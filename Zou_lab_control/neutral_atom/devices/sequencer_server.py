@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import json
 import os
+import socket
 import subprocess
 from typing import Sequence
 
@@ -132,8 +133,64 @@ def run_server(
     print("Zou_lab_control sequencer service")
     print(json.dumps(service.snapshot(), indent=2))
     print(f"Listening on {host}:{port}")
+    _print_client_endpoints(host, port)
     print(f"State directory: {Path(state_dir).resolve()}")
     return serve_runtime_sequencer(service, host=host, port=port, start=True)
+
+
+def _print_client_endpoints(host: str, port: int) -> None:
+    addresses = _client_addresses(host)
+    if not addresses:
+        print("Client endpoints: no non-loopback IPv4 address detected")
+        return
+    print("Client endpoints:")
+    for address in addresses:
+        print(f"  {address}:{int(port)}")
+    print("Notebook connect example:")
+    print(f'  exp = na.connect("remote_template", sequencer={{"host": "{addresses[0]}", "port": {int(port)}}}, open_devices=True)')
+
+
+def _client_addresses(bind_host: str) -> list[str]:
+    host = str(bind_host).strip()
+    if host and host not in {"0.0.0.0", "::"}:
+        return [host]
+    return _local_ipv4_addresses()
+
+
+def _local_ipv4_addresses() -> list[str]:
+    addresses: list[str] = []
+
+    def add(value) -> None:
+        try:
+            ip = str(value).strip()
+            packed = socket.inet_aton(ip)
+        except OSError:
+            return
+        if ip == "0.0.0.0" or ip.startswith("127."):
+            return
+        if packed not in [socket.inet_aton(existing) for existing in addresses]:
+            addresses.append(ip)
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            add(sock.getsockname()[0])
+    except OSError:
+        pass
+
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET, socket.SOCK_STREAM):
+            add(info[4][0])
+    except OSError:
+        pass
+
+    try:
+        for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
+            add(ip)
+    except OSError:
+        pass
+
+    return addresses
 
 
 def _split_channels(value: str | Sequence[str]) -> list[str]:

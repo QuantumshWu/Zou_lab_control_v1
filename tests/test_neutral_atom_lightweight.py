@@ -454,6 +454,21 @@ def test_load_devices_can_open_device_graph(monkeypatch):
     assert TrackingCamera.events == ["sequencer.open", "camera.open", "camera.close", "sequencer.close"]
 
 
+def test_sequencer_server_reports_client_endpoints(monkeypatch, capsys):
+    from Zou_lab_control.neutral_atom.devices import sequencer_server
+
+    assert sequencer_server._client_addresses("192.168.0.20") == ["192.168.0.20"]
+
+    monkeypatch.setattr(sequencer_server, "_client_addresses", lambda host: ["192.168.0.20", "10.0.0.5"])
+    sequencer_server._print_client_endpoints("0.0.0.0", 18861)
+    output = capsys.readouterr().out
+
+    assert "Client endpoints:" in output
+    assert "192.168.0.20:18861" in output
+    assert "10.0.0.5:18861" in output
+    assert 'sequencer={"host": "192.168.0.20", "port": 18861}' in output
+
+
 def test_qcmos_camera_acquire_uses_dcam_and_expanded_sequencer(monkeypatch):
     class FakeApi:
         initialized = False
