@@ -348,7 +348,9 @@ class RemoteSequencer(SequencerDevice):
         ca_certs: str | None = None,
         connect_on_init: bool = False,
     ):
-        self.host = str(host)
+        self.host = str(host).strip()
+        if self.host in {"", "0.0.0.0", "::"}:
+            raise ValueError("RemoteSequencer host must be the server address reachable from the control computer.")
         self.port = int(port)
         self.channels = list(channel_names(channels, "channels"))
         self.clock_hz = positive_float(clock_hz, "clock_hz")

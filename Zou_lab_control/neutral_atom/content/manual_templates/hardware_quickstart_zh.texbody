@@ -39,7 +39,11 @@ connect devices
 notebook 里每个 cell 应该是实验动作，而不是命令行脚本的平铺。推荐的交互形状是：
 
 \begin{codeblock}[Notebook shape]
-exp = na.connect("real_remote_template")
+exp = na.connect(
+    "remote_template",
+    sequencer={"host": "192.168.0.20", "port": 18861},
+    open_devices=True,
+)
 
 exp.timing.configure_imaging(exposure=2e-3, load=True)
 capture = exp.camera.capture()
@@ -231,7 +235,7 @@ camera wait/read frames
 sequencer.wait_done(timeout)
 \end{codeblock}
 
-\pyapi{connect_on_init=False} 是故意的。加载 config 和创建 session 不应该立刻连接硬件；真正需要采集时才 open/connect。这样 notebook 可以先 inspect config、跑 preflight、确认参数，再进入真实 shot。
+\pyapi{connect_on_init=False} 让 device graph 可以先构造和校验而不连接网络。需要在连接阶段直接打开硬件时，用 \pyapi{na.connect(..., open_devices=True)} 或 \pyapi{na.load_devices(..., open_devices=True)}，由 device loader 统一处理 open 顺序和失败回滚。
 
 \section{Verilog/FPGA 电脑上跑什么}
 Verilog/FPGA 电脑负责启动 sequencer server。推荐先打开 FPGA server notebook：
@@ -289,12 +293,12 @@ safe_state_callback()
 
 control PC 的 notebook 仍然只调用 \pyapi{RemoteSequencer.prepare/fire/wait_done}。
 
-\section{真实配置模板}
-现在有两个 real config template：
+\section{硬件配置模板}
+现在有两个 hardware config template：
 
 \begin{itemize}
-  \item \pyapi{real_manual_template.json}: \pyapi{QCMOSCamera} + \pyapi{ManualSequencer}。
-  \item \pyapi{real_remote_template.json}: \pyapi{QCMOSCamera} + \pyapi{RemoteSequencer}。
+  \item \pyapi{manual_template.json}: \pyapi{QCMOSCamera} + \pyapi{ManualSequencer}。
+  \item \pyapi{remote_template.json}: \pyapi{QCMOSCamera} + \pyapi{RemoteSequencer}。
 \end{itemize}
 
 真实使用前至少要检查：
@@ -326,6 +330,15 @@ control PC 的 notebook 仍然只调用 \pyapi{RemoteSequencer.prepare/fire/wait
 
 \pyapi{type} 可以是 registry 里的短名，也可以是完整 Python import path。加载时会实例化 class，然后立刻用 \pyapi{validate_device_contract} 检查角色。顶层 key 为 \pyapi{camera} 的对象必须继承 \pyapi{CameraDevice}；顶层 key 为 \pyapi{sequencer} 的对象必须继承 \pyapi{SequencerDevice}。这比 duck typing 更严格，也更适合实验控制：错误应该在连接阶段暴露，而不是等到相机已经 arm 以后才发现某个 method 不存在。
 
+本次运行要覆盖某个 device 参数时，使用 \pyapi{overrides} 或 \pyapi{na.connect(..., sequencer={...})}，不要在 notebook 里手动读写 JSON：
+
+\begin{codeblock}[Python]
+devices = na.load_devices(
+    "remote_template",
+    overrides={"sequencer": {"host": "192.168.0.20", "port": 18861}},
+)
+\end{codeblock}
+
 \section{QCMOSCamera 配置}
 真实 qCMOS template 里的 camera 部分是：
 
@@ -353,10 +366,10 @@ control PC 的 notebook 仍然只调用 \pyapi{RemoteSequencer.prepare/fire/wait
   \item[\pyapi{timeout_ms}] 每次等待 frame ready 的 timeout。多帧 acquisition 中每一帧都会调用 wait；不要把它理解成整个 scan 的总 timeout。
 \end{description}
 
-\pyapi{QCMOSCamera.open()} 只在第一次真实 acquisition 时 import \pyapi{dcam} 并打开设备。所以 notebook 可以安全地 \pyapi{na.connect("real_remote_template")} 和 \pyapi{exp.status()}，只要不调用 \pyapi{capture/acquire}。
+\pyapi{QCMOSCamera.open()} 只在第一次 acquisition 或显式 \pyapi{open_devices=True} 时 import \pyapi{dcam} 并打开设备。
 
 \section{ManualSequencer 配置}
-\pyapi{real_manual_template} 的 sequencer 是：
+\pyapi{manual_template} 的 sequencer 是：
 
 \begin{codeblock}[Manual sequencer]
 "sequencer": {
@@ -373,7 +386,7 @@ control PC 的 notebook 仍然只调用 \pyapi{RemoteSequencer.prepare/fire/wait
 \pyapi{channels} 是 sequence validation 和 edge table compilation 的 channel universe。\pyapi{trigger_channels} 告诉 acquisition 哪些 channel 算 camera trigger。这个名字必须和 \pyapi{PulseSequence} 里的 channel 一致。如果你的 FPGA 代码里叫 \pyapi{camera_trigger}，要么把 imaging sequence 改成这个 channel，要么把 \pyapi{trigger_channels} 包含它。
 
 \section{RemoteSequencer 配置}
-\pyapi{real_remote_template} 的 sequencer 是：
+\pyapi{remote_template} 的 sequencer 是：
 
 \begin{codeblock}[Remote sequencer]
 "sequencer": {
@@ -392,7 +405,10 @@ control PC 的 notebook 仍然只调用 \pyapi{RemoteSequencer.prepare/fire/wait
 \pyapi{connect_on_init=false} 让 session creation 不连接网络。第一次 \pyapi{prepare}、\pyapi{fire} 或 \pyapi{wait_done} 才会 open RPyC connection。调试时可以先：
 
 \begin{codeblock}[Python]
-devices = na.load_devices("real_remote_template")
+devices = na.load_devices(
+    "remote_template",
+    overrides={"sequencer": {"host": "192.168.0.20", "port": 18861}},
+)
 devices.snapshot()
 devices.close()
 \end{codeblock}
@@ -516,7 +532,10 @@ tutorials/neutral_atom_tutorial.ipynb
 在控制电脑上先只读配置，不打开相机：
 
 \begin{codeblock}[Python]
-devices = na.load_devices("real_remote_template")
+devices = na.load_devices(
+    "remote_template",
+    overrides={"sequencer": {"host": "192.168.0.20", "port": 18861}},
+)
 devices.snapshot()
 devices.close()
 \end{codeblock}
@@ -524,7 +543,7 @@ devices.close()
 这一步应该不需要 qCMOS driver 和 FPGA PC 在线。如果失败，说明配置文件或 class registry 有问题。然后打开 \filepath{tutorials/neutral_atom_hardware_quickstart.ipynb} 继续真实连接。
 
 \section{阶段 3: manual first-light}
-用 \pyapi{real_manual_template} 拍一张图。检查：
+用 \pyapi{manual_template} 拍一张图。检查：
 \begin{itemize}
   \item camera 能 open。
   \item external trigger 后能得到 frame。
@@ -535,7 +554,7 @@ devices.close()
 这一步不追求自动 scan，只追求硬件链路通。
 
 \section{阶段 4: remote service first-light}
-在 FPGA PC 开 service，在 control PC 用 \pyapi{real_remote_template}。先跑一张 capture，再跑小 frames 的 sitemap。这里最容易暴露的是 trigger count、network address、service callback 和 FPGA done signal。
+在 FPGA PC 开 service，在 control PC 用 \pyapi{remote_template}。先跑一张 capture，再跑小 frames 的 sitemap。这里最容易暴露的是 trigger count、network address、service callback 和 FPGA done signal。
 
 \section{阶段 5: readout calibration}
 真实 hardware 能拍图之后，才跑：
@@ -568,15 +587,15 @@ zf.notebook_setup()
 控制电脑打开 \filepath{tutorials/neutral_atom_hardware_quickstart.ipynb}。确认 Verilog/FPGA 电脑 server 已经启动后，使用：
 
 \begin{codeblock}[Python]
-DEVICE_CONFIG = "real_remote_template"
+exp = na.connect(
+    "remote_template",
+    sequencer={"host": "192.168.0.20", "port": 18861},
+    open_devices=True,
+)
 GRID_SHAPE = (5, 7)
-
-exp = na.connect(DEVICE_CONFIG)
-exp.devices.sequencer.open()
-exp.camera.open()
 \end{codeblock}
 
-这里 sequencer open 会连接 Verilog/FPGA 电脑；camera open 会打开 qCMOS。失败时不要继续跑后面的 calibration cell。
+这里由 \pyapi{connect(..., open_devices=True)} 统一打开 device graph。失败时不要继续跑后面的 calibration cell。
 
 \section{拍 raw image}
 capture 图只显示 raw camera frame：
@@ -670,10 +689,10 @@ scan.stop()
 
 \chapter{真实机器上的执行顺序}
 \section{first-light 手动触发}
-第一次连真实 qCMOS 和 FPGA 时，建议先用 \pyapi{real_manual_template}：
+第一次连真实 qCMOS 和 FPGA 时，建议先用 \pyapi{manual_template}：
 
 \begin{codeblock}[Python]
-exp = na.connect("real_manual_template")
+exp = na.connect("manual_template", open_devices=True)
 exp.timing.configure_imaging(exposure=2e-3, load=True)
 preflight = exp.timing.preflight()
 preflight.raise_if_failed()
@@ -692,7 +711,11 @@ capture = exp.camera.capture(display=True)
 当 FPGA PC 上的 service 准备好后，用：
 
 \begin{codeblock}[Python]
-exp = na.connect("real_remote_template")
+exp = na.connect(
+    "remote_template",
+    sequencer={"host": "192.168.0.20", "port": 18861},
+    open_devices=True,
+)
 exp.timing.configure_imaging(exposure=2e-3, load=True)
 capture = exp.camera.capture(display=True)
 \end{codeblock}

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 import importlib
 import json
@@ -70,9 +71,26 @@ class DeviceSet:
             raise TypeError(f"device {name!r} ({type(device).__name__}) must inherit {expected_name}.")
         return device
 
+    def open(self) -> "DeviceSet":
+        opened: list[tuple[str, Any]] = []
+        try:
+            for name in self._open_order():
+                device = self.require(name)
+                device.open()
+                opened.append((name, device))
+        except Exception:
+            for _, device in reversed(opened):
+                try:
+                    device.close()
+                except Exception:
+                    pass
+            raise
+        return self
+
     def close(self) -> None:
         errors: list[str] = []
-        for name, device in reversed(list(self.devices.items())):
+        ordered = [(name, self.devices[name]) for name in self._open_order() if name in self.devices]
+        for name, device in reversed(ordered):
             close = getattr(device, "close", None)
             if callable(close):
                 try:
@@ -89,15 +107,25 @@ class DeviceSet:
             out[name] = snap() if callable(snap) else {"type": type(device).__name__}
         return out
 
+    def _open_order(self) -> list[str]:
+        names = list(self.devices)
+        return [name for name in names if name != "camera"] + [name for name in names if name == "camera"]
+
 
 def device_config_dir() -> Path:
     return Path(__file__).resolve().parent.parent / "configs"
 
 
-def load_devices(config: str | Path | Mapping[str, Any] = "virtual") -> DeviceSet:
+def load_devices(
+    config: str | Path | Mapping[str, Any] = "virtual",
+    *,
+    overrides: Mapping[str, Mapping[str, Any]] | None = None,
+    open_devices: bool = False,
+) -> DeviceSet:
     """Load a device graph from ``virtual``, JSON, or a Python dict."""
 
     cfg = read_config(config)
+    apply_device_overrides(cfg, overrides)
     devices: dict[str, Any] = {}
     visiting: set[str] = set()
 
@@ -129,15 +157,18 @@ def load_devices(config: str | Path | Mapping[str, Any] = "virtual") -> DeviceSe
     try:
         for name in cfg:
             build(name)
+        device_set = DeviceSet(devices, cfg)
+        if open_devices:
+            device_set.open()
     except Exception:
         DeviceSet(devices, cfg).close()
         raise
-    return DeviceSet(devices, cfg)
+    return device_set
 
 
 def read_config(config: str | Path | Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(config, Mapping):
-        return dict(config)
+        return deepcopy(dict(config))
     if str(config).lower() == "virtual":
         return virtual_config()
     path = Path(config)
@@ -146,6 +177,30 @@ def read_config(config: str | Path | Mapping[str, Any]) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(f"device config not found: {config}")
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def apply_device_overrides(cfg: dict[str, Any], overrides: Mapping[str, Mapping[str, Any]] | None) -> None:
+    if not overrides:
+        return
+    for name, params in overrides.items():
+        if params is None:
+            continue
+        if name not in cfg:
+            raise KeyError(f"device {name!r} is not present in config.")
+        if not isinstance(params, Mapping):
+            raise TypeError(f"device override for {name!r} must be a mapping.")
+        target = cfg[name].setdefault("params", {})
+        if not isinstance(target, dict):
+            raise TypeError(f"device {name!r} params must be a mapping to apply overrides.")
+        deep_update(target, params)
+
+
+def deep_update(target: dict[str, Any], source: Mapping[str, Any]) -> None:
+    for key, value in source.items():
+        if isinstance(value, Mapping) and isinstance(target.get(key), dict):
+            deep_update(target[key], value)
+        else:
+            target[key] = deepcopy(value)
 
 
 def resolve_class(name: str) -> type:
@@ -164,4 +219,13 @@ def available_device_configs() -> list[str]:
     return sorted(set(names))
 
 
-__all__ = ["DEVICE_CLASSES", "DeviceSet", "available_device_configs", "device_config_dir", "load_devices", "read_config", "resolve_class"]
+__all__ = [
+    "DEVICE_CLASSES",
+    "DeviceSet",
+    "apply_device_overrides",
+    "available_device_configs",
+    "device_config_dir",
+    "load_devices",
+    "read_config",
+    "resolve_class",
+]

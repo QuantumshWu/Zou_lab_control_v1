@@ -360,9 +360,13 @@ def test_hardware_tutorial_is_real_hardware_not_virtual_demo():
     assert 'na.connect("virtual")' not in hardware_text
     assert "VirtualCamera" not in hardware_text
     assert "VirtualSequencer" not in hardware_text
-    assert "real_remote_template" in hardware_text
-    assert "exp.camera.open()" in hardware_text
-    assert "exp.devices.sequencer.open()" in hardware_text
+    assert '"remote_template"' in hardware_text
+    assert "open_devices=True" in hardware_text
+    assert "zf.require_attrs" not in hardware_text
+    assert "isinstance(" not in hardware_text
+    assert "exp.camera.open()" not in hardware_text
+    assert "exp.devices.sequencer.open()" not in hardware_text
+    assert "results_real_hardware" not in hardware_text
     assert "neutral_atom.devices.sequencer_server" in fpga_text
     assert "na.run_sequencer_server" in fpga_text
     assert "address_switch.xpr" not in fpga_text
@@ -371,14 +375,83 @@ def test_hardware_tutorial_is_real_hardware_not_virtual_demo():
 
 
 def test_real_device_templates_load_without_hardware_connection():
-    manual = na.load_devices("real_manual_template")
-    remote = na.load_devices("real_remote_template")
+    manual = na.load_devices("manual_template")
+    remote = na.load_devices("remote_template", overrides={"sequencer": {"host": "192.168.0.21", "port": 18862}})
 
     assert isinstance(manual.camera, na.QCMOSCamera)
     assert isinstance(manual.sequencer, na.ManualSequencer)
     assert isinstance(remote.camera, na.QCMOSCamera)
     assert isinstance(remote.sequencer, na.RemoteSequencer)
+    assert remote.sequencer.host == "192.168.0.21"
+    assert remote.sequencer.port == 18862
     assert remote.sequencer.snapshot()["connected"] is False
+
+    exp = na.connect("remote_template", sequencer={"host": "192.168.0.22"})
+    assert exp.devices.sequencer.host == "192.168.0.22"
+
+    try:
+        na.load_devices("remote_template", overrides={"sequencer": {"host": "0.0.0.0"}})
+    except ValueError as exc:
+        assert "RemoteSequencer host" in str(exc)
+    else:
+        raise AssertionError("RemoteSequencer accepted a non-client host.")
+
+
+def test_load_devices_can_open_device_graph(monkeypatch):
+    from Zou_lab_control.neutral_atom.devices import registry
+
+    class TrackingCamera(na.CameraDevice):
+        events = []
+
+        @property
+        def exposure(self):
+            return 1e-3
+
+        def configure(self, *, exposure=None, **kwargs):
+            pass
+
+        def acquire(self, frames=1, *, sequence=None, sequencer=None, **kwargs):
+            return [np.zeros((2, 2))]
+
+        def open(self):
+            self.events.append("camera.open")
+            return self
+
+        def close(self):
+            self.events.append("camera.close")
+
+    class TrackingSequencer(na.SequencerDevice):
+        events = TrackingCamera.events
+        channels = ["qcm_trigger"]
+        clock_hz = 1e6
+
+        def prepare(self, sequence):
+            pass
+
+        def fire(self, sequence=None):
+            pass
+
+        def open(self):
+            self.events.append("sequencer.open")
+            return self
+
+        def close(self):
+            self.events.append("sequencer.close")
+
+    monkeypatch.setitem(registry.DEVICE_CLASSES, "TrackingCamera", TrackingCamera)
+    monkeypatch.setitem(registry.DEVICE_CLASSES, "TrackingSequencer", TrackingSequencer)
+
+    devices = na.load_devices(
+        {
+            "camera": {"type": "TrackingCamera"},
+            "sequencer": {"type": "TrackingSequencer"},
+        },
+        open_devices=True,
+    )
+
+    assert TrackingCamera.events == ["sequencer.open", "camera.open"]
+    devices.close()
+    assert TrackingCamera.events == ["sequencer.open", "camera.open", "camera.close", "sequencer.close"]
 
 
 def test_qcmos_camera_acquire_uses_dcam_and_expanded_sequencer(monkeypatch):

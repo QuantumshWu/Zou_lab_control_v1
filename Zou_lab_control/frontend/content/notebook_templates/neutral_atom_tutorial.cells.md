@@ -29,7 +29,7 @@ zf.apply_style()
 推荐调用边界：
 
 - `na.BaseDevice` / `na.CameraDevice` / `na.SequencerDevice` / `na.TrapArrayDevice`：硬件契约。真实 camera 至少要满足 `exposure`、`configure(...)`、`acquire(frames, sequence=..., sequencer=...)`。
-- `na.load_devices(...)`：只负责按 JSON/dict 构造 device graph，并要求每个 device 继承对应 base class。
+- `na.load_devices(...)`：按 JSON/dict 构造 device graph，合并本次运行的 device 参数，并要求每个 device 继承对应 base class；需要时也可以统一 open。
 - `exp.camera`：真实 camera device 本体，`capture()` 是 camera device 方法。
 - `exp.readout`：camera readout subsystem，包含 sitemap、threshold、detect、detection-time fidelity calibration。
 - `exp.timing.*`：pulse sequence、preflight、Verilog 生成。
@@ -61,11 +61,7 @@ exp = na.connect(
     loss_rate=0.1,
     sitemap={"grid_shape": (5, 7), "spacing_px": 12.0, "roi_radius": 1, "sitemap_exposure": 0.02},
 )
-zf.require_attrs(exp, ["camera", "readout", "timing"], name="exp")
 exp
-
-<!-- cell:code -->
-isinstance(exp.camera, na.CameraDevice), isinstance(exp.readout, na.ReadoutSubsystem)
 
 <!-- cell:markdown -->
 ## Configure and inspect the imaging pulse

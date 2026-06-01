@@ -332,12 +332,14 @@ def connect(
     camera: dict[str, Any] | None = None,
     sequencer: dict[str, Any] | None = None,
     defaults: dict[str, Any] | None = None,
+    open_devices: bool = False,
     **virtual_params,
 ) -> NeutralAtomSession:
     """Load devices and return a notebook-facing neutral-atom session."""
 
     default_values = dict(defaults or {})
     device_config = config
+    device_overrides: dict[str, dict[str, Any]] = {}
     if _is_virtual_config(config):
         device_config, inferred_defaults = _virtual_config_with_overrides(
             trap_array=trap_array,
@@ -347,9 +349,17 @@ def connect(
             params=virtual_params,
         )
         default_values.update(inferred_defaults)
-    elif trap_array or sitemap or camera or sequencer or virtual_params:
-        raise ValueError("trap_array/sitemap/camera/sequencer overrides are only supported with config='virtual'.")
-    return NeutralAtomSession(load_devices(device_config), name=name, defaults=default_values)
+    else:
+        if sitemap or virtual_params:
+            raise ValueError("sitemap and virtual shortcut parameters are only supported with config='virtual'.")
+        for device_name, params in (("trap_array", trap_array), ("camera", camera), ("sequencer", sequencer)):
+            if params:
+                device_overrides[device_name] = dict(params)
+    return NeutralAtomSession(
+        load_devices(device_config, overrides=device_overrides or None, open_devices=open_devices),
+        name=name,
+        defaults=default_values,
+    )
 
 
 def _is_virtual_config(config) -> bool:

@@ -1,4 +1,4 @@
-# Zou_lab_control Neutral Atom Real Hardware Runbook
+# Zou_lab_control Neutral Atom Hardware Runbook
 
 This runbook is the short operational version of the PDF. It uses the new
 `Zou_lab_control.neutral_atom` architecture only. Do not call old
@@ -95,13 +95,14 @@ cd C:\path\to\Zou_lab_control_v1
 jupyter lab tutorials\neutral_atom_hardware_quickstart.ipynb
 ```
 
-The main connection cell is intentionally real hardware:
+The main connection cell is:
 
 ```python
-DEVICE_CONFIG = "real_remote_template"
-exp = na.connect(DEVICE_CONFIG)
-exp.devices.sequencer.open()
-exp.camera.open()
+exp = na.connect(
+    "remote_template",
+    sequencer={"host": "192.168.0.20", "port": 18861},
+    open_devices=True,
+)
 ```
 
 Then run the cells in order:
@@ -112,16 +113,18 @@ preflight = exp.timing.preflight()
 preflight.raise_if_failed()
 
 capture = exp.camera.capture(frames=1, display=True)
-sitemap = exp.readout.sitemap(frames=20, grid_shape=GRID_SHAPE, roi_radius=ROI_RADIUS, display=True)
+grid_shape = (5, 7)
+sitemap = exp.readout.sitemap(frames=20, grid_shape=grid_shape, roi_radius=1, display=True)
 threshold = exp.readout.thresholds(frames=120, site=0, display=True)
 shot = exp.readout.detect(display=True)
-scan = exp.readout.detection_time(DETECTION_TIMES, shots=30, live=False, display=True)
+times = np.linspace(0.2e-3, 8e-3, 40)
+scan = exp.readout.detection_time(times, shots=30, live=False, display=True)
 ```
 
-For first-light without the remote server, set:
+For first-light without the remote server:
 
 ```python
-DEVICE_CONFIG = "real_manual_template"
+exp = na.connect("manual_template", open_devices=True)
 ```
 
 Then `exp.camera.capture()` will arm the qCMOS and print the manual trigger

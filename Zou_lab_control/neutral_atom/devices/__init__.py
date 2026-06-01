@@ -17,6 +17,7 @@ from .virtual import DEFAULT_CHANNELS, VirtualCamera, VirtualSequencer, VirtualT
 _REGISTRY_EXPORTS = {
     "DEVICE_CLASSES",
     "DeviceSet",
+    "apply_device_overrides",
     "available_device_configs",
     "device_config_dir",
     "load_devices",
@@ -64,6 +65,7 @@ __all__ = [
     "VirtualCamera",
     "VirtualSequencer",
     "VirtualTrapArray",
+    "apply_device_overrides",
     "available_device_configs",
     "build_sequencer_server_arg_parser",
     "device_config_dir",

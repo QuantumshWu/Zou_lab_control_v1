@@ -3,6 +3,7 @@ import matplotlib
 matplotlib.use("Agg")
 
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -405,11 +406,24 @@ def test_notes_tex_writer_copies_template(tmp_path):
 def test_frontend_generates_utf8_tutorial_notebooks(tmp_path):
     frontend = zf.write_frontend_tutorial(tmp_path / "frontend.ipynb")
     neutral = zf.write_neutral_atom_tutorial(tmp_path / "neutral.ipynb")
+    hardware = zf.write_neutral_atom_hardware_tutorial(tmp_path / "hardware.ipynb")
+    fpga_server = zf.write_neutral_atom_fpga_server_tutorial(tmp_path / "fpga_server.ipynb")
 
-    for result in (frontend, neutral):
+    for result in (frontend, neutral, hardware, fpga_server):
         text = result.path.read_text(encoding="utf-8")
         assert "???" not in text
         assert "\ufffd" not in text
     assert "这个 notebook" in neutral.path.read_text(encoding="utf-8")
+    hardware_text = hardware.path.read_text(encoding="utf-8")
+    assert "open_devices=True" in hardware_text
+    assert "zf.require_attrs" not in hardware_text
+    assert "isinstance(" not in hardware_text
     assert "BOOTSTRAP_CELL" in zf.__all__
     assert "write_neutral_atom_tutorial" in zf.__all__
+
+
+def test_checked_in_tutorial_notebooks_are_utf8():
+    for path in sorted((Path(__file__).resolve().parents[1] / "tutorials").glob("*.ipynb")):
+        text = path.read_text(encoding="utf-8")
+        assert "???" not in text, path
+        assert "\ufffd" not in text, path

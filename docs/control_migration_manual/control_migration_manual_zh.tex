@@ -527,7 +527,7 @@ qCMOS_end(dcam)
 \end{codeblock}
 新写法：
 \begin{codeblock}[Python]
-dev = na.load_devices("virtual")  # or real_template/custom JSON
+dev = na.load_devices("virtual")  # or remote_template/custom JSON
 shot = na.ShotExperiment(dev, calibration=cal)
 result = shot.acquire(sequence=seq)
 shot.save_record("results/shot_record.json", result)
