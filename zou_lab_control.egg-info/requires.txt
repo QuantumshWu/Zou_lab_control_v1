@@ -1,5 +1,0 @@
-ipython
-matplotlib
-nbformat
-numpy
-scipy
