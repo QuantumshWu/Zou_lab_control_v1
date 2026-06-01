@@ -94,7 +94,18 @@ class CommandSequencerBackend:
         log_path = self.state_dir / f"{action}.log"
         log_path.write_text(result.stdout, encoding="utf-8", errors="replace")
         if result.returncode != 0:
-            raise RuntimeError(f"sequencer {action} command failed with code {result.returncode}. See {log_path}.")
+            message = f"sequencer {action} command failed with code {result.returncode}. See {log_path}."
+            tail = _log_tail(result.stdout)
+            if tail:
+                message = f"{message}\n\n--- {log_path.name} tail ---\n{tail}"
+            raise RuntimeError(message)
+
+
+def _log_tail(text: str, *, max_lines: int = 80, max_chars: int = 12_000) -> str:
+    tail = "\n".join(str(text).splitlines()[-max_lines:])
+    if len(tail) > max_chars:
+        tail = tail[-max_chars:]
+    return tail.strip()
 
 
 def run_server(

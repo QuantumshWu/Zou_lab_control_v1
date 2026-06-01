@@ -50,7 +50,7 @@ def write_vivado_vio_tcl(
     project: str | None = None,
     bitstream: str | None = None,
     probes: str | None = None,
-    vio_filter: str = 'CELL_NAME=~"vio"',
+    vio_filter: str = 'CELL_NAME=~"*vio*"',
 ) -> Path:
     """Write a Vivado batch Tcl file that assigns named VIO probes."""
 
@@ -88,8 +88,15 @@ def write_vivado_vio_tcl(
         "    set_property FULL_PROBES.FILE $probes $device",
         "    refresh_hw_device $device",
         "}",
+        "set available_vios [get_hw_vios -of_objects $device]",
         "set vio [lindex [get_hw_vios -of_objects $device -filter $vio_filter] 0]",
-        "if {$vio eq \"\"} { error \"No VIO core matched filter '$vio_filter'.\" }",
+        "if {$vio eq \"\"} {",
+        "    puts \"Available VIO cores:\"",
+        "    foreach candidate $available_vios {",
+        "        puts \"  NAME=[get_property NAME $candidate] CELL_NAME=[get_property CELL_NAME $candidate]\"",
+        "    }",
+        "    error \"No VIO core matched filter '$vio_filter'.\"",
+        "}",
         "proc set_vio_probe {vio name value} {",
         "    set probe [lindex [get_hw_probes $name -of_objects $vio] 0]",
         "    if {$probe eq \"\"} { error \"VIO probe '$name' was not found.\" }",
@@ -178,19 +185,28 @@ def run_action(
         project=os.environ.get("ZLC_VIVADO_PROJECT"),
         bitstream=os.environ.get("ZLC_VIVADO_BIT"),
         probes=os.environ.get("ZLC_VIVADO_LTX"),
-        vio_filter=os.environ.get("ZLC_VIO_FILTER", 'CELL_NAME=~"vio"'),
+        vio_filter=os.environ.get("ZLC_VIO_FILTER", 'CELL_NAME=~"*vio*"'),
     )
     if dry_run:
         return tcl_path
-    result = subprocess.run(
-        [vivado, "-mode", "batch", "-source", str(tcl_path)],
-        cwd=state,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=timeout,
-    )
     log_path = state / f"legacy_address_switch_{action}.log"
+    try:
+        result = subprocess.run(
+            [vivado, "-mode", "batch", "-source", str(tcl_path)],
+            cwd=state,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+        )
+    except FileNotFoundError as exc:
+        message = (
+            f"Vivado executable was not found: {vivado!r}.\n"
+            "Set ZLC_VIVADO_BIN to the full Vivado executable path, for example "
+            r"C:\Xilinx\Vivado\2023.2\bin\vivado.bat, or add Vivado bin to PATH."
+        )
+        log_path.write_text(message, encoding="utf-8", errors="replace")
+        raise RuntimeError(f"legacy address-switch {action} could not start Vivado. See {log_path}.") from exc
     log_path.write_text(result.stdout, encoding="utf-8", errors="replace")
     if result.returncode != 0:
         raise RuntimeError(f"legacy address-switch {action} failed with code {result.returncode}. See {log_path}.")

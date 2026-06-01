@@ -51,7 +51,7 @@ os.environ["ZLC_VIVADO_PROJECT"] = r"D:\zlc_fpga\neutral_atom_sequence\neutral_a
 os.environ["ZLC_VIVADO_BIT"] = r"D:\zlc_fpga\neutral_atom_sequence\neutral_atom_sequence.runs\impl_1\main.bit"
 os.environ["ZLC_VIVADO_LTX"] = r"D:\zlc_fpga\neutral_atom_sequence\neutral_atom_sequence.runs\impl_1\main.ltx"
 os.environ["ZLC_VIVADO_PROGRAM_ON_RUN"] = "0"  # set to "1" only when you intentionally want to reprogram the bitstream
-os.environ["ZLC_VIO_FILTER"] = 'CELL_NAME=~"vio"'
+os.environ["ZLC_VIO_FILTER"] = 'CELL_NAME=~"*vio*"'
 
 # Probe names in address_switch/address_switch.srcs/sources_1/new/main.v.
 os.environ["ZLC_LEGACY_START_PARAM"] = "config_ready"

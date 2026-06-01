@@ -277,6 +277,25 @@ def test_command_sequencer_backend_writes_program_and_runs_fire_command(tmp_path
     assert payload["source_sequence"]["name"] == seq.name
 
 
+def test_command_sequencer_backend_error_includes_log_tail(tmp_path):
+    command = f'"{sys.executable}" -c "print(\'prepare failed detail\'); raise SystemExit(7)"'
+    seq = na.imaging_sequence(exposure=1e-4, load=True)
+    program = na.compile_runtime_program(seq, channels=["trap", "cooling", "probe", "qcm_trigger"])
+    backend = na.CommandSequencerBackend(tmp_path, prepare_command=command)
+
+    try:
+        backend.prepare(program)
+    except RuntimeError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("prepare command should have failed")
+
+    assert "failed with code 7" in message
+    assert "prepare.log tail" in message
+    assert "prepare failed detail" in message
+    assert "prepare failed detail" in (tmp_path / "prepare.log").read_text(encoding="utf-8")
+
+
 def test_remote_sequencer_round_trip_uses_json_protocol(tmp_path):
     try:
         import rpyc  # noqa: F401
@@ -326,6 +345,8 @@ def test_legacy_address_switch_extracts_probe_lasting_and_writes_tcl(tmp_path, m
 
     assert params == {"pulse_lasting": 400, "cycle_counts": 5}
     tcl = tcl_path.read_text(encoding="utf-8")
+    assert 'set vio_filter {CELL_NAME=~"*vio*"}' in tcl
+    assert "Available VIO cores:" in tcl
     assert "set_vio_probe $vio {pulse_lasting} {400}" in tcl
     assert "set_vio_probe $vio {cycle_counts} {5}" in tcl
 
@@ -343,6 +364,27 @@ def test_legacy_address_switch_prepare_requires_trigger_confirmation(monkeypatch
         assert "exactly one positive edge per cycle" in str(exc)
     else:
         raise AssertionError("legacy backend should require qCMOS trigger confirmation")
+
+
+def test_legacy_address_switch_missing_vivado_writes_clear_log(tmp_path, monkeypatch):
+    from Zou_lab_control.neutral_atom.devices.legacy_address_switch import run_action
+
+    monkeypatch.setenv("ZLC_LEGACY_SINGLE_CAMERA_TRIGGER_CONFIRMED", "1")
+    seq = na.imaging_sequence(exposure=4e-6, load=True)
+    program = na.compile_runtime_program(seq, channels=["trap", "cooling", "probe", "qcm_trigger"], clock_hz=100e6)
+    program_path = tmp_path / "program.json"
+    program_path.write_text(json.dumps(program.to_dict()), encoding="utf-8")
+
+    try:
+        run_action("prepare", program_path=program_path, state_dir=tmp_path, vivado="zlc_missing_vivado_executable")
+    except RuntimeError as exc:
+        assert "could not start Vivado" in str(exc)
+    else:
+        raise AssertionError("missing Vivado executable should fail clearly")
+
+    log_text = (tmp_path / "legacy_address_switch_prepare.log").read_text(encoding="utf-8")
+    assert "Vivado executable was not found" in log_text
+    assert "ZLC_VIVADO_BIN" in log_text
 
 
 def test_legacy_address_switch_wait_done_resets_config_ready():
