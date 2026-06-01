@@ -1,6 +1,7 @@
 # Python cache and build outputs
 __pycache__/
 *.py[cod]
+*.pyc.*
 *$py.class
 .pytest_cache/
 .mypy_cache/
@@ -34,6 +35,8 @@ tutorials/_executed_check/
 # Generated local outputs
 /generated_sequences/
 /results/
+**/generated_sequences/
+**/results/
 
 # Root-level source archives kept locally outside git history
 /*.zip

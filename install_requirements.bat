@@ -14,10 +14,7 @@ if defined PYTHON_CMD goto verify_python
 call :from_jupyter_kernels
 if defined PYTHON_CMD goto verify_python
 
-call :from_path
-if defined PYTHON_CMD goto verify_python
-
-echo Could not find the Python interpreter used by VSCode.
+echo Could not identify the Python interpreter currently selected by VSCode.
 echo.
 echo Easiest option: in the VSCode notebook, run:
 echo.
@@ -35,6 +32,13 @@ set /p "PYTHON_EXE=python.exe path: "
 if not "%PYTHON_EXE%"=="" (
     set "PYTHON_CMD="%PYTHON_EXE%""
     goto verify_python
+)
+
+echo.
+set /p "USE_PATH=Use py/python from PATH instead? This may be a different environment. [y/N]: "
+if /I "%USE_PATH%"=="Y" (
+    call :from_path
+    if defined PYTHON_CMD goto verify_python
 )
 
 echo.
