@@ -411,12 +411,10 @@ detect 图不再只画一个抽象 occupancy heatmap。背景是 raw camera data
 \section{推荐调用}
 \begin{codeblock}[Python]
 times = np.linspace(0.2e-3, 10e-3, 100)
-scan = exp.readout.detection_time(times, shots=30, live=False)
-fit_result, popt = scan.data_figure.decay()
-scan.summary(), fit_result, popt
+scan = exp.readout.detection_time(times, shots=30, live=True)
 \end{codeblock}
 
-\pyapi{detection_time} 默认 \pyapi{live=True}。cell 会很快返回，scan 在 frontend-owned worker 里继续跑；worker 负责采集并写共享 \pyapi{data_y}，plot timer 只刷新图。这样采集不会阻塞 Jupyter UI，也给未来 PyQt 主线程绘图留出边界。上面的教程调用显式使用 \pyapi{live=False}，只是为了在同一个 cell 里立刻得到 completed \pyapi{scan} 并直接调用 \pyapi{scan.data\_figure.decay()}。
+\pyapi{detection_time} 默认 \pyapi{live=True}。cell 会很快返回，scan 在 frontend-owned worker 里继续跑；worker 负责采集并写共享 \pyapi{data_y}，plot timer 只刷新图。这样采集不会阻塞 Jupyter UI，也给未来 PyQt 主线程绘图留出边界。教程里保留 live scan：等图跑完或需要提前停止时，先运行 \pyapi{scan.stop()}，再在后面的 cell 里做 fit。
 
 \begin{figure}[htbp]
   \centering
@@ -424,22 +422,22 @@ scan.summary(), fit_result, popt
   \caption{detection time 与 reference-calibrated model fidelity。}
 \end{figure}
 
-\section{中断 live scan：一个对外 stop}
-长扫描对外只提供一个 stop：
+\section{停止 live scan：一个对外 stop}
+长扫描对外只提供一个 stop，完成后或需要提前中断时运行：
 \begin{codeblock}[Python]
-interrupt_scan = exp.readout.detection_time(np.linspace(0.2e-3, 20e-3, 200), shots=30)
-interrupt_scan.stop()
-interrupt_scan.summary()
+scan.stop()
+scan.summary()
 \end{codeblock}
 
 \pyapi{scan.stop()} 来自 task base class，它转发到 frontend \pyapi{RunSession.stop()}。这个 session 会设置 stop event、调用 source/device 的 \pyapi{stop()}（如果存在）、停止 plot refresh timer，并做一次 final refresh，让已采到的数据留在图和 \pyapi{scan.fidelities} 里。真实硬件接入时，device/source 的 \pyapi{stop()} 必须能打断阻塞采集，否则 Python 线程只能在当前 shot/acquire 返回后自然退出。
 
 \section{用 scan.data\_figure 做 decay fit}
-拟合前要保证数据已经采完。交互式实验里可以等 live 图跑完再执行拟合；教程和脚本里如果要立刻拟合，就把这一次 scan 设成 \pyapi{live=False}，让它在当前 cell 内采完。
+拟合前要保证数据已经采完。交互式实验里可以等 live 图跑完，再先执行上一节的 \pyapi{scan.stop()} 做 final refresh；然后在后面的 cell 里执行拟合。
 
 scan result 不应该复制 \pyapi{DataFigure} 的方法。它只暴露组成部分：\pyapi{scan.measurement} 管 lifecycle，\pyapi{scan.plot} 管显示，\pyapi{scan.data\_figure} 管 fitting/saving/post-processing。因此 decay fit 直接调用已有的 frontend fitting 栈：
 \begin{codeblock}[Python]
 fit_result, popt = scan.data_figure.decay()
+scan.summary(), fit_result, popt
 \end{codeblock}
 
 \section{reference exposure 的角色}

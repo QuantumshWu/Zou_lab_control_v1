@@ -143,25 +143,31 @@ standalone_shot.occupied.shape
 <!-- cell:markdown -->
 ## Scan detection time and fidelity
 
-`detection_time` 不使用 virtual ground truth。它先拍 long-exposure reference images，然后对每个 detection time 的 ROI count distribution 做 threshold 和 Gaussian split fidelity 估计。接口默认 `live=True`，但这里为了马上在同一个 `scan` 上做 fit，显式设成 `live=False`，让这个 cell 返回时数据已经采完。
+`detection_time` 不使用 virtual ground truth。它先拍 long-exposure reference images，然后对每个 detection time 的 ROI count distribution 做 threshold 和 Gaussian split fidelity 估计。接口默认 `live=True`；这里保留 live scan，cell 返回后 acquisition worker 和 frontend plot 会继续更新。等图跑完或想提前停止时，运行下一格 `scan.stop()`，再在后面的 cell 里做 decay fit。
 
 <!-- cell:code -->
 times = np.linspace(0.2e-3, 10e-3, 100)
-scan = exp.readout.detection_time(times, shots=30, live=False, display=True)
-fit_result, popt = scan.data_figure.decay()
-scan.summary(), fit_result, popt
+scan = exp.readout.detection_time(times, shots=30, live=True, display=True)
 
 <!-- cell:markdown -->
-## Interrupt a long live scan
+## Stop the live scan
 
-对 notebook 和未来 GUI 来说，外部只需要一个 stop：`scan.stop()`。它转发到 frontend `RunSession.stop()`，这个 session 会请求 acquisition worker/source 停止，并停止 attached plot refresh timer。已经采到的数据仍然留在 `scan.fidelities` 里，可以继续保存或做粗略诊断。
+对 notebook 和未来 GUI 来说，外部只需要一个 stop：`scan.stop()`。它转发到 frontend `RunSession.stop()`，这个 session 会请求 acquisition worker/source 停止，并停止 attached plot refresh timer。已经采到的数据仍然留在 `scan.fidelities` 里，可以继续保存、显示 summary，或在下一格做 fit。
 
 内部仍然保留 `scan.measurement`、`scan.plot`、`scan.data_figure` 这三个部件，方便 debug 或 GUI 接管；但普通实验流程不要把 stop 拆成两套 API。
 
 <!-- cell:code -->
-interrupt_scan = exp.readout.detection_time(np.linspace(0.2e-3, 20e-3, 200), shots=30, display=True)
-interrupt_scan.stop()
-interrupt_scan.summary()
+scan.stop()
+scan.summary()
+
+<!-- cell:markdown -->
+## Fit the stopped scan
+
+拟合前要保证 live scan 已经结束或已经运行过 `scan.stop()`。decay fit 直接使用 frontend 的 `DataFigure` fitting 栈。
+
+<!-- cell:code -->
+fit_result, popt = scan.data_figure.decay()
+scan.summary(), fit_result, popt
 
 <!-- cell:markdown -->
 ## Save calibration, status, and Verilog
