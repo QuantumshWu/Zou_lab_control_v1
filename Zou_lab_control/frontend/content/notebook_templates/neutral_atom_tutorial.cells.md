@@ -3,7 +3,7 @@
 
 这个 notebook 展示第一版轻量中性原子实验线路：连接 device，配置 pulse sequence，拍 camera 图，校准 sitemap，校准 threshold，探测 occupancy，最后得到 detection time 和 fidelity 曲线。
 
-第一格只做一次轻量 API 检查：正常使用时只需要 `import Zou_lab_control.frontend as zf` 和 `zf.notebook_setup()`。如果 import 失败，在项目根目录执行一次 `python -m pip install -e .` 后重启 kernel。
+第一格直接把 `..` 加入 `sys.path` / `PYTHONPATH`，然后导入 `Zou_lab_control.frontend`，不需要先安装本仓库。
 
 <!-- cell:code -->
 {{BOOTSTRAP_CELL}}

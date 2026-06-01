@@ -37,7 +37,7 @@ zf.enable_long_output()
 如果你的 bitstream 已经换成真正的 pulse-table runtime，后面只需要换 `PREPARE_COMMAND/FIRE_COMMAND` 后面的 backend；control 电脑的 notebook 不应该变。
 
 <!-- cell:code -->
-PROJECT_ROOT = Path.cwd()
+PROJECT_ROOT = Path("..").resolve()
 
 HOST = "0.0.0.0"
 PORT = 18861
@@ -93,6 +93,7 @@ PREPARE_COMMAND, FIRE_COMMAND, WAIT_DONE_COMMAND, SAFE_STATE_COMMAND
 <!-- cell:code -->
 print(fr"""
 cd "{PROJECT_ROOT}"
+$env:PYTHONPATH = (Get-Location).Path
 $env:ZLC_VIVADO_PROJECT = "{os.environ["ZLC_VIVADO_PROJECT"]}"
 $env:ZLC_VIVADO_BIT = "{os.environ["ZLC_VIVADO_BIT"]}"
 $env:ZLC_VIVADO_LTX = "{os.environ["ZLC_VIVADO_LTX"]}"

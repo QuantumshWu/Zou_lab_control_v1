@@ -9,6 +9,8 @@ description = "Jupyter plotting frontend and neutral-atom control helpers for Zo
 requires-python = ">=3.9"
 dependencies = [
     "ipython",
+    "ipympl",
+    "ipywidgets",
     "matplotlib",
     "nbformat",
     "numpy",

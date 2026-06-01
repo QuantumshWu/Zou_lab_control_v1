@@ -28,6 +28,8 @@ ENV/
 **/.ipynb_checkpoints/
 *-checkpoint.ipynb
 **/*-checkpoint.ipynb
+tutorials/_executed_check/
+**/_executed_check/
 
 # Generated local outputs
 /generated_sequences/

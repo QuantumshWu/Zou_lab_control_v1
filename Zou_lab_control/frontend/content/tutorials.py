@@ -6,10 +6,14 @@ from pathlib import Path
 import re
 
 BOOTSTRAP_CELL = r"""
-try:
-    import Zou_lab_control.frontend as zf
-except ModuleNotFoundError as exc:
-    raise ModuleNotFoundError("Install once from the project root with `python -m pip install -e .`, then restart this kernel.") from exc
+import os
+import sys
+
+PROJECT_ROOT = os.path.abspath("..")
+sys.path.insert(0, PROJECT_ROOT)
+os.environ["PYTHONPATH"] = PROJECT_ROOT
+
+import Zou_lab_control.frontend as zf
 
 zf.notebook_setup()
 """.strip()

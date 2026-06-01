@@ -46,7 +46,7 @@ def require_attrs(obj, attrs: Sequence[str], *, name: str = "object") -> None:
     raise RuntimeError(
         f"{name} is missing required API attributes: {missing}. "
         f"The loaded package is {module_path}. Run the notebook bootstrap cell, "
-        "or reinstall with `python -m pip install -e <project-root>` and restart the kernel."
+        "then restart the kernel."
     )
 
 

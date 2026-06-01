@@ -6,6 +6,9 @@
 运行前请先在 Verilog/FPGA 电脑上启动 sequencer server。推荐先打开并运行 `tutorials/neutral_atom_fpga_server.ipynb`，或者使用同等命令行：
 
 ```powershell
+cd "C:\path\to\Zou_lab_control_v1"
+$env:PYTHONPATH = (Get-Location).Path
+
 $env:ZLC_LEGACY_SINGLE_CAMERA_TRIGGER_CONFIRMED = "0"  # set to 1 only after oscilloscope confirmation
 
 python -m Zou_lab_control.neutral_atom.devices.sequencer_server `

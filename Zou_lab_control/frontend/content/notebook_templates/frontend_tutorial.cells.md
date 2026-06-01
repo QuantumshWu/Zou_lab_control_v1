@@ -1,9 +1,7 @@
 <!-- cell:markdown -->
 # Zou_lab_control.frontend tutorial
 
-这个 notebook 展示统一的 Jupyter 画图接口。第一格只做一次轻量 API 检查：正常使用时只需要 `import Zou_lab_control.frontend as zf` 和 `zf.notebook_setup()`。
-
-如果这个 import 失败，说明当前 kernel 还没有安装本仓库；在项目根目录执行一次 `python -m pip install -e .` 后重启 kernel 即可。这个安装步骤不应该反复塞进每个 notebook cell。
+这个 notebook 展示统一的 Jupyter 画图接口。第一格直接把 `..` 加入 `sys.path` / `PYTHONPATH`，然后导入 `Zou_lab_control.frontend`，不需要先安装本仓库。
 
 <!-- cell:code -->
 {{BOOTSTRAP_CELL}}

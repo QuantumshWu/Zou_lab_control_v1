@@ -1,0 +1,14 @@
+# Core runtime
+ipython
+matplotlib
+nbformat
+numpy
+rpyc
+scipy
+
+# Jupyter notebook/widget plotting
+ipykernel
+ipympl
+ipywidgets
+jupyterlab
+notebook
