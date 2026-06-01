@@ -1,0 +1,41 @@
+{
+  "trap_array": {
+    "type": "VirtualTrapArray",
+    "params": {
+      "grid_shape": [5, 7],
+      "image_shape": [96, 128],
+      "loading_probability": 0.55,
+      "atom_rate": 3000.0,
+      "background_rate": 8.0,
+      "offset_counts": 200.0,
+      "conversion_e_per_count": 0.107,
+      "read_noise_e": 0.43,
+      "dark_current_e_per_s": 0.006,
+      "detection_lifetime": 10.0,
+      "seed": 7
+    }
+  },
+  "camera": {
+    "type": "VirtualCamera",
+    "params": {
+      "trap_array": "$device:trap_array",
+      "exposure": 0.02
+    }
+  },
+  "sequencer": {
+    "type": "VirtualSequencer",
+    "params": {
+      "clock_hz": 250000000.0,
+      "channels": [
+        "trap",
+        "probe",
+        "qcm_trigger",
+        "camera_trigger",
+        "trig",
+        "cooling",
+        "pushout",
+        "microwave"
+      ]
+    }
+  }
+}

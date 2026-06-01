@@ -1,0 +1,23 @@
+{
+  "camera": {
+    "type": "QCMOSCamera",
+    "params": {
+      "config": {
+        "exposure": 0.02,
+        "readout_speed": 1,
+        "roi": [1648, 64, 1144, 64],
+        "device_index": 0,
+        "timeout_ms": 10000
+      }
+    }
+  },
+  "sequencer": {
+    "type": "ManualSequencer",
+    "params": {
+      "channels": ["trap", "cooling", "probe", "qcm_trigger"],
+      "clock_hz": 100000000.0,
+      "trigger_channels": ["qcm_trigger"],
+      "message": "qCMOS is armed. Start the FPGA trigger sequence now."
+    }
+  }
+}

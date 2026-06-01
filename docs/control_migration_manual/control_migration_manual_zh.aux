@@ -1,0 +1,166 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand*\HyPL@Entry[1]{}
+\HyPL@Entry{0<</S/r>>}
+\HyPL@Entry{1<</S/r>>}
+\def\@LN@column{1}
+\def\@LN@column{1}
+\def\@LN@column{1}
+\HyPL@Entry{4<</S/D>>}
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {chapter}{\numberline {1}阅读范围与结论}{1}{chapter.1}\protected@file@percent }
+\@writefile{lof}{\addvspace {10\p@ }}
+\@writefile{lot}{\addvspace {10\p@ }}
+\@writefile{toc}{\contentsline {section}{\numberline {1.1}这份文档只讨论什么}{1}{section.1.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {1.2}一句话总结}{1}{section.1.2}\protected@file@percent }
+\def\@LN@column{1}
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {chapter}{\numberline {2}原始 PythonCamDemo 总览}{3}{chapter.2}\protected@file@percent }
+\@writefile{lof}{\addvspace {10\p@ }}
+\@writefile{lot}{\addvspace {10\p@ }}
+\@writefile{toc}{\contentsline {section}{\numberline {2.1}目录角色}{3}{section.2.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {2.2}原始流程的状态图}{3}{section.2.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {2.3}原始代码为什么能快速推进实验}{3}{section.2.3}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {2.1}{\ignorespaces 原始 qCMOS 采集函数把 DCAM 生命周期、GUI 进程、内存保存和平均图计算放在同一个函数内。}}{4}{figure.2.1}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {2.2}{\ignorespaces 原始重排 notebook 的主线：拍图、阈值判别、规划路径、读取频率表、PXIE 执行、再次拍图验证。}}{4}{figure.2.2}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {section}{\numberline {2.4}原始代码的主要维护代价}{5}{section.2.4}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {chapter}{\numberline {3}qCMOS 原始采集逻辑}{6}{chapter.3}\protected@file@percent }
+\@writefile{lof}{\addvspace {10\p@ }}
+\@writefile{lot}{\addvspace {10\p@ }}
+\@writefile{toc}{\contentsline {section}{\numberline {3.1}交互式 qCMOS 采集函数}{6}{section.3.1}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {section}{\numberline {3.2}GUI 进程的意义和代价}{7}{section.3.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {3.3}三段式 qCMOS 接口}{7}{section.3.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {3.4}qCMOS 原始逻辑的关键隐含假设}{7}{section.3.4}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {section}{\numberline {3.5}重构对应关系}{8}{section.3.5}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {chapter}{\numberline {4}图像分析、阈值和校准文件}{9}{chapter.4}\protected@file@percent }
+\@writefile{lof}{\addvspace {10\p@ }}
+\@writefile{lot}{\addvspace {10\p@ }}
+\@writefile{toc}{\contentsline {section}{\numberline {4.1}三个旧校准文件}{9}{section.4.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {4.2}原始图像判别模型}{9}{section.4.2}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {section}{\numberline {4.3}center finder 和 ordering}{10}{section.4.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {4.4}阈值估计}{10}{section.4.4}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {chapter}{\numberline {5}重排 planner 原始逻辑}{11}{chapter.5}\protected@file@percent }
+\@writefile{lof}{\addvspace {10\p@ }}
+\@writefile{lot}{\addvspace {10\p@ }}
+\@writefile{toc}{\contentsline {section}{\numberline {5.1}早期 LSAP 重排器}{11}{section.5.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {5.2}后期 cascade pushing}{11}{section.5.2}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{lof}{\contentsline {figure}{\numberline {5.1}{\ignorespaces 原始 \textcolor {StarkFocus}{\texttt  {PythonCamDemo}} 中保存的 atom movement 结果图。它适合放在 planner 章节，因为它展示的不是单个 device call，而是拍图、判别、路径规划和 AOD move 共同作用后的实验现象。}}{12}{figure.5.1}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {5.2}{\ignorespaces 原始结果图的增强版。重构后的 run record/plot 接口要保留这种实验可读性，同时把图背后的 pulse、threshold、frequency map 和 move trace 一起保存。}}{12}{figure.5.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {5.3}planner 和 hardware move 的边界}{12}{section.5.3}\protected@file@percent }
+\def\@LN@column{1}
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {chapter}{\numberline {6}PXIE/AOD 原始控制逻辑}{14}{chapter.6}\protected@file@percent }
+\@writefile{lof}{\addvspace {10\p@ }}
+\@writefile{lot}{\addvspace {10\p@ }}
+\@writefile{toc}{\contentsline {section}{\numberline {6.1}DLL 绑定和板卡初始化}{14}{section.6.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {6.2}频率 ramp 的物理含义}{14}{section.6.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {6.3}amplitude ramp up/down}{14}{section.6.3}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {section}{\numberline {6.4}丢弃原子}{15}{section.6.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {6.5}重构对应关系}{15}{section.6.5}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {chapter}{\numberline {7}address\_switch 原始 Verilog 逻辑}{16}{chapter.7}\protected@file@percent }
+\@writefile{lof}{\addvspace {10\p@ }}
+\@writefile{lot}{\addvspace {10\p@ }}
+\@writefile{toc}{\contentsline {section}{\numberline {7.1}工程结构}{16}{section.7.1}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {7.1}{\ignorespaces \textcolor {StarkFocus}{\texttt  {address_switch}} 的核心结构：VIO 参数进入 \textcolor {StarkFocus}{\texttt  {main.v}}，再驱动 \textcolor {StarkFocus}{\texttt  {time_sequence.v}} 中的 counter-based phase logic。}}{16}{figure.7.1}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {section}{\numberline {7.2}main.v: VIO 参数桥}{17}{section.7.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {7.3}time\_sequence.v: 累计时间条件}{17}{section.7.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {7.4}debug 分支和 run 分支}{17}{section.7.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {7.5}TTL、shutter 和 DA 混在同一个时序模块}{17}{section.7.5}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {section}{\numberline {7.6}pin map 的迁移}{18}{section.7.6}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {chapter}{\numberline {8}原始逻辑的关键风险}{19}{chapter.8}\protected@file@percent }
+\@writefile{lof}{\addvspace {10\p@ }}
+\@writefile{lot}{\addvspace {10\p@ }}
+\@writefile{toc}{\contentsline {section}{\numberline {8.1}不是“代码不好”，而是边界太隐式}{19}{section.8.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {8.2}为什么必须做 preflight}{19}{section.8.2}\protected@file@percent }
+\def\@LN@column{1}
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {chapter}{\numberline {9}重构后的总架构}{21}{chapter.9}\protected@file@percent }
+\@writefile{lof}{\addvspace {10\p@ }}
+\@writefile{lot}{\addvspace {10\p@ }}
+\@writefile{toc}{\contentsline {section}{\numberline {9.1}模块边界}{21}{section.9.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {9.2}为什么没有一个大 Controller}{21}{section.9.2}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {9.1}{\ignorespaces 重构后的边界：每层只持有自己必须持有的状态，跨层只传小对象。}}{22}{figure.9.1}\protected@file@percent }
+\def\@LN@column{1}
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {chapter}{\numberline {10}实验调度：single shot}{23}{chapter.10}\protected@file@percent }
+\@writefile{lof}{\addvspace {10\p@ }}
+\@writefile{lot}{\addvspace {10\p@ }}
+\@writefile{toc}{\contentsline {section}{\numberline {10.1}事务流程}{23}{section.10.1}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {10.1}{\ignorespaces 重构后的 single shot 调度：慢动作在 camera arm 前完成，fast fire 在 armed 后执行。}}{23}{figure.10.1}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {section}{\numberline {10.2}prepare/fire 为什么是核心}{24}{section.10.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {10.3}last\_acquisition trace}{24}{section.10.3}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {chapter}{\numberline {11}PulseSequence 到 Verilog}{25}{chapter.11}\protected@file@percent }
+\@writefile{lof}{\addvspace {10\p@ }}
+\@writefile{lot}{\addvspace {10\p@ }}
+\@writefile{toc}{\contentsline {section}{\numberline {11.1}物理时序和 tick 投影分开}{25}{section.11.1}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {11.1}{\ignorespaces \textcolor {StarkBlue}{\texttt  {PulseSequence}} 先保持秒级物理语义，最后才投影成 edge tick table。}}{25}{figure.11.1}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {section}{\numberline {11.2}VerilogBuild 和 manifest}{26}{section.11.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {11.3}address\_switch 迁移}{26}{section.11.3}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {chapter}{\numberline {12}qCMOS preflight 和同步检查}{27}{chapter.12}\protected@file@percent }
+\@writefile{lof}{\addvspace {10\p@ }}
+\@writefile{lot}{\addvspace {10\p@ }}
+\@writefile{toc}{\contentsline {section}{\numberline {12.1}trigger 数}{27}{section.12.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {12.2}exposure window}{27}{section.12.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {12.3}timeout budget}{27}{section.12.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {12.4}ROI}{27}{section.12.4}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {chapter}{\numberline {13}AOD/PXIE 重构}{28}{chapter.13}\protected@file@percent }
+\@writefile{lof}{\addvspace {10\p@ }}
+\@writefile{lot}{\addvspace {10\p@ }}
+\@writefile{toc}{\contentsline {section}{\numberline {13.1}FrequencyMap}{28}{section.13.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {13.2}AODMove}{28}{section.13.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {13.3}PXIEAOD}{28}{section.13.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {13.4}VirtualAOD}{28}{section.13.4}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {chapter}{\numberline {14}frontend 在新调度中的角色}{29}{chapter.14}\protected@file@percent }
+\@writefile{lof}{\addvspace {10\p@ }}
+\@writefile{lot}{\addvspace {10\p@ }}
+\@writefile{toc}{\contentsline {section}{\numberline {14.1}array 契约}{29}{section.14.1}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {14.1}{\ignorespaces 重构后的 live 边界：采集 worker 只写 array，UI timer 才更新 Matplotlib artist。}}{29}{figure.14.1}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {section}{\numberline {14.2}为什么不让采集代码自己画图}{30}{section.14.2}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {chapter}{\numberline {15}run record 和复现}{31}{chapter.15}\protected@file@percent }
+\@writefile{lof}{\addvspace {10\p@ }}
+\@writefile{lot}{\addvspace {10\p@ }}
+\@writefile{toc}{\contentsline {section}{\numberline {15.1}record 保存什么}{31}{section.15.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {15.2}为什么不保存完整 Verilog source}{31}{section.15.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {15.3}snapshot 的意义}{31}{section.15.3}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {chapter}{\numberline {16}从旧 notebook 到新接口的迁移路线}{32}{chapter.16}\protected@file@percent }
+\@writefile{lof}{\addvspace {10\p@ }}
+\@writefile{lot}{\addvspace {10\p@ }}
+\@writefile{toc}{\contentsline {section}{\numberline {16.1}单次拍图}{32}{section.16.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {16.2}多帧 stack}{32}{section.16.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {16.3}重排}{32}{section.16.3}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {section}{\numberline {16.4}address\_switch}{33}{section.16.4}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {chapter}{\numberline {17}调试地图}{34}{chapter.17}\protected@file@percent }
+\@writefile{lof}{\addvspace {10\p@ }}
+\@writefile{lot}{\addvspace {10\p@ }}
+\@writefile{toc}{\contentsline {section}{\numberline {17.1}按症状查层}{34}{section.17.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {17.2}新增功能放哪里}{34}{section.17.2}\protected@file@percent }
+\def\@LN@column{1}
+\@writefile{toc}{\contentsline {chapter}{\numberline {18}结语}{35}{chapter.18}\protected@file@percent }
+\@writefile{lof}{\addvspace {10\p@ }}
+\@writefile{lot}{\addvspace {10\p@ }}
+\ttl@finishall
+\gdef \@abspage@last{39}

@@ -1,0 +1,542 @@
+\documentclass[11pt,oneside,openany]{book}
+\usepackage{zlc_frontend_notes}
+
+\begin{document}
+\frontmatter
+\zlctitlepage{Zou\_lab\_control.frontend 中文手册}{Jupyter / GUI 实验绘图前端}{统一 array 数据契约、live session、fit、selector 与 PDF notes}{2026-06-01}
+\tableofcontents
+\cleardoublepage
+\mainmatter
+
+
+\chapter{设计目标}
+\section{这个 front-end 解决什么问题}
+\pyapi{Zou_lab_control.frontend} 是实验控制系统和 notebook/GUI 绘图之间的薄前端层。它的核心原则是：实验逻辑只描述数据和采集，绘图层负责 figure 生命周期、固定尺寸、selector、fit、保存和 live 刷新。这样做的目的是避免把硬件控制、Jupyter 交互和 Matplotlib handle 混在一起。
+
+数据模型保持非常小：
+\begin{itemize}
+  \item \pyapi{data_x} 是形状为 \pyapi{(N, coordinate_dim)} 的坐标数组。
+  \item \pyapi{data_y} 是形状为 \pyapi{(N, channel_dim)} 的数据数组。
+  \item 一维扫描使用 \pyapi{coordinate_dim == 1}，二维扫描使用 \pyapi{coordinate_dim == 2}。
+  \item 未完成的数据用 \pyapi{NaN} 表示；front-end 可以用有限值数量推断进度。
+\end{itemize}
+
+\begin{notebox}[线程边界]
+在 Jupyter 中，绘图刷新依赖 notebook 的事件循环；在未来 PyQt 中，Qt/Matplotlib 绘图同样必须留在主线程。阻塞式硬件采集因此不能直接跑在 UI 线程里。\pyapi{zf.run} 的设计就是把采集 handle 放进 session 内部 worker，而 plot 仍然只在前端 timer 中读取 array。
+\end{notebox}
+
+\section{两条公开路径}
+\begin{description}
+  \item[\pyapi{zf.plot}] 用于已有 array。它不会采集，只把 \pyapi{data_x/data_y} 画出来，并返回稳定的 plot handle。
+  \item[\pyapi{zf.run}] 用于阻塞式采集 handle。它创建或接收 \pyapi{data_y}，内部启动 worker，前端 timer 刷新同一份数据。
+\end{description}
+
+\begin{codeblock}[Python]
+pl = zf.plot(data_x, data_y, labels=("X", "Y", "Counts"))
+scan = zf.run(data_x, measure, labels=("X", "Y", "Counts"))
+\end{codeblock}
+
+\chapter{内部架构与数据流}
+\section{模块分层}
+frontend 现在分成几层，每层只做一类事情。理解这个分层比记住每个参数更重要，因为以后接 PyQt 或新增实验图形时，应该尽量只替换对应层。
+
+\begin{description}
+  \item[\filepath{style.py}] 保存 Confocal\_GUIv2 派生出来的 Matplotlib rcParams、字体和 notebook 输出样式。
+  \item[\filepath{canvas.py}] 管 figure 生命周期、固定像素数据区、cell rerun 清理、ipympl canvas 显示。
+  \item[\filepath{live.py}] 定义 plotter：\pyapi{Live1D}、\pyapi{Live2DDis}、\pyapi{LiveLiveDis}、\pyapi{HistogramFigure}，负责 artist 初始化和增量更新。
+  \item[\filepath{selectors.py}] 定义交互工具和 figure 共享状态：area、crosshair、zoom/pan、drag line。
+  \item[\filepath{data_figure.py}] 定义拟合、单位切换、保存和后处理入口。
+  \item[\filepath{_watcher.py}] 定义 frontend timer watcher，只在 UI 侧定期读取 array 并刷新 artist。
+  \item[\filepath{session.py}] 定义 \pyapi{RunSession}，把阻塞式采集 handle 放到 session worker 里。
+  \item[\filepath{notes.py}] 定义 XeLaTeX notes/manual 生成接口。
+\end{description}
+
+\begin{codeblock}[Architecture]
+hardware/source handle
+    -> RunSession worker thread
+        -> writes data_y under RLock
+        -> updates points_done
+
+Matplotlib/Jupyter/PyQt UI thread
+    -> ArrayWatcher timer
+        -> snapshots data_y and points_done
+        -> plot.update(...)
+        -> artists, selectors, DataFigure
+\end{codeblock}
+
+这里最关键的一点是：\tfocus{采集线程永远不碰 Matplotlib artist}。采集线程只写 \pyapi{data_y} 和 \pyapi{points_done}；UI timer 才调用 \pyapi{plot.update}。这就是以后切换 PyQt 时还能保留大部分实验逻辑的原因。
+
+\section{真正需要守住的状态所有权}
+frontend 表面上只有 \pyapi{plot} 和 \pyapi{run}，内部其实是在管理几类寿命完全不同的状态。很多 notebook 绘图 bug 都来自这些状态被放错地方。
+
+\begin{description}
+  \item[\pyapi{data_x/data_y}] 是实验数据状态。它可以被已有 array 提供，也可以由 \pyapi{RunSession} 创建并逐行填充；plotter 只读取它，不拥有硬件。
+  \item[\pyapi{points_done/done_event/error}] 是采集进度状态。它属于 \pyapi{RunSession}，解决的是“array 里哪些点语义上已经完成”和“worker 是否失败”。
+  \item[\pyapi{fig/ax/artist}] 是显示状态。它属于 plotter 和 canvas，必须留在 UI 事件循环里，不能被硬件 worker 改。
+  \item[\pyapi{fig._zlc_tools}] 是交互 callback 的寿命状态。Matplotlib selector、drag line 和 crosshair 如果没有强引用会被垃圾回收；如果 cell rerun 不销毁旧工具，又会留下幽灵 callback。
+  \item[\pyapi{fig._zlc_state}] 是交互工具读取数据的共享快照。selector 和 \pyapi{DataFigure} 不应该直接猜 plotter 内部字段，而是通过这个轻量 state 拿最新 grid、labels、axes 和 data handle。
+\end{description}
+
+\begin{notebox}[为什么这些状态不能合成一个大对象]
+一个巨大 controller 看起来能少传参数，但会让硬件 worker、Matplotlib artist、selector callback 和 experiment result 互相持有。旧 GUI 难重构的根本原因就在这里。现在每层只持有自己的状态：worker 写数据，watcher 刷新图，selector 读 figure state，DataFigure 做后处理。出了问题时，先看是哪类状态不对，再进对应文件。
+\end{notebox}
+
+\section{一次 live update 的完整时序}
+维护 live 图时，最容易误判的是“图为什么没有边采边画”。下面这条时序是实际实现，不是概念图：
+\begin{enumerate}
+  \item 用户调用 \pyapi{zf.run(data_x, source, ...)}。这里的 \pyapi{source} 可以是函数，也可以是带 \pyapi{measure/read/acquire/next} 方法的对象。
+  \item \pyapi{RunSession._prepare_arrays} 把输入标准化成 \pyapi{data_x: (N,d)} 和 \pyapi{data_y: (N,c)}；如果是 histogram，\pyapi{run(500, source, kind="hist")} 会把 500 理解成 shot 数，并创建一列 \pyapi{NaN}。
+  \item session 先调用内部 \pyapi{plot(..., update="watch")}。这一步会立刻创建 figure、axes、artist、selector 和 \pyapi{ArrayWatcher}，所以用户应该先看到一张空图或已有数据图。
+  \item \pyapi{RunSession.start} 开一个 session 自己持有的 daemon worker。worker 进入 append 或 roll 循环，每次只做三件事：读 source、写 \pyapi{data_y}、更新 \pyapi{points_done}。
+  \item \pyapi{ArrayWatcher} 用当前 Matplotlib canvas 的 timer 周期性执行 \pyapi{refresh}。它在同一个 lock 里读取 \pyapi{data_y} snapshot 和 \pyapi{points_done}，再调用 \pyapi{plot.update(...)}。
+  \item \pyapi{plot.update} 不重建 figure，只进入对应 plotter 的 \pyapi{update_core}：一维改 line data，二维改 image array 和 side distribution，histogram 改 bars、fit line 和 threshold 文本。
+  \item worker 结束后设置 \pyapi{done_event}。watcher 下一次 refresh 会做最后一次完整 snapshot，然后 stop，并在需要时创建 \pyapi{DataFigure}。
+\end{enumerate}
+
+这条链里有两个细节很关键。第一，\pyapi{RunSession} 的异常不会从 timer callback 里冒出来，而是存在 \pyapi{session.error}；notebook 用户不需要等待 worker，只需要看图、必要时检查 \pyapi{session.error}。第二，图如果“等采完才出现”，常见原因不是 session 没开线程，而是 source 太快，或者 notebook cell 自己在后面用 busy loop/阻塞等待占住了 kernel，让前端 timer 没机会跑。
+
+\section{几个关键实现为什么不能随便简化}
+frontend 里有几处实现看起来只是“工程细节”，但实际上是在保护 notebook 和未来 GUI 后端的边界。
+
+\begin{description}
+  \item[\pyapi{RunSession._read_value}] 不是为了炫技式地猜签名，而是为了让硬件对象保持自然接口。一个计数器可以只有 \pyapi{read()}，一个扫描设备可以有 \pyapi{measure(point)}，一个二维平台可以有 \pyapi{measure(x, y)}，它们都不需要额外写 wrapper。session 会按 \pyapi{(point, index)}、\pyapi{(x, y, index)}、\pyapi{(x, y)}、\pyapi{(point)}、\pyapi{(index)} 和 \pyapi{()} 这些候选形式尝试绑定；真正采集时 worker 只看到“读一个值”这个动作。
+  \item[\pyapi{data_y + points_done + lock}] 是 live plot 的最小共享状态。只用 \pyapi{NaN} 推断进度在静态图和简单 live 中很好用，但采集线程和 UI timer 并发时，进度和 array 必须作为一个 snapshot 读取。否则二维图很容易出现最后一两个点已经写进 array，但 watcher 读到的完成点数还停在旧值，最终要点一下图才刷新。
+  \item[\pyapi{plot.update_core}] 只改已有 artist。Matplotlib 在 Jupyter widget backend 下重建 axes、colorbar 或 selector callback 的成本高，而且容易留下旧 callback。因此一维只改 line，二维只改 image/side distribution，histogram 只改 bar vertices、fit line、threshold text。fit、保存和单位切换全部放进 \pyapi{DataFigure}，不进入 timer 主路径。
+  \item[\pyapi{fig._zlc_tools} 与 \pyapi{fig._zlc_state}] 分别解决“callback 活多久”和“selector 读哪份数据”。前者保存强引用并在 cell rerun 时销毁旧工具；后者保存最新 grid、axes、labels、selector 范围和 data handle。二维 live 每次更新后都要刷新 state，否则 crosshair 或 fit 读到的是上一帧的坐标映射。
+  \item[\pyapi{DragVLine}] 管 threshold 拖动，而不是让 area selector 自己判断。拖动 orange threshold 时会临时关掉 area selector，释放后恢复；这样 histogram 的阈值线、区域选择和双峰拟合文本可以共存，而不是互相抢鼠标事件。
+\end{description}
+
+\begin{notebox}[改 live 代码时的自检顺序]
+先确认 \pyapi{RunSession} 是否立即返回并创建空图；再确认 worker 是否只写 array 和 \pyapi{points_done}；然后看 \pyapi{ArrayWatcher._snapshot_and_points} 是否同锁读取；最后看对应 plotter 的 \pyapi{update_core} 是否只改 artist 而不重建 figure。这个顺序基本覆盖了“只显示最终图”“最后点缺失”“selector 读旧数据”和“cell 重跑后交互异常”四类问题。
+\end{notebox}
+
+\section{源码修改时最该保护的地方}
+这部分是给以后改代码的人看的。frontend 看起来只是画图，但有几处小实现是在处理 notebook 绘图的坑，改坏后现象会很怪：
+\begin{itemize}
+  \item \pyapi{new_figure} 只关闭同一个 cell 上一次 run 留下的 figure。不要改成全局关图，否则一个 cell 会误杀另一个 live 图。
+  \item \pyapi{fig._zlc_tools} 是强引用。Matplotlib widget callback 如果没有被保存，很容易被垃圾回收；如果 cell rerun 时没有 destroy，又会留下旧 callback。
+  \item \pyapi{fig._zlc_state} 是 selector/DataFigure 的轻量共享状态。二维图每次 \pyapi{update_core} 后都要重新安装 state，否则 crosshair 读到的 grid 会是旧的。
+  \item \pyapi{ArrayWatcher._snapshot_and_points} 必须同时读数据和进度。分开读会产生“最后两个点要点一下图才出现”这类 race。
+  \item \pyapi{HistogramFigure} 的 threshold 线是 \pyapi{DragVLine} 管的；拖动时会暂时关闭 area selector，释放后恢复。否则拖 threshold 会顺手画出一个区域选择框。
+  \item \pyapi{DataFigure} 不应该进入 live timer 主路径。fit 可以慢，可以失败，可以画额外 artist；live update 必须保持成轻量的 \pyapi{update_core}。
+\end{itemize}
+
+\begin{notebox}[判断问题属于哪一层]
+如果 figure 尺寸或 colorbar 挤压不对，看 \filepath{canvas.py}；如果数据明明写进 array 但图不动，看 \filepath{_watcher.py} 和 lock；如果图动但 selector/fitting 读到旧数据，看 \pyapi{fig._zlc_state}；如果采集没有边跑边画，看 \filepath{session.py} 和调用 cell 是否阻塞了 notebook 事件循环。
+\end{notebox}
+
+\section{关键不变量}
+这套 frontend 里有几条不变量比具体 class 名更重要。只要这些不变量保持住，Jupyter、未来 PyQt GUI、真实硬件和 virtual device 就可以共用同一套实验逻辑；如果这些不变量被破坏，问题通常会表现成 live 卡住、最后几个点不刷新、selector 读到旧坐标、或者 notebook 重跑后出现多个旧 callback。
+
+\begin{enumerate}
+  \item \tfocus{公开数据契约只有 \pyapi{data_x/data_y}}。\pyapi{data_x} 描述坐标，\pyapi{data_y} 描述测量值；静态图和 live 图的区别只是 \pyapi{data_y} 是否正在从 \pyapi{NaN} 逐步变成有限值。
+  \item \tfocus{artist 只初始化一次}。\pyapi{init_core} 创建 line、image、PolyCollection、text、drag line；\pyapi{update_core} 只用 \pyapi{set_data}、\pyapi{set_array}、\pyapi{set_verts}、\pyapi{set_xdata/ydata} 改已有 artist。live 过程中不要重新 \pyapi{plot} 或重建 axes。
+  \item \tfocus{UI 更新只发生在 UI timer}。采集 worker 不能碰 \pyapi{fig}、\pyapi{ax}、Matplotlib artist 或 selector；它只能写 array 和进度。未来 PyQt 也必须保持这个边界。
+  \item \tfocus{\pyapi{points_done} 和 array snapshot 要一起读}。最后几个点缺失通常不是 fit 或 imshow 的问题，而是进度和数据在不同时间点被读到了。当前 \pyapi{ArrayWatcher} 用同一个 lock 读 snapshot 和 progress，就是为了解决这个 race。
+  \item \tfocus{selector 状态挂在 figure 上}。\pyapi{fig._zlc_tools} 防止 callback 被垃圾回收；\pyapi{fig._zlc_state} 给 crosshair、zoom reset、DataFigure 读取最新 grid/axes 信息。更新图像数据后必须重新安装最新 state。
+  \item \tfocus{\pyapi{DataFigure} 是后处理 handle，不是 plotter 本体}。fit、保存、单位切换、area selection 都通过它做；plotter 只负责显示和增量刷新。这样 live 刷新路径不会被拟合逻辑拖复杂。
+\end{enumerate}
+
+\begin{notebox}[为什么不让硬件直接拿 plot handle]
+让硬件代码直接调用 \pyapi{plot.update_point} 看起来简单，但它会把采集时序、GUI 主线程约束和 artist 生命周期绑死。现在的设计只让硬件暴露阻塞式 \pyapi{read/measure/acquire}，由 \pyapi{RunSession} 负责 worker 和停止逻辑；plotter 只看 array。这是为了让同一段实验逻辑以后能同时服务 notebook、PyQt 和 virtual-device 测试。
+\end{notebox}
+
+\section{\pyapi{plot} 和 \pyapi{run} 的关系}
+\pyapi{zf.plot} 和 \pyapi{zf.run} 不是两套绘图接口。两者最后都落到同一批 plotter class，区别只在谁拥有采集生命周期：
+\begin{itemize}
+  \item \pyapi{plot(data_x, data_y)}：调用者已经有 array，frontend 只负责画。
+  \item \pyapi{run(data_x, source)}：调用者有阻塞采集 handle，frontend 创建或接管 \pyapi{data_y}，并拥有 worker、timer、停止逻辑。
+\end{itemize}
+
+这也是为什么 \pyapi{run} 返回的 \pyapi{RunSession} 会透传很多 plot 属性：\pyapi{session.fig}、\pyapi{session.ax}、\pyapi{session.data_figure} 实际上来自内部的 \pyapi{session.plot}。用户面向的是一个对象，但内部仍然保留清晰分层。
+
+\section{RunSession 状态机和错误传播}
+\pyapi{RunSession} 看起来像一个 plot handle，其实内部更像一个很小的采集状态机。这个状态机不拥有硬件语义，只拥有“什么时候开始读、读到哪里、什么时候停止、错误放在哪里”。
+
+\begin{codeblock}[RunSession state]
+created
+  -> plot-created / watcher-started
+  -> worker-running
+      -> write one row under lock
+      -> points_done += 1
+      -> repeat / roll
+  -> done-event set
+  -> watcher final refresh
+  -> stopped
+\end{codeblock}
+
+\pyapi{source} 抛出的异常不会跨线程直接打断 notebook cell，也不会从 Matplotlib timer callback 里弹出。worker 会把异常保存到 \pyapi{session.error}，设置 done event，并让 watcher 有机会做最后一次 refresh。这样 UI 侧和硬件侧的错误通道是分开的：硬件失败看 \pyapi{session.error}；图没刷新看 watcher/timer/lock；fit 失败看 \pyapi{DataFigure}。
+
+这里也故意没有把 \pyapi{wait()} 做成普通用户接口。等待 worker 会鼓励 notebook cell 阻塞当前 kernel，而 Jupyter/ipympl 的 live 刷新正依赖这个事件循环。需要停止时调用 \pyapi{session.stop()}；需要连续 monitor 时用 \pyapi{stop_when_full=False} 让 session 一直滚动，实验结束再 stop。测试代码可以用私有同步方式验证结果，但这不是实验脚本和未来 GUI 应该依赖的接口。
+
+\section{Figure 生命周期和固定尺寸}
+Jupyter 里常见的问题是同一 cell 反复运行后旧 selector 还活着、figure 尺寸被 colorbar 或 side axes 撑变、HiDPI canvas 第一次显示空白。这里的解决办法集中在 \filepath{canvas.py}：
+\begin{itemize}
+  \item \pyapi{FigureSpec} 用 \pyapi{data_px}、\pyapi{margins_px} 和 \pyapi{dpi} 描述逻辑像素尺寸。
+  \item \pyapi{new_figure} 读取 notebook 的 \pyapi{cellId} 和 message id，只关闭同一个 cell 上一次运行留下的 figure。
+  \item \pyapi{create_axes_fixed} 用 Matplotlib \pyapi{Divider} 和 \pyapi{Size.Fixed} 创建固定数据区，而不是依赖 \pyapi{subplots_adjust} 这种比例式布局。
+  \item \pyapi{split_axes_horizontally} 只在固定数据区内部切分 side distribution 和 colorbar，因此主图尺寸不随附加 axes 改变。
+  \item \pyapi{display_figure} 在 ipympl backend 下隐藏工具栏、设置 scroll capture，并尽量继承已知的 device pixel ratio。
+\end{itemize}
+
+\begin{notebox}[为什么不用普通 subplot]
+普通 \pyapi{plt.subplots} 的 axes 位置是 figure 比例坐标。加入 colorbar、tight layout、notebook 前端缩放之后，真正数据区域会漂移。实验 scan 需要比较不同图之间的 spot size、ROI 和 selector 坐标，所以固定的是数据 box，而不是整张 figure 的外框。
+\end{notebox}
+
+\chapter{安装与 notebook 使用}
+\section{安装}
+推荐在仓库根目录执行 editable install。这样 notebook 不需要手动修改 \pyapi{sys.path}。
+
+\begin{shellblock}
+python -m pip install -e .
+\end{shellblock}
+
+如果当前 notebook kernel 已经 import 过旧版本包，修改源码后需要 restart kernel。Python 已加载的模块对象不会自动更新。
+
+\section{Jupyter 初始化}
+\begin{codeblock}[Python]
+import numpy as np
+import matplotlib.pyplot as plt
+
+import Zou_lab_control.frontend as zf
+
+zf.use_widget_backend()
+zf.enable_long_output()
+zf.apply_style()
+\end{codeblock}
+
+\section{核心数据契约}
+所有 array plot 都走同一个契约：
+\[
+  \mathrm{data\_x}\in\mathbb{R}^{N\times d},\qquad
+  \mathrm{data\_y}\in\mathbb{R}^{N\times c}.
+\]
+其中 \pyapi{N} 是点数，\pyapi{d} 是坐标维度，\pyapi{c} 是通道数。一维扫描用 \pyapi{d=1}，二维扫描用 \pyapi{d=2}。如果传入一维数组，内部会标准化成 \pyapi{(N, 1)}；如果 \pyapi{data_y is None}，内部会创建全 \pyapi{NaN} 的 \pyapi{(N, 1)} array。
+
+这个契约有三个实际好处：
+\begin{itemize}
+  \item 静态图和 live 图不分两套输入；live 只是逐步把 \pyapi{NaN} 变成有限值。
+  \item 多通道一维线图天然支持 \pyapi{data_y[:, channel]}。
+  \item 二维 scan 不要求方形矩阵输入，实验控制只需要维护一张点表。
+\end{itemize}
+
+\begin{notebox}[进度推断]
+如果外部没有提供 \pyapi{points_done}，watcher 会用 \pyapi{data_y[:, 0]} 里有限值的数量推断进度。因此当前版本默认把第一列当作主通道；如果以后需要“点有效但值可以是 NaN”的实验，需要增加显式 valid mask，而不是继续复用 NaN 语义。
+\end{notebox}
+
+\chapter{静态绘图接口}
+\section{一维扫描}
+\pyapi{zf.plot} 会根据 \pyapi{data_x} 的第二维自动选择一维或二维图。下面是一维光谱扫描和 Lorentzian fit 的例子。
+
+\begin{codeblock}[Python]
+x = np.linspace(737.0, 737.2, 301).reshape(-1, 1)
+y = signal.reshape(-1, 1)
+
+ple = zf.plot(
+    x,
+    y,
+    labels=("Wavelength (nm)", "Counts/0.1s", "Counts"),
+    relim_mode="tight",
+)
+fit_result, popt = ple.data_figure.lorent()
+\end{codeblock}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.82\textwidth]{assets/frontend_1d_fit.pdf}
+  \caption{一维扫描、固定尺寸 notebook figure、以及 \pyapi{DataFigure.lorent} 拟合标注。}
+\end{figure}
+
+\section{二维扫描}
+二维扫描不要求方形网格，也不要求按行顺序采集。只要 \pyapi{data_x} 中每行是一个 \pyapi{(x, y)} 坐标，front-end 就会把 \pyapi{data_y} 填回图像网格。
+
+\begin{codeblock}[Python]
+SX, SY = np.meshgrid(scan_x_axis, scan_y_axis)
+data_x = np.column_stack([SX.ravel(), SY.ravel()])
+data_y = counts.ravel().reshape(-1, 1)
+
+pl_map = zf.plot(data_x, data_y, labels=("X (um)", "Y (um)", "Counts"))
+pl_map.data_figure.center()
+\end{codeblock}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.80\textwidth]{assets/frontend_2d_scan.pdf}
+  \caption{二维 scan 图像、右侧分布、colorbar 和可拖动 color limit。}
+\end{figure}
+
+\section{二维网格映射}
+\pyapi{Live2DDis} 不把二维数据要求成 \pyapi{Z.shape == (ny, nx)}，而是从点表恢复网格：
+\begin{itemize}
+  \item \pyapi{x_array = np.unique(data_x[:, 0])}，\pyapi{y_array = np.unique(data_x[:, 1])}。
+  \item \pyapi{data_shape = (len(y_array), len(x_array))}，所以非方形 scan 天然支持。
+  \item \pyapi{fill_grid} 遍历每个 \pyapi{(x, y), z}，用 \pyapi{np.searchsorted} 找到对应像素，填入 \pyapi{grid[iy, ix]}。
+  \item \pyapi{imshow} 使用由坐标间隔估计出来的 \pyapi{extent}；如果 \pyapi{square=True}，坐标范围会补边成正方形视野，但数据矩阵本身不需要正方形。
+\end{itemize}
+
+这种实现允许硬件按任意顺序采集点，只要坐标来自同一组离散 grid。需要注意的是，它不是三角剖分或插值绘图；如果坐标带随机 jitter，应该先在实验逻辑里 round 到真实 grid，或者以后新增一个专门的 irregular map plotter。
+
+\begin{notebox}[为什么不能简单 reshape]
+二维 scan 的自然数据结构是点表，不是正方形矩阵。把 \pyapi{data_y} 按 \pyapi{sqrt(N)} 或某个固定 \pyapi{ny,nx} 直接 reshape，会把非方形 scan、蛇形 scan、随机顺序 scan 和缺点 scan 全部搞错。当前 \pyapi{fill_grid} 只相信 \pyapi{data_x} 里的真实坐标，\pyapi{NaN} 仍然留成空像素；这也是 live 过程中最后点、缺点和 mask 能被统一处理的原因。
+\end{notebox}
+
+\section{plotter 初始化和更新}
+每个 plotter 的生命周期都很短：
+\begin{enumerate}
+  \item \pyapi{show}：应用 style、创建 fixed-size axes、调用 \pyapi{init_core} 初始化 artist、安装 \pyapi{PlotState}、绑定 selector、display。
+  \item \pyapi{update}：标准化新的 \pyapi{data_y}、更新 \pyapi{points_done}、调用 \pyapi{update_core} 改已有 artist、重新安装最新 \pyapi{PlotState}、draw。
+  \item \pyapi{after_plot/to_data_figure}：在需要 fit/save 时创建 \pyapi{DataFigure}。
+\end{enumerate}
+
+这里刻意不在更新时重画整张 figure。live 刷新的关键是“artist 保持不变，只改数据”：一维改 line data，二维改 image array 和 side histogram vertices，histogram 改 PolyCollection vertices 和 threshold line 位置。
+
+\chapter{Live 采集接口}
+\section{为什么是 \pyapi{zf.run}}
+如果调用者自己填 array，在 Jupyter 中勉强可行；但在 PyQt 架构里，调用出的 GUI 主循环会阻塞调用栈，调用者不能再一边填 array 一边保持 UI 响应。因此 live 采集必须由一个 session/controller 接管：调用者只传普通阻塞采集函数或硬件对象。
+
+\begin{codeblock}[Python]
+def measure_scan(point):
+    x, y = point
+    return hardware.read_at(x, y)
+
+scan = zf.run(
+    data_x,
+    measure_scan,
+    labels=("X", "Y", "Counts"),
+    update_time=0.05,
+)
+\end{codeblock}
+
+\pyapi{zf.run} 立即返回 \pyapi{RunSession}，不会等待采集结束。session 暴露 \pyapi{stop}、\pyapi{data_x}、\pyapi{data_y}、\pyapi{plot}、\pyapi{fig}、\pyapi{ax}、\pyapi{data_figure} 等常用属性。
+
+\section{函数签名匹配}
+source 可以是普通函数，也可以是有 \pyapi{read}、\pyapi{measure}、\pyapi{acquire} 或 \pyapi{next} 方法的对象。session 会按坐标维度尝试调用：
+\begin{itemize}
+  \item 一维：\pyapi{source(point)} 或 \pyapi{source(point, index)}。
+  \item 二维：\pyapi{source(point)}，其中 point 是 \pyapi{np.ndarray([x, y])}；也支持 \pyapi{source(x, y)}。
+  \item monitor/hist：可使用无参数 \pyapi{source()}。
+\end{itemize}
+
+\section{RunSession 内部机制}
+\pyapi{RunSession} 做四件事：
+\begin{enumerate}
+  \item \pyapi{_prepare_arrays} 把输入变成统一的 \pyapi{data_x/data_y}。histogram 是特殊情况：\pyapi{run(200, source, kind="hist")} 表示创建 200 个 shot 的 \pyapi{data_y}。
+  \item 构造内部 \pyapi{plot(..., update="watch")}，让 plotter 先显示出来，并启动 \pyapi{ArrayWatcher}。
+  \item \pyapi{start} 创建一个 daemon worker thread。这个线程只调用硬件 handle，并在 \pyapi{RLock} 保护下写 \pyapi{data_y} 和 \pyapi{points_done}。
+  \item \pyapi{stop} 设置 stop event、尝试调用 \pyapi{source.stop()}、停止 watcher，并让 session 状态进入 done。
+\end{enumerate}
+
+\pyapi{_read_value} 的签名适配是有意做宽的：它先找 \pyapi{source} 自己是否 callable，否则查找 \pyapi{measure/read/acquire/next}；然后用 \pyapi{inspect.signature(...).bind(...)} 尝试 \pyapi{(point, index)}、\pyapi{(x, y, index)}、\pyapi{(x, y)}、\pyapi{(point)}、\pyapi{(index)} 和 \pyapi{()}。这样硬件类可以保持自然写法，不需要为了 frontend 包一层胶水函数。
+
+\section{ArrayWatcher 和最后一点数据}
+\pyapi{ArrayWatcher} 是前端侧刷新器，不是采集器。它使用当前 Matplotlib backend 的 canvas timer，所以在 Jupyter widget backend 或未来 Qt backend 下，回调都发生在 UI 事件循环里。
+
+watcher 每次 refresh 会在同一个 lock 里同时拿到 \pyapi{data_y} snapshot 和 \pyapi{points_done}。这个细节很重要：如果先读进度再读 array，worker 可能刚好写入下一点，导致图上缺最后一个或两个点；如果先读 array 再读进度，又可能把未完成点当成完成点。当前实现把 snapshot 和 progress 合并在同一个内部调用里，\pyapi{done} 时还会在 \pyapi{copy=True} 情况下再读一次，保证最终画面完整。
+
+\begin{codeblock}[Internal]
+data, points_done = watcher._snapshot_and_points()
+\end{codeblock}
+
+\begin{notebox}[Jupyter live 的限制]
+\pyapi{zf.run} 不需要用户写线程，也没有 \pyapi{wait}。但如果 source 是纯 Python CPU-heavy 循环并长期持有 GIL，notebook UI 仍可能不够流畅。真实硬件读取通常会阻塞在 IO 或驱动调用上，GIL 会有机会让 UI timer 执行；如果某个模拟 source 过快，采集可能在第一帧 timer 前就结束，这时看到的是最终图而不是慢过程。
+\end{notebox}
+
+\section{\pyapi{run} 参数组织}
+\pyapi{run} 的参数分两类：
+\begin{itemize}
+  \item session 参数：\pyapi{mode}、\pyapi{max_points}、\pyapi{autostart}、\pyapi{stop_when_full}、\pyapi{update_time}、\pyapi{copy_on_refresh}。
+  \item plot 参数：\pyapi{cmap}、\pyapi{bad_color}、\pyapi{thresholds}、\pyapi{bins}、\pyapi{relim_mode} 等。
+\end{itemize}
+为了以后接口更干净，plot 类型相关参数推荐放进 \pyapi{plot_options} 字典；顶层 \pyapi{**plot_kwargs} 仍然保留，是为了 notebook 里少写字和兼容已有调用。
+
+这些 lifecycle 参数会故意做严格检查：\pyapi{update_time} 和 \pyapi{watch_interval} 必须是有限正数，\pyapi{max_points} 和 histogram shot 数必须是真正的正整数，\pyapi{autostart/display/stop_when_full/copy_on_refresh/copy/done} 必须是真正的布尔值。这里不接受 \pyapi{"False"}、\pyapi{True} 当作 \pyapi{1} 或 \pyapi{1.0}，因为 live session 一旦启动 worker，再发现参数语义错了就很难判断问题在采集、timer 还是 plotter。早失败可以保证 bad input 在打开硬件或启动刷新之前停住。
+
+\section{连续 monitor}
+\begin{codeblock}[Python]
+def read_count():
+    return counter.read()
+
+monitor = zf.run(
+    np.arange(200),
+    read_count,
+    kind="monitor",
+    mode="roll",
+    stop_when_full=False,
+    labels=("Recent shots", "Counts/shot", "Counts"),
+)
+
+# 实验结束时停止
+monitor.stop()
+\end{codeblock}
+
+\chapter{Histogram 和阈值判别}
+\section{双峰拟合和 threshold}
+\pyapi{kind="hist"} 面向中性原子状态判别。橙色 threshold 线可以拖动；右上角文本显示当前 threshold、根据双峰 Gaussian 拟合估计的 fidelity、实际数据按当前 threshold 分开的左右比例，以及 \pyapi{fit cut}。
+
+\begin{notebox}[fit cut 是什么]
+\pyapi{fit cut} 是双峰 Gaussian 拟合后两条 Gaussian 曲线的交点。它是拟合模型建议的切分点；真正当前使用的切分线仍然是橙色 \pyapi{th}，也就是你拖动的位置。
+\end{notebox}
+
+\section{双峰 Gaussian 拟合细节}
+histogram 的拟合不是直接 fit 每个 shot，而是 fit 直方图 bin center 上的 counts：
+\[
+  f(x)=A_0e^{-(x-\mu_0)^2/(2\sigma_0^2)}+
+       A_1e^{-(x-\mu_1)^2/(2\sigma_1^2)} .
+\]
+初值用当前有限数据的 median 分成左右两组，分别估计 \pyapi{mu} 和 \pyapi{sigma}；如果某一侧点数太少，就退回到按顺序一分为二。fit 完成后会强制让 \pyapi{mu0 < mu1}，避免左/右态标签交换。
+
+\pyapi{fit cut} 的计算方式是在 \pyapi{mu0} 到 \pyapi{mu1} 之间取密集采样点，找到两条 Gaussian 差值最小的位置。这个值只作为模型建议，不会自动覆盖用户拖动的 threshold。
+
+fidelity 用当前 threshold 估计：
+\[
+  F = \frac{w_0 P_0(x\le t)+w_1 P_1(x>t)}{w_0+w_1},
+  \qquad w_i = |A_i\sigma_i| .
+\]
+这里 \pyapi{P0} 和 \pyapi{P1} 由 Gaussian CDF 计算，\pyapi{L/R} 百分比则直接由真实 shot 数据按当前 threshold 统计。因此 \pyapi{fit F} 和 \pyapi{L/R} 回答的是两个不同问题：前者是模型认为这条 cut 的状态判别正确率，后者是实际数据被分到左右两边的比例。
+
+\begin{codeblock}[Python]
+hist = zf.plot(
+    shots,
+    kind="hist",
+    labels=("ROI counts", "Shots", "Population"),
+    thresholds=[45],
+    bins=55,
+)
+
+hist.fractions()
+hist.set_thresholds([50])
+\end{codeblock}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.78\textwidth]{assets/frontend_histogram.pdf}
+  \caption{带可拖 threshold、双峰 Gaussian 拟合和 fidelity 文本的 histogram。}
+\end{figure}
+
+\chapter{Selector 与 DataFigure}
+\section{交互工具}
+每个 plot handle 都保留稳定引用：
+\begin{itemize}
+  \item \pyapi{plot.area}：左键矩形区域选择。
+  \item \pyapi{plot.cross}：右键 crosshair，连续右键两次清除。
+  \item \pyapi{plot.zoom}：滚轮缩放，中键拖动平移。
+  \item \pyapi{plot.drag}：二维 color limit 或 histogram threshold 的拖动器。
+\end{itemize}
+
+拖动 histogram threshold 时，area selector 会临时关闭，避免误触发区域选择。
+
+\section{selector 状态模型}
+Matplotlib widget 和 event callback 很容易被 Python 垃圾回收，或者在 cell rerun 后留下旧 callback。frontend 用两个 figure 属性解决这个问题：
+\begin{itemize}
+  \item \pyapi{fig._zlc_tools} 保存 \pyapi{InteractionBundle} 的强引用，里面有 area、cross、zoom、drag。
+  \item \pyapi{fig._zlc_state} 保存当前 plot 的轻量状态，例如一维 \pyapi{x_array/y_array}、二维 \pyapi{grid}、side distribution axes、colorbar axes 和 square extent。
+\end{itemize}
+
+\pyapi{AreaSelector} 只响应左键矩形；\pyapi{CrossSelector} 只响应右键，并同时兼容 Matplotlib 的 \pyapi{event.dblclick} 和两次右键时间间隔小于 \pyapi{0.35 s} 的情况，所以在 Jupyter/ipympl 里右键两次也能清掉 crosshair。二维图的 crosshair 会从 \pyapi{fig._zlc_state.grid} 读最近像素的 z 值，并在右侧分布图上加一条淡线。
+
+\pyapi{DragVLine} 用于 histogram threshold。按下 threshold 附近时，它会设置一个 disable-area 标记，并暂时把 area selector inactive；释放鼠标后再恢复 area selector。这样拖 threshold 不会顺手创建一个讨厌的矩形区域。
+
+\begin{codeblock}[Internal]
+fig._zlc_disable_area_once = True
+\end{codeblock}
+
+\section{拟合与保存}
+\pyapi{DataFigure} 是 fit、单位切换、保存和后处理的入口。常用方法包括 \pyapi{lorent}、\pyapi{gaussian}、\pyapi{rabi}、\pyapi{decay}、\pyapi{center}、\pyapi{change_unit}、\pyapi{change_cmap} 和 \pyapi{save}。
+
+\begin{codeblock}[Python]
+result, popt = ple.data_figure.lorent()
+paths = ple.data_figure.save(
+    "results/frontend_ple_demo",
+    extra_info={"note": "tutorial"},
+)
+\end{codeblock}
+
+\section{DataFigure 拟合流程}
+\pyapi{DataFigure} 可以从 plotter 自动创建，也可以显式传入 \pyapi{fig/data_x/data_y}。从 plotter 创建时，它会拿到同一份数据、label、selector handle 和 metadata，因此 fit 可以自然尊重当前交互状态。
+
+fit 的内部流程是：
+\begin{enumerate}
+  \item \pyapi{_valid_index} 只选择 \pyapi{data_y[:, 0]} 有限的点，live 未完成部分不会参与拟合。
+  \item \pyapi{_select_fit} 根据 area selector 范围选择数据；如果没有 area，就用当前 axis limit。二维 fit 会把 area 边界对齐到最近 grid 点。
+  \item 每个 fit 方法构造一个或多个 \pyapi{p0} 和 bounds。例如 Lorentzian 同时尝试正峰和负峰初值，Rabi 用 FFT 猜振荡频率。
+  \item \pyapi{_fit_and_draw} 在多个初值里选择 residual 最小的结果，更新 orange fit line 或二维中心 marker。
+  \item \pyapi{_place_text} 在几个候选角落里找和数据点重叠最少的位置放参数文本，避免每次都压在峰顶上。
+\end{enumerate}
+
+一维数据点数不太多时，fit 后原来的 line 会变成淡灰 scatter，再把拟合曲线画在上面。这样视觉上更接近 Confocal\_GUIv2 的风格，也更容易看 residual 和异常点。
+
+\chapter{PDF notes 接口}
+\section{生成自定义 notes}
+这份 PDF 本身就是用 frontend 的 notes 接口生成的。模板来自根目录的 Stark physics notes 风格，但整理成了 XeLaTeX 版本，并加入中文、代码块、命令行块、API 引用和文件路径样式。
+
+\begin{codeblock}[Python]
+body = r'''
+\chapter{实验记录}
+这里写中文 notes，也可以插入 \pyapi{zf.plot} 生成的图。
+'''
+
+result = zf.render_notes_pdf(
+    "notes/my_note",
+    filename="my_note.tex",
+    title="实验记录",
+    subtitle="Zou lab notes",
+    description="中文 XeLaTeX PDF",
+    body=body,
+)
+\end{codeblock}
+
+\section{notes 生成管线}
+\pyapi{write_notes_tex} 只转义 title、subtitle、description、date；\pyapi{body} 被当作 raw LaTeX 插入。这样实验 notes 可以直接写章节、公式和图片，但也意味着 body 里的下划线要放进 API/path inline 宏或 codeblock 里，或者手动转义。
+
+模板文件作为 package data 放在 \filepath{Zou_lab_control/frontend/templates}。每次写 notes 时会先复制到输出目录，保证单独拷走 \pyapi{.tex} 和 \pyapi{.sty} 也能编译。编译默认用 XeLaTeX 跑两次，用来生成目录和交叉引用。
+
+\begin{notebox}[verbatim 的坑]
+早期版本让 codeblock 支持 LaTeX command escape，结果如果代码块里出现 LaTeX 命令样式的字符串，TeX 会误执行它。现在 \pyapi{zlcverbatim} 不启用 command chars，代码块内容保持纯文本，这对 tutorial 和实验记录更安全。
+\end{notebox}
+
+\section{生成 frontend manual}
+\begin{codeblock}[Python]
+result = zf.build_frontend_manual("docs/frontend_manual")
+print(result.pdf_path)
+\end{codeblock}
+
+\begin{shellblock}
+python -m pip install -e .
+\end{shellblock}
+
+\chapter{调试与扩展}
+\section{常见问题定位}
+\begin{description}
+  \item[import 失败] 先确认当前 Python 环境已经在仓库根目录执行过 \cmdinline{python -m pip install -e .}。如果 notebook 之前 import 过旧代码，restart kernel。
+  \item[live 只有最终图] 看 source 是否太快，或者当前 cell 是否用 busy loop 长时间占住 kernel。真实慢硬件应由 \pyapi{zf.run} 接管；不要在 notebook 里自己 \pyapi{join} worker。
+  \item[2D 图缺最后点] 看 \pyapi{ArrayWatcher} 的 snapshot/progress 读取、\pyapi{RunSession.points_done} 和 lock 是否仍然一起传递。最终 refresh 的完整性依赖这三者。
+  \item[2D 网格错位] 看 \pyapi{data_x} 是否来自离散 grid。若坐标有浮点 jitter，\pyapi{np.unique/searchsorted} 会把它当成新 grid 或放错 index。
+  \item[selector 行为异常] 先检查 \pyapi{fig._zlc_tools} 是否存在，cell rerun 后旧 figure 是否被 \pyapi{new_figure} 清掉，drag line 是否在 destroy 时断开 event callback。
+  \item[hist threshold 误触发 area] 看 \pyapi{DragVLine} 的 area 开关和 \pyapi{fig._zlc_disable_area_once}。这两个逻辑必须配合。
+  \item[PDF 编译失败] 先看 \pyapi{frontend_manual_zh.build.log}。常见原因是没有 XeLaTeX、body raw LaTeX 里有未转义下划线，或者代码块环境被破坏。
+\end{description}
+
+\section{以后接 PyQt 的关键替换点}
+现在 Jupyter live 使用 Matplotlib canvas timer。未来 PyQt 版本不应该改硬件层或 plotter 数据契约，主要替换三处：
+\begin{itemize}
+  \item 把 \pyapi{ArrayWatcher} 的 timer 调度换成 Qt 主线程 timer，例如 \pyapi{QTimer}。
+  \item 保留 \pyapi{RunSession} 的 worker/read/write 边界，或者把 worker 换成 Qt thread pool，但仍然只写 array。
+  \item 保留 plotter 的 \pyapi{init_core/update_core} artist 更新方式；GUI 面板只持有 plot/session handle，不直接操作硬件采集循环。
+\end{itemize}
+
+换句话说，PyQt 版本的核心不是“重写 frontend”，而是把 UI 调度器从 notebook canvas timer 换成 Qt timer。只要 \pyapi{data_x/data_y} 契约不动，实验逻辑和 notebook tutorial 仍然能共用。
+
+\section{新增 plot 类型}
+新增 plot 类型时，优先保持相同数据契约：\pyapi{data_x} 描述坐标，\pyapi{data_y} 描述测量值。静态绘图仍走 \pyapi{zf.plot}，阻塞采集仍走 \pyapi{zf.run}。如果新增 GUI 后端，推荐只替换 watcher/session 的 UI 调度层，不改变实验逻辑面对的接口。
+
+\section{维护原则}
+\begin{itemize}
+  \item 不在硬件层保存 Matplotlib artist。
+  \item 不让 plot 对象采集数据。
+  \item 不让用户在 notebook 里手写线程或 coroutine。
+  \item 对于 PyQt，所有 UI 更新留在主线程；采集 handle 放入 session worker。
+  \item 手册和实验 notes 统一使用 \pyapi{render_notes_pdf} 或 \pyapi{build_frontend_manual}，保持图和文档风格一致。
+\end{itemize}
+
+
+\end{document}

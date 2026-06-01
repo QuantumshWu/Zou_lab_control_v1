@@ -1,0 +1,77 @@
+\contentsline {chapter}{\numberline {1}阅读范围与结论}{1}{chapter.1}%
+\contentsline {section}{\numberline {1.1}这份文档只讨论什么}{1}{section.1.1}%
+\contentsline {section}{\numberline {1.2}一句话总结}{1}{section.1.2}%
+\contentsline {chapter}{\numberline {2}原始 PythonCamDemo 总览}{3}{chapter.2}%
+\contentsline {section}{\numberline {2.1}目录角色}{3}{section.2.1}%
+\contentsline {section}{\numberline {2.2}原始流程的状态图}{3}{section.2.2}%
+\contentsline {section}{\numberline {2.3}原始代码为什么能快速推进实验}{3}{section.2.3}%
+\contentsline {section}{\numberline {2.4}原始代码的主要维护代价}{5}{section.2.4}%
+\contentsline {chapter}{\numberline {3}qCMOS 原始采集逻辑}{6}{chapter.3}%
+\contentsline {section}{\numberline {3.1}交互式 qCMOS 采集函数}{6}{section.3.1}%
+\contentsline {section}{\numberline {3.2}GUI 进程的意义和代价}{7}{section.3.2}%
+\contentsline {section}{\numberline {3.3}三段式 qCMOS 接口}{7}{section.3.3}%
+\contentsline {section}{\numberline {3.4}qCMOS 原始逻辑的关键隐含假设}{7}{section.3.4}%
+\contentsline {section}{\numberline {3.5}重构对应关系}{8}{section.3.5}%
+\contentsline {chapter}{\numberline {4}图像分析、阈值和校准文件}{9}{chapter.4}%
+\contentsline {section}{\numberline {4.1}三个旧校准文件}{9}{section.4.1}%
+\contentsline {section}{\numberline {4.2}原始图像判别模型}{9}{section.4.2}%
+\contentsline {section}{\numberline {4.3}center finder 和 ordering}{10}{section.4.3}%
+\contentsline {section}{\numberline {4.4}阈值估计}{10}{section.4.4}%
+\contentsline {chapter}{\numberline {5}重排 planner 原始逻辑}{11}{chapter.5}%
+\contentsline {section}{\numberline {5.1}早期 LSAP 重排器}{11}{section.5.1}%
+\contentsline {section}{\numberline {5.2}后期 cascade pushing}{11}{section.5.2}%
+\contentsline {section}{\numberline {5.3}planner 和 hardware move 的边界}{12}{section.5.3}%
+\contentsline {chapter}{\numberline {6}PXIE/AOD 原始控制逻辑}{14}{chapter.6}%
+\contentsline {section}{\numberline {6.1}DLL 绑定和板卡初始化}{14}{section.6.1}%
+\contentsline {section}{\numberline {6.2}频率 ramp 的物理含义}{14}{section.6.2}%
+\contentsline {section}{\numberline {6.3}amplitude ramp up/down}{14}{section.6.3}%
+\contentsline {section}{\numberline {6.4}丢弃原子}{15}{section.6.4}%
+\contentsline {section}{\numberline {6.5}重构对应关系}{15}{section.6.5}%
+\contentsline {chapter}{\numberline {7}address\_switch 原始 Verilog 逻辑}{16}{chapter.7}%
+\contentsline {section}{\numberline {7.1}工程结构}{16}{section.7.1}%
+\contentsline {section}{\numberline {7.2}main.v: VIO 参数桥}{17}{section.7.2}%
+\contentsline {section}{\numberline {7.3}time\_sequence.v: 累计时间条件}{17}{section.7.3}%
+\contentsline {section}{\numberline {7.4}debug 分支和 run 分支}{17}{section.7.4}%
+\contentsline {section}{\numberline {7.5}TTL、shutter 和 DA 混在同一个时序模块}{17}{section.7.5}%
+\contentsline {section}{\numberline {7.6}pin map 的迁移}{18}{section.7.6}%
+\contentsline {chapter}{\numberline {8}原始逻辑的关键风险}{19}{chapter.8}%
+\contentsline {section}{\numberline {8.1}不是“代码不好”，而是边界太隐式}{19}{section.8.1}%
+\contentsline {section}{\numberline {8.2}为什么必须做 preflight}{19}{section.8.2}%
+\contentsline {chapter}{\numberline {9}重构后的总架构}{21}{chapter.9}%
+\contentsline {section}{\numberline {9.1}模块边界}{21}{section.9.1}%
+\contentsline {section}{\numberline {9.2}为什么没有一个大 Controller}{21}{section.9.2}%
+\contentsline {chapter}{\numberline {10}实验调度：single shot}{23}{chapter.10}%
+\contentsline {section}{\numberline {10.1}事务流程}{23}{section.10.1}%
+\contentsline {section}{\numberline {10.2}prepare/fire 为什么是核心}{24}{section.10.2}%
+\contentsline {section}{\numberline {10.3}last\_acquisition trace}{24}{section.10.3}%
+\contentsline {chapter}{\numberline {11}PulseSequence 到 Verilog}{25}{chapter.11}%
+\contentsline {section}{\numberline {11.1}物理时序和 tick 投影分开}{25}{section.11.1}%
+\contentsline {section}{\numberline {11.2}VerilogBuild 和 manifest}{26}{section.11.2}%
+\contentsline {section}{\numberline {11.3}address\_switch 迁移}{26}{section.11.3}%
+\contentsline {chapter}{\numberline {12}qCMOS preflight 和同步检查}{27}{chapter.12}%
+\contentsline {section}{\numberline {12.1}trigger 数}{27}{section.12.1}%
+\contentsline {section}{\numberline {12.2}exposure window}{27}{section.12.2}%
+\contentsline {section}{\numberline {12.3}timeout budget}{27}{section.12.3}%
+\contentsline {section}{\numberline {12.4}ROI}{27}{section.12.4}%
+\contentsline {chapter}{\numberline {13}AOD/PXIE 重构}{28}{chapter.13}%
+\contentsline {section}{\numberline {13.1}FrequencyMap}{28}{section.13.1}%
+\contentsline {section}{\numberline {13.2}AODMove}{28}{section.13.2}%
+\contentsline {section}{\numberline {13.3}PXIEAOD}{28}{section.13.3}%
+\contentsline {section}{\numberline {13.4}VirtualAOD}{28}{section.13.4}%
+\contentsline {chapter}{\numberline {14}frontend 在新调度中的角色}{29}{chapter.14}%
+\contentsline {section}{\numberline {14.1}array 契约}{29}{section.14.1}%
+\contentsline {section}{\numberline {14.2}为什么不让采集代码自己画图}{30}{section.14.2}%
+\contentsline {chapter}{\numberline {15}run record 和复现}{31}{chapter.15}%
+\contentsline {section}{\numberline {15.1}record 保存什么}{31}{section.15.1}%
+\contentsline {section}{\numberline {15.2}为什么不保存完整 Verilog source}{31}{section.15.2}%
+\contentsline {section}{\numberline {15.3}snapshot 的意义}{31}{section.15.3}%
+\contentsline {chapter}{\numberline {16}从旧 notebook 到新接口的迁移路线}{32}{chapter.16}%
+\contentsline {section}{\numberline {16.1}单次拍图}{32}{section.16.1}%
+\contentsline {section}{\numberline {16.2}多帧 stack}{32}{section.16.2}%
+\contentsline {section}{\numberline {16.3}重排}{32}{section.16.3}%
+\contentsline {section}{\numberline {16.4}address\_switch}{33}{section.16.4}%
+\contentsline {chapter}{\numberline {17}调试地图}{34}{chapter.17}%
+\contentsline {section}{\numberline {17.1}按症状查层}{34}{section.17.1}%
+\contentsline {section}{\numberline {17.2}新增功能放哪里}{34}{section.17.2}%
+\contentsline {chapter}{\numberline {18}结语}{35}{chapter.18}%
+\contentsfinish 

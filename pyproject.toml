@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zou-lab-control"
+version = "0.1.0"
+description = "Jupyter plotting frontend and neutral-atom control helpers for Zou lab experiments."
+requires-python = ">=3.9"
+dependencies = [
+    "ipython",
+    "matplotlib",
+    "nbformat",
+    "numpy",
+    "rpyc",
+    "scipy",
+]
+
+[tool.setuptools.packages.find]
+include = ["Zou_lab_control*"]
+
+[tool.setuptools.package-data]
+"Zou_lab_control.frontend" = ["assets/*.ttf", "templates/*.sty", "content/notebook_templates/*.cells.md", "content/manual_templates/*.texbody"]
+"Zou_lab_control.neutral_atom" = ["configs/*.json", "content/manual_templates/*.texbody"]
