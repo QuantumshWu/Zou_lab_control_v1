@@ -65,7 +65,8 @@ os.environ["ZLC_LEGACY_WAIT_FOR_DURATION"] = "1"
 # sees exactly one positive edge per address-switch cycle in run mode.  The
 # original address_switch Verilog can produce two emCCD/readout pulses per cycle
 # and does not explicitly drive trig in run mode.
-os.environ["ZLC_LEGACY_SINGLE_CAMERA_TRIGGER_CONFIRMED"] = "0"
+os.environ.setdefault("ZLC_LEGACY_SINGLE_CAMERA_TRIGGER_CONFIRMED", "0")
+print("ZLC_LEGACY_SINGLE_CAMERA_TRIGGER_CONFIRMED =", os.environ["ZLC_LEGACY_SINGLE_CAMERA_TRIGGER_CONFIRMED"])
 
 # Optional defaults for other legacy VIO probes. Fill these with known-good
 # values for your current experiment; they are written during prepare before
