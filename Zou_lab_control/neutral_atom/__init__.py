@@ -21,7 +21,7 @@ from .core.analysis import (
     sort_centers_grid,
 )
 from .core.calibration import TrapCalibration
-from .devices import QCMOSCamera, QCMOSConfig
+from .devices import DEFAULT_DCAM_MODULE, QCMOSCamera, QCMOSConfig
 from .devices import (
     BaseDevice,
     CameraDevice,
@@ -104,6 +104,7 @@ __all__ = [
     "CameraDevice",
     "CommandSequencerBackend",
     "DEFAULT_CHANNELS",
+    "DEFAULT_DCAM_MODULE",
     "DetectionResult",
     "DetectionTimeScanResult",
     "DeviceSet",

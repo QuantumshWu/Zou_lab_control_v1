@@ -32,6 +32,9 @@ class QCMOSConfig:
             self.roi = normalize_roi(self.roi)
 
 
+DEFAULT_DCAM_MODULE = "Zou_lab_control.neutral_atom.devices.drivers.dcam.dcam"
+
+
 class QCMOSCamera(CameraDevice):
     """Thin external-trigger Hamamatsu qCMOS adapter.
 
@@ -40,7 +43,7 @@ class QCMOSCamera(CameraDevice):
     still belongs to the sequencer.
     """
 
-    def __init__(self, config: QCMOSConfig | dict[str, Any] | None = None, *, dcam_module: str = "dcam"):
+    def __init__(self, config: QCMOSConfig | dict[str, Any] | None = None, *, dcam_module: str = DEFAULT_DCAM_MODULE):
         self.config = config if isinstance(config, QCMOSConfig) else QCMOSConfig(**dict(config or {}))
         self.dcam_module_name = str(dcam_module)
         self._module = None
@@ -222,4 +225,4 @@ def positive_float(value, name: str) -> float:
     return out
 
 
-__all__ = ["QCMOSCamera", "QCMOSConfig", "normalize_roi"]
+__all__ = ["DEFAULT_DCAM_MODULE", "QCMOSCamera", "QCMOSConfig", "normalize_roi"]

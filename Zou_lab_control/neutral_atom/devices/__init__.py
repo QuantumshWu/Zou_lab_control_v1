@@ -1,7 +1,7 @@
 """Device contracts, virtual devices, and hardware adapters."""
 
 from .base import BaseDevice, CameraDevice, SequencerDevice, TrapArrayDevice, validate_device_contract
-from .qcmos import QCMOSCamera, QCMOSConfig
+from .qcmos import DEFAULT_DCAM_MODULE, QCMOSCamera, QCMOSConfig
 from .sequencer import (
     ManualSequencer,
     RemoteSequencer,
@@ -50,6 +50,7 @@ __all__ = [
     "CameraDevice",
     "CommandSequencerBackend",
     "DEFAULT_CHANNELS",
+    "DEFAULT_DCAM_MODULE",
     "DEVICE_CLASSES",
     "DeviceSet",
     "ManualSequencer",

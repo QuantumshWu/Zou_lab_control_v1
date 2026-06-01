@@ -379,8 +379,10 @@ def test_real_device_templates_load_without_hardware_connection():
     remote = na.load_devices("remote_template", overrides={"sequencer": {"host": "192.168.0.21", "port": 18862}})
 
     assert isinstance(manual.camera, na.QCMOSCamera)
+    assert manual.camera.dcam_module_name == na.DEFAULT_DCAM_MODULE
     assert isinstance(manual.sequencer, na.ManualSequencer)
     assert isinstance(remote.camera, na.QCMOSCamera)
+    assert remote.camera.dcam_module_name == na.DEFAULT_DCAM_MODULE
     assert isinstance(remote.sequencer, na.RemoteSequencer)
     assert remote.sequencer.host == "192.168.0.21"
     assert remote.sequencer.port == 18862
@@ -388,6 +390,7 @@ def test_real_device_templates_load_without_hardware_connection():
 
     exp = na.connect("remote_template", sequencer={"host": "192.168.0.22"})
     assert exp.devices.sequencer.host == "192.168.0.22"
+    assert exp.camera.dcam_module_name == na.DEFAULT_DCAM_MODULE
 
     try:
         na.load_devices("remote_template", overrides={"sequencer": {"host": "0.0.0.0"}})
