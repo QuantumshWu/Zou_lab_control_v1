@@ -9,22 +9,21 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
-from .qcmos import QCMOSCamera
-from .sequencer import ManualSequencer, RemoteSequencer, RuntimeSequencer, VerilogSequencer
-from .virtual import VirtualCamera, VirtualSequencer, VirtualTrapArray, virtual_config
+from .virtual import virtual_config
 from .base import CameraDevice, SequencerDevice, TrapArrayDevice, validate_device_contract
 
 
-DEVICE_CLASSES = {
-    "QCMOSCamera": QCMOSCamera,
-    "ManualSequencer": ManualSequencer,
-    "RemoteSequencer": RemoteSequencer,
-    "RuntimeSequencer": RuntimeSequencer,
-    "VerilogSequencer": VerilogSequencer,
-    "VirtualCamera": VirtualCamera,
-    "VirtualSequencer": VirtualSequencer,
-    "VirtualTrapArray": VirtualTrapArray,
+BUILTIN_DEVICE_CLASS_PATHS = {
+    "QCMOSCamera": "Zou_lab_control.neutral_atom.devices.qcmos.QCMOSCamera",
+    "ManualSequencer": "Zou_lab_control.neutral_atom.devices.sequencer.ManualSequencer",
+    "RemoteSequencer": "Zou_lab_control.neutral_atom.devices.sequencer.RemoteSequencer",
+    "RuntimeSequencer": "Zou_lab_control.neutral_atom.devices.sequencer.RuntimeSequencer",
+    "VerilogSequencer": "Zou_lab_control.neutral_atom.devices.sequencer.VerilogSequencer",
+    "VirtualCamera": "Zou_lab_control.neutral_atom.devices.virtual.VirtualCamera",
+    "VirtualSequencer": "Zou_lab_control.neutral_atom.devices.virtual.VirtualSequencer",
+    "VirtualTrapArray": "Zou_lab_control.neutral_atom.devices.virtual.VirtualTrapArray",
 }
+DEVICE_CLASSES: dict[str, type | str] = dict(BUILTIN_DEVICE_CLASS_PATHS)
 
 
 @dataclass
@@ -204,12 +203,39 @@ def deep_update(target: dict[str, Any], source: Mapping[str, Any]) -> None:
 
 
 def resolve_class(name: str) -> type:
-    if name in DEVICE_CLASSES:
-        return DEVICE_CLASSES[name]
-    if "." not in name:
+    target = DEVICE_CLASSES.get(name, name)
+    if isinstance(target, type):
+        return target
+    if "." not in str(target):
         raise KeyError(f"unknown device class {name!r}. Known: {sorted(DEVICE_CLASSES)}")
-    module_name, class_name = name.rsplit(".", 1)
-    return getattr(importlib.import_module(module_name), class_name)
+    module_name, class_name = str(target).rsplit(".", 1)
+    cls = getattr(importlib.import_module(module_name), class_name)
+    if not isinstance(cls, type):
+        raise TypeError(f"resolved device class {name!r} is not a class.")
+    DEVICE_CLASSES[name] = cls
+    return cls
+
+
+def register_device_class(name: str, cls: type | str) -> None:
+    """Register a device class or import path for future ``load_devices`` calls."""
+
+    if not str(name).strip():
+        raise ValueError("device class name must not be empty.")
+    if not isinstance(cls, type) and "." not in str(cls):
+        raise ValueError("device class registration must be a class or fully qualified import path.")
+    DEVICE_CLASSES[str(name)] = cls
+
+
+def device_class_registry() -> dict[str, str]:
+    """Return the known device classes without forcing every hardware import."""
+
+    out = {}
+    for name, target in DEVICE_CLASSES.items():
+        if isinstance(target, type):
+            out[name] = f"{target.__module__}.{target.__qualname__}"
+        else:
+            out[name] = str(target)
+    return dict(sorted(out.items()))
 
 
 def available_device_configs() -> list[str]:
@@ -224,8 +250,10 @@ __all__ = [
     "DeviceSet",
     "apply_device_overrides",
     "available_device_configs",
+    "device_class_registry",
     "device_config_dir",
     "load_devices",
     "read_config",
+    "register_device_class",
     "resolve_class",
 ]

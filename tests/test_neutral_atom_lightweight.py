@@ -4,6 +4,7 @@ matplotlib.use("Agg")
 
 import json
 import socket
+import subprocess
 import time
 import sys
 import threading
@@ -113,6 +114,26 @@ def test_device_contracts_are_explicit_and_validated():
         assert "abstract" in str(exc)
     else:
         raise AssertionError("incomplete CameraDevice subclass should not instantiate")
+
+
+def test_device_registry_can_register_external_classes():
+    class RegisteredSequencer(na.RuntimeSequencer):
+        pass
+
+    na.register_device_class("RegisteredSequencerForTest", RegisteredSequencer)
+    devices = na.load_devices(
+        {
+            "sequencer": {
+                "type": "RegisteredSequencerForTest",
+                "params": {"channels": ["trap", "cooling", "probe", "qcm_trigger"]},
+            }
+        }
+    )
+
+    registry = na.device_class_registry()
+    assert isinstance(devices.sequencer, RegisteredSequencer)
+    assert registry["RegisteredSequencerForTest"].endswith("RegisteredSequencer")
+    assert registry["QCMOSCamera"].endswith(".QCMOSCamera")
 
 
 def test_public_standalone_operations_live_outside_session_subsystem():
@@ -257,6 +278,148 @@ def test_runtime_sequencer_service_contract():
     snapshot = sequencer.snapshot()
     assert snapshot["state"] == "done"
     assert snapshot["prepared_program"]["trigger_count"] == 2
+
+
+def test_fpga_pulse_streamer_writes_hdl_and_upload_tcl(tmp_path):
+    seq = na.sequence_for_frame_count(na.imaging_sequence(exposure=4e-6, load=True), 2)
+    program = na.compile_runtime_program(seq, channels=["trap", "cooling", "probe", "qcm_trigger"], clock_hz=100e6)
+
+    files = na.write_pulse_streamer_hdl_bundle(tmp_path / "hdl", channels=["trap", "cooling", "probe", "qcm_trigger"], max_edges=16)
+    tcl_path = na.write_vivado_pulse_streamer_tcl(
+        tmp_path / "prepare.tcl",
+        "prepare",
+        program=program,
+        project="D:/fake/project.xpr",
+        bitstream="D:/fake/main.bit",
+        probes="D:/fake/main.ltx",
+        max_edges=16,
+        channel_count=4,
+    )
+
+    na.validate_pulse_streamer_program(program, max_edges=16, channel_count=4)
+    core = files.core_path.read_text(encoding="utf-8")
+    top = files.top_example_path.read_text(encoding="utf-8")
+    tcl = tcl_path.read_text(encoding="utf-8")
+    assert "module zlc_pulse_streamer" in core
+    assert "Runtime-programmable edge-table pulse streamer" in core
+    assert "probe_out4 zlc_prog_tick" in top
+    assert "zlc_set_probe $vio $zlc_prog_count_probe" in tcl
+    assert "zlc_set_probe $vio $zlc_prog_tick_probe" in tcl
+    assert "zlc_set_probe $vio $zlc_prog_mask_probe" in tcl
+    assert "Available probes on matched VIO:" in tcl
+    assert f"with {len(program.ticks)} edges" in tcl
+
+
+def test_fpga_pulse_streamer_rejects_program_that_does_not_fit():
+    seq = na.sequence_for_frame_count(na.imaging_sequence(exposure=4e-6, load=True), 2)
+    program = na.compile_runtime_program(seq, channels=["trap", "cooling", "probe", "qcm_trigger"], clock_hz=100e6)
+
+    try:
+        na.validate_pulse_streamer_program(program, max_edges=1, channel_count=4)
+    except ValueError as exc:
+        assert "edges" in str(exc)
+    else:
+        raise AssertionError("pulse-streamer validation should reject too many edges")
+
+
+def test_fpga_pulse_streamer_rejects_runtime_edge_table_hazards():
+    bad_duplicate_tick = na.RuntimeSequenceProgram(
+        sequence_id="bad",
+        sequence_name="bad",
+        clock_hz=100e6,
+        channels=["trap", "qcm_trigger"],
+        ticks=[0, 10, 10],
+        masks=[1, 2, 0],
+        duration=1e-7,
+        trigger_count=1,
+    )
+    bad_final_mask = na.RuntimeSequenceProgram(
+        sequence_id="bad",
+        sequence_name="bad",
+        clock_hz=100e6,
+        channels=["trap", "qcm_trigger"],
+        ticks=[0, 10],
+        masks=[1, 1],
+        duration=1e-7,
+        trigger_count=1,
+    )
+    bad_duplicate_channel = na.RuntimeSequenceProgram(
+        sequence_id="bad",
+        sequence_name="bad",
+        clock_hz=100e6,
+        channels=["trap", "trap"],
+        ticks=[0, 10],
+        masks=[1, 0],
+        duration=1e-7,
+        trigger_count=0,
+    )
+
+    for program, expected in (
+        (bad_duplicate_tick, "strictly increasing"),
+        (bad_final_mask, "final mask"),
+        (bad_duplicate_channel, "unique"),
+    ):
+        try:
+            na.validate_pulse_streamer_program(program, channel_count=2)
+        except ValueError as exc:
+            assert expected in str(exc)
+        else:
+            raise AssertionError(f"pulse-streamer validation should reject {expected}")
+
+
+def test_fpga_pulse_streamer_rejects_bad_top_level_channel_names():
+    for channels, expected in (
+        (["a-b", "a_b"], "collide"),
+        (["clk", "probe"], "top-level"),
+    ):
+        try:
+            na.generate_pulse_streamer_top_example(channels=channels)
+        except ValueError as exc:
+            assert expected in str(exc)
+        else:
+            raise AssertionError(f"top example should reject {channels!r}")
+
+
+def test_fpga_pulse_streamer_fire_dry_run_does_not_require_program_file(tmp_path):
+    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import run_action
+
+    tcl_path = run_action("fire", state_dir=tmp_path, dry_run=True)
+
+    tcl = tcl_path.read_text(encoding="utf-8")
+    assert "zlc_set_probe $vio $zlc_start_probe 1" in tcl
+    assert "ZLC pulse-streamer start edge sent" in tcl
+
+
+def test_fpga_pulse_streamer_module_cli_generates_hdl(tmp_path):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer",
+            "generate_hdl",
+            "--output-dir",
+            str(tmp_path),
+            "--channels",
+            "trap",
+            "cooling",
+            "probe",
+            "qcm_trigger",
+            "--max-edges",
+            "16",
+            "--tick-width",
+            "32",
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=20,
+    )
+
+    assert result.returncode == 0, result.stdout
+    assert "RuntimeWarning" not in result.stdout
+    assert (tmp_path / "zlc_pulse_streamer.v").exists()
+    assert (tmp_path / "zlc_pulse_streamer_top_example.v").exists()
+    assert (tmp_path / "zlc_pulse_streamer.manifest.json").exists()
 
 
 def test_command_sequencer_backend_writes_program_and_runs_fire_command(tmp_path):
@@ -410,6 +573,8 @@ def test_hardware_tutorial_is_real_hardware_not_virtual_demo():
     assert "exp.devices.sequencer.open()" not in hardware_text
     assert "results_real_hardware" not in hardware_text
     assert "neutral_atom.devices.sequencer_server" in fpga_text
+    assert "fpga_pulse_streamer" in fpga_text
+    assert "legacy_address_switch" not in fpga_text
     assert "na.run_sequencer_server" in fpga_text
     assert "address_switch.xpr" not in fpga_text
     assert "qCMOS.py" not in hardware_text + fpga_text

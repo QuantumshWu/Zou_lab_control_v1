@@ -1,19 +1,19 @@
 <!-- cell:markdown -->
-# Neutral atom FPGA/Vivado sequencer server
+# Neutral atom FPGA pulse-streamer server
 
-这个 notebook 在 Verilog/FPGA 电脑上运行。它启动一个新的 `Zou_lab_control.neutral_atom` sequencer server，等待控制电脑上的 `RemoteSequencer` 连接。
+这个 notebook 在 Verilog/FPGA 电脑上运行。它启动 `Zou_lab_control.neutral_atom` sequencer server，等待控制电脑上的 `RemoteSequencer` 连接。
 
-它不调用 `PythonCamDemo` 或旧控制代码接口。新的边界是：
+推荐架构是固定烧一个 `zlc_pulse_streamer` bitstream。control 电脑每次 acquisition 只发送 `PulseSequence`；FPGA 电脑把它编译成 `ticks/masks` edge table，上传到 FPGA 的 runtime RAM，再给一个 start edge。网络只负责上传表和发 start，不参与微秒级 timing。
 
 ```text
 control computer RemoteSequencer
   -> RPyC
   -> SequencerService on FPGA/Vivado computer
-  -> device-layer command backend
-  -> legacy_address_switch Vivado/VIO adapter or a future pulse-table FPGA backend
+  -> fpga_pulse_streamer backend
+  -> fixed zlc_pulse_streamer bitstream edge-table RAM
 ```
 
-如果你不想用 Jupyter，也可以在 Verilog 电脑的 PowerShell 中运行本 notebook 第 3 节给出的命令行。
+旧 `address_switch` backend 只适合应急 first-light，不再作为默认路径。
 
 <!-- cell:code -->
 {{BOOTSTRAP_CELL}}
@@ -21,7 +21,6 @@ control computer RemoteSequencer
 <!-- cell:code -->
 import os
 from pathlib import Path
-import json
 import sys
 
 import Zou_lab_control.frontend as zf
@@ -30,85 +29,100 @@ import Zou_lab_control.neutral_atom as na
 zf.enable_long_output()
 
 <!-- cell:markdown -->
-## 1. Configure this FPGA/Vivado computer
+## 1. Generate the fixed FPGA pulse-streamer HDL
 
-把下面路径改成 Verilog 电脑上的真实路径。这里默认接的是当前 `address_switch` 那种固定状态机 bitstream：`prepare` 根据 control 电脑传来的 `RuntimeSequenceProgram` 计算 `pulse_lasting` 和 `cycle_counts`，通过 Vivado/VIO 写进 FPGA；`fire` 再把 `config_ready` 拉高启动序列。也就是说 scan readout time/fidelity 时，每个 detection time 都会重新写 probe pulse width。
+第一次部署时先生成 HDL。把 `zlc_pulse_streamer.v` 加到 Vivado 工程，把 `zlc_pulse_streamer_top_example.v` 当作 wiring reference：它说明 VIO probe 的名字、宽度和方向。
 
-如果你的 bitstream 已经换成真正的 pulse-table runtime，后面只需要换 `PREPARE_COMMAND/FIRE_COMMAND` 后面的 backend；control 电脑的 notebook 不应该变。
+工程里需要一个 VIO IP，probe 约定如下：
+
+```text
+probe_out0 zlc_reset      width 1
+probe_out1 zlc_start      width 1
+probe_out2 zlc_prog_we    width 1
+probe_out3 zlc_prog_addr  width 10   # MAX_EDGES=1024
+probe_out4 zlc_prog_tick  width 32
+probe_out5 zlc_prog_mask  width 4    # CHANNELS=trap/cooling/probe/qcm_trigger
+probe_out6 zlc_prog_count width 11
+probe_in0  zlc_running    width 1
+probe_in1  zlc_done       width 1
+```
+
+`out[0:3]` 分别接到 `trap/cooling/probe/qcm_trigger` 的真实 FPGA 输出 pin。qCMOS 必须接 `qcm_trigger` 这个输出。
 
 <!-- cell:code -->
 PROJECT_ROOT = Path("..").resolve()
 
-HOST = "0.0.0.0"
-PORT = 18861
 CHANNELS = ["trap", "cooling", "probe", "qcm_trigger"]
 TRIGGER_CHANNELS = ["qcm_trigger"]
-CLOCK_HZ = 100_000_000.0  # address_switch tick clock; change if your FPGA state machine uses another clk
+CLOCK_HZ = 100_000_000.0
+MAX_EDGES = 1024
+TICK_WIDTH = 32
 
+HDL_DIR = Path(r"D:\zlc_pulse_streamer_hdl")
+hdl_files = na.write_pulse_streamer_hdl_bundle(
+    HDL_DIR,
+    channels=CHANNELS,
+    max_edges=MAX_EDGES,
+    tick_width=TICK_WIDTH,
+)
+hdl_files
+
+<!-- cell:markdown -->
+## 2. Configure Vivado paths and backend commands
+
+在 Vivado 里用上面生成的 HDL 建工程、连接 VIO 和 output pins、generate bitstream。然后把下面三个路径改成真实 `.xpr/.bit/.ltx`。
+
+第一次烧板子时设 `ZLC_PS_VIVADO_PROGRAM_ON_RUN="1"`；烧成功后可以改回 `"0"`，后续只加载 probes 和写 runtime table。
+
+<!-- cell:code -->
+HOST = "0.0.0.0"
+PORT = 18861
 STATE_DIR = Path(r"D:\zlc_sequencer_state")
 
-os.environ["ZLC_VIVADO_PROJECT"] = r"D:\zlc_fpga\neutral_atom_sequence\neutral_atom_sequence.xpr"
-os.environ["ZLC_VIVADO_BIT"] = r"D:\zlc_fpga\neutral_atom_sequence\neutral_atom_sequence.runs\impl_1\main.bit"
-os.environ["ZLC_VIVADO_LTX"] = r"D:\zlc_fpga\neutral_atom_sequence\neutral_atom_sequence.runs\impl_1\main.ltx"
-os.environ["ZLC_VIVADO_PROGRAM_ON_RUN"] = "0"  # set to "1" only when you intentionally want to reprogram the bitstream
-os.environ["ZLC_VIO_FILTER"] = 'CELL_NAME=~"*vio*"'
+os.environ["ZLC_PS_VIVADO_BIN"] = r"C:\Xilinx\Vivado\2019.2\bin\vivado.bat"
+os.environ["ZLC_PS_VIVADO_PROJECT"] = r"D:\time_sequence\zlc_pulse_streamer\zlc_pulse_streamer.xpr"
+os.environ["ZLC_PS_VIVADO_BIT"] = r"D:\time_sequence\zlc_pulse_streamer\zlc_pulse_streamer.runs\impl_1\main.bit"
+os.environ["ZLC_PS_VIVADO_LTX"] = r"D:\time_sequence\zlc_pulse_streamer\zlc_pulse_streamer.runs\impl_1\main.ltx"
+os.environ["ZLC_PS_VIVADO_PROGRAM_ON_RUN"] = "1"
+os.environ["ZLC_PS_VIO_FILTER"] = 'CELL_NAME=~"*vio*"'
+os.environ["ZLC_PS_MAX_EDGES"] = str(MAX_EDGES)
+os.environ["ZLC_PS_TICK_WIDTH"] = str(TICK_WIDTH)
+os.environ["ZLC_PS_CHANNEL_COUNT"] = str(len(CHANNELS))
 
-# Probe names in address_switch/address_switch.srcs/sources_1/new/main.v.
-os.environ["ZLC_LEGACY_START_PARAM"] = "config_ready"
-os.environ["ZLC_LEGACY_DEBUG_PARAM"] = "debug"
-os.environ["ZLC_LEGACY_PULSE_PARAM"] = "pulse_lasting"
-os.environ["ZLC_LEGACY_CYCLE_PARAM"] = "cycle_counts"
-os.environ["ZLC_LEGACY_PROBE_CHANNEL"] = "probe"
-os.environ["ZLC_LEGACY_WAIT_FOR_DURATION"] = "1"
+PREPARE_COMMAND = f'"{sys.executable}" -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer prepare'
+FIRE_COMMAND = f'"{sys.executable}" -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer fire'
+WAIT_DONE_COMMAND = f'"{sys.executable}" -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer wait_done'
+SAFE_STATE_COMMAND = f'"{sys.executable}" -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer safe_state'
 
-# Keep this at "0" until an oscilloscope confirms that the qCMOS trigger input
-# sees exactly one positive edge per address-switch cycle in run mode.  The
-# original address_switch Verilog can produce two emCCD/readout pulses per cycle
-# and does not explicitly drive trig in run mode.
-os.environ.setdefault("ZLC_LEGACY_SINGLE_CAMERA_TRIGGER_CONFIRMED", "0")
-print("ZLC_LEGACY_SINGLE_CAMERA_TRIGGER_CONFIRMED =", os.environ["ZLC_LEGACY_SINGLE_CAMERA_TRIGGER_CONFIRMED"])
-
-# Optional defaults for other legacy VIO probes. Fill these with known-good
-# values for your current experiment; they are written during prepare before
-# pulse_lasting/cycle_counts are written.
-LEGACY_VIO_DEFAULTS = {
-    # "PGC_lasting": 0,
-    # "PGC_waiting": 0,
-    # "probe_waiting": 0,
-    # "CCD_waiting": 0,
-}
-os.environ["ZLC_LEGACY_VIO_DEFAULTS"] = json.dumps(LEGACY_VIO_DEFAULTS)
-
-PREPARE_COMMAND = f'"{sys.executable}" -m Zou_lab_control.neutral_atom.devices.legacy_address_switch prepare'
-FIRE_COMMAND = f'"{sys.executable}" -m Zou_lab_control.neutral_atom.devices.legacy_address_switch fire'
-WAIT_DONE_COMMAND = f'"{sys.executable}" -m Zou_lab_control.neutral_atom.devices.legacy_address_switch wait_done'
-SAFE_STATE_COMMAND = f'"{sys.executable}" -m Zou_lab_control.neutral_atom.devices.legacy_address_switch safe_state'
+for key in ("ZLC_PS_VIVADO_BIN", "ZLC_PS_VIVADO_PROJECT", "ZLC_PS_VIVADO_BIT", "ZLC_PS_VIVADO_LTX"):
+    print(key, Path(os.environ[key]).exists(), os.environ[key])
 
 PREPARE_COMMAND, FIRE_COMMAND, WAIT_DONE_COMMAND, SAFE_STATE_COMMAND
 
 <!-- cell:markdown -->
-## 2. PowerShell command equivalent
+## 3. PowerShell command equivalent
 
-在 Verilog 电脑上也可以不用 Jupyter，直接在 PowerShell 运行：
+不用 Jupyter 时，在 Verilog 电脑 PowerShell 运行这段。server 启动后 terminal 会一直阻塞，这是正常的。
 
 <!-- cell:code -->
 print(fr"""
 cd "{PROJECT_ROOT}"
 $env:PYTHONPATH = (Get-Location).Path
-$env:ZLC_VIVADO_PROJECT = "{os.environ["ZLC_VIVADO_PROJECT"]}"
-$env:ZLC_VIVADO_BIT = "{os.environ["ZLC_VIVADO_BIT"]}"
-$env:ZLC_VIVADO_LTX = "{os.environ["ZLC_VIVADO_LTX"]}"
-$env:ZLC_VIVADO_PROGRAM_ON_RUN = "{os.environ["ZLC_VIVADO_PROGRAM_ON_RUN"]}"
 
-$env:ZLC_VIO_FILTER = '{os.environ["ZLC_VIO_FILTER"]}'
-$env:ZLC_LEGACY_START_PARAM = "{os.environ["ZLC_LEGACY_START_PARAM"]}"
-$env:ZLC_LEGACY_DEBUG_PARAM = "{os.environ["ZLC_LEGACY_DEBUG_PARAM"]}"
-$env:ZLC_LEGACY_PULSE_PARAM = "{os.environ["ZLC_LEGACY_PULSE_PARAM"]}"
-$env:ZLC_LEGACY_CYCLE_PARAM = "{os.environ["ZLC_LEGACY_CYCLE_PARAM"]}"
-$env:ZLC_LEGACY_PROBE_CHANNEL = "{os.environ["ZLC_LEGACY_PROBE_CHANNEL"]}"
-$env:ZLC_LEGACY_WAIT_FOR_DURATION = "{os.environ["ZLC_LEGACY_WAIT_FOR_DURATION"]}"
-$env:ZLC_LEGACY_SINGLE_CAMERA_TRIGGER_CONFIRMED = "{os.environ["ZLC_LEGACY_SINGLE_CAMERA_TRIGGER_CONFIRMED"]}"
-$env:ZLC_LEGACY_VIO_DEFAULTS = '{os.environ["ZLC_LEGACY_VIO_DEFAULTS"]}'
+$env:ZLC_PS_VIVADO_BIN = "{os.environ["ZLC_PS_VIVADO_BIN"]}"
+$env:ZLC_PS_VIVADO_PROJECT = "{os.environ["ZLC_PS_VIVADO_PROJECT"]}"
+$env:ZLC_PS_VIVADO_BIT = "{os.environ["ZLC_PS_VIVADO_BIT"]}"
+$env:ZLC_PS_VIVADO_LTX = "{os.environ["ZLC_PS_VIVADO_LTX"]}"
+$env:ZLC_PS_VIVADO_PROGRAM_ON_RUN = "{os.environ["ZLC_PS_VIVADO_PROGRAM_ON_RUN"]}"
+$env:ZLC_PS_VIO_FILTER = '{os.environ["ZLC_PS_VIO_FILTER"]}'
+$env:ZLC_PS_MAX_EDGES = "{os.environ["ZLC_PS_MAX_EDGES"]}"
+$env:ZLC_PS_TICK_WIDTH = "{os.environ["ZLC_PS_TICK_WIDTH"]}"
+$env:ZLC_PS_CHANNEL_COUNT = "{os.environ["ZLC_PS_CHANNEL_COUNT"]}"
+
+Test-Path $env:ZLC_PS_VIVADO_BIN
+Test-Path $env:ZLC_PS_VIVADO_PROJECT
+Test-Path $env:ZLC_PS_VIVADO_BIT
+Test-Path $env:ZLC_PS_VIVADO_LTX
 
 python -m Zou_lab_control.neutral_atom.devices.sequencer_server `
   --host {HOST} `
@@ -124,11 +138,11 @@ python -m Zou_lab_control.neutral_atom.devices.sequencer_server `
 """)
 
 <!-- cell:markdown -->
-## 3. Start the server
+## 4. Start the server
 
-运行下面这个 cell 后它会一直阻塞，这是正常的：它在等待控制电脑连接。保持这个 notebook/kernel 不要关，然后去控制电脑运行 `neutral_atom_hardware_quickstart.ipynb`。
+运行下面这个 cell 后它会一直阻塞，保持这个 notebook/kernel 不要关，然后去控制电脑运行 `neutral_atom_hardware_quickstart.ipynb`。
 
-如果你只是想检查参数，不要运行这个 cell。
+如果只想生成 HDL 或检查路径，不要运行这个 cell。
 
 <!-- cell:code -->
 na.run_sequencer_server(

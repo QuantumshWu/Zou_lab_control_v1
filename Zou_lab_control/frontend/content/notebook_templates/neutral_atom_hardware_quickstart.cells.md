@@ -9,18 +9,27 @@
 cd "C:\path\to\Zou_lab_control_v1"
 $env:PYTHONPATH = (Get-Location).Path
 
-$env:ZLC_LEGACY_SINGLE_CAMERA_TRIGGER_CONFIRMED = "0"  # set to 1 only after oscilloscope confirmation
+$env:ZLC_PS_VIVADO_BIN = "C:\Xilinx\Vivado\2019.2\bin\vivado.bat"
+$env:ZLC_PS_VIVADO_PROJECT = "D:\time_sequence\zlc_pulse_streamer\zlc_pulse_streamer.xpr"
+$env:ZLC_PS_VIVADO_BIT = "D:\time_sequence\zlc_pulse_streamer\zlc_pulse_streamer.runs\impl_1\main.bit"
+$env:ZLC_PS_VIVADO_LTX = "D:\time_sequence\zlc_pulse_streamer\zlc_pulse_streamer.runs\impl_1\main.ltx"
+$env:ZLC_PS_VIVADO_PROGRAM_ON_RUN = "1"
+$env:ZLC_PS_VIO_FILTER = 'CELL_NAME=~"*vio*"'
+$env:ZLC_PS_MAX_EDGES = "1024"
+$env:ZLC_PS_TICK_WIDTH = "32"
+$env:ZLC_PS_CHANNEL_COUNT = "4"
 
 python -m Zou_lab_control.neutral_atom.devices.sequencer_server `
   --host 0.0.0.0 `
   --port 18861 `
   --channels trap cooling probe qcm_trigger `
   --trigger-channels qcm_trigger `
+  --clock-hz 100000000 `
   --state-dir D:\zlc_sequencer_state `
-  --prepare-command "python -m Zou_lab_control.neutral_atom.devices.legacy_address_switch prepare" `
-  --fire-command "python -m Zou_lab_control.neutral_atom.devices.legacy_address_switch fire" `
-  --wait-done-command "python -m Zou_lab_control.neutral_atom.devices.legacy_address_switch wait_done" `
-  --safe-state-command "python -m Zou_lab_control.neutral_atom.devices.legacy_address_switch safe_state"
+  --prepare-command "python -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer prepare" `
+  --fire-command "python -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer fire" `
+  --wait-done-command "python -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer wait_done" `
+  --safe-state-command "python -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer safe_state"
 ```
 
 离线检查 frontend/readout 流程时跑 `neutral_atom_tutorial.ipynb`。

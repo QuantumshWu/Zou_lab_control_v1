@@ -254,7 +254,34 @@ Verilog/FPGA 电脑负责启动 sequencer server。推荐先打开 FPGA server n
 tutorials/neutral_atom_fpga_server.ipynb
 \end{codeblock}
 
-修改 Vivado project、bit、ltx 和 legacy VIO probe 名，然后运行最后一个 cell；这个 cell 会阻塞并等待控制电脑连接。
+默认路径是新的 \pyapi{fpga_pulse_streamer} backend：固定烧一个 runtime-programmable pulse-streamer bitstream，control PC 每次只上传 \pyapi{PulseSequence}；FPGA PC 把 sequence 编译成 \pyapi{RuntimeSequenceProgram} 的 \pyapi{ticks/masks} edge table，再通过 VIO 写进 FPGA RAM。这样 readout time、multi-frame trigger、cooling/probe/trap pulse 都来自同一张 edge table，不再把 sequence 压扁成旧 \pyapi{pulse_lasting/cycle_counts} 两个参数。
+
+第一次部署先生成 HDL：
+
+\begin{shellblock}
+cd C:\path\to\Zou_lab_control_v1
+python -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer generate_hdl `
+  --output-dir D:\zlc_pulse_streamer_hdl `
+  --channels trap cooling probe qcm_trigger `
+  --max-edges 1024 `
+  --tick-width 32
+\end{shellblock}
+
+把生成的 \filepath{zlc_pulse_streamer.v} 加到 Vivado 工程。 \filepath{zlc_pulse_streamer_top_example.v} 是 wiring reference：它列出需要创建的 VIO probe 名、宽度和方向。默认 probe contract 是：
+
+\begin{codeblock}[VIO probes]
+probe_out0 zlc_reset      width 1
+probe_out1 zlc_start      width 1
+probe_out2 zlc_prog_we    width 1
+probe_out3 zlc_prog_addr  width 10
+probe_out4 zlc_prog_tick  width 32
+probe_out5 zlc_prog_mask  width 4
+probe_out6 zlc_prog_count width 11
+probe_in0  zlc_running    width 1
+probe_in1  zlc_done       width 1
+\end{codeblock}
+
+\pyapi{out[0:3]} 分别接到 \pyapi{trap/cooling/probe/qcm_trigger} 的 FPGA 输出 pin。qCMOS trigger 输入必须接 \pyapi{qcm_trigger} 对应的物理输出。这个 bitstream 只需要综合/烧录一次；之后每次实验只上传新的 edge table。
 
 不使用 Jupyter 时，在 Verilog/FPGA 电脑的 PowerShell 运行：
 
@@ -262,18 +289,15 @@ tutorials/neutral_atom_fpga_server.ipynb
 cd C:\path\to\Zou_lab_control_v1
 python -m pip install -e .
 
-$env:ZLC_VIVADO_PROJECT = "D:\zlc_fpga\neutral_atom_sequence\neutral_atom_sequence.xpr"
-$env:ZLC_VIVADO_BIT = "D:\zlc_fpga\neutral_atom_sequence\neutral_atom_sequence.runs\impl_1\main.bit"
-$env:ZLC_VIVADO_LTX = "D:\zlc_fpga\neutral_atom_sequence\neutral_atom_sequence.runs\impl_1\main.ltx"
-$env:ZLC_VIVADO_PROGRAM_ON_RUN = "0"
-$env:ZLC_LEGACY_START_PARAM = "config_ready"
-$env:ZLC_LEGACY_DEBUG_PARAM = "debug"
-$env:ZLC_LEGACY_PULSE_PARAM = "pulse_lasting"
-$env:ZLC_LEGACY_CYCLE_PARAM = "cycle_counts"
-$env:ZLC_LEGACY_PROBE_CHANNEL = "probe"
-$env:ZLC_LEGACY_WAIT_FOR_DURATION = "1"
-$env:ZLC_LEGACY_SINGLE_CAMERA_TRIGGER_CONFIRMED = "0"
-$env:ZLC_LEGACY_VIO_DEFAULTS = "{}"
+$env:ZLC_PS_VIVADO_BIN = "C:\Xilinx\Vivado\2019.2\bin\vivado.bat"
+$env:ZLC_PS_VIVADO_PROJECT = "D:\time_sequence\zlc_pulse_streamer\zlc_pulse_streamer.xpr"
+$env:ZLC_PS_VIVADO_BIT = "D:\time_sequence\zlc_pulse_streamer\zlc_pulse_streamer.runs\impl_1\main.bit"
+$env:ZLC_PS_VIVADO_LTX = "D:\time_sequence\zlc_pulse_streamer\zlc_pulse_streamer.runs\impl_1\main.ltx"
+$env:ZLC_PS_VIVADO_PROGRAM_ON_RUN = "1"
+$env:ZLC_PS_VIO_FILTER = 'CELL_NAME=~"*vio*"'
+$env:ZLC_PS_MAX_EDGES = "1024"
+$env:ZLC_PS_TICK_WIDTH = "32"
+$env:ZLC_PS_CHANNEL_COUNT = "4"
 
 python -m Zou_lab_control.neutral_atom.devices.sequencer_server `
   --host 0.0.0.0 `
@@ -282,17 +306,13 @@ python -m Zou_lab_control.neutral_atom.devices.sequencer_server `
   --trigger-channels qcm_trigger `
   --clock-hz 100000000 `
   --state-dir D:\zlc_sequencer_state `
-  --prepare-command "python -m Zou_lab_control.neutral_atom.devices.legacy_address_switch prepare" `
-  --fire-command "python -m Zou_lab_control.neutral_atom.devices.legacy_address_switch fire" `
-  --wait-done-command "python -m Zou_lab_control.neutral_atom.devices.legacy_address_switch wait_done" `
-  --safe-state-command "python -m Zou_lab_control.neutral_atom.devices.legacy_address_switch safe_state"
+  --prepare-command "python -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer prepare" `
+  --fire-command "python -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer fire" `
+  --wait-done-command "python -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer wait_done" `
+  --safe-state-command "python -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer safe_state"
 \end{shellblock}
 
-\pyapi{legacy_address_switch} 是新架构里的 device-layer backend，不调用旧 Python 控制接口。它读取 server 写下的 \pyapi{RuntimeSequenceProgram}，在 \pyapi{prepare} 时从 sequence 里提取 probe pulse duration，写入 legacy VIO 的 \pyapi{pulse_lasting}，同时把 trigger 数写入 \pyapi{cycle_counts}；\pyapi{fire} 时再把 \pyapi{config_ready} 拉高；\pyapi{wait_done} 会在有限 sequence 结束后把 \pyapi{config_ready} 拉回 0。这样 \pyapi{exp.readout.detection_time(...)} 扫 readout time 时，每个点都会通过 server 改 FPGA 里的 probe lasting，并且每次 acquisition 结束后旧状态机会被干净复位。这里的 \pyapi{100000000} 必须改成你的 address-switch 状态机实际 clock。
-
-\pyapi{ZLC_LEGACY_SINGLE_CAMERA_TRIGGER_CONFIRMED} 默认是 0，这是故意的。原始 \pyapi{address_switch} 的 run 分支里 \pyapi{trig} 没有明确驱动，而 \pyapi{emCCD} 每个 cycle 可能有 before/after 两个 pulse。上机前必须用示波器确认 qCMOS trigger 输入在 run 模式下每个 cycle 只看到一个正沿；确认后再设成 1。如果看到两个正沿，不能直接跑 readout fidelity scan，应该先改 Verilog 或切到真正的 pulse-table backend。
-
-如果你之后有真正的 FPGA runtime uploader，不需要改控制电脑 notebook；只要把 server 的 \pyapi{--prepare-command}、\pyapi{--fire-command}、\pyapi{--wait-done-command} 接到新的硬件 backend：
+\pyapi{ZLC_PS_VIVADO_PROGRAM_ON_RUN="1"} 会在第一次 run 时烧 bitstream 并加载 probes；确认成功后可以改成 \pyapi{"0"}。如果日后把 VIO upload 换成 UART、JTAG-to-AXI、PCIe 或 Ethernet，只需要替换 server 的 backend command；control PC notebook 仍然只调用 \pyapi{RemoteSequencer.prepare/fire/wait_done}。
 
 \begin{codeblock}[Backend hooks]
 prepare_callback(program)
@@ -301,7 +321,7 @@ wait_done_callback(program, timeout)
 safe_state_callback()
 \end{codeblock}
 
-control PC 的 notebook 仍然只调用 \pyapi{RemoteSequencer.prepare/fire/wait_done}。
+旧 \pyapi{legacy_address_switch} backend 仍然保留给 first-light 对比，但它不是推荐路径。它只能从 sequence 里提取单一 probe width 和 trigger count，不能表达任意 channel edge table，也无法保证 qCMOS trigger 与其它 pulse 完全来自同一个 runtime program。
 
 \section{硬件配置模板}
 现在有两个 hardware config template：
@@ -310,6 +330,29 @@ control PC 的 notebook 仍然只调用 \pyapi{RemoteSequencer.prepare/fire/wait
   \item \pyapi{manual_template.json}: \pyapi{QCMOSCamera} + \pyapi{ManualSequencer}。
   \item \pyapi{remote_template.json}: \pyapi{QCMOSCamera} + \pyapi{RemoteSequencer}。
 \end{itemize}
+
+\section{device loader 的扩展原则}
+\pyapi{load_devices} 保持故意简单：配置仍然是一个 JSON/dict device graph，每个节点有 \pyapi{type} 和 \pyapi{params}；依赖用 \pyapi{"$device:name"} 显式引用；构造后按 role 检查 \pyapi{CameraDevice/SequencerDevice/TrapArrayDevice} contract。这个设计比复杂插件系统更适合实验室：配置文件能直接读懂，错误会在连接前暴露。
+
+为了让后续硬件扩展不需要反复改 loader 本体，现在有两个扩展点：
+
+\begin{codeblock}[Python]
+na.register_device_class("MySequencer", MySequencer)
+na.device_class_registry()
+\end{codeblock}
+
+\pyapi{type} 也可以直接写完整 import path，例如：
+
+\begin{codeblock}[JSON]
+{
+  "sequencer": {
+    "type": "my_lab_devices.fpga.MySequencer",
+    "params": {"channels": ["trap", "cooling", "probe", "qcm_trigger"]}
+  }
+}
+\end{codeblock}
+
+这样未来加 AOD、microwave、DDS、shutter 或新的 camera adapter 时，只需要实现一个继承对应 base class 的 device，再在 config 中引用它。session、readout、timing 和 notebook 不应该知道这个类内部怎么打开硬件。
 
 真实使用前至少要检查：
 \begin{itemize}

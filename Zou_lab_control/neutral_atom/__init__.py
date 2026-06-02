@@ -36,8 +36,10 @@ from .devices import (
     apply_device_overrides,
     available_device_configs,
     compile_runtime_program,
+    device_class_registry,
     device_config_dir,
     load_devices,
+    register_device_class,
     serve_runtime_sequencer,
     validate_device_contract,
 )
@@ -83,11 +85,26 @@ def run_sequencer_server(*args, **kwargs):
     return run_server(*args, **kwargs)
 
 
+_PULSE_STREAMER_EXPORTS = {
+    "PulseStreamerHDLFiles",
+    "PulseStreamerProbeNames",
+    "generate_pulse_streamer_core",
+    "generate_pulse_streamer_top_example",
+    "validate_pulse_streamer_program",
+    "write_pulse_streamer_hdl_bundle",
+    "write_vivado_pulse_streamer_tcl",
+}
+
+
 def __getattr__(name: str):
     if name == "CommandSequencerBackend":
         from .devices.sequencer_server import CommandSequencerBackend
 
         return CommandSequencerBackend
+    if name in _PULSE_STREAMER_EXPORTS:
+        from .devices import fpga_pulse_streamer
+
+        return getattr(fpga_pulse_streamer, name)
     raise AttributeError(name)
 
 try:
@@ -115,6 +132,8 @@ __all__ = [
     "NeutralAtomSession",
     "PreflightReport",
     "Pulse",
+    "PulseStreamerHDLFiles",
+    "PulseStreamerProbeNames",
     "PulseSequence",
     "QCMOSCamera",
     "QCMOSConfig",
@@ -147,11 +166,14 @@ __all__ = [
     "count_trigger_pulses",
     "detect_image",
     "detect_atoms",
+    "device_class_registry",
     "device_config_dir",
     "estimate_threshold_fidelity",
     "estimate_thresholds",
     "exposure_from_sequence",
     "find_site_centers",
+    "generate_pulse_streamer_core",
+    "generate_pulse_streamer_top_example",
     "generate_verilog",
     "image_to_points",
     "imaging_sequence",
@@ -164,11 +186,15 @@ __all__ = [
     "plot_site_values",
     "plot_threshold_hist",
     "roi_counts",
+    "register_device_class",
     "run_sequencer_server",
     "serve_runtime_sequencer",
     "sequence_for_frame_count",
     "sort_centers_grid",
     "virtual_config",
+    "validate_pulse_streamer_program",
     "validate_device_contract",
+    "write_pulse_streamer_hdl_bundle",
+    "write_vivado_pulse_streamer_tcl",
     "write_verilog_bundle",
 ]
