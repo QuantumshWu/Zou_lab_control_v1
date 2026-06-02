@@ -469,7 +469,9 @@ detect 图不再只画一个抽象 occupancy heatmap。背景是 raw camera data
 \chapter{{Detection-time fidelity scan}}
 \section{{推荐调用}}
 \begin{{codeblock}}[Python]
-times = np.linspace(0.2e-3, 10e-3, 100)
+clock_hz = exp.devices.sequencer.clock_hz
+time_ticks = np.linspace(int(round(0.2e-3 * clock_hz)), int(round(10e-3 * clock_hz)), 100, dtype=int)
+times = time_ticks / clock_hz
 scan = exp.readout.detection_time(times, shots=30, live=True)
 \end{{codeblock}}
 

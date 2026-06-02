@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from math import erf, sqrt
+from math import ceil, erf, sqrt
 from typing import Any, Mapping, Sequence
 
 import matplotlib
@@ -698,6 +698,168 @@ def _label_with_unit(label: str, unit: str) -> str:
     return f"{label} ({unit})"
 
 
+def pulse_plot_channels(
+    sequence,
+    *,
+    channels: Sequence[str] | None = None,
+    include_always_off: bool = False,
+    minimum: int = 1,
+) -> list[str]:
+    """Return the channels a pulse plot should display."""
+
+    rows = _pulse_rows(sequence)
+    if channels is None:
+        if hasattr(sequence, "channels"):
+            channels = list(getattr(sequence, "channels"))
+        else:
+            channels = sorted({row["channel"] for row in rows})
+    ordered = [str(channel) for channel in (channels or [])]
+    if include_always_off:
+        return ordered or ["pulse"]
+    active = {row["channel"] for row in rows if row["value"] and row["duration"] > 0}
+    visible = [channel for channel in ordered if channel in active]
+    if not visible and ordered:
+        visible = ordered[: max(0, min(int(minimum), len(ordered)))]
+    return visible or ["pulse"]
+
+
+def pulse_plot_spec(
+    channel_count: int,
+    *,
+    data_width_px: int = 520,
+    rows_per_block: int = 10,
+    block_height_px: int = 360,
+    margins_px: tuple[int, int, int, int] = (110, 90, 100, 50),
+    dpi: int = 300,
+) -> FigureSpec:
+    """FigureSpec sized so pulse rows stay legible beyond 10 channels."""
+
+    rows_per_block = max(1, int(rows_per_block))
+    chunks = max(1, ceil(max(1, int(channel_count)) / rows_per_block))
+    return FigureSpec(data_px=(int(data_width_px), int(block_height_px) * chunks), margins_px=margins_px, dpi=int(dpi))
+
+
+def pulse_repeat_notation(
+    state_or_start=None,
+    repeat_end: int | None = None,
+    repeat_count: int | None = None,
+    *,
+    default_forever: bool = True,
+) -> str:
+    """Return a compact repeat label for pulse plots."""
+
+    if hasattr(state_or_start, "repeat_start"):
+        repeat_start = getattr(state_or_start, "repeat_start", None)
+        repeat_end = getattr(state_or_start, "repeat_end", None)
+        repeat_count = getattr(state_or_start, "repeat_count", None)
+        periods = list(getattr(state_or_start, "periods", ()))
+    else:
+        repeat_start = state_or_start
+        periods = []
+    if repeat_start is None or repeat_end is None:
+        return "repeat ∞" if default_forever else ""
+    repeat_count = 1 if repeat_count is None else int(repeat_count)
+    inner = f"P{int(repeat_start) + 1}-P{int(repeat_end) + 1} x{repeat_count}"
+    if periods and (int(repeat_start) != 0 or int(repeat_end) != len(periods) - 1):
+        return f"repeat ∞ + {inner}"
+    return f"repeat {inner}"
+
+
+def _pulse_period_starts_ns(periods, *, x_ns: float | None = None, time_step_ns: float | None = None) -> list[float]:
+    starts_ns = [0.0]
+    for period in periods:
+        duration_ns = period.duration_ns(x_ns=0.0 if x_ns is None else x_ns, time_step_ns=time_step_ns)
+        starts_ns.append(starts_ns[-1] + float(duration_ns))
+    return starts_ns
+
+
+def pulse_repeat_marker(
+    state_or_periods=None,
+    *,
+    repeat_start: int | None = None,
+    repeat_end: int | None = None,
+    repeat_count: int | None = None,
+    x_ns: float | None = None,
+    time_step_ns: float | None = None,
+    total_duration_s: float | None = None,
+    default_forever: bool = True,
+) -> tuple[float, float, str] | None:
+    """Return ``(start_s, stop_s, label)`` for a pulse-plot repeat bracket."""
+
+    periods = None
+    if hasattr(state_or_periods, "periods"):
+        periods = list(getattr(state_or_periods, "periods"))
+        repeat_start = getattr(state_or_periods, "repeat_start", repeat_start)
+        repeat_end = getattr(state_or_periods, "repeat_end", repeat_end)
+        repeat_count = getattr(state_or_periods, "repeat_count", repeat_count)
+        x_ns = getattr(state_or_periods, "x_ns", x_ns)
+        time_step_ns = getattr(state_or_periods, "time_step_ns", time_step_ns)
+    elif state_or_periods is not None:
+        periods = list(state_or_periods)
+
+    if periods is None:
+        if total_duration_s is None or not default_forever:
+            return None
+        return (0.0, float(total_duration_s), "∞")
+
+    starts_ns = _pulse_period_starts_ns(periods, x_ns=x_ns, time_step_ns=time_step_ns)
+    if repeat_start is None or repeat_end is None:
+        if not default_forever:
+            return None
+        return (0.0, starts_ns[-1] * 1e-9, "∞")
+    repeat_start = int(repeat_start)
+    repeat_end = int(repeat_end)
+    if repeat_start < 0 or repeat_end < repeat_start or repeat_end + 1 >= len(starts_ns):
+        return None
+    repeat_count = 1 if repeat_count is None else int(repeat_count)
+    return (starts_ns[repeat_start] * 1e-9, starts_ns[repeat_end + 1] * 1e-9, f"x{repeat_count}")
+
+
+def pulse_repeat_markers(
+    state_or_periods=None,
+    *,
+    repeat_start: int | None = None,
+    repeat_end: int | None = None,
+    repeat_count: int | None = None,
+    x_ns: float | None = None,
+    time_step_ns: float | None = None,
+    total_duration_s: float | None = None,
+    default_forever: bool = True,
+) -> list[tuple[float, float, str]]:
+    """Return all repeat brackets that should be drawn on a pulse plot."""
+
+    periods = None
+    if hasattr(state_or_periods, "periods"):
+        periods = list(getattr(state_or_periods, "periods"))
+        repeat_start = getattr(state_or_periods, "repeat_start", repeat_start)
+        repeat_end = getattr(state_or_periods, "repeat_end", repeat_end)
+        repeat_count = getattr(state_or_periods, "repeat_count", repeat_count)
+        x_ns = getattr(state_or_periods, "x_ns", x_ns)
+        time_step_ns = getattr(state_or_periods, "time_step_ns", time_step_ns)
+    elif state_or_periods is not None:
+        periods = list(state_or_periods)
+
+    if periods is None:
+        if total_duration_s is None or not default_forever:
+            return []
+        return [(0.0, float(total_duration_s), "∞")]
+
+    starts_ns = _pulse_period_starts_ns(periods, x_ns=x_ns, time_step_ns=time_step_ns)
+    total = starts_ns[-1] * 1e-9
+    if repeat_start is None or repeat_end is None:
+        return [(0.0, total, "∞")] if default_forever else []
+
+    repeat_start = int(repeat_start)
+    repeat_end = int(repeat_end)
+    if repeat_start < 0 or repeat_end < repeat_start or repeat_end + 1 >= len(starts_ns):
+        return []
+    repeat_count = 1 if repeat_count is None else int(repeat_count)
+    inner = (starts_ns[repeat_start] * 1e-9, starts_ns[repeat_end + 1] * 1e-9, f"x{repeat_count}")
+    if repeat_start == 0 and repeat_end == len(periods) - 1:
+        return [inner]
+    return [(0.0, total, "∞"), inner] if default_forever else [inner]
+
+
 class PulseSequenceFigure(BaseLivePlot):
     """Filled-rectangle pulse timeline for sequencer/verilog inspection."""
 
@@ -708,24 +870,40 @@ class PulseSequenceFigure(BaseLivePlot):
         sequence,
         *,
         channels: Sequence[str] | None = None,
+        channel_labels: Mapping[str, str] | None = None,
         colors: Sequence[str] | None = None,
         show_names: bool = False,
+        include_always_off: bool = False,
+        repeat_notation: str | None = None,
+        repeat_bracket: tuple[float, float, str] | None = None,
+        repeat_brackets: Sequence[tuple[float, float, str]] | None = None,
+        auto_height: bool = True,
         labels: Sequence[str] = ("Time (s)", "Pulse", "State"),
         **kwargs,
     ):
         self.sequence = sequence
         self.pulses = _pulse_rows(sequence)
         self.show_names = bool(show_names)
+        self.channel_labels = {str(k): str(v) for k, v in dict(channel_labels or {}).items()}
+        self.repeat_notation = "" if repeat_notation is None else str(repeat_notation)
+        if repeat_brackets is None:
+            repeat_brackets = [repeat_bracket] if repeat_bracket is not None else []
+        self.repeat_brackets = [tuple(item) for item in repeat_brackets if item is not None]
+        self.repeat_bracket = self.repeat_brackets[0] if self.repeat_brackets else None
         if channels is None:
             if hasattr(sequence, "channels"):
                 channels = list(getattr(sequence, "channels"))
             else:
                 channels = []
-        if channels is None or len(channels) == 0:
-            channels = sorted({row["channel"] for row in self.pulses}) or ["pulse"]
-        self.channels = [str(channel) for channel in channels]
+        self.channels = pulse_plot_channels(
+            sequence,
+            channels=channels,
+            include_always_off=include_always_off,
+        )
         self.channel_colors = list(colors or PULSE_COLORS)
         dummy_n = max(1, len(self.pulses))
+        if auto_height and not any(key in kwargs for key in ("spec", "data_px", "margins_px")):
+            kwargs["spec"] = pulse_plot_spec(len(self.channels))
         super().__init__(np.arange(dummy_n, dtype=float), np.zeros((dummy_n, 1), dtype=float), labels=labels, relim_mode="tight", **kwargs)
 
     @property
@@ -734,18 +912,36 @@ class PulseSequenceFigure(BaseLivePlot):
             return 1.0
         return max(float(row["stop"]) for row in self.pulses)
 
+    def _xlimits_for_timeline(self, start_min: float, stop_max: float, *, has_bracket: bool) -> tuple[float, float]:
+        span = max(float(stop_max - start_min), 1e-12)
+        margin_x = max(span * (0.065 if has_bracket else 0.025), 1e-12)
+        left_limit = start_min - margin_x if has_bracket else max(0.0, start_min - margin_x)
+        right_limit = stop_max + margin_x * (1.25 if has_bracket else 0.8)
+        return left_limit, right_limit
+
     def init_core(self) -> None:
         self.ax.set_ylabel(self.ylabel)
         color_map = {channel: self.channel_colors[i % len(self.channel_colors)] for i, channel in enumerate(self.channels)}
-        index_map = {channel: i for i, channel in enumerate(self.channels)}
         row_height = 0.64 if len(self.channels) <= 10 else max(0.42, 6.4 / len(self.channels))
         n_channels = len(self.channels)
+        index_map = {channel: n_channels - 1 - i for i, channel in enumerate(self.channels)}
         start_min = min([0.0] + [float(row["start"]) for row in self.pulses])
         stop_max = max([1e-12] + [float(row["stop"]) for row in self.pulses])
+        bracket_bounds: list[tuple[float, float]] = []
+        for repeat_bracket in self.repeat_brackets:
+            try:
+                bracket_start = float(repeat_bracket[0])
+                bracket_stop = float(repeat_bracket[1])
+            except Exception:
+                bracket_start = bracket_stop = float("nan")
+            if np.isfinite(bracket_start) and np.isfinite(bracket_stop) and bracket_stop > bracket_start:
+                bracket_bounds.append((bracket_start, bracket_stop))
+                start_min = min(start_min, bracket_start)
+                stop_max = max(stop_max, bracket_stop)
         span = max(stop_max - start_min, 1e-12)
         self.time_scale, self.time_unit = _pulse_time_unit(span)
         self.ax.set_xlabel(_label_with_unit(self.xlabel, self.time_unit))
-        pad_x = max(span * 0.035, 1e-6)
+        left_limit, right_limit = self._xlimits_for_timeline(start_min, stop_max, has_bracket=bool(bracket_bounds))
         self.off_lines = []
         baseline_offset = row_height / 2
         pulse_zorder = 3
@@ -757,8 +953,8 @@ class PulseSequenceFigure(BaseLivePlot):
             self.off_lines.append(
                 self.ax.hlines(
                     baseline_y,
-                    start_min - pad_x * 0.25,
-                    stop_max + pad_x * 0.25,
+                    left_limit,
+                    right_limit,
                     color=color,
                     linewidth=0.65,
                     alpha=1.0,
@@ -796,15 +992,30 @@ class PulseSequenceFigure(BaseLivePlot):
                     zorder=pulse_zorder + 1,
                 )
 
-        self.ax.set_xlim(start_min - pad_x, stop_max + pad_x)
-        self.ax.set_ylim(-0.62, n_channels - 0.38)
-        self.ax.set_yticks(np.arange(n_channels, dtype=float))
-        self.ax.set_yticklabels(self.channels)
+        self.ax.set_xlim(left_limit, right_limit)
+        ylim_top = n_channels - 0.38
+        if self.repeat_brackets:
+            ylim_top = n_channels + 0.45 + 0.16 * max(0, len(self.repeat_brackets) - 1)
+        self.ax.set_ylim(-0.62, ylim_top)
+        self.ax.set_yticks([index_map[channel] for channel in self.channels])
+        self.ax.set_yticklabels([self.channel_labels.get(channel, channel) for channel in self.channels])
         self.ax.tick_params(axis="y", labelsize=max(4.8, matplotlib.rcParams["ytick.labelsize"] - 1.2))
         for tick, channel in zip(self.ax.get_yticklabels(), self.channels):
             tick.set_color(color_map[channel])
+        if self.repeat_notation and not self.repeat_brackets:
+            self.ax.text(
+                0.995,
+                1.012,
+                self.repeat_notation,
+                transform=self.ax.transAxes,
+                ha="right",
+                va="bottom",
+                color="0.35",
+                fontsize=max(5.5, matplotlib.rcParams["legend.fontsize"] - 1.0),
+            )
+        self._draw_repeat_bracket(n_channels)
         self.ax.xaxis.set_major_locator(MaxNLocator(nbins=5, prune="lower"))
-        self.ax.xaxis.set_major_formatter(FuncFormatter(lambda value, _pos: _float2str_eng(value / self.time_scale, length=4)))
+        self.ax.xaxis.set_major_formatter(FuncFormatter(lambda value, _pos: "" if value < 0 else _float2str_eng(value / self.time_scale, length=4)))
         self.ax.tick_params(axis="x", which="both", bottom=True, top=False, labelbottom=True, labeltop=False, pad=2)
         self.ax.set_axisbelow(True)
         self.ax.grid(axis="x", color="0.88", linewidth=0.35, zorder=0)
@@ -815,6 +1026,75 @@ class PulseSequenceFigure(BaseLivePlot):
 
     def update_core(self) -> None:
         pass
+
+    def _draw_repeat_bracket(self, n_channels: int) -> None:
+        if not self.repeat_brackets:
+            return
+        colors = ("#6A6A6A", "#C96F3D", "#4F7EA8", "#8B6BB8")
+        self.repeat_bracket_artists = []
+        self.repeat_bracket_labels = []
+        xlim = self.ax.get_xlim()
+        span = max(float(xlim[1] - xlim[0]), 1e-12)
+        tick_base = span * 0.024
+        bracket_count = max(1, len(self.repeat_brackets))
+        for index, repeat_bracket in enumerate(self.repeat_brackets):
+            try:
+                start, stop, label = repeat_bracket
+                start = float(start)
+                stop = float(stop)
+                label = str(label)
+            except Exception:
+                continue
+            if not np.isfinite(start) or not np.isfinite(stop) or stop <= start:
+                continue
+            color = colors[index % len(colors)]
+            alpha = 0.58
+            outer_depth = max(0, bracket_count - 1 - index)
+            y_low = -0.42 - 0.10 * outer_depth
+            y_high = float(n_channels) - 0.12 + 0.14 * outer_depth
+            tick = tick_base
+            if stop > start:
+                tick = min(tick, max(stop - start, 0.0) * 0.2)
+            tick = max(tick, span * 0.006)
+            left_artist = self.ax.plot(
+                [start + tick, start, start, start + tick],
+                [y_high, y_high, y_low, y_low],
+                color=color,
+                alpha=alpha,
+                linewidth=1.05,
+                solid_capstyle="round",
+                clip_on=True,
+                zorder=8 + index,
+            )[0]
+            right_artist = self.ax.plot(
+                [stop - tick, stop, stop, stop - tick],
+                [y_high, y_high, y_low, y_low],
+                color=color,
+                alpha=alpha,
+                linewidth=1.05,
+                solid_capstyle="round",
+                clip_on=True,
+                zorder=8 + index,
+            )[0]
+            self.repeat_bracket_artists.extend([left_artist, right_artist])
+            label_artist = self.ax.text(
+                stop + tick * 0.12,
+                y_high + 0.035,
+                label,
+                ha="left",
+                va="bottom",
+                color=color,
+                fontfamily="DejaVu Sans",
+                alpha=alpha,
+                fontsize=max(5.5, matplotlib.rcParams["legend.fontsize"] - 0.8),
+                clip_on=False,
+                zorder=9 + index,
+            )
+            self.repeat_bracket_labels.append(label_artist)
+        if self.repeat_bracket_artists:
+            self.repeat_bracket_artist = self.repeat_bracket_artists[0]
+        if self.repeat_bracket_labels:
+            self.repeat_bracket_label = self.repeat_bracket_labels[-1]
 
     def _attach_interactions(self) -> None:
         self.tools = attach_interaction(self.ax, area=False)
@@ -1146,4 +1426,9 @@ __all__ = [
     "LiveLiveDis",
     "PulseSequenceFigure",
     "plot",
+    "pulse_plot_channels",
+    "pulse_plot_spec",
+    "pulse_repeat_marker",
+    "pulse_repeat_markers",
+    "pulse_repeat_notation",
 ]

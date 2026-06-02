@@ -142,7 +142,9 @@ standalone_shot.occupied.shape
 `detection_time` 不使用 virtual ground truth。它先拍 long-exposure reference images，然后对每个 detection time 的 ROI count distribution 做 threshold 和 Gaussian split fidelity 估计。接口默认 `live=True`；这里保留 live scan，cell 返回后 acquisition worker 和 frontend plot 会继续更新。等图跑完或想提前停止时，运行下一格 `scan.stop()`，再在后面的 cell 里做 decay fit。
 
 <!-- cell:code -->
-times = np.linspace(0.2e-3, 10e-3, 100)
+clock_hz = exp.devices.sequencer.clock_hz
+time_ticks = np.linspace(int(round(0.2e-3 * clock_hz)), int(round(10e-3 * clock_hz)), 100, dtype=int)
+times = time_ticks / clock_hz
 scan = exp.readout.detection_time(times, shots=30, live=True, display=True)
 
 <!-- cell:markdown -->

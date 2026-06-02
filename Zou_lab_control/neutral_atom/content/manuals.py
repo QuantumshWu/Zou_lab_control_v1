@@ -65,7 +65,9 @@ def generate_hardware_quickstart_figures(asset_dir: str | Path) -> dict[str, Pat
     detect_path = _save_plot(shot.plot, asset_dir / "hardware_detect.png")
     plt.close(shot.plot.fig)
 
-    times = np.linspace(0.2e-3, 8e-3, 60)
+    clock_hz = exp.devices.sequencer.clock_hz
+    time_ticks = np.linspace(int(round(0.2e-3 * clock_hz)), int(round(8e-3 * clock_hz)), 60, dtype=int)
+    times = time_ticks / clock_hz
     scan = exp.readout.detection_time(times, shots=20, live=False, display=False)
     scan_path = _save_plot(scan.plot, asset_dir / "hardware_detection_time.png")
     plt.close(scan.plot.fig)

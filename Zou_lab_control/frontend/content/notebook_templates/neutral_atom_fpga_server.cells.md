@@ -1,4 +1,4 @@
-<!-- cell:markdown -->
+﻿<!-- cell:markdown -->
 # Neutral atom FPGA pulse-streamer server
 
 这个 notebook 在 Verilog/FPGA 电脑上运行。它启动 `Zou_lab_control.neutral_atom` sequencer server，等待控制电脑上的 `RemoteSequencer` 连接。
@@ -29,9 +29,48 @@ import Zou_lab_control.neutral_atom as na
 zf.enable_long_output()
 
 <!-- cell:markdown -->
-## 1. Generate the fixed FPGA pulse-streamer HDL
+## 1. Build and program the fixed FPGA pulse-streamer bitstream
 
-第一次部署时先生成 HDL。把 `zlc_pulse_streamer.v` 加到 Vivado 工程，把 `zlc_pulse_streamer_top_example.v` 当作 wiring reference：它说明 VIO probe 的名字、宽度和方向。
+仓库里已经有 first-light Vivado 工程入口：
+
+```text
+fpga/pulse_streamer/
+  zlc_pulse_streamer.v
+  zlc_pulse_streamer_top_4ch.v
+  zlc_pulse_streamer_top_40ch.v
+  zlc_pulse_streamer_4ch.xdc
+  zlc_pulse_streamer_40ch.xdc.template
+  create_project_4ch.tcl
+  create_project_40ch.tcl
+  program_fpga_4ch.tcl
+  program_fpga_40ch.tcl
+  build_4ch_bitstream.bat
+  program_4ch_fpga.bat
+```
+
+在 Verilog/FPGA 电脑 PowerShell 运行：
+
+```powershell
+cd D:\GitHub\Zou_lab_control_v1
+.\fpga\pulse_streamer\build_4ch_bitstream.bat
+.\fpga\pulse_streamer\program_4ch_fpga.bat
+.\fpga\pulse_streamer\smoke_test_4ch_upload.bat
+```
+
+这些 bat 会把 Vivado/Python 的 errorlevel 传回 PowerShell；如果 synth/impl 没有 Complete，或者 `.bit/.ltx` 缺失，会提前失败，不要继续启动 server。
+
+这个 bitstream 把 FPGA 变成 runtime pulse-streamer。后续 notebook/server 只通过 VIO 写 `ticks/masks` edge table，不需要每次重新综合。
+
+`smoke_test_4ch_upload.bat` 不需要 qCMOS。先用示波器确认 `trap/cooling/probe/qcm_trigger` 输出符合：
+
+```text
+trap         high 0-10 us
+cooling      high 0-3 us
+probe        high 2-6 us
+qcm_trigger  high 2-3 us
+```
+
+这个 smoke-test bat 默认使用上一节 build 目录里的 `.xpr/.bit/.ltx`，因此新的 Vivado batch 进程也会加载 VIO probes。
 
 工程里需要一个 VIO IP，probe 约定如下：
 
@@ -47,6 +86,8 @@ probe_in0  zlc_running    width 1
 probe_in1  zlc_done       width 1
 ```
 
+server 查 probe 时会先找 `zlc_reset/zlc_start/...` 这些语义名；如果 Vivado `.ltx` 里只有 `probe_out0/probe_out1/...`，也会自动 fallback 到对应端口名。
+
 `out[0:3]` 分别接到 `trap/cooling/probe/qcm_trigger` 的真实 FPGA 输出 pin。qCMOS 必须接 `qcm_trigger` 这个输出。
 
 <!-- cell:code -->
@@ -58,19 +99,35 @@ CLOCK_HZ = 100_000_000.0
 MAX_EDGES = 1024
 TICK_WIDTH = 32
 
-HDL_DIR = Path(r"D:\zlc_pulse_streamer_hdl")
-hdl_files = na.write_pulse_streamer_hdl_bundle(
-    HDL_DIR,
-    channels=CHANNELS,
-    max_edges=MAX_EDGES,
-    tick_width=TICK_WIDTH,
-)
-hdl_files
+# 40-channel example after building/programming the 40ch top and filling the XDC:
+# CHANNELS = ["trap", "cooling", "probe", "qcm_trigger"] + [f"ch{i:02d}" for i in range(4, 40)]
+# TRIGGER_CHANNELS = ["qcm_trigger"]
+
+FPGA_DIR = PROJECT_ROOT / "fpga" / "pulse_streamer"
+for filename in (
+    "zlc_pulse_streamer.v",
+    "zlc_pulse_streamer_top_4ch.v",
+    "zlc_pulse_streamer_top_40ch.v",
+    "zlc_pulse_streamer_4ch.xdc",
+    "zlc_pulse_streamer_40ch.xdc.template",
+    "create_project_4ch.tcl",
+    "create_project_40ch.tcl",
+    "program_fpga_4ch.tcl",
+    "program_fpga_40ch.tcl",
+    "build_4ch_bitstream.bat",
+    "program_4ch_fpga.bat",
+    "build_40ch_bitstream.bat",
+    "program_40ch_fpga.bat",
+    "smoke_test_4ch.py",
+    "smoke_test_4ch_upload.bat",
+):
+    path = FPGA_DIR / filename
+    print(path.exists(), path)
 
 <!-- cell:markdown -->
 ## 2. Configure Vivado paths and backend commands
 
-在 Vivado 里用上面生成的 HDL 建工程、连接 VIO 和 output pins、generate bitstream。然后把下面三个路径改成真实 `.xpr/.bit/.ltx`。
+如果用仓库里的 4ch first-light 入口，上一节的 `build_4ch_bitstream.bat` 已经完成建工程、创建 VIO、综合、实现和生成 bitstream。下面三个路径应指向这个脚本生成的 `.xpr/.bit/.ltx`。
 
 第一次烧板子时设 `ZLC_PS_VIVADO_PROGRAM_ON_RUN="1"`；烧成功后可以改回 `"0"`，后续只加载 probes 和写 runtime table。
 
@@ -80,10 +137,10 @@ PORT = 18861
 STATE_DIR = Path(r"D:\zlc_sequencer_state")
 
 os.environ["ZLC_PS_VIVADO_BIN"] = r"C:\Xilinx\Vivado\2019.2\bin\vivado.bat"
-os.environ["ZLC_PS_VIVADO_PROJECT"] = r"D:\time_sequence\zlc_pulse_streamer\zlc_pulse_streamer.xpr"
-os.environ["ZLC_PS_VIVADO_BIT"] = r"D:\time_sequence\zlc_pulse_streamer\zlc_pulse_streamer.runs\impl_1\main.bit"
-os.environ["ZLC_PS_VIVADO_LTX"] = r"D:\time_sequence\zlc_pulse_streamer\zlc_pulse_streamer.runs\impl_1\main.ltx"
-os.environ["ZLC_PS_VIVADO_PROGRAM_ON_RUN"] = "1"
+os.environ["ZLC_PS_VIVADO_PROJECT"] = str(PROJECT_ROOT / "fpga" / "pulse_streamer" / "build" / "zlc_pulse_streamer_4ch" / "zlc_pulse_streamer_4ch.xpr")
+os.environ["ZLC_PS_VIVADO_BIT"] = str(PROJECT_ROOT / "fpga" / "pulse_streamer" / "build" / "zlc_pulse_streamer_4ch" / "zlc_pulse_streamer_4ch.runs" / "impl_1" / "zlc_pulse_streamer_top_4ch.bit")
+os.environ["ZLC_PS_VIVADO_LTX"] = str(PROJECT_ROOT / "fpga" / "pulse_streamer" / "build" / "zlc_pulse_streamer_4ch" / "zlc_pulse_streamer_4ch.runs" / "impl_1" / "zlc_pulse_streamer_top_4ch.ltx")
+os.environ["ZLC_PS_VIVADO_PROGRAM_ON_RUN"] = "0"
 os.environ["ZLC_PS_VIO_FILTER"] = 'CELL_NAME=~"*vio*"'
 os.environ["ZLC_PS_MAX_EDGES"] = str(MAX_EDGES)
 os.environ["ZLC_PS_TICK_WIDTH"] = str(TICK_WIDTH)
@@ -157,3 +214,22 @@ na.run_sequencer_server(
     wait_done_command=WAIT_DONE_COMMAND,
     safe_state_command=SAFE_STATE_COMMAND,
 )
+
+<!-- cell:markdown -->
+## 5. Optional: run the pulse GUI on this FPGA computer
+
+`run_sequencer_server(...)` 会阻塞当前 kernel。要在 FPGA/Vivado 电脑本机打开 pulse GUI，请在另一个 Python 进程或另一个 notebook kernel 里运行下面的代码，并连接 `127.0.0.1:{PORT}`。GUI 仍然只是前端；实际 prepare/fire/wait 通过正在运行的 server 执行。新建 pulse 默认名是 `pulse_YYYYMMDD_HHMMSS`。`channels` 是硬件 channel 名和 FPGA bit order，例如 `ch00/ch01/...`；Name 面板左侧固定显示硬件 channel，右侧是可选 display label，GUI 不会自动猜物理含义。右侧 name 改动后，Delay 行、period checkbox 和 Preview y 轴会显示这个 label。传入 `clock_hz=CLOCK_HZ` 后，GUI 左侧 `step (ns)` 会默认等于 FPGA tick，例如 100 MHz 时是 10 ns。40-channel 展开时，channel name、delay 和 period checkbox 共用整体纵向滚动，方便检查每一路是否对齐。`X` 会把该 channel 的所有 period 设为 off，但不自动隐藏；`Hide Off` 只看 period 是否为 on，delay/name 会保留，重新 Add Channel 会按硬件顺序回原位。Preview 页会画未展开 period table 的 pulse 图，默认隐藏 always-off channel；如果 channel 有 display label，Preview y 轴显示 label。没有 bracket 时是 `repeat ∞`；bracket 覆盖所有 period 时是有限外层 repeat；bracket 在内部时整体仍然是 `repeat ∞`，Preview 会画整段 `∞` 和内部 `xN` 两套不同颜色的 bracket，状态栏显示 `repeat ∞ + Pm-Pn xN`。bracket 画在真实 start/stop 时间节点上，xlim 只负责留显示空间，负时间 tick label 会被隐藏。`Save Pulse` 默认保存到仓库 `pulses/` 目录；`Save Figure` 是 Preview 顶栏最右侧的一行按钮，单独保存 preview PNG。若窗口在当前显示器上偏大，可以传 `scale=0.82, window_ratio=0.90`。
+
+<!-- cell:code -->
+# import Zou_lab_control.frontend as zf
+# import Zou_lab_control.neutral_atom as na
+#
+# local_sequencer = na.RemoteSequencer(
+#     host="127.0.0.1",
+#     port=PORT,
+#     channels=CHANNELS,
+#     clock_hz=CLOCK_HZ,
+#     trigger_channels=TRIGGER_CHANNELS,
+# )
+# pulse_gui = zf.show_pulse_gui(channels=CHANNELS, sequencer=local_sequencer, scale=0.82, window_ratio=0.90)
+# pulse_gui

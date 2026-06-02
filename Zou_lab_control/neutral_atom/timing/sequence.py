@@ -6,10 +6,15 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, Sequence
 import json
+import math
 
 import numpy as np
 
 from ..core.analysis import finite_float, positive_int
+
+
+CLOCK_GRID_RTOL = 1e-12
+CLOCK_GRID_ATOL_TICKS = 1e-9
 
 
 @dataclass(frozen=True)
@@ -127,8 +132,14 @@ class PulseSequence:
             if pulse.duration <= 0:
                 errors.append(f"pulse {pulse.channel!r} has non-positive duration.")
             if clock is not None:
-                start_tick = int(round(pulse.start * clock))
-                stop_tick = int(round(pulse.stop * clock))
+                start_tick = _time_to_clock_tick(pulse.start, clock)
+                stop_tick = _time_to_clock_tick(pulse.stop, clock)
+                if start_tick is None:
+                    errors.append(f"pulse {pulse.channel!r} start={pulse.start:g} s is not on the {clock:g} Hz clock grid.")
+                    start_tick = int(round(pulse.start * clock))
+                if stop_tick is None:
+                    errors.append(f"pulse {pulse.channel!r} stop={pulse.stop:g} s is not on the {clock:g} Hz clock grid.")
+                    stop_tick = int(round(pulse.stop * clock))
                 if stop_tick <= start_tick:
                     errors.append(f"pulse {pulse.channel!r} is shorter than one clock tick at {clock:g} Hz.")
             by_channel.setdefault(pulse.channel, []).append((pulse.start, pulse.stop, index))
@@ -353,6 +364,14 @@ def positive_float(value, name: str) -> float:
     if out <= 0:
         raise ValueError(f"{name} must be > 0.")
     return out
+
+
+def _time_to_clock_tick(time_s: float, clock_hz: float) -> int | None:
+    raw_tick = time_s * clock_hz
+    tick = int(round(raw_tick))
+    if not math.isclose(raw_tick, tick, rel_tol=CLOCK_GRID_RTOL, abs_tol=CLOCK_GRID_ATOL_TICKS):
+        return None
+    return tick
 
 
 __all__ = [

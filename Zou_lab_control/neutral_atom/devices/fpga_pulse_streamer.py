@@ -125,11 +125,12 @@ module {module_name} #(
 
     localparam integer MAX_EDGES = {actual_edges};
 
-    reg [TICK_WIDTH-1:0] tick_mem [0:MAX_EDGES-1];
-    reg [CHANNEL_COUNT-1:0] mask_mem [0:MAX_EDGES-1];
+    (* ram_style = "distributed" *) reg [TICK_WIDTH-1:0] tick_mem [0:MAX_EDGES-1];
+    (* ram_style = "distributed" *) reg [CHANNEL_COUNT-1:0] mask_mem [0:MAX_EDGES-1];
 
     reg [CHANNEL_COUNT-1:0] state_mask = {{CHANNEL_COUNT{{1'b0}}}};
     reg [TICK_WIDTH-1:0] time_count = {{TICK_WIDTH{{1'b0}}}};
+    reg [TICK_WIDTH-1:0] final_tick = {{TICK_WIDTH{{1'b0}}}};
     reg [EDGE_ADDR_WIDTH:0] edge_index = {{(EDGE_ADDR_WIDTH + 1){{1'b0}}}};
     reg [EDGE_ADDR_WIDTH:0] active_count = {{(EDGE_ADDR_WIDTH + 1){{1'b0}}}};
 
@@ -140,7 +141,6 @@ module {module_name} #(
 
     wire start_edge = start_sync && !start_prev;
     wire prog_we_edge = prog_we_sync && !prog_we_prev;
-    wire [TICK_WIDTH-1:0] final_tick = (active_count == 0) ? {{TICK_WIDTH{{1'b0}}}} : tick_mem[active_count[EDGE_ADDR_WIDTH-1:0] - 1'b1];
     wire [EDGE_ADDR_WIDTH-1:0] edge_addr = edge_index[EDGE_ADDR_WIDTH-1:0];
 
     assign out = state_mask;
@@ -161,6 +161,7 @@ module {module_name} #(
             done <= 1'b0;
             state_mask <= {{CHANNEL_COUNT{{1'b0}}}};
             time_count <= {{TICK_WIDTH{{1'b0}}}};
+            final_tick <= {{TICK_WIDTH{{1'b0}}}};
             edge_index <= {{(EDGE_ADDR_WIDTH + 1){{1'b0}}}};
             active_count <= {{(EDGE_ADDR_WIDTH + 1){{1'b0}}}};
         end else if (start_edge && !running) begin
@@ -168,6 +169,7 @@ module {module_name} #(
             done <= (prog_count == 0);
             state_mask <= {{CHANNEL_COUNT{{1'b0}}}};
             time_count <= {{TICK_WIDTH{{1'b0}}}};
+            final_tick <= (prog_count == 0) ? {{TICK_WIDTH{{1'b0}}}} : tick_mem[prog_count[EDGE_ADDR_WIDTH-1:0] - 1'b1];
             edge_index <= {{(EDGE_ADDR_WIDTH + 1){{1'b0}}}};
             active_count <= prog_count;
         end else if (running) begin
@@ -511,6 +513,11 @@ def _vivado_common_tcl(
         probes_line,
         f"set vio_filter {{{vio_filter}}}",
         program_line,
+        "if {$project ne \"\" && ![file exists $project]} { error \"Vivado project not found: $project\" }",
+        "if {$probes ne \"\" && ![file exists $probes]} { error \"Vivado probe file not found: $probes\" }",
+        "if {$program_on_run ne \"0\" && ($bitstream eq \"\" || ![file exists $bitstream])} {",
+        "    error \"Vivado bitstream not found for programming: $bitstream\"",
+        "}",
         "if {$project ne \"\" && [file exists $project]} { open_project $project }",
         "open_hw_manager",
         "connect_hw_server -allow_non_jtag",
@@ -549,35 +556,54 @@ def _vivado_common_tcl(
         "        puts \"  $line\"",
         "    }",
         "}",
-        "proc zlc_probe {vio name} {",
-        "    set probe [lindex [get_hw_probes $name -of_objects $vio] 0]",
-        "    if {$probe eq \"\"} {",
-        "        zlc_list_probes $vio",
-        "        error \"VIO probe '$name' was not found.\"",
+        "proc zlc_probe {vio names} {",
+        "    set matches {}",
+        "    foreach name $names {",
+        "        set probe [lindex [get_hw_probes $name -of_objects $vio] 0]",
+        "        if {$probe ne \"\"} { lappend matches $probe }",
         "    }",
-        "    return $probe",
+        "    if {[llength $matches] == 1} { return [lindex $matches 0] }",
+        "    if {[llength $matches] == 0} {",
+        "        foreach candidate [get_hw_probes -of_objects $vio] {",
+        "            set candidate_name [get_property NAME $candidate]",
+        "            foreach name $names {",
+        "                if {$candidate_name eq $name || [string match \"*/$name\" $candidate_name] || [string match \"*$name*\" $candidate_name]} {",
+        "                    lappend matches $candidate",
+        "                    break",
+        "                }",
+        "            }",
+        "        }",
+        "    }",
+        "    set unique_matches {}",
+        "    foreach probe $matches {",
+        "        if {[lsearch -exact $unique_matches $probe] < 0} { lappend unique_matches $probe }",
+        "    }",
+        "    if {[llength $unique_matches] == 1} { return [lindex $unique_matches 0] }",
+        "    zlc_list_probes $vio",
+        "    if {[llength $unique_matches] > 1} { error \"VIO probe aliases '$names' matched multiple probes.\" }",
+        "    error \"VIO probe aliases '$names' were not found.\"",
         "}",
         "proc zlc_set_probe {vio name value} {",
         "    set probe [zlc_probe $vio $name]",
         "    set_property OUTPUT_VALUE_RADIX UNSIGNED $probe",
         "    set_property OUTPUT_VALUE $value $probe",
         "    commit_hw_vio $probe",
-        "    puts \"ZLC pulse-streamer VIO: $name=$value\"",
+        "    puts \"ZLC pulse-streamer VIO: [lindex $name 0]=$value\"",
         "}",
         "proc zlc_read_probe {vio name} {",
         "    refresh_hw_vio $vio",
         "    set probe [zlc_probe $vio $name]",
         "    return [get_property INPUT_VALUE $probe]",
         "}",
-        f"set zlc_reset_probe {{{probe_names.reset}}}",
-        f"set zlc_start_probe {{{probe_names.start}}}",
-        f"set zlc_prog_we_probe {{{probe_names.prog_we}}}",
-        f"set zlc_prog_addr_probe {{{probe_names.prog_addr}}}",
-        f"set zlc_prog_tick_probe {{{probe_names.prog_tick}}}",
-        f"set zlc_prog_mask_probe {{{probe_names.prog_mask}}}",
-        f"set zlc_prog_count_probe {{{probe_names.prog_count}}}",
-        f"set zlc_running_probe {{{probe_names.running}}}",
-        f"set zlc_done_probe {{{probe_names.done}}}",
+        f"set zlc_reset_probe {{{probe_names.reset} probe_out0}}",
+        f"set zlc_start_probe {{{probe_names.start} probe_out1}}",
+        f"set zlc_prog_we_probe {{{probe_names.prog_we} probe_out2}}",
+        f"set zlc_prog_addr_probe {{{probe_names.prog_addr} probe_out3}}",
+        f"set zlc_prog_tick_probe {{{probe_names.prog_tick} probe_out4}}",
+        f"set zlc_prog_mask_probe {{{probe_names.prog_mask} probe_out5}}",
+        f"set zlc_prog_count_probe {{{probe_names.prog_count} probe_out6}}",
+        f"set zlc_running_probe {{{probe_names.running} probe_in0}}",
+        f"set zlc_done_probe {{{probe_names.done} probe_in1}}",
     ]
 
 

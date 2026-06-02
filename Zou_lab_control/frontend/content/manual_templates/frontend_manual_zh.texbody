@@ -26,6 +26,102 @@ pl = zf.plot(data_x, data_y, labels=("X", "Y", "Counts"))
 scan = zf.run(data_x, measure, labels=("X", "Y", "Counts"))
 \end{codeblock}
 
+\section{Pulse GUI 也是 front-end}
+\pyapi{zf.show_pulse_gui} 是 PyQt pulse editor。它和 \pyapi{zf.plot/zf.run} 的边界一致：GUI 负责显示、编辑、保存和按钮事件；硬件动作仍然由传入的 neutral-atom \pyapi{SequencerDevice} 完成。它不会创建新的 sequencer，也不会绕过 \pyapi{PulseSequence} 或 \pyapi{RemoteSequencer}。
+
+\begin{codeblock}[Python]
+import Zou_lab_control.frontend as zf
+import Zou_lab_control.neutral_atom as na
+
+channels = ["ch00", "ch01", "ch02", "ch03"]
+state = na.PulseTableState(channels=channels)
+
+# Offline editor: design and save a pulse without touching hardware.
+gui = zf.show_pulse_gui(state=state)
+sequence = gui.to_sequence()
+\end{codeblock}
+
+连接真实 sequencer 时，只把 sequencer 作为参数传进去：
+
+\begin{codeblock}[Python]
+sequencer = na.RemoteSequencer(
+    host="192.168.0.20",
+    port=18861,
+    channels=channels,
+    clock_hz=100_000_000,
+    trigger_channels=["ch03"],
+)
+
+gui = zf.show_pulse_gui(channels=channels, sequencer=sequencer)
+\end{codeblock}
+
+GUI 的数据模型是 \pyapi{PulseTableState}。它把旧 pulse GUI 里好用的 period-card 交互保留下来：每个 period 有一个 duration、一个单位下拉框，以及一组 channel checkbox；delay、\pyapi{x_ns} 和 repeat bracket 在导出 \pyapi{PulseSequence} 前展开。保存文件是 JSON，不是旧 \pyapi{.npz}，这样 notebook、测试和 GUI 都能读同一个结构。这里的 \pyapi{channels} 永远是硬件 channel 名和 FPGA bit order，例如 \pyapi{ch00/ch01/...}；GUI 不会自动把 \pyapi{ch00} 猜成 \pyapi{trap}。如果想在界面里显示实验含义，在 Name 面板右侧填 display label，或者在 JSON/API 中显式保存 \pyapi{channel_labels}。Name 面板左侧仍然显示硬件 channel；右侧 name 改动后，Delay 行、period checkbox 和 Preview y 轴都会显示这个 label。
+
+minimal time 由 \pyapi{PulseTableState.time_step_ns} 表示。离线打开 GUI 时默认是 1 ns；如果用 \pyapi{show_pulse_gui(..., sequencer=sequencer)} 或 \pyapi{show_pulse_gui(experiment=exp)}，GUI 会用 \pyapi{sequencer.clock_hz} 自动设置 \pyapi{step (ns)}，例如 100 MHz 对应 10 ns。duration、delay 和 \pyapi{x_ns} 必须是这个 step 的整数倍；按 \pyapi{Prepare} 时还会按实际 sequencer clock 再检查一次，避免半个 FPGA tick 被 round。
+
+\pyapi{x_ns} 是保留下来的扫描变量。默认值保存在 state 里；真正生成 sequence 时可以临时覆盖它，因此扫某个 duration 不需要重建整张 pulse 表：
+
+\begin{codeblock}[Python]
+state = na.PulseTableState(
+    channels=["trap", "probe", "qcm_trigger"],
+    time_step_ns=10,
+    periods=[
+        na.PulsePeriod(1000, (1, 0, 0), unit="ns"),
+        na.PulsePeriod("x", (1, 1, 1), unit="str (ns)"),
+        na.PulsePeriod(1000, (0, 0, 0), unit="ns"),
+    ],
+    x_ns=2000,
+)
+
+for width_ns in [500, 1000, 2000, 4000]:
+    sequence = state.to_sequence(x_ns=width_ns, time_step_ns=10)
+    program = state.compile(clock_hz=100_000_000, x_ns=width_ns)
+\end{codeblock}
+
+\pyapi{state.with_x(width_ns)} 会返回一个带新默认 \pyapi{x_ns} 的 copy，适合保存不同 preset；\pyapi{state.to_sequence(x_ns=...)} 更适合 scan loop 中临时生成。\pyapi{state.total_duration_steps(x_ns=..., time_step_ns=...)} 可以在不打开 GUI 时直接检查整数 step 数；\pyapi{state.compile(clock_hz=...)} 返回最终上传的 \pyapi{ticks/masks} edge table。
+
+40 channel 时，GUI 默认只显示硬件顺序前 4 路；其它 channel 留在 hidden-channel 下拉框里。用户可以逐个 \pyapi{Add Channel}，用 \pyapi{Hide Off} 收起所有 period 中全程为 off 的 channel，也可以 \pyapi{Show All} 做全局检查。每个 delay 行右侧的 \pyapi{X} 会把该 channel 在所有 period 中设为 off，但不自动隐藏；delay 和 display name 会保留在 \pyapi{PulseTableState} 里。\pyapi{Hide Off} 只看 period 是否为 on，delay 非零也可以隐藏；它会把符合条件的 channel 从 \pyapi{Channel Names}、\pyapi{Delay/X} 和 period card 中一起收起，并至少保留 4 路可见 channel。即使所有 channel 都是 off，也会留下前 4 路作为可编辑起点。Add Channel 会按硬件 channel 顺序插回原位，不会 append 到最后。可见 channel 较多时，\pyapi{Channel Names and Duration}、\pyapi{Delay and X} 和所有 period card 的 channel 行共用同一个纵向滚动区域；这样向下滚动时，channel name、delay 和每个 period 的 checkbox 始终保持同一行对齐。period 时间轴有独立的横向滚动条，用来容纳更多 period card。隐藏 channel 只是前端视图，完整 channel 顺序、channel label 和 delay 仍然保存在 \pyapi{PulseTableState} 中，因此 FPGA bit index 不会因为隐藏/显示而改变。
+
+GUI 窗口默认固定为当前屏幕可用区域的 90\%，避免拖动窗口时破坏 period row 对齐。若笔记本屏幕较小，或 Windows 显示缩放让窗口显得过大，可以在启动时手动传入 \pyapi{scale} 或 \pyapi{window_ratio}，例如 \pyapi{show_pulse_gui(..., scale=0.82, window_ratio=0.90)}。\pyapi{scale} 只改变前端控件尺寸和字体；\pyapi{window_ratio} 只改变固定窗口大小；两者都不改变 \pyapi{PulseTableState}、channel 顺序或 FPGA timing。
+
+\begin{notebox}[Preview 页和保存文件]
+GUI 的 \pyapi{Edit} 页负责编辑 period card；\pyapi{Preview} 页在切换过去时自动调用 \pyapi{zf.plot(sequence, kind="pulse")} 画 pulse 图，不需要手动 refresh。Preview 用未展开的 period table 作图；Prepare/Compile 给硬件的 sequence 仍会按 repeat 展开。默认只画不是 always-off 的 channel，打开 \pyapi{Show always-off} 开关后会显示完整 channel list；如果 channel 有 display label，Preview 的 y 轴显示 label，保存和编译仍然使用硬件 channel。没有 repeat bracket 时，整段 sequence 视为持续重复，bracket 覆盖整段并标记 \(\infty\)。如果 bracket 覆盖所有 period，它就是最外层 repeat，Preview 标记 \pyapi{xN}，状态栏显示 \pyapi{repeat P1-PM xN}。如果 bracket 只在内部 period 上，整体仍然是 \(\infty\) repeat，内部 bracket 只是其中一个 finite sub-loop；Preview 会同时画整段 \(\infty\) bracket 和内部 \pyapi{xN} bracket，并用不同颜色区分，状态栏显示例如 \pyapi{repeat ∞ + P2-P4 x3}。bracket 的竖线画在真实 start/stop 时间节点上，plot 只通过 xlim 留出左侧显示空间，并隐藏负时间 tick label。\pyapi{Save Pulse} 保存 JSON；\pyapi{Save Figure} 是 Preview 顶栏最右侧的一行按钮，保存当前 preview PNG。默认目录是仓库根目录下的 \pyapi{pulses/}；需要换目录时可以设置环境变量 \pyapi{ZLC_PULSE_DIR}。新建 pulse 的默认名字是 \pyapi{pulse_YYYYMMDD_HHMMSS}，保存对话框会用这个名字作为默认文件名。
+\end{notebox}
+
+\begin{notebox}[界面结构]
+Pulse GUI 保留 Confocal GUI 的 Fluent 面板节奏：顶部状态栏显示文件/运行状态和摘要；左侧是 channel 名称与总时长；中间是 \pyapi{x_ns}、minimal step 和 channel delay；右侧是横向 period-card 时间轴；底部是等宽的大按钮网格。下拉框、popup list、toggle switch、spinbox 和滚动条使用同一套 Fluent 样式，因此 hidden-channel 下拉框、repeat count 的 \pyapi{FluentDoubleSpinBox}、Preview 的 \pyapi{Show always-off} 开关和 40-channel 总滚动条的 hover、selection、handle 形状是一致的。这个 double spinbox 复刻 Confocal GUI：右侧有蓝色 Plus/Minus 区域、白色上下三角和一个 \pyapi{.} step 按钮。Edit 页的 \pyapi{Collapse Left} 可以临时把 Name/Delay 两个面板收成侧边窄条，给 period timeline 腾出更多横向空间；按侧边 \pyapi{Show} 可以恢复。
+\end{notebox}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.98\textwidth]{assets/pulse_gui_camera_edit.png}
+  \caption{Pulse GUI 打开 40-channel camera imaging preset 时的 Edit 页。左侧保留硬件 channel，右侧 display label 会同步到 Delay 行和 period checkbox。}
+\end{figure}
+
+在仓库根目录打开 GUI 时，推荐使用 standalone 入口。它不需要 experiment config；默认创建 40 路本地 \pyapi{RuntimeSequencer} 预览，硬件 channel 为 \pyapi{ch00...ch39}，先显示前 4 路，其它 channel 留在下拉框中：
+
+\begin{codeblock}[PowerShell]
+.\pulse_gui.bat
+\end{codeblock}
+
+连接已经运行的 FPGA server 时，只需要加 remote 参数：
+
+\begin{codeblock}[PowerShell]
+.\pulse_gui.bat --remote-host 127.0.0.1 --remote-port 18861
+\end{codeblock}
+
+控制电脑连接 FPGA/Vivado 电脑时，把 \pyapi{127.0.0.1} 换成 FPGA 电脑 IP。需要改 channel list 或缩放时：
+
+\begin{codeblock}[PowerShell]
+.\pulse_gui.bat --channels ch00 ch01 ch02 ch03 --trigger-channels ch03 --scale 1.0 --window-ratio 0.90
+\end{codeblock}
+
+如果已经在 PyQt 程序或 notebook Qt 事件循环里，通常只需要保存返回的 \pyapi{gui} handle，不需要再手动调用 \pyapi{exec_()}。
+
+\begin{notebox}[PyQt 依赖]
+\pyapi{Zou_lab_control.frontend} 的普通 plotting API 不要求 PyQt。只有调用 \pyapi{show_pulse_gui} 或直接 import \pyapi{Zou_lab_control.frontend.pulse_gui} 时才需要安装 \pyapi{PyQt5}。这样 notebook plotting、manual 生成和轻量测试不会被 GUI 依赖卡住。
+\end{notebox}
+
 \chapter{内部架构与数据流}
 \section{模块分层}
 frontend 现在分成几层，每层只做一类事情。理解这个分层比记住每个参数更重要，因为以后接 PyQt 或新增实验图形时，应该尽量只替换对应层。

@@ -1,4 +1,4 @@
-<!-- cell:markdown -->
+﻿<!-- cell:markdown -->
 # Zou_lab_control.frontend tutorial
 
 这个 notebook 展示统一的 Jupyter 画图接口。第一格直接把 `..` 加入 `sys.path` / `PYTHONPATH`，然后导入 `Zou_lab_control.frontend`，不需要先安装本仓库。
@@ -79,6 +79,52 @@ pulse_plot = zf.plot(
     labels=("Time (s)", "Pulse", "State"),
     title="10-channel timing check",
 )
+
+<!-- cell:markdown -->
+## Pulse table model and PyQt pulse GUI
+
+`PulseTableState` 是 pulse GUI 和 notebook 共用的 period-card 模型。GUI 是可选前端；不打开 GUI 时，也可以直接用这个模型生成 `PulseSequence`。新建 pulse 默认名是 `pulse_YYYYMMDD_HHMMSS`。`channels` 是硬件 channel 名和 FPGA bit order，例如 `ch00/ch01/...`；GUI 不会自动把 `ch00` 猜成 `trap`。Name 面板左侧固定显示硬件 channel，右侧是可选 display label；右侧 name 改动后，Delay 行、period checkbox 和 Preview y 轴会跟着显示这个 label。`time_step_ns` 是 minimal time，所有 duration、delay 和 `x_ns` 都要是它的整数倍；连接 sequencer 的 GUI 会默认用 `1e9 / sequencer.clock_hz`。40-channel 时默认只显示硬件顺序前 4 路，其它 channel 可以在 GUI 里临时添加或隐藏。`X` 会把该 channel 的所有 period 设为 off，但不自动隐藏；`Hide Off` 只看 period 是否为 on，delay 非零也可以隐藏；display name 和 delay 会保留，重新 Add Channel 会按硬件顺序插回原位。Preview 页自动调用 `zf.plot(..., kind="pulse")`，默认隐藏 always-off channel；如果 channel 有 display label，Preview y 轴显示 label，并用左右竖直 bracket 标记未展开 period table 里的 repeat 区间。没有 bracket 时是 `repeat ∞`；bracket 覆盖所有 period 时是有限外层 `repeat Pm-Pn xN`；bracket 在内部时整体仍然是 `repeat ∞`，Preview 会画整段 `∞` 和内部 `xN` 两套不同颜色的 bracket，状态栏显示 `repeat ∞ + Pm-Pn xN`。bracket 画在真实 start/stop 时间节点上，xlim 只负责留显示空间，负时间 tick label 会被隐藏。`Save Pulse` 默认保存到仓库 `pulses/` 目录；`Save Figure` 是 Preview 顶栏最右侧的一行按钮，单独保存 preview PNG。窗口固定为屏幕可用区域的一部分；小屏幕也可以手动传 `scale=0.82, window_ratio=0.90`。
+
+<!-- cell:code -->
+import Zou_lab_control.neutral_atom as na
+
+pulse_state = na.PulseTableState(
+    channels=[f"ch{i:02d}" for i in range(40)],
+    x_ns=50,
+    time_step_ns=10,
+)
+pulse_state.set_period_state(0, "ch00", 1)
+pulse_sequence = pulse_state.to_sequence(time_step_ns=10)
+pulse_state.total_duration_steps(time_step_ns=10)
+
+api_pulse_plot = zf.plot(
+    pulse_sequence,
+    kind="pulse",
+    channels=pulse_state.channels,
+    title="PulseTableState API sequence",
+)
+
+# Uncomment on a desktop Python/Qt environment:
+# pulse_gui = zf.show_pulse_gui(state=pulse_state, scale=0.82, window_ratio=0.90)
+
+<!-- cell:markdown -->
+`x_ns` 可以临时覆盖，用来扫某个 duration 或 delay。下面这个例子不打开 GUI，只用 API 生成四个不同宽度的 sequence，并编译成 100 MHz FPGA 的 integer tick edge table。
+
+<!-- cell:code -->
+x_scan_state = na.PulseTableState(
+    channels=["trap", "probe", "qcm_trigger"],
+    time_step_ns=10,
+    periods=[
+        na.PulsePeriod(1000, (1, 0, 0), unit="ns", name="pre"),
+        na.PulsePeriod("x", (1, 1, 1), unit="str (ns)", name="image"),
+        na.PulsePeriod(1000, (0, 0, 0), unit="ns", name="idle"),
+    ],
+)
+
+x_widths_ns = [250, 500, 1000, 2000]
+x_sequences = [x_scan_state.to_sequence(x_ns=width, time_step_ns=10) for width in x_widths_ns]
+x_programs = [x_scan_state.compile(clock_hz=100_000_000, x_ns=width) for width in x_widths_ns]
+[(x_scan_state.total_duration_steps(x_ns=width, time_step_ns=10), program.ticks[-1]) for width, program in zip(x_widths_ns, x_programs)]
 
 <!-- cell:markdown -->
 ## Live 2D scan

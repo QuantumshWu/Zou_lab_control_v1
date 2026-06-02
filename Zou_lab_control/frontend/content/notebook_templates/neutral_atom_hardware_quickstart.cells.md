@@ -1,4 +1,4 @@
-<!-- cell:markdown -->
+﻿<!-- cell:markdown -->
 # Neutral atom hardware quickstart
 
 这个 notebook 是控制电脑上的硬件流程：连接 qCMOS 和 sequencer，配置 pulse sequence，拍 raw image，校准 sitemap 和 threshold，detect，最后扫 detection time。
@@ -84,6 +84,18 @@ preflight.summary()
 preflight.raise_if_failed()
 
 <!-- cell:markdown -->
+## Optional: edit pulses with the PyQt pulse GUI
+
+GUI 只是 pulse 的前端。它读取 `exp.devices.sequencer.channels`，编辑 `PulseTableState`，然后在 `Prepare/Fire/Wait/Safe` 按钮里调用同一个 sequencer。新建 pulse 默认名是 `pulse_YYYYMMDD_HHMMSS`。`channels` 是硬件 channel 名和 FPGA bit order，例如 `ch00/ch01/...`；Name 面板左侧固定显示硬件 channel，右侧是可选 display label，GUI 不会自动猜物理含义。右侧 name 改动后，Delay 行、period checkbox 和 Preview y 轴会显示这个 label。左侧 `step (ns)` 来自 `1e9 / exp.devices.sequencer.clock_hz`，所有 duration、delay 和 `x` 都必须是这个 minimal time 的整数倍。40-channel server 也可以用这个入口；默认只显示硬件顺序前 4 路，其它 channel 从下拉框里添加。`X` 会把该 channel 的所有 period 设为 off，但不自动隐藏；`Hide Off` 只看 period 是否为 on，delay 非零也可以隐藏；display name 和 delay 会保留，重新 Add Channel 会按硬件顺序插回原位。全通道展开时，channel name、delay 和 period checkbox 共用整体纵向滚动。Preview 页会画未展开 period table 的 pulse 图，默认隐藏 always-off channel；如果 channel 有 display label，Preview y 轴显示 label。没有 bracket 时是 `repeat ∞`；bracket 覆盖所有 period 时是有限外层 repeat；bracket 在内部时整体仍然是 `repeat ∞`，Preview 会画整段 `∞` 和内部 `xN` 两套不同颜色的 bracket，状态栏显示 `repeat ∞ + Pm-Pn xN`。bracket 画在真实 start/stop 时间节点上，xlim 只负责留显示空间，负时间 tick label 会被隐藏。`Save Pulse` 默认保存到仓库 `pulses/` 目录；`Save Figure` 是 Preview 顶栏最右侧的一行按钮，单独保存 preview PNG。日常 camera preset 在 `pulses/camera_imaging_40ch.json`。小屏幕可以传 `scale=0.82, window_ratio=0.90`。
+
+如果当前环境没有桌面/Qt，跳过这个 cell，继续用 `exp.timing.configure_imaging(...)` 和 API 配置 pulse。
+
+<!-- cell:code -->
+# Uncomment on a desktop Python/Qt environment.
+# pulse_gui = zf.show_pulse_gui(experiment=exp, scale=0.82, window_ratio=0.90)
+# pulse_gui
+
+<!-- cell:markdown -->
 ## Capture a camera image
 
 `capture` 只显示 raw camera frame；site overlay 只属于 calibration/readout/detect 图。
@@ -127,7 +139,9 @@ occupancy_grid, shot.summary()
 这个 scan 使用 camera images，不使用任何 ground truth。第一次上机默认同步跑完；确认流程稳定后可以改成 `live=True`，再用 `scan.stop()` 结束 live scan。
 
 <!-- cell:code -->
-times = np.linspace(0.2e-3, 8e-3, 40)
+clock_hz = exp.devices.sequencer.clock_hz
+time_ticks = np.linspace(int(round(0.2e-3 * clock_hz)), int(round(8e-3 * clock_hz)), 40, dtype=int)
+times = time_ticks / clock_hz
 scan = exp.readout.detection_time(times, shots=30, live=False, display=True)
 fit_result, popt = scan.data_figure.decay(is_display=False)
 scan.summary(), fit_result, popt

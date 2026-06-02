@@ -1,6 +1,6 @@
 \chapter{目标和边界}
-\section{这版先跑通什么}
-这一版 \pyapi{Zou_lab_control.neutral_atom} 的目标不是一次性写完完整控制系统，而是先把真实实验最早会用到的一条线跑通：
+\section{当前目标}
+\pyapi{Zou_lab_control.neutral_atom} 当前提供一条真实硬件上最早会用到的实验闭环：
 
 \begin{codeblock}[Experiment path]
 connect devices
@@ -12,7 +12,7 @@ connect devices
   -> scan detection time and readout fidelity
 \end{codeblock}
 
-这条线看起来短，但它决定了以后控制框架的关键边界：camera 是 device，sequencer 是 device，readout 是一个有机 subsystem，frontend 只负责画图和 live refresh，analysis 函数可以 standalone 处理已经保存的 array。这样做的原因很实际：以后换真实 qCMOS、FPGA、AOD rearrangement、GUI 面板或 database logging 时，实验逻辑不应该重新变成一个互相耦合的 notebook 巨块。
+这条线看起来短，但它决定了控制框架的关键边界：camera 是 device，sequencer 是 device，readout 是一个有机 subsystem，frontend 只负责画图和 live refresh，analysis 函数可以 standalone 处理已经保存的 array。以后换真实 qCMOS、FPGA、AOD rearrangement、GUI 面板或 database logging 时，实验逻辑仍应沿着这些边界扩展。
 
 \section{当前承诺和暂时不承诺的部分}
 当前版本承诺以下事情：
@@ -28,11 +28,11 @@ connect devices
 \begin{itemize}
   \item 不把 address rearrangement、AOD waveform、full scheduler 一次性写完。
   \item 不把旧 \pyapi{PythonCamDemo} 或旧 address-switch Python 接口作为 notebook 调用路径；真实硬件通过新的 \pyapi{QCMOSCamera}、\pyapi{RemoteSequencer} 和 \pyapi{sequencer_server} 边界进入。
-  \item 不承诺已经替你完成最终 FPGA runtime bitstream；Verilog/FPGA 电脑先通过新 server 的 command backend 调 Vivado Tcl 或你自己的 FPGA backend。
+  \item 不包含最终实验版 FPGA runtime bitstream；Verilog/FPGA 电脑先通过新 server 的 command backend 调 Vivado Tcl 或实验室自定义 FPGA backend。
 \end{itemize}
 
 \begin{notebox}[核心取舍]
-这版把架构骨架放对，但实现只覆盖第一条真实实验闭环。这样你可以尽快拿真实 camera 和 trigger 反馈，同时后面加 device 和实验任务时不用推翻接口。
+当前版本先覆盖第一条真实实验闭环，同时保留清晰的 device、timing、analysis 和 frontend 边界。后续增加 device、实验任务或 GUI 时，可以沿着这些接口扩展。
 \end{notebox}
 
 \section{不要让 notebook 变成命令行}
@@ -93,7 +93,7 @@ class CameraDevice(BaseDevice):
         ...
 \end{codeblock}
 
-\pyapi{acquire} 是底层动作：arm buffer、准备 sequencer、启动采集、读 frame、返回 image list。\pyapi{capture} 是 notebook convenience：调用 \pyapi{acquire}，把最后一帧画出来，并返回 \pyapi{CaptureResult}。它永远只画 raw data；如果 capture 图上自动出现 sitemap 圈，那就是严重架构错误，因为这表示 camera 层知道了 readout calibration 或 simulator truth。
+\pyapi{acquire} 是底层动作：arm buffer、准备 sequencer、启动采集、读 frame、返回 image list。\pyapi{capture} 是 notebook convenience：调用 \pyapi{acquire}，把最后一帧画出来，并返回 \pyapi{CaptureResult}。它只显示 raw camera frame。site centers、ROI circles 和 occupancy overlays 属于 readout/calibration 结果，因此只出现在 \pyapi{sitemap}、\pyapi{thresholds}、\pyapi{detect} 等 readout 图里。
 
 \section{为什么 readout 是 subsystem}
 \pyapi{sitemap}、\pyapi{thresholds}、\pyapi{detect} 和 \pyapi{detection_time} 是一组有机动作。它们共享同一份 \pyapi{TrapCalibration}：
@@ -218,7 +218,7 @@ FPGA/Vivado PC
 \pyapi{ManualSequencer} 是 first-light 工具。它做的事情很少：
 \begin{itemize}
   \item 在 \pyapi{prepare} 阶段验证 sequence 和 trigger 数量。
-  \item 在 \pyapi{fire} 阶段打印提示：camera 已经 arm，请你启动 FPGA/manual trigger。
+  \item 在 \pyapi{fire} 阶段打印提示：camera 已经 arm，需要启动 FPGA/manual trigger。
   \item 不假装自己知道硬件已经真的完成，只返回一个保守的 snapshot state。
 \end{itemize}
 
@@ -246,18 +246,296 @@ tutorials/neutral_atom_fpga_server.ipynb
 
 默认路径是新的 \pyapi{fpga_pulse_streamer} backend：固定烧一个 runtime-programmable pulse-streamer bitstream，control PC 每次只上传 \pyapi{PulseSequence}；FPGA PC 把 sequence 编译成 \pyapi{RuntimeSequenceProgram} 的 \pyapi{ticks/masks} edge table，再通过 VIO 写进 FPGA RAM。这样 readout time、multi-frame trigger、cooling/probe/trap pulse 都来自同一张 edge table，不再把 sequence 压扁成旧 \pyapi{pulse_lasting/cycle_counts} 两个参数。
 
-第一次部署先生成 HDL：
+\section{pulse-streamer 设计、资源和 latency}
+\pyapi{zlc_pulse_streamer} 的核心思想是 edge table，而不是逐条 pulse 解释。Python 先把 \pyapi{PulseSequence} 展开成按时间排序的边沿表：
+
+\begin{codeblock}[Runtime program]
+tick[i] = integer FPGA clock tick
+mask[i] = complete output state at tick[i]
+\end{codeblock}
+
+\pyapi{mask} 是所有输出 channel 的完整状态。比如 40 路输出时，\pyapi{mask} 是 40 bit：bit 0 对应 \pyapi{channels[0]}，bit 1 对应 \pyapi{channels[1]}，以此类推。多个 channel 如果在同一时刻改变，它们会合并成同一条 edge；FPGA 到时刻后一次性更新整个 \pyapi{state_mask}，因此 qCMOS trigger、probe、trap、cooling 和其它 TTL channel 都来自同一个时钟域。
+
+生成的 Verilog core 内部主要有：
+
+\begin{codeblock}[Core state]
+tick_mem[MAX_EDGES]   // TICK_WIDTH bits per edge
+mask_mem[MAX_EDGES]   // CHANNEL_COUNT bits per edge
+state_mask            // current output register
+time_count            // counter while running
+edge_index            // next edge to apply
+active_count          // uploaded edge count
+\end{codeblock}
+
+\pyapi{prepare} 阶段只写 RAM，不出光、不触发相机。当前 VIO backend 会先让 \pyapi{reset=1}，写入 \pyapi{prog_count}，然后对每个 edge 写 \pyapi{prog_addr/prog_tick/prog_mask}，再把 \pyapi{prog_we} 拉高/拉低打一拍。写完后释放 \pyapi{reset}。这个动作可以很慢，因为它走 Vivado、hw server 和 JTAG；但它发生在 camera arm 之前，不参与 shot 内部 timing。
+
+\pyapi{fire} 阶段只负责给 \pyapi{zlc_start} 一个边沿。qCMOS acquisition 的顺序是：先 \pyapi{prepare(sequence)}，然后 camera \pyapi{cap_start} 进入等待 external trigger 状态，最后 \pyapi{fire()}。因此 Python/Vivado/JTAG 的启动延迟只决定“这一发 shot 什么时候开始”，不决定 shot 内每个 pulse 的相对时间。start edge 到达 FPGA 以后，所有 pulse edge 都由 FPGA clock 推进。
+
+在 \pyapi{CLOCK_HZ=100000000} 时，一个 tick 是 10 ns。Python 侧把物理时间换成 tick 使用 \pyapi{round(time * clock_hz)}，所以单个 edge 的量化误差约为半个 tick，即 5 ns 量级。FPGA core 看到 \pyapi{start} 后有一个固定 pipeline offset：约一拍同步、一拍检测 start、一拍应用 \pyapi{tick=0} 的第一条 mask；100 MHz 下约 30 ns。这个 offset 是固定的，可以并入 qCMOS trigger channel 的定义；edge 之间的相对 timing 仍然在 10 ns tick grid 上。
+
+资源估算时，真正占空间的是 edge table。40 路、32 bit tick 时，每条 edge 约为：
+
+\begin{codeblock}[Edge size]
+32 bit tick + 40 bit mask = 72 bit per edge
+\end{codeblock}
+
+对应的 RAM 量级是：
+
+\begin{codeblock}[40-channel edge-table estimate]
+MAX_EDGES=1024   ->  73,728 bit  ~=   9 KiB
+MAX_EDGES=4096   -> 294,912 bit  ~=  36 KiB
+MAX_EDGES=16384  ->   1.18 Mbit ~= 144 KiB
+\end{codeblock}
+
+当前 first-light HDL 为了让 \pyapi{tick_mem[edge_index]} 和 \pyapi{mask_mem[edge_index]} 在同一拍被简单读取，显式使用 Vivado distributed RAM，也就是 LUTRAM。对 40 路、1024 edges 来说，大约是 72k bit 量级，约等于一千多个 64x1 LUTRAM 单元，再加少量 counter/register/VIO 逻辑；这对 Artix-7 35T 档位是合理的 first-light 规模。更大的 4096/16384-edge 表也可以作为方向，但那时要看 Vivado utilization 里的 LUT/SLICEM 占用；如果 sequence 真的长期需要大表，应把 edge table 改成 BRAM-friendly 的同步读 pipeline 或 AXI/BRAM 写接口，而不是继续无限放大 VIO/LUTRAM 版本。
+
+本地历史 Vivado 工程使用的 FPGA part 是 \pyapi{xc7a35tfgg484-2}，也就是 Artix-7 35T 这个资源档。这个档位有大约 33k logic cells、20k LUT、41k flip-flop、50 个 36 Kb block RAM 和 90 个 DSP slice。对 40 路、1024-edge first-light pulse-streamer 来说，LUT/FF/BRAM 都不是主要瓶颈。更实际的瓶颈是三件事：
+
+\begin{itemize}
+  \item 是否有 40 个已经引出的、空闲的、同电平兼容的物理输出 pin。
+  \item 输出到实验仪器时是否需要 buffer、level shifter 或 line driver。FPGA pin 不应直接当作耐插拔的实验室 BNC/TTL 输出。
+  \item VIO 上传速度。当前 \pyapi{prepare} 大约需要 \pyapi{5 * edge_count} 次 \pyapi{commit_hw_vio} 加少量常数项，适合 first deployment 和小表；如果要高重复率 scan 或很长 sequence，后续应换成 AXI、UART、SPI、Ethernet、JTAG-to-AXI 或 FIFO/BRAM 写接口。
+\end{itemize}
+
+因此推荐的第一版参数是 \pyapi{CHANNEL_COUNT=40}、\pyapi{MAX_EDGES=1024}、\pyapi{TICK_WIDTH=32}、\pyapi{CLOCK_HZ=100000000}。先综合、看 utilization 和 timing，再根据真实 sequence 的 edge 数决定是否升到 4096 或切换 BRAM pipeline。40 路输出本身只是一个 40 bit register 和 40 个 top-level output；工程工作量主要在 top wrapper、VIO probe 宽度和 XDC pin map。
+
+\section{和 Confocal\_GUI pulse API 的对应关系}
+旧 \filepath{Confocal_GUIv2} 里的 \pyapi{BasePulse} 把 pulse 存成 \pyapi{data_matrix}：每一行是一个 duration，后面跟 8 个 channel 的 0/1 状态；\pyapi{read_data()} 再把它变成每个 channel 的 time slice。这个设计有三个值得保留的思想：
+
+\begin{itemize}
+  \item 用户层描述 pulse，而不是手写硬件寄存器。
+  \item channel delay 和 repeat 在编译阶段展开，硬件只执行最终时序。
+  \item 真正打开 pulse 前先进入 off/safe state，结束时能回到 final/safe state。
+\end{itemize}
+
+当前 \pyapi{Zou_lab_control.neutral_atom} 采用同样的边界，但数据结构换成更适合相机触发和多 PC 控制的形式：
+
+\begin{codeblock}[Concept map]
+Confocal_GUI BasePulse.data_matrix
+  duration row + per-channel state
+  delay_array / repeat_info
+  off_pulse() -> on_pulse_core()
+
+Zou_lab_control PulseTableState / PulseSequence
+  GUI period cards + visible channel subset
+  x_ns / delays / repeat bracket
+  to_sequence()
+
+SequencerDevice
+  absolute physical start/duration
+  sequence.delay(channel, dt) / sequence.repeated(frames)
+  compile_runtime_program() -> ticks/masks edge table
+  prepare(reset/upload) -> fire(start) -> wait_done()/safe_state()
+\end{codeblock}
+
+\pyapi{PulseTableState} 是给 GUI 和 notebook 共用的编辑模型。它保留旧 pulse GUI 的 period-card 思路：每一段有一个 duration，并给出这一段内所有可见 channel 的 0/1 状态；\pyapi{x_ns}、每路 delay 和 repeat bracket 在编译阶段展开。它不拥有硬件，也不直接写 VIO。用户按 period 编辑完成后，调用 \pyapi{state.to_sequence()} 得到 \pyapi{PulseSequence}；再由 \pyapi{RemoteSequencer.prepare/fire/wait_done} 或本地 \pyapi{RuntimeSequencer} 执行。
+
+\pyapi{PulseSequence} 保留物理时间语义，\pyapi{compile_runtime_program} 才把它投影到 FPGA clock tick。这样 notebook 和 GUI 里看到的是 \pyapi{probe}、\pyapi{qcm_trigger} 和 \pyapi{trap} 的物理时间；FPGA 看到的是已经展开、排序并验证过的 \pyapi{tick/mask} 表。旧 \pyapi{.npz pulse_file} 不作为新硬件路径的输入格式；新 GUI 使用 \pyapi{PulseTableState.save("pulse.json")} 保存 JSON，里面包含 channel list、可见 channel、period、delay、repeat 和 channel display label。需要 scan 某个 pulse width 时，可以在 Python 层改 \pyapi{x_ns} 或重建 \pyapi{PulseTableState/PulseSequence}，然后重新 \pyapi{prepare}。
+
+所有 pulse 数字最终都必须是 minimal time 的整数倍。编辑模型里的 minimal time 是 \pyapi{PulseTableState.time_step_ns}；连接 100 MHz FPGA server 时，GUI 默认把它设成 10 ns。API 也可以显式写 \pyapi{time_step_ns=10}。\pyapi{state.total_duration_steps(...)} 返回整数 step 数，\pyapi{state.compile(clock_hz=...)} 会按 \pyapi{1e9/clock_hz} 再检查一次 FPGA tick。直接使用 \pyapi{PulseSequence} 的用户也会在 \pyapi{sequence.validate(clock_hz=...)} 和 server prepare 阶段被检查；如果某个 start/stop 不在 clock grid 上，会在上传前报错，而不是 silently round。
+
+\pyapi{x_ns} 的使用方式接近旧 pulse GUI 里的 \pyapi{x}，但它留在 Python/GUI 前端层。duration 或 delay 选择 \pyapi{str (ns)} 时可以写 \pyapi{x} 表达式，例如 \pyapi{x}、\pyapi{1000-x} 或 \pyapi{2*x+50}。扫某个 duration 时，不需要重写整张表：
+
+\begin{codeblock}[Python]
+state = na.PulseTableState(
+    channels=["trap", "probe", "qcm_trigger"],
+    time_step_ns=10,  # 100 MHz FPGA clock -> 10 ns tick
+    periods=[
+        na.PulsePeriod(1000, (1, 0, 0), unit="ns", name="pre"),
+        na.PulsePeriod("x", (1, 1, 1), unit="str (ns)", name="image"),
+        na.PulsePeriod(1000, (0, 0, 0), unit="ns", name="idle"),
+    ],
+)
+
+clock_hz = exp.devices.sequencer.clock_hz
+clock_step_ns = 1e9 / clock_hz
+for width_ns in [500, 1000, 2000, 4000]:
+    seq = state.to_sequence(x_ns=width_ns, time_step_ns=clock_step_ns)
+    program = state.compile(clock_hz=clock_hz, trigger_channels=["qcm_trigger"], x_ns=width_ns)
+    exp.devices.sequencer.prepare(seq)
+    exp.devices.sequencer.fire()
+    exp.devices.sequencer.wait_done(timeout=1.0)
+\end{codeblock}
+
+每个 \pyapi{x_ns} 值都会生成一张新的 edge table，所以自动 scan 的正常顺序是 \pyapi{prepare(seq_for_this_x)}，camera arm，\pyapi{fire()}，然后 \pyapi{wait_done()}。如果只是离线检查，可以用 \pyapi{state.with_x(width_ns)} 生成带不同默认 \pyapi{x_ns} 的 copy，或者用 \pyapi{state.to_sequence(x_ns=...)} 临时覆盖。
+
+安全状态也对应得很直接：旧 pulse streamer 的 \pyapi{off_pulse()} 会先写一个全低 pattern；这里 \pyapi{prepare} 会先拉高 \pyapi{reset}，\pyapi{validate_pulse_streamer_program} 要求最后一条 mask 为 0，\pyapi{safe_state} 会把 \pyapi{start/prog_we} 拉低并保持 \pyapi{reset=1}。因此每个正常 sequence 的最后状态、abort 状态和下一次 prepare 的初态都是全低输出。
+
+\section{Pulse GUI 的位置和启动方式}
+Pulse GUI 是 \pyapi{Zou_lab_control.frontend} 的前端控件，不是新的硬件层。它只编辑 \pyapi{PulseTableState}，并在用户按 \pyapi{Prepare/Fire/Wait/Safe} 时调用传入的 \pyapi{SequencerDevice}。因此同一个 GUI 可以在控制电脑上连远程 FPGA server，也可以在 Verilog/FPGA 电脑上通过 \pyapi{127.0.0.1} 连接本机正在运行的 server。
+
+最简单的 standalone 打开方式是在仓库根目录运行：
+
+\begin{codeblock}[PowerShell]
+.\pulse_gui.bat
+\end{codeblock}
+
+这个入口不读取 experiment config。默认创建 40 路本地 \pyapi{RuntimeSequencer} 预览，硬件 channel 名是 \pyapi{ch00...ch39}，不自动把前几路显示成 \pyapi{trap/cooling/probe/qcm_trigger}；如果需要这些实验含义，请在 GUI 的 Name 右侧手动填写或加载保存过的 JSON。窗口固定为当前屏幕可用区域的 90\%；如果 FPGA server 已经在本机运行，使用：
+
+\begin{codeblock}[PowerShell]
+.\pulse_gui.bat --remote-host 127.0.0.1 --remote-port 18861
+\end{codeblock}
+
+控制电脑连接 FPGA/Vivado 电脑时，把 \pyapi{127.0.0.1} 换成 FPGA 电脑 IP。
+
+在控制电脑上，如果已经有实验 session：
+
+\begin{codeblock}[Python]
+import Zou_lab_control.frontend as zf
+import Zou_lab_control.neutral_atom as na
+
+exp = na.connect(
+    "remote_template",
+    sequencer={"host": "192.168.0.20", "port": 18861},
+    open_devices=True,
+)
+
+gui = zf.show_pulse_gui(experiment=exp)
+\end{codeblock}
+
+\pyapi{show_pulse_gui(experiment=exp)} 会从 \pyapi{exp.devices.sequencer.channels} 读取真实 channel list，并把按钮连到同一个 sequencer。按 \pyapi{Prepare} 时，GUI 先把 period card 编译成 \pyapi{PulseSequence}，再调用 \pyapi{RemoteSequencer.prepare(sequence)}；按 \pyapi{Fire} 时调用 \pyapi{RemoteSequencer.fire()}；按 \pyapi{Wait} 时调用 \pyapi{wait_done(timeout=10)}；按 \pyapi{Safe} 时调用 \pyapi{set_safe_state()} 或 \pyapi{abort()}。
+
+如果 GUI 启动时传入了 sequencer，它会用 \pyapi{sequencer.clock_hz} 自动设置左侧的 \pyapi{step (ns)}。例如 100 MHz server 显示 10 ns。用户仍然可以手动改 \pyapi{step (ns)} 做离线设计；但按 \pyapi{Prepare} 时会按实际 sequencer clock 再检查一次，任何不在 FPGA tick 上的 duration、delay 或 \pyapi{x_ns} 都会在上传前报错。
+
+在 Verilog/FPGA 电脑上，如果 server 已经在另一个 terminal 或 notebook kernel 中运行，可以从第二个 Python 进程连接本机 server：
+
+\begin{codeblock}[Python]
+import Zou_lab_control.frontend as zf
+import Zou_lab_control.neutral_atom as na
+
+channels = ["ch00", "ch01", "ch02", "ch03"]
+sequencer = na.RemoteSequencer(
+    host="127.0.0.1",
+    port=18861,
+    channels=channels,
+    clock_hz=100_000_000,
+    trigger_channels=["ch03"],
+)
+
+gui = zf.show_pulse_gui(channels=channels, sequencer=sequencer)
+\end{codeblock}
+
+如果只是离线设计 pulse，不连接硬件，也可以不给 sequencer：
+
+\begin{codeblock}[Python]
+state = na.PulseTableState(channels=["ch00", "ch01", "ch02", "ch03"])
+gui = zf.show_pulse_gui(state=state)
+sequence = gui.to_sequence()
+sequence.validate(clock_hz=100_000_000, channels=state.channels).raise_if_failed()
+\end{codeblock}
+
+这种模式下 GUI 可以保存/加载 JSON，也可以导出 \pyapi{PulseSequence} 给 notebook 继续画图或 preflight；\pyapi{Prepare/Fire} 不会直接驱动硬件。
+
+\section{Pulse GUI 的 40 channel 使用方式}
+40 channel bitstream 的 channel list 由 server 启动参数和 \pyapi{RemoteSequencer.channels} 共同定义。这个 list 是硬件 channel 名和 FPGA bit order，例如 \pyapi{ch00/ch01/...}，不是 display label。GUI 默认不会把 40 路全部铺满屏幕，而是先显示硬件顺序前 4 路；其它 channel 保留在右下角的 hidden-channel 下拉框中。这样简单成像 pulse 不会被 40 个 checkbox 淹没。
+
+period card 仍然沿用旧 pulse GUI 的横向时间轴：每张 card 是一段 duration，左右拖动可以重排 period。每张 card 标题显示当前位置，例如 \pyapi{Period 1/5}。右侧时间轴有独立的横向滚动条；channel name、delay 和 period checkbox 共用同一个纵向滚动区域，因此 40 路展开时每个 channel 行仍然对齐。可见 channel 超过 16 路时，GUI 会自动使用 compact 尺寸，方便临时 \pyapi{Show All} 检查 40 路状态。
+
+GUI 会根据屏幕自动缩放并固定窗口大小。如果当前显示器较小，可以在启动时传入 \pyapi{scale} 或 \pyapi{window_ratio}，例如 \pyapi{show_pulse_gui(..., scale=0.82, window_ratio=0.90)}。\pyapi{scale} 只影响控件尺寸；\pyapi{window_ratio} 只影响窗口占屏比例；二者都不改变 sequence 时间、channel 顺序或 FPGA bit mask。
+
+常用操作如下：
+\begin{itemize}
+  \item \pyapi{Add Channel}: 从隐藏列表里把某一路按硬件 channel 顺序加入当前视图，不改变其它 channel 的 pulse 状态。
+  \item \pyapi{Name}: 左侧固定显示硬件 channel，例如 \pyapi{ch00}；右侧是可选 display label。GUI 不会自动猜 \pyapi{ch00} 是什么设备。右侧 name 改动后，Delay 行、period checkbox 和 Preview y 轴会显示这个 label，但保存和编译仍然使用左侧硬件 channel。
+  \item \pyapi{X}: 把当前 channel 在所有 period 中设为 off，但不自动隐藏；display name 和 delay 会留在 state 中。
+  \item \pyapi{Hide Off}: 一次性隐藏所有 period 中全程为 off 的 channel，并至少保留 4 路可见 channel。它只检查 period 是否为 on；delay 非零不会阻止隐藏。channel label 和 delay 会留在 state 中；隐藏只是视图变化。
+  \item \pyapi{Show All}: 临时显示全部 channel，用于检查 40 路 pin map 或做全局审查。
+  \item \pyapi{Add Period/Remove Period}: 增删 period card。每张 card 的 duration 可以用 \pyapi{ns/us/ms/s}，也可以用 \pyapi{str (ns)} 写 \pyapi{x} 表达式，例如 \pyapi{1000-x}。
+  \item \pyapi{Add Bracket}: 在 period 序列中加入 repeat bracket；拖动 bracket 或 period card 可以改变 repeat 范围。repeat count 使用复刻 Confocal GUI 的 \pyapi{FluentDoubleSpinBox}：右侧有蓝色 Plus/Minus 区域、白色上下三角和一个 \pyapi{.} step 按钮。
+  \item \pyapi{Preview}: 调用 frontend pulse plot 画未展开 period table 的预览图。默认只画不是 always-off 的 channel，也可以打开 \pyapi{Show always-off} 显示全部 channel；如果 channel 有 display label，Preview y 轴显示 label。没有 bracket 时，整体 sequence 持续重复，左右竖直 bracket 覆盖整段并标记 \(\infty\)。如果 bracket 覆盖所有 period，它就是最外层 finite repeat，Preview 标记 \pyapi{xN}。如果 bracket 只包住内部 period，整体仍然是 \(\infty\)，Preview 会同时画整段 \(\infty\) bracket 和内部 \pyapi{xN} bracket，并用不同颜色区分；状态栏显示例如 \pyapi{repeat ∞ + P2-P4 x3}。bracket 的竖线画在真实 start/stop 时间节点上，plot 只通过 xlim 留出左侧显示空间，并隐藏负时间 tick label。Prepare/Compile 给 FPGA 的 sequence 仍会按 repeat 展开。
+  \item \pyapi{Save Pulse / Save Figure}: \pyapi{Save Pulse} 保存 JSON，默认目录是仓库 \pyapi{pulses/}，也可以用 \pyapi{ZLC_PULSE_DIR} 覆盖；\pyapi{Save Figure} 在 Preview 顶栏最右侧，单独保存当前 preview PNG。新建 pulse 的默认名字是 \pyapi{pulse_YYYYMMDD_HHMMSS}。
+\end{itemize}
+
+无论可见几路，保存的 \pyapi{PulseTableState} 都保留完整 \pyapi{channels} 顺序。隐藏 channel 只是 GUI 视图，不会改变 bit index。FPGA 端 \pyapi{mask} 的 bit 仍然按照 \pyapi{channels[0]}, \pyapi{channels[1]}, ... 排列；因此 40 路 pin map、server channel list、control PC config 和 GUI state 必须使用同一份 channel 顺序。保存 pulse JSON 时，GUI 会用 pulse name 作为默认文件名；需要保存预览图时按 \pyapi{Save Figure}。
+
+仓库 \filepath{pulses/camera_imaging_40ch.json} 是按默认 qCMOS 成像时序保存的 40-channel GUI/API preset。硬件 channel 仍然是 \pyapi{ch00...ch39}；只有前 4 路显式保存 display label：\pyapi{ch00=trap}, \pyapi{ch01=cooling}, \pyapi{ch02=probe}, \pyapi{ch03=qcm_trigger}。它使用 100 MHz FPGA 的 10 ns minimal step，所有 delay 为 0 ns，默认只显示前 4 路。period timing 对应 \pyapi{imaging_sequence(exposure=20 ms, load=True, cooling=2 ms, pre_trigger=100 us, trigger_width=20 us)}：cooling 在 0--2 ms 打开；trap 从 0 持续到 22.12 ms；probe 从 2.10 ms 持续到 22.10 ms；qCMOS trigger 在 2.10--2.12 ms 给一个 20 us TTL positive pulse；最后 20 us 只保留 trap hold，然后所有输出回到 0。编译到 100 MHz 时 edge tick 为 \pyapi{[0, 200000, 210000, 212000, 2210000, 2212000]}，mask 为 \pyapi{[3, 1, 13, 5, 1, 0]}，trigger count 为 1，edge count 为 6，远小于 1024。
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.98\textwidth]{assets/hardware_pulse_gui_camera_edit.png}
+  \caption{在 Pulse GUI 中打开 \filepath{pulses/camera_imaging_40ch.json}。GUI 只显示当前需要编辑的 channel，但保存和编译仍然保留完整 40-channel 硬件顺序。}
+\end{figure}
+
+\begin{notebox}[推荐工作流]
+先在 4 路 first-light bitstream 上用 \pyapi{trap/cooling/probe/qcm_trigger} 做 smoke test；确认 \pyapi{prepare -> fire -> wait_done -> safe_state} 后，再切到 40 路 bitstream。40 路第一次上机时先 \pyapi{Show All}，逐路用短 pulse 和示波器确认 pin map；日常成像时再把不用的 channel 隐藏起来。
+\end{notebox}
+
+\section{把 FPGA 烧成 pulse-streamer}
+仓库里已经给出一个 Vivado-ready 入口：
 
 \begin{shellblock}
-cd C:\path\to\Zou_lab_control_v1
-python -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer generate_hdl `
-  --output-dir D:\zlc_pulse_streamer_hdl `
-  --channels trap cooling probe qcm_trigger `
-  --max-edges 1024 `
-  --tick-width 32
+fpga\pulse_streamer\
+  zlc_pulse_streamer.v
+  zlc_pulse_streamer_top_4ch.v
+  zlc_pulse_streamer_4ch.xdc
+  create_project_4ch.tcl
+  program_fpga_4ch.tcl
+  build_4ch_bitstream.bat
+  program_4ch_fpga.bat
+  zlc_pulse_streamer_top_40ch.v
+  zlc_pulse_streamer_40ch.xdc.template
 \end{shellblock}
 
-把生成的 \filepath{zlc_pulse_streamer.v} 加到 Vivado 工程。 \filepath{zlc_pulse_streamer_top_example.v} 是 wiring reference：它列出需要创建的 VIO probe 名、宽度和方向。默认 probe contract 是：
+\filepath{zlc_pulse_streamer.v} 是真正的 runtime pulse-streamer core。\filepath{zlc_pulse_streamer_top_4ch.v} 是 first-light top：它实例化 core 和 Vivado VIO IP，并把 \pyapi{out[0:3]} 接到 \pyapi{trap/cooling/probe/qcm_trigger}。这四个 pin 来自历史 \pyapi{address_switch} XDC：
+
+\begin{codeblock}[4-channel pin map]
+out[0] -> trap        -> PACKAGE_PIN M17
+out[1] -> cooling     -> PACKAGE_PIN F15
+out[2] -> probe       -> PACKAGE_PIN N15
+out[3] -> qcm_trigger -> PACKAGE_PIN R17
+clk                  -> PACKAGE_PIN R4
+running LED          -> PACKAGE_PIN R2
+done LED             -> PACKAGE_PIN R3
+\end{codeblock}
+
+在 Verilog/FPGA 电脑上生成 bitstream：
+
+\begin{shellblock}
+cd D:\GitHub\Zou_lab_control_v1
+.\fpga\pulse_streamer\build_4ch_bitstream.bat
+\end{shellblock}
+
+这个脚本会调用 \filepath{C:\Xilinx\Vivado\2019.2\bin\vivado.bat}，创建工程、创建 \pyapi{vio_0} IP、综合、实现并写 bitstream。生成物在：
+
+\begin{shellblock}
+fpga\pulse_streamer\build\zlc_pulse_streamer_4ch\
+  zlc_pulse_streamer_4ch.xpr
+  zlc_pulse_streamer_4ch.runs\impl_1\zlc_pulse_streamer_top_4ch.bit
+  zlc_pulse_streamer_4ch.runs\impl_1\zlc_pulse_streamer_top_4ch.ltx
+\end{shellblock}
+
+build Tcl 会检查 \pyapi{synth_1} 和 \pyapi{impl_1} 的 run status，并确认 \pyapi{.bit/.ltx} 都生成出来；bat wrapper 会把 Vivado 的 errorlevel 传回 PowerShell。如果 build 没有完成或 probe 文件缺失，不要继续进入 program/smoke/server 步骤。
+
+如果想在 Vivado GUI 里一步步看，也可以打开 \filepath{C:\Xilinx\Vivado\2019.2\bin\vivado.bat} 或 Windows Start Menu 里的 Xilinx Vivado 2019.2。若工程还没有生成，先运行 \filepath{build_4ch_bitstream.bat}；已有工程后，在 Vivado 里点 \pyapi{File -> Project -> Open}，选择 \filepath{fpga\pulse_streamer\build\zlc_pulse_streamer_4ch\zlc_pulse_streamer_4ch.xpr}。左侧 \pyapi{Flow Navigator} 依次点 \pyapi{Run Synthesis}、\pyapi{Run Implementation}、\pyapi{Generate Bitstream}；每一步完成后底部 Tcl Console/Messages 不应有 error。首次 4-channel build 通常需要 8--20 分钟，电脑较慢或第一次生成 IP cache 时可能到 30 分钟；incremental build 一般 3--10 分钟。
+
+然后烧到 FPGA：
+
+\begin{shellblock}
+.\fpga\pulse_streamer\program_4ch_fpga.bat
+\end{shellblock}
+
+烧录脚本会打开 hardware manager、连接第一个 JTAG device、设置 \pyapi{PROGRAM.FILE}，同时加载 \pyapi{.ltx} probes，然后执行 \pyapi{program_hw_devices}。成功后这个 FPGA 就是固定 pulse-streamer bitstream；后续 acquisition 只需要通过 VIO 写 edge table，不需要每次重新综合。
+
+Vivado GUI 的烧录路线是：左侧 \pyapi{Flow Navigator -> Program and Debug -> Open Hardware Manager}；顶部绿色栏或 toolbar 点 \pyapi{Open Target -> Auto Connect}；在 Hardware 窗口选中 FPGA device；点 \pyapi{Program Device}。Bitstream 选择 \filepath{...\zlc_pulse_streamer_4ch.runs\impl_1\zlc_pulse_streamer_top_4ch.bit}，Probes file 选择同目录的 \filepath{zlc_pulse_streamer_top_4ch.ltx}，然后点 \pyapi{Program}。JTAG 连接正常时烧录通常 30 秒--2 分钟；第一次打开 Hardware Manager 或驱动枚举较慢时预留 3--5 分钟。
+
+烧录完成后，先不接 qCMOS，使用示波器做 4 路 smoke test：
+
+\begin{shellblock}
+.\fpga\pulse_streamer\smoke_test_4ch_upload.bat
+\end{shellblock}
+
+这个脚本会默认把 \pyapi{ZLC_PS_VIVADO_PROJECT}、\pyapi{ZLC_PS_VIVADO_BIT} 和 \pyapi{ZLC_PS_VIVADO_LTX} 指向上面 \pyapi{build_4ch_bitstream.bat} 生成的 \pyapi{.xpr/.bit/.ltx}，所以新的 Vivado batch 进程也能重新加载 VIO probes。它会生成一个已知 \pyapi{RuntimeSequenceProgram}，然后通过当前 \pyapi{fpga_pulse_streamer} backend 执行 \pyapi{prepare -> fire -> wait_done -> safe_state}。100 MHz clock 下，预期输出是：
+
+\begin{codeblock}[4-channel smoke timing]
+trap         high 0-10 us
+cooling      high 0-3 us
+probe        high 2-6 us
+qcm_trigger  high 2-3 us
+\end{codeblock}
+
+如果这些波形不对，先不要连接相机；检查 \pyapi{ZLC_PS_VIVADO_BIT}、\pyapi{ZLC_PS_VIVADO_LTX}、VIO probe 名、XDC pin map 和示波器接线。
+
+first-light 版本的 VIO probe contract 是：
 
 \begin{codeblock}[VIO probes]
 probe_out0 zlc_reset      width 1
@@ -271,19 +549,21 @@ probe_in0  zlc_running    width 1
 probe_in1  zlc_done       width 1
 \end{codeblock}
 
-\pyapi{out[0:3]} 分别接到 \pyapi{trap/cooling/probe/qcm_trigger} 的 FPGA 输出 pin。qCMOS trigger 输入必须接 \pyapi{qcm_trigger} 对应的物理输出。这个 bitstream 只需要综合/烧录一次；之后每次实验只上传新的 edge table。
+Vivado 的 \pyapi{.ltx} 里可能把 probe 暴露成语义 net 名，例如 \pyapi{zlc_reset} 或 \pyapi{zlc_vio_i/zlc_reset}；也可能只暴露成 VIO 端口名，例如 \pyapi{probe_out0}。server 生成的 Tcl 会按两套别名查找：\pyapi{zlc_reset -> probe_out0}，\pyapi{zlc_start -> probe_out1}，\pyapi{zlc_prog_we -> probe_out2}，\pyapi{zlc_prog_addr -> probe_out3}，\pyapi{zlc_prog_tick -> probe_out4}，\pyapi{zlc_prog_mask -> probe_out5}，\pyapi{zlc_prog_count -> probe_out6}，\pyapi{zlc_running -> probe_in0}，\pyapi{zlc_done -> probe_in1}。如果匹配多个 probe，会打印当前 VIO 上的 probe 列表并报错。正常启动后，\pyapi{prepare.log} 或 \pyapi{pulse_streamer_prepare.log} 里应能看到 \pyapi{ZLC pulse-streamer VIO: zlc_prog_tick=...} 这样的写入记录。
+
+\pyapi{zlc_pulse_streamer_top_40ch.v} 使用同一个 core，但是 \pyapi{prog_mask} 宽度是 40，输出是 \pyapi{ch[39:0]}。使用 40 路前，先把 \filepath{zlc_pulse_streamer_40ch.xdc.template} 复制成 \filepath{zlc_pulse_streamer_40ch.xdc}，逐项填入真实 package pin 和连接器含义，然后运行 \filepath{build_40ch_bitstream.bat} 和 \filepath{program_40ch_fpga.bat}。如果 \filepath{zlc_pulse_streamer_40ch.xdc} 仍然包含 \pyapi{<PIN_CHxx>} placeholder，40 路 build 会提前停止。不要在没有确认 40 个物理 pin、电平标准、bank 电压、连接器方向和外部 buffer/level shifter 的情况下烧 40 路 bitstream。40-channel build 比 4-channel VIO 更宽，通常预留 15--35 分钟；烧录仍然大约 1--3 分钟。
 
 不使用 Jupyter 时，在 Verilog/FPGA 电脑的 PowerShell 运行：
 
 \begin{shellblock}
-cd C:\path\to\Zou_lab_control_v1
+cd D:\GitHub\Zou_lab_control_v1
 python -m pip install -e .
 
 $env:ZLC_PS_VIVADO_BIN = "C:\Xilinx\Vivado\2019.2\bin\vivado.bat"
-$env:ZLC_PS_VIVADO_PROJECT = "D:\time_sequence\zlc_pulse_streamer\zlc_pulse_streamer.xpr"
-$env:ZLC_PS_VIVADO_BIT = "D:\time_sequence\zlc_pulse_streamer\zlc_pulse_streamer.runs\impl_1\main.bit"
-$env:ZLC_PS_VIVADO_LTX = "D:\time_sequence\zlc_pulse_streamer\zlc_pulse_streamer.runs\impl_1\main.ltx"
-$env:ZLC_PS_VIVADO_PROGRAM_ON_RUN = "1"
+$env:ZLC_PS_VIVADO_PROJECT = "$PWD\fpga\pulse_streamer\build\zlc_pulse_streamer_4ch\zlc_pulse_streamer_4ch.xpr"
+$env:ZLC_PS_VIVADO_BIT = "$PWD\fpga\pulse_streamer\build\zlc_pulse_streamer_4ch\zlc_pulse_streamer_4ch.runs\impl_1\zlc_pulse_streamer_top_4ch.bit"
+$env:ZLC_PS_VIVADO_LTX = "$PWD\fpga\pulse_streamer\build\zlc_pulse_streamer_4ch\zlc_pulse_streamer_4ch.runs\impl_1\zlc_pulse_streamer_top_4ch.ltx"
+$env:ZLC_PS_VIVADO_PROGRAM_ON_RUN = "0"
 $env:ZLC_PS_VIO_FILTER = 'CELL_NAME=~"*vio*"'
 $env:ZLC_PS_MAX_EDGES = "1024"
 $env:ZLC_PS_TICK_WIDTH = "32"
@@ -426,7 +706,7 @@ devices = na.load_devices(
 }
 \end{codeblock}
 
-\pyapi{channels} 是 sequence validation 和 edge table compilation 的 channel universe。\pyapi{trigger_channels} 告诉 acquisition 哪些 channel 算 camera trigger。这个名字必须和 \pyapi{PulseSequence} 里的 channel 一致。如果你的 FPGA 代码里叫 \pyapi{camera_trigger}，要么把 imaging sequence 改成这个 channel，要么把 \pyapi{trigger_channels} 包含它。
+\pyapi{channels} 是 sequence validation 和 edge table compilation 的 channel universe。\pyapi{trigger_channels} 告诉 acquisition 哪些 channel 算 camera trigger。这个名字必须和 \pyapi{PulseSequence} 里的 channel 一致。如果 FPGA 代码里使用 \pyapi{camera_trigger} 作为触发通道名，需要把 imaging sequence 改成这个 channel，或把 \pyapi{trigger_channels} 包含它。
 
 \section{RemoteSequencer 配置}
 \pyapi{remote_template} 的 sequencer 是：
@@ -488,7 +768,7 @@ dcam.buf_release()
 这个顺序里最关键的是 camera arm 和 sequencer fire 的相对位置。必须先 \pyapi{cap_start}，再 \pyapi{fire}；否则第一个 trigger 可能在 qCMOS ready 前到达，结果就是丢第一帧或者整次 acquisition timeout。
 
 \section{为什么 prepare 在 camera arm 前}
-\pyapi{prepare} 做的是 validation、compile、upload 或生成 Verilog。它可以慢，也可以失败。它必须发生在 camera arm 前，因为 camera arm 之后你希望尽快 fire，而不是再做可能耗时的编译或网络传输。对于 remote sequencer，\pyapi{prepare} 可以把 edge table 送到 FPGA PC；\pyapi{fire} 只发一个 start 命令。
+\pyapi{prepare} 做的是 validation、compile、upload 或生成 Verilog。它可以慢，也可以失败。它必须发生在 camera arm 前，因为 camera arm 之后应尽快 fire，而不是再做可能耗时的编译或网络传输。对于 remote sequencer，\pyapi{prepare} 可以把 edge table 送到 FPGA PC；\pyapi{fire} 只发一个 start 命令。
 
 \section{为什么 wait done 在读完 frame 后}
 camera frame ready 和 sequencer done 是两个不同概念。camera 可能先读到所有 frame，但 FPGA service 还没确认 finite sequence 结束；也可能 sequencer 已经结束，但 camera readout 还在传输。当前顺序是在 frame 全部读出后调用 \pyapi{wait_done}，用它确认 timing backend 没有卡死。未来如果某些 backend 能提供 done interrupt，也可以更早并行等待，但用户接口不应该变。
@@ -538,7 +818,7 @@ threshold calibration 的核心是从 count distribution 里找 cut。当前 his
   \item 尝试用双峰 Gaussian 拟合估计 bright/dark overlap fidelity。
 \end{itemize}
 
-这个 fidelity 是模型估计，不是 ground truth。真实实验中你通常不知道每次 shot 是否真的有 atom，所以不能用 simulator occupancy 直接算 accuracy。更可靠的做法是保存 raw counts、reference images 和 fit parameters，再结合物理实验设计，例如 pushout/recapture 或重复探测，交叉验证 readout error。
+这个 fidelity 是模型估计，不是 ground truth。真实实验中通常不知道每次 shot 是否真的有 atom，所以不能用 simulator occupancy 直接算 accuracy。更可靠的做法是保存 raw counts、reference images 和 fit parameters，再结合物理实验设计，例如 pushout/recapture 或重复探测，交叉验证 readout error。
 
 \section{detection-time scan 的参考图像}
 \pyapi{detection_time} 会先拍 reference exposure images，然后再扫描短 exposure。reference 的作用是用真实可见的 count distribution 给 readout model 一个锚点，而不是偷看 simulator。短 exposure 下的 fidelity 可能出现爬升、平台和下降：
@@ -717,7 +997,9 @@ detection-time scan 不使用 ground truth。它先拍 reference images，再对
 \end{figure}
 
 \begin{codeblock}[Python]
-times = np.linspace(0.2e-3, 8e-3, 60)
+clock_hz = exp.devices.sequencer.clock_hz
+time_ticks = np.linspace(int(round(0.2e-3 * clock_hz)), int(round(8e-3 * clock_hz)), 60, dtype=int)
+times = time_ticks / clock_hz
 scan = exp.readout.detection_time(times, shots=20, live=False)
 fit_result, popt = scan.data_figure.decay()
 \end{codeblock}
@@ -742,7 +1024,7 @@ preflight.raise_if_failed()
 capture = exp.camera.capture(display=True)
 \end{codeblock}
 
-执行到 \pyapi{capture} 时，qCMOS 会 open、配置 external trigger、alloc buffer、start capture，然后 \pyapi{ManualSequencer.fire()} 打印提示。此时你手动启动 FPGA trigger。这个模式能检查：
+执行到 \pyapi{capture} 时，qCMOS 会 open、配置 external trigger、alloc buffer、start capture，然后 \pyapi{ManualSequencer.fire()} 打印提示。此时手动启动 FPGA trigger。这个模式能检查：
 \begin{itemize}
   \item DCAM driver 是否能打开相机。
   \item qCMOS external trigger polarity 是否正确。
@@ -804,15 +1086,15 @@ python -m pip install -e .
 
 然后重启 kernel。教程里的 bootstrap cell 只做简单 import 检查，并在失败时给出这条安装指令。
 
-\section{capture 图上出现 site 圈}
-这是必须修的错误。capture 属于 camera，不能知道 sitemap。正确行为：
+\section{capture、sitemap 和 detect 的显示区别}
+三类图的显示职责不同：
 \begin{itemize}
   \item \pyapi{exp.camera.capture()} 只显示 raw frame。
   \item \pyapi{exp.readout.sitemap()} 显示所有 found sites。
   \item \pyapi{exp.readout.detect()} 显示浅色 sitemap background circles 和 occupied circles。
 \end{itemize}
 
-如果 capture 有圈，优先检查 \pyapi{CameraDevice.capture} 和 \pyapi{views.plot_image} 是否错误读取了 session calibration 或 virtual trap internals。
+因此，用户通常先用 \pyapi{capture} 检查相机图像本身，再用 \pyapi{sitemap} 建立 site calibration，最后用 \pyapi{detect} 查看带 calibration overlay 的单次占据判断。
 
 \section{多帧真实采集少帧或 timeout}
 优先检查：
