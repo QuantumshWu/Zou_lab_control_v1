@@ -90,6 +90,14 @@ def fluent_font_size() -> int:
     return max(8, int(round(FONT_SIZE * _FLUENT_SCALE)))
 
 
+def fluent_text_width(metrics: QtGui.QFontMetrics, text: str) -> int:
+    """Return text width on old and new PyQt5 builds."""
+
+    if hasattr(metrics, "horizontalAdvance"):
+        return int(metrics.horizontalAdvance(text))
+    return int(metrics.width(text))
+
+
 def _radius() -> int:
     return scaled_px(RADIUS)
 
@@ -572,7 +580,7 @@ class FluentSwitch(QtWidgets.QAbstractButton):
         self.setMinimumSize(scaled_px(126, minimum=96), scaled_px(30, minimum=24))
 
     def sizeHint(self) -> QtCore.QSize:
-        text_w = QtGui.QFontMetrics(self.font()).horizontalAdvance(self.text())
+        text_w = fluent_text_width(QtGui.QFontMetrics(self.font()), self.text())
         return QtCore.QSize(max(self.minimumWidth(), scaled_px(60) + text_w), self.minimumHeight())
 
     def paintEvent(self, event) -> None:
@@ -1020,6 +1028,7 @@ __all__ = [
     "fluent_scale",
     "fluent_scrollbar_stylesheet",
     "fluent_spinbox_stylesheet",
+    "fluent_text_width",
     "fluent_widget_stylesheet",
     "format_compact_number",
     "run_fluent_window",

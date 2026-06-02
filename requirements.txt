@@ -6,6 +6,10 @@ numpy
 rpyc
 scipy
 
+# PyQt pulse GUI
+PyQt5
+PyQt-Frameless-Window
+
 # Jupyter notebook/widget plotting
 ipykernel
 ipympl

@@ -14,6 +14,8 @@ dependencies = [
     "matplotlib",
     "nbformat",
     "numpy",
+    "PyQt-Frameless-Window",
+    "PyQt5",
     "rpyc",
     "scipy",
 ]

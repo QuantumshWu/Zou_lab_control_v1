@@ -836,6 +836,16 @@ def test_fluent_combo_box_wheel_ignores_closed_popup(monkeypatch):
     assert event.ignored
 
 
+def test_fluent_text_width_supports_old_qfontmetrics():
+    from Zou_lab_control.frontend.qt_fluent import fluent_text_width
+
+    class OldMetrics:
+        def width(self, text):
+            return len(text) * 7
+
+    assert fluent_text_width(OldMetrics(), "pulse") == 35
+
+
 def test_checked_in_tutorial_notebooks_are_utf8():
     for path in sorted((Path(__file__).resolve().parents[1] / "tutorials").glob("*.ipynb")):
         text = path.read_text(encoding="utf-8")

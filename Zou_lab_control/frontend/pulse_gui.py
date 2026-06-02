@@ -41,6 +41,7 @@ from .qt_fluent import (
     ensure_qt_app,
     fluent_font_size,
     fluent_scrollbar_stylesheet,
+    fluent_text_width,
     fluent_widget_stylesheet,
     format_compact_number,
     scaled_px,
@@ -79,7 +80,7 @@ def _font_metrics() -> QtGui.QFontMetrics:
 
 
 def _text_width(text: str) -> int:
-    return _font_metrics().horizontalAdvance(text)
+    return fluent_text_width(_font_metrics(), text)
 
 
 def _row_height() -> int:
