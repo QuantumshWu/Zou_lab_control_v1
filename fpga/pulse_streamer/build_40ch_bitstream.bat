@@ -1,12 +1,16 @@
 @echo off
 setlocal
 set "SCRIPT_DIR=%~dp0"
-if "%ZLC_PS_VIVADO_BIN%"=="" (
-  set "ZLC_PS_VIVADO_BIN=C:\Xilinx\Vivado\2019.2\bin\vivado.bat"
+if "%~1"=="--help" (
+  echo Build the 40-channel ZLC pulse-streamer bitstream after zlc_pulse_streamer_40ch.xdc has real pins.
+  echo Use check_40ch_synth.bat for a no-XDC synthesis self-check.
+  exit /b 0
 )
-if not exist "%ZLC_PS_VIVADO_BIN%" (
-  set "ZLC_PS_VIVADO_BIN=vivado"
+if "%~1"=="/?" (
+  echo Build the 40-channel ZLC pulse-streamer bitstream after zlc_pulse_streamer_40ch.xdc has real pins.
+  echo Use check_40ch_synth.bat for a no-XDC synthesis self-check.
+  exit /b 0
 )
-"%ZLC_PS_VIVADO_BIN%" -mode batch -source "%SCRIPT_DIR%create_project_40ch.tcl"
+call "%SCRIPT_DIR%vivado_run_tcl.bat" create_project_40ch.tcl
 set "ZLC_STATUS=%ERRORLEVEL%"
 endlocal & exit /b %ZLC_STATUS%

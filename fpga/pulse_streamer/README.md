@@ -18,12 +18,53 @@ connector map before building a bitstream.
 - `program_fpga_4ch.tcl`: program the FPGA with the generated bitstream.
 - `build_4ch_bitstream.bat`: Windows one-click batch wrapper for build.
 - `program_4ch_fpga.bat`: Windows one-click batch wrapper for programming.
+- `simulate_4ch_core.bat` / `tb_zlc_pulse_streamer_4ch.v`: board-free xsim
+  simulation of upload, start, output timing, done, and safe-off behavior.
 - `zlc_pulse_streamer_top_40ch.v`: 40-output top wrapper and VIO contract.
 - `zlc_pulse_streamer_40ch.xdc.template`: pin-map template for the 40-output build.
 - `build_40ch_bitstream.bat`: build wrapper for the completed 40-output XDC.
 - `program_40ch_fpga.bat`: programming wrapper for the 40-output bitstream.
+- `check_40ch_synth.bat`: no-XDC 40-channel synthesis self-check. It verifies
+  the 40-bit VIO/prog_mask/top-level HDL path but does not produce a
+  board-ready bitstream.
+- `start_server_4ch.bat` / `start_server_40ch.bat`: convenience launchers for
+  the FPGA sequencer server.
+- `vivado_env.bat` / `vivado_run_tcl.bat`: shared Vivado/Python discovery and
+  short-path batch helpers.
 - `smoke_test_4ch.py` / `smoke_test_4ch_upload.bat`: upload and fire a known
   4-channel pulse table for oscilloscope verification.
+
+## Vivado Version And Path Discovery
+
+The batch files do not require a hard-coded Vivado version. They search in this
+order:
+
+1. User override `ZLC_PS_VIVADO_BIN`.
+2. Installed `C:\Xilinx\Vivado\*\bin\vivado.bat` and
+   `D:\Xilinx\Vivado\*\bin\vivado.bat`.
+3. `vivado.bat` or `vivado` on `PATH`.
+
+This supports the local test computer with Vivado 2019.1 and the historical
+`address_switch` project, which was generated with Vivado 2019.2 under a short
+path such as `D:\time_sequence\address_switch`. If the FPGA computer has a
+different version, set the path explicitly before running any batch file:
+
+```bat
+set ZLC_PS_VIVADO_BIN=C:\Xilinx\Vivado\2019.2\bin\vivado.bat
+```
+
+Vivado 2019 debug cores can fail when the project path is too deep. The shared
+batch helper automatically uses a temporary short drive letter through `subst`
+when possible. A real short checkout such as `D:\ZLC` or `D:\time_sequence\ZLC`
+is still recommended on the Verilog/FPGA computer.
+
+Check the detected tools without building:
+
+```powershell
+.\fpga\pulse_streamer\vivado_env.bat
+.\fpga\pulse_streamer\build_4ch_bitstream.bat --help
+.\fpga\pulse_streamer\build_40ch_bitstream.bat --help
+```
 
 ## Build And Program The 4-Channel First-Light Bitstream
 
@@ -31,6 +72,7 @@ Run this on the Verilog/FPGA computer:
 
 ```powershell
 cd D:\GitHub\Zou_lab_control_v1
+.\fpga\pulse_streamer\simulate_4ch_core.bat
 .\fpga\pulse_streamer\build_4ch_bitstream.bat
 ```
 
@@ -57,6 +99,12 @@ The build Tcl checks that synthesis and implementation runs completed and that
 both `.bit` and `.ltx` were generated. The program Tcl also requires the `.ltx`
 probe file, because the server controls this bitstream through VIO. The batch
 wrappers return Vivado/Python's exit code to the shell.
+
+In the normal bring-up flow, run this programming batch explicitly before the
+smoke test and before starting the server. You can skip it only when the same
+bitstream/probes were already programmed manually in Vivado Hardware Manager, or
+when `ZLC_PS_VIVADO_PROGRAM_ON_RUN="1"` is intentionally used so the backend
+programs the board during its first hardware action.
 
 After programming, start the sequencer server with `ZLC_PS_VIVADO_BIT` and
 `ZLC_PS_VIVADO_LTX` pointing to the two generated files above. You may set
@@ -150,9 +198,15 @@ early if any `<PIN_CHxx>` placeholder remains.
 Then build/program:
 
 ```powershell
+.\fpga\pulse_streamer\check_40ch_synth.bat
 .\fpga\pulse_streamer\build_40ch_bitstream.bat
 .\fpga\pulse_streamer\program_40ch_fpga.bat
 ```
+
+`check_40ch_synth.bat` is safe to run before the real 40-output XDC exists; it
+uses no output-pin constraints and only verifies the 40-channel HDL/VIO logic
+contract. `build_40ch_bitstream.bat` is intentionally stricter: it stops until
+`zlc_pulse_streamer_40ch.xdc` exists and contains no `<PIN_CHxx>` placeholders.
 
 ## Sequencer Server Environment
 
@@ -162,6 +216,7 @@ Example after building the 4-channel bitstream:
 cd D:\GitHub\Zou_lab_control_v1
 $env:PYTHONPATH = (Get-Location).Path
 
+# Optional. Omit this if vivado_env.bat finds the right Vivado automatically.
 $env:ZLC_PS_VIVADO_BIN = "C:\Xilinx\Vivado\2019.2\bin\vivado.bat"
 $env:ZLC_PS_VIVADO_PROJECT = "$PWD\fpga\pulse_streamer\build\zlc_pulse_streamer_4ch\zlc_pulse_streamer_4ch.xpr"
 $env:ZLC_PS_VIVADO_BIT = "$PWD\fpga\pulse_streamer\build\zlc_pulse_streamer_4ch\zlc_pulse_streamer_4ch.runs\impl_1\zlc_pulse_streamer_top_4ch.bit"
@@ -184,3 +239,41 @@ python -m Zou_lab_control.neutral_atom.devices.sequencer_server `
   --wait-done-command "python -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer wait_done" `
   --safe-state-command "python -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer safe_state"
 ```
+
+The same 4-channel server can be started with:
+
+```powershell
+.\fpga\pulse_streamer\start_server_4ch.bat
+```
+
+For the 40-channel server after the 40-channel bitstream is built and
+programmed:
+
+```powershell
+.\fpga\pulse_streamer\start_server_40ch.bat
+```
+
+The 40-channel launcher uses channels `ch00 ... ch39`, `ch03` as the trigger
+channel, a 100 MHz clock, and `ZLC_PS_CHANNEL_COUNT=40`. Override
+`ZLC_PS_HOST`, `ZLC_PS_PORT`, `ZLC_PS_STATE_DIR`, or the Vivado project/bit/LTX
+environment variables when the hardware setup differs.
+
+## Pulse GUI Frontend
+
+The root launcher is independent of experiment configs:
+
+```powershell
+.\pulse_gui.bat
+```
+
+To use the GUI on the FPGA computer after `start_server_40ch.bat` is running,
+open a second terminal and connect to localhost:
+
+```powershell
+.\pulse_gui.bat --remote-host 127.0.0.1 --remote-port 18861 --state .\pulses\camera_imaging_40ch.json
+```
+
+To use the GUI on the control/qCMOS computer, replace `127.0.0.1` with the IP
+printed by the server. The GUI only edits pulse state and calls the attached
+`RemoteSequencer.prepare/fire/wait_done/set_safe_state`; the hardware upload
+still happens through the server and `fpga_pulse_streamer` backend.

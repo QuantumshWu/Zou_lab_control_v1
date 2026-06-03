@@ -46,15 +46,29 @@ fpga/pulse_streamer/
   program_fpga_40ch.tcl
   build_4ch_bitstream.bat
   program_4ch_fpga.bat
+  simulate_4ch_core.bat
+  check_40ch_synth.bat
+  build_40ch_bitstream.bat
+  program_40ch_fpga.bat
+  start_server_4ch.bat
+  start_server_40ch.bat
 ```
 
 在 Verilog/FPGA 电脑 PowerShell 运行：
 
 ```powershell
 cd D:\GitHub\Zou_lab_control_v1
+.\fpga\pulse_streamer\vivado_env.bat
+.\fpga\pulse_streamer\simulate_4ch_core.bat
 .\fpga\pulse_streamer\build_4ch_bitstream.bat
 .\fpga\pulse_streamer\program_4ch_fpga.bat
 .\fpga\pulse_streamer\smoke_test_4ch_upload.bat
+```
+
+这些 bat 会自动寻找 Vivado：先看 `ZLC_PS_VIVADO_BIN`，再找 `C:\Xilinx\Vivado\*\bin\vivado.bat` 和 `D:\Xilinx\Vivado\*\bin\vivado.bat`，最后看 PATH。当前本机验证用的是 Vivado 2019.1；旧 `address_switch` archive 是 Vivado 2019.2，路径曾经是 `D:\time_sequence\address_switch`。如果 Verilog 电脑不是这些默认路径，先手动设：
+
+```powershell
+$env:ZLC_PS_VIVADO_BIN = "C:\Xilinx\Vivado\2019.2\bin\vivado.bat"
 ```
 
 这些 bat 会把 Vivado/Python 的 errorlevel 传回 PowerShell；如果 synth/impl 没有 Complete，或者 `.bit/.ltx` 缺失，会提前失败，不要继续启动 server。
@@ -102,6 +116,8 @@ TICK_WIDTH = 32
 # 40-channel example after building/programming the 40ch top and filling the XDC:
 # CHANNELS = ["trap", "cooling", "probe", "qcm_trigger"] + [f"ch{i:02d}" for i in range(4, 40)]
 # TRIGGER_CHANNELS = ["qcm_trigger"]
+# If the 40ch XDC is not filled yet, run check_40ch_synth.bat only. It checks
+# the 40-bit VIO/top HDL contract but does not create a board-ready bitstream.
 
 FPGA_DIR = PROJECT_ROOT / "fpga" / "pulse_streamer"
 for filename in (
@@ -116,8 +132,12 @@ for filename in (
     "program_fpga_40ch.tcl",
     "build_4ch_bitstream.bat",
     "program_4ch_fpga.bat",
+    "simulate_4ch_core.bat",
+    "check_40ch_synth.bat",
     "build_40ch_bitstream.bat",
     "program_40ch_fpga.bat",
+    "start_server_4ch.bat",
+    "start_server_40ch.bat",
     "smoke_test_4ch.py",
     "smoke_test_4ch_upload.bat",
 ):
@@ -136,7 +156,18 @@ HOST = "0.0.0.0"
 PORT = 18861
 STATE_DIR = Path(r"D:\zlc_sequencer_state")
 
-os.environ["ZLC_PS_VIVADO_BIN"] = r"C:\Xilinx\Vivado\2019.2\bin\vivado.bat"
+def find_vivado_bin():
+    if os.environ.get("ZLC_PS_VIVADO_BIN"):
+        return os.environ["ZLC_PS_VIVADO_BIN"]
+    candidates = []
+    for root in (Path(r"C:\Xilinx\Vivado"), Path(r"D:\Xilinx\Vivado")):
+        if root.exists():
+            candidates.extend(root.glob(r"*\bin\vivado.bat"))
+    if candidates:
+        return str(sorted(candidates)[-1])
+    return "vivado"
+
+os.environ["ZLC_PS_VIVADO_BIN"] = find_vivado_bin()
 os.environ["ZLC_PS_VIVADO_PROJECT"] = str(PROJECT_ROOT / "fpga" / "pulse_streamer" / "build" / "zlc_pulse_streamer_4ch" / "zlc_pulse_streamer_4ch.xpr")
 os.environ["ZLC_PS_VIVADO_BIT"] = str(PROJECT_ROOT / "fpga" / "pulse_streamer" / "build" / "zlc_pulse_streamer_4ch" / "zlc_pulse_streamer_4ch.runs" / "impl_1" / "zlc_pulse_streamer_top_4ch.bit")
 os.environ["ZLC_PS_VIVADO_LTX"] = str(PROJECT_ROOT / "fpga" / "pulse_streamer" / "build" / "zlc_pulse_streamer_4ch" / "zlc_pulse_streamer_4ch.runs" / "impl_1" / "zlc_pulse_streamer_top_4ch.ltx")
@@ -159,7 +190,20 @@ PREPARE_COMMAND, FIRE_COMMAND, WAIT_DONE_COMMAND, SAFE_STATE_COMMAND
 <!-- cell:markdown -->
 ## 3. PowerShell command equivalent
 
-不用 Jupyter 时，在 Verilog 电脑 PowerShell 运行这段。server 启动后 terminal 会一直阻塞，这是正常的。
+不用 Jupyter 时，推荐直接运行 bat。server 启动后 terminal 会一直阻塞，这是正常的。
+
+```powershell
+cd D:\GitHub\Zou_lab_control_v1
+.\fpga\pulse_streamer\start_server_4ch.bat
+```
+
+如果已经完成 40ch XDC、build 和 program，则运行：
+
+```powershell
+.\fpga\pulse_streamer\start_server_40ch.bat
+```
+
+下面是等价的展开版命令，便于检查环境变量：
 
 <!-- cell:code -->
 print(fr"""
@@ -219,6 +263,12 @@ na.run_sequencer_server(
 ## 5. Optional: run the pulse GUI on this FPGA computer
 
 `run_sequencer_server(...)` 会阻塞当前 kernel。要在 FPGA/Vivado 电脑本机打开 pulse GUI，请在另一个 Python 进程或另一个 notebook kernel 里运行下面的代码，并连接 `127.0.0.1:{PORT}`。GUI 仍然只是前端；实际 prepare/fire/wait 通过正在运行的 server 执行。新建 pulse 默认名是 `pulse_YYYYMMDD_HHMMSS`。`channels` 是硬件 channel 名和 FPGA bit order，例如 `ch00/ch01/...`；Name 面板左侧固定显示硬件 channel，右侧是可选 display label，GUI 不会自动猜物理含义。右侧 name 改动后，Delay 行、period checkbox 和 Preview y 轴会显示这个 label。传入 `clock_hz=CLOCK_HZ` 后，GUI 左侧 `step (ns)` 会默认等于 FPGA tick，例如 100 MHz 时是 10 ns。40-channel 展开时，channel name、delay 和 period checkbox 共用整体纵向滚动，方便检查每一路是否对齐。`X` 会把该 channel 的所有 period 设为 off，但不自动隐藏；`Hide Off` 只看 period 是否为 on，delay/name 会保留，重新 Add Channel 会按硬件顺序回原位。Preview 页会画未展开 period table 的 pulse 图，默认隐藏 always-off channel；如果 channel 有 display label，Preview y 轴显示 label。没有 bracket 时是 `repeat ∞`；bracket 覆盖所有 period 时是有限外层 repeat；bracket 在内部时整体仍然是 `repeat ∞`，Preview 会画整段 `∞` 和内部 `xN` 两套不同颜色的 bracket，状态栏显示 `repeat ∞ + Pm-Pn xN`。bracket 画在真实 start/stop 时间节点上，xlim 只负责留显示空间，负时间 tick label 会被隐藏。`Save Pulse` 默认保存到仓库 `pulses/` 目录；`Save Figure` 是 Preview 顶栏最右侧的一行按钮，单独保存 preview PNG。若窗口在当前显示器上偏大，可以传 `scale=0.82, window_ratio=0.90`。
+
+PowerShell 入口：
+
+```powershell
+.\pulse_gui.bat --remote-host 127.0.0.1 --remote-port 18861 --state .\pulses\camera_imaging_40ch.json
+```
 
 <!-- cell:code -->
 # import Zou_lab_control.frontend as zf

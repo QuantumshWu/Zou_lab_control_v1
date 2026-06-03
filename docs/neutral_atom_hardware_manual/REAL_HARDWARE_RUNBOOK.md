@@ -12,15 +12,46 @@ cd C:\path\to\Zou_lab_control_v1
 python -m pip install -e .
 ```
 
+For a fresh Windows machine, `install_requirements.bat` is also acceptable. It
+installs the same Python-side GUI/server dependencies, including PyQt5 and
+RPyC. Vivado itself is not a Python dependency; install it separately on the
+Verilog/FPGA computer.
+
 ## 1. Build and program the FPGA pulse-streamer
 
 Run this on the Verilog/FPGA computer:
 
 ```powershell
 cd C:\path\to\Zou_lab_control_v1
+.\fpga\pulse_streamer\simulate_4ch_core.bat
 .\fpga\pulse_streamer\build_4ch_bitstream.bat
 .\fpga\pulse_streamer\program_4ch_fpga.bat
 ```
+
+`simulate_4ch_core.bat` runs `xvlog/xelab/xsim` and does not require an FPGA
+board. It verifies the runtime upload path, start edge, expected output masks,
+`running`, `done`, and final all-off state before any hardware programming.
+
+The batch files call `fpga\pulse_streamer\vivado_env.bat`. The search order is:
+
+1. existing `ZLC_PS_VIVADO_BIN`;
+2. installed `C:\Xilinx\Vivado\*\bin\vivado.bat` or
+   `D:\Xilinx\Vivado\*\bin\vivado.bat`;
+3. `vivado.bat` or `vivado` on `PATH`.
+
+The local test machine used Vivado 2019.1. The historical `address_switch`
+project in `references\source_archives\address_switch` was generated with
+Vivado 2019.2 and originally lived under a short path like
+`D:\time_sequence\address_switch`. If the Verilog computer has a different
+Vivado install, set the override explicitly before running the scripts:
+
+```powershell
+$env:ZLC_PS_VIVADO_BIN = "C:\Xilinx\Vivado\2019.2\bin\vivado.bat"
+```
+
+Vivado 2019 debug-core generation is path-length sensitive. The batch helper
+uses a temporary short drive letter through `subst` when possible, but a short
+checkout such as `D:\ZLC` or `D:\time_sequence\ZLC` is still recommended.
 
 This creates and programs the first-light `trap/cooling/probe/qcm_trigger`
 bitstream from `fpga\pulse_streamer\zlc_pulse_streamer.v`,
@@ -36,10 +67,18 @@ fpga\pulse_streamer\build\zlc_pulse_streamer_4ch\zlc_pulse_streamer_4ch.runs\imp
 The build/program batch files return nonzero if Vivado fails, if synth/impl did
 not complete, or if the `.bit/.ltx` outputs are missing.
 
+Do not skip `program_4ch_fpga.bat` in the normal hardware bring-up flow. The
+only usual exceptions are: the same `.bit/.ltx` pair has already been programmed
+manually from Vivado Hardware Manager, or `ZLC_PS_VIVADO_PROGRAM_ON_RUN="1"` is
+intentionally set so the backend programs the board during the first hardware
+run.
+
 Vivado GUI route for the same operation:
 
-1. Open **Xilinx Vivado 2019.2** from the Windows Start Menu, or run
-   `C:\Xilinx\Vivado\2019.2\bin\vivado.bat`.
+1. Open the installed **Xilinx Vivado 2019.x** from the Windows Start Menu, or
+   run the path printed by `.\fpga\pulse_streamer\vivado_env.bat`. On the local
+   test machine this was `C:\Xilinx\Vivado\2019.1\bin\vivado.bat`; the old
+   `address_switch` archive was Vivado 2019.2.
 2. If the project does not exist yet, run `build_4ch_bitstream.bat` first.
    Otherwise choose **File -> Project -> Open** and open
    `fpga\pulse_streamer\build\zlc_pulse_streamer_4ch\zlc_pulse_streamer_4ch.xpr`.
@@ -94,10 +133,14 @@ For 40-channel hardware, copy
 `fpga\pulse_streamer\zlc_pulse_streamer_40ch.xdc.template` to
 `fpga\pulse_streamer\zlc_pulse_streamer_40ch.xdc`, fill every `ch00` through
 `ch39` package pin, confirm bank voltage/electrical level, then run
-`build_40ch_bitstream.bat` and `program_40ch_fpga.bat`. The 40-channel build
-will stop if `<PIN_CHxx>` placeholders remain. Expect roughly 15-35 minutes for
-the first 40-channel build and 1-3 minutes for programming. Do not connect the
-qCMOS or lasers until the pin map has been checked with a scope.
+`build_40ch_bitstream.bat` and `program_40ch_fpga.bat`. Before the real XDC is
+available, `check_40ch_synth.bat` can be used as a logic/API self-check; it
+synthesizes the 40-channel top and VIO widths without output-pin constraints
+and does not produce a board-ready bitstream. The real 40-channel build will
+stop if the XDC is missing or any `<PIN_CHxx>` placeholder remains. Expect
+roughly 15-35 minutes for the first real 40-channel build and 1-3 minutes for
+programming. Do not connect the qCMOS or lasers until the pin map has been
+checked with a scope.
 
 ## 2. Start the FPGA server
 
@@ -117,6 +160,7 @@ Equivalent PowerShell route:
 cd C:\path\to\Zou_lab_control_v1
 $env:PYTHONPATH = (Get-Location).Path
 
+# Optional. Omit this if vivado_env.bat finds the correct Vivado install.
 $env:ZLC_PS_VIVADO_BIN = "C:\Xilinx\Vivado\2019.2\bin\vivado.bat"
 $env:ZLC_PS_VIVADO_PROJECT = "$PWD\fpga\pulse_streamer\build\zlc_pulse_streamer_4ch\zlc_pulse_streamer_4ch.xpr"
 $env:ZLC_PS_VIVADO_BIT = "$PWD\fpga\pulse_streamer\build\zlc_pulse_streamer_4ch\zlc_pulse_streamer_4ch.runs\impl_1\zlc_pulse_streamer_top_4ch.bit"
@@ -144,6 +188,24 @@ python -m Zou_lab_control.neutral_atom.devices.sequencer_server `
   --wait-done-command "python -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer wait_done" `
   --safe-state-command "python -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer safe_state"
 ```
+
+The same server can be started with the repository batch launcher:
+
+```powershell
+.\fpga\pulse_streamer\start_server_4ch.bat
+```
+
+For the 40-channel bitstream, after the real XDC has been filled, built, and
+programmed:
+
+```powershell
+.\fpga\pulse_streamer\start_server_40ch.bat
+```
+
+That launcher uses channels `ch00 ... ch39`, trigger channel `ch03`, 100 MHz
+clock, and `ZLC_PS_CHANNEL_COUNT=40`. Override `ZLC_PS_HOST`, `ZLC_PS_PORT`,
+`ZLC_PS_STATE_DIR`, `ZLC_PS_VIVADO_PROJECT`, `ZLC_PS_VIVADO_BIT`, or
+`ZLC_PS_VIVADO_LTX` if your hardware paths differ.
 
 Use `ZLC_PS_VIVADO_PROGRAM_ON_RUN="1"` for the first run so Vivado programs the
 bitstream and probes. After the board is programmed, set it to `"0"` for
@@ -269,6 +331,12 @@ pulse timing.
 
 On the FPGA computer, open the GUI from a second Python process after the server
 is running:
+
+```powershell
+.\pulse_gui.bat --remote-host 127.0.0.1 --remote-port 18861 --state .\pulses\camera_imaging_40ch.json
+```
+
+The equivalent Python API is:
 
 ```python
 sequencer = na.RemoteSequencer(

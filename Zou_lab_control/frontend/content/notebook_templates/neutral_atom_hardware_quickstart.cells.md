@@ -9,28 +9,20 @@
 cd "C:\path\to\Zou_lab_control_v1"
 $env:PYTHONPATH = (Get-Location).Path
 
-$env:ZLC_PS_VIVADO_BIN = "C:\Xilinx\Vivado\2019.2\bin\vivado.bat"
-$env:ZLC_PS_VIVADO_PROJECT = "D:\time_sequence\zlc_pulse_streamer\zlc_pulse_streamer.xpr"
-$env:ZLC_PS_VIVADO_BIT = "D:\time_sequence\zlc_pulse_streamer\zlc_pulse_streamer.runs\impl_1\main.bit"
-$env:ZLC_PS_VIVADO_LTX = "D:\time_sequence\zlc_pulse_streamer\zlc_pulse_streamer.runs\impl_1\main.ltx"
-$env:ZLC_PS_VIVADO_PROGRAM_ON_RUN = "1"
-$env:ZLC_PS_VIO_FILTER = 'CELL_NAME=~"*vio*"'
-$env:ZLC_PS_MAX_EDGES = "1024"
-$env:ZLC_PS_TICK_WIDTH = "32"
-$env:ZLC_PS_CHANNEL_COUNT = "4"
-
-python -m Zou_lab_control.neutral_atom.devices.sequencer_server `
-  --host 0.0.0.0 `
-  --port 18861 `
-  --channels trap cooling probe qcm_trigger `
-  --trigger-channels qcm_trigger `
-  --clock-hz 100000000 `
-  --state-dir D:\zlc_sequencer_state `
-  --prepare-command "python -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer prepare" `
-  --fire-command "python -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer fire" `
-  --wait-done-command "python -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer wait_done" `
-  --safe-state-command "python -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer safe_state"
+.\fpga\pulse_streamer\vivado_env.bat
+.\fpga\pulse_streamer\simulate_4ch_core.bat
+.\fpga\pulse_streamer\build_4ch_bitstream.bat
+.\fpga\pulse_streamer\program_4ch_fpga.bat
+.\fpga\pulse_streamer\start_server_4ch.bat
 ```
+
+如果 Verilog 电脑的 Vivado 不在默认搜索路径，先设置：
+
+```powershell
+$env:ZLC_PS_VIVADO_BIN = "C:\Xilinx\Vivado\2019.2\bin\vivado.bat"
+```
+
+当前本机验证用的是 Vivado 2019.1；旧 `address_switch` archive 是 Vivado 2019.2，路径曾经是 `D:\time_sequence\address_switch`。40ch 真实 bitstream 需要先填完 `fpga\pulse_streamer\zlc_pulse_streamer_40ch.xdc`；没填真实 pin 前只运行 `check_40ch_synth.bat` 做 HDL/VIO 宽度自查，不要 program。
 
 离线检查 frontend/readout 流程时跑 `neutral_atom_tutorial.ipynb`。
 

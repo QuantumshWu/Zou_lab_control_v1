@@ -446,12 +446,20 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
         "zlc_pulse_streamer_40ch.xdc.template",
         "create_project_4ch.tcl",
         "create_project_40ch.tcl",
+        "check_40ch_synth.tcl",
         "program_fpga_4ch.tcl",
         "program_fpga_40ch.tcl",
         "build_4ch_bitstream.bat",
         "program_4ch_fpga.bat",
         "build_40ch_bitstream.bat",
         "program_40ch_fpga.bat",
+        "check_40ch_synth.bat",
+        "start_server_4ch.bat",
+        "start_server_40ch.bat",
+        "vivado_env.bat",
+        "vivado_run_tcl.bat",
+        "tb_zlc_pulse_streamer_4ch.v",
+        "simulate_4ch_core.bat",
         "smoke_test_4ch.py",
         "smoke_test_4ch_upload.bat",
         "README.md",
@@ -463,9 +471,15 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     top40 = (fpga / "zlc_pulse_streamer_top_40ch.v").read_text(encoding="utf-8")
     tcl4 = (fpga / "create_project_4ch.tcl").read_text(encoding="utf-8")
     tcl40 = (fpga / "create_project_40ch.tcl").read_text(encoding="utf-8")
+    check40 = (fpga / "check_40ch_synth.tcl").read_text(encoding="utf-8")
     program_tcl4 = (fpga / "program_fpga_4ch.tcl").read_text(encoding="utf-8")
     build_bat = (fpga / "build_4ch_bitstream.bat").read_text(encoding="utf-8")
     program_bat = (fpga / "program_4ch_fpga.bat").read_text(encoding="utf-8")
+    vivado_env_bat = (fpga / "vivado_env.bat").read_text(encoding="utf-8")
+    vivado_run_bat = (fpga / "vivado_run_tcl.bat").read_text(encoding="utf-8")
+    server40_bat = (fpga / "start_server_40ch.bat").read_text(encoding="utf-8")
+    sim4_bat = (fpga / "simulate_4ch_core.bat").read_text(encoding="utf-8")
+    sim4_tb = (fpga / "tb_zlc_pulse_streamer_4ch.v").read_text(encoding="utf-8")
     smoke_bat = (fpga / "smoke_test_4ch_upload.bat").read_text(encoding="utf-8")
     xdc4 = (fpga / "zlc_pulse_streamer_4ch.xdc").read_text(encoding="utf-8")
     core = (fpga / "zlc_pulse_streamer.v").read_text(encoding="utf-8")
@@ -488,11 +502,22 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     assert "VIO probe file was not generated" in tcl4
     assert "CONFIG.C_PROBE_OUT5_WIDTH {40}" in tcl40
     assert "still contains <PIN_CHxx> placeholders" in tcl40
+    assert "CONFIG.C_PROBE_OUT5_WIDTH {40}" in check40
+    assert "ZLC 40ch synth check complete" in check40
     assert "ZLC_PS_VIVADO_BIT" in program_tcl4
     assert "ZLC_PS_VIVADO_LTX" in program_tcl4
     assert "VIO probe file not found" in program_tcl4
+    assert "2019.1 2019.2" in vivado_env_bat
+    assert "C:\\Xilinx\\Vivado\\%%V\\bin\\vivado.bat" in vivado_env_bat
+    assert "subst !ZLC_SHORT_DRIVE!" in vivado_run_bat
+    assert "--help" in build_bat
+    assert "create_project_4ch.tcl" in build_bat
     assert "exit /b %ZLC_STATUS%" in build_bat
     assert "exit /b %ZLC_STATUS%" in program_bat
+    assert "ZLC_PS_CHANNEL_COUNT=40" in server40_bat
+    assert "ch00 ch01 ch02 ch03" in server40_bat
+    assert "xsim" in sim4_bat
+    assert "ZLC_SIM_PASS" in sim4_tb
     assert "zlc_pulse_streamer_top_4ch.bit" in smoke_bat
     assert "zlc_pulse_streamer_top_4ch.ltx" in smoke_bat
     assert "ZLC_PS_CHANNEL_COUNT=4" in smoke_bat

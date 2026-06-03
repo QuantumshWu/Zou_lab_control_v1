@@ -482,8 +482,17 @@ fpga\pulse_streamer\
   program_fpga_4ch.tcl
   build_4ch_bitstream.bat
   program_4ch_fpga.bat
+  simulate_4ch_core.bat
+  tb_zlc_pulse_streamer_4ch.v
   zlc_pulse_streamer_top_40ch.v
   zlc_pulse_streamer_40ch.xdc.template
+  check_40ch_synth.bat
+  build_40ch_bitstream.bat
+  program_40ch_fpga.bat
+  start_server_4ch.bat
+  start_server_40ch.bat
+  vivado_env.bat
+  vivado_run_tcl.bat
 \end{shellblock}
 
 \filepath{zlc_pulse_streamer.v} 是真正的 runtime pulse-streamer core。\filepath{zlc_pulse_streamer_top_4ch.v} 是 first-light top：它实例化 core 和 Vivado VIO IP，并把 \pyapi{out[0:3]} 接到 \pyapi{trap/cooling/probe/qcm_trigger}。这四个 pin 来自历史 \pyapi{address_switch} XDC：
@@ -502,10 +511,18 @@ done LED             -> PACKAGE_PIN R3
 
 \begin{shellblock}
 cd D:\GitHub\Zou_lab_control_v1
+.\fpga\pulse_streamer\vivado_env.bat
+.\fpga\pulse_streamer\simulate_4ch_core.bat
 .\fpga\pulse_streamer\build_4ch_bitstream.bat
 \end{shellblock}
 
-这个脚本会调用 \filepath{C:\Xilinx\Vivado\2019.2\bin\vivado.bat}，创建工程、创建 \pyapi{vio_0} IP、综合、实现并写 bitstream。生成物在：
+\filepath{simulate_4ch_core.bat} 不需要 FPGA 板卡，它用 Vivado 的 \pyapi{xvlog/xelab/xsim} 检查 runtime upload、start edge、输出 mask、\pyapi{running/done} 和最终全 off。后面的 build 脚本会调用 \filepath{vivado_env.bat} 自动寻找 Vivado：先看 \pyapi{ZLC_PS_VIVADO_BIN}，再找 \filepath{C:\Xilinx\Vivado\*\bin\vivado.bat} 和 \filepath{D:\Xilinx\Vivado\*\bin\vivado.bat}，最后看 PATH。本机测试用的是 Vivado 2019.1；旧 \filepath{address_switch} archive 是 Vivado 2019.2，历史路径类似 \filepath{D:\time_sequence\address_switch}。如果 Verilog 电脑的 Vivado 在别处，先手动设：
+
+\begin{shellblock}
+$env:ZLC_PS_VIVADO_BIN = "C:\Xilinx\Vivado\2019.2\bin\vivado.bat"
+\end{shellblock}
+
+Vivado 2019 的 debug core 生成对路径长度比较敏感。bat helper 会尽量用临时 \pyapi{subst} 短盘符运行 Tcl；上机时仍建议把 repo 放在 \filepath{D:\ZLC} 或 \filepath{D:\time_sequence\ZLC} 这种短路径。build 脚本会创建工程、创建 \pyapi{vio_0} IP、综合、实现并写 bitstream。生成物在：
 
 \begin{shellblock}
 fpga\pulse_streamer\build\zlc_pulse_streamer_4ch\
@@ -514,9 +531,9 @@ fpga\pulse_streamer\build\zlc_pulse_streamer_4ch\
   zlc_pulse_streamer_4ch.runs\impl_1\zlc_pulse_streamer_top_4ch.ltx
 \end{shellblock}
 
-build Tcl 会检查 \pyapi{synth_1} 和 \pyapi{impl_1} 的 run status，并确认 \pyapi{.bit/.ltx} 都生成出来；bat wrapper 会把 Vivado 的 errorlevel 传回 PowerShell。如果 build 没有完成或 probe 文件缺失，不要继续进入 program/smoke/server 步骤。
+build Tcl 会检查 \pyapi{synth_1} 和 \pyapi{impl_1} 的 run status，并确认 \pyapi{.bit/.ltx} 都生成出来；bat wrapper 会把 Vivado 的 errorlevel 传回 PowerShell。如果 build 没有完成或 probe 文件缺失，不要继续进入 program/smoke/server 步骤。只想看入口说明而不真正启动 Vivado 时，可以运行 \filepath{build_4ch_bitstream.bat --help}。
 
-如果想在 Vivado GUI 里一步步看，也可以打开 \filepath{C:\Xilinx\Vivado\2019.2\bin\vivado.bat} 或 Windows Start Menu 里的 Xilinx Vivado 2019.2。若工程还没有生成，先运行 \filepath{build_4ch_bitstream.bat}；已有工程后，在 Vivado 里点 \pyapi{File -> Project -> Open}，选择 \filepath{fpga\pulse_streamer\build\zlc_pulse_streamer_4ch\zlc_pulse_streamer_4ch.xpr}。左侧 \pyapi{Flow Navigator} 依次点 \pyapi{Run Synthesis}、\pyapi{Run Implementation}、\pyapi{Generate Bitstream}；每一步完成后底部 Tcl Console/Messages 不应有 error。首次 4-channel build 通常需要 8--20 分钟，电脑较慢或第一次生成 IP cache 时可能到 30 分钟；incremental build 一般 3--10 分钟。
+如果想在 Vivado GUI 里一步步看，也可以打开当前机器安装的 Xilinx Vivado 2019.x，或打开 \filepath{vivado_env.bat} 打印出的 \filepath{vivado.bat}。若工程还没有生成，先运行 \filepath{build_4ch_bitstream.bat}；已有工程后，在 Vivado 里点 \pyapi{File -> Project -> Open}，选择 \filepath{fpga\pulse_streamer\build\zlc_pulse_streamer_4ch\zlc_pulse_streamer_4ch.xpr}。左侧 \pyapi{Flow Navigator} 依次点 \pyapi{Run Synthesis}、\pyapi{Run Implementation}、\pyapi{Generate Bitstream}；每一步完成后底部 Tcl Console/Messages 不应有 error。首次 4-channel build 通常需要 8--20 分钟，电脑较慢或第一次生成 IP cache 时可能到 30 分钟；incremental build 一般 3--10 分钟。
 
 然后烧到 FPGA：
 
@@ -561,7 +578,7 @@ probe_in1  zlc_done       width 1
 
 Vivado 的 \pyapi{.ltx} 里可能把 probe 暴露成语义 net 名，例如 \pyapi{zlc_reset} 或 \pyapi{zlc_vio_i/zlc_reset}；也可能只暴露成 VIO 端口名，例如 \pyapi{probe_out0}。server 生成的 Tcl 会按两套别名查找：\pyapi{zlc_reset -> probe_out0}，\pyapi{zlc_start -> probe_out1}，\pyapi{zlc_prog_we -> probe_out2}，\pyapi{zlc_prog_addr -> probe_out3}，\pyapi{zlc_prog_tick -> probe_out4}，\pyapi{zlc_prog_mask -> probe_out5}，\pyapi{zlc_prog_count -> probe_out6}，\pyapi{zlc_running -> probe_in0}，\pyapi{zlc_done -> probe_in1}。如果匹配多个 probe，会打印当前 VIO 上的 probe 列表并报错。正常启动后，\pyapi{prepare.log} 或 \pyapi{pulse_streamer_prepare.log} 里应能看到 \pyapi{ZLC pulse-streamer VIO: zlc_prog_tick=...} 这样的写入记录。
 
-\pyapi{zlc_pulse_streamer_top_40ch.v} 使用同一个 core，但是 \pyapi{prog_mask} 宽度是 40，输出是 \pyapi{ch[39:0]}。使用 40 路前，先把 \filepath{zlc_pulse_streamer_40ch.xdc.template} 复制成 \filepath{zlc_pulse_streamer_40ch.xdc}，逐项填入真实 package pin 和连接器含义，然后运行 \filepath{build_40ch_bitstream.bat} 和 \filepath{program_40ch_fpga.bat}。如果 \filepath{zlc_pulse_streamer_40ch.xdc} 仍然包含 \pyapi{<PIN_CHxx>} placeholder，40 路 build 会提前停止。不要在没有确认 40 个物理 pin、电平标准、bank 电压、连接器方向和外部 buffer/level shifter 的情况下烧 40 路 bitstream。40-channel build 比 4-channel VIO 更宽，通常预留 15--35 分钟；烧录仍然大约 1--3 分钟。
+\pyapi{zlc_pulse_streamer_top_40ch.v} 使用同一个 core，但是 \pyapi{prog_mask} 宽度是 40，输出是 \pyapi{ch[39:0]}。使用 40 路前，先把 \filepath{zlc_pulse_streamer_40ch.xdc.template} 复制成 \filepath{zlc_pulse_streamer_40ch.xdc}，逐项填入真实 package pin 和连接器含义。没有真实 40 路 XDC 时，只运行 \filepath{check_40ch_synth.bat} 做 HDL/VIO 宽度自查；它不使用输出 pin constraint，也不会生成可烧板子的 bitstream。真实 40 路上板时再运行 \filepath{build_40ch_bitstream.bat} 和 \filepath{program_40ch_fpga.bat}。如果 \filepath{zlc_pulse_streamer_40ch.xdc} 缺失，或仍然包含 \pyapi{<PIN_CHxx>} placeholder，40 路 build 会提前停止。不要在没有确认 40 个物理 pin、电平标准、bank 电压、连接器方向和外部 buffer/level shifter 的情况下烧 40 路 bitstream。40-channel build 比 4-channel VIO 更宽，通常预留 15--35 分钟；烧录仍然大约 1--3 分钟。
 
 不使用 Jupyter 时，在 Verilog/FPGA 电脑的 PowerShell 运行：
 
@@ -569,7 +586,19 @@ Vivado 的 \pyapi{.ltx} 里可能把 probe 暴露成语义 net 名，例如 \pya
 cd D:\GitHub\Zou_lab_control_v1
 python -m pip install -e .
 
-$env:ZLC_PS_VIVADO_BIN = "C:\Xilinx\Vivado\2019.2\bin\vivado.bat"
+.\fpga\pulse_streamer\start_server_4ch.bat
+\end{shellblock}
+
+这个 launcher 会默认使用 4ch build 目录里的 \filepath{.xpr/.bit/.ltx}，并在 terminal 中阻塞运行 server。已经完成 40ch XDC、build 和 program 后，可以改用：
+
+\begin{shellblock}
+.\fpga\pulse_streamer\start_server_40ch.bat
+\end{shellblock}
+
+40ch launcher 使用 \pyapi{ch00 ... ch39}、\pyapi{ch03} trigger、100 MHz clock 和 \pyapi{ZLC_PS_CHANNEL_COUNT=40}。如果要手动展开 server 命令，等价写法是：
+
+\begin{shellblock}
+$env:ZLC_PS_VIVADO_BIN = "C:\Xilinx\Vivado\2019.2\bin\vivado.bat"  # optional
 $env:ZLC_PS_VIVADO_PROJECT = "$PWD\fpga\pulse_streamer\build\zlc_pulse_streamer_4ch\zlc_pulse_streamer_4ch.xpr"
 $env:ZLC_PS_VIVADO_BIT = "$PWD\fpga\pulse_streamer\build\zlc_pulse_streamer_4ch\zlc_pulse_streamer_4ch.runs\impl_1\zlc_pulse_streamer_top_4ch.bit"
 $env:ZLC_PS_VIVADO_LTX = "$PWD\fpga\pulse_streamer\build\zlc_pulse_streamer_4ch\zlc_pulse_streamer_4ch.runs\impl_1\zlc_pulse_streamer_top_4ch.ltx"

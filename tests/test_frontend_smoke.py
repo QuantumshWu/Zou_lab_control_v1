@@ -750,6 +750,63 @@ def test_standalone_pulse_gui_defaults_use_hardware_channel_names():
     assert launcher._resolve_trigger_channels(args, channels) == ["ch03"]
 
 
+def test_pulse_gui_controls_call_attached_40ch_sequencer(monkeypatch):
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor, ensure_qt_app
+
+    app = ensure_qt_app()
+    channels = [f"ch{i:02d}" for i in range(40)]
+
+    class RecordingSequencer:
+        clock_hz = 100e6
+        trigger_channels = ["ch03"]
+
+        def __init__(self):
+            self.channels = channels
+            self.prepared = None
+            self.events = []
+
+        def prepare(self, sequence):
+            self.prepared = sequence
+            self.events.append(("prepare", sequence.name, list(sequence.channels)))
+            return na.compile_runtime_program(sequence, channels=self.channels, clock_hz=self.clock_hz, trigger_channels=self.trigger_channels)
+
+        def fire(self):
+            self.events.append(("fire",))
+
+        def wait_done(self, timeout=None):
+            self.events.append(("wait_done", timeout))
+            return True
+
+        def set_safe_state(self):
+            self.events.append(("safe",))
+
+    sequencer = RecordingSequencer()
+    editor = PulseSequenceEditor(
+        state=na.PulseTableState.load(Path(__file__).resolve().parents[1] / "pulses" / "camera_imaging_40ch.json"),
+        sequencer=sequencer,
+    )
+    try:
+        editor.show()
+        app.processEvents()
+
+        editor.prepare()
+        editor.fire()
+        editor.wait_done()
+        editor.safe_state()
+        app.processEvents()
+
+        assert sequencer.events[0][0] == "prepare"
+        assert [event[0] for event in sequencer.events] == ["prepare", "fire", "wait_done", "safe"]
+        assert editor.last_program.channels == channels
+        assert editor.last_program.trigger_count == 1
+        assert sequencer.prepared.validate(clock_hz=100e6, channels=channels).ok
+    finally:
+        editor.close()
+
+
 def test_pulse_gui_repeat_preview_uses_unexpanded_periods(monkeypatch):
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
