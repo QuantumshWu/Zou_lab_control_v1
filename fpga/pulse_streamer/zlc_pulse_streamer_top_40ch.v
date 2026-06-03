@@ -13,10 +13,14 @@ module zlc_pulse_streamer_top_40ch(
     wire zlc_reset;
     wire zlc_start;
     wire zlc_prog_we;
-    wire [9:0] zlc_prog_addr;
+    wire [6:0] zlc_prog_addr;
     wire [31:0] zlc_prog_tick;
     wire [39:0] zlc_prog_mask;
-    wire [10:0] zlc_prog_count;
+    wire [7:0] zlc_prog_count;
+    wire zlc_repeat_forever;
+    wire [6:0] zlc_loop_start_addr;
+    wire [31:0] zlc_loop_end_tick;
+    wire [31:0] zlc_loop_count;
     wire [39:0] out;
     wire zlc_running;
     wire zlc_done;
@@ -27,7 +31,7 @@ module zlc_pulse_streamer_top_40ch(
 
     zlc_pulse_streamer #(
         .CHANNEL_COUNT(40),
-        .EDGE_ADDR_WIDTH(10),
+        .EDGE_ADDR_WIDTH(7),
         .TICK_WIDTH(32)
     ) zlc_streamer_i (
         .clk(clk),
@@ -38,6 +42,10 @@ module zlc_pulse_streamer_top_40ch(
         .prog_tick(zlc_prog_tick),
         .prog_mask(zlc_prog_mask),
         .prog_count(zlc_prog_count),
+        .repeat_forever(zlc_repeat_forever),
+        .loop_start_addr(zlc_loop_start_addr),
+        .loop_end_tick(zlc_loop_end_tick),
+        .loop_count(zlc_loop_count),
         .out(out),
         .running(zlc_running),
         .done(zlc_done)
@@ -53,6 +61,10 @@ module zlc_pulse_streamer_top_40ch(
         .probe_out3(zlc_prog_addr),
         .probe_out4(zlc_prog_tick),
         .probe_out5(zlc_prog_mask),
-        .probe_out6(zlc_prog_count)
+        .probe_out6(zlc_prog_count),
+        .probe_out7(zlc_repeat_forever),
+        .probe_out8(zlc_loop_start_addr),
+        .probe_out9(zlc_loop_end_tick),
+        .probe_out10(zlc_loop_count)
     );
 endmodule

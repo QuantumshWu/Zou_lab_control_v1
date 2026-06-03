@@ -3,6 +3,7 @@ import matplotlib
 matplotlib.use("Agg")
 
 import json
+import queue
 from pathlib import Path
 import re
 import socket
@@ -16,7 +17,6 @@ import numpy as np
 from matplotlib.patches import Circle
 
 import Zou_lab_control.neutral_atom as na
-from Zou_lab_control.neutral_atom.devices.legacy_address_switch import legacy_imaging_parameters, write_vivado_vio_tcl
 from Zou_lab_control.frontend.content.tutorials import neutral_atom_fpga_server_cells, neutral_atom_hardware_tutorial_cells
 
 
@@ -254,6 +254,18 @@ def test_multiframe_acquisition_repeats_camera_trigger_sequence():
     assert fires[-1]["duration"] == expanded.duration
 
 
+def test_pulse_sequence_repeat_metadata_does_not_expand_for_runtime_counts():
+    seq = na.PulseSequence(name="huge_repeat").pulse("qcm_trigger", 0.0, 1e-6).repeated(100_000, period=2e-6)
+    report = seq.validate(clock_hz=100_000_000, channels=["trap", "cooling", "probe", "qcm_trigger"])
+    program = na.compile_runtime_program(seq, channels=["trap", "cooling", "probe", "qcm_trigger"], clock_hz=100_000_000)
+
+    assert report.ok
+    assert na.count_trigger_pulses(seq) == 100_000
+    assert program.repeat_forever is False
+    assert program.loop_count == 100_000
+    assert len(program.ticks) < 16
+
+
 def test_detection_time_scan_sends_probe_duration_per_point():
     exp = na.connect("virtual", sitemap={"grid_shape": (1, 2), "image_shape": (32, 48)})
     exp.readout.sitemap(frames=3, display=False)
@@ -307,16 +319,28 @@ def test_fpga_pulse_streamer_writes_hdl_and_upload_tcl(tmp_path):
     assert "module zlc_pulse_streamer" in core
     assert "Runtime-programmable edge-table pulse streamer" in core
     assert '(* ram_style = "distributed" *)' in core
+    assert "if (reset && prog_we)" in core
+    assert "prog_we_edge" not in core
     assert "probe_out4 zlc_prog_tick" in top
-    assert "zlc_set_probe $vio $zlc_prog_count_probe" in tcl
-    assert "zlc_set_probe $vio $zlc_prog_tick_probe" in tcl
-    assert "zlc_set_probe $vio $zlc_prog_mask_probe" in tcl
+    assert "probe_out10 zlc_loop_count" in top
+    assert "proc zlc_stage_probe" in tcl
+    assert "proc zlc_commit_probes" in tcl
+    assert "zlc_commit_probes $zlc_batch" in tcl
+    assert "zlc_stage_probe $vio $zlc_prog_count_probe" in tcl
+    assert "zlc_stage_probe $vio $zlc_repeat_forever_probe" in tcl
+    assert "zlc_stage_probe $vio $zlc_loop_start_addr_probe" in tcl
+    assert "zlc_stage_probe $vio $zlc_loop_end_tick_probe" in tcl
+    assert "zlc_stage_probe $vio $zlc_loop_count_probe" in tcl
+    assert "zlc_stage_probe $vio $zlc_prog_tick_probe" in tcl
+    assert "zlc_stage_probe $vio $zlc_prog_mask_probe" in tcl
     assert "Available probes on matched VIO:" in tcl
     assert "Vivado project not found" in tcl
     assert "Vivado probe file not found" in tcl
     assert "Vivado bitstream not found for programming" in tcl
     assert "set zlc_reset_probe {zlc_reset probe_out0}" in tcl
     assert "set zlc_prog_tick_probe {zlc_prog_tick probe_out4}" in tcl
+    assert "set zlc_repeat_forever_probe {zlc_repeat_forever probe_out7}" in tcl
+    assert "set zlc_loop_count_probe {zlc_loop_count probe_out10}" in tcl
     assert "set zlc_done_probe {zlc_done probe_in1}" in tcl
     assert "string match \"*/$name\"" in tcl
     assert "probe aliases" in tcl
@@ -399,8 +423,10 @@ def test_fpga_pulse_streamer_fire_dry_run_does_not_require_program_file(tmp_path
     tcl_path = run_action("fire", state_dir=tmp_path, dry_run=True)
 
     tcl = tcl_path.read_text(encoding="utf-8")
-    assert "zlc_set_probe $vio $zlc_start_probe 1" in tcl
-    assert "ZLC pulse-streamer start edge sent" in tcl
+    assert "set zlc_start_next [expr {$zlc_start_toggle_value ? 0 : 1}]" in tcl
+    assert "zlc_stage_probe $vio $zlc_start_probe $zlc_start_next" in tcl
+    assert "zlc_set_probe $vio $zlc_start_probe" not in tcl
+    assert "ZLC pulse-streamer start toggle sent value=" in tcl
 
 
 def test_fpga_pulse_streamer_module_cli_generates_hdl(tmp_path):
@@ -438,100 +464,85 @@ def test_fpga_pulse_streamer_module_cli_generates_hdl(tmp_path):
 def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     root = Path(__file__).resolve().parents[1]
     fpga = root / "fpga" / "pulse_streamer"
+    for name in ("install_requirements.bat", "pulse_gui.bat", "start_tutorials_jupyter_lab.bat"):
+        assert (root / name).exists(), name
+    assert not (root / "build_and_program.bat").exists()
+    assert not (root / "run_server.bat").exists()
+
+    fpga_build_bat = root / "fpga" / "build_and_program.bat"
+    fpga_server_bat = root / "fpga" / "run_server.bat"
+    assert fpga_build_bat.exists()
+    assert fpga_server_bat.exists()
+    assert not list(fpga.glob("*.bat"))
+
     required = [
         "zlc_pulse_streamer.v",
-        "zlc_pulse_streamer_top_4ch.v",
         "zlc_pulse_streamer_top_40ch.v",
-        "zlc_pulse_streamer_4ch.xdc",
         "zlc_pulse_streamer_40ch.xdc.template",
-        "create_project_4ch.tcl",
         "create_project_40ch.tcl",
         "check_40ch_synth.tcl",
-        "program_fpga_4ch.tcl",
+        "diagnose_hw_target.tcl",
         "program_fpga_40ch.tcl",
-        "build_4ch_bitstream.bat",
-        "program_4ch_fpga.bat",
-        "build_40ch_bitstream.bat",
-        "program_40ch_fpga.bat",
-        "check_40ch_synth.bat",
-        "start_server_4ch.bat",
-        "start_server_40ch.bat",
-        "vivado_env.bat",
-        "vivado_run_tcl.bat",
-        "tb_zlc_pulse_streamer_4ch.v",
-        "simulate_4ch_core.bat",
-        "smoke_test_4ch.py",
-        "smoke_test_4ch_upload.bat",
         "README.md",
     ]
     for name in required:
         assert (fpga / name).exists(), name
 
-    top4 = (fpga / "zlc_pulse_streamer_top_4ch.v").read_text(encoding="utf-8")
     top40 = (fpga / "zlc_pulse_streamer_top_40ch.v").read_text(encoding="utf-8")
-    tcl4 = (fpga / "create_project_4ch.tcl").read_text(encoding="utf-8")
     tcl40 = (fpga / "create_project_40ch.tcl").read_text(encoding="utf-8")
     check40 = (fpga / "check_40ch_synth.tcl").read_text(encoding="utf-8")
-    program_tcl4 = (fpga / "program_fpga_4ch.tcl").read_text(encoding="utf-8")
-    build_bat = (fpga / "build_4ch_bitstream.bat").read_text(encoding="utf-8")
-    program_bat = (fpga / "program_4ch_fpga.bat").read_text(encoding="utf-8")
-    vivado_env_bat = (fpga / "vivado_env.bat").read_text(encoding="utf-8")
-    vivado_run_bat = (fpga / "vivado_run_tcl.bat").read_text(encoding="utf-8")
-    server40_bat = (fpga / "start_server_40ch.bat").read_text(encoding="utf-8")
-    sim4_bat = (fpga / "simulate_4ch_core.bat").read_text(encoding="utf-8")
-    sim4_tb = (fpga / "tb_zlc_pulse_streamer_4ch.v").read_text(encoding="utf-8")
-    smoke_bat = (fpga / "smoke_test_4ch_upload.bat").read_text(encoding="utf-8")
-    xdc4 = (fpga / "zlc_pulse_streamer_4ch.xdc").read_text(encoding="utf-8")
+    program_tcl40 = (fpga / "program_fpga_40ch.tcl").read_text(encoding="utf-8")
+    diagnose_hw_tcl = (fpga / "diagnose_hw_target.tcl").read_text(encoding="utf-8")
+    build_bat = fpga_build_bat.read_text(encoding="utf-8")
+    server_bat = fpga_server_bat.read_text(encoding="utf-8")
     core = (fpga / "zlc_pulse_streamer.v").read_text(encoding="utf-8")
 
     assert '(* ram_style = "distributed" *)' in core
-    assert ".probe_out3(zlc_prog_addr)" in top4
-    assert ".probe_out4(zlc_prog_tick)" in top4
-    assert ".probe_out5(zlc_prog_mask)" in top4
-    assert ".probe_out6(zlc_prog_count)" in top4
-    assert "wire [3:0] zlc_prog_mask" in top4
     assert "wire [39:0] zlc_prog_mask" in top40
-    assert "CONFIG.C_NUM_PROBE_IN {2}" in tcl4
-    assert "CONFIG.C_NUM_PROBE_OUT {7}" in tcl4
-    assert "CONFIG.C_PROBE_OUT3_WIDTH {10}" in tcl4
-    assert "CONFIG.C_PROBE_OUT4_WIDTH {32}" in tcl4
-    assert "CONFIG.C_PROBE_OUT5_WIDTH {4}" in tcl4
-    assert "CONFIG.C_PROBE_OUT6_WIDTH {11}" in tcl4
-    assert "zlc_require_run_complete synth_1" in tcl4
-    assert "zlc_require_run_complete impl_1" in tcl4
-    assert "VIO probe file was not generated" in tcl4
+    assert "wire [6:0] zlc_prog_addr" in top40
+    assert "wire [7:0] zlc_prog_count" in top40
+    assert ".EDGE_ADDR_WIDTH(7)" in top40
+    assert "CONFIG.C_PROBE_OUT3_WIDTH {7}" in tcl40
     assert "CONFIG.C_PROBE_OUT5_WIDTH {40}" in tcl40
+    assert "CONFIG.C_PROBE_OUT6_WIDTH {8}" in tcl40
+    assert "CONFIG.C_PROBE_OUT8_WIDTH {7}" in tcl40
+    assert "ZLC_PS_40CH_XDC" in tcl40
+    assert "ZLC_PS_XDC" in tcl40
     assert "still contains <PIN_CHxx> placeholders" in tcl40
+    assert "CONFIG.C_PROBE_OUT3_WIDTH {7}" in check40
     assert "CONFIG.C_PROBE_OUT5_WIDTH {40}" in check40
+    assert "CONFIG.C_PROBE_OUT6_WIDTH {8}" in check40
+    assert "zlc_check_utilization" in check40
+    assert "40ch synth LUT utilization is too high" in check40
     assert "ZLC 40ch synth check complete" in check40
-    assert "ZLC_PS_VIVADO_BIT" in program_tcl4
-    assert "ZLC_PS_VIVADO_LTX" in program_tcl4
-    assert "VIO probe file not found" in program_tcl4
-    assert "2019.1 2019.2" in vivado_env_bat
-    assert "C:\\Xilinx\\Vivado\\%%V\\bin\\vivado.bat" in vivado_env_bat
-    assert "subst !ZLC_SHORT_DRIVE!" in vivado_run_bat
+    assert "ZLC_PS_VIVADO_BIT" in program_tcl40
+    assert "ZLC_PS_VIVADO_LTX" in program_tcl40
+    assert "VIO probe file not found" in program_tcl40
+    assert "load_features labtools" in program_tcl40
+    assert "open_hw" in program_tcl40
+    assert "get_hw_targets" in program_tcl40
+    assert "No Vivado hardware target found" in program_tcl40
+    assert "Retrying open_hw_target with -jtag_mode on" in program_tcl40
+    assert "Target opened but no FPGA devices were detected" in diagnose_hw_tcl
+    assert "Vivado hardware Tcl commands are unavailable" in program_tcl40
+    assert "retrying without option" in program_tcl40
     assert "--help" in build_bat
-    assert "create_project_4ch.tcl" in build_bat
-    assert "exit /b %ZLC_STATUS%" in build_bat
-    assert "exit /b %ZLC_STATUS%" in program_bat
-    assert "ZLC_PS_CHANNEL_COUNT=40" in server40_bat
-    assert "ch00 ch01 ch02 ch03" in server40_bat
-    assert "xsim" in sim4_bat
-    assert "ZLC_SIM_PASS" in sim4_tb
-    assert "zlc_pulse_streamer_top_4ch.bit" in smoke_bat
-    assert "zlc_pulse_streamer_top_4ch.ltx" in smoke_bat
-    assert "ZLC_PS_CHANNEL_COUNT=4" in smoke_bat
-    assert "exit /b %ZLC_STATUS%" in smoke_bat
-
-    for port, pin in {
-        "clk": "R4",
-        "trap": "M17",
-        "cooling": "F15",
-        "probe": "N15",
-        "qcm_trigger": "R17",
-    }.items():
-        assert f"PACKAGE_PIN {pin}" in xdc4
-        assert f"[get_ports {port}]" in xdc4
+    assert "--check" in build_bat
+    assert "--diagnose" in build_bat
+    assert "create_project_40ch.tcl" in build_bat
+    assert "program_fpga_40ch.tcl" in build_bat
+    assert "check_40ch_synth.tcl" in build_bat
+    assert "diagnose_hw_target.tcl" in build_bat
+    assert "ZLC_PS_40CH_XDC" in build_bat
+    assert "ZLC_PS_VIVADO_BIN" in build_bat
+    assert "subst !ZLC_SHORT_DRIVE!" in build_bat
+    assert "ZLC_PS_CHANNEL_COUNT=40" in server_bat
+    assert "ZLC_PS_PROFILE" not in server_bat
+    assert "ZLC_PS_SERVER_BACKEND=vivado-session" in server_bat
+    assert "ch00 ch01 ch02 ch03" in server_bat
+    assert "ch36 ch37 ch38 ch39" in server_bat
+    assert "--trigger-channels ch03" in server_bat
+    assert "trap cooling probe qcm_trigger" not in server_bat
 
 
 def test_fpga_pulse_streamer_prepare_tcl_covers_full_edge_table_boundary(tmp_path):
@@ -559,12 +570,21 @@ def test_fpga_pulse_streamer_prepare_tcl_covers_full_edge_table_boundary(tmp_pat
     )
     tcl = tcl_path.read_text(encoding="utf-8")
 
-    assert "zlc_set_probe $vio $zlc_prog_count_probe 1024" in tcl
-    assert "zlc_set_probe $vio $zlc_prog_addr_probe 1023" in tcl
-    assert "zlc_set_probe $vio $zlc_prog_tick_probe 1023" in tcl
-    assert "zlc_set_probe $vio $zlc_prog_mask_probe 0" in tcl
-    assert tcl.count("zlc_set_probe $vio $zlc_prog_we_probe 1") == 1024
-    assert tcl.count("zlc_set_probe $vio $zlc_prog_we_probe 0") == 1025
+    assert "zlc_stage_probe $vio $zlc_prog_count_probe 1024" in tcl
+    assert "load_features labtools" in tcl
+    assert "open_hw" in tcl
+    assert "get_hw_targets" in tcl
+    assert "No Vivado hardware target found" in tcl
+    assert "Vivado hardware Tcl commands are unavailable" in tcl
+    assert "retrying without option" in tcl
+    assert "VIO filter '$vio_filter' failed" in tcl
+    assert "using the only available VIO core" in tcl
+    assert "zlc_stage_probe $vio $zlc_prog_addr_probe 1023" in tcl
+    assert "zlc_stage_probe $vio $zlc_prog_tick_probe 1023" in tcl
+    assert "zlc_stage_probe $vio $zlc_prog_mask_probe 0" in tcl
+    assert tcl.count("zlc_stage_probe $vio $zlc_prog_we_probe 1") == 1024
+    assert tcl.count("zlc_stage_probe $vio $zlc_prog_we_probe 0") == 2
+    assert "zlc_set_probe $vio $zlc_prog_we_probe 0" not in tcl
 
 
 def test_fpga_pulse_streamer_edge_table_python_model_matches_contract():
@@ -591,10 +611,14 @@ def test_fpga_pulse_streamer_compiles_channel_delay_and_repeated_frames():
     repeated = seq.repeated(2, period=5e-8)
     program = na.compile_runtime_program(repeated, channels=["trap", "cooling", "probe", "qcm_trigger"], clock_hz=100e6)
 
-    assert program.ticks == [0, 1, 2, 5, 6, 7]
-    assert program.masks == [0b0001, 0b1001, 0b0000, 0b0001, 0b1001, 0b0000]
+    assert program.ticks == [0, 1, 2, 5]
+    assert program.masks == [0b0001, 0b1001, 0b0000, 0b0000]
     assert program.masks[-1] == 0
     assert program.trigger_count == 2
+    assert program.repeat_forever is False
+    assert program.loop_start_index == 0
+    assert program.loop_end_tick == 5
+    assert program.loop_count == 2
 
 
 def test_pulse_table_state_compiles_repeat_visibility_and_delays(tmp_path):
@@ -634,9 +658,17 @@ def test_pulse_table_state_compiles_repeat_visibility_and_delays(tmp_path):
     assert state.x_ns == 100
     assert na.count_trigger_pulses(sequence, trigger_channels=["qcm_trigger"]) == 3
     assert program.trigger_count == 3
+    assert program.repeat_forever is True
+    assert program.ticks == [0, 10, 15, 30, 35, 40]
+    assert program.masks == [0b000001, 0b000101, 0b001101, 0b001000, 0, 0]
+    assert program.loop_start_index == 1
+    assert program.loop_end_tick == 40
+    assert program.loop_count == 3
     program_x = state.compile(clock_hz=100e6, trigger_channels=["qcm_trigger"], x_ns=200)
     assert program_x.trigger_count == 3
-    assert program_x.ticks[-1] == 160
+    assert program_x.repeat_forever is True
+    assert program_x.ticks[-1] == 60
+    assert program_x.duration == 1.6e-6
     assert loaded.to_dict() == state.to_dict()
 
     state.hide_channel("aod0")
@@ -648,6 +680,129 @@ def test_pulse_table_state_compiles_repeat_visibility_and_delays(tmp_path):
         assert "active" in str(exc)
     else:
         raise AssertionError("active channel should require explicit clearing before hiding")
+
+
+def test_pulse_table_state_compiles_hardware_repeat_without_expanding_edges():
+    state = na.PulseTableState(
+        channels=["ch00", "ch01", "ch02", "ch03"],
+        periods=[
+            na.PulsePeriod(10, (1, 0, 0, 0), unit="ns", name="load"),
+            na.PulsePeriod(20, (0, 1, 0, 1), unit="ns", name="trigger"),
+            na.PulsePeriod(10, (0, 0, 0, 0), unit="ns", name="idle"),
+        ],
+        time_step_ns=10,
+        repeat_start=1,
+        repeat_end=1,
+        repeat_count=500,
+        visible_channels=["ch00", "ch03"],
+        channel_labels={"ch00": "trap", "ch03": "qcm_trigger"},
+    )
+
+    hardware_channels = [f"ch{i:02d}" for i in range(40)]
+    program = na.compile_pulse_table_runtime_program(
+        state,
+        channels=hardware_channels,
+        clock_hz=100_000_000,
+        trigger_channels=["ch03"],
+    )
+    aligned = state.aligned_to_channels(hardware_channels)
+
+    assert len(program.channels) == 40
+    assert program.channels == hardware_channels
+    assert program.ticks == [0, 1, 3, 4]
+    assert program.masks == [0b0001, 0b1010, 0, 0]
+    assert program.duration == 1002 / 100_000_000
+    assert program.repeat_forever is True
+    assert program.loop_start_index == 1
+    assert program.loop_end_tick == 3
+    assert program.loop_count == 500
+    assert program.trigger_count == 1
+    assert len(program.ticks) == len(state.periods) + 1
+    assert len(program.ticks) < state.repeat_count
+    assert aligned.channels == hardware_channels
+    assert aligned.periods[0].states[:4] == (1, 0, 0, 0)
+    assert all(value == 0 for value in aligned.periods[0].states[4:])
+    na.validate_pulse_streamer_program(program, max_edges=1024, tick_width=32, channel_count=40)
+
+
+def test_partial_hardware_channels_default_missing_outputs_off():
+    hardware_channels = [f"ch{i:02d}" for i in range(40)]
+    seq = na.PulseSequence(name="partial_hardware").pulse("ch00", 0.0, 10e-9).pulse("ch03", 10e-9, 10e-9).forever(period=30e-9)
+    sequence_program = na.compile_runtime_program(seq, channels=hardware_channels, clock_hz=100_000_000, trigger_channels=["ch03"])
+
+    state = na.PulseTableState(
+        channels=["ch00", "ch03"],
+        periods=[
+            na.PulsePeriod(10, (1, 0), unit="ns"),
+            na.PulsePeriod(10, (0, 1), unit="ns"),
+            na.PulsePeriod(10, (0, 0), unit="ns"),
+        ],
+        time_step_ns=10,
+        visible_channels=["ch00", "ch03"],
+    )
+    table_program = na.compile_pulse_table_runtime_program(
+        state,
+        channels=hardware_channels,
+        clock_hz=100_000_000,
+        trigger_channels=["ch03"],
+    )
+
+    assert sequence_program.channels == hardware_channels
+    assert sequence_program.masks == [1 << 0, 1 << 3, 0, 0]
+    assert sequence_program.repeat_forever is True
+    assert len(table_program.channels) == 40
+    assert table_program.channels == hardware_channels
+    assert table_program.masks == [1 << 0, 1 << 3, 0, 0]
+    assert table_program.repeat_forever is True
+    assert table_program.trigger_count == 1
+    assert all(mask & ~((1 << 0) | (1 << 3)) == 0 for mask in table_program.masks)
+    assert all(mask >> 4 == 0 for mask in table_program.masks)
+
+
+def test_40ch_gui_visible_subset_compiles_as_full_width_fpga_program():
+    hardware_channels = [f"ch{i:02d}" for i in range(40)]
+    state = na.PulseTableState(
+        channels=hardware_channels,
+        periods=[
+            na.PulsePeriod(100, (1, 1, 0, 0, *([0] * 36)), unit="ns", name="load"),
+            na.PulsePeriod(20, (1, 0, 1, 1, *([0] * 36)), unit="ns", name="camera"),
+            na.PulsePeriod(100, (0,) * 40, unit="ns", name="off"),
+        ],
+        time_step_ns=10,
+        visible_channels=["ch00", "ch01", "ch02", "ch03"],
+        channel_labels={"ch00": "trap", "ch01": "cooling", "ch02": "probe", "ch03": "qcm_trigger"},
+    )
+
+    program = na.compile_pulse_table_runtime_program(
+        state,
+        channels=hardware_channels,
+        clock_hz=100_000_000,
+        trigger_channels=["ch03"],
+    )
+
+    assert state.visible_channels == hardware_channels[:4]
+    assert program.channels == hardware_channels
+    assert len(program.channels) == 40
+    assert program.masks == [0b0011, 0b1101, 0, 0]
+    assert all(mask >> 4 == 0 for mask in program.masks)
+    assert program.trigger_count == 1
+    assert program.repeat_forever is True
+    na.validate_pulse_streamer_program(program, max_edges=128, tick_width=32, channel_count=40)
+
+
+def test_pulse_table_unknown_channel_is_not_silently_ignored():
+    state = na.PulseTableState(
+        channels=["ch00", "not_on_fpga"],
+        periods=[na.PulsePeriod(10, (1, 1), unit="ns")],
+        time_step_ns=10,
+    )
+    try:
+        na.compile_pulse_table_runtime_program(state, channels=[f"ch{i:02d}" for i in range(40)], clock_hz=100_000_000)
+    except ValueError as exc:
+        assert "not in hardware channels" in str(exc)
+        assert "not_on_fpga" in str(exc)
+    else:
+        raise AssertionError("unknown pulse-table channels should be rejected")
 
 
 def test_checked_in_camera_imaging_pulse_compiles_for_40ch_fpga():
@@ -667,6 +822,10 @@ def test_checked_in_camera_imaging_pulse_compiles_for_40ch_fpga():
     assert program.ticks == [0, 200_000, 210_000, 212_000, 2_210_000, 2_212_000]
     assert program.masks == [0b0011, 0b0001, 0b1101, 0b0101, 0b0001, 0]
     assert program.trigger_count == 1
+    assert program.repeat_forever is True
+    assert program.loop_start_index == 0
+    assert program.loop_end_tick == 2_212_000
+    assert program.loop_count == 1
     na.validate_pulse_streamer_program(program, max_edges=1024, tick_width=32, channel_count=40)
 
 
@@ -726,35 +885,8 @@ def test_pulse_table_from_sequence_materializes_delays_without_double_applying()
     ]
 
 
-def test_fpga_pulse_streamer_smoke_test_script_writes_valid_program(tmp_path):
-    root = Path(__file__).resolve().parents[1]
-    script = root / "fpga" / "pulse_streamer" / "smoke_test_4ch.py"
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(script),
-            "--state-dir",
-            str(tmp_path),
-            "--write-only",
-        ],
-        cwd=root,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=20,
-    )
-
-    assert result.returncode == 0, result.stdout
-    assert "expected outputs at 100 MHz" in result.stdout
-    payload = json.loads((tmp_path / "fpga_4ch_smoke_program.json").read_text(encoding="utf-8"))
-    program = na.RuntimeSequenceProgram.from_dict(payload)
-    na.validate_pulse_streamer_program(program, max_edges=1024, tick_width=32, channel_count=4)
-    assert program.channels == ["trap", "cooling", "probe", "qcm_trigger"]
-    assert program.trigger_count == 1
-
-
 def _simulate_pulse_streamer(ticks, masks):
-    """Small behavioral model of the HDL run loop after the start edge is accepted."""
+    """Small behavioral model of the HDL run loop after the start transition is accepted."""
 
     active_count = len(ticks)
     final_tick = 0 if active_count == 0 else int(ticks[-1])
@@ -815,6 +947,94 @@ def test_command_sequencer_backend_error_includes_log_tail(tmp_path):
     assert "prepare failed detail" in (tmp_path / "prepare.log").read_text(encoding="utf-8")
 
 
+class _FakeVivadoStdout:
+    def __init__(self):
+        self.items: queue.Queue[str | None] = queue.Queue()
+
+    def push(self, line: str) -> None:
+        self.items.put(line)
+
+    def close(self) -> None:
+        self.items.put(None)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> str:
+        item = self.items.get(timeout=5)
+        if item is None:
+            raise StopIteration
+        return item
+
+
+class _FakeVivadoStdin:
+    def __init__(self, stdout: _FakeVivadoStdout):
+        self.stdout = stdout
+        self.writes: list[str] = []
+
+    def write(self, text: str) -> int:
+        self.writes.append(text)
+        match = re.search(r"ZLC_SESSION_(\d{6})_END", text)
+        if match:
+            marker = f"ZLC_SESSION_{match.group(1)}"
+            self.stdout.push(f"{marker}_OK\n")
+            self.stdout.push(f"{marker}_END\n")
+        return len(text)
+
+    def flush(self) -> None:
+        return None
+
+
+class _FakeVivadoProcess:
+    def __init__(self, args, **_kwargs):
+        self.args = args
+        self.stdout = _FakeVivadoStdout()
+        self.stdin = _FakeVivadoStdin(self.stdout)
+        self.returncode = None
+
+    def wait(self, timeout=None):
+        self.returncode = 0
+        self.stdout.close()
+        return 0
+
+    def terminate(self):
+        self.returncode = -15
+        self.stdout.close()
+
+
+def test_vivado_pulse_streamer_session_reuses_one_vivado_process(tmp_path, monkeypatch):
+    from Zou_lab_control.neutral_atom.devices import fpga_pulse_streamer as fps
+
+    created: list[_FakeVivadoProcess] = []
+
+    def fake_popen(args, **kwargs):
+        process = _FakeVivadoProcess(args, **kwargs)
+        created.append(process)
+        return process
+
+    monkeypatch.setattr(fps.subprocess, "Popen", fake_popen)
+    hardware_channels = [f"ch{i:02d}" for i in range(40)]
+    seq = na.PulseSequence(name="session").pulse("ch03", 0.0, 1e-6).forever(period=2e-6)
+    program = na.compile_runtime_program(seq, channels=hardware_channels, clock_hz=100e6, trigger_channels=["ch03"])
+    session = na.VivadoPulseStreamerSession(state_dir=tmp_path, vivado="fake_vivado", max_edges=128, channel_count=40)
+
+    session.prepare(program)
+    session.fire(program)
+    assert session.wait_done(program, timeout=1.0)
+    session.safe_state()
+    session.close()
+
+    assert len(created) == 1
+    assert created[0].args[:3] == ["fake_vivado", "-mode", "tcl"]
+    script = "".join(created[0].stdin.writes)
+    assert "connect_hw_server" in script
+    assert "zlc_stage_probe $vio $zlc_prog_mask_probe" in script
+    assert "zlc_stage_probe $vio $zlc_repeat_forever_probe 1" in script
+    assert "ZLC pulse-streamer start toggle sent value=" in script
+    assert "ZLC pulse-streamer safe state requested" in script
+    assert json.loads((tmp_path / "prepared_program.json").read_text(encoding="utf-8"))["repeat_forever"] is True
+
+
 def test_remote_sequencer_round_trip_uses_json_protocol(tmp_path):
     try:
         import rpyc  # noqa: F401
@@ -852,66 +1072,6 @@ def test_remote_sequencer_round_trip_uses_json_protocol(tmp_path):
     assert program.trigger_count == 4
     assert payload["trigger_count"] == 4
     assert payload["source_sequence"]["name"] == seq.name
-
-
-def test_legacy_address_switch_extracts_probe_lasting_and_writes_tcl(tmp_path, monkeypatch):
-    monkeypatch.setenv("ZLC_LEGACY_SINGLE_CAMERA_TRIGGER_CONFIRMED", "1")
-    seq = na.sequence_for_frame_count(na.imaging_sequence(exposure=4e-6, load=True), 5)
-    program = na.compile_runtime_program(seq, channels=["trap", "cooling", "probe", "qcm_trigger"], clock_hz=100e6)
-
-    params = legacy_imaging_parameters(program, clock_hz=100e6)
-    tcl_path = write_vivado_vio_tcl(tmp_path / "prepare.tcl", params, project="", bitstream="", probes="")
-
-    assert params == {"pulse_lasting": 400, "cycle_counts": 5}
-    tcl = tcl_path.read_text(encoding="utf-8")
-    assert 'set vio_filter {CELL_NAME=~"*vio*"}' in tcl
-    assert "Available VIO cores:" in tcl
-    assert "set_vio_probe $vio {pulse_lasting} {400}" in tcl
-    assert "set_vio_probe $vio {cycle_counts} {5}" in tcl
-
-
-def test_legacy_address_switch_prepare_requires_trigger_confirmation(monkeypatch):
-    from Zou_lab_control.neutral_atom.devices.legacy_address_switch import build_assignments
-
-    monkeypatch.delenv("ZLC_LEGACY_SINGLE_CAMERA_TRIGGER_CONFIRMED", raising=False)
-    seq = na.sequence_for_frame_count(na.imaging_sequence(exposure=4e-6, load=True), 2)
-    program = na.compile_runtime_program(seq, channels=["trap", "cooling", "probe", "qcm_trigger"], clock_hz=100e6)
-
-    try:
-        build_assignments("prepare", program)
-    except RuntimeError as exc:
-        assert "exactly one positive edge per cycle" in str(exc)
-    else:
-        raise AssertionError("legacy backend should require qCMOS trigger confirmation")
-
-
-def test_legacy_address_switch_missing_vivado_writes_clear_log(tmp_path, monkeypatch):
-    from Zou_lab_control.neutral_atom.devices.legacy_address_switch import run_action
-
-    monkeypatch.setenv("ZLC_LEGACY_SINGLE_CAMERA_TRIGGER_CONFIRMED", "1")
-    seq = na.imaging_sequence(exposure=4e-6, load=True)
-    program = na.compile_runtime_program(seq, channels=["trap", "cooling", "probe", "qcm_trigger"], clock_hz=100e6)
-    program_path = tmp_path / "program.json"
-    program_path.write_text(json.dumps(program.to_dict()), encoding="utf-8")
-
-    try:
-        run_action("prepare", program_path=program_path, state_dir=tmp_path, vivado="zlc_missing_vivado_executable")
-    except RuntimeError as exc:
-        assert "could not start Vivado" in str(exc)
-    else:
-        raise AssertionError("missing Vivado executable should fail clearly")
-
-    log_text = (tmp_path / "legacy_address_switch_prepare.log").read_text(encoding="utf-8")
-    assert "Vivado executable was not found" in log_text
-    assert "ZLC_VIVADO_BIN" in log_text
-
-
-def test_legacy_address_switch_wait_done_resets_config_ready():
-    from Zou_lab_control.neutral_atom.devices.legacy_address_switch import build_assignments
-
-    assert build_assignments("fire", None) == {"config_ready": 1}
-    assert build_assignments("wait_done", None) == {"config_ready": 0}
-    assert build_assignments("safe_state", None) == {"config_ready": 0, "debug": 0}
 
 
 def test_hardware_tutorial_is_real_hardware_not_virtual_demo():

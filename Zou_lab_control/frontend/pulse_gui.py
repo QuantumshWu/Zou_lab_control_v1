@@ -796,6 +796,8 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         elif channel_labels:
             state.channel_labels.update({str(k): str(v) for k, v in dict(channel_labels).items()})
             state.validate()
+        if state is not None and channels is not None and list(state.channels) != list(channels):
+            state = state.aligned_to_channels(channels)
         self.state = state
         self.sequencer = sequencer or (getattr(getattr(experiment, "devices", None), "sequencer", None) if experiment is not None else None)
         self.last_program = None
@@ -926,14 +928,13 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         button_layout.setContentsMargins(0, 0, 0, 0)
         button_layout.setSpacing(_px(8, minimum=5))
 
-        self.safe_button = self._control_button("Off\nPulse", self.safe_state, RED)
+        self.safe_button = self._control_button("Stop\nPulse", self.safe_state, RED)
         self.fire_button = self._control_button("On\nPulse", self.fire, GREEN)
         self.remove_button = self._control_button("Remove\nColumn", self.remove_period, ORANGE)
         self.add_button = self._control_button("Add\nColumn", self.add_period, ACCENT)
         self.bracket_button = self._control_button("Add\nBracket", self.toggle_bracket, YELLOW)
         self.save_button = self._control_button("Save to\nfile*", self.save_to_file, YELLOW)
         self.load_button = self._control_button("Load\nfrom\nfile", self.load_from_file, ORANGE)
-        self.prepare_button = self._control_button("Sync\nwith\ndevice", self.prepare, ORANGE)
         self.wait_button = self._control_button("Wait\nDone", self.wait_done, ACCENT)
         self.collapse_button = self._control_button("Collapse\nLeft", self.toggle_left_panels, GREY)
         button_positions = [
@@ -945,8 +946,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             (self.collapse_button, 0, 5),
             (self.save_button, 1, 0),
             (self.load_button, 1, 1),
-            (self.prepare_button, 1, 2),
-            (self.wait_button, 1, 3),
+            (self.wait_button, 1, 2),
         ]
         for button, row, col in button_positions:
             button_layout.addWidget(button, row, col)
@@ -1442,16 +1442,22 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self.add_channel_combo.setEnabled(has_hidden)
         self.add_channel_button.setEnabled(has_hidden)
 
+    def _prepare_to_device(self):
+        state = self.read_state()
+        clock_step_ns = self._clock_step_ns(self.sequencer)
+        if self.sequencer is None:
+            if clock_step_ns is not None:
+                state.to_sequence(time_step_ns=clock_step_ns)
+            else:
+                state.to_sequence()
+            return None
+        return self.sequencer.prepare(state)
+
     def prepare(self) -> None:
         try:
-            state = self.read_state()
-            clock_step_ns = self._clock_step_ns(self.sequencer)
-            sequence = state.to_sequence(time_step_ns=clock_step_ns) if clock_step_ns is not None else state.to_sequence()
-            if self.sequencer is None:
+            self.last_program = self._prepare_to_device()
+            if self.last_program is None:
                 self._message("No sequencer attached. Sequence validated only.")
-                self.stateui_manager.runstate = PulseStateUIManager.RunState.PREPARED
-                return
-            self.last_program = self.sequencer.prepare(sequence)
             self.stateui_manager.runstate = PulseStateUIManager.RunState.PREPARED
         except Exception as exc:
             self.stateui_manager.runstate = PulseStateUIManager.RunState.ERROR
@@ -1459,8 +1465,10 @@ class PulseSequenceEditor(QtWidgets.QWidget):
 
     def fire(self) -> None:
         try:
+            self.last_program = self._prepare_to_device()
             if self.sequencer is None:
-                self._message("No sequencer attached.")
+                self._message("No sequencer attached. Sequence validated only.")
+                self.stateui_manager.runstate = PulseStateUIManager.RunState.PREPARED
                 return
             self.sequencer.fire()
             self.stateui_manager.runstate = PulseStateUIManager.RunState.RUNNING

@@ -55,10 +55,22 @@ class Pulse:
 class PulseSequence:
     """Physical-time pulse table with simple per-channel delay support."""
 
-    def __init__(self, pulses: Iterable[Pulse] | None = None, *, name: str = "sequence", delays: dict[str, float] | None = None):
+    def __init__(
+        self,
+        pulses: Iterable[Pulse] | None = None,
+        *,
+        name: str = "sequence",
+        delays: dict[str, float] | None = None,
+        repeat_count: int = 1,
+        repeat_period: float | None = None,
+        repeat_forever: bool = False,
+    ):
         self.name = str(name)
         self.pulses = tuple(pulses or ())
         self.delays = {channel_name(k): finite_float(v, f"delay for {k!r}") for k, v in dict(delays or {}).items()}
+        self.repeat_count = positive_int(repeat_count, "repeat_count")
+        self.repeat_period = None if repeat_period is None else positive_float(repeat_period, "repeat_period")
+        self.repeat_forever = bool(repeat_forever)
 
     def pulse(self, channel: str, start: float, duration: float, *, value: int = 1, name: str = "") -> "PulseSequence":
         channel = channel_name(channel)
@@ -69,7 +81,14 @@ class PulseSequence:
         if duration <= 0:
             raise ValueError("duration must be > 0.")
         pulse = Pulse(channel, start, duration, digital_value(value), str(name))
-        return PulseSequence((*self.pulses, pulse), name=self.name, delays=self.delays)
+        return PulseSequence(
+            (*self.pulses, pulse),
+            name=self.name,
+            delays=self.delays,
+            repeat_count=self.repeat_count,
+            repeat_period=self.repeat_period,
+            repeat_forever=self.repeat_forever,
+        )
 
     def on(self, channel: str, start: float, stop: float, *, value: int = 1, name: str = "") -> "PulseSequence":
         start = finite_float(start, "start")
@@ -81,17 +100,33 @@ class PulseSequence:
         dt = finite_float(dt, "dt")
         delays = dict(self.delays)
         delays[channel] = delays.get(channel, 0.0) + dt
-        return PulseSequence(self.pulses, name=self.name, delays=delays)
+        return PulseSequence(
+            self.pulses,
+            name=self.name,
+            delays=delays,
+            repeat_count=self.repeat_count,
+            repeat_period=self.repeat_period,
+            repeat_forever=self.repeat_forever,
+        )
 
     def repeated(self, repeats: int, *, period: float | None = None) -> "PulseSequence":
         repeats = positive_int(repeats, "repeats")
-        period = self.duration if period is None else finite_float(period, "period")
+        period = self.base_duration if period is None else finite_float(period, "period")
         if period <= 0:
             raise ValueError("period must be > 0.")
-        pulses: list[Pulse] = []
-        for repeat in range(repeats):
-            pulses.extend(pulse.shifted(repeat * period) for pulse in self.pulses)
-        out = PulseSequence(pulses, name=self.name, delays=self.delays)
+        if period + 1e-15 < self.base_duration:
+            raise ValueError("period must be at least the base sequence duration.")
+        out = PulseSequence(self.pulses, name=self.name, delays=self.delays, repeat_count=repeats, repeat_period=period)
+        out.validate().raise_if_failed()
+        return out
+
+    def forever(self, *, period: float | None = None) -> "PulseSequence":
+        period = self.base_duration if period is None else finite_float(period, "period")
+        if period <= 0:
+            raise ValueError("period must be > 0.")
+        if period + 1e-15 < self.base_duration:
+            raise ValueError("period must be at least the base sequence duration.")
+        out = PulseSequence(self.pulses, name=self.name, delays=self.delays, repeat_count=1, repeat_period=period, repeat_forever=True)
         out.validate().raise_if_failed()
         return out
 
@@ -101,12 +136,33 @@ class PulseSequence:
 
     @property
     def duration(self) -> float:
+        base = self.base_duration
+        if self.repeat_forever:
+            return base
+        if self.repeat_count > 1:
+            return self.repeat_count * (self.repeat_period or base)
+        return base
+
+    @property
+    def base_duration(self) -> float:
         if not self.pulses:
             return 0.0
         return max(pulse.stop + self.delays.get(pulse.channel, 0.0) for pulse in self.pulses)
 
-    def effective_pulses(self) -> tuple[Pulse, ...]:
+    def base_pulses(self) -> tuple[Pulse, ...]:
+        """Return one unexpanded copy of the sequence with delays applied."""
+
         return tuple(replace(pulse, start=pulse.start + self.delays.get(pulse.channel, 0.0)) for pulse in self.pulses)
+
+    def effective_pulses(self) -> tuple[Pulse, ...]:
+        base = self.base_pulses()
+        if self.repeat_forever or self.repeat_count == 1:
+            return base
+        period = self.repeat_period or self.base_duration
+        return tuple(pulse.shifted(repeat * period) for repeat in range(self.repeat_count) for pulse in base)
+
+    def without_repeat(self) -> "PulseSequence":
+        return PulseSequence(self.pulses, name=self.name, delays=self.delays)
 
     def validate(self, *, clock_hz: float | None = None, channels: Sequence[str] | None = None) -> "PulseReport":
         errors: list[str] = []
@@ -124,7 +180,17 @@ class PulseSequence:
         for channel in self.delays:
             if channel not in raw_channels:
                 warnings.append(f"delay for {channel!r} is unused.")
-        for index, pulse in enumerate(self.effective_pulses()):
+        base_duration = self.base_duration
+        if self.repeat_forever or self.repeat_count > 1:
+            period = self.repeat_period or base_duration
+            if period <= 0:
+                errors.append("repeat period must be > 0.")
+            elif period + 1e-15 < base_duration:
+                errors.append("repeat period must be at least the base sequence duration.")
+            if clock is not None and period > 0 and _time_to_clock_tick(period, clock) is None:
+                errors.append(f"repeat period={period:g} s is not on the {clock:g} Hz clock grid.")
+
+        for index, pulse in enumerate(self.base_pulses()):
             if allowed is not None and pulse.channel not in allowed:
                 errors.append(f"channel {pulse.channel!r} is not in the sequencer channel list.")
             if pulse.start < 0:
@@ -184,9 +250,12 @@ class PulseSequence:
     def to_dict(self) -> dict[str, object]:
         return {
             "schema": "Zou_lab_control.neutral_atom.PulseSequence",
-            "version": 1,
+            "version": 2,
             "name": self.name,
             "delays": dict(self.delays),
+            "repeat_count": self.repeat_count,
+            "repeat_period": self.repeat_period,
+            "repeat_forever": self.repeat_forever,
             "pulses": [pulse.to_dict() for pulse in self.pulses],
         }
 
@@ -198,6 +267,9 @@ class PulseSequence:
             [Pulse.from_dict(item) for item in payload.get("pulses", [])],
             name=str(payload.get("name", "sequence")),
             delays=dict(payload.get("delays", {})),
+            repeat_count=int(payload.get("repeat_count", 1)),
+            repeat_period=None if payload.get("repeat_period") is None else finite_float(payload.get("repeat_period"), "repeat_period"),
+            repeat_forever=bool(payload.get("repeat_forever", False)),
         )
 
     def save(self, path: str | Path) -> Path:
@@ -258,7 +330,10 @@ def count_trigger_pulses(sequence: PulseSequence, *, trigger_channels: Sequence[
     """Count rising camera-trigger pulses in a sequence."""
 
     channels = set(channel_names(trigger_channels, "trigger_channels"))
-    return sum(1 for pulse in sequence.effective_pulses() if pulse.value and pulse.channel in channels)
+    base_count = sum(1 for pulse in sequence.base_pulses() if pulse.value and pulse.channel in channels)
+    if sequence.repeat_forever:
+        return base_count
+    return base_count * int(sequence.repeat_count)
 
 
 def sequence_for_frame_count(
@@ -299,11 +374,7 @@ def exposure_from_sequence(sequence: PulseSequence | None, *, default: float, ch
     if sequence is None:
         return default
     channel = channel_name(channel)
-    durations = [
-        int(round(pulse.duration * 1e15))
-        for pulse in sequence.effective_pulses()
-        if pulse.channel == channel and pulse.value
-    ]
+    durations = [int(round(pulse.duration * 1e15)) for pulse in sequence.base_pulses() if pulse.channel == channel and pulse.value]
     if not durations:
         return default
     unique = sorted(set(durations))

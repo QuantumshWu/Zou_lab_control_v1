@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 from pathlib import Path
 import threading
 import time
@@ -14,6 +15,7 @@ from .base import SequencerDevice
 from ..timing import (
     DEFAULT_CAMERA_TRIGGER_CHANNELS,
     PulseSequence,
+    PulseTableState,
     channel_names,
     count_trigger_pulses,
     positive_float,
@@ -34,11 +36,16 @@ class RuntimeSequenceProgram:
     duration: float
     trigger_count: int
     source_sequence: dict[str, Any] | None = None
+    source_table: dict[str, Any] | None = None
+    repeat_forever: bool = False
+    loop_start_index: int = 0
+    loop_end_tick: int = 0
+    loop_count: int = 1
 
     def to_dict(self) -> dict[str, object]:
         payload = {
             "schema": "Zou_lab_control.neutral_atom.RuntimeSequenceProgram",
-            "version": 1,
+            "version": 2,
             "sequence_id": self.sequence_id,
             "sequence_name": self.sequence_name,
             "clock_hz": self.clock_hz,
@@ -47,9 +54,15 @@ class RuntimeSequenceProgram:
             "masks": list(self.masks),
             "duration": self.duration,
             "trigger_count": self.trigger_count,
+            "repeat_forever": bool(self.repeat_forever),
+            "loop_start_index": int(self.loop_start_index),
+            "loop_end_tick": int(self.loop_end_tick),
+            "loop_count": int(self.loop_count),
         }
         if self.source_sequence is not None:
             payload["source_sequence"] = self.source_sequence
+        if self.source_table is not None:
+            payload["source_table"] = self.source_table
         return payload
 
     @classmethod
@@ -66,6 +79,11 @@ class RuntimeSequenceProgram:
             duration=float(payload["duration"]),
             trigger_count=int(payload["trigger_count"]),
             source_sequence=None if payload.get("source_sequence") is None else dict(payload["source_sequence"]),
+            source_table=None if payload.get("source_table") is None else dict(payload["source_table"]),
+            repeat_forever=bool(payload.get("repeat_forever", False)),
+            loop_start_index=int(payload.get("loop_start_index", 0)),
+            loop_end_tick=int(payload.get("loop_end_tick", 0)),
+            loop_count=int(payload.get("loop_count", 1)),
         )
 
 
@@ -80,13 +98,19 @@ def compile_runtime_program(
 
     channels = list(channel_names(channels, "channels"))
     clock_hz = positive_float(clock_hz, "clock_hz")
-    ticks, masks, channels = sequence.edges(clock_hz=clock_hz, channels=channels)
+    base_sequence = sequence.without_repeat()
+    ticks, masks, channels = base_sequence.edges(clock_hz=clock_hz, channels=channels)
+    repeat_period = sequence.repeat_period or base_sequence.duration
+    loop_end_tick = _time_to_ticks(repeat_period, clock_hz, "repeat_period") if repeat_period > 0 else (int(ticks[-1]) if ticks else 0)
+    ticks, masks = _ensure_final_off_edge(ticks, masks, loop_end_tick)
     payload = {
         "sequence": sequence.to_dict(),
         "clock_hz": clock_hz,
         "channels": channels,
         "ticks": ticks,
         "masks": masks,
+        "repeat_count": sequence.repeat_count,
+        "repeat_forever": sequence.repeat_forever,
     }
     sequence_id = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
     return RuntimeSequenceProgram(
@@ -99,7 +123,119 @@ def compile_runtime_program(
         duration=sequence.duration,
         trigger_count=count_trigger_pulses(sequence, trigger_channels=trigger_channels),
         source_sequence=sequence.to_dict(),
+        repeat_forever=bool(sequence.repeat_forever),
+        loop_start_index=0,
+        loop_end_tick=loop_end_tick,
+        loop_count=int(sequence.repeat_count),
     )
+
+
+def compile_pulse_table_runtime_program(
+    state: PulseTableState,
+    *,
+    channels: Sequence[str] | None = None,
+    clock_hz: float = 250e6,
+    trigger_channels: Sequence[str] = DEFAULT_CAMERA_TRIGGER_CHANNELS,
+    x_ns: float | None = None,
+    repeat_forever: bool = True,
+) -> RuntimeSequenceProgram:
+    """Compile GUI period-card state into an unexpanded FPGA loop program.
+
+    ``PulseTableState`` carries the frontend repeat-bracket semantics.  The
+    runtime FPGA should receive one copy of the period table plus loop metadata,
+    not a fully expanded edge table.  A bracket becomes one finite inner loop;
+    the whole table may still be repeated forever by the FPGA.
+    """
+
+    channels = list(channel_names(state.channels if channels is None else channels, "channels"))
+    unknown_channels = [channel for channel in state.channels if channel not in channels]
+    if unknown_channels:
+        raise ValueError(f"pulse table channels are not in hardware channels: {unknown_channels}.")
+    clock_hz = positive_float(clock_hz, "clock_hz")
+    clock_step_ns = 1e9 / clock_hz
+    x_value = state.x_ns if x_ns is None else x_ns
+    state.validate(x_ns=x_value, time_step_ns=clock_step_ns)
+
+    sequence = state.to_sequence(x_ns=x_value, time_step_ns=clock_step_ns, expand_repeat=False)
+    period_starts = _pulse_table_period_starts_ticks(state, x_ns=x_value, time_step_ns=clock_step_ns)
+    has_delays = _pulse_table_has_delays(state, x_ns=x_value, time_step_ns=clock_step_ns)
+    if has_delays:
+        _validate_pulse_table_delays_for_hardware_loop(
+            state,
+            period_starts=period_starts,
+            x_ns=x_value,
+            time_step_ns=clock_step_ns,
+        )
+        ticks, masks, channels = sequence.edges(clock_hz=clock_hz, channels=channels)
+        base_duration_tick = _time_to_ticks(max(sequence.duration, period_starts[-1] / clock_hz), clock_hz, "pulse table duration")
+        ticks, masks = _ensure_final_off_edge(ticks, masks, base_duration_tick)
+    else:
+        ticks, masks, channels = _pulse_table_edge_table(state, channels=channels, x_ns=x_value, time_step_ns=clock_step_ns)
+    repeat_count = int(state.repeat_count)
+    if state.repeat_start is None or state.repeat_end is None:
+        loop_start_index = 0
+        loop_end_tick = int(ticks[-1]) if has_delays else int(period_starts[-1])
+        loop_count = 1
+    else:
+        loop_start_tick = int(period_starts[int(state.repeat_start)])
+        loop_end_tick = int(period_starts[int(state.repeat_end) + 1])
+        if has_delays:
+            ticks, masks, loop_start_index = _insert_mask_edge_at_tick(ticks, masks, loop_start_tick)
+        else:
+            loop_start_index = _edge_index_at_or_after(ticks, loop_start_tick)
+        loop_count = repeat_count
+
+    effective_duration_ticks = _pulse_table_effective_duration_ticks(state, x_ns=x_value, time_step_ns=clock_step_ns)
+    if has_delays and state.repeat_start is None and state.repeat_end is None:
+        effective_duration_ticks = int(ticks[-1])
+    payload = {
+        "table": state.to_dict(),
+        "clock_hz": clock_hz,
+        "channels": channels,
+        "ticks": ticks,
+        "masks": masks,
+        "repeat_forever": bool(repeat_forever),
+        "loop_start_index": loop_start_index,
+        "loop_end_tick": loop_end_tick,
+        "loop_count": loop_count,
+    }
+    sequence_id = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    return RuntimeSequenceProgram(
+        sequence_id=sequence_id,
+        sequence_name=state.name,
+        clock_hz=clock_hz,
+        channels=list(channels),
+        ticks=list(ticks),
+        masks=list(masks),
+        duration=effective_duration_ticks / clock_hz,
+        trigger_count=_pulse_table_trigger_count(state, trigger_channels=trigger_channels),
+        source_sequence=sequence.to_dict(),
+        source_table=state.to_dict(),
+        repeat_forever=bool(repeat_forever),
+        loop_start_index=loop_start_index,
+        loop_end_tick=loop_end_tick,
+        loop_count=loop_count,
+    )
+
+
+def compile_runtime_program_for_payload(
+    payload: PulseSequence | PulseTableState,
+    *,
+    channels: Sequence[str],
+    clock_hz: float = 250e6,
+    trigger_channels: Sequence[str] = DEFAULT_CAMERA_TRIGGER_CHANNELS,
+) -> RuntimeSequenceProgram:
+    """Compile either finite sequence data or GUI pulse-table data."""
+
+    if isinstance(payload, PulseTableState):
+        return compile_pulse_table_runtime_program(
+            payload,
+            channels=channels,
+            clock_hz=clock_hz,
+            trigger_channels=trigger_channels,
+            repeat_forever=True,
+        )
+    return compile_runtime_program(payload, channels=channels, clock_hz=clock_hz, trigger_channels=trigger_channels)
 
 
 class SequencerService:
@@ -136,9 +272,9 @@ class SequencerService:
         self.history: list[dict[str, object]] = []
 
     def prepare(self, sequence_payload) -> dict[str, object]:
-        sequence = sequence_from_payload(sequence_payload)
-        program = compile_runtime_program(
-            sequence,
+        timing_payload = timing_from_payload(sequence_payload)
+        program = compile_runtime_program_for_payload(
+            timing_payload,
             channels=self.channels,
             clock_hz=self.clock_hz,
             trigger_channels=self.trigger_channels,
@@ -155,8 +291,8 @@ class SequencerService:
         with self._lock:
             program = self._require_prepared()
             if sequence_payload is not None:
-                requested = compile_runtime_program(
-                    sequence_from_payload(sequence_payload),
+                requested = compile_runtime_program_for_payload(
+                    timing_from_payload(sequence_payload),
                     channels=self.channels,
                     clock_hz=self.clock_hz,
                     trigger_channels=self.trigger_channels,
@@ -240,12 +376,12 @@ class RuntimeSequencer(SequencerDevice):
         self.clock_hz = self.service.clock_hz
         self.last_program: RuntimeSequenceProgram | None = None
 
-    def prepare(self, sequence: PulseSequence) -> RuntimeSequenceProgram:
-        self.last_program = RuntimeSequenceProgram.from_dict(self.service.prepare(sequence.to_dict()))
+    def prepare(self, sequence: PulseSequence | PulseTableState) -> RuntimeSequenceProgram:
+        self.last_program = RuntimeSequenceProgram.from_dict(self.service.prepare(timing_payload_to_dict(sequence)))
         return self.last_program
 
-    def fire(self, sequence: PulseSequence | None = None) -> None:
-        self.service.fire(None if sequence is None else sequence.to_dict())
+    def fire(self, sequence: PulseSequence | PulseTableState | None = None) -> None:
+        self.service.fire(None if sequence is None else timing_payload_to_dict(sequence))
 
     def wait_done(self, timeout: float | None = None) -> bool:
         return self.service.wait_done(timeout)
@@ -376,18 +512,19 @@ class RemoteSequencer(SequencerDevice):
         snap = self._conn.root.snapshot()
         self.channels = list(snap.get("channels", self.channels))
         self.clock_hz = float(snap.get("clock_hz", self.clock_hz))
+        self.trigger_channels = tuple(channel_names(snap.get("trigger_channels", self.trigger_channels), "trigger_channels"))
         return self
 
-    def prepare(self, sequence: PulseSequence) -> RuntimeSequenceProgram:
+    def prepare(self, sequence: PulseSequence | PulseTableState) -> RuntimeSequenceProgram:
         self.open()
-        program = self._conn.root.prepare(json.dumps(sequence.to_dict()))
+        program = self._conn.root.prepare(json.dumps(timing_payload_to_dict(sequence)))
         payload = json.loads(program) if isinstance(program, (str, bytes)) else dict(program)
         self._last_program = RuntimeSequenceProgram.from_dict(payload)
         return self._last_program
 
-    def fire(self, sequence: PulseSequence | None = None) -> None:
+    def fire(self, sequence: PulseSequence | PulseTableState | None = None) -> None:
         self.open()
-        self._conn.root.fire(None if sequence is None else json.dumps(sequence.to_dict()))
+        self._conn.root.fire(None if sequence is None else json.dumps(timing_payload_to_dict(sequence)))
 
     def wait_done(self, timeout: float | None = None) -> bool:
         self.open()
@@ -485,18 +622,276 @@ class VerilogSequencer(SequencerDevice):
         pass
 
 
-def sequence_from_payload(payload) -> PulseSequence:
-    """Accept a local ``PulseSequence`` or its JSON/RPyC-safe dict payload."""
+def timing_payload_to_dict(payload: PulseSequence | PulseTableState) -> dict[str, object]:
+    """Return the JSON-safe timing payload for a sequence or pulse table."""
+
+    if isinstance(payload, (PulseSequence, PulseTableState)):
+        return payload.to_dict()
+    if isinstance(payload, Mapping):
+        return dict(payload)
+    raise TypeError("timing payload must be a PulseSequence, PulseTableState, or mapping.")
+
+
+def timing_from_payload(payload) -> PulseSequence | PulseTableState:
+    """Accept local timing objects or their JSON/RPyC-safe dict payload."""
 
     if isinstance(payload, PulseSequence):
         return payload
+    if isinstance(payload, PulseTableState):
+        return payload
     if isinstance(payload, (str, bytes)):
-        return PulseSequence.from_dict(json.loads(payload))
+        return timing_from_payload(json.loads(payload))
     if isinstance(payload, Mapping):
-        return PulseSequence.from_dict(dict(payload))
+        data = dict(payload)
+        schema = data.get("schema", "Zou_lab_control.neutral_atom.PulseSequence")
+        if schema == "Zou_lab_control.neutral_atom.PulseTableState":
+            return PulseTableState.from_dict(data)
+        if schema == "Zou_lab_control.neutral_atom.PulseSequence":
+            return PulseSequence.from_dict(data)
+        raise ValueError(f"unsupported timing payload schema {schema!r}.")
     if hasattr(payload, "items"):
-        return PulseSequence.from_dict(_plain_rpc_payload(payload))
-    raise TypeError("sequence payload must be a PulseSequence or PulseSequence.to_dict() mapping.")
+        return timing_from_payload(_plain_rpc_payload(payload))
+    raise TypeError("timing payload must be a PulseSequence/PulseTableState or a to_dict() mapping.")
+
+
+def sequence_from_payload(payload) -> PulseSequence:
+    """Accept a local ``PulseSequence`` or its JSON/RPyC-safe dict payload."""
+
+    timing = timing_from_payload(payload)
+    if not isinstance(timing, PulseSequence):
+        raise TypeError("sequence payload must be a PulseSequence or PulseSequence.to_dict() mapping.")
+    return timing
+
+
+def _time_to_ticks(value_s: float, clock_hz: float, name: str) -> int:
+    raw = float(value_s) * float(clock_hz)
+    ticks = int(round(raw))
+    if not math.isclose(raw, ticks, rel_tol=1e-12, abs_tol=1e-9):
+        raise ValueError(f"{name}={value_s:g} s is not on the {clock_hz:g} Hz clock grid.")
+    if ticks <= 0:
+        raise ValueError(f"{name} must be at least one clock tick.")
+    return ticks
+
+
+def _ensure_final_off_edge(ticks: Sequence[int], masks: Sequence[int], final_tick: int) -> tuple[list[int], list[int]]:
+    ticks = [int(tick) for tick in ticks]
+    masks = [int(mask) for mask in masks]
+    final_tick = int(final_tick)
+    if not ticks:
+        return [final_tick], [0]
+    if final_tick < ticks[-1]:
+        raise ValueError("repeat period is shorter than the base sequence edge table.")
+    if final_tick == ticks[-1]:
+        masks[-1] = 0
+        return ticks, masks
+    ticks.append(final_tick)
+    masks.append(0)
+    return ticks, masks
+
+
+def _insert_mask_edge_at_tick(ticks: Sequence[int], masks: Sequence[int], tick: int) -> tuple[list[int], list[int], int]:
+    """Insert a snapshot edge at ``tick`` and return its index.
+
+    Hardware loops restart by loading ``mask_mem[loop_start_index]``.  Delayed
+    pulse sequences may not naturally have an edge at the GUI repeat-bracket
+    boundary, so the compiler inserts a complete state snapshot there.
+    """
+
+    out_ticks = [int(item) for item in ticks]
+    out_masks = [int(item) for item in masks]
+    tick = int(tick)
+    current_mask = 0
+    for index, candidate in enumerate(out_ticks):
+        candidate = int(candidate)
+        if candidate == tick:
+            return out_ticks, out_masks, index
+        if candidate > tick:
+            out_ticks.insert(index, tick)
+            out_masks.insert(index, current_mask)
+            return out_ticks, out_masks, index
+        current_mask = out_masks[index]
+    out_ticks.append(tick)
+    out_masks.append(current_mask)
+    return out_ticks, out_masks, len(out_ticks) - 1
+
+
+def _pulse_table_period_starts_ticks(
+    state: PulseTableState,
+    *,
+    x_ns: float,
+    time_step_ns: float,
+) -> list[int]:
+    starts = [0]
+    for period in state.periods:
+        starts.append(starts[-1] + period.duration_steps(x_ns=x_ns, time_step_ns=time_step_ns))
+    return starts
+
+
+def _pulse_table_effective_duration_ticks(
+    state: PulseTableState,
+    *,
+    x_ns: float,
+    time_step_ns: float,
+) -> int:
+    starts = _pulse_table_period_starts_ticks(state, x_ns=x_ns, time_step_ns=time_step_ns)
+    if state.repeat_start is None or state.repeat_end is None or state.repeat_count <= 1:
+        return starts[-1]
+    loop_ticks = starts[int(state.repeat_end) + 1] - starts[int(state.repeat_start)]
+    return starts[-1] + (int(state.repeat_count) - 1) * loop_ticks
+
+
+def _pulse_table_edge_table(
+    state: PulseTableState,
+    *,
+    channels: Sequence[str],
+    x_ns: float,
+    time_step_ns: float,
+) -> tuple[list[int], list[int], list[str]]:
+    hardware_channels = list(channel_names(channels, "channels"))
+    state_index = {channel: index for index, channel in enumerate(state.channels)}
+    starts = _pulse_table_period_starts_ticks(state, x_ns=x_ns, time_step_ns=time_step_ns)
+    ticks: list[int] = []
+    masks: list[int] = []
+    for period_index, period in enumerate(state.periods):
+        mask = 0
+        for bit, channel in enumerate(hardware_channels):
+            source_index = state_index.get(channel)
+            if source_index is not None and int(period.states[source_index]):
+                mask |= 1 << bit
+        ticks.append(int(starts[period_index]))
+        masks.append(mask)
+    ticks.append(int(starts[-1]))
+    masks.append(0)
+    return ticks, masks, hardware_channels
+
+
+def _validate_pulse_table_delays_for_hardware_loop(
+    state: PulseTableState,
+    *,
+    period_starts: Sequence[int],
+    x_ns: float,
+    time_step_ns: float,
+) -> None:
+    """Reject delayed edges that a compact FPGA loop cannot replay correctly."""
+
+    table_start = 0
+    table_end = int(period_starts[-1])
+    has_bracket = state.repeat_start is not None and state.repeat_end is not None
+    loop_start = int(period_starts[int(state.repeat_start)]) if has_bracket else table_start
+    loop_end = int(period_starts[int(state.repeat_end) + 1]) if has_bracket else table_end
+    delayed_spans = _pulse_table_delayed_channel_spans(
+        state,
+        period_starts=period_starts,
+        x_ns=x_ns,
+        time_step_ns=time_step_ns,
+    )
+    for channel, raw_start, raw_stop, delay_steps in delayed_spans:
+        shifted_start = raw_start + delay_steps
+        shifted_stop = raw_stop + delay_steps
+        if shifted_start < table_start or shifted_stop > table_end:
+            raise ValueError(
+                f"delay for {channel!r} moves a pulse outside the uploaded period table; "
+                "add guard/idle periods or reduce the delay before using FPGA repeat."
+            )
+        if not has_bracket:
+            continue
+        raw_inside = raw_start >= loop_start and raw_stop <= loop_end
+        shifted_inside = shifted_start >= loop_start and shifted_stop <= loop_end
+        shifted_intersects = shifted_start < loop_end and shifted_stop > loop_start
+        if raw_inside != shifted_inside or (not raw_inside and shifted_intersects):
+            raise ValueError(
+                f"delay for {channel!r} moves a pulse across the repeat bracket boundary; "
+                "move the bracket, add guard periods, or keep delayed edges inside the bracket."
+            )
+
+
+def _pulse_table_delayed_channel_spans(
+    state: PulseTableState,
+    *,
+    period_starts: Sequence[int],
+    x_ns: float,
+    time_step_ns: float,
+) -> list[tuple[str, int, int, int]]:
+    spans: list[tuple[str, int, int, int]] = []
+    for channel_index, channel in enumerate(state.channels):
+        delay_steps = state.delay_steps(channel, x_ns=x_ns, time_step_ns=time_step_ns)
+        if delay_steps == 0:
+            continue
+        active_start: int | None = None
+        for period_index, period in enumerate(state.periods):
+            state_value = int(period.states[channel_index])
+            if state_value and active_start is None:
+                active_start = int(period_starts[period_index])
+            elif not state_value and active_start is not None:
+                spans.append((channel, active_start, int(period_starts[period_index]), delay_steps))
+                active_start = None
+        if active_start is not None:
+            spans.append((channel, active_start, int(period_starts[-1]), delay_steps))
+    return spans
+
+
+def _edge_index_at_or_after(ticks: Sequence[int], tick: int) -> int:
+    for index, candidate in enumerate(ticks):
+        if int(candidate) >= int(tick):
+            return index
+    raise ValueError(f"repeat bracket starts at tick {tick}, but no edge exists at or after that tick.")
+
+
+def _pulse_table_trigger_count(
+    state: PulseTableState,
+    *,
+    trigger_channels: Sequence[str],
+) -> int:
+    trigger_channels = list(channel_names(trigger_channels, "trigger_channels", allow_empty=True))
+    total = 0
+    for channel in trigger_channels:
+        if channel in state.channels:
+            total += _pulse_table_channel_rises(state, channel)
+    return total
+
+
+def _pulse_table_channel_rises(state: PulseTableState, channel: str) -> int:
+    index = state.channel_index(channel)
+    states = [int(period.states[index]) for period in state.periods]
+    if state.repeat_start is None or state.repeat_end is None or state.repeat_count <= 1:
+        count, _last = _count_rises(states, initial=0)
+        return count
+
+    repeat_start = int(state.repeat_start)
+    repeat_end = int(state.repeat_end)
+    repeat_count = int(state.repeat_count)
+    pre = states[:repeat_start]
+    loop = states[repeat_start : repeat_end + 1]
+    post = states[repeat_end + 1 :]
+
+    count, last = _count_rises(pre, initial=0)
+    first_count, last_after_loop = _count_rises(loop, initial=last)
+    count += first_count
+    if repeat_count > 1:
+        loop_again_count, last_after_loop = _count_rises(loop, initial=last_after_loop)
+        count += (repeat_count - 1) * loop_again_count
+    post_count, _last = _count_rises(post, initial=last_after_loop)
+    return count + post_count
+
+
+def _count_rises(states: Sequence[int], *, initial: int) -> tuple[int, int]:
+    last = 1 if int(initial) else 0
+    count = 0
+    for state in states:
+        state = 1 if int(state) else 0
+        if state and not last:
+            count += 1
+        last = state
+    return count, last
+
+
+def _pulse_table_has_delays(
+    state: PulseTableState,
+    *,
+    x_ns: float,
+    time_step_ns: float,
+) -> bool:
+    return any(state.delay_steps(channel, x_ns=x_ns, time_step_ns=time_step_ns) != 0 for channel in state.channels)
 
 
 def _plain_rpc_payload(value):
@@ -574,6 +969,8 @@ __all__ = [
     "RuntimeSequencer",
     "SequencerService",
     "VerilogSequencer",
+    "compile_pulse_table_runtime_program",
     "compile_runtime_program",
+    "compile_runtime_program_for_payload",
     "serve_runtime_sequencer",
 ]

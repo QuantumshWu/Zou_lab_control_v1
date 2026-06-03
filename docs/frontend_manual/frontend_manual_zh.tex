@@ -3,7 +3,7 @@
 
 \begin{document}
 \frontmatter
-\zlctitlepage{Zou\_lab\_control.frontend 中文手册}{Jupyter / GUI 实验绘图前端}{统一 array 数据契约、live session、fit、selector 与 PDF notes}{2026-06-02}
+\zlctitlepage{Zou\_lab\_control.frontend 中文手册}{Jupyter / GUI 实验绘图前端}{统一 array 数据契约、live session、fit、selector 与 PDF notes}{2026-06-03}
 \tableofcontents
 \cleardoublepage
 \mainmatter
@@ -67,7 +67,7 @@ gui = zf.show_pulse_gui(channels=channels, sequencer=sequencer)
 
 GUI 的数据模型是 \pyapi{PulseTableState}。它把旧 pulse GUI 里好用的 period-card 交互保留下来：每个 period 有一个 duration、一个单位下拉框，以及一组 channel checkbox；delay、\pyapi{x_ns} 和 repeat bracket 在导出 \pyapi{PulseSequence} 前展开。保存文件是 JSON，不是旧 \pyapi{.npz}，这样 notebook、测试和 GUI 都能读同一个结构。这里的 \pyapi{channels} 永远是硬件 channel 名和 FPGA bit order，例如 \pyapi{ch00/ch01/...}；GUI 不会自动把 \pyapi{ch00} 猜成 \pyapi{trap}。如果想在界面里显示实验含义，在 Name 面板右侧填 display label，或者在 JSON/API 中显式保存 \pyapi{channel_labels}。Name 面板左侧仍然显示硬件 channel；右侧 name 改动后，Delay 行、period checkbox 和 Preview y 轴都会显示这个 label。
 
-minimal time 由 \pyapi{PulseTableState.time_step_ns} 表示。离线打开 GUI 时默认是 1 ns；如果用 \pyapi{show_pulse_gui(..., sequencer=sequencer)} 或 \pyapi{show_pulse_gui(experiment=exp)}，GUI 会用 \pyapi{sequencer.clock_hz} 自动设置 \pyapi{step (ns)}，例如 100 MHz 对应 10 ns。duration、delay 和 \pyapi{x_ns} 必须是这个 step 的整数倍；按 \pyapi{Prepare} 时还会按实际 sequencer clock 再检查一次，避免半个 FPGA tick 被 round。
+minimal time 由 \pyapi{PulseTableState.time_step_ns} 表示。离线打开 GUI 时默认是 1 ns；如果用 \pyapi{show_pulse_gui(..., sequencer=sequencer)} 或 \pyapi{show_pulse_gui(experiment=exp)}，GUI 会用 \pyapi{sequencer.clock_hz} 自动设置 \pyapi{step (ns)}，例如 100 MHz 对应 10 ns。duration、delay 和 \pyapi{x_ns} 必须是这个 step 的整数倍；按 \pyapi{On Pulse} 时还会按实际 sequencer clock 再检查一次，避免半个 FPGA tick 被 round。
 
 \pyapi{x_ns} 是保留下来的扫描变量。默认值保存在 state 里；真正生成 sequence 时可以临时覆盖它，因此扫某个 duration 不需要重建整张 pulse 表：
 
@@ -95,7 +95,7 @@ for width_ns in [500, 1000, 2000, 4000]:
 GUI 窗口默认固定为当前屏幕可用区域的 90\%，避免拖动窗口时破坏 period row 对齐。若笔记本屏幕较小，或 Windows 显示缩放让窗口显得过大，可以在启动时手动传入 \pyapi{scale} 或 \pyapi{window_ratio}，例如 \pyapi{show_pulse_gui(..., scale=0.82, window_ratio=0.90)}。\pyapi{scale} 只改变前端控件尺寸和字体；\pyapi{window_ratio} 只改变固定窗口大小；两者都不改变 \pyapi{PulseTableState}、channel 顺序或 FPGA timing。
 
 \begin{notebox}[Preview 页和保存文件]
-GUI 的 \pyapi{Edit} 页负责编辑 period card；\pyapi{Preview} 页在切换过去时自动调用 \pyapi{zf.plot(sequence, kind="pulse")} 画 pulse 图，不需要手动 refresh。Preview 用未展开的 period table 作图；Prepare/Compile 给硬件的 sequence 仍会按 repeat 展开。默认只画不是 always-off 的 channel，打开 \pyapi{Show always-off} 开关后会显示完整 channel list；如果 channel 有 display label，Preview 的 y 轴显示 label，保存和编译仍然使用硬件 channel。没有 repeat bracket 时，整段 sequence 视为持续重复，bracket 覆盖整段并标记 \(\infty\)。如果 bracket 覆盖所有 period，它就是最外层 repeat，Preview 标记 \pyapi{xN}，状态栏显示 \pyapi{repeat P1-PM xN}。如果 bracket 只在内部 period 上，整体仍然是 \(\infty\) repeat，内部 bracket 只是其中一个 finite sub-loop；Preview 会同时画整段 \(\infty\) bracket 和内部 \pyapi{xN} bracket，并用不同颜色区分，状态栏显示例如 \pyapi{repeat ∞ + P2-P4 x3}。bracket 的竖线画在真实 start/stop 时间节点上，plot 只通过 xlim 留出左侧显示空间，并隐藏负时间 tick label。\pyapi{Save Pulse} 保存 JSON；\pyapi{Save Figure} 是 Preview 顶栏最右侧的一行按钮，保存当前 preview PNG。默认目录是仓库根目录下的 \pyapi{pulses/}；需要换目录时可以设置环境变量 \pyapi{ZLC_PULSE_DIR}。新建 pulse 的默认名字是 \pyapi{pulse_YYYYMMDD_HHMMSS}，保存对话框会用这个名字作为默认文件名。
+GUI 的 \pyapi{Edit} 页负责编辑 period card；\pyapi{On Pulse} 会先把当前 state 上传/prepare 到 attached sequencer，再立刻 start；\pyapi{Stop Pulse} 进入 safe/reset 状态。GUI 中没有独立 sync 按钮。\pyapi{Preview} 页在切换过去时自动调用 \pyapi{zf.plot(sequence, kind="pulse")} 画 pulse 图，不需要手动 refresh。Preview 用未展开的 period table 作图；\pyapi{On Pulse}/Compile 给硬件的是未展开 period table 加 repeat metadata，不会把长 repeat 展开成长 edge table。默认只画不是 always-off 的 channel，打开 \pyapi{Show always-off} 开关后会显示完整 channel list；如果 channel 有 display label，Preview 的 y 轴显示 label，保存和编译仍然使用硬件 channel。没有 repeat bracket 时，整段 sequence 视为持续重复，bracket 覆盖整段并标记 \(\infty\)。如果 bracket 覆盖所有 period，它就是最外层 repeat，Preview 标记 \pyapi{xN}，状态栏显示 \pyapi{repeat P1-PM xN}。如果 bracket 只在内部 period 上，整体仍然是 \(\infty\) repeat，内部 bracket 只是其中一个 finite sub-loop；Preview 会同时画整段 \(\infty\) bracket 和内部 \pyapi{xN} bracket，并用不同颜色区分，状态栏显示例如 \pyapi{repeat ∞ + P2-P4 x3}。bracket 的竖线画在真实 start/stop 时间节点上，plot 只通过 xlim 留出左侧显示空间，并隐藏负时间 tick label。\pyapi{Save Pulse} 保存 JSON；\pyapi{Save Figure} 是 Preview 顶栏最右侧的一行按钮，保存当前 preview PNG。默认目录是仓库根目录下的 \pyapi{pulses/}；需要换目录时可以设置环境变量 \pyapi{ZLC_PULSE_DIR}。新建 pulse 的默认名字是 \pyapi{pulse_YYYYMMDD_HHMMSS}，保存对话框会用这个名字作为默认文件名。
 \end{notebox}
 
 \begin{notebox}[界面结构]

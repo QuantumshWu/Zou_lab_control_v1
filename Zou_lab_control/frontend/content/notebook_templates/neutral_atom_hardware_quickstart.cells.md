@@ -1,19 +1,15 @@
-﻿<!-- cell:markdown -->
+<!-- cell:markdown -->
 # Neutral atom hardware quickstart
 
-这个 notebook 是控制电脑上的硬件流程：连接 qCMOS 和 sequencer，配置 pulse sequence，拍 raw image，校准 sitemap 和 threshold，detect，最后扫 detection time。
+这个 notebook 是控制电脑上的硬件流程：连接 qCMOS 和 40ch FPGA sequencer，配置 pulse sequence，拍 raw image，校准 sitemap 和 threshold，detect，最后扫 detection time。
 
 运行前先在 Verilog/FPGA 电脑上启动 sequencer server，可以打开 `tutorials/neutral_atom_fpga_server.ipynb`，也可以运行同等命令行：
 
 ```powershell
-cd "C:\path\to\Zou_lab_control_v1"
-$env:PYTHONPATH = (Get-Location).Path
-
-.\fpga\pulse_streamer\vivado_env.bat
-.\fpga\pulse_streamer\simulate_4ch_core.bat
-.\fpga\pulse_streamer\build_4ch_bitstream.bat
-.\fpga\pulse_streamer\program_4ch_fpga.bat
-.\fpga\pulse_streamer\start_server_4ch.bat
+cd "D:\ZLC"
+.\fpga\build_and_program.bat --check
+.\fpga\build_and_program.bat
+.\fpga\run_server.bat
 ```
 
 如果 Verilog 电脑的 Vivado 不在默认搜索路径，先设置：
@@ -22,7 +18,7 @@ $env:PYTHONPATH = (Get-Location).Path
 $env:ZLC_PS_VIVADO_BIN = "C:\Xilinx\Vivado\2019.2\bin\vivado.bat"
 ```
 
-当前本机验证用的是 Vivado 2019.1；旧 `address_switch` archive 是 Vivado 2019.2，路径曾经是 `D:\time_sequence\address_switch`。40ch 真实 bitstream 需要先填完 `fpga\pulse_streamer\zlc_pulse_streamer_40ch.xdc`；没填真实 pin 前只运行 `check_40ch_synth.bat` 做 HDL/VIO 宽度自查，不要 program。
+`fpga\build_and_program.bat` 和 `fpga\run_server.bat` 都是 40ch 入口。GUI 或 API 可以只配置 `ch00..ch03`，但传给 FPGA backend 时会按 server 的完整 `ch00..ch39` channel order 编译成 40-bit mask；没有配置的 channel 全部为 off。40ch 真实 bitstream 需要先填完 `fpga\pulse_streamer\zlc_pulse_streamer_40ch.xdc`，也可以设置 `ZLC_PS_40CH_XDC` 指向别处的板级 XDC；没填真实 pin 前只运行 `.\fpga\build_and_program.bat --check` 做 HDL/VIO 宽度自查，不要 program。
 
 离线检查 frontend/readout 流程时跑 `neutral_atom_tutorial.ipynb`。
 
@@ -78,13 +74,22 @@ preflight.raise_if_failed()
 <!-- cell:markdown -->
 ## Optional: edit pulses with the PyQt pulse GUI
 
-GUI 只是 pulse 的前端。它读取 `exp.devices.sequencer.channels`，编辑 `PulseTableState`，然后在 `Prepare/Fire/Wait/Safe` 按钮里调用同一个 sequencer。新建 pulse 默认名是 `pulse_YYYYMMDD_HHMMSS`。`channels` 是硬件 channel 名和 FPGA bit order，例如 `ch00/ch01/...`；Name 面板左侧固定显示硬件 channel，右侧是可选 display label，GUI 不会自动猜物理含义。右侧 name 改动后，Delay 行、period checkbox 和 Preview y 轴会显示这个 label。左侧 `step (ns)` 来自 `1e9 / exp.devices.sequencer.clock_hz`，所有 duration、delay 和 `x` 都必须是这个 minimal time 的整数倍。40-channel server 也可以用这个入口；默认只显示硬件顺序前 4 路，其它 channel 从下拉框里添加。`X` 会把该 channel 的所有 period 设为 off，但不自动隐藏；`Hide Off` 只看 period 是否为 on，delay 非零也可以隐藏；display name 和 delay 会保留，重新 Add Channel 会按硬件顺序插回原位。全通道展开时，channel name、delay 和 period checkbox 共用整体纵向滚动。Preview 页会画未展开 period table 的 pulse 图，默认隐藏 always-off channel；如果 channel 有 display label，Preview y 轴显示 label。没有 bracket 时是 `repeat ∞`；bracket 覆盖所有 period 时是有限外层 repeat；bracket 在内部时整体仍然是 `repeat ∞`，Preview 会画整段 `∞` 和内部 `xN` 两套不同颜色的 bracket，状态栏显示 `repeat ∞ + Pm-Pn xN`。bracket 画在真实 start/stop 时间节点上，xlim 只负责留显示空间，负时间 tick label 会被隐藏。`Save Pulse` 默认保存到仓库 `pulses/` 目录；`Save Figure` 是 Preview 顶栏最右侧的一行按钮，单独保存 preview PNG。日常 camera preset 在 `pulses/camera_imaging_40ch.json`。小屏幕可以传 `scale=0.82, window_ratio=0.90`。
+GUI 只是 pulse 前端。它读取 `exp.devices.sequencer.channels`，编辑 `PulseTableState`，然后在 `On Pulse/Stop Pulse/Wait Done` 按钮里调用同一个 sequencer。`On Pulse` 会先把当前 pulse state 上传到 sequencer，再立刻 start；GUI 里没有单独的 sync 按钮。
+
+40ch server 的硬件 channel 和 FPGA bit order 是 `ch00...ch39`，trigger 默认是 `ch03`。GUI 默认只显示前 4 路，让简单 pulse 不乱；其它 channel 可以从 Add Channel 下拉框加回来。这个“显示几路”不改变硬件宽度：上传时仍然以 server 的 40 路为准，未显示/未配置的 channel 自动补 0。`pulses/camera_imaging_40ch.json` 只给 `ch00..ch03` 显示 label：`trap/cooling/probe/qcm_trigger`，但保存和上传的硬件名字仍是 `ch00..ch39`。
+
+左侧 `step (ns)` 来自 `1e9 / exp.devices.sequencer.clock_hz`，所有 duration、delay 和 `x` 都必须是这个 minimal time 的整数倍。`X` 会把该 channel 的所有 period 设为 off；`Hide Off` 只看 period 是否为 on，display name 和 delay 会保留，重新 Add Channel 会按硬件顺序插回原位。全通道展开时，channel name、delay 和 period checkbox 共用整体纵向滚动。Preview 页会画未展开 period table 的 pulse 图，默认隐藏 always-off channel，并用 display label 作为 y 轴。`Save Pulse` 默认保存到仓库 `pulses/` 目录；`Save Figure` 单独保存 preview PNG。小屏幕可以传 `scale=0.82, window_ratio=0.90`。
 
 如果当前环境没有桌面/Qt，跳过这个 cell，继续用 `exp.timing.configure_imaging(...)` 和 API 配置 pulse。
 
 <!-- cell:code -->
 # Uncomment on a desktop Python/Qt environment.
-# pulse_gui = zf.show_pulse_gui(experiment=exp, scale=0.82, window_ratio=0.90)
+# pulse_gui = zf.show_pulse_gui(
+#     experiment=exp,
+#     state=na.PulseTableState.load("pulses/camera_imaging_40ch.json"),
+#     scale=0.82,
+#     window_ratio=0.90,
+# )
 # pulse_gui
 
 <!-- cell:markdown -->

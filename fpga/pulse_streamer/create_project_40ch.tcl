@@ -1,16 +1,20 @@
 set script_dir [file normalize [file dirname [info script]]]
-set xdc_path [file join $script_dir zlc_pulse_streamer_40ch.xdc]
+proc env_or {name default} {
+    if {[info exists ::env($name)] && $::env($name) ne ""} { return [file normalize $::env($name)] }
+    return $default
+}
+set xdc_path [env_or ZLC_PS_40CH_XDC [env_or ZLC_PS_XDC [file join $script_dir zlc_pulse_streamer_40ch.xdc]]]
 if {![file exists $xdc_path]} {
-    error "Create zlc_pulse_streamer_40ch.xdc from zlc_pulse_streamer_40ch.xdc.template and fill the real 40 output pins before building."
+    error "Create zlc_pulse_streamer_40ch.xdc from zlc_pulse_streamer_40ch.xdc.template, or set ZLC_PS_40CH_XDC/ZLC_PS_XDC to a completed 40-output XDC."
 }
 set xdc_file [open $xdc_path r]
 set xdc_text [read $xdc_file]
 close $xdc_file
 if {[string match "*<PIN_CH*" $xdc_text]} {
-    error "zlc_pulse_streamer_40ch.xdc still contains <PIN_CHxx> placeholders. Fill all 40 real package pins before building."
+    error "$xdc_path still contains <PIN_CHxx> placeholders. Fill all 40 real package pins before building."
 }
 
-set project_dir [file join $script_dir build zlc_pulse_streamer_40ch]
+set project_dir [env_or ZLC_PS_PROJECT_DIR [file join $script_dir build zlc_pulse_streamer_40ch]]
 set project_name zlc_pulse_streamer_40ch
 set top zlc_pulse_streamer_top_40ch
 set part xc7a35tfgg484-2
@@ -22,6 +26,10 @@ proc zlc_require_run_complete {run_name expected_status} {
     }
 }
 
+if {[file exists $project_dir]} {
+    puts "Removing previous ZLC pulse-streamer project: $project_dir"
+    file delete -force $project_dir
+}
 file mkdir [file dirname $project_dir]
 create_project $project_name $project_dir -part $part -force
 set_property target_language Verilog [current_project]
@@ -34,16 +42,20 @@ set_property top $top [current_fileset]
 create_ip -name vio -vendor xilinx.com -library ip -version 3.0 -module_name vio_0
 set_property -dict [list \
     CONFIG.C_NUM_PROBE_IN {2} \
-    CONFIG.C_NUM_PROBE_OUT {7} \
+    CONFIG.C_NUM_PROBE_OUT {11} \
     CONFIG.C_PROBE_IN0_WIDTH {1} \
     CONFIG.C_PROBE_IN1_WIDTH {1} \
     CONFIG.C_PROBE_OUT0_WIDTH {1} \
     CONFIG.C_PROBE_OUT1_WIDTH {1} \
     CONFIG.C_PROBE_OUT2_WIDTH {1} \
-    CONFIG.C_PROBE_OUT3_WIDTH {10} \
+    CONFIG.C_PROBE_OUT3_WIDTH {7} \
     CONFIG.C_PROBE_OUT4_WIDTH {32} \
     CONFIG.C_PROBE_OUT5_WIDTH {40} \
-    CONFIG.C_PROBE_OUT6_WIDTH {11} \
+    CONFIG.C_PROBE_OUT6_WIDTH {8} \
+    CONFIG.C_PROBE_OUT7_WIDTH {1} \
+    CONFIG.C_PROBE_OUT8_WIDTH {7} \
+    CONFIG.C_PROBE_OUT9_WIDTH {32} \
+    CONFIG.C_PROBE_OUT10_WIDTH {32} \
 ] [get_ips vio_0]
 generate_target all [get_ips vio_0]
 

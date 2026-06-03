@@ -771,7 +771,7 @@ def test_pulse_gui_controls_call_attached_40ch_sequencer(monkeypatch):
         def prepare(self, sequence):
             self.prepared = sequence
             self.events.append(("prepare", sequence.name, list(sequence.channels)))
-            return na.compile_runtime_program(sequence, channels=self.channels, clock_hz=self.clock_hz, trigger_channels=self.trigger_channels)
+            return na.compile_runtime_program_for_payload(sequence, channels=self.channels, clock_hz=self.clock_hz, trigger_channels=self.trigger_channels)
 
         def fire(self):
             self.events.append(("fire",))
@@ -792,7 +792,9 @@ def test_pulse_gui_controls_call_attached_40ch_sequencer(monkeypatch):
         editor.show()
         app.processEvents()
 
-        editor.prepare()
+        assert editor.fire_button.text() == "On\nPulse"
+        assert editor.safe_button.text() == "Stop\nPulse"
+        assert not hasattr(editor, "prepare_button")
         editor.fire()
         editor.wait_done()
         editor.safe_state()
@@ -802,7 +804,9 @@ def test_pulse_gui_controls_call_attached_40ch_sequencer(monkeypatch):
         assert [event[0] for event in sequencer.events] == ["prepare", "fire", "wait_done", "safe"]
         assert editor.last_program.channels == channels
         assert editor.last_program.trigger_count == 1
-        assert sequencer.prepared.validate(clock_hz=100e6, channels=channels).ok
+        assert isinstance(sequencer.prepared, na.PulseTableState)
+        assert sequencer.prepared.to_sequence(expand_repeat=False).validate(clock_hz=100e6, channels=channels).ok
+        assert editor.last_program.repeat_forever is True
     finally:
         editor.close()
 

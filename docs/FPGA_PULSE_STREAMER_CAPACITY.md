@@ -82,20 +82,24 @@ For 40 channels, each edge is approximately 72 bits.
 
 | MAX_EDGES | Edge table bits | Approx bytes | Approx 64x1 LUTRAM cells |
 | --- | ---: | ---: | ---: |
+| 128 | 9,216 | 1.125 KiB | 144 |
 | 1024 | 73,728 | 9 KiB | 1,152 |
 | 4096 | 294,912 | 36 KiB | 4,608 |
 | 16384 | 1,179,648 | 144 KiB | 18,432 |
 
 The first-light HDL explicitly marks `tick_mem` and `mask_mem` as distributed
 RAM because the core uses simple asynchronous table reads. This keeps the
-control logic straightforward and avoids depending on BRAM inference semantics
-for the initial 1024-edge design. The approximate LUTRAM column is a lower-bound
-bit-packing estimate; Vivado utilization will include mapping overhead,
-VIO/debug logic, routing, and normal control registers.
+control logic straightforward, but the approximate LUTRAM column is only a
+lower-bound bit-packing estimate; Vivado utilization also includes mapping
+overhead, VIO/debug logic, routing, and normal control registers.
 
-For 1024 edges, this is a reasonable Artix-7 35T first-light size. For 4096
-edges, inspect LUT/SLICEM utilization before treating it as production. If the
-experiment needs very large tables or high scan throughput, move the edge table
+The checked-in 4-channel first-light profile keeps 1024 edges. The checked-in
+40-channel full-channel profile uses 128 edges by default, because local Vivado
+2019.1 synthesis showed that the 40-channel/1024-edge distributed-memory version
+over-uses the xc7a35t logic budget. This is still enough for the camera-imaging
+preset and many compact pulse tables because API/GUI repeats are uploaded as
+loop metadata instead of expanded rows. If the experiment needs hundreds or
+thousands of unique non-repeating edges on all 40 channels, move the edge table
 to a BRAM-friendly synchronous-read pipeline and replace Vivado/VIO upload with
 AXI, JTAG-to-AXI, UART/SPI, Ethernet, or a FIFO/BRAM write port.
 
@@ -119,12 +123,15 @@ increasing and fit in `TICK_WIDTH`.
 
 ### FPGA Execution Latency
 
-The core samples `start` and `prog_we` through registered edge detectors. Once a
-start transition is visible at the module input, the core needs roughly:
+The core samples `start` through a small registered transition detector. During
+`reset=1`, `prog_we` is a level write-enable for the upload RAM: each VIO commit
+that changes `prog_addr/prog_tick/prog_mask` while `prog_we=1` rewrites the
+selected table entry. Once a start transition is visible at the module input,
+the core needs roughly:
 
 ```text
 1 clock: capture start into start_sync
-1 clock: detect start_edge and enter running state
+1 clock: detect start_event and enter running state
 1 clock: apply the first mask if tick_mem[0] == 0
 ```
 
@@ -139,26 +146,33 @@ absorbed into the definition of the qCMOS trigger channel.
 ### Host/Vivado Upload Latency
 
 The current backend uploads through Vivado VIO. This is intentionally simple for
-first deployment, but it is not a high-throughput transport.
+first deployment, but it is not a high-throughput transport. The default server
+uses a persistent Vivado Tcl session, so Vivado startup, hardware-target open,
+`.ltx` loading, and probe lookup are paid once when
+`fpga/run_server.bat` starts.
 
-For each edge, the generated Tcl currently performs:
+For each edge, the generated Tcl currently stages:
 
 ```text
 set addr
 set tick
 set mask
 prog_we = 1
-prog_we = 0
 ```
 
-Each `zlc_set_probe` calls `commit_hw_vio`, so the prepare path costs roughly
-`5 * edge_count + constant` VIO commits. This latency is dominated by Vivado,
-hw_server, and JTAG. It happens before the qCMOS is armed, so it does not add
-shot-internal jitter, but it can make large scans slow.
+The generated Tcl batches `addr/tick/mask/prog_we=1` into one VIO commit per
+edge, then commits `prog_we=0` and releases reset at the end. The prepare path
+therefore costs roughly `edge_count + constant` VIO commits. This is much better
+than one commit per probe or a high/low write-enable pair for every edge, and it
+is faster than launching a fresh Vivado batch process for every action. The
+remaining latency is still dominated by VIO/JTAG commits. It happens before the
+qCMOS is armed, so it does not add shot-internal jitter, but it can make large
+scans slow.
 
-The `fire` path toggles `zlc_start` with a few VIO commits. The absolute time
-from the Python call to the FPGA start edge is host/Vivado/JTAG dependent, but
-after the start edge reaches the FPGA, the pulse timing is deterministic.
+The `fire` path toggles `zlc_start` in one VIO commit after a program has been
+prepared. The absolute time from the Python call to the FPGA start transition is
+host/Vivado/JTAG dependent, but after that transition reaches the FPGA, the
+pulse timing is deterministic.
 
 The `wait_done` path polls `zlc_done`; the default generated Tcl poll interval is
 20 ms. This affects when the host learns that a shot has completed, not the
@@ -187,24 +201,31 @@ Start synthesis with:
 
 ```text
 CHANNEL_COUNT = 40
-MAX_EDGES = 1024
+MAX_EDGES = 128
 TICK_WIDTH = 32
 CLOCK_HZ = 100_000_000
 ```
 
 Then inspect Vivado utilization and timing. If the experiment sequences exceed
-1024 edges, move to 4096 before attempting larger tables.
+128 unique uploaded edges, first check whether the sequence can use a repeat
+bracket or `repeat_forever`. If it truly needs a larger unique table, redesign
+the memory path around BRAM before attempting larger 40-channel bitstreams on an
+xc7a35t.
 
 The 40-channel bitstream needs a new top-level wrapper and XDC pin map. The
 Python backend already supports `ZLC_PS_CHANNEL_COUNT` and generated HDL with
 arbitrary channel names, but the Vivado VIO probe widths and physical output
 constraints must match the generated bundle exactly.
 
-The repository now includes a Vivado-ready first-light entry point in
-`fpga/pulse_streamer/`. Use `build_4ch_bitstream.bat` and `program_4ch_fpga.bat`
-to build and program the 4-channel `trap/cooling/probe/qcm_trigger` bitstream.
-Use `zlc_pulse_streamer_top_40ch.v` only after completing
-`zlc_pulse_streamer_40ch.xdc` from the template with verified package pins.
+The repository now uses the 40-channel FPGA path as the operational entry
+point. Use `fpga/build_and_program.bat` to check, build, and program the 40ch
+bitstream, then use `fpga/run_server.bat` to start a server whose hardware
+channels are always `ch00 ... ch39`. A GUI or API pulse may configure only a
+subset of those channels; the compiler fills every missing channel with an off
+bit before uploading the 40-bit masks. The real build uses
+`zlc_pulse_streamer_top_40ch.v` after completing
+`zlc_pulse_streamer_40ch.xdc` from the template, or after setting
+`ZLC_PS_40CH_XDC` to a verified package-pin map.
 
 ## External References
 

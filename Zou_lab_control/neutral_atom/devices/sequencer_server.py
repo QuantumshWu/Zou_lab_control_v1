@@ -121,31 +121,49 @@ def run_server(
     wait_done_command: str | None = None,
     safe_state_command: str | None = None,
     command_timeout: float | None = None,
+    backend: str = "command",
 ):
     """Start the RPyC sequencer service used by ``RemoteSequencer``."""
 
-    backend = CommandSequencerBackend(
-        Path(state_dir),
-        prepare_command=prepare_command,
-        fire_command=fire_command,
-        wait_done_command=wait_done_command,
-        safe_state_command=safe_state_command,
-        timeout=command_timeout,
-    )
+    backend_name = str(backend).strip().lower().replace("_", "-")
+    if backend_name in {"vivado-session", "persistent-vivado", "fpga-pulse-streamer"}:
+        from .fpga_pulse_streamer import VivadoPulseStreamerSession
+
+        hardware_backend = VivadoPulseStreamerSession(state_dir=state_dir)
+        prepare_callback = hardware_backend.prepare
+        fire_callback = hardware_backend.fire
+        wait_done_callback = hardware_backend.wait_done
+        safe_state_callback = hardware_backend.safe_state
+    elif backend_name == "command":
+        hardware_backend = CommandSequencerBackend(
+            Path(state_dir),
+            prepare_command=prepare_command,
+            fire_command=fire_command,
+            wait_done_command=wait_done_command,
+            safe_state_command=safe_state_command,
+            timeout=command_timeout,
+        )
+        prepare_callback = hardware_backend.prepare
+        fire_callback = hardware_backend.fire
+        wait_done_callback = hardware_backend.wait_done
+        safe_state_callback = hardware_backend.safe_state
+    else:
+        raise ValueError("backend must be 'vivado-session' or 'command'.")
     service = SequencerService(
         channels=channels,
         clock_hz=clock_hz,
         trigger_channels=trigger_channels,
-        prepare_callback=backend.prepare,
-        fire_callback=backend.fire,
-        wait_done_callback=backend.wait_done,
-        safe_state_callback=backend.safe_state,
+        prepare_callback=prepare_callback,
+        fire_callback=fire_callback,
+        wait_done_callback=wait_done_callback,
+        safe_state_callback=safe_state_callback,
     )
     print("Zou_lab_control sequencer service")
     print(json.dumps(service.snapshot(), indent=2))
     print(f"Listening on {host}:{port}")
     _print_client_endpoints(host, port)
     print(f"State directory: {Path(state_dir).resolve()}")
+    print(f"Backend: {backend_name}")
     return serve_runtime_sequencer(service, host=host, port=port, start=True)
 
 
@@ -229,6 +247,12 @@ def build_arg_parser() -> ArgumentParser:
     parser.add_argument("--wait-done-command", default=None)
     parser.add_argument("--safe-state-command", default=None)
     parser.add_argument("--command-timeout", type=float, default=None)
+    parser.add_argument(
+        "--backend",
+        default="command",
+        choices=["command", "vivado-session"],
+        help="Hardware backend. vivado-session keeps one Vivado Tcl process alive for lower runtime latency.",
+    )
     return parser
 
 
@@ -246,6 +270,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         wait_done_command=args.wait_done_command,
         safe_state_command=args.safe_state_command,
         command_timeout=args.command_timeout,
+        backend=args.backend,
     )
     return 0
 

@@ -152,6 +152,36 @@ class PulseTableState:
         payload["x_ns"] = float(x_ns)
         return type(self).from_dict(payload)
 
+    def aligned_to_channels(self, channels: Sequence[str]) -> "PulseTableState":
+        """Return a copy whose channel list matches hardware, filling missing channels off."""
+
+        channels = list(channel_names(channels, "channels"))
+        source_index = {channel: index for index, channel in enumerate(self.channels)}
+        unknown = [channel for channel in self.channels if channel not in source_index or channel not in channels]
+        if unknown:
+            raise ValueError(f"pulse state channels are not in hardware channels: {unknown}.")
+        periods = []
+        for period in self.periods:
+            states = tuple(int(period.states[source_index[channel]]) if channel in source_index else 0 for channel in channels)
+            periods.append(PulsePeriod(period.duration, states, unit=period.unit, name=period.name))
+        visible = [channel for channel in self.visible_channels if channel in channels]
+        if not visible:
+            visible = default_visible_channels(channels)
+        return type(self)(
+            channels=channels,
+            periods=periods,
+            delays={channel: value for channel, value in self.delays.items() if channel in channels},
+            delay_units={channel: value for channel, value in self.delay_units.items() if channel in channels},
+            name=self.name,
+            x_ns=self.x_ns,
+            time_step_ns=self.time_step_ns,
+            repeat_start=self.repeat_start,
+            repeat_end=self.repeat_end,
+            repeat_count=self.repeat_count,
+            visible_channels=visible,
+            channel_labels={channel: value for channel, value in self.channel_labels.items() if channel in channels},
+        )
+
     def label_for(self, channel: str) -> str:
         channel = self.channels[self.channel_index(channel)]
         return self.channel_labels.get(channel) or channel
@@ -310,15 +340,16 @@ class PulseTableState:
         trigger_channels: Sequence[str] = ("qcm_trigger", "camera_trigger", "trig"),
         x_ns: float | None = None,
     ):
-        from ..devices.sequencer import compile_runtime_program
+        from ..devices.sequencer import compile_pulse_table_runtime_program
 
         clock_hz = positive_float(clock_hz, "clock_hz")
-        clock_step_ns = 1e9 / clock_hz
-        return compile_runtime_program(
-            self.to_sequence(x_ns=x_ns, time_step_ns=clock_step_ns),
+        return compile_pulse_table_runtime_program(
+            self,
             channels=self.channels,
             clock_hz=clock_hz,
             trigger_channels=trigger_channels,
+            x_ns=x_ns,
+            repeat_forever=True,
         )
 
     def to_dict(self) -> dict[str, object]:

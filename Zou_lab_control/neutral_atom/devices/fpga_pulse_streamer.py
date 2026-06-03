@@ -12,7 +12,9 @@ from dataclasses import dataclass
 from pathlib import Path
 import json
 import os
+import queue
 import subprocess
+import threading
 import time
 from typing import Mapping, Sequence
 
@@ -38,6 +40,10 @@ class PulseStreamerProbeNames:
     prog_tick: str = "zlc_prog_tick"
     prog_mask: str = "zlc_prog_mask"
     prog_count: str = "zlc_prog_count"
+    repeat_forever: str = "zlc_repeat_forever"
+    loop_start_addr: str = "zlc_loop_start_addr"
+    loop_end_tick: str = "zlc_loop_end_tick"
+    loop_count: str = "zlc_loop_count"
     running: str = "zlc_running"
     done: str = "zlc_done"
 
@@ -85,6 +91,23 @@ def validate_pulse_streamer_program(
             raise ValueError(f"program mask {mask} does not fit {channel_count} channels.")
     if program.masks and int(program.masks[-1]) != 0:
         raise ValueError("program final mask must be 0 so the streamer returns to a safe idle state.")
+    loop_count = int(getattr(program, "loop_count", 1))
+    loop_start_index = int(getattr(program, "loop_start_index", 0))
+    loop_end_tick = int(getattr(program, "loop_end_tick", 0))
+    repeat_forever = bool(getattr(program, "repeat_forever", False))
+    if loop_count < 1:
+        raise ValueError("program loop_count must be >= 1.")
+    if repeat_forever or loop_count > 1:
+        if not program.ticks:
+            raise ValueError("hardware repeat requires at least one uploaded edge.")
+        if loop_start_index < 0 or loop_start_index >= len(program.ticks):
+            raise ValueError("program loop_start_index must select an uploaded edge.")
+        if loop_end_tick <= int(program.ticks[loop_start_index]):
+            raise ValueError("program loop_end_tick must be after the loop start tick.")
+        if loop_end_tick > int(program.ticks[-1]):
+            raise ValueError("program loop_end_tick must not exceed the uploaded final tick.")
+        if loop_end_tick > tick_limit:
+            raise ValueError(f"program loop_end_tick {loop_end_tick} does not fit {tick_width} bits.")
 
 
 def generate_pulse_streamer_core(
@@ -118,6 +141,10 @@ module {module_name} #(
     input wire [TICK_WIDTH-1:0] prog_tick,
     input wire [CHANNEL_COUNT-1:0] prog_mask,
     input wire [EDGE_ADDR_WIDTH:0] prog_count,
+    input wire repeat_forever,
+    input wire [EDGE_ADDR_WIDTH-1:0] loop_start_addr,
+    input wire [TICK_WIDTH-1:0] loop_end_tick,
+    input wire [31:0] loop_count,
     output wire [CHANNEL_COUNT-1:0] out,
     output reg running = 1'b0,
     output reg done = 1'b0
@@ -133,14 +160,16 @@ module {module_name} #(
     reg [TICK_WIDTH-1:0] final_tick = {{TICK_WIDTH{{1'b0}}}};
     reg [EDGE_ADDR_WIDTH:0] edge_index = {{(EDGE_ADDR_WIDTH + 1){{1'b0}}}};
     reg [EDGE_ADDR_WIDTH:0] active_count = {{(EDGE_ADDR_WIDTH + 1){{1'b0}}}};
+    reg repeat_forever_active = 1'b0;
+    reg [EDGE_ADDR_WIDTH-1:0] loop_start_active = {{EDGE_ADDR_WIDTH{{1'b0}}}};
+    reg [TICK_WIDTH-1:0] loop_end_active = {{TICK_WIDTH{{1'b0}}}};
+    reg [31:0] loop_count_active = 32'd1;
+    reg [31:0] loops_remaining = 32'd1;
 
     reg start_sync = 1'b0;
     reg start_prev = 1'b0;
-    reg prog_we_sync = 1'b0;
-    reg prog_we_prev = 1'b0;
 
-    wire start_edge = start_sync && !start_prev;
-    wire prog_we_edge = prog_we_sync && !prog_we_prev;
+    wire start_event = start_sync != start_prev;
     wire [EDGE_ADDR_WIDTH-1:0] edge_addr = edge_index[EDGE_ADDR_WIDTH-1:0];
 
     assign out = state_mask;
@@ -148,10 +177,8 @@ module {module_name} #(
     always @(posedge clk) begin
         start_sync <= start;
         start_prev <= start_sync;
-        prog_we_sync <= prog_we;
-        prog_we_prev <= prog_we_sync;
 
-        if (prog_we_edge) begin
+        if (reset && prog_we) begin
             tick_mem[prog_addr] <= prog_tick;
             mask_mem[prog_addr] <= prog_mask;
         end
@@ -164,25 +191,59 @@ module {module_name} #(
             final_tick <= {{TICK_WIDTH{{1'b0}}}};
             edge_index <= {{(EDGE_ADDR_WIDTH + 1){{1'b0}}}};
             active_count <= {{(EDGE_ADDR_WIDTH + 1){{1'b0}}}};
-        end else if (start_edge && !running) begin
+            repeat_forever_active <= 1'b0;
+            loop_start_active <= {{EDGE_ADDR_WIDTH{{1'b0}}}};
+            loop_end_active <= {{TICK_WIDTH{{1'b0}}}};
+            loop_count_active <= 32'd1;
+            loops_remaining <= 32'd1;
+        end else if (start_event && !running) begin
             running <= (prog_count != 0);
             done <= (prog_count == 0);
-            state_mask <= {{CHANNEL_COUNT{{1'b0}}}};
-            time_count <= {{TICK_WIDTH{{1'b0}}}};
             final_tick <= (prog_count == 0) ? {{TICK_WIDTH{{1'b0}}}} : tick_mem[prog_count[EDGE_ADDR_WIDTH-1:0] - 1'b1];
-            edge_index <= {{(EDGE_ADDR_WIDTH + 1){{1'b0}}}};
             active_count <= prog_count;
-        end else if (running) begin
-            if (edge_index < active_count && time_count == tick_mem[edge_addr]) begin
-                state_mask <= mask_mem[edge_addr];
-                edge_index <= edge_index + 1'b1;
-            end
-
-            if (time_count >= final_tick) begin
-                running <= 1'b0;
-                done <= 1'b1;
-                state_mask <= {{CHANNEL_COUNT{{1'b0}}}};
+            repeat_forever_active <= repeat_forever;
+            loop_start_active <= loop_start_addr;
+            loop_end_active <= loop_end_tick;
+            loop_count_active <= (loop_count == 0) ? 32'd1 : loop_count;
+            loops_remaining <= (loop_count == 0) ? 32'd1 : loop_count;
+            if (prog_count != 0 && tick_mem[0] == {{TICK_WIDTH{{1'b0}}}}) begin
+                state_mask <= mask_mem[0];
+                time_count <= {{{{(TICK_WIDTH-1){{1'b0}}}}, 1'b1}};
+                edge_index <= {{{{EDGE_ADDR_WIDTH{{1'b0}}}}, 1'b1}};
             end else begin
+                state_mask <= {{CHANNEL_COUNT{{1'b0}}}};
+                time_count <= {{TICK_WIDTH{{1'b0}}}};
+                edge_index <= {{(EDGE_ADDR_WIDTH + 1){{1'b0}}}};
+            end
+        end else if (running) begin
+            if (loop_count_active > 32'd1 && loops_remaining > 32'd1 && time_count >= loop_end_active) begin
+                state_mask <= mask_mem[loop_start_active];
+                time_count <= tick_mem[loop_start_active] + 1'b1;
+                edge_index <= {{1'b0, loop_start_active}} + 1'b1;
+                loops_remaining <= loops_remaining - 1'b1;
+            end else if (time_count >= final_tick) begin
+                if (repeat_forever_active) begin
+                    if (tick_mem[0] == {{TICK_WIDTH{{1'b0}}}}) begin
+                        state_mask <= mask_mem[0];
+                        time_count <= {{{{(TICK_WIDTH-1){{1'b0}}}}, 1'b1}};
+                        edge_index <= {{{{EDGE_ADDR_WIDTH{{1'b0}}}}, 1'b1}};
+                    end else begin
+                        state_mask <= {{CHANNEL_COUNT{{1'b0}}}};
+                        time_count <= {{TICK_WIDTH{{1'b0}}}};
+                        edge_index <= {{(EDGE_ADDR_WIDTH + 1){{1'b0}}}};
+                    end
+                    loops_remaining <= loop_count_active;
+                    done <= 1'b0;
+                end else begin
+                    running <= 1'b0;
+                    done <= 1'b1;
+                    state_mask <= {{CHANNEL_COUNT{{1'b0}}}};
+                end
+            end else begin
+                if (edge_index < active_count && time_count == tick_mem[edge_addr]) begin
+                    state_mask <= mask_mem[edge_addr];
+                    edge_index <= edge_index + 1'b1;
+                end
                 time_count <= time_count + 1'b1;
             end
         end
@@ -229,6 +290,10 @@ def generate_pulse_streamer_top_example(
 //   probe_out4 {probe_names.prog_tick}  width {tick_width}
 //   probe_out5 {probe_names.prog_mask}  width {len(channels)}
 //   probe_out6 {probe_names.prog_count} width {edge_addr_width + 1}
+//   probe_out7 {probe_names.repeat_forever} width 1
+//   probe_out8 {probe_names.loop_start_addr} width {edge_addr_width}
+//   probe_out9 {probe_names.loop_end_tick} width {tick_width}
+//   probe_out10 {probe_names.loop_count} width 32
 //   probe_in0  {probe_names.running}    width 1
 //   probe_in1  {probe_names.done}       width 1
 
@@ -246,6 +311,10 @@ module {top_module_name}(
     wire [{tick_width - 1}:0] {probe_names.prog_tick};
     wire [{len(channels) - 1}:0] {probe_names.prog_mask};
     wire [{edge_addr_width}:0] {probe_names.prog_count};
+    wire {probe_names.repeat_forever};
+    wire [{edge_addr_width - 1}:0] {probe_names.loop_start_addr};
+    wire [{tick_width - 1}:0] {probe_names.loop_end_tick};
+    wire [31:0] {probe_names.loop_count};
     wire [{len(channels) - 1}:0] out;
     wire {probe_names.running};
     wire {probe_names.done};
@@ -267,6 +336,10 @@ module {top_module_name}(
         .prog_tick({probe_names.prog_tick}),
         .prog_mask({probe_names.prog_mask}),
         .prog_count({probe_names.prog_count}),
+        .repeat_forever({probe_names.repeat_forever}),
+        .loop_start_addr({probe_names.loop_start_addr}),
+        .loop_end_tick({probe_names.loop_end_tick}),
+        .loop_count({probe_names.loop_count}),
         .out(out),
         .running({probe_names.running}),
         .done({probe_names.done})
@@ -282,7 +355,11 @@ module {top_module_name}(
         .probe_out3({probe_names.prog_addr}),
         .probe_out4({probe_names.prog_tick}),
         .probe_out5({probe_names.prog_mask}),
-        .probe_out6({probe_names.prog_count})
+        .probe_out6({probe_names.prog_count}),
+        .probe_out7({probe_names.repeat_forever}),
+        .probe_out8({probe_names.loop_start_addr}),
+        .probe_out9({probe_names.loop_end_tick}),
+        .probe_out10({probe_names.loop_count})
     );
 endmodule
 """
@@ -392,6 +469,215 @@ def write_vivado_pulse_streamer_tcl(
     return path
 
 
+class VivadoPulseStreamerSession:
+    """Persistent Vivado/VIO transport for the runtime pulse streamer.
+
+    The batch backend is reliable for bring-up, but it pays Vivado startup,
+    hardware-target open, and probe discovery on every action.  This session
+    performs that setup once, then executes prepare/fire/wait/safe Tcl snippets
+    in the same Vivado Tcl process.
+    """
+
+    def __init__(
+        self,
+        *,
+        state_dir: str | Path,
+        vivado: str | None = None,
+        project: str | None = None,
+        bitstream: str | None = None,
+        probes: str | None = None,
+        vio_filter: str = DEFAULT_VIO_FILTER,
+        program_on_run: str | None = None,
+        probe_names: PulseStreamerProbeNames | None = None,
+        max_edges: int | None = None,
+        tick_width: int | None = None,
+        channel_count: int | None = None,
+        startup_timeout: float = 90.0,
+        action_timeout: float | None = None,
+    ):
+        self.state_dir = Path(state_dir)
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.program_path = self.state_dir / "prepared_program.json"
+        self.vivado = vivado or os.environ.get("ZLC_PS_VIVADO_BIN", os.environ.get("ZLC_VIVADO_BIN", "vivado"))
+        self.project = project if project is not None else _env_first("ZLC_PS_VIVADO_PROJECT", "ZLC_VIVADO_PROJECT")
+        self.bitstream = bitstream if bitstream is not None else _env_first("ZLC_PS_VIVADO_BIT", "ZLC_VIVADO_BIT")
+        self.probes = probes if probes is not None else _env_first("ZLC_PS_VIVADO_LTX", "ZLC_VIVADO_LTX")
+        self.vio_filter = str(vio_filter)
+        self.program_on_run = program_on_run if program_on_run is not None else _env_first("ZLC_PS_VIVADO_PROGRAM_ON_RUN", "ZLC_VIVADO_PROGRAM_ON_RUN")
+        self.probe_names = probe_names or PulseStreamerProbeNames()
+        self.max_edges = _env_int("ZLC_PS_MAX_EDGES", DEFAULT_MAX_EDGES) if max_edges is None else _positive_int(max_edges, "max_edges")
+        self.tick_width = _env_int("ZLC_PS_TICK_WIDTH", DEFAULT_TICK_WIDTH) if tick_width is None else _positive_int(tick_width, "tick_width")
+        self.channel_count = None if channel_count is None else _positive_int(channel_count, "channel_count")
+        self.startup_timeout = float(startup_timeout)
+        self.action_timeout = action_timeout
+        self._process: subprocess.Popen | None = None
+        self._reader: threading.Thread | None = None
+        self._queue: queue.Queue[str | None] = queue.Queue()
+        self._counter = 0
+        self._closed = False
+        self._log_path = self.state_dir / "vivado_session.log"
+
+    def start(self) -> "VivadoPulseStreamerSession":
+        if self._process is not None:
+            return self
+        try:
+            self._process = subprocess.Popen(
+                [self.vivado, "-mode", "tcl", "-nolog", "-nojournal"],
+                cwd=self.state_dir,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+        except FileNotFoundError as exc:
+            message = (
+                f"Vivado executable was not found: {self.vivado!r}.\n"
+                "Set ZLC_PS_VIVADO_BIN or ZLC_VIVADO_BIN to the full Vivado executable path."
+            )
+            self._write_action_log("vivado_session_start", message)
+            raise RuntimeError(f"pulse-streamer could not start persistent Vivado. See {self.state_dir / 'vivado_session_start.log'}.") from exc
+        self._reader = threading.Thread(target=self._read_stdout, name="zlc-vivado-session-reader", daemon=True)
+        self._reader.start()
+        init_lines = _vivado_common_tcl(
+            project=self.project,
+            bitstream=self.bitstream,
+            probes=self.probes,
+            vio_filter=self.vio_filter,
+            program_on_run=self.program_on_run,
+            probe_names=self.probe_names,
+        )
+        self._execute(init_lines, action="vivado_session_start", timeout=self.startup_timeout)
+        return self
+
+    def prepare(self, program: RuntimeSequenceProgram) -> None:
+        channel_count = len(program.channels) if self.channel_count is None else self.channel_count
+        validate_pulse_streamer_program(program, max_edges=self.max_edges, tick_width=self.tick_width, channel_count=channel_count)
+        self._write_program(program)
+        self._execute(_prepare_tcl(program, probe_names=self.probe_names), action="prepare", timeout=self.action_timeout)
+
+    def fire(self, program: RuntimeSequenceProgram | None = None) -> None:
+        if program is not None:
+            self._write_program(program)
+        self._execute(_fire_tcl(probe_names=self.probe_names), action="fire", timeout=self.action_timeout)
+        (self.state_dir / "pulse_streamer_fire_time.txt").write_text(str(time.monotonic()), encoding="utf-8")
+
+    def wait_done(self, program: RuntimeSequenceProgram | None = None, timeout: float | None = None) -> bool:
+        if program is not None:
+            self._write_program(program)
+        read_timeout = None if timeout is None else float(timeout) + 5.0
+        self._execute(
+            _wait_done_tcl(probe_names=self.probe_names, timeout=timeout, poll_interval=0.02),
+            action="wait_done",
+            timeout=read_timeout,
+        )
+        return True
+
+    def safe_state(self) -> None:
+        self._execute(_safe_state_tcl(probe_names=self.probe_names), action="safe_state", timeout=self.action_timeout)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        process = self._process
+        if process is None:
+            return
+        try:
+            if process.stdin is not None:
+                process.stdin.write("exit\n")
+                process.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+        self._process = None
+
+    def _write_program(self, program: RuntimeSequenceProgram) -> None:
+        self.program_path.write_text(json.dumps(program.to_dict(), indent=2), encoding="utf-8")
+        (self.state_dir / "last_sequence_id.txt").write_text(program.sequence_id, encoding="utf-8")
+
+    def _execute(self, lines: Sequence[str], *, action: str, timeout: float | None) -> str:
+        self.start() if self._process is None else None
+        process = self._process
+        if process is None or process.stdin is None:
+            raise RuntimeError("persistent Vivado session is not running.")
+        self._counter += 1
+        marker = f"ZLC_SESSION_{self._counter:06d}"
+        script = self._wrap_tcl(lines, marker)
+        try:
+            process.stdin.write(script)
+            process.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            self.close()
+            message = f"persistent Vivado session stopped before {action}. See {self._log_path}."
+            self._write_action_log(action, message)
+            raise RuntimeError(message) from exc
+        output = self._read_until_marker(marker, timeout=timeout)
+        self._write_action_log(action, output)
+        if f"{marker}_ERROR" in output:
+            tail = _log_tail(output)
+            message = f"persistent Vivado {action} failed. See {self.state_dir / (action + '.log')}."
+            if tail:
+                message = f"{message}\n\n--- {action}.log tail ---\n{tail}"
+            raise RuntimeError(message)
+        return output
+
+    @staticmethod
+    def _wrap_tcl(lines: Sequence[str], marker: str) -> str:
+        body = "\n".join(lines)
+        return (
+            f"puts \"{marker}_BEGIN\"\n"
+            "if {[catch {\n"
+            f"{body}\n"
+            "} zlc_session_result zlc_session_options]} {\n"
+            f"    puts \"{marker}_ERROR $zlc_session_result\"\n"
+            "    if {[dict exists $zlc_session_options -errorinfo]} { puts [dict get $zlc_session_options -errorinfo] }\n"
+            "} else {\n"
+            f"    puts \"{marker}_OK\"\n"
+            "}\n"
+            f"puts \"{marker}_END\"\n"
+            "flush stdout\n"
+        )
+
+    def _read_until_marker(self, marker: str, *, timeout: float | None) -> str:
+        deadline = None if timeout is None else time.monotonic() + max(0.1, float(timeout))
+        lines: list[str] = []
+        while True:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            if remaining == 0.0:
+                self.close()
+                raise TimeoutError(f"persistent Vivado action timed out waiting for {marker}.")
+            try:
+                item = self._queue.get(timeout=remaining)
+            except queue.Empty as exc:
+                self.close()
+                raise TimeoutError(f"persistent Vivado action timed out waiting for {marker}.") from exc
+            if item is None:
+                raise RuntimeError("persistent Vivado exited unexpectedly.")
+            lines.append(item)
+            if f"{marker}_END" in item:
+                return "".join(lines)
+
+    def _read_stdout(self) -> None:
+        assert self._process is not None
+        stdout = self._process.stdout
+        if stdout is None:
+            self._queue.put(None)
+            return
+        with self._log_path.open("a", encoding="utf-8", errors="replace") as log:
+            for line in stdout:
+                log.write(line)
+                log.flush()
+                self._queue.put(line)
+        self._queue.put(None)
+
+    def _write_action_log(self, action: str, text: str) -> None:
+        (self.state_dir / f"{action}.log").write_text(text, encoding="utf-8", errors="replace")
+
+
 def run_action(
     action: str,
     *,
@@ -436,7 +722,11 @@ def run_action(
     log_path = state / f"pulse_streamer_{action}.log"
     log_path.write_text(result.stdout, encoding="utf-8", errors="replace")
     if result.returncode != 0:
-        raise RuntimeError(f"pulse-streamer {action} failed with code {result.returncode}. See {log_path}.")
+        message = f"pulse-streamer {action} failed with code {result.returncode}. See {log_path}."
+        tail = _log_tail(result.stdout)
+        if tail:
+            message = f"{message}\n\n--- {log_path.name} tail ---\n{tail}"
+        raise RuntimeError(message)
     if action == "fire":
         (state / "pulse_streamer_fire_time.txt").write_text(str(time.monotonic()), encoding="utf-8")
     return tcl_path
@@ -512,18 +802,57 @@ def _vivado_common_tcl(
         bitstream_line,
         probes_line,
         f"set vio_filter {{{vio_filter}}}",
+        "set hw_server_url [env_or ZLC_PS_HW_SERVER_URL [env_or ZLC_HW_SERVER_URL \"\"]]",
         program_line,
-        "if {$project ne \"\" && ![file exists $project]} { error \"Vivado project not found: $project\" }",
-        "if {$probes ne \"\" && ![file exists $probes]} { error \"Vivado probe file not found: $probes\" }",
+        "if {$project ne \"\" && ![file exists $project]} {",
+        "    puts \"Vivado project not found; continuing without open_project: $project\"",
+        "    set project \"\"",
+        "}",
+        "if {$probes eq \"\"} { error \"Vivado .ltx probe file is required for VIO control. Set ZLC_PS_VIVADO_LTX to the Probes file used when programming the FPGA, or run fpga/build_and_program.bat after completing the 40ch XDC.\" }",
+        "if {![file exists $probes]} { error \"Vivado probe file not found: $probes\" }",
         "if {$program_on_run ne \"0\" && ($bitstream eq \"\" || ![file exists $bitstream])} {",
         "    error \"Vivado bitstream not found for programming: $bitstream\"",
         "}",
-        "if {$project ne \"\" && [file exists $project]} { open_project $project }",
-        "open_hw_manager",
-        "connect_hw_server -allow_non_jtag",
-        "open_hw_target",
+        "if {$project ne \"\" && [file exists $project]} {",
+        "    if {[catch {open_project $project} zlc_open_project_error]} {",
+        "        puts \"open_project failed; continuing without open_project: $zlc_open_project_error\"",
+        "        set project \"\"",
+        "    }",
+        "}",
+        "if {[llength [info commands load_features]]} { catch {load_features labtools} }",
+        "if {[llength [info commands open_hw_manager]]} {",
+        "    open_hw_manager",
+        "} elseif {[llength [info commands open_hw]]} {",
+        "    open_hw",
+        "}",
+        "if {![llength [info commands connect_hw_server]]} {",
+        "    error \"Vivado hardware Tcl commands are unavailable. Install/enable Vivado LabTools or set ZLC_PS_VIVADO_BIN to a Vivado with Hardware Manager support.\"",
+        "}",
+        "if {$hw_server_url ne \"\"} {",
+        "    connect_hw_server -url $hw_server_url",
+        "} elseif {[catch {connect_hw_server} zlc_connect_error]} {",
+        "    error \"connect_hw_server failed: $zlc_connect_error\"",
+        "}",
+        "catch {refresh_hw_server}",
+        "set zlc_targets {}",
+        "if {[catch {set zlc_targets [get_hw_targets]} zlc_target_error]} {",
+        "    puts \"get_hw_targets failed after refresh: $zlc_target_error\"",
+        "    set zlc_targets {}",
+        "}",
+        "puts \"Available hardware targets: $zlc_targets\"",
+        "set zlc_target [lindex $zlc_targets 0]",
+        "if {$zlc_target eq \"\"} { error \"No Vivado hardware target found. Check the USB/JTAG cable, board power, and hw_server connection.\" }",
+        "current_hw_target $zlc_target",
+        "if {[catch {open_hw_target $zlc_target} zlc_open_target_error]} {",
+        "    puts \"open_hw_target failed: $zlc_open_target_error\"",
+        "    catch {close_hw_target}",
+        "    puts \"Retrying open_hw_target with -jtag_mode on.\"",
+        "    if {[catch {open_hw_target -jtag_mode on $zlc_target} zlc_open_target_jtag_error]} {",
+        "        error \"Vivado sees hardware target '$zlc_target' but no FPGA device could be opened. Check board power, JTAG chain/mode jumpers, power-source jumper, cable seating, then disconnect/reconnect hw_server. Last error: $zlc_open_target_jtag_error\"",
+        "    }",
+        "}",
         "set device [lindex [get_hw_devices] 0]",
-        "if {$device eq \"\"} { error \"No Vivado hardware device found.\" }",
+        "if {$device eq \"\"} { error \"Vivado opened the hardware target but found no FPGA device. Check board power, JTAG chain/mode jumpers, power-source jumper, and Hardware Manager Auto Connect.\" }",
         "if {$program_on_run ne \"0\" && $bitstream ne \"\" && [file exists $bitstream]} {",
         "    set_property PROGRAM.FILE $bitstream $device",
         "    if {$probes ne \"\" && [file exists $probes]} {",
@@ -538,11 +867,23 @@ def _vivado_common_tcl(
         "    refresh_hw_device $device",
         "}",
         "set available_vios [get_hw_vios -of_objects $device]",
-        "set vio [lindex [get_hw_vios -of_objects $device -filter $vio_filter] 0]",
+        "set filtered_vios {}",
+        "if {[catch {set filtered_vios [get_hw_vios -of_objects $device -filter $vio_filter]} zlc_vio_filter_error]} {",
+        "    puts \"VIO filter '$vio_filter' failed: $zlc_vio_filter_error\"",
+        "    set filtered_vios {}",
+        "}",
+        "set vio [lindex $filtered_vios 0]",
+        "if {$vio eq \"\" && [llength $available_vios] == 1} {",
+        "    puts \"VIO filter did not select a core; using the only available VIO core.\"",
+        "    set vio [lindex $available_vios 0]",
+        "}",
         "if {$vio eq \"\"} {",
         "    puts \"Available VIO cores:\"",
         "    foreach candidate $available_vios {",
         "        puts \"  NAME=[get_property NAME $candidate] CELL_NAME=[get_property CELL_NAME $candidate]\"",
+        "    }",
+        "    if {[llength $available_vios] == 0} {",
+        "        error \"No VIO core was found on the FPGA. The current FPGA image is not the ZLC pulse-streamer bitstream, or the matching .ltx probes were not loaded. Program zlc_pulse_streamer_top_40ch.bit with zlc_pulse_streamer_top_40ch.ltx, or set ZLC_PS_VIVADO_LTX to the exact Probes file used in Vivado Program Device.\"",
         "    }",
         "    error \"No VIO core matched filter '$vio_filter'.\"",
         "}",
@@ -583,17 +924,36 @@ def _vivado_common_tcl(
         "    if {[llength $unique_matches] > 1} { error \"VIO probe aliases '$names' matched multiple probes.\" }",
         "    error \"VIO probe aliases '$names' were not found.\"",
         "}",
-        "proc zlc_set_probe {vio name value} {",
+        "proc zlc_stage_probe {vio name value} {",
         "    set probe [zlc_probe $vio $name]",
         "    set_property OUTPUT_VALUE_RADIX UNSIGNED $probe",
         "    set_property OUTPUT_VALUE $value $probe",
-        "    commit_hw_vio $probe",
         "    puts \"ZLC pulse-streamer VIO: [lindex $name 0]=$value\"",
+        "    return $probe",
+        "}",
+        "proc zlc_commit_probes {probes} {",
+        "    set unique_probes {}",
+        "    foreach probe $probes {",
+        "        if {[lsearch -exact $unique_probes $probe] < 0} { lappend unique_probes $probe }",
+        "    }",
+        "    if {[llength $unique_probes] > 0} { commit_hw_vio $unique_probes }",
+        "}",
+        "proc zlc_set_probe {vio name value} {",
+        "    zlc_commit_probes [list [zlc_stage_probe $vio $name $value]]",
         "}",
         "proc zlc_read_probe {vio name} {",
         "    refresh_hw_vio $vio",
         "    set probe [zlc_probe $vio $name]",
         "    return [get_property INPUT_VALUE $probe]",
+        "}",
+        "proc zlc_output_probe_bool {vio name} {",
+        "    refresh_hw_vio $vio",
+        "    set probe [zlc_probe $vio $name]",
+        "    set value [get_property OUTPUT_VALUE $probe]",
+        "    if {$value eq \"\"} { return 0 }",
+        "    if {[string is integer -strict $value]} { return [expr {int($value) != 0}] }",
+        "    if {[regexp {([01])$} $value _ bit]} { return [expr {int($bit) != 0}] }",
+        "    return 0",
         "}",
         f"set zlc_reset_probe {{{probe_names.reset} probe_out0}}",
         f"set zlc_start_probe {{{probe_names.start} probe_out1}}",
@@ -602,32 +962,50 @@ def _vivado_common_tcl(
         f"set zlc_prog_tick_probe {{{probe_names.prog_tick} probe_out4}}",
         f"set zlc_prog_mask_probe {{{probe_names.prog_mask} probe_out5}}",
         f"set zlc_prog_count_probe {{{probe_names.prog_count} probe_out6}}",
+        f"set zlc_repeat_forever_probe {{{probe_names.repeat_forever} probe_out7}}",
+        f"set zlc_loop_start_addr_probe {{{probe_names.loop_start_addr} probe_out8}}",
+        f"set zlc_loop_end_tick_probe {{{probe_names.loop_end_tick} probe_out9}}",
+        f"set zlc_loop_count_probe {{{probe_names.loop_count} probe_out10}}",
         f"set zlc_running_probe {{{probe_names.running} probe_in0}}",
         f"set zlc_done_probe {{{probe_names.done} probe_in1}}",
     ]
 
 
 def _prepare_tcl(program: RuntimeSequenceProgram, *, probe_names: PulseStreamerProbeNames) -> list[str]:
+    loop_end_tick = int(program.loop_end_tick) if int(program.loop_end_tick) > 0 else (int(program.ticks[-1]) if program.ticks else 0)
+    loop_start_index = int(program.loop_start_index) if program.ticks else 0
+    loop_count = max(1, int(program.loop_count))
     lines = [
-        "zlc_set_probe $vio $zlc_reset_probe 1",
-        "zlc_set_probe $vio $zlc_start_probe 0",
-        "zlc_set_probe $vio $zlc_prog_we_probe 0",
-        f"zlc_set_probe $vio $zlc_prog_count_probe {len(program.ticks)}",
+        "set zlc_batch {}",
+        "lappend zlc_batch [zlc_stage_probe $vio $zlc_reset_probe 1]",
+        "lappend zlc_batch [zlc_stage_probe $vio $zlc_start_probe 0]",
+        "lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_we_probe 0]",
+        f"lappend zlc_batch [zlc_stage_probe $vio $zlc_repeat_forever_probe {1 if program.repeat_forever else 0}]",
+        f"lappend zlc_batch [zlc_stage_probe $vio $zlc_loop_start_addr_probe {loop_start_index}]",
+        f"lappend zlc_batch [zlc_stage_probe $vio $zlc_loop_end_tick_probe {loop_end_tick}]",
+        f"lappend zlc_batch [zlc_stage_probe $vio $zlc_loop_count_probe {loop_count}]",
+        f"lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_count_probe {len(program.ticks)}]",
+        "zlc_commit_probes $zlc_batch",
     ]
     for index, (tick, mask) in enumerate(zip(program.ticks, program.masks)):
         lines.extend(
             [
-                f"zlc_set_probe $vio $zlc_prog_addr_probe {index}",
-                f"zlc_set_probe $vio $zlc_prog_tick_probe {int(tick)}",
-                f"zlc_set_probe $vio $zlc_prog_mask_probe {int(mask)}",
-                "zlc_set_probe $vio $zlc_prog_we_probe 1",
-                "zlc_set_probe $vio $zlc_prog_we_probe 0",
+                "set zlc_batch {}",
+                f"lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_addr_probe {index}]",
+                f"lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_tick_probe {int(tick)}]",
+                f"lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_mask_probe {int(mask)}]",
+                "lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_we_probe 1]",
+                "zlc_commit_probes $zlc_batch",
             ]
         )
     lines.extend(
         [
-            "zlc_set_probe $vio $zlc_reset_probe 0",
-            f"puts \"ZLC pulse-streamer prepared sequence {program.sequence_id} with {len(program.ticks)} edges\"",
+            "set zlc_batch {}",
+            "lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_we_probe 0]",
+            "lappend zlc_batch [zlc_stage_probe $vio $zlc_reset_probe 0]",
+            "zlc_commit_probes $zlc_batch",
+            "set zlc_start_toggle_value 0",
+            f"puts \"ZLC pulse-streamer prepared sequence {program.sequence_id} with {len(program.ticks)} edges repeat_forever={int(program.repeat_forever)} loop_start={loop_start_index} loop_end={loop_end_tick} loop_count={loop_count}\"",
         ]
     )
     return lines
@@ -635,11 +1013,14 @@ def _prepare_tcl(program: RuntimeSequenceProgram, *, probe_names: PulseStreamerP
 
 def _fire_tcl(*, probe_names: PulseStreamerProbeNames) -> list[str]:
     return [
-        "zlc_set_probe $vio $zlc_reset_probe 0",
-        "zlc_set_probe $vio $zlc_start_probe 0",
-        "zlc_set_probe $vio $zlc_start_probe 1",
-        "zlc_set_probe $vio $zlc_start_probe 0",
-        "puts \"ZLC pulse-streamer start edge sent\"",
+        "if {![info exists zlc_start_toggle_value]} { set zlc_start_toggle_value [zlc_output_probe_bool $vio $zlc_start_probe] }",
+        "set zlc_start_next [expr {$zlc_start_toggle_value ? 0 : 1}]",
+        "set zlc_batch {}",
+        "lappend zlc_batch [zlc_stage_probe $vio $zlc_reset_probe 0]",
+        "lappend zlc_batch [zlc_stage_probe $vio $zlc_start_probe $zlc_start_next]",
+        "zlc_commit_probes $zlc_batch",
+        "set zlc_start_toggle_value $zlc_start_next",
+        "puts \"ZLC pulse-streamer start toggle sent value=$zlc_start_next\"",
     ]
 
 
@@ -663,9 +1044,13 @@ def _wait_done_tcl(*, probe_names: PulseStreamerProbeNames, timeout: float | Non
 
 def _safe_state_tcl(*, probe_names: PulseStreamerProbeNames) -> list[str]:
     return [
-        "zlc_set_probe $vio $zlc_start_probe 0",
-        "zlc_set_probe $vio $zlc_prog_we_probe 0",
-        "zlc_set_probe $vio $zlc_reset_probe 1",
+        "set zlc_batch {}",
+        "lappend zlc_batch [zlc_stage_probe $vio $zlc_start_probe 0]",
+        "lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_we_probe 0]",
+        "lappend zlc_batch [zlc_stage_probe $vio $zlc_repeat_forever_probe 0]",
+        "lappend zlc_batch [zlc_stage_probe $vio $zlc_reset_probe 1]",
+        "zlc_commit_probes $zlc_batch",
+        "set zlc_start_toggle_value 0",
         "puts \"ZLC pulse-streamer safe state requested\"",
     ]
 
@@ -726,6 +1111,13 @@ def _optional_float(value) -> float | None:
     if value is None or str(value).strip() == "":
         return None
     return float(value)
+
+
+def _log_tail(text: str, *, max_lines: int = 80, max_chars: int = 12_000) -> str:
+    tail = "\n".join(str(text).splitlines()[-max_lines:])
+    if len(tail) > max_chars:
+        tail = tail[-max_chars:]
+    return tail.strip()
 
 
 def _env_int(name: str, default: int) -> int:

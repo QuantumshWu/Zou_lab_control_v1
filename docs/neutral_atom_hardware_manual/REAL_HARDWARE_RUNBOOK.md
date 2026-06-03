@@ -1,393 +1,213 @@
 # Zou_lab_control Neutral Atom Hardware Runbook
 
-This is the short operational version of the hardware manual. The preferred
-FPGA path is now a fixed runtime pulse-streamer bitstream: the control computer
-sends `PulseSequence`, the FPGA computer uploads the compiled `ticks/masks`
-edge table, and the FPGA clock executes the pulses.
+This is the short operational hardware runbook. The default FPGA path is a
+40-channel runtime pulse-streamer bitstream. The control computer sends a
+`PulseSequence` or GUI `PulseTableState`; the FPGA/Vivado computer compiles it
+against the full `ch00..ch39` channel list, uploads `ticks/masks` through Vivado
+VIO, and the FPGA clock executes the pulses.
 
-## 0. Install on both computers
+The GUI is only a frontend. It may display four channels, ten channels, or all
+forty. At upload time the sequencer server still produces a full-width 40-bit
+program; hidden or unconfigured channels are off.
+
+## 0. Install
+
+On both computers:
 
 ```powershell
 cd C:\path\to\Zou_lab_control_v1
+install_requirements.bat
+```
+
+or:
+
+```powershell
 python -m pip install -e .
 ```
 
-For a fresh Windows machine, `install_requirements.bat` is also acceptable. It
-installs the same Python-side GUI/server dependencies, including PyQt5 and
-RPyC. Vivado itself is not a Python dependency; install it separately on the
-Verilog/FPGA computer.
+Vivado is separate from Python requirements and only needs to be installed on
+the Verilog/FPGA computer.
 
-## 1. Build and program the FPGA pulse-streamer
+## 1. Build And Program On The FPGA Computer
 
-Run this on the Verilog/FPGA computer:
+Use a short checkout path when possible, for example `D:\ZLC`.
 
 ```powershell
-cd C:\path\to\Zou_lab_control_v1
-.\fpga\pulse_streamer\simulate_4ch_core.bat
-.\fpga\pulse_streamer\build_4ch_bitstream.bat
-.\fpga\pulse_streamer\program_4ch_fpga.bat
+cd D:\ZLC
+.\fpga\build_and_program.bat --help
+.\fpga\build_and_program.bat --check
 ```
 
-`simulate_4ch_core.bat` runs `xvlog/xelab/xsim` and does not require an FPGA
-board. It verifies the runtime upload path, start edge, expected output masks,
-`running`, `done`, and final all-off state before any hardware programming.
+`--check` performs a no-XDC 40ch synthesis self-check. It is useful before the
+board pin map is ready. It does not create a board-ready bitstream.
 
-The batch files call `fpga\pulse_streamer\vivado_env.bat`. The search order is:
+For a real build, copy and complete the 40ch XDC:
 
-1. existing `ZLC_PS_VIVADO_BIN`;
-2. installed `C:\Xilinx\Vivado\*\bin\vivado.bat` or
+```powershell
+copy .\fpga\pulse_streamer\zlc_pulse_streamer_40ch.xdc.template `
+     .\fpga\pulse_streamer\zlc_pulse_streamer_40ch.xdc
+```
+
+Fill every `ch00` through `ch39` package pin, voltage standard, and any
+board-level constraints. Then build and program:
+
+```powershell
+.\fpga\build_and_program.bat
+```
+
+If your XDC lives elsewhere:
+
+```powershell
+$env:ZLC_PS_40CH_XDC = "D:\fpga_pin_maps\zlc_pulse_streamer_40ch_my_board.xdc"
+.\fpga\build_and_program.bat
+```
+
+The script refuses to build if the XDC is missing or still contains
+`<PIN_CHxx>` placeholders. It also returns nonzero if synthesis,
+implementation, `.bit/.ltx` generation, or programming fails.
+
+Generated files normally live at:
+
+```text
+fpga\pulse_streamer\build\zlc_pulse_streamer_40ch\zlc_pulse_streamer_40ch.xpr
+fpga\pulse_streamer\build\zlc_pulse_streamer_40ch\zlc_pulse_streamer_40ch.runs\impl_1\zlc_pulse_streamer_top_40ch.bit
+fpga\pulse_streamer\build\zlc_pulse_streamer_40ch\zlc_pulse_streamer_40ch.runs\impl_1\zlc_pulse_streamer_top_40ch.ltx
+```
+
+Vivado discovery order:
+
+1. `ZLC_PS_VIVADO_BIN`, then `ZLC_VIVADO_BIN`;
+2. `C:\Xilinx\Vivado\*\bin\vivado.bat` and
    `D:\Xilinx\Vivado\*\bin\vivado.bat`;
 3. `vivado.bat` or `vivado` on `PATH`.
 
-The local test machine used Vivado 2019.1. The historical `address_switch`
-project in `references\source_archives\address_switch` was generated with
-Vivado 2019.2 and originally lived under a short path like
-`D:\time_sequence\address_switch`. If the Verilog computer has a different
-Vivado install, set the override explicitly before running the scripts:
+Manual override:
 
 ```powershell
 $env:ZLC_PS_VIVADO_BIN = "C:\Xilinx\Vivado\2019.2\bin\vivado.bat"
 ```
 
-Vivado 2019 debug-core generation is path-length sensitive. The batch helper
-uses a temporary short drive letter through `subst` when possible, but a short
-checkout such as `D:\ZLC` or `D:\time_sequence\ZLC` is still recommended.
+Vivado GUI route:
 
-This creates and programs the first-light `trap/cooling/probe/qcm_trigger`
-bitstream from `fpga\pulse_streamer\zlc_pulse_streamer.v`,
-`zlc_pulse_streamer_top_4ch.v`, and `zlc_pulse_streamer_4ch.xdc`. The generated
-Vivado project and bit/probe files are normally:
+1. Open Vivado 2019.x.
+2. If the project does not exist yet, run `.\fpga\build_and_program.bat --build-only`.
+3. Open
+   `fpga\pulse_streamer\build\zlc_pulse_streamer_40ch\zlc_pulse_streamer_40ch.xpr`.
+4. Run Synthesis, Run Implementation, then Generate Bitstream.
+5. Open Hardware Manager, Open Target, Auto Connect.
+6. Select the FPGA device and Program Device.
+7. Choose `zlc_pulse_streamer_top_40ch.bit` and
+   `zlc_pulse_streamer_top_40ch.ltx`.
+
+If Vivado sees a Digilent target but no FPGA device, run:
+
+```powershell
+.\fpga\build_and_program.bat --diagnose
+```
+
+Then check board power, JTAG/mode jumpers, power-source jumper, cable seating,
+and Hardware Manager Auto Connect.
+
+## 2. Start The 40ch Sequencer Server
+
+After programming:
+
+```powershell
+cd D:\ZLC
+.\fpga\run_server.bat
+```
+
+Defaults:
 
 ```text
-fpga\pulse_streamer\build\zlc_pulse_streamer_4ch\zlc_pulse_streamer_4ch.xpr
-fpga\pulse_streamer\build\zlc_pulse_streamer_4ch\zlc_pulse_streamer_4ch.runs\impl_1\zlc_pulse_streamer_top_4ch.bit
-fpga\pulse_streamer\build\zlc_pulse_streamer_4ch\zlc_pulse_streamer_4ch.runs\impl_1\zlc_pulse_streamer_top_4ch.ltx
+host:     0.0.0.0
+port:     18861
+backend:  vivado-session
+clock:    100 MHz
+channels: ch00 ... ch39
+trigger:  ch03
 ```
 
-The build/program batch files return nonzero if Vivado fails, if synth/impl did
-not complete, or if the `.bit/.ltx` outputs are missing.
+The persistent `vivado-session` backend opens Vivado Tcl once, loads the `.ltx`
+probes once, and reuses that process for `prepare/fire/wait_done/safe_state`.
+Set `ZLC_PS_SERVER_BACKEND=command` only for debugging the older
+subprocess-per-action path.
 
-Do not skip `program_4ch_fpga.bat` in the normal hardware bring-up flow. The
-only usual exceptions are: the same `.bit/.ltx` pair has already been programmed
-manually from Vivado Hardware Manager, or `ZLC_PS_VIVADO_PROGRAM_ON_RUN="1"` is
-intentionally set so the backend programs the board during the first hardware
-run.
+## 3. Pulse GUI
 
-Vivado GUI route for the same operation:
-
-1. Open the installed **Xilinx Vivado 2019.x** from the Windows Start Menu, or
-   run the path printed by `.\fpga\pulse_streamer\vivado_env.bat`. On the local
-   test machine this was `C:\Xilinx\Vivado\2019.1\bin\vivado.bat`; the old
-   `address_switch` archive was Vivado 2019.2.
-2. If the project does not exist yet, run `build_4ch_bitstream.bat` first.
-   Otherwise choose **File -> Project -> Open** and open
-   `fpga\pulse_streamer\build\zlc_pulse_streamer_4ch\zlc_pulse_streamer_4ch.xpr`.
-3. In **Flow Navigator**, run **Run Synthesis**, then **Run Implementation**,
-   then **Generate Bitstream**. Check the Tcl Console/Messages panel for errors.
-4. To program the board, choose **Flow Navigator -> Program and Debug -> Open
-   Hardware Manager**.
-5. Click **Open Target -> Auto Connect**.
-6. Select the FPGA device in the Hardware window and click **Program Device**.
-7. Set **Bitstream file** to
-   `...\zlc_pulse_streamer_4ch.runs\impl_1\zlc_pulse_streamer_top_4ch.bit`.
-8. Set **Probes file** to
-   `...\zlc_pulse_streamer_4ch.runs\impl_1\zlc_pulse_streamer_top_4ch.ltx`.
-9. Click **Program**.
-
-Expected time: first 4-channel build is usually 8-20 minutes, sometimes up to
-about 30 minutes on a slow machine or first IP-cache generation. Incremental
-builds are usually 3-10 minutes. Programming through JTAG is usually
-30 seconds to 2 minutes; reserve 3-5 minutes if Hardware Manager starts slowly.
-
-The Vivado VIO probe contract is:
-
-```text
-probe_out0 zlc_reset      width 1
-probe_out1 zlc_start      width 1
-probe_out2 zlc_prog_we    width 1
-probe_out3 zlc_prog_addr  width 10
-probe_out4 zlc_prog_tick  width 32
-probe_out5 zlc_prog_mask  width 4
-probe_out6 zlc_prog_count width 11
-probe_in0  zlc_running    width 1
-probe_in1  zlc_done       width 1
-```
-
-The backend can find either the semantic names (`zlc_reset`, `zlc_prog_tick`,
-...) or Vivado's native port names (`probe_out0`, `probe_out4`, ...).
-
-Before connecting the qCMOS, run the FPGA-only smoke test and check the four
-outputs on an oscilloscope:
-
-```powershell
-.\fpga\pulse_streamer\smoke_test_4ch_upload.bat
-```
-
-The batch file defaults the Vivado project, bitstream, and `.ltx` probe paths to
-the `build\zlc_pulse_streamer_4ch` outputs above.
-
-Expected timing at 100 MHz: `trap` high 0-10 us, `cooling` high 0-3 us,
-`probe` high 2-6 us, and `qcm_trigger` high 2-3 us.
-
-For 40-channel hardware, copy
-`fpga\pulse_streamer\zlc_pulse_streamer_40ch.xdc.template` to
-`fpga\pulse_streamer\zlc_pulse_streamer_40ch.xdc`, fill every `ch00` through
-`ch39` package pin, confirm bank voltage/electrical level, then run
-`build_40ch_bitstream.bat` and `program_40ch_fpga.bat`. Before the real XDC is
-available, `check_40ch_synth.bat` can be used as a logic/API self-check; it
-synthesizes the 40-channel top and VIO widths without output-pin constraints
-and does not produce a board-ready bitstream. The real 40-channel build will
-stop if the XDC is missing or any `<PIN_CHxx>` placeholder remains. Expect
-roughly 15-35 minutes for the first real 40-channel build and 1-3 minutes for
-programming. Do not connect the qCMOS or lasers until the pin map has been
-checked with a scope.
-
-## 2. Start the FPGA server
-
-Preferred Jupyter route:
-
-```powershell
-cd C:\path\to\Zou_lab_control_v1
-jupyter lab tutorials\neutral_atom_fpga_server.ipynb
-```
-
-Edit the Vivado paths in the notebook, then run the final server cell. The
-cell blocks while the server is running. Keep the kernel alive.
-
-Equivalent PowerShell route:
-
-```powershell
-cd C:\path\to\Zou_lab_control_v1
-$env:PYTHONPATH = (Get-Location).Path
-
-# Optional. Omit this if vivado_env.bat finds the correct Vivado install.
-$env:ZLC_PS_VIVADO_BIN = "C:\Xilinx\Vivado\2019.2\bin\vivado.bat"
-$env:ZLC_PS_VIVADO_PROJECT = "$PWD\fpga\pulse_streamer\build\zlc_pulse_streamer_4ch\zlc_pulse_streamer_4ch.xpr"
-$env:ZLC_PS_VIVADO_BIT = "$PWD\fpga\pulse_streamer\build\zlc_pulse_streamer_4ch\zlc_pulse_streamer_4ch.runs\impl_1\zlc_pulse_streamer_top_4ch.bit"
-$env:ZLC_PS_VIVADO_LTX = "$PWD\fpga\pulse_streamer\build\zlc_pulse_streamer_4ch\zlc_pulse_streamer_4ch.runs\impl_1\zlc_pulse_streamer_top_4ch.ltx"
-$env:ZLC_PS_VIVADO_PROGRAM_ON_RUN = "0"
-$env:ZLC_PS_VIO_FILTER = 'CELL_NAME=~"*vio*"'
-$env:ZLC_PS_MAX_EDGES = "1024"
-$env:ZLC_PS_TICK_WIDTH = "32"
-$env:ZLC_PS_CHANNEL_COUNT = "4"
-
-Test-Path $env:ZLC_PS_VIVADO_BIN
-Test-Path $env:ZLC_PS_VIVADO_PROJECT
-Test-Path $env:ZLC_PS_VIVADO_BIT
-Test-Path $env:ZLC_PS_VIVADO_LTX
-
-python -m Zou_lab_control.neutral_atom.devices.sequencer_server `
-  --host 0.0.0.0 `
-  --port 18861 `
-  --channels trap cooling probe qcm_trigger `
-  --trigger-channels qcm_trigger `
-  --clock-hz 100000000 `
-  --state-dir D:\zlc_sequencer_state `
-  --prepare-command "python -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer prepare" `
-  --fire-command "python -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer fire" `
-  --wait-done-command "python -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer wait_done" `
-  --safe-state-command "python -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer safe_state"
-```
-
-The same server can be started with the repository batch launcher:
-
-```powershell
-.\fpga\pulse_streamer\start_server_4ch.bat
-```
-
-For the 40-channel bitstream, after the real XDC has been filled, built, and
-programmed:
-
-```powershell
-.\fpga\pulse_streamer\start_server_40ch.bat
-```
-
-That launcher uses channels `ch00 ... ch39`, trigger channel `ch03`, 100 MHz
-clock, and `ZLC_PS_CHANNEL_COUNT=40`. Override `ZLC_PS_HOST`, `ZLC_PS_PORT`,
-`ZLC_PS_STATE_DIR`, `ZLC_PS_VIVADO_PROJECT`, `ZLC_PS_VIVADO_BIT`, or
-`ZLC_PS_VIVADO_LTX` if your hardware paths differ.
-
-Use `ZLC_PS_VIVADO_PROGRAM_ON_RUN="1"` for the first run so Vivado programs the
-bitstream and probes. After the board is programmed, set it to `"0"` for
-faster table uploads.
-
-## 3. Control/qCMOS computer
-
-Open the real hardware notebook:
-
-```powershell
-cd C:\path\to\Zou_lab_control_v1
-jupyter lab tutorials\neutral_atom_hardware_quickstart.ipynb
-```
-
-Use the IP printed by the FPGA server:
-
-```python
-exp = na.connect(
-    "remote_template",
-    sequencer={"host": "192.168.1.123", "port": 18861},
-    open_devices=True,
-)
-```
-
-Then run the cells in order:
-
-```python
-exp.timing.configure_imaging(...)
-preflight = exp.timing.preflight()
-preflight.raise_if_failed()
-
-capture = exp.camera.capture(frames=1, display=True)
-grid_shape = (5, 7)
-sitemap = exp.readout.sitemap(frames=20, grid_shape=grid_shape, roi_radius=1, display=True)
-threshold = exp.readout.thresholds(frames=120, site=0, display=True)
-shot = exp.readout.detect(display=True)
-clock_hz = exp.devices.sequencer.clock_hz
-time_ticks = np.linspace(int(round(0.2e-3 * clock_hz)), int(round(8e-3 * clock_hz)), 40, dtype=int)
-times = time_ticks / clock_hz
-scan = exp.readout.detection_time(times, shots=30, live=True, display=True)
-```
-
-## 4. Optional pulse GUI
-
-On a desktop Python/Qt environment, the pulse GUI is a frontend for the same
-sequencer:
-
-```python
-pulse_gui = zf.show_pulse_gui(experiment=exp)
-```
-
-The standalone root launcher does not require an experiment config:
-
-```powershell
-.\pulse_gui.bat
-```
-
-To connect that launcher directly to an already running FPGA sequencer server:
-
-```powershell
-.\pulse_gui.bat --remote-host 127.0.0.1 --remote-port 18861
-```
-
-On the control computer, replace `127.0.0.1` with the FPGA computer IP printed
-by the server. The launcher defaults to 40 hardware channels named
-`ch00...ch39`, a 100 MHz clock, `ch03` as trigger channel, and only the first
-four channels visible. To open the normal camera imaging preset:
-
-```powershell
-.\pulse_gui.bat --state .\pulses\camera_imaging_40ch.json
-```
-
-The preset keeps hardware names as `ch00...ch39`; display labels are explicitly
-stored only for `ch00=trap`, `ch01=cooling`, `ch02=probe`, and
-`ch03=qcm_trigger`. All delays are 0 ns. At 100 MHz it compiles to 6 edges:
-
-```text
-ticks: 0, 200000, 210000, 212000, 2210000, 2212000
-masks: 3, 1, 13, 5, 1, 0
-trigger_count: 1
-```
-
-This is well within the first runtime design limits of 1024 edges, 32-bit
-ticks, and 40 mask bits.
-
-When a sequencer is attached, the GUI `step (ns)` defaults to
-`1e9 / sequencer.clock_hz`; at 100 MHz this is 10 ns. Durations, delays, and
-`x` scan values must be integer multiples of that step. `Prepare` validates the
-same FPGA clock grid before uploading the runtime edge table.
-
-For 40-channel hardware, keep the server `--channels` order, the control config,
-and the GUI state in the same order. The channel list is the hardware channel
-name list and FPGA bit order, for example `ch00`, `ch01`, and so on. The GUI
-does not infer device meanings for these names. The Name panel shows the
-hardware channel on the left and an optional display label on the right; when a
-display label is edited, the Delay row and period checkbox text follow that
-label, and the Preview y-axis uses the label as well, while saved/compiled
-pulses still use the hardware channel name. The GUI
-can hide unused channels and add them back without changing FPGA mask bit
-positions. When all channels are shown, the channel-name column, delay column,
-and period checkbox columns share one vertical scroll position so each channel
-row remains aligned across the editor. The period timeline has its own
-horizontal scrollbar. `X` clears all period states for a channel without hiding
-it. `Hide Off` hides channels that are off in every period and keeps at least
-four channels visible. It ignores delay values when deciding whether a channel
-can be hidden, and stored delay and display-name values are kept in the saved
-state. Adding a hidden channel back restores its original hardware-order
-position.
-The Preview tab calls `zf.plot(..., kind="pulse")`; it hides always-off channels
-by default, can show them with the toggle, uses display labels for the y-axis,
-and marks repeat mode as
-`repeat ∞`, `repeat Pm-Pn xN`, or `repeat ∞ + Pm-Pn xN`. A bracket covering all
-periods is a finite outer repeat. An internal bracket is drawn as a colored
-nested bracket while the full sequence remains `∞`. The preview plots the
-unexpanded period table; hardware prepare still uses the expanded repeat
-sequence. `Save Pulse` stores JSON in the project `pulses/` directory by
-default, or in `ZLC_PULSE_DIR` when that environment variable is set. New pulse
-names default to `pulse_YYYYMMDD_HHMMSS`. `Save Figure` is the one-line button
-at the right side of the Preview top bar and stores the preview PNG. If the
-window is too large for the current display, pass
-`scale=0.82` or `window_ratio=0.90`; these change only frontend geometry, not
-pulse timing.
-
-On the FPGA computer, open the GUI from a second Python process after the server
-is running:
+Root GUI entry remains separate from FPGA scripts:
 
 ```powershell
 .\pulse_gui.bat --remote-host 127.0.0.1 --remote-port 18861 --state .\pulses\camera_imaging_40ch.json
 ```
 
-The equivalent Python API is:
+From a control computer, replace `127.0.0.1` with the FPGA computer IP printed
+by the server.
+
+`pulses\camera_imaging_40ch.json` stores forty hardware channels but only shows
+the first four by default:
+
+```text
+ch00 label trap
+ch01 label cooling
+ch02 label probe
+ch03 label qcm_trigger
+```
+
+This is still a 40ch pulse for the FPGA. The GUI visible-channel list only
+controls editor clutter. When `On Pulse` is pressed, the current state is sent
+to the sequencer, compiled against `ch00..ch39`, uploaded, and fired. Channels
+not present in the state or not visible in the GUI are zero in the uploaded
+40-bit masks.
+
+The camera preset compiles at 100 MHz to:
+
+```text
+ticks: 0, 200000, 210000, 212000, 2210000, 2212000
+masks: 3, 1, 13, 5, 1, 0
+trigger_count: 1
+repeat_forever: true
+```
+
+All high bits above `ch03` are zero.
+
+## 4. Control/qCMOS Computer
+
+Open:
+
+```powershell
+jupyter lab tutorials\neutral_atom_hardware_quickstart.ipynb
+```
+
+Connect to the FPGA computer:
 
 ```python
-sequencer = na.RemoteSequencer(
-    host="127.0.0.1",
-    port=18861,
-    channels=["trap", "cooling", "probe", "qcm_trigger"],
-    clock_hz=100_000_000,
-    trigger_channels=["qcm_trigger"],
+exp = na.connect(
+    "remote_template",
+    sequencer={"host": "192.168.0.20", "port": 18861},
+    open_devices=True,
 )
-pulse_gui = zf.show_pulse_gui(channels=sequencer.channels, sequencer=sequencer, scale=0.82, window_ratio=0.90)
 ```
 
-## 5. Loader and extension rule
+Then configure imaging, run preflight, capture raw camera frames, calibrate
+sitemap/threshold, detect, and scan detection time from the notebook.
 
-Keep `load_devices` configs simple: each device has `type` and `params`; use
-`"$device:name"` for dependencies. New hardware classes should inherit the
-right base class and either use a full import path in JSON or be registered:
+## Runtime Principle
 
-```python
-na.register_device_class("MySequencer", MySequencer)
-na.device_class_registry()
+The fixed FPGA bitstream stores an edge table:
+
+```text
+ticks: absolute FPGA clock ticks
+masks: full 40-bit output masks
 ```
 
-Do not put FPGA transport details into the control notebook. The only control
-PC contract is `RemoteSequencer.prepare/fire/wait_done`.
+During `prepare`, Python writes the table and repeat metadata through VIO while
+reset is asserted. During `fire`, Python toggles `zlc_start` once. After that,
+`time_count` advances on the FPGA clock and updates outputs when
+`time_count == tick_mem[edge_index]`.
 
-## 6. First-light fallback
-
-For camera-only trigger checks:
-
-```python
-exp = na.connect("manual_template", open_devices=True)
-capture = exp.camera.capture(frames=1, display=True, timeout_ms=60000)
-```
-
-Then manually provide a TTL positive edge to the qCMOS external trigger input.
-
-The old `legacy_address_switch` backend remains available for comparison, but
-it is not the recommended path. It can only write `pulse_lasting/cycle_counts`
-and cannot express a full edge table.
-
-## 7. Quick troubleshooting
-
-- Remote connection fails: check FPGA computer IP, port `18861`, firewall, and
-  that the server cell or PowerShell process is still running.
-- Vivado fails: check `ZLC_PS_VIVADO_BIN`, `.xpr`, `.bit`, `.ltx`, and whether
-  the VIO core probes use the required names.
-- qCMOS timeout: check that the `qcm_trigger` FPGA output is physically wired
-  to the qCMOS external trigger input and is a TTL positive edge.
-- Sequence rejected: check `MAX_EDGES`, `TICK_WIDTH`, channel names, and
-  overlapping pulses in `exp.timing.preflight()`. If the message says
-  "clock grid", set GUI `step (ns)` to the FPGA tick and use integer multiples.
-- Sitemap requires `grid_shape`: real hardware configs do not have a virtual
-  trap array, so pass `grid_shape=(rows, cols)` explicitly.
+Repeat is metadata, not expanded rows. A GUI table with `repeat infinity` is
+uploaded once with `zlc_repeat_forever=1`. A finite repeat bracket uses
+`loop_start_addr`, `loop_end_tick`, and `loop_count`. This is why a simple GUI
+pulse using only four visible channels can still run cleanly on the 40ch
+bitstream without changing Verilog.

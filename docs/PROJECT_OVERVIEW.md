@@ -62,12 +62,12 @@ The recommended backend is a fixed pulse-streamer bitstream:
 Control PC notebook
   -> RemoteSequencer over RPyC
   -> SequencerService on FPGA/Vivado PC
-  -> fpga_pulse_streamer command backend
+  -> fpga_pulse_streamer persistent Vivado-session backend
   -> Vivado/VIO upload of ticks/masks
   -> zlc_pulse_streamer FPGA edge-table RAM
 ```
 
-This design makes each acquisition upload a new sequence without rebuilding Verilog. Network and Vivado commands handle setup/start; microsecond timing is executed by FPGA clocked logic.
+This design makes each acquisition upload a new sequence without rebuilding Verilog. The default server keeps one Vivado Tcl process alive while the server runs; microsecond timing is executed by FPGA clocked logic.
 
 For FPGA resource sizing, pin-count assumptions, and 40-channel pulse-streamer notes, see `docs/FPGA_PULSE_STREAMER_CAPACITY.md`.
 

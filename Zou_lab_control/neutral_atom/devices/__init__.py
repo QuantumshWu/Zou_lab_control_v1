@@ -9,7 +9,9 @@ from .sequencer import (
     RuntimeSequencer,
     SequencerService,
     VerilogSequencer,
+    compile_pulse_table_runtime_program,
     compile_runtime_program,
+    compile_runtime_program_for_payload,
     serve_runtime_sequencer,
 )
 from .virtual import DEFAULT_CHANNELS, VirtualCamera, VirtualSequencer, VirtualTrapArray, virtual_config
@@ -30,6 +32,7 @@ _REGISTRY_EXPORTS = {
 _PULSE_STREAMER_EXPORTS = {
     "PulseStreamerHDLFiles",
     "PulseStreamerProbeNames",
+    "VivadoPulseStreamerSession",
     "generate_pulse_streamer_core",
     "generate_pulse_streamer_top_example",
     "validate_pulse_streamer_program",
@@ -72,6 +75,7 @@ __all__ = [
     "ManualSequencer",
     "PulseStreamerHDLFiles",
     "PulseStreamerProbeNames",
+    "VivadoPulseStreamerSession",
     "QCMOSCamera",
     "QCMOSConfig",
     "RemoteSequencer",
@@ -100,6 +104,8 @@ __all__ = [
     "validate_device_contract",
     "virtual_config",
     "compile_runtime_program",
+    "compile_pulse_table_runtime_program",
+    "compile_runtime_program_for_payload",
     "serve_runtime_sequencer",
     "write_pulse_streamer_hdl_bundle",
     "write_vivado_pulse_streamer_tcl",

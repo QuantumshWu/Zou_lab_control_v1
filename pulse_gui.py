@@ -8,6 +8,7 @@ FPGA sequencer server through RemoteSequencer.
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 from typing import Sequence
 
@@ -56,12 +57,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scale", type=_positive_float, default=0.82, help="GUI scale. Use 1.0 for full size.")
     parser.add_argument("--window-ratio", type=_positive_float, default=0.90, help="Fixed GUI window size as a fraction of the screen.")
     parser.add_argument("--state", type=Path, help="Load a PulseTableState JSON file.")
-    parser.add_argument("--remote-host", help="Connect to an already running FPGA sequencer server.")
+    parser.add_argument(
+        "--remote-host",
+        default=os.environ.get("ZLC_PS_REMOTE_HOST", "127.0.0.1"),
+        help="Connect to an already running FPGA sequencer server. Use --no-sequencer for offline editing.",
+    )
     parser.add_argument("--remote-port", type=int, default=18861, help="Remote sequencer server port.")
     parser.add_argument(
         "--no-sequencer",
         action="store_true",
-        help="Open only the editor without prepare/fire/wait/safe backend calls.",
+        help="Open only the editor without On Pulse, Wait Done, or Stop Pulse backend calls.",
     )
     return parser
 
@@ -83,31 +88,50 @@ def main(argv: Sequence[str] | None = None) -> int:
     import Zou_lab_control.neutral_atom as na
 
     state = na.PulseTableState.load(args.state) if args.state else None
-    channels = _resolve_channels(args, state)
-    trigger_channels = _resolve_trigger_channels(args, channels)
-    if state is None and not args.channels:
-        state = na.PulseTableState(
-            channels=channels,
-            time_step_ns=1_000_000_000.0 / args.clock_hz,
-            visible_channels=channels[: min(4, len(channels))],
-        )
-
     sequencer = None
     if not args.no_sequencer:
         if args.remote_host:
+            seed_channels = _resolve_channels(args, state)
+            seed_trigger_channels = _resolve_trigger_channels(args, seed_channels)
             sequencer = na.RemoteSequencer(
                 host=args.remote_host,
                 port=args.remote_port,
-                channels=channels,
+                channels=seed_channels,
                 clock_hz=args.clock_hz,
-                trigger_channels=trigger_channels,
+                trigger_channels=seed_trigger_channels,
+                connect_on_init=True,
             )
+            channels = list(sequencer.channels)
+            trigger_channels = list(sequencer.trigger_channels)
         else:
+            channels = _resolve_channels(args, state)
+            trigger_channels = _resolve_trigger_channels(args, channels)
             sequencer = na.RuntimeSequencer(
                 channels=channels,
                 clock_hz=args.clock_hz,
                 trigger_channels=trigger_channels,
             )
+    else:
+        channels = _resolve_channels(args, state)
+        trigger_channels = _resolve_trigger_channels(args, channels)
+
+    if state is not None and list(state.channels) != list(channels):
+        if all(channel in channels for channel in state.channels):
+            state = state.aligned_to_channels(channels)
+        else:
+            parser = _build_parser()
+            parser.error(
+                "loaded pulse state channels do not match the sequencer channels: "
+                f"state={list(state.channels)!r}, sequencer={list(channels)!r}. "
+                "Load a matching pulse JSON or use hardware channel names with display labels."
+            )
+
+    if state is None and not args.channels:
+        state = na.PulseTableState(
+            channels=channels,
+            time_step_ns=1_000_000_000.0 / float(getattr(sequencer, "clock_hz", args.clock_hz)),
+            visible_channels=channels[: min(4, len(channels))],
+        )
 
     zf.show_pulse_gui(
         state=state,
