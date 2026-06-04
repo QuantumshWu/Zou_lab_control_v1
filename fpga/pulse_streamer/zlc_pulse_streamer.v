@@ -44,11 +44,11 @@ module zlc_pulse_streamer #(
     reg [CHANNEL_COUNT-1:0] state_mask = {CHANNEL_COUNT{1'b0}};
     reg [TICK_WIDTH-1:0] time_count = {TICK_WIDTH{1'b0}};
     reg [TICK_WIDTH-1:0] final_tick = {TICK_WIDTH{1'b0}};
+    reg [TICK_WIDTH-1:0] final_tick_shadow = {TICK_WIDTH{1'b0}};
     reg [TICK_WIDTH-1:0] first_tick_shadow = {TICK_WIDTH{1'b0}};
     reg [CHANNEL_COUNT-1:0] first_mask_shadow = {CHANNEL_COUNT{1'b0}};
     reg [TICK_WIDTH-1:0] loop_start_tick_shadow = {TICK_WIDTH{1'b0}};
     reg [CHANNEL_COUNT-1:0] loop_start_mask_shadow = {CHANNEL_COUNT{1'b0}};
-    reg [TICK_WIDTH-1:0] final_tick_shadow = {TICK_WIDTH{1'b0}};
     reg [EDGE_ADDR_WIDTH:0] edge_index = {(EDGE_ADDR_WIDTH + 1){1'b0}};
     reg [EDGE_ADDR_WIDTH:0] active_count = {(EDGE_ADDR_WIDTH + 1){1'b0}};
     reg repeat_forever_active = 1'b0;

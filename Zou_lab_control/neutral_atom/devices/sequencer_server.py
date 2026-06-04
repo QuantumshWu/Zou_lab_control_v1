@@ -108,6 +108,13 @@ def _log_tail(text: str, *, max_lines: int = 80, max_chars: int = 12_000) -> str
     return tail.strip()
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return bool(default)
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
 def run_server(
     *,
     channels: Sequence[str],
@@ -153,6 +160,7 @@ def run_server(
         safe_state_callback = hardware_backend.safe_state
     else:
         raise ValueError("backend must be 'vivado-session' or 'command'.")
+    cache_prepared = _env_bool("ZLC_SEQUENCER_CACHE_PREPARED", False)
     service = SequencerService(
         channels=channels,
         clock_hz=clock_hz,
@@ -161,6 +169,7 @@ def run_server(
         fire_callback=fire_callback,
         wait_done_callback=wait_done_callback,
         safe_state_callback=safe_state_callback,
+        cache_prepared=cache_prepared,
     )
     print("Zou_lab_control sequencer service")
     print(json.dumps(service.snapshot(), indent=2))
@@ -168,6 +177,7 @@ def run_server(
     _print_client_endpoints(host, port)
     print(f"State directory: {Path(state_dir).resolve()}")
     print(f"Backend: {backend_name}")
+    print(f"Prepare cache: {'on' if cache_prepared else 'off'}")
     return serve_runtime_sequencer(service, host=host, port=port, start=True)
 
 

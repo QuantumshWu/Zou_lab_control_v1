@@ -2351,19 +2351,23 @@ def test_vivado_pulse_streamer_session_prepare_uses_differential_edge_upload(tmp
     diff_prepare = created[0].stdin.writes[2]
     loop_metadata_prepare = created[0].stdin.writes[3]
     assert full_prepare.count("zlc_stage_probe $vio $zlc_prog_addr_probe") == 4
-    assert full_prepare.count("zlc_commit_probes $zlc_batch") == 5
+    assert full_prepare.count("zlc_commit_probes $zlc_batch") == 6
+    assert full_prepare.index("zlc_stage_probe $vio $zlc_reset_probe 1") < full_prepare.index(
+        "zlc_stage_probe $vio $zlc_prog_addr_probe 0"
+    )
+    assert "after $zlc_prepare_reset_settle_ms" in full_prepare
     assert "wrote 4/4 edge rows" in full_prepare
-    assert "initial_edge_batch=1" in full_prepare
+    assert "reset_settle_ms=$zlc_prepare_reset_settle_ms" in full_prepare
     assert diff_prepare.count("zlc_stage_probe $vio $zlc_prog_addr_probe") == 3
-    assert diff_prepare.count("zlc_commit_probes $zlc_batch") == 4
+    assert diff_prepare.count("zlc_commit_probes $zlc_batch") == 5
     assert "zlc_stage_probe $vio $zlc_prog_addr_probe 0" in diff_prepare
     assert "zlc_stage_probe $vio $zlc_prog_addr_probe 1" not in diff_prepare
     assert "zlc_stage_probe $vio $zlc_prog_addr_probe 2" in diff_prepare
     assert "zlc_stage_probe $vio $zlc_prog_addr_probe 3" in diff_prepare
     assert "wrote 3/4 edge rows" in diff_prepare
-    assert "initial_edge_batch=1" in diff_prepare
+    assert "reset_settle_ms=$zlc_prepare_reset_settle_ms" in diff_prepare
     assert loop_metadata_prepare.count("zlc_stage_probe $vio $zlc_prog_addr_probe") == 3
-    assert loop_metadata_prepare.count("zlc_commit_probes $zlc_batch") == 4
+    assert loop_metadata_prepare.count("zlc_commit_probes $zlc_batch") == 5
     assert "zlc_stage_probe $vio $zlc_loop_start_addr_probe 2" in loop_metadata_prepare
     assert "zlc_stage_probe $vio $zlc_loop_count_probe 2" in loop_metadata_prepare
     assert loop_metadata_prepare.index("zlc_stage_probe $vio $zlc_loop_start_addr_probe 2") < loop_metadata_prepare.index(
@@ -2373,7 +2377,7 @@ def test_vivado_pulse_streamer_session_prepare_uses_differential_edge_upload(tmp
     assert "zlc_stage_probe $vio $zlc_prog_addr_probe 1" not in loop_metadata_prepare
     assert "zlc_stage_probe $vio $zlc_prog_addr_probe 2" in loop_metadata_prepare
     assert "zlc_stage_probe $vio $zlc_prog_addr_probe 3" in loop_metadata_prepare
-    assert "wrote 3/4 edge rows initial_edge_batch=1 repeat_forever=1 loop_start=2 loop_end=30 loop_count=2" in loop_metadata_prepare
+    assert "wrote 3/4 edge rows reset_settle_ms=$zlc_prepare_reset_settle_ms repeat_forever=1 loop_start=2 loop_end=30 loop_count=2" in loop_metadata_prepare
 
 
 def test_sequencer_server_warm_starts_vivado_session_before_accepting_clients(tmp_path, monkeypatch):

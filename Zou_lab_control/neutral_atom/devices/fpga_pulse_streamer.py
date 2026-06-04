@@ -1114,6 +1114,12 @@ def _vivado_common_tcl(
         "    if {[regexp {([01])$} $value _ bit]} { return [expr {int($bit) != 0}] }",
         "    return 0",
         "}",
+        "proc zlc_probe_value_bool {value} {",
+        "    if {$value eq \"\"} { return 0 }",
+        "    if {[string is integer -strict $value]} { return [expr {int($value) != 0}] }",
+        "    if {[regexp {([01])$} $value _ bit]} { return [expr {int($bit) != 0}] }",
+        "    return 0",
+        "}",
         f"set zlc_reset_probe {{{probe_names.reset} probe_out0}}",
         f"set zlc_start_probe {{{probe_names.start} probe_out1}}",
         f"set zlc_prog_we_probe {{{probe_names.prog_we} probe_out2}}",
@@ -1168,8 +1174,6 @@ def _prepare_tcl(
     lines = [
         "set zlc_prog_we_toggle_value [zlc_output_probe_bool $vio $zlc_prog_we_probe]",
     ]
-    if first_write_index is not None:
-        lines.append("set zlc_prog_we_toggle_value [expr {$zlc_prog_we_toggle_value ? 0 : 1}]")
     lines.extend(
         [
         "set zlc_batch {}",
@@ -1180,6 +1184,9 @@ def _prepare_tcl(
         f"lappend zlc_batch [zlc_stage_probe $vio $zlc_loop_end_tick_probe {loop_end_tick}]",
         f"lappend zlc_batch [zlc_stage_probe $vio $zlc_loop_count_probe {loop_count}]",
         f"lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_count_probe {len(program.ticks)}]",
+        "zlc_commit_probes $zlc_batch",
+        "set zlc_prepare_reset_settle_ms [expr {max(1, int([env_or ZLC_PS_PREPARE_RESET_SETTLE_MS 5]))}]",
+        "after $zlc_prepare_reset_settle_ms",
         ]
     )
     if first_write_index is not None:
@@ -1187,13 +1194,15 @@ def _prepare_tcl(
         mask = int(program.masks[first_write_index])
         lines.extend(
             [
+                "set zlc_prog_we_toggle_value [expr {$zlc_prog_we_toggle_value ? 0 : 1}]",
+                "set zlc_batch {}",
                 f"lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_addr_probe {first_write_index}]",
                 f"lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_tick_probe {tick}]",
                 f"lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_mask_probe {mask}]",
                 "lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_we_probe $zlc_prog_we_toggle_value]",
+                "zlc_commit_probes $zlc_batch",
             ]
         )
-    lines.append("zlc_commit_probes $zlc_batch")
     for index in remaining_write_indices:
         tick = int(program.ticks[index])
         mask = int(program.masks[index])
@@ -1213,7 +1222,7 @@ def _prepare_tcl(
             "set zlc_batch {}",
             "lappend zlc_batch [zlc_stage_probe $vio $zlc_reset_probe 0]",
             "zlc_commit_probes $zlc_batch",
-            f"puts \"ZLC pulse-streamer prepared sequence {program.sequence_id} wrote {len(write_indices)}/{len(program.ticks)} edge rows initial_edge_batch={1 if first_write_index is not None else 0} repeat_forever={int(program.repeat_forever)} loop_start={loop_start_index} loop_end={loop_end_tick} loop_count={loop_count}\"",
+            f"puts \"ZLC pulse-streamer prepared sequence {program.sequence_id} wrote {len(write_indices)}/{len(program.ticks)} edge rows reset_settle_ms=$zlc_prepare_reset_settle_ms repeat_forever={int(program.repeat_forever)} loop_start={loop_start_index} loop_end={loop_end_tick} loop_count={loop_count}\"",
         ]
     )
     return lines
@@ -1226,10 +1235,22 @@ def _fire_tcl(*, probe_names: PulseStreamerProbeNames) -> list[str]:
         "}",
         "set zlc_batch {}",
         "lappend zlc_batch [zlc_stage_probe $vio $zlc_reset_probe 0]",
+        "zlc_commit_probes $zlc_batch",
+        "set zlc_fire_arm_delay_ms [expr {max(0, int([env_or ZLC_PS_FIRE_ARM_DELAY_MS 5]))}]",
+        "set zlc_fire_hold_ms [expr {max(1, int([env_or ZLC_PS_FIRE_HOLD_MS 5]))}]",
+        "if {$zlc_fire_arm_delay_ms > 0} { after $zlc_fire_arm_delay_ms }",
+        "set zlc_batch {}",
         "lappend zlc_batch [zlc_stage_probe $vio $zlc_start_probe 1]",
         "zlc_commit_probes $zlc_batch",
+        "after $zlc_fire_hold_ms",
         "zlc_set_probe $vio $zlc_start_probe 0",
-        "puts \"ZLC pulse-streamer start pulse sent\"",
+        "after 1",
+        "set zlc_running_value [zlc_read_probe $vio $zlc_running_probe]",
+        "set zlc_done_value [zlc_read_probe $vio $zlc_done_probe]",
+        "puts \"ZLC pulse-streamer start pulse sent running=$zlc_running_value done=$zlc_done_value arm_delay_ms=$zlc_fire_arm_delay_ms hold_ms=$zlc_fire_hold_ms\"",
+        "if {![zlc_probe_value_bool $zlc_running_value] && ![zlc_probe_value_bool $zlc_done_value]} {",
+        "    error \"ZLC pulse-streamer start was not observed by FPGA: running=$zlc_running_value done=$zlc_done_value. Check bitstream/probes/clock/reset and try a longer ZLC_PS_FIRE_ARM_DELAY_MS.\"",
+        "}",
     ]
 
 

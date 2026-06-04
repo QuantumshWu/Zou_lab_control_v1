@@ -842,10 +842,10 @@ def test_pulse_gui_constructs_40_channel_editor(monkeypatch, tmp_path):
         assert editor.names_panel.graphicsEffect() is not None
         assert editor.channel_panel.graphicsEffect() is not None
         assert first_card.graphicsEffect() is not None
-        assert editor.button_frame.graphicsEffect() is not None
-        assert editor.button_frame.metaObject().className() == "FluentFrame"
-        assert editor.channel_view.graphicsEffect() is not None
-        assert editor.channel_view.parent() is editor.button_frame
+        assert editor.button_frame.background.graphicsEffect() is not None
+        assert editor.button_frame.background.metaObject().className() == "FluentFrame"
+        assert editor.channel_view.background.graphicsEffect() is not None
+        assert editor.channel_view.parent() is editor.button_frame.content
         assert editor.names_panel_layout.contentsMargins().top() == editor.drag_container.layout_main.contentsMargins().top()
         assert editor.names_panel_layout.contentsMargins().top() > 0
         margins = editor.edit_tab.layout().contentsMargins()

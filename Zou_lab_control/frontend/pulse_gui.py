@@ -185,6 +185,52 @@ def _channel_row_height(channel_count: int) -> int:
     return _px(26 if channel_count > 16 else ROW_HEIGHT, minimum=22)
 
 
+class _FluentLayeredSurface(QtWidgets.QWidget):
+    """Keep Fluent shadow/background separate from interactive child widgets."""
+
+    def __init__(self, background: QtWidgets.QWidget, parent=None):
+        super().__init__(parent)
+        self._pad = _shadow_pad()
+        self.background = background
+        self.background.setParent(self)
+        self.background.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+        self.background.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        self.content = QtWidgets.QWidget(self)
+        self.content.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+        self.content.setAutoFillBackground(False)
+        self.content.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+        self.content.raise_()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt API name
+        super().resizeEvent(event)
+        pad = self._pad
+        rect = self.rect().adjusted(pad, pad, -pad, -pad)
+        if rect.width() < 1 or rect.height() < 1:
+            rect = self.rect()
+        self.background.setGeometry(rect)
+        self.content.setGeometry(rect)
+        self.content.raise_()
+
+    def sizeHint(self) -> QtCore.QSize:  # noqa: N802 - Qt API name
+        size = self.content.sizeHint().expandedTo(self.background.sizeHint())
+        return QtCore.QSize(size.width() + 2 * self._pad, size.height() + 2 * self._pad)
+
+    def minimumSizeHint(self) -> QtCore.QSize:  # noqa: N802 - Qt API name
+        size = self.content.minimumSizeHint().expandedTo(self.background.minimumSizeHint())
+        return QtCore.QSize(size.width() + 2 * self._pad, size.height() + 2 * self._pad)
+
+
+class _FluentLayeredFrame(_FluentLayeredSurface):
+    def __init__(self, parent=None):
+        super().__init__(FluentFrame(), parent=parent)
+
+
+class _FluentLayeredGroupBox(_FluentLayeredSurface):
+    def __init__(self, title: str = "", parent=None):
+        super().__init__(FluentGroupBox(title), parent=parent)
+
+
 class PulseStateUIManager(QtCore.QObject):
     class RunState:
         INIT = "INIT"
@@ -887,9 +933,9 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self.channel_panel_layout.setSpacing(0)
         dataset.addWidget(self.channel_panel_holder)
 
-        self.left_panel_stub = FluentFrame()
+        self.left_panel_stub = _FluentLayeredFrame()
         self.left_panel_stub.setFixedWidth(_px(82, minimum=68))
-        stub_layout = QtWidgets.QVBoxLayout(self.left_panel_stub)
+        stub_layout = QtWidgets.QVBoxLayout(self.left_panel_stub.content)
         stub_layout.setContentsMargins(_px(6), _px(8), _px(6), _px(8))
         stub_layout.setSpacing(_px(6, minimum=4))
         stub_label = FluentLabel("Name\nDelay")
@@ -930,8 +976,8 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         inner_hbar.valueChanged.connect(self.timeline_hbar.setValue)
         self.timeline_hbar.valueChanged.connect(inner_hbar.setValue)
 
-        self.button_frame = FluentFrame(shadow=False)
-        bottom = QtWidgets.QHBoxLayout(self.button_frame)
+        self.button_frame = _FluentLayeredFrame()
+        bottom = QtWidgets.QHBoxLayout(self.button_frame.content)
         bottom.setContentsMargins(shadow_pad, shadow_pad, shadow_pad, shadow_pad)
         bottom.setSpacing(_px(6, minimum=4))
 
@@ -964,15 +1010,16 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             button_layout.setColumnStretch(col, 1)
         bottom.addWidget(button_area, 1)
 
-        self.channel_view = FluentGroupBox("Channel View")
+        self.channel_view = _FluentLayeredGroupBox("Channel View")
         panel_margin = _px(8)
         panel_gap = _px(6, minimum=4)
         channel_control_w = _px(124, minimum=98)
         channel_control_h = _px(46, minimum=38)
+        group_title_h = _px(32)
         panel_width = panel_margin * 2 + panel_gap + channel_control_w * 2
         self.channel_view.setFixedWidth(panel_width)
-        view_layout = QtWidgets.QGridLayout(self.channel_view)
-        view_layout.setContentsMargins(panel_margin, panel_margin, panel_margin, panel_margin)
+        view_layout = QtWidgets.QGridLayout(self.channel_view.content)
+        view_layout.setContentsMargins(panel_margin, panel_margin + group_title_h, panel_margin, panel_margin)
         view_layout.setHorizontalSpacing(panel_gap)
         view_layout.setVerticalSpacing(_px(8, minimum=5))
         self.add_channel_combo = FluentComboBox()
@@ -1006,9 +1053,9 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         preview_layout.setContentsMargins(tab_margin, tab_margin, tab_margin, tab_margin)
         preview_layout.setSpacing(_px(8, minimum=5))
 
-        preview_controls = FluentFrame()
+        preview_controls = _FluentLayeredFrame()
         preview_controls.setFixedHeight(_px(48, minimum=38))
-        preview_row = QtWidgets.QHBoxLayout(preview_controls)
+        preview_row = QtWidgets.QHBoxLayout(preview_controls.content)
         preview_row.setContentsMargins(_px(12), _px(6), _px(12), _px(6))
         preview_row.setSpacing(_px(10, minimum=6))
         self.preview_include_off = FluentSwitch("Show always-off")

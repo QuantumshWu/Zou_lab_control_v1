@@ -396,6 +396,7 @@ class SequencerService:
                 "clock_hz": self.clock_hz,
                 "trigger_channels": list(self.trigger_channels),
                 "state": self.state,
+                "cache_prepared": self.cache_prepared,
                 "prepared_program": None if self.prepared_program is None else self.prepared_program.to_dict(),
                 "history_length": len(self.history),
             }
