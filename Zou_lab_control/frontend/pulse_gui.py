@@ -1809,7 +1809,7 @@ def _fit_window_to_available_screen(
     editor: QtWidgets.QWidget,
     app: QtWidgets.QApplication,
 ) -> None:
-    screen = window.screen() or app.primaryScreen()
+    screen = _qt_screen_for_window(window, app)
     if screen is None:
         window.setFixedSize(window.size())
         return
@@ -1838,6 +1838,25 @@ def _fit_window_to_available_screen(
     frame = window.frameGeometry()
     frame.moveCenter(available.center())
     window.move(frame.topLeft())
+
+
+def _qt_screen_for_window(
+    window: QtWidgets.QWidget,
+    app: QtWidgets.QApplication,
+):
+    handle = window.windowHandle() if hasattr(window, "windowHandle") else None
+    if handle is not None and hasattr(handle, "screen"):
+        screen = handle.screen()
+        if screen is not None:
+            return screen
+    if hasattr(window, "screen"):
+        try:
+            screen = window.screen()
+        except Exception:
+            screen = None
+        if screen is not None:
+            return screen
+    return app.primaryScreen()
 
 
 __all__ = ["PulseSequenceEditor", "show_pulse_gui", "ensure_qt_app"]
