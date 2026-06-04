@@ -936,7 +936,6 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         bottom.setSpacing(_px(6, minimum=4))
 
         button_area = QtWidgets.QWidget()
-        button_area.setStyleSheet("background: transparent;")
         button_layout = QtWidgets.QGridLayout(button_area)
         button_layout.setContentsMargins(0, 0, 0, 0)
         button_layout.setSpacing(_px(8, minimum=5))

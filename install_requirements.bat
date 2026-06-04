@@ -81,15 +81,30 @@ if errorlevel 1 (
 echo.
 echo Installing Python packages from requirements.txt into this kernel...
 %PYTHON_CMD% -m pip install --upgrade pip
-if errorlevel 1 goto install_failed
+if errorlevel 1 (
+    echo.
+    echo Warning: pip self-upgrade failed. This is common on Windows when the
+    echo interpreter is installed system-wide or another Python process is open.
+    echo Continuing with the existing pip.
+)
 
 %PYTHON_CMD% -m pip install -r "%~dp0requirements.txt"
-if errorlevel 1 goto install_failed
+if errorlevel 1 (
+    echo.
+    echo Normal install failed. Retrying with --user to avoid Windows permission error 5...
+    %PYTHON_CMD% -m pip install --user -r "%~dp0requirements.txt"
+    if errorlevel 1 goto install_failed
+)
 
 echo.
 echo Installing this repository in editable mode...
 %PYTHON_CMD% -m pip install -e "%~dp0."
-if errorlevel 1 goto install_failed
+if errorlevel 1 (
+    echo.
+    echo Normal editable install failed. Retrying with --user...
+    %PYTHON_CMD% -m pip install --user -e "%~dp0."
+    if errorlevel 1 goto install_failed
+)
 
 echo.
 echo Remembering this Python for pulse_gui.bat...
