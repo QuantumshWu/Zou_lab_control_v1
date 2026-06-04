@@ -930,7 +930,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         inner_hbar.valueChanged.connect(self.timeline_hbar.setValue)
         self.timeline_hbar.valueChanged.connect(inner_hbar.setValue)
 
-        self.button_frame = FluentFrame()
+        self.button_frame = FluentFrame(shadow=False)
         bottom = QtWidgets.QHBoxLayout(self.button_frame)
         bottom.setContentsMargins(shadow_pad, shadow_pad, shadow_pad, shadow_pad)
         bottom.setSpacing(_px(6, minimum=4))
