@@ -1795,7 +1795,9 @@ def show_pulse_gui(
     )
     window = FluentWindow(widget=editor, title="PulseGUI@Zou lab", hide_on_close=False)
     editor._set_gui_title(editor.windowTitle())
-    _fit_window_to_available_screen(window, editor, app)
+    window.adjustSize()
+    window.setFixedSize(window.size())
+    _center_window_on_primary_screen(window, app)
     window.show()
     editor._zlc_window = window
     if not hasattr(app, "_zlc_pulse_windows"):
@@ -1804,59 +1806,14 @@ def show_pulse_gui(
     return editor
 
 
-def _fit_window_to_available_screen(
-    window: QtWidgets.QWidget,
-    editor: QtWidgets.QWidget,
-    app: QtWidgets.QApplication,
-) -> None:
-    screen = _qt_screen_for_window(window, app)
+def _center_window_on_primary_screen(window: QtWidgets.QWidget, app: QtWidgets.QApplication) -> None:
+    screen = app.primaryScreen()
     if screen is None:
-        window.setFixedSize(window.size())
         return
-
     available = screen.availableGeometry()
-    max_w = max(360, available.width() - _px(28, minimum=20))
-    max_h = max(320, available.height() - _px(28, minimum=20))
-
-    window.adjustSize()
-    extra_h = max(0, window.height() - editor.height())
-    extra_w = max(0, window.width() - editor.width())
-    if window.width() > max_w or window.height() > max_h:
-        editor_max_w = max(240, max_w - extra_w)
-        editor_max_h = max(240, max_h - extra_h)
-        min_editor_w = min(_px(620, minimum=560), editor_max_w)
-        min_editor_h = min(_px(430, minimum=380), editor_max_h)
-        editor.setFixedSize(
-            max(min_editor_w, min(editor.width(), editor_max_w)),
-            max(min_editor_h, min(editor.height(), editor_max_h)),
-        )
-        window.adjustSize()
-
-    window.resize(min(window.width(), max_w), min(window.height(), max_h))
-    window.setFixedSize(window.size())
-
     frame = window.frameGeometry()
     frame.moveCenter(available.center())
     window.move(frame.topLeft())
-
-
-def _qt_screen_for_window(
-    window: QtWidgets.QWidget,
-    app: QtWidgets.QApplication,
-):
-    handle = window.windowHandle() if hasattr(window, "windowHandle") else None
-    if handle is not None and hasattr(handle, "screen"):
-        screen = handle.screen()
-        if screen is not None:
-            return screen
-    if hasattr(window, "screen"):
-        try:
-            screen = window.screen()
-        except Exception:
-            screen = None
-        if screen is not None:
-            return screen
-    return app.primaryScreen()
 
 
 __all__ = ["PulseSequenceEditor", "show_pulse_gui", "ensure_qt_app"]
