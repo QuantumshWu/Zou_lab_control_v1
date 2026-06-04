@@ -1083,9 +1083,17 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             return QtCore.QSize(_px(1280, minimum=960), _px(760, minimum=620))
         available = screen.availableGeometry()
         titlebar_allowance = _px(36, minimum=28)
+        margin_w = _px(40, minimum=28)
+        margin_h = _px(48, minimum=32)
+        max_w = max(360, available.width() - margin_w)
+        max_h = max(320, available.height() - titlebar_allowance - margin_h)
+        min_w = min(_px(980, minimum=820), max_w)
+        min_h = min(_px(640, minimum=560), max_h)
+        desired_w = min(max_w, int(available.width() * self.window_ratio))
+        desired_h = min(max_h, int(available.height() * self.window_ratio) - titlebar_allowance)
         return QtCore.QSize(
-            max(_px(980, minimum=820), int(available.width() * self.window_ratio)),
-            max(_px(640, minimum=560), int(available.height() * self.window_ratio) - titlebar_allowance),
+            max(min_w, desired_w),
+            max(min_h, desired_h),
         )
 
     def _set_gui_title(self, title: str) -> None:
@@ -1787,13 +1795,49 @@ def show_pulse_gui(
     )
     window = FluentWindow(widget=editor, title="PulseGUI@Zou lab", hide_on_close=False)
     editor._set_gui_title(editor.windowTitle())
-    window.setFixedSize(window.size())
+    _fit_window_to_available_screen(window, editor, app)
     window.show()
     editor._zlc_window = window
     if not hasattr(app, "_zlc_pulse_windows"):
         app._zlc_pulse_windows = []
     app._zlc_pulse_windows.extend([window, editor])
     return editor
+
+
+def _fit_window_to_available_screen(
+    window: QtWidgets.QWidget,
+    editor: QtWidgets.QWidget,
+    app: QtWidgets.QApplication,
+) -> None:
+    screen = window.screen() or app.primaryScreen()
+    if screen is None:
+        window.setFixedSize(window.size())
+        return
+
+    available = screen.availableGeometry()
+    max_w = max(360, available.width() - _px(28, minimum=20))
+    max_h = max(320, available.height() - _px(28, minimum=20))
+
+    window.adjustSize()
+    extra_h = max(0, window.height() - editor.height())
+    extra_w = max(0, window.width() - editor.width())
+    if window.width() > max_w or window.height() > max_h:
+        editor_max_w = max(240, max_w - extra_w)
+        editor_max_h = max(240, max_h - extra_h)
+        min_editor_w = min(_px(620, minimum=560), editor_max_w)
+        min_editor_h = min(_px(430, minimum=380), editor_max_h)
+        editor.setFixedSize(
+            max(min_editor_w, min(editor.width(), editor_max_w)),
+            max(min_editor_h, min(editor.height(), editor_max_h)),
+        )
+        window.adjustSize()
+
+    window.resize(min(window.width(), max_w), min(window.height(), max_h))
+    window.setFixedSize(window.size())
+
+    frame = window.frameGeometry()
+    frame.moveCenter(available.center())
+    window.move(frame.topLeft())
 
 
 __all__ = ["PulseSequenceEditor", "show_pulse_gui", "ensure_qt_app"]

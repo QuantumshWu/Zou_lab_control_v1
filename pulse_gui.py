@@ -71,8 +71,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--clock-hz", type=_positive_float, default=100_000_000.0, help="Sequencer clock in Hz.")
     parser.add_argument("--trigger-channels", nargs="+", help="Hardware channel names counted as camera triggers.")
-    parser.add_argument("--scale", type=_positive_float, default=0.82, help="GUI scale. Use 1.0 for full size.")
-    parser.add_argument("--window-ratio", type=_positive_float, default=0.90, help="Fixed GUI window size as a fraction of the screen.")
+    parser.add_argument(
+        "--scale",
+        type=_positive_float,
+        default=None,
+        help="GUI scale. Omit for automatic screen/DPI fitting; use 1.0 for full size.",
+    )
+    parser.add_argument("--window-ratio", type=_positive_float, default=0.90, help="GUI window size as a fraction of the available screen.")
     parser.add_argument("--state", type=Path, help="Load a PulseTableState JSON file.")
     parser.add_argument(
         "--remote-host",
