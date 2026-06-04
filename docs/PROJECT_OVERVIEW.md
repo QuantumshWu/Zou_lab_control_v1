@@ -46,6 +46,29 @@ Zou_lab_control/
     views/                  neutral-atom plotting adapters
 ```
 
+## Standalone Entry Points
+
+The repo root keeps only user-facing launchers that are not tied to one
+hardware board:
+
+- `install_requirements.bat`: install the editable package and record the
+  Python path in `.zlc_python_path`.
+- `pulse_gui.bat`: open the pulse GUI as a frontend, either local or remote.
+- `start_tutorials_jupyter_lab.bat`: open the checked-in tutorials.
+
+The FPGA side is intentionally grouped under `fpga/`:
+
+- `fpga/build_and_program.bat`: build/check/diagnose/program the 40-channel
+  bitstream.
+- `fpga/run_server.bat`: start the 40-channel sequencer server.
+- `fpga/pulse_streamer/`: HDL, XDC, Vivado Tcl, and the design note.
+
+Generated Vivado projects, `.runs`, `.cache`, `.hw`, `.sim`, `.ltx`, journals,
+and server state live under `fpga\build` by default.  The batch files print
+`ZLC build root` and `ZLC project dir`; the default real project is
+`fpga\build\p40`, and that printed `ZLC project dir` is the source of truth for
+`.xpr/.bit/.ltx`.
+
 ## Layer Responsibilities
 
 - Camera devices acquire images and expose configuration. They do not know site maps, thresholds, or simulator truth.
@@ -84,11 +107,16 @@ Historical reference code lives in `references/` and is intentionally ignored by
 
 ## Verification Checklist
 
-Before handing off changes:
+Before handing off changes, prefer the scoped matrix in `tests/README.md`.  Run
+only the checks that cover the files and behavior you touched, then broaden the
+sweep when the change crosses subsystem boundaries.
+
+Common targeted checks:
 
 ```powershell
-pytest -q
-python -m py_compile (rg --files -g "*.py" Zou_lab_control tests)
+pytest -q tests\test_neutral_atom_lightweight.py -k "repo_vivado_entrypoint_contract or dry_run_uses_short_project_artifacts"
+pytest -q tests\test_frontend_smoke.py -k "render_tex_pdf or pulse_gui"
+python -m py_compile (rg --files -g "*.py" Zou_lab_control tests fpga)
 git diff --check
 ```
 
@@ -98,3 +126,6 @@ For notebook/template changes, also validate notebook JSON:
 python -m json.tool tutorials\neutral_atom_fpga_server.ipynb > $null
 python -m json.tool tutorials\neutral_atom_hardware_quickstart.ipynb > $null
 ```
+
+Use full `pytest -q` for broad handoff, release-like sweeps, or changes that
+touch frontend, neutral-atom runtime, FPGA scripts, and docs at the same time.

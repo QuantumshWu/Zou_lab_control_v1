@@ -1,6 +1,8 @@
 # Core runtime
 ipython
+ipykernel
 matplotlib
+nbconvert
 nbformat
 numpy
 rpyc
@@ -11,7 +13,6 @@ PyQt5
 PyQt-Frameless-Window
 
 # Jupyter notebook/widget plotting
-ipykernel
 ipympl
 ipywidgets
 jupyterlab

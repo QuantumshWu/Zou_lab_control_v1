@@ -44,7 +44,7 @@
     "ch38",
     "ch39"
   ],
-  "x_ns": 0.0,
+  "x_ns": 19980000.0,
   "time_step_ns": 10.0,
   "periods": [
     {
@@ -189,8 +189,8 @@
       ]
     },
     {
-      "duration": 19.98,
-      "unit": "ms",
+      "duration": "x",
+      "unit": "str (ns)",
       "name": "camera_exposure",
       "states": [
         1,
@@ -293,7 +293,43 @@
     "ch00": "trap",
     "ch01": "cooling",
     "ch02": "probe",
-    "ch03": "qcm_trigger"
+    "ch03": "qcm_trigger",
+    "ch04": "cooling_pgc",
+    "ch05": "repump",
+    "ch06": "emCCD",
+    "ch07": "UV",
+    "ch08": "address",
+    "ch09": "microwave",
+    "ch10": "state_pre",
+    "ch11": "coil",
+    "ch12": "grey_cooling",
+    "ch13": "pushout",
+    "ch14": "cooling_shutter",
+    "ch15": "repump_shutter",
+    "ch16": "probe_shutter",
+    "ch17": "bias",
+    "ch18": "da_clk0",
+    "ch19": "da_clk1",
+    "ch20": "da_clk2",
+    "ch21": "da_clk3",
+    "ch22": "da_dipole[0]",
+    "ch23": "da_dipole[1]",
+    "ch24": "da_dipole[2]",
+    "ch25": "da_dipole[3]",
+    "ch26": "da_dipole[4]",
+    "ch27": "da_dipole[5]",
+    "ch28": "da_dipole[6]",
+    "ch29": "da_dipole[7]",
+    "ch30": "da_dipole[8]",
+    "ch31": "da_dipole[9]",
+    "ch32": "da_bias_x[0]",
+    "ch33": "da_bias_x[1]",
+    "ch34": "da_bias_x[2]",
+    "ch35": "da_bias_x[3]",
+    "ch36": "da_bias_x[4]",
+    "ch37": "da_bias_x[5]",
+    "ch38": "da_bias_x[6]",
+    "ch39": "da_bias_x[7]"
   },
   "delays": {
     "ch00": 0,
@@ -381,5 +417,6 @@
   },
   "repeat_start": null,
   "repeat_end": null,
-  "repeat_count": 1
+  "repeat_count": 1,
+  "repeat_forever": true
 }

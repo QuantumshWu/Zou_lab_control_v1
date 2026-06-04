@@ -301,6 +301,10 @@ def imaging_sequence(
     load: bool = False,
     cooling: float = 2e-3,
     name: str = "imaging",
+    trap_channel: str = "trap",
+    cooling_channel: str = "cooling",
+    probe_channel: str = "probe",
+    trigger_channel: str = "qcm_trigger",
 ) -> PulseSequence:
     """Build the minimal load/probe/qCMOS-trigger sequence used in notebooks."""
 
@@ -315,11 +319,16 @@ def imaging_sequence(
 
     offset = cooling + pre_trigger if load else pre_trigger
     total = offset + exposure + trigger_width
-    seq = PulseSequence(name=name).pulse("trap", 0.0, total, name="trap_hold")
+    trap_channel = channel_name(trap_channel)
+    cooling_channel = channel_name(cooling_channel)
+    probe_channel = channel_name(probe_channel)
+    trigger_channel = channel_name(trigger_channel)
+
+    seq = PulseSequence(name=name).pulse(trap_channel, 0.0, total, name="trap_hold")
     if load and cooling > 0:
-        seq = seq.pulse("cooling", 0.0, cooling, name="load")
-    seq = seq.pulse("probe", offset, exposure, name="probe")
-    seq = seq.pulse("qcm_trigger", offset, trigger_width, name="camera_trigger")
+        seq = seq.pulse(cooling_channel, 0.0, cooling, name="load")
+    seq = seq.pulse(probe_channel, offset, exposure, name="probe")
+    seq = seq.pulse(trigger_channel, offset, trigger_width, name="camera_trigger")
     return seq
 
 
@@ -373,8 +382,17 @@ def exposure_from_sequence(sequence: PulseSequence | None, *, default: float, ch
     default = positive_float(default, "default exposure")
     if sequence is None:
         return default
+    if not hasattr(sequence, "base_pulses"):
+        return default
     channel = channel_name(channel)
-    durations = [int(round(pulse.duration * 1e15)) for pulse in sequence.base_pulses() if pulse.channel == channel and pulse.value]
+    probe_candidates = [channel]
+    if channel == "probe":
+        probe_candidates.append("ch02")
+    durations = [
+        int(round(pulse.duration * 1e15))
+        for pulse in sequence.base_pulses()
+        if pulse.channel in probe_candidates and pulse.value
+    ]
     if not durations:
         return default
     unique = sorted(set(durations))

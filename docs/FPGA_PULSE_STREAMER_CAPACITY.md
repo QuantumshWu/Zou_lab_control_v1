@@ -57,9 +57,25 @@ active_count          // number of uploaded edges
 ```
 
 During `prepare`, the host writes the table into `tick_mem` and `mask_mem`.
-During `fire`, the host toggles `start`. The FPGA then runs by comparing
+During `fire`, the host sends a low-high-low `start` pulse. The FPGA then runs by comparing
 `time_count` with `tick_mem[edge_index]`; when they match, it copies
 `mask_mem[edge_index]` into the output register and advances to the next edge.
+The checked-in runtime core also caches the first edge, loop-start edge, and
+final tick during upload.  That keeps the run path to one edge-table read
+address instead of several independent reads from `tick_mem/mask_mem`.
+
+For finite GUI repeat brackets, `loop_end_tick` is only the restart boundary
+while repeated loop cycles remain. The final uploaded row remains the table
+`final_tick`, so post-loop idle/cleanup periods still occur before a
+`repeat_forever` table restart.
+
+This also explains a common oscilloscope observation: if `repeat_forever=True`
+and a finite internal bracket is used, any high channel in period 0 will appear
+again once per full-table restart after the finite bracket count has finished.
+That table-boundary high is detectable in Python with
+`PulseTableState.repeat_forever_boundary_active_channels()`, and the pulse GUI
+shows it with the full-table restart interval in the summary line, for example
+`table restart high every 1.2 us: trap`.
 
 The shot-level timing is therefore clocked by the FPGA. Network, RPyC, Python,
 Vivado, and JTAG are only used before the shot starts, or to send the start
@@ -87,21 +103,30 @@ For 40 channels, each edge is approximately 72 bits.
 | 4096 | 294,912 | 36 KiB | 4,608 |
 | 16384 | 1,179,648 | 144 KiB | 18,432 |
 
-The first-light HDL explicitly marks `tick_mem` and `mask_mem` as distributed
-RAM because the core uses simple asynchronous table reads. This keeps the
-control logic straightforward, but the approximate LUTRAM column is only a
-lower-bound bit-packing estimate; Vivado utilization also includes mapping
-overhead, VIO/debug logic, routing, and normal control registers.
+The HDL currently marks `tick_mem` and `mask_mem` as distributed RAM because the
+run path uses simple asynchronous reads. Earlier 40-channel experiments showed
+excessive LUT/FF use when the run logic read `tick_mem/mask_mem` from several
+addresses in the same cycle. The current core avoids that multi-read-port shape:
+metadata such as first edge, loop-start edge, and final tick is latched during
+upload, so the active shot reads only the current `edge_index` row. That makes a
+1024-row 40-channel operational profile practical to build and reason about,
+while keeping repeat brackets compact.
 
-The checked-in 4-channel first-light profile keeps 1024 edges. The checked-in
-40-channel full-channel profile uses 128 edges by default, because local Vivado
-2019.1 synthesis showed that the 40-channel/1024-edge distributed-memory version
-over-uses the xc7a35t logic budget. This is still enough for the camera-imaging
-preset and many compact pulse tables because API/GUI repeats are uploaded as
-loop metadata instead of expanded rows. If the experiment needs hundreds or
-thousands of unique non-repeating edges on all 40 channels, move the edge table
-to a BRAM-friendly synchronous-read pipeline and replace Vivado/VIO upload with
-AXI, JTAG-to-AXI, UART/SPI, Ethernet, or a FIFO/BRAM write port.
+If the experiment later needs several thousand unique non-repeating edges on all
+40 channels, the next architectural step is a BRAM-friendly synchronous-read
+pipeline and a faster upload transport such as AXI, JTAG-to-AXI, UART/SPI,
+Ethernet, or a FIFO/BRAM write port.
+
+Validation evidence from the checked-in 40-channel top:
+
+```text
+Command: fpga\build_and_program.bat --check
+Vivado:  2019.1
+Part:    xc7a35tfgg484-2
+Profile: CHANNEL_COUNT=40, MAX_EDGES=1024, TICK_WIDTH=32
+Result:  synth_design completed with 0 errors / 0 critical warnings
+Util:    LUT 2406/20800 (11.57%), FF 1127/41600 (2.71%)
+```
 
 At 100 MHz, a 32-bit tick counter covers about 42.9 seconds. One tick is 10 ns.
 
@@ -123,19 +148,20 @@ increasing and fit in `TICK_WIDTH`.
 
 ### FPGA Execution Latency
 
-The core samples `start` through a small registered transition detector. During
-`reset=1`, `prog_we` is a level write-enable for the upload RAM: each VIO commit
-that changes `prog_addr/prog_tick/prog_mask` while `prog_we=1` rewrites the
-selected table entry. Once a start transition is visible at the module input,
-the core needs roughly:
+The core samples the VIO-facing `reset`, `start`, and `prog_we` controls through
+two-stage synchronizers before the runtime state machine uses them. During
+`reset=1`, `prog_we` is then treated as a synchronized toggle event for the
+upload RAM: each VIO commit that stages `prog_addr/prog_tick/prog_mask` and flips
+`prog_we` writes exactly one selected table entry. Once a start transition is
+visible at the module input, the core needs roughly:
 
 ```text
-1 clock: capture start into start_sync
+2 clocks: synchronize start into the FPGA clock domain
 1 clock: detect start_event and enter running state
 1 clock: apply the first mask if tick_mem[0] == 0
 ```
 
-At 100 MHz, this is about 30 ns from the start input becoming visible to the
+At 100 MHz, this is about 40 ns from the start input becoming visible to the
 first zero-tick output update. This is a fixed pipeline offset. Relative timing
 between pulse edges remains on the FPGA tick grid.
 
@@ -157,20 +183,30 @@ For each edge, the generated Tcl currently stages:
 set addr
 set tick
 set mask
-prog_we = 1
+toggle prog_we
 ```
 
-The generated Tcl batches `addr/tick/mask/prog_we=1` into one VIO commit per
-edge, then commits `prog_we=0` and releases reset at the end. The prepare path
-therefore costs roughly `edge_count + constant` VIO commits. This is much better
-than one commit per probe or a high/low write-enable pair for every edge, and it
-is faster than launching a fresh Vivado batch process for every action. The
-remaining latency is still dominated by VIO/JTAG commits. It happens before the
-qCMOS is armed, so it does not add shot-internal jitter, but it can make large
-scans slow.
+The generated Tcl batches `addr/tick/mask/prog_we` into one VIO commit per
+edge. `prog_we` is a toggle, not a level, so each synchronized transition writes
+exactly one row and there is no extra high/low write-enable pair per edge. The
+Vivado Tcl layer also caches matched VIO probe objects after the first lookup in
+the persistent session, so repeated `zlc_stage_probe(...)` calls do not keep
+searching the full probe list. The first prepare therefore costs roughly
+`edge_count + constant` VIO commits.
 
-The `fire` path toggles `zlc_start` in one VIO commit after a program has been
-prepared. The absolute time from the Python call to the FPGA start transition is
+After one successful prepare, `VivadoPulseStreamerSession` keeps the last
+uploaded program in Python and uses a differential prepare for the next program
+with the same channel order and clock. It rewrites rows whose `tick` or `mask`
+changed, and always rewrites the shadow-critical rows `0`, `loop_start_index`,
+and the final row so the HDL's first-edge, loop-start, and final-tick shadows
+stay correct. A readout scan that only changes `pulse.x` can therefore avoid a
+full edge-table upload when only a few ticks change. This is faster than
+launching a fresh Vivado batch process for every action, but the remaining
+latency is still dominated by VIO/JTAG commits. It happens before the qCMOS is
+armed, so it does not add shot-internal jitter, but it can make large scans slow.
+
+The `fire` path sends a `zlc_start` rising-edge pulse after a program has been
+prepared. The absolute time from the Python call to that FPGA start transition is
 host/Vivado/JTAG dependent, but after that transition reaches the FPGA, the
 pulse timing is deterministic.
 
@@ -201,16 +237,16 @@ Start synthesis with:
 
 ```text
 CHANNEL_COUNT = 40
-MAX_EDGES = 128
+MAX_EDGES = 1024
 TICK_WIDTH = 32
 CLOCK_HZ = 100_000_000
 ```
 
 Then inspect Vivado utilization and timing. If the experiment sequences exceed
-128 unique uploaded edges, first check whether the sequence can use a repeat
+1024 unique uploaded edges, first check whether the sequence can use a repeat
 bracket or `repeat_forever`. If it truly needs a larger unique table, redesign
-the memory path around BRAM before attempting larger 40-channel bitstreams on an
-xc7a35t.
+the memory path around BRAM before attempting much larger 40-channel bitstreams
+on an xc7a35t.
 
 The 40-channel bitstream needs a new top-level wrapper and XDC pin map. The
 Python backend already supports `ZLC_PS_CHANNEL_COUNT` and generated HDL with
@@ -223,8 +259,9 @@ bitstream, then use `fpga/run_server.bat` to start a server whose hardware
 channels are always `ch00 ... ch39`. A GUI or API pulse may configure only a
 subset of those channels; the compiler fills every missing channel with an off
 bit before uploading the 40-bit masks. The real build uses
-`zlc_pulse_streamer_top_40ch.v` after completing
-`zlc_pulse_streamer_40ch.xdc` from the template, or after setting
+`zlc_pulse_streamer_top_40ch.v` with the checked-in
+`zlc_pulse_streamer_40ch.xdc`, which is derived from the historical
+`address_switch` pin map. For a different board or cable map, set
 `ZLC_PS_40CH_XDC` to a verified package-pin map.
 
 ## External References

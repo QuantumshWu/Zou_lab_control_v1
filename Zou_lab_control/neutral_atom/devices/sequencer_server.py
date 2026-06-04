@@ -122,6 +122,7 @@ def run_server(
     safe_state_command: str | None = None,
     command_timeout: float | None = None,
     backend: str = "command",
+    warm_start: bool = True,
 ):
     """Start the RPyC sequencer service used by ``RemoteSequencer``."""
 
@@ -130,6 +131,9 @@ def run_server(
         from .fpga_pulse_streamer import VivadoPulseStreamerSession
 
         hardware_backend = VivadoPulseStreamerSession(state_dir=state_dir)
+        if warm_start:
+            print("Starting persistent Vivado session before accepting clients...")
+            hardware_backend.start()
         prepare_callback = hardware_backend.prepare
         fire_callback = hardware_backend.fire
         wait_done_callback = hardware_backend.wait_done
@@ -238,7 +242,7 @@ def build_arg_parser() -> ArgumentParser:
     parser = ArgumentParser(description="Start the Zou_lab_control neutral-atom sequencer service on the FPGA/Vivado computer.")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=18861)
-    parser.add_argument("--channels", nargs="+", required=True, help="Sequencer channels, e.g. trap cooling probe qcm_trigger.")
+    parser.add_argument("--channels", nargs="+", required=True, help="Sequencer channels, e.g. ch00 ch01 ch02 ch03 ... ch39.")
     parser.add_argument("--trigger-channels", nargs="+", default=["qcm_trigger"])
     parser.add_argument("--clock-hz", type=float, default=250e6)
     parser.add_argument("--state-dir", default="zlc_sequencer_state")
@@ -252,6 +256,11 @@ def build_arg_parser() -> ArgumentParser:
         default="command",
         choices=["command", "vivado-session"],
         help="Hardware backend. vivado-session keeps one Vivado Tcl process alive for lower runtime latency.",
+    )
+    parser.add_argument(
+        "--no-warm-start",
+        action="store_true",
+        help="For vivado-session, delay Vivado startup until the first prepare call.",
     )
     return parser
 
@@ -271,6 +280,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         safe_state_command=args.safe_state_command,
         command_timeout=args.command_timeout,
         backend=args.backend,
+        warm_start=not args.no_warm_start,
     )
     return 0
 

@@ -68,6 +68,261 @@ def test_frontend_2d_and_histogram():
     assert "fit cut=" in hist.stats_text.get_text()
 
 
+def test_render_latex_pdf_clean_copies_only_final_pdf(tmp_path, monkeypatch):
+    import Zou_lab_control.frontend.notes as notes
+
+    calls = []
+
+    class Result:
+        returncode = 0
+        stdout = "fake xelatex ok"
+
+    def fake_run(cmd, cwd, text, stdout, stderr):
+        calls.append((cmd, Path(cwd)))
+        tex_name = Path(cmd[-1])
+        (Path(cwd) / tex_name.with_suffix(".pdf").name).write_bytes(b"%PDF fake\n")
+        (Path(cwd) / tex_name.with_suffix(".aux").name).write_text("aux", encoding="utf-8")
+        return Result()
+
+    monkeypatch.setattr(notes.subprocess, "run", fake_run)
+    out = tmp_path / "manual.pdf"
+
+    pdf = zf.render_latex_pdf_clean(
+        r"\documentclass{article}\begin{document}hello\end{document}",
+        out,
+        xelatex="fake-xelatex",
+        runs=1,
+    )
+
+    assert pdf == out.resolve()
+    assert out.read_bytes().startswith(b"%PDF")
+    assert calls and calls[0][0][0] == "fake-xelatex"
+    assert not (tmp_path / "manual.aux").exists()
+    assert not (tmp_path / "manual.build.log").exists()
+
+    out2 = tmp_path / "manual2.pdf"
+    pdf2 = zf.render_tex_pdf(
+        r"\documentclass{article}\begin{document}hello again\end{document}",
+        out2,
+        xelatex="fake-xelatex",
+        runs=1,
+    )
+    assert pdf2 == out2.resolve()
+    assert out2.read_bytes().startswith(b"%PDF")
+    assert not (tmp_path / "manual2.aux").exists()
+
+    result = zf.render_notes_pdf(
+        tmp_path / "notes",
+        filename="quick_note.tex",
+        title="Quick Note",
+        body="hello",
+        xelatex="fake-xelatex",
+        runs=1,
+    )
+    assert result.pdf_path.read_bytes().startswith(b"%PDF")
+    assert result.tex_path.name == "quick_note.tex"
+    assert not (result.tex_path.parent / "quick_note.aux").exists()
+    assert result.log_path is None
+
+    draft = zf.render_notes_pdf(
+        tmp_path / "draft",
+        filename="draft_note.tex",
+        title="Draft Note",
+        body="hello",
+        compile_pdf=False,
+    )
+    assert draft.tex_path.exists()
+    assert draft.pdf_path == draft.tex_path.with_suffix(".pdf")
+    assert draft.log_path is None
+
+
+def test_render_tex_pdf_skips_stale_latex_auxiliary_files(tmp_path, monkeypatch):
+    import Zou_lab_control.frontend.notes as notes
+
+    copied_files = []
+
+    class Result:
+        returncode = 0
+        stdout = "fake xelatex ok"
+
+    def fake_run(cmd, cwd, text, stdout, stderr):
+        build_dir = Path(cwd)
+        copied_files.append({path.name for path in build_dir.rglob("*") if path.is_file()})
+        tex_name = Path(cmd[-1])
+        (build_dir / tex_name.with_suffix(".pdf").name).write_bytes(b"%PDF fake\n")
+        return Result()
+
+    monkeypatch.setattr(notes.subprocess, "run", fake_run)
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    (source_dir / "manual.tex").write_text(r"\documentclass{article}\begin{document}hello\end{document}", encoding="utf-8")
+    (source_dir / "manual.aux").write_text("old aux", encoding="utf-8")
+    (source_dir / "manual.log").write_text("old log", encoding="utf-8")
+    (source_dir / "manual.build.log").write_text("old build log", encoding="utf-8")
+    (source_dir / "asset.txt").write_text("asset", encoding="utf-8")
+
+    out = tmp_path / "out" / "manual.pdf"
+    pdf = zf.render_tex_pdf(source_dir / "manual.tex", out, xelatex="fake-xelatex", runs=1)
+
+    assert pdf == out.resolve()
+    assert out.read_bytes().startswith(b"%PDF")
+    assert copied_files
+    assert "manual.tex" in copied_files[0]
+    assert "asset.txt" in copied_files[0]
+    assert "manual.aux" not in copied_files[0]
+    assert "manual.log" not in copied_files[0]
+    assert "manual.build.log" not in copied_files[0]
+    assert not (out.parent / "manual.aux").exists()
+    assert not (out.parent / "manual.log").exists()
+    assert not (out.parent / "manual.build.log").exists()
+
+
+def test_render_tex_pdf_does_not_copy_stale_source_or_output_pdf(tmp_path, monkeypatch):
+    import Zou_lab_control.frontend.notes as notes
+
+    copied_files = []
+
+    class Result:
+        returncode = 0
+        stdout = "fake xelatex ok"
+
+    def fake_run(cmd, cwd, text, stdout, stderr):
+        build_dir = Path(cwd)
+        copied_files.append({str(path.relative_to(build_dir)) for path in build_dir.rglob("*") if path.is_file()})
+        tex_name = Path(cmd[-1])
+        (build_dir / tex_name.with_suffix(".pdf").name).write_bytes(b"%PDF fresh\n")
+        return Result()
+
+    monkeypatch.setattr(notes.subprocess, "run", fake_run)
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    (source_dir / "manual.tex").write_text(r"\documentclass{article}\begin{document}fresh\end{document}", encoding="utf-8")
+    (source_dir / "manual.pdf").write_bytes(b"%PDF stale source\n")
+    (source_dir / "assets").mkdir()
+    (source_dir / "assets" / "figure.pdf").write_bytes(b"%PDF asset\n")
+    out = tmp_path / "out" / "manual.pdf"
+    out.parent.mkdir()
+    out.write_bytes(b"%PDF stale output\n")
+    out.with_suffix(".build.log").write_text("old failure", encoding="utf-8")
+
+    pdf = zf.render_tex_pdf(source_dir / "manual.tex", out, xelatex="fake-xelatex", runs=1)
+
+    assert pdf == out.resolve()
+    assert out.read_bytes() == b"%PDF fresh\n"
+    assert copied_files
+    assert "manual.tex" in copied_files[0]
+    assert "manual.pdf" not in copied_files[0]
+    assert "assets\\figure.pdf" in copied_files[0] or "assets/figure.pdf" in copied_files[0]
+    assert not out.with_suffix(".build.log").exists()
+
+
+def test_render_tex_pdf_skips_stale_output_pdf_inside_source_tree(tmp_path, monkeypatch):
+    import Zou_lab_control.frontend.notes as notes
+
+    copied_files = []
+
+    class Result:
+        returncode = 0
+        stdout = "fake xelatex ok"
+
+    def fake_run(cmd, cwd, text, stdout, stderr):
+        build_dir = Path(cwd)
+        copied_files.append({str(path.relative_to(build_dir)) for path in build_dir.rglob("*") if path.is_file()})
+        (build_dir / "manual.pdf").write_bytes(b"%PDF fresh\n")
+        return Result()
+
+    monkeypatch.setattr(notes.subprocess, "run", fake_run)
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    (source_dir / "manual.tex").write_text(r"\documentclass{article}\begin{document}fresh\end{document}", encoding="utf-8")
+    (source_dir / "final.pdf").write_bytes(b"%PDF stale output\n")
+    (source_dir / "assets").mkdir()
+    (source_dir / "assets" / "figure.pdf").write_bytes(b"%PDF asset\n")
+
+    pdf = zf.render_tex_pdf(source_dir / "manual.tex", source_dir / "final.pdf", xelatex="fake-xelatex", runs=1)
+
+    assert pdf == (source_dir / "final.pdf").resolve()
+    assert (source_dir / "final.pdf").read_bytes() == b"%PDF fresh\n"
+    assert copied_files
+    assert "manual.tex" in copied_files[0]
+    assert "final.pdf" not in copied_files[0]
+    assert "assets\\figure.pdf" in copied_files[0] or "assets/figure.pdf" in copied_files[0]
+
+
+def test_render_tex_pdf_failure_writes_only_build_log(tmp_path, monkeypatch):
+    import Zou_lab_control.frontend.notes as notes
+
+    class Result:
+        returncode = 1
+        stdout = "fake xelatex failure"
+
+    def fake_run(cmd, cwd, text, stdout, stderr):
+        build_dir = Path(cwd)
+        tex_name = Path(cmd[-1])
+        (build_dir / tex_name.with_suffix(".aux").name).write_text("aux", encoding="utf-8")
+        (build_dir / tex_name.with_suffix(".log").name).write_text("log", encoding="utf-8")
+        return Result()
+
+    monkeypatch.setattr(notes.subprocess, "run", fake_run)
+
+    out = tmp_path / "failed.pdf"
+    out.write_bytes(b"%PDF stale\n")
+    with pytest.raises(RuntimeError, match="xelatex failed"):
+        zf.render_tex_pdf(
+            r"\documentclass{article}\begin{document}bad\end{document}",
+            out,
+            xelatex="fake-xelatex",
+            runs=1,
+        )
+
+    assert not out.exists()
+    assert (tmp_path / "failed.build.log").read_text(encoding="utf-8") == "fake xelatex failure"
+    assert not (tmp_path / "failed.aux").exists()
+    assert not (tmp_path / "failed.log").exists()
+
+
+def test_render_tex_pdf_missing_xelatex_writes_build_log(tmp_path, monkeypatch):
+    import Zou_lab_control.frontend.notes as notes
+
+    monkeypatch.setattr(notes.shutil, "which", lambda name: None)
+    out = tmp_path / "missing.pdf"
+    out.write_bytes(b"%PDF stale\n")
+
+    with pytest.raises(RuntimeError, match="See"):
+        zf.render_tex_pdf(r"\documentclass{article}\begin{document}hello\end{document}", out, runs=1)
+
+    assert not out.exists()
+    log_text = out.with_suffix(".build.log").read_text(encoding="utf-8")
+    assert "xelatex was not found on PATH" in log_text
+    assert not (tmp_path / "missing.aux").exists()
+    assert not (tmp_path / "missing.log").exists()
+
+
+def test_render_tex_pdf_bad_xelatex_path_writes_build_log(tmp_path, monkeypatch):
+    import Zou_lab_control.frontend.notes as notes
+
+    def fake_run(cmd, cwd, text, stdout, stderr):
+        raise FileNotFoundError(cmd[0])
+
+    monkeypatch.setattr(notes.subprocess, "run", fake_run)
+    out = tmp_path / "bad_path.pdf"
+    out.write_bytes(b"%PDF stale\n")
+
+    with pytest.raises(RuntimeError, match="executable was not found"):
+        zf.render_tex_pdf(
+            r"\documentclass{article}\begin{document}hello\end{document}",
+            out,
+            xelatex="missing-xelatex",
+            runs=1,
+        )
+
+    assert not out.exists()
+    log_text = out.with_suffix(".build.log").read_text(encoding="utf-8")
+    assert "xelatex executable was not found: missing-xelatex" in log_text
+    assert not (tmp_path / "bad_path.aux").exists()
+    assert not (tmp_path / "bad_path.log").exists()
+
+
 def test_frontend_title_pulse_and_public_2d_square_guard():
     line = zf.plot(np.arange(5), np.arange(5), title="Small title", display=False)
     assert line.ax.get_title() == "Small title"
@@ -795,13 +1050,15 @@ def test_pulse_gui_controls_call_attached_40ch_sequencer(monkeypatch):
         assert editor.fire_button.text() == "On\nPulse"
         assert editor.safe_button.text() == "Stop\nPulse"
         assert not hasattr(editor, "prepare_button")
+        assert not hasattr(editor, "wait_button")
+        assert not hasattr(editor, "repeat_forever_switch")
+        assert not hasattr(editor, "wait_done")
         editor.fire()
-        editor.wait_done()
         editor.safe_state()
         app.processEvents()
 
         assert sequencer.events[0][0] == "prepare"
-        assert [event[0] for event in sequencer.events] == ["prepare", "fire", "wait_done", "safe"]
+        assert [event[0] for event in sequencer.events] == ["prepare", "fire", "safe"]
         assert editor.last_program.channels == channels
         assert editor.last_program.trigger_count == 1
         assert isinstance(sequencer.prepared, na.PulseTableState)
@@ -870,6 +1127,40 @@ def test_pulse_gui_repeat_preview_uses_unexpanded_periods(monkeypatch):
         x_tick_labels = [tick.get_text().strip() for tick in editor._preview_plot.ax.get_xticklabels() if tick.get_visible()]
         assert all(not label.startswith("-") for label in x_tick_labels if label)
         assert editor._preview_plot.channels == channels
+    finally:
+        editor.close()
+
+
+def test_pulse_gui_summary_warns_about_repeat_forever_table_boundary_high(monkeypatch):
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor, ensure_qt_app
+
+    app = ensure_qt_app()
+    state = na.PulseTableState(
+        channels=["ch00", "ch03"],
+        periods=[
+            na.PulsePeriod(100, (1, 0), unit="ns"),
+            na.PulsePeriod(20, (0, 1), unit="ns"),
+            na.PulsePeriod(1000, (0, 0), unit="ns"),
+        ],
+        repeat_start=1,
+        repeat_end=1,
+        repeat_count=5,
+        repeat_forever=True,
+        channel_labels={"ch00": "trap", "ch03": "qcm_trigger"},
+        visible_channels=["ch00", "ch03"],
+        time_step_ns=10,
+    )
+    editor = PulseSequenceEditor(state=state, scale=0.86)
+    try:
+        editor.show()
+        app.processEvents()
+        editor._update_summary()
+
+        assert "repeat ∞" in editor.summary.text()
+        assert "table restart high every 1.2 us: trap" in editor.summary.text()
     finally:
         editor.close()
 

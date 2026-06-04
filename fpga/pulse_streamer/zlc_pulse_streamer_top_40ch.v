@@ -1,7 +1,8 @@
 `timescale 1ns / 1ps
 // 40-channel top wrapper for zlc_pulse_streamer.
 //
-// Complete zlc_pulse_streamer_40ch.xdc before building this top.
+// Uses zlc_pulse_streamer_40ch.xdc for the checked-in address_switch-derived
+// pin map, or a board-specific XDC supplied through ZLC_PS_40CH_XDC.
 
 module zlc_pulse_streamer_top_40ch(
     input wire clk,
@@ -13,12 +14,12 @@ module zlc_pulse_streamer_top_40ch(
     wire zlc_reset;
     wire zlc_start;
     wire zlc_prog_we;
-    wire [6:0] zlc_prog_addr;
+    wire [9:0] zlc_prog_addr;
     wire [31:0] zlc_prog_tick;
     wire [39:0] zlc_prog_mask;
-    wire [7:0] zlc_prog_count;
+    wire [10:0] zlc_prog_count;
     wire zlc_repeat_forever;
-    wire [6:0] zlc_loop_start_addr;
+    wire [9:0] zlc_loop_start_addr;
     wire [31:0] zlc_loop_end_tick;
     wire [31:0] zlc_loop_count;
     wire [39:0] out;
@@ -31,7 +32,7 @@ module zlc_pulse_streamer_top_40ch(
 
     zlc_pulse_streamer #(
         .CHANNEL_COUNT(40),
-        .EDGE_ADDR_WIDTH(7),
+        .EDGE_ADDR_WIDTH(10),
         .TICK_WIDTH(32)
     ) zlc_streamer_i (
         .clk(clk),

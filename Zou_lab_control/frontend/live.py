@@ -752,6 +752,7 @@ def pulse_repeat_notation(
         repeat_start = getattr(state_or_start, "repeat_start", None)
         repeat_end = getattr(state_or_start, "repeat_end", None)
         repeat_count = getattr(state_or_start, "repeat_count", None)
+        default_forever = bool(getattr(state_or_start, "repeat_forever", default_forever))
         periods = list(getattr(state_or_start, "periods", ()))
     else:
         repeat_start = state_or_start
@@ -792,6 +793,7 @@ def pulse_repeat_marker(
         repeat_start = getattr(state_or_periods, "repeat_start", repeat_start)
         repeat_end = getattr(state_or_periods, "repeat_end", repeat_end)
         repeat_count = getattr(state_or_periods, "repeat_count", repeat_count)
+        default_forever = bool(getattr(state_or_periods, "repeat_forever", default_forever))
         x_ns = getattr(state_or_periods, "x_ns", x_ns)
         time_step_ns = getattr(state_or_periods, "time_step_ns", time_step_ns)
     elif state_or_periods is not None:
@@ -834,6 +836,7 @@ def pulse_repeat_markers(
         repeat_start = getattr(state_or_periods, "repeat_start", repeat_start)
         repeat_end = getattr(state_or_periods, "repeat_end", repeat_end)
         repeat_count = getattr(state_or_periods, "repeat_count", repeat_count)
+        default_forever = bool(getattr(state_or_periods, "repeat_forever", default_forever))
         x_ns = getattr(state_or_periods, "x_ns", x_ns)
         time_step_ns = getattr(state_or_periods, "time_step_ns", time_step_ns)
     elif state_or_periods is not None:

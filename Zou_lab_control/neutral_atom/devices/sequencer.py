@@ -11,6 +11,7 @@ import threading
 import time
 from typing import Any, Callable, Mapping, Sequence
 
+from ..core.analysis import positive_int
 from .base import SequencerDevice
 from ..timing import (
     DEFAULT_CAMERA_TRIGGER_CHANNELS,
@@ -19,6 +20,7 @@ from ..timing import (
     channel_names,
     count_trigger_pulses,
     positive_float,
+    sequence_for_frame_count,
 )
 from ..timing.verilog import VerilogBuild, VerilogFiles, generate_verilog, write_verilog_bundle
 
@@ -233,9 +235,38 @@ def compile_runtime_program_for_payload(
             channels=channels,
             clock_hz=clock_hz,
             trigger_channels=trigger_channels,
-            repeat_forever=True,
+            repeat_forever=payload.repeat_forever,
         )
     return compile_runtime_program(payload, channels=channels, clock_hz=clock_hz, trigger_channels=trigger_channels)
+
+
+def finite_frame_sequence(
+    payload: PulseSequence | PulseTableState,
+    frames: int,
+    *,
+    trigger_channels: Sequence[str] = DEFAULT_CAMERA_TRIGGER_CHANNELS,
+) -> PulseSequence:
+    """Return a finite ``PulseSequence`` with exactly ``frames`` trigger rises."""
+
+    frames = positive_int(frames, "frames")
+    trigger_channels = tuple(channel_names(trigger_channels, "trigger_channels"))
+    if isinstance(payload, PulseTableState):
+        sequence = payload.to_sequence(x_ns=payload.x_ns, time_step_ns=payload.time_step_ns, expand_repeat=False)
+        base_period_s = sum(
+            period.duration_steps(x_ns=payload.x_ns, time_step_ns=payload.time_step_ns) for period in payload.periods
+        ) * payload.time_step_ns * 1e-9
+        triggers = count_trigger_pulses(sequence, trigger_channels=trigger_channels)
+        if triggers == frames:
+            return sequence
+        if triggers == 1 and frames > 1:
+            return sequence.repeated(frames, period=base_period_s)
+        raise ValueError(
+            f"sequence {sequence.name!r} has {triggers} camera trigger pulses, "
+            f"but acquisition requested {frames} frame(s)."
+        )
+    if isinstance(payload, PulseSequence):
+        return sequence_for_frame_count(payload, frames, trigger_channels=trigger_channels)
+    raise TypeError("frame acquisition sequence must be a PulseSequence or PulseTableState.")
 
 
 class SequencerService:
@@ -257,6 +288,7 @@ class SequencerService:
         wait_done_callback: Callable[[RuntimeSequenceProgram, float | None], bool] | None = None,
         safe_state_callback: Callable[[], None] | None = None,
         sleep_scale: float = 0.0,
+        cache_prepared: bool = True,
     ):
         self.channels = list(channel_names(channels, "channels"))
         self.clock_hz = positive_float(clock_hz, "clock_hz")
@@ -266,6 +298,7 @@ class SequencerService:
         self.wait_done_callback = wait_done_callback
         self.safe_state_callback = safe_state_callback
         self.sleep_scale = nonnegative_float(sleep_scale, "sleep_scale")
+        self.cache_prepared = bool(cache_prepared)
         self._lock = threading.RLock()
         self.prepared_program: RuntimeSequenceProgram | None = None
         self.state = "idle"
@@ -280,11 +313,23 @@ class SequencerService:
             trigger_channels=self.trigger_channels,
         )
         with self._lock:
-            if self.prepare_callback is not None:
+            cached = (
+                self.cache_prepared
+                and self.prepared_program is not None
+                and self.prepared_program.sequence_id == program.sequence_id
+            )
+            if self.prepare_callback is not None and not cached:
                 self.prepare_callback(program)
             self.prepared_program = program
             self.state = "prepared"
-            self.history.append({"action": "prepare", "sequence_id": program.sequence_id, "triggers": program.trigger_count})
+            self.history.append(
+                {
+                    "action": "prepare",
+                    "sequence_id": program.sequence_id,
+                    "triggers": program.trigger_count,
+                    "cached": cached,
+                }
+            )
         return program.to_dict()
 
     def fire(self, sequence_payload=None) -> dict[str, object]:
@@ -308,8 +353,12 @@ class SequencerService:
     def wait_done(self, timeout: float | None = None) -> bool:
         with self._lock:
             program = self._require_prepared()
+        if program.repeat_forever and timeout is None:
+            raise RuntimeError("sequencer wait_done cannot wait forever for a repeat_forever program; pass a timeout or stop the pulse.")
         if self.wait_done_callback is not None:
             ok = bool(self.wait_done_callback(program, timeout))
+        elif program.repeat_forever:
+            ok = False
         else:
             delay = program.duration * self.sleep_scale
             if timeout is not None and delay > float(timeout):
@@ -325,15 +374,17 @@ class SequencerService:
 
     def abort(self) -> None:
         with self._lock:
+            self.prepared_program = None
             self.state = "aborted"
-            self.history.append({"action": "abort"})
+            self.history.append({"action": "abort", "invalidated": True})
         if self.safe_state_callback is not None:
             self.safe_state_callback()
 
     def set_safe_state(self) -> None:
         with self._lock:
+            self.prepared_program = None
             self.state = "safe"
-            self.history.append({"action": "safe"})
+            self.history.append({"action": "safe", "invalidated": True})
         if self.safe_state_callback is not None:
             self.safe_state_callback()
 
@@ -374,6 +425,7 @@ class RuntimeSequencer(SequencerDevice):
         )
         self.channels = self.service.channels
         self.clock_hz = self.service.clock_hz
+        self.trigger_channels = self.service.trigger_channels
         self.last_program: RuntimeSequenceProgram | None = None
 
     def prepare(self, sequence: PulseSequence | PulseTableState) -> RuntimeSequenceProgram:
@@ -562,6 +614,126 @@ class RemoteSequencer(SequencerDevice):
                 self._conn.close()
             finally:
                 self._conn = None
+
+
+class PulseController:
+    """Notebook helper that binds a pulse payload to a sequencer.
+
+    It keeps readout scans terse: ``pulse.x = 200; pulse.on_pulse()``.  The
+    controller owns no hardware; it delegates to the supplied local or remote
+    ``SequencerDevice``.
+    """
+
+    def __init__(self, sequencer: SequencerDevice, pulse: PulseSequence | PulseTableState):
+        self.sequencer = sequencer
+        self.pulse = pulse
+        self.x = float(getattr(pulse, "x_ns", 0.0))
+        self.last_program: RuntimeSequenceProgram | None = None
+
+    @property
+    def x_ns(self) -> float:
+        return self.x
+
+    @x_ns.setter
+    def x_ns(self, value: float) -> None:
+        self.x = float(value)
+
+    def payload(self, *, x_ns: float | None = None, repeat_forever: bool | None = None) -> PulseSequence | PulseTableState:
+        if isinstance(self.pulse, PulseTableState):
+            payload = self.pulse.with_x(self.x if x_ns is None else x_ns)
+            if repeat_forever is not None:
+                data = payload.to_dict()
+                data["repeat_forever"] = bool(repeat_forever)
+                payload = PulseTableState.from_dict(data)
+            return payload
+        if repeat_forever is not None:
+            data = self.pulse.to_dict()
+            data["repeat_forever"] = bool(repeat_forever)
+            return PulseSequence.from_dict(data)
+        return self.pulse
+
+    def frame_sequence(
+        self,
+        frames: int,
+        *,
+        x_ns: float | None = None,
+        trigger_channels: Sequence[str] | None = None,
+    ) -> PulseSequence:
+        """Return a finite ``PulseSequence`` with exactly ``frames`` triggers."""
+
+        frames = positive_int(frames, "frames")
+        trigger_channels = tuple(channel_names(
+            getattr(self.sequencer, "trigger_channels", DEFAULT_CAMERA_TRIGGER_CHANNELS) if trigger_channels is None else trigger_channels,
+            "trigger_channels",
+        ))
+        payload = self.payload(x_ns=x_ns, repeat_forever=False)
+        return finite_frame_sequence(payload, frames, trigger_channels=trigger_channels)
+
+    def prepare(self, *, repeat_forever: bool | None = None) -> RuntimeSequenceProgram:
+        self.last_program = self.sequencer.prepare(self.payload(repeat_forever=repeat_forever))
+        return self.last_program
+
+    def on_pulse(
+        self,
+        *,
+        wait: bool = False,
+        timeout: float | None = None,
+        repeat_forever: bool | None = None,
+    ) -> RuntimeSequenceProgram:
+        payload = self.payload(repeat_forever=repeat_forever)
+        if wait and timeout is None and bool(getattr(payload, "repeat_forever", False)):
+            raise RuntimeError(
+                "pulse.on_pulse(wait=True) cannot wait for a repeat_forever pulse without a timeout. "
+                "Use pulse.on_pulse(wait=False, repeat_forever=True) for continuous scope output, "
+                "or pulse.on_pulse(wait=True, repeat_forever=False) for a finite shot."
+            )
+        self.last_program = self.sequencer.prepare(payload)
+        program = self.last_program
+        self.sequencer.fire()
+        if wait:
+            if not self.sequencer.wait_done(timeout=timeout):
+                raise TimeoutError(f"sequencer did not report done for pulse {program.sequence_name!r}.")
+        return program
+
+    def wait_done(self, timeout: float | None = None) -> bool:
+        return bool(self.sequencer.wait_done(timeout=timeout))
+
+    def stop(self) -> None:
+        if hasattr(self.sequencer, "set_safe_state"):
+            self.sequencer.set_safe_state()
+        elif hasattr(self.sequencer, "abort"):
+            self.sequencer.abort()
+
+    def snapshot(self) -> dict[str, object]:
+        """Return a JSON-safe summary for notebook/debug display."""
+
+        last = None
+        if self.last_program is not None:
+            last = {
+                "sequence_name": self.last_program.sequence_name,
+                "channels": list(self.last_program.channels),
+                "edge_count": len(self.last_program.ticks),
+                "trigger_count": int(self.last_program.trigger_count),
+                "duration": float(self.last_program.duration),
+                "repeat_forever": bool(self.last_program.repeat_forever),
+                "loop_count": int(self.last_program.loop_count),
+            }
+        return {
+            "type": type(self).__name__,
+            "pulse_type": type(self.pulse).__name__,
+            "x_ns": float(self.x),
+            "sequencer_type": type(self.sequencer).__name__,
+            "sequencer_channels": list(getattr(self.sequencer, "channels", [])),
+            "clock_hz": float(getattr(self.sequencer, "clock_hz", 0.0)),
+            "trigger_channels": list(getattr(self.sequencer, "trigger_channels", [])),
+            "last_program": last,
+        }
+
+
+def bind_pulse(sequencer: SequencerDevice, pulse: PulseSequence | PulseTableState) -> PulseController:
+    """Return a ``PulseController`` for concise notebook pulse scans."""
+
+    return PulseController(sequencer, pulse)
 
 
 class VerilogSequencer(SequencerDevice):
@@ -964,11 +1136,13 @@ def serve_runtime_sequencer(
 
 __all__ = [
     "ManualSequencer",
+    "PulseController",
     "RemoteSequencer",
     "RuntimeSequenceProgram",
     "RuntimeSequencer",
     "SequencerService",
     "VerilogSequencer",
+    "bind_pulse",
     "compile_pulse_table_runtime_program",
     "compile_runtime_program",
     "compile_runtime_program_for_payload",

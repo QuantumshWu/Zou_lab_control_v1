@@ -167,6 +167,15 @@ def _unit_resolution(step_ns: float, unit: str) -> float:
     return float(step_ns) / factor
 
 
+def _summary_time_text(value_ns: float) -> str:
+    value_ns = float(value_ns)
+    units = (("s", 1_000_000_000.0), ("ms", 1_000_000.0), ("us", 1_000.0), ("ns", 1.0))
+    for unit, factor in units:
+        if abs(value_ns) >= factor or unit == "ns":
+            return f"{format_compact_number(value_ns / factor, digits=6)} {unit}"
+    return f"{format_compact_number(value_ns, digits=6)} ns"
+
+
 def _set_fixed_height(widget: QtWidgets.QWidget, height: int | None = None) -> QtWidgets.QWidget:
     widget.setFixedHeight(_row_height() if height is None else height)
     return widget
@@ -793,11 +802,15 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 time_step_ns=self._clock_step_ns(sequencer) or 1.0,
                 channel_labels=labels,
             )
-        elif channel_labels:
-            state.channel_labels.update({str(k): str(v) for k, v in dict(channel_labels).items()})
-            state.validate()
         if state is not None and channels is not None and list(state.channels) != list(channels):
             state = state.aligned_to_channels(channels)
+        if state is not None and channel_labels:
+            for key, value in dict(channel_labels).items():
+                channel = str(key)
+                label = str(value)
+                if channel in state.channels and channel not in state.channel_labels and label and label != channel:
+                    state.channel_labels[channel] = label
+            state.validate()
         self.state = state
         self.sequencer = sequencer or (getattr(getattr(experiment, "devices", None), "sequencer", None) if experiment is not None else None)
         self.last_program = None
@@ -935,7 +948,6 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self.bracket_button = self._control_button("Add\nBracket", self.toggle_bracket, YELLOW)
         self.save_button = self._control_button("Save to\nfile*", self.save_to_file, YELLOW)
         self.load_button = self._control_button("Load\nfrom\nfile", self.load_from_file, ORANGE)
-        self.wait_button = self._control_button("Wait\nDone", self.wait_done, ACCENT)
         self.collapse_button = self._control_button("Collapse\nLeft", self.toggle_left_panels, GREY)
         button_positions = [
             (self.safe_button, 0, 0),
@@ -946,7 +958,6 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             (self.collapse_button, 0, 5),
             (self.save_button, 1, 0),
             (self.load_button, 1, 1),
-            (self.wait_button, 1, 2),
         ]
         for button, row, col in button_positions:
             button_layout.addWidget(button, row, col)
@@ -1305,6 +1316,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             channel_labels=dict(self.state.channel_labels),
             delays=dict(self.state.delays),
             delay_units=dict(self.state.delay_units),
+            repeat_forever=bool(self.state.repeat_forever),
         )
         self.names_panel.read_values(state)
         self.channel_panel.read_values(state)
@@ -1476,16 +1488,6 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             self.stateui_manager.runstate = PulseStateUIManager.RunState.ERROR
             self._message(str(exc))
 
-    def wait_done(self) -> None:
-        try:
-            if self.sequencer is None:
-                return
-            ok = self.sequencer.wait_done(timeout=10.0)
-            self.stateui_manager.runstate = PulseStateUIManager.RunState.STOP if ok else PulseStateUIManager.RunState.ERROR
-        except Exception as exc:
-            self.stateui_manager.runstate = PulseStateUIManager.RunState.ERROR
-            self._message(str(exc))
-
     def safe_state(self) -> None:
         try:
             if self.sequencer is not None:
@@ -1557,9 +1559,15 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 f"step {state.time_step_ns:g} ns",
                 f"{total_ns:.3g} ns",
                 f"{len(sequence.pulses)} pulses",
+                "repeat ∞" if state.repeat_forever else "single",
             ]
             if hidden:
                 parts.append(f"hidden active: {', '.join(hidden)}")
+            boundary_active = state.repeat_forever_boundary_active_channels()
+            if boundary_active:
+                labels = [state.label_for(channel) for channel in boundary_active[:4]]
+                suffix = "" if len(boundary_active) <= 4 else f", +{len(boundary_active) - 4}"
+                parts.append(f"table restart high every {_summary_time_text(total_ns)}: {', '.join(labels)}{suffix}")
             self.summary.setText(" | ".join(parts))
             if hasattr(self, "names_panel"):
                 self.names_panel.total_label.setText(f"{total_ns:.9g} ns")

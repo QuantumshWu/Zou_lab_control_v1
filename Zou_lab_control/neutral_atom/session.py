@@ -32,7 +32,7 @@ from .core.results import (
     ThresholdResult,
 )
 from .core.utils import html_summary, json_ready, site_index
-from .devices import CameraDevice, DeviceSet, load_devices
+from .devices import CameraDevice, DeviceSet, SequencerDevice, load_devices
 from .devices.virtual import VirtualTrapArray, virtual_config
 from .operations import calibrate_sitemap_from_images, calibrate_threshold_from_images, detect_image
 from .timing import PulseSequence, imaging_sequence
@@ -54,7 +54,7 @@ class NeutralAtomSession:
         self.devices = devices
         self.name = str(name)
         self.defaults = dict(defaults or {})
-        self.sequence = imaging_sequence(exposure=self._camera_exposure(), load=True)
+        self.sequence = self._imaging_sequence(exposure=self._camera_exposure(), load=True)
         self._calibration: TrapCalibration | None = None
         self.history: list[Any] = []
         self.devices.camera.bind_experiment(self)
@@ -64,6 +64,10 @@ class NeutralAtomSession:
     @property
     def camera(self) -> CameraDevice:
         return self.devices.camera
+
+    @property
+    def sequencer(self) -> SequencerDevice:
+        return self.devices.sequencer
 
     @property
     def readout(self) -> ReadoutSubsystem:
@@ -84,13 +88,28 @@ class NeutralAtomSession:
     def _configure_imaging(self, *, exposure: float | None = None, load: bool = True, trigger_width: float = 20e-6, pre_trigger: float = 100e-6) -> PulseSequence:
         if exposure is not None and hasattr(self.devices.camera, "configure"):
             self.devices.camera.configure(exposure=exposure)
-        self.sequence = imaging_sequence(
+        self.sequence = self._imaging_sequence(
             exposure=self._camera_exposure() if exposure is None else exposure,
             trigger_width=trigger_width,
             pre_trigger=pre_trigger,
             load=load,
         )
         return self.sequence
+
+    def _imaging_sequence(self, **kwargs) -> PulseSequence:
+        return imaging_sequence(**kwargs, **self._imaging_channel_kwargs())
+
+    def _imaging_channel_kwargs(self) -> dict[str, str]:
+        sequencer = getattr(self.devices, "sequencer", None)
+        channels = list(getattr(sequencer, "channels", ()))
+        if all(f"ch{index:02d}" in channels for index in range(4)):
+            return {
+                "trap_channel": "ch00",
+                "cooling_channel": "ch01",
+                "probe_channel": "ch02",
+                "trigger_channel": "ch03",
+            }
+        return {}
 
     def _calibrate_sitemap(
         self,
@@ -105,7 +124,7 @@ class NeutralAtomSession:
         grid_shape = self._grid_shape(grid_shape)
         roi_radius = int(self.defaults.get("roi_radius", 1) if roi_radius is None else roi_radius)
         exposure = self.defaults.get("sitemap_exposure", self._camera_exposure())
-        sequence = imaging_sequence(exposure=exposure, load=True, name="sitemap")
+        sequence = self._imaging_sequence(exposure=exposure, load=True, name="sitemap")
         images = self.devices.camera.acquire(positive_int(frames, "frames"), sequence=sequence, sequencer=getattr(self.devices, "sequencer", None))
         result = calibrate_sitemap_from_images(
             images,
@@ -128,7 +147,7 @@ class NeutralAtomSession:
         display: bool = True,
     ) -> ThresholdResult:
         calibration = self.require_calibration(require_thresholds=False)
-        sequence = imaging_sequence(exposure=self._camera_exposure() if exposure is None else exposure, load=True, name="threshold")
+        sequence = self._imaging_sequence(exposure=self._camera_exposure() if exposure is None else exposure, load=True, name="threshold")
         images = self.devices.camera.acquire(positive_int(frames, "frames"), sequence=sequence, sequencer=getattr(self.devices, "sequencer", None))
         result = calibrate_threshold_from_images(images, calibration, site=site, display=display)
         self._calibration = result.calibration
@@ -137,7 +156,7 @@ class NeutralAtomSession:
 
     def _detect(self, *, exposure: float | None = None, display: bool = True, what: str = "occupancy") -> DetectionResult:
         calibration = self.require_calibration(require_thresholds=True)
-        sequence = imaging_sequence(exposure=self._camera_exposure() if exposure is None else exposure, load=True, name="detect")
+        sequence = self._imaging_sequence(exposure=self._camera_exposure() if exposure is None else exposure, load=True, name="detect")
         images = self.devices.camera.acquire(1, sequence=sequence, sequencer=getattr(self.devices, "sequencer", None))
         result = detect_image(images[-1], calibration, sequence=sequence, display=display, what=what)
         self.history.append(result)
@@ -154,6 +173,7 @@ class NeutralAtomSession:
         live: bool = True,
         update_time: float = 0.05,
         display: bool = True,
+        pulse: Any | None = None,
     ) -> DetectionTimeScanResult:
         calibration = self.require_calibration(require_thresholds=False)
         times = np.asarray(times, dtype=float).reshape(-1)
@@ -166,11 +186,25 @@ class NeutralAtomSession:
         if not np.isfinite(reference_exposure) or reference_exposure <= 0:
             raise ValueError("reference_exposure must be positive and finite.")
 
-        reference_sequence = imaging_sequence(exposure=reference_exposure, load=True, name="reference_threshold")
+        if pulse is None:
+            reference_sequence = self._imaging_sequence(exposure=reference_exposure, load=True, name="reference_threshold")
+            reference_sequencer = getattr(self.devices, "sequencer", None)
+        else:
+            reference_x_ns = float(reference_exposure) * 1e9
+            if hasattr(pulse, "x_ns"):
+                pulse.x_ns = reference_x_ns
+            configure = getattr(self.devices.camera, "configure", None)
+            if callable(configure):
+                configure(exposure=float(reference_exposure))
+            frame_sequence = getattr(pulse, "frame_sequence", None)
+            if not callable(frame_sequence):
+                raise TypeError("pulse must be a PulseController returned by exp.timing.bind_pulse(...) or na.bind_pulse(...).")
+            reference_sequence = frame_sequence(reference_shots, x_ns=reference_x_ns)
+            reference_sequencer = getattr(pulse, "sequencer", getattr(self.devices, "sequencer", None))
         reference_images = self.devices.camera.acquire(
             reference_shots,
             sequence=reference_sequence,
-            sequencer=getattr(self.devices, "sequencer", None),
+            sequencer=reference_sequencer,
         )
         reference_counts = np.vstack(
             [roi_counts(image, calibration.centers, radius=calibration.roi_radius, reducer=calibration.reducer) for image in reference_images]
@@ -192,8 +226,22 @@ class NeutralAtomSession:
         )
 
         def measure(time_s: float, index: int | None = None) -> float:
-            sequence = imaging_sequence(exposure=float(time_s), load=True, name="detect_time_scan")
-            images = self.devices.camera.acquire(shots, sequence=sequence, sequencer=getattr(self.devices, "sequencer", None))
+            if pulse is None:
+                sequence = self._imaging_sequence(exposure=float(time_s), load=True, name="detect_time_scan")
+                sequencer = getattr(self.devices, "sequencer", None)
+            else:
+                x_ns = float(time_s) * 1e9
+                if hasattr(pulse, "x_ns"):
+                    pulse.x_ns = x_ns
+                configure = getattr(self.devices.camera, "configure", None)
+                if callable(configure):
+                    configure(exposure=float(time_s))
+                frame_sequence = getattr(pulse, "frame_sequence", None)
+                if not callable(frame_sequence):
+                    raise TypeError("pulse must be a PulseController returned by exp.timing.bind_pulse(...) or na.bind_pulse(...).")
+                sequence = frame_sequence(shots, x_ns=x_ns)
+                sequencer = getattr(pulse, "sequencer", getattr(self.devices, "sequencer", None))
+            images = self.devices.camera.acquire(shots, sequence=sequence, sequencer=sequencer)
             counts = np.vstack(
                 [roi_counts(image, calibration.centers, radius=calibration.roi_radius, reducer=calibration.reducer) for image in images]
             )

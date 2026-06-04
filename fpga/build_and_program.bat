@@ -2,13 +2,25 @@
 setlocal EnableExtensions EnableDelayedExpansion
 
 if /I not "%~1"=="--inner" (
+  set "ZLC_ACTION=build/program"
+  if /I "%~1"=="--check" set "ZLC_ACTION=40ch synth check"
+  if /I "%~1"=="--diagnose" set "ZLC_ACTION=hardware diagnose"
+  if /I "%~1"=="--build-only" set "ZLC_ACTION=40ch build"
+  if /I "%~1"=="--program-only" set "ZLC_ACTION=40ch program"
   call "%~f0" --inner %*
   set "ZLC_STATUS=!ERRORLEVEL!"
-  if not "!ZLC_STATUS!"=="0" (
+  if "!ZLC_STATUS!"=="0" (
+    if "%~1"=="--help" exit /b 0
+    if "%~1"=="/?" exit /b 0
     echo.
-    echo ZLC build/program failed with code !ZLC_STATUS!.
+    echo ZLC !ZLC_ACTION! completed successfully.
+    echo You can close this window, or press any key to exit.
+    if "%ZLC_NO_PAUSE%"=="" pause
+  ) else (
+    echo.
+    echo ZLC !ZLC_ACTION! failed with code !ZLC_STATUS!.
     echo Keep this window open and read the messages above.
-    pause
+    if "%ZLC_NO_PAUSE%"=="" pause
   )
   exit /b !ZLC_STATUS!
 )
@@ -17,6 +29,7 @@ shift /1
 set "FPGA_DIR=%~dp0"
 for %%I in ("%FPGA_DIR%..") do set "REPO_ROOT=%%~fI"
 set "STREAMER_DIR=%FPGA_DIR%pulse_streamer"
+set "ZLC_REPO_ROOT=%REPO_ROOT%"
 
 set "MODE=all"
 if "%~1"=="--help" goto zlc_help
@@ -32,6 +45,9 @@ if not "%~1"=="" if "%MODE%"=="all" (
 )
 
 call :zlc_find_vivado
+if errorlevel 1 exit /b 1
+call :zlc_default_paths
+call :zlc_verify_40ch_sources
 if errorlevel 1 exit /b 1
 
 if /I "%MODE%"=="check" (
@@ -67,14 +83,104 @@ echo   fpga\build_and_program.bat --program-only Program existing 40ch bit/LTX
 echo   fpga\build_and_program.bat --check      No-XDC 40ch synthesis self-check
 echo   fpga\build_and_program.bat --diagnose   List Vivado hw targets/devices
 echo.
-echo Required for a real build:
+echo Real build XDC:
 echo   fpga\pulse_streamer\zlc_pulse_streamer_40ch.xdc
-echo or:
-echo   set ZLC_PS_40CH_XDC=C:\path\to\completed_40ch_board.xdc
+echo   This checked-in XDC is derived from the old address_switch pin map.
+echo   For a different board/cable map, set:
+echo   set ZLC_PS_40CH_XDC=C:\path\to\board_40ch.xdc
 echo.
 echo Optional:
 echo   set ZLC_PS_VIVADO_BIN=C:\Xilinx\Vivado\2019.2\bin\vivado.bat
-echo   set ZLC_PS_DISABLE_SUBST=1
+echo   set ZLC_PS_PROJECT_DIR=%%CD%%\fpga\build\p40
+exit /b 0
+
+:zlc_verify_40ch_sources
+set "ZLC_DEFAULT_XDC=%STREAMER_DIR%\zlc_pulse_streamer_40ch.xdc"
+if not defined ZLC_PS_40CH_XDC if not defined ZLC_PS_XDC set "ZLC_PS_40CH_XDC=%ZLC_DEFAULT_XDC%"
+set "ZLC_SELECTED_XDC=%ZLC_PS_40CH_XDC%"
+if not defined ZLC_SELECTED_XDC set "ZLC_SELECTED_XDC=%ZLC_PS_XDC%"
+if not defined ZLC_PS_40CH_XDC set "ZLC_PS_40CH_XDC=%ZLC_SELECTED_XDC%"
+if not defined ZLC_PS_XDC set "ZLC_PS_XDC=%ZLC_SELECTED_XDC%"
+if not exist "%STREAMER_DIR%\zlc_pulse_streamer_top_40ch.v" (
+  echo ERROR: missing 40ch top HDL: %STREAMER_DIR%\zlc_pulse_streamer_top_40ch.v
+  exit /b 2
+)
+if not exist "%STREAMER_DIR%\create_project_40ch.tcl" (
+  echo ERROR: missing 40ch build Tcl: %STREAMER_DIR%\create_project_40ch.tcl
+  exit /b 2
+)
+findstr /C:".EDGE_ADDR_WIDTH(10)" "%STREAMER_DIR%\zlc_pulse_streamer_top_40ch.v" >nul || (
+  echo ERROR: 40ch top is not the 1024-edge build. Expected .EDGE_ADDR_WIDTH^(10^).
+  exit /b 2
+)
+findstr /C:"CONFIG.C_PROBE_OUT3_WIDTH {10}" "%STREAMER_DIR%\create_project_40ch.tcl" >nul || (
+  echo ERROR: create_project_40ch.tcl has stale prog_addr width. Expected VIO probe_out3 width 10.
+  exit /b 2
+)
+findstr /C:"CONFIG.C_PROBE_OUT6_WIDTH {11}" "%STREAMER_DIR%\create_project_40ch.tcl" >nul || (
+  echo ERROR: create_project_40ch.tcl has stale prog_count width. Expected VIO probe_out6 width 11.
+  exit /b 2
+)
+findstr /C:"zlc_safe_project_dir" "%STREAMER_DIR%\create_project_40ch.tcl" >nul || (
+  echo ERROR: create_project_40ch.tcl is missing the Vivado path-length guard.
+  exit /b 2
+)
+if not exist "!ZLC_SELECTED_XDC!" (
+  echo ERROR: missing 40ch XDC: !ZLC_SELECTED_XDC!
+  echo Restore fpga\pulse_streamer\zlc_pulse_streamer_40ch.xdc. It is derived from references\source_archives\address_switch\address_switch.srcs\constrs_1\new\addre.xdc.
+  exit /b 2
+)
+findstr /C:"[get_ports {ch[39]}]" "!ZLC_SELECTED_XDC!" >nul || (
+  echo ERROR: selected XDC does not define ch[39]; this is not a full 40ch pulse-streamer XDC.
+  exit /b 2
+)
+findstr /C:"<PIN_CH" "!ZLC_SELECTED_XDC!" >nul && (
+  echo ERROR: selected XDC still contains PIN_CH placeholders: !ZLC_SELECTED_XDC!
+  exit /b 2
+)
+echo ZLC 40ch source contract: channels=40 max_edges=1024 edge_addr_width=10 prog_count_width=11
+echo ZLC 40ch XDC: !ZLC_SELECTED_XDC!
+exit /b 0
+
+:zlc_default_paths
+if defined ZLC_PS_BUILD_ROOT if "!ZLC_PS_BUILD_ROOT: =!"=="" set "ZLC_PS_BUILD_ROOT="
+if defined ZLC_PS_PROJECT_DIR if "!ZLC_PS_PROJECT_DIR: =!"=="" set "ZLC_PS_PROJECT_DIR="
+if defined ZLC_PS_CHECK_PROJECT_DIR if "!ZLC_PS_CHECK_PROJECT_DIR: =!"=="" set "ZLC_PS_CHECK_PROJECT_DIR="
+if defined ZLC_PS_LOG_DIR if "!ZLC_PS_LOG_DIR: =!"=="" set "ZLC_PS_LOG_DIR="
+if not defined ZLC_PS_BUILD_ROOT set "ZLC_PS_BUILD_ROOT=%FPGA_DIR%build"
+if not exist "!ZLC_PS_BUILD_ROOT!\" mkdir "!ZLC_PS_BUILD_ROOT!" >nul 2>nul
+
+:zlc_have_build_root
+if not defined ZLC_PS_PROJECT_DIR set "ZLC_PS_PROJECT_DIR=%ZLC_PS_BUILD_ROOT%\p40"
+if not defined ZLC_PS_CHECK_PROJECT_DIR set "ZLC_PS_CHECK_PROJECT_DIR=%ZLC_PS_BUILD_ROOT%\c40"
+if not defined ZLC_PS_LOG_DIR set "ZLC_PS_LOG_DIR=%ZLC_PS_BUILD_ROOT%\logs"
+echo ZLC build root: %ZLC_PS_BUILD_ROOT%
+if defined ZLC_PS_PROJECT_DIR if /I not "!ZLC_PS_PROJECT_DIR:pulse_streamer\build=!"=="!ZLC_PS_PROJECT_DIR!" (
+  echo Ignoring old pulse_streamer build-local ZLC_PS_PROJECT_DIR: !ZLC_PS_PROJECT_DIR!
+  set "ZLC_PS_PROJECT_DIR=%ZLC_PS_BUILD_ROOT%\p40"
+)
+if defined ZLC_PS_CHECK_PROJECT_DIR if /I not "!ZLC_PS_CHECK_PROJECT_DIR:pulse_streamer\build=!"=="!ZLC_PS_CHECK_PROJECT_DIR!" (
+  echo Ignoring old pulse_streamer build-local ZLC_PS_CHECK_PROJECT_DIR: !ZLC_PS_CHECK_PROJECT_DIR!
+  set "ZLC_PS_CHECK_PROJECT_DIR=%ZLC_PS_BUILD_ROOT%\c40"
+)
+call :zlc_clear_unsafe_artifact ZLC_PS_VIVADO_PROJECT
+call :zlc_clear_unsafe_artifact ZLC_PS_VIVADO_BIT
+call :zlc_clear_unsafe_artifact ZLC_PS_VIVADO_LTX
+call :zlc_clear_unsafe_artifact ZLC_PS_BIT
+call :zlc_clear_unsafe_artifact ZLC_PS_LTX
+call :zlc_clear_unsafe_artifact ZLC_VIVADO_PROJECT
+call :zlc_clear_unsafe_artifact ZLC_VIVADO_BIT
+call :zlc_clear_unsafe_artifact ZLC_VIVADO_LTX
+exit /b 0
+
+:zlc_clear_unsafe_artifact
+set "ZLC_ARTIFACT_VAR=%~1"
+set "ZLC_ARTIFACT_VALUE=!%~1!"
+if not defined ZLC_ARTIFACT_VALUE exit /b 0
+if /I not "!ZLC_ARTIFACT_VALUE:pulse_streamer\build=!"=="!ZLC_ARTIFACT_VALUE!" (
+  echo Ignoring old pulse_streamer build-local %~1: !ZLC_ARTIFACT_VALUE!
+  set "%~1="
+)
 exit /b 0
 
 :zlc_find_vivado
@@ -105,52 +211,19 @@ exit /b 0
 
 :zlc_run_tcl
 set "TCL_NAME=%~1"
+set "TCL_STEM=%~n1"
 set "DIRECT_TCL=%STREAMER_DIR%\%TCL_NAME%"
 if not exist "%DIRECT_TCL%" (
   echo Missing Tcl script: %DIRECT_TCL%
   exit /b 2
 )
+if not exist "%ZLC_PS_LOG_DIR%" mkdir "%ZLC_PS_LOG_DIR%" >nul 2>nul
 
-if "%ZLC_PS_DISABLE_SUBST%"=="1" goto zlc_direct_tcl
-
-set "ZLC_SHORT_DRIVE="
-set "ZLC_CREATED_SUBST=0"
-for /f "tokens=1,2,*" %%A in ('subst 2^>nul') do (
-  if /I "%%C"=="%REPO_ROOT%" (
-    set "ZLC_SHORT_DRIVE=%%A"
-    set "ZLC_SHORT_DRIVE=!ZLC_SHORT_DRIVE:~0,2!"
-  )
-)
-if not "%ZLC_PS_SHORT_DRIVE%"=="" (
-  set "ZLC_SHORT_DRIVE=%ZLC_PS_SHORT_DRIVE%"
-)
-if "!ZLC_SHORT_DRIVE!"=="" (
-  for %%D in (Z: Y: X: W: V: U: T: S: R: Q:) do (
-    if "!ZLC_SHORT_DRIVE!"=="" if not exist "%%D\NUL" set "ZLC_SHORT_DRIVE=%%D"
-  )
-)
-if "!ZLC_SHORT_DRIVE!"=="" goto zlc_direct_tcl
-
-if not exist "!ZLC_SHORT_DRIVE!\NUL" (
-  subst !ZLC_SHORT_DRIVE! "%REPO_ROOT%" >nul
-  if errorlevel 1 goto zlc_direct_tcl
-  set "ZLC_CREATED_SUBST=1"
-)
-
-set "SHORT_TCL=!ZLC_SHORT_DRIVE!\fpga\pulse_streamer\%TCL_NAME%"
-if "%ZLC_PS_PROJECT_DIR%"=="" set "ZLC_PS_PROJECT_DIR=!ZLC_SHORT_DRIVE!\fpga\pulse_streamer\build\zlc_pulse_streamer_40ch"
-echo ZLC short Vivado path: !SHORT_TCL!
-echo ZLC short project dir: %ZLC_PS_PROJECT_DIR%
-pushd "!ZLC_SHORT_DRIVE!\"
-call "%ZLC_PS_VIVADO_BIN%" -mode batch -source "!SHORT_TCL!"
-set "ZLC_STATUS=!ERRORLEVEL!"
-popd
-if "!ZLC_CREATED_SUBST!"=="1" subst !ZLC_SHORT_DRIVE! /D >nul 2>nul
-exit /b !ZLC_STATUS!
-
-:zlc_direct_tcl
-if "%ZLC_PS_PROJECT_DIR%"=="" set "ZLC_PS_PROJECT_DIR=%TEMP%\zlc_ps_40ch"
 echo ZLC direct Vivado path: %DIRECT_TCL%
-echo ZLC short project dir: %ZLC_PS_PROJECT_DIR%
-call "%ZLC_PS_VIVADO_BIN%" -mode batch -source "%DIRECT_TCL%"
+if /I "%TCL_NAME%"=="check_40ch_synth.tcl" (
+  echo ZLC check project dir: !ZLC_PS_CHECK_PROJECT_DIR!
+) else (
+  echo ZLC project dir: !ZLC_PS_PROJECT_DIR!
+)
+call "%ZLC_PS_VIVADO_BIN%" -mode batch -journal "!ZLC_PS_LOG_DIR!\!TCL_STEM!.jou" -log "!ZLC_PS_LOG_DIR!\!TCL_STEM!.log" -source "%DIRECT_TCL%"
 exit /b %ERRORLEVEL%

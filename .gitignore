@@ -23,6 +23,7 @@ ENV/
 .env
 .env.*
 !.env.example
+.zlc_python_path
 
 # Jupyter
 .ipynb_checkpoints/
@@ -77,6 +78,7 @@ desktop.ini
 *.run.xml
 *.synctex.gz
 *.toc
+docs/**/*_zh.txt
 
 # Vivado / FPGA generated working files
 .Xil/

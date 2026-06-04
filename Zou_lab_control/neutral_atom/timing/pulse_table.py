@@ -88,6 +88,7 @@ class PulseTableState:
         repeat_start: int | None = None,
         repeat_end: int | None = None,
         repeat_count: int = 1,
+        repeat_forever: bool = True,
         visible_channels: Sequence[str] | None = None,
         channel_labels: Mapping[str, str] | None = None,
     ):
@@ -101,6 +102,7 @@ class PulseTableState:
         self.repeat_start = None if repeat_start is None else int(repeat_start)
         self.repeat_end = None if repeat_end is None else int(repeat_end)
         self.repeat_count = int(repeat_count)
+        self.repeat_forever = bool(repeat_forever)
         self.visible_channels = list(channel_names(visible_channels, "visible_channels", allow_empty=True)) if visible_channels is not None else default_visible_channels(self.channels)
         self.channel_labels = {str(k): str(v) for k, v in dict(channel_labels or {}).items()}
         self.validate()
@@ -178,6 +180,7 @@ class PulseTableState:
             repeat_start=self.repeat_start,
             repeat_end=self.repeat_end,
             repeat_count=self.repeat_count,
+            repeat_forever=self.repeat_forever,
             visible_channels=visible,
             channel_labels={channel: value for channel, value in self.channel_labels.items() if channel in channels},
         )
@@ -210,6 +213,24 @@ class PulseTableState:
     def hidden_active_channels(self) -> list[str]:
         visible = set(self.visible_channels)
         return [channel for channel in self.period_active_channels() if channel not in visible]
+
+    def repeat_forever_boundary_active_channels(self) -> list[str]:
+        """Channels that go high when an internal finite bracket restarts the table.
+
+        With ``repeat_forever=True``, an internal finite repeat bracket is a
+        nested loop.  After that loop count is exhausted, the FPGA finishes the
+        post-bracket periods and then restarts the whole uploaded table.  If
+        period 0 has high outputs, those channels will pulse once at that table
+        boundary.  This is often what an oscilloscope shows as a slow periodic
+        spike.
+        """
+
+        if not self.repeat_forever or self.repeat_start is None or self.repeat_end is None or self.repeat_count <= 1:
+            return []
+        if int(self.repeat_start) == 0 and int(self.repeat_end) == len(self.periods) - 1:
+            return []
+        first_states = self.periods[0].states
+        return [channel for channel, state in zip(self.channels, first_states) if int(state)]
 
     def show_channel(self, channel: str, *, index: int | None = None) -> "PulseTableState":
         channel = self.channels[self.channel_index(channel)]
@@ -339,6 +360,7 @@ class PulseTableState:
         clock_hz: float,
         trigger_channels: Sequence[str] = ("qcm_trigger", "camera_trigger", "trig"),
         x_ns: float | None = None,
+        repeat_forever: bool | None = None,
     ):
         from ..devices.sequencer import compile_pulse_table_runtime_program
 
@@ -349,7 +371,7 @@ class PulseTableState:
             clock_hz=clock_hz,
             trigger_channels=trigger_channels,
             x_ns=x_ns,
-            repeat_forever=True,
+            repeat_forever=self.repeat_forever if repeat_forever is None else bool(repeat_forever),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -368,6 +390,7 @@ class PulseTableState:
             "repeat_start": self.repeat_start,
             "repeat_end": self.repeat_end,
             "repeat_count": self.repeat_count,
+            "repeat_forever": self.repeat_forever,
         }
 
     @classmethod
@@ -387,6 +410,7 @@ class PulseTableState:
             repeat_start=payload.get("repeat_start"),
             repeat_end=payload.get("repeat_end"),
             repeat_count=int(payload.get("repeat_count", 1)),
+            repeat_forever=bool(payload.get("repeat_forever", True)),
         )
 
     def save(self, path: str | Path) -> Path:

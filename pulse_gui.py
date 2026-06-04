@@ -10,7 +10,12 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+import sys
 from typing import Sequence
+
+
+DEFAULT_PULSE_GUI_MAX_CHANNELS = 40
+DEFAULT_PULSE_GUI_XDC = Path("fpga") / "pulse_streamer" / "zlc_pulse_streamer_40ch.xdc"
 
 
 def _default_channels(count: int) -> list[str]:
@@ -49,8 +54,20 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--channel-count",
         type=int,
-        default=40,
-        help="Build default hardware channels ch00... in FPGA bit order when --channels is not given.",
+        default=None,
+        help="Build default hardware channels ch00... in FPGA bit order. Defaults to the XDC channel count.",
+    )
+    parser.add_argument(
+        "--xdc",
+        type=Path,
+        default=Path(os.environ.get("ZLC_PS_XDC", DEFAULT_PULSE_GUI_XDC)),
+        help="Pulse-streamer XDC used to infer the default full channel count.",
+    )
+    parser.add_argument(
+        "--max-channel-count",
+        type=int,
+        default=int(os.environ.get("ZLC_PS_MAX_CHANNEL_COUNT", DEFAULT_PULSE_GUI_MAX_CHANNELS)),
+        help="Maximum channel count accepted from --xdc.",
     )
     parser.add_argument("--clock-hz", type=_positive_float, default=100_000_000.0, help="Sequencer clock in Hz.")
     parser.add_argument("--trigger-channels", nargs="+", help="Hardware channel names counted as camera triggers.")
@@ -60,49 +77,112 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--remote-host",
         default=os.environ.get("ZLC_PS_REMOTE_HOST", "127.0.0.1"),
-        help="Connect to an already running FPGA sequencer server. Use --no-sequencer for offline editing.",
+        help=(
+            "Connect to an already running FPGA sequencer server. "
+            "The default tries localhost and opens offline if no server is listening; "
+            "an explicit --remote-host is treated as required."
+        ),
     )
     parser.add_argument("--remote-port", type=int, default=18861, help="Remote sequencer server port.")
     parser.add_argument(
         "--no-sequencer",
         action="store_true",
-        help="Open only the editor without On Pulse, Wait Done, or Stop Pulse backend calls.",
+        help="Open only the editor without On Pulse or Stop Pulse backend calls.",
     )
     return parser
+
+
+def _remote_host_was_requested(argv: Sequence[str]) -> bool:
+    """Return true when the user explicitly asked for a hardware server."""
+
+    if os.environ.get("ZLC_PS_REMOTE_HOST"):
+        return True
+    for item in argv:
+        text = str(item)
+        if text == "--remote-host" or text.startswith("--remote-host="):
+            return True
+    return False
 
 
 def _resolve_channels(args, state) -> list[str]:
     if args.channels:
         return [str(channel) for channel in args.channels]
+    if args.channel_count is not None:
+        return _default_channels(args.channel_count)
+    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import infer_xdc_channel_count
+
+    count = infer_xdc_channel_count(
+        args.xdc,
+        default=DEFAULT_PULSE_GUI_MAX_CHANNELS,
+        max_count=args.max_channel_count,
+    )
+    return _default_channels(count)
+
+
+def _resolve_channel_labels(args, channels: Sequence[str], state) -> dict[str, str]:
+    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import infer_xdc_channel_labels
+
+    channels = [str(channel) for channel in channels]
+    labels = {
+        channel: label
+        for channel, label in infer_xdc_channel_labels(
+            args.xdc,
+            default=len(channels) or DEFAULT_PULSE_GUI_MAX_CHANNELS,
+            max_count=args.max_channel_count,
+        ).items()
+        if channel in channels and label and label != channel
+    }
     if state is not None:
-        return list(state.channels)
-    return _default_channels(args.channel_count)
+        labels.update({str(channel): str(label) for channel, label in state.channel_labels.items() if channel in channels and label})
+    return labels
+
+
+def _connect_remote_or_offline(args, state, na, *, explicit_remote: bool):
+    seed_channels = _resolve_channels(args, state)
+    seed_trigger_channels = _resolve_trigger_channels(args, seed_channels)
+    try:
+        sequencer = na.RemoteSequencer(
+            host=args.remote_host,
+            port=args.remote_port,
+            channels=seed_channels,
+            clock_hz=args.clock_hz,
+            trigger_channels=seed_trigger_channels,
+            connect_on_init=True,
+        )
+    except Exception as exc:
+        if explicit_remote:
+            raise
+        notice = (
+            f"Could not connect to local sequencer server at {args.remote_host}:{args.remote_port}; "
+            "opened offline editor. Start fpga\\run_server.bat for hardware control, "
+            "or pass --remote-host for a required remote connection."
+        )
+        print(f"ZLC pulse GUI: {notice}\n{type(exc).__name__}: {exc}")
+        return None, seed_channels, seed_trigger_channels, notice
+    return sequencer, list(sequencer.channels), list(sequencer.trigger_channels), None
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+    args = _build_parser().parse_args(argv_list)
+    explicit_remote = _remote_host_was_requested(argv_list)
 
-    from PyQt5 import QtWidgets
+    from PyQt5 import QtCore, QtWidgets
 
     import Zou_lab_control.frontend as zf
     import Zou_lab_control.neutral_atom as na
 
     state = na.PulseTableState.load(args.state) if args.state else None
     sequencer = None
+    startup_notice = None
     if not args.no_sequencer:
         if args.remote_host:
-            seed_channels = _resolve_channels(args, state)
-            seed_trigger_channels = _resolve_trigger_channels(args, seed_channels)
-            sequencer = na.RemoteSequencer(
-                host=args.remote_host,
-                port=args.remote_port,
-                channels=seed_channels,
-                clock_hz=args.clock_hz,
-                trigger_channels=seed_trigger_channels,
-                connect_on_init=True,
+            sequencer, channels, trigger_channels, startup_notice = _connect_remote_or_offline(
+                args,
+                state,
+                na,
+                explicit_remote=explicit_remote,
             )
-            channels = list(sequencer.channels)
-            trigger_channels = list(sequencer.trigger_channels)
         else:
             channels = _resolve_channels(args, state)
             trigger_channels = _resolve_trigger_channels(args, channels)
@@ -125,22 +205,39 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"state={list(state.channels)!r}, sequencer={list(channels)!r}. "
                 "Load a matching pulse JSON or use hardware channel names with display labels."
             )
+    channel_labels = _resolve_channel_labels(args, channels, state)
+    if state is not None and channel_labels:
+        for channel, label in channel_labels.items():
+            if channel in state.channels and channel not in state.channel_labels and label != channel:
+                state.channel_labels[channel] = label
+        state.validate()
 
     if state is None and not args.channels:
         state = na.PulseTableState(
             channels=channels,
             time_step_ns=1_000_000_000.0 / float(getattr(sequencer, "clock_hz", args.clock_hz)),
             visible_channels=channels[: min(4, len(channels))],
+            channel_labels=channel_labels,
         )
 
-    zf.show_pulse_gui(
+    editor = zf.show_pulse_gui(
         state=state,
         channels=channels,
         sequencer=sequencer,
+        channel_labels=channel_labels,
         scale=args.scale,
         window_ratio=args.window_ratio,
     )
-    QtWidgets.QApplication.instance().exec_()
+    if startup_notice:
+        if hasattr(editor, "summary"):
+            editor.summary.setText(startup_notice)
+        if hasattr(editor, "preview_status"):
+            editor.preview_status.setText(startup_notice)
+    app = QtWidgets.QApplication.instance()
+    auto_close_ms = os.environ.get("ZLC_PULSE_GUI_AUTO_CLOSE_MS")
+    if auto_close_ms:
+        QtCore.QTimer.singleShot(max(0, int(auto_close_ms)), app.quit)
+    app.exec_()
     return 0
 
 

@@ -47,7 +47,16 @@ from .live import (
     pulse_repeat_markers,
     pulse_repeat_notation,
 )
-from .notes import NotesBuildResult, build_frontend_manual, compile_notes_pdf, notes_template_dir, render_notes_pdf, write_notes_tex
+from .notes import (
+    NotesBuildResult,
+    build_frontend_manual,
+    compile_notes_pdf,
+    notes_template_dir,
+    render_latex_pdf_clean,
+    render_notes_pdf,
+    render_tex_pdf,
+    write_notes_tex,
+)
 from .session import RunSession, run
 from .selectors import AreaSelector, CrossSelector, DragHLine, DragVLine, InteractionBundle, PlotState, ZoomPan, attach_interaction
 from .style import DEFAULT_STYLE, FONT_PATH, apply_style, enable_long_output, style_context, use_widget_backend
@@ -120,7 +129,9 @@ __all__ = [
     "pulse_repeat_markers",
     "pulse_repeat_notation",
     "require_attrs",
+    "render_latex_pdf_clean",
     "render_notes_pdf",
+    "render_tex_pdf",
     "run",
     "save_figure_data",
     "show_pulse_gui",

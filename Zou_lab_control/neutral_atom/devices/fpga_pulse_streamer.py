@@ -13,6 +13,7 @@ from pathlib import Path
 import json
 import os
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -24,9 +25,12 @@ from ..timing.verilog import CONTROL_PORTS, safe_identifier
 
 
 DEFAULT_CHANNELS = ["trap", "cooling", "probe", "qcm_trigger"]
+DEFAULT_FPGA_CHANNEL_COUNT = 40
 DEFAULT_VIO_FILTER = 'CELL_NAME=~"*vio*"'
 DEFAULT_MAX_EDGES = 1024
 DEFAULT_TICK_WIDTH = 32
+DEFAULT_PROJECT_NAME = "p40"
+DEFAULT_TOP_NAME = "zlc_pulse_streamer_top_40ch"
 
 
 @dataclass(frozen=True)
@@ -53,6 +57,91 @@ class PulseStreamerHDLFiles:
     core_path: Path
     top_example_path: Path
     manifest_path: Path
+
+
+def hardware_channel_names(count: int = DEFAULT_FPGA_CHANNEL_COUNT) -> list[str]:
+    """Return hardware channel names in FPGA bit order."""
+
+    count = _positive_int(count, "count")
+    return [f"ch{index:02d}" for index in range(count)]
+
+
+def infer_xdc_channel_count(
+    xdc_path: str | Path | None = None,
+    *,
+    default: int = DEFAULT_FPGA_CHANNEL_COUNT,
+    max_count: int | None = DEFAULT_FPGA_CHANNEL_COUNT,
+) -> int:
+    """Infer the full FPGA output width from ``get_ports {ch[n]}`` constraints.
+
+    A completed board XDC is the most concrete source of the physical output
+    contract.  If no XDC is present, the caller gets ``default`` so GUI/offline
+    workflows still open cleanly.
+    """
+
+    default = _positive_int(default, "default")
+    path = _resolve_xdc_path(xdc_path)
+    if path is None or not path.exists():
+        return default
+    text = path.read_text(encoding="utf-8", errors="replace")
+    indices = [int(match.group(1)) for match in re.finditer(r"get_ports\s+\{?ch\[(\d+)\]\}?", text)]
+    if not indices:
+        return default
+    count = max(indices) + 1
+    missing = sorted(set(range(count)) - set(indices))
+    if missing:
+        raise ValueError(f"XDC channel constraints are not contiguous; missing ch indices: {missing}.")
+    if max_count is not None and count > int(max_count):
+        raise ValueError(f"XDC defines {count} channels, above max_count={int(max_count)}.")
+    return count
+
+
+def infer_xdc_channels(
+    xdc_path: str | Path | None = None,
+    *,
+    default: int = DEFAULT_FPGA_CHANNEL_COUNT,
+    max_count: int | None = DEFAULT_FPGA_CHANNEL_COUNT,
+) -> list[str]:
+    """Return ``ch00..`` names inferred from a completed pulse-streamer XDC."""
+
+    return hardware_channel_names(infer_xdc_channel_count(xdc_path, default=default, max_count=max_count))
+
+
+def infer_xdc_channel_labels(
+    xdc_path: str | Path | None = None,
+    *,
+    default: int = DEFAULT_FPGA_CHANNEL_COUNT,
+    max_count: int | None = DEFAULT_FPGA_CHANNEL_COUNT,
+) -> dict[str, str]:
+    """Return display labels parsed from ``zlc_pulse_streamer_40ch.xdc`` comments.
+
+    The hardware channel names stay ``ch00..`` in FPGA bit order.  Labels are
+    only front-end names, parsed from comments such as ``;# ch04 <- cooling_pgc``.
+    Existing pulse JSON labels should take priority over this default map.
+    """
+
+    channels = infer_xdc_channels(xdc_path, default=default, max_count=max_count)
+    labels = {channel: channel for channel in channels}
+    path = _resolve_xdc_path(xdc_path)
+    if path is None or not path.exists():
+        return labels
+    text = path.read_text(encoding="utf-8", errors="replace")
+    for line in text.splitlines():
+        port_match = re.search(r"get_ports\s+\{?ch\[(\d+)\]\}?", line)
+        if not port_match:
+            continue
+        channel = f"ch{int(port_match.group(1)):02d}"
+        if channel not in labels:
+            continue
+        comment = ""
+        if ";#" in line:
+            comment = line.split(";#", 1)[1]
+        elif "#" in line:
+            comment = line.split("#", 1)[1]
+        label = _label_from_xdc_comment(comment, channel)
+        if label:
+            labels[channel] = label
+    return labels
 
 
 def validate_pulse_streamer_program(
@@ -152,12 +241,19 @@ module {module_name} #(
 
     localparam integer MAX_EDGES = {actual_edges};
 
+    // Keep the runtime read side to one table address.  Vivado otherwise has
+    // to synthesize a multi-read-port memory, which is expensive on Artix-7.
     (* ram_style = "distributed" *) reg [TICK_WIDTH-1:0] tick_mem [0:MAX_EDGES-1];
     (* ram_style = "distributed" *) reg [CHANNEL_COUNT-1:0] mask_mem [0:MAX_EDGES-1];
 
     reg [CHANNEL_COUNT-1:0] state_mask = {{CHANNEL_COUNT{{1'b0}}}};
     reg [TICK_WIDTH-1:0] time_count = {{TICK_WIDTH{{1'b0}}}};
     reg [TICK_WIDTH-1:0] final_tick = {{TICK_WIDTH{{1'b0}}}};
+    reg [TICK_WIDTH-1:0] first_tick_shadow = {{TICK_WIDTH{{1'b0}}}};
+    reg [CHANNEL_COUNT-1:0] first_mask_shadow = {{CHANNEL_COUNT{{1'b0}}}};
+    reg [TICK_WIDTH-1:0] loop_start_tick_shadow = {{TICK_WIDTH{{1'b0}}}};
+    reg [CHANNEL_COUNT-1:0] loop_start_mask_shadow = {{CHANNEL_COUNT{{1'b0}}}};
+    reg [TICK_WIDTH-1:0] final_tick_shadow = {{TICK_WIDTH{{1'b0}}}};
     reg [EDGE_ADDR_WIDTH:0] edge_index = {{(EDGE_ADDR_WIDTH + 1){{1'b0}}}};
     reg [EDGE_ADDR_WIDTH:0] active_count = {{(EDGE_ADDR_WIDTH + 1){{1'b0}}}};
     reg repeat_forever_active = 1'b0;
@@ -166,24 +262,48 @@ module {module_name} #(
     reg [31:0] loop_count_active = 32'd1;
     reg [31:0] loops_remaining = 32'd1;
 
+    reg reset_meta = 1'b0;
+    reg reset_sync = 1'b0;
+    reg start_meta = 1'b0;
     reg start_sync = 1'b0;
     reg start_prev = 1'b0;
+    reg prog_we_meta = 1'b0;
+    reg prog_we_sync = 1'b0;
+    reg prog_we_prev = 1'b0;
 
-    wire start_event = start_sync != start_prev;
+    wire start_event = start_sync && !start_prev;
+    wire prog_we_event = prog_we_sync != prog_we_prev;
     wire [EDGE_ADDR_WIDTH-1:0] edge_addr = edge_index[EDGE_ADDR_WIDTH-1:0];
 
     assign out = state_mask;
 
     always @(posedge clk) begin
-        start_sync <= start;
+        reset_meta <= reset;
+        reset_sync <= reset_meta;
+        start_meta <= start;
+        start_sync <= start_meta;
         start_prev <= start_sync;
+        prog_we_meta <= prog_we;
+        prog_we_sync <= prog_we_meta;
+        prog_we_prev <= prog_we_sync;
 
-        if (reset && prog_we) begin
+        if (reset_sync && prog_we_event) begin
             tick_mem[prog_addr] <= prog_tick;
             mask_mem[prog_addr] <= prog_mask;
+            if (prog_addr == {{EDGE_ADDR_WIDTH{{1'b0}}}}) begin
+                first_tick_shadow <= prog_tick;
+                first_mask_shadow <= prog_mask;
+            end
+            if (prog_addr == loop_start_addr) begin
+                loop_start_tick_shadow <= prog_tick;
+                loop_start_mask_shadow <= prog_mask;
+            end
+            if (prog_count != 0 && prog_addr == (prog_count[EDGE_ADDR_WIDTH-1:0] - 1'b1)) begin
+                final_tick_shadow <= prog_tick;
+            end
         end
 
-        if (reset) begin
+        if (reset_sync) begin
             running <= 1'b0;
             done <= 1'b0;
             state_mask <= {{CHANNEL_COUNT{{1'b0}}}};
@@ -199,15 +319,15 @@ module {module_name} #(
         end else if (start_event && !running) begin
             running <= (prog_count != 0);
             done <= (prog_count == 0);
-            final_tick <= (prog_count == 0) ? {{TICK_WIDTH{{1'b0}}}} : tick_mem[prog_count[EDGE_ADDR_WIDTH-1:0] - 1'b1];
+            final_tick <= (prog_count == 0) ? {{TICK_WIDTH{{1'b0}}}} : final_tick_shadow;
             active_count <= prog_count;
             repeat_forever_active <= repeat_forever;
             loop_start_active <= loop_start_addr;
             loop_end_active <= loop_end_tick;
             loop_count_active <= (loop_count == 0) ? 32'd1 : loop_count;
             loops_remaining <= (loop_count == 0) ? 32'd1 : loop_count;
-            if (prog_count != 0 && tick_mem[0] == {{TICK_WIDTH{{1'b0}}}}) begin
-                state_mask <= mask_mem[0];
+            if (prog_count != 0 && first_tick_shadow == {{TICK_WIDTH{{1'b0}}}}) begin
+                state_mask <= first_mask_shadow;
                 time_count <= {{{{(TICK_WIDTH-1){{1'b0}}}}, 1'b1}};
                 edge_index <= {{{{EDGE_ADDR_WIDTH{{1'b0}}}}, 1'b1}};
             end else begin
@@ -217,14 +337,14 @@ module {module_name} #(
             end
         end else if (running) begin
             if (loop_count_active > 32'd1 && loops_remaining > 32'd1 && time_count >= loop_end_active) begin
-                state_mask <= mask_mem[loop_start_active];
-                time_count <= tick_mem[loop_start_active] + 1'b1;
+                state_mask <= loop_start_mask_shadow;
+                time_count <= loop_start_tick_shadow + 1'b1;
                 edge_index <= {{1'b0, loop_start_active}} + 1'b1;
                 loops_remaining <= loops_remaining - 1'b1;
             end else if (time_count >= final_tick) begin
                 if (repeat_forever_active) begin
-                    if (tick_mem[0] == {{TICK_WIDTH{{1'b0}}}}) begin
-                        state_mask <= mask_mem[0];
+                    if (first_tick_shadow == {{TICK_WIDTH{{1'b0}}}}) begin
+                        state_mask <= first_mask_shadow;
                         time_count <= {{{{(TICK_WIDTH-1){{1'b0}}}}, 1'b1}};
                         edge_index <= {{{{EDGE_ADDR_WIDTH{{1'b0}}}}, 1'b1}};
                     end else begin
@@ -499,9 +619,7 @@ class VivadoPulseStreamerSession:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.program_path = self.state_dir / "prepared_program.json"
         self.vivado = vivado or os.environ.get("ZLC_PS_VIVADO_BIN", os.environ.get("ZLC_VIVADO_BIN", "vivado"))
-        self.project = project if project is not None else _env_first("ZLC_PS_VIVADO_PROJECT", "ZLC_VIVADO_PROJECT")
-        self.bitstream = bitstream if bitstream is not None else _env_first("ZLC_PS_VIVADO_BIT", "ZLC_VIVADO_BIT")
-        self.probes = probes if probes is not None else _env_first("ZLC_PS_VIVADO_LTX", "ZLC_VIVADO_LTX")
+        self.project, self.bitstream, self.probes = _resolve_vivado_artifacts(project=project, bitstream=bitstream, probes=probes)
         self.vio_filter = str(vio_filter)
         self.program_on_run = program_on_run if program_on_run is not None else _env_first("ZLC_PS_VIVADO_PROGRAM_ON_RUN", "ZLC_VIVADO_PROGRAM_ON_RUN")
         self.probe_names = probe_names or PulseStreamerProbeNames()
@@ -515,6 +633,7 @@ class VivadoPulseStreamerSession:
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._counter = 0
         self._closed = False
+        self._uploaded_program: RuntimeSequenceProgram | None = None
         self._log_path = self.state_dir / "vivado_session.log"
 
     def start(self) -> "VivadoPulseStreamerSession":
@@ -554,7 +673,9 @@ class VivadoPulseStreamerSession:
         channel_count = len(program.channels) if self.channel_count is None else self.channel_count
         validate_pulse_streamer_program(program, max_edges=self.max_edges, tick_width=self.tick_width, channel_count=channel_count)
         self._write_program(program)
-        self._execute(_prepare_tcl(program, probe_names=self.probe_names), action="prepare", timeout=self.action_timeout)
+        previous = self._uploaded_program
+        self._execute(_prepare_tcl(program, probe_names=self.probe_names, previous_program=previous), action="prepare", timeout=self.action_timeout)
+        self._uploaded_program = program
 
     def fire(self, program: RuntimeSequenceProgram | None = None) -> None:
         if program is not None:
@@ -594,6 +715,7 @@ class VivadoPulseStreamerSession:
         except subprocess.TimeoutExpired:
             process.terminate()
         self._process = None
+        self._uploaded_program = None
 
     def _write_program(self, program: RuntimeSequenceProgram) -> None:
         self.program_path.write_text(json.dumps(program.to_dict(), indent=2), encoding="utf-8")
@@ -702,13 +824,14 @@ def run_action(
     tick_width = _env_int("ZLC_PS_TICK_WIDTH", DEFAULT_TICK_WIDTH) if tick_width is None else tick_width
     if channel_count is None:
         channel_count = _env_int("ZLC_PS_CHANNEL_COUNT", len(program.channels) if program is not None else len(DEFAULT_CHANNELS))
+    project, bitstream, probes = _resolve_vivado_artifacts(project=None, bitstream=None, probes=None)
     tcl_path = write_vivado_pulse_streamer_tcl(
         state / f"pulse_streamer_{action}.tcl",
         action,
         program=program,
-        project=_env_first("ZLC_PS_VIVADO_PROJECT", "ZLC_VIVADO_PROJECT"),
-        bitstream=_env_first("ZLC_PS_VIVADO_BIT", "ZLC_VIVADO_BIT"),
-        probes=_env_first("ZLC_PS_VIVADO_LTX", "ZLC_VIVADO_LTX"),
+        project=project,
+        bitstream=bitstream,
+        probes=probes,
         vio_filter=os.environ.get("ZLC_PS_VIO_FILTER", os.environ.get("ZLC_VIO_FILTER", DEFAULT_VIO_FILTER)),
         program_on_run=_env_first("ZLC_PS_VIVADO_PROGRAM_ON_RUN", "ZLC_VIVADO_PROGRAM_ON_RUN"),
         max_edges=max_edges,
@@ -734,7 +857,21 @@ def run_action(
 
 def build_arg_parser() -> ArgumentParser:
     parser = ArgumentParser(description="Prepare/fire a runtime-programmable FPGA pulse streamer.")
-    parser.add_argument("action", choices=["prepare", "fire", "wait_done", "safe_state", "abort", "generate_hdl"], nargs="?", default=None)
+    parser.add_argument(
+        "action",
+        choices=[
+            "prepare",
+            "fire",
+            "wait_done",
+            "safe_state",
+            "abort",
+            "generate_hdl",
+            "infer_channel_count",
+            "infer_channels",
+        ],
+        nargs="?",
+        default=None,
+    )
     parser.add_argument("--program", default=None, help="RuntimeSequenceProgram JSON path. Defaults to ZLC_SEQUENCE_PROGRAM.")
     parser.add_argument("--state-dir", default=None, help="State/log directory. Defaults to ZLC_STATE_DIR.")
     parser.add_argument("--vivado", default=os.environ.get("ZLC_PS_VIVADO_BIN", os.environ.get("ZLC_VIVADO_BIN", "vivado")))
@@ -745,6 +882,9 @@ def build_arg_parser() -> ArgumentParser:
     parser.add_argument("--channel-count", type=int, default=None)
     parser.add_argument("--output-dir", default="generated_pulse_streamer")
     parser.add_argument("--channels", nargs="+", default=DEFAULT_CHANNELS)
+    parser.add_argument("--xdc", default=None, help="Completed pulse-streamer XDC used to infer ch00.. width.")
+    parser.add_argument("--default-count", type=int, default=DEFAULT_FPGA_CHANNEL_COUNT)
+    parser.add_argument("--max-channel-count", type=int, default=DEFAULT_FPGA_CHANNEL_COUNT)
     return parser
 
 
@@ -761,6 +901,12 @@ def main(argv=None) -> int:
         print(files.core_path)
         print(files.top_example_path)
         print(files.manifest_path)
+        return 0
+    if action == "infer_channel_count":
+        print(infer_xdc_channel_count(args.xdc, default=args.default_count, max_count=args.max_channel_count))
+        return 0
+    if action == "infer_channels":
+        print(" ".join(infer_xdc_channels(args.xdc, default=args.default_count, max_count=args.max_channel_count)))
         return 0
     run_action(
         action,
@@ -803,12 +949,13 @@ def _vivado_common_tcl(
         probes_line,
         f"set vio_filter {{{vio_filter}}}",
         "set hw_server_url [env_or ZLC_PS_HW_SERVER_URL [env_or ZLC_HW_SERVER_URL \"\"]]",
+        "set zlc_verbose_vio [env_or ZLC_PS_VERBOSE_VIO \"0\"]",
         program_line,
         "if {$project ne \"\" && ![file exists $project]} {",
         "    puts \"Vivado project not found; continuing without open_project: $project\"",
         "    set project \"\"",
         "}",
-        "if {$probes eq \"\"} { error \"Vivado .ltx probe file is required for VIO control. Set ZLC_PS_VIVADO_LTX to the Probes file used when programming the FPGA, or run fpga/build_and_program.bat after completing the 40ch XDC.\" }",
+        "if {$probes eq \"\"} { error \"Vivado .ltx probe file is required for VIO control. Set ZLC_PS_VIVADO_LTX to the Probes file used when programming the FPGA, or check the 40ch XDC pin map and run fpga/build_and_program.bat.\" }",
         "if {![file exists $probes]} { error \"Vivado probe file not found: $probes\" }",
         "if {$program_on_run ne \"0\" && ($bitstream eq \"\" || ![file exists $bitstream])} {",
         "    error \"Vivado bitstream not found for programming: $bitstream\"",
@@ -898,12 +1045,18 @@ def _vivado_common_tcl(
         "    }",
         "}",
         "proc zlc_probe {vio names} {",
+        "    global zlc_probe_cache",
+        "    set cache_key \"$vio|[join $names {|}]\"",
+        "    if {[info exists zlc_probe_cache($cache_key)]} { return $zlc_probe_cache($cache_key) }",
         "    set matches {}",
         "    foreach name $names {",
         "        set probe [lindex [get_hw_probes $name -of_objects $vio] 0]",
         "        if {$probe ne \"\"} { lappend matches $probe }",
         "    }",
-        "    if {[llength $matches] == 1} { return [lindex $matches 0] }",
+        "    if {[llength $matches] == 1} {",
+        "        set zlc_probe_cache($cache_key) [lindex $matches 0]",
+        "        return [lindex $matches 0]",
+        "    }",
         "    if {[llength $matches] == 0} {",
         "        foreach candidate [get_hw_probes -of_objects $vio] {",
         "            set candidate_name [get_property NAME $candidate]",
@@ -919,16 +1072,22 @@ def _vivado_common_tcl(
         "    foreach probe $matches {",
         "        if {[lsearch -exact $unique_matches $probe] < 0} { lappend unique_matches $probe }",
         "    }",
-        "    if {[llength $unique_matches] == 1} { return [lindex $unique_matches 0] }",
+        "    if {[llength $unique_matches] == 1} {",
+        "        set zlc_probe_cache($cache_key) [lindex $unique_matches 0]",
+        "        return [lindex $unique_matches 0]",
+        "    }",
         "    zlc_list_probes $vio",
         "    if {[llength $unique_matches] > 1} { error \"VIO probe aliases '$names' matched multiple probes.\" }",
         "    error \"VIO probe aliases '$names' were not found.\"",
         "}",
         "proc zlc_stage_probe {vio name value} {",
+        "    global zlc_verbose_vio",
         "    set probe [zlc_probe $vio $name]",
         "    set_property OUTPUT_VALUE_RADIX UNSIGNED $probe",
         "    set_property OUTPUT_VALUE $value $probe",
-        "    puts \"ZLC pulse-streamer VIO: [lindex $name 0]=$value\"",
+        "    if {$zlc_verbose_vio ne \"\" && $zlc_verbose_vio ne \"0\"} {",
+        "        puts \"ZLC pulse-streamer VIO: [lindex $name 0]=$value\"",
+        "    }",
         "    return $probe",
         "}",
         "proc zlc_commit_probes {probes} {",
@@ -971,41 +1130,90 @@ def _vivado_common_tcl(
     ]
 
 
-def _prepare_tcl(program: RuntimeSequenceProgram, *, probe_names: PulseStreamerProbeNames) -> list[str]:
+def _prepare_edge_indices(program: RuntimeSequenceProgram, previous_program: RuntimeSequenceProgram | None = None) -> list[int]:
+    if not program.ticks:
+        return []
+    full = list(range(len(program.ticks)))
+    if previous_program is None:
+        return full
+    if list(previous_program.channels) != list(program.channels):
+        return full
+    if float(previous_program.clock_hz) != float(program.clock_hz):
+        return full
+    changed = {
+        index
+        for index, (tick, mask) in enumerate(zip(program.ticks, program.masks))
+        if index >= len(previous_program.ticks)
+        or index >= len(previous_program.masks)
+        or int(previous_program.ticks[index]) != int(tick)
+        or int(previous_program.masks[index]) != int(mask)
+    }
+    loop_start_index = int(program.loop_start_index) if program.ticks else 0
+    critical = {0, max(0, min(loop_start_index, len(program.ticks) - 1)), len(program.ticks) - 1}
+    return sorted(index for index in (changed | critical) if 0 <= index < len(program.ticks))
+
+
+def _prepare_tcl(
+    program: RuntimeSequenceProgram,
+    *,
+    probe_names: PulseStreamerProbeNames,
+    previous_program: RuntimeSequenceProgram | None = None,
+) -> list[str]:
     loop_end_tick = int(program.loop_end_tick) if int(program.loop_end_tick) > 0 else (int(program.ticks[-1]) if program.ticks else 0)
     loop_start_index = int(program.loop_start_index) if program.ticks else 0
     loop_count = max(1, int(program.loop_count))
+    write_indices = _prepare_edge_indices(program, previous_program)
+    first_write_index = write_indices[0] if write_indices else None
+    remaining_write_indices = write_indices[1:] if first_write_index is not None else []
     lines = [
+        "set zlc_prog_we_toggle_value [zlc_output_probe_bool $vio $zlc_prog_we_probe]",
+    ]
+    if first_write_index is not None:
+        lines.append("set zlc_prog_we_toggle_value [expr {$zlc_prog_we_toggle_value ? 0 : 1}]")
+    lines.extend(
+        [
         "set zlc_batch {}",
         "lappend zlc_batch [zlc_stage_probe $vio $zlc_reset_probe 1]",
         "lappend zlc_batch [zlc_stage_probe $vio $zlc_start_probe 0]",
-        "lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_we_probe 0]",
         f"lappend zlc_batch [zlc_stage_probe $vio $zlc_repeat_forever_probe {1 if program.repeat_forever else 0}]",
         f"lappend zlc_batch [zlc_stage_probe $vio $zlc_loop_start_addr_probe {loop_start_index}]",
         f"lappend zlc_batch [zlc_stage_probe $vio $zlc_loop_end_tick_probe {loop_end_tick}]",
         f"lappend zlc_batch [zlc_stage_probe $vio $zlc_loop_count_probe {loop_count}]",
         f"lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_count_probe {len(program.ticks)}]",
-        "zlc_commit_probes $zlc_batch",
-    ]
-    for index, (tick, mask) in enumerate(zip(program.ticks, program.masks)):
+        ]
+    )
+    if first_write_index is not None:
+        tick = int(program.ticks[first_write_index])
+        mask = int(program.masks[first_write_index])
         lines.extend(
             [
+                f"lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_addr_probe {first_write_index}]",
+                f"lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_tick_probe {tick}]",
+                f"lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_mask_probe {mask}]",
+                "lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_we_probe $zlc_prog_we_toggle_value]",
+            ]
+        )
+    lines.append("zlc_commit_probes $zlc_batch")
+    for index in remaining_write_indices:
+        tick = int(program.ticks[index])
+        mask = int(program.masks[index])
+        lines.extend(
+            [
+                "set zlc_prog_we_toggle_value [expr {$zlc_prog_we_toggle_value ? 0 : 1}]",
                 "set zlc_batch {}",
                 f"lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_addr_probe {index}]",
-                f"lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_tick_probe {int(tick)}]",
-                f"lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_mask_probe {int(mask)}]",
-                "lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_we_probe 1]",
+                f"lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_tick_probe {tick}]",
+                f"lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_mask_probe {mask}]",
+                "lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_we_probe $zlc_prog_we_toggle_value]",
                 "zlc_commit_probes $zlc_batch",
             ]
         )
     lines.extend(
         [
             "set zlc_batch {}",
-            "lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_we_probe 0]",
             "lappend zlc_batch [zlc_stage_probe $vio $zlc_reset_probe 0]",
             "zlc_commit_probes $zlc_batch",
-            "set zlc_start_toggle_value 0",
-            f"puts \"ZLC pulse-streamer prepared sequence {program.sequence_id} with {len(program.ticks)} edges repeat_forever={int(program.repeat_forever)} loop_start={loop_start_index} loop_end={loop_end_tick} loop_count={loop_count}\"",
+            f"puts \"ZLC pulse-streamer prepared sequence {program.sequence_id} wrote {len(write_indices)}/{len(program.ticks)} edge rows initial_edge_batch={1 if first_write_index is not None else 0} repeat_forever={int(program.repeat_forever)} loop_start={loop_start_index} loop_end={loop_end_tick} loop_count={loop_count}\"",
         ]
     )
     return lines
@@ -1013,14 +1221,15 @@ def _prepare_tcl(program: RuntimeSequenceProgram, *, probe_names: PulseStreamerP
 
 def _fire_tcl(*, probe_names: PulseStreamerProbeNames) -> list[str]:
     return [
-        "if {![info exists zlc_start_toggle_value]} { set zlc_start_toggle_value [zlc_output_probe_bool $vio $zlc_start_probe] }",
-        "set zlc_start_next [expr {$zlc_start_toggle_value ? 0 : 1}]",
+        "if {[zlc_output_probe_bool $vio $zlc_start_probe]} {",
+        "    zlc_set_probe $vio $zlc_start_probe 0",
+        "}",
         "set zlc_batch {}",
         "lappend zlc_batch [zlc_stage_probe $vio $zlc_reset_probe 0]",
-        "lappend zlc_batch [zlc_stage_probe $vio $zlc_start_probe $zlc_start_next]",
+        "lappend zlc_batch [zlc_stage_probe $vio $zlc_start_probe 1]",
         "zlc_commit_probes $zlc_batch",
-        "set zlc_start_toggle_value $zlc_start_next",
-        "puts \"ZLC pulse-streamer start toggle sent value=$zlc_start_next\"",
+        "zlc_set_probe $vio $zlc_start_probe 0",
+        "puts \"ZLC pulse-streamer start pulse sent\"",
     ]
 
 
@@ -1046,11 +1255,9 @@ def _safe_state_tcl(*, probe_names: PulseStreamerProbeNames) -> list[str]:
     return [
         "set zlc_batch {}",
         "lappend zlc_batch [zlc_stage_probe $vio $zlc_start_probe 0]",
-        "lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_we_probe 0]",
         "lappend zlc_batch [zlc_stage_probe $vio $zlc_repeat_forever_probe 0]",
         "lappend zlc_batch [zlc_stage_probe $vio $zlc_reset_probe 1]",
         "zlc_commit_probes $zlc_batch",
-        "set zlc_start_toggle_value 0",
         "puts \"ZLC pulse-streamer safe state requested\"",
     ]
 
@@ -1100,6 +1307,24 @@ def _safe_channel_identifiers(channels: Sequence[str], *, reserved: set[str]) ->
     return safe_channels
 
 
+def _label_from_xdc_comment(comment: str, channel: str) -> str:
+    text = str(comment or "").strip()
+    if not text:
+        return ""
+    if "<-" in text:
+        text = text.split("<-", 1)[1].strip()
+    elif "=" in text:
+        left, right = text.split("=", 1)
+        if channel in left or re.search(r"\bch\d+\b", left):
+            text = right.strip()
+    text = text.split(",", 1)[0].strip()
+    if "/" in text:
+        text = text.split("/")[-1].strip()
+    text = re.sub(r"\s+", "_", text)
+    text = re.sub(r"[^0-9A-Za-z_\[\]-]+", "", text)
+    return text
+
+
 def _positive_int(value, name: str) -> int:
     out = int(value)
     if out <= 0:
@@ -1133,11 +1358,93 @@ def _env_first(*names: str) -> str | None:
     return None
 
 
+def _path_is_under(child: Path, parent: Path) -> bool:
+    try:
+        child.resolve().relative_to(parent.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _default_project_root() -> Path:
+    root = _env_first("ZLC_PS_PROJECT_ROOT")
+    if root:
+        return Path(root)
+    return Path(__file__).resolve().parents[3] / "fpga" / "build"
+
+
+def _old_pulse_streamer_build_dir() -> Path:
+    return Path(__file__).resolve().parents[3] / "fpga" / "pulse_streamer" / "build"
+
+
+def _safe_project_dir(path: str | Path | None) -> Path:
+    fallback = _default_project_root() / "p40"
+    candidate = Path(path) if path else fallback
+    if _path_is_under(candidate, _old_pulse_streamer_build_dir()):
+        return fallback
+    return candidate
+
+
+def _safe_vivado_artifact_env(value: str | None) -> str | None:
+    if not value:
+        return None
+    candidate = Path(value)
+    if _path_is_under(candidate, _old_pulse_streamer_build_dir()):
+        return None
+    return str(candidate)
+
+
+def _default_vivado_artifact_paths(project_dir: Path) -> tuple[Path, Path, Path]:
+    impl_dir = project_dir / f"{DEFAULT_PROJECT_NAME}.runs" / "impl_1"
+    return (
+        project_dir / f"{DEFAULT_PROJECT_NAME}.xpr",
+        impl_dir / f"{DEFAULT_TOP_NAME}.bit",
+        impl_dir / f"{DEFAULT_TOP_NAME}.ltx",
+    )
+
+
+def _resolve_vivado_artifacts(
+    *,
+    project: str | None,
+    bitstream: str | None,
+    probes: str | None,
+) -> tuple[str | None, str | None, str | None]:
+    project_dir = _safe_project_dir(_env_first("ZLC_PS_PROJECT_DIR"))
+    default_project, default_bitstream, default_probes = _default_vivado_artifact_paths(project_dir)
+    resolved_project = project if project is not None else _safe_vivado_artifact_env(_env_first("ZLC_PS_VIVADO_PROJECT", "ZLC_VIVADO_PROJECT"))
+    resolved_bitstream = bitstream if bitstream is not None else _safe_vivado_artifact_env(_env_first("ZLC_PS_VIVADO_BIT", "ZLC_VIVADO_BIT"))
+    resolved_probes = probes if probes is not None else _safe_vivado_artifact_env(_env_first("ZLC_PS_VIVADO_LTX", "ZLC_VIVADO_LTX"))
+    if not resolved_project:
+        resolved_project = str(default_project)
+    if not resolved_bitstream:
+        resolved_bitstream = str(default_bitstream)
+    if not resolved_probes:
+        resolved_probes = str(default_probes)
+    return resolved_project, resolved_bitstream, resolved_probes
+
+
+def _resolve_xdc_path(xdc_path: str | Path | None) -> Path | None:
+    if xdc_path is not None and str(xdc_path).strip():
+        return Path(xdc_path)
+    for env_name in ("ZLC_PS_40CH_XDC", "ZLC_PS_XDC"):
+        value = os.environ.get(env_name)
+        if value:
+            return Path(value)
+    cwd_candidate = Path.cwd() / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_40ch.xdc"
+    if cwd_candidate.exists():
+        return cwd_candidate
+    package_candidate = Path(__file__).resolve().parents[3] / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_40ch.xdc"
+    if package_candidate.exists():
+        return package_candidate
+    return None
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())
 
 
 __all__ = [
+    "DEFAULT_FPGA_CHANNEL_COUNT",
     "DEFAULT_MAX_EDGES",
     "DEFAULT_TICK_WIDTH",
     "DEFAULT_VIO_FILTER",
@@ -1146,6 +1453,10 @@ __all__ = [
     "build_arg_parser",
     "generate_pulse_streamer_core",
     "generate_pulse_streamer_top_example",
+    "hardware_channel_names",
+    "infer_xdc_channel_count",
+    "infer_xdc_channel_labels",
+    "infer_xdc_channels",
     "main",
     "run_action",
     "validate_pulse_streamer_program",

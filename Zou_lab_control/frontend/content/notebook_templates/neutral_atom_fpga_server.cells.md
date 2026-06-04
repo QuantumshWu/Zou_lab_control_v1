@@ -3,7 +3,7 @@
 
 这个 notebook 在 Verilog/FPGA 电脑上运行。它启动 40ch FPGA pulse-streamer server，等待控制电脑上的 `RemoteSequencer` 连接。
 
-推荐架构是固定烧一个 `zlc_pulse_streamer_top_40ch` bitstream。control 电脑每次 acquisition 只发送 `PulseSequence` 或 GUI 的 `PulseTableState`；FPGA 电脑把它编译成未展开的 40-bit `ticks/masks` edge table 和 repeat metadata，上传到 FPGA runtime RAM，再给一个 start toggle。网络和 Vivado 只负责上传表和发 start，不参与微秒级 timing。
+推荐架构是固定烧一个 `zlc_pulse_streamer_top_40ch` bitstream。control 电脑每次 acquisition 只发送 `PulseSequence` 或 GUI 的 `PulseTableState`；FPGA 电脑把它编译成未展开的 40-bit `ticks/masks` edge table 和 repeat metadata，上传到 FPGA runtime RAM，再给一个明确的 `zlc_start` low-high-low pulse。网络和 Vivado 只负责上传表和发 start，不参与微秒级 timing。
 
 ```text
 control computer RemoteSequencer
@@ -39,7 +39,7 @@ cd D:\ZLC
 .\fpga\build_and_program.bat
 ```
 
-`--check` 不需要真实 pin XDC，只做 40ch HDL/VIO 宽度自查。真实 build/program 需要先把 `fpga\pulse_streamer\zlc_pulse_streamer_40ch.xdc.template` 复制成 `zlc_pulse_streamer_40ch.xdc` 并填完 `ch00...ch39` 的真实 package pin。也可以设置：
+`--check` 不需要真实 pin XDC，只做 40ch HDL/VIO 宽度自查。真实 build/program 默认使用 `fpga\pulse_streamer\zlc_pulse_streamer_40ch.xdc`；这份 XDC 已从旧 `address_switch` 的 pin map 生成，前四路是 `ch00=trap`、`ch01=cooling`、`ch02=probe`、`ch03=qcm_trigger/trig`。如果板卡或转接线不同，复制 `zlc_pulse_streamer_40ch.xdc.template` 到别处并设置：
 
 ```powershell
 $env:ZLC_PS_40CH_XDC = "D:\fpga_pin_maps\zlc_pulse_streamer_40ch_my_board.xdc"
@@ -53,12 +53,12 @@ $env:ZLC_PS_VIVADO_BIN = "C:\Xilinx\Vivado\2019.2\bin\vivado.bat"
 
 `fpga\build_and_program.bat --diagnose` 可以列出 Vivado hardware target 和 FPGA device，不会 program 或 fire pulse。若 Vivado GUI 能看到 Digilent target 但 `Number of devices: 0`，先检查板卡供电、JTAG/mode jumper、线缆、power-source jumper，再重新 Auto Connect。
 
-生成物通常在：
+生成物默认在 repo 的 `fpga\build`。以 `fpga\build_and_program.bat` 打印的 `ZLC build root:` 和 `ZLC project dir:` 为准；默认位置是 `fpga\build\p40`。如果旧终端里的 `ZLC_PS_PROJECT_DIR` 仍指向 `fpga\pulse_streamer\build`，batch 会忽略它并回到 `fpga\build`，避免继续使用旧工程布局。如果当前 repo 路径太长，脚本会在 Vivado 慢 build 前直接提示把 repo 移到 `D:\ZLC` 这类短目录。
 
 ```text
-fpga\pulse_streamer\build\zlc_pulse_streamer_40ch\zlc_pulse_streamer_40ch.xpr
-fpga\pulse_streamer\build\zlc_pulse_streamer_40ch\zlc_pulse_streamer_40ch.runs\impl_1\zlc_pulse_streamer_top_40ch.bit
-fpga\pulse_streamer\build\zlc_pulse_streamer_40ch\zlc_pulse_streamer_40ch.runs\impl_1\zlc_pulse_streamer_top_40ch.ltx
+<ZLC project dir>\p40.xpr
+<ZLC project dir>\p40.runs\impl_1\zlc_pulse_streamer_top_40ch.bit
+<ZLC project dir>\p40.runs\impl_1\zlc_pulse_streamer_top_40ch.ltx
 ```
 
 VIO probe 约定：
@@ -67,19 +67,19 @@ VIO probe 约定：
 probe_out0  zlc_reset           width 1
 probe_out1  zlc_start           width 1
 probe_out2  zlc_prog_we         width 1
-probe_out3  zlc_prog_addr       width 7
+probe_out3  zlc_prog_addr       width 10
 probe_out4  zlc_prog_tick       width 32
 probe_out5  zlc_prog_mask       width 40
-probe_out6  zlc_prog_count      width 8
+probe_out6  zlc_prog_count      width 11
 probe_out7  zlc_repeat_forever  width 1
-probe_out8  zlc_loop_start_addr width 7
+probe_out8  zlc_loop_start_addr width 10
 probe_out9  zlc_loop_end_tick   width 32
 probe_out10 zlc_loop_count      width 32
 probe_in0   zlc_running         width 1
 probe_in1   zlc_done            width 1
 ```
 
-Verilog 原理：Python 上传的是 edge table，每一行是绝对 FPGA tick 和这一刻之后的 40-bit output mask。`Fire` 只把 `zlc_start` 翻转一次，Verilog 把任意方向的翻转都当成 start event；之后 FPGA 自己用 `time_count` 按 clock 数 tick，在 `time_count == tick_mem[edge_index]` 时更新 `state_mask`。所以微秒级 pulse timing 不依赖 Python、RPyC、Vivado 或 Windows 调度。`repeat_forever` 和 repeat bracket 也由 Verilog metadata 执行，不会展开成超长表。
+Verilog 原理：Python 上传的是 edge table，每一行是绝对 FPGA tick 和这一刻之后的 40-bit output mask。VIO 侧的 `reset/start/prog_we` 先经过两级 FPGA-clock 同步；`Fire` 给 `zlc_start` 一个 low-high-low pulse，Verilog 只把同步后的 rising edge 当成 start event；之后 FPGA 自己用 `time_count` 按 clock 数 tick，在 `time_count == tick_mem[edge_index]` 时更新 `state_mask`。所以微秒级 pulse timing 不依赖 Python、RPyC、Vivado 或 Windows 调度。`repeat_forever` 和 repeat bracket 也由 Verilog metadata 执行，不会展开成超长表。注意：如果 finite repeat bracket 嵌在 `repeat_forever=True` 的表里，bracket 跑完后整张表会从 period 0 再开始；如果 period 0 打开 load/cooling/probe，示波器上会看到周期性表头 pulse。
 
 <!-- cell:code -->
 PROJECT_ROOT = Path("..").resolve()
@@ -88,7 +88,7 @@ FPGA_DIR = PROJECT_ROOT / "fpga" / "pulse_streamer"
 CHANNELS = [f"ch{i:02d}" for i in range(40)]
 TRIGGER_CHANNELS = ["ch03"]
 CLOCK_HZ = 100_000_000.0
-MAX_EDGES = 128
+MAX_EDGES = 1024
 TICK_WIDTH = 32
 
 for filename in (
@@ -117,7 +117,9 @@ print((PROJECT_ROOT / "pulse_gui.bat").exists(), PROJECT_ROOT / "pulse_gui.bat")
 <!-- cell:code -->
 HOST = "0.0.0.0"
 PORT = 18861
-STATE_DIR = PROJECT_ROOT / "fpga" / "pulse_streamer" / "build" / "zlc_sequencer_state_40ch"
+
+BUILD_ROOT = PROJECT_ROOT / "fpga" / "build"
+STATE_DIR = Path(os.environ.get("ZLC_PS_STATE_DIR", BUILD_ROOT / "state40"))
 
 def find_vivado_bin():
     if os.environ.get("ZLC_PS_VIVADO_BIN"):
@@ -130,9 +132,11 @@ def find_vivado_bin():
     return "vivado"
 
 os.environ["ZLC_PS_VIVADO_BIN"] = find_vivado_bin()
-os.environ["ZLC_PS_VIVADO_PROJECT"] = str(FPGA_DIR / "build" / "zlc_pulse_streamer_40ch" / "zlc_pulse_streamer_40ch.xpr")
-os.environ["ZLC_PS_VIVADO_BIT"] = str(FPGA_DIR / "build" / "zlc_pulse_streamer_40ch" / "zlc_pulse_streamer_40ch.runs" / "impl_1" / "zlc_pulse_streamer_top_40ch.bit")
-os.environ["ZLC_PS_VIVADO_LTX"] = str(FPGA_DIR / "build" / "zlc_pulse_streamer_40ch" / "zlc_pulse_streamer_40ch.runs" / "impl_1" / "zlc_pulse_streamer_top_40ch.ltx")
+PROJECT_DIR = Path(os.environ.get("ZLC_PS_PROJECT_DIR", BUILD_ROOT / "p40"))
+os.environ["ZLC_PS_PROJECT_DIR"] = str(PROJECT_DIR)
+os.environ["ZLC_PS_VIVADO_PROJECT"] = str(PROJECT_DIR / "p40.xpr")
+os.environ["ZLC_PS_VIVADO_BIT"] = str(PROJECT_DIR / "p40.runs" / "impl_1" / "zlc_pulse_streamer_top_40ch.bit")
+os.environ["ZLC_PS_VIVADO_LTX"] = str(PROJECT_DIR / "p40.runs" / "impl_1" / "zlc_pulse_streamer_top_40ch.ltx")
 os.environ["ZLC_PS_VIVADO_PROGRAM_ON_RUN"] = "0"
 os.environ["ZLC_PS_SERVER_BACKEND"] = "vivado-session"
 os.environ["ZLC_PS_VIO_FILTER"] = 'CELL_NAME=~"*vio*"'
@@ -152,8 +156,11 @@ print("trigger", TRIGGER_CHANNELS)
 
 ```powershell
 cd D:\ZLC
+.\fpga\run_server.bat --check-config
 .\fpga\run_server.bat
 ```
+
+`--check-config` 会打印 resolved project/bit/LTX/channel/trigger 后退出。确认路径正确后再启动真正的 long-running server。
 
 下面是等价的展开版命令，便于检查环境变量：
 

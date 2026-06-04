@@ -9,6 +9,7 @@ This file is for future coding agents and maintainers. User-facing manuals must 
 - `docs/FPGA_PULSE_STREAMER_CAPACITY.md`: FPGA capacity notes for the runtime pulse-streamer design.
 - `docs/FRONTEND_FLUENT_STYLE_GUIDE.md`: PyQt/Fluent visual rules, pulse GUI layout contract, and screenshot QA checklist.
 - `docs/neutral_atom_hardware_manual/REAL_HARDWARE_RUNBOOK.md`: short operational hardware runbook.
+- `tests/README.md`: targeted verification matrix; prefer scoped tests over full-suite runs unless the change is broad.
 - `tutorials/neutral_atom_fpga_server.ipynb`: runs on the FPGA/Vivado computer.
 - `tutorials/neutral_atom_hardware_quickstart.ipynb`: runs on the control/qCMOS computer.
 
@@ -56,13 +57,22 @@ Keep this simple. Do not introduce a heavyweight dependency-injection framework 
 
 ## Common Commands
 
+Prefer the scoped matrix in `tests/README.md` when a change touches only one
+boundary. Start with the smallest command that proves the edited boundary, for
+example:
+
 ```powershell
-pytest -q
+pytest -q tests\test_neutral_atom_lightweight.py -k "pulse or sequencer or qcmos or readout"
+pytest -q tests\test_neutral_atom_lightweight.py -k "repo_vivado_entrypoint_contract or xdc or differential_edge_upload"
+pytest -q tests\test_frontend_smoke.py -k "render_tex_pdf or pulse_gui"
 python -m py_compile (rg --files -g "*.py" Zou_lab_control tests fpga)
 python -m json.tool tutorials\neutral_atom_fpga_server.ipynb > $null
 python -m json.tool tutorials\neutral_atom_hardware_quickstart.ipynb > $null
 python -m json.tool tutorials\neutral_atom_tutorial.ipynb > $null
 ```
+
+Use full `pytest -q` only for broad handoff, release-like sweeps, or changes
+that genuinely cross many subsystems.
 
 Generate pulse-streamer HDL:
 

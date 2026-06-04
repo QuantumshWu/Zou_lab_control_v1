@@ -3,6 +3,9 @@ setlocal EnableExtensions
 
 cd /d "%~dp0"
 
+if "%~1"=="--help" goto install_help
+if "%~1"=="/?" goto install_help
+
 if not "%~1"=="" (
     set "PYTHON_CMD="%~1""
     goto verify_python
@@ -78,20 +81,52 @@ if errorlevel 1 (
 echo.
 echo Installing Python packages from requirements.txt into this kernel...
 %PYTHON_CMD% -m pip install --upgrade pip
-if errorlevel 1 exit /b %errorlevel%
+if errorlevel 1 goto install_failed
 
 %PYTHON_CMD% -m pip install -r "%~dp0requirements.txt"
-if errorlevel 1 exit /b %errorlevel%
+if errorlevel 1 goto install_failed
+
+echo.
+echo Installing this repository in editable mode...
+%PYTHON_CMD% -m pip install -e "%~dp0."
+if errorlevel 1 goto install_failed
+
+echo.
+echo Remembering this Python for pulse_gui.bat...
+%PYTHON_CMD% -c "import sys, pathlib; pathlib.Path(r'%~dp0.zlc_python_path').write_text(sys.executable, encoding='utf-8')"
+if errorlevel 1 (
+    echo Warning: could not write .zlc_python_path. pulse_gui.bat can still use PATH or ZLC_PULSE_GUI_PYTHON.
+)
 
 echo.
 echo Registering this interpreter as a Jupyter kernel for VSCode...
 %PYTHON_CMD% -m ipykernel install --user --name zou_lab_control --display-name "Python (Zou lab control)"
-if errorlevel 1 exit /b %errorlevel%
+if errorlevel 1 goto install_failed
 
 echo.
 echo Done. In VSCode, choose kernel: Python (Zou lab control).
 echo Restart the Jupyter kernel after installing.
 pause
+exit /b 0
+
+:install_failed
+set "ZLC_INSTALL_STATUS=%errorlevel%"
+if "%ZLC_INSTALL_STATUS%"=="0" set "ZLC_INSTALL_STATUS=1"
+echo.
+echo install_requirements.bat failed with code %ZLC_INSTALL_STATUS%.
+echo Keep this window open and read the messages above.
+pause
+exit /b %ZLC_INSTALL_STATUS%
+
+:install_help
+echo Install Zou_lab_control requirements into a selected Python/Jupyter kernel.
+echo.
+echo Usage:
+echo   install_requirements.bat
+echo   install_requirements.bat C:\path\to\python.exe
+echo.
+echo The script installs requirements.txt, installs this repo with pip install -e .,
+echo registers the Jupyter kernel, and writes .zlc_python_path for pulse_gui.bat.
 exit /b 0
 
 :from_vscode_settings

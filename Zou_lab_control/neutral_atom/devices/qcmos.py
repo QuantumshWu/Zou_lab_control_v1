@@ -9,8 +9,9 @@ from typing import Any, Sequence
 import numpy as np
 
 from ..core.analysis import finite_float, positive_int
-from ..timing import exposure_from_sequence, sequence_for_frame_count
+from ..timing import exposure_from_sequence
 from .base import CameraDevice
+from .sequencer import PulseController, finite_frame_sequence
 
 
 @dataclass
@@ -83,19 +84,15 @@ class QCMOSCamera(CameraDevice):
     def acquire(self, frames: int = 1, *, sequence=None, sequencer=None, timeout_ms: int | None = None) -> list[np.ndarray]:
         frames = positive_int(frames, "frames")
         self.open()
-        runtime_sequence = sequence
+        if sequencer is None and isinstance(sequence, PulseController):
+            sequencer = sequence.sequencer
+        runtime_sequence = self._sequence_for_frames(sequence, frames=frames, sequencer=sequencer)
         if sequence is not None:
-            sequence_exposure = exposure_from_sequence(sequence, default=self.config.exposure)
+            sequence_exposure = exposure_from_sequence(runtime_sequence, default=self.config.exposure)
             if sequence_exposure != self.config.exposure:
                 self.config.exposure = sequence_exposure
                 self._write_settings()
         if sequencer is not None and sequence is not None:
-            trigger_channels = getattr(sequencer, "trigger_channels", None)
-            runtime_sequence = (
-                sequence_for_frame_count(sequence, frames, trigger_channels=trigger_channels)
-                if trigger_channels is not None
-                else sequence_for_frame_count(sequence, frames)
-            )
             prepare = getattr(sequencer, "prepare", None)
             if callable(prepare):
                 prepare(runtime_sequence)
@@ -150,6 +147,18 @@ class QCMOSCamera(CameraDevice):
                     dcam.buf_release()
                 except Exception:
                     pass
+
+    def _sequence_for_frames(self, sequence, *, frames: int, sequencer=None):
+        if sequence is None:
+            return None
+        if isinstance(sequence, PulseController):
+            return sequence.frame_sequence(frames)
+        trigger_channels = getattr(sequencer, "trigger_channels", None)
+        return finite_frame_sequence(
+            sequence,
+            frames,
+            trigger_channels=trigger_channels if trigger_channels is not None else ("qcm_trigger", "camera_trigger", "trig"),
+        )
 
     def _write_settings(self) -> None:
         mod = self._module

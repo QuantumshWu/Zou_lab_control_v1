@@ -2,13 +2,26 @@
 setlocal EnableExtensions EnableDelayedExpansion
 
 if /I not "%~1"=="--inner" (
+  set "ZLC_ACTION=server"
+  if /I "%~1"=="--check-config" set "ZLC_ACTION=server config check"
   call "%~f0" --inner %*
   set "ZLC_STATUS=!ERRORLEVEL!"
-  if not "!ZLC_STATUS!"=="0" (
+  if "!ZLC_STATUS!"=="0" (
+    if "%~1"=="--help" exit /b 0
+    if "%~1"=="/?" exit /b 0
     echo.
-    echo ZLC server failed with code !ZLC_STATUS!.
+    echo ZLC !ZLC_ACTION! completed successfully.
+    if /I "%~1"=="--check-config" (
+      echo You can close this window, or press any key to exit.
+    ) else (
+      echo Server stopped normally. You can close this window, or press any key to exit.
+    )
+    if "%ZLC_NO_PAUSE%"=="" pause
+  ) else (
+    echo.
+    echo ZLC !ZLC_ACTION! failed with code !ZLC_STATUS!.
     echo Keep this window open and read the messages above.
-    pause
+    if "%ZLC_NO_PAUSE%"=="" pause
   )
   exit /b !ZLC_STATUS!
 )
@@ -17,13 +30,24 @@ shift /1
 set "FPGA_DIR=%~dp0"
 for %%I in ("%FPGA_DIR%..") do set "REPO_ROOT=%%~fI"
 set "STREAMER_DIR=%FPGA_DIR%pulse_streamer"
+set "ZLC_REPO_ROOT=%REPO_ROOT%"
 
+set "ZLC_RUN_SERVER_CHECK=0"
 if "%~1"=="--help" goto zlc_help
 if "%~1"=="/?" goto zlc_help
+if /I "%~1"=="--check-config" set "ZLC_RUN_SERVER_CHECK=1"
+if not "%~1"=="" if not "%ZLC_RUN_SERVER_CHECK%"=="1" (
+  echo Unknown option: %~1
+  echo.
+  goto zlc_help
+)
 
 call :zlc_find_python
 if errorlevel 1 exit /b 1
 call :zlc_find_vivado
+if errorlevel 1 exit /b 1
+call :zlc_default_paths
+call :zlc_verify_40ch_sources
 if errorlevel 1 exit /b 1
 
 pushd "%REPO_ROOT%"
@@ -33,22 +57,23 @@ if "%ZLC_PS_HOST%"=="" set "ZLC_PS_HOST=0.0.0.0"
 if "%ZLC_PS_PORT%"=="" set "ZLC_PS_PORT=18861"
 if "%ZLC_PS_SERVER_BACKEND%"=="" set "ZLC_PS_SERVER_BACKEND=vivado-session"
 if "%ZLC_PS_VIVADO_PROGRAM_ON_RUN%"=="" set "ZLC_PS_VIVADO_PROGRAM_ON_RUN=0"
-if "%ZLC_PS_MAX_EDGES%"=="" set "ZLC_PS_MAX_EDGES=128"
+if "%ZLC_PS_MAX_EDGES%"=="" set "ZLC_PS_MAX_EDGES=1024"
 if "%ZLC_PS_TICK_WIDTH%"=="" set "ZLC_PS_TICK_WIDTH=32"
-set "ZLC_PS_CHANNEL_COUNT=40"
-
-if "%ZLC_PS_STATE_DIR%"=="" set "ZLC_PS_STATE_DIR=%CD%\fpga\pulse_streamer\build\zlc_sequencer_state_40ch"
-if "%ZLC_PS_PROJECT_DIR%"=="" if exist "%TEMP%\zlc_ps_40ch\zlc_pulse_streamer_40ch.xpr" set "ZLC_PS_PROJECT_DIR=%TEMP%\zlc_ps_40ch"
-if not "%ZLC_PS_PROJECT_DIR%"=="" (
-  if "%ZLC_PS_VIVADO_PROJECT%"=="" if exist "%ZLC_PS_PROJECT_DIR%\zlc_pulse_streamer_40ch.xpr" set "ZLC_PS_VIVADO_PROJECT=%ZLC_PS_PROJECT_DIR%\zlc_pulse_streamer_40ch.xpr"
-  if "%ZLC_PS_VIVADO_BIT%"=="" if exist "%ZLC_PS_PROJECT_DIR%\zlc_pulse_streamer_40ch.runs\impl_1\zlc_pulse_streamer_top_40ch.bit" set "ZLC_PS_VIVADO_BIT=%ZLC_PS_PROJECT_DIR%\zlc_pulse_streamer_40ch.runs\impl_1\zlc_pulse_streamer_top_40ch.bit"
-  if "%ZLC_PS_VIVADO_LTX%"=="" if exist "%ZLC_PS_PROJECT_DIR%\zlc_pulse_streamer_40ch.runs\impl_1\zlc_pulse_streamer_top_40ch.ltx" set "ZLC_PS_VIVADO_LTX=%ZLC_PS_PROJECT_DIR%\zlc_pulse_streamer_40ch.runs\impl_1\zlc_pulse_streamer_top_40ch.ltx"
+if "%ZLC_PS_MAX_CHANNEL_COUNT%"=="" set "ZLC_PS_MAX_CHANNEL_COUNT=40"
+if "%ZLC_PS_XDC%"=="" if exist "%CD%\fpga\pulse_streamer\zlc_pulse_streamer_40ch.xdc" set "ZLC_PS_XDC=%CD%\fpga\pulse_streamer\zlc_pulse_streamer_40ch.xdc"
+if "%ZLC_PS_CHANNEL_COUNT%"=="" (
+  for /f "delims=" %%I in ('%ZLC_PY_CMD% -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer infer_channel_count --xdc "%ZLC_PS_XDC%" --default-count 40 --max-channel-count %ZLC_PS_MAX_CHANNEL_COUNT% 2^>nul') do if "!ZLC_PS_CHANNEL_COUNT!"=="" set "ZLC_PS_CHANNEL_COUNT=%%I"
 )
-if "%ZLC_PS_VIVADO_PROJECT%"=="" if exist "%CD%\fpga\pulse_streamer\build\zlc_pulse_streamer_40ch\zlc_pulse_streamer_40ch.xpr" set "ZLC_PS_VIVADO_PROJECT=%CD%\fpga\pulse_streamer\build\zlc_pulse_streamer_40ch\zlc_pulse_streamer_40ch.xpr"
-if "%ZLC_PS_VIVADO_BIT%"=="" if exist "%CD%\fpga\pulse_streamer\build\zlc_pulse_streamer_40ch\zlc_pulse_streamer_40ch.runs\impl_1\zlc_pulse_streamer_top_40ch.bit" set "ZLC_PS_VIVADO_BIT=%CD%\fpga\pulse_streamer\build\zlc_pulse_streamer_40ch\zlc_pulse_streamer_40ch.runs\impl_1\zlc_pulse_streamer_top_40ch.bit"
-if "%ZLC_PS_VIVADO_LTX%"=="" if exist "%CD%\fpga\pulse_streamer\build\zlc_pulse_streamer_40ch\zlc_pulse_streamer_40ch.runs\impl_1\zlc_pulse_streamer_top_40ch.ltx" set "ZLC_PS_VIVADO_LTX=%CD%\fpga\pulse_streamer\build\zlc_pulse_streamer_40ch\zlc_pulse_streamer_40ch.runs\impl_1\zlc_pulse_streamer_top_40ch.ltx"
-if "%ZLC_PS_VIVADO_LTX%"=="" (
-  if exist "%CD%\fpga\pulse_streamer\build" for /r "%CD%\fpga\pulse_streamer\build" %%F in (*.ltx) do if "!ZLC_PS_VIVADO_LTX!"=="" set "ZLC_PS_VIVADO_LTX=%%~fF"
+if "%ZLC_PS_CHANNEL_COUNT%"=="" set "ZLC_PS_CHANNEL_COUNT=40"
+if "%ZLC_PS_CHANNELS%"=="" (
+  for /f "delims=" %%I in ('%ZLC_PY_CMD% -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer infer_channels --xdc "%ZLC_PS_XDC%" --default-count %ZLC_PS_CHANNEL_COUNT% --max-channel-count %ZLC_PS_MAX_CHANNEL_COUNT% 2^>nul') do if "!ZLC_PS_CHANNELS!"=="" set "ZLC_PS_CHANNELS=%%I"
+)
+if "%ZLC_PS_CHANNELS%"=="" set "ZLC_PS_CHANNELS=ch00 ch01 ch02 ch03 ch04 ch05 ch06 ch07 ch08 ch09 ch10 ch11 ch12 ch13 ch14 ch15 ch16 ch17 ch18 ch19 ch20 ch21 ch22 ch23 ch24 ch25 ch26 ch27 ch28 ch29 ch30 ch31 ch32 ch33 ch34 ch35 ch36 ch37 ch38 ch39"
+
+if not "%ZLC_PS_PROJECT_DIR%"=="" (
+  if "%ZLC_PS_VIVADO_PROJECT%"=="" set "ZLC_PS_VIVADO_PROJECT=%ZLC_PS_PROJECT_DIR%\p40.xpr"
+  if "%ZLC_PS_VIVADO_BIT%"=="" set "ZLC_PS_VIVADO_BIT=%ZLC_PS_PROJECT_DIR%\p40.runs\impl_1\zlc_pulse_streamer_top_40ch.bit"
+  if "%ZLC_PS_VIVADO_LTX%"=="" set "ZLC_PS_VIVADO_LTX=%ZLC_PS_PROJECT_DIR%\p40.runs\impl_1\zlc_pulse_streamer_top_40ch.ltx"
 )
 if "%ZLC_PS_VIVADO_LTX%"=="" (
   echo ERROR: no Vivado .ltx probe file was found.
@@ -57,7 +82,7 @@ if "%ZLC_PS_VIVADO_LTX%"=="" (
   echo the same .ltx Probes file used when the FPGA was programmed.
   echo.
   echo Fix one of these:
-  echo   1. Run fpga\build_and_program.bat after completing the 40ch XDC.
+  echo   1. Check the 40ch XDC pin map, then run fpga\build_and_program.bat.
   echo   2. Or set ZLC_PS_VIVADO_LTX to the .ltx from Vivado Program Device.
   echo.
   echo Example:
@@ -67,30 +92,60 @@ if "%ZLC_PS_VIVADO_LTX%"=="" (
   popd
   exit /b 2
 )
+if not exist "%ZLC_PS_VIVADO_LTX%" (
+  echo ERROR: Vivado .ltx probe file does not exist:
+  echo   %ZLC_PS_VIVADO_LTX%
+  echo.
+  echo Build/program the 40ch bitstream first:
+  echo   fpga\build_and_program.bat
+  echo.
+  echo Or set ZLC_PS_VIVADO_LTX to the exact Probes file used in Vivado Program Device.
+  popd
+  exit /b 2
+)
 
-set "ZLC_40CH_CHANNELS=ch00 ch01 ch02 ch03 ch04 ch05 ch06 ch07 ch08 ch09 ch10 ch11 ch12 ch13 ch14 ch15 ch16 ch17 ch18 ch19 ch20 ch21 ch22 ch23 ch24 ch25 ch26 ch27 ch28 ch29 ch30 ch31 ch32 ch33 ch34 ch35 ch36 ch37 ch38 ch39"
-
-echo ZLC FPGA pulse-streamer server: 40ch
+echo ZLC FPGA pulse-streamer server: %ZLC_PS_CHANNEL_COUNT%ch
 echo Host:    %ZLC_PS_HOST%:%ZLC_PS_PORT%
 echo Backend: %ZLC_PS_SERVER_BACKEND%
 echo Project: %ZLC_PS_VIVADO_PROJECT%
 echo Bit:     %ZLC_PS_VIVADO_BIT%
 echo LTX:     %ZLC_PS_VIVADO_LTX%
-echo Channels: %ZLC_40CH_CHANNELS%
+echo Channels: %ZLC_PS_CHANNELS%
 echo Trigger:  ch03
+
+if "%ZLC_RUN_SERVER_CHECK%"=="1" (
+  echo ZLC server config check complete.
+  popd
+  endlocal & exit /b 0
+)
+
+if /I "%ZLC_PS_SERVER_BACKEND%"=="command" goto zlc_run_command_backend
 
 %ZLC_PY_CMD% -m Zou_lab_control.neutral_atom.devices.sequencer_server ^
   --backend %ZLC_PS_SERVER_BACKEND% ^
   --host %ZLC_PS_HOST% ^
   --port %ZLC_PS_PORT% ^
-  --channels %ZLC_40CH_CHANNELS% ^
+  --channels %ZLC_PS_CHANNELS% ^
+  --trigger-channels ch03 ^
+  --clock-hz 100000000 ^
+  --state-dir "%ZLC_PS_STATE_DIR%"
+set "ZLC_STATUS=%ERRORLEVEL%"
+popd
+endlocal & exit /b %ZLC_STATUS%
+
+:zlc_run_command_backend
+%ZLC_PY_CMD% -m Zou_lab_control.neutral_atom.devices.sequencer_server ^
+  --backend command ^
+  --host %ZLC_PS_HOST% ^
+  --port %ZLC_PS_PORT% ^
+  --channels %ZLC_PS_CHANNELS% ^
   --trigger-channels ch03 ^
   --clock-hz 100000000 ^
   --state-dir "%ZLC_PS_STATE_DIR%" ^
-  --prepare-command "%ZLC_PY_CMD% -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer prepare" ^
-  --fire-command "%ZLC_PY_CMD% -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer fire" ^
-  --wait-done-command "%ZLC_PY_CMD% -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer wait_done" ^
-  --safe-state-command "%ZLC_PY_CMD% -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer safe_state"
+  --prepare-command "%ZLC_PY_ARG% -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer prepare" ^
+  --fire-command "%ZLC_PY_ARG% -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer fire" ^
+  --wait-done-command "%ZLC_PY_ARG% -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer wait_done" ^
+  --safe-state-command "%ZLC_PY_ARG% -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer safe_state"
 set "ZLC_STATUS=%ERRORLEVEL%"
 popd
 endlocal & exit /b %ZLC_STATUS%
@@ -100,6 +155,7 @@ echo Start the 40-channel ZLC FPGA pulse-streamer server.
 echo.
 echo Usage:
 echo   fpga\run_server.bat
+echo   fpga\run_server.bat --check-config
 echo.
 echo Defaults:
 echo   host/port: 0.0.0.0:18861
@@ -108,24 +164,128 @@ echo   channels:  ch00 ... ch39
 echo   trigger:   ch03
 echo.
 echo Optional:
+echo   set ZLC_FPGA_SERVER_PYTHON=C:\path\to\python.exe
 echo   set ZLC_PS_HOST=0.0.0.0
 echo   set ZLC_PS_PORT=18861
 echo   set ZLC_PS_VIVADO_BIN=C:\Xilinx\Vivado\2019.2\bin\vivado.bat
 echo   set ZLC_PS_SERVER_BACKEND=vivado-session
+echo   set ZLC_PS_PROJECT_DIR=%%CD%%\fpga\build\p40
+exit /b 0
+
+:zlc_verify_40ch_sources
+set "ZLC_DEFAULT_XDC=%STREAMER_DIR%\zlc_pulse_streamer_40ch.xdc"
+if not defined ZLC_PS_XDC if not defined ZLC_PS_40CH_XDC set "ZLC_PS_XDC=%ZLC_DEFAULT_XDC%"
+set "ZLC_SELECTED_XDC=%ZLC_PS_40CH_XDC%"
+if not defined ZLC_SELECTED_XDC set "ZLC_SELECTED_XDC=%ZLC_PS_XDC%"
+if not defined ZLC_PS_40CH_XDC set "ZLC_PS_40CH_XDC=%ZLC_SELECTED_XDC%"
+if not defined ZLC_PS_XDC set "ZLC_PS_XDC=%ZLC_SELECTED_XDC%"
+if not exist "%STREAMER_DIR%\zlc_pulse_streamer_top_40ch.v" (
+  echo ERROR: missing 40ch top HDL: %STREAMER_DIR%\zlc_pulse_streamer_top_40ch.v
+  exit /b 2
+)
+if not exist "%STREAMER_DIR%\create_project_40ch.tcl" (
+  echo ERROR: missing 40ch build Tcl: %STREAMER_DIR%\create_project_40ch.tcl
+  exit /b 2
+)
+findstr /C:".EDGE_ADDR_WIDTH(10)" "%STREAMER_DIR%\zlc_pulse_streamer_top_40ch.v" >nul || (
+  echo ERROR: 40ch top is not the 1024-edge build. Expected .EDGE_ADDR_WIDTH^(10^).
+  exit /b 2
+)
+findstr /C:"CONFIG.C_PROBE_OUT3_WIDTH {10}" "%STREAMER_DIR%\create_project_40ch.tcl" >nul || (
+  echo ERROR: create_project_40ch.tcl has stale prog_addr width. Expected VIO probe_out3 width 10.
+  exit /b 2
+)
+findstr /C:"CONFIG.C_PROBE_OUT6_WIDTH {11}" "%STREAMER_DIR%\create_project_40ch.tcl" >nul || (
+  echo ERROR: create_project_40ch.tcl has stale prog_count width. Expected VIO probe_out6 width 11.
+  exit /b 2
+)
+if not exist "!ZLC_SELECTED_XDC!" (
+  echo ERROR: missing 40ch XDC: !ZLC_SELECTED_XDC!
+  echo Restore fpga\pulse_streamer\zlc_pulse_streamer_40ch.xdc. It is derived from references\source_archives\address_switch\address_switch.srcs\constrs_1\new\addre.xdc.
+  exit /b 2
+)
+findstr /C:"[get_ports {ch[39]}]" "!ZLC_SELECTED_XDC!" >nul || (
+  echo ERROR: selected XDC does not define ch[39]; this is not a full 40ch pulse-streamer XDC.
+  exit /b 2
+)
+findstr /C:"<PIN_CH" "!ZLC_SELECTED_XDC!" >nul && (
+  echo ERROR: selected XDC still contains PIN_CH placeholders: !ZLC_SELECTED_XDC!
+  exit /b 2
+)
+echo ZLC 40ch source contract: channels=40 max_edges=1024 edge_addr_width=10 prog_count_width=11
+echo ZLC 40ch XDC: !ZLC_SELECTED_XDC!
+exit /b 0
+
+:zlc_default_paths
+if defined ZLC_PS_BUILD_ROOT if "!ZLC_PS_BUILD_ROOT: =!"=="" set "ZLC_PS_BUILD_ROOT="
+if defined ZLC_PS_PROJECT_DIR if "!ZLC_PS_PROJECT_DIR: =!"=="" set "ZLC_PS_PROJECT_DIR="
+if defined ZLC_PS_STATE_DIR if "!ZLC_PS_STATE_DIR: =!"=="" set "ZLC_PS_STATE_DIR="
+if not defined ZLC_PS_BUILD_ROOT set "ZLC_PS_BUILD_ROOT=%FPGA_DIR%build"
+if not exist "!ZLC_PS_BUILD_ROOT!\" mkdir "!ZLC_PS_BUILD_ROOT!" >nul 2>nul
+
+:zlc_have_build_root
+if not defined ZLC_PS_PROJECT_DIR set "ZLC_PS_PROJECT_DIR=%ZLC_PS_BUILD_ROOT%\p40"
+if not defined ZLC_PS_STATE_DIR set "ZLC_PS_STATE_DIR=%ZLC_PS_BUILD_ROOT%\state40"
+echo ZLC build root: %ZLC_PS_BUILD_ROOT%
+if defined ZLC_PS_PROJECT_DIR if /I not "!ZLC_PS_PROJECT_DIR:pulse_streamer\build=!"=="!ZLC_PS_PROJECT_DIR!" (
+  echo Ignoring old pulse_streamer build-local ZLC_PS_PROJECT_DIR: !ZLC_PS_PROJECT_DIR!
+  set "ZLC_PS_PROJECT_DIR=%ZLC_PS_BUILD_ROOT%\p40"
+)
+call :zlc_clear_unsafe_artifact ZLC_PS_VIVADO_PROJECT
+call :zlc_clear_unsafe_artifact ZLC_PS_VIVADO_BIT
+call :zlc_clear_unsafe_artifact ZLC_PS_VIVADO_LTX
+call :zlc_clear_unsafe_artifact ZLC_VIVADO_PROJECT
+call :zlc_clear_unsafe_artifact ZLC_VIVADO_BIT
+call :zlc_clear_unsafe_artifact ZLC_VIVADO_LTX
+exit /b 0
+
+:zlc_clear_unsafe_artifact
+set "ZLC_ARTIFACT_VAR=%~1"
+set "ZLC_ARTIFACT_VALUE=!%~1!"
+if not defined ZLC_ARTIFACT_VALUE exit /b 0
+if /I not "!ZLC_ARTIFACT_VALUE:pulse_streamer\build=!"=="!ZLC_ARTIFACT_VALUE!" (
+  echo Ignoring old pulse_streamer build-local %~1: !ZLC_ARTIFACT_VALUE!
+  set "%~1="
+)
 exit /b 0
 
 :zlc_find_python
-if not "%ZLC_PY_CMD%"=="" goto zlc_python_found
+if defined ZLC_PY_CMD (
+  call :zlc_normalize_python_cmd
+  goto zlc_python_found
+)
+if defined ZLC_FPGA_SERVER_PYTHON (
+  if exist "%ZLC_FPGA_SERVER_PYTHON%" (
+    set "ZLC_PY_CMD=call "%ZLC_FPGA_SERVER_PYTHON%""
+  ) else (
+    set "ZLC_PY_CMD=%ZLC_FPGA_SERVER_PYTHON%"
+  )
+  goto zlc_python_found
+)
+if exist "%REPO_ROOT%\.zlc_python_path" (
+  set /p "ZLC_STORED_PY="<"%REPO_ROOT%\.zlc_python_path"
+  if exist "!ZLC_STORED_PY!" (
+    set "ZLC_PY_CMD=call "!ZLC_STORED_PY!""
+    goto zlc_python_found
+  )
+  echo Ignoring stale .zlc_python_path: !ZLC_STORED_PY!
+)
 where python >nul 2>nul
 if not errorlevel 1 set "ZLC_PY_CMD=python"
-if not "%ZLC_PY_CMD%"=="" goto zlc_python_found
+if defined ZLC_PY_CMD goto zlc_python_found
 where py >nul 2>nul
 if not errorlevel 1 set "ZLC_PY_CMD=py -3"
-if not "%ZLC_PY_CMD%"=="" goto zlc_python_found
+if defined ZLC_PY_CMD goto zlc_python_found
 echo Could not find python or py. Run install_requirements.bat first.
 exit /b 1
 :zlc_python_found
+set "ZLC_PY_ARG=%ZLC_PY_CMD:"=""%"
 echo ZLC Python: %ZLC_PY_CMD%
+exit /b 0
+
+:zlc_normalize_python_cmd
+set "ZLC_PY_RAW=%ZLC_PY_CMD:"=%"
+if exist "%ZLC_PY_RAW%" set "ZLC_PY_CMD=call "%ZLC_PY_RAW%""
 exit /b 0
 
 :zlc_find_vivado

@@ -26,7 +26,7 @@
 .\fpga\run_server.bat
 \end{shellblock}
 
-\pyapi{--check} 做无 XDC 的 40 路 synth 自查；真实 build/program 需要完成 \filepath{fpga\pulse_streamer\zlc_pulse_streamer_40ch.xdc}，或设置 \pyapi{ZLC_PS_40CH_XDC} 指向完成的板级 XDC。脚本会拒绝仍包含 \pyapi{<PIN_CHxx>} placeholder 的 XDC。
+\pyapi{--check} 做无物理 pin XDC 的 40 路 synth 自查；真实 build/program 默认使用已经从旧 \filepath{address_switch} pin map 生成的 \filepath{fpga\pulse_streamer\zlc_pulse_streamer_40ch.xdc}。如果板卡或转接线不同，设置 \pyapi{ZLC_PS_40CH_XDC} 指向新的板级 XDC。脚本会拒绝仍包含 \pyapi{<PIN_CHxx>} placeholder 的 XDC。
 
 \filepath{pulse_gui.bat} 仍在 repo 根目录，因为它是前端入口，不是 FPGA build/server 脚本：
 
@@ -68,7 +68,7 @@ program.repeat_forever is True
 这就是“GUI 只显示少数 channel，FPGA 仍然正常跑 40 路”的边界。Verilog 不需要知道 GUI 隐藏了哪些行；它只接收已经补齐的 40-bit mask。
 
 \chapter{Camera Imaging Preset}
-\filepath{pulses\camera_imaging_40ch.json} 是当前相机成像 preset。它的硬件 channel 是 \pyapi{ch00...ch39}，默认 visible channel 是 \pyapi{ch00/ch01/ch02/ch03}，display label 分别是 \pyapi{trap/cooling/probe/qcm_trigger}。
+\filepath{pulses\camera_imaging_40ch.json} 是当前相机成像 preset。它的硬件 channel 是 \pyapi{ch00...ch39}，默认 visible channel 是 \pyapi{ch00/ch01/ch02/ch03}，display label 分别是 \pyapi{trap/cooling/probe/qcm_trigger}。\pyapi{camera_exposure} period 使用 \pyapi{duration="x"} 和默认 \pyapi{x_ns=19980000}，所以控制电脑 notebook 中的 \pyapi{pulse.x = ...} 会直接改变 probe/readout exposure；默认 \pyapi{x_ns} 下的 edge table 仍是：
 
 \begin{figure}[h]
   \centering
@@ -91,17 +91,58 @@ repeat_forever: true
 \begin{shellblock}
 cmd /c fpga\build_and_program.bat --help
 cmd /c fpga\run_server.bat --help
+cmd /c fpga\build_and_program.bat --check
+cmd /c "set ZLC_NO_PAUSE=1&&fpga\build_and_program.bat --help"
+cmd /c fpga\run_server.bat --check-config
+cmd /c fpga\build_and_program.bat --diagnose
 python -m json.tool tutorials\neutral_atom_fpga_server.ipynb
 python -m json.tool tutorials\neutral_atom_hardware_quickstart.ipynb
-pytest -q tests\test_neutral_atom_lightweight.py tests\test_frontend_smoke.py
+pytest -q tests\test_neutral_atom_lightweight.py -k "repo_vivado_entrypoint_contract or checked_in_camera_imaging_pulse or differential_edge_upload"
+pytest -q tests\test_frontend_smoke.py -k "render_tex_pdf or pulse_gui"
 \end{shellblock}
+
+\section{Vivado 40ch 路径和 build 结果}
+当前脚本的 Vivado 工程 source of truth 是 \filepath{fpga\build_and_program.bat} 打印的项目目录。默认 build root 是 repo 内的 \filepath{fpga\build}，真实 40 路工程是 \filepath{fpga\build\p40}，工程名是 \filepath{p40}。不要再把旧 \filepath{fpga\pulse_streamer\build} 里的工程、bitstream 或 probes 当作当前工程源。
+
+当前无耗时重跑 build 的脚本级验证结果如下：
+
+\begin{codeblock}[Vivado build-only summary]
+Vivado: C:\Xilinx\Vivado\2019.1\bin\vivado.bat
+ZLC build root: <repo>\fpga\build
+Project dir: <repo>\fpga\build\p40
+Top: zlc_pulse_streamer_top_40ch
+CHANNEL_COUNT: 40
+EDGE_ADDR_WIDTH: 10
+MAX_EDGES: 1024
+Expected bitstream: zlc_pulse_streamer_top_40ch.bit
+Expected probes: zlc_pulse_streamer_top_40ch.ltx
+\end{codeblock}
+
+build 完成后产物应在脚本打印的短路径工程目录中：
+
+\begin{shellblock}
+<repo>\fpga\build\p40\p40.runs\impl_1\zlc_pulse_streamer_top_40ch.bit
+<repo>\fpga\build\p40\p40.runs\impl_1\zlc_pulse_streamer_top_40ch.ltx
+\end{shellblock}
+
+\filepath{fpga\run_server.bat --check-config} 会先检查上述 \filepath{.ltx}。如果 \filepath{fpga\build\p40} 还没有 build 产物，它会明确报错并要求先运行 \filepath{fpga\build_and_program.bat} 或手动设置 \pyapi{ZLC_PS_VIVADO_LTX}；这比误用旧 \filepath{fpga\pulse_streamer\build} 里的 \filepath{.ltx} 更安全。build 成功后，server channel list 应为完整 \pyapi{ch00...ch39}，trigger 为 \pyapi{ch03}。
+
+\section{硬件 target 诊断状态}
+\filepath{fpga\build_and_program.bat --diagnose} 是非破坏性硬件枚举，不会 program FPGA。当前机器上该诊断返回：
+
+\begin{codeblock}[diagnose result]
+No hardware targets found.
+Check USB/JTAG cable, board power, cable drivers, and hw_server.
+\end{codeblock}
+
+因此本报告证明到“40ch bitstream 可以完整生成，server 会指向正确 bit/LTX”的层级；真正 program FPGA、启动 server、从 GUI/API 发 \pyapi{On Pulse} 并在示波器上看输出，仍需要在能枚举到 JTAG target 的 Verilog/FPGA 电脑上执行。
 
 如果在真实 FPGA 电脑上继续验证，推荐顺序是：
 
 \begin{enumerate}
   \item 把 repo 放到短路径，例如 \filepath{D:\ZLC}。
   \item 设置 \pyapi{ZLC_PS_VIVADO_BIN}，如果 Vivado 不在默认搜索路径。
-  \item 填完 \filepath{zlc_pulse_streamer_40ch.xdc}。
+  \item 核对 \filepath{zlc_pulse_streamer_40ch.xdc} 的 40 路 pin map；换板子时设置 \pyapi{ZLC_PS_40CH_XDC}。
   \item 运行 \filepath{fpga\build_and_program.bat --check}。
   \item 运行 \filepath{fpga\build_and_program.bat} 生成并 program 40 路 bitstream。
   \item 运行 \filepath{fpga\run_server.bat}。

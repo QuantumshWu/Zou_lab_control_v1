@@ -1,8 +1,44 @@
 set script_dir [file normalize [file dirname [info script]]]
-set project_dir [file join $script_dir build zlc_pulse_streamer_40ch_check]
-set project_name zlc_pulse_streamer_40ch_check
+proc env_or {name default} {
+    if {[info exists ::env($name)] && $::env($name) ne ""} { return [file normalize $::env($name)] }
+    return $default
+}
+proc zlc_default_project_root {script_dir} {
+    if {[info exists ::env(ZLC_PS_PROJECT_ROOT)] && $::env(ZLC_PS_PROJECT_ROOT) ne ""} {
+        return [file normalize $::env(ZLC_PS_PROJECT_ROOT)]
+    }
+    return [file normalize [file join $script_dir .. build]]
+}
+proc zlc_path_under {child parent} {
+    set child_norm [string tolower [file normalize $child]]
+    set parent_norm [string tolower [file normalize $parent]]
+    set parent_len [string length $parent_norm]
+    if {[string range $child_norm 0 [expr {$parent_len - 1}]] ne $parent_norm} {
+        return 0
+    }
+    set next_char [string range $child_norm $parent_len $parent_len]
+    return [expr {$next_char eq "" || $next_char eq "/" || $next_char eq "\\"}]
+}
+proc zlc_safe_check_project_dir {project_dir fallback_dir script_dir project_name} {
+    set out [file normalize $project_dir]
+    if {[zlc_path_under $out [file join $script_dir build]]} {
+        puts "Ignoring old fpga/pulse_streamer/build ZLC_PS_CHECK_PROJECT_DIR: $out"
+        set out [file normalize $fallback_dir]
+    }
+    set debug_tmp [file normalize [file join $out ${project_name}.runs synth_1 .Xil Vivado-00000-QuantumPad]]
+    if {[string length $debug_tmp] > 146} {
+        error "Vivado debug-core temporary path would be too long ($debug_tmp). Move the repo to a shorter project folder such as D:/ZLC, or set ZLC_PS_CHECK_PROJECT_DIR to a shorter project-local build path."
+    }
+    return $out
+}
+set zlc_default_project_root [zlc_default_project_root $script_dir]
+set project_name c40
+set project_dir [zlc_safe_check_project_dir [env_or ZLC_PS_CHECK_PROJECT_DIR [file join $zlc_default_project_root c40]] [file join $zlc_default_project_root c40] $script_dir $project_name]
 set top zlc_pulse_streamer_top_40ch
 set part xc7a35tfgg484-2
+
+puts "ZLC check_40ch_synth contract: CHANNEL_COUNT=40 MAX_EDGES=1024 EDGE_ADDR_WIDTH=10"
+puts "ZLC check_40ch_synth project_dir: $project_dir"
 
 proc zlc_require_run_complete {run_name expected_status} {
     set status [get_property STATUS [get_runs $run_name]]
@@ -30,6 +66,10 @@ proc zlc_check_utilization {report_path} {
     }
 }
 
+if {[file exists $project_dir]} {
+    puts "Removing previous ZLC 40ch synth-check project: $project_dir"
+    file delete -force $project_dir
+}
 file mkdir [file dirname $project_dir]
 create_project $project_name $project_dir -part $part -force
 set_property target_language Verilog [current_project]
@@ -47,12 +87,12 @@ set_property -dict [list \
     CONFIG.C_PROBE_OUT0_WIDTH {1} \
     CONFIG.C_PROBE_OUT1_WIDTH {1} \
     CONFIG.C_PROBE_OUT2_WIDTH {1} \
-    CONFIG.C_PROBE_OUT3_WIDTH {7} \
+    CONFIG.C_PROBE_OUT3_WIDTH {10} \
     CONFIG.C_PROBE_OUT4_WIDTH {32} \
     CONFIG.C_PROBE_OUT5_WIDTH {40} \
-    CONFIG.C_PROBE_OUT6_WIDTH {8} \
+    CONFIG.C_PROBE_OUT6_WIDTH {11} \
     CONFIG.C_PROBE_OUT7_WIDTH {1} \
-    CONFIG.C_PROBE_OUT8_WIDTH {7} \
+    CONFIG.C_PROBE_OUT8_WIDTH {10} \
     CONFIG.C_PROBE_OUT9_WIDTH {32} \
     CONFIG.C_PROBE_OUT10_WIDTH {32} \
 ] [get_ips vio_0]

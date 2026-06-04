@@ -1,13 +1,53 @@
 proc env_or {name default} {
-    if {[info exists ::env($name)]} { return $::env($name) }
+    if {[info exists ::env($name)] && $::env($name) ne ""} { return [file normalize $::env($name)] }
     return $default
+}
+proc zlc_default_project_root {script_dir} {
+    if {[info exists ::env(ZLC_PS_PROJECT_ROOT)] && $::env(ZLC_PS_PROJECT_ROOT) ne ""} {
+        return [file normalize $::env(ZLC_PS_PROJECT_ROOT)]
+    }
+    return [file normalize [file join $script_dir .. build]]
+}
+proc zlc_path_under {child parent} {
+    set child_norm [string tolower [file normalize $child]]
+    set parent_norm [string tolower [file normalize $parent]]
+    set parent_len [string length $parent_norm]
+    if {[string range $child_norm 0 [expr {$parent_len - 1}]] ne $parent_norm} {
+        return 0
+    }
+    set next_char [string range $child_norm $parent_len $parent_len]
+    return [expr {$next_char eq "" || $next_char eq "/" || $next_char eq "\\"}]
+}
+proc zlc_safe_project_dir {project_dir fallback_dir script_dir} {
+    set out [file normalize $project_dir]
+    if {[zlc_path_under $out [file join $script_dir build]]} {
+        puts "Ignoring old fpga/pulse_streamer/build ZLC_PS_PROJECT_DIR: $out"
+        set out [file normalize $fallback_dir]
+    }
+    return $out
+}
+proc zlc_safe_artifact_path {artifact_path fallback_path script_dir label} {
+    set out [file normalize $artifact_path]
+    if {[zlc_path_under $out [file join $script_dir build]]} {
+        puts "Ignoring old fpga/pulse_streamer/build $label: $out"
+        return [file normalize $fallback_path]
+    }
+    return $out
 }
 
 set script_dir [file normalize [file dirname [info script]]]
-set project_dir [env_or ZLC_PS_PROJECT_DIR [file join $script_dir build zlc_pulse_streamer_40ch]]
-set bit_path [env_or ZLC_PS_VIVADO_BIT [env_or ZLC_PS_BIT [file join $project_dir zlc_pulse_streamer_40ch.runs impl_1 zlc_pulse_streamer_top_40ch.bit]]]
-set ltx_path [env_or ZLC_PS_VIVADO_LTX [env_or ZLC_PS_LTX [file join $project_dir zlc_pulse_streamer_40ch.runs impl_1 zlc_pulse_streamer_top_40ch.ltx]]]
+set zlc_default_project_root [zlc_default_project_root $script_dir]
+set project_dir [zlc_safe_project_dir [env_or ZLC_PS_PROJECT_DIR [file join $zlc_default_project_root p40]] [file join $zlc_default_project_root p40] $script_dir]
+set default_bit_path [file join $project_dir p40.runs impl_1 zlc_pulse_streamer_top_40ch.bit]
+set default_ltx_path [file join $project_dir p40.runs impl_1 zlc_pulse_streamer_top_40ch.ltx]
+set bit_path [zlc_safe_artifact_path [env_or ZLC_PS_VIVADO_BIT [env_or ZLC_PS_BIT $default_bit_path]] $default_bit_path $script_dir "bitstream path"]
+set ltx_path [zlc_safe_artifact_path [env_or ZLC_PS_VIVADO_LTX [env_or ZLC_PS_LTX $default_ltx_path]] $default_ltx_path $script_dir "probe path"]
 set hw_server_url [env_or ZLC_PS_HW_SERVER_URL [env_or ZLC_HW_SERVER_URL ""]]
+
+puts "ZLC program_fpga_40ch contract: CHANNEL_COUNT=40 MAX_EDGES=1024 EDGE_ADDR_WIDTH=10"
+puts "ZLC program_fpga_40ch project_dir: $project_dir"
+puts "ZLC program_fpga_40ch bitstream: $bit_path"
+puts "ZLC program_fpga_40ch probes: $ltx_path"
 
 if {![file exists $bit_path]} { error "Bitstream not found: $bit_path" }
 if {![file exists $ltx_path]} { error "VIO probe file not found: $ltx_path" }
