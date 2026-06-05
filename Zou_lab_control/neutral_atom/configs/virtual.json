@@ -2,8 +2,14 @@
   "trap_array": {
     "type": "VirtualTrapArray",
     "params": {
-      "grid_shape": [5, 7],
-      "image_shape": [96, 128],
+      "grid_shape": [
+        5,
+        7
+      ],
+      "image_shape": [
+        96,
+        128
+      ],
       "loading_probability": 0.55,
       "atom_rate": 3000.0,
       "background_rate": 8.0,
@@ -25,16 +31,17 @@
   "sequencer": {
     "type": "VirtualSequencer",
     "params": {
-      "clock_hz": 250000000.0,
+      "clock_hz": 50000000.0,
       "channels": [
         "trap",
         "probe",
-        "qcm_trigger",
-        "camera_trigger",
-        "trig",
+        "emCCD",
         "cooling",
         "pushout",
         "microwave"
+      ],
+      "trigger_channels": [
+        "emCCD"
       ]
     }
   }

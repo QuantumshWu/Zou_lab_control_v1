@@ -312,10 +312,10 @@ virtual camera 不再用任意 counts 噪声。它参考 C15550-22UP instruction
 \pyapi{PulseSequence} 保存物理时间：
 \begin{codeblock}[Python]
 seq = na.imaging_sequence(exposure=2e-3, load=True)
-seq = seq.delay("qcm_trigger", 4e-9)
+seq = seq.delay("trig", 20e-9)
 \end{codeblock}
 
-默认 imaging sequence 包含 \pyapi{trap}、可选 \pyapi{cooling}、\pyapi{probe} 和 \pyapi{qcm_trigger}。sequence 本身不接触 camera，也不直接写 Verilog；它只是可验证的 timing source of truth。
+默认 imaging sequence 包含 \pyapi{trap}、可选 \pyapi{cooling}、\pyapi{probe} 和 \pyapi{emCCD}。sequence 本身不接触 camera，也不直接写 Verilog；它只是可验证的 timing source of truth。
 
 \section{preflight 检查}
 \pyapi{exp.timing.preflight()} 检查：

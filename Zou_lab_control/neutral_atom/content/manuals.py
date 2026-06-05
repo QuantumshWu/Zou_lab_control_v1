@@ -27,10 +27,10 @@ def _save_pulse_streamer_flow_figure(path: Path) -> Path:
     nodes = [
         ((0.35, 3.35), "Pulse GUI / Notebook", "PulseTableState\nvisible subset"),
         ((2.45, 3.35), "RemoteSequencer", "JSON over RPyC\nprepare / fire"),
-        ((4.55, 3.35), "FPGA PC server", "compile full\nch00..ch39 masks"),
+        ((4.55, 3.35), "FPGA PC server", "compile full\nXDC-inferred masks"),
         ((6.65, 3.35), "Vivado session", "VIO probes\nchanged rows"),
         ((8.75, 3.35), "Verilog core", "tick_mem + mask_mem\nstate machine"),
-        ((10.85, 3.35), "40 TTL outputs", "qCMOS trigger\ntrap / cooling / probe"),
+        ((10.85, 3.35), "XDC outputs", "emCCD / trap\ncooling / probe"),
     ]
     box_w = 1.65
     box_h = 1.25
@@ -130,7 +130,7 @@ def generate_hardware_quickstart_figures(asset_dir: str | Path) -> dict[str, Pat
     seq = exp.timing.configure_imaging(exposure=2e-3, load=True, trigger_width=20e-6, pre_trigger=100e-6)
     expanded = na.sequence_for_frame_count(seq, 5)
 
-    pulse = zf.plot(expanded, kind="pulse", channels=exp.devices.sequencer.channels, title="Five-frame qCMOS trigger sequence", display=False)
+    pulse = zf.plot(expanded, kind="pulse", channels=exp.devices.sequencer.channels, title="Five-frame camera-trigger sequence", display=False)
     pulse_path = _save_plot(pulse, asset_dir / "hardware_pulse_sequence.png")
     plt.close(pulse.fig)
 

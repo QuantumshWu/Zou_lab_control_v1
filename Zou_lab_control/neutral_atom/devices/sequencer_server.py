@@ -11,7 +11,7 @@ import socket
 import subprocess
 from typing import Sequence
 
-from .sequencer import RuntimeSequenceProgram, SequencerService, serve_runtime_sequencer
+from .sequencer import DEFAULT_CAMERA_TRIGGER_CHANNELS, DEFAULT_RUNTIME_CLOCK_HZ, RuntimeSequenceProgram, SequencerService, serve_runtime_sequencer
 
 
 @dataclass
@@ -120,8 +120,8 @@ def run_server(
     channels: Sequence[str],
     host: str = "0.0.0.0",
     port: int = 18861,
-    clock_hz: float = 250e6,
-    trigger_channels: Sequence[str] = ("qcm_trigger",),
+    clock_hz: float = DEFAULT_RUNTIME_CLOCK_HZ,
+    trigger_channels: Sequence[str] = DEFAULT_CAMERA_TRIGGER_CHANNELS,
     state_dir: str | Path = "zlc_sequencer_state",
     prepare_command: str | None = None,
     fire_command: str | None = None,
@@ -252,9 +252,9 @@ def build_arg_parser() -> ArgumentParser:
     parser = ArgumentParser(description="Start the Zou_lab_control neutral-atom sequencer service on the FPGA/Vivado computer.")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=18861)
-    parser.add_argument("--channels", nargs="+", required=True, help="Sequencer channels, e.g. ch00 ch01 ch02 ch03 ... ch39.")
-    parser.add_argument("--trigger-channels", nargs="+", default=["qcm_trigger"])
-    parser.add_argument("--clock-hz", type=float, default=250e6)
+    parser.add_argument("--channels", nargs="+", required=True, help="Sequencer channels, e.g. ch00 ch01 ... inferred from the selected XDC.")
+    parser.add_argument("--trigger-channels", nargs="+", default=list(DEFAULT_CAMERA_TRIGGER_CHANNELS))
+    parser.add_argument("--clock-hz", type=float, default=DEFAULT_RUNTIME_CLOCK_HZ)
     parser.add_argument("--state-dir", default="zlc_sequencer_state")
     parser.add_argument("--prepare-command", default=None)
     parser.add_argument("--fire-command", default=None)

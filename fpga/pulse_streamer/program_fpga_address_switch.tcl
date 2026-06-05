@@ -37,17 +37,17 @@ proc zlc_safe_artifact_path {artifact_path fallback_path script_dir label} {
 
 set script_dir [file normalize [file dirname [info script]]]
 set zlc_default_project_root [zlc_default_project_root $script_dir]
-set project_dir [zlc_safe_project_dir [env_or ZLC_PS_PROJECT_DIR [file join $zlc_default_project_root p40]] [file join $zlc_default_project_root p40] $script_dir]
-set default_bit_path [file join $project_dir p40.runs impl_1 zlc_pulse_streamer_top_40ch.bit]
-set default_ltx_path [file join $project_dir p40.runs impl_1 zlc_pulse_streamer_top_40ch.ltx]
+set project_dir [zlc_safe_project_dir [env_or ZLC_PS_PROJECT_DIR [file join $zlc_default_project_root address_switch]] [file join $zlc_default_project_root address_switch] $script_dir]
+set default_bit_path [file join $project_dir address_switch.runs impl_1 zlc_pulse_streamer_top_address_switch.bit]
+set default_ltx_path [file join $project_dir address_switch.runs impl_1 zlc_pulse_streamer_top_address_switch.ltx]
 set bit_path [zlc_safe_artifact_path [env_or ZLC_PS_VIVADO_BIT [env_or ZLC_PS_BIT $default_bit_path]] $default_bit_path $script_dir "bitstream path"]
 set ltx_path [zlc_safe_artifact_path [env_or ZLC_PS_VIVADO_LTX [env_or ZLC_PS_LTX $default_ltx_path]] $default_ltx_path $script_dir "probe path"]
 set hw_server_url [env_or ZLC_PS_HW_SERVER_URL [env_or ZLC_HW_SERVER_URL ""]]
 
-puts "ZLC program_fpga_40ch contract: CHANNEL_COUNT=40 MAX_EDGES=1024 EDGE_ADDR_WIDTH=10"
-puts "ZLC program_fpga_40ch project_dir: $project_dir"
-puts "ZLC program_fpga_40ch bitstream: $bit_path"
-puts "ZLC program_fpga_40ch probes: $ltx_path"
+puts "ZLC program_fpga_address_switch contract: CHANNEL_COUNT=62 MAX_EDGES=512 MAX_SCAN_POINTS=256 EDGE_ADDR_WIDTH=9 SCAN_ADDR_WIDTH=8"
+puts "ZLC program_fpga_address_switch project_dir: $project_dir"
+puts "ZLC program_fpga_address_switch bitstream: $bit_path"
+puts "ZLC program_fpga_address_switch probes: $ltx_path"
 
 if {![file exists $bit_path]} { error "Bitstream not found: $bit_path" }
 if {![file exists $ltx_path]} { error "VIO probe file not found: $ltx_path" }

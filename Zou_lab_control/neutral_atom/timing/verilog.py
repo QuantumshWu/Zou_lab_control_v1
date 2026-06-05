@@ -37,7 +37,7 @@ def generate_verilog(
     sequence: PulseSequence,
     *,
     channels: Sequence[str] | None = None,
-    clock_hz: float = 250e6,
+    clock_hz: float = 50_000_000.0,
     module_name: str = "zlc_sequence",
 ) -> VerilogBuild:
     """Generate a small start/done edge-table sequencer module."""

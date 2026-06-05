@@ -294,7 +294,7 @@ end
 这种写法的语义很清楚：MOT、PGC、等待、probe、state prep、microwave、Ramsey、pushout、readout 等阶段沿着一条绝对 tick 时间线发生。但维护风险也明显：如果要在 probe 前插一个阶段，后面所有累计表达式都要检查；如果一个 shutter delay 用负向提前量，表达式中出现 \pyapi{probe_waiting - probe_shutter_open_delay}，需要人工保证不会下溢或跨过其他事件。
 
 \section{debug 分支和 run 分支}
-\pyapi{debug} 为真时，\filepath{time_sequence.v} 走手动开关分支：\pyapi{cooling_on/probe_on/address_on/trap_on/...} 等 VIO bool 直接控制 TTL 输出。这适合调线和看单路设备响应。注意 \pyapi{trig} 在现有源码中只在 debug branch 里随 \pyapi{cooling_on} 置高/置低；run branch 中没有显式 \pyapi{trig <= ...} 条件。这意味着真实 qCMOS trigger 在旧工程里要么依赖其他路径/外部接线，要么该端口在 run branch 中不是主控制对象。重构时不能假设旧 \pyapi{trig} 自动就是每帧 qCMOS trigger，而要让 \pyapi{PulseSequence} 中的 \pyapi{qcm_trigger} 显式出现，并由 preflight 检查 trigger 数量。
+\pyapi{debug} 为真时，\filepath{time_sequence.v} 走手动开关分支：\pyapi{cooling_on/probe_on/address_on/trap_on/...} 等 VIO bool 直接控制 TTL 输出。这适合调线和看单路设备响应。注意 \pyapi{trig} 在现有源码中只在 debug branch 里随 \pyapi{cooling_on} 置高/置低；run branch 中没有显式 \pyapi{trig <= ...} 条件。这意味着真实 qCMOS trigger 在旧工程里要么依赖其他路径/外部接线，要么该端口在 run branch 中不是主控制对象。重构时不能假设旧 \pyapi{trig} 自动就是每帧 qCMOS trigger，而要让 \pyapi{PulseSequence} 中的 \pyapi{trig} 显式出现，并由 preflight 检查 trigger 数量。
 
 \section{TTL、shutter 和 DA 混在同一个时序模块}
 旧 Verilog 同时做三类事情：
@@ -561,8 +561,8 @@ result = rearrange.execute(targets)
 \begin{codeblock}[Python]
 seq = na.default_imaging_sequence(exposure=20e-3)
 sequencer = na.VerilogSequencer(
-    channels=["trap", "probe", "qcm_trigger"],
-    pin_map={"trap": "M17", "probe": "N15", "qcm_trigger": "R17"},
+    channels=["trap", "probe", "trig"],
+    pin_map={"trap": "M17", "probe": "N15", "trig": "R17"},
     control_pin_map={"clk": "R4"},
 )
 build = sequencer.prepare(seq)

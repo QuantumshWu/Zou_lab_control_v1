@@ -1,13 +1,14 @@
 # Zou_lab_control Neutral Atom Hardware Runbook
 
-This is the short operational hardware runbook. The default FPGA path is a
-40-channel runtime pulse-streamer bitstream. The control computer sends a
-`PulseSequence` or GUI `PulseTableState`; the FPGA/Vivado computer compiles it
-against the full `ch00..ch39` channel list, uploads `ticks/masks` through Vivado
-VIO, and the FPGA clock executes the pulses.
+This is the short operational runbook for the real two-computer hardware path.
+The default FPGA path is the address-switch pulse-streamer bitstream.  The
+control computer sends a `PulseSequence` or GUI `PulseTableState`; the
+FPGA/Vivado computer compiles it against the full XDC-inferred hardware channel
+order, uploads `ticks/masks` through Vivado VIO, and the FPGA clock executes the
+pulse timing.
 
-The GUI is only a frontend. It may display four channels, ten channels, or all
-forty. At upload time the sequencer server still produces a full-width 40-bit
+The GUI is only a frontend.  It may display four channels, ten channels, or every
+XDC channel.  At upload time the sequencer server still produces a full-width
 program; hidden or unconfigured channels are off.
 
 ## 0. Install
@@ -19,91 +20,92 @@ cd C:\path\to\Zou_lab_control_v1
 install_requirements.bat
 ```
 
-`install_requirements.bat` records the selected interpreter in the ignored
-local file `.zlc_python_path`.  Root `pulse_gui.bat`,
+`install_requirements.bat` installs the Python package in editable mode and
+records the selected interpreter in `.zlc_python_path`.  Root `pulse_gui.bat`,
 `start_tutorials_jupyter_lab.bat`, and `fpga\run_server.bat` use that
-interpreter before falling back to PATH, so the GUI, tutorials, and FPGA server
-open in the same Python environment that received PyQt, RPyC, Jupyter, and the
-editable package install.  To override one terminal, set
-`ZLC_PULSE_GUI_PYTHON` for the GUI, `ZLC_TUTORIALS_PYTHON` for the tutorial
-launcher, or `ZLC_FPGA_SERVER_PYTHON` for the FPGA server.  To verify the
-tutorial launcher without opening a browser, run:
-
-```powershell
-start_tutorials_jupyter_lab.bat --check
-```
-
-or:
-
-```powershell
-python -m pip install -e .
-```
+interpreter before falling back to `PATH`.
 
 Vivado is separate from Python requirements and only needs to be installed on
-the Verilog/FPGA computer.
+the FPGA/Vivado computer.
 
 ## 1. Build And Program On The FPGA Computer
 
-Use a short checkout path when possible, for example `D:\ZLC`.  The build
-script writes generated Vivado projects under `fpga\build` and uses the short
-project names `p40` and `c40`.  The printed `ZLC build root: ...` and
-`ZLC project dir: ...` lines are the source of truth.  The default real
-bitstream project is `fpga\build\p40`.
-
-If an old terminal still has `ZLC_PS_PROJECT_DIR`,
-`ZLC_PS_CHECK_PROJECT_DIR`, `ZLC_PS_VIVADO_BIT`, or `ZLC_PS_VIVADO_LTX`
-pointing inside the repository, for example `...\fpga\pulse_streamer\build\...`,
-the batch script ignores that value and falls back to `fpga\build`. This avoids
-using the old long-path project layout and prevents the server from loading a
-stale probes file.
+Use a short checkout path when possible, for example `D:\ZLC`.
 
 ```powershell
 cd D:\ZLC
 .\fpga\build_and_program.bat --help
 .\fpga\build_and_program.bat --check
-```
-
-`--check` performs a no-XDC 40ch synthesis self-check. It is useful before the
-board pin map is ready. It does not create a board-ready bitstream.
-
-For a real build, the repo uses the checked-in
-`fpga\pulse_streamer\zlc_pulse_streamer_40ch.xdc`.  It was generated from the
-historical `address_switch` XDC.  The first four physical outputs are:
-
-```text
-ch00 -> trap
-ch01 -> cooling
-ch02 -> probe
-ch03 -> old trig / qcm_trigger
-```
-
-Then build and program:
-
-```powershell
 .\fpga\build_and_program.bat
 ```
 
-If your XDC lives elsewhere:
+The script writes Vivado projects under `fpga\build`.  The default real project
+is:
+
+```text
+fpga\build\address_switch\address_switch.xpr
+fpga\build\address_switch\address_switch.runs\impl_1\zlc_pulse_streamer_top_address_switch.bit
+fpga\build\address_switch\address_switch.runs\impl_1\zlc_pulse_streamer_top_address_switch.ltx
+```
+
+The default XDC source is the historical address-switch pin map:
+
+```text
+references\source_archives\address_switch\address_switch.srcs\constrs_1\new\addre.xdc
+```
+
+To use a different board-level XDC, set `ZLC_PS_XDC`:
 
 ```powershell
-$env:ZLC_PS_40CH_XDC = "D:\fpga_pin_maps\zlc_pulse_streamer_40ch_my_board.xdc"
+$env:ZLC_PS_XDC = "D:\fpga_pin_maps\my_address_switch_board.xdc"
 .\fpga\build_and_program.bat
 ```
 
-The script refuses to build if the selected XDC is missing or still contains
-`<PIN_CHxx>` placeholders. It also returns nonzero if synthesis,
-implementation, `.bit/.ltx` generation, or programming fails. On success it
-prints a completion message and waits for the user to close the window; set
-`ZLC_NO_PAUSE=1` for automation.
-
-Generated files live under the `ZLC project dir` printed by the build script,
-for example:
+The address-switch wrapper uses the original port names and maps them to a
+runtime bit vector.  For the camera-imaging preset, the important physical
+outputs are:
 
 ```text
-<ZLC project dir>\p40.xpr
-<ZLC project dir>\p40.runs\impl_1\zlc_pulse_streamer_top_40ch.bit
-<ZLC project dir>\p40.runs\impl_1\zlc_pulse_streamer_top_40ch.ltx
+ch09 -> trap    -> package pin M17
+ch00 -> cooling -> package pin F15
+ch03 -> probe   -> package pin N15
+ch11 -> emCCD   -> package pin M13
 ```
+
+The same XDC also has `ch06 -> trig -> package pin R17`.  That output remains
+available, but the checked-in camera/qCMOS preset uses `emCCD` (`ch11`) as the
+camera trigger.  Do not change package-pin mapping to make this work; the pulse
+JSON and trigger-channel inference select the existing `emCCD` channel.
+
+The hardware clock is 50 MHz, so the timing quantum is 20 ns.  If a GUI field
+shows `Step: 20 ns`, the displayed duration should match the scope duration.
+
+The original XDC also contains 10-bit TTL-style buses that the GUI/API may treat
+as logical analog-value channels:
+
+```text
+da_dipole: ch18..ch27        bit order da_dipole[0]..da_dipole[9]
+da_bias_y: ch38..ch29        bit order da_bias_y[0]..da_bias_y[9]
+da_bias_x: ch40..ch49        bit order da_bias_x[0]..da_bias_x[9]
+da_bias_z: ch60..ch51        bit order da_bias_z[0]..da_bias_z[9]
+```
+
+`--check` performs a no-board self-check for the HDL/VIO width and capacity
+contract.  A full build and program returns nonzero if synthesis,
+implementation, bitstream/LTX generation, or programming fails.
+
+The capacity/resource profile is configurable before build:
+
+```powershell
+$env:ZLC_PS_RESOURCE_TARGET_PCT = "70"
+$env:ZLC_PS_MAX_EDGES = "512"
+$env:ZLC_PS_MAX_SCAN_POINTS = "256"
+.\fpga\build_and_program.bat --check
+```
+
+The default resource target is 70%.  The script prints the selected edge-table
+and scan-array capacity; Vivado `report_utilization` remains the final resource
+evidence for the generated project.
 
 Vivado discovery order:
 
@@ -112,22 +114,17 @@ Vivado discovery order:
    `D:\Xilinx\Vivado\*\bin\vivado.bat`;
 3. `vivado.bat` or `vivado` on `PATH`.
 
-Manual override:
-
-```powershell
-$env:ZLC_PS_VIVADO_BIN = "C:\Xilinx\Vivado\2019.2\bin\vivado.bat"
-```
-
-Vivado GUI route:
+Manual Vivado route:
 
 1. Open Vivado 2019.x.
 2. If the project does not exist yet, run `.\fpga\build_and_program.bat --build-only`.
-3. Open `p40.xpr` under the printed `ZLC project dir`.
+3. Open `fpga\build\address_switch\address_switch.xpr`.
 4. Run Synthesis, Run Implementation, then Generate Bitstream.
 5. Open Hardware Manager, Open Target, Auto Connect.
 6. Select the FPGA device and Program Device.
-7. Choose `zlc_pulse_streamer_top_40ch.bit` and
-   `zlc_pulse_streamer_top_40ch.ltx`.
+7. Choose `zlc_pulse_streamer_top_address_switch.bit` and
+   `zlc_pulse_streamer_top_address_switch.ltx` from the same implementation
+   directory.
 
 If Vivado sees a Digilent target but no FPGA device, run:
 
@@ -138,7 +135,7 @@ If Vivado sees a Digilent target but no FPGA device, run:
 Then check board power, JTAG/mode jumpers, power-source jumper, cable seating,
 and Hardware Manager Auto Connect.
 
-## 2. Start The 40ch Sequencer Server
+## 2. Start The Sequencer Server
 
 After programming:
 
@@ -148,96 +145,95 @@ cd D:\ZLC
 .\fpga\run_server.bat
 ```
 
-`--check-config` prints the resolved project, bitstream, probes file, 40-channel
-list, and trigger channel, then exits.  Use it after `--build-only` or a full
-build to confirm the server will point at the same `.bit/.ltx` before starting
-the long-running process.  The batch wrapper prints a completion line and keeps
-the window open after this check; set `ZLC_NO_PAUSE=1` when running it from an
-automation script.
+`--check-config` prints the resolved project, bitstream, probes file, full
+channel list, trigger channel, clock, edge capacity, and scan capacity, then
+exits.
 
-Defaults:
+Default runtime settings:
 
 ```text
-host:     0.0.0.0
-port:     18861
-backend:  vivado-session
-clock:    100 MHz
-channels: ch00 ... ch39
-trigger:  ch03
+host:            0.0.0.0
+port:            18861
+backend:         vivado-session
+clock:           50 MHz
+time step:       20 ns
+channels:        inferred from the selected XDC, fallback ch00 ... ch61
+trigger channel: inferred from the XDC label "emCCD", normally ch11
+edge rows:       configured by build/runtime capacity settings
+scan RAM:        ordered named scan rows: up to two timing-axis ticks plus packed DA bus values
 ```
 
 The persistent `vivado-session` backend opens Vivado Tcl once, loads the `.ltx`
 probes once, and reuses that process for `prepare/fire/wait_done/safe_state`.
-Matched VIO probe handles are cached after their first lookup in that Tcl
-session. This warm start happens before clients connect, so the first GUI
-`On Pulse` does not pay the Vivado startup cost.
-
-After the first successful prepare, the persistent session also keeps a Python
-copy of the uploaded edge table.  A later prepare with the same channel order
-and FPGA clock uses differential upload: it rewrites only edge rows whose
-`tick` or `mask` changed, plus the shadow-critical rows `0`,
-`loop_start_index`, and the final row.  The prepare log reports this as, for
-example, `wrote 3/6 edge rows`.  Exact repeat `On Pulse` calls with the same
-`sequence_id` are skipped by the sequencer service and only fire again; changed
-`pulse.x` values still prepare a new program, but the Vivado session can upload
-only the changed rows.
-Set `ZLC_PS_SERVER_BACKEND=command` only for debugging the older
-subprocess-per-action path.
+After the first successful prepare, later prepares with the same channel order
+and FPGA clock can use differential upload: only changed edge rows, changed scan
+points, and shadow-critical rows are rewritten.
 
 ## 3. Pulse GUI
 
-Root GUI entry remains separate from FPGA scripts:
+Open the standalone GUI from the repository root:
 
 ```powershell
-.\pulse_gui.bat --remote-host 127.0.0.1 --remote-port 18861 --state .\pulses\camera_imaging_40ch.json
+.\pulse_gui.bat --remote-host 127.0.0.1 --remote-port 18861 --state .\pulses\camera_imaging_address_switch.json
 ```
 
-From a control computer, replace `127.0.0.1` with the FPGA computer IP printed
-by the server.
+From a control computer, replace `127.0.0.1` with the FPGA computer IP.  For
+offline editing:
 
-`pulses\camera_imaging_40ch.json` stores forty hardware channels but only shows
-the first four by default.  Its `camera_exposure` period uses `duration="x"`
-with default `x_ns=19980000`, so `pulse.x = ...` in the control notebook scans
-probe/readout exposure without rebuilding the pulse table by hand:
-
-```text
-ch00 label trap
-ch01 label cooling
-ch02 label probe
-ch03 label qcm_trigger
+```powershell
+.\pulse_gui.bat --no-sequencer --state .\pulses\camera_imaging_address_switch.json
 ```
 
-This is still a 40ch pulse for the FPGA. The GUI visible-channel list only
-controls editor clutter. When `On Pulse` is pressed, the current state is sent
-to the sequencer, compiled against `ch00..ch39`, uploaded, and fired. Channels
-not present in the state or not visible in the GUI are zero in the uploaded
-40-bit masks.
-
-The camera preset compiles at 100 MHz to:
+`pulses\camera_imaging_address_switch.json` stores the full hardware channel
+order and only shows the camera-imaging subset by default:
 
 ```text
-ticks: 0, 200000, 210000, 212000, 2210000, 2212000
-masks: 3, 1, 13, 5, 1, 0
+visible: ch09 trap, ch00 cooling, ch03 probe, ch11 emCCD
+```
+
+The `camera_exposure` period uses `duration="camera_exposure_ns"` with default
+`camera_exposure_ns=19_980_000`, so
+`pulse.set_variable("camera_exposure_ns", value_ns)` in a control notebook
+scans probe/readout exposure without rebuilding the pulse table.
+
+When `On Pulse` is pressed, the GUI sends the current state to the sequencer.
+The sequencer compiles it against the full XDC-inferred channel order, uploads
+the edge table, and fires the FPGA.  Channels not present in the state or hidden
+in the GUI are zero in the uploaded masks.
+
+The camera preset compiles at 50 MHz to:
+
+```text
+ticks: 0, 100000, 105000, 106000, 1105000, 1106000
+masks: 513, 512, 2568, 520, 512, 0
 trigger_count: 1
 repeat_forever: true
 ```
 
-All high bits above `ch03` are zero.  The Pulse GUI does not expose a separate
-whole-table repeat switch; the visible repeat control is the period bracket.
-For single-shot oscilloscope or camera debugging, call
-`pulse.on_pulse(wait=True, repeat_forever=False)` from a controller created with
-`exp.timing.bind_pulse("pulses/camera_imaging_40ch.json")`, or let the camera
-readout helper generate the finite trigger sequence. Otherwise a qCMOS trigger
-pulse can intentionally reappear once per table period.
+These masks mean:
 
-If the scope shows a periodic extra pulse every many frames or every few
-seconds, first check whether the table contains a long finite repeat bracket
-inside `repeat_forever=True`. In that mode the FPGA runs the bracketed span a
-finite number of times, then finishes the rest of the table, then the outer
-`repeat_forever` restarts from period 0. If period 0 turns on load/cooling/probe
-channels, that table-head pulse is expected. For a steady scope train, build a
-pulse table whose whole table is only the steady camera cycle, or run finite
-shots through the camera/readout workflow.
+```text
+513 = ch00 + ch09
+512 = ch09
+2568 = ch03 + ch09 + ch11
+520 = ch03 + ch09
+```
+
+In the standalone Pulse GUI, the left raw hardware column displays XDC package
+pins when available.  For this preset, expect to see `M17`, `F15`, `N15`, and
+`M13` in the raw column, with the hardware bit name such as `ch11` kept in the
+tooltip and JSON/API state.
+
+For single-shot scope or camera debugging, run a finite shot from the API, for
+example:
+
+```python
+pulse = exp.timing.bind_pulse("pulses/camera_imaging_address_switch.json")
+pulse.on_pulse(wait=True, repeat_forever=False)
+```
+
+For normal camera acquisition, let the camera/readout helper generate the finite
+trigger sequence so the camera is armed before the FPGA fires.
 
 ## 4. Control/qCMOS Computer
 
@@ -266,23 +262,45 @@ The fixed FPGA bitstream stores an edge table:
 
 ```text
 ticks: absolute FPGA clock ticks
-masks: full 40-bit output masks
+masks: full-width output masks
 ```
 
 During `prepare`, Python writes the table and repeat metadata through VIO while
-reset is asserted.  A full prepare writes each row by staging `prog_addr`,
-`prog_tick`, and `prog_mask`, then toggling `prog_we`; the FPGA writes once on
-that synchronized toggle. Differential prepares use the same row-write protocol
-but only for changed rows plus shadow-critical rows. The
-VIO-facing `reset`, `start`, and `prog_we` controls pass through two FPGA-clock
-synchronizer stages before the state machine uses them. This avoids corrupt
-table rows while Vivado updates multiple VIO probes. During `fire`, Python sends
-a low-high-low `zlc_start` pulse and the FPGA reacts only to the rising edge.
-After that, `time_count` advances on
-the FPGA clock and updates outputs when `time_count == tick_mem[edge_index]`.
+reset is asserted. A full prepare writes each row by staging `prog_addr`,
+`prog_tick`, optional two-axis timing coefficients, and `prog_mask`, then
+toggling `prog_we`; the FPGA writes once on that synchronized toggle. Scan
+programs upload one ordered named-parameter table after the host packs at most
+two active timing parameters into the two hardware scan columns. The current
+bitstream probe names for those columns are still `scan_prog_x` and
+`scan_prog_y`; treat those as internal axis0/axis1 wires, not user-facing x/y
+variables.
 
-Repeat is metadata, not expanded rows. A GUI table with `repeat infinity` is
-uploaded once with `zlc_repeat_forever=1`. A finite repeat bracket uses
-`loop_start_addr`, `loop_end_tick`, and `loop_count`. This is why a simple GUI
-pulse using only four visible channels can still run cleanly on the 40ch
-bitstream without changing Verilog.
+Repeat is metadata, not expanded rows.  A GUI table with repeat infinity is
+uploaded once with `zlc_repeat_forever=1`.  A finite repeat bracket uses
+`loop_start_addr`, `loop_end_tick`, and `loop_count`.
+
+Scan is also metadata plus a compact template, not an expanded table. In the
+Pulse GUI, press the dot beside a duration or delay field to bind it to a named
+scan parameter, then link a table file:
+
+```text
+# vars: camera_exposure_ns(ns), trig_delay(ns)
+1000 0
+2000 20
+4000 40
+```
+
+All values are ns and the GUI snaps numeric entries to the active hardware step
+using the same Fluent line-edit resolution logic as duration and delay fields.
+Rows whose delay or duration contains named parameters or expressions such as
+`100000 - camera_exposure_ns` keep those symbolic expressions in the editor and
+preview. The GUI does not expand the scan table into hundreds of period
+columns; the FPGA iterates the packed scan rows internally.
+
+Analog bus rows are folded views of 10-bit TTL groups.  Current hardware
+uploads them through a separate bus-segment table with rows such as `bus_id,
+start_tick, stop_tick, start_value, stop_value, mode`.  A small FPGA bus engine
+generates the stair-step ramp locally, while the digital edge table remains
+reserved for laser, shutter, camera, and other TTL transitions.  Hardware scan
+arrays do not currently combine with analog bus segments in the same upload;
+prepare one bus-ramp pulse per scan point when that case is needed.

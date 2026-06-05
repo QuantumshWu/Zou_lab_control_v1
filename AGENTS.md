@@ -79,12 +79,13 @@ Generate pulse-streamer HDL:
 ```powershell
 python -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer generate_hdl `
   --output-dir D:\zlc_pulse_streamer_hdl `
-  --channels trap cooling probe qcm_trigger `
+  --channels trap cooling probe trig `
   --max-edges 1024 `
   --tick-width 32
 ```
 
-For 40-channel FPGA sizing and constraints, read `docs/FPGA_PULSE_STREAMER_CAPACITY.md`.
+For address-switch FPGA sizing, resource targets, and constraints, read
+`docs/FPGA_PULSE_STREAMER_CAPACITY.md`.
 
 ## Documentation Rule
 

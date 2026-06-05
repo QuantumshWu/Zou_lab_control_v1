@@ -381,7 +381,7 @@ def test_frontend_title_pulse_and_public_2d_square_guard():
     assert all_rows.spec.data_px[1] >= 4 * 360
     assert zf.pulse_repeat_notation() == "repeat ∞"
     assert zf.pulse_repeat_notation(0, 2, 4) == "repeat P1-P3 x4"
-    assert zf.pulse_repeat_marker(total_duration_s=3e-6) == (0.0, 3e-6, "∞")
+    assert zf.pulse_repeat_marker(total_duration_s=3e-6) == (0.0, 3e-6, "×∞")
     repeat_state = na.PulseTableState(
         channels=["ch00", "ch01"],
         periods=[
@@ -396,18 +396,18 @@ def test_frontend_title_pulse_and_public_2d_square_guard():
     )
     assert zf.pulse_repeat_notation(repeat_state) == "repeat ∞ + P2-P2 x5"
     repeat_markers = zf.pulse_repeat_markers(repeat_state)
-    assert [marker[2] for marker in repeat_markers] == ["∞", "x5"]
+    assert [marker[2] for marker in repeat_markers] == ["×∞", "×5"]
     assert np.allclose([(marker[0], marker[1]) for marker in repeat_markers], [(0.0, 600e-9), (100e-9, 300e-9)])
     outer_repeat_state = na.PulseTableState.from_dict({**repeat_state.to_dict(), "repeat_start": 0, "repeat_end": 2, "repeat_count": 3})
     assert zf.pulse_repeat_notation(outer_repeat_state) == "repeat P1-P3 x3"
     outer_markers = zf.pulse_repeat_markers(outer_repeat_state)
-    assert [marker[2] for marker in outer_markers] == ["x3"]
+    assert [marker[2] for marker in outer_markers] == ["×3"]
     assert np.allclose([(marker[0], marker[1]) for marker in outer_markers], [(0.0, 600e-9)])
     bracketed = zf.plot(
         FortySeq(),
         kind="pulse",
         repeat_notation="repeat ∞",
-        repeat_bracket=(0.0, 3e-6, "∞"),
+        repeat_bracket=(0.0, 3e-6, "×∞"),
         display=False,
     )
     bracketed.fig.canvas.draw()
@@ -418,7 +418,7 @@ def test_frontend_title_pulse_and_public_2d_square_guard():
         bracket_y = bracket.get_ydata()
         assert min(bracket_y) <= -0.3
         assert max(bracket_y) >= len(bracketed.channels) - 0.2
-    assert bracketed.repeat_bracket_label.get_text() == "∞"
+    assert bracketed.repeat_bracket_label.get_text() == "×∞"
     assert bracketed.repeat_bracket_label.get_position()[0] > 3e-6
     assert bracketed.repeat_bracket_label.get_ha() == "left"
     assert bracketed.repeat_bracket_label.get_clip_on() is False
@@ -436,7 +436,7 @@ def test_frontend_title_pulse_and_public_2d_square_guard():
         FortySeq(),
         kind="pulse",
         repeat_notation="repeat ∞",
-        repeat_bracket=(0.0, 5e-6, "∞"),
+        repeat_bracket=(0.0, 5e-6, "×∞"),
         display=False,
     )
     bracketed_far.fig.canvas.draw()
@@ -458,12 +458,12 @@ def test_frontend_title_pulse_and_public_2d_square_guard():
         kind="pulse",
         channels=["ch00", "ch01"],
         repeat_notation="repeat ∞ + P2-P3 x4",
-        repeat_brackets=[(0.0, 4.3e-6, "∞"), (1.0e-6, 3.2e-6, "x4")],
+        repeat_brackets=[(0.0, 4.3e-6, "×∞"), (1.0e-6, 3.2e-6, "×4")],
         display=False,
     )
     middle_repeat.fig.canvas.draw()
     assert len(middle_repeat.repeat_bracket_artists) == 4
-    assert [label.get_text() for label in middle_repeat.repeat_bracket_labels] == ["∞", "x4"]
+    assert [label.get_text() for label in middle_repeat.repeat_bracket_labels] == ["×∞", "×4"]
     assert min(middle_repeat.repeat_bracket_artists[0].get_xdata()) == 0.0
     assert max(middle_repeat.repeat_bracket_artists[1].get_xdata()) == 4.3e-6
     assert min(middle_repeat.repeat_bracket_artists[2].get_xdata()) == 1.0e-6
@@ -799,7 +799,7 @@ def test_frontend_generates_utf8_tutorial_notebooks(tmp_path):
     assert "write_neutral_atom_tutorial" in zf.__all__
 
 
-def test_pulse_gui_constructs_40_channel_editor(monkeypatch, tmp_path):
+def test_pulse_gui_constructs_xdc_channel_editor(monkeypatch, tmp_path):
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
 
@@ -808,11 +808,11 @@ def test_pulse_gui_constructs_40_channel_editor(monkeypatch, tmp_path):
     from Zou_lab_control.frontend.pulse_gui import FigureCanvas, PulseSequenceEditor, ensure_qt_app
 
     app = ensure_qt_app()
-    channels = [f"ch{i:02d}" for i in range(40)]
+    channels = [f"ch{i:02d}" for i in range(62)]
 
     class DummySequencer:
-        clock_hz = 100e6
-        trigger_channels = ["ch03"]
+        clock_hz = 50e6
+        trigger_channels = ["ch11"]
 
         def __init__(self, channels):
             self.channels = channels
@@ -823,14 +823,22 @@ def test_pulse_gui_constructs_40_channel_editor(monkeypatch, tmp_path):
         editor.show()
         app.processEvents()
 
-        assert len(editor.state.channels) == 40
+        assert len(editor.state.channels) == 62
         assert re.fullmatch(r"pulse_\d{8}_\d{6}", editor.state.name)
-        assert editor.state.time_step_ns == 10
+        assert editor.state.time_step_ns == 20
         assert editor.state.visible_channels == ["ch00", "ch01", "ch02", "ch03"]
         assert editor.names_panel.label_edits["ch00"].text() == ""
-        assert "4/40 visible" in editor.summary.text()
-        assert "step 10 ns" in editor.summary.text()
-        assert editor.add_channel_combo.count() == 36
+        assert "4/62 visible" in editor.summary.text()
+        assert "step 20 ns" in editor.summary.text()
+        assert editor.add_channel_combo.count() == 58
+        assert not hasattr(editor.channel_panel, "x_edit")
+        assert not hasattr(editor.channel_panel, "y_edit")
+        assert not hasattr(editor.channel_panel, "scan_y_switch")
+        assert not hasattr(editor.channel_panel, "scan_edit")
+        assert editor.channel_panel.top_labels["params"].text() == "Params:"
+        assert editor.channel_panel.top_labels["file"].text() == "File:"
+        assert editor.channel_panel.scan_params_edit.text() == ""
+        assert editor.channel_panel.scan_file_edit.text() == ""
         first_card = editor.drag_container.pulse_cards()[0]
         assert first_card.checks["ch00"].text() == "ch00"
         assert editor.channel_panel.channel_labels["ch00"].text() == "ch00"
@@ -842,12 +850,40 @@ def test_pulse_gui_constructs_40_channel_editor(monkeypatch, tmp_path):
         assert editor.names_panel.graphicsEffect() is not None
         assert editor.channel_panel.graphicsEffect() is not None
         assert first_card.graphicsEffect() is not None
-        assert editor.button_frame.background.graphicsEffect() is not None
-        assert editor.button_frame.background.metaObject().className() == "FluentFrame"
-        assert editor.channel_view.background.graphicsEffect() is not None
-        assert editor.channel_view.parent() is editor.button_frame.content
+        assert editor.button_frame.graphicsEffect() is not None
+        assert editor.button_frame.metaObject().className() == "FluentGroupBox"
+        assert editor.button_frame.title() == "Control Buttons"
+        assert editor.channel_view.graphicsEffect() is not None
+        assert editor.channel_view.title() == "Channel View"
+        assert editor.channel_view.parent() is editor.button_frame
+        assert editor.button_frame.minimumHeight() >= editor.channel_view.minimumHeight()
+        assert editor.channel_view.layout().contentsMargins().top() > editor.channel_view.layout().contentsMargins().left()
+        assert editor.load_button.text() == "Load\nFile"
         assert editor.names_panel_layout.contentsMargins().top() == editor.drag_container.layout_main.contentsMargins().top()
         assert editor.names_panel_layout.contentsMargins().top() > 0
+        def y_in_editor(widget):
+            return widget.mapTo(editor, QtCore.QPoint(0, 0)).y()
+
+        def x_in_editor(widget):
+            return widget.mapTo(editor, QtCore.QPoint(0, 0)).x()
+
+        assert editor.channel_panel.top_labels["params"].alignment() == QtCore.Qt.AlignCenter
+        assert editor.channel_panel.top_labels["file"].alignment() == QtCore.Qt.AlignCenter
+        assert editor.channel_panel.top_labels["step"].alignment() == QtCore.Qt.AlignCenter
+        assert x_in_editor(editor.channel_panel.top_labels["step"]) == x_in_editor(editor.channel_panel.top_labels["params"])
+        assert x_in_editor(editor.channel_panel.top_labels["params"]) == x_in_editor(editor.channel_panel.top_labels["file"])
+        assert x_in_editor(editor.channel_panel.step_edit) == x_in_editor(editor.channel_panel.scan_params_edit)
+        assert x_in_editor(editor.channel_panel.scan_params_edit) == x_in_editor(editor.channel_panel.scan_file_edit)
+        assert abs(y_in_editor(editor.channel_panel.top_labels["params"]) - y_in_editor(editor.channel_panel.scan_params_edit)) <= 1
+        assert editor.channel_panel.top_labels["params"].height() == editor.channel_panel.scan_params_edit.height()
+        assert abs(y_in_editor(editor.channel_panel.top_labels["file"]) - y_in_editor(editor.channel_panel.scan_file_edit)) <= 1
+        assert editor.channel_panel.top_labels["file"].height() == editor.channel_panel.scan_file_edit.height()
+        assert abs(y_in_editor(editor.channel_panel.top_labels["step"]) - y_in_editor(editor.channel_panel.step_edit)) <= 1
+        assert editor.channel_panel.top_labels["step"].height() == editor.channel_panel.step_edit.height()
+        assert abs(y_in_editor(editor.names_panel.raw_label_widgets["ch00"]) - y_in_editor(editor.channel_panel.delay_edits["ch00"])) <= 1
+        assert abs(y_in_editor(editor.channel_panel.delay_edits["ch00"]) - y_in_editor(first_card.checks["ch00"])) <= 1
+        assert abs(y_in_editor(editor.channel_panel.scan_params_edit) - y_in_editor(editor.names_panel.total_label)) <= 1
+        assert abs(y_in_editor(editor.channel_panel.scan_file_edit) - y_in_editor(editor.names_panel.periods_label)) <= 1
         margins = editor.edit_tab.layout().contentsMargins()
         assert margins.left() > 0 and margins.top() > 0
         controls = [
@@ -861,6 +897,7 @@ def test_pulse_gui_constructs_40_channel_editor(monkeypatch, tmp_path):
         assert editor.add_channel_combo.geometry().x() == editor.hide_off_button.geometry().x()
         assert editor.add_channel_button.geometry().x() == editor.show_all_button.geometry().x()
         assert editor.preview_include_off.metaObject().className() == "FluentSwitch"
+        assert editor.preview_include_off.text() == "Show off rows"
         assert not hasattr(editor, "preview_refresh_button")
         assert hasattr(editor, "preview_save_figure_button")
         assert not hasattr(editor, "save_figure_button")
@@ -887,7 +924,7 @@ def test_pulse_gui_constructs_40_channel_editor(monkeypatch, tmp_path):
             editor.preview_include_off.setChecked(True)
             QtTest.QTest.qWait(250)
             app.processEvents()
-            assert "40/40 plotted" in editor.preview_status.text()
+            assert "62/62 plotted" in editor.preview_status.text()
             editor.preview_include_off.setChecked(False)
             QtTest.QTest.qWait(250)
             app.processEvents()
@@ -896,8 +933,8 @@ def test_pulse_gui_constructs_40_channel_editor(monkeypatch, tmp_path):
 
         editor.show_all_channels()
         app.processEvents()
-        assert len(editor.state.visible_channels) == 40
-        assert "40/40 visible" in editor.summary.text()
+        assert len(editor.state.visible_channels) == 62
+        assert "62/62 visible" in editor.summary.text()
         assert editor.add_channel_combo.count() == 0
         assert not editor.add_channel_button.isEnabled()
         assert editor.dataset_scroll.verticalScrollBar().width() == editor.timeline_hbar.height()
@@ -907,7 +944,7 @@ def test_pulse_gui_constructs_40_channel_editor(monkeypatch, tmp_path):
         assert editor.state.visible_channels == ["ch00", "ch01", "ch02", "ch03"]
 
         editor.names_panel.label_edits["ch01"].setText("cooling_laser")
-        editor.channel_panel.delay_edits["ch01"].setText("30")
+        editor.channel_panel.delay_edits["ch01"].setText("40")
         app.processEvents()
         assert editor.channel_panel.channel_labels["ch01"].text() == "cooling_laser"
         current_first_card = editor.drag_container.pulse_cards()[0]
@@ -917,7 +954,7 @@ def test_pulse_gui_constructs_40_channel_editor(monkeypatch, tmp_path):
         assert editor.state.visible_channels == ["ch00", "ch01", "ch02", "ch03"]
         assert all(not period.states[editor.state.channel_index("ch01")] for period in editor.state.periods)
         assert editor.state.channel_labels["ch01"] == "cooling_laser"
-        assert editor.state.delays["ch01"] == "30"
+        assert editor.state.delays["ch01"] == "40"
 
         editor.hide_off_channels()
         app.processEvents()
@@ -951,7 +988,7 @@ def test_pulse_gui_constructs_40_channel_editor(monkeypatch, tmp_path):
             assert editor._preview_canvas is not None
             assert "plotted" in editor.preview_status.text()
             assert "repeat ∞" in editor.preview_status.text()
-            assert editor._preview_plot.repeat_bracket[2] == "∞"
+            assert editor._preview_plot.repeat_bracket[2] == "×∞"
             assert len(editor._preview_plot.repeat_bracket_artists) == 2
             assert all(abs(bracket.get_alpha() - 0.58) < 1e-12 for bracket in editor._preview_plot.repeat_bracket_artists)
             for bracket in editor._preview_plot.repeat_bracket_artists:
@@ -984,8 +1021,8 @@ def test_pulse_gui_constructs_40_channel_editor(monkeypatch, tmp_path):
         assert (tmp_path / "pulse_custom.png").exists()
 
         sequence = editor.to_sequence()
-        assert sequence.validate(clock_hz=100e6, channels=channels).ok
-        screenshot = editor.grab_screenshot(tmp_path / "pulse_gui_40ch.png")
+        assert sequence.validate(clock_hz=50e6, channels=channels).ok
+        screenshot = editor.grab_screenshot(tmp_path / "pulse_gui_address_switch.png")
         assert screenshot.exists()
         assert screenshot.stat().st_size > 1000
     finally:
@@ -1002,21 +1039,24 @@ def test_standalone_pulse_gui_defaults_use_hardware_channel_names():
     assert channels == ["ch00", "ch01", "ch02", "ch03", "ch04"]
     assert not hasattr(launcher, "DEFAULT_CHANNEL_LABELS")
     args = SimpleNamespace(trigger_channels=None)
-    assert launcher._resolve_trigger_channels(args, channels) == ["ch03"]
+    with pytest.raises(ValueError, match="emCCD"):
+        launcher._resolve_trigger_channels(args, [f"ch{i:02d}" for i in range(62)])
+    assert launcher._resolve_trigger_channels(args, [f"ch{i:02d}" for i in range(62)], {"ch11": "emCCD"}) == ["ch11"]
+    assert launcher._build_parser().parse_args([]).clock_hz == 50_000_000
 
 
-def test_pulse_gui_controls_call_attached_40ch_sequencer(monkeypatch):
+def test_pulse_gui_controls_call_attached_address_switch_sequencer(monkeypatch):
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
 
     from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor, ensure_qt_app
 
     app = ensure_qt_app()
-    channels = [f"ch{i:02d}" for i in range(40)]
+    channels = [f"ch{i:02d}" for i in range(62)]
 
     class RecordingSequencer:
-        clock_hz = 100e6
-        trigger_channels = ["ch03"]
+        clock_hz = 50e6
+        trigger_channels = ["ch11"]
 
         def __init__(self):
             self.channels = channels
@@ -1040,8 +1080,9 @@ def test_pulse_gui_controls_call_attached_40ch_sequencer(monkeypatch):
 
     sequencer = RecordingSequencer()
     editor = PulseSequenceEditor(
-        state=na.PulseTableState.load(Path(__file__).resolve().parents[1] / "pulses" / "camera_imaging_40ch.json"),
+        state=na.PulseTableState.load(Path(__file__).resolve().parents[1] / "pulses" / "camera_imaging_address_switch.json"),
         sequencer=sequencer,
+        channel_pins={"ch00": "F15", "ch11": "M13"},
     )
     try:
         editor.show()
@@ -1049,6 +1090,8 @@ def test_pulse_gui_controls_call_attached_40ch_sequencer(monkeypatch):
 
         assert editor.fire_button.text() == "On\nPulse"
         assert editor.safe_button.text() == "Stop\nPulse"
+        assert editor.names_panel.raw_label_widgets["ch00"].text() == "F15"
+        assert editor.names_panel.raw_label_widgets["ch11"].text() == "M13"
         assert not hasattr(editor, "prepare_button")
         assert not hasattr(editor, "wait_button")
         assert not hasattr(editor, "repeat_forever_switch")
@@ -1062,7 +1105,7 @@ def test_pulse_gui_controls_call_attached_40ch_sequencer(monkeypatch):
         assert editor.last_program.channels == channels
         assert editor.last_program.trigger_count == 1
         assert isinstance(sequencer.prepared, na.PulseTableState)
-        assert sequencer.prepared.to_sequence(expand_repeat=False).validate(clock_hz=100e6, channels=channels).ok
+        assert sequencer.prepared.to_sequence(expand_repeat=False).validate(clock_hz=50e6, channels=channels).ok
         assert editor.last_program.repeat_forever is True
     finally:
         editor.close()
@@ -1072,7 +1115,7 @@ def test_pulse_gui_repeat_preview_uses_unexpanded_periods(monkeypatch):
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
 
-    from PyQt5 import QtWidgets
+    from PyQt5 import QtCore, QtWidgets
 
     from Zou_lab_control.frontend.pulse_gui import FigureCanvas, PulseSequenceEditor, ensure_qt_app
 
@@ -1095,6 +1138,10 @@ def test_pulse_gui_repeat_preview_uses_unexpanded_periods(monkeypatch):
         assert bracket_end.repeat_spin._step_btn.text() == "."
         assert bracket_end.repeat_spin.buttonSymbols() == QtWidgets.QAbstractSpinBox.PlusMinus
         assert "FluentInputDialog" in bracket_end.repeat_spin._on_edit_step.__globals__
+        first_card = editor.drag_container.pulse_cards()[0]
+        spin_y = bracket_end.repeat_spin.mapTo(editor, QtCore.QPoint(0, 0)).y()
+        duration_y = first_card.duration_edit.mapTo(editor, QtCore.QPoint(0, 0)).y()
+        assert abs(spin_y - duration_y) <= 1
         state = editor.read_state()
         assert (state.repeat_start, state.repeat_end, state.repeat_count) == (0, 1, 2)
 
@@ -1112,7 +1159,10 @@ def test_pulse_gui_repeat_preview_uses_unexpanded_periods(monkeypatch):
         assert expanded > unexpanded
         assert editor._preview_plot.sequence.duration == unexpanded
         assert "repeat ∞ + P1-P2 x2" in editor.preview_status.text()
-        assert [label.get_text() for label in editor._preview_plot.repeat_bracket_labels] == ["∞", "x2"]
+        assert [label.get_text() for label in editor._preview_plot.repeat_bracket_labels] == ["×∞", "×2"]
+        repeat_label_sizes = [label.get_fontsize() for label in editor._preview_plot.repeat_bracket_labels]
+        assert max(repeat_label_sizes) == min(repeat_label_sizes)
+        assert editor._preview_plot.repeat_bracket_labels[1].get_position()[1] < editor._preview_plot.repeat_bracket_labels[0].get_position()[1]
         assert [tick.get_text() for tick in editor._preview_plot.ax.get_yticklabels()] == ["trap", "cooling", "ch02", "ch03"]
         assert len(editor._preview_plot.repeat_bracket_artists) == 4
         outer_y = np.r_[editor._preview_plot.repeat_bracket_artists[0].get_ydata(), editor._preview_plot.repeat_bracket_artists[1].get_ydata()]
@@ -1131,6 +1181,203 @@ def test_pulse_gui_repeat_preview_uses_unexpanded_periods(monkeypatch):
         editor.close()
 
 
+def test_pulse_gui_named_scan_bindings_list_file_and_mark_symbolic_regions(monkeypatch, tmp_path):
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor, ensure_qt_app
+
+    app = ensure_qt_app()
+    scan_file = tmp_path / "scan_points.txt"
+    scan_file.write_text("# vars: p1_duration(ns), trig_delay(ns)\n20 0\n40 20\n", encoding="utf-8")
+    state = na.PulseTableState(
+        channels=["ch00", "ch03"],
+        periods=[
+            na.PulsePeriod(20, (1, 0), unit="ns", name="load"),
+            na.PulsePeriod(80, (0, 1), unit="ns", name="trigger"),
+        ],
+        time_step_ns=20,
+        visible_channels=["ch00", "ch03"],
+        channel_labels={"ch00": "trap", "ch03": "trig"},
+    )
+    editor = PulseSequenceEditor(state=state, scale=0.86)
+    try:
+        editor.show()
+        app.processEvents()
+
+        assert not hasattr(editor.channel_panel, "x_edit")
+        assert not hasattr(editor.channel_panel, "y_edit")
+        assert not hasattr(editor.channel_panel, "scan_y_switch")
+        assert not hasattr(editor.channel_panel, "scan_edit")
+        first_card, second_card = editor.drag_container.pulse_cards()
+        first_card.duration_scan_button.click()
+        app.processEvents()
+        assert first_card.duration_edit.text() == "p1_duration"
+        assert first_card.duration_edit.isReadOnly()
+        assert first_card.duration_edit.property("zlcScanBound") == "true"
+        assert not first_card.unit_combo.isEnabled()
+        first_card.duration_scan_button.click()
+        app.processEvents()
+        assert first_card.duration_edit.text() == "20"
+        assert not first_card.duration_edit.isReadOnly()
+        assert first_card.duration_edit.property("zlcScanBound") == "false"
+        assert first_card.unit_combo.isEnabled()
+        assert "period:0:duration" not in editor.read_state().scan_bindings
+        first_card.duration_scan_button.click()
+        second_card.duration_edit.setText("100-p1_duration")
+        editor.channel_panel._bind_delay_scan("ch03")
+        app.processEvents()
+        assert editor.channel_panel.delay_edits["ch03"].text() == "trig_delay"
+        assert editor.channel_panel.delay_edits["ch03"].isReadOnly()
+        assert editor.channel_panel.delay_edits["ch03"].property("zlcScanBound") == "true"
+        assert not editor.channel_panel.delay_units["ch03"].isEnabled()
+        editor.channel_panel._bind_delay_scan("ch03")
+        app.processEvents()
+        assert editor.channel_panel.delay_edits["ch03"].text() == "0"
+        assert not editor.channel_panel.delay_edits["ch03"].isReadOnly()
+        assert editor.channel_panel.delay_edits["ch03"].property("zlcScanBound") == "false"
+        assert editor.channel_panel.delay_units["ch03"].isEnabled()
+        editor.channel_panel._bind_delay_scan("ch03")
+        editor.channel_panel.scan_file_edit.setText(str(scan_file))
+        app.processEvents()
+
+        restored = editor.read_state()
+        assert restored.scan_points == []
+        assert restored.scan_table_path.endswith("scan_points.txt")
+        assert restored.scan_variables["p1_duration"] == 20
+        assert restored.scan_variables["trig_delay"] == 0
+        assert restored.scan_bindings["period:0:duration"] == "p1_duration"
+        assert restored.scan_bindings["delay:ch03"] == "trig_delay"
+        assert restored.active_scan_parameters() == ["p1_duration", "trig_delay"]
+        assert "p1_duration" in editor.channel_panel.scan_params_edit.text()
+
+        plotter, _channels, _repeat = editor._create_preview_plot(editor.read_state(), include_always_off=True)
+        labels = [text.get_text() for text in plotter.variable_region_labels]
+        assert "p1_duration" in labels
+        assert "100-p1_duration" in labels
+        assert len({round(text.get_position()[1], 6) for text in plotter.variable_region_labels}) == 1
+        assert len(plotter.variable_region_artists) >= 2
+        for patch in plotter.variable_region_artists:
+            y_values = [round(float(point[1]), 6) for point in patch.get_path().vertices]
+            assert min(y_values) == 0.0
+            assert max(y_values) == 1.0
+        if hasattr(plotter, "fig") and plotter.fig is not None:
+            plotter.fig.canvas.draw()
+    finally:
+        editor.close()
+
+
+def test_pulse_gui_fluent_window_wrapper_renders_named_scan_rows(monkeypatch, tmp_path):
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from PyQt5 import QtCore, QtTest
+
+    from Zou_lab_control.frontend.pulse_gui import ensure_qt_app, show_pulse_gui
+
+    app = ensure_qt_app()
+    scan_file = tmp_path / "scan_points.txt"
+    scan_file.write_text("# vars: exposure_ns(ns)\n20\n40\n", encoding="utf-8")
+    state = na.PulseTableState(
+        channels=["ch00", "ch03"],
+        periods=[
+            na.PulsePeriod("exposure_ns", (1, 0), unit="str (ns)", name="expose"),
+            na.PulsePeriod(20, (0, 1), unit="ns", name="trigger"),
+        ],
+        time_step_ns=20,
+        visible_channels=["ch00", "ch03"],
+        channel_labels={"ch00": "trap", "ch03": "trig"},
+        scan_variables={"exposure_ns": 20},
+        scan_bindings={"period:0:duration": "exposure_ns"},
+        scan_table_path=scan_file,
+    )
+    editor = show_pulse_gui(state=state, scale=0.86, window_ratio=0.65)
+    window = editor.window()
+    try:
+        app.processEvents()
+        QtTest.QTest.qWait(1000)
+        app.processEvents()
+
+        assert window is not editor
+        assert editor.parent() is window
+        assert window.windowTitle() == editor.windowTitle()
+        assert editor.channel_panel.top_labels["params"].text() == "Params:"
+        assert editor.channel_panel.top_labels["file"].text() == "File:"
+        assert "exposure_ns" in editor.channel_panel.scan_params_edit.text()
+        assert editor.channel_panel.scan_file_edit.text().endswith("scan_points.txt")
+        assert not hasattr(editor.channel_panel, "scan_y_switch")
+        assert not hasattr(editor.channel_panel, "scan_edit")
+
+        pixmap = window.grab()
+        assert not pixmap.isNull()
+        image = pixmap.toImage()
+        colors = set()
+        for x in range(0, image.width(), max(1, image.width() // 6)):
+            for y in range(0, image.height(), max(1, image.height() // 6)):
+                colors.add(image.pixelColor(x, y).rgba())
+        assert len(colors) > 3
+        assert editor.channel_panel.scan_params_edit.mapTo(editor, QtCore.QPoint(0, 0)).y() == editor.channel_panel.top_labels["params"].mapTo(editor, QtCore.QPoint(0, 0)).y()
+    finally:
+        window.close()
+        editor.close()
+
+
+def test_pulse_gui_analog_bus_uses_line_edit_and_hollow_preview(monkeypatch):
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor, ensure_qt_app
+
+    app = ensure_qt_app()
+    state = na.PulseTableState(
+        channels=["ch00", "ch01", "ch02"],
+        periods=[
+            na.PulsePeriod(20, (0, 0, 0), unit="ns"),
+            na.PulsePeriod(20, (0, 0, 0), unit="ns"),
+        ],
+        visible_channels=["ch00", "ch01", "ch02"],
+        channel_labels={"ch00": "da_test[0]", "ch01": "da_test[1]", "ch02": "da_test[2]"},
+        analog_buses={"da_test": ["ch00", "ch01", "ch02"]},
+        time_step_ns=20,
+    )
+    state.set_analog_bus_mode(0, "da_test", "edge", value=0)
+    state.set_analog_bus_mode(1, "da_test", "ramp", value=7)
+    state.apply_analog_bus_modes_to_period_states()
+    editor = PulseSequenceEditor(state=state, scale=0.86)
+    try:
+        editor.show()
+        app.processEvents()
+        first_card, second_card = editor.drag_container.pulse_cards()
+
+        assert first_card.bus_value_edits["da_test"].metaObject().className() == "FluentLineEdit"
+        assert not hasattr(first_card, "bus_spins")
+        second_card.bus_value_edits["da_test"].setText("2048")
+        restored = editor.read_state()
+        assert editor.drag_container.pulse_cards()[1].bus_value_edits["da_test"].text() == "7"
+        assert restored.analog_bus_modes["da_test"][1] == {"mode": "ramp", "value": 7}
+        editor.add_period()
+        app.processEvents()
+        added = editor.read_state()
+        assert len(added.periods) == 3
+        assert len(added.analog_bus_modes["da_test"]) == 3
+        assert added.analog_bus_modes["da_test"][2] == {"mode": "hold", "value": None}
+        editor.remove_period()
+        app.processEvents()
+        removed = editor.read_state()
+        assert len(removed.periods) == 2
+        assert len(removed.analog_bus_modes["da_test"]) == 2
+
+        plotter, channels, _repeat = editor._create_preview_plot(restored, include_always_off=True)
+        assert channels == []
+        assert len(plotter.analog_traces) == 1
+        assert len(plotter.analog_trace_artists) == 1
+        assert plotter.analog_trace_artists[0].get_linewidth() == 0.65
+        assert plotter.analog_trace_labels == []
+        assert [tick.get_text() for tick in plotter.ax.get_yticklabels()] == ["da test"]
+    finally:
+        editor.close()
+
+
 def test_pulse_gui_summary_warns_about_repeat_forever_table_boundary_high(monkeypatch):
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
@@ -1139,7 +1386,7 @@ def test_pulse_gui_summary_warns_about_repeat_forever_table_boundary_high(monkey
 
     app = ensure_qt_app()
     state = na.PulseTableState(
-        channels=["ch00", "ch03"],
+        channels=["ch09", "ch06"],
         periods=[
             na.PulsePeriod(100, (1, 0), unit="ns"),
             na.PulsePeriod(20, (0, 1), unit="ns"),
@@ -1149,9 +1396,9 @@ def test_pulse_gui_summary_warns_about_repeat_forever_table_boundary_high(monkey
         repeat_end=1,
         repeat_count=5,
         repeat_forever=True,
-        channel_labels={"ch00": "trap", "ch03": "qcm_trigger"},
-        visible_channels=["ch00", "ch03"],
-        time_step_ns=10,
+        channel_labels={"ch09": "trap", "ch06": "trig"},
+        visible_channels=["ch09", "ch06"],
+        time_step_ns=20,
     )
     editor = PulseSequenceEditor(state=state, scale=0.86)
     try:

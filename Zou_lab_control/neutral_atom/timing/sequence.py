@@ -222,7 +222,7 @@ class PulseSequence:
                     active_index = index
         return PulseReport(not errors, self.name, len(self.pulses), clock, tuple(errors), tuple(warnings))
 
-    def edges(self, *, clock_hz: float = 250e6, channels: Sequence[str] | None = None) -> tuple[list[int], list[int], list[str]]:
+    def edges(self, *, clock_hz: float = 50_000_000.0, channels: Sequence[str] | None = None) -> tuple[list[int], list[int], list[str]]:
         channels = list(self.channels if channels is None else channel_names(channels, "channels", allow_empty=True))
         if not channels:
             raise ValueError("channels must contain at least one channel.")
@@ -304,9 +304,9 @@ def imaging_sequence(
     trap_channel: str = "trap",
     cooling_channel: str = "cooling",
     probe_channel: str = "probe",
-    trigger_channel: str = "qcm_trigger",
+    trigger_channel: str = "emCCD",
 ) -> PulseSequence:
-    """Build the minimal load/probe/qCMOS-trigger sequence used in notebooks."""
+    """Build the minimal load/probe/camera-trigger sequence used in notebooks."""
 
     exposure = positive_float(exposure, "exposure")
     trigger_width = positive_float(trigger_width, "trigger_width")
@@ -332,7 +332,7 @@ def imaging_sequence(
     return seq
 
 
-DEFAULT_CAMERA_TRIGGER_CHANNELS = ("qcm_trigger", "camera_trigger", "trig")
+DEFAULT_CAMERA_TRIGGER_CHANNELS = ("emCCD",)
 
 
 def count_trigger_pulses(sequence: PulseSequence, *, trigger_channels: Sequence[str] = DEFAULT_CAMERA_TRIGGER_CHANNELS) -> int:
@@ -401,13 +401,13 @@ def exposure_from_sequence(sequence: PulseSequence | None, *, default: float, ch
     return positive_float(unique[0] / 1e15, f"{channel} exposure")
 
 
-def plot_sequence(sequence: PulseSequence, *, clock_hz: float = 250e6, display: bool = True):
+def plot_sequence(sequence: PulseSequence, *, clock_hz: float = 50_000_000.0, display: bool = True):
     """Plot a pulse timeline with ``Zou_lab_control.frontend``."""
 
     from Zou_lab_control import frontend as zf
 
     channels = sequence.edges(clock_hz=clock_hz)[2]
-    return zf.plot(sequence, kind="pulse", channels=channels, labels=("Time (s)", "Pulse", "State"), title=sequence.name, display=display)
+    return zf.plot(sequence, kind="pulse", channels=channels, labels=("Time (s)", "", "State"), title=sequence.name, display=display)
 
 
 def state_to_mask(state: dict[str, int], channels: Sequence[str]) -> int:

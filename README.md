@@ -44,7 +44,7 @@ It installs the same editable checkout into the active kernel and writes
 Zou_lab_control/
   frontend/       standalone plotting, PyQt/Fluent GUI, PDF, notebook helpers
   neutral_atom/   device contracts, qCMOS/readout/session/timing logic
-fpga/             standalone 40ch pulse-streamer build/server side
+fpga/             standalone address-switch pulse-streamer build/server side
 pulses/           checked-in PulseTableState presets
 tutorials/        generated Jupyter notebooks
 docs/             manuals, runbooks, design notes, generated PDFs
@@ -59,12 +59,13 @@ control/qCMOS computer
   -> RemoteSequencer
   -> FPGA/Vivado computer running fpga\run_server.bat
   -> persistent Vivado/VIO session
-  -> fixed zlc_pulse_streamer_top_40ch bitstream
+  -> fixed zlc_pulse_streamer_top_address_switch bitstream
 ```
 
-The FPGA side is always a 40-channel hardware contract by default.  The GUI may
-show only `ch00..ch03`, but upload compiles against the full hardware order
-`ch00..ch39`; hidden or unconfigured channels are off.
+The FPGA side infers the full hardware contract from the address-switch XDC.
+The GUI may show only a small subset such as `ch09/ch00/ch03/ch11`, but upload
+compiles against the full hardware order; hidden or unconfigured channels are
+off.
 
 Use these hardware-side commands on the FPGA/Vivado computer:
 
@@ -78,7 +79,7 @@ fpga\run_server.bat
 Vivado projects, `.runs`, `.cache`, `.hw`, `.sim`, `.ltx`, journals, and server
 state are generated under `fpga\build` by default.  The FPGA batch files print
 `ZLC build root` and `ZLC project dir`; the default project is
-`fpga\build\p40`, and that printed path is the source of truth for
+`fpga\build\address_switch`, and that printed path is the source of truth for
 `.xpr/.bit/.ltx`.
 
 ## Key Docs

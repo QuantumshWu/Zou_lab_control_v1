@@ -3,27 +3,28 @@
 
 \begin{document}
 \frontmatter
-\zlctitlepage{ZLC FPGA Pulse Streamer 测试报告}{40-channel entrypoint / GUI subset compile / server contract}{Vivado 2019.x、runtime edge table、Pulse GUI 与 sequencer server 的当前验证摘要}{2026-06-03}
+\zlctitlepage{ZLC FPGA Pulse Streamer ????}{address-switch entrypoint / GUI subset compile / server contract}{Vivado 2019.x runtime edge table?Pulse GUI ? sequencer server ??}{2026-06-05}
 \tableofcontents
 \cleardoublepage
 \mainmatter
 
 \chapter{结论先行}
-本报告记录当前仓库中 FPGA pulse-streamer 的 40-channel 入口、Pulse GUI/API 编译边界、server 启动边界和文档同步状态。当前硬件路线是固定的 40 路 runtime pulse-streamer：GUI 可以只显示或配置少数 channel，但 server 上传给 FPGA 的 program 始终按 \pyapi{ch00...ch39} 补齐，未使用 channel 的 mask bit 为 0。
+本报告记录当前仓库中 FPGA pulse-streamer 的 address-switch 入口、Pulse GUI/API 编译边界、server 启动边界和文档同步状态。当前硬件路线是固定 address-switch runtime pulse-streamer：GUI 可以只显示或配置少数 channel，但 server 上传给 FPGA 的 program 始终按 XDC 推断的完整 channel order 补齐，未使用 channel 的 mask bit 为 0。
 
 \begin{figure}[h]
   \centering
-  \includegraphics[width=0.98\textwidth]{assets/pulse_streamer_architecture.png}
-  \caption{控制电脑、FPGA server、Vivado/VIO、FPGA bitstream 和 qCMOS trigger 的边界。GUI 在前端；40 路补齐发生在 sequencer compile/upload 边界。}
+  \includegraphics[width=0.98\textwidth]{assets/pulse_streamer_architecture_address_switch.png}
+  \caption{控制电脑、FPGA server、Vivado/VIO、FPGA bitstream 和相机外触发的边界。GUI 在前端；full-width 补齐发生在 sequencer compile/upload 边界。}
 \end{figure}
 
 本轮重点检查：
 \begin{itemize}
-  \item \filepath{fpga\build_and_program.bat} 是 40 路 build/program/check/diagnose 的统一入口。
-  \item \filepath{fpga\run_server.bat} 永远启动 \pyapi{ch00...ch39} 的 40 路 server，trigger 为 \pyapi{ch03}。
-  \item \filepath{fpga\pulse_streamer} 下旧的分散 Windows bat 已删除，Vivado build 产物目录已从源码树清理。
-  \item \filepath{pulses\camera_imaging_40ch.json} 默认只显示前四路，但保存和编译仍保留完整 40 路硬件顺序。
-  \item 只包含 \pyapi{ch00/ch03} 的 GUI/API state 编译到 40 路硬件时，\pyapi{program.channels} 是完整 40 路，所有高于 \pyapi{ch03} 的 mask bit 都为 0。
+  \item \filepath{fpga\build_and_program.bat} 是 build/program/check/diagnose 的统一入口。
+  \item \filepath{fpga\run_server.bat} 从 address-switch XDC 推断完整 channel list，默认 fallback 为 \pyapi{ch00...ch61}。
+  \item trigger channel 从 XDC label \pyapi{emCCD} 推断，默认是 \pyapi{ch11}。
+  \item \filepath{pulses\camera_imaging_address_switch.json} 默认只显示 \pyapi{ch09/ch00/ch03/ch11}，但保存和编译仍保留完整硬件顺序。
+\item GUI/API state 即使只包含相机成像子集，也会编译到 full-width program；未配置 channel 全部为 off。
+  \item \pyapi{da_dipole/da_bias_y/da_bias_x/da_bias_z} 不再通过普通 TTL mask 展开 ramp；它们使用独立 analog bus segment table。
 \end{itemize}
 
 \chapter{入口和目录}
@@ -33,130 +34,143 @@
 .\fpga\build_and_program.bat --help
 .\fpga\build_and_program.bat --check
 .\fpga\build_and_program.bat
+.\fpga\run_server.bat --check-config
 .\fpga\run_server.bat
 \end{shellblock}
 
-\pyapi{--check} 做无物理 pin XDC 的 40 路 synth 自查；真实 build/program 默认使用已经从旧 \filepath{address_switch} pin map 生成的 \filepath{fpga\pulse_streamer\zlc_pulse_streamer_40ch.xdc}。如果板卡或转接线不同，设置 \pyapi{ZLC_PS_40CH_XDC} 指向新的板级 XDC。脚本会拒绝仍包含 \pyapi{<PIN_CHxx>} placeholder 的 XDC。
+默认 Vivado 工程：
 
-\filepath{pulse_gui.bat} 仍在 repo 根目录，因为它是前端入口，不是 FPGA build/server 脚本：
+\begin{codeblock}[Address-switch build]
+fpga\build\address_switch\address_switch.xpr
+fpga\build\address_switch\address_switch.runs\impl_1\zlc_pulse_streamer_top_address_switch.bit
+fpga\build\address_switch\address_switch.runs\impl_1\zlc_pulse_streamer_top_address_switch.ltx
+\end{codeblock}
 
-\begin{shellblock}
-.\pulse_gui.bat --remote-host 127.0.0.1 --remote-port 18861 --state .\pulses\camera_imaging_40ch.json
-\end{shellblock}
+默认 XDC：
 
-\chapter{40-channel 编译契约}
-\pyapi{PulseTableState} 可以包含完整 40 路，也可以只包含当前使用的硬件 channel 子集。真正上传前，\pyapi{compile_pulse_table_runtime_program(state, channels=hardware_channels)} 使用 server 的完整硬件 channel list 作为 bit order：
+\begin{codeblock}[XDC]
+references\source_archives\address_switch\address_switch.srcs\constrs_1\new\addre.xdc
+\end{codeblock}
+
+若使用另一份已确认的板级 XDC，设置 \pyapi{ZLC_PS_XDC}。不再需要复制旧 template XDC。
+
+\chapter{编译契约}
+Pulse GUI 和 notebook 使用 \pyapi{PulseTableState}。GUI 的 \pyapi{visible_channels} 只影响显示，不影响 FPGA bit order。上传前，sequencer service 会把 state 对齐到 server 的 full channel list：
 
 \begin{codeblock}[Python]
-hardware_channels = [f"ch{i:02d}" for i in range(40)]
-state = na.PulseTableState(
-    channels=["ch00", "ch03"],
-    periods=[
-        na.PulsePeriod(10, (1, 0), unit="ns"),
-        na.PulsePeriod(10, (0, 1), unit="ns"),
-        na.PulsePeriod(10, (0, 0), unit="ns"),
-    ],
-    visible_channels=["ch00", "ch03"],
-)
-program = na.compile_pulse_table_runtime_program(
-    state,
-    channels=hardware_channels,
-    clock_hz=100_000_000,
-    trigger_channels=["ch03"],
-)
+state = na.PulseTableState.load("pulses/camera_imaging_address_switch.json")
+program = state.compile(clock_hz=50_000_000, trigger_channels=["ch11"])
 \end{codeblock}
 
-预期结果：
+默认 camera-imaging preset 的关键通道是：
 
-\begin{codeblock}[Expected]
-program.channels == ["ch00", ..., "ch39"]
-program.masks == [1 << 0, 1 << 3, 0, 0]
-all(mask >> 4 == 0 for mask in program.masks)
-program.repeat_forever is True
+\begin{codeblock}[Camera subset]
+ch09 trap
+ch00 cooling
+ch03 probe
+ch11 emCCD
 \end{codeblock}
 
-这就是“GUI 只显示少数 channel，FPGA 仍然正常跑 40 路”的边界。Verilog 不需要知道 GUI 隐藏了哪些行；它只接收已经补齐的 40-bit mask。
-
-\chapter{Camera Imaging Preset}
-\filepath{pulses\camera_imaging_40ch.json} 是当前相机成像 preset。它的硬件 channel 是 \pyapi{ch00...ch39}，默认 visible channel 是 \pyapi{ch00/ch01/ch02/ch03}，display label 分别是 \pyapi{trap/cooling/probe/qcm_trigger}。\pyapi{camera_exposure} period 使用 \pyapi{duration="x"} 和默认 \pyapi{x_ns=19980000}，所以控制电脑 notebook 中的 \pyapi{pulse.x = ...} 会直接改变 probe/readout exposure；默认 \pyapi{x_ns} 下的 edge table 仍是：
+默认 \pyapi{camera_exposure_ns=19980000} 时，50 MHz 编译结果为：
 
 \begin{figure}[h]
   \centering
-  \includegraphics[width=0.95\textwidth]{assets/camera_imaging_40ch_edges.png}
-  \caption{40-channel camera imaging preset 的 edge table。图中只使用前四路，上传 program 仍然带完整 40 路 channel list。}
+  \includegraphics[width=0.95\textwidth]{assets/camera_imaging_address_switch_edges.png}
+  \caption{camera\_imaging\_address\_switch preset 的 edge table。图中只使用相机成像子集，上传 program 仍然带完整 channel list。}
 \end{figure}
 
-100 MHz 下这个 preset 编译为：
-
-\begin{codeblock}[camera imaging 40ch]
-ticks: 0, 200000, 210000, 212000, 2210000, 2212000
-masks: 3, 1, 13, 5, 1, 0
+\begin{codeblock}[camera imaging address-switch]
+ticks: 0, 100000, 105000, 106000, 1105000, 1106000
+masks: 513, 512, 2568, 520, 512, 0
 trigger_count: 1
 repeat_forever: true
 \end{codeblock}
 
-\chapter{验证命令}
-本轮相关验证命令：
+\pyapi{513 = ch00 + ch09}，\pyapi{2568 = ch03 + ch09 + ch11}。这说明相机外触发 bit 是 \pyapi{ch11/emCCD}，不是 \pyapi{ch03}。
 
-\begin{shellblock}
-cmd /c fpga\build_and_program.bat --help
-cmd /c fpga\run_server.bat --help
-cmd /c fpga\build_and_program.bat --check
-cmd /c "set ZLC_NO_PAUSE=1&&fpga\build_and_program.bat --help"
-cmd /c fpga\run_server.bat --check-config
-cmd /c fpga\build_and_program.bat --diagnose
-python -m json.tool tutorials\neutral_atom_fpga_server.ipynb
-python -m json.tool tutorials\neutral_atom_hardware_quickstart.ipynb
-pytest -q tests\test_neutral_atom_lightweight.py -k "repo_vivado_entrypoint_contract or checked_in_camera_imaging_pulse or differential_edge_upload"
-pytest -q tests\test_frontend_smoke.py -k "render_tex_pdf or pulse_gui"
-\end{shellblock}
+\chapter{scan 和容量}
+scan 使用一个 named scan table file，并由 host 打包到当前两轴 timing scan RAM。单个 FPGA program 使用有限 scan rows；大 scan file 可以由 API 分 chunk 连续上传运行：
 
-\section{Vivado 40ch 路径和 build 结果}
-当前脚本的 Vivado 工程 source of truth 是 \filepath{fpga\build_and_program.bat} 打印的项目目录。默认 build root 是 repo 内的 \filepath{fpga\build}，真实 40 路工程是 \filepath{fpga\build\p40}，工程名是 \filepath{p40}。不要再把旧 \filepath{fpga\pulse_streamer\build} 里的工程、bitstream 或 probes 当作当前工程源。
-
-当前无耗时重跑 build 的脚本级验证结果如下：
-
-\begin{codeblock}[Vivado build-only summary]
-Vivado: C:\Xilinx\Vivado\2019.1\bin\vivado.bat
-ZLC build root: <repo>\fpga\build
-Project dir: <repo>\fpga\build\p40
-Top: zlc_pulse_streamer_top_40ch
-CHANNEL_COUNT: 40
-EDGE_ADDR_WIDTH: 10
-MAX_EDGES: 1024
-Expected bitstream: zlc_pulse_streamer_top_40ch.bit
-Expected probes: zlc_pulse_streamer_top_40ch.ltx
+\begin{codeblock}[Scan table]
+# vars: camera_exposure_ns(ns), trig_delay(ns)
+1000 0
+2000 20
+4000 40
 \end{codeblock}
 
-build 完成后产物应在脚本打印的短路径工程目录中：
+所有 timing 值单位是 ns，默认 50 MHz 硬件下必须对齐到 20 ns。FPGA 上传的是 edge template 加 packed scan RAM，不会把 scan row 展开成大量 period column。
+
+build/check 使用资源目标参数作为 sizing guide：
 
 \begin{shellblock}
-<repo>\fpga\build\p40\p40.runs\impl_1\zlc_pulse_streamer_top_40ch.bit
-<repo>\fpga\build\p40\p40.runs\impl_1\zlc_pulse_streamer_top_40ch.ltx
+$env:ZLC_PS_RESOURCE_TARGET_PCT = "70"
+$env:ZLC_PS_MAX_EDGES = "512"
+$env:ZLC_PS_MAX_SCAN_POINTS = "256"
+.\fpga\build_and_program.bat --check
 \end{shellblock}
 
-\filepath{fpga\run_server.bat --check-config} 会先检查上述 \filepath{.ltx}。如果 \filepath{fpga\build\p40} 还没有 build 产物，它会明确报错并要求先运行 \filepath{fpga\build_and_program.bat} 或手动设置 \pyapi{ZLC_PS_VIVADO_LTX}；这比误用旧 \filepath{fpga\pulse_streamer\build} 里的 \filepath{.ltx} 更安全。build 成功后，server channel list 应为完整 \pyapi{ch00...ch39}，trigger 为 \pyapi{ch03}。
+Vivado \pyapi{report_utilization} 和 \pyapi{report_timing_summary} 是最终证据；Python/Tcl 的容量打印是 build 前的预算提示。
 
-\section{硬件 target 诊断状态}
-\filepath{fpga\build_and_program.bat --diagnose} 是非破坏性硬件枚举，不会 program FPGA。当前机器上该诊断返回：
+\chapter{analog bus segment 验证}
+address-switch bitstream 仍然保留 62-bit digital \pyapi{prog_mask}，但 DA 类 10-bit bus 现在走独立 segment upload。普通 TTL 和 DA bus 是两张表：
 
-\begin{codeblock}[diagnose result]
-No hardware targets found.
-Check USB/JTAG cable, board power, cable drivers, and hw_server.
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.96\textwidth]{assets/edge_vs_bus_segment_table.png}
+  \caption{普通 edge table 与 analog bus segment table 的执行角色不同。}
+\end{figure}
+
+\begin{codeblock}[Bus segment row]
+bus_id, start_tick, stop_tick, start_value, stop_value, mode
 \end{codeblock}
 
-因此本报告证明到“40ch bitstream 可以完整生成，server 会指向正确 bit/LTX”的层级；真正 program FPGA、启动 server、从 GUI/API 发 \pyapi{On Pulse} 并在示波器上看输出，仍需要在能枚举到 JTAG target 的 Verilog/FPGA 电脑上执行。
+\pyapi{edge} segment 的 \pyapi{start_tick == stop_tick}，运行到该 tick 时直接更新 bus value。\pyapi{ramp} segment 使用 \pyapi{start_tick/stop_tick} 和 \pyapi{start_value/stop_value}，由 FPGA 内部 DDA accumulator 在每个 clock tick 计算当前 stair-step。这样一个长 ramp 只占一个 bus segment，不会把普通 \pyapi{tick/mask} edge table 填满。
 
-如果在真实 FPGA 电脑上继续验证，推荐顺序是：
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.96\textwidth]{assets/analog_bus_segment_flow.png}
+  \caption{从 GUI/API 到 Verilog runtime 的 bus segment 上传和执行路径。}
+\end{figure}
 
+默认 VIO output probe 从 21 个扩展到 31 个：
+
+\begin{codeblock}[Bus VIO probes]
+probe_out21 zlc_bus_prog_we          width 1
+probe_out22 zlc_bus_prog_bus         width 2
+probe_out23 zlc_bus_prog_addr        width 6
+probe_out24 zlc_bus_prog_start_tick  width 32
+probe_out25 zlc_bus_prog_stop_tick   width 32
+probe_out26 zlc_bus_prog_start_value width 10
+probe_out27 zlc_bus_prog_stop_value  width 10
+probe_out28 zlc_bus_prog_mode        width 2
+probe_out29 zlc_bus_counts           width 28
+probe_out30 zlc_scan_prog_bus_values width 40
+\end{codeblock}
+
+四个 bus 的硬件顺序为 \pyapi{da_dipole, da_bias_y, da_bias_x, da_bias_z}，每个 bus 最多 64 个 segment。没有使用的 bus 在 \pyapi{bus_counts} 中 count 为 0，因此旧 RAM 内容不会被执行。普通 TTL 输出继续使用 \pyapi{tick/mask} edge rows；一个长 DA ramp 只消耗一个 bus segment，不消耗几百个 ordinary edge rows。静态 edge-mode DA value scan 通过 \pyapi{zlc_scan_prog_bus_values} 每个 scan row 上传一个 packed 4x10-bit 值；当前限制是 hardware scan array 不能和 analog bus ramp segment 同一次上传，如果需要扫描 analog ramp，应按 scan point 逐个 prepare/fire。
+
+\chapter{验证摘要}
+当前交付需要覆盖的最小检查：
+
+\begin{itemize}
+  \item \pyapi{python -m py_compile} 覆盖 sequencer、server、frontend GUI 和 fpga backend。
+  \item \pyapi{python -m json.tool} 覆盖三份 tutorial notebook。
+  \item \filepath{fpga\build_and_program.bat --help} 和 \filepath{fpga\run_server.bat --help} 显示 address-switch 默认路径、50 MHz clock 和 XDC-inferred channel list。
+  \item \filepath{pulses\camera_imaging_address_switch.json} 可编译出上述 ticks/masks。
+\end{itemize}
+
+\chapter{上机顺序}
 \begin{enumerate}
-  \item 把 repo 放到短路径，例如 \filepath{D:\ZLC}。
-  \item 设置 \pyapi{ZLC_PS_VIVADO_BIN}，如果 Vivado 不在默认搜索路径。
-  \item 核对 \filepath{zlc_pulse_streamer_40ch.xdc} 的 40 路 pin map；换板子时设置 \pyapi{ZLC_PS_40CH_XDC}。
+  \item 在 Verilog/FPGA 电脑把 repo 放到短路径，例如 \filepath{D:\ZLC}。
+  \item 运行 \filepath{install_requirements.bat}。
+  \item 设置 \pyapi{ZLC_PS_VIVADO_BIN}，或确认 Vivado 自动发现路径正确。
   \item 运行 \filepath{fpga\build_and_program.bat --check}。
-  \item 运行 \filepath{fpga\build_and_program.bat} 生成并 program 40 路 bitstream。
-  \item 运行 \filepath{fpga\run_server.bat}。
-  \item 从 FPGA 电脑或控制电脑运行 \filepath{pulse_gui.bat --remote-host ... --state .\pulses\camera_imaging_40ch.json}。
+  \item 运行 \filepath{fpga\build_and_program.bat}，确认 \filepath{.bit/.ltx} 生成并 program 成功。
+  \item 运行 \filepath{fpga\run_server.bat --check-config}，确认 project、bit、ltx、XDC、channel、trigger、clock 都正确。
+  \item 运行 \filepath{fpga\run_server.bat} 保持 server 窗口打开。
+  \item 在 FPGA 电脑或控制电脑运行 \filepath{pulse_gui.bat --remote-host ... --state .\pulses\camera_imaging_address_switch.json}。
+  \item 按 \pyapi{On Pulse} 前确认示波器接到 \pyapi{ch09/ch00/ch03/ch11} 对应的物理输出。
 \end{enumerate}
+
 
 \end{document}

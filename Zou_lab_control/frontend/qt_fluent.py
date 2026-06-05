@@ -47,6 +47,19 @@ _FLOAT_OR_X_RE = re.compile(
     r"""
     ^\s*
     (?:
+        [0-9A-Za-z_eE+\-*/().\s]+
+    )
+    \s*$
+    """,
+    re.VERBOSE,
+)
+_FLOAT_TOKEN_RE = re.compile(r"(?<![A-Za-z_])[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?")
+_VARIABLE_TOKEN_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
+_UNSAFE_TIME_EXPR_RE = re.compile(r"[^0-9A-Za-z_eE+\-*/().\s]")
+_OLD_FLOAT_OR_X_RE = re.compile(
+    r"""
+    ^\s*
+    (?:
         [+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?
         |
         [+-]?x
@@ -219,8 +232,8 @@ def align_to_resolution(value: str | float, resolution: float, *, allow_any: boo
             snapped = float(resolution)
         return format_compact_number(snapped)
 
-    if "x" in text.lower():
-        return re.sub(r"(?<![A-Za-z_])[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?", snap_number, text)
+    if _VARIABLE_TOKEN_RE.search(text) or any(char in text for char in "[](),"):
+        return _FLOAT_TOKEN_RE.sub(snap_number, text)
     return snap_number(re.match(r".+", text))
 
 
@@ -341,6 +354,12 @@ class FluentLineEdit(QtWidgets.QLineEdit):
                 font: {fluent_font_size()}pt "{FONT}";
             }}
             QLineEdit:focus {{ border: 1px solid {ACCENT}; }}
+            QLineEdit[zlcScanBound="true"] {{
+                background: #FFE8D6;
+                border: 1px solid {ORANGE};
+                color: {TEXT};
+            }}
+            QLineEdit[zlcScanBound="true"]:focus {{ border: 1px solid {ORANGE}; }}
             QLineEdit:disabled {{ background: {BG}; color: {PLACEHOLDER}; }}
             """
         )
@@ -373,7 +392,10 @@ class FloatLineEdit(FluentLineEdit):
 
 class FloatOrXLineEdit(FluentLineEdit):
     def has_acceptable_text(self) -> bool:
-        return bool(_FLOAT_OR_X_RE.fullmatch(self.text() or ""))
+        text = self.text() or ""
+        if not _FLOAT_OR_X_RE.fullmatch(text) or _UNSAFE_TIME_EXPR_RE.search(text):
+            return False
+        return bool(text.strip())
 
 
 class FluentComboBox(QtWidgets.QComboBox):
@@ -421,43 +443,9 @@ class FluentComboBox(QtWidgets.QComboBox):
             QComboBox::down-arrow {{ image: none; }}
             QComboBox QAbstractItemView {{
                 border: 1px solid {PLACEHOLDER};
-                border-radius: {_radius()}px;
-                background: white;
-                color: {TEXT};
-                outline: 0;
                 selection-background-color: {ACCENT};
-                selection-color: white;
-                font: {fluent_font_size()}pt "{FONT}";
-                padding: {scaled_px(2)}px;
-            }}
-            """
-        )
-        self.view().setMouseTracking(True)
-        self.view().setStyleSheet(
-            f"""
-            QListView {{
-                background: white;
-                color: {TEXT};
-                border: 1px solid {PLACEHOLDER};
-                border-radius: {_radius()}px;
-                outline: 0;
-                padding: {scaled_px(2)}px;
                 font: {fluent_font_size()}pt "{FONT}";
             }}
-            QListView::item {{
-                min-height: {scaled_px(24, minimum=18)}px;
-                padding: {scaled_px(2)}px {scaled_px(6)}px;
-                border-radius: {_radius()}px;
-            }}
-            QListView::item:hover {{
-                background: {BG};
-                color: {TEXT};
-            }}
-            QListView::item:selected {{
-                background: {ACCENT};
-                color: white;
-            }}
-            {fluent_scrollbar_stylesheet("QScrollBar")}
             """
         )
 
@@ -468,7 +456,17 @@ class FluentComboBox(QtWidgets.QComboBox):
     def _layout_lineedit(self) -> None:
         if not self.isEditable():
             return
-        rect = QtCore.QRect(0, 0, max(0, self.width() - scaled_px(COMBO_WIDTH)), self.height())
+        opt = QtWidgets.QStyleOptionComboBox()
+        self.initStyleOption(opt)
+        rect = self.style().subControlRect(QtWidgets.QStyle.CC_ComboBox, opt, QtWidgets.QStyle.SC_ComboBoxEditField, self)
+        drop_width = scaled_px(COMBO_WIDTH)
+        if not rect.isValid() or rect.width() <= 0:
+            rect = QtCore.QRect(0, 0, max(0, self.width() - drop_width), self.height())
+        drop_left = self.width() - drop_width
+        if rect.right() >= drop_left:
+            rect.setRight(drop_left - 1)
+        if rect.left() < 0:
+            rect.setLeft(0)
         self.lineEdit().setGeometry(rect)
 
     def resizeEvent(self, event):

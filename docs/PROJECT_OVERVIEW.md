@@ -58,16 +58,16 @@ hardware board:
 
 The FPGA side is intentionally grouped under `fpga/`:
 
-- `fpga/build_and_program.bat`: build/check/diagnose/program the 40-channel
-  bitstream.
-- `fpga/run_server.bat`: start the 40-channel sequencer server.
+- `fpga/build_and_program.bat`: build/check/diagnose/program the
+  address-switch pulse-streamer bitstream.
+- `fpga/run_server.bat`: start the XDC-inferred sequencer server.
 - `fpga/pulse_streamer/`: HDL, XDC, Vivado Tcl, and the design note.
 
 Generated Vivado projects, `.runs`, `.cache`, `.hw`, `.sim`, `.ltx`, journals,
 and server state live under `fpga\build` by default.  The batch files print
 `ZLC build root` and `ZLC project dir`; the default real project is
-`fpga\build\p40`, and that printed `ZLC project dir` is the source of truth for
-`.xpr/.bit/.ltx`.
+`fpga\build\address_switch`, and that printed `ZLC project dir` is the source
+of truth for `.xpr/.bit/.ltx`.
 
 ## Layer Responsibilities
 
@@ -92,7 +92,8 @@ Control PC notebook
 
 This design makes each acquisition upload a new sequence without rebuilding Verilog. The default server keeps one Vivado Tcl process alive while the server runs; microsecond timing is executed by FPGA clocked logic.
 
-For FPGA resource sizing, pin-count assumptions, and 40-channel pulse-streamer notes, see `docs/FPGA_PULSE_STREAMER_CAPACITY.md`.
+For FPGA resource sizing, pin-count assumptions, and pulse-streamer capacity
+notes, see `docs/FPGA_PULSE_STREAMER_CAPACITY.md`.
 
 ## Documentation Map
 

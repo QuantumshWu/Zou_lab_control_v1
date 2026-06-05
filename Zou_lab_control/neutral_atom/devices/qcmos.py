@@ -9,7 +9,7 @@ from typing import Any, Sequence
 import numpy as np
 
 from ..core.analysis import finite_float, positive_int
-from ..timing import exposure_from_sequence
+from ..timing import DEFAULT_CAMERA_TRIGGER_CHANNELS, exposure_from_sequence
 from .base import CameraDevice
 from .sequencer import PulseController, finite_frame_sequence
 
@@ -157,7 +157,7 @@ class QCMOSCamera(CameraDevice):
         return finite_frame_sequence(
             sequence,
             frames,
-            trigger_channels=trigger_channels if trigger_channels is not None else ("qcm_trigger", "camera_trigger", "trig"),
+            trigger_channels=trigger_channels if trigger_channels is not None else DEFAULT_CAMERA_TRIGGER_CHANNELS,
         )
 
     def _write_settings(self) -> None:

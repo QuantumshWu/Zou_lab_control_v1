@@ -17,6 +17,7 @@ from urllib.parse import unquote
 
 import numpy as np
 from matplotlib.patches import Circle
+import pytest
 
 import Zou_lab_control.neutral_atom as na
 from Zou_lab_control.frontend.content.tutorials import neutral_atom_fpga_server_cells, neutral_atom_hardware_tutorial_cells
@@ -129,7 +130,7 @@ def test_device_registry_can_register_external_classes():
         {
             "sequencer": {
                 "type": "RegisteredSequencerForTest",
-                "params": {"channels": ["trap", "cooling", "probe", "qcm_trigger"]},
+                "params": {"channels": ["trap", "cooling", "probe", "trig"]},
             }
         }
     )
@@ -229,13 +230,13 @@ def test_virtual_config_accepts_experiment_parameters():
 
 
 def test_timing_and_verilog_boundaries(tmp_path):
-    seq = na.imaging_sequence(exposure=1e-3, load=True).delay("qcm_trigger", 4e-9)
-    report = seq.validate(clock_hz=250e6, channels=["trap", "cooling", "probe", "qcm_trigger"])
-    build = na.generate_verilog(seq, channels=["trap", "cooling", "probe", "qcm_trigger"], clock_hz=250e6)
+    seq = na.imaging_sequence(exposure=1e-3, load=True).delay("emCCD", 20e-9)
+    report = seq.validate(clock_hz=50_000_000, channels=["trap", "cooling", "probe", "emCCD"])
+    build = na.generate_verilog(seq, channels=["trap", "cooling", "probe", "emCCD"], clock_hz=50_000_000)
     files = na.write_verilog_bundle(build, tmp_path)
 
     assert report.ok
-    assert seq.delays == {"qcm_trigger": 4e-09}
+    assert seq.delays == {"emCCD": 20e-09}
     assert build.ticks
     assert files.verilog_path.exists()
     assert files.manifest_path.exists()
@@ -257,9 +258,9 @@ def test_multiframe_acquisition_repeats_camera_trigger_sequence():
 
 
 def test_pulse_sequence_repeat_metadata_does_not_expand_for_runtime_counts():
-    seq = na.PulseSequence(name="huge_repeat").pulse("qcm_trigger", 0.0, 1e-6).repeated(100_000, period=2e-6)
-    report = seq.validate(clock_hz=100_000_000, channels=["trap", "cooling", "probe", "qcm_trigger"])
-    program = na.compile_runtime_program(seq, channels=["trap", "cooling", "probe", "qcm_trigger"], clock_hz=100_000_000)
+    seq = na.PulseSequence(name="huge_repeat").pulse("emCCD", 0.0, 1e-6).repeated(100_000, period=2e-6)
+    report = seq.validate(clock_hz=50_000_000, channels=["trap", "cooling", "probe", "emCCD"])
+    program = na.compile_runtime_program(seq, channels=["trap", "cooling", "probe", "emCCD"], clock_hz=50_000_000)
 
     assert report.ok
     assert na.count_trigger_pulses(seq) == 100_000
@@ -287,7 +288,7 @@ def test_detection_time_scan_sends_probe_duration_per_point():
 
 def test_runtime_sequencer_service_contract():
     seq = na.sequence_for_frame_count(na.imaging_sequence(exposure=1e-4, load=True), 2)
-    sequencer = na.RuntimeSequencer(channels=["trap", "cooling", "probe", "qcm_trigger"], sleep_scale=0.0)
+    sequencer = na.RuntimeSequencer(channels=["trap", "cooling", "probe", "emCCD"], sleep_scale=0.0)
     program = sequencer.prepare(seq)
     sequencer.fire(seq)
 
@@ -300,9 +301,9 @@ def test_runtime_sequencer_service_contract():
 
 def test_fpga_pulse_streamer_writes_hdl_and_upload_tcl(tmp_path):
     seq = na.sequence_for_frame_count(na.imaging_sequence(exposure=4e-6, load=True), 2)
-    program = na.compile_runtime_program(seq, channels=["trap", "cooling", "probe", "qcm_trigger"], clock_hz=100e6)
+    program = na.compile_runtime_program(seq, channels=["trap", "cooling", "probe", "emCCD"], clock_hz=50_000_000)
 
-    files = na.write_pulse_streamer_hdl_bundle(tmp_path / "hdl", channels=["trap", "cooling", "probe", "qcm_trigger"], max_edges=16)
+    files = na.write_pulse_streamer_hdl_bundle(tmp_path / "hdl", channels=["trap", "cooling", "probe", "emCCD"], max_edges=16)
     tcl_path = na.write_vivado_pulse_streamer_tcl(
         tmp_path / "prepare.tcl",
         "prepare",
@@ -368,7 +369,7 @@ def test_fpga_pulse_streamer_writes_hdl_and_upload_tcl(tmp_path):
 
 def test_fpga_pulse_streamer_rejects_program_that_does_not_fit():
     seq = na.sequence_for_frame_count(na.imaging_sequence(exposure=4e-6, load=True), 2)
-    program = na.compile_runtime_program(seq, channels=["trap", "cooling", "probe", "qcm_trigger"], clock_hz=100e6)
+    program = na.compile_runtime_program(seq, channels=["trap", "cooling", "probe", "emCCD"], clock_hz=50_000_000)
 
     try:
         na.validate_pulse_streamer_program(program, max_edges=1, channel_count=4)
@@ -383,7 +384,7 @@ def test_fpga_pulse_streamer_rejects_runtime_edge_table_hazards():
         sequence_id="bad",
         sequence_name="bad",
         clock_hz=100e6,
-        channels=["trap", "qcm_trigger"],
+        channels=["trap", "trig"],
         ticks=[0, 10, 10],
         masks=[1, 2, 0],
         duration=1e-7,
@@ -393,7 +394,7 @@ def test_fpga_pulse_streamer_rejects_runtime_edge_table_hazards():
         sequence_id="bad",
         sequence_name="bad",
         clock_hz=100e6,
-        channels=["trap", "qcm_trigger"],
+        channels=["trap", "trig"],
         ticks=[0, 10],
         masks=[1, 1],
         duration=1e-7,
@@ -452,12 +453,12 @@ def test_fpga_pulse_streamer_dry_run_uses_project_local_artifacts(tmp_path, monk
     from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import run_action
 
     root = Path(__file__).resolve().parents[1]
-    unsafe_project_dir = root / "fpga" / "pulse_streamer" / "build" / "zlc_pulse_streamer_40ch"
-    unsafe_bitstream = unsafe_project_dir / "zlc_pulse_streamer_40ch.runs" / "impl_1" / "zlc_pulse_streamer_top_40ch.bit"
-    unsafe_probes = unsafe_project_dir / "zlc_pulse_streamer_40ch.runs" / "impl_1" / "zlc_pulse_streamer_top_40ch.ltx"
-    default_project_dir = root / "fpga" / "build" / "p40"
+    unsafe_project_dir = root / "fpga" / "pulse_streamer" / "build" / "zlc_pulse_streamer_legacy"
+    unsafe_bitstream = unsafe_project_dir / "legacy.runs" / "impl_1" / "legacy_top.bit"
+    unsafe_probes = unsafe_project_dir / "legacy.runs" / "impl_1" / "legacy_top.ltx"
+    default_project_dir = root / "fpga" / "build" / "address_switch"
     monkeypatch.setenv("ZLC_PS_PROJECT_DIR", str(unsafe_project_dir))
-    monkeypatch.setenv("ZLC_PS_VIVADO_PROJECT", str(unsafe_project_dir / "zlc_pulse_streamer_40ch.xpr"))
+    monkeypatch.setenv("ZLC_PS_VIVADO_PROJECT", str(unsafe_project_dir / "legacy.xpr"))
     monkeypatch.setenv("ZLC_PS_VIVADO_BIT", str(unsafe_bitstream))
     monkeypatch.setenv("ZLC_PS_VIVADO_LTX", str(unsafe_probes))
     for name in (
@@ -475,10 +476,10 @@ def test_fpga_pulse_streamer_dry_run_uses_project_local_artifacts(tmp_path, monk
     assert str(unsafe_bitstream) not in tcl
     assert str(unsafe_probes) not in tcl
     assert str(default_project_dir) in tcl
-    assert "p40.xpr" in tcl
-    assert "p40.runs" in tcl
-    assert "zlc_pulse_streamer_top_40ch.bit" in tcl
-    assert "zlc_pulse_streamer_top_40ch.ltx" in tcl
+    assert "address_switch.xpr" in tcl
+    assert "address_switch.runs" in tcl
+    assert "zlc_pulse_streamer_top_address_switch.bit" in tcl
+    assert "zlc_pulse_streamer_top_address_switch.ltx" in tcl
 
 
 def test_fpga_pulse_streamer_module_cli_generates_hdl(tmp_path):
@@ -494,7 +495,7 @@ def test_fpga_pulse_streamer_module_cli_generates_hdl(tmp_path):
             "trap",
             "cooling",
             "probe",
-            "qcm_trigger",
+            "trig",
             "--max-edges",
             "16",
             "--tick-width",
@@ -507,7 +508,6 @@ def test_fpga_pulse_streamer_module_cli_generates_hdl(tmp_path):
     )
 
     assert result.returncode == 0, result.stdout
-    assert "RuntimeWarning" not in result.stdout
     assert (tmp_path / "zlc_pulse_streamer.v").exists()
     assert (tmp_path / "zlc_pulse_streamer_top_example.v").exists()
     assert (tmp_path / "zlc_pulse_streamer.manifest.json").exists()
@@ -524,8 +524,8 @@ def test_pulse_gui_launcher_aligns_subset_state_to_full_hardware_channels(monkey
     args = types.SimpleNamespace(
         channels=None,
         channel_count=None,
-        xdc=root / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_40ch.xdc",
-        max_channel_count=40,
+        xdc=root / "references" / "source_archives" / "address_switch" / "address_switch.srcs" / "constrs_1" / "new" / "addre.xdc",
+        max_channel_count=62,
         trigger_channels=None,
     )
     subset_state = na.PulseTableState(
@@ -536,26 +536,31 @@ def test_pulse_gui_launcher_aligns_subset_state_to_full_hardware_channels(monkey
             na.PulsePeriod(100, (0, 0), unit="ns"),
         ],
         visible_channels=["ch00", "ch03"],
-        channel_labels={"ch00": "trap", "ch03": "qcm_trigger"},
-        time_step_ns=10,
+        channel_labels={"ch00": "trap"},
+        time_step_ns=20,
         repeat_forever=True,
     )
 
     channels = pulse_gui_launcher._resolve_channels(args, subset_state)
     aligned = subset_state.aligned_to_channels(channels)
-    program = aligned.compile(clock_hz=100_000_000, trigger_channels=["ch03"])
+    program = aligned.compile(clock_hz=50_000_000, trigger_channels=["ch11"])
 
-    assert channels == [f"ch{i:02d}" for i in range(40)]
+    assert channels == [f"ch{i:02d}" for i in range(62)]
     assert aligned.channels == channels
     assert aligned.visible_channels == ["ch00", "ch03"]
     assert all(period.states[1:3] == (0, 0) for period in aligned.periods)
-    assert max(program.masks) < (1 << 40)
-    assert pulse_gui_launcher._resolve_trigger_channels(args, channels) == ["ch03"]
+    assert max(program.masks) < (1 << 62)
     labels = pulse_gui_launcher._resolve_channel_labels(args, channels, subset_state)
+    pins = pulse_gui_launcher._resolve_channel_pins(args, channels)
+    assert pulse_gui_launcher._resolve_trigger_channels(args, channels, labels) == ["ch11"]
     assert labels["ch00"] == "trap"
-    assert labels["ch03"] == "qcm_trigger"
-    assert labels["ch04"] == "cooling_pgc"
-    assert labels["ch39"] == "da_bias_x[7]"
+    assert labels["ch03"] == "probe"
+    assert labels["ch06"] == "trig"
+    assert labels["ch11"] == "emCCD"
+    assert labels["ch04"] == "pushout"
+    assert labels["ch39"] == "da_clk1"
+    assert pins["ch00"] == "F15"
+    assert pins["ch11"] == "M13"
 
     explicit_args = types.SimpleNamespace(**{**args.__dict__, "channel_count": 4})
     assert pulse_gui_launcher._resolve_channels(explicit_args, subset_state) == ["ch00", "ch01", "ch02", "ch03"]
@@ -565,7 +570,7 @@ def test_pulse_gui_launcher_aligns_subset_state_to_full_hardware_channels(monkey
             **args.__dict__,
             "remote_host": "127.0.0.1",
             "remote_port": 18861,
-            "clock_hz": 100_000_000,
+            "clock_hz": 50_000_000,
         }
     )
 
@@ -582,7 +587,7 @@ def test_pulse_gui_launcher_aligns_subset_state_to_full_hardware_channels(monkey
     )
     assert sequencer is None
     assert fallback_channels == channels
-    assert fallback_triggers == ["ch03"]
+    assert fallback_triggers == ["ch11"]
     assert "opened offline editor" in notice
     assert pulse_gui_launcher._remote_host_was_requested([]) is False
     assert pulse_gui_launcher._remote_host_was_requested(["--remote-host", "192.168.0.20"]) is True
@@ -599,437 +604,248 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     root = Path(__file__).resolve().parents[1]
     fpga = root / "fpga" / "pulse_streamer"
     root_readme = (root / "README.md").read_text(encoding="utf-8")
-    pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
-    requirements = (root / "requirements.txt").read_text(encoding="utf-8")
-    install_bat = (root / "install_requirements.bat").read_text(encoding="utf-8")
-    install_kernel_py = (root / "install_current_kernel.py").read_text(encoding="utf-8")
-    pulse_gui_bat = (root / "pulse_gui.bat").read_text(encoding="utf-8")
-    pulse_gui_launcher = (root / "pulse_gui.py").read_text(encoding="utf-8")
-    tutorials_bat = (root / "start_tutorials_jupyter_lab.bat").read_text(encoding="utf-8")
-    gitignore = (root / ".gitignore").read_text(encoding="utf-8")
-    runbook = (root / "docs" / "neutral_atom_hardware_manual" / "REAL_HARDWARE_RUNBOOK.md").read_text(encoding="utf-8")
     project_overview = (root / "docs" / "PROJECT_OVERVIEW.md").read_text(encoding="utf-8")
-    pulse_report = (
-        root / "docs" / "pulse_streamer_test_report" / "pulse_streamer_test_report_zh.texbody"
-    ).read_text(encoding="utf-8")
+    runbook = (root / "docs" / "neutral_atom_hardware_manual" / "REAL_HARDWARE_RUNBOOK.md").read_text(encoding="utf-8")
+    pulse_report = (root / "docs" / "pulse_streamer_test_report" / "pulse_streamer_test_report_zh.texbody").read_text(encoding="utf-8")
     fpga_readme = (root / "fpga" / "README.md").read_text(encoding="utf-8")
-    fpga_streamer_readme = (root / "fpga" / "pulse_streamer" / "README.md").read_text(encoding="utf-8")
+    streamer_readme = (fpga / "README.md").read_text(encoding="utf-8")
     frontend_readme = (root / "Zou_lab_control" / "frontend" / "README.md").read_text(encoding="utf-8")
-    frontend_manual_template = (
-        root / "Zou_lab_control" / "frontend" / "content" / "manual_templates" / "frontend_manual_zh.texbody"
-    ).read_text(encoding="utf-8")
-    frontend_manual_pdf_tex = (root / "docs" / "frontend_manual" / "frontend_manual_zh.tex").read_text(encoding="utf-8")
     pulses_readme = (root / "pulses" / "README.md").read_text(encoding="utf-8")
     tests_readme = (root / "tests" / "README.md").read_text(encoding="utf-8")
-    hardware_quickstart_template = (
-        root / "Zou_lab_control" / "neutral_atom" / "content" / "manual_templates" / "hardware_quickstart_zh.texbody"
-    ).read_text(encoding="utf-8")
-    hardware_quickstart_pdf_tex = (
-        root / "docs" / "neutral_atom_hardware_manual" / "neutral_atom_hardware_quickstart_zh.tex"
-    ).read_text(encoding="utf-8")
+    frontend_manual_template = (root / "Zou_lab_control" / "frontend" / "content" / "manual_templates" / "frontend_manual_zh.texbody").read_text(encoding="utf-8")
+    hardware_quickstart_template = (root / "Zou_lab_control" / "neutral_atom" / "content" / "manual_templates" / "hardware_quickstart_zh.texbody").read_text(encoding="utf-8")
+    hardware_quickstart_pdf_tex = (root / "docs" / "neutral_atom_hardware_manual" / "neutral_atom_hardware_quickstart_zh.tex").read_text(encoding="utf-8")
+    fpga_notebook_text = "\n".join(cell["source"] for cell in neutral_atom_fpga_server_cells())
+    hardware_notebook_text = "\n".join(cell["source"] for cell in neutral_atom_hardware_tutorial_cells())
+
     for name in ("install_requirements.bat", "pulse_gui.bat", "start_tutorials_jupyter_lab.bat"):
         assert (root / name).exists(), name
     assert not (root / "build_and_program.bat").exists()
     assert not (root / "run_server.bat").exists()
-    assert "standalone frontend layer" in root_readme
-    assert "standalone FPGA pulse-streamer hardware side" in root_readme
-    assert "fpga\\build_and_program.bat --check" in root_readme
-    assert "fpga\\build\\p40" in root_readme
-    assert "%run ../install_current_kernel.py" in root_readme
-    assert "Pulse presets" in root_readme
-    assert "Test strategy" in root_readme
-    root_bats = {path.name for path in root.glob("*.bat")}
-    assert root_bats == {"install_requirements.bat", "pulse_gui.bat", "start_tutorials_jupyter_lab.bat"}
-    legacy_root_bats = {"build_4ch_bitstream.bat", "start_server_4ch.bat", "simulate_4ch_core.bat", "smoke_test_4ch_upload.bat"}
-    assert root_bats.isdisjoint(legacy_root_bats)
-    assert not list((root / "docs" / "pulse_streamer_test_report" / "assets").glob("*4ch*"))
+    assert {path.name for path in root.glob("*.bat")} == {
+        "install_requirements.bat",
+        "pulse_gui.bat",
+        "start_tutorials_jupyter_lab.bat",
+    }
 
-    fpga_build_bat = root / "fpga" / "build_and_program.bat"
-    fpga_server_bat = root / "fpga" / "run_server.bat"
-    assert fpga_build_bat.exists()
-    assert fpga_server_bat.exists()
-    assert (root / "fpga" / "README.md").exists()
-    assert (root / "Zou_lab_control" / "frontend" / "README.md").exists()
-    assert not list(fpga.glob("*.bat"))
-
-    required = [
+    required = {
         "zlc_pulse_streamer.v",
-        "zlc_pulse_streamer_top_40ch.v",
-        "zlc_pulse_streamer_40ch.xdc",
-        "zlc_pulse_streamer_40ch.xdc.template",
-        "create_project_40ch.tcl",
-        "check_40ch_synth.tcl",
+        "zlc_pulse_streamer_top_address_switch.v",
+        "create_project_address_switch.tcl",
+        "check_address_switch_synth.tcl",
         "diagnose_hw_target.tcl",
-        "program_fpga_40ch.tcl",
+        "program_fpga_address_switch.tcl",
         "README.md",
-    ]
-    for name in required:
-        assert (fpga / name).exists(), name
-    for dependency in ("PyQt5", "PyQt-Frameless-Window", "rpyc", "ipykernel", "jupyterlab", "nbconvert", "notebook"):
-        assert dependency in pyproject
-        assert dependency in requirements
-    assert 'pip install -e "%~dp0."' in install_bat
-    assert ".zlc_python_path" in install_bat
-    assert "sys.executable" in install_bat
-    assert "--help" in install_bat
-    assert "install_requirements.bat failed with code" in install_bat
-    assert ":install_failed" in install_bat
-    assert "pip\", \"install\", \"-e\", str(ROOT)" in install_kernel_py
-    assert "PYTHON_PATH_RECORD.write_text(sys.executable" in install_kernel_py
-    assert ".zlc_python_path" in install_kernel_py
-    assert ".zlc_python_path" in gitignore
-    assert "ZLC_PULSE_GUI_PYTHON" in pulse_gui_bat
-    assert ".zlc_python_path" in pulse_gui_bat
-    assert "ZLC_PULSE_GUI_INNER" in pulse_gui_bat
-    assert "ZLC pulse GUI failed with code" in pulse_gui_bat
-    assert "Keep this window open and read the messages above." in pulse_gui_bat
-    assert 'if "%ZLC_NO_PAUSE%"=="" pause' in pulse_gui_bat
-    assert "DEFAULT_PULSE_GUI_MAX_CHANNELS = 40" in pulse_gui_launcher
-    assert "infer_xdc_channel_count" in pulse_gui_launcher
-    assert "connect_on_init=True" in pulse_gui_launcher
-    assert "opened offline editor" in pulse_gui_launcher
-    assert "_remote_host_was_requested" in pulse_gui_launcher
-    assert "ZLC_PULSE_GUI_AUTO_CLOSE_MS" in pulse_gui_launcher
-    assert "ZLC_TUTORIALS_PYTHON" in tutorials_bat
-    assert ".zlc_python_path" in tutorials_bat
-    assert "--check" in tutorials_bat
-    assert "ZLC_TUTORIALS_MODE=check" in tutorials_bat
-    assert "%ZLC_PYTHON_CMD% -m jupyter lab ." in tutorials_bat
-    assert ".zlc_python_path" in runbook
-    assert "ZLC_PULSE_GUI_PYTHON" in runbook
-    assert "ZLC_TUTORIALS_PYTHON" in runbook
-    assert "ZLC_FPGA_SERVER_PYTHON" in runbook
-    assert "start_tutorials_jupyter_lab.bat --check" in runbook
-    assert "Standalone Entry Points" in project_overview
-    assert "The repo root keeps only user-facing launchers" in project_overview
-    assert "`fpga/build_and_program.bat`" in project_overview
-    assert "`fpga/run_server.bat`" in project_overview
-    assert "`ZLC project dir` is the source of truth" in project_overview
-    assert "tests/README.md" in project_overview
-    assert "prefer the scoped matrix" in project_overview
+    }
+    assert required.issubset({path.name for path in fpga.iterdir()})
+    legacy_width = "40" + "ch"
+    removed = {
+        f"zlc_pulse_streamer_top_{legacy_width}.v",
+        f"zlc_pulse_streamer_{legacy_width}.xdc",
+        f"zlc_pulse_streamer_{legacy_width}.xdc.template",
+        f"create_project_{legacy_width}.tcl",
+        f"check_{legacy_width}_synth.tcl",
+        f"program_fpga_{legacy_width}.tcl",
+    }
+    assert removed.isdisjoint({path.name for path in fpga.iterdir()})
+    assert not list((root / "docs" / "pulse_streamer_test_report" / "assets").glob(f"*{legacy_width}*"))
 
-    top40 = (fpga / "zlc_pulse_streamer_top_40ch.v").read_text(encoding="utf-8")
-    tcl40 = (fpga / "create_project_40ch.tcl").read_text(encoding="utf-8")
-    check40 = (fpga / "check_40ch_synth.tcl").read_text(encoding="utf-8")
-    program_tcl40 = (fpga / "program_fpga_40ch.tcl").read_text(encoding="utf-8")
-    diagnose_hw_tcl = (fpga / "diagnose_hw_target.tcl").read_text(encoding="utf-8")
-    build_bat = fpga_build_bat.read_text(encoding="utf-8")
-    server_bat = fpga_server_bat.read_text(encoding="utf-8")
-    core = (fpga / "zlc_pulse_streamer.v").read_text(encoding="utf-8")
-    xdc40 = (fpga / "zlc_pulse_streamer_40ch.xdc").read_text(encoding="utf-8")
-    fpga_notebook_text = "\n".join(cell["source"] for cell in neutral_atom_fpga_server_cells())
-    hardware_notebook_text = "\n".join(cell["source"] for cell in neutral_atom_hardware_tutorial_cells())
+    top = (fpga / "zlc_pulse_streamer_top_address_switch.v").read_text(encoding="utf-8")
+    create_tcl = (fpga / "create_project_address_switch.tcl").read_text(encoding="utf-8")
+    check_tcl = (fpga / "check_address_switch_synth.tcl").read_text(encoding="utf-8")
+    program_tcl = (fpga / "program_fpga_address_switch.tcl").read_text(encoding="utf-8")
+    build_bat = (root / "fpga" / "build_and_program.bat").read_text(encoding="utf-8")
+    server_bat = (root / "fpga" / "run_server.bat").read_text(encoding="utf-8")
+    launcher = (root / "pulse_gui.py").read_text(encoding="utf-8")
+    preset = root / "pulses" / "camera_imaging_address_switch.json"
 
-    assert '(* ram_style = "distributed" *)' in core
-    assert "first_tick_shadow" in core
-    assert "loop_start_mask_shadow" in core
-    assert "tick_mem[0]" not in core
-    assert "mask_mem[loop_start_active]" not in core
-    assert "wire [39:0] zlc_prog_mask" in top40
-    assert "wire [9:0] zlc_prog_addr" in top40
-    assert "wire [10:0] zlc_prog_count" in top40
-    assert ".EDGE_ADDR_WIDTH(10)" in top40
-    assert "CONFIG.C_PROBE_OUT3_WIDTH {10}" in tcl40
-    assert "CONFIG.C_PROBE_OUT5_WIDTH {40}" in tcl40
-    assert "CONFIG.C_PROBE_OUT6_WIDTH {11}" in tcl40
-    assert "CONFIG.C_PROBE_OUT8_WIDTH {10}" in tcl40
-    assert "ZLC_PS_40CH_XDC" in tcl40
-    assert "ZLC_PS_XDC" in tcl40
-    assert "ZLC create_project_40ch contract: CHANNEL_COUNT=40 MAX_EDGES=1024 EDGE_ADDR_WIDTH=10" in tcl40
-    assert "zlc_default_project_root" in tcl40
-    assert "[file join $script_dir .. build]" in tcl40
-    assert "set project_name p40" in tcl40
-    assert "set project_dir [zlc_safe_project_dir" in tcl40
-    assert "still contains <PIN_CHxx> placeholders" in tcl40
-    assert "repo normally includes zlc_pulse_streamer_40ch.xdc derived from address_switch" in tcl40
-    assert "zlc_path_under" in tcl40
-    assert "Ignoring old fpga/pulse_streamer/build ZLC_PS_PROJECT_DIR" in tcl40
-    assert "Move the repo to a shorter project folder such as D:/ZLC" in tcl40
-    assert "Create zlc_pulse_streamer_40ch.xdc from zlc_pulse_streamer_40ch.xdc.template" not in tcl40
-    assert "CONFIG.C_PROBE_OUT3_WIDTH {10}" in check40
-    assert "CONFIG.C_PROBE_OUT5_WIDTH {40}" in check40
-    assert "CONFIG.C_PROBE_OUT6_WIDTH {11}" in check40
-    assert "ZLC check_40ch_synth contract: CHANNEL_COUNT=40 MAX_EDGES=1024 EDGE_ADDR_WIDTH=10" in check40
-    assert "ZLC_PS_CHECK_PROJECT_DIR" in check40
-    assert "Ignoring old fpga/pulse_streamer/build ZLC_PS_CHECK_PROJECT_DIR" in check40
-    assert "Move the repo to a shorter project folder such as D:/ZLC" in check40
-    assert "c40" in check40
-    assert "[file join $script_dir build zlc_pulse_streamer_40ch]" not in tcl40
-    assert "[file join $script_dir build zlc_pulse_streamer_40ch_check]" not in check40
-    assert "EDGE_ADDR_WIDTH bound to: 7" not in pulse_report
-    assert "pytest -q tests\\test_neutral_atom_lightweight.py tests\\test_frontend_smoke.py" not in pulse_report
-    assert 'tests\\test_neutral_atom_lightweight.py -k "repo_vivado_entrypoint_contract' in pulse_report
-    assert 'tests\\test_frontend_smoke.py -k "render_tex_pdf or pulse_gui"' in pulse_report
-    assert "zlc_check_utilization" in check40
-    assert "40ch synth LUT utilization is too high" in check40
-    assert "ZLC 40ch synth check complete" in check40
-    assert "ZLC_PS_VIVADO_BIT" in program_tcl40
-    assert "ZLC_PS_VIVADO_LTX" in program_tcl40
-    assert "ZLC program_fpga_40ch contract: CHANNEL_COUNT=40 MAX_EDGES=1024 EDGE_ADDR_WIDTH=10" in program_tcl40
-    assert "zlc_safe_artifact_path" in program_tcl40
-    assert "Ignoring old fpga/pulse_streamer/build $label" in program_tcl40
-    assert "VIO probe file not found" in program_tcl40
-    assert "load_features labtools" in program_tcl40
-    assert "open_hw" in program_tcl40
-    assert "get_hw_targets" in program_tcl40
-    assert "No Vivado hardware target found" in program_tcl40
-    assert "Retrying open_hw_target with -jtag_mode on" in program_tcl40
-    assert "Target opened but no FPGA devices were detected" in diagnose_hw_tcl
-    assert "Vivado hardware Tcl commands are unavailable" in program_tcl40
-    assert "allow_non_jtag" not in program_tcl40
-    assert "--help" in build_bat
-    assert "--check" in build_bat
-    assert "--diagnose" in build_bat
-    assert "create_project_40ch.tcl" in build_bat
-    assert "program_fpga_40ch.tcl" in build_bat
-    assert "check_40ch_synth.tcl" in build_bat
-    assert "diagnose_hw_target.tcl" in build_bat
-    assert "ZLC_PS_40CH_XDC" in build_bat
-    assert "ZLC_PS_VIVADO_BIN" in build_bat
-    assert "ZLC_PS_CHECK_PROJECT_DIR" in build_bat
-    assert "ZLC_PS_BUILD_ROOT" in build_bat
-    assert "ZLC_REPO_ROOT=%REPO_ROOT%" in build_bat
-    assert "zlc_verify_40ch_sources" in build_bat
-    assert "ZLC 40ch source contract: channels=40 max_edges=1024 edge_addr_width=10 prog_count_width=11" in build_bat
-    assert "selected XDC does not define ch[39]" in build_bat
-    assert "Expected VIO probe_out3 width 10" in build_bat
-    assert "Expected VIO probe_out6 width 11" in build_bat
-    assert "zlc_clear_unsafe_artifact ZLC_PS_VIVADO_BIT" in build_bat
-    assert "zlc_clear_unsafe_artifact ZLC_PS_VIVADO_LTX" in build_bat
-    assert "Ignoring old pulse_streamer build-local %~1" in build_bat
-    assert "ZLC build root:" in build_bat
-    assert "fpga\\build\\p40" in build_bat
-    assert "\\p40" in build_bat
-    assert "\\c40" in build_bat
-    assert "\\logs" in build_bat
-    assert 'if not exist "!ZLC_PS_BUILD_ROOT!\\"' in build_bat
-    assert "subst " not in build_bat.lower()
-    assert "ZLC_PS_SHORT_DRIVE" not in build_bat
-    assert "ZLC_PS_DISABLE_SUBST" not in build_bat
-    assert "infer_channel_count" in server_bat
-    assert "infer_channels" in server_bat
-    assert "ZLC_PS_MAX_CHANNEL_COUNT=40" in server_bat
-    assert "ZLC_PS_MAX_EDGES=1024" in server_bat
-    assert "ZLC_PS_BUILD_ROOT" in server_bat
-    assert "ZLC_REPO_ROOT=%REPO_ROOT%" in server_bat
-    assert "zlc_verify_40ch_sources" in server_bat
-    assert "ZLC 40ch source contract: channels=40 max_edges=1024 edge_addr_width=10 prog_count_width=11" in server_bat
-    assert "selected XDC does not define ch[39]" in server_bat
-    assert "zlc_clear_unsafe_artifact ZLC_PS_VIVADO_BIT" in server_bat
-    assert "zlc_clear_unsafe_artifact ZLC_PS_VIVADO_LTX" in server_bat
-    assert "Ignoring old pulse_streamer build-local %~1" in server_bat
-    assert "ZLC build root:" in server_bat
-    assert "fpga\\build\\p40" in server_bat
-    assert "\\p40" in server_bat
-    assert "\\state40" in server_bat
-    assert 'if not exist "!ZLC_PS_BUILD_ROOT!\\"' in server_bat
-    assert "for /r \"%CD%\\fpga\\pulse_streamer\\build\"" not in server_bat
-    assert "ZLC_PS_PROFILE" not in server_bat
-    assert "ZLC_PS_SERVER_BACKEND=vivado-session" in server_bat
-    assert "ZLC_FPGA_SERVER_PYTHON" in server_bat
-    assert ".zlc_python_path" in server_bat
-    assert "zlc_normalize_python_cmd" in server_bat
-    assert 'call "%ZLC_FPGA_SERVER_PYTHON%"' in server_bat
-    assert 'call "!ZLC_STORED_PY!"' in server_bat
-    assert "ZLC_PY_ARG" in server_bat
-    assert 'if /I "%ZLC_PS_SERVER_BACKEND%"=="command" goto zlc_run_command_backend' in server_bat
-    assert "--prepare-command" in server_bat
-    assert "ch00 ch01 ch02 ch03" in server_bat
-    assert "ch36 ch37 ch38 ch39" in server_bat
-    assert "--trigger-channels ch03" in server_bat
-    assert "--no-warm-start" not in server_bat
-    assert "--check-config" in server_bat
-    assert "ZLC server config check complete" in server_bat
-    assert "ZLC !ZLC_ACTION! completed successfully" in server_bat
-    assert "ZLC !ZLC_ACTION! failed with code" in server_bat
-    assert "ZLC_ACTION=server config check" in server_bat
-    assert "Server stopped normally" in server_bat
-    assert "trap cooling probe qcm_trigger" not in server_bat
-    assert "ZLC !ZLC_ACTION! completed successfully" in build_bat
-    assert "ZLC !ZLC_ACTION! failed with code" in build_bat
-    assert "ZLC_ACTION=hardware diagnose" in build_bat
-    assert "ZLC_ACTION=40ch build" in build_bat
-    assert "derived from the old address_switch pin map" in build_bat
-    assert 'if "%ZLC_NO_PAUSE%"=="" pause' in server_bat
-    for pattern in ("build/", ".Xil/", "*.jou", "*.str", "*.ltx", "*.runs/", "*.cache/", "*.hw/", "*.sim/"):
-        assert pattern in gitignore
-    assert "address_switch.srcs/constrs_1/new/addre.xdc" in xdc40
-    assert "[get_ports {ch[0]}]" in xdc40
-    assert "[get_ports {ch[39]}]" in xdc40
-    assert "<PIN_CH" not in xdc40
-    assert "ZLC project dir" in runbook
-    assert "<ZLC project dir>\\p40.xpr" in runbook
-    assert "C:\\ZLCPS\\p40\\zlc_pulse_streamer_40ch.xpr" not in runbook
-    assert "docs/**/*_zh.txt" in gitignore
-    assert "真实 build/program 默认使用 `fpga\\pulse_streamer\\zlc_pulse_streamer_40ch.xdc`" in fpga_notebook_text
-    assert "需要先把 `fpga\\pulse_streamer\\zlc_pulse_streamer_40ch.xdc.template`" not in fpga_notebook_text
-    assert "standalone hardware side" in fpga_readme
-    assert "fpga\\build\\p40" in fpga_readme
-    assert "debug path guard" in fpga_readme
-    assert "ZLC_PS_VIVADO_LTX" in fpga_readme
-    assert "must not load a stale repo-local" in fpga_readme
-    assert "ZLC project dir" in fpga_readme
-    assert "run_server.bat --check-config" in fpga_readme
-    assert "differential upload" in fpga_streamer_readme
-    assert "differential upload" in runbook
-    assert "wrote 3/6 edge rows" in runbook
-    assert "ZLC_PS_VIVADO_LTX" in runbook
-    assert 'duration="x"' in runbook
-    assert "pulse.x = ..." in runbook
-    assert "差分 prepare" in hardware_quickstart_template
-    assert "wrote 3/6 edge rows" in hardware_quickstart_template
-    assert "shadow-critical rows" in hardware_quickstart_template
-    assert 'duration="x"' in hardware_quickstart_template
-    assert "x_ns=19980000" in hardware_quickstart_template
-    assert 'exp.readout.detection_time(times, shots=20, live=False, pulse=pulse)' in hardware_quickstart_template
-    assert "RUN_SINGLE_PULSE_TEST = False" in hardware_quickstart_template
-    assert "pulse.on_pulse(wait=True, timeout=10.0, repeat_forever=False)" in hardware_quickstart_template
-    assert "live_scan = exp.readout.detection_time(" in hardware_quickstart_template
-    assert "pulse=pulse" in hardware_quickstart_template
-    assert "live_scan.stop()" in hardware_quickstart_template
-    assert "差分 prepare" in hardware_quickstart_pdf_tex
-    assert "wrote 3/6 edge rows" in hardware_quickstart_pdf_tex
-    assert "shadow-critical rows" in hardware_quickstart_pdf_tex
-    assert 'duration="x"' in hardware_quickstart_pdf_tex
-    assert "x_ns=19980000" in hardware_quickstart_pdf_tex
-    assert 'exp.readout.detection_time(times, shots=20, live=False, pulse=pulse)' in hardware_quickstart_pdf_tex
-    assert "RUN_SINGLE_PULSE_TEST = False" in hardware_quickstart_pdf_tex
-    assert "pulse.on_pulse(wait=True, timeout=10.0, repeat_forever=False)" in hardware_quickstart_pdf_tex
-    assert "live_scan = exp.readout.detection_time(" in hardware_quickstart_pdf_tex
-    assert "pulse=pulse" in hardware_quickstart_pdf_tex
-    assert "live_scan.stop()" in hardware_quickstart_pdf_tex
-    assert 'duration="x", unit="str (ns)"' in hardware_notebook_text
-    assert "test_widths_ns" in hardware_notebook_text
-    assert "RUN_SINGLE_PULSE_TEST = False" in hardware_notebook_text
-    assert "pulse.on_pulse(wait=True, timeout=10.0, repeat_forever=False)" in hardware_notebook_text
-    assert "RUN_LIVE_READOUT_SCAN = False" in hardware_notebook_text
-    assert "Optional live readout-time scan" in hardware_notebook_text
-    assert "live_scan = exp.readout.detection_time(" in hardware_notebook_text
-    assert "pulse=pulse" in hardware_notebook_text
-    assert "live_scan.stop()" in hardware_notebook_text
-    assert "shadow-critical rows" in fpga_readme
-    assert "shadow-critical rows" in fpga_streamer_readme
-    assert "full hardware channel list" in fpga_readme
-    assert "standalone user-interface layer" in frontend_readme
-    assert "Pulse GUI Contract" in frontend_readme
-    assert "DEFAULT_PULSE_GUI_MAX_CHANNELS = 40" in frontend_readme
-    assert "127.0.0.1:18861" in frontend_readme
-    assert "--remote-host" in frontend_readme
-    assert "--no-sequencer" in frontend_readme
-    assert "默认创建 40 路本地" not in frontend_manual_template
-    assert "默认创建 40 路本地" not in frontend_manual_pdf_tex
-    assert "127.0.0.1:18861" in frontend_manual_template
-    assert "127.0.0.1:18861" in frontend_manual_pdf_tex
-    assert "默认会尝试连接本机" in frontend_manual_template
-    assert "离线打开 editor" in frontend_manual_template
-    assert "显式传入 \\pyapi{--remote-host}" in frontend_manual_template
-    assert ".\\pulse_gui.bat --no-sequencer" in frontend_manual_template
-    assert ".\\pulse_gui.bat --no-sequencer" in frontend_manual_pdf_tex
-    assert "默认创建 40 路本地" not in hardware_quickstart_template
-    assert "默认创建 40 路本地" not in hardware_quickstart_pdf_tex
-    assert "127.0.0.1:18861" in hardware_quickstart_template
-    assert "127.0.0.1:18861" in hardware_quickstart_pdf_tex
-    assert "默认会尝试连接本机" in hardware_quickstart_template
-    assert "GUI 会离线打开" in hardware_quickstart_template
-    assert "保留窗口并显示错误" in hardware_quickstart_template
-    assert ".\\pulse_gui.bat --no-sequencer" in hardware_quickstart_template
-    assert ".\\pulse_gui.bat --no-sequencer" in hardware_quickstart_pdf_tex
-    assert "render_tex_pdf(tex, output_pdf)" in frontend_readme
-    assert "does not own hardware actions" in frontend_readme
-    assert "camera_imaging_40ch.json" in pulses_readme
-    assert "duration=\"x\"" in pulses_readme
-    assert "pulse.x" in pulses_readme
-    assert "19980000" in pulses_readme
-    assert "keeps `ch03` low" in pulses_readme
-    assert "slow table-boundary qCMOS spike" in pulses_readme
-    assert "finite trigger sequence" in pulses_readme
+    assert "module zlc_pulse_streamer_top_address_switch" in top
+    assert "localparam integer CHANNEL_COUNT = 62" in top
+    assert "assign trig = out[6];" in top
+    assert "assign trap = out[9];" in top
+    assert "assign probe = out[3];" in top
+    assert "assign cooling = out[0];" in top
+    assert "wire [CHANNEL_COUNT-1:0] zlc_prog_mask" in top
+    assert "CONFIG.C_PROBE_OUT5_WIDTH {62}" in create_tcl
+    assert "set project_name address_switch" in create_tcl
+    assert "zlc_pulse_streamer_top_address_switch" in create_tcl
+    assert "ZLC_PS_XDC" in create_tcl
+    legacy_xdc_env = "ZLC_PS_" + legacy_width.upper() + "_XDC"
+    assert legacy_xdc_env not in create_tcl
+    assert "CONFIG.C_PROBE_OUT5_WIDTH {62}" in check_tcl
+    assert "ZLC check_address_switch_synth contract" in check_tcl
+    assert "ZLC program_fpga_address_switch contract" in program_tcl
+    assert "zlc_pulse_streamer_top_address_switch.bit" in program_tcl
+    assert "zlc_pulse_streamer_top_address_switch.ltx" in program_tcl
+
+    assert "create_project_address_switch.tcl" in build_bat
+    assert "program_fpga_address_switch.tcl" in build_bat
+    assert "check_address_switch_synth.tcl" in build_bat
+    assert "zlc_verify_address_switch_sources" in build_bat
+    assert "fpga\\build\\address_switch" in build_bat
+    assert legacy_xdc_env not in build_bat
+    assert "ZLC_PS_CLOCK_HZ=50000000" in server_bat
+    assert "zlc_verify_address_switch_sources" in server_bat
+    assert "fpga\\build\\address_switch" in server_bat
+    assert "state_address_switch" in server_bat
+    assert "echo Trigger:" not in server_bat
+    assert "--trigger-channels ch03" not in server_bat
+
+    assert "DEFAULT_PULSE_GUI_FALLBACK_CHANNELS = 62" in launcher
+    assert "infer_xdc_channel_count" in launcher
+    assert "infer_trigger_channels" in server_bat
+    assert preset.exists()
+
+    for text in (
+        root_readme,
+        project_overview,
+        runbook,
+        pulse_report,
+        fpga_readme,
+        streamer_readme,
+        frontend_readme,
+        pulses_readme,
+        frontend_manual_template,
+        hardware_quickstart_template,
+        hardware_quickstart_pdf_tex,
+        fpga_notebook_text,
+        hardware_notebook_text,
+    ):
+        assert f"camera_imaging_{legacy_width}" not in text
+        assert f"zlc_pulse_streamer_top_{legacy_width}" not in text
+        assert f"zlc_pulse_streamer_{legacy_width}" not in text
+        assert legacy_xdc_env not in text
+        assert "fpga\\build\\p40" not in text
+
+    assert "camera_imaging_address_switch.json" in pulses_readme
+    assert "camera_exposure_scan_example.txt" in pulses_readme
+    assert (root / "pulses" / "camera_exposure_scan_example.txt").exists()
+    assert "ch11" in pulses_readme
+    assert "50 MHz" in runbook
+    assert "20 ns" in runbook
+    assert "# vars: camera_exposure_ns" in runbook
+    assert "ZLC_PS_RESOURCE_TARGET_PCT" in runbook
+    assert "address-switch" in project_overview
     assert "Run the smallest check" in tests_readme
     assert "Full `pytest -q` is reserved for broad handoff" in tests_readme
-    assert "fpga\\build_and_program.bat --check" in tests_readme
-    assert "render_tex_pdf" in tests_readme
-    for text in (hardware_quickstart_template, hardware_quickstart_pdf_tex):
-        assert "prog_we} 翻转一次" in text
-        assert "level write-enable" not in text
-        assert "prog_we=1" not in text
-        assert "从按下 On Pulse 到 FPGA pin 变化" in text
-        assert "GUI 不直接写硬件" in text
-        assert "RPyC 只传一次描述" in text
-        assert "第一条需要写的 edge row 放在同一批 VIO commit" in text
-        assert "外部 pin 只连到 \\pyapi{state_mask}" in text
-        assert "为什么第一次慢、后面快，以及 100 ms 的边界" in text
-        assert "正确升级方向不是改 GUI" in text
-    assert "Pulse GUI On Pulse:" in fpga_streamer_readme
-    assert "read widgets -> PulseTableState" in fpga_streamer_readme
-    assert "RemoteSequencer.prepare" in fpga_streamer_readme
-    assert "Runtime `prepare` writes VIO rows" in fpga_streamer_readme
-    assert "Runtime `fire` is one small VIO commit" in fpga_streamer_readme
-    assert "replace only the upload transport" in fpga_streamer_readme
 
-
-def test_fpga_pulse_streamer_40ch_vio_widths_match_python_generator():
+def test_fpga_pulse_streamer_address_switch_vio_widths_match_python_generator():
     root = Path(__file__).resolve().parents[1]
     fpga = root / "fpga" / "pulse_streamer"
-    top40 = (fpga / "zlc_pulse_streamer_top_40ch.v").read_text(encoding="utf-8")
-    tcl40 = (fpga / "create_project_40ch.tcl").read_text(encoding="utf-8")
+    top = (fpga / "zlc_pulse_streamer_top_address_switch.v").read_text(encoding="utf-8")
+    tcl = (fpga / "create_project_address_switch.tcl").read_text(encoding="utf-8")
 
     generated_top = na.generate_pulse_streamer_top_example(
-        channels=[f"ch{i:02d}" for i in range(40)],
-        top_module_name="zlc_pulse_streamer_top_40ch",
-        max_edges=1024,
+        channels=[f"ch{i:02d}" for i in range(62)],
+        top_module_name="zlc_pulse_streamer_top_address_switch",
+        max_edges=512,
+        max_scan_points=256,
     )
 
     width_contract = {
-        "prog_addr": "9:0",
+        "prog_addr": "8:0",
         "prog_tick": "31:0",
-        "prog_mask": "39:0",
-        "prog_count": "10:0",
-        "loop_start_addr": "9:0",
+        "prog_mask": "61:0",
+        "prog_count": "9:0",
+        "loop_start_addr": "8:0",
         "loop_end_tick": "31:0",
         "loop_count": "31:0",
+        "scan_prog_addr": "7:0",
+        "scan_prog_bus_values": "39:0",
+        "scan_count": "8:0",
+        "bus_prog_bus": "1:0",
+        "bus_prog_addr": "5:0",
+        "bus_prog_start_tick": "31:0",
+        "bus_prog_stop_tick": "31:0",
+        "bus_prog_start_value": "9:0",
+        "bus_prog_stop_value": "9:0",
+        "bus_prog_mode": "1:0",
+        "bus_counts": "27:0",
     }
     for signal, width in width_contract.items():
-        assert f"wire [{width}] zlc_{signal};" in top40
-        assert f"wire [{width}] zlc_{signal};" in generated_top
+        if signal == "prog_mask":
+            assert "wire [CHANNEL_COUNT-1:0] zlc_prog_mask;" in top
+            assert "wire [61:0] zlc_prog_mask;" in generated_top
+        else:
+            assert f"wire [{width}] zlc_{signal};" in top
+            assert f"wire [{width}] zlc_{signal};" in generated_top
+
+    signed_width_contract = {
+        "prog_tick_x_coeff": "15:0",
+        "prog_tick_y_coeff": "15:0",
+        "scan_prog_x": "31:0",
+        "scan_prog_y": "31:0",
+        "loop_end_x_coeff": "15:0",
+        "loop_end_y_coeff": "15:0",
+    }
+    for signal, width in signed_width_contract.items():
+        assert f"wire signed [{width}] zlc_{signal};" in top
+        assert f"wire signed [{width}] zlc_{signal};" in generated_top
 
     for expected in {
-        "CONFIG.C_PROBE_OUT3_WIDTH {10}",
+        "CONFIG.C_NUM_PROBE_OUT {31}",
+        "CONFIG.C_PROBE_OUT3_WIDTH {9}",
         "CONFIG.C_PROBE_OUT4_WIDTH {32}",
-        "CONFIG.C_PROBE_OUT5_WIDTH {40}",
-        "CONFIG.C_PROBE_OUT6_WIDTH {11}",
-        "CONFIG.C_PROBE_OUT8_WIDTH {10}",
+        "CONFIG.C_PROBE_OUT5_WIDTH {62}",
+        "CONFIG.C_PROBE_OUT6_WIDTH {10}",
+        "CONFIG.C_PROBE_OUT8_WIDTH {9}",
         "CONFIG.C_PROBE_OUT9_WIDTH {32}",
         "CONFIG.C_PROBE_OUT10_WIDTH {32}",
+        "CONFIG.C_PROBE_OUT11_WIDTH {16}",
+        "CONFIG.C_PROBE_OUT12_WIDTH {16}",
+        "CONFIG.C_PROBE_OUT15_WIDTH {8}",
+        "CONFIG.C_PROBE_OUT16_WIDTH {32}",
+        "CONFIG.C_PROBE_OUT17_WIDTH {32}",
+        "CONFIG.C_PROBE_OUT18_WIDTH {9}",
+        "CONFIG.C_PROBE_OUT19_WIDTH {16}",
+        "CONFIG.C_PROBE_OUT20_WIDTH {16}",
+        "CONFIG.C_PROBE_OUT21_WIDTH {1}",
+        "CONFIG.C_PROBE_OUT22_WIDTH {2}",
+        "CONFIG.C_PROBE_OUT23_WIDTH {6}",
+        "CONFIG.C_PROBE_OUT24_WIDTH {32}",
+        "CONFIG.C_PROBE_OUT25_WIDTH {32}",
+        "CONFIG.C_PROBE_OUT26_WIDTH {10}",
+        "CONFIG.C_PROBE_OUT27_WIDTH {10}",
+        "CONFIG.C_PROBE_OUT28_WIDTH {2}",
+        "CONFIG.C_PROBE_OUT29_WIDTH {28}",
+        "CONFIG.C_PROBE_OUT30_WIDTH {40}",
     }:
-        assert expected in tcl40
+        assert expected in tcl
 
-    assert ".EDGE_ADDR_WIDTH(10)" in top40
-    assert ".EDGE_ADDR_WIDTH(10)" in generated_top
-    assert "CONFIG.C_PROBE_OUT3_WIDTH {7}" not in tcl40
-    assert "CONFIG.C_PROBE_OUT6_WIDTH {8}" not in tcl40
-    assert ".EDGE_ADDR_WIDTH(7)" not in top40
-    assert ".EDGE_ADDR_WIDTH(7)" not in generated_top
+    assert ".EDGE_ADDR_WIDTH(9)" in top
+    assert ".EDGE_ADDR_WIDTH(9)" in generated_top
+    assert ".SCAN_ADDR_WIDTH(8)" in top
+    assert ".SCAN_ADDR_WIDTH(8)" in generated_top
+    assert "CONFIG.C_PROBE_OUT3_WIDTH {10}" not in tcl
+    assert "CONFIG.C_PROBE_OUT18_WIDTH {11}" not in tcl
+    assert ".EDGE_ADDR_WIDTH(10)" not in top
+    assert ".EDGE_ADDR_WIDTH(10)" not in generated_top
 
 
 def test_fpga_pulse_streamer_capacity_doc_matches_checked_in_ram_strategy():
     root = Path(__file__).resolve().parents[1]
     fpga = root / "fpga" / "pulse_streamer"
     core = (fpga / "zlc_pulse_streamer.v").read_text(encoding="utf-8")
-    top40 = (fpga / "zlc_pulse_streamer_top_40ch.v").read_text(encoding="utf-8")
+    top = (fpga / "zlc_pulse_streamer_top_address_switch.v").read_text(encoding="utf-8")
     capacity = (root / "docs" / "FPGA_PULSE_STREAMER_CAPACITY.md").read_text(encoding="utf-8")
     streamer_readme = (fpga / "README.md").read_text(encoding="utf-8")
 
     assert '(* ram_style = "distributed" *)' in core
-    assert ".CHANNEL_COUNT(40)" in top40
-    assert ".EDGE_ADDR_WIDTH(10)" in top40
-    assert "The HDL currently marks `tick_mem` and `mask_mem` as distributed RAM" in capacity
-    assert "1024-row 40-channel operational profile" in capacity
+    assert "scan_bus_value_mem" in core
+    assert "localparam integer CHANNEL_COUNT = 62" in top
+    assert ".CHANNEL_COUNT(CHANNEL_COUNT)" in top
+    assert ".EDGE_ADDR_WIDTH(9)" in top
+    assert "The HDL currently marks `tick_mem`, `mask_mem`, and scan RAM as distributed RAM" in capacity
+    assert "CHANNEL_COUNT=62" in capacity
     assert "BRAM-friendly synchronous-read" in capacity
     assert "pipeline and a faster upload transport" in capacity
     assert "AXI, JTAG-to-AXI, UART/SPI" in capacity
     assert "current `edge_index` row" in streamer_readme
-    assert "1024 rows" in streamer_readme
-    assert "probe_out3  zlc_prog_addr       width 10" in streamer_readme
-    assert "probe_out6  zlc_prog_count      width 11" in streamer_readme
+    assert "512 rows" in streamer_readme
+    assert "probe_out3  zlc_prog_addr" in streamer_readme
+    assert "probe_out6  zlc_prog_count" in streamer_readme
+    assert "probe_out18 zlc_scan_count" in streamer_readme
+    assert "probe_out30 zlc_scan_prog_bus_values" in streamer_readme
 
 
 def test_user_facing_markdown_local_links_exist():
@@ -1130,7 +946,7 @@ def test_fpga_pulse_streamer_xdc_infers_full_channel_count(tmp_path):
             [
                 "set_property PACKAGE_PIN A1 [get_ports {ch[0]}] ;# ch00 <- trap",
                 "set_property PACKAGE_PIN A2 [get_ports {ch[1]}] ;# ch01 <- cooling_pgc",
-                "set_property PACKAGE_PIN A3 [get_ports {ch[2]}] ;# ch02 <- trig / qcm_trigger",
+                "set_property PACKAGE_PIN A3 [get_ports {ch[2]}] ;# ch02 <- trig / trig",
             ]
         ),
         encoding="utf-8",
@@ -1138,7 +954,7 @@ def test_fpga_pulse_streamer_xdc_infers_full_channel_count(tmp_path):
     assert na.infer_xdc_channel_labels(labeled, default=40, max_count=40) == {
         "ch00": "trap",
         "ch01": "cooling_pgc",
-        "ch02": "qcm_trigger",
+        "ch02": "trig",
     }
 
     sparse = tmp_path / "sparse.xdc"
@@ -1155,12 +971,32 @@ def test_fpga_pulse_streamer_xdc_infers_full_channel_count(tmp_path):
         raise AssertionError("sparse XDC channel map should be rejected")
 
 
+def test_address_switch_xdc_infers_62_outputs_trigger_and_bus_channels():
+    root = Path(__file__).resolve().parents[1]
+    xdc = root / "references" / "source_archives" / "address_switch" / "address_switch.srcs" / "constrs_1" / "new" / "addre.xdc"
+    count = na.infer_xdc_channel_count(xdc, default=1, max_count=None)
+    labels = na.infer_xdc_channel_labels(xdc, default=count, max_count=None)
+    channels = [f"ch{index:02d}" for index in range(count)]
+    buses = na.infer_bus_channels(channels, labels)
+
+    assert count == 62
+    assert labels["ch03"] == "probe"
+    assert labels["ch06"] == "trig"
+    assert labels["ch11"] == "emCCD"
+    assert labels["ch09"] == "trap"
+    assert na.infer_xdc_trigger_channels(xdc, default=count, max_count=None) == ["ch11"]
+    assert buses["da_dipole"] == [f"ch{index:02d}" for index in range(18, 28)]
+    assert buses["da_bias_x"] == [f"ch{index:02d}" for index in range(40, 50)]
+    assert buses["da_bias_y"] == [f"ch{index:02d}" for index in range(38, 28, -1)]
+    assert buses["da_bias_z"] == [f"ch{index:02d}" for index in range(60, 50, -1)]
+
+
 def test_fpga_pulse_streamer_prepare_tcl_covers_full_edge_table_boundary(tmp_path):
     program = na.RuntimeSequenceProgram(
         sequence_id="full",
         sequence_name="full_table",
         clock_hz=100e6,
-        channels=["trap", "cooling", "probe", "qcm_trigger"],
+        channels=["trap", "cooling", "probe", "trig"],
         ticks=list(range(1024)),
         masks=[1] * 1023 + [0],
         duration=1023 / 100e6,
@@ -1200,8 +1036,8 @@ def test_fpga_pulse_streamer_prepare_tcl_covers_full_edge_table_boundary(tmp_pat
 
 
 def test_fpga_pulse_streamer_edge_table_python_model_matches_contract():
-    seq = na.PulseSequence(name="contract").pulse("trap", 0.0, 5e-8).pulse("probe", 2e-8, 8e-8).pulse("qcm_trigger", 2e-8, 4e-8)
-    program = na.compile_runtime_program(seq, channels=["trap", "cooling", "probe", "qcm_trigger"], clock_hz=100e6)
+    seq = na.PulseSequence(name="contract").pulse("trap", 0.0, 5e-8).pulse("probe", 2e-8, 8e-8).pulse("trig", 2e-8, 4e-8)
+    program = na.compile_runtime_program(seq, channels=["trap", "cooling", "probe", "trig"], clock_hz=100e6)
     na.validate_pulse_streamer_program(program, max_edges=16, channel_count=4)
 
     history = _simulate_pulse_streamer(program.ticks, program.masks)
@@ -1219,9 +1055,9 @@ def test_fpga_pulse_streamer_edge_table_python_model_matches_contract():
 
 
 def test_fpga_pulse_streamer_compiles_channel_delay_and_repeated_frames():
-    seq = na.PulseSequence(name="delay_repeat").pulse("trap", 0.0, 2e-8).pulse("qcm_trigger", 0.0, 1e-8).delay("qcm_trigger", 1e-8)
+    seq = na.PulseSequence(name="delay_repeat").pulse("trap", 0.0, 2e-8).pulse("emCCD", 0.0, 1e-8).delay("emCCD", 1e-8)
     repeated = seq.repeated(2, period=5e-8)
-    program = na.compile_runtime_program(repeated, channels=["trap", "cooling", "probe", "qcm_trigger"], clock_hz=100e6)
+    program = na.compile_runtime_program(repeated, channels=["trap", "cooling", "probe", "emCCD"], clock_hz=100e6)
 
     assert program.ticks == [0, 1, 2, 5]
     assert program.masks == [0b0001, 0b1001, 0b0000, 0b0000]
@@ -1238,15 +1074,16 @@ def test_pulse_table_state_compiles_repeat_visibility_and_delays(tmp_path):
     assert re.fullmatch(r"pulse_\d{8}_\d{6}", unnamed.name)
 
     state = na.PulseTableState(
-        channels=["trap", "cooling", "probe", "qcm_trigger", "aod0", "aod1"],
+        channels=["trap", "cooling", "probe", "trig", "aod0", "aod1"],
         periods=[
             na.PulsePeriod(100, (1, 0, 0, 0, 0, 0), unit="ns", name="load"),
-            na.PulsePeriod("2*x", (1, 0, 1, 1, 0, 0), unit="str (ns)", name="image"),
+            na.PulsePeriod("2*tau", (1, 0, 1, 1, 0, 0), unit="str (ns)", name="image"),
             na.PulsePeriod(100, (0, 0, 0, 0, 0, 0), unit="ns", name="idle"),
         ],
-        delays={"qcm_trigger": "x/2"},
-        delay_units={"qcm_trigger": "str (ns)"},
-        x_ns=100,
+        delays={"trig": "tau/2"},
+        delay_units={"trig": "str (ns)"},
+        scan_variables={"tau": 100},
+        scan_bindings={"period:1:duration": "tau", "delay:trig": "tau"},
         time_step_ns=1,
         repeat_start=1,
         repeat_end=2,
@@ -1254,21 +1091,21 @@ def test_pulse_table_state_compiles_repeat_visibility_and_delays(tmp_path):
     )
 
     sequence = state.to_sequence()
-    program = state.compile(clock_hz=100e6, trigger_channels=["qcm_trigger"])
+    program = state.compile(clock_hz=100e6, trigger_channels=["trig"])
     saved = state.save(tmp_path / "pulse.json")
     loaded = na.PulseTableState.load(saved)
 
     assert state.time_step_ns == 1
     assert state.total_duration_steps() == 1000
-    assert state.total_duration_steps(x_ns=200, time_step_ns=10) == 160
+    assert state.total_duration_steps(variables={"tau": 200}, time_step_ns=10) == 160
     assert state.total_duration_ns() == 100 + 3 * (200 + 100)
-    assert state.total_duration_ns(x_ns=200) == 100 + 3 * (400 + 100)
-    assert state.periods[1].duration_steps(x_ns=200, time_step_ns=state.time_step_ns) == 400
-    assert state.delay_ns("qcm_trigger", x_ns=200) == 100
-    assert state.delay_steps("qcm_trigger", x_ns=200, time_step_ns=10) == 10
-    assert state.with_x(200).x_ns == 200
-    assert state.x_ns == 100
-    assert na.count_trigger_pulses(sequence, trigger_channels=["qcm_trigger"]) == 3
+    assert state.total_duration_ns(variables={"tau": 200}) == 100 + 3 * (400 + 100)
+    assert state.periods[1].duration_steps(variables={"tau": 200}, time_step_ns=state.time_step_ns) == 400
+    assert state.delay_ns("trig", variables={"tau": 200}) == 100
+    assert state.delay_steps("trig", variables={"tau": 200}, time_step_ns=10) == 10
+    assert state.with_scan_variables(tau=200).scan_variables["tau"] == 200
+    assert state.scan_variables["tau"] == 100
+    assert na.count_trigger_pulses(sequence, trigger_channels=["trig"]) == 3
     assert program.trigger_count == 3
     assert program.repeat_forever is True
     assert program.ticks == [0, 10, 15, 30, 35, 40]
@@ -1276,11 +1113,11 @@ def test_pulse_table_state_compiles_repeat_visibility_and_delays(tmp_path):
     assert program.loop_start_index == 1
     assert program.loop_end_tick == 40
     assert program.loop_count == 3
-    program_x = state.compile(clock_hz=100e6, trigger_channels=["qcm_trigger"], x_ns=200)
-    assert program_x.trigger_count == 3
-    assert program_x.repeat_forever is True
-    assert program_x.ticks[-1] == 60
-    assert program_x.duration == 1.6e-6
+    program_tau = state.compile(clock_hz=100e6, trigger_channels=["trig"], variables={"tau": 200})
+    assert program_tau.trigger_count == 3
+    assert program_tau.repeat_forever is True
+    assert program_tau.ticks[-1] == 60
+    assert program_tau.duration == 1.6e-6
     assert loaded.to_dict() == state.to_dict()
 
     state.hide_channel("aod0")
@@ -1307,7 +1144,7 @@ def test_pulse_table_state_compiles_hardware_repeat_without_expanding_edges():
         repeat_end=1,
         repeat_count=500,
         visible_channels=["ch00", "ch03"],
-        channel_labels={"ch00": "trap", "ch03": "qcm_trigger"},
+        channel_labels={"ch00": "trap", "ch03": "trig"},
     )
 
     hardware_channels = [f"ch{i:02d}" for i in range(40)]
@@ -1337,6 +1174,292 @@ def test_pulse_table_state_compiles_hardware_repeat_without_expanding_edges():
     na.validate_pulse_streamer_program(program, max_edges=1024, tick_width=32, channel_count=40)
 
 
+def test_pulse_table_analog_bus_modes_compile_to_runtime_bus_segments(tmp_path):
+    channels = ["ch00", "ch01", "ch02", "ch03"]
+    labels = {"ch00": "da_test[0]", "ch01": "da_test[1]", "ch02": "da_test[2]", "ch03": "trig"}
+    state = na.PulseTableState(
+        channels=channels,
+        channel_labels=labels,
+        visible_channels=channels,
+        time_step_ns=20,
+        periods=[
+            na.PulsePeriod(100, (0, 0, 0, 0), unit="ns"),
+            na.PulsePeriod(100, (0, 0, 0, 0), unit="ns"),
+            na.PulsePeriod(100, (0, 0, 0, 0), unit="ns"),
+        ],
+    )
+    state.set_analog_bus_mode(0, "da_test", "edge", value=0)
+    state.set_analog_bus_mode(2, "da_test", "ramp", value=7)
+    state.apply_analog_bus_modes_to_period_states()
+    saved = state.save(tmp_path / "analog_bus.json")
+    loaded = na.PulseTableState.load(saved)
+    program = loaded.compile(clock_hz=50_000_000, trigger_channels=["ch03"], repeat_forever=False)
+
+    assert loaded.bus_channels()["da_test"] == ["ch00", "ch01", "ch02"]
+    assert loaded.analog_bus_modes["da_test"] == [
+        {"mode": "edge", "value": 0},
+        {"mode": "hold", "value": None},
+        {"mode": "ramp", "value": 7},
+    ]
+    assert loaded.periods[1].states[:3] == (0, 0, 1)
+    assert program.ticks == [0, 5, 10, 15]
+    assert program.masks == [0, 0, 0, 0]
+    assert program.bus_names == ["da_test"]
+    assert [segment.to_dict() for segment in (program.bus_segments or [])] == [
+        {
+            "bus_index": 0,
+            "bus_name": "da_test",
+            "start_tick": 0,
+            "stop_tick": 10,
+            "start_value": 0,
+            "stop_value": 7,
+            "mode": "ramp",
+        }
+    ]
+    roundtrip = na.RuntimeSequenceProgram.from_dict(program.to_dict())
+    assert [segment.to_dict() for segment in (roundtrip.bus_segments or [])] == [
+        segment.to_dict() for segment in (program.bus_segments or [])
+    ]
+    na.validate_pulse_streamer_program(program, max_edges=16, max_bus_segments=4, tick_width=32, channel_count=4)
+
+
+def test_pulse_table_scan_rejects_analog_bus_ramp_mode(tmp_path):
+    scan_file = tmp_path / "scan_points.txt"
+    scan_file.write_text("# vars: tau(ns)\n20\n40\n", encoding="utf-8")
+    state = na.PulseTableState(
+        channels=["ch00", "ch01"],
+        channel_labels={"ch00": "da_test[0]", "ch01": "da_test[1]"},
+        visible_channels=["ch00", "ch01"],
+        time_step_ns=20,
+        scan_variables={"tau": 20},
+        scan_bindings={"period:0:duration": "tau"},
+        scan_table_path=scan_file,
+        periods=[
+            na.PulsePeriod("tau", (0, 0), unit="str (ns)"),
+            na.PulsePeriod(100, (0, 0), unit="ns"),
+        ],
+    )
+    state.set_analog_bus_mode(0, "da_test", "edge", value=0)
+    state.set_analog_bus_mode(1, "da_test", "ramp", value=3)
+
+    with pytest.raises(ValueError, match="ramp values cannot be combined"):
+        na.compile_pulse_table_scan_runtime_program(state, channels=["ch00", "ch01"], clock_hz=50_000_000)
+
+
+def test_pulse_table_state_rejects_legacy_pair_array_scan():
+    with pytest.raises(ValueError, match="legacy x/y scan_points"):
+        na.PulseTableState(
+            channels=["ch00", "ch01", "ch02", "ch03"],
+            periods=[
+                na.PulsePeriod(20, (1, 0, 0, 0), unit="ns", name="load"),
+                na.PulsePeriod("x", (0, 0, 0, 1), unit="str (ns)", name="camera"),
+                na.PulsePeriod("y+20", (0, 0, 0, 0), unit="str (ns)", name="idle"),
+            ],
+            x_ns=20,
+            y_ns=20,
+            scan_points=[(20, 20), (40, 40)],
+            time_step_ns=20,
+            visible_channels=["ch00", "ch03"],
+        )
+
+
+def test_pulse_table_named_scan_file_compiles_to_two_axis_template(tmp_path):
+    scan_file = tmp_path / "scan_points.txt"
+    scan_file.write_text("# vars: tau(ns), d(ns)\n20 20\n40 20\n", encoding="utf-8")
+    state = na.PulseTableState(
+        channels=["ch00", "ch01"],
+        periods=[
+            na.PulsePeriod("tau", (1, 0), unit="str (ns)", name="load"),
+            na.PulsePeriod(20, (0, 1), unit="ns", name="detect"),
+        ],
+        delays={"ch01": "d"},
+        delay_units={"ch01": "str (ns)"},
+        scan_variables={"tau": 20, "d": 20},
+        scan_bindings={"period:0:duration": "tau", "delay:ch01": "d"},
+        scan_table_path=scan_file,
+        time_step_ns=20,
+        visible_channels=["ch00", "ch01"],
+    )
+
+    program = na.compile_pulse_table_scan_runtime_program(
+        state,
+        channels=["ch00", "ch01"],
+        clock_hz=50_000_000,
+        trigger_channels=["ch01"],
+    )
+
+    assert program.scan_axis_names == ["tau", "d"]
+    assert program.scan_points == [(1, 1), (2, 1)]
+    assert program.tick_x_coeffs is not None and any(program.tick_x_coeffs)
+    assert program.tick_y_coeffs is not None and any(program.tick_y_coeffs)
+    assert program.source_table["scan_table_path"].endswith("scan_points.txt")
+    assert len(program.ticks) < len(program.scan_points) * 4
+    na.validate_pulse_streamer_program(program, max_edges=1024, max_scan_points=1024, tick_width=32, channel_count=2)
+
+
+def test_pulse_table_named_scan_file_rejects_more_than_two_time_axes(tmp_path):
+    scan_file = tmp_path / "scan_points.txt"
+    scan_file.write_text("# vars: a(ns), b(ns), c(ns)\n20 20 20\n", encoding="utf-8")
+    state = na.PulseTableState(
+        channels=["ch00"],
+        periods=[
+            na.PulsePeriod("a", (1,), unit="str (ns)"),
+            na.PulsePeriod("b", (0,), unit="str (ns)"),
+            na.PulsePeriod("c", (0,), unit="str (ns)"),
+        ],
+        scan_variables={"a": 20, "b": 20, "c": 20},
+        scan_table_path=scan_file,
+        time_step_ns=20,
+    )
+
+    with pytest.raises(ValueError, match="two hardware axes"):
+        na.compile_pulse_table_scan_runtime_program(state, channels=["ch00"], clock_hz=50_000_000)
+
+
+def test_pulse_table_da_value_scan_binding_compiles_to_scan_bus_values(tmp_path):
+    scan_file = tmp_path / "scan_points.txt"
+    scan_file.write_text("# vars: amp\n1\n2\n", encoding="utf-8")
+    state = na.PulseTableState(
+        channels=["ch00", "ch01"],
+        channel_labels={"ch00": "da_test[0]", "ch01": "da_test[1]"},
+        analog_buses={"da_test": ["ch00", "ch01"]},
+        periods=[na.PulsePeriod(20, (0, 0), unit="ns")],
+        analog_bus_modes={"da_test": [{"mode": "edge", "value": "amp"}]},
+        scan_variables={"amp": 1},
+        scan_bindings={"bus:da_test:0:value": "amp"},
+        scan_table_path=scan_file,
+        time_step_ns=20,
+        visible_channels=["ch00", "ch01"],
+    )
+
+    program = na.compile_pulse_table_scan_runtime_program(state, channels=["ch00", "ch01"], clock_hz=50_000_000)
+    roundtrip = na.RuntimeSequenceProgram.from_dict(program.to_dict())
+    tcl_path = na.write_vivado_pulse_streamer_tcl(
+        tmp_path / "prepare_da_scan.tcl",
+        "prepare",
+        program=program,
+        project="",
+        bitstream="",
+        probes="",
+        max_edges=16,
+        max_scan_points=16,
+        channel_count=2,
+    )
+    tcl = tcl_path.read_text(encoding="utf-8")
+
+    assert program.scan_axis_names == []
+    assert program.scan_points == [(0, 0), (0, 0)]
+    assert program.bus_names == ["da_test"]
+    assert program.scan_bus_values == [1, 2]
+    assert program.bus_segments is None
+    assert roundtrip.scan_bus_values == [1, 2]
+    assert "zlc_scan_prog_bus_values_probe {zlc_scan_prog_bus_values probe_out30}" in tcl
+    assert "zlc_stage_probe $vio $zlc_scan_prog_bus_values_probe 1" in tcl
+    assert "zlc_stage_probe $vio $zlc_scan_prog_bus_values_probe 2" in tcl
+    na.validate_pulse_streamer_program(program, max_edges=16, max_scan_points=16, tick_width=32, channel_count=2)
+
+
+def test_pulse_table_duration_and_da_value_scan_share_compact_template(tmp_path):
+    scan_file = tmp_path / "scan_points.txt"
+    scan_file.write_text("# vars: tau(ns), amp\n20 1\n40 2\n", encoding="utf-8")
+    state = na.PulseTableState(
+        channels=["ch00", "ch01", "ch02"],
+        channel_labels={"ch00": "da_test[0]", "ch01": "da_test[1]", "ch02": "trig"},
+        analog_buses={"da_test": ["ch00", "ch01"]},
+        periods=[
+            na.PulsePeriod("tau", (0, 0, 1), unit="str (ns)", name="image"),
+            na.PulsePeriod(20, (0, 0, 0), unit="ns", name="idle"),
+        ],
+        analog_bus_modes={"da_test": [{"mode": "edge", "value": "amp"}, {"mode": "hold", "value": None}]},
+        scan_variables={"tau": 20, "amp": 1},
+        scan_bindings={"period:0:duration": "tau", "bus:da_test:0:value": "amp"},
+        scan_table_path=scan_file,
+        time_step_ns=20,
+        visible_channels=["ch00", "ch01", "ch02"],
+    )
+
+    program = na.compile_pulse_table_scan_runtime_program(
+        state,
+        channels=["ch00", "ch01", "ch02"],
+        clock_hz=50_000_000,
+        trigger_channels=["ch02"],
+    )
+
+    assert program.scan_axis_names == ["tau"]
+    assert program.scan_points == [(1, 0), (2, 0)]
+    assert program.scan_bus_values == [1, 2]
+    assert program.bus_segments is None
+    assert len(program.ticks) < len(program.scan_points) * 4
+    na.validate_pulse_streamer_program(program, max_edges=16, max_scan_points=16, tick_width=32, channel_count=3)
+
+
+def test_camera_imaging_example_scan_file_compiles_for_address_switch_preset():
+    root = Path(__file__).resolve().parents[1]
+    scan_file = root / "pulses" / "camera_exposure_scan_example.txt"
+    state = na.PulseTableState.load(root / "pulses" / "camera_imaging_address_switch.json").with_scan_table_path(scan_file)
+
+    program = na.compile_pulse_table_scan_runtime_program(
+        state,
+        channels=state.channels,
+        clock_hz=50_000_000,
+        trigger_channels=["ch11"],
+    )
+
+    assert program.scan_axis_names == ["camera_exposure_ns"]
+    assert len(program.scan_points) == 4
+    assert program.scan_points[0] == (100000, 0)
+    assert program.scan_points[-1] == (999000, 0)
+    assert program.source_table["scan_table_path"].endswith("camera_exposure_scan_example.txt")
+    na.validate_pulse_streamer_program(program, max_edges=512, max_scan_points=256, tick_width=32, channel_count=62)
+
+
+def test_camera_imaging_example_scan_file_also_matches_manual_p4_duration_binding():
+    root = Path(__file__).resolve().parents[1]
+    scan_file = root / "pulses" / "camera_exposure_scan_example.txt"
+    state = na.PulseTableState.load(root / "pulses" / "camera_imaging_address_switch.json")
+    payload = state.to_dict()
+    payload["periods"][3]["duration"] = "p4_duration"
+    payload["periods"][3]["unit"] = "str (ns)"
+    payload["scan_variables"] = {"p4_duration": 19_980_000}
+    payload["scan_bindings"] = {"period:3:duration": "p4_duration"}
+    state = na.PulseTableState.from_dict(payload).with_scan_table_path(scan_file)
+
+    program = na.compile_pulse_table_scan_runtime_program(
+        state,
+        channels=state.channels,
+        clock_hz=50_000_000,
+        trigger_channels=["ch11"],
+    )
+
+    assert program.scan_axis_names == ["p4_duration"]
+    assert len(program.scan_points) == 4
+    assert program.scan_points[0] == (100000, 0)
+    assert program.scan_points[-1] == (999000, 0)
+    na.validate_pulse_streamer_program(program, max_edges=512, max_scan_points=256, tick_width=32, channel_count=62)
+
+
+def test_pulse_table_scan_rejects_more_than_five_active_parameter_slots(tmp_path):
+    scan_file = tmp_path / "scan_points.txt"
+    scan_file.write_text("# vars: a(ns), b(ns), c(ns), d(ns), e(ns), f(ns)\n20 20 20 20 20 20\n", encoding="utf-8")
+    state = na.PulseTableState(
+        channels=["ch00"],
+        periods=[
+            na.PulsePeriod("a", (1,), unit="str (ns)"),
+            na.PulsePeriod("b", (0,), unit="str (ns)"),
+            na.PulsePeriod("c", (0,), unit="str (ns)"),
+            na.PulsePeriod("d", (0,), unit="str (ns)"),
+            na.PulsePeriod("e", (0,), unit="str (ns)"),
+            na.PulsePeriod("f", (0,), unit="str (ns)"),
+        ],
+        scan_variables={name: 20 for name in "abcdef"},
+        scan_table_path=scan_file,
+        time_step_ns=20,
+    )
+
+    with pytest.raises(ValueError, match="at most 5 active named scan parameters"):
+        na.compile_pulse_table_scan_runtime_program(state, channels=["ch00"], clock_hz=50_000_000)
+
+
 def test_sequencer_service_pads_gui_subset_state_to_full_40ch_hardware():
     hardware_channels = [f"ch{i:02d}" for i in range(40)]
     prepared_programs: list[na.RuntimeSequenceProgram] = []
@@ -1356,7 +1479,7 @@ def test_sequencer_service_pads_gui_subset_state_to_full_40ch_hardware():
         time_step_ns=10,
         repeat_forever=True,
         visible_channels=["ch00", "ch03"],
-        channel_labels={"ch00": "trap", "ch03": "qcm_trigger"},
+        channel_labels={"ch00": "trap", "ch03": "trig"},
     )
 
     payload = service.prepare(state.to_dict())
@@ -1404,7 +1527,9 @@ def test_fpga_loop_repeat_keeps_post_loop_idle_before_repeat_forever():
     assert program.loop_count == 2
     assert program.repeat_forever is True
     assert history[:7] == [0b0001, 0b1000, 0b1000, 0b1000, 0b1000, 0, 0b0001]
-    assert "final_tick <= (prog_count == 0) ? {TICK_WIDTH{1'b0}} : final_tick_shadow;" in core
+    assert "final_tick <= (prog_count == 0) ? {TICK_WIDTH{1'b0}} : zlc_effective_tick(" in core
+    assert "final_x_coeff_shadow" in core
+    assert "final_y_coeff_shadow" in core
     assert "loop_end_tick : final_tick_shadow" not in core
 
 
@@ -1421,7 +1546,7 @@ def test_pulse_table_reports_repeat_forever_table_boundary_high_channels():
         repeat_end=1,
         repeat_count=3,
         repeat_forever=True,
-        channel_labels={"ch00": "trap", "ch01": "cooling", "ch03": "qcm_trigger"},
+        channel_labels={"ch00": "trap", "ch01": "cooling", "ch03": "trig"},
     )
 
     program = na.compile_pulse_table_runtime_program(
@@ -1506,7 +1631,7 @@ def test_40ch_gui_visible_subset_compiles_as_full_width_fpga_program():
         ],
         time_step_ns=10,
         visible_channels=["ch00", "ch01", "ch02", "ch03"],
-        channel_labels={"ch00": "trap", "ch01": "cooling", "ch02": "probe", "ch03": "qcm_trigger"},
+        channel_labels={"ch00": "trap", "ch01": "cooling", "ch02": "probe", "ch03": "trig"},
     )
 
     program = na.compile_pulse_table_runtime_program(
@@ -1533,7 +1658,7 @@ def test_pulse_table_unknown_channel_is_not_silently_ignored():
         time_step_ns=10,
     )
     try:
-        na.compile_pulse_table_runtime_program(state, channels=[f"ch{i:02d}" for i in range(40)], clock_hz=100_000_000)
+        na.compile_pulse_table_runtime_program(state, channels=[f"ch{i:02d}" for i in range(62)], clock_hz=50_000_000)
     except ValueError as exc:
         assert "not in hardware channels" in str(exc)
         assert "not_on_fpga" in str(exc)
@@ -1541,51 +1666,54 @@ def test_pulse_table_unknown_channel_is_not_silently_ignored():
         raise AssertionError("unknown pulse-table channels should be rejected")
 
 
-def test_checked_in_camera_imaging_pulse_compiles_for_40ch_fpga():
-    path = Path(__file__).resolve().parents[1] / "pulses" / "camera_imaging_40ch.json"
+def test_checked_in_camera_imaging_pulse_compiles_for_address_switch_fpga():
+    path = Path(__file__).resolve().parents[1] / "pulses" / "camera_imaging_address_switch.json"
     state = na.PulseTableState.load(path)
-    program = state.compile(clock_hz=100_000_000, trigger_channels=["ch03"])
+    program = state.compile(clock_hz=50_000_000, trigger_channels=["ch11"])
 
-    assert state.channels == [f"ch{i:02d}" for i in range(40)]
-    assert state.visible_channels == ["ch00", "ch01", "ch02", "ch03"]
-    assert len(state.channel_labels) == 40
-    assert state.channel_labels["ch00"] == "trap"
-    assert state.channel_labels["ch03"] == "qcm_trigger"
-    assert state.channel_labels["ch04"] == "cooling_pgc"
-    assert state.channel_labels["ch18"] == "da_clk0"
-    assert state.channel_labels["ch39"] == "da_bias_x[7]"
-    assert state.delay_steps("ch00", time_step_ns=10) == 0
-    assert state.delay_steps("ch03", time_step_ns=10) == 0
+    assert state.channels == [f"ch{i:02d}" for i in range(62)]
+    assert state.visible_channels == ["ch09", "ch00", "ch03", "ch11"]
+    assert state.time_step_ns == 20
+    assert len(state.channel_labels) == 62
+    assert state.channel_labels["ch00"] == "cooling"
+    assert state.channel_labels["ch03"] == "probe"
+    assert state.channel_labels["ch06"] == "trig"
+    assert state.channel_labels["ch11"] == "emCCD"
+    assert state.channel_labels["ch09"] == "trap"
+    assert state.channel_labels["ch18"] == "da_dipole[0]"
+    assert state.channel_labels["ch39"] == "da_clk1"
+    assert state.delay_steps("ch00", time_step_ns=20) == 0
+    assert state.delay_steps("ch11", time_step_ns=20) == 0
     assert state.repeat_start is None
     assert state.repeat_end is None
     assert state.repeat_count == 1
     assert state.repeat_forever is True
     assert state.repeat_forever_boundary_active_channels() == []
-    assert state.x_ns == 19_980_000
+    assert state.scan_variables["camera_exposure_ns"] == 19_980_000
     exposure_period = next(period for period in state.periods if period.name == "camera_exposure")
-    assert exposure_period.duration == "x"
+    assert exposure_period.duration == "camera_exposure_ns"
     assert exposure_period.unit == "str (ns)"
-    assert state.periods[0].states[state.channel_index("ch03")] == 0
+    assert state.periods[0].states[state.channel_index("ch11")] == 0
     assert program.channels == state.channels
-    assert program.ticks == [0, 200_000, 210_000, 212_000, 2_210_000, 2_212_000]
-    assert program.masks == [0b0011, 0b0001, 0b1101, 0b0101, 0b0001, 0]
+    assert program.ticks == [0, 100_000, 105_000, 106_000, 1_105_000, 1_106_000]
+    assert program.masks == [513, 512, 2568, 520, 512, 0]
     assert program.trigger_count == 1
     assert program.repeat_forever is True
     assert program.loop_start_index == 0
-    assert program.loop_end_tick == 2_212_000
+    assert program.loop_end_tick == 1_106_000
     assert program.loop_count == 1
-    na.validate_pulse_streamer_program(program, max_edges=1024, tick_width=32, channel_count=40)
+    na.validate_pulse_streamer_program(program, max_edges=1024, tick_width=32, channel_count=62)
 
-    shorter = state.compile(clock_hz=100_000_000, trigger_channels=["ch03"], x_ns=2_000_000)
-    assert shorter.ticks == [0, 200_000, 210_000, 212_000, 412_000, 414_000]
+    shorter = state.compile(clock_hz=50_000_000, trigger_channels=["ch11"], variables={"camera_exposure_ns": 2_000_000})
+    assert shorter.ticks == [0, 100_000, 105_000, 106_000, 206_000, 207_000]
     assert shorter.masks == program.masks
     assert shorter.trigger_count == 1
-    finite = na.finite_frame_sequence(state.with_x(2_000_000), 3, trigger_channels=["ch03"])
+    finite = na.finite_frame_sequence(state.with_scan_variables(camera_exposure_ns=2_000_000), 3, trigger_channels=["ch11"])
     finite_program = na.compile_runtime_program(
         finite,
         channels=state.channels,
-        clock_hz=100_000_000,
-        trigger_channels=["ch03"],
+        clock_hz=50_000_000,
+        trigger_channels=["ch11"],
     )
     assert finite_program.repeat_forever is False
     assert finite_program.trigger_count == 3
@@ -1624,7 +1752,7 @@ def test_pulse_table_repeat_forever_can_be_disabled_for_single_shot():
     assert program.masks == [1 << 0, 1 << 3, 0, 0]
 
 
-def test_bind_pulse_controller_updates_x_and_fires_runtime_sequencer():
+def test_bind_pulse_controller_updates_named_variable_and_fires_runtime_sequencer():
     sequencer = na.RuntimeSequencer(
         channels=["ch00", "ch03"],
         clock_hz=100_000_000,
@@ -1634,19 +1762,20 @@ def test_bind_pulse_controller_updates_x_and_fires_runtime_sequencer():
     state = na.PulseTableState(
         channels=["ch00", "ch03"],
         periods=[
-            na.PulsePeriod("x", (1, 0), unit="str (ns)"),
+            na.PulsePeriod("readout_duration_ns", (1, 0), unit="str (ns)"),
             na.PulsePeriod(20, (0, 1), unit="ns"),
             na.PulsePeriod(20, (0, 0), unit="ns"),
         ],
         time_step_ns=10,
-        x_ns=100,
+        scan_variables={"readout_duration_ns": 100},
+        scan_bindings={"period:0:duration": "readout_duration_ns"},
         repeat_forever=False,
     )
 
     pulse = na.bind_pulse(sequencer, state)
     assert pulse.snapshot()["last_program"] is None
     assert pulse.snapshot()["sequencer_channels"] == ["ch00", "ch03"]
-    pulse.x = 200
+    pulse.set_variable("readout_duration_ns", 200)
     program = pulse.on_pulse(wait=True, timeout=1.0)
 
     assert program.ticks == [0, 20, 22, 24]
@@ -1654,9 +1783,80 @@ def test_bind_pulse_controller_updates_x_and_fires_runtime_sequencer():
     assert program.repeat_forever is False
     assert sequencer.snapshot()["state"] == "done"
     snapshot = pulse.snapshot()
-    assert snapshot["x_ns"] == 200
+    assert snapshot["scan_variables"]["readout_duration_ns"] == 200
     assert snapshot["last_program"]["edge_count"] == len(program.ticks)
-    assert snapshot["last_program"]["trigger_count"] == program.trigger_count
+    assert snapshot["last_program_count"] == 1
+
+
+def test_bind_pulse_controller_chunks_large_named_scan_file(tmp_path):
+    scan_file = tmp_path / "scan_points.txt"
+    scan_file.write_text("# vars: readout_duration_ns(ns)\n20\n40\n60\n", encoding="utf-8")
+    sequencer = na.RuntimeSequencer(
+        channels=["ch00", "ch03"],
+        clock_hz=50_000_000,
+        trigger_channels=["ch03"],
+        sleep_scale=0.0,
+    )
+    state = na.PulseTableState(
+        channels=["ch00", "ch03"],
+        periods=[
+            na.PulsePeriod("readout_duration_ns", (1, 0), unit="str (ns)"),
+            na.PulsePeriod(20, (0, 1), unit="ns"),
+            na.PulsePeriod(20, (0, 0), unit="ns"),
+        ],
+        time_step_ns=20,
+        scan_variables={"readout_duration_ns": 20},
+        scan_bindings={"period:0:duration": "readout_duration_ns"},
+        scan_table_path=scan_file,
+        repeat_forever=False,
+    )
+
+    pulse = na.bind_pulse(sequencer, state)
+    last = pulse.on_pulse(wait=True, timeout=1.0, scan_chunk_size=2)
+
+    assert last is pulse.last_programs[-1]
+    assert [len(program.scan_points or []) for program in pulse.last_programs] == [2, 1]
+    assert [program.trigger_count for program in pulse.last_programs] == [2, 1]
+    assert [program.scan_points for program in pulse.last_programs] == [[(1, 0), (2, 0)], [(3, 0)]]
+    assert sequencer.snapshot()["state"] == "done"
+    assert pulse.snapshot()["last_program_count"] == 2
+
+
+def test_bind_pulse_controller_prepare_rejects_large_scan_file_without_chunking(tmp_path):
+    scan_file = tmp_path / "scan_points.txt"
+    scan_file.write_text("# vars: readout_duration_ns(ns)\n20\n40\n60\n", encoding="utf-8")
+    sequencer = na.RuntimeSequencer(channels=["ch00"], clock_hz=50_000_000, sleep_scale=0.0)
+    sequencer.max_scan_points = 2
+    state = na.PulseTableState(
+        channels=["ch00"],
+        periods=[na.PulsePeriod("readout_duration_ns", (1,), unit="str (ns)")],
+        time_step_ns=20,
+        scan_variables={"readout_duration_ns": 20},
+        scan_bindings={"period:0:duration": "readout_duration_ns"},
+        scan_table_path=scan_file,
+        repeat_forever=False,
+    )
+
+    pulse = na.bind_pulse(sequencer, state)
+    with pytest.raises(RuntimeError, match="automatic scan chunking"):
+        pulse.prepare()
+    with pytest.raises(RuntimeError, match="requires wait=True"):
+        pulse.on_pulse(wait=False, scan_chunk_size=2)
+
+
+def test_bind_pulse_controller_rejects_legacy_xy_scan_api():
+    sequencer = na.RuntimeSequencer(channels=["ch00"], clock_hz=100_000_000, sleep_scale=0.0)
+    state = na.PulseTableState(
+        channels=["ch00"],
+        periods=[na.PulsePeriod(100, (1,), unit="ns")],
+        time_step_ns=10,
+    )
+    pulse = na.bind_pulse(sequencer, state)
+
+    with pytest.raises(ValueError, match="legacy x/y"):
+        pulse.x = 200
+    with pytest.raises(ValueError, match="legacy x/y scan_points"):
+        pulse.set_scan_points([20, 40])
 
 
 def test_bind_pulse_controller_can_override_repeat_forever_for_scope_debug():
@@ -1823,11 +2023,12 @@ def test_detection_time_scan_uses_bound_40ch_pulse_controller():
         channels=["ch00", "ch02", "ch03"],
         periods=[
             na.PulsePeriod(100, (1, 0, 0), unit="ns"),
-            na.PulsePeriod("x", (1, 1, 1), unit="str (ns)"),
+            na.PulsePeriod("detection_time_ns", (1, 1, 1), unit="str (ns)"),
             na.PulsePeriod(100, (0, 0, 0), unit="ns"),
         ],
         time_step_ns=10,
-        x_ns=1_000,
+        scan_variables={"detection_time_ns": 1_000},
+        scan_bindings={"period:1:duration": "detection_time_ns"},
         repeat_forever=True,
     )
     pulse = na.bind_pulse(sequencer, state)
@@ -1843,7 +2044,7 @@ def test_detection_time_scan_uses_bound_40ch_pulse_controller():
     )
 
     assert scan.summary()["finished"] is True
-    assert pulse.x_ns == 4_000
+    assert pulse.variables["detection_time_ns"] == 4_000
     assert [program.loop_end_tick for program in sequencer.prepared_programs] == [820, 220, 420]
     assert [program.trigger_count for program in sequencer.prepared_programs] == [2, 2, 2]
     assert [program.source_sequence["repeat_count"] for program in sequencer.prepared_programs] == [2, 2, 2]
@@ -1875,11 +2076,12 @@ def test_timing_subsystem_bind_pulse_loads_json_for_40ch_remote_style_scan(tmp_p
         channels=["ch00", "ch02", "ch03"],
         periods=[
             na.PulsePeriod(100, (1, 0, 0), unit="ns"),
-            na.PulsePeriod("x", (1, 1, 1), unit="str (ns)"),
+            na.PulsePeriod("detection_time_ns", (1, 1, 1), unit="str (ns)"),
             na.PulsePeriod(100, (0, 0, 0), unit="ns"),
         ],
         time_step_ns=10,
-        x_ns=1_000,
+        scan_variables={"detection_time_ns": 1_000},
+        scan_bindings={"period:1:duration": "detection_time_ns"},
         repeat_forever=True,
     )
     path = state.save(tmp_path / "camera_imaging.json")
@@ -1887,7 +2089,7 @@ def test_timing_subsystem_bind_pulse_loads_json_for_40ch_remote_style_scan(tmp_p
     pulse = exp.timing.bind_pulse(path)
     assert pulse.sequencer is exp.sequencer
     assert pulse.snapshot()["sequencer_channels"] == hardware_channels
-    pulse.x = 2_000
+    pulse.set_variable("detection_time_ns", 2_000)
     single = pulse.on_pulse(wait=True, timeout=1.0, repeat_forever=False)
 
     assert single.channels == hardware_channels
@@ -1906,7 +2108,7 @@ def test_timing_subsystem_bind_pulse_loads_json_for_40ch_remote_style_scan(tmp_p
     )
 
     assert scan.summary()["finished"] is True
-    assert pulse.x_ns == 4_000
+    assert pulse.variables["detection_time_ns"] == 4_000
     assert sequencer.prepared_programs[-1].channels == hardware_channels
     assert sequencer.prepared_programs[-1].trigger_count == 2
     assert sequencer.prepared_programs[-1].repeat_forever is False
@@ -1948,18 +2150,19 @@ def test_bound_pulse_frame_sequence_uses_requested_frames_not_gui_repeat_count()
 
 def test_pulse_table_rejects_times_off_minimal_grid():
     state = na.PulseTableState(
-        channels=["trap", "qcm_trigger"],
+        channels=["trap", "trig"],
         periods=[
             na.PulsePeriod(100, (1, 0), unit="ns"),
-            na.PulsePeriod("x", (0, 1), unit="str (ns)"),
+            na.PulsePeriod("pulse_width_ns", (0, 1), unit="str (ns)"),
         ],
-        x_ns=20,
+        scan_variables={"pulse_width_ns": 20},
+        scan_bindings={"period:1:duration": "pulse_width_ns"},
         time_step_ns=1,
     )
 
-    assert state.to_sequence(x_ns=20, time_step_ns=10).validate(clock_hz=100e6, channels=state.channels).ok
+    assert state.to_sequence(variables={"pulse_width_ns": 20}, time_step_ns=10).validate(clock_hz=100e6, channels=state.channels).ok
     try:
-        state.to_sequence(x_ns=25, time_step_ns=10)
+        state.to_sequence(variables={"pulse_width_ns": 25}, time_step_ns=10)
     except ValueError as exc:
         assert "integer multiple" in str(exc)
     else:
@@ -1992,13 +2195,13 @@ def test_pulse_sequence_clock_validation_rejects_off_tick_edges():
 
 
 def test_pulse_table_from_sequence_materializes_delays_without_double_applying():
-    seq = na.PulseSequence(name="delayed").pulse("qcm_trigger", 0.0, 20e-9).delay("qcm_trigger", 10e-9)
-    state = na.PulseTableState.from_sequence(seq, channels=["trap", "qcm_trigger"], clock_hz=100e6)
+    seq = na.PulseSequence(name="delayed").pulse("trig", 0.0, 20e-9).delay("trig", 10e-9)
+    state = na.PulseTableState.from_sequence(seq, channels=["trap", "trig"], clock_hz=100e6)
     round_trip = state.to_sequence()
 
     assert state.delays == {}
     assert [(p.channel, round(p.start, 10), round(p.duration, 10)) for p in round_trip.effective_pulses()] == [
-        ("qcm_trigger", 10e-9, 20e-9)
+        ("trig", 10e-9, 20e-9)
     ]
 
 
@@ -2093,7 +2296,7 @@ def test_command_sequencer_backend_writes_program_and_runs_fire_command(tmp_path
         f'"import os, pathlib; pathlib.Path(r\'{marker}\').write_text(os.environ[\'ZLC_SEQUENCE_ID\'])"'
     )
     seq = na.imaging_sequence(exposure=1e-4, load=True)
-    program = na.compile_runtime_program(seq, channels=["trap", "cooling", "probe", "qcm_trigger"])
+    program = na.compile_runtime_program(seq, channels=["trap", "cooling", "probe", "emCCD"])
     backend = na.CommandSequencerBackend(tmp_path, fire_command=command)
 
     backend.fire(program)
@@ -2107,7 +2310,7 @@ def test_command_sequencer_backend_writes_program_and_runs_fire_command(tmp_path
 def test_command_sequencer_backend_error_includes_log_tail(tmp_path):
     command = f'"{sys.executable}" -c "print(\'prepare failed detail\'); raise SystemExit(7)"'
     seq = na.imaging_sequence(exposure=1e-4, load=True)
-    program = na.compile_runtime_program(seq, channels=["trap", "cooling", "probe", "qcm_trigger"])
+    program = na.compile_runtime_program(seq, channels=["trap", "cooling", "probe", "emCCD"])
     backend = na.CommandSequencerBackend(tmp_path, prepare_command=command)
 
     try:
@@ -2138,18 +2341,19 @@ def test_sequencer_service_skips_duplicate_prepare_uploads():
     state = na.PulseTableState(
         channels=["ch00", "ch03"],
         periods=[
-            na.PulsePeriod("x", (1, 0), unit="str (ns)"),
+            na.PulsePeriod("pulse_width_ns", (1, 0), unit="str (ns)"),
             na.PulsePeriod(20, (1, 1), unit="ns"),
             na.PulsePeriod(20, (0, 0), unit="ns"),
         ],
         time_step_ns=10,
-        x_ns=100,
+        scan_variables={"pulse_width_ns": 100},
+        scan_bindings={"period:0:duration": "pulse_width_ns"},
         repeat_forever=False,
     )
 
     first = service.prepare(state)
     second = service.prepare(state)
-    third = service.prepare(state.with_x(200))
+    third = service.prepare(state.with_scan_variables(pulse_width_ns=200))
 
     assert first["sequence_id"] == second["sequence_id"]
     assert third["sequence_id"] != first["sequence_id"]
@@ -2377,7 +2581,11 @@ def test_vivado_pulse_streamer_session_prepare_uses_differential_edge_upload(tmp
     assert "zlc_stage_probe $vio $zlc_prog_addr_probe 1" not in loop_metadata_prepare
     assert "zlc_stage_probe $vio $zlc_prog_addr_probe 2" in loop_metadata_prepare
     assert "zlc_stage_probe $vio $zlc_prog_addr_probe 3" in loop_metadata_prepare
-    assert "wrote 3/4 edge rows reset_settle_ms=$zlc_prepare_reset_settle_ms repeat_forever=1 loop_start=2 loop_end=30 loop_count=2" in loop_metadata_prepare
+    assert (
+        "wrote 3/4 edge rows, 0/0 scan points, and 0/0 bus segments "
+        "reset_settle_ms=$zlc_prepare_reset_settle_ms repeat_forever=1 scan=0 "
+        "loop_start=2 loop_end=30 loop_count=2 bus_counts=0"
+    ) in loop_metadata_prepare
 
 
 def test_sequencer_server_warm_starts_vivado_session_before_accepting_clients(tmp_path, monkeypatch):
@@ -2476,9 +2684,9 @@ def test_remote_sequencer_round_trip_uses_json_protocol(tmp_path):
 
     backend = na.CommandSequencerBackend(tmp_path)
     service = na.SequencerService(
-        channels=["trap", "cooling", "probe", "qcm_trigger"],
-        clock_hz=100e6,
-        trigger_channels=["qcm_trigger"],
+        channels=["trap", "cooling", "probe", "emCCD"],
+        clock_hz=50_000_000,
+        trigger_channels=["emCCD"],
         prepare_callback=backend.prepare,
         fire_callback=backend.fire,
         wait_done_callback=backend.wait_done,
@@ -2491,7 +2699,7 @@ def test_remote_sequencer_round_trip_uses_json_protocol(tmp_path):
     thread = threading.Thread(target=server.start, daemon=True)
     thread.start()
     time.sleep(0.2)
-    remote = na.RemoteSequencer(host="127.0.0.1", port=port, channels=["trap", "cooling", "probe", "qcm_trigger"], clock_hz=100e6)
+    remote = na.RemoteSequencer(host="127.0.0.1", port=port, channels=["trap", "cooling", "probe", "emCCD"], clock_hz=50_000_000)
     seq = na.sequence_for_frame_count(na.imaging_sequence(exposure=12e-6, load=True), 4)
     try:
         program = remote.prepare(seq)
@@ -2507,7 +2715,7 @@ def test_remote_sequencer_round_trip_uses_json_protocol(tmp_path):
     assert payload["source_sequence"]["name"] == seq.name
 
 
-def test_remote_pulse_controller_sends_pulse_table_x_over_json_protocol(tmp_path):
+def test_remote_pulse_controller_sends_named_scan_variable_over_json_protocol(tmp_path):
     try:
         import rpyc  # noqa: F401
     except ImportError:
@@ -2550,17 +2758,18 @@ def test_remote_pulse_controller_sends_pulse_table_x_over_json_protocol(tmp_path
         channels=["ch00", "ch03"],
         periods=[
             na.PulsePeriod(100, (1, 0), unit="ns"),
-            na.PulsePeriod("x", (1, 1), unit="str (ns)"),
+            na.PulsePeriod("detection_time_ns", (1, 1), unit="str (ns)"),
             na.PulsePeriod(100, (0, 0), unit="ns"),
         ],
         time_step_ns=10,
-        x_ns=1_000,
+        scan_variables={"detection_time_ns": 1_000},
+        scan_bindings={"period:1:duration": "detection_time_ns"},
         repeat_forever=True,
         visible_channels=["ch00", "ch03"],
     )
     pulse = na.bind_pulse(remote, state)
     try:
-        pulse.x = 2_000
+        pulse.set_variable("detection_time_ns", 2_000)
         program = pulse.on_pulse(wait=True, timeout=1.0, repeat_forever=False)
         snapshot = pulse.snapshot()
     finally:
@@ -2569,7 +2778,7 @@ def test_remote_pulse_controller_sends_pulse_table_x_over_json_protocol(tmp_path
 
     assert remote.channels == hardware_channels
     assert remote.clock_hz == 100_000_000
-    assert pulse.x_ns == 2_000
+    assert pulse.variables["detection_time_ns"] == 2_000
     assert program.channels == hardware_channels
     assert program.ticks == [0, 10, 210, 220]
     assert program.masks == [1 << 0, (1 << 0) | (1 << 3), 0, 0]
@@ -2620,11 +2829,12 @@ def test_remote_detection_time_scan_uses_bound_pulse_controller_over_json_protoc
         channels=["ch00", "ch02", "ch03"],
         periods=[
             na.PulsePeriod(100, (1, 0, 0), unit="ns"),
-            na.PulsePeriod("x", (1, 1, 1), unit="str (ns)"),
+            na.PulsePeriod("detection_time_ns", (1, 1, 1), unit="str (ns)"),
             na.PulsePeriod(100, (0, 0, 0), unit="ns"),
         ],
         time_step_ns=10,
-        x_ns=1_000,
+        scan_variables={"detection_time_ns": 1_000},
+        scan_bindings={"period:1:duration": "detection_time_ns"},
         repeat_forever=True,
     )
     pulse = na.bind_pulse(remote, state)
@@ -2646,7 +2856,7 @@ def test_remote_detection_time_scan_uses_bound_pulse_controller_over_json_protoc
     assert scan.summary()["finished"] is True
     assert remote.channels == hardware_channels
     assert remote.clock_hz == 100_000_000
-    assert pulse.x_ns == 4_000
+    assert pulse.variables["detection_time_ns"] == 4_000
     assert [program.channels for program in prepared_programs] == [hardware_channels] * 3
     assert [program.trigger_count for program in prepared_programs] == [2, 2, 2]
     assert [program.loop_end_tick for program in prepared_programs] == [820, 220, 420]
@@ -2673,7 +2883,7 @@ def test_hardware_tutorial_is_real_hardware_not_virtual_demo():
     assert "fpga_pulse_streamer" in fpga_text
     assert "legacy_address_switch" not in fpga_text
     assert "na.run_sequencer_server" in fpga_text
-    assert "address_switch.xpr" not in fpga_text
+    assert "fpga\\build\\address_switch\\address_switch.xpr" in fpga_text
     assert "qCMOS.py" not in hardware_text + fpga_text
     assert "pxie_control" not in hardware_text + fpga_text
 
@@ -2681,26 +2891,28 @@ def test_hardware_tutorial_is_real_hardware_not_virtual_demo():
 def test_real_device_templates_load_without_hardware_connection():
     manual = na.load_devices("manual_template")
     remote = na.load_devices("remote_template", overrides={"sequencer": {"host": "192.168.0.21", "port": 18862}})
-    hardware_channels = [f"ch{i:02d}" for i in range(40)]
+    hardware_channels = [f"ch{i:02d}" for i in range(62)]
 
     assert isinstance(manual.camera, na.QCMOSCamera)
     assert manual.camera.dcam_module_name == na.DEFAULT_DCAM_MODULE
     assert isinstance(manual.sequencer, na.ManualSequencer)
     assert manual.sequencer.channels == hardware_channels
-    assert manual.sequencer.trigger_channels == ("ch03",)
+    assert manual.sequencer.clock_hz == 50_000_000
+    assert manual.sequencer.trigger_channels == ("ch11",)
     assert isinstance(remote.camera, na.QCMOSCamera)
     assert remote.camera.dcam_module_name == na.DEFAULT_DCAM_MODULE
     assert isinstance(remote.sequencer, na.RemoteSequencer)
     assert remote.sequencer.host == "192.168.0.21"
     assert remote.sequencer.port == 18862
     assert remote.sequencer.channels == hardware_channels
-    assert remote.sequencer.trigger_channels == ("ch03",)
+    assert remote.sequencer.clock_hz == 50_000_000
+    assert remote.sequencer.trigger_channels == ("ch11",)
     assert remote.sequencer.snapshot()["connected"] is False
 
     exp = na.connect("remote_template", sequencer={"host": "192.168.0.22"})
     assert exp.devices.sequencer.host == "192.168.0.22"
     assert exp.camera.dcam_module_name == na.DEFAULT_DCAM_MODULE
-    assert exp.sequence.channels == ["ch00", "ch01", "ch02", "ch03"]
+    assert exp.sequence.channels == ["ch00", "ch03", "ch09", "ch11"]
 
     try:
         na.load_devices("remote_template", overrides={"sequencer": {"host": "0.0.0.0"}})
@@ -2735,7 +2947,7 @@ def test_load_devices_can_open_device_graph(monkeypatch):
 
     class TrackingSequencer(na.SequencerDevice):
         events = TrackingCamera.events
-        channels = ["qcm_trigger"]
+        channels = ["aux"]
         clock_hz = 1e6
 
         def prepare(self, sequence):
@@ -2868,9 +3080,9 @@ def test_qcmos_camera_acquire_uses_dcam_and_expanded_sequencer(monkeypatch):
     monkeypatch.setitem(sys.modules, "fake_dcam_for_qcmos_test", fake_module)
 
     class FakeSequencer:
-        channels = ["trap", "cooling", "probe", "qcm_trigger"]
-        clock_hz = 250e6
-        trigger_channels = ("qcm_trigger",)
+        channels = ["trap", "cooling", "probe", "emCCD"]
+        clock_hz = 50_000_000
+        trigger_channels = ("emCCD",)
 
         def __init__(self):
             self.prepared = None

@@ -17,9 +17,7 @@ DEFAULT_CHANNELS = (
     "trap",
     "cooling",
     "probe",
-    "qcm_trigger",
-    "camera_trigger",
-    "trig",
+    "emCCD",
     "pushout",
     "microwave",
 )
@@ -200,7 +198,7 @@ class VirtualCamera(CameraDevice):
 
 
 class VirtualSequencer(SequencerDevice):
-    def __init__(self, channels: Sequence[str] = DEFAULT_CHANNELS, clock_hz: float = 250e6, sleep_scale: float = 0.0):
+    def __init__(self, channels: Sequence[str] = DEFAULT_CHANNELS, clock_hz: float = 50_000_000.0, sleep_scale: float = 0.0):
         self.channels = tuple(str(channel) for channel in channels)
         self.clock_hz = positive_float(clock_hz, "clock_hz")
         self.sleep_scale = nonnegative_float(sleep_scale, "sleep_scale")

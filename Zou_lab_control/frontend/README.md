@@ -27,20 +27,23 @@ back to PATH.  For a temporary override, set `ZLC_PULSE_GUI_PYTHON`.
 
 ## Pulse GUI Contract
 
-The hardware channel names are FPGA bit names such as `ch00..ch39`.  Display
-labels such as `trap` or `qcm_trigger` are labels only.  Hiding channels changes
-only the GUI view; upload still uses the sequencer's full channel order and
-zeros all missing bits.
+The hardware channel names are FPGA bit names such as `ch00..ch61` when the
+original address-switch XDC is used.  Display labels such as `trap`, `probe`,
+or `emCCD` are labels only.  When the XDC pin map is available, the raw column
+shows package pins such as `F15` or `M13`; `chNN` remains the saved/API bit
+name.  Hiding channels changes only the GUI view; upload still uses the
+sequencer's full channel order and zeros all missing bits.
 
-The standalone launcher infers the default channel count from the FPGA XDC.  It
-falls back to `DEFAULT_PULSE_GUI_MAX_CHANNELS = 40`.  A loaded JSON that only
-contains a subset such as `ch00..ch03` is aligned to that full hardware list
-before upload; missing channels stay off.  The hardware list can be overridden:
+The standalone launcher infers the default channel count, display labels, and
+package pins from the FPGA XDC.  It falls back to
+`DEFAULT_PULSE_GUI_FALLBACK_CHANNELS = 62`.  A loaded JSON that only contains a
+subset such as `ch09/ch00/ch03/ch11` is aligned to the full hardware list before
+upload; missing channels stay off.  The hardware list can be overridden:
 
 ```powershell
 .\pulse_gui.bat --channel-count 24
 .\pulse_gui.bat --xdc D:\pin_maps\my_board.xdc
-.\pulse_gui.bat --max-channel-count 40
+.\pulse_gui.bat --max-channel-count 62
 ```
 
 By default the launcher tries a sequencer server on `127.0.0.1:18861`, which is
@@ -55,16 +58,16 @@ pure offline editing with no backend calls, pass `--no-sequencer`; in that mode
 backend to reset.
 
 ```powershell
-.\pulse_gui.bat --remote-host 192.168.0.20 --state .\pulses\camera_imaging_40ch.json
-.\pulse_gui.bat --no-sequencer --state .\pulses\camera_imaging_40ch.json
+.\pulse_gui.bat --remote-host 192.168.0.20 --state .\pulses\camera_imaging_address_switch.json
+.\pulse_gui.bat --no-sequencer --state .\pulses\camera_imaging_address_switch.json
 ```
 
 The GUI does not expose a separate whole-table repeat switch.  The visible
 repeat control is the bracket marker in the period timeline.  With no internal
-bracket, the preview still shows the whole table as `∞`, matching the default
-pulse-streamer behavior.  A bracket gives a finite sub-loop count inside that
-overall table.  Script and camera workflows can still request finite hardware
-shots through the API when they need to wait for completion.
+bracket, the preview still shows the whole table as `×∞`, matching the default
+pulse-streamer behavior.  A bracket gives a finite sub-loop count `×N` inside
+that overall table.  Script and camera workflows can still request finite
+hardware shots through the API when they need to wait for completion.
 
 If a finite internal repeat bracket is used while the uploaded table is run in
 the default repeating mode, the FPGA finishes that bracket count and then

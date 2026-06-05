@@ -410,7 +410,7 @@ planner 的理论结构是两层：
 
 修复：
 \begin{itemize}
-  \item 在 Verilog 中新增明确的 \pyapi{qcm_trigger} 或在 run 分支明确驱动 \pyapi{trig}。
+  \item 在 Verilog 中明确驱动 \pyapi{trig}，并在上层配置中把它映射到当前硬件 trigger channel。
   \item 每个 readout 只发一个正沿 trigger，宽度用参数 \pyapi{trigger_lasting} 控制。
   \item 用示波器同时看 \pyapi{trig}、\pyapi{probe}、qCMOS exposure out 或 frame valid。
   \item Python preflight 检查请求帧数等于 sequence 中 trigger 数。
@@ -542,7 +542,7 @@ if img_before is None:
 \section{推荐的中期修法}
 中期应该把 Verilog 改成由 Python 生成的 edge table 或至少由 Python preflight 的参数化 sequence。核心思想是：
 \begin{itemize}
-  \item Python 中写 \pyapi{PulseSequence}，用物理单位秒描述 \pyapi{trap/probe/qcm_trigger/pushout}。
+  \item Python 中写 \pyapi{PulseSequence}，用物理单位秒描述 \pyapi{trap/probe/trig/pushout}。
   \item Python 自动检查 trigger 数、exposure window、shutter delay、cycle end。
   \item 生成 Verilog edge table，避免手写 \pyapi{mot_lasting + PGC_waiting + ...}。
   \item qCMOS driver 的 \pyapi{acquire(frames, sequence, sequencer)} 负责 camera arm、sequencer fire、read frames 和 stop。

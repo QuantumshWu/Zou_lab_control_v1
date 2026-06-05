@@ -11,6 +11,7 @@ from argparse import ArgumentParser
 from dataclasses import dataclass
 from pathlib import Path
 import json
+import math
 import os
 import queue
 import re
@@ -24,13 +25,19 @@ from ..timing import channel_names
 from ..timing.verilog import CONTROL_PORTS, safe_identifier
 
 
-DEFAULT_CHANNELS = ["trap", "cooling", "probe", "qcm_trigger"]
-DEFAULT_FPGA_CHANNEL_COUNT = 40
+DEFAULT_FPGA_CHANNEL_COUNT = 62
+DEFAULT_CHANNELS = [f"ch{index:02d}" for index in range(DEFAULT_FPGA_CHANNEL_COUNT)]
 DEFAULT_VIO_FILTER = 'CELL_NAME=~"*vio*"'
-DEFAULT_MAX_EDGES = 1024
+DEFAULT_MAX_EDGES = 512
+DEFAULT_MAX_SCAN_POINTS = 256
+DEFAULT_MAX_BUS_SEGMENTS = 64
 DEFAULT_TICK_WIDTH = 32
-DEFAULT_PROJECT_NAME = "p40"
-DEFAULT_TOP_NAME = "zlc_pulse_streamer_top_40ch"
+DEFAULT_SCAN_COEFF_WIDTH = 16
+DEFAULT_SCAN_COEFF_FRAC_BITS = 8
+DEFAULT_BUS_COUNT = 4
+DEFAULT_BUS_WIDTH = 10
+DEFAULT_PROJECT_NAME = "address_switch"
+DEFAULT_TOP_NAME = "zlc_pulse_streamer_top_address_switch"
 
 
 @dataclass(frozen=True)
@@ -48,6 +55,26 @@ class PulseStreamerProbeNames:
     loop_start_addr: str = "zlc_loop_start_addr"
     loop_end_tick: str = "zlc_loop_end_tick"
     loop_count: str = "zlc_loop_count"
+    prog_tick_x_coeff: str = "zlc_prog_tick_x_coeff"
+    prog_tick_y_coeff: str = "zlc_prog_tick_y_coeff"
+    scan_enable: str = "zlc_scan_enable"
+    scan_prog_we: str = "zlc_scan_prog_we"
+    scan_prog_addr: str = "zlc_scan_prog_addr"
+    scan_prog_x: str = "zlc_scan_prog_x"
+    scan_prog_y: str = "zlc_scan_prog_y"
+    scan_prog_bus_values: str = "zlc_scan_prog_bus_values"
+    scan_count: str = "zlc_scan_count"
+    loop_end_x_coeff: str = "zlc_loop_end_x_coeff"
+    loop_end_y_coeff: str = "zlc_loop_end_y_coeff"
+    bus_prog_we: str = "zlc_bus_prog_we"
+    bus_prog_bus: str = "zlc_bus_prog_bus"
+    bus_prog_addr: str = "zlc_bus_prog_addr"
+    bus_prog_start_tick: str = "zlc_bus_prog_start_tick"
+    bus_prog_stop_tick: str = "zlc_bus_prog_stop_tick"
+    bus_prog_start_value: str = "zlc_bus_prog_start_value"
+    bus_prog_stop_value: str = "zlc_bus_prog_stop_value"
+    bus_prog_mode: str = "zlc_bus_prog_mode"
+    bus_counts: str = "zlc_bus_counts"
     running: str = "zlc_running"
     done: str = "zlc_done"
 
@@ -64,6 +91,33 @@ def hardware_channel_names(count: int = DEFAULT_FPGA_CHANNEL_COUNT) -> list[str]
 
     count = _positive_int(count, "count")
     return [f"ch{index:02d}" for index in range(count)]
+
+
+def _xdc_ports(text: str) -> list[str]:
+    ports: list[str] = []
+    pattern = re.compile(r"get_ports\s+(?:\{([^}]+)\}|([A-Za-z_][A-Za-z0-9_\[\]]*))\s*\]")
+    for match in pattern.finditer(text):
+        port = (match.group(1) or match.group(2) or "").strip()
+        if port:
+            ports.append(port)
+    return ports
+
+
+def _xdc_output_port_labels(text: str) -> list[str]:
+    labels: list[str] = []
+    seen: set[str] = set()
+    for port in _xdc_ports(text):
+        if re.fullmatch(r"ch\[\d+\]", port):
+            continue
+        if port == "clk" or port.startswith("led[") or re.fullmatch(r"GND\d*", port, re.IGNORECASE):
+            continue
+        if port in CONTROL_PORTS or port in {"zlc_running_led", "zlc_done_led"}:
+            continue
+        if port in seen:
+            continue
+        seen.add(port)
+        labels.append(port)
+    return labels
 
 
 def infer_xdc_channel_count(
@@ -85,12 +139,15 @@ def infer_xdc_channel_count(
         return default
     text = path.read_text(encoding="utf-8", errors="replace")
     indices = [int(match.group(1)) for match in re.finditer(r"get_ports\s+\{?ch\[(\d+)\]\}?", text)]
-    if not indices:
-        return default
-    count = max(indices) + 1
-    missing = sorted(set(range(count)) - set(indices))
-    if missing:
-        raise ValueError(f"XDC channel constraints are not contiguous; missing ch indices: {missing}.")
+    if indices:
+        count = max(indices) + 1
+        missing = sorted(set(range(count)) - set(indices))
+        if missing:
+            raise ValueError(f"XDC channel constraints are not contiguous; missing ch indices: {missing}.")
+    else:
+        count = len(_xdc_output_port_labels(text))
+        if count <= 0:
+            return default
     if max_count is not None and count > int(max_count):
         raise ValueError(f"XDC defines {count} channels, above max_count={int(max_count)}.")
     return count
@@ -113,7 +170,7 @@ def infer_xdc_channel_labels(
     default: int = DEFAULT_FPGA_CHANNEL_COUNT,
     max_count: int | None = DEFAULT_FPGA_CHANNEL_COUNT,
 ) -> dict[str, str]:
-    """Return display labels parsed from ``zlc_pulse_streamer_40ch.xdc`` comments.
+    """Return display labels parsed from address-switch XDC comments.
 
     The hardware channel names stay ``ch00..`` in FPGA bit order.  Labels are
     only front-end names, parsed from comments such as ``;# ch04 <- cooling_pgc``.
@@ -126,10 +183,12 @@ def infer_xdc_channel_labels(
     if path is None or not path.exists():
         return labels
     text = path.read_text(encoding="utf-8", errors="replace")
+    ch_style = False
     for line in text.splitlines():
         port_match = re.search(r"get_ports\s+\{?ch\[(\d+)\]\}?", line)
         if not port_match:
             continue
+        ch_style = True
         channel = f"ch{int(port_match.group(1)):02d}"
         if channel not in labels:
             continue
@@ -141,20 +200,93 @@ def infer_xdc_channel_labels(
         label = _label_from_xdc_comment(comment, channel)
         if label:
             labels[channel] = label
+    if ch_style:
+        return labels
+    for index, label in enumerate(_xdc_output_port_labels(text)):
+        channel = f"ch{index:02d}"
+        if channel in labels:
+            labels[channel] = label
     return labels
+
+
+def infer_xdc_channel_pins(
+    xdc_path: str | Path | None = None,
+    *,
+    default: int = DEFAULT_FPGA_CHANNEL_COUNT,
+    max_count: int | None = DEFAULT_FPGA_CHANNEL_COUNT,
+) -> dict[str, str]:
+    """Return FPGA package pins for inferred ``chNN`` hardware channels."""
+
+    channels = infer_xdc_channels(xdc_path, default=default, max_count=max_count)
+    pins = {channel: channel for channel in channels}
+    path = _resolve_xdc_path(xdc_path)
+    if path is None or not path.exists():
+        return pins
+    text = path.read_text(encoding="utf-8", errors="replace")
+    labels = infer_xdc_channel_labels(xdc_path, default=default, max_count=max_count)
+    label_to_channel = {label: channel for channel, label in labels.items()}
+    for line in text.splitlines():
+        pin_match = re.search(r"PACKAGE_PIN\s+([A-Za-z0-9_]+)", line)
+        ports = _xdc_ports(line)
+        if not pin_match or not ports:
+            continue
+        pin = pin_match.group(1)
+        port = ports[0]
+        channel = None
+        ch_match = re.fullmatch(r"ch\[(\d+)\]", port)
+        if ch_match:
+            channel = f"ch{int(ch_match.group(1)):02d}"
+        else:
+            channel = label_to_channel.get(port)
+        if channel in pins:
+            pins[channel] = pin
+    return pins
+
+
+def infer_xdc_trigger_channels(
+    xdc_path: str | Path | None = None,
+    *,
+    default: int = DEFAULT_FPGA_CHANNEL_COUNT,
+    max_count: int | None = None,
+    preferred_labels: Sequence[str] = ("emccd",),
+) -> list[str]:
+    """Infer hardware trigger channels from XDC display labels.
+
+    The returned names are hardware bit names such as ``ch11``.  The default
+    camera trigger is the physical ``emCCD`` output; labels such as ``trig``
+    remain ordinary output names and are not selected implicitly.
+    """
+
+    labels = infer_xdc_channel_labels(xdc_path, default=default, max_count=max_count)
+    preferred = [str(label).strip().lower() for label in preferred_labels if str(label).strip()]
+    for target in preferred:
+        for channel, label in labels.items():
+            if str(label).strip().lower() == target:
+                return [channel]
+    return []
 
 
 def validate_pulse_streamer_program(
     program: RuntimeSequenceProgram,
     *,
     max_edges: int = DEFAULT_MAX_EDGES,
+    max_scan_points: int = DEFAULT_MAX_SCAN_POINTS,
+    max_bus_segments: int = DEFAULT_MAX_BUS_SEGMENTS,
     tick_width: int = DEFAULT_TICK_WIDTH,
     channel_count: int | None = None,
+    coeff_width: int = DEFAULT_SCAN_COEFF_WIDTH,
+    bus_count: int = DEFAULT_BUS_COUNT,
+    bus_width: int = DEFAULT_BUS_WIDTH,
 ) -> None:
     """Validate that a runtime edge table fits the fixed FPGA streamer."""
 
     max_edges = _positive_int(max_edges, "max_edges")
+    max_scan_points = _positive_int(max_scan_points, "max_scan_points")
+    max_bus_segments = _positive_int(max_bus_segments, "max_bus_segments")
     tick_width = _positive_int(tick_width, "tick_width")
+    coeff_width = _positive_int(coeff_width, "coeff_width")
+    bus_count = _positive_int(bus_count, "bus_count")
+    bus_width = _positive_int(bus_width, "bus_width")
     channel_count = len(program.channels) if channel_count is None else _positive_int(channel_count, "channel_count")
     if len(set(program.channels)) != len(program.channels):
         raise ValueError("program channels must be unique.")
@@ -166,10 +298,13 @@ def validate_pulse_streamer_program(
         raise ValueError(f"program uses {len(program.channels)} channels, but the FPGA streamer has {channel_count}.")
     tick_limit = (1 << tick_width) - 1
     mask_limit = (1 << channel_count) - 1
+    scan_points = list(getattr(program, "scan_points", None) or [])
+    scan_bus_values = list(getattr(program, "scan_bus_values", None) or [])
+    require_base_ticks_increasing = not scan_points
     last_tick = -1
     for tick in program.ticks:
         tick = int(tick)
-        if tick <= last_tick:
+        if require_base_ticks_increasing and tick <= last_tick:
             raise ValueError("program ticks must be strictly increasing.")
         if tick < 0 or tick > tick_limit:
             raise ValueError(f"program tick {tick} does not fit {tick_width} bits.")
@@ -180,6 +315,69 @@ def validate_pulse_streamer_program(
             raise ValueError(f"program mask {mask} does not fit {channel_count} channels.")
     if program.masks and int(program.masks[-1]) != 0:
         raise ValueError("program final mask must be 0 so the streamer returns to a safe idle state.")
+    bus_segments = list(getattr(program, "bus_segments", None) or [])
+    if bus_segments and scan_points:
+        raise ValueError("program cannot combine scan_points with bus_segments in the current FPGA bitstream.")
+    if scan_bus_values and not scan_points:
+        raise ValueError("scan_bus_values require scan_points rows.")
+    if scan_bus_values and len(scan_bus_values) != len(scan_points):
+        raise ValueError("scan_bus_values length must match scan_points length.")
+    scan_bus_value_limit = (1 << (bus_count * bus_width)) - 1
+    for point_index, value in enumerate(scan_bus_values):
+        value = int(value)
+        if value < 0 or value > scan_bus_value_limit:
+            raise ValueError(f"scan_bus_values[{point_index}] does not fit {bus_count * bus_width} bits.")
+    bus_segment_counts = [0 for _ in range(bus_count)]
+    bus_value_limit = (1 << bus_width) - 1
+    for index, segment in enumerate(bus_segments):
+        bus_index = int(getattr(segment, "bus_index", segment.get("bus_index") if isinstance(segment, Mapping) else 0))
+        start_tick = int(getattr(segment, "start_tick", segment.get("start_tick") if isinstance(segment, Mapping) else 0))
+        stop_tick = int(getattr(segment, "stop_tick", segment.get("stop_tick", start_tick) if isinstance(segment, Mapping) else start_tick))
+        start_value = int(getattr(segment, "start_value", segment.get("start_value", 0) if isinstance(segment, Mapping) else 0))
+        stop_value = int(getattr(segment, "stop_value", segment.get("stop_value", start_value) if isinstance(segment, Mapping) else start_value))
+        mode = str(getattr(segment, "mode", segment.get("mode", "edge") if isinstance(segment, Mapping) else "edge")).lower()
+        if bus_index < 0 or bus_index >= bus_count:
+            raise ValueError(f"bus segment {index} bus_index {bus_index} is outside bus_count={bus_count}.")
+        if start_tick < 0 or stop_tick < start_tick or stop_tick > tick_limit:
+            raise ValueError(f"bus segment {index} has invalid tick range {start_tick}..{stop_tick}.")
+        if start_value < 0 or start_value > bus_value_limit or stop_value < 0 or stop_value > bus_value_limit:
+            raise ValueError(f"bus segment {index} value does not fit {bus_width} bits.")
+        if mode not in {"edge", "ramp"}:
+            raise ValueError(f"bus segment {index} has unsupported mode {mode!r}.")
+        bus_segment_counts[bus_index] += 1
+        if bus_segment_counts[bus_index] > max_bus_segments:
+            raise ValueError(f"bus {bus_index} has {bus_segment_counts[bus_index]} segments, above max_bus_segments={max_bus_segments}.")
+    if bus_segments and (int(getattr(program, "loop_count", 1)) > 1 and int(getattr(program, "loop_start_index", 0)) != 0):
+        raise ValueError("bus_segments do not currently support finite inner repeat brackets.")
+    tick_x_coeffs = list(getattr(program, "tick_x_coeffs", None) or [0 for _ in program.ticks])
+    tick_y_coeffs = list(getattr(program, "tick_y_coeffs", None) or [0 for _ in program.ticks])
+    if len(tick_x_coeffs) != len(program.ticks) or len(tick_y_coeffs) != len(program.ticks):
+        raise ValueError("scan tick coefficient arrays must match the edge table length.")
+    coeff_min = -(1 << (coeff_width - 1))
+    coeff_max = (1 << (coeff_width - 1)) - 1
+    for coeff in [*tick_x_coeffs, *tick_y_coeffs, int(getattr(program, "loop_end_x_coeff", 0)), int(getattr(program, "loop_end_y_coeff", 0))]:
+        if int(coeff) < coeff_min or int(coeff) > coeff_max:
+            raise ValueError(f"scan coefficient {int(coeff)} does not fit signed {coeff_width} bits.")
+    frac_bits = int(getattr(program, "scan_coeff_frac_bits", DEFAULT_SCAN_COEFF_FRAC_BITS))
+    if scan_points:
+        if len(scan_points) > max_scan_points:
+            raise ValueError(f"program has {len(scan_points)} scan points, but the FPGA streamer only accepts {max_scan_points}.")
+        signed_tick_min = -(1 << (tick_width - 1))
+        signed_tick_max = (1 << (tick_width - 1)) - 1
+        for point_index, point in enumerate(scan_points):
+            if len(point) != 2:
+                raise ValueError(f"scan row {point_index} must contain two timing-axis tick slots.")
+            x_tick, y_tick = int(point[0]), int(point[1])
+            if x_tick < signed_tick_min or x_tick > signed_tick_max or y_tick < signed_tick_min or y_tick > signed_tick_max:
+                raise ValueError(f"scan row {point_index} timing-axis tick does not fit signed {tick_width} bits.")
+            last_effective_tick = -1
+            for tick, x_coeff, y_coeff in zip(program.ticks, tick_x_coeffs, tick_y_coeffs):
+                effective_tick = _apply_scan_tick(tick, x_coeff, y_coeff, x_tick, y_tick, frac_bits)
+                if effective_tick <= last_effective_tick:
+                    raise ValueError(f"scan row {point_index} produces non-increasing effective edge ticks.")
+                if effective_tick < 0 or effective_tick > tick_limit:
+                    raise ValueError(f"scan row {point_index} effective tick {effective_tick} does not fit {tick_width} bits.")
+                last_effective_tick = effective_tick
     loop_count = int(getattr(program, "loop_count", 1))
     loop_start_index = int(getattr(program, "loop_start_index", 0))
     loop_end_tick = int(getattr(program, "loop_end_tick", 0))
@@ -191,12 +389,76 @@ def validate_pulse_streamer_program(
             raise ValueError("hardware repeat requires at least one uploaded edge.")
         if loop_start_index < 0 or loop_start_index >= len(program.ticks):
             raise ValueError("program loop_start_index must select an uploaded edge.")
-        if loop_end_tick <= int(program.ticks[loop_start_index]):
-            raise ValueError("program loop_end_tick must be after the loop start tick.")
-        if loop_end_tick > int(program.ticks[-1]):
-            raise ValueError("program loop_end_tick must not exceed the uploaded final tick.")
         if loop_end_tick > tick_limit:
             raise ValueError(f"program loop_end_tick {loop_end_tick} does not fit {tick_width} bits.")
+        if scan_points:
+            loop_end_x_coeff = int(getattr(program, "loop_end_x_coeff", 0))
+            loop_end_y_coeff = int(getattr(program, "loop_end_y_coeff", 0))
+            for point_index, (x_tick, y_tick) in enumerate(scan_points):
+                loop_start_tick = _apply_scan_tick(
+                    program.ticks[loop_start_index],
+                    tick_x_coeffs[loop_start_index],
+                    tick_y_coeffs[loop_start_index],
+                    x_tick,
+                    y_tick,
+                    frac_bits,
+                )
+                effective_loop_end = _apply_scan_tick(loop_end_tick, loop_end_x_coeff, loop_end_y_coeff, x_tick, y_tick, frac_bits)
+                effective_final = _apply_scan_tick(program.ticks[-1], tick_x_coeffs[-1], tick_y_coeffs[-1], x_tick, y_tick, frac_bits)
+                if effective_loop_end <= loop_start_tick:
+                    raise ValueError(f"scan row {point_index} loop_end_tick must be after the loop start tick.")
+                if effective_loop_end > effective_final:
+                    raise ValueError(f"scan row {point_index} loop_end_tick must not exceed the uploaded final tick.")
+        else:
+            if loop_end_tick <= int(program.ticks[loop_start_index]):
+                raise ValueError("program loop_end_tick must be after the loop start tick.")
+            if loop_end_tick > int(program.ticks[-1]):
+                raise ValueError("program loop_end_tick must not exceed the uploaded final tick.")
+
+
+def capacity_estimate_text(
+    *,
+    channel_count: int = DEFAULT_FPGA_CHANNEL_COUNT,
+    max_edges: int = DEFAULT_MAX_EDGES,
+    max_scan_points: int = DEFAULT_MAX_SCAN_POINTS,
+    tick_width: int = DEFAULT_TICK_WIDTH,
+    target_pct: float = 70.0,
+) -> str:
+    """Return a conservative capacity note for the configured FPGA profile."""
+
+    channel_count = _positive_int(channel_count, "channel_count")
+    max_edges = _positive_int(max_edges, "max_edges")
+    max_scan_points = _positive_int(max_scan_points, "max_scan_points")
+    tick_width = _positive_int(tick_width, "tick_width")
+    target_pct = float(target_pct)
+    lut_total = 20_800
+    bram_total = 50
+    baseline_lut = 2406.0
+    baseline_edges = 1024.0
+    baseline_row_bits = 32.0 + 40.0
+    fixed_lut = max(900.0, baseline_lut - (baseline_edges * baseline_row_bits / 64.0))
+    scan_row_bits = tick_width + channel_count + 2 * DEFAULT_SCAN_COEFF_WIDTH
+    point_bits = 2 * tick_width + DEFAULT_BUS_COUNT * DEFAULT_BUS_WIDTH
+    lut_budget = lut_total * max(1.0, min(95.0, target_pct)) / 100.0
+    usable_lutram = max(0.0, lut_budget - fixed_lut)
+    configured_lutram = (max_edges * scan_row_bits + max_scan_points * point_bits) / 64.0
+    configured_lut_est = fixed_lut + configured_lutram
+    max_edges_if_points_fixed = max(0, int((usable_lutram * 64.0 - max_scan_points * point_bits) // scan_row_bits))
+    max_points_if_edges_fixed = max(0, int((usable_lutram * 64.0 - max_edges * scan_row_bits) // point_bits))
+    bram_for_points = math.ceil(max_scan_points * point_bits / 36_864)
+    return "\n".join(
+        [
+            "ZLC pulse-streamer capacity estimate",
+            f"  target:          {target_pct:g}% LUT budget ({lut_budget:.0f}/{lut_total})",
+            f"  configured:      channels={channel_count} edges={max_edges} scan_rows={max_scan_points} tick_width={tick_width}",
+            f"  row bits:        edge_template={scan_row_bits} scan_pair_plus_bus={point_bits}",
+            f"  LUT estimate:    {configured_lut_est:.0f}/{lut_total} ({configured_lut_est / lut_total * 100.0:.1f}%)",
+            f"  at target:       with {max_scan_points} scan rows, approx max_edges={max_edges_if_points_fixed}",
+            f"  at target:       with {max_edges} edges, approx max_scan_rows={max_points_if_edges_fixed}",
+            f"  BRAM note:       scan row plus DA-value RAM would be about {bram_for_points}/{bram_total} 36Kb blocks if mapped to BRAM",
+            "  final evidence:  use Vivado report_utilization after synthesis; this is a design-budget estimate.",
+        ]
+    )
 
 
 def generate_pulse_streamer_core(
@@ -204,7 +466,13 @@ def generate_pulse_streamer_core(
     module_name: str = "zlc_pulse_streamer",
     channel_count: int = len(DEFAULT_CHANNELS),
     max_edges: int = DEFAULT_MAX_EDGES,
+    max_scan_points: int = DEFAULT_MAX_SCAN_POINTS,
+    max_bus_segments: int = DEFAULT_MAX_BUS_SEGMENTS,
     tick_width: int = DEFAULT_TICK_WIDTH,
+    coeff_width: int = DEFAULT_SCAN_COEFF_WIDTH,
+    coeff_frac_bits: int = DEFAULT_SCAN_COEFF_FRAC_BITS,
+    bus_count: int = DEFAULT_BUS_COUNT,
+    bus_width: int = DEFAULT_BUS_WIDTH,
 ) -> str:
     """Return synthesizable Verilog for a runtime edge-table pulse streamer."""
 
@@ -212,164 +480,33 @@ def generate_pulse_streamer_core(
     channel_count = _positive_int(channel_count, "channel_count")
     tick_width = _positive_int(tick_width, "tick_width")
     edge_addr_width = _edge_addr_width(max_edges)
-    actual_edges = 1 << edge_addr_width
-    return f"""`timescale 1ns / 1ps
-// Generated by Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer.
-// Runtime-programmable edge-table pulse streamer.
-
-module {module_name} #(
-    parameter integer CHANNEL_COUNT = {channel_count},
-    parameter integer EDGE_ADDR_WIDTH = {edge_addr_width},
-    parameter integer TICK_WIDTH = {tick_width}
-)(
-    input wire clk,
-    input wire reset,
-    input wire start,
-    input wire prog_we,
-    input wire [EDGE_ADDR_WIDTH-1:0] prog_addr,
-    input wire [TICK_WIDTH-1:0] prog_tick,
-    input wire [CHANNEL_COUNT-1:0] prog_mask,
-    input wire [EDGE_ADDR_WIDTH:0] prog_count,
-    input wire repeat_forever,
-    input wire [EDGE_ADDR_WIDTH-1:0] loop_start_addr,
-    input wire [TICK_WIDTH-1:0] loop_end_tick,
-    input wire [31:0] loop_count,
-    output wire [CHANNEL_COUNT-1:0] out,
-    output reg running = 1'b0,
-    output reg done = 1'b0
-);
-
-    localparam integer MAX_EDGES = {actual_edges};
-
-    // Keep the runtime read side to one table address.  Vivado otherwise has
-    // to synthesize a multi-read-port memory, which is expensive on Artix-7.
-    (* ram_style = "distributed" *) reg [TICK_WIDTH-1:0] tick_mem [0:MAX_EDGES-1];
-    (* ram_style = "distributed" *) reg [CHANNEL_COUNT-1:0] mask_mem [0:MAX_EDGES-1];
-
-    reg [CHANNEL_COUNT-1:0] state_mask = {{CHANNEL_COUNT{{1'b0}}}};
-    reg [TICK_WIDTH-1:0] time_count = {{TICK_WIDTH{{1'b0}}}};
-    reg [TICK_WIDTH-1:0] final_tick = {{TICK_WIDTH{{1'b0}}}};
-    reg [TICK_WIDTH-1:0] first_tick_shadow = {{TICK_WIDTH{{1'b0}}}};
-    reg [CHANNEL_COUNT-1:0] first_mask_shadow = {{CHANNEL_COUNT{{1'b0}}}};
-    reg [TICK_WIDTH-1:0] loop_start_tick_shadow = {{TICK_WIDTH{{1'b0}}}};
-    reg [CHANNEL_COUNT-1:0] loop_start_mask_shadow = {{CHANNEL_COUNT{{1'b0}}}};
-    reg [TICK_WIDTH-1:0] final_tick_shadow = {{TICK_WIDTH{{1'b0}}}};
-    reg [EDGE_ADDR_WIDTH:0] edge_index = {{(EDGE_ADDR_WIDTH + 1){{1'b0}}}};
-    reg [EDGE_ADDR_WIDTH:0] active_count = {{(EDGE_ADDR_WIDTH + 1){{1'b0}}}};
-    reg repeat_forever_active = 1'b0;
-    reg [EDGE_ADDR_WIDTH-1:0] loop_start_active = {{EDGE_ADDR_WIDTH{{1'b0}}}};
-    reg [TICK_WIDTH-1:0] loop_end_active = {{TICK_WIDTH{{1'b0}}}};
-    reg [31:0] loop_count_active = 32'd1;
-    reg [31:0] loops_remaining = 32'd1;
-
-    reg reset_meta = 1'b0;
-    reg reset_sync = 1'b0;
-    reg start_meta = 1'b0;
-    reg start_sync = 1'b0;
-    reg start_prev = 1'b0;
-    reg prog_we_meta = 1'b0;
-    reg prog_we_sync = 1'b0;
-    reg prog_we_prev = 1'b0;
-
-    wire start_event = start_sync && !start_prev;
-    wire prog_we_event = prog_we_sync != prog_we_prev;
-    wire [EDGE_ADDR_WIDTH-1:0] edge_addr = edge_index[EDGE_ADDR_WIDTH-1:0];
-
-    assign out = state_mask;
-
-    always @(posedge clk) begin
-        reset_meta <= reset;
-        reset_sync <= reset_meta;
-        start_meta <= start;
-        start_sync <= start_meta;
-        start_prev <= start_sync;
-        prog_we_meta <= prog_we;
-        prog_we_sync <= prog_we_meta;
-        prog_we_prev <= prog_we_sync;
-
-        if (reset_sync && prog_we_event) begin
-            tick_mem[prog_addr] <= prog_tick;
-            mask_mem[prog_addr] <= prog_mask;
-            if (prog_addr == {{EDGE_ADDR_WIDTH{{1'b0}}}}) begin
-                first_tick_shadow <= prog_tick;
-                first_mask_shadow <= prog_mask;
-            end
-            if (prog_addr == loop_start_addr) begin
-                loop_start_tick_shadow <= prog_tick;
-                loop_start_mask_shadow <= prog_mask;
-            end
-            if (prog_count != 0 && prog_addr == (prog_count[EDGE_ADDR_WIDTH-1:0] - 1'b1)) begin
-                final_tick_shadow <= prog_tick;
-            end
-        end
-
-        if (reset_sync) begin
-            running <= 1'b0;
-            done <= 1'b0;
-            state_mask <= {{CHANNEL_COUNT{{1'b0}}}};
-            time_count <= {{TICK_WIDTH{{1'b0}}}};
-            final_tick <= {{TICK_WIDTH{{1'b0}}}};
-            edge_index <= {{(EDGE_ADDR_WIDTH + 1){{1'b0}}}};
-            active_count <= {{(EDGE_ADDR_WIDTH + 1){{1'b0}}}};
-            repeat_forever_active <= 1'b0;
-            loop_start_active <= {{EDGE_ADDR_WIDTH{{1'b0}}}};
-            loop_end_active <= {{TICK_WIDTH{{1'b0}}}};
-            loop_count_active <= 32'd1;
-            loops_remaining <= 32'd1;
-        end else if (start_event && !running) begin
-            running <= (prog_count != 0);
-            done <= (prog_count == 0);
-            final_tick <= (prog_count == 0) ? {{TICK_WIDTH{{1'b0}}}} : final_tick_shadow;
-            active_count <= prog_count;
-            repeat_forever_active <= repeat_forever;
-            loop_start_active <= loop_start_addr;
-            loop_end_active <= loop_end_tick;
-            loop_count_active <= (loop_count == 0) ? 32'd1 : loop_count;
-            loops_remaining <= (loop_count == 0) ? 32'd1 : loop_count;
-            if (prog_count != 0 && first_tick_shadow == {{TICK_WIDTH{{1'b0}}}}) begin
-                state_mask <= first_mask_shadow;
-                time_count <= {{{{(TICK_WIDTH-1){{1'b0}}}}, 1'b1}};
-                edge_index <= {{{{EDGE_ADDR_WIDTH{{1'b0}}}}, 1'b1}};
-            end else begin
-                state_mask <= {{CHANNEL_COUNT{{1'b0}}}};
-                time_count <= {{TICK_WIDTH{{1'b0}}}};
-                edge_index <= {{(EDGE_ADDR_WIDTH + 1){{1'b0}}}};
-            end
-        end else if (running) begin
-            if (loop_count_active > 32'd1 && loops_remaining > 32'd1 && time_count >= loop_end_active) begin
-                state_mask <= loop_start_mask_shadow;
-                time_count <= loop_start_tick_shadow + 1'b1;
-                edge_index <= {{1'b0, loop_start_active}} + 1'b1;
-                loops_remaining <= loops_remaining - 1'b1;
-            end else if (time_count >= final_tick) begin
-                if (repeat_forever_active) begin
-                    if (first_tick_shadow == {{TICK_WIDTH{{1'b0}}}}) begin
-                        state_mask <= first_mask_shadow;
-                        time_count <= {{{{(TICK_WIDTH-1){{1'b0}}}}, 1'b1}};
-                        edge_index <= {{{{EDGE_ADDR_WIDTH{{1'b0}}}}, 1'b1}};
-                    end else begin
-                        state_mask <= {{CHANNEL_COUNT{{1'b0}}}};
-                        time_count <= {{TICK_WIDTH{{1'b0}}}};
-                        edge_index <= {{(EDGE_ADDR_WIDTH + 1){{1'b0}}}};
-                    end
-                    loops_remaining <= loop_count_active;
-                    done <= 1'b0;
-                end else begin
-                    running <= 1'b0;
-                    done <= 1'b1;
-                    state_mask <= {{CHANNEL_COUNT{{1'b0}}}};
-                end
-            end else begin
-                if (edge_index < active_count && time_count == tick_mem[edge_addr]) begin
-                    state_mask <= mask_mem[edge_addr];
-                    edge_index <= edge_index + 1'b1;
-                end
-                time_count <= time_count + 1'b1;
-            end
-        end
-    end
-endmodule
-"""
+    scan_addr_width = _edge_addr_width(max_scan_points)
+    bus_seg_addr_width = _edge_addr_width(max_bus_segments)
+    template_path = Path(__file__).resolve().parents[3] / "fpga" / "pulse_streamer" / "zlc_pulse_streamer.v"
+    if not template_path.exists():
+        raise FileNotFoundError(f"pulse-streamer HDL template not found: {template_path}")
+    text = template_path.read_text(encoding="utf-8")
+    text = re.sub(r"\bmodule\s+zlc_pulse_streamer\b", f"module {module_name}", text, count=1)
+    replacements = {
+        "CHANNEL_COUNT": channel_count,
+        "EDGE_ADDR_WIDTH": edge_addr_width,
+        "TICK_WIDTH": tick_width,
+        "SCAN_ADDR_WIDTH": scan_addr_width,
+        "COEFF_WIDTH": _positive_int(coeff_width, "coeff_width"),
+        "COEFF_FRAC_BITS": _positive_int(coeff_frac_bits, "coeff_frac_bits"),
+        "BUS_COUNT": _positive_int(bus_count, "bus_count"),
+        "BUS_INDEX_WIDTH": _edge_addr_width(bus_count),
+        "BUS_WIDTH": _positive_int(bus_width, "bus_width"),
+        "BUS_SEG_ADDR_WIDTH": bus_seg_addr_width,
+    }
+    for name, value in replacements.items():
+        text = re.sub(
+            rf"parameter integer {name} = \d+",
+            f"parameter integer {name} = {int(value)}",
+            text,
+            count=1,
+        )
+    return text
 
 
 def generate_pulse_streamer_top_example(
@@ -378,7 +515,12 @@ def generate_pulse_streamer_top_example(
     core_module_name: str = "zlc_pulse_streamer",
     top_module_name: str = "zlc_pulse_streamer_top_example",
     max_edges: int = DEFAULT_MAX_EDGES,
+    max_scan_points: int = DEFAULT_MAX_SCAN_POINTS,
+    max_bus_segments: int = DEFAULT_MAX_BUS_SEGMENTS,
     tick_width: int = DEFAULT_TICK_WIDTH,
+    coeff_width: int = DEFAULT_SCAN_COEFF_WIDTH,
+    bus_count: int = DEFAULT_BUS_COUNT,
+    bus_width: int = DEFAULT_BUS_WIDTH,
     probe_names: PulseStreamerProbeNames | None = None,
 ) -> str:
     """Return an example top module showing the VIO probe contract."""
@@ -398,6 +540,11 @@ def generate_pulse_streamer_top_example(
     }
     safe_channels = _safe_channel_identifiers(channels, reserved=reserved)
     edge_addr_width = _edge_addr_width(max_edges)
+    scan_addr_width = _edge_addr_width(max_scan_points)
+    bus_seg_addr_width = _edge_addr_width(max_bus_segments)
+    bus_index_width = _edge_addr_width(bus_count)
+    bus_counts_width = bus_count * (bus_seg_addr_width + 1)
+    scan_bus_values_width = bus_count * bus_width
     assigns = "\n".join(f"    assign {name} = out[{index}];" for index, name in enumerate(safe_channels))
     outputs = "\n".join(f"    output wire {name}," for name in safe_channels)
     return f"""`timescale 1ns / 1ps
@@ -414,6 +561,26 @@ def generate_pulse_streamer_top_example(
 //   probe_out8 {probe_names.loop_start_addr} width {edge_addr_width}
 //   probe_out9 {probe_names.loop_end_tick} width {tick_width}
 //   probe_out10 {probe_names.loop_count} width 32
+//   probe_out11 {probe_names.prog_tick_x_coeff} width {coeff_width}
+//   probe_out12 {probe_names.prog_tick_y_coeff} width {coeff_width}
+//   probe_out13 {probe_names.scan_enable} width 1
+//   probe_out14 {probe_names.scan_prog_we} width 1
+//   probe_out15 {probe_names.scan_prog_addr} width {scan_addr_width}
+//   probe_out16 {probe_names.scan_prog_x} width {tick_width}
+//   probe_out17 {probe_names.scan_prog_y} width {tick_width}
+//   probe_out18 {probe_names.scan_count} width {scan_addr_width + 1}
+//   probe_out19 {probe_names.loop_end_x_coeff} width {coeff_width}
+//   probe_out20 {probe_names.loop_end_y_coeff} width {coeff_width}
+//   probe_out21 {probe_names.bus_prog_we} width 1
+//   probe_out22 {probe_names.bus_prog_bus} width {bus_index_width}
+//   probe_out23 {probe_names.bus_prog_addr} width {bus_seg_addr_width}
+//   probe_out24 {probe_names.bus_prog_start_tick} width {tick_width}
+//   probe_out25 {probe_names.bus_prog_stop_tick} width {tick_width}
+//   probe_out26 {probe_names.bus_prog_start_value} width {bus_width}
+//   probe_out27 {probe_names.bus_prog_stop_value} width {bus_width}
+//   probe_out28 {probe_names.bus_prog_mode} width 2
+//   probe_out29 {probe_names.bus_counts} width {bus_counts_width}
+//   probe_out30 {probe_names.scan_prog_bus_values} width {scan_bus_values_width}
 //   probe_in0  {probe_names.running}    width 1
 //   probe_in1  {probe_names.done}       width 1
 
@@ -434,8 +601,29 @@ module {top_module_name}(
     wire {probe_names.repeat_forever};
     wire [{edge_addr_width - 1}:0] {probe_names.loop_start_addr};
     wire [{tick_width - 1}:0] {probe_names.loop_end_tick};
+    wire signed [{coeff_width - 1}:0] {probe_names.loop_end_x_coeff};
+    wire signed [{coeff_width - 1}:0] {probe_names.loop_end_y_coeff};
     wire [31:0] {probe_names.loop_count};
+    wire signed [{coeff_width - 1}:0] {probe_names.prog_tick_x_coeff};
+    wire signed [{coeff_width - 1}:0] {probe_names.prog_tick_y_coeff};
+    wire {probe_names.scan_enable};
+    wire {probe_names.scan_prog_we};
+    wire [{scan_addr_width - 1}:0] {probe_names.scan_prog_addr};
+    wire signed [{tick_width - 1}:0] {probe_names.scan_prog_x};
+    wire signed [{tick_width - 1}:0] {probe_names.scan_prog_y};
+    wire [{scan_bus_values_width - 1}:0] {probe_names.scan_prog_bus_values};
+    wire [{scan_addr_width}:0] {probe_names.scan_count};
+    wire {probe_names.bus_prog_we};
+    wire [{bus_index_width - 1}:0] {probe_names.bus_prog_bus};
+    wire [{bus_seg_addr_width - 1}:0] {probe_names.bus_prog_addr};
+    wire [{tick_width - 1}:0] {probe_names.bus_prog_start_tick};
+    wire [{tick_width - 1}:0] {probe_names.bus_prog_stop_tick};
+    wire [{bus_width - 1}:0] {probe_names.bus_prog_start_value};
+    wire [{bus_width - 1}:0] {probe_names.bus_prog_stop_value};
+    wire [1:0] {probe_names.bus_prog_mode};
+    wire [{bus_counts_width - 1}:0] {probe_names.bus_counts};
     wire [{len(channels) - 1}:0] out;
+    wire [{bus_count * bus_width - 1}:0] bus_out;
     wire {probe_names.running};
     wire {probe_names.done};
 
@@ -446,7 +634,14 @@ module {top_module_name}(
     {core_module_name} #(
         .CHANNEL_COUNT({len(channels)}),
         .EDGE_ADDR_WIDTH({edge_addr_width}),
-        .TICK_WIDTH({tick_width})
+        .TICK_WIDTH({tick_width}),
+        .SCAN_ADDR_WIDTH({scan_addr_width}),
+        .COEFF_WIDTH({coeff_width}),
+        .COEFF_FRAC_BITS({DEFAULT_SCAN_COEFF_FRAC_BITS}),
+        .BUS_COUNT({bus_count}),
+        .BUS_INDEX_WIDTH({bus_index_width}),
+        .BUS_WIDTH({bus_width}),
+        .BUS_SEG_ADDR_WIDTH({bus_seg_addr_width})
     ) zlc_streamer_i (
         .clk(clk),
         .reset({probe_names.reset}),
@@ -454,13 +649,34 @@ module {top_module_name}(
         .prog_we({probe_names.prog_we}),
         .prog_addr({probe_names.prog_addr}),
         .prog_tick({probe_names.prog_tick}),
+        .prog_tick_x_coeff({probe_names.prog_tick_x_coeff}),
+        .prog_tick_y_coeff({probe_names.prog_tick_y_coeff}),
         .prog_mask({probe_names.prog_mask}),
         .prog_count({probe_names.prog_count}),
         .repeat_forever({probe_names.repeat_forever}),
         .loop_start_addr({probe_names.loop_start_addr}),
         .loop_end_tick({probe_names.loop_end_tick}),
+        .loop_end_x_coeff({probe_names.loop_end_x_coeff}),
+        .loop_end_y_coeff({probe_names.loop_end_y_coeff}),
         .loop_count({probe_names.loop_count}),
+        .scan_enable({probe_names.scan_enable}),
+        .scan_prog_we({probe_names.scan_prog_we}),
+        .scan_prog_addr({probe_names.scan_prog_addr}),
+        .scan_prog_x({probe_names.scan_prog_x}),
+        .scan_prog_y({probe_names.scan_prog_y}),
+        .scan_prog_bus_values({probe_names.scan_prog_bus_values}),
+        .scan_count({probe_names.scan_count}),
+        .bus_prog_we({probe_names.bus_prog_we}),
+        .bus_prog_bus({probe_names.bus_prog_bus}),
+        .bus_prog_addr({probe_names.bus_prog_addr}),
+        .bus_prog_start_tick({probe_names.bus_prog_start_tick}),
+        .bus_prog_stop_tick({probe_names.bus_prog_stop_tick}),
+        .bus_prog_start_value({probe_names.bus_prog_start_value}),
+        .bus_prog_stop_value({probe_names.bus_prog_stop_value}),
+        .bus_prog_mode({probe_names.bus_prog_mode}),
+        .bus_counts({probe_names.bus_counts}),
         .out(out),
+        .bus_out(bus_out),
         .running({probe_names.running}),
         .done({probe_names.done})
     );
@@ -479,7 +695,27 @@ module {top_module_name}(
         .probe_out7({probe_names.repeat_forever}),
         .probe_out8({probe_names.loop_start_addr}),
         .probe_out9({probe_names.loop_end_tick}),
-        .probe_out10({probe_names.loop_count})
+        .probe_out10({probe_names.loop_count}),
+        .probe_out11({probe_names.prog_tick_x_coeff}),
+        .probe_out12({probe_names.prog_tick_y_coeff}),
+        .probe_out13({probe_names.scan_enable}),
+        .probe_out14({probe_names.scan_prog_we}),
+        .probe_out15({probe_names.scan_prog_addr}),
+        .probe_out16({probe_names.scan_prog_x}),
+        .probe_out17({probe_names.scan_prog_y}),
+        .probe_out18({probe_names.scan_count}),
+        .probe_out19({probe_names.loop_end_x_coeff}),
+        .probe_out20({probe_names.loop_end_y_coeff}),
+        .probe_out21({probe_names.bus_prog_we}),
+        .probe_out22({probe_names.bus_prog_bus}),
+        .probe_out23({probe_names.bus_prog_addr}),
+        .probe_out24({probe_names.bus_prog_start_tick}),
+        .probe_out25({probe_names.bus_prog_stop_tick}),
+        .probe_out26({probe_names.bus_prog_start_value}),
+        .probe_out27({probe_names.bus_prog_stop_value}),
+        .probe_out28({probe_names.bus_prog_mode}),
+        .probe_out29({probe_names.bus_counts}),
+        .probe_out30({probe_names.scan_prog_bus_values})
     );
 endmodule
 """
@@ -492,6 +728,8 @@ def write_pulse_streamer_hdl_bundle(
     core_module_name: str = "zlc_pulse_streamer",
     top_module_name: str = "zlc_pulse_streamer_top_example",
     max_edges: int = DEFAULT_MAX_EDGES,
+    max_scan_points: int = DEFAULT_MAX_SCAN_POINTS,
+    max_bus_segments: int = DEFAULT_MAX_BUS_SEGMENTS,
     tick_width: int = DEFAULT_TICK_WIDTH,
 ) -> PulseStreamerHDLFiles:
     """Write the pulse-streamer core, an example top, and a manifest."""
@@ -507,6 +745,8 @@ def write_pulse_streamer_hdl_bundle(
             module_name=core_module_name,
             channel_count=len(channels),
             max_edges=max_edges,
+            max_scan_points=max_scan_points,
+            max_bus_segments=max_bus_segments,
             tick_width=tick_width,
         ),
         encoding="utf-8",
@@ -518,6 +758,8 @@ def write_pulse_streamer_hdl_bundle(
             core_module_name=core_module_name,
             top_module_name=top_module_name,
             max_edges=max_edges,
+            max_scan_points=max_scan_points,
+            max_bus_segments=max_bus_segments,
             tick_width=tick_width,
         ),
         encoding="utf-8",
@@ -528,7 +770,13 @@ def write_pulse_streamer_hdl_bundle(
         "version": 1,
         "channels": channels,
         "max_edges": int(max_edges),
+        "max_scan_points": int(max_scan_points),
+        "max_bus_segments": int(max_bus_segments),
         "edge_addr_width": _edge_addr_width(max_edges),
+        "scan_addr_width": _edge_addr_width(max_scan_points),
+        "bus_seg_addr_width": _edge_addr_width(max_bus_segments),
+        "bus_count": DEFAULT_BUS_COUNT,
+        "bus_width": DEFAULT_BUS_WIDTH,
         "tick_width": int(tick_width),
         "core": core_path.name,
         "top_example": top_path.name,
@@ -550,6 +798,7 @@ def write_vivado_pulse_streamer_tcl(
     program_on_run: str | None = None,
     probe_names: PulseStreamerProbeNames | None = None,
     max_edges: int = DEFAULT_MAX_EDGES,
+    max_scan_points: int = DEFAULT_MAX_SCAN_POINTS,
     tick_width: int = DEFAULT_TICK_WIDTH,
     channel_count: int | None = None,
     timeout: float | None = None,
@@ -562,7 +811,13 @@ def write_vivado_pulse_streamer_tcl(
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if program is not None:
-        validate_pulse_streamer_program(program, max_edges=max_edges, tick_width=tick_width, channel_count=channel_count)
+        validate_pulse_streamer_program(
+            program,
+            max_edges=max_edges,
+            max_scan_points=max_scan_points,
+            tick_width=tick_width,
+            channel_count=channel_count,
+        )
     channel_count = len(program.channels) if channel_count is None and program is not None else _positive_int(channel_count or len(DEFAULT_CHANNELS), "channel_count")
 
     lines = _vivado_common_tcl(
@@ -610,6 +865,7 @@ class VivadoPulseStreamerSession:
         program_on_run: str | None = None,
         probe_names: PulseStreamerProbeNames | None = None,
         max_edges: int | None = None,
+        max_scan_points: int | None = None,
         tick_width: int | None = None,
         channel_count: int | None = None,
         startup_timeout: float = 90.0,
@@ -624,6 +880,7 @@ class VivadoPulseStreamerSession:
         self.program_on_run = program_on_run if program_on_run is not None else _env_first("ZLC_PS_VIVADO_PROGRAM_ON_RUN", "ZLC_VIVADO_PROGRAM_ON_RUN")
         self.probe_names = probe_names or PulseStreamerProbeNames()
         self.max_edges = _env_int("ZLC_PS_MAX_EDGES", DEFAULT_MAX_EDGES) if max_edges is None else _positive_int(max_edges, "max_edges")
+        self.max_scan_points = _env_int("ZLC_PS_MAX_SCAN_POINTS", DEFAULT_MAX_SCAN_POINTS) if max_scan_points is None else _positive_int(max_scan_points, "max_scan_points")
         self.tick_width = _env_int("ZLC_PS_TICK_WIDTH", DEFAULT_TICK_WIDTH) if tick_width is None else _positive_int(tick_width, "tick_width")
         self.channel_count = None if channel_count is None else _positive_int(channel_count, "channel_count")
         self.startup_timeout = float(startup_timeout)
@@ -671,7 +928,13 @@ class VivadoPulseStreamerSession:
 
     def prepare(self, program: RuntimeSequenceProgram) -> None:
         channel_count = len(program.channels) if self.channel_count is None else self.channel_count
-        validate_pulse_streamer_program(program, max_edges=self.max_edges, tick_width=self.tick_width, channel_count=channel_count)
+        validate_pulse_streamer_program(
+            program,
+            max_edges=self.max_edges,
+            max_scan_points=self.max_scan_points,
+            tick_width=self.tick_width,
+            channel_count=channel_count,
+        )
         self._write_program(program)
         previous = self._uploaded_program
         self._execute(_prepare_tcl(program, probe_names=self.probe_names, previous_program=previous), action="prepare", timeout=self.action_timeout)
@@ -809,6 +1072,7 @@ def run_action(
     dry_run: bool = False,
     timeout: float | None = None,
     max_edges: int | None = None,
+    max_scan_points: int | None = None,
     tick_width: int | None = None,
     channel_count: int | None = None,
 ) -> Path | None:
@@ -821,6 +1085,7 @@ def run_action(
     if action == "wait_done" and timeout is None:
         timeout = _optional_float(os.environ.get("ZLC_TIMEOUT"))
     max_edges = _env_int("ZLC_PS_MAX_EDGES", DEFAULT_MAX_EDGES) if max_edges is None else max_edges
+    max_scan_points = _env_int("ZLC_PS_MAX_SCAN_POINTS", DEFAULT_MAX_SCAN_POINTS) if max_scan_points is None else max_scan_points
     tick_width = _env_int("ZLC_PS_TICK_WIDTH", DEFAULT_TICK_WIDTH) if tick_width is None else tick_width
     if channel_count is None:
         channel_count = _env_int("ZLC_PS_CHANNEL_COUNT", len(program.channels) if program is not None else len(DEFAULT_CHANNELS))
@@ -835,6 +1100,7 @@ def run_action(
         vio_filter=os.environ.get("ZLC_PS_VIO_FILTER", os.environ.get("ZLC_VIO_FILTER", DEFAULT_VIO_FILTER)),
         program_on_run=_env_first("ZLC_PS_VIVADO_PROGRAM_ON_RUN", "ZLC_VIVADO_PROGRAM_ON_RUN"),
         max_edges=max_edges,
+        max_scan_points=max_scan_points,
         tick_width=tick_width,
         channel_count=channel_count,
         timeout=timeout,
@@ -866,8 +1132,10 @@ def build_arg_parser() -> ArgumentParser:
             "safe_state",
             "abort",
             "generate_hdl",
+            "capacity_estimate",
             "infer_channel_count",
             "infer_channels",
+            "infer_trigger_channels",
         ],
         nargs="?",
         default=None,
@@ -878,13 +1146,16 @@ def build_arg_parser() -> ArgumentParser:
     parser.add_argument("--timeout", type=float, default=None)
     parser.add_argument("--dry-run", action="store_true", help="Only write the generated Tcl file.")
     parser.add_argument("--max-edges", type=int, default=None)
+    parser.add_argument("--max-scan-points", type=int, default=None)
+    parser.add_argument("--max-bus-segments", type=int, default=None)
+    parser.add_argument("--resource-target-pct", type=float, default=None)
     parser.add_argument("--tick-width", type=int, default=None)
     parser.add_argument("--channel-count", type=int, default=None)
     parser.add_argument("--output-dir", default="generated_pulse_streamer")
     parser.add_argument("--channels", nargs="+", default=DEFAULT_CHANNELS)
     parser.add_argument("--xdc", default=None, help="Completed pulse-streamer XDC used to infer ch00.. width.")
     parser.add_argument("--default-count", type=int, default=DEFAULT_FPGA_CHANNEL_COUNT)
-    parser.add_argument("--max-channel-count", type=int, default=DEFAULT_FPGA_CHANNEL_COUNT)
+    parser.add_argument("--max-channel-count", type=int, default=None)
     return parser
 
 
@@ -896,17 +1167,31 @@ def main(argv=None) -> int:
             args.output_dir,
             channels=args.channels,
             max_edges=args.max_edges or _env_int("ZLC_PS_MAX_EDGES", DEFAULT_MAX_EDGES),
+            max_scan_points=args.max_scan_points or _env_int("ZLC_PS_MAX_SCAN_POINTS", DEFAULT_MAX_SCAN_POINTS),
+            max_bus_segments=args.max_bus_segments or _env_int("ZLC_PS_MAX_BUS_SEGMENTS", DEFAULT_MAX_BUS_SEGMENTS),
             tick_width=args.tick_width or _env_int("ZLC_PS_TICK_WIDTH", DEFAULT_TICK_WIDTH),
         )
         print(files.core_path)
         print(files.top_example_path)
         print(files.manifest_path)
         return 0
+    if action == "capacity_estimate":
+        print(capacity_estimate_text(
+            channel_count=args.channel_count or DEFAULT_FPGA_CHANNEL_COUNT,
+            max_edges=args.max_edges or _env_int("ZLC_PS_MAX_EDGES", DEFAULT_MAX_EDGES),
+            max_scan_points=args.max_scan_points or _env_int("ZLC_PS_MAX_SCAN_POINTS", DEFAULT_MAX_SCAN_POINTS),
+            tick_width=args.tick_width or _env_int("ZLC_PS_TICK_WIDTH", DEFAULT_TICK_WIDTH),
+            target_pct=args.resource_target_pct if args.resource_target_pct is not None else _env_float("ZLC_PS_RESOURCE_TARGET_PCT", 70.0),
+        ))
+        return 0
     if action == "infer_channel_count":
         print(infer_xdc_channel_count(args.xdc, default=args.default_count, max_count=args.max_channel_count))
         return 0
     if action == "infer_channels":
         print(" ".join(infer_xdc_channels(args.xdc, default=args.default_count, max_count=args.max_channel_count)))
+        return 0
+    if action == "infer_trigger_channels":
+        print(" ".join(infer_xdc_trigger_channels(args.xdc, default=args.default_count, max_count=args.max_channel_count)))
         return 0
     run_action(
         action,
@@ -916,6 +1201,7 @@ def main(argv=None) -> int:
         dry_run=args.dry_run,
         timeout=args.timeout,
         max_edges=args.max_edges,
+        max_scan_points=args.max_scan_points,
         tick_width=args.tick_width,
         channel_count=args.channel_count,
     )
@@ -955,7 +1241,7 @@ def _vivado_common_tcl(
         "    puts \"Vivado project not found; continuing without open_project: $project\"",
         "    set project \"\"",
         "}",
-        "if {$probes eq \"\"} { error \"Vivado .ltx probe file is required for VIO control. Set ZLC_PS_VIVADO_LTX to the Probes file used when programming the FPGA, or check the 40ch XDC pin map and run fpga/build_and_program.bat.\" }",
+        "if {$probes eq \"\"} { error \"Vivado .ltx probe file is required for VIO control. Set ZLC_PS_VIVADO_LTX to the Probes file used when programming the FPGA, or check the address-switch XDC pin map and run fpga/build_and_program.bat.\" }",
         "if {![file exists $probes]} { error \"Vivado probe file not found: $probes\" }",
         "if {$program_on_run ne \"0\" && ($bitstream eq \"\" || ![file exists $bitstream])} {",
         "    error \"Vivado bitstream not found for programming: $bitstream\"",
@@ -1030,7 +1316,7 @@ def _vivado_common_tcl(
         "        puts \"  NAME=[get_property NAME $candidate] CELL_NAME=[get_property CELL_NAME $candidate]\"",
         "    }",
         "    if {[llength $available_vios] == 0} {",
-        "        error \"No VIO core was found on the FPGA. The current FPGA image is not the ZLC pulse-streamer bitstream, or the matching .ltx probes were not loaded. Program zlc_pulse_streamer_top_40ch.bit with zlc_pulse_streamer_top_40ch.ltx, or set ZLC_PS_VIVADO_LTX to the exact Probes file used in Vivado Program Device.\"",
+        "        error \"No VIO core was found on the FPGA. The current FPGA image is not the ZLC pulse-streamer bitstream, or the matching .ltx probes were not loaded. Program zlc_pulse_streamer_top_address_switch.bit with zlc_pulse_streamer_top_address_switch.ltx, or set ZLC_PS_VIVADO_LTX to the exact Probes file used in Vivado Program Device.\"",
         "    }",
         "    error \"No VIO core matched filter '$vio_filter'.\"",
         "}",
@@ -1131,6 +1417,26 @@ def _vivado_common_tcl(
         f"set zlc_loop_start_addr_probe {{{probe_names.loop_start_addr} probe_out8}}",
         f"set zlc_loop_end_tick_probe {{{probe_names.loop_end_tick} probe_out9}}",
         f"set zlc_loop_count_probe {{{probe_names.loop_count} probe_out10}}",
+        f"set zlc_prog_tick_x_coeff_probe {{{probe_names.prog_tick_x_coeff} probe_out11}}",
+        f"set zlc_prog_tick_y_coeff_probe {{{probe_names.prog_tick_y_coeff} probe_out12}}",
+        f"set zlc_scan_enable_probe {{{probe_names.scan_enable} probe_out13}}",
+        f"set zlc_scan_prog_we_probe {{{probe_names.scan_prog_we} probe_out14}}",
+        f"set zlc_scan_prog_addr_probe {{{probe_names.scan_prog_addr} probe_out15}}",
+        f"set zlc_scan_prog_x_probe {{{probe_names.scan_prog_x} probe_out16}}",
+        f"set zlc_scan_prog_y_probe {{{probe_names.scan_prog_y} probe_out17}}",
+        f"set zlc_scan_count_probe {{{probe_names.scan_count} probe_out18}}",
+        f"set zlc_loop_end_x_coeff_probe {{{probe_names.loop_end_x_coeff} probe_out19}}",
+        f"set zlc_loop_end_y_coeff_probe {{{probe_names.loop_end_y_coeff} probe_out20}}",
+        f"set zlc_bus_prog_we_probe {{{probe_names.bus_prog_we} probe_out21}}",
+        f"set zlc_bus_prog_bus_probe {{{probe_names.bus_prog_bus} probe_out22}}",
+        f"set zlc_bus_prog_addr_probe {{{probe_names.bus_prog_addr} probe_out23}}",
+        f"set zlc_bus_prog_start_tick_probe {{{probe_names.bus_prog_start_tick} probe_out24}}",
+        f"set zlc_bus_prog_stop_tick_probe {{{probe_names.bus_prog_stop_tick} probe_out25}}",
+        f"set zlc_bus_prog_start_value_probe {{{probe_names.bus_prog_start_value} probe_out26}}",
+        f"set zlc_bus_prog_stop_value_probe {{{probe_names.bus_prog_stop_value} probe_out27}}",
+        f"set zlc_bus_prog_mode_probe {{{probe_names.bus_prog_mode} probe_out28}}",
+        f"set zlc_bus_counts_probe {{{probe_names.bus_counts} probe_out29}}",
+        f"set zlc_scan_prog_bus_values_probe {{{probe_names.scan_prog_bus_values} probe_out30}}",
         f"set zlc_running_probe {{{probe_names.running} probe_in0}}",
         f"set zlc_done_probe {{{probe_names.done} probe_in1}}",
     ]
@@ -1146,17 +1452,117 @@ def _prepare_edge_indices(program: RuntimeSequenceProgram, previous_program: Run
         return full
     if float(previous_program.clock_hz) != float(program.clock_hz):
         return full
+    previous_x_coeffs = list(previous_program.tick_x_coeffs or [0 for _ in previous_program.ticks])
+    previous_y_coeffs = list(previous_program.tick_y_coeffs or [0 for _ in previous_program.ticks])
+    current_x_coeffs = list(program.tick_x_coeffs or [0 for _ in program.ticks])
+    current_y_coeffs = list(program.tick_y_coeffs or [0 for _ in program.ticks])
     changed = {
         index
         for index, (tick, mask) in enumerate(zip(program.ticks, program.masks))
         if index >= len(previous_program.ticks)
         or index >= len(previous_program.masks)
+        or index >= len(previous_x_coeffs)
+        or index >= len(previous_y_coeffs)
+        or index >= len(current_x_coeffs)
+        or index >= len(current_y_coeffs)
         or int(previous_program.ticks[index]) != int(tick)
         or int(previous_program.masks[index]) != int(mask)
+        or int(previous_x_coeffs[index]) != int(current_x_coeffs[index])
+        or int(previous_y_coeffs[index]) != int(current_y_coeffs[index])
     }
     loop_start_index = int(program.loop_start_index) if program.ticks else 0
     critical = {0, max(0, min(loop_start_index, len(program.ticks) - 1)), len(program.ticks) - 1}
     return sorted(index for index in (changed | critical) if 0 <= index < len(program.ticks))
+
+
+def _prepare_scan_indices(program: RuntimeSequenceProgram, previous_program: RuntimeSequenceProgram | None = None) -> list[int]:
+    points = list(getattr(program, "scan_points", None) or [])
+    if not points:
+        return []
+    values = _scan_bus_values_for_program(program)
+    full = list(range(len(points)))
+    if previous_program is None:
+        return full
+    previous_points = list(getattr(previous_program, "scan_points", None) or [])
+    previous_values = _scan_bus_values_for_program(previous_program)
+    if len(previous_points) != len(points) or len(previous_values) != len(values):
+        return full
+    return [
+        index
+        for index, point in enumerate(points)
+        if index >= len(previous_points)
+        or int(previous_points[index][0]) != int(point[0])
+        or int(previous_points[index][1]) != int(point[1])
+        or int(previous_values[index]) != int(values[index])
+    ]
+
+
+def _scan_bus_values_for_program(program: RuntimeSequenceProgram) -> list[int]:
+    points = list(getattr(program, "scan_points", None) or [])
+    values = list(getattr(program, "scan_bus_values", None) or [])
+    if not points:
+        return []
+    if not values:
+        return [0 for _ in points]
+    return [int(value) for value in values]
+
+
+def _bus_segment_mode_value(mode: str) -> int:
+    mode = str(mode).strip().lower()
+    if mode == "edge":
+        return 1
+    if mode == "ramp":
+        return 2
+    raise ValueError(f"unsupported bus segment mode {mode!r}.")
+
+
+def _bus_segments_by_bus(program: RuntimeSequenceProgram, *, bus_count: int = DEFAULT_BUS_COUNT) -> list[list[object]]:
+    groups: list[list[object]] = [[] for _ in range(bus_count)]
+    for segment in list(getattr(program, "bus_segments", None) or []):
+        bus_index = int(getattr(segment, "bus_index", segment.get("bus_index") if isinstance(segment, Mapping) else 0))
+        if 0 <= bus_index < bus_count:
+            groups[bus_index].append(segment)
+    for bus_segments in groups:
+        bus_segments.sort(
+            key=lambda segment: (
+                int(getattr(segment, "start_tick", segment.get("start_tick") if isinstance(segment, Mapping) else 0)),
+                int(getattr(segment, "stop_tick", segment.get("stop_tick") if isinstance(segment, Mapping) else 0)),
+            )
+        )
+    return groups
+
+
+def _bus_counts_word(program: RuntimeSequenceProgram, *, bus_count: int = DEFAULT_BUS_COUNT, addr_width: int = 6) -> int:
+    word = 0
+    field_width = int(addr_width) + 1
+    for bus_index, segments in enumerate(_bus_segments_by_bus(program, bus_count=bus_count)):
+        word |= int(len(segments)) << (bus_index * field_width)
+    return word
+
+
+def _prepare_bus_rows(
+    program: RuntimeSequenceProgram,
+    previous_program: RuntimeSequenceProgram | None = None,
+    *,
+    bus_count: int = DEFAULT_BUS_COUNT,
+) -> list[tuple[int, int, object]]:
+    groups = _bus_segments_by_bus(program, bus_count=bus_count)
+    previous_groups = _bus_segments_by_bus(previous_program, bus_count=bus_count) if previous_program is not None else None
+    rows: list[tuple[int, int, object]] = []
+    for bus_index, segments in enumerate(groups):
+        previous_segments = [] if previous_groups is None else previous_groups[bus_index]
+        if previous_groups is not None and len(previous_segments) == len(segments):
+            changed = [
+                addr
+                for addr, segment in enumerate(segments)
+                if getattr(previous_segments[addr], "to_dict", lambda: previous_segments[addr])()
+                != getattr(segment, "to_dict", lambda: segment)()
+            ]
+        else:
+            changed = list(range(len(segments)))
+        for addr in changed:
+            rows.append((bus_index, addr, segments[addr]))
+    return rows
 
 
 def _prepare_tcl(
@@ -1168,11 +1574,20 @@ def _prepare_tcl(
     loop_end_tick = int(program.loop_end_tick) if int(program.loop_end_tick) > 0 else (int(program.ticks[-1]) if program.ticks else 0)
     loop_start_index = int(program.loop_start_index) if program.ticks else 0
     loop_count = max(1, int(program.loop_count))
+    tick_x_coeffs = list(program.tick_x_coeffs or [0 for _ in program.ticks])
+    tick_y_coeffs = list(program.tick_y_coeffs or [0 for _ in program.ticks])
+    scan_points = list(program.scan_points or [])
+    scan_bus_values = _scan_bus_values_for_program(program)
+    scan_indices = _prepare_scan_indices(program, previous_program)
     write_indices = _prepare_edge_indices(program, previous_program)
+    bus_rows = _prepare_bus_rows(program, previous_program)
+    bus_counts_word = _bus_counts_word(program)
     first_write_index = write_indices[0] if write_indices else None
     remaining_write_indices = write_indices[1:] if first_write_index is not None else []
     lines = [
         "set zlc_prog_we_toggle_value [zlc_output_probe_bool $vio $zlc_prog_we_probe]",
+        "set zlc_scan_prog_we_toggle_value [zlc_output_probe_bool $vio $zlc_scan_prog_we_probe]",
+        "set zlc_bus_prog_we_toggle_value [zlc_output_probe_bool $vio $zlc_bus_prog_we_probe]",
     ]
     lines.extend(
         [
@@ -1183,6 +1598,11 @@ def _prepare_tcl(
         f"lappend zlc_batch [zlc_stage_probe $vio $zlc_loop_start_addr_probe {loop_start_index}]",
         f"lappend zlc_batch [zlc_stage_probe $vio $zlc_loop_end_tick_probe {loop_end_tick}]",
         f"lappend zlc_batch [zlc_stage_probe $vio $zlc_loop_count_probe {loop_count}]",
+        f"lappend zlc_batch [zlc_stage_probe $vio $zlc_loop_end_x_coeff_probe {_signed_to_unsigned(int(getattr(program, 'loop_end_x_coeff', 0)), DEFAULT_SCAN_COEFF_WIDTH)}]",
+        f"lappend zlc_batch [zlc_stage_probe $vio $zlc_loop_end_y_coeff_probe {_signed_to_unsigned(int(getattr(program, 'loop_end_y_coeff', 0)), DEFAULT_SCAN_COEFF_WIDTH)}]",
+        f"lappend zlc_batch [zlc_stage_probe $vio $zlc_scan_enable_probe {1 if scan_points else 0}]",
+        f"lappend zlc_batch [zlc_stage_probe $vio $zlc_scan_count_probe {len(scan_points)}]",
+        f"lappend zlc_batch [zlc_stage_probe $vio $zlc_bus_counts_probe {bus_counts_word}]",
         f"lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_count_probe {len(program.ticks)}]",
         "zlc_commit_probes $zlc_batch",
         "set zlc_prepare_reset_settle_ms [expr {max(1, int([env_or ZLC_PS_PREPARE_RESET_SETTLE_MS 5]))}]",
@@ -1192,6 +1612,8 @@ def _prepare_tcl(
     if first_write_index is not None:
         tick = int(program.ticks[first_write_index])
         mask = int(program.masks[first_write_index])
+        x_coeff = _signed_to_unsigned(int(tick_x_coeffs[first_write_index]), DEFAULT_SCAN_COEFF_WIDTH)
+        y_coeff = _signed_to_unsigned(int(tick_y_coeffs[first_write_index]), DEFAULT_SCAN_COEFF_WIDTH)
         lines.extend(
             [
                 "set zlc_prog_we_toggle_value [expr {$zlc_prog_we_toggle_value ? 0 : 1}]",
@@ -1199,6 +1621,8 @@ def _prepare_tcl(
                 f"lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_addr_probe {first_write_index}]",
                 f"lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_tick_probe {tick}]",
                 f"lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_mask_probe {mask}]",
+                f"lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_tick_x_coeff_probe {x_coeff}]",
+                f"lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_tick_y_coeff_probe {y_coeff}]",
                 "lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_we_probe $zlc_prog_we_toggle_value]",
                 "zlc_commit_probes $zlc_batch",
             ]
@@ -1206,6 +1630,8 @@ def _prepare_tcl(
     for index in remaining_write_indices:
         tick = int(program.ticks[index])
         mask = int(program.masks[index])
+        x_coeff = _signed_to_unsigned(int(tick_x_coeffs[index]), DEFAULT_SCAN_COEFF_WIDTH)
+        y_coeff = _signed_to_unsigned(int(tick_y_coeffs[index]), DEFAULT_SCAN_COEFF_WIDTH)
         lines.extend(
             [
                 "set zlc_prog_we_toggle_value [expr {$zlc_prog_we_toggle_value ? 0 : 1}]",
@@ -1213,7 +1639,46 @@ def _prepare_tcl(
                 f"lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_addr_probe {index}]",
                 f"lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_tick_probe {tick}]",
                 f"lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_mask_probe {mask}]",
+                f"lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_tick_x_coeff_probe {x_coeff}]",
+                f"lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_tick_y_coeff_probe {y_coeff}]",
                 "lappend zlc_batch [zlc_stage_probe $vio $zlc_prog_we_probe $zlc_prog_we_toggle_value]",
+                "zlc_commit_probes $zlc_batch",
+            ]
+        )
+    for bus_index, bus_addr, segment in bus_rows:
+        start_tick = int(getattr(segment, "start_tick", segment.get("start_tick") if isinstance(segment, Mapping) else 0))
+        stop_tick = int(getattr(segment, "stop_tick", segment.get("stop_tick", start_tick) if isinstance(segment, Mapping) else start_tick))
+        start_value = int(getattr(segment, "start_value", segment.get("start_value", 0) if isinstance(segment, Mapping) else 0))
+        stop_value = int(getattr(segment, "stop_value", segment.get("stop_value", start_value) if isinstance(segment, Mapping) else start_value))
+        mode_value = _bus_segment_mode_value(str(getattr(segment, "mode", segment.get("mode", "edge") if isinstance(segment, Mapping) else "edge")))
+        lines.extend(
+            [
+                "set zlc_bus_prog_we_toggle_value [expr {$zlc_bus_prog_we_toggle_value ? 0 : 1}]",
+                "set zlc_batch {}",
+                f"lappend zlc_batch [zlc_stage_probe $vio $zlc_bus_prog_bus_probe {bus_index}]",
+                f"lappend zlc_batch [zlc_stage_probe $vio $zlc_bus_prog_addr_probe {bus_addr}]",
+                f"lappend zlc_batch [zlc_stage_probe $vio $zlc_bus_prog_start_tick_probe {start_tick}]",
+                f"lappend zlc_batch [zlc_stage_probe $vio $zlc_bus_prog_stop_tick_probe {stop_tick}]",
+                f"lappend zlc_batch [zlc_stage_probe $vio $zlc_bus_prog_start_value_probe {start_value}]",
+                f"lappend zlc_batch [zlc_stage_probe $vio $zlc_bus_prog_stop_value_probe {stop_value}]",
+                f"lappend zlc_batch [zlc_stage_probe $vio $zlc_bus_prog_mode_probe {mode_value}]",
+                "lappend zlc_batch [zlc_stage_probe $vio $zlc_bus_prog_we_probe $zlc_bus_prog_we_toggle_value]",
+                "zlc_commit_probes $zlc_batch",
+            ]
+        )
+    for index in scan_indices:
+        x_tick = _signed_to_unsigned(int(scan_points[index][0]), DEFAULT_TICK_WIDTH)
+        y_tick = _signed_to_unsigned(int(scan_points[index][1]), DEFAULT_TICK_WIDTH)
+        bus_values = int(scan_bus_values[index]) if index < len(scan_bus_values) else 0
+        lines.extend(
+            [
+                "set zlc_scan_prog_we_toggle_value [expr {$zlc_scan_prog_we_toggle_value ? 0 : 1}]",
+                "set zlc_batch {}",
+                f"lappend zlc_batch [zlc_stage_probe $vio $zlc_scan_prog_addr_probe {index}]",
+                f"lappend zlc_batch [zlc_stage_probe $vio $zlc_scan_prog_x_probe {x_tick}]",
+                f"lappend zlc_batch [zlc_stage_probe $vio $zlc_scan_prog_y_probe {y_tick}]",
+                f"lappend zlc_batch [zlc_stage_probe $vio $zlc_scan_prog_bus_values_probe {bus_values}]",
+                "lappend zlc_batch [zlc_stage_probe $vio $zlc_scan_prog_we_probe $zlc_scan_prog_we_toggle_value]",
                 "zlc_commit_probes $zlc_batch",
             ]
         )
@@ -1222,7 +1687,7 @@ def _prepare_tcl(
             "set zlc_batch {}",
             "lappend zlc_batch [zlc_stage_probe $vio $zlc_reset_probe 0]",
             "zlc_commit_probes $zlc_batch",
-            f"puts \"ZLC pulse-streamer prepared sequence {program.sequence_id} wrote {len(write_indices)}/{len(program.ticks)} edge rows reset_settle_ms=$zlc_prepare_reset_settle_ms repeat_forever={int(program.repeat_forever)} loop_start={loop_start_index} loop_end={loop_end_tick} loop_count={loop_count}\"",
+            f"puts \"ZLC pulse-streamer prepared sequence {program.sequence_id} wrote {len(write_indices)}/{len(program.ticks)} edge rows, {len(scan_indices)}/{len(scan_points)} scan points, and {len(bus_rows)}/{len(getattr(program, 'bus_segments', None) or [])} bus segments reset_settle_ms=$zlc_prepare_reset_settle_ms repeat_forever={int(program.repeat_forever)} scan={int(bool(scan_points))} loop_start={loop_start_index} loop_end={loop_end_tick} loop_count={loop_count} bus_counts={bus_counts_word}\"",
         ]
     )
     return lines
@@ -1277,6 +1742,7 @@ def _safe_state_tcl(*, probe_names: PulseStreamerProbeNames) -> list[str]:
         "set zlc_batch {}",
         "lappend zlc_batch [zlc_stage_probe $vio $zlc_start_probe 0]",
         "lappend zlc_batch [zlc_stage_probe $vio $zlc_repeat_forever_probe 0]",
+        "lappend zlc_batch [zlc_stage_probe $vio $zlc_scan_enable_probe 0]",
         "lappend zlc_batch [zlc_stage_probe $vio $zlc_reset_probe 1]",
         "zlc_commit_probes $zlc_batch",
         "puts \"ZLC pulse-streamer safe state requested\"",
@@ -1318,6 +1784,21 @@ def _edge_addr_width(max_edges: int) -> int:
     return max(1, (max_edges - 1).bit_length())
 
 
+def _apply_scan_tick(base_tick: int, x_coeff: int, y_coeff: int, x_tick: int, y_tick: int, frac_bits: int) -> int:
+    return int(base_tick) + ((int(x_coeff) * int(x_tick) + int(y_coeff) * int(y_tick)) >> int(frac_bits))
+
+
+def _signed_to_unsigned(value: int, width: int) -> int:
+    value = int(value)
+    width = int(width)
+    limit = 1 << width
+    if value < 0:
+        value = limit + value
+    if value < 0 or value >= limit:
+        raise ValueError(f"signed value does not fit {width} bits.")
+    return value
+
+
 def _safe_channel_identifiers(channels: Sequence[str], *, reserved: set[str]) -> list[str]:
     safe_channels = [safe_identifier(channel) for channel in channels]
     if len(set(safe_channels)) != len(safe_channels):
@@ -1340,7 +1821,7 @@ def _label_from_xdc_comment(comment: str, channel: str) -> str:
             text = right.strip()
     text = text.split(",", 1)[0].strip()
     if "/" in text:
-        text = text.split("/")[-1].strip()
+        text = text.split("/", 1)[0].strip()
     text = re.sub(r"\s+", "_", text)
     text = re.sub(r"[^0-9A-Za-z_\[\]-]+", "", text)
     return text
@@ -1371,6 +1852,14 @@ def _env_int(name: str, default: int) -> int:
     return int(default if raw is None or raw == "" else raw)
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    out = float(default if raw is None or raw == "" else raw)
+    if not math.isfinite(out):
+        raise ValueError(f"{name} must be finite.")
+    return out
+
+
 def _env_first(*names: str) -> str | None:
     for name in names:
         value = os.environ.get(name)
@@ -1399,7 +1888,7 @@ def _old_pulse_streamer_build_dir() -> Path:
 
 
 def _safe_project_dir(path: str | Path | None) -> Path:
-    fallback = _default_project_root() / "p40"
+    fallback = _default_project_root() / DEFAULT_PROJECT_NAME
     candidate = Path(path) if path else fallback
     if _path_is_under(candidate, _old_pulse_streamer_build_dir()):
         return fallback
@@ -1447,14 +1936,13 @@ def _resolve_vivado_artifacts(
 def _resolve_xdc_path(xdc_path: str | Path | None) -> Path | None:
     if xdc_path is not None and str(xdc_path).strip():
         return Path(xdc_path)
-    for env_name in ("ZLC_PS_40CH_XDC", "ZLC_PS_XDC"):
-        value = os.environ.get(env_name)
-        if value:
-            return Path(value)
-    cwd_candidate = Path.cwd() / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_40ch.xdc"
+    value = os.environ.get("ZLC_PS_XDC")
+    if value:
+        return Path(value)
+    cwd_candidate = Path.cwd() / "references" / "source_archives" / "address_switch" / "address_switch.srcs" / "constrs_1" / "new" / "addre.xdc"
     if cwd_candidate.exists():
         return cwd_candidate
-    package_candidate = Path(__file__).resolve().parents[3] / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_40ch.xdc"
+    package_candidate = Path(__file__).resolve().parents[3] / "references" / "source_archives" / "address_switch" / "address_switch.srcs" / "constrs_1" / "new" / "addre.xdc"
     if package_candidate.exists():
         return package_candidate
     return None
@@ -1467,17 +1955,23 @@ if __name__ == "__main__":  # pragma: no cover
 __all__ = [
     "DEFAULT_FPGA_CHANNEL_COUNT",
     "DEFAULT_MAX_EDGES",
+    "DEFAULT_MAX_SCAN_POINTS",
+    "DEFAULT_SCAN_COEFF_FRAC_BITS",
+    "DEFAULT_SCAN_COEFF_WIDTH",
     "DEFAULT_TICK_WIDTH",
     "DEFAULT_VIO_FILTER",
     "PulseStreamerHDLFiles",
     "PulseStreamerProbeNames",
     "build_arg_parser",
+    "capacity_estimate_text",
     "generate_pulse_streamer_core",
     "generate_pulse_streamer_top_example",
     "hardware_channel_names",
     "infer_xdc_channel_count",
     "infer_xdc_channel_labels",
+    "infer_xdc_channel_pins",
     "infer_xdc_channels",
+    "infer_xdc_trigger_channels",
     "main",
     "run_action",
     "validate_pulse_streamer_program",

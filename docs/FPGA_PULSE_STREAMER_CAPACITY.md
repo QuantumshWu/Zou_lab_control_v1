@@ -1,21 +1,18 @@
 # FPGA Pulse-Streamer Capacity Notes
 
-This note records the resource assumptions for the runtime-programmable
-`zlc_pulse_streamer` backend. It is intended for maintainers and future
-engineering agents, not as a user tutorial.
+This note records resource assumptions for the runtime-programmable
+`zlc_pulse_streamer` backend. It is maintainer-facing; user tutorials should use
+`docs/neutral_atom_hardware_manual/REAL_HARDWARE_RUNBOOK.md`.
 
 ## Identified FPGA
 
-The board label `ATK91131A` is not sufficient to estimate FPGA resources. Use
-the Vivado part name from the active hardware project instead.
-
-The historical `address_switch` Vivado project in `references/` targets:
+The historical address-switch Vivado project in `references/` targets:
 
 ```text
 xc7a35tfgg484-2
 ```
 
-That is an Artix-7 35T in an FGG484 package. The Artix-7 35T resource class is
+That is an Artix-7 35T in an FGG484 package. The resource class is
 approximately:
 
 ```text
@@ -24,249 +21,249 @@ CLB LUTs:    20,800
 CLB FFs:     41,600
 BRAM:        1,800 Kb = 50 x 36 Kb blocks
 DSP slices:  90
-max user I/O in this class: 250
 ```
 
-The existing XDC in the reference project already constrains 44 physical pins
-with `LVCMOS33`, including the old laser/control outputs and several 10-bit
-DAC-style buses.
+The checked-in address-switch XDC constrains the original named outputs,
+including `cooling`, `probe`, `trig`, `trap`, several shutter/control outputs,
+and four 10-bit TTL-style buses:
+
+```text
+da_dipole, da_bias_y, da_bias_x, da_bias_z
+```
+
+The runtime wrapper maps those XDC ports onto a contiguous `ch00..ch61`
+hardware channel order.  GUI visibility is independent from this hardware
+width; upload always pads to the full channel order.
 
 ## Runtime Design
 
-The pulse streamer does not store one row per named pulse. It compiles the
-entire `PulseSequence` into an edge table:
+The pulse streamer stores an edge table:
 
 ```text
 tick[i]: integer FPGA clock tick
 mask[i]: complete output state at that tick
 ```
 
-For `CHANNEL_COUNT = 40`, each mask is a 40-bit word. Bit 0 corresponds to
-`channels[0]`, bit 1 to `channels[1]`, and so on. When multiple channels change
-at the same physical time, they become one edge with a complete 40-bit state.
+Bit 0 corresponds to `channels[0]`, bit 1 to `channels[1]`, and so on.  When
+multiple channels change at the same physical time, they become one edge with a
+complete output mask.
 
-The generated core contains:
-
-```text
-tick_mem[MAX_EDGES]   // TICK_WIDTH bits per entry
-mask_mem[MAX_EDGES]   // CHANNEL_COUNT bits per entry
-state_mask            // current output state
-time_count            // free-running counter during a shot
-edge_index            // next edge to consume
-active_count          // number of uploaded edges
-```
-
-During `prepare`, the host writes the table into `tick_mem` and `mask_mem`.
-During `fire`, the host sends a low-high-low `start` pulse. The FPGA then runs by comparing
-`time_count` with `tick_mem[edge_index]`; when they match, it copies
-`mask_mem[edge_index]` into the output register and advances to the next edge.
-The checked-in runtime core also caches the first edge, loop-start edge, and
-final tick during upload.  That keeps the run path to one edge-table read
-address instead of several independent reads from `tick_mem/mask_mem`.
-
-For finite GUI repeat brackets, `loop_end_tick` is only the restart boundary
-while repeated loop cycles remain. The final uploaded row remains the table
-`final_tick`, so post-loop idle/cleanup periods still occur before a
-`repeat_forever` table restart.
-
-This also explains a common oscilloscope observation: if `repeat_forever=True`
-and a finite internal bracket is used, any high channel in period 0 will appear
-again once per full-table restart after the finite bracket count has finished.
-That table-boundary high is detectable in Python with
-`PulseTableState.repeat_forever_boundary_active_channels()`, and the pulse GUI
-shows it with the full-table restart interval in the summary line, for example
-`table restart high every 1.2 us: trap`.
-
-The shot-level timing is therefore clocked by the FPGA. Network, RPyC, Python,
-Vivado, and JTAG are only used before the shot starts, or to send the start
-command.
-
-## 40-Channel Feasibility
-
-A 40-channel pulse-streamer design is realistic for this FPGA class. The output
-state itself is only a 40-bit register plus 40 output pins. The edge table RAM is
-the meaningful resource.
-
-For the current generated design, each edge stores:
+The scan-capable core contains:
 
 ```text
-tick: 32 bits
-mask: CHANNEL_COUNT bits
+tick_mem[MAX_EDGES]       // base tick for each edge-template row
+axis0_coeff_mem[MAX_EDGES] // fixed-point coefficient for scan_axis_names[0]
+axis1_coeff_mem[MAX_EDGES] // fixed-point coefficient for scan_axis_names[1]
+mask_mem[MAX_EDGES]       // CHANNEL_COUNT bits per row
+scan_axis0_mem[MAX_SCAN]  // tick value for scan_axis_names[0]
+scan_axis1_mem[MAX_SCAN]  // tick value for scan_axis_names[1]
+scan_bus_value_mem[MAX_SCAN] // packed 4x10-bit static DA values
 ```
 
-For 40 channels, each edge is approximately 72 bits.
+For ordinary pulses, axis coefficients are zero. For hardware scans, the GUI/API
+uses named parameters and a linked table file. The host currently maps at most
+two active timing parameters onto the two hardware axes, preserving the names in
+`RuntimeSequenceProgram.scan_axis_names`:
 
-| MAX_EDGES | Edge table bits | Approx bytes | Approx 64x1 LUTRAM cells |
+```text
+# vars: camera_exposure_ns(ns), trig_delay(ns)
+2000 0
+4000 20
+
+scan_axis_names = ["camera_exposure_ns", "trig_delay"]
+hardware rows   = [(2000 ticks, 0 ticks), (4000 ticks, 20 ticks)]
+```
+
+The FPGA computes each edge time as:
+
+```text
+effective_tick = base_tick + ((axis0_coeff*axis0_tick + axis1_coeff*axis1_tick) >> frac_bits)
+```
+
+The FPGA never receives host-side names or separate per-parameter objects. Names
+are host metadata; the current bitstream receives two timing tick columns plus
+one packed static DA/bus value word per scan row.  Ramp-mode DA scans still use
+the non-scan bus-segment path and are not combined with scan rows.
+
+## Current Capacity Shape
+
+Each edge-template row stores:
+
+```text
+tick:        32 bits
+mask:        CHANNEL_COUNT bits
+axis0_coeff: 16 bits signed fixed point
+axis1_coeff: 16 bits signed fixed point
+```
+
+So the approximate row width is:
+
+```text
+edge_row_bits = 64 + CHANNEL_COUNT
+```
+
+For the current address-switch profile, `CHANNEL_COUNT=62`, so each edge row is
+about 126 bits.  Each scan row stores two timing ticks plus one packed 4x10-bit
+DA word, or 104 bits.
+
+Approximate memory scale:
+
+| MAX_EDGES | Edge-template bits | Approx bytes | Approx LUTRAM 64x1 cells |
 | --- | ---: | ---: | ---: |
-| 128 | 9,216 | 1.125 KiB | 144 |
-| 1024 | 73,728 | 9 KiB | 1,152 |
-| 4096 | 294,912 | 36 KiB | 4,608 |
-| 16384 | 1,179,648 | 144 KiB | 18,432 |
+| 128 | 16,128 | 1.97 KiB | 252 |
+| 1024 | 129,024 | 15.75 KiB | 2,016 |
+| 2048 | 258,048 | 31.5 KiB | 4,032 |
+| 4096 | 516,096 | 63 KiB | 8,064 |
 
-The HDL currently marks `tick_mem` and `mask_mem` as distributed RAM because the
-run path uses simple asynchronous reads. Earlier 40-channel experiments showed
-excessive LUT/FF use when the run logic read `tick_mem/mask_mem` from several
-addresses in the same cycle. The current core avoids that multi-read-port shape:
-metadata such as first edge, loop-start edge, and final tick is latched during
-upload, so the active shot reads only the current `edge_index` row. That makes a
-1024-row 40-channel operational profile practical to build and reason about,
-while keeping repeat brackets compact.
+The HDL currently marks `tick_mem`, `mask_mem`, and scan RAM as distributed RAM
+because the run path uses simple asynchronous reads.  The current core avoids
+multi-read-port RAM pressure by latching first-edge, loop-start, and final-tick
+metadata during upload.  During a shot it reads only the current `edge_index`
+row.
 
-If the experiment later needs several thousand unique non-repeating edges on all
-40 channels, the next architectural step is a BRAM-friendly synchronous-read
+If future experiments need many thousands of unique non-repeating edges, the
+next architecture should move the table to a BRAM-friendly synchronous-read
 pipeline and a faster upload transport such as AXI, JTAG-to-AXI, UART/SPI,
 Ethernet, or a FIFO/BRAM write port.
 
-Validation evidence from the checked-in 40-channel top:
+## Configurable Resource Target
 
-```text
-Command: fpga\build_and_program.bat --check
-Vivado:  2019.1
-Part:    xc7a35tfgg484-2
-Profile: CHANNEL_COUNT=40, MAX_EDGES=1024, TICK_WIDTH=32
-Result:  synth_design completed with 0 errors / 0 critical warnings
-Util:    LUT 2406/20800 (11.57%), FF 1127/41600 (2.71%)
+The build path should treat the resource target as a planning target, not a hard
+Vivado guarantee.  The default is 70% of the LUT/FF class budget:
+
+```powershell
+$env:ZLC_PS_RESOURCE_TARGET_PCT = "70"
+$env:ZLC_PS_MAX_EDGES = "512"
+$env:ZLC_PS_MAX_SCAN_POINTS = "256"
 ```
 
-At 100 MHz, a 32-bit tick counter covers about 42.9 seconds. One tick is 10 ns.
+`fpga\build_and_program.bat --check` and the Tcl scripts print the selected
+profile and the estimated edge/scan capacity.  The estimate is a budget guide.
+The authoritative evidence is the actual Vivado `report_utilization` and
+`report_timing_summary` for the generated project.
 
-## Latency Estimates
-
-There are three different latencies to keep separate.
-
-### Sequence Quantization
-
-`PulseSequence.edges()` converts seconds to ticks with:
+For first-light address-switch hardware, start with:
 
 ```text
-tick = round(time_seconds * clock_hz)
-```
-
-At 100 MHz, the tick period is 10 ns, so the quantization error is at most about
-5 ns per edge. The generated program validates that ticks are strictly
-increasing and fit in `TICK_WIDTH`.
-
-### FPGA Execution Latency
-
-The core samples the VIO-facing `reset`, `start`, and `prog_we` controls through
-two-stage synchronizers before the runtime state machine uses them. During
-`reset=1`, `prog_we` is then treated as a synchronized toggle event for the
-upload RAM: each VIO commit that stages `prog_addr/prog_tick/prog_mask` and flips
-`prog_we` writes exactly one selected table entry. Once a start transition is
-visible at the module input, the core needs roughly:
-
-```text
-2 clocks: synchronize start into the FPGA clock domain
-1 clock: detect start_event and enter running state
-1 clock: apply the first mask if tick_mem[0] == 0
-```
-
-At 100 MHz, this is about 40 ns from the start input becoming visible to the
-first zero-tick output update. This is a fixed pipeline offset. Relative timing
-between pulse edges remains on the FPGA tick grid.
-
-If the first edge is at tick `T`, the output update appears after the same fixed
-start pipeline plus `T` FPGA clocks. The fixed offset can be calibrated or simply
-absorbed into the definition of the qCMOS trigger channel.
-
-### Host/Vivado Upload Latency
-
-The current backend uploads through Vivado VIO. This is intentionally simple for
-first deployment, but it is not a high-throughput transport. The default server
-uses a persistent Vivado Tcl session, so Vivado startup, hardware-target open,
-`.ltx` loading, and probe lookup are paid once when
-`fpga/run_server.bat` starts.
-
-For each edge, the generated Tcl currently stages:
-
-```text
-set addr
-set tick
-set mask
-toggle prog_we
-```
-
-The generated Tcl batches `addr/tick/mask/prog_we` into one VIO commit per
-edge. `prog_we` is a toggle, not a level, so each synchronized transition writes
-exactly one row and there is no extra high/low write-enable pair per edge. The
-Vivado Tcl layer also caches matched VIO probe objects after the first lookup in
-the persistent session, so repeated `zlc_stage_probe(...)` calls do not keep
-searching the full probe list. The first prepare therefore costs roughly
-`edge_count + constant` VIO commits.
-
-After one successful prepare, `VivadoPulseStreamerSession` keeps the last
-uploaded program in Python and uses a differential prepare for the next program
-with the same channel order and clock. It rewrites rows whose `tick` or `mask`
-changed, and always rewrites the shadow-critical rows `0`, `loop_start_index`,
-and the final row so the HDL's first-edge, loop-start, and final-tick shadows
-stay correct. A readout scan that only changes `pulse.x` can therefore avoid a
-full edge-table upload when only a few ticks change. This is faster than
-launching a fresh Vivado batch process for every action, but the remaining
-latency is still dominated by VIO/JTAG commits. It happens before the qCMOS is
-armed, so it does not add shot-internal jitter, but it can make large scans slow.
-
-The `fire` path sends a `zlc_start` rising-edge pulse after a program has been
-prepared. The absolute time from the Python call to that FPGA start transition is
-host/Vivado/JTAG dependent, but after that transition reaches the FPGA, the
-pulse timing is deterministic.
-
-The `wait_done` path polls `zlc_done`; the default generated Tcl poll interval is
-20 ms. This affects when the host learns that a shot has completed, not the
-timing of the pulse sequence itself.
-
-## Main Constraints
-
-The limiting factors are expected to be board-level and workflow-level rather
-than LUT count:
-
-- 40 channels require 40 routed, usable output pins with compatible voltage
-  banks and connectors.
-- Lab-facing TTL/BNC outputs should normally use output buffers, level shifters,
-  or line drivers. Do not treat FPGA pins as rugged instrument outputs.
-- Vivado/VIO is convenient for first deployment because it avoids designing a
-  new transport, but it is not a high-throughput upload path. Large edge tables
-  or high-rate scans should eventually move to AXI, UART, SPI, Ethernet, or a
-  dedicated FIFO/BRAM write interface.
-- The qCMOS trigger should be one named channel in the same edge table as the
-  laser/control channels, so camera timing and pulse timing share one clocked
-  source of truth.
-
-## Practical Starting Point
-
-Start synthesis with:
-
-```text
-CHANNEL_COUNT = 40
-MAX_EDGES = 1024
+CHANNEL_COUNT = inferred from XDC, normally 62
+MAX_EDGES = 512
+MAX_SCAN_POINTS = 256
 TICK_WIDTH = 32
-CLOCK_HZ = 100_000_000
+CLOCK_HZ = 50_000_000
+RESOURCE_TARGET = 70%
 ```
 
-Then inspect Vivado utilization and timing. If the experiment sequences exceed
-1024 unique uploaded edges, first check whether the sequence can use a repeat
-bracket or `repeat_forever`. If it truly needs a larger unique table, redesign
-the memory path around BRAM before attempting much larger 40-channel bitstreams
-on an xc7a35t.
+The default Artix-7 35T profile keeps five active named scan-parameter slots
+per FPGA chunk. At most two of those slots may affect timing; static DA value
+scan columns are packed into per-row bus values. Larger linked scan files can
+be run as consecutive host/API chunks while each FPGA program stays within
+`MAX_SCAN_POINTS`. If a sequence exceeds `MAX_EDGES`, first check whether it
+can use a repeat bracket, `repeat_forever`, a named scan table with at most two
+active timing parameters, or a smaller scan chunk. If it truly needs a larger
+unique edge table, increase
+`ZLC_PS_MAX_EDGES` and re-run `--check` before building a board bitstream.
 
-The 40-channel bitstream needs a new top-level wrapper and XDC pin map. The
-Python backend already supports `ZLC_PS_CHANNEL_COUNT` and generated HDL with
-arbitrary channel names, but the Vivado VIO probe widths and physical output
-constraints must match the generated bundle exactly.
+## Timing Constants
 
-The repository now uses the 40-channel FPGA path as the operational entry
-point. Use `fpga/build_and_program.bat` to check, build, and program the 40ch
-bitstream, then use `fpga/run_server.bat` to start a server whose hardware
-channels are always `ch00 ... ch39`. A GUI or API pulse may configure only a
-subset of those channels; the compiler fills every missing channel with an off
-bit before uploading the 40-bit masks. The real build uses
-`zlc_pulse_streamer_top_40ch.v` with the checked-in
-`zlc_pulse_streamer_40ch.xdc`, which is derived from the historical
-`address_switch` pin map. For a different board or cable map, set
-`ZLC_PS_40CH_XDC` to a verified package-pin map.
+The checked-in real-hardware default is 50 MHz because measured pulses were
+twice as long when the software/server assumed 100 MHz.  At 50 MHz:
 
-## External References
+```text
+tick period: 20 ns
+32-bit tick counter range: about 85.9 seconds
+edge quantization error: at most half a 20 ns tick
+```
 
-- AMD Artix 7 product family page:
-  <https://www.amd.com/en/products/adaptive-socs-and-fpgas/fpga/artix-7.html>
-- AMD/Xilinx 7 Series FPGA overview datasheet DS180:
-  <https://docs.amd.com/v/u/en-US/ds180_7Series_Overview>
+If the board clock is changed to a verified 100 MHz source, update both the XDC
+clock constraint and `ZLC_PS_CLOCK_HZ=100000000`.
+
+## Execution And Upload Latency
+
+Once the FPGA sees a start transition, the relative pulse timing is on the FPGA
+tick grid.  The VIO-facing `reset`, `start`, and `prog_we` controls pass through
+two synchronizer stages before the runtime state machine uses them.  A zero-tick
+first edge therefore appears after a small fixed pipeline offset; relative edge
+spacing remains deterministic.
+
+Vivado/VIO upload latency is outside the shot.  The persistent server starts one
+Vivado Tcl process, opens the hardware target, loads the `.ltx`, and reuses that
+session for `prepare/fire/wait_done/safe_state`.  After one successful prepare,
+the Python backend can perform differential upload for the next compatible
+program: changed edge rows, changed scan points, and shadow-critical rows are
+rewritten; unchanged rows are skipped.
+
+The camera external-trigger output should remain one output bit in the same edge
+table as laser/control channels.  In the checked-in camera-imaging preset, that
+hardware output is `ch11`, physical label `emCCD`, package pin `M13`.  The same
+XDC also defines `ch06/trig/R17`; it remains available as a separate output but
+is not the preset qCMOS trigger.
+
+## Scan And Bus Design Notes
+
+The scan-template design is intentionally separate from table expansion.  A
+one-dimensional scan or a two-parameter grid should stay one ordered named scan
+table plus one edge template whenever edge ordering is invariant:
+
+```text
+edge row: base_tick, axis0_coeff, axis1_coeff, mask
+scan RAM: (axis0_point0, axis1_point0), (axis0_point1, axis1_point1), ...
+scan bus RAM: packed static da_dipole/da_bias_y/da_bias_x/da_bias_z values per row
+scan_axis_names: ["camera_exposure_ns", "trig_delay"]
+```
+
+The compiler rejects a scan if the same edge rows would reorder for different
+points.  That rejection is a real safety boundary; split the scan into multiple
+templates or prepare one pulse per point instead of uploading an ambiguous
+template.
+
+Analog bus ramps are the main case that should not consume the digital edge
+table.  The current implementation folds `da_dipole`, `da_bias_x/y/z`, and
+similar buses into GUI/API rows, then uploads them through a separate bus
+segment memory instead of expanding every stair-step into `prog_mask` rows:
+
+```text
+bus_id
+start_tick
+stop_tick
+start_value
+stop_value
+mode        // edge, ramp, hold
+```
+
+The FPGA runs one small bus engine per logical bus.  `edge` updates the bus at
+`start_tick`; `hold` is represented by the absence of a new segment; `ramp` uses
+a DDA accumulator and snaps to `stop_value` at `stop_tick`, so a long ramp
+consumes one segment rather than hundreds of digital edge rows.  Digital output
+RAM then only needs laser, shutter, camera, and other TTL transitions.
+Partial-delay-heavy designs can use the same principle: move channel-local
+timing metadata out of the global edge table only when it reduces repeated
+full-mask edge rows.
+
+Current limitation: hardware scan arrays can combine timing scan with static
+edge-mode DA value scan, but not with analog bus ramp segments in the same
+upload.  Run one prepared ramp pulse per scan point, or add a scan-aware bus
+segment table if that experiment becomes common.
+
+## Current Operational Entry
+
+Use:
+
+```powershell
+.\fpga\build_and_program.bat
+.\fpga\run_server.bat
+.\pulse_gui.bat --state .\pulses\camera_imaging_address_switch.json
+```
+
+The real top-level wrapper is:
+
+```text
+fpga\pulse_streamer\zlc_pulse_streamer_top_address_switch.v
+```
+
+The default board XDC is:
+
+```text
+references\source_archives\address_switch\address_switch.srcs\constrs_1\new\addre.xdc
+```
+
+Set `ZLC_PS_XDC` only when using a verified alternative package-pin map.
