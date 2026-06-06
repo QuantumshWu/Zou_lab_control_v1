@@ -57,7 +57,7 @@ fpga\run_server.bat
 ```
 
 Do not use stale Vivado products from `fpga\pulse_streamer\build`.  Current
-scripts write to the printed project directory, normally `fpga\build\p40`, and
+scripts write to the printed project directory, normally `fpga\build\address_switch`, and
 ignore old `fpga\pulse_streamer\build` project, bitstream, and probes paths.
 
 ## GUI Screenshot Checks

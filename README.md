@@ -1,42 +1,24 @@
 # Zou_lab_control
 
-Notebook-first neutral-atom experiment control with a standalone frontend layer
-and a standalone FPGA pulse-streamer hardware side.
+Notebook-first neutral-atom experiment control: a standalone frontend layer
+(plotting + PyQt/Fluent pulse GUI) and a standalone FPGA pulse-streamer hardware
+side, joined over RPyC. The same experiment logic runs with virtual devices,
+real qCMOS hardware, and a remote FPGA sequencer.
 
 ## Start Here
 
-- Install Python/Jupyter/PyQt/RPyC requirements:
-
-  ```powershell
-  install_requirements.bat
-  ```
-
-- Open tutorials:
-
-  ```powershell
-  start_tutorials_jupyter_lab.bat
-  ```
-
-- Open the pulse editor without an experiment config:
-
-  ```powershell
-  pulse_gui.bat
-  ```
-
-The installer records the selected interpreter in the ignored local file
-`.zlc_python_path`.  The root launchers use that interpreter before falling
-back to PATH, so GUI, notebooks, and the FPGA server share the same editable
-checkout.
-
-If VS Code/Jupyter already has the right kernel selected but PowerShell cannot
-find that Python, run this from a notebook in `tutorials/`:
-
-```python
-%run ../install_current_kernel.py
+```powershell
+install_requirements.bat            # install the editable package + record .zlc_python_path
+start_tutorials_jupyter_lab.bat     # open the checked-in tutorials
+pulse_gui.bat                        # open the pulse editor (offline if no server)
 ```
 
-It installs the same editable checkout into the active kernel and writes
-`.zlc_python_path` for the launchers.
+The installer records the selected interpreter in the ignored local file
+`.zlc_python_path`. The root launchers use that interpreter before falling back
+to PATH, so the GUI, notebooks, and the FPGA server share the same editable
+checkout. If VS Code/Jupyter already has the right kernel but PowerShell cannot
+find that Python, run `%run ../install_current_kernel.py` from a notebook in
+`tutorials/`.
 
 ## Repository Layout
 
@@ -44,29 +26,58 @@ It installs the same editable checkout into the active kernel and writes
 Zou_lab_control/
   frontend/       standalone plotting, PyQt/Fluent GUI, PDF, notebook helpers
   neutral_atom/   device contracts, qCMOS/readout/session/timing logic
-fpga/             standalone 40ch pulse-streamer build/server side
+fpga/             standalone address-switch pulse-streamer build/server side
 pulses/           checked-in PulseTableState presets
 tutorials/        generated Jupyter notebooks
-docs/             manuals, runbooks, design notes, generated PDFs
+docs/             the three manuals, maintainer notes, generated PDFs
 tests/            targeted verification matrix and tests
-references/       historical source archives for comparison only
+references/       historical source archives (ignored by git)
+```
+
+## Documentation
+
+There are exactly **three tutorial PDF manuals**, plus one maintainer note.
+
+| Manual | Source dir | Covers |
+| --- | --- | --- |
+| Main | `docs/main_manual/` | System architecture, neutral-atom session/devices/timing, `PulseSequence` vs `PulseTableState`, the sequencer lifecycle (prepare/fire/wait_done/safe_state), the real-hardware runbook, and the N-slot scan model end to end |
+| Frontend | `docs/frontend_manual/` | The `qt_fluent` widget library and layout primitives, the pulse GUI (Edit/Preview/Scan tabs), the per-field scan-dot workflow, the plotting API, and PDF rendering |
+| FPGA | `docs/fpga_manual/` | The Artix-7 35T pulse-streamer RTL, the N-slot affine scan engine, the packed VIO probe contract, the analog-bus DAC engine, the host compiler -> upload flow, resource budget notes, and the v3 roadmap |
+
+- Maintainer/agent notes (architecture invariants, anti-patterns, QA): see
+  [docs/MAINTAINER_NOTES.md](docs/MAINTAINER_NOTES.md).
+- Subsystem pointers: [fpga/README.md](fpga/README.md),
+  [fpga/pulse_streamer/README.md](fpga/pulse_streamer/README.md),
+  [pulses/README.md](pulses/README.md),
+  [Zou_lab_control/frontend/README.md](Zou_lab_control/frontend/README.md).
+- Test strategy: [tests/README.md](tests/README.md).
+
+### Building the manuals
+
+Each manual is generated from a `.texbody` template into a `.tex` wrapper and
+compiled with XeLaTeX (2-pass, in a temporary build dir). XeLaTeX must be on
+PATH.
+
+```powershell
+python -c "from Zou_lab_control.neutral_atom.content.manuals import build_main_manual, build_fpga_manual; build_main_manual(); build_fpga_manual()"
+python -c "from Zou_lab_control.frontend.notes import build_frontend_manual; build_frontend_manual()"
 ```
 
 ## Real Hardware Path
 
 ```text
 control/qCMOS computer
-  -> RemoteSequencer
+  -> RemoteSequencer (RPyC)
   -> FPGA/Vivado computer running fpga\run_server.bat
   -> persistent Vivado/VIO session
-  -> fixed zlc_pulse_streamer_top_40ch bitstream
+  -> fixed zlc_pulse_streamer_top_address_switch bitstream
 ```
 
-The FPGA side is always a 40-channel hardware contract by default.  The GUI may
-show only `ch00..ch03`, but upload compiles against the full hardware order
-`ch00..ch39`; hidden or unconfigured channels are off.
-
-Use these hardware-side commands on the FPGA/Vivado computer:
+The FPGA side infers the full hardware contract from the address-switch XDC. The
+GUI may show only a subset such as `ch09/ch00/ch03/ch11`, but upload compiles
+against the full hardware order; hidden or unconfigured channels are off. The
+clock is 50 MHz (20 ns tick). Hardware-side commands on the FPGA/Vivado
+computer:
 
 ```powershell
 fpga\build_and_program.bat --check
@@ -75,26 +86,29 @@ fpga\run_server.bat --check-config
 fpga\run_server.bat
 ```
 
-Vivado projects, `.runs`, `.cache`, `.hw`, `.sim`, `.ltx`, journals, and server
-state are generated under `fpga\build` by default.  The FPGA batch files print
-`ZLC build root` and `ZLC project dir`; the default project is
-`fpga\build\p40`, and that printed path is the source of truth for
-`.xpr/.bit/.ltx`.
+Generated Vivado projects and server state live under `fpga\build` by default;
+the printed `ZLC project dir` is the source of truth for `.xpr/.bit/.ltx`. The
+full runbook is in the **main manual**.
 
-## Key Docs
+## Frontend
 
-- [Project overview](docs/PROJECT_OVERVIEW.md)
-- [FPGA submodule](fpga/README.md)
-- [Pulse-streamer design](fpga/pulse_streamer/README.md)
-- [Frontend submodule](Zou_lab_control/frontend/README.md)
-- [Pulse presets](pulses/README.md)
-- [Hardware runbook](docs/neutral_atom_hardware_manual/REAL_HARDWARE_RUNBOOK.md)
-- [Test strategy](tests/README.md)
+The pulse GUI edits a `PulseTableState` and drives a supplied sequencer; it is a
+frontend only, not a separate hardware-control layer. Scanning uses named slots
+`s0, s1, ...`: bind any duration/delay/DAC field (a scan dot in the GUI, or
+`state.bind_field(kind, target)`), then provide an `N_points x N_slots`
+`scan_table`. The **frontend manual** covers the widget library, the
+Edit/Preview/Scan tabs, the scan-dot workflow, and the plotting/PDF API. Open
+the editor remotely or offline:
+
+```powershell
+pulse_gui.bat --remote-host 192.168.0.20 --state .\pulses\camera_imaging_address_switch.json
+pulse_gui.bat --no-sequencer --state .\pulses\camera_imaging_address_switch.json
+```
 
 ## Targeted Verification
 
-Prefer scoped checks from [tests/README.md](tests/README.md) instead of running
-the full suite for every small change.  Typical handoff checks are:
+Prefer scoped checks from [tests/README.md](tests/README.md) over the full suite
+for small changes. Typical handoff checks:
 
 ```powershell
 pytest -q tests\test_neutral_atom_lightweight.py -k "repo_vivado_entrypoint_contract"
@@ -102,4 +116,4 @@ python -m json.tool tutorials\neutral_atom_hardware_quickstart.ipynb > $null
 git diff --check
 ```
 
-Use full `pytest -q` for broad handoff or cross-subsystem changes.
+Use full `pytest -q` for broad or cross-subsystem changes.

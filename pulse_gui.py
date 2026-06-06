@@ -11,11 +11,19 @@ import argparse
 import os
 from pathlib import Path
 import sys
-from typing import Sequence
+from typing import Mapping, Sequence
 
 
-DEFAULT_PULSE_GUI_MAX_CHANNELS = 40
-DEFAULT_PULSE_GUI_XDC = Path("fpga") / "pulse_streamer" / "zlc_pulse_streamer_40ch.xdc"
+DEFAULT_PULSE_GUI_FALLBACK_CHANNELS = 62
+DEFAULT_PULSE_GUI_XDC = (
+    Path("references")
+    / "source_archives"
+    / "address_switch"
+    / "address_switch.srcs"
+    / "constrs_1"
+    / "new"
+    / "addre.xdc"
+)
 
 
 def _default_channels(count: int) -> list[str]:
@@ -25,19 +33,32 @@ def _default_channels(count: int) -> list[str]:
     return [f"ch{i:02d}" for i in range(count)]
 
 
-def _resolve_trigger_channels(args, channels: Sequence[str]) -> list[str]:
+def _resolve_trigger_channels(args, channels: Sequence[str], channel_labels: Mapping[str, str] | None = None) -> list[str]:
     if args.trigger_channels:
         return [str(channel) for channel in args.trigger_channels]
-    for candidate in ("qcm_trigger", "camera_trigger", "trig", "ch03"):
-        if candidate in channels:
-            return [candidate]
-    return [channels[min(3, len(channels) - 1)]]
+    labels = {str(channel): str(label).strip().lower() for channel, label in dict(channel_labels or {}).items()}
+    for channel in channels:
+        if labels.get(str(channel)) == "emccd":
+            return [str(channel)]
+    if "emCCD" in channels:
+        return ["emCCD"]
+    raise ValueError("No default emCCD trigger channel was found. Provide --trigger-channels explicitly after confirming the camera trigger output.")
 
 
 def _positive_float(text: str) -> float:
     value = float(text)
     if value <= 0:
         raise argparse.ArgumentTypeError("value must be positive.")
+    return value
+
+
+def _optional_positive_int_env(name: str) -> int | None:
+    text = os.environ.get(name, "").strip()
+    if not text:
+        return None
+    value = int(text)
+    if value <= 0:
+        raise ValueError(f"{name} must be positive.")
     return value
 
 
@@ -66,10 +87,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-channel-count",
         type=int,
-        default=int(os.environ.get("ZLC_PS_MAX_CHANNEL_COUNT", DEFAULT_PULSE_GUI_MAX_CHANNELS)),
-        help="Maximum channel count accepted from --xdc.",
+        default=_optional_positive_int_env("ZLC_PS_MAX_CHANNEL_COUNT"),
+        help="Maximum channel count accepted from --xdc. Omit for no GUI-side limit.",
     )
-    parser.add_argument("--clock-hz", type=_positive_float, default=100_000_000.0, help="Sequencer clock in Hz.")
+    parser.add_argument("--clock-hz", type=_positive_float, default=50_000_000.0, help="Sequencer clock in Hz.")
     parser.add_argument("--trigger-channels", nargs="+", help="Hardware channel names counted as camera triggers.")
     parser.add_argument(
         "--scale",
@@ -118,7 +139,7 @@ def _resolve_channels(args, state) -> list[str]:
 
     count = infer_xdc_channel_count(
         args.xdc,
-        default=DEFAULT_PULSE_GUI_MAX_CHANNELS,
+        default=DEFAULT_PULSE_GUI_FALLBACK_CHANNELS,
         max_count=args.max_channel_count,
     )
     return _default_channels(count)
@@ -132,7 +153,7 @@ def _resolve_channel_labels(args, channels: Sequence[str], state) -> dict[str, s
         channel: label
         for channel, label in infer_xdc_channel_labels(
             args.xdc,
-            default=len(channels) or DEFAULT_PULSE_GUI_MAX_CHANNELS,
+            default=len(channels) or DEFAULT_PULSE_GUI_FALLBACK_CHANNELS,
             max_count=args.max_channel_count,
         ).items()
         if channel in channels and label and label != channel
@@ -142,9 +163,25 @@ def _resolve_channel_labels(args, channels: Sequence[str], state) -> dict[str, s
     return labels
 
 
+def _resolve_channel_pins(args, channels: Sequence[str]) -> dict[str, str]:
+    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import infer_xdc_channel_pins
+
+    channels = [str(channel) for channel in channels]
+    return {
+        channel: pin
+        for channel, pin in infer_xdc_channel_pins(
+            args.xdc,
+            default=len(channels) or DEFAULT_PULSE_GUI_FALLBACK_CHANNELS,
+            max_count=args.max_channel_count,
+        ).items()
+        if channel in channels and pin
+    }
+
+
 def _connect_remote_or_offline(args, state, na, *, explicit_remote: bool):
     seed_channels = _resolve_channels(args, state)
-    seed_trigger_channels = _resolve_trigger_channels(args, seed_channels)
+    seed_labels = _resolve_channel_labels(args, seed_channels, state)
+    seed_trigger_channels = _resolve_trigger_channels(args, seed_channels, seed_labels)
     try:
         sequencer = na.RemoteSequencer(
             host=args.remote_host,
@@ -190,7 +227,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         else:
             channels = _resolve_channels(args, state)
-            trigger_channels = _resolve_trigger_channels(args, channels)
+            channel_labels = _resolve_channel_labels(args, channels, state)
+            trigger_channels = _resolve_trigger_channels(args, channels, channel_labels)
             sequencer = na.RuntimeSequencer(
                 channels=channels,
                 clock_hz=args.clock_hz,
@@ -198,7 +236,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
     else:
         channels = _resolve_channels(args, state)
-        trigger_channels = _resolve_trigger_channels(args, channels)
+        channel_labels = _resolve_channel_labels(args, channels, state)
+        trigger_channels = _resolve_trigger_channels(args, channels, channel_labels)
 
     if state is not None and list(state.channels) != list(channels):
         if all(channel in channels for channel in state.channels):
@@ -210,7 +249,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"state={list(state.channels)!r}, sequencer={list(channels)!r}. "
                 "Load a matching pulse JSON or use hardware channel names with display labels."
             )
-    channel_labels = _resolve_channel_labels(args, channels, state)
+    channel_labels = locals().get("channel_labels") or _resolve_channel_labels(args, channels, state)
+    channel_pins = _resolve_channel_pins(args, channels)
     if state is not None and channel_labels:
         for channel, label in channel_labels.items():
             if channel in state.channels and channel not in state.channel_labels and label != channel:
@@ -230,6 +270,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         channels=channels,
         sequencer=sequencer,
         channel_labels=channel_labels,
+        channel_pins=channel_pins,
         scale=args.scale,
         window_ratio=args.window_ratio,
     )

@@ -7,6 +7,7 @@ soft shadows.
 
 from __future__ import annotations
 
+import contextlib
 import math
 import re
 import sys
@@ -26,9 +27,16 @@ BG = "#F3F3F3"
 TEXT = "#323130"
 HINT = "#F0a150"
 PLACEHOLDER = "#A19F9D"
+# Light neutral hairline used to delineate cards that opt out of a drop shadow
+# (shadows are costly to repaint while scrolling).
+DIVIDER = "#E1DFDD"
 GREEN = "#7FC2AD"
 RED = "#CD7380"
 ORANGE = "#D69A6E"
+# A scan-bound field is painted a pale orange so the saturated-orange scan dot
+# (the inline spinbox-style button) stands out against it instead of vanishing.
+ORANGE_TINT = "#F6E3D4"
+ORANGE_DARK = "#8A4B1F"
 YELLOW = "#E5C85B"
 GREY = "#A2A2A2"
 RADIUS = 4
@@ -44,6 +52,19 @@ STEP_WIDTH = 6
 _QT_APP = None
 _FLUENT_SCALE = 1.0
 _FLOAT_OR_X_RE = re.compile(
+    r"""
+    ^\s*
+    (?:
+        [0-9xyXYeE+\-*/().\s]+
+    )
+    \s*$
+    """,
+    re.VERBOSE,
+)
+_FLOAT_TOKEN_RE = re.compile(r"(?<![A-Za-z_])[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?")
+_VARIABLE_TOKEN_RE = re.compile(r"\b[xXyY]\b")
+_UNSAFE_TIME_EXPR_RE = re.compile(r"[^0-9xyXYeE+\-*/().\s]")
+_OLD_FLOAT_OR_X_RE = re.compile(
     r"""
     ^\s*
     (?:
@@ -174,6 +195,43 @@ def add_fluent_shadow(widget: QtWidgets.QWidget, *, blur: int = 20, alpha: int =
     widget.setGraphicsEffect(shadow)
 
 
+@contextlib.contextmanager
+def signals_blocked(*widgets: QtWidgets.QWidget | None):
+    """Temporarily block Qt signals on each (non-None) widget, restoring after.
+
+    Handy when updating many existing widgets' values in place (e.g. refreshing
+    a form from a model) without each ``setText`` / ``setCurrentText`` firing a
+    feedback signal -- the standard alternative to destroying + rebuilding the
+    widgets.
+    """
+
+    saved = [(w, w.blockSignals(True)) for w in widgets if w is not None]
+    try:
+        yield
+    finally:
+        for widget, previous in saved:
+            widget.blockSignals(previous)
+
+
+@contextlib.contextmanager
+def batched_updates(*widgets: QtWidgets.QWidget | None):
+    """Suspend repaints on each widget for a bulk change, repainting once after.
+
+    Wrap a teardown + rebuild of many child widgets in this so each ``addWidget``
+    on the (visible) tree does not trigger its own relayout + repaint; the single
+    repaint on exit is the dominant speed-up for large dynamic panels.
+    """
+
+    saved = [(w, w.updatesEnabled()) for w in widgets if w is not None]
+    for widget, _previous in saved:
+        widget.setUpdatesEnabled(False)
+    try:
+        yield
+    finally:
+        for widget, previous in saved:
+            widget.setUpdatesEnabled(previous)
+
+
 def format_compact_number(value: float, *, digits: int = 12) -> str:
     if not math.isfinite(float(value)):
         return str(value)
@@ -219,8 +277,8 @@ def align_to_resolution(value: str | float, resolution: float, *, allow_any: boo
             snapped = float(resolution)
         return format_compact_number(snapped)
 
-    if "x" in text.lower():
-        return re.sub(r"(?<![A-Za-z_])[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?", snap_number, text)
+    if _VARIABLE_TOKEN_RE.search(text) or any(char in text for char in "[](),"):
+        return _FLOAT_TOKEN_RE.sub(snap_number, text)
     return snap_number(re.match(r".+", text))
 
 
@@ -268,11 +326,17 @@ class FluentFrame(QtWidgets.QFrame):
 class FluentGroupBox(QtWidgets.QGroupBox):
     def __init__(self, title: str = "", parent=None, *, shadow: bool = True):
         super().__init__(title, parent)
+        # A soft drop shadow (QGraphicsDropShadowEffect) is expensive to repaint
+        # -- it rasterises + blurs the whole widget every frame, which makes a
+        # tall, scrolled panel stutter.  When shadow is off we draw a light 1px
+        # border instead so the card is still delineated, for a fraction of the
+        # paint cost.
+        border = "none" if shadow else f"1px solid {DIVIDER}"
         self.setStyleSheet(
             f"""
             QGroupBox {{
                 background: white;
-                border: none;
+                border: {border};
                 border-radius: {_radius()}px;
                 margin-top: 0px;
                 padding-top: {scaled_px(32)}px;
@@ -299,6 +363,12 @@ class FluentButton(QtWidgets.QPushButton):
         super().__init__(text, parent)
         self._current_bg = None
         self.setMinimumHeight(scaled_px(30, minimum=22))
+        # Default sizing is set ONCE here, not inside set_color -- callers that
+        # opt into Expanding (e.g. a button grid) would otherwise have their
+        # policy silently reset to Fixed the next time the colour changes, making
+        # the button collapse to its text width (the "Save button shrinks after
+        # load" bug).
+        self.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
         self.set_color(color)
 
     def set_color(self, color: str) -> None:
@@ -321,7 +391,6 @@ class FluentButton(QtWidgets.QPushButton):
             QPushButton:disabled {{ background: {PLACEHOLDER}; color: {BG}; }}
             """
         )
-        self.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
 
 
 class FluentLineEdit(QtWidgets.QLineEdit):
@@ -373,25 +442,25 @@ class FloatLineEdit(FluentLineEdit):
 
 class FloatOrXLineEdit(FluentLineEdit):
     def has_acceptable_text(self) -> bool:
-        return bool(_FLOAT_OR_X_RE.fullmatch(self.text() or ""))
+        text = self.text() or ""
+        if not _FLOAT_OR_X_RE.fullmatch(text) or _UNSAFE_TIME_EXPR_RE.search(text):
+            return False
+        return bool(text.strip())
 
 
 class FluentComboBox(QtWidgets.QComboBox):
+    """A non-editable Fluent combo that paints its own current text.
+
+    QComboBox's editable-lineEdit display does not render reliably on the Qt
+    ``offscreen`` platform (and is finicky to style), so the current item text
+    is drawn directly in :meth:`paintEvent`.  This also makes the text always
+    visible for screenshots and avoids cursor/clipping quirks.
+    """
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumHeight(scaled_px(30, minimum=22))
-        self.setEditable(True)
-        line_edit = self.lineEdit()
-        line_edit.setReadOnly(True)
-        line_edit.setFrame(False)
-        line_edit.setCursor(QtCore.Qt.ArrowCursor)
-        line_edit.setFocusPolicy(QtCore.Qt.NoFocus)
-        line_edit.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
-        line_edit.setStyleSheet("background: transparent; border: none; padding: 0;")
-        line_edit.setTextMargins(scaled_px(EDIT_PADDING_H), scaled_px(PADDING_V), scaled_px(EDIT_PADDING_H), scaled_px(PADDING_V))
-        line_edit.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
-        self.currentTextChanged.connect(self._reset_cursor)
-        self.editTextChanged.connect(self._reset_cursor)
+        self.setEditable(False)
         self.setStyleSheet(
             f"""
             QComboBox {{
@@ -418,75 +487,47 @@ class FluentComboBox(QtWidgets.QComboBox):
             }}
             QComboBox::drop-down:disabled {{ background-color: {PLACEHOLDER}; }}
             QComboBox::drop-down:hover {{ background-color: {HOVER}; }}
-            QComboBox::down-arrow {{ image: none; }}
+            QComboBox::down-arrow {{ image: none; width: 0px; height: 0px; }}
             QComboBox QAbstractItemView {{
-                border: 1px solid {PLACEHOLDER};
-                border-radius: {_radius()}px;
                 background: white;
+                border: 1px solid {PLACEHOLDER};
                 color: {TEXT};
-                outline: 0;
                 selection-background-color: {ACCENT};
                 selection-color: white;
                 font: {fluent_font_size()}pt "{FONT}";
-                padding: {scaled_px(2)}px;
+                outline: none;
             }}
             """
         )
-        self.view().setMouseTracking(True)
-        self.view().setStyleSheet(
-            f"""
-            QListView {{
-                background: white;
-                color: {TEXT};
-                border: 1px solid {PLACEHOLDER};
-                border-radius: {_radius()}px;
-                outline: 0;
-                padding: {scaled_px(2)}px;
-                font: {fluent_font_size()}pt "{FONT}";
-            }}
-            QListView::item {{
-                min-height: {scaled_px(24, minimum=18)}px;
-                padding: {scaled_px(2)}px {scaled_px(6)}px;
-                border-radius: {_radius()}px;
-            }}
-            QListView::item:hover {{
-                background: {BG};
-                color: {TEXT};
-            }}
-            QListView::item:selected {{
-                background: {ACCENT};
-                color: white;
-            }}
-            {fluent_scrollbar_stylesheet("QScrollBar")}
-            """
-        )
-
-    def _reset_cursor(self, *_):
-        if self.isEditable() and self.lineEdit():
-            self.lineEdit().setCursorPosition(0)
-
-    def _layout_lineedit(self) -> None:
-        if not self.isEditable():
-            return
-        rect = QtCore.QRect(0, 0, max(0, self.width() - scaled_px(COMBO_WIDTH)), self.height())
-        self.lineEdit().setGeometry(rect)
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._layout_lineedit()
-
-    def showEvent(self, event):
-        super().showEvent(event)
-        self._layout_lineedit()
-        self._reset_cursor()
 
     def paintEvent(self, event):
-        super().paintEvent(event)
+        del event
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        option = QtWidgets.QStyleOptionComboBox()
+        self.initStyleOption(option)
+        option.currentText = ""  # suppress the style's own label so we don't double-draw
+        self.style().drawComplexControl(QtWidgets.QStyle.CC_ComboBox, option, painter, self)
+
+        drop_width = scaled_px(COMBO_WIDTH)
+        pad = scaled_px(EDIT_PADDING_H)
+        # A styled QLineEdit insets its text by the frame width (~2 px) on top of
+        # the stylesheet padding, so a combo that paints text at `pad` alone sits
+        # a couple of pixels further left than the line edits / spin boxes beside
+        # it.  Add the frame allowance so e.g. the "ns" unit lines up exactly with
+        # the duration value above it.
+        text_inset = pad + scaled_px(2)
+        text_width = max(0, self.width() - drop_width - text_inset - pad)
+        text_rect = QtCore.QRect(text_inset, 0, text_width, self.height())
+        painter.setPen(QtGui.QColor(TEXT if self.isEnabled() else PLACEHOLDER))
+        painter.setFont(QtGui.QFont(FONT, fluent_font_size()))
+        metrics = painter.fontMetrics()
+        text = metrics.elidedText(self.currentText(), QtCore.Qt.ElideRight, text_width)
+        painter.drawText(text_rect, QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, text)
+
         painter.setPen(QtCore.Qt.NoPen)
-        painter.setBrush(QtGui.QBrush(QtGui.QColor("#FFFFFF")))
-        cx = int(self.width() - scaled_px(COMBO_WIDTH) / 2)
+        painter.setBrush(QtGui.QColor("#FFFFFF"))
+        cx = int(self.width() - drop_width / 2)
         cy = int(self.height() / 2)
         size = scaled_px(COMBO_TRI_SIZE)
         points = [
@@ -496,6 +537,23 @@ class FluentComboBox(QtWidgets.QComboBox):
         ]
         painter.drawPolygon(QtGui.QPolygon(points))
         painter.end()
+
+    def showPopup(self):
+        # Size the dropdown to its widest item so options like "Edge"/"Ramp"/
+        # "Hold" or "ns"/"us"/"ms" are never clipped when the combo itself is
+        # narrow (the popup defaults to the combo width otherwise).
+        view = self.view()
+        if view is not None and self.count():
+            metrics = view.fontMetrics()
+            widest = 0
+            for index in range(self.count()):
+                try:
+                    advance = metrics.horizontalAdvance(self.itemText(index))
+                except AttributeError:  # pragma: no cover - very old Qt
+                    advance = metrics.width(self.itemText(index))
+                widest = max(widest, advance)
+            view.setMinimumWidth(widest + scaled_px(COMBO_WIDTH) + scaled_px(EDIT_PADDING_H) * 2)
+        super().showPopup()
 
     def wheelEvent(self, event):
         view = self.view()
@@ -687,7 +745,12 @@ class FluentSpinBox(QtWidgets.QSpinBox):
         super().__init__(parent)
         self.setButtonSymbols(QtWidgets.QAbstractSpinBox.PlusMinus)
         self.setMinimumHeight(scaled_px(30, minimum=22))
-        self.setAlignment(QtCore.Qt.AlignCenter)
+        # Left-align with zero internal text margins so the text's left inset is
+        # exactly the stylesheet ``padding`` (EDIT_PADDING_H) -- identical to a
+        # plain FluentLineEdit / FluentScanLineEdit.  Center alignment made the
+        # left gap content-dependent and looked narrower than the line edits.
+        self.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        self.lineEdit().setTextMargins(0, 0, 0, 0)
         self.setStyleSheet(fluent_spinbox_stylesheet("QSpinBox"))
 
 
@@ -740,7 +803,10 @@ class FluentDoubleSpinBox(QtWidgets.QDoubleSpinBox):
         super().__init__(parent)
         self.setButtonSymbols(QtWidgets.QAbstractSpinBox.PlusMinus)
         self.setMinimumHeight(scaled_px(30, minimum=22))
-        self.setAlignment(QtCore.Qt.AlignCenter)
+        # See FluentSpinBox: left-align + zero text margins for left-padding
+        # parity with the line edits.
+        self.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        self.lineEdit().setTextMargins(0, 0, 0, 0)
         self.setStyleSheet(fluent_spinbox_stylesheet("QDoubleSpinBox"))
 
         self._step_btn = QtWidgets.QToolButton(self)
@@ -989,6 +1055,311 @@ def run_fluent_window(
     return window
 
 
+# ---------------------------------------------------------------------------
+# Layout primitives -- structural guards against alignment / overlap / cutoff.
+#
+# Pages should compose these instead of hand-rolling fixed-width QHBoxLayouts.
+# Labels elide and gain tooltips instead of overflowing; the label column width
+# is computed from the actual text; fields share one row height so rows align.
+# ---------------------------------------------------------------------------
+
+
+class Metrics:
+    """Scaled spacing/size tokens.  Call methods to read current pixel values."""
+
+    @staticmethod
+    def margin() -> int:
+        return scaled_px(8, minimum=5)
+
+    @staticmethod
+    def gap_row() -> int:
+        return scaled_px(6, minimum=4)
+
+    @staticmethod
+    def gap_item() -> int:
+        return scaled_px(5, minimum=3)
+
+    @staticmethod
+    def gap_tight() -> int:
+        return scaled_px(3, minimum=2)
+
+    @staticmethod
+    def row_h() -> int:
+        return scaled_px(28, minimum=22)
+
+    @staticmethod
+    def dot() -> int:
+        return scaled_px(15, minimum=12)
+
+
+def measure_text_width(texts, *, padding: int = 16, minimum: int = 0, maximum: int | None = None) -> int:
+    """Return a label-column width that fits the widest of ``texts`` at the current scale."""
+
+    metrics = QtGui.QFontMetrics(QtGui.QFont(FONT, fluent_font_size()))
+    widest = max([fluent_text_width(metrics, str(text)) for text in texts] + [0])
+    width = widest + scaled_px(padding)
+    if minimum:
+        width = max(width, scaled_px(minimum))
+    if maximum is not None:
+        width = min(width, scaled_px(maximum))
+    return int(width)
+
+
+class ElidedLabel(QtWidgets.QLabel):
+    """A label that elides with ``...`` and exposes the full text as a tooltip."""
+
+    def __init__(self, text: str = "", parent=None, *, mode=QtCore.Qt.ElideRight, align=QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft):
+        super().__init__(parent)
+        self._full = str(text)
+        self._mode = mode
+        self.setAlignment(align)
+        self.setStyleSheet(f'QLabel {{ color: {TEXT}; font: {fluent_font_size()}pt "{FONT}"; background: transparent; }}')
+        self.setMinimumWidth(scaled_px(8))
+        self.setText(str(text))
+
+    def setText(self, text: str) -> None:  # noqa: N802 - Qt API name
+        self._full = str(text)
+        self.setToolTip(self._full)
+        self._elide()
+
+    def text(self) -> str:  # noqa: N802 - Qt API name
+        return self._full
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._elide()
+
+    def _elide(self) -> None:
+        metrics = self.fontMetrics()
+        available = max(0, self.width() - scaled_px(2))
+        shown = metrics.elidedText(self._full, self._mode, available) if available > scaled_px(4) else self._full
+        super().setText(shown)
+
+
+class FluentScanDot(QtWidgets.QAbstractButton):
+    """Small round toggle that marks a field as a scan parameter.
+
+    Unbound: a hollow grey dot.  Bound: a filled orange dot showing its 1-based
+    slot number.  Click toggles; the consumer connects ``toggled``.
+    """
+
+    def __init__(self, parent=None, *, tooltip: str = "Click to scan this field"):
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.setCursor(QtCore.Qt.PointingHandCursor)
+        self._number: int | None = None
+        diameter = Metrics.dot()
+        self.setFixedSize(diameter, diameter)
+        self.setToolTip(tooltip)
+
+    def set_number(self, number: int | None) -> None:
+        self._number = None if number is None else int(number)
+        self.update()
+
+    def number(self) -> int | None:
+        return self._number
+
+    def paintEvent(self, event) -> None:
+        del event
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        center = QtCore.QPointF(self.width() / 2.0, self.height() / 2.0)
+        radius = min(self.width(), self.height()) / 2.0 - max(1.0, scaled_px(1))
+        if self.isChecked():
+            painter.setBrush(QtGui.QColor(ORANGE))
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.drawEllipse(center, radius, radius)
+            if self._number is not None:
+                painter.setPen(QtGui.QColor("#FFFFFF"))
+                font = QtGui.QFont(FONT, max(6, fluent_font_size() - 5))
+                font.setBold(True)
+                painter.setFont(font)
+                painter.drawText(self.rect(), QtCore.Qt.AlignCenter, str(self._number))
+        else:
+            painter.setBrush(QtCore.Qt.NoBrush)
+            painter.setPen(QtGui.QPen(QtGui.QColor(PLACEHOLDER), max(1, scaled_px(1))))
+            painter.drawEllipse(center, radius, radius)
+            painter.setBrush(QtGui.QColor(PLACEHOLDER))
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.drawEllipse(center, radius * 0.42, radius * 0.42)
+        painter.end()
+
+
+def mark_scan_field(widget: QtWidgets.QWidget, *, bound: bool) -> None:
+    """Apply (or clear) the orange disabled look on a field bound to a scan slot."""
+
+    widget.setProperty("zlcScanBound", bool(bound))
+    widget.setEnabled(not bound)
+    if bound:
+        widget.setStyleSheet(
+            f"""
+            QLineEdit, QComboBox {{
+                background: {ORANGE_TINT};
+                color: {ORANGE_DARK};
+                border: 1px solid {ORANGE};
+                border-radius: {_radius()}px;
+                padding: {scaled_px(PADDING_V)}px {scaled_px(EDIT_PADDING_H)}px;
+                font: {fluent_font_size()}pt "{FONT}";
+            }}
+            """
+        )
+    else:
+        widget.setStyleSheet("")
+
+
+def _muted_line_style() -> str:
+    """Read-only / inactive look for a field that must stay *enabled* (so its
+    embedded scan dot keeps receiving clicks)."""
+
+    return (
+        f"QLineEdit {{ background: {BG}; color: {PLACEHOLDER}; "
+        f"border: 1px solid {PLACEHOLDER}; border-radius: {_radius()}px; "
+        f"padding: {scaled_px(PADDING_V)}px {scaled_px(EDIT_PADDING_H)}px; "
+        f'font: {fluent_font_size()}pt "{FONT}"; }}'
+    )
+
+
+class FluentScanLineEdit(FluentLineEdit):
+    """A line edit with a round 'scan' toggle embedded on the right edge.
+
+    The dot behaves like a spinbox's inline button: it sits inside the field
+    (vertically centered) and stays clickable even when the field is bound.
+    Binding turns the field orange + read-only and shows the slot number on the
+    dot; clicking the dot emits :attr:`scanClicked`.
+    """
+
+    scanClicked = QtCore.pyqtSignal()
+
+    def __init__(self, text: str = "", parent=None, *, tooltip: str = "Click the dot to scan this field"):
+        super().__init__(text, parent)
+        self._base_style = self.styleSheet()
+        self._dot = FluentScanDot(self, tooltip=tooltip)
+        self._dot.clicked.connect(self.scanClicked)
+        self._bound = False
+        self._reserve_right()
+
+    def _dot_size(self) -> int:
+        return Metrics.dot()
+
+    def _reserve_right(self) -> None:
+        # Left margin 0: the stylesheet ``padding`` (EDIT_PADDING_H) already sets
+        # the left text inset, so the text/number left edge lines up with a plain
+        # FluentLineEdit / spinbox.  Only reserve space on the RIGHT for the dot.
+        margin = self._dot_size() + scaled_px(3)
+        self.setTextMargins(0, 0, margin, 0)
+
+    def _place_dot(self) -> None:
+        diameter = self._dot_size()
+        x = self.width() - diameter - scaled_px(4)
+        y = (self.height() - diameter) // 2
+        self._dot.setGeometry(int(x), int(y), int(diameter), int(diameter))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._place_dot()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._place_dot()
+
+    @property
+    def dot(self) -> "FluentScanDot":
+        return self._dot
+
+    def set_scan_bound(self, bound: bool, number: int | None = None) -> None:
+        self._bound = bool(bound)
+        self._dot.setChecked(self._bound)
+        self._dot.set_number(number if self._bound else None)
+        self.setReadOnly(self._bound)
+        if self._bound:
+            self.setStyleSheet(
+                f"""
+                QLineEdit {{
+                    background: {ORANGE_TINT};
+                    color: {ORANGE_DARK};
+                    border: 1px solid {ORANGE};
+                    border-radius: {_radius()}px;
+                    padding: {scaled_px(PADDING_V)}px {scaled_px(EDIT_PADDING_H)}px;
+                    font: {fluent_font_size()}pt "{FONT}";
+                }}
+                """
+            )
+        else:
+            self.setStyleSheet(self._base_style)
+        self._reserve_right()
+        self.update()
+
+    def set_editable(self, editable: bool) -> None:
+        """Toggle text editability *without disabling the widget*.
+
+        Disabling a ``QLineEdit`` also disables its child scan dot, which would
+        make the dot un-clickable -- you could no longer bind/unbind a scan
+        slot.  So an inactive field (e.g. a ``hold`` bus segment) instead goes
+        read-only with a muted style while staying enabled, keeping the dot
+        live.  The bound (orange) state owns its own appearance, so this is a
+        no-op while bound.
+        """
+
+        if self._bound:
+            return
+        self.setReadOnly(not editable)
+        self.setStyleSheet(self._base_style if editable else _muted_line_style())
+        self._reserve_right()
+        self.update()
+
+
+class FluentLabeledField(QtWidgets.QWidget):
+    """A ``label : widget [suffix]`` row with a shared, aligned height."""
+
+    def __init__(self, label: str, widget: QtWidgets.QWidget, *, label_width: int | None = None, suffix: QtWidgets.QWidget | None = None, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet("background: transparent;")
+        layout = QtWidgets.QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(Metrics.gap_item())
+        self.label = ElidedLabel(str(label))
+        self.label.setFixedHeight(Metrics.row_h())
+        if label_width is not None:
+            self.label.setFixedWidth(int(label_width))
+        layout.addWidget(self.label)
+        widget.setFixedHeight(Metrics.row_h())
+        layout.addWidget(widget, 1)
+        self.field = widget
+        self.suffix = suffix
+        if suffix is not None:
+            layout.addWidget(suffix, 0, QtCore.Qt.AlignVCenter)
+
+
+class FluentFormGrid(QtWidgets.QWidget):
+    """A multi-column form whose first (label) column is shared and aligned.
+
+    Every row keeps the same height and the same label-column width, so a stack
+    of forms lines up without per-row fixed geometry.
+    """
+
+    def __init__(self, parent=None, *, label_width: int | None = None):
+        super().__init__(parent)
+        self.setStyleSheet("background: transparent;")
+        self.grid = QtWidgets.QGridLayout(self)
+        self.grid.setContentsMargins(0, 0, 0, 0)
+        self.grid.setHorizontalSpacing(Metrics.gap_item())
+        self.grid.setVerticalSpacing(Metrics.gap_row())
+        self.grid.setColumnStretch(1, 1)
+        self._rows = 0
+        if label_width is not None:
+            self.grid.setColumnMinimumWidth(0, int(label_width))
+
+    def add_row(self, label, *widgets) -> ElidedLabel | QtWidgets.QWidget:
+        cell = ElidedLabel(str(label)) if isinstance(label, str) else label
+        cell.setFixedHeight(Metrics.row_h())
+        self.grid.addWidget(cell, self._rows, 0)
+        for column, widget in enumerate(widgets, start=1):
+            widget.setFixedHeight(Metrics.row_h())
+            self.grid.addWidget(widget, self._rows, column)
+        self._rows += 1
+        return cell
+
+
 __all__ = [
     "ACCENT",
     "BG",
@@ -1035,4 +1406,12 @@ __all__ = [
     "scaled_px",
     "set_fluent_scale",
     "status_dot_stylesheet",
+    "Metrics",
+    "ElidedLabel",
+    "FluentScanDot",
+    "FluentScanLineEdit",
+    "FluentLabeledField",
+    "FluentFormGrid",
+    "measure_text_width",
+    "mark_scan_field",
 ]

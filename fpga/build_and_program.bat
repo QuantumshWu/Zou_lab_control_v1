@@ -3,10 +3,10 @@ setlocal EnableExtensions EnableDelayedExpansion
 
 if /I not "%~1"=="--inner" (
   set "ZLC_ACTION=build/program"
-  if /I "%~1"=="--check" set "ZLC_ACTION=40ch synth check"
+  if /I "%~1"=="--check" set "ZLC_ACTION=62ch synth check"
   if /I "%~1"=="--diagnose" set "ZLC_ACTION=hardware diagnose"
-  if /I "%~1"=="--build-only" set "ZLC_ACTION=40ch build"
-  if /I "%~1"=="--program-only" set "ZLC_ACTION=40ch program"
+  if /I "%~1"=="--build-only" set "ZLC_ACTION=62ch build"
+  if /I "%~1"=="--program-only" set "ZLC_ACTION=62ch program"
   call "%~f0" --inner %*
   set "ZLC_STATUS=!ERRORLEVEL!"
   if "!ZLC_STATUS!"=="0" (
@@ -47,11 +47,12 @@ if not "%~1"=="" if "%MODE%"=="all" (
 call :zlc_find_vivado
 if errorlevel 1 exit /b 1
 call :zlc_default_paths
-call :zlc_verify_40ch_sources
+call :zlc_verify_address_switch_sources
 if errorlevel 1 exit /b 1
+call :zlc_print_capacity_estimate
 
 if /I "%MODE%"=="check" (
-  call :zlc_run_tcl "check_40ch_synth.tcl"
+  call :zlc_run_tcl "check_address_switch_synth.tcl"
   exit /b !ERRORLEVEL!
 )
 
@@ -62,84 +63,124 @@ if /I "%MODE%"=="diagnose" (
 
 if /I "%MODE%"=="program" goto zlc_program
 
-echo ZLC FPGA pulse streamer: build 40ch bitstream
-call :zlc_run_tcl "create_project_40ch.tcl"
+echo ZLC FPGA pulse streamer: build address-switch bitstream
+call :zlc_run_tcl "create_project_address_switch.tcl"
 if errorlevel 1 exit /b 1
 
 if /I "%MODE%"=="build" exit /b 0
 
 :zlc_program
-echo ZLC FPGA pulse streamer: program 40ch bitstream
-call :zlc_run_tcl "program_fpga_40ch.tcl"
+echo ZLC FPGA pulse streamer: program address-switch bitstream
+call :zlc_run_tcl "program_fpga_address_switch.tcl"
 exit /b %ERRORLEVEL%
 
 :zlc_help
-echo Build/program the 40-channel ZLC FPGA pulse-streamer.
+echo Build/program the address-switch ZLC FPGA pulse-streamer.
 echo.
 echo Usage:
-echo   fpga\build_and_program.bat              Build and program 40ch
-echo   fpga\build_and_program.bat --build-only Build 40ch only
-echo   fpga\build_and_program.bat --program-only Program existing 40ch bit/LTX
-echo   fpga\build_and_program.bat --check      No-XDC 40ch synthesis self-check
+echo   fpga\build_and_program.bat              Build and program address-switch outputs
+echo   fpga\build_and_program.bat --build-only Build only
+echo   fpga\build_and_program.bat --program-only Program existing bit/LTX
+echo   fpga\build_and_program.bat --check      No-XDC synthesis self-check
 echo   fpga\build_and_program.bat --diagnose   List Vivado hw targets/devices
 echo.
 echo Real build XDC:
-echo   fpga\pulse_streamer\zlc_pulse_streamer_40ch.xdc
-echo   This checked-in XDC is derived from the old address_switch pin map.
+echo   references\source_archives\address_switch\address_switch.srcs\constrs_1\new\addre.xdc
+echo   This original XDC is the default address_switch pin map.
 echo   For a different board/cable map, set:
-echo   set ZLC_PS_40CH_XDC=C:\path\to\board_40ch.xdc
+echo   set ZLC_PS_XDC=C:\path\to\board_address_switch.xdc
 echo.
 echo Optional:
 echo   set ZLC_PS_VIVADO_BIN=C:\Xilinx\Vivado\2019.2\bin\vivado.bat
-echo   set ZLC_PS_PROJECT_DIR=%%CD%%\fpga\build\p40
+echo   set ZLC_PS_PROJECT_DIR=%%CD%%\fpga\build\address_switch
+echo   set ZLC_PS_RESOURCE_TARGET_PCT=70
+echo   set ZLC_PS_MAX_SCAN_POINTS=1024
 exit /b 0
 
-:zlc_verify_40ch_sources
-set "ZLC_DEFAULT_XDC=%STREAMER_DIR%\zlc_pulse_streamer_40ch.xdc"
-if not defined ZLC_PS_40CH_XDC if not defined ZLC_PS_XDC set "ZLC_PS_40CH_XDC=%ZLC_DEFAULT_XDC%"
-set "ZLC_SELECTED_XDC=%ZLC_PS_40CH_XDC%"
+:zlc_verify_address_switch_sources
+set "ZLC_DEFAULT_XDC=%REPO_ROOT%\references\source_archives\address_switch\address_switch.srcs\constrs_1\new\addre.xdc"
+if not defined ZLC_PS_XDC set "ZLC_PS_XDC=%ZLC_DEFAULT_XDC%"
+set "ZLC_SELECTED_XDC=%ZLC_PS_XDC%"
 if not defined ZLC_SELECTED_XDC set "ZLC_SELECTED_XDC=%ZLC_PS_XDC%"
-if not defined ZLC_PS_40CH_XDC set "ZLC_PS_40CH_XDC=%ZLC_SELECTED_XDC%"
 if not defined ZLC_PS_XDC set "ZLC_PS_XDC=%ZLC_SELECTED_XDC%"
-if not exist "%STREAMER_DIR%\zlc_pulse_streamer_top_40ch.v" (
-  echo ERROR: missing 40ch top HDL: %STREAMER_DIR%\zlc_pulse_streamer_top_40ch.v
+if not exist "%STREAMER_DIR%\zlc_pulse_streamer_top_address_switch.v" (
+  echo ERROR: missing address-switch top HDL: %STREAMER_DIR%\zlc_pulse_streamer_top_address_switch.v
   exit /b 2
 )
-if not exist "%STREAMER_DIR%\create_project_40ch.tcl" (
-  echo ERROR: missing 40ch build Tcl: %STREAMER_DIR%\create_project_40ch.tcl
+if not exist "%STREAMER_DIR%\create_project_address_switch.tcl" (
+  echo ERROR: missing address-switch build Tcl: %STREAMER_DIR%\create_project_address_switch.tcl
   exit /b 2
 )
-findstr /C:".EDGE_ADDR_WIDTH(10)" "%STREAMER_DIR%\zlc_pulse_streamer_top_40ch.v" >nul || (
-  echo ERROR: 40ch top is not the 1024-edge build. Expected .EDGE_ADDR_WIDTH^(10^).
+findstr /C:"localparam integer CHANNEL_COUNT = 62" "%STREAMER_DIR%\zlc_pulse_streamer_top_address_switch.v" >nul || (
+  echo ERROR: pulse-streamer top is not the 62-output address-switch wrapper.
   exit /b 2
 )
-findstr /C:"CONFIG.C_PROBE_OUT3_WIDTH {10}" "%STREAMER_DIR%\create_project_40ch.tcl" >nul || (
-  echo ERROR: create_project_40ch.tcl has stale prog_addr width. Expected VIO probe_out3 width 10.
+findstr /C:".EDGE_ADDR_WIDTH(10)" "%STREAMER_DIR%\zlc_pulse_streamer_top_address_switch.v" >nul || (
+  echo ERROR: address-switch top is not the 1024-edge build. Expected .EDGE_ADDR_WIDTH^(10^).
   exit /b 2
 )
-findstr /C:"CONFIG.C_PROBE_OUT6_WIDTH {11}" "%STREAMER_DIR%\create_project_40ch.tcl" >nul || (
-  echo ERROR: create_project_40ch.tcl has stale prog_count width. Expected VIO probe_out6 width 11.
+findstr /C:".SCAN_ADDR_WIDTH(10)" "%STREAMER_DIR%\zlc_pulse_streamer_top_address_switch.v" >nul || (
+  echo ERROR: address-switch top is not the 1024-scan-pair build. Expected .SCAN_ADDR_WIDTH^(10^).
   exit /b 2
 )
-findstr /C:"zlc_safe_project_dir" "%STREAMER_DIR%\create_project_40ch.tcl" >nul || (
-  echo ERROR: create_project_40ch.tcl is missing the Vivado path-length guard.
+findstr /C:"CONFIG.C_PROBE_OUT3_WIDTH {10}" "%STREAMER_DIR%\create_project_address_switch.tcl" >nul || (
+  echo ERROR: create_project_address_switch.tcl has stale prog_addr width. Expected VIO probe_out3 width 10.
+  exit /b 2
+)
+findstr /C:"CONFIG.C_PROBE_OUT5_WIDTH {62}" "%STREAMER_DIR%\create_project_address_switch.tcl" >nul || (
+  echo ERROR: create_project_address_switch.tcl has stale mask width. Expected VIO probe_out5 width 62.
+  exit /b 2
+)
+findstr /C:"CONFIG.C_PROBE_OUT6_WIDTH {11}" "%STREAMER_DIR%\create_project_address_switch.tcl" >nul || (
+  echo ERROR: create_project_address_switch.tcl has stale prog_count width. Expected VIO probe_out6 width 11.
+  exit /b 2
+)
+findstr /C:"CONFIG.C_NUM_PROBE_OUT {30}" "%STREAMER_DIR%\create_project_address_switch.tcl" >nul || (
+  echo ERROR: create_project_address_switch.tcl has stale VIO probe count. Expected 30 output probes for scan and analog bus support.
+  exit /b 2
+)
+findstr /C:"CONFIG.C_PROBE_OUT18_WIDTH {11}" "%STREAMER_DIR%\create_project_address_switch.tcl" >nul || (
+  echo ERROR: create_project_address_switch.tcl has stale scan_count width. Expected VIO probe_out18 width 11.
+  exit /b 2
+)
+findstr /C:"CONFIG.C_PROBE_OUT29_WIDTH {28}" "%STREAMER_DIR%\create_project_address_switch.tcl" >nul || (
+  echo ERROR: create_project_address_switch.tcl has stale bus_counts width. Expected VIO probe_out29 width 28.
+  exit /b 2
+)
+findstr /C:"zlc_safe_project_dir" "%STREAMER_DIR%\create_project_address_switch.tcl" >nul || (
+  echo ERROR: create_project_address_switch.tcl is missing the Vivado path-length guard.
   exit /b 2
 )
 if not exist "!ZLC_SELECTED_XDC!" (
-  echo ERROR: missing 40ch XDC: !ZLC_SELECTED_XDC!
-  echo Restore fpga\pulse_streamer\zlc_pulse_streamer_40ch.xdc. It is derived from references\source_archives\address_switch\address_switch.srcs\constrs_1\new\addre.xdc.
+  echo ERROR: missing address-switch XDC: !ZLC_SELECTED_XDC!
+  echo Restore references\source_archives\address_switch\address_switch.srcs\constrs_1\new\addre.xdc or set ZLC_PS_XDC.
   exit /b 2
 )
-findstr /C:"[get_ports {ch[39]}]" "!ZLC_SELECTED_XDC!" >nul || (
-  echo ERROR: selected XDC does not define ch[39]; this is not a full 40ch pulse-streamer XDC.
+findstr /C:"[get_ports trig]" "!ZLC_SELECTED_XDC!" >nul || (
+  echo ERROR: selected XDC does not define the address_switch trig output.
   exit /b 2
 )
 findstr /C:"<PIN_CH" "!ZLC_SELECTED_XDC!" >nul && (
   echo ERROR: selected XDC still contains PIN_CH placeholders: !ZLC_SELECTED_XDC!
   exit /b 2
 )
-echo ZLC 40ch source contract: channels=40 max_edges=1024 edge_addr_width=10 prog_count_width=11
-echo ZLC 40ch XDC: !ZLC_SELECTED_XDC!
+echo ZLC address-switch source contract: channels=62 max_edges=1024 scan_pairs=1024 bus_segments=4x64 vio_outputs=30 edge_addr_width=10 scan_addr_width=10 bus_seg_addr_width=6 prog_count_width=11
+echo ZLC address-switch XDC: !ZLC_SELECTED_XDC!
+exit /b 0
+
+:zlc_print_capacity_estimate
+if "%ZLC_PS_RESOURCE_TARGET_PCT%"=="" set "ZLC_PS_RESOURCE_TARGET_PCT=70"
+if "%ZLC_PS_MAX_SCAN_POINTS%"=="" set "ZLC_PS_MAX_SCAN_POINTS=1024"
+where python >nul 2>nul
+if errorlevel 1 (
+  echo ZLC capacity estimate skipped: python was not found on PATH.
+  echo ZLC resource target: %ZLC_PS_RESOURCE_TARGET_PCT%%% LUT, max_edges=1024, scan_pairs=%ZLC_PS_MAX_SCAN_POINTS%, bus_segments=4x64
+  exit /b 0
+)
+pushd "%REPO_ROOT%"
+set "PYTHONPATH=%CD%;%PYTHONPATH%"
+python -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer capacity_estimate --channel-count 62 --max-edges 1024 --max-scan-points %ZLC_PS_MAX_SCAN_POINTS% --tick-width 32 --resource-target-pct %ZLC_PS_RESOURCE_TARGET_PCT%
+popd
 exit /b 0
 
 :zlc_default_paths
@@ -151,17 +192,17 @@ if not defined ZLC_PS_BUILD_ROOT set "ZLC_PS_BUILD_ROOT=%FPGA_DIR%build"
 if not exist "!ZLC_PS_BUILD_ROOT!\" mkdir "!ZLC_PS_BUILD_ROOT!" >nul 2>nul
 
 :zlc_have_build_root
-if not defined ZLC_PS_PROJECT_DIR set "ZLC_PS_PROJECT_DIR=%ZLC_PS_BUILD_ROOT%\p40"
-if not defined ZLC_PS_CHECK_PROJECT_DIR set "ZLC_PS_CHECK_PROJECT_DIR=%ZLC_PS_BUILD_ROOT%\c40"
+if not defined ZLC_PS_PROJECT_DIR set "ZLC_PS_PROJECT_DIR=%ZLC_PS_BUILD_ROOT%\address_switch"
+if not defined ZLC_PS_CHECK_PROJECT_DIR set "ZLC_PS_CHECK_PROJECT_DIR=%ZLC_PS_BUILD_ROOT%\check_address_switch"
 if not defined ZLC_PS_LOG_DIR set "ZLC_PS_LOG_DIR=%ZLC_PS_BUILD_ROOT%\logs"
 echo ZLC build root: %ZLC_PS_BUILD_ROOT%
 if defined ZLC_PS_PROJECT_DIR if /I not "!ZLC_PS_PROJECT_DIR:pulse_streamer\build=!"=="!ZLC_PS_PROJECT_DIR!" (
   echo Ignoring old pulse_streamer build-local ZLC_PS_PROJECT_DIR: !ZLC_PS_PROJECT_DIR!
-  set "ZLC_PS_PROJECT_DIR=%ZLC_PS_BUILD_ROOT%\p40"
+  set "ZLC_PS_PROJECT_DIR=%ZLC_PS_BUILD_ROOT%\address_switch"
 )
 if defined ZLC_PS_CHECK_PROJECT_DIR if /I not "!ZLC_PS_CHECK_PROJECT_DIR:pulse_streamer\build=!"=="!ZLC_PS_CHECK_PROJECT_DIR!" (
   echo Ignoring old pulse_streamer build-local ZLC_PS_CHECK_PROJECT_DIR: !ZLC_PS_CHECK_PROJECT_DIR!
-  set "ZLC_PS_CHECK_PROJECT_DIR=%ZLC_PS_BUILD_ROOT%\c40"
+  set "ZLC_PS_CHECK_PROJECT_DIR=%ZLC_PS_BUILD_ROOT%\check_address_switch"
 )
 call :zlc_clear_unsafe_artifact ZLC_PS_VIVADO_PROJECT
 call :zlc_clear_unsafe_artifact ZLC_PS_VIVADO_BIT
@@ -220,7 +261,7 @@ if not exist "%DIRECT_TCL%" (
 if not exist "%ZLC_PS_LOG_DIR%" mkdir "%ZLC_PS_LOG_DIR%" >nul 2>nul
 
 echo ZLC direct Vivado path: %DIRECT_TCL%
-if /I "%TCL_NAME%"=="check_40ch_synth.tcl" (
+if /I "%TCL_NAME%"=="check_address_switch_synth.tcl" (
   echo ZLC check project dir: !ZLC_PS_CHECK_PROJECT_DIR!
 ) else (
   echo ZLC project dir: !ZLC_PS_PROJECT_DIR!

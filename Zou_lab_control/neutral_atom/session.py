@@ -102,12 +102,20 @@ class NeutralAtomSession:
     def _imaging_channel_kwargs(self) -> dict[str, str]:
         sequencer = getattr(self.devices, "sequencer", None)
         channels = list(getattr(sequencer, "channels", ()))
-        if all(f"ch{index:02d}" in channels for index in range(4)):
+        trigger_channels = list(getattr(sequencer, "trigger_channels", ()))
+        if all(channel in channels for channel in ("ch00", "ch03", "ch09")) and trigger_channels and trigger_channels[0] in channels:
             return {
-                "trap_channel": "ch00",
-                "cooling_channel": "ch01",
-                "probe_channel": "ch02",
-                "trigger_channel": "ch03",
+                "trap_channel": "ch09",
+                "cooling_channel": "ch00",
+                "probe_channel": "ch03",
+                "trigger_channel": trigger_channels[0],
+            }
+        if all(channel in channels for channel in ("trap", "cooling", "probe", "emCCD")):
+            return {
+                "trap_channel": "trap",
+                "cooling_channel": "cooling",
+                "probe_channel": "probe",
+                "trigger_channel": "emCCD",
             }
         return {}
 
@@ -191,15 +199,13 @@ class NeutralAtomSession:
             reference_sequencer = getattr(self.devices, "sequencer", None)
         else:
             reference_x_ns = float(reference_exposure) * 1e9
-            if hasattr(pulse, "x_ns"):
-                pulse.x_ns = reference_x_ns
             configure = getattr(self.devices.camera, "configure", None)
             if callable(configure):
                 configure(exposure=float(reference_exposure))
             frame_sequence = getattr(pulse, "frame_sequence", None)
             if not callable(frame_sequence):
                 raise TypeError("pulse must be a PulseController returned by exp.timing.bind_pulse(...) or na.bind_pulse(...).")
-            reference_sequence = frame_sequence(reference_shots, x_ns=reference_x_ns)
+            reference_sequence = frame_sequence(reference_shots, time_ns=reference_x_ns)
             reference_sequencer = getattr(pulse, "sequencer", getattr(self.devices, "sequencer", None))
         reference_images = self.devices.camera.acquire(
             reference_shots,
@@ -231,15 +237,13 @@ class NeutralAtomSession:
                 sequencer = getattr(self.devices, "sequencer", None)
             else:
                 x_ns = float(time_s) * 1e9
-                if hasattr(pulse, "x_ns"):
-                    pulse.x_ns = x_ns
                 configure = getattr(self.devices.camera, "configure", None)
                 if callable(configure):
                     configure(exposure=float(time_s))
                 frame_sequence = getattr(pulse, "frame_sequence", None)
                 if not callable(frame_sequence):
                     raise TypeError("pulse must be a PulseController returned by exp.timing.bind_pulse(...) or na.bind_pulse(...).")
-                sequence = frame_sequence(shots, x_ns=x_ns)
+                sequence = frame_sequence(shots, time_ns=x_ns)
                 sequencer = getattr(pulse, "sequencer", getattr(self.devices, "sequencer", None))
             images = self.devices.camera.acquire(shots, sequence=sequence, sequencer=sequencer)
             counts = np.vstack(
@@ -284,7 +288,7 @@ class NeutralAtomSession:
         errors: list[str] = []
         warnings: list[str] = []
         sequencer = getattr(self.devices, "sequencer", None)
-        clock = getattr(sequencer, "clock_hz", 250e6)
+        clock = getattr(sequencer, "clock_hz", 50_000_000.0)
         channels = getattr(sequencer, "channels", None)
         pulse_report = sequence.validate(clock_hz=clock, channels=channels)
         errors.extend(pulse_report.errors)
@@ -308,7 +312,7 @@ class NeutralAtomSession:
         sequence = sequence or self.sequence
         sequencer = getattr(self.devices, "sequencer", None)
         channels = getattr(sequencer, "channels", sequence.channels)
-        clock = getattr(sequencer, "clock_hz", 250e6)
+        clock = getattr(sequencer, "clock_hz", 50_000_000.0)
         pin_map = getattr(sequencer, "pin_map", None)
         build = generate_verilog(sequence, channels=channels, clock_hz=clock, module_name="neutral_atom_sequence")
         files = write_verilog_bundle(build, output_dir, pin_map=pin_map)

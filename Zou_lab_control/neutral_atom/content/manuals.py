@@ -1,102 +1,10 @@
-"""Neutral-atom manual text and figure generation."""
+"""Neutral-atom manual text generation."""
 
 from __future__ import annotations
 
 from importlib import resources
 from pathlib import Path
-
-import numpy as np
-
-
-def _save_plot(plot_obj, path: Path) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    plot_obj.fig.savefig(path, bbox_inches="tight", dpi=180)
-    return path
-
-
-def _save_pulse_streamer_flow_figure(path: Path) -> Path:
-    import matplotlib.pyplot as plt
-    from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig, ax = plt.subplots(figsize=(12.8, 5.8), dpi=180)
-    ax.set_xlim(0, 12.8)
-    ax.set_ylim(0, 5.8)
-    ax.axis("off")
-
-    nodes = [
-        ((0.35, 3.35), "Pulse GUI / Notebook", "PulseTableState\nvisible subset"),
-        ((2.45, 3.35), "RemoteSequencer", "JSON over RPyC\nprepare / fire"),
-        ((4.55, 3.35), "FPGA PC server", "compile full\nch00..ch39 masks"),
-        ((6.65, 3.35), "Vivado session", "VIO probes\nchanged rows"),
-        ((8.75, 3.35), "Verilog core", "tick_mem + mask_mem\nstate machine"),
-        ((10.85, 3.35), "40 TTL outputs", "qCMOS trigger\ntrap / cooling / probe"),
-    ]
-    box_w = 1.65
-    box_h = 1.25
-    colors = ["#EAF3F8", "#EEF6EA", "#FFF6DE", "#F7ECF1", "#ECECFA", "#F2F2F2"]
-
-    for idx, ((x, y), title, body) in enumerate(nodes):
-        box = FancyBboxPatch(
-            (x, y),
-            box_w,
-            box_h,
-            boxstyle="round,pad=0.08,rounding_size=0.08",
-            linewidth=1.2,
-            edgecolor="#4A6472",
-            facecolor=colors[idx],
-        )
-        ax.add_patch(box)
-        ax.text(x + box_w / 2, y + 0.86, title, ha="center", va="center", fontsize=9.2, weight="bold", color="#23343D")
-        ax.text(x + box_w / 2, y + 0.38, body, ha="center", va="center", fontsize=8.0, color="#3B4A52")
-
-    def arrow(x0, y0, x1, y1, label=None, color="#5D7583"):
-        ax.add_patch(FancyArrowPatch((x0, y0), (x1, y1), arrowstyle="-|>", mutation_scale=14, linewidth=1.3, color=color))
-        if label:
-            ax.text((x0 + x1) / 2, (y0 + y1) / 2 + 0.20, label, ha="center", va="bottom", fontsize=7.8, color=color)
-
-    for i in range(len(nodes) - 1):
-        x0, y0 = nodes[i][0]
-        x1, y1 = nodes[i + 1][0]
-        arrow(x0 + box_w, y0 + box_h / 2, x1, y1 + box_h / 2)
-
-    ax.text(6.4, 5.08, "Runtime pulse-streamer path", ha="center", va="center", fontsize=15, weight="bold", color="#22313A")
-    ax.text(
-        6.4,
-        4.78,
-        "GUI/API is only the front-end; the FPGA server owns compilation and hardware upload.",
-        ha="center",
-        va="center",
-        fontsize=9.2,
-        color="#53656D",
-    )
-
-    lower = [
-        (0.65, 1.55, 3.15, "Edit pulse once:\nname, delays, periods, bracket, x"),
-        (3.6, 1.55, 3.15, "Prepare before camera arm:\nreset high, upload ticks/masks, release reset"),
-        (7.05, 1.55, 2.15, "Fire:\none start pulse"),
-        (9.65, 1.55, 2.45, "After start:\nFPGA clock owns edge timing"),
-    ]
-    for x, y, w, text in lower:
-        box = FancyBboxPatch(
-            (x, y),
-            w,
-            0.72,
-            boxstyle="round,pad=0.08,rounding_size=0.08",
-            linewidth=1.0,
-            edgecolor="#B2A469",
-            facecolor="#FFF9E8",
-        )
-        ax.add_patch(box)
-        ax.text(x + w / 2, y + 0.36, text, ha="center", va="center", fontsize=8.0, color="#5C4D19")
-
-    arrow(5.15, 3.35, 5.15, 2.35, "edge table", color="#9A765E")
-    arrow(8.0, 2.27, 8.0, 3.35, "VIO", color="#9A765E")
-    arrow(8.12, 1.92, 9.08, 3.34, "start", color="#7A6FA4")
-
-    fig.savefig(path, bbox_inches="tight")
-    plt.close(fig)
-    return path
+from typing import Mapping
 
 
 def _template_text(name: str) -> str:
@@ -104,79 +12,110 @@ def _template_text(name: str) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def generate_hardware_quickstart_figures(asset_dir: str | Path) -> dict[str, Path]:
-    """Generate figures used by the hardware quickstart manual."""
+def _device_placeholder_image(path: Path, caption: str) -> Path:
+    """Write a small matplotlib placeholder so the manual still builds even if
+    the live virtual-backend render is unavailable."""
 
     import matplotlib
 
-    matplotlib.use("Agg", force=True)
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    import Zou_lab_control.frontend as zf
-    import Zou_lab_control.neutral_atom as na
+    fig, ax = plt.subplots(figsize=(4.0, 2.4))
+    ax.axis("off")
+    ax.text(0.5, 0.5, caption, ha="center", va="center", wrap=True, fontsize=9)
+    fig.savefig(path, bbox_inches="tight", dpi=150)
+    plt.close(fig)
+    return path
 
-    zf.apply_style()
+
+def _render_threshold_hist(path: Path) -> Path:
+    """Render the REAL threshold-calibration histogram the readout tutorial
+    produces, using the offline virtual backend (no hardware)."""
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        from Zou_lab_control import neutral_atom as na
+
+        exp = na.connect("virtual")
+        exp.readout.sitemap(frames=6, display=False)
+        threshold_result = exp.readout.thresholds(frames=120, site=0, display=False)
+        plot = threshold_result.plot_site(0, display=False)
+        plot.fig.savefig(path, bbox_inches="tight", dpi=150)
+        plt.close(plot.fig)
+        return path
+    except Exception:  # pragma: no cover - defensive: keep the manual buildable
+        return _device_placeholder_image(path, "阈值直方图（暗/亮双峰 + Otsu 阈值）")
+
+
+def generate_device_manual_figures(asset_dir: str | Path) -> dict[str, Path]:
+    """Render the device-manual figures (real tutorial output) into asset_dir."""
+
     asset_dir = Path(asset_dir)
     asset_dir.mkdir(parents=True, exist_ok=True)
+    return {"threshold_hist": _render_threshold_hist(asset_dir / "device_threshold_hist.png")}
 
-    exp = na.connect(
-        "virtual",
-        bright_count_rate=3000,
-        background_count_rate=8,
-        loss_rate=0.1,
-        exposure=2e-3,
-        sitemap={"grid_shape": (5, 7), "spacing_px": 12.0, "roi_radius": 1, "sitemap_exposure": 0.02},
+
+def _threshold_figure_tex(fig_path: str) -> str:
+    caption = (
+        "虚拟后端\\tfocus{实跑}的 thresholds 标定直方图（Site 0，120 帧）：左峰为\\tfocus{暗}态"
+        "（背景+读出噪声），右峰为\\tfocus{亮}态（原子荧光），并叠加亮/暗高斯拟合；图中标注了 Otsu "
+        "阈值、拟合保真度与亮/暗占比。\\pyapi{detect} 时把单张图每格点的 ROI 计数与该阈值逐位比较，"
+        "得占据布尔；两峰分得越开、保真度越接近 1。本图由读出标定 \\pyapi{thresholds} 的 "
+        "\\pyapi{plot_site} 直接产出，而非示意图。"
     )
-    seq = exp.timing.configure_imaging(exposure=2e-3, load=True, trigger_width=20e-6, pre_trigger=100e-6)
-    expanded = na.sequence_for_frame_count(seq, 5)
-
-    pulse = zf.plot(expanded, kind="pulse", channels=exp.devices.sequencer.channels, title="Five-frame qCMOS trigger sequence", display=False)
-    pulse_path = _save_plot(pulse, asset_dir / "hardware_pulse_sequence.png")
-    plt.close(pulse.fig)
-
-    flow_path = _save_pulse_streamer_flow_figure(asset_dir / "hardware_pulse_streamer_flow.png")
-
-    capture = exp.camera.capture(display=False)
-    capture_path = _save_plot(capture.plot, asset_dir / "hardware_capture.png")
-    plt.close(capture.plot.fig)
-
-    sitemap = exp.readout.sitemap(frames=12, display=False)
-    sitemap_path = _save_plot(sitemap.plot, asset_dir / "hardware_sitemap.png")
-    plt.close(sitemap.plot.fig)
-
-    threshold = exp.readout.thresholds(frames=80, site=0, display=False)
-    threshold_path = _save_plot(threshold.plot, asset_dir / "hardware_threshold.png")
-    plt.close(threshold.plot.fig)
-
-    shot = exp.readout.detect(display=False)
-    detect_path = _save_plot(shot.plot, asset_dir / "hardware_detect.png")
-    plt.close(shot.plot.fig)
-
-    clock_hz = exp.devices.sequencer.clock_hz
-    time_ticks = np.linspace(int(round(0.2e-3 * clock_hz)), int(round(8e-3 * clock_hz)), 60, dtype=int)
-    times = time_ticks / clock_hz
-    scan = exp.readout.detection_time(times, shots=20, live=False, display=False)
-    scan_path = _save_plot(scan.plot, asset_dir / "hardware_detection_time.png")
-    plt.close(scan.plot.fig)
-
-    return {
-        "pulse": pulse_path,
-        "pulse_streamer_flow": flow_path,
-        "capture": capture_path,
-        "sitemap": sitemap_path,
-        "threshold": threshold_path,
-        "detect": detect_path,
-        "scan": scan_path,
-    }
+    return (
+        "\\begin{figure}[h]\n\\centering\n"
+        f"\\includegraphics[width=0.6\\linewidth]{{{fig_path}}}\n"
+        f"\\caption{{{caption}}}\n"
+        "\\end{figure}"
+    )
 
 
-def hardware_quickstart_body(figures: dict[str, Path]) -> str:
-    """Return the hardware quickstart manual body with figure paths filled in."""
+def main_manual_body() -> str:
+    """Return the main (system-overview) manual body.
 
-    text = _template_text("hardware_quickstart_zh.texbody")
-    for name, path in figures.items():
-        text = text.replace(f"__FIG_{name.upper()}__", (Path("assets") / Path(path).name).as_posix())
-    return text
+    The main manual uses inline TikZ diagrams only, so no figure files are
+    required; the template compiles as-is.
+    """
+
+    return _template_text("main_manual_zh.texbody")
 
 
-__all__ = ["generate_hardware_quickstart_figures", "hardware_quickstart_body"]
+def fpga_manual_body() -> str:
+    """Return the FPGA (pulse-streamer) manual body.
+
+    The FPGA manual uses inline TikZ diagrams only, so no figure files are
+    required; the template compiles as-is.
+    """
+
+    return _template_text("fpga_manual_zh.texbody")
+
+
+def device_manual_body(figures: Mapping[str, Path] | None = None) -> str:
+    """Return the device & experiment manual body.
+
+    Covers device configuration/loading, camera capture, the camera-readout
+    tutorial (sitemap/thresholds/detect) with principles, calibration & result
+    objects, and the end-to-end experiment flow.  ``figures`` (from
+    :func:`generate_device_manual_figures`) injects the real threshold-histogram
+    image; omit it and the placeholder is simply dropped so the text still
+    compiles.
+    """
+
+    body = _template_text("device_manual_zh.texbody")
+    fig_path = None if not figures else figures.get("threshold_hist")
+    figure_tex = _threshold_figure_tex(Path(fig_path).as_posix()) if fig_path else ""
+    return body.replace("__READOUT_THRESHOLD_FIG__", figure_tex)
+
+
+__all__ = [
+    "device_manual_body",
+    "generate_device_manual_figures",
+    "fpga_manual_body",
+    "main_manual_body",
+]

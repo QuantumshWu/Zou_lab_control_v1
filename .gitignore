@@ -92,3 +92,6 @@ docs/**/*_zh.txt
 *.cache/
 *.hw/
 *.sim/
+
+# Scratch GUI verification screenshots (devtools output, not deliverables)
+/_gui_shots/

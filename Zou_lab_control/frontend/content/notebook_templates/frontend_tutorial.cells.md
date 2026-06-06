@@ -66,7 +66,7 @@ pl_map.data_figure.center()
 `kind="pulse"` 使用实心色块显示 on 区间，同时保留每个 channel 的 off baseline。baseline 和 block 使用同一个颜色、同一个 alpha，只是 baseline 是细线，on interval 是从 baseline 向上长出的实心块。y 轴 label 与该 channel 的 pulse 颜色一致，10 个 channel 仍然可读。x 轴会按总时长自动选择 `ns/us/ms/s`，避免时序图上全是很长的科学计数法秒数。
 
 <!-- cell:code -->
-channels = ["trap", "cooling", "probe", "qcm_trigger", "pushout", "microwave", "aod_x", "aod_y", "repump", "camera_gate"]
+channels = ["trap", "cooling", "probe", "trig", "pushout", "microwave", "aod_x", "aod_y", "repump", "camera_gate"]
 pulses = [
     {"channel": channel, "start": i * 1.4e-6, "duration": 0.9e-6 + (i % 3) * 0.16e-6, "value": 1, "name": channel}
     for i, channel in enumerate(channels)
@@ -76,26 +76,50 @@ pulse_plot = zf.plot(
     pulses,
     kind="pulse",
     channels=channels,
-    labels=("Time (s)", "Pulse", "State"),
+    labels=("Time (s)", "", "State"),
     title="10-channel timing check",
 )
 
 <!-- cell:markdown -->
 ## Pulse table model and PyQt pulse GUI
 
-`PulseTableState` 是 pulse GUI 和 notebook 共用的 period-card 模型。GUI 是可选前端；不打开 GUI 时，也可以直接用这个模型生成 `PulseSequence`。新建 pulse 默认名是 `pulse_YYYYMMDD_HHMMSS`。`channels` 是硬件 channel 名和 FPGA bit order，例如 `ch00/ch01/...`。standalone `pulse_gui.bat` 会从 `zlc_pulse_streamer_40ch.xdc` 的注释读取默认 display label，例如 `ch04 <- cooling_pgc`；JSON 里保存过的 `channel_labels` 优先，不会被默认名覆盖。Name 面板左侧固定显示硬件 channel，右侧是可选 display label；右侧 name 改动后，Delay 行、period checkbox 和 Preview y 轴会跟着显示这个 label。`time_step_ns` 是 minimal time，所有 duration、delay 和 `x_ns` 都要是它的整数倍；连接 sequencer 的 GUI 会默认用 `1e9 / sequencer.clock_hz`。40-channel 时默认只显示硬件顺序前 4 路，其它 channel 可以在 GUI 里临时添加或隐藏。`X` 会把该 channel 的所有 period 设为 off，但不自动隐藏；`Hide Off` 只看 period 是否为 on，delay 非零也可以隐藏；display name 和 delay 会保留，重新 Add Channel 会按硬件顺序插回原位。Preview 页自动调用 `zf.plot(..., kind="pulse")`，默认隐藏 always-off channel；如果 channel 有 display label，Preview y 轴显示 label，并用左右竖直 bracket 标记未展开 period table 里的 repeat 区间。没有 bracket 时是 `repeat ∞`；bracket 覆盖所有 period 时是有限外层 `repeat Pm-Pn xN`；bracket 在内部时整体仍然是 `repeat ∞`，Preview 会画整段 `∞` 和内部 `xN` 两套不同颜色的 bracket，状态栏显示 `repeat ∞ + Pm-Pn xN`。bracket 画在真实 start/stop 时间节点上，xlim 只负责留显示空间，负时间 tick label 会被隐藏。`Save Pulse` 默认保存到仓库 `pulses/` 目录；`Save Figure` 是 Preview 顶栏最右侧的一行按钮，单独保存 preview PNG。窗口固定为屏幕可用区域的一部分；小屏幕也可以手动传 `scale=0.82, window_ratio=0.90`。
+`PulseTableState` 是 pulse GUI 和 notebook 共用的 period-card 模型。GUI 是可选前端；不打开 GUI 时，也可以直接用这个模型生成 `PulseSequence`。新建 pulse 默认名是 `pulse_YYYYMMDD_HHMMSS`。`channels` 是硬件 channel 名和 FPGA bit order，例如 `ch00/ch01/...`；display label 只是前端名字。standalone `pulse_gui.bat` 会从 address-switch XDC 推断完整 channel list、display label 和 package pin；JSON 里保存过的 `channel_labels` 优先。`time_step_ns` 是 minimal time，连接默认 FPGA server 时是 20 ns。所有 duration、delay、`x_ns/y_ns` 和 scan array 都要是它的整数倍。GUI 默认只显示常用子集，其它 channel 可以在 GUI 里临时添加或隐藏；隐藏不改变上传宽度，compile/upload 会自动补齐完整硬件 channel order。Preview 页自动调用 `zf.plot(..., kind="pulse")`，默认隐藏 off-only channel，并保留 symbolic `x/y` 标记，不把 scan array 展开成大量 period columns。
+
+Pulse GUI 的 Edit 页可以按这个顺序读：
+
+```text
+Channel Names and Duration: pulse 名字、总时长、可见 channel 的 display name。
+Delay and Scan:             Step、Use Y、Scan X/Scan XY、每个 channel delay。
+Period cards:               每个 period 的 duration/unit 和 channel on/off。
+Control Buttons:            Stop Pulse、On Pulse、Add/Remove Column、Add Bracket、Save/Load。
+Channel View:               Add Channel、Hide Off、Show All 和 visible/hidden 计数。
+```
+
+Name 面板左侧 raw column 在 standalone address-switch 路线下显示 XDC package pin，
+例如 `M17/F15/N15/M13`，不是 `ch09/ch00/ch03/ch11`。硬件 bit 名仍然保存在
+tooltip、JSON 和 API state 中，所以保存、编译和上传不会丢失真正的 channel order。
+Preview y 轴显示 display label，例如 `trap/cooling/probe/emCCD`；如果打开
+`Show off rows`，它会显示完整硬件 channel list，但 y 轴仍然不显示总标题 `Pulse`。
+
+`On Pulse` 的语义和 API 一样：先读取当前 GUI state，按 attached sequencer 的
+clock/channel list 编译成 full-width edge table，`prepare` 上传，再 `fire`。如果
+GUI 只显示四路，上传仍然是完整 address-switch channel 宽度；没显示、没配置或被
+隐藏的 channel mask bit 都是 0。`Stop Pulse` 调用 sequencer safe/reset。GUI 没有
+独立 sync 按钮；等待 finite acquisition 完成属于 notebook/camera API。
 
 <!-- cell:code -->
 import Zou_lab_control.neutral_atom as na
 
 pulse_state = na.PulseTableState(
-    channels=[f"ch{i:02d}" for i in range(40)],
-    x_ns=50,
-    time_step_ns=10,
+    channels=[f"ch{i:02d}" for i in range(62)],
+    visible_channels=["ch09", "ch00", "ch03", "ch11"],
+    channel_labels={"ch09": "trap", "ch00": "cooling", "ch03": "probe", "ch11": "emCCD"},
+    x_ns=60,
+    time_step_ns=20,
 )
-pulse_state.set_period_state(0, "ch00", 1)
-pulse_sequence = pulse_state.to_sequence(time_step_ns=10)
-pulse_state.total_duration_steps(time_step_ns=10)
+pulse_state.set_period_state(0, "ch09", 1)
+pulse_sequence = pulse_state.to_sequence(time_step_ns=20)
+pulse_state.total_duration_steps(time_step_ns=20)
 
 api_pulse_plot = zf.plot(
     pulse_sequence,
@@ -108,12 +132,13 @@ api_pulse_plot = zf.plot(
 # pulse_gui = zf.show_pulse_gui(state=pulse_state, scale=0.82, window_ratio=0.90)
 
 <!-- cell:markdown -->
-`x_ns` 可以临时覆盖，用来扫某个 duration 或 delay。下面这个例子不打开 GUI，只用 API 生成四个不同宽度的 sequence，并编译成 100 MHz FPGA 的 integer tick edge table。
+`x_ns` 可以临时覆盖，用来扫某个 duration 或 delay。下面这个例子不打开 GUI，只用 API 生成四个不同宽度的 sequence，并编译成 50 MHz FPGA 的 integer tick edge table。GUI 里的同一件事是：把 period duration 写成 `x` 或 `100000-x`，在 `Scan X` 输入 `[240, 500, 1000, 2000]`；如果要二维扫描，打开 `Use Y`，这一行会变成 `Scan XY`，输入 `[(x0, y0), (x1, y1), ...]`。scan 数值会用和 duration/delay 一样的 resolution 逻辑对齐到 active step。
 
 <!-- cell:code -->
 x_scan_state = na.PulseTableState(
-    channels=["trap", "probe", "qcm_trigger"],
-    time_step_ns=10,
+    channels=["ch09", "ch03", "ch11"],
+    channel_labels={"ch09": "trap", "ch03": "probe", "ch11": "emCCD"},
+    time_step_ns=20,
     periods=[
         na.PulsePeriod(1000, (1, 0, 0), unit="ns", name="pre"),
         na.PulsePeriod("x", (1, 1, 1), unit="str (ns)", name="image"),
@@ -121,10 +146,47 @@ x_scan_state = na.PulseTableState(
     ],
 )
 
-x_widths_ns = [250, 500, 1000, 2000]
-x_sequences = [x_scan_state.to_sequence(x_ns=width, time_step_ns=10) for width in x_widths_ns]
-x_programs = [x_scan_state.compile(clock_hz=100_000_000, x_ns=width) for width in x_widths_ns]
-[(x_scan_state.total_duration_steps(x_ns=width, time_step_ns=10), program.ticks[-1]) for width, program in zip(x_widths_ns, x_programs)]
+x_widths_ns = [240, 500, 1000, 2000]
+x_sequences = [x_scan_state.to_sequence(x_ns=width, time_step_ns=20) for width in x_widths_ns]
+x_programs = [x_scan_state.compile(clock_hz=50_000_000, x_ns=width) for width in x_widths_ns]
+[(x_scan_state.total_duration_steps(x_ns=width, time_step_ns=20), program.ticks[-1]) for width, program in zip(x_widths_ns, x_programs)]
+
+<!-- cell:markdown -->
+For real hardware, do not let the GUI invent hardware. Start the server on the
+FPGA/Vivado computer, then attach the same `RemoteSequencer` from GUI or API:
+
+```python
+sequencer = na.RemoteSequencer(
+    host="192.168.0.20",
+    port=18861,
+    channels=[f"ch{i:02d}" for i in range(62)],
+    clock_hz=50_000_000,
+    trigger_channels=["ch11"],  # emCCD/M13 in the checked-in address-switch XDC
+)
+gui = zf.show_pulse_gui(
+    state=na.PulseTableState.load("pulses/camera_imaging_address_switch.json"),
+    sequencer=sequencer,
+)
+```
+
+The API equivalent of pressing `On Pulse` is:
+
+```python
+state = na.PulseTableState.load("pulses/camera_imaging_address_switch.json")
+program = state.compile(clock_hz=50_000_000, trigger_channels=["ch11"])
+sequencer.prepare(program)
+sequencer.fire()
+```
+
+In normal camera acquisition, prefer the higher-level readout helper because it
+arms qCMOS first and then fires a finite trigger sequence. Free-running
+`repeat_forever=True` is useful for scope checks, not for a finite camera stack.
+
+Analog bus rows such as `da_dipole` or `da_bias_x/y/z` are folded views of
+10-bit TTL groups. Their GUI value field is a line edit clamped to `0..1023`.
+Preview draws one hollow stair-step analog trace. The runtime uploads these rows
+through the FPGA analog-bus segment table, so a long bus ramp costs one bus
+segment instead of one ordinary TTL `prog_mask` edge per stair step.
 
 <!-- cell:markdown -->
 ## Live 2D scan

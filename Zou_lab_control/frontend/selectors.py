@@ -289,7 +289,8 @@ class ZoomPan:
             return
         x = event.xdata if event.xdata is not None else float(np.mean(self.ax.get_xlim()))
         y = event.ydata if event.ydata is not None else float(np.mean(self.ax.get_ylim()))
-        scale = 1 / self.zoom_scale if event.button == "up" else self.zoom_scale
+        # Scroll DOWN zooms in (smaller view range), scroll UP zooms out.
+        scale = self.zoom_scale if event.button == "up" else 1 / self.zoom_scale
         xlim = self.ax.get_xlim()
         ylim = self.ax.get_ylim()
         new_xlim = [x - (x - xlim[0]) * scale, x + (xlim[1] - x) * scale]

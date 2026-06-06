@@ -17,9 +17,7 @@ DEFAULT_CHANNELS = (
     "trap",
     "cooling",
     "probe",
-    "qcm_trigger",
-    "camera_trigger",
-    "trig",
+    "emCCD",
     "pushout",
     "microwave",
 )
@@ -156,7 +154,15 @@ class VirtualCamera(CameraDevice):
         if exposure is not None:
             self.exposure = positive_float(exposure, "exposure")
 
-    def acquire(self, frames: int = 1, *, sequence: PulseSequence | None = None, sequencer=None, **_) -> list[np.ndarray]:
+    def acquire(
+        self,
+        frames: int = 1,
+        *,
+        sequence: PulseSequence | None = None,
+        sequencer=None,
+        force_all_sites: bool | None = None,
+        **_,
+    ) -> list[np.ndarray]:
         frames = positive_int(frames, "frames")
         runtime_sequence = sequence
         if sequencer is not None and sequence is not None:
@@ -171,7 +177,15 @@ class VirtualCamera(CameraDevice):
         exposure = exposure_from_sequence(sequence, default=self.exposure)
         reload_each = sequence_requests_load(sequence)
         images: list[np.ndarray] = []
-        all_sites = sequence is not None and sequence.name == "sitemap"
+        # "All sites loaded" (for sitemap calibration) is best requested
+        # explicitly via ``force_all_sites``.  The legacy fallback keys off the
+        # sequence *name* == "sitemap"; an explicit value always wins so callers
+        # are not surprised by a hidden, virtual-only string match.
+        all_sites = (
+            bool(force_all_sites)
+            if force_all_sites is not None
+            else (sequence is not None and sequence.name == "sitemap")
+        )
         for _ in range(frames):
             if reload_each:
                 self.trap_array.reload()
@@ -200,7 +214,7 @@ class VirtualCamera(CameraDevice):
 
 
 class VirtualSequencer(SequencerDevice):
-    def __init__(self, channels: Sequence[str] = DEFAULT_CHANNELS, clock_hz: float = 250e6, sleep_scale: float = 0.0):
+    def __init__(self, channels: Sequence[str] = DEFAULT_CHANNELS, clock_hz: float = 50_000_000.0, sleep_scale: float = 0.0):
         self.channels = tuple(str(channel) for channel in channels)
         self.clock_hz = positive_float(clock_hz, "clock_hz")
         self.sleep_scale = nonnegative_float(sleep_scale, "sleep_scale")

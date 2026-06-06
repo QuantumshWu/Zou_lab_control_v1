@@ -708,6 +708,7 @@ def pulse_plot_channels(
     """Return the channels a pulse plot should display."""
 
     rows = _pulse_rows(sequence)
+    explicit_channels = channels is not None
     if channels is None:
         if hasattr(sequence, "channels"):
             channels = list(getattr(sequence, "channels"))
@@ -715,12 +716,12 @@ def pulse_plot_channels(
             channels = sorted({row["channel"] for row in rows})
     ordered = [str(channel) for channel in (channels or [])]
     if include_always_off:
-        return ordered or ["pulse"]
+        return ordered if explicit_channels else (ordered or ["pulse"])
     active = {row["channel"] for row in rows if row["value"] and row["duration"] > 0}
     visible = [channel for channel in ordered if channel in active]
     if not visible and ordered:
         visible = ordered[: max(0, min(int(minimum), len(ordered)))]
-    return visible or ["pulse"]
+    return visible if explicit_channels else (visible or ["pulse"])
 
 
 def pulse_plot_spec(
@@ -766,10 +767,10 @@ def pulse_repeat_notation(
     return f"repeat {inner}"
 
 
-def _pulse_period_starts_ns(periods, *, x_ns: float | None = None, time_step_ns: float | None = None) -> list[float]:
+def _pulse_period_starts_ns(periods, *, slots=None, time_step_ns: float | None = None) -> list[float]:
     starts_ns = [0.0]
     for period in periods:
-        duration_ns = period.duration_ns(x_ns=0.0 if x_ns is None else x_ns, time_step_ns=time_step_ns)
+        duration_ns = period.duration_ns(slots=slots, time_step_ns=time_step_ns)
         starts_ns.append(starts_ns[-1] + float(duration_ns))
     return starts_ns
 
@@ -780,7 +781,7 @@ def pulse_repeat_marker(
     repeat_start: int | None = None,
     repeat_end: int | None = None,
     repeat_count: int | None = None,
-    x_ns: float | None = None,
+    slots=None,
     time_step_ns: float | None = None,
     total_duration_s: float | None = None,
     default_forever: bool = True,
@@ -794,7 +795,7 @@ def pulse_repeat_marker(
         repeat_end = getattr(state_or_periods, "repeat_end", repeat_end)
         repeat_count = getattr(state_or_periods, "repeat_count", repeat_count)
         default_forever = bool(getattr(state_or_periods, "repeat_forever", default_forever))
-        x_ns = getattr(state_or_periods, "x_ns", x_ns)
+        slots = state_or_periods.reference_slots() if hasattr(state_or_periods, "reference_slots") else slots
         time_step_ns = getattr(state_or_periods, "time_step_ns", time_step_ns)
     elif state_or_periods is not None:
         periods = list(state_or_periods)
@@ -802,19 +803,19 @@ def pulse_repeat_marker(
     if periods is None:
         if total_duration_s is None or not default_forever:
             return None
-        return (0.0, float(total_duration_s), "∞")
+        return (0.0, float(total_duration_s), "×∞")
 
-    starts_ns = _pulse_period_starts_ns(periods, x_ns=x_ns, time_step_ns=time_step_ns)
+    starts_ns = _pulse_period_starts_ns(periods, slots=slots, time_step_ns=time_step_ns)
     if repeat_start is None or repeat_end is None:
         if not default_forever:
             return None
-        return (0.0, starts_ns[-1] * 1e-9, "∞")
+        return (0.0, starts_ns[-1] * 1e-9, "×∞")
     repeat_start = int(repeat_start)
     repeat_end = int(repeat_end)
     if repeat_start < 0 or repeat_end < repeat_start or repeat_end + 1 >= len(starts_ns):
         return None
     repeat_count = 1 if repeat_count is None else int(repeat_count)
-    return (starts_ns[repeat_start] * 1e-9, starts_ns[repeat_end + 1] * 1e-9, f"x{repeat_count}")
+    return (starts_ns[repeat_start] * 1e-9, starts_ns[repeat_end + 1] * 1e-9, f"×{repeat_count}")
 
 
 def pulse_repeat_markers(
@@ -823,7 +824,7 @@ def pulse_repeat_markers(
     repeat_start: int | None = None,
     repeat_end: int | None = None,
     repeat_count: int | None = None,
-    x_ns: float | None = None,
+    slots=None,
     time_step_ns: float | None = None,
     total_duration_s: float | None = None,
     default_forever: bool = True,
@@ -837,7 +838,7 @@ def pulse_repeat_markers(
         repeat_end = getattr(state_or_periods, "repeat_end", repeat_end)
         repeat_count = getattr(state_or_periods, "repeat_count", repeat_count)
         default_forever = bool(getattr(state_or_periods, "repeat_forever", default_forever))
-        x_ns = getattr(state_or_periods, "x_ns", x_ns)
+        slots = state_or_periods.reference_slots() if hasattr(state_or_periods, "reference_slots") else slots
         time_step_ns = getattr(state_or_periods, "time_step_ns", time_step_ns)
     elif state_or_periods is not None:
         periods = list(state_or_periods)
@@ -845,22 +846,22 @@ def pulse_repeat_markers(
     if periods is None:
         if total_duration_s is None or not default_forever:
             return []
-        return [(0.0, float(total_duration_s), "∞")]
+        return [(0.0, float(total_duration_s), "×∞")]
 
-    starts_ns = _pulse_period_starts_ns(periods, x_ns=x_ns, time_step_ns=time_step_ns)
+    starts_ns = _pulse_period_starts_ns(periods, slots=slots, time_step_ns=time_step_ns)
     total = starts_ns[-1] * 1e-9
     if repeat_start is None or repeat_end is None:
-        return [(0.0, total, "∞")] if default_forever else []
+        return [(0.0, total, "×∞")] if default_forever else []
 
     repeat_start = int(repeat_start)
     repeat_end = int(repeat_end)
     if repeat_start < 0 or repeat_end < repeat_start or repeat_end + 1 >= len(starts_ns):
         return []
     repeat_count = 1 if repeat_count is None else int(repeat_count)
-    inner = (starts_ns[repeat_start] * 1e-9, starts_ns[repeat_end + 1] * 1e-9, f"x{repeat_count}")
+    inner = (starts_ns[repeat_start] * 1e-9, starts_ns[repeat_end + 1] * 1e-9, f"×{repeat_count}")
     if repeat_start == 0 and repeat_end == len(periods) - 1:
         return [inner]
-    return [(0.0, total, "∞"), inner] if default_forever else [inner]
+    return [(0.0, total, "×∞"), inner] if default_forever else [inner]
 
 
 class PulseSequenceFigure(BaseLivePlot):
@@ -880,8 +881,9 @@ class PulseSequenceFigure(BaseLivePlot):
         repeat_notation: str | None = None,
         repeat_bracket: tuple[float, float, str] | None = None,
         repeat_brackets: Sequence[tuple[float, float, str]] | None = None,
+        analog_traces: Sequence[Mapping[str, Any]] | None = None,
         auto_height: bool = True,
-        labels: Sequence[str] = ("Time (s)", "Pulse", "State"),
+        labels: Sequence[str] = ("Time (s)", "", "State"),
         **kwargs,
     ):
         self.sequence = sequence
@@ -893,6 +895,7 @@ class PulseSequenceFigure(BaseLivePlot):
             repeat_brackets = [repeat_bracket] if repeat_bracket is not None else []
         self.repeat_brackets = [tuple(item) for item in repeat_brackets if item is not None]
         self.repeat_bracket = self.repeat_brackets[0] if self.repeat_brackets else None
+        self.analog_traces = [dict(item) for item in (analog_traces or [])]
         if channels is None:
             if hasattr(sequence, "channels"):
                 channels = list(getattr(sequence, "channels"))
@@ -906,7 +909,7 @@ class PulseSequenceFigure(BaseLivePlot):
         self.channel_colors = list(colors or PULSE_COLORS)
         dummy_n = max(1, len(self.pulses))
         if auto_height and not any(key in kwargs for key in ("spec", "data_px", "margins_px")):
-            kwargs["spec"] = pulse_plot_spec(len(self.channels))
+            kwargs["spec"] = pulse_plot_spec(len(self.channels) + len(self.analog_traces))
         super().__init__(np.arange(dummy_n, dtype=float), np.zeros((dummy_n, 1), dtype=float), labels=labels, relim_mode="tight", **kwargs)
 
     @property
@@ -923,11 +926,13 @@ class PulseSequenceFigure(BaseLivePlot):
         return left_limit, right_limit
 
     def init_core(self) -> None:
-        self.ax.set_ylabel(self.ylabel)
+        self.ax.set_ylabel("")
         color_map = {channel: self.channel_colors[i % len(self.channel_colors)] for i, channel in enumerate(self.channels)}
         row_height = 0.64 if len(self.channels) <= 10 else max(0.42, 6.4 / len(self.channels))
-        n_channels = len(self.channels)
-        index_map = {channel: n_channels - 1 - i for i, channel in enumerate(self.channels)}
+        analog_keys = [f"analog:{index}:{trace.get('name', 'analog')}" for index, trace in enumerate(self.analog_traces)]
+        row_keys = list(self.channels) + analog_keys
+        n_channels = len(row_keys)
+        index_map = {key: n_channels - 1 - i for i, key in enumerate(row_keys)}
         start_min = min([0.0] + [float(row["start"]) for row in self.pulses])
         stop_max = max([1e-12] + [float(row["stop"]) for row in self.pulses])
         bracket_bounds: list[tuple[float, float]] = []
@@ -949,7 +954,10 @@ class PulseSequenceFigure(BaseLivePlot):
         baseline_offset = row_height / 2
         pulse_zorder = 3
         self._pulse_baseline_y = {}
-        for channel, y in index_map.items():
+        self._analog_baseline_y = {}
+        self._pulse_row_height = row_height
+        for channel in self.channels:
+            y = index_map[channel]
             color = color_map[channel]
             baseline_y = y - baseline_offset
             self._pulse_baseline_y[channel] = baseline_y
@@ -998,13 +1006,73 @@ class PulseSequenceFigure(BaseLivePlot):
         self.ax.set_xlim(left_limit, right_limit)
         ylim_top = n_channels - 0.38
         if self.repeat_brackets:
-            ylim_top = n_channels + 0.45 + 0.16 * max(0, len(self.repeat_brackets) - 1)
+            ylim_top = n_channels + 0.78 + 0.26 * max(0, len(self.repeat_brackets) - 1)
         self.ax.set_ylim(-0.62, ylim_top)
-        self.ax.set_yticks([index_map[channel] for channel in self.channels])
-        self.ax.set_yticklabels([self.channel_labels.get(channel, channel) for channel in self.channels])
+        self.analog_trace_artists = []
+        self.analog_trace_labels = []
+        for trace_index, (key, trace) in enumerate(zip(analog_keys, self.analog_traces)):
+            y = index_map[key]
+            baseline_y = y - baseline_offset
+            row_top = baseline_y + row_height
+            name = str(trace.get("name", f"analog{trace_index}"))
+            self._analog_baseline_y[name] = baseline_y
+            max_value = max(1, int(trace.get("max", 1)))
+            color = self.channel_colors[(len(self.channels) + trace_index) % len(self.channel_colors)]
+            starts = np.asarray(trace.get("starts", []), dtype=float)
+            values = np.asarray(trace.get("values", []), dtype=float)
+            # Dashed, semi-transparent "0" reference baseline -- the analog
+            # analogue of a digital channel's off line.  Same colour + weight as
+            # the value trace, but dashed and more transparent so it reads as a
+            # reference while the solid value line stands out on top.
+            self.ax.plot(
+                [left_limit, right_limit],
+                [baseline_y, baseline_y],
+                color=color,
+                linewidth=0.65,
+                alpha=0.5,
+                linestyle=(0, (4, 3)),
+                zorder=pulse_zorder + 1,
+            )
+            if starts.size >= 2 and values.size >= 1:
+                # One continuous step line that reflects the ACTUAL DAC value
+                # (a value of 0 sits on the baseline), drawn solid on top of the
+                # dashed reference.  Same weight + opacity as the digital channel
+                # lines (off_lines use linewidth=0.65, alpha=1.0).
+                x = starts[: values.size + 1]
+                y_values = baseline_y + row_height * np.clip(values[: x.size - 1] / max_value, 0.0, 1.0)
+                line_x = np.repeat(x, 2)[1:-1]
+                line_y = np.repeat(y_values, 2)
+                artist = self.ax.plot(
+                    line_x,
+                    line_y,
+                    color=color,
+                    linewidth=0.65,
+                    alpha=1.0,
+                    zorder=pulse_zorder + 2,
+                )[0]
+                self.analog_trace_artists.append(artist)
+            else:
+                # No value data: a flat solid line at 0 sits on the baseline.
+                artist = self.ax.plot(
+                    [left_limit, right_limit], [baseline_y, baseline_y],
+                    color=color, linewidth=0.65, alpha=1.0, zorder=pulse_zorder + 2,
+                )[0]
+                self.analog_trace_artists.append(artist)
+
+        self.ax.set_yticks([index_map[key] for key in row_keys])
+        self.ax.set_yticklabels(
+            [self.channel_labels.get(channel, channel) for channel in self.channels]
+            + [str(trace.get("label") or trace.get("name") or "analog") for trace in self.analog_traces]
+        )
         self.ax.tick_params(axis="y", labelsize=max(4.8, matplotlib.rcParams["ytick.labelsize"] - 1.2))
-        for tick, channel in zip(self.ax.get_yticklabels(), self.channels):
+        tick_labels = self.ax.get_yticklabels()
+        for tick, channel in zip(tick_labels, self.channels):
             tick.set_color(color_map[channel])
+        # Colour the analog-bus row labels to match their trace, exactly like the
+        # digital channels above -- otherwise the DAC rows' names stayed default
+        # black while every other label was tinted to its line.
+        for trace_index, tick in enumerate(tick_labels[len(self.channels):]):
+            tick.set_color(self.channel_colors[(len(self.channels) + trace_index) % len(self.channel_colors)])
         if self.repeat_notation and not self.repeat_brackets:
             self.ax.text(
                 0.995,
@@ -1025,7 +1093,7 @@ class PulseSequenceFigure(BaseLivePlot):
         for gridline in self.ax.get_xgridlines():
             gridline.set_zorder(0)
         self.ax.spines[["top", "right"]].set_visible(False)
-        self.lines = [*self.off_lines, *self.pulse_artists]
+        self.lines = [*self.off_lines, *self.pulse_artists, *self.analog_trace_artists]
 
     def update_core(self) -> None:
         pass
@@ -1053,8 +1121,8 @@ class PulseSequenceFigure(BaseLivePlot):
             color = colors[index % len(colors)]
             alpha = 0.58
             outer_depth = max(0, bracket_count - 1 - index)
-            y_low = -0.42 - 0.10 * outer_depth
-            y_high = float(n_channels) - 0.12 + 0.14 * outer_depth
+            y_low = -0.42 - 0.13 * outer_depth
+            y_high = float(n_channels) - 0.10 + 0.34 * outer_depth
             tick = tick_base
             if stop > start:
                 tick = min(tick, max(stop - start, 0.0) * 0.2)
@@ -1082,7 +1150,7 @@ class PulseSequenceFigure(BaseLivePlot):
             self.repeat_bracket_artists.extend([left_artist, right_artist])
             label_artist = self.ax.text(
                 stop + tick * 0.12,
-                y_high + 0.035,
+                y_high + 0.055,
                 label,
                 ha="left",
                 va="bottom",
@@ -1100,7 +1168,9 @@ class PulseSequenceFigure(BaseLivePlot):
             self.repeat_bracket_label = self.repeat_bracket_labels[-1]
 
     def _attach_interactions(self) -> None:
-        self.tools = attach_interaction(self.ax, area=False)
+        # Enable the left-drag area selector on the pulse timeline too (it used to
+        # be disabled), so a region can be box-selected like the other plots.
+        self.tools = attach_interaction(self.ax)
         self.area, self.cross, self.zoom, self.drag = self.tools.area, self.tools.cross, self.tools.zoom, self.tools.drag
 
     def _install_state(self) -> None:
@@ -1386,7 +1456,7 @@ def plot(
     elif normalized_kind == "pulse":
         if should_watch:
             raise ValueError("pulse plots are static timing diagrams; update='watch' is not supported.")
-        labels = tuple(labels or ("Time (s)", "Pulse", "State"))
+        labels = tuple(labels or ("Time (s)", "", "State"))
         plotter = PulseSequenceFigure(data_x, labels=labels, **kwargs).show(display=display)
     else:
         x = _as_data_x(data_x)

@@ -37,12 +37,15 @@ from .devices import (
     apply_device_overrides,
     available_device_configs,
     bind_pulse,
+    compile_pulse_table_scan_runtime_program,
     compile_pulse_table_runtime_program,
     compile_runtime_program,
     compile_runtime_program_for_payload,
     device_class_registry,
     device_config_dir,
     finite_frame_sequence,
+    infer_xdc_channel_pins,
+    infer_xdc_trigger_channels,
     load_devices,
     register_device_class,
     serve_runtime_sequencer,
@@ -51,6 +54,7 @@ from .devices import (
 from .views import image_to_points, plot_detection_image, plot_detection_scan, plot_image, plot_site_values, plot_threshold_hist
 from .devices import VerilogSequencer
 from .timing import (
+    ANALOG_BUS_MODES,
     DEFAULT_CAMERA_TRIGGER_CHANNELS,
     Pulse,
     PulsePeriod,
@@ -60,6 +64,7 @@ from .timing import (
     default_pulse_name,
     exposure_from_sequence,
     imaging_sequence,
+    infer_bus_channels,
     plot_sequence,
     positive_time_step_ns,
     quantized_time_ns,
@@ -98,6 +103,9 @@ def run_sequencer_server(*args, **kwargs):
 
 _PULSE_STREAMER_EXPORTS = {
     "DEFAULT_FPGA_CHANNEL_COUNT",
+    "DEFAULT_MAX_SCAN_POINTS",
+    "DEFAULT_SCAN_COEFF_FRAC_BITS",
+    "DEFAULT_SCAN_COEFF_WIDTH",
     "PulseStreamerHDLFiles",
     "PulseStreamerProbeNames",
     "VivadoPulseStreamerSession",
@@ -106,10 +114,13 @@ _PULSE_STREAMER_EXPORTS = {
     "hardware_channel_names",
     "infer_xdc_channel_count",
     "infer_xdc_channel_labels",
+    "infer_xdc_channel_pins",
     "infer_xdc_channels",
+    "infer_xdc_trigger_channels",
     "validate_pulse_streamer_program",
     "write_pulse_streamer_hdl_bundle",
     "write_vivado_pulse_streamer_tcl",
+    "capacity_estimate_text",
 }
 
 
@@ -125,10 +136,10 @@ def __getattr__(name: str):
     raise AttributeError(name)
 
 try:
-    from .notes import build_neutral_atom_hardware_manual, build_neutral_atom_manual
+    from .notes import build_fpga_manual, build_main_manual
 except Exception:  # pragma: no cover - notes import should not block experiments
-    build_neutral_atom_hardware_manual = None
-    build_neutral_atom_manual = None
+    build_fpga_manual = None
+    build_main_manual = None
 
 
 __all__ = [
@@ -140,6 +151,9 @@ __all__ = [
     "DEFAULT_CHANNELS",
     "DEFAULT_DCAM_MODULE",
     "DEFAULT_FPGA_CHANNEL_COUNT",
+    "DEFAULT_MAX_SCAN_POINTS",
+    "DEFAULT_SCAN_COEFF_FRAC_BITS",
+    "DEFAULT_SCAN_COEFF_WIDTH",
     "DetectionResult",
     "DetectionTimeScanResult",
     "DeviceSet",
@@ -148,6 +162,7 @@ __all__ = [
     "ManualSequencer",
     "MeasurementTaskResult",
     "NeutralAtomSession",
+    "ANALOG_BUS_MODES",
     "PreflightReport",
     "Pulse",
     "PulseController",
@@ -180,12 +195,14 @@ __all__ = [
     "apply_device_overrides",
     "available_device_configs",
     "bind_pulse",
-    "build_neutral_atom_manual",
-    "build_neutral_atom_hardware_manual",
+    "build_fpga_manual",
+    "build_main_manual",
     "calibrate_sitemap_from_images",
     "calibrate_threshold_from_images",
+    "capacity_estimate_text",
     "compile_runtime_program",
     "compile_pulse_table_runtime_program",
+    "compile_pulse_table_scan_runtime_program",
     "compile_runtime_program_for_payload",
     "connect",
     "count_trigger_pulses",
@@ -205,6 +222,7 @@ __all__ = [
     "hardware_channel_names",
     "image_to_points",
     "imaging_sequence",
+    "infer_bus_channels",
     "infer_xdc_channel_count",
     "infer_xdc_channel_labels",
     "infer_xdc_channels",

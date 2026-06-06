@@ -1,19 +1,22 @@
 <!-- cell:markdown -->
 # Neutral atom FPGA pulse-streamer server
 
-这个 notebook 在 Verilog/FPGA 电脑上运行。它启动 40ch FPGA pulse-streamer server，等待控制电脑上的 `RemoteSequencer` 连接。
+这个 notebook 在 Verilog/FPGA 电脑上运行。它对应 `fpga\build_and_program.bat`
+和 `fpga\run_server.bat` 的同一条 address-switch 路线。
 
-推荐架构是固定烧一个 `zlc_pulse_streamer_top_40ch` bitstream。control 电脑每次 acquisition 只发送 `PulseSequence` 或 GUI 的 `PulseTableState`；FPGA 电脑把它编译成未展开的 40-bit `ticks/masks` edge table 和 repeat metadata，上传到 FPGA runtime RAM，再给一个明确的 `zlc_start` low-high-low pulse。网络和 Vivado 只负责上传表和发 start，不参与微秒级 timing。
+推荐工作流：
 
 ```text
-control computer RemoteSequencer
+control computer RemoteSequencer / Pulse GUI
   -> RPyC
   -> SequencerService on FPGA/Vivado computer
-  -> fpga_pulse_streamer backend
-  -> fixed 40ch zlc_pulse_streamer bitstream
+  -> fpga_pulse_streamer Vivado/VIO runtime backend
+  -> fixed address-switch pulse-streamer bitstream
 ```
 
-GUI 只决定前端显示/编辑哪些 channel。无论 GUI 显示 4 路还是 40 路，server 上传到 FPGA 的 program 都按 `ch00...ch39` 补全；未配置 channel 的 mask bit 是 0。
+GUI 只决定前端显示/编辑哪些 channel。无论 GUI 显示几路，server 上传到
+FPGA 的 program 都按 XDC 推断的完整 channel order 补全；未配置 channel 的
+mask bit 是 0。
 
 <!-- cell:code -->
 {{BOOTSTRAP_CELL}}
@@ -28,7 +31,7 @@ import Zou_lab_control.neutral_atom as na
 zf.enable_long_output()
 
 <!-- cell:markdown -->
-## 1. Build and program the 40ch bitstream
+## 1. Build and program the address-switch bitstream
 
 PowerShell 推荐入口：
 
@@ -39,65 +42,66 @@ cd D:\ZLC
 .\fpga\build_and_program.bat
 ```
 
-`--check` 不需要真实 pin XDC，只做 40ch HDL/VIO 宽度自查。真实 build/program 默认使用 `fpga\pulse_streamer\zlc_pulse_streamer_40ch.xdc`；这份 XDC 已从旧 `address_switch` 的 pin map 生成，前四路是 `ch00=trap`、`ch01=cooling`、`ch02=probe`、`ch03=qcm_trigger/trig`。如果板卡或转接线不同，复制 `zlc_pulse_streamer_40ch.xdc.template` 到别处并设置：
+默认 XDC 是历史 address-switch pin map：
 
-```powershell
-$env:ZLC_PS_40CH_XDC = "D:\fpga_pin_maps\zlc_pulse_streamer_40ch_my_board.xdc"
+```text
+references\source_archives\address_switch\address_switch.srcs\constrs_1\new\addre.xdc
 ```
 
 如果 Vivado 不在默认路径：
 
 ```powershell
-$env:ZLC_PS_VIVADO_BIN = "C:\Xilinx\Vivado\2019.2\bin\vivado.bat"
+$env:ZLC_PS_VIVADO_BIN = "C:\Xilinx\Vivado\2019.1\bin\vivado.bat"
 ```
 
-`fpga\build_and_program.bat --diagnose` 可以列出 Vivado hardware target 和 FPGA device，不会 program 或 fire pulse。若 Vivado GUI 能看到 Digilent target 但 `Number of devices: 0`，先检查板卡供电、JTAG/mode jumper、线缆、power-source jumper，再重新 Auto Connect。
+如果要使用另一份已确认的板级 XDC：
 
-生成物默认在 repo 的 `fpga\build`。以 `fpga\build_and_program.bat` 打印的 `ZLC build root:` 和 `ZLC project dir:` 为准；默认位置是 `fpga\build\p40`。如果旧终端里的 `ZLC_PS_PROJECT_DIR` 仍指向 `fpga\pulse_streamer\build`，batch 会忽略它并回到 `fpga\build`，避免继续使用旧工程布局。如果当前 repo 路径太长，脚本会在 Vivado 慢 build 前直接提示把 repo 移到 `D:\ZLC` 这类短目录。
+```powershell
+$env:ZLC_PS_XDC = "D:\fpga_pin_maps\my_address_switch_board.xdc"
+```
+
+生成物默认在：
 
 ```text
-<ZLC project dir>\p40.xpr
-<ZLC project dir>\p40.runs\impl_1\zlc_pulse_streamer_top_40ch.bit
-<ZLC project dir>\p40.runs\impl_1\zlc_pulse_streamer_top_40ch.ltx
+fpga\build\address_switch\address_switch.xpr
+fpga\build\address_switch\address_switch.runs\impl_1\zlc_pulse_streamer_top_address_switch.bit
+fpga\build\address_switch\address_switch.runs\impl_1\zlc_pulse_streamer_top_address_switch.ltx
 ```
 
-VIO probe 约定：
-
-```text
-probe_out0  zlc_reset           width 1
-probe_out1  zlc_start           width 1
-probe_out2  zlc_prog_we         width 1
-probe_out3  zlc_prog_addr       width 10
-probe_out4  zlc_prog_tick       width 32
-probe_out5  zlc_prog_mask       width 40
-probe_out6  zlc_prog_count      width 11
-probe_out7  zlc_repeat_forever  width 1
-probe_out8  zlc_loop_start_addr width 10
-probe_out9  zlc_loop_end_tick   width 32
-probe_out10 zlc_loop_count      width 32
-probe_in0   zlc_running         width 1
-probe_in1   zlc_done            width 1
-```
-
-Verilog 原理：Python 上传的是 edge table，每一行是绝对 FPGA tick 和这一刻之后的 40-bit output mask。VIO 侧的 `reset/start/prog_we` 先经过两级 FPGA-clock 同步；`Fire` 给 `zlc_start` 一个 low-high-low pulse，Verilog 只把同步后的 rising edge 当成 start event；之后 FPGA 自己用 `time_count` 按 clock 数 tick，在 `time_count == tick_mem[edge_index]` 时更新 `state_mask`。所以微秒级 pulse timing 不依赖 Python、RPyC、Vivado 或 Windows 调度。`repeat_forever` 和 repeat bracket 也由 Verilog metadata 执行，不会展开成超长表。注意：如果 finite repeat bracket 嵌在 `repeat_forever=True` 的表里，bracket 跑完后整张表会从 period 0 再开始；如果 period 0 打开 load/cooling/probe，示波器上会看到周期性表头 pulse。
+`--diagnose` 可以列出 Vivado hardware target 和 FPGA device，不会 program 或
+fire pulse。若 Vivado GUI 能看到 Digilent target 但 `Number of devices: 0`，
+先检查板卡供电、JTAG/mode jumper、线缆、power-source jumper，再重新
+Auto Connect。
 
 <!-- cell:code -->
 PROJECT_ROOT = Path("..").resolve()
 FPGA_DIR = PROJECT_ROOT / "fpga" / "pulse_streamer"
+XDC = PROJECT_ROOT / "references" / "source_archives" / "address_switch" / "address_switch.srcs" / "constrs_1" / "new" / "addre.xdc"
 
-CHANNELS = [f"ch{i:02d}" for i in range(40)]
-TRIGGER_CHANNELS = ["ch03"]
-CLOCK_HZ = 100_000_000.0
-MAX_EDGES = 1024
-TICK_WIDTH = 32
+CHANNELS = na.infer_xdc_channels(XDC)
+CHANNEL_LABELS = na.infer_xdc_channel_labels(XDC)
+CHANNEL_PINS = na.infer_xdc_channel_pins(XDC)
+TRIGGER_CHANNELS = na.infer_xdc_trigger_channels(XDC)
+if not TRIGGER_CHANNELS:
+    raise RuntimeError("The selected XDC must label the camera trigger output as emCCD.")
+CLOCK_HZ = 50_000_000.0
+MAX_EDGES = int(os.environ.get("ZLC_PS_MAX_EDGES", "1024"))
+MAX_SCAN_POINTS = int(os.environ.get("ZLC_PS_MAX_SCAN_POINTS", "1024"))
+TICK_WIDTH = int(os.environ.get("ZLC_PS_TICK_WIDTH", "32"))
+RESOURCE_TARGET_PCT = int(os.environ.get("ZLC_PS_RESOURCE_TARGET_PCT", "70"))
+
+print("channel count:", len(CHANNELS))
+print("trigger:", TRIGGER_CHANNELS, {ch: CHANNEL_LABELS.get(ch) for ch in TRIGGER_CHANNELS})
+print("camera subset:", {ch: (CHANNEL_LABELS.get(ch), CHANNEL_PINS.get(ch)) for ch in ("ch09", "ch00", "ch03", "ch11")})
+print("trig output still exists:", "ch06", CHANNEL_LABELS.get("ch06"), CHANNEL_PINS.get("ch06"))
+print("clock:", CLOCK_HZ, "Hz; step:", 1e9 / CLOCK_HZ, "ns")
 
 for filename in (
     "zlc_pulse_streamer.v",
-    "zlc_pulse_streamer_top_40ch.v",
-    "zlc_pulse_streamer_40ch.xdc.template",
-    "create_project_40ch.tcl",
-    "program_fpga_40ch.tcl",
-    "check_40ch_synth.tcl",
+    "zlc_pulse_streamer_top_address_switch.v",
+    "create_project_address_switch.tcl",
+    "program_fpga_address_switch.tcl",
+    "check_address_switch_synth.tcl",
     "diagnose_hw_target.tcl",
 ):
     path = FPGA_DIR / filename
@@ -112,14 +116,17 @@ print((PROJECT_ROOT / "pulse_gui.bat").exists(), PROJECT_ROOT / "pulse_gui.bat")
 <!-- cell:markdown -->
 ## 2. Configure Vivado paths and backend
 
-如果已经运行 `.\fpga\build_and_program.bat`，下面三个 Vivado 路径应指向 40ch build 目录。第一次烧板时用 bat program；server 默认不再重复 program。
+如果已经运行 `.\fpga\build_and_program.bat`，下面三个 Vivado 路径应指向
+`address_switch` build 目录。第一次烧板时用 bat program；server 默认不再
+重复 program。
 
 <!-- cell:code -->
 HOST = "0.0.0.0"
 PORT = 18861
 
 BUILD_ROOT = PROJECT_ROOT / "fpga" / "build"
-STATE_DIR = Path(os.environ.get("ZLC_PS_STATE_DIR", BUILD_ROOT / "state40"))
+STATE_DIR = Path(os.environ.get("ZLC_PS_STATE_DIR", BUILD_ROOT / "state_address_switch"))
+PROJECT_DIR = Path(os.environ.get("ZLC_PS_PROJECT_DIR", BUILD_ROOT / "address_switch"))
 
 def find_vivado_bin():
     if os.environ.get("ZLC_PS_VIVADO_BIN"):
@@ -132,22 +139,24 @@ def find_vivado_bin():
     return "vivado"
 
 os.environ["ZLC_PS_VIVADO_BIN"] = find_vivado_bin()
-PROJECT_DIR = Path(os.environ.get("ZLC_PS_PROJECT_DIR", BUILD_ROOT / "p40"))
 os.environ["ZLC_PS_PROJECT_DIR"] = str(PROJECT_DIR)
-os.environ["ZLC_PS_VIVADO_PROJECT"] = str(PROJECT_DIR / "p40.xpr")
-os.environ["ZLC_PS_VIVADO_BIT"] = str(PROJECT_DIR / "p40.runs" / "impl_1" / "zlc_pulse_streamer_top_40ch.bit")
-os.environ["ZLC_PS_VIVADO_LTX"] = str(PROJECT_DIR / "p40.runs" / "impl_1" / "zlc_pulse_streamer_top_40ch.ltx")
+os.environ["ZLC_PS_VIVADO_PROJECT"] = str(PROJECT_DIR / "address_switch.xpr")
+os.environ["ZLC_PS_VIVADO_BIT"] = str(PROJECT_DIR / "address_switch.runs" / "impl_1" / "zlc_pulse_streamer_top_address_switch.bit")
+os.environ["ZLC_PS_VIVADO_LTX"] = str(PROJECT_DIR / "address_switch.runs" / "impl_1" / "zlc_pulse_streamer_top_address_switch.ltx")
 os.environ["ZLC_PS_VIVADO_PROGRAM_ON_RUN"] = "0"
 os.environ["ZLC_PS_SERVER_BACKEND"] = "vivado-session"
 os.environ["ZLC_PS_VIO_FILTER"] = 'CELL_NAME=~"*vio*"'
 os.environ["ZLC_PS_MAX_EDGES"] = str(MAX_EDGES)
+os.environ["ZLC_PS_MAX_SCAN_POINTS"] = str(MAX_SCAN_POINTS)
 os.environ["ZLC_PS_TICK_WIDTH"] = str(TICK_WIDTH)
-os.environ["ZLC_PS_CHANNEL_COUNT"] = "40"
+os.environ["ZLC_PS_RESOURCE_TARGET_PCT"] = str(RESOURCE_TARGET_PCT)
+os.environ["ZLC_PS_CLOCK_HZ"] = str(int(CLOCK_HZ))
+os.environ["ZLC_PS_CHANNEL_COUNT"] = str(len(CHANNELS))
+os.environ["ZLC_PS_XDC"] = str(XDC)
 
-for key in ("ZLC_PS_VIVADO_BIN", "ZLC_PS_VIVADO_PROJECT", "ZLC_PS_VIVADO_BIT", "ZLC_PS_VIVADO_LTX"):
+for key in ("ZLC_PS_VIVADO_BIN", "ZLC_PS_VIVADO_PROJECT", "ZLC_PS_VIVADO_BIT", "ZLC_PS_VIVADO_LTX", "ZLC_PS_XDC"):
     print(key, Path(os.environ[key]).exists(), os.environ[key])
-print("channels", CHANNELS)
-print("trigger", TRIGGER_CHANNELS)
+print("server config", {"channels": len(CHANNELS), "trigger_channels": TRIGGER_CHANNELS, "clock_hz": CLOCK_HZ, "max_scan_points": MAX_SCAN_POINTS})
 
 <!-- cell:markdown -->
 ## 3. PowerShell command equivalent
@@ -160,8 +169,6 @@ cd D:\ZLC
 .\fpga\run_server.bat
 ```
 
-`--check-config` 会打印 resolved project/bit/LTX/channel/trigger 后退出。确认路径正确后再启动真正的 long-running server。
-
 下面是等价的展开版命令，便于检查环境变量：
 
 <!-- cell:code -->
@@ -173,12 +180,16 @@ $env:ZLC_PS_VIVADO_BIN = "{os.environ["ZLC_PS_VIVADO_BIN"]}"
 $env:ZLC_PS_VIVADO_PROJECT = "{os.environ["ZLC_PS_VIVADO_PROJECT"]}"
 $env:ZLC_PS_VIVADO_BIT = "{os.environ["ZLC_PS_VIVADO_BIT"]}"
 $env:ZLC_PS_VIVADO_LTX = "{os.environ["ZLC_PS_VIVADO_LTX"]}"
-$env:ZLC_PS_VIVADO_PROGRAM_ON_RUN = "{os.environ["ZLC_PS_VIVADO_PROGRAM_ON_RUN"]}"
-$env:ZLC_PS_SERVER_BACKEND = "{os.environ["ZLC_PS_SERVER_BACKEND"]}"
-$env:ZLC_PS_VIO_FILTER = '{os.environ["ZLC_PS_VIO_FILTER"]}'
-$env:ZLC_PS_MAX_EDGES = "{os.environ["ZLC_PS_MAX_EDGES"]}"
-$env:ZLC_PS_TICK_WIDTH = "{os.environ["ZLC_PS_TICK_WIDTH"]}"
-$env:ZLC_PS_CHANNEL_COUNT = "40"
+$env:ZLC_PS_XDC = "{os.environ["ZLC_PS_XDC"]}"
+$env:ZLC_PS_VIVADO_PROGRAM_ON_RUN = "0"
+$env:ZLC_PS_SERVER_BACKEND = "vivado-session"
+$env:ZLC_PS_VIO_FILTER = 'CELL_NAME=~"*vio*"'
+$env:ZLC_PS_MAX_EDGES = "{MAX_EDGES}"
+$env:ZLC_PS_MAX_SCAN_POINTS = "{MAX_SCAN_POINTS}"
+$env:ZLC_PS_TICK_WIDTH = "{TICK_WIDTH}"
+$env:ZLC_PS_RESOURCE_TARGET_PCT = "{RESOURCE_TARGET_PCT}"
+$env:ZLC_PS_CLOCK_HZ = "{int(CLOCK_HZ)}"
+$env:ZLC_PS_CHANNEL_COUNT = "{len(CHANNELS)}"
 
 python -m Zou_lab_control.neutral_atom.devices.sequencer_server `
   --backend vivado-session `
@@ -193,7 +204,8 @@ python -m Zou_lab_control.neutral_atom.devices.sequencer_server `
 <!-- cell:markdown -->
 ## 4. Start the server
 
-运行下面这个 cell 后它会一直阻塞，保持这个 notebook/kernel 不要关，然后去控制电脑运行 `neutral_atom_hardware_quickstart.ipynb`。
+运行下面这个 cell 后它会一直阻塞。保持这个 notebook/kernel 不要关，然后去
+控制电脑运行 `neutral_atom_hardware_quickstart.ipynb` 或打开 pulse GUI。
 
 <!-- cell:code -->
 na.run_sequencer_server(
@@ -209,13 +221,43 @@ na.run_sequencer_server(
 <!-- cell:markdown -->
 ## 5. Optional: run the pulse GUI on this FPGA computer
 
-`run_sequencer_server(...)` 会阻塞当前 kernel。要在 FPGA/Vivado 电脑本机打开 pulse GUI，请在另一个 PowerShell 或另一个 notebook kernel 里运行：
+`run_sequencer_server(...)` 会阻塞当前 kernel。要在 FPGA/Vivado 电脑本机打开
+pulse GUI，请在另一个 PowerShell 或另一个 notebook kernel 里运行：
 
 ```powershell
-.\pulse_gui.bat --remote-host 127.0.0.1 --remote-port 18861 --state .\pulses\camera_imaging_40ch.json
+.\pulse_gui.bat --remote-host 127.0.0.1 --remote-port 18861 --state .\pulses\camera_imaging_address_switch.json
 ```
 
-GUI 仍然只是前端；实际 prepare/fire/wait 通过正在运行的 40ch server 执行。默认 preset 只显示前 4 路，但上传时仍是 40ch full-width program，`ch04..ch39` 全部是 off。若窗口在当前显示器上偏大，可以传 `scale=0.82, window_ratio=0.90`。
+GUI 仍然只是前端；实际 prepare/fire/wait 通过正在运行的 sequencer server
+执行。默认 preset 只显示相机成像子集，但上传时仍是 full-width program。
+
+First-light checklist on the FPGA computer:
+
+```text
+1. build_and_program.bat completed and programmed the address_switch bitstream.
+2. run_server.bat --check-config prints the same bit/LTX/XDC paths.
+3. run_server.bat is still open and blocking.
+4. pulse_gui.bat connects to 127.0.0.1:18861.
+5. Load pulses/camera_imaging_address_switch.json.
+6. Edit tab raw column shows package pins: M17, F15, N15, M13.
+7. Press On Pulse for a repeat-forever scope test, or use finite API for one shot.
+```
+
+Expected camera-imaging physical outputs:
+
+```text
+ch09 trap    M17
+ch00 cooling F15
+ch03 probe   N15
+ch11 emCCD   M13   qCMOS/emCCD trigger for this preset
+ch06 trig    R17   still available, but not the preset camera trigger
+```
+
+If `On Pulse` reports no error but the scope is flat, check these before editing
+Python code: the probe is on the correct address-switch pin, the programmed
+bit/LTX belongs to the current `fpga/build/address_switch` directory, Vivado
+Hardware Manager sees a device rather than only a Digilent target, and the GUI
+is connected to the running server rather than offline mode.
 
 <!-- cell:code -->
 # import Zou_lab_control.frontend as zf
@@ -229,10 +271,45 @@ GUI 仍然只是前端；实际 prepare/fire/wait 通过正在运行的 40ch ser
 #     trigger_channels=TRIGGER_CHANNELS,
 # )
 # pulse_gui = zf.show_pulse_gui(
-#     state=na.PulseTableState.load(PROJECT_ROOT / "pulses" / "camera_imaging_40ch.json"),
+#     state=na.PulseTableState.load(PROJECT_ROOT / "pulses" / "camera_imaging_address_switch.json"),
 #     channels=CHANNELS,
 #     sequencer=local_sequencer,
 #     scale=0.82,
 #     window_ratio=0.90,
 # )
 # pulse_gui
+
+<!-- cell:markdown -->
+## 6. Runtime table principle
+
+The bitstream is fixed after programming. It does not contain a hard-coded
+experiment pulse. Each GUI/API `prepare` uploads runtime metadata:
+
+```text
+edge template:
+  tick[i]          absolute FPGA clock tick
+  mask[i]          full-width output state
+  x_coeff[i]       optional symbolic x contribution
+  y_coeff[i]       optional symbolic y contribution
+
+scan RAM:
+  scan_x[j], scan_y[j]
+
+repeat metadata:
+  repeat_forever, loop_start_addr, loop_end_tick, loop_count
+```
+
+One edge row is a complete state mask at a time point. If trap and emCCD change
+at the same tick, that is still one row, not two. GUI hidden channels do not
+change row width; they simply have zero bits in the uploaded masks.
+
+For `Scan X`, the GUI/API sends an ordered list like `[x0, x1, ...]`, internally
+normalized to `(x, 0)` points. For `Scan XY`, it sends `[(x0, y0), ...]`.
+The compiler accepts a scan template only when edge ordering stays the same for
+every scan point. If two symbolic edges would swap order, split the scan or
+prepare one point at a time.
+
+Analog buses are compiled through a separate bus segment memory with
+`bus_id/start_tick/stop_tick/start_value/stop_value/mode`. The FPGA generates
+10-bit stair-step ramps locally, so dense bus ramps do not consume ordinary
+digital edge rows.
