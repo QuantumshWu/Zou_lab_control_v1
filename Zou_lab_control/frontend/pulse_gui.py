@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 import os
 import re
+import queue
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -463,22 +464,41 @@ def _elide_text(text: object, width: int) -> str:
 
 
 class _SequencerWorker(QtCore.QThread):
-    """Run a blocking sequencer call (prepare/fire/safe_state -> RPyC -> Vivado
-    hw_axi -> FPGA) OFF the Qt main thread, so the GUI event loop keeps running and
-    the window never shows "(Not Responding)".  The result (or error message) is
-    delivered back to the main thread via the ``done`` signal (queued connection)."""
+    """ONE long-lived thread that runs every blocking sequencer call (prepare/fire/
+    safe_state -> RPyC -> Vivado hw_axi -> FPGA) OFF the Qt main thread, so the GUI
+    event loop never blocks ("(Not Responding)").
 
-    done = QtCore.pyqtSignal(object, object)  # (result, error_message_or_None)
+    A SINGLE persistent thread (not a fresh QThread per op) is deliberate:
+      * the RPyC connection is created and used on ALWAYS the same thread (cross-
+        thread RPyC use can hang), and
+      * there is no per-op QThread that could be garbage-collected the instant it
+        finishes ("QThread: Destroyed while thread is still running" -> freeze/crash
+        on the next operation -- the off->on hang).
+    Tasks are posted via submit(); each result/error is delivered back to the main
+    thread through the ``done`` signal (queued connection)."""
 
-    def __init__(self, fn, parent=None):
+    done = QtCore.pyqtSignal(object, object, object)  # (tag, result, error_or_None)
+
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self._fn = fn
+        self._queue: "queue.Queue" = queue.Queue()
+
+    def submit(self, tag, fn) -> None:
+        self._queue.put((tag, fn))
+
+    def shutdown(self) -> None:
+        self._queue.put(None)
 
     def run(self) -> None:  # executes on the worker thread
-        try:
-            self.done.emit(self._fn(), None)
-        except Exception as exc:  # surface ANY backend error on the GUI thread
-            self.done.emit(None, str(exc))
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            tag, fn = item
+            try:
+                self.done.emit(tag, fn(), None)
+            except Exception as exc:  # surface ANY backend error on the GUI thread
+                self.done.emit(tag, None, str(exc))
 
 
 class PulseStateUIManager(QtCore.QObject):
@@ -2543,9 +2563,31 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             if button is not None:
                 button.setEnabled(not busy)
 
+    def _ensure_seq_worker(self) -> "_SequencerWorker":
+        worker = getattr(self, "_seq_worker", None)
+        if worker is None:
+            worker = _SequencerWorker(self)          # parented -> Qt owns its lifetime
+            worker.done.connect(self._on_seq_done)   # queued (worker thread -> main thread)
+            self._seq_worker = worker
+            worker.start()
+        return worker
+
+    def _on_seq_done(self, tag, result, error) -> None:
+        success_state, store_program = tag
+        self._seq_busy = False
+        self._set_control_buttons_busy(False)        # ALWAYS re-enable the buttons
+        if error is not None:
+            self.stateui_manager.runstate = PulseStateUIManager.RunState.ERROR
+            self._message(str(error))
+        else:
+            if store_program:
+                self.last_program = result
+            self.stateui_manager.runstate = success_state
+
     def _dispatch_sequencer(self, fn, *, success_state, store_program: bool = False) -> None:
         """Run ``fn`` (a blocking sequencer call) without freezing the GUI: inline when
-        offscreen, else on a worker thread that reports back via a queued signal."""
+        offscreen (deterministic for tests), else on the single persistent worker
+        thread, which reports back via a queued signal so the buttons always recover."""
         RunState = PulseStateUIManager.RunState
         if not self._async_enabled():
             try:
@@ -2557,27 +2599,12 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 self.stateui_manager.runstate = RunState.ERROR
                 self._message(str(exc))
             return
-        worker = getattr(self, "_seq_worker", None)
-        if worker is not None and worker.isRunning():
+        if getattr(self, "_seq_busy", False):
             self._message("A pulse operation is already in progress; please wait.")
             return
+        self._seq_busy = True
         self._set_control_buttons_busy(True)
-
-        def _on_done(result, error):
-            self._set_control_buttons_busy(False)
-            if error is not None:
-                self.stateui_manager.runstate = RunState.ERROR
-                self._message(str(error))
-            else:
-                if store_program:
-                    self.last_program = result
-                self.stateui_manager.runstate = success_state
-            self._seq_worker = None
-
-        worker = _SequencerWorker(fn)
-        worker.done.connect(_on_done)
-        self._seq_worker = worker
-        worker.start()
+        self._ensure_seq_worker().submit((success_state, store_program), fn)
 
     def prepare(self) -> None:
         RunState = PulseStateUIManager.RunState
@@ -2643,11 +2670,14 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self._dispatch_sequencer(work, success_state=RunState.SAFE)
 
     def closeEvent(self, event) -> None:
-        # Don't let Qt destroy a still-running sequencer worker thread ("QThread:
-        # Destroyed while thread is still running" -> crash).  Wait (bounded) for it.
+        # Cleanly stop the persistent sequencer worker so Qt never destroys a running
+        # QThread ("Destroyed while thread is still running").  shutdown() unblocks its
+        # queue.get(); wait() is bounded in case a sequencer call is mid-flight.
         worker = getattr(self, "_seq_worker", None)
-        if worker is not None and worker.isRunning():
+        if worker is not None:
+            worker.shutdown()
             worker.wait(20000)
+            self._seq_worker = None
         super().closeEvent(event)
 
     def save_to_file(self) -> None:

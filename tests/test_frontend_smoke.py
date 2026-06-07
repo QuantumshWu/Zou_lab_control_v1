@@ -1407,6 +1407,71 @@ def test_pulse_gui_fire_runs_off_main_thread(monkeypatch):
         editor.close()
 
 
+def test_pulse_gui_on_stop_on_cycle_recovers(monkeypatch):
+    """The reported off->on hang: On -> Stop -> On must EACH complete and recover the
+    buttons.  All sequencer calls must run on the SINGLE persistent worker thread (no
+    per-op QThread that gets GC'd mid-finish, no cross-thread RPyC), which is what
+    made the 2nd/3rd operation freeze with the buttons stuck disabled."""
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    import time as _time
+    import threading as _threading
+
+    from Zou_lab_control.frontend.pulse_gui import (
+        PulseSequenceEditor, PulseStateUIManager, ensure_qt_app,
+    )
+
+    app = ensure_qt_app()
+    RunState = PulseStateUIManager.RunState
+
+    class Seq:
+        clock_hz = 50e6
+        trigger_channels: list[str] = []
+
+        def __init__(self):
+            self.channels = [f"ch{i:02d}" for i in range(8)]
+            self.calls: list[str] = []
+            self.threads: set[int] = set()
+
+        def prepare(self, state):
+            self.threads.add(_threading.get_ident()); self.calls.append("prepare")
+            _time.sleep(0.05); return object()
+
+        def fire(self, *a, **k):
+            self.threads.add(_threading.get_ident()); self.calls.append("fire")
+
+        def set_safe_state(self):
+            self.threads.add(_threading.get_ident()); self.calls.append("safe")
+
+    seq = Seq()
+    editor = PulseSequenceEditor(sequencer=seq)
+    try:
+        monkeypatch.setattr(editor, "_async_enabled", lambda: True)
+        editor.resize(800, 600); editor.show(); app.processEvents()
+
+        def wait_state(target):
+            deadline = _time.monotonic() + 5.0
+            while _time.monotonic() < deadline:
+                app.processEvents()
+                if editor.stateui_manager.runstate == target and editor.fire_button.isEnabled():
+                    return True
+                _time.sleep(0.005)
+            return False
+
+        editor.fire()
+        assert wait_state(RunState.RUNNING), "first On did not complete"
+        editor.safe_state()
+        assert wait_state(RunState.SAFE), "Stop did not complete"
+        editor.fire()
+        assert wait_state(RunState.RUNNING), "second On (after Stop) did not complete -- the off->on hang"
+
+        assert seq.calls == ["prepare", "fire", "safe", "prepare", "fire"]
+        assert len(seq.threads) == 1, "all sequencer calls must run on ONE persistent worker thread"
+        assert editor.fire_button.isEnabled() and editor.safe_button.isEnabled()
+    finally:
+        editor.close()
+
+
 def test_pulse_gui_constructs_xdc_channel_editor(monkeypatch, tmp_path):
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
