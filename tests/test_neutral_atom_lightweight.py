@@ -1991,6 +1991,84 @@ def test_vivado_axi_session_tolerates_transient_underflow(tmp_path):
     assert session.wait_done(timeout=2.0) is True   # underflow tolerated, completes on DONE
 
 
+def test_edge_streamer_repeat_streaming_structure():
+    """Engine + top carry the bank_chunk handshake: the scan advance is gated on the
+    bank holding the RIGHT chunk (never a stale point), and the repeat_forever wrap
+    waits for chunk 0 to be reloaded -- so a finite streamed scan re-sweeps."""
+
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer"
+    eng = (root / "zlc_edge_streamer.v").read_text(encoding="utf-8")
+    top = (root / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
+    assert "bank_chunk0" in eng and "bank_chunk1" in eng
+    assert "scan_point_resident" in eng                       # advance gated on ready AND right chunk
+    assert "bank_chunk0 == {SCAN_COUNT_WIDTH{1'b0}}" in eng   # repeat wrap waits for chunk 0
+    assert "C_BANK0_CHUNK" in top and "C_BANK1_CHUNK" in top
+    assert "bank_chunk0(ctrl_reg[C_BANK0_CHUNK]" in top and "bank_chunk1(ctrl_reg[C_BANK1_CHUNK]" in top
+
+
+def test_vivado_axi_session_repeat_streaming_refills_cyclically(tmp_path):
+    """repeat_forever over a FINITE STREAMED scan (N > 2*bank_size) re-sweeps: the
+    background refill thread reloads chunk 0 (and 1) at each sweep seam, cyclically,
+    keeping the engine fed across re-sweeps.  Never raises; safe_state stops it."""
+
+    import re as _re, time as _time
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+    from fpga.pulse_streamer.host.image import (
+        StreamerParams, CtrlWords, STATUS_RUNNING, STATUS_LOADED, CMD_LOAD, CMD_FIRE, CMD_SAFE,
+    )
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
+
+    N = 12
+    params = StreamerParams(max_edges=16, bank_size=2)   # total_chunks = 6 (streamed)
+    program = RuntimeSequenceProgram(
+        sequence_id="rs", sequence_name="rs", clock_hz=50e6,
+        channels=[f"ch{i:02d}" for i in range(62)],
+        ticks=[0, 5, 40], masks=[0, 1, 0], duration=4e-6, trigger_count=0,
+        repeat_forever=True, loop_start_index=0, loop_end_tick=40, loop_count=1,
+        slot_count=1, slot_kinds=["delay"], loop_end_slot_coeffs=[0],
+        tick_slot_coeffs=[[0], [256], [0]], scan_points=[[k] for k in range(N)], scan_coeff_frac_bits=8,
+    )
+
+    class Hw:
+        def __init__(self):
+            self.bram = {}; self.status = 0; self.fired = False; self.cursor = 0; self.reloads0 = 0
+        def __call__(self, lines, action, timeout):
+            text = "\n".join(lines)
+            for a, d in _re.findall(r"-address ([0-9A-Fa-f]+) -data ([0-9A-Fa-f]+) -len 1 -type write", text):
+                w = int(a, 16) // 4; v = int(d, 16); self.bram[w] = v
+                if w == CtrlWords.COMMAND and v & CMD_LOAD: self.status = STATUS_LOADED
+                if w == CtrlWords.COMMAND and v & CMD_FIRE: self.fired = True; self.status = STATUS_RUNNING; self.cursor = 0
+                if w == CtrlWords.COMMAND and v & CMD_SAFE: self.status = 0; self.fired = False
+                # the engine wraps once the host reloads chunk 0 at the sweep seam
+                if w == CtrlWords.BANK0_CHUNK and v == 0 and self.cursor >= N:
+                    self.reloads0 += 1; self.cursor = 0
+            m = _re.search(r"-address ([0-9A-Fa-f]+) -len 1 -type read", text)
+            if m:
+                w = int(m.group(1), 16) // 4
+                if w == CtrlWords.STATUS:
+                    return f"ZLCDATA {self.status:08X}\n"
+                if w == CtrlWords.CURSOR:
+                    if self.fired and self.cursor < N:
+                        self.cursor = min(N, self.cursor + params.bank_size)
+                    return f"ZLCDATA {self.cursor:08X}\n"
+                return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
+            return "ok\n"
+
+    hw = Hw()
+    session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=hw)
+    try:
+        session.prepare(program)
+        session.fire()
+        assert session.wait_done(timeout=1.0) is True       # RUNNING -> returns; thread feeds
+        deadline = _time.monotonic() + 3.0
+        while hw.reloads0 < 2 and _time.monotonic() < deadline:
+            _time.sleep(0.02)
+    finally:
+        session.safe_state()
+    assert hw.reloads0 >= 2, f"expected the streamed scan to re-sweep cyclically, got {hw.reloads0}"
+
+
 def test_edgetable_prefetch_engine_is_tick_exact_and_gapless():
     """The Architecture-D BRAM+prefetch engine must produce a per-tick output
     byte-identical to the validated combinatorial engine, for every program shape

@@ -65,6 +65,8 @@ class CtrlWords:
     SLOT_COUNT = 14
     CURSOR = 15           # top -> host: scan points consumed (for streaming refill)
     BANK_READY = 16       # host -> top: bit b = bank b is loaded/ready
+    BANK0_CHUNK = 17      # host -> top: sweep-chunk index currently resident in bank 0
+    BANK1_CHUNK = 18      # host -> top: sweep-chunk index currently resident in bank 1
 
 
 CTRL_WORDS = 64
@@ -275,9 +277,13 @@ def pack_program(program, params: StreamerParams | None = None) -> dict[int, int
         for k in range(p.mask_words):
             w[bases["mask"] + i * p.mask_words + k] = mw[k] if k < len(mw) else 0
 
-    # first two scan chunks -> banks 0 and 1
+    # first two scan chunks -> banks 0 and 1; record which chunk each bank holds so
+    # the engine's bank_chunk handshake accepts them (host updates these while
+    # streaming/re-sweeping).
     for chunk in (0, 1):
         w.update(scan_bank_words(program, p, chunk))
+    w[CtrlWords.BANK0_CHUNK] = 0
+    w[CtrlWords.BANK1_CHUNK] = 1
 
     # bus segments (bus-major)
     per_bus: list[list[object]] = [[] for _ in range(p.bus_count)]

@@ -125,6 +125,10 @@ class VivadoAxiStreamerSession:
         self._repeat_forever = False
         self._program = None          # last prepared program (for streaming refills)
         self._total_points = 0
+        self._total_chunks = 1
+        self._io_lock = threading.Lock()    # serialise AXI access (main + stream thread)
+        self._stream_thread: threading.Thread | None = None
+        self._stream_stop: threading.Event | None = None
 
         self._process: subprocess.Popen | None = None
         self._reader: threading.Thread | None = None
@@ -166,6 +170,7 @@ class VivadoAxiStreamerSession:
         if self._closed:
             return
         self._closed = True
+        self._stop_stream_thread()
         process = self._process
         if process is None:
             return
@@ -272,24 +277,20 @@ class VivadoAxiStreamerSession:
         """Pack the program into the BRAM image, upload it over AXI, then command
         the top's mini-loader to copy the bus image into the engine (LOAD)."""
 
+        self._stop_stream_thread()             # any prior streaming refill must end first
         p = self.params
         points = list(getattr(program, "scan_points", []) or [])
         self._program = program
         self._total_points = len(points)
+        self._total_chunks = max(1, math.ceil(self._total_points / p.bank_size)) if self._total_points else 1
         self._repeat_forever = bool(getattr(program, "repeat_forever", False))
-        if self._repeat_forever and self._total_points > 2 * p.bank_size:
-            raise ValueError(
-                "repeat_forever with a streaming scan (> 2*bank_size points) is not "
-                "supported: the ping-pong banks are overwritten ahead of the cursor, so "
-                "a wrap to point 0 cannot be served seamlessly. Use a finite scan for "
-                f"unbounded streaming, or keep <= {2 * p.bank_size} points for repeat."
-            )
         image = pack_program(program, p)
         # Halt + reset first so a prior run cannot drive outputs while we rewrite BRAM.
         self._command(CMD_SAFE)
         for word_offset in sorted(image):
             self._queue_word(word_offset, image[word_offset])
-        # banks 0 and 1 are resident after pack_program -> arm both ready bits.
+        # banks 0 and 1 are resident after pack_program (bank_chunk 0/1 set in the
+        # image) -> arm both ready bits.
         self._queue_word(CtrlWords.BANK_READY, 0b11)
         self._flush()
         if not self._command(CMD_LOAD, wait_mask=STATUS_LOADED):
@@ -303,61 +304,128 @@ class VivadoAxiStreamerSession:
             self.prepare(program)
         self._command(CMD_FIRE)
         (self.state_dir / "fire_time.txt").write_text(str(time.monotonic()), encoding="utf-8")
+        # a repeat_forever STREAMED scan (> 2 banks) must be fed continuously while it
+        # re-sweeps; a background thread keeps the ping-pong banks loaded.
+        self._start_stream_thread()
+
+    # --- streaming refill primitive -----------------------------------------
+    def _load_chunk(self, sweep_chunk: int, bank_ready: int) -> int:
+        """Load sweep-chunk ``sweep_chunk`` into its ping-pong bank and return the
+        new BANK_READY mask.  De-arm the bank, write its scan rows, record the
+        chunk index (bank_chunk handshake), then re-arm -- so the engine STALLS on
+        a bank mid-rewrite and only accepts it once it truly holds this chunk."""
+
+        p = self.params
+        bank = sweep_chunk % 2
+        refill = scan_bank_words(self._program, p, sweep_chunk)
+        bank_ready &= ~(1 << bank)
+        self._queue_word(CtrlWords.BANK_READY, bank_ready)        # de-arm during rewrite
+        for off in sorted(refill):
+            self._queue_word(off, refill[off])
+        self._queue_word(CtrlWords.BANK0_CHUNK if bank == 0 else CtrlWords.BANK1_CHUNK, sweep_chunk)
+        bank_ready |= (1 << bank)
+        self._queue_word(CtrlWords.BANK_READY, bank_ready)        # re-arm
+        self._flush()
+        return bank_ready
 
     def wait_done(self, program=None, timeout: float | None = None) -> bool:
-        """Poll to completion.  For an unbounded scan (N > 2*bank_size) this also
-        STREAMS: it refills each ping-pong bank as the cursor frees it, so the host
-        keeps the engine fed for the whole N-point sweep."""
+        """Poll to completion.  A finite scan with N > 2*bank_size STREAMS here:
+        each ping-pong bank is refilled as the cursor frees it (with the bank_chunk
+        handshake) so the whole N-point sweep plays gaplessly.  A repeat_forever
+        streamed scan is fed by a background thread (started at fire); this returns
+        once RUNNING is observed (DONE never asserts for repeat_forever)."""
 
         effective = float(timeout) if timeout is not None else float(self.action_timeout or 600.0)
         deadline = time.monotonic() + max(0.0, effective)
         p = self.params
         bank_size = p.bank_size
-        total_chunks = max(1, math.ceil(self._total_points / bank_size)) if self._total_points else 1
+        total_chunks = self._total_chunks
         next_chunk = 2                # chunks 0,1 are already resident
         bank_ready = 0b11
 
-        stalled_polls = 0
         while True:
             status = self._read_word(CtrlWords.STATUS)
             if status & STATUS_DONE:
                 return True
             if self._repeat_forever and (status & STATUS_RUNNING):
-                return True
+                return True            # background thread keeps a streamed re-sweep fed
             if status & STATUS_ERROR:
                 raise RuntimeError("pulse streamer reported STATUS_ERROR (bad image magic?).")
-            # STATUS_UNDERFLOW is a TRANSIENT streaming stall (the engine is holding
-            # because it reached a bank we have not refilled yet), NOT a fatal error.
-            # It is a distinct bit from STATUS_ERROR on purpose -- keep polling/refilling
-            # and the engine resumes the instant the bank is armed.  (Bit-map drift here
-            # would silently turn a recoverable stall into a crash; guarded by
-            # test_final_status_bits_match_host.)
-            if status & STATUS_UNDERFLOW:
-                stalled_polls += 1
+            # STATUS_UNDERFLOW is a TRANSIENT streaming stall (the engine reached a
+            # bank not yet refilled), NOT a fatal error -- a distinct bit from
+            # STATUS_ERROR on purpose; keep polling/refilling and it resumes the
+            # instant the bank is armed.  (Guarded by test_final_status_bits_match_host.)
 
-            # --- streaming refill: load the next chunk into the freed bank ---
+            # --- finite streaming refill: load the next chunk into the freed bank ---
             if next_chunk < total_chunks:
                 cursor = self._read_word(CtrlWords.CURSOR)
                 # chunk (next_chunk-2) lives in bank next_chunk%2; it is fully
                 # consumed once cursor >= (next_chunk-1)*bank_size, freeing that bank.
                 if cursor >= (next_chunk - 1) * bank_size:
-                    bank = next_chunk % 2
-                    refill = scan_bank_words(self._program, p, next_chunk)
-                    bank_ready &= ~(1 << bank)
-                    self._queue_word(CtrlWords.BANK_READY, bank_ready)   # de-arm during rewrite
-                    for off in sorted(refill):
-                        self._queue_word(off, refill[off])
-                    bank_ready |= (1 << bank)
-                    self._queue_word(CtrlWords.BANK_READY, bank_ready)   # re-arm
-                    self._flush()
+                    bank_ready = self._load_chunk(next_chunk, bank_ready)
                     next_chunk += 1
-                    continue   # re-check status/cursor promptly while streaming
+                    continue           # re-check status/cursor promptly while streaming
 
             if time.monotonic() >= deadline:
                 return False
             time.sleep(self.stream_poll_interval if next_chunk < total_chunks else 0.01)
 
+    # --- repeat_forever streamed re-sweep: background cyclic refill ----------
+    def _stream_refill_loop(self) -> None:
+        """Keep a repeat_forever STREAMED scan fed forever: refill chunks 2..K-1 as
+        the cursor frees their banks, and at each sweep end (cursor reaches N) reload
+        chunks 0 and 1 so the engine's wrap (gated on bank_chunk0==0) is served.
+        Within a sweep this is gapless; the inter-sweep seam is a brief safe hold
+        (never a wrong point).  Runs until _stop_stream_thread()."""
+
+        p = self.params
+        bank_size = p.bank_size
+        total_chunks = self._total_chunks
+        N = self._total_points
+        next_chunk = 2
+        bank_ready = 0b11
+        stop = self._stream_stop
+        try:
+            while not stop.is_set():
+                cursor = self._read_word(CtrlWords.CURSOR)
+                if cursor >= N:
+                    # sweep finished: the engine is holding at the wrap until chunk 0
+                    # (and chunk 1) are resident again.  Reload them, then it re-sweeps.
+                    bank_ready = self._load_chunk(0, bank_ready)
+                    if total_chunks > 1:
+                        bank_ready = self._load_chunk(1, bank_ready)
+                    next_chunk = 2
+                    # wait for the engine to wrap (cursor returns below N) before refilling
+                    while not stop.is_set() and self._read_word(CtrlWords.CURSOR) >= N:
+                        time.sleep(self.stream_poll_interval)
+                    continue
+                if next_chunk < total_chunks and cursor >= (next_chunk - 1) * bank_size:
+                    bank_ready = self._load_chunk(next_chunk, bank_ready)
+                    next_chunk += 1
+                    continue
+                time.sleep(self.stream_poll_interval)
+        except Exception as exc:        # never let the daemon die silently
+            self._write_action_log("stream_refill", f"streaming refill thread stopped: {exc!r}")
+
+    def _start_stream_thread(self) -> None:
+        if self._repeat_forever and self._total_points > 2 * self.params.bank_size:
+            self._stop_stream_thread()
+            self._stream_stop = threading.Event()
+            self._stream_thread = threading.Thread(
+                target=self._stream_refill_loop, name="zlc-scan-stream", daemon=True)
+            self._stream_thread.start()
+
+    def _stop_stream_thread(self) -> None:
+        if self._stream_stop is not None:
+            self._stream_stop.set()
+        thread = self._stream_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+        self._stream_thread = None
+        self._stream_stop = None
+
     def safe_state(self) -> None:
+        self._stop_stream_thread()
         self._command(CMD_SAFE)
 
     # ------------------------------------------------------------------ mailbox
@@ -386,9 +454,12 @@ class VivadoAxiStreamerSession:
 
     # ------------------------------------------------------------------ Tcl plumbing
     def _run_tcl(self, lines: Sequence[str], *, action: str, timeout: float | None) -> str:
-        if self._external_executor is not None:
-            return self._external_executor(list(lines), action, timeout)
-        return self._execute(lines, action=action, timeout=timeout)
+        # One AXI transaction at a time: the main thread and the streaming-refill
+        # thread share the single Vivado Tcl process / marker stream.
+        with self._io_lock:
+            if self._external_executor is not None:
+                return self._external_executor(list(lines), action, timeout)
+            return self._execute(lines, action=action, timeout=timeout)
 
     def _execute(self, lines: Sequence[str], *, action: str, timeout: float | None) -> str:
         if self._process is None:

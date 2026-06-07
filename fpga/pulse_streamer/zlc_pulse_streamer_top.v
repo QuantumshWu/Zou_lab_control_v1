@@ -113,6 +113,8 @@ module zlc_pulse_streamer_top #(
     localparam integer C_SLOT_COUNT = 14;
     localparam integer C_CURSOR = 15;       // engine -> host (points consumed)
     localparam integer C_BANK_READY = 16;   // host -> engine (bit b: bank b loaded)
+    localparam integer C_BANK0_CHUNK = 17;  // host -> engine: sweep chunk resident in bank 0
+    localparam integer C_BANK1_CHUNK = 18;  // host -> engine: sweep chunk resident in bank 1
 
     // engine outputs
     wire [CHANNEL_COUNT-1:0] out;
@@ -366,6 +368,8 @@ module zlc_pulse_streamer_top #(
         .edge_mask_rdata(edge_mask_rdata_w[CHANNEL_COUNT-1:0]),
         .scan_raddr(scan_raddr), .scan_rdata(scan_rdata_w),
         .bank_ready(ctrl_reg[C_BANK_READY][1:0]),
+        .bank_chunk0(ctrl_reg[C_BANK0_CHUNK][SCAN_COUNT_WIDTH-1:0]),
+        .bank_chunk1(ctrl_reg[C_BANK1_CHUNK][SCAN_COUNT_WIDTH-1:0]),
         .scan_cursor(zlc_cursor), .underflow(zlc_underflow),
         .bus_prog_we(bus_prog_we), .bus_prog_bus(bus_prog_bus), .bus_prog_addr(bus_prog_addr),
         .bus_prog_start_tick(bus_prog_start_tick), .bus_prog_stop_tick(bus_prog_stop_tick),

@@ -85,6 +85,8 @@ module zlc_edge_streamer #(
 
     // streaming handshake with the host
     input  wire [1:0] bank_ready,               // bit b: bank b loaded
+    input  wire [SCAN_COUNT_WIDTH-1:0] bank_chunk0,  // chunk index resident in bank 0
+    input  wire [SCAN_COUNT_WIDTH-1:0] bank_chunk1,  // chunk index resident in bank 1
     output reg  [SCAN_COUNT_WIDTH-1:0] scan_cursor,  // points consumed (host refills behind)
     output reg  underflow,                      // a bank was not ready in time
 
@@ -232,6 +234,22 @@ module zlc_edge_streamer #(
     function bank_of;
         input [SCAN_COUNT_WIDTH-1:0] idx;
         begin bank_of = idx[BANK_BITS]; end
+    endfunction
+    function [SCAN_COUNT_WIDTH-1:0] chunk_of;        // which sweep chunk a point belongs to
+        input [SCAN_COUNT_WIDTH-1:0] idx;
+        begin chunk_of = idx >> BANK_BITS; end
+    endfunction
+    // bank b is usable for point idx only if it is armed AND actually holds idx's
+    // chunk (host writes bank_chunk{0,1} when it loads a chunk).  This is the proven
+    // streaming_scan_play handshake -- it makes a late/cyclic refill STALL, never a
+    // wrong/stale point, and lets repeat_forever re-sweep a streamed scan.
+    function scan_point_resident;
+        input [SCAN_COUNT_WIDTH-1:0] idx;
+        reg b;
+        begin
+            b = idx[BANK_BITS];
+            scan_point_resident = bank_ready[b] && ((b ? bank_chunk1 : bank_chunk0) == chunk_of(idx));
+        end
     endfunction
 
     task zlc_bus_clear_runtime;
@@ -463,8 +481,8 @@ module zlc_edge_streamer #(
                 zlc_bus_start_table(slot_active);
             end else if (time_count >= final_tick) begin
                 if (scan_enable_active && (scan_point_index+1'b1) < active_scan_count) begin
-                    if (!bank_ready[bank_of(scan_point_index+1'b1)]) begin
-                        underflow <= 1'b1;          // STALL: hold, re-check next cycle
+                    if (!scan_point_resident(scan_point_index+1'b1)) begin
+                        underflow <= 1'b1;          // STALL: next chunk not (yet) resident
                     end else begin
                         underflow <= 1'b0;
                         scan_point_index <= scan_point_index+1'b1;
@@ -478,13 +496,23 @@ module zlc_edge_streamer #(
                         seed_from_edge0(scan_rdata);
                     end
                 end else if (repeat_forever_active) begin
-                    slot_active <= scan_first_values; scan_point_index <= {SCAN_COUNT_WIDTH{1'b0}}; scan_cursor <= {SCAN_COUNT_WIDTH{1'b0}};
-                    scan_raddr <= scan_addr_of({{(SCAN_COUNT_WIDTH-1){1'b0}},1'b1});
-                    final_tick <= zlc_effective_tick(sh_final_t,sh_final_c,scan_first_values);
-                    loop_end_active <= zlc_effective_tick(loop_end_tick,loop_end_coeffs,scan_first_values);
-                    loops_remaining <= loop_count_active;
-                    zlc_bus_start_table(scan_first_values);
-                    seed_from_edge0(scan_first_values);
+                    // Restart the sweep at point 0.  For a STREAMING scan the host has
+                    // overwritten bank 0 with a later chunk, so wait until it reloads
+                    // chunk 0 (bank_chunk0==0) before wrapping -- the re-sweep is then
+                    // seamless (resident scans pass instantly; streamed ones stall only
+                    // at the seam, never emit a wrong point).
+                    if (scan_enable_active && !(bank_ready[1'b0] && bank_chunk0 == {SCAN_COUNT_WIDTH{1'b0}})) begin
+                        underflow <= 1'b1;
+                    end else begin
+                        underflow <= 1'b0;
+                        slot_active <= scan_first_values; scan_point_index <= {SCAN_COUNT_WIDTH{1'b0}}; scan_cursor <= {SCAN_COUNT_WIDTH{1'b0}};
+                        scan_raddr <= scan_addr_of({{(SCAN_COUNT_WIDTH-1){1'b0}},1'b1});
+                        final_tick <= zlc_effective_tick(sh_final_t,sh_final_c,scan_first_values);
+                        loop_end_active <= zlc_effective_tick(loop_end_tick,loop_end_coeffs,scan_first_values);
+                        loops_remaining <= loop_count_active;
+                        zlc_bus_start_table(scan_first_values);
+                        seed_from_edge0(scan_first_values);
+                    end
                 end else begin
                     running <= 1'b0; done <= 1'b1; state_mask <= {CHANNEL_COUNT{1'b0}}; zlc_bus_clear_runtime();
                 end
