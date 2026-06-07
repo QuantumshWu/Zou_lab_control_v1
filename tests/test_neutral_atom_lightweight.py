@@ -4222,3 +4222,80 @@ def test_rtl_lane_player_realization_matches_reference():
                   repeat_forever=(rnd.random() < 0.5),
                   loop_start_index=0, loop_count=1, delay_lanes=lanes)
         assert _rtl_lane_realization_play(prog, 500) == em.reference_play(prog, 500), (mts, lanes)
+
+
+def _on_intervals(out, bit):
+    on, start = [], None
+    for i, mask in enumerate(out):
+        b = (int(mask) >> bit) & 1
+        if b and start is None:
+            start = i
+        elif not b and start is not None:
+            on.append((start, i)); start = None
+    if start is not None:
+        on.append((start, len(out)))
+    return on
+
+
+def test_reordering_lane_corner_cases_end_to_end():
+    """Adversarial corner cases for the reordering-delay lane, each compiled from the
+    real GUI state -> validated -> played by all three cycle models:
+      (a) repeat_forever loops the whole scan, period-preserving;
+      (b) TWO channels with reordering delays -> two disjoint lanes at once;
+      (c) a DAC-value scan (bus value_select) AND a reordering digital delay together
+          -> a bus segment and a lane coexist without disturbing each other.
+    The combination the single sorted edge table cannot play now runs on hardware."""
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import validate_pulse_streamer_program
+    from fpga.pulse_streamer.host import engine_model as em
+
+    def agree(prog, n):
+        ep = em.EngineProgram.from_program(prog)
+        r = em.reference_play(ep, n)
+        assert em.prefetch_play(ep, n) == r and em.rtl_mirror_play(ep, n) == r
+        return r
+
+    # (a) repeat_forever: the 2-point scan loops; B's 30-tick delay at the odd points
+    # rides its lane, the whole frame preserved (period 100).
+    sta = na.PulseTableState(
+        channels=["A", "B"],
+        periods=[na.PulsePeriod(1000, (1, 1), unit="ns"), na.PulsePeriod(1000, (0, 0), unit="ns")],
+        time_step_ns=20, delays={"B": "s0"}, delay_units={"B": "ns"},
+        scan_slots=[{"kind": "delay", "target": "B", "unit": "ns", "nominal": 0.0}],
+        scan_table=[[0.0], [600.0]])
+    pa = na.compile_pulse_table_scan_runtime_program(sta, channels=["A", "B"], clock_hz=50e6, repeat_forever=True)
+    validate_pulse_streamer_program(pa, channel_count=62)
+    ra = agree(pa, 420)
+    assert _on_intervals(ra, 1)[:4] == [(0, 50), (130, 180), (200, 250), (330, 380)]
+
+    # (b) two simultaneous reordering lanes (B on s0, C on s1), independent bits.
+    stb = na.PulseTableState(
+        channels=["A", "B", "C"],
+        periods=[na.PulsePeriod(1000, (1, 1, 1), unit="ns"), na.PulsePeriod(1000, (0, 0, 0), unit="ns")],
+        time_step_ns=20, delays={"B": "s0", "C": "s1"}, delay_units={"B": "ns", "C": "ns"},
+        scan_slots=[{"kind": "delay", "target": "B", "unit": "ns", "nominal": 0.0},
+                    {"kind": "delay", "target": "C", "unit": "ns", "nominal": 0.0}],
+        scan_table=[[0.0, 0.0], [600.0, 700.0]])
+    pb = na.compile_pulse_table_scan_runtime_program(stb, channels=["A", "B", "C"], clock_hz=50e6, repeat_forever=False)
+    validate_pulse_streamer_program(pb, channel_count=62)
+    assert sorted(l.channel for l in pb.delay_lanes) == ["B", "C"]
+    rb = agree(pb, 200)
+    assert _on_intervals(rb, 1) == [(0, 50), (130, 180)]   # B delay 30
+    assert _on_intervals(rb, 2) == [(0, 50), (135, 185)]   # C delay 35
+
+    # (c) DAC value scan (bus) + reordering digital delay (lane) at once.
+    stc = na.PulseTableState(
+        channels=["ch00", "ch01", "ch02", "ch03"],
+        channel_labels={"ch00": "da[0]", "ch01": "da[1]", "ch02": "cool", "ch03": "trap"},
+        time_step_ns=20,
+        periods=[na.PulsePeriod(1000, (0, 0, 1, 1), unit="ns"), na.PulsePeriod(1000, (0, 0, 0, 0), unit="ns")])
+    stc.bind_field("dac", "da@1", unit="value", label="da")        # s0 DAC value scan
+    stc.bind_field("delay", "ch03", unit="ns", label="trap dly")   # s1 reordering delay
+    stc.set_scan_table([[1.0, 0.0], [3.0, 600.0]])
+    pc = na.compile_pulse_table_scan_runtime_program(stc, channels=["ch00", "ch01", "ch02", "ch03"], clock_hz=50e6, repeat_forever=False)
+    validate_pulse_streamer_program(pc, channel_count=62)
+    assert [l.channel for l in pc.delay_lanes] == ["ch03"]
+    assert 1 in {int(getattr(s, "value_select", 0)) for s in pc.bus_segments}   # DAC value rides slot 1
+    rc = agree(pc, 200)
+    assert _on_intervals(rc, 2) == [(0, 50), (100, 150)]   # cool fixed
+    assert _on_intervals(rc, 3) == [(0, 50), (130, 180)]   # trap reorders past cool
