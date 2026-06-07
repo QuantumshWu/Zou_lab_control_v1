@@ -3922,3 +3922,53 @@ def test_pulse_table_negative_delay_global_retranslate_in_hardware():
     assert min(prog.ticks) >= 0                  # never a negative tick
     truth = _additive_truth(st, slots={}, time_step_ns=20, channels=list(prog.channels), n_ticks=300)
     assert em.reference_play(em.EngineProgram.from_program(prog), 300) == truth
+
+
+def _lane_on_intervals(out, bit):
+    on, start = [], None
+    for i, mask in enumerate(out):
+        b = (int(mask) >> bit) & 1
+        if b and start is None:
+            start = i
+        elif not b and start is not None:
+            on.append((start, i)); start = None
+    if start is not None:
+        on.append((start, len(out)))
+    return on
+
+
+def test_pulse_table_reordering_scan_delay_uses_disjoint_lane():
+    """A SCANNED digital delay that sweeps a channel's edges PAST another channel's --
+    the reordering case the single global sorted edge table CANNOT play -- compiles to a
+    disjoint-bit delay LANE: the channel rides its own output bit (additively shifted per
+    scan point) while the others stay in the main table, so nothing reorders.  Proven by
+    all three engine models (combinatorial reference, FIFO, exact RTL mirror) agreeing."""
+    import Zou_lab_control.neutral_atom as na
+    from fpga.pulse_streamer.host import engine_model as em
+
+    st = na.PulseTableState(
+        channels=["A", "B"],
+        periods=[na.PulsePeriod(1000, (1, 1), unit="ns"), na.PulsePeriod(1000, (0, 0), unit="ns")],
+        time_step_ns=20, delays={"B": "s0"}, delay_units={"B": "ns"},
+        scan_slots=[{"kind": "delay", "target": "B", "unit": "ns", "nominal": 0.0}],
+        scan_table=[[0.0], [600.0]],   # B delay 0, then 30 ticks -> B's edges cross A's
+    )
+    prog = na.compile_pulse_table_scan_runtime_program(st, channels=["A", "B"], clock_hz=50e6, repeat_forever=False)
+    assert prog.delay_lanes and len(prog.delay_lanes) == 1
+    lane = prog.delay_lanes[0]
+    assert lane.channel == "B" and lane.channel_bit == 1
+    assert lane.values == [1, 0]                        # rise then fall
+    assert all(any(c) for c in lane.coeffs)            # both edges affine in the scanned delay
+    # B is pulled OUT of the main sorted table (its bit never appears in the main masks);
+    # A stays in the main table.
+    assert all(not ((m >> 1) & 1) for m in prog.masks)
+    assert any((m >> 0) & 1 for m in prog.masks)
+
+    ep = em.EngineProgram.from_program(prog)
+    r = em.reference_play(ep, 200)
+    assert em.prefetch_play(ep, 200) == r
+    assert em.rtl_mirror_play(ep, 200) == r
+    # A: fixed at [0,50) every frame; B: point0 delay 0 -> [0,50), point1 delay 30 ticks
+    # -> [30,80) shifted into the second frame = [130,180).  The reordering is correct.
+    assert _lane_on_intervals(r, 0) == [(0, 50), (100, 150)]
+    assert _lane_on_intervals(r, 1) == [(0, 50), (130, 180)]

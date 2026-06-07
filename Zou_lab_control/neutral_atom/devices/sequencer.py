@@ -95,6 +95,50 @@ class RuntimeBusSegment:
 
 
 @dataclass(frozen=True)
+class DelayLane:
+    """One digital channel whose SCANNED delay reorders its edges past other channels.
+
+    Such a channel cannot stay in the single global sorted edge table (the merged order
+    changes per scan point).  It is pulled out onto its own DISJOINT output bit and
+    played by a tiny per-channel sub-player -- structurally the per-bus DAC engine
+    (``zlc_bus_tick``) specialised to a 1-bit value.  Because the hardware delay is
+    ADDITIVE (not cyclic), each edge tick is ``period_start +/- delay`` -- AFFINE in the
+    scan slots -- so the lane reuses the same ``effective_tick`` MAC and the same 4
+    gapless boundary reseeds as the main table and the bus engine; the disjoint bit means
+    no global re-sort is ever needed.
+
+    ``ticks[i]`` / ``coeffs[i]`` are the affine base tick + per-slot coefficients of
+    edge ``i`` (sorted by reference-point effective tick); ``values[i]`` is 0/1.  The
+    final edge is the channel's last fall, so the lane returns to 0 within the frame.
+    """
+
+    channel: str
+    channel_bit: int
+    ticks: list[int]
+    coeffs: list[list[int]]
+    values: list[int]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "channel": str(self.channel),
+            "channel_bit": int(self.channel_bit),
+            "ticks": [int(t) for t in self.ticks],
+            "coeffs": [[int(c) for c in row] for row in self.coeffs],
+            "values": [int(v) for v in self.values],
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "DelayLane":
+        return cls(
+            channel=str(payload.get("channel", "")),
+            channel_bit=int(payload.get("channel_bit", 0)),
+            ticks=[int(t) for t in payload.get("ticks", [])],
+            coeffs=[[int(c) for c in row] for row in payload.get("coeffs", [])],
+            values=[int(v) for v in payload.get("values", [])],
+        )
+
+
+@dataclass(frozen=True)
 class RuntimeSequenceProgram:
     """Runtime edge-table program uploaded to a pulse-streamer-like FPGA."""
 
@@ -122,6 +166,7 @@ class RuntimeSequenceProgram:
     scan_coeff_frac_bits: int = 8
     bus_names: list[str] | None = None
     bus_segments: list[RuntimeBusSegment] | None = None
+    delay_lanes: list[DelayLane] | None = None
 
     def to_dict(self) -> dict[str, object]:
         payload = {
@@ -149,6 +194,7 @@ class RuntimeSequenceProgram:
             "scan_coeff_frac_bits": int(self.scan_coeff_frac_bits),
             "bus_names": list(self.bus_names or []),
             "bus_segments": [segment.to_dict() for segment in (self.bus_segments or [])],
+            "delay_lanes": [lane.to_dict() for lane in (self.delay_lanes or [])],
         }
         if self.source_sequence is not None:
             payload["source_sequence"] = self.source_sequence
@@ -189,6 +235,7 @@ class RuntimeSequenceProgram:
             scan_coeff_frac_bits=int(payload.get("scan_coeff_frac_bits", 8)),
             bus_names=[str(item) for item in payload.get("bus_names", [])] or None,
             bus_segments=[RuntimeBusSegment.from_dict(item) for item in payload.get("bus_segments", [])] or None,
+            delay_lanes=[DelayLane.from_dict(item) for item in payload.get("delay_lanes", [])] or None,
         )
 
     @property
@@ -436,15 +483,45 @@ def compile_pulse_table_scan_runtime_program(
         )
         bus_members = [channel for members in state.bus_channels().values() for channel in members]
 
-    rows = _pulse_table_affine_rows(
-        state,
-        channels=channels,
-        scan_points=points_ticks,
-        slot_vars=slot_vars,
-        time_step_ns=clock_step_ns,
-        coeff_frac_bits=coeff_frac_bits,
-        exclude_channels=bus_members,
-    )
+    # Prefer the single global affine edge table (cheapest): it plays a scanned delay
+    # fine as long as the channel's edges do NOT reorder past another channel's.  Only
+    # when that fails (the reordering case the table cannot represent) do we pull the
+    # scanned-delay channels onto their own DISJOINT-bit delay lanes (affine 1-bit
+    # sub-players) and rebuild the main rows without them, so the global stream never
+    # reorders.  A constant (non-scanned) delay is always baked into the main table.
+    lane_channels: list[str] = []
+    delay_lanes: list[DelayLane] = []
+    try:
+        rows = _pulse_table_affine_rows(
+            state,
+            channels=channels,
+            scan_points=points_ticks,
+            slot_vars=slot_vars,
+            time_step_ns=clock_step_ns,
+            coeff_frac_bits=coeff_frac_bits,
+            exclude_channels=bus_members,
+        )
+    except ValueError:
+        lane_channels, delay_lanes = _pulse_table_delay_lanes(
+            state,
+            channels=channels,
+            scan_points=points_ticks,
+            slot_vars=slot_vars,
+            time_step_ns=clock_step_ns,
+            coeff_frac_bits=coeff_frac_bits,
+            exclude_channels=bus_members,
+        )
+        if not lane_channels:
+            raise  # the failure is not a scanned-delay reorder -> a genuine error
+        rows = _pulse_table_affine_rows(
+            state,
+            channels=channels,
+            scan_points=points_ticks,
+            slot_vars=slot_vars,
+            time_step_ns=clock_step_ns,
+            coeff_frac_bits=coeff_frac_bits,
+            exclude_channels=list(bus_members) + lane_channels,
+        )
     ticks = [row[0] for row in rows]
     masks = [row[1] for row in rows]
     tick_slot_coeffs = [list(row[2]) for row in rows]
@@ -481,6 +558,7 @@ def compile_pulse_table_scan_runtime_program(
         "scan_coeff_frac_bits": coeff_frac_bits,
         "bus_names": bus_names,
         "bus_segments": [segment.to_dict() for segment in bus_segments],
+        "delay_lanes": [lane.to_dict() for lane in delay_lanes],
     }
     sequence_id = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
     return RuntimeSequenceProgram(
@@ -507,6 +585,7 @@ def compile_pulse_table_scan_runtime_program(
         scan_coeff_frac_bits=coeff_frac_bits,
         bus_names=bus_names or None,
         bus_segments=bus_segments or None,
+        delay_lanes=delay_lanes or None,
     )
 
 
@@ -1371,6 +1450,88 @@ def _pulse_table_affine_loop_metadata(
     loop_end = starts[int(state.repeat_end) + 1]
     loop_start_index = _affine_row_index(rows, loop_start)
     return loop_start_index, int(loop_end[0]), list(loop_end[1]), int(state.repeat_count)
+
+
+def _pulse_table_delay_lanes(
+    state: PulseTableState,
+    *,
+    channels: Sequence[str],
+    scan_points: Sequence[Sequence[int]],
+    slot_vars: Sequence[str],
+    time_step_ns: float,
+    coeff_frac_bits: int,
+    exclude_channels: Sequence[str] = (),
+) -> tuple[list[str], list[DelayLane]]:
+    """Build a DELAY LANE for each digital channel whose DELAY is SCANNED.
+
+    Because the hardware delay is ADDITIVE, a delayed edge tick is ``period_start +
+    delay`` -- affine in the scan slots -- so the lane is a 1-bit affine sub-player on a
+    DISJOINT output bit (structurally the per-bus DAC engine).  Pulling the channel out
+    of the global sorted table is what lets a scanned delay REORDER its edges past other
+    channels (the failing case the single table rejects).  A scanned delay must keep the
+    channel inside the frame at every scan point (extending the frame for a scanned delay
+    is a v-next item); this is validated with a clear error.  Returns the lane channel
+    names (to exclude from the main edge rows) and the lanes."""
+
+    hardware_channels = list(channel_names(channels, "channels"))
+    channel_bits = {channel: index for index, channel in enumerate(hardware_channels)}
+    exclude = set(exclude_channels)
+    affine_starts = _pulse_table_affine_period_starts(state, slot_vars=slot_vars, time_step_ns=time_step_ns, coeff_frac_bits=coeff_frac_bits)
+    frame_base, frame_coeffs = affine_starts[-1]
+    points = [list(point) for point in scan_points] or [[0] * len(slot_vars)]
+    lane_channels: list[str] = []
+    lanes: list[DelayLane] = []
+    for channel_index, channel in enumerate(state.channels):
+        if channel in exclude or channel not in channel_bits:
+            continue
+        delay_aff = _affine_expr(state.delays.get(channel, 0.0), state.delay_units.get(channel, "ns"), slot_vars, time_step_ns, coeff_frac_bits)
+        if not any(delay_aff[1]):
+            continue  # delay not scanned -> stays in the (cheaper) main edge table
+        # the channel's ON period-runs -> affine rise(=1)/fall(=0) edges shifted by delay
+        edges: list[tuple[tuple[int, tuple[int, ...]], int]] = []
+        active: int | None = None
+        for period_index, period in enumerate(state.periods):
+            on = int(period.states[channel_index])
+            if on and active is None:
+                active = period_index
+            elif not on and active is not None:
+                edges.append((_affine_add(affine_starts[active], delay_aff), 1))
+                edges.append((_affine_add(affine_starts[period_index], delay_aff), 0))
+                active = None
+        if active is not None:
+            edges.append((_affine_add(affine_starts[active], delay_aff), 1))
+            edges.append((_affine_add(affine_starts[len(state.periods)], delay_aff), 0))
+        if not edges:
+            continue
+        ref = points[0]
+        edges.sort(key=lambda e: _apply_affine_ticks(e[0][0], e[0][1], ref, coeff_frac_bits))
+        for point_index, point in enumerate(points):
+            frame_end = _apply_affine_ticks(frame_base, frame_coeffs, point, coeff_frac_bits)
+            prev = -1
+            for (base, coeffs), _value in edges:
+                tick = _apply_affine_ticks(base, coeffs, point, coeff_frac_bits)
+                if tick < 0 or tick > frame_end:
+                    raise ValueError(
+                        f"scanned delay on channel {channel!r} pushes an edge to tick {tick}, "
+                        f"outside the frame [0, {frame_end}] at scan point {point_index}; keep "
+                        "the scanned delay within the frame (extending the frame for a scanned "
+                        "delay is planned)."
+                    )
+                if tick <= prev:
+                    raise ValueError(
+                        f"scanned delay on channel {channel!r} reverses its own edges at scan "
+                        f"point {point_index} (a channel cannot run its own pulses backwards)."
+                    )
+                prev = tick
+        lanes.append(DelayLane(
+            channel=channel,
+            channel_bit=channel_bits[channel],
+            ticks=[int(base) for (base, _c), _v in edges],
+            coeffs=[list(coeffs) for (_b, coeffs), _v in edges],
+            values=[int(value) for (_bc), value in edges],
+        ))
+        lane_channels.append(channel)
+    return lane_channels, lanes
 
 
 def _stable_affine_groups(

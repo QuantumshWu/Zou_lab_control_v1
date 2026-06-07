@@ -262,6 +262,17 @@ def validate_pulse_streamer_program(
     bus_count = _positive_int(bus_count, "bus_count")
     bus_width = _positive_int(bus_width, "bus_width")
     channel_count = len(program.channels) if channel_count is None else _positive_int(channel_count, "channel_count")
+    if getattr(program, "delay_lanes", None):
+        # SAFETY GATE (removed when the lane RTL lands): a reordering scanned-delay
+        # program compiles to disjoint-bit delay lanes and is proven cycle-accurate by
+        # engine_model, but the lane sub-players are not yet in the bitstream -- uploading
+        # would leave the lane channel silent.  Reject at upload (never silently wrong)
+        # until the RTL lane players are built.
+        raise NotImplementedError(
+            "this program uses delay lanes (a scanned digital delay whose edges reorder "
+            "past other channels); the RTL lane players are the next build step.  Until "
+            "then keep the scanned delay non-reordering so it stays in the main edge table."
+        )
     if len(set(program.channels)) != len(program.channels):
         raise ValueError("program channels must be unique.")
     if len(program.ticks) != len(program.masks):
