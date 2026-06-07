@@ -953,6 +953,57 @@ def test_pulse_gui_row_alignment_contract(monkeypatch):
     check_alignment("show-all")
 
 
+def test_pulse_gui_channel_display_order_is_fixed_hardware_order(monkeypatch):
+    """Edit (and preview) channel rows must ALWAYS render in the fixed hardware
+    channel order, no matter how show/hide/hide-off scrambled visible_channels.
+
+    This is the user's "通道显示固定排序不被打乱": _display_rows now walks
+    state.channels (hardware order) filtered by visibility, so the order cannot
+    depend on the order entries happen to sit in visible_channels.
+    """
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.frontend.pulse_gui import _display_rows
+
+    # --- data-model: a deliberately scrambled visible_channels still displays
+    #     in hardware order, visible-filtered.
+    channels = [f"ch{i:02d}" for i in range(10)]
+    state = na.PulseTableState(
+        channels=channels,
+        periods=[na.PulsePeriod(100, tuple(1 for _ in channels), unit="ns")],
+        time_step_ns=20,
+        visible_channels=channels,
+    )
+    state.visible_channels = ["ch05", "ch01", "ch09", "ch00", "ch03"]  # scrambled
+    keys = [row["key"] for row in _display_rows(state)]
+    assert keys == ["ch00", "ch01", "ch03", "ch05", "ch09"], keys
+
+    # --- editor path: show-all then hide-off must leave visible_channels in
+    #     hardware order AND render the panel rows top-to-bottom in that order.
+    from Zou_lab_control.frontend import devtools as dt
+
+    editor = dt.demo_editor(size=(1480, 900))
+    editor.show_all_channels()
+    dt.settle(editor, 200)
+    editor.hide_off_channels()
+    dt.settle(editor, 200)
+
+    vis = list(editor.state.visible_channels)
+    assert vis == sorted(vis, key=editor.state.channel_index), vis
+
+    rows = _display_rows(editor.state)
+    names = editor.names_panel
+    ys = []
+    for row in rows:
+        widget = names.raw_label_widgets.get(row["key"])
+        if widget is not None:
+            ys.append(widget.mapTo(editor, widget.rect().center()).y())
+    assert len(ys) >= 3, "names panel should expose the visible row labels"
+    assert ys == sorted(ys), ("panel rows must render top-to-bottom in hardware order", ys)
+
+
 def test_pulse_gui_scan_dot_retoggle_preserves_values(monkeypatch):
     """Toggling a scan dot OFF then ON restores the typed scan column.
 

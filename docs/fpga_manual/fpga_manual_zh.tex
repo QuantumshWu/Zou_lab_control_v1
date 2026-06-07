@@ -3,7 +3,7 @@
 
 \begin{document}
 \frontmatter
-\zlctitlepage{ZLC FPGA Pulse Streamer 手册}{Artix-7 35T 运行时边沿流送器 / N-slot 仿射扫描 / VIO 契约}{RTL、扫描引擎、模拟总线 DAC、编译上传流程、资源预算与 v3 路线图}{2026-06-05}
+\zlctitlepage{ZLC FPGA Pulse Streamer 手册}{Artix-7 35T 运行时边沿流送器 / N-slot 仿射扫描 / VIO 契约}{RTL、扫描引擎、模拟总线 DAC、编译上传流程、资源预算与 v3 路线图}{2026-06-06}
 \tableofcontents
 \cleardoublepage
 \mainmatter
@@ -563,7 +563,7 @@ spec 最初要求的是 per-channel run-length（逐通道游程编码）+ dual-
 \item \tfocus{可验证}。在仓库里\tfocus{没有 Verilog 仿真器}（无 iverilog/cocotb）的前提下，仿射方案能被纯 Python 的契约测试（位宽对齐、探针打包）+ 行为仿真（逐 tick 复刻 RTL 数学）覆盖。run-length 的复杂状态机就很难用 Python 行为模型忠实复现。
 \end{itemize}
 
-run-length / dual-bank 被列入 \filepath{docs/fpga\_manual} 的 v3 路线图，不在当前 RTL 中。
+曾尝试的单通道 run-length 重写已被\tfocus{放弃}（单 BRAM 读口下每个边界要重装 62 个通道约 $23.6\,\mu$s，无法无缝，见末章"JTAG-to-AXI 边沿表加载器"）。edge-table 引擎是当前唯一引擎，并通过片上加载器接到 JTAG-to-AXI 控制路径。
 
 \section{仿射公式与 zlc\_effective\_tick 内部实现}
 
@@ -1089,21 +1089,68 @@ effective_tick = base_tick + ( sum_j coeff_j * slot_j ) >> FRAC
 单读口分布式 RAM + 流送引擎在 row 0 / loop start / last 这几行上做边界判断（序列开始、循环回跳、序列结束）。即便主机的影子认为它们"没变"，也要重写以排除任何影子失配（例如上一次会话遗留、或位打包细节变动）导致的边界错位。代价只有常数几行，换来边界绝对正确，是值得的保守策略。
 \end{notebox}
 
-\chapter{v3 路线图与设计取舍}
+\chapter{JTAG-to-AXI 边沿表加载器（当前架构）}
 
-\section{曾考虑的 dual-bank 流式设计}
-有一个更激进的 spec（\filepath{references/pulse_sequencer_scan_spec.md} 描述的 \filepath{zlc_scan_sequencer.v}）：per-channel run-length 引擎 + slot bank + 独立 Scan FSM + dual-bank 流式 ParamTable，支持 N 个命名变量、上百万点的 ParamTable、\pyapi{N_REP}、双 bank 无缝切换、每点相机触发、marker、\pyapi{MODE}。
-
-\section{为什么这一版选了 N-slot 仿射}
-对 35T 这颗 LUT 有限的器件，dual-bank 流式 ParamTable 被\tfocus{推迟}。当前实现的 N-slot 仿射引擎：
-
+\section{为什么放弃 per-channel run-length}
+上一轮曾按 spec 做单通道 run-length 引擎（每数字通道一个硬件 player，走自己的转换列表）。在 35T 的\tfocus{单个 BRAM 读口}下，每个 repeat/scan 边界都要重新装载 62 个通道 player，实测约 \tfocus{$23.6\,\mu$s}——短重复段根本无法无缝。因此\tfocus{放弃}该方案，回到已逐 tick 验证的\tfocus{全局仿射 edge-table 引擎} \filepath{zlc_pulse_streamer.v}。它只有\emph{一个}全局边沿指针，所以：
 \begin{itemize}
-  \item 把旧的 2 变量系统直接\tfocus{推广}为 N 个命名 slot；
-  \item 适配 distributed RAM，读路径简单（异步单行读 + 锁存元数据）；
-  \item 复用现有的 VIO / server / 编译器路径，不需要新 transport。
+  \item repeat = 单周期硬件 loop 回卷（影子寄存器重载，\filepath{zlc_pulse_streamer.v} 第 470--475 行）$\Rightarrow$ \tfocus{0 gap}；
+  \item 扫描点切换 = 单周期换 slot 向量（第 477--493 行）$\Rightarrow$ \tfocus{0 gap}；
+  \item LUT 更省——一个比较器 + 一条 \pyapi{zlc_effective_tick} MAC，而非 62 个 player。
+\end{itemize}
+这与商用脉冲流发生器一致：Swabian Pulse Streamer 是\emph{全局} RLE 指令流 + 硬件 loop，SpinCore PulseBlaster 是\emph{全局}指令流 + LOOP opcode——都不用逐通道硬件 player。
+
+\section{控制路径：片上加载器（替代 VIO）}
+引擎\tfocus{一个字节都没改}，仍是 \filepath{zlc_pulse_streamer.v}（host$\leftrightarrow$RTL 逐 tick 验证过的那个）。改变的只是\emph{程序怎么进引擎}：用 JTAG-to-AXI 把程序映像写进 BRAM，再由片上加载器 \filepath{zlc_axi_program_loader.v} 把映像拷进引擎的 \pyapi{prog_*}/\pyapi{scan_prog_*}/\pyapi{bus_prog_*} 写口（引擎自己的写契约：复位保持时翻转 \pyapi{prog_we} 提交一行，写入期间影子寄存器从 \pyapi{prog_count}/\pyapi{loop_start_addr} 锁存），随后松复位、发 start。因为引擎未变，无缝与 tick 精确原样保留——这也是不重写引擎、只换\emph{送数方式}的关键。
+
+\section{各文件}
+\begin{itemize}
+  \item \filepath{devices/edgetable_image.py}：把 \pyapi{RuntimeSequenceProgram} 打包成 32 位 BRAM 映像——偏移 0 的 CTRL 块（magic、COMMAND/STATUS 邮箱、prog\_count、scan\_count、loop 字段、bus\_counts、slot\_count），随后 EDGE 表（tick + N-slot 系数 + 62 位 mask，5 字/边沿）、SCAN 点表（\pyapi{NUM_SLOTS} 字/点）、按总线的 BUS 段表（仿射起止 tick + 系数 + 值/模式/\pyapi{value_select}，7 字/段）。只发非空行（稀疏），典型程序几百字。\pyapi{unpack_program} 是加载器走表的解码器；\pyapi{pack(p)} 再 \pyapi{unpack} 等于 \pyapi{p} 是契约。
+  \item \filepath{zlc_axi_program_loader.v}：顺序 FSM，非时序关键（prepare 期间跑）。轮询 COMMAND（上升沿检测 LOAD/FIRE/SAFE/RESET），LOAD 时按 \pyapi{unpack_program} 的顺序走映像、驱动引擎 toggle 写口（每行数据保持稳定、每次读 settle 以容忍读延迟 1 或 2），FIRE 时松复位 + 发 start，并把 STATUS（LOADED/RUNNING/DONE/ERROR）写回 BRAM 供主机轮询。\pyapi{repeat_forever} 永不置 DONE，故 FSM 持续轮询命令（永久运行中 SAFE/RESET/LOAD 仍有效）。
+  \item \filepath{devices/edgetable_loader_model.py}：仓库\tfocus{无 Verilog 仿真器}，故把加载器 FSM 在 Python 里\tfocus{逐周期}镜像，校验其捕获的引擎写能重建解码后的映像——这是新时序器走表顺序/地址/字段切片的上机前证据（含 200 边沿压测 + 无 scan/无 bus 边界）。
+  \item \filepath{zlc_pulse_streamer_loader_top.v}：\pyapi{jtag_axi_0} $\to$ \pyapi{axi_bram_ctrl_0} $\to$ \pyapi{blk_mem_gen_0}（真双口）：A 口 = AXI 上传 + 邮箱，B 口 = 加载器。加载器 $\to$ 引擎；引擎 \pyapi{out}（62）+ \pyapi{bus_out}（40，DAC 现已接上）$\to$ 原样 62 脚 address\_switch 板图。
+  \item 构建 \path{create_project_loader.tcl}（严格 32768 BRAM 深度 + 回读守护，短项目名 l 是 Vivado 路径长度修复）；\path{program_fpga_loader.tcl} 让 jtag\_axi 核作为 \pyapi{hw_axi} 可见。
+  \item \filepath{devices/axi_session.py}（\pyapi{VivadoAxiStreamerSession}）：一个常驻 \texttt{vivado -mode tcl}；\pyapi{prepare} 打包 + 上传映像再发 LOAD（等 STATUS\_LOADED），\pyapi{fire} 发 FIRE，\pyapi{wait_done} 轮询 STATUS\_DONE（\pyapi{repeat_forever} 用 RUNNING 当完成），\pyapi{safe_state} 发 SAFE。COMMAND 邮箱发命令前先写 0 以保证干净上升沿。Tcl 执行器可注入，整条 pack$\to$上传$\to$加载器模型$\to$LOAD$\to$fire 流程无需 Vivado 即被单测覆盖。
 \end{itemize}
 
-只有当某个实验需要超过约 $10^4$ 条唯一非重复边沿、或需要超出片上扫描表的流式参数时，才重新考虑 dual-bank ParamTable 设计——届时它应当配套 BRAM 表和更快的 transport（AXI / JTAG-to-AXI / UART / 以太网 / FIFO）。
+\section{当前容量与待办}
+62 数字 + 4$\times$10 位 DAC；20\,ns tick；\pyapi{NUM_SLOTS}=4 个仿射槽（delay/duration/DAC 任意组合都可同时扫）；引擎 LUTRAM 表 $\le$ 1024 边沿 + 1024 扫描点（映像 BRAM 能放更多）。on\_pulse $\to$ 首个输出 = 1 周期（20\,ns）；$<$100\,ms 预算只是上传，已加载程序的 re-fire 只是几次控制写。\tfocus{v-next}：更多边沿/点（引擎表搬 BRAM + 1 边沿预取流水），以及冷加载 $<$100\,ms 的 burst / AXI4-full 上传；当前单字上传正确但几百字冷载约亚秒，之后无限次快速 re-fire。
+
+\section{构建 / 运行}
+\path{fpga/build_and_program.bat}（无参数双击）构建 + 烧录加载器位流到 \path{fpga/build/l}；随后 \path{fpga/run_server.bat} 以默认后端 \texttt{jtag-axi} 连接并提供 RPyC 服务。GUI/notebook 的 Run 照常走 \pyapi{prepare}$\to$LOAD$\to$\pyapi{fire}，引擎从 LUTRAM 无缝播放。
+
+
+\chapter{Architecture-D：BRAM 表 + 预取（2048 edges + 4096 points）}
+
+\section{为什么需要 D}
+加载器路径把整张程序拷进引擎的 LUTRAM 表，所以容量受分布式 RAM（35T 约 400\,Kib $\approx$ 6400 个 LUTRAM-LUT）限制：1024 edges + 1024 points 已接近上限，\tfocus{2048 edges + 2048 points 纯 LUTRAM 放不下}（约需 11.5k LUTRAM-LUT）。要达到用户要求的 2048+/2048+ 且每项资源 $\le$75\%，\tfocus{edge 表和 scan 表必须搬进 block RAM}。模拟总线段表\tfocus{留在 LUTRAM}——因为总线/斜坡引擎\tfocus{每 tick 组合读}这些表，搬进 BRAM 会破坏它。这就是 “D” 的取舍（经对抗复核确认优于把总线也搬 BRAM）。
+
+\section{depth-1 预取与最小边沿间距}
+BRAM 是\tfocus{同步读}（1--2 周期延迟），而引擎要\tfocus{同周期}比较 \pyapi{time_count == effective_tick} 才能无缝触发。\filepath{zlc_pulse_streamer_d.v} 用 \tfocus{depth-1 预取}解决：当前边沿 \pyapi{cur} 是一个\tfocus{寄存器}——边沿 0 来自 \pyapi{first} 影子（arm 时预读，零延迟），其余边沿在 \pyapi{edge_index} 前进时从 BRAM 读入 \pyapi{pre_*}，约 \pyapi{RD_SETTLE} 周期后有效。因为一条边沿一触发就立刻发起下一条的读，而下一条至少在\tfocus{最小边沿间距}之外，\pyapi{pre_*} 总能在它的 effective tick 之前就绪——所以触发仍是同周期、无缝。四个无缝重载点（start / loop 回卷 / scan 推进 / repeat）本就从影子寄存器重载，零 BRAM 延迟，和已验证的组合引擎一致。
+
+\tfocus{代价}：最小边沿间距 = \pyapi{RD_SETTLE}$+1$ = \textbf{3 tick = 60\,ns}（50\,MHz）。这不是核心需求（核心需求是 repeat/scan 之间无缝，而非两条边沿能多近），主机编译/上传时\tfocus{强制}该约束并清晰报错（\pyapi{axi_session} 调 \pyapi{min_edge_spacing}，$<3$ 则拒绝）。
+
+\tfocus{无仿真器下的证明}：\filepath{devices/edgetable_engine_model.py} 的 \pyapi{prefetch_d1_play} 在间距 $\ge 3$ 时与已验证组合引擎 \pyapi{reference_play} \tfocus{逐 tick 字节相同}、更密时正确 STALL（见 \pyapi{test_edgetable_d1_prefetch_matches_reference_with_min_spacing} 与三方暴力 ground-truth 交叉验证）。这是把 “算法证明对” 落到这块 RTL 的依据。
+
+\section{容量与参数化（随 XDC + FPGA 派生）}
+\filepath{devices/edgetable_image.py} 的 \pyapi{solve_capacity(part, channel_count)} 是\tfocus{单一真相源}：按 FPGA 部件的 RAMB36/LUT/FF/DSP 预算 + XDC 通道数，派生 \pyapi{max_edges} / \pyapi{max_scan_points} / 地址位宽 / BRAM 深度，并\tfocus{校验每项资源 $\le$75\%}。换 XDC 或换 FPGA 只改这一处输入，RTL localparams、create-project tcl、主机三者同源派生。
+
+\begin{itemize}
+\item \textbf{xc7a35t（62 通道）}：\textbf{2048 edges + 4096 scan points + 512 流式窗口}，约 \textbf{31/50 RAMB36 = 62\%}；LUT $\sim$23\%、FF $\sim$7\%、DSP $\le$9\%。\tfocus{全部 $\le$75\%}（比要求的 2048$\times$2048 还多）。
+\item 换大板（xc7a100t/200t）自动放宽到同等或更大容量，占用比例更低；换窄 XDC（如 16 通道）也自动适配——都不重写。
+\end{itemize}
+
+\section{各文件}
+\begin{itemize}
+\item \filepath{zlc_pulse_streamer_d.v}：D 引擎（depth-1 预取 + 影子；总线 LUTRAM + 总线引擎原样复用 \pyapi{zlc_effective_tick}/ramp/value\_select）。edge/scan 经外部 BRAM 读口进来。
+\item \filepath{zlc_pulse_streamer_d_top.v}：复用已验证的 \pyapi{axi_bram_ctrl}（它处理 AXI 握手），只加一个\tfocus{简单组合地址译码}把其 BRAM 端口分到 edge BRAM（非对称 32 写/256 读）、scan BRAM（32/128）、bus-image BRAM、控制寄存器组；bus 小加载器把 bus 镜像写进引擎 LUTRAM。62 脚板图 + DAC（接 \pyapi{bus_out}）原样。
+\item \filepath{create_project_d.tcl}：建 3 个 BRAM IP（防御式 \pyapi{zlc_try}+dump，版本无关属性名上机收敛）+ jtag\_axi + axi\_bram\_ctrl，综合到位流（项目 \path{fpga/build/d}）。
+\item \filepath{devices/edgetable_image.py}：\pyapi{pack_program_d}/\pyapi{unpack_program_d}（D 的 AXI 写镜像：edge 8 字/256 位行、scan \pyapi{NUM_SLOTS} 字、bus 7 字；区基址与顶层 localparam 一致）。
+\item \filepath{devices/axi_session.py}：\pyapi{VivadoAxiStreamerSession(variant="d")}——打包 D 镜像、强制最小边沿间距、写 BRAM、COMMAND/STATUS（LOAD$\to$FIRE$\to$轮询 DONE），与加载器路径共用 Tcl 管道。
+\end{itemize}
+
+\section{状态与 bring-up}
+引擎算法（depth-1 模型 $=$ 参考引擎）、容量求解、主机镜像往返、结构契约都已 Python 测试通过。\tfocus{多-BRAM AXI 集成本身是盲写}（仓库无 Verilog 仿真器），需在板上 bring-up：先用 \path{create_project_d.tcl} 综合（grep 日志的 \texttt{ZLC IPDUMP}/\texttt{ZLC TRY-FAIL} 收敛版本相关 IP 属性），再上板。这是本项目一贯的 RTL 验证现实——上机前能证明的都已证明。
 
 
 \end{document}

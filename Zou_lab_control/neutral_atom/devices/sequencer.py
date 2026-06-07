@@ -1264,8 +1264,9 @@ def _pulse_table_affine_rows(
     Every channel's rise/fall edge is ``period_start +/- delay`` evaluated
     affinely in the bound scan slots.  Delays compose additively with period
     durations, so a bound delay and a bound duration on the same edge sum their
-    coefficients.  ``_stable_affine_groups`` validates that the edge ordering and
-    non-negativity hold for *every* scan point, not just the first.
+    coefficients.  ``_stable_affine_groups`` validates PER-CHANNEL edge ordering and
+    non-negativity at *every* scan point (cross-channel reorder is allowed -- the
+    per-channel engine plays each channel independently).
     """
 
     hardware_channels = list(channel_names(channels, "channels"))
@@ -1357,18 +1358,29 @@ def _stable_affine_groups(
         if any(item[0] != expr for item in items):
             raise ValueError("hardware scan has events that coincide only for the first scan point; split the scan or simplify timing.")
         grouped.append((expr, [(channel, value) for _expr, channel, value in items]))
+    # Per-channel monotonicity: each channel's OWN edges must stay strictly ordered
+    # (and non-negative) at every scan point.  The per-channel run-length engine plays
+    # each channel independently, so a scan that reorders edges ACROSS channels (e.g. a
+    # delay that slides one channel's pulse past another channel's) is fine -- only a
+    # channel reversing/colliding its own edges is unrepresentable.  (The old global
+    # edge-table engine needed global monotonicity; that is the wrong constraint here.)
     for point_index, point in enumerate(scan_points):
-        last_tick = -1
-        for expr, _items in grouped:
+        per_chan_last: dict[str, int] = {}
+        for expr, items in grouped:
             tick = _apply_affine_ticks(expr[0], expr[1], point, coeff_frac_bits)
             if tick < 0:
                 raise ValueError(f"hardware scan produced a negative edge tick at scan point {point_index}.")
-            if tick <= last_tick:
-                raise ValueError(
-                    "hardware scan changes edge order for at least one scan point; "
-                    "split the scan into multiple templates or use simpler delay/duration expressions."
-                )
-            last_tick = tick
+            for channel, _value in items:
+                if channel is None:
+                    continue  # final/loop markers are not channel edges
+                previous = per_chan_last.get(channel)
+                if previous is not None and tick <= previous:
+                    raise ValueError(
+                        f"hardware scan reverses or collides channel '{channel}'s own edges at "
+                        f"scan point {point_index}; simplify that channel's delay/duration scan "
+                        "(a single channel cannot run its own pulses backwards)."
+                    )
+                per_chan_last[channel] = tick
     return grouped
 
 

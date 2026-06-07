@@ -273,7 +273,16 @@ def _display_rows(state: PulseTableState) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     emitted: set[str] = set()
     visible = set(state.visible_channels)
-    for channel in state.visible_channels:
+    # Display order is ALWAYS the fixed hardware-channel order (state.channels),
+    # filtered to the visible set -- NOT the order entries happen to sit in
+    # visible_channels.  This keeps the Edit panel rows (and the names/period
+    # cards built from these rows) stable no matter what show/hide/hide-off
+    # history produced visible_channels, matching the preview which also walks
+    # state.channels.  (Channels have no user-defined order; only periods are
+    # drag-reorderable.)
+    for channel in state.channels:
+        if channel not in visible:
+            continue
         bus = member_to_bus.get(channel)
         if bus is not None:
             if bus in emitted:
@@ -2438,7 +2447,11 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 keepers.append(channel)
         if not keepers:
             keepers = list(state.channels[:min_visible])
-        state.visible_channels = keepers
+        # Keep visible_channels in fixed hardware order (the display already walks
+        # hardware order, but normalising the stored list keeps the saved JSON and
+        # every other consumer stable too).
+        keep_set = set(keepers)
+        state.visible_channels = [channel for channel in state.channels if channel in keep_set]
         state.validate()
         self.load_state(state)
 

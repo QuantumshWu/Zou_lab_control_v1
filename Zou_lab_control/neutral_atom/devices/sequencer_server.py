@@ -134,7 +134,37 @@ def run_server(
     """Start the RPyC sequencer service used by ``RemoteSequencer``."""
 
     backend_name = str(backend).strip().lower().replace("_", "-")
-    if backend_name in {"vivado-session", "persistent-vivado", "fpga-pulse-streamer"}:
+    if backend_name in {"jtag-axi", "axi", "loader", "edge-table"}:
+        # Affine edge-table engine, driven over JTAG-to-AXI (hw_axi) through the
+        # on-chip program loader (edgetable_image + zlc_axi_program_loader).
+        from .axi_session import VivadoAxiStreamerSession
+
+        program_on_start = _env_bool("ZLC_PS_VIVADO_PROGRAM_ON_RUN", False)
+        # ZLC_PS_VARIANT selects the bitstream/host layout: "loader" (default,
+        # LUTRAM edge-table, <=1024 edges/points) or "d" (Architecture-D BRAM
+        # tables, 2048 edges + 4096 points, depth-1 prefetch).  For D the capacity
+        # geometry is solved from the part + channel count (single source of truth).
+        variant = str(os.environ.get("ZLC_PS_VARIANT", "loader")).strip().lower()
+        d_params = None
+        if variant == "d":
+            from .edgetable_image import solve_capacity
+            part = os.environ.get("ZLC_PS_FPGA_PART", "xc7a35t")
+            d_params = solve_capacity(part, channel_count=max(1, len(list(channels)))).params
+        hardware_backend = VivadoAxiStreamerSession(
+            state_dir=state_dir,
+            clock_hz=clock_hz,
+            program_on_start=program_on_start,
+            variant=variant,
+            params=d_params,
+        )
+        if warm_start:
+            print("Starting persistent Vivado JTAG-to-AXI session before accepting clients...")
+            hardware_backend.start()
+        prepare_callback = hardware_backend.prepare
+        fire_callback = hardware_backend.fire
+        wait_done_callback = hardware_backend.wait_done
+        safe_state_callback = hardware_backend.safe_state
+    elif backend_name in {"vivado-session", "persistent-vivado", "fpga-pulse-streamer"}:
         from .fpga_pulse_streamer import VivadoPulseStreamerSession
 
         hardware_backend = VivadoPulseStreamerSession(state_dir=state_dir)
@@ -159,7 +189,7 @@ def run_server(
         wait_done_callback = hardware_backend.wait_done
         safe_state_callback = hardware_backend.safe_state
     else:
-        raise ValueError("backend must be 'vivado-session' or 'command'.")
+        raise ValueError("backend must be 'jtag-axi', 'vivado-session', or 'command'.")
     cache_prepared = _env_bool("ZLC_SEQUENCER_CACHE_PREPARED", False)
     service = SequencerService(
         channels=channels,
@@ -263,14 +293,16 @@ def build_arg_parser() -> ArgumentParser:
     parser.add_argument("--command-timeout", type=float, default=None)
     parser.add_argument(
         "--backend",
-        default="command",
-        choices=["command", "vivado-session"],
-        help="Hardware backend. vivado-session keeps one Vivado Tcl process alive for lower runtime latency.",
+        default="jtag-axi",
+        choices=["jtag-axi", "vivado-session", "command"],
+        help="Hardware backend. jtag-axi drives the run-length engine over a persistent "
+        "Vivado hw_axi session (the current architecture); vivado-session is the older VIO "
+        "edge-table path; command shells out per action.",
     )
     parser.add_argument(
         "--no-warm-start",
         action="store_true",
-        help="For vivado-session, delay Vivado startup until the first prepare call.",
+        help="For session backends, delay Vivado startup until the first prepare call.",
     )
     return parser
 
