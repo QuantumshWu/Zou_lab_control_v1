@@ -3661,3 +3661,31 @@ def test_top_status_fsm_clears_running_on_safe_then_reloads():
     top = (Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
     assert "status_running" in top
     assert "ctrl_reg[C_STATUS][1]) begin" not in top
+
+
+def test_pulse_table_delay_is_cyclic_in_preview():
+    """A channel delay in the preview (to_sequence) is a CYCLIC rotation within the
+    frame (delay %% total_duration): a pulse pushed past the frame end wraps to the
+    front.  This is the periodic ("inf") view, correct for ANY delay (>= total, or
+    negative) -- not the old additive shift that only worked for delay < total."""
+    import Zou_lab_control.neutral_atom as na
+
+    st = na.PulseTableState(
+        channels=["ch0"],
+        periods=[na.PulsePeriod(1000, (1,), unit="ns"), na.PulsePeriod(1000, (0,), unit="ns")],
+        time_step_ns=20,
+    )  # frame = 2000 ns, ch0 ON [0,1000)
+
+    def on_intervals(delay_ns):
+        st.delays = {"ch0": delay_ns}; st.delay_units = {"ch0": "ns"}
+        seq = st.to_sequence()
+        return sorted((round(p.start * 1e9), round((p.start + p.duration) * 1e9)) for p in seq.effective_pulses())
+
+    assert on_intervals(0) == [(0, 1000)]
+    assert on_intervals(500) == [(500, 1500)]
+    assert on_intervals(1500) == [(0, 500), (1500, 2000)]      # wraps past the frame end
+    assert on_intervals(2500) == [(500, 1500)]                 # 2500 %% 2000 == 500
+    assert on_intervals(-500) == [(0, 500), (1500, 2000)]      # -500 %% 2000 == 1500
+    # frame total is unchanged by delay (cyclic, never extends the period)
+    st.delays = {"ch0": 1500}
+    assert round(st.to_sequence().duration * 1e9) == 2000

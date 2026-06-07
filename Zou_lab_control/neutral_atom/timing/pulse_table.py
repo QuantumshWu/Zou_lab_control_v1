@@ -43,6 +43,25 @@ SCAN_SLOT_KINDS = ("duration", "delay", "dac")
 SLOT_VAR_RE = re.compile(r"^s(?P<index>\d+)$")
 
 
+def _cyclic_shift_interval(start: int, stop: int, delay: int, total: int) -> list[tuple[int, int]]:
+    """Shift an ON interval ``[start, stop)`` later by ``delay`` steps, CYCLICALLY
+    within a frame of ``total`` steps: any piece pushed past ``total`` wraps to the
+    front.  Returns 1 or 2 sub-intervals, all inside ``[0, total)``.  This is the
+    periodic ("inf") delay the preview always shows, and what the hardware applies for
+    a repeat_forever sequence.  Matches Confocal-GUIv2 ``base.delay`` (delay %% total,
+    cyclic roll).  Python ``%`` keeps the result in ``[0, total)`` so a negative delay
+    wraps correctly too."""
+    if total <= 0:
+        return [(start, stop)]
+    d = delay % total
+    a, b = start + d, stop + d
+    if b <= total:
+        return [(a, b)]
+    if a >= total:
+        return [(a - total, b - total)]
+    return [(a, total), (0, b - total)]
+
+
 def default_pulse_name() -> str:
     return "pulse_" + datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -835,27 +854,36 @@ class PulseTableState:
         slots = self.reference_slots() if slots is None else dict(slots)
         self.validate(slots=slots, time_step_ns=step_ns)
         sequence = PulseSequence(name=name or self.name)
+        # First build each channel's UN-delayed ON intervals (in steps) over the frame.
         starts: dict[str, int | None] = {channel: None for channel in self.channels}
+        intervals: dict[str, list[tuple[int, int]]] = {channel: [] for channel in self.channels}
         t_steps = 0
         periods = self.expanded_periods() if expand_repeat else list(self.periods)
         for period in periods:
-            duration_steps = period.duration_steps(slots=slots, time_step_ns=step_ns)
-            next_t_steps = t_steps + duration_steps
+            next_t_steps = t_steps + period.duration_steps(slots=slots, time_step_ns=step_ns)
             for channel, state in zip(self.channels, period.states):
                 active_start = starts[channel]
                 if state and active_start is None:
                     starts[channel] = t_steps
                 elif not state and active_start is not None:
-                    sequence = sequence.pulse(channel, active_start * step_ns * 1e-9, (t_steps - active_start) * step_ns * 1e-9)
+                    intervals[channel].append((active_start, t_steps))
                     starts[channel] = None
             t_steps = next_t_steps
         for channel, active_start in starts.items():
             if active_start is not None:
-                sequence = sequence.pulse(channel, active_start * step_ns * 1e-9, (t_steps - active_start) * step_ns * 1e-9)
+                intervals[channel].append((active_start, t_steps))
+        # Apply each channel's delay as a CYCLIC rotation within the frame
+        # (delay %% total_duration): a pulse pushed past the frame end wraps to the
+        # start.  This is the periodic ("inf") view the preview always shows; it is
+        # also exactly what the hardware does for a repeat_forever sequence.  See
+        # _cyclic_shift_interval (matches Confocal-GUIv2's delay()).
+        total_steps = t_steps
         for channel in self.channels:
-            delay_steps = self.delay_steps(channel, slots=slots, time_step_ns=step_ns)
-            if delay_steps:
-                sequence = sequence.delay(channel, delay_steps * step_ns * 1e-9)
+            d_steps = self.delay_steps(channel, slots=slots, time_step_ns=step_ns)
+            for start_steps, stop_steps in intervals[channel]:
+                for a, b in _cyclic_shift_interval(start_steps, stop_steps, d_steps, total_steps):
+                    if b > a:
+                        sequence = sequence.pulse(channel, a * step_ns * 1e-9, (b - a) * step_ns * 1e-9)
         return sequence
 
     def compile(
