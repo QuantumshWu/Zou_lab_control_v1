@@ -244,7 +244,7 @@ value_select (dual)     : start 与 stop 各一个选择子
 \pyapi{edge/hold} 段把输出保持在某个值；\pyapi{ramp} 段在 start 到 stop 之间\tfocus{线性插值}，引擎本地每步走 1 个码（不额外占边沿行）。\tfocus{dual value\_select} 让 start 与 stop 各自可以指向一个扫描 slot——于是一条 ramp 能\tfocus{同时扫两个端点}（扫描-A $\rightarrow$ 扫描-B），一条 edge/hold 段能跟随一个扫描的 DAC 码。
 
 \section{模拟 DAC ramp 与扫描端点:前端脉冲实绘}
-每条模拟总线是一张小 LUTRAM 段表(组合读),段含 start/stop tick(仿射系数)+ start/stop 值 + mode(edge/ramp)+ 	focus{双 value\_select}(start 和 stop 各一个)。ramp 段由引擎在本地按 tick 插值生成 10-bit 阶梯(不占数字边沿行);双 value\_select 让一条 ramp 的	focus{两个端点各跟一个 scan slot}(scanned-A $	o$ scanned-B),edge/hold 段则跟单个被扫 DAC 码。下图是	focus{前端脉冲绘图器实绘}的 DAC 波形。
+每条模拟总线是一张小 LUTRAM 段表(组合读),段含 start/stop tick(仿射系数)+ start/stop 值 + mode(edge/ramp)+ \tfocus{双 value\_select}(start 和 stop 各一个)。ramp 段由引擎在本地按 tick 插值生成 10-bit 阶梯(不占数字边沿行);双 value\_select 让一条 ramp 的\tfocus{两个端点各跟一个 scan slot}(scanned-A $\to$ scanned-B),edge/hold 段则跟单个被扫 DAC 码。下图是\tfocus{前端脉冲绘图器实绘}的 DAC 波形。
 
 \begin{figure}[h]
 \centering
@@ -253,6 +253,84 @@ value_select (dual)     : start 与 stop 各一个选择子
 \end{figure}
 
 \pyapi{host.engine_model.bus_play} 逐 tick 证明了总线/ramp 引擎，包含被扫描的 ramp 端点。
+
+\chapter{三个子系统的深入讨论}
+
+本章把三个互相支撑的子系统讲透：\tfocus{AXI4 突发上传}（怎么把程序映像快速写进 FPGA）、\tfocus{加性、保周期的硬件延时}（一个 channel 被延时后到底输出什么）、以及\tfocus{会重排的不相交位延时 lane}（被扫描的延时把边沿顺序扫乱时怎么办）。它们的共同地基是仿射有效 tick（见上一章）：因为延时是加性的，被延时的边沿 tick 是 slot 的线性函数，这条性质同时让单表能扫、又让需要时能优雅地分流到 lane。
+
+\section{AXI4 突发上传}
+主机到 FPGA 的传输是 JTAG-to-AXI：\pyapi{jtag_axi_0}（一个由 Vivado Tcl 经 JTAG 线驱动的 AXI 主机）$\rightarrow$ \pyapi{axi_bram_ctrl_0} $\rightarrow$ 顶层后面区段译码的 BRAM 映像。架构上的关键事实是：这两个 IP 都配成\tfocus{完整 AXI4，而不是 AXI4-Lite}。
+
+\textbf{为什么这很重要。} 在 JTAG-to-AXI 上，一次单拍写大约要 10\,ms（开销在 JTAG 往返，不在数据量）。AXI4-Lite 没有突发，所以每个 32-bit 字都是一次事务；一张 4096 边沿的程序有几千个字，于是\tfocus{每次 On Pulse 都是数秒级的上传}。完整 AXI4 允许主机每次事务发一个最多 256 拍（AWLEN 上限）的 INCR 突发，于是一段地址连续的字一个往返就写完，整张 4096 边沿映像因此降到约 \tfocus{100\,ms}。
+
+配置的单一真相源在 \filepath{fpga/pulse_streamer/create_project.tcl}：\pyapi{jtag_axi_0} 与 \pyapi{axi_bram_ctrl_0} 都设 \pyapi{CONFIG.PROTOCOL {AXI4}}，并把 \pyapi{M_AXI_ID_WIDTH=1} / \pyapi{ID_WIDTH=1} 对齐，32-bit 数据/地址，\pyapi{SUPPORTS_NARROW_BURST=0}。顶层 \filepath{zlc_pulse_streamer_top.v} 把主从 1:1 接线，\tfocus{包含突发旁带}（\pyapi{awlen}/\pyapi{awsize}/\pyapi{awburst}/\pyapi{wlast} 等及读通道镜像）。
+
+\begin{notebox}[一个静默退化点]
+若漂回 \pyapi{AXI4LITE}（或丢掉突发旁带），综合仍然成功，但 \pyapi{-len N} 被忽略，上传又变回数秒级——\tfocus{不会报错}。契约测试因此断言 \pyapi{CONFIG.PROTOCOL {AXI4}} 存在、\pyapi{{AXI4LITE}} 不存在，且主机侧 \pyapi{m_axi_awlen}/\pyapi{m_axi_awburst}/\pyapi{m_axi_wlast} 与从机端口映射 \pyapi{.s_axi_awlen(}/\pyapi{.s_axi_awburst(}/\pyapi{.s_axi_wlast(} 都已接线。
+\end{notebox}
+
+\textbf{主机侧}（\filepath{Zou_lab_control/neutral_atom/devices/axi_session.py}，\pyapi{VivadoAxiStreamerSession}）。字写入先排成 \pyapi{(byte_addr, value)} 队列，在 flush 时合并成突发：
+
+\begin{itemize}
+  \item \pyapi{_burst_runs} 按\tfocus{插入顺序}（绝不全局排序）扫描待写队列，只合并严格地址连续（步长 4）的项，上限 \pyapi{burst_max}（默认 256，夹到 $[1,256]$）。\tfocus{顺序是有载荷的}：COMMAND 上升沿是对\tfocus{同一}地址的两次写（先 0 后 cmd），\pyapi{BANK_READY} 的撤销/重置也是对同一地址的两次写；这些都必须保持有序的单拍写，所以不会被合并或重排。
+  \item \pyapi{_write_burst_tcl} 发一条 \pyapi{create_hw_axi_txn ... -len N -type write -burst INCR}。\pyapi{-burst INCR} 是显式写的：Vivado 默认突发类型跨版本不保证是 INCR，而 FIXED 会把每拍都写到基地址（静默损坏）。对多字突发，\pyapi{-data} 是\tfocus{一个拼接的十六进制大数，其最低位（最右）的字落在基地址}——所以逐拍的字是高地址在前发出的，即连续值要\tfocus{逆序拼接}。这个字节序是唯一一个容易静默出错的点。
+  \item \pyapi{_flush} 每个 Vivado 往返里发多个突发（\pyapi{write_batch} 限的是突发数，不是字数），摊薄主机$\leftrightarrow$Tcl 的往返延迟。
+  \item \pyapi{axi_self_test} 是 warm-start 上电自检：突发写一段已知 ramp 进扫描 BRAM 区，再单拍读回比对，不一致就抛错。它正好抓住两类静默故障——突发 \pyapi{-data} 字节序错、或仍是 Lite 的 bitstream 忽略了 \pyapi{-len}——\tfocus{在任何真实脉冲上传之前}。
+\end{itemize}
+
+\textbf{上传不会随扫描点无界增长。} 点数超过 \pyapi{2*bank_size} 的扫描，引擎播 2-bank ping-pong 窗口、主机\tfocus{流式}回填（见前面"无限流式扫描"一章）：在游标 \pyapi{CURSOR} 之后把空出的 bank 填上下一段并重置 \pyapi{BANK_READY}。总扫描点数只受主机内存限制，晚到的回填只会 STALL（\pyapi{STATUS_UNDERFLOW}），\tfocus{绝不}给出错误点。
+
+\section{加性、保周期的硬件延时}
+channel 延时实现为\tfocus{加性}平移，而\tfocus{不是}循环（mod-$T$）旋转。一个被延时 $d$ 的 channel，输出是它周期波形\tfocus{整体右移 $d$}、\tfocus{fire 之前为 0}，并且循环周期仍是帧长 $T$。编译它的是 \pyapi{compile_pulse_table_runtime_program} $\rightarrow$ \pyapi{_pulse_table_edge_table}（\filepath{sequencer.py}）。
+
+\textbf{为什么是加性，不是循环。} 循环视角（GUI \tfocus{预览}显示的就是它）会在 $t=0$ 伪造一段"绕回来的尾巴"，于是 fire 之后的头几个脉冲变成序列尾部的幻影，\tfocus{破坏真实的实验起始}。"无限重复"在现实里是有限的（实验会结束），所以这头几个真实脉冲很重要；加性延时让它们正确。延一个 channel 不应改变另一个 channel 的周期——这才是符合直觉的延时——所以 $T$ 保持不变。
+
+\begin{codeblock}[additive vs cyclic（延时 d，帧 T）]
+cyclic (预览, 仅显示):  [尾巴绕回][.....原信号右移.....]   <- t=0 处有幻影
+additive (硬件, 真相):  [.....0.....][原信号右移 d.....]   <- fire 前恒 0
+\end{codeblock}
+
+机理要点：
+\begin{itemize}
+  \item 编译器先算出每个 channel 在 $[0,T)$ 上的未延时 ON 区间和它的原始延时，再把 ON/OFF 事件按有效延时平移发出。
+  \item \tfocus{负延时}把整帧重新平移 $G=\max(0,-\min(\text{delays}))$，使最早事件 $\ge 0$（统一的基准偏移不会重排任何东西，运行时 tick 计数也永不为负）。
+  \item \pyapi{repeat_forever} 先播一次\tfocus{真实起始的 preamble}，之后只循环稳态帧：它发 $\lceil \text{max\_eff}/T\rceil + 1$ 个整帧使最后一帧达到稳态，再在 \pyapi{loop_end - T} 插一条带稳态帧 mask 的锚边沿，并返回指向它的 \pyapi{repeat_from_index}。引擎把循环倒回那条稳态帧（\pyapi{loop_start_addr}），\tfocus{而不是}倒回边沿 0，所以 preamble 恰好播一次。RTL（\filepath{zlc_edge_streamer.v} 与顶层）里这是 \pyapi{repeat_from_loop_start}。
+\end{itemize}
+
+\begin{notebox}[无 Verilog 仿真下如何证明]
+预览保持循环（只为显示）。硬件/编译路径由一个独立的 \pyapi{_additive_truth} 真值预言（在测试里）加上 \filepath{host/engine_model.py} 的 \pyapi{reference_play} / \pyapi{prefetch_play} / \pyapi{rtl_mirror_play} 逐周期模型证明：编译出的程序过这些周期模型后，与加性真值\tfocus{逐 tick 相同}。
+\end{notebox}
+
+\section{会重排的不相交位延时 lane}
+\tfocus{被扫描}的延时，是单张全局边沿表不一定能表达的情形。当延时被扫掠时，一个 channel 的边沿会移动到\tfocus{越过}另一个 channel 的边沿，于是合并后边沿表的\tfocus{排序顺序}随扫描点改变。单张排序表只有一个固定的行序，表达不了这种变化。
+
+让它有解的关键，正是上一节那条性质：因为硬件延时是加性的，被延时的边沿 tick 是 \pyapi{period_start + delay}——\tfocus{slot 的仿射函数}。所以一个会重排的 channel 可以被拉到\tfocus{自己专属的不相交输出位}上，由一个 1-bit 仿射子播放器来播，而其余 channel 仍用全局排序流。这个子播放器在结构上就是\tfocus{每总线 DAC 引擎特化到 1 bit}：\pyapi{lane_tick_mem} / \pyapi{lane_coeff_mem} / \pyapi{lane_value_mem} 放在 \tfocus{LUTRAM}（\pyapi{ram_style="distributed"}）、自带指针、共享同一条仿射 MAC \pyapi{zlc_effective_tick}（都在 \filepath{zlc_edge_streamer.v}）。lane channel 被从主边沿 mask 里排除，输出合并是 \pyapi{(state_mask & ~lane_mask) | lane_out}，于是全局流\tfocus{永不}重排。
+
+\textbf{路由（编译器，\filepath{sequencer.py}）：}
+\begin{itemize}
+  \item \pyapi{compile_pulse_table_scan_runtime_program} \tfocus{先}试最便宜的单张全局仿射表（\pyapi{_pulse_table_affine_rows}）。常数延时、或不会重排的被扫延时，都留在主表里。
+  \item 只有当它抛错（真的发生重排）时，才调 \pyapi{_pulse_table_delay_lanes} 把被扫延时的 channel 分流到 lane，再排除它们重建主表行。若失败并非"被扫延时重排"，则把原错误重新抛出。
+\end{itemize}
+
+\textbf{单边沿重置（为什么没有复制的乘法器）。} 重排延时扫描是\tfocus{单帧}的：\pyapi{loop_start=0}、\pyapi{loop_count=1}、\pyapi{repeat_from=0}。因此 lane 只重置到帧 tick 0，重置是\tfocus{单边沿检查}——没有对 lane 的展开式遍历，于是\tfocus{不会}为每条 lane 边沿复制 MAC。\pyapi{validate_pulse_streamer_program}（\filepath{fpga_pulse_streamer.py}）会以清晰报错\tfocus{拒绝} lane 与内层 repeat bracket（\pyapi{loop_start>0}）或加性 repeat preamble（\pyapi{repeat_from_index>0}）的组合，并校验 lane 数、\pyapi{channel_bit} 不相交、每 lane 边沿数、以及每个扫描点上 lane 有效 tick 落在帧内且严格递增。
+
+\textbf{容量与限制：}
+\begin{itemize}
+  \item 最多 \pyapi{NUM_LANES=4} 条同时 lane（够同时扫几个接口的延时），每个被延时 channel 最多 \pyapi{MAX_LANE_EDGES=64} 个子边沿（脉冲）。默认值 \pyapi{DEFAULT_NUM_LANES=4} / \pyapi{DEFAULT_MAX_LANE_EDGES=64} 与 RTL 参数一致。
+  \item lane PLAY 表是 LUTRAM（\tfocus{+0 BRAM}），每 lane 一个 MAC 站点。35T 上每一项资源轴都留在 90\% 以内（lane PLAY 表不占 RAMB36；lane IMAGE 暂存 BRAM \pyapi{blk_mem_gen_laneimg} 是 6 块 BRAM 之一）。
+  \item 把边沿推到\tfocus{超出帧末}或\tfocus{为负}的被扫延时，会在\tfocus{编译期}以清晰可操作的报错拒绝——按扫描点扩展/平移帧是后续工作。每 channel 多个子边沿\tfocus{是支持的}（至 \pyapi{MAX_LANE_EDGES}）。
+\end{itemize}
+
+\begin{notebox}[lane 也是被逐寄存器证明的]
+\pyapi{_rtl_lane_realization_play}（在测试里）逐寄存器复刻 lane 播放器的 RTL 传输，并在真实重排扫描程序、一组手搭程序（start / scan-advance / repeat-forever-restart、多 lane、仿射 lane）、以及一个 200 程序 fuzz 集上，与 \pyapi{engine_model.reference_play} \tfocus{逐 tick 相等}。
+\end{notebox}
+
+\section{两件没有下放进 sequencer 的事}
+两条边界澄清，免得把架构搞混：
+\begin{itemize}
+  \item \tfocus{解耦。} sequencer / 边沿流送器\tfocus{不含}任何相机/触发判断。引擎只播放数字边沿、模拟总线段、和延时 lane；引擎 HDL（\filepath{zlc_edge_streamer.v}）里\tfocus{没有}相机/采集/读出/判定逻辑。触发通道只是引擎驱动的又一路数字输出——\tfocus{何时}计数或阈值判定的决定，住在采集/反馈子系统（\pyapi{subsystems} / readout），不在 timing 里。
+  \item \tfocus{对齐到 tick（单一来源）。} 时钟只能落在整 tick（$\ge 20$\,ns），所以字面时间值会被对齐到网格，且只有\tfocus{一个}对齐来源 \pyapi{PulseTableState.snapped()}（\filepath{timing/pulse_table.py}）：period 持续时间\tfocus{向下取整到 $\ge 1$ tick}（绝不塌到 0，例如 5\,ns $\rightarrow$ 20\,ns）；channel 延时与扫描点值\tfocus{四舍五入到最近 tick}（半值远离零、保号）；DAC 扫描点取最近整数码；而 slot \tfocus{表达式}（\pyapi{s0}、\pyapi{20+s0} 等非数字）\tfocus{原样保留}——编译器改为对它的仿射 base 取整，所以绑定永不被破坏。它\tfocus{永不报错}（自动对齐），对应共聚焦的 \pyapi{align_to_resolution}。脉冲传输 API 在 \pyapi{sequencer.timing_payload_to_dict} 里用 \pyapi{snapped()} 一次性对齐整个状态，GUI 则通过 \pyapi{align_to_resolution} 背书的分辨率控件逐字段套同一规则——两端共享 \filepath{timing/pulse_table.py} 的同一套取整逻辑，所以\tfocus{所见即所跑}。
+\end{itemize}
 
 \chapter{容量与资源预算}
 

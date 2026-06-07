@@ -41,7 +41,7 @@ Source of truth for generated docs (edit the template, then rebuild the PDF):
 The build entry points are in `Zou_lab_control/neutral_atom/content/manuals.py`
 and `Zou_lab_control/frontend/content/manuals.py`; both call
 `Zou_lab_control.frontend.notes.render_tex_pdf` / `render_notes_pdf`. See
-section 7 for the build commands.
+section 10 for the build commands.
 
 Notebook markdown should be short and operational: say what the next cell does,
 show the concrete call, and link to a manual for background.
@@ -71,6 +71,14 @@ Invariants:
   dependencies use `"$device:name"`, built-in classes resolve lazily, external
   classes use a full import path or `register_device_class()`. Do not grow this
   into a heavyweight dependency-injection framework.
+- **Sequencer / streamer is purely a player.** The sequencer and the FPGA edge
+  streamer contain NO camera/trigger judgment. The streamer only plays digital
+  edges, analog-bus segments, and delay lanes; the engine HDL
+  (`zlc_edge_streamer.v`) has no camera/acquire/readout/detect logic at all. A
+  trigger channel is just one more digital output the player drives — the decision
+  about *when* to count or threshold lives in the acquisition/feedback subsystem
+  (`subsystems/`, readout), not in timing. Do not push exposure/threshold/feedback
+  decisions down into the sequencer; keep playback and acquisition decoupled.
 
 ## 3. Real Hardware Path
 
@@ -148,6 +156,23 @@ This replaced the old `x`/`y` affine scan. **There is no more `x`/`y` notion.**
 Anti-patterns: do not expand a scan grid into many GUI columns or many prepared
 pulse tables when one ordered `scan_table` describes it; do not re-introduce
 separate `x_array`/`y_array` objects.
+
+Snap-to-tick (single source). The clock can only land on whole ticks (>= 20 ns),
+so literal time values are snapped to the grid, and there is exactly **one** snap
+source: `PulseTableState.snapped()` (`timing/pulse_table.py`). Rule: period
+durations floor to `>= 1` tick (a duration never collapses to zero — e.g. 5 ns ->
+20 ns); channel delays and scan-point values round to the nearest tick (ties away
+from zero, sign preserved); DAC scan points round to the nearest integer code; and
+slot **expressions** (`"s0"`, `"20+s0"`, anything non-numeric) are preserved
+literally — the compiler snaps their affine base instead, so bindings are never
+corrupted. It never raises (it auto-snaps), mirroring the confocal
+`align_to_resolution`. The same grid rule is applied on both ends so what the user
+sees and what the hardware runs always agree: the pulse-transfer API snaps the
+whole state once via `snapped()` in `sequencer.timing_payload_to_dict`, and the GUI
+applies the identical rule field-by-field through the `align_to_resolution`-backed
+resolution widgets (`pulse_gui.py` `set_resolution`) plus `snap_scan_table`, all of
+which share the `quantized_time_steps` floor/round-to-nearest logic in
+`timing/pulse_table.py`.
 
 ## 5. Frontend Fluent Rules
 
@@ -350,7 +375,154 @@ resident scan points + UNBOUNDED streaming**; RAMB36 78% (LUT 26%, FF 12%, DSP
 9%) from `solve_capacity`. The bus segment tables are LUTRAM (distributed), not
 RAMB36, because the bus/ramp engine reads them combinationally each tick.
 
-## 7. Building The Manuals
+## 7. AXI4 Burst Upload (transport architecture)
+
+The host<->FPGA transport is JTAG-to-AXI: `jtag_axi_0` (a Vivado AXI master driven
+from Tcl over the JTAG cable) -> `axi_bram_ctrl_0` -> the region-decoded BRAM image
+behind `zlc_pulse_streamer_top.v`. The architecturally important fact is that both IP
+are configured as **full AXI4, not AXI4-Lite**.
+
+Why this matters. Over JTAG-to-AXI a single-beat write costs roughly 10 ms (the cost is
+the JTAG round-trip, not the transfer). AXI4-Lite has no burst, so every 32-bit word is
+one transaction; a 4096-edge program is several thousand words, i.e. a multi-second
+upload on every `On Pulse`. Full AXI4 lets the master issue an INCR burst of up to 256
+beats (AWLEN max) per transaction, so an address-contiguous run of words moves in one
+round-trip. A complete 4096-edge image then uploads in ~100 ms.
+
+Configuration source of truth (`fpga/pulse_streamer/create_project.tcl`):
+`CONFIG.PROTOCOL {AXI4}` on both `jtag_axi_0` and `axi_bram_ctrl_0`, with
+`CONFIG.M_AXI_ID_WIDTH {1}` / `CONFIG.ID_WIDTH {1}` matched, 32-bit data/address, and
+`SUPPORTS_NARROW_BURST {0}`. The top (`zlc_pulse_streamer_top.v`) wires the master and
+slave 1:1 including the burst sidebands (`awid/awlen/awsize/awburst/awlock/awcache/wlast`
+and the read mirror). A drift back to `AXI4LITE` (or dropping the burst sidebands) is
+silent: synthesis still succeeds, but `-len N` is ignored and uploads return to seconds.
+The contract test asserts `CONFIG.PROTOCOL {AXI4}` is present and `{AXI4LITE}` is absent,
+and that `m_axi_awlen`/`m_axi_awburst`/`m_axi_wlast` (master) and `.s_axi_awlen(`/
+`.s_axi_awburst(`/`.s_axi_wlast(` (slave port map) are wired.
+
+Host side (`Zou_lab_control/neutral_atom/devices/axi_session.py`,
+`VivadoAxiStreamerSession`). Word writes are queued as `(byte_addr, value)` and coalesced
+at flush:
+
+- `_burst_runs` walks the **pending list in insertion order** (never globally sorted) and
+  merges only strictly address-contiguous entries (stride 4), capped at `burst_max`
+  (default 256, clamped to [1, 256]). Order is load-bearing: a COMMAND rising edge is two
+  writes to the *same* address (0 then cmd), and a `BANK_READY` de-arm/re-arm pair is two
+  writes to the same address; both must stay ordered single-beat writes, so they are
+  never merged or reordered.
+- `_write_burst_tcl` emits one `create_hw_axi_txn ... -len N -type write -burst INCR`. The
+  `-burst INCR` is explicit because the Vivado default burst type is not guaranteed INCR
+  across versions and FIXED would write every beat to the base address (silent
+  corruption). For a multi-word burst the `-data` argument is **one concatenated hex value
+  whose least-significant (rightmost) word lands at the base address** — so the per-beat
+  words are emitted high-address-first, i.e. the contiguous values are concatenated in
+  REVERSE. This byte order is the one easy silent failure mode.
+- `_flush` sends several bursts per Vivado round-trip (`write_batch` bounds bursts, not
+  words) to amortise the host<->Tcl latency.
+- `axi_self_test` is a warm-start bring-up check: it burst-writes a known ramp into the
+  scan-BRAM region, reads it back single-beat, and raises if it does not match. This
+  catches exactly the two silent faults — wrong burst `-data` byte order, or a still-Lite
+  bitstream that ignores `-len` — before any real pulse upload.
+
+Streaming bound. A scan with more than `2*bank_size` points does **not** make the upload
+grow without bound. The engine plays a 2-bank ping-pong window; the host streams — it
+refills the bank behind the consumed `CURSOR` with the next chunk and re-arms
+`BANK_READY` (see section 3 and 6). Total scan points are limited only by host memory, and
+a late refill STALLs (`STATUS_UNDERFLOW`, hold), never a wrong point.
+
+## 8. Additive, Period-Preserving Hardware Delay
+
+A channel delay is implemented as an **additive** shift, not a cyclic (mod-`T`) rotation.
+A channel delayed by `d` emits its periodic waveform shifted RIGHT by `d`, with **zero
+output before fire** and the loop period preserved at the frame length `T`. The compiler
+that builds this is `compile_pulse_table_runtime_program` ->
+`_pulse_table_edge_table` in `sequencer.py`.
+
+Why additive, not cyclic. The cyclic view (what the GUI **preview** shows) would fake a
+wrapped-in tail at `t=0`, so the first pulses right after fire would be a phantom of the
+sequence end. That corrupts the true experiment startup. "Repeat forever" is finite in
+reality (the experiment ends), so those first real pulses matter; additive delay makes
+them correct. Delaying one channel must not change another channel's period — the
+physically intuitive behaviour — so `T` is held fixed.
+
+Mechanics:
+
+- The compiler computes each channel's un-delayed ON intervals over `[0, T)` and its raw
+  delay, then emits ON/OFF events shifted by the effective delay.
+- A NEGATIVE delay re-translates the WHOLE frame by `G = max(0, -min(delays))` so the
+  earliest event is `>= 0` (a uniform base offset cannot reorder anything, and the
+  runtime tick counter never goes negative).
+- `repeat_forever` plays a real-startup **preamble** once, then loops only the
+  steady-state frame. It emits `ceil(max_eff/T) + 1` whole frames so the last one is
+  steady-state, then inserts an anchor edge at `loop_end - T` carrying the steady-frame
+  mask and returns `repeat_from_index` pointing at it. The engine rewinds the loop to that
+  steady frame (`loop_start_addr`), **not** to edge 0, so the preamble plays exactly once.
+  In the RTL (`zlc_edge_streamer.v` + top) this is `repeat_from_loop_start`.
+
+Correctness without a Verilog simulator. The preview stays cyclic (display only). The
+hardware/compiler path is proven by an independent `_additive_truth` oracle (in
+`tests/test_neutral_atom_lightweight.py`) plus the `reference_play` / `prefetch_play` /
+`rtl_mirror_play` cycle models in `fpga/pulse_streamer/host/engine_model.py`: the compiled
+program played through the cycle models equals the additive truth tick-for-tick.
+
+## 9. Reordering Disjoint-Bit Delay Lanes
+
+A **scanned** delay is the case the single global edge table cannot always represent. As
+the delay sweeps, one channel's edges can move PAST another channel's edges, so the
+*sorted* order of the merged edge table changes per scan point. A single sorted table has
+one fixed row order and cannot express that.
+
+The key enabling fact is from section 8: because the hardware delay is additive, a delayed
+edge tick is `period_start + delay` — **affine in the scan slots**. So a reordering
+channel can be pulled onto its **own disjoint output bit** and played by a 1-bit affine
+sub-player, while the rest of the channels keep using the global sorted stream. The
+sub-player is structurally the per-bus DAC engine specialised to one bit: `lane_tick_mem`
+/ `lane_coeff_mem` / `lane_value_mem` in **LUTRAM** (`ram_style="distributed"`), its own
+pointer, and the **shared** affine MAC `zlc_effective_tick` (all in
+`zlc_edge_streamer.v`). The lane channel is excluded from the main edge mask, and the
+output merge is `(state_mask & ~lane_mask) | lane_out`, so the global stream **never**
+reorders.
+
+Routing (compiler, `sequencer.py`):
+
+- `compile_pulse_table_scan_runtime_program` tries the cheap single global affine table
+  FIRST (`_pulse_table_affine_rows`). A constant delay, or a scanned delay that does NOT
+  reorder, stays in the main table.
+- Only if that raises (a genuine reorder) does it call `_pulse_table_delay_lanes` to route
+  the scanned-delay channels to lanes, then rebuild the main rows excluding them. If the
+  failure was not a scanned-delay reorder, it re-raises the original error.
+- `_pulse_table_delay_lanes` emits each lane's affine rise/fall edges as `(base, coeffs)`
+  and packs a `DelayLane(channel, channel_bit, ticks, coeffs, values)`.
+
+Single-edge reinit (why no replicated multipliers). The reordering-delay scan is
+single-frame: `loop_start=0`, `loop_count=1`, `repeat_from=0`. The lane therefore reseeds
+only to frame-tick 0, so the reinit is a single-edge check — there is **no unrolled walk**
+of the lane and hence no replicated MAC per lane edge. `validate_pulse_streamer_program`
+(`fpga_pulse_streamer.py`) REJECTS a lane combined with an inner repeat bracket
+(`loop_start>0`) or with the additive repeat preamble (`repeat_from_index>0`) with a clear
+message; it also enforces lane count, disjoint `channel_bit`, per-lane edge count, and
+per-scan-point in-frame strict monotonicity.
+
+Capacity and limits:
+
+- Up to `NUM_LANES=4` simultaneous lanes (covers scanning several interfaces' delays at
+  once); up to `MAX_LANE_EDGES=64` sub-edges (pulses) per delayed channel. Defaults are
+  `DEFAULT_NUM_LANES=4` / `DEFAULT_MAX_LANE_EDGES=64`, matching the RTL params.
+- Lane PLAY tables are LUTRAM (+0 BRAM); one MAC site per lane. Capacity on the 35T stays
+  within 90% on every axis (lane PLAY tables add no RAMB36; the lane IMAGE staging BRAM
+  `blk_mem_gen_laneimg` is one of the 6 BRAMs).
+- A scanned delay that pushes an edge past the frame end, or negative, is rejected at
+  COMPILE with a clear actionable message — extending/translating the frame per scan point
+  is future work. Multiple sub-edges per delayed channel ARE supported (up to
+  `MAX_LANE_EDGES`).
+
+Proof. `_rtl_lane_realization_play` (in `tests/test_neutral_atom_lightweight.py`)
+re-derives the exact RTL register transfers of the lane player and equals
+`engine_model.reference_play` over the real reordering-scan program, a hand-built set
+(start / scan-advance / repeat-forever-restart, multiple lanes, affine lane), and a 200-
+program fuzz set.
+
+## 10. Building The Manuals
 
 ```powershell
 python -c "from Zou_lab_control.neutral_atom.notes import build_main_manual, build_fpga_manual, build_device_manual; build_main_manual(); build_fpga_manual(); build_device_manual()"
@@ -362,7 +534,7 @@ template, writes the `.tex` wrapper, and runs `render_tex_pdf` (XeLaTeX, 2-pass,
 in a temp dir). XeLaTeX must be on PATH (or pass `xelatex=`). A failed build
 leaves only a `.build.log` next to the target PDF.
 
-## 8. Verification
+## 11. Verification
 
 Tests are owned by another agent; see `tests/README.md` for the scoped matrix.
 Prefer the smallest scoped check that covers the edited boundary; use full
@@ -375,7 +547,7 @@ python -m json.tool tutorials\neutral_atom_hardware_quickstart.ipynb > $null
 git diff --check
 ```
 
-## 9. Framework Review (architecture assessment)
+## 12. Framework Review (architecture assessment)
 
 A whole-framework review was done after the scan-redesign work. **Verdict: no
 large rewrite is warranted.** The layering (`devices` contract / `timing` truth
