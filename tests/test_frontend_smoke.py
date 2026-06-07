@@ -1346,6 +1346,67 @@ def test_fluent_combo_popup_fits_widest_item(monkeypatch):
     combo.hidePopup()
 
 
+def test_pulse_gui_fire_runs_off_main_thread(monkeypatch):
+    """Regression for the off->on GUI freeze: a slow sequencer call (prepare/fire ->
+    RPyC -> hw_axi) must run on a WORKER thread so fire() returns immediately and the
+    Qt event loop keeps running; the runstate updates + buttons re-enable once the
+    worker finishes.  (The real freeze was prepare()/fire() blocking the main thread
+    for up to the 120 s action_timeout.)"""
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    import time as _time
+
+    from Zou_lab_control.frontend.pulse_gui import (
+        PulseSequenceEditor, PulseStateUIManager, ensure_qt_app,
+    )
+
+    app = ensure_qt_app()
+
+    class SlowSequencer:
+        clock_hz = 50e6
+        trigger_channels: list[str] = []
+
+        def __init__(self):
+            self.channels = [f"ch{i:02d}" for i in range(8)]
+            self.prepared = 0
+            self.fired = 0
+
+        def prepare(self, state):
+            _time.sleep(0.4)            # simulate a slow BRAM upload + LOAD poll
+            self.prepared += 1
+            return object()
+
+        def fire(self, *args, **kwargs):
+            self.fired += 1
+
+    seq = SlowSequencer()
+    editor = PulseSequenceEditor(sequencer=seq)
+    try:
+        monkeypatch.setattr(editor, "_async_enabled", lambda: True)  # force worker path
+        editor.resize(800, 600)
+        editor.show()
+        app.processEvents()
+
+        t0 = _time.monotonic()
+        editor.fire()
+        elapsed = _time.monotonic() - t0
+        assert elapsed < 0.2, f"fire() blocked the GUI thread for {elapsed:.2f}s (should dispatch to a worker)"
+        assert editor.fire_button.isEnabled() is False   # disabled while the worker is in flight
+
+        deadline = _time.monotonic() + 5.0
+        while _time.monotonic() < deadline:
+            app.processEvents()
+            if editor.stateui_manager.runstate == PulseStateUIManager.RunState.RUNNING:
+                break
+            _time.sleep(0.01)
+
+        assert seq.prepared == 1 and seq.fired == 1
+        assert editor.stateui_manager.runstate == PulseStateUIManager.RunState.RUNNING
+        assert editor.fire_button.isEnabled() is True    # re-enabled after the worker finished
+    finally:
+        editor.close()
+
+
 def test_pulse_gui_constructs_xdc_channel_editor(monkeypatch, tmp_path):
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")

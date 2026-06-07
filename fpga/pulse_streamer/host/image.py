@@ -427,12 +427,18 @@ def _scan_ramb(bank_size: int, p: StreamerParams) -> int:
 def solve_capacity(part, *, channel_count: int = 62, num_slots: int = 4, coeff_width: int = 16,
                    tick_width: int = 32, coeff_frac_bits: int = 8, bus_count: int = 4,
                    bus_width: int = 10, bus_seg_addr_width: int = 6, bus_sel_width: int = 3,
+                   slot_mul_width: int = 25,
                    target_pct: float = 90.0, bank_size: int = 512,
                    max_edges_cap: int = 16384,
-                   engine_logic_luts: int = 4500, engine_ff: int = 5000, engine_dsp: int = 8) -> SolvedCapacity:
+                   engine_logic_luts: int = 8000, engine_ff: int = 9000, engine_dsp: int | None = None) -> SolvedCapacity:
     """Maximise max_edges under <=target_pct of the part's RAMB36 (edges are the
     bounded resource; scan points are UNBOUNDED via streaming, so only the 2-bank
-    window costs BRAM).  Edge fields are parallel BRAMs (no width padding)."""
+    window costs BRAM).  Edge fields are parallel BRAMs (no width padding).
+
+    LUT/FF/DSP estimates are CALIBRATED to a real Vivado 2019.1 place+route of the
+    35T build (zlc_pulse_streamer_top): 7376 slice LUTs (35%), 8059 FF (19%), 52
+    DSP (58%), 40 RAMB36 (80%).  The defaults below sit just above those with margin
+    so the contract test catches a regression that would push any axis past 90%."""
     prof = part_profile(part)
     pct = max(1.0, min(100.0, float(target_pct)))
     budget = int(prof.ramb36 * pct / 100.0)
@@ -474,6 +480,18 @@ def solve_capacity(part, *, channel_count: int = 62, num_slots: int = 4, coeff_w
     # (2*coeff_bits), start+stop value (2*bus_width), mode (2), and the start AND stop
     # value_select (2*bus_sel_width -- a ramp can scan both endpoints).
     bus_lutram = _ceil((2 * tick_width + 2 * params.coeff_bits + 2 * bus_width + 2 + 2 * bus_sel_width) * params.bus_rows, 64)
+
+    # DSP estimate, derived from the engine's affine-MAC (zlc_effective_tick) call
+    # sites -- the dominant DSP user.  After the shared-MAC dedup the engine has:
+    #   * bus_tick: 2 evals/bus (segment start + stop), ONE shared set      -> 2*bus_count
+    #   * main: edge-0 seed, final, loop_end, loop-rewind, next-edge compare -> 5
+    # Each eval is num_slots products of coeff(<=18b) x slot(slot_mul_width); a slot
+    # operand <=25b fits ONE DSP48E1 (25x18), else two.  Keep this in sync with
+    # zlc_edge_streamer.v so capacity is checked for DSP, not just BRAM.
+    if engine_dsp is None:
+        mac_instances = 2 * bus_count + 5
+        dsp_per_mult = 1 if slot_mul_width <= 25 else 2
+        engine_dsp = mac_instances * num_slots * dsp_per_mult
 
     def res(used, total):
         b = int(total * pct / 100.0)

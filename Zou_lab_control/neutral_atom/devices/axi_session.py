@@ -104,6 +104,7 @@ class VivadoAxiStreamerSession:
         params: StreamerParams | None = None,
         startup_timeout: float = 180.0,
         action_timeout: float | None = 120.0,
+        load_timeout: float = 15.0,
         write_batch: int = 200,
         stream_poll_interval: float = 0.005,
         tcl_executor: Callable[[Sequence[str], str, float | None], str] | None = None,
@@ -119,6 +120,7 @@ class VivadoAxiStreamerSession:
         self.params = params or DEFAULT_PARAMS
         self.startup_timeout = float(startup_timeout)
         self.action_timeout = action_timeout
+        self.load_timeout = float(load_timeout)
         self.write_batch = max(1, int(write_batch))
         self.stream_poll_interval = float(stream_poll_interval)
 
@@ -314,10 +316,16 @@ class VivadoAxiStreamerSession:
         # image) -> arm both ready bits.
         self._queue_word(CtrlWords.BANK_READY, 0b11)
         self._flush()
-        if not self._command(CMD_LOAD, wait_mask=STATUS_LOADED):
+        # The mini-loader asserts LOADED within microseconds of CMD_LOAD on real
+        # hardware, so wait only a few seconds: a missing LOADED means a wedged
+        # bring-up (bad .bit/.ltx, JTAG, or AXI), which should surface as a prompt
+        # error -- not a 120 s freeze.
+        if not self._command(CMD_LOAD, wait_mask=STATUS_LOADED, timeout=self.load_timeout):
+            status = self._read_word(CtrlWords.STATUS)
             raise RuntimeError(
                 "pulse streamer did not report LOADED after the program upload "
-                "(check the .bit/.ltx, the JTAG cable, and the STATUS word)."
+                f"(STATUS=0x{status:08X}; check the .bit/.ltx, the JTAG cable, and that "
+                "run_server programmed the current bitstream)."
             )
 
     def fire(self, program=None) -> None:
@@ -449,7 +457,15 @@ class VivadoAxiStreamerSession:
             self._stream_stop.set()
         thread = self._stream_thread
         if thread is not None and thread.is_alive():
-            thread.join(timeout=2.0)
+            # The refill thread can be mid-AXI-read holding _io_lock; that read is
+            # itself bounded by action_timeout and then self-clears.  Wait long
+            # enough that the thread is truly dead before reusing the session --
+            # if it is still alive, KEEP the handle so a later stop retries the
+            # join instead of orphaning a thread that still holds _io_lock (which
+            # would make the NEXT prepare/safe_state block on the lock).
+            thread.join(timeout=float(self.action_timeout or 120.0) + 5.0)
+            if thread.is_alive():
+                return
         self._stream_thread = None
         self._stream_stop = None
 

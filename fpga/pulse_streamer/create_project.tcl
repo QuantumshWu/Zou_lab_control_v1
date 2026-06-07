@@ -230,10 +230,27 @@ update_compile_order -fileset sources_1
 launch_runs synth_1 -jobs 4
 wait_on_run synth_1
 zlc_require_run_complete synth_1 "synth_design Complete!"
-launch_runs impl_1 -to_step write_bitstream -jobs 4
-wait_on_run impl_1
-zlc_require_run_complete impl_1 "write_bitstream Complete!"
 
-set bit_path [file join $project_dir ${project_name}.runs impl_1 ${top}.bit]
+# Implementation runs IN-PROCESS (open the finished synth run, then opt/place/route/
+# bitstream in this same Vivado session) instead of as a separate project "impl_1"
+# run.  The project impl run is launched with `launch_runs impl_1 -jobs N`, which
+# re-checks every out-of-context IP run for currency and can relaunch one in
+# parallel -- leaving impl_1 stuck at STATUS "Scripts Generated" and producing no
+# bitstream.  The in-process flow has a single, deterministic dependency (the
+# completed synth_1) and writes the bit/ltx to the same impl_1 path the server +
+# program_fpga.tcl expect.
+set impl_dir [file join $project_dir ${project_name}.runs impl_1]
+file mkdir $impl_dir
+open_run synth_1 -name impl_1
+opt_design
+place_design
+phys_opt_design
+route_design
+set bit_path [file join $impl_dir ${top}.bit]
+set ltx_path [file join $impl_dir ${top}.ltx]
+write_bitstream -force $bit_path
+catch {write_debug_probes -force $ltx_path}
+report_utilization -file [file join $impl_dir ${top}_utilization_routed.rpt]
+catch {report_timing_summary -file [file join $impl_dir ${top}_timing_summary_routed.rpt]}
 if {![file exists $bit_path]} { error "Bitstream was not generated: $bit_path" }
 puts "ZLC bitstream: $bit_path"

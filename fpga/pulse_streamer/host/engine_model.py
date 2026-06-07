@@ -45,13 +45,32 @@ class ScanUnderflow(RuntimeError):
     """The host did not refill the next scan bank before the engine reached it."""
 
 
+# Affine-MAC slot operand width -- MUST match zlc_edge_streamer.v SLOT_MUL_WIDTH.
+# The per-slot scan value is multiplied by a 16-bit coeff using a single DSP48E1
+# (25x18), so the slot operand is the low SLOT_MUL_WIDTH bits taken as signed.
+# This bounds the raw scan VALUE to +/-2^24 ticks (~+/-335 ms @ 20 ns); the coeff
+# still scales it, so the resulting tick offset spans the full 32-bit range.
+SLOT_MUL_WIDTH = 25
+
+
+def _narrow_slot(value: int) -> int:
+    """Low SLOT_MUL_WIDTH bits of ``value`` as a signed int (mirrors the RTL's
+    ``$signed(slots[.. +: SLOT_MUL_WIDTH])``)."""
+    mask = (1 << SLOT_MUL_WIDTH) - 1
+    v = int(value) & mask
+    if v & (1 << (SLOT_MUL_WIDTH - 1)):
+        v -= 1 << SLOT_MUL_WIDTH
+    return v
+
+
 def effective_tick(base_tick: int, coeffs: Sequence[int], slots: Sequence[int], frac_bits: int) -> int:
     """base + (sum coeff_j*slot_j) >>> frac (arithmetic shift; matches the RTL MAC
-    and the host compiler).  Python ``>>`` on a negative int is an arithmetic
+    and the host compiler).  The slot operand is narrowed to SLOT_MUL_WIDTH signed
+    bits exactly as the RTL does.  Python ``>>`` on a negative int is an arithmetic
     (floor) shift, identical to Verilog ``>>>`` on the signed accumulator."""
     total = 0
     for c, s in zip(coeffs, slots):
-        total += int(c) * int(s)
+        total += int(c) * _narrow_slot(s)
     return int(base_tick) + (total >> int(frac_bits))
 
 

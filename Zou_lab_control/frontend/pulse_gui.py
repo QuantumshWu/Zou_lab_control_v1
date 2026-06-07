@@ -462,6 +462,25 @@ def _elide_text(text: object, width: int) -> str:
     return _font_metrics().elidedText(str(text), QtCore.Qt.ElideRight, max(8, int(width)))
 
 
+class _SequencerWorker(QtCore.QThread):
+    """Run a blocking sequencer call (prepare/fire/safe_state -> RPyC -> Vivado
+    hw_axi -> FPGA) OFF the Qt main thread, so the GUI event loop keeps running and
+    the window never shows "(Not Responding)".  The result (or error message) is
+    delivered back to the main thread via the ``done`` signal (queued connection)."""
+
+    done = QtCore.pyqtSignal(object, object)  # (result, error_message_or_None)
+
+    def __init__(self, fn, parent=None):
+        super().__init__(parent)
+        self._fn = fn
+
+    def run(self) -> None:  # executes on the worker thread
+        try:
+            self.done.emit(self._fn(), None)
+        except Exception as exc:  # surface ANY backend error on the GUI thread
+            self.done.emit(None, str(exc))
+
+
 class PulseStateUIManager(QtCore.QObject):
     class RunState:
         INIT = "INIT"
@@ -2512,40 +2531,116 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             return None
         return self.sequencer.prepare(state)
 
+    def _async_enabled(self) -> bool:
+        # Offscreen (tests / screenshots) runs sequencer calls SYNCHRONOUSLY so the
+        # runstate is deterministic for assertions; the real GUI runs them in a worker
+        # thread so a slow/stuck hardware upload never freezes the window.
+        return os.environ.get("QT_QPA_PLATFORM", "").lower() != "offscreen"
+
+    def _set_control_buttons_busy(self, busy: bool) -> None:
+        for name in ("fire_button", "safe_button", "prepare_button"):
+            button = getattr(self, name, None)
+            if button is not None:
+                button.setEnabled(not busy)
+
+    def _dispatch_sequencer(self, fn, *, success_state, store_program: bool = False) -> None:
+        """Run ``fn`` (a blocking sequencer call) without freezing the GUI: inline when
+        offscreen, else on a worker thread that reports back via a queued signal."""
+        RunState = PulseStateUIManager.RunState
+        if not self._async_enabled():
+            try:
+                result = fn()
+                if store_program:
+                    self.last_program = result
+                self.stateui_manager.runstate = success_state
+            except Exception as exc:
+                self.stateui_manager.runstate = RunState.ERROR
+                self._message(str(exc))
+            return
+        worker = getattr(self, "_seq_worker", None)
+        if worker is not None and worker.isRunning():
+            self._message("A pulse operation is already in progress; please wait.")
+            return
+        self._set_control_buttons_busy(True)
+
+        def _on_done(result, error):
+            self._set_control_buttons_busy(False)
+            if error is not None:
+                self.stateui_manager.runstate = RunState.ERROR
+                self._message(str(error))
+            else:
+                if store_program:
+                    self.last_program = result
+                self.stateui_manager.runstate = success_state
+            self._seq_worker = None
+
+        worker = _SequencerWorker(fn)
+        worker.done.connect(_on_done)
+        self._seq_worker = worker
+        worker.start()
+
     def prepare(self) -> None:
-        try:
-            self.last_program = self._prepare_to_device()
-            if self.last_program is None:
+        RunState = PulseStateUIManager.RunState
+        if self.sequencer is None:
+            try:
+                self._prepare_to_device()
                 self._message("No sequencer attached. Sequence validated only.")
-            self.stateui_manager.runstate = PulseStateUIManager.RunState.PREPARED
+                self.stateui_manager.runstate = RunState.PREPARED
+            except Exception as exc:
+                self.stateui_manager.runstate = RunState.ERROR
+                self._message(str(exc))
+            return
+        try:
+            state = self.read_state()      # read widgets on the GUI thread
         except Exception as exc:
-            self.stateui_manager.runstate = PulseStateUIManager.RunState.ERROR
+            self.stateui_manager.runstate = RunState.ERROR
             self._message(str(exc))
+            return
+        sequencer = self.sequencer
+        self._dispatch_sequencer(lambda: sequencer.prepare(state),
+                                 success_state=RunState.PREPARED, store_program=True)
 
     def fire(self) -> None:
-        try:
-            self.last_program = self._prepare_to_device()
-            if self.sequencer is None:
+        RunState = PulseStateUIManager.RunState
+        if self.sequencer is None:
+            try:
+                self._prepare_to_device()
                 self._message("No sequencer attached. Sequence validated only.")
-                self.stateui_manager.runstate = PulseStateUIManager.RunState.PREPARED
-                return
-            self.sequencer.fire()
-            self.stateui_manager.runstate = PulseStateUIManager.RunState.RUNNING
+                self.stateui_manager.runstate = RunState.PREPARED
+            except Exception as exc:
+                self.stateui_manager.runstate = RunState.ERROR
+                self._message(str(exc))
+            return
+        try:
+            state = self.read_state()      # read widgets on the GUI thread
         except Exception as exc:
-            self.stateui_manager.runstate = PulseStateUIManager.RunState.ERROR
+            self.stateui_manager.runstate = RunState.ERROR
             self._message(str(exc))
+            return
+        sequencer = self.sequencer
+
+        def work():
+            program = sequencer.prepare(state)   # upload + LOAD (blocking) on the worker
+            sequencer.fire()                     # FIRE (rising edge)
+            return program
+
+        self._dispatch_sequencer(work, success_state=RunState.RUNNING, store_program=True)
 
     def safe_state(self) -> None:
-        try:
-            if self.sequencer is not None:
-                if hasattr(self.sequencer, "set_safe_state"):
-                    self.sequencer.set_safe_state()
-                elif hasattr(self.sequencer, "abort"):
-                    self.sequencer.abort()
-            self.stateui_manager.runstate = PulseStateUIManager.RunState.SAFE
-        except Exception as exc:
-            self.stateui_manager.runstate = PulseStateUIManager.RunState.ERROR
-            self._message(str(exc))
+        RunState = PulseStateUIManager.RunState
+        sequencer = self.sequencer
+        if sequencer is None:
+            self.stateui_manager.runstate = RunState.SAFE
+            return
+
+        def work():
+            if hasattr(sequencer, "set_safe_state"):
+                sequencer.set_safe_state()
+            elif hasattr(sequencer, "abort"):
+                sequencer.abort()
+            return None
+
+        self._dispatch_sequencer(work, success_state=RunState.SAFE)
 
     def save_to_file(self) -> None:
         try:

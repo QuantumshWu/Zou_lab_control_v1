@@ -38,6 +38,13 @@ DEFAULT_TICK_WIDTH = 32
 DEFAULT_SCAN_COEFF_WIDTH = 16
 DEFAULT_SCAN_COEFF_FRAC_BITS = 8
 DEFAULT_NUM_SLOTS = 4
+# Affine-MAC slot operand width -- MUST match zlc_edge_streamer.v SLOT_MUL_WIDTH
+# and engine_model.SLOT_MUL_WIDTH.  Each scan slot VALUE is multiplied by a 16-bit
+# coeff on a single DSP48E1 (25x18), so the slot operand is the low 25 bits taken
+# as signed; a scan value outside +/-2^24 ticks (~+/-335 ms @ 20 ns) would diverge
+# from the model, so the validator rejects it.  (The coeff still scales the slot,
+# so the resulting tick OFFSET keeps the full 32-bit range.)
+DEFAULT_SLOT_MUL_WIDTH = 25
 DEFAULT_BUS_COUNT = 4
 DEFAULT_BUS_WIDTH = 10
 
@@ -234,6 +241,7 @@ def validate_pulse_streamer_program(
     num_slots: int = DEFAULT_NUM_SLOTS,
     bus_count: int = DEFAULT_BUS_COUNT,
     bus_width: int = DEFAULT_BUS_WIDTH,
+    slot_mul_width: int = DEFAULT_SLOT_MUL_WIDTH,
     max_validated_scan_points: int | None = None,
 ) -> None:
     """Validate that a runtime edge table fits the fixed FPGA streamer.
@@ -332,8 +340,12 @@ def validate_pulse_streamer_program(
     if scan_points:
         if len(scan_points) > max_scan_points:
             raise ValueError(f"program has {len(scan_points)} scan points, but the FPGA streamer only accepts {max_scan_points}.")
-        signed_tick_min = -(1 << (tick_width - 1))
-        signed_tick_max = (1 << (tick_width - 1)) - 1
+        # Each slot VALUE goes through the affine MAC's single-DSP 16x25 product, so
+        # it must fit signed slot_mul_width bits (the RTL/model narrow it identically).
+        # This is a tighter bound than tick_width; +/-2^24 ticks (~335 ms) covers any
+        # real scan, and the resulting tick offset still spans the full tick_width.
+        signed_slot_min = -(1 << (slot_mul_width - 1))
+        signed_slot_max = (1 << (slot_mul_width - 1)) - 1
         # cheap shape/value check on EVERY point (O(points*slots)).
         slot_kinds = list(getattr(program, "slot_kinds", []) or [])
         for point_index, point in enumerate(scan_points):
@@ -341,8 +353,11 @@ def validate_pulse_streamer_program(
                 raise ValueError(f"scan point {point_index} must have {slot_count} slot value(s).")
             for slot_j, value in enumerate(point):
                 v = int(value)
-                if v < signed_tick_min or v > signed_tick_max:
-                    raise ValueError(f"scan point {point_index} value {v} does not fit signed {tick_width} bits.")
+                if v < signed_slot_min or v > signed_slot_max:
+                    raise ValueError(
+                        f"scan point {point_index} value {v} does not fit signed {slot_mul_width} bits "
+                        f"(the affine slot-multiply bound, +/-2^{slot_mul_width - 1} ticks)."
+                    )
                 # a DAC slot value is a raw DAC code read straight onto the bus, so it
                 # must fit bus_width (else it would silently truncate on hardware).
                 if slot_j < len(slot_kinds) and slot_kinds[slot_j] == "dac" and not (0 <= v <= bus_value_limit):

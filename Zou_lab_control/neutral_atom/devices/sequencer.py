@@ -844,7 +844,11 @@ class RemoteSequencer(SequencerDevice):
         if self.ssl:
             self._conn = rpyc.utils.classic.ssl_connect(host=self.host, port=self.port, ca_certs=self.ca_certs)
         else:
-            self._conn = rpyc.connect(self.host, self.port, config={"allow_pickle": True, "sync_request_timeout": None})
+            # Finite backstop timeout (generous: must exceed the longest server-side
+            # action, e.g. wait_done on a big finite scan) so a genuinely wedged server
+            # cannot block the caller -- the GUI worker thread -- forever.  prepare/fire
+            # return in seconds; this only bounds a truly stuck request.
+            self._conn = rpyc.connect(self.host, self.port, config={"allow_pickle": True, "sync_request_timeout": 3600.0})
         snap = self._conn.root.snapshot()
         self.channels = list(snap.get("channels", self.channels))
         self.clock_hz = float(snap.get("clock_hz", self.clock_hz))
