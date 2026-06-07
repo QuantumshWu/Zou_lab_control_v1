@@ -57,6 +57,13 @@ from fpga.pulse_streamer.host.image import (
 
 DEFAULT_RUNTIME_CLOCK_HZ = 50_000_000.0
 
+
+class _AxiAborted(Exception):
+    """Raised when an in-flight hw_axi read is interrupted by a stop request (the
+    streaming-refill thread being torn down on Off/prepare).  Distinct from
+    TimeoutError, which signals a real hardware fault."""
+
+
 # The default host geometry MUST match the built bitstream (create_project.tcl /
 # host.image.solve_capacity for the 35T): 4096 edges + bank_size 2048.
 DEFAULT_PARAMS = StreamerParams(max_edges=4096, bank_size=2048)
@@ -247,10 +254,10 @@ class VivadoAxiStreamerSession:
     def _queue_word(self, word_offset: int, value: int) -> None:
         self._pending.append((int(word_offset) * 4, int(value) & 0xFFFFFFFF))
 
-    def _read_word(self, word_offset: int) -> int:
-        self._flush()
+    def _read_word(self, word_offset: int, *, stop: "threading.Event | None" = None) -> int:
+        self._flush(stop=stop)
         marker = "ZLCDATA"
-        out = self._run_tcl(self._read_txn_tcl(int(word_offset) * 4, marker), action="axi_read", timeout=self.action_timeout)
+        out = self._run_tcl(self._read_txn_tcl(int(word_offset) * 4, marker), action="axi_read", timeout=self.action_timeout, stop=stop)
         return self._parse_read(out, marker)
 
     @staticmethod
@@ -265,7 +272,7 @@ class VivadoAxiStreamerSession:
         token = re.sub(r"[^0-9a-fA-F]", "", token) or "0"
         return int(token, 16) & 0xFFFFFFFF
 
-    def _flush(self) -> None:
+    def _flush(self, *, stop: "threading.Event | None" = None) -> None:
         if not self._pending:
             return
         pending = self._pending
@@ -275,7 +282,7 @@ class VivadoAxiStreamerSession:
             lines: list[str] = []
             for byte_addr, value in batch:
                 lines.extend(self._write_txn_tcl(byte_addr, value))
-            self._run_tcl(lines, action="axi_write", timeout=self.action_timeout)
+            self._run_tcl(lines, action="axi_write", timeout=self.action_timeout, stop=stop)
 
     # --------------------------------------------------------------- sequencer API
     def prepare(self, program) -> None:
@@ -336,6 +343,12 @@ class VivadoAxiStreamerSession:
         # over whatever the freed bank now holds).
         self._next_chunk = 2          # chunks 0,1 resident after prepare
         self._bank_ready = 0b11
+        # Re-arm BOTH ping-pong banks on the FPGA before firing.  prepare() already
+        # set this, but a standalone fire() (program=None, e.g. re-fire after a prior
+        # repeat_forever STREAMED run that left BANK_READY de-armed mid-refill) must
+        # not start the engine against a stale, half-armed bank mask.
+        self._queue_word(CtrlWords.BANK_READY, 0b11)
+        self._flush()
         self._command(CMD_FIRE)
         (self.state_dir / "fire_time.txt").write_text(str(time.monotonic()), encoding="utf-8")
         # a repeat_forever STREAMED scan (> 2 banks) must be fed continuously while it
@@ -343,7 +356,7 @@ class VivadoAxiStreamerSession:
         self._start_stream_thread()
 
     # --- streaming refill primitive -----------------------------------------
-    def _load_chunk(self, sweep_chunk: int, bank_ready: int) -> int:
+    def _load_chunk(self, sweep_chunk: int, bank_ready: int, *, stop: "threading.Event | None" = None) -> int:
         """Load sweep-chunk ``sweep_chunk`` into its ping-pong bank and return the
         new BANK_READY mask.  De-arm the bank, write its scan rows, record the
         chunk index (bank_chunk handshake), then re-arm -- so the engine STALLS on
@@ -359,7 +372,7 @@ class VivadoAxiStreamerSession:
         self._queue_word(CtrlWords.BANK0_CHUNK if bank == 0 else CtrlWords.BANK1_CHUNK, sweep_chunk)
         bank_ready |= (1 << bank)
         self._queue_word(CtrlWords.BANK_READY, bank_ready)        # re-arm
-        self._flush()
+        self._flush(stop=stop)
         return bank_ready
 
     def wait_done(self, program=None, timeout: float | None = None) -> bool:
@@ -420,27 +433,29 @@ class VivadoAxiStreamerSession:
         stop = self._stream_stop
         try:
             while not stop.is_set():
-                cursor = self._read_word(CtrlWords.CURSOR)
+                cursor = self._read_word(CtrlWords.CURSOR, stop=stop)
                 if cursor >= N:
                     # sweep finished: the engine is holding at the wrap until chunk 0
                     # (and chunk 1) are resident again.  Reload them, then it re-sweeps.
-                    bank_ready = self._load_chunk(0, bank_ready)
+                    bank_ready = self._load_chunk(0, bank_ready, stop=stop)
                     if total_chunks > 1:
-                        bank_ready = self._load_chunk(1, bank_ready)
+                        bank_ready = self._load_chunk(1, bank_ready, stop=stop)
                     next_chunk = 2
                     # wait for the engine to wrap (cursor returns below N), then refill.
                     # Bounded so a hardware fault (engine never wraps) cannot spin-poll
                     # the AXI link forever -- fall back to the outer loop, which re-checks.
                     for _ in range(2000):
-                        if stop.is_set() or self._read_word(CtrlWords.CURSOR) < N:
+                        if stop.is_set() or self._read_word(CtrlWords.CURSOR, stop=stop) < N:
                             break
                         time.sleep(self.stream_poll_interval)
                     continue
                 if next_chunk < total_chunks and cursor >= (next_chunk - 1) * bank_size:
-                    bank_ready = self._load_chunk(next_chunk, bank_ready)
+                    bank_ready = self._load_chunk(next_chunk, bank_ready, stop=stop)
                     next_chunk += 1
                     continue
                 time.sleep(self.stream_poll_interval)
+        except _AxiAborted:             # Off/prepare tore us down mid-read: clean exit
+            pass
         except Exception as exc:        # never let the daemon die silently
             self._write_action_log("stream_refill", f"streaming refill thread stopped: {exc!r}")
 
@@ -498,15 +513,17 @@ class VivadoAxiStreamerSession:
             time.sleep(0.01)
 
     # ------------------------------------------------------------------ Tcl plumbing
-    def _run_tcl(self, lines: Sequence[str], *, action: str, timeout: float | None) -> str:
+    def _run_tcl(self, lines: Sequence[str], *, action: str, timeout: float | None,
+                 stop: "threading.Event | None" = None) -> str:
         # One AXI transaction at a time: the main thread and the streaming-refill
         # thread share the single Vivado Tcl process / marker stream.
         with self._io_lock:
             if self._external_executor is not None:
                 return self._external_executor(list(lines), action, timeout)
-            return self._execute(lines, action=action, timeout=timeout)
+            return self._execute(lines, action=action, timeout=timeout, stop=stop)
 
-    def _execute(self, lines: Sequence[str], *, action: str, timeout: float | None) -> str:
+    def _execute(self, lines: Sequence[str], *, action: str, timeout: float | None,
+                 stop: "threading.Event | None" = None) -> str:
         if self._process is None:
             self.start()
         process = self._process
@@ -523,7 +540,7 @@ class VivadoAxiStreamerSession:
             message = f"persistent Vivado hw_axi session stopped before {action}. See {self._log_path}."
             self._write_action_log(action, message)
             raise RuntimeError(message) from exc
-        output = self._read_until_marker(marker, timeout=timeout)
+        output = self._read_until_marker(marker, timeout=timeout, stop=stop)
         self._write_action_log(action, output)
         if f"{marker}_ERROR" in output:
             tail = "\n".join(output.splitlines()[-25:])
@@ -547,19 +564,30 @@ class VivadoAxiStreamerSession:
             "flush stdout\n"
         )
 
-    def _read_until_marker(self, marker: str, *, timeout: float | None) -> str:
+    def _read_until_marker(self, marker: str, *, timeout: float | None,
+                           stop: "threading.Event | None" = None) -> str:
+        # Poll the queue in short slices so a ``stop`` request (from the streaming
+        # refill thread being torn down on Off/prepare) is honoured PROMPTLY instead
+        # of blocking for the full action_timeout.  Aborting mid-read is safe: each
+        # Tcl command carries a UNIQUE marker, so any stale response is harmlessly
+        # accumulated-and-skipped by the next read (which matches on its own marker).
         deadline = None if timeout is None else time.monotonic() + max(0.1, float(timeout))
         lines: list[str] = []
         while True:
-            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-            if remaining == 0.0:
-                self.close()
-                raise TimeoutError(f"persistent Vivado hw_axi action timed out waiting for {marker}.")
+            if stop is not None and stop.is_set():
+                raise _AxiAborted(f"hw_axi read aborted (stop requested) waiting for {marker}.")
+            if deadline is None:
+                slice_s = 0.2
+            else:
+                remaining = max(0.0, deadline - time.monotonic())
+                if remaining == 0.0:
+                    self.close()
+                    raise TimeoutError(f"persistent Vivado hw_axi action timed out waiting for {marker}.")
+                slice_s = min(remaining, 0.2)   # wake at least every 0.2 s to re-check stop/deadline
             try:
-                item = self._queue.get(timeout=remaining)
-            except queue.Empty as exc:
-                self.close()
-                raise TimeoutError(f"persistent Vivado hw_axi action timed out waiting for {marker}.") from exc
+                item = self._queue.get(timeout=slice_s)
+            except queue.Empty:
+                continue                        # re-check stop / deadline, then keep waiting
             if item is None:
                 raise RuntimeError("persistent Vivado hw_axi process exited unexpectedly.")
             lines.append(item)

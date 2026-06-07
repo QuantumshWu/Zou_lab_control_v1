@@ -2642,6 +2642,14 @@ class PulseSequenceEditor(QtWidgets.QWidget):
 
         self._dispatch_sequencer(work, success_state=RunState.SAFE)
 
+    def closeEvent(self, event) -> None:
+        # Don't let Qt destroy a still-running sequencer worker thread ("QThread:
+        # Destroyed while thread is still running" -> crash).  Wait (bounded) for it.
+        worker = getattr(self, "_seq_worker", None)
+        if worker is not None and worker.isRunning():
+            worker.wait(20000)
+        super().closeEvent(event)
+
     def save_to_file(self) -> None:
         try:
             state = self.read_state()
