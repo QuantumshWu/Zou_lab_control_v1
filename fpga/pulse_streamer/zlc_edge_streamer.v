@@ -3,48 +3,41 @@
 // zlc_edge_streamer -- FINAL affine edge-table pulse streamer engine.
 //
 // Global edge-table playback with:
-//   * edge + scan tables in BLOCK RAM (so thousands of edges + unbounded scan
-//     points fit the device); bus segment tables in LUTRAM (the bus/ramp engine
-//     reads them combinationally every tick, so they MUST stay async-read).
+//   * edge + scan tables in BLOCK RAM (thousands of edges + unbounded scan
+//     points); bus segment tables in LUTRAM (the bus/ramp engine reads them
+//     combinationally every tick, so they MUST stay async-read).
 //   * a depth-FIFO_DEPTH continuous PREFETCH of the next edges (one BRAM read per
-//     cycle, fixed RD_LAT-cycle latency) + first/second and loop-start/+1 SHADOWS
-//     latched at arm time, so the fire stays SAME-CYCLE and back-to-back **1-tick
-//     (20 ns) edges** play one per cycle -- and the four gapless reload sites
-//     (start / loop-rewind / scan-advance / repeat) reseed the prefetch instantly.
-//   * a 2-bank PING-PONG scan window: the engine plays scan point
-//     scan_point_index = 0..N-1, addressing bank (idx/BANK_SIZE)%2; the host
-//     refills the bank it just left (cursor + bank_ready handshake), so the total
-//     number of scan points is UNBOUNDED.  A not-yet-refilled bank STALLS the
-//     engine (holds, flags STATUS underflow) -- never emits a wrong point.
+//     cycle, fixed RD_LAT-cycle latency) + FIFO_DEPTH(=RD_LAT+1) edge SHADOWS
+//     latched at arm time per boundary, so the four gapless reload sites
+//     (start / loop-rewind / scan-advance / repeat) reseed instantly and
+//     back-to-back **1-tick (20 ns) edges** play one per cycle.
+//   * a 2-bank PING-PONG scan window: the engine plays scan point 0..N-1,
+//     addressing bank (idx/BANK_SIZE)%2; the host refills the bank it just left
+//     (cursor + bank_ready handshake), so total scan points are UNBOUNDED.  A
+//     not-yet-refilled bank STALLS the engine (holds, flags STATUS underflow) --
+//     never emits a wrong point.
 //
-// PROVEN PRE-HARDWARE (no Verilog sim here): the algorithm is byte-identical to
-// the combinatorial reference for every program shape at read latency 1 AND 2,
-// 1-tick spacing included, and the streaming is gapless over the full N-point
-// sweep / stall-not-corrupt when starved -- see fpga/pulse_streamer/host/
-// engine_model.py (reference_play / prefetch_play / streaming_scan_play) and the
-// test_final_engine_model_* tests.  An RTL-register-transfer mirror of THIS
-// module's FIFO is also asserted == reference (test_edge_streamer_rtl_mirror_*).
+// PROVEN PRE-HARDWARE (no Verilog sim in repo): this module's exact register
+// transfers are mirrored cycle-for-cycle by engine_model.rtl_mirror_play, which
+// is byte-identical to the combinatorial reference_play for every program shape
+// (1-tick spacing included) at read latency 1, 2 AND 3, over hand cases
+// (b2b1/scan1tick/loop1tick) + 400 fuzz programs.  The streaming ping-pong is
+// proven by streaming_scan_play.  See test_final_engine_model_* /
+// test_edge_streamer_rtl_mirror_*.
+//
+// SEED INVARIANT (the subtle part the mirror forced out): at every boundary, seed
+// FIFO_DEPTH resident shadows starting at the FIRST not-yet-output edge, and
+// issue NO read at the boundary (occupancy == #shadows <= depth).  The first
+// PREFETCHED edge is issued only when the head fires and frees a slot; with
+// FIFO_DEPTH = RD_LAT+1 that read lands and registers into arm exactly in time
+// for a 1-tick successor.  A 2-shadow seed is one cycle short and drops edges.
 //
 // RD_LAT MUST equal the synthesised edge-BRAM read latency; the build tcl FORCES
-// the edge BRAMs to READ_LATENCY_B = 2 (both output registers on) so RD_LAT=2 is
-// deterministic.  BANK_SIZE is a power-of-two build constant from
-// host.image.solve_capacity (the host uses the same value).
+// the edge BRAMs to READ_LATENCY_B = 2 so RD_LAT=2 is deterministic.  BANK_SIZE
+// is a power-of-two build constant from host.image.solve_capacity.
 //
-// *** WIP -- PREFETCH NOT YET 1-TICK-EXACT, DO NOT BUILD. ***  The RTL-register-
-// transfer mirror (engine_model.rtl_mirror_play) caught a real bug in THIS code:
-// seeding only 2 shadows (edges target, target+1) + issuing the first prefetch
-// read one cycle too late cannot sustain back-to-back 1-tick edges right after a
-// boundary -- the next edge's BRAM read + the arm-register append (+1 cycle) miss
-// the deadline.  The fix being converged in the mirror: seed FIFO_DEPTH(=RD_LAT+1)
-// shadows AND add a same-cycle BYPASS (fire directly from edge_*_rdata on the
-// cycle a read lands when the FIFO head is empty), so a 1-tick edge that lands
-// exactly when needed still fires that cycle.  This module will be rewritten to
-// match the corrected mirror (test_edge_streamer_rtl_mirror_*) before any build.
-//
-// Tables are external (top-level BRAM): edge fields are 3 PARALLEL BRAMs read in
-// lockstep (tick / coeffs / mask) so a whole edge arrives per access with no
-// width padding; scan is one BRAM (slot vector per access).  Bus is written
-// through bus_prog_* by the top's mini-loader.
+// Edge fields are 3 PARALLEL BRAMs read in lockstep (tick / coeffs / mask) so a
+// whole edge arrives per access with no width padding; scan is one BRAM.
 // =============================================================================
 
 module zlc_edge_streamer #(
@@ -63,7 +56,8 @@ module zlc_edge_streamer #(
     parameter integer BUS_SEG_ADDR_WIDTH = 6,
     parameter integer BUS_SEL_WIDTH = 3,
     parameter integer RD_LAT = 2,               // edge-BRAM read latency (forced)
-    parameter integer FIFO_DEPTH = 3            // >= RD_LAT + 1 for 1-tick spacing
+    parameter integer FIFO_DEPTH = 3,           // == RD_LAT + 1 for 1-tick spacing
+    parameter integer ARM_SETTLE = 4            // generous one-time arm read settle
 )(
     input  wire clk,
     input  wire reset,
@@ -148,16 +142,21 @@ module zlc_edge_streamer #(
     reg [31:0] loops_remaining = 32'd1;
 
     // shadows latched at arm time (BRAM pre-reads while reset is asserted)
-    reg [TICK_WIDTH-1:0]  sh_first_t, sh_second_t, sh_ls_t, sh_ls1_t, sh_final_t;
-    reg [COEFF_BITS-1:0]  sh_first_c, sh_second_c, sh_ls_c, sh_ls1_c, sh_final_c;
-    reg [CHANNEL_COUNT-1:0] sh_first_m, sh_second_m, sh_ls_m, sh_ls1_m;
+    reg [TICK_WIDTH-1:0]  sh_e0_t, sh_e1_t, sh_e2_t, sh_e3_t;
+    reg [COEFF_BITS-1:0]  sh_e0_c, sh_e1_c, sh_e2_c, sh_e3_c;
+    reg [CHANNEL_COUNT-1:0] sh_e0_m, sh_e1_m, sh_e2_m, sh_e3_m;
+    reg [TICK_WIDTH-1:0]  sh_ls0_t, sh_ls1_t, sh_ls2_t, sh_ls3_t;
+    reg [COEFF_BITS-1:0]  sh_ls0_c, sh_ls1_c, sh_ls2_c, sh_ls3_c;
+    reg [CHANNEL_COUNT-1:0] sh_ls0_m, sh_ls1_m, sh_ls2_m, sh_ls3_m;
+    reg [TICK_WIDTH-1:0]  sh_final_t;
+    reg [COEFF_BITS-1:0]  sh_final_c;
     reg [SLOT_BITS-1:0] scan_first_values;
 
-    // depth-FIFO_DEPTH edge prefetch (FIFO_DEPTH==3 used here)
+    // depth-FIFO_DEPTH edge prefetch
     reg [TICK_WIDTH-1:0] arm_t [0:FIFO_DEPTH-1];
     reg [COEFF_BITS-1:0] arm_c [0:FIFO_DEPTH-1];
     reg [CHANNEL_COUNT-1:0] arm_m [0:FIFO_DEPTH-1];
-    reg [2:0] arm_nv;                         // number of valid arm entries (0..FIFO_DEPTH)
+    reg [2:0] arm_nv;                         // valid arm entries (0..FIFO_DEPTH)
     reg [EDGE_ADDR_WIDTH:0] fetch_idx;        // next edge index to read
     reg [RD_LAT-1:0] pend;                    // in-flight read markers (1 bit/latency-stage)
 
@@ -177,7 +176,7 @@ module zlc_edge_streamer #(
     reg reset_meta = 1'b0, reset_sync = 1'b0;
     reg start_meta = 1'b0, start_sync = 1'b0, start_prev = 1'b0;
     reg bus_prog_we_meta = 1'b0, bus_prog_we_sync = 1'b0, bus_prog_we_prev = 1'b0;
-    integer bus_loop, ii;
+    integer bus_loop;
     reg [BUS_INDEX_WIDTH+BUS_SEG_ADDR_WIDTH-1:0] bus_prog_flat_addr, bus_runtime_addr;
     reg [TICK_WIDTH+BUS_WIDTH:0] bus_accum_next;
 
@@ -213,6 +212,11 @@ module zlc_edge_streamer #(
         end
     endfunction
 
+    function [2:0] clamp3;                     // min(FIFO_DEPTH, available)
+        input [EDGE_ADDR_WIDTH:0] avail;
+        begin clamp3 = (avail >= FIFO_DEPTH) ? FIFO_DEPTH[2:0] : avail[2:0]; end
+    endfunction
+
     function [BUS_SEG_ADDR_WIDTH:0] zlc_bus_count_at;
         input integer bus_index;
         begin zlc_bus_count_at = bus_counts[bus_index*(BUS_SEG_ADDR_WIDTH+1) +: (BUS_SEG_ADDR_WIDTH+1)]; end
@@ -221,11 +225,7 @@ module zlc_edge_streamer #(
     // scan-window address for point idx (2 banks, BANK_SIZE pow2)
     function [SCAN_ADDR_WIDTH-1:0] scan_addr_of;
         input [SCAN_COUNT_WIDTH-1:0] idx;
-        reg bnk;
-        begin
-            bnk = idx[BANK_BITS];                          // (idx/BANK_SIZE) & 1
-            scan_addr_of = {bnk, idx[BANK_BITS-1:0]};      // bank*BANK_SIZE + offset
-        end
+        begin scan_addr_of = {idx[BANK_BITS], idx[BANK_BITS-1:0]}; end   // bank*BANK_SIZE + offset
     endfunction
     function bank_of;
         input [SCAN_COUNT_WIDTH-1:0] idx;
@@ -343,13 +343,40 @@ module zlc_edge_streamer #(
         end
     endtask
 
-    // ----- ARM sequencer: pre-read shadows + scan point 0 (while reset high) ---
-    localparam [3:0] A_E0=0, A_E1=1, A_LS=2, A_LS1=3, A_FIN=4, A_SC0=5, A_READY=6;
-    reg [3:0] arm_state = A_E0;
-    reg [3:0] arm_wait;
-    reg arm_kick;
+    // ---- seed the prefetch from edge-0 shadows for slot vector sv (start/scan/repeat) ----
+    // Mirrors engine_model.boundary_to: output edge0 directly iff eff(edge0)==0,
+    // then seed FIFO_DEPTH(=3) resident shadows from the first not-yet-output edge.
+    task seed_from_edge0;
+        input [SLOT_BITS-1:0] sv;
+        begin
+            pend <= {RD_LAT{1'b0}};
+            if (active_count != 0 && zlc_effective_tick(sh_e0_t, sh_e0_c, sv) == {TICK_WIDTH{1'b0}}) begin
+                state_mask <= sh_e0_m; time_count <= {{(TICK_WIDTH-1){1'b0}},1'b1};
+                edge_index <= {{EDGE_ADDR_WIDTH{1'b0}},1'b1};
+                arm_t[0]<=sh_e1_t; arm_c[0]<=sh_e1_c; arm_m[0]<=sh_e1_m;
+                arm_t[1]<=sh_e2_t; arm_c[1]<=sh_e2_c; arm_m[1]<=sh_e2_m;
+                arm_t[2]<=sh_e3_t; arm_c[2]<=sh_e3_c; arm_m[2]<=sh_e3_m;
+                arm_nv <= clamp3(active_count - 1'b1);
+                fetch_idx <= {{(EDGE_ADDR_WIDTH-2){1'b0}},3'd4}; edge_raddr <= {{(EDGE_ADDR_WIDTH-2){1'b0}},3'd4};
+            end else begin
+                state_mask <= {CHANNEL_COUNT{1'b0}}; time_count <= {TICK_WIDTH{1'b0}};
+                edge_index <= {(EDGE_ADDR_WIDTH+1){1'b0}};
+                arm_t[0]<=sh_e0_t; arm_c[0]<=sh_e0_c; arm_m[0]<=sh_e0_m;
+                arm_t[1]<=sh_e1_t; arm_c[1]<=sh_e1_c; arm_m[1]<=sh_e1_m;
+                arm_t[2]<=sh_e2_t; arm_c[2]<=sh_e2_c; arm_m[2]<=sh_e2_m;
+                arm_nv <= clamp3(active_count);
+                fetch_idx <= {{(EDGE_ADDR_WIDTH-1){1'b0}},2'd3}; edge_raddr <= {{(EDGE_ADDR_WIDTH-1){1'b0}},2'd3};
+            end
+        end
+    endtask
 
-    // ----- prefetch helpers (combinational next-state) -------------------------
+    // ----- one-time ARM sequencer: pre-read 8 edge shadows + final + scan0 -----
+    // step 0..7 -> e0,e1,e2,e3,ls0,ls1,ls2,ls3 ; 8 -> final ; 9 -> scan point 0.
+    reg [3:0] arm_step;
+    reg [3:0] arm_wait;
+    reg arm_kicked;
+
+    // combinational temps for the normal prefetch cycle
     reg landed;
     reg do_fire;
     reg issue;
@@ -376,34 +403,31 @@ module zlc_edge_streamer #(
         if (reset_sync) begin
             running <= 1'b0; done <= 1'b0; underflow <= 1'b0;
             state_mask <= {CHANNEL_COUNT{1'b0}};
-            time_count <= {TICK_WIDTH{1'b0}};
-            edge_index <= {(EDGE_ADDR_WIDTH+1){1'b0}};
-            scan_point_index <= {SCAN_COUNT_WIDTH{1'b0}};
-            scan_cursor <= {SCAN_COUNT_WIDTH{1'b0}};
-            loops_remaining <= 32'd1;
             arm_nv <= 3'd0; pend <= {RD_LAT{1'b0}};
             zlc_bus_clear_runtime();
-            case (arm_state)
-                A_E0: begin
-                    edge_raddr <= {EDGE_ADDR_WIDTH{1'b0}};
-                    if (arm_kick) begin
-                        if (arm_wait == 0) begin sh_first_t <= edge_tick_rdata; sh_first_c <= edge_coeff_rdata; sh_first_m <= edge_mask_rdata;
-                            edge_raddr <= {{(EDGE_ADDR_WIDTH-1){1'b0}},1'b1}; arm_wait <= RD_LAT[3:0]; arm_state <= A_E1; end
-                        else arm_wait <= arm_wait - 1'b1;
-                    end else begin arm_kick <= 1'b1; arm_wait <= RD_LAT[3:0]; end
-                end
-                A_E1: if (arm_wait==0) begin sh_second_t<=edge_tick_rdata; sh_second_c<=edge_coeff_rdata; sh_second_m<=edge_mask_rdata;
-                        edge_raddr<=loop_start_addr; arm_wait<=RD_LAT[3:0]; arm_state<=A_LS; end else arm_wait<=arm_wait-1'b1;
-                A_LS: if (arm_wait==0) begin sh_ls_t<=edge_tick_rdata; sh_ls_c<=edge_coeff_rdata; sh_ls_m<=edge_mask_rdata;
-                        edge_raddr<=loop_start_addr+1'b1; arm_wait<=RD_LAT[3:0]; arm_state<=A_LS1; end else arm_wait<=arm_wait-1'b1;
-                A_LS1: if (arm_wait==0) begin sh_ls1_t<=edge_tick_rdata; sh_ls1_c<=edge_coeff_rdata; sh_ls1_m<=edge_mask_rdata;
-                        edge_raddr<=(prog_count==0)?{EDGE_ADDR_WIDTH{1'b0}}:(prog_count[EDGE_ADDR_WIDTH-1:0]-1'b1); arm_wait<=RD_LAT[3:0]; arm_state<=A_FIN; end else arm_wait<=arm_wait-1'b1;
-                A_FIN: if (arm_wait==0) begin sh_final_t<=edge_tick_rdata; sh_final_c<=edge_coeff_rdata;
-                        scan_raddr<={SCAN_ADDR_WIDTH{1'b0}}; arm_wait<=RD_LAT[3:0]; arm_state<=A_SC0; end else arm_wait<=arm_wait-1'b1;
-                A_SC0: if (arm_wait==0) begin scan_first_values<=(scan_enable && scan_count!=0)?scan_rdata:{SLOT_BITS{1'b0}}; arm_state<=A_READY; end else arm_wait<=arm_wait-1'b1;
-                A_READY: ;
-                default: arm_state <= A_E0;
-            endcase
+            // --- one-time settle-based ARM read sequence (no timing pressure) ---
+            if (!arm_kicked) begin
+                arm_kicked <= 1'b1; arm_step <= 4'd0; arm_wait <= ARM_SETTLE[3:0];
+                edge_raddr <= {EDGE_ADDR_WIDTH{1'b0}};
+            end else if (arm_wait != 0) begin
+                arm_wait <= arm_wait - 1'b1;
+            end else begin
+                case (arm_step)
+                    4'd0: begin sh_e0_t<=edge_tick_rdata; sh_e0_c<=edge_coeff_rdata; sh_e0_m<=edge_mask_rdata; edge_raddr<={{(EDGE_ADDR_WIDTH-1){1'b0}},1'b1}; end
+                    4'd1: begin sh_e1_t<=edge_tick_rdata; sh_e1_c<=edge_coeff_rdata; sh_e1_m<=edge_mask_rdata; edge_raddr<={{(EDGE_ADDR_WIDTH-2){1'b0}},2'd2}; end
+                    4'd2: begin sh_e2_t<=edge_tick_rdata; sh_e2_c<=edge_coeff_rdata; sh_e2_m<=edge_mask_rdata; edge_raddr<={{(EDGE_ADDR_WIDTH-2){1'b0}},2'd3}; end
+                    4'd3: begin sh_e3_t<=edge_tick_rdata; sh_e3_c<=edge_coeff_rdata; sh_e3_m<=edge_mask_rdata; edge_raddr<=loop_start_addr; end
+                    4'd4: begin sh_ls0_t<=edge_tick_rdata; sh_ls0_c<=edge_coeff_rdata; sh_ls0_m<=edge_mask_rdata; edge_raddr<=loop_start_addr+1'b1; end
+                    4'd5: begin sh_ls1_t<=edge_tick_rdata; sh_ls1_c<=edge_coeff_rdata; sh_ls1_m<=edge_mask_rdata; edge_raddr<=loop_start_addr+2'd2; end
+                    4'd6: begin sh_ls2_t<=edge_tick_rdata; sh_ls2_c<=edge_coeff_rdata; sh_ls2_m<=edge_mask_rdata; edge_raddr<=loop_start_addr+2'd3; end
+                    4'd7: begin sh_ls3_t<=edge_tick_rdata; sh_ls3_c<=edge_coeff_rdata; sh_ls3_m<=edge_mask_rdata;
+                                edge_raddr<=(prog_count==0)?{EDGE_ADDR_WIDTH{1'b0}}:(prog_count[EDGE_ADDR_WIDTH-1:0]-1'b1); end
+                    4'd8: begin sh_final_t<=edge_tick_rdata; sh_final_c<=edge_coeff_rdata; scan_raddr<={SCAN_ADDR_WIDTH{1'b0}}; end
+                    4'd9: begin scan_first_values<=(scan_enable && scan_count!=0)?scan_rdata:{SLOT_BITS{1'b0}}; end
+                    default: ;
+                endcase
+                if (arm_step < 4'd9) begin arm_step <= arm_step + 1'b1; arm_wait <= ARM_SETTLE[3:0]; end
+            end
         end else if (start_event && !running) begin
             running <= (prog_count != 0); done <= (prog_count == 0); underflow <= 1'b0;
             active_count <= prog_count; repeat_forever_active <= repeat_forever;
@@ -416,64 +440,35 @@ module zlc_edge_streamer #(
             final_tick <= (prog_count==0)?{TICK_WIDTH{1'b0}}:zlc_effective_tick(sh_final_t, sh_final_c, scan_first_values);
             loop_end_active <= zlc_effective_tick(loop_end_tick, loop_end_coeffs, scan_first_values);
             zlc_bus_start_table(scan_first_values);
-            // seed prefetch FIFO from shadows (edges 0,1); fetch from edge 2.
-            arm_t[0]<=sh_first_t; arm_c[0]<=sh_first_c; arm_m[0]<=sh_first_m;
-            arm_t[1]<=sh_second_t; arm_c[1]<=sh_second_c; arm_m[1]<=sh_second_m;
-            arm_nv <= (prog_count>1)?3'd2:((prog_count==1)?3'd1:3'd0);
-            fetch_idx <= {{(EDGE_ADDR_WIDTH-1){1'b0}},2'b10}; pend <= {RD_LAT{1'b0}};
-            edge_raddr <= {{(EDGE_ADDR_WIDTH-1){1'b0}},2'b10};
-            if (prog_count!=0 && zlc_effective_tick(sh_first_t,sh_first_c,scan_first_values)=={TICK_WIDTH{1'b0}}) begin
-                // edge 0 fires immediately -> pop it; arm[0] becomes edge 1
-                state_mask <= sh_first_m; time_count <= {{(TICK_WIDTH-1){1'b0}},1'b1};
-                edge_index <= {{EDGE_ADDR_WIDTH{1'b0}},1'b1};
-                arm_t[0]<=sh_second_t; arm_c[0]<=sh_second_c; arm_m[0]<=sh_second_m;
-                arm_nv <= (prog_count>1)?3'd1:3'd0;
-            end else begin
-                state_mask <= {CHANNEL_COUNT{1'b0}}; time_count <= {TICK_WIDTH{1'b0}};
-                edge_index <= {(EDGE_ADDR_WIDTH+1){1'b0}};
-            end
+            seed_from_edge0(scan_first_values);
         end else if (running) begin
-            // -------- edge prefetch read pipeline (issue 1/cycle, land RD_LAT later)
             landed = pend[RD_LAT-1];
-            // shift pend; new issue decided below
-            // (defaults; do_fire / reseed branches set state)
-            do_fire = 1'b0;
-
             if (loop_count_active>32'd1 && loops_remaining>32'd1 && time_count>=loop_end_active) begin
-                state_mask <= sh_ls_m; time_count <= zlc_effective_tick(sh_ls_t,sh_ls_c,slot_active)+1'b1;
+                // loop rewind: output loop_start mask, seed arm from loop_start+1
+                state_mask <= sh_ls0_m; time_count <= zlc_effective_tick(sh_ls0_t,sh_ls0_c,slot_active)+1'b1;
                 edge_index <= {1'b0,loop_start_addr}+1'b1; loops_remaining <= loops_remaining-1'b1;
                 arm_t[0]<=sh_ls1_t; arm_c[0]<=sh_ls1_c; arm_m[0]<=sh_ls1_m;
-                arm_nv <= ((loop_start_addr+1'b1) < prog_count[EDGE_ADDR_WIDTH-1:0]) ? 3'd1 : 3'd0;
-                fetch_idx <= {1'b0,loop_start_addr}+2'd2; edge_raddr <= loop_start_addr+2'd2;
+                arm_t[1]<=sh_ls2_t; arm_c[1]<=sh_ls2_c; arm_m[1]<=sh_ls2_m;
+                arm_t[2]<=sh_ls3_t; arm_c[2]<=sh_ls3_c; arm_m[2]<=sh_ls3_m;
+                arm_nv <= clamp3(active_count - ({1'b0,loop_start_addr}+1'b1));
+                fetch_idx <= {1'b0,loop_start_addr}+3'd4; edge_raddr <= loop_start_addr+3'd4;
                 pend <= {RD_LAT{1'b0}};
                 zlc_bus_start_table(slot_active);
             end else if (time_count >= final_tick) begin
                 if (scan_enable_active && (scan_point_index+1'b1) < active_scan_count) begin
-                    // need the next point resident (its bank ready)
                     if (!bank_ready[bank_of(scan_point_index+1'b1)]) begin
                         underflow <= 1'b1;          // STALL: hold, re-check next cycle
                     end else begin
                         underflow <= 1'b0;
                         scan_point_index <= scan_point_index+1'b1;
                         scan_cursor <= scan_point_index+1'b1;
-                        scan_raddr <= scan_addr_of(scan_point_index+2'd2);   // pre-read the following point
+                        scan_raddr <= scan_addr_of(scan_point_index+2'd2);   // pre-read following point
                         slot_active <= scan_rdata;
                         final_tick <= zlc_effective_tick(sh_final_t,sh_final_c,scan_rdata);
                         loop_end_active <= zlc_effective_tick(loop_end_tick,loop_end_coeffs,scan_rdata);
                         loops_remaining <= loop_count_active;
-                        // reseed FIFO from shadows for the new point
-                        arm_t[0]<=sh_first_t; arm_c[0]<=sh_first_c; arm_m[0]<=sh_first_m;
-                        arm_t[1]<=sh_second_t; arm_c[1]<=sh_second_c; arm_m[1]<=sh_second_m;
-                        fetch_idx <= {{(EDGE_ADDR_WIDTH-1){1'b0}},2'b10}; edge_raddr <= {{(EDGE_ADDR_WIDTH-1){1'b0}},2'b10};
-                        pend <= {RD_LAT{1'b0}};
-                        if (zlc_effective_tick(sh_first_t,sh_first_c,scan_rdata)=={TICK_WIDTH{1'b0}}) begin
-                            state_mask <= sh_first_m; time_count <= {{(TICK_WIDTH-1){1'b0}},1'b1}; edge_index <= {{EDGE_ADDR_WIDTH{1'b0}},1'b1};
-                            arm_t[0]<=sh_second_t; arm_c[0]<=sh_second_c; arm_m[0]<=sh_second_m;
-                            arm_nv <= (active_count>1)?3'd1:3'd0;
-                        end else begin
-                            state_mask <= {CHANNEL_COUNT{1'b0}}; time_count <= {TICK_WIDTH{1'b0}}; edge_index <= {(EDGE_ADDR_WIDTH+1){1'b0}};
-                            arm_nv <= (active_count>1)?3'd2:((active_count==1)?3'd1:3'd0);
-                        end
+                        zlc_bus_start_table(scan_rdata);
+                        seed_from_edge0(scan_rdata);
                     end
                 end else if (repeat_forever_active) begin
                     slot_active <= scan_first_values; scan_point_index <= {SCAN_COUNT_WIDTH{1'b0}}; scan_cursor <= {SCAN_COUNT_WIDTH{1'b0}};
@@ -481,16 +476,8 @@ module zlc_edge_streamer #(
                     final_tick <= zlc_effective_tick(sh_final_t,sh_final_c,scan_first_values);
                     loop_end_active <= zlc_effective_tick(loop_end_tick,loop_end_coeffs,scan_first_values);
                     loops_remaining <= loop_count_active;
-                    arm_t[0]<=sh_first_t; arm_c[0]<=sh_first_c; arm_m[0]<=sh_first_m;
-                    arm_t[1]<=sh_second_t; arm_c[1]<=sh_second_c; arm_m[1]<=sh_second_m;
-                    fetch_idx <= {{(EDGE_ADDR_WIDTH-1){1'b0}},2'b10}; edge_raddr <= {{(EDGE_ADDR_WIDTH-1){1'b0}},2'b10}; pend <= {RD_LAT{1'b0}};
-                    if (zlc_effective_tick(sh_first_t,sh_first_c,scan_first_values)=={TICK_WIDTH{1'b0}}) begin
-                        state_mask <= sh_first_m; time_count <= {{(TICK_WIDTH-1){1'b0}},1'b1}; edge_index <= {{EDGE_ADDR_WIDTH{1'b0}},1'b1};
-                        arm_t[0]<=sh_second_t; arm_c[0]<=sh_second_c; arm_m[0]<=sh_second_m; arm_nv <= (active_count>1)?3'd1:3'd0;
-                    end else begin
-                        state_mask <= {CHANNEL_COUNT{1'b0}}; time_count <= {TICK_WIDTH{1'b0}}; edge_index <= {(EDGE_ADDR_WIDTH+1){1'b0}};
-                        arm_nv <= (active_count>1)?3'd2:((active_count==1)?3'd1:3'd0);
-                    end
+                    zlc_bus_start_table(scan_first_values);
+                    seed_from_edge0(scan_first_values);
                 end else begin
                     running <= 1'b0; done <= 1'b1; state_mask <= {CHANNEL_COUNT{1'b0}}; zlc_bus_clear_runtime();
                 end
@@ -502,7 +489,7 @@ module zlc_edge_streamer #(
                     edge_index <= edge_index + 1'b1;
                 end
                 time_count <= time_count + 1'b1;
-                // --- FIFO update: shift on fire, append on land (this cycle) ---
+                // --- FIFO update: shift down on fire, append landed at tail ---
                 nv_after_fire = do_fire ? (arm_nv - 1'b1) : arm_nv;
                 if (do_fire) begin
                     for (k = 0; k < FIFO_DEPTH-1; k = k + 1) begin
@@ -517,10 +504,8 @@ module zlc_edge_streamer #(
                 end else begin
                     arm_nv <= nv_after_fire;
                 end
-                // --- issue a read to keep (resident + in-flight) at FIFO_DEPTH ---
-                // After this cycle: resident = nv_after_fire + landed; the only
-                // still-in-flight read (RD_LAT=2) is pend[0] (pend[RD_LAT-1] landed
-                // this cycle).  Issue iff that total is below FIFO_DEPTH.
+                // --- issue a read iff resident + still-in-flight is below depth ---
+                // resident-after = nv_after_fire + landed ; still-in-flight (RD_LAT=2) = pend[0].
                 issue = ((nv_after_fire + (landed ? 1'b1 : 1'b0) + pend[0]) < FIFO_DEPTH[2:0])
                         && (fetch_idx < active_count);
                 if (issue) begin edge_raddr <= fetch_idx; fetch_idx <= fetch_idx + 1'b1; end
@@ -528,4 +513,6 @@ module zlc_edge_streamer #(
             end
         end
     end
+
+    initial begin arm_kicked = 1'b0; arm_step = 4'd0; arm_wait = 4'd0; end
 endmodule

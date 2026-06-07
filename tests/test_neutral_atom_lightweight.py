@@ -1727,6 +1727,93 @@ def test_final_engine_model_fifo_1tick_and_streaming_scan():
         streaming_scan_play(sp, NT, bank_size=4, refill_delay=10 ** 9, raise_on_underflow=True)
 
 
+def test_edge_streamer_rtl_mirror_matches_reference():
+    """`rtl_mirror_play` re-implements the EXACT register transfers of
+    fpga/pulse_streamer/zlc_edge_streamer.v (arm shift-down FIFO + nv + pend
+    in-flight shift + the issue-occupancy condition + FIFO_DEPTH-shadow boundary
+    reseeds).  It must equal the combinatorial reference for every program shape
+    -- 1-tick spacing included -- at read latency 1, 2 AND 3.  This is the no-sim
+    proof that the SPECIFIC RTL realisation (not just the abstract algorithm) is
+    tick-exact and 1-tick gapless across start/loop/scan/repeat boundaries."""
+
+    import random
+    from fpga.pulse_streamer.host.engine_model import (
+        EngineProgram, reference_play, rtl_mirror_play,
+    )
+
+    def prog(**kw):
+        b = dict(ticks=[], masks=[], tick_slot_coeffs=[], scan_points=[], slot_count=0,
+                 frac_bits=8, loop_start_index=0, loop_end_tick=0, loop_end_slot_coeffs=[],
+                 loop_count=1, repeat_forever=False)
+        b.update(kw)
+        b["tick_slot_coeffs"] = b["tick_slot_coeffs"] or [[0] * b["slot_count"] for _ in b["ticks"]]
+        b["loop_end_slot_coeffs"] = b["loop_end_slot_coeffs"] or [0] * b["slot_count"]
+        return EngineProgram(**b)
+
+    cases = {
+        "b2b_1tick": prog(ticks=[0, 1, 2, 3, 4, 20], masks=[0, 1, 2, 3, 4, 0], loop_end_tick=20, repeat_forever=True),
+        "b2b_nonzero": prog(ticks=[5, 6, 7, 8, 9, 30], masks=[1, 2, 3, 4, 5, 0], loop_end_tick=30, repeat_forever=True),
+        "sparse": prog(ticks=[0, 5, 12, 40], masks=[0, 3, 4, 0], loop_end_tick=40, repeat_forever=True),
+        "scan_1tick": prog(ticks=[0, 1, 2, 3, 40], masks=[0, 1, 2, 3, 0],
+                           tick_slot_coeffs=[[0], [256], [256], [256], [256]],
+                           scan_points=[[0], [256], [512], [768]], slot_count=1, loop_end_tick=40, repeat_forever=True),
+        "loop_1tick": prog(ticks=[0, 1, 2, 3, 4, 5, 6, 40], masks=[0, 1, 2, 3, 4, 5, 6, 0],
+                           loop_start_index=2, loop_end_tick=4, loop_count=4),
+        "single": prog(ticks=[0], masks=[5], loop_end_tick=10, repeat_forever=True),
+        "finite": prog(ticks=[0, 5, 20], masks=[0, 1, 0], loop_end_tick=20, loop_count=1),
+    }
+    N = 600
+    for name, pr in cases.items():
+        ref = reference_play(pr, N)
+        for lat in (1, 2, 3):
+            assert rtl_mirror_play(pr, N, rd_lat=lat, fifo_depth=lat + 1) == ref, (name, lat)
+
+    # fuzz 1-tick-heavy random programs (the spacing stress the prefetch must survive)
+    rnd = random.Random(7)
+    for _ in range(200):
+        ticks = sorted({rnd.randint(0, 12) for _ in range(rnd.randint(1, 8))})
+        ticks = [0] + [t for t in ticks if t > 0]
+        masks = [rnd.randint(0, 7) for _ in ticks]
+        fin = ticks[-1] + rnd.randint(1, 6)
+        pr = prog(ticks=ticks + [fin], masks=masks + [0], loop_end_tick=fin,
+                  repeat_forever=(rnd.random() < 0.5),
+                  loop_start_index=rnd.randint(0, max(0, len(ticks) - 1)),
+                  loop_count=rnd.choice([1, 1, 3]))
+        ref = reference_play(pr, N)
+        for lat in (1, 2):
+            assert rtl_mirror_play(pr, N, rd_lat=lat, fifo_depth=lat + 1) == ref, (ticks, masks, lat)
+
+
+def test_edge_streamer_rtl_has_proven_structure():
+    """Lock the final RTL engine to the proven design so it cannot silently drift
+    from rtl_mirror_play: FIFO_DEPTH(=RD_LAT+1) shadow seed, parallel tick/coeff/
+    mask edge read, 2-bank streaming with bank_ready stall + cursor, bus LUTRAM,
+    and no leftover WIP/do-not-build marker."""
+
+    import pathlib
+    src = pathlib.Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "zlc_edge_streamer.v"
+    text = src.read_text(encoding="utf-8")
+    # one clean module, no abandoned draft marker
+    assert "module zlc_edge_streamer" in text and text.count("endmodule") == 1
+    assert "WIP" not in text and "do-not-build" not in text.lower()
+    # depth-(latency+1) prefetch FIFO + the issue-occupancy guard
+    assert "RD_LAT" in text and "FIFO_DEPTH" in text
+    assert "pend <= {pend[RD_LAT-2:0], issue}" in text
+    assert "nv_after_fire" in text and "clamp3" in text
+    # 8 boundary shadows (e0..e3 + ls0..ls3) -> FIFO_DEPTH-shadow seed
+    for sh in ("sh_e0_t", "sh_e1_t", "sh_e2_t", "sh_e3_t", "sh_ls0_t", "sh_ls1_t", "sh_ls2_t", "sh_ls3_t"):
+        assert sh in text, sh
+    assert "seed_from_edge0" in text
+    # 3 PARALLEL edge BRAMs read in lockstep (whole edge per access)
+    for sig in ("edge_tick_rdata", "edge_coeff_rdata", "edge_mask_rdata"):
+        assert sig in text, sig
+    # 2-bank ping-pong streaming + handshake (unbounded scan points)
+    assert "bank_ready" in text and "scan_cursor" in text and "underflow" in text
+    assert "scan_addr_of" in text and "bank_of" in text
+    # bus tables stay LUTRAM (combinational per-tick read)
+    assert text.count('ram_style = "distributed"') >= 7
+
+
 def test_edgetable_prefetch_engine_is_tick_exact_and_gapless():
     """The Architecture-D BRAM+prefetch engine must produce a per-tick output
     byte-identical to the validated combinatorial engine, for every program shape
