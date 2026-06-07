@@ -1636,6 +1636,97 @@ def test_edgetable_loader_top_and_build_wire_engine_and_ips():
     assert "get_hw_axis" in prog
 
 
+def test_final_image_solver_90pct_and_packs_round_trip():
+    """The FINAL BRAM image (fpga/pulse_streamer/host/image.py): solve_capacity at
+    <=90% maximises edges (35T -> 4096 edges + a 2-bank resident scan window) with
+    scan points UNBOUNDED via streaming; pack/unpack round-trips a full program
+    incl. a 0..1023 DAC ramp (one segment) + loop + scan resident."""
+
+    from fpga.pulse_streamer.host.image import solve_capacity, pack_program, unpack_program, scan_bank_words
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram, RuntimeBusSegment
+
+    s = solve_capacity("xc7a35t", channel_count=62, target_pct=90.0)
+    assert s.params.max_edges >= 4096
+    assert s.params.bank_size >= 512
+    assert s.all_within_budget() and s.resource_report["ramb36"]["pct"] <= 90.0
+    big = solve_capacity("xc7a200t", channel_count=62)
+    assert big.params.max_edges >= s.params.max_edges
+
+    p = s.params
+    prog = RuntimeSequenceProgram(
+        sequence_id="a", sequence_name="t", clock_hz=50e6,
+        channels=[f"ch{i:02d}" for i in range(62)],
+        ticks=[0, 5, 25, 400], masks=[0, (1 << 0) | (1 << 5), (1 << 61), 0],
+        duration=8e-6, trigger_count=0, repeat_forever=True, loop_start_index=1,
+        loop_end_tick=400, loop_count=3, slot_count=2, slot_kinds=["delay", "dac"],
+        loop_end_slot_coeffs=[256, 0], tick_slot_coeffs=[[0, 0], [256, 0], [256, 0], [256, 0]],
+        scan_points=[[k, k * 2] for k in range(5)], scan_coeff_frac_bits=8, bus_names=["da0"],
+        bus_segments=[RuntimeBusSegment(bus_index=0, start_tick=5, stop_tick=25, start_value=0,
+                                        stop_value=1023, mode="ramp", value_select=2,
+                                        start_tick_coeffs=[256, 0], stop_tick_coeffs=[256, 0])],
+    )
+    out = unpack_program(pack_program(prog, p), p)
+    pad = lambda r, n: list(r) + [0] * (n - len(r))
+    assert out["ticks"] == prog.ticks and out["masks"] == prog.masks
+    assert out["tick_slot_coeffs"] == [pad(r, p.num_slots) for r in prog.tick_slot_coeffs]
+    assert out["scan_points_resident"] == [list(pt) for pt in prog.scan_points]
+    assert out["scan_count"] == 5 and out["loop_count"] == 3 and out["repeat_forever"]
+    b = out["bus_segments"][0]
+    assert b["mode"] == "ramp" and b["stop_value"] == 1023 and b["value_select"] == 2
+    # a streamed chunk (beyond the resident window) packs into the right bank.
+    assert scan_bank_words(prog, p, 0)  # chunk 0 non-empty
+
+
+def test_final_engine_model_fifo_1tick_and_streaming_scan():
+    """The FINAL engine model (fpga/pulse_streamer/host/engine_model.py): the edge
+    FIFO prefetch is tick-exact at 1-tick spacing (latency 1 AND 2), and the scan
+    ping-pong streaming reproduces the full N-point sweep gaplessly for any bank
+    size while the host keeps up, and STALLS (never a wrong point) when starved."""
+
+    from fpga.pulse_streamer.host.engine_model import (
+        EngineProgram, reference_play, prefetch_play, streaming_scan_play, ScanUnderflow,
+    )
+
+    def prog(**kw):
+        b = dict(ticks=[], masks=[], tick_slot_coeffs=[], scan_points=[], slot_count=0,
+                 frac_bits=8, loop_start_index=0, loop_end_tick=0, loop_end_slot_coeffs=[],
+                 loop_count=1, repeat_forever=False)
+        b.update(kw)
+        b["tick_slot_coeffs"] = b["tick_slot_coeffs"] or [[0] * b["slot_count"] for _ in b["ticks"]]
+        b["loop_end_slot_coeffs"] = b["loop_end_slot_coeffs"] or [0] * b["slot_count"]
+        return EngineProgram(**b)
+
+    # --- FIFO prefetch (1-tick) == combinatorial reference, latency 1 and 2 ---
+    fifo_cases = {
+        "b2b_1tick": prog(ticks=[0, 1, 2, 3, 4, 20], masks=[0, 1, 2, 3, 4, 0], loop_end_tick=20, repeat_forever=True),
+        "scan": prog(ticks=[0, 10, 20, 100], masks=[0, 1, 2, 0], tick_slot_coeffs=[[0], [256], [256], [256]],
+                     scan_points=[[0], [256], [512]], slot_count=1, loop_end_tick=100, repeat_forever=True),
+        "loop3": prog(ticks=[0, 10, 30, 60], masks=[0, 1, 2, 0], loop_start_index=1, loop_end_tick=30, loop_count=3),
+    }
+    for name, pr in fifo_cases.items():
+        ref = reference_play(pr, 400)
+        for lat in (1, 2):
+            assert prefetch_play(pr, 400, read_latency=lat, fifo_depth=lat + 1) == ref, (name, lat)
+
+    # --- streaming: 20 points, constant duration, waveform differs per point ---
+    N = 20
+    sp = prog(ticks=[0, 5, 25, 40], masks=[0, 1, 2, 0], tick_slot_coeffs=[[0], [256], [0], [0]],
+              scan_points=[[k] for k in range(N)], slot_count=1, loop_end_tick=40, repeat_forever=False)
+    NT = N * 41 + 60
+    ref = reference_play(sp, NT)
+    for bank_size in (1, 4, 5, 8):
+        out, stalled, played = streaming_scan_play(sp, NT, bank_size=bank_size, refill_delay=0)
+        assert out == ref and not stalled and played == N, (bank_size, played)
+
+    # --- starved refill: stalls (no wrong point); the un-starved prefix matches ref ---
+    out2, stalled2, _ = streaming_scan_play(sp, NT, bank_size=4, refill_delay=10 ** 9)
+    assert stalled2
+    first_diff = next((i for i in range(NT) if out2[i] != ref[i]), NT)
+    assert first_diff >= 4 * 41  # gapless through the first two resident banks (8 points)
+    with pytest.raises(ScanUnderflow):
+        streaming_scan_play(sp, NT, bank_size=4, refill_delay=10 ** 9, raise_on_underflow=True)
+
+
 def test_edgetable_prefetch_engine_is_tick_exact_and_gapless():
     """The Architecture-D BRAM+prefetch engine must produce a per-tick output
     byte-identical to the validated combinatorial engine, for every program shape

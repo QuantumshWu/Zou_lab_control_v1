@@ -1,0 +1,386 @@
+"""Cycle-accurate behavioural models of the FINAL affine edge-table engine
+(``fpga/pulse_streamer/zlc_pulse_streamer.v``), used to prove tick-exactness +
+gaplessness BEFORE hardware (no Verilog simulator in this repo).
+
+Three models, all walking the SAME engine FSM:
+
+* :func:`reference_play` -- the *combinatorial* ground truth: every cycle it reads
+  the current edge in-line and fires same-cycle on ``time_count == effective_tick``
+  (this is the behaviour the design must reproduce; min edge spacing = 1 tick).
+
+* :func:`prefetch_play` -- the BRAM engine's EDGE path: edge tables in block RAM
+  (synchronous ``read_latency``-cycle read), hidden by a depth-(latency+1)
+  continuous prefetch FIFO + first/second-edge (and loop-start/+1) shadows, so the
+  four gapless reload sites reseed instantly and back-to-back **1-tick** edges
+  still fire one per cycle.  Proven == reference for latency 1 AND 2.
+
+* :func:`streaming_scan_play` -- the SCAN path: the scan-point table is a 2-bank
+  ping-pong window of ``bank_size`` points; the host refills the idle bank behind
+  the engine cursor so the total number of scan points is UNBOUNDED.  Proven ==
+  reference over the full N-point sweep when the host keeps up, and STALL (hold,
+  never a wrong point) on a late refill.
+
+The RTL combines the edge FIFO and the scan ping-pong; each is verified here
+independently and against the same ``reference_play`` ground truth.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+from dataclasses import dataclass
+from typing import Sequence
+
+__all__ = [
+    "EngineProgram", "effective_tick", "reference_play", "prefetch_play",
+    "streaming_scan_play", "min_edge_spacing", "PrefetchStall", "ScanUnderflow",
+]
+
+
+class PrefetchStall(RuntimeError):
+    """Edge FIFO underran (a well-sized FIFO + shadows must never hit this)."""
+
+
+class ScanUnderflow(RuntimeError):
+    """The host did not refill the next scan bank before the engine reached it."""
+
+
+def effective_tick(base_tick: int, coeffs: Sequence[int], slots: Sequence[int], frac_bits: int) -> int:
+    """base + (sum coeff_j*slot_j) >>> frac (arithmetic shift; matches the RTL MAC
+    and the host compiler).  Python ``>>`` on a negative int is an arithmetic
+    (floor) shift, identical to Verilog ``>>>`` on the signed accumulator."""
+    total = 0
+    for c, s in zip(coeffs, slots):
+        total += int(c) * int(s)
+    return int(base_tick) + (total >> int(frac_bits))
+
+
+@dataclass
+class EngineProgram:
+    ticks: list[int]
+    masks: list[int]
+    tick_slot_coeffs: list[list[int]]
+    scan_points: list[list[int]]
+    slot_count: int
+    frac_bits: int
+    loop_start_index: int
+    loop_end_tick: int
+    loop_end_slot_coeffs: list[int]
+    loop_count: int
+    repeat_forever: bool
+
+    @classmethod
+    def from_program(cls, program) -> "EngineProgram":
+        slot_count = int(getattr(program, "slot_count", 0) or 0)
+        ticks = [int(t) for t in program.ticks]
+        coeffs = list(getattr(program, "tick_slot_coeffs", None) or [[0] * slot_count for _ in ticks])
+        coeffs = [list(r) + [0] * (slot_count - len(r)) for r in coeffs]
+        return cls(
+            ticks=ticks,
+            masks=[int(m) for m in program.masks],
+            tick_slot_coeffs=coeffs,
+            scan_points=[list(p) for p in (getattr(program, "scan_points", None) or [])],
+            slot_count=slot_count,
+            frac_bits=int(getattr(program, "scan_coeff_frac_bits", 8)),
+            loop_start_index=int(getattr(program, "loop_start_index", 0)),
+            loop_end_tick=int(getattr(program, "loop_end_tick", 0)),
+            loop_end_slot_coeffs=list(getattr(program, "loop_end_slot_coeffs", None) or [0] * slot_count),
+            loop_count=max(1, int(getattr(program, "loop_count", 1) or 1)),
+            repeat_forever=bool(getattr(program, "repeat_forever", False)),
+        )
+
+
+def _zero(p: EngineProgram) -> list[int]:
+    return [0] * p.slot_count
+
+
+def _first_values(p: EngineProgram) -> list[int]:
+    return list(p.scan_points[0]) if p.scan_points else _zero(p)
+
+
+def min_edge_spacing(program) -> int:
+    """Smallest gap (ticks) between consecutive effective edge ticks over all scan
+    points (edge 0 exempt).  The FINAL FIFO engine handles 1-tick spacing, so this
+    is informational; a value < 1 would indicate a non-monotonic program bug."""
+    p = program if isinstance(program, EngineProgram) else EngineProgram.from_program(program)
+    if len(p.ticks) < 2:
+        return 1 << 30
+    points = p.scan_points or [_zero(p)]
+    worst = 1 << 30
+    for slots in points:
+        prev = effective_tick(p.ticks[0], p.tick_slot_coeffs[0], slots, p.frac_bits)
+        for i in range(1, len(p.ticks)):
+            e = effective_tick(p.ticks[i], p.tick_slot_coeffs[i], slots, p.frac_bits)
+            worst = min(worst, e - prev)
+            prev = e
+    return worst
+
+
+# ----------------------------------------------------------------------------
+# reference: combinatorial engine (the ground truth the RTL must reproduce)
+# ----------------------------------------------------------------------------
+def reference_play(program, n_ticks: int) -> list[int]:
+    p = program if isinstance(program, EngineProgram) else EngineProgram.from_program(program)
+    n = len(p.ticks)
+    scan_en = bool(p.scan_points)
+    scan_count = len(p.scan_points)
+
+    def eff(i, slots):
+        return effective_tick(p.ticks[i], p.tick_slot_coeffs[i], slots, p.frac_bits)
+
+    def eff_le(slots):
+        return effective_tick(p.loop_end_tick, p.loop_end_slot_coeffs, slots, p.frac_bits)
+
+    slot = _first_values(p)
+    final = 0 if n == 0 else eff(n - 1, slot)
+    loop_end = eff_le(slot)
+    loops = p.loop_count
+    spi = 0
+    running = n != 0
+    if running and eff(0, slot) == 0:
+        sm, tc, ei = p.masks[0], 1, 1
+    else:
+        sm, tc, ei = 0, 0, 0
+    out = []
+    for _ in range(n_ticks):
+        out.append(sm)
+        if not running:
+            continue
+        if p.loop_count > 1 and loops > 1 and tc >= loop_end:
+            sm = p.masks[p.loop_start_index]
+            tc = eff(p.loop_start_index, slot) + 1
+            ei = p.loop_start_index + 1
+            loops -= 1
+        elif tc >= final:
+            if scan_en and spi + 1 < scan_count:
+                slot = list(p.scan_points[spi + 1]); spi += 1
+                final = eff(n - 1, slot); loop_end = eff_le(slot); loops = p.loop_count
+                sm, tc, ei = (p.masks[0], 1, 1) if eff(0, slot) == 0 else (0, 0, 0)
+            elif p.repeat_forever:
+                slot = _first_values(p); spi = 0
+                final = eff(n - 1, slot); loop_end = eff_le(slot); loops = p.loop_count
+                sm, tc, ei = (p.masks[0], 1, 1) if eff(0, slot) == 0 else (0, 0, 0)
+            else:
+                running = False; sm = 0
+        else:
+            if ei < n and tc == eff(ei, slot):
+                sm = p.masks[ei]; ei += 1
+            tc += 1
+    return out
+
+
+# ----------------------------------------------------------------------------
+# edge FIFO prefetch (BRAM edge tables, 1-tick seamless)
+# ----------------------------------------------------------------------------
+def prefetch_play(program, n_ticks: int, *, read_latency: int = 2, fifo_depth: int = 3) -> list[int]:
+    p = program if isinstance(program, EngineProgram) else EngineProgram.from_program(program)
+    n = len(p.ticks)
+    scan_en = bool(p.scan_points)
+    scan_count = len(p.scan_points)
+    if fifo_depth < read_latency + 1:
+        fifo_depth = read_latency + 1
+
+    def eff(i, slots):
+        return effective_tick(p.ticks[i], p.tick_slot_coeffs[i], slots, p.frac_bits)
+
+    def eff_le(slots):
+        return effective_tick(p.loop_end_tick, p.loop_end_slot_coeffs, slots, p.frac_bits)
+
+    fifo: deque[int] = deque()
+    inflight: list[tuple[int, int]] = []
+    fetch_idx = 0
+    cycle = 0
+
+    def reseed(target):
+        nonlocal fetch_idx
+        fifo.clear(); inflight.clear()
+        if target < n:
+            fifo.append(target)
+        if target + 1 < n:
+            fifo.append(target + 1)
+        fetch_idx = target + 2
+        issue()
+
+    def issue():
+        nonlocal fetch_idx
+        resident = len(fifo) + len(inflight)
+        while resident < fifo_depth and fetch_idx < n:
+            inflight.append((fetch_idx, cycle + read_latency)); fetch_idx += 1; resident += 1
+
+    def land():
+        ready = sorted([it for it in inflight if it[1] <= cycle], key=lambda t: t[0])
+        for it in ready:
+            inflight.remove(it); fifo.append(it[0])
+
+    slot = _first_values(p)
+    final = 0 if n == 0 else eff(n - 1, slot)
+    loop_end = eff_le(slot)
+    loops = p.loop_count
+    spi = 0
+    running = n != 0
+    reseed(0)
+    if running and eff(0, slot) == 0:
+        sm, tc, ei = p.masks[0], 1, 1
+        if fifo and fifo[0] == 0:
+            fifo.popleft()
+        issue()
+    else:
+        sm, tc, ei = 0, 0, 0
+
+    out = []
+    for _ in range(n_ticks):
+        cycle += 1; land(); out.append(sm)
+        if not running:
+            continue
+        if p.loop_count > 1 and loops > 1 and tc >= loop_end:
+            sm = p.masks[p.loop_start_index]
+            tc = eff(p.loop_start_index, slot) + 1
+            ei = p.loop_start_index + 1
+            loops -= 1
+            reseed(p.loop_start_index)
+            if fifo and fifo[0] == p.loop_start_index:
+                fifo.popleft()
+            issue()
+        elif tc >= final:
+            if scan_en and spi + 1 < scan_count:
+                slot = list(p.scan_points[spi + 1]); spi += 1
+                final = eff(n - 1, slot); loop_end = eff_le(slot); loops = p.loop_count
+                reseed(0)
+                if eff(0, slot) == 0:
+                    sm, tc, ei = p.masks[0], 1, 1
+                    if fifo and fifo[0] == 0:
+                        fifo.popleft()
+                    issue()
+                else:
+                    sm, tc, ei = 0, 0, 0
+            elif p.repeat_forever:
+                slot = _first_values(p); spi = 0
+                final = eff(n - 1, slot); loop_end = eff_le(slot); loops = p.loop_count
+                reseed(0)
+                if eff(0, slot) == 0:
+                    sm, tc, ei = p.masks[0], 1, 1
+                    if fifo and fifo[0] == 0:
+                        fifo.popleft()
+                    issue()
+                else:
+                    sm, tc, ei = 0, 0, 0
+            else:
+                running = False; sm = 0
+        else:
+            if ei < n:
+                if not fifo or fifo[0] != ei:
+                    raise PrefetchStall(f"edge FIFO underrun: need edge {ei} at tick {tc}, head={fifo[0] if fifo else None}")
+                if tc == eff(ei, slot):
+                    sm = p.masks[ei]; fifo.popleft(); ei += 1; issue()
+            tc += 1
+    return out
+
+
+# ----------------------------------------------------------------------------
+# scan ping-pong streaming (unbounded scan points)
+# ----------------------------------------------------------------------------
+def streaming_scan_play(program, n_ticks: int, *, bank_size: int, refill_delay: int = 0,
+                        raise_on_underflow: bool = False):
+    """Play the engine with the scan-point table held in a 2-bank ping-pong window
+    of ``bank_size`` points each.  Banks hold CHUNKS of the full sweep: chunk c =
+    points[c*bank_size:(c+1)*bank_size] sits in bank c%2.  The host pre-loads
+    chunks 0 and 1; when the engine crosses from chunk c into c+1 it frees the bank
+    holding chunk c and the host refills it with chunk c+2 ``refill_delay`` ticks
+    later (modelling JTAG-AXI write latency).  Returns (out, stalled, points_played).
+
+    With ``refill_delay`` small enough the output equals :func:`reference_play` over
+    the full N-point sweep (gapless, unbounded points).  A late refill makes the
+    engine STALL (hold the current state, never emit a wrong point); set
+    ``raise_on_underflow`` to turn that stall into a :class:`ScanUnderflow`."""
+    p = program if isinstance(program, EngineProgram) else EngineProgram.from_program(program)
+    n = len(p.ticks)
+    points = p.scan_points
+    N = len(points)
+    if N == 0 or bank_size <= 0:
+        return reference_play(program, n_ticks), False, 0
+
+    def eff(i, slots):
+        return effective_tick(p.ticks[i], p.tick_slot_coeffs[i], slots, p.frac_bits)
+
+    def eff_le(slots):
+        return effective_tick(p.loop_end_tick, p.loop_end_slot_coeffs, slots, p.frac_bits)
+
+    n_chunks = (N + bank_size - 1) // bank_size
+    bank_chunk = [-1, -1]     # which chunk each bank currently holds (-1 = none)
+    bank_ready = [False, False]
+    pending: list[tuple[int, int, int]] = []   # (bank, chunk, ready_cycle)
+
+    def load(b, chunk):
+        bank_chunk[b] = chunk
+        bank_ready[b] = True
+
+    def preload():
+        bank_chunk[0] = bank_chunk[1] = -1
+        bank_ready[0] = bank_ready[1] = False
+        pending.clear()
+        load(0, 0)
+        if n_chunks > 1:
+            load(1, 1)
+
+    def point(idx):
+        chunk = idx // bank_size
+        b = chunk % 2
+        if bank_chunk[b] == chunk and bank_ready[b]:
+            return points[idx]
+        return None           # this chunk isn't resident yet -> underflow/stall
+
+    preload()
+    slot = list(points[0])
+    final = eff(n - 1, slot)
+    loop_end = eff_le(slot)
+    loops = p.loop_count
+    spi = 0
+    running = n != 0
+    stalled = False
+    cycle = 0
+    sm, tc, ei = (p.masks[0], 1, 1) if (running and eff(0, slot) == 0) else (0, 0, 0)
+
+    out = []
+    for _ in range(n_ticks):
+        cycle += 1
+        for item in [it for it in pending if it[2] <= cycle]:
+            pending.remove(item)
+            load(item[0], item[1])
+        out.append(sm)
+        if not running:
+            continue
+        if p.loop_count > 1 and loops > 1 and tc >= loop_end:
+            sm = p.masks[p.loop_start_index]; tc = eff(p.loop_start_index, slot) + 1
+            ei = p.loop_start_index + 1; loops -= 1
+        elif tc >= final:
+            nxt_idx = spi + 1
+            if nxt_idx < N:
+                nxt = point(nxt_idx)
+                if nxt is None:
+                    if raise_on_underflow:
+                        raise ScanUnderflow(f"scan chunk {nxt_idx // bank_size} not ready at tick {tc}")
+                    stalled = True            # hold; re-check next tick
+                else:
+                    old_chunk = spi // bank_size
+                    new_chunk = nxt_idx // bank_size
+                    if new_chunk != old_chunk:
+                        free_bank = old_chunk % 2
+                        bank_ready[free_bank] = False
+                        bank_chunk[free_bank] = -1
+                        refill_chunk = old_chunk + 2
+                        if refill_chunk < n_chunks:
+                            pending.append((free_bank, refill_chunk, cycle + max(0, refill_delay)))
+                    slot = list(nxt); spi = nxt_idx
+                    final = eff(n - 1, slot); loop_end = eff_le(slot); loops = p.loop_count
+                    sm, tc, ei = (p.masks[0], 1, 1) if eff(0, slot) == 0 else (0, 0, 0)
+            elif p.repeat_forever:
+                preload()
+                slot = list(points[0]); spi = 0
+                final = eff(n - 1, slot); loop_end = eff_le(slot); loops = p.loop_count
+                sm, tc, ei = (p.masks[0], 1, 1) if eff(0, slot) == 0 else (0, 0, 0)
+            else:
+                running = False; sm = 0
+        else:
+            if ei < n and tc == eff(ei, slot):
+                sm = p.masks[ei]; ei += 1
+            tc += 1
+    return out, stalled, spi + 1
