@@ -1814,6 +1814,49 @@ def test_edge_streamer_rtl_has_proven_structure():
     assert text.count('ram_style = "distributed"') >= 7
 
 
+def test_final_top_regions_match_image_and_has_structure():
+    """The final top zlc_pulse_streamer_top.v decodes the SAME word-address
+    regions the host packs (host.image.region_bases), instantiates the FINAL
+    engine with 3 parallel edge BRAMs + the streaming handshake, and exposes the
+    cursor/bank_ready ports.  Locks top <-> host so they cannot drift."""
+
+    import pathlib, re, dataclasses
+    from fpga.pulse_streamer.host import image as im
+
+    src = pathlib.Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_top.v"
+    text = src.read_text(encoding="utf-8")
+
+    # solved build geometry (the create-project tcl uses the same source)
+    p = dataclasses.replace(im.StreamerParams(), bank_size=2048, max_edges=4096)
+    rb = im.region_bases(p)
+    me = 4096
+    top = {
+        "tick": 64,
+        "coeff": 64 + me,
+        "mask": 64 + me + me * 2,
+        "scan": 64 + me + me * 2 + me * 2,
+        "bus": 64 + me + me * 2 + me * 2 + (2 * 2048) * 4,
+    }
+    for k in ("tick", "coeff", "mask", "scan", "bus"):
+        assert rb[k] == top[k], (k, rb[k], top[k])
+
+    # one clean module, instantiates the final engine (no variant), 3 edge BRAMs
+    assert "module zlc_pulse_streamer_top" in text and text.count("endmodule") == 1
+    assert "zlc_edge_streamer" in text
+    for ip in ("blk_mem_gen_edge_tick", "blk_mem_gen_edge_coeff", "blk_mem_gen_edge_mask",
+               "blk_mem_gen_scan", "blk_mem_gen_busimg"):
+        assert ip in text, ip
+    # streaming handshake + cursor read-back
+    assert "bank_ready" in text and "scan_cursor" in text and "C_CURSOR" in text and "C_BANK_READY" in text
+    # CTRL word map matches host.image.CtrlWords
+    cw = im.CtrlWords
+    for name, off in (("C_COMMAND", cw.COMMAND), ("C_STATUS", cw.STATUS), ("C_PROG_COUNT", cw.PROG_COUNT),
+                      ("C_BANK_SIZE", cw.BANK_SIZE), ("C_CURSOR", cw.CURSOR), ("C_BANK_READY", cw.BANK_READY)):
+        m = re.search(r"localparam integer %s = (\d+);" % name, text)
+        assert m and int(m.group(1)) == off, (name, off, m and m.group(1))
+    assert "jtag_axi_0" in text and "axi_bram_ctrl_0" in text
+
+
 def test_edgetable_prefetch_engine_is_tick_exact_and_gapless():
     """The Architecture-D BRAM+prefetch engine must produce a per-tick output
     byte-identical to the validated combinatorial engine, for every program shape
