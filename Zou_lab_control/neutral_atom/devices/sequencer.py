@@ -1392,7 +1392,14 @@ def _stable_affine_groups(
     for _tick0, items in sorted(by_ref.items(), key=lambda item: item[0]):
         expr = items[0][0]
         if any(item[0] != expr for item in items):
-            raise ValueError("hardware scan has events that coincide only for the first scan point; split the scan or simplify timing.")
+            raise ValueError(
+                "this scan moves one channel's edges PAST another channel's edges as the "
+                "scanned delay sweeps (the channels reorder), which the single global edge "
+                "table cannot play.  Keep the scanned delay small enough that the channel "
+                "stays in its own slot relative to the others, OR scan a DAC delay (analog "
+                "buses are independent timelines and may reorder freely).  Reordering "
+                "digital-delay scans need the per-channel delay-lane path (planned)."
+            )
         grouped.append((expr, [(channel, value) for _expr, channel, value in items]))
     # Per-channel monotonicity: each channel's OWN edges must stay strictly ordered
     # (and non-negative) at every scan point -- a channel reversing/colliding its own
