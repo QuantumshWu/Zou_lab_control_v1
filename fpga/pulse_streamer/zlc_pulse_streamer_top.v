@@ -236,6 +236,11 @@ module zlc_pulse_streamer_top #(
     localparam integer CNT_W = BUS_SEG_ADDR_WIDTH + 1;
 
     reg eng_reset = 1'b1, eng_start = 1'b0;
+    // FSM-owned "engine is in its RUNNING/DONE-tracking phase" flag.  The DONE/
+    // UNDERFLOW refresh is gated on THIS (not on ctrl_reg[C_STATUS], which a separate
+    // block writes back one cycle late): a command clears it atomically here, so a
+    // SAFE/RESET/LOAD cannot be bounced back to RUNNING by a stale-STATUS re-read.
+    reg status_running = 1'b0;
     reg bus_prog_we = 1'b0;
     reg [BUS_INDEX_WIDTH-1:0] bus_prog_bus = {BUS_INDEX_WIDTH{1'b0}};
     reg [BUS_SEG_ADDR_WIDTH-1:0] bus_prog_addr = {BUS_SEG_ADDR_WIDTH{1'b0}};
@@ -278,10 +283,10 @@ module zlc_pulse_streamer_top #(
         case (lstate)
         L_IDLE: begin
             cmd_seen <= cmd_now;
-            if (cmd_edge & CMD_RESET) begin eng_reset <= 1'b1; ldr_status_we <= 1'b1; ldr_status_val <= 32'b0; end
-            else if (cmd_edge & CMD_SAFE) begin eng_reset <= 1'b1; ldr_status_we <= 1'b1; ldr_status_val <= 32'b0; end
+            if (cmd_edge & CMD_RESET) begin eng_reset <= 1'b1; status_running <= 1'b0; ldr_status_we <= 1'b1; ldr_status_val <= 32'b0; end
+            else if (cmd_edge & CMD_SAFE) begin eng_reset <= 1'b1; status_running <= 1'b0; ldr_status_we <= 1'b1; ldr_status_val <= 32'b0; end
             else if (cmd_edge & CMD_LOAD) begin
-                eng_reset <= 1'b1; bcur <= 0; baddr <= 0; bcnt <= bus_count_of(0); wi <= 0; lstate <= L_NEXT;
+                eng_reset <= 1'b1; status_running <= 1'b0; bcur <= 0; baddr <= 0; bcnt <= bus_count_of(0); wi <= 0; lstate <= L_NEXT;
             end else if ((cmd_edge & CMD_FIRE) && (ctrl_reg[C_STATUS][0])) begin
                 lstate <= L_FIRE;
             end
@@ -331,6 +336,7 @@ module zlc_pulse_streamer_top #(
         L_FIRE: begin
             eng_reset <= 1'b0;
             eng_start <= 1'b1;
+            status_running <= 1'b1;
             ldr_status_we <= 1'b1; ldr_status_val <= {27'b0, ST_RUNNING};
             cmd_seen <= cmd_now;
             lstate <= L_IDLE;
@@ -345,9 +351,10 @@ module zlc_pulse_streamer_top #(
         // next CMD_LOAD's LOADED would never stick (observed as STATUS stuck at 0x2).
         // Gating on (idle && no command edge) lets SAFE/RESET/LOAD/FIRE win their
         // cycle, while still tracking done/underflow on the quiescent run cycles.
-        if ((lstate == L_IDLE) && (cmd_edge == 4'b0) && ctrl_reg[C_STATUS][1]) begin
+        if ((lstate == L_IDLE) && (cmd_edge == 4'b0) && status_running) begin
             ldr_status_we <= 1'b1;
             ldr_status_val <= {27'b0, ((zlc_done ? 5'b0 : ST_RUNNING) | (zlc_done ? ST_DONE : 5'b0) | (zlc_underflow ? ST_UNDERFLOW : 5'b0))};
+            if (zlc_done) status_running <= 1'b0;   // DONE latched; stop re-asserting STATUS
         end
     end
 

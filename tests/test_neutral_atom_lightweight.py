@@ -3579,3 +3579,85 @@ def test_standalone_calibration_and_detection_from_arrays():
     assert sitemap.centers.shape[0] == exp.devices.trap_array.n_sites
     assert threshold.thresholds.shape == (exp.devices.trap_array.n_sites,)
     assert shot.occupied.dtype == bool
+
+
+def test_top_status_fsm_clears_running_on_safe_then_reloads():
+    """Cycle-accurate model of the top's STATUS/command FSM, modeling the TWO always
+    blocks (the FSM sets ldr_status_val; a SEPARATE writeback block applies it to
+    ctrl_reg[C_STATUS] ONE cycle later).  That delay is what made the off->on
+    "STATUS=0x00000002" bug: a CMD_SAFE that should clear RUNNING was bounced back by
+    the DONE/UNDERFLOW refresh re-reading the stale ctrl_reg[C_STATUS] the next cycle,
+    so the next CMD_LOAD's LOADED never stuck.  The fix gates the refresh on an
+    FSM-owned ``status_running`` flag (cleared atomically by the command).  This test
+    reproduces the bounce with the OLD gate and proves the NEW gate clears + reloads,
+    and asserts the RTL actually uses the fixed gate.  (The top FSM has no Verilog sim,
+    so this models it directly.)"""
+    from pathlib import Path
+
+    LOADED, RUNNING, DONE, UNDER = 1, 2, 4, 16
+    LOAD, FIRE, RESET, SAFE = 1, 2, 4, 8
+
+    class Fsm:
+        def __init__(self, mode):
+            self.mode = mode
+            self.status = 0; self.command = 0; self.ldr_we = 0; self.ldr_val = 0
+            self.status_running = 0; self.eng_reset = 1; self.cmd_seen = 0
+            self.lstate = "IDLE"; self.ctr = 0; self.done = 0; self.under = 0
+
+        def tick(self, cmd_write=None):
+            c = dict(self.__dict__)
+            n_status = c["ldr_val"] if c["ldr_we"] else c["status"]   # Block A (delayed writeback)
+            n_command = cmd_write if cmd_write is not None else c["command"]
+            n_we = 0; n_val = c["ldr_val"]; n_run = c["status_running"]
+            n_res = c["eng_reset"]; n_seen = c["cmd_seen"]; n_lstate = c["lstate"]; n_ctr = c["ctr"]
+            cmd_now = c["command"] & 0xF; edge = cmd_now & (~c["cmd_seen"]) & 0xF
+            if c["lstate"] == "IDLE":
+                n_seen = cmd_now
+                if edge & RESET or edge & SAFE:
+                    n_res = 1; n_run = 0; n_we = 1; n_val = 0
+                elif edge & LOAD:
+                    n_res = 1; n_run = 0; n_lstate = "LOAD"; n_ctr = 3
+                elif (edge & FIRE) and (c["status"] & LOADED):
+                    n_lstate = "FIRE"
+            elif c["lstate"] == "LOAD":
+                if c["ctr"] > 0: n_ctr = c["ctr"] - 1
+                else: n_we = 1; n_val = LOADED; n_lstate = "IDLE"
+            elif c["lstate"] == "FIRE":
+                n_res = 0; n_run = 1; n_we = 1; n_val = RUNNING; n_seen = cmd_now; n_lstate = "IDLE"
+            cond = (c["status"] & RUNNING) if self.mode == "old" else c["status_running"]
+            if c["lstate"] == "IDLE" and edge == 0 and cond:
+                n_we = 1
+                n_val = ((0 if c["done"] else RUNNING) | (DONE if c["done"] else 0) | (UNDER if c["under"] else 0))
+                if self.mode == "new" and c["done"]: n_run = 0
+            self.status, self.command = n_status, n_command
+            self.ldr_we, self.ldr_val = n_we, n_val
+            self.status_running, self.eng_reset = n_run, n_res
+            self.cmd_seen, self.lstate, self.ctr = n_seen, n_lstate, n_ctr
+
+        def cmd(self, c):
+            self.tick(0); self.tick(c)
+            for _ in range(10): self.tick()
+
+    def scenario(mode):
+        f = Fsm(mode)
+        f.cmd(SAFE); f.cmd(LOAD); on1_loaded = bool(f.status & LOADED)
+        f.cmd(FIRE); on1_running = bool(f.status & RUNNING)
+        for _ in range(10):
+            f.tick()                       # repeat-forever: engine never asserts done
+        f.cmd(SAFE); off_status = f.status
+        f.cmd(SAFE); f.cmd(LOAD); on2_loaded = bool(f.status & LOADED)
+        return on1_loaded, on1_running, off_status, on2_loaded
+
+    # OLD gate reproduces the reported bug: STATUS stuck RUNNING -> 2nd LOAD never loads.
+    old = scenario("old")
+    assert old[2] == RUNNING and old[3] is False
+    # NEW gate: SAFE clears STATUS, the next LOAD asserts LOADED, off->on works.
+    new = scenario("new")
+    assert new[0] is True and new[1] is True
+    assert new[2] == 0, "CMD_SAFE must clear STATUS even from RUNNING"
+    assert new[3] is True, "off->on must reload (LOADED) after a prior run"
+
+    # The RTL must actually use the fixed (status_running) gate, not the buggy one.
+    top = (Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
+    assert "status_running" in top
+    assert "ctrl_reg[C_STATUS][1]) begin" not in top
