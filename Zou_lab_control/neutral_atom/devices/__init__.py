@@ -38,12 +38,7 @@ _PULSE_STREAMER_EXPORTS = {
     "DEFAULT_MAX_SCAN_POINTS",
     "DEFAULT_SCAN_COEFF_FRAC_BITS",
     "DEFAULT_SCAN_COEFF_WIDTH",
-    "PulseStreamerHDLFiles",
-    "PulseStreamerProbeNames",
-    "VivadoPulseStreamerSession",
     "capacity_estimate_text",
-    "generate_pulse_streamer_core",
-    "generate_pulse_streamer_top_example",
     "hardware_channel_names",
     "infer_xdc_channel_count",
     "infer_xdc_channel_labels",
@@ -51,8 +46,6 @@ _PULSE_STREAMER_EXPORTS = {
     "infer_xdc_channels",
     "infer_xdc_trigger_channels",
     "validate_pulse_streamer_program",
-    "write_pulse_streamer_hdl_bundle",
-    "write_vivado_pulse_streamer_tcl",
 }
 
 
@@ -90,9 +83,6 @@ __all__ = [
     "DeviceSet",
     "ManualSequencer",
     "PulseController",
-    "PulseStreamerHDLFiles",
-    "PulseStreamerProbeNames",
-    "VivadoPulseStreamerSession",
     "QCMOSCamera",
     "QCMOSConfig",
     "RemoteSequencer",
@@ -111,8 +101,6 @@ __all__ = [
     "build_sequencer_server_arg_parser",
     "device_class_registry",
     "device_config_dir",
-    "generate_pulse_streamer_core",
-    "generate_pulse_streamer_top_example",
     "hardware_channel_names",
     "infer_xdc_channel_count",
     "infer_xdc_channel_labels",
@@ -133,6 +121,4 @@ __all__ = [
     "compile_runtime_program_for_payload",
     "finite_frame_sequence",
     "serve_runtime_sequencer",
-    "write_pulse_streamer_hdl_bundle",
-    "write_vivado_pulse_streamer_tcl",
 ]

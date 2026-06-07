@@ -356,18 +356,6 @@ def test_fpga_pulse_streamer_rejects_runtime_edge_table_hazards():
             raise AssertionError(f"pulse-streamer validation should reject {expected}")
 
 
-def test_fpga_pulse_streamer_fire_dry_run_does_not_require_program_file(tmp_path):
-    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import run_action
-
-    tcl_path = run_action("fire", state_dir=tmp_path, dry_run=True)
-
-    tcl = tcl_path.read_text(encoding="utf-8")
-    assert "if {[zlc_output_probe_bool $vio $zlc_start_probe]} {" in tcl
-    assert "zlc_stage_probe $vio $zlc_start_probe 1" in tcl
-    assert "zlc_set_probe $vio $zlc_start_probe 0" in tcl
-    assert "ZLC pulse-streamer start pulse sent" in tcl
-
-
 def test_pulse_gui_launcher_aligns_subset_state_to_full_hardware_channels(monkeypatch):
     monkeypatch.delenv("ZLC_PS_REMOTE_HOST", raising=False)
     root = Path(__file__).resolve().parents[1]
