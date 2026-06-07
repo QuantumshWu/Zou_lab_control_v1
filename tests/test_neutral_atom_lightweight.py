@@ -3262,10 +3262,14 @@ def test_hardware_tutorial_is_real_hardware_not_virtual_demo():
     assert "exp.devices.sequencer.open()" not in hardware_text
     assert "results_real_hardware" not in hardware_text
     assert "neutral_atom.devices.sequencer_server" in fpga_text
-    assert "fpga_pulse_streamer" in fpga_text
+    assert "axi_session" in fpga_text                    # final JTAG-to-AXI backend
     assert "legacy_address_switch" not in fpga_text
     assert "na.run_sequencer_server" in fpga_text
-    assert "fpga\\build\\address_switch\\address_switch.xpr" in fpga_text
+    # final design: jtag-axi backend + the pulse_streamer build dir (no VIO project)
+    assert "jtag-axi" in fpga_text
+    assert "fpga\\build\\pulse_streamer" in fpga_text
+    assert "address_switch.xpr" not in fpga_text
+    assert "vivado-session" not in fpga_text
     assert "qCMOS.py" not in hardware_text + fpga_text
     assert "pxie_control" not in hardware_text + fpga_text
 
