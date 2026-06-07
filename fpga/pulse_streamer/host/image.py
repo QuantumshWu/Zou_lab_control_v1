@@ -302,6 +302,10 @@ def pack_program(program, params: StreamerParams | None = None) -> dict[int, int
             flags |= (int(getattr(seg, "stop_value", 0)) & ((1 << p.bus_width) - 1)) << p.bus_width
             flags |= (_bus_mode_value(getattr(seg, "mode", "edge")) & 0x3) << (2 * p.bus_width)
             flags |= (int(getattr(seg, "value_select", 0)) & ((1 << p.bus_sel_width) - 1)) << (2 * p.bus_width + 2)
+            # stop-endpoint select (bits above start select) lets a ramp scan BOTH
+            # value endpoints; edge/hold segments default it to value_select.
+            _stop_sel = int(getattr(seg, "stop_value_select", getattr(seg, "value_select", 0)))
+            flags |= (_stop_sel & ((1 << p.bus_sel_width) - 1)) << (2 * p.bus_width + 2 + p.bus_sel_width)
             w[row + 2 + 2 * p.coeff_words] = flags
     w[CtrlWords.BUS_COUNTS] = bus_counts
     return w
@@ -348,6 +352,7 @@ def unpack_program(words: Mapping[int, int], params: StreamerParams | None = Non
                 "stop_value": (flags >> p.bus_width) & ((1 << p.bus_width) - 1),
                 "mode": _bus_mode_name((flags >> (2 * p.bus_width)) & 0x3),
                 "value_select": (flags >> (2 * p.bus_width + 2)) & ((1 << p.bus_sel_width) - 1),
+                "stop_value_select": (flags >> (2 * p.bus_width + 2 + p.bus_sel_width)) & ((1 << p.bus_sel_width) - 1),
             })
     return {
         "ticks": ticks, "masks": masks, "tick_slot_coeffs": coeffs,

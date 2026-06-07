@@ -46,14 +46,19 @@ class RuntimeBusSegment:
     mode: str = "edge"
     bus_name: str = ""
     value_select: int = 0
-    """0 = use ``start_value``/``stop_value``; ``j+1`` = read the DAC code from
-    scan slot ``j`` at runtime so the level tracks a scan point seamlessly."""
+    """START-endpoint scan-slot select.  0 = use ``start_value``; ``j+1`` = read the
+    DAC code from scan slot ``j`` at runtime.  For edge/hold segments (start==stop)
+    this is THE held-value select."""
     start_tick_coeffs: list[int] | None = None
     stop_tick_coeffs: list[int] | None = None
     """Per-slot affine coefficients for the segment's start/stop tick.  The FPGA
     computes ``effective_tick = start_tick + (sum coeff_j*slot_j) >> frac`` so a
     scanned duration/delay moves the segment in lockstep with the digital edges
     -- this is what lets DAC value + duration + delay scan simultaneously."""
+    stop_value_select: int = 0
+    """STOP-endpoint scan-slot select (``j+1`` = stop value reads slot ``j``).  For
+    edge/hold segments it equals ``value_select`` (start==stop).  Independent from
+    ``value_select`` so a RAMP can scan BOTH endpoints: ramp scanned-A -> scanned-B."""
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -65,6 +70,7 @@ class RuntimeBusSegment:
             "stop_value": int(self.stop_value),
             "mode": str(self.mode),
             "value_select": int(self.value_select),
+            "stop_value_select": int(self.stop_value_select),
             "start_tick_coeffs": list(self.start_tick_coeffs or []),
             "stop_tick_coeffs": list(self.stop_tick_coeffs or []),
         }
@@ -80,6 +86,9 @@ class RuntimeBusSegment:
             stop_value=int(payload.get("stop_value", payload.get("start_value", 0))),
             mode=str(payload.get("mode", "edge")).strip().lower(),
             value_select=int(payload.get("value_select", 0)),
+            # stop select defaults to the start select so an edge/hold held-value scan
+            # (start==stop) stays correct when only value_select is given.
+            stop_value_select=int(payload.get("stop_value_select", payload.get("value_select", 0))),
             start_tick_coeffs=[int(v) for v in payload.get("start_tick_coeffs", [])] or None,
             stop_tick_coeffs=[int(v) for v in payload.get("stop_tick_coeffs", [])] or None,
         )
@@ -1707,7 +1716,7 @@ def _pulse_table_bus_segments(
             if previous is None:
                 next_anchor = anchors[anchor_index + 1] if anchor_index + 1 < len(anchors) else None
                 if next_anchor is None or str(next_anchor[4]).lower() != "ramp":
-                    segments.append(RuntimeBusSegment(bus_index, base, base, value, value, "edge", bus_name, value_select, _coeffs(coeffs), _coeffs(coeffs)))
+                    segments.append(RuntimeBusSegment(bus_index, base, base, value, value, "edge", bus_name, value_select, _coeffs(coeffs), _coeffs(coeffs), stop_value_select=value_select))
             elif mode == "ramp":
                 start_ref = int(previous[1])
                 start_base = int(previous[2])
@@ -1715,16 +1724,19 @@ def _pulse_table_bus_segments(
                 start_value = int(previous[5])
                 if ref_tick < start_ref:
                     raise ValueError(f"analog bus {bus_name!r} ramp end precedes its start.")
-                if previous[6] or value_select:
-                    raise ValueError(
-                        f"analog bus {bus_name!r} cannot ramp into or out of a scanned DAC level; "
-                        "hold the scanned value with an edge segment instead."
-                    )
-                segments.append(RuntimeBusSegment(bus_index, start_base, base, start_value, value, "ramp", bus_name, 0, _coeffs(start_coeffs), _coeffs(coeffs)))
+                # A ramp may scan EITHER endpoint independently: the start value reads
+                # the previous anchor's slot (previous[6]); the stop value reads this
+                # anchor's slot (value_select).  The RTL bus engine's dual value_select
+                # makes a ramp scanned-A -> scanned-B seamless.
+                segments.append(RuntimeBusSegment(
+                    bus_index, start_base, base, start_value, value, "ramp", bus_name,
+                    previous[6], _coeffs(start_coeffs), _coeffs(coeffs),
+                    stop_value_select=value_select,
+                ))
             else:
                 next_anchor = anchors[anchor_index + 1] if anchor_index + 1 < len(anchors) else None
                 if next_anchor is None or str(next_anchor[4]).lower() != "ramp":
-                    segments.append(RuntimeBusSegment(bus_index, base, base, value, value, "edge", bus_name, value_select, _coeffs(coeffs), _coeffs(coeffs)))
+                    segments.append(RuntimeBusSegment(bus_index, base, base, value, value, "edge", bus_name, value_select, _coeffs(coeffs), _coeffs(coeffs), stop_value_select=value_select))
             previous = anchor
     return bus_names, segments
 

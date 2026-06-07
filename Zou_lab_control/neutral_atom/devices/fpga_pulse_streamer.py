@@ -338,13 +338,15 @@ def validate_pulse_streamer_program(
             raise ValueError(f"bus segment {index} has unsupported mode {mode!r}.")
         # value_select==0 uses the literal value above; j+1 makes the segment read
         # its DAC code from scan slot j at runtime (the seamless DAC-value scan).
-        if value_select < 0 or value_select > program_slot_count:
-            raise ValueError(
-                f"bus segment {index} value_select {value_select} must be 0 (literal) "
-                f"or 1..{program_slot_count} (scan slot index + 1)."
-            )
-        if value_select > 0 and not scan_points:
-            raise ValueError(f"bus segment {index} value_select requires a scan-point table.")
+        stop_value_select = int(getattr(segment, "stop_value_select", segment.get("stop_value_select", value_select) if isinstance(segment, Mapping) else value_select))
+        for sel_name, sel in (("value_select", value_select), ("stop_value_select", stop_value_select)):
+            if sel < 0 or sel > program_slot_count:
+                raise ValueError(
+                    f"bus segment {index} {sel_name} {sel} must be 0 (literal) "
+                    f"or 1..{program_slot_count} (scan slot index + 1)."
+                )
+            if sel > 0 and not scan_points:
+                raise ValueError(f"bus segment {index} {sel_name} requires a scan-point table.")
         bus_segment_counts[bus_index] += 1
         if bus_segment_counts[bus_index] > max_bus_segments:
             raise ValueError(f"bus {bus_index} has {bus_segment_counts[bus_index]} segments, above max_bus_segments={max_bus_segments}.")

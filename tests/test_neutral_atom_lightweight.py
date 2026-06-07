@@ -1437,6 +1437,7 @@ def test_pulse_table_analog_bus_modes_compile_to_runtime_bus_segments(tmp_path):
             "stop_value": 7,
             "mode": "ramp",
             "value_select": 0,
+            "stop_value_select": 0,
             "start_tick_coeffs": [],
             "stop_tick_coeffs": [],
         }
@@ -1446,6 +1447,53 @@ def test_pulse_table_analog_bus_modes_compile_to_runtime_bus_segments(tmp_path):
         segment.to_dict() for segment in (program.bus_segments or [])
     ]
     na.validate_pulse_streamer_program(program, max_edges=16, max_bus_segments=4, tick_width=32, channel_count=4)
+
+
+def test_analog_ramp_can_scan_both_value_endpoints_round_trip():
+    """R16: a ramp may scan BOTH value endpoints independently -- the start reads one
+    scan slot, the stop another -- via the dual value_select.  The host image
+    round-trips both selects and the validator accepts them (no longer rejected)."""
+
+    from fpga.pulse_streamer.host.image import StreamerParams, pack_program, unpack_program
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram, RuntimeBusSegment
+
+    prog = RuntimeSequenceProgram(
+        sequence_id="r", sequence_name="r", clock_hz=50e6,
+        channels=[f"ch{i:02d}" for i in range(62)],
+        ticks=[0, 50, 200], masks=[0, 1, 0], duration=4e-6, trigger_count=0,
+        repeat_forever=False, loop_start_index=0, loop_end_tick=200, loop_count=1,
+        slot_count=2, slot_kinds=["dac", "dac"], loop_end_slot_coeffs=[0, 0],
+        tick_slot_coeffs=[[0, 0], [0, 0], [0, 0]],
+        scan_points=[[100, 900], [200, 800]], scan_coeff_frac_bits=8,
+        bus_names=["da0"],
+        bus_segments=[
+            RuntimeBusSegment(bus_index=0, start_tick=50, stop_tick=120, start_value=0, stop_value=0,
+                              mode="ramp", value_select=1, stop_value_select=2,
+                              start_tick_coeffs=[0, 0], stop_tick_coeffs=[0, 0]),
+        ],
+    )
+    params = StreamerParams(max_edges=16, bank_size=4)
+    seg = unpack_program(pack_program(prog, params), params)["bus_segments"][0]
+    assert seg["mode"] == "ramp"
+    assert seg["value_select"] == 1 and seg["stop_value_select"] == 2   # both endpoints scanned
+    na.validate_pulse_streamer_program(prog, max_edges=16, max_bus_segments=4, tick_width=32,
+                                       channel_count=62, num_slots=2)
+    # round-trip through the program dict preserves both selects too
+    rseg = na.RuntimeSequenceProgram.from_dict(prog.to_dict()).bus_segments[0]
+    assert rseg.value_select == 1 and rseg.stop_value_select == 2
+
+
+def test_edge_streamer_has_dual_value_select():
+    """The RTL bus engine has the dual start/stop value_select path (a ramp can read
+    a different scan slot for each endpoint)."""
+
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer"
+    eng = (root / "zlc_edge_streamer.v").read_text(encoding="utf-8")
+    top = (root / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
+    assert "bus_stop_value_select_mem" in eng
+    assert "bus_prog_stop_value_select" in eng and "bus_prog_stop_value_select" in top
+    assert "start_sel" in eng and "stop_sel" in eng        # independent endpoint reads
 
 
 def test_pulse_table_scan_allows_analog_bus_ramp_with_timing_scan():

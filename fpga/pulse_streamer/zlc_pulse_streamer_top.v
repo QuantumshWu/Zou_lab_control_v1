@@ -245,6 +245,7 @@ module zlc_pulse_streamer_top #(
     reg [BUS_WIDTH-1:0] bus_prog_stop_value = {BUS_WIDTH{1'b0}};
     reg [1:0] bus_prog_mode = 2'b0;
     reg [BUS_SEL_WIDTH-1:0] bus_prog_value_select = {BUS_SEL_WIDTH{1'b0}};
+    reg [BUS_SEL_WIDTH-1:0] bus_prog_stop_value_select = {BUS_SEL_WIDTH{1'b0}};
 
     localparam [3:0] L_IDLE=0, L_RD=1, L_CAP=2, L_EMIT=3, L_NEXT=4, L_FIRE=5, L_RUN=6;
     reg [3:0] lstate = L_IDLE;
@@ -317,6 +318,7 @@ module zlc_pulse_streamer_top #(
             bus_prog_stop_value <= cap[6][2*BUS_WIDTH-1:BUS_WIDTH];
             bus_prog_mode <= cap[6][2*BUS_WIDTH+1:2*BUS_WIDTH];
             bus_prog_value_select <= cap[6][2*BUS_WIDTH+2+BUS_SEL_WIDTH-1:2*BUS_WIDTH+2];
+            bus_prog_stop_value_select <= cap[6][2*BUS_WIDTH+2+2*BUS_SEL_WIDTH-1:2*BUS_WIDTH+2+BUS_SEL_WIDTH];
             bus_prog_we <= ~bus_prog_we;          // toggle commits a segment write
             baddr <= baddr + 1'b1;
             settle <= 2'd2; lstate <= L_RUN;
@@ -371,6 +373,7 @@ module zlc_pulse_streamer_top #(
         .bus_prog_stop_tick_coeffs(bus_prog_stop_tick_coeffs),
         .bus_prog_start_value(bus_prog_start_value), .bus_prog_stop_value(bus_prog_stop_value),
         .bus_prog_mode(bus_prog_mode), .bus_prog_value_select(bus_prog_value_select),
+        .bus_prog_stop_value_select(bus_prog_stop_value_select),
         .bus_counts(ctrl_reg[C_BUS_COUNTS][BUS_COUNT*(BUS_SEG_ADDR_WIDTH+1)-1:0]),
         .out(out), .bus_out(zlc_bus_out), .running(zlc_running), .done(zlc_done)
     );

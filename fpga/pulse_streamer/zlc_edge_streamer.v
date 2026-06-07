@@ -100,6 +100,7 @@ module zlc_edge_streamer #(
     input  wire [BUS_WIDTH-1:0] bus_prog_stop_value,
     input  wire [1:0] bus_prog_mode,
     input  wire [BUS_SEL_WIDTH-1:0] bus_prog_value_select,
+    input  wire [BUS_SEL_WIDTH-1:0] bus_prog_stop_value_select,
     input  wire [BUS_COUNT*(BUS_SEG_ADDR_WIDTH+1)-1:0] bus_counts,
 
     output wire [CHANNEL_COUNT-1:0] out,
@@ -123,6 +124,7 @@ module zlc_edge_streamer #(
     (* ram_style = "distributed" *) reg [BUS_WIDTH-1:0] bus_stop_value_mem [0:MAX_BUS_SEGMENT_ROWS-1];
     (* ram_style = "distributed" *) reg [1:0] bus_mode_mem [0:MAX_BUS_SEGMENT_ROWS-1];
     (* ram_style = "distributed" *) reg [BUS_SEL_WIDTH-1:0] bus_value_select_mem [0:MAX_BUS_SEGMENT_ROWS-1];
+    (* ram_style = "distributed" *) reg [BUS_SEL_WIDTH-1:0] bus_stop_value_select_mem [0:MAX_BUS_SEGMENT_ROWS-1];
     (* ram_style = "distributed" *) reg [COEFF_BITS-1:0] bus_start_tick_coeff_mem [0:MAX_BUS_SEGMENT_ROWS-1];
     (* ram_style = "distributed" *) reg [COEFF_BITS-1:0] bus_stop_tick_coeff_mem [0:MAX_BUS_SEGMENT_ROWS-1];
 
@@ -252,16 +254,20 @@ module zlc_edge_streamer #(
         input [BUS_INDEX_WIDTH+BUS_SEG_ADDR_WIDTH-1:0] addr;
         input [SLOT_BITS-1:0] slot_vec;
         reg [TICK_WIDTH-1:0] span;
-        reg [BUS_SEL_WIDTH-1:0] sel;
+        reg [BUS_SEL_WIDTH-1:0] start_sel, stop_sel;
         reg [BUS_WIDTH-1:0] vstart, vstop;
         reg [TICK_WIDTH-1:0] tkstart, tkstop;
         begin
-            sel = bus_value_select_mem[addr];
-            if (sel != {BUS_SEL_WIDTH{1'b0}}) begin
-                vstart = slot_vec[(sel - 1'b1)*TICK_WIDTH +: BUS_WIDTH]; vstop = vstart;
-            end else begin
-                vstart = bus_start_value_mem[addr]; vstop = bus_stop_value_mem[addr];
-            end
+            // Independent start/stop value selects: each endpoint either takes its
+            // literal value or reads its own scan slot.  A ramp can therefore go
+            // from a scanned start level to a scanned stop level; an edge/hold
+            // segment has start_sel == stop_sel so vstart == vstop.
+            start_sel = bus_value_select_mem[addr];
+            stop_sel  = bus_stop_value_select_mem[addr];
+            vstart = (start_sel != {BUS_SEL_WIDTH{1'b0}})
+                     ? slot_vec[(start_sel - 1'b1)*TICK_WIDTH +: BUS_WIDTH] : bus_start_value_mem[addr];
+            vstop  = (stop_sel  != {BUS_SEL_WIDTH{1'b0}})
+                     ? slot_vec[(stop_sel  - 1'b1)*TICK_WIDTH +: BUS_WIDTH] : bus_stop_value_mem[addr];
             tkstart = zlc_effective_tick(bus_start_tick_mem[addr], bus_start_tick_coeff_mem[addr], slot_vec);
             tkstop = zlc_effective_tick(bus_stop_tick_mem[addr], bus_stop_tick_coeff_mem[addr], slot_vec);
             if (bus_mode_mem[addr] == BUS_MODE_RAMP && tkstop > tkstart) begin
@@ -396,6 +402,7 @@ module zlc_edge_streamer #(
             bus_stop_value_mem[bus_prog_flat_addr] <= bus_prog_stop_value;
             bus_mode_mem[bus_prog_flat_addr] <= bus_prog_mode;
             bus_value_select_mem[bus_prog_flat_addr] <= bus_prog_value_select;
+            bus_stop_value_select_mem[bus_prog_flat_addr] <= bus_prog_stop_value_select;
             bus_start_tick_coeff_mem[bus_prog_flat_addr] <= bus_prog_start_tick_coeffs;
             bus_stop_tick_coeff_mem[bus_prog_flat_addr] <= bus_prog_stop_tick_coeffs;
         end
