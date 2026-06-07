@@ -67,6 +67,9 @@ class CtrlWords:
     BANK_READY = 16       # host -> top: bit b = bank b is loaded/ready
     BANK0_CHUNK = 17      # host -> top: sweep-chunk index currently resident in bank 0
     BANK1_CHUNK = 18      # host -> top: sweep-chunk index currently resident in bank 1
+    REPEAT_FROM_LOOP_START = 19  # repeat_forever rewinds to LOOP_START (additive-delay
+    #                              steady frame), not edge 0, so the startup preamble
+    #                              plays once
 
 
 CTRL_WORDS = 64
@@ -258,7 +261,13 @@ def pack_program(program, params: StreamerParams | None = None) -> dict[int, int
     w[CtrlWords.SCAN_COUNT] = len(points)
     w[CtrlWords.SCAN_ENABLE] = 1 if points else 0
     w[CtrlWords.REPEAT_FOREVER] = 1 if bool(getattr(program, "repeat_forever", False)) else 0
-    w[CtrlWords.LOOP_START] = int(getattr(program, "loop_start_index", 0))
+    # An additive-delay program (repeat_from_index > 0, never with a finite bracket)
+    # rewinds repeat_forever to its STEADY frame: point loop_start_addr there and flag
+    # it.  A bracket (repeat_from_index == 0) keeps loop_start = the bracket start and
+    # rewinds repeat_forever from edge 0.
+    repeat_from_index = int(getattr(program, "repeat_from_index", 0) or 0)
+    w[CtrlWords.LOOP_START] = repeat_from_index if repeat_from_index > 0 else int(getattr(program, "loop_start_index", 0))
+    w[CtrlWords.REPEAT_FROM_LOOP_START] = 1 if repeat_from_index > 0 else 0
     w[CtrlWords.LOOP_COUNT] = int(getattr(program, "loop_count", 1) or 1)
     w[CtrlWords.LOOP_END_TICK] = _to_unsigned(int(getattr(program, "loop_end_tick", 0)), p.tick_width)
     le = _field_words(_pack_coeffs(getattr(program, "loop_end_slot_coeffs", None), p), p.coeff_bits)
@@ -364,7 +373,11 @@ def unpack_program(words: Mapping[int, int], params: StreamerParams | None = Non
         "ticks": ticks, "masks": masks, "tick_slot_coeffs": coeffs,
         "scan_points_resident": scan_points, "scan_count": n_points, "slot_count": slot_count,
         "repeat_forever": bool(g(CtrlWords.REPEAT_FOREVER) & 1),
-        "loop_start_index": g(CtrlWords.LOOP_START), "loop_count": g(CtrlWords.LOOP_COUNT),
+        # LOOP_START is the additive-delay steady-frame anchor when the flag is set,
+        # else the finite-bracket start.
+        "loop_start_index": 0 if (g(CtrlWords.REPEAT_FROM_LOOP_START) & 1) else g(CtrlWords.LOOP_START),
+        "repeat_from_index": g(CtrlWords.LOOP_START) if (g(CtrlWords.REPEAT_FROM_LOOP_START) & 1) else 0,
+        "loop_count": g(CtrlWords.LOOP_COUNT),
         "loop_end_tick": g(CtrlWords.LOOP_END_TICK),
         "loop_end_slot_coeffs": _unpack_coeffs(_unfield([g(CtrlWords.LOOP_END_LO), g(CtrlWords.LOOP_END_HI)], p.coeff_bits), p),
         "bus_segments": bus_segments, "bank_size": g(CtrlWords.BANK_SIZE),

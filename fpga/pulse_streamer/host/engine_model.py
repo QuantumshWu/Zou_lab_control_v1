@@ -283,14 +283,23 @@ def prefetch_play(program, n_ticks: int, *, read_latency: int = 2, fifo_depth: i
             elif p.repeat_forever:
                 slot = _first_values(p); spi = 0
                 final = eff(n - 1, slot); loop_end = eff_le(slot); loops = p.loop_count
-                reseed(0)
-                if eff(0, slot) == 0:
-                    sm, tc, ei = p.masks[0], 1, 1
-                    if fifo and fifo[0] == 0:
+                ri = p.repeat_from_index
+                if ri > 0:
+                    # additive-delay: rewind to the steady frame, not edge 0
+                    sm, tc, ei = p.masks[ri], eff(ri, slot) + 1, ri + 1
+                    reseed(ri)
+                    if fifo and fifo[0] == ri:
                         fifo.popleft()
                     issue()
                 else:
-                    sm, tc, ei = 0, 0, 0
+                    reseed(0)
+                    if eff(0, slot) == 0:
+                        sm, tc, ei = p.masks[0], 1, 1
+                        if fifo and fifo[0] == 0:
+                            fifo.popleft()
+                        issue()
+                    else:
+                        sm, tc, ei = 0, 0, 0
             else:
                 running = False; sm = 0
         else:
@@ -486,6 +495,14 @@ def rtl_mirror_play(program, n_ticks: int, *, rd_lat: int = 2, fifo_depth: int =
         if tc >= final:
             if scan_en and spi + 1 < scan_count:
                 slot = list(p.scan_points[spi + 1]); spi += 1
+            elif p.repeat_forever and p.repeat_from_index > 0 and not scan_en:
+                # additive-delay repeat: rewind to the steady frame (loop_start
+                # shadows), NOT edge 0 -- mirrors the RTL repeat_from_loop_start branch.
+                ri = p.repeat_from_index
+                final = eff(n - 1, slot); loop_end = eff_le(slot); loops = p.loop_count
+                sm = p.masks[ri]; tc = eff(ri, slot) + 1; ei = ri + 1
+                reseed_from(ri + 1)
+                continue
             elif p.repeat_forever:
                 slot = _first_values(p); spi = 0
             else:

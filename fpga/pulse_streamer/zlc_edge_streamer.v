@@ -70,6 +70,11 @@ module zlc_edge_streamer #(
     input  wire [TICK_WIDTH-1:0] loop_end_tick,
     input  wire [NUM_SLOTS*COEFF_WIDTH-1:0] loop_end_coeffs,
     input  wire [31:0] loop_count,
+    // When set, repeat_forever rewinds to loop_start_addr (the steady-state frame of an
+    // additive-delay program) instead of edge 0 -- so the real-startup preamble plays
+    // ONCE.  The host points loop_start_addr at the steady frame (loop_count is 1, so
+    // the finite-bracket rewind is unused and its shadows are reused for free).
+    input  wire repeat_from_loop_start,
     input  wire scan_enable,
     input  wire [SCAN_COUNT_WIDTH-1:0] scan_count,   // total N points
 
@@ -538,12 +543,27 @@ module zlc_edge_streamer #(
                         bnd_bus_tick = 1'b1; bnd_bus_reinit = 1'b1; bnd_seed = 1'b1;
                     end
                 end else if (repeat_forever_active) begin
-                    // Restart the sweep at point 0.  For a STREAMING scan the host has
-                    // overwritten bank 0 with a later chunk, so wait until it reloads
-                    // chunk 0 (bank_chunk0==0) before wrapping -- the re-sweep is then
-                    // seamless (resident scans pass instantly; streamed ones stall only
-                    // at the seam, never emit a wrong point).
-                    if (scan_enable_active && !(bank_ready[1'b0] && bank_chunk0 == {SCAN_COUNT_WIDTH{1'b0}})) begin
+                    if (repeat_from_loop_start && !scan_enable_active) begin
+                        // ADDITIVE-DELAY repeat: rewind to the STEADY frame (loop_start
+                        // shadows), NOT edge 0, so the real-startup preamble plays once.
+                        // Same gapless reseed as the finite-bracket rewind, but
+                        // loops_remaining is untouched (this repeat is infinite).
+                        underflow <= 1'b0;
+                        state_mask <= sh_ls0_m; time_count <= zlc_effective_tick(sh_ls0_t,sh_ls0_c,slot_active)+1'b1;
+                        edge_index <= {1'b0,loop_start_addr}+1'b1;
+                        arm_t[0]<=sh_ls1_t; arm_c[0]<=sh_ls1_c; arm_m[0]<=sh_ls1_m;
+                        arm_t[1]<=sh_ls2_t; arm_c[1]<=sh_ls2_c; arm_m[1]<=sh_ls2_m;
+                        arm_t[2]<=sh_ls3_t; arm_c[2]<=sh_ls3_c; arm_m[2]<=sh_ls3_m;
+                        arm_nv <= clamp3(active_count - ({1'b0,loop_start_addr}+1'b1));
+                        fetch_idx <= {1'b0,loop_start_addr}+3'd4; edge_raddr <= loop_start_addr+3'd4;
+                        pend <= {RD_LAT{1'b0}};
+                        bnd_bus_tick = 1'b1; bnd_bus_reinit = 1'b1; bnd_slots = slot_active;
+                    // Otherwise restart the sweep at point 0.  For a STREAMING scan the
+                    // host has overwritten bank 0 with a later chunk, so wait until it
+                    // reloads chunk 0 (bank_chunk0==0) before wrapping -- the re-sweep is
+                    // then seamless (resident scans pass instantly; streamed ones stall
+                    // only at the seam, never emit a wrong point).
+                    end else if (scan_enable_active && !(bank_ready[1'b0] && bank_chunk0 == {SCAN_COUNT_WIDTH{1'b0}})) begin
                         underflow <= 1'b1;
                     end else begin
                         underflow <= 1'b0;

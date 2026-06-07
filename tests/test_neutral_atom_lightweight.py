@@ -562,6 +562,9 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     assert "CONFIG.PROTOCOL {AXI4LITE}" not in create_tcl
     assert "m_axi_awlen" in top and "m_axi_awburst" in top and "m_axi_wlast" in top
     assert ".s_axi_awlen(" in top and ".s_axi_awburst(" in top and ".s_axi_wlast(" in top
+    # additive-delay repeat: the engine rewinds repeat_forever to the steady frame
+    # (loop_start), not edge 0, so the real-startup preamble plays exactly once.
+    assert "repeat_from_loop_start" in engine and "repeat_from_loop_start" in top
     assert "set top zlc_pulse_streamer_top" in program_tcl
     assert "ps.runs" in program_tcl
     assert "pulse_streamer.runs" not in program_tcl
@@ -3889,7 +3892,12 @@ def test_pulse_table_repeat_forever_delay_is_additive_in_hardware():
     assert prog.repeat_from_index > 0 and prog.ticks[prog.repeat_from_index] == 100
 
     truth = _additive_truth(st, slots={}, time_step_ns=20, channels=["ch0"], n_ticks=400)
-    assert em.reference_play(em.EngineProgram.from_program(prog), 400) == truth
+    ep = em.EngineProgram.from_program(prog)
+    assert em.reference_play(ep, 400) == truth
+    # the BRAM FIFO engine + its exact RTL register mirror both reproduce the additive
+    # truth -- the no-Verilog-sim proof that the repeat_from_loop_start rewind is correct.
+    assert em.prefetch_play(ep, 400) == truth
+    assert em.rtl_mirror_play(ep, 400) == truth
     # the additive hardware is OFF at fire and turns ON only at tick 75 -- it does NOT
     # show the cyclic preview's wrapped tail at t=0; steady state then has period 100.
     assert truth[0] == 0 and truth[74] == 0 and truth[75] == 1 and truth[124] == 1 and truth[125] == 0

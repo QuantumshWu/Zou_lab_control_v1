@@ -115,6 +115,8 @@ module zlc_pulse_streamer_top #(
     localparam integer C_BANK_READY = 16;   // host -> engine (bit b: bank b loaded)
     localparam integer C_BANK0_CHUNK = 17;  // host -> engine: sweep chunk resident in bank 0
     localparam integer C_BANK1_CHUNK = 18;  // host -> engine: sweep chunk resident in bank 1
+    localparam integer C_REPEAT_FROM_LOOP_START = 19;  // repeat_forever rewinds to LOOP_START
+                                                       // (additive-delay steady frame), not edge 0
 
     // engine outputs
     wire [CHANNEL_COUNT-1:0] out;
@@ -383,6 +385,7 @@ module zlc_pulse_streamer_top #(
         .loop_end_tick(ctrl_reg[C_LOOP_END_TICK][TICK_WIDTH-1:0]),
         .loop_end_coeffs({ctrl_reg[C_LOOP_END_HI][COEFF_BITS-33:0], ctrl_reg[C_LOOP_END_LO]}),
         .loop_count(ctrl_reg[C_LOOP_COUNT]),
+        .repeat_from_loop_start(ctrl_reg[C_REPEAT_FROM_LOOP_START][0]),
         .scan_enable(ctrl_reg[C_SCAN_ENABLE][0]),
         .scan_count(ctrl_reg[C_SCAN_COUNT][SCAN_COUNT_WIDTH-1:0]),
         .edge_raddr(edge_raddr),
