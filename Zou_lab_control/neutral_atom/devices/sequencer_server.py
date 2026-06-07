@@ -154,6 +154,14 @@ def run_server(
         if warm_start:
             print("Starting persistent Vivado JTAG-to-AXI session before accepting clients...")
             hardware_backend.start()
+            # Fail-fast bring-up check: a burst write + single-beat read-back proves the
+            # AXI4 INCR-burst upload path works (right -data byte order, AXI4 -- not
+            # Lite -- bitstream) BEFORE any client uploads a pulse.  Disable with
+            # ZLC_PS_AXI_SELF_TEST=0 if a flaky cable makes it spurious.
+            if _env_bool("ZLC_PS_AXI_SELF_TEST", True):
+                print("Verifying AXI burst upload path (write + read-back self-test)...")
+                hardware_backend.axi_self_test()
+                print("AXI burst self-test OK.")
         prepare_callback = hardware_backend.prepare
         fire_callback = hardware_backend.fire
         wait_done_callback = hardware_backend.wait_done

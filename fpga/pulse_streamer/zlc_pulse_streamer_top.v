@@ -122,14 +122,23 @@ module zlc_pulse_streamer_top #(
     wire zlc_running, zlc_done, zlc_underflow;
     wire [SCAN_COUNT_WIDTH-1:0] zlc_cursor;
 
-    // --- JTAG-to-AXI master -> AXI4-Lite -> AXI BRAM controller ---------------
+    // --- JTAG-to-AXI master -> FULL AXI4 -> AXI BRAM controller ---------------
+    // Full AXI4 (not Lite) so the host issues INCR burst writes (up to 256 words per
+    // transaction) -> ~100x faster BRAM upload.  ID width 1; the extra burst sidebands
+    // (awid/awlen/awsize/awburst/awlock/awcache/wlast/bid/... + read mirror) are wired
+    // master<->slave 1:1.  m_axi_awqos/arqos are driven by the master but axi_bram_ctrl
+    // has no qos/region/user ports, so those two wires are intentionally left dangling.
     wire axi_clk = clk;
     wire axi_resetn = 1'b1;
+    wire [0:0]  m_axi_awid;    wire [7:0] m_axi_awlen;   wire [2:0] m_axi_awsize;
+    wire [1:0]  m_axi_awburst; wire [0:0] m_axi_awlock;  wire [3:0] m_axi_awcache;  wire [3:0] m_axi_awqos;
     wire [31:0] m_axi_awaddr;  wire [2:0] m_axi_awprot;  wire m_axi_awvalid; wire m_axi_awready;
-    wire [31:0] m_axi_wdata;   wire [3:0] m_axi_wstrb;   wire m_axi_wvalid;  wire m_axi_wready;
-    wire [1:0]  m_axi_bresp;   wire m_axi_bvalid;        wire m_axi_bready;
+    wire [31:0] m_axi_wdata;   wire [3:0] m_axi_wstrb;   wire m_axi_wlast;   wire m_axi_wvalid;  wire m_axi_wready;
+    wire [0:0]  m_axi_bid;     wire [1:0] m_axi_bresp;   wire m_axi_bvalid;        wire m_axi_bready;
+    wire [0:0]  m_axi_arid;    wire [7:0] m_axi_arlen;   wire [2:0] m_axi_arsize;
+    wire [1:0]  m_axi_arburst; wire [0:0] m_axi_arlock;  wire [3:0] m_axi_arcache;  wire [3:0] m_axi_arqos;
     wire [31:0] m_axi_araddr;  wire [2:0] m_axi_arprot;  wire m_axi_arvalid; wire m_axi_arready;
-    wire [31:0] m_axi_rdata;   wire [1:0] m_axi_rresp;   wire m_axi_rvalid;  wire m_axi_rready;
+    wire [0:0]  m_axi_rid;     wire [31:0] m_axi_rdata;  wire [1:0] m_axi_rresp;   wire m_axi_rlast; wire m_axi_rvalid;  wire m_axi_rready;
 
     wire        bram_clka, bram_rsta, bram_ena;
     wire [3:0]  bram_wea;
@@ -399,27 +408,39 @@ module zlc_pulse_streamer_top #(
     // ---- JTAG-to-AXI + AXI BRAM controller IP --------------------------------
     jtag_axi_0 zlc_jtag_axi_i (
         .aclk(axi_clk), .aresetn(axi_resetn),
-        .m_axi_awaddr(m_axi_awaddr), .m_axi_awprot(m_axi_awprot),
-        .m_axi_awvalid(m_axi_awvalid), .m_axi_awready(m_axi_awready),
-        .m_axi_wdata(m_axi_wdata), .m_axi_wstrb(m_axi_wstrb),
+        .m_axi_awid(m_axi_awid), .m_axi_awaddr(m_axi_awaddr),
+        .m_axi_awlen(m_axi_awlen), .m_axi_awsize(m_axi_awsize), .m_axi_awburst(m_axi_awburst),
+        .m_axi_awlock(m_axi_awlock), .m_axi_awcache(m_axi_awcache), .m_axi_awprot(m_axi_awprot),
+        .m_axi_awqos(m_axi_awqos), .m_axi_awvalid(m_axi_awvalid), .m_axi_awready(m_axi_awready),
+        .m_axi_wdata(m_axi_wdata), .m_axi_wstrb(m_axi_wstrb), .m_axi_wlast(m_axi_wlast),
         .m_axi_wvalid(m_axi_wvalid), .m_axi_wready(m_axi_wready),
-        .m_axi_bresp(m_axi_bresp), .m_axi_bvalid(m_axi_bvalid), .m_axi_bready(m_axi_bready),
-        .m_axi_araddr(m_axi_araddr), .m_axi_arprot(m_axi_arprot),
-        .m_axi_arvalid(m_axi_arvalid), .m_axi_arready(m_axi_arready),
-        .m_axi_rdata(m_axi_rdata), .m_axi_rresp(m_axi_rresp),
-        .m_axi_rvalid(m_axi_rvalid), .m_axi_rready(m_axi_rready)
+        .m_axi_bid(m_axi_bid), .m_axi_bresp(m_axi_bresp), .m_axi_bvalid(m_axi_bvalid), .m_axi_bready(m_axi_bready),
+        .m_axi_arid(m_axi_arid), .m_axi_araddr(m_axi_araddr),
+        .m_axi_arlen(m_axi_arlen), .m_axi_arsize(m_axi_arsize), .m_axi_arburst(m_axi_arburst),
+        .m_axi_arlock(m_axi_arlock), .m_axi_arcache(m_axi_arcache), .m_axi_arprot(m_axi_arprot),
+        .m_axi_arqos(m_axi_arqos), .m_axi_arvalid(m_axi_arvalid), .m_axi_arready(m_axi_arready),
+        .m_axi_rid(m_axi_rid), .m_axi_rdata(m_axi_rdata), .m_axi_rresp(m_axi_rresp),
+        .m_axi_rlast(m_axi_rlast), .m_axi_rvalid(m_axi_rvalid), .m_axi_rready(m_axi_rready)
     );
+    // axi_bram_ctrl in full AXI4: same wires, plus the burst sidebands.  It has no
+    // qos/region/user ports, so m_axi_awqos/m_axi_arqos are NOT connected here (the
+    // master drives them; they simply have no slave load).  The external BRAM port
+    // (bram_*) is identical to before -- burst beats just increment bram_addra.
     axi_bram_ctrl_0 zlc_bram_ctrl_i (
         .s_axi_aclk(axi_clk), .s_axi_aresetn(axi_resetn),
-        .s_axi_awaddr(m_axi_awaddr), .s_axi_awprot(m_axi_awprot),
+        .s_axi_awid(m_axi_awid), .s_axi_awaddr(m_axi_awaddr),
+        .s_axi_awlen(m_axi_awlen), .s_axi_awsize(m_axi_awsize), .s_axi_awburst(m_axi_awburst),
+        .s_axi_awlock(m_axi_awlock), .s_axi_awcache(m_axi_awcache), .s_axi_awprot(m_axi_awprot),
         .s_axi_awvalid(m_axi_awvalid), .s_axi_awready(m_axi_awready),
-        .s_axi_wdata(m_axi_wdata), .s_axi_wstrb(m_axi_wstrb),
+        .s_axi_wdata(m_axi_wdata), .s_axi_wstrb(m_axi_wstrb), .s_axi_wlast(m_axi_wlast),
         .s_axi_wvalid(m_axi_wvalid), .s_axi_wready(m_axi_wready),
-        .s_axi_bresp(m_axi_bresp), .s_axi_bvalid(m_axi_bvalid), .s_axi_bready(m_axi_bready),
-        .s_axi_araddr(m_axi_araddr), .s_axi_arprot(m_axi_arprot),
+        .s_axi_bid(m_axi_bid), .s_axi_bresp(m_axi_bresp), .s_axi_bvalid(m_axi_bvalid), .s_axi_bready(m_axi_bready),
+        .s_axi_arid(m_axi_arid), .s_axi_araddr(m_axi_araddr),
+        .s_axi_arlen(m_axi_arlen), .s_axi_arsize(m_axi_arsize), .s_axi_arburst(m_axi_arburst),
+        .s_axi_arlock(m_axi_arlock), .s_axi_arcache(m_axi_arcache), .s_axi_arprot(m_axi_arprot),
         .s_axi_arvalid(m_axi_arvalid), .s_axi_arready(m_axi_arready),
-        .s_axi_rdata(m_axi_rdata), .s_axi_rresp(m_axi_rresp),
-        .s_axi_rvalid(m_axi_rvalid), .s_axi_rready(m_axi_rready),
+        .s_axi_rid(m_axi_rid), .s_axi_rdata(m_axi_rdata), .s_axi_rresp(m_axi_rresp),
+        .s_axi_rlast(m_axi_rlast), .s_axi_rvalid(m_axi_rvalid), .s_axi_rready(m_axi_rready),
         .bram_rst_a(bram_rsta), .bram_clk_a(bram_clka), .bram_en_a(bram_ena),
         .bram_we_a(bram_wea), .bram_addr_a(bram_addra),
         .bram_wrdata_a(bram_dina), .bram_rddata_a(bram_douta)

@@ -951,6 +951,36 @@ class PulseTableState:
             "repeat_forever": self.repeat_forever,
         }
 
+    def snapped(self, *, time_step_ns: float | None = None) -> "PulseTableState":
+        """Return a copy with every LITERAL time value snapped to the clock-tick grid:
+        period durations up to ``>= 1`` tick, channel delays to the nearest tick (sign
+        preserved), and scan-table points to the nearest tick (DAC points to the nearest
+        integer code).  Slot EXPRESSIONS (``s0`` ...) are kept verbatim; the compiler
+        snaps their affine base.  This is the single snap source shared by the GUI
+        display and the server / pulse-transfer API, so what the user sees and what the
+        hardware runs always agree (the hardware can only land on whole ticks)."""
+
+        step = self.time_step_ns if time_step_ns is None else positive_time_step_ns(time_step_ns)
+        copy = PulseTableState.from_dict(self.to_dict())
+        copy.periods = [
+            PulsePeriod(
+                _snap_literal_time_value(period.duration, period.unit, step, allow_zero=False),
+                period.states,
+                unit=period.unit,
+                name=period.name,
+            )
+            for period in copy.periods
+        ]
+        copy.delays = {
+            channel: _snap_literal_time_value(
+                value, copy.delay_units.get(channel, "ns"), step, allow_zero=True, allow_negative=True
+            )
+            for channel, value in copy.delays.items()
+        }
+        copy.scan_table = snap_scan_table(copy.scan_table, copy.scan_slots, time_step_ns=step)
+        copy.validate()
+        return copy
+
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> "PulseTableState":
         if payload.get("schema", cls.schema) != cls.schema:
@@ -1194,6 +1224,62 @@ def quantized_time_steps(
     return steps
 
 
+def _snap_literal_time_value(
+    value: float | str,
+    unit: str,
+    time_step_ns: float,
+    *,
+    allow_zero: bool,
+    allow_negative: bool = False,
+) -> float | str:
+    """Snap one literal time value (in ``unit``) to the clock-tick grid, returned in
+    the SAME unit.  A scan-slot EXPRESSION (anything that is not a plain number, e.g.
+    ``"s0"`` or ``"20+s0"``) is returned unchanged -- the compiler snaps its affine
+    base instead, so binding/expressions are never corrupted."""
+
+    if isinstance(value, str):
+        try:
+            number = float(value)
+        except ValueError:
+            return value
+    else:
+        number = float(value)
+    factor = UNITS_TO_NS.get(str(unit), 1.0)
+    snapped_ns = quantized_time_ns(
+        number * factor, time_step_ns=time_step_ns, name="time value",
+        allow_zero=allow_zero, allow_negative=allow_negative,
+    )
+    out = snapped_ns / factor
+    return int(out) if float(out).is_integer() else out
+
+
+def snap_scan_table(
+    scan_table: Sequence[Sequence[float]],
+    scan_slots: Sequence["ScanSlot"],
+    *,
+    time_step_ns: float,
+) -> list[list[float]]:
+    """Snap every scan-table point to the clock grid: time slots to the nearest tick
+    (in the slot's display unit, sign preserved), DAC slots to the nearest integer
+    code.  One shared snap source for the GUI (so the displayed/saved table matches)
+    and the server/pulse API (so the transferred pulse matches the hardware)."""
+
+    step = positive_time_step_ns(time_step_ns)
+    out: list[list[float]] = []
+    for row in scan_table:
+        new_row: list[float] = []
+        for value, slot in zip(row, scan_slots):
+            if getattr(slot, "kind", "") == "dac":
+                new_row.append(float(int(round(float(value)))))
+            else:
+                snapped = _snap_literal_time_value(
+                    float(value), slot.unit, step, allow_zero=True, allow_negative=True
+                )
+                new_row.append(float(snapped))
+        out.append(new_row)
+    return out
+
+
 def quantized_time_ns(
     value_ns: float | str,
     *,
@@ -1350,4 +1436,5 @@ __all__ = [
     "quantized_time_ns",
     "quantized_time_steps",
     "slot_var",
+    "snap_scan_table",
 ]

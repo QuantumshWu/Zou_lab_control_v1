@@ -114,6 +114,7 @@ class VivadoAxiStreamerSession:
         load_timeout: float = 5.0,
         write_batch: int = 200,
         stream_poll_interval: float = 0.005,
+        burst_max: int = 256,
         tcl_executor: Callable[[Sequence[str], str, float | None], str] | None = None,
     ):
         self.state_dir = Path(state_dir)
@@ -129,6 +130,11 @@ class VivadoAxiStreamerSession:
         self.action_timeout = action_timeout
         self.load_timeout = float(load_timeout)
         self.write_batch = max(1, int(write_batch))
+        # AXI4 INCR burst beats per transaction (AWLEN max => 256).  Address-contiguous
+        # queued words are coalesced into bursts so one ``run_hw_axi`` moves up to 256
+        # words instead of one -- the difference between a multi-second upload and a
+        # ~100 ms one over JTAG-to-AXI.  Requires the AXI4 (not AXI4-Lite) bitstream.
+        self.burst_max = max(1, min(256, int(burst_max)))
         self.stream_poll_interval = float(stream_poll_interval)
 
         self._pending: list[tuple[int, int]] = []  # (byte_addr, value) queued writes
@@ -231,14 +237,54 @@ class VivadoAxiStreamerSession:
         return lines
 
     @staticmethod
-    def _write_txn_tcl(byte_addr: int, value: int) -> list[str]:
+    def _write_burst_tcl(byte_addr: int, values: Sequence[int]) -> list[str]:
+        """One AXI write transaction for ``values`` at consecutive word addresses
+        starting at ``byte_addr``.  For len > 1 this is a single INCR burst (needs the
+        AXI4 bitstream).  Vivado ``create_hw_axi_txn -data`` for a burst is ONE
+        concatenated hex value whose LEAST-significant (rightmost) word goes to the
+        BASE address, so the per-beat words are emitted high-address-first."""
+
         addr = f"{byte_addr & 0xFFFFFFFF:08X}"
-        data = f"{value & 0xFFFFFFFF:08X}"
+        n = len(values)
+        if n == 1:
+            data = f"{int(values[0]) & 0xFFFFFFFF:08X}"
+        else:
+            data = "".join(f"{int(v) & 0xFFFFFFFF:08X}" for v in reversed(values))
+        # -burst INCR is explicit: the default burst type is not guaranteed INCR across
+        # Vivado versions, and FIXED would write every beat to the BASE address (silent
+        # corruption).  -size is omitted (defaults to the 32-bit bus width).
         return [
-            f"create_hw_axi_txn zlc_w [get_hw_axis] -address {addr} -data {data} -len 1 -type write",
+            f"create_hw_axi_txn zlc_w [get_hw_axis] -address {addr} -data {data} -len {n} -type write -burst INCR",
             "run_hw_axi zlc_w",
             "delete_hw_axi_txn zlc_w",
         ]
+
+    def _burst_runs(self, pending: Sequence[tuple[int, int]]) -> list[tuple[int, list[int]]]:
+        """Coalesce queued (byte_addr, value) writes into ``(base, [values])`` bursts.
+
+        Runs are built in INSERTION ORDER -- never globally sorted -- so an
+        order-dependent command sequence (e.g. COMMAND 0 then COMMAND cmd, or
+        BANK_READY de-arm then re-arm at the SAME address) keeps its order and stays a
+        sequence of len-1 writes.  Only consecutive, strictly address-contiguous
+        (stride 4) entries merge, capped at ``burst_max`` beats."""
+
+        runs: list[tuple[int, list[int]]] = []
+        i = 0
+        n = len(pending)
+        while i < n:
+            base, val = pending[i]
+            vals = [val]
+            j = i + 1
+            while (
+                j < n
+                and len(vals) < self.burst_max
+                and pending[j][0] == base + 4 * len(vals)
+            ):
+                vals.append(pending[j][1])
+                j += 1
+            runs.append((base, vals))
+            i = j
+        return runs
 
     @staticmethod
     def _read_txn_tcl(byte_addr: int, marker: str) -> list[str]:
@@ -277,11 +323,19 @@ class VivadoAxiStreamerSession:
             return
         pending = self._pending
         self._pending = []
-        for start in range(0, len(pending), self.write_batch):
-            batch = pending[start : start + self.write_batch]
-            lines: list[str] = []
-            for byte_addr, value in batch:
-                lines.extend(self._write_txn_tcl(byte_addr, value))
+        runs = self._burst_runs(pending)
+        # Send several bursts per Vivado round-trip (amortise the host<->Tcl latency);
+        # write_batch bounds the bursts-per-round-trip, not the words.
+        lines: list[str] = []
+        bursts = 0
+        for base, values in runs:
+            lines.extend(self._write_burst_tcl(base, values))
+            bursts += 1
+            if bursts >= self.write_batch:
+                self._run_tcl(lines, action="axi_write", timeout=self.action_timeout, stop=stop)
+                lines = []
+                bursts = 0
+        if lines:
             self._run_tcl(lines, action="axi_write", timeout=self.action_timeout, stop=stop)
 
     # --------------------------------------------------------------- sequencer API
@@ -334,6 +388,31 @@ class VivadoAxiStreamerSession:
                 f"(STATUS=0x{status:08X}; check the .bit/.ltx, the JTAG cable, and that "
                 "run_server programmed the current bitstream)."
             )
+
+    def axi_self_test(self, *, count: int = 16) -> bool:
+        """Bring-up check for the AXI4 burst path: burst-write a known ramp into the
+        scan-BRAM region, read it back single-beat, and confirm it matches.  This
+        catches the one silent failure mode -- a wrong ``create_hw_axi_txn -data`` burst
+        byte order (or a still-AXI4-Lite bitstream that ignores ``-len``) -- BEFORE any
+        real pulse upload.  Returns True on success; raises on mismatch.  Safe to call
+        before ``prepare`` (the scan region is overwritten by the next upload)."""
+
+        base = region_bases(self.params)["scan"]
+        n = max(2, int(count))
+        pattern = [(0xC0DE0000 + i) & 0xFFFFFFFF for i in range(n)]
+        self._stop_stream_thread()
+        for offset, value in enumerate(pattern):
+            self._queue_word(base + offset, value)
+        self._flush()                      # one contiguous burst
+        read = [self._read_word(base + offset) for offset in range(n)]
+        if read != pattern:
+            raise RuntimeError(
+                "AXI burst self-test FAILED -- the uploaded ramp read back scrambled, "
+                "so the burst -data byte order is wrong or the bitstream is still "
+                f"AXI4-Lite (no burst).  wrote={[hex(v) for v in pattern[:4]]}... "
+                f"read={[hex(v) for v in read[:4]]}..."
+            )
+        return True
 
     def fire(self, program=None) -> None:
         if program is not None:

@@ -21,6 +21,7 @@ from Zou_lab_control.neutral_atom.timing.pulse_table import (
     default_pulse_name,
     load_scan_table,
     slot_var,
+    snap_scan_table,
 )
 from .live import plot as frontend_plot, pulse_plot_channels, pulse_repeat_markers, pulse_repeat_notation
 from .qt_fluent import (
@@ -732,6 +733,9 @@ class PeriodCard(FluentGroupBox):
 
     def _handle_unit(self, unit: str) -> None:
         self.duration_edit.set_resolution(_unit_resolution(self.time_step_ns, unit))
+        # A period duration must occupy at least one clock tick: snap up to >=1 tick
+        # on commit (never to 0), matching the compiler and what the hardware runs.
+        self.duration_edit.set_allow_any(False)
 
     def to_period(self, *, full_channels: Sequence[str], time_step_ns: float, slots: Mapping[str, float] | None = None) -> PulsePeriod:
         states = []
@@ -2157,7 +2161,8 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load scan array", start, "Scan array (*.npy *.csv *.txt *.json)")
             if not path:
                 return
-            state.set_scan_table(load_scan_table(path))
+            loaded = snap_scan_table(load_scan_table(path), state.scan_slots, time_step_ns=state.time_step_ns)
+            state.set_scan_table(loaded)
             self.load_state(state)
             if hasattr(self, "preview_status"):
                 self.preview_status.setText(f"Loaded {len(state.scan_table)} scan points from {Path(path).name}")
@@ -2292,7 +2297,8 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 self._message("Assign an N_points x N_slots array to a 'scan_table' variable.")
                 return
             array = np.atleast_2d(np.asarray(table, dtype=float))
-            state.set_scan_table([[float(value) for value in row] for row in array])
+            rows = snap_scan_table([[float(value) for value in row] for row in array], state.scan_slots, time_step_ns=state.time_step_ns)
+            state.set_scan_table(rows)
             self.load_state(state)
             self._open_scan_tab()
         except Exception as exc:

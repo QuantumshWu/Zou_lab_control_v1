@@ -120,8 +120,13 @@ read_xdc $xdc_path
 set_property top $top [current_fileset]
 
 # --- jtag_axi master ------------------------------------------------------
+# FULL AXI4 (not AXI4-Lite) so the host can issue INCR burst writes -- one
+# run_hw_axi moves up to 256 words instead of one, turning a multi-second BRAM
+# upload into a ~100 ms one.  PROTOCOL is a string property; Vivado recomputes
+# the burst/lock/cache/qos interface flags from it.  ID width 1 (1-bit awid..rid).
 create_ip -name jtag_axi -vendor xilinx.com -library ip -module_name jtag_axi_0
-zlc_try "jtag PROTOCOL=AXI4LITE"  {set_property CONFIG.PROTOCOL {AXI4LITE} [get_ips jtag_axi_0]}
+zlc_try "jtag PROTOCOL=AXI4"  {set_property CONFIG.PROTOCOL {AXI4} [get_ips jtag_axi_0]}
+zlc_try "jtag ID=1" {set_property CONFIG.M_AXI_ID_WIDTH {1} [get_ips jtag_axi_0]}
 zlc_try "jtag DATA=32" {set_property CONFIG.M_AXI_DATA_WIDTH {32} [get_ips jtag_axi_0]}
 zlc_try "jtag ADDR=32" {set_property CONFIG.M_AXI_ADDR_WIDTH {32} [get_ips jtag_axi_0]}
 zlc_dump_ip jtag_axi_0
@@ -131,7 +136,11 @@ generate_target all [get_ips jtag_axi_0]
 create_ip -name axi_bram_ctrl -vendor xilinx.com -library ip -module_name axi_bram_ctrl_0
 zlc_try "bramc DATA=32"      {set_property CONFIG.DATA_WIDTH {32} [get_ips axi_bram_ctrl_0]}
 zlc_try "bramc SINGLE_PORT"  {set_property CONFIG.SINGLE_PORT_BRAM {1} [get_ips axi_bram_ctrl_0]}
-zlc_try "bramc PROTOCOL=AXI4LITE" {set_property CONFIG.PROTOCOL {AXI4LITE} [get_ips axi_bram_ctrl_0]}
+# FULL AXI4 with ID width matching the master (1) so it accepts INCR burst writes.
+zlc_try "bramc PROTOCOL=AXI4" {set_property CONFIG.PROTOCOL {AXI4} [get_ips axi_bram_ctrl_0]}
+zlc_try "bramc ID=1"        {set_property CONFIG.ID_WIDTH {1} [get_ips axi_bram_ctrl_0]}
+zlc_try "bramc narrow=0"    {set_property CONFIG.SUPPORTS_NARROW_BURST {0} [get_ips axi_bram_ctrl_0]}
+zlc_try "bramc readlat=1"   {set_property CONFIG.READ_LATENCY {1} [get_ips axi_bram_ctrl_0]}
 zlc_try "bramc BMG=EXTERNAL" {set_property CONFIG.BMG_INSTANCE {EXTERNAL} [get_ips axi_bram_ctrl_0]}
 set_property CONFIG.MEM_DEPTH $zlc_axi_bram_depth [get_ips axi_bram_ctrl_0]
 if {[get_property CONFIG.MEM_DEPTH [get_ips axi_bram_ctrl_0]] != $zlc_axi_bram_depth} {

@@ -1140,9 +1140,16 @@ class VerilogSequencer(SequencerDevice):
 
 
 def timing_payload_to_dict(payload: PulseSequence | PulseTableState) -> dict[str, object]:
-    """Return the JSON-safe timing payload for a sequence or pulse table."""
+    """Return the JSON-safe timing payload for a sequence or pulse table.
 
-    if isinstance(payload, (PulseSequence, PulseTableState)):
+    A ``PulseTableState`` is SNAPPED to the clock-tick grid before serialization, so
+    the pulse transferred to the server/hardware carries the same whole-tick values
+    the GUI displays and the compiler would land on -- there is no place where an
+    off-grid value silently slips through the pulse-transfer API."""
+
+    if isinstance(payload, PulseTableState):
+        return payload.snapped().to_dict()
+    if isinstance(payload, PulseSequence):
         return payload.to_dict()
     if isinstance(payload, Mapping):
         return dict(payload)

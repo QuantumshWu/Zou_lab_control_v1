@@ -23,6 +23,25 @@ import Zou_lab_control.neutral_atom as na
 from Zou_lab_control.frontend.content.tutorials import neutral_atom_fpga_server_cells, neutral_atom_hardware_tutorial_cells
 
 
+def _decode_axi_writes(text: str) -> list[tuple[int, int]]:
+    """Decode ``create_hw_axi_txn ... -type write`` transactions (single-beat OR INCR
+    burst) into ``(word_addr, value)`` pairs -- the mock-hardware counterpart of
+    ``axi_session._write_burst_tcl`` (burst ``-data`` is one concatenated hex value,
+    high-address word first, so we reverse to put the base-address word first)."""
+
+    out: list[tuple[int, int]] = []
+    for addr_hex, data_hex, n_str in re.findall(
+        r"-address ([0-9A-Fa-f]+) -data ([0-9A-Fa-f]+) -len (\d+) -type write", text
+    ):
+        base = int(addr_hex, 16) // 4
+        n = int(n_str)
+        words = [int(data_hex[i * 8:(i + 1) * 8], 16) for i in range(n)]
+        words.reverse()
+        for k, value in enumerate(words):
+            out.append((base + k, value))
+    return out
+
+
 def wait_until_done(task, *, timeout=10.0):
     measurement = task.measurement
     assert measurement is not None
@@ -535,6 +554,14 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     assert "Always_Enabled" not in create_tcl
     assert create_tcl.count("Enable_A {Use_ENA_Pin}") == 5   # all 5 BRAMs expose ENA
     assert create_tcl.count("Enable_B {Use_ENB_Pin}") == 5   # ...and ENB (top drives both)
+    # AXI4 BURST upload path: jtag_axi + axi_bram_ctrl are FULL AXI4 (not Lite), and the
+    # top wires the INCR-burst sidebands -- so one create_hw_axi_txn -len N moves up to
+    # 256 words and a few-thousand-word BRAM upload drops from seconds to ~100 ms.  A
+    # drift back to AXI4-Lite (single beat) would silently make uploads slow again.
+    assert "CONFIG.PROTOCOL {AXI4}" in create_tcl
+    assert "CONFIG.PROTOCOL {AXI4LITE}" not in create_tcl
+    assert "m_axi_awlen" in top and "m_axi_awburst" in top and "m_axi_wlast" in top
+    assert ".s_axi_awlen(" in top and ".s_axi_awburst(" in top and ".s_axi_wlast(" in top
     assert "set top zlc_pulse_streamer_top" in program_tcl
     assert "ps.runs" in program_tcl
     assert "pulse_streamer.runs" not in program_tcl
@@ -1479,8 +1506,8 @@ def test_vivado_axi_session_tolerates_transient_underflow(tmp_path):
             self.bram = {}; self.status = 0; self.fired = False; self.polls = 0
         def __call__(self, lines, action, timeout):
             text = "\n".join(lines)
-            for a, d in _re.findall(r"-address ([0-9A-Fa-f]+) -data ([0-9A-Fa-f]+) -len 1 -type write", text):
-                w = int(a, 16) // 4; v = int(d, 16); self.bram[w] = v
+            for w, v in _decode_axi_writes(text):
+                self.bram[w] = v
                 if w == CtrlWords.COMMAND and v & CMD_LOAD: self.status = STATUS_LOADED
                 if w == CtrlWords.COMMAND and v & CMD_FIRE: self.fired = True; self.status = STATUS_RUNNING
             m = _re.search(r"-address ([0-9A-Fa-f]+) -len 1 -type read", text)
@@ -1569,8 +1596,8 @@ def test_vivado_axi_session_wait_done_is_reentrant(tmp_path):
             self.chunk_writes = []     # order of (BANK*_CHUNK) values written after fire
         def __call__(self, lines, action, timeout):
             text = "\n".join(lines)
-            for a, d in _re.findall(r"-address ([0-9A-Fa-f]+) -data ([0-9A-Fa-f]+) -len 1 -type write", text):
-                w = int(a, 16) // 4; v = int(d, 16); self.bram[w] = v
+            for w, v in _decode_axi_writes(text):
+                self.bram[w] = v
                 if w == CtrlWords.COMMAND and v & CMD_LOAD: self.status = STATUS_LOADED
                 if w == CtrlWords.COMMAND and v & CMD_FIRE: self.fired = True; self.status = STATUS_RUNNING
                 if self.fired and w in (CtrlWords.BANK0_CHUNK, CtrlWords.BANK1_CHUNK):
@@ -1657,8 +1684,8 @@ def test_vivado_axi_session_repeat_streaming_refills_cyclically(tmp_path):
             self.bram = {}; self.status = 0; self.fired = False; self.cursor = 0; self.reloads0 = 0
         def __call__(self, lines, action, timeout):
             text = "\n".join(lines)
-            for a, d in _re.findall(r"-address ([0-9A-Fa-f]+) -data ([0-9A-Fa-f]+) -len 1 -type write", text):
-                w = int(a, 16) // 4; v = int(d, 16); self.bram[w] = v
+            for w, v in _decode_axi_writes(text):
+                self.bram[w] = v
                 if w == CtrlWords.COMMAND and v & CMD_LOAD: self.status = STATUS_LOADED
                 if w == CtrlWords.COMMAND and v & CMD_FIRE: self.fired = True; self.status = STATUS_RUNNING; self.cursor = 0
                 if w == CtrlWords.COMMAND and v & CMD_SAFE: self.status = 0; self.fired = False
@@ -2574,6 +2601,102 @@ def test_pulse_table_snaps_times_to_minimal_grid():
     assert na.PulsePeriod(3.0, (1,), unit="ns").duration_ns(time_step_ns=1) == 3.0
 
 
+def test_pulse_table_snapped_snaps_literals_and_keeps_expressions():
+    from Zou_lab_control.neutral_atom.timing.pulse_table import ScanSlot, snap_scan_table
+
+    state = na.PulseTableState(
+        channels=["trap", "trig"],
+        periods=[
+            na.PulsePeriod(50, (1, 0), unit="ns"),    # off-grid -> 60 ns at 20 ns step
+            na.PulsePeriod("s0", (0, 1), unit="str (ns)"),  # expression: must be kept
+        ],
+        delays={"trig": 30.0, "trap": "s0"},          # 30 -> 40; "s0" kept
+        delay_units={"trig": "ns", "trap": "ns"},
+        scan_slots=[{"kind": "duration", "target": "1", "unit": "ns", "nominal": 20.0}],
+        scan_table=[[51.0], [9.0]],
+        time_step_ns=20,
+    )
+    snapped = state.snapped()
+    # literal duration snaps to a whole tick (50 -> 60), expression preserved
+    assert snapped.periods[0].duration == 60
+    assert snapped.periods[1].duration == "s0"
+    # literal delay snaps (30 -> 40), expression delay preserved
+    assert snapped.delays["trig"] == 40
+    assert snapped.delays["trap"] == "s0"
+    # scan table: time slot snaps to the tick grid
+    assert snapped.scan_table[0][0] == 60.0   # 51 ns -> 60 ns
+    assert snapped.scan_table[1][0] == 0.0    # 9 ns rounds to 0 (a delay slot may be 0)
+    # the original state is untouched (snapped returns a copy)
+    assert state.periods[0].duration == 50
+
+    # snap_scan_table is the shared helper used by the GUI; DAC slots round to an
+    # integer code, time slots snap to the tick grid.
+    dac_slot = ScanSlot(kind="dac", target="da_dipole@0", unit="value")
+    time_slot = ScanSlot(kind="delay", target="trig", unit="ns")
+    snapped_rows = snap_scan_table([[51.0, 512.4], [9.0, 800.6]], [time_slot, dac_slot], time_step_ns=20)
+    assert snapped_rows == [[60.0, 512.0], [0.0, 801.0]]
+
+
+def test_timing_payload_to_dict_snaps_pulse_table():
+    from Zou_lab_control.neutral_atom.devices.sequencer import timing_payload_to_dict
+
+    state = na.PulseTableState(
+        channels=["trap", "trig"],
+        periods=[na.PulsePeriod(50, (1, 0), unit="ns"), na.PulsePeriod(120, (0, 1), unit="ns")],
+        time_step_ns=20,
+    )
+    payload = timing_payload_to_dict(state)
+    # the transferred pulse-API payload carries snapped whole-tick durations (50 -> 60)
+    assert payload["periods"][0]["duration"] == 60
+    assert payload["periods"][1]["duration"] == 120
+
+
+def test_axi_session_burst_coalesces_contiguous_and_preserves_order(tmp_path):
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+
+    s = VivadoAxiStreamerSession(state_dir=tmp_path, tcl_executor=lambda *a: "ok\n", burst_max=4)
+    # an address-contiguous run is coalesced and split at burst_max (4): 6 words -> 4+2
+    pending = [(0x40 + 4 * i, i) for i in range(6)]
+    assert s._burst_runs(pending) == [(0x40, [0, 1, 2, 3]), (0x50, [4, 5])]
+    # an order-dependent same-address sequence (COMMAND 0 then cmd) must NOT be merged
+    # or reordered -- it stays two len-1 writes in order.
+    assert s._burst_runs([(0x4, 0), (0x4, 2)]) == [(0x4, [0]), (0x4, [2])]
+    # non-contiguous addresses stay separate len-1 writes
+    assert s._burst_runs([(0x0, 9), (0x10, 8)]) == [(0x0, [9]), (0x10, [8])]
+    # the burst Tcl encodes one INCR transaction whose data round-trips to the SAME
+    # words at consecutive addresses (writer/decoder agree on the high-addr-first order)
+    lines = s._write_burst_tcl(0x40, [0xAA, 0xBB, 0xCC])
+    text = "\n".join(lines)
+    assert "-len 3 -type write" in text and text.count("run_hw_axi") == 1
+    assert _decode_axi_writes(text) == [(16, 0xAA), (17, 0xBB), (18, 0xCC)]
+
+
+def test_axi_session_self_test_catches_scrambled_burst(tmp_path):
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+
+    class Hw:
+        def __init__(self, scramble=False):
+            self.bram = {}; self.scramble = scramble
+        def __call__(self, lines, action, timeout):
+            text = "\n".join(lines)
+            writes = _decode_axi_writes(text)
+            if self.scramble and len(writes) > 1:   # simulate wrong burst data ordering
+                addrs = [w for w, _ in writes]; vals = [v for _, v in writes]
+                writes = list(zip(addrs, list(reversed(vals))))
+            for w, v in writes:
+                self.bram[w] = v
+            m = re.search(r"-address ([0-9A-Fa-f]+) -len 1 -type read", text)
+            if m:
+                return f"ZLCDATA {self.bram.get(int(m.group(1), 16) // 4, 0):08X}\n"
+            return "ok\n"
+
+    good = VivadoAxiStreamerSession(state_dir=tmp_path, tcl_executor=Hw(scramble=False))
+    assert good.axi_self_test(count=8) is True
+    bad = VivadoAxiStreamerSession(state_dir=tmp_path, tcl_executor=Hw(scramble=True))
+    with pytest.raises(RuntimeError):
+        bad.axi_self_test(count=8)
+
+
 def test_pulse_sequence_clock_validation_rejects_off_tick_edges():
     seq = na.PulseSequence(name="off_grid").pulse("trap", 0.0, 25e-9)
     report = seq.validate(clock_hz=100e6, channels=["trap"])
@@ -2865,6 +2988,10 @@ def test_sequencer_server_jtag_axi_backend_warm_starts_axi_session(tmp_path, mon
             events.append("start")
             return self
 
+        def axi_self_test(self, **kwargs):
+            events.append("self_test")
+            return True
+
         def prepare(self, program):
             events.append("prepare")
 
@@ -2896,7 +3023,9 @@ def test_sequencer_server_jtag_axi_backend_warm_starts_axi_session(tmp_path, mon
         warm_start=True,
     )
 
-    assert events[:3] == ["init:state_loader:clk=50000000", "start", "serve:127.0.0.1:18861"]
+    # warm start: construct -> start the Vivado session -> AXI burst self-test (fail-fast
+    # bring-up check) -> serve.
+    assert events[:4] == ["init:state_loader:clk=50000000", "start", "self_test", "serve:127.0.0.1:18861"]
     assert service is not None
 
 
@@ -2927,11 +3056,7 @@ class _FakeStreamerHardware:
             STATUS_LOADED, STATUS_RUNNING, STATUS_DONE,
         )
         text = "\n".join(lines)
-        for addr_hex, data_hex in re.findall(
-            r"-address ([0-9A-Fa-f]+) -data ([0-9A-Fa-f]+) -len 1 -type write", text
-        ):
-            word = int(addr_hex, 16) // 4
-            value = int(data_hex, 16)
+        for word, value in _decode_axi_writes(text):
             self.bram[word] = value
             if word == CtrlWords.BANK_READY and self.fired:
                 self.bank_ready_writes.append(value)
