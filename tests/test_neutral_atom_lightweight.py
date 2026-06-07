@@ -527,6 +527,14 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     assert "zlc_force_latency2" in create_tcl              # forced edge-BRAM read latency 2
     assert "ZLC_PS_XDC" in create_tcl
     assert legacy_xdc_env not in create_tcl
+    # BRAM IP enable-pin contract (the build is blind -- no Verilog sim in CI). The
+    # top drives BOTH .ena and .enb on every BRAM, so each IP must expose BOTH
+    # enable pins. A drift to Enable_B {Always_Enabled} drops the enb port and synth
+    # dies with "named port connection 'enb' does not exist". Keep ena/enb symmetric.
+    assert ".ena(" in top and ".enb(" in top
+    assert "Always_Enabled" not in create_tcl
+    assert create_tcl.count("Enable_A {Use_ENA_Pin}") == 5   # all 5 BRAMs expose ENA
+    assert create_tcl.count("Enable_B {Use_ENB_Pin}") == 5   # ...and ENB (top drives both)
     assert "set top zlc_pulse_streamer_top" in program_tcl
     assert "ps.runs" in program_tcl
     assert "pulse_streamer.runs" not in program_tcl

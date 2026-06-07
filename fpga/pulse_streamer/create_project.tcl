@@ -151,7 +151,7 @@ zlc_try "tick WDA"      {set_property CONFIG.Write_Depth_A $zlc_max_edges [get_i
 zlc_try "tick WWB=32"   {set_property CONFIG.Write_Width_B {32} [get_ips blk_mem_gen_edge_tick]}
 zlc_try "tick RWB=32"   {set_property CONFIG.Read_Width_B {32} [get_ips blk_mem_gen_edge_tick]}
 zlc_try "tick ENA"      {set_property CONFIG.Enable_A {Use_ENA_Pin} [get_ips blk_mem_gen_edge_tick]}
-zlc_try "tick ENB"      {set_property CONFIG.Enable_B {Always_Enabled} [get_ips blk_mem_gen_edge_tick]}
+zlc_try "tick ENB"      {set_property CONFIG.Enable_B {Use_ENB_Pin} [get_ips blk_mem_gen_edge_tick]}
 zlc_try "tick noRSTA"   {set_property CONFIG.Use_RSTA_Pin {false} [get_ips blk_mem_gen_edge_tick]}
 zlc_try "tick noRSTB"   {set_property CONFIG.Use_RSTB_Pin {false} [get_ips blk_mem_gen_edge_tick]}
 zlc_force_latency2 blk_mem_gen_edge_tick
@@ -169,7 +169,7 @@ zlc_try "coeff WDA"     {set_property CONFIG.Write_Depth_A $zlc_coeff_porta_dept
 zlc_try "coeff WWB=64"  {set_property CONFIG.Write_Width_B $zlc_coeff_portb_bits [get_ips blk_mem_gen_edge_coeff]}
 zlc_try "coeff RWB=64"  {set_property CONFIG.Read_Width_B $zlc_coeff_portb_bits [get_ips blk_mem_gen_edge_coeff]}
 zlc_try "coeff ENA"     {set_property CONFIG.Enable_A {Use_ENA_Pin} [get_ips blk_mem_gen_edge_coeff]}
-zlc_try "coeff ENB"     {set_property CONFIG.Enable_B {Always_Enabled} [get_ips blk_mem_gen_edge_coeff]}
+zlc_try "coeff ENB"     {set_property CONFIG.Enable_B {Use_ENB_Pin} [get_ips blk_mem_gen_edge_coeff]}
 zlc_try "coeff noRSTA"  {set_property CONFIG.Use_RSTA_Pin {false} [get_ips blk_mem_gen_edge_coeff]}
 zlc_try "coeff noRSTB"  {set_property CONFIG.Use_RSTB_Pin {false} [get_ips blk_mem_gen_edge_coeff]}
 zlc_force_latency2 blk_mem_gen_edge_coeff
@@ -187,7 +187,7 @@ zlc_try "mask WDA"      {set_property CONFIG.Write_Depth_A $zlc_mask_porta_depth
 zlc_try "mask WWB=64"   {set_property CONFIG.Write_Width_B $zlc_mask_portb_bits [get_ips blk_mem_gen_edge_mask]}
 zlc_try "mask RWB=64"   {set_property CONFIG.Read_Width_B $zlc_mask_portb_bits [get_ips blk_mem_gen_edge_mask]}
 zlc_try "mask ENA"      {set_property CONFIG.Enable_A {Use_ENA_Pin} [get_ips blk_mem_gen_edge_mask]}
-zlc_try "mask ENB"      {set_property CONFIG.Enable_B {Always_Enabled} [get_ips blk_mem_gen_edge_mask]}
+zlc_try "mask ENB"      {set_property CONFIG.Enable_B {Use_ENB_Pin} [get_ips blk_mem_gen_edge_mask]}
 zlc_try "mask noRSTA"   {set_property CONFIG.Use_RSTA_Pin {false} [get_ips blk_mem_gen_edge_mask]}
 zlc_try "mask noRSTB"   {set_property CONFIG.Use_RSTB_Pin {false} [get_ips blk_mem_gen_edge_mask]}
 zlc_force_latency2 blk_mem_gen_edge_mask
@@ -205,7 +205,7 @@ zlc_try "scan WDA"      {set_property CONFIG.Write_Depth_A $zlc_scan_porta_depth
 zlc_try "scan WWB=128"  {set_property CONFIG.Write_Width_B $zlc_scan_portb_bits [get_ips blk_mem_gen_scan]}
 zlc_try "scan RWB=128"  {set_property CONFIG.Read_Width_B $zlc_scan_portb_bits [get_ips blk_mem_gen_scan]}
 zlc_try "scan ENA"      {set_property CONFIG.Enable_A {Use_ENA_Pin} [get_ips blk_mem_gen_scan]}
-zlc_try "scan ENB"      {set_property CONFIG.Enable_B {Always_Enabled} [get_ips blk_mem_gen_scan]}
+zlc_try "scan ENB"      {set_property CONFIG.Enable_B {Use_ENB_Pin} [get_ips blk_mem_gen_scan]}
 zlc_try "scan noRSTA"   {set_property CONFIG.Use_RSTA_Pin {false} [get_ips blk_mem_gen_scan]}
 zlc_try "scan noRSTB"   {set_property CONFIG.Use_RSTB_Pin {false} [get_ips blk_mem_gen_scan]}
 zlc_force_latency2 blk_mem_gen_scan
@@ -220,7 +220,7 @@ zlc_try "busimg ByteSize8" {set_property CONFIG.Byte_Size {8} [get_ips blk_mem_g
 zlc_try "busimg WWA=32" {set_property CONFIG.Write_Width_A {32} [get_ips blk_mem_gen_busimg]}
 zlc_try "busimg WDA=2048" {set_property CONFIG.Write_Depth_A {2048} [get_ips blk_mem_gen_busimg]}
 zlc_try "busimg ENA"    {set_property CONFIG.Enable_A {Use_ENA_Pin} [get_ips blk_mem_gen_busimg]}
-zlc_try "busimg ENB"    {set_property CONFIG.Enable_B {Always_Enabled} [get_ips blk_mem_gen_busimg]}
+zlc_try "busimg ENB"    {set_property CONFIG.Enable_B {Use_ENB_Pin} [get_ips blk_mem_gen_busimg]}
 zlc_try "busimg noRSTA" {set_property CONFIG.Use_RSTA_Pin {false} [get_ips blk_mem_gen_busimg]}
 zlc_try "busimg noRSTB" {set_property CONFIG.Use_RSTB_Pin {false} [get_ips blk_mem_gen_busimg]}
 zlc_dump_ip blk_mem_gen_busimg
