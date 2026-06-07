@@ -80,12 +80,12 @@ Default real-hardware path (the only one hardware tutorials should use):
 control/qCMOS computer
   -> RemoteSequencer.prepare/fire/wait_done (RPyC)
   -> SequencerService on FPGA/Vivado computer (fpga\run_server.bat)
-  -> fpga_pulse_streamer persistent Vivado-session backend
-  -> Vivado/VIO upload of ticks/masks/coeffs/scan_points/bus_segments
-  -> zlc_pulse_streamer_top_address_switch.bit on the FPGA
+  -> VivadoAxiStreamerSession (persistent Vivado hw_axi / JTAG-to-AXI)
+  -> axi_bram_ctrl: pack + upload BRAM image (edges/scan/bus) + CTRL mailbox
+  -> zlc_pulse_streamer_top.bit on the FPGA (edge-table engine)
 ```
 
-The FPGA side infers the full hardware contract from the address-switch XDC
+The FPGA side infers the full hardware contract from the board XDC
 (`references\source_archives\address_switch\address_switch.srcs\constrs_1\new\addre.xdc`,
 62 controllable outputs, fallback `ch00..ch61`). GUI visibility is a view
 operation only; the server always pads to full hardware width and zeros
@@ -102,17 +102,20 @@ Key fixed facts:
   `ch03 probe (N15)`, `ch11 emCCD (M13)`.
 - Four 10-bit analog buses: `da_dipole`, `da_bias_y`, `da_bias_x`, `da_bias_z`.
 
-`prepare` holds reset high, writes rows via `prog_we` toggle, releases reset; it
-does not start. `fire` sends an explicit `start` low-high-low; only the
-synchronized rising edge is a start event. After that, the FPGA clock owns edge
-timing. `wait_done` polls `done`; `safe_state` resets outputs.
+`prepare` drives SAFE, packs + uploads the BRAM image over JTAG-to-AXI, arms the
+scan banks, then drives LOAD (rising-edge COMMAND, waits `STATUS_LOADED`); it does
+not start. `fire` drives FIRE; only the synchronized rising edge is a start event.
+After that, the FPGA clock owns edge timing. `wait_done` polls `STATUS` (and
+stream-refills the freed scan bank behind `CURSOR` for streamed scans);
+`safe_state` drives SAFE. The COMMAND word is cleared to 0 before each command for
+a clean rising edge.
 
-Differential upload: after one successful prepare with the same channel order
-and clock, later prepares rewrite only changed edge rows, changed scan points,
-and the shadow-critical rows `0`, `loop_start_index`, and the final row.
-
-The historical `legacy_address_switch` module remains for comparison only. Do
-not make it the default path in tutorials.
+Streaming refill: for scans larger than the resident 2-bank window the host
+refills the freed bank behind the cursor with the next chunk; the engine only
+advances into a bank when `BANK_READY` AND that bank holds the right chunk, so a
+late refill STALLs (`STATUS_UNDERFLOW`), never a wrong point. `repeat_forever`
+re-sweeps a streamed scan via a host background refill thread; the inter-sweep
+seam is a brief safe hold.
 
 ## 4. N-Slot Scan Model (current design)
 
@@ -128,15 +131,19 @@ This replaced the old `x`/`y` affine scan. **There is no more `x`/`y` notion.**
   code for `dac` slots).
 - Host compiles to an affine edge template plus a streamed scan-point table:
   `compile_pulse_table_scan_runtime_program` (sequencer.py). The FPGA evaluates
-  `effective_tick = base + (sum_j coeff_j * slot_j) >> COEFF_FRAC_BITS` and
+  `effective_tick = base + (sum_j coeff_j * slot_j) >>> COEFF_FRAC_BITS` and
   iterates scan points seamlessly. `RuntimeSequenceProgram` schema carries
   `slot_count/slot_kinds/tick_slot_coeffs/loop_end_slot_coeffs/scan_points/
   scan_coeff_frac_bits` plus ticks/masks/bus_segments.
 - Time expressions in durations/delays may only be affine in slots (numbers,
   `s0..`, `+ - * /`, parentheses); the compiler rejects non-affine scan timing.
-- The compiler rejects a scan if edge ordering would change across scan points;
-  split into chunks or prepare one pulse per point. `dac` slots cannot currently
-  share an upload with the analog-bus segment path.
+- Duration, delay, and DAC value can scan in any combination and seamlessly: the
+  analog-bus segments carry affine start/stop ticks (same `effective_tick`) and a
+  dual `value_select` so a ramp can scan BOTH endpoints (scanned-A -> scanned-B)
+  and an edge/hold segment can track a scanned DAC code.
+- The host validates global effective-tick monotonicity before upload
+  (`validate_pulse_streamer_program`); a scan that reorders the merged edges is
+  rejected, not silently dropped.
 
 Anti-patterns: do not expand a scan grid into many GUI columns or many prepared
 pulse tables when one ordered `scan_table` describes it; do not re-introduce
@@ -225,164 +232,121 @@ logic cells: 33,280   CLB LUTs: 20,800   CLB FFs: 41,600
 BRAM: 1,800 Kb (50 x 36 Kb)   DSP: 90
 ```
 
-RTL: `fpga/pulse_streamer/zlc_pulse_streamer.v` (core, `parameter NUM_SLOTS`,
-`COEFF_FRAC_BITS=8`) and `zlc_pulse_streamer_top_address_switch.v` (top,
-`NUM_SLOTS=4`, 62 channels + 4x10-bit DAC buses + VIO). Python generator,
-validator, and Tcl are in
-`Zou_lab_control/neutral_atom/devices/fpga_pulse_streamer.py`.
+RTL: `fpga/pulse_streamer/zlc_edge_streamer.v` (the engine, `parameter NUM_SLOTS`,
+`COEFF_FRAC_BITS=8`, `RD_LAT=2`, `FIFO_DEPTH=3`) and
+`zlc_pulse_streamer_top.v` (top, `NUM_SLOTS=4`, 62 channels + 4x10-bit DAC buses,
+`axi_bram_ctrl` + CTRL regfile + region-decoded BRAMs, no VIO). The host-side
+image packer + cycle-accurate engine model are in `fpga/pulse_streamer/host/`
+(`image.py`, `engine_model.py`); `infer_xdc_*` + `validate_pulse_streamer_program`
+stay in `Zou_lab_control/neutral_atom/devices/fpga_pulse_streamer.py`.
 
-Default profile: `CHANNEL_COUNT=62`, `MAX_EDGES=1024`, `MAX_SCAN_POINTS=1024`,
-`NUM_SLOTS=4`, `TICK_WIDTH=32`, `COEFF_WIDTH=16`, `COEFF_FRAC_BITS=8`,
-`CLOCK_HZ=50e6`, `RESOURCE_TARGET=70%`. Big tables (`tick_mem`, `mask_mem`,
-`coeff_mem`, `scan_value_mem`) are `ram_style="distributed"` (LUTRAM) because the
-run path uses async single-row reads. To shrink on the 35T: lower `MAX_EDGES` /
-`MAX_SCAN_POINTS`, or migrate the big tables to a BRAM-friendly synchronous-read
-pipeline. Vivado `report_utilization`/`report_timing_summary` are the final
-authority; the Python/Tcl estimate is only a budget guide.
+Default profile (from `host.image.StreamerParams` / `solve_capacity` on the 35T):
+`CHANNEL_COUNT=62`, `MAX_EDGES=4096`, `BANK_SIZE=2048` (4096 resident scan points,
+UNBOUNDED via streaming), `NUM_SLOTS=4`, `TICK_WIDTH=32`, `COEFF_WIDTH=16`,
+`COEFF_FRAC_BITS=8`, `RD_LAT=2`, `FIFO_DEPTH=3`, `CLOCK_HZ=50e6`. The edge tables
+live in three parallel block RAMs (tick 32b / coeff 64b / mask 62b, forced
+`READ_LATENCY_B=2`); the scan window is one BRAM; the bus segment tables stay in
+LUTRAM (distributed) because the bus/ramp engine reads them combinationally each
+tick. Vivado `report_utilization`/`report_timing_summary` are the final authority;
+the Python estimate is a budget guide (RAMB36 78%, LUT 26%, FF 12%, DSP 9%).
 
-Packed VIO probe contract for `NUM_SLOTS=4` (27 `probe_out`, 2 `probe_in`):
-`prog_tick_coeffs = 64b`, `scan_prog_values = 128b`, `loop_end_coeffs = 64b`.
-The full table is in the FPGA manual; keep it in sync with the top wrapper's
-`vio_0` instantiation.
+The minimal pulse width AND resolution is **1 tick (20 ns)**: a depth-`FIFO_DEPTH`
+(=`RD_LAT`+1=3) continuous edge prefetch hides the 2-cycle BRAM read latency, so
+back-to-back 1-tick edges fire one per clock. Four gapless reload sites
+(start / loop-rewind / scan-advance / repeat) reseed the FIFO with `FIFO_DEPTH`
+shadows at every boundary, so the last edge of point k and the first edge of point
+k+1 are adjacent with no gap. Cycle behavior is proven by
+`host.engine_model.rtl_mirror_play == reference_play` at read latency 1/2/3 + 200
+fuzz programs (no Verilog simulator in repo).
 
 Build/program workflow on the Vivado computer:
 
 ```powershell
-fpga\build_and_program.bat --check     # no-board HDL/VIO width + capacity self-check
-fpga\build_and_program.bat             # build + program
+fpga\build_and_program.bat --check     # no-board HDL synth + capacity self-check
+fpga\build_and_program.bat             # build + program (create_project.tcl -> program_fpga.tcl)
 fpga\run_server.bat --check-config     # print resolved project/bit/ltx/xdc/clock/capacity
-fpga\run_server.bat                     # start persistent server
+fpga\run_server.bat                     # start persistent server (jtag-axi backend)
 ```
 
-Configurable before build: `ZLC_PS_RESOURCE_TARGET_PCT`, `ZLC_PS_MAX_EDGES`,
-`ZLC_PS_MAX_SCAN_POINTS`, `ZLC_PS_XDC`, `ZLC_PS_VIVADO_BIN`. Vivado 2019 debug
-cores are path-length sensitive — keep the checkout short (`D:\ZLC`). The
-printed `ZLC build root` / `ZLC project dir` are the source of truth for
-`.xpr/.bit/.ltx`; the default project is `fpga\build\address_switch`.
+Configurable before build: `ZLC_PS_XDC`, `ZLC_PS_VIVADO_BIN`, `ZLC_PS_CLOCK_HZ`.
+Capacity is fixed by `host.image.solve_capacity` (no per-build override). Vivado
+2019 debug cores are path-length sensitive — keep the checkout short (`D:\ZLC`).
+The printed `ZLC build root` / `ZLC project dir` are the source of truth for the
+generated `impl_1\zlc_pulse_streamer_top.{bit,ltx}`; the default project is
+`fpga\build\pulse_streamer`.
 
-### Edge-table loader over JTAG-to-AXI (current architecture)
+### Edge-table engine + JTAG-to-AXI streaming (the one design)
 
-The board target is the **validated affine edge-table engine**
-(`fpga/pulse_streamer/zlc_pulse_streamer.v`) driven over **JTAG-to-AXI** by an
-on-chip **program loader** (`zlc_axi_program_loader.v`).  This replaces the
-short-lived per-channel run-length detour, which was **discarded**: on a single
-BRAM read port, re-arming 62 channel players at every repeat/scan boundary costs
-~23.6 us and cannot be seamless for short passes.  The global edge-table engine
-has ONE edge pointer, so repeat = single-cycle pointer/shadow reload and
-scan-point advance = single-cycle slot-vector reload -> both gapless, and it is
-*cheaper* in LUTs (one comparator + one affine MAC, not 62 players).  This
-matches how real pulse streamers are built (Swabian = one global RLE instruction
-stream + hardware loop; SpinCore PulseBlaster = one global instruction stream +
-LOOP opcodes).
+There is ONE design, no variants, no backward compat. The board target is the
+global affine **edge-table engine** (`fpga/pulse_streamer/zlc_edge_streamer.v`),
+fed over **JTAG-to-AXI**: the host packs the program into a BRAM image and writes
+it through an `axi_bram_ctrl`; a CTRL register-file mailbox carries
+COMMAND/STATUS + the streaming handshake. The engine has ONE edge pointer, so a
+repeat / loop-rewind / scan-advance is a single-cycle pointer + shadow reload
+(gapless), and it is cheap in LUTs (one comparator + one affine MAC, not per-
+channel players). This matches how real pulse streamers are built (Swabian = one
+global RLE stream + hardware loop; SpinCore PulseBlaster = one global instruction
+stream + LOOP opcodes).
 
-Why a loader instead of changing the engine: the engine is byte-for-byte the
-already-validated, host<->RTL tick-verified `zlc_pulse_streamer.v` (seamless loop
-at lines ~470-475, single-cycle scan-point advance at ~477-493, N-slot affine
-`zlc_effective_tick`, DAC-value scan via bus `value_select`).  Instead of VIO
-probes, the loader copies the program out of the AXI BRAM into the engine's
-`prog_*`/`scan_prog_*`/`bus_prog_*` ports (the engine's own write contract:
-toggle `prog_we` while reset is held; shadow regs latch from `prog_count`/
-`loop_start_addr` during writes), releases reset, and pulses start.  The gapless
-behaviour and tick-exactness therefore carry over unchanged; only the *delivery*
-of the tables changed.
+**1-tick prefetch.** The edge table is three parallel block RAMs (tick 32b /
+coeff 64b / mask 62b, forced `READ_LATENCY_B=2` so `RD_LAT=2` is deterministic).
+A depth-`FIFO_DEPTH` (=`RD_LAT`+1=3) continuous prefetch issues one BRAM read per
+cycle and an "arm" FIFO holds the next edges, reseeded with `FIFO_DEPTH` shadows
+at every boundary; that hides the 2-cycle latency so back-to-back 1-tick (20 ns)
+edges fire one per clock. Four gapless reload sites: start / loop-rewind /
+scan-advance / repeat.
 
-**Pieces (all in-repo, all Python-verified pre-hardware):**
+**Unbounded streaming scan.** The scan window is a 2-bank ping-pong
+(`BANK_SIZE`=2048 pow2 -> 4096 resident points) in one BRAM. The engine plays
+point 0..N-1, addressing bank `(idx/BANK_SIZE)%2`, exposes `CURSOR`, and the host
+refills the freed bank behind the cursor with the next chunk. The `BANK_READY` +
+`BANK*_CHUNK` handshake means the engine only advances when the bank is ready AND
+holds the right chunk, so a late refill STALLs (hold, `STATUS_UNDERFLOW`), never a
+wrong point. `repeat_forever` re-sweeps a streamed scan via a host background
+refill thread; within a sweep it is gapless, the inter-sweep seam is a brief safe
+hold.
 
-- **Image layout / packer (`devices/edgetable_image.py`).** Packs a
-  `RuntimeSequenceProgram` into 32-bit BRAM words: a CTRL block (magic, COMMAND/
-  STATUS mailbox, prog_count, scan_count, loop_*, bus_counts, slot_count) at
-  offset 0, then the EDGE table (tick + N-slot coeffs + 62-bit mask, 5 words/edge),
-  SCAN-point table (N_slots words/point), and per-bus BUS-segment table (affine
-  start/stop ticks + coeffs + value/mode/value_select, 7 words/seg).  Only used
-  rows are emitted (sparse), so a typical program is a few hundred words.  Region
-  bases are fixed at the maxima (1024 edges / 1024 points / 4x64 bus segs); total
-  span ~11040 words << the 32768-word (32/50 RAMB36) program BRAM.
-  `unpack_program` is the loader-walk decoder; `pack->unpack == program` is the
-  contract (test `test_edgetable_image_*`).
-- **Loader FSM (`zlc_axi_program_loader.v`).** Sequential, NOT timing-critical
-  (runs at prepare).  Polls COMMAND (rising-edge detected: LOAD/FIRE/SAFE/RESET),
-  on LOAD walks the image exactly like `unpack_program` and drives the engine's
-  toggle-write ports (holding each row stable, settling each BRAM read for
-  latency 1 OR 2), then on FIRE releases reset + pulses start, writing STATUS
-  (LOADED/RUNNING/DONE/ERROR) back to BRAM for the host to poll.  A
-  `repeat_forever` program never asserts DONE, so the FSM keeps polling commands
-  (so SAFE/RESET/LOAD still work while it runs forever).  RTL constants are
-  contract-tested against `edgetable_image` (`test_edgetable_loader_rtl_constants_*`).
-- **Loader co-sim (`devices/edgetable_loader_model.py`).** No Verilog simulator in
-  repo, so the loader FSM is mirrored cycle-accurately in Python and its captured
-  engine writes are checked to reconstruct the decoded image
-  (`test_edgetable_loader_fsm_cosim_reconstructs_program`, incl. a 200-edge stress
-  + no-scan/no-bus cases).  This is the pre-hardware proof the new sequencer walks
-  edges/scan/bus in the right order with correct addresses + field slices.
-- **Top (`zlc_pulse_streamer_loader_top.v`).** `jtag_axi_0` -> `axi_bram_ctrl_0`
-  (AXI4-Lite, single-port-BRAM, BMG EXTERNAL) -> `blk_mem_gen_0` (TDP): port A =
-  AXI image upload + mailbox, port B = loader.  Loader -> engine; engine `out`
-  (62) + `bus_out` (40, DACs now real) -> the exact 62-pin address_switch board
-  map.  Build = `create_project_loader.tcl` (strict 32768 BRAM depth + readback
-  guard, short project name `l` for the Vivado path-length fix);
-  `program_fpga_loader.tcl` leaves the jtag_axi core discoverable as a `hw_axi`.
+**Pieces (all in-repo, all Python-verified pre-hardware, no Verilog sim):**
+
+- **Image layout / packer + capacity (`fpga/pulse_streamer/host/image.py`).**
+  Single source of truth for the host<->FPGA AXI write contract AND the geometry
+  the RTL localparams + create-project tcl derive from. `pack_program` lays out a
+  CTRL regfile (magic, COMMAND/STATUS mailbox, scalars, `CURSOR`, `BANK_READY`,
+  `BANK*_CHUNK`) + TICK/COEFF/MASK edge BRAMs (read in parallel) + the 2-bank SCAN
+  window + the BUS segment image; `unpack_program` is the decoder; `pack->unpack ==
+  program` is the round-trip contract. `solve_capacity(part, channel_count)`
+  re-derives `max_edges`/`bank_size`/addr widths from the part's RAMB36/LUT budget
+  at `<=target_pct` (default 90); the 35T resolves to **4096 edges + bank_size 2048
+  (4096 resident) + UNBOUNDED streaming, RAMB36 78%**.
+- **Engine model (`fpga/pulse_streamer/host/engine_model.py`).** Cycle-accurate
+  Python mirror. `rtl_mirror_play == reference_play` at read latency 1/2/3 + 200
+  fuzz programs proves the 1-tick prefetch; `streaming_scan_play` proves the 2-bank
+  ping-pong + late-refill STALL; `bus_play` proves the bus/ramp engine incl.
+  scanned ramp endpoints. This is the pre-hardware proof (no Verilog simulator is
+  in the repo).
+- **Top (`zlc_pulse_streamer_top.v`).** `jtag_axi` -> `axi_bram_ctrl` -> region-
+  decoded BRAMs (3 parallel edge + scan + bus image) + CTRL regfile, driving the
+  engine; engine `out` (62) + `bus_out` (4x10b DACs) go to the board pins.
+  `create_project.tcl` builds it (`zlc_force_latency2` forces the edge BRAMs to
+  `READ_LATENCY_B=2`); `program_fpga.tcl` leaves the `jtag_axi` core discoverable
+  as a `hw_axi`. Structure is contract-tested (`test_final_top_regions_match_image_*`).
 - **Host session (`devices/axi_session.py :: VivadoAxiStreamerSession`).** One
-  persistent `vivado -mode tcl`; `prepare` packs + uploads the image then drives
-  LOAD (waits STATUS_LOADED); `fire` drives FIRE; `wait_done` polls STATUS_DONE
-  (treats RUNNING as success for repeat_forever); `safe_state` drives SAFE.  The
-  COMMAND mailbox always writes 0 before a command for a clean rising edge.  The
-  Tcl executor is injectable, so the full pack->upload->loader-model->LOAD->fire
-  flow is unit-tested without Vivado (`test_vivado_axi_session_*`).  `run_server.bat`
-  default backend is `jtag-axi`; `build_and_program.bat` builds + programs the
-  loader bitstream (project `fpga/build/l`).
+  persistent `vivado -mode tcl` hw_axi session. `prepare` SAFE + pack + upload +
+  arm banks + LOAD (waits `STATUS_LOADED`); `fire` FIRE (and starts the background
+  refill thread for streamed/repeat scans); `wait_done` polls STATUS and refills
+  the freed bank behind `CURSOR`; `safe_state` SAFE. COMMAND is cleared to 0
+  before each command for a clean rising edge. The Tcl executor is injectable, so
+  the full pack -> upload -> LOAD -> fire -> stream flow is unit-tested without
+  Vivado (`test_vivado_axi_session_*`). `run_server.bat` default backend is
+  `jtag-axi`; `build_and_program.bat` builds + programs the bitstream (project
+  `fpga/build/pulse_streamer`).
 
-**Capacity (35T, current build):** 62 digital + 4x10-bit DAC; 20 ns tick;
-NUM_SLOTS=4 affine slots (delay/duration/DAC any combination); up to 1024 edges +
-1024 scan points in the LUTRAM engine tables (the image BRAM holds far more).
-on_pulse -> first output = 1 clock (20 ns); the <100 ms budget is upload-only, and
-re-firing an already-loaded program is a few control writes.  Bigger edge/point
-counts (BRAM-resident engine tables + a 1-edge prefetch pipeline, and burst /
-AXI4-full upload to keep a cold load < 100 ms) are the documented v-next; the
-current single-beat upload is correct but ~sub-second for a few-hundred-word cold
-load, then unlimited fast re-fires.
-
-**Removed (no legacy residue):** `zlc_runlength_engine.v`,
-`zlc_pulse_streamer_runlength{,_top}.v`, `create_project_runlength.tcl`,
-`program_fpga_runlength.tcl`, and the per-channel host modules `devices/runlength.py`,
-`devices/axi_map.py`, `devices/axi_transport.py`.  The VIO edge-table path
-(`zlc_pulse_streamer_top_address_switch.v` + `VivadoPulseStreamerSession`,
-`--backend vivado-session`) is kept as an alternate way to drive the *same* engine.
-
-### Architecture-D: BRAM tables + depth-1 prefetch (2048 edges + 4096 points)
-
-The loader path is LUTRAM-bound (~1024 edges/points = the 35T's ~400 Kib
-distributed RAM).  To reach **2048 edges + 4096 scan points at <=75%** (the
-user's "②+④" goal), the **edge + scan tables move to BLOCK RAM** while the bus
-segment tables **stay in LUTRAM** (the bus/ramp engine reads them combinationally
-every tick — moving them to BRAM would break that).  This "D" choice was
-adversarially reviewed as optimal over moving the bus tables too.
-
-* **Engine `zlc_pulse_streamer_d.v`**: edge 0 comes from the `first` shadow
-  (instant), every later edge is a **depth-1 prefetch** read into `pre_*` (valid
-  `RD_SETTLE` cycles after edge_index advances).  Same-cycle fire (`cur` is a
-  register).  Cost: **min edge spacing = RD_SETTLE+1 = 3 ticks (60 ns)** — not a
-  core need (repeat/scan are still gapless), host-enforced.  *Proven* by the
-  cycle model `devices/edgetable_engine_model.py:prefetch_d1_play` == the
-  validated combinatorial `reference_play` for spacing >= 3, STALL otherwise
-  (`test_edgetable_d1_prefetch_*`, cross-checked vs an independent brute force).
-  A depth-(latency+1) FIFO variant (`prefetch_play`) is also proven for 1-tick
-  spacing if a future build wants it.
-* **Top `zlc_pulse_streamer_d_top.v`**: reuses the proven `axi_bram_ctrl` for the
-  AXI handshakes + a simple combinational write-address decoder to the asymmetric
-  edge BRAM (32b write / 256b read), scan BRAM (32b / 128b), bus-image BRAM, and
-  a CTRL regfile + bus mini-loader (copies the bus image into the engine LUTRAM).
-  Build `create_project_d.tcl` (defensive IP config), program `program_fpga_d.tcl`.
-* **Parameterisation `edgetable_image.solve_capacity(part, channel_count)`** is the
-  single source of truth: derives max_edges/max_scan_points/addr widths/BRAM
-  depths from the part's RAMB36/LUT budget at <=75%; 35T -> 2048 edges + 4096
-  points + 512 streaming window = 62% RAMB36.  Host: `pack_program_d` +
-  `VivadoAxiStreamerSession(variant="d")` (enforces min spacing); server
-  `ZLC_PS_VARIANT=d`; bats `set ZLC_PS_VARIANT=d` builds `fpga/build/d`.
-* **Status:** engine algorithm + capacity + host image round-trip + structural
-  contracts are Python-tested; the multi-BRAM AXI integration is BLIND (no
-  Verilog sim) and needs **on-board bring-up** (synth via create_project_d.tcl,
-  grep `ZLC IPDUMP`/`ZLC TRY-FAIL` to converge version-specific IP props, then
-  scope on the bench).  This is the standard no-sim RTL reality, not a shortcut.
+**Capacity (35T `xc7a35tfgg484-2`, target `<=90%`):** 62 digital + 4x10-bit DAC;
+20 ns tick (1-tick min width AND resolution); `NUM_SLOTS=4` affine slots
+(delay/duration/DAC value, any combination, seamless); **4096 edges + 4096
+resident scan points + UNBOUNDED streaming**; RAMB36 78% (LUT 26%, FF 12%, DSP
+9%) from `solve_capacity`. The bus segment tables are LUTRAM (distributed), not
+RAMB36, because the bus/ramp engine reads them combinationally each tick.
 
 ## 7. Building The Manuals
 
@@ -414,8 +378,9 @@ git diff --check
 A whole-framework review was done after the scan-redesign work. **Verdict: no
 large rewrite is warranted.** The layering (`devices` contract / `timing` truth
 / `core` algorithms / `subsystems` capability bundles / `views`+`frontend`
-plotting) is clean and the three backends share one session surface. The
-remaining items are targeted robustness/clarity improvements, not redesigns.
+plotting) is clean, and the virtual / command / jtag-axi sequencer paths share
+one prepare/fire/wait_done/safe_state surface. The remaining items are targeted
+robustness/clarity improvements, not redesigns.
 
 What is sound and should NOT be churned:
 - The `BaseDevice`/`CameraDevice`/`SequencerDevice`/`TrapArrayDevice` contract,

@@ -592,13 +592,14 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     assert "prepare" in maintainer_notes and "fire" in maintainer_notes
     assert "wait_done" in maintainer_notes and "safe_state" in maintainer_notes
     assert "prepare / fire / wait\\_done / safe\\_state" in main_manual_template
-    # The build/resource knob moved into the maintainer note + fpga README.
-    assert "ZLC_PS_RESOURCE_TARGET_PCT" in maintainer_notes
-    assert "ZLC_PS_RESOURCE_TARGET_PCT" in fpga_readme
-    # "address-switch" was the PROJECT_OVERVIEW keyword; it now anchors the new
-    # root README and the maintainer note.
-    assert "address-switch" in root_readme
-    assert "address-switch" in maintainer_notes
+    # Capacity is now fixed by the host image solver (no per-build env knob); the
+    # source of truth is named in the maintainer note + fpga README.
+    assert "solve_capacity" in maintainer_notes
+    assert "solve_capacity" in fpga_readme
+    # The FINAL transport (JTAG-to-AXI) anchors the new root README and the
+    # maintainer note (replacing the old VIO/address-switch control keyword).
+    assert "JTAG-to-AXI" in root_readme
+    assert "JTAG-to-AXI" in maintainer_notes
     assert "Run the smallest check" in tests_readme
     assert "Full `pytest -q` is reserved for broad handoff" in tests_readme
 

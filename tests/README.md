@@ -13,8 +13,8 @@ pytest -q tests\test_neutral_atom_lightweight.py -k "pulse or sequencer or qcmos
 # Control-computer readout scan through the RPyC RemoteSequencer JSON protocol
 pytest -q tests\test_neutral_atom_lightweight.py -k "remote_detection_time_scan_uses_bound_pulse_controller_over_json_protocol"
 
-# FPGA launcher/HDL/Tcl contracts without opening Vivado
-pytest -q tests\test_neutral_atom_lightweight.py -k "repo_vivado_entrypoint_contract or dry_run_uses_short_project_artifacts or xdc or differential_edge_upload"
+# FPGA launcher/HDL/Tcl contracts + host image packer + AXI session, without opening Vivado
+pytest -q tests\test_neutral_atom_lightweight.py -k "repo_vivado_entrypoint_contract or xdc or image_solver or top_regions or vivado_axi_session"
 
 # Frontend plotting, PDF rendering, notebook-template generation
 pytest -q tests\test_frontend_smoke.py -k "frontend or render_tex_pdf or notebook"
@@ -46,7 +46,7 @@ only when HDL/Tcl/XDC/batch behavior changed and a Vivado machine is available.
 cmd /c fpga\build_and_program.bat --help
 cmd /c fpga\run_server.bat --help
 
-# HDL/VIO width self-check; uses Vivado but not board pin constraints
+# HDL synth + capacity self-check; uses Vivado but not board pin constraints
 fpga\build_and_program.bat --check
 
 # Real hardware path; run only on the FPGA/Vivado computer
@@ -56,9 +56,9 @@ fpga\run_server.bat --check-config
 fpga\run_server.bat
 ```
 
-Do not use stale Vivado products from `fpga\pulse_streamer\build`.  Current
-scripts write to the printed project directory, normally `fpga\build\address_switch`, and
-ignore old `fpga\pulse_streamer\build` project, bitstream, and probes paths.
+The scripts write to the printed project directory, normally
+`fpga\build\pulse_streamer`; that printed path is the source of truth for the
+generated `impl_1\zlc_pulse_streamer_top.{bit,ltx}`.
 
 ## GUI Screenshot Checks
 

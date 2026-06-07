@@ -170,7 +170,7 @@ scan.summary(), fit_result, popt
 <!-- cell:markdown -->
 ## Save calibration, status, and Verilog
 
-当前 Verilog 生成的是轻量 edge-table module。它已经足够检查 timing/channel/tick，但还不是完整 address_switch register/VIO 体系。
+`write_verilog` 导出的是一个轻量 edge-table 片段，便于离线检查 timing/channel/tick。真实硬件上传走的是 host 把程序打包成 BRAM image、经 JTAG-to-AXI 写进 `zlc_pulse_streamer_top` 的路径(见 FPGA manual)。
 
 <!-- cell:code -->
 Path("results").mkdir(exist_ok=True)

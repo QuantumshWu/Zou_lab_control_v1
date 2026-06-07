@@ -4,79 +4,84 @@ Vivado Tcl and HDL sources for the neutral-atom runtime pulse streamer. The
 user-facing Windows entry points live one directory up (`fpga\build_and_program.bat`,
 `fpga\run_server.bat`).
 
-This is a short subsystem pointer. For the full design tutorial (RTL walk, the
-N-slot affine scan engine, the analog-bus DAC engine, the host compiler ->
-upload flow, resource budgets, and the v3 roadmap) see the **FPGA manual** in
+This is a short subsystem pointer. For the full design tutorial (the edge-table
+RTL walk, the 1-tick FIFO prefetch pipeline, the 2-bank streaming scan window,
+the affine N-slot scan engine, the analog-bus DAC engine, the JTAG-to-AXI host
+upload flow, and resource budgets) see the **FPGA manual** in
 `docs/fpga_manual/`.
 
 ## Files
 
-- `zlc_pulse_streamer.v`: runtime edge-table pulse-streamer core. Parameterized
-  by `NUM_SLOTS` (affine scan slots), `CHANNEL_COUNT`, `MAX_EDGES`,
-  `MAX_SCAN_POINTS`, `COEFF_FRAC_BITS`, and the analog-bus parameters.
-- `zlc_pulse_streamer_top_address_switch.v`: address-switch top wrapper and VIO
-  contract. `NUM_SLOTS=4`. Exposes the original XDC ports and maps them to the
-  core's `out[0..61]` mask bits plus four 10-bit DAC buses.
-- `create_project_address_switch.tcl`: create project + VIO IP, synth,
-  implement, write bitstream.
-- `program_fpga_address_switch.tcl`: program with the generated `.bit`/`.ltx`.
-- `check_address_switch_synth.tcl`: no-output-pin synthesis self-check.
+- `zlc_edge_streamer.v`: the engine. A global edge table held in three parallel
+  block RAMs (tick 32b / coeff 64b / mask 62b, forced `READ_LATENCY_B=2`), a
+  depth-`FIFO_DEPTH` (=`RD_LAT`+1=3) continuous edge prefetch that hides the BRAM
+  latency so back-to-back 1-tick (20 ns) edges fire one per clock, a 2-bank
+  ping-pong scan window (`BANK_SIZE`=2048, 4096 resident points) for unbounded
+  streamed scans, and the affine effective-tick MAC + analog-bus DAC engine.
+- `zlc_pulse_streamer_top.v`: top wrapper. Region-decoded BRAMs behind an
+  `axi_bram_ctrl` (edge tables + scan window + bus image) plus a CTRL register
+  file (the COMMAND/STATUS mailbox + streaming `CURSOR`/`BANK_READY`/`BANK*_CHUNK`
+  handshake), driving the engine and the board output pins / four 10-bit DAC
+  buses.
+- `create_project.tcl`: create project (jtag_axi + axi_bram_ctrl + 5 BRAMs),
+  `zlc_force_latency2` forces the edge BRAMs to `READ_LATENCY_B=2`, synth,
+  implement, write bitstream + probes.
+- `program_fpga.tcl`: program the device with the generated `.bit`/`.ltx`.
 - `diagnose_hw_target.tcl`: non-destructive hardware-target diagnostic.
+- `host/`: the host-side Python that the runtime uses --- `image.py` packs the
+  compiled program into the BRAM image and reports `solve_capacity`;
+  `engine_model.py` is the cycle-accurate behavioral model used by the contract
+  tests (no Verilog simulator is in the repo).
 
 ## Contract Summary
 
-Target FPGA is the Artix-7 35T `xc7a35tfgg484-2`. The default XDC is
+Target FPGA is the Artix-7 35T `xc7a35tfgg484-2`. The default board XDC is
 `references\source_archives\address_switch\...\addre.xdc` (62 outputs,
 `ch00..ch61`; `emCCD=ch11/M13`, `trig=ch06/R17`). The bitstream is fixed; every
-`On Pulse` uploads a fresh runtime table through the already-built VIO probes.
-One edge row means "at this absolute FPGA tick, set all outputs to this mask".
+`On Pulse` packs a fresh program image and uploads it over JTAG-to-AXI through
+`axi_bram_ctrl`, then drives the CTRL mailbox. One edge row means "at this
+absolute FPGA tick, set all outputs to this mask".
 
 Scans use named slots: each edge row stores a base tick plus `NUM_SLOTS`
 fixed-point coefficients, and the FPGA computes
-`effective_tick = base + (sum_j coeff_j * slot_j) >> COEFF_FRAC_BITS` while
-iterating the streamed scan-point table. Analog buses upload through a separate
-segment table (`bus_id, start_tick, stop_tick, start_value, stop_value, mode`)
-so a ramp costs one segment, not hundreds of TTL edge rows.
+`effective_tick = base + (sum_j coeff_j * slot_j) >>> COEFF_FRAC_BITS` while
+iterating the scan-point table. The scan window is a 2-bank ping-pong (the engine
+plays the resident points and exposes `CURSOR`; the host refills the freed bank
+with the next chunk under the `BANK_READY`/`BANK*_CHUNK` handshake), so the
+scan-point file is finite but unbounded. Analog buses upload through a separate
+LUTRAM segment table (`bus_id, start_tick, stop_tick, start_value, stop_value,
+mode`, plus dual `value_select` for scanned endpoints) so a ramp costs one
+segment, not hundreds of TTL edge rows.
 
-Default profile: `CHANNEL_COUNT=62`, `NUM_SLOTS=4`, `MAX_EDGES=1024`,
-`MAX_SCAN_POINTS=1024`, `TICK_WIDTH=32`, `COEFF_WIDTH=16`, `COEFF_FRAC_BITS=8`,
-`CLOCK_HZ=50 MHz`, `RESOURCE_TARGET=70%`. Vivado `report_utilization` is the
-final resource authority.
+Default profile (from `host.image.StreamerParams` / `solve_capacity` on the 35T):
+`CHANNEL_COUNT=62`, `NUM_SLOTS=4`, `MAX_EDGES=4096`, `BANK_SIZE=2048` (4096
+resident points), `TICK_WIDTH=32`, `COEFF_WIDTH=16`, `COEFF_FRAC_BITS=8`,
+`RD_LAT=2`, `FIFO_DEPTH=3`, `CLOCK_HZ=50 MHz` (20 ns tick). Vivado
+`report_utilization` is the final resource authority; the budgeted estimate is
+RAMB36 78% (LUT 26%, FF 12%, DSP 9%).
 
-## VIO Probe Contract (NUM_SLOTS=4)
+## CTRL Register-File Mailbox
+
+The host never bit-bangs probes; it reads and writes a small CTRL register file
+over `axi_bram_ctrl`. The mailbox words (see `host.image.CtrlWords`):
 
 ```text
-probe_out0  zlc_reset               width 1
-probe_out1  zlc_start               width 1
-probe_out2  zlc_prog_we             width 1
-probe_out3  zlc_prog_addr           width 10
-probe_out4  zlc_prog_tick           width 32
-probe_out5  zlc_prog_mask           width 62
-probe_out6  zlc_prog_count          width 11
-probe_out7  zlc_repeat_forever      width 1
-probe_out8  zlc_loop_start_addr     width 10
-probe_out9  zlc_loop_end_tick       width 32
-probe_out10 zlc_loop_count          width 32
-probe_out11 zlc_prog_tick_coeffs    width 64   (NUM_SLOTS*COEFF_WIDTH = 4*16)
-probe_out12 zlc_scan_enable         width 1
-probe_out13 zlc_scan_prog_we        width 1
-probe_out14 zlc_scan_prog_addr      width 10
-probe_out15 zlc_scan_prog_values    width 128  (NUM_SLOTS*TICK_WIDTH = 4*32)
-probe_out16 zlc_scan_count          width 11
-probe_out17 zlc_loop_end_coeffs     width 64   (NUM_SLOTS*COEFF_WIDTH = 4*16)
-probe_out18 zlc_bus_prog_we         width 1
-probe_out19 zlc_bus_prog_bus        width 2
-probe_out20 zlc_bus_prog_addr       width 6
-probe_out21 zlc_bus_prog_start_tick width 32
-probe_out22 zlc_bus_prog_stop_tick  width 32
-probe_out23 zlc_bus_prog_start_value width 10
-probe_out24 zlc_bus_prog_stop_value width 10
-probe_out25 zlc_bus_prog_mode       width 2
-probe_out26 zlc_bus_counts          width 28
-probe_in0   zlc_running             width 1
-probe_in1   zlc_done                width 1
+COMMAND     host -> top   rising-edge LOAD(1) / FIRE(2) / RESET(4) / SAFE(8)
+STATUS      top -> host   LOADED(1) / RUNNING(2) / DONE(4) / ERROR(8) / UNDERFLOW(16)
+PROG_COUNT                number of edge rows
+SCAN_COUNT                TOTAL scan points N (may exceed the resident window)
+SCAN_ENABLE / REPEAT_FOREVER
+LOOP_START / LOOP_COUNT / LOOP_END_TICK / LOOP_END_LO / LOOP_END_HI
+BUS_COUNTS                packed per-bus segment counts
+BANK_SIZE / SLOT_COUNT
+CURSOR      top -> host   scan points consumed so far (drives streaming refill)
+BANK_READY  host -> top   bit b = bank b is loaded and ready
+BANK0_CHUNK / BANK1_CHUNK host -> top   sweep-chunk index resident in each bank
 ```
 
-Keep this table in sync with the `vio_0` instantiation in
-`zlc_pulse_streamer_top_address_switch.v`. A Python contract test asserts the
-generated VIO widths match the Python generator.
+Lifecycle: `prepare` (SAFE, upload image, arm banks, LOAD) / `fire` (FIRE) /
+`wait_done` (poll STATUS; stream-refill the freed scan bank behind the cursor) /
+`safe_state`. The engine only advances into a bank when `BANK_READY` AND that
+bank holds the right chunk, so a late refill STALLs (hold, `STATUS_UNDERFLOW`),
+never a wrong point. The cycle-accurate behavior is locked by
+`host.engine_model` against the reference player + 200 fuzz programs.

@@ -15,9 +15,10 @@ cd "D:\ZLC"
 .\fpga\run_server.bat
 ```
 
-默认硬件路线是 address-switch pulse streamer。server 从 XDC 推断完整
-channel order；GUI 或 API 可以只显示/配置其中几路，但上传时会自动补成
-full-width mask，没配置的 channel 全部为 off。默认相机成像子集是：
+默认硬件路线是 JTAG-to-AXI edge-table pulse streamer。server 从 board XDC
+(`address_switch/addre.xdc` 的引脚图) 推断完整 channel order；GUI 或 API
+可以只显示/配置其中几路，但上传时会自动补成 full-width mask，没配置的
+channel 全部为 off。默认相机成像子集是：
 
 ```text
 ch09 trap

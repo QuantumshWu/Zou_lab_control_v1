@@ -26,7 +26,7 @@ find that Python, run `%run ../install_current_kernel.py` from a notebook in
 Zou_lab_control/
   frontend/       standalone plotting, PyQt/Fluent GUI, PDF, notebook helpers
   neutral_atom/   device contracts, qCMOS/readout/session/timing logic
-fpga/             standalone address-switch pulse-streamer build/server side
+fpga/             standalone JTAG-to-AXI pulse-streamer build/server side
 pulses/           checked-in PulseTableState presets
 tutorials/        generated Jupyter notebooks
 docs/             the three manuals, maintainer notes, generated PDFs
@@ -42,7 +42,7 @@ There are exactly **three tutorial PDF manuals**, plus one maintainer note.
 | --- | --- | --- |
 | Main | `docs/main_manual/` | System architecture, neutral-atom session/devices/timing, `PulseSequence` vs `PulseTableState`, the sequencer lifecycle (prepare/fire/wait_done/safe_state), the real-hardware runbook, and the N-slot scan model end to end |
 | Frontend | `docs/frontend_manual/` | The `qt_fluent` widget library and layout primitives, the pulse GUI (Edit/Preview/Scan tabs), the per-field scan-dot workflow, the plotting API, and PDF rendering |
-| FPGA | `docs/fpga_manual/` | The Artix-7 35T pulse-streamer RTL, the N-slot affine scan engine, the packed VIO probe contract, the analog-bus DAC engine, the host compiler -> upload flow, resource budget notes, and the v3 roadmap |
+| FPGA | `docs/fpga_manual/` | The Artix-7 35T edge-table pulse-streamer RTL, the 1-tick FIFO prefetch pipeline, the 2-bank streaming scan window, the affine N-slot scan engine, the analog-bus DAC engine, the JTAG-to-AXI host upload flow, and the resource budget |
 
 - Maintainer/agent notes (architecture invariants, anti-patterns, QA): see
   [docs/MAINTAINER_NOTES.md](docs/MAINTAINER_NOTES.md).
@@ -69,11 +69,15 @@ python -c "from Zou_lab_control.frontend.notes import build_frontend_manual; bui
 control/qCMOS computer
   -> RemoteSequencer (RPyC)
   -> FPGA/Vivado computer running fpga\run_server.bat
-  -> persistent Vivado/VIO session
-  -> fixed zlc_pulse_streamer_top_address_switch bitstream
+  -> persistent Vivado hw_axi session (JTAG-to-AXI)
+  -> zlc_pulse_streamer_top bitstream (edge-table engine)
 ```
 
-The FPGA side infers the full hardware contract from the address-switch XDC. The
+The host packs the compiled program into a BRAM image and uploads it over
+JTAG-to-AXI (`VivadoAxiStreamerSession` in
+`Zou_lab_control/neutral_atom/devices/axi_session.py`); a CTRL register-file
+mailbox carries COMMAND/STATUS and the streaming-scan handshake. The FPGA side
+infers the full hardware contract from the board XDC. The
 GUI may show only a subset such as `ch09/ch00/ch03/ch11`, but upload compiles
 against the full hardware order; hidden or unconfigured channels are off. The
 clock is 50 MHz (20 ns tick). Hardware-side commands on the FPGA/Vivado
@@ -86,9 +90,10 @@ fpga\run_server.bat --check-config
 fpga\run_server.bat
 ```
 
-Generated Vivado projects and server state live under `fpga\build` by default;
-the printed `ZLC project dir` is the source of truth for `.xpr/.bit/.ltx`. The
-full runbook is in the **main manual**.
+Generated Vivado projects and server state live under `fpga\build\pulse_streamer`
+by default; the printed `ZLC project dir` is the source of truth for the
+generated `impl_1\zlc_pulse_streamer_top.{bit,ltx}`. The full runbook is in the
+**main manual**.
 
 ## Frontend
 

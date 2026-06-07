@@ -83,7 +83,7 @@ pulse_plot = zf.plot(
 <!-- cell:markdown -->
 ## Pulse table model and PyQt pulse GUI
 
-`PulseTableState` 是 pulse GUI 和 notebook 共用的 period-card 模型。GUI 是可选前端；不打开 GUI 时，也可以直接用这个模型生成 `PulseSequence`。新建 pulse 默认名是 `pulse_YYYYMMDD_HHMMSS`。`channels` 是硬件 channel 名和 FPGA bit order，例如 `ch00/ch01/...`；display label 只是前端名字。standalone `pulse_gui.bat` 会从 address-switch XDC 推断完整 channel list、display label 和 package pin；JSON 里保存过的 `channel_labels` 优先。`time_step_ns` 是 minimal time，连接默认 FPGA server 时是 20 ns。所有 duration、delay、`x_ns/y_ns` 和 scan array 都要是它的整数倍。GUI 默认只显示常用子集，其它 channel 可以在 GUI 里临时添加或隐藏；隐藏不改变上传宽度，compile/upload 会自动补齐完整硬件 channel order。Preview 页自动调用 `zf.plot(..., kind="pulse")`，默认隐藏 off-only channel，并保留 symbolic `x/y` 标记，不把 scan array 展开成大量 period columns。
+`PulseTableState` 是 pulse GUI 和 notebook 共用的 period-card 模型。GUI 是可选前端；不打开 GUI 时，也可以直接用这个模型生成 `PulseSequence`。新建 pulse 默认名是 `pulse_YYYYMMDD_HHMMSS`。`channels` 是硬件 channel 名和 FPGA bit order，例如 `ch00/ch01/...`；display label 只是前端名字。standalone `pulse_gui.bat` 会从 address-switch XDC 推断完整 channel list、display label 和 package pin；JSON 里保存过的 `channel_labels` 优先。`time_step_ns` 是 minimal time，连接默认 FPGA server 时是 20 ns。所有 duration、delay 和 scan array 的值都要是它的整数倍。扫描用命名 slot：给任意 duration/delay/DAC 字段绑定一个 slot(`s0, s1, ...`)，再提供一张 `N_points x N_slots` 的 `scan_table`。GUI 默认只显示常用子集，其它 channel 可以在 GUI 里临时添加或隐藏；隐藏不改变上传宽度，compile/upload 会自动补齐完整硬件 channel order。Preview 页自动调用 `zf.plot(..., kind="pulse")`，默认隐藏 off-only channel，并保留 symbolic slot 标记，不把 scan array 展开成大量 period columns。
 
 Pulse GUI 的 Edit 页可以按这个顺序读：
 
