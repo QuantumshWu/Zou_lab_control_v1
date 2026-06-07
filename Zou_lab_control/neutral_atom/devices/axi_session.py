@@ -364,6 +364,8 @@ class VivadoAxiStreamerSession:
             num_slots=p.num_slots,
             bus_count=p.bus_count,
             bus_width=p.bus_width,
+            num_lanes=p.num_lanes,
+            max_lane_edges=p.max_lane_edges,
             # bound the monotonicity sweep so a million-point streamed scan does not
             # hang prepare(); the per-slot extreme points are always included.
             max_validated_scan_points=max(4096, 2 * p.bank_size),

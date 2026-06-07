@@ -47,6 +47,10 @@ DEFAULT_NUM_SLOTS = 4
 DEFAULT_SLOT_MUL_WIDTH = 25
 DEFAULT_BUS_COUNT = 4
 DEFAULT_BUS_WIDTH = 10
+# Disjoint-bit delay lanes (scanned digital delays whose edges reorder past other
+# channels), matching zlc_edge_streamer.v NUM_LANES / MAX_LANE_EDGES + host.image.
+DEFAULT_NUM_LANES = 4
+DEFAULT_MAX_LANE_EDGES = 64
 
 
 def hardware_channel_names(count: int = DEFAULT_FPGA_CHANNEL_COUNT) -> list[str]:
@@ -242,6 +246,8 @@ def validate_pulse_streamer_program(
     bus_count: int = DEFAULT_BUS_COUNT,
     bus_width: int = DEFAULT_BUS_WIDTH,
     slot_mul_width: int = DEFAULT_SLOT_MUL_WIDTH,
+    num_lanes: int = DEFAULT_NUM_LANES,
+    max_lane_edges: int = DEFAULT_MAX_LANE_EDGES,
     max_validated_scan_points: int | None = None,
 ) -> None:
     """Validate that a runtime edge table fits the fixed FPGA streamer.
@@ -262,17 +268,8 @@ def validate_pulse_streamer_program(
     bus_count = _positive_int(bus_count, "bus_count")
     bus_width = _positive_int(bus_width, "bus_width")
     channel_count = len(program.channels) if channel_count is None else _positive_int(channel_count, "channel_count")
-    if getattr(program, "delay_lanes", None):
-        # SAFETY GATE (removed when the lane RTL lands): a reordering scanned-delay
-        # program compiles to disjoint-bit delay lanes and is proven cycle-accurate by
-        # engine_model, but the lane sub-players are not yet in the bitstream -- uploading
-        # would leave the lane channel silent.  Reject at upload (never silently wrong)
-        # until the RTL lane players are built.
-        raise NotImplementedError(
-            "this program uses delay lanes (a scanned digital delay whose edges reorder "
-            "past other channels); the RTL lane players are the next build step.  Until "
-            "then keep the scanned delay non-reordering so it stays in the main edge table."
-        )
+    num_lanes = _positive_int(num_lanes, "num_lanes")
+    max_lane_edges = _positive_int(max_lane_edges, "max_lane_edges")
     if len(set(program.channels)) != len(program.channels):
         raise ValueError("program channels must be unique.")
     if len(program.ticks) != len(program.masks):
@@ -424,6 +421,87 @@ def validate_pulse_streamer_program(
                 raise ValueError("program loop_end_tick must be after the loop start tick.")
             if loop_end_tick > int(program.ticks[-1]):
                 raise ValueError("program loop_end_tick must not exceed the uploaded final tick.")
+
+    # --- delay lanes ---------------------------------------------------------
+    # A scanned digital DELAY whose edges reorder past other channels is pulled out
+    # of the global sorted edge table onto its own DISJOINT output bit, played by a
+    # 1-bit affine sub-player (the RTL lane player == engine_model lanes).  Validate
+    # the lane RTL's constraints: lane count, per-lane edge count, channel_bit
+    # disjoint from the main mask + each other, and (per scan point) lane effective
+    # ticks within the frame and strictly increasing.
+    delay_lanes = list(getattr(program, "delay_lanes", None) or [])
+    if delay_lanes:
+        if len(delay_lanes) > num_lanes:
+            raise ValueError(f"program uses {len(delay_lanes)} delay lanes, but the FPGA streamer has {num_lanes}.")
+        # The lane player reseeds ONLY to lane-time 0 (a single-edge reinit -- no unrolled
+        # MAC walk, which would replicate ~MAX_LANE_EDGES*NUM_LANES multipliers and bust
+        # the device).  That is correct iff the program never rewinds a lane to a non-zero
+        # frame tick: no inner finite bracket (loop_start>0) and no additive repeat-forever
+        # preamble (repeat_from_index>0).  The reordering-delay scan compiler never emits
+        # those with a lane; reject defensively so a future change can never silently
+        # mis-play a lane on hardware.
+        if int(getattr(program, "loop_count", 1)) > 1 and int(getattr(program, "loop_start_index", 0)) > 0:
+            raise ValueError(
+                "a delay lane cannot run inside an inner finite repeat bracket (loop_start>0); "
+                "keep the reordering scanned delay outside the bracket, or make it non-reordering "
+                "so it stays in the main edge table (which does support brackets)."
+            )
+        if int(getattr(program, "repeat_from_index", 0)) > 0:
+            raise ValueError(
+                "a delay lane cannot use the additive repeat-forever preamble (repeat_from_index>0); "
+                "the reordering scanned delay is single-frame."
+            )
+        main_mask_union = 0
+        for mask in program.masks:
+            main_mask_union |= int(mask) & mask_limit
+        lane_points = scan_points or [[0] * slot_count]
+        seen_bits: set[int] = set()
+        for lane_index, lane in enumerate(delay_lanes):
+            channel_bit = int(getattr(lane, "channel_bit", 0))
+            lane_ticks = [int(t) for t in getattr(lane, "ticks", [])]
+            lane_coeffs = [list(c) for c in getattr(lane, "coeffs", [])]
+            lane_values = [int(v) for v in getattr(lane, "values", [])]
+            if channel_bit < 0 or channel_bit >= channel_count:
+                raise ValueError(f"delay lane {lane_index} channel_bit {channel_bit} is outside the {channel_count} channels.")
+            if (main_mask_union >> channel_bit) & 1:
+                raise ValueError(
+                    f"delay lane {lane_index} channel_bit {channel_bit} also appears in the main edge "
+                    "masks; a lane channel must be DISJOINT from the global edge table."
+                )
+            if channel_bit in seen_bits:
+                raise ValueError(f"delay lane {lane_index} channel_bit {channel_bit} collides with another lane.")
+            seen_bits.add(channel_bit)
+            if not lane_ticks:
+                raise ValueError(f"delay lane {lane_index} has no edges.")
+            if len(lane_ticks) > max_lane_edges:
+                raise ValueError(
+                    f"delay lane {lane_index} has {len(lane_ticks)} edges, but the FPGA lane player only "
+                    f"accepts {max_lane_edges}."
+                )
+            if len(lane_coeffs) != len(lane_ticks) or len(lane_values) != len(lane_ticks):
+                raise ValueError(f"delay lane {lane_index} ticks/coeffs/values must have the same length.")
+            for value in lane_values:
+                if value not in (0, 1):
+                    raise ValueError(f"delay lane {lane_index} value {value} must be 0 or 1.")
+            for coeff in [int(c) for row in lane_coeffs for c in row]:
+                if coeff < coeff_min or coeff > coeff_max:
+                    raise ValueError(f"delay lane {lane_index} scan coefficient {coeff} does not fit signed {coeff_width} bits.")
+            # per-point: lane effective ticks within the frame [0, effective final] and
+            # strictly increasing (the lane plays its own frame-tick llt -- a reversed or
+            # out-of-frame edge would desync from the model).
+            for point_index, point in enumerate(lane_points):
+                frame_end = _apply_scan_tick(program.ticks[-1], tick_slot_coeffs[-1], point, frac_bits) if program.ticks else 0
+                last = -1
+                for base, coeffs in zip(lane_ticks, lane_coeffs):
+                    eff = _apply_scan_tick(base, coeffs, point, frac_bits)
+                    if eff <= last:
+                        raise ValueError(f"delay lane {lane_index} produces non-increasing effective ticks at scan point {point_index}.")
+                    if eff < 0 or eff > frame_end:
+                        raise ValueError(
+                            f"delay lane {lane_index} effective tick {eff} is outside the frame "
+                            f"[0, {frame_end}] at scan point {point_index}."
+                        )
+                    last = eff
 
 
 def capacity_estimate_text(

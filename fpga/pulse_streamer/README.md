@@ -17,13 +17,17 @@ upload flow, and resource budgets) see the **FPGA manual** in
   depth-`FIFO_DEPTH` (=`RD_LAT`+1=3) continuous edge prefetch that hides the BRAM
   latency so back-to-back 1-tick (20 ns) edges fire one per clock, a 2-bank
   ping-pong scan window (`BANK_SIZE`=2048, 4096 resident points) for unbounded
-  streamed scans, and the affine effective-tick MAC + analog-bus DAC engine.
+  streamed scans, and the affine effective-tick MAC + analog-bus DAC engine.  A
+  scanned digital DELAY whose edges reorder past other channels is pulled out of
+  the global table onto its own DISJOINT output bit and played by a 1-bit affine
+  sub-player ("delay lane") -- LUTRAM tables, the shared MAC, +0 RAMB36/+0 DSP.
 - `zlc_pulse_streamer_top.v`: top wrapper. Region-decoded BRAMs behind an
-  `axi_bram_ctrl` (edge tables + scan window + bus image) plus a CTRL register
-  file (the COMMAND/STATUS mailbox + streaming `CURSOR`/`BANK_READY`/`BANK*_CHUNK`
-  handshake), driving the engine and the board output pins / four 10-bit DAC
-  buses.
-- `create_project.tcl`: create project (jtag_axi + axi_bram_ctrl + 5 BRAMs),
+  `axi_bram_ctrl` (edge tables + scan window + bus image + lane image) plus a CTRL
+  register file (the COMMAND/STATUS mailbox + streaming `CURSOR`/`BANK_READY`/
+  `BANK*_CHUNK` handshake), driving the engine and the board output pins / four
+  10-bit DAC buses.  A mini-loader copies the bus + lane images into the engine
+  LUTRAM at LOAD.
+- `create_project.tcl`: create project (jtag_axi + axi_bram_ctrl + 6 BRAMs),
   `zlc_force_latency2` forces the edge BRAMs to `READ_LATENCY_B=2`, synth,
   implement, write bitstream + probes.
 - `program_fpga.tcl`: program the device with the generated `.bit`/`.ltx`.

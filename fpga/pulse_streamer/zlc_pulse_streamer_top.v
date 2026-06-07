@@ -53,7 +53,11 @@ module zlc_pulse_streamer_top #(
     parameter integer BUS_INDEX_WIDTH = 2,
     parameter integer BUS_WIDTH = 10,
     parameter integer BUS_SEG_ADDR_WIDTH = 6,
-    parameter integer BUS_SEL_WIDTH = 3
+    parameter integer BUS_SEL_WIDTH = 3,
+    parameter integer NUM_LANES = 4,            // disjoint-bit scanned-delay lane players
+    parameter integer MAX_LANE_EDGES = 64,      // per-lane affine rise/fall edges (LUTRAM)
+    parameter integer LANE_SEG_ADDR_WIDTH = 6,  // $clog2(MAX_LANE_EDGES)
+    parameter integer CHANNEL_BIT_WIDTH = 6     // $clog2(CHANNEL_COUNT)
 )(
     input  wire clk,
     output wire [1:0] led,
@@ -84,6 +88,9 @@ module zlc_pulse_streamer_top #(
     localparam integer MAX_BUS_SEGMENTS = (1 << BUS_SEG_ADDR_WIDTH);
     localparam integer BUS_ROWS = BUS_COUNT * MAX_BUS_SEGMENTS;
     localparam integer BUS_WORDS = 2 + 2 * ((COEFF_BITS + 31) / 32) + 1;   // 7
+    localparam integer LANE_ROWS = NUM_LANES * MAX_LANE_EDGES;             // 256
+    localparam integer LANE_WORDS = 1 + ((COEFF_BITS + 31) / 32) + 1;      // tick + coeff(2) + value = 4
+    localparam integer LANE_CNT_W = LANE_SEG_ADDR_WIDTH + 1;
 
     // --- word-address region bases (== host.image.region_bases) ---------------
     localparam integer R_CTRL_BASE = 0;
@@ -93,7 +100,8 @@ module zlc_pulse_streamer_top #(
     localparam integer R_MASK_BASE  = R_COEFF_BASE + MAX_EDGES * COEFF_WORDS;
     localparam integer R_SCAN_BASE  = R_MASK_BASE  + MAX_EDGES * MASK_WORDS;
     localparam integer R_BUS_BASE   = R_SCAN_BASE  + SCAN_DEPTH * SCAN_WORDS;
-    localparam integer R_TOTAL_WORDS = R_BUS_BASE + BUS_ROWS * BUS_WORDS;
+    localparam integer R_LANE_BASE  = R_BUS_BASE   + BUS_ROWS * BUS_WORDS;
+    localparam integer R_TOTAL_WORDS = R_LANE_BASE + LANE_ROWS * LANE_WORDS;
 
     // CTRL regfile word offsets (== host.image.CtrlWords).
     localparam integer C_MAGIC = 0;
@@ -117,6 +125,9 @@ module zlc_pulse_streamer_top #(
     localparam integer C_BANK1_CHUNK = 18;  // host -> engine: sweep chunk resident in bank 1
     localparam integer C_REPEAT_FROM_LOOP_START = 19;  // repeat_forever rewinds to LOOP_START
                                                        // (additive-delay steady frame), not edge 0
+    localparam integer C_LANE_COUNT  = 20;  // number of active delay lanes
+    localparam integer C_LANE_COUNTS = 21;  // packed per-lane edge counts
+    localparam integer C_LANE_BITS   = 22;  // packed per-lane output channel_bit
 
     // engine outputs
     wire [CHANNEL_COUNT-1:0] out;
@@ -157,12 +168,14 @@ module zlc_pulse_streamer_top #(
     wire sel_coeff = (word_addr >= R_COEFF_BASE) && (word_addr < R_MASK_BASE);
     wire sel_mask  = (word_addr >= R_MASK_BASE)  && (word_addr < R_SCAN_BASE);
     wire sel_scan  = (word_addr >= R_SCAN_BASE)  && (word_addr < R_BUS_BASE);
-    wire sel_bus   = (word_addr >= R_BUS_BASE)   && (word_addr < R_TOTAL_WORDS);
+    wire sel_bus   = (word_addr >= R_BUS_BASE)   && (word_addr < R_LANE_BASE);
+    wire sel_lane  = (word_addr >= R_LANE_BASE)  && (word_addr < R_TOTAL_WORDS);
     wire [29:0] tick_word_off  = word_addr - R_TICK_BASE[29:0];
     wire [29:0] coeff_word_off = word_addr - R_COEFF_BASE[29:0];
     wire [29:0] mask_word_off  = word_addr - R_MASK_BASE[29:0];
     wire [29:0] scan_word_off  = word_addr - R_SCAN_BASE[29:0];
     wire [29:0] bus_word_off   = word_addr - R_BUS_BASE[29:0];
+    wire [29:0] lane_word_off  = word_addr - R_LANE_BASE[29:0];
 
     // --- CTRL regfile ---------------------------------------------------------
     reg [31:0] ctrl_reg [0:R_CTRL_WORDS-1];
@@ -233,6 +246,19 @@ module zlc_pulse_streamer_top #(
         .addrb(bus_img_raddr), .dinb(32'b0), .doutb(bus_img_doutb)
     );
 
+    // --- LANE image BRAM (32b TDP; the mini-loader reads it into the engine lane
+    // LUTRAM via lane_prog_*, exactly like the bus image -> bus LUTRAM).  The lane
+    // PLAY tables are engine-internal LUTRAM (+0 RAMB36); only this small staging
+    // image costs a fixed BRAM (1 RAMB36 at LANE_ROWS*LANE_WORDS=1024 words). ---
+    wire [31:0] lane_img_doutb;
+    reg  [($clog2(LANE_ROWS*LANE_WORDS))-1:0] lane_img_raddr;
+    blk_mem_gen_laneimg zlc_lane_img_i (
+        .clka(axi_clk), .ena(bram_ena && sel_lane), .wea(bram_wea),
+        .addra(lane_word_off[($clog2(LANE_ROWS*LANE_WORDS))-1:0]), .dina(bram_dina), .douta(),
+        .clkb(axi_clk), .enb(1'b1), .web(4'b0),
+        .addrb(lane_img_raddr), .dinb(32'b0), .doutb(lane_img_doutb)
+    );
+
     // --- control / bus mini-loader FSM ----------------------------------------
     // On LOAD: hold engine reset, copy the bus image (R_BUS) into the engine bus
     // LUTRAM via bus_prog_*, set STATUS.LOADED.  On FIRE: release reset + pulse
@@ -265,7 +291,16 @@ module zlc_pulse_streamer_top #(
     reg [BUS_SEL_WIDTH-1:0] bus_prog_value_select = {BUS_SEL_WIDTH{1'b0}};
     reg [BUS_SEL_WIDTH-1:0] bus_prog_stop_value_select = {BUS_SEL_WIDTH{1'b0}};
 
-    localparam [3:0] L_IDLE=0, L_RD=1, L_CAP=2, L_EMIT=3, L_NEXT=4, L_FIRE=5, L_RUN=6;
+    // delay-lane mini-loader write port (mirrors bus_prog_*)
+    reg lane_prog_we = 1'b0;
+    reg [($clog2(NUM_LANES>1?NUM_LANES:2))-1:0] lane_prog_lane = {($clog2(NUM_LANES>1?NUM_LANES:2)){1'b0}};
+    reg [LANE_SEG_ADDR_WIDTH-1:0] lane_prog_addr = {LANE_SEG_ADDR_WIDTH{1'b0}};
+    reg [TICK_WIDTH-1:0] lane_prog_tick = {TICK_WIDTH{1'b0}};
+    reg [COEFF_BITS-1:0] lane_prog_coeffs = {COEFF_BITS{1'b0}};
+    reg lane_prog_value = 1'b0;
+
+    localparam [3:0] L_IDLE=0, L_RD=1, L_CAP=2, L_EMIT=3, L_NEXT=4, L_FIRE=5, L_RUN=6,
+                     L_LNEXT=7, L_LRD=8, L_LCAP=9, L_LEMIT=10, L_LRUN=11;
     reg [3:0] lstate = L_IDLE;
     reg [2:0] wi;                       // word index within a bus row
     reg [31:0] cap [0:6];
@@ -274,8 +309,12 @@ module zlc_pulse_streamer_top #(
     reg [BUS_SEG_ADDR_WIDTH:0] bcnt;    // count for current bus
     reg [1:0] settle;
     reg [3:0] cmd_seen;
+    // lane mini-loader counters (mirror bcur/baddr/bcnt for the lane image)
+    reg [($clog2(NUM_LANES>1?NUM_LANES:2)):0] lcur;   // current lane
+    reg [LANE_SEG_ADDR_WIDTH:0] laddr;                 // edge within lane
+    reg [LANE_SEG_ADDR_WIDTH:0] lcnt;                  // edge count for current lane
     integer ic;
-    initial begin for (ic=0; ic<7; ic=ic+1) cap[ic]=32'b0; wi=0; bcur=0; baddr=0; bcnt=0; settle=0; cmd_seen=0; bus_img_raddr=0; end
+    initial begin for (ic=0; ic<7; ic=ic+1) cap[ic]=32'b0; wi=0; bcur=0; baddr=0; bcnt=0; settle=0; cmd_seen=0; bus_img_raddr=0; lane_img_raddr=0; lcur=0; laddr=0; lcnt=0; end
 
     wire [3:0] cmd_now = ctrl_reg[C_COMMAND][3:0];
     wire [3:0] cmd_edge = cmd_now & ~cmd_seen;
@@ -285,6 +324,12 @@ module zlc_pulse_streamer_top #(
     function [($clog2(BUS_ROWS*BUS_WORDS))-1:0] R_relbus;
         input integer b; input integer a;
         begin R_relbus = (b * MAX_BUS_SEGMENTS + a) * BUS_WORDS; end
+    endfunction
+    function [LANE_CNT_W-1:0] lane_count_of; input integer k; begin
+        lane_count_of = ctrl_reg[C_LANE_COUNTS][k*LANE_CNT_W +: LANE_CNT_W]; end endfunction
+    function [($clog2(LANE_ROWS*LANE_WORDS))-1:0] R_rellane;
+        input integer k; input integer a;
+        begin R_rellane = (k * MAX_LANE_EDGES + a) * LANE_WORDS; end
     endfunction
 
     always @(posedge clk) begin
@@ -306,7 +351,8 @@ module zlc_pulse_streamer_top #(
             wi <= 0;
             if (baddr >= bcnt) begin
                 if (bcur == BUS_COUNT-1) begin
-                    ldr_status_we <= 1'b1; ldr_status_val <= {27'b0, ST_LOADED}; lstate <= L_IDLE;
+                    // bus image done -> load the delay-lane image into the engine lane LUTRAM
+                    lcur <= 0; laddr <= 0; lcnt <= lane_count_of(0); wi <= 0; lstate <= L_LNEXT;
                 end else begin
                     bcur <= bcur + 1'b1; baddr <= 0; bcnt <= bus_count_of(bcur + 1'b1); lstate <= L_NEXT;
                 end
@@ -344,6 +390,45 @@ module zlc_pulse_streamer_top #(
         L_RUN: begin
             if (settle == 0) lstate <= L_NEXT; else settle <= settle - 1'b1;
         end
+        // ---- delay-lane image -> engine lane LUTRAM (mirrors the bus L_NEXT/.../L_RUN) ----
+        L_LNEXT: begin
+            wi <= 0;
+            if (laddr >= lcnt) begin
+                if (lcur == NUM_LANES-1) begin
+                    ldr_status_we <= 1'b1; ldr_status_val <= {27'b0, ST_LOADED}; lstate <= L_IDLE;
+                end else begin
+                    lcur <= lcur + 1'b1; laddr <= 0; lcnt <= lane_count_of(lcur + 1'b1); lstate <= L_LNEXT;
+                end
+            end else begin
+                lane_img_raddr <= R_rellane(lcur, laddr);
+                settle <= 2'd2; lstate <= L_LRD;
+            end
+        end
+        L_LRD: begin
+            lane_img_raddr <= R_rellane(lcur, laddr) + wi;
+            settle <= 2'd2; lstate <= L_LCAP;
+        end
+        L_LCAP: begin
+            if (settle == 0) begin
+                cap[wi] <= lane_img_doutb;
+                if (wi == LANE_WORDS-1) lstate <= L_LEMIT;
+                else begin wi <= wi + 1'b1; lstate <= L_LRD; end
+            end else settle <= settle - 1'b1;
+        end
+        L_LEMIT: begin
+            // lane row = [tick, coeff_lo, coeff_hi, value] (host.image lane layout)
+            lane_prog_lane <= lcur[($clog2(NUM_LANES>1?NUM_LANES:2))-1:0];
+            lane_prog_addr <= laddr[LANE_SEG_ADDR_WIDTH-1:0];
+            lane_prog_tick <= cap[0];
+            lane_prog_coeffs <= {cap[2][COEFF_BITS-33:0], cap[1]};
+            lane_prog_value <= cap[3][0];
+            lane_prog_we <= ~lane_prog_we;        // toggle commits a lane-edge write
+            laddr <= laddr + 1'b1;
+            settle <= 2'd2; lstate <= L_LRUN;
+        end
+        L_LRUN: begin
+            if (settle == 0) lstate <= L_LNEXT; else settle <= settle - 1'b1;
+        end
         L_FIRE: begin
             eng_reset <= 1'b0;
             eng_start <= 1'b1;
@@ -376,6 +461,8 @@ module zlc_pulse_streamer_top #(
         .TICK_WIDTH(TICK_WIDTH), .NUM_SLOTS(NUM_SLOTS), .COEFF_WIDTH(COEFF_WIDTH), .COEFF_FRAC_BITS(COEFF_FRAC_BITS),
         .BUS_COUNT(BUS_COUNT), .BUS_INDEX_WIDTH(BUS_INDEX_WIDTH), .BUS_WIDTH(BUS_WIDTH),
         .BUS_SEG_ADDR_WIDTH(BUS_SEG_ADDR_WIDTH), .BUS_SEL_WIDTH(BUS_SEL_WIDTH),
+        .NUM_LANES(NUM_LANES), .MAX_LANE_EDGES(MAX_LANE_EDGES),
+        .LANE_SEG_ADDR_WIDTH(LANE_SEG_ADDR_WIDTH), .CHANNEL_BIT_WIDTH(CHANNEL_BIT_WIDTH),
         .RD_LAT(2), .FIFO_DEPTH(3)
     ) zlc_engine_i (
         .clk(axi_clk), .reset(eng_reset), .start(eng_start),
@@ -405,6 +492,11 @@ module zlc_pulse_streamer_top #(
         .bus_prog_mode(bus_prog_mode), .bus_prog_value_select(bus_prog_value_select),
         .bus_prog_stop_value_select(bus_prog_stop_value_select),
         .bus_counts(ctrl_reg[C_BUS_COUNTS][BUS_COUNT*(BUS_SEG_ADDR_WIDTH+1)-1:0]),
+        .lane_prog_we(lane_prog_we), .lane_prog_lane(lane_prog_lane), .lane_prog_addr(lane_prog_addr),
+        .lane_prog_tick(lane_prog_tick), .lane_prog_coeffs(lane_prog_coeffs), .lane_prog_value(lane_prog_value),
+        .lane_counts(ctrl_reg[C_LANE_COUNTS][NUM_LANES*(LANE_SEG_ADDR_WIDTH+1)-1:0]),
+        .lane_channel_bits(ctrl_reg[C_LANE_BITS][NUM_LANES*CHANNEL_BIT_WIDTH-1:0]),
+        .lane_count(ctrl_reg[C_LANE_COUNT][$clog2(NUM_LANES+1)-1:0]),
         .out(out), .bus_out(zlc_bus_out), .running(zlc_running), .done(zlc_done)
     );
 

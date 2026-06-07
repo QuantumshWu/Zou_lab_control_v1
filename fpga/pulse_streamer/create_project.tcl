@@ -22,7 +22,9 @@
 #     mask  BRAM 32b(A)/64b(B)  port-A depth 8192, port-B depth 4096
 #   BANK_SIZE=2048 -> scan depth 2*2048=4096:
 #     scan  BRAM 32b(A)/128b(B) port-A depth 16384, port-B depth 4096
-#   bus image 256*7=1792 words; CTRL 64; total 38720 -> axi_bram depth 65536
+#   bus image 256*7=1792 words; lane image 4*64*4=1024 words; CTRL 64; total 39744
+#     -> axi_bram depth 65536.  The lane PLAY tables are engine LUTRAM (+0 RAMB36);
+#        blk_mem_gen_laneimg is only the staging image (1 RAMB36, mirrors busimg).
 
 set script_dir [file normalize [file dirname [info script]]]
 proc env_or {name default} {
@@ -234,6 +236,24 @@ zlc_try "busimg noRSTA" {set_property CONFIG.Use_RSTA_Pin {false} [get_ips blk_m
 zlc_try "busimg noRSTB" {set_property CONFIG.Use_RSTB_Pin {false} [get_ips blk_mem_gen_busimg]}
 zlc_dump_ip blk_mem_gen_busimg
 generate_target all [get_ips blk_mem_gen_busimg]
+
+# --- LANE image BRAM: symmetric 32b TDP (A=AXI write, B=mini-loader read) ------
+# The lane PLAY tables are engine-internal LUTRAM (distributed, +0 RAMB36); this is
+# only the small staging image (NUM_LANES*MAX_LANE_EDGES*LANE_WORDS = 4*64*4 = 1024
+# words, 1 RAMB36) the mini-loader copies into the engine lane LUTRAM via lane_prog_*,
+# exactly like the bus image BRAM.
+create_ip -name blk_mem_gen -vendor xilinx.com -library ip -module_name blk_mem_gen_laneimg
+zlc_try "laneimg TDP"    {set_property CONFIG.Memory_Type {True_Dual_Port_RAM} [get_ips blk_mem_gen_laneimg]}
+zlc_try "laneimg ByteWE" {set_property CONFIG.Use_Byte_Write_Enable {true} [get_ips blk_mem_gen_laneimg]}
+zlc_try "laneimg ByteSize8" {set_property CONFIG.Byte_Size {8} [get_ips blk_mem_gen_laneimg]}
+zlc_try "laneimg WWA=32" {set_property CONFIG.Write_Width_A {32} [get_ips blk_mem_gen_laneimg]}
+zlc_try "laneimg WDA=1024" {set_property CONFIG.Write_Depth_A {1024} [get_ips blk_mem_gen_laneimg]}
+zlc_try "laneimg ENA"    {set_property CONFIG.Enable_A {Use_ENA_Pin} [get_ips blk_mem_gen_laneimg]}
+zlc_try "laneimg ENB"    {set_property CONFIG.Enable_B {Use_ENB_Pin} [get_ips blk_mem_gen_laneimg]}
+zlc_try "laneimg noRSTA" {set_property CONFIG.Use_RSTA_Pin {false} [get_ips blk_mem_gen_laneimg]}
+zlc_try "laneimg noRSTB" {set_property CONFIG.Use_RSTB_Pin {false} [get_ips blk_mem_gen_laneimg]}
+zlc_dump_ip blk_mem_gen_laneimg
+generate_target all [get_ips blk_mem_gen_laneimg]
 
 update_compile_order -fileset sources_1
 launch_runs synth_1 -jobs 4

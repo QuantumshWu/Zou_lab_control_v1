@@ -55,6 +55,10 @@ module zlc_edge_streamer #(
     parameter integer BUS_WIDTH = 10,
     parameter integer BUS_SEG_ADDR_WIDTH = 6,
     parameter integer BUS_SEL_WIDTH = 3,
+    parameter integer NUM_LANES = 4,            // disjoint-bit scanned-delay lane players
+    parameter integer MAX_LANE_EDGES = 64,      // per-lane affine rise/fall edges (LUTRAM)
+    parameter integer LANE_SEG_ADDR_WIDTH = 6,  // $clog2(MAX_LANE_EDGES)
+    parameter integer CHANNEL_BIT_WIDTH = 6,    // $clog2(CHANNEL_COUNT)
     parameter integer RD_LAT = 2,               // edge-BRAM read latency (forced)
     parameter integer FIFO_DEPTH = 3,           // == RD_LAT + 1 for 1-tick spacing
     parameter integer ARM_SETTLE = 4            // generous one-time arm read settle
@@ -110,6 +114,20 @@ module zlc_edge_streamer #(
     input  wire [BUS_SEL_WIDTH-1:0] bus_prog_stop_value_select,
     input  wire [BUS_COUNT*(BUS_SEG_ADDR_WIDTH+1)-1:0] bus_counts,
 
+    // delay-lane table write port (LUTRAM inside this module; mirrors bus_prog_*).
+    // A lane is a 1-bit affine sub-player on a DISJOINT output bit -- a scanned digital
+    // DELAY pulled out of the global sorted table so its reordering edges never disturb
+    // the main stream.  Structurally the per-bus DAC engine specialised to 1 bit.
+    input  wire lane_prog_we,
+    input  wire [$clog2(NUM_LANES>1?NUM_LANES:2)-1:0] lane_prog_lane,
+    input  wire [LANE_SEG_ADDR_WIDTH-1:0] lane_prog_addr,
+    input  wire [TICK_WIDTH-1:0] lane_prog_tick,
+    input  wire [NUM_SLOTS*COEFF_WIDTH-1:0] lane_prog_coeffs,
+    input  wire lane_prog_value,
+    input  wire [NUM_LANES*(LANE_SEG_ADDR_WIDTH+1)-1:0] lane_counts,  // packed per-lane edge count
+    input  wire [NUM_LANES*CHANNEL_BIT_WIDTH-1:0] lane_channel_bits,  // packed per-lane output bit
+    input  wire [$clog2(NUM_LANES+1)-1:0] lane_count,                 // number of active lanes
+
     output wire [CHANNEL_COUNT-1:0] out,
     output wire [BUS_COUNT*BUS_WIDTH-1:0] bus_out,
     output reg  running = 1'b0,
@@ -143,6 +161,14 @@ module zlc_edge_streamer #(
     (* ram_style = "distributed" *) reg [BUS_SEL_WIDTH-1:0] bus_stop_value_select_mem [0:MAX_BUS_SEGMENT_ROWS-1];
     (* ram_style = "distributed" *) reg [COEFF_BITS-1:0] bus_start_tick_coeff_mem [0:MAX_BUS_SEGMENT_ROWS-1];
     (* ram_style = "distributed" *) reg [COEFF_BITS-1:0] bus_stop_tick_coeff_mem [0:MAX_BUS_SEGMENT_ROWS-1];
+
+    // ----- delay-lane tables: LUTRAM (per-tick combinatorial read) -------------
+    // The lane PLAY mem is engine-internal distributed RAM (NEVER BRAM -- BRAM would
+    // bust the 35T).  Each lane edge: affine base tick + slot coeffs + 1-bit value.
+    localparam integer MAX_LANE_ROWS = NUM_LANES * MAX_LANE_EDGES;
+    (* ram_style = "distributed" *) reg [TICK_WIDTH-1:0] lane_tick_mem [0:MAX_LANE_ROWS-1];
+    (* ram_style = "distributed" *) reg [COEFF_BITS-1:0] lane_coeff_mem [0:MAX_LANE_ROWS-1];
+    (* ram_style = "distributed" *) reg lane_value_mem [0:MAX_LANE_ROWS-1];
 
     // ----- engine state -------------------------------------------------------
     reg [CHANNEL_COUNT-1:0] state_mask = {CHANNEL_COUNT{1'b0}};
@@ -191,6 +217,22 @@ module zlc_edge_streamer #(
     reg [TICK_WIDTH-1:0] bus_ramp_denom [0:BUS_COUNT-1];
     reg [TICK_WIDTH+BUS_WIDTH:0] bus_ramp_accum [0:BUS_COUNT-1];
 
+    // ----- lane runtime -------------------------------------------------------
+    // lane_time (llt) is the lane's OWN frame-tick counter (NOT time_count): reset at
+    // every gapless boundary, +1 each output tick.  lane_idx[k]/lane_bit[k] are the
+    // 1-bit affine sub-player state; lane_count_active[k]/lane_bit_pos[k] are latched
+    // build constants from the host.
+    reg [TICK_WIDTH-1:0] lane_time = {TICK_WIDTH{1'b0}};
+    reg [LANE_SEG_ADDR_WIDTH:0] lane_idx [0:NUM_LANES-1];
+    reg lane_bit [0:NUM_LANES-1];
+    reg [LANE_SEG_ADDR_WIDTH:0] lane_count_active [0:NUM_LANES-1];
+    reg [CHANNEL_BIT_WIDTH-1:0] lane_bit_pos [0:NUM_LANES-1];
+    reg [NUM_LANES-1:0] lane_active = {NUM_LANES{1'b0}};   // lane k carries a program
+    integer lane_i;
+    reg [(NUM_LANES>1?$clog2(NUM_LANES):1)+LANE_SEG_ADDR_WIDTH-1:0] lane_flat_addr;
+
+    reg lane_prog_we_meta = 1'b0, lane_prog_we_sync = 1'b0, lane_prog_we_prev = 1'b0;
+
     reg reset_meta = 1'b0, reset_sync = 1'b0;
     reg start_meta = 1'b0, start_sync = 1'b0, start_prev = 1'b0;
     reg bus_prog_we_meta = 1'b0, bus_prog_we_sync = 1'b0, bus_prog_we_prev = 1'b0;
@@ -200,8 +242,26 @@ module zlc_edge_streamer #(
 
     wire start_event = start_sync && !start_prev;
     wire bus_prog_we_event = bus_prog_we_sync != bus_prog_we_prev;
+    wire lane_prog_we_event = lane_prog_we_sync != lane_prog_we_prev;
 
-    assign out = state_mask;
+    // Disjoint-bit merge: each delay lane owns its own output bit, so the lane bits
+    // are simply OR'd in over the (lane-cleared) main mask -- no global re-sort.  The
+    // lane sub-player state (lane_bit/lane_bit_pos/lane_active) is registered below; the
+    // merge itself is combinational (no extra latency vs the registered lane_bit).
+    reg [CHANNEL_COUNT-1:0] lane_mask;   // bit b set iff some active lane drives bit b
+    reg [CHANNEL_COUNT-1:0] lane_out;    // OR of lane_bit[k] << lane_bit_pos[k]
+    integer lane_m;
+    always @(*) begin
+        lane_mask = {CHANNEL_COUNT{1'b0}};
+        lane_out  = {CHANNEL_COUNT{1'b0}};
+        for (lane_m = 0; lane_m < NUM_LANES; lane_m = lane_m + 1) begin
+            if (lane_active[lane_m]) begin
+                lane_mask[lane_bit_pos[lane_m]] = 1'b1;
+                lane_out[lane_bit_pos[lane_m]]  = lane_out[lane_bit_pos[lane_m]] | lane_bit[lane_m];
+            end
+        end
+    end
+    assign out = (state_mask & ~lane_mask) | lane_out;
     genvar gi;
     generate
         for (gi = 0; gi < BUS_COUNT; gi = gi + 1) begin : zlc_bus_out_assign
@@ -278,6 +338,75 @@ module zlc_edge_streamer #(
                 bus_ramp_start_tick[i] <= {TICK_WIDTH{1'b0}}; bus_ramp_stop_tick[i] <= {TICK_WIDTH{1'b0}};
                 bus_ramp_target[i] <= {BUS_WIDTH{1'b0}}; bus_ramp_delta[i] <= {(BUS_WIDTH+1){1'b0}};
                 bus_ramp_denom[i] <= {TICK_WIDTH{1'b0}}; bus_ramp_accum[i] <= {(TICK_WIDTH+BUS_WIDTH+1){1'b0}};
+            end
+        end
+    endtask
+
+    // ------------------------------------------------------------------ delay lanes
+    function [LANE_SEG_ADDR_WIDTH:0] zlc_lane_count_at;
+        input integer lane_index;
+        begin zlc_lane_count_at = lane_counts[lane_index*(LANE_SEG_ADDR_WIDTH+1) +: (LANE_SEG_ADDR_WIDTH+1)]; end
+    endfunction
+    function [CHANNEL_BIT_WIDTH-1:0] zlc_lane_bit_at;
+        input integer lane_index;
+        begin zlc_lane_bit_at = lane_channel_bits[lane_index*CHANNEL_BIT_WIDTH +: CHANNEL_BIT_WIDTH]; end
+    endfunction
+
+    task zlc_lane_clear_runtime;
+        integer i;
+        begin
+            for (i = 0; i < NUM_LANES; i = i + 1) begin
+                lane_idx[i] <= {(LANE_SEG_ADDR_WIDTH+1){1'b0}};
+                lane_bit[i] <= 1'b0;
+            end
+        end
+    endtask
+
+    // Unified lane player (mirrors zlc_bus_tick): reinit==1 reseeds the lane to the
+    // boundary lane-time llt_value; reinit==0 advances ONE edge to llt_value (the
+    // running step).  Both read exactly ONE edge and call the SHARED zlc_effective_tick
+    // MAC ONCE per lane (no unrolled walk -> no replicated multipliers).
+    //
+    // Why one edge is enough for reinit: the host reseeds lanes ONLY to llt==0 -- every
+    // lane program has loop_start_index==0, loop_count==1, repeat_from_index==0
+    // (the reordering-delay scan is single-frame; validate ENFORCES this, rejecting an
+    // inner bracket / additive preamble on a lane channel).  At llt==0 the lane edges
+    // are strictly increasing >= 0, so at most edge 0 can satisfy eff<=0; checking edge 0
+    // alone reproduces the model's reinit.  llt rises by 1/cycle and lane edges are >=1
+    // tick apart, so the running step also fires at most one edge/cycle.  Byte-identical
+    // to engine_model._lane_bits at llt==0 (the no-sim proof: _rtl_lane_realization_play).
+    task zlc_lane_tick;
+        input reinit;
+        input [TICK_WIDTH-1:0] llt_value;
+        input [SLOT_BITS-1:0] slot_vec;
+        reg [LANE_SEG_ADDR_WIDTH:0] cnt;
+        reg [LANE_SEG_ADDR_WIDTH:0] cur;
+        reg [TICK_WIDTH-1:0] lane_eff;
+        reg lane_due;
+        begin
+            // Guard on the HELD CTRL scalars (lane_count / lane_counts), not the
+            // registered lane_active/lane_count_active, so the start-cycle seed runs
+            // correctly even though those registers latch this same cycle (NBA).
+            for (lane_i = 0; lane_i < NUM_LANES; lane_i = lane_i + 1) begin
+                cnt = zlc_lane_count_at(lane_i);
+                if ((lane_i < lane_count) && (cnt != {(LANE_SEG_ADDR_WIDTH+1){1'b0}})) begin
+                    // edge under inspection: edge 0 on reinit (llt==0), else the next edge.
+                    // ONE effective_tick eval per lane per cycle (the single shared MAC site
+                    // counted in host.image.solve_capacity) -- no unrolled walk.
+                    cur = reinit ? {(LANE_SEG_ADDR_WIDTH+1){1'b0}} : lane_idx[lane_i];
+                    lane_flat_addr = (lane_i * MAX_LANE_EDGES) + cur[LANE_SEG_ADDR_WIDTH-1:0];
+                    lane_eff = zlc_effective_tick(lane_tick_mem[lane_flat_addr], lane_coeff_mem[lane_flat_addr], slot_vec);
+                    lane_due = (cur < cnt) && (lane_eff <= llt_value);
+                    if (reinit) begin
+                        // at llt==0 only edge 0 can be due; otherwise the lane idles low
+                        lane_bit[lane_i] <= lane_due ? lane_value_mem[lane_flat_addr] : 1'b0;
+                        lane_idx[lane_i] <= lane_due ? {{(LANE_SEG_ADDR_WIDTH){1'b0}}, 1'b1}
+                                                     : {(LANE_SEG_ADDR_WIDTH+1){1'b0}};
+                    end else if (lane_due) begin
+                        lane_bit[lane_i] <= lane_value_mem[lane_flat_addr];
+                        lane_idx[lane_i] <= cur + 1'b1;
+                    end
+                end
             end
         end
     endtask
@@ -437,11 +566,17 @@ module zlc_edge_streamer #(
     reg bnd_seed;              // reseed the edge prefetch from edge-0 shadows
     reg bnd_recompute_final;   // recompute final_tick / loop_end_active
     reg [SLOT_BITS-1:0] bnd_slots;
+    // delay-lane boundary work (same dispatch as the bus/edge boundary work, so the
+    // lane affine MAC is the SAME shared evaluator -- no per-lane DSP).
+    reg bnd_lane_tick;         // run the lane players this cycle
+    reg bnd_lane_reinit;       // ...as a gapless reseed to bnd_lane_llt (vs. a normal step)
+    reg [TICK_WIDTH-1:0] bnd_lane_llt;   // the lane-time (llt) to advance/seed to
 
     always @(posedge clk) begin
         reset_meta <= reset; reset_sync <= reset_meta;
         start_meta <= start; start_sync <= start_meta; start_prev <= start_sync;
         bus_prog_we_meta <= bus_prog_we; bus_prog_we_sync <= bus_prog_we_meta; bus_prog_we_prev <= bus_prog_we_sync;
+        lane_prog_we_meta <= lane_prog_we; lane_prog_we_sync <= lane_prog_we_meta; lane_prog_we_prev <= lane_prog_we_sync;
 
         if (reset_sync && bus_prog_we_event && bus_prog_bus < BUS_COUNT) begin
             bus_prog_flat_addr = {bus_prog_bus, bus_prog_addr};
@@ -456,15 +591,26 @@ module zlc_edge_streamer #(
             bus_stop_tick_coeff_mem[bus_prog_flat_addr] <= bus_prog_stop_tick_coeffs;
         end
 
+        // delay-lane LUTRAM write (toggled prog_we, while reset held -- mirrors bus_prog_*)
+        if (reset_sync && lane_prog_we_event && lane_prog_lane < NUM_LANES) begin
+            lane_flat_addr = (lane_prog_lane * MAX_LANE_EDGES) + lane_prog_addr;
+            lane_tick_mem[lane_flat_addr] <= lane_prog_tick;
+            lane_coeff_mem[lane_flat_addr] <= lane_prog_coeffs;
+            lane_value_mem[lane_flat_addr] <= lane_prog_value;
+        end
+
         // boundary work-request defaults (consumed once, after the state chain)
         bnd_bus_tick = 1'b0; bnd_bus_reinit = 1'b0; bnd_seed = 1'b0;
         bnd_recompute_final = 1'b0; bnd_slots = slot_active;
+        bnd_lane_tick = 1'b0; bnd_lane_reinit = 1'b0; bnd_lane_llt = lane_time;
 
         if (reset_sync) begin
             running <= 1'b0; done <= 1'b0; underflow <= 1'b0;
             state_mask <= {CHANNEL_COUNT{1'b0}};
             arm_nv <= 3'd0; pend <= {RD_LAT{1'b0}};
             zlc_bus_clear_runtime();
+            zlc_lane_clear_runtime();
+            lane_time <= {TICK_WIDTH{1'b0}}; lane_active <= {NUM_LANES{1'b0}};
             // --- settle-based ARM read sequence (no timing pressure) ---
             // CONTINUOUSLY re-runs (steps 0..9 then wraps to 0) for as long as reset
             // is held.  Critical for real hardware: the host holds the engine in reset
@@ -510,11 +656,20 @@ module zlc_edge_streamer #(
             scan_raddr <= scan_addr_of({{(SCAN_COUNT_WIDTH-1){1'b0}},1'b1});      // pre-read point 1
             loop_count_active <= (loop_count==0)?32'd1:loop_count;
             loops_remaining <= (loop_count==0)?32'd1:loop_count;
+            // latch the per-lane build constants (count / output channel_bit / active)
+            // from the held CTRL scalars; seed each lane to llt=0 below.
+            for (lane_i = 0; lane_i < NUM_LANES; lane_i = lane_i + 1) begin
+                lane_count_active[lane_i] <= zlc_lane_count_at(lane_i);
+                lane_bit_pos[lane_i] <= zlc_lane_bit_at(lane_i);
+                lane_active[lane_i] <= (lane_i < lane_count) && (zlc_lane_count_at(lane_i) != {(LANE_SEG_ADDR_WIDTH+1){1'b0}});
+            end
+            lane_time <= {TICK_WIDTH{1'b0}};
             // heavy affine work (final/loop_end recompute, bus (re)start, edge-0 seed)
             // is dispatched ONCE after the chain via these flags (see SLOT_MUL_WIDTH /
             // bnd_* notes): same cycle, same slots -> identical behavior, far fewer MACs.
             bnd_slots = scan_first_values; bnd_recompute_final = 1'b1;
             bnd_bus_tick = 1'b1; bnd_bus_reinit = 1'b1; bnd_seed = 1'b1;
+            bnd_lane_tick = 1'b1; bnd_lane_reinit = 1'b1; bnd_lane_llt = {TICK_WIDTH{1'b0}};
         end else if (running) begin
             landed = pend[RD_LAT-1];
             if (loop_count_active>32'd1 && loops_remaining>32'd1 && time_count>=loop_end_active) begin
@@ -528,6 +683,10 @@ module zlc_edge_streamer #(
                 fetch_idx <= {1'b0,loop_start_addr}+3'd4; edge_raddr <= loop_start_addr+3'd4;
                 pend <= {RD_LAT{1'b0}};
                 bnd_bus_tick = 1'b1; bnd_bus_reinit = 1'b1; bnd_slots = slot_active;  // re(start) bus, keep slots
+                // lane loop-rewind: llt = eff(loop_start), reseed (engine_model loop branch)
+                bnd_lane_tick = 1'b1; bnd_lane_reinit = 1'b1;
+                lane_time <= zlc_effective_tick(sh_ls0_t,sh_ls0_c,slot_active);
+                bnd_lane_llt = zlc_effective_tick(sh_ls0_t,sh_ls0_c,slot_active);
             end else if (time_count >= final_tick) begin
                 if (scan_enable_active && (scan_point_index+1'b1) < active_scan_count) begin
                     if (!scan_point_resident(scan_point_index+1'b1)) begin
@@ -541,6 +700,9 @@ module zlc_edge_streamer #(
                         loops_remaining <= loop_count_active;
                         bnd_slots = scan_rdata; bnd_recompute_final = 1'b1;
                         bnd_bus_tick = 1'b1; bnd_bus_reinit = 1'b1; bnd_seed = 1'b1;
+                        // lane scan-advance: llt = 0, reseed with the new slot vector
+                        bnd_lane_tick = 1'b1; bnd_lane_reinit = 1'b1; bnd_lane_llt = {TICK_WIDTH{1'b0}};
+                        lane_time <= {TICK_WIDTH{1'b0}};
                     end
                 end else if (repeat_forever_active) begin
                     if (repeat_from_loop_start && !scan_enable_active) begin
@@ -558,6 +720,10 @@ module zlc_edge_streamer #(
                         fetch_idx <= {1'b0,loop_start_addr}+3'd4; edge_raddr <= loop_start_addr+3'd4;
                         pend <= {RD_LAT{1'b0}};
                         bnd_bus_tick = 1'b1; bnd_bus_reinit = 1'b1; bnd_slots = slot_active;
+                        // lane additive-delay repeat: llt = eff(loop_start), reseed
+                        bnd_lane_tick = 1'b1; bnd_lane_reinit = 1'b1;
+                        lane_time <= zlc_effective_tick(sh_ls0_t,sh_ls0_c,slot_active);
+                        bnd_lane_llt = zlc_effective_tick(sh_ls0_t,sh_ls0_c,slot_active);
                     // Otherwise restart the sweep at point 0.  For a STREAMING scan the
                     // host has overwritten bank 0 with a later chunk, so wait until it
                     // reloads chunk 0 (bank_chunk0==0) before wrapping -- the re-sweep is
@@ -572,12 +738,19 @@ module zlc_edge_streamer #(
                         loops_remaining <= loop_count_active;
                         bnd_slots = scan_first_values; bnd_recompute_final = 1'b1;
                         bnd_bus_tick = 1'b1; bnd_bus_reinit = 1'b1; bnd_seed = 1'b1;
+                        // lane re-sweep / repeat-from-0: llt = 0, reseed with point-0 slots
+                        bnd_lane_tick = 1'b1; bnd_lane_reinit = 1'b1; bnd_lane_llt = {TICK_WIDTH{1'b0}};
+                        lane_time <= {TICK_WIDTH{1'b0}};
                     end
                 end else begin
                     running <= 1'b0; done <= 1'b1; state_mask <= {CHANNEL_COUNT{1'b0}}; zlc_bus_clear_runtime();
                 end
             end else begin
                 bnd_bus_tick = 1'b1; bnd_bus_reinit = 1'b0; bnd_slots = slot_active;  // normal bus step
+                // lane normal step: advance lane_time by 1 and step the lane players
+                // (engine_model: out at this tick, then llt += 1 and step for next tick).
+                bnd_lane_tick = 1'b1; bnd_lane_reinit = 1'b0;
+                lane_time <= lane_time + 1'b1; bnd_lane_llt = lane_time + 1'b1;
                 do_fire = (edge_index < active_count) && (arm_nv != 0) && (time_count == zlc_effective_tick(arm_t[0],arm_c[0],slot_active));
                 if (do_fire) begin
                     state_mask <= arm_m[0];
@@ -618,6 +791,9 @@ module zlc_edge_streamer #(
         end
         if (bnd_bus_tick) zlc_bus_tick(bnd_bus_reinit, bnd_slots);
         if (bnd_seed) seed_from_edge0(bnd_slots);
+        // dispatch the lane players once, on the SAME shared affine MAC + same slot
+        // vector as the rest of the boundary work (no per-lane DSP).
+        if (bnd_lane_tick) zlc_lane_tick(bnd_lane_reinit, bnd_lane_llt, bnd_slots);
     end
 
     initial begin arm_kicked = 1'b0; arm_step = 4'd0; arm_wait = 4'd0; end

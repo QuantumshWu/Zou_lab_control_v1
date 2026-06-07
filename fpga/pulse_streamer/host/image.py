@@ -12,6 +12,10 @@ Memory map (32-bit AXI words; the top decodes one axi_bram_ctrl port to regions)
   MASK   edge 62-bit masks    (2 words/edge, engine reads 64b: low 62 used)
   SCAN   2-bank ping-pong window: 2 * bank_size points * num_slots words
   BUS    bus-segment image    (7 words/seg, copied into engine LUTRAM by the top)
+  LANE   delay-lane image     (4 words/edge, copied into engine LUTRAM by the top):
+         a scanned digital DELAY whose edges reorder past other channels rides its
+         own disjoint output bit, played by a 1-bit affine sub-player (LUTRAM, the
+         shared MAC -- +0 RAMB36 / +0 DSP)
 
 The edge fields are separate BRAMs read in PARALLEL (one whole edge per access,
 no width padding) so max_edges is large; the scan window is small (2 banks) and
@@ -70,6 +74,9 @@ class CtrlWords:
     REPEAT_FROM_LOOP_START = 19  # repeat_forever rewinds to LOOP_START (additive-delay
     #                              steady frame), not edge 0, so the startup preamble
     #                              plays once
+    LANE_COUNT = 20       # number of active delay lanes
+    LANE_COUNTS = 21      # packed per-lane edge counts (lane_seg_addr_width+1 bits each)
+    LANE_BITS = 22        # packed per-lane output channel_bit (channel_bit_width bits each)
 
 
 CTRL_WORDS = 64
@@ -88,6 +95,14 @@ class StreamerParams:
     bus_width: int = 10
     bus_seg_addr_width: int = 6
     bus_sel_width: int = 3
+    # delay lanes: a scanned digital DELAY that reorders its edges past other
+    # channels is pulled out of the global sorted table onto its own DISJOINT bit
+    # and played by a 1-bit affine sub-player (structurally the per-bus DAC engine
+    # specialised to 1 bit).  The lane PLAY mem is engine-internal LUTRAM (+0
+    # RAMB36); only the small lane IMAGE staging costs a fixed BRAM, like the bus
+    # image.  num_lanes covers the few interfaces that can be simultaneously scanned.
+    num_lanes: int = 4
+    max_lane_edges: int = 64       # per-lane affine rise/fall edges (LUTRAM depth)
 
     @property
     def coeff_bits(self) -> int:
@@ -122,6 +137,19 @@ class StreamerParams:
         return 2 + 2 * self.coeff_words + 1
 
     @property
+    def lane_seg_addr_width(self) -> int:
+        return _addr_width(self.max_lane_edges)
+
+    @property
+    def lane_rows(self) -> int:
+        return self.num_lanes * self.max_lane_edges
+
+    @property
+    def lane_words(self) -> int:
+        # one lane edge = base tick (1) + slot coeffs (coeff_words) + value (1)
+        return 1 + self.coeff_words + 1
+
+    @property
     def edge_addr_width(self) -> int:
         return _addr_width(self.max_edges)
 
@@ -154,9 +182,10 @@ def region_bases(p: StreamerParams) -> dict:
     mask = coeff + p.max_edges * p.coeff_words
     scan = mask + p.max_edges * p.mask_words
     bus = scan + 2 * p.bank_size * p.scan_words
-    total = bus + p.bus_rows * p.bus_words
+    lane = bus + p.bus_rows * p.bus_words
+    total = lane + p.lane_rows * p.lane_words
     return {"ctrl": ctrl, "tick": tick, "coeff": coeff, "mask": mask,
-            "scan": scan, "bus": bus, "total": total}
+            "scan": scan, "bus": bus, "lane": lane, "total": total}
 
 
 # --------------------------------------------------------------------------- bits
@@ -254,6 +283,9 @@ def pack_program(program, params: StreamerParams | None = None) -> dict[int, int
     coeffs = list(getattr(program, "tick_slot_coeffs", None) or [[0] * slot_count for _ in ticks])
     points = [list(pt) for pt in (getattr(program, "scan_points", None) or [])]
     bus_segments = list(getattr(program, "bus_segments", None) or [])
+    delay_lanes = list(getattr(program, "delay_lanes", None) or [])
+    if len(delay_lanes) > p.num_lanes:
+        raise ValueError(f"{len(delay_lanes)} delay lanes > num_lanes {p.num_lanes}.")
 
     w: dict[int, int] = {}
     w[CtrlWords.MAGIC] = IMAGE_MAGIC
@@ -323,6 +355,34 @@ def pack_program(program, params: StreamerParams | None = None) -> dict[int, int
             flags |= (_stop_sel & ((1 << p.bus_sel_width) - 1)) << (2 * p.bus_width + 2 + p.bus_sel_width)
             w[row + 2 + 2 * p.coeff_words] = flags
     w[CtrlWords.BUS_COUNTS] = bus_counts
+
+    # delay lanes (lane-major): each lane's affine rise/fall sub-edges go into a
+    # disjoint LUTRAM player.  The lane PLAY mem is engine-internal LUTRAM; only this
+    # small image is staged in BRAM (mirrors the bus image).  lane_counts packs the
+    # per-lane edge count; lane_bits packs each lane's output channel_bit.
+    lane_cnt_w = p.lane_seg_addr_width + 1
+    bit_w = _addr_width(max(2, p.channel_count))
+    lane_counts = 0
+    lane_bits = 0
+    for k, lane in enumerate(delay_lanes):
+        lane_ticks = [int(t) for t in getattr(lane, "ticks", [])]
+        lane_coeffs = [list(c) for c in getattr(lane, "coeffs", [])]
+        lane_values = [int(v) for v in getattr(lane, "values", [])]
+        n_lane_edges = len(lane_ticks)
+        if n_lane_edges > p.max_lane_edges:
+            raise ValueError(f"delay lane {k} has {n_lane_edges} edges > max_lane_edges {p.max_lane_edges}.")
+        lane_counts |= (n_lane_edges & ((1 << lane_cnt_w) - 1)) << (k * lane_cnt_w)
+        lane_bits |= (int(getattr(lane, "channel_bit", 0)) & ((1 << bit_w) - 1)) << (k * bit_w)
+        for e in range(n_lane_edges):
+            row = bases["lane"] + (k * p.max_lane_edges + e) * p.lane_words
+            w[row + 0] = _to_unsigned(lane_ticks[e], p.tick_width)
+            cw = _field_words(_pack_coeffs(lane_coeffs[e] if e < len(lane_coeffs) else [], p), p.coeff_bits)
+            for c in range(p.coeff_words):
+                w[row + 1 + c] = cw[c] if c < len(cw) else 0
+            w[row + 1 + p.coeff_words] = lane_values[e] & 0x1 if e < len(lane_values) else 0
+    w[CtrlWords.LANE_COUNT] = len(delay_lanes)
+    w[CtrlWords.LANE_COUNTS] = lane_counts
+    w[CtrlWords.LANE_BITS] = lane_bits
     return w
 
 
@@ -369,6 +429,23 @@ def unpack_program(words: Mapping[int, int], params: StreamerParams | None = Non
                 "value_select": (flags >> (2 * p.bus_width + 2)) & ((1 << p.bus_sel_width) - 1),
                 "stop_value_select": (flags >> (2 * p.bus_width + 2 + p.bus_sel_width)) & ((1 << p.bus_sel_width) - 1),
             })
+    # delay lanes (lane-major; the disjoint-bit 1-bit affine players)
+    lane_cnt_w = p.lane_seg_addr_width + 1
+    bit_w = _addr_width(max(2, p.channel_count))
+    lane_count = g(CtrlWords.LANE_COUNT)
+    lane_counts = g(CtrlWords.LANE_COUNTS)
+    lane_bits = g(CtrlWords.LANE_BITS)
+    delay_lanes = []
+    for k in range(lane_count):
+        n_lane_edges = (lane_counts >> (k * lane_cnt_w)) & ((1 << lane_cnt_w) - 1)
+        channel_bit = (lane_bits >> (k * bit_w)) & ((1 << bit_w) - 1)
+        lt, lc, lv = [], [], []
+        for e in range(n_lane_edges):
+            row = bases["lane"] + (k * p.max_lane_edges + e) * p.lane_words
+            lt.append(_from_unsigned(g(row + 0), p.tick_width))
+            lc.append(_unpack_coeffs(_unfield([g(row + 1 + c) for c in range(p.coeff_words)], p.coeff_bits), p))
+            lv.append(g(row + 1 + p.coeff_words) & 0x1)
+        delay_lanes.append({"channel_bit": channel_bit, "ticks": lt, "coeffs": lc, "values": lv})
     return {
         "ticks": ticks, "masks": masks, "tick_slot_coeffs": coeffs,
         "scan_points_resident": scan_points, "scan_count": n_points, "slot_count": slot_count,
@@ -381,6 +458,7 @@ def unpack_program(words: Mapping[int, int], params: StreamerParams | None = Non
         "loop_end_tick": g(CtrlWords.LOOP_END_TICK),
         "loop_end_slot_coeffs": _unpack_coeffs(_unfield([g(CtrlWords.LOOP_END_LO), g(CtrlWords.LOOP_END_HI)], p.coeff_bits), p),
         "bus_segments": bus_segments, "bank_size": g(CtrlWords.BANK_SIZE),
+        "delay_lanes": delay_lanes,
     }
 
 
@@ -440,6 +518,7 @@ def _scan_ramb(bank_size: int, p: StreamerParams) -> int:
 def solve_capacity(part, *, channel_count: int = 62, num_slots: int = 4, coeff_width: int = 16,
                    tick_width: int = 32, coeff_frac_bits: int = 8, bus_count: int = 4,
                    bus_width: int = 10, bus_seg_addr_width: int = 6, bus_sel_width: int = 3,
+                   num_lanes: int = 4, max_lane_edges: int = 64,
                    slot_mul_width: int = 25,
                    target_pct: float = 90.0, bank_size: int = 512,
                    max_edges_cap: int = 16384,
@@ -458,13 +537,18 @@ def solve_capacity(part, *, channel_count: int = 62, num_slots: int = 4, coeff_w
     base = StreamerParams(channel_count=channel_count, num_slots=num_slots, coeff_width=coeff_width,
                           tick_width=tick_width, coeff_frac_bits=coeff_frac_bits, max_edges=256,
                           bank_size=bank_size, bus_count=bus_count, bus_width=bus_width,
-                          bus_seg_addr_width=bus_seg_addr_width, bus_sel_width=bus_sel_width)
+                          bus_seg_addr_width=bus_seg_addr_width, bus_sel_width=bus_sel_width,
+                          num_lanes=num_lanes, max_lane_edges=max_lane_edges)
     # bus image is a small 32b BRAM (bus_rows*bus_words words); bus tables themselves
     # live in engine LUTRAM (counted under distributed RAM / LUT, not RAMB36).
     bus_img_ram = _ceil(base.bus_rows * base.bus_words, 1024)
+    # lane IMAGE staging is a small 32b BRAM too (lane_rows*lane_words words); the lane
+    # PLAY tables live in engine LUTRAM (distributed RAM / LUT), +0 RAMB36 + +0 DSP
+    # (the shared affine MAC), exactly like the bus engine they replicate.
+    lane_img_ram = _ceil(base.lane_rows * base.lane_words, 1024)
     scan_ram = _scan_ramb(bank_size, base)
     ctrl_ram = 1
-    fixed = scan_ram + bus_img_ram + ctrl_ram
+    fixed = scan_ram + bus_img_ram + lane_img_ram + ctrl_ram
     # largest pow2 max_edges whose edge BRAM fits the remaining budget
     max_edges = 256
     for cand in (16384, 8192, 4096, 2048, 1024, 512, 256):
@@ -479,7 +563,7 @@ def solve_capacity(part, *, channel_count: int = 62, num_slots: int = 4, coeff_w
     for cand in (8192, 4096, 2048, 1024, bank_size):
         if cand < bank_size:
             continue
-        if _edge_ramb(max_edges, base) + _scan_ramb(cand, base) + bus_img_ram + ctrl_ram <= budget:
+        if _edge_ramb(max_edges, base) + _scan_ramb(cand, base) + bus_img_ram + lane_img_ram + ctrl_ram <= budget:
             chosen_bank = cand
             break
     bank_size = chosen_bank
@@ -487,22 +571,28 @@ def solve_capacity(part, *, channel_count: int = 62, num_slots: int = 4, coeff_w
     params = StreamerParams(channel_count=channel_count, num_slots=num_slots, coeff_width=coeff_width,
                             tick_width=tick_width, coeff_frac_bits=coeff_frac_bits, max_edges=max_edges,
                             bank_size=bank_size, bus_count=bus_count, bus_width=bus_width,
-                            bus_seg_addr_width=bus_seg_addr_width, bus_sel_width=bus_sel_width)
-    ramb36_used = _edge_ramb(max_edges, params) + scan_ram + bus_img_ram + ctrl_ram
+                            bus_seg_addr_width=bus_seg_addr_width, bus_sel_width=bus_sel_width,
+                            num_lanes=num_lanes, max_lane_edges=max_lane_edges)
+    ramb36_used = _edge_ramb(max_edges, params) + scan_ram + bus_img_ram + lane_img_ram + ctrl_ram
     # per bus-segment row: start+stop tick (2*tick_width), start+stop tick coeffs
     # (2*coeff_bits), start+stop value (2*bus_width), mode (2), and the start AND stop
     # value_select (2*bus_sel_width -- a ramp can scan both endpoints).
     bus_lutram = _ceil((2 * tick_width + 2 * params.coeff_bits + 2 * bus_width + 2 + 2 * bus_sel_width) * params.bus_rows, 64)
+    # per lane-edge LUTRAM row: base tick (tick_width) + slot coeffs (coeff_bits) + value (1).
+    # The lane PLAY tables are engine-internal distributed RAM (LUT, +0 RAMB36, +0 DSP via
+    # the shared affine MAC).  Counted under LUT so the capacity contract stays honest.
+    lane_lutram = _ceil((tick_width + params.coeff_bits + 1) * params.lane_rows, 64)
 
     # DSP estimate, derived from the engine's affine-MAC (zlc_effective_tick) call
     # sites -- the dominant DSP user.  After the shared-MAC dedup the engine has:
     #   * bus_tick: 2 evals/bus (segment start + stop), ONE shared set      -> 2*bus_count
     #   * main: edge-0 seed, final, loop_end, loop-rewind, next-edge compare -> 5
+    #   * lane_tick: 1 eval/lane (single-edge reinit OR step, one shared site) -> num_lanes
     # Each eval is num_slots products of coeff(<=18b) x slot(slot_mul_width); a slot
     # operand <=25b fits ONE DSP48E1 (25x18), else two.  Keep this in sync with
     # zlc_edge_streamer.v so capacity is checked for DSP, not just BRAM.
     if engine_dsp is None:
-        mac_instances = 2 * bus_count + 5
+        mac_instances = 2 * bus_count + 5 + num_lanes
         dsp_per_mult = 1 if slot_mul_width <= 25 else 2
         engine_dsp = mac_instances * num_slots * dsp_per_mult
 
@@ -513,7 +603,7 @@ def solve_capacity(part, *, channel_count: int = 62, num_slots: int = 4, coeff_w
 
     report = {
         "ramb36": res(ramb36_used, prof.ramb36),
-        "lut": res(engine_logic_luts + bus_lutram, prof.lut),
+        "lut": res(engine_logic_luts + bus_lutram + lane_lutram, prof.lut),
         "ff": res(engine_ff, prof.ff),
         "dsp": res(engine_dsp, prof.dsp),
     }

@@ -552,8 +552,11 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     # dies with "named port connection 'enb' does not exist". Keep ena/enb symmetric.
     assert ".ena(" in top and ".enb(" in top
     assert "Always_Enabled" not in create_tcl
-    assert create_tcl.count("Enable_A {Use_ENA_Pin}") == 5   # all 5 BRAMs expose ENA
-    assert create_tcl.count("Enable_B {Use_ENB_Pin}") == 5   # ...and ENB (top drives both)
+    # 6 BRAMs now: 3 edge + scan + bus image + LANE image (the disjoint-bit delay-lane
+    # staging; the lane PLAY tables are engine LUTRAM, +0 RAMB36).
+    assert create_tcl.count("Enable_A {Use_ENA_Pin}") == 6   # all 6 BRAMs expose ENA
+    assert create_tcl.count("Enable_B {Use_ENB_Pin}") == 6   # ...and ENB (top drives both)
+    assert "blk_mem_gen_laneimg" in create_tcl and "blk_mem_gen_laneimg" in top
     # AXI4 BURST upload path: jtag_axi + axi_bram_ctrl are FULL AXI4 (not Lite), and the
     # top wires the INCR-burst sidebands -- so one create_hw_axi_txn -len N moves up to
     # 256 words and a few-thousand-word BRAM upload drops from seconds to ~100 ms.  A
@@ -565,6 +568,22 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     # additive-delay repeat: the engine rewinds repeat_forever to the steady frame
     # (loop_start), not edge 0, so the real-startup preamble plays exactly once.
     assert "repeat_from_loop_start" in engine and "repeat_from_loop_start" in top
+    # DISJOINT-BIT DELAY LANES: a scanned digital delay whose edges reorder past other
+    # channels is pulled out of the global sorted table onto its own output bit, played
+    # by a 1-bit affine sub-player (structurally the per-bus DAC engine).  The engine
+    # must contain the lane LUTRAM player + the disjoint-bit merge; the top must surface
+    # the lane prog port + the lane image loader.  Locks the RTL to engine_model lanes.
+    assert "lane_value_mem" in engine and "lane_tick_mem" in engine and "lane_coeff_mem" in engine
+    assert "zlc_lane_tick" in engine and "bnd_lane_reinit" in engine
+    assert "lane_channel_bits" in engine and "lane_bit_pos" in engine
+    assert 'ram_style = "distributed"' in engine and "lane_tick_mem" in engine  # lane mem is LUTRAM, NOT BRAM
+    # the disjoint-bit output merge: out = (state_mask & ~lane_mask) | lane_out
+    assert "(state_mask & ~lane_mask) | lane_out" in engine
+    assert "lane_prog_we" in top and "lane_channel_bits" in top
+    assert "blk_mem_gen_laneimg" in top                   # lane IMAGE staging BRAM (mini-loader)
+    assert "C_LANE_COUNTS" in top and "C_LANE_BITS" in top
+    # lane PLAY mem MUST be distributed LUTRAM (never BRAM -- BRAM would bust the 35T)
+    assert "blk_mem_gen_lane " not in engine and "blk_mem_gen_lane(" not in engine
     assert "set top zlc_pulse_streamer_top" in program_tcl
     assert "ps.runs" in program_tcl
     assert "pulse_streamer.runs" not in program_tcl
@@ -1251,12 +1270,20 @@ def test_final_image_solver_90pct_and_packs_round_trip():
     incl. a 0..1023 DAC ramp (one segment) + loop + scan resident."""
 
     from fpga.pulse_streamer.host.image import solve_capacity, pack_program, unpack_program, scan_bank_words
-    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram, RuntimeBusSegment
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram, RuntimeBusSegment, DelayLane
 
     s = solve_capacity("xc7a35t", channel_count=62, target_pct=90.0)
     assert s.params.max_edges >= 4096
     assert s.params.bank_size >= 512
+    # every axis (RAMB36/LUT/FF/DSP) must stay <=90% WITH the delay lanes -- the lane
+    # PLAY tables are LUTRAM (+0 RAMB36), but each lane has ONE affine-MAC eval site
+    # (single-edge reinit OR step, no unrolled walk), so lanes add num_lanes MAC
+    # instances of DSP -- counted honestly below.
     assert s.all_within_budget() and s.resource_report["ramb36"]["pct"] <= 90.0
+    assert all(r["pct"] <= 90.0 for r in s.resource_report.values())
+    assert s.params.num_lanes >= 1
+    # DSP includes the per-lane MAC sites (one eval per lane); must match the engine.
+    assert s.resource_report["dsp"]["used"] == (2 * s.params.bus_count + 5 + s.params.num_lanes) * s.params.num_slots
     big = solve_capacity("xc7a200t", channel_count=62)
     assert big.params.max_edges >= s.params.max_edges
 
@@ -1283,6 +1310,39 @@ def test_final_image_solver_90pct_and_packs_round_trip():
     assert b["mode"] == "ramp" and b["stop_value"] == 1023 and b["value_select"] == 2
     # a streamed chunk (beyond the resident window) packs into the right bank.
     assert scan_bank_words(prog, p, 0)  # chunk 0 non-empty
+
+
+def test_final_image_packs_delay_lanes_round_trip():
+    """The BRAM image round-trips the disjoint-bit DELAY LANES (host.image.pack_program
+    / unpack_program): each lane's affine base ticks + per-slot coeffs + 0/1 values,
+    plus the per-lane edge count and output channel_bit.  This is the host<->FPGA
+    contract for the lane image the top's mini-loader copies into the engine LUTRAM."""
+
+    from fpga.pulse_streamer.host.image import StreamerParams, pack_program, unpack_program, region_bases
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram, DelayLane
+
+    p = StreamerParams()
+    assert "lane" in region_bases(p)            # lane region exists after the bus region
+    prog = RuntimeSequenceProgram(
+        sequence_id="l", sequence_name="lanes", clock_hz=50e6,
+        channels=[f"ch{i:02d}" for i in range(62)],
+        ticks=[0, 50, 100], masks=[1 << 0, 0, 0],   # ch00 in the main table; ch01/ch07 on lanes
+        duration=4e-6, trigger_count=0, slot_count=1,
+        tick_slot_coeffs=[[0], [0], [0]],
+        scan_points=[[0], [30]], scan_coeff_frac_bits=8,
+        delay_lanes=[
+            DelayLane(channel="ch01", channel_bit=1, ticks=[0, 50], coeffs=[[256], [256]], values=[1, 0]),
+            DelayLane(channel="ch07", channel_bit=7, ticks=[10, 30, 60], coeffs=[[0], [128], [-64]], values=[1, 0, 1]),
+        ],
+    )
+    out = unpack_program(pack_program(prog, p), p)
+    pad = lambda r, n: list(r) + [0] * (n - len(r))
+    got = out["delay_lanes"]
+    assert len(got) == 2
+    assert got[0]["channel_bit"] == 1 and got[0]["ticks"] == [0, 50] and got[0]["values"] == [1, 0]
+    assert got[0]["coeffs"] == [pad([256], p.num_slots), pad([256], p.num_slots)]
+    assert got[1]["channel_bit"] == 7 and got[1]["ticks"] == [10, 30, 60] and got[1]["values"] == [1, 0, 1]
+    assert got[1]["coeffs"] == [pad([0], p.num_slots), pad([128], p.num_slots), pad([-64], p.num_slots)]
 
 
 def test_final_engine_model_fifo_1tick_and_streaming_scan():
@@ -1438,29 +1498,33 @@ def test_final_top_regions_match_image_and_has_structure():
     p = dataclasses.replace(im.StreamerParams(), bank_size=2048, max_edges=4096)
     rb = im.region_bases(p)
     me = 4096
+    bus_base = 64 + me + me * 2 + me * 2 + (2 * 2048) * 4
     top = {
         "tick": 64,
         "coeff": 64 + me,
         "mask": 64 + me + me * 2,
         "scan": 64 + me + me * 2 + me * 2,
-        "bus": 64 + me + me * 2 + me * 2 + (2 * 2048) * 4,
+        "bus": bus_base,
+        # bus image is bus_rows*bus_words = (4*64)*7 = 1792 words; lanes follow.
+        "lane": bus_base + (p.bus_count * p.max_bus_segments) * p.bus_words,
     }
-    for k in ("tick", "coeff", "mask", "scan", "bus"):
+    for k in ("tick", "coeff", "mask", "scan", "bus", "lane"):
         assert rb[k] == top[k], (k, rb[k], top[k])
 
     # one clean module, instantiates the final engine (no variant), 3 edge BRAMs
     assert "module zlc_pulse_streamer_top" in text and text.count("endmodule") == 1
     assert "zlc_edge_streamer" in text
     for ip in ("blk_mem_gen_edge_tick", "blk_mem_gen_edge_coeff", "blk_mem_gen_edge_mask",
-               "blk_mem_gen_scan", "blk_mem_gen_busimg"):
+               "blk_mem_gen_scan", "blk_mem_gen_busimg", "blk_mem_gen_laneimg"):
         assert ip in text, ip
     # streaming handshake + cursor read-back
     assert "bank_ready" in text and "scan_cursor" in text and "C_CURSOR" in text and "C_BANK_READY" in text
     # CTRL word map matches host.image.CtrlWords
     cw = im.CtrlWords
     for name, off in (("C_COMMAND", cw.COMMAND), ("C_STATUS", cw.STATUS), ("C_PROG_COUNT", cw.PROG_COUNT),
-                      ("C_BANK_SIZE", cw.BANK_SIZE), ("C_CURSOR", cw.CURSOR), ("C_BANK_READY", cw.BANK_READY)):
-        m = re.search(r"localparam integer %s = (\d+);" % name, text)
+                      ("C_BANK_SIZE", cw.BANK_SIZE), ("C_CURSOR", cw.CURSOR), ("C_BANK_READY", cw.BANK_READY),
+                      ("C_LANE_COUNT", cw.LANE_COUNT), ("C_LANE_COUNTS", cw.LANE_COUNTS), ("C_LANE_BITS", cw.LANE_BITS)):
+        m = re.search(r"localparam integer %s\s*= (\d+);" % name, text)
         assert m and int(m.group(1)) == off, (name, off, m and m.group(1))
     assert "jtag_axi_0" in text and "axi_bram_ctrl_0" in text
 
@@ -3945,6 +4009,7 @@ def test_pulse_table_reordering_scan_delay_uses_disjoint_lane():
     all three engine models (combinatorial reference, FIFO, exact RTL mirror) agreeing."""
     import Zou_lab_control.neutral_atom as na
     from fpga.pulse_streamer.host import engine_model as em
+    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import validate_pulse_streamer_program
 
     st = na.PulseTableState(
         channels=["A", "B"],
@@ -3954,6 +4019,10 @@ def test_pulse_table_reordering_scan_delay_uses_disjoint_lane():
         scan_table=[[0.0], [600.0]],   # B delay 0, then 30 ticks -> B's edges cross A's
     )
     prog = na.compile_pulse_table_scan_runtime_program(st, channels=["A", "B"], clock_hz=50e6, repeat_forever=False)
+    # the lane RTL is built now, so the program must VALIDATE (the safety gate is gone):
+    # the lane channel bit is disjoint, edge count fits, and the per-point effective
+    # ticks are in-frame + strictly increasing.
+    validate_pulse_streamer_program(prog, channel_count=62)
     assert prog.delay_lanes and len(prog.delay_lanes) == 1
     lane = prog.delay_lanes[0]
     assert lane.channel == "B" and lane.channel_bit == 1
@@ -3972,3 +4041,184 @@ def test_pulse_table_reordering_scan_delay_uses_disjoint_lane():
     # -> [30,80) shifted into the second frame = [130,180).  The reordering is correct.
     assert _lane_on_intervals(r, 0) == [(0, 50), (100, 150)]
     assert _lane_on_intervals(r, 1) == [(0, 50), (130, 180)]
+
+
+def _rtl_lane_realization_play(ep, n_ticks):
+    """Re-implement the EXACT register transfers of the zlc_edge_streamer.v lane player
+    (lane_time/lane_idx/lane_bit, the bounded reinit fast-forward, the single-edge
+    normal step, the disjoint-bit merge) on top of rtl_mirror_play's main FSM.  A
+    divergence from reference_play flags a bug in THAT RTL realisation, not just the
+    abstract model -- the no-Verilog-sim proof for the lane sub-players."""
+    from fpga.pulse_streamer.host import engine_model as em
+    p = ep
+    n = len(p.ticks)
+    scan_en = bool(p.scan_points); scan_count = len(p.scan_points); frac = p.frac_bits
+
+    def e(i, s):
+        return em.effective_tick(p.ticks[i], p.tick_slot_coeffs[i], s, frac)
+
+    def e_le(s):
+        return em.effective_tick(p.loop_end_tick, p.loop_end_slot_coeffs, s, frac)
+
+    def le(L, i, s):
+        return em.effective_tick(L["ti"][i], L["co"][i], s, frac)
+
+    arm = []; pend = [None] * 2; fetch_idx = 0; rd_lat = 2; fd = 3
+
+    def reseed_from(si):
+        nonlocal fetch_idx, pend
+        arm.clear()
+        for k in range(fd):
+            if si + k < n:
+                arm.append(si + k)
+        fetch_idx = si + fd; pend = [None] * rd_lat
+
+    lanes = em._make_lanes(p)
+    LANE_MASK = 0
+    for L in lanes:
+        LANE_MASK |= 1 << L["cb"]
+
+    def lane_reinit(llt, s):          # RTL reseeds lanes ONLY to llt==0 -> single-edge
+        for L in lanes:               # check (edge 0 is the only one that can be <=0)
+            L["idx"] = 0; L["bit"] = 0
+            if len(L["ti"]) and le(L, 0, s) <= llt:
+                L["bit"] = L["va"][0]; L["idx"] = 1
+
+    def lane_step(llt, s):            # advance the single next edge if now due
+        for L in lanes:
+            if L["idx"] < len(L["ti"]) and le(L, L["idx"], s) <= llt:
+                L["bit"] = L["va"][L["idx"]]; L["idx"] += 1
+
+    def lane_bits():
+        b = 0
+        for L in lanes:
+            b |= L["bit"] << L["cb"]
+        return b
+
+    def boundary_to():
+        if e(0, slot) == 0:
+            reseed_from(1); return p.masks[0], 1, 1
+        reseed_from(0); return 0, 0, 0
+
+    slot = em._first_values(p)
+    final = 0 if n == 0 else e(n - 1, slot)
+    loop_end = e_le(slot); loops = p.loop_count; spi = 0; running = n != 0; llt = 0
+    if running:
+        sm, tc, ei = boundary_to(); lane_reinit(0, slot)
+    else:
+        sm, tc, ei = 0, 0, 0
+    out = []
+    for _ in range(n_ticks):
+        out.append((sm & ~LANE_MASK) | lane_bits())
+        llt += 1
+        if not running:
+            continue
+        if p.loop_count > 1 and loops > 1 and tc >= loop_end:
+            sm = p.masks[p.loop_start_index]; tc = e(p.loop_start_index, slot) + 1
+            ei = p.loop_start_index + 1; loops -= 1; reseed_from(p.loop_start_index + 1)
+            llt = e(p.loop_start_index, slot); lane_reinit(llt, slot); continue
+        if tc >= final:
+            if scan_en and spi + 1 < scan_count:
+                slot = list(p.scan_points[spi + 1]); spi += 1
+            elif p.repeat_forever and p.repeat_from_index > 0 and not scan_en:
+                ri = p.repeat_from_index
+                final = e(n - 1, slot); loop_end = e_le(slot); loops = p.loop_count
+                sm = p.masks[ri]; tc = e(ri, slot) + 1; ei = ri + 1; reseed_from(ri + 1)
+                llt = e(ri, slot); lane_reinit(llt, slot); continue
+            elif p.repeat_forever:
+                slot = em._first_values(p); spi = 0
+            else:
+                running = False; sm = 0; continue
+            final = e(n - 1, slot); loop_end = e_le(slot); loops = p.loop_count
+            sm, tc, ei = boundary_to(); llt = 0; lane_reinit(0, slot); continue
+        landed = pend[rd_lat - 1]
+        fire = (ei < n) and len(arm) and tc == e(arm[0], slot)
+        if fire:
+            sm = p.masks[arm[0]]; ei += 1; arm.pop(0)
+        if landed is not None:
+            arm.append(landed)
+        tc += 1
+        ifl = sum(1 for x in pend[0:rd_lat - 1] if x is not None)
+        issue = (len(arm) + ifl < fd) and fetch_idx < n
+        pend = [fetch_idx if issue else None] + pend[0:rd_lat - 1]
+        if issue:
+            fetch_idx += 1
+        lane_step(llt, slot)
+    return out
+
+
+def test_rtl_lane_player_realization_matches_reference():
+    """The SPECIFIC zlc_edge_streamer.v lane register design (lane_time + incremental
+    lane_idx + bounded reinit fast-forward + disjoint-bit merge) reproduces the
+    combinatorial reference for the reordering-delay program AND a fuzz set covering
+    start / scan-advance / loop-rewind / repeat / additive-repeat-from boundaries and
+    multiple lanes.  This is the no-Verilog-sim proof that the RTL realisation -- not
+    just engine_model -- is cycle-exact."""
+    import random
+    import Zou_lab_control.neutral_atom as na
+    from fpga.pulse_streamer.host import engine_model as em
+
+    # the real reordering-scan-delay program
+    st = na.PulseTableState(
+        channels=["A", "B"],
+        periods=[na.PulsePeriod(1000, (1, 1), unit="ns"), na.PulsePeriod(1000, (0, 0), unit="ns")],
+        time_step_ns=20, delays={"B": "s0"}, delay_units={"B": "ns"},
+        scan_slots=[{"kind": "delay", "target": "B", "unit": "ns", "nominal": 0.0}],
+        scan_table=[[0.0], [600.0]],
+    )
+    ep = em.EngineProgram.from_program(
+        na.compile_pulse_table_scan_runtime_program(st, channels=["A", "B"], clock_hz=50e6, repeat_forever=False))
+    assert _rtl_lane_realization_play(ep, 400) == em.reference_play(ep, 400)
+
+    def mk(**kw):
+        b = dict(ticks=[], masks=[], tick_slot_coeffs=[], scan_points=[], slot_count=0,
+                 frac_bits=8, loop_start_index=0, loop_end_tick=0, loop_end_slot_coeffs=[],
+                 loop_count=1, repeat_forever=False, repeat_from_index=0, delay_lanes=None)
+        b.update(kw)
+        b["tick_slot_coeffs"] = b["tick_slot_coeffs"] or [[0] * b["slot_count"] for _ in b["ticks"]]
+        b["loop_end_slot_coeffs"] = b["loop_end_slot_coeffs"] or [0] * b["slot_count"]
+        return em.EngineProgram(**b)
+
+    # The lane player reseeds only to llt==0 (single-frame reordering-delay scan: every
+    # lane program has loop_start==0, loop_count==1, repeat_from==0).  Cover start /
+    # scan-advance / repeat-forever-restart (all llt==0) + multiple lanes + an affine
+    # (scan-dependent) lane.  (Inner brackets / additive preamble on a lane are rejected
+    # by validate, never reach the RTL, and so are not modelled here.)
+    hand = {
+        "rf": mk(ticks=[0, 50, 100], masks=[1, 0, 0], loop_end_tick=100, repeat_forever=True,
+                 delay_lanes=[(1, [10, 40], [[0], [0]], [1, 0])]),
+        "scan": mk(ticks=[0, 50, 100], masks=[1, 0, 0], tick_slot_coeffs=[[0], [0], [0]],
+                   scan_points=[[0], [10], [20]], slot_count=1, loop_end_tick=100,
+                   delay_lanes=[(2, [0, 40], [[256], [256]], [1, 0])]),
+        "two": mk(ticks=[0, 80], masks=[1, 0], loop_end_tick=80, repeat_forever=True,
+                  delay_lanes=[(1, [5, 20], [[0], [0]], [1, 0]), (4, [10, 30], [[0], [0]], [1, 0])]),
+    }
+    for name, prog in hand.items():
+        assert _rtl_lane_realization_play(prog, 400) == em.reference_play(prog, 400), name
+
+    rnd = random.Random(11)
+    for _ in range(200):
+        frame = rnd.randint(20, 60)
+        mts = sorted({rnd.randint(0, frame - 2) for _ in range(rnd.randint(1, 4))})
+        mts = [0] + [t for t in mts if t > 0]
+        lanes = []; used = set()
+        for _ in range(rnd.randint(1, 3)):
+            cb = rnd.choice([1, 2, 3, 4, 5])
+            if cb in used:
+                continue
+            used.add(cb)
+            ts = sorted({rnd.randint(0, frame - 1) for _ in range(rnd.randint(2, 4))})
+            if len(ts) < 2:
+                continue
+            if len(ts) % 2:
+                ts = ts[:-1]
+            lanes.append((cb, ts, [[0] for _ in ts], [1 if i % 2 == 0 else 0 for i in range(len(ts))]))
+        if not lanes:
+            continue
+        # A lane program never rewinds to a non-zero frame tick (validate enforces
+        # loop_start==0 + no additive preamble), so the boundaries exercised are start /
+        # scan-advance / repeat-forever-restart -- all at llt==0.
+        prog = mk(ticks=mts + [frame], masks=[1 for _ in mts] + [0], loop_end_tick=frame,
+                  repeat_forever=(rnd.random() < 0.5),
+                  loop_start_index=0, loop_count=1, delay_lanes=lanes)
+        assert _rtl_lane_realization_play(prog, 500) == em.reference_play(prog, 500), (mts, lanes)
