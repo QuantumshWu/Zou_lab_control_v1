@@ -1448,7 +1448,11 @@ def test_pulse_table_analog_bus_modes_compile_to_runtime_bus_segments(tmp_path):
     na.validate_pulse_streamer_program(program, max_edges=16, max_bus_segments=4, tick_width=32, channel_count=4)
 
 
-def test_pulse_table_scan_rejects_analog_bus_ramp_mode():
+def test_pulse_table_scan_allows_analog_bus_ramp_with_timing_scan():
+    """A fixed-endpoint analog ramp combined with a scanned DURATION compiles: the
+    ramp's start/stop ticks are emitted as affine expressions so the ramp stretches
+    in lockstep with the scanned timing (no longer rejected)."""
+
     state = na.PulseTableState(
         channels=["ch00", "ch01"],
         channel_labels={"ch00": "da_test[0]", "ch01": "da_test[1]"},
@@ -1462,12 +1466,22 @@ def test_pulse_table_scan_rejects_analog_bus_ramp_mode():
     # Scan the duration of the first period (a time slot) ...
     state.bind_field("duration", "0")
     state.set_scan_table([[20.0], [40.0]])
-    # ... while the analog bus ramps: the seamless hardware scan path cannot do both.
+    # ... while the analog bus ramps between FIXED value endpoints: now supported.
     state.set_analog_bus_mode(0, "da_test", "edge", value=0)
     state.set_analog_bus_mode(1, "da_test", "ramp", value=3)
 
-    with pytest.raises(ValueError, match="scan array cannot currently combine"):
-        na.compile_pulse_table_scan_runtime_program(state, channels=["ch00", "ch01"], clock_hz=50_000_000)
+    program = na.compile_pulse_table_scan_runtime_program(
+        state, channels=["ch00", "ch01"], clock_hz=50_000_000
+    )
+    ramps = [s for s in (program.bus_segments or []) if s.mode == "ramp"]
+    assert ramps, "expected a ramp segment"
+    r = ramps[0]
+    # fixed value endpoints (no scanned-endpoint value_select) ...
+    assert r.start_value == 0 and r.stop_value == 3 and r.value_select == 0
+    # ... but affine ticks: the scanned-duration slot moves a ramp endpoint tick so
+    # the ramp stretches in lockstep with the scan.
+    assert any(c != 0 for c in (list(r.start_tick_coeffs or []) + list(r.stop_tick_coeffs or []))), \
+        "a ramp endpoint tick must be affine under the scan"
 
 
 def _v2_loop_steps_resolved(eff_ticks, masks, loop_start_index, eff_loop_end, loop_count, repeat_forever, steps):

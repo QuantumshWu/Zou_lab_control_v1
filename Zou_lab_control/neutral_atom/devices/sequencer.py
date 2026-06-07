@@ -353,21 +353,18 @@ def compile_pulse_table_scan_runtime_program(
     clock_step_ns = 1e9 / clock_hz
     if not state.scan_slots:
         raise ValueError("hardware scan requires at least one bound scan slot; bind a duration/delay/DAC first.")
-    dac_slots = [index for index, slot in enumerate(state.scan_slots) if slot.kind == "dac"]
-    # DAC value + duration + delay can now scan simultaneously: the analog-bus
-    # segment ticks are emitted as affine expressions (base + per-slot coeffs),
-    # so a scanned duration moves the bus segment in lockstep with the edges.
+    # DAC value + duration + delay scan simultaneously: every analog-bus segment's
+    # ticks are emitted as affine expressions (base + per-slot coeffs), so a scanned
+    # duration/delay moves the segment -- and any ramp's start/stop ticks -- in
+    # lockstep with the digital edges.  Ramps with fixed value endpoints therefore
+    # scan their TIMING freely; ramps whose value endpoints are themselves scanned
+    # use the dual start/stop value_select (see _pulse_table_bus_segments).
     table = [[float(value) for value in row] for row in (state.scan_table if scan_table is None else scan_table)]
     if not table:
         raise ValueError("hardware scan requires at least one scan-table row.")
     for index, row in enumerate(table):
         if len(row) != len(state.scan_slots):
             raise ValueError(f"scan table row {index} has {len(row)} values but {len(state.scan_slots)} slots.")
-    if _pulse_table_has_analog_ramp(state) and not dac_slots:
-        raise ValueError(
-            "hardware scan array cannot currently combine with analog bus ramps. "
-            "Use an edge-hold DAC level, or run one prepared analog-bus pulse per scan point."
-        )
     slot_vars = state.scan_var_names
 
     def point_slots_ns(row: Sequence[float]) -> dict[str, float]:
