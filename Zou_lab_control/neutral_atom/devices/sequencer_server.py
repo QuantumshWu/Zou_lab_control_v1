@@ -277,10 +277,9 @@ def build_arg_parser() -> ArgumentParser:
     parser.add_argument(
         "--backend",
         default="jtag-axi",
-        choices=["jtag-axi", "vivado-session", "command"],
-        help="Hardware backend. jtag-axi drives the run-length engine over a persistent "
-        "Vivado hw_axi session (the current architecture); vivado-session is the older VIO "
-        "edge-table path; command shells out per action.",
+        choices=["jtag-axi", "command"],
+        help="Hardware backend. jtag-axi drives the final edge-table streamer over a "
+        "persistent Vivado hw_axi (JTAG-to-AXI) session; command shells out per action.",
     )
     parser.add_argument(
         "--no-warm-start",

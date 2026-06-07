@@ -1,8 +1,12 @@
-"""Vivado/VIO runtime pulse-streamer backend for the FPGA computer.
+"""FPGA host helpers: board-XDC channel/trigger inference + program validation.
 
-The control computer sends a ``PulseSequence`` over RPyC.  The FPGA computer
-compiles it into a ``RuntimeSequenceProgram`` and this backend uploads the
-resulting edge table to a fixed pulse-streamer bitstream.
+The FINAL pulse streamer is driven over JTAG-to-AXI by
+``axi_session.VivadoAxiStreamerSession`` (which packs the BRAM image from
+``fpga.pulse_streamer.host.image`` and uploads it).  This module keeps only the
+host-side helpers shared by the server + GUI launcher: inferring channel names,
+labels, pins and the camera trigger from a board XDC, and validating a compiled
+``RuntimeSequenceProgram`` before upload.  (The old VIO/Vivado-Tcl HDL generator +
+session were removed with the rest of the legacy control path.)
 """
 
 from __future__ import annotations
