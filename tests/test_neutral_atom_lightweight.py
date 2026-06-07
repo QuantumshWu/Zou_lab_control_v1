@@ -1068,6 +1068,45 @@ def test_analog_ramp_can_scan_both_value_endpoints_round_trip():
     assert rseg.value_select == 1 and rseg.stop_value_select == 2
 
 
+def test_bus_play_models_dual_endpoint_ramp_and_held_value():
+    """Cycle-accurate bus-engine model (engine_model.bus_play) proves the dual
+    value_select path end-to-end: a ramp scans BOTH endpoints (start slot A -> stop
+    slot B) and an edge/hold segment tracks its scanned slot -- the bus-path
+    counterpart of the edge rtl_mirror proof (closes the no-bus-model gap)."""
+
+    from fpga.pulse_streamer.host.engine_model import bus_play
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram, RuntimeBusSegment
+
+    def prog(segs, points):
+        return RuntimeSequenceProgram(
+            sequence_id="b", sequence_name="b", clock_hz=50e6,
+            channels=[f"ch{i:02d}" for i in range(62)],
+            ticks=[0, 5, 200], masks=[0, 1, 0], duration=4e-6, trigger_count=0,
+            repeat_forever=False, loop_start_index=0, loop_end_tick=200, loop_count=1,
+            slot_count=2, slot_kinds=["dac", "dac"], loop_end_slot_coeffs=[0, 0],
+            tick_slot_coeffs=[[0, 0], [0, 0], [0, 0]], scan_points=points, scan_coeff_frac_bits=8,
+            bus_names=["da0"], bus_segments=segs)
+
+    ramp = RuntimeBusSegment(bus_index=0, start_tick=10, stop_tick=70, start_value=0, stop_value=0,
+                             mode="ramp", value_select=1, stop_value_select=2,
+                             start_tick_coeffs=[0, 0], stop_tick_coeffs=[0, 0])
+    p = prog([ramp], [[100, 900], [900, 100]])
+    up = bus_play(p, 0, 100, scan_point=0)        # ramp scanned-A(100) -> scanned-B(900)
+    assert up == sorted(up)                        # non-decreasing 0 -> 100 -> ... -> 900
+    assert 100 in up and max(up) == 900 and up[-1] == 900
+    down = bus_play(p, 0, 100, scan_point=1)       # ramp scanned-A(900) -> scanned-B(100)
+    assert max(down) == 900 and down[-1] == 100
+    s = down.index(900)
+    assert down[s:] == sorted(down[s:], reverse=True)   # non-increasing 900 -> 100
+
+    hold = RuntimeBusSegment(bus_index=0, start_tick=10, stop_tick=10, start_value=0, stop_value=0,
+                             mode="edge", value_select=1, stop_value_select=1,
+                             start_tick_coeffs=[0, 0], stop_tick_coeffs=[0, 0])
+    ph = prog([hold], [[300, 0], [700, 0]])
+    assert bus_play(ph, 0, 40, scan_point=0)[-1] == 300   # held DAC value tracks the scan slot
+    assert bus_play(ph, 0, 40, scan_point=1)[-1] == 700
+
+
 def test_edge_streamer_has_dual_value_select():
     """The RTL bus engine has the dual start/stop value_select path (a ramp can read
     a different scan slot for each endpoint)."""

@@ -32,7 +32,7 @@ from typing import Sequence
 
 __all__ = [
     "EngineProgram", "effective_tick", "reference_play", "prefetch_play",
-    "streaming_scan_play", "rtl_mirror_play", "min_edge_spacing",
+    "streaming_scan_play", "rtl_mirror_play", "bus_play", "min_edge_spacing",
     "PrefetchStall", "ScanUnderflow",
 ]
 
@@ -484,4 +484,67 @@ def rtl_mirror_play(program, n_ticks: int, *, rd_lat: int = 2, fifo_depth: int =
         if issue:
             fetch_idx += 1
         pend = new_pend
+    return out
+
+
+def bus_play(program, bus_index: int, n_ticks: int, scan_point: int = 0, *,
+             bus_width: int = 10, frac_bits: int | None = None) -> list[int]:
+    """Cycle-accurate mirror of zlc_edge_streamer.v's per-bus DAC engine
+    (zlc_bus_start_table + zlc_bus_step + zlc_bus_apply_segment): the interpolating
+    ramp, the DUAL start/stop value_select (a ramp can scan BOTH endpoints), and the
+    affine segment ticks.  Returns bus_out at each tick for one scan point -- the
+    bus-path counterpart of reference_play (which covers only the digital edges)."""
+
+    frac = int(getattr(program, "scan_coeff_frac_bits", 8)) if frac_bits is None else frac_bits
+    pts = list(getattr(program, "scan_points", None) or [])
+    point = list(pts[scan_point]) if pts else []
+    mask = (1 << bus_width) - 1
+    segs = [s for s in (getattr(program, "bus_segments", None) or []) if int(s.bus_index) == bus_index]
+
+    def eff(base, coeffs):
+        c = [int(x) for x in (coeffs or [])]
+        return effective_tick(int(base), c, point, frac) if (c and point) else int(base)
+
+    segs.sort(key=lambda s: eff(s.start_tick, s.start_tick_coeffs))
+
+    def endpoints(s):
+        vs = (point[int(s.value_select) - 1] & mask) if int(getattr(s, "value_select", 0)) else (int(s.start_value) & mask)
+        sss = int(getattr(s, "stop_value_select", getattr(s, "value_select", 0)))
+        ve = (point[sss - 1] & mask) if sss else (int(s.stop_value) & mask)
+        return vs, ve
+
+    st = {"idx": 0, "value": 0, "ramp": False, "rstart": 0, "rstop": 0,
+          "target": 0, "denom": 0, "accum": 0, "up": True, "delta": 0}
+
+    def apply(s):
+        vs, ve = endpoints(s)
+        ts = eff(s.start_tick, s.start_tick_coeffs)
+        te = eff(s.stop_tick, s.stop_tick_coeffs)
+        if str(s.mode).lower() == "ramp" and te > ts:
+            st.update(value=vs, ramp=True, rstart=ts, rstop=te, target=ve, denom=te - ts,
+                      accum=0, up=ve >= vs, delta=(ve - vs) if ve >= vs else (vs - ve))
+        else:
+            st.update(value=ve, ramp=False, accum=0)
+
+    if segs and eff(segs[0].start_tick, segs[0].start_tick_coeffs) == 0:
+        apply(segs[0]); st["idx"] = 1
+
+    out = []
+    for t in range(n_ticks):
+        out.append(st["value"])           # registered bus_out value at this tick
+        if st["ramp"]:
+            if t >= st["rstop"]:
+                st["value"] = st["target"]; st["ramp"] = False; st["accum"] = 0
+                if st["idx"] < len(segs) and eff(segs[st["idx"]].start_tick, segs[st["idx"]].start_tick_coeffs) <= t:
+                    apply(segs[st["idx"]]); st["idx"] += 1
+            elif t > st["rstart"] and st["denom"]:
+                st["accum"] += st["delta"]
+                if st["accum"] >= st["denom"]:
+                    st["accum"] -= st["denom"]
+                    if st["up"] and st["value"] < st["target"]:
+                        st["value"] += 1
+                    elif (not st["up"]) and st["value"] > st["target"]:
+                        st["value"] -= 1
+        elif st["idx"] < len(segs) and t >= eff(segs[st["idx"]].start_tick, segs[st["idx"]].start_tick_coeffs):
+            apply(segs[st["idx"]]); st["idx"] += 1
     return out
