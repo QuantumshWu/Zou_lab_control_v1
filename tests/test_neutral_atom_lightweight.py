@@ -2545,7 +2545,9 @@ def test_bound_pulse_frame_sequence_uses_requested_frames_not_gui_repeat_count()
     assert program.duration == 28 / 100_000_000
 
 
-def test_pulse_table_rejects_times_off_minimal_grid():
+def test_pulse_table_snaps_times_to_minimal_grid():
+    # The pulse-table (GUI) path must AUTO-SNAP off-grid durations to the nearest
+    # tick instead of rejecting them -- the hardware clock can only land on ticks.
     state = na.PulseTableState(
         channels=["trap", "trig"],
         periods=[
@@ -2557,23 +2559,19 @@ def test_pulse_table_rejects_times_off_minimal_grid():
     )
 
     assert state.to_sequence(slots={"s0": 20}, time_step_ns=10).validate(clock_hz=100e6, channels=state.channels).ok
-    try:
-        state.to_sequence(slots={"s0": 25}, time_step_ns=10)
-    except ValueError as exc:
-        assert "integer multiple" in str(exc)
-    else:
-        raise AssertionError("pulse table should reject slot values off the minimal time grid")
+    # 25 ns at a 10 ns step snaps to 30 ns (ties away from zero) and stays valid.
+    snapped = state.to_sequence(slots={"s0": 25}, time_step_ns=10)
+    assert snapped.validate(clock_hz=100e6, channels=state.channels).ok
+    assert state.periods[1].duration_ns(slots={"s0": 25}, time_step_ns=10) == 30.0
 
-    try:
-        na.PulseTableState(
-            channels=["trap"],
-            periods=[na.PulsePeriod(2.5, (1,), unit="ns")],
-            time_step_ns=1,
-        )
-    except ValueError as exc:
-        assert "integer multiple" in str(exc)
-    else:
-        raise AssertionError("pulse table should reject non-integer-ns duration at 1 ns step")
+    # A duration that rounds toward zero must still snap UP to one tick (never 0).
+    tiny = na.PulseTableState(
+        channels=["trap"],
+        periods=[na.PulsePeriod(2.5, (1,), unit="ns")],
+        time_step_ns=1,
+    )
+    assert tiny.periods[0].duration_steps(time_step_ns=10) == 1  # 2.5 ns -> one 10 ns tick
+    assert na.PulsePeriod(3.0, (1,), unit="ns").duration_ns(time_step_ns=1) == 3.0
 
 
 def test_pulse_sequence_clock_validation_rejects_off_tick_edges():

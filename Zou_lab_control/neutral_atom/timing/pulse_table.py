@@ -1181,13 +1181,16 @@ def quantized_time_steps(
     value = eval_time_expr(value_ns, slots=None)
     step = positive_time_step_ns(time_step_ns)
     raw_steps = value / step
-    steps = int(round(raw_steps))
-    if not math.isclose(raw_steps, steps, rel_tol=GRID_RTOL, abs_tol=GRID_ATOL_STEPS):
-        raise ValueError(f"{name}={value:g} ns is not an integer multiple of time_step_ns={step:g} ns.")
+    # Snap to the nearest tick (ties away from zero), mirroring the confocal
+    # align_to_resolution semantics.  An off-grid value is NEVER rejected -- the
+    # hardware clock can only land on whole ticks, so we quietly round.
+    steps = int(math.floor(raw_steps + 0.5)) if raw_steps >= 0 else int(math.ceil(raw_steps - 0.5))
     if steps < 0 and not allow_negative:
-        raise ValueError(f"{name} must be >= 0 ns.")
+        steps = 0
     if steps == 0 and not allow_zero:
-        raise ValueError(f"{name} must be at least one time step.")
+        # A period duration must occupy at least one tick (>= time_step_ns).
+        # Snap *up* to one tick instead of rejecting, so e.g. 5 ns -> 20 ns.
+        steps = 1
     return steps
 
 

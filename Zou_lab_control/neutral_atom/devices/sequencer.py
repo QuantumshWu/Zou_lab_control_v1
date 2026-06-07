@@ -1439,11 +1439,12 @@ def _apply_affine_ticks(base: int, coeffs: Sequence[int], slot_ticks: Sequence[i
 
 def _time_ns_to_ticks(value_ns: float, time_step_ns: float, name: str, *, allow_negative: bool = False) -> int:
     raw = float(value_ns) / float(time_step_ns)
-    ticks = int(round(raw))
-    if not math.isclose(raw, ticks, rel_tol=1e-12, abs_tol=1e-9):
-        raise ValueError(f"{name}={value_ns:g} ns is not on the {time_step_ns:g} ns clock grid.")
+    # Auto-snap to the nearest tick (ties away from zero) instead of rejecting an
+    # off-grid value.  Scan-table points are arbitrary floats; the clock can only
+    # land on whole ticks, so we round rather than raise.
+    ticks = int(math.floor(raw + 0.5)) if raw >= 0 else int(math.ceil(raw - 0.5))
     if ticks < 0 and not allow_negative:
-        raise ValueError(f"{name} must be >= 0 ns.")
+        ticks = 0
     return ticks
 
 
