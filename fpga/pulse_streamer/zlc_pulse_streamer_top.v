@@ -337,8 +337,15 @@ module zlc_pulse_streamer_top #(
         end
         default: lstate <= L_IDLE;
         endcase
-        // surface DONE / UNDERFLOW while running
-        if (ctrl_reg[C_STATUS][1]) begin   // was RUNNING: refresh DONE/UNDERFLOW, clear RUNNING on finish
+        // Surface DONE / UNDERFLOW while running -- but ONLY when idle and NOT
+        // handling a command this cycle.  This block runs after the case and shares
+        // ldr_status_val with it, so if it fired unconditionally it would OVERWRITE a
+        // command-driven STATUS write (SAFE/RESET clear, LOAD's LOADED) every cycle,
+        // re-asserting RUNNING forever -> the host could never clear RUNNING and the
+        // next CMD_LOAD's LOADED would never stick (observed as STATUS stuck at 0x2).
+        // Gating on (idle && no command edge) lets SAFE/RESET/LOAD/FIRE win their
+        // cycle, while still tracking done/underflow on the quiescent run cycles.
+        if ((lstate == L_IDLE) && (cmd_edge == 4'b0) && ctrl_reg[C_STATUS][1]) begin
             ldr_status_we <= 1'b1;
             ldr_status_val <= {27'b0, ((zlc_done ? 5'b0 : ST_RUNNING) | (zlc_done ? ST_DONE : 5'b0) | (zlc_underflow ? ST_UNDERFLOW : 5'b0))};
         end
