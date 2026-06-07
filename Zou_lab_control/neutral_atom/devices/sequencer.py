@@ -25,7 +25,7 @@ from ..timing import (
     sequence_for_frame_count,
     slot_var,
 )
-from ..timing.pulse_table import UNITS_TO_NS, _cyclic_shift_interval
+from ..timing.pulse_table import UNITS_TO_NS
 from ..timing.verilog import VerilogBuild, VerilogFiles, generate_verilog, write_verilog_bundle
 
 
@@ -112,6 +112,7 @@ class RuntimeSequenceProgram:
     loop_start_index: int = 0
     loop_end_tick: int = 0
     loop_count: int = 1
+    repeat_from_index: int = 0
     slot_count: int = 0
     slot_kinds: list[str] | None = None
     loop_end_slot_coeffs: list[int] | None = None
@@ -138,6 +139,7 @@ class RuntimeSequenceProgram:
             "loop_start_index": int(self.loop_start_index),
             "loop_end_tick": int(self.loop_end_tick),
             "loop_count": int(self.loop_count),
+            "repeat_from_index": int(self.repeat_from_index),
             "slot_count": int(self.slot_count),
             "slot_kinds": list(self.slot_kinds or []),
             "loop_end_slot_coeffs": list(self.loop_end_slot_coeffs or [0] * int(self.slot_count)),
@@ -177,6 +179,7 @@ class RuntimeSequenceProgram:
             loop_start_index=int(payload.get("loop_start_index", 0)),
             loop_end_tick=int(payload.get("loop_end_tick", 0)),
             loop_count=int(payload.get("loop_count", 1)),
+            repeat_from_index=int(payload.get("repeat_from_index", 0)),
             slot_count=slot_count,
             slot_kinds=[str(v) for v in payload.get("slot_kinds", [])] or None,
             loop_end_slot_coeffs=[int(v) for v in payload.get("loop_end_slot_coeffs", [])] or None,
@@ -267,13 +270,14 @@ def compile_pulse_table_runtime_program(
     sequence = state.to_sequence(slots=slot_values, time_step_ns=clock_step_ns, expand_repeat=False)
     period_starts = _pulse_table_period_starts_ticks(state, slots=slot_values, time_step_ns=clock_step_ns)
     has_delays = _pulse_table_has_delays(state, slots=slot_values, time_step_ns=clock_step_ns)
-    # A repeat_forever sequence (no finite bracket) gets the CYCLIC delay: a channel
-    # delay rotates its pattern within the frame and wraps across the loop seam --
-    # identical to what the preview shows.  A finite/bracketed sequence keeps the real
-    # additive shift (channel comes out later; table extends), which the loop guard
-    # checks fits.
-    cyclic_delay = bool(repeat_forever) and state.repeat_start is None and state.repeat_end is None
-    if has_delays and not cyclic_delay:
+    has_bracket = state.repeat_start is not None and state.repeat_end is not None
+    # Hardware delay is a PURE ADDITIVE shift: the frame extends to fit a delayed
+    # channel and a negative delay re-translates the whole frame (see
+    # _pulse_table_edge_table).  The cyclic %total view is preview-only.  Inside a
+    # finite repeat bracket a delayed edge must not cross the bracket boundary (the
+    # global table has no per-channel loop -- that is the v-next lane loop-stack), so
+    # the bracketed case is still validated.
+    if has_delays and has_bracket:
         _validate_pulse_table_delays_for_hardware_loop(
             state,
             period_starts=period_starts,
@@ -285,30 +289,32 @@ def compile_pulse_table_runtime_program(
         slots=slot_values,
         time_step_ns=clock_step_ns,
     )
-    ticks, masks, channels = _pulse_table_edge_table(
+    ticks, masks, channels, loop_end, repeat_from_index = _pulse_table_edge_table(
         state,
         channels=channels,
         slots=slot_values,
         time_step_ns=clock_step_ns,
         fold_analog_buses=not bool(bus_segments),
-        cyclic_delay=cyclic_delay,
+        repeat_forever=bool(repeat_forever) and not has_bracket,
     )
     repeat_count = int(state.repeat_count)
-    if state.repeat_start is None or state.repeat_end is None:
+    if not has_bracket:
         loop_start_index = 0
-        # cyclic delay keeps the loop period at the frame (delay wraps within it);
-        # the additive (finite) path extends the table by the delay.
-        loop_end_tick = int(ticks[-1]) if (has_delays and not cyclic_delay) else int(period_starts[-1])
+        # The loop period is the steady frame end; with a delay the engine rewinds to
+        # repeat_from_index (the steady-frame start) so the real-startup preamble plays
+        # exactly once.  With no delay repeat_from_index == 0 (the whole frame loops).
+        loop_end_tick = int(loop_end)
         loop_count = 1
     else:
         loop_start_tick = int(period_starts[int(state.repeat_start)])
         loop_end_tick = int(period_starts[int(state.repeat_end) + 1])
         ticks, masks, loop_start_index = _insert_mask_edge_at_tick(ticks, masks, loop_start_tick)
         loop_count = repeat_count
+        repeat_from_index = 0   # a finite bracket replays the whole program on repeat
 
     effective_duration_ticks = _pulse_table_effective_duration_ticks(state, slots=slot_values, time_step_ns=clock_step_ns)
-    if has_delays and not cyclic_delay and state.repeat_start is None and state.repeat_end is None:
-        effective_duration_ticks = int(ticks[-1])
+    if has_delays and not has_bracket:
+        effective_duration_ticks = int(loop_end)
     payload = {
         "table": state.to_dict(),
         "clock_hz": clock_hz,
@@ -319,6 +325,7 @@ def compile_pulse_table_runtime_program(
         "loop_start_index": loop_start_index,
         "loop_end_tick": loop_end_tick,
         "loop_count": loop_count,
+        "repeat_from_index": repeat_from_index,
         "bus_names": bus_names,
         "bus_segments": [segment.to_dict() for segment in bus_segments],
     }
@@ -338,6 +345,7 @@ def compile_pulse_table_runtime_program(
         loop_start_index=loop_start_index,
         loop_end_tick=loop_end_tick,
         loop_count=loop_count,
+        repeat_from_index=repeat_from_index,
         bus_names=bus_names or None,
         bus_segments=bus_segments or None,
     )
@@ -1475,94 +1483,118 @@ def _pulse_table_edge_table(
     slots: Mapping[str, float] | None = None,
     time_step_ns: float,
     fold_analog_buses: bool = True,
-    cyclic_delay: bool = False,
-) -> tuple[list[int], list[int], list[str]]:
-    """Build the (ticks, masks) edge table.
+    repeat_forever: bool = True,
+) -> tuple[list[int], list[int], list[str], int, int]:
+    """Build ``(ticks, masks, channels, loop_end, repeat_from_index)`` for one frame.
 
-    ``cyclic_delay`` selects the delay semantics (see the timing manual / Confocal
-    delay): for a repeat_forever sequence a channel delay is a CYCLIC rotation of its
-    on/off pattern within the frame (a pulse pushed past the end wraps to the start,
-    and a pulse spanning the loop seam stays on across it -- no spurious OFF at the
-    frame end).  For a finite/one-shot sequence it is a real additive shift (the
-    channel comes out ``delay`` later; the table simply extends)."""
+    A channel/DAC delay is a PURE ADDITIVE delay (NOT the cyclic ``%total`` view the
+    preview shows): a channel delayed by ``d`` is its periodic signal shifted RIGHT by
+    ``d`` with ZERO before fire -- so the FIRST pulses after fire are the real
+    delayed sequence (the cyclic view would fake a wrapped-in tail at t=0, corrupting
+    the experiment startup).  The loop PERIOD stays the original frame ``T`` (delaying
+    one channel does not change another's period -- the physically-intuitive delay).
+
+    A NEGATIVE delay re-translates the WHOLE frame: ``G = max(0, -min delay)`` is added
+    to every channel so the earliest event is ``>= 0`` (a uniform base offset cannot
+    reorder anything).
+
+    For ``repeat_forever`` this emits a real-startup PREAMBLE then one steady-state
+    frame, and returns ``repeat_from_index`` = the edge at the steady frame start so the
+    engine loops ONLY the steady frame (period ``T``), playing the preamble once.  For a
+    finite/one-shot run it emits the additively-shifted edges once (the frame extends to
+    fit), ``loop_end`` = last edge, ``repeat_from_index`` = 0."""
     hardware_channels = list(channel_names(channels, "channels"))
-    state_index = {channel: index for index, channel in enumerate(state.channels)}
     starts = _pulse_table_period_starts_ticks(state, slots=slots, time_step_ns=time_step_ns)
     table_end = int(starts[-1])
+    channel_bits = {channel: index for index, channel in enumerate(hardware_channels)}
     bus_groups = state.bus_channels()
     bus_members = {channel for members in bus_groups.values() for channel in members}
-    events: list[tuple[int, str | None, int | None]] = []
-    for tick in starts:
-        events.append((int(tick), None, None))
 
+    # --- per-channel UN-delayed ON intervals over [0, T) + each channel's raw delay ---
+    base_intervals: dict[str, list[tuple[int, int]]] = {}
+    raw_delay: dict[str, int] = {}
     for channel_index, channel in enumerate(state.channels):
-        if channel in bus_members:
+        if channel in bus_members or channel not in channel_bits:
             continue
-        delay_steps = state.delay_steps(channel, slots=slots, time_step_ns=time_step_ns)
-        # collect the channel's UN-delayed ON intervals over the frame
-        ivals: list[tuple[int, int]] = []
-        active_start: int | None = None
+        raw_delay[channel] = state.delay_steps(channel, slots=slots, time_step_ns=time_step_ns)
+        ivals, active = [], None
         for period_index, period in enumerate(state.periods):
-            value = int(period.states[channel_index])
-            if value and active_start is None:
-                active_start = int(starts[period_index])
-            elif not value and active_start is not None:
-                ivals.append((active_start, int(starts[period_index])))
-                active_start = None
-        if active_start is not None:
-            ivals.append((active_start, table_end))
-        if cyclic_delay and table_end > 0:
-            # CYCLIC: rotate each interval within [0, table_end); a piece that spans
-            # the loop seam (ends exactly at table_end while the channel is also ON at
-            # t=0) must NOT emit an OFF at the seam -- it continues into the next loop.
-            pieces: list[tuple[int, int]] = []
-            for a, b in ivals:
-                pieces.extend(_cyclic_shift_interval(a, b, delay_steps, table_end))
-            on_at_zero = any(a == 0 for a, b in pieces)
-            for a, b in pieces:
-                if b <= a:
-                    continue
-                events.append((a, channel, 1))
-                if b < table_end or not on_at_zero:
-                    events.append((b, channel, 0))
-        else:
-            # additive (real) shift -- finite / one-shot
-            for a, b in ivals:
-                events.append((a + delay_steps, channel, 1))
-                events.append((b + delay_steps, channel, 0))
-
+            if int(period.states[channel_index]) and active is None:
+                active = int(starts[period_index])
+            elif not int(period.states[channel_index]) and active is not None:
+                ivals.append((active, int(starts[period_index]))); active = None
+        if active is not None:
+            ivals.append((active, table_end))
+        base_intervals[channel] = ivals
     if fold_analog_buses:
         for bus_name, members in bus_groups.items():
-            delay_steps = _pulse_table_bus_delay_steps(state, members, slots=slots, time_step_ns=time_step_ns)
+            bus_delay = _pulse_table_bus_delay_steps(state, members, slots=slots, time_step_ns=time_step_ns)
             plan = state.analog_bus_plan(bus_name)
-            bus_ticks = _pulse_table_analog_bus_ticks(plan, starts)
+            bus_ticks = sorted(set(_pulse_table_analog_bus_ticks(plan, starts)) | {0})
             for tick in bus_ticks:
                 if tick < 0 or tick > table_end:
                     raise ValueError(f"analog bus {bus_name!r} produced edge tick {tick} outside the uploaded table.")
-                value = _pulse_table_analog_bus_value_at_tick(plan, starts, tick)
-                for bit, channel in enumerate(members):
-                    events.append((int(tick) + delay_steps, channel, 1 if (int(value) >> bit) & 1 else 0))
             for bit, channel in enumerate(members):
-                events.append((table_end + delay_steps, channel, 0))
+                if channel not in channel_bits:
+                    continue
+                raw_delay[channel] = bus_delay
+                ivals, active = [], None
+                for tick in bus_ticks:
+                    on = (int(_pulse_table_analog_bus_value_at_tick(plan, starts, tick)) >> bit) & 1
+                    if on and active is None:
+                        active = int(tick)
+                    elif not on and active is not None:
+                        ivals.append((active, int(tick))); active = None
+                if active is not None:
+                    ivals.append((active, table_end))
+                base_intervals[channel] = ivals
+
+    global_shift = max(0, -min(raw_delay.values())) if raw_delay else 0
+    eff_delay = {channel: raw_delay[channel] + global_shift for channel in raw_delay}
+    max_eff = max(eff_delay.values()) if eff_delay else 0
+
+    # --- emit ON/OFF events (additive, period-preserving) ---
+    # channel=None entries are period-boundary anchors (no-op edges) that keep the
+    # frame structure (and bracket loop boundaries) explicit.
+    events: list[tuple[int, str | None, int | None]] = []
+    if repeat_forever and table_end > 0 and max_eff > 0:
+        # PREAMBLE + steady frame: enough whole frames so the last one is steady-state.
+        num_frames = (max_eff + table_end - 1) // table_end + 1   # ceil(max_eff/T) + 1
+        loop_end = num_frames * table_end
+        for channel, ivals in base_intervals.items():
+            d = eff_delay[channel]
+            for k in range(num_frames + 1):
+                for a, b in ivals:
+                    s, e = a + d + k * table_end, b + d + k * table_end
+                    s, e = max(0, s), min(loop_end, e)
+                    if s < e:
+                        events.append((s, channel, 1)); events.append((e, channel, 0))
+    else:
+        # finite / one-shot / bracket / no-delay: the additively-shifted frame played
+        # once; the frame extends only to fit the latest shifted edge (a bracket's
+        # delays are validated to fit, so this stays the bracket frame end).
+        for tick in starts:
+            events.append((int(tick) + global_shift, None, None))
+        for channel, ivals in base_intervals.items():
+            d = eff_delay[channel]
+            for a, b in ivals:
+                events.append((a + d, channel, 1)); events.append((b + d, channel, 0))
+        loop_end = max([table_end + global_shift] + [int(t) for t, _, _ in events])
 
     grouped: dict[int, list[tuple[str | None, int | None]]] = {}
     for tick, channel, value in events:
-        tick = int(tick)
-        if tick < 0 or tick > table_end:
-            raise ValueError(f"pulse table edge tick {tick} is outside the uploaded table [0, {table_end}].")
-        grouped.setdefault(tick, []).append((channel, value))
+        if tick < 0 or tick > loop_end:
+            raise ValueError(f"pulse table edge tick {tick} is outside the uploaded table [0, {loop_end}].")
+        grouped.setdefault(int(tick), []).append((channel, value))
 
     ticks: list[int] = []
     masks: list[int] = []
     current_mask = 0
-    channel_bits = {channel: index for index, channel in enumerate(hardware_channels)}
     for tick in sorted(grouped):
         for channel, value in grouped[tick]:
             if channel is None or value is None:
                 continue
-            bit = channel_bits.get(channel)
-            if bit is None:
-                continue
+            bit = channel_bits[channel]
             if int(value):
                 current_mask |= 1 << bit
             else:
@@ -1570,8 +1602,22 @@ def _pulse_table_edge_table(
         ticks.append(int(tick))
         masks.append(int(current_mask))
     ticks, masks = _dedupe_same_tick_edges(ticks, masks)
-    ticks, masks = _ensure_final_off_edge(ticks, masks, table_end)
-    return ticks, masks, hardware_channels
+    # Anchor an edge at tick 0 (all-off if nothing starts there): the engine seeds its
+    # time counter from edge 0, so the table must begin at tick 0 or every edge slips a
+    # tick.  A delayed channel that starts later, or an all-off opening period, both need
+    # this explicit tick-0 anchor.
+    if not ticks or ticks[0] != 0:
+        ticks = [0] + ticks
+        masks = [0] + masks
+    ticks, masks = _ensure_final_off_edge(ticks, masks, loop_end)
+
+    repeat_from_index = 0
+    if repeat_forever and table_end > 0 and max_eff > 0:
+        # the loop replays ONLY the steady frame [loop_end - T, loop_end); insert an
+        # anchor edge there carrying the steady-state-start mask so repeat_forever
+        # rewinds to it (NOT to edge 0 -- that would replay the startup preamble).
+        ticks, masks, repeat_from_index = _insert_mask_edge_at_tick(ticks, masks, loop_end - table_end)
+    return ticks, masks, hardware_channels, loop_end, repeat_from_index
 
 
 def _dedupe_same_tick_edges(ticks: Sequence[int], masks: Sequence[int]) -> tuple[list[int], list[int]]:

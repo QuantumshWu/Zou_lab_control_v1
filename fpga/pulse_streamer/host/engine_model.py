@@ -87,6 +87,7 @@ class EngineProgram:
     loop_end_slot_coeffs: list[int]
     loop_count: int
     repeat_forever: bool
+    repeat_from_index: int = 0
 
     @classmethod
     def from_program(cls, program) -> "EngineProgram":
@@ -106,6 +107,7 @@ class EngineProgram:
             loop_end_slot_coeffs=list(getattr(program, "loop_end_slot_coeffs", None) or [0] * slot_count),
             loop_count=max(1, int(getattr(program, "loop_count", 1) or 1)),
             repeat_forever=bool(getattr(program, "repeat_forever", False)),
+            repeat_from_index=int(getattr(program, "repeat_from_index", 0) or 0),
         )
 
 
@@ -178,7 +180,13 @@ def reference_play(program, n_ticks: int) -> list[int]:
             elif p.repeat_forever:
                 slot = _first_values(p); spi = 0
                 final = eff(n - 1, slot); loop_end = eff_le(slot); loops = p.loop_count
-                sm, tc, ei = (p.masks[0], 1, 1) if eff(0, slot) == 0 else (0, 0, 0)
+                ri = p.repeat_from_index
+                if ri > 0:
+                    # rewind to the steady-state frame start (additive-delay preamble
+                    # plays once); the engine seeds masks[ri] at its tick + 1.
+                    sm, tc, ei = p.masks[ri], eff(ri, slot) + 1, ri + 1
+                else:
+                    sm, tc, ei = (p.masks[0], 1, 1) if eff(0, slot) == 0 else (0, 0, 0)
             else:
                 running = False; sm = 0
         else:

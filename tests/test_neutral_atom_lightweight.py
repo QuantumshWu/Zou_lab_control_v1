@@ -3814,50 +3814,103 @@ def test_pulse_table_delay_is_cyclic_in_preview():
     assert round(st.to_sequence().duration * 1e9) == 2000
 
 
-def test_pulse_table_repeat_forever_delay_cyclic_hardware_matches_preview():
-    """repeat_forever + a channel delay that wraps: the compiled edge table is the
-    CYCLIC rotation (same as the preview), the loop period stays the frame (not
-    extended by the delay), the final mask is safe-idle 0, AND the engine loops it
-    SEAMLESSLY -- a pulse spanning the loop seam stays ON across it (verified with the
-    cycle-accurate engine model, no hardware needed)."""
+def _additive_truth(state, *, slots, time_step_ns, channels, n_ticks):
+    """Independent ADDITIVE delay oracle (the trusted root for hardware delay): build
+    each digital channel's UN-delayed ON intervals, shift them by a PURE additive delay
+    (no modulo/wrap), re-translate the whole frame by G = max(0, -min delay) so the
+    earliest event is >= 0, extend the frame to fit the latest shifted edge, and emit
+    the per-tick mask by interval membership over the repeating extended frame.  This is
+    correct by inspection and is structurally different from to_sequence (cyclic) and
+    from reference_play (plays a given table) -- so it independently proves the compiler
+    builds the right additive edge table."""
+
+    starts = [0]
+    for period in state.periods:
+        starts.append(starts[-1] + period.duration_steps(slots=slots, time_step_ns=time_step_ns))
+    table_end = starts[-1]
+    bus_members = {c for members in state.bus_channels().values() for c in members}
+    delays, intervals = {}, {}
+    for ci, ch in enumerate(state.channels):
+        if ch in bus_members:
+            continue
+        delays[ch] = state.delay_steps(ch, slots=slots, time_step_ns=time_step_ns)
+        ivals, active = [], None
+        for pi, period in enumerate(state.periods):
+            v = int(period.states[ci])
+            if v and active is None:
+                active = starts[pi]
+            elif not v and active is not None:
+                ivals.append((active, starts[pi])); active = None
+        if active is not None:
+            ivals.append((active, table_end))
+        intervals[ch] = ivals
+    g = max(0, -min(delays.values())) if delays else 0
+    eff = {ch: delays[ch] + g for ch in delays}
+    T = table_end
+    bits = {ch: channels.index(ch) for ch in delays if ch in channels}
+    out = []
+    for t in range(n_ticks):
+        mask = 0
+        for ch, ivals in intervals.items():
+            d = eff[ch]
+            if t < d or T <= 0:                 # channel hasn't started (real delay)
+                continue
+            phase = (t - d) % T                 # period PRESERVED at T (physical delay)
+            for a, b in ivals:
+                if a <= phase < b:
+                    mask |= 1 << bits[ch]; break
+        out.append(mask)
+    return out
+
+
+def test_pulse_table_repeat_forever_delay_is_additive_in_hardware():
+    """HARDWARE delay is a PURE ADDITIVE shift (NOT the cyclic %total preview): the
+    channel comes out `delay` later with NO wrap, the frame EXTENDS to fit it, and the
+    loop repeats that extended frame.  The FIRST pulses after fire are exact (the cyclic
+    view would fake a wrapped-in tail at t=0, corrupting the experiment startup).
+    Proven against the independent additive oracle via the cycle-accurate engine model
+    (no Verilog/hardware needed)."""
     import Zou_lab_control.neutral_atom as na
     from Zou_lab_control.neutral_atom.devices.sequencer import compile_pulse_table_runtime_program
     from fpga.pulse_streamer.host import engine_model as em
-
-    def on_intervals(bits):
-        out, s = [], None
-        for i in range(len(bits) + 1):
-            b = (i < len(bits)) and (int(bits[i]) & 1)
-            if b and s is None:
-                s = i
-            elif not b and s is not None:
-                out.append((s, i)); s = None
-        return out
 
     st = na.PulseTableState(
         channels=["ch0"],
         periods=[na.PulsePeriod(1000, (1,), unit="ns"), na.PulsePeriod(1000, (0,), unit="ns")],
         time_step_ns=20,
-    )  # frame = 2000 ns = 100 ticks; ch0 ON [0,1000) = ticks [0,50)
-    st.delays = {"ch0": 1500}; st.delay_units = {"ch0": "ns"}  # +75 ticks -> wraps the frame
+    )  # frame 2000 ns = 100 ticks; ch0 ON [0,1000) = ticks [0,50)
+    st.delays = {"ch0": 1500}; st.delay_units = {"ch0": "ns"}   # +75 ticks (additive: extends)
 
     prog = compile_pulse_table_runtime_program(st, clock_hz=50e6, repeat_forever=True)
-    assert prog.masks[-1] == 0                 # final mask is safe-idle
-    assert prog.loop_end_tick == 100           # loop period stays the frame (delay wraps within it)
+    assert prog.masks[-1] == 0                  # final mask is safe-idle
+    # period is PRESERVED at T=100: a preamble frame [0,100) plays once, then the steady
+    # frame [100,200) loops -- so loop_end=200 and the engine rewinds to tick 100, NOT 0.
+    assert prog.loop_end_tick == 200
+    assert prog.repeat_from_index > 0 and prog.ticks[prog.repeat_from_index] == 100
 
-    # per-frame hardware ON (from ticks/masks) matches the cyclic preview
-    hw = []
-    for i, tk in enumerate(prog.ticks):
-        nxt = prog.ticks[i + 1] if i + 1 < len(prog.ticks) else prog.loop_end_tick
-        if int(prog.masks[i]) & 1 and nxt > tk:
-            hw.append((tk, nxt))
-    hw = [iv for iv in hw if iv[1] > iv[0]]
-    seq = st.to_sequence()
-    preview = sorted((round(p.start / 20e-9), round((p.start + p.duration) / 20e-9)) for p in seq.effective_pulses())
-    assert preview == [(0, 25), (75, 100)]
-    # merge hw across exactly-adjacent edges for comparison
-    assert sorted(hw) == [(0, 25), (75, 100)]
+    truth = _additive_truth(st, slots={}, time_step_ns=20, channels=["ch0"], n_ticks=400)
+    assert em.reference_play(em.EngineProgram.from_program(prog), 400) == truth
+    # the additive hardware is OFF at fire and turns ON only at tick 75 -- it does NOT
+    # show the cyclic preview's wrapped tail at t=0; steady state then has period 100.
+    assert truth[0] == 0 and truth[74] == 0 and truth[75] == 1 and truth[124] == 1 and truth[125] == 0
+    assert truth[175] == 1 and truth[224] == 1 and truth[225] == 0   # repeats every 100 ticks
 
-    # engine-model loop playback: the wrap is SEAMLESS (ON [75,100) continues into [0,25))
-    ep = em.EngineProgram.from_program(prog)
-    assert on_intervals(em.reference_play(ep, 230)) == [(0, 25), (75, 125), (175, 225)]
+
+def test_pulse_table_negative_delay_global_retranslate_in_hardware():
+    """A NEGATIVE delay re-translates the WHOLE frame (G = -min delay added to every
+    channel) so the delayed channel precedes the rest and the earliest event is >= 0 --
+    never a runtime negative tick.  Proven against the additive oracle."""
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.devices.sequencer import compile_pulse_table_runtime_program
+    from fpga.pulse_streamer.host import engine_model as em
+
+    st = na.PulseTableState(
+        channels=["a", "b"],
+        periods=[na.PulsePeriod(1000, (1, 1), unit="ns"), na.PulsePeriod(1000, (0, 0), unit="ns")],
+        time_step_ns=20,
+    )  # frame 100 ticks; a,b ON [0,50)
+    st.delays = {"a": -500}; st.delay_units = {"a": "ns"}   # a -25 ticks -> G=25: a stays, b shifts +25
+    prog = compile_pulse_table_runtime_program(st, clock_hz=50e6, repeat_forever=True)
+    assert min(prog.ticks) >= 0                  # never a negative tick
+    truth = _additive_truth(st, slots={}, time_step_ns=20, channels=list(prog.channels), n_ticks=300)
+    assert em.reference_play(em.EngineProgram.from_program(prog), 300) == truth
