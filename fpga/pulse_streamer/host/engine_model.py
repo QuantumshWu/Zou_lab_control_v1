@@ -1,5 +1,5 @@
 """Cycle-accurate behavioural models of the FINAL affine edge-table engine
-(``fpga/pulse_streamer/zlc_pulse_streamer.v``), used to prove tick-exactness +
+(``fpga/pulse_streamer/zlc_edge_streamer.v``), used to prove tick-exactness +
 gaplessness BEFORE hardware (no Verilog simulator in this repo).
 
 Three models, all walking the SAME engine FSM:

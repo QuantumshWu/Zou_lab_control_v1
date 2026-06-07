@@ -227,7 +227,10 @@ module zlc_pulse_streamer_top #(
     // Bus rows are 7 words = [start_tick, stop_tick, sc_lo, sc_hi, ec_lo, ec_hi,
     // flags] (host.image bus layout).  Rising-edge-detected commands.
     localparam CMD_LOAD = 4'b0001, CMD_FIRE = 4'b0010, CMD_RESET = 4'b0100, CMD_SAFE = 4'b1000;
-    localparam ST_LOADED = 4'b0001, ST_RUNNING = 4'b0010, ST_DONE = 4'b0100, ST_UNDERFLOW = 4'b1000;
+    // STATUS bit map MUST match host.image: LOADED=1 RUNNING=2 DONE=4 ERROR=8(host-only,
+    // never set here) UNDERFLOW=16.  Underflow is bit4 (NOT bit3) so a transient
+    // streaming STALL is never confused with the host's fatal ERROR bit.
+    localparam [4:0] ST_LOADED = 5'd1, ST_RUNNING = 5'd2, ST_DONE = 5'd4, ST_UNDERFLOW = 5'd16;
     localparam integer CNT_W = BUS_SEG_ADDR_WIDTH + 1;
 
     reg eng_reset = 1'b1, eng_start = 1'b0;
@@ -284,7 +287,7 @@ module zlc_pulse_streamer_top #(
             wi <= 0;
             if (baddr >= bcnt) begin
                 if (bcur == BUS_COUNT-1) begin
-                    ldr_status_we <= 1'b1; ldr_status_val <= {28'b0, ST_LOADED}; lstate <= L_IDLE;
+                    ldr_status_we <= 1'b1; ldr_status_val <= {27'b0, ST_LOADED}; lstate <= L_IDLE;
                 end else begin
                     bcur <= bcur + 1'b1; baddr <= 0; bcnt <= bus_count_of(bcur + 1'b1); lstate <= L_NEXT;
                 end
@@ -324,7 +327,7 @@ module zlc_pulse_streamer_top #(
         L_FIRE: begin
             eng_reset <= 1'b0;
             eng_start <= 1'b1;
-            ldr_status_we <= 1'b1; ldr_status_val <= {28'b0, ST_RUNNING};
+            ldr_status_we <= 1'b1; ldr_status_val <= {27'b0, ST_RUNNING};
             cmd_seen <= cmd_now;
             lstate <= L_IDLE;
         end
@@ -333,7 +336,7 @@ module zlc_pulse_streamer_top #(
         // surface DONE / UNDERFLOW while running
         if (ctrl_reg[C_STATUS][1]) begin   // RUNNING
             ldr_status_we <= 1'b1;
-            ldr_status_val <= {28'b0, (ST_RUNNING | (zlc_done ? ST_DONE : 4'b0) | (zlc_underflow ? ST_UNDERFLOW : 4'b0))};
+            ldr_status_val <= {27'b0, (ST_RUNNING | (zlc_done ? ST_DONE : 5'b0) | (zlc_underflow ? ST_UNDERFLOW : 5'b0))};
         end
     end
 

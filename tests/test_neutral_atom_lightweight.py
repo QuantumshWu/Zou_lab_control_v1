@@ -1862,6 +1862,73 @@ def test_final_top_regions_match_image_and_has_structure():
     assert "jtag_axi_0" in text and "axi_bram_ctrl_0" in text
 
 
+def test_final_status_bits_match_host():
+    """The top STATUS bit map MUST equal host.image STATUS_*; in particular the
+    streaming UNDERFLOW bit must be a DISTINCT bit from the host's fatal ERROR bit,
+    else a recoverable streaming stall would crash the host (regression guard for
+    the ST_UNDERFLOW=8 vs STATUS_ERROR=8 collision)."""
+
+    import pathlib, re
+    from fpga.pulse_streamer.host import image as im
+    top = (pathlib.Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
+    m = re.search(r"ST_LOADED = 5'd(\d+), ST_RUNNING = 5'd(\d+), ST_DONE = 5'd(\d+), ST_UNDERFLOW = 5'd(\d+);", top)
+    assert m, "could not find ST_* localparams in the top"
+    loaded, running, done, under = (int(g) for g in m.groups())
+    assert (loaded, running, done, under) == (im.STATUS_LOADED, im.STATUS_RUNNING, im.STATUS_DONE, im.STATUS_UNDERFLOW)
+    assert (loaded, running, done, under) == (1, 2, 4, 16)
+    # the recoverable stall bit must NOT collide with the host's fatal ERROR bit.
+    for v in (loaded, running, done, under):
+        assert v != im.STATUS_ERROR, "a STATUS bit collides with host STATUS_ERROR (bit 3)"
+
+
+def test_vivado_axi_session_tolerates_transient_underflow(tmp_path):
+    """STATUS_UNDERFLOW (bit 4) is a transient streaming stall, a DISTINCT bit from
+    the fatal STATUS_ERROR (bit 3).  wait_done must keep polling and complete on the
+    later DONE -- it must NEVER raise on an underflow."""
+
+    import re as _re
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+    from fpga.pulse_streamer.host.image import (
+        StreamerParams, CtrlWords, STATUS_RUNNING, STATUS_DONE, STATUS_UNDERFLOW, STATUS_LOADED, CMD_LOAD, CMD_FIRE,
+    )
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
+
+    params = StreamerParams(max_edges=16, bank_size=4)
+    program = RuntimeSequenceProgram(
+        sequence_id="u", sequence_name="u", clock_hz=50e6,
+        channels=[f"ch{i:02d}" for i in range(62)],
+        ticks=[0, 100, 200], masks=[1, 0, 0], duration=4e-6, trigger_count=0,
+        repeat_forever=False, loop_start_index=0, loop_end_tick=200, loop_count=1, slot_count=0,
+    )
+
+    class Hw:
+        def __init__(self):
+            self.bram = {}; self.status = 0; self.fired = False; self.polls = 0
+        def __call__(self, lines, action, timeout):
+            text = "\n".join(lines)
+            for a, d in _re.findall(r"-address ([0-9A-Fa-f]+) -data ([0-9A-Fa-f]+) -len 1 -type write", text):
+                w = int(a, 16) // 4; v = int(d, 16); self.bram[w] = v
+                if w == CtrlWords.COMMAND and v & CMD_LOAD: self.status = STATUS_LOADED
+                if w == CtrlWords.COMMAND and v & CMD_FIRE: self.fired = True; self.status = STATUS_RUNNING
+            m = _re.search(r"-address ([0-9A-Fa-f]+) -len 1 -type read", text)
+            if m:
+                w = int(m.group(1), 16) // 4
+                if w == CtrlWords.STATUS:
+                    if self.fired:
+                        self.polls += 1
+                        if self.polls <= 3:   # transient stall: RUNNING + UNDERFLOW
+                            return f"ZLCDATA {STATUS_RUNNING | STATUS_UNDERFLOW:08X}\n"
+                        return f"ZLCDATA {STATUS_RUNNING | STATUS_DONE:08X}\n"
+                    return f"ZLCDATA {self.status:08X}\n"
+                return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
+            return "ok\n"
+
+    hw = Hw()
+    session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=hw)
+    session.prepare(program); session.fire()
+    assert session.wait_done(timeout=2.0) is True   # underflow tolerated, completes on DONE
+
+
 def test_edgetable_prefetch_engine_is_tick_exact_and_gapless():
     """The Architecture-D BRAM+prefetch engine must produce a per-tick output
     byte-identical to the validated combinatorial engine, for every program shape

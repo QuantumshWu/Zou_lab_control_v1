@@ -1,5 +1,5 @@
 """BRAM program image + capacity solver for the FINAL edge-table streamer
-(``fpga/pulse_streamer/zlc_pulse_streamer.v`` + ``..._top.v``).
+(``fpga/pulse_streamer/zlc_edge_streamer.v`` + ``zlc_pulse_streamer_top.v``).
 
 Single source of truth for the host<->FPGA AXI write contract AND the geometry
 the RTL localparams + create-project tcl derive from.  A different XDC (channel

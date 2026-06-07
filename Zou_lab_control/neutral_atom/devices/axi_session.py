@@ -317,6 +317,7 @@ class VivadoAxiStreamerSession:
         next_chunk = 2                # chunks 0,1 are already resident
         bank_ready = 0b11
 
+        stalled_polls = 0
         while True:
             status = self._read_word(CtrlWords.STATUS)
             if status & STATUS_DONE:
@@ -325,6 +326,14 @@ class VivadoAxiStreamerSession:
                 return True
             if status & STATUS_ERROR:
                 raise RuntimeError("pulse streamer reported STATUS_ERROR (bad image magic?).")
+            # STATUS_UNDERFLOW is a TRANSIENT streaming stall (the engine is holding
+            # because it reached a bank we have not refilled yet), NOT a fatal error.
+            # It is a distinct bit from STATUS_ERROR on purpose -- keep polling/refilling
+            # and the engine resumes the instant the bank is armed.  (Bit-map drift here
+            # would silently turn a recoverable stall into a crash; guarded by
+            # test_final_status_bits_match_host.)
+            if status & STATUS_UNDERFLOW:
+                stalled_polls += 1
 
             # --- streaming refill: load the next chunk into the freed bank ---
             if next_chunk < total_chunks:
