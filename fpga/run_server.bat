@@ -2,7 +2,7 @@
 setlocal EnableExtensions EnableDelayedExpansion
 
 if /I not "%~1"=="--inner" (
-  set "ZLC_ACTION=edge-table loader server"
+  set "ZLC_ACTION=pulse streamer server"
   if /I "%~1"=="--check-config" set "ZLC_ACTION=server config check"
   call "%~f0" --inner %*
   set "ZLC_STATUS=!ERRORLEVEL!"
@@ -47,7 +47,7 @@ if errorlevel 1 exit /b 1
 call :zlc_find_vivado
 if errorlevel 1 exit /b 1
 call :zlc_default_paths
-call :zlc_verify_loader_sources
+call :zlc_verify_sources
 if errorlevel 1 exit /b 1
 
 pushd "%REPO_ROOT%"
@@ -84,25 +84,20 @@ if "%ZLC_PS_TRIGGER_CHANNELS%"=="" (
   exit /b 1
 )
 
-rem Default the edge-table loader bitstream + JTAG-to-AXI probes from the in-repo build (build\r).
-if /I "%ZLC_PS_VARIANT%"=="d" (
-  if "%ZLC_PS_VIVADO_BIT%"=="" set "ZLC_PS_VIVADO_BIT=%ZLC_PS_PROJECT_DIR%\d.runs\impl_1\zlc_pulse_streamer_d_top.bit"
-  if "%ZLC_PS_VIVADO_LTX%"=="" set "ZLC_PS_VIVADO_LTX=%ZLC_PS_PROJECT_DIR%\d.runs\impl_1\zlc_pulse_streamer_d_top.ltx"
-) else (
+rem Default the bitstream + JTAG-to-AXI probes from the in-repo build (build\pulse_streamer).
 if not "%ZLC_PS_PROJECT_DIR%"=="" (
-  if "%ZLC_PS_VIVADO_BIT%"=="" set "ZLC_PS_VIVADO_BIT=%ZLC_PS_PROJECT_DIR%\l.runs\impl_1\zlc_pulse_streamer_loader_top.bit"
-  if "%ZLC_PS_VIVADO_LTX%"=="" set "ZLC_PS_VIVADO_LTX=%ZLC_PS_PROJECT_DIR%\l.runs\impl_1\zlc_pulse_streamer_loader_top.ltx"
-)
+  if "%ZLC_PS_VIVADO_BIT%"=="" set "ZLC_PS_VIVADO_BIT=%ZLC_PS_PROJECT_DIR%\pulse_streamer.runs\impl_1\zlc_pulse_streamer_top.bit"
+  if "%ZLC_PS_VIVADO_LTX%"=="" set "ZLC_PS_VIVADO_LTX=%ZLC_PS_PROJECT_DIR%\pulse_streamer.runs\impl_1\zlc_pulse_streamer_top.ltx"
 )
 if "%ZLC_PS_VIVADO_LTX%"=="" (
   echo ERROR: no Vivado .ltx probes file was found.
   echo.
-  echo The edge-table loader server drives the FPGA over JTAG-to-AXI ^(hw_axi^); it loads the
+  echo The server drives the FPGA over JTAG-to-AXI ^(hw_axi^); it loads the
   echo .ltx so Vivado can find the jtag_axi core in the programmed bitstream.
   echo.
-  echo Fix: build + program the edge-table loader bitstream first:
+  echo Fix: build + program the bitstream first:
   echo   fpga\build_and_program.bat
-  echo Or set ZLC_PS_VIVADO_LTX to the .ltx from the edge-table loader build.
+  echo Or set ZLC_PS_VIVADO_LTX to the .ltx from the build.
   popd
   exit /b 2
 )
@@ -110,13 +105,13 @@ if not exist "%ZLC_PS_VIVADO_LTX%" (
   echo ERROR: Vivado .ltx probes file does not exist:
   echo   %ZLC_PS_VIVADO_LTX%
   echo.
-  echo Build + program the edge-table loader bitstream first:
+  echo Build + program the bitstream first:
   echo   fpga\build_and_program.bat
   popd
   exit /b 2
 )
 
-echo ZLC FPGA edge-table loader server: %ZLC_PS_CHANNEL_COUNT%ch ^(JTAG-to-AXI^)
+echo ZLC FPGA pulse streamer server: %ZLC_PS_CHANNEL_COUNT%ch ^(JTAG-to-AXI, 1-tick + streaming^)
 echo Host:    %ZLC_PS_HOST%:%ZLC_PS_PORT%
 echo Backend: %ZLC_PS_SERVER_BACKEND%
 echo Bit:     %ZLC_PS_VIVADO_BIT%
@@ -144,7 +139,8 @@ popd
 endlocal & exit /b %ZLC_STATUS%
 
 :zlc_help
-echo Start the edge-table loader ZLC FPGA pulse-streamer server ^(JTAG-to-AXI / hw_axi^).
+echo Start the FINAL ZLC FPGA pulse-streamer server ^(JTAG-to-AXI / hw_axi^).
+echo Engine: 1-tick ^(20 ns^) FIFO prefetch + unbounded 2-bank streaming scan.
 echo.
 echo Usage:
 echo   fpga\run_server.bat
@@ -152,10 +148,10 @@ echo   fpga\run_server.bat --check-config
 echo.
 echo Defaults:
 echo   host/port: 0.0.0.0:18861
-echo   backend:   jtag-axi  ^(persistent Vivado hw_axi session driving the edge-table loader engine^)
+echo   backend:   jtag-axi  ^(persistent Vivado hw_axi session^)
 echo   channels:  inferred from ZLC_PS_XDC, fallback ch00 ... ch61
 echo   clock:     50000000 Hz ^(override with ZLC_PS_CLOCK_HZ^)
-echo   bit/ltx:   fpga\build\l\l.runs\impl_1\zlc_pulse_streamer_loader_top.{bit,ltx}
+echo   bit/ltx:   fpga\build\pulse_streamer\pulse_streamer.runs\impl_1\zlc_pulse_streamer_top.{bit,ltx}
 echo.
 echo Run fpga\build_and_program.bat first ^(it builds AND programs the FPGA^).
 echo.
@@ -166,33 +162,33 @@ echo   set ZLC_PS_PORT=18861
 echo   set ZLC_PS_VIVADO_BIN=C:\Xilinx\Vivado\2019.1\bin\vivado.bat
 echo   set ZLC_PS_VIVADO_PROGRAM_ON_RUN=1   ^(re-program the FPGA when the server starts^)
 echo   set ZLC_PS_HW_SERVER_URL=localhost:3121
-echo   set ZLC_PS_PROJECT_DIR=%%CD%%\fpga\build\l
+echo   set ZLC_PS_PROJECT_DIR=%%CD%%\fpga\build\pulse_streamer
 exit /b 0
 
-:zlc_verify_loader_sources
+:zlc_verify_sources
 set "ZLC_DEFAULT_XDC=%REPO_ROOT%\references\source_archives\address_switch\address_switch.srcs\constrs_1\new\addre.xdc"
 if not defined ZLC_PS_XDC set "ZLC_PS_XDC=%ZLC_DEFAULT_XDC%"
-if not exist "%STREAMER_DIR%\zlc_axi_program_loader.v" (
-  echo ERROR: missing edge-table loader playback engine HDL: %STREAMER_DIR%\zlc_axi_program_loader.v
+if not exist "%STREAMER_DIR%\zlc_edge_streamer.v" (
+  echo ERROR: missing FINAL engine HDL: %STREAMER_DIR%\zlc_edge_streamer.v
   exit /b 2
 )
-if not exist "%STREAMER_DIR%\zlc_pulse_streamer_loader_top.v" (
-  echo ERROR: missing edge-table loader top HDL: %STREAMER_DIR%\zlc_pulse_streamer_loader_top.v
+if not exist "%STREAMER_DIR%\zlc_pulse_streamer_top.v" (
+  echo ERROR: missing FINAL top HDL: %STREAMER_DIR%\zlc_pulse_streamer_top.v
   exit /b 2
 )
-if not exist "%STREAMER_DIR%\create_project_loader.tcl" (
-  echo ERROR: missing edge-table loader build Tcl: %STREAMER_DIR%\create_project_loader.tcl
+if not exist "%STREAMER_DIR%\create_project.tcl" (
+  echo ERROR: missing FINAL build Tcl: %STREAMER_DIR%\create_project.tcl
   exit /b 2
 )
-findstr /C:"localparam integer CHANNEL_COUNT = 62" "%STREAMER_DIR%\zlc_pulse_streamer_loader_top.v" >nul || (
-  echo ERROR: edge-table loader top is not the 62-output wrapper.
+findstr /C:"module zlc_pulse_streamer_top" "%STREAMER_DIR%\zlc_pulse_streamer_top.v" >nul || (
+  echo ERROR: FINAL top module name is wrong.
   exit /b 2
 )
-findstr /C:"localparam integer NUM_SLOTS = 4" "%STREAMER_DIR%\zlc_pulse_streamer_loader_top.v" >nul || (
-  echo ERROR: edge-table loader top is not the 5-slot build. Expected NUM_SLOTS = 4.
+findstr /C:"module zlc_edge_streamer" "%STREAMER_DIR%\zlc_edge_streamer.v" >nul || (
+  echo ERROR: FINAL engine module name is wrong.
   exit /b 2
 )
-echo ZLC edge-table loader source contract: channels=62 num_slots=4 control=JTAG-to-AXI
+echo ZLC FINAL source contract: channels=62 num_slots=4 control=JTAG-to-AXI
 exit /b 0
 
 :zlc_default_paths
@@ -201,9 +197,8 @@ if defined ZLC_PS_PROJECT_DIR if "!ZLC_PS_PROJECT_DIR: =!"=="" set "ZLC_PS_PROJE
 if defined ZLC_PS_STATE_DIR if "!ZLC_PS_STATE_DIR: =!"=="" set "ZLC_PS_STATE_DIR="
 if not defined ZLC_PS_BUILD_ROOT set "ZLC_PS_BUILD_ROOT=%FPGA_DIR%build"
 if not exist "!ZLC_PS_BUILD_ROOT!\" mkdir "!ZLC_PS_BUILD_ROOT!" >nul 2>nul
-rem Short project dir name "r" matches create_project_loader.tcl (path-length fix).
-if /I "%ZLC_PS_VARIANT%"=="d" (if not defined ZLC_PS_PROJECT_DIR set "ZLC_PS_PROJECT_DIR=%ZLC_PS_BUILD_ROOT%\d") else (if not defined ZLC_PS_PROJECT_DIR set "ZLC_PS_PROJECT_DIR=%ZLC_PS_BUILD_ROOT%\l")
-if not defined ZLC_PS_STATE_DIR set "ZLC_PS_STATE_DIR=%ZLC_PS_BUILD_ROOT%\state_loader"
+if not defined ZLC_PS_PROJECT_DIR set "ZLC_PS_PROJECT_DIR=%ZLC_PS_BUILD_ROOT%\pulse_streamer"
+if not defined ZLC_PS_STATE_DIR set "ZLC_PS_STATE_DIR=%ZLC_PS_BUILD_ROOT%\state"
 echo ZLC build root: %ZLC_PS_BUILD_ROOT%
 exit /b 0
 

@@ -713,11 +713,14 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     assert 'set "ZLC_PROJ_SUB=pulse_streamer"' in build_bat
     assert r'set "ZLC_PS_PROJECT_DIR=%ZLC_PS_BUILD_ROOT%\!ZLC_PROJ_SUB!"' in build_bat
     assert legacy_xdc_env not in build_bat
-    # run_server.bat starts the edge-table loader JTAG-to-AXI server.
+    # run_server.bat starts the FINAL JTAG-to-AXI server (no loader/variant residue).
     assert "ZLC_PS_CLOCK_HZ=50000000" in server_bat
-    assert "zlc_verify_loader_sources" in server_bat
+    assert "zlc_verify_sources" in server_bat
+    assert "zlc_verify_loader_sources" not in server_bat
     assert "ZLC_PS_SERVER_BACKEND=jtag-axi" in server_bat
-    assert "zlc_pulse_streamer_loader_top.ltx" in server_bat
+    assert "zlc_pulse_streamer_top.ltx" in server_bat
+    assert "zlc_pulse_streamer_loader_top" not in server_bat
+    assert "ZLC_PS_VARIANT" not in server_bat
     assert "fpga\\build\\address_switch" not in server_bat
     assert "echo Trigger:" not in server_bat
     assert "--trigger-channels ch03" not in server_bat
