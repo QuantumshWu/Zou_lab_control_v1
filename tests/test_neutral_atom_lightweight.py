@@ -698,17 +698,19 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     assert "zlc_pulse_streamer_top_address_switch.bit" in program_tcl
     assert "zlc_pulse_streamer_top_address_switch.ltx" in program_tcl
 
-    # build_and_program.bat builds the edge-table loader (JTAG-to-AXI), not the VIO
-    # address-switch top and not the discarded run-length engine.
-    assert "create_project_loader.tcl" in build_bat       # default (loader) variant
-    assert "program_fpga_loader.tcl" in build_bat
-    assert "zlc_verify_loader_sources" in build_bat
+    # build_and_program.bat builds the FINAL single design (JTAG-to-AXI, 1-tick
+    # FIFO prefetch + streaming scan): one create_project.tcl, no variants, no VIO
+    # address-switch and no discarded run-length engine.
+    assert "create_project.tcl" in build_bat
+    assert "program_fpga.tcl" in build_bat
+    assert "zlc_verify_sources" in build_bat
+    assert "zlc_force_latency2" in build_bat              # forces edge BRAM latency 2
+    assert "blk_mem_gen_edge_tick" in build_bat           # 3 parallel edge BRAMs
     assert "create_project_runlength.tcl" not in build_bat
     assert "create_project_address_switch.tcl" not in build_bat
-    # ZLC_PS_VARIANT=d selects the Architecture-D build (BRAM tables, 2048 edges +
-    # 4096 points); default stays the loader build.
-    assert 'set "ZLC_PROJ_SUB=l"' in build_bat
-    assert "create_project_d.tcl" in build_bat and 'set "ZLC_PROJ_SUB=d"' in build_bat
+    assert "create_project_loader.tcl" not in build_bat
+    assert "ZLC_PS_VARIANT" not in build_bat              # one path, no variants
+    assert 'set "ZLC_PROJ_SUB=pulse_streamer"' in build_bat
     assert r'set "ZLC_PS_PROJECT_DIR=%ZLC_PS_BUILD_ROOT%\!ZLC_PROJ_SUB!"' in build_bat
     assert legacy_xdc_env not in build_bat
     # run_server.bat starts the edge-table loader JTAG-to-AXI server.
