@@ -3,10 +3,10 @@ setlocal EnableExtensions EnableDelayedExpansion
 
 if /I not "%~1"=="--inner" (
   set "ZLC_ACTION=build/program"
-  if /I "%~1"=="--check" set "ZLC_ACTION=edge-table loader synth check"
+  if /I "%~1"=="--check" set "ZLC_ACTION=synth check"
   if /I "%~1"=="--diagnose" set "ZLC_ACTION=hardware diagnose"
-  if /I "%~1"=="--build-only" set "ZLC_ACTION=edge-table loader build"
-  if /I "%~1"=="--program-only" set "ZLC_ACTION=edge-table loader program"
+  if /I "%~1"=="--build-only" set "ZLC_ACTION=build"
+  if /I "%~1"=="--program-only" set "ZLC_ACTION=program"
   call "%~f0" --inner %*
   set "ZLC_STATUS=!ERRORLEVEL!"
   if "!ZLC_STATUS!"=="0" (
@@ -30,16 +30,9 @@ set "FPGA_DIR=%~dp0"
 for %%I in ("%FPGA_DIR%..") do set "REPO_ROOT=%%~fI"
 set "STREAMER_DIR=%FPGA_DIR%pulse_streamer"
 set "ZLC_REPO_ROOT=%REPO_ROOT%"
-
-if /I "%ZLC_PS_VARIANT%"=="d" (
-  set "ZLC_CREATE_TCL=create_project_d.tcl"
-  set "ZLC_PROGRAM_TCL=program_fpga_d.tcl"
-  set "ZLC_PROJ_SUB=d"
-) else (
-  set "ZLC_CREATE_TCL=create_project_loader.tcl"
-  set "ZLC_PROGRAM_TCL=program_fpga_loader.tcl"
-  set "ZLC_PROJ_SUB=l"
-)
+set "ZLC_CREATE_TCL=create_project.tcl"
+set "ZLC_PROGRAM_TCL=program_fpga.tcl"
+set "ZLC_PROJ_SUB=pulse_streamer"
 
 set "MODE=all"
 if "%~1"=="--help" goto zlc_help
@@ -57,7 +50,7 @@ if not "%~1"=="" if "%MODE%"=="all" (
 call :zlc_find_vivado
 if errorlevel 1 exit /b 1
 call :zlc_default_paths
-if /I not "%ZLC_PS_VARIANT%"=="d" call :zlc_verify_loader_sources
+call :zlc_verify_sources
 if errorlevel 1 exit /b 1
 call :zlc_print_capacity_estimate
 
@@ -68,7 +61,7 @@ if /I "%MODE%"=="diagnose" (
 
 if /I "%MODE%"=="program" goto zlc_program
 
-echo ZLC FPGA pulse streamer: build edge-table loader bitstream (JTAG-to-AXI)
+echo ZLC FPGA pulse streamer: build FINAL bitstream (1-tick FIFO prefetch + streaming, JTAG-to-AXI)
 call :zlc_run_tcl "!ZLC_CREATE_TCL!"
 if errorlevel 1 exit /b 1
 
@@ -76,16 +69,17 @@ if /I "%MODE%"=="build" exit /b 0
 if /I "%MODE%"=="check" exit /b 0
 
 :zlc_program
-echo ZLC FPGA pulse streamer: program edge-table loader bitstream
+echo ZLC FPGA pulse streamer: program FINAL bitstream
 call :zlc_run_tcl "!ZLC_PROGRAM_TCL!"
 exit /b %ERRORLEVEL%
 
 :zlc_help
-echo Build/program the per-channel edge-table loader ZLC FPGA pulse-streamer.
-echo Control path: JTAG-to-AXI master -^> AXI BRAM controller -^> dual-port BRAM.
+echo Build/program the FINAL ZLC FPGA pulse streamer (one clean design, no variants).
+echo Control path: JTAG-to-AXI master -^> AXI BRAM controller -^> edge/scan BRAMs + bus loader.
+echo Engine: 1-tick (20 ns) FIFO prefetch + unbounded 2-bank streaming scan.
 echo.
 echo Usage:
-echo   fpga\build_and_program.bat              Build and program edge-table loader outputs
+echo   fpga\build_and_program.bat              Build and program
 echo   fpga\build_and_program.bat --build-only Build only
 echo   fpga\build_and_program.bat --program-only Program existing bitstream
 echo   fpga\build_and_program.bat --check      Build only (alias of --build-only)
@@ -93,66 +87,64 @@ echo   fpga\build_and_program.bat --diagnose   List Vivado hw targets/devices
 echo.
 echo Real build XDC:
 echo   references\source_archives\address_switch\address_switch.srcs\constrs_1\new\addre.xdc
-echo   This original XDC is the default 62-output pin map (edge-table loader top reuses it).
-echo   For a different board/cable map, set:
+echo   This original XDC is the default 62-output pin map. For a different board, set:
 echo   set ZLC_PS_XDC=C:\path\to\board.xdc
 echo.
 echo Optional:
 echo   set ZLC_PS_VIVADO_BIN=C:\Xilinx\Vivado\2019.2\bin\vivado.bat
-echo   set ZLC_PS_PROJECT_DIR=%%CD%%\fpga\build\l
-echo   set ZLC_PS_RESOURCE_TARGET_PCT=70
+echo   set ZLC_PS_PROJECT_DIR=%%CD%%\fpga\build\pulse_streamer
 exit /b 0
 
-:zlc_verify_loader_sources
+:zlc_verify_sources
 set "ZLC_DEFAULT_XDC=%REPO_ROOT%\references\source_archives\address_switch\address_switch.srcs\constrs_1\new\addre.xdc"
 if not defined ZLC_PS_XDC set "ZLC_PS_XDC=%ZLC_DEFAULT_XDC%"
 set "ZLC_SELECTED_XDC=%ZLC_PS_XDC%"
-if not exist "%STREAMER_DIR%\zlc_axi_program_loader.v" (
-  echo ERROR: missing edge-table loader playback engine HDL: %STREAMER_DIR%\zlc_axi_program_loader.v
+if not exist "%STREAMER_DIR%\zlc_edge_streamer.v" (
+  echo ERROR: missing FINAL engine HDL: %STREAMER_DIR%\zlc_edge_streamer.v
   exit /b 2
 )
-if not exist "%STREAMER_DIR%\zlc_pulse_streamer_loader_top.v" (
-  echo ERROR: missing edge-table loader top HDL: %STREAMER_DIR%\zlc_pulse_streamer_loader_top.v
+if not exist "%STREAMER_DIR%\zlc_pulse_streamer_top.v" (
+  echo ERROR: missing FINAL top HDL: %STREAMER_DIR%\zlc_pulse_streamer_top.v
   exit /b 2
 )
-findstr /C:"zlc_axi_program_loader.v" "%STREAMER_DIR%\create_project_loader.tcl" >nul || (
-  echo ERROR: create_project_loader.tcl does not read the edge-table loader engine HDL.
+if not exist "%STREAMER_DIR%\create_project.tcl" (
+  echo ERROR: missing FINAL build Tcl: %STREAMER_DIR%\create_project.tcl
   exit /b 2
 )
-if not exist "%STREAMER_DIR%\create_project_loader.tcl" (
-  echo ERROR: missing edge-table loader build Tcl: %STREAMER_DIR%\create_project_loader.tcl
+findstr /C:"zlc_edge_streamer.v" "%STREAMER_DIR%\create_project.tcl" >nul || (
+  echo ERROR: create_project.tcl does not read the FINAL engine HDL.
   exit /b 2
 )
-findstr /C:"localparam integer CHANNEL_COUNT = 62" "%STREAMER_DIR%\zlc_pulse_streamer_loader_top.v" >nul || (
-  echo ERROR: edge-table loader top is not the 62-output wrapper.
+findstr /C:"module zlc_pulse_streamer_top" "%STREAMER_DIR%\zlc_pulse_streamer_top.v" >nul || (
+  echo ERROR: FINAL top module name is wrong.
   exit /b 2
 )
-findstr /C:"localparam integer NUM_SLOTS = 4" "%STREAMER_DIR%\zlc_pulse_streamer_loader_top.v" >nul || (
-  echo ERROR: edge-table loader top is not the 5-slot build. Expected NUM_SLOTS = 4.
+findstr /C:"module zlc_edge_streamer" "%STREAMER_DIR%\zlc_edge_streamer.v" >nul || (
+  echo ERROR: FINAL engine module name is wrong.
   exit /b 2
 )
-findstr /C:"module zlc_pulse_streamer_loader_top" "%STREAMER_DIR%\zlc_pulse_streamer_loader_top.v" >nul || (
-  echo ERROR: edge-table loader top module name is wrong.
+findstr /C:"create_ip -name jtag_axi" "%STREAMER_DIR%\create_project.tcl" >nul || (
+  echo ERROR: create_project.tcl does not create the JTAG-to-AXI master IP.
   exit /b 2
 )
-findstr /C:"create_ip -name jtag_axi" "%STREAMER_DIR%\create_project_loader.tcl" >nul || (
-  echo ERROR: create_project_loader.tcl does not create the JTAG-to-AXI master IP.
+findstr /C:"create_ip -name axi_bram_ctrl" "%STREAMER_DIR%\create_project.tcl" >nul || (
+  echo ERROR: create_project.tcl does not create the AXI BRAM controller IP.
   exit /b 2
 )
-findstr /C:"create_ip -name axi_bram_ctrl" "%STREAMER_DIR%\create_project_loader.tcl" >nul || (
-  echo ERROR: create_project_loader.tcl does not create the AXI BRAM controller IP.
+findstr /C:"blk_mem_gen_edge_tick" "%STREAMER_DIR%\create_project.tcl" >nul || (
+  echo ERROR: create_project.tcl does not create the 3 parallel edge BRAMs.
   exit /b 2
 )
-findstr /C:"create_ip -name blk_mem_gen" "%STREAMER_DIR%\create_project_loader.tcl" >nul || (
-  echo ERROR: create_project_loader.tcl does not create the dual-port BRAM IP.
+findstr /C:"zlc_force_latency2" "%STREAMER_DIR%\create_project.tcl" >nul || (
+  echo ERROR: create_project.tcl does not force the edge-BRAM read latency to 2.
   exit /b 2
 )
-findstr /C:"zlc_safe_project_dir" "%STREAMER_DIR%\create_project_loader.tcl" >nul || (
-  echo ERROR: create_project_loader.tcl is missing the Vivado path-length guard.
+findstr /C:"zlc_safe_project_dir" "%STREAMER_DIR%\create_project.tcl" >nul || (
+  echo ERROR: create_project.tcl is missing the Vivado path-length guard.
   exit /b 2
 )
 if not exist "!ZLC_SELECTED_XDC!" (
-  echo ERROR: missing edge-table loader XDC: !ZLC_SELECTED_XDC!
+  echo ERROR: missing board XDC: !ZLC_SELECTED_XDC!
   echo Restore references\source_archives\address_switch\address_switch.srcs\constrs_1\new\addre.xdc or set ZLC_PS_XDC.
   exit /b 2
 )
@@ -164,19 +156,19 @@ findstr /C:"<PIN_CH" "!ZLC_SELECTED_XDC!" >nul && (
   echo ERROR: selected XDC still contains PIN_CH placeholders: !ZLC_SELECTED_XDC!
   exit /b 2
 )
-echo ZLC edge-table loader source contract: channels=62 num_slots=4 control=JTAG-to-AXI (jtag_axi+axi_bram_ctrl+blk_mem_gen)
-echo ZLC edge-table loader XDC: !ZLC_SELECTED_XDC!
+echo ZLC FINAL source contract: channels=62 num_slots=4 control=JTAG-to-AXI (jtag_axi+axi_bram_ctrl+5 BRAMs, forced edge latency 2)
+echo ZLC FINAL XDC: !ZLC_SELECTED_XDC!
 exit /b 0
 
 :zlc_print_capacity_estimate
 where python >nul 2>nul
 if errorlevel 1 (
-  echo ZLC BRAM estimate skipped: python was not found on PATH.
+  echo ZLC capacity estimate skipped: python was not found on PATH.
   exit /b 0
 )
 pushd "%REPO_ROOT%"
 set "PYTHONPATH=%CD%;%PYTHONPATH%"
-python -c "from Zou_lab_control.neutral_atom.devices.edgetable_image import EdgeTableImageParams as P; import math; p=P(); print('ZLC edge-table image span: {} words; program BRAM 32768 words = {}/50 RAMB36'.format(p.total_words, math.ceil(32768/1024)))"
+python -c "from fpga.pulse_streamer.host.image import solve_capacity as s; r=s('xc7a35tfgg484-2', channel_count=62, target_pct=90); rr=r.resource_report['ramb36']; print('ZLC capacity: {} edges + bank_size {} (2x resident) + UNBOUNDED streaming; RAMB36 {}/{} = {}pct'.format(r.params.max_edges, r.params.bank_size, rr['used'], rr['total'], rr['pct']))"
 popd
 exit /b 0
 
@@ -186,7 +178,6 @@ if defined ZLC_PS_PROJECT_DIR if "!ZLC_PS_PROJECT_DIR: =!"=="" set "ZLC_PS_PROJE
 if defined ZLC_PS_LOG_DIR if "!ZLC_PS_LOG_DIR: =!"=="" set "ZLC_PS_LOG_DIR="
 if not defined ZLC_PS_BUILD_ROOT set "ZLC_PS_BUILD_ROOT=%FPGA_DIR%build"
 if not exist "!ZLC_PS_BUILD_ROOT!\" mkdir "!ZLC_PS_BUILD_ROOT!" >nul 2>nul
-rem Short project dir name "r" is the Vivado debug-core path-length fix.
 if not defined ZLC_PS_PROJECT_DIR set "ZLC_PS_PROJECT_DIR=%ZLC_PS_BUILD_ROOT%\!ZLC_PROJ_SUB!"
 if not defined ZLC_PS_LOG_DIR set "ZLC_PS_LOG_DIR=%ZLC_PS_BUILD_ROOT%\logs"
 echo ZLC build root: %ZLC_PS_BUILD_ROOT%
