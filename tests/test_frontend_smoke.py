@@ -357,6 +357,18 @@ def test_frontend_title_pulse_and_public_2d_square_guard():
     assert any(label for label in x_tick_labels)
     assert pulse.ax.get_xlabel() == "Time (us)"
     assert all("e" not in label.lower() for label in x_tick_labels if label)
+    # Non-bracket timeline: the display window is a touch wider than the data on
+    # BOTH sides, so a first edge at t=0 gets breathing room instead of sitting
+    # flush on the spine (the left used to be clamped to 0). Margins are
+    # symmetric, and the negative-time headroom is never given a tick label.
+    pulse_xlim = pulse.ax.get_xlim()
+    pulse_stop = max(row.start + row.duration for row in Seq().effective_pulses())
+    left_margin = 0.0 - pulse_xlim[0]
+    right_margin = pulse_xlim[1] - pulse_stop
+    assert pulse_xlim[0] < 0.0
+    assert left_margin > 0.0 and right_margin > 0.0
+    assert abs(left_margin - right_margin) < 1e-6 * left_margin
+    assert all(not label.startswith("-") for label in x_tick_labels if label)
 
     ns_pulse = zf.plot([{"channel": "gate", "start": 0.0, "duration": 30e-9, "value": 1}], kind="pulse", display=False)
     ns_pulse.fig.canvas.draw()

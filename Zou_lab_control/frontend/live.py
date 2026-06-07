@@ -36,6 +36,23 @@ PULSE_COLORS = [
 ]
 
 
+# --- Pulse-plot display margins -------------------------------------------
+# The pulse timeline draws a viewport deliberately a little WIDER than the data
+# extent, so pulses/edges sitting on the boundary (e.g. a first edge at t=0) are
+# clearly visible instead of flush against a spine -- the same idea the other
+# plot types use when they pad their display limits beyond the raw data range
+# (Live1D/Histogram pad y by ~10-20%; Live2DDis pads both axes).  off_lines and
+# analog baselines are still drawn out to these limits, so the full-bleed
+# baseline look is preserved on purpose.  X uses a fraction of the time span (so
+# the margin scales with the data/zoom); Y uses a fixed gap in channel-row units
+# (rows are unit-spaced, so a fixed gap reads the same regardless of how many
+# channels are shown).
+PULSE_X_MARGIN_FRAC = 0.04          # per-side x headroom, as a fraction of the time span
+PULSE_X_BRACKET_LABEL_FRAC = 0.05   # extra RIGHT headroom when a repeat x N bracket label is shown
+PULSE_Y_PAD_BOTTOM = 0.62           # gap below the bottom channel row (row units)
+PULSE_Y_PAD_TOP = 0.38              # gap above the top channel row (row units)
+
+
 def _as_data_x(data_x) -> np.ndarray:
     x = np.asarray(data_x, dtype=float)
     if x.ndim == 1:
@@ -919,10 +936,24 @@ class PulseSequenceFigure(BaseLivePlot):
         return max(float(row["stop"]) for row in self.pulses)
 
     def _xlimits_for_timeline(self, start_min: float, stop_max: float, *, has_bracket: bool) -> tuple[float, float]:
+        """Display x-limits, deliberately a bit wider than ``[start_min, stop_max]``.
+
+        A symmetric margin (a fraction of the time span, see
+        ``PULSE_X_MARGIN_FRAC``) is added on each side and the left edge is
+        *never* clamped to 0, so a first edge at ``t=0`` still gets breathing
+        room instead of sitting flush on the spine.  Negative-time headroom is
+        cosmetic only -- the x-axis formatter blanks tick labels for ``value <
+        0``, so no negative tick is ever shown.  When a repeat bracket is
+        present, extra room is added on the right for its ``x N`` label.
+        ``off_lines`` and the analog baselines are drawn out to these same
+        limits, which keeps the intentional full-bleed baseline look.
+        """
         span = max(float(stop_max - start_min), 1e-12)
-        margin_x = max(span * (0.065 if has_bracket else 0.025), 1e-12)
-        left_limit = start_min - margin_x if has_bracket else max(0.0, start_min - margin_x)
-        right_limit = stop_max + margin_x * (1.25 if has_bracket else 0.8)
+        margin_x = max(span * PULSE_X_MARGIN_FRAC, 1e-12)
+        left_limit = start_min - margin_x
+        right_limit = stop_max + margin_x
+        if has_bracket:
+            right_limit += span * PULSE_X_BRACKET_LABEL_FRAC
         return left_limit, right_limit
 
     def init_core(self) -> None:
@@ -1004,10 +1035,10 @@ class PulseSequenceFigure(BaseLivePlot):
                 )
 
         self.ax.set_xlim(left_limit, right_limit)
-        ylim_top = n_channels - 0.38
+        ylim_top = n_channels - PULSE_Y_PAD_TOP
         if self.repeat_brackets:
             ylim_top = n_channels + 0.78 + 0.26 * max(0, len(self.repeat_brackets) - 1)
-        self.ax.set_ylim(-0.62, ylim_top)
+        self.ax.set_ylim(-PULSE_Y_PAD_BOTTOM, ylim_top)
         self.analog_trace_artists = []
         self.analog_trace_labels = []
         for trace_index, (key, trace) in enumerate(zip(analog_keys, self.analog_traces)):
