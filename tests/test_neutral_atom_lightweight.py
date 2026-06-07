@@ -3689,3 +3689,52 @@ def test_pulse_table_delay_is_cyclic_in_preview():
     # frame total is unchanged by delay (cyclic, never extends the period)
     st.delays = {"ch0": 1500}
     assert round(st.to_sequence().duration * 1e9) == 2000
+
+
+def test_pulse_table_repeat_forever_delay_cyclic_hardware_matches_preview():
+    """repeat_forever + a channel delay that wraps: the compiled edge table is the
+    CYCLIC rotation (same as the preview), the loop period stays the frame (not
+    extended by the delay), the final mask is safe-idle 0, AND the engine loops it
+    SEAMLESSLY -- a pulse spanning the loop seam stays ON across it (verified with the
+    cycle-accurate engine model, no hardware needed)."""
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.devices.sequencer import compile_pulse_table_runtime_program
+    from fpga.pulse_streamer.host import engine_model as em
+
+    def on_intervals(bits):
+        out, s = [], None
+        for i in range(len(bits) + 1):
+            b = (i < len(bits)) and (int(bits[i]) & 1)
+            if b and s is None:
+                s = i
+            elif not b and s is not None:
+                out.append((s, i)); s = None
+        return out
+
+    st = na.PulseTableState(
+        channels=["ch0"],
+        periods=[na.PulsePeriod(1000, (1,), unit="ns"), na.PulsePeriod(1000, (0,), unit="ns")],
+        time_step_ns=20,
+    )  # frame = 2000 ns = 100 ticks; ch0 ON [0,1000) = ticks [0,50)
+    st.delays = {"ch0": 1500}; st.delay_units = {"ch0": "ns"}  # +75 ticks -> wraps the frame
+
+    prog = compile_pulse_table_runtime_program(st, clock_hz=50e6, repeat_forever=True)
+    assert prog.masks[-1] == 0                 # final mask is safe-idle
+    assert prog.loop_end_tick == 100           # loop period stays the frame (delay wraps within it)
+
+    # per-frame hardware ON (from ticks/masks) matches the cyclic preview
+    hw = []
+    for i, tk in enumerate(prog.ticks):
+        nxt = prog.ticks[i + 1] if i + 1 < len(prog.ticks) else prog.loop_end_tick
+        if int(prog.masks[i]) & 1 and nxt > tk:
+            hw.append((tk, nxt))
+    hw = [iv for iv in hw if iv[1] > iv[0]]
+    seq = st.to_sequence()
+    preview = sorted((round(p.start / 20e-9), round((p.start + p.duration) / 20e-9)) for p in seq.effective_pulses())
+    assert preview == [(0, 25), (75, 100)]
+    # merge hw across exactly-adjacent edges for comparison
+    assert sorted(hw) == [(0, 25), (75, 100)]
+
+    # engine-model loop playback: the wrap is SEAMLESS (ON [75,100) continues into [0,25))
+    ep = em.EngineProgram.from_program(prog)
+    assert on_intervals(em.reference_play(ep, 230)) == [(0, 25), (75, 125), (175, 225)]

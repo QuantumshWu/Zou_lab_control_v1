@@ -25,7 +25,7 @@ from ..timing import (
     sequence_for_frame_count,
     slot_var,
 )
-from ..timing.pulse_table import UNITS_TO_NS
+from ..timing.pulse_table import UNITS_TO_NS, _cyclic_shift_interval
 from ..timing.verilog import VerilogBuild, VerilogFiles, generate_verilog, write_verilog_bundle
 
 
@@ -267,7 +267,13 @@ def compile_pulse_table_runtime_program(
     sequence = state.to_sequence(slots=slot_values, time_step_ns=clock_step_ns, expand_repeat=False)
     period_starts = _pulse_table_period_starts_ticks(state, slots=slot_values, time_step_ns=clock_step_ns)
     has_delays = _pulse_table_has_delays(state, slots=slot_values, time_step_ns=clock_step_ns)
-    if has_delays:
+    # A repeat_forever sequence (no finite bracket) gets the CYCLIC delay: a channel
+    # delay rotates its pattern within the frame and wraps across the loop seam --
+    # identical to what the preview shows.  A finite/bracketed sequence keeps the real
+    # additive shift (channel comes out later; table extends), which the loop guard
+    # checks fits.
+    cyclic_delay = bool(repeat_forever) and state.repeat_start is None and state.repeat_end is None
+    if has_delays and not cyclic_delay:
         _validate_pulse_table_delays_for_hardware_loop(
             state,
             period_starts=period_starts,
@@ -285,11 +291,14 @@ def compile_pulse_table_runtime_program(
         slots=slot_values,
         time_step_ns=clock_step_ns,
         fold_analog_buses=not bool(bus_segments),
+        cyclic_delay=cyclic_delay,
     )
     repeat_count = int(state.repeat_count)
     if state.repeat_start is None or state.repeat_end is None:
         loop_start_index = 0
-        loop_end_tick = int(ticks[-1]) if has_delays else int(period_starts[-1])
+        # cyclic delay keeps the loop period at the frame (delay wraps within it);
+        # the additive (finite) path extends the table by the delay.
+        loop_end_tick = int(ticks[-1]) if (has_delays and not cyclic_delay) else int(period_starts[-1])
         loop_count = 1
     else:
         loop_start_tick = int(period_starts[int(state.repeat_start)])
@@ -298,7 +307,7 @@ def compile_pulse_table_runtime_program(
         loop_count = repeat_count
 
     effective_duration_ticks = _pulse_table_effective_duration_ticks(state, slots=slot_values, time_step_ns=clock_step_ns)
-    if has_delays and state.repeat_start is None and state.repeat_end is None:
+    if has_delays and not cyclic_delay and state.repeat_start is None and state.repeat_end is None:
         effective_duration_ticks = int(ticks[-1])
     payload = {
         "table": state.to_dict(),
@@ -1458,7 +1467,16 @@ def _pulse_table_edge_table(
     slots: Mapping[str, float] | None = None,
     time_step_ns: float,
     fold_analog_buses: bool = True,
+    cyclic_delay: bool = False,
 ) -> tuple[list[int], list[int], list[str]]:
+    """Build the (ticks, masks) edge table.
+
+    ``cyclic_delay`` selects the delay semantics (see the timing manual / Confocal
+    delay): for a repeat_forever sequence a channel delay is a CYCLIC rotation of its
+    on/off pattern within the frame (a pulse pushed past the end wraps to the start,
+    and a pulse spanning the loop seam stays on across it -- no spurious OFF at the
+    frame end).  For a finite/one-shot sequence it is a real additive shift (the
+    channel comes out ``delay`` later; the table simply extends)."""
     hardware_channels = list(channel_names(channels, "channels"))
     state_index = {channel: index for index, channel in enumerate(state.channels)}
     starts = _pulse_table_period_starts_ticks(state, slots=slots, time_step_ns=time_step_ns)
@@ -1473,18 +1491,37 @@ def _pulse_table_edge_table(
         if channel in bus_members:
             continue
         delay_steps = state.delay_steps(channel, slots=slots, time_step_ns=time_step_ns)
+        # collect the channel's UN-delayed ON intervals over the frame
+        ivals: list[tuple[int, int]] = []
         active_start: int | None = None
         for period_index, period in enumerate(state.periods):
             value = int(period.states[channel_index])
             if value and active_start is None:
                 active_start = int(starts[period_index])
             elif not value and active_start is not None:
-                events.append((active_start + delay_steps, channel, 1))
-                events.append((int(starts[period_index]) + delay_steps, channel, 0))
+                ivals.append((active_start, int(starts[period_index])))
                 active_start = None
         if active_start is not None:
-            events.append((active_start + delay_steps, channel, 1))
-            events.append((table_end + delay_steps, channel, 0))
+            ivals.append((active_start, table_end))
+        if cyclic_delay and table_end > 0:
+            # CYCLIC: rotate each interval within [0, table_end); a piece that spans
+            # the loop seam (ends exactly at table_end while the channel is also ON at
+            # t=0) must NOT emit an OFF at the seam -- it continues into the next loop.
+            pieces: list[tuple[int, int]] = []
+            for a, b in ivals:
+                pieces.extend(_cyclic_shift_interval(a, b, delay_steps, table_end))
+            on_at_zero = any(a == 0 for a, b in pieces)
+            for a, b in pieces:
+                if b <= a:
+                    continue
+                events.append((a, channel, 1))
+                if b < table_end or not on_at_zero:
+                    events.append((b, channel, 0))
+        else:
+            # additive (real) shift -- finite / one-shot
+            for a, b in ivals:
+                events.append((a + delay_steps, channel, 1))
+                events.append((b + delay_steps, channel, 0))
 
     if fold_analog_buses:
         for bus_name, members in bus_groups.items():
