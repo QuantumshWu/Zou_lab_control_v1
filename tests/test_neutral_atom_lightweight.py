@@ -299,74 +299,6 @@ def test_runtime_sequencer_service_contract():
     assert snapshot["prepared_program"]["trigger_count"] == 2
 
 
-def test_fpga_pulse_streamer_writes_hdl_and_upload_tcl(tmp_path):
-    seq = na.sequence_for_frame_count(na.imaging_sequence(exposure=4e-6, load=True), 2)
-    program = na.compile_runtime_program(seq, channels=["trap", "cooling", "probe", "emCCD"], clock_hz=50_000_000)
-
-    files = na.write_pulse_streamer_hdl_bundle(tmp_path / "hdl", channels=["trap", "cooling", "probe", "emCCD"], max_edges=16)
-    tcl_path = na.write_vivado_pulse_streamer_tcl(
-        tmp_path / "prepare.tcl",
-        "prepare",
-        program=program,
-        project="D:/fake/project.xpr",
-        bitstream="D:/fake/main.bit",
-        probes="D:/fake/main.ltx",
-        max_edges=16,
-        channel_count=4,
-    )
-
-    na.validate_pulse_streamer_program(program, max_edges=16, channel_count=4)
-    core = files.core_path.read_text(encoding="utf-8")
-    top = files.top_example_path.read_text(encoding="utf-8")
-    tcl = tcl_path.read_text(encoding="utf-8")
-    assert "module zlc_pulse_streamer" in core
-    assert "Runtime-programmable edge-table pulse streamer" in core
-    assert '(* ram_style = "distributed" *)' in core
-    assert "first_tick_shadow" in core
-    assert "loop_start_mask_shadow" in core
-    assert "tick_mem[0]" not in core
-    assert "mask_mem[0]" not in core
-    assert "mask_mem[loop_start_active]" not in core
-    assert "reg reset_meta = 1'b0;" in core
-    assert "reg reset_sync = 1'b0;" in core
-    assert "reg start_meta = 1'b0;" in core
-    assert "reg prog_we_meta = 1'b0;" in core
-    assert "wire start_event = start_sync && !start_prev" in core
-    assert "wire start_event = start_sync != start_prev" not in core
-    assert "wire prog_we_event = prog_we_sync != prog_we_prev" in core
-    assert "if (reset_sync && prog_we_event)" in core
-    assert "probe_out4 zlc_prog_tick" in top
-    assert "probe_out10 zlc_loop_count" in top
-    assert "proc zlc_stage_probe" in tcl
-    assert "proc zlc_commit_probes" in tcl
-    assert "global zlc_probe_cache" in tcl
-    assert "set cache_key" in tcl
-    assert "zlc_probe_cache($cache_key)" in tcl
-    assert "ZLC_PS_VERBOSE_VIO" in tcl
-    assert "global zlc_verbose_vio" in tcl
-    assert "zlc_commit_probes $zlc_batch" in tcl
-    assert "zlc_stage_probe $vio $zlc_prog_count_probe" in tcl
-    assert "zlc_stage_probe $vio $zlc_repeat_forever_probe" in tcl
-    assert "zlc_stage_probe $vio $zlc_loop_start_addr_probe" in tcl
-    assert "zlc_stage_probe $vio $zlc_loop_end_tick_probe" in tcl
-    assert "zlc_stage_probe $vio $zlc_loop_count_probe" in tcl
-    assert "zlc_stage_probe $vio $zlc_prog_tick_probe" in tcl
-    assert "zlc_stage_probe $vio $zlc_prog_mask_probe" in tcl
-    assert "zlc_start_toggle_value" not in tcl
-    assert "Available probes on matched VIO:" in tcl
-    assert "Vivado project not found" in tcl
-    assert "Vivado probe file not found" in tcl
-    assert "Vivado bitstream not found for programming" in tcl
-    assert "set zlc_reset_probe {zlc_reset probe_out0}" in tcl
-    assert "set zlc_prog_tick_probe {zlc_prog_tick probe_out4}" in tcl
-    assert "set zlc_repeat_forever_probe {zlc_repeat_forever probe_out7}" in tcl
-    assert "set zlc_loop_count_probe {zlc_loop_count probe_out10}" in tcl
-    assert "set zlc_done_probe {zlc_done probe_in1}" in tcl
-    assert "string match \"*/$name\"" in tcl
-    assert "probe aliases" in tcl
-    assert f"wrote {len(program.ticks)}/{len(program.ticks)} edge rows" in tcl
-
-
 def test_fpga_pulse_streamer_rejects_program_that_does_not_fit():
     seq = na.sequence_for_frame_count(na.imaging_sequence(exposure=4e-6, load=True), 2)
     program = na.compile_runtime_program(seq, channels=["trap", "cooling", "probe", "emCCD"], clock_hz=50_000_000)
@@ -424,19 +356,6 @@ def test_fpga_pulse_streamer_rejects_runtime_edge_table_hazards():
             raise AssertionError(f"pulse-streamer validation should reject {expected}")
 
 
-def test_fpga_pulse_streamer_rejects_bad_top_level_channel_names():
-    for channels, expected in (
-        (["a-b", "a_b"], "collide"),
-        (["clk", "probe"], "top-level"),
-    ):
-        try:
-            na.generate_pulse_streamer_top_example(channels=channels)
-        except ValueError as exc:
-            assert expected in str(exc)
-        else:
-            raise AssertionError(f"top example should reject {channels!r}")
-
-
 def test_fpga_pulse_streamer_fire_dry_run_does_not_require_program_file(tmp_path):
     from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import run_action
 
@@ -447,70 +366,6 @@ def test_fpga_pulse_streamer_fire_dry_run_does_not_require_program_file(tmp_path
     assert "zlc_stage_probe $vio $zlc_start_probe 1" in tcl
     assert "zlc_set_probe $vio $zlc_start_probe 0" in tcl
     assert "ZLC pulse-streamer start pulse sent" in tcl
-
-
-def test_fpga_pulse_streamer_dry_run_uses_project_local_artifacts(tmp_path, monkeypatch):
-    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import run_action
-
-    root = Path(__file__).resolve().parents[1]
-    unsafe_project_dir = root / "fpga" / "pulse_streamer" / "build" / "zlc_pulse_streamer_legacy"
-    unsafe_bitstream = unsafe_project_dir / "legacy.runs" / "impl_1" / "legacy_top.bit"
-    unsafe_probes = unsafe_project_dir / "legacy.runs" / "impl_1" / "legacy_top.ltx"
-    default_project_dir = root / "fpga" / "build" / "address_switch"
-    monkeypatch.setenv("ZLC_PS_PROJECT_DIR", str(unsafe_project_dir))
-    monkeypatch.setenv("ZLC_PS_VIVADO_PROJECT", str(unsafe_project_dir / "legacy.xpr"))
-    monkeypatch.setenv("ZLC_PS_VIVADO_BIT", str(unsafe_bitstream))
-    monkeypatch.setenv("ZLC_PS_VIVADO_LTX", str(unsafe_probes))
-    for name in (
-        "ZLC_PS_PROJECT_ROOT",
-        "ZLC_VIVADO_PROJECT",
-        "ZLC_VIVADO_BIT",
-        "ZLC_VIVADO_LTX",
-    ):
-        monkeypatch.delenv(name, raising=False)
-
-    tcl_path = run_action("fire", state_dir=tmp_path, dry_run=True)
-
-    tcl = tcl_path.read_text(encoding="utf-8")
-    assert str(unsafe_project_dir) not in tcl
-    assert str(unsafe_bitstream) not in tcl
-    assert str(unsafe_probes) not in tcl
-    assert str(default_project_dir) in tcl
-    assert "address_switch.xpr" in tcl
-    assert "address_switch.runs" in tcl
-    assert "zlc_pulse_streamer_top_address_switch.bit" in tcl
-    assert "zlc_pulse_streamer_top_address_switch.ltx" in tcl
-
-
-def test_fpga_pulse_streamer_module_cli_generates_hdl(tmp_path):
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer",
-            "generate_hdl",
-            "--output-dir",
-            str(tmp_path),
-            "--channels",
-            "trap",
-            "cooling",
-            "probe",
-            "trig",
-            "--max-edges",
-            "16",
-            "--tick-width",
-            "32",
-        ],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=20,
-    )
-
-    assert result.returncode == 0, result.stdout
-    assert (tmp_path / "zlc_pulse_streamer.v").exists()
-    assert (tmp_path / "zlc_pulse_streamer_top_example.v").exists()
-    assert (tmp_path / "zlc_pulse_streamer.manifest.json").exists()
 
 
 def test_pulse_gui_launcher_aligns_subset_state_to_full_hardware_channels(monkeypatch):
@@ -631,72 +486,57 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     }
 
     required = {
-        # Validated edge-table engine + the JTAG-to-AXI on-chip loader = the active
-        # build target.  The loader copies the program image from BRAM into the
-        # (unchanged, seamless) engine, so repeat + scan stay gapless and tick-exact.
-        "zlc_pulse_streamer.v",
-        "zlc_axi_program_loader.v",
-        "zlc_pulse_streamer_loader_top.v",
-        "create_project_loader.tcl",
-        "program_fpga_loader.tcl",
-        # VIO edge-table path kept as an alternate backend (same engine, VIO control).
-        "zlc_pulse_streamer_top_address_switch.v",
-        "create_project_address_switch.tcl",
-        "check_address_switch_synth.tcl",
+        # the FINAL single design (1-tick FIFO prefetch + 2-bank streaming scan),
+        # driven over JTAG-to-AXI -- the ONLY build target (no variants).
+        "zlc_edge_streamer.v",
+        "zlc_pulse_streamer_top.v",
+        "create_project.tcl",
+        "program_fpga.tcl",
         "diagnose_hw_target.tcl",
-        "program_fpga_address_switch.tcl",
         "README.md",
     }
-    assert required.issubset({path.name for path in fpga.iterdir()})
-    # The discarded per-channel run-length residue must be gone (no legacy residue).
-    assert {path.name for path in fpga.iterdir()}.isdisjoint({
-        "zlc_pulse_streamer_runlength.v",
-        "zlc_runlength_engine.v",
-        "zlc_pulse_streamer_runlength_top.v",
-        "create_project_runlength.tcl",
-        "program_fpga_runlength.tcl",
-    })
+    present = {path.name for path in fpga.iterdir()}
+    assert required.issubset(present), required - present
+    # NO legacy residue: the old LUTRAM/VIO engine, the depth-1 'D' engine, the
+    # on-chip AXI loader, and the VIO address-switch top + all their tcl are GONE.
+    assert present.isdisjoint({
+        "zlc_pulse_streamer.v", "zlc_pulse_streamer_d.v", "zlc_pulse_streamer_d_top.v",
+        "zlc_axi_program_loader.v", "zlc_pulse_streamer_loader_top.v",
+        "zlc_pulse_streamer_top_address_switch.v",
+        "create_project_d.tcl", "create_project_loader.tcl", "create_project_address_switch.tcl",
+        "program_fpga_d.tcl", "program_fpga_loader.tcl", "program_fpga_address_switch.tcl",
+        "check_address_switch_synth.tcl",
+        "zlc_pulse_streamer_runlength.v", "zlc_runlength_engine.v",
+    }), "legacy residue HDL/tcl still present in fpga/pulse_streamer"
     legacy_width = "40" + "ch"
-    removed = {
-        f"zlc_pulse_streamer_top_{legacy_width}.v",
-        f"zlc_pulse_streamer_{legacy_width}.xdc",
-        f"zlc_pulse_streamer_{legacy_width}.xdc.template",
-        f"create_project_{legacy_width}.tcl",
-        f"check_{legacy_width}_synth.tcl",
-        f"program_fpga_{legacy_width}.tcl",
-    }
-    assert removed.isdisjoint({path.name for path in fpga.iterdir()})
-    # The legacy-width artifacts must not survive anywhere under docs/ either
-    # (the old pulse_streamer_test_report assets dir was deleted in the reorg).
+    legacy_xdc_env = "ZLC_PS_" + legacy_width.upper() + "_XDC"
     assert not list((root / "docs").rglob(f"*{legacy_width}*"))
 
-    top = (fpga / "zlc_pulse_streamer_top_address_switch.v").read_text(encoding="utf-8")
-    create_tcl = (fpga / "create_project_address_switch.tcl").read_text(encoding="utf-8")
-    check_tcl = (fpga / "check_address_switch_synth.tcl").read_text(encoding="utf-8")
-    program_tcl = (fpga / "program_fpga_address_switch.tcl").read_text(encoding="utf-8")
+    top = (fpga / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
+    engine = (fpga / "zlc_edge_streamer.v").read_text(encoding="utf-8")
+    create_tcl = (fpga / "create_project.tcl").read_text(encoding="utf-8")
+    program_tcl = (fpga / "program_fpga.tcl").read_text(encoding="utf-8")
     build_bat = (root / "fpga" / "build_and_program.bat").read_text(encoding="utf-8")
     server_bat = (root / "fpga" / "run_server.bat").read_text(encoding="utf-8")
     launcher = (root / "pulse_gui.py").read_text(encoding="utf-8")
     preset = root / "pulses" / "camera_imaging_address_switch.json"
 
-    assert "module zlc_pulse_streamer_top_address_switch" in top
-    assert "localparam integer CHANNEL_COUNT = 62" in top
+    # final top: 62-pin board map + the FINAL engine instance + forced-latency build.
+    assert "module zlc_pulse_streamer_top" in top
+    assert "parameter integer CHANNEL_COUNT = 62" in top
     assert "assign trig = out[6];" in top
     assert "assign trap = out[9];" in top
     assert "assign probe = out[3];" in top
     assert "assign cooling = out[0];" in top
-    assert "wire [CHANNEL_COUNT-1:0] zlc_prog_mask" in top
-    assert "CONFIG.C_PROBE_OUT5_WIDTH {62}" in create_tcl
-    assert "set project_name address_switch" in create_tcl
-    assert "zlc_pulse_streamer_top_address_switch" in create_tcl
+    assert "zlc_edge_streamer" in top                      # instantiates the final engine
+    assert "module zlc_edge_streamer" in engine
+    assert "set project_name pulse_streamer" in create_tcl
+    assert "zlc_edge_streamer.v" in create_tcl and "zlc_pulse_streamer_top.v" in create_tcl
+    assert "zlc_force_latency2" in create_tcl              # forced edge-BRAM read latency 2
     assert "ZLC_PS_XDC" in create_tcl
-    legacy_xdc_env = "ZLC_PS_" + legacy_width.upper() + "_XDC"
     assert legacy_xdc_env not in create_tcl
-    assert "CONFIG.C_PROBE_OUT5_WIDTH {62}" in check_tcl
-    assert "ZLC check_address_switch_synth contract" in check_tcl
-    assert "ZLC program_fpga_address_switch contract" in program_tcl
-    assert "zlc_pulse_streamer_top_address_switch.bit" in program_tcl
-    assert "zlc_pulse_streamer_top_address_switch.ltx" in program_tcl
+    assert "set top zlc_pulse_streamer_top" in program_tcl
+    assert "pulse_streamer.runs" in program_tcl
 
     # build_and_program.bat builds the FINAL single design (JTAG-to-AXI, 1-tick
     # FIFO prefetch + streaming scan): one create_project.tcl, no variants, no VIO
@@ -759,11 +599,10 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     assert "20 ns" in maintainer_notes
     assert "50 MHz" in main_manual_template
     assert "20 ns" in main_manual_template
-    # The Vivado prepare/fire/wait_done/safe_state lifecycle and the persistent
-    # VIO-session contract now live in the maintainer note + main manual.
+    # The prepare/fire/wait_done/safe_state lifecycle lives in the maintainer note
+    # + main manual (design-agnostic host contract).
     assert "prepare" in maintainer_notes and "fire" in maintainer_notes
     assert "wait_done" in maintainer_notes and "safe_state" in maintainer_notes
-    assert "VIO" in maintainer_notes
     assert "prepare / fire / wait\\_done / safe\\_state" in main_manual_template
     # The build/resource knob moved into the maintainer note + fpga README.
     assert "ZLC_PS_RESOURCE_TARGET_PCT" in maintainer_notes
@@ -774,138 +613,6 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     assert "address-switch" in maintainer_notes
     assert "Run the smallest check" in tests_readme
     assert "Full `pytest -q` is reserved for broad handoff" in tests_readme
-
-def _vio_probe_map(text):
-    """Return ``{probe_out_index: zlc_signal_name}`` from a top-module VIO instance."""
-
-    return {int(index): name for index, name in re.findall(r"\.probe_out(\d+)\((zlc_[A-Za-z0-9_]+)\)", text)}
-
-
-def _wire_width_expr(text, signal):
-    """Return the bracketed width expression of a ``wire [...] zlc_<signal>;`` declaration."""
-
-    match = re.search(rf"wire(?: signed)? \[([^\]]+)\] zlc_{re.escape(signal)};", text)
-    return None if match is None else match.group(1).strip()
-
-
-def test_fpga_pulse_streamer_address_switch_vio_widths_match_python_generator():
-    root = Path(__file__).resolve().parents[1]
-    fpga = root / "fpga" / "pulse_streamer"
-    top = (fpga / "zlc_pulse_streamer_top_address_switch.v").read_text(encoding="utf-8")
-
-    generated_top = na.generate_pulse_streamer_top_example(
-        channels=[f"ch{i:02d}" for i in range(62)],
-        top_module_name="zlc_pulse_streamer_top_address_switch",
-        max_edges=1024,
-    )
-
-    # The N-slot packed VIO layout has exactly 28 probe_out (0..27) and 2 probe_in,
-    # and the same signal must sit on the same probe_out index in both files.
-    top_map = _vio_probe_map(top)
-    gen_map = _vio_probe_map(generated_top)
-    expected_map = {
-        0: "zlc_reset",
-        1: "zlc_start",
-        2: "zlc_prog_we",
-        3: "zlc_prog_addr",
-        4: "zlc_prog_tick",
-        5: "zlc_prog_mask",
-        6: "zlc_prog_count",
-        7: "zlc_repeat_forever",
-        8: "zlc_loop_start_addr",
-        9: "zlc_loop_end_tick",
-        10: "zlc_loop_count",
-        11: "zlc_prog_tick_coeffs",
-        12: "zlc_scan_enable",
-        13: "zlc_scan_prog_we",
-        14: "zlc_scan_prog_addr",
-        15: "zlc_scan_prog_values",
-        16: "zlc_scan_count",
-        17: "zlc_loop_end_coeffs",
-        18: "zlc_bus_prog_we",
-        19: "zlc_bus_prog_bus",
-        20: "zlc_bus_prog_addr",
-        21: "zlc_bus_prog_start_tick",
-        22: "zlc_bus_prog_stop_tick",
-        23: "zlc_bus_prog_start_value",
-        24: "zlc_bus_prog_stop_value",
-        25: "zlc_bus_prog_mode",
-        26: "zlc_bus_counts",
-        27: "zlc_bus_prog_value_select",
-        28: "zlc_bus_prog_start_tick_coeffs",
-        29: "zlc_bus_prog_stop_tick_coeffs",
-    }
-    assert top_map == expected_map
-    assert gen_map == expected_map
-    assert sorted(top_map) == list(range(30))
-    assert "probe_in1" in top and "probe_in1" in generated_top
-    assert "probe_out30" not in top and "probe_out30" not in generated_top
-
-    # Scalar / addr / value wires carry identical numeric widths in both files.
-    width_contract = {
-        "prog_addr": "9:0",
-        "prog_tick": "31:0",
-        "prog_count": "10:0",
-        "loop_start_addr": "9:0",
-        "loop_end_tick": "31:0",
-        "loop_count": "31:0",
-        "scan_prog_addr": "9:0",
-        "scan_count": "10:0",
-        "bus_prog_bus": "1:0",
-        "bus_prog_addr": "5:0",
-        "bus_prog_start_tick": "31:0",
-        "bus_prog_stop_tick": "31:0",
-        "bus_prog_start_value": "9:0",
-        "bus_prog_stop_value": "9:0",
-        "bus_prog_mode": "1:0",
-        "bus_counts": "27:0",
-        "bus_prog_value_select": "2:0",
-    }
-    for signal, width in width_contract.items():
-        assert f"wire [{width}] zlc_{signal};" in top, signal
-        assert f"wire [{width}] zlc_{signal};" in generated_top, signal
-
-    # prog_mask is parameterized to CHANNEL_COUNT in the checked-in top.
-    assert "wire [CHANNEL_COUNT-1:0] zlc_prog_mask;" in top
-    assert "wire [61:0] zlc_prog_mask;" in generated_top
-
-    # The N-slot packed buses: prog_tick_coeffs = NUM_SLOTS*COEFF_WIDTH = 4*16 = 64,
-    # scan_prog_values = NUM_SLOTS*TICK_WIDTH = 4*32 = 128, loop_end_coeffs = 64.
-    # The checked-in top keeps them parameterized; the generator emits the numbers.
-    assert "localparam integer NUM_SLOTS = 4;" in top
-    assert "wire [NUM_SLOTS*COEFF_WIDTH-1:0] zlc_prog_tick_coeffs;" in top
-    assert "wire [NUM_SLOTS*COEFF_WIDTH-1:0] zlc_loop_end_coeffs;" in top
-    assert "wire [NUM_SLOTS*TICK_WIDTH-1:0] zlc_scan_prog_values;" in top
-    # Affine bus-segment tick coefficients (DAC+duration+delay simultaneous scan).
-    assert "wire [NUM_SLOTS*COEFF_WIDTH-1:0] zlc_bus_prog_start_tick_coeffs;" in top
-    assert "wire [NUM_SLOTS*COEFF_WIDTH-1:0] zlc_bus_prog_stop_tick_coeffs;" in top
-    assert _wire_width_expr(generated_top, "prog_tick_coeffs") == "63:0"
-    assert _wire_width_expr(generated_top, "loop_end_coeffs") == "63:0"
-    assert _wire_width_expr(generated_top, "scan_prog_values") == "127:0"
-    assert _wire_width_expr(generated_top, "bus_prog_start_tick_coeffs") == "63:0"
-    assert _wire_width_expr(generated_top, "bus_prog_stop_tick_coeffs") == "63:0"
-    assert ".NUM_SLOTS(NUM_SLOTS)" in top
-    assert ".NUM_SLOTS(4)" in generated_top
-
-    # The old per-x/y coefficient probes are gone from both files.
-    for removed in (
-        "prog_tick_x_coeff",
-        "prog_tick_y_coeff",
-        "scan_prog_x",
-        "scan_prog_y",
-        "loop_end_x_coeff",
-        "loop_end_y_coeff",
-    ):
-        assert f"zlc_{removed}" not in top, removed
-        assert f"zlc_{removed}" not in generated_top, removed
-
-    assert ".EDGE_ADDR_WIDTH(10)" in top
-    assert ".EDGE_ADDR_WIDTH(10)" in generated_top
-    assert ".SCAN_ADDR_WIDTH(10)" in top
-    assert ".SCAN_ADDR_WIDTH(10)" in generated_top
-    assert ".EDGE_ADDR_WIDTH(7)" not in top
-    assert ".EDGE_ADDR_WIDTH(7)" not in generated_top
-
 
 def test_repo_batch_files_use_crlf_line_endings():
     """Windows .bat files MUST be CRLF in the working tree.  With bare-LF endings
@@ -942,72 +649,6 @@ def test_repo_gitattributes_forces_crlf_for_batch_files():
     root = Path(__file__).resolve().parents[1]
     attrs = (root / ".gitattributes").read_text(encoding="utf-8")
     assert "*.bat text eol=crlf" in attrs
-
-
-def test_fpga_pulse_streamer_capacity_doc_matches_checked_in_ram_strategy():
-    root = Path(__file__).resolve().parents[1]
-    fpga = root / "fpga" / "pulse_streamer"
-    core = (fpga / "zlc_pulse_streamer.v").read_text(encoding="utf-8")
-    top = (fpga / "zlc_pulse_streamer_top_address_switch.v").read_text(encoding="utf-8")
-    # The standalone capacity doc was folded into the consolidated maintainer
-    # note and the FPGA manual template during the docs reorg.
-    notes = (root / "docs" / "MAINTAINER_NOTES.md").read_text(encoding="utf-8")
-    fpga_manual = (
-        root
-        / "Zou_lab_control"
-        / "neutral_atom"
-        / "content"
-        / "manual_templates"
-        / "fpga_manual_zh.texbody"
-    ).read_text(encoding="utf-8")
-    streamer_readme = (fpga / "README.md").read_text(encoding="utf-8")
-
-    # The checked-in RTL marks every big runtime table as distributed RAM
-    # (async single-row reads). The new N-slot packed memories are
-    # coeff_mem (NUM_SLOTS*COEFF_WIDTH wide) and scan_value_mem
-    # (NUM_SLOTS*TICK_WIDTH wide); tick_mem and mask_mem carry the per-edge
-    # absolute tick and full output mask.
-    assert '(* ram_style = "distributed" *)' in core
-    for mem in ("tick_mem", "coeff_mem", "mask_mem", "scan_value_mem"):
-        assert re.search(
-            rf'\(\* ram_style = "distributed" \*\) reg \[[^\]]+\] {mem} ',
-            core,
-        ), mem
-    # Packed widths must be the N-slot ones, not the old per-x/y coefficients.
-    assert "reg [COEFF_BITS-1:0] coeff_mem" in core
-    assert "reg [SLOT_BITS-1:0] scan_value_mem" in core
-    assert "localparam integer COEFF_BITS = NUM_SLOTS * COEFF_WIDTH;" in core
-    assert "localparam integer SLOT_BITS = NUM_SLOTS * TICK_WIDTH;" in core
-
-    assert "localparam integer CHANNEL_COUNT = 62" in top
-    assert ".CHANNEL_COUNT(CHANNEL_COUNT)" in top
-    assert ".EDGE_ADDR_WIDTH(10)" in top
-
-    # The documented RAM strategy (now in the maintainer note + FPGA manual)
-    # must match that RTL: distributed RAM today, with a BRAM-friendly
-    # synchronous-read pipeline + faster transport as the documented scale path.
-    assert 'ram_style="distributed"' in notes
-    assert "tick_mem" in notes and "mask_mem" in notes
-    assert "coeff_mem" in notes and "scan_value_mem" in notes
-    assert "CHANNEL_COUNT=62" in notes
-    # The documented scale path is a BRAM-friendly synchronous-read pipeline plus
-    # a faster transport.  The run-length engine locks that transport to
-    # JTAG-to-AXI (was an open list while the design was still deferred).
-    assert "BRAM-friendly synchronous-read" in notes
-    assert "pipeline" in notes
-    assert "JTAG-to-AXI" in notes
-
-    assert 'ram_style = "distributed"' in fpga_manual
-    assert "BRAM" in fpga_manual
-    assert "AXI" in fpga_manual and "JTAG-to-AXI" in fpga_manual
-
-    # The trimmed subsystem README still documents the VIO probe map; the new
-    # N-slot layout puts scan_count on probe_out16 (probe_out18 is bus_prog_we).
-    assert "One edge row means" in streamer_readme
-    assert "MAX_EDGES=1024" in streamer_readme
-    assert "probe_out3  zlc_prog_addr" in streamer_readme
-    assert "probe_out6  zlc_prog_count" in streamer_readme
-    assert "probe_out16 zlc_scan_count" in streamer_readme
 
 
 def _user_facing_markdown_files(root):
@@ -1205,50 +846,6 @@ def test_address_switch_xdc_infers_62_outputs_trigger_and_bus_channels():
     assert buses["da_bias_x"] == [f"ch{index:02d}" for index in range(40, 50)]
     assert buses["da_bias_y"] == [f"ch{index:02d}" for index in range(38, 28, -1)]
     assert buses["da_bias_z"] == [f"ch{index:02d}" for index in range(60, 50, -1)]
-
-
-def test_fpga_pulse_streamer_prepare_tcl_covers_full_edge_table_boundary(tmp_path):
-    program = na.RuntimeSequenceProgram(
-        sequence_id="full",
-        sequence_name="full_table",
-        clock_hz=100e6,
-        channels=["trap", "cooling", "probe", "trig"],
-        ticks=list(range(1024)),
-        masks=[1] * 1023 + [0],
-        duration=1023 / 100e6,
-        trigger_count=0,
-    )
-
-    na.validate_pulse_streamer_program(program, max_edges=1024, channel_count=4)
-    tcl_path = na.write_vivado_pulse_streamer_tcl(
-        tmp_path / "prepare_full.tcl",
-        "prepare",
-        program=program,
-        project="",
-        bitstream="",
-        probes="",
-        max_edges=1024,
-        channel_count=4,
-    )
-    tcl = tcl_path.read_text(encoding="utf-8")
-
-    assert "zlc_stage_probe $vio $zlc_prog_count_probe 1024" in tcl
-    assert "load_features labtools" in tcl
-    assert "open_hw" in tcl
-    assert "get_hw_targets" in tcl
-    assert "No Vivado hardware target found" in tcl
-    assert "Vivado hardware Tcl commands are unavailable" in tcl
-    assert "allow_non_jtag" not in tcl
-    assert "VIO filter '$vio_filter' failed" in tcl
-    assert "using the only available VIO core" in tcl
-    assert "zlc_stage_probe $vio $zlc_prog_addr_probe 1023" in tcl
-    assert "zlc_stage_probe $vio $zlc_prog_tick_probe 1023" in tcl
-    assert "zlc_stage_probe $vio $zlc_prog_mask_probe 0" in tcl
-    assert tcl.count("set zlc_prog_we_toggle_value [expr {$zlc_prog_we_toggle_value ? 0 : 1}]") == 1024
-    assert tcl.count("zlc_stage_probe $vio $zlc_prog_we_probe $zlc_prog_we_toggle_value") == 1024
-    assert "set zlc_prog_we_toggle_value [zlc_output_probe_bool $vio $zlc_prog_we_probe]" in tcl
-    assert "zlc_stage_probe $vio $zlc_prog_we_probe 0" not in tcl
-    assert "zlc_set_probe $vio $zlc_prog_we_probe 0" not in tcl
 
 
 def test_fpga_pulse_streamer_edge_table_python_model_matches_contract():
@@ -1565,142 +1162,6 @@ def _v2_loop_steps_resolved(eff_ticks, masks, loop_start_index, eff_loop_end, lo
             time_count += 1
         history.append(state_mask)
     return history
-
-
-def test_program_bram_depth_fits_device_and_matches_build():
-    """The program BRAM must (a) hold the whole edge-table image, (b) be a power of
-    two that fits the 35T's 50 RAMB36, and (c) match the depth + address widths wired
-    in the loader build Tcl and loader top.  Guards the BRAM sizing against drift."""
-
-    import math
-    from Zou_lab_control.neutral_atom.devices.edgetable_image import EdgeTableImageParams
-
-    p = EdgeTableImageParams()
-    depth = 32768
-    assert depth & (depth - 1) == 0, "BRAM depth must be a power of two for axi_bram_ctrl"
-    assert depth >= p.total_words, "BRAM too small to hold the edge-table image"
-    assert math.ceil(depth / 1024) <= 50, "BRAM exceeds the 35T's 50 RAMB36"
-
-    root = Path(__file__).resolve().parents[1]
-    tcl = (root / "fpga" / "pulse_streamer" / "create_project_loader.tcl").read_text(encoding="utf-8")
-    # Depth is set strictly (not via failure-tolerant zlc_try) with a read-back guard.
-    assert f"set zlc_bram_depth {depth}" in tcl
-    assert "CONFIG.MEM_DEPTH $zlc_bram_depth" in tcl
-    assert "CONFIG.Write_Depth_A $zlc_bram_depth" in tcl
-    assert "MEM_DEPTH did not take" in tcl
-    assert "Write_Depth_A reverted" in tcl
-
-    top = (root / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_loader_top.v").read_text(encoding="utf-8")
-    # axi_bram_ctrl bram_addr_a is byte-addressed (17 bits); the loader drives BRAM
-    # port B by WORD address (15 bits for 32768 words).
-    assert "wire [16:0] bram_addra" in top
-    assert "addra(bram_addra[16:2])" in top
-    assert "wire [14:0] ldr_addr" in top
-    assert ".addrb(ldr_addr)" in top
-def test_edgetable_image_packs_and_loader_walk_reconstructs_program():
-    """The edge-table BRAM image (loader path) must round-trip a full program:
-    pack(program) -> loader-walk unpack == program.  This proves the on-chip
-    loader delivers the SAME edge/scan/bus/loop data the validated VIO upload
-    delivered, so the unchanged seamless engine stays tick-exact + gapless."""
-
-    from Zou_lab_control.neutral_atom.devices.sequencer import (
-        RuntimeSequenceProgram,
-        RuntimeBusSegment,
-    )
-    from Zou_lab_control.neutral_atom.devices.edgetable_image import (
-        pack_program,
-        unpack_program,
-        EdgeTableImageParams,
-    )
-
-    prog = RuntimeSequenceProgram(
-        sequence_id="abc", sequence_name="t", clock_hz=50e6,
-        channels=[f"ch{i:02d}" for i in range(62)],
-        ticks=[0, 50, 120, 400],
-        masks=[0, (1 << 0) | (1 << 5), (1 << 61), 0],  # exercise the high mask bit
-        duration=8e-6, trigger_count=0,
-        repeat_forever=True, loop_start_index=1, loop_end_tick=400, loop_count=3,
-        slot_count=2, slot_kinds=["delay", "dac"],
-        loop_end_slot_coeffs=[256, 0],
-        tick_slot_coeffs=[[0, 0], [256, 0], [256, 0], [256, 0]],
-        scan_points=[[0, 0], [256, 256], [512, -768]],  # negative slot value too
-        scan_coeff_frac_bits=8,
-        bus_names=["da0"],
-        bus_segments=[
-            RuntimeBusSegment(bus_index=0, start_tick=50, stop_tick=120, start_value=0,
-                              stop_value=0, mode="edge", value_select=2,
-                              start_tick_coeffs=[256, 0], stop_tick_coeffs=[256, 0]),
-            RuntimeBusSegment(bus_index=2, start_tick=10, stop_tick=400, start_value=512,
-                              stop_value=1023, mode="ramp", value_select=0),
-        ],
-    )
-    p = EdgeTableImageParams()
-    image = pack_program(prog, p)
-    out = unpack_program(image, p)
-
-    def pad(row, n):
-        return list(row) + [0] * (n - len(row))
-
-    assert out["ticks"] == prog.ticks
-    assert out["masks"] == prog.masks
-    assert out["tick_slot_coeffs"] == [pad(r, p.num_slots) for r in prog.tick_slot_coeffs]
-    assert out["scan_points"] == prog.scan_points
-    assert out["slot_count"] == 2
-    assert out["repeat_forever"] is True
-    assert out["loop_start_index"] == 1
-    assert out["loop_count"] == 3
-    assert out["loop_end_tick"] == 400
-    assert out["loop_end_slot_coeffs"] == pad([256, 0], p.num_slots)
-
-    bus = {s["bus_index"]: s for s in out["bus_segments"]}
-    assert len(out["bus_segments"]) == 2
-    assert bus[0]["start_tick"] == 50 and bus[0]["stop_tick"] == 120
-    assert bus[0]["value_select"] == 2 and bus[0]["mode"] == "edge"
-    assert bus[0]["start_tick_coeffs"] == pad([256, 0], p.num_slots)
-    assert bus[2]["start_value"] == 512 and bus[2]["stop_value"] == 1023
-    assert bus[2]["mode"] == "ramp" and bus[2]["value_select"] == 0
-
-    # The whole image must fit a 32-RAMB36 (32768-word) program BRAM.
-    assert p.total_words <= 32768
-    # Only used rows are emitted -> the host uploads a small image.
-    assert len(image) < 200
-
-
-def test_edgetable_loader_top_and_build_wire_engine_and_ips():
-    """The loader top must instantiate the validated edge-table engine + the loader
-    + the three JTAG-to-AXI IPs, keep the exact 62-pin board map, and route the
-    engine's DAC bus_out to the pins (no longer tied to 0).  The build Tcl must read
-    all three RTL files, set the loader top, and size the BRAM strictly."""
-
-    root = Path(__file__).resolve().parents[1]
-    fpga = root / "fpga" / "pulse_streamer"
-    top = (fpga / "zlc_pulse_streamer_loader_top.v").read_text(encoding="utf-8")
-
-    assert "zlc_axi_program_loader #(" in top
-    assert "zlc_pulse_streamer #(" in top
-    assert "jtag_axi_0 zlc_jtag_axi_i" in top
-    assert "axi_bram_ctrl_0 zlc_bram_ctrl_i" in top
-    assert "blk_mem_gen_0 zlc_prog_bram_i" in top
-    # port B is driven by the loader (word address), port A by AXI
-    assert ".addrb(ldr_addr)" in top and ".web({4{ldr_we}})" in top
-    assert "addra(bram_addra[16:2])" in top
-    # exact board pin map preserved + DAC buses now driven by the engine
-    assert "assign da_clk3 = out[61];" in top
-    assert "assign da_dipole[0] = zlc_bus_out[0];" in top
-    assert ".bus_out(zlc_bus_out)" in top
-    assert "zlc_bus_out = 40'b0" not in top  # DACs are real now, not tied off
-
-    tcl = (fpga / "create_project_loader.tcl").read_text(encoding="utf-8")
-    assert "zlc_pulse_streamer.v" in tcl
-    assert "zlc_axi_program_loader.v" in tcl
-    assert "zlc_pulse_streamer_loader_top.v" in tcl
-    assert "set top zlc_pulse_streamer_loader_top" in tcl
-    assert "set zlc_bram_depth 32768" in tcl
-    assert "MEM_DEPTH did not take" in tcl  # strict depth guard preserved
-
-    prog = (fpga / "program_fpga_loader.tcl").read_text(encoding="utf-8")
-    assert "zlc_pulse_streamer_loader_top" in prog
-    assert "get_hw_axis" in prog
 
 
 def test_final_image_solver_90pct_and_packs_round_trip():
@@ -2180,390 +1641,6 @@ def test_vivado_axi_session_repeat_streaming_refills_cyclically(tmp_path):
     assert hw.reloads0 >= 2, f"expected the streamed scan to re-sweep cyclically, got {hw.reloads0}"
 
 
-def test_edgetable_prefetch_engine_is_tick_exact_and_gapless():
-    """The Architecture-D BRAM+prefetch engine must produce a per-tick output
-    byte-identical to the validated combinatorial engine, for every program shape
-    and at BRAM read latency 1 AND 2 -- proving the prefetch retiming preserves
-    tick-exactness AND 1-tick gaplessness (incl. across scan/loop/repeat
-    boundaries).  No Verilog sim in repo, so this Python co-sim is the proof."""
-
-    from Zou_lab_control.neutral_atom.devices.edgetable_engine_model import (
-        EngineProgram, reference_play, prefetch_play, PrefetchStall,
-    )
-    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import _apply_scan_tick
-
-    def prog(**kw):
-        base = dict(ticks=[], masks=[], tick_slot_coeffs=[], scan_points=[], slot_count=0,
-                    frac_bits=8, loop_start_index=0, loop_end_tick=0, loop_end_slot_coeffs=[],
-                    loop_count=1, repeat_forever=False)
-        base.update(kw)
-        base["tick_slot_coeffs"] = base["tick_slot_coeffs"] or [[0] * base["slot_count"] for _ in base["ticks"]]
-        base["loop_end_slot_coeffs"] = base["loop_end_slot_coeffs"] or [0] * base["slot_count"]
-        return EngineProgram(**base)
-
-    cases = {
-        "simple_rf": prog(ticks=[0, 5, 12, 40], masks=[0, 0b11, 0b100, 0], loop_end_tick=40, repeat_forever=True),
-        # back-to-back 1-tick edges: the spacing stress case prefetch must survive.
-        "b2b_1tick": prog(ticks=[0, 1, 2, 3, 4, 20], masks=[0, 1, 2, 3, 4, 0], loop_end_tick=20, repeat_forever=True),
-        "loop3": prog(ticks=[0, 10, 30, 60], masks=[0, 1, 2, 0], loop_start_index=1, loop_end_tick=30, loop_count=3),
-        "scan": prog(ticks=[0, 10, 20, 100], masks=[0, 1, 2, 0],
-                     tick_slot_coeffs=[[0, 0], [256, 0], [256, 0], [256, 0]],
-                     scan_points=[[0, 0], [256, 0], [512, 0]], slot_count=2, loop_end_tick=100, repeat_forever=True),
-        # 1-tick edges immediately after a scan-point boundary (edge0@0, edge1@1).
-        "scan_b2b": prog(ticks=[0, 1, 8, 50], masks=[0b1, 0b11, 0b100, 0],
-                         tick_slot_coeffs=[[0], [0], [256], [256]],
-                         scan_points=[[0], [256], [512]], slot_count=1, loop_end_tick=50, repeat_forever=True),
-        "single": prog(ticks=[0], masks=[0b101], loop_end_tick=10, repeat_forever=True),
-    }
-
-    N = 400
-    for name, pr in cases.items():
-        ref = reference_play(pr, N)
-        for lat in (1, 2):
-            for depth in (lat + 1, 4):
-                try:
-                    pf = prefetch_play(pr, N, read_latency=lat, fifo_depth=depth)
-                except PrefetchStall as exc:  # a stall would be a hardware gap
-                    raise AssertionError(f"{name} stalled at latency {lat}/depth {depth}: {exc}")
-                assert pf == ref, f"{name}: prefetch != reference at latency {lat}/depth {depth}"
-
-    # Independent brute-force ground truth for a single pass (no loop/repeat/scan):
-    # level at tick t = mask of the last edge whose effective tick <= t.
-    sp = prog(ticks=[0, 5, 12, 40], masks=[0, 0b11, 0b100, 0], loop_end_tick=40, loop_count=1)
-    effs = [_apply_scan_tick(sp.ticks[i], sp.tick_slot_coeffs[i], [], sp.frac_bits) for i in range(len(sp.ticks))]
-    brute = []
-    for t in range(45):
-        m = 0
-        for i, e in enumerate(effs):
-            if e <= t:
-                m = sp.masks[i]
-        brute.append(m)
-    assert reference_play(sp, 45) == brute
-    assert prefetch_play(sp, 45, read_latency=2, fifo_depth=3) == brute
-
-
-def test_edgetable_d_engine_rtl_structure_matches_design():
-    """zlc_pulse_streamer_d.v must implement the verified Architecture-D design:
-    edge/scan tables are EXTERNAL BRAM (read ports, not internal LUTRAM), the bus
-    tables stay LUTRAM, and the depth-1 prefetch + first/loop_start/final shadows
-    are present.  Guards the RTL against drifting from the proven model."""
-
-    root = Path(__file__).resolve().parents[1]
-    src = (root / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_d.v").read_text(encoding="utf-8")
-
-    # edge/scan are external BRAM read ports (NOT internal LUTRAM tables)
-    assert "edge_raddr" in src and "edge_rdata" in src
-    assert "scan_raddr" in src and "scan_rdata" in src
-    assert "reg [TICK_WIDTH-1:0] tick_mem" not in src   # no internal edge LUTRAM
-    assert "scan_value_mem" not in src                  # no internal scan LUTRAM
-    # bus tables DO stay in LUTRAM (the per-tick combinatorial bus engine)
-    assert 'ram_style = "distributed"' in src and "bus_start_tick_mem" in src
-    # depth-1 prefetch + shadows
-    assert "pre_tick" in src and "pre_valid" in src and "rd_wait" in src
-    assert "first_tick_shadow" in src and "loop_start_tick_shadow" in src and "final_tick_shadow" in src
-    assert "cur_eff" in src and "is_edge0" in src
-    # the seamless reload sites are present (loop rewind / scan advance / repeat)
-    assert "loops_remaining" in src and "repeat_forever_active" in src and "scan_point_index" in src
-    # the validated effective-tick MAC is reused unchanged
-    assert "function [TICK_WIDTH-1:0] zlc_effective_tick" in src
-
-    # The engine is built ONLY by the D build tcl (with its top), never by the
-    # loader/address-switch builds (those use the validated combinatorial engine).
-    fpga = root / "fpga" / "pulse_streamer"
-    for tcl in fpga.glob("create_project_*.tcl"):
-        text = tcl.read_text(encoding="utf-8")
-        if "zlc_pulse_streamer_d.v" in text:
-            assert tcl.name == "create_project_d.tcl", tcl.name
-            assert "zlc_pulse_streamer_d_top.v" in text
-
-
-def test_edgetable_d_image_packs_and_round_trips_at_solved_geometry():
-    """The Architecture-D AXI write image round-trips a full program at the solved
-    35T geometry, and its region bases match the D top localparams (64 / 64 /
-    64+2048*8 / +4096*4) so the host->BRAM write addresses are correct."""
-
-    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram, RuntimeBusSegment
-    from Zou_lab_control.neutral_atom.devices.edgetable_image import (
-        pack_program_d, unpack_program_d, d_region_bases, solve_capacity,
-    )
-
-    s = solve_capacity("xc7a35t", channel_count=62)
-    p = s.params
-    bases = d_region_bases(p)
-    assert bases["ctrl"] == 0 and bases["edge"] == 64
-    assert bases["scan"] == 64 + p.max_edges * 8
-    assert bases["bus"] == bases["scan"] + p.max_scan_points * p.num_slots
-
-    prog = RuntimeSequenceProgram(
-        sequence_id="a", sequence_name="t", clock_hz=50e6,
-        channels=[f"ch{i:02d}" for i in range(62)],
-        ticks=[0, 50, 120, 400], masks=[0, (1 << 0) | (1 << 5), (1 << 61), 0],
-        duration=8e-6, trigger_count=0, repeat_forever=True, loop_start_index=1,
-        loop_end_tick=400, loop_count=3, slot_count=2, slot_kinds=["delay", "dac"],
-        loop_end_slot_coeffs=[256, 0], tick_slot_coeffs=[[0, 0], [256, 0], [256, 0], [256, 0]],
-        scan_points=[[0, 0], [256, 256], [512, -768]], scan_coeff_frac_bits=8, bus_names=["da0"],
-        bus_segments=[
-            RuntimeBusSegment(bus_index=0, start_tick=50, stop_tick=120, start_value=0, stop_value=0,
-                              mode="edge", value_select=2, start_tick_coeffs=[256, 0], stop_tick_coeffs=[256, 0]),
-            RuntimeBusSegment(bus_index=2, start_tick=10, stop_tick=400, start_value=512, stop_value=1023, mode="ramp"),
-        ],
-    )
-    out = unpack_program_d(pack_program_d(prog, p), p)
-    pad = lambda r, n: list(r) + [0] * (n - len(r))
-    assert out["ticks"] == prog.ticks and out["masks"] == prog.masks
-    assert out["tick_slot_coeffs"] == [pad(r, p.num_slots) for r in prog.tick_slot_coeffs]
-    assert out["scan_points"] == [pad(pt, p.num_slots) for pt in prog.scan_points]  # incl. negative slot
-    assert out["loop_start_index"] == 1 and out["loop_count"] == 3 and out["repeat_forever"]
-    bus = {b["bus_index"]: b for b in out["bus_segments"]}
-    assert bus[0]["value_select"] == 2 and bus[0]["mode"] == "edge"
-    assert bus[2]["start_value"] == 512 and bus[2]["stop_value"] == 1023 and bus[2]["mode"] == "ramp"
-
-
-def test_edgetable_d_top_and_build_structure():
-    """The D top instantiates the D engine + the edge/scan/bus BRAMs + the JTAG-to-
-    AXI IPs, keeps the exact 62-pin board map with DAC buses driven by the engine,
-    and the build tcl creates those IPs.  (Structural contract; the multi-BRAM AXI
-    integration itself is bring-up-validated, no Verilog sim in repo.)"""
-
-    root = Path(__file__).resolve().parents[1]
-    fpga = root / "fpga" / "pulse_streamer"
-    top = (fpga / "zlc_pulse_streamer_d_top.v").read_text(encoding="utf-8")
-
-    assert "zlc_pulse_streamer_d #(" in top                  # the D engine
-    assert "jtag_axi_0 zlc_jtag_axi_i" in top
-    assert "axi_bram_ctrl_0 zlc_bram_ctrl_i" in top
-    assert "blk_mem_gen_edge zlc_edge_bram_i" in top         # asymmetric edge BRAM
-    assert "blk_mem_gen_scan zlc_scan_bram_i" in top         # asymmetric scan BRAM
-    assert "blk_mem_gen_busimg zlc_bus_img_i" in top         # bus image BRAM
-    # the engine reads edge/scan directly (no LUTRAM tables, no staging copy)
-    assert ".edge_rdata(edge_doutb" in top and ".scan_rdata(scan_doutb)" in top
-    # bus mini-loader drives the engine bus_prog_* (bus stays LUTRAM in the engine)
-    assert ".bus_prog_we(bus_prog_we)" in top
-    # exact board map + DACs driven by the engine bus_out
-    assert "assign da_clk3 = out[61];" in top
-    assert ".bus_out(zlc_bus_out)" in top and "zlc_bus_out = 40'b0" not in top
-    assert "assign da_dipole[0] = zlc_bus_out[0];" in top
-
-    tcl = (fpga / "create_project_d.tcl").read_text(encoding="utf-8")
-    assert "zlc_pulse_streamer_d.v" in tcl and "zlc_pulse_streamer_d_top.v" in tcl
-    assert "set top zlc_pulse_streamer_d_top" in tcl
-    for ip in ("jtag_axi", "axi_bram_ctrl", "blk_mem_gen_edge", "blk_mem_gen_scan", "blk_mem_gen_busimg"):
-        assert ip in tcl, ip
-    # edge port-B 256b, scan port-B 128b (asymmetric wide read = 1 edge/point per read)
-    assert "Write_Width_B $zlc_edge_portb_bits" in tcl
-    assert "set zlc_edge_portb_bits 256" in tcl and "set zlc_scan_portb_bits 128" in tcl
-
-
-def test_edgetable_d1_prefetch_matches_reference_with_min_spacing():
-    """The depth-1 prefetch engine (zlc_pulse_streamer_d.v's design): for programs
-    whose minimum edge spacing >= settle+1 it is byte-identical to the reference;
-    for closer edges it STALLS -- proving the host-enforced min edge spacing is a
-    real requirement, not an unguarded assumption."""
-
-    from Zou_lab_control.neutral_atom.devices.edgetable_engine_model import (
-        EngineProgram, reference_play, prefetch_d1_play, min_edge_spacing, PrefetchStall,
-    )
-
-    def prog(**kw):
-        base = dict(ticks=[], masks=[], tick_slot_coeffs=[], scan_points=[], slot_count=0,
-                    frac_bits=8, loop_start_index=0, loop_end_tick=0, loop_end_slot_coeffs=[],
-                    loop_count=1, repeat_forever=False)
-        base.update(kw)
-        base["tick_slot_coeffs"] = base["tick_slot_coeffs"] or [[0] * base["slot_count"] for _ in base["ticks"]]
-        base["loop_end_slot_coeffs"] = base["loop_end_slot_coeffs"] or [0] * base["slot_count"]
-        return EngineProgram(**base)
-
-    settle = 2
-    spaced = {
-        "simple": prog(ticks=[0, 5, 12, 40], masks=[0, 3, 4, 0], loop_end_tick=40, repeat_forever=True),
-        "loop3": prog(ticks=[0, 10, 30, 60], masks=[0, 1, 2, 0], loop_start_index=1, loop_end_tick=30, loop_count=3),
-        "scan": prog(ticks=[0, 10, 20, 100], masks=[0, 1, 2, 0],
-                     tick_slot_coeffs=[[0, 0], [256, 0], [256, 0], [256, 0]],
-                     scan_points=[[0, 0], [256, 0], [512, 0]], slot_count=2, loop_end_tick=100, repeat_forever=True),
-        "edge0_nonzero": prog(ticks=[4, 9, 20], masks=[1, 2, 0], loop_end_tick=20, repeat_forever=True),
-    }
-    for name, pr in spaced.items():
-        assert min_edge_spacing(pr) >= settle + 1, name
-        assert prefetch_d1_play(pr, 400, settle=settle) == reference_play(pr, 400), name
-
-    close = prog(ticks=[0, 1, 2, 10], masks=[0, 1, 2, 0], loop_end_tick=10, repeat_forever=True)
-    assert min_edge_spacing(close) < settle + 1
-    with pytest.raises(PrefetchStall):
-        prefetch_d1_play(close, 50, settle=settle)
-
-
-def test_edgetable_capacity_solver_is_parameterised_and_within_budget():
-    """solve_capacity derives (edges, points, addr widths, BRAM depth) from the
-    FPGA part + XDC channel count with EVERY resource <= 75% -- so swapping the
-    XDC or the FPGA needs no hand-edit.  Architecture D: edge+scan in BRAM, bus in
-    LUTRAM."""
-
-    from Zou_lab_control.neutral_atom.devices.edgetable_image import solve_capacity, part_profile
-
-    # 35T target: must reach at least the requested 2048 edges + 2048 points, with
-    # every resource within 75%.
-    s = solve_capacity("xc7a35tfgg484-2", channel_count=62, target_pct=75.0)
-    assert s.part == "xc7a35t"
-    assert s.params.max_edges >= 2048
-    assert s.params.max_scan_points >= 2048
-    assert s.pong_depth >= 256  # streaming window for unbounded points
-    assert s.all_within_budget(), s.resource_report
-    assert s.resource_report["ramb36"]["pct"] <= 75.0
-    assert s.resource_report["lut"]["pct"] <= 75.0
-    assert s.resource_report["ff"]["pct"] <= 75.0
-    assert s.resource_report["dsp"]["pct"] <= 75.0
-    # address widths track the solved depths (power-of-two)
-    assert (1 << s.edge_addr_width) == s.params.max_edges
-    assert (1 << s.scan_addr_width) == s.params.max_scan_points
-
-    # Bigger part: same or larger capacity, far under budget (no rewrite needed).
-    big = solve_capacity("xc7a200t", channel_count=62)
-    assert big.params.max_edges >= s.params.max_edges
-    assert big.params.max_scan_points >= s.params.max_scan_points
-    assert big.resource_report["ramb36"]["pct"] < s.resource_report["ramb36"]["pct"]
-
-    # Fewer channels (different XDC) still solves within budget.
-    narrow = solve_capacity("xc7a35t", channel_count=16)
-    assert narrow.all_within_budget()
-    assert narrow.params.channel_count == 16
-
-    # Unknown part errors loudly rather than silently mis-sizing.
-    import pytest as _pytest
-    with _pytest.raises(KeyError):
-        part_profile("xc7zynqfoo")
-
-    # tighter budget shrinks capacity but stays within budget.
-    tight = solve_capacity("xc7a35t", channel_count=62, target_pct=40.0)
-    assert tight.all_within_budget()
-    assert tight.resource_report["ramb36"]["used"] <= int(0.40 * 50)
-
-
-def test_edgetable_loader_rtl_constants_match_python_image():
-    """The RTL loader hardcodes the image's CTRL offsets, magic and CTRL_WORDS for
-    speed; they MUST equal the edgetable_image source of truth (a drift here would
-    make the on-chip loader read the wrong BRAM words)."""
-
-    from Zou_lab_control.neutral_atom.devices import edgetable_image as ei
-
-    root = Path(__file__).resolve().parents[1]
-    src = (root / "fpga" / "pulse_streamer" / "zlc_axi_program_loader.v").read_text(encoding="utf-8")
-
-    def localparam(name):
-        m = re.search(rf"localparam\s+integer\s+{name}\s*=\s*(\d+)", src)
-        assert m, f"loader missing localparam {name}"
-        return int(m.group(1))
-
-    assert localparam("CTRL_WORDS") == ei.CTRL_WORDS == 32
-    assert localparam("C_MAGIC") == ei.CtrlWords.MAGIC
-    assert localparam("C_COMMAND") == ei.CtrlWords.COMMAND
-    assert localparam("C_STATUS") == ei.CtrlWords.STATUS
-    assert localparam("C_PROG_COUNT") == ei.CtrlWords.PROG_COUNT
-    assert localparam("C_SCAN_COUNT") == ei.CtrlWords.SCAN_COUNT
-    assert localparam("C_SCAN_ENABLE") == ei.CtrlWords.SCAN_ENABLE
-    assert localparam("C_REPEAT_FOREVER") == ei.CtrlWords.REPEAT_FOREVER
-    assert localparam("C_LOOP_START") == ei.CtrlWords.LOOP_START_ADDR
-    assert localparam("C_LOOP_COUNT") == ei.CtrlWords.LOOP_COUNT
-    assert localparam("C_LOOP_END_TICK") == ei.CtrlWords.LOOP_END_TICK
-    assert localparam("C_LOOP_END_LO") == ei.CtrlWords.LOOP_END_COEFF_LO
-    assert localparam("C_LOOP_END_HI") == ei.CtrlWords.LOOP_END_COEFF_HI
-    assert localparam("C_BUS_COUNTS") == ei.CtrlWords.BUS_COUNTS
-    assert localparam("C_SLOT_COUNT") == ei.CtrlWords.SLOT_COUNT
-
-    # magic constant matches "ZLE1"
-    m = re.search(r"IMAGE_MAGIC\s*=\s*32'h([0-9A-Fa-f]+)", src)
-    assert m and int(m.group(1), 16) == ei.IMAGE_MAGIC
-
-    # The loader drives the engine's toggle-triggered write port (must hold reset
-    # during the load and toggle prog_we / scan_prog_we / bus_prog_we).
-    assert "prog_we <= ~prog_we" in src
-    assert "scan_prog_we <= ~scan_prog_we" in src
-    assert "bus_prog_we <= ~bus_prog_we" in src
-    assert "eng_reset" in src and "eng_start" in src
-
-
-def test_edgetable_loader_fsm_cosim_reconstructs_program():
-    """Cycle-accurate co-sim of the on-chip loader FSM (zlc_axi_program_loader.v):
-    stepping the FSM over a packed image and capturing the engine's toggle-writes
-    must reconstruct exactly what edgetable_image decodes -- proving the loader
-    walks edges/scan/bus in the right order with correct addresses + field slices
-    and never writes while the engine reset is low.  (No Verilog sim in repo, so
-    this Python mirror is the pre-hardware verification of the new sequencer.)"""
-
-    from Zou_lab_control.neutral_atom.devices.sequencer import (
-        RuntimeSequenceProgram,
-        RuntimeBusSegment,
-    )
-    from Zou_lab_control.neutral_atom.devices.edgetable_image import (
-        pack_program,
-        unpack_program,
-        EdgeTableImageParams,
-    )
-    from Zou_lab_control.neutral_atom.devices.edgetable_loader_model import run_loader_model
-
-    p = EdgeTableImageParams()
-
-    def check(prog):
-        image = pack_program(prog, p)
-        decoded = unpack_program(image, p)
-        loaded = run_loader_model(image, p)
-        loaded.pop("_cycles")
-        for key, value in decoded.items():
-            assert loaded[key] == value, f"loader mismatch on {key}"
-        return loaded
-
-    # 1) full program: scan + affine coeffs + loop + two DAC bus segments
-    full = RuntimeSequenceProgram(
-        sequence_id="abc", sequence_name="t", clock_hz=50e6,
-        channels=[f"ch{i:02d}" for i in range(62)],
-        ticks=[0, 50, 120, 400], masks=[0, (1 << 0) | (1 << 5), (1 << 61), 0],
-        duration=8e-6, trigger_count=0,
-        repeat_forever=True, loop_start_index=1, loop_end_tick=400, loop_count=3,
-        slot_count=2, slot_kinds=["delay", "dac"], loop_end_slot_coeffs=[256, 0],
-        tick_slot_coeffs=[[0, 0], [256, 0], [256, 0], [256, 0]],
-        scan_points=[[0, 0], [256, 256], [512, -768]], scan_coeff_frac_bits=8,
-        bus_names=["da0"],
-        bus_segments=[
-            RuntimeBusSegment(bus_index=0, start_tick=50, stop_tick=120, start_value=0,
-                              stop_value=0, mode="edge", value_select=2,
-                              start_tick_coeffs=[256, 0], stop_tick_coeffs=[256, 0]),
-            RuntimeBusSegment(bus_index=2, start_tick=10, stop_tick=400, start_value=512,
-                              stop_value=1023, mode="ramp", value_select=0),
-        ],
-    )
-    check(full)
-
-    # 2) larger edge table (stress the row walk + addressing, no off-by-one)
-    n = 200
-    big = RuntimeSequenceProgram(
-        sequence_id="big", sequence_name="big", clock_hz=50e6,
-        channels=[f"ch{i:02d}" for i in range(62)],
-        ticks=[10 * i for i in range(n)],
-        masks=[(i * 2654435761) & ((1 << 62) - 1) for i in range(n)],
-        duration=1e-3, trigger_count=0,
-        repeat_forever=True, loop_start_index=0, loop_end_tick=10 * n, loop_count=1,
-        slot_count=1, slot_kinds=["delay"], loop_end_slot_coeffs=[0],
-        tick_slot_coeffs=[[(i % 7) - 3] for i in range(n)],  # signed coeffs incl. negatives
-        scan_points=[[k * 64] for k in range(16)],
-        scan_coeff_frac_bits=8,
-    )
-    out = check(big)
-    assert out["ticks"][199] == 1990
-    assert len(out["scan_points"]) == 16
-
-    # 3) no scan, no bus (plain repeat) still loads
-    plain = RuntimeSequenceProgram(
-        sequence_id="p", sequence_name="p", clock_hz=50e6,
-        channels=[f"ch{i:02d}" for i in range(62)],
-        ticks=[0, 100, 200], masks=[1, 0, 1],
-        duration=4e-6, trigger_count=0,
-        repeat_forever=True, loop_start_index=0, loop_end_tick=200, loop_count=1,
-        slot_count=0,
-    )
-    plain_out = check(plain)
-    assert plain_out["scan_points"] == []
-    assert plain_out["bus_segments"] == []
-
-
 def test_pulse_table_state_compiles_pair_array_scan_to_full_40ch_template():
     hardware_channels = [f"ch{i:02d}" for i in range(40)]
     # Two bound time slots: s0 scans the camera duration, s1 scans the trailing
@@ -2608,67 +1685,6 @@ def test_pulse_table_state_compiles_pair_array_scan_to_full_40ch_template():
     assert roundtrip.scan_points == [[1, 1], [2, 2]]
     assert roundtrip.tick_slot_coeffs == [[0, 0], [0, 0], [256, 0], [256, 256]]
     na.validate_pulse_streamer_program(program, max_edges=1024, max_scan_points=1024, tick_width=32, channel_count=40)
-
-
-def test_pulse_table_seamless_dac_value_scan_compiles_and_uploads(tmp_path):
-    # A 2-bit DAC bus (da_test[0..1]) plus a TTL channel.  The DAC level in the
-    # second period is scanned across three points; timing is fixed, so this is
-    # the seamless hardware DAC-value scan path.
-    state = na.PulseTableState(
-        channels=["ch00", "ch01", "ch02"],
-        channel_labels={"ch00": "da_test[0]", "ch01": "da_test[1]", "ch02": "trig"},
-        visible_channels=["ch00", "ch01", "ch02"],
-        time_step_ns=20,
-        periods=[
-            na.PulsePeriod(100, (0, 0, 1), unit="ns", name="load"),
-            na.PulsePeriod(200, (0, 0, 0), unit="ns", name="hold"),
-        ],
-    )
-    # Bind the DAC value of period 1 to a scan slot, then sweep raw 2-bit codes.
-    state.bind_field("dac", "da_test@1", unit="value", label="da_test")
-    state.set_scan_table([[0.0], [2.0], [3.0]])
-
-    program = na.compile_pulse_table_scan_runtime_program(
-        state, channels=["ch00", "ch01", "ch02"], clock_hz=50_000_000, trigger_channels=["ch02"]
-    )
-
-    assert program.scan_enabled is True
-    assert program.slot_count == 1
-    assert program.slot_kinds == ["dac"]
-    # DAC codes are stored verbatim (no ns->tick scaling) and never move an edge.
-    assert program.scan_points == [[0], [2], [3]]
-    assert all(all(c == 0 for c in row) for row in (program.tick_slot_coeffs or []))
-    # The scanned period start (100 ns / 20 ns = tick 5) carries value_select=1.
-    scanned = [s for s in (program.bus_segments or []) if s.value_select]
-    assert len(scanned) == 1
-    assert scanned[0].value_select == 1
-    assert scanned[0].start_tick == 5
-    # The TTL bus member bits must NOT also appear in the digital edge masks.
-    assert all((mask & 0b011) == 0 for mask in program.masks)
-
-    na.validate_pulse_streamer_program(
-        program, max_edges=1024, max_scan_points=1024, tick_width=32, channel_count=3
-    )
-
-    roundtrip = na.RuntimeSequenceProgram.from_dict(program.to_dict())
-    assert [s.value_select for s in (roundtrip.bus_segments or [])] == [
-        s.value_select for s in (program.bus_segments or [])
-    ]
-
-    tcl_path = na.write_vivado_pulse_streamer_tcl(
-        tmp_path / "prepare_dac_scan.tcl",
-        "prepare",
-        program=program,
-        project="",
-        bitstream="",
-        probes="",
-        max_edges=1024,
-        channel_count=3,
-    )
-    tcl = tcl_path.read_text(encoding="utf-8")
-    # The upload stages the value_select probe (probe_out27) for each segment.
-    assert "zlc_bus_prog_value_select_probe" in tcl
-    assert "probe_out27" in tcl
 
 
 def _rtl_bus_held_value(program, bus_index, tick, scan_point, *, bus_width=10):
@@ -2763,40 +1779,6 @@ def test_dac_value_scan_behavioral_model_tracks_scanned_code():
     # Consecutive scan points really produce different DAC outputs (seamless sweep).
     sweep = [_rtl_bus_held_value(program, bus, int(seg.start_tick), p) for p in range(len(codes))]
     assert sweep == codes
-
-
-def test_pulse_streamer_rtl_has_dac_value_select_path():
-    """The checked-in RTL must carry the DAC value_select (PSEL) scan path.
-
-    Guards the four pieces that make a bus segment read its DAC code from a scan
-    slot at runtime, so a refactor cannot silently drop seamless DAC scanning.
-    """
-
-    root = Path(__file__).resolve().parents[1]
-    core = (root / "fpga" / "pulse_streamer" / "zlc_pulse_streamer.v").read_text(encoding="utf-8")
-    top = (root / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_top_address_switch.v").read_text(encoding="utf-8")
-    tcl = (root / "fpga" / "pulse_streamer" / "create_project_address_switch.tcl").read_text(encoding="utf-8")
-
-    # core: the input port, the per-segment memory, the write, and the slot read.
-    assert "bus_prog_value_select" in core
-    assert "bus_value_select_mem" in core
-    assert "slot_vec[(sel - 1'b1)*TICK_WIDTH +: BUS_WIDTH]" in core
-    # the slot vector is threaded explicitly into the apply/start tasks.
-    assert "zlc_bus_start_table(scan_value_mem[next_scan_addr])" in core
-    # affine bus-segment ticks: per-segment coeff memories + effective-tick eval.
-    assert "bus_start_tick_coeff_mem" in core
-    assert "bus_stop_tick_coeff_mem" in core
-    assert "zlc_bus_seg_start" in core
-    assert "eff_tk_start = zlc_effective_tick(bus_start_tick_mem[addr]" in core
-    # top + IP: probe_out27 value_select, probe_out28/29 tick coeffs, 30 probe_outs.
-    assert "wire [2:0] zlc_bus_prog_value_select;" in top
-    assert ".probe_out27(zlc_bus_prog_value_select)" in top
-    assert ".probe_out28(zlc_bus_prog_start_tick_coeffs)" in top
-    assert ".probe_out29(zlc_bus_prog_stop_tick_coeffs)" in top
-    assert "CONFIG.C_NUM_PROBE_OUT {30}" in tcl
-    assert "CONFIG.C_PROBE_OUT27_WIDTH {3}" in tcl
-    assert "CONFIG.C_PROBE_OUT28_WIDTH {64}" in tcl
-    assert "CONFIG.C_PROBE_OUT29_WIDTH {64}" in tcl
 
 
 def test_dac_plus_duration_scan_behavioral_model_value_and_timing():
@@ -2956,9 +1938,6 @@ def test_fpga_loop_repeat_keeps_post_loop_idle_before_repeat_forever():
         trigger_channels=["ch03"],
     )
     history = _simulate_pulse_streamer_program_steps(program, steps=8)
-    core = (Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "zlc_pulse_streamer.v").read_text(
-        encoding="utf-8"
-    )
 
     assert program.ticks == [0, 1, 3, 4]
     assert program.masks == [0b0001, 0b1000, 0, 0]
@@ -2967,11 +1946,6 @@ def test_fpga_loop_repeat_keeps_post_loop_idle_before_repeat_forever():
     assert program.loop_count == 2
     assert program.repeat_forever is True
     assert history[:7] == [0b0001, 0b1000, 0b1000, 0b1000, 0b1000, 0, 0b0001]
-    assert "final_tick <= (prog_count == 0) ? {TICK_WIDTH{1'b0}} : zlc_effective_tick(" in core
-    assert "final_coeffs_shadow" in core
-    assert "final_x_coeff_shadow" not in core
-    assert "final_y_coeff_shadow" not in core
-    assert "loop_end_tick : final_tick_shadow" not in core
 
 
 def test_pulse_table_reports_repeat_forever_table_boundary_high_channels():
@@ -3826,187 +2800,6 @@ class _FakeVivadoProcess:
         self.stdout.close()
 
 
-def test_vivado_pulse_streamer_session_reuses_one_vivado_process(tmp_path, monkeypatch):
-    from Zou_lab_control.neutral_atom.devices import fpga_pulse_streamer as fps
-
-    created: list[_FakeVivadoProcess] = []
-
-    def fake_popen(args, **kwargs):
-        process = _FakeVivadoProcess(args, **kwargs)
-        created.append(process)
-        return process
-
-    monkeypatch.setattr(fps.subprocess, "Popen", fake_popen)
-    hardware_channels = [f"ch{i:02d}" for i in range(40)]
-    seq = na.PulseSequence(name="session").pulse("ch03", 0.0, 1e-6).forever(period=2e-6)
-    program = na.compile_runtime_program(seq, channels=hardware_channels, clock_hz=100e6, trigger_channels=["ch03"])
-    session = na.VivadoPulseStreamerSession(state_dir=tmp_path, vivado="fake_vivado", max_edges=1024, channel_count=40)
-
-    session.prepare(program)
-    session.fire(program)
-    assert session.wait_done(program, timeout=1.0)
-    session.safe_state()
-    session.close()
-
-    assert len(created) == 1
-    assert created[0].args[:3] == ["fake_vivado", "-mode", "tcl"]
-    script = "".join(created[0].stdin.writes)
-    assert "connect_hw_server" in script
-    assert "zlc_stage_probe $vio $zlc_prog_mask_probe" in script
-    assert "zlc_stage_probe $vio $zlc_repeat_forever_probe 1" in script
-    assert "ZLC pulse-streamer start pulse sent" in script
-    assert "zlc_start_toggle_value" not in script
-    assert "ZLC pulse-streamer safe state requested" in script
-    assert json.loads((tmp_path / "prepared_program.json").read_text(encoding="utf-8"))["repeat_forever"] is True
-
-
-def test_vivado_pulse_streamer_session_prepare_uses_differential_edge_upload(tmp_path, monkeypatch):
-    from Zou_lab_control.neutral_atom.devices import fpga_pulse_streamer as fps
-
-    created: list[_FakeVivadoProcess] = []
-
-    def fake_popen(args, **kwargs):
-        process = _FakeVivadoProcess(args, **kwargs)
-        created.append(process)
-        return process
-
-    monkeypatch.setattr(fps.subprocess, "Popen", fake_popen)
-    channels = ["ch00", "ch01", "ch02", "ch03"]
-    first = na.RuntimeSequenceProgram(
-        sequence_id="first",
-        sequence_name="diff",
-        clock_hz=100_000_000,
-        channels=channels,
-        ticks=[0, 10, 20, 30],
-        masks=[1, 0, 8, 0],
-        duration=30 / 100_000_000,
-        trigger_count=1,
-        repeat_forever=True,
-        loop_start_index=0,
-        loop_end_tick=30,
-        loop_count=1,
-    )
-    second = na.RuntimeSequenceProgram(
-        sequence_id="second",
-        sequence_name="diff",
-        clock_hz=100_000_000,
-        channels=channels,
-        ticks=[0, 10, 22, 30],
-        masks=[1, 0, 8, 0],
-        duration=30 / 100_000_000,
-        trigger_count=1,
-        repeat_forever=True,
-        loop_start_index=0,
-        loop_end_tick=30,
-        loop_count=1,
-    )
-    moved_loop = na.RuntimeSequenceProgram(
-        sequence_id="moved-loop",
-        sequence_name="diff",
-        clock_hz=100_000_000,
-        channels=channels,
-        ticks=[0, 10, 22, 30],
-        masks=[1, 0, 8, 0],
-        duration=30 / 100_000_000,
-        trigger_count=1,
-        repeat_forever=True,
-        loop_start_index=2,
-        loop_end_tick=30,
-        loop_count=2,
-    )
-    session = na.VivadoPulseStreamerSession(state_dir=tmp_path, vivado="fake_vivado", max_edges=1024, channel_count=4)
-
-    session.prepare(first)
-    session.prepare(second)
-    session.prepare(moved_loop)
-    session.close()
-
-    assert len(created) == 1
-    full_prepare = created[0].stdin.writes[1]
-    diff_prepare = created[0].stdin.writes[2]
-    loop_metadata_prepare = created[0].stdin.writes[3]
-    assert full_prepare.count("zlc_stage_probe $vio $zlc_prog_addr_probe") == 4
-    assert full_prepare.count("zlc_commit_probes $zlc_batch") == 6
-    assert full_prepare.index("zlc_stage_probe $vio $zlc_reset_probe 1") < full_prepare.index(
-        "zlc_stage_probe $vio $zlc_prog_addr_probe 0"
-    )
-    assert "after $zlc_prepare_reset_settle_ms" in full_prepare
-    assert "wrote 4/4 edge rows" in full_prepare
-    assert "reset_settle_ms=$zlc_prepare_reset_settle_ms" in full_prepare
-    assert diff_prepare.count("zlc_stage_probe $vio $zlc_prog_addr_probe") == 3
-    assert diff_prepare.count("zlc_commit_probes $zlc_batch") == 5
-    assert "zlc_stage_probe $vio $zlc_prog_addr_probe 0" in diff_prepare
-    assert "zlc_stage_probe $vio $zlc_prog_addr_probe 1" not in diff_prepare
-    assert "zlc_stage_probe $vio $zlc_prog_addr_probe 2" in diff_prepare
-    assert "zlc_stage_probe $vio $zlc_prog_addr_probe 3" in diff_prepare
-    assert "wrote 3/4 edge rows" in diff_prepare
-    assert "reset_settle_ms=$zlc_prepare_reset_settle_ms" in diff_prepare
-    assert loop_metadata_prepare.count("zlc_stage_probe $vio $zlc_prog_addr_probe") == 3
-    assert loop_metadata_prepare.count("zlc_commit_probes $zlc_batch") == 5
-    assert "zlc_stage_probe $vio $zlc_loop_start_addr_probe 2" in loop_metadata_prepare
-    assert "zlc_stage_probe $vio $zlc_loop_count_probe 2" in loop_metadata_prepare
-    assert loop_metadata_prepare.index("zlc_stage_probe $vio $zlc_loop_start_addr_probe 2") < loop_metadata_prepare.index(
-        "zlc_stage_probe $vio $zlc_prog_addr_probe 0"
-    )
-    assert "zlc_stage_probe $vio $zlc_prog_addr_probe 0" in loop_metadata_prepare
-    assert "zlc_stage_probe $vio $zlc_prog_addr_probe 1" not in loop_metadata_prepare
-    assert "zlc_stage_probe $vio $zlc_prog_addr_probe 2" in loop_metadata_prepare
-    assert "zlc_stage_probe $vio $zlc_prog_addr_probe 3" in loop_metadata_prepare
-    assert (
-        "wrote 3/4 edge rows, 0/0 scan points, and 0/0 bus segments "
-        "reset_settle_ms=$zlc_prepare_reset_settle_ms repeat_forever=1 scan=0 "
-        "loop_start=2 loop_end=30 loop_count=2 bus_counts=0"
-    ) in loop_metadata_prepare
-
-
-def test_sequencer_server_warm_starts_vivado_session_before_accepting_clients(tmp_path, monkeypatch):
-    from Zou_lab_control.neutral_atom.devices import fpga_pulse_streamer as fps
-    from Zou_lab_control.neutral_atom.devices import sequencer_server
-
-    events: list[str] = []
-
-    class FakeVivadoSession:
-        def __init__(self, *, state_dir):
-            events.append(f"init:{Path(state_dir).name}")
-
-        def start(self):
-            events.append("start")
-            return self
-
-        def prepare(self, program):
-            events.append(f"prepare:{program.sequence_id}")
-
-        def fire(self, program):
-            events.append(f"fire:{program.sequence_id}")
-
-        def wait_done(self, program, timeout=None):
-            events.append(f"wait:{program.sequence_id}")
-            return True
-
-        def safe_state(self):
-            events.append("safe")
-
-    def fake_serve(service, *, host, port, start):
-        events.append(f"serve:{host}:{port}:{start}:{service.snapshot()['state']}")
-        return object()
-
-    monkeypatch.setattr(fps, "VivadoPulseStreamerSession", FakeVivadoSession)
-    monkeypatch.setattr(sequencer_server, "serve_runtime_sequencer", fake_serve)
-
-    sequencer_server.run_server(
-        channels=[f"ch{i:02d}" for i in range(40)],
-        trigger_channels=["ch03"],
-        host="127.0.0.1",
-        port=18861,
-        clock_hz=100_000_000,
-        state_dir=tmp_path / "state40",
-        backend="vivado-session",
-        warm_start=True,
-    )
-
-    assert events[:3] == ["init:state40", "start", "serve:127.0.0.1:18861:True:idle"]
-
-
 def test_sequencer_server_jtag_axi_backend_warm_starts_axi_session(tmp_path, monkeypatch):
     """The default 'jtag-axi' backend brings up the run-length VivadoAxiStreamerSession
     and wires its prepare/fire/wait_done/safe_state into the RPyC service."""
@@ -4239,46 +3032,6 @@ def test_vivado_axi_session_repeat_forever_treats_running_as_done(tmp_path):
     session.fire()
     # DONE never sets, but wait_done returns True because RUNNING is observed.
     assert session.wait_done(timeout=1.0) is True
-
-
-def test_sequencer_server_can_disable_vivado_warm_start_for_diagnostics(tmp_path, monkeypatch):
-    from Zou_lab_control.neutral_atom.devices import fpga_pulse_streamer as fps
-    from Zou_lab_control.neutral_atom.devices import sequencer_server
-
-    events: list[str] = []
-
-    class FakeVivadoSession:
-        def __init__(self, *, state_dir):
-            events.append(f"init:{Path(state_dir).name}")
-
-        def start(self):
-            events.append("start")
-            return self
-
-        def prepare(self, program):
-            events.append(f"prepare:{program.sequence_id}")
-
-        def fire(self, program):
-            events.append(f"fire:{program.sequence_id}")
-
-        def wait_done(self, program, timeout=None):
-            return True
-
-        def safe_state(self):
-            return None
-
-    monkeypatch.setattr(fps, "VivadoPulseStreamerSession", FakeVivadoSession)
-    monkeypatch.setattr(sequencer_server, "serve_runtime_sequencer", lambda service, **kwargs: events.append("serve"))
-
-    sequencer_server.run_server(
-        channels=["ch00", "ch03"],
-        trigger_channels=["ch03"],
-        state_dir=tmp_path / "state40",
-        backend="vivado-session",
-        warm_start=False,
-    )
-
-    assert events == ["init:state40", "serve"]
 
 
 def test_remote_sequencer_round_trip_uses_json_protocol(tmp_path):
