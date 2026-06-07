@@ -32,7 +32,8 @@ from typing import Sequence
 
 __all__ = [
     "EngineProgram", "effective_tick", "reference_play", "prefetch_play",
-    "streaming_scan_play", "min_edge_spacing", "PrefetchStall", "ScanUnderflow",
+    "streaming_scan_play", "rtl_mirror_play", "min_edge_spacing",
+    "PrefetchStall", "ScanUnderflow",
 ]
 
 
@@ -384,3 +385,103 @@ def streaming_scan_play(program, n_ticks: int, *, bank_size: int, refill_delay: 
                 sm = p.masks[ei]; ei += 1
             tc += 1
     return out, stalled, spi + 1
+
+
+def rtl_mirror_play(program, n_ticks: int, *, rd_lat: int = 2, fifo_depth: int = 3) -> list[int]:
+    """Re-implements the EXACT register transfers of zlc_edge_streamer.v's edge
+    prefetch (arm[] shift-down FIFO + nv count + pend in-flight shift + the
+    issue-occupancy condition + the four boundary reseeds), so a divergence from
+    :func:`reference_play` flags a bug in THAT RTL realization (not just the
+    abstract algorithm).  Resident scan (no streaming) -- the bank addressing is
+    proven separately by :func:`streaming_scan_play`."""
+    p = program if isinstance(program, EngineProgram) else EngineProgram.from_program(program)
+    n = len(p.ticks)
+    scan_en = bool(p.scan_points)
+    scan_count = len(p.scan_points)
+
+    def eff(i, slots):
+        return effective_tick(p.ticks[i], p.tick_slot_coeffs[i], slots, p.frac_bits)
+
+    def eff_le(slots):
+        return effective_tick(p.loop_end_tick, p.loop_end_slot_coeffs, slots, p.frac_bits)
+
+    arm: list[int] = []                          # arm[0] = head; len(arm) = nv
+    pend: list = [None] * rd_lat                  # pend[rd_lat-1] lands this cycle
+    fetch_idx = 0
+
+    def reseed_from(start_idx):
+        # Seed FIFO_DEPTH(=RD_LAT+1) resident shadows beginning at the first
+        # not-yet-output edge.  That runway is exactly enough that the first
+        # PREFETCHED edge (issued when the head fires) lands + registers into arm
+        # in time for back-to-back 1-tick edges.  occupancy == #shadows <= depth,
+        # so no read is issued at the boundary (no overflow); reads start when a
+        # slot frees.
+        nonlocal fetch_idx, pend
+        arm.clear()
+        for k in range(fifo_depth):
+            if start_idx + k < n:
+                arm.append(start_idx + k)
+        fetch_idx = start_idx + fifo_depth
+        pend = [None] * rd_lat
+
+    def boundary_to(start_at_zero_mask):
+        # Common start/scan-advance/repeat seed: output edge0 directly iff it
+        # fires at tick 0, else let the FIFO fire it.
+        if eff(0, slot) == 0:
+            reseed_from(1)
+            return p.masks[0], 1, 1
+        reseed_from(0)
+        return 0, 0, 0
+
+    slot = _first_values(p)
+    final = 0 if n == 0 else eff(n - 1, slot)
+    loop_end = eff_le(slot)
+    loops = p.loop_count
+    spi = 0
+    running = n != 0
+    if running:
+        sm, tc, ei = boundary_to(True)
+    else:
+        sm, tc, ei = 0, 0, 0
+
+    out = []
+    for _ in range(n_ticks):
+        out.append(sm)
+        if not running:
+            continue
+        if p.loop_count > 1 and loops > 1 and tc >= loop_end:
+            sm = p.masks[p.loop_start_index]
+            tc = eff(p.loop_start_index, slot) + 1
+            ei = p.loop_start_index + 1
+            loops -= 1
+            reseed_from(p.loop_start_index + 1)   # loop_start output directly above
+            continue
+        if tc >= final:
+            if scan_en and spi + 1 < scan_count:
+                slot = list(p.scan_points[spi + 1]); spi += 1
+            elif p.repeat_forever:
+                slot = _first_values(p); spi = 0
+            else:
+                running = False; sm = 0; continue
+            final = eff(n - 1, slot); loop_end = eff_le(slot); loops = p.loop_count
+            sm, tc, ei = boundary_to(True)
+            continue
+        # ---- normal cycle: exact RTL FIFO transfers ----
+        landed_idx = pend[rd_lat - 1]
+        fire_arm = (ei < n) and (len(arm) != 0) and (tc == eff(arm[0], slot))
+        if fire_arm:
+            sm = p.masks[arm[0]]
+            ei += 1
+            arm.pop(0)               # shift down
+        if landed_idx is not None:
+            arm.append(landed_idx)   # land at tail (register: visible next cycle)
+        tc += 1
+        # issue a read iff resident + still-in-flight is below depth
+        inflight_after = sum(1 for x in pend[0:rd_lat - 1] if x is not None)
+        occupancy = len(arm) + inflight_after
+        issue = (occupancy < fifo_depth) and (fetch_idx < n)
+        new_pend = [fetch_idx if issue else None] + pend[0:rd_lat - 1]
+        if issue:
+            fetch_idx += 1
+        pend = new_pend
+    return out
