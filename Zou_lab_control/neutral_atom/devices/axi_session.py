@@ -71,7 +71,7 @@ def _default_vivado() -> str:
 
 
 def _default_artifact(suffix: str) -> str | None:
-    """Default bit/ltx path from the in-repo final build (fpga/build/pulse_streamer)."""
+    """Default bit/ltx path from the in-repo final build (fpga/build/ps)."""
 
     env = {
         ".bit": ("ZLC_PS_VIVADO_BIT", "ZLC_PS_BIT"),
@@ -84,7 +84,7 @@ def _default_artifact(suffix: str) -> str | None:
     root = os.environ.get("ZLC_PS_PROJECT_DIR")
     if not root:
         return None
-    candidate = Path(root) / "pulse_streamer.runs" / "impl_1" / f"zlc_pulse_streamer_top{suffix}"
+    candidate = Path(root) / "ps.runs" / "impl_1" / f"zlc_pulse_streamer_top{suffix}"
     return str(candidate) if candidate.exists() else None
 
 

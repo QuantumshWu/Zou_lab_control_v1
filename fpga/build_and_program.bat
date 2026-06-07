@@ -32,7 +32,7 @@ set "STREAMER_DIR=%FPGA_DIR%pulse_streamer"
 set "ZLC_REPO_ROOT=%REPO_ROOT%"
 set "ZLC_CREATE_TCL=create_project.tcl"
 set "ZLC_PROGRAM_TCL=program_fpga.tcl"
-set "ZLC_PROJ_SUB=pulse_streamer"
+set "ZLC_PROJ_SUB=ps"
 
 set "MODE=all"
 if "%~1"=="--help" goto zlc_help
@@ -92,7 +92,7 @@ echo   set ZLC_PS_XDC=C:\path\to\board.xdc
 echo.
 echo Optional:
 echo   set ZLC_PS_VIVADO_BIN=C:\Xilinx\Vivado\2019.2\bin\vivado.bat
-echo   set ZLC_PS_PROJECT_DIR=%%CD%%\fpga\build\pulse_streamer
+echo   set ZLC_PS_PROJECT_DIR=%%CD%%\fpga\build\ps
 exit /b 0
 
 :zlc_verify_sources
@@ -178,6 +178,8 @@ if defined ZLC_PS_PROJECT_DIR if "!ZLC_PS_PROJECT_DIR: =!"=="" set "ZLC_PS_PROJE
 if defined ZLC_PS_LOG_DIR if "!ZLC_PS_LOG_DIR: =!"=="" set "ZLC_PS_LOG_DIR="
 if not defined ZLC_PS_BUILD_ROOT set "ZLC_PS_BUILD_ROOT=%FPGA_DIR%build"
 if not exist "!ZLC_PS_BUILD_ROOT!\" mkdir "!ZLC_PS_BUILD_ROOT!" >nul 2>nul
+rem In-repo build (fpga\build\ps).  The SHORT subdir "ps" keeps Vivado's deep
+rem run/.Xil temp path under the Windows MAX_PATH limit without leaving fpga/.
 if not defined ZLC_PS_PROJECT_DIR set "ZLC_PS_PROJECT_DIR=%ZLC_PS_BUILD_ROOT%\!ZLC_PROJ_SUB!"
 if not defined ZLC_PS_LOG_DIR set "ZLC_PS_LOG_DIR=%ZLC_PS_BUILD_ROOT%\logs"
 echo ZLC build root: %ZLC_PS_BUILD_ROOT%

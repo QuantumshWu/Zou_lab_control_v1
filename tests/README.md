@@ -57,7 +57,7 @@ fpga\run_server.bat
 ```
 
 The scripts write to the printed project directory, normally
-`fpga\build\pulse_streamer`; that printed path is the source of truth for the
+`fpga\build\ps`; that printed path is the source of truth for the
 generated `impl_1\zlc_pulse_streamer_top.{bit,ltx}`.
 
 ## GUI Screenshot Checks

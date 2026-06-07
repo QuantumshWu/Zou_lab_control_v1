@@ -518,13 +518,18 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     assert "assign cooling = out[0];" in top
     assert "zlc_edge_streamer" in top                      # instantiates the final engine
     assert "module zlc_edge_streamer" in engine
-    assert "set project_name pulse_streamer" in create_tcl
+    # SHORT project name "ps" (-> ps.runs) keeps Vivado's deep run/.Xil temp path
+    # under Windows MAX_PATH while staying in fpga/build (no out-of-repo relocation,
+    # no extra drive/junction).
+    assert "set project_name ps" in create_tcl
+    assert "set project_name pulse_streamer" not in create_tcl
     assert "zlc_edge_streamer.v" in create_tcl and "zlc_pulse_streamer_top.v" in create_tcl
     assert "zlc_force_latency2" in create_tcl              # forced edge-BRAM read latency 2
     assert "ZLC_PS_XDC" in create_tcl
     assert legacy_xdc_env not in create_tcl
     assert "set top zlc_pulse_streamer_top" in program_tcl
-    assert "pulse_streamer.runs" in program_tcl
+    assert "ps.runs" in program_tcl
+    assert "pulse_streamer.runs" not in program_tcl
 
     # build_and_program.bat builds the FINAL single design (JTAG-to-AXI, 1-tick
     # FIFO prefetch + streaming scan): one create_project.tcl, no variants, no VIO
@@ -538,9 +543,18 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     assert "create_project_address_switch.tcl" not in build_bat
     assert "create_project_loader.tcl" not in build_bat
     assert "ZLC_PS_VARIANT" not in build_bat              # one path, no variants
-    assert 'set "ZLC_PROJ_SUB=pulse_streamer"' in build_bat
+    assert 'set "ZLC_PROJ_SUB=ps"' in build_bat
     assert r'set "ZLC_PS_PROJECT_DIR=%ZLC_PS_BUILD_ROOT%\!ZLC_PROJ_SUB!"' in build_bat
     assert legacy_xdc_env not in build_bat
+    # Long-path safety: the build stays IN fpga/build (no out-of-repo relocation,
+    # no extra drive); the short "ps" project name keeps Vivado's deep run/.Xil
+    # temp path under the limit. Both bats default the project dir under fpga/build,
+    # and the tcl guard fails clearly (advising a shorter CHECKOUT) if even that is
+    # too long.
+    assert "zlc_safe_project_dir" in create_tcl
+    assert "LOCALAPPDATA" not in build_bat and "LOCALAPPDATA" not in server_bat
+    assert r"%FPGA_DIR%build" in build_bat                # build root stays in fpga\build
+    assert r"%FPGA_DIR%build" in server_bat
     # run_server.bat starts the FINAL JTAG-to-AXI server (no loader/variant residue).
     assert "ZLC_PS_CLOCK_HZ=50000000" in server_bat
     assert "zlc_verify_sources" in server_bat
@@ -3266,9 +3280,10 @@ def test_hardware_tutorial_is_real_hardware_not_virtual_demo():
     assert "axi_session" in fpga_text                    # final JTAG-to-AXI backend
     assert "legacy_address_switch" not in fpga_text
     assert "na.run_sequencer_server" in fpga_text
-    # final design: jtag-axi backend + the pulse_streamer build dir (no VIO project)
+    # final design: jtag-axi backend + the short in-repo build dir (no VIO project)
     assert "jtag-axi" in fpga_text
-    assert "fpga\\build\\pulse_streamer" in fpga_text
+    assert "fpga\\build\\ps" in fpga_text
+    assert "fpga\\build\\pulse_streamer" not in fpga_text
     assert "address_switch.xpr" not in fpga_text
     assert "vivado-session" not in fpga_text
     assert "qCMOS.py" not in hardware_text + fpga_text

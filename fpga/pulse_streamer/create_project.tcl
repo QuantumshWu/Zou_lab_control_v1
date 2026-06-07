@@ -35,11 +35,24 @@ proc zlc_default_project_root {script_dir} {
     }
     return [file normalize [file join $script_dir .. build]]
 }
+# Vivado writes a debug-core temp dir (<project>/<name>.runs/impl_1/.Xil/
+# Vivado-PID-HOST) during implementation; files created under it must stay below
+# the Windows MAX_PATH (260).  There is NO Vivado knob to relocate just that temp
+# dir, so the only fix is a SHORT project path.  The build deliberately stays in
+# fpga/build (in-repo, tracked, no extra drive/junction, cross-platform clean) and
+# uses the SHORT project name "ps" (-> ps.runs) to keep the run path well under the
+# limit even on a deep checkout (e.g. .../Zou_lab_control_v1/fpga/build/ps -> ~141
+# chars here vs ~165 with the old long name).  If even that is too long, the repo
+# itself is checked out too deep -- shorten the CHECKOUT location (keep the build
+# in fpga/), do not split the build out.
+proc zlc_debug_tmp_path {dir project_name} {
+    return [file normalize [file join $dir ${project_name}.runs impl_1 .Xil Vivado-00000-QuantumPad]]
+}
 proc zlc_safe_project_dir {project_dir script_dir project_name} {
     set out [file normalize $project_dir]
-    set debug_tmp [file normalize [file join $out ${project_name}.runs impl_1 .Xil Vivado-00000-QuantumPad]]
+    set debug_tmp [zlc_debug_tmp_path $out $project_name]
     if {[string length $debug_tmp] > 146} {
-        error "Vivado debug-core temp path too long ($debug_tmp). Check out at a shorter path or set ZLC_PS_PROJECT_DIR."
+        error "Vivado debug-core temp path too long ($debug_tmp).\n  The build must stay under fpga/build, so the REPO is checked out too deep.\n  Check out the repo at a shorter path (e.g. C:/src/zlc) and rebuild, or set ZLC_PS_PROJECT_DIR to a shorter in-repo dir."
     }
     return $out
 }
@@ -49,9 +62,11 @@ if {![file exists $xdc_path]} { error "board XDC not found: $xdc_path. Set ZLC_P
 set xdc_file [open $xdc_path r]; set xdc_text [read $xdc_file]; close $xdc_file
 if {[string match "*<PIN_CH*" $xdc_text]} { error "$xdc_path still has <PIN_CHxx> placeholders." }
 
+# SHORT project name/subdir (ps) keeps Vivado's deep run/.Xil temp path under the
+# Windows MAX_PATH limit while staying in fpga/build (see zlc_safe_project_dir).
 set project_root [zlc_default_project_root $script_dir]
-set project_name pulse_streamer
-set project_dir [zlc_safe_project_dir [env_or ZLC_PS_PROJECT_DIR [file join $project_root pulse_streamer]] $script_dir $project_name]
+set project_name ps
+set project_dir [zlc_safe_project_dir [env_or ZLC_PS_PROJECT_DIR [file join $project_root ps]] $script_dir $project_name]
 set top zlc_pulse_streamer_top
 set part xc7a35tfgg484-2
 

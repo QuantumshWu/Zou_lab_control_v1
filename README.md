@@ -90,8 +90,10 @@ fpga\run_server.bat --check-config
 fpga\run_server.bat
 ```
 
-Generated Vivado projects and server state live under `fpga\build\pulse_streamer`
-by default; the printed `ZLC project dir` is the source of truth for the
+Generated Vivado projects and server state live under `fpga\build\ps`
+by default (short name `ps` keeps Vivado's deep run/.Xil temp path under the
+Windows MAX_PATH limit while staying in-repo); the printed `ZLC project dir` is
+the source of truth for the
 generated `impl_1\zlc_pulse_streamer_top.{bit,ltx}`. The full runbook is in the
 **main manual**.
 

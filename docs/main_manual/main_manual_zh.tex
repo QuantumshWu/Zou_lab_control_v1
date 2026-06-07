@@ -202,7 +202,7 @@ cd D:\ZLC
 .\fpga\build_and_program.bat            # build + program (create_project.tcl -> program_fpga.tcl)
 \end{codeblock}
 
-默认工程在 \filepath{fpga\build\pulse_streamer}，bit/ltx（\filepath{zlc_pulse_streamer_top.bit/.ltx}）在其 \filepath{impl_1} 目录下。默认 XDC 是 address-switch 板的引脚图（\filepath{addre.xdc}）。相机成像预设的关键物理输出：
+默认工程在 \filepath{fpga\build\ps}（短名 \pyapi{ps} 让 Vivado 深层 run/.Xil 临时路径不超过 Windows MAX\_PATH，构建仍留在仓库内），bit/ltx（\filepath{zlc_pulse_streamer_top.bit/.ltx}）在其 \filepath{ps.runs\textbackslash impl_1} 目录下。默认 XDC 是 address-switch 板的引脚图（\filepath{addre.xdc}）。相机成像预设的关键物理输出：
 
 \begin{codeblock}[Camera-imaging subset]
 ch09 -> trap    -> M17
@@ -1337,7 +1337,7 @@ cd D:\ZLC
 \begin{codeblock}[text]
 Host:    0.0.0.0:18861
 Backend: jtag-axi
-Project: ...\fpga\build\pulse_streamer
+Project: ...\fpga\build\ps
 Bit:     ...\impl_1\zlc_pulse_streamer_top.bit
 LTX:     ...\impl_1\zlc_pulse_streamer_top.ltx
 Channels: ch00 ch01 ... ch61

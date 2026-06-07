@@ -13,10 +13,10 @@ proc zlc_default_project_root {script_dir} {
 
 set script_dir [file normalize [file dirname [info script]]]
 set project_root [zlc_default_project_root $script_dir]
-set project_dir [env_or ZLC_PS_PROJECT_DIR [file join $project_root pulse_streamer]]
+set project_dir [env_or ZLC_PS_PROJECT_DIR [file join $project_root ps]]
 set top zlc_pulse_streamer_top
-set default_bit_path [file join $project_dir pulse_streamer.runs impl_1 ${top}.bit]
-set default_ltx_path [file join $project_dir pulse_streamer.runs impl_1 ${top}.ltx]
+set default_bit_path [file join $project_dir ps.runs impl_1 ${top}.bit]
+set default_ltx_path [file join $project_dir ps.runs impl_1 ${top}.ltx]
 set bit_path [env_or ZLC_PS_VIVADO_BIT [env_or ZLC_PS_BIT $default_bit_path]]
 set ltx_path [env_or ZLC_PS_VIVADO_LTX [env_or ZLC_PS_LTX $default_ltx_path]]
 set hw_server_url [env_or ZLC_PS_HW_SERVER_URL [env_or ZLC_HW_SERVER_URL ""]]

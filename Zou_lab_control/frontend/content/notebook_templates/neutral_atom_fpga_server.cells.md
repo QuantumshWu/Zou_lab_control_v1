@@ -64,8 +64,8 @@ $env:ZLC_PS_XDC = "D:\fpga_pin_maps\my_board.xdc"
 生成物默认在：
 
 ```text
-fpga\build\pulse_streamer\pulse_streamer.runs\impl_1\zlc_pulse_streamer_top.bit
-fpga\build\pulse_streamer\pulse_streamer.runs\impl_1\zlc_pulse_streamer_top.ltx
+fpga\build\ps\ps.runs\impl_1\zlc_pulse_streamer_top.bit
+fpga\build\ps\ps.runs\impl_1\zlc_pulse_streamer_top.ltx
 ```
 
 `--diagnose` 可以列出 Vivado hardware target 和 FPGA device,不会 program 或
@@ -113,7 +113,7 @@ print((PROJECT_ROOT / "pulse_gui.bat").exists(), PROJECT_ROOT / "pulse_gui.bat")
 ## 2. Configure Vivado paths and backend
 
 如果已经运行 `.\fpga\build_and_program.bat`,下面两个 Vivado 路径应指向
-`fpga\build\pulse_streamer` build 目录。第一次烧板时用 bat program;server
+`fpga\build\ps` build 目录。第一次烧板时用 bat program;server
 默认不再重复 program。后端固定是 `jtag-axi`(持久 Vivado hw_axi 会话)。
 
 <!-- cell:code -->
@@ -122,8 +122,8 @@ PORT = 18861
 
 BUILD_ROOT = PROJECT_ROOT / "fpga" / "build"
 STATE_DIR = Path(os.environ.get("ZLC_PS_STATE_DIR", BUILD_ROOT / "state"))
-PROJECT_DIR = Path(os.environ.get("ZLC_PS_PROJECT_DIR", BUILD_ROOT / "pulse_streamer"))
-RUNS = PROJECT_DIR / "pulse_streamer.runs" / "impl_1"
+PROJECT_DIR = Path(os.environ.get("ZLC_PS_PROJECT_DIR", BUILD_ROOT / "ps"))
+RUNS = PROJECT_DIR / "ps.runs" / "impl_1"
 
 def find_vivado_bin():
     if os.environ.get("ZLC_PS_VIVADO_BIN"):
@@ -240,7 +240,7 @@ ch06 trig    R17   still available, but not the preset camera trigger
 
 If `On Pulse` reports no error but the scope is flat, check these before editing
 Python code: the probe is on the correct board pin, the programmed bit/LTX
-belongs to the current `fpga/build/pulse_streamer` directory, Vivado Hardware
+belongs to the current `fpga/build/ps` directory, Vivado Hardware
 Manager sees a device rather than only a Digilent target, and the GUI is
 connected to the running server rather than offline mode.
 

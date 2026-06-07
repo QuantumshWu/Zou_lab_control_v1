@@ -251,7 +251,7 @@ FPGA 侧只有一个入口 \filepath{fpga\textbackslash build\_and\_program.bat}
 .\fpga\run_server.bat                    # 启动常驻 hw_axi server (host 0.0.0.0, port 18861)
 \end{codeblock}
 
-\pyapi{create_project.tcl} 生成 \pyapi{jtag_axi} + \pyapi{axi_bram_ctrl} + 5 块 BRAM，并用 \pyapi{zlc_force_latency2} 把边沿 BRAM 强制成 \pyapi{READ_LATENCY_B=2}。产物 \filepath{zlc_pulse_streamer_top.\{bit,ltx\}} 落在 \filepath{fpga\textbackslash build\textbackslash pulse_streamer\textbackslash pulse_streamer.runs\textbackslash impl_1}。server 加载 \filepath{.ltx} 是为了在比特流里定位 \pyapi{jtag_axi} 核（即 \pyapi{hw_axi}），所以 bit 与 ltx 必须来自\tfocus{同一次编译}。
+\pyapi{create_project.tcl} 生成 \pyapi{jtag_axi} + \pyapi{axi_bram_ctrl} + 5 块 BRAM，并用 \pyapi{zlc_force_latency2} 把边沿 BRAM 强制成 \pyapi{READ_LATENCY_B=2}。产物 \filepath{zlc_pulse_streamer_top.\{bit,ltx\}} 落在 \filepath{fpga\textbackslash build\textbackslash ps\textbackslash ps.runs\textbackslash impl_1}（工程用短名 \pyapi{ps} 是为了让 Vivado 深层的 run / \filepath{.Xil} 临时路径不超过 Windows MAX\_PATH 限制，同时构建仍然留在仓库内的 \filepath{fpga\textbackslash build}，不挪到别处）。server 加载 \filepath{.ltx} 是为了在比特流里定位 \pyapi{jtag_axi} 核（即 \pyapi{hw_axi}），所以 bit 与 ltx 必须来自\tfocus{同一次编译}。
 
 \section{一次上传里发生了什么}
 \begin{enumerate}

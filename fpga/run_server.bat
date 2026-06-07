@@ -84,10 +84,10 @@ if "%ZLC_PS_TRIGGER_CHANNELS%"=="" (
   exit /b 1
 )
 
-rem Default the bitstream + JTAG-to-AXI probes from the in-repo build (build\pulse_streamer).
+rem Default the bitstream + JTAG-to-AXI probes from the in-repo build (build\ps).
 if not "%ZLC_PS_PROJECT_DIR%"=="" (
-  if "%ZLC_PS_VIVADO_BIT%"=="" set "ZLC_PS_VIVADO_BIT=%ZLC_PS_PROJECT_DIR%\pulse_streamer.runs\impl_1\zlc_pulse_streamer_top.bit"
-  if "%ZLC_PS_VIVADO_LTX%"=="" set "ZLC_PS_VIVADO_LTX=%ZLC_PS_PROJECT_DIR%\pulse_streamer.runs\impl_1\zlc_pulse_streamer_top.ltx"
+  if "%ZLC_PS_VIVADO_BIT%"=="" set "ZLC_PS_VIVADO_BIT=%ZLC_PS_PROJECT_DIR%\ps.runs\impl_1\zlc_pulse_streamer_top.bit"
+  if "%ZLC_PS_VIVADO_LTX%"=="" set "ZLC_PS_VIVADO_LTX=%ZLC_PS_PROJECT_DIR%\ps.runs\impl_1\zlc_pulse_streamer_top.ltx"
 )
 if "%ZLC_PS_VIVADO_LTX%"=="" (
   echo ERROR: no Vivado .ltx probes file was found.
@@ -151,7 +151,7 @@ echo   host/port: 0.0.0.0:18861
 echo   backend:   jtag-axi  ^(persistent Vivado hw_axi session^)
 echo   channels:  inferred from ZLC_PS_XDC, fallback ch00 ... ch61
 echo   clock:     50000000 Hz ^(override with ZLC_PS_CLOCK_HZ^)
-echo   bit/ltx:   fpga\build\pulse_streamer\pulse_streamer.runs\impl_1\zlc_pulse_streamer_top.{bit,ltx}
+echo   bit/ltx:   fpga\build\ps\ps.runs\impl_1\zlc_pulse_streamer_top.{bit,ltx}
 echo.
 echo Run fpga\build_and_program.bat first ^(it builds AND programs the FPGA^).
 echo.
@@ -162,7 +162,7 @@ echo   set ZLC_PS_PORT=18861
 echo   set ZLC_PS_VIVADO_BIN=C:\Xilinx\Vivado\2019.1\bin\vivado.bat
 echo   set ZLC_PS_VIVADO_PROGRAM_ON_RUN=1   ^(re-program the FPGA when the server starts^)
 echo   set ZLC_PS_HW_SERVER_URL=localhost:3121
-echo   set ZLC_PS_PROJECT_DIR=%%CD%%\fpga\build\pulse_streamer
+echo   set ZLC_PS_PROJECT_DIR=%%CD%%\fpga\build\ps
 exit /b 0
 
 :zlc_verify_sources
@@ -197,7 +197,9 @@ if defined ZLC_PS_PROJECT_DIR if "!ZLC_PS_PROJECT_DIR: =!"=="" set "ZLC_PS_PROJE
 if defined ZLC_PS_STATE_DIR if "!ZLC_PS_STATE_DIR: =!"=="" set "ZLC_PS_STATE_DIR="
 if not defined ZLC_PS_BUILD_ROOT set "ZLC_PS_BUILD_ROOT=%FPGA_DIR%build"
 if not exist "!ZLC_PS_BUILD_ROOT!\" mkdir "!ZLC_PS_BUILD_ROOT!" >nul 2>nul
-if not defined ZLC_PS_PROJECT_DIR set "ZLC_PS_PROJECT_DIR=%ZLC_PS_BUILD_ROOT%\pulse_streamer"
+rem In-repo build (fpga\build\ps); the SHORT "ps" subdir matches build_and_program
+rem so the server finds the bitstream under ps.runs\impl_1.
+if not defined ZLC_PS_PROJECT_DIR set "ZLC_PS_PROJECT_DIR=%ZLC_PS_BUILD_ROOT%\ps"
 if not defined ZLC_PS_STATE_DIR set "ZLC_PS_STATE_DIR=%ZLC_PS_BUILD_ROOT%\state"
 echo ZLC build root: %ZLC_PS_BUILD_ROOT%
 exit /b 0

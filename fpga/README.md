@@ -19,8 +19,9 @@ invariants and architecture notes, see `docs/MAINTAINER_NOTES.md`.
 - `pulse_streamer/`: HDL (`zlc_edge_streamer.v`, `zlc_pulse_streamer_top.v`),
   Vivado Tcl, and the `host/` Python image packer + behavioral engine model.
 - Generated Vivado projects and server state default to `fpga\build`. The
-  default project is `fpga\build\pulse_streamer`; the default server state dir is
-  `fpga\build\state`.
+  default project is `fpga\build\ps`; the short name `ps` (-> `ps.runs`) keeps
+  Vivado's deep run/.Xil temp path under the Windows MAX_PATH limit while the
+  build stays in-repo. The default server state dir is `fpga\build\state`.
 
 The root-level `pulse_gui.bat` is the frontend entry point; the FPGA batch files
 stay here so hardware setup is separate from the GUI.

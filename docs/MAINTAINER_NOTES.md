@@ -273,7 +273,8 @@ Capacity is fixed by `host.image.solve_capacity` (no per-build override). Vivado
 2019 debug cores are path-length sensitive — keep the checkout short (`D:\ZLC`).
 The printed `ZLC build root` / `ZLC project dir` are the source of truth for the
 generated `impl_1\zlc_pulse_streamer_top.{bit,ltx}`; the default project is
-`fpga\build\pulse_streamer`.
+`fpga\build\ps` (short name `ps` -> `ps.runs`, chosen so Vivado's deep
+run/.Xil temp path stays under MAX_PATH while the build remains in-repo).
 
 ### Edge-table engine + JTAG-to-AXI streaming (the one design)
 
@@ -339,7 +340,8 @@ hold.
   the full pack -> upload -> LOAD -> fire -> stream flow is unit-tested without
   Vivado (`test_vivado_axi_session_*`). `run_server.bat` default backend is
   `jtag-axi`; `build_and_program.bat` builds + programs the bitstream (project
-  `fpga/build/pulse_streamer`).
+  `fpga/build/ps` -- the short name "ps" keeps Vivado's deep run/.Xil temp path
+  under the Windows MAX_PATH limit while the build stays in-repo).
 
 **Capacity (35T `xc7a35tfgg484-2`, target `<=90%`):** 62 digital + 4x10-bit DAC;
 20 ns tick (1-tick min width AND resolution); `NUM_SLOTS=4` affine slots
