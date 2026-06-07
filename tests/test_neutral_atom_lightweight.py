@@ -2007,6 +2007,91 @@ def test_edge_streamer_repeat_streaming_structure():
     assert "bank_chunk0(ctrl_reg[C_BANK0_CHUNK]" in top and "bank_chunk1(ctrl_reg[C_BANK1_CHUNK]" in top
 
 
+def test_vivado_axi_session_rejects_dac_value_over_bus_width(tmp_path):
+    """A scanned DAC code wider than bus_width (would silently truncate on hardware)
+    is rejected at prepare."""
+
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+    from fpga.pulse_streamer.host.image import StreamerParams
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
+
+    params = StreamerParams(max_edges=16, bank_size=4, bus_width=10)
+    program = RuntimeSequenceProgram(
+        sequence_id="dh", sequence_name="dh", clock_hz=50e6,
+        channels=[f"ch{i:02d}" for i in range(62)],
+        ticks=[0, 50, 200], masks=[0, 1, 0], duration=4e-6, trigger_count=0,
+        repeat_forever=False, loop_start_index=0, loop_end_tick=200, loop_count=1,
+        slot_count=1, slot_kinds=["dac"], loop_end_slot_coeffs=[0],
+        tick_slot_coeffs=[[0], [0], [0]], scan_points=[[100], [2000]], scan_coeff_frac_bits=8,  # 2000 > 1023
+    )
+    session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=lambda *a: "ok\n")
+    with pytest.raises(ValueError, match="does not fit 10 bits"):
+        session.prepare(program)
+
+
+def test_vivado_axi_session_wait_done_is_reentrant(tmp_path):
+    """A finite streamed scan whose wait_done returns early (timeout) must RESUME on
+    the next call -- it must NOT reload from chunk 2 over the bank that now holds a
+    later chunk.  Each chunk is loaded exactly once, in order, across the two calls."""
+
+    import re as _re
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+    from fpga.pulse_streamer.host.image import (
+        StreamerParams, CtrlWords, STATUS_RUNNING, STATUS_DONE, STATUS_LOADED, CMD_LOAD, CMD_FIRE,
+    )
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
+
+    N = 10
+    params = StreamerParams(max_edges=16, bank_size=2)   # 5 chunks; chunks 2,3,4 streamed
+    program = RuntimeSequenceProgram(
+        sequence_id="re", sequence_name="re", clock_hz=50e6,
+        channels=[f"ch{i:02d}" for i in range(62)],
+        ticks=[0, 5, 40], masks=[0, 1, 0], duration=4e-6, trigger_count=0,
+        repeat_forever=False, loop_start_index=0, loop_end_tick=40, loop_count=1,
+        slot_count=1, slot_kinds=["delay"], loop_end_slot_coeffs=[0],
+        tick_slot_coeffs=[[0], [256], [0]], scan_points=[[k] for k in range(N)], scan_coeff_frac_bits=8,
+    )
+
+    class Hw:
+        def __init__(self):
+            self.bram = {}; self.status = 0; self.fired = False; self.cursor = 0; self.cap = 0
+            self.chunk_writes = []     # order of (BANK*_CHUNK) values written after fire
+        def __call__(self, lines, action, timeout):
+            text = "\n".join(lines)
+            for a, d in _re.findall(r"-address ([0-9A-Fa-f]+) -data ([0-9A-Fa-f]+) -len 1 -type write", text):
+                w = int(a, 16) // 4; v = int(d, 16); self.bram[w] = v
+                if w == CtrlWords.COMMAND and v & CMD_LOAD: self.status = STATUS_LOADED
+                if w == CtrlWords.COMMAND and v & CMD_FIRE: self.fired = True; self.status = STATUS_RUNNING
+                if self.fired and w in (CtrlWords.BANK0_CHUNK, CtrlWords.BANK1_CHUNK):
+                    self.chunk_writes.append(v)
+            m = _re.search(r"-address ([0-9A-Fa-f]+) -len 1 -type read", text)
+            if m:
+                w = int(m.group(1), 16) // 4
+                if w == CtrlWords.CURSOR:
+                    return f"ZLCDATA {self.cursor:08X}\n"
+                if w == CtrlWords.STATUS:
+                    if self.fired:               # advance toward the allowed cap, then DONE at N
+                        self.cursor = min(self.cap, self.cursor + params.bank_size)
+                        if self.cursor >= N:
+                            self.status |= STATUS_DONE
+                    return f"ZLCDATA {self.status:08X}\n"
+                return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
+            return "ok\n"
+
+    hw = Hw()
+    session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=hw)
+    session.prepare(program)
+    session.fire()
+    hw.cap = 6                                   # only let the engine reach cursor 6 this call
+    assert session.wait_done(timeout=0.3) is False   # not done yet; some chunks streamed
+    partial = list(hw.chunk_writes)
+    assert partial == sorted(partial) and partial[0] == 2   # loaded 2,3,... in order, none repeated
+    hw.cap = N                                   # allow it to finish
+    assert session.wait_done(timeout=1.0) is True
+    # every streamed chunk loaded exactly once, strictly increasing across BOTH calls
+    assert hw.chunk_writes == [2, 3, 4], hw.chunk_writes
+
+
 def test_vivado_axi_session_rejects_nonmonotonic_program(tmp_path):
     """The host validates the program before upload (defence in depth): an affine
     scan that makes the effective edge ticks non-monotonic (an edge would overtake a
@@ -2590,11 +2675,12 @@ def _rtl_bus_held_value(program, bus_index, tick, scan_point, *, bus_width=10):
     """Python re-implementation of the RTL bus engine's held DAC value.
 
     Faithfully mirrors ``zlc_bus_apply_segment`` / ``zlc_bus_seg_start`` in
-    ``fpga/pulse_streamer/zlc_pulse_streamer.v``: at a scan point the bus walks
+    ``fpga/pulse_streamer/zlc_edge_streamer.v``: at a scan point the bus walks
     its segments in *effective*-tick order and holds the most recent one whose
     effective start tick <= ``tick``.  The effective tick applies the segment's
     affine coefficients to the current scan point (so a scanned duration moves
-    the segment), and an edge segment with ``value_select = j+1`` reads the low
+    the segment).  For an edge/hold segment the RTL holds ``vstop`` (the STOP
+    endpoint), so a held value with ``stop_value_select = j+1`` reads the low
     ``bus_width`` bits of scan slot ``j`` (so the DAC value tracks the scan).
     Together this models the simultaneous DA-value + duration + delay scan.
     """
@@ -2619,7 +2705,9 @@ def _rtl_bus_held_value(program, bus_index, tick, scan_point, *, bus_width=10):
     for seg in segments:
         if eff_start(seg) > tick:
             break
-        sel = int(getattr(seg, "value_select", 0))
+        # edge/hold holds vstop in the RTL -> use the STOP endpoint select (which for
+        # an edge/hold segment equals value_select, since start==stop).
+        sel = int(getattr(seg, "stop_value_select", getattr(seg, "value_select", 0)))
         if sel:
             value = int(point[sel - 1]) & mask
         else:

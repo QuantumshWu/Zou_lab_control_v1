@@ -278,8 +278,16 @@ def validate_pulse_streamer_program(
     num_slots: int = DEFAULT_NUM_SLOTS,
     bus_count: int = DEFAULT_BUS_COUNT,
     bus_width: int = DEFAULT_BUS_WIDTH,
+    max_validated_scan_points: int | None = None,
 ) -> None:
-    """Validate that a runtime edge table fits the fixed FPGA streamer."""
+    """Validate that a runtime edge table fits the fixed FPGA streamer.
+
+    ``max_validated_scan_points`` bounds the O(points*edges) effective-tick
+    monotonicity sweep for a large STREAMED scan: when there are more points than
+    the cap, only a representative subset (an even stride plus the per-slot extreme
+    points, which the affine ticks make the most likely to reorder) is checked, so
+    the validator never hangs on a million-point sweep.  ``None`` checks every point
+    (shape/value checks always run for every point)."""
 
     max_edges = _positive_int(max_edges, "max_edges")
     max_scan_points = _positive_int(max_scan_points, "max_scan_points")
@@ -370,12 +378,35 @@ def validate_pulse_streamer_program(
             raise ValueError(f"program has {len(scan_points)} scan points, but the FPGA streamer only accepts {max_scan_points}.")
         signed_tick_min = -(1 << (tick_width - 1))
         signed_tick_max = (1 << (tick_width - 1)) - 1
+        # cheap shape/value check on EVERY point (O(points*slots)).
+        slot_kinds = list(getattr(program, "slot_kinds", []) or [])
         for point_index, point in enumerate(scan_points):
             if len(point) != slot_count:
                 raise ValueError(f"scan point {point_index} must have {slot_count} slot value(s).")
-            for value in point:
-                if int(value) < signed_tick_min or int(value) > signed_tick_max:
-                    raise ValueError(f"scan point {point_index} value {int(value)} does not fit signed {tick_width} bits.")
+            for slot_j, value in enumerate(point):
+                v = int(value)
+                if v < signed_tick_min or v > signed_tick_max:
+                    raise ValueError(f"scan point {point_index} value {v} does not fit signed {tick_width} bits.")
+                # a DAC slot value is a raw DAC code read straight onto the bus, so it
+                # must fit bus_width (else it would silently truncate on hardware).
+                if slot_j < len(slot_kinds) and slot_kinds[slot_j] == "dac" and not (0 <= v <= bus_value_limit):
+                    raise ValueError(f"scan point {point_index} DAC slot {slot_j} value {v} does not fit {bus_width} bits.")
+        # effective-tick monotonicity + range is O(edges) per point; bound it for a
+        # large streamed scan (the affine ticks make the per-slot EXTREME points the
+        # ones most likely to reorder, so always include those).
+        if max_validated_scan_points is None or len(scan_points) <= max_validated_scan_points:
+            check_indices = range(len(scan_points))
+        else:
+            stride = max(1, len(scan_points) // max_validated_scan_points)
+            picked = set(range(0, len(scan_points), stride))
+            picked.add(len(scan_points) - 1)
+            for j in range(slot_count):
+                col_min = min(range(len(scan_points)), key=lambda i: int(scan_points[i][j]))
+                col_max = max(range(len(scan_points)), key=lambda i: int(scan_points[i][j]))
+                picked.add(col_min); picked.add(col_max)
+            check_indices = sorted(picked)
+        for point_index in check_indices:
+            point = scan_points[point_index]
             last_effective_tick = -1
             for tick, coeffs in zip(program.ticks, tick_slot_coeffs):
                 effective_tick = _apply_scan_tick(tick, coeffs, point, frac_bits)

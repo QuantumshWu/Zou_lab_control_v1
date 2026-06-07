@@ -470,7 +470,10 @@ def solve_capacity(part, *, channel_count: int = 62, num_slots: int = 4, coeff_w
                             bank_size=bank_size, bus_count=bus_count, bus_width=bus_width,
                             bus_seg_addr_width=bus_seg_addr_width, bus_sel_width=bus_sel_width)
     ramb36_used = _edge_ramb(max_edges, params) + scan_ram + bus_img_ram + ctrl_ram
-    bus_lutram = _ceil((2 * tick_width + 2 * params.coeff_bits + 2 * bus_width + 2 + bus_sel_width) * params.bus_rows, 64)
+    # per bus-segment row: start+stop tick (2*tick_width), start+stop tick coeffs
+    # (2*coeff_bits), start+stop value (2*bus_width), mode (2), and the start AND stop
+    # value_select (2*bus_sel_width -- a ramp can scan both endpoints).
+    bus_lutram = _ceil((2 * tick_width + 2 * params.coeff_bits + 2 * bus_width + 2 + 2 * bus_sel_width) * params.bus_rows, 64)
 
     def res(used, total):
         b = int(total * pct / 100.0)

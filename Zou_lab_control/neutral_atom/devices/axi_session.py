@@ -127,6 +127,8 @@ class VivadoAxiStreamerSession:
         self._program = None          # last prepared program (for streaming refills)
         self._total_points = 0
         self._total_chunks = 1
+        self._next_chunk = 2          # finite-streaming cursor (instance state -> re-entrant)
+        self._bank_ready = 0b11
         self._io_lock = threading.Lock()    # serialise AXI access (main + stream thread)
         self._stream_thread: threading.Thread | None = None
         self._stream_stop: threading.Event | None = None
@@ -299,6 +301,9 @@ class VivadoAxiStreamerSession:
             num_slots=p.num_slots,
             bus_count=p.bus_count,
             bus_width=p.bus_width,
+            # bound the monotonicity sweep so a million-point streamed scan does not
+            # hang prepare(); the per-slot extreme points are always included.
+            max_validated_scan_points=max(4096, 2 * p.bank_size),
         )
         image = pack_program(program, p)
         # Halt + reset first so a prior run cannot drive outputs while we rewrite BRAM.
@@ -318,6 +323,11 @@ class VivadoAxiStreamerSession:
     def fire(self, program=None) -> None:
         if program is not None:
             self.prepare(program)
+        # finite-streaming cursor state lives on the instance so wait_done is
+        # re-entrant (a second call resumes the refill instead of reloading chunk 2
+        # over whatever the freed bank now holds).
+        self._next_chunk = 2          # chunks 0,1 resident after prepare
+        self._bank_ready = 0b11
         self._command(CMD_FIRE)
         (self.state_dir / "fire_time.txt").write_text(str(time.monotonic()), encoding="utf-8")
         # a repeat_forever STREAMED scan (> 2 banks) must be fed continuously while it
@@ -356,8 +366,6 @@ class VivadoAxiStreamerSession:
         p = self.params
         bank_size = p.bank_size
         total_chunks = self._total_chunks
-        next_chunk = 2                # chunks 0,1 are already resident
-        bank_ready = 0b11
 
         while True:
             status = self._read_word(CtrlWords.STATUS)
@@ -373,18 +381,19 @@ class VivadoAxiStreamerSession:
             # instant the bank is armed.  (Guarded by test_final_status_bits_match_host.)
 
             # --- finite streaming refill: load the next chunk into the freed bank ---
-            if next_chunk < total_chunks:
+            # (next_chunk / bank_ready live on the instance so this is re-entrant.)
+            if self._next_chunk < total_chunks:
                 cursor = self._read_word(CtrlWords.CURSOR)
                 # chunk (next_chunk-2) lives in bank next_chunk%2; it is fully
                 # consumed once cursor >= (next_chunk-1)*bank_size, freeing that bank.
-                if cursor >= (next_chunk - 1) * bank_size:
-                    bank_ready = self._load_chunk(next_chunk, bank_ready)
-                    next_chunk += 1
+                if cursor >= (self._next_chunk - 1) * bank_size:
+                    self._bank_ready = self._load_chunk(self._next_chunk, self._bank_ready)
+                    self._next_chunk += 1
                     continue           # re-check status/cursor promptly while streaming
 
             if time.monotonic() >= deadline:
                 return False
-            time.sleep(self.stream_poll_interval if next_chunk < total_chunks else 0.01)
+            time.sleep(self.stream_poll_interval if self._next_chunk < total_chunks else 0.01)
 
     # --- repeat_forever streamed re-sweep: background cyclic refill ----------
     def _stream_refill_loop(self) -> None:
@@ -411,8 +420,12 @@ class VivadoAxiStreamerSession:
                     if total_chunks > 1:
                         bank_ready = self._load_chunk(1, bank_ready)
                     next_chunk = 2
-                    # wait for the engine to wrap (cursor returns below N) before refilling
-                    while not stop.is_set() and self._read_word(CtrlWords.CURSOR) >= N:
+                    # wait for the engine to wrap (cursor returns below N), then refill.
+                    # Bounded so a hardware fault (engine never wraps) cannot spin-poll
+                    # the AXI link forever -- fall back to the outer loop, which re-checks.
+                    for _ in range(2000):
+                        if stop.is_set() or self._read_word(CtrlWords.CURSOR) < N:
+                            break
                         time.sleep(self.stream_poll_interval)
                     continue
                 if next_chunk < total_chunks and cursor >= (next_chunk - 1) * bank_size:

@@ -1271,8 +1271,10 @@ def _pulse_table_affine_rows(
     affinely in the bound scan slots.  Delays compose additively with period
     durations, so a bound delay and a bound duration on the same edge sum their
     coefficients.  ``_stable_affine_groups`` validates PER-CHANNEL edge ordering and
-    non-negativity at *every* scan point (cross-channel reorder is allowed -- the
-    per-channel engine plays each channel independently).
+    non-negativity at *every* scan point.  NOTE: the FINAL engine is a single GLOBAL
+    edge-table player, so the merged edge list must ALSO stay globally tick-monotone
+    at every scan point; ``validate_pulse_streamer_program`` enforces that (a scan
+    that reorders the merged edges across channels is rejected, not silently dropped).
     """
 
     hardware_channels = list(channel_names(channels, "channels"))
@@ -1365,11 +1367,12 @@ def _stable_affine_groups(
             raise ValueError("hardware scan has events that coincide only for the first scan point; split the scan or simplify timing.")
         grouped.append((expr, [(channel, value) for _expr, channel, value in items]))
     # Per-channel monotonicity: each channel's OWN edges must stay strictly ordered
-    # (and non-negative) at every scan point.  The per-channel run-length engine plays
-    # each channel independently, so a scan that reorders edges ACROSS channels (e.g. a
-    # delay that slides one channel's pulse past another channel's) is fine -- only a
-    # channel reversing/colliding its own edges is unrepresentable.  (The old global
-    # edge-table engine needed global monotonicity; that is the wrong constraint here.)
+    # (and non-negative) at every scan point -- a channel reversing/colliding its own
+    # edges is unrepresentable.  This is NECESSARY but NOT sufficient for the FINAL
+    # design: the engine is a single GLOBAL edge-table player, so the MERGED edge list
+    # must also stay globally tick-monotone at every scan point.  That global check is
+    # enforced downstream by ``validate_pulse_streamer_program`` (host prepare), which
+    # rejects a scan that reorders edges across channels rather than dropping them.
     for point_index, point in enumerate(scan_points):
         per_chan_last: dict[str, int] = {}
         for expr, items in grouped:
