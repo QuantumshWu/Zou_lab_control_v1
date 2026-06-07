@@ -118,20 +118,14 @@ bit 0 对应 \pyapi{channels[0]}。一行的含义是：\tfocus{在这个有效 
 在每个边界，从"第一条还没输出的边沿"开始\tfocus{播种 \pyapi{FIFO_DEPTH} 条影子}，并且边界当拍\tfocus{不发新读}（占用 == 影子数 $\le$ 深度）。3 条影子刚好够给紧跟着的 1-tick 后继留出时间；2 条影子会少一拍而丢边沿。这条不变式是逐 tick 镜像仿真"逼"出来的。
 \end{notebox}
 
-\section{时序图：背靠背 1-tick 边沿一拍一个}
-下面把时钟周期画在横轴，信号画在纵轴。边沿表是 4 条 1-tick 边沿（有效 tick = 0,1,2,3，mask = A,B,C,D）。\pyapi{rd@T} 表示"周期 T 发出的 BRAM 读"，它的数据在 \pyapi{T+RD_LAT}（=T+2）落地（\pyapi{<A}=A 落地）。注意 \pyapi{out} 在 tick 0,1,2,3 上恰好逐拍输出 A,B,C,D，中间\tfocus{没有空拍}。
+\section{背靠背 1-tick 边沿:前端脉冲实绘}
+边沿表放在 block RAM(同步读,\pyapi{RD_LAT}=2),引擎用一条深度 \pyapi{FIFO_DEPTH}=\pyapi{RD_LAT}+1=3 的连续预取流水线把读延迟藏掉:它\tfocus{每周期发一次}BRAM 读(周期 $T$ 发出的读,数据在 $T+$\pyapi{RD_LAT} 落地),读回的边沿压进 arm FIFO 尾;当 \pyapi{time_count} 追上 FIFO 头那条边沿的有效 tick 时,在\tfocus{同一周期}把它的 mask 打到输出并弹出。因为 FIFO 深度比读延迟多 1,弹出与补充始终咬合、FIFO 不空。下图是\tfocus{前端脉冲绘图器实绘}的引擎输出:三路通道在相邻 20\,ns tick 上背靠背切换,每个 1-tick 边沿逐拍打出、中间无空拍——这正是 20\,ns 的最小脉宽与分辨率。
 
-\begin{codeblock}[1-tick prefetch (RD\_LAT=2, FIFO\_DEPTH=3)]
-cycle (clk)   :  -2   -1    0    1    2    3    4
-time_count    :   -    -    0    1    2    3    4
-issue BRAM rd :  rdA  rdB  rdC  rdD   -    -    -      (one read per cycle)
-data lands    :   -    -   <A   <B   <C   <D   -       (T+RD_LAT, RD_LAT=2)
-arm FIFO depth:   0    1    2    3    2    1    0       (>=1 until drained)
-FIFO head edge:   -    -    A    B    C    D    -
-out (mask)    :   0    0    A    B    C    D    0
-                            ^    ^    ^    ^
-                         tick0 tick1 tick2 tick3  <- one 1-tick edge per clock
-\end{codeblock}
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.8\linewidth]{assets/fpga_1tick.png}
+\caption{前端脉冲实绘：三路通道在相邻 20\,ns tick 上背靠背切换——引擎的最小脉宽与分辨率就是 1 个 tick；预取流水线让这些 1-tick 边沿逐拍打出，中间无空拍。}
+\end{figure}
 
 \begin{itemize}
   \item 周期 $-2,-1$ 是\tfocus{arm 阶段}（reset/LOAD 期间）：连发读把前几条边沿的影子预取进 FIFO，使 \pyapi{time_count} 从 0 开始时 FIFO 已经有货。
@@ -148,24 +142,26 @@ out (mask)    :   0    0    A    B    C    D    0
 \section{边界为什么不留缝}
 引擎只有\tfocus{一个}全局边沿指针，所以一次 repeat / loop-rewind / scan-advance / start 只是\tfocus{单周期}的指针 + 影子重装。四个 gapless 重装点（start / loop-rewind / scan-advance / repeat）在边界用上一节的 SEED 不变式重新播种 \pyapi{FIFO_DEPTH} 条影子，于是\tfocus{点 k 的最后一条边沿与点 k+1 的第一条边沿在时间上紧挨着，中间没有缝}。
 
-\section{时序图：扫描点 k -> k+1 跨界无缝}
-设每个扫描点的边沿模板末尾在相对 tick $L-1$ 输出 mask $Z$，下一点的首条边沿在该点的有效 tick 0（绝对上紧跟在 $Z$ 之后一拍）输出 mask $A'$。引擎在播放点 k 末尾的同时，已经把点 k+1 的首批影子按新 slot 向量重新播种好了：
+\section{扫描点 k -> k+1 跨界无缝:前端脉冲实绘}
+仿射扫描把 duration/delay/DAC 绑到 slot \pyapi{s0..sN};每个扫描点用新的 slot 向量,边沿的有效 tick = \pyapi{base + (sum coeff*slot) >>> FRAC} 随之平移。下图是\tfocus{前端实绘}的同一脉冲在两个扫描点的输出——被扫的中间周期把后面的边沿在硬件里 lockstep 平移。引擎在播放点 k 末尾的同一拍,就已按 k+1 的新 slot 向量把首批影子重新播种好,所以\tfocus{点 k 的末边沿与点 k+1 的首边沿在时间上紧挨着、无 gap}。
 
-\begin{codeblock}[scan-advance boundary (gapless)]
-abs tick      :  L-3  L-2  L-1 | L    L+1  L+2          (| = scan-advance)
-playing point :   k    k    k  | k+1  k+1  k+1
-issue BRAM rd : rdY  rdZ  rdA' | rdB' rdC'  -           (k+1 reads cross-issued)
-arm FIFO      :  ...   Z   A'  | B'   C'   ...          (reseeded at boundary)
-out (mask)    :   X    Y    Z  | A'   B'   C'
-                            ^    ^
-                       point k  point k+1
-                       末edge   首edge  <- 相邻一拍, 无 gap
-\end{codeblock}
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.48\linewidth]{assets/fpga_scan_lo.png}\hfill
+\includegraphics[width=0.48\linewidth]{assets/fpga_scan_hi.png}
+\caption{前端脉冲实绘：同一脉冲在两个 scan 点的渲染。被扫的中间周期把后面的边沿在硬件里 lockstep 平移；扫描点之间的切换是无缝的（边界影子重装）。}
+\end{figure}
 
 \begin{itemize}
-  \item 边界处（\pyapi{|}）引擎\tfocus{不发新读}，只用已经播种好的影子（A'、B'…）。新 slot 向量在边界当拍生效，所以 A' 的有效 tick 已经按 k+1 的扫描值算好。
-  \item loop-rewind（repeat bracket）走的是同一套机制：指针跳回 \pyapi{loop_start_addr}，影子按 loop 起点重新播种，循环接缝同样无缝。
+  \item 边界处引擎\tfocus{不发新读},只用已经播种好的影子。新 slot 向量在边界当拍生效,所以下一点首条边沿的有效 tick 已按 k+1 的扫描值算好。
+  \item loop-rewind(repeat bracket)走同一套机制:指针跳回 \pyapi{loop_start_addr},影子按 loop 起点重新播种,循环接缝同样无缝。下图是前端实绘的硬件重复 loop 循环体(不展开),重复之间无缝回绕。
 \end{itemize}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.8\linewidth]{assets/fpga_repeat.png}
+\caption{前端脉冲实绘：硬件重复 loop 的循环体（不展开）。\pyapi{repeat\_forever} 在硬件里无缝回绕，重复之间不留缝。}
+\end{figure}
 
 \pyapi{host.engine_model} 用 \pyapi{streaming_scan_play} 与 1-tick 边界 fuzz 证明了这一点：跨扫描点 / 跨 loop 的边沿与不分段的参考播放逐 tick 相同。
 
@@ -247,35 +243,13 @@ value_select (dual)     : start 与 stop 各一个选择子
 
 \pyapi{edge/hold} 段把输出保持在某个值；\pyapi{ramp} 段在 start 到 stop 之间\tfocus{线性插值}，引擎本地每步走 1 个码（不额外占边沿行）。\tfocus{dual value\_select} 让 start 与 stop 各自可以指向一个扫描 slot——于是一条 ramp 能\tfocus{同时扫两个端点}（扫描-A $\rightarrow$ 扫描-B），一条 edge/hold 段能跟随一个扫描的 DAC 码。
 
-\section{时序图：ramp 插值与扫描端点}
-横轴是 tick，纵轴是 DAC 码。下图画一条从 \pyapi{start_value} 到 \pyapi{stop_value} 的 ramp；当端点被绑定到 slot 时，不同扫描点画出不同斜率/高度的同一条段（无需新增边沿行）。
+\section{模拟 DAC ramp 与扫描端点:前端脉冲实绘}
+每条模拟总线是一张小 LUTRAM 段表(组合读),段含 start/stop tick(仿射系数)+ start/stop 值 + mode(edge/ramp)+ 	focus{双 value\_select}(start 和 stop 各一个)。ramp 段由引擎在本地按 tick 插值生成 10-bit 阶梯(不占数字边沿行);双 value\_select 让一条 ramp 的	focus{两个端点各跟一个 scan slot}(scanned-A $	o$ scanned-B),edge/hold 段则跟单个被扫 DAC 码。下图是	focus{前端脉冲绘图器实绘}的 DAC 波形。
 
-\begin{figure}[htbp]
-  \centering
-  \begin{tikzpicture}[font=\scriptsize, >=Latex]
-    \draw[->, StarkGray] (0,0) -- (7.2,0) node[right]{tick};
-    \draw[->, StarkGray] (0,0) -- (0,3.3) node[above]{DAC code};
-    % axis ticks
-    \draw[StarkGray] (1,0.05) -- (1,-0.05) node[below]{\tiny start};
-    \draw[StarkGray] (5,0.05) -- (5,-0.05) node[below]{\tiny stop};
-    % point p0 ramp: start_value low -> stop_value high
-    \draw[StarkTeal, very thick] (1,0.6) -- (5,2.0);
-    \node[StarkTeal, font=\tiny, above left] at (5,2.0) {p0: A0 -> B0};
-    \fill[StarkTeal] (1,0.6) circle (1.3pt);
-    \fill[StarkTeal] (5,2.0) circle (1.3pt);
-    % hold before/after
-    \draw[StarkTeal, thick, dashed] (0.2,0.6) -- (1,0.6);
-    \draw[StarkTeal, thick, dashed] (5,2.0) -- (6.6,2.0);
-    % point p1 ramp (scanned both endpoints): higher start, higher stop
-    \draw[StarkBlue, very thick] (1,1.2) -- (5,3.0);
-    \node[StarkBlue, font=\tiny, above left] at (5,3.0) {p1: A1 -> B1 (scanned)};
-    \fill[StarkBlue] (1,1.2) circle (1.3pt);
-    \fill[StarkBlue] (5,3.0) circle (1.3pt);
-    % per-step note
-    \node[StarkGray, font=\tiny, align=center] at (3,0.25) {引擎每步 +1 码\\(本地插值, 不占边沿行)};
-  \end{tikzpicture}
-  \caption{ramp 段：引擎在 start/stop tick 之间本地线性插值。端点绑定 slot 时，不同扫描点（p0/p1）画出不同起止——dual value\_select 让一条段同时扫两个端点。}
-  \label{fig:fpga-ramp}
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.8\linewidth]{assets/fpga_dac.png}
+\caption{前端脉冲实绘：模拟总线 DAC 波形——保持 0、斜坡 0$\to$1023、保持 1023。引擎在本地按 tick 插值生成 10-bit 阶梯;双 value\_select 允许斜坡两端各跟一个 scan slot。}
 \end{figure}
 
 \pyapi{host.engine_model.bus_play} 逐 tick 证明了总线/ramp 引擎，包含被扫描的 ramp 端点。

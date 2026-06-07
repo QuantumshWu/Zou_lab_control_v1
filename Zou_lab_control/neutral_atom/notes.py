@@ -12,6 +12,7 @@ from .content.manuals import (
     device_manual_body,
     fpga_manual_body,
     generate_device_manual_figures,
+    generate_fpga_manual_figures,
     main_manual_body,
 )
 
@@ -46,17 +47,22 @@ def build_fpga_manual(
 ) -> NotesBuildResult:
     """Generate the FPGA pulse-streamer manual.
 
-    The FPGA manual uses inline TikZ diagrams only, so it has no figure
-    dependencies and compiles directly from the template.
+    The TIMING diagrams are REAL pulses rendered by the frontend plotter
+    (generate_fpga_manual_figures) into ``<output_dir>/assets`` and injected via
+    fpga_manual_body; block-diagram TikZ stays inline.
     """
 
+    output_dir = Path(output_dir)
+    asset_dir = output_dir / "assets"
+    figures = generate_fpga_manual_figures(asset_dir)
+    tex_figures = {name: Path("assets") / path.name for name, path in figures.items()}
     return render_notes_pdf(
-        Path(output_dir),
+        output_dir,
         filename="fpga_manual_zh.tex",
         title="ZLC FPGA Pulse Streamer 手册",
         subtitle="Artix-7 35T 边沿流送器 / 1-tick 预取 / 无限流式扫描 / JTAG-to-AXI",
         description="RTL、1-tick 预取、双 bank 流式、仿射扫描引擎、模拟总线 DAC、编译上传流程、资源预算",
-        body=fpga_manual_body(),
+        body=fpga_manual_body(tex_figures),
         doc_date=date.today().isoformat(),
         compile_pdf=compile_pdf,
     )
