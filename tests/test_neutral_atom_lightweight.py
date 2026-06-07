@@ -2007,6 +2007,32 @@ def test_edge_streamer_repeat_streaming_structure():
     assert "bank_chunk0(ctrl_reg[C_BANK0_CHUNK]" in top and "bank_chunk1(ctrl_reg[C_BANK1_CHUNK]" in top
 
 
+def test_vivado_axi_session_rejects_nonmonotonic_program(tmp_path):
+    """The host validates the program before upload (defence in depth): an affine
+    scan that makes the effective edge ticks non-monotonic (an edge would overtake a
+    later one and be silently dropped on hardware) is rejected at prepare, not
+    uploaded."""
+
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+    from fpga.pulse_streamer.host.image import StreamerParams
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
+
+    params = StreamerParams(max_edges=16, bank_size=4)
+    # edge 1 has a large positive slot coeff, so at slot=1000 it lands at tick
+    # 100+1000=1100, OVERTAKING the fixed edge 2 at 200 -> non-monotonic.
+    program = RuntimeSequenceProgram(
+        sequence_id="bad", sequence_name="bad", clock_hz=50e6,
+        channels=[f"ch{i:02d}" for i in range(62)],
+        ticks=[0, 100, 200], masks=[0, 1, 0], duration=4e-6, trigger_count=0,
+        repeat_forever=False, loop_start_index=0, loop_end_tick=200, loop_count=1,
+        slot_count=1, slot_kinds=["delay"], loop_end_slot_coeffs=[0],
+        tick_slot_coeffs=[[0], [256], [0]], scan_points=[[0], [1000]], scan_coeff_frac_bits=8,
+    )
+    session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=lambda *a: "ok\n")
+    with pytest.raises(ValueError, match="non-increasing"):
+        session.prepare(program)
+
+
 def test_vivado_axi_session_repeat_streaming_refills_cyclically(tmp_path):
     """repeat_forever over a FINITE STREAMED scan (N > 2*bank_size) re-sweeps: the
     background refill thread reloads chunk 0 (and 1) at each sweep seam, cyclically,
@@ -4113,7 +4139,7 @@ def test_vivado_axi_session_repeat_forever_treats_running_as_done(tmp_path):
     program = RuntimeSequenceProgram(
         sequence_id="p", sequence_name="p", clock_hz=50e6,
         channels=[f"ch{i:02d}" for i in range(62)],
-        ticks=[0, 100, 200], masks=[1, 0, 1],
+        ticks=[0, 100, 200], masks=[1, 0, 0],
         duration=4e-6, trigger_count=0,
         repeat_forever=True, loop_start_index=0, loop_end_tick=200, loop_count=1,
         slot_count=0,

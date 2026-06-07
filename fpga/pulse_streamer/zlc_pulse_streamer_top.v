@@ -338,9 +338,9 @@ module zlc_pulse_streamer_top #(
         default: lstate <= L_IDLE;
         endcase
         // surface DONE / UNDERFLOW while running
-        if (ctrl_reg[C_STATUS][1]) begin   // RUNNING
+        if (ctrl_reg[C_STATUS][1]) begin   // was RUNNING: refresh DONE/UNDERFLOW, clear RUNNING on finish
             ldr_status_we <= 1'b1;
-            ldr_status_val <= {27'b0, (ST_RUNNING | (zlc_done ? ST_DONE : 5'b0) | (zlc_underflow ? ST_UNDERFLOW : 5'b0))};
+            ldr_status_val <= {27'b0, ((zlc_done ? 5'b0 : ST_RUNNING) | (zlc_done ? ST_DONE : 5'b0) | (zlc_underflow ? ST_UNDERFLOW : 5'b0))};
         end
     end
 

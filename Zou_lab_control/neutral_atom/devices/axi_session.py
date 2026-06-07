@@ -37,6 +37,7 @@ import time
 from pathlib import Path
 from typing import Callable, Sequence
 
+from .fpga_pulse_streamer import validate_pulse_streamer_program
 from fpga.pulse_streamer.host.image import (
     StreamerParams,
     CtrlWords,
@@ -284,6 +285,21 @@ class VivadoAxiStreamerSession:
         self._total_points = len(points)
         self._total_chunks = max(1, math.ceil(self._total_points / p.bank_size)) if self._total_points else 1
         self._repeat_forever = bool(getattr(program, "repeat_forever", False))
+        # Independently validate before upload (defence in depth -- a non-monotonic
+        # effective-tick program would silently drop edges on hardware).  Allow the
+        # full scan-point count (streaming is unbounded) by raising the cap to N.
+        validate_pulse_streamer_program(
+            program,
+            max_edges=p.max_edges,
+            max_scan_points=max(1, self._total_points),
+            max_bus_segments=p.max_bus_segments,
+            tick_width=p.tick_width,
+            channel_count=len(program.channels),
+            coeff_width=p.coeff_width,
+            num_slots=p.num_slots,
+            bus_count=p.bus_count,
+            bus_width=p.bus_width,
+        )
         image = pack_program(program, p)
         # Halt + reset first so a prior run cannot drive outputs while we rewrite BRAM.
         self._command(CMD_SAFE)
