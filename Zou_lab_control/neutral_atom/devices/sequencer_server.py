@@ -135,27 +135,21 @@ def run_server(
 
     backend_name = str(backend).strip().lower().replace("_", "-")
     if backend_name in {"jtag-axi", "axi", "loader", "edge-table"}:
-        # Affine edge-table engine, driven over JTAG-to-AXI (hw_axi) through the
-        # on-chip program loader (edgetable_image + zlc_axi_program_loader).
+        # The FINAL affine edge-table engine (1-tick FIFO prefetch + 2-bank
+        # streaming scan), driven over JTAG-to-AXI (hw_axi).  The host BRAM image
+        # geometry is solved from the part + channel count (single source of truth
+        # with the create-project tcl + the top localparams).
         from .axi_session import VivadoAxiStreamerSession
+        from fpga.pulse_streamer.host.image import solve_capacity
 
         program_on_start = _env_bool("ZLC_PS_VIVADO_PROGRAM_ON_RUN", False)
-        # ZLC_PS_VARIANT selects the bitstream/host layout: "loader" (default,
-        # LUTRAM edge-table, <=1024 edges/points) or "d" (Architecture-D BRAM
-        # tables, 2048 edges + 4096 points, depth-1 prefetch).  For D the capacity
-        # geometry is solved from the part + channel count (single source of truth).
-        variant = str(os.environ.get("ZLC_PS_VARIANT", "loader")).strip().lower()
-        d_params = None
-        if variant == "d":
-            from .edgetable_image import solve_capacity
-            part = os.environ.get("ZLC_PS_FPGA_PART", "xc7a35t")
-            d_params = solve_capacity(part, channel_count=max(1, len(list(channels)))).params
+        part = os.environ.get("ZLC_PS_FPGA_PART", "xc7a35tfgg484-2")
+        params = solve_capacity(part, channel_count=max(1, len(list(channels)))).params
         hardware_backend = VivadoAxiStreamerSession(
             state_dir=state_dir,
             clock_hz=clock_hz,
             program_on_start=program_on_start,
-            variant=variant,
-            params=d_params,
+            params=params,
         )
         if warm_start:
             print("Starting persistent Vivado JTAG-to-AXI session before accepting clients...")

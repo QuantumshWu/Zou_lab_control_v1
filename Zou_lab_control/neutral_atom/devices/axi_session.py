@@ -1,27 +1,33 @@
-"""Persistent Vivado JTAG-to-AXI runtime session for the edge-table loader.
+"""Persistent Vivado JTAG-to-AXI runtime session for the FINAL pulse streamer.
 
-This drives the affine edge-table pulse streamer (``zlc_pulse_streamer``, the
-validated seamless engine) through the on-chip loader (``zlc_axi_program_loader``)
-over the JTAG-to-AXI master.  It holds one persistent ``vivado -mode tcl`` process,
-connects to the programmed FPGA, and:
+Drives ``zlc_pulse_streamer_top`` + ``zlc_edge_streamer`` (1-tick FIFO prefetch +
+2-bank streaming scan) over the JTAG-to-AXI master.  It holds one persistent
+``vivado -mode tcl`` process, connects to the programmed FPGA, and:
 
-  * packs the compiled :class:`RuntimeSequenceProgram` into the BRAM program image
-    (:mod:`edgetable_image`),
-  * writes that image into the program BRAM over AXI (``create_hw_axi_txn`` /
-    ``run_hw_axi``),
-  * drives the loader's COMMAND/STATUS mailbox (LOAD -> the loader copies the image
-    into the engine's prog_* ports and asserts LOADED; FIRE -> the loader releases
-    reset and pulses start; SAFE -> halt + reset), and
-  * polls STATUS (DONE for a finite scan; a repeat_forever program never asserts
-    DONE so the host treats RUNNING as success).
+  * packs the compiled program into the BRAM image (:mod:`fpga.pulse_streamer.host.image`):
+    edges -> the 3 parallel TICK/COEFF/MASK BRAMs, the first two scan chunks ->
+    the ping-pong banks, the bus segments -> the bus-image BRAM, scalars -> CTRL,
+  * writes that image over AXI (``create_hw_axi_txn`` / ``run_hw_axi``),
+  * drives the CTRL COMMAND/STATUS mailbox (LOAD -> the top's mini-loader copies
+    the bus image into the engine + asserts LOADED; FIRE -> release reset + pulse
+    start; SAFE -> halt + reset),
+  * for an UNBOUNDED scan (N > 2*bank_size points) STREAMS: it polls the engine's
+    CURSOR, and as each ping-pong bank is freed behind the cursor it rewrites that
+    bank with the next chunk and re-arms its BANK_READY bit, so the scan-point
+    count is limited only by host memory.  A late refill makes the engine STALL
+    (STATUS underflow) -- it never emits a wrong point.
+
+There is NO min-edge-spacing constraint: the engine is 1-tick seamless.
 
 The Tcl execution is injectable (``tcl_executor``) so the whole
-prepare/fire/wait_done/safe_state flow is tested without Vivado or hardware.
-``wait_done`` always bounds its poll, so the server can never busy-poll forever.
+prepare/fire/stream/wait_done/safe_state flow is tested without Vivado or
+hardware.  ``wait_done`` always bounds its poll, so the server can never busy-poll
+forever.
 """
 
 from __future__ import annotations
 
+import math
 import os
 import queue
 import re
@@ -31,11 +37,12 @@ import time
 from pathlib import Path
 from typing import Callable, Sequence
 
-from .edgetable_image import (
-    EdgeTableImageParams,
+from fpga.pulse_streamer.host.image import (
+    StreamerParams,
     CtrlWords,
     pack_program,
-    pack_program_d,
+    scan_bank_words,
+    region_bases,
     CMD_LOAD,
     CMD_FIRE,
     CMD_SAFE,
@@ -44,14 +51,14 @@ from .edgetable_image import (
     STATUS_RUNNING,
     STATUS_DONE,
     STATUS_ERROR,
+    STATUS_UNDERFLOW,
 )
-from .edgetable_engine_model import min_edge_spacing
-
-# Architecture-D depth-1 prefetch settle: the host must keep min edge spacing >=
-# this many ticks so the BRAM read always lands before the edge fires.
-D_MIN_EDGE_SPACING = 3
 
 DEFAULT_RUNTIME_CLOCK_HZ = 50_000_000.0
+
+# The default host geometry MUST match the built bitstream (create_project.tcl /
+# host.image.solve_capacity for the 35T): 4096 edges + bank_size 2048.
+DEFAULT_PARAMS = StreamerParams(max_edges=4096, bank_size=2048)
 
 
 def _default_vivado() -> str:
@@ -63,7 +70,7 @@ def _default_vivado() -> str:
 
 
 def _default_artifact(suffix: str) -> str | None:
-    """Default bit/ltx path from the in-repo edge-table loader build (fpga/build/l)."""
+    """Default bit/ltx path from the in-repo final build (fpga/build/pulse_streamer)."""
 
     env = {
         ".bit": ("ZLC_PS_VIVADO_BIT", "ZLC_PS_BIT"),
@@ -76,12 +83,12 @@ def _default_artifact(suffix: str) -> str | None:
     root = os.environ.get("ZLC_PS_PROJECT_DIR")
     if not root:
         return None
-    candidate = Path(root) / "l.runs" / "impl_1" / f"zlc_pulse_streamer_loader_top{suffix}"
+    candidate = Path(root) / "pulse_streamer.runs" / "impl_1" / f"zlc_pulse_streamer_top{suffix}"
     return str(candidate) if candidate.exists() else None
 
 
 class VivadoAxiStreamerSession:
-    """Persistent Vivado hw_axi transport for the edge-table loader pulse streamer."""
+    """Persistent Vivado hw_axi transport for the final pulse streamer."""
 
     def __init__(
         self,
@@ -93,17 +100,13 @@ class VivadoAxiStreamerSession:
         hw_server_url: str | None = None,
         program_on_start: bool = False,
         clock_hz: float = DEFAULT_RUNTIME_CLOCK_HZ,
-        params: EdgeTableImageParams | None = None,
-        variant: str = "loader",
+        params: StreamerParams | None = None,
         startup_timeout: float = 180.0,
         action_timeout: float | None = 120.0,
         write_batch: int = 200,
+        stream_poll_interval: float = 0.005,
         tcl_executor: Callable[[Sequence[str], str, float | None], str] | None = None,
     ):
-        # variant "loader" = the LUTRAM edge-table loader path (pack_program);
-        # "d" = the Architecture-D BRAM-table path (pack_program_d + min edge
-        # spacing enforcement).  Both share the COMMAND/STATUS mailbox + Tcl plumbing.
-        self.variant = str(variant).strip().lower()
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.vivado = vivado or _default_vivado()
@@ -112,15 +115,17 @@ class VivadoAxiStreamerSession:
         self.hw_server_url = hw_server_url or os.environ.get("ZLC_PS_HW_SERVER_URL") or os.environ.get("ZLC_HW_SERVER_URL") or ""
         self.program_on_start = bool(program_on_start)
         self.clock_hz = float(clock_hz)
-        self.params = params or EdgeTableImageParams()
+        self.params = params or DEFAULT_PARAMS
         self.startup_timeout = float(startup_timeout)
         self.action_timeout = action_timeout
         self.write_batch = max(1, int(write_batch))
+        self.stream_poll_interval = float(stream_poll_interval)
 
         self._pending: list[tuple[int, int]] = []  # (byte_addr, value) queued writes
-        self._repeat_forever = False  # remembers the last prepared program's loop mode
+        self._repeat_forever = False
+        self._program = None          # last prepared program (for streaming refills)
+        self._total_points = 0
 
-        # Persistent Vivado Tcl session plumbing (mirrors VivadoPulseStreamerSession).
         self._process: subprocess.Popen | None = None
         self._reader: threading.Thread | None = None
         self._queue: "queue.Queue[str | None]" = queue.Queue()
@@ -150,7 +155,7 @@ class VivadoAxiStreamerSession:
             )
             self._write_action_log("vivado_axi_session_start", message)
             raise RuntimeError(
-                f"run-length session could not start persistent Vivado. See {self.state_dir / 'vivado_axi_session_start.log'}."
+                f"pulse-streamer session could not start persistent Vivado. See {self.state_dir / 'vivado_axi_session_start.log'}."
             ) from exc
         self._reader = threading.Thread(target=self._read_stdout, name="zlc-vivado-axi-reader", daemon=True)
         self._reader.start()
@@ -203,7 +208,7 @@ class VivadoAxiStreamerSession:
         lines.append("refresh_hw_device [current_hw_device]")
         lines += [
             "set zlc_axi [get_hw_axis]",
-            'if {$zlc_axi eq ""} { error "No JTAG-to-AXI (hw_axi) core found. Program the run-length bitstream first (build_and_program.bat), and check the .ltx probes file." }',
+            'if {$zlc_axi eq ""} { error "No JTAG-to-AXI (hw_axi) core found. Program the bitstream first (build_and_program.bat), and check the .ltx probes file." }',
             'puts "ZLC hw_axi cores: $zlc_axi"',
         ]
         return lines
@@ -240,7 +245,6 @@ class VivadoAxiStreamerSession:
 
     @staticmethod
     def _parse_read(output: str, marker: str) -> int:
-        # DATA comes back as a hex string (possibly with 0x / spaces); take the last.
         match = None
         for line in output.splitlines():
             if marker in line:
@@ -265,61 +269,84 @@ class VivadoAxiStreamerSession:
 
     # --------------------------------------------------------------- sequencer API
     def prepare(self, program) -> None:
-        """Pack the edge-table program into the BRAM image, upload it over AXI, then
-        command the on-chip loader to copy it into the engine (LOAD)."""
+        """Pack the program into the BRAM image, upload it over AXI, then command
+        the top's mini-loader to copy the bus image into the engine (LOAD)."""
 
-        if self.variant == "d":
-            # depth-1 prefetch requires the host to keep edges >= D_MIN_EDGE_SPACING
-            # ticks apart (else the BRAM read cannot land before the edge fires).
-            spacing = min_edge_spacing(program)
-            if spacing < D_MIN_EDGE_SPACING:
-                raise ValueError(
-                    f"Architecture-D engine needs edges >= {D_MIN_EDGE_SPACING} ticks apart "
-                    f"(found {spacing}). Widen the closest pulse/delay or use the loader build."
-                )
-            image = pack_program_d(program, self.params)
-        else:
-            image = pack_program(program, self.params)
+        p = self.params
+        points = list(getattr(program, "scan_points", []) or [])
+        self._program = program
+        self._total_points = len(points)
         self._repeat_forever = bool(getattr(program, "repeat_forever", False))
+        if self._repeat_forever and self._total_points > 2 * p.bank_size:
+            raise ValueError(
+                "repeat_forever with a streaming scan (> 2*bank_size points) is not "
+                "supported: the ping-pong banks are overwritten ahead of the cursor, so "
+                "a wrap to point 0 cannot be served seamlessly. Use a finite scan for "
+                f"unbounded streaming, or keep <= {2 * p.bank_size} points for repeat."
+            )
+        image = pack_program(program, p)
         # Halt + reset first so a prior run cannot drive outputs while we rewrite BRAM.
         self._command(CMD_SAFE)
-        # Upload the program image (only the used words are emitted by pack_program).
         for word_offset in sorted(image):
             self._queue_word(word_offset, image[word_offset])
+        # banks 0 and 1 are resident after pack_program -> arm both ready bits.
+        self._queue_word(CtrlWords.BANK_READY, 0b11)
         self._flush()
-        # Tell the loader to copy the image into the engine's prog_* tables.
         if not self._command(CMD_LOAD, wait_mask=STATUS_LOADED):
             raise RuntimeError(
-                "edge-table loader did not report LOADED after the program upload "
-                "(check the .bit/.ltx, the JTAG cable, and the loader STATUS word)."
+                "pulse streamer did not report LOADED after the program upload "
+                "(check the .bit/.ltx, the JTAG cable, and the STATUS word)."
             )
 
     def fire(self, program=None) -> None:
         if program is not None:
             self.prepare(program)
-        # FIRE: the loader releases the engine reset and pulses start.  RUNNING is set
-        # by the loader; DONE is cleared at fire time inside the loader.
         self._command(CMD_FIRE)
-        (self.state_dir / "loader_fire_time.txt").write_text(str(time.monotonic()), encoding="utf-8")
+        (self.state_dir / "fire_time.txt").write_text(str(time.monotonic()), encoding="utf-8")
 
     def wait_done(self, program=None, timeout: float | None = None) -> bool:
-        # Always bound the poll: with timeout=None fall back to a finite ceiling so the
-        # server can never busy-poll the engine forever (honours "never hang").
+        """Poll to completion.  For an unbounded scan (N > 2*bank_size) this also
+        STREAMS: it refills each ping-pong bank as the cursor frees it, so the host
+        keeps the engine fed for the whole N-point sweep."""
+
         effective = float(timeout) if timeout is not None else float(self.action_timeout or 600.0)
         deadline = time.monotonic() + max(0.0, effective)
+        p = self.params
+        bank_size = p.bank_size
+        total_chunks = max(1, math.ceil(self._total_points / bank_size)) if self._total_points else 1
+        next_chunk = 2                # chunks 0,1 are already resident
+        bank_ready = 0b11
+
         while True:
             status = self._read_word(CtrlWords.STATUS)
             if status & STATUS_DONE:
                 return True
-            # A repeat_forever program never asserts DONE; treat RUNNING as success so
-            # the caller is not blocked for the full timeout on an infinite loop.
             if self._repeat_forever and (status & STATUS_RUNNING):
                 return True
             if status & STATUS_ERROR:
-                raise RuntimeError("edge-table loader reported STATUS_ERROR (bad image magic?).")
+                raise RuntimeError("pulse streamer reported STATUS_ERROR (bad image magic?).")
+
+            # --- streaming refill: load the next chunk into the freed bank ---
+            if next_chunk < total_chunks:
+                cursor = self._read_word(CtrlWords.CURSOR)
+                # chunk (next_chunk-2) lives in bank next_chunk%2; it is fully
+                # consumed once cursor >= (next_chunk-1)*bank_size, freeing that bank.
+                if cursor >= (next_chunk - 1) * bank_size:
+                    bank = next_chunk % 2
+                    refill = scan_bank_words(self._program, p, next_chunk)
+                    bank_ready &= ~(1 << bank)
+                    self._queue_word(CtrlWords.BANK_READY, bank_ready)   # de-arm during rewrite
+                    for off in sorted(refill):
+                        self._queue_word(off, refill[off])
+                    bank_ready |= (1 << bank)
+                    self._queue_word(CtrlWords.BANK_READY, bank_ready)   # re-arm
+                    self._flush()
+                    next_chunk += 1
+                    continue   # re-check status/cursor promptly while streaming
+
             if time.monotonic() >= deadline:
                 return False
-            time.sleep(0.01)
+            time.sleep(self.stream_poll_interval if next_chunk < total_chunks else 0.01)
 
     def safe_state(self) -> None:
         self._command(CMD_SAFE)
@@ -327,9 +354,9 @@ class VivadoAxiStreamerSession:
     # ------------------------------------------------------------------ mailbox
     def _command(self, command: int, *, wait_mask: int | None = None,
                  timeout: float | None = None) -> bool:
-        """Drive a rising edge on the loader COMMAND word, optionally waiting for a
-        STATUS mask.  The loader edge-detects commands, so write 0 first to guarantee
-        a clean 0->cmd transition even if the same command was issued before."""
+        """Drive a rising edge on the COMMAND word, optionally waiting for a STATUS
+        mask.  The top edge-detects commands, so write 0 first to guarantee a clean
+        0->cmd transition even if the same command was issued before."""
 
         self._queue_word(CtrlWords.COMMAND, 0)
         self._queue_word(CtrlWords.COMMAND, int(command) & 0xF)
@@ -341,7 +368,7 @@ class VivadoAxiStreamerSession:
         while True:
             status = self._read_word(CtrlWords.STATUS)
             if status & STATUS_ERROR:
-                raise RuntimeError("edge-table loader reported STATUS_ERROR (bad image magic?).")
+                raise RuntimeError("pulse streamer reported STATUS_ERROR (bad image magic?).")
             if (status & wait_mask) == wait_mask:
                 return True
             if time.monotonic() >= deadline:
@@ -431,4 +458,4 @@ class VivadoAxiStreamerSession:
         (self.state_dir / f"{action}.log").write_text(text, encoding="utf-8", errors="replace")
 
 
-__all__ = ["VivadoAxiStreamerSession", "DEFAULT_RUNTIME_CLOCK_HZ"]
+__all__ = ["VivadoAxiStreamerSession", "DEFAULT_RUNTIME_CLOCK_HZ", "DEFAULT_PARAMS"]

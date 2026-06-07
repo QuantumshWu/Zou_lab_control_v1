@@ -3735,70 +3735,80 @@ def test_sequencer_server_jtag_axi_backend_warm_starts_axi_session(tmp_path, mon
     assert service is not None
 
 
-class _FakeLoaderHardware:
-    """In-memory stand-in for the programmed FPGA: a BRAM dict + the loader's
-    COMMAND/STATUS mailbox.  On LOAD it runs the cycle-accurate loader model over the
-    uploaded image and only asserts STATUS_LOADED if the reconstructed engine tables
-    match the decoded image -- so the test exercises the FULL host->upload->loader
-    path, not just the Tcl shape."""
+class _FakeStreamerHardware:
+    """In-memory stand-in for the programmed FPGA running the FINAL design: a BRAM
+    dict + the CTRL COMMAND/STATUS/CURSOR/BANK_READY mailbox.  On LOAD it verifies
+    the uploaded image round-trips through host.image.unpack_program (so the test
+    exercises the full host->upload->decode path).  On FIRE it advances a CURSOR so
+    the host's streaming refill loop runs; it records each BANK_READY write so the
+    streaming handshake can be asserted.  ``forever`` => RUNNING but never DONE."""
 
-    def __init__(self, params):
-        from Zou_lab_control.neutral_atom.devices.edgetable_image import CtrlWords
+    def __init__(self, params, *, forever=False, total_points=0):
+        from fpga.pulse_streamer.host.image import CtrlWords
         self.params = params
         self.CtrlWords = CtrlWords
+        self.forever = bool(forever)
+        self.total_points = int(total_points)
         self.bram: dict[int, int] = {}
         self.status = 0
         self.load_ok = False
         self.fired = False
+        self.cursor = 0
+        self.bank_ready_writes: list[int] = []   # post-fire BANK_READY values
 
     def __call__(self, lines, action, timeout):
-        from Zou_lab_control.neutral_atom.devices.edgetable_image import (
+        from fpga.pulse_streamer.host.image import (
             unpack_program, CtrlWords, CMD_LOAD, CMD_FIRE, CMD_SAFE,
             STATUS_LOADED, STATUS_RUNNING, STATUS_DONE,
         )
-        from Zou_lab_control.neutral_atom.devices.edgetable_loader_model import run_loader_model
-
         text = "\n".join(lines)
-        # writes: -address AAAA -data DDDD ... -type write
         for addr_hex, data_hex in re.findall(
             r"-address ([0-9A-Fa-f]+) -data ([0-9A-Fa-f]+) -len 1 -type write", text
         ):
             word = int(addr_hex, 16) // 4
             value = int(data_hex, 16)
             self.bram[word] = value
+            if word == CtrlWords.BANK_READY and self.fired:
+                self.bank_ready_writes.append(value)
             if word == CtrlWords.COMMAND and value != 0:
                 if value & CMD_SAFE:
-                    self.status = 0
-                    self.load_ok = False
+                    self.status = 0; self.load_ok = False
                 if value & CMD_LOAD:
-                    # Verify the uploaded image with the loader co-sim model.
                     decoded = unpack_program(self.bram, self.params)
-                    loaded = run_loader_model(self.bram, self.params)
-                    loaded.pop("_cycles")
-                    self.load_ok = all(loaded[k] == decoded[k] for k in decoded)
+                    self.load_ok = (decoded["ticks"] and decoded["masks"]
+                                    and len(decoded["ticks"]) == self.bram.get(CtrlWords.PROG_COUNT, 0))
                     self.status = STATUS_LOADED if self.load_ok else 0x8
                 if value & CMD_FIRE:
-                    self.fired = True
-                    self.status = (self.status | STATUS_RUNNING | STATUS_DONE) & ~0x8
-        # reads: return the requested word as "ZLCDATA <hex>"
+                    self.fired = True; self.cursor = 0
+                    self.status = (self.status | STATUS_RUNNING) & ~0x8
         m = re.search(r"-address ([0-9A-Fa-f]+) -len 1 -type read", text)
         if m:
             word = int(m.group(1), 16) // 4
+            if word == CtrlWords.CURSOR:
+                # report progress only; the engine (STATUS poll) drives the cursor.
+                return f"ZLCDATA {self.cursor:08X}\n"
             if word == CtrlWords.STATUS:
+                if self.fired and not self.forever:
+                    if self.total_points:
+                        # advance one bank per status poll (the engine's pace), giving
+                        # the host a full bank to refill ahead -> gapless streaming.
+                        self.cursor = min(self.total_points, self.cursor + self.params.bank_size)
+                        if self.cursor >= self.total_points:
+                            self.status |= STATUS_DONE
+                    else:
+                        self.status |= STATUS_DONE
                 return f"ZLCDATA {self.status:08X}\n"
             return f"ZLCDATA {self.bram.get(word, 0):08X}\n"
         return "ok\n"
 
 
 def test_vivado_axi_session_loads_and_fires_edge_table_program(tmp_path):
-    """prepare/fire/wait_done/safe_state drive the loader COMMAND/STATUS mailbox over
+    """prepare/fire/wait_done/safe_state drive the CTRL COMMAND/STATUS mailbox over
     create_hw_axi_txn writes/reads, and the uploaded image round-trips through the
-    loader model (no Vivado, no hardware)."""
+    final host packer/unpacker (no Vivado, no hardware)."""
 
     from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
-    from Zou_lab_control.neutral_atom.devices.edgetable_image import (
-        EdgeTableImageParams, CtrlWords, CMD_LOAD, CMD_FIRE, CMD_SAFE,
-    )
+    from fpga.pulse_streamer.host.image import StreamerParams, CtrlWords
     from Zou_lab_control.neutral_atom.devices.sequencer import (
         RuntimeSequenceProgram, RuntimeBusSegment,
     )
@@ -3820,91 +3830,66 @@ def test_vivado_axi_session_loads_and_fires_edge_table_program(tmp_path):
         ],
     )
 
-    params = EdgeTableImageParams()
-    hw = _FakeLoaderHardware(params)
+    params = StreamerParams(max_edges=16, bank_size=4)
+    hw = _FakeStreamerHardware(params)
     session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=hw)
 
     session.prepare(program)
-    assert hw.load_ok, "loader model must accept the uploaded image"
+    assert hw.load_ok, "final unpacker must accept the uploaded image"
+    # banks 0,1 armed at prepare (3 points fit in 2 banks of 4).
+    assert hw.bram[CtrlWords.BANK_READY] == 0b11
     session.fire()
     assert hw.fired
     assert session.wait_done(timeout=1.0) is True
     session.safe_state()
 
-    # The COMMAND mailbox always writes 0 before a command (clean rising edge) and the
-    # commands themselves were issued at the COMMAND word (byte addr = word*4).
-    cmd_addr = f"{CtrlWords.COMMAND * 4:08X}"
     assert hw.bram[CtrlWords.PROG_COUNT] == 4  # edges uploaded
     assert hw.bram[CtrlWords.SCAN_COUNT] == 3  # scan points uploaded
 
 
-def test_vivado_axi_session_d_variant_uploads_and_enforces_min_spacing(tmp_path):
-    """The 'd' variant packs the Architecture-D image, the uploaded BRAM image
-    round-trips through unpack_program_d, and the host REJECTS programs whose edges
-    are closer than the depth-1 prefetch can serve (the min-spacing contract)."""
+def test_vivado_axi_session_streams_unbounded_scan(tmp_path):
+    """A scan with more points than the 2-bank window (N > 2*bank_size) STREAMS:
+    wait_done polls CURSOR and refills each freed ping-pong bank with the next
+    chunk, re-arming its BANK_READY bit, until the whole N-point sweep is played."""
 
-    import re as _re
-    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession, D_MIN_EDGE_SPACING
-    from Zou_lab_control.neutral_atom.devices.edgetable_image import (
-        solve_capacity, unpack_program_d, DCtrl, D_STATUS_LOADED, D_STATUS_RUNNING, D_STATUS_DONE, D_CMD_LOAD, D_CMD_FIRE,
-    )
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+    from fpga.pulse_streamer.host.image import StreamerParams, CtrlWords, region_bases
     from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
 
-    params = solve_capacity("xc7a35t", channel_count=62).params
-
-    class DHw:
-        def __init__(self):
-            self.bram = {}
-            self.status = 0
-            self.load_ok = False
-
-        def __call__(self, lines, action, timeout):
-            text = "\n".join(lines)
-            for a, d in _re.findall(r"-address ([0-9A-Fa-f]+) -data ([0-9A-Fa-f]+) -len 1 -type write", text):
-                word = int(a, 16) // 4
-                val = int(d, 16)
-                self.bram[word] = val
-                if word == DCtrl.COMMAND and val != 0:
-                    if val & D_CMD_LOAD:
-                        dec = unpack_program_d(self.bram, params)
-                        self.load_ok = (dec["ticks"] == prog.ticks and dec["masks"] == prog.masks
-                                        and dec["scan_points"] == [list(p) + [0] * (params.num_slots - len(p)) for p in prog.scan_points])
-                        self.status = D_STATUS_LOADED if self.load_ok else 0x8
-                    if val & D_CMD_FIRE:
-                        self.status = (self.status | D_STATUS_RUNNING | D_STATUS_DONE) & ~0x8
-            m = _re.search(r"-address ([0-9A-Fa-f]+) -len 1 -type read", text)
-            if m:
-                word = int(m.group(1), 16) // 4
-                return f"ZLCDATA {(self.status if word == DCtrl.STATUS else self.bram.get(word, 0)):08X}\n"
-            return "ok\n"
-
-    # edges spaced >= D_MIN_EDGE_SPACING; a 2-slot scan
-    prog = RuntimeSequenceProgram(
-        sequence_id="d", sequence_name="d", clock_hz=50e6,
+    N = 9                      # 9 points, bank_size 2 -> 5 chunks (chunks 2,3,4 streamed)
+    params = StreamerParams(max_edges=16, bank_size=2)
+    program = RuntimeSequenceProgram(
+        sequence_id="s", sequence_name="s", clock_hz=50e6,
         channels=[f"ch{i:02d}" for i in range(62)],
-        ticks=[0, 10, 40, 200], masks=[0, 1, 2, 0], duration=4e-6, trigger_count=0,
-        repeat_forever=True, loop_start_index=0, loop_end_tick=200, loop_count=1,
-        slot_count=2, slot_kinds=["delay", "dac"], loop_end_slot_coeffs=[0, 0],
-        tick_slot_coeffs=[[0, 0], [256, 0], [256, 0], [256, 0]],
-        scan_points=[[0, 0], [256, 100], [512, 200]], scan_coeff_frac_bits=8,
+        ticks=[0, 5, 25, 40], masks=[0, 1, 2, 0], duration=4e-6, trigger_count=0,
+        repeat_forever=False, loop_start_index=0, loop_end_tick=40, loop_count=1,
+        slot_count=1, slot_kinds=["delay"], loop_end_slot_coeffs=[0],
+        tick_slot_coeffs=[[0], [256], [0], [0]],
+        scan_points=[[k] for k in range(N)], scan_coeff_frac_bits=8,
     )
-    hw = DHw()
-    session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, variant="d", tcl_executor=hw)
-    session.prepare(prog)
-    assert hw.load_ok, "D image must round-trip through unpack_program_d"
+    hw = _FakeStreamerHardware(params, total_points=N)
+    session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=hw)
+    session.prepare(program)
+    assert hw.bram[CtrlWords.BANK_READY] == 0b11      # banks 0,1 resident
     session.fire()
-    assert session.wait_done(timeout=1.0) is True
+    assert session.wait_done(timeout=2.0) is True
 
-    # too-close edges (gap 1 < D_MIN_EDGE_SPACING) are rejected at prepare.
-    close = RuntimeSequenceProgram(
-        sequence_id="c", sequence_name="c", clock_hz=50e6,
-        channels=[f"ch{i:02d}" for i in range(62)],
-        ticks=[0, 1, 2, 50], masks=[0, 1, 2, 0], duration=1e-6, trigger_count=0,
-        repeat_forever=True, loop_start_index=0, loop_end_tick=50, loop_count=1, slot_count=0,
-    )
-    import pytest as _pytest
-    with _pytest.raises(ValueError, match="ticks apart"):
-        VivadoAxiStreamerSession(state_dir=tmp_path, params=params, variant="d", tcl_executor=DHw()).prepare(close)
+    # chunks 2,3,4 were streamed in: each refill de-arms then re-arms its bank, so
+    # exactly 2*(total_chunks-2) post-fire BANK_READY writes occurred.
+    total_chunks = -(-N // params.bank_size)          # ceil
+    assert total_chunks == 5
+    assert len(hw.bank_ready_writes) == 2 * (total_chunks - 2)
+    # the last write re-armed both banks ready.
+    assert hw.bank_ready_writes[-1] == 0b11
+    # the streamed chunks actually landed in their (alternating) banks.
+    bases = region_bases(params)
+    scan_base = bases["scan"]
+    bank0_word = scan_base + 0 * params.bank_size * params.scan_words
+    bank1_word = scan_base + 1 * params.bank_size * params.scan_words
+    # chunk 4 (even) -> bank 0 first slot value == point 8
+    assert hw.bram[bank0_word] == 8
+    # chunk 3 (odd) -> bank 1 first slot value == point 6
+    assert hw.bram[bank1_word] == 6
 
 
 def test_vivado_axi_session_repeat_forever_treats_running_as_done(tmp_path):
@@ -3912,7 +3897,7 @@ def test_vivado_axi_session_repeat_forever_treats_running_as_done(tmp_path):
     is seen instead of blocking for the whole timeout."""
 
     from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
-    from Zou_lab_control.neutral_atom.devices.edgetable_image import EdgeTableImageParams, STATUS_RUNNING
+    from fpga.pulse_streamer.host.image import StreamerParams
     from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
 
     program = RuntimeSequenceProgram(
@@ -3923,18 +3908,8 @@ def test_vivado_axi_session_repeat_forever_treats_running_as_done(tmp_path):
         repeat_forever=True, loop_start_index=0, loop_end_tick=200, loop_count=1,
         slot_count=0,
     )
-
-    class _ForeverHw(_FakeLoaderHardware):
-        def __call__(self, lines, action, timeout):
-            from Zou_lab_control.neutral_atom.devices.edgetable_image import CMD_FIRE, CtrlWords, STATUS_LOADED
-            out = super().__call__(lines, action, timeout)
-            # override: a forever program is RUNNING but NEVER DONE
-            if self.fired:
-                self.status = (STATUS_LOADED | STATUS_RUNNING)
-            return out if "-type read" not in "\n".join(lines) else f"ZLCDATA {self.status:08X}\n"
-
-    params = EdgeTableImageParams()
-    hw = _ForeverHw(params)
+    params = StreamerParams(max_edges=16, bank_size=4)
+    hw = _FakeStreamerHardware(params, forever=True)
     session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=hw)
     session.prepare(program)
     session.fire()
