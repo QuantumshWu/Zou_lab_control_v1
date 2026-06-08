@@ -167,6 +167,12 @@ class RuntimeSequenceProgram:
     bus_names: list[str] | None = None
     bus_segments: list[RuntimeBusSegment] | None = None
     delay_lanes: list[DelayLane] | None = None
+    # PHYSICAL CHANNEL DELAY: per-channel-bit delay in ticks, applied to the engine OUTPUT
+    # (a delay line), NOT baked into ``ticks``.  ``ticks``/``masks`` are the UNDELAYED frame;
+    # the engine delays bit ``b`` by ``channel_delays[b]`` (startup counter + sub-period phase
+    # shift -- see engine_model.phase_offset_play).  Any length; never disturbs another
+    # channel; first frame real.  Empty/None = no channel delayed.
+    channel_delays: list[int] | None = None
 
     def to_dict(self) -> dict[str, object]:
         payload = {
@@ -195,6 +201,7 @@ class RuntimeSequenceProgram:
             "bus_names": list(self.bus_names or []),
             "bus_segments": [segment.to_dict() for segment in (self.bus_segments or [])],
             "delay_lanes": [lane.to_dict() for lane in (self.delay_lanes or [])],
+            "channel_delays": list(self.channel_delays or []),
         }
         if self.source_sequence is not None:
             payload["source_sequence"] = self.source_sequence
@@ -236,6 +243,7 @@ class RuntimeSequenceProgram:
             bus_names=[str(item) for item in payload.get("bus_names", [])] or None,
             bus_segments=[RuntimeBusSegment.from_dict(item) for item in payload.get("bus_segments", [])] or None,
             delay_lanes=[DelayLane.from_dict(item) for item in payload.get("delay_lanes", [])] or None,
+            channel_delays=[int(v) for v in payload.get("channel_delays", [])] or None,
         )
 
     @property
