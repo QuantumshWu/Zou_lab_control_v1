@@ -576,12 +576,13 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     # the cursor stays at N-1, the host never reloads, and a >2*bank_size repeat_forever scan
     # stops dead after exactly one sweep.
     assert "scan_cursor <= active_scan_count" in engine
-    # PER-CHANNEL OUTPUT DELAY -- a LITERAL delay line (a plain circular buffer).  A channel delay
-    # is applied to the engine OUTPUT, not baked into the edges -- output_delayed[t] =
-    # output_undelayed[t-d], 0 before fire (never disturbs another channel, first frame real).
-    # ONE CHANNEL_COUNT-wide ring (depth DELAY_DEPTH+1) holds the undelayed state_mask history;
-    # each channel reads its OWN bit at (wptr - d_ch).  The OLD membership / interval / skip / off
-    # machinery (and the even older scanned-delay "lane") MUST be GONE.
+    # PER-CHANNEL OUTPUT DELAY -- a LITERAL delay line.  A channel delay is applied to the engine
+    # OUTPUT, not baked into the edges -- output_delayed[t] = output_undelayed[t-d], 0 before fire
+    # (never disturbs another channel, first frame real).  TTL: each channel has its OWN variable-
+    # tap SHIFT REGISTER ttl_sr[ch] (the SRL primitive -- NOT a 2D-scalar RAM, which Vivado explodes
+    # into flip-flops); the value pushed d ticks ago is the tap ttl_sr[ch][d-1].  DAC: a per-bus
+    # 10-bit ring read at (wptr - d).  The OLD membership / interval / skip / off machinery (and the
+    # even older scanned-delay "lane") MUST be GONE.
     assert "zlc_lane_tick" not in engine and "lane_tick_mem" not in engine and "NUM_LANES" not in engine
     # no membership residue: no intervals, no off/skip/frame-index startup gate
     assert "del_iv_start_mem" not in engine and "del_iv_stop_mem" not in engine and "del_iv_count" not in engine
@@ -590,11 +591,14 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     assert "membership" not in engine.lower()
     assert "MAX_DELAY_INTERVALS" not in engine and "NUM_DELAYS" not in engine and "SKIP_WIDTH" not in engine
     assert "delay_prog" not in engine and "delay_prog" not in top
-    # the LITERAL delay line: a bounded circular buffer (depth DELAY_DEPTH) in distributed RAM
+    # the LITERAL delay line: a bounded depth DELAY_DEPTH (TTL shift register + DAC ring)
     assert "DELAY_DEPTH" in engine and "DELAY_DEPTH" in top and "DELAY_DEPTH" in create_tcl
-    assert "ttl_ring" in engine and "bus_ring" in engine          # the per-channel/per-bus rings
+    # the per-channel TTL SHIFT REGISTER (SRL, NOT a 2D-scalar RAM) + the per-bus DAC ring
+    assert "ttl_sr" in engine and "bus_ring" in engine
+    assert "ttl_ring [" not in engine                             # the old 2D-scalar RAM is GONE (3D-RAM synth bug)
+    assert "{ ttl_sr[" in engine                                  # the channel shift: shift newest in at [0]
     assert "del_wptr" in engine and "del_ch_ticks" in engine and "del_bus_ticks" in engine
-    assert 'ram_style = "distributed"' in engine                  # the rings are LUTRAM, NOT BRAM
+    assert 'ram_style = "distributed"' in engine                  # the bus ring is LUTRAM, NOT BRAM
     # the per-channel output-delay merge: out = (state_mask & ~delayed_mask) | delayed_out
     assert "(state_mask & ~delayed_mask) | delayed_out" in engine
     # held DENSE CTRL words carry the delays (no interval image / loader): per-channel + per-bus
@@ -4410,20 +4414,28 @@ def test_fixed_dac_bus_delayed_beyond_one_frame_compiles_and_streams():
 def test_edge_streamer_has_literal_delay_line_path():
     """Lock the RTL elements of the LITERAL delay line into zlc_edge_streamer.v + the top, so
     the design cannot silently regress to membership/intervals/skip:
-      (1) the engine has a per-channel TTL ring + per-bus DAC ring (distributed RAM), a write
-          pointer, and held per-channel/per-bus delay tick counts;
-      (2) the bounded-depth circular buffer (DELAY_DEPTH) -- NO membership / interval / skip / off;
+      (1) the engine has a per-channel TTL SHIFT REGISTER (ttl_sr, the SRL primitive) + a per-bus
+          DAC ring (distributed RAM), a write pointer, and held per-channel/per-bus delay counts;
+      (2) the bounded-depth delay line (DELAY_DEPTH) -- NO membership / interval / skip / off;
       (3) the disjoint merge out = (state_mask & ~delayed_mask) | delayed_out;
       (4) the top assembles the DENSE DELAY_TICKS / BUS_DELAY_TICKS CTRL words and wires the ports."""
     import pathlib
     root = pathlib.Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer"
     eng = (root / "zlc_edge_streamer.v").read_text(encoding="utf-8")
     top = (root / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
-    # (1) the rings + write pointer + fill counter + held delay tick counts
-    for tok in ("ttl_ring", "bus_ring", "del_wptr", "del_fill", "del_ch_ticks", "del_bus_ticks",
+    # (1) the per-channel TTL shift register + per-bus DAC ring + write pointer + fill counter +
+    #     held delay tick counts.  The TTL line is a per-channel variable-tap SHIFT REGISTER
+    #     ttl_sr[ch] (the SRL primitive), NOT the old 2D-scalar RAM ttl_ring[ch][slot] (which Vivado
+    #     could not infer -- "3D RAM not supported" -> 62*2049 flip-flops, synth hang).
+    for tok in ("ttl_sr", "bus_ring", "del_wptr", "del_fill", "del_ch_ticks", "del_bus_ticks",
                 "delay_ticks", "bus_delay_ticks", "DELAY_DEPTH", "DELAY_SLOTS"):
         assert tok in eng, tok
-    assert 'ram_style = "distributed"' in eng                 # the rings are LUTRAM, not BRAM
+    assert "ttl_ring [" not in eng                            # the old 2D-scalar RAM is GONE
+    # the TTL shift register: newest undelayed bit shifted in at [0] each tick (the SRL write).
+    assert "{ ttl_sr[" in eng
+    # the tap d-1 == the value pushed d ticks ago (byte-identical to the old ring read wptr-d).
+    assert "ttl_sr[del_m][del_ch_ticks[del_m] - 1'b1]" in eng
+    assert 'ram_style = "distributed"' in eng                 # the bus ring is LUTRAM, not BRAM
     # (2) NO membership / interval / skip / off residue
     for tok in ("membership", "del_iv_start_mem", "del_iv_stop_mem", "del_off", "del_skip",
                 "del_frame_idx", "del_member", "del_phase", "zlc_bus_value_at",

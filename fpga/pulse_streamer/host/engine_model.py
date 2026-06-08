@@ -99,14 +99,15 @@ def effective_tick(base_tick: int, coeffs: Sequence[int], slots: Sequence[int], 
 # PHYSICAL CHANNEL DELAY -- a literal OUTPUT delay line (the final, correct model)
 # ----------------------------------------------------------------------------
 # A channel delay is NOT baked into the edge ticks; it is a per-channel delay on the engine
-# OUTPUT:  output_delayed[t] = output_undelayed[t - d], zero before fire.  The hardware is a
-# plain circular buffer (a per-channel addressable shift register, depth DELAY_DEPTH, 1 bit):
-# each tick push the channel's UNDELAYED output bit; the delayed bit is the value pushed d
-# ticks ago.  d=0 is exact passthrough; d>0 reads a slot still holding its FIRE-time 0 until
-# t>=d (silent startup, for free).  Bounded to DELAY_DEPTH ticks (~40 us at 20 ns/tick).
+# OUTPUT:  output_delayed[t] = output_undelayed[t - d], zero before fire.  The TTL hardware is a
+# per-channel variable-tap SHIFT REGISTER (the SRL primitive, depth DELAY_DEPTH, 1 bit): each
+# tick shift the channel's UNDELAYED output bit in at [0]; the delayed bit is the tap at index
+# d-1 (the value pushed d ticks ago).  d=0 is exact passthrough; d>0 reads a tap whose startup
+# gate holds its FIRE-time 0 until t>=d (silent startup, for free).  Bounded to DELAY_DEPTH ticks
+# (~40 us at 20 ns/tick).  (The DAC bus delay is still a 10-bit-wide circular buffer.)
 #
 #   * delay_line_reference     -- the EXACT stream-shift ground truth.
-#   * rtl_delay_line_mirror    -- the cycle-exact RTL circular-buffer register mirror.
+#   * rtl_delay_line_mirror    -- the cycle-exact RTL shift-register register mirror.
 def delay_line_reference(undelayed: Sequence[int], channel_delays) -> list[int]:
     """Exact physical delay line: every channel bit delayed by its own ``d``, 0 before fire.
     Non-delayed bits pass through untouched (a delay never disturbs another channel)."""
@@ -143,16 +144,24 @@ def bus_delay_line_reference(undelayed_bus: Sequence[int], delay: int,
 # CYCLE-EXACT REGISTER MIRRORS of the literal delay-line hardware (no Verilog sim)
 # ----------------------------------------------------------------------------
 # These reproduce the EXACT registers of zlc_edge_streamer.v's delay line so a divergence
-# from delay_line_reference / bus_delay_line_reference flags an RTL bug.  The hardware:
-#   The ring has DELAY_DEPTH+1 slots (so a delay of EXACTLY DELAY_DEPTH is representable).
-#   At FIRE: ring[*] = 0 for every slot of every delayed channel/bus; wptr = 0.
-#   Each RUNNING output tick (the engine's own running ticks, one per emitted sample):
-#       ring[ch][wptr] = undelayed_bit[ch]                          # push this tick's value
-#       delayed_bit[ch] = ring[ch][(wptr - d_ch) mod (DELAY_DEPTH+1)]  # value pushed d_ch ago
+# from delay_line_reference / bus_delay_line_reference flags an RTL bug.  The two paths differ:
+#
+#   TTL (rtl_delay_line_mirror): a per-channel variable-tap SHIFT REGISTER (the SRL primitive,
+#   DELAY_DEPTH+1 bits, zero at FIRE).  Each RUNNING tick read the gated tap THEN shift in:
+#       delayed_bit[ch] = (del_fill >= d_ch) ? sr[ch][d_ch - 1] : 0   # value pushed d_ch ago
+#       sr[ch] = {sr[ch][DELAY_DEPTH-1:0], undelayed_bit[ch]}         # shift newest in at [0]
+#   The pre-shift tap sr[k] == the bit pushed k+1 ticks ago, so sr[d-1] == d ticks ago; del_fill
+#   (running tick index) gates it to 0 until t>=d.  d==0 is bypassed (passthrough).
+#
+#   DAC (rtl_bus_delay_line_mirror): a 10-bit-wide circular buffer of DELAY_DEPTH+1 slots (zero
+#   at FIRE; wptr=0).  Each RUNNING tick:
+#       ring[wptr] = undelayed_value                                 # push this tick's value
+#       delayed_value = ring[(wptr - d) mod (DELAY_DEPTH+1)]         # value pushed d ago
 #       wptr = (wptr + 1) mod (DELAY_DEPTH+1)
-#   d=0 reads the slot just written this tick -> exact passthrough.  d>0 before the buffer
-#   has filled (t<d) reads a still-zero slot -> silent until t>=d.  This is out[t]=in[t-d],
-#   0 before fire, byte-for-byte == delay_line_reference / bus_delay_line_reference.
+#   d=0 reads the slot just written this tick -> exact passthrough; d>0 before the buffer has
+#   filled (t<d) reads a still-zero slot -> silent until t>=d.
+#
+#   Both are out[t]=in[t-d], 0 before fire, byte-for-byte == the *_reference functions.
 
 
 def _validate_delay_depth(d: int, depth: int, what: str) -> int:
@@ -166,32 +175,44 @@ def _validate_delay_depth(d: int, depth: int, what: str) -> int:
 
 def rtl_delay_line_mirror(undelayed: Sequence[int], channel_delays,
                           *, depth: int = DELAY_DEPTH) -> list[int]:
-    """Cycle-exact circular-buffer register mirror of the RTL per-channel delay line.
+    """Cycle-exact register mirror of the RTL per-channel delay line -- now a per-channel
+    variable-tap SHIFT REGISTER (``ttl_sr[ch]``, the SRL primitive), NOT an addressed ring.
 
-    Per delayed bit a 1-bit ring of ``depth`` slots, zero-initialised at FIRE; each tick
-    push the undelayed bit and read the slot ``d`` writes ago.  Equals
-    :func:`delay_line_reference` for every d in [0, depth]; a d > depth raises
+    Per delayed bit a ``depth+1``-bit shift register, zero at FIRE.  Each running tick:
+    read the OUTPUT for tick ``t`` as the gated tap (the value pushed ``d`` ticks ago), THEN
+    shift this tick's undelayed bit in at index 0 (oldest falls off the top).  Modelling the
+    RTL exactly:
+
+      * the SR shifts the newest bit in at ``[0]`` on the clock edge (nonblocking), so the
+        COMBINATIONAL tap this cycle sees the PRE-shift contents: ``sr[k]`` == the bit pushed
+        ``k+1`` ticks ago.  The value pushed ``d`` ticks ago is therefore the tap ``sr[d-1]``
+        (the RTL ``ttl_sr[ch][d_ch-1]``) -- exactly the old ring read ``ring[wptr-d]``.
+      * ``del_fill`` (running tick index, saturating at ``depth``) gates the tap to 0 until
+        ``del_fill >= d`` i.e. ``t >= d`` -- the SRL has no synchronous bulk clear, so this
+        startup gate IS the FIRE-time-0 ``out[t]=in[t-d], 0 before fire`` behaviour.
+
+    Equals :func:`delay_line_reference` for every d in [0, depth]; a d > depth raises
     :class:`DelayDepthExceeded` (the bounded cap)."""
     cds = {int(b): _validate_delay_depth(d, depth, f"channel bit {b}")
            for b, d in dict(channel_delays).items() if int(d) != 0}
     delayed_mask = 0
     for b in cds:
         delayed_mask |= 1 << b
-    # depth+1 ring slots so a delay of EXACTLY DELAY_DEPTH is representable (the slot written
-    # d ticks ago must not be the slot we overwrite this tick).
-    slots = depth + 1
-    rings = {b: [0] * slots for b in cds}
-    wptr = 0
+    # depth+1 SR bits so a delay of EXACTLY DELAY_DEPTH (tap index depth-1) is representable.
+    width = depth + 1
+    srs = {b: [0] * width for b in cds}                # sr[0] = newest pushed
+    del_fill = 0                                       # running tick index, saturating at depth
     out = []
     for t in range(len(undelayed)):
         u = int(undelayed[t])
         m = u & ~delayed_mask                          # non-delayed channels: passthrough
         for bit, d in cds.items():
-            ring = rings[bit]
-            ring[wptr] = (u >> bit) & 1                 # push this tick's undelayed bit
-            if ring[(wptr - d) % slots]:               # value pushed d ticks ago
+            sr = srs[bit]
+            if del_fill >= d and sr[d - 1]:            # gated tap: value pushed d ticks ago
                 m |= 1 << bit
-        wptr = (wptr + 1) % slots
+            srs[bit] = [(u >> bit) & 1] + sr[:-1]      # shift newest in at [0] (oldest drops)
+        if del_fill < depth:
+            del_fill += 1
         out.append(m)
     return out
 

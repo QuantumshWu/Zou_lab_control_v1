@@ -39,14 +39,15 @@
 // Edge fields are 3 PARALLEL BRAMs read in lockstep (tick / coeffs / mask) so a
 // whole edge arrives per access with no width padding; scan is one BRAM.
 //
-// OUTPUT DELAY -- a LITERAL delay line (a plain circular buffer):
-//   * TTL: ONE CHANNEL_COUNT-wide ring (depth DELAY_DEPTH+1) holds the engine's UNDELAYED
-//     state_mask history.  Each tick push state_mask; each channel reads its OWN bit at
-//     (wptr - d_ch), so out_delayed[t] = out_undelayed[t-d] -- ALL 62 channels independently
-//     delayable, 0 before fire (the ring is zeroed at FIRE, so a read before it fills is 0).
-//   * DAC: ONE BUS_WIDTH(10)-wide ring per bus (one delay shared by all 10 bits), read at
-//     (wptr - d_bus).
-//   d=0 is exact passthrough (the non-delayed bits/buses bypass the ring entirely).  The
+// OUTPUT DELAY -- a LITERAL delay line:
+//   * TTL: each channel has its OWN variable-tap SHIFT REGISTER ttl_sr[ch] (a packed
+//     DELAY_DEPTH+1-bit reg -- the textbook SRL primitive, infers as SRLC32E, NOT an addressed
+//     RAM).  Each tick shift the channel's undelayed bit in at [0]; the value pushed d ticks ago
+//     is the tap ttl_sr[ch][d-1], so out_delayed[t] = out_undelayed[t-d] -- ALL 62 channels
+//     independently delayable, 0 before fire (del_fill gates the tap to 0 until t >= d).
+//   * DAC: ONE BUS_WIDTH(10)-wide ring per bus (a 2D word array Vivado DOES infer as 3D RAM; one
+//     delay shared by all 10 bits), read at (del_wptr - d_bus).
+//   d=0 is exact passthrough (the non-delayed bits/buses bypass the line entirely).  The
 //   delay is BOUNDED to DELAY_DEPTH ticks (~40 us @ 20 ns; the host validates d <= DELAY_DEPTH).
 //   Proven cycle-exact by engine_model.rtl_delay_line_mirror / rtl_bus_delay_line_mirror.
 // =============================================================================
@@ -133,13 +134,13 @@ module zlc_edge_streamer #(
     //   * bus_delay_ticks : per-bus delay d in ticks (0 = no delay = passthrough)
     input  wire [BUS_COUNT*DELAY_TICK_WIDTH-1:0] bus_delay_ticks,
 
-    // PHYSICAL per-channel OUTPUT DELAY -- a LITERAL delay line (a per-channel 1-bit circular
-    // buffer of depth DELAY_DEPTH).  A channel delay is NOT baked into the edges -- it is applied
-    // to the engine OUTPUT: out_delayed[t] = out_undelayed[t - d], 0 before fire.  Each running
-    // tick the whole undelayed state_mask is pushed into a single CHANNEL_COUNT-wide ring; each
-    // channel reads its OWN bit d_ch ticks ago (independent per-channel read index), so ALL 62
-    // channels are independently delayable.  d=0 is exact passthrough; before the buffer fills
-    // (t<d) the read slot is still its FIRE-time 0 -> the channel is silent until t>=d, for free.
+    // PHYSICAL per-channel OUTPUT DELAY -- a LITERAL delay line (a per-channel variable-tap SHIFT
+    // REGISTER of depth DELAY_DEPTH, the SRL primitive).  A channel delay is NOT baked into the
+    // edges -- it is applied to the engine OUTPUT: out_delayed[t] = out_undelayed[t - d], 0 before
+    // fire.  Each running tick the channel's undelayed bit is shifted into its OWN shift register;
+    // the value pushed d_ch ticks ago is the tap at index d_ch-1, so ALL 62 channels are
+    // independently delayable.  d=0 is exact passthrough; before the SR fills (t<d) the gated tap
+    // returns its FIRE-time 0 -> the channel is silent until t>=d, for free.
     // Bounded: d <= DELAY_DEPTH (validated by the host).  Proven == engine_model.
     // rtl_delay_line_mirror == delay_line_reference for ANY d in [0, DELAY_DEPTH], zero, and --
     // via the host's folded global shift G -- negative.
@@ -234,21 +235,23 @@ module zlc_edge_streamer #(
     reg [TICK_WIDTH-1:0] bus_ramp_denom [0:BUS_COUNT-1];
     reg [TICK_WIDTH+BUS_WIDTH:0] bus_ramp_accum [0:BUS_COUNT-1];
 
-    // ----- LITERAL delay-line runtime (per-channel TTL + per-bus DAC circular buffers) -----
-    // ONE shared CHANNEL_COUNT-wide ring (depth DELAY_SLOTS) holds the engine's UNDELAYED
-    // state_mask history; each channel reads its OWN bit at (wptr - d_ch).  ONE BUS_WIDTH-wide
-    // ring per bus holds that bus's UNDELAYED value history; the bus reads (wptr - d_bus).  Both
-    // rings share one write pointer del_wptr (advanced once per running output tick).  d_ch /
-    // d_bus are held CTRL (a delay is constant, never scanned), latched into del_ch_ticks /
-    // del_bus_ticks at FIRE.  At FIRE the rings are zeroed, so a read before the buffer fills
-    // returns the FIRE-time 0 -> silent until t == d (real startup, for free).
-    // 62 SEPARATE 1-bit rings (a 2D array -- NOT one CHANNEL_COUNT-wide memory): each channel's
-    // ring is its own distributed RAM with ONE write + ONE read port, so 62 independent per-channel
-    // read addresses infer cleanly (one shared 62-bit-wide memory read at 62 addresses needs 62
-    // read ports and CANNOT be inferred).  Same 2D pattern as bus_ring below.
-    (* ram_style = "distributed" *) reg ttl_ring [0:CHANNEL_COUNT-1][0:DELAY_SLOTS-1];
+    // ----- LITERAL delay-line runtime (per-channel TTL SRL + per-bus DAC ring) ---------------
+    // TTL: each channel's UNDELAYED output bit is delayed by its OWN variable-tap SHIFT REGISTER
+    // ttl_sr[ch] (a packed DELAY_SLOTS-bit reg, the standard SRL primitive -- infers as SRLC32E,
+    // NOT an addressed RAM).  Each running tick shift the newest undelayed bit in at [0] (oldest
+    // falls out the top); the value pushed d ticks ago is the tap ttl_sr[ch][d-1].  62 SEPARATE
+    // shift registers, each unambiguously an SRL (a 2D array of 1-bit SCALARS read at a per-channel
+    // index is NOT an SRL -- Vivado calls it a 3D RAM and explodes it into flip-flops, hanging
+    // synth; a packed shift-reg with a tap select is the textbook inferrable delay line).
+    // DAC: each bus's UNDELAYED 10-bit value history is a BUS_WIDTH-wide ring bus_ring[bus] (a 2D
+    // array of 10-bit words -- Vivado DOES recognise this as a 3D RAM and infers it; it is read at
+    // (del_wptr - d_bus)), left exactly as is.  d_ch / d_bus are held CTRL (a delay is constant,
+    // never scanned), latched into del_ch_ticks / del_bus_ticks at FIRE.  del_fill gates both reads
+    // to 0 before the line has filled d deep, so a read before fill returns 0 -> silent until t == d
+    // (real startup, for free; no bulk clear needed).
+    reg [DELAY_SLOTS-1:0] ttl_sr [0:CHANNEL_COUNT-1];   // 62 packed shift registers (newest at [0]); infers SRL
     (* ram_style = "distributed" *) reg [BUS_WIDTH-1:0] bus_ring [0:BUS_COUNT-1][0:DELAY_SLOTS-1];
-    reg [DELAY_ADDR_WIDTH-1:0] del_wptr = {DELAY_ADDR_WIDTH{1'b0}};
+    reg [DELAY_ADDR_WIDTH-1:0] del_wptr = {DELAY_ADDR_WIDTH{1'b0}};   // write pointer -- bus_ring only (the SRL self-shifts)
     reg [DELAY_TICK_WIDTH-1:0] del_ch_ticks  [0:CHANNEL_COUNT-1];  // per-channel d (0 = passthrough)
     reg [DELAY_TICK_WIDTH-1:0] del_bus_ticks [0:BUS_COUNT-1];      // per-bus d (0 = passthrough)
     // del_fill = number of UNDELAYED samples pushed BEFORE this tick (== the running tick index t
@@ -290,15 +293,22 @@ module zlc_edge_streamer #(
         end
     endfunction
 
-    // Per-channel OUTPUT-delay merge (combinational read of the shared TTL ring).  delayed_mask[b]
-    // marks the bits a delayed channel owns (cleared from the undelayed state_mask); delayed_out[b]
-    // is that channel's bit read d_ch writes ago -- gated by (del_fill >= d_ch) so it is 0 until t
-    // >= d_ch this run (silent startup, no bulk RAM clear needed).
+    // Per-channel OUTPUT-delay merge (combinational tap of each channel's SHIFT REGISTER).
+    // delayed_mask[b] marks the bits a delayed channel owns (cleared from the undelayed
+    // state_mask); delayed_out[b] is that channel's bit pushed d_ch writes ago -- gated by
+    // (del_fill >= d_ch) so it is 0 until t >= d_ch this run (silent startup, no bulk clear).
+    //
+    // TAP = d-1 (proven == the old circular read): the SR shifts the newest undelayed bit in at [0]
+    // each running tick (nonblocking, so this cycle ttl_sr[ch][0] still holds the bit pushed LAST
+    // tick).  Hence combinationally ttl_sr[ch][k] == the bit pushed (k+1) ticks ago, so the value
+    // pushed d ticks ago is ttl_sr[ch][d-1].  d_ch != 0 here (d==0 is bypassed via state_mask), so
+    // d-1 is always a valid in-range tap; this is byte-identical to the old ring read at
+    // (del_wptr - d), which the delay_line_reference (out[t]=in[t-d]) proves.
     // out = (state_mask & ~delayed_mask) | delayed_out -- a non-delayed channel passes straight
-    // through; a delay never touches another channel.  d_ch == 0 never reaches here (the merge
-    // bypasses non-delayed bits via state_mask), so the host never delays a channel by 0.
+    // through; a delay never touches another channel.  d_ch == 0 never reaches here, so the host
+    // never delays a channel by 0.
     reg [CHANNEL_COUNT-1:0] delayed_mask;   // bit b set iff channel b is delayed (d_ch != 0)
-    reg [CHANNEL_COUNT-1:0] delayed_out;    // delayed value per owned bit (read d_ch writes ago)
+    reg [CHANNEL_COUNT-1:0] delayed_out;    // delayed value per owned bit (pushed d_ch writes ago)
     integer del_m;
     always @(*) begin
         delayed_mask = {CHANNEL_COUNT{1'b0}};
@@ -306,9 +316,9 @@ module zlc_edge_streamer #(
         for (del_m = 0; del_m < CHANNEL_COUNT; del_m = del_m + 1) begin
             if (del_ch_ticks[del_m] != {DELAY_TICK_WIDTH{1'b0}}) begin
                 delayed_mask[del_m] = 1'b1;
-                // channel del_m's OWN 1-bit ring, read d_ch writes ago (its own distributed RAM)
+                // channel del_m's OWN shift register, tapped d_ch-1 (== d_ch writes ago)
                 delayed_out[del_m] = (del_fill >= del_ch_ticks[del_m])
-                                     ? ttl_ring[del_m][zlc_delay_rd(del_ch_ticks[del_m])] : 1'b0;
+                                     ? ttl_sr[del_m][del_ch_ticks[del_m] - 1'b1] : 1'b0;
             end
         end
     end
@@ -790,18 +800,19 @@ module zlc_edge_streamer #(
         end
         if (bnd_bus_tick) zlc_bus_tick(bnd_bus_reinit, bnd_slots);
         if (bnd_seed) seed_from_edge0(bnd_slots);
-        // ---- LITERAL delay line: push this tick's UNDELAYED outputs into the rings -------------
-        // On every running output tick, write the current (pre-update) undelayed state_mask into
-        // the shared TTL ring slot del_wptr and each bus's current undelayed value into its ring,
-        // then advance del_wptr and the fill counter.  The combinational merge above reads
-        // (del_wptr - d) -> the value pushed d ticks ago == out[t] = undelayed[t-d].  Since the
-        // write is nonblocking it lands at slot del_wptr next cycle, and the read uses the
-        // (not-yet-advanced) del_wptr, a read at distance d>=1 returns exactly the undelayed value
-        // from d ticks ago (the post-play delay_line_reference shift).  del_fill gates the read to
-        // 0 until d pushes have happened -> silent until t == d (no bulk RAM clear).
+        // ---- LITERAL delay line: push this tick's UNDELAYED outputs into the SR / ring ----------
+        // On every running output tick, SHIFT the current (pre-update) undelayed state_mask bit into
+        // each channel's shift register at [0] (oldest bit falls out the top), and write each bus's
+        // current undelayed value into its ring slot del_wptr, then advance del_wptr + the fill
+        // counter.  This is the SAME timing as the old circular write (gated by bnd_delay_advance,
+        // ONE nonblocking write per channel/bus per tick -- NO added pipeline stage / cycle of
+        // latency).  The combinational TTL tap reads ttl_sr[ch][d-1] (== d ticks ago, see merge
+        // above), byte-identical to the old ring read (del_wptr - d).  bus_ring keeps the ring read
+        // (del_wptr - d).  del_fill gates both reads to 0 until d pushes have happened -> silent
+        // until t == d (no bulk clear).
         if (bnd_delay_advance) begin
             for (del_i = 0; del_i < CHANNEL_COUNT; del_i = del_i + 1)
-                ttl_ring[del_i][del_wptr] <= state_mask[del_i];   // each channel -> its own ring
+                ttl_sr[del_i] <= { ttl_sr[del_i][DELAY_SLOTS-2:0], state_mask[del_i] };  // shift newest in at [0]
             for (del_i = 0; del_i < BUS_COUNT; del_i = del_i + 1)
                 bus_ring[del_i][del_wptr] <= bus_value_active[del_i];
             del_wptr <= (del_wptr == DELAY_SLOTS-1) ? {DELAY_ADDR_WIDTH{1'b0}} : (del_wptr + 1'b1);

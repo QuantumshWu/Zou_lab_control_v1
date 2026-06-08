@@ -596,13 +596,18 @@ def solve_capacity(part, *, channel_count: int = 62, num_slots: int = 4, coeff_w
     # (2*coeff_bits), start+stop value (2*bus_width), mode (2), and the start AND stop
     # value_select (2*bus_sel_width -- a ramp can scan both endpoints).
     bus_lutram = _ceil((2 * tick_width + 2 * params.coeff_bits + 2 * bus_width + 2 + 2 * bus_sel_width) * params.bus_rows, 64)
-    # LITERAL delay line (distributed-RAM circular buffer): one independent 64-deep distributed-RAM
-    # block (1 LUT) per bit-lane per ceil(DELAY_SLOTS/64) depth-block.  All channel_count TTL bits
-    # + bus_count*bus_width DAC bits are independently delayable (each its own read index), so the
-    # LUT cost is (channel_count + bus_count*bus_width) * ceil((delay_depth+1)/64).
+    # LITERAL delay line LUT cost (split: TTL = SRL, DAC = distributed-RAM ring):
+    #   * TTL -- each channel is a variable-tap SHIFT REGISTER (ttl_sr[ch]); Vivado maps a 32-deep
+    #     1-bit shift to ONE SRLC32E (1 LUT), so depth DELAY_SLOTS costs ceil(DELAY_SLOTS/32) SRL32
+    #     LUTs per channel, PLUS a tap-select mux (the d-1 read into the SRL output reg + a small
+    #     cascade mux); budget ~1 extra LUT per channel for that mux.  x channel_count channels.
+    #   * DAC -- each bus is a BUS_WIDTH-bit distributed-RAM ring read at (wptr - d): one 64-deep
+    #     distributed-RAM block (1 LUT) per bit-lane per ceil(DELAY_SLOTS/64) depth-block, over
+    #     bus_count*bus_width independently-read bit-lanes (UNCHANGED -- bus_ring is left as is).
     delay_slots = params.delay_depth + 1
-    delay_lanes = params.channel_count + params.bus_count * params.bus_width
-    delay_lutram = delay_lanes * _ceil(delay_slots, 64)
+    ttl_srl_luts = params.channel_count * (_ceil(delay_slots, 32) + 1)   # SRL32 chain + tap mux/ch
+    dac_ring_luts = (params.bus_count * params.bus_width) * _ceil(delay_slots, 64)
+    delay_lutram = ttl_srl_luts + dac_ring_luts
 
     # DSP estimate, derived from the engine's affine-MAC (zlc_effective_tick) call
     # sites -- the dominant DSP user.  After the shared-MAC dedup the engine has:

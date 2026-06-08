@@ -148,7 +148,7 @@ class RuntimeSequenceProgram:
     # ``channel_delays``; empty/None = no bus delayed.  Bounded to the delay-line depth.
     bus_delays: list[RuntimeBusDelay] | None = None
     # PHYSICAL CHANNEL DELAY: per-channel-bit delay in ticks, applied to the engine OUTPUT by a
-    # LITERAL delay line (a per-channel 1-bit circular buffer), NOT baked into ``ticks``.
+    # LITERAL delay line (a per-channel variable-tap shift register / SRL), NOT baked into ``ticks``.
     # ``ticks``/``masks`` are the UNDELAYED frame; the engine delays bit ``b`` by
     # ``channel_delays[b]`` -- out[t]=in[t-d], 0 before fire (see engine_model.delay_line_reference).
     # Any d in [0, delay_depth]; never disturbs another channel; first frame real.  The global
