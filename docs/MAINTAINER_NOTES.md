@@ -485,23 +485,34 @@ reorders.
 
 Routing (compiler, `sequencer.py`):
 
-- `compile_pulse_table_scan_runtime_program` tries the cheap single global affine table
-  FIRST (`_pulse_table_affine_rows`). A constant delay, or a scanned delay that does NOT
-  reorder, stays in the main table.
-- Only if that raises (a genuine reorder) does it call `_pulse_table_delay_lanes` to route
-  the scanned-delay channels to lanes, then rebuild the main rows excluding them. If the
-  failure was not a scanned-delay reorder, it re-raises the original error.
-- `_pulse_table_delay_lanes` emits each lane's affine rise/fall edges as `(base, coeffs)`
-  and packs a `DelayLane(channel, channel_bit, ticks, coeffs, values)`.
+- `compile_pulse_table_scan_runtime_program` routes EVERY channel with a scanned delay onto
+  its own lane (`_pulse_table_delay_lanes`) and excludes those channels from the main global
+  affine edge table (`_pulse_table_affine_rows`). This is a CORRECTNESS choice, not just an
+  optimisation: with the global shift `G` the minimum edge lands on tick 0 at the extreme
+  scan point, which would collide with the table's mandatory tick-0 seed anchor, and the
+  single-edge-per-tick prefetch engine would slip that edge one tick anyway. A lane plays at
+  its exact effective tick every scan point (its own sub-player, no FIFO, no anchor), so a
+  scanned delay of any form is exact. The main table then carries only constant/zero-delay
+  channels, whose period-0 edges share the anchor's zero-coeff expression and merge.
+- `_pulse_table_delay_lanes` emits each lane's affine rise/fall edges as `(base, coeffs)` and
+  packs a `DelayLane(channel, channel_bit, ticks, coeffs, values)`.
 
-Single-edge reinit (why no replicated multipliers). The reordering-delay scan is
-single-frame: `loop_start=0`, `loop_count=1`, `repeat_from=0`. The lane therefore reseeds
-only to frame-tick 0, so the reinit is a single-edge check — there is **no unrolled walk**
-of the lane and hence no replicated MAC per lane edge. `validate_pulse_streamer_program`
-(`fpga_pulse_streamer.py`) REJECTS a lane combined with an inner repeat bracket
-(`loop_start>0`) or with the additive repeat preamble (`repeat_from_index>0`) with a clear
-message; it also enforces lane count, disjoint `channel_bit`, per-lane edge count, and
-per-scan-point in-frame strict monotonicity.
+Tick-0 seed anchor (the silent-off-by-one fix). The engine seeds its time counter from edge
+0, so the main edge table MUST begin at tick 0 at EVERY scan point or every edge slips one
+tick on hardware (the common idle/guard opening period triggers exactly this). Every
+compiler path prepends an all-off tick-0 edge with zero slot coefficients
+(`_pulse_table_affine_rows`, `_pulse_table_edge_table`, `compile_runtime_program`), and
+`validate_pulse_streamer_program` BACKSTOPS it -- rejecting any program whose edge 0 is not
+at tick 0 (or whose edge-0 slot coefficients are non-zero) so a forgotten anchor can never
+reach the FPGA silently.
+
+Single-edge reinit (why no replicated multipliers). A lane program is always single-frame
+(`loop_count=1`, `repeat_from=0`) -- an inner bracket is UNROLLED before compiling -- so the
+lane reseeds only to frame-tick 0 and the reinit is a single-edge check: **no unrolled walk**
+of the lane, hence no replicated MAC per lane edge. `validate_pulse_streamer_program` also
+enforces lane count, disjoint `channel_bit`, per-lane edge count, and per-scan-point
+in-frame strict monotonicity (and rejects, as a defensive backstop the compiler never hits,
+a lane combined with `loop_start>0` / `repeat_from_index>0`).
 
 Capacity and limits:
 
