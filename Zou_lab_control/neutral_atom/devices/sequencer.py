@@ -528,27 +528,17 @@ def compile_pulse_table_scan_runtime_program(
         state, scan_points=points_ticks, slot_vars=slot_vars, time_step_ns=clock_step_ns,
         coeff_frac_bits=coeff_frac_bits, exclude_channels=bus_members,
     )
-    # FRAME END is PERIOD-PRESERVING.  A channel DELAY (spec 4.2) shifts ONLY that channel and
-    # must NOT change the frame length -- otherwise scanning the delay would stretch every
-    # other channel's period as it sweeps (exactly the "the whole pulse changes" bug).  So the
-    # frame end is the period STRUCTURE end (affine in the scanned DURATIONS, which legitimately
-    # resize the frame) plus G -- it is NEVER extended by a scanned DELAY.  Scanned-delay
-    # channels always ride a lane, so they are EXCLUDED from the frame-end candidates here; the
-    # loop_end is then independent of the swept delay and the PERIOD is identical at every scan
-    # point (only the delayed channel's lane moves).  A scanned delay big enough to push an edge
-    # past this fixed frame is rejected by the lane in-frame check below -- a clear, actionable
-    # error -- rather than silently lengthening the period for all channels.
-    def _is_scanned_delay(ch: str) -> bool:
-        _base, coeffs = _affine_expr(
-            state.delays.get(ch, 0.0), state.delay_units.get(ch, "ns"),
-            slot_vars, clock_step_ns, coeff_frac_bits)
-        return any(int(c) for c in coeffs)
-
-    scanned_delay_channels = [ch for ch in state.channels if ch not in bus_members and _is_scanned_delay(ch)]
+    # FRAME END = the period STRUCTURE end (affine in scanned DURATIONS) + a CONSTANT headroom
+    # that holds the latest delayed edge across ALL scan points.  A channel DELAY (spec 4.2) is
+    # pure additive: a delayed pulse appears LATER, never wrapped to the frame start, and never
+    # changes another channel's period.  The headroom is the SAME constant at every scan point,
+    # so the period does NOT breathe as the delay sweeps (the user-reported bug was an affine,
+    # per-point frame end), yet the frame automatically grows to hold a delay of ANY length.
+    # ALL digital channels (main + lane) are included so the headroom is big enough; only
+    # analog-bus members are excluded.
     frame_end = _pulse_table_affine_frame_end(
         state, scan_points=points_ticks, slot_vars=slot_vars, time_step_ns=clock_step_ns,
-        coeff_frac_bits=coeff_frac_bits,
-        exclude_channels=list(bus_members) + scanned_delay_channels, global_shift=global_shift,
+        coeff_frac_bits=coeff_frac_bits, exclude_channels=bus_members, global_shift=global_shift,
     )
 
     # Every channel with a SCANNED delay rides its own DISJOINT-bit delay lane (a 1-bit
@@ -1522,57 +1512,47 @@ def _pulse_table_affine_frame_end(
     coeff_frac_bits: int,
     exclude_channels: Sequence[str],
     global_shift: int,
-) -> tuple[int, tuple[int, ...]] | None:
-    """The single AFFINE, PERIOD-PRESERVING frame-end expr (with G applied) that DOMINATES
-    every retained channel's latest edge at EVERY scan point, or ``None`` if no single
-    affine expr does.
+) -> tuple[int, tuple[int, ...]]:
+    """The frame-end expr = the period STRUCTURE end (affine in scanned DURATIONS) shifted by
+    a CONSTANT amount (G + headroom H) that does NOT depend on the scan point.
 
-    PERIOD-PRESERVING: the caller passes ``exclude_channels`` covering every SCANNED-delay
-    channel (they all ride lanes), so the candidates carry only scanned-DURATION coeffs and
-    CONSTANT delays -- never a scanned-delay coeff.  The frame length therefore depends on
-    the scanned durations (which legitimately resize the frame) but is INDEPENDENT of a
-    scanned delay, so scanning a delay shifts only that channel's lane and leaves every
-    other channel's period unchanged (spec 4.2).  A scanned delay big enough to leave this
-    fixed frame is rejected by the lane in-frame check, not absorbed by stretching the frame.
+    A channel DELAY is a PURE ADDITIVE delay (spec 4.2): a delayed pulse appears LATER -- at
+    ``period_start + delay`` -- NOT wrapped to the frame start, and delaying one channel must
+    not lengthen another channel's period.  The frame end must therefore be long enough to
+    hold the LATEST delayed edge at every scan point, but the EXTRA room past the period
+    structure must be the SAME for every scan point.  If that headroom varied with the swept
+    delay (an affine frame end), ``loop_end`` would change from one scan point to the next and
+    the WHOLE pulse's period would breathe as the delay sweeps -- the user-reported bug.  So:
 
-    The engine's frame length for a scan point is the last main-table row's effective tick;
-    the lanes reset their frame tick at the same boundary.  So the frame end must, at every
-    scan point, be >= every retained (main + lane) edge -- a single affine expr.  A larger
-    frame end at one point but a smaller candidate at another (scanned durations make the
-    candidates cross) -> ``None`` (the caller falls back to the per-row reference max).
+      frame_end = (table_end shifted by G)  +  H ,   H = max over ALL scan points of
+                  max(0, latest edge tick - table_end tick)  -- a single compile-time constant.
 
-    The candidate set is every retained edge expr PLUS ``table_end + delay_ch`` for each
-    retained channel (a constant-delay stop is at most the delayed table end), so the
-    dominating frame end exists whenever a single channel carries the largest constant delay
-    at every scan point -- the common case.
-    """
+    ``table_end`` keeps its DURATION coefficients (a scanned duration legitimately resizes the
+    frame), while H and G carry NO scan coefficient.  So a pure scanned-delay program has a
+    delay-INDEPENDENT period (loop_end_slot_coeffs all zero) -- only the delayed channel's lane
+    moves, every other channel and the period are identical at every scan point -- yet the
+    frame automatically grows by the constant H to hold even a delay approaching/exceeding the
+    nominal period (the late pulse plays in the [table_end, table_end+H] headroom, additive,
+    never wrapped).  ``exclude_channels`` drops analog-bus members; ALL digital channels
+    (including the delay-lane ones) are included so H is large enough to hold their edges."""
 
     edge_exprs = _pulse_table_affine_all_edge_exprs(
         state, slot_vars=slot_vars, time_step_ns=time_step_ns, coeff_frac_bits=coeff_frac_bits, exclude_channels=exclude_channels
     )
     starts = _pulse_table_affine_period_starts(state, slot_vars=slot_vars, time_step_ns=time_step_ns, coeff_frac_bits=coeff_frac_bits)
     table_end = starts[-1]
-    exclude = set(exclude_channels)
-    candidates = list(edge_exprs)
-    for channel in state.channels:
-        if channel in exclude:
-            continue
-        delay = _affine_expr(state.delays.get(channel, 0.0), state.delay_units.get(channel, "ns"), slot_vars, time_step_ns, coeff_frac_bits)
-        candidates.append(_affine_add(table_end, delay))   # frame end if THIS channel's delay dominates
-    g = (int(global_shift), tuple(0 for _ in slot_vars))
-    candidates = [_affine_add(expr, g) for expr in candidates]
     points = [list(point) for point in scan_points] or [[0] * len(slot_vars)]
-    # Vectorised: the per-point max over ALL edges is computed ONCE, then each candidate is
-    # checked against it -- O((edges + candidates) * points) instead of the O(candidates *
-    # edges * points) double-recompute that dominated compile_scan at thousands of points.
+    # H = the largest amount ANY edge sticks out past the period structure, over every scan
+    # point.  G cancels in the (edge - table_end) difference, so H is computed without it.
     import numpy as np
 
-    edge_max = _affine_ticks_matrix(edge_exprs, points, coeff_frac_bits).max(axis=0)   # (N,)
-    cand_mat = _affine_ticks_matrix(candidates, points, coeff_frac_bits)               # (C, N)
-    for i, cand in enumerate(candidates):
-        if bool(np.all(cand_mat[i] >= edge_max)):
-            return cand
-    return None
+    table_end_ticks = _affine_ticks_matrix([table_end], points, coeff_frac_bits)[0]    # (N,)
+    if edge_exprs:
+        edge_max = _affine_ticks_matrix(edge_exprs, points, coeff_frac_bits).max(axis=0)   # (N,)
+        headroom = int(max(0, int((edge_max - table_end_ticks).max())))
+    else:
+        headroom = 0
+    return (int(table_end[0]) + int(global_shift) + headroom, tuple(int(c) for c in table_end[1]))
 
 
 def _pulse_table_affine_rows(

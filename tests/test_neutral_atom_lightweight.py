@@ -4681,40 +4681,42 @@ def test_negative_scanned_delay_with_and_without_bracket():
         assert all(t >= 0 for t in p2.ticks)
 
 
-def test_large_scanned_delay_period_preserving_or_rejected():
-    """A scanned delay is PERIOD-PRESERVING (spec 4.2): it shifts ONLY its own channel (on a
-    lane) and NEVER changes the frame length, so the period and every other channel are
-    byte-identical at every scan point.  A delay that keeps the pulse INSIDE the frame
-    compiles (loop_end and the whole main table are delay-free); a delay big enough to push
-    the pulse PAST the frame is REJECTED with a clear, actionable error rather than silently
-    stretching everyone's period (the bug this replaces 'extended the frame')."""
-    import pytest
+def test_large_scanned_delay_auto_extends_period_preserving():
+    """A scanned delay of ANY length is PURE ADDITIVE (spec 4.2): the delayed pulse appears
+    LATER (at period_start + delay), NEVER wrapped to the frame start, and delaying one
+    channel never changes another channel's period.  The frame auto-extends by a CONSTANT
+    headroom -- the SAME for every scan point -- so a delay that pushes the pulse past the
+    nominal period just compiles (no reject), the period does NOT breathe as the delay sweeps
+    (loop_end_slot_coeffs all zero), and every non-delayed channel is byte-identical at every
+    scan point.  Both for a lone channel and a reordering pair, finite and repeat_forever."""
     import Zou_lab_control.neutral_atom as na
+    from fpga.pulse_streamer.host import engine_model as em
 
-    # WITHIN-FRAME: a long trailing guard period absorbs even a large swept delay.  A is not
-    # delayed (stays in the main table); B rides a lane.  The period is delay-independent.
-    within = na.PulseTableState(
+    # B's short pulse is at the very START; its delay sweeps from 0 to a FULL period (2000 ns).
+    # No guard period -- the frame auto-extends to hold the late pulse.
+    st = na.PulseTableState(
         channels=["A", "B"],
-        periods=[na.PulsePeriod(1000, (1, 1), unit="ns"),
-                 na.PulsePeriod(4000, (0, 0), unit="ns")],   # guard absorbs up to ~4000 ns of delay
+        periods=[na.PulsePeriod(1000, (1, 1), unit="ns"), na.PulsePeriod(1000, (1, 0), unit="ns")],
         time_step_ns=20, delays={"B": "s0"}, delay_units={"B": "ns"},
         scan_slots=[{"kind": "delay", "target": "B", "unit": "ns", "nominal": 0.0}],
-        scan_table=[[0.0], [2000.0]])   # B shifted a long way, but still inside the 5000 ns frame
+        scan_table=[[0.0], [1000.0], [2000.0]])   # 0, half, FULL nominal period -- no reject
     for rf in (False, True):
-        prog = _assert_scan_matches_oracle(within, channels=["A", "B"], clock_hz=50e6, repeat_forever=rf, n_ticks=1200, want_lane=True)
+        prog = _assert_scan_matches_oracle(st, channels=["A", "B"], clock_hz=50e6, repeat_forever=rf, n_ticks=1200, want_lane=True)
         assert [l.channel for l in prog.delay_lanes] == ["B"]
-        assert not any(prog.loop_end_slot_coeffs)              # PERIOD unchanged by the swept delay
+        assert not any(prog.loop_end_slot_coeffs)              # PERIOD does not breathe as the delay sweeps
         assert not any(any(c) for c in prog.tick_slot_coeffs)  # A (main table) identical at every scan point
-
-    # PAST-FRAME: no guard, so a 2000 ns delay pushes B's pulse past the 2000 ns frame -> reject.
-    past = na.PulseTableState(
-        channels=["A", "B"],
-        periods=[na.PulsePeriod(1000, (1, 1), unit="ns"), na.PulsePeriod(1000, (0, 0), unit="ns")],
-        time_step_ns=20, delays={"B": "s0"}, delay_units={"B": "ns"},
-        scan_slots=[{"kind": "delay", "target": "B", "unit": "ns", "nominal": 0.0}],
-        scan_table=[[0.0], [2000.0]])
-    with pytest.raises(ValueError, match="period-preserving frame|guard period"):
-        past.compile_scan(clock_hz=50e6, repeat_forever=True)
+        ep = em.EngineProgram.from_program(prog)
+        loops = {em.effective_tick(ep.loop_end_tick, ep.loop_end_slot_coeffs, pt, ep.frac_bits) for pt in ep.scan_points}
+        assert len(loops) == 1                                 # one constant period for all scan points
+    # PURE ADDITIVE, NOT wrapped: at the full-period delay B's pulse is at the END (tick 100),
+    # not back at tick 0.  Play the three scan-point frames of the repeat_forever program.
+    prog = st.compile_scan(clock_hz=50e6, repeat_forever=True)
+    ep = em.EngineProgram.from_program(prog)
+    period = em.effective_tick(ep.loop_end_tick, ep.loop_end_slot_coeffs, ep.scan_points[0], ep.frac_bits)
+    out = em.reference_play(prog, period * 3)
+    first_on = lambda fr, bit: next((i for i, m in enumerate(fr) if (m >> bit) & 1), None)
+    rises = [first_on(out[k * period:(k + 1) * period], 1) for k in range(3)]
+    assert rises == [0, 50, 100]   # delay 0 / 1000 ns(50 t) / 2000 ns(100 t) -- additive, never wrapped to 0
 
 
 def test_scanned_delay_changes_only_its_own_channel_not_the_whole_pulse():
