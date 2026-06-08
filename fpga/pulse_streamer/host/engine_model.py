@@ -34,6 +34,7 @@ __all__ = [
     "EngineProgram", "effective_tick", "reference_play", "prefetch_play",
     "streaming_scan_play", "rtl_mirror_play", "bus_play", "min_edge_spacing",
     "PrefetchStall", "ScanUnderflow",
+    "delay_line_reference", "phase_offset_play",
 ]
 
 
@@ -97,6 +98,62 @@ def _lane_bits(lanes: list[dict], llt: int, slots: Sequence[int], frac_bits: int
 def _lane_reset(lanes: list[dict]) -> None:
     for L in lanes:
         L["idx"] = 0; L["bit"] = 0
+
+
+# ----------------------------------------------------------------------------
+# PHYSICAL CHANNEL DELAY (the final, correct delay model)
+# ----------------------------------------------------------------------------
+# A channel delay is NOT baked into the edge ticks; it is a per-channel delay on the
+# engine OUTPUT:  output_delayed[t] = output_undelayed[t - d], zero before fire.  This is
+# the literal physical delay -- ANY length, NEVER changes another channel's timing (each
+# channel is delayed independently), and the FIRST frame is real (silent until t = d, no
+# cyclic wrapped-in tail).  Two equivalent realisations, both proven in the test-suite:
+#
+#   * delay_line_reference -- the EXACT stream-shift ground truth (a literal d-deep buffer).
+#   * phase_offset_play    -- the FINITE-hardware realisation: a startup COUNTER (suppresses
+#     the first d ticks = floor(d/T) whole periods, so d is UNBOUNDED -- just a wider
+#     counter) plus a sub-period phase shift (d mod T < T) that RE-READS the channel's own
+#     periodic pattern (NO buffer).  Equal to the reference tick-for-tick whenever the
+#     undelayed signal is periodic over the delay span (delay + repeat, delay + DAC-value
+#     scan); for a duration scan it delays each scan point's own pattern.
+def delay_line_reference(undelayed: Sequence[int], channel_delays) -> list[int]:
+    """Exact physical delay line: every channel bit delayed by its own ``d``, 0 before fire.
+    Non-delayed bits pass through untouched (a delay never disturbs another channel)."""
+    cds = {int(b): int(d) for b, d in dict(channel_delays).items() if int(d) != 0}
+    delayed_mask = 0
+    for b in cds:
+        delayed_mask |= 1 << b
+    out = []
+    for t in range(len(undelayed)):
+        m = int(undelayed[t]) & ~delayed_mask          # non-delayed channels: passthrough
+        for bit, d in cds.items():
+            s = t - d
+            if s >= 0 and (int(undelayed[s]) >> bit) & 1:
+                m |= 1 << bit
+        out.append(m)
+    return out
+
+
+def phase_offset_play(undelayed: Sequence[int], channel_delays, period: int) -> list[int]:
+    """Finite-hardware realisation of the physical delay: a startup gate (silent while
+    ``t < d``) + a sub-period phase shift ``d mod T`` that re-reads the channel's periodic
+    pattern.  ``d`` is UNBOUNDED (the gate is a counter); no per-tick buffer is used.
+    Equal to :func:`delay_line_reference` for a signal periodic over the delay span."""
+    cds = {int(b): int(d) for b, d in dict(channel_delays).items() if int(d) != 0}
+    delayed_mask = 0
+    for b in cds:
+        delayed_mask |= 1 << b
+    T = int(period)
+    out = []
+    for t in range(len(undelayed)):
+        m = int(undelayed[t]) & ~delayed_mask          # non-delayed channels: passthrough
+        for bit, d in cds.items():
+            if t >= d:                                  # startup counter: 0 for the first d ticks
+                phase = (t - (d % T)) % T               # sub-period phase shift, re-read pattern
+                if (int(undelayed[phase]) >> bit) & 1:
+                    m |= 1 << bit
+        out.append(m)
+    return out
 
 
 @dataclass

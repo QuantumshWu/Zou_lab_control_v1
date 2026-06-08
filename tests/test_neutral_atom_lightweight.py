@@ -4155,6 +4155,36 @@ def test_pulse_table_negative_delay_global_retranslate_in_hardware():
     assert em.reference_play(em.EngineProgram.from_program(prog), 300) == truth
 
 
+def test_physical_delay_phase_offset_equals_delay_line_any_length():
+    """THE delay model: a channel delay is a per-channel delay on the engine OUTPUT, not
+    baked into edges.  The finite-hardware realisation (startup counter + sub-period phase
+    shift that re-reads the channel's pattern, engine_model.phase_offset_play) must equal
+    the EXACT delay line (delay_line_reference) tick-for-tick for a periodic signal at ANY
+    delay length -- proving: (a) delay is unbounded (the counter handles floor(d/T) whole
+    periods with no buffer), (b) other channels are byte-identical (a delay never touches
+    another channel), (c) the first frame is REAL (the delayed channel is silent until t=d,
+    never a cyclic wrapped-in tail)."""
+    from fpga.pulse_streamer.host import engine_model as em
+
+    T = 100; n = T * 40
+    def undel(t):
+        p, m = t % T, 0
+        if p < 10: m |= 1            # bit0 A: [0,10)
+        if 80 <= p < 90: m |= 1 << 1  # bit1 B: [80,90) -- near the frame end (wraps for big d)
+        if 40 <= p < 55: m |= 1 << 2  # bit2 C: [40,55)
+        return m
+    U = [undel(t) for t in range(n)]
+
+    for delays in [{1: 0}, {1: 30}, {1: 213}, {1: 5000}, {1: 30, 2: 7}, {1: 99999}]:
+        ref = em.delay_line_reference(U, delays)      # exact physical delay (ground truth)
+        rtl = em.phase_offset_play(U, delays, T)       # finite-hardware realisation
+        assert ref == rtl, f"phase-offset != delay-line at delays={delays}"
+        keep = ~sum(1 << b for b in delays)
+        assert all((rtl[t] & keep) == (U[t] & keep) for t in range(n)), "a delay disturbed another channel"
+        for bit, d in delays.items():
+            assert all(not ((rtl[t] >> bit) & 1) for t in range(min(d, n))), "delayed channel not silent during startup"
+
+
 def _lane_on_intervals(out, bit):
     on, start = [], None
     for i, mask in enumerate(out):
