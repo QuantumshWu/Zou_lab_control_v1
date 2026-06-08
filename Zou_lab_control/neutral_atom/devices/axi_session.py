@@ -392,27 +392,43 @@ class VivadoAxiStreamerSession:
             )
 
     def axi_self_test(self, *, count: int = 16) -> bool:
-        """Bring-up check for the AXI4 burst path: burst-write a known ramp into the
-        scan-BRAM region, read it back single-beat, and confirm it matches.  This
-        catches the one silent failure mode -- a wrong ``create_hw_axi_txn -data`` burst
-        byte order (or a still-AXI4-Lite bitstream that ignores ``-len``) -- BEFORE any
-        real pulse upload.  Returns True on success; raises on mismatch.  Safe to call
-        before ``prepare`` (the scan region is overwritten by the next upload)."""
+        """Bring-up check for the AXI4 burst path: burst-write a known ramp into a SCRATCH
+        range of the CTRL register file, read it back single-beat, and confirm it matches.
 
-        base = region_bases(self.params)["scan"]
-        n = max(2, int(count))
+        The CTRL register file is the ONLY AXI-READABLE region -- the image BRAMs (tick /
+        coeff / mask / scan / bus / lane) are write-only from the AXI side (their port-A
+        ``douta`` is unconnected; the engine reads them via port B), so an AXI read-back of
+        any BRAM region always returns 0 and cannot verify anything.  CTRL goes through the
+        SAME ``axi_bram_ctrl`` -> external-BMG native port as the BRAM regions, so a burst
+        to CTRL exercises the identical INCR address/data path and still catches the one
+        silent failure mode -- a wrong ``create_hw_axi_txn -data`` burst byte order (or a
+        still-AXI4-Lite bitstream that ignores ``-len``) -- BEFORE any real pulse upload.
+
+        The scratch words sit ABOVE every defined CTRL word (the highest, ``LANE_BITS``, is
+        index 22), so writing them has no side effect (no COMMAND/BANK_READY/loop fields are
+        touched) and the next ``prepare`` overwrites only the low command words.  Returns
+        True on success; raises on mismatch."""
+
+        from fpga.pulse_streamer.host.image import CTRL_WORDS
+
+        ctrl_base = region_bases(self.params)["ctrl"]
+        scratch = 32                              # safely above all defined CtrlWords (<= 22)
+        n = max(2, min(int(count), CTRL_WORDS - scratch))
+        base = ctrl_base + scratch
         pattern = [(0xC0DE0000 + i) & 0xFFFFFFFF for i in range(n)]
         self._stop_stream_thread()
         for offset, value in enumerate(pattern):
             self._queue_word(base + offset, value)
-        self._flush()                      # one contiguous burst
+        self._flush()                      # one contiguous INCR burst
         read = [self._read_word(base + offset) for offset in range(n)]
         if read != pattern:
             raise RuntimeError(
-                "AXI burst self-test FAILED -- the uploaded ramp read back scrambled, "
-                "so the burst -data byte order is wrong or the bitstream is still "
-                f"AXI4-Lite (no burst).  wrote={[hex(v) for v in pattern[:4]]}... "
-                f"read={[hex(v) for v in read[:4]]}..."
+                "AXI burst self-test FAILED -- the uploaded ramp read back scrambled or "
+                "empty, so the burst -data byte order is wrong or the bitstream is not the "
+                "current AXI4 build (an AXI4-Lite or stale bitstream ignores -len / the new "
+                f"address map).  wrote={[hex(v) for v in pattern[:4]]}... "
+                f"read={[hex(v) for v in read[:4]]}...  If read is all-zero, re-run "
+                "build_and_program to load the CURRENT bitstream, then restart the server."
             )
         return True
 
