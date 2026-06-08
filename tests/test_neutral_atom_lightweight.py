@@ -4237,6 +4237,29 @@ def _on_intervals(out, bit):
     return on
 
 
+def test_streaming_reordering_lane_matches_reference():
+    """A reordering-delay lane combined with the 2-bank ping-pong scan STREAMING (the
+    >2*bank_size points path): the lane reseeds at every scan-advance independently of
+    the bank swap, so the streamed output equals reference_play tick-for-tick.  Proves
+    the lane and the unbounded-scan streaming are orthogonal (both finite + repeat)."""
+    import Zou_lab_control.neutral_atom as na
+    from fpga.pulse_streamer.host import engine_model as em
+
+    st = na.PulseTableState(
+        channels=["A", "B"],
+        periods=[na.PulsePeriod(1000, (1, 1), unit="ns"), na.PulsePeriod(1000, (0, 0), unit="ns")],
+        time_step_ns=20, delays={"B": "s0"}, delay_units={"B": "ns"},
+        scan_slots=[{"kind": "delay", "target": "B", "unit": "ns", "nominal": 0.0}],
+        scan_table=[[0.0], [600.0], [200.0], [600.0], [0.0], [400.0]])  # 6 pts -> 3 banks of 2
+    for rf in (False, True):
+        p = na.compile_pulse_table_scan_runtime_program(st, channels=["A", "B"], clock_hz=50e6, repeat_forever=rf)
+        assert p.delay_lanes
+        ep = em.EngineProgram.from_program(p)
+        out, stalled, _ = em.streaming_scan_play(ep, 800, bank_size=2, refill_delay=1)
+        assert not stalled
+        assert out == em.reference_play(ep, 800)
+
+
 def test_reordering_lane_corner_cases_end_to_end():
     """Adversarial corner cases for the reordering-delay lane, each compiled from the
     real GUI state -> validated -> played by all three cycle models:

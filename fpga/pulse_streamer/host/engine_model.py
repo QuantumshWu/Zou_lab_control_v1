@@ -433,6 +433,8 @@ def streaming_scan_play(program, n_ticks: int, *, bank_size: int, refill_delay: 
     stalled = False
     cycle = 0
     sm, tc, ei = (p.masks[0], 1, 1) if (running and eff(0, slot) == 0) else (0, 0, 0)
+    lanes = _make_lanes(p)
+    llt = 0
 
     out = []
     for _ in range(n_ticks):
@@ -440,12 +442,13 @@ def streaming_scan_play(program, n_ticks: int, *, bank_size: int, refill_delay: 
         for item in [it for it in pending if it[2] <= cycle]:
             pending.remove(item)
             load(item[0], item[1])
-        out.append(sm)
+        out.append(sm | _lane_bits(lanes, llt, slot, p.frac_bits)); llt += 1
         if not running:
             continue
         if p.loop_count > 1 and loops > 1 and tc >= loop_end:
             sm = p.masks[p.loop_start_index]; tc = eff(p.loop_start_index, slot) + 1
             ei = p.loop_start_index + 1; loops -= 1
+            llt = eff(p.loop_start_index, slot); _lane_reset(lanes)
         elif tc >= final:
             nxt_idx = spi + 1
             if nxt_idx < N:
@@ -467,11 +470,13 @@ def streaming_scan_play(program, n_ticks: int, *, bank_size: int, refill_delay: 
                     slot = list(nxt); spi = nxt_idx
                     final = eff(n - 1, slot); loop_end = eff_le(slot); loops = p.loop_count
                     sm, tc, ei = (p.masks[0], 1, 1) if eff(0, slot) == 0 else (0, 0, 0)
+                    llt = 0; _lane_reset(lanes)
             elif p.repeat_forever:
                 preload()
                 slot = list(points[0]); spi = 0
                 final = eff(n - 1, slot); loop_end = eff_le(slot); loops = p.loop_count
                 sm, tc, ei = (p.masks[0], 1, 1) if eff(0, slot) == 0 else (0, 0, 0)
+                llt = 0; _lane_reset(lanes)
             else:
                 running = False; sm = 0
         else:
