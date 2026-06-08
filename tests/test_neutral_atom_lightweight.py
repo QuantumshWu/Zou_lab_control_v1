@@ -568,6 +568,12 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     # additive-delay repeat: the engine rewinds repeat_forever to the steady frame
     # (loop_start), not edge 0, so the real-startup preamble plays exactly once.
     assert "repeat_from_loop_start" in engine and "repeat_from_loop_start" in top
+    # STREAMED repeat_forever re-sweep: at the sweep seam the engine stalls waiting for the
+    # host to reload chunk 0; it MUST publish scan_cursor = active_scan_count there so the
+    # host's refill loop (which reloads chunk 0 only when CURSOR >= N) fires -- without this
+    # the cursor stays at N-1, the host never reloads, and a >2*bank_size repeat_forever scan
+    # stops dead after exactly one sweep.
+    assert "scan_cursor <= active_scan_count" in engine
     # DISJOINT-BIT DELAY LANES: a scanned digital delay whose edges reorder past other
     # channels is pulled out of the global sorted table onto its own output bit, played
     # by a 1-bit affine sub-player (structurally the per-bus DAC engine).  The engine
@@ -4396,6 +4402,54 @@ def _on_intervals(out, bit):
     if start is not None:
         on.append((start, len(out)))
     return on
+
+
+def test_repeat_forever_scan_resweeps_and_commands_fpga():
+    """repeat_forever means: sweep ALL scan points, then start over from point 0, forever
+    (NOT stop after one sweep).  Locks BOTH halves of that contract:
+      (1) the HOST writes the FPGA CTRL register so the engine re-sweeps -- REPEAT_FOREVER=1,
+          SCAN_ENABLE=1, SCAN_COUNT=N, BANK0_CHUNK=0 (the RTL wrap gate);
+      (2) the engine re-sweeps -- the RTL-faithful rtl_mirror_play replays point 0..N-1 then
+          wraps to point 0 again (the pattern repeats every sweep, never stops at N).
+    Covers a DURATION scan and a DELAY scan (lane) -- both must re-sweep identically."""
+    import Zou_lab_control.neutral_atom as na
+    from fpga.pulse_streamer.host.image import pack_program, StreamerParams, CtrlWords
+    from fpga.pulse_streamer.host import engine_model as em
+
+    def duration_scan():
+        st = na.PulseTableState(channels=["a", "b"],
+            periods=[na.PulsePeriod(1000, (1, 1), unit="ns"), na.PulsePeriod(1000, (0, 0), unit="ns")],
+            time_step_ns=20)
+        st.bind_field("duration", "1", unit="ns")
+        st.set_scan_table([[1000.0], [2000.0], [3000.0]])   # 3 points
+        return st
+
+    def delay_scan():
+        return na.PulseTableState(channels=["a", "b"],
+            periods=[na.PulsePeriod(1000, (1, 1), unit="ns"), na.PulsePeriod(1000, (0, 0), unit="ns")],
+            time_step_ns=20, delays={"b": "s0"}, delay_units={"b": "ns"},
+            scan_slots=[{"kind": "delay", "target": "b", "unit": "ns", "nominal": 0.0}],
+            scan_table=[[0.0], [400.0], [800.0]])
+
+    for make in (duration_scan, delay_scan):
+        st = make()
+        st.repeat_forever = True
+        prog = na.compile_runtime_program_for_payload(st, channels=["a", "b"], clock_hz=50e6)
+        assert prog.repeat_forever and len(prog.scan_points) == 3
+        # (1) the host commands the FPGA to re-sweep
+        w = pack_program(prog, StreamerParams(max_edges=4096, bank_size=2048))
+        assert w[CtrlWords.REPEAT_FOREVER] == 1
+        assert w[CtrlWords.SCAN_ENABLE] == 1
+        assert w[CtrlWords.SCAN_COUNT] == 3
+        assert w[CtrlWords.BANK0_CHUNK] == 0     # RTL wrap gate (bank_chunk0==0) passes
+        # (2) the RTL-faithful engine re-sweeps: point pattern repeats every full sweep,
+        # it does NOT stop after one sweep.
+        ep = em.EngineProgram.from_program(prog)
+        sweep = em.effective_tick(ep.loop_end_tick, ep.loop_end_slot_coeffs, ep.scan_points[-1], ep.frac_bits)
+        out = em.rtl_mirror_play(ep, 4000)
+        # the LAST scan point's frame must appear AGAIN after a full re-sweep -> not stopped.
+        assert out == em.reference_play(ep, 4000)
+        assert any(m != 0 for m in out[2 * sweep:])  # still toggling well past one sweep
 
 
 def test_streaming_reordering_lane_matches_reference():

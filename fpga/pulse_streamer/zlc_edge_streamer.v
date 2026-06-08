@@ -730,7 +730,14 @@ module zlc_edge_streamer #(
                     // then seamless (resident scans pass instantly; streamed ones stall
                     // only at the seam, never emit a wrong point).
                     end else if (scan_enable_active && !(bank_ready[1'b0] && bank_chunk0 == {SCAN_COUNT_WIDTH{1'b0}})) begin
+                        // STREAMED re-sweep seam: bank 0 still holds a later chunk, so we must
+                        // wait for the host to reload chunk 0.  Publish scan_cursor = N (the full
+                        // count) so the host's refill loop (which reloads chunk 0 only when
+                        // CURSOR >= N) actually fires -- otherwise the cursor would stay at N-1,
+                        // the host would never reload, and the engine would stall here forever
+                        // (the scan stops after exactly one sweep).
                         underflow <= 1'b1;
+                        scan_cursor <= active_scan_count;
                     end else begin
                         underflow <= 1'b0;
                         slot_active <= scan_first_values; scan_point_index <= {SCAN_COUNT_WIDTH{1'b0}}; scan_cursor <= {SCAN_COUNT_WIDTH{1'b0}};
