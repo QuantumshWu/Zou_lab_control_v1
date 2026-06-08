@@ -531,91 +531,34 @@ def compile_pulse_table_scan_runtime_program(
         )
         bus_members = [channel for members in state.bus_channels().values() for channel in members]
 
-    # GLOBAL SHIFT G is computed over ALL non-bus channels (main + would-be lanes) so a
-    # NEGATIVE scanned delay re-translates the whole frame uniformly.  G is ONE compile-time
-    # constant (the affine min over points is reached at an extreme point), so it never varies
-    # from one scan point to the next -- a uniform offset, not a per-point frame change.
-    global_shift = _pulse_table_affine_global_shift(
-        state, scan_points=points_ticks, slot_vars=slot_vars, time_step_ns=clock_step_ns,
-        coeff_frac_bits=coeff_frac_bits, exclude_channels=bus_members,
-    )
-    # FRAME END = the period STRUCTURE end (affine in scanned DURATIONS) + a CONSTANT headroom
-    # that holds the latest delayed edge across ALL scan points.  A channel DELAY (spec 4.2) is
-    # pure additive: a delayed pulse appears LATER, never wrapped to the frame start, and never
-    # changes another channel's period.  The headroom is the SAME constant at every scan point,
-    # so the period does NOT breathe as the delay sweeps (the user-reported bug was an affine,
-    # per-point frame end), yet the frame automatically grows to hold a delay of ANY length.
-    # ALL digital channels (main + lane) are included so the headroom is big enough; only
-    # analog-bus members are excluded.
-    frame_end = _pulse_table_affine_frame_end(
-        state, scan_points=points_ticks, slot_vars=slot_vars, time_step_ns=clock_step_ns,
-        coeff_frac_bits=coeff_frac_bits, exclude_channels=bus_members, global_shift=global_shift,
-    )
+    # PHYSICAL CHANNEL DELAY: a delay is NOT scanned and NOT baked into the edges -- it is a
+    # CONSTANT per-channel OUTPUT delay (a delay line; see engine_model.delay_line_reference).
+    # Compute it over the TTL (non-bus) channels, folding the negative-delay global shift
+    # G = max(0, -min delay) into every channel's delay (a causal delay line cannot lead, so
+    # shifting all of them by G keeps relative timing while every delay stays >= 0).  The edge
+    # table is emitted UNDELAYED and the loop period is the plain (affine-in-duration) frame,
+    # so a delay of ANY length never disturbs another channel and never changes the period.
+    hardware_bits = {ch: index for index, ch in enumerate(channel_names(channels, "channels"))}
+    raw_delay = {
+        ch: state.delay_steps(ch, slots=state.reference_slots(), time_step_ns=clock_step_ns)
+        for ch in state.channels if ch not in bus_members and ch in hardware_bits
+    }
+    global_shift = max(0, -min(raw_delay.values())) if raw_delay else 0
+    channel_delays = {
+        hardware_bits[ch]: raw_delay[ch] + global_shift
+        for ch in raw_delay if (raw_delay[ch] + global_shift) != 0
+    }
+    delay_lanes = None
 
-    # Every channel with a SCANNED delay rides its own DISJOINT-bit delay lane (a 1-bit
-    # affine sub-player), and is excluded from the main global edge table.  This is not an
-    # optimisation choice but a CORRECTNESS one: a scanned-delay edge sweeps through tick
-    # values and, after the global shift G, the minimum edge lands on tick 0 at the extreme
-    # scan point -- which would collide with the table's mandatory tick-0 seed anchor, and
-    # the single-edge-per-tick prefetch engine would slip that edge by one tick anyway.  A
-    # lane plays at its exact effective tick every scan point (its own sub-player reseeds to
-    # lane-tick 0, no FIFO, no anchor), so a scanned delay of ANY form -- reordering past
-    # other channels, crossing the (unrolled) bracket, negative (shared G), or frame-
-    # extending (shared frame_end) -- is exact.  The main table then carries only constant/
-    # zero-delay and non-delayed channels, whose period-0 edges share the anchor's zero-
-    # coeff expression and merge cleanly.
-    # A reorder can ALSO arise without a scanned delay: a scanned DURATION moves a
-    # CONSTANT-delay channel's edges past another channel's as it sweeps.  Such a channel
-    # is not pre-laned (its delay is not scanned), so after laning the scanned-delay
-    # channels we GREEDILY lane the constant-delay channels too, one at a time, until the
-    # main global table is monotone at every scan point.  Laning any one removes its
-    # reordering edge from the global stream; in the worst case every nonzero-delay channel
-    # is laned and the main table holds only zero-delay channels (edges at monotone period
-    # boundaries -- never reorder).  So a reorder of ANY origin is handled, bounded only by
-    # NUM_LANES (a clear validate error) and per-channel monotonicity.
-    def _has_any_delay(ch: str) -> bool:
-        base, coeffs = _affine_expr(
-            state.delays.get(ch, 0.0), state.delay_units.get(ch, "ns"),
-            slot_vars, clock_step_ns, coeff_frac_bits)
-        return int(base) != 0 or any(int(c) for c in coeffs)
-
-    forced: list[str] = []
-    constant_delay_candidates = [
-        ch for ch in state.channels
-        if ch not in bus_members and ch in channels and _has_any_delay(ch)
-    ]
-    while True:
-        lane_channels, delay_lanes = _pulse_table_delay_lanes(
-            state,
-            channels=channels,
-            scan_points=points_ticks,
-            slot_vars=slot_vars,
-            time_step_ns=clock_step_ns,
-            coeff_frac_bits=coeff_frac_bits,
-            exclude_channels=bus_members,
-            global_shift=global_shift,
-            frame_end=frame_end,
-            include_channels=forced,
-        )
-        try:
-            rows = _pulse_table_affine_rows(
-                state,
-                channels=channels,
-                scan_points=points_ticks,
-                slot_vars=slot_vars,
-                time_step_ns=clock_step_ns,
-                coeff_frac_bits=coeff_frac_bits,
-                exclude_channels=list(bus_members) + lane_channels,
-                global_shift=global_shift,
-                frame_end=frame_end,
-            )
-            break
-        except ValueError:
-            nxt = next((ch for ch in constant_delay_candidates
-                        if ch not in lane_channels and ch not in forced), None)
-            if nxt is None:
-                raise   # no nonzero-delay channel left to offload -> a genuine non-laneable reorder
-            forced.append(nxt)
+    rows = _pulse_table_affine_rows(
+        state,
+        channels=channels,
+        scan_points=points_ticks,
+        slot_vars=slot_vars,
+        time_step_ns=clock_step_ns,
+        coeff_frac_bits=coeff_frac_bits,
+        exclude_channels=bus_members,
+    )
     ticks = [row[0] for row in rows]
     masks = [row[1] for row in rows]
     tick_slot_coeffs = [list(row[2]) for row in rows]
@@ -652,8 +595,10 @@ def compile_pulse_table_scan_runtime_program(
         "scan_coeff_frac_bits": coeff_frac_bits,
         "bus_names": bus_names,
         "bus_segments": [segment.to_dict() for segment in bus_segments],
-        "delay_lanes": [lane.to_dict() for lane in delay_lanes],
+        "delay_lanes": [lane.to_dict() for lane in (delay_lanes or [])],
+        "channel_delays": [int(channel_delays.get(bit, 0)) for bit in range(len(channels))],
     }
+    channel_delays_list = [int(channel_delays.get(bit, 0)) for bit in range(len(channels))] if channel_delays else None
     sequence_id = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
     return RuntimeSequenceProgram(
         sequence_id=sequence_id,
@@ -680,6 +625,7 @@ def compile_pulse_table_scan_runtime_program(
         bus_names=bus_names or None,
         bus_segments=bus_segments or None,
         delay_lanes=delay_lanes or None,
+        channel_delays=channel_delays_list,
     )
 
 
@@ -1575,85 +1521,45 @@ def _pulse_table_affine_rows(
     time_step_ns: float,
     coeff_frac_bits: int,
     exclude_channels: Sequence[str] = (),
-    global_shift: int | None = None,
-    frame_end: tuple[int, tuple[int, ...]] | None = None,
 ) -> list[tuple[int, int, tuple[int, ...]]]:
-    """Return one affine edge row ``(base_tick, mask, slot_coeffs)`` per edge.
+    """Return one affine edge row ``(base_tick, mask, slot_coeffs)`` per edge -- the
+    UNDELAYED template.
 
-    Every channel's rise/fall edge is ``period_start +/- delay`` evaluated
-    affinely in the bound scan slots.  Delays compose additively with period
-    durations, so a bound delay and a bound duration on the same edge sum their
-    coefficients.  ``_stable_affine_groups`` validates PER-CHANNEL edge ordering and
-    non-negativity at *every* scan point.  NOTE: the FINAL engine is a single GLOBAL
-    edge-table player, so the merged edge list must ALSO stay globally tick-monotone
-    at every scan point; ``validate_pulse_streamer_program`` enforces that (a scan
-    that reorders the merged edges across channels is rejected, not silently dropped).
-
-    ``global_shift`` (G) is the additive frame re-translation for negative scanned
-    delays.  Pass it explicitly when delay LANES are also in play so the main table and
-    the lanes share ONE G (their frame ticks must align); ``None`` computes G from these
-    rows' own edges (the no-lane path).  ``frame_end`` (ALREADY shifted by G) forces the
-    final-row tick so the frame EXTENDS to cover lane edges that push past these rows'
-    own latest edge (the large/frame-extending scanned-delay-on-a-lane case).
-    """
+    Every channel's rise/fall edge is a period boundary ``period_start`` evaluated affinely
+    in the bound scan slots (the scanned DURATIONS).  Channel DELAYS are NOT applied here:
+    a delay is a per-channel OUTPUT delay (``channel_delays``, a delay line), never baked
+    into the edges.  Because every edge sits on a monotone period boundary, the merged edge
+    list is globally tick-monotone at every scan point automatically -- no channel reorders,
+    so no global shift G and no delay lane are needed.  ``_stable_affine_groups`` still
+    validates per-channel + cross-channel ordering at every scan point as a safety net."""
 
     hardware_channels = list(channel_names(channels, "channels"))
     exclude = set(exclude_channels)
     starts = _pulse_table_affine_period_starts(state, slot_vars=slot_vars, time_step_ns=time_step_ns, coeff_frac_bits=coeff_frac_bits)
     events: list[tuple[tuple[int, tuple[int, ...]], str | None, int | None]] = []
-    final_expr = starts[-1]
 
     for channel_index, channel in enumerate(state.channels):
         if channel in exclude:
             continue  # analog-bus members are driven by the bus engine, not TTL edges
-        delay = _affine_expr(state.delays.get(channel, 0.0), state.delay_units.get(channel, "ns"), slot_vars, time_step_ns, coeff_frac_bits)
         active_start: tuple[int, tuple[int, ...]] | None = None
         for period_index, period in enumerate(state.periods):
             value = int(period.states[channel_index])
             if value and active_start is None:
                 active_start = starts[period_index]
             elif not value and active_start is not None:
-                events.append((_affine_add(active_start, delay), channel, 1))
-                events.append((_affine_add(starts[period_index], delay), channel, 0))
-                final_expr = _affine_max_reference(final_expr, _affine_add(starts[period_index], delay), scan_points, coeff_frac_bits)
+                events.append((active_start, channel, 1))
+                events.append((starts[period_index], channel, 0))
                 active_start = None
         if active_start is not None:
-            events.append((_affine_add(active_start, delay), channel, 1))
-            events.append((_affine_add(starts[-1], delay), channel, 0))
-            final_expr = _affine_max_reference(final_expr, _affine_add(starts[-1], delay), scan_points, coeff_frac_bits)
+            events.append((active_start, channel, 1))
+            events.append((starts[-1], channel, 0))
 
     if state.repeat_start is not None and state.repeat_end is not None and state.repeat_count > 1:
         events.append((starts[int(state.repeat_start)], None, None))
 
-    # GLOBAL SHIFT G (negative scanned delay): G = max(0, -(min effective edge tick over
-    # ALL channels AND all scan points)) -- the affine min over the scan points is at an
-    # extreme point, so G is a single compile-time constant.  Adding G to every edge BASE
-    # re-translates the WHOLE frame so the earliest event is >= 0 at every scan point; a
-    # uniform base offset never reorders anything and the edges stay affine.  Mirrors the
-    # additive-G logic in _pulse_table_edge_table.
-    if global_shift is None:
-        shift = max(0, -_affine_min_over_points([expr for expr, _c, _v in events] + [final_expr], scan_points, coeff_frac_bits))
-    else:
-        shift = int(global_shift)
-    if shift:
-        g_expr = (shift, tuple(0 for _ in slot_vars))
-        events = [(_affine_add(expr, g_expr), channel, value) for expr, channel, value in events]
-        final_expr = _affine_add(final_expr, g_expr)
-    # The final (all-off) marker uses the EXTENDED, already-shifted frame end when one is
-    # supplied (covers lane edges past these rows' own latest edge); else this table's own
-    # shifted final.  If that frame end COINCIDES with a real edge at the reference point
-    # (e.g. a lane delay is 0 at the reference, so the frame does not extend there) it would
-    # produce two rows at the same tick -- bump it one tick later (a single harmless idle
-    # tick at the frame end) so the table stays strictly increasing; it still extends to fit
-    # the lane edges at the other scan points.
-    final_marker = frame_end if frame_end is not None else final_expr
-    ref_point = scan_points[0] if scan_points else ()
-    marker_ref = _apply_affine_ticks(final_marker[0], final_marker[1], ref_point, coeff_frac_bits)
-    real_edge_refs = {_apply_affine_ticks(expr[0], expr[1], ref_point, coeff_frac_bits)
-                      for expr, channel, _v in events if channel is not None}
-    if marker_ref in real_edge_refs:
-        final_marker = (final_marker[0] + 1, final_marker[1])
-    events.append((final_marker, None, None))
+    # Final all-off marker at the nominal frame end (a channel ON through the last period has
+    # its fall at the SAME expr, so they group into one all-off row -- no bump needed).
+    events.append((starts[-1], None, None))
 
     grouped = _stable_affine_groups(events, scan_points=scan_points, coeff_frac_bits=coeff_frac_bits)
     current_mask = 0

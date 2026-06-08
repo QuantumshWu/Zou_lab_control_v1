@@ -4191,61 +4191,6 @@ def test_physical_delay_phase_offset_equals_delay_line_any_length():
             assert all(not ((rtl[t] >> bit) & 1) for t in range(min(d, n))), "delayed channel not silent during startup"
 
 
-def _lane_on_intervals(out, bit):
-    on, start = [], None
-    for i, mask in enumerate(out):
-        b = (int(mask) >> bit) & 1
-        if b and start is None:
-            start = i
-        elif not b and start is not None:
-            on.append((start, i)); start = None
-    if start is not None:
-        on.append((start, len(out)))
-    return on
-
-
-def test_pulse_table_reordering_scan_delay_uses_disjoint_lane():
-    """A SCANNED digital delay that sweeps a channel's edges PAST another channel's --
-    the reordering case the single global sorted edge table CANNOT play -- compiles to a
-    disjoint-bit delay LANE: the channel rides its own output bit (additively shifted per
-    scan point) while the others stay in the main table, so nothing reorders.  Proven by
-    all three engine models (combinatorial reference, FIFO, exact RTL mirror) agreeing."""
-    import Zou_lab_control.neutral_atom as na
-    from fpga.pulse_streamer.host import engine_model as em
-    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import validate_pulse_streamer_program
-
-    st = na.PulseTableState(
-        channels=["A", "B"],
-        periods=[na.PulsePeriod(1000, (1, 1), unit="ns"), na.PulsePeriod(1000, (0, 0), unit="ns")],
-        time_step_ns=20, delays={"B": "s0"}, delay_units={"B": "ns"},
-        scan_slots=[{"kind": "delay", "target": "B", "unit": "ns", "nominal": 0.0}],
-        scan_table=[[0.0], [600.0]],   # B delay 0, then 30 ticks -> B's edges cross A's
-    )
-    prog = na.compile_pulse_table_scan_runtime_program(st, channels=["A", "B"], clock_hz=50e6, repeat_forever=False)
-    # the lane RTL is built now, so the program must VALIDATE (the safety gate is gone):
-    # the lane channel bit is disjoint, edge count fits, and the per-point effective
-    # ticks are in-frame + strictly increasing.
-    validate_pulse_streamer_program(prog, channel_count=62)
-    assert prog.delay_lanes and len(prog.delay_lanes) == 1
-    lane = prog.delay_lanes[0]
-    assert lane.channel == "B" and lane.channel_bit == 1
-    assert lane.values == [1, 0]                        # rise then fall
-    assert all(any(c) for c in lane.coeffs)            # both edges affine in the scanned delay
-    # B is pulled OUT of the main sorted table (its bit never appears in the main masks);
-    # A stays in the main table.
-    assert all(not ((m >> 1) & 1) for m in prog.masks)
-    assert any((m >> 0) & 1 for m in prog.masks)
-
-    ep = em.EngineProgram.from_program(prog)
-    r = em.reference_play(ep, 200)
-    assert em.prefetch_play(ep, 200) == r
-    assert em.rtl_mirror_play(ep, 200) == r
-    # A: fixed at [0,50) every frame; B: point0 delay 0 -> [0,50), point1 delay 30 ticks
-    # -> [30,80) shifted into the second frame = [130,180).  The reordering is correct.
-    assert _lane_on_intervals(r, 0) == [(0, 50), (100, 150)]
-    assert _lane_on_intervals(r, 1) == [(0, 50), (130, 180)]
-
-
 def _rtl_lane_realization_play(ep, n_ticks):
     """Re-implement the EXACT register transfers of the zlc_edge_streamer.v lane player
     (lane_time/lane_idx/lane_bit, the bounded reinit fast-forward, the single-edge
@@ -4427,19 +4372,6 @@ def test_rtl_lane_player_realization_matches_reference():
         assert _rtl_lane_realization_play(prog, 500) == em.reference_play(prog, 500), (mts, lanes)
 
 
-def _on_intervals(out, bit):
-    on, start = [], None
-    for i, mask in enumerate(out):
-        b = (int(mask) >> bit) & 1
-        if b and start is None:
-            start = i
-        elif not b and start is not None:
-            on.append((start, i)); start = None
-    if start is not None:
-        on.append((start, len(out)))
-    return on
-
-
 def test_repeat_forever_scan_resweeps_and_commands_fpga():
     """repeat_forever means: sweep ALL scan points, then start over from point 0, forever
     (NOT stop after one sweep).  Locks BOTH halves of that contract:
@@ -4486,93 +4418,6 @@ def test_repeat_forever_scan_resweeps_and_commands_fpga():
         # the LAST scan point's frame must appear AGAIN after a full re-sweep -> not stopped.
         assert out == em.reference_play(ep, 4000)
         assert any(m != 0 for m in out[2 * sweep:])  # still toggling well past one sweep
-
-
-def test_streaming_reordering_lane_matches_reference():
-    """A reordering-delay lane combined with the 2-bank ping-pong scan STREAMING (the
-    >2*bank_size points path): the lane reseeds at every scan-advance independently of
-    the bank swap, so the streamed output equals reference_play tick-for-tick.  Proves
-    the lane and the unbounded-scan streaming are orthogonal (both finite + repeat)."""
-    import Zou_lab_control.neutral_atom as na
-    from fpga.pulse_streamer.host import engine_model as em
-
-    st = na.PulseTableState(
-        channels=["A", "B"],
-        periods=[na.PulsePeriod(1000, (1, 1), unit="ns"), na.PulsePeriod(1000, (0, 0), unit="ns")],
-        time_step_ns=20, delays={"B": "s0"}, delay_units={"B": "ns"},
-        scan_slots=[{"kind": "delay", "target": "B", "unit": "ns", "nominal": 0.0}],
-        scan_table=[[0.0], [600.0], [200.0], [600.0], [0.0], [400.0]])  # 6 pts -> 3 banks of 2
-    for rf in (False, True):
-        p = na.compile_pulse_table_scan_runtime_program(st, channels=["A", "B"], clock_hz=50e6, repeat_forever=rf)
-        assert p.delay_lanes
-        ep = em.EngineProgram.from_program(p)
-        out, stalled, _ = em.streaming_scan_play(ep, 800, bank_size=2, refill_delay=1)
-        assert not stalled
-        assert out == em.reference_play(ep, 800)
-
-
-def test_reordering_lane_corner_cases_end_to_end():
-    """Adversarial corner cases for the reordering-delay lane, each compiled from the
-    real GUI state -> validated -> played by all three cycle models:
-      (a) repeat_forever loops the whole scan, period-preserving;
-      (b) TWO channels with reordering delays -> two disjoint lanes at once;
-      (c) a DAC-value scan (bus value_select) AND a reordering digital delay together
-          -> a bus segment and a lane coexist without disturbing each other.
-    The combination the single sorted edge table cannot play now runs on hardware."""
-    import Zou_lab_control.neutral_atom as na
-    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import validate_pulse_streamer_program
-    from fpga.pulse_streamer.host import engine_model as em
-
-    def agree(prog, n):
-        ep = em.EngineProgram.from_program(prog)
-        r = em.reference_play(ep, n)
-        assert em.prefetch_play(ep, n) == r and em.rtl_mirror_play(ep, n) == r
-        return r
-
-    # (a) repeat_forever: the 2-point scan loops; B's 30-tick delay at the odd points
-    # rides its lane, the whole frame preserved (period 100).
-    sta = na.PulseTableState(
-        channels=["A", "B"],
-        periods=[na.PulsePeriod(1000, (1, 1), unit="ns"), na.PulsePeriod(1000, (0, 0), unit="ns")],
-        time_step_ns=20, delays={"B": "s0"}, delay_units={"B": "ns"},
-        scan_slots=[{"kind": "delay", "target": "B", "unit": "ns", "nominal": 0.0}],
-        scan_table=[[0.0], [600.0]])
-    pa = na.compile_pulse_table_scan_runtime_program(sta, channels=["A", "B"], clock_hz=50e6, repeat_forever=True)
-    validate_pulse_streamer_program(pa, channel_count=62)
-    ra = agree(pa, 420)
-    assert _on_intervals(ra, 1)[:4] == [(0, 50), (130, 180), (200, 250), (330, 380)]
-
-    # (b) two simultaneous reordering lanes (B on s0, C on s1), independent bits.
-    stb = na.PulseTableState(
-        channels=["A", "B", "C"],
-        periods=[na.PulsePeriod(1000, (1, 1, 1), unit="ns"), na.PulsePeriod(1000, (0, 0, 0), unit="ns")],
-        time_step_ns=20, delays={"B": "s0", "C": "s1"}, delay_units={"B": "ns", "C": "ns"},
-        scan_slots=[{"kind": "delay", "target": "B", "unit": "ns", "nominal": 0.0},
-                    {"kind": "delay", "target": "C", "unit": "ns", "nominal": 0.0}],
-        scan_table=[[0.0, 0.0], [600.0, 700.0]])
-    pb = na.compile_pulse_table_scan_runtime_program(stb, channels=["A", "B", "C"], clock_hz=50e6, repeat_forever=False)
-    validate_pulse_streamer_program(pb, channel_count=62)
-    assert sorted(l.channel for l in pb.delay_lanes) == ["B", "C"]
-    rb = agree(pb, 200)
-    assert _on_intervals(rb, 1) == [(0, 50), (130, 180)]   # B delay 30
-    assert _on_intervals(rb, 2) == [(0, 50), (135, 185)]   # C delay 35
-
-    # (c) DAC value scan (bus) + reordering digital delay (lane) at once.
-    stc = na.PulseTableState(
-        channels=["ch00", "ch01", "ch02", "ch03"],
-        channel_labels={"ch00": "da[0]", "ch01": "da[1]", "ch02": "cool", "ch03": "trap"},
-        time_step_ns=20,
-        periods=[na.PulsePeriod(1000, (0, 0, 1, 1), unit="ns"), na.PulsePeriod(1000, (0, 0, 0, 0), unit="ns")])
-    stc.bind_field("dac", "da@1", unit="value", label="da")        # s0 DAC value scan
-    stc.bind_field("delay", "ch03", unit="ns", label="trap dly")   # s1 reordering delay
-    stc.set_scan_table([[1.0, 0.0], [3.0, 600.0]])
-    pc = na.compile_pulse_table_scan_runtime_program(stc, channels=["ch00", "ch01", "ch02", "ch03"], clock_hz=50e6, repeat_forever=False)
-    validate_pulse_streamer_program(pc, channel_count=62)
-    assert [l.channel for l in pc.delay_lanes] == ["ch03"]
-    assert 1 in {int(getattr(s, "value_select", 0)) for s in pc.bus_segments}   # DAC value rides slot 1
-    rc = agree(pc, 200)
-    assert _on_intervals(rc, 2) == [(0, 50), (100, 150)]   # cool fixed
-    assert _on_intervals(rc, 3) == [(0, 50), (130, 180)]   # trap reorders past cool
 
 
 # ===========================================================================
@@ -4641,207 +4486,6 @@ def test_constant_delay_crosses_inner_bracket_boundary_is_supported():
     assert r == truth
 
 
-def test_scanned_delay_with_inner_bracket_noncrossing_and_crossing():
-    """A SCANNED delay with an inner repeat bracket, both non-crossing (small) and
-    crossing the (former) bracket boundary (large) -- supported via unroll, tick-exact."""
-    import Zou_lab_control.neutral_atom as na
-
-    def make(table):
-        return na.PulseTableState(
-            channels=["A", "B"],
-            periods=[
-                na.PulsePeriod(1000, (0, 0), unit="ns"),
-                na.PulsePeriod(1000, (1, 0), unit="ns"),   # A ON inside the bracket
-                na.PulsePeriod(1000, (0, 0), unit="ns"),
-                na.PulsePeriod(1000, (0, 1), unit="ns"),   # B ON after the bracket
-            ],
-            time_step_ns=20, repeat_start=1, repeat_end=2, repeat_count=2,
-            delays={"A": "s0"}, delay_units={"A": "ns"},
-            scan_slots=[{"kind": "delay", "target": "A", "unit": "ns", "nominal": 0.0}],
-            scan_table=table)
-    for rf in (False, True):
-        _assert_scan_matches_oracle(make([[0.0], [200.0]]), channels=["A", "B"], clock_hz=50e6, repeat_forever=rf, n_ticks=1400)
-        # crossing the former boundary: A's pulse shifts out of the bracketed region
-        _assert_scan_matches_oracle(make([[0.0], [2000.0]]), channels=["A", "B"], clock_hz=50e6, repeat_forever=rf, n_ticks=1400)
-
-
-def test_reordering_scanned_delay_with_inner_bracket():
-    """A reordering scanned delay (sweeps one channel's edges past another's) WITH an
-    inner bracket: unrolled flat, the reordering channel rides a disjoint lane, tick-exact
-    vs the oracle and all models.  A trailing guard period keeps the delayed pulse inside
-    the (period-preserving) frame -- a scanned delay shifts only its own channel and never
-    lengthens the others' period, so loop_end stays delay-free."""
-    import Zou_lab_control.neutral_atom as na
-
-    st = na.PulseTableState(
-        channels=["A", "B"],
-        periods=[
-            na.PulsePeriod(1000, (1, 1), unit="ns"),   # both ON
-            na.PulsePeriod(1000, (0, 0), unit="ns"),
-            na.PulsePeriod(1000, (1, 1), unit="ns"),
-            na.PulsePeriod(1000, (0, 0), unit="ns"),   # trailing guard: a delayed B stays in-frame
-        ],
-        time_step_ns=20, repeat_start=0, repeat_end=1, repeat_count=2,
-        delays={"B": "s0"}, delay_units={"B": "ns"},
-        scan_slots=[{"kind": "delay", "target": "B", "unit": "ns", "nominal": 0.0}],
-        scan_table=[[0.0], [600.0]])   # B reorders past A, staying inside the guarded frame
-    for rf in (False, True):
-        prog = _assert_scan_matches_oracle(st, channels=["A", "B"], clock_hz=50e6, repeat_forever=rf, n_ticks=1600, want_lane=True)
-        assert [l.channel for l in prog.delay_lanes] == ["B"]
-        assert not any(prog.loop_end_slot_coeffs)            # PERIOD-PRESERVING: delay never extends the frame
-        assert not any(any(c) for c in prog.tick_slot_coeffs)  # A (main table) is identical at every scan point
-
-
-def test_negative_scanned_delay_with_and_without_bracket():
-    """A NEGATIVE scanned delay re-translates the whole frame by the global shift G so no
-    runtime tick is ever negative -- proven both without and with an inner bracket."""
-    import Zou_lab_control.neutral_atom as na
-
-    no_bracket = na.PulseTableState(
-        channels=["A", "B"],
-        periods=[na.PulsePeriod(2000, (0, 1), unit="ns"), na.PulsePeriod(2000, (1, 1), unit="ns"), na.PulsePeriod(2000, (0, 0), unit="ns")],
-        time_step_ns=20, delays={"A": "s0"}, delay_units={"A": "ns"},
-        scan_slots=[{"kind": "delay", "target": "A", "unit": "ns", "nominal": 0.0}],
-        scan_table=[[0.0], [-400.0]])
-    with_bracket = na.PulseTableState(
-        channels=["A", "B"],
-        periods=[na.PulsePeriod(2000, (0, 1), unit="ns"), na.PulsePeriod(2000, (1, 1), unit="ns"), na.PulsePeriod(2000, (0, 0), unit="ns")],
-        time_step_ns=20, repeat_start=1, repeat_end=1, repeat_count=2,
-        delays={"A": "s0"}, delay_units={"A": "ns"},
-        scan_slots=[{"kind": "delay", "target": "A", "unit": "ns", "nominal": 0.0}],
-        scan_table=[[0.0], [-400.0]])
-    for rf in (False, True):
-        p1 = _assert_scan_matches_oracle(no_bracket, channels=["A", "B"], clock_hz=50e6, repeat_forever=rf, n_ticks=900)
-        assert all(t >= 0 for t in p1.ticks)
-        p2 = _assert_scan_matches_oracle(with_bracket, channels=["A", "B"], clock_hz=50e6, repeat_forever=rf, n_ticks=1400)
-        assert all(t >= 0 for t in p2.ticks)
-
-
-def test_large_scanned_delay_auto_extends_period_preserving():
-    """A scanned delay of ANY length is PURE ADDITIVE (spec 4.2): the delayed pulse appears
-    LATER (at period_start + delay), NEVER wrapped to the frame start, and delaying one
-    channel never changes another channel's period.  The frame auto-extends by a CONSTANT
-    headroom -- the SAME for every scan point -- so a delay that pushes the pulse past the
-    nominal period just compiles (no reject), the period does NOT breathe as the delay sweeps
-    (loop_end_slot_coeffs all zero), and every non-delayed channel is byte-identical at every
-    scan point.  Both for a lone channel and a reordering pair, finite and repeat_forever."""
-    import Zou_lab_control.neutral_atom as na
-    from fpga.pulse_streamer.host import engine_model as em
-
-    # B's short pulse is at the very START; its delay sweeps from 0 to a FULL period (2000 ns).
-    # No guard period -- the frame auto-extends to hold the late pulse.
-    st = na.PulseTableState(
-        channels=["A", "B"],
-        periods=[na.PulsePeriod(1000, (1, 1), unit="ns"), na.PulsePeriod(1000, (1, 0), unit="ns")],
-        time_step_ns=20, delays={"B": "s0"}, delay_units={"B": "ns"},
-        scan_slots=[{"kind": "delay", "target": "B", "unit": "ns", "nominal": 0.0}],
-        scan_table=[[0.0], [1000.0], [2000.0]])   # 0, half, FULL nominal period -- no reject
-    for rf in (False, True):
-        prog = _assert_scan_matches_oracle(st, channels=["A", "B"], clock_hz=50e6, repeat_forever=rf, n_ticks=1200, want_lane=True)
-        assert [l.channel for l in prog.delay_lanes] == ["B"]
-        assert not any(prog.loop_end_slot_coeffs)              # PERIOD does not breathe as the delay sweeps
-        assert not any(any(c) for c in prog.tick_slot_coeffs)  # A (main table) identical at every scan point
-        ep = em.EngineProgram.from_program(prog)
-        loops = {em.effective_tick(ep.loop_end_tick, ep.loop_end_slot_coeffs, pt, ep.frac_bits) for pt in ep.scan_points}
-        assert len(loops) == 1                                 # one constant period for all scan points
-    # PURE ADDITIVE, NOT wrapped: at the full-period delay B's pulse is at the END (tick 100),
-    # not back at tick 0.  Play the three scan-point frames of the repeat_forever program.
-    prog = st.compile_scan(clock_hz=50e6, repeat_forever=True)
-    ep = em.EngineProgram.from_program(prog)
-    period = em.effective_tick(ep.loop_end_tick, ep.loop_end_slot_coeffs, ep.scan_points[0], ep.frac_bits)
-    out = em.reference_play(prog, period * 3)
-    first_on = lambda fr, bit: next((i for i, m in enumerate(fr) if (m >> bit) & 1), None)
-    rises = [first_on(out[k * period:(k + 1) * period], 1) for k in range(3)]
-    assert rises == [0, 50, 100]   # delay 0 / 1000 ns(50 t) / 2000 ns(100 t) -- additive, never wrapped to 0
-
-
-def test_scanned_delay_changes_only_its_own_channel_not_the_whole_pulse():
-    """REGRESSION (user-reported real-hardware bug): a SCANNED delay must shift ONLY its own
-    channel and leave the period and EVERY other channel byte-identical at every scan point.
-
-    The bug: the frame end was made affine in the scanned delay, so as the delay swept the
-    whole frame grew and every channel's pulse moved ('scan 下的大 delay 会把整个 pulse 都
-    改变了，而不是仅仅改变那个 channel 的 delay').  Non-scan delay was correct because its
-    frame is period-preserving.  This plays several scan-point frames and asserts the
-    non-delayed channels' per-tick output is IDENTICAL across points, while the delayed
-    channel shifts by exactly the delay -- the precise behaviour the user demanded."""
-    import Zou_lab_control.neutral_atom as na
-    from fpga.pulse_streamer.host import engine_model as em
-
-    st = na.PulseTableState(
-        channels=["A", "B", "C"],
-        periods=[na.PulsePeriod(100, (1, 0, 1), unit="ns"),   # A, C on
-                 na.PulsePeriod(100, (0, 1, 0), unit="ns"),   # B on
-                 na.PulsePeriod(800, (0, 0, 0), unit="ns")],  # guard absorbs the swept delay
-        time_step_ns=20, delays={"C": "s0"}, delay_units={"C": "ns"},
-        scan_slots=[{"kind": "delay", "target": "C", "unit": "ns", "nominal": 0.0}],
-        scan_table=[[0.0], [100.0], [200.0], [300.0]])
-    prog = st.compile_scan(clock_hz=50e6, repeat_forever=True)
-    ep = em.EngineProgram.from_program(prog)
-    assert not any(ep.loop_end_slot_coeffs)              # period is delay-independent
-    assert not any(any(c) for c in ep.tick_slot_coeffs)  # the main (A,B) table never moves
-
-    period = em.effective_tick(ep.loop_end_tick, ep.loop_end_slot_coeffs, ep.scan_points[0], ep.frac_bits)
-    out = em.reference_play(prog, period * len(ep.scan_points))
-    frames = [out[k * period:(k + 1) * period] for k in range(len(ep.scan_points))]
-    # Mask off C (bit 2): the A/B part of every frame must be byte-identical across points.
-    without_c = lambda frame: [m & ~(1 << 2) for m in frame]
-    for k in range(1, len(frames)):
-        assert without_c(frames[k]) == without_c(frames[0]), f"non-delayed channels moved at scan point {k}"
-    # C (bit 2) rises exactly `delay` ticks into each frame (0, 5, 10, 15 for 0/100/200/300 ns).
-    def first_on(frame, bit):
-        ons = [i for i, m in enumerate(frame) if (m >> bit) & 1]
-        return ons[0] if ons else None
-    assert [first_on(f, 2) for f in frames] == [0, 5, 10, 15]
-
-
-def test_constant_delay_reordered_by_scanned_duration_uses_lane():
-    """A reorder can arise WITHOUT a scanned delay: a scanned DURATION moves a CONSTANT-
-    delay channel's edges past another channel's as it sweeps.  Such a channel is not
-    pre-laned (its delay is not scanned), so the compiler greedily lanes it once the main
-    table reorders -- the global table never holds a reordering edge.  Tick-exact vs the
-    independent oracle and all models, both finite and repeat_forever."""
-    import Zou_lab_control.neutral_atom as na
-
-    # A on period 0 (scanned duration, delay 0 -> its fall = s0); B on period 1 with a
-    # constant NEGATIVE delay (its edges = period-1 start - 300, also moved by s0).  As s0
-    # shrinks, B's rise crosses A's rise (which is pinned at the period-0 start) -> reorder.
-    st = na.PulseTableState(
-        channels=["A", "B"],
-        periods=[na.PulsePeriod("s0", (1, 0), unit="ns"),
-                 na.PulsePeriod(200, (0, 1), unit="ns"),
-                 na.PulsePeriod(200, (0, 0), unit="ns")],
-        time_step_ns=20, delays={"A": 0, "B": -300}, delay_units={"A": "ns", "B": "ns"},
-        scan_slots=[{"kind": "duration", "target": "0", "unit": "ns", "nominal": 400.0}],
-        scan_table=[[400.0], [100.0]])
-    for rf in (False, True):
-        prog = _assert_scan_matches_oracle(st, channels=["A", "B"], clock_hz=50e6, repeat_forever=rf, n_ticks=900, want_lane=True)
-        # the constant-delay channel B is the one pulled onto a lane (A stays in the table)
-        assert [l.channel for l in prog.delay_lanes] == ["B"]
-
-
-def test_multipulse_channel_with_bracket_and_scanned_delay():
-    """A multi-pulse channel (several ON sub-runs) inside an unrolled bracket, with a
-    scanned reordering delay -> the channel's full sub-edge train rides one lane."""
-    import Zou_lab_control.neutral_atom as na
-
-    st = na.PulseTableState(
-        channels=["A", "B"],
-        periods=[
-            na.PulsePeriod(1000, (1, 0), unit="ns"),
-            na.PulsePeriod(1000, (0, 0), unit="ns"),
-            na.PulsePeriod(1000, (1, 0), unit="ns"),
-            na.PulsePeriod(1000, (0, 1), unit="ns"),
-        ],
-        time_step_ns=20, repeat_start=0, repeat_end=1, repeat_count=2,
-        delays={"A": "s0"}, delay_units={"A": "ns"},
-        scan_slots=[{"kind": "delay", "target": "A", "unit": "ns", "nominal": 0.0}],
-        scan_table=[[0.0], [200.0]])
-    for rf in (False, True):
-        prog = _assert_scan_matches_oracle(st, channels=["A", "B"], clock_hz=50e6, repeat_forever=rf, n_ticks=1600, want_lane=True)
-        assert [l.channel for l in prog.delay_lanes] == ["A"]
-
-
 def test_scanned_duration_of_bracketed_period_plus_delay():
     """A scanned DURATION of a period INSIDE the bracket (the value carries via the 'sN'
     expression to every unrolled copy) combined with a constant channel delay."""
@@ -4897,26 +4541,186 @@ def test_scanned_dac_of_bracketed_period_plus_delay():
         assert 3 in set(em.bus_play(prog, 0, 800, scan_point=1))
 
 
-def test_repeat_forever_combined_with_bracket_and_scanned_delay():
-    """repeat_forever combined with an inner bracket AND a scanned reordering delay: the
-    whole unrolled flat frame loops forever, every scan point period-preserving, tick-exact
-    across the oracle and all three engine models over several full sweeps."""
-    import Zou_lab_control.neutral_atom as na
+# ===========================================================================
+# A constant channel DELAY is a per-channel OUTPUT delay line -- NOT scannable,
+# NOT baked into the (undelayed) edge table.  The program carries the delay in
+# ``channel_delays`` (per output bit, in ticks, with the global shift G folded in
+# for negatives so every entry is >= 0) and the engine applies it as the exact
+# ``delay_line_reference`` at the END of play.  The KEY proof: compile the SAME
+# state twice -- once WITH the delay, once with the delay removed (delays={}) --
+# and assert the delayed play == delay_line_reference(undelayed play).  Each case
+# combines the constant delay with a different scan / bracket feature, and is
+# cross-checked across all three engine models (reference == prefetch == rtl_mirror).
+# ===========================================================================
 
-    st = na.PulseTableState(
-        channels=["A", "B"],
-        periods=[
-            na.PulsePeriod(1000, (1, 1), unit="ns"),
-            na.PulsePeriod(1000, (0, 0), unit="ns"),
-            na.PulsePeriod(1000, (1, 1), unit="ns"),
-            na.PulsePeriod(1000, (0, 0), unit="ns"),   # trailing guard: a delayed B stays in-frame
-        ],
-        time_step_ns=20, repeat_start=0, repeat_end=1, repeat_count=2,
-        delays={"B": "s0"}, delay_units={"B": "ns"},
-        scan_slots=[{"kind": "delay", "target": "B", "unit": "ns", "nominal": 0.0}],
-        scan_table=[[0.0], [600.0], [200.0]])
-    prog = _assert_scan_matches_oracle(st, channels=["A", "B"], clock_hz=50e6, repeat_forever=True, n_ticks=3000, want_lane=True)
-    assert not any(prog.loop_end_slot_coeffs)   # repeat_forever period stays fixed as the delay sweeps
+def test_constant_delay_with_scanned_duration_is_output_delay_line():
+    """A CONSTANT channel delay combined with a SCANNED DURATION: the delay is a pure
+    per-channel output delay line, orthogonal to the duration sweep.  Compile WITH the
+    delay and WITHOUT it (delays={}); the delayed play must equal the undelayed play with
+    only that channel's bit delayed by d -- across every scan point and all three models.
+    The delay (1500 ns = 75 ticks) exceeds the 1000 ns period, proving ANY length works."""
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.devices.sequencer import compile_pulse_table_scan_runtime_program as cscan
+    from fpga.pulse_streamer.host import engine_model as em
+
+    chans = ["trig", "a", "b"]
+    D_ns = 1500.0   # 75 ticks at 20 ns/tick -- longer than one 1000 ns period
+
+    def build(delays):
+        st = na.PulseTableState(
+            channels=chans,
+            periods=[na.PulsePeriod(1000, (1, 1, 0), unit="ns"),   # trig + a ON
+                     na.PulsePeriod(1000, (0, 0, 1), unit="ns")],  # b ON
+            time_step_ns=20,
+            delays=delays, delay_units=({"trig": "ns"} if delays else {}),
+        )
+        st.bind_field("duration", "0", unit="ns")           # scan period 0's duration -> s0
+        st.set_scan_table([[1000.0], [2000.0], [3000.0]])   # three duration points
+        return st
+
+    pd = cscan(build({"trig": D_ns}), channels=chans, clock_hz=50e6, repeat_forever=True)
+    p0 = cscan(build({}), channels=chans, clock_hz=50e6, repeat_forever=True)
+    bit = pd.channels.index("trig")
+    d_ticks = D_ns / 20   # 75
+    assert pd.channel_delays[bit] == d_ticks
+    assert all(v == 0 for i, v in enumerate(pd.channel_delays) if i != bit)
+    # the no-delay twin carries no output delay at all (None) or an all-zero vector
+    assert not any(p0.channel_delays or [])
+    assert pd.delay_lanes is None        # NO lanes in the new model -- it's an output delay
+
+    N = 1200
+    out_d = em.reference_play(em.EngineProgram.from_program(pd), N)
+    out_0 = em.reference_play(em.EngineProgram.from_program(p0), N)
+    # the whole point: delayed == undelayed + a per-channel output delay
+    assert out_d == em.delay_line_reference(out_0, {bit: int(d_ticks)})
+    # cross-model agreement on the delayed program
+    assert em.prefetch_play(em.EngineProgram.from_program(pd), N) == out_d
+    assert em.rtl_mirror_play(em.EngineProgram.from_program(pd), N) == out_d
+
+
+def test_constant_delay_with_scanned_dac_value_is_output_delay_line():
+    """A CONSTANT delay on a DIGITAL trigger channel combined with a SCANNED DAC value (a
+    bus channel + scan_table).  The delay rides the DIGITAL trigger's output bit, NOT the
+    bus; it stays a pure delay line while the DAC code sweeps via value_select.  Delayed
+    play == undelayed play with the trigger's bit delayed by d, across both scan points
+    and all three models -- and the DAC bus still carries the scanned codes."""
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.devices.sequencer import compile_pulse_table_scan_runtime_program as cscan
+    from fpga.pulse_streamer.host import engine_model as em
+
+    chans = ["ch00", "ch01", "ch02", "ch03"]   # ch00/ch01 = DAC bus, ch03 = digital trigger
+    D_ns = 1500.0   # 75 ticks -- longer than one 1000 ns period
+
+    def build(delays):
+        st = na.PulseTableState(
+            channels=chans,
+            channel_labels={"ch00": "da[0]", "ch01": "da[1]", "ch02": "cool", "ch03": "trig"},
+            time_step_ns=20,
+            periods=[na.PulsePeriod(1000, (0, 0, 1, 0), unit="ns"),   # cool ON
+                     na.PulsePeriod(1000, (0, 0, 0, 1), unit="ns"),   # trig ON (delayed channel)
+                     na.PulsePeriod(1000, (0, 0, 0, 0), unit="ns")],
+            delays=delays, delay_units=({"ch03": "ns"} if delays else {}),
+        )
+        st.bind_field("dac", "da@1", unit="value", label="da")   # scan the DAC value -> s0
+        st.set_scan_table([[1.0], [3.0]])                        # two DAC codes
+        return st
+
+    pd = cscan(build({"ch03": D_ns}), channels=chans, clock_hz=50e6, repeat_forever=True)
+    p0 = cscan(build({}), channels=chans, clock_hz=50e6, repeat_forever=True)
+    bit = pd.channels.index("ch03")
+    d_ticks = D_ns / 20   # 75
+    assert pd.channel_delays[bit] == d_ticks
+    assert all(v == 0 for i, v in enumerate(pd.channel_delays) if i != bit)
+    assert pd.delay_lanes is None
+
+    N = 1200
+    out_d = em.reference_play(em.EngineProgram.from_program(pd), N)
+    out_0 = em.reference_play(em.EngineProgram.from_program(p0), N)
+    assert out_d == em.delay_line_reference(out_0, {bit: int(d_ticks)})
+    assert em.prefetch_play(em.EngineProgram.from_program(pd), N) == out_d
+    assert em.rtl_mirror_play(em.EngineProgram.from_program(pd), N) == out_d
+    # the DAC bus is unaffected by the digital delay: it still carries the scanned codes.
+    assert 1 in {int(getattr(s, "value_select", 0)) for s in (pd.bus_segments or [])}
+    assert 1 in set(em.bus_play(pd, 0, 800, scan_point=0))
+    assert 3 in set(em.bus_play(pd, 0, 800, scan_point=1))
+
+
+def test_constant_delay_with_inner_bracket_is_output_delay_line():
+    """A CONSTANT delay combined with an INNER repeat bracket: the bracket is unrolled flat
+    and the delay stays a pure per-channel output delay line over the whole unrolled frame.
+    Compile WITH and WITHOUT the delay (delays={}); the delayed repeat-forever play must
+    equal the undelayed play with only the delayed bit shifted by d -- exercising the
+    bracket-unroll + delay together, across all three models.  d=75 ticks (> a period)."""
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.devices.sequencer import compile_pulse_table_runtime_program as cplain
+    from fpga.pulse_streamer.host import engine_model as em
+
+    chans = ["trig", "b"]
+    D_ns = 1500.0   # 75 ticks -- longer than one 1000 ns period
+
+    def build(delays):
+        return na.PulseTableState(
+            channels=chans,
+            periods=[na.PulsePeriod(1000, (0, 0), unit="ns", name="pre"),
+                     na.PulsePeriod(1000, (1, 0), unit="ns", name="loop0"),   # trig ON inside bracket
+                     na.PulsePeriod(1000, (0, 0), unit="ns", name="loop1"),
+                     na.PulsePeriod(1000, (0, 1), unit="ns", name="post")],   # b ON after bracket
+            time_step_ns=20, repeat_start=1, repeat_end=2, repeat_count=3,
+            delays=delays, delay_units=({"trig": "ns"} if delays else {}),
+            repeat_forever=True,
+        )
+
+    pd = cplain(build({"trig": D_ns}), clock_hz=50e6, repeat_forever=True)
+    p0 = cplain(build({}), clock_hz=50e6, repeat_forever=True)
+    assert pd.loop_count == 1   # the inner bracket was unrolled into a flat frame
+    bit = pd.channels.index("trig")
+    d_ticks = D_ns / 20   # 75
+    assert pd.channel_delays[bit] == d_ticks
+    assert all(v == 0 for i, v in enumerate(pd.channel_delays) if i != bit)
+    assert pd.delay_lanes is None
+
+    N = 1500
+    out_d = em.reference_play(em.EngineProgram.from_program(pd), N)
+    out_0 = em.reference_play(em.EngineProgram.from_program(p0), N)
+    assert out_d == em.delay_line_reference(out_0, {bit: int(d_ticks)})
+    assert em.prefetch_play(em.EngineProgram.from_program(pd), N) == out_d
+    assert em.rtl_mirror_play(em.EngineProgram.from_program(pd), N) == out_d
+
+
+def test_negative_constant_delay_folds_global_shift_into_channel_delays():
+    """A NEGATIVE constant delay re-translates the WHOLE frame by the global shift
+    G = max(0, -min delay) so EVERY entry of ``channel_delays`` is >= 0 -- never a runtime
+    negative tick.  With two channels and a's delay = -500 ns (-25 ticks), G = 25: a's
+    delay folds to 0 and b's to +25.  The played output equals the undelayed play with the
+    G-shifted per-channel delays applied as a delay line (proven across all three models)."""
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.devices.sequencer import compile_pulse_table_runtime_program as cplain
+    from fpga.pulse_streamer.host import engine_model as em
+
+    chans = ["a", "b"]
+
+    def build(delays):
+        return na.PulseTableState(
+            channels=chans,
+            periods=[na.PulsePeriod(1000, (1, 1), unit="ns"), na.PulsePeriod(1000, (0, 0), unit="ns")],
+            time_step_ns=20,
+            delays=delays, delay_units=({"a": "ns"} if delays else {}),
+        )
+
+    pd = cplain(build({"a": -500}), clock_hz=50e6, repeat_forever=True)
+    p0 = cplain(build({}), clock_hz=50e6, repeat_forever=True)
+    # G folded in: no negative ticks, every channel delay >= 0, the frame retranslated.
+    assert min(pd.channel_delays) >= 0
+    assert min(pd.ticks) >= 0
+    assert pd.channel_delays == [0, 25]   # a folds to 0, b shifts +25 (G = 25 ticks)
+
+    N = 300
+    out_d = em.reference_play(em.EngineProgram.from_program(pd), N)
+    out_0 = em.reference_play(em.EngineProgram.from_program(p0), N)
+    g_shifted = {i: v for i, v in enumerate(pd.channel_delays) if v}
+    assert out_d == em.delay_line_reference(out_0, g_shifted)
+    assert em.prefetch_play(em.EngineProgram.from_program(pd), N) == out_d
+    assert em.rtl_mirror_play(em.EngineProgram.from_program(pd), N) == out_d
 
 
 def test_unrolled_bracket_overflow_raises_actionable_error():
