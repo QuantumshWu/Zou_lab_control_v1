@@ -75,31 +75,6 @@ def effective_tick(base_tick: int, coeffs: Sequence[int], slots: Sequence[int], 
     return int(base_tick) + (total >> int(frac_bits))
 
 
-# ---- disjoint-bit delay lanes (a scanned-delay channel pulled out of the global table)
-# A lane is a 1-bit affine sub-player on its own output bit, advanced by its OWN frame
-# tick ``llt`` (reset at every boundary) and OR'd into the digital output -- structurally
-# the per-bus DAC engine specialised to 1 bit.  Shared by every engine model so the
-# combinatorial reference, the FIFO model, and the exact RTL mirror all play lanes
-# identically.
-def _make_lanes(p: "EngineProgram") -> list[dict]:
-    return [{"cb": cb, "ti": ti, "co": co, "va": va, "idx": 0, "bit": 0}
-            for (cb, ti, co, va) in (p.delay_lanes or [])]
-
-
-def _lane_bits(lanes: list[dict], llt: int, slots: Sequence[int], frac_bits: int) -> int:
-    bits = 0
-    for L in lanes:
-        while L["idx"] < len(L["ti"]) and effective_tick(L["ti"][L["idx"]], L["co"][L["idx"]], slots, frac_bits) <= llt:
-            L["bit"] = L["va"][L["idx"]]; L["idx"] += 1
-        bits |= L["bit"] << L["cb"]
-    return bits
-
-
-def _lane_reset(lanes: list[dict]) -> None:
-    for L in lanes:
-        L["idx"] = 0; L["bit"] = 0
-
-
 # ----------------------------------------------------------------------------
 # PHYSICAL CHANNEL DELAY (the final, correct delay model)
 # ----------------------------------------------------------------------------
@@ -170,10 +145,6 @@ class EngineProgram:
     loop_count: int
     repeat_forever: bool
     repeat_from_index: int = 0
-    # each lane: (channel_bit, [base ticks], [[coeffs]], [values 0/1]) -- a 1-bit affine
-    # sub-player on a disjoint output bit (a scanned-delay channel pulled out of the
-    # global sorted table).
-    delay_lanes: list | None = None
     # PHYSICAL CHANNEL DELAY: per-output-bit delay in ticks, applied to the engine OUTPUT
     # (a delay line) AFTER the undelayed play -- never baked into the edges.
     channel_delays: list[int] | None = None
@@ -197,11 +168,6 @@ class EngineProgram:
             loop_count=max(1, int(getattr(program, "loop_count", 1) or 1)),
             repeat_forever=bool(getattr(program, "repeat_forever", False)),
             repeat_from_index=int(getattr(program, "repeat_from_index", 0) or 0),
-            delay_lanes=[
-                (int(lane.channel_bit), [int(t) for t in lane.ticks],
-                 [list(c) for c in lane.coeffs], [int(v) for v in lane.values])
-                for lane in (getattr(program, "delay_lanes", None) or [])
-            ] or None,
             channel_delays=[int(v) for v in (getattr(program, "channel_delays", None) or [])] or None,
         )
 
@@ -269,20 +235,9 @@ def reference_play(program, n_ticks: int) -> list[int]:
     else:
         sm, tc, ei = 0, 0, 0
 
-    # Disjoint-bit DELAY LANES: a scanned-delay channel that reorders edges is pulled
-    # out of the global sorted table onto its own bit, played by a 1-bit affine
-    # sub-player advanced by its OWN frame-tick `llt` and reseeded at every boundary, so
-    # a reordering delay never disturbs the global edge stream.  out = main | OR(lanes).
-    lanes = _make_lanes(p)
-
-    def lane_reset():
-        _lane_reset(lanes)
-
-    llt = 0
     out = []
     for _ in range(n_ticks):
-        out.append(sm | _lane_bits(lanes, llt, slot, p.frac_bits))
-        llt += 1
+        out.append(sm)
         if not running:
             continue
         if p.loop_count > 1 and loops > 1 and tc >= loop_end:
@@ -290,13 +245,11 @@ def reference_play(program, n_ticks: int) -> list[int]:
             tc = eff(p.loop_start_index, slot) + 1
             ei = p.loop_start_index + 1
             loops -= 1
-            llt = eff(p.loop_start_index, slot); lane_reset()
         elif tc >= final:
             if scan_en and spi + 1 < scan_count:
                 slot = list(p.scan_points[spi + 1]); spi += 1
                 final = eff(n - 1, slot); loop_end = eff_le(slot); loops = p.loop_count
                 sm, tc, ei = (p.masks[0], 1, 1) if eff(0, slot) == 0 else (0, 0, 0)
-                llt = 0; lane_reset()
             elif p.repeat_forever:
                 slot = _first_values(p); spi = 0
                 final = eff(n - 1, slot); loop_end = eff_le(slot); loops = p.loop_count
@@ -305,11 +258,8 @@ def reference_play(program, n_ticks: int) -> list[int]:
                     # rewind to the steady-state frame start (additive-delay preamble
                     # plays once); the engine seeds masks[ri] at its tick + 1.
                     sm, tc, ei = p.masks[ri], eff(ri, slot) + 1, ri + 1
-                    llt = eff(ri, slot)
                 else:
                     sm, tc, ei = (p.masks[0], 1, 1) if eff(0, slot) == 0 else (0, 0, 0)
-                    llt = 0
-                lane_reset()
             else:
                 running = False; sm = 0
         else:
@@ -377,11 +327,9 @@ def prefetch_play(program, n_ticks: int, *, read_latency: int = 2, fifo_depth: i
     else:
         sm, tc, ei = 0, 0, 0
 
-    lanes = _make_lanes(p)
-    llt = 0
     out = []
     for _ in range(n_ticks):
-        cycle += 1; land(); out.append(sm | _lane_bits(lanes, llt, slot, p.frac_bits)); llt += 1
+        cycle += 1; land(); out.append(sm)
         if not running:
             continue
         if p.loop_count > 1 and loops > 1 and tc >= loop_end:
@@ -393,7 +341,6 @@ def prefetch_play(program, n_ticks: int, *, read_latency: int = 2, fifo_depth: i
             if fifo and fifo[0] == p.loop_start_index:
                 fifo.popleft()
             issue()
-            llt = eff(p.loop_start_index, slot); _lane_reset(lanes)
         elif tc >= final:
             if scan_en and spi + 1 < scan_count:
                 slot = list(p.scan_points[spi + 1]); spi += 1
@@ -406,7 +353,6 @@ def prefetch_play(program, n_ticks: int, *, read_latency: int = 2, fifo_depth: i
                     issue()
                 else:
                     sm, tc, ei = 0, 0, 0
-                llt = 0; _lane_reset(lanes)
             elif p.repeat_forever:
                 slot = _first_values(p); spi = 0
                 final = eff(n - 1, slot); loop_end = eff_le(slot); loops = p.loop_count
@@ -418,7 +364,6 @@ def prefetch_play(program, n_ticks: int, *, read_latency: int = 2, fifo_depth: i
                     if fifo and fifo[0] == ri:
                         fifo.popleft()
                     issue()
-                    llt = eff(ri, slot)
                 else:
                     reseed(0)
                     if eff(0, slot) == 0:
@@ -428,8 +373,6 @@ def prefetch_play(program, n_ticks: int, *, read_latency: int = 2, fifo_depth: i
                         issue()
                     else:
                         sm, tc, ei = 0, 0, 0
-                    llt = 0
-                _lane_reset(lanes)
             else:
                 running = False; sm = 0
         else:
@@ -505,8 +448,6 @@ def streaming_scan_play(program, n_ticks: int, *, bank_size: int, refill_delay: 
     stalled = False
     cycle = 0
     sm, tc, ei = (p.masks[0], 1, 1) if (running and eff(0, slot) == 0) else (0, 0, 0)
-    lanes = _make_lanes(p)
-    llt = 0
 
     out = []
     for _ in range(n_ticks):
@@ -514,13 +455,12 @@ def streaming_scan_play(program, n_ticks: int, *, bank_size: int, refill_delay: 
         for item in [it for it in pending if it[2] <= cycle]:
             pending.remove(item)
             load(item[0], item[1])
-        out.append(sm | _lane_bits(lanes, llt, slot, p.frac_bits)); llt += 1
+        out.append(sm)
         if not running:
             continue
         if p.loop_count > 1 and loops > 1 and tc >= loop_end:
             sm = p.masks[p.loop_start_index]; tc = eff(p.loop_start_index, slot) + 1
             ei = p.loop_start_index + 1; loops -= 1
-            llt = eff(p.loop_start_index, slot); _lane_reset(lanes)
         elif tc >= final:
             nxt_idx = spi + 1
             if nxt_idx < N:
@@ -542,13 +482,11 @@ def streaming_scan_play(program, n_ticks: int, *, bank_size: int, refill_delay: 
                     slot = list(nxt); spi = nxt_idx
                     final = eff(n - 1, slot); loop_end = eff_le(slot); loops = p.loop_count
                     sm, tc, ei = (p.masks[0], 1, 1) if eff(0, slot) == 0 else (0, 0, 0)
-                    llt = 0; _lane_reset(lanes)
             elif p.repeat_forever:
                 preload()
                 slot = list(points[0]); spi = 0
                 final = eff(n - 1, slot); loop_end = eff_le(slot); loops = p.loop_count
                 sm, tc, ei = (p.masks[0], 1, 1) if eff(0, slot) == 0 else (0, 0, 0)
-                llt = 0; _lane_reset(lanes)
             else:
                 running = False; sm = 0
         else:
@@ -615,11 +553,9 @@ def rtl_mirror_play(program, n_ticks: int, *, rd_lat: int = 2, fifo_depth: int =
     else:
         sm, tc, ei = 0, 0, 0
 
-    lanes = _make_lanes(p)
-    llt = 0
     out = []
     for _ in range(n_ticks):
-        out.append(sm | _lane_bits(lanes, llt, slot, p.frac_bits)); llt += 1
+        out.append(sm)
         if not running:
             continue
         if p.loop_count > 1 and loops > 1 and tc >= loop_end:
@@ -628,7 +564,6 @@ def rtl_mirror_play(program, n_ticks: int, *, rd_lat: int = 2, fifo_depth: int =
             ei = p.loop_start_index + 1
             loops -= 1
             reseed_from(p.loop_start_index + 1)   # loop_start output directly above
-            llt = eff(p.loop_start_index, slot); _lane_reset(lanes)
             continue
         if tc >= final:
             if scan_en and spi + 1 < scan_count:
@@ -640,7 +575,6 @@ def rtl_mirror_play(program, n_ticks: int, *, rd_lat: int = 2, fifo_depth: int =
                 final = eff(n - 1, slot); loop_end = eff_le(slot); loops = p.loop_count
                 sm = p.masks[ri]; tc = eff(ri, slot) + 1; ei = ri + 1
                 reseed_from(ri + 1)
-                llt = eff(ri, slot); _lane_reset(lanes)
                 continue
             elif p.repeat_forever:
                 slot = _first_values(p); spi = 0
@@ -648,7 +582,6 @@ def rtl_mirror_play(program, n_ticks: int, *, rd_lat: int = 2, fifo_depth: int =
                 running = False; sm = 0; continue
             final = eff(n - 1, slot); loop_end = eff_le(slot); loops = p.loop_count
             sm, tc, ei = boundary_to(True)
-            llt = 0; _lane_reset(lanes)
             continue
         # ---- normal cycle: exact RTL FIFO transfers ----
         landed_idx = pend[rd_lat - 1]

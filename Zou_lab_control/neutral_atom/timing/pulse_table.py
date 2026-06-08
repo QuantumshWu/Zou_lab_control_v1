@@ -39,7 +39,7 @@ ANALOG_BUS_MODES = ("hold", "edge", "ramp")
 
 #: Scan-slot kinds.  ``duration`` binds a period duration, ``delay`` binds a
 #: channel delay, ``dac`` binds one analog-bus value in one period.
-SCAN_SLOT_KINDS = ("duration", "delay", "dac")
+SCAN_SLOT_KINDS = ("duration", "dac")
 SLOT_VAR_RE = re.compile(r"^s(?P<index>\d+)$")
 
 
@@ -79,11 +79,13 @@ class ScanSlot:
     """One bound scan parameter.
 
     ``kind`` is one of :data:`SCAN_SLOT_KINDS`.  ``target`` identifies the bound
-    field: a period index (``duration``), a channel name (``delay``), or
-    ``"<bus>@<period_index>"`` (``dac``).  ``label`` is a short human name for
-    GUI lists.  ``unit`` records the field's display unit; ``scan_table`` values
-    are stored as the field's final physical quantity (ns for time slots, the
-    integer DAC code for ``dac`` slots).
+    field: a period index (``duration``) or ``"<bus>@<period_index>"`` (``dac``).
+    ``label`` is a short human name for GUI lists.  ``unit`` records the field's
+    display unit; ``scan_table`` values are stored as the field's final physical
+    quantity (ns for time slots, the integer DAC code for ``dac`` slots).
+
+    A per-channel delay is a FIXED output delay (a delay line) and is NOT
+    scannable, so ``"delay"`` is not a valid slot kind.
     """
 
     kind: str
@@ -102,7 +104,7 @@ class ScanSlot:
 
     @property
     def is_time(self) -> bool:
-        return self.kind in ("duration", "delay")
+        return self.kind == "duration"
 
     @property
     def dac_bus(self) -> str:
@@ -279,8 +281,6 @@ class PulseTableState:
             slots = self.reference_slots()
             if kind == "duration":
                 return self.periods[int(target)].duration_ns(slots=slots) / scale
-            if kind == "delay":
-                return self.delay_ns(target, slots=slots) / scale
             if kind == "dac":
                 bus, period_index = target.split("@", 1)
                 return float(self.bus_value(int(period_index), bus))
@@ -295,18 +295,20 @@ class PulseTableState:
         field returns its existing slot index.
         """
 
+        if kind == "delay":
+            raise ValueError("delay is a fixed per-channel value and cannot be scanned")
         existing = self.slot_index_for(kind, target)
         if existing is not None:
             return existing
         if nominal is None:
             nominal = self._read_field_nominal(kind, str(target), unit)
-        # Time slots (duration/delay) are ALWAYS stored in ns: binding rewrites the field to
+        # Duration slots are ALWAYS stored in ns: binding rewrites the field to
         # its "str (ns)" (ns) display, so a slot left in us/ms would scan in that unit while
         # the card shows "str (ns)" -- a silent 1000x mismatch.  Convert the nominal from the
-        # field's entry unit to ns and pin the slot unit to ns so the Scan tab, the period/
-        # delay card, and the compiled program all agree.  (DAC slots keep their raw "value"
+        # field's entry unit to ns and pin the slot unit to ns so the Scan tab, the period
+        # card, and the compiled program all agree.  (DAC slots keep their raw "value"
         # unit -- a DAC code is not a time.)
-        if kind in ("duration", "delay") and unit not in ("ns", "value"):
+        if kind == "duration" and unit not in ("ns", "value"):
             nominal = float(nominal) * UNITS_TO_NS.get(unit, 1.0)
             unit = "ns"
         index = len(self.scan_slots)
@@ -346,9 +348,6 @@ class PulseTableState:
             period_index = int(slot.target)
             period = self.periods[period_index]
             self.periods[period_index] = PulsePeriod(var, period.states, unit="str (ns)", name=period.name)
-        elif slot.kind == "delay":
-            self.delays[slot.target] = var
-            self.delay_units[slot.target] = "str (ns)"
         elif slot.kind == "dac":
             bus, period_index = slot.dac_bus, slot.dac_period
             plan = self.analog_bus_plan(bus)
@@ -364,10 +363,6 @@ class PulseTableState:
             if str(period.duration) == var:
                 value = 1_000 if restore is None else restore
                 self.periods[period_index] = PulsePeriod(value, period.states, unit="ns", name=period.name)
-        elif slot.kind == "delay":
-            if str(self.delays.get(slot.target)) == var:
-                self.delays[slot.target] = 0 if restore is None else restore
-                self.delay_units[slot.target] = "ns"
         elif slot.kind == "dac":
             bus, period_index = slot.dac_bus, slot.dac_period
             plan = self.analog_bus_plan(bus)
@@ -402,9 +397,6 @@ class PulseTableState:
                 period_index = int(slot.target)
                 period = new.periods[period_index]
                 new.periods[period_index] = PulsePeriod(value, period.states, unit="ns", name=period.name)
-            elif slot.kind == "delay":
-                new.delays[slot.target] = value
-                new.delay_units[slot.target] = "ns"
             elif slot.kind == "dac":
                 plan = new.analog_bus_plan(slot.dac_bus)
                 plan[slot.dac_period] = {"mode": "edge", "value": int(round(value))}
@@ -416,7 +408,7 @@ class PulseTableState:
         return new
 
     def primary_time_slot(self) -> str | None:
-        """Return the variable name of the first duration/delay scan slot."""
+        """Return the variable name of the first duration (time) scan slot."""
 
         for index, slot in enumerate(self.scan_slots):
             if slot.is_time:
@@ -512,9 +504,6 @@ class PulseTableState:
                 period_index = int(slot.target) if slot.target.lstrip("-").isdigit() else -1
                 if period_index < 0 or period_index >= len(self.periods):
                     raise ValueError(f"scan slot {index} binds duration of missing period {slot.target!r}.")
-            elif slot.kind == "delay":
-                if slot.target not in self.channels:
-                    raise ValueError(f"scan slot {index} binds delay of unknown channel {slot.target!r}.")
             elif slot.kind == "dac":
                 if slot.dac_bus not in self.bus_channels(min_width=1):
                     raise ValueError(f"scan slot {index} binds unknown analog bus {slot.dac_bus!r}.")

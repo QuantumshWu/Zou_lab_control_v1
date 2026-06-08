@@ -364,8 +364,6 @@ class VivadoAxiStreamerSession:
             num_slots=p.num_slots,
             bus_count=p.bus_count,
             bus_width=p.bus_width,
-            num_lanes=p.num_lanes,
-            max_lane_edges=p.max_lane_edges,
             # bound the monotonicity sweep so a million-point streamed scan does not
             # hang prepare(); the per-slot extreme points are always included.
             max_validated_scan_points=max(4096, 2 * p.bank_size),
@@ -396,7 +394,7 @@ class VivadoAxiStreamerSession:
         range of the CTRL register file, read it back single-beat, and confirm it matches.
 
         The CTRL register file is the ONLY AXI-READABLE region -- the image BRAMs (tick /
-        coeff / mask / scan / bus / lane) are write-only from the AXI side (their port-A
+        coeff / mask / scan / bus) are write-only from the AXI side (their port-A
         ``douta`` is unconnected; the engine reads them via port B), so an AXI read-back of
         any BRAM region always returns 0 and cannot verify anything.  CTRL goes through the
         SAME ``axi_bram_ctrl`` -> external-BMG native port as the BRAM regions, so a burst
@@ -404,15 +402,15 @@ class VivadoAxiStreamerSession:
         silent failure mode -- a wrong ``create_hw_axi_txn -data`` burst byte order (or a
         still-AXI4-Lite bitstream that ignores ``-len``) -- BEFORE any real pulse upload.
 
-        The scratch words sit ABOVE every defined CTRL word (the highest, ``LANE_BITS``, is
-        index 22), so writing them has no side effect (no COMMAND/BANK_READY/loop fields are
-        touched) and the next ``prepare`` overwrites only the low command words.  Returns
-        True on success; raises on mismatch."""
+        The scratch words sit ABOVE every defined CTRL word (the highest,
+        ``REPEAT_FROM_LOOP_START``, is index 19), so writing them has no side effect (no
+        COMMAND/BANK_READY/loop fields are touched) and the next ``prepare`` overwrites only
+        the low command words.  Returns True on success; raises on mismatch."""
 
         from fpga.pulse_streamer.host.image import CTRL_WORDS
 
         ctrl_base = region_bases(self.params)["ctrl"]
-        scratch = 32                              # safely above all defined CtrlWords (<= 22)
+        scratch = 32                              # safely above all defined CtrlWords (<= 19)
         n = max(2, min(int(count), CTRL_WORDS - scratch))
         base = ctrl_base + scratch
         pattern = [(0xC0DE0000 + i) & 0xFFFFFFFF for i in range(n)]

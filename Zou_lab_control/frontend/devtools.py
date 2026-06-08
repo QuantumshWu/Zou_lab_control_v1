@@ -153,11 +153,10 @@ def demo_editor(*, scale: float = 1.0, size=(1440, 880), bind_scans: bool = True
     if bind_scans:
         # Re-fetch cards after each bind: load_state() rebuilds the cards.
         ed._toggle_duration_scan(ed.drag_container.pulse_cards()[3])  # period-4 duration -> s0
-        ed._toggle_delay_scan("ch01")                                # cooling delay     -> s1
         buses = list(ed.state.bus_channels().keys())
         if buses:
-            ed._toggle_dac_scan(ed.drag_container.pulse_cards()[1], buses[0])  # da_dipole p2 -> s2
-        ed.state.set_scan_table([[10000, 0, 100], [20000, 200, 300], [40000, 400, 700]])
+            ed._toggle_dac_scan(ed.drag_container.pulse_cards()[1], buses[0])  # da_dipole p2 -> s1
+        ed.state.set_scan_table([[10000, 100], [20000, 300], [40000, 700]])
         ed.load_state(ed.state)
     if size is not None:
         ed.setFixedSize(int(size[0]), int(size[1]))

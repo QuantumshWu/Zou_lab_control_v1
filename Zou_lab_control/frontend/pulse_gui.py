@@ -203,8 +203,6 @@ def _scan_slot_label(state: PulseTableState, index: int) -> str:
             return f"Period {int(slot.target) + 1} duration"
         except ValueError:
             return f"Period {slot.target} duration"
-    if slot.kind == "delay":
-        return f"{state.label_for(slot.target)} delay"
     if slot.kind == "dac":
         return f"{slot.dac_bus} (period {slot.dac_period + 1})"
     return slot.target
@@ -1097,7 +1095,6 @@ class ChannelNamesPanel(FluentGroupBox):
 class ChannelPanel(FluentGroupBox):
     changed = QtCore.pyqtSignal()
     clearRequested = QtCore.pyqtSignal(str)
-    delayScanRequested = QtCore.pyqtSignal(str)
     loadScanRequested = QtCore.pyqtSignal()
     editScanRequested = QtCore.pyqtSignal()
 
@@ -1106,7 +1103,6 @@ class ChannelPanel(FluentGroupBox):
         self.state = state
         self.delay_edits: dict[str, FluentLineEdit] = {}
         self.delay_units: dict[str, FluentComboBox] = {}
-        self.delay_dots: dict[str, FluentScanDot] = {}
         self.channel_labels: dict[str, ElidedLabel] = {}
         self.top_labels: dict[str, FluentLabel] = {}
         self.rows = _display_rows(state)
@@ -1184,19 +1180,16 @@ class ChannelPanel(FluentGroupBox):
             else:
                 delay_value = state.delays.get(key, 0)
                 delay_unit = state.delay_units.get(key, "ns")
-            bound = _is_slot_expr(delay_value)
-            delay_edit = FluentScanLineEdit(str(delay_value), tooltip="Delay value; click the dot to scan it")
+            # A per-channel delay is a FIXED output delay (a delay line) and is not
+            # scannable, so the field is a plain numeric input -- no scan dot.
+            delay_edit = FluentLineEdit(str(delay_value))
+            delay_edit.setToolTip("Fixed per-channel output delay")
             delay_edit.setFixedSize(delay_w, row_height)
             delay_edit.textChanged.connect(lambda text, ch=key: self._handle_delay_text(ch, text))
             delay_edit.textChanged.connect(self.changed)
-            if is_bus:
-                delay_edit.dot.setEnabled(False)
-                delay_edit.dot.setToolTip("Bind individual channel delays, not a bus, to a scan slot.")
-            else:
-                delay_edit.scanClicked.connect(lambda ch=key: self.delayScanRequested.emit(ch))
             unit = FluentComboBox()
             unit.addItems(TIME_UNITS)
-            unit.setCurrentText("str (ns)" if bound else delay_unit)
+            unit.setCurrentText(delay_unit)
             unit.setFixedSize(unit_w, row_height)
             unit.currentTextChanged.connect(lambda unit_text, ch=key: self._handle_delay_unit(ch, unit_text))
             unit.currentTextChanged.connect(self.changed)
@@ -1207,19 +1200,13 @@ class ChannelPanel(FluentGroupBox):
 
             self.delay_edits[key] = delay_edit
             self.delay_units[key] = unit
-            self.delay_dots[key] = delay_edit.dot
             row.addWidget(label)
             row.addWidget(delay_edit, 1)
             row.addWidget(unit)
             row.addWidget(clear_btn)
             layout.addLayout(row)
-            if bound and not is_bus:
-                slot_index = state.slot_index_for("delay", key)
-                delay_edit.set_scan_bound(True, None if slot_index is None else slot_index + 1)
-                unit.setEnabled(False)
-            else:
-                self._handle_delay_text(key, delay_edit.text())
-                self._handle_delay_unit(key, unit.currentText())
+            self._handle_delay_text(key, delay_edit.text())
+            self._handle_delay_unit(key, unit.currentText())
         layout.addStretch()
         self.set_scan_summary()
 
@@ -1252,13 +1239,6 @@ class ChannelPanel(FluentGroupBox):
         edit = self.delay_edits.get(channel)
         if combo is None or edit is None:
             return
-        if _is_slot_expr(text):
-            was_blocked = combo.blockSignals(True)
-            combo.setCurrentText("str (ns)")
-            combo.blockSignals(was_blocked)
-            combo.setEnabled(False)
-        else:
-            combo.setEnabled(True)
         self._handle_delay_unit(channel, combo.currentText())
 
     def _handle_delay_unit(self, channel: str, unit: str) -> None:
@@ -1688,7 +1668,6 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self.channel_panel = ChannelPanel(self.state)
         self.channel_panel.changed.connect(self._mark_dirty)
         self.channel_panel.clearRequested.connect(self.clear_channel)
-        self.channel_panel.delayScanRequested.connect(self._toggle_delay_scan)
         self.channel_panel.loadScanRequested.connect(self._load_scan_file)
         self.channel_panel.editScanRequested.connect(self._open_scan_tab)
         self.channel_panel_layout.addWidget(self.channel_panel)
@@ -1957,10 +1936,9 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         """Snapshot a field's full pre-bind state (mode/value/unit).
 
         Binding rewrites the field to ``s{i}`` and a plain ``unbind`` only knows
-        how to reset it to a hard default (duration -> 1000 ns, delay -> 0, DAC ->
-        hold).  Stashing the original here lets us put the field back EXACTLY as
-        it was -- e.g. a DAC that was "edge / 500" returns to "edge / 500", not
-        "hold".
+        how to reset it to a hard default (duration -> 1000 ns, DAC -> hold).
+        Stashing the original here lets us put the field back EXACTLY as it was
+        -- e.g. a DAC that was "edge / 500" returns to "edge / 500", not "hold".
         """
 
         cache = getattr(self, "_field_state_cache", None)
@@ -1971,8 +1949,6 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             if kind == "duration":
                 period = state.periods[int(target)]
                 cache[key] = ("duration", period.duration, period.unit)
-            elif kind == "delay":
-                cache[key] = ("delay", state.delays.get(target), state.delay_units.get(target, "ns"))
             elif kind == "dac":
                 bus, _, period_str = str(target).rpartition("@")
                 period_index = int(period_str)
@@ -1992,10 +1968,6 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 _, duration, unit = saved
                 period = state.periods[int(target)]
                 state.periods[int(target)] = PulsePeriod(duration, period.states, unit=unit, name=period.name)
-            elif saved[0] == "delay":
-                _, value, unit = saved
-                state.delays[target] = value
-                state.delay_units[target] = unit
             elif saved[0] == "dac":
                 _, bus, period_index, entry = saved
                 plan = state.analog_bus_plan(bus)
@@ -2061,7 +2033,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                         if bound:
                             si = state.slot_index_for("dac", f"{bus}@{pidx}")
                             value_edit.set_scan_bound(True, None if si is None else si + 1)
-            # --- channel panel: delay fields ---
+            # --- channel panel: delay fields (fixed per-channel value, not scannable) ---
             panel = self.channel_panel
             for key, edit in panel.delay_edits.items():
                 is_bus = str(key).startswith("bus:")
@@ -2074,20 +2046,11 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 else:
                     dval = state.delays.get(key, 0)
                     dunit = state.delay_units.get(key, "ns")
-                bound = _is_slot_expr(dval)
                 ucombo = panel.delay_units.get(key)
                 with _signals_blocked(edit, ucombo):
-                    edit.set_scan_bound(False)
                     edit.setText(str(dval))
                     if ucombo is not None:
-                        ucombo.setCurrentText("str (ns)" if bound else dunit)
-                    if bound and not is_bus:
-                        si = state.slot_index_for("delay", key)
-                        edit.set_scan_bound(True, None if si is None else si + 1)
-                        if ucombo is not None:
-                            ucombo.setEnabled(False)
-                    elif ucombo is not None:
-                        ucombo.setEnabled(True)
+                        ucombo.setCurrentText(dunit)
             panel.state = state
             panel.set_scan_summary()
             return True
@@ -2124,17 +2087,6 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             self._toggle_scan_binding(
                 state, "duration", str(index),
                 bind=lambda: state.bind_field("duration", str(index), unit="ns" if unit == "str (ns)" else unit),
-            )
-        except Exception as exc:
-            self._message(str(exc))
-
-    def _toggle_delay_scan(self, channel: str) -> None:
-        try:
-            state = self.read_state()
-            unit = state.delay_units.get(channel, "ns")
-            self._toggle_scan_binding(
-                state, "delay", channel,
-                bind=lambda: state.bind_field("delay", channel, unit="ns" if unit == "str (ns)" else unit),
             )
         except Exception as exc:
             self._message(str(exc))
@@ -2836,33 +2788,6 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 add_band(x0, x1, area_bottom, area_top, BAND_ALPHA)
                 label_y = min(area_top + row_h * 0.5, ylim_top - row_h * 0.2)
                 add_number((x0 + x1) / 2, label_y, tag, va="center")
-            elif slot.kind == "delay":
-                channel = slot.target
-                if channel not in base_y:
-                    continue
-                try:
-                    delay_ns = state.delay_ns(channel, slots=slots, time_step_ns=state.time_step_ns)
-                except Exception:
-                    continue
-                channel_idx = state.channel_index(channel)
-                y0 = base_y[channel]
-                y1 = y0 + row_h
-                active_start: float | None = None
-                spans: list[tuple[float, float]] = []
-                for period_index, period in enumerate(state.periods):
-                    on = int(period.states[channel_idx])
-                    if on and active_start is None:
-                        active_start = starts_ns[period_index]
-                    elif not on and active_start is not None:
-                        spans.append((active_start, active_start + delay_ns))
-                        active_start = None
-                if active_start is not None:
-                    spans.append((active_start, active_start + delay_ns))
-                # Shade each lead-in on THIS channel's row; label once.
-                for span_idx, (span_start, span_stop) in enumerate(spans):
-                    add_band(span_start * 1e-9, span_stop * 1e-9, y0, y1, BAND_ALPHA + 0.10)
-                    if span_idx == 0:
-                        add_number((span_start + span_stop) / 2 * 1e-9, (y0 + y1) / 2, tag, va="center")
             elif slot.kind == "dac":
                 bus = slot.dac_bus
                 pidx = slot.dac_period

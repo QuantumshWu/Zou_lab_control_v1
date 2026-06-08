@@ -901,7 +901,6 @@ def test_pulse_gui_preview_robust_across_states(monkeypatch):
         editor = PulseSequenceEditor(state=build())
         if name == "scanned":
             editor._toggle_duration_scan(editor.drag_container.pulse_cards()[3])
-            editor._toggle_delay_scan("ch01")
             editor._toggle_dac_scan(editor.drag_container.pulse_cards()[2], "da_dipole")
         # both toggle states must produce a real figure with at least one axis line/patch
         for include_off in (False, True, False):  # OFF -> ON -> OFF reproducible
@@ -1031,15 +1030,15 @@ def test_pulse_gui_scan_dot_retoggle_preserves_values(monkeypatch):
 
     ensure_qt_app()
     editor = PulseSequenceEditor(state=dt.demo_state())
-    editor._toggle_delay_scan("ch01")
+    editor._toggle_duration_scan(editor.drag_container.pulse_cards()[1])
     editor.state.set_scan_table([[100], [200], [300]])
     editor.load_state(editor.state)
     assert editor.state.scan_table == [[100.0], [200.0], [300.0]]
 
-    editor._toggle_delay_scan("ch01")  # unbind
+    editor._toggle_duration_scan(editor.drag_container.pulse_cards()[1])  # unbind
     assert len(editor.state.scan_slots) == 0
 
-    editor._toggle_delay_scan("ch01")  # rebind -> values restored, not reset to nominal
+    editor._toggle_duration_scan(editor.drag_container.pulse_cards()[1])  # rebind -> values restored, not reset to nominal
     assert editor.state.scan_table == [[100.0], [200.0], [300.0]]
 
 
@@ -1103,19 +1102,19 @@ def test_pulse_gui_inplace_scan_refresh_matches_rebuild(monkeypatch):
                 fields.append(("dac", i, bus, e.text(), e._bound, e.dot.number(),
                                card.bus_mode_combos[bus].currentText()))
         for k, e in editor.channel_panel.delay_edits.items():
-            fields.append(("del", k, e.text(), e._bound, e.dot.number()))
+            # delay is a fixed per-channel value -- a plain line edit, never scannable
+            fields.append(("del", k, e.text(), editor.channel_panel.delay_units[k].currentText()))
         return editor.read_state().to_dict(), fields
 
-    chans = editor.state.visible_channels
     bus = list(editor.state.bus_channels())[0]
     editor.drag_container.pulse_cards()[0].bus_mode_combos[bus].setCurrentText("Edge")
     app.processEvents()
-    # A mix of binds and unbinds across all three kinds, all via the in-place path.
-    editor._toggle_delay_scan(chans[1]); app.processEvents()
+    # A mix of binds and unbinds across duration + DAC kinds, all via the in-place path.
+    editor._toggle_duration_scan(editor.drag_container.pulse_cards()[2]); app.processEvents()
     editor._toggle_duration_scan(editor.drag_container.pulse_cards()[1]); app.processEvents()
     editor.drag_container.pulse_cards()[0].bus_dots[bus].clicked.emit(); app.processEvents()
-    editor._toggle_delay_scan(chans[3]); app.processEvents()
-    editor._toggle_delay_scan(chans[1]); app.processEvents()  # unbind -> renumbers later slots
+    editor._toggle_duration_scan(editor.drag_container.pulse_cards()[3]); app.processEvents()
+    editor._toggle_duration_scan(editor.drag_container.pulse_cards()[2]); app.processEvents()  # unbind -> renumbers later slots
 
     state_fast, fields_fast = snapshot()
     # Force the slow path: a full rebuild from the read-back state.
@@ -1157,8 +1156,8 @@ def test_pulse_gui_scan_unbind_restores_field_state(monkeypatch):
     """Unbinding a scan slot must restore the field's ORIGINAL value/mode.
 
     The user's bug: a DAC that was "edge / 500" came back as "hold" after a
-    bind/unbind round-trip.  The same hard-default reset hit duration (-> 1000)
-    and delay (-> 0).  Verify all three return to exactly what they were.
+    bind/unbind round-trip.  The same hard-default reset hit duration (-> 1000).
+    Verify both return to exactly what they were.
     """
 
     pytest.importorskip("PyQt5")
@@ -1195,13 +1194,14 @@ def test_pulse_gui_scan_unbind_restores_field_state(monkeypatch):
 
 
 def test_pulse_gui_scan_dots_clickable_bind_and_unbind(monkeypatch):
-    """Clicking a scan dot must bind AND later unbind -- for delay and DAC.
+    """Clicking a scan dot must bind AND later unbind -- for duration and DAC.
 
-    The user's bug: "DA dot can't be clicked back" / "delay dot does nothing".
-    Root cause was the DAC value field being *disabled* when bound, which also
-    disabled its embedded dot, so the second click never reached the toggle.
-    This exercises the real signal path (dot.clicked -> scanClicked -> toggle)
-    and asserts the dot stays enabled the whole time.
+    The user's bug: "DA dot can't be clicked back".  Root cause was the DAC
+    value field being *disabled* when bound, which also disabled its embedded
+    dot, so the second click never reached the toggle.  This exercises the real
+    signal path (dot.clicked -> scanClicked -> toggle) and asserts the dot stays
+    enabled the whole time.  (A per-channel delay is a fixed value and has no
+    scan dot.)
     """
 
     pytest.importorskip("PyQt5")
@@ -1215,17 +1215,17 @@ def test_pulse_gui_scan_dots_clickable_bind_and_unbind(monkeypatch):
     editor.show()
     app.processEvents()
 
-    # --- delay dot (normal channel) ---
-    delay_dot = editor.channel_panel.delay_dots["ch01"]
-    assert delay_dot.isEnabled()
-    delay_dot.clicked.emit()
+    # --- duration dot (period card) ---
+    dur_dot = editor.drag_container.pulse_cards()[1].duration_edit.dot
+    assert dur_dot.isEnabled()
+    dur_dot.clicked.emit()
     app.processEvents()
-    assert any(s.kind == "delay" and s.target == "ch01" for s in editor.state.scan_slots)
-    delay_dot = editor.channel_panel.delay_dots["ch01"]  # rebuilt
-    assert delay_dot.isEnabled()
-    delay_dot.clicked.emit()
+    assert any(s.kind == "duration" and s.target == "1" for s in editor.state.scan_slots)
+    dur_dot = editor.drag_container.pulse_cards()[1].duration_edit.dot  # rebuilt
+    assert dur_dot.isEnabled()
+    dur_dot.clicked.emit()
     app.processEvents()
-    assert not any(s.kind == "delay" and s.target == "ch01" for s in editor.state.scan_slots)
+    assert not any(s.kind == "duration" and s.target == "1" for s in editor.state.scan_slots)
 
     # --- DAC value dot (force Edge mode so the value is scannable) ---
     bus = list(editor.state.bus_channels())[0]
@@ -1808,19 +1808,20 @@ def test_pulse_gui_scan_array_toggle_validates_and_marks_symbolic_regions(monkey
         assert scan_program.slot_count == 1
         assert scan_program.scan_points == [[1], [2]]
 
-        # Bind a second slot (a channel delay) so the preview shades two regions.
-        editor._toggle_delay_scan("ch03")
+        # Bind a second slot (the second period's duration) so the preview shades
+        # two regions.  (A per-channel delay is a fixed value and is not scannable.)
+        editor._toggle_duration_scan(editor.drag_container.pulse_cards()[1])
         app.processEvents()
-        assert [slot.kind for slot in editor.state.scan_slots] == ["duration", "delay"]
-        assert editor.state.slot_index_for("delay", "ch03") == 1
-        assert editor.channel_panel.delay_dots["ch03"].isChecked()
-        editor.state.set_scan_table([[20.0, 0.0], [40.0, 20.0]])
+        assert [slot.kind for slot in editor.state.scan_slots] == ["duration", "duration"]
+        assert editor.state.slot_index_for("duration", "1") == 1
+        assert editor.drag_container.pulse_cards()[1].duration_dot.isChecked()
+        editor.state.set_scan_table([[20.0, 80.0], [40.0, 120.0]])
         editor.load_state(editor.state)
         app.processEvents()
         assert editor.channel_panel.scan_summary.text() == "2 slots · 2 pts"
         restored = editor.read_state()
         assert restored.slot_count == 2
-        assert restored.scan_table == [[20.0, 0.0], [40.0, 20.0]]
+        assert restored.scan_table == [[20.0, 80.0], [40.0, 120.0]]
         assert restored.n_points == 2
 
         # The preview shades each scanned span with the slot's 1-based number.
@@ -1839,8 +1840,8 @@ def test_pulse_gui_scan_array_toggle_validates_and_marks_symbolic_regions(monkey
         # Toggling a dot off unbinds its slot and renumbers the rest.
         editor._toggle_duration_scan(editor.drag_container.pulse_cards()[0])
         app.processEvents()
-        assert [slot.kind for slot in editor.state.scan_slots] == ["delay"]
-        assert editor.state.slot_index_for("delay", "ch03") == 0
+        assert [slot.kind for slot in editor.state.scan_slots] == ["duration"]
+        assert editor.state.slot_index_for("duration", "1") == 0
     finally:
         editor.close()
 

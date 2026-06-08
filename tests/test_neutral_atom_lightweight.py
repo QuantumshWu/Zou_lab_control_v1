@@ -552,11 +552,11 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     # dies with "named port connection 'enb' does not exist". Keep ena/enb symmetric.
     assert ".ena(" in top and ".enb(" in top
     assert "Always_Enabled" not in create_tcl
-    # 6 BRAMs now: 3 edge + scan + bus image + LANE image (the disjoint-bit delay-lane
-    # staging; the lane PLAY tables are engine LUTRAM, +0 RAMB36).
-    assert create_tcl.count("Enable_A {Use_ENA_Pin}") == 6   # all 6 BRAMs expose ENA
-    assert create_tcl.count("Enable_B {Use_ENB_Pin}") == 6   # ...and ENB (top drives both)
-    assert "blk_mem_gen_laneimg" in create_tcl and "blk_mem_gen_laneimg" in top
+    # 5 BRAMs: 3 edge (tick/coeff/mask) + scan + bus image.  The per-channel OUTPUT delay
+    # players are distributed-RAM SRL rings (+0 RAMB36) -- there is NO delay/lane image BRAM.
+    assert create_tcl.count("Enable_A {Use_ENA_Pin}") == 5   # all 5 BRAMs expose ENA
+    assert create_tcl.count("Enable_B {Use_ENB_Pin}") == 5   # ...and ENB (top drives both)
+    assert "blk_mem_gen_laneimg" not in create_tcl and "blk_mem_gen_laneimg" not in top
     # AXI4 BURST upload path: jtag_axi + axi_bram_ctrl are FULL AXI4 (not Lite), and the
     # top wires the INCR-burst sidebands -- so one create_hw_axi_txn -len N moves up to
     # 256 words and a few-thousand-word BRAM upload drops from seconds to ~100 ms.  A
@@ -574,22 +574,23 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     # the cursor stays at N-1, the host never reloads, and a >2*bank_size repeat_forever scan
     # stops dead after exactly one sweep.
     assert "scan_cursor <= active_scan_count" in engine
-    # DISJOINT-BIT DELAY LANES: a scanned digital delay whose edges reorder past other
-    # channels is pulled out of the global sorted table onto its own output bit, played
-    # by a 1-bit affine sub-player (structurally the per-bus DAC engine).  The engine
-    # must contain the lane LUTRAM player + the disjoint-bit merge; the top must surface
-    # the lane prog port + the lane image loader.  Locks the RTL to engine_model lanes.
-    assert "lane_value_mem" in engine and "lane_tick_mem" in engine and "lane_coeff_mem" in engine
-    assert "zlc_lane_tick" in engine and "bnd_lane_reinit" in engine
-    assert "lane_channel_bits" in engine and "lane_bit_pos" in engine
-    assert 'ram_style = "distributed"' in engine and "lane_tick_mem" in engine  # lane mem is LUTRAM, NOT BRAM
-    # the disjoint-bit output merge: out = (state_mask & ~lane_mask) | lane_out
-    assert "(state_mask & ~lane_mask) | lane_out" in engine
-    assert "lane_prog_we" in top and "lane_channel_bits" in top
-    assert "blk_mem_gen_laneimg" in top                   # lane IMAGE staging BRAM (mini-loader)
-    assert "C_LANE_COUNTS" in top and "C_LANE_BITS" in top
-    # lane PLAY mem MUST be distributed LUTRAM (never BRAM -- BRAM would bust the 35T)
-    assert "blk_mem_gen_lane " not in engine and "blk_mem_gen_lane(" not in engine
+    # PER-CHANNEL OUTPUT DELAY (the delay line): a channel delay is applied to the engine
+    # OUTPUT, not baked into the edges -- output_delayed[t] = output_undelayed[t-d], 0 before
+    # fire (any length, never disturbs another channel, first frame real).  Each delayed
+    # channel is a 1-bit SRL ring (sub-period off = d mod T) + a startup counter (skip =
+    # floor(d/T) whole periods, so d is unbounded), merged over the undelayed mask.  The OLD
+    # scanned-delay "lane" machinery must be GONE.
+    assert "zlc_lane_tick" not in engine and "lane_tick_mem" not in engine and "NUM_LANES" not in engine
+    assert "del_started_eff" in engine and "delayed_mask" in engine and "delayed_out" in engine
+    assert "del_skip_cnt" in engine and "del_off" in engine and "ring[" in engine
+    assert 'ram_style = "distributed"' in engine          # the SRL delay ring is LUTRAM, NOT BRAM
+    # the per-channel output-delay merge: out = (state_mask & ~delayed_mask) | delayed_out
+    assert "(state_mask & ~delayed_mask) | delayed_out" in engine
+    assert "NUM_DELAYS" in engine and "DELAY_DEPTH" in engine
+    # held CTRL scalars carry the delay (no per-channel image/loader): count/bits/off/skip
+    assert "delay_count" in top and "delay_off" in top and "delay_skip" in top
+    assert "C_DELAY_COUNT" in top and "C_DELAY_OFF" in top and "C_DELAY_SKIP" in top
+    assert "blk_mem_gen_lane" not in top                  # no delay/lane image BRAM at all
     assert "set top zlc_pulse_streamer_top" in program_tcl
     assert "ps.runs" in program_tcl
     assert "pulse_streamer.runs" not in program_tcl
@@ -1296,20 +1297,16 @@ def test_final_image_solver_90pct_and_packs_round_trip():
     incl. a 0..1023 DAC ramp (one segment) + loop + scan resident."""
 
     from fpga.pulse_streamer.host.image import solve_capacity, pack_program, unpack_program, scan_bank_words
-    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram, RuntimeBusSegment, DelayLane
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram, RuntimeBusSegment
 
     s = solve_capacity("xc7a35t", channel_count=62, target_pct=90.0)
     assert s.params.max_edges >= 4096
     assert s.params.bank_size >= 512
-    # every axis (RAMB36/LUT/FF/DSP) must stay <=90% WITH the delay lanes -- the lane
-    # PLAY tables are LUTRAM (+0 RAMB36), but each lane has ONE affine-MAC eval site
-    # (single-edge reinit OR step, no unrolled walk), so lanes add num_lanes MAC
-    # instances of DSP -- counted honestly below.
+    # every axis (RAMB36/LUT/FF/DSP) must stay <=90% of the part.
     assert s.all_within_budget() and s.resource_report["ramb36"]["pct"] <= 90.0
     assert all(r["pct"] <= 90.0 for r in s.resource_report.values())
-    assert s.params.num_lanes >= 1
-    # DSP includes the per-lane MAC sites (one eval per lane); must match the engine.
-    assert s.resource_report["dsp"]["used"] == (2 * s.params.bus_count + 5 + s.params.num_lanes) * s.params.num_slots
+    # DSP = the affine-MAC eval sites (bus start/stop + the 5 main sites); must match the engine.
+    assert s.resource_report["dsp"]["used"] == (2 * s.params.bus_count + 5) * s.params.num_slots
     big = solve_capacity("xc7a200t", channel_count=62)
     assert big.params.max_edges >= s.params.max_edges
 
@@ -1336,39 +1333,6 @@ def test_final_image_solver_90pct_and_packs_round_trip():
     assert b["mode"] == "ramp" and b["stop_value"] == 1023 and b["value_select"] == 2
     # a streamed chunk (beyond the resident window) packs into the right bank.
     assert scan_bank_words(prog, p, 0)  # chunk 0 non-empty
-
-
-def test_final_image_packs_delay_lanes_round_trip():
-    """The BRAM image round-trips the disjoint-bit DELAY LANES (host.image.pack_program
-    / unpack_program): each lane's affine base ticks + per-slot coeffs + 0/1 values,
-    plus the per-lane edge count and output channel_bit.  This is the host<->FPGA
-    contract for the lane image the top's mini-loader copies into the engine LUTRAM."""
-
-    from fpga.pulse_streamer.host.image import StreamerParams, pack_program, unpack_program, region_bases
-    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram, DelayLane
-
-    p = StreamerParams()
-    assert "lane" in region_bases(p)            # lane region exists after the bus region
-    prog = RuntimeSequenceProgram(
-        sequence_id="l", sequence_name="lanes", clock_hz=50e6,
-        channels=[f"ch{i:02d}" for i in range(62)],
-        ticks=[0, 50, 100], masks=[1 << 0, 0, 0],   # ch00 in the main table; ch01/ch07 on lanes
-        duration=4e-6, trigger_count=0, slot_count=1,
-        tick_slot_coeffs=[[0], [0], [0]],
-        scan_points=[[0], [30]], scan_coeff_frac_bits=8,
-        delay_lanes=[
-            DelayLane(channel="ch01", channel_bit=1, ticks=[0, 50], coeffs=[[256], [256]], values=[1, 0]),
-            DelayLane(channel="ch07", channel_bit=7, ticks=[10, 30, 60], coeffs=[[0], [128], [-64]], values=[1, 0, 1]),
-        ],
-    )
-    out = unpack_program(pack_program(prog, p), p)
-    pad = lambda r, n: list(r) + [0] * (n - len(r))
-    got = out["delay_lanes"]
-    assert len(got) == 2
-    assert got[0]["channel_bit"] == 1 and got[0]["ticks"] == [0, 50] and got[0]["values"] == [1, 0]
-    assert got[0]["coeffs"] == [pad([256], p.num_slots), pad([256], p.num_slots)]
-    assert got[1]["channel_bit"] == 7 and got[1]["ticks"] == [10, 30, 60] and got[1]["values"] == [1, 0, 1]
-    assert got[1]["coeffs"] == [pad([0], p.num_slots), pad([128], p.num_slots), pad([-64], p.num_slots)]
 
 
 def test_final_engine_model_fifo_1tick_and_streaming_scan():
@@ -1531,25 +1495,22 @@ def test_final_top_regions_match_image_and_has_structure():
         "mask": 64 + me + me * 2,
         "scan": 64 + me + me * 2 + me * 2,
         "bus": bus_base,
-        # bus image is bus_rows*bus_words = (4*64)*7 = 1792 words; lanes follow.
-        "lane": bus_base + (p.bus_count * p.max_bus_segments) * p.bus_words,
     }
-    for k in ("tick", "coeff", "mask", "scan", "bus", "lane"):
+    for k in ("tick", "coeff", "mask", "scan", "bus"):
         assert rb[k] == top[k], (k, rb[k], top[k])
 
     # one clean module, instantiates the final engine (no variant), 3 edge BRAMs
     assert "module zlc_pulse_streamer_top" in text and text.count("endmodule") == 1
     assert "zlc_edge_streamer" in text
     for ip in ("blk_mem_gen_edge_tick", "blk_mem_gen_edge_coeff", "blk_mem_gen_edge_mask",
-               "blk_mem_gen_scan", "blk_mem_gen_busimg", "blk_mem_gen_laneimg"):
+               "blk_mem_gen_scan", "blk_mem_gen_busimg"):
         assert ip in text, ip
     # streaming handshake + cursor read-back
     assert "bank_ready" in text and "scan_cursor" in text and "C_CURSOR" in text and "C_BANK_READY" in text
     # CTRL word map matches host.image.CtrlWords
     cw = im.CtrlWords
     for name, off in (("C_COMMAND", cw.COMMAND), ("C_STATUS", cw.STATUS), ("C_PROG_COUNT", cw.PROG_COUNT),
-                      ("C_BANK_SIZE", cw.BANK_SIZE), ("C_CURSOR", cw.CURSOR), ("C_BANK_READY", cw.BANK_READY),
-                      ("C_LANE_COUNT", cw.LANE_COUNT), ("C_LANE_COUNTS", cw.LANE_COUNTS), ("C_LANE_BITS", cw.LANE_BITS)):
+                      ("C_BANK_SIZE", cw.BANK_SIZE), ("C_CURSOR", cw.CURSOR), ("C_BANK_READY", cw.BANK_READY)):
         m = re.search(r"localparam integer %s\s*= (\d+);" % name, text)
         assert m and int(m.group(1)) == off, (name, off, m and m.group(1))
     assert "jtag_axi_0" in text and "axi_bram_ctrl_0" in text
@@ -2001,11 +1962,12 @@ def test_dac_plus_duration_scan_behavioral_model_value_and_timing():
 
 
 def test_pulse_table_dac_duration_delay_scan_simultaneously():
-    """DAC value + a duration BEFORE it + a delay all scan together.
+    """DAC value + a duration BEFORE it scan together, with a FIXED per-channel delay.
 
     The DAC bus segment must carry affine tick coefficients so its effective
     tick moves in lockstep with the scanned duration, while its value still
-    tracks the scanned DAC code -- the simultaneous DA+duration+delay scan.
+    tracks the scanned DAC code.  A per-channel delay is a fixed output delay
+    (a delay line) and is NOT scannable -- it is carried as a constant.
     """
 
     state = na.PulseTableState(
@@ -2017,25 +1979,29 @@ def test_pulse_table_dac_duration_delay_scan_simultaneously():
             na.PulsePeriod(100, (0, 0, 1), unit="ns"),  # period 0 duration scanned
             na.PulsePeriod(200, (0, 0, 0), unit="ns"),  # DAC level scanned here (period 1)
         ],
+        delays={"ch02": 40.0},          # FIXED per-channel delay (not scannable)
+        delay_units={"ch02": "ns"},
     )
     state.bind_field("duration", "0", unit="ns", label="load dur")   # s0
-    state.bind_field("delay", "ch02", unit="ns", label="trig delay")  # s1
-    state.bind_field("dac", "da_test@1", unit="value", label="da_test")  # s2
-    # rows: [period-0 duration ns, trig delay ns, DAC code]
-    state.set_scan_table([[40.0, 0.0, 0.0], [80.0, 20.0, 3.0], [120.0, 40.0, 2.0]])
+    state.bind_field("dac", "da_test@1", unit="value", label="da_test")  # s1
+    # binding a delay is rejected -- a delay is a fixed value, not a scan slot
+    with pytest.raises(ValueError, match="cannot be scanned"):
+        state.bind_field("delay", "ch02", unit="ns")
+    # rows: [period-0 duration ns, DAC code]
+    state.set_scan_table([[40.0, 0.0], [80.0, 3.0], [120.0, 2.0]])
 
     program = na.compile_pulse_table_scan_runtime_program(
         state, channels=["ch00", "ch01", "ch02"], clock_hz=50_000_000
     )
-    assert program.slot_kinds == ["duration", "delay", "dac"]
+    assert program.slot_kinds == ["duration", "dac"]
     scanned = [s for s in (program.bus_segments or []) if int(getattr(s, "value_select", 0))]
     assert len(scanned) == 1
     seg = scanned[0]
     # The DAC segment sits at period-1 start = scanned period-0 duration, so its
     # start-tick coefficient for slot s0 (duration) must be non-zero.
     assert seg.start_tick_coeffs is not None and seg.start_tick_coeffs[0] != 0
-    # ...and zero for the delay/dac slots (they don't move period-1's start).
-    assert seg.start_tick_coeffs[2] == 0
+    # ...and zero for the dac slot (it doesn't move period-1's start).
+    assert seg.start_tick_coeffs[1] == 0
 
     # The DAC value tracks the scanned code, and the effective tick moves with the
     # scanned period-0 duration -- verified by the affine evaluation per point.
@@ -2666,10 +2632,13 @@ def test_bound_pulse_frame_sequence_uses_requested_frames_not_gui_repeat_count()
 
 
 def test_bind_field_time_slot_always_normalized_to_ns():
-    """Binding a duration/delay rewrites the field to its 'str (ns)' display, so the scan
+    """Binding a duration rewrites the field to its 'str (ns)' display, so the scan
     slot MUST be stored in ns -- a period entered in us/ms would otherwise scan in that
     unit while the card shows 'str (ns)' (a silent 1000x mismatch).  bind_field converts
-    the nominal to ns and pins the slot unit to ns; the compiled scan point matches."""
+    the nominal to ns and pins the slot unit to ns; the compiled scan point matches.
+
+    A per-channel delay is a fixed output delay (a delay line) and is NOT scannable, so
+    bind_field('delay', ...) raises rather than silently treating it as a constant."""
     state = na.PulseTableState(
         channels=["a", "b"],
         periods=[na.PulsePeriod(1000, (1, 1), unit="ns"), na.PulsePeriod(20, (0, 0), unit="us")],
@@ -2677,12 +2646,15 @@ def test_bind_field_time_slot_always_normalized_to_ns():
     state.bind_field("duration", "1", unit="us")          # period 1 was 20 us
     slot = state.scan_slots[0]
     assert slot.unit == "ns" and slot.nominal == 20000.0   # 20 us -> 20000 ns
-    # a us delay normalizes too
+    # a delay is a FIXED value and cannot be scanned
     state.delays = {"a": 5}; state.delay_units = {"a": "us"}
-    idx = state.bind_field("delay", "a", unit="us")
-    assert state.scan_slots[idx].unit == "ns" and state.scan_slots[idx].nominal == 5000.0
+    with pytest.raises(ValueError, match="cannot be scanned"):
+        state.bind_field("delay", "a", unit="us")
+    # the fixed delay is left untouched (no slot added), only the duration slot exists
+    assert [s.kind for s in state.scan_slots] == ["duration"]
+    assert state.delays == {"a": 5}
     # and the compiled scan value is interpreted in ns: 30000 in the table -> 1500 ticks
-    state.set_scan_table([[20000.0, 5000.0], [30000.0, 5000.0]])
+    state.set_scan_table([[20000.0], [30000.0]])
     prog = na.compile_pulse_table_scan_runtime_program(state, channels=["a", "b"], clock_hz=50e6)
     # period-1 duration slot value 30000 ns = 1500 ticks (period 0 = 1000 ns = 50 ticks)
     assert prog.scan_points[1][0] == 1500
@@ -2726,8 +2698,8 @@ def test_pulse_table_snapped_snaps_literals_and_keeps_expressions():
             na.PulsePeriod(50, (1, 0), unit="ns"),    # off-grid -> 60 ns at 20 ns step
             na.PulsePeriod("s0", (0, 1), unit="str (ns)"),  # expression: must be kept
         ],
-        delays={"trig": 30.0, "trap": "s0"},          # 30 -> 40; "s0" kept
-        delay_units={"trig": "ns", "trap": "ns"},
+        delays={"trig": 30.0},                        # fixed per-channel delay; 30 -> 40
+        delay_units={"trig": "ns"},
         scan_slots=[{"kind": "duration", "target": "1", "unit": "ns", "nominal": 20.0}],
         scan_table=[[51.0], [9.0]],
         time_step_ns=20,
@@ -2736,19 +2708,18 @@ def test_pulse_table_snapped_snaps_literals_and_keeps_expressions():
     # literal duration snaps to a whole tick (50 -> 60), expression preserved
     assert snapped.periods[0].duration == 60
     assert snapped.periods[1].duration == "s0"
-    # literal delay snaps (30 -> 40), expression delay preserved
+    # the fixed delay snaps to a whole tick (30 -> 40)
     assert snapped.delays["trig"] == 40
-    assert snapped.delays["trap"] == "s0"
     # scan table: time slot snaps to the tick grid
     assert snapped.scan_table[0][0] == 60.0   # 51 ns -> 60 ns
-    assert snapped.scan_table[1][0] == 0.0    # 9 ns rounds to 0 (a delay slot may be 0)
+    assert snapped.scan_table[1][0] == 0.0    # 9 ns rounds to 0 (a duration slot may snap to 0)
     # the original state is untouched (snapped returns a copy)
     assert state.periods[0].duration == 50
 
     # snap_scan_table is the shared helper used by the GUI; DAC slots round to an
     # integer code, time slots snap to the tick grid.
     dac_slot = ScanSlot(kind="dac", target="da_dipole@0", unit="value")
-    time_slot = ScanSlot(kind="delay", target="trig", unit="ns")
+    time_slot = ScanSlot(kind="duration", target="1", unit="ns")
     snapped_rows = snap_scan_table([[51.0, 512.4], [9.0, 800.6]], [time_slot, dac_slot], time_step_ns=20)
     assert snapped_rows == [[60.0, 512.0], [0.0, 801.0]]
 
@@ -4021,16 +3992,16 @@ def _scan_point_geometry(state, *, point_ns, time_step_ns):
     return table_end, geom
 
 
-def _additive_scan_frame(state, *, point_ns, time_step_ns, channels, global_shift, frame_end_at, lane_channels=()):
+def _additive_scan_frame(state, *, point_ns, time_step_ns, channels, global_shift, frame_end_at):
     """ONE additive frame for ONE scan point, with the bracket UNROLLED -- modelling the
     engine's scan frame EXACTLY (independent interval math, NOT the affine compiler).
 
     ``global_shift`` G re-translates every edge so the earliest is >= 0 at every point.
     ``frame_end_at`` is the per-point frame length (the program's final effective tick the
     engine plays).  The edge table is ANCHORED at tick 0 (the compiler prepends an all-off
-    tick-0 edge for every scan point), so the engine seeds from tick 0 and every edge --
-    MAIN and LANE alike -- plays at its exact effective tick ``a + d + G`` with NO startup
-    slip.  Bus-member channels are excluded (driven by the bus engine)."""
+    tick-0 edge for every scan point), so the engine seeds from tick 0 and every edge plays
+    at its exact effective tick ``a + d + G`` with NO startup slip.  Bus-member channels are
+    excluded (driven by the bus engine)."""
     _table_end, geom = _scan_point_geometry(state, point_ns=point_ns, time_step_ns=time_step_ns)
     g = int(global_shift)
     bits = {ch: channels.index(ch) for ch in geom if ch in channels}
@@ -4082,11 +4053,10 @@ def _additive_scan_truth(program, state, *, scan_table, time_step_ns, channels, 
     ep = program if isinstance(program, em.EngineProgram) else em.EngineProgram.from_program(program)
     pts_ticks = [list(p) for p in (ep.scan_points or [[0] * ep.slot_count])]
     frame_ends = [em.effective_tick(ep.ticks[-1], ep.tick_slot_coeffs[-1], pt, ep.frac_bits) for pt in pts_ticks]
-    lane_channels = [lane.channel for lane in (getattr(program, "delay_lanes", None) or [])]
 
     frames = [
         _additive_scan_frame(state, point_ns=pn, time_step_ns=time_step_ns, channels=channels,
-                             global_shift=g, frame_end_at=fe, lane_channels=lane_channels)[0]
+                             global_shift=g, frame_end_at=fe)[0]
         for pn, fe in zip(points, frame_ends)
     ]
     out = []
@@ -4161,6 +4131,92 @@ def test_pulse_table_negative_delay_global_retranslate_in_hardware():
     assert em.reference_play(em.EngineProgram.from_program(prog), 300) == truth
 
 
+def test_rtl_delay_player_mirror_matches_physical_delay_any_length():
+    """RTL DELAY-PLAYER proof (no Verilog simulator): a register-exact Python mirror of the
+    hardware per-channel delay player -- a DELAY_DEPTH-bit SRL ring (sub-period read offset
+    off = d mod T) + a startup counter (skip = floor(d/T) whole periods decremented at each
+    frame seam, + off residual ticks) + the combinational merge out = (state_mask &
+    ~delayed_mask) | delayed_out -- equals phase_offset_play (== delay_line_reference for a
+    periodic signal) for ANY delay length.  This is the byte-exact contract between
+    fpga/pulse_streamer/zlc_edge_streamer.v's delay player and the host model."""
+    from fpga.pulse_streamer.host import engine_model as em
+
+    DEPTH = 2048
+    T = 100; n = T * 40
+    def undel(t):
+        p, m = t % T, 0
+        if p < 10: m |= 1            # A: [0,10)
+        if 80 <= p < 90: m |= 1 << 1  # B: [80,90) near the frame end (wraps for large d)
+        if 40 <= p < 55: m |= 1 << 2  # C: [40,55)
+        return m
+    U = [undel(t) for t in range(n)]
+    boundaries = set(range(T, n, T))   # the engine reseeds (a frame seam) every period T
+
+    def rtl_mirror(delays):
+        # one player per delayed bit: off=d%T (ring tap), skip=d//T (whole-period gate)
+        ch = [{"b": b, "off": d % T, "off_cnt": d % T, "skip_cnt": d // T,
+               "started": (d % T == 0 and d // T == 0), "ring": 0} for b, d in delays.items()]
+        rmask = (1 << DEPTH) - 1
+        out = []
+        for t in range(n):
+            m = U[t]
+            for c in ch:                                   # combinational merge (this tick)
+                m &= ~(1 << c["b"])
+                eff = c["started"] or (c["skip_cnt"] == 0 and c["off_cnt"] == 0)
+                read = ((U[t] >> c["b"]) & 1) if c["off"] == 0 else ((c["ring"] >> (c["off"] - 1)) & 1)
+                if eff:
+                    m |= read << c["b"]
+            out.append(m)
+            for c in ch:                                   # registered updates (next tick)
+                c["ring"] = ((c["ring"] << 1) | ((U[t] >> c["b"]) & 1)) & rmask   # push undelayed bit
+                if not c["started"]:
+                    sk = c["skip_cnt"]                      # both decisions read the pre-edge skip
+                    if sk == 0:
+                        if c["off_cnt"] == 0:
+                            c["started"] = True
+                        else:
+                            c["off_cnt"] -= 1
+                    if t in boundaries and sk != 0:
+                        c["skip_cnt"] = sk - 1
+        return out
+
+    for delays in [{1: 0}, {1: 30}, {1: 213}, {1: 5000}, {1: 30, 2: 7}, {1: 99999}, {0: 5, 1: 250, 2: 1}]:
+        mirror = rtl_mirror(delays)
+        assert mirror == em.phase_offset_play(U, delays, T), f"RTL mirror != phase_offset at {delays}"
+        assert mirror == em.delay_line_reference(U, delays), f"RTL mirror != physical delay at {delays}"
+
+
+def test_image_delay_ctrl_packing_matches_rtl_unpack():
+    """Host->RTL delay contract (no Verilog sim): image.pack_program packs channel_delays into
+    the C_DELAY_* CTRL words; reading them back EXACTLY as zlc_pulse_streamer_top.v does
+    (delay_count / packed delay_bits / delay_off / per-channel delay_skip, then d = skip*T +
+    off) must reconstruct the program's channel_delays byte-for-byte -- so the FPGA delay
+    player is fed exactly the intended per-channel delay.  Covers d < T, d = T, and d > T."""
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.devices.sequencer import compile_pulse_table_runtime_program
+    from fpga.pulse_streamer.host import image as img
+
+    for d_ns in (1500, 2500, 40, 2000):   # 75t(<T), 125t(skip=1), 2t, 100t(=T -> off=0,skip=1)
+        st = na.PulseTableState(
+            channels=["A", "B", "C"],
+            periods=[na.PulsePeriod(1000, (1, 1, 0), unit="ns"), na.PulsePeriod(1000, (0, 0, 1), unit="ns")],
+            time_step_ns=20, delays={"B": d_ns, "C": 200}, delay_units={"B": "ns", "C": "ns"})
+        prog = compile_pulse_table_runtime_program(st, clock_hz=50e6, repeat_forever=True)
+        p = img.StreamerParams()
+        w = img.pack_program(prog, p)
+        cbw, daw, T = p.channel_bit_width, p.delay_aw, int(prog.loop_end_tick)
+        cnt = w.get(img.CtrlWords.DELAY_COUNT, 0)
+        bits_w = sum(w.get(img.CtrlWords.DELAY_BITS + i, 0) << (32 * i) for i in range(2))
+        off_w = sum(w.get(img.CtrlWords.DELAY_OFF + i, 0) << (32 * i) for i in range(3))
+        recon = [0] * len(prog.channels)
+        for k in range(cnt):
+            b = (bits_w >> (k * cbw)) & ((1 << cbw) - 1)
+            off = (off_w >> (k * daw)) & ((1 << daw) - 1)
+            skip = w.get(img.CtrlWords.DELAY_SKIP + k, 0)
+            recon[b] = skip * T + off                       # the RTL gate opens at skip*T + off = d
+        assert recon == list(prog.channel_delays), f"d_ns={d_ns}: {recon} != {prog.channel_delays}"
+
+
 def test_physical_delay_phase_offset_equals_delay_line_any_length():
     """THE delay model: a channel delay is a per-channel delay on the engine OUTPUT, not
     baked into edges.  The finite-hardware realisation (startup counter + sub-period phase
@@ -4191,233 +4247,56 @@ def test_physical_delay_phase_offset_equals_delay_line_any_length():
             assert all(not ((rtl[t] >> bit) & 1) for t in range(min(d, n))), "delayed channel not silent during startup"
 
 
-def _rtl_lane_realization_play(ep, n_ticks):
-    """Re-implement the EXACT register transfers of the zlc_edge_streamer.v lane player
-    (lane_time/lane_idx/lane_bit, the bounded reinit fast-forward, the single-edge
-    normal step, the disjoint-bit merge) on top of rtl_mirror_play's main FSM.  A
-    divergence from reference_play flags a bug in THAT RTL realisation, not just the
-    abstract model -- the no-Verilog-sim proof for the lane sub-players."""
-    from fpga.pulse_streamer.host import engine_model as em
-    p = ep
-    n = len(p.ticks)
-    scan_en = bool(p.scan_points); scan_count = len(p.scan_points); frac = p.frac_bits
-
-    def e(i, s):
-        return em.effective_tick(p.ticks[i], p.tick_slot_coeffs[i], s, frac)
-
-    def e_le(s):
-        return em.effective_tick(p.loop_end_tick, p.loop_end_slot_coeffs, s, frac)
-
-    def le(L, i, s):
-        return em.effective_tick(L["ti"][i], L["co"][i], s, frac)
-
-    arm = []; pend = [None] * 2; fetch_idx = 0; rd_lat = 2; fd = 3
-
-    def reseed_from(si):
-        nonlocal fetch_idx, pend
-        arm.clear()
-        for k in range(fd):
-            if si + k < n:
-                arm.append(si + k)
-        fetch_idx = si + fd; pend = [None] * rd_lat
-
-    lanes = em._make_lanes(p)
-    LANE_MASK = 0
-    for L in lanes:
-        LANE_MASK |= 1 << L["cb"]
-
-    def lane_reinit(llt, s):          # RTL reseeds lanes ONLY to llt==0 -> single-edge
-        for L in lanes:               # check (edge 0 is the only one that can be <=0)
-            L["idx"] = 0; L["bit"] = 0
-            if len(L["ti"]) and le(L, 0, s) <= llt:
-                L["bit"] = L["va"][0]; L["idx"] = 1
-
-    def lane_step(llt, s):            # advance the single next edge if now due
-        for L in lanes:
-            if L["idx"] < len(L["ti"]) and le(L, L["idx"], s) <= llt:
-                L["bit"] = L["va"][L["idx"]]; L["idx"] += 1
-
-    def lane_bits():
-        b = 0
-        for L in lanes:
-            b |= L["bit"] << L["cb"]
-        return b
-
-    def boundary_to():
-        if e(0, slot) == 0:
-            reseed_from(1); return p.masks[0], 1, 1
-        reseed_from(0); return 0, 0, 0
-
-    slot = em._first_values(p)
-    final = 0 if n == 0 else e(n - 1, slot)
-    loop_end = e_le(slot); loops = p.loop_count; spi = 0; running = n != 0; llt = 0
-    if running:
-        sm, tc, ei = boundary_to(); lane_reinit(0, slot)
-    else:
-        sm, tc, ei = 0, 0, 0
-    out = []
-    for _ in range(n_ticks):
-        out.append((sm & ~LANE_MASK) | lane_bits())
-        llt += 1
-        if not running:
-            continue
-        if p.loop_count > 1 and loops > 1 and tc >= loop_end:
-            sm = p.masks[p.loop_start_index]; tc = e(p.loop_start_index, slot) + 1
-            ei = p.loop_start_index + 1; loops -= 1; reseed_from(p.loop_start_index + 1)
-            llt = e(p.loop_start_index, slot); lane_reinit(llt, slot); continue
-        if tc >= final:
-            if scan_en and spi + 1 < scan_count:
-                slot = list(p.scan_points[spi + 1]); spi += 1
-            elif p.repeat_forever and p.repeat_from_index > 0 and not scan_en:
-                ri = p.repeat_from_index
-                final = e(n - 1, slot); loop_end = e_le(slot); loops = p.loop_count
-                sm = p.masks[ri]; tc = e(ri, slot) + 1; ei = ri + 1; reseed_from(ri + 1)
-                llt = e(ri, slot); lane_reinit(llt, slot); continue
-            elif p.repeat_forever:
-                slot = em._first_values(p); spi = 0
-            else:
-                running = False; sm = 0; continue
-            final = e(n - 1, slot); loop_end = e_le(slot); loops = p.loop_count
-            sm, tc, ei = boundary_to(); llt = 0; lane_reinit(0, slot); continue
-        landed = pend[rd_lat - 1]
-        fire = (ei < n) and len(arm) and tc == e(arm[0], slot)
-        if fire:
-            sm = p.masks[arm[0]]; ei += 1; arm.pop(0)
-        if landed is not None:
-            arm.append(landed)
-        tc += 1
-        ifl = sum(1 for x in pend[0:rd_lat - 1] if x is not None)
-        issue = (len(arm) + ifl < fd) and fetch_idx < n
-        pend = [fetch_idx if issue else None] + pend[0:rd_lat - 1]
-        if issue:
-            fetch_idx += 1
-        lane_step(llt, slot)
-    return out
-
-
-def test_rtl_lane_player_realization_matches_reference():
-    """The SPECIFIC zlc_edge_streamer.v lane register design (lane_time + incremental
-    lane_idx + bounded reinit fast-forward + disjoint-bit merge) reproduces the
-    combinatorial reference for the reordering-delay program AND a fuzz set covering
-    start / scan-advance / loop-rewind / repeat / additive-repeat-from boundaries and
-    multiple lanes.  This is the no-Verilog-sim proof that the RTL realisation -- not
-    just engine_model -- is cycle-exact."""
-    import random
-    import Zou_lab_control.neutral_atom as na
-    from fpga.pulse_streamer.host import engine_model as em
-
-    # the real reordering-scan-delay program
-    st = na.PulseTableState(
-        channels=["A", "B"],
-        periods=[na.PulsePeriod(1000, (1, 1), unit="ns"), na.PulsePeriod(1000, (0, 0), unit="ns")],
-        time_step_ns=20, delays={"B": "s0"}, delay_units={"B": "ns"},
-        scan_slots=[{"kind": "delay", "target": "B", "unit": "ns", "nominal": 0.0}],
-        scan_table=[[0.0], [600.0]],
-    )
-    ep = em.EngineProgram.from_program(
-        na.compile_pulse_table_scan_runtime_program(st, channels=["A", "B"], clock_hz=50e6, repeat_forever=False))
-    assert _rtl_lane_realization_play(ep, 400) == em.reference_play(ep, 400)
-
-    def mk(**kw):
-        b = dict(ticks=[], masks=[], tick_slot_coeffs=[], scan_points=[], slot_count=0,
-                 frac_bits=8, loop_start_index=0, loop_end_tick=0, loop_end_slot_coeffs=[],
-                 loop_count=1, repeat_forever=False, repeat_from_index=0, delay_lanes=None)
-        b.update(kw)
-        b["tick_slot_coeffs"] = b["tick_slot_coeffs"] or [[0] * b["slot_count"] for _ in b["ticks"]]
-        b["loop_end_slot_coeffs"] = b["loop_end_slot_coeffs"] or [0] * b["slot_count"]
-        return em.EngineProgram(**b)
-
-    # The lane player reseeds only to llt==0 (single-frame reordering-delay scan: every
-    # lane program has loop_start==0, loop_count==1, repeat_from==0).  Cover start /
-    # scan-advance / repeat-forever-restart (all llt==0) + multiple lanes + an affine
-    # (scan-dependent) lane.  (Inner brackets / additive preamble on a lane are rejected
-    # by validate, never reach the RTL, and so are not modelled here.)
-    hand = {
-        "rf": mk(ticks=[0, 50, 100], masks=[1, 0, 0], loop_end_tick=100, repeat_forever=True,
-                 delay_lanes=[(1, [10, 40], [[0], [0]], [1, 0])]),
-        "scan": mk(ticks=[0, 50, 100], masks=[1, 0, 0], tick_slot_coeffs=[[0], [0], [0]],
-                   scan_points=[[0], [10], [20]], slot_count=1, loop_end_tick=100,
-                   delay_lanes=[(2, [0, 40], [[256], [256]], [1, 0])]),
-        "two": mk(ticks=[0, 80], masks=[1, 0], loop_end_tick=80, repeat_forever=True,
-                  delay_lanes=[(1, [5, 20], [[0], [0]], [1, 0]), (4, [10, 30], [[0], [0]], [1, 0])]),
-    }
-    for name, prog in hand.items():
-        assert _rtl_lane_realization_play(prog, 400) == em.reference_play(prog, 400), name
-
-    rnd = random.Random(11)
-    for _ in range(200):
-        frame = rnd.randint(20, 60)
-        mts = sorted({rnd.randint(0, frame - 2) for _ in range(rnd.randint(1, 4))})
-        mts = [0] + [t for t in mts if t > 0]
-        lanes = []; used = set()
-        for _ in range(rnd.randint(1, 3)):
-            cb = rnd.choice([1, 2, 3, 4, 5])
-            if cb in used:
-                continue
-            used.add(cb)
-            ts = sorted({rnd.randint(0, frame - 1) for _ in range(rnd.randint(2, 4))})
-            if len(ts) < 2:
-                continue
-            if len(ts) % 2:
-                ts = ts[:-1]
-            lanes.append((cb, ts, [[0] for _ in ts], [1 if i % 2 == 0 else 0 for i in range(len(ts))]))
-        if not lanes:
-            continue
-        # A lane program never rewinds to a non-zero frame tick (validate enforces
-        # loop_start==0 + no additive preamble), so the boundaries exercised are start /
-        # scan-advance / repeat-forever-restart -- all at llt==0.
-        prog = mk(ticks=mts + [frame], masks=[1 for _ in mts] + [0], loop_end_tick=frame,
-                  repeat_forever=(rnd.random() < 0.5),
-                  loop_start_index=0, loop_count=1, delay_lanes=lanes)
-        assert _rtl_lane_realization_play(prog, 500) == em.reference_play(prog, 500), (mts, lanes)
-
-
 def test_repeat_forever_scan_resweeps_and_commands_fpga():
     """repeat_forever means: sweep ALL scan points, then start over from point 0, forever
-    (NOT stop after one sweep).  Locks BOTH halves of that contract:
+    (NOT stop after one sweep).  Locks BOTH halves of that contract for a STREAMED scan
+    (N > 2*bank_size points, so the host must keep refilling the freed ping-pong bank):
       (1) the HOST writes the FPGA CTRL register so the engine re-sweeps -- REPEAT_FOREVER=1,
-          SCAN_ENABLE=1, SCAN_COUNT=N, BANK0_CHUNK=0 (the RTL wrap gate);
+          SCAN_ENABLE=1, SCAN_COUNT=N, BANK0_CHUNK=0 (the RTL wrap gate) -- and a streamed
+          chunk beyond the resident window packs into the right bank;
       (2) the engine re-sweeps -- the RTL-faithful rtl_mirror_play replays point 0..N-1 then
           wraps to point 0 again (the pattern repeats every sweep, never stops at N).
-    Covers a DURATION scan and a DELAY scan (lane) -- both must re-sweep identically."""
+    Uses a scanned DURATION; the streamed re-sweep handshake is independent of delays."""
     import Zou_lab_control.neutral_atom as na
-    from fpga.pulse_streamer.host.image import pack_program, StreamerParams, CtrlWords
+    from fpga.pulse_streamer.host.image import pack_program, scan_bank_words, StreamerParams, CtrlWords
     from fpga.pulse_streamer.host import engine_model as em
 
-    def duration_scan():
-        st = na.PulseTableState(channels=["a", "b"],
-            periods=[na.PulsePeriod(1000, (1, 1), unit="ns"), na.PulsePeriod(1000, (0, 0), unit="ns")],
-            time_step_ns=20)
-        st.bind_field("duration", "1", unit="ns")
-        st.set_scan_table([[1000.0], [2000.0], [3000.0]])   # 3 points
-        return st
+    # A scanned DURATION with enough points to STREAM (N > 2*bank_size).
+    st = na.PulseTableState(channels=["a", "b"],
+        periods=[na.PulsePeriod(1000, (1, 1), unit="ns"), na.PulsePeriod(1000, (0, 0), unit="ns")],
+        time_step_ns=20)
+    st.bind_field("duration", "1", unit="ns")
+    st.set_scan_table([[1000.0 + 100.0 * k] for k in range(10)])   # 10 duration points
+    st.repeat_forever = True
 
-    def delay_scan():
-        return na.PulseTableState(channels=["a", "b"],
-            periods=[na.PulsePeriod(1000, (1, 1), unit="ns"), na.PulsePeriod(1000, (0, 0), unit="ns")],
-            time_step_ns=20, delays={"b": "s0"}, delay_units={"b": "ns"},
-            scan_slots=[{"kind": "delay", "target": "b", "unit": "ns", "nominal": 0.0}],
-            scan_table=[[0.0], [400.0], [800.0]])
+    prog = na.compile_runtime_program_for_payload(st, channels=["a", "b"], clock_hz=50e6)
+    assert prog.repeat_forever and len(prog.scan_points) == 10
 
-    for make in (duration_scan, delay_scan):
-        st = make()
-        st.repeat_forever = True
-        prog = na.compile_runtime_program_for_payload(st, channels=["a", "b"], clock_hz=50e6)
-        assert prog.repeat_forever and len(prog.scan_points) == 3
-        # (1) the host commands the FPGA to re-sweep
-        w = pack_program(prog, StreamerParams(max_edges=4096, bank_size=2048))
-        assert w[CtrlWords.REPEAT_FOREVER] == 1
-        assert w[CtrlWords.SCAN_ENABLE] == 1
-        assert w[CtrlWords.SCAN_COUNT] == 3
-        assert w[CtrlWords.BANK0_CHUNK] == 0     # RTL wrap gate (bank_chunk0==0) passes
-        # (2) the RTL-faithful engine re-sweeps: point pattern repeats every full sweep,
-        # it does NOT stop after one sweep.
-        ep = em.EngineProgram.from_program(prog)
-        sweep = em.effective_tick(ep.loop_end_tick, ep.loop_end_slot_coeffs, ep.scan_points[-1], ep.frac_bits)
-        out = em.rtl_mirror_play(ep, 4000)
-        # the LAST scan point's frame must appear AGAIN after a full re-sweep -> not stopped.
-        assert out == em.reference_play(ep, 4000)
-        assert any(m != 0 for m in out[2 * sweep:])  # still toggling well past one sweep
+    # bank_size 4 -> 2*bank_size = 8 < 10 points, so the scan must STREAM the extra chunk(s).
+    p = StreamerParams(max_edges=4096, bank_size=4)
+    assert len(prog.scan_points) > 2 * p.bank_size
+
+    # (1) the host commands the FPGA to re-sweep
+    w = pack_program(prog, p)
+    assert w[CtrlWords.REPEAT_FOREVER] == 1
+    assert w[CtrlWords.SCAN_ENABLE] == 1
+    assert w[CtrlWords.SCAN_COUNT] == 10
+    assert w[CtrlWords.BANK0_CHUNK] == 0     # RTL wrap gate (bank_chunk0==0) passes
+    # a streamed chunk beyond the two resident banks packs into the right ping-pong bank.
+    assert scan_bank_words(prog, p, 2)       # chunk 2 (points 8..) is non-empty -> streamed
+
+    # (2) the RTL-faithful engine re-sweeps: point pattern repeats every full sweep,
+    # it does NOT stop after one sweep.
+    ep = em.EngineProgram.from_program(prog)
+    sweep = sum(
+        em.effective_tick(ep.ticks[-1], ep.tick_slot_coeffs[-1], pt, ep.frac_bits)
+        for pt in ep.scan_points
+    )
+    n_ticks = 2 * sweep + 200
+    out = em.rtl_mirror_play(ep, n_ticks)
+    # the full sweep must appear AGAIN after a complete re-sweep -> not stopped at N.
+    assert out == em.reference_play(ep, n_ticks)
+    assert any(m != 0 for m in out[sweep:])  # still toggling well past one sweep
 
 
 # ===========================================================================
@@ -4438,7 +4317,7 @@ def _agree_models(prog, n):
     return r
 
 
-def _assert_scan_matches_oracle(state, *, channels, clock_hz, repeat_forever, n_ticks, want_lane=None):
+def _assert_scan_matches_oracle(state, *, channels, clock_hz, repeat_forever, n_ticks):
     """Compile the SCAN program, validate it, and prove it == the independent additive
     scan oracle tick-for-tick AND across all three cycle models."""
     import Zou_lab_control.neutral_atom as na
@@ -4447,8 +4326,6 @@ def _assert_scan_matches_oracle(state, *, channels, clock_hz, repeat_forever, n_
     prog = na.compile_pulse_table_scan_runtime_program(
         state, channels=channels, clock_hz=clock_hz, repeat_forever=repeat_forever)
     validate_pulse_streamer_program(prog, channel_count=62)
-    if want_lane is not None:
-        assert bool(prog.delay_lanes) == bool(want_lane), (want_lane, prog.delay_lanes)
     r = _agree_models(prog, n_ticks)
     truth = _additive_scan_truth(
         prog, state, scan_table=state.scan_table, time_step_ns=1e9 / clock_hz,
@@ -4586,7 +4463,6 @@ def test_constant_delay_with_scanned_duration_is_output_delay_line():
     assert all(v == 0 for i, v in enumerate(pd.channel_delays) if i != bit)
     # the no-delay twin carries no output delay at all (None) or an all-zero vector
     assert not any(p0.channel_delays or [])
-    assert pd.delay_lanes is None        # NO lanes in the new model -- it's an output delay
 
     N = 1200
     out_d = em.reference_play(em.EngineProgram.from_program(pd), N)
@@ -4631,7 +4507,6 @@ def test_constant_delay_with_scanned_dac_value_is_output_delay_line():
     d_ticks = D_ns / 20   # 75
     assert pd.channel_delays[bit] == d_ticks
     assert all(v == 0 for i, v in enumerate(pd.channel_delays) if i != bit)
-    assert pd.delay_lanes is None
 
     N = 1200
     out_d = em.reference_play(em.EngineProgram.from_program(pd), N)
@@ -4677,7 +4552,6 @@ def test_constant_delay_with_inner_bracket_is_output_delay_line():
     d_ticks = D_ns / 20   # 75
     assert pd.channel_delays[bit] == d_ticks
     assert all(v == 0 for i, v in enumerate(pd.channel_delays) if i != bit)
-    assert pd.delay_lanes is None
 
     N = 1500
     out_d = em.reference_play(em.EngineProgram.from_program(pd), N)
