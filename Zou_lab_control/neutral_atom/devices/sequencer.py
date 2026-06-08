@@ -354,7 +354,7 @@ def compile_pulse_table_runtime_program(
         slots=slot_values,
         time_step_ns=clock_step_ns,
     )
-    ticks, masks, channels, loop_end, repeat_from_index = _pulse_table_edge_table(
+    ticks, masks, channels, loop_end, repeat_from_index, channel_delays = _pulse_table_edge_table(
         state,
         channels=channels,
         slots=slot_values,
@@ -393,7 +393,9 @@ def compile_pulse_table_runtime_program(
         "repeat_from_index": repeat_from_index,
         "bus_names": bus_names,
         "bus_segments": [segment.to_dict() for segment in bus_segments],
+        "channel_delays": [int(channel_delays.get(bit, 0)) for bit in range(len(channels))],
     }
+    channel_delays_list = [int(channel_delays.get(bit, 0)) for bit in range(len(channels))] if channel_delays else None
     sequence_id = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
     return RuntimeSequenceProgram(
         sequence_id=sequence_id,
@@ -413,6 +415,7 @@ def compile_pulse_table_runtime_program(
         repeat_from_index=repeat_from_index,
         bus_names=bus_names or None,
         bus_segments=bus_segments or None,
+        channel_delays=channel_delays_list,
     )
 
 
@@ -2004,25 +2007,19 @@ def _pulse_table_edge_table(
     time_step_ns: float,
     fold_analog_buses: bool = True,
     repeat_forever: bool = True,
-) -> tuple[list[int], list[int], list[str], int, int]:
-    """Build ``(ticks, masks, channels, loop_end, repeat_from_index)`` for one frame.
+) -> tuple[list[int], list[int], list[str], int, int, dict[int, int]]:
+    """Build ``(ticks, masks, channels, loop_end, repeat_from_index, channel_delays)``.
 
-    A channel/DAC delay is a PURE ADDITIVE delay (NOT the cyclic ``%total`` view the
-    preview shows): a channel delayed by ``d`` is its periodic signal shifted RIGHT by
-    ``d`` with ZERO before fire -- so the FIRST pulses after fire are the real
-    delayed sequence (the cyclic view would fake a wrapped-in tail at t=0, corrupting
-    the experiment startup).  The loop PERIOD stays the original frame ``T`` (delaying
-    one channel does not change another's period -- the physically-intuitive delay).
+    The edge table is UNDELAYED: every channel sits at its nominal position and the loop
+    period is the plain frame end ``table_end`` (``repeat_from_index`` always 0).  A channel
+    delay is NOT baked into the ticks -- it is applied to the engine OUTPUT by a per-channel
+    delay line (output_delayed[t] = output_undelayed[t-d], zero before fire).  This is the
+    literal physical delay: ANY length, never disturbs another channel, first frame real.
+    ``channel_delays`` maps output-bit -> delay in ticks (only nonzero entries).
 
-    A NEGATIVE delay re-translates the WHOLE frame: ``G = max(0, -min delay)`` is added
-    to every channel so the earliest event is ``>= 0`` (a uniform base offset cannot
-    reorder anything).
-
-    For ``repeat_forever`` this emits a real-startup PREAMBLE then one steady-state
-    frame, and returns ``repeat_from_index`` = the edge at the steady frame start so the
-    engine loops ONLY the steady frame (period ``T``), playing the preamble once.  For a
-    finite/one-shot run it emits the additively-shifted edges once (the frame extends to
-    fit), ``loop_end`` = last edge, ``repeat_from_index`` = 0."""
+    A NEGATIVE delay re-translates the WHOLE frame, so the global shift ``G = max(0, -min
+    delay)`` is FOLDED INTO every channel's delay (a causal delay line cannot lead): every
+    returned delay is ``raw_delay + G >= 0``, preserving relative timing."""
     hardware_channels = list(channel_names(channels, "channels"))
     starts = _pulse_table_period_starts_ticks(state, slots=slots, time_step_ns=time_step_ns)
     table_end = int(starts[-1])
@@ -2069,37 +2066,23 @@ def _pulse_table_edge_table(
                     ivals.append((active, table_end))
                 base_intervals[channel] = ivals
 
+    # PHYSICAL DELAY: edges are emitted UNDELAYED (every channel at its nominal position);
+    # each channel's delay is applied to the engine OUTPUT (a per-channel delay line), NOT
+    # baked into the ticks.  ``channel_delays`` carries it.  A NEGATIVE delay re-translates
+    # the WHOLE frame, so fold the global shift G = max(0, -min delay) into EVERY channel's
+    # delay -- a causal delay line cannot lead, so shifting everyone by G makes all delays
+    # >= 0 while preserving relative timing (the old in-edge G, now an output delay).
     global_shift = max(0, -min(raw_delay.values())) if raw_delay else 0
-    eff_delay = {channel: raw_delay[channel] + global_shift for channel in raw_delay}
-    max_eff = max(eff_delay.values()) if eff_delay else 0
+    channel_delays = {channel: raw_delay[channel] + global_shift for channel in raw_delay}
 
-    # --- emit ON/OFF events (additive, period-preserving) ---
-    # channel=None entries are period-boundary anchors (no-op edges) that keep the
-    # frame structure (and bracket loop boundaries) explicit.
+    # --- emit UNDELAYED ON/OFF events (channel=None entries are period-boundary anchors) ---
     events: list[tuple[int, str | None, int | None]] = []
-    if repeat_forever and table_end > 0 and max_eff > 0:
-        # PREAMBLE + steady frame: enough whole frames so the last one is steady-state.
-        num_frames = (max_eff + table_end - 1) // table_end + 1   # ceil(max_eff/T) + 1
-        loop_end = num_frames * table_end
-        for channel, ivals in base_intervals.items():
-            d = eff_delay[channel]
-            for k in range(num_frames + 1):
-                for a, b in ivals:
-                    s, e = a + d + k * table_end, b + d + k * table_end
-                    s, e = max(0, s), min(loop_end, e)
-                    if s < e:
-                        events.append((s, channel, 1)); events.append((e, channel, 0))
-    else:
-        # finite / one-shot / bracket / no-delay: the additively-shifted frame played
-        # once; the frame extends only to fit the latest shifted edge (a bracket's
-        # delays are validated to fit, so this stays the bracket frame end).
-        for tick in starts:
-            events.append((int(tick) + global_shift, None, None))
-        for channel, ivals in base_intervals.items():
-            d = eff_delay[channel]
-            for a, b in ivals:
-                events.append((a + d, channel, 1)); events.append((b + d, channel, 0))
-        loop_end = max([table_end + global_shift] + [int(t) for t, _, _ in events])
+    loop_end = table_end
+    for tick in starts:
+        events.append((int(tick), None, None))
+    for channel, ivals in base_intervals.items():
+        for a, b in ivals:
+            events.append((a, channel, 1)); events.append((b, channel, 0))
 
     grouped: dict[int, list[tuple[str | None, int | None]]] = {}
     for tick, channel, value in events:
@@ -2131,13 +2114,11 @@ def _pulse_table_edge_table(
         masks = [0] + masks
     ticks, masks = _ensure_final_off_edge(ticks, masks, loop_end)
 
+    # The frame is UNDELAYED, so the loop always replays the WHOLE frame (period = table_end);
+    # the per-channel output delay line, not a steady-frame rewind, produces the real startup.
     repeat_from_index = 0
-    if repeat_forever and table_end > 0 and max_eff > 0:
-        # the loop replays ONLY the steady frame [loop_end - T, loop_end); insert an
-        # anchor edge there carrying the steady-state-start mask so repeat_forever
-        # rewinds to it (NOT to edge 0 -- that would replay the startup preamble).
-        ticks, masks, repeat_from_index = _insert_mask_edge_at_tick(ticks, masks, loop_end - table_end)
-    return ticks, masks, hardware_channels, loop_end, repeat_from_index
+    channel_delays_by_bit = {channel_bits[ch]: int(d) for ch, d in channel_delays.items() if int(d) != 0}
+    return ticks, masks, hardware_channels, loop_end, repeat_from_index, channel_delays_by_bit
 
 
 def _dedupe_same_tick_edges(ticks: Sequence[int], masks: Sequence[int]) -> tuple[list[int], list[int]]:

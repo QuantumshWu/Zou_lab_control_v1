@@ -174,6 +174,9 @@ class EngineProgram:
     # sub-player on a disjoint output bit (a scanned-delay channel pulled out of the
     # global sorted table).
     delay_lanes: list | None = None
+    # PHYSICAL CHANNEL DELAY: per-output-bit delay in ticks, applied to the engine OUTPUT
+    # (a delay line) AFTER the undelayed play -- never baked into the edges.
+    channel_delays: list[int] | None = None
 
     @classmethod
     def from_program(cls, program) -> "EngineProgram":
@@ -199,7 +202,19 @@ class EngineProgram:
                  [list(c) for c in lane.coeffs], [int(v) for v in lane.values])
                 for lane in (getattr(program, "delay_lanes", None) or [])
             ] or None,
+            channel_delays=[int(v) for v in (getattr(program, "channel_delays", None) or [])] or None,
         )
+
+
+def _apply_channel_delays(out: list[int], p: "EngineProgram") -> list[int]:
+    """Apply the per-channel OUTPUT delay (the physical delay line) to a finished play.
+    No-op when no channel is delayed.  This is the EXACT ``delay_line_reference`` (the
+    ground truth); the RTL realises the same with a per-channel SRL ring + startup counter
+    (proven equal for the periodic span by test_physical_delay_phase_offset_*)."""
+    if not p.channel_delays or not any(p.channel_delays):
+        return out
+    cds = {b: int(d) for b, d in enumerate(p.channel_delays) if int(d)}
+    return delay_line_reference(out, cds)
 
 
 def _zero(p: EngineProgram) -> list[int]:
@@ -301,7 +316,7 @@ def reference_play(program, n_ticks: int) -> list[int]:
             if ei < n and tc == eff(ei, slot):
                 sm = p.masks[ei]; ei += 1
             tc += 1
-    return out
+    return _apply_channel_delays(out, p)
 
 
 # ----------------------------------------------------------------------------
@@ -424,7 +439,7 @@ def prefetch_play(program, n_ticks: int, *, read_latency: int = 2, fifo_depth: i
                 if tc == eff(ei, slot):
                     sm = p.masks[ei]; fifo.popleft(); ei += 1; issue()
             tc += 1
-    return out
+    return _apply_channel_delays(out, p)
 
 
 # ----------------------------------------------------------------------------
@@ -653,7 +668,7 @@ def rtl_mirror_play(program, n_ticks: int, *, rd_lat: int = 2, fifo_depth: int =
         if issue:
             fetch_idx += 1
         pend = new_pend
-    return out
+    return _apply_channel_delays(out, p)
 
 
 def bus_play(program, bus_index: int, n_ticks: int, scan_point: int = 0, *,

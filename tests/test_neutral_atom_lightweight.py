@@ -999,10 +999,12 @@ def test_pulse_table_state_compiles_repeat_visibility_and_delays(tmp_path):
     # whole flat frame still repeats forever) rather than the old compact inner loop.
     assert program.loop_count == 1
     assert program.masks[-1] == 0
-    # the 3 image periods each emit trig delayed by s0/2 (=5 ticks @ 10 ns/tick); the
-    # flat frame is 200 ticks (load 10 + 3*image 60 + idle 10).
-    assert program.loop_end_tick == 200
-    assert program.ticks[-1] == 200
+    # The edge table is UNDELAYED: the flat frame is 100 ticks (load 10 + 3*(image 20 +
+    # idle 10)); trig's delay (s0/2 = 5 ticks @ 10 ns/tick) rides channel_delays, applied to
+    # the OUTPUT, NOT baked into the frame.
+    assert program.loop_end_tick == 100
+    assert program.ticks[-1] == 100
+    assert program.channel_delays == [0, 0, 0, 5, 0, 0]   # trig (bit 3) delayed 5 ticks
     # the unrolled additive program plays IDENTICALLY to the independent additive oracle
     # and across all three cycle-accurate engine models (no Verilog sim needed).
     from fpga.pulse_streamer.host import engine_model as em
@@ -1017,8 +1019,10 @@ def test_pulse_table_state_compiles_repeat_visibility_and_delays(tmp_path):
     program_x = state.compile(clock_hz=100e6, trigger_channels=["trig"], slots=s0_200)
     assert program_x.trigger_count == 3
     assert program_x.repeat_forever is True
-    # s0=200 -> each image is 400 ns = 40 ticks; flat frame = 10 + 3*40 + 10 = 140 ticks.
-    assert program_x.ticks[-1] == 320
+    # s0=200 -> each image is 400 ns = 40 ticks; undelayed flat frame = 10 + 3*(40+10) = 160
+    # ticks (trig delay now 10 ticks on channel_delays, not in the frame).
+    assert program_x.ticks[-1] == 160
+    assert program_x.channel_delays == [0, 0, 0, 10, 0, 0]
     assert loaded.to_dict() == state.to_dict()
 
     state.hide_channel("aod0")
@@ -4098,12 +4102,13 @@ def _additive_scan_truth(program, state, *, scan_table, time_step_ns, channels, 
 
 
 def test_pulse_table_repeat_forever_delay_is_additive_in_hardware():
-    """HARDWARE delay is a PURE ADDITIVE shift (NOT the cyclic %total preview): the
-    channel comes out `delay` later with NO wrap, the frame EXTENDS to fit it, and the
-    loop repeats that extended frame.  The FIRST pulses after fire are exact (the cyclic
-    view would fake a wrapped-in tail at t=0, corrupting the experiment startup).
-    Proven against the independent additive oracle via the cycle-accurate engine model
-    (no Verilog/hardware needed)."""
+    """HARDWARE delay is a PURE PHYSICAL delay applied to the OUTPUT (a delay line), NOT
+    baked into the edges and NOT the cyclic %total preview: the channel comes out `delay`
+    later, the FIRST pulses after fire are real (silent until t=delay), and every OTHER
+    channel and the period are untouched.  The edge table stays UNDELAYED (loop period = the
+    plain frame T, repeat_from_index 0); the delay rides ``channel_delays`` and the engine
+    model applies it as the exact ``delay_line_reference``.  Proven against the independent
+    additive oracle (no Verilog/hardware needed)."""
     import Zou_lab_control.neutral_atom as na
     from Zou_lab_control.neutral_atom.devices.sequencer import compile_pulse_table_runtime_program
     from fpga.pulse_streamer.host import engine_model as em
@@ -4113,14 +4118,15 @@ def test_pulse_table_repeat_forever_delay_is_additive_in_hardware():
         periods=[na.PulsePeriod(1000, (1,), unit="ns"), na.PulsePeriod(1000, (0,), unit="ns")],
         time_step_ns=20,
     )  # frame 2000 ns = 100 ticks; ch0 ON [0,1000) = ticks [0,50)
-    st.delays = {"ch0": 1500}; st.delay_units = {"ch0": "ns"}   # +75 ticks (additive: extends)
+    st.delays = {"ch0": 1500}; st.delay_units = {"ch0": "ns"}   # +75 ticks (output delay)
 
     prog = compile_pulse_table_runtime_program(st, clock_hz=50e6, repeat_forever=True)
     assert prog.masks[-1] == 0                  # final mask is safe-idle
-    # period is PRESERVED at T=100: a preamble frame [0,100) plays once, then the steady
-    # frame [100,200) loops -- so loop_end=200 and the engine rewinds to tick 100, NOT 0.
-    assert prog.loop_end_tick == 200
-    assert prog.repeat_from_index > 0 and prog.ticks[prog.repeat_from_index] == 100
+    # UNDELAYED edge table: the loop period is the plain frame T=100, repeat_from_index 0
+    # (no preamble); the delay is an OUTPUT delay carried by channel_delays.
+    assert prog.loop_end_tick == 100
+    assert prog.repeat_from_index == 0
+    assert prog.channel_delays == [75]          # ch0 (bit 0) delayed 75 ticks on the output
 
     truth = _additive_truth(st, slots={}, time_step_ns=20, channels=["ch0"], n_ticks=400)
     ep = em.EngineProgram.from_program(prog)
