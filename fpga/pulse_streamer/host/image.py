@@ -69,13 +69,19 @@ class CtrlWords:
     BANK1_CHUNK = 18      # host -> top: sweep-chunk index currently resident in bank 1
     REPEAT_FROM_LOOP_START = 19  # repeat_forever rewinds to LOOP_START; with no channel
     #                              delay this is the whole frame (bracket loop start)
-    # Per-channel OUTPUT delay (the delay line): off = d mod T (sub-period ring offset),
-    # skip = floor(d/T) (whole-period startup count, any length), bit = the output channel
-    # bit.  Must match zlc_pulse_streamer_top.v C_DELAY_* and the engine's delay player.
+    # Per-channel OUTPUT delay (the UNBOUNDED membership delay line).  There is NO ring
+    # buffer: each delayed channel stores its ON intervals [a_i, b_i) in a per-channel
+    # LUTRAM (the DELAY image region, copied into the engine by the top loader) and the
+    # engine EVALUATES membership at the shifted phase ``(time_count - off) mod T`` -- so
+    # off is now the FULL phase (TICK_WIDTH, one 32b word/channel, not a ring index) and T
+    # is unbounded.  off = d mod T, skip = floor(d/T), bit = output channel bit, iv_count =
+    # number of ON intervals.  Layout is for the DEFAULT num_delays=8 (locked to
+    # zlc_pulse_streamer_top.v C_DELAY_* by test_final_top_regions_match_image).
     DELAY_COUNT = 20    # number of active delayed channels (<= num_delays)
     DELAY_BITS = 21     # packed per-channel output bit (channel_bit_width each) -> 2 words (21,22)
-    DELAY_OFF = 23      # packed per-channel off = d mod T (delay_aw each) -> 3 words (23,24,25)
-    DELAY_SKIP = 26     # per-channel skip = floor(d/T), one 32-bit word each -> num_delays words (26..)
+    DELAY_OFF = 23      # per-channel off = d mod T, one 32-bit word each -> num_delays words (23..30)
+    DELAY_IV_COUNTS = 31  # packed per-channel ON-interval count (iv_cnt_width each) -> 1 word
+    DELAY_SKIP = 32     # per-channel skip = floor(d/T), one 32-bit word each -> num_delays words (32..39)
 
 
 CTRL_WORDS = 64
@@ -94,19 +100,31 @@ class StreamerParams:
     bus_width: int = 10
     bus_seg_addr_width: int = 6
     bus_sel_width: int = 3
-    # per-channel OUTPUT delay players (the delay line).  num_delays = max simultaneously
-    # delayed channels; delay_depth = the sub-period ring depth (SRL) = the max frame period
-    # for which an arbitrary delay is exact (d is unbounded via the 32-bit skip counter).
+    # per-channel OUTPUT delay players (the UNBOUNDED membership delay line).  num_delays =
+    # max simultaneously delayed channels; max_delay_intervals = ON intervals stored per
+    # delayed channel.  There is NO ring/depth: off = d mod T is the full phase (tick_width)
+    # and T (the frame period) is unbounded -- the engine evaluates the stored intervals at
+    # the shifted phase instead of buffering, so NO frame-period cap exists.
     num_delays: int = 8
-    delay_depth: int = 2048
+    max_delay_intervals: int = 8
 
     @property
     def channel_bit_width(self) -> int:
         return _addr_width(max(2, self.channel_count))   # bits to index an output channel
 
     @property
-    def delay_aw(self) -> int:
-        return _addr_width(self.delay_depth)             # width of off = d mod T
+    def delay_iv_cnt_width(self) -> int:
+        # bits to hold an ON-interval count 0..max_delay_intervals
+        return _addr_width(max(2, self.max_delay_intervals)) + 1
+
+    @property
+    def delay_words(self) -> int:
+        # per ON-interval row: a_i, b_i (2*tick_width) + start/stop affine coeffs (2*coeff_bits)
+        return 2 + 2 * self.coeff_words
+
+    @property
+    def delay_rows(self) -> int:
+        return self.num_delays * self.max_delay_intervals
 
     @property
     def coeff_bits(self) -> int:
@@ -173,9 +191,10 @@ def region_bases(p: StreamerParams) -> dict:
     mask = coeff + p.max_edges * p.coeff_words
     scan = mask + p.max_edges * p.mask_words
     bus = scan + 2 * p.bank_size * p.scan_words
-    total = bus + p.bus_rows * p.bus_words
+    delay = bus + p.bus_rows * p.bus_words
+    total = delay + p.delay_rows * p.delay_words
     return {"ctrl": ctrl, "tick": tick, "coeff": coeff, "mask": mask,
-            "scan": scan, "bus": bus, "total": total}
+            "scan": scan, "bus": bus, "delay": delay, "total": total}
 
 
 # --------------------------------------------------------------------------- bits
@@ -343,36 +362,77 @@ def pack_program(program, params: StreamerParams | None = None) -> dict[int, int
             w[row + 2 + 2 * p.coeff_words] = flags
     w[CtrlWords.BUS_COUNTS] = bus_counts
 
-    # Per-channel OUTPUT delay (the delay line).  channel_delays[b] = d ticks; decompose into
-    # off = d mod T (the SRL ring read offset) and skip = floor(d/T) (whole periods suppressed
-    # at startup -- 32 bits, so d is effectively unbounded), where T = the engine's reseed
-    # period = loop_end_tick.  off rides the ring (depth delay_depth); skip is just a counter.
-    channel_delays = list(getattr(program, "channel_delays", None) or [])
-    active = [(b, int(d)) for b, d in enumerate(channel_delays) if int(d)]
-    if active:
+    # Per-channel OUTPUT delay (the UNBOUNDED membership delay line).  Each delayed channel
+    # carries its OWN undelayed ON intervals [a_i, b_i) over [0, T) (with affine tick coeffs so
+    # a scanned DURATION moves the interval) PLUS its delay d.  Decompose d into off = d mod T
+    # (the FULL phase shift, one 32b word/channel -- NOT a ring index) and skip = floor(d/T)
+    # (whole periods suppressed at startup, 32b), where T = the frame period = loop_end_tick.
+    # The intervals go into the DELAY image region (copied into the engine's per-channel LUTRAM
+    # by the top loader); the engine evaluates membership at (time_count - off) mod T -- NO
+    # buffer, so there is NO frame-period / delay-length cap of any kind.
+    delay_channels = _program_delay_channels(program)
+    if delay_channels:
         T = int(getattr(program, "loop_end_tick", 0) or 0)
-        if len(active) > p.num_delays:
-            raise ValueError(f"{len(active)} delayed channels > num_delays {p.num_delays}.")
-        cbw, daw = p.channel_bit_width, p.delay_aw
+        if len(delay_channels) > p.num_delays:
+            raise ValueError(f"{len(delay_channels)} delayed channels > num_delays {p.num_delays}.")
+        cbw = p.channel_bit_width
+        cnt_w = p.delay_iv_cnt_width
         delay_bits = 0
-        delay_off = 0
-        for k, (b, d) in enumerate(active):
-            off = (d % T) if T > 0 else d
-            skip = (d // T) if T > 0 else 0
-            if off >= p.delay_depth:
+        iv_counts = 0
+        for k, dc in enumerate(delay_channels):
+            b = int(dc["bit"])
+            d = int(dc["delay"])
+            off = (d % T) if T > 0 else d                 # full phase (no cap); T unbounded
+            skip = (d // T) if T > 0 else 0               # whole periods (32b counter)
+            ivals = list(dc.get("intervals") or [])
+            if len(ivals) > p.max_delay_intervals:
                 raise ValueError(
-                    f"channel-delay output bit {b}: off={off} ticks >= delay_depth {p.delay_depth} "
-                    f"(the frame period {T} ticks is longer than the delay ring); the delay line's "
-                    "sub-period offset must fit the ring -- shorten the frame or the delay.")
+                    f"channel-delay output bit {b}: {len(ivals)} ON intervals > "
+                    f"max_delay_intervals {p.max_delay_intervals}; raise max_delay_intervals.")
             delay_bits |= (b & ((1 << cbw) - 1)) << (k * cbw)
-            delay_off |= (off & ((1 << daw) - 1)) << (k * daw)
+            iv_counts |= (len(ivals) & ((1 << cnt_w) - 1)) << (k * cnt_w)
+            w[CtrlWords.DELAY_OFF + k] = _to_unsigned(off, 32)     # one 32b word per channel
             w[CtrlWords.DELAY_SKIP + k] = _to_unsigned(skip, 32)
-        w[CtrlWords.DELAY_COUNT] = len(active)
+            for i, iv in enumerate(ivals):
+                row = bases["delay"] + (k * p.max_delay_intervals + i) * p.delay_words
+                w[row + 0] = _to_unsigned(int(iv.get("start_tick", 0)), p.tick_width)
+                w[row + 1] = _to_unsigned(int(iv.get("stop_tick", 0)), p.tick_width)
+                sc = _field_words(_pack_coeffs(iv.get("start_tick_coeffs"), p), p.coeff_bits)
+                ec = _field_words(_pack_coeffs(iv.get("stop_tick_coeffs"), p), p.coeff_bits)
+                for j in range(p.coeff_words):
+                    w[row + 2 + j] = sc[j] if j < len(sc) else 0
+                    w[row + 2 + p.coeff_words + j] = ec[j] if j < len(ec) else 0
+        w[CtrlWords.DELAY_COUNT] = len(delay_channels)
         for i in range(2):   # delay_bits = num_delays*channel_bit_width bits -> 2 words
             w[CtrlWords.DELAY_BITS + i] = (delay_bits >> (32 * i)) & 0xFFFFFFFF
-        for i in range(3):   # delay_off = num_delays*delay_aw bits -> 3 words
-            w[CtrlWords.DELAY_OFF + i] = (delay_off >> (32 * i)) & 0xFFFFFFFF
+        w[CtrlWords.DELAY_IV_COUNTS] = iv_counts & 0xFFFFFFFF
     return w
+
+
+def _program_delay_channels(program) -> list[dict]:
+    """Normalise the program's per-channel delay info to a list of dicts
+    ``{bit, delay, intervals}`` (intervals = list of {start_tick, stop_tick,
+    start_tick_coeffs, stop_tick_coeffs}).
+
+    Prefers an explicit ``delay_channels`` (carries the ON intervals needed by the
+    membership player); falls back to ``channel_delays`` (delay only -- a delay with
+    no ON time, i.e. an always-off delayed channel) for backward-shaped inputs."""
+    dcs = getattr(program, "delay_channels", None)
+    if dcs:
+        out = []
+        for dc in dcs:
+            if isinstance(dc, Mapping):
+                bit, delay = int(dc.get("bit", 0)), int(dc.get("delay", 0))
+                ivals = list(dc.get("intervals") or [])
+            else:
+                bit, delay = int(getattr(dc, "bit", 0)), int(getattr(dc, "delay", 0))
+                ivals = [iv if isinstance(iv, Mapping) else iv.to_dict() for iv in (getattr(dc, "intervals", None) or [])]
+            out.append({"bit": bit, "delay": delay,
+                        "intervals": [dict(iv) for iv in ivals]})
+        return out
+    channel_delays = list(getattr(program, "channel_delays", None) or [])
+    return [{"bit": b, "delay": int(d), "intervals": []}
+            for b, d in enumerate(channel_delays) if int(d)]
 
 
 def unpack_program(words: Mapping[int, int], params: StreamerParams | None = None) -> dict:
@@ -418,8 +478,31 @@ def unpack_program(words: Mapping[int, int], params: StreamerParams | None = Non
                 "value_select": (flags >> (2 * p.bus_width + 2)) & ((1 << p.bus_sel_width) - 1),
                 "stop_value_select": (flags >> (2 * p.bus_width + 2 + p.bus_sel_width)) & ((1 << p.bus_sel_width) - 1),
             })
+    # Per-channel OUTPUT delay (the membership delay line): reconstruct each delayed
+    # channel's bit, off, skip, iv_count and its ON intervals from the DELAY image region.
+    delay_count = g(CtrlWords.DELAY_COUNT)
+    cbw, dcnt_w = p.channel_bit_width, p.delay_iv_cnt_width
+    delay_bits_w = sum(g(CtrlWords.DELAY_BITS + i) << (32 * i) for i in range(2))
+    iv_counts_w = g(CtrlWords.DELAY_IV_COUNTS)
+    delay_channels = []
+    for k in range(delay_count):
+        bit = (delay_bits_w >> (k * cbw)) & ((1 << cbw) - 1)
+        off = g(CtrlWords.DELAY_OFF + k)
+        skip = g(CtrlWords.DELAY_SKIP + k)
+        iv_count = (iv_counts_w >> (k * dcnt_w)) & ((1 << dcnt_w) - 1)
+        intervals = []
+        for i in range(iv_count):
+            row = bases["delay"] + (k * p.max_delay_intervals + i) * p.delay_words
+            intervals.append({
+                "start_tick": g(row + 0), "stop_tick": g(row + 1),
+                "start_tick_coeffs": _unpack_coeffs(_unfield([g(row + 2 + j) for j in range(p.coeff_words)], p.coeff_bits), p),
+                "stop_tick_coeffs": _unpack_coeffs(_unfield([g(row + 2 + p.coeff_words + j) for j in range(p.coeff_words)], p.coeff_bits), p),
+            })
+        delay_channels.append({"bit": bit, "off": off, "skip": skip,
+                               "iv_count": iv_count, "intervals": intervals})
     return {
         "ticks": ticks, "masks": masks, "tick_slot_coeffs": coeffs,
+        "delay_channels": delay_channels,
         "scan_points_resident": scan_points, "scan_count": n_points, "slot_count": slot_count,
         "repeat_forever": bool(g(CtrlWords.REPEAT_FOREVER) & 1),
         # LOOP_START is the additive-delay steady-frame anchor when the flag is set,
@@ -509,11 +592,14 @@ def solve_capacity(part, *, channel_count: int = 62, num_slots: int = 4, coeff_w
                           bank_size=bank_size, bus_count=bus_count, bus_width=bus_width,
                           bus_seg_addr_width=bus_seg_addr_width, bus_sel_width=bus_sel_width)
     # bus image is a small 32b BRAM (bus_rows*bus_words words); bus tables themselves
-    # live in engine LUTRAM (counted under distributed RAM / LUT, not RAMB36).
+    # live in engine LUTRAM (counted under distributed RAM / LUT, not RAMB36).  The delay
+    # ON-interval image is the SAME shape (delay_rows*delay_words 32b words) -- the engine
+    # per-channel interval tables are also LUTRAM, so the image is the only RAMB36 cost.
     bus_img_ram = _ceil(base.bus_rows * base.bus_words, 1024)
+    delay_img_ram = _ceil(base.delay_rows * base.delay_words, 1024)
     scan_ram = _scan_ramb(bank_size, base)
     ctrl_ram = 1
-    fixed = scan_ram + bus_img_ram + ctrl_ram
+    fixed = scan_ram + bus_img_ram + delay_img_ram + ctrl_ram
     # largest pow2 max_edges whose edge BRAM fits the remaining budget
     max_edges = 256
     for cand in (16384, 8192, 4096, 2048, 1024, 512, 256):
@@ -528,7 +614,7 @@ def solve_capacity(part, *, channel_count: int = 62, num_slots: int = 4, coeff_w
     for cand in (8192, 4096, 2048, 1024, bank_size):
         if cand < bank_size:
             continue
-        if _edge_ramb(max_edges, base) + _scan_ramb(cand, base) + bus_img_ram + ctrl_ram <= budget:
+        if _edge_ramb(max_edges, base) + _scan_ramb(cand, base) + bus_img_ram + delay_img_ram + ctrl_ram <= budget:
             chosen_bank = cand
             break
     bank_size = chosen_bank
@@ -537,7 +623,7 @@ def solve_capacity(part, *, channel_count: int = 62, num_slots: int = 4, coeff_w
                             tick_width=tick_width, coeff_frac_bits=coeff_frac_bits, max_edges=max_edges,
                             bank_size=bank_size, bus_count=bus_count, bus_width=bus_width,
                             bus_seg_addr_width=bus_seg_addr_width, bus_sel_width=bus_sel_width)
-    ramb36_used = _edge_ramb(max_edges, params) + scan_ram + bus_img_ram + ctrl_ram
+    ramb36_used = _edge_ramb(max_edges, params) + scan_ram + bus_img_ram + delay_img_ram + ctrl_ram
     # per bus-segment row: start+stop tick (2*tick_width), start+stop tick coeffs
     # (2*coeff_bits), start+stop value (2*bus_width), mode (2), and the start AND stop
     # value_select (2*bus_sel_width -- a ramp can scan both endpoints).

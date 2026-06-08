@@ -35,6 +35,7 @@ __all__ = [
     "streaming_scan_play", "rtl_mirror_play", "bus_play", "min_edge_spacing",
     "PrefetchStall", "ScanUnderflow",
     "delay_line_reference", "phase_offset_play",
+    "membership_delay_play", "membership_bus_delay_play",
 ]
 
 
@@ -128,6 +129,130 @@ def phase_offset_play(undelayed: Sequence[int], channel_delays, period: int) -> 
                 if (int(undelayed[phase]) >> bit) & 1:
                     m |= 1 << bit
         out.append(m)
+    return out
+
+
+# ----------------------------------------------------------------------------
+# REGISTER-EXACT MIRRORS of the UNBOUNDED membership delay player
+# ----------------------------------------------------------------------------
+# The RTL (zlc_edge_streamer.v) does NOT BUFFER the delayed signal (a buffer of depth N
+# would cap the frame period at N).  Instead each delayed channel/bus stores its OWN
+# undelayed pattern -- TTL: the ON intervals [a_i, b_i) over [0, T); DAC: the bus value
+# segments -- in a tiny per-channel LUTRAM, and produces the delayed value by EVALUATING
+# that pattern at the shifted phase ``shifted = (time_count - off) mod T``.  No buffer ->
+# T (and the delay) are UNBOUNDED.  These two functions reproduce the EXACT registers of
+# that RTL so a divergence from phase_offset_play / delay_line_reference flags an RTL bug.
+#
+# Per delayed channel the RTL holds:
+#   * the resolved ON intervals [a_i, b_i) (TTL) / bus value segments (DAC),
+#   * off  = d mod T  (the sub-period phase shift; HOST-supplied per scan point),
+#   * skip = floor(d/T) (whole periods; HOST-supplied per scan point -- NO FPGA divider).
+# Combinational each playback tick:
+#   shifted = time_count - off; if shifted < 0: shifted += T
+#   bit/value = pattern evaluated at ``shifted``
+#   out = started ? bit/value : 0(safe)
+# Startup gate (real first frame, silent until t == d):
+#   skip_cnt decrements once at each gapless frame seam; off_cnt decrements each
+#   running tick once skip_cnt == 0; started when both reach 0 (== d ticks).
+# off == 0 && skip == 0 (zero delay) => started from t = 0, shifted == time_count
+# => passthrough.  The delay LENGTH is unbounded (skip is a >=32-bit counter); the
+# offset is plain ``time_count - off`` arithmetic (no buffer) bounded only by
+# TICK_WIDTH -- effectively unbounded.
+
+
+def membership_delay_play(undelayed: Sequence[int], channel_delays, period: int) -> list[int]:
+    """Register-exact mirror of the RTL membership TTL delay player (no buffer).
+
+    For each delayed bit it stores the bit's own undelayed ON intervals over [0, T)
+    and evaluates membership at ``shifted = (time_count - off) mod T`` with a
+    skip/off startup gate -- exactly the RTL registers.  ``period`` = T = the
+    engine's frame/loop_end tick.  Equal to :func:`phase_offset_play` /
+    :func:`delay_line_reference` for ANY delay length (off above any old ring depth,
+    huge d, zero, and -- via the global shift folded by the host -- negative)."""
+    cds = {int(b): int(d) for b, d in dict(channel_delays).items() if int(d) != 0}
+    delayed_mask = 0
+    for b in cds:
+        delayed_mask |= 1 << b
+    T = int(period)
+
+    # Per-bit undelayed ON intervals [a_i, b_i) over [0, T) -- the LUTRAM table.
+    def intervals_of(bit: int) -> list[tuple[int, int]]:
+        ivals: list[tuple[int, int]] = []
+        active = None
+        for t in range(T):
+            on = (int(undelayed[t]) >> bit) & 1 if t < len(undelayed) else 0
+            if on and active is None:
+                active = t
+            elif not on and active is not None:
+                ivals.append((active, t)); active = None
+        if active is not None:
+            ivals.append((active, T))
+        return ivals
+
+    # Per-player off/skip seeded at FIRE (== the RTL del_off/del_skip).  off = d mod T is the
+    # full phase shift; skip = floor(d/T) is the target frame index at which the gate opens.
+    players = []
+    for bit, d in cds.items():
+        players.append({
+            "bit": bit, "off": (d % T) if T > 0 else d,
+            "skip": (d // T) if T > 0 else 0, "ivals": intervals_of(bit),
+        })
+
+    out = []
+    for t in range(len(undelayed)):
+        m = int(undelayed[t]) & ~delayed_mask          # passthrough non-delayed bits
+        # the engine's per-frame counter (time_count) cycles 0..T-1 each frame, and a frame
+        # index (frames elapsed since fire) advances at each seam.  t = frame_idx*T + time_count.
+        frame_idx = t // T if T > 0 else 0
+        time_count = t % T if T > 0 else t
+        for p in players:                              # combinational merge (this tick)
+            # STARTUP GATE: out is silent until exactly t == d = skip*T + off.  Equivalent to
+            # ``t >= d`` but expressed from the bounded (frame_idx, time_count) the RTL holds:
+            #   started = (frame_idx > skip) || (frame_idx == skip && time_count >= off)
+            started = (frame_idx > p["skip"]) or (frame_idx == p["skip"] and time_count >= p["off"])
+            if started and T > 0:
+                shifted = time_count - p["off"]        # shifted = (time_count - off) mod T
+                if shifted < 0:
+                    shifted += T
+                for a, b in p["ivals"]:
+                    if a <= shifted < b:
+                        m |= 1 << p["bit"]; break
+        out.append(m)
+    return out
+
+
+def membership_bus_delay_play(undelayed_bus: Sequence[int], delay: int, period: int,
+                              *, safe_value: int = 0) -> list[int]:
+    """Register-exact mirror of the RTL membership DAC-bus delay player (no buffer).
+
+    A delayed DAC bus value = the bus VALUE stream delayed by ``d``: evaluate the
+    undelayed bus value at the shifted phase ``(time_count - off) mod T`` with the
+    SAME skip/off startup gate (hold ``safe_value`` before t == d).  ``undelayed_bus``
+    is the per-tick undelayed bus value (e.g. from :func:`bus_play`); ``period`` = T.
+    Negative/zero/huge ``d`` all behave like the TTL player (negative via the host's
+    global shift -> off/skip >= 0)."""
+    d = int(delay)
+    T = int(period)
+    if d == 0 or T <= 0:
+        return [int(v) for v in undelayed_bus]
+    off = d % T
+    skip = d // T
+    out = []
+    for t in range(len(undelayed_bus)):
+        frame_idx = t // T
+        time_count = t % T                              # per-frame counter (0..T-1)
+        # same startup gate as the TTL membership player: silent until t == d = skip*T + off.
+        started = (frame_idx > skip) or (frame_idx == skip and time_count >= off)
+        if started:
+            shifted = time_count - off
+            if shifted < 0:
+                shifted += T
+            # the delayed bus value = the undelayed value at this frame phase; the RTL
+            # re-evaluates the bus segments at ``shifted`` (always valid), so read the
+            # steady frame's value at that phase (frame 0 holds the canonical pattern).
+            out.append(int(undelayed_bus[shifted]) if shifted < len(undelayed_bus) else safe_value)
+        else:
+            out.append(int(safe_value))
     return out
 
 

@@ -552,11 +552,13 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     # dies with "named port connection 'enb' does not exist". Keep ena/enb symmetric.
     assert ".ena(" in top and ".enb(" in top
     assert "Always_Enabled" not in create_tcl
-    # 5 BRAMs: 3 edge (tick/coeff/mask) + scan + bus image.  The per-channel OUTPUT delay
-    # players are distributed-RAM SRL rings (+0 RAMB36) -- there is NO delay/lane image BRAM.
-    assert create_tcl.count("Enable_A {Use_ENA_Pin}") == 5   # all 5 BRAMs expose ENA
-    assert create_tcl.count("Enable_B {Use_ENB_Pin}") == 5   # ...and ENB (top drives both)
+    # 6 BRAMs: 3 edge (tick/coeff/mask) + scan + bus image + delay ON-interval image.  The
+    # per-channel OUTPUT delay tables are distributed-RAM LUTRAM (+0 RAMB36); only the small
+    # delay UPLOAD image is a BRAM (like the bus image).  No ring buffer anywhere.
+    assert create_tcl.count("Enable_A {Use_ENA_Pin}") == 6   # all 6 BRAMs expose ENA
+    assert create_tcl.count("Enable_B {Use_ENB_Pin}") == 6   # ...and ENB (top drives both)
     assert "blk_mem_gen_laneimg" not in create_tcl and "blk_mem_gen_laneimg" not in top
+    assert "blk_mem_gen_delayimg" in create_tcl and "blk_mem_gen_delayimg" in top
     # AXI4 BURST upload path: jtag_axi + axi_bram_ctrl are FULL AXI4 (not Lite), and the
     # top wires the INCR-burst sidebands -- so one create_hw_axi_txn -len N moves up to
     # 256 words and a few-thousand-word BRAM upload drops from seconds to ~100 ms.  A
@@ -574,23 +576,37 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     # the cursor stays at N-1, the host never reloads, and a >2*bank_size repeat_forever scan
     # stops dead after exactly one sweep.
     assert "scan_cursor <= active_scan_count" in engine
-    # PER-CHANNEL OUTPUT DELAY (the delay line): a channel delay is applied to the engine
-    # OUTPUT, not baked into the edges -- output_delayed[t] = output_undelayed[t-d], 0 before
-    # fire (any length, never disturbs another channel, first frame real).  Each delayed
-    # channel is a 1-bit SRL ring (sub-period off = d mod T) + a startup counter (skip =
-    # floor(d/T) whole periods, so d is unbounded), merged over the undelayed mask.  The OLD
-    # scanned-delay "lane" machinery must be GONE.
+    # PER-CHANNEL OUTPUT DELAY -- the UNBOUNDED MEMBERSHIP delay line.  A channel delay is
+    # applied to the engine OUTPUT, not baked into the edges -- output_delayed[t] =
+    # output_undelayed[t-d], 0 before fire (ANY length, never disturbs another channel, first
+    # frame real).  There is NO ring/buffer: each delayed channel stores its OWN undelayed ON
+    # intervals in a per-channel LUTRAM and the engine EVALUATES membership at the shifted phase
+    # ``shifted = (time_count - off) mod T`` (off = d mod T is the full TICK_WIDTH phase, NOT a
+    # ring index), gated by a startup counter (skip = floor(d/T) whole periods).  This is what
+    # removes the frame-period cap -- so the OLD ring/DELAY_DEPTH machinery (and the even older
+    # scanned-delay "lane") must be GONE.
     assert "zlc_lane_tick" not in engine and "lane_tick_mem" not in engine and "NUM_LANES" not in engine
+    # NO ring / NO depth cap anywhere -- the membership eval has no buffer.
+    assert "ring[" not in engine                                     # the SRL ring array is gone
+    assert "DELAY_DEPTH" not in engine and "DELAY_DEPTH" not in top and "DELAY_DEPTH" not in create_tcl
+    assert "DELAY_AW" not in engine and "DELAY_AW" not in top
+    # the membership player: shifted-phase eval over per-channel ON-interval LUTRAM + startup gate
     assert "del_started_eff" in engine and "delayed_mask" in engine and "delayed_out" in engine
-    assert "del_skip_cnt" in engine and "del_off" in engine and "ring[" in engine
-    assert 'ram_style = "distributed"' in engine          # the SRL delay ring is LUTRAM, NOT BRAM
+    assert "del_skip" in engine and "del_off" in engine and "del_frame_idx" in engine
+    assert "del_iv_count" in engine and "del_iv_start_mem" in engine and "del_iv_stop_mem" in engine
+    assert "del_phase" in engine and "del_member" in engine          # shifted-phase membership eval
+    # the startup gate is a combinational frame-index compare (NO decrementing counter)
+    assert "frame_idx > del_skip" in engine.replace("del_frame_idx[del_m]", "frame_idx")
+    assert "MAX_DELAY_INTERVALS" in engine                            # interval table geometry
+    assert 'ram_style = "distributed"' in engine                     # interval LUTRAM, NOT BRAM
     # the per-channel output-delay merge: out = (state_mask & ~delayed_mask) | delayed_out
     assert "(state_mask & ~delayed_mask) | delayed_out" in engine
-    assert "NUM_DELAYS" in engine and "DELAY_DEPTH" in engine
-    # held CTRL scalars carry the delay (no per-channel image/loader): count/bits/off/skip
+    assert "NUM_DELAYS" in engine
+    # held CTRL scalars + the interval-image loader carry the delay: count/bits/off/iv_counts/
+    # skip in CTRL, intervals copied via delay_prog_* (NO ring).
     assert "delay_count" in top and "delay_off" in top and "delay_skip" in top
-    assert "C_DELAY_COUNT" in top and "C_DELAY_OFF" in top and "C_DELAY_SKIP" in top
-    assert "blk_mem_gen_lane" not in top                  # no delay/lane image BRAM at all
+    assert "delay_iv_counts" in top and "delay_prog_we" in top
+    assert "C_DELAY_COUNT" in top and "C_DELAY_OFF" in top and "C_DELAY_SKIP" in top and "C_DELAY_IV_COUNTS" in top
     assert "set top zlc_pulse_streamer_top" in program_tcl
     assert "ps.runs" in program_tcl
     assert "pulse_streamer.runs" not in program_tcl
@@ -4133,15 +4149,19 @@ def test_pulse_table_negative_delay_global_retranslate_in_hardware():
 
 def test_rtl_delay_player_mirror_matches_physical_delay_any_length():
     """RTL DELAY-PLAYER proof (no Verilog simulator): a register-exact Python mirror of the
-    hardware per-channel delay player -- a DELAY_DEPTH-bit SRL ring (sub-period read offset
-    off = d mod T) + a startup counter (skip = floor(d/T) whole periods decremented at each
-    frame seam, + off residual ticks) + the combinational merge out = (state_mask &
-    ~delayed_mask) | delayed_out -- equals phase_offset_play (== delay_line_reference for a
-    periodic signal) for ANY delay length.  This is the byte-exact contract between
-    fpga/pulse_streamer/zlc_edge_streamer.v's delay player and the host model."""
+    UNBOUNDED MEMBERSHIP per-channel delay player -- per delayed channel a tiny ON-interval
+    LUTRAM ([a_i, b_i) over [0, T)) EVALUATED at the shifted phase ``shifted = (time_count -
+    off) mod T`` (off = d mod T is the FULL phase, NO ring index, NO buffer), gated by the
+    purely-combinational frame-index compare (frame_idx > skip) || (frame_idx == skip &&
+    time_count >= off) -- == ``t >= d`` with NO decrementing counter -- where frame_idx (a
+    registered counter ++'d at each gapless seam) and time_count are the engine's own state.
+    Merged out = (state_mask & ~delayed_mask) | delayed_out -- equals membership_delay_play ==
+    phase_offset_play == delay_line_reference for ANY delay length.  This walks EXACTLY the
+    registers of zlc_edge_streamer.v's membership player.  Because the eval has NO buffer, the
+    cases include off FAR above the old 2048 ring depth and d >> T -- which the old ring could
+    NOT realise -- proving the period/length cap is gone."""
     from fpga.pulse_streamer.host import engine_model as em
 
-    DEPTH = 2048
     T = 100; n = T * 40
     def undel(t):
         p, m = t % T, 0
@@ -4150,53 +4170,149 @@ def test_rtl_delay_player_mirror_matches_physical_delay_any_length():
         if 40 <= p < 55: m |= 1 << 2  # C: [40,55)
         return m
     U = [undel(t) for t in range(n)]
-    boundaries = set(range(T, n, T))   # the engine reseeds (a frame seam) every period T
+    # The engine reseeds (sets up the NEXT frame) on the LAST tick of each frame (t = k*T-1),
+    # so the registered frame_idx++ lands at t = k*T -- making frame_idx == t//T and
+    # time_count == t%T self-consistent at every tick (matches reference_play's periodicity).
+    boundaries = set(range(T - 1, n, T))
+
+    def intervals_of(b):               # the per-channel ON-interval LUTRAM contents over [0, T)
+        ivals, active = [], None
+        for p in range(T):
+            on = (undel(p) >> b) & 1
+            if on and active is None:
+                active = p
+            elif not on and active is not None:
+                ivals.append((active, p)); active = None
+        if active is not None:
+            ivals.append((active, T))
+        return ivals
 
     def rtl_mirror(delays):
-        # one player per delayed bit: off=d%T (ring tap), skip=d//T (whole-period gate)
-        ch = [{"b": b, "off": d % T, "off_cnt": d % T, "skip_cnt": d // T,
-               "started": (d % T == 0 and d // T == 0), "ring": 0} for b, d in delays.items()]
-        rmask = (1 << DEPTH) - 1
+        # one player per delayed bit: off = d % T (FULL phase, not a ring index), skip = d // T
+        # (the TARGET frame index), a registered frame_idx (++ at each seam), plus the player's
+        # own ON intervals -- NO buffer, NO startup counter.
+        ch = [{"b": b, "off": d % T, "skip": d // T, "frame_idx": 0, "ivals": intervals_of(b)}
+              for b, d in delays.items()]
         out = []
         for t in range(n):
             m = U[t]
+            tc = t % T                                     # the engine's per-frame counter
             for c in ch:                                   # combinational merge (this tick)
                 m &= ~(1 << c["b"])
-                eff = c["started"] or (c["skip_cnt"] == 0 and c["off_cnt"] == 0)
-                read = ((U[t] >> c["b"]) & 1) if c["off"] == 0 else ((c["ring"] >> (c["off"] - 1)) & 1)
-                if eff:
-                    m |= read << c["b"]
+                # startup gate (combinational, NO counter): (frame_idx > skip) ||
+                #   (frame_idx == skip && time_count >= off)  ==  t >= d
+                started = (c["frame_idx"] > c["skip"]) or (c["frame_idx"] == c["skip"] and tc >= c["off"])
+                shifted = tc - c["off"]                    # (time_count - off) mod T (one cond +T)
+                if shifted < 0:
+                    shifted += T
+                member = any(a <= shifted < bb for a, bb in c["ivals"])   # membership eval, NO buffer
+                if started and member:
+                    m |= 1 << c["b"]
             out.append(m)
-            for c in ch:                                   # registered updates (next tick)
-                c["ring"] = ((c["ring"] << 1) | ((U[t] >> c["b"]) & 1)) & rmask   # push undelayed bit
-                if not c["started"]:
-                    sk = c["skip_cnt"]                      # both decisions read the pre-edge skip
-                    if sk == 0:
-                        if c["off_cnt"] == 0:
-                            c["started"] = True
-                        else:
-                            c["off_cnt"] -= 1
-                    if t in boundaries and sk != 0:
-                        c["skip_cnt"] = sk - 1
+            if t in boundaries:                            # registered: frame_idx ++ at each seam
+                for c in ch:
+                    c["frame_idx"] += 1
         return out
 
+    # off FAR above the old 2048 ring depth (T=100 d=5000 -> off=0 skip=50; T=100 d=99999 ->
+    # off=99 skip=999) AND d >> T -- the OLD ring could not store these, the membership eval can.
     for delays in [{1: 0}, {1: 30}, {1: 213}, {1: 5000}, {1: 30, 2: 7}, {1: 99999}, {0: 5, 1: 250, 2: 1}]:
         mirror = rtl_mirror(delays)
+        assert mirror == em.membership_delay_play(U, delays, T), f"RTL mirror != membership at {delays}"
         assert mirror == em.phase_offset_play(U, delays, T), f"RTL mirror != phase_offset at {delays}"
         assert mirror == em.delay_line_reference(U, delays), f"RTL mirror != physical delay at {delays}"
 
 
+def test_membership_delay_no_cap_extreme_battery():
+    """THE 'no cap of any kind' proof for the membership TTL player: the register-exact mirror
+    (engine_model.membership_delay_play) == delay_line_reference == phase_offset_play for the
+    EXACT battery the spec demands -- off FAR above 2048 (T=5000 off=2500; T=10000 d=55000),
+    T up to 100000, d up to 10^7, d=0, and multiple delayed channels.  The old ring (depth
+    2048) could realise NONE of the off>2048 / huge-T cases; the membership eval realises them
+    all because it has NO buffer.  (The negative-delay case is proven separately by
+    test_negative_constant_delay_folds_global_shift_into_channel_delays -- the host folds the
+    global shift G so every off/skip handed to the player is >= 0.)"""
+    from fpga.pulse_streamer.host import engine_model as em
+
+    def make(T):
+        # an undelayed periodic pattern with ON runs spread across the frame, incl. near the end
+        def undel(t):
+            p, m = t % T, 0
+            if p < max(1, T // 10): m |= 1                      # bit0 at the frame start
+            if T - max(1, T // 10) <= p < T: m |= 1 << 1        # bit1 at the very end (wraps for big d)
+            if T // 3 <= p < T // 3 + max(1, T // 8): m |= 1 << 2
+            return m
+        return undel
+
+    cases = [
+        (5000, {1: 2500}),         # off = 2500 -- FAR above the old 2048 ring depth
+        (10000, {1: 55000}),       # d = 55000 -> off=5000, skip=5
+        (100000, {1: 10 ** 7}),    # T = 100000, d = 10^7 -> off=0, skip=100
+        (100000, {1: 99999, 2: 1}),# T = 100000, off=99999 (one tick below T), + a tiny delay
+        (100, {1: 0}),             # zero delay -> passthrough
+        (4096, {0: 4095, 1: 4096, 2: 8191}),  # off across/at/above one frame; multi-channel
+    ]
+    for T, delays in cases:
+        n = min(T * 12 + 5000, max(T * 4, max(delays.values()) + 3 * T))
+        undel = make(T)
+        U = [undel(t) for t in range(n)]
+        mem = em.membership_delay_play(U, delays, T)
+        assert mem == em.delay_line_reference(U, delays), f"membership != delay_line at T={T} {delays}"
+        assert mem == em.phase_offset_play(U, delays, T), f"membership != phase_offset at T={T} {delays}"
+        # a delay NEVER disturbs another channel, and the delayed channel is silent until t == d.
+        keep = ~sum(1 << b for b in delays if delays[b])
+        assert all((mem[t] & keep) == (U[t] & keep) for t in range(n)), "a delay disturbed another channel"
+        for b, d in delays.items():
+            assert all(not ((mem[t] >> b) & 1) for t in range(min(d, n))), "delayed channel not silent during startup"
+
+
+def test_membership_bus_delay_no_cap_extreme_battery():
+    """THE 'no cap of any kind' proof for the membership DAC-bus player: a delayed DAC bus value
+    is the bus VALUE stream delayed by d, evaluated at the shifted phase (NO buffer).  The
+    register-exact mirror (engine_model.membership_bus_delay_play) == the value stream literally
+    delayed by d (held safe value before t == d) for the SAME battery: any T, any d (incl.
+    d >> any old ring depth), zero, and a negative delay folded to a non-negative off/skip by
+    the host's global shift."""
+    from fpga.pulse_streamer.host import engine_model as em
+
+    def bus_stream(T, n):
+        # a periodic DAC value stream: code A for the first third, code B for the rest
+        return [(123 if (t % T) < (T // 3) else 777) for t in range(n)]
+
+    for T, d in [(5000, 2500), (10000, 55000), (100000, 10 ** 6), (100, 0), (100, 99999),
+                 (4096, 4095), (4096, 12345)]:
+        n = min(T * 12 + 5000, max(T * 4, d + 3 * T))
+        U = bus_stream(T, n)
+        out = em.membership_bus_delay_play(U, d, T, safe_value=0)
+        ref = [(U[t - d] if t - d >= 0 else 0) for t in range(n)]   # literal buffered ground truth
+        assert out == ref, f"bus membership != buffered delay at T={T} d={d}"
+        # silent (safe value 0) until t == d, then tracks the delayed value.
+        assert all(out[t] == 0 for t in range(min(d, n))), "DAC delay not held at safe value during startup"
+
+    # NEGATIVE delay: the host folds the global shift G so the value handed to the player is
+    # >= 0; the player itself only ever sees a non-negative off/skip.  Model it as the post-fold
+    # non-negative delay and confirm it tracks the shifted stream.
+    T, n = 1000, 8000
+    U = bus_stream(T, n)
+    G = 250                                  # e.g. raw delay -250 -> folded to +0 with others at +250
+    out = em.membership_bus_delay_play(U, G, T)
+    assert out == [(U[t - G] if t - G >= 0 else 0) for t in range(n)]
+
+
 def test_image_delay_ctrl_packing_matches_rtl_unpack():
-    """Host->RTL delay contract (no Verilog sim): image.pack_program packs channel_delays into
-    the C_DELAY_* CTRL words; reading them back EXACTLY as zlc_pulse_streamer_top.v does
-    (delay_count / packed delay_bits / delay_off / per-channel delay_skip, then d = skip*T +
-    off) must reconstruct the program's channel_delays byte-for-byte -- so the FPGA delay
-    player is fed exactly the intended per-channel delay.  Covers d < T, d = T, and d > T."""
+    """Host->RTL delay contract (no Verilog sim): image.pack_program packs each delayed channel
+    into the C_DELAY_* CTRL words PLUS the DELAY image region (the membership player's ON
+    intervals).  Reading them back EXACTLY as zlc_pulse_streamer_top.v does -- delay_count /
+    packed delay_bits / per-channel delay_off (one 32b word -- the FULL phase, NOT a ring
+    index) / per-channel delay_skip, then d = skip*T + off -- must reconstruct the program's
+    channel_delays byte-for-byte, AND the DELAY image must round-trip the ON intervals.  Covers
+    d < T, d = T (off=0), and d >> T (off far above any old ring depth)."""
     import Zou_lab_control.neutral_atom as na
     from Zou_lab_control.neutral_atom.devices.sequencer import compile_pulse_table_runtime_program
     from fpga.pulse_streamer.host import image as img
 
-    for d_ns in (1500, 2500, 40, 2000):   # 75t(<T), 125t(skip=1), 2t, 100t(=T -> off=0,skip=1)
+    # 75t (<T), 125t (skip=1), 2t, 100t (=T -> off=0,skip=1), and 5000t (off=2500 FAR above 2048)
+    for d_ns in (1500, 2500, 40, 2000, 100000):
         st = na.PulseTableState(
             channels=["A", "B", "C"],
             periods=[na.PulsePeriod(1000, (1, 1, 0), unit="ns"), na.PulsePeriod(1000, (0, 0, 1), unit="ns")],
@@ -4204,17 +4320,26 @@ def test_image_delay_ctrl_packing_matches_rtl_unpack():
         prog = compile_pulse_table_runtime_program(st, clock_hz=50e6, repeat_forever=True)
         p = img.StreamerParams()
         w = img.pack_program(prog, p)
-        cbw, daw, T = p.channel_bit_width, p.delay_aw, int(prog.loop_end_tick)
+        cbw, T = p.channel_bit_width, int(prog.loop_end_tick)
         cnt = w.get(img.CtrlWords.DELAY_COUNT, 0)
         bits_w = sum(w.get(img.CtrlWords.DELAY_BITS + i, 0) << (32 * i) for i in range(2))
-        off_w = sum(w.get(img.CtrlWords.DELAY_OFF + i, 0) << (32 * i) for i in range(3))
         recon = [0] * len(prog.channels)
         for k in range(cnt):
             b = (bits_w >> (k * cbw)) & ((1 << cbw) - 1)
-            off = (off_w >> (k * daw)) & ((1 << daw) - 1)
+            off = w.get(img.CtrlWords.DELAY_OFF + k, 0)    # one full 32b word per channel
             skip = w.get(img.CtrlWords.DELAY_SKIP + k, 0)
             recon[b] = skip * T + off                       # the RTL gate opens at skip*T + off = d
         assert recon == list(prog.channel_delays), f"d_ns={d_ns}: {recon} != {prog.channel_delays}"
+        # off is the full phase d mod T (can be >> any old ring depth) and skip = floor(d/T).
+        d_ticks = round(d_ns / 20)
+        assert recon[1] == d_ticks
+        # the DELAY image + CTRL round-trip the ON intervals exactly (what the membership player reads).
+        u = img.unpack_program(w, p)
+        by_bit = {dc["bit"]: dc for dc in u["delay_channels"]}
+        # channel B (bit 1) is ON in period 0 -> interval [0, 50) ticks (1000 ns / 20)
+        ivb = by_bit[1]["intervals"]
+        assert ivb and ivb[0]["start_tick"] == 0 and ivb[0]["stop_tick"] == 50
+        assert by_bit[1]["off"] == d_ticks % T and by_bit[1]["skip"] == d_ticks // T
 
 
 def test_physical_delay_phase_offset_equals_delay_line_any_length():

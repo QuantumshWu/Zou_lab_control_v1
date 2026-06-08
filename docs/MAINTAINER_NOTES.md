@@ -430,128 +430,98 @@ refills the bank behind the consumed `CURSOR` with the next chunk and re-arms
 `BANK_READY` (see section 3 and 6). Total scan points are limited only by host memory, and
 a late refill STALLs (`STATUS_UNDERFLOW`, hold), never a wrong point.
 
-## 8. Additive, Period-Preserving Hardware Delay
+## 8. Unbounded Per-Channel OUTPUT Delay (the membership delay line)
 
-A channel delay is implemented as an **additive** shift, not a cyclic (mod-`T`) rotation.
-A channel delayed by `d` emits its periodic waveform shifted RIGHT by `d`, with **zero
-output before fire** and the loop period preserved at the frame length `T`. The compiler
-that builds this is `compile_pulse_table_runtime_program` ->
-`_pulse_table_edge_table` in `sequencer.py`.
+A channel delay is a **physical OUTPUT delay**, not baked into the edge ticks:
+`output_delayed[t] = output_undelayed[t - d]`, **zero before fire**, with the loop period
+preserved at the frame length `T`. The edge table is emitted UNDELAYED (every channel at
+its nominal position); the delay rides `channel_delays` / `delay_channels`. This is the
+literal physical delay -- **ANY** length (positive, negative, zero, arbitrarily large or
+small), it never disturbs another channel, and the first frame is REAL (silent until
+`t = d`, no cyclic wrapped-in tail). The compilers are
+`compile_pulse_table_runtime_program` -> `_pulse_table_edge_table` (constant frame) and
+`compile_pulse_table_scan_runtime_program` -> `_pulse_table_affine_delay_channels` (scan),
+both in `sequencer.py`.
 
-Why additive, not cyclic. The cyclic view (what the GUI **preview** shows) would fake a
-wrapped-in tail at `t=0`, so the first pulses right after fire would be a phantom of the
-sequence end. That corrupts the true experiment startup. "Repeat forever" is finite in
-reality (the experiment ends), so those first real pulses matter; additive delay makes
-them correct. Delaying one channel must not change another channel's period — the
-physically intuitive behaviour — so `T` is held fixed.
+THE KEY DESIGN -- no buffer, no cap. The RTL (`zlc_edge_streamer.v`) does **NOT** buffer the
+delayed signal. A buffer of depth `N` would cap the frame period at `N` ticks; the old
+design used a per-channel SRL ring of depth `DELAY_DEPTH=2048` and so capped `T <= 2048`.
+Instead, each delayed channel stores its **own** undelayed ON intervals `[a_i, b_i)` over
+`[0, T)` in a tiny per-channel LUTRAM (`del_iv_start_mem` / `del_iv_stop_mem` +
+`ram_style="distributed"`, with affine tick coeffs so a scanned DURATION moves the
+interval), and produces the delayed bit COMBINATIONALLY each tick by **evaluating
+membership** at the shifted phase:
 
-Mechanics:
+```
+shifted = (time_count - off) mod T        # off = d mod T, the FULL phase (TICK_WIDTH)
+bit     = OR_i (a_i <= shifted < b_i)      # over the channel's resolved ON intervals
+out_bit = started ? bit : 0
+```
 
-- The compiler computes each channel's un-delayed ON intervals over `[0, T)` and its raw
-  delay, then emits ON/OFF events shifted by the effective delay.
-- A NEGATIVE delay re-translates the WHOLE frame by `G = max(0, -min(delays))` so the
-  earliest event is `>= 0` (a uniform base offset cannot reorder anything, and the
-  runtime tick counter never goes negative).
-- `repeat_forever` plays a real-startup **preamble** once, then loops only the
-  steady-state frame. It emits `ceil(max_eff/T) + 1` whole frames so the last one is
-  steady-state, then inserts an anchor edge at `loop_end - T` carrying the steady-frame
-  mask and returns `repeat_from_index` pointing at it. The engine rewinds the loop to that
-  steady frame (`loop_start_addr`), **not** to edge 0, so the preamble plays exactly once.
-  In the RTL (`zlc_edge_streamer.v` + top) this is `repeat_from_loop_start`.
+No buffer -> `T` (and the delay) are **UNBOUNDED**. `off` is now the full `TICK_WIDTH` phase
+(not a ring index), the modulo is a single conditional `+T`, and `skip = floor(d/T)` whole
+periods are handled by a startup gate -- so the delay LENGTH is unbounded too.
 
-Correctness without a Verilog simulator. The preview stays cyclic (display only). The
-hardware/compiler path is proven by an independent `_additive_truth` oracle (in
-`tests/test_neutral_atom_lightweight.py`) plus the `reference_play` / `prefetch_play` /
-`rtl_mirror_play` cycle models in `fpga/pulse_streamer/host/engine_model.py`: the compiled
-program played through the cycle models equals the additive truth tick-for-tick.
+Startup gate (silent first frame, opens at EXACTLY `t = d`). Purely COMBINATIONAL from the
+engine's own `time_count` and a per-player `del_frame_idx` (frames elapsed since fire, ++ at
+each gapless seam) vs the targets `del_skip` / `del_off`:
 
-## 9. Reordering Disjoint-Bit Delay Lanes
+```
+started = (frame_idx > skip) || (frame_idx == skip && time_count >= off)   # == t >= d
+```
 
-A **scanned** delay is the case the single global edge table cannot always represent. As
-the delay sweeps, one channel's edges can move PAST another channel's edges, so the
-*sorted* order of the merged edge table changes per scan point. A single sorted table has
-one fixed row order and cannot express that.
+No decrementing counter, no off-by-one. `off==0 && skip==0` (zero delay) => `started` from
+`t=0` and `shifted == time_count` => passthrough.
 
-The key enabling fact is from section 8: because the hardware delay is additive, a delayed
-edge tick is `period_start + delay` — **affine in the scan slots**. So a reordering
-channel can be pulled onto its **own disjoint output bit** and played by a 1-bit affine
-sub-player, while the rest of the channels keep using the global sorted stream. The
-sub-player is structurally the per-bus DAC engine specialised to one bit: `lane_tick_mem`
-/ `lane_coeff_mem` / `lane_value_mem` in **LUTRAM** (`ram_style="distributed"`), its own
-pointer, and the **shared** affine MAC `zlc_effective_tick` (all in
-`zlc_edge_streamer.v`). The lane channel is excluded from the main edge mask, and the
-output merge is `(state_mask & ~lane_mask) | lane_out`, so the global stream **never**
-reorders.
+Merge (unchanged shape): `out = (state_mask & ~delayed_mask) | delayed_out`. The delayed
+channel is cleared from the undelayed mask and re-driven by its membership result.
 
-Routing (compiler, `sequencer.py`):
+Negative / zero / huge. A NEGATIVE delay re-translates the WHOLE frame: the host folds the
+global shift `G = max(0, -min(delays))` into EVERY channel's delay (a causal delay line
+cannot lead), so every `off`/`skip` handed to the player is `>= 0`. Zero is passthrough.
+A huge delay is just a wider `skip` (a 32-bit-plus counter).
 
-- `compile_pulse_table_scan_runtime_program` routes EVERY channel with a scanned delay onto
-  its own lane (`_pulse_table_delay_lanes`) and excludes those channels from the main global
-  affine edge table (`_pulse_table_affine_rows`). This is a CORRECTNESS choice, not just an
-  optimisation: with the global shift `G` the minimum edge lands on tick 0 at the extreme
-  scan point, which would collide with the table's mandatory tick-0 seed anchor, and the
-  single-edge-per-tick prefetch engine would slip that edge one tick anyway. A lane plays at
-  its exact effective tick every scan point (its own sub-player, no FIFO, no anchor), so a
-  scanned delay of any form is exact. The main table then carries only constant/zero-delay
-  channels, whose period-0 edges share the anchor's zero-coeff expression and merge.
-- `_pulse_table_delay_lanes` emits each lane's affine rise/fall edges as `(base, coeffs)` and
-  packs a `DelayLane(channel, channel_bit, ticks, coeffs, values)`.
-- A reorder can also arise WITHOUT a scanned delay -- a scanned DURATION can move a
-  CONSTANT-delay channel's edges past another channel's. That channel is not pre-laned, so
-  if the main table still reorders the compiler GREEDILY lanes the constant-delay channels
-  too (`_pulse_table_delay_lanes(include_channels=...)`) one at a time until the global
-  table is monotone at every scan point. In the worst case every nonzero-delay channel is
-  laned and the table holds only zero-delay channels (edges at monotone period boundaries,
-  never reorder). So a reorder of ANY origin is handled, bounded only by `NUM_LANES` (a
-  clear validate error) and per-channel monotonicity (a channel cannot run its own pulses
-  backwards). There is no longer a "this scan reorders -> rejected" outcome for any case
-  that fits in the lanes.
+Host -> FPGA contract (`fpga/pulse_streamer/host/image.py`). Per delayed channel the CTRL
+regfile carries `delay_count` / packed `delay_bits` / per-channel `delay_off` (one 32-bit
+word -- the full phase) / packed `delay_iv_counts` / per-channel `delay_skip`; the ON
+intervals (+ affine coeffs) go into the **DELAY image** region (one of the 6 BRAMs). The
+top's delay mini-loader copies the image rows into the engine's per-channel interval LUTRAM
+via `delay_prog_*` (a `prog_we`-toggle loader, exactly like the bus-segment loader). `off`
+and `skip` are computed on the host from `T = loop_end_tick` (constant `T` => constant
+`off`/`skip`; the affine ON intervals carry the per-scan-point period shift via the shared
+MAC `zlc_effective_tick`). There is NO HW divider.
 
-Tick-0 seed anchor (the silent-off-by-one fix). The engine seeds its time counter from edge
-0, so the main edge table MUST begin at tick 0 at EVERY scan point or every edge slips one
-tick on hardware (the common idle/guard opening period triggers exactly this). Every
-compiler path prepends an all-off tick-0 edge with zero slot coefficients
-(`_pulse_table_affine_rows`, `_pulse_table_edge_table`, `compile_runtime_program`), and
-`validate_pulse_streamer_program` BACKSTOPS it -- rejecting any program whose edge 0 is not
-at tick 0 (or whose edge-0 slot coefficients are non-zero) so a forgotten anchor can never
-reach the FPGA silently.
+DAC buses. A DAC value reaching the output via the TTL-folded path (fixed bus values,
+`fold_analog_buses`) inherits the membership player directly -- each bus bit is a delayed
+TTL channel, so its delay is unbounded with identical capability. A scanned DAC value (the
+value-engine / `value_select` path) carries the sub-period delay via the bus segment's
+affine start/stop ticks (the existing, proven mechanism); the membership DAC model
+`engine_model.membership_bus_delay_play` proves the value-stream-delayed-by-d spec for any
+`T`/`d`/zero/negative.
 
-Single-edge reinit (why no replicated multipliers). A lane program is always single-frame
-(`loop_count=1`, `repeat_from=0`) -- an inner bracket is UNROLLED before compiling -- so the
-lane reseeds only to frame-tick 0 and the reinit is a single-edge check: **no unrolled walk**
-of the lane, hence no replicated MAC per lane edge. `validate_pulse_streamer_program` also
-enforces lane count, disjoint `channel_bit`, per-lane edge count, and per-scan-point
-in-frame strict monotonicity (and rejects, as a defensive backstop the compiler never hits,
-a lane combined with `loop_start>0` / `repeat_from_index>0`).
+Capacity. The per-channel interval tables are LUTRAM (+0 RAMB36); the only RAMB36 cost is
+the small DELAY image staging BRAM (`blk_mem_gen_delayimg`, 8*8*6 = 384 words = 1 RAMB36,
+the 6th BRAM). `NUM_DELAYS=8` delayed channels, `MAX_DELAY_INTERVALS=8` ON intervals each
+(`DEFAULT_NUM_DELAYS` / `DEFAULT_MAX_DELAY_INTERVALS` in `fpga_pulse_streamer.py`, matching
+the RTL params). `validate_pulse_streamer_program` enforces only `count <= num_delays` and
+`intervals <= max_delay_intervals` -- there is **NO** frame-period / delay-length cap.
 
-Capacity and limits:
+Tick-0 seed anchor (unchanged). The engine seeds its time counter from edge 0, so the
+UNDELAYED edge table must begin at tick 0 at every scan point; every compiler path prepends
+an all-off tick-0 edge and `validate_pulse_streamer_program` backstops it. (Because the edge
+table is undelayed, no channel reorders -- the delay is entirely on the output -- so the old
+"delay lane" / reordering machinery is gone.)
 
-- Up to `NUM_LANES=4` simultaneous lanes (covers scanning several interfaces' delays at
-  once); up to `MAX_LANE_EDGES=64` sub-edges (pulses) per delayed channel. Defaults are
-  `DEFAULT_NUM_LANES=4` / `DEFAULT_MAX_LANE_EDGES=64`, matching the RTL params.
-- Lane PLAY tables are LUTRAM (+0 BRAM); one MAC site per lane. Capacity on the 35T stays
-  within 90% on every axis (lane PLAY tables add no RAMB36; the lane IMAGE staging BRAM
-  `blk_mem_gen_laneimg` is one of the 6 BRAMs).
-- A scanned delay in ANY form is supported: reordering past other channels (it rides its
-  own lane), NEGATIVE (a single compile-time global shift `G = max(0, -min effective edge
-  tick over all channels and scan points)` re-translates the whole frame so no runtime tick
-  is < 0), and LARGE / frame-extending (the affine final-row tick — a single expr that
-  dominates every edge at every scan point — grows to fit the delayed edges; the lane and
-  the main table share one `G` and one frame end). Multiple sub-edges per delayed channel
-  ARE supported (up to `MAX_LANE_EDGES`). A delay (constant OR scanned) combined with an
-  inner repeat bracket is handled by UNROLLING the bracket into a flat period list at the
-  STATE level (`PulseTableState.unrolled_bracket`) before compiling, so a delayed edge has
-  no inner-loop boundary to cross; the flat frame still repeats via `repeat_forever`. The
-  only residual COMPILE reject is a genuine cross-channel edge collision/reorder that the
-  single global table cannot hold AND that does not reduce to a lane, or an unrolled edge
-  count over `max_edges` (actionable: use `repeat_forever` for the outer loop, or fewer
-  inner iterations).
-
-Proof. `_rtl_lane_realization_play` (in `tests/test_neutral_atom_lightweight.py`)
-re-derives the exact RTL register transfers of the lane player and equals
-`engine_model.reference_play` over the real reordering-scan program, a hand-built set
-(start / scan-advance / repeat-forever-restart, multiple lanes, affine lane), and a 200-
-program fuzz set.
+Proof (no Verilog simulator). `engine_model.delay_line_reference` is the exact buffered
+ground truth; `phase_offset_play` and `membership_delay_play` / `membership_bus_delay_play`
+are the no-buffer realisations, proven == the reference for the full battery (off far above
+2048, `T` up to 100000, `d` up to 10^7, zero, negative-via-G, multi-channel) by
+`test_membership_delay_no_cap_extreme_battery` / `test_membership_bus_delay_no_cap_extreme_battery`.
+`test_rtl_delay_player_mirror_matches_physical_delay_any_length` walks the EXACT registers
+of the RTL membership player (per-channel interval LUTRAM eval at the shifted phase +
+`del_frame_idx` startup gate, NO buffer) and equals all three. `test_image_delay_ctrl_packing_matches_rtl_unpack`
+round-trips the host->image->RTL contract (off/skip/iv_counts + intervals). The contract
+test asserts the RTL has NO `ring` / `DELAY_DEPTH` / lane strings.
 
 ## 10. Building The Manuals
 

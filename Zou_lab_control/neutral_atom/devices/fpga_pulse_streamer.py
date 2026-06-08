@@ -38,10 +38,13 @@ DEFAULT_TICK_WIDTH = 32
 DEFAULT_SCAN_COEFF_WIDTH = 16
 DEFAULT_SCAN_COEFF_FRAC_BITS = 8
 DEFAULT_NUM_SLOTS = 4
-# Per-channel OUTPUT delay players (the delay line): max simultaneously-delayed channels and
-# the sub-period ring depth (must match zlc_edge_streamer.v NUM_DELAYS / DELAY_DEPTH).
+# Per-channel OUTPUT delay players (the UNBOUNDED membership delay line): max simultaneously-
+# delayed channels and ON intervals stored per channel (must match zlc_edge_streamer.v
+# NUM_DELAYS / MAX_DELAY_INTERVALS).  There is NO ring depth -- the engine evaluates the stored
+# intervals at the shifted phase instead of buffering, so the frame period and delay length are
+# both unbounded.
 DEFAULT_NUM_DELAYS = 8
-DEFAULT_DELAY_DEPTH = 2048
+DEFAULT_MAX_DELAY_INTERVALS = 8
 # Affine-MAC slot operand width -- MUST match zlc_edge_streamer.v SLOT_MUL_WIDTH
 # and engine_model.SLOT_MUL_WIDTH.  Each scan slot VALUE is multiplied by a 16-bit
 # coeff on a single DSP48E1 (25x18), so the slot operand is the low 25 bits taken
@@ -247,7 +250,7 @@ def validate_pulse_streamer_program(
     bus_width: int = DEFAULT_BUS_WIDTH,
     slot_mul_width: int = DEFAULT_SLOT_MUL_WIDTH,
     num_delays: int = DEFAULT_NUM_DELAYS,
-    delay_depth: int = DEFAULT_DELAY_DEPTH,
+    max_delay_intervals: int = DEFAULT_MAX_DELAY_INTERVALS,
     max_validated_scan_points: int | None = None,
 ) -> None:
     """Validate that a runtime edge table fits the fixed FPGA streamer.
@@ -276,24 +279,23 @@ def validate_pulse_streamer_program(
         raise ValueError(f"program has {len(program.ticks)} edges, but the FPGA streamer only accepts {max_edges}.")
     if len(program.channels) > channel_count:
         raise ValueError(f"program uses {len(program.channels)} channels, but the FPGA streamer has {channel_count}.")
-    # PER-CHANNEL OUTPUT DELAY (the delay line): at most num_delays channels may be delayed,
-    # and the sub-period offset off = d mod T must fit the SRL ring (depth delay_depth).  The
-    # whole-period part skip = d // T is a 32-bit counter, so the delay LENGTH itself is
-    # unbounded -- only the per-period offset is ring-limited (i.e. the FRAME period, not the
-    # delay, is what delay_depth caps).
+    # PER-CHANNEL OUTPUT DELAY (the UNBOUNDED membership delay line): at most num_delays
+    # channels may be delayed, each with at most max_delay_intervals ON intervals.  There is
+    # NO frame-period / delay-length cap -- the engine evaluates the stored intervals at the
+    # shifted phase ``(time_count - off) mod T`` instead of buffering, so off (= d mod T) is
+    # the full TICK_WIDTH phase and skip (= floor(d/T)) is a 32-bit counter: ANY length,
+    # positive/negative (via the host's folded global shift)/zero, arbitrarily large or small.
     channel_delays = [int(d) for d in (getattr(program, "channel_delays", None) or [])]
     delayed = [(b, d) for b, d in enumerate(channel_delays) if d]
     if len(delayed) > num_delays:
         raise ValueError(
             f"program delays {len(delayed)} channels, but the FPGA delay line has {num_delays} players.")
-    period = int(getattr(program, "loop_end_tick", 0) or 0)
-    for bit, d in delayed:
-        off = (d % period) if period > 0 else d
-        if off >= delay_depth:
+    for dc in (getattr(program, "delay_channels", None) or []):
+        ivals = list(getattr(dc, "intervals", None) or [])
+        if len(ivals) > max_delay_intervals:
             raise ValueError(
-                f"channel-delay output bit {bit}: sub-period offset {off} ticks >= delay ring depth "
-                f"{delay_depth} (the frame period {period} ticks is too long for the delay ring); "
-                "shorten the frame or the delay.")
+                f"channel-delay output bit {getattr(dc, 'bit', '?')}: {len(ivals)} ON intervals > "
+                f"max_delay_intervals {max_delay_intervals}; raise max_delay_intervals.")
     tick_limit = (1 << tick_width) - 1
     mask_limit = (1 << channel_count) - 1
     scan_points = list(getattr(program, "scan_points", None) or [])

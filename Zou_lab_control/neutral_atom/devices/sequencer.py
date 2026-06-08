@@ -35,6 +35,67 @@ BUS_SEGMENT_MODES = {"edge": 1, "ramp": 2}
 
 
 @dataclass(frozen=True)
+class RuntimeDelayInterval:
+    """One undelayed ON interval ``[start_tick, stop_tick)`` of a delayed channel,
+    affine in the scanned DURATION slots (``effective = start_tick + (sum coeff_j*
+    slot_j) >> frac``) so the interval moves with a scanned duration -- exactly like a
+    bus segment's start/stop ticks."""
+
+    start_tick: int
+    stop_tick: int
+    start_tick_coeffs: list[int] | None = None
+    stop_tick_coeffs: list[int] | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "start_tick": int(self.start_tick),
+            "stop_tick": int(self.stop_tick),
+            "start_tick_coeffs": list(self.start_tick_coeffs or []),
+            "stop_tick_coeffs": list(self.stop_tick_coeffs or []),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "RuntimeDelayInterval":
+        return cls(
+            start_tick=int(payload.get("start_tick", 0)),
+            stop_tick=int(payload.get("stop_tick", payload.get("start_tick", 0))),
+            start_tick_coeffs=[int(v) for v in payload.get("start_tick_coeffs", [])] or None,
+            stop_tick_coeffs=[int(v) for v in payload.get("stop_tick_coeffs", [])] or None,
+        )
+
+
+@dataclass(frozen=True)
+class RuntimeDelayChannel:
+    """One delayed output channel for the UNBOUNDED membership delay player.
+
+    ``bit`` is the output channel bit; ``delay`` is the physical delay ``d`` in ticks
+    (>= 0 after the host folds the global negative-delay shift G); ``intervals`` are
+    the channel's OWN undelayed ON intervals over ``[0, T)``.  The engine stores the
+    intervals in a per-channel LUTRAM and produces the delayed bit by evaluating
+    membership at the shifted phase ``(time_count - (d mod T)) mod T`` (skip =
+    floor(d/T) whole periods gate the startup) -- NO buffer, so T and d are unbounded."""
+
+    bit: int
+    delay: int
+    intervals: list[RuntimeDelayInterval] | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "bit": int(self.bit),
+            "delay": int(self.delay),
+            "intervals": [iv.to_dict() for iv in (self.intervals or [])],
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "RuntimeDelayChannel":
+        return cls(
+            bit=int(payload.get("bit", 0)),
+            delay=int(payload.get("delay", 0)),
+            intervals=[RuntimeDelayInterval.from_dict(iv) for iv in (payload.get("intervals") or [])] or None,
+        )
+
+
+@dataclass(frozen=True)
 class RuntimeBusSegment:
     """One runtime analog-bus segment uploaded beside the digital edge table."""
 
@@ -125,9 +186,12 @@ class RuntimeSequenceProgram:
     # PHYSICAL CHANNEL DELAY: per-channel-bit delay in ticks, applied to the engine OUTPUT
     # (a delay line), NOT baked into ``ticks``.  ``ticks``/``masks`` are the UNDELAYED frame;
     # the engine delays bit ``b`` by ``channel_delays[b]`` (startup counter + sub-period phase
-    # shift -- see engine_model.phase_offset_play).  Any length; never disturbs another
-    # channel; first frame real.  Empty/None = no channel delayed.
+    # shift -- see engine_model.membership_delay_play).  Any length; never disturbs another
+    # channel; first frame real.  Empty/None = no channel delayed.  ``channel_delays`` keeps
+    # the delay-per-bit (the source of d); ``delay_channels`` carries the same delays PLUS each
+    # delayed channel's ON intervals -- what the UNBOUNDED membership player needs.
     channel_delays: list[int] | None = None
+    delay_channels: list[RuntimeDelayChannel] | None = None
 
     def to_dict(self) -> dict[str, object]:
         payload = {
@@ -156,6 +220,7 @@ class RuntimeSequenceProgram:
             "bus_names": list(self.bus_names or []),
             "bus_segments": [segment.to_dict() for segment in (self.bus_segments or [])],
             "channel_delays": list(self.channel_delays or []),
+            "delay_channels": [dc.to_dict() for dc in (self.delay_channels or [])],
         }
         if self.source_sequence is not None:
             payload["source_sequence"] = self.source_sequence
@@ -197,6 +262,7 @@ class RuntimeSequenceProgram:
             bus_names=[str(item) for item in payload.get("bus_names", [])] or None,
             bus_segments=[RuntimeBusSegment.from_dict(item) for item in payload.get("bus_segments", [])] or None,
             channel_delays=[int(v) for v in payload.get("channel_delays", [])] or None,
+            delay_channels=[RuntimeDelayChannel.from_dict(item) for item in payload.get("delay_channels", [])] or None,
         )
 
     @property
@@ -307,7 +373,7 @@ def compile_pulse_table_runtime_program(
         slots=slot_values,
         time_step_ns=clock_step_ns,
     )
-    ticks, masks, channels, loop_end, repeat_from_index, channel_delays = _pulse_table_edge_table(
+    ticks, masks, channels, loop_end, repeat_from_index, channel_delays, delay_channels = _pulse_table_edge_table(
         state,
         channels=channels,
         slots=slot_values,
@@ -347,6 +413,7 @@ def compile_pulse_table_runtime_program(
         "bus_names": bus_names,
         "bus_segments": [segment.to_dict() for segment in bus_segments],
         "channel_delays": [int(channel_delays.get(bit, 0)) for bit in range(len(channels))],
+        "delay_channels": [dc.to_dict() for dc in delay_channels],
     }
     channel_delays_list = [int(channel_delays.get(bit, 0)) for bit in range(len(channels))] if channel_delays else None
     sequence_id = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
@@ -369,6 +436,7 @@ def compile_pulse_table_runtime_program(
         bus_names=bus_names or None,
         bus_segments=bus_segments or None,
         channel_delays=channel_delays_list,
+        delay_channels=delay_channels or None,
     )
 
 
@@ -521,6 +589,18 @@ def compile_pulse_table_scan_runtime_program(
         time_step_ns=clock_step_ns,
         coeff_frac_bits=coeff_frac_bits,
     )
+    # Per-delayed-channel ON intervals (affine in the scanned durations) for the UNBOUNDED
+    # membership delay player -- the engine evaluates membership at the shifted phase, never
+    # buffers, so the delay/period are unbounded across the scan too.
+    delay_channels = _pulse_table_affine_delay_channels(
+        state,
+        channel_delays=channel_delays,
+        hardware_bits=hardware_bits,
+        exclude_channels=bus_members,
+        slot_vars=slot_vars,
+        time_step_ns=clock_step_ns,
+        coeff_frac_bits=coeff_frac_bits,
+    )
     point_durations = [
         float(_apply_affine_ticks(ticks[-1], tick_slot_coeffs[-1], point, coeff_frac_bits)) / clock_hz
         for point in points_ticks
@@ -548,6 +628,7 @@ def compile_pulse_table_scan_runtime_program(
         "bus_names": bus_names,
         "bus_segments": [segment.to_dict() for segment in bus_segments],
         "channel_delays": [int(channel_delays.get(bit, 0)) for bit in range(len(channels))],
+        "delay_channels": [dc.to_dict() for dc in delay_channels],
     }
     channel_delays_list = [int(channel_delays.get(bit, 0)) for bit in range(len(channels))] if channel_delays else None
     sequence_id = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
@@ -576,6 +657,7 @@ def compile_pulse_table_scan_runtime_program(
         bus_names=bus_names or None,
         bus_segments=bus_segments or None,
         channel_delays=channel_delays_list,
+        delay_channels=delay_channels or None,
     )
 
 
@@ -1466,6 +1548,53 @@ def _pulse_table_affine_rows(
     return rows
 
 
+def _pulse_table_affine_delay_channels(
+    state: PulseTableState,
+    *,
+    channel_delays: Mapping[int, int],
+    hardware_bits: Mapping[str, int],
+    exclude_channels: Sequence[str],
+    slot_vars: Sequence[str],
+    time_step_ns: float,
+    coeff_frac_bits: int,
+) -> list[RuntimeDelayChannel]:
+    """Build the per-delayed-channel ON intervals for the UNBOUNDED membership player on
+    the SCAN path.  Each interval's start/stop tick is a period boundary evaluated affinely
+    in the scanned DURATION slots (base + per-slot coeffs), so a scanned duration moves the
+    interval in lockstep with the edge table -- exactly the affine bus-segment ticks.  The
+    delays themselves are constant (a delay is not scannable)."""
+    if not channel_delays:
+        return []
+    starts = _pulse_table_affine_period_starts(state, slot_vars=slot_vars, time_step_ns=time_step_ns, coeff_frac_bits=coeff_frac_bits)
+    exclude = set(exclude_channels)
+    bit_to_channel = {hardware_bits[ch]: ch for ch in hardware_bits}
+    out: list[RuntimeDelayChannel] = []
+    for bit, d in channel_delays.items():
+        channel = bit_to_channel.get(bit)
+        if channel is None or channel in exclude:
+            continue
+        channel_index = state.channels.index(channel)
+        intervals: list[RuntimeDelayInterval] = []
+        active: tuple[int, tuple[int, ...]] | None = None
+        for period_index, period in enumerate(state.periods):
+            value = int(period.states[channel_index])
+            if value and active is None:
+                active = starts[period_index]
+            elif not value and active is not None:
+                stop = starts[period_index]
+                intervals.append(RuntimeDelayInterval(
+                    start_tick=int(active[0]), stop_tick=int(stop[0]),
+                    start_tick_coeffs=list(active[1]) or None, stop_tick_coeffs=list(stop[1]) or None))
+                active = None
+        if active is not None:
+            stop = starts[-1]
+            intervals.append(RuntimeDelayInterval(
+                start_tick=int(active[0]), stop_tick=int(stop[0]),
+                start_tick_coeffs=list(active[1]) or None, stop_tick_coeffs=list(stop[1]) or None))
+        out.append(RuntimeDelayChannel(bit=int(bit), delay=int(d), intervals=intervals or None))
+    return out
+
+
 def _pulse_table_affine_loop_metadata(
     state: PulseTableState,
     *,
@@ -1762,7 +1891,18 @@ def _pulse_table_edge_table(
     # the per-channel output delay line, not a steady-frame rewind, produces the real startup.
     repeat_from_index = 0
     channel_delays_by_bit = {channel_bits[ch]: int(d) for ch, d in channel_delays.items() if int(d) != 0}
-    return ticks, masks, hardware_channels, loop_end, repeat_from_index, channel_delays_by_bit
+    # The UNBOUNDED membership delay player needs each delayed channel's OWN undelayed ON
+    # intervals over [0, T) -- the engine evaluates membership at the shifted phase instead of
+    # buffering.  No scan here -> the intervals are LITERAL (zero affine coeffs).
+    delay_channels = [
+        RuntimeDelayChannel(
+            bit=channel_bits[ch],
+            delay=int(channel_delays[ch]),
+            intervals=[RuntimeDelayInterval(start_tick=int(a), stop_tick=int(b)) for a, b in base_intervals.get(ch, [])] or None,
+        )
+        for ch in channel_delays if int(channel_delays[ch]) != 0
+    ]
+    return ticks, masks, hardware_channels, loop_end, repeat_from_index, channel_delays_by_bit, delay_channels
 
 
 def _dedupe_same_tick_edges(ticks: Sequence[int], masks: Sequence[int]) -> tuple[list[int], list[int]]:
