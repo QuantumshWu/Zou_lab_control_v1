@@ -490,13 +490,18 @@ def compile_pulse_table_scan_runtime_program(
             ns[slot_var(slot_index)], clock_step_ns, f"scan point {point_index} slot {slot_index}", allow_negative=True
         )
 
+    # Validate the slot bindings + the full scan TABLE once (slot-independent), then each
+    # scan point only re-checks its RESOLVED state (durations/DAC/delays at that point) with
+    # validate_scan_slots=False.  Validating the whole table per point was O(N^2) and made
+    # on_pulse very slow for thousands of points.
+    state.validate(slots=state.reference_slots(), time_step_ns=clock_step_ns)
     points_ticks: list[list[int]] = []
     for point_index, row in enumerate(table):
         ns = point_slots_ns(row)
         points_ticks.append([
             point_slot_value(point_index, index, ns) for index in range(len(state.scan_slots))
         ])
-        state.validate(slots=ns, time_step_ns=clock_step_ns)
+        state.validate(slots=ns, time_step_ns=clock_step_ns, validate_scan_slots=False)
 
     # Analog buses are driven by the hardware bus engine, not the TTL edge table.
     # A scanned DAC value becomes a bus segment whose value_select reads the slot
@@ -1534,13 +1539,15 @@ def _pulse_table_affine_frame_end(
     g = (int(global_shift), tuple(0 for _ in slot_vars))
     candidates = [_affine_add(expr, g) for expr in candidates]
     points = [list(point) for point in scan_points] or [[0] * len(slot_vars)]
-    for cand in candidates:
-        cand_ticks = [_apply_affine_ticks(cand[0], cand[1], point, coeff_frac_bits) for point in points]
-        if all(
-            cand_ticks[p] >= _apply_affine_ticks(other[0], other[1], point, coeff_frac_bits)
-            for other in edge_exprs
-            for p, point in enumerate(points)
-        ):
+    # Vectorised: the per-point max over ALL edges is computed ONCE, then each candidate is
+    # checked against it -- O((edges + candidates) * points) instead of the O(candidates *
+    # edges * points) double-recompute that dominated compile_scan at thousands of points.
+    import numpy as np
+
+    edge_max = _affine_ticks_matrix(edge_exprs, points, coeff_frac_bits).max(axis=0)   # (N,)
+    cand_mat = _affine_ticks_matrix(candidates, points, coeff_frac_bits)               # (C, N)
+    for i, cand in enumerate(candidates):
+        if bool(np.all(cand_mat[i] >= edge_max)):
             return cand
     return None
 
@@ -1896,14 +1903,10 @@ def _affine_min_over_points(
     the scan points is reached at an extreme point, so the result is a single constant.
     """
 
-    points = list(scan_points) or [()]
-    best: int | None = None
-    for base, coeffs in exprs:
-        for point in points:
-            tick = _apply_affine_ticks(base, coeffs, point, coeff_frac_bits)
-            if best is None or tick < best:
-                best = tick
-    return 0 if best is None else int(best)
+    if not exprs:
+        return 0
+    mat = _affine_ticks_matrix(exprs, scan_points, coeff_frac_bits)
+    return int(mat.min()) if mat.size else 0
 
 
 def _affine_max_reference(
@@ -1923,6 +1926,33 @@ def _affine_max_reference(
 def _apply_affine_ticks(base: int, coeffs: Sequence[int], slot_ticks: Sequence[int], coeff_frac_bits: int) -> int:
     total = sum(int(coeff) * int(tick) for coeff, tick in zip(coeffs, slot_ticks))
     return int(base) + (total >> int(coeff_frac_bits))
+
+
+def _affine_ticks_matrix(exprs, scan_points, coeff_frac_bits):
+    """``(len(exprs), N)`` numpy int64 array of effective ticks for every expr at every
+    scan point -- the VECTORISED form of ``_apply_affine_ticks`` over a whole sweep.  The
+    affine compile evaluates the same exprs at every scan point several times (global
+    shift G, frame-end domination, global monotonicity); at thousands of points a Python
+    double loop dominates ``compile_scan`` (~0.7 s at 4096 pts).  numpy's ``@`` + arithmetic
+    ``>>`` (sign-extending = floor, identical to Python ``>>``) make it ~milliseconds and
+    BIT-IDENTICAL to ``_apply_affine_ticks``.  ``np.int64`` holds the worst-case dot
+    (coeff 2^15 x slot 2^24 x 4 slots = 2^41)."""
+    import numpy as np
+
+    points = [list(p) for p in scan_points] or [[]]
+    n = len(points)
+    frac = int(coeff_frac_bits)
+    slots = len(points[0]) if points and points[0] else max((len(c) for _b, c in exprs), default=0)
+    if not exprs:
+        return np.zeros((0, n), dtype=np.int64)
+    if slots == 0:
+        return np.array([[int(base)] * n for base, _c in exprs], dtype=np.int64)
+    pts = np.array([(list(p) + [0] * slots)[:slots] for p in points], dtype=np.int64)  # (N, slots)
+    rows = []
+    for base, coeffs in exprs:
+        c = np.array((list(coeffs) + [0] * slots)[:slots], dtype=np.int64)
+        rows.append(int(base) + ((pts @ c) >> frac))
+    return np.stack(rows)
 
 
 def _time_ns_to_ticks(value_ns: float, time_step_ns: float, name: str, *, allow_negative: bool = False) -> int:

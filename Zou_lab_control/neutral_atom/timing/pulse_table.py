@@ -414,7 +414,12 @@ class PulseTableState:
                 return slot_var(index)
         return None
 
-    def validate(self, *, slots: Mapping[str, float] | None = None, time_step_ns: float | None = None) -> "PulseTableState":
+    def validate(self, *, slots: Mapping[str, float] | None = None, time_step_ns: float | None = None,
+                 validate_scan_slots: bool = True) -> "PulseTableState":
+        # ``validate_scan_slots`` checks the slot bindings + the FULL N-row scan table; it is
+        # SLOT-INDEPENDENT, so a per-scan-point validate (compile_scan) sets it False after
+        # one full check -- otherwise validating N points each rescans the whole table, an
+        # O(N^2) blow-up that dominated compile at thousands of points.
         step_ns = self.time_step_ns if time_step_ns is None else positive_time_step_ns(time_step_ns)
         slots = self.reference_slots() if slots is None else dict(slots)
         if not self.channels:
@@ -488,7 +493,8 @@ class PulseTableState:
             if channel not in self.channels:
                 raise ValueError(f"delay channel {channel!r} is not in channels.")
             self.delay_steps(channel, slots=slots, time_step_ns=step_ns)
-        self._validate_scan_slots()
+        if validate_scan_slots:
+            self._validate_scan_slots()
         return self
 
     def _validate_scan_slots(self) -> None:
