@@ -4623,6 +4623,31 @@ def test_large_scanned_delay_extends_frame_reordering_and_not():
         _assert_scan_matches_oracle(reorder, channels=["A", "B"], clock_hz=50e6, repeat_forever=rf, n_ticks=1200, want_lane=True)
 
 
+def test_constant_delay_reordered_by_scanned_duration_uses_lane():
+    """A reorder can arise WITHOUT a scanned delay: a scanned DURATION moves a CONSTANT-
+    delay channel's edges past another channel's as it sweeps.  Such a channel is not
+    pre-laned (its delay is not scanned), so the compiler greedily lanes it once the main
+    table reorders -- the global table never holds a reordering edge.  Tick-exact vs the
+    independent oracle and all models, both finite and repeat_forever."""
+    import Zou_lab_control.neutral_atom as na
+
+    # A on period 0 (scanned duration, delay 0 -> its fall = s0); B on period 1 with a
+    # constant NEGATIVE delay (its edges = period-1 start - 300, also moved by s0).  As s0
+    # shrinks, B's rise crosses A's rise (which is pinned at the period-0 start) -> reorder.
+    st = na.PulseTableState(
+        channels=["A", "B"],
+        periods=[na.PulsePeriod("s0", (1, 0), unit="ns"),
+                 na.PulsePeriod(200, (0, 1), unit="ns"),
+                 na.PulsePeriod(200, (0, 0), unit="ns")],
+        time_step_ns=20, delays={"A": 0, "B": -300}, delay_units={"A": "ns", "B": "ns"},
+        scan_slots=[{"kind": "duration", "target": "0", "unit": "ns", "nominal": 400.0}],
+        scan_table=[[400.0], [100.0]])
+    for rf in (False, True):
+        prog = _assert_scan_matches_oracle(st, channels=["A", "B"], clock_hz=50e6, repeat_forever=rf, n_ticks=900, want_lane=True)
+        # the constant-delay channel B is the one pulled onto a lane (A stays in the table)
+        assert [l.channel for l in prog.delay_lanes] == ["B"]
+
+
 def test_multipulse_channel_with_bracket_and_scanned_delay():
     """A multi-pulse channel (several ON sub-runs) inside an unrolled bracket, with a
     scanned reordering delay -> the channel's full sub-edge train rides one lane."""

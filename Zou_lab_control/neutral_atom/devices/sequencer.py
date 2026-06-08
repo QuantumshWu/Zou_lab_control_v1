@@ -542,28 +542,58 @@ def compile_pulse_table_scan_runtime_program(
     # extending (shared frame_end) -- is exact.  The main table then carries only constant/
     # zero-delay and non-delayed channels, whose period-0 edges share the anchor's zero-
     # coeff expression and merge cleanly.
-    lane_channels, delay_lanes = _pulse_table_delay_lanes(
-        state,
-        channels=channels,
-        scan_points=points_ticks,
-        slot_vars=slot_vars,
-        time_step_ns=clock_step_ns,
-        coeff_frac_bits=coeff_frac_bits,
-        exclude_channels=bus_members,
-        global_shift=global_shift,
-        frame_end=frame_end,
-    )
-    rows = _pulse_table_affine_rows(
-        state,
-        channels=channels,
-        scan_points=points_ticks,
-        slot_vars=slot_vars,
-        time_step_ns=clock_step_ns,
-        coeff_frac_bits=coeff_frac_bits,
-        exclude_channels=list(bus_members) + lane_channels,
-        global_shift=global_shift,
-        frame_end=frame_end,
-    )
+    # A reorder can ALSO arise without a scanned delay: a scanned DURATION moves a
+    # CONSTANT-delay channel's edges past another channel's as it sweeps.  Such a channel
+    # is not pre-laned (its delay is not scanned), so after laning the scanned-delay
+    # channels we GREEDILY lane the constant-delay channels too, one at a time, until the
+    # main global table is monotone at every scan point.  Laning any one removes its
+    # reordering edge from the global stream; in the worst case every nonzero-delay channel
+    # is laned and the main table holds only zero-delay channels (edges at monotone period
+    # boundaries -- never reorder).  So a reorder of ANY origin is handled, bounded only by
+    # NUM_LANES (a clear validate error) and per-channel monotonicity.
+    def _has_any_delay(ch: str) -> bool:
+        base, coeffs = _affine_expr(
+            state.delays.get(ch, 0.0), state.delay_units.get(ch, "ns"),
+            slot_vars, clock_step_ns, coeff_frac_bits)
+        return int(base) != 0 or any(int(c) for c in coeffs)
+
+    forced: list[str] = []
+    constant_delay_candidates = [
+        ch for ch in state.channels
+        if ch not in bus_members and ch in channels and _has_any_delay(ch)
+    ]
+    while True:
+        lane_channels, delay_lanes = _pulse_table_delay_lanes(
+            state,
+            channels=channels,
+            scan_points=points_ticks,
+            slot_vars=slot_vars,
+            time_step_ns=clock_step_ns,
+            coeff_frac_bits=coeff_frac_bits,
+            exclude_channels=bus_members,
+            global_shift=global_shift,
+            frame_end=frame_end,
+            include_channels=forced,
+        )
+        try:
+            rows = _pulse_table_affine_rows(
+                state,
+                channels=channels,
+                scan_points=points_ticks,
+                slot_vars=slot_vars,
+                time_step_ns=clock_step_ns,
+                coeff_frac_bits=coeff_frac_bits,
+                exclude_channels=list(bus_members) + lane_channels,
+                global_shift=global_shift,
+                frame_end=frame_end,
+            )
+            break
+        except ValueError:
+            nxt = next((ch for ch in constant_delay_candidates
+                        if ch not in lane_channels and ch not in forced), None)
+            if nxt is None:
+                raise   # no nonzero-delay channel left to offload -> a genuine non-laneable reorder
+            forced.append(nxt)
     ticks = [row[0] for row in rows]
     masks = [row[1] for row in rows]
     tick_slot_coeffs = [list(row[2]) for row in rows]
@@ -1662,6 +1692,7 @@ def _pulse_table_delay_lanes(
     exclude_channels: Sequence[str] = (),
     global_shift: int = 0,
     frame_end: tuple[int, tuple[int, ...]] | None = None,
+    include_channels: Sequence[str] = (),
 ) -> tuple[list[str], list[DelayLane]]:
     """Build a DELAY LANE for each digital channel whose DELAY is SCANNED.
 
@@ -1683,6 +1714,7 @@ def _pulse_table_delay_lanes(
     hardware_channels = list(channel_names(channels, "channels"))
     channel_bits = {channel: index for index, channel in enumerate(hardware_channels)}
     exclude = set(exclude_channels)
+    force = set(include_channels)
     affine_starts = _pulse_table_affine_period_starts(state, slot_vars=slot_vars, time_step_ns=time_step_ns, coeff_frac_bits=coeff_frac_bits)
     g_expr = (int(global_shift), tuple(0 for _ in slot_vars))
     if frame_end is None:
@@ -1695,8 +1727,12 @@ def _pulse_table_delay_lanes(
         if channel in exclude or channel not in channel_bits:
             continue
         delay_aff = _affine_expr(state.delays.get(channel, 0.0), state.delay_units.get(channel, "ns"), slot_vars, time_step_ns, coeff_frac_bits)
-        if not any(delay_aff[1]):
-            continue  # delay not scanned -> stays in the (cheaper) main edge table
+        if channel not in force and not any(delay_aff[1]):
+            continue  # delay not scanned, not forced -> stays in the (cheaper) main edge table
+        # a FORCED channel (constant delay that nonetheless REORDERS because a scanned
+        # DURATION moves its edges relative to another channel's) is laned too: its edges
+        # are still affine (period_start carries the duration coeffs), so the lane plays it
+        # exactly and the global table no longer has to hold the reordering edge.
         # the channel's ON period-runs -> affine rise(=1)/fall(=0) edges shifted by delay
         # AND by the shared global shift G (so the lane frame aligns with the main frame).
         shift_aff = _affine_add(delay_aff, g_expr)

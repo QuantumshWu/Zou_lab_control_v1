@@ -496,6 +496,16 @@ Routing (compiler, `sequencer.py`):
   channels, whose period-0 edges share the anchor's zero-coeff expression and merge.
 - `_pulse_table_delay_lanes` emits each lane's affine rise/fall edges as `(base, coeffs)` and
   packs a `DelayLane(channel, channel_bit, ticks, coeffs, values)`.
+- A reorder can also arise WITHOUT a scanned delay -- a scanned DURATION can move a
+  CONSTANT-delay channel's edges past another channel's. That channel is not pre-laned, so
+  if the main table still reorders the compiler GREEDILY lanes the constant-delay channels
+  too (`_pulse_table_delay_lanes(include_channels=...)`) one at a time until the global
+  table is monotone at every scan point. In the worst case every nonzero-delay channel is
+  laned and the table holds only zero-delay channels (edges at monotone period boundaries,
+  never reorder). So a reorder of ANY origin is handled, bounded only by `NUM_LANES` (a
+  clear validate error) and per-channel monotonicity (a channel cannot run its own pulses
+  backwards). There is no longer a "this scan reorders -> rejected" outcome for any case
+  that fits in the lanes.
 
 Tick-0 seed anchor (the silent-off-by-one fix). The engine seeds its time counter from edge
 0, so the main edge table MUST begin at tick 0 at EVERY scan point or every edge slips one
