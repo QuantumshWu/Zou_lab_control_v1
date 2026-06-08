@@ -22,11 +22,10 @@
 #     mask  BRAM 32b(A)/64b(B)  port-A depth 8192, port-B depth 4096
 #   BANK_SIZE=2048 -> scan depth 2*2048=4096:
 #     scan  BRAM 32b(A)/128b(B) port-A depth 16384, port-B depth 4096
-#   bus image 256*7=1792 words; delay image 8*8*6=384 words; CTRL 64 -> axi_bram depth 65536.
-#   The per-channel OUTPUT delay is the UNBOUNDED membership player: held CTRL scalars
-#   (delay_count/bits/off/iv_counts/skip) + a small DELAY image BRAM whose intervals the
-#   delay mini-loader copies into the engine's per-channel ON-interval LUTRAM (NO ring buffer,
-#   so NO frame-period / delay-length cap).
+#   bus image 256*7=1792 words; CTRL 64 -> axi_bram depth 65536.
+#   The OUTPUT delay is a LITERAL delay line: a per-channel / per-bus distributed-RAM circular
+#   buffer of depth DELAY_DEPTH(2048) inferred inside the engine (ram_style="distributed", +0
+#   RAMB36).  Its delays ride DENSE CTRL words (DELAY_TICKS / BUS_DELAY_TICKS) -- NO delay BRAM.
 
 set script_dir [file normalize [file dirname [info script]]]
 proc env_or {name default} {
@@ -85,13 +84,10 @@ set zlc_scan_portb_bits 128
 set zlc_coeff_porta_depth [expr {$zlc_max_edges * ($zlc_coeff_portb_bits / 32)}]
 set zlc_mask_porta_depth  [expr {$zlc_max_edges * ($zlc_mask_portb_bits / 32)}]
 set zlc_scan_porta_depth  [expr {$zlc_scan_depth * ($zlc_scan_portb_bits / 32)}]
-# per-channel OUTPUT-delay ON-interval image: NUM_DELAYS(8) * MAX_DELAY_INTERVALS(8) rows,
-# each DELAY_WORDS = 2 + 2*(coeff 64b/32) = 6 words.  (The membership delay player's intervals;
-# the engine per-channel tables are LUTRAM, this is just the upload image.)
-set zlc_num_delays 8
-set zlc_max_delay_intervals 8
-set zlc_delay_words 6
-set zlc_delay_porta_depth [expr {$zlc_num_delays * $zlc_max_delay_intervals * $zlc_delay_words}]
+# LITERAL OUTPUT delay line: a per-channel / per-bus distributed-RAM circular buffer of depth
+# DELAY_DEPTH(2048) ticks (~40us), inferred inside zlc_edge_streamer (ram_style="distributed",
+# +0 RAMB36).  Its delays ride DENSE CTRL words -- there is NO delay image BRAM to build.
+set zlc_delay_depth 2048
 set zlc_axi_bram_depth 65536
 
 puts "ZLC create_project: FINAL engine (1-tick FIFO prefetch + 2-bank streaming), 4096 edges + bank 2048"
@@ -246,28 +242,11 @@ zlc_try "busimg noRSTB" {set_property CONFIG.Use_RSTB_Pin {false} [get_ips blk_m
 zlc_dump_ip blk_mem_gen_busimg
 generate_target all [get_ips blk_mem_gen_busimg]
 
-# --- DELAY image BRAM: 32b TDP (the delay mini-loader reads it into the engine's per-
-#     channel ON-interval LUTRAM).  Depth = NUM_DELAYS*MAX_DELAY_INTERVALS*DELAY_WORDS,
-#     rounded up to 2048 (1 RAMB36); this is the UNBOUNDED membership player's interval image.
-create_ip -name blk_mem_gen -vendor xilinx.com -library ip -module_name blk_mem_gen_delayimg
-zlc_try "delayimg TDP"    {set_property CONFIG.Memory_Type {True_Dual_Port_RAM} [get_ips blk_mem_gen_delayimg]}
-zlc_try "delayimg ByteWE" {set_property CONFIG.Use_Byte_Write_Enable {true} [get_ips blk_mem_gen_delayimg]}
-zlc_try "delayimg ByteSize8" {set_property CONFIG.Byte_Size {8} [get_ips blk_mem_gen_delayimg]}
-zlc_try "delayimg WWA=32" {set_property CONFIG.Write_Width_A {32} [get_ips blk_mem_gen_delayimg]}
-zlc_try "delayimg WDA=2048" {set_property CONFIG.Write_Depth_A {2048} [get_ips blk_mem_gen_delayimg]}
-zlc_try "delayimg ENA"    {set_property CONFIG.Enable_A {Use_ENA_Pin} [get_ips blk_mem_gen_delayimg]}
-zlc_try "delayimg ENB"    {set_property CONFIG.Enable_B {Use_ENB_Pin} [get_ips blk_mem_gen_delayimg]}
-zlc_try "delayimg noRSTA" {set_property CONFIG.Use_RSTA_Pin {false} [get_ips blk_mem_gen_delayimg]}
-zlc_try "delayimg noRSTB" {set_property CONFIG.Use_RSTB_Pin {false} [get_ips blk_mem_gen_delayimg]}
-zlc_dump_ip blk_mem_gen_delayimg
-generate_target all [get_ips blk_mem_gen_delayimg]
-
-# NOTE: the DELAY image BRAM above holds only the per-channel ON-interval UPLOAD image; the
-# engine's per-channel ON-interval tables are inferred distributed-RAM / LUTRAM inside
-# zlc_edge_streamer (ram_style="distributed", +0 RAMB36, +0 DSP).  The delay mini-loader
-# copies the image rows into that LUTRAM via delay_prog_*.  There is NO ring buffer -- the
-# engine evaluates the intervals at the shifted phase, so the frame period and delay are
-# both unbounded.
+# NOTE: the LITERAL OUTPUT delay line (per-channel TTL ring + per-bus DAC ring, depth
+# DELAY_DEPTH) is inferred distributed-RAM / LUTRAM inside zlc_edge_streamer
+# (ram_style="distributed", +0 RAMB36, +0 DSP).  Its delays ride DENSE CTRL words latched at
+# FIRE -- there is NO delay image BRAM and NO mini-loader to build (only 5 BRAMs: 3 edge + scan
+# + bus image).
 
 update_compile_order -fileset sources_1
 launch_runs synth_1 -jobs 4

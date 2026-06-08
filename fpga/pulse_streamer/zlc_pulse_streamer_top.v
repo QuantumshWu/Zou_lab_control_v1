@@ -54,10 +54,7 @@ module zlc_pulse_streamer_top #(
     parameter integer BUS_WIDTH = 10,
     parameter integer BUS_SEG_ADDR_WIDTH = 6,
     parameter integer BUS_SEL_WIDTH = 3,
-    parameter integer NUM_DELAYS = 8,           // per-channel OUTPUT delay players
-    parameter integer MAX_DELAY_INTERVALS = 8,  // ON intervals stored per delayed channel
-    parameter integer SKIP_WIDTH = 32,          // whole-period skip = floor(d/T)
-    parameter integer CHANNEL_BIT_WIDTH = 6     // $clog2(CHANNEL_COUNT)
+    parameter integer DELAY_DEPTH = 2048        // LITERAL delay-line buffer depth (ticks, ~40us)
 )(
     input  wire clk,
     output wire [1:0] led,
@@ -88,15 +85,13 @@ module zlc_pulse_streamer_top #(
     localparam integer MAX_BUS_SEGMENTS = (1 << BUS_SEG_ADDR_WIDTH);
     localparam integer BUS_ROWS = BUS_COUNT * MAX_BUS_SEGMENTS;
     localparam integer BUS_WORDS = 2 + 2 * ((COEFF_BITS + 31) / 32) + 1;   // 7
-    // per-channel OUTPUT-delay ON-interval image: one row per (player, interval), each row =
-    // a_i, b_i (2 words) + start/stop affine coeffs (2 * COEFF_WORDS words) = DELAY_WORDS.
-    localparam integer DELAY_ROWS = NUM_DELAYS * MAX_DELAY_INTERVALS;
-    localparam integer DELAY_WORDS = 2 + 2 * COEFF_WORDS;                  // 6
+    // LITERAL delay line: a distributed-RAM circular buffer, depth DELAY_DEPTH+1.  DELAY_TICK_WIDTH
+    // holds a delay in [0, DELAY_DEPTH]; the delays ride DENSE CTRL words (no BRAM image).
+    localparam integer DELAY_TICK_WIDTH = $clog2(DELAY_DEPTH + 1);         // 12 for 2048
 
     // --- word-address region bases (== host.image.region_bases) ---------------
-    // The per-channel OUTPUT delay is the UNBOUNDED membership player: held CTRL scalars
-    // (count/bits/off/iv_counts/skip) PLUS a small DELAY image region that the delay mini-loader
-    // copies into the engine's per-channel ON-interval LUTRAM (there is NO ring buffer).
+    // The LITERAL OUTPUT delay line carries its delays in DENSE CTRL words (DELAY_TICKS /
+    // BUS_DELAY_TICKS) -- there is NO delay BRAM image / region, so the last region is the bus image.
     localparam integer R_CTRL_BASE = 0;
     localparam integer R_CTRL_WORDS = 64;
     localparam integer R_TICK_BASE  = R_CTRL_BASE + R_CTRL_WORDS;
@@ -104,8 +99,7 @@ module zlc_pulse_streamer_top #(
     localparam integer R_MASK_BASE  = R_COEFF_BASE + MAX_EDGES * COEFF_WORDS;
     localparam integer R_SCAN_BASE  = R_MASK_BASE  + MAX_EDGES * MASK_WORDS;
     localparam integer R_BUS_BASE   = R_SCAN_BASE  + SCAN_DEPTH * SCAN_WORDS;
-    localparam integer R_DELAY_BASE = R_BUS_BASE   + BUS_ROWS * BUS_WORDS;
-    localparam integer R_TOTAL_WORDS = R_DELAY_BASE + DELAY_ROWS * DELAY_WORDS;
+    localparam integer R_TOTAL_WORDS = R_BUS_BASE   + BUS_ROWS * BUS_WORDS;
 
     // CTRL regfile word offsets (== host.image.CtrlWords).
     localparam integer C_MAGIC = 0;
@@ -129,28 +123,15 @@ module zlc_pulse_streamer_top #(
     localparam integer C_BANK1_CHUNK = 18;  // host -> engine: sweep chunk resident in bank 1
     localparam integer C_REPEAT_FROM_LOOP_START = 19;  // repeat_forever rewinds to LOOP_START
                                                        // (additive-delay steady frame), not edge 0
-    // --- per-channel OUTPUT delay (held CTRL scalars for the UNBOUNDED membership player).
-    // delay_bits      = NUM_DELAYS*CHANNEL_BIT_WIDTH bits (8*6 = 48)  -> 2 words
-    // delay_off       = NUM_DELAYS * one 32b word        (8*32)       -> one 32b word each (8)
-    //                   (off = d mod T is now the FULL phase, not a ring index -> 1 word/chan)
-    // delay_iv_counts = NUM_DELAYS*DELAY_IV_CNT_W bits   (8*4 = 32)   -> 1 word
-    // delay_skip      = NUM_DELAYS * one 32b word        (8*32)       -> one 32b word each (8)
-    localparam integer DELAY_BITS_BITS  = NUM_DELAYS * CHANNEL_BIT_WIDTH;   // 48
-    localparam integer DELAY_BITS_WORDS = (DELAY_BITS_BITS + 31) / 32;      // 2
-    localparam integer DELAY_IV_AW      = ($clog2(MAX_DELAY_INTERVALS) > 0) ? $clog2(MAX_DELAY_INTERVALS) : 1;
-    localparam integer DELAY_IV_CNT_W   = DELAY_IV_AW + 1;                  // 4
-    localparam integer C_DELAY_COUNT = 20;  // number of active delayed channels ($clog2(N+1) bits)
-    localparam integer C_DELAY_BITS  = 21;  // packed per-channel output bit (DELAY_BITS_WORDS words: 21,22)
-    localparam integer C_DELAY_OFF   = C_DELAY_BITS + DELAY_BITS_WORDS;   // 23: off = d mod T, one 32b word/chan (NUM_DELAYS words: 23..30)
-    localparam integer C_DELAY_IV_COUNTS = C_DELAY_OFF + NUM_DELAYS;      // 31: packed ON-interval count (1 word)
-    localparam integer C_DELAY_SKIP  = C_DELAY_IV_COUNTS + 1;            // 32: skip = floor(d/T), one 32b word/chan (NUM_DELAYS words: 32..39)
-    // --- per-bus DAC DELAY (held CTRL scalars for the UNBOUNDED membership BUS-delay player;
-    // the DAC-value counterpart of the per-channel delay above).  bus_delay_bus = packed bus
-    // index (BUS_INDEX_WIDTH each) -> 1 word; off/skip = one 32b word per delayed-bus slot.
-    localparam integer C_BUS_DELAY_COUNT = 40;  // number of delayed buses (<= BUS_COUNT)
-    localparam integer C_BUS_DELAY_BUS   = 41;  // packed per-delay bus index (1 word)
-    localparam integer C_BUS_DELAY_OFF   = 42;  // off = d mod T, one 32b word/bus (BUS_COUNT words: 42..45)
-    localparam integer C_BUS_DELAY_SKIP  = C_BUS_DELAY_OFF + BUS_COUNT;  // 46: skip = floor(d/T), one 32b word/bus (46..49)
+    // --- LITERAL delay line: DENSE per-channel / per-bus delay tick counts in CTRL words.
+    // DELAY_TICKS    = CHANNEL_COUNT * DELAY_TICK_WIDTH bits (62*12 = 744) -> ceil/32 = 24 words
+    // BUS_DELAY_TICKS= BUS_COUNT * DELAY_TICK_WIDTH bits     (4*12 = 48)   -> ceil/32 = 2 words
+    localparam integer DELAY_TICKS_BITS      = CHANNEL_COUNT * DELAY_TICK_WIDTH;   // 744
+    localparam integer DELAY_TICKS_WORDS     = (DELAY_TICKS_BITS + 31) / 32;       // 24
+    localparam integer BUS_DELAY_TICKS_BITS  = BUS_COUNT * DELAY_TICK_WIDTH;       // 48
+    localparam integer BUS_DELAY_TICKS_WORDS = (BUS_DELAY_TICKS_BITS + 31) / 32;   // 2
+    localparam integer C_DELAY_TICKS = 20;                               // dense per-channel d (24 words: 20..43)
+    localparam integer C_BUS_DELAY_TICKS = C_DELAY_TICKS + DELAY_TICKS_WORDS;  // 44: dense per-bus d (2 words: 44..45)
 
     // engine outputs
     wire [CHANNEL_COUNT-1:0] out;
@@ -158,17 +139,13 @@ module zlc_pulse_streamer_top #(
     wire zlc_running, zlc_done, zlc_underflow;
     wire [SCAN_COUNT_WIDTH-1:0] zlc_cursor;
 
-    // --- per-channel OUTPUT delay: assemble the packed engine busses from the CTRL
-    // regfile words.  delay_bits (48b) spans DELAY_BITS_WORDS=2 words; delay_off is now one
-    // 32b word per channel (the FULL phase, not a ring index); delay_skip is one 32b word per
-    // channel; delay_iv_counts (32b) is one word.  The ctrl regfile is declared below.
-    wire [DELAY_BITS_WORDS*32-1:0] delay_bits_w;
-    wire [NUM_DELAYS*TICK_WIDTH-1:0] delay_off_w;
-    wire [NUM_DELAYS*SKIP_WIDTH-1:0] delay_skip_w;
-    wire [NUM_DELAYS*DELAY_IV_CNT_W-1:0] delay_iv_counts_w;
-    // --- per-bus DAC delay: assemble the packed engine busses (one 32b word/bus each).
-    wire [BUS_COUNT*TICK_WIDTH-1:0] bus_delay_off_w;
-    wire [BUS_COUNT*SKIP_WIDTH-1:0] bus_delay_skip_w;
+    // --- LITERAL delay line: assemble the DENSE delay-tick busses from consecutive CTRL words.
+    // delay_ticks (CHANNEL_COUNT*DELAY_TICK_WIDTH bits) spans DELAY_TICKS_WORDS words;
+    // bus_delay_ticks (BUS_COUNT*DELAY_TICK_WIDTH bits) spans BUS_DELAY_TICKS_WORDS words.
+    wire [DELAY_TICKS_WORDS*32-1:0] delay_ticks_pack;
+    wire [BUS_DELAY_TICKS_WORDS*32-1:0] bus_delay_ticks_pack;
+    wire [CHANNEL_COUNT*DELAY_TICK_WIDTH-1:0] delay_ticks_w;
+    wire [BUS_COUNT*DELAY_TICK_WIDTH-1:0] bus_delay_ticks_w;
 
     // --- JTAG-to-AXI master -> FULL AXI4 -> AXI BRAM controller ---------------
     // Full AXI4 (not Lite) so the host issues INCR burst writes (up to 256 words per
@@ -203,42 +180,32 @@ module zlc_pulse_streamer_top #(
     wire sel_coeff = (word_addr >= R_COEFF_BASE) && (word_addr < R_MASK_BASE);
     wire sel_mask  = (word_addr >= R_MASK_BASE)  && (word_addr < R_SCAN_BASE);
     wire sel_scan  = (word_addr >= R_SCAN_BASE)  && (word_addr < R_BUS_BASE);
-    wire sel_bus   = (word_addr >= R_BUS_BASE)   && (word_addr < R_DELAY_BASE);
-    wire sel_delay = (word_addr >= R_DELAY_BASE) && (word_addr < R_TOTAL_WORDS);
+    wire sel_bus   = (word_addr >= R_BUS_BASE)   && (word_addr < R_TOTAL_WORDS);
     wire [29:0] tick_word_off  = word_addr - R_TICK_BASE[29:0];
     wire [29:0] coeff_word_off = word_addr - R_COEFF_BASE[29:0];
     wire [29:0] mask_word_off  = word_addr - R_MASK_BASE[29:0];
     wire [29:0] scan_word_off  = word_addr - R_SCAN_BASE[29:0];
     wire [29:0] bus_word_off   = word_addr - R_BUS_BASE[29:0];
-    wire [29:0] delay_word_off = word_addr - R_DELAY_BASE[29:0];
 
     // --- CTRL regfile ---------------------------------------------------------
     reg [31:0] ctrl_reg [0:R_CTRL_WORDS-1];
     integer ci;
     initial begin for (ci = 0; ci < R_CTRL_WORDS; ci = ci + 1) ctrl_reg[ci] = 32'b0; end
 
-    // assemble the packed per-channel OUTPUT delay busses from consecutive CTRL words
-    // (little-endian word order: word j supplies bits [32*j +: 32]); slice the engine input
-    // widths from the LSBs (the upper pad bits of the last word are 0 from the host).
+    // assemble the DENSE delay-tick busses from consecutive CTRL words (little-endian word
+    // order: word j supplies bits [32*j +: 32]); slice the engine input widths from the LSBs
+    // (the upper pad bits of the last word are 0 from the host).
     genvar dw;
     generate
-        for (dw = 0; dw < DELAY_BITS_WORDS; dw = dw + 1) begin : zlc_delay_bits_pack
-            assign delay_bits_w[dw*32 +: 32] = ctrl_reg[C_DELAY_BITS + dw];
+        for (dw = 0; dw < DELAY_TICKS_WORDS; dw = dw + 1) begin : zlc_delay_ticks_pack_gen
+            assign delay_ticks_pack[dw*32 +: 32] = ctrl_reg[C_DELAY_TICKS + dw];
         end
-        for (dw = 0; dw < NUM_DELAYS; dw = dw + 1) begin : zlc_delay_off_pack
-            assign delay_off_w[dw*TICK_WIDTH +: TICK_WIDTH] = ctrl_reg[C_DELAY_OFF + dw];
-        end
-        for (dw = 0; dw < NUM_DELAYS; dw = dw + 1) begin : zlc_delay_skip_pack
-            assign delay_skip_w[dw*SKIP_WIDTH +: SKIP_WIDTH] = ctrl_reg[C_DELAY_SKIP + dw];
-        end
-        for (dw = 0; dw < BUS_COUNT; dw = dw + 1) begin : zlc_bus_delay_off_pack
-            assign bus_delay_off_w[dw*TICK_WIDTH +: TICK_WIDTH] = ctrl_reg[C_BUS_DELAY_OFF + dw];
-        end
-        for (dw = 0; dw < BUS_COUNT; dw = dw + 1) begin : zlc_bus_delay_skip_pack
-            assign bus_delay_skip_w[dw*SKIP_WIDTH +: SKIP_WIDTH] = ctrl_reg[C_BUS_DELAY_SKIP + dw];
+        for (dw = 0; dw < BUS_DELAY_TICKS_WORDS; dw = dw + 1) begin : zlc_bus_delay_ticks_pack_gen
+            assign bus_delay_ticks_pack[dw*32 +: 32] = ctrl_reg[C_BUS_DELAY_TICKS + dw];
         end
     endgenerate
-    assign delay_iv_counts_w = ctrl_reg[C_DELAY_IV_COUNTS][NUM_DELAYS*DELAY_IV_CNT_W-1:0];
+    assign delay_ticks_w = delay_ticks_pack[CHANNEL_COUNT*DELAY_TICK_WIDTH-1:0];
+    assign bus_delay_ticks_w = bus_delay_ticks_pack[BUS_COUNT*DELAY_TICK_WIDTH-1:0];
 
     // loader/engine-driven write-backs (separate from AXI host writes)
     reg ldr_status_we;
@@ -304,25 +271,12 @@ module zlc_pulse_streamer_top #(
         .addrb(bus_img_raddr), .dinb(32'b0), .doutb(bus_img_doutb)
     );
 
-    // --- DELAY image BRAM (32b TDP; the delay mini-loader reads it into the engine's
-    //     per-channel ON-interval LUTRAM) -- the UNBOUNDED membership player's intervals.
-    wire [31:0] delay_img_doutb;
-    reg  [($clog2(DELAY_ROWS*DELAY_WORDS))-1:0] delay_img_raddr;
-    blk_mem_gen_delayimg zlc_delay_img_i (
-        .clka(axi_clk), .ena(bram_ena && sel_delay), .wea(bram_wea),
-        .addra(delay_word_off[($clog2(DELAY_ROWS*DELAY_WORDS))-1:0]), .dina(bram_dina), .douta(),
-        .clkb(axi_clk), .enb(1'b1), .web(4'b0),
-        .addrb(delay_img_raddr), .dinb(32'b0), .doutb(delay_img_doutb)
-    );
-
-    // --- control / bus + delay mini-loader FSM --------------------------------
-    // On LOAD: hold engine reset, copy the bus image (R_BUS) into the engine bus
-    // LUTRAM via bus_prog_*, THEN copy the delay ON-interval image (R_DELAY) into the
-    // engine's per-channel interval LUTRAM via delay_prog_*, then set STATUS.LOADED.  On
-    // FIRE: release reset + pulse start.  Edge/scan are NOT copied (the engine reads those
-    // BRAMs directly).  Bus rows are 7 words = [start_tick, stop_tick, sc_lo, sc_hi, ec_lo,
-    // ec_hi, flags]; delay rows are DELAY_WORDS=6 words = [a, b, sc_lo, sc_hi, ec_lo, ec_hi]
-    // (host.image layouts).  Rising-edge-detected commands.
+    // --- control / bus mini-loader FSM ----------------------------------------
+    // On LOAD: hold engine reset, copy the bus image (R_BUS) into the engine bus LUTRAM via
+    // bus_prog_*, then set STATUS.LOADED.  On FIRE: release reset + pulse start.  Edge/scan are
+    // NOT copied (the engine reads those BRAMs directly); the LITERAL delay line takes its delays
+    // straight from the dense CTRL words (no image to copy).  Bus rows are 7 words = [start_tick,
+    // stop_tick, sc_lo, sc_hi, ec_lo, ec_hi, flags] (host.image).  Rising-edge-detected commands.
     localparam CMD_LOAD = 4'b0001, CMD_FIRE = 4'b0010, CMD_RESET = 4'b0100, CMD_SAFE = 4'b1000;
     // STATUS bit map MUST match host.image: LOADED=1 RUNNING=2 DONE=4 ERROR=8(host-only,
     // never set here) UNDERFLOW=16.  Underflow is bit4 (NOT bit3) so a transient
@@ -349,31 +303,17 @@ module zlc_pulse_streamer_top #(
     reg [BUS_SEL_WIDTH-1:0] bus_prog_value_select = {BUS_SEL_WIDTH{1'b0}};
     reg [BUS_SEL_WIDTH-1:0] bus_prog_stop_value_select = {BUS_SEL_WIDTH{1'b0}};
 
-    // delay ON-interval loader outputs (drive the engine's delay_prog_* port)
-    localparam integer DELAY_PLAYER_AW = ($clog2(NUM_DELAYS) > 0) ? $clog2(NUM_DELAYS) : 1;
-    reg delay_prog_we = 1'b0;
-    reg [DELAY_PLAYER_AW-1:0] delay_prog_player = {DELAY_PLAYER_AW{1'b0}};
-    reg [DELAY_IV_AW-1:0] delay_prog_addr = {DELAY_IV_AW{1'b0}};
-    reg [TICK_WIDTH-1:0] delay_prog_start_tick = {TICK_WIDTH{1'b0}};
-    reg [TICK_WIDTH-1:0] delay_prog_stop_tick = {TICK_WIDTH{1'b0}};
-    reg [COEFF_BITS-1:0] delay_prog_start_coeffs = {COEFF_BITS{1'b0}};
-    reg [COEFF_BITS-1:0] delay_prog_stop_coeffs = {COEFF_BITS{1'b0}};
-
-    localparam [3:0] L_IDLE=0, L_RD=1, L_CAP=2, L_EMIT=3, L_NEXT=4, L_FIRE=5, L_RUN=6,
-                     L_DNEXT=7, L_DRD=8, L_DCAP=9, L_DEMIT=10, L_DRUN=11;
+    localparam [3:0] L_IDLE=0, L_RD=1, L_CAP=2, L_EMIT=3, L_NEXT=4, L_FIRE=5, L_RUN=6;
     reg [3:0] lstate = L_IDLE;
-    reg [2:0] wi;                       // word index within a bus / delay row
+    reg [2:0] wi;                       // word index within a bus row
     reg [31:0] cap [0:6];
     reg [BUS_INDEX_WIDTH:0] bcur;       // current bus
     reg [BUS_SEG_ADDR_WIDTH:0] baddr;   // segment within bus
     reg [BUS_SEG_ADDR_WIDTH:0] bcnt;    // count for current bus
-    reg [DELAY_PLAYER_AW:0] dcur;       // current delay player
-    reg [DELAY_IV_CNT_W-1:0] daddr;     // interval within player
-    reg [DELAY_IV_CNT_W-1:0] dcnt;      // ON-interval count for current player
     reg [1:0] settle;
     reg [3:0] cmd_seen;
     integer ic;
-    initial begin for (ic=0; ic<7; ic=ic+1) cap[ic]=32'b0; wi=0; bcur=0; baddr=0; bcnt=0; dcur=0; daddr=0; dcnt=0; settle=0; cmd_seen=0; bus_img_raddr=0; delay_img_raddr=0; end
+    initial begin for (ic=0; ic<7; ic=ic+1) cap[ic]=32'b0; wi=0; bcur=0; baddr=0; bcnt=0; settle=0; cmd_seen=0; bus_img_raddr=0; end
 
     wire [3:0] cmd_now = ctrl_reg[C_COMMAND][3:0];
     wire [3:0] cmd_edge = cmd_now & ~cmd_seen;
@@ -383,12 +323,6 @@ module zlc_pulse_streamer_top #(
     function [($clog2(BUS_ROWS*BUS_WORDS))-1:0] R_relbus;
         input integer b; input integer a;
         begin R_relbus = (b * MAX_BUS_SEGMENTS + a) * BUS_WORDS; end
-    endfunction
-    function [DELAY_IV_CNT_W-1:0] delay_iv_count_of; input integer k; begin
-        delay_iv_count_of = ctrl_reg[C_DELAY_IV_COUNTS][k*DELAY_IV_CNT_W +: DELAY_IV_CNT_W]; end endfunction
-    function [($clog2(DELAY_ROWS*DELAY_WORDS))-1:0] R_reldelay;
-        input integer k; input integer a;
-        begin R_reldelay = (k * MAX_DELAY_INTERVALS + a) * DELAY_WORDS; end
     endfunction
 
     always @(posedge clk) begin
@@ -410,8 +344,9 @@ module zlc_pulse_streamer_top #(
             wi <= 0;
             if (baddr >= bcnt) begin
                 if (bcur == BUS_COUNT-1) begin
-                    // bus image done -> copy the delay ON-interval image into the engine LUTRAM.
-                    dcur <= 0; daddr <= 0; dcnt <= delay_iv_count_of(0); lstate <= L_DNEXT;
+                    // bus image done -> LOADED.  The LITERAL delay line needs no image copy
+                    // (its delays ride the dense CTRL words, latched by the engine at FIRE).
+                    ldr_status_we <= 1'b1; ldr_status_val <= {27'b0, ST_LOADED}; lstate <= L_IDLE;
                 end else begin
                     bcur <= bcur + 1'b1; baddr <= 0; bcnt <= bus_count_of(bcur + 1'b1); lstate <= L_NEXT;
                 end
@@ -449,45 +384,6 @@ module zlc_pulse_streamer_top #(
         L_RUN: begin
             if (settle == 0) lstate <= L_NEXT; else settle <= settle - 1'b1;
         end
-        // ---- delay ON-interval loader: copy R_DELAY rows into the engine interval LUTRAM ----
-        L_DNEXT: begin
-            wi <= 0;
-            if (daddr >= dcnt) begin
-                if (dcur == NUM_DELAYS-1) begin
-                    // delay image done -> LOADED (engine reads the per-channel intervals).
-                    ldr_status_we <= 1'b1; ldr_status_val <= {27'b0, ST_LOADED}; lstate <= L_IDLE;
-                end else begin
-                    dcur <= dcur + 1'b1; daddr <= 0; dcnt <= delay_iv_count_of(dcur + 1'b1); lstate <= L_DNEXT;
-                end
-            end else begin
-                delay_img_raddr <= R_reldelay(dcur, daddr);
-                settle <= 2'd2; lstate <= L_DRD;
-            end
-        end
-        L_DRD: begin
-            delay_img_raddr <= R_reldelay(dcur, daddr) + wi;
-            settle <= 2'd2; lstate <= L_DCAP;
-        end
-        L_DCAP: begin
-            if (settle == 0) begin
-                cap[wi] <= delay_img_doutb;
-                if (wi == DELAY_WORDS-1) lstate <= L_DEMIT;
-                else begin wi <= wi + 1'b1; lstate <= L_DRD; end
-            end else settle <= settle - 1'b1;
-        end
-        L_DEMIT: begin
-            delay_prog_player <= dcur[DELAY_PLAYER_AW-1:0];
-            delay_prog_addr <= daddr[DELAY_IV_AW-1:0];
-            delay_prog_start_tick <= cap[0]; delay_prog_stop_tick <= cap[1];
-            delay_prog_start_coeffs <= {cap[3][COEFF_BITS-33:0], cap[2]};
-            delay_prog_stop_coeffs <= {cap[5][COEFF_BITS-33:0], cap[4]};
-            delay_prog_we <= ~delay_prog_we;      // toggle commits an interval write
-            daddr <= daddr + 1'b1;
-            settle <= 2'd2; lstate <= L_DRUN;
-        end
-        L_DRUN: begin
-            if (settle == 0) lstate <= L_DNEXT; else settle <= settle - 1'b1;
-        end
         L_FIRE: begin
             eng_reset <= 1'b0;
             eng_start <= 1'b1;
@@ -520,8 +416,7 @@ module zlc_pulse_streamer_top #(
         .TICK_WIDTH(TICK_WIDTH), .NUM_SLOTS(NUM_SLOTS), .COEFF_WIDTH(COEFF_WIDTH), .COEFF_FRAC_BITS(COEFF_FRAC_BITS),
         .BUS_COUNT(BUS_COUNT), .BUS_INDEX_WIDTH(BUS_INDEX_WIDTH), .BUS_WIDTH(BUS_WIDTH),
         .BUS_SEG_ADDR_WIDTH(BUS_SEG_ADDR_WIDTH), .BUS_SEL_WIDTH(BUS_SEL_WIDTH),
-        .NUM_DELAYS(NUM_DELAYS), .MAX_DELAY_INTERVALS(MAX_DELAY_INTERVALS),
-        .SKIP_WIDTH(SKIP_WIDTH), .CHANNEL_BIT_WIDTH(CHANNEL_BIT_WIDTH),
+        .DELAY_DEPTH(DELAY_DEPTH),
         .RD_LAT(2), .FIFO_DEPTH(3)
     ) zlc_engine_i (
         .clk(axi_clk), .reset(eng_reset), .start(eng_start),
@@ -551,23 +446,10 @@ module zlc_pulse_streamer_top #(
         .bus_prog_mode(bus_prog_mode), .bus_prog_value_select(bus_prog_value_select),
         .bus_prog_stop_value_select(bus_prog_stop_value_select),
         .bus_counts(ctrl_reg[C_BUS_COUNTS][BUS_COUNT*(BUS_SEG_ADDR_WIDTH+1)-1:0]),
-        // per-bus DAC delay -- UNBOUNDED membership BUS-delay player (held CTRL scalars; the
-        // segments stay nominal, the engine evaluates the bus value at the shifted phase).
-        .bus_delay_count(ctrl_reg[C_BUS_DELAY_COUNT][$clog2(BUS_COUNT+1)-1:0]),
-        .bus_delay_bus(ctrl_reg[C_BUS_DELAY_BUS][BUS_COUNT*BUS_INDEX_WIDTH-1:0]),
-        .bus_delay_off(bus_delay_off_w),
-        .bus_delay_skip(bus_delay_skip_w),
-        // per-channel OUTPUT delay -- UNBOUNDED membership player (held CTRL scalars + the
-        // ON-interval LUTRAM filled via delay_prog_*).
-        .delay_count(ctrl_reg[C_DELAY_COUNT][$clog2(NUM_DELAYS+1)-1:0]),
-        .delay_bits(delay_bits_w[NUM_DELAYS*CHANNEL_BIT_WIDTH-1:0]),
-        .delay_off(delay_off_w),
-        .delay_skip(delay_skip_w),
-        .delay_iv_counts(delay_iv_counts_w),
-        .delay_prog_we(delay_prog_we), .delay_prog_player(delay_prog_player),
-        .delay_prog_addr(delay_prog_addr),
-        .delay_prog_start_tick(delay_prog_start_tick), .delay_prog_stop_tick(delay_prog_stop_tick),
-        .delay_prog_start_coeffs(delay_prog_start_coeffs), .delay_prog_stop_coeffs(delay_prog_stop_coeffs),
+        // LITERAL OUTPUT delay line -- dense per-channel / per-bus delay tick counts (the engine
+        // pushes the undelayed outputs into a circular buffer and reads (wptr - d)).
+        .bus_delay_ticks(bus_delay_ticks_w),
+        .delay_ticks(delay_ticks_w),
         .out(out), .bus_out(zlc_bus_out), .running(zlc_running), .done(zlc_done)
     );
 

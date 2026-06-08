@@ -38,13 +38,11 @@ DEFAULT_TICK_WIDTH = 32
 DEFAULT_SCAN_COEFF_WIDTH = 16
 DEFAULT_SCAN_COEFF_FRAC_BITS = 8
 DEFAULT_NUM_SLOTS = 4
-# Per-channel OUTPUT delay players (the UNBOUNDED membership delay line): max simultaneously-
-# delayed channels and ON intervals stored per channel (must match zlc_edge_streamer.v
-# NUM_DELAYS / MAX_DELAY_INTERVALS).  There is NO ring depth -- the engine evaluates the stored
-# intervals at the shifted phase instead of buffering, so the frame period and delay length are
-# both unbounded.
-DEFAULT_NUM_DELAYS = 8
-DEFAULT_MAX_DELAY_INTERVALS = 8
+# LITERAL OUTPUT delay-line depth in ticks (must match zlc_edge_streamer.v DELAY_DEPTH and
+# host.image / engine_model DELAY_DEPTH).  A bounded cap: 2048 * 20 ns = ~40 us, covering
+# +/-15 us after the negative-delay global shift G (which can push an effective delay to ~30 us).
+# ALL channels and ALL buses are independently delayable; every effective delay must be <= this.
+DEFAULT_DELAY_DEPTH = 2048
 # Affine-MAC slot operand width -- MUST match zlc_edge_streamer.v SLOT_MUL_WIDTH
 # and engine_model.SLOT_MUL_WIDTH.  Each scan slot VALUE is multiplied by a 16-bit
 # coeff on a single DSP48E1 (25x18), so the slot operand is the low 25 bits taken
@@ -249,8 +247,7 @@ def validate_pulse_streamer_program(
     bus_count: int = DEFAULT_BUS_COUNT,
     bus_width: int = DEFAULT_BUS_WIDTH,
     slot_mul_width: int = DEFAULT_SLOT_MUL_WIDTH,
-    num_delays: int = DEFAULT_NUM_DELAYS,
-    max_delay_intervals: int = DEFAULT_MAX_DELAY_INTERVALS,
+    delay_depth: int = DEFAULT_DELAY_DEPTH,
     max_validated_scan_points: int | None = None,
 ) -> None:
     """Validate that a runtime edge table fits the fixed FPGA streamer.
@@ -279,23 +276,17 @@ def validate_pulse_streamer_program(
         raise ValueError(f"program has {len(program.ticks)} edges, but the FPGA streamer only accepts {max_edges}.")
     if len(program.channels) > channel_count:
         raise ValueError(f"program uses {len(program.channels)} channels, but the FPGA streamer has {channel_count}.")
-    # PER-CHANNEL OUTPUT DELAY (the UNBOUNDED membership delay line): at most num_delays
-    # channels may be delayed, each with at most max_delay_intervals ON intervals.  There is
-    # NO frame-period / delay-length cap -- the engine evaluates the stored intervals at the
-    # shifted phase ``(time_count - off) mod T`` instead of buffering, so off (= d mod T) is
-    # the full TICK_WIDTH phase and skip (= floor(d/T)) is a 32-bit counter: ANY length,
-    # positive/negative (via the host's folded global shift)/zero, arbitrarily large or small.
+    # PER-CHANNEL OUTPUT DELAY -- a LITERAL delay line (a per-channel circular buffer of depth
+    # delay_depth).  ALL channels are independently delayable, but each effective delay is
+    # BOUNDED by the buffer depth (a bounded cap; the user accepted the +/-15us bound).  A delay
+    # is constant (never scanned), positive/negative-via-the-folded-global-shift/zero.
+    delay_depth = _positive_int(delay_depth, "delay_depth")
     channel_delays = [int(d) for d in (getattr(program, "channel_delays", None) or [])]
-    delayed = [(b, d) for b, d in enumerate(channel_delays) if d]
-    if len(delayed) > num_delays:
-        raise ValueError(
-            f"program delays {len(delayed)} channels, but the FPGA delay line has {num_delays} players.")
-    for dc in (getattr(program, "delay_channels", None) or []):
-        ivals = list(getattr(dc, "intervals", None) or [])
-        if len(ivals) > max_delay_intervals:
+    for b, d in enumerate(channel_delays):
+        if d < 0 or d > delay_depth:
             raise ValueError(
-                f"channel-delay output bit {getattr(dc, 'bit', '?')}: {len(ivals)} ON intervals > "
-                f"max_delay_intervals {max_delay_intervals}; raise max_delay_intervals.")
+                f"channel-delay output bit {b}: delay {d} ticks exceeds the delay-line depth "
+                f"DELAY_DEPTH={delay_depth} (~{delay_depth * 20 / 1000:.0f}us); reduce the delay.")
     tick_limit = (1 << tick_width) - 1
     mask_limit = (1 << channel_count) - 1
     scan_points = list(getattr(program, "scan_points", None) or [])
@@ -359,20 +350,19 @@ def validate_pulse_streamer_program(
             raise ValueError(f"bus {bus_index} has {bus_segment_counts[bus_index]} segments, above max_bus_segments={max_bus_segments}.")
     if bus_segments and (int(getattr(program, "loop_count", 1)) > 1 and int(getattr(program, "loop_start_index", 0)) != 0):
         raise ValueError("bus_segments do not currently support finite inner repeat brackets.")
-    # Per-bus DAC DELAY (the UNBOUNDED membership BUS-delay player -- the DAC-value counterpart
-    # of the per-channel delay).  At most bus_count buses may be delayed, each by ANY amount:
-    # there is NO frame-period / delay-length cap -- the engine evaluates the bus value at the
-    # shifted phase ``(time_count - off) mod T`` (off = d mod T full phase, skip = floor(d/T)
-    # 32b) instead of riding the segment ticks, so a DAC value can be delayed by more than one
-    # frame, positive/negative (via the host's folded global shift)/zero.
+    # Per-bus DAC DELAY -- the LITERAL per-bus delay line (a 10-bit circular buffer, one delay
+    # shared by all 10 bits).  Each bus may be delayed by up to delay_depth ticks (the same
+    # bounded cap as the per-channel delay).
     bus_delays = list(getattr(program, "bus_delays", None) or [])
-    if len(bus_delays) > bus_count:
-        raise ValueError(
-            f"program delays {len(bus_delays)} buses, but the FPGA bus-delay player has {bus_count} slots.")
     for bd in bus_delays:
         bdi = int(getattr(bd, "bus_index", bd.get("bus_index") if isinstance(bd, Mapping) else 0))
+        bdd = int(getattr(bd, "delay", bd.get("delay") if isinstance(bd, Mapping) else 0))
         if bdi < 0 or bdi >= bus_count:
             raise ValueError(f"bus delay bus_index {bdi} is outside bus_count={bus_count}.")
+        if bdd < 0 or bdd > delay_depth:
+            raise ValueError(
+                f"bus delay bus_index {bdi}: delay {bdd} ticks exceeds the delay-line depth "
+                f"DELAY_DEPTH={delay_depth} (~{delay_depth * 20 / 1000:.0f}us); reduce the delay.")
     slot_count = int(getattr(program, "slot_count", 0))
     tick_slot_coeffs = list(getattr(program, "tick_slot_coeffs", None) or [[0] * slot_count for _ in program.ticks])
     if len(tick_slot_coeffs) != len(program.ticks):
