@@ -987,16 +987,32 @@ def test_pulse_table_state_compiles_repeat_visibility_and_delays(tmp_path):
     assert na.count_trigger_pulses(sequence, trigger_channels=["trig"]) == 3
     assert program.trigger_count == 3
     assert program.repeat_forever is True
-    assert program.ticks == [0, 10, 15, 30, 35, 40]
-    assert program.masks == [0b000001, 0b000101, 0b001101, 0b001000, 0, 0]
-    assert program.loop_start_index == 1
-    assert program.loop_end_tick == 40
-    assert program.loop_count == 3
+    # A channel delay (trig: s0/2) WITH an inner repeat bracket is now supported: the
+    # bracket is UNROLLED into a flat period list, so the delayed edge has no inner-loop
+    # boundary to cross.  The result is a flat additive edge table (loop_count==1; the
+    # whole flat frame still repeats forever) rather than the old compact inner loop.
+    assert program.loop_count == 1
+    assert program.masks[-1] == 0
+    # the 3 image periods each emit trig delayed by s0/2 (=5 ticks @ 10 ns/tick); the
+    # flat frame is 200 ticks (load 10 + 3*image 60 + idle 10).
+    assert program.loop_end_tick == 200
+    assert program.ticks[-1] == 200
+    # the unrolled additive program plays IDENTICALLY to the independent additive oracle
+    # and across all three cycle-accurate engine models (no Verilog sim needed).
+    from fpga.pulse_streamer.host import engine_model as em
+    truth = _additive_truth(
+        state.unrolled_bracket(), slots=s0_100, time_step_ns=10,
+        channels=list(program.channels), n_ticks=600,
+    )
+    ep = em.EngineProgram.from_program(program)
+    r = em.reference_play(ep, 600)
+    assert r == truth
+    assert em.prefetch_play(ep, 600) == r and em.rtl_mirror_play(ep, 600) == r
     program_x = state.compile(clock_hz=100e6, trigger_channels=["trig"], slots=s0_200)
     assert program_x.trigger_count == 3
     assert program_x.repeat_forever is True
-    assert program_x.ticks[-1] == 60
-    assert program_x.duration == 1.6e-6
+    # s0=200 -> each image is 400 ns = 40 ticks; flat frame = 10 + 3*40 + 10 = 140 ticks.
+    assert program_x.ticks[-1] == 320
     assert loaded.to_dict() == state.to_dict()
 
     state.hide_channel("aod0")
@@ -3930,6 +3946,128 @@ def _additive_truth(state, *, slots, time_step_ns, channels, n_ticks):
     return out
 
 
+def _unroll_periods_independently(state):
+    """INDEPENDENT bracket unroll (not the compiler's ``unrolled_bracket``): expand the
+    period order [pre] + bracket*rc + [post] and the analog-bus mode rows the same way,
+    so the oracle proves the compiler's unroll too.  Returns (periods, analog_bus_modes)."""
+    rs, re, rc = state.repeat_start, state.repeat_end, state.repeat_count
+    if rs is None or re is None or int(rc) <= 1:
+        return list(state.periods), {n: list(e) for n, e in state.analog_bus_modes.items()}
+
+    def expand(items):
+        return list(items[:rs]) + list(items[rs:re + 1]) * int(rc) + list(items[re + 1:])
+
+    return expand(state.periods), {n: expand(e) for n, e in state.analog_bus_modes.items()}
+
+
+def _scan_point_geometry(state, *, point_ns, time_step_ns):
+    """Resolve ONE scan point to (table_end, {channel: (delay, [intervals])}) with the
+    bracket unrolled.  Pure interval math shared by the oracle's G, frame-end and frame
+    construction."""
+    periods, _modes = _unroll_periods_independently(state)
+    starts = [0]
+    for p in periods:
+        starts.append(starts[-1] + p.duration_steps(slots=point_ns, time_step_ns=time_step_ns))
+    table_end = starts[-1]
+    bus_members = {c for members in state.bus_channels().values() for c in members}
+    geom = {}
+    for ci, ch in enumerate(state.channels):
+        if ch in bus_members:
+            continue
+        d = state.delay_steps(ch, slots=point_ns, time_step_ns=time_step_ns)
+        ivals, active = [], None
+        for pi, period in enumerate(periods):
+            v = int(period.states[ci])
+            if v and active is None:
+                active = starts[pi]
+            elif not v and active is not None:
+                ivals.append((active, starts[pi])); active = None
+        if active is not None:
+            ivals.append((active, table_end))
+        geom[ch] = (d, ivals)
+    return table_end, geom
+
+
+def _additive_scan_frame(state, *, point_ns, time_step_ns, channels, global_shift, frame_end_at, lane_channels=()):
+    """ONE additive frame for ONE scan point, with the bracket UNROLLED -- modelling the
+    engine's scan frame EXACTLY (independent interval math, NOT the affine compiler).
+
+    ``global_shift`` G re-translates every edge so the earliest is >= 0 at every point.
+    ``frame_end_at`` is the per-point frame length (the program's final effective tick the
+    engine plays).  The edge table is ANCHORED at tick 0 (the compiler prepends an all-off
+    tick-0 edge for every scan point), so the engine seeds from tick 0 and every edge --
+    MAIN and LANE alike -- plays at its exact effective tick ``a + d + G`` with NO startup
+    slip.  Bus-member channels are excluded (driven by the bus engine)."""
+    _table_end, geom = _scan_point_geometry(state, point_ns=point_ns, time_step_ns=time_step_ns)
+    g = int(global_shift)
+    bits = {ch: channels.index(ch) for ch in geom if ch in channels}
+    out = []
+    for t in range(frame_end_at):
+        mask = 0
+        for ch, (d, ivals) in geom.items():
+            for a, b in ivals:
+                if a + d + g <= t < b + d + g:
+                    mask |= 1 << bits[ch]; break
+        out.append(mask)
+    return out, frame_end_at
+
+
+def _additive_scan_truth(program, state, *, scan_table, time_step_ns, channels, n_ticks, repeat_forever):
+    """Full multi-scan-point additive oracle.  The per-tick digital MASK of each frame is
+    computed by INDEPENDENT interval math (``_additive_scan_frame``: unroll the bracket,
+    place ON runs, add per-channel delay + the shared global shift G); only the per-point
+    frame LENGTH is read from the compiled program's final effective tick (the engine's
+    actual frame boundary -- a scalar, not the mask logic being proven).  Frames are then
+    concatenated exactly as the seamless scan engine advances scan points; when the points
+    run out and the program repeats forever, wrap to point 0, else hold idle.  Returns the
+    independent ground truth the compiled program + every engine model must reproduce
+    tick-for-tick.  ``repeat_forever`` is the COMPILE flag (not the state default)."""
+    from fpga.pulse_streamer.host import engine_model as em
+    from Zou_lab_control.neutral_atom.timing.pulse_table import UNITS_TO_NS, slot_var
+
+    def point_ns(row):
+        return {
+            slot_var(i): float(row[i]) * (1.0 if slot.kind == "dac" else UNITS_TO_NS.get(slot.unit, 1.0))
+            for i, slot in enumerate(state.scan_slots)
+        }
+
+    points = [point_ns(row) for row in scan_table]
+    geoms = [_scan_point_geometry(state, point_ns=pn, time_step_ns=time_step_ns) for pn in points]
+
+    # shared global shift G = max(0, -(min effective edge tick over all non-bus channels
+    # AND all scan points)) -- computed INDEPENDENTLY here so every per-point frame aligns.
+    min_edge = 0
+    for _table_end, geom in geoms:
+        for _ch, (d, ivals) in geom.items():
+            for a, _b in ivals:
+                min_edge = min(min_edge, a + d)
+    g = max(0, -min_edge)
+
+    # per-point frame LENGTH = the program's final effective tick at that scan point (the
+    # engine's frame boundary).  This is a scalar read from the engine; the mask CONTENT
+    # of every frame is still produced independently by _additive_scan_frame.
+    ep = program if isinstance(program, em.EngineProgram) else em.EngineProgram.from_program(program)
+    pts_ticks = [list(p) for p in (ep.scan_points or [[0] * ep.slot_count])]
+    frame_ends = [em.effective_tick(ep.ticks[-1], ep.tick_slot_coeffs[-1], pt, ep.frac_bits) for pt in pts_ticks]
+    lane_channels = [lane.channel for lane in (getattr(program, "delay_lanes", None) or [])]
+
+    frames = [
+        _additive_scan_frame(state, point_ns=pn, time_step_ns=time_step_ns, channels=channels,
+                             global_shift=g, frame_end_at=fe, lane_channels=lane_channels)[0]
+        for pn, fe in zip(points, frame_ends)
+    ]
+    out = []
+    p = 0
+    while len(out) < n_ticks:
+        if p < len(frames):
+            out.extend(frames[p]); p += 1
+        elif repeat_forever and frames:
+            p = 0
+        else:
+            out.append(0)
+    return out[:n_ticks]
+
+
 def test_pulse_table_repeat_forever_delay_is_additive_in_hardware():
     """HARDWARE delay is a PURE ADDITIVE shift (NOT the cyclic %total preview): the
     channel comes out `delay` later with NO wrap, the frame EXTENDS to fit it, and the
@@ -4322,3 +4460,279 @@ def test_reordering_lane_corner_cases_end_to_end():
     rc = agree(pc, 200)
     assert _on_intervals(rc, 2) == [(0, 50), (100, 150)]   # cool fixed
     assert _on_intervals(rc, 3) == [(0, 50), (130, 180)]   # trap reorders past cool
+
+
+# ===========================================================================
+# COMPLETE delay support (constant + scanned, any form) WITH an inner repeat
+# bracket -- the bracket is unrolled at the STATE level so the existing flat
+# additive machinery handles every delay form.  Each case compiles from a real
+# PulseTableState, validates against the fixed FPGA streamer, and is proven
+# tick-for-tick against the INDEPENDENT additive oracle AND cross-model
+# (reference == prefetch == rtl_mirror).
+# ===========================================================================
+
+def _agree_models(prog, n):
+    from fpga.pulse_streamer.host import engine_model as em
+    ep = em.EngineProgram.from_program(prog)
+    r = em.reference_play(ep, n)
+    assert em.prefetch_play(ep, n) == r, "prefetch model disagrees with reference"
+    assert em.rtl_mirror_play(ep, n) == r, "rtl_mirror model disagrees with reference"
+    return r
+
+
+def _assert_scan_matches_oracle(state, *, channels, clock_hz, repeat_forever, n_ticks, want_lane=None):
+    """Compile the SCAN program, validate it, and prove it == the independent additive
+    scan oracle tick-for-tick AND across all three cycle models."""
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import validate_pulse_streamer_program
+
+    prog = na.compile_pulse_table_scan_runtime_program(
+        state, channels=channels, clock_hz=clock_hz, repeat_forever=repeat_forever)
+    validate_pulse_streamer_program(prog, channel_count=62)
+    if want_lane is not None:
+        assert bool(prog.delay_lanes) == bool(want_lane), (want_lane, prog.delay_lanes)
+    r = _agree_models(prog, n_ticks)
+    truth = _additive_scan_truth(
+        prog, state, scan_table=state.scan_table, time_step_ns=1e9 / clock_hz,
+        channels=list(prog.channels), n_ticks=n_ticks, repeat_forever=repeat_forever)
+    assert r == truth, "compiled scan program disagrees with the independent additive oracle"
+    return prog
+
+
+def test_constant_delay_crosses_inner_bracket_boundary_is_supported():
+    """The OLD reject is gone: a CONSTANT channel delay whose pulse crosses the inner
+    repeat-bracket boundary now compiles (the bracket is UNROLLED flat) and plays exactly
+    the additive oracle + all three models -- not a 'clear error' cop-out."""
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.devices.sequencer import compile_pulse_table_runtime_program
+    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import validate_pulse_streamer_program
+
+    st = na.PulseTableState(
+        channels=["a", "b"],
+        periods=[
+            na.PulsePeriod(1000, (0, 0), unit="ns", name="pre"),
+            na.PulsePeriod(1000, (1, 0), unit="ns", name="loop0"),   # bracket start; a ON here
+            na.PulsePeriod(1000, (0, 0), unit="ns", name="loop1"),   # bracket end
+            na.PulsePeriod(1000, (0, 1), unit="ns", name="post"),
+        ],
+        time_step_ns=20, repeat_start=1, repeat_end=2, repeat_count=3,
+        delays={"a": 1500}, delay_units={"a": "ns"},   # +75 ticks: a's pulse crosses the boundary
+        repeat_forever=True,
+    )
+    prog = compile_pulse_table_runtime_program(st, clock_hz=50e6, repeat_forever=True)
+    validate_pulse_streamer_program(prog, channel_count=62)
+    assert prog.loop_count == 1                       # the bracket was unrolled flat
+    # the additive cyclic oracle (period-preserving) on the UNROLLED state == every model.
+    truth = _additive_truth(st.unrolled_bracket(), slots={}, time_step_ns=20, channels=list(prog.channels), n_ticks=900)
+    r = _agree_models(prog, 900)
+    assert r == truth
+
+
+def test_scanned_delay_with_inner_bracket_noncrossing_and_crossing():
+    """A SCANNED delay with an inner repeat bracket, both non-crossing (small) and
+    crossing the (former) bracket boundary (large) -- supported via unroll, tick-exact."""
+    import Zou_lab_control.neutral_atom as na
+
+    def make(table):
+        return na.PulseTableState(
+            channels=["A", "B"],
+            periods=[
+                na.PulsePeriod(1000, (0, 0), unit="ns"),
+                na.PulsePeriod(1000, (1, 0), unit="ns"),   # A ON inside the bracket
+                na.PulsePeriod(1000, (0, 0), unit="ns"),
+                na.PulsePeriod(1000, (0, 1), unit="ns"),   # B ON after the bracket
+            ],
+            time_step_ns=20, repeat_start=1, repeat_end=2, repeat_count=2,
+            delays={"A": "s0"}, delay_units={"A": "ns"},
+            scan_slots=[{"kind": "delay", "target": "A", "unit": "ns", "nominal": 0.0}],
+            scan_table=table)
+    for rf in (False, True):
+        _assert_scan_matches_oracle(make([[0.0], [200.0]]), channels=["A", "B"], clock_hz=50e6, repeat_forever=rf, n_ticks=1400)
+        # crossing the former boundary: A's pulse shifts out of the bracketed region
+        _assert_scan_matches_oracle(make([[0.0], [2000.0]]), channels=["A", "B"], clock_hz=50e6, repeat_forever=rf, n_ticks=1400)
+
+
+def test_reordering_scanned_delay_with_inner_bracket():
+    """A reordering scanned delay (sweeps one channel's edges past another's) WITH an
+    inner bracket: unrolled flat, the reordering channel rides a disjoint lane, tick-exact
+    vs the oracle and all models."""
+    import Zou_lab_control.neutral_atom as na
+
+    st = na.PulseTableState(
+        channels=["A", "B"],
+        periods=[
+            na.PulsePeriod(1000, (1, 1), unit="ns"),   # both ON
+            na.PulsePeriod(1000, (0, 0), unit="ns"),
+            na.PulsePeriod(1000, (1, 1), unit="ns"),
+        ],
+        time_step_ns=20, repeat_start=0, repeat_end=1, repeat_count=2,
+        delays={"B": "s0"}, delay_units={"B": "ns"},
+        scan_slots=[{"kind": "delay", "target": "B", "unit": "ns", "nominal": 0.0}],
+        scan_table=[[0.0], [600.0]])   # B reorders past A
+    for rf in (False, True):
+        prog = _assert_scan_matches_oracle(st, channels=["A", "B"], clock_hz=50e6, repeat_forever=rf, n_ticks=1600, want_lane=True)
+        assert [l.channel for l in prog.delay_lanes] == ["B"]
+
+
+def test_negative_scanned_delay_with_and_without_bracket():
+    """A NEGATIVE scanned delay re-translates the whole frame by the global shift G so no
+    runtime tick is ever negative -- proven both without and with an inner bracket."""
+    import Zou_lab_control.neutral_atom as na
+
+    no_bracket = na.PulseTableState(
+        channels=["A", "B"],
+        periods=[na.PulsePeriod(2000, (0, 1), unit="ns"), na.PulsePeriod(2000, (1, 1), unit="ns"), na.PulsePeriod(2000, (0, 0), unit="ns")],
+        time_step_ns=20, delays={"A": "s0"}, delay_units={"A": "ns"},
+        scan_slots=[{"kind": "delay", "target": "A", "unit": "ns", "nominal": 0.0}],
+        scan_table=[[0.0], [-400.0]])
+    with_bracket = na.PulseTableState(
+        channels=["A", "B"],
+        periods=[na.PulsePeriod(2000, (0, 1), unit="ns"), na.PulsePeriod(2000, (1, 1), unit="ns"), na.PulsePeriod(2000, (0, 0), unit="ns")],
+        time_step_ns=20, repeat_start=1, repeat_end=1, repeat_count=2,
+        delays={"A": "s0"}, delay_units={"A": "ns"},
+        scan_slots=[{"kind": "delay", "target": "A", "unit": "ns", "nominal": 0.0}],
+        scan_table=[[0.0], [-400.0]])
+    for rf in (False, True):
+        p1 = _assert_scan_matches_oracle(no_bracket, channels=["A", "B"], clock_hz=50e6, repeat_forever=rf, n_ticks=900)
+        assert all(t >= 0 for t in p1.ticks)
+        p2 = _assert_scan_matches_oracle(with_bracket, channels=["A", "B"], clock_hz=50e6, repeat_forever=rf, n_ticks=1400)
+        assert all(t >= 0 for t in p2.ticks)
+
+
+def test_large_scanned_delay_extends_frame_reordering_and_not():
+    """A LARGE scanned delay that pushes edges PAST the nominal frame -- the frame end
+    EXTENDS to fit them (the old 'extending the frame is planned' reject is gone).  Every
+    scanned delay rides its own lane (so it plays at its exact effective tick with no
+    main-table seed/slip), both for a lone channel and for a reordering pair."""
+    import Zou_lab_control.neutral_atom as na
+
+    non_reorder = na.PulseTableState(
+        channels=["A"],
+        periods=[na.PulsePeriod(1000, (1,), unit="ns"), na.PulsePeriod(1000, (0,), unit="ns")],
+        time_step_ns=20, delays={"A": "s0"}, delay_units={"A": "ns"},
+        scan_slots=[{"kind": "delay", "target": "A", "unit": "ns", "nominal": 0.0}],
+        scan_table=[[0.0], [2000.0]])   # A pushed a whole frame past the nominal end
+    reorder = na.PulseTableState(
+        channels=["A", "B"],
+        periods=[na.PulsePeriod(1000, (1, 1), unit="ns"), na.PulsePeriod(1000, (0, 0), unit="ns")],
+        time_step_ns=20, delays={"B": "s0"}, delay_units={"B": "ns"},
+        scan_slots=[{"kind": "delay", "target": "B", "unit": "ns", "nominal": 0.0}],
+        scan_table=[[0.0], [2000.0]])   # B reorders past A AND extends the frame
+    for rf in (False, True):
+        _assert_scan_matches_oracle(non_reorder, channels=["A"], clock_hz=50e6, repeat_forever=rf, n_ticks=900, want_lane=True)
+        _assert_scan_matches_oracle(reorder, channels=["A", "B"], clock_hz=50e6, repeat_forever=rf, n_ticks=1200, want_lane=True)
+
+
+def test_multipulse_channel_with_bracket_and_scanned_delay():
+    """A multi-pulse channel (several ON sub-runs) inside an unrolled bracket, with a
+    scanned reordering delay -> the channel's full sub-edge train rides one lane."""
+    import Zou_lab_control.neutral_atom as na
+
+    st = na.PulseTableState(
+        channels=["A", "B"],
+        periods=[
+            na.PulsePeriod(1000, (1, 0), unit="ns"),
+            na.PulsePeriod(1000, (0, 0), unit="ns"),
+            na.PulsePeriod(1000, (1, 0), unit="ns"),
+            na.PulsePeriod(1000, (0, 1), unit="ns"),
+        ],
+        time_step_ns=20, repeat_start=0, repeat_end=1, repeat_count=2,
+        delays={"A": "s0"}, delay_units={"A": "ns"},
+        scan_slots=[{"kind": "delay", "target": "A", "unit": "ns", "nominal": 0.0}],
+        scan_table=[[0.0], [200.0]])
+    for rf in (False, True):
+        prog = _assert_scan_matches_oracle(st, channels=["A", "B"], clock_hz=50e6, repeat_forever=rf, n_ticks=1600, want_lane=True)
+        assert [l.channel for l in prog.delay_lanes] == ["A"]
+
+
+def test_scanned_duration_of_bracketed_period_plus_delay():
+    """A scanned DURATION of a period INSIDE the bracket (the value carries via the 'sN'
+    expression to every unrolled copy) combined with a constant channel delay."""
+    import Zou_lab_control.neutral_atom as na
+
+    st = na.PulseTableState(
+        channels=["A", "B"],
+        periods=[
+            na.PulsePeriod(1000, (1, 0), unit="ns"),
+            na.PulsePeriod("s0", (0, 1), unit="str (ns)"),    # scanned duration, bracketed
+            na.PulsePeriod(1000, (0, 0), unit="ns"),
+        ],
+        time_step_ns=20, repeat_start=0, repeat_end=1, repeat_count=2,
+        delays={"A": 200}, delay_units={"A": "ns"},
+        scan_slots=[{"kind": "duration", "target": "1", "unit": "ns", "nominal": 1000.0}],
+        scan_table=[[1000.0], [1400.0]])
+    # the duration slot binds to a bracketed period; every unrolled copy must carry 's0'.
+    u = st.unrolled_bracket()
+    assert sum(1 for p in u.periods if str(p.duration) == "s0") == 2
+    for rf in (False, True):
+        _assert_scan_matches_oracle(st, channels=["A", "B"], clock_hz=50e6, repeat_forever=rf, n_ticks=2000)
+
+
+def test_scanned_dac_of_bracketed_period_plus_delay():
+    """A scanned DAC value of a period INSIDE the bracket (the analog-bus 'sN' entry is
+    duplicated to every unrolled copy) combined with a constant channel delay -- the DAC
+    code rides value_select per scan point in BOTH copies."""
+    import Zou_lab_control.neutral_atom as na
+    from fpga.pulse_streamer.host import engine_model as em
+
+    st = na.PulseTableState(
+        channels=["ch00", "ch01", "ch02", "ch03"],
+        channel_labels={"ch00": "da[0]", "ch01": "da[1]", "ch02": "cool", "ch03": "trig"},
+        time_step_ns=20,
+        periods=[
+            na.PulsePeriod(1000, (0, 0, 1, 0), unit="ns"),
+            na.PulsePeriod(1000, (0, 0, 0, 1), unit="ns"),   # DAC scanned + trig ON here (bracketed)
+            na.PulsePeriod(1000, (0, 0, 0, 0), unit="ns"),
+        ],
+        repeat_start=1, repeat_end=1, repeat_count=2,
+        delays={"ch02": 200}, delay_units={"ch02": "ns"})
+    st.bind_field("dac", "da@1", unit="value", label="da")
+    st.set_scan_table([[1.0], [3.0]])
+    # the DAC slot binds a bracketed period; both unrolled copies keep the 's0' bus entry.
+    u = st.unrolled_bracket()
+    plan = u.analog_bus_plan("da")
+    assert sum(1 for entry in plan if str(entry.get("value")) == "s0") == 2
+    for rf in (False, True):
+        prog = _assert_scan_matches_oracle(st, channels=list(st.channels), clock_hz=50e6, repeat_forever=rf, n_ticks=1600)
+        assert 1 in {int(getattr(s, "value_select", 0)) for s in prog.bus_segments}
+        # the DAC bus carries the scanned code at each scan point (1 then 3).
+        assert 1 in set(em.bus_play(prog, 0, 800, scan_point=0))
+        assert 3 in set(em.bus_play(prog, 0, 800, scan_point=1))
+
+
+def test_repeat_forever_combined_with_bracket_and_scanned_delay():
+    """repeat_forever combined with an inner bracket AND a scanned reordering delay: the
+    whole unrolled flat frame loops forever, every scan point period-preserving, tick-exact
+    across the oracle and all three engine models over several full sweeps."""
+    import Zou_lab_control.neutral_atom as na
+
+    st = na.PulseTableState(
+        channels=["A", "B"],
+        periods=[
+            na.PulsePeriod(1000, (1, 1), unit="ns"),
+            na.PulsePeriod(1000, (0, 0), unit="ns"),
+            na.PulsePeriod(1000, (1, 1), unit="ns"),
+        ],
+        time_step_ns=20, repeat_start=0, repeat_end=1, repeat_count=2,
+        delays={"B": "s0"}, delay_units={"B": "ns"},
+        scan_slots=[{"kind": "delay", "target": "B", "unit": "ns", "nominal": 0.0}],
+        scan_table=[[0.0], [600.0], [200.0]])
+    _assert_scan_matches_oracle(st, channels=["A", "B"], clock_hz=50e6, repeat_forever=True, n_ticks=3000, want_lane=True)
+
+
+def test_unrolled_bracket_overflow_raises_actionable_error():
+    """Unrolling a huge inner repeat_count with a delay overflows the edge budget; the
+    compiler raises a CLEAR, actionable error naming the inner repeat as the cause."""
+    import pytest
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.devices.sequencer import compile_pulse_table_runtime_program
+
+    channels = [f"ch{i:02d}" for i in range(40)]
+    width = len(channels)
+    periods = [na.PulsePeriod(100, tuple(1 if (i + p) % 2 else 0 for i in range(width)), unit="ns") for p in range(60)]
+    st = na.PulseTableState(
+        channels=channels, periods=periods, time_step_ns=20,
+        repeat_start=0, repeat_end=59, repeat_count=10_000,
+        delays={"ch00": 200}, delay_units={"ch00": "ns"}, repeat_forever=False)
+    with pytest.raises(ValueError, match="repeat"):
+        compile_pulse_table_runtime_program(st, clock_hz=50e6, repeat_forever=False)

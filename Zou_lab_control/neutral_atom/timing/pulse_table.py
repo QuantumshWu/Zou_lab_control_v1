@@ -809,6 +809,77 @@ class PulseTableState:
             + list(self.periods[self.repeat_end + 1 :])
         )
 
+    def _expand_bracket_index(self, period_index: int) -> int:
+        """Map an ORIGINAL period index to its FIRST index after the bracket is
+        unrolled flat (see :meth:`unrolled_bracket`).
+
+        Periods before the bracket keep their index; a bracketed period maps to its
+        first unrolled copy (so a scanned-duration/scanned-DAC slot whose ``target``
+        names it still points at a period that carries the ``sN`` expression -- and
+        because every copy carries that same expression, every copy scans together);
+        a period after the bracket shifts by ``(repeat_count-1) * bracket_length``.
+        """
+
+        rs, re, rc = int(self.repeat_start), int(self.repeat_end), int(self.repeat_count)
+        if period_index <= re:
+            return period_index                      # before or first copy of the bracket
+        loop_len = re - rs + 1
+        return period_index + (rc - 1) * loop_len     # after the bracket
+
+    def unrolled_bracket(self) -> "PulseTableState":
+        """Return a NEW state with the inner finite repeat bracket fully UNROLLED into a
+        flat period list (``repeat_count`` becomes 1, the bracket is cleared).
+
+        This is the unifying trick that makes a (constant OR scanned) channel delay work
+        with an inner bracket: once the bracket is flat there is no inner-loop boundary
+        for an additively-shifted edge to cross, so the existing flat machinery (additive
+        delay + reordering delay lanes + affine scan + repeat_forever) handles delays in
+        ANY form.  The whole flat frame can still repeat via ``repeat_forever``.
+
+        Each bracketed ``PulsePeriod`` is duplicated to its new indices -- carrying its
+        duration expression (incl. ``sN``), states, unit and name automatically -- and so
+        is each analog-bus plan entry (mode + value, incl. a scanned ``sN`` DAC level), so
+        a scanned duration/DAC of a bracketed period scans every copy in lockstep.
+        Per-channel delays, scan slots and the scan table copy unchanged; only the slot
+        ``target`` period indices are remapped to stay valid.  No bracket -> ``self``.
+        """
+
+        if self.repeat_start is None or self.repeat_end is None or int(self.repeat_count) <= 1:
+            return self
+        rs, re = int(self.repeat_start), int(self.repeat_end)
+
+        def expand(items: Sequence) -> list:
+            return list(items[:rs]) + list(items[rs : re + 1]) * int(self.repeat_count) + list(items[re + 1 :])
+
+        scan_slots: list[dict[str, object]] = []
+        for slot in self.scan_slots:
+            payload = slot.to_dict()
+            if slot.kind == "duration" and str(slot.target).lstrip("-").isdigit():
+                payload["target"] = str(self._expand_bracket_index(int(slot.target)))
+            elif slot.kind == "dac":
+                bus, period_index = slot.target.split("@", 1)
+                payload["target"] = f"{bus}@{self._expand_bracket_index(int(period_index))}"
+            scan_slots.append(payload)
+
+        return type(self)(
+            channels=list(self.channels),
+            periods=[PulsePeriod(p.duration, p.states, unit=p.unit, name=p.name) for p in expand(self.periods)],
+            delays=dict(self.delays),
+            delay_units=dict(self.delay_units),
+            name=self.name,
+            scan_slots=scan_slots,
+            scan_table=[list(row) for row in self.scan_table],
+            time_step_ns=self.time_step_ns,
+            repeat_start=None,
+            repeat_end=None,
+            repeat_count=1,
+            repeat_forever=self.repeat_forever,
+            visible_channels=list(self.visible_channels),
+            channel_labels=dict(self.channel_labels),
+            analog_buses={name: list(members) for name, members in self.analog_buses.items()},
+            analog_bus_modes={name: [dict(entry) for entry in expand(entries)] for name, entries in self.analog_bus_modes.items()},
+        )
+
     def delay_steps(self, channel: str, *, slots: Mapping[str, float] | None = None, time_step_ns: float | None = None) -> int:
         raw = self.delays.get(channel, 0.0)
         unit = self.delay_units.get(channel, "ns")

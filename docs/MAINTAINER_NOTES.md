@@ -511,10 +511,20 @@ Capacity and limits:
 - Lane PLAY tables are LUTRAM (+0 BRAM); one MAC site per lane. Capacity on the 35T stays
   within 90% on every axis (lane PLAY tables add no RAMB36; the lane IMAGE staging BRAM
   `blk_mem_gen_laneimg` is one of the 6 BRAMs).
-- A scanned delay that pushes an edge past the frame end, or negative, is rejected at
-  COMPILE with a clear actionable message — extending/translating the frame per scan point
-  is future work. Multiple sub-edges per delayed channel ARE supported (up to
-  `MAX_LANE_EDGES`).
+- A scanned delay in ANY form is supported: reordering past other channels (it rides its
+  own lane), NEGATIVE (a single compile-time global shift `G = max(0, -min effective edge
+  tick over all channels and scan points)` re-translates the whole frame so no runtime tick
+  is < 0), and LARGE / frame-extending (the affine final-row tick — a single expr that
+  dominates every edge at every scan point — grows to fit the delayed edges; the lane and
+  the main table share one `G` and one frame end). Multiple sub-edges per delayed channel
+  ARE supported (up to `MAX_LANE_EDGES`). A delay (constant OR scanned) combined with an
+  inner repeat bracket is handled by UNROLLING the bracket into a flat period list at the
+  STATE level (`PulseTableState.unrolled_bracket`) before compiling, so a delayed edge has
+  no inner-loop boundary to cross; the flat frame still repeats via `repeat_forever`. The
+  only residual COMPILE reject is a genuine cross-channel edge collision/reorder that the
+  single global table cannot hold AND that does not reduce to a lane, or an unrolled edge
+  count over `max_edges` (actionable: use `repeat_forever` for the outer loop, or fewer
+  inner iterations).
 
 Proof. `_rtl_lane_realization_play` (in `tests/test_neutral_atom_lightweight.py`)
 re-derives the exact RTL register transfers of the lane player and equals
