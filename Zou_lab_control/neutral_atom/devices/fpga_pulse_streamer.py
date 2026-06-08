@@ -359,6 +359,20 @@ def validate_pulse_streamer_program(
             raise ValueError(f"bus {bus_index} has {bus_segment_counts[bus_index]} segments, above max_bus_segments={max_bus_segments}.")
     if bus_segments and (int(getattr(program, "loop_count", 1)) > 1 and int(getattr(program, "loop_start_index", 0)) != 0):
         raise ValueError("bus_segments do not currently support finite inner repeat brackets.")
+    # Per-bus DAC DELAY (the UNBOUNDED membership BUS-delay player -- the DAC-value counterpart
+    # of the per-channel delay).  At most bus_count buses may be delayed, each by ANY amount:
+    # there is NO frame-period / delay-length cap -- the engine evaluates the bus value at the
+    # shifted phase ``(time_count - off) mod T`` (off = d mod T full phase, skip = floor(d/T)
+    # 32b) instead of riding the segment ticks, so a DAC value can be delayed by more than one
+    # frame, positive/negative (via the host's folded global shift)/zero.
+    bus_delays = list(getattr(program, "bus_delays", None) or [])
+    if len(bus_delays) > bus_count:
+        raise ValueError(
+            f"program delays {len(bus_delays)} buses, but the FPGA bus-delay player has {bus_count} slots.")
+    for bd in bus_delays:
+        bdi = int(getattr(bd, "bus_index", bd.get("bus_index") if isinstance(bd, Mapping) else 0))
+        if bdi < 0 or bdi >= bus_count:
+            raise ValueError(f"bus delay bus_index {bdi} is outside bus_count={bus_count}.")
     slot_count = int(getattr(program, "slot_count", 0))
     tick_slot_coeffs = list(getattr(program, "tick_slot_coeffs", None) or [[0] * slot_count for _ in program.ticks])
     if len(tick_slot_coeffs) != len(program.ticks):

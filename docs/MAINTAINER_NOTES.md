@@ -493,11 +493,26 @@ MAC `zlc_effective_tick`). There is NO HW divider.
 
 DAC buses. A DAC value reaching the output via the TTL-folded path (fixed bus values,
 `fold_analog_buses`) inherits the membership player directly -- each bus bit is a delayed
-TTL channel, so its delay is unbounded with identical capability. A scanned DAC value (the
-value-engine / `value_select` path) carries the sub-period delay via the bus segment's
-affine start/stop ticks (the existing, proven mechanism); the membership DAC model
-`engine_model.membership_bus_delay_play` proves the value-stream-delayed-by-d spec for any
-`T`/`d`/zero/negative.
+TTL channel, so its delay is unbounded with identical capability. A DAC value reaching the
+output via the value-engine / `value_select` path (a scanned DAC value, OR a fixed bus value
+emitted as bus segments) is now ALSO delayed by an UNBOUNDED membership BUS-delay player --
+the DAC-value counterpart of the TTL player. The bus SEGMENTS stay at their NOMINAL phase
+(the delay is no longer baked into the segment ticks, which capped it at one frame and
+rejected `d > T`); the per-bus delay is carried as a separate `RuntimeBusDelay`
+(`bus_index`, `delay`), packed into the `BUS_DELAY_*` CTRL words as `off = d mod T` /
+`skip = floor(d/T)`, and the engine produces the delayed value by EVALUATING the bus value
+at the shifted phase `(time_count - off) mod T` (RTL `zlc_bus_value_at`: walk the segments,
+hold the active one, resolve literal/`value_select` value, closed-form ramp staircase),
+gated by the SAME `skip`/`off` startup as the TTL player -- NO buffer, so a scanned DAC value
+is delayable by ANY amount, incl. `> one frame`, positive/negative-via-G/zero. The per-bus
+delay shares the SAME global shift `G` as the TTL channels. Proven by
+`engine_model.bus_value_at` (== `bus_play` undelayed) + `engine_model.rtl_bus_delay_play`
+(== `membership_bus_delay_play` delayed) in
+`test_bus_value_at_combinational_equals_bus_play_undelayed`,
+`test_rtl_bus_delay_player_no_cap_extreme_battery`,
+`test_scanned_dac_value_delayed_beyond_one_frame_compiles_and_streams`,
+`test_image_bus_delay_ctrl_packing_roundtrip`, and the RTL structure lock
+`test_edge_streamer_has_unbounded_bus_delay_path`.
 
 Capacity. The per-channel interval tables are LUTRAM (+0 RAMB36); the only RAMB36 cost is
 the small DELAY image staging BRAM (`blk_mem_gen_delayimg`, 8*8*6 = 384 words = 1 RAMB36,
@@ -505,6 +520,9 @@ the 6th BRAM). `NUM_DELAYS=8` delayed channels, `MAX_DELAY_INTERVALS=8` ON inter
 (`DEFAULT_NUM_DELAYS` / `DEFAULT_MAX_DELAY_INTERVALS` in `fpga_pulse_streamer.py`, matching
 the RTL params). `validate_pulse_streamer_program` enforces only `count <= num_delays` and
 `intervals <= max_delay_intervals` -- there is **NO** frame-period / delay-length cap.
+The per-bus DAC delay is likewise enforced only as `count <= bus_count` and a valid
+`bus_index` -- **NO** frame-period / delay-length cap on a DAC value either (`off`/`skip`
+in `BUS_DELAY_*` CTRL words, the bus value evaluated at the shifted phase, no buffer).
 
 Tick-0 seed anchor (unchanged). The engine seeds its time counter from edge 0, so the
 UNDELAYED edge table must begin at tick 0 at every scan point; every compiler path prepends

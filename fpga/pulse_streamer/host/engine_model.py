@@ -36,6 +36,7 @@ __all__ = [
     "PrefetchStall", "ScanUnderflow",
     "delay_line_reference", "phase_offset_play",
     "membership_delay_play", "membership_bus_delay_play",
+    "bus_value_at", "rtl_bus_delay_play",
 ]
 
 
@@ -789,4 +790,122 @@ def bus_play(program, bus_index: int, n_ticks: int, scan_point: int = 0, *,
                         st["value"] -= 1
         elif st["idx"] < len(segs) and t >= eff(segs[st["idx"]].start_tick, segs[st["idx"]].start_tick_coeffs):
             apply(segs[st["idx"]]); st["idx"] += 1
+    return out
+
+
+# ----------------------------------------------------------------------------
+# UNBOUNDED DAC-BUS DELAY: the bus value stream evaluated at the shifted phase
+# ----------------------------------------------------------------------------
+# A DELAYED DAC bus is the SAME idea as the TTL membership player, but the
+# "membership" yields a multi-bit VALUE, not a bit.  The bus segments are stored
+# at their NOMINAL (undelayed) phases; the engine produces the delayed value by
+# EVALUATING the bus value at the shifted phase ``shifted = (time_count - off) mod
+# T`` (find the segment active at ``shifted``, resolve its value -- literal or
+# value_select slot read -- and for a ramp interpolate at ``shifted``), gated by
+# the startup (skip whole periods + off ticks = t >= d; hold the safe value before
+# t = d).  off is the full TICK_WIDTH phase; skip is a >= 32-bit counter; NO buffer,
+# NO depth cap, T unbounded.  Zero delay (off == 0, skip == 0) is exact passthrough.
+#
+# :func:`bus_value_at` is the COMBINATIONAL shifted-phase evaluator (the RTL
+# ``zlc_bus_value_at`` function); it is byte-identical to :func:`bus_play` when
+# evaluated at the running ``time_count`` (proven in the test-suite), i.e. it is the
+# undelayed bus stream re-derived combinationally so it can be sampled at any phase.
+# :func:`rtl_bus_delay_play` wraps it with the startup gate + modulo phase; it is
+# byte-identical to :func:`membership_bus_delay_play` fed the periodic (steady-frame)
+# undelayed stream -- the physically correct ground truth for a repeating engine.
+
+
+def bus_value_at(program, bus_index: int, phase: int, scan_point: int = 0, *,
+                 bus_width: int = 10, frac_bits: int | None = None) -> int:
+    """Combinational evaluation of bus ``bus_index``'s value at frame phase ``phase``
+    for one scan point -- the RTL ``zlc_bus_value_at`` function.
+
+    Walks the bus's segments in effective-tick order, holds the segment applied most
+    recently at or before ``phase`` (the RTL registers the apply, so a segment whose
+    effective start is ``ts`` first shows at ``ts+1``; a segment at ``ts == 0`` is
+    pre-applied and shows at phase 0), resolves its value (literal or value_select
+    slot read for either endpoint) and, for a RAMP active over ``[ts, te)``, returns
+    the closed-form accumulator staircase value at ``phase`` (exactly the value the
+    interpolating :func:`bus_play` FSM holds at that tick).  Sampling this at the
+    running ``time_count`` reproduces :func:`bus_play` tick-for-tick (no FSM needed)."""
+
+    frac = int(getattr(program, "scan_coeff_frac_bits", 8)) if frac_bits is None else frac_bits
+    pts = list(getattr(program, "scan_points", None) or [])
+    point = list(pts[scan_point]) if pts else []
+    mask = (1 << bus_width) - 1
+    segs = [s for s in (getattr(program, "bus_segments", None) or []) if int(s.bus_index) == bus_index]
+
+    def eff(base, coeffs):
+        c = [int(x) for x in (coeffs or [])]
+        return effective_tick(int(base), c, point, frac) if (c and point) else int(base)
+
+    def endval(sel, lit):
+        return (int(point[sel - 1]) & mask) if sel else (int(lit) & mask)
+
+    chosen = None
+    for s in sorted(segs, key=lambda s: eff(s.start_tick, s.start_tick_coeffs)):
+        ts = eff(s.start_tick, s.start_tick_coeffs)
+        if ts < phase or ts == 0:        # registered apply (ts shows at ts+1); seg@0 pre-applied
+            chosen = s
+        else:
+            break
+    if chosen is None:
+        return 0
+    ts = eff(chosen.start_tick, chosen.start_tick_coeffs)
+    te = eff(chosen.stop_tick, chosen.stop_tick_coeffs)
+    vstart = endval(int(getattr(chosen, "value_select", 0)), chosen.start_value)
+    stop_sel = int(getattr(chosen, "stop_value_select", getattr(chosen, "value_select", 0)))
+    vstop = endval(stop_sel, chosen.stop_value)
+    if str(chosen.mode).lower() == "ramp" and te > ts:
+        if phase <= ts:
+            return vstart
+        if phase > te:
+            return vstop
+        denom = te - ts
+        delta = abs(vstop - vstart)
+        k = (phase - 1) - ts             # accumulator-increment ticks elapsed (registered)
+        if delta == 0 or denom == 0:
+            moves = 0
+        elif delta <= denom:             # <= 1 crossing/tick -> #moves == #crossings
+            moves = (k * delta) // denom
+        else:                            # delta > denom -> every tick crosses (value +1/tick)
+            moves = k
+        if moves > delta:
+            moves = delta
+        return (vstart + moves) if vstop >= vstart else (vstart - moves)
+    return vstop
+
+
+def rtl_bus_delay_play(program, bus_index: int, delay: int, period: int, n_ticks: int,
+                       scan_point: int = 0, *, bus_width: int = 10, safe_value: int = 0) -> list[int]:
+    """Register-exact mirror of the RTL UNBOUNDED DAC-bus delay player (NO buffer).
+
+    The bus segments are stored at NOMINAL phase; the delayed value is the bus value
+    EVALUATED at ``shifted = (time_count - off) mod T`` (via :func:`bus_value_at`),
+    gated by the SAME startup machinery as the TTL membership player:
+        off = d mod T, skip = floor(d/T)  (host-supplied per scan point)
+        started = (frame_idx > skip) || (frame_idx == skip && time_count >= off)
+    Hold ``safe_value`` until ``t == d``; thereafter track the value at the shifted
+    phase.  ``d`` of ANY length (incl. >> T), ``T`` unbounded, zero (exact
+    passthrough), or negative-folded-via-G all behave like the TTL player.  Equal to
+    :func:`membership_bus_delay_play` fed the steady (periodic) undelayed stream."""
+    T = int(period)
+    d = int(delay)
+    if T <= 0:
+        return [bus_value_at(program, bus_index, t - d, scan_point, bus_width=bus_width) if t - d >= 0 else int(safe_value)
+                for t in range(n_ticks)]
+    off = d % T
+    skip = d // T
+    out = []
+    for t in range(n_ticks):
+        frame_idx = t // T
+        time_count = t % T
+        started = (frame_idx > skip) or (frame_idx == skip and time_count >= off)
+        if started:
+            shifted = time_count - off
+            if shifted < 0:
+                shifted += T
+            out.append(bus_value_at(program, bus_index, shifted, scan_point, bus_width=bus_width))
+        else:
+            out.append(int(safe_value))
     return out

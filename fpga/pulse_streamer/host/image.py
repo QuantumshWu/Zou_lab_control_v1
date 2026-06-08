@@ -82,6 +82,17 @@ class CtrlWords:
     DELAY_OFF = 23      # per-channel off = d mod T, one 32-bit word each -> num_delays words (23..30)
     DELAY_IV_COUNTS = 31  # packed per-channel ON-interval count (iv_cnt_width each) -> 1 word
     DELAY_SKIP = 32     # per-channel skip = floor(d/T), one 32-bit word each -> num_delays words (32..39)
+    # Per-bus DAC DELAY (the UNBOUNDED membership BUS-delay player -- the DAC-value
+    # counterpart of the per-channel delay above).  The bus SEGMENTS are uploaded at their
+    # NOMINAL phase; the engine evaluates the bus value at the shifted phase ``(time_count -
+    # off) mod T``, off = d mod T (full 32b phase, NOT a ring index), skip = floor(d/T) (32b
+    # counter) -- NO buffer, so a DAC value can be delayed by ANY amount, incl. > one frame.
+    # Layout for the DEFAULT bus_count=4 (locked to zlc_pulse_streamer_top.v by
+    # test_final_top_regions_match_image).
+    BUS_DELAY_COUNT = 40  # number of delayed buses (<= bus_count)
+    BUS_DELAY_BUS = 41    # packed per-delay bus index (bus_index_width each) -> 1 word
+    BUS_DELAY_OFF = 42    # per-delayed-bus off = d mod T, one 32b word each -> bus_count words (42..45)
+    BUS_DELAY_SKIP = 46   # per-delayed-bus skip = floor(d/T), one 32b word each -> bus_count words (46..49)
 
 
 CTRL_WORDS = 64
@@ -111,6 +122,10 @@ class StreamerParams:
     @property
     def channel_bit_width(self) -> int:
         return _addr_width(max(2, self.channel_count))   # bits to index an output channel
+
+    @property
+    def bus_index_width(self) -> int:
+        return _addr_width(max(2, self.bus_count))       # bits to index a DAC bus
 
     @property
     def delay_iv_cnt_width(self) -> int:
@@ -406,7 +421,46 @@ def pack_program(program, params: StreamerParams | None = None) -> dict[int, int
         for i in range(2):   # delay_bits = num_delays*channel_bit_width bits -> 2 words
             w[CtrlWords.DELAY_BITS + i] = (delay_bits >> (32 * i)) & 0xFFFFFFFF
         w[CtrlWords.DELAY_IV_COUNTS] = iv_counts & 0xFFFFFFFF
+
+    # Per-bus DAC DELAY (the UNBOUNDED membership BUS-delay player).  The bus segments are
+    # already packed at NOMINAL phase above; here we decompose each delayed bus's delay d into
+    # off = d mod T (the full 32b phase) and skip = floor(d/T) (whole periods), exactly like
+    # the per-channel delay -- NO buffer, so a DAC value can be delayed by ANY amount.
+    bus_delays = _program_bus_delays(program)
+    if bus_delays:
+        T = int(getattr(program, "loop_end_tick", 0) or 0)
+        if len(bus_delays) > p.bus_count:
+            raise ValueError(f"{len(bus_delays)} delayed buses > bus_count {p.bus_count}.")
+        biw = p.bus_index_width
+        bus_delay_bus = 0
+        for k, bd in enumerate(bus_delays):
+            b = int(bd["bus_index"])
+            d = int(bd["delay"])
+            if b < 0 or b >= p.bus_count:
+                raise ValueError(f"bus delay bus_index {b} is outside bus_count {p.bus_count}.")
+            off = (d % T) if T > 0 else d                 # full phase (no cap); T unbounded
+            skip = (d // T) if T > 0 else 0               # whole periods (32b counter)
+            bus_delay_bus |= (b & ((1 << biw) - 1)) << (k * biw)
+            w[CtrlWords.BUS_DELAY_OFF + k] = _to_unsigned(off, 32)
+            w[CtrlWords.BUS_DELAY_SKIP + k] = _to_unsigned(skip, 32)
+        w[CtrlWords.BUS_DELAY_COUNT] = len(bus_delays)
+        w[CtrlWords.BUS_DELAY_BUS] = bus_delay_bus & 0xFFFFFFFF
     return w
+
+
+def _program_bus_delays(program) -> list[dict]:
+    """Normalise the program's per-bus delay info to a list of dicts ``{bus_index, delay}``
+    (only nonzero delays)."""
+    bds = getattr(program, "bus_delays", None) or []
+    out = []
+    for bd in bds:
+        if isinstance(bd, Mapping):
+            bus_index, delay = int(bd.get("bus_index", 0)), int(bd.get("delay", 0))
+        else:
+            bus_index, delay = int(getattr(bd, "bus_index", 0)), int(getattr(bd, "delay", 0))
+        if delay:
+            out.append({"bus_index": bus_index, "delay": delay})
+    return out
 
 
 def _program_delay_channels(program) -> list[dict]:
@@ -500,6 +554,18 @@ def unpack_program(words: Mapping[int, int], params: StreamerParams | None = Non
             })
         delay_channels.append({"bit": bit, "off": off, "skip": skip,
                                "iv_count": iv_count, "intervals": intervals})
+    # Per-bus DAC delay (the membership BUS-delay player): reconstruct each delayed bus's
+    # bus_index, off and skip (d = skip*T + off) from the CTRL words.
+    bus_delay_count = g(CtrlWords.BUS_DELAY_COUNT)
+    biw = p.bus_index_width
+    bus_delay_bus_w = g(CtrlWords.BUS_DELAY_BUS)
+    bus_delays = []
+    for k in range(bus_delay_count):
+        bus_delays.append({
+            "bus_index": (bus_delay_bus_w >> (k * biw)) & ((1 << biw) - 1),
+            "off": g(CtrlWords.BUS_DELAY_OFF + k),
+            "skip": g(CtrlWords.BUS_DELAY_SKIP + k),
+        })
     return {
         "ticks": ticks, "masks": masks, "tick_slot_coeffs": coeffs,
         "delay_channels": delay_channels,
@@ -513,6 +579,7 @@ def unpack_program(words: Mapping[int, int], params: StreamerParams | None = Non
         "loop_end_tick": g(CtrlWords.LOOP_END_TICK),
         "loop_end_slot_coeffs": _unpack_coeffs(_unfield([g(CtrlWords.LOOP_END_LO), g(CtrlWords.LOOP_END_HI)], p.coeff_bits), p),
         "bus_segments": bus_segments, "bank_size": g(CtrlWords.BANK_SIZE),
+        "bus_delays": bus_delays,
     }
 
 
@@ -636,6 +703,15 @@ def solve_capacity(part, *, channel_count: int = 62, num_slots: int = 4, coeff_w
     # Each eval is num_slots products of coeff(<=18b) x slot(slot_mul_width); a slot
     # operand <=25b fits ONE DSP48E1 (25x18), else two.  Keep this in sync with
     # zlc_edge_streamer.v so capacity is checked for DSP, not just BRAM.
+    #
+    # NOTE on the membership DELAY players (both the per-channel TTL player and the per-bus
+    # DAC bus-value player): their combinational affine evals -- zlc_effective_tick over the
+    # stored ON intervals / bus segments at the shifted phase -- are NOT counted here, the
+    # same as they have never been counted for the TTL player.  Their coeffs are ZERO unless a
+    # DURATION is scanned (a delay is constant, never scanned), so Vivado folds them to plain
+    # tick comparisons (LUT logic, not DSPs); only a scanned-duration program materialises any
+    # MAC there.  Counting one delay player's evals but not the other would be inconsistent, so
+    # both are excluded.  The bus-delay evaluator is the DAC counterpart of the TTL player.
     if engine_dsp is None:
         mac_instances = 2 * bus_count + 5
         dsp_per_mult = 1 if slot_mul_width <= 25 else 2

@@ -144,6 +144,13 @@ module zlc_pulse_streamer_top #(
     localparam integer C_DELAY_OFF   = C_DELAY_BITS + DELAY_BITS_WORDS;   // 23: off = d mod T, one 32b word/chan (NUM_DELAYS words: 23..30)
     localparam integer C_DELAY_IV_COUNTS = C_DELAY_OFF + NUM_DELAYS;      // 31: packed ON-interval count (1 word)
     localparam integer C_DELAY_SKIP  = C_DELAY_IV_COUNTS + 1;            // 32: skip = floor(d/T), one 32b word/chan (NUM_DELAYS words: 32..39)
+    // --- per-bus DAC DELAY (held CTRL scalars for the UNBOUNDED membership BUS-delay player;
+    // the DAC-value counterpart of the per-channel delay above).  bus_delay_bus = packed bus
+    // index (BUS_INDEX_WIDTH each) -> 1 word; off/skip = one 32b word per delayed-bus slot.
+    localparam integer C_BUS_DELAY_COUNT = 40;  // number of delayed buses (<= BUS_COUNT)
+    localparam integer C_BUS_DELAY_BUS   = 41;  // packed per-delay bus index (1 word)
+    localparam integer C_BUS_DELAY_OFF   = 42;  // off = d mod T, one 32b word/bus (BUS_COUNT words: 42..45)
+    localparam integer C_BUS_DELAY_SKIP  = C_BUS_DELAY_OFF + BUS_COUNT;  // 46: skip = floor(d/T), one 32b word/bus (46..49)
 
     // engine outputs
     wire [CHANNEL_COUNT-1:0] out;
@@ -159,6 +166,9 @@ module zlc_pulse_streamer_top #(
     wire [NUM_DELAYS*TICK_WIDTH-1:0] delay_off_w;
     wire [NUM_DELAYS*SKIP_WIDTH-1:0] delay_skip_w;
     wire [NUM_DELAYS*DELAY_IV_CNT_W-1:0] delay_iv_counts_w;
+    // --- per-bus DAC delay: assemble the packed engine busses (one 32b word/bus each).
+    wire [BUS_COUNT*TICK_WIDTH-1:0] bus_delay_off_w;
+    wire [BUS_COUNT*SKIP_WIDTH-1:0] bus_delay_skip_w;
 
     // --- JTAG-to-AXI master -> FULL AXI4 -> AXI BRAM controller ---------------
     // Full AXI4 (not Lite) so the host issues INCR burst writes (up to 256 words per
@@ -220,6 +230,12 @@ module zlc_pulse_streamer_top #(
         end
         for (dw = 0; dw < NUM_DELAYS; dw = dw + 1) begin : zlc_delay_skip_pack
             assign delay_skip_w[dw*SKIP_WIDTH +: SKIP_WIDTH] = ctrl_reg[C_DELAY_SKIP + dw];
+        end
+        for (dw = 0; dw < BUS_COUNT; dw = dw + 1) begin : zlc_bus_delay_off_pack
+            assign bus_delay_off_w[dw*TICK_WIDTH +: TICK_WIDTH] = ctrl_reg[C_BUS_DELAY_OFF + dw];
+        end
+        for (dw = 0; dw < BUS_COUNT; dw = dw + 1) begin : zlc_bus_delay_skip_pack
+            assign bus_delay_skip_w[dw*SKIP_WIDTH +: SKIP_WIDTH] = ctrl_reg[C_BUS_DELAY_SKIP + dw];
         end
     endgenerate
     assign delay_iv_counts_w = ctrl_reg[C_DELAY_IV_COUNTS][NUM_DELAYS*DELAY_IV_CNT_W-1:0];
@@ -535,6 +551,12 @@ module zlc_pulse_streamer_top #(
         .bus_prog_mode(bus_prog_mode), .bus_prog_value_select(bus_prog_value_select),
         .bus_prog_stop_value_select(bus_prog_stop_value_select),
         .bus_counts(ctrl_reg[C_BUS_COUNTS][BUS_COUNT*(BUS_SEG_ADDR_WIDTH+1)-1:0]),
+        // per-bus DAC delay -- UNBOUNDED membership BUS-delay player (held CTRL scalars; the
+        // segments stay nominal, the engine evaluates the bus value at the shifted phase).
+        .bus_delay_count(ctrl_reg[C_BUS_DELAY_COUNT][$clog2(BUS_COUNT+1)-1:0]),
+        .bus_delay_bus(ctrl_reg[C_BUS_DELAY_BUS][BUS_COUNT*BUS_INDEX_WIDTH-1:0]),
+        .bus_delay_off(bus_delay_off_w),
+        .bus_delay_skip(bus_delay_skip_w),
         // per-channel OUTPUT delay -- UNBOUNDED membership player (held CTRL scalars + the
         // ON-interval LUTRAM filled via delay_prog_*).
         .delay_count(ctrl_reg[C_DELAY_COUNT][$clog2(NUM_DELAYS+1)-1:0]),

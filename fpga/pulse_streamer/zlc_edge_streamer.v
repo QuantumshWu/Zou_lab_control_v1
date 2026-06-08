@@ -114,6 +114,26 @@ module zlc_edge_streamer #(
     input  wire [BUS_SEL_WIDTH-1:0] bus_prog_stop_value_select,
     input  wire [BUS_COUNT*(BUS_SEG_ADDR_WIDTH+1)-1:0] bus_counts,
 
+    // PHYSICAL per-bus DAC DELAY -- UNBOUNDED membership BUS-delay player (NO buffer; the
+    // DAC-value counterpart of the per-channel TTL delay below).  A bus delay is NOT baked
+    // into the segment ticks (that capped it at one frame) -- the segments stay at their
+    // NOMINAL phase and the engine produces the DELAYED bus value by EVALUATING the bus value
+    // at the shifted phase ``shifted = (time_count - off) mod T`` (find the segment active at
+    // ``shifted`` -- literal or value_select slot read -- and for a ramp interpolate at
+    // ``shifted``), gated by the SAME skip/off startup machinery as the TTL player.  off = d
+    // mod T is the full TICK_WIDTH phase; skip = floor(d/T) whole periods; NO buffer -> T and
+    // the delay are UNBOUNDED (any length, incl. > one frame, positive/negative-via-G/zero).
+    // Zero delay (off==0, skip==0) is exact passthrough.  Proven == engine_model.
+    // rtl_bus_delay_play == membership_bus_delay_play (the bus VALUE stream delayed by d).
+    //   * bus_delay_count : number of delayed buses (<= BUS_COUNT)
+    //   * bus_delay_bus   : packed bus index per delayed-bus slot (BUS_INDEX_WIDTH each)
+    //   * bus_delay_off   : off = d mod T per delayed-bus slot (full TICK_WIDTH phase)
+    //   * bus_delay_skip  : skip = floor(d/T) per delayed-bus slot (whole periods)
+    input  wire [$clog2(BUS_COUNT+1)-1:0] bus_delay_count,
+    input  wire [BUS_COUNT*BUS_INDEX_WIDTH-1:0] bus_delay_bus,
+    input  wire [BUS_COUNT*TICK_WIDTH-1:0] bus_delay_off,
+    input  wire [BUS_COUNT*SKIP_WIDTH-1:0] bus_delay_skip,
+
     // PHYSICAL per-channel OUTPUT DELAY -- UNBOUNDED membership player (NO buffer of any kind).
     // A channel delay is NOT baked into the edges -- it is applied to the engine OUTPUT:
     // out_delayed[t] = out_undelayed[t - d], 0 before fire.  d = skip*T + off, where
@@ -237,6 +257,20 @@ module zlc_edge_streamer #(
     reg [TICK_WIDTH-1:0] bus_ramp_denom [0:BUS_COUNT-1];
     reg [TICK_WIDTH+BUS_WIDTH:0] bus_ramp_accum [0:BUS_COUNT-1];
 
+    // ----- per-bus DAC DELAY runtime (UNBOUNDED membership BUS-delay player) ---
+    // One slot per bus (i = 0..BUS_COUNT-1).  There is NO buffer.  When bus_del_active[i] is
+    // set, bus_out[i] is the bus VALUE evaluated at the shifted phase ``(time_count - off) mod
+    // T`` (the stateful zlc_bus_tick still maintains bus_value_active[i] -- the UNDELAYED
+    // stream -- for the not-delayed buses, and a zero-delay bus is exact passthrough through
+    // it).  bus_del_off/skip seed at FIRE; bus_del_frame_idx increments at every gapless frame
+    // seam (the startup gate is the same combinational (frame_idx, time_count) vs (skip, off)
+    // compare as the TTL player).
+    reg [BUS_COUNT-1:0] bus_del_active = {BUS_COUNT{1'b0}};
+    reg [TICK_WIDTH-1:0] bus_del_off [0:BUS_COUNT-1];
+    reg [SKIP_WIDTH-1:0] bus_del_skip [0:BUS_COUNT-1];
+    reg [SKIP_WIDTH-1:0] bus_del_frame_idx [0:BUS_COUNT-1];
+    integer bus_del_i;
+
     // ----- per-channel OUTPUT DELAY runtime (UNBOUNDED membership player) ------
     // One delay player per delayed channel (k = 0..NUM_DELAYS-1).  There is NO buffer of any
     // kind.  Each player stores its channel's OWN undelayed ON intervals [a_i, b_i) over [0, T)
@@ -299,6 +333,20 @@ module zlc_edge_streamer #(
         begin zlc_delay_bit_at = delay_bits[k*CHANNEL_BIT_WIDTH +: CHANNEL_BIT_WIDTH]; end
     endfunction
 
+    // ---- per-delayed-bus input slices (the membership BUS-delay player CTRL scalars) ----
+    function [BUS_INDEX_WIDTH-1:0] zlc_bus_delay_bus_at;
+        input integer k;
+        begin zlc_bus_delay_bus_at = bus_delay_bus[k*BUS_INDEX_WIDTH +: BUS_INDEX_WIDTH]; end
+    endfunction
+    function [TICK_WIDTH-1:0] zlc_bus_delay_off_at;
+        input integer k;
+        begin zlc_bus_delay_off_at = bus_delay_off[k*TICK_WIDTH +: TICK_WIDTH]; end
+    endfunction
+    function [SKIP_WIDTH-1:0] zlc_bus_delay_skip_at;
+        input integer k;
+        begin zlc_bus_delay_skip_at = bus_delay_skip[k*SKIP_WIDTH +: SKIP_WIDTH]; end
+    endfunction
+
     // Per-channel OUTPUT-delay merge (combinational, NO buffer).  delayed_mask[b] marks the
     // bits an active delay player owns (cleared from the undelayed state_mask); delayed_out[b]
     // is that player's delayed value, found by evaluating its stored ON intervals at the shifted
@@ -352,10 +400,45 @@ module zlc_edge_streamer #(
         end
     end
     assign out = (state_mask & ~delayed_mask) | delayed_out;
+
+    // ----- per-bus OUTPUT merge: UNBOUNDED membership BUS-delay (combinational, NO buffer) -----
+    // For a NOT-delayed bus, bus_out = bus_value_active (the stateful zlc_bus_tick stream --
+    // exact, and a zero-delay bus rides it unchanged).  For a DELAYED bus, bus_out is the bus
+    // VALUE EVALUATED at the shifted phase ``shifted = (time_count - off) mod T`` (no FSM
+    // jump, no buffer), gated by the SAME combinational startup compare as the TTL player:
+    //   bus_del_started = (frame_idx > skip) || (frame_idx == skip && time_count >= off)  (== t >= d)
+    //   shifted = time_count - off ; if (shifted[TICK_WIDTH-1]) shifted += loop_end_active (T)
+    //   value   = zlc_bus_value_at(b, shifted, slot_active) ; held at safe 0 before t == d
+    // loop_end_active holds the active per-point frame T (the SAME T the host used for off = d
+    // mod T), so the modulo is one conditional +T -> T and the delay are UNBOUNDED.
+    reg [BUS_WIDTH-1:0] bus_out_merged [0:BUS_COUNT-1];
+    reg bus_del_started_eff;
+    reg signed [TICK_WIDTH:0] bus_del_shifted;
+    reg [TICK_WIDTH-1:0] bus_del_phase;
+    integer bus_om;
+    always @(*) begin
+        for (bus_om = 0; bus_om < BUS_COUNT; bus_om = bus_om + 1) begin
+            if (bus_del_active[bus_om]) begin
+                bus_del_started_eff = (bus_del_frame_idx[bus_om] > bus_del_skip[bus_om])
+                                      || ((bus_del_frame_idx[bus_om] == bus_del_skip[bus_om])
+                                          && (time_count >= bus_del_off[bus_om]));
+                bus_del_shifted = $signed({1'b0, time_count}) - $signed({1'b0, bus_del_off[bus_om]});
+                if (bus_del_shifted < 0)
+                    bus_del_phase = bus_del_shifted[TICK_WIDTH-1:0] + loop_end_active;
+                else
+                    bus_del_phase = bus_del_shifted[TICK_WIDTH-1:0];
+                bus_out_merged[bus_om] = bus_del_started_eff
+                                         ? zlc_bus_value_at(bus_om, bus_del_phase, slot_active)
+                                         : {BUS_WIDTH{1'b0}};
+            end else begin
+                bus_out_merged[bus_om] = bus_value_active[bus_om];
+            end
+        end
+    end
     genvar gi;
     generate
         for (gi = 0; gi < BUS_COUNT; gi = gi + 1) begin : zlc_bus_out_assign
-            assign bus_out[gi*BUS_WIDTH +: BUS_WIDTH] = bus_value_active[gi];
+            assign bus_out[gi*BUS_WIDTH +: BUS_WIDTH] = bus_out_merged[gi];
         end
     endgenerate
 
@@ -389,6 +472,94 @@ module zlc_edge_streamer #(
     function [BUS_SEG_ADDR_WIDTH:0] zlc_bus_count_at;
         input integer bus_index;
         begin zlc_bus_count_at = bus_counts[bus_index*(BUS_SEG_ADDR_WIDTH+1) +: (BUS_SEG_ADDR_WIDTH+1)]; end
+    endfunction
+
+    // ---- COMBINATIONAL shifted-phase BUS VALUE evaluator (the UNBOUNDED bus-delay player) ----
+    // Evaluate bus ``b``'s value at frame phase ``phase`` for slot vector ``slot_vec`` -- the
+    // bus-value counterpart of the TTL membership-interval test.  There is NO buffer and NO
+    // FSM state: it walks the bus's LUTRAM segments (async read), holds the segment applied
+    // most recently at/before ``phase`` (the engine REGISTERS the apply, so a segment whose
+    // effective start is ``ts`` first shows at ``ts+1`` -- qualify on ``ts < phase``; a
+    // segment at ``ts == 0`` is pre-applied and shows at phase 0), resolves its value
+    // (literal or value_select slot read for either endpoint) and, for a ramp active over
+    // ``[ts, te)``, returns the closed-form accumulator staircase value at ``phase`` (exactly
+    // the value the interpolating zlc_bus_tick FSM holds at that tick -- the value moves at
+    // most 1 per tick, so #moves = (|delta| <= span) ? (k*|delta|)/span : k, capped at
+    // |delta|, k = (phase-1) - ts).  Sampling this at the running time_count reproduces
+    // zlc_bus_tick tick-for-tick; sampling it at the SHIFTED phase realises the bus delay.
+    // Proven == engine_model.bus_value_at == bus_play (undelayed) and, under the startup gate,
+    // == rtl_bus_delay_play == membership_bus_delay_play (delayed).
+    function [BUS_WIDTH-1:0] zlc_bus_value_at;
+        input integer b;
+        input [TICK_WIDTH-1:0] phase;
+        input [SLOT_BITS-1:0] slot_vec;
+        integer s;
+        reg [BUS_INDEX_WIDTH+BUS_SEG_ADDR_WIDTH-1:0] addr;
+        reg [BUS_SEG_ADDR_WIDTH:0] count;
+        reg found;
+        reg [BUS_INDEX_WIDTH+BUS_SEG_ADDR_WIDTH-1:0] held_addr;
+        reg [TICK_WIDTH-1:0] ts, te, held_ts, held_te;
+        reg [BUS_SEL_WIDTH-1:0] start_sel, stop_sel;
+        reg [BUS_WIDTH-1:0] vstart, vstop;
+        reg [TICK_WIDTH-1:0] span, k;
+        reg [BUS_WIDTH:0] delta;
+        reg [TICK_WIDTH+BUS_WIDTH:0] prod;     // k*delta (wide enough; capped to delta after)
+        reg [TICK_WIDTH-1:0] moves;
+        begin
+            count = zlc_bus_count_at(b);
+            found = 1'b0;
+            held_addr = {(BUS_INDEX_WIDTH+BUS_SEG_ADDR_WIDTH){1'b0}};
+            held_ts = {TICK_WIDTH{1'b0}};
+            // walk all segments in addr (== ascending start-tick) order; keep the last that
+            // qualifies as the held/active segment at this phase.
+            for (s = 0; s < MAX_BUS_SEGMENTS; s = s + 1) begin
+                if (s < count) begin
+                    addr = (b * MAX_BUS_SEGMENTS) + s[BUS_SEG_ADDR_WIDTH-1:0];
+                    ts = zlc_effective_tick(bus_start_tick_mem[addr], bus_start_tick_coeff_mem[addr], slot_vec);
+                    if ((ts < phase) || (ts == {TICK_WIDTH{1'b0}})) begin
+                        found = 1'b1; held_addr = addr; held_ts = ts;
+                    end
+                end
+            end
+            if (!found) begin
+                zlc_bus_value_at = {BUS_WIDTH{1'b0}};
+            end else begin
+                held_te = zlc_effective_tick(bus_stop_tick_mem[held_addr], bus_stop_tick_coeff_mem[held_addr], slot_vec);
+                start_sel = bus_value_select_mem[held_addr];
+                stop_sel  = bus_stop_value_select_mem[held_addr];
+                vstart = (start_sel != {BUS_SEL_WIDTH{1'b0}})
+                         ? slot_vec[(start_sel - 1'b1)*TICK_WIDTH +: BUS_WIDTH] : bus_start_value_mem[held_addr];
+                vstop  = (stop_sel  != {BUS_SEL_WIDTH{1'b0}})
+                         ? slot_vec[(stop_sel  - 1'b1)*TICK_WIDTH +: BUS_WIDTH] : bus_stop_value_mem[held_addr];
+                if (bus_mode_mem[held_addr] == BUS_MODE_RAMP && held_te > held_ts) begin
+                    if (phase <= held_ts) begin
+                        zlc_bus_value_at = vstart;
+                    end else if (phase > held_te) begin
+                        zlc_bus_value_at = vstop;
+                    end else begin
+                        span = held_te - held_ts;
+                        delta = (vstop >= vstart) ? (vstop - vstart) : (vstart - vstop);
+                        k = (phase - 1'b1) - held_ts;            // accumulator-increment ticks
+                        if (delta == {(BUS_WIDTH+1){1'b0}} || span == {TICK_WIDTH{1'b0}}) begin
+                            moves = {TICK_WIDTH{1'b0}};
+                        end else if ({{(TICK_WIDTH-BUS_WIDTH-1){1'b0}}, delta} <= span) begin
+                            // <= 1 crossing/tick -> #moves == #crossings = floor(k*|delta|/span)
+                            prod = k * delta;
+                            moves = (prod / span);
+                        end else begin
+                            // |delta| > span -> every tick crosses -> 1 move/tick
+                            moves = k;
+                        end
+                        if (moves > {{(TICK_WIDTH-BUS_WIDTH-1){1'b0}}, delta})
+                            moves = {{(TICK_WIDTH-BUS_WIDTH-1){1'b0}}, delta};
+                        zlc_bus_value_at = (vstop >= vstart) ? (vstart + moves[BUS_WIDTH-1:0])
+                                                             : (vstart - moves[BUS_WIDTH-1:0]);
+                    end
+                end else begin
+                    zlc_bus_value_at = vstop;
+                end
+            end
+        end
     endfunction
 
     // scan-window address for point idx (2 banks, BANK_SIZE pow2)
@@ -428,7 +599,12 @@ module zlc_edge_streamer #(
                 bus_ramp_start_tick[i] <= {TICK_WIDTH{1'b0}}; bus_ramp_stop_tick[i] <= {TICK_WIDTH{1'b0}};
                 bus_ramp_target[i] <= {BUS_WIDTH{1'b0}}; bus_ramp_delta[i] <= {(BUS_WIDTH+1){1'b0}};
                 bus_ramp_denom[i] <= {TICK_WIDTH{1'b0}}; bus_ramp_accum[i] <= {(TICK_WIDTH+BUS_WIDTH+1){1'b0}};
+                // per-bus DAC delay scalars (the membership BUS-delay player; NO buffer)
+                bus_del_off[i] <= {TICK_WIDTH{1'b0}};
+                bus_del_skip[i] <= {SKIP_WIDTH{1'b0}};
+                bus_del_frame_idx[i] <= {SKIP_WIDTH{1'b0}};
             end
+            bus_del_active <= {BUS_COUNT{1'b0}};
         end
     endtask
 
@@ -713,6 +889,26 @@ module zlc_edge_streamer #(
                 del_skip[del_i]      <= zlc_delay_skip_at(del_i);
                 del_frame_idx[del_i] <= {SKIP_WIDTH{1'b0}};
             end
+            // AT FIRE: seed the per-bus DAC-delay player (the membership BUS-delay player).
+            // The bus SEGMENTS stay at NOMINAL phase; the engine evaluates the bus value at the
+            // shifted phase, so there is NO buffer to seed -- only the per-bus off/skip scalars
+            // and a zeroed frame index.  Zero ALL buses first, then set the delayed ones; each
+            // delayed-bus CTRL slot k targets bus index zlc_bus_delay_bus_at(k) (the host gives
+            // each bus at most one slot, so the two loops never write the same index twice).
+            // Buses not named by any slot stay un-delayed (bus_value_active passthrough).
+            bus_del_active <= {BUS_COUNT{1'b0}};
+            for (bus_del_i = 0; bus_del_i < BUS_COUNT; bus_del_i = bus_del_i + 1) begin
+                bus_del_off[bus_del_i] <= {TICK_WIDTH{1'b0}};
+                bus_del_skip[bus_del_i] <= {SKIP_WIDTH{1'b0}};
+                bus_del_frame_idx[bus_del_i] <= {SKIP_WIDTH{1'b0}};
+            end
+            for (bus_del_i = 0; bus_del_i < BUS_COUNT; bus_del_i = bus_del_i + 1) begin
+                if (bus_del_i < bus_delay_count) begin
+                    bus_del_active[zlc_bus_delay_bus_at(bus_del_i)] <= 1'b1;
+                    bus_del_off[zlc_bus_delay_bus_at(bus_del_i)]  <= zlc_bus_delay_off_at(bus_del_i);
+                    bus_del_skip[zlc_bus_delay_bus_at(bus_del_i)] <= zlc_bus_delay_skip_at(bus_del_i);
+                end
+            end
             // heavy affine work (final/loop_end recompute, bus (re)start, edge-0 seed)
             // is dispatched ONCE after the chain via these flags (see SLOT_MUL_WIDTH /
             // bnd_* notes): same cycle, same slots -> identical behavior, far fewer MACs.
@@ -856,6 +1052,13 @@ module zlc_edge_streamer #(
             for (del_i = 0; del_i < NUM_DELAYS; del_i = del_i + 1) begin
                 if (del_active[del_i])
                     del_frame_idx[del_i] <= del_frame_idx[del_i] + 1'b1;
+            end
+            // The per-bus DAC-delay player uses the SAME frame seams: advance bus_del_frame_idx
+            // at every gapless boundary so its combinational startup gate (frame_idx,time_count)
+            // vs (skip,off) opens at exactly t == d.  NO buffer to maintain across the seam.
+            for (bus_del_i = 0; bus_del_i < BUS_COUNT; bus_del_i = bus_del_i + 1) begin
+                if (bus_del_active[bus_del_i])
+                    bus_del_frame_idx[bus_del_i] <= bus_del_frame_idx[bus_del_i] + 1'b1;
             end
         end
     end
