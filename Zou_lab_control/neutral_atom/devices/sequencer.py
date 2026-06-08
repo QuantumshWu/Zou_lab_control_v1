@@ -259,6 +259,12 @@ def compile_runtime_program(
     repeat_period = sequence.repeat_period or base_sequence.duration
     loop_end_tick = _time_to_ticks(repeat_period, clock_hz, "repeat_period") if repeat_period > 0 else (int(ticks[-1]) if ticks else 0)
     ticks, masks = _ensure_final_off_edge(ticks, masks, loop_end_tick)
+    # Anchor an all-off edge at tick 0: the engine seeds its time counter from edge 0, so a
+    # sequence whose first pulse starts after t=0 would otherwise slip every edge one tick
+    # on hardware (same invariant the pulse-table compilers enforce).
+    if not ticks or int(ticks[0]) != 0:
+        ticks = [0] + list(ticks)
+        masks = [0] + list(masks)
     payload = {
         "sequence": sequence.to_dict(),
         "clock_hz": clock_hz,

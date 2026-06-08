@@ -296,6 +296,15 @@ def validate_pulse_streamer_program(
             raise ValueError(f"program mask {mask} does not fit {channel_count} channels.")
     if program.masks and int(program.masks[-1]) != 0:
         raise ValueError("program final mask must be 0 so the streamer returns to a safe idle state.")
+    # The streamer SEEDS its time counter from edge 0, so the table MUST begin at tick 0
+    # (a table starting after tick 0 slips every edge one tick on hardware -- the prefetch
+    # startup invariant).  Backstop both compiler paths here so a forgotten anchor can
+    # never reach the FPGA silently.
+    if program.ticks and int(program.ticks[0]) != 0:
+        raise ValueError(
+            "program edge 0 must be at tick 0 (the streamer seeds its time counter from "
+            "edge 0; a table starting after tick 0 slips every edge one tick)."
+        )
     bus_segments = list(getattr(program, "bus_segments", None) or [])
     program_slot_count = int(getattr(program, "slot_count", 0))
     bus_segment_counts = [0 for _ in range(bus_count)]
@@ -336,6 +345,10 @@ def validate_pulse_streamer_program(
     tick_slot_coeffs = list(getattr(program, "tick_slot_coeffs", None) or [[0] * slot_count for _ in program.ticks])
     if len(tick_slot_coeffs) != len(program.ticks):
         raise ValueError("scan tick coefficient rows must match the edge table length.")
+    # Edge 0 must be at tick 0 at EVERY scan point, not just the reference -- so its slot
+    # coefficients must all be 0 (otherwise the seed edge moves with the scan and slips).
+    if tick_slot_coeffs and any(int(c) != 0 for c in tick_slot_coeffs[0]):
+        raise ValueError("program edge 0 must be at tick 0 at every scan point (edge-0 slot coefficients must be 0).")
     if slot_count > num_slots:
         raise ValueError(f"program uses {slot_count} scan slots, but the FPGA streamer has {num_slots}.")
     loop_end_slot_coeffs = list(getattr(program, "loop_end_slot_coeffs", None) or [0] * slot_count)
