@@ -444,8 +444,25 @@ class VivadoAxiStreamerSession:
         # not start the engine against a stale, half-armed bank mask.
         self._queue_word(CtrlWords.BANK_READY, 0b11)
         self._flush()
+        # DIAGNOSTIC (re-fire "no output"): report engine STATUS just before + after FIRE so a
+        # failed re-arm is localized.  STATUS bits: 0=LOADED 1=RUNNING 2=DONE 4=UNDERFLOW.
+        # Expect: before=LOADED(0x1) -> after=RUNNING(0x2).  Stuck at 0x1/0x0 => FIRE did not
+        # start the engine (top FIRE-gate / start pulse); RUNNING but no pulses => output path.
+        try:
+            st_before = self._read_word(CtrlWords.STATUS)
+        except Exception:
+            st_before = -1
         self._command(CMD_FIRE)
         (self.state_dir / "fire_time.txt").write_text(str(time.monotonic()), encoding="utf-8")
+        try:
+            st_a = self._read_word(CtrlWords.STATUS)
+            time.sleep(0.05)
+            st_b = self._read_word(CtrlWords.STATUS)
+            print(f"ZLC FIRE diag: STATUS before=0x{st_before & 0xffffffff:X} "
+                  f"after=0x{st_a & 0xffffffff:X} +50ms=0x{st_b & 0xffffffff:X} "
+                  f"(bit0=LOADED 1=RUNNING 2=DONE 4=UNDERFLOW)", flush=True)
+        except Exception as exc:
+            print(f"ZLC FIRE diag: STATUS read failed: {exc}", flush=True)
         # a repeat_forever STREAMED scan (> 2 banks) must be fed continuously while it
         # re-sweeps; a background thread keeps the ping-pong banks loaded.
         self._start_stream_thread()
