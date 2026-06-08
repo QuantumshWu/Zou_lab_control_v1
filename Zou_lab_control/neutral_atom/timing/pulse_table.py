@@ -300,6 +300,15 @@ class PulseTableState:
             return existing
         if nominal is None:
             nominal = self._read_field_nominal(kind, str(target), unit)
+        # Time slots (duration/delay) are ALWAYS stored in ns: binding rewrites the field to
+        # its "str (ns)" (ns) display, so a slot left in us/ms would scan in that unit while
+        # the card shows "str (ns)" -- a silent 1000x mismatch.  Convert the nominal from the
+        # field's entry unit to ns and pin the slot unit to ns so the Scan tab, the period/
+        # delay card, and the compiled program all agree.  (DAC slots keep their raw "value"
+        # unit -- a DAC code is not a time.)
+        if kind in ("duration", "delay") and unit not in ("ns", "value"):
+            nominal = float(nominal) * UNITS_TO_NS.get(unit, 1.0)
+            unit = "ns"
         index = len(self.scan_slots)
         slot = ScanSlot(kind=kind, target=str(target), label=label, unit=unit, nominal=float(nominal))
         self.scan_slots.append(slot)

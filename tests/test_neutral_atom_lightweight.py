@@ -2655,6 +2655,29 @@ def test_bound_pulse_frame_sequence_uses_requested_frames_not_gui_repeat_count()
     assert program.duration == 28 / 100_000_000
 
 
+def test_bind_field_time_slot_always_normalized_to_ns():
+    """Binding a duration/delay rewrites the field to its 'str (ns)' display, so the scan
+    slot MUST be stored in ns -- a period entered in us/ms would otherwise scan in that
+    unit while the card shows 'str (ns)' (a silent 1000x mismatch).  bind_field converts
+    the nominal to ns and pins the slot unit to ns; the compiled scan point matches."""
+    state = na.PulseTableState(
+        channels=["a", "b"],
+        periods=[na.PulsePeriod(1000, (1, 1), unit="ns"), na.PulsePeriod(20, (0, 0), unit="us")],
+        time_step_ns=20)
+    state.bind_field("duration", "1", unit="us")          # period 1 was 20 us
+    slot = state.scan_slots[0]
+    assert slot.unit == "ns" and slot.nominal == 20000.0   # 20 us -> 20000 ns
+    # a us delay normalizes too
+    state.delays = {"a": 5}; state.delay_units = {"a": "us"}
+    idx = state.bind_field("delay", "a", unit="us")
+    assert state.scan_slots[idx].unit == "ns" and state.scan_slots[idx].nominal == 5000.0
+    # and the compiled scan value is interpreted in ns: 30000 in the table -> 1500 ticks
+    state.set_scan_table([[20000.0, 5000.0], [30000.0, 5000.0]])
+    prog = na.compile_pulse_table_scan_runtime_program(state, channels=["a", "b"], clock_hz=50e6)
+    # period-1 duration slot value 30000 ns = 1500 ticks (period 0 = 1000 ns = 50 ticks)
+    assert prog.scan_points[1][0] == 1500
+
+
 def test_pulse_table_snaps_times_to_minimal_grid():
     # The pulse-table (GUI) path must AUTO-SNAP off-grid durations to the nearest
     # tick instead of rejecting them -- the hardware clock can only land on ticks.
