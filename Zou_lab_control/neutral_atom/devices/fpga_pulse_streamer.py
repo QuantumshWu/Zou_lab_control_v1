@@ -408,7 +408,8 @@ def validate_pulse_streamer_program(
         if loop_end_tick > tick_limit:
             raise ValueError(f"program loop_end_tick {loop_end_tick} does not fit {tick_width} bits.")
         if scan_points:
-            for point_index, point in enumerate(scan_points):
+            for point_index in check_indices:   # sampled subset (bounds a huge streamed scan)
+                point = scan_points[point_index]
                 loop_start_tick = _apply_scan_tick(program.ticks[loop_start_index], tick_slot_coeffs[loop_start_index], point, frac_bits)
                 effective_loop_end = _apply_scan_tick(loop_end_tick, loop_end_slot_coeffs, point, frac_bits)
                 effective_final = _apply_scan_tick(program.ticks[-1], tick_slot_coeffs[-1], point, frac_bits)
@@ -488,8 +489,13 @@ def validate_pulse_streamer_program(
                     raise ValueError(f"delay lane {lane_index} scan coefficient {coeff} does not fit signed {coeff_width} bits.")
             # per-point: lane effective ticks within the frame [0, effective final] and
             # strictly increasing (the lane plays its own frame-tick llt -- a reversed or
-            # out-of-frame edge would desync from the model).
-            for point_index, point in enumerate(lane_points):
+            # out-of-frame edge would desync from the model).  Sampled like the main
+            # effective-tick sweep so a huge streamed scan does not stall the validator
+            # (per-slot extreme points, which are the most likely to leave the frame, are
+            # always in check_indices).
+            lane_point_indices = check_indices if scan_points else range(len(lane_points))
+            for point_index in lane_point_indices:
+                point = lane_points[point_index]
                 frame_end = _apply_scan_tick(program.ticks[-1], tick_slot_coeffs[-1], point, frac_bits) if program.ticks else 0
                 last = -1
                 for base, coeffs in zip(lane_ticks, lane_coeffs):

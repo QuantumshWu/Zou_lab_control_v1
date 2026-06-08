@@ -874,9 +874,12 @@ class PulseTableState:
                 intervals[channel].append((active_start, t_steps))
         # Apply each channel's delay as a CYCLIC rotation within the frame
         # (delay %% total_duration): a pulse pushed past the frame end wraps to the
-        # start.  This is the periodic ("inf") view the preview always shows; it is
-        # also exactly what the hardware does for a repeat_forever sequence.  See
-        # _cyclic_shift_interval (matches Confocal-GUIv2's delay()).
+        # start.  This is the periodic ("inf") view used FOR THE PREVIEW ONLY -- it is a
+        # convenient steady-state picture (matches Confocal-GUIv2's delay()).  The
+        # HARDWARE delay is ADDITIVE / period-preserving (zero output before fire, no
+        # wrap-in tail) -- see _pulse_table_edge_table in sequencer.py -- so this cyclic
+        # view is NOT what the streamer plays; do not use to_sequence as the hardware
+        # truth.  See _cyclic_shift_interval.
         total_steps = t_steps
         for channel in self.channels:
             d_steps = self.delay_steps(channel, slots=slots, time_step_ns=step_ns)
