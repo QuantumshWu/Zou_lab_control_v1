@@ -242,7 +242,11 @@ module zlc_edge_streamer #(
     // d_bus are held CTRL (a delay is constant, never scanned), latched into del_ch_ticks /
     // del_bus_ticks at FIRE.  At FIRE the rings are zeroed, so a read before the buffer fills
     // returns the FIRE-time 0 -> silent until t == d (real startup, for free).
-    (* ram_style = "distributed" *) reg [CHANNEL_COUNT-1:0] ttl_ring [0:DELAY_SLOTS-1];
+    // 62 SEPARATE 1-bit rings (a 2D array -- NOT one CHANNEL_COUNT-wide memory): each channel's
+    // ring is its own distributed RAM with ONE write + ONE read port, so 62 independent per-channel
+    // read addresses infer cleanly (one shared 62-bit-wide memory read at 62 addresses needs 62
+    // read ports and CANNOT be inferred).  Same 2D pattern as bus_ring below.
+    (* ram_style = "distributed" *) reg ttl_ring [0:CHANNEL_COUNT-1][0:DELAY_SLOTS-1];
     (* ram_style = "distributed" *) reg [BUS_WIDTH-1:0] bus_ring [0:BUS_COUNT-1][0:DELAY_SLOTS-1];
     reg [DELAY_ADDR_WIDTH-1:0] del_wptr = {DELAY_ADDR_WIDTH{1'b0}};
     reg [DELAY_TICK_WIDTH-1:0] del_ch_ticks  [0:CHANNEL_COUNT-1];  // per-channel d (0 = passthrough)
@@ -295,7 +299,6 @@ module zlc_edge_streamer #(
     // bypasses non-delayed bits via state_mask), so the host never delays a channel by 0.
     reg [CHANNEL_COUNT-1:0] delayed_mask;   // bit b set iff channel b is delayed (d_ch != 0)
     reg [CHANNEL_COUNT-1:0] delayed_out;    // delayed value per owned bit (read d_ch writes ago)
-    reg [CHANNEL_COUNT-1:0] ttl_rd_word;
     integer del_m;
     always @(*) begin
         delayed_mask = {CHANNEL_COUNT{1'b0}};
@@ -303,8 +306,9 @@ module zlc_edge_streamer #(
         for (del_m = 0; del_m < CHANNEL_COUNT; del_m = del_m + 1) begin
             if (del_ch_ticks[del_m] != {DELAY_TICK_WIDTH{1'b0}}) begin
                 delayed_mask[del_m] = 1'b1;
-                ttl_rd_word = ttl_ring[zlc_delay_rd(del_ch_ticks[del_m])];  // value pushed d_ch ago
-                delayed_out[del_m] = (del_fill >= del_ch_ticks[del_m]) ? ttl_rd_word[del_m] : 1'b0;
+                // channel del_m's OWN 1-bit ring, read d_ch writes ago (its own distributed RAM)
+                delayed_out[del_m] = (del_fill >= del_ch_ticks[del_m])
+                                     ? ttl_ring[del_m][zlc_delay_rd(del_ch_ticks[del_m])] : 1'b0;
             end
         end
     end
@@ -796,7 +800,8 @@ module zlc_edge_streamer #(
         // from d ticks ago (the post-play delay_line_reference shift).  del_fill gates the read to
         // 0 until d pushes have happened -> silent until t == d (no bulk RAM clear).
         if (bnd_delay_advance) begin
-            ttl_ring[del_wptr] <= state_mask;
+            for (del_i = 0; del_i < CHANNEL_COUNT; del_i = del_i + 1)
+                ttl_ring[del_i][del_wptr] <= state_mask[del_i];   // each channel -> its own ring
             for (del_i = 0; del_i < BUS_COUNT; del_i = del_i + 1)
                 bus_ring[del_i][del_wptr] <= bus_value_active[del_i];
             del_wptr <= (del_wptr == DELAY_SLOTS-1) ? {DELAY_ADDR_WIDTH{1'b0}} : (del_wptr + 1'b1);
