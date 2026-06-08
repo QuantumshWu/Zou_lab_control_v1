@@ -520,19 +520,35 @@ def compile_pulse_table_scan_runtime_program(
         )
         bus_members = [channel for members in state.bus_channels().values() for channel in members]
 
-    # GLOBAL SHIFT G + FRAME END, computed ONCE over ALL non-bus channels (the union of
-    # main-table and would-be lane channels) so the main table and the lanes agree on the
-    # frame re-translation (negative scanned delay) and on the frame length (a large
-    # scanned delay extends it).  ``frame_end`` is a single affine expr that dominates
-    # every channel's latest delayed edge at every scan point, or None (the affine
-    # candidates cross -> fall back to the main rows' own per-reference max).
+    # GLOBAL SHIFT G is computed over ALL non-bus channels (main + would-be lanes) so a
+    # NEGATIVE scanned delay re-translates the whole frame uniformly.  G is ONE compile-time
+    # constant (the affine min over points is reached at an extreme point), so it never varies
+    # from one scan point to the next -- a uniform offset, not a per-point frame change.
     global_shift = _pulse_table_affine_global_shift(
         state, scan_points=points_ticks, slot_vars=slot_vars, time_step_ns=clock_step_ns,
         coeff_frac_bits=coeff_frac_bits, exclude_channels=bus_members,
     )
+    # FRAME END is PERIOD-PRESERVING.  A channel DELAY (spec 4.2) shifts ONLY that channel and
+    # must NOT change the frame length -- otherwise scanning the delay would stretch every
+    # other channel's period as it sweeps (exactly the "the whole pulse changes" bug).  So the
+    # frame end is the period STRUCTURE end (affine in the scanned DURATIONS, which legitimately
+    # resize the frame) plus G -- it is NEVER extended by a scanned DELAY.  Scanned-delay
+    # channels always ride a lane, so they are EXCLUDED from the frame-end candidates here; the
+    # loop_end is then independent of the swept delay and the PERIOD is identical at every scan
+    # point (only the delayed channel's lane moves).  A scanned delay big enough to push an edge
+    # past this fixed frame is rejected by the lane in-frame check below -- a clear, actionable
+    # error -- rather than silently lengthening the period for all channels.
+    def _is_scanned_delay(ch: str) -> bool:
+        _base, coeffs = _affine_expr(
+            state.delays.get(ch, 0.0), state.delay_units.get(ch, "ns"),
+            slot_vars, clock_step_ns, coeff_frac_bits)
+        return any(int(c) for c in coeffs)
+
+    scanned_delay_channels = [ch for ch in state.channels if ch not in bus_members and _is_scanned_delay(ch)]
     frame_end = _pulse_table_affine_frame_end(
         state, scan_points=points_ticks, slot_vars=slot_vars, time_step_ns=clock_step_ns,
-        coeff_frac_bits=coeff_frac_bits, exclude_channels=bus_members, global_shift=global_shift,
+        coeff_frac_bits=coeff_frac_bits,
+        exclude_channels=list(bus_members) + scanned_delay_channels, global_shift=global_shift,
     )
 
     # Every channel with a SCANNED delay rides its own DISJOINT-bit delay lane (a 1-bit
@@ -1507,21 +1523,28 @@ def _pulse_table_affine_frame_end(
     exclude_channels: Sequence[str],
     global_shift: int,
 ) -> tuple[int, tuple[int, ...]] | None:
-    """The single AFFINE frame-end expr (with G applied) that DOMINATES every channel's
-    latest delayed edge at EVERY scan point, or ``None`` if no single affine expr does.
+    """The single AFFINE, PERIOD-PRESERVING frame-end expr (with G applied) that DOMINATES
+    every retained channel's latest edge at EVERY scan point, or ``None`` if no single
+    affine expr does.
 
-    The engine's frame length for a scan point is the last main-table row's effective
-    tick; the lanes reset their frame tick at the same boundary.  So the frame end must,
-    at every scan point, be >= every (main + lane) edge -- a single affine expr -- for the
-    frame to extend over a large/frame-extending scanned delay without cutting it off.
-    A LARGER frame end at one point but a smaller candidate at another (the affine
-    candidates cross) -> ``None`` (a genuinely unrepresentable frame; the caller falls
-    back to the per-row reference max).
+    PERIOD-PRESERVING: the caller passes ``exclude_channels`` covering every SCANNED-delay
+    channel (they all ride lanes), so the candidates carry only scanned-DURATION coeffs and
+    CONSTANT delays -- never a scanned-delay coeff.  The frame length therefore depends on
+    the scanned durations (which legitimately resize the frame) but is INDEPENDENT of a
+    scanned delay, so scanning a delay shifts only that channel's lane and leaves every
+    other channel's period unchanged (spec 4.2).  A scanned delay big enough to leave this
+    fixed frame is rejected by the lane in-frame check, not absorbed by stretching the frame.
 
-    The candidate set is every edge expr PLUS ``table_end + delay_ch`` for each channel:
-    the latter is >= every edge of that channel (a delayed stop is at most the delayed
-    table end), so the dominating frame end exists whenever a single channel carries the
-    largest delay at every scan point -- the common case (one trigger/probe delay swept).
+    The engine's frame length for a scan point is the last main-table row's effective tick;
+    the lanes reset their frame tick at the same boundary.  So the frame end must, at every
+    scan point, be >= every retained (main + lane) edge -- a single affine expr.  A larger
+    frame end at one point but a smaller candidate at another (scanned durations make the
+    candidates cross) -> ``None`` (the caller falls back to the per-row reference max).
+
+    The candidate set is every retained edge expr PLUS ``table_end + delay_ch`` for each
+    retained channel (a constant-delay stop is at most the delayed table end), so the
+    dominating frame end exists whenever a single channel carries the largest constant delay
+    at every scan point -- the common case.
     """
 
     edge_exprs = _pulse_table_affine_all_edge_exprs(
@@ -1707,16 +1730,19 @@ def _pulse_table_delay_lanes(
     delay`` -- affine in the scan slots -- so the lane is a 1-bit affine sub-player on a
     DISJOINT output bit (structurally the per-bus DAC engine).  Pulling the channel out
     of the global sorted table is what lets a scanned delay REORDER its edges past other
-    channels (the failing case the single table rejects), and a LARGE scanned delay push
-    edges past the nominal frame -- the frame end EXTENDS to fit them.
+    channels (the failing case the single table rejects) while leaving the global table,
+    and therefore every other channel's timing, untouched.
 
     ``global_shift`` (G) is added to every lane edge so a NEGATIVE scanned delay aligns
     with the same re-translated frame as the main table; the lane and the main table share
-    ONE G and reset their frame tick at the same boundary.  ``frame_end`` (the program's
-    ACTUAL final tick expr, already extended to fit positive delayed edges and shifted by
-    G) bounds the per-point in-frame check; an edge may extend the frame but not run
-    backwards or leave the (extended) frame.  Returns the lane channel names (to exclude
-    from the main edge rows) and the lanes."""
+    ONE G and reset their frame tick at the same boundary.  ``frame_end`` is the program's
+    PERIOD-PRESERVING final tick expr (independent of the scanned delay -- see
+    ``_pulse_table_affine_frame_end``); it bounds the per-point in-frame check.  The delay
+    shifts ONLY this channel WITHIN the fixed frame: an edge may not run backwards and may
+    not leave the frame.  A scanned delay large enough to push the pulse past the frame is
+    REJECTED here (period-preserving wrap of a per-point-varying delay is not representable
+    in the affine table) -- keep the delay within the period or add a guard period.
+    Returns the lane channel names (to exclude from the main edge rows) and the lanes."""
 
     hardware_channels = list(channel_names(channels, "channels"))
     channel_bits = {channel: index for index, channel in enumerate(hardware_channels)}
@@ -1768,8 +1794,11 @@ def _pulse_table_delay_lanes(
                 if tick < 0 or tick > frame_tick:
                     raise ValueError(
                         f"scanned delay on channel {channel!r} pushes an edge to tick {tick}, "
-                        f"outside the (extended) frame [0, {frame_tick}] at scan point {point_index}; "
-                        "the frame end could not be made to dominate this edge at every scan point."
+                        f"outside the period-preserving frame [0, {frame_tick}] at scan point "
+                        f"{point_index}.  A delay shifts only this channel and must NOT lengthen "
+                        "the period for the others, so the pulse must stay inside the frame at "
+                        "every scan point: reduce the scanned delay range, or add a trailing "
+                        "guard period long enough to absorb the largest delay."
                     )
                 if tick <= prev:
                     raise ValueError(

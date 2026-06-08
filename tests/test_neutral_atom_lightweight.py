@@ -4632,7 +4632,9 @@ def test_scanned_delay_with_inner_bracket_noncrossing_and_crossing():
 def test_reordering_scanned_delay_with_inner_bracket():
     """A reordering scanned delay (sweeps one channel's edges past another's) WITH an
     inner bracket: unrolled flat, the reordering channel rides a disjoint lane, tick-exact
-    vs the oracle and all models."""
+    vs the oracle and all models.  A trailing guard period keeps the delayed pulse inside
+    the (period-preserving) frame -- a scanned delay shifts only its own channel and never
+    lengthens the others' period, so loop_end stays delay-free."""
     import Zou_lab_control.neutral_atom as na
 
     st = na.PulseTableState(
@@ -4641,14 +4643,17 @@ def test_reordering_scanned_delay_with_inner_bracket():
             na.PulsePeriod(1000, (1, 1), unit="ns"),   # both ON
             na.PulsePeriod(1000, (0, 0), unit="ns"),
             na.PulsePeriod(1000, (1, 1), unit="ns"),
+            na.PulsePeriod(1000, (0, 0), unit="ns"),   # trailing guard: a delayed B stays in-frame
         ],
         time_step_ns=20, repeat_start=0, repeat_end=1, repeat_count=2,
         delays={"B": "s0"}, delay_units={"B": "ns"},
         scan_slots=[{"kind": "delay", "target": "B", "unit": "ns", "nominal": 0.0}],
-        scan_table=[[0.0], [600.0]])   # B reorders past A
+        scan_table=[[0.0], [600.0]])   # B reorders past A, staying inside the guarded frame
     for rf in (False, True):
         prog = _assert_scan_matches_oracle(st, channels=["A", "B"], clock_hz=50e6, repeat_forever=rf, n_ticks=1600, want_lane=True)
         assert [l.channel for l in prog.delay_lanes] == ["B"]
+        assert not any(prog.loop_end_slot_coeffs)            # PERIOD-PRESERVING: delay never extends the frame
+        assert not any(any(c) for c in prog.tick_slot_coeffs)  # A (main table) is identical at every scan point
 
 
 def test_negative_scanned_delay_with_and_without_bracket():
@@ -4676,28 +4681,80 @@ def test_negative_scanned_delay_with_and_without_bracket():
         assert all(t >= 0 for t in p2.ticks)
 
 
-def test_large_scanned_delay_extends_frame_reordering_and_not():
-    """A LARGE scanned delay that pushes edges PAST the nominal frame -- the frame end
-    EXTENDS to fit them (the old 'extending the frame is planned' reject is gone).  Every
-    scanned delay rides its own lane (so it plays at its exact effective tick with no
-    main-table seed/slip), both for a lone channel and for a reordering pair."""
+def test_large_scanned_delay_period_preserving_or_rejected():
+    """A scanned delay is PERIOD-PRESERVING (spec 4.2): it shifts ONLY its own channel (on a
+    lane) and NEVER changes the frame length, so the period and every other channel are
+    byte-identical at every scan point.  A delay that keeps the pulse INSIDE the frame
+    compiles (loop_end and the whole main table are delay-free); a delay big enough to push
+    the pulse PAST the frame is REJECTED with a clear, actionable error rather than silently
+    stretching everyone's period (the bug this replaces 'extended the frame')."""
+    import pytest
     import Zou_lab_control.neutral_atom as na
 
-    non_reorder = na.PulseTableState(
-        channels=["A"],
-        periods=[na.PulsePeriod(1000, (1,), unit="ns"), na.PulsePeriod(1000, (0,), unit="ns")],
-        time_step_ns=20, delays={"A": "s0"}, delay_units={"A": "ns"},
-        scan_slots=[{"kind": "delay", "target": "A", "unit": "ns", "nominal": 0.0}],
-        scan_table=[[0.0], [2000.0]])   # A pushed a whole frame past the nominal end
-    reorder = na.PulseTableState(
+    # WITHIN-FRAME: a long trailing guard period absorbs even a large swept delay.  A is not
+    # delayed (stays in the main table); B rides a lane.  The period is delay-independent.
+    within = na.PulseTableState(
+        channels=["A", "B"],
+        periods=[na.PulsePeriod(1000, (1, 1), unit="ns"),
+                 na.PulsePeriod(4000, (0, 0), unit="ns")],   # guard absorbs up to ~4000 ns of delay
+        time_step_ns=20, delays={"B": "s0"}, delay_units={"B": "ns"},
+        scan_slots=[{"kind": "delay", "target": "B", "unit": "ns", "nominal": 0.0}],
+        scan_table=[[0.0], [2000.0]])   # B shifted a long way, but still inside the 5000 ns frame
+    for rf in (False, True):
+        prog = _assert_scan_matches_oracle(within, channels=["A", "B"], clock_hz=50e6, repeat_forever=rf, n_ticks=1200, want_lane=True)
+        assert [l.channel for l in prog.delay_lanes] == ["B"]
+        assert not any(prog.loop_end_slot_coeffs)              # PERIOD unchanged by the swept delay
+        assert not any(any(c) for c in prog.tick_slot_coeffs)  # A (main table) identical at every scan point
+
+    # PAST-FRAME: no guard, so a 2000 ns delay pushes B's pulse past the 2000 ns frame -> reject.
+    past = na.PulseTableState(
         channels=["A", "B"],
         periods=[na.PulsePeriod(1000, (1, 1), unit="ns"), na.PulsePeriod(1000, (0, 0), unit="ns")],
         time_step_ns=20, delays={"B": "s0"}, delay_units={"B": "ns"},
         scan_slots=[{"kind": "delay", "target": "B", "unit": "ns", "nominal": 0.0}],
-        scan_table=[[0.0], [2000.0]])   # B reorders past A AND extends the frame
-    for rf in (False, True):
-        _assert_scan_matches_oracle(non_reorder, channels=["A"], clock_hz=50e6, repeat_forever=rf, n_ticks=900, want_lane=True)
-        _assert_scan_matches_oracle(reorder, channels=["A", "B"], clock_hz=50e6, repeat_forever=rf, n_ticks=1200, want_lane=True)
+        scan_table=[[0.0], [2000.0]])
+    with pytest.raises(ValueError, match="period-preserving frame|guard period"):
+        past.compile_scan(clock_hz=50e6, repeat_forever=True)
+
+
+def test_scanned_delay_changes_only_its_own_channel_not_the_whole_pulse():
+    """REGRESSION (user-reported real-hardware bug): a SCANNED delay must shift ONLY its own
+    channel and leave the period and EVERY other channel byte-identical at every scan point.
+
+    The bug: the frame end was made affine in the scanned delay, so as the delay swept the
+    whole frame grew and every channel's pulse moved ('scan 下的大 delay 会把整个 pulse 都
+    改变了，而不是仅仅改变那个 channel 的 delay').  Non-scan delay was correct because its
+    frame is period-preserving.  This plays several scan-point frames and asserts the
+    non-delayed channels' per-tick output is IDENTICAL across points, while the delayed
+    channel shifts by exactly the delay -- the precise behaviour the user demanded."""
+    import Zou_lab_control.neutral_atom as na
+    from fpga.pulse_streamer.host import engine_model as em
+
+    st = na.PulseTableState(
+        channels=["A", "B", "C"],
+        periods=[na.PulsePeriod(100, (1, 0, 1), unit="ns"),   # A, C on
+                 na.PulsePeriod(100, (0, 1, 0), unit="ns"),   # B on
+                 na.PulsePeriod(800, (0, 0, 0), unit="ns")],  # guard absorbs the swept delay
+        time_step_ns=20, delays={"C": "s0"}, delay_units={"C": "ns"},
+        scan_slots=[{"kind": "delay", "target": "C", "unit": "ns", "nominal": 0.0}],
+        scan_table=[[0.0], [100.0], [200.0], [300.0]])
+    prog = st.compile_scan(clock_hz=50e6, repeat_forever=True)
+    ep = em.EngineProgram.from_program(prog)
+    assert not any(ep.loop_end_slot_coeffs)              # period is delay-independent
+    assert not any(any(c) for c in ep.tick_slot_coeffs)  # the main (A,B) table never moves
+
+    period = em.effective_tick(ep.loop_end_tick, ep.loop_end_slot_coeffs, ep.scan_points[0], ep.frac_bits)
+    out = em.reference_play(prog, period * len(ep.scan_points))
+    frames = [out[k * period:(k + 1) * period] for k in range(len(ep.scan_points))]
+    # Mask off C (bit 2): the A/B part of every frame must be byte-identical across points.
+    without_c = lambda frame: [m & ~(1 << 2) for m in frame]
+    for k in range(1, len(frames)):
+        assert without_c(frames[k]) == without_c(frames[0]), f"non-delayed channels moved at scan point {k}"
+    # C (bit 2) rises exactly `delay` ticks into each frame (0, 5, 10, 15 for 0/100/200/300 ns).
+    def first_on(frame, bit):
+        ons = [i for i, m in enumerate(frame) if (m >> bit) & 1]
+        return ons[0] if ons else None
+    assert [first_on(f, 2) for f in frames] == [0, 5, 10, 15]
 
 
 def test_constant_delay_reordered_by_scanned_duration_uses_lane():
@@ -4814,12 +4871,14 @@ def test_repeat_forever_combined_with_bracket_and_scanned_delay():
             na.PulsePeriod(1000, (1, 1), unit="ns"),
             na.PulsePeriod(1000, (0, 0), unit="ns"),
             na.PulsePeriod(1000, (1, 1), unit="ns"),
+            na.PulsePeriod(1000, (0, 0), unit="ns"),   # trailing guard: a delayed B stays in-frame
         ],
         time_step_ns=20, repeat_start=0, repeat_end=1, repeat_count=2,
         delays={"B": "s0"}, delay_units={"B": "ns"},
         scan_slots=[{"kind": "delay", "target": "B", "unit": "ns", "nominal": 0.0}],
         scan_table=[[0.0], [600.0], [200.0]])
-    _assert_scan_matches_oracle(st, channels=["A", "B"], clock_hz=50e6, repeat_forever=True, n_ticks=3000, want_lane=True)
+    prog = _assert_scan_matches_oracle(st, channels=["A", "B"], clock_hz=50e6, repeat_forever=True, n_ticks=3000, want_lane=True)
+    assert not any(prog.loop_end_slot_coeffs)   # repeat_forever period stays fixed as the delay sweeps
 
 
 def test_unrolled_bracket_overflow_raises_actionable_error():
