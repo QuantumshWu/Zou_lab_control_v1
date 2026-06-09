@@ -2347,19 +2347,21 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             template_buttons.addWidget(button, 1)
         editor_layout.addLayout(template_buttons)
         editor_layout.addWidget(self.scan_code, 1)
+        # Run the code -> generated scan table; Save the resulting array.  Loading an
+        # ARRAY file lives in the Delay/Scan panel ("Load Array" + source toggle); a
+        # second "Load File" here would just duplicate it.  (Load PROGRAM, above, loads
+        # .py code into the editor -- a different thing.)
         code_buttons = QtWidgets.QHBoxLayout()
         code_buttons.setSpacing(_px(6, minimum=4))
         run_btn = FluentButton("Run", color=GREEN)
         run_btn.setFixedHeight(_row_height())
         run_btn.setToolTip("Run the code; assign an N_points x N_slots array to 'scan_table'.")
         run_btn.clicked.connect(self._run_scan_code)
-        load_btn = FluentButton("Load File", color=ACCENT)
-        load_btn.setFixedHeight(_row_height())
-        load_btn.clicked.connect(self._load_scan_file)
         save_btn = FluentButton("Save Array", color=YELLOW)
         save_btn.setFixedHeight(_row_height())
+        save_btn.setToolTip("Save the generated scan table to a .npy/.csv file.")
         save_btn.clicked.connect(self._save_scan_array)
-        for button in (run_btn, load_btn, save_btn):
+        for button in (run_btn, save_btn):
             button.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
             code_buttons.addWidget(button, 1)
         editor_layout.addLayout(code_buttons)
@@ -2433,7 +2435,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             footer = f"\n... {len(rows)} points total" if len(rows) > 40 else f"\n{len(rows)} point(s)"
             self.scan_table_view.setPlainText(header + "\n" + "\n".join(shown) + footer)
         else:
-            self.scan_table_view.setPlainText("(empty — Run code or Load File)")
+            self.scan_table_view.setPlainText("(empty — Run code, or Load Array in the Delay/Scan panel)")
         # Default = column_stack template, auto-adapting to the current slot count, as
         # long as the user has not edited it / loaded a program / picked the grid template.
         current = self.scan_code.toPlainText()
