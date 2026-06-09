@@ -211,6 +211,9 @@ class PulseTableState:
         clk_channels: Sequence[str] | None = None,
     ):
         self.channels = list(channel_names(channels, "channels"))
+        # O(1) channel->bit index (channels are fixed after construction).  channel_index is
+        # called per period x channel x rebuild from the GUI, so list.index() there is wasteful.
+        self._channel_index = {channel: index for index, channel in enumerate(self.channels)}
         self.name = str(name) if name is not None else default_pulse_name()
         self.time_step_ns = positive_time_step_ns(time_step_ns)
         self.scan_slots = [slot if isinstance(slot, ScanSlot) else ScanSlot.from_dict(slot) for slot in (scan_slots or [])]
@@ -232,7 +235,10 @@ class PulseTableState:
         # Channels wired directly to the FPGA clk (output = clk).  They are EXCLUDED from
         # the pulse engine (their edge-table bit is forced 0) so the engine never fights
         # the clk routing; the top muxes clk onto their pin via a runtime clk-enable mask.
-        self.clk_channels = [c for c in (str(x) for x in (clk_channels or [])) if c in self.channels]
+        # Keep clk_channels RAW (do not silently drop unknown names) so validate() can flag a
+        # typo / stale config instead of leaving clk quietly disabled.  Callers that intend to
+        # drop clk channels missing from a new channel list (aligned_to_channels) pre-filter.
+        self.clk_channels = [str(x) for x in (clk_channels or [])]
         self.validate()
 
     # -- scan slot helpers -------------------------------------------------
@@ -396,7 +402,7 @@ class PulseTableState:
         return self
 
     def load_scan_table(self, path: str | Path) -> "PulseTableState":
-        return self.set_scan_table(load_scan_table(path))
+        return self.set_scan_table(load_scan_table(path, n_slots=len(self.scan_slots) or None))
 
     def clk_enable_mask(self) -> int:
         """Bitmask (bit n = channel ``self.channels[n]``) of channels wired to the FPGA
@@ -493,6 +499,11 @@ class PulseTableState:
         if duplicated_bus_members:
             raise ValueError(f"analog bus channels must not overlap: {duplicated_bus_members}.")
         known_buses = self.bus_channels(min_width=1)
+        # An unknown clk channel is almost always a typo / stale config -- raise rather than
+        # silently leave clk disabled on a pin the user thinks is clocked.
+        unknown_clk = [c for c in self.clk_channels if c not in self.channels]
+        if unknown_clk:
+            raise ValueError(f"clk channels are not in hardware channels: {unknown_clk}.")
         # A clk channel is muxed directly onto the FPGA clk pin; if it were also an analog-bus
         # member the bus engine would drive that same DAC bit -> ambiguous double-drive on
         # hardware.  The GUI guards this, but validate() is the real contract gate (JSON /
@@ -644,8 +655,8 @@ class PulseTableState:
 
     def channel_index(self, channel: str) -> int:
         try:
-            return self.channels.index(str(channel))
-        except ValueError as exc:
+            return self._channel_index[str(channel)]
+        except KeyError as exc:
             raise ValueError(f"unknown channel {channel!r}.") from exc
 
     def active_channels(self) -> list[str]:
@@ -939,6 +950,10 @@ class PulseTableState:
             channel_labels=dict(self.channel_labels),
             analog_buses={name: list(members) for name, members in self.analog_buses.items()},
             analog_bus_modes={name: [dict(entry) for entry in expand(entries)] for name, entries in self.analog_bus_modes.items()},
+            # channels are unchanged by the unroll, so the clk set carries verbatim -- without
+            # this a finite-bracket-with-delay compile (which unrolls first) would silently drop
+            # clk channels back to engine-driven (same bug class as aligned_to_channels).
+            clk_channels=list(self.clk_channels),
         )
 
     def delay_steps(self, channel: str, *, slots: Mapping[str, float] | None = None, time_step_ns: float | None = None) -> int:
@@ -1368,12 +1383,18 @@ def _normalize_scan_table(rows: Sequence[Sequence[float]] | None, *, n_slots: in
     return out
 
 
-def load_scan_table(path: str | Path) -> list[list[float]]:
+def load_scan_table(path: str | Path, *, n_slots: int | None = None) -> list[list[float]]:
     """Load a scan table (``N_points x N_slots``) from ``.npy``/``.csv``/``.txt``.
 
     ``.npy`` is read with NumPy.  Text files accept comma or whitespace
     separators and ignore ``#`` comment lines and a single header line of names.
-    """
+
+    A 1-D array is ambiguous (``[1, 2, 3]`` could be 1 point of 3 slots or 3 points
+    of 1 slot).  When ``n_slots`` is given it disambiguates: a flat array whose length
+    is a multiple of ``n_slots`` is reshaped to ``(-1, n_slots)`` -- so ``n_slots=1``
+    gives a COLUMN (3 points x 1 slot), the intuitive single-slot case, and
+    ``n_slots=2`` over ``[a, b, c, d]`` gives 2 points.  Without ``n_slots`` a 1-D array
+    stays a single row (legacy behavior)."""
 
     import numpy as np
 
@@ -1396,7 +1417,12 @@ def load_scan_table(path: str | Path) -> list[list[float]]:
             except ValueError:
                 continue  # header / names line
         array = np.asarray(rows, dtype=float) if rows else np.zeros((0, 0))
-    array = np.atleast_2d(np.asarray(array, dtype=float))
+    array = np.asarray(array, dtype=float)
+    # Disambiguate a 1-D array by the known slot count: a flat array whose length is a
+    # multiple of n_slots is N points x n_slots (so n_slots=1 -> a column of points).
+    if array.ndim == 1 and n_slots and int(n_slots) > 0 and array.size % int(n_slots) == 0:
+        array = array.reshape(-1, int(n_slots))
+    array = np.atleast_2d(array)
     return [[float(value) for value in row] for row in array]
 
 
@@ -1599,6 +1625,12 @@ class _SafeEval:
 
     def __init__(self, slots: Mapping[str, float] | None = None):
         self.values = {str(k): float(v) for k, v in dict(slots or {}).items()}
+        # _has_context: a NON-EMPTY slot mapping was provided -> the caller is resolving against
+        # a known slot set, so an sN missing from it is a typo and must raise.  With NO slots
+        # (None) or an EMPTY mapping (e.g. validate after with_slots_resolved cleared the slots,
+        # where a leftover delay/duration expression like "s0/2" must still evaluate), keep the
+        # lenient 0.0 fallback -- raising there would break legitimate resolve/validate passes.
+        self._has_context = bool(self.values)
 
     def eval(self, text: str) -> float:
         return float(self._visit(ast.parse(_insert_implicit_mul(text), mode="eval").body))
@@ -1610,7 +1642,9 @@ class _SafeEval:
             if node.id in self.values:
                 return self.values[node.id]
             if SLOT_VAR_RE.fullmatch(node.id):
-                return self.values.get(node.id, 0.0)
+                if self._has_context:
+                    raise ValueError(f"time expression references unbound scan slot {node.id!r}.")
+                return 0.0
         if isinstance(node, ast.BinOp) and type(node.op) in self._binops:
             return self._binops[type(node.op)](self._visit(node.left), self._visit(node.right))
         if isinstance(node, ast.UnaryOp) and type(node.op) in self._unary:

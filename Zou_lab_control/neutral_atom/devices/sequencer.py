@@ -1759,9 +1759,9 @@ def _pulse_table_edge_table(
     fold_analog_buses: bool = True,
     repeat_forever: bool = True,
     extra_raw_delays: Mapping[int, int] | None = None,
-) -> tuple[list[int], list[int], list[str], int, int, dict[int, int], list, dict[int, int]]:
+) -> tuple[list[int], list[int], list[str], int, int, dict[int, int], list]:
     """Build ``(ticks, masks, channels, loop_end, repeat_from_index, channel_delays,
-    bus_delays)``.
+    bus_delays)`` -- 7 values (the annotation matches the return exactly).
 
     The edge table is UNDELAYED: every channel sits at its nominal position and the loop
     period is the plain frame end ``table_end`` (``repeat_from_index`` always 0).  A channel

@@ -5183,3 +5183,66 @@ def test_estimate_resources_matches_solve_capacity_and_reports_pass_fail():
     assert all(result["report"][axis]["ok"] for axis in ("lut", "ff", "dsp", "ramb36"))
     text = im.format_capacity_report(result)
     assert "HAS enough resources" in text and "RAMB36" in text
+
+
+# --------------------------------------------------------------------------- #
+# Regression guards for the 2026-06-09 audit-list fixes (clk carry/validate,
+# DAC/1D scan-table handling, unbound-slot eval).
+# --------------------------------------------------------------------------- #
+def test_unrolled_bracket_preserves_clk_channels():
+    """BUG 1.1: unrolled_bracket() dropped clk_channels, so a finite-bracket-with-delay
+    compile (which unrolls first) silently reverted a clk channel to engine-driven."""
+
+    state = na.PulseTableState(
+        channels=["D0", "D1"],
+        periods=[na.PulsePeriod(10, (1, 0), unit="ns"), na.PulsePeriod(20, (0, 1), unit="ns")],
+        repeat_start=0, repeat_end=1, repeat_count=2,
+        clk_channels=["D1"], time_step_ns=20,
+    )
+    unrolled = state.unrolled_bracket()
+    assert unrolled.clk_channels == ["D1"]
+    assert unrolled.clk_enable_mask() == (1 << 1)
+    assert len(unrolled.periods) == 4   # bracket [P0,P1] x2 unrolled
+
+
+def test_clk_channel_unknown_raises_not_silently_dropped():
+    """BUG 1.5: an unknown clk channel (typo / stale config) used to be silently filtered
+    out, leaving clk quietly disabled.  It must raise at construction (validate)."""
+
+    with pytest.raises(ValueError, match="clk channels are not in hardware channels"):
+        na.PulseTableState(
+            channels=["D0", "D1"],
+            periods=[na.PulsePeriod(100, (0, 0), unit="ns")],
+            clk_channels=["D9_typo"], time_step_ns=20,
+        )
+
+
+def test_load_scan_table_1d_reshaped_by_slot_count(tmp_path):
+    """BUG 1.4: a 1-D array was always read as 1 point x N slots; with the slot count it is
+    N points x n_slots (n_slots=1 -> a column), the intuitive single-slot case."""
+
+    from Zou_lab_control.neutral_atom.timing.pulse_table import load_scan_table
+
+    p = tmp_path / "scan.npy"
+    np.save(p, np.array([1.0, 2.0, 3.0]))
+    assert load_scan_table(p, n_slots=1) == [[1.0], [2.0], [3.0]]      # 3 points x 1 slot
+    assert load_scan_table(p, n_slots=None) == [[1.0, 2.0, 3.0]]       # legacy: single row
+    np.save(p, np.array([1.0, 2.0, 3.0, 4.0]))
+    assert load_scan_table(p, n_slots=2) == [[1.0, 2.0], [3.0, 4.0]]   # 2 points x 2 slots
+    # a 2-D file is untouched by the reshape
+    np.save(p, np.array([[5.0], [6.0]]))
+    assert load_scan_table(p, n_slots=1) == [[5.0], [6.0]]
+
+
+def test_eval_time_expr_unbound_slot_raises_only_with_slot_context():
+    """BUG 2.3: a typo'd sN used to evaluate to 0.0 silently.  With a (non-empty) slot
+    context an unbound sN now raises; with no/empty context the lenient 0.0 fallback stays
+    (so with_slots_resolved's leftover delay expressions still validate)."""
+
+    from Zou_lab_control.neutral_atom.timing.pulse_table import eval_time_expr
+
+    assert eval_time_expr("s0*2", slots={"s0": 50.0}) == 100.0        # bound resolves
+    assert eval_time_expr("s5", slots=None) == 0.0                    # no context -> lenient
+    assert eval_time_expr("s5", slots={}) == 0.0                      # empty context -> lenient
+    with pytest.raises(ValueError, match="unbound scan slot"):
+        eval_time_expr("s5", slots={"s0": 100.0})                    # typo with context -> raise

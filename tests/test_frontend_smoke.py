@@ -1989,6 +1989,7 @@ def test_fluent_combo_box_wheel_ignores_closed_popup(monkeypatch):
 
 
 def test_fluent_text_width_supports_old_qfontmetrics():
+    pytest.importorskip("PyQt5")   # qt_fluent imports PyQt5 at module top
     from Zou_lab_control.frontend.qt_fluent import fluent_text_width
 
     class OldMetrics:
@@ -2199,6 +2200,7 @@ def test_clk_channel_disables_period_checkboxes(monkeypatch):
 def test_floatorx_lineedit_residue_removed():
     """#4 residue: the dead x/y FloatOrXLineEdit (and its regexes) are gone."""
 
+    pytest.importorskip("PyQt5")   # qt_fluent imports PyQt5 at module top
     from Zou_lab_control.frontend import qt_fluent as qf
 
     assert not hasattr(qf, "FloatOrXLineEdit")
@@ -2262,3 +2264,67 @@ def test_hold_field_tracks_upstream_edge_change(monkeypatch):
     # the downstream hold fields now track the new upstream value (no rebuild)
     assert cards[1].bus_value_edits["da"].text() == "500"
     assert cards[2].bus_value_edits["da"].text() == "500"
+
+
+def test_pulse_gui_clear_bus_clears_analog_bus_modes(monkeypatch):
+    """BUG 1.3: clearing a DAC bus only cleared the member TTL bits; analog_bus_modes
+    re-projected the stale edge/ramp value back.  Clearing must zero the LOGICAL bus too."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+
+    app = ensure_qt_app()
+    editor = PulseSequenceEditor(state=dt.demo_state())
+    editor.show(); editor.show_all_channels(); app.processEvents()
+
+    bus = list(editor.state.bus_channels())[0]
+    card0 = editor.drag_container.pulse_cards()[0]
+    card0.bus_mode_combos[bus].setCurrentText("Edge")
+    card0.bus_value_edits[bus].setText("500")
+    app.processEvents()
+    assert editor.read_state().analog_bus_modes[bus][0]["mode"] == "edge"
+
+    editor.clear_channel(f"bus:{bus}")
+    app.processEvents()
+    after = editor.read_state()
+    assert all(str(e.get("mode", "hold")).lower() == "hold" for e in after.analog_bus_modes.get(bus, []))
+    assert after.bus_value(0, bus) == 0   # the clear actually sticks now
+
+
+def test_pulse_gui_dac_scan_target_follows_period_reorder(monkeypatch):
+    """BUG 1.2: _reconcile_scan_slots only remapped duration targets; a DAC slot's
+    bus@period_index went stale when periods were reordered.  It must follow the move."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor, PeriodCard
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+
+    app = ensure_qt_app()
+    editor = PulseSequenceEditor(state=dt.demo_state())
+    editor.show(); editor.show_all_channels(); app.processEvents()
+    if editor.state.repeat_start is not None:
+        pytest.skip("reorder test assumes no repeat bracket")
+
+    bus = list(editor.state.bus_channels())[0]
+    cards = editor.drag_container.pulse_cards()
+    cards[1].bus_mode_combos[bus].setCurrentText("Edge")
+    cards[1].bus_value_edits[bus].setText("300")
+    app.processEvents()
+    editor._toggle_dac_scan(cards[1], bus); app.processEvents()
+    dac_slot = next(s for s in editor.read_state().scan_slots if s.kind == "dac")
+    assert dac_slot.target == f"{bus}@1"
+
+    # Move the period-1 card to index 0 (reorder the drag items, then refresh + read).
+    dc = editor.drag_container
+    moved = next(it for it in dc.items if it.widget is cards[1])
+    dc.items.remove(moved)
+    dc.items.insert(0, moved)
+    dc.refresh_layout()
+    app.processEvents()
+    dac_slot2 = next(s for s in editor.read_state().scan_slots if s.kind == "dac")
+    assert dac_slot2.target == f"{bus}@0"   # target followed the reorder

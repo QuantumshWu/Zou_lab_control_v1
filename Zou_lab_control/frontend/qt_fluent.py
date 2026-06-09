@@ -389,7 +389,10 @@ class FluentLineEdit(QtWidgets.QLineEdit):
         self.editingFinished.connect(self._snap_to_resolution)
 
     def setText(self, text: str) -> None:  # noqa: N802 - Qt API name
-        super().setText(str(text))
+        text = str(text)
+        if self.text() == text:
+            return   # no-op guard: skip the (expensive) re-set + cursor reset when unchanged
+        super().setText(text)
         if not self.hasFocus():
             self.setCursorPosition(0)
 
@@ -1268,7 +1271,13 @@ class FluentScanLineEdit(FluentLineEdit):
         return self._dot
 
     def set_scan_bound(self, bound: bool, number: int | None = None) -> None:
-        self._bound = bool(bound)
+        bound = bool(bound)
+        # no-op guard: re-applying the (expensive) stylesheet/dot/readonly when neither the
+        # bound flag nor the badge number changed is wasted work (Qt re-polishes the style).
+        if self._bound == bound and getattr(self, "_scan_number", "\x00unset") == number:
+            return
+        self._bound = bound
+        self._scan_number = number
         self._dot.setChecked(self._bound)
         self._dot.set_number(number if self._bound else None)
         self.setReadOnly(self._bound)
@@ -1301,8 +1310,12 @@ class FluentScanLineEdit(FluentLineEdit):
         no-op while bound.
         """
 
+        editable = bool(editable)
         if self._bound:
             return
+        if getattr(self, "_editable", None) == editable:
+            return   # no-op guard: skip the readonly/stylesheet re-apply when unchanged
+        self._editable = editable
         self.setReadOnly(not editable)
         self.setStyleSheet(self._base_style if editable else _muted_line_style())
         self._reserve_right()

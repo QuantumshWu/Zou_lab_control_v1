@@ -845,7 +845,10 @@ class PeriodCard(FluentGroupBox):
                 continue  # scanned DAC value; underlying bits stay as previewed
             value_text = _normalize_bus_value_text(value_edit.text(), max_value=self.bus_max_values.get(bus_name, 0))
             if value_edit.text() != value_text:
-                value_edit.setText(value_text)
+                # read_state() must not itself mark the editor dirty: block the textChanged
+                # that this normalization setText would otherwise fire (-> changed -> _mark_dirty).
+                with _signals_blocked(value_edit):
+                    value_edit.setText(value_text)
             value = int(value_text)
             for bit, channel in enumerate(members):
                 if channel in channel_index:
@@ -2056,11 +2059,15 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         return state
 
     def _reconcile_scan_slots(self, periods: Sequence[PulsePeriod]) -> list[ScanSlot]:
-        """Carry scan slots through an edit, realigning ``duration`` targets.
+        """Carry scan slots through an edit, realigning ``duration`` AND ``dac`` targets.
 
-        Slots are owned by ``self.state`` (created/removed only by the scan
-        dots).  Here we only re-point ``duration`` slots at the period that now
-        holds their ``s{i}`` expression, since drag-reordering can move it.
+        Slots are owned by ``self.state`` (created/removed only by the scan dots).
+        Drag-reordering moves a period's ``s{i}`` expression to a new index, so we
+        re-point each slot's target at the period/card that now holds it:
+        ``duration`` slots by the period whose duration is ``s{i}``; ``dac`` slots
+        (``bus@period_index``) by the card whose bus value is ``s{i}``.  Without the
+        ``dac`` remap a DAC scan + period drag would leave the slot target pointing at
+        the old period index (stale compile/unbind/highlight).
         """
 
         var_to_period: dict[int, int] = {}
@@ -2068,12 +2075,21 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             slot_index = _slot_index_of_expr(period.duration)
             if slot_index is not None:
                 var_to_period[slot_index] = period_index
+        var_to_dac_target: dict[int, str] = {}
+        for period_index, card in enumerate(self.drag_container.pulse_cards()):
+            for bus_name, entry in card.bus_modes().items():
+                slot_index = _slot_index_of_expr(entry.get("value"))
+                if slot_index is not None:
+                    var_to_dac_target[slot_index] = f"{bus_name}@{period_index}"
         out: list[ScanSlot] = []
         for index, slot in enumerate(self.state.scan_slots):
             if slot.kind == "duration":
                 period_index = var_to_period.get(index)
                 target = str(period_index) if period_index is not None else slot.target
                 out.append(ScanSlot("duration", target, slot.label, slot.unit, slot.nominal))
+            elif slot.kind == "dac":
+                target = var_to_dac_target.get(index, slot.target)
+                out.append(ScanSlot("dac", target, slot.label, slot.unit, slot.nominal))
             else:
                 out.append(slot)
         return out
@@ -2309,7 +2325,9 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             if not path:
                 return
             loaded = snap_scan_table(
-                load_scan_table(path),
+                # pass the slot count so a 1-D array is read as N points x n_slots
+                # (n_slots=1 -> a column of points), not 1 point x N slots.
+                load_scan_table(path, n_slots=len(state.scan_slots) or None),
                 state.scan_slots,
                 time_step_ns=state.time_step_ns,
                 dac_maxes=state.scan_slot_dac_maxes(),
@@ -2456,7 +2474,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             self.scan_slots_label.setText("\n".join(lines))
         else:
             self.scan_slots_label.setText(
-                "No scan slots bound yet. In the Edit tab, click the dot next to any duration, delay, or DAC value to scan it."
+                "No scan slots bound yet. In the Edit tab, click the dot next to any duration or DAC value to scan it. (A channel delay is a fixed value and cannot be scanned.)"
             )
         rows = state.scan_table
         if rows:
@@ -2484,7 +2502,10 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             import math as _math
 
             namespace = {"np": np, "numpy": np, "math": _math, "n_slots": len(state.scan_slots)}
-            exec(self.scan_code.toPlainText(), namespace)  # noqa: S102 - local experiment tool
+            # SECURITY: this runs the user-entered scan snippet as arbitrary Python. It is a
+            # LOCAL experiment tool -- only run code you wrote or trust (a loaded scan .py can do
+            # anything Python can). Do not paste/load untrusted scan programs.
+            exec(self.scan_code.toPlainText(), namespace)  # noqa: S102 - local experiment tool, trusted input only
             table = namespace.get("scan_table")
             if table is None:
                 self._message("Assign an N_points x N_slots array to a 'scan_table' variable.")
@@ -2681,6 +2702,12 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             state = self.read_state()
             if _is_bus_key(channel):
                 bus = channel.split(":", 1)[1]
+                # Clear the LOGICAL bus first: reset its per-period plan to all-hold (value 0),
+                # else apply_analog_bus_modes_to_period_states would re-project a stale
+                # edge/ramp value back onto the member bits and the "clear" would not stick.
+                if bus in state.analog_bus_modes:
+                    state.analog_bus_modes[bus] = [{"mode": "hold", "value": None} for _ in state.periods]
+                    state.apply_analog_bus_modes_to_period_states()
                 for member in state.bus_channels().get(bus, []):
                     state.clear_channel(member)
             else:
@@ -2929,7 +2956,17 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 if hasattr(self, "channel_panel") and hasattr(self, "drag_container")
                 else self.state
             )
-            sequence = state.to_sequence()
+            # The pulse COUNT is the only thing we need from the (expensive) full expansion;
+            # cache it keyed on the state so a burst of debounced refreshes for the SAME state
+            # doesn't rebuild the sequence each time.  Identical display, less compute.
+            import json
+            state_key = json.dumps(state.to_dict(), sort_keys=True, separators=(",", ":"))
+            if state_key == getattr(self, "_summary_state_key", None):
+                pulse_count = self._summary_pulse_count
+            else:
+                pulse_count = len(state.to_sequence().pulses)
+                self._summary_state_key = state_key
+                self._summary_pulse_count = pulse_count
             hidden = state.hidden_active_channels()
             total_ns = state.total_duration_ns()
             parts = [
@@ -2937,7 +2974,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 f"{len(state.periods)} periods",
                 f"step {state.time_step_ns:g} ns",
                 f"{total_ns:.3g} ns",
-                f"{len(sequence.pulses)} pulses",
+                f"{pulse_count} pulses",
                 "repeat ∞" if state.repeat_forever else "single",
             ]
             if state.scan_slots:
@@ -3043,13 +3080,13 @@ class PulseSequenceEditor(QtWidgets.QWidget):
     ) -> None:
         """Shade the time spans affected by each scan slot in transparent orange.
 
+        Only ``duration`` and ``dac`` are scannable (a channel delay is a fixed value):
         - a scanned *duration* spans its whole period across all channels;
-        - a scanned *delay* spans only the lead-in of its channel's pulses;
         - a scanned *DAC* value spans its period on its own analog-bus row.
 
         Each slot carries its 1-based number exactly once, placed on the row it
-        affects (delay on its channel, DAC on its bus), so several scanned DAC
-        buses get distinct, non-overlapping labels instead of piling up.
+        affects (the DAC's bus row), so several scanned DAC buses get distinct,
+        non-overlapping labels instead of piling up.
         """
 
         if not hasattr(plotter, "ax"):
