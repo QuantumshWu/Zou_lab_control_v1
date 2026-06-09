@@ -817,8 +817,8 @@ def test_pulse_gui_layout_geometry_contract(monkeypatch):
     Measures actual widget geometry instead of eyeballing screenshots:
     - the scan dot is EMBEDDED in its line edit (parent is the field) and
       vertically CENTERED, sitting on the right edge like a spinbox spin button;
-    - the Delay/Scan panel's 'Load Array' and 'Scan Tab' buttons are aligned
-      (same top, same height, equal width);
+    - the Delay/Scan panel's 'Load Array' button, file-path label and the
+      generated/loaded source toggle are present and aligned in the row;
     - no Control/Channels button has its text clipped.
     """
 
@@ -838,11 +838,16 @@ def test_pulse_gui_layout_geometry_contract(monkeypatch):
     assert abs((dr.y() + dr.height() / 2) - fr.height() / 2) <= 1.5  # vertically centred
     assert 0 <= fr.right() - dr.right() <= 8  # hugs the right edge (spinbox-spin style)
 
-    # --- Load Array / Scan Tab aligned ---
-    la, sc = editor.channel_panel.load_button, editor.channel_panel.edit_button
-    assert la.mapTo(editor, la.rect().topLeft()).y() == sc.mapTo(editor, sc.rect().topLeft()).y()
-    assert la.height() == sc.height()
-    assert abs(la.width() - sc.width()) <= 1
+    # --- Load Array button + file-path label + source toggle ---
+    la = editor.channel_panel.load_button
+    fl = editor.channel_panel.scan_file_label
+    tg = editor.channel_panel.scan_source_toggle
+    assert la.text() == "Load Array"
+    # button and the path label share the same row (same top within a pixel)
+    assert abs(la.mapTo(editor, la.rect().topLeft()).y() - fl.mapTo(editor, fl.rect().topLeft()).y()) <= 1
+    # the source toggle starts OFF (use the generated table) and sits below the row
+    assert not tg.isChecked()
+    assert tg.mapTo(editor, tg.rect().topLeft()).y() > la.mapTo(editor, la.rect().topLeft()).y()
 
     # --- no control/channel button text clipped ---
     buttons = [
@@ -1448,11 +1453,14 @@ def test_pulse_gui_constructs_xdc_channel_editor(monkeypatch, tmp_path):
         assert editor.channel_panel.top_labels["scan"].alignment() == QtCore.Qt.AlignCenter
         assert editor.channel_panel.top_labels["step"].alignment() == QtCore.Qt.AlignCenter
         assert x_in_editor(editor.channel_panel.top_labels["step"]) == x_in_editor(editor.channel_panel.top_labels["scan"])
-        assert x_in_editor(editor.channel_panel.step_edit) == x_in_editor(editor.channel_panel.scan_summary)
+        assert x_in_editor(editor.channel_panel.step_display) == x_in_editor(editor.channel_panel.scan_summary)
         assert abs(y_in_editor(editor.channel_panel.top_labels["scan"]) - y_in_editor(editor.channel_panel.scan_summary)) <= 1
         assert editor.channel_panel.top_labels["scan"].height() == editor.channel_panel.scan_summary.height()
-        assert abs(y_in_editor(editor.channel_panel.top_labels["step"]) - y_in_editor(editor.channel_panel.step_edit)) <= 1
-        assert editor.channel_panel.top_labels["step"].height() == editor.channel_panel.step_edit.height()
+        assert abs(y_in_editor(editor.channel_panel.top_labels["step"]) - y_in_editor(editor.channel_panel.step_display)) <= 1
+        assert editor.channel_panel.top_labels["step"].height() == editor.channel_panel.step_display.height()
+        # The clock step is read-only (fixed by the FPGA clock), shown as MHz · ns/tick.
+        assert editor.channel_panel.step_display.isEnabled() is False
+        assert "MHz" in editor.channel_panel.step_display.text()
         assert abs(y_in_editor(editor.names_panel.raw_label_widgets["ch00"]) - y_in_editor(editor.channel_panel.delay_edits["ch00"])) <= 1
         assert abs(y_in_editor(editor.channel_panel.delay_edits["ch00"]) - y_in_editor(first_card.checks["ch00"])) <= 1
         margins = editor.edit_tab.layout().contentsMargins()
@@ -1995,3 +2003,133 @@ def test_checked_in_tutorial_notebooks_are_utf8():
         text = path.read_text(encoding="utf-8")
         assert "???" not in text, path
         assert "\ufffd" not in text, path
+
+
+def test_preview_hides_idle_dac_when_off_rows_off(monkeypatch):
+    """#5: with 'Show off rows' OFF an idle (all-zero) DAC bus is hidden, just like an
+    always-off TTL channel; a DAC carrying a real value (or scanned) still shows."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend import pulse_gui
+    from Zou_lab_control.neutral_atom.timing.pulse_table import PulsePeriod, PulseTableState
+
+    ensure_qt_app()
+    ch = [f"da[{i}]" for i in range(10)] + ["trig"]
+    labels = {f"da[{i}]": f"da[{i}]" for i in range(10)}
+    state = PulseTableState(
+        channels=ch,
+        visible_channels=ch,
+        periods=[PulsePeriod(1000, tuple([0] * 11), unit="ns")],  # DAC = 0 in every period (idle)
+        channel_labels=labels,
+        time_step_ns=20.0,
+    )
+    off, _ = pulse_gui._analog_bus_traces(state, include_always_off=False)
+    on, _ = pulse_gui._analog_bus_traces(state, include_always_off=True)
+    assert off == []          # idle DAC hidden when off-rows are hidden
+    assert len(on) == 1       # but shown when off-rows are shown
+
+    state.set_bus_value(0, "da", 512)   # now it carries a real value
+    off2, _ = pulse_gui._analog_bus_traces(state, include_always_off=False)
+    assert len(off2) == 1     # an active DAC is shown even with off-rows hidden
+
+
+def test_scan_source_toggle_switches_generated_and_loaded(monkeypatch):
+    """#4: the Delay/Scan toggle picks the active scan table -- off = generated (Run),
+    on = the array loaded from a file -- without re-running anything."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    ed = dt.demo_editor(size=(1400, 880))
+    dt.settle(ed, 200)
+    ed._scan_tables["generated"] = [[10000.0, 100.0], [20000.0, 200.0]]
+    ed._scan_tables["loaded"] = [[30000.0, 300.0]]
+    ed._scan_use_loaded = False
+    ed._apply_scan_source()
+    assert len(ed.state.scan_table) == 2          # generated source active
+
+    ed.channel_panel.scan_source_toggle.setChecked(True)   # -> loaded
+    dt.settle(ed, 100)
+    assert ed.channel_panel.scan_source_toggle.isChecked()
+    assert len(ed.state.scan_table) == 1
+
+    ed.channel_panel.scan_source_toggle.setChecked(False)  # -> generated
+    dt.settle(ed, 100)
+    assert len(ed.state.scan_table) == 2
+
+
+def test_scan_default_template_adapts_to_slot_count(monkeypatch):
+    """#6: the default Scan-tab code is the column_stack template, regenerated to match
+    the bound slot count until the user edits it."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    ed = dt.demo_editor(size=(1400, 880))   # binds 2 scan slots (s0 duration, s1 dac)
+    dt.settle(ed, 150)
+    ed._refresh_scan_tab()
+    code = ed.scan_code.toPlainText()
+    assert "column_stack([s0, s1])" in code      # adapted to the 2 bound slots
+    assert "2 bound slot(s)" in code
+
+
+def test_delay_edit_caps_at_delay_depth(monkeypatch):
+    """#1: a delay larger than the delay-line depth is clamped on the field."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.neutral_atom.timing.pulse_table import DELAY_DEPTH_TICKS
+
+    ed = dt.demo_editor(size=(1400, 880))
+    dt.settle(ed, 120)
+    panel = ed.channel_panel
+    channel = next(iter(panel.delay_edits))
+    edit = panel.delay_edits[channel]
+    panel.delay_units[channel].setCurrentText("us")
+    edit.setText("999")                  # 999 us >> 40.96 us cap
+    panel._clamp_delay_edit(channel, edit)
+    capped_us = DELAY_DEPTH_TICKS * ed.state.time_step_ns / 1000.0
+    assert abs(float(edit.text()) - capped_us) < 1e-6
+
+
+def test_delay_unit_combo_only_ns_and_us(monkeypatch):
+    """The per-channel delay unit combo offers only ns/us (ms/s exceed the delay-line
+    depth; 'str (ns)' is meaningless for a fixed non-scannable delay)."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    ed = dt.demo_editor(size=(1400, 880))
+    dt.settle(ed, 120)
+    for combo in ed.channel_panel.delay_units.values():
+        items = [combo.itemText(i) for i in range(combo.count())]
+        assert items == ["ns", "us"], items
+
+
+def test_dac_value_field_and_dot_stay_inside_card(monkeypatch):
+    """The DAC value field (and its embedded scan dot) must never spill past the period
+    card's right border -- the '右边缘 cutoff' the user reported.  Sizing the value field
+    to the card's remaining width guarantees this regardless of the rendering font."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    ed = dt.demo_editor(size=(1480, 900))
+    st = ed.state
+    st.set_bus_value(0, "da_dipole", 1023)   # full-scale code: the widest content
+    ed.load_state(st)
+    dt.settle(ed, 200)
+    card = ed.drag_container.pulse_cards()[0]
+    value_edit = list(card.bus_value_edits.values())[0]
+    dot = value_edit.dot
+    card_right = card.width()
+    # both the value field and the dot end at or before the card's right edge
+    assert value_edit.mapTo(card, value_edit.rect().topRight()).x() <= card_right
+    assert dot.mapTo(card, dot.rect().topRight()).x() <= card_right

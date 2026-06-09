@@ -448,24 +448,25 @@ class VivadoAxiStreamerSession:
         # failed re-arm is localized.  STATUS bits: 0=LOADED 1=RUNNING 2=DONE 4=UNDERFLOW.
         # Expect: before=LOADED(0x1) -> after=RUNNING(0x2).  Stuck at 0x1/0x0 => FIRE did not
         # start the engine (top FIRE-gate / start pulse); RUNNING but no pulses => output path.
+        # NOTE: do NOT sleep here -- a STREAMED scan must start its refill thread the instant
+        # the engine starts, or the FPGA drains both ping-pong banks before the host refills.
         try:
             st_before = self._read_word(CtrlWords.STATUS)
         except Exception:
             st_before = -1
         self._command(CMD_FIRE)
         (self.state_dir / "fire_time.txt").write_text(str(time.monotonic()), encoding="utf-8")
+        # a repeat_forever STREAMED scan (> 2 banks) must be fed continuously while it
+        # re-sweeps; a background thread keeps the ping-pong banks loaded.  Start it FIRST,
+        # then read STATUS (a plain read, no sleep) so the diagnostic never delays streaming.
+        self._start_stream_thread()
         try:
-            st_a = self._read_word(CtrlWords.STATUS)
-            time.sleep(0.05)
-            st_b = self._read_word(CtrlWords.STATUS)
+            st_after = self._read_word(CtrlWords.STATUS)
             print(f"ZLC FIRE diag: STATUS before=0x{st_before & 0xffffffff:X} "
-                  f"after=0x{st_a & 0xffffffff:X} +50ms=0x{st_b & 0xffffffff:X} "
-                  f"(bit0=LOADED 1=RUNNING 2=DONE 4=UNDERFLOW)", flush=True)
+                  f"after=0x{st_after & 0xffffffff:X} (bit0=LOADED 1=RUNNING 2=DONE 4=UNDERFLOW)",
+                  flush=True)
         except Exception as exc:
             print(f"ZLC FIRE diag: STATUS read failed: {exc}", flush=True)
-        # a repeat_forever STREAMED scan (> 2 banks) must be fed continuously while it
-        # re-sweeps; a background thread keeps the ping-pong banks loaded.
-        self._start_stream_thread()
 
     # --- streaming refill primitive -----------------------------------------
     def _load_chunk(self, sweep_chunk: int, bank_ready: int, *, stop: "threading.Event | None" = None) -> int:

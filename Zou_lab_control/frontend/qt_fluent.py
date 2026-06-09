@@ -427,6 +427,40 @@ class FluentLineEdit(QtWidgets.QLineEdit):
     def set_allow_any(self, allow_any: bool = True) -> None:
         self._allow_any = bool(allow_any)
 
+    def set_numeric_validator(
+        self,
+        kind: str = "float",
+        *,
+        bottom: float | None = None,
+        top: float | None = None,
+        decimals: int = 12,
+    ) -> None:
+        """Restrict typed input to a number (like the Confocal GUI's FloatLineEdit).
+
+        ``kind="float"`` accepts only digits, a decimal point, ``e``/``E`` and a sign
+        (scientific notation); ``kind="int"`` accepts only an integer.  Optional
+        ``bottom``/``top`` bound the value (an int field with a ``top`` also blocks
+        clearly-too-big entries as you type).  Other characters are simply rejected at
+        the keystroke, so the field can never hold non-numeric junk."""
+
+        if kind == "int":
+            validator: QtGui.QValidator = QtGui.QIntValidator(self)
+            if bottom is not None:
+                validator.setBottom(int(bottom))
+            if top is not None:
+                validator.setTop(int(top))
+        else:
+            validator = QtGui.QDoubleValidator(self)
+            validator.setNotation(QtGui.QDoubleValidator.ScientificNotation)
+            validator.setDecimals(int(decimals))
+            if bottom is not None:
+                validator.setBottom(float(bottom))
+            if top is not None:
+                validator.setTop(float(top))
+        # Force a dot decimal separator regardless of the system locale.
+        validator.setLocale(QtCore.QLocale.c())
+        self.setValidator(validator)
+
     def _snap_to_resolution(self) -> None:
         if not self._res_step:
             return

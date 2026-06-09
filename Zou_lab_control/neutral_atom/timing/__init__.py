@@ -15,6 +15,7 @@ from .sequence import (
 )
 from .pulse_table import (
     ANALOG_BUS_MODES,
+    DELAY_DEPTH_TICKS,
     SCAN_SLOT_KINDS,
     PulsePeriod,
     PulseTableState,
@@ -30,12 +31,14 @@ from .pulse_table import (
     quantized_time_ns,
     quantized_time_steps,
     slot_var,
+    snap_scan_table,
 )
 from .verilog import CONTROL_PORTS, VerilogBuild, VerilogFiles, generate_verilog, generate_xdc, write_verilog_bundle
 
 __all__ = [
     "CONTROL_PORTS",
     "ANALOG_BUS_MODES",
+    "DELAY_DEPTH_TICKS",
     "SCAN_SLOT_KINDS",
     "DEFAULT_CAMERA_TRIGGER_CHANNELS",
     "Pulse",
@@ -66,5 +69,6 @@ __all__ = [
     "quantized_time_steps",
     "sequence_for_frame_count",
     "slot_var",
+    "snap_scan_table",
     "write_verilog_bundle",
 ]

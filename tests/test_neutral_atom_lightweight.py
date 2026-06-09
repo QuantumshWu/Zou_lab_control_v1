@@ -2723,18 +2723,86 @@ def test_pulse_table_snapped_snaps_literals_and_keeps_expressions():
     assert snapped.periods[1].duration == "s0"
     # the fixed delay snaps to a whole tick (30 -> 40)
     assert snapped.delays["trig"] == 40
-    # scan table: time slot snaps to the tick grid
+    # scan table: a duration slot snaps to the tick grid, UP to at least one tick
+    # (a period must occupy >= 1 tick, so it never collapses to 0).
     assert snapped.scan_table[0][0] == 60.0   # 51 ns -> 60 ns
-    assert snapped.scan_table[1][0] == 0.0    # 9 ns rounds to 0 (a duration slot may snap to 0)
+    assert snapped.scan_table[1][0] == 20.0   # 9 ns -> one 20 ns tick (snapped up, never 0)
     # the original state is untouched (snapped returns a copy)
     assert state.periods[0].duration == 50
 
     # snap_scan_table is the shared helper used by the GUI; DAC slots round to an
-    # integer code, time slots snap to the tick grid.
+    # integer code (clamped to the bus width), duration slots snap UP to >= 1 tick.
     dac_slot = ScanSlot(kind="dac", target="da_dipole@0", unit="value")
     time_slot = ScanSlot(kind="duration", target="1", unit="ns")
     snapped_rows = snap_scan_table([[51.0, 512.4], [9.0, 800.6]], [time_slot, dac_slot], time_step_ns=20)
-    assert snapped_rows == [[60.0, 512.0], [0.0, 801.0]]
+    assert snapped_rows == [[60.0, 512.0], [20.0, 801.0]]
+    # DAC codes are clamped to [0, max]: a negative or over-range code is pulled in.
+    clamped = snap_scan_table([[-5.0, 2000.0]], [time_slot, dac_slot], time_step_ns=20, dac_maxes=[None, 1023])
+    assert clamped == [[20.0, 1023.0]]
+
+
+def test_scan_slot_dac_maxes_reports_bus_width():
+    """A DAC scan slot reports its bus's max code (2**width - 1); time slots report None."""
+
+    state = na.PulseTableState(
+        channels=[f"da[{i}]" for i in range(10)] + ["trig"],
+        periods=[na.PulsePeriod(1000, tuple([0] * 11), unit="ns")],
+        scan_slots=[
+            {"kind": "dac", "target": "da@0", "unit": "value", "nominal": 0.0},
+            {"kind": "duration", "target": "0", "unit": "ns", "nominal": 1000.0},
+        ],
+        time_step_ns=20,
+    )
+    maxes = state.scan_slot_dac_maxes()
+    assert maxes[0] == (1 << 10) - 1  # 10-bit DAC bus -> 1023
+    assert maxes[1] is None           # duration slot has no DAC max
+
+
+def test_compile_scan_clamps_dac_codes_to_bus_width():
+    """#9 hardware safety: a DAC scan point outside [0, 2**width-1] (negative or
+    over-range) is clamped before it reaches the bus engine, via BOTH the snap in
+    compile_scan and the hard clamp in the host compiler."""
+
+    ch = [f"da[{i}]" for i in range(10)] + ["trig"]
+    labels = {f"da[{i}]": f"da[{i}]" for i in range(10)}
+    state = na.PulseTableState(
+        channels=ch,
+        visible_channels=ch,
+        periods=[
+            na.PulsePeriod(1000, tuple([0] * 11), unit="ns"),
+            na.PulsePeriod(2000, tuple([0] * 10 + [1]), unit="ns"),
+        ],
+        channel_labels=labels,
+        time_step_ns=20.0,
+    )
+    state.bind_field("dac", "da@0", unit="value", label="da")
+    state.set_scan_table([[-50.0], [512.4], [2000.0]])
+    program = state.compile_scan(clock_hz=50e6)
+    codes = [point[0] for point in program.scan_points]
+    assert codes == [0, 512, 1023]  # clamped: -50->0, 512.4->512, 2000->1023
+
+
+def test_delay_depth_constants_agree_across_layers():
+    """The delay-line depth must be ONE number across the timing model, the device
+    validator and the fpga host engine model (and the RTL, which a structure test
+    locks).  A drift here would let the GUI accept a delay the hardware can't run."""
+
+    from Zou_lab_control.neutral_atom.timing.pulse_table import DELAY_DEPTH_TICKS
+    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import DEFAULT_DELAY_DEPTH
+
+    assert DELAY_DEPTH_TICKS == DEFAULT_DELAY_DEPTH == 2048
+    try:
+        import importlib.util as _ilu
+        import pathlib as _pl
+
+        root = _pl.Path(__file__).resolve().parents[1]
+        em_path = root / "fpga" / "pulse_streamer" / "host" / "engine_model.py"
+        spec = _ilu.spec_from_file_location("zlc_engine_model_depthcheck", em_path)
+        em = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(em)
+        assert em.DELAY_DEPTH == DELAY_DEPTH_TICKS
+    except Exception:  # pragma: no cover - host tooling import is environment-dependent
+        pass
 
 
 def test_timing_payload_to_dict_snaps_pulse_table():

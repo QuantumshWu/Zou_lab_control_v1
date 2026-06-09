@@ -482,12 +482,22 @@ def compile_pulse_table_scan_runtime_program(
             for index, slot in enumerate(state.scan_slots)
         }
 
+    # Per-slot DAC maximum (2**width - 1) so a DAC scan point can never exceed the bus
+    # width (defense in depth -- the GUI + snapped() already clamp; this guarantees the
+    # bus engine only ever sees a legal code no matter how the program was built).
+    dac_slot_maxes = state.scan_slot_dac_maxes()
+
     def point_slot_value(point_index: int, slot_index: int, ns: Mapping[str, float]) -> int:
         slot = state.scan_slots[slot_index]
         if slot.kind == "dac":
             # Store the DAC code verbatim (no ns->tick conversion); its affine
-            # coefficient is 0 so it never enters the edge-tick formula.
-            return int(round(float(ns[slot_var(slot_index)])))
+            # coefficient is 0 so it never enters the edge-tick formula.  Clamp to the
+            # bus bit width: a negative / over-range code is pulled into [0, max].
+            code = int(round(float(ns[slot_var(slot_index)])))
+            hi = dac_slot_maxes[slot_index]
+            if hi is not None:
+                code = max(0, min(int(hi), code))
+            return code
         return _time_ns_to_ticks(
             ns[slot_var(slot_index)], clock_step_ns, f"scan point {point_index} slot {slot_index}", allow_negative=True
         )

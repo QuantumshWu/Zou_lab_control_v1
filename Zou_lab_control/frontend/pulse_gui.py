@@ -15,6 +15,7 @@ import re
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from Zou_lab_control.neutral_atom.timing.pulse_table import (
+    DELAY_DEPTH_TICKS,
     PulsePeriod,
     PulseTableState,
     ScanSlot,
@@ -78,6 +79,10 @@ except Exception:  # pragma: no cover - depends on the local desktop environment
 
 
 TIME_UNITS = ["ns", "us", "ms", "s", "str (ns)"]
+# A per-channel delay is bounded to the delay-line depth (~+/-40 us), so only ns / us
+# make sense as units -- ms / s would always exceed the cap, and "str (ns)" (the affine
+# expression unit) is meaningless for a fixed, non-scannable delay.
+DELAY_UNITS = ["ns", "us"]
 UNIT_TO_NS = {"ns": 1.0, "us": 1_000.0, "ms": 1_000_000.0, "s": 1_000_000_000.0, "str (ns)": 1.0}
 ROW_HEIGHT = 30
 CHANNEL_LABEL_WIDTH = 100
@@ -85,7 +90,7 @@ TIME_UNIT_WIDTH = 60
 HIDE_BUTTON_WIDTH = 26
 PANEL_TOP_HEIGHT = 152
 CHANNEL_ROW_SPACING = 4
-PERIOD_CARD_WIDTH = 146
+PERIOD_CARD_WIDTH = 150
 DEFAULT_WINDOW_RATIO = 0.90
 DEFAULT_HARDWARE_CLOCK_HZ = 50_000_000.0
 DEFAULT_TIME_STEP_NS = 1_000_000_000.0 / DEFAULT_HARDWARE_CLOCK_HZ
@@ -208,20 +213,94 @@ def _scan_slot_label(state: PulseTableState, index: int) -> str:
     return slot.target
 
 
-def _default_scan_code(n_slots: int) -> str:
-    n_slots = max(1, int(n_slots))
-    if n_slots == 1:
-        build = "scan_table = points.reshape(-1, 1)"
-    else:
-        columns = ", ".join(["points"] + ["np.zeros_like(points)"] * (n_slots - 1))
-        build = f"scan_table = np.column_stack([{columns}])"
-    return (
+def _template_column_stack(n_slots: int) -> str:
+    """``column_stack`` template: one independent column per slot (the default).
+
+    Adapts to the current slot count; a 2-slot binding shows the anti-correlated
+    "keep the total constant" example."""
+
+    n = max(1, int(n_slots))
+    head = (
         "import numpy as np\n\n"
-        f"# {n_slots} bound slot(s). Build an (N_points x {n_slots}) array.\n"
-        "# Row = one scan point; column j = slot sj, in the slot's display unit.\n"
-        "points = np.linspace(1000, 10000, 11)\n"
-        f"{build}\n"
+        f"# {n} bound slot(s): s0..s{n - 1}.  Build an (N_points x {n}) array:\n"
+        "# one row per scan point, one column per slot (in the slot's unit:\n"
+        "# ns for a duration, integer code for a DAC).\n"
+        "points = np.arange(20, 200e3, 20)        # base sweep\n"
     )
+    if n == 1:
+        body = "scan_table = points.reshape(-1, 1)\n"
+    elif n == 2:
+        body = (
+            "s0 = points\n"
+            "s1 = 200e3 - s0                          # anti-correlated: s0 + s1 = 200 us (constant total)\n"
+            "scan_table = np.column_stack([s0, s1])\n"
+        )
+    else:
+        columns = ", ".join(["points"] + [f"np.zeros_like(points)  # s{j}" for j in range(1, n)])
+        body = f"scan_table = np.column_stack([{columns}])\n"
+    return head + body
+
+
+def _template_grid(n_slots: int) -> str:
+    """Grid (outer-product) template: every combination of two axis arrays."""
+
+    n = max(1, int(n_slots))
+    head = (
+        "import numpy as np\n\n"
+        f"# Grid scan over {n} slot(s): every combination of the axis arrays.\n"
+        "a = np.linspace(1000, 5000, 5)           # axis for s0\n"
+    )
+    if n == 1:
+        body = "scan_table = a.reshape(-1, 1)\n"
+    elif n == 2:
+        body = (
+            "b = np.linspace(0, 1000, 4)              # axis for s1\n"
+            "A, B = np.meshgrid(a, b, indexing=\"ij\")\n"
+            "scan_table = np.column_stack([A.ravel(), B.ravel()])   # 5 x 4 = 20 points\n"
+        )
+    else:
+        lines = [
+            "b = np.linspace(0, 1000, 4)              # axis for s1",
+            "A, B = np.meshgrid(a, b, indexing=\"ij\")",
+            "grid = [A.ravel(), B.ravel()]",
+        ]
+        for j in range(2, n):
+            lines.append(f"grid.append(np.full(A.size, 0.0))      # s{j} held constant")
+        lines.append("scan_table = np.column_stack(grid)")
+        body = "\n".join(lines) + "\n"
+    return head + body
+
+
+def _default_scan_code(n_slots: int) -> str:
+    return _template_column_stack(n_slots)
+
+
+def _format_clock_text(time_step_ns: float) -> str:
+    """Read-only ``<freq> MHz · <step> ns`` label for the fixed FPGA clock."""
+
+    step = float(time_step_ns)
+    if step <= 0:
+        return "—"
+    mhz = 1000.0 / step  # (1e9 / step) Hz -> MHz
+    return f"{format_compact_number(mhz)} MHz · {format_compact_number(step)} ns"
+
+
+def _delay_cap_text(time_step_ns: float) -> str:
+    """Human description of the per-channel delay magnitude cap (the delay-line depth)."""
+
+    max_us = DELAY_DEPTH_TICKS * float(time_step_ns) / 1000.0
+    return f"±{format_compact_number(max_us)} us ({DELAY_DEPTH_TICKS} ticks)"
+
+
+def _bus_mode_combo_width() -> int:
+    """Width that *just* fits the widest mode word ("Ramp") plus the dropdown arrow.
+
+    Matches the non-text budget FluentComboBox.paintEvent reserves (drop arrow +
+    insets = ~26 px), measured at the current font so it stays correct under both
+    the real Segoe UI and the wider offscreen substitute font used for screenshots.
+    A real gap (the row spacing) then separates it from the value field."""
+
+    return measure_text_width(["Edge", "Ramp", "Hold"], padding=26)
 
 
 def _normalize_bus_value_text(text: str, *, max_value: int) -> str:
@@ -362,7 +441,29 @@ def _analog_bus_ticks(plan: Sequence[Mapping[str, object]], starts: Sequence[int
     return sorted(ticks)
 
 
-def _analog_bus_traces(state: PulseTableState) -> tuple[list[dict[str, object]], set[str]]:
+def _bus_has_signal(state: PulseTableState, bus_name: str) -> bool:
+    """True if a DAC bus carries a real signal: a non-zero code in any period, OR a
+    scanned (slot-referenced) value.  An all-zero / hold bus is treated as "off"."""
+
+    for index in range(len(state.periods)):
+        try:
+            if state.bus_value(index, bus_name) != 0:
+                return True
+        except Exception:
+            pass
+    for slot in state.scan_slots:
+        if getattr(slot, "kind", "") == "dac" and slot.dac_bus == bus_name:
+            return True
+    for entry in state.analog_bus_modes.get(bus_name, []):
+        value = entry.get("value")
+        if isinstance(value, str) and value.strip():
+            return True
+        if value not in (None, 0):
+            return True
+    return False
+
+
+def _analog_bus_traces(state: PulseTableState, *, include_always_off: bool = True) -> tuple[list[dict[str, object]], set[str]]:
     buses = state.bus_channels()
     if not buses:
         return [], set()
@@ -370,20 +471,17 @@ def _analog_bus_traces(state: PulseTableState) -> tuple[list[dict[str, object]],
     slots = state.reference_slots()
     for period in state.periods:
         starts_steps.append(starts_steps[-1] + period.duration_steps(slots=slots, time_step_ns=state.time_step_ns))
-    visible = set(state.visible_channels)
     traces: list[dict[str, object]] = []
     folded_members: set[str] = set()
     for bus_name, members in buses.items():
-        # A recognized DAC bus is ALWAYS shown as one folded analog row -- its bit
-        # channels must never leak into the digital plot as individual rows
-        # (that was the bug where DA appeared as 10 separate channels).  So fold
-        # every member here; only the *tracing* (drawing the row) is gated on the
-        # bus being visible or carrying a non-zero / scanned value.
+        # A recognized DAC bus is ALWAYS folded -- its bit channels must never leak
+        # into the digital plot as individual rows (that was the bug where DA appeared
+        # as 10 separate channels).  So fold every member here regardless of whether
+        # its analog row is drawn.
         folded_members.update(members)
-        active = bus_name in state.analog_bus_modes or any(
-            state.bus_value(index, bus_name) != 0 for index in range(len(state.periods))
-        )
-        if not any(member in visible for member in members) and not active:
+        # "Show off rows" off -> hide idle (all-zero / hold) DAC buses, exactly like an
+        # always-off TTL channel.  Show off rows on -> show ALL DAC buses.
+        if not include_always_off and not _bus_has_signal(state, bus_name):
             continue
         # Resolve scanned (slot-referenced) DAC values to their reference value so
         # the preview shows a concrete trace instead of crashing on int("s2").
@@ -615,6 +713,8 @@ class PeriodCard(FluentGroupBox):
         scanned = _is_slot_expr(period.duration)
         self.duration_edit = FluentScanLineEdit(_period_duration_text(period), tooltip="Duration value; click the dot to scan it")
         self.duration_edit.setFixedWidth(control_width)
+        # Input restriction is applied in _handle_unit: a numeric unit (ns/us/...) only
+        # accepts digits/./e; the "str (ns)" unit allows an affine slot expression.
         self.duration_dot = self.duration_edit.dot
         top_layout.addWidget(_set_fixed_height(self.duration_edit))
 
@@ -662,19 +762,28 @@ class PeriodCard(FluentGroupBox):
                 row_widget.setFixedHeight(bus_row_height)
                 row_layout = QtWidgets.QHBoxLayout(row_widget)
                 row_layout.setContentsMargins(0, 0, 0, 0)
-                row_layout.setSpacing(_px(3, minimum=2))
+                # A clear gap between the mode combo and the value field (they used to
+                # sit almost flush, which read as one merged control).
+                row_gap = _px(7, minimum=5)
+                row_layout.setSpacing(row_gap)
                 combo = FluentComboBox()
                 combo.addItems(["Edge", "Ramp", "Hold"])
                 combo.setCurrentText(_bus_mode_title(mode))
-                # "Edge"/"Ramp"/"Hold" + dropdown arrow.  Wide enough for "Ramp"
-                # (the widest, due to the 'm') even under a wide substitute font,
-                # while still leaving the value field room for the widest code (1023).
-                combo.setFixedSize(_px(66, minimum=60), bus_row_height)
+                # Just wide enough for "Edge"/"Ramp"/"Hold" + the dropdown arrow (the
+                # value field keeps the rest, so the widest code 1023 always shows).
+                combo_w = _bus_mode_combo_width()
+                combo.setFixedSize(combo_w, bus_row_height)
                 combo.setToolTip(f"{bus_name}: output mode")
                 value_edit = FluentScanLineEdit(value_display, tooltip=f"{bus_name}: integer 0..{max_value}; click the dot to scan it")
                 value_edit.setFixedHeight(bus_row_height)
-                # Room for the widest code (e.g. 1023) plus the embedded scan dot.
-                value_edit.setMinimumWidth(_px(62, minimum=54))
+                # Size the value field to EXACTLY the card's remaining width (combo + gap
+                # + value = card content), so it can never spill past the card's right
+                # border and clip the embedded scan dot -- independent of the font's
+                # width.  On the real (narrow) font the leftover comfortably fits "1023".
+                value_w = max(_px(44), (width - 2 * _px(7)) - combo_w - row_gap)
+                value_edit.setFixedWidth(value_w)
+                # DAC code is an integer in [0, max_value]; reject any other keystroke.
+                value_edit.set_numeric_validator("int", bottom=0, top=max_value)
                 # NB: use set_editable (read-only + muted) NOT setEnabled --
                 # disabling the field would also disable the embedded scan dot,
                 # so you could never click it again to unbind the slot.
@@ -734,6 +843,12 @@ class PeriodCard(FluentGroupBox):
         # A period duration must occupy at least one clock tick: snap up to >=1 tick
         # on commit (never to 0), matching the compiler and what the hardware runs.
         self.duration_edit.set_allow_any(False)
+        # Numeric unit -> restrict typing to digits/./e (like the confocal float field).
+        # "str (ns)" is the affine-expression mode -> allow s0/s1+20 etc (no validator).
+        if unit == "str (ns)":
+            self.duration_edit.setValidator(None)
+        else:
+            self.duration_edit.set_numeric_validator("float", bottom=0.0)
 
     def to_period(self, *, full_channels: Sequence[str], time_step_ns: float, slots: Mapping[str, float] | None = None) -> PulsePeriod:
         states = []
@@ -1096,7 +1211,7 @@ class ChannelPanel(FluentGroupBox):
     changed = QtCore.pyqtSignal()
     clearRequested = QtCore.pyqtSignal(str)
     loadScanRequested = QtCore.pyqtSignal()
-    editScanRequested = QtCore.pyqtSignal()
+    scanSourceToggled = QtCore.pyqtSignal(bool)
 
     def __init__(self, state: PulseTableState, parent=None):
         super().__init__("Delay / Scan", parent)
@@ -1126,36 +1241,44 @@ class ChannelPanel(FluentGroupBox):
         top_layout.setContentsMargins(0, 0, 0, 0)
         top_layout.setSpacing(_px(6, minimum=4))
 
-        self.step_edit = FluentLineEdit(format_compact_number(state.time_step_ns))
-        self.step_edit.set_resolution(1e-12)
-        self.step_edit.textChanged.connect(self._handle_step_text)
-        self.step_edit.textChanged.connect(self.changed)
-        self.top_labels["step"] = self._add_labeled_widget(top_layout, "Step:", self.step_edit)
+        # The tick step is fixed by the FPGA clock -- it is NOT user-editable.  Show
+        # the clock frequency + tick width read-only instead of an editable "Step" box.
+        self.step_display = FluentLineEdit(_format_clock_text(state.time_step_ns))
+        self.step_display.setEnabled(False)
+        self.step_display.setToolTip("FPGA clock (fixed by hardware). One tick = 1 / clock; all times snap to a whole tick.")
+        self.top_labels["step"] = self._add_labeled_widget(top_layout, "Clock:", self.step_display)
 
         self.scan_summary = FluentLineEdit("")
         self.scan_summary.setEnabled(False)
         self.scan_summary.setToolTip("Active scan slots and uploaded scan points. Click a dot to bind a field.")
         self.top_labels["scan"] = self._add_labeled_widget(top_layout, "Scan:", self.scan_summary)
 
+        # Load Array + the loaded file's tail path beside it (elide from the left so
+        # the last dozen-or-so characters of the path stay visible).
         btn_row = QtWidgets.QHBoxLayout()
         btn_row.setContentsMargins(0, 0, 0, 0)
         btn_row.setSpacing(_px(5, minimum=3))
         self.load_button = FluentButton("Load Array", color=ACCENT)
         self.load_button.setFixedHeight(_row_height())
-        self.load_button.setToolTip("Load a scan-table file (.npy/.csv/.txt): one row per scan point, one column per slot.")
+        self.load_button.setToolTip("Load a scan-table file (.npy/.csv/.txt/.json): one row per scan point, one column per slot.")
         self.load_button.clicked.connect(self.loadScanRequested)
-        self.edit_button = FluentButton("Scan Tab", color=GREY)
-        self.edit_button.setFixedHeight(_row_height())
-        self.edit_button.setToolTip("Open the Scan tab to write code that builds the scan table.")
-        self.edit_button.clicked.connect(self.editScanRequested)
-        # Expanding policy so the two buttons fill the row in EQUAL halves and line
-        # up (FluentButton defaults to a fixed width = its own text, which made
-        # "Load Array" and "Scan Tab" different widths and look misaligned).
-        for _scan_btn in (self.load_button, self.edit_button):
-            _scan_btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
-        btn_row.addWidget(self.load_button, 1)
-        btn_row.addWidget(self.edit_button, 1)
+        self.scan_file_label = ElidedLabel("(no file)", mode=QtCore.Qt.ElideLeft)
+        self.scan_file_label.setFixedHeight(_row_height())
+        self.scan_file_label.setToolTip("The scan-table file currently loaded (used when the toggle below is on).")
+        btn_row.addWidget(self.load_button)
+        btn_row.addWidget(self.scan_file_label, 1)
         top_layout.addLayout(btn_row)
+
+        # Toggle: off = use the scan table generated in the Scan tab; on = use the
+        # array loaded from the file above.
+        self.scan_source_toggle = FluentSwitch("Use loaded file")
+        self.scan_source_toggle.setFixedHeight(_row_height())
+        self.scan_source_toggle.setToolTip(
+            "Off: use the scan table generated in the Scan tab (Run).\n"
+            "On: use the array loaded with Load Array."
+        )
+        self.scan_source_toggle.toggled.connect(self.scanSourceToggled)
+        top_layout.addWidget(self.scan_source_toggle)
         top_layout.addStretch()
         layout.addWidget(top)
 
@@ -1183,13 +1306,19 @@ class ChannelPanel(FluentGroupBox):
             # A per-channel delay is a FIXED output delay (a delay line) and is not
             # scannable, so the field is a plain numeric input -- no scan dot.
             delay_edit = FluentLineEdit(str(delay_value))
-            delay_edit.setToolTip("Fixed per-channel output delay")
+            delay_edit.setToolTip(
+                "Fixed per-channel output delay (may be negative). "
+                f"|delay| is capped at {_delay_cap_text(state.time_step_ns)}."
+            )
             delay_edit.setFixedSize(delay_w, row_height)
+            # A delay is a number (digits / decimal point / e-notation / sign only).
+            delay_edit.set_numeric_validator("float")
             delay_edit.textChanged.connect(lambda text, ch=key: self._handle_delay_text(ch, text))
             delay_edit.textChanged.connect(self.changed)
+            delay_edit.editingFinished.connect(lambda ch=key, edit=delay_edit: self._clamp_delay_edit(ch, edit))
             unit = FluentComboBox()
-            unit.addItems(TIME_UNITS)
-            unit.setCurrentText(delay_unit)
+            unit.addItems(DELAY_UNITS)
+            unit.setCurrentText(delay_unit if delay_unit in DELAY_UNITS else "ns")
             unit.setFixedSize(unit_w, row_height)
             unit.currentTextChanged.connect(lambda unit_text, ch=key: self._handle_delay_unit(ch, unit_text))
             unit.currentTextChanged.connect(self.changed)
@@ -1219,9 +1348,13 @@ class ChannelPanel(FluentGroupBox):
             text = f"{n_slots} slot{'s' if n_slots != 1 else ''} · {n_points} pt{'s' if n_points != 1 else ''}"
         self.scan_summary.setText(text)
 
-    def _handle_step_text(self, _text: str) -> None:
-        for channel, combo in self.delay_units.items():
-            self._handle_delay_unit(channel, combo.currentText())
+    def set_scan_source(self, *, use_loaded: bool, path: str) -> None:
+        """Reflect the active scan-table source on the toggle + the file-path label
+        (called after a rebuild so the widgets survive a load_state)."""
+
+        with _signals_blocked(self.scan_source_toggle):
+            self.scan_source_toggle.setChecked(bool(use_loaded))
+        self.scan_file_label.setText(str(path) if path else "(no file)")
 
     def _add_labeled_widget(self, layout: QtWidgets.QVBoxLayout, label_text: str, widget: QtWidgets.QWidget) -> FluentLabel:
         row = QtWidgets.QHBoxLayout()
@@ -1245,6 +1378,27 @@ class ChannelPanel(FluentGroupBox):
         edit = self.delay_edits.get(channel)
         if edit is not None:
             edit.set_resolution(_unit_resolution(self.state.time_step_ns, unit))
+
+    def _clamp_delay_edit(self, channel: str, edit: FluentLineEdit) -> None:
+        """Clamp a finished delay entry to ±DELAY_DEPTH_TICKS ticks (the delay-line
+        depth); a larger delay can never be realized.  The compiler still raises a
+        clear error if the *span* of delays exceeds the depth after the global shift."""
+
+        text = edit.text().strip()
+        if not text:
+            return
+        try:
+            value = float(text)
+        except ValueError:
+            return
+        unit_combo = self.delay_units.get(channel)
+        unit_text = unit_combo.currentText() if unit_combo is not None else "ns"
+        factor = UNIT_TO_NS.get(unit_text, 1.0) or 1.0
+        max_ns = DELAY_DEPTH_TICKS * float(self.state.time_step_ns)
+        value_ns = value * factor
+        if abs(value_ns) > max_ns + 1e-6:
+            clamped = max(-max_ns, min(max_ns, value_ns)) / factor
+            edit.setText(format_compact_number(clamped))
 
     def read_values(self, state: PulseTableState) -> None:
         for row_info in self.rows:
@@ -1313,6 +1467,12 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self.last_program = None
         self.bracket_exists = False
         self.address_str = ""
+        # Two scan-table sources, switched by the Delay/Scan panel toggle:
+        #   "generated" -> produced by the Scan tab code (Run)
+        #   "loaded"    -> read from a file (Load Array)
+        self._scan_tables: dict[str, list[list[float]]] = {"generated": [], "loaded": []}
+        self._scan_loaded_path = ""
+        self._scan_use_loaded = False
         self._last_save_state = None
         self._last_load_state = None
         self._building = False
@@ -1669,8 +1829,11 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self.channel_panel.changed.connect(self._mark_dirty)
         self.channel_panel.clearRequested.connect(self.clear_channel)
         self.channel_panel.loadScanRequested.connect(self._load_scan_file)
-        self.channel_panel.editScanRequested.connect(self._open_scan_tab)
+        self.channel_panel.scanSourceToggled.connect(self._on_scan_source_toggled)
         self.channel_panel_layout.addWidget(self.channel_panel)
+        # Restore the active scan-table source (the panel was just recreated, so its
+        # toggle + file label default back to off / empty).
+        self.channel_panel.set_scan_source(use_loaded=self._scan_use_loaded, path=self._scan_loaded_path)
 
     def _rebuild_periods(self) -> None:
         while self.drag_container.layout_main.count():
@@ -1846,7 +2009,9 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             window.update()
 
     def read_state(self) -> PulseTableState:
-        time_step_ns = float(self.channel_panel.step_edit.text() or self.state.time_step_ns)
+        # The tick step is fixed by the FPGA clock (shown read-only in the panel), so
+        # it always comes from the current state -- never an editable field.
+        time_step_ns = float(self.state.time_step_ns)
         slots = self.state.reference_slots()
         cards = self.drag_container.pulse_cards()
         periods = [
@@ -2113,11 +2278,18 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load scan array", start, "Scan array (*.npy *.csv *.txt *.json)")
             if not path:
                 return
-            loaded = snap_scan_table(load_scan_table(path), state.scan_slots, time_step_ns=state.time_step_ns)
-            state.set_scan_table(loaded)
-            self.load_state(state)
+            loaded = snap_scan_table(
+                load_scan_table(path),
+                state.scan_slots,
+                time_step_ns=state.time_step_ns,
+                dac_maxes=state.scan_slot_dac_maxes(),
+            )
+            self._scan_tables["loaded"] = loaded
+            self._scan_loaded_path = path
+            self._scan_use_loaded = True
+            self._apply_scan_source()
             if hasattr(self, "preview_status"):
-                self.preview_status.setText(f"Loaded {len(state.scan_table)} scan points from {Path(path).name}")
+                self.preview_status.setText(f"Loaded {len(loaded)} scan points from {Path(path).name}")
         except Exception as exc:
             self._message(str(exc))
 
@@ -2156,6 +2328,24 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             f'border: 1px solid #A19F9D; border-radius: {scaled_px(4)}px; '
             f'font: {fluent_font_size()}pt "Consolas", "Courier New", monospace; padding: {_px(4)}px; }}'
         )
+        # Top row: load a saved program (.py) or drop in a template that adapts to the
+        # currently bound slot count (column_stack is the default starting point).
+        template_buttons = QtWidgets.QHBoxLayout()
+        template_buttons.setSpacing(_px(6, minimum=4))
+        load_prog_btn = FluentButton("Load Program", color=ACCENT)
+        load_prog_btn.setToolTip("Load a Python program (.py) into the editor.")
+        load_prog_btn.clicked.connect(self._load_scan_program)
+        tmpl_cs_btn = FluentButton("Template: column_stack", color=GREY)
+        tmpl_cs_btn.setToolTip("Insert the column_stack template (one column per slot), adapted to the bound slots.")
+        tmpl_cs_btn.clicked.connect(lambda: self._insert_scan_template("column_stack"))
+        tmpl_grid_btn = FluentButton("Template: grid", color=GREY)
+        tmpl_grid_btn.setToolTip("Insert the grid template (outer product of two arrays), adapted to the bound slots.")
+        tmpl_grid_btn.clicked.connect(lambda: self._insert_scan_template("grid"))
+        for button in (load_prog_btn, tmpl_cs_btn, tmpl_grid_btn):
+            button.setFixedHeight(_row_height())
+            button.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+            template_buttons.addWidget(button, 1)
+        editor_layout.addLayout(template_buttons)
         editor_layout.addWidget(self.scan_code, 1)
         code_buttons = QtWidgets.QHBoxLayout()
         code_buttons.setSpacing(_px(6, minimum=4))
@@ -2200,7 +2390,10 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         body.addWidget(preview_box, 2)
         layout.addLayout(body, 1)
 
-        self._scan_code_initialized = False
+        # Tracks the last auto-written column_stack default.  While the editor still
+        # holds exactly that text (the user has not edited / loaded / picked grid), the
+        # default is regenerated to match the current slot count.
+        self._scan_auto_code = ""
         return tab
 
     def _refresh_scan_tab(self) -> None:
@@ -2212,10 +2405,22 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             state = self.state
         if state.scan_slots:
             lines = ["Columns of the scan table (one row = one scan point):"]
+            maxes = state.scan_slot_dac_maxes()
+            step = float(state.time_step_ns)
             for index, slot in enumerate(state.scan_slots):
+                if slot.kind == "dac":
+                    allowed = f"integer code 0..{maxes[index]}"
+                else:
+                    allowed = f"snapped to a whole {format_compact_number(step)} ns tick (≥ 1 tick)"
                 lines.append(
-                    f"  s{index}: {_scan_slot_label(state, index)}  [{slot.unit}]  (nominal {format_compact_number(slot.nominal)})"
+                    f"  s{index}: {_scan_slot_label(state, index)}  [{slot.unit}]  "
+                    f"(nominal {format_compact_number(slot.nominal)}) → {allowed}"
                 )
+            lines.append("")
+            lines.append(
+                "Every point is snapped automatically before it runs (durations → whole ticks, "
+                "DAC → integer codes in range), so this table is exactly what the hardware plays."
+            )
             self.scan_slots_label.setText("\n".join(lines))
         else:
             self.scan_slots_label.setText(
@@ -2229,9 +2434,13 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             self.scan_table_view.setPlainText(header + "\n" + "\n".join(shown) + footer)
         else:
             self.scan_table_view.setPlainText("(empty — Run code or Load File)")
-        if not self._scan_code_initialized and not self.scan_code.toPlainText().strip():
-            self.scan_code.setPlainText(_default_scan_code(max(1, len(state.scan_slots))))
-            self._scan_code_initialized = True
+        # Default = column_stack template, auto-adapting to the current slot count, as
+        # long as the user has not edited it / loaded a program / picked the grid template.
+        current = self.scan_code.toPlainText()
+        if not current.strip() or current == getattr(self, "_scan_auto_code", ""):
+            fresh = _default_scan_code(max(1, len(state.scan_slots)))
+            self.scan_code.setPlainText(fresh)
+            self._scan_auto_code = fresh
 
     def _run_scan_code(self) -> None:
         try:
@@ -2249,12 +2458,68 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 self._message("Assign an N_points x N_slots array to a 'scan_table' variable.")
                 return
             array = np.atleast_2d(np.asarray(table, dtype=float))
-            rows = snap_scan_table([[float(value) for value in row] for row in array], state.scan_slots, time_step_ns=state.time_step_ns)
-            state.set_scan_table(rows)
-            self.load_state(state)
+            # Snap behind the scenes so what runs is always hardware-legal: durations
+            # -> whole ticks (>= 1), DAC -> integer codes clamped to each bus width.
+            rows = snap_scan_table(
+                [[float(value) for value in row] for row in array],
+                state.scan_slots,
+                time_step_ns=state.time_step_ns,
+                dac_maxes=state.scan_slot_dac_maxes(),
+            )
+            self._scan_tables["generated"] = rows
+            self._scan_use_loaded = False
+            self._apply_scan_source()
             self._open_scan_tab()
         except Exception as exc:
             self._message(f"Scan code error: {exc}")
+
+    def _apply_scan_source(self) -> None:
+        """Make the active scan table = the selected source (generated or loaded),
+        reconciled to the current slot count, then rebuild so every view agrees."""
+
+        state = self.read_state()
+        rows = self._scan_tables.get("loaded" if self._scan_use_loaded else "generated", [])
+        n = len(state.scan_slots)
+        rows = [list(row)[:n] + [0.0] * max(0, n - len(row)) for row in rows]
+        state.set_scan_table(rows)
+        self.load_state(state)
+
+    def _on_scan_source_toggled(self, use_loaded: bool) -> None:
+        self._scan_use_loaded = bool(use_loaded)
+        if self._scan_use_loaded and not self._scan_tables.get("loaded"):
+            self._message("No file loaded yet — use Load Array first. Using the generated table.")
+            self._scan_use_loaded = False
+        self._apply_scan_source()
+        if hasattr(self, "preview_status"):
+            which = "loaded file" if self._scan_use_loaded else "generated code"
+            self.preview_status.setText(f"Scan-table source: {which}")
+        self._mark_dirty()
+
+    def _load_scan_program(self) -> None:
+        try:
+            start = str(Path(self.address_str).parent if self.address_str else _pulse_files_dir())
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, "Load scan program", start, "Python program (*.py *.txt)"
+            )
+            if not path:
+                return
+            self.scan_code.setPlainText(Path(path).read_text(encoding="utf-8"))
+            # A loaded program is user content -> stop auto-regenerating the default.
+            self._scan_auto_code = ""
+            if hasattr(self, "preview_status"):
+                self.preview_status.setText(f"Loaded scan program: {Path(path).name}")
+        except Exception as exc:
+            self._message(f"Load program error: {exc}")
+
+    def _insert_scan_template(self, kind: str) -> None:
+        try:
+            state = self.read_state()
+        except Exception:
+            state = self.state
+        n = max(1, len(state.scan_slots))
+        code = _template_grid(n) if kind == "grid" else _template_column_stack(n)
+        self.scan_code.setPlainText(code)
+        self._scan_code_initialized = True
 
     def _save_scan_array(self) -> None:
         try:
@@ -2584,6 +2849,11 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 self.address_str = path
                 self._last_load_state = state.to_dict()
                 self._last_save_state = None
+                # A freshly opened pulse's scan table becomes the "generated" source;
+                # the loaded-file source resets until the user picks a file.
+                self._scan_tables = {"generated": [list(row) for row in state.scan_table], "loaded": []}
+                self._scan_loaded_path = ""
+                self._scan_use_loaded = False
                 self.stateui_manager.address_str = path
                 self.stateui_manager.filestate = PulseStateUIManager.FileState.LOAD
                 self.load_state(state)
@@ -2678,7 +2948,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 (start, max(stop, seq_end), label) if "∞" in str(label) else (start, stop, label)
                 for (start, stop, label) in repeat_brackets
             ]
-        analog_traces, folded_members = _analog_bus_traces(state)
+        analog_traces, folded_members = _analog_bus_traces(state, include_always_off=include_always_off)
         digital_channel_universe = [channel for channel in state.channels if channel not in folded_members]
         channels = pulse_plot_channels(
             sequence,

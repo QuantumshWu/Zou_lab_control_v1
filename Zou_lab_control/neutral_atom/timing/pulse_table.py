@@ -37,6 +37,16 @@ GRID_ATOL_STEPS = 1e-9
 BUS_LABEL_RE = re.compile(r"^(?P<base>.+)\[(?P<bit>\d+)\]$")
 ANALOG_BUS_MODES = ("hold", "edge", "ramp")
 
+#: LITERAL output delay-line depth, in clock ticks.  A per-channel (TTL) or per-bus
+#: (DAC) delay ``d`` is realized as ``output[t] = undelayed[t-d]`` by a hardware
+#: delay line bounded to this many ticks.  This is the single timing-layer source of
+#: truth for the cap; it MUST match ``DEFAULT_DELAY_DEPTH`` (devices.fpga_pulse_streamer),
+#: ``DELAY_DEPTH`` (fpga host engine_model / image) and the RTL ``DELAY_DEPTH`` localparam.
+#: A contract test asserts they agree.  At the default 20 ns tick this is ~40.96 us,
+#: which covers the user's +/-15 us range with headroom for the negative-delay global
+#: shift G (the GUI clamps each |delay| <= this; the compiler rejects anything past it).
+DELAY_DEPTH_TICKS = 2048
+
 #: Scan-slot kinds.  ``duration`` binds a period duration, ``delay`` binds a
 #: channel delay, ``dac`` binds one analog-bus value in one period.
 SCAN_SLOT_KINDS = ("duration", "dac")
@@ -382,6 +392,21 @@ class PulseTableState:
 
     def load_scan_table(self, path: str | Path) -> "PulseTableState":
         return self.set_scan_table(load_scan_table(path))
+
+    def scan_slot_dac_maxes(self) -> list[int | None]:
+        """Per-slot maximum DAC code (``2**width - 1``) for ``dac`` slots, ``None``
+        otherwise.  Aligned with :attr:`scan_slots`; pass to :func:`snap_scan_table`
+        so DAC scan points are clamped to each bus's real bit width."""
+
+        buses = self.bus_channels(min_width=1)
+        out: list[int | None] = []
+        for slot in self.scan_slots:
+            if getattr(slot, "kind", "") == "dac":
+                width = max(1, len(buses.get(slot.dac_bus, [])))
+                out.append((1 << width) - 1)
+            else:
+                out.append(None)
+        return out
 
     def with_slots_resolved(self, slots: Mapping[str, float]) -> "PulseTableState":
         """Return a non-scan copy with each slot replaced by a constant value.
@@ -995,13 +1020,22 @@ class PulseTableState:
         from ..devices.sequencer import compile_pulse_table_scan_runtime_program
 
         clock_hz = positive_float(clock_hz, "clock_hz")
+        step_ns = 1_000_000_000.0 / clock_hz
+        # Snap + clamp before compiling so the program is exactly what the hardware can
+        # run, no matter how compile_scan is reached (GUI, notebook, save bundle):
+        # durations -> whole ticks, fixed delays -> ticks, DAC scan codes -> [0, max].
+        source = self
+        if scan_table is not None:
+            source = PulseTableState.from_dict(self.to_dict())
+            source.set_scan_table(scan_table)
+        snapped = source.snapped(time_step_ns=step_ns)
         return compile_pulse_table_scan_runtime_program(
-            self,
-            channels=self.channels,
+            snapped,
+            channels=snapped.channels,
             clock_hz=clock_hz,
             trigger_channels=trigger_channels,
-            scan_table=self.scan_table if scan_table is None else scan_table,
-            repeat_forever=self.repeat_forever if repeat_forever is None else bool(repeat_forever),
+            scan_table=snapped.scan_table,
+            repeat_forever=snapped.repeat_forever if repeat_forever is None else bool(repeat_forever),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -1055,7 +1089,12 @@ class PulseTableState:
             )
             for channel, value in copy.delays.items()
         }
-        copy.scan_table = snap_scan_table(copy.scan_table, copy.scan_slots, time_step_ns=step)
+        # A per-channel delay past +/- DELAY_DEPTH_TICKS can never be realized; do NOT
+        # silently clamp it here (that would corrupt the physics) -- the GUI clamps the
+        # input field, and the compiler raises a clear DelayDepthExceeded at validate.
+        copy.scan_table = snap_scan_table(
+            copy.scan_table, copy.scan_slots, time_step_ns=step, dac_maxes=copy.scan_slot_dac_maxes()
+        )
         copy.validate()
         return copy
 
@@ -1331,27 +1370,50 @@ def _snap_literal_time_value(
     return int(out) if float(out).is_integer() else out
 
 
+#: Default DAC bus width (bits) used to clamp a DAC scan point when no per-slot
+#: maximum is supplied.  Matches the 10-bit buses in the top/XDC.
+DEFAULT_DAC_BITS = 10
+
+
 def snap_scan_table(
     scan_table: Sequence[Sequence[float]],
     scan_slots: Sequence["ScanSlot"],
     *,
     time_step_ns: float,
+    dac_maxes: Sequence[int | None] | None = None,
 ) -> list[list[float]]:
-    """Snap every scan-table point to the clock grid: time slots to the nearest tick
-    (in the slot's display unit, sign preserved), DAC slots to the nearest integer
-    code.  One shared snap source for the GUI (so the displayed/saved table matches)
-    and the server/pulse API (so the transferred pulse matches the hardware)."""
+    """Snap + clamp every scan-table point to a value the hardware can actually run.
+
+    Per slot kind, with the SAME rules the rest of the toolchain enforces, so the
+    table the user sees / saves / uploads is exactly what the FPGA plays:
+
+    * ``duration`` -> the nearest whole clock tick, snapped UP to at least one tick
+      (a period must occupy >= 1 tick) and never negative.
+    * ``dac`` -> the nearest integer code, clamped to ``[0, max]`` where ``max`` is
+      ``dac_maxes[j]`` for that slot if given, else ``2**DEFAULT_DAC_BITS - 1`` (1023).
+
+    ``dac_maxes`` (optional) is a per-slot sequence aligned with ``scan_slots``;
+    entries for non-DAC slots are ignored.  One shared snap source for the GUI (so the
+    displayed/saved table matches) and the server/pulse API (so the transferred pulse
+    matches the hardware)."""
 
     step = positive_time_step_ns(time_step_ns)
+    default_dac_max = (1 << DEFAULT_DAC_BITS) - 1
     out: list[list[float]] = []
     for row in scan_table:
         new_row: list[float] = []
-        for value, slot in zip(row, scan_slots):
+        for index, (value, slot) in enumerate(zip(row, scan_slots)):
             if getattr(slot, "kind", "") == "dac":
-                new_row.append(float(int(round(float(value)))))
+                hi = None
+                if dac_maxes is not None and index < len(dac_maxes):
+                    hi = dac_maxes[index]
+                hi = default_dac_max if hi is None else int(hi)
+                code = int(round(float(value)))
+                new_row.append(float(max(0, min(hi, code))))
             else:
+                # A scanned period duration must be >= 1 tick and never negative.
                 snapped = _snap_literal_time_value(
-                    float(value), slot.unit, step, allow_zero=True, allow_negative=True
+                    float(value), slot.unit, step, allow_zero=False, allow_negative=False
                 )
                 new_row.append(float(snapped))
         out.append(new_row)
