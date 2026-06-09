@@ -23,6 +23,8 @@ from Zou_lab_control.neutral_atom.timing.pulse_table import (
     load_scan_table,
     slot_var,
     snap_scan_table,
+    _analog_bus_value_at_tick,
+    analog_bus_ticks as _analog_bus_ticks,
 )
 from .live import plot as frontend_plot, pulse_plot_channels, pulse_repeat_markers, pulse_repeat_notation
 from .qt_fluent import (
@@ -389,58 +391,6 @@ def _bus_value_from_states(state: PulseTableState, period: PulsePeriod, bus_name
     return value
 
 
-def _analog_bus_value_at_tick(plan: Sequence[Mapping[str, object]], starts: Sequence[int], tick: int) -> int:
-    anchors: list[tuple[int, int, str, int]] = []
-    for index, entry in enumerate(plan):
-        mode = str(entry.get("mode", "hold")).lower()
-        value = entry.get("value")
-        if mode in {"edge", "ramp"} and value is not None:
-            anchors.append((index, int(starts[index]), mode, int(value)))
-    if not anchors:
-        return 0
-    tick = int(tick)
-    if tick < anchors[0][1]:
-        return 0
-    previous = anchors[0]
-    for anchor in anchors[1:]:
-        if tick < anchor[1]:
-            if anchor[2] == "ramp" and anchor[1] > previous[1]:
-                fraction = (tick - previous[1]) / (anchor[1] - previous[1])
-                return int(round(previous[3] + (anchor[3] - previous[3]) * fraction))
-            return int(previous[3])
-        previous = anchor
-    return int(previous[3])
-
-
-def _analog_bus_ticks(plan: Sequence[Mapping[str, object]], starts: Sequence[int]) -> list[int]:
-    ticks = {int(starts[index]) for index in range(max(0, len(starts) - 1))}
-    anchors: list[tuple[int, int, str, int]] = []
-    for index, entry in enumerate(plan):
-        mode = str(entry.get("mode", "hold")).lower()
-        value = entry.get("value")
-        if mode in {"edge", "ramp"} and value is not None:
-            anchors.append((index, int(starts[index]), mode, int(value)))
-    previous = anchors[0] if anchors else None
-    for anchor in anchors[1:]:
-        ticks.add(anchor[1])
-        if previous is not None and anchor[2] == "ramp":
-            span = anchor[1] - previous[1]
-            steps = abs(anchor[3] - previous[3])
-            if span > 0 and steps > 0:
-                last_tick = previous[1]
-                for step in range(1, steps + 1):
-                    tick = int(round(previous[1] + span * (step / steps)))
-                    tick = max(previous[1], min(anchor[1], tick))
-                    if tick <= last_tick and last_tick < anchor[1]:
-                        tick = last_tick + 1
-                    if tick <= anchor[1]:
-                        ticks.add(tick)
-                        last_tick = tick
-        previous = anchor
-    ticks.add(int(starts[-1]))
-    return sorted(ticks)
-
-
 def _bus_has_signal(state: PulseTableState, bus_name: str) -> bool:
     """True if a DAC bus carries a real signal: a non-zero code in any period, OR a
     scanned (slot-referenced) value.  An all-zero / hold bus is treated as "off"."""
@@ -655,6 +605,7 @@ class PulseStateUIManager(QtCore.QObject):
 class PeriodCard(FluentGroupBox):
     changed = QtCore.pyqtSignal()
     busScanRequested = QtCore.pyqtSignal(str)
+    busChanged = QtCore.pyqtSignal()  # a DAC mode/value committed -> refresh hold displays
 
     def __init__(
         self,
@@ -789,10 +740,12 @@ class PeriodCard(FluentGroupBox):
                 # so you could never click it again to unbind the slot.
                 value_edit.set_editable(mode != "hold")
                 value_edit.editingFinished.connect(lambda edit=value_edit, limit=max_value: self._normalize_bus_value_edit(edit, limit))
+                value_edit.editingFinished.connect(self.busChanged)
                 value_edit.textChanged.connect(self.changed)
                 value_edit.scanClicked.connect(lambda b=bus_name: self.busScanRequested.emit(b))
                 combo.currentTextChanged.connect(lambda text, edit=value_edit: edit.set_editable(_bus_mode_value(text) != "hold"))
                 combo.currentTextChanged.connect(self.changed)
+                combo.currentTextChanged.connect(self.busChanged)
                 self.bus_mode_combos[bus_name] = combo
                 self.bus_value_edits[bus_name] = value_edit
                 self.bus_max_values[bus_name] = max_value
@@ -1867,6 +1820,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 time_step_ns=self.state.time_step_ns,
             )
             card.changed.connect(self._mark_dirty)
+            card.busChanged.connect(self._refresh_bus_displays)
             card.duration_dot.clicked.connect(lambda _checked=False, c=card: self._toggle_duration_scan(c))
             card.busScanRequested.connect(lambda bus_name, c=card: self._toggle_dac_scan(c, bus_name))
             self.drag_container.add_item(card, "pulse")
@@ -2255,6 +2209,32 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             )
         except Exception as exc:
             self._message(str(exc))
+
+    def _refresh_bus_displays(self) -> None:
+        """A DAC mode/value was committed: recompute every HOLD period's shown value (the
+        value carried in from the preceding edge/ramp) in place, so it tracks upstream
+        edits.  Cheap, no full rebuild; edge/ramp fields keep the typed target."""
+
+        if getattr(self, "_building", False):
+            return
+        try:
+            state = self.read_state()
+            state.apply_analog_bus_modes_to_period_states()
+        except Exception:
+            return
+        for period_index, card in enumerate(self.drag_container.pulse_cards()):
+            for bus_name, edit in getattr(card, "bus_value_edits", {}).items():
+                combo = card.bus_mode_combos.get(bus_name)
+                mode = _bus_mode_value(combo.currentText()) if combo is not None else "hold"
+                dot = card.bus_dots.get(bus_name)
+                if mode != "hold" or (dot is not None and dot.isChecked()):
+                    continue  # only hold (and non-scanned) fields show a carried value
+                try:
+                    value = int(state.analog_bus_value_at_period_start(period_index, bus_name))
+                except Exception:
+                    continue
+                with _signals_blocked(edit):
+                    edit.setText(str(value))
 
     def _toggle_dac_scan(self, card: "PeriodCard", bus_name: str) -> None:
         try:

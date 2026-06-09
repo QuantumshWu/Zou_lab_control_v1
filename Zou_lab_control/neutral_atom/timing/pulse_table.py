@@ -1205,32 +1205,87 @@ def infer_bus_channels(
     return out
 
 
+def bus_period_levels(
+    plan: Sequence[Mapping[str, object]], starts: Sequence[int]
+) -> list[tuple[int, int, int, int, str]]:
+    """Per-period DAC levels with the WITHIN-PERIOD waveform semantics.
+
+    Walks the periods front-to-back carrying the current DAC value (it starts at 0
+    before the first period).  For each period returns
+    ``(start_tick, stop_tick, in_value, out_value, mode)`` where ``in_value`` is the
+    value entering the period and:
+
+    * ``edge v`` -> the period steps to ``v`` at its start and holds it
+      (``out_value = v``);
+    * ``ramp v`` -> the period ramps linearly from ``in_value`` at ``start_tick`` to
+      ``v`` at ``stop_tick`` (``out_value = v``);
+    * ``hold``   -> the period holds the carried-in value (``out_value = in_value``).
+
+    This is the SINGLE source of truth for the DAC waveform, shared by the preview
+    value/tick helpers and (in structure) the hardware segment compiler -- so a ramp
+    always describes the CURRENT period, and a hold always shows the value carried in
+    from whatever edge/ramp preceded it (which updates if that upstream value changes)."""
+
+    count = min(len(plan), max(0, len(starts) - 1))
+    levels: list[tuple[int, int, int, int, str]] = []
+    carried = 0
+    for index in range(count):
+        entry = plan[index]
+        mode = str(entry.get("mode", "hold")).strip().lower()
+        value = entry.get("value")
+        start_tick = int(starts[index])
+        stop_tick = int(starts[index + 1])
+        in_value = carried
+        if value is not None and mode in {"edge", "ramp"}:
+            out_value = int(value)
+        else:
+            mode = "hold"
+            out_value = carried
+        levels.append((start_tick, stop_tick, in_value, out_value, mode))
+        carried = out_value
+    return levels
+
+
 def _analog_bus_value_at_tick(plan: Sequence[Mapping[str, object]], starts: Sequence[int], tick: int) -> int:
     tick = int(tick)
-    anchors: list[tuple[int, int, str, int]] = []
-    for index, entry in enumerate(plan):
-        mode = str(entry.get("mode", "hold")).lower()
-        if mode not in {"edge", "ramp"}:
-            continue
-        value = entry.get("value")
-        if value is None:
-            continue
-        anchors.append((index, int(starts[index]), mode, int(value)))
-    if not anchors:
+    levels = bus_period_levels(plan, starts)
+    if not levels:
         return 0
-    first = anchors[0]
-    if tick < first[1]:
-        return 0
-    previous = first
-    for anchor in anchors[1:]:
-        _index, anchor_tick, mode, value = anchor
-        if tick < anchor_tick:
-            if mode == "ramp" and anchor_tick > previous[1]:
-                fraction = (tick - previous[1]) / (anchor_tick - previous[1])
-                return int(round(previous[3] + (value - previous[3]) * fraction))
-            return int(previous[3])
-        previous = anchor
-    return int(previous[3])
+    for start_tick, stop_tick, in_value, out_value, mode in levels:
+        if start_tick <= tick < stop_tick:
+            if mode == "ramp" and stop_tick > start_tick:
+                fraction = (tick - start_tick) / (stop_tick - start_tick)
+                return int(round(in_value + (out_value - in_value) * fraction))
+            return int(out_value)
+    # at/after the table end the bus holds its final level
+    if tick >= levels[-1][1]:
+        return int(levels[-1][3])
+    return 0
+
+
+def analog_bus_ticks(plan: Sequence[Mapping[str, object]], starts: Sequence[int]) -> list[int]:
+    """Breakpoint ticks for drawing/expanding the bus waveform: every period boundary
+    plus, inside each ramp period, one tick per 1-LSB DAC step (a monotone staircase)."""
+
+    levels = bus_period_levels(plan, starts)
+    ticks = {0}
+    for start_tick, stop_tick, in_value, out_value, mode in levels:
+        ticks.add(start_tick)
+        if mode == "ramp" and stop_tick > start_tick and in_value != out_value:
+            span = stop_tick - start_tick
+            steps = abs(out_value - in_value)
+            last = start_tick
+            for step in range(1, steps + 1):
+                tick = int(round(start_tick + span * (step / steps)))
+                tick = max(start_tick, min(stop_tick, tick))
+                if tick <= last and last < stop_tick:
+                    tick = last + 1
+                if tick <= stop_tick:
+                    ticks.add(tick)
+                    last = tick
+    if starts:
+        ticks.add(int(starts[-1]))
+    return sorted(ticks)
 
 
 def _is_slot_ref(value: object) -> bool:

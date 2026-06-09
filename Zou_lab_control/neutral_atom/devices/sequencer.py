@@ -25,7 +25,12 @@ from ..timing import (
     sequence_for_frame_count,
     slot_var,
 )
-from ..timing.pulse_table import UNITS_TO_NS
+from ..timing.pulse_table import (
+    UNITS_TO_NS,
+    bus_period_levels as _bus_period_levels,
+    analog_bus_ticks as _pulse_table_analog_bus_ticks,
+    _analog_bus_value_at_tick as _pulse_table_analog_bus_value_at_tick,
+)
 from ..timing.verilog import VerilogBuild, VerilogFiles, generate_verilog, write_verilog_bundle
 
 
@@ -1869,64 +1874,6 @@ def _pulse_table_bus_delay_steps(
     return next(iter(delays), 0)
 
 
-def _pulse_table_analog_bus_ticks(plan: Sequence[Mapping[str, object]], starts: Sequence[int]) -> list[int]:
-    ticks = {int(starts[index]) for index in range(max(0, len(starts) - 1))}
-    anchors: list[tuple[int, int, str, int]] = []
-    for index, entry in enumerate(plan):
-        mode = str(entry.get("mode", "hold")).lower()
-        if mode not in {"edge", "ramp"} or entry.get("value") is None:
-            continue
-        anchors.append((index, int(starts[index]), mode, int(entry["value"])))
-    if anchors:
-        ticks.add(anchors[0][1])
-    previous = anchors[0] if anchors else None
-    for anchor in anchors[1:]:
-        ticks.add(anchor[1])
-        if previous is not None and anchor[2] == "ramp":
-            start_tick = previous[1]
-            stop_tick = anchor[1]
-            start_value = previous[3]
-            stop_value = anchor[3]
-            span = stop_tick - start_tick
-            steps = abs(stop_value - start_value)
-            if span > 0 and steps > 0:
-                last_tick = start_tick
-                for step in range(1, steps + 1):
-                    tick = int(round(start_tick + span * (step / steps)))
-                    tick = max(start_tick, min(stop_tick, tick))
-                    if tick <= last_tick and last_tick < stop_tick:
-                        tick = last_tick + 1
-                    if tick <= stop_tick:
-                        ticks.add(tick)
-                        last_tick = tick
-        previous = anchor
-    ticks.add(int(starts[-1]))
-    return sorted(ticks)
-
-
-def _pulse_table_analog_bus_value_at_tick(plan: Sequence[Mapping[str, object]], starts: Sequence[int], tick: int) -> int:
-    anchors: list[tuple[int, int, str, int]] = []
-    for index, entry in enumerate(plan):
-        mode = str(entry.get("mode", "hold")).lower()
-        value = entry.get("value")
-        if mode in {"edge", "ramp"} and value is not None:
-            anchors.append((index, int(starts[index]), mode, int(value)))
-    if not anchors:
-        return 0
-    tick = int(tick)
-    if tick < anchors[0][1]:
-        return 0
-    previous = anchors[0]
-    for anchor in anchors[1:]:
-        if tick < anchor[1]:
-            if anchor[2] == "ramp" and anchor[1] > previous[1]:
-                fraction = (tick - previous[1]) / (anchor[1] - previous[1])
-                return int(round(previous[3] + (anchor[3] - previous[3]) * fraction))
-            return int(previous[3])
-        previous = anchor
-    return int(previous[3])
-
-
 def _pulse_table_bus_order(bus_groups: Mapping[str, Sequence[str]]) -> list[str]:
     """Return the HDL bus order, keeping address-switch buses stable."""
 
@@ -2010,14 +1957,36 @@ def _pulse_table_bus_segments(
         delay_steps = _pulse_table_bus_delay_steps(state, members, slots=slots, time_step_ns=time_step_ns)
         if delay_steps:
             bus_delays[bus_index] = int(delay_steps)
-        # anchor: (period_index, ref_tick, base_tick, coeffs, mode, value_int, value_select)
-        anchors: list[tuple[int, int, int, tuple[int, ...], str, int, int]] = []
         max_value = (1 << len(members)) - 1
-        for period_index, entry in enumerate(plan):
+
+        def _coeffs(values: tuple[int, ...]) -> list[int] | None:
+            return list(values) if affine else None
+
+        def _boundary(boundary_index: int) -> tuple[int, int, tuple[int, ...]]:
+            """(ref_tick, base_tick, coeffs) for period boundary i in [0, n_periods]."""
+            ref = int(starts[boundary_index])
+            if affine:
+                base, coeffs = affine_starts[boundary_index]
+                return ref, int(base), tuple(coeffs)
+            return ref, ref, zero_coeffs
+
+        # Forward-propagate the DAC value through the periods, so each mode controls the
+        # CURRENT period:
+        #   edge v -> step to v at the period start and HOLD v (a point segment);
+        #   ramp v -> ramp linearly from the value carried INTO the period to v by the
+        #             period END (a [start_i, start_{i+1}) segment); the RTL/engine
+        #             interpolate within that window and hold v afterwards;
+        #   hold   -> emit NO segment (the engine keeps the carried value).
+        # carried_value/carried_select describe the value entering the period; the ramp's
+        # START endpoint reads carried_select so a scanned hold/edge still scans the start.
+        carried_value = 0
+        carried_select = 0
+        for period_index in range(len(state.periods)):
+            entry = plan[period_index] if period_index < len(plan) else {"mode": "hold", "value": None}
             mode = str(entry.get("mode", "hold")).strip().lower()
             value = entry.get("value")
             if mode not in {"edge", "ramp"} or value is None:
-                continue
+                continue  # hold -> carried value persists in the engine
             ref_index = _slot_ref_index(value, slot_vars)
             if ref_index is not None:
                 value_select = ref_index + 1
@@ -2025,47 +1994,30 @@ def _pulse_table_bus_segments(
             else:
                 value_select = 0
                 value_int = max(0, min(max_value, int(value)))
-            ref_tick = int(starts[period_index])     # NOMINAL phase (no delay baked in)
-            if affine:
-                base, coeffs = affine_starts[period_index]
-                base, coeffs = int(base), tuple(coeffs)
-            else:
-                base, coeffs = ref_tick, zero_coeffs
-            anchors.append((period_index, ref_tick, int(base), tuple(coeffs), mode, value_int, value_select))
-
-        def _coeffs(values: tuple[int, ...]) -> list[int] | None:
-            return list(values) if affine else None
-
-        previous: tuple[int, int, int, tuple[int, ...], str, int, int] | None = None
-        for anchor_index, anchor in enumerate(anchors):
-            _period_index, ref_tick, base, coeffs, mode, value, value_select = anchor
-            if ref_tick < 0 or ref_tick > table_end:
-                raise ValueError(f"analog bus {bus_name!r} produced segment tick {ref_tick} outside the uploaded table.")
-            if previous is None:
-                next_anchor = anchors[anchor_index + 1] if anchor_index + 1 < len(anchors) else None
-                if next_anchor is None or str(next_anchor[4]).lower() != "ramp":
-                    segments.append(RuntimeBusSegment(bus_index, base, base, value, value, "edge", bus_name, value_select, _coeffs(coeffs), _coeffs(coeffs), stop_value_select=value_select))
-            elif mode == "ramp":
-                start_ref = int(previous[1])
-                start_base = int(previous[2])
-                start_coeffs = previous[3]
-                start_value = int(previous[5])
-                if ref_tick < start_ref:
+            start_ref, start_base, start_coeffs = _boundary(period_index)
+            if start_ref < 0 or start_ref > table_end:
+                raise ValueError(f"analog bus {bus_name!r} produced segment tick {start_ref} outside the uploaded table.")
+            if mode == "edge":
+                # Emit only when the level actually changes -- an edge to the value the
+                # engine already holds (e.g. edge 0 at the start, when the bus is 0) is a
+                # no-op, so skipping it keeps the segment table minimal.
+                if not (value_int == carried_value and value_select == carried_select):
+                    segments.append(RuntimeBusSegment(
+                        bus_index, start_base, start_base, value_int, value_int, "edge", bus_name,
+                        value_select, _coeffs(start_coeffs), _coeffs(start_coeffs),
+                        stop_value_select=value_select,
+                    ))
+            else:  # ramp within THIS period: carried-in value -> value, over [start_i, start_{i+1})
+                end_ref, end_base, end_coeffs = _boundary(period_index + 1)
+                if end_ref < start_ref:
                     raise ValueError(f"analog bus {bus_name!r} ramp end precedes its start.")
-                # A ramp may scan EITHER endpoint independently: the start value reads
-                # the previous anchor's slot (previous[6]); the stop value reads this
-                # anchor's slot (value_select).  The RTL bus engine's dual value_select
-                # makes a ramp scanned-A -> scanned-B seamless.
                 segments.append(RuntimeBusSegment(
-                    bus_index, start_base, base, start_value, value, "ramp", bus_name,
-                    previous[6], _coeffs(start_coeffs), _coeffs(coeffs),
+                    bus_index, start_base, end_base, carried_value, value_int, "ramp", bus_name,
+                    carried_select, _coeffs(start_coeffs), _coeffs(end_coeffs),
                     stop_value_select=value_select,
                 ))
-            else:
-                next_anchor = anchors[anchor_index + 1] if anchor_index + 1 < len(anchors) else None
-                if next_anchor is None or str(next_anchor[4]).lower() != "ramp":
-                    segments.append(RuntimeBusSegment(bus_index, base, base, value, value, "edge", bus_name, value_select, _coeffs(coeffs), _coeffs(coeffs), stop_value_select=value_select))
-            previous = anchor
+            carried_value = value_int
+            carried_select = value_select
     return bus_names, segments, bus_delays
 
 

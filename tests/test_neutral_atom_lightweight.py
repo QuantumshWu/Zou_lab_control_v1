@@ -1120,16 +1120,20 @@ def test_pulse_table_analog_bus_modes_compile_to_runtime_bus_segments(tmp_path):
         {"mode": "hold", "value": None},
         {"mode": "ramp", "value": 7},
     ]
-    assert loaded.periods[1].states[:3] == (0, 0, 1)
+    # period 1 is a HOLD after the edge-0, so it carries 0 (the ramp belongs to period 2,
+    # not the preceding hold -- the within-period ramp fix).
+    assert loaded.periods[1].states[:3] == (0, 0, 0)
     assert program.ticks == [0, 5, 10, 15]
     assert program.masks == [0, 0, 0, 0]
     assert program.bus_names == ["da_test"]
+    # The edge-0 at period 0 is a no-op (bus already 0) so it emits nothing; the ramp now
+    # spans period 2 [10,15) from the carried-in 0 to 7 (NOT the old [0,10] across periods).
     assert [segment.to_dict() for segment in (program.bus_segments or [])] == [
         {
             "bus_index": 0,
             "bus_name": "da_test",
-            "start_tick": 0,
-            "stop_tick": 10,
+            "start_tick": 10,
+            "stop_tick": 15,
             "start_value": 0,
             "stop_value": 7,
             "mode": "ramp",
@@ -1144,6 +1148,49 @@ def test_pulse_table_analog_bus_modes_compile_to_runtime_bus_segments(tmp_path):
         segment.to_dict() for segment in (program.bus_segments or [])
     ]
     na.validate_pulse_streamer_program(program, max_edges=16, max_bus_segments=4, tick_width=32, channel_count=4)
+
+
+def test_dac_ramp_spans_current_period_with_hold_carry_and_edge_step():
+    """The within-period DAC semantics (the user's ramp/edge/hold fix), proven end-to-end
+    through the compiler + the cycle-accurate engine model:
+
+      * edge v -> the period steps to v and holds it,
+      * hold   -> the period carries the value from the preceding edge/ramp,
+      * ramp v -> the period ramps from the carried-in value to v over ITS OWN window
+                  (NOT across the preceding period as the old anchor model did).
+    """
+    from fpga.pulse_streamer.host.engine_model import bus_play
+
+    ch = [f"da[{i}]" for i in range(10)] + ["t"]
+    labels = {f"da[{i}]": f"da[{i}]" for i in range(10)}
+    state = na.PulseTableState(
+        channels=ch,
+        visible_channels=ch,
+        periods=[na.PulsePeriod(1000, tuple([0] * 11), unit="ns") for _ in range(4)],
+        channel_labels=labels,
+        time_step_ns=20.0,   # 1000 ns / 20 = 50 ticks per period
+        name="ramp_within_period",
+    )
+    # Use a representable slope: the DAC ramps at most 1 LSB/tick, so keep the magnitude
+    # (40 LSB) within the period length (50 ticks).
+    state.set_analog_bus_mode(0, "da", "edge", value=100)
+    state.set_analog_bus_mode(1, "da", "hold")
+    state.set_analog_bus_mode(2, "da", "ramp", value=140)
+    state.set_analog_bus_mode(3, "da", "edge", value=0)
+    program = state.compile(clock_hz=50_000_000)
+    wave = bus_play(program, 0, 200)   # 4 periods x 50 ticks
+
+    # period 0 (edge 100) and period 1 (hold) both sit flat at 100 -- the ramp is NOT here.
+    assert wave[0] == 100 and wave[49] == 100
+    assert min(wave[50:100]) == 100 and max(wave[50:100]) == 100   # hold carries 100, no ramp
+    # period 2 (ramp to 140) rises monotonically WITHIN [100,150): starts at the carried 100
+    # and reaches the target by the period end.
+    assert wave[100] == 100
+    assert all(wave[i] <= wave[i + 1] for i in range(100, 149))     # monotone non-decreasing
+    assert wave[125] > 100 and wave[149] >= 138                     # actually ramping, ~140 by the end
+    # period 3 (edge 0) steps back to 0 (settled within the period; the boundary tick is a
+    # 1-tick registered transition)
+    assert wave[160] == 0 and wave[199] == 0
 
 
 def test_analog_ramp_can_scan_both_value_endpoints_round_trip():
