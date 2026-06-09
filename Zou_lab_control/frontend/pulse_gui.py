@@ -1165,21 +1165,25 @@ class ChannelPanel(FluentGroupBox):
     clearRequested = QtCore.pyqtSignal(str)
     loadScanRequested = QtCore.pyqtSignal()
     scanSourceToggled = QtCore.pyqtSignal(bool)
+    clkRequested = QtCore.pyqtSignal(str)   # toggle: wire this channel's pin to the FPGA clk
 
     def __init__(self, state: PulseTableState, parent=None):
         super().__init__("Delay / Scan", parent)
         self.state = state
         self.delay_edits: dict[str, FluentLineEdit] = {}
         self.delay_units: dict[str, FluentComboBox] = {}
+        self.clk_buttons: dict[str, FluentButton] = {}
         self.channel_labels: dict[str, ElidedLabel] = {}
         self.top_labels: dict[str, FluentLabel] = {}
         self.rows = _display_rows(state)
+        clk_set = set(getattr(state, "clk_channels", []))
         label_w = _channel_label_width()
         delay_w = _px(70, minimum=60)
         unit_w = _time_unit_width()
         hide_w = _hide_button_width()
+        clk_w = _px(30, minimum=26)
         gap = _px(4, minimum=3)
-        content_w = label_w + delay_w + unit_w + hide_w + gap * 3 + _px(16)
+        content_w = label_w + delay_w + unit_w + hide_w + clk_w + gap * 4 + _px(16)
         self.setMinimumWidth(content_w)
         self.setMaximumWidth(content_w)
 
@@ -1280,12 +1284,33 @@ class ChannelPanel(FluentGroupBox):
             clear_btn.setToolTip("Set this row fully off.")
             clear_btn.clicked.connect(lambda _=False, ch=key: self.clearRequested.emit(ch))
 
+            # 'clk' toggle: wire this single channel's PIN directly to the FPGA clk
+            # (output = clk).  Only valid for a single TTL channel, not a DAC bus.
+            is_clk = (not is_bus) and key in clk_set
+            clk_btn = FluentButton("clk", color=(ACCENT if is_clk else GREY))
+            clk_btn.setFixedSize(clk_w, row_height)
+            if is_bus:
+                clk_btn.setEnabled(False)
+                clk_btn.setToolTip("A DAC bus cannot be driven by clk.")
+            else:
+                clk_btn.setToolTip(
+                    "Drive this channel's output pin directly from the FPGA clk "
+                    "(removes it from the pulse engine + preview)."
+                )
+                clk_btn.clicked.connect(lambda _=False, ch=key: self.clkRequested.emit(ch))
+            self.clk_buttons[key] = clk_btn
+            if is_clk:
+                # A clk channel's delay/unit are meaningless -> grey them out.
+                delay_edit.setEnabled(False)
+                unit.setEnabled(False)
+
             self.delay_edits[key] = delay_edit
             self.delay_units[key] = unit
             row.addWidget(label)
             row.addWidget(delay_edit, 1)
             row.addWidget(unit)
             row.addWidget(clear_btn)
+            row.addWidget(clk_btn)
             layout.addLayout(row)
             self._handle_delay_text(key, delay_edit.text())
             self._handle_delay_unit(key, unit.currentText())
@@ -1783,6 +1808,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self.channel_panel.clearRequested.connect(self.clear_channel)
         self.channel_panel.loadScanRequested.connect(self._load_scan_file)
         self.channel_panel.scanSourceToggled.connect(self._on_scan_source_toggled)
+        self.channel_panel.clkRequested.connect(self._toggle_clk_channel)
         self.channel_panel_layout.addWidget(self.channel_panel)
         # Restore the active scan-table source (the panel was just recreated, so its
         # toggle + file label default back to off / empty).
@@ -1993,6 +2019,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             delays=dict(self.state.delays),
             delay_units=dict(self.state.delay_units),
             repeat_forever=bool(self.state.repeat_forever),
+            clk_channels=list(self.state.clk_channels),
         )
         self.names_panel.read_values(state)
         self.channel_panel.read_values(state)
@@ -2640,6 +2667,28 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             return
         self.load_state(state)
 
+    def _toggle_clk_channel(self, channel: str) -> None:
+        """Toggle a single channel between engine-driven and wired-to-clk.  A clk channel
+        outputs the FPGA clk on its pin and is removed from the pulse engine + preview."""
+
+        try:
+            state = self.read_state()
+            channel = str(channel)
+            clk = [c for c in state.clk_channels if c != channel]
+            if channel not in state.clk_channels:
+                if channel not in state.channels:
+                    return
+                if channel in {m for members in state.bus_channels().values() for m in members}:
+                    self._message(f"{channel!r} is a DAC bus member and cannot be driven by clk.")
+                    return
+                clk.append(channel)
+            state.clk_channels = clk
+            state.validate()
+        except Exception as exc:
+            self._message(str(exc))
+            return
+        self.load_state(state)
+
     def hide_off_channels(self) -> None:
         state = self.read_state()
         off_channels = {channel for channel in state.channels if not self._channel_has_period_on(state, channel)}
@@ -2931,7 +2980,11 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 for (start, stop, label) in repeat_brackets
             ]
         analog_traces, folded_members = _analog_bus_traces(state, include_always_off=include_always_off)
-        digital_channel_universe = [channel for channel in state.channels if channel not in folded_members]
+        clk_set = set(getattr(state, "clk_channels", []))
+        digital_channel_universe = [
+            channel for channel in state.channels
+            if channel not in folded_members and channel not in clk_set   # clk channels aren't engine-driven
+        ]
         channels = pulse_plot_channels(
             sequence,
             channels=digital_channel_universe,

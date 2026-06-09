@@ -132,6 +132,10 @@ module zlc_pulse_streamer_top #(
     localparam integer BUS_DELAY_TICKS_WORDS = (BUS_DELAY_TICKS_BITS + 31) / 32;   // 2
     localparam integer C_DELAY_TICKS = 20;                               // dense per-channel d (24 words: 20..43)
     localparam integer C_BUS_DELAY_TICKS = C_DELAY_TICKS + DELAY_TICKS_WORDS;  // 44: dense per-bus d (2 words: 44..45)
+    // --- per-channel CLK mask: bit b drives channel b's PIN from the FPGA clk
+    // (== host.image.CtrlWords.CLK_ENABLE).  CHANNEL_COUNT bits -> ceil/32 words.
+    localparam integer CLK_ENABLE_WORDS = (CHANNEL_COUNT + 31) / 32;            // 2
+    localparam integer C_CLK_ENABLE = C_BUS_DELAY_TICKS + BUS_DELAY_TICKS_WORDS; // 46: per-channel clk mask (2 words: 46..47)
 
     // engine outputs
     wire [CHANNEL_COUNT-1:0] out;
@@ -146,6 +150,12 @@ module zlc_pulse_streamer_top #(
     wire [BUS_DELAY_TICKS_WORDS*32-1:0] bus_delay_ticks_pack;
     wire [CHANNEL_COUNT*DELAY_TICK_WIDTH-1:0] delay_ticks_w;
     wire [BUS_COUNT*DELAY_TICK_WIDTH-1:0] bus_delay_ticks_w;
+
+    // --- per-channel CLK mask + muxed output: a channel wired to clk outputs the FPGA
+    // clk on its pin; otherwise it outputs the engine bit.  out_final feeds the pin map.
+    wire [CLK_ENABLE_WORDS*32-1:0] clk_enable_pack;
+    wire [CHANNEL_COUNT-1:0] clk_en;
+    wire [CHANNEL_COUNT-1:0] out_final;
 
     // --- JTAG-to-AXI master -> FULL AXI4 -> AXI BRAM controller ---------------
     // Full AXI4 (not Lite) so the host issues INCR burst writes (up to 256 words per
@@ -206,6 +216,21 @@ module zlc_pulse_streamer_top #(
     endgenerate
     assign delay_ticks_w = delay_ticks_pack[CHANNEL_COUNT*DELAY_TICK_WIDTH-1:0];
     assign bus_delay_ticks_w = bus_delay_ticks_pack[BUS_COUNT*DELAY_TICK_WIDTH-1:0];
+
+    // Assemble the per-channel clk mask from its CTRL words, then mux clk onto each pin.
+    genvar cw;
+    generate
+        for (cw = 0; cw < CLK_ENABLE_WORDS; cw = cw + 1) begin : zlc_clk_enable_pack_gen
+            assign clk_enable_pack[cw*32 +: 32] = ctrl_reg[C_CLK_ENABLE + cw];
+        end
+    endgenerate
+    assign clk_en = clk_enable_pack[CHANNEL_COUNT-1:0];
+    genvar cmx;
+    generate
+        for (cmx = 0; cmx < CHANNEL_COUNT; cmx = cmx + 1) begin : zlc_clk_mux_gen
+            assign out_final[cmx] = clk_en[cmx] ? clk : out[cmx];
+        end
+    endgenerate
 
     // loader/engine-driven write-backs (separate from AXI host writes)
     reg ldr_status_we;
@@ -497,36 +522,37 @@ module zlc_pulse_streamer_top #(
     // ---- LEDs + 62-pin board map (identical to the validated board XDC) -------
     assign led[0] = zlc_running;
     assign led[1] = |out;
-    assign cooling = out[0]; assign cooling_pgc = out[1]; assign repump = out[2]; assign probe = out[3];
-    assign pushout = out[4]; assign state_pre = out[5]; assign trig = out[6]; assign coil = out[7];
-    assign grey_cooling = out[8]; assign trap = out[9]; assign UV = out[10]; assign emCCD = out[11];
-    assign microwave = out[12]; assign address = out[13];
-    assign cooling_shutter = out[14]; assign repump_shutter = out[15]; assign probe_shutter = out[16];
-    assign bias = out[17];
+    // out_final = the clk-muxed engine output (a channel marked clk shows the FPGA clk).
+    assign cooling = out_final[0]; assign cooling_pgc = out_final[1]; assign repump = out_final[2]; assign probe = out_final[3];
+    assign pushout = out_final[4]; assign state_pre = out_final[5]; assign trig = out_final[6]; assign coil = out_final[7];
+    assign grey_cooling = out_final[8]; assign trap = out_final[9]; assign UV = out_final[10]; assign emCCD = out_final[11];
+    assign microwave = out_final[12]; assign address = out_final[13];
+    assign cooling_shutter = out_final[14]; assign repump_shutter = out_final[15]; assign probe_shutter = out_final[16];
+    assign bias = out_final[17];
     assign da_dipole[0] = zlc_bus_out[0]; assign da_dipole[1] = zlc_bus_out[1];
     assign da_dipole[2] = zlc_bus_out[2]; assign da_dipole[3] = zlc_bus_out[3];
     assign da_dipole[4] = zlc_bus_out[4]; assign da_dipole[5] = zlc_bus_out[5];
     assign da_dipole[6] = zlc_bus_out[6]; assign da_dipole[7] = zlc_bus_out[7];
     assign da_dipole[8] = zlc_bus_out[8]; assign da_dipole[9] = zlc_bus_out[9];
-    assign da_clk0 = out[28];
+    assign da_clk0 = out_final[28];
     assign da_bias_y[0] = zlc_bus_out[10]; assign da_bias_y[1] = zlc_bus_out[11];
     assign da_bias_y[2] = zlc_bus_out[12]; assign da_bias_y[3] = zlc_bus_out[13];
     assign da_bias_y[4] = zlc_bus_out[14]; assign da_bias_y[5] = zlc_bus_out[15];
     assign da_bias_y[6] = zlc_bus_out[16]; assign da_bias_y[7] = zlc_bus_out[17];
     assign da_bias_y[8] = zlc_bus_out[18]; assign da_bias_y[9] = zlc_bus_out[19];
-    assign da_clk1 = out[39];
+    assign da_clk1 = out_final[39];
     assign da_bias_x[0] = zlc_bus_out[20]; assign da_bias_x[1] = zlc_bus_out[21];
     assign da_bias_x[2] = zlc_bus_out[22]; assign da_bias_x[3] = zlc_bus_out[23];
     assign da_bias_x[4] = zlc_bus_out[24]; assign da_bias_x[5] = zlc_bus_out[25];
     assign da_bias_x[6] = zlc_bus_out[26]; assign da_bias_x[7] = zlc_bus_out[27];
     assign da_bias_x[8] = zlc_bus_out[28]; assign da_bias_x[9] = zlc_bus_out[29];
-    assign da_clk2 = out[50];
+    assign da_clk2 = out_final[50];
     assign da_bias_z[0] = zlc_bus_out[30]; assign da_bias_z[1] = zlc_bus_out[31];
     assign da_bias_z[2] = zlc_bus_out[32]; assign da_bias_z[3] = zlc_bus_out[33];
     assign da_bias_z[4] = zlc_bus_out[34]; assign da_bias_z[5] = zlc_bus_out[35];
     assign da_bias_z[6] = zlc_bus_out[36]; assign da_bias_z[7] = zlc_bus_out[37];
     assign da_bias_z[8] = zlc_bus_out[38]; assign da_bias_z[9] = zlc_bus_out[39];
-    assign da_clk3 = out[61];
+    assign da_clk3 = out_final[61];
     assign GND1 = 1'b0; assign GND4 = 1'b0; assign GND5 = 1'b0; assign GND6 = 1'b0;
     assign GND7 = 1'b0; assign GND8 = 1'b0; assign GND9 = 1'b0; assign GND10 = 1'b0;
     assign GND11 = 1'b0; assign GND12 = 1'b0; assign GND13 = 1'b0; assign GND14 = 1'b0;

@@ -281,6 +281,14 @@ delay line (硬件, 真相): [.....0.....][原信号右移 d.....]   <- fire 前
 
 \textbf{成本小结。} TTL 用\tfocus{一条} \pyapi{CHANNEL_COUNT} 位宽的环、每条 DAC 总线用一条 10 位宽的环；这些环都是\tfocus{分布式 RAM（LUTRAM / distributed）}，\tfocus{不占额外 BRAM}（\pyapi{ram_style="distributed"}）。延时 tick 数走稠密的 CTRL 字（\pyapi{delay_ticks} / \pyapi{bus_delay_ticks}）下发，\tfocus{没有}延时上传映像、\tfocus{没有}迷你装载器。在 35T（\pyapi{xc7a35t}）上整套延时落地后仍有余量：LUT 约 59\%、BRAM 39/50、DSP 约 58\%。
 
+\section{逐通道 clk 输出（把某通道直接接到时钟）}
+有时需要某个 TTL 引脚直接输出 FPGA 的 \pyapi{clk}（例如给外部 DAC 喂时钟），而引擎按 tick 寄存的输出本身\tfocus{产生不出}一个时钟方波。为此顶层在引脚映射上加了一层\tfocus{运行时可选的 clk 复用}：一个 \pyapi{CHANNEL_COUNT} 位的 \pyapi{clk\_enable} 掩码（CTRL 字 \pyapi{C_CLK_ENABLE}，紧接 \pyapi{BUS_DELAY_TICKS} 之后，62 位占 2 个字）随程序映像下发，顶层据此把每个引脚选成
+\begin{codeblock}[逐通道 clk 复用（zlc\_pulse\_streamer\_top.v）]
+assign out_final[n] = clk_en[n] ? clk : out[n];   // n: 0..CHANNEL_COUNT-1
+// 引脚映射改为驱动 out_final（不是 out）：assign trig = out_final[6]; assign da_clk0 = out_final[28]; ...
+\end{codeblock}
+所以被标记为 clk 的通道，其引脚\tfocus{恒等于 clk}，与引擎完全无关。配套地，主机编译时把该通道的 mask 位\tfocus{强制清 0}（\pyapi{masks[i] &= ~clk_enable}），引擎\tfocus{绝不驱动}它、也就\tfocus{不会覆盖}clk 行为；\pyapi{clk\_enable} 掩码由 \pyapi{PulseTableState.clk\_channels} 经 \pyapi{clk\_enable\_mask()} 算出，随 \pyapi{RuntimeSequenceProgram.clk\_enable} 打包进 CTRL 字（\pyapi{host.image.CtrlWords.CLK_ENABLE}）。换哪条通道做 clk\tfocus{只是改这份运行时掩码、不需要重新综合}；但首次引入这套 mux 需要重新构建一次 bitstream。DAC 总线成员位不允许设成 clk（会破坏 DAC，GUI 已禁用）。这套 mux 是纯组合逻辑、几乎不占资源。
+
 \section{两件没有下放进 sequencer 的事}
 两条边界澄清，免得把架构搞混：
 \begin{itemize}

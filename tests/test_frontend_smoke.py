@@ -2133,3 +2133,30 @@ def test_dac_value_field_and_dot_stay_inside_card(monkeypatch):
     # both the value field and the dot end at or before the card's right edge
     assert value_edit.mapTo(card, value_edit.rect().topRight()).x() <= card_right
     assert dot.mapTo(card, dot.rect().topRight()).x() <= card_right
+
+
+def test_clk_button_marks_channel_disables_delay_and_hides_from_preview(monkeypatch):
+    """The per-channel 'clk' toggle: pressing it wires the channel to the FPGA clk -> it
+    enters state.clk_channels, its delay/unit fields grey out, and it drops from the
+    preview (it is no longer engine-driven).  Pressing again restores it."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    ed = dt.demo_editor(size=(1500, 920))
+    dt.settle(ed, 200)
+    ch = "ch00"
+    assert ch in ed.channel_panel.clk_buttons
+    assert ed.channel_panel.delay_edits[ch].isEnabled()
+    ed.channel_panel.clk_buttons[ch].click()
+    dt.settle(ed, 150)
+    assert ed.state.clk_channels == [ch]
+    assert not ed.channel_panel.delay_edits[ch].isEnabled()      # delay greyed out
+    assert not ed.channel_panel.delay_units[ch].isEnabled()
+    _plotter, channels, _repeat = ed._create_preview_plot(ed.read_state(), include_always_off=True)
+    assert ch not in channels                                    # excluded from preview
+    ed.channel_panel.clk_buttons[ch].click()                     # toggle off
+    dt.settle(ed, 150)
+    assert ed.state.clk_channels == []
+    assert ed.channel_panel.delay_edits[ch].isEnabled()

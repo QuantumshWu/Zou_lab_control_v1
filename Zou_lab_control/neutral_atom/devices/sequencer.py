@@ -159,6 +159,10 @@ class RuntimeSequenceProgram:
     # Any d in [0, delay_depth]; never disturbs another channel; first frame real.  The global
     # negative-delay shift G is folded in so every entry is >= 0.  Empty/None = no channel delayed.
     channel_delays: list[int] | None = None
+    # Bitmask (bit b = channel b) of channels wired directly to the FPGA clk.  These bits
+    # are forced 0 in every edge mask (the engine does not drive them); the top muxes clk
+    # onto their pins via this mask.  0 = no clk channels.
+    clk_enable: int = 0
 
     def to_dict(self) -> dict[str, object]:
         payload = {
@@ -188,6 +192,7 @@ class RuntimeSequenceProgram:
             "bus_segments": [segment.to_dict() for segment in (self.bus_segments or [])],
             "bus_delays": [bd.to_dict() for bd in (self.bus_delays or [])],
             "channel_delays": list(self.channel_delays or []),
+            "clk_enable": int(self.clk_enable),
         }
         if self.source_sequence is not None:
             payload["source_sequence"] = self.source_sequence
@@ -230,6 +235,7 @@ class RuntimeSequenceProgram:
             bus_segments=[RuntimeBusSegment.from_dict(item) for item in payload.get("bus_segments", [])] or None,
             bus_delays=[RuntimeBusDelay.from_dict(item) for item in payload.get("bus_delays", [])] or None,
             channel_delays=[int(v) for v in payload.get("channel_delays", [])] or None,
+            clk_enable=int(payload.get("clk_enable", 0)),
         )
 
     @property
@@ -371,6 +377,11 @@ def compile_pulse_table_runtime_program(
         loop_count = repeat_count
         repeat_from_index = 0   # a finite bracket replays the whole program on repeat
 
+    # Channels wired to clk are driven by the top's clk mux, NOT the engine: force their
+    # bits to 0 in every edge mask so the engine never fights the clk routing.
+    clk_enable = state.clk_enable_mask()
+    if clk_enable:
+        masks = [int(mask) & ~clk_enable for mask in masks]
     effective_duration_ticks = _pulse_table_effective_duration_ticks(state, slots=slot_values, time_step_ns=clock_step_ns)
     if has_delays and not has_bracket:
         effective_duration_ticks = int(loop_end)
@@ -389,6 +400,7 @@ def compile_pulse_table_runtime_program(
         "bus_segments": [segment.to_dict() for segment in bus_segments],
         "bus_delays": [bd.to_dict() for bd in bus_delays],
         "channel_delays": [int(channel_delays.get(bit, 0)) for bit in range(len(channels))],
+        "clk_enable": int(clk_enable),
     }
     channel_delays_list = [int(channel_delays.get(bit, 0)) for bit in range(len(channels))] if channel_delays else None
     sequence_id = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
@@ -412,6 +424,7 @@ def compile_pulse_table_runtime_program(
         bus_segments=bus_segments or None,
         bus_delays=bus_delays or None,
         channel_delays=channel_delays_list,
+        clk_enable=int(clk_enable),
     )
 
 
@@ -576,6 +589,10 @@ def compile_pulse_table_scan_runtime_program(
     )
     ticks = [row[0] for row in rows]
     masks = [row[1] for row in rows]
+    # Channels wired to clk are driven by the top's clk mux, not the engine -> 0 in masks.
+    clk_enable = state.clk_enable_mask()
+    if clk_enable:
+        masks = [int(mask) & ~clk_enable for mask in masks]
     tick_slot_coeffs = [list(row[2]) for row in rows]
     loop_start_index, loop_end_tick, loop_end_slot_coeffs, loop_count = _pulse_table_affine_loop_metadata(
         state,
@@ -612,6 +629,7 @@ def compile_pulse_table_scan_runtime_program(
         "bus_segments": [segment.to_dict() for segment in bus_segments],
         "bus_delays": [bd.to_dict() for bd in bus_delays],
         "channel_delays": [int(channel_delays.get(bit, 0)) for bit in range(len(channels))],
+        "clk_enable": int(clk_enable),
     }
     channel_delays_list = [int(channel_delays.get(bit, 0)) for bit in range(len(channels))] if channel_delays else None
     sequence_id = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
@@ -641,6 +659,7 @@ def compile_pulse_table_scan_runtime_program(
         bus_segments=bus_segments or None,
         bus_delays=bus_delays or None,
         channel_delays=channel_delays_list,
+        clk_enable=int(clk_enable),
     )
 
 

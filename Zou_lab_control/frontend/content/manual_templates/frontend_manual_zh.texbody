@@ -301,6 +301,8 @@ Channel Names 面板是 Edit 页\tfocus{最左边}的一张白色、带标题的
 \item[单位下拉框（ns / us）] 作用：选择该行延迟数值的\tfocus{时间单位}。延迟的可选单位\tfocus{只有 \pyapi{ns} 和 \pyapi{us} 两个}——延迟被延时线深度限制在约 $\pm40\,\mu$s 以内，\pyapi{ms}/\pyapi{s} 一定超界，而 \pyapi{str (ns)}（仿射表达式单位）对一个固定、不可扫描的延迟也没有意义，所以这里不再提供。点击后会发生什么：下拉展开，选中某个单位后，左边输入框里的数字就按这个单位解释（例如填 \pyapi{1} 配 \pyapi{us} 等于 1 微秒）。常见的坑：单位选错会让延迟差出 1000 倍（把 \pyapi{us} 当成 \pyapi{ns}）；另外最终值仍会被时钟节拍量化，所以填一个比节拍还小的组合可能被对齐成 \pyapi{0}。实用提示：日常多用 \pyapi{ns}，较长的固定延迟用 \pyapi{us}。
 
 \item[X 按钮（隐藏通道）] 作用：把该通道从表里\tfocus{隐藏}，让界面更清爽。点击后会发生什么：这一行从 Delay / Scan 表里消失，该通道被移到\tfocus{隐藏列表}中。它去哪了：底部的 \pyapi{Channels}（通道）卡片会记录被隐藏的通道，你可以从那里把它\tfocus{重新调出来}。常见的坑：以为 X 是“删除/禁用通道”——它只是\tfocus{视觉上隐藏}，不会改动该通道的脉冲内容；找不回来时别新建，去底部 Channels 卡找。实用提示：把当前实验用不到的通道隐藏起来，可以让一长串通道里真正关心的几行更醒目、对齐更易读。
+
+\item[clk 按钮（把通道接到 FPGA 时钟）] 作用：把\tfocus{这一条通道的输出引脚直接接到 FPGA 的 clk}（相当于 verilog 里 \pyapi{assign 这个引脚 = clk}），用来给外部设备（比如 DAC）提供时钟。点击后会发生什么：该通道被标记为 clk 通道——它\tfocus{从脉冲引擎里移除}（不再由边沿表驱动，所以引擎\tfocus{绝不会覆盖}它的 clk 行为），它这一行的\tfocus{延迟框和单位框都变灰禁止编辑}（对一条 clk 通道没有意义），并且\tfocus{从 Preview 里隐去}（它输出的是时钟方波，不是脉冲）。再点一次恢复成普通的引擎驱动通道。实现上，编译时把该通道的 mask 位强制清 0，并把一个 62 位的 \pyapi{clk_enable} 掩码随程序下发；FPGA 顶层用 \pyapi{out_final[n] = clk_en[n] ? clk : out[n]} 把 clk 接到该引脚（运行时由 CTRL 寄存器选择，换 clk 通道\tfocus{不需要重新综合}，但首次启用这套 mux 需要一次重新构建 bitstream）。常见的坑：DAC 总线（da\_dipole 等）的成员位\tfocus{不能}单独设成 clk（会破坏 DAC），所以这些行的 clk 按钮是禁用的。实用提示：要给外部 DAC 喂时钟，就把对应那条通道（如某个 da\_clk 线）设成 clk，不用再在脉冲里手动翻转它。
 \end{description}
 
 \subsection{扫描圆点（scan dot）——把字段变成扫描变量}

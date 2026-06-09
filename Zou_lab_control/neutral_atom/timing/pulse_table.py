@@ -208,6 +208,7 @@ class PulseTableState:
         channel_labels: Mapping[str, str] | None = None,
         analog_buses: Mapping[str, Sequence[str]] | None = None,
         analog_bus_modes: Mapping[str, Sequence[Mapping[str, object] | str | None]] | None = None,
+        clk_channels: Sequence[str] | None = None,
     ):
         self.channels = list(channel_names(channels, "channels"))
         self.name = str(name) if name is not None else default_pulse_name()
@@ -228,6 +229,10 @@ class PulseTableState:
             for name, members in dict(analog_buses or {}).items()
         }
         self.analog_bus_modes = self._normalize_analog_bus_modes(analog_bus_modes)
+        # Channels wired directly to the FPGA clk (output = clk).  They are EXCLUDED from
+        # the pulse engine (their edge-table bit is forced 0) so the engine never fights
+        # the clk routing; the top muxes clk onto their pin via a runtime clk-enable mask.
+        self.clk_channels = [c for c in (str(x) for x in (clk_channels or [])) if c in self.channels]
         self.validate()
 
     # -- scan slot helpers -------------------------------------------------
@@ -392,6 +397,20 @@ class PulseTableState:
 
     def load_scan_table(self, path: str | Path) -> "PulseTableState":
         return self.set_scan_table(load_scan_table(path))
+
+    def clk_enable_mask(self) -> int:
+        """Bitmask (bit n = channel ``self.channels[n]``) of channels wired to the FPGA
+        clk.  The compiler forces these bits to 0 in the edge table and ships this mask so
+        the top muxes clk onto their pins (out_final[n] = clk_en[n] ? clk : engine_out[n])."""
+
+        mask = 0
+        for channel in self.clk_channels:
+            if channel in self.channels:
+                mask |= 1 << self.channel_index(channel)
+        return mask
+
+    def is_clk_channel(self, channel: str) -> bool:
+        return str(channel) in set(self.clk_channels)
 
     def scan_slot_dac_maxes(self) -> list[int | None]:
         """Per-slot maximum DAC code (``2**width - 1``) for ``dac`` slots, ``None``
@@ -1061,6 +1080,7 @@ class PulseTableState:
             "repeat_end": self.repeat_end,
             "repeat_count": self.repeat_count,
             "repeat_forever": self.repeat_forever,
+            "clk_channels": list(self.clk_channels),
         }
 
     def snapped(self, *, time_step_ns: float | None = None) -> "PulseTableState":
@@ -1119,6 +1139,7 @@ class PulseTableState:
             repeat_end=payload.get("repeat_end"),
             repeat_count=int(payload.get("repeat_count", 1)),
             repeat_forever=bool(payload.get("repeat_forever", True)),
+            clk_channels=payload.get("clk_channels"),
         )
 
     def save(self, path: str | Path) -> Path:

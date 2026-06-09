@@ -84,6 +84,11 @@ class CtrlWords:
     # PER-BUS DAC DELAY -- the same LITERAL delay line, one delay shared by all 10 bits of a bus:
     # bus b is delayed by ``bus_delay_ticks[b]`` ticks (0 = passthrough), dense per-bus.
     BUS_DELAY_TICKS = 44  # dense per-bus delay (delay_tick_width bits each) -> ceil(4*12/32)=2 words (44..45)
+    # PER-CHANNEL CLK MASK -- channels wired directly to the FPGA clk (output = clk).  One
+    # bit per channel; the top muxes clk onto those pins (out_final[n]=clk_en[n]?clk:out[n])
+    # and the engine's bit for them is forced 0 so it never fights the clk.  ceil(62/32)=2
+    # words (46..47); locked to zlc_pulse_streamer_top.v by test_final_top_regions_match_image.
+    CLK_ENABLE = 46
 
 
 CTRL_WORDS = 64
@@ -401,6 +406,12 @@ def pack_program(program, params: StreamerParams | None = None) -> dict[int, int
         bus_delay_word |= (d & ((1 << dtw) - 1)) << (b * dtw)
     for i in range(p.bus_delay_ticks_words):
         w[CtrlWords.BUS_DELAY_TICKS + i] = (bus_delay_word >> (32 * i)) & 0xFFFFFFFF
+
+    # PER-CHANNEL CLK MASK -- 1 bit per channel (bit b = channel b's pin driven by clk).
+    # The compiler already forced these bits to 0 in the edge masks; the top muxes clk on.
+    clk_enable = int(getattr(program, "clk_enable", 0))
+    for i in range((p.channel_count + 31) // 32):
+        w[CtrlWords.CLK_ENABLE + i] = (clk_enable >> (32 * i)) & 0xFFFFFFFF
     return w
 
 
@@ -468,9 +479,14 @@ def unpack_program(words: Mapping[int, int], params: StreamerParams | None = Non
     bus_delays = [{"bus_index": b, "delay": (bus_delay_word >> (b * dtw)) & ((1 << dtw) - 1)}
                   for b in range(p.bus_count)
                   if ((bus_delay_word >> (b * dtw)) & ((1 << dtw) - 1)) != 0]
+    clk_enable = 0
+    for i in range((p.channel_count + 31) // 32):
+        clk_enable |= (g(CtrlWords.CLK_ENABLE + i) & 0xFFFFFFFF) << (32 * i)
+    clk_enable &= (1 << p.channel_count) - 1
     return {
         "ticks": ticks, "masks": masks, "tick_slot_coeffs": coeffs,
         "channel_delays": channel_delays,
+        "clk_enable": clk_enable,
         "scan_points_resident": scan_points, "scan_count": n_points, "slot_count": slot_count,
         "repeat_forever": bool(g(CtrlWords.REPEAT_FOREVER) & 1),
         # LOOP_START is the additive-delay steady-frame anchor when the flag is set,

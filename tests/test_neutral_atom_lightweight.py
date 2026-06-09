@@ -531,10 +531,11 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     # final top: 62-pin board map + the FINAL engine instance + forced-latency build.
     assert "module zlc_pulse_streamer_top" in top
     assert "parameter integer CHANNEL_COUNT = 62" in top
-    assert "assign trig = out[6];" in top
-    assert "assign trap = out[9];" in top
-    assert "assign probe = out[3];" in top
-    assert "assign cooling = out[0];" in top
+    # The pin map drives out_final (the clk-muxed engine output: out_final[n] = clk_en[n] ? clk : out[n]).
+    assert "assign trig = out_final[6];" in top
+    assert "assign trap = out_final[9];" in top
+    assert "assign probe = out_final[3];" in top
+    assert "assign cooling = out_final[0];" in top
     assert "zlc_edge_streamer" in top                      # instantiates the final engine
     assert "module zlc_edge_streamer" in engine
     # SHORT project name "ps" (-> ps.runs) keeps Vivado's deep run/.Xil temp path
@@ -1191,6 +1192,52 @@ def test_dac_ramp_spans_current_period_with_hold_carry_and_edge_step():
     # period 3 (edge 0) steps back to 0 (settled within the period; the boundary tick is a
     # 1-tick registered transition)
     assert wave[160] == 0 and wave[199] == 0
+
+
+def test_clk_channel_excluded_from_engine_and_carried_as_mask(tmp_path):
+    """A channel marked clk is wired to the FPGA clk by the top: it is removed from the
+    edge masks, ships as a clk_enable bitmask, survives save/load, and round-trips through
+    the program image (pack/unpack)."""
+
+    channels = [f"ch{i:02d}" for i in range(62)]
+    state = na.PulseTableState(
+        channels=channels,
+        visible_channels=channels[:8],
+        periods=[na.PulsePeriod(1000, tuple(1 if c in (0, 6, 9) else 0 for c in range(62)), unit="ns")],
+        time_step_ns=20.0,
+        clk_channels=["ch06"],
+    )
+    # save/load preserves the clk channel
+    loaded = na.PulseTableState.load(state.save(tmp_path / "clk.json"))
+    assert loaded.clk_channels == ["ch06"]
+    assert loaded.clk_enable_mask() == (1 << 6)
+
+    program = state.compile(clock_hz=50_000_000)
+    assert program.clk_enable == (1 << 6)
+    # bit 6 (the clk channel) is forced out of every edge mask; bit 9 (a normal on) stays.
+    assert all(not (mask & (1 << 6)) for mask in program.masks)
+    assert any(mask & (1 << 9) for mask in program.masks)
+
+    from fpga.pulse_streamer.host.image import pack_program, unpack_program, StreamerParams
+    params = StreamerParams()
+    rebuilt = unpack_program(pack_program(program, params), params)
+    assert rebuilt["clk_enable"] == (1 << 6)
+
+
+def test_top_has_per_channel_clk_mux():
+    """The board top muxes clk onto a channel's pin via a runtime CTRL clk-enable mask
+    (out_final[n] = clk_en[n] ? clk : out[n]); the pin map drives out_final, and the CTRL
+    word offset matches host.image.CtrlWords.CLK_ENABLE.  (No Verilog sim -> structure check.)"""
+
+    root = Path(__file__).resolve().parents[1]
+    top = (root / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
+    assert "C_CLK_ENABLE" in top
+    assert "out_final[cmx] = clk_en[cmx] ? clk : out[cmx]" in top
+    assert "assign cooling = out_final[0]" in top      # the pin map is driven by the muxed output
+    assert "assign da_clk0 = out_final[28]" in top
+    # the CTRL offset lines up with the host image layout
+    from fpga.pulse_streamer.host.image import CtrlWords
+    assert CtrlWords.CLK_ENABLE == 46
 
 
 def test_analog_ramp_can_scan_both_value_endpoints_round_trip():
