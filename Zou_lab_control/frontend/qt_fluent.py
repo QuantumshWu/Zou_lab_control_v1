@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import math
+import os
 import re
 import sys
 
@@ -51,39 +52,8 @@ STEP_WIDTH = 6
 
 _QT_APP = None
 _FLUENT_SCALE = 1.0
-_FLOAT_OR_X_RE = re.compile(
-    r"""
-    ^\s*
-    (?:
-        [0-9xyXYeE+\-*/().\s]+
-    )
-    \s*$
-    """,
-    re.VERBOSE,
-)
+# Matches one float token; used by align_to_resolution to snap numbers inside a value.
 _FLOAT_TOKEN_RE = re.compile(r"(?<![A-Za-z_])[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?")
-_VARIABLE_TOKEN_RE = re.compile(r"\b[xXyY]\b")
-_UNSAFE_TIME_EXPR_RE = re.compile(r"[^0-9xyXYeE+\-*/().\s]")
-_OLD_FLOAT_OR_X_RE = re.compile(
-    r"""
-    ^\s*
-    (?:
-        [+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?
-        |
-        [+-]?x
-        |
-        [+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\s*[-+*/]\s*x
-        |
-        [+-]?x\s*[-+*/]\s*(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?
-        |
-        [+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\s*[-+]\s*x
-        |
-        [+-]?x\s*[-+]\s*(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?
-    )
-    \s*$
-    """,
-    re.VERBOSE,
-)
 
 
 def fluent_scale() -> float:
@@ -135,6 +105,8 @@ def ensure_qt_app() -> QtWidgets.QApplication:
         QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
     if hasattr(QtCore.Qt, "AA_UseHighDpiPixmaps"):
         QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
+    # Silence the harmless Windows "Unable to open default EUDC font" Qt warning.
+    os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.fonts=false")
     _QT_APP = QtWidgets.QApplication(sys.argv)
     _QT_APP.setFont(QtGui.QFont(FONT, fluent_font_size()))
     return _QT_APP
@@ -277,7 +249,7 @@ def align_to_resolution(value: str | float, resolution: float, *, allow_any: boo
             snapped = float(resolution)
         return format_compact_number(snapped)
 
-    if _VARIABLE_TOKEN_RE.search(text) or any(char in text for char in "[](),"):
+    if any(char in text for char in "[](),"):
         return _FLOAT_TOKEN_RE.sub(snap_number, text)
     return snap_number(re.match(r".+", text))
 
@@ -472,14 +444,6 @@ class FluentLineEdit(QtWidgets.QLineEdit):
 
 class FloatLineEdit(FluentLineEdit):
     pass
-
-
-class FloatOrXLineEdit(FluentLineEdit):
-    def has_acceptable_text(self) -> bool:
-        text = self.text() or ""
-        if not _FLOAT_OR_X_RE.fullmatch(text) or _UNSAFE_TIME_EXPR_RE.search(text):
-            return False
-        return bool(text.strip())
 
 
 class FluentComboBox(QtWidgets.QComboBox):
@@ -957,6 +921,9 @@ class FluentCheckBox(QtWidgets.QCheckBox):
             QCheckBox::indicator:hover {{
                 border: 1px solid {HOVER};
             }}
+            QCheckBox:disabled {{ color: {PLACEHOLDER}; }}
+            QCheckBox::indicator:disabled {{ border: 1px solid {BG}; background: {BG}; }}
+            QCheckBox::indicator:checked:disabled {{ background: {PLACEHOLDER}; border: 1px solid {PLACEHOLDER}; }}
             """
         )
 
@@ -1422,7 +1389,6 @@ __all__ = [
     "FluentSwitch",
     "FluentTabWidget",
     "FloatLineEdit",
-    "FloatOrXLineEdit",
     "FluentScrollArea",
     "FluentStatusDot",
     "FluentWindow",

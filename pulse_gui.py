@@ -192,7 +192,9 @@ def _connect_remote_or_offline(args, state, na, *, explicit_remote: bool):
             "opened offline editor. Start fpga\\run_server.bat for hardware control, "
             "or pass --remote-host for a required remote connection."
         )
-        print(f"ZLC pulse GUI: {notice}\n{type(exc).__name__}: {exc}")
+        # No server listening is the normal offline case -- print a clean one-liner, not
+        # the raw ConnectionRefusedError traceback (it reads as a scary error otherwise).
+        print(f"ZLC pulse GUI: {notice}")
         return None, seed_channels, seed_trigger_channels, notice
     return sequencer, list(sequencer.channels), list(sequencer.trigger_channels), None
 
@@ -201,6 +203,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     argv_list = list(sys.argv[1:] if argv is None else argv)
     args = _build_parser().parse_args(argv_list)
     explicit_remote = _remote_host_was_requested(argv_list)
+
+    # Silence the harmless Windows Qt font noise ("Unable to open default EUDC font:
+    # EUDC.TTE") -- it is just Qt probing the end-user-defined-characters font.
+    os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.fonts=false")
 
     from PyQt5 import QtCore, QtWidgets
 

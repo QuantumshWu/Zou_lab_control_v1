@@ -6,12 +6,9 @@ if not defined ZLC_PULSE_GUI_INNER (
     call "%~f0" %*
     set "ZLC_STATUS=!ERRORLEVEL!"
     if "!ZLC_STATUS!"=="0" (
-        if "%~1"=="--help" exit /b 0
-        if "%~1"=="/?" exit /b 0
-        echo.
-        echo ZLC pulse GUI closed normally.
-        echo You can close this window, or press any key to exit.
-        if "%ZLC_NO_PAUSE%"=="" pause
+        rem GUI closed normally -> close this console window automatically (no pause).
+        rem Only keep the window open on FAILURE so the error messages stay readable.
+        exit /b 0
     ) else (
         echo.
         echo ZLC pulse GUI failed with code !ZLC_STATUS!.

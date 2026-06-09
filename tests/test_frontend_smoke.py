@@ -2160,3 +2160,68 @@ def test_clk_button_marks_channel_disables_delay_and_hides_from_preview(monkeypa
     dt.settle(ed, 150)
     assert ed.state.clk_channels == []
     assert ed.channel_panel.delay_edits[ch].isEnabled()
+
+
+def test_duration_unit_dropdown_excludes_str_ns_until_scanned(monkeypatch):
+    """#4 residue: a normal duration's unit dropdown is ns/us/ms/s only; the internal
+    'str (ns)' expression unit appears only for a scan-bound duration (auto, disabled)."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    ed = dt.demo_editor(size=(1480, 900))   # binds period-4 duration to s0
+    dt.settle(ed, 150)
+    cards = ed.drag_container.pulse_cards()
+    unbound = cards[0].unit_combo
+    assert [unbound.itemText(i) for i in range(unbound.count())] == ["ns", "us", "ms", "s"]
+    bound = cards[3].unit_combo                      # period 4 is bound to s0
+    assert bound.currentText() == "str (ns)" and not bound.isEnabled()
+
+
+def test_clk_channel_disables_period_checkboxes(monkeypatch):
+    """#2: marking a channel as clk locks (disables) its checkbox in every period card."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    ed = dt.demo_editor(size=(1480, 900))
+    dt.settle(ed, 120)
+    ed._toggle_clk_channel("ch01")
+    dt.settle(ed, 150)
+    assert "ch01" in ed.state.clk_channels
+    for card in ed.drag_container.pulse_cards():
+        if "ch01" in card.checks:
+            assert not card.checks["ch01"].isEnabled()
+
+
+def test_floatorx_lineedit_residue_removed():
+    """#4 residue: the dead x/y FloatOrXLineEdit (and its regexes) are gone."""
+
+    from Zou_lab_control.frontend import qt_fluent as qf
+
+    assert not hasattr(qf, "FloatOrXLineEdit")
+    assert not hasattr(qf, "_FLOAT_OR_X_RE")
+    assert not hasattr(qf, "_OLD_FLOAT_OR_X_RE")
+    assert not hasattr(qf, "_VARIABLE_TOKEN_RE")
+
+
+def test_bus_mode_combo_fits_ramp(monkeypatch):
+    """#3: the Edge/Ramp/Hold combo is wide enough to show 'Ramp' without eliding."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5 import QtGui
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.qt_fluent import COMBO_WIDTH, EDIT_PADDING_H, scaled_px
+
+    ed = dt.demo_editor(size=(1480, 900))
+    dt.settle(ed, 120)
+    combo = next(iter(ed.drag_container.pulse_cards()[0].bus_mode_combos.values()))
+    metrics = QtGui.QFontMetrics(QtGui.QFont(combo.font()))
+    ramp_w = metrics.horizontalAdvance("Ramp")
+    # paintEvent reserves drop arrow + insets (~drop + 2*pad + 2); the combo must leave at
+    # least the "Ramp" text width after that reserve.
+    reserve = scaled_px(COMBO_WIDTH) + scaled_px(EDIT_PADDING_H) * 2 + scaled_px(2)
+    assert combo.width() - reserve >= ramp_w

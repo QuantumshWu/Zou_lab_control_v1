@@ -81,6 +81,10 @@ except Exception:  # pragma: no cover - depends on the local desktop environment
 
 
 TIME_UNITS = ["ns", "us", "ms", "s", "str (ns)"]
+# User-selectable duration units.  "str (ns)" is the internal unit for a SCAN-BOUND
+# duration ("s0" expression); it is set automatically when you bind via the scan dot and
+# is NOT offered in the dropdown for a normal (unbound) duration.
+DURATION_UNITS = ["ns", "us", "ms", "s"]
 # A per-channel delay is bounded to the delay-line depth (~+/-40 us), so only ns / us
 # make sense as units -- ms / s would always exceed the cap, and "str (ns)" (the affine
 # expression unit) is meaningless for a fixed, non-scannable delay.
@@ -92,7 +96,7 @@ TIME_UNIT_WIDTH = 60
 HIDE_BUTTON_WIDTH = 26
 PANEL_TOP_HEIGHT = 152
 CHANNEL_ROW_SPACING = 4
-PERIOD_CARD_WIDTH = 150
+PERIOD_CARD_WIDTH = 158
 DEFAULT_WINDOW_RATIO = 0.90
 DEFAULT_HARDWARE_CLOCK_HZ = 50_000_000.0
 DEFAULT_TIME_STEP_NS = 1_000_000_000.0 / DEFAULT_HARDWARE_CLOCK_HZ
@@ -298,11 +302,25 @@ def _bus_mode_combo_width() -> int:
     """Width that *just* fits the widest mode word ("Ramp") plus the dropdown arrow.
 
     Matches the non-text budget FluentComboBox.paintEvent reserves (drop arrow +
-    insets = ~26 px), measured at the current font so it stays correct under both
-    the real Segoe UI and the wider offscreen substitute font used for screenshots.
-    A real gap (the row spacing) then separates it from the value field."""
+    insets ~26 px) PLUS a few px of slack so "Ramp" never elides on the rounding edge,
+    measured at the current font so it stays correct under both the real Segoe UI and
+    the wider offscreen substitute font used for screenshots.  A real gap (the row
+    spacing) then separates it from the value field."""
 
-    return measure_text_width(["Edge", "Ramp", "Hold"], padding=26)
+    return measure_text_width(["Edge", "Ramp", "Hold"], padding=34)
+
+
+def _set_duration_unit_combo(combo, *, scanned: bool, unit: str) -> None:
+    """Populate a period-duration unit combo.  Normal duration: ns/us/ms/s.  A scan-bound
+    duration: the internal "str (ns)" expression unit (added + selected automatically, and
+    the combo is disabled), so "str (ns)" is never a user-pickable option for a plain
+    duration.  Call inside a signals-blocked block when reused on a live combo."""
+
+    items = list(DURATION_UNITS) + (["str (ns)"] if scanned else [])
+    if [combo.itemText(i) for i in range(combo.count())] != items:
+        combo.clear()
+        combo.addItems(items)
+    combo.setCurrentText("str (ns)" if scanned else (unit if unit in DURATION_UNITS else "ns"))
 
 
 def _normalize_bus_value_text(text: str, *, max_value: int) -> str:
@@ -670,8 +688,7 @@ class PeriodCard(FluentGroupBox):
         top_layout.addWidget(_set_fixed_height(self.duration_edit))
 
         self.unit_combo = FluentComboBox()
-        self.unit_combo.addItems(TIME_UNITS)
-        self.unit_combo.setCurrentText("str (ns)" if scanned else period.unit)
+        _set_duration_unit_combo(self.unit_combo, scanned=scanned, unit=period.unit)
         self.unit_combo.setToolTip("Duration unit")
         self.unit_combo.setFixedWidth(control_width)
         top_layout.addWidget(_set_fixed_height(self.unit_combo))
@@ -767,6 +784,11 @@ class PeriodCard(FluentGroupBox):
             checkbox.setToolTip(f"{channel} / {full_label}" if full_label != channel else channel)
             checkbox.setFixedHeight(row_height)
             checkbox.toggled.connect(self.changed)
+            # A clk-driven channel's pin is the FPGA clock, so the engine never drives it:
+            # lock + grey its per-period checkbox (like the delay field in the Delay panel).
+            if full_state is not None and full_state.is_clk_channel(channel):
+                checkbox.setEnabled(False)
+                checkbox.setToolTip(f"{channel}: wired to the FPGA clk (not engine-driven)")
             self.checks[channel] = checkbox
             self.check_full_labels[channel] = full_label
             layout.addWidget(checkbox)
@@ -784,7 +806,7 @@ class PeriodCard(FluentGroupBox):
     def _handle_duration_text(self, text: str) -> None:
         if _is_slot_expr(text):
             was_blocked = self.unit_combo.blockSignals(True)
-            self.unit_combo.setCurrentText("str (ns)")
+            _set_duration_unit_combo(self.unit_combo, scanned=True, unit="str (ns)")
             self.unit_combo.blockSignals(was_blocked)
             self.unit_combo.setEnabled(False)
         else:
@@ -2149,7 +2171,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 with _signals_blocked(edit, combo):
                     edit.set_scan_bound(False)
                     edit.setText(_period_duration_text(period))
-                    combo.setCurrentText("str (ns)" if scanned else period.unit)
+                    _set_duration_unit_combo(combo, scanned=scanned, unit=period.unit)
                     combo.setEnabled(not scanned)
                     if scanned:
                         idx = _slot_index_of_expr(period.duration)
