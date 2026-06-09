@@ -87,7 +87,7 @@ echo   fpga\build_and_program.bat --diagnose   List Vivado hw targets/devices
 echo.
 echo Real build XDC:
 echo   fpga\board_config\board.xdc
-echo   This is the default 62-output board pin map (see fpga\board_config\README.md).
+echo   This is the default 62-output board pin map ^(see fpga\board_config\README.md^).
 echo   For a different board, replace board.xdc or set:
 echo   set ZLC_PS_XDC=C:\path\to\board.xdc
 echo.
@@ -146,7 +146,7 @@ findstr /C:"zlc_safe_project_dir" "%STREAMER_DIR%\create_project.tcl" >nul || (
 )
 if not exist "!ZLC_SELECTED_XDC!" (
   echo ERROR: missing board XDC: !ZLC_SELECTED_XDC!
-  echo Put your board pin map at fpga\board_config\board.xdc (see its README) or set ZLC_PS_XDC.
+  echo Put your board pin map at fpga\board_config\board.xdc -- see its README -- or set ZLC_PS_XDC.
   exit /b 2
 )
 findstr /C:"[get_ports trig]" "!ZLC_SELECTED_XDC!" >nul || (
