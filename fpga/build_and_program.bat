@@ -52,6 +52,7 @@ if errorlevel 1 exit /b 1
 call :zlc_default_paths
 call :zlc_verify_sources
 if errorlevel 1 exit /b 1
+call :zlc_resolve_part
 call :zlc_print_capacity_estimate
 
 if /I "%MODE%"=="diagnose" (
@@ -161,15 +162,31 @@ echo ZLC FINAL source contract: channels=62 num_slots=4 control=JTAG-to-AXI (jta
 echo ZLC FINAL XDC: !ZLC_SELECTED_XDC!
 exit /b 0
 
+:zlc_resolve_part
+rem Single source: take the synthesis part from fpga\board_config\streamer_config.json
+rem (unless ZLC_PS_FPGA_PART is already set) and export it so create_project.tcl targets
+rem the configured board.  Pure read; never fails the build if python/config is missing.
+if not "%ZLC_PS_FPGA_PART%"=="" goto :zlc_resolve_part_done
+where python >nul 2>nul
+if errorlevel 1 goto :zlc_resolve_part_done
+set "ZLC_CFG_JSON=%REPO_ROOT%\fpga\board_config\streamer_config.json"
+if not exist "%ZLC_CFG_JSON%" goto :zlc_resolve_part_done
+for /f "delims=" %%I in ('python -c "import json;print(json.load(open(r'%ZLC_CFG_JSON%'))['fpga_part'])" 2^>nul') do set "ZLC_PS_FPGA_PART=%%I"
+:zlc_resolve_part_done
+if not "%ZLC_PS_FPGA_PART%"=="" echo ZLC synthesis part: %ZLC_PS_FPGA_PART% (from streamer_config.json / env)
+exit /b 0
+
 :zlc_print_capacity_estimate
 where python >nul 2>nul
 if errorlevel 1 (
   echo ZLC capacity estimate skipped: python was not found on PATH.
   exit /b 0
 )
+set "ZLC_EST_PART=%ZLC_PS_FPGA_PART%"
+if "%ZLC_EST_PART%"=="" set "ZLC_EST_PART=xc7a35tfgg484-2"
 pushd "%REPO_ROOT%"
 set "PYTHONPATH=%CD%;%PYTHONPATH%"
-python -c "from fpga.pulse_streamer.host.image import solve_capacity as s; r=s('xc7a35tfgg484-2', channel_count=62, target_pct=90); rr=r.resource_report['ramb36']; print('ZLC capacity: {} edges + bank_size {} (2x resident) + UNBOUNDED streaming; RAMB36 {}/{} = {}pct'.format(r.params.max_edges, r.params.bank_size, rr['used'], rr['total'], rr['pct']))"
+python -m fpga.pulse_streamer.host.image --part "%ZLC_EST_PART%"
 popd
 exit /b 0
 
@@ -194,6 +211,11 @@ if not "%ZLC_PS_VIVADO_BIN%"=="" goto zlc_vivado_found
 for %%V in (2019.1 2019.2 2020.1 2020.2 2021.1 2021.2 2022.1 2022.2 2023.1 2023.2 2024.1 2024.2 2025.1 2025.2) do (
   if exist "C:\Xilinx\Vivado\%%V\bin\vivado.bat" set "ZLC_PS_VIVADO_BIN=C:\Xilinx\Vivado\%%V\bin\vivado.bat"
   if exist "D:\Xilinx\Vivado\%%V\bin\vivado.bat" set "ZLC_PS_VIVADO_BIN=D:\Xilinx\Vivado\%%V\bin\vivado.bat"
+)
+rem Future-proof: also glob any Vivado version directory in the default install roots
+rem (so a newer release than the list above is still auto-found); last match wins (newest).
+for /d %%V in ("C:\Xilinx\Vivado\*" "D:\Xilinx\Vivado\*") do (
+  if exist "%%~V\bin\vivado.bat" set "ZLC_PS_VIVADO_BIN=%%~V\bin\vivado.bat"
 )
 if not "%ZLC_PS_VIVADO_BIN%"=="" goto zlc_vivado_found
 

@@ -29,29 +29,56 @@ from ..timing import channel_names
 from ..timing.verilog import CONTROL_PORTS, safe_identifier
 
 
-DEFAULT_FPGA_CHANNEL_COUNT = 62
+# The reconfigurable, compile-affecting specifics (channel/edge/scan/bus/delay geometry,
+# widths, FPGA part) come from the SINGLE user-editable config file
+# fpga/board_config/streamer_config.json, loaded through host.image -- so a board or
+# geometry change is edited in ONE place and flows to validation + capacity together.
+# These module constants MIRROR that config; the literal fallback (kept identical to the
+# shipped config) keeps this module importable if the fpga package is unavailable.
+# NOTE: max_edges/bank_size/delay_depth etc. are baked into the synthesized bitstream
+# (zlc_pulse_streamer_top.v localparams) -- changing the JSON does NOT re-synthesize; it
+# only re-aligns host validation/estimation.  Double-click estimate_resources.bat after
+# editing to check the part still fits, and rebuild the RTL to actually change the geometry.
+try:  # pragma: no cover - exercised whenever the fpga package is importable (the norm)
+    from fpga.pulse_streamer.host.image import load_streamer_config as _load_streamer_config
+
+    _STREAMER_CFG = _load_streamer_config()
+    _CFG_PARAMS = _STREAMER_CFG["params"]
+    DEFAULT_FPGA_CHANNEL_COUNT = int(_CFG_PARAMS.channel_count)
+    DEFAULT_MAX_EDGES = int(_CFG_PARAMS.max_edges)
+    DEFAULT_MAX_SCAN_POINTS = int(2 * _CFG_PARAMS.bank_size)   # resident 2-bank window; more stream
+    DEFAULT_MAX_BUS_SEGMENTS = int(_CFG_PARAMS.max_bus_segments)
+    DEFAULT_TICK_WIDTH = int(_CFG_PARAMS.tick_width)
+    DEFAULT_SCAN_COEFF_WIDTH = int(_CFG_PARAMS.coeff_width)
+    DEFAULT_SCAN_COEFF_FRAC_BITS = int(_CFG_PARAMS.coeff_frac_bits)
+    DEFAULT_NUM_SLOTS = int(_CFG_PARAMS.num_slots)
+    DEFAULT_DELAY_DEPTH = int(_CFG_PARAMS.delay_depth)
+    DEFAULT_SLOT_MUL_WIDTH = int(_STREAMER_CFG["slot_mul_width"])
+    DEFAULT_BUS_COUNT = int(_CFG_PARAMS.bus_count)
+    DEFAULT_BUS_WIDTH = int(_CFG_PARAMS.bus_width)
+    DEFAULT_FPGA_PART = str(_STREAMER_CFG["fpga_part"])
+except Exception:  # pragma: no cover - fpga package not importable; use shipped-config literals
+    DEFAULT_FPGA_CHANNEL_COUNT = 62
+    DEFAULT_MAX_EDGES = 4096
+    DEFAULT_MAX_SCAN_POINTS = 4096        # 2 * bank_size (2048)
+    DEFAULT_MAX_BUS_SEGMENTS = 64
+    DEFAULT_TICK_WIDTH = 32
+    DEFAULT_SCAN_COEFF_WIDTH = 16
+    DEFAULT_SCAN_COEFF_FRAC_BITS = 8
+    DEFAULT_NUM_SLOTS = 4
+    # LITERAL OUTPUT delay-line depth in ticks (must match zlc_edge_streamer.v DELAY_DEPTH and
+    # host.image / engine_model DELAY_DEPTH).  Bounded cap: 2048 * 20 ns = ~40 us.
+    DEFAULT_DELAY_DEPTH = 2048
+    # Affine-MAC slot operand width -- MUST match zlc_edge_streamer.v SLOT_MUL_WIDTH and
+    # engine_model.SLOT_MUL_WIDTH.  Each scan slot VALUE x a 16-bit coeff fits one DSP48E1
+    # (25x18), so the slot operand is the low 25 bits as signed; the validator rejects a
+    # scan value outside +/-2^24 ticks (the coeff still scales it, so the tick OFFSET keeps
+    # the full 32-bit range).
+    DEFAULT_SLOT_MUL_WIDTH = 25
+    DEFAULT_BUS_COUNT = 4
+    DEFAULT_BUS_WIDTH = 10
+    DEFAULT_FPGA_PART = "xc7a35tfgg484-2"
 DEFAULT_CHANNELS = [f"ch{index:02d}" for index in range(DEFAULT_FPGA_CHANNEL_COUNT)]
-DEFAULT_MAX_EDGES = 1024
-DEFAULT_MAX_SCAN_POINTS = 1024
-DEFAULT_MAX_BUS_SEGMENTS = 64
-DEFAULT_TICK_WIDTH = 32
-DEFAULT_SCAN_COEFF_WIDTH = 16
-DEFAULT_SCAN_COEFF_FRAC_BITS = 8
-DEFAULT_NUM_SLOTS = 4
-# LITERAL OUTPUT delay-line depth in ticks (must match zlc_edge_streamer.v DELAY_DEPTH and
-# host.image / engine_model DELAY_DEPTH).  A bounded cap: 2048 * 20 ns = ~40 us, covering
-# +/-15 us after the negative-delay global shift G (which can push an effective delay to ~30 us).
-# ALL channels and ALL buses are independently delayable; every effective delay must be <= this.
-DEFAULT_DELAY_DEPTH = 2048
-# Affine-MAC slot operand width -- MUST match zlc_edge_streamer.v SLOT_MUL_WIDTH
-# and engine_model.SLOT_MUL_WIDTH.  Each scan slot VALUE is multiplied by a 16-bit
-# coeff on a single DSP48E1 (25x18), so the slot operand is the low 25 bits taken
-# as signed; a scan value outside +/-2^24 ticks (~+/-335 ms @ 20 ns) would diverge
-# from the model, so the validator rejects it.  (The coeff still scales the slot,
-# so the resulting tick OFFSET keeps the full 32-bit range.)
-DEFAULT_SLOT_MUL_WIDTH = 25
-DEFAULT_BUS_COUNT = 4
-DEFAULT_BUS_WIDTH = 10
 
 
 def hardware_channel_names(count: int = DEFAULT_FPGA_CHANNEL_COUNT) -> list[str]:

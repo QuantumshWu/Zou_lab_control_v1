@@ -482,7 +482,8 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     fpga_notebook_text = "\n".join(cell["source"] for cell in neutral_atom_fpga_server_cells())
     hardware_notebook_text = "\n".join(cell["source"] for cell in neutral_atom_hardware_tutorial_cells())
 
-    for name in ("install_requirements.bat", "pulse_gui.bat", "start_tutorials_jupyter_lab.bat"):
+    for name in ("install_requirements.bat", "pulse_gui.bat", "start_tutorials_jupyter_lab.bat",
+                 "estimate_resources.bat"):
         assert (root / name).exists(), name
     assert not (root / "build_and_program.bat").exists()
     assert not (root / "run_server.bat").exists()
@@ -490,6 +491,8 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
         "install_requirements.bat",
         "pulse_gui.bat",
         "start_tutorials_jupyter_lab.bat",
+        # double-click capacity check against fpga/board_config/streamer_config.json
+        "estimate_resources.bat",
     }
 
     required = {
@@ -856,6 +859,7 @@ def test_repo_bat_entrypoints_are_minimal_and_grouped_by_submodule():
     bat_files = sorted(path.relative_to(root).as_posix() for path in root.rglob("*.bat") if not (set(path.relative_to(root).parts) & ignored_roots))
 
     assert bat_files == [
+        "estimate_resources.bat",
         "fpga/build_and_program.bat",
         "fpga/run_server.bat",
         "install_requirements.bat",
@@ -5056,3 +5060,126 @@ def test_unrolled_bracket_overflow_raises_actionable_error():
         delays={"ch00": 200}, delay_units={"ch00": "ns"}, repeat_forever=False)
     with pytest.raises(ValueError, match="repeat"):
         compile_pulse_table_runtime_program(st, clock_hz=50e6, repeat_forever=False)
+
+
+# --------------------------------------------------------------------------- #
+# Regression guards for the 2026-06-09 audit fixes (config single-source +
+# correctness bugs found in pulse_table / sequencer).
+# --------------------------------------------------------------------------- #
+def test_aligned_to_channels_preserves_clk_channels():
+    """BUG: aligned_to_channels dropped clk_channels, so aligning a saved table onto the
+    device channel list silently reverted a clk-wired channel to engine-driven (its clk pin
+    stopped clocking).  It must survive the align, filtered to the surviving channels."""
+
+    state = na.PulseTableState(
+        channels=["a", "b", "c"],
+        periods=[na.PulsePeriod(1000, (1, 0, 0), unit="ns")],
+        time_step_ns=20.0,
+        clk_channels=["c"],
+    )
+    aligned = state.aligned_to_channels(["a", "b", "c", "d"])   # superset (the real device list)
+    assert aligned.clk_channels == ["c"]
+    assert aligned.clk_enable_mask() == (1 << 2)
+
+
+def test_validate_rejects_clk_channel_that_is_bus_member():
+    """BUG: validate() never checked clk_channels vs analog-bus members, so a clk channel
+    that is also a DAC bit compiled to BOTH a clk mux and a bus segment -> double-drive on
+    hardware.  validate() (called from __init__/from_dict) must reject it, covering buses
+    inferred from labels, not just explicit analog_buses."""
+
+    channels = [f"da_x[{i}]" for i in range(10)] + ["trig"]
+    with pytest.raises(ValueError, match="clk channels must not be analog-bus members"):
+        na.PulseTableState(
+            channels=channels,
+            periods=[na.PulsePeriod(1000, tuple([0] * 11), unit="ns")],
+            time_step_ns=20.0,
+            clk_channels=["da_x[0]"],   # da_x[0..9] infer to bus "da_x" -> da_x[0] is a member
+        )
+
+
+def test_snap_scan_table_rejects_too_wide_rows_instead_of_truncating():
+    """BUG: snap_scan_table zip()'d row vs slots, silently DROPPING extra columns (a wrong-
+    width loaded array was mis-snapped, not reported).  It must normalize width first: raise
+    on a too-wide row, pad a short one."""
+
+    from Zou_lab_control.neutral_atom.timing.pulse_table import snap_scan_table, ScanSlot
+
+    dur = ScanSlot(kind="duration", target="0", unit="ns")
+    dac = ScanSlot(kind="dac", target="d@0", unit="value")
+    with pytest.raises(ValueError, match="values but 1 slots"):
+        snap_scan_table([[100.0, 200.0]], [dur], time_step_ns=20)
+    # a short row is padded (established normalize behavior) then snapped
+    assert snap_scan_table([[100.0]], [dur, dac], time_step_ns=20) == [[100.0, 0.0]]
+
+
+def test_scan_compile_snaps_zero_duration_to_one_tick_on_direct_call():
+    """BUG: compile_pulse_table_scan_runtime_program used the raw scan_table when called
+    directly (not via compile_scan), so a 0 ns scanned-duration point became a 0-tick
+    (zero-length) period the engine cannot play.  The snap must hold at this entry point too."""
+
+    state = na.PulseTableState(
+        channels=["trap", "trig"],
+        periods=[
+            na.PulsePeriod(100, (1, 0), unit="ns"),
+            na.PulsePeriod("s0", (0, 1), unit="str (ns)"),
+        ],
+        scan_slots=[{"kind": "duration", "target": "1", "unit": "ns", "nominal": 20.0}],
+        time_step_ns=20,
+    )
+    state.set_scan_table([[0.0], [30000.0]])   # first point: 0 ns -> must snap UP to 1 tick
+    prog = na.compile_pulse_table_scan_runtime_program(state, channels=["trap", "trig"], clock_hz=50e6)
+    assert prog.scan_points[0][0] == 1          # 0 ns -> one 20 ns tick, never 0
+    assert prog.scan_points[1][0] == 1500       # 30000 ns -> 1500 ticks (unchanged)
+
+
+def test_slot_ref_helpers_are_the_single_parser():
+    """The "sN" scan-slot reference parser lives once in the timing layer and is reused by
+    the sequencer compiler and the GUI (no more 3 private regexes that could drift)."""
+
+    from Zou_lab_control.neutral_atom.timing.pulse_table import is_slot_ref, slot_ref_index, _is_slot_ref
+
+    assert is_slot_ref("s0") and is_slot_ref(" s12 ") and not is_slot_ref("x0") and not is_slot_ref("s")
+    assert slot_ref_index("s3") == 3 and slot_ref_index("sX") is None and slot_ref_index(7) is None
+    assert _is_slot_ref is is_slot_ref   # private alias kept for in-module callers
+
+
+def test_streamer_config_is_single_source_for_host_geometry():
+    """The reconfigurable geometry comes from fpga/board_config/streamer_config.json; the
+    host validator constants and the AXI runtime default are SOURCED from it (no scattered
+    literals), and the shipped values match the synthesized RTL (zlc_pulse_streamer_top.v)."""
+
+    from fpga.pulse_streamer.host import image as im
+
+    cfg = im.load_streamer_config()
+    p = cfg["params"]
+    assert cfg["warnings"] == []                      # the shipped config file loads cleanly
+    assert (p.max_edges, p.bank_size, p.delay_depth) == (4096, 2048, 2048)
+    assert (p.channel_count, p.num_slots, p.bus_count, p.bus_width) == (62, 4, 4, 10)
+
+    from Zou_lab_control.neutral_atom.devices import fpga_pulse_streamer as fps
+    assert fps.DEFAULT_MAX_EDGES == p.max_edges
+    assert fps.DEFAULT_DELAY_DEPTH == p.delay_depth
+    assert fps.DEFAULT_NUM_SLOTS == p.num_slots
+    assert fps.DEFAULT_BUS_WIDTH == p.bus_width
+    assert fps.DEFAULT_FPGA_CHANNEL_COUNT == p.channel_count
+
+    from Zou_lab_control.neutral_atom.devices import axi_session as ax
+    assert ax.DEFAULT_PARAMS.max_edges == p.max_edges and ax.DEFAULT_PARAMS.bank_size == p.bank_size
+
+
+def test_estimate_resources_matches_solve_capacity_and_reports_pass_fail():
+    """solve_capacity now delegates its accounting to estimate_resources (one model), and
+    check_config_capacity (the estimate_resources.bat backend) reports the configured part
+    fits within the target budget on every axis."""
+
+    from fpga.pulse_streamer.host import image as im
+
+    s = im.solve_capacity("xc7a35t", channel_count=62, target_pct=90.0)
+    assert im.estimate_resources(s.params, part="xc7a35t", target_pct=90.0) == s.resource_report
+
+    result = im.check_config_capacity()
+    assert result["ok"] is True
+    assert all(result["report"][axis]["ok"] for axis in ("lut", "ff", "dsp", "ramb36"))
+    text = im.format_capacity_report(result)
+    assert "HAS enough resources" in text and "RAMB36" in text

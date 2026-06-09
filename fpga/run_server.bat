@@ -251,6 +251,11 @@ for %%V in (2019.1 2019.2 2020.1 2020.2 2021.1 2021.2 2022.1 2022.2 2023.1 2023.
   if exist "C:\Xilinx\Vivado\%%V\bin\vivado.bat" set "ZLC_PS_VIVADO_BIN=C:\Xilinx\Vivado\%%V\bin\vivado.bat"
   if exist "D:\Xilinx\Vivado\%%V\bin\vivado.bat" set "ZLC_PS_VIVADO_BIN=D:\Xilinx\Vivado\%%V\bin\vivado.bat"
 )
+rem Future-proof: also glob any Vivado version directory in the default install roots
+rem (so a newer release than the list above is still auto-found); last match wins (newest).
+for /d %%V in ("C:\Xilinx\Vivado\*" "D:\Xilinx\Vivado\*") do (
+  if exist "%%~V\bin\vivado.bat" set "ZLC_PS_VIVADO_BIN=%%~V\bin\vivado.bat"
+)
 if not "%ZLC_PS_VIVADO_BIN%"=="" goto zlc_vivado_found
 for /f "delims=" %%I in ('where vivado.bat 2^>nul') do if "%ZLC_PS_VIVADO_BIN%"=="" set "ZLC_PS_VIVADO_BIN=%%I"
 if not "%ZLC_PS_VIVADO_BIN%"=="" goto zlc_vivado_found

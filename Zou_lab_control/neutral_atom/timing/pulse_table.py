@@ -493,6 +493,15 @@ class PulseTableState:
         if duplicated_bus_members:
             raise ValueError(f"analog bus channels must not overlap: {duplicated_bus_members}.")
         known_buses = self.bus_channels(min_width=1)
+        # A clk channel is muxed directly onto the FPGA clk pin; if it were also an analog-bus
+        # member the bus engine would drive that same DAC bit -> ambiguous double-drive on
+        # hardware.  The GUI guards this, but validate() is the real contract gate (JSON /
+        # notebook / from_dict bypass the GUI), so reject it here too.  Check against ALL
+        # bus members -- inferred-from-labels AND explicit -- not just explicit analog_buses.
+        all_bus_members = {channel for members in known_buses.values() for channel in members}
+        clk_bus = sorted(set(self.clk_channels) & all_bus_members)
+        if clk_bus:
+            raise ValueError(f"clk channels must not be analog-bus members: {clk_bus}.")
         unknown_bus_modes = [name for name in self.analog_bus_modes if name not in known_buses]
         if unknown_bus_modes:
             raise ValueError(f"analog bus modes reference unknown buses: {unknown_bus_modes}.")
@@ -623,6 +632,10 @@ class PulseTableState:
                 for name, entries in self.analog_bus_modes.items()
                 if name in self.bus_channels(min_width=1)
             },
+            # A channel wired to the FPGA clk must survive an align onto the device
+            # channel list (else it silently reverts to engine-driven and the clk pin
+            # stops clocking) -- filter to the surviving channels like delays/labels.
+            clk_channels=[channel for channel in self.clk_channels if channel in channels],
         )
 
     def label_for(self, channel: str) -> str:
@@ -1309,8 +1322,24 @@ def analog_bus_ticks(plan: Sequence[Mapping[str, object]], starts: Sequence[int]
     return sorted(ticks)
 
 
-def _is_slot_ref(value: object) -> bool:
+def is_slot_ref(value: object) -> bool:
+    """True when ``value`` is a scan-slot reference like ``"s0"`` / ``"s3"``.
+
+    The SINGLE slot-reference parser (shared by the sequencer compiler and the GUI so
+    the ``sN`` spelling cannot drift between layers)."""
     return isinstance(value, str) and bool(SLOT_VAR_RE.fullmatch(value.strip()))
+
+
+def slot_ref_index(value: object) -> int | None:
+    """Return the slot index N for a ``"sN"`` reference, else ``None``."""
+    if not isinstance(value, str):
+        return None
+    match = SLOT_VAR_RE.fullmatch(value.strip())
+    return int(match.group("index")) if match else None
+
+
+# Backwards-compatible private alias for the in-module callers.
+_is_slot_ref = is_slot_ref
 
 
 def _coerce_bus_value(value: object) -> object:
@@ -1475,8 +1504,13 @@ def snap_scan_table(
 
     step = positive_time_step_ns(time_step_ns)
     default_dac_max = (1 << DEFAULT_DAC_BITS) - 1
+    # Normalize the column count to the slot count FIRST (pads a short row with 0.0,
+    # RAISES on a too-wide row) -- otherwise a mismatched loaded array would be silently
+    # truncated/under-snapped by the zip() below (a column would be dropped or a slot left
+    # un-clamped).  This makes "loading the wrong-width array" a clear error, not silent data loss.
+    normalized = _normalize_scan_table(scan_table, n_slots=len(scan_slots))
     out: list[list[float]] = []
-    for row in scan_table:
+    for row in normalized:
         new_row: list[float] = []
         for index, (value, slot) in enumerate(zip(row, scan_slots)):
             if getattr(slot, "kind", "") == "dac":

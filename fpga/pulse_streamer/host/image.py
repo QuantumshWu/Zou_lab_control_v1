@@ -24,17 +24,23 @@ BUS_DELAY_TICKS), there is NO delay BRAM image / region.
 
 from __future__ import annotations
 
+import json
 import math
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, fields as _dataclass_fields
+from pathlib import Path
 from typing import Mapping, Sequence
 
 __all__ = [
     "StreamerParams", "CtrlWords", "FpgaPartProfile", "FPGA_PARTS", "part_profile",
-    "SolvedCapacity", "solve_capacity",
+    "SolvedCapacity", "solve_capacity", "estimate_resources",
     "pack_program", "unpack_program", "scan_bank_words", "region_bases",
     "CMD_LOAD", "CMD_FIRE", "CMD_RESET", "CMD_SAFE",
     "STATUS_LOADED", "STATUS_RUNNING", "STATUS_DONE", "STATUS_ERROR", "STATUS_UNDERFLOW",
     "IMAGE_MAGIC",
+    "DEFAULT_CONFIG_PATH", "load_streamer_config", "params_from_config", "default_params",
+    "default_part", "default_target_pct", "default_clock_hz",
+    "check_config_capacity", "format_capacity_report",
 ]
 
 IMAGE_MAGIC = 0x5A4C4532   # "ZLE2"
@@ -554,6 +560,54 @@ def _scan_ramb(bank_size: int, p: StreamerParams) -> int:
     return _ceil(p.slot_bits, 36) * _ceil(2 * bank_size, 1024)
 
 
+def estimate_resources(params: StreamerParams, *, part, target_pct: float = 90.0,
+                       slot_mul_width: int = 25, engine_logic_luts: int = 8000,
+                       engine_ff: int = 9000, engine_dsp: int | None = None) -> dict:
+    """Resource usage of a CONCRETE ``StreamerParams`` vs a part, per axis.
+
+    This is the single accounting model shared by :func:`solve_capacity` (which
+    searches for the largest ``max_edges`` that fits) and the config-check CLI
+    (which reports whether the configured geometry fits as-is).  Returns
+    ``{"ramb36"|"lut"|"ff"|"dsp": {"used","budget","total","pct","ok"}}``.
+
+    LUT/FF/DSP are CALIBRATED to a real Vivado 2019.1 place+route of the 35T build
+    (zlc_pulse_streamer_top): 7376 slice LUTs (35%), 8059 FF (19%), 52 DSP (58%), 40
+    RAMB36 (80%).  Edge fields are parallel BRAMs; the LITERAL delay line is
+    distributed RAM (LUTs, no RAMB36)."""
+    prof = part_profile(part)
+    pct = max(1.0, min(100.0, float(target_pct)))
+    ramb36_used = (_edge_ramb(params.max_edges, params) + _scan_ramb(params.bank_size, params)
+                   + _ceil(params.bus_rows * params.bus_words, 1024) + 1)
+    # per bus-segment row: start+stop tick (2*tick_width), start+stop tick coeffs
+    # (2*coeff_bits), start+stop value (2*bus_width), mode (2), start+stop value_select
+    # (2*bus_sel_width -- a ramp can scan both endpoints).
+    bus_lutram = _ceil((2 * params.tick_width + 2 * params.coeff_bits + 2 * params.bus_width
+                        + 2 + 2 * params.bus_sel_width) * params.bus_rows, 64)
+    # LITERAL delay line LUT cost: TTL = SRL32 chain + tap mux/ch; DAC = distributed-RAM ring.
+    delay_slots = params.delay_depth + 1
+    ttl_srl_luts = params.channel_count * (_ceil(delay_slots, 32) + 1)
+    dac_ring_luts = (params.bus_count * params.bus_width) * _ceil(delay_slots, 64)
+    delay_lutram = ttl_srl_luts + dac_ring_luts
+    # DSP: engine affine-MAC call sites (2 evals/bus + 5 main) x num_slots products,
+    # each coeff(<=18b) x slot(slot_mul_width); slot operand <=25b fits ONE DSP48E1.
+    if engine_dsp is None:
+        mac_instances = 2 * params.bus_count + 5
+        dsp_per_mult = 1 if slot_mul_width <= 25 else 2
+        engine_dsp = mac_instances * params.num_slots * dsp_per_mult
+
+    def res(used, total):
+        b = int(total * pct / 100.0)
+        return {"used": int(used), "budget": b, "total": int(total),
+                "pct": round(100.0 * used / total, 1) if total else 0.0, "ok": used <= b}
+
+    return {
+        "ramb36": res(ramb36_used, prof.ramb36),
+        "lut": res(engine_logic_luts + bus_lutram + delay_lutram, prof.lut),
+        "ff": res(engine_ff, prof.ff),
+        "dsp": res(engine_dsp, prof.dsp),
+    }
+
+
 def solve_capacity(part, *, channel_count: int = 62, num_slots: int = 4, coeff_width: int = 16,
                    tick_width: int = 32, coeff_frac_bits: int = 8, bus_count: int = 4,
                    bus_width: int = 10, bus_seg_addr_width: int = 6, bus_sel_width: int = 3,
@@ -602,54 +656,208 @@ def solve_capacity(part, *, channel_count: int = 62, num_slots: int = 4, coeff_w
             chosen_bank = cand
             break
     bank_size = chosen_bank
-    scan_ram = _scan_ramb(bank_size, base)
     params = StreamerParams(channel_count=channel_count, num_slots=num_slots, coeff_width=coeff_width,
                             tick_width=tick_width, coeff_frac_bits=coeff_frac_bits, max_edges=max_edges,
                             bank_size=bank_size, bus_count=bus_count, bus_width=bus_width,
                             bus_seg_addr_width=bus_seg_addr_width, bus_sel_width=bus_sel_width)
-    ramb36_used = _edge_ramb(max_edges, params) + scan_ram + bus_img_ram + ctrl_ram
-    # per bus-segment row: start+stop tick (2*tick_width), start+stop tick coeffs
-    # (2*coeff_bits), start+stop value (2*bus_width), mode (2), and the start AND stop
-    # value_select (2*bus_sel_width -- a ramp can scan both endpoints).
-    bus_lutram = _ceil((2 * tick_width + 2 * params.coeff_bits + 2 * bus_width + 2 + 2 * bus_sel_width) * params.bus_rows, 64)
-    # LITERAL delay line LUT cost (split: TTL = SRL, DAC = distributed-RAM ring):
-    #   * TTL -- each channel is a variable-tap SHIFT REGISTER (ttl_sr[ch]); Vivado maps a 32-deep
-    #     1-bit shift to ONE SRLC32E (1 LUT), so depth DELAY_SLOTS costs ceil(DELAY_SLOTS/32) SRL32
-    #     LUTs per channel, PLUS a tap-select mux (the d-1 read into the SRL output reg + a small
-    #     cascade mux); budget ~1 extra LUT per channel for that mux.  x channel_count channels.
-    #   * DAC -- each bus is a BUS_WIDTH-bit distributed-RAM ring read at (wptr - d): one 64-deep
-    #     distributed-RAM block (1 LUT) per bit-lane per ceil(DELAY_SLOTS/64) depth-block, over
-    #     bus_count*bus_width independently-read bit-lanes (UNCHANGED -- bus_ring is left as is).
-    delay_slots = params.delay_depth + 1
-    ttl_srl_luts = params.channel_count * (_ceil(delay_slots, 32) + 1)   # SRL32 chain + tap mux/ch
-    dac_ring_luts = (params.bus_count * params.bus_width) * _ceil(delay_slots, 64)
-    delay_lutram = ttl_srl_luts + dac_ring_luts
-
-    # DSP estimate, derived from the engine's affine-MAC (zlc_effective_tick) call
-    # sites -- the dominant DSP user.  After the shared-MAC dedup the engine has:
-    #   * bus_tick: 2 evals/bus (segment start + stop), ONE shared set      -> 2*bus_count
-    #   * main: edge-0 seed, final, loop_end, loop-rewind, next-edge compare -> 5
-    # Each eval is num_slots products of coeff(<=18b) x slot(slot_mul_width); a slot
-    # operand <=25b fits ONE DSP48E1 (25x18), else two.  Keep this in sync with
-    # zlc_edge_streamer.v so capacity is checked for DSP, not just BRAM.
-    #
-    # NOTE: the LITERAL delay line uses NO affine MAC (a delay is a plain tick count; the ring
-    # read is a subtractor, not a multiply), so it adds 0 DSP -- only LUTs (delay_lutram above).
-    if engine_dsp is None:
-        mac_instances = 2 * bus_count + 5
-        dsp_per_mult = 1 if slot_mul_width <= 25 else 2
-        engine_dsp = mac_instances * num_slots * dsp_per_mult
-
-    def res(used, total):
-        b = int(total * pct / 100.0)
-        return {"used": int(used), "budget": b, "total": int(total),
-                "pct": round(100.0 * used / total, 1) if total else 0.0, "ok": used <= b}
-
-    report = {
-        "ramb36": res(ramb36_used, prof.ramb36),
-        "lut": res(engine_logic_luts + bus_lutram + delay_lutram, prof.lut),
-        "ff": res(engine_ff, prof.ff),
-        "dsp": res(engine_dsp, prof.dsp),
-    }
+    # Single accounting model (shared with the config-check CLI).  The LITERAL delay line
+    # is distributed RAM (LUTs, no RAMB36); DSP is the engine affine-MAC sites.
+    report = estimate_resources(params, part=prof, target_pct=pct, slot_mul_width=slot_mul_width,
+                                engine_logic_luts=engine_logic_luts, engine_ff=engine_ff,
+                                engine_dsp=engine_dsp)
+    ramb36_used = report["ramb36"]["used"]
     return SolvedCapacity(part=prof.name, params=params, ramb36_used=ramb36_used,
                           ramb36_budget=budget, resource_report=report)
+
+
+# --------------------------------------------------------------- config file
+# Single user-editable source of truth for the reconfigurable, compile-affecting
+# specifics (geometry + part + clock).  The host runtime defaults, the program
+# validator, and the resource estimator all read this -- edit the JSON, never the
+# scattered DEFAULT_* literals.  See fpga/board_config/streamer_config.json.
+DEFAULT_CONFIG_FILENAME = "streamer_config.json"
+DEFAULT_FPGA_PART = "xc7a35tfgg484-2"
+DEFAULT_TARGET_PCT = 90.0
+DEFAULT_CLOCK_HZ = 50_000_000.0
+DEFAULT_SLOT_MUL_WIDTH = 25
+
+# StreamerParams constructor field names (so config["params"] can carry extra keys
+# like slot_mul_width without breaking the dataclass).
+_PARAM_FIELD_NAMES = tuple(f.name for f in _dataclass_fields(StreamerParams))
+
+
+def _config_search_paths() -> list[Path]:
+    rel = Path("fpga") / "board_config" / DEFAULT_CONFIG_FILENAME
+    paths: list[Path] = []
+    env = os.environ.get("ZLC_PS_CONFIG")
+    if env and env.strip():
+        paths.append(Path(env))
+    paths.append(Path.cwd() / rel)
+    # image.py is fpga/pulse_streamer/host/image.py -> parents[2] == fpga/.
+    paths.append(Path(__file__).resolve().parents[2] / "board_config" / DEFAULT_CONFIG_FILENAME)
+    return paths
+
+
+def _default_config_path() -> Path:
+    """The canonical config path (parents[2]==fpga/), used for messages/round-trips."""
+    return Path(__file__).resolve().parents[2] / "board_config" / DEFAULT_CONFIG_FILENAME
+
+
+DEFAULT_CONFIG_PATH = _default_config_path()
+
+
+def params_from_config(params_map: Mapping | None) -> StreamerParams:
+    """Build a :class:`StreamerParams` from a config ``params`` mapping.
+
+    Only known dataclass fields are forwarded; extra keys (``slot_mul_width``,
+    underscore comment keys) are ignored, so the JSON can hold estimator-only knobs
+    alongside the geometry."""
+    kwargs = {k: v for k, v in dict(params_map or {}).items() if k in _PARAM_FIELD_NAMES}
+    return StreamerParams(**kwargs)
+
+
+def load_streamer_config(path: str | Path | None = None) -> dict:
+    """Load the single streamer config file.
+
+    Returns a normalized dict: ``{"params": StreamerParams, "fpga_part", "clock_hz",
+    "target_pct", "slot_mul_width", "source": Path|None, "warnings": [...]}``.  Missing
+    file or unreadable JSON falls back to built-in defaults (so offline/GUI workflows
+    never crash) and records a warning -- the estimator CLI surfaces these."""
+    warnings: list[str] = []
+    raw: dict = {}
+    source: Path | None = None
+    candidates = [Path(path)] if path is not None and str(path).strip() else _config_search_paths()
+    for candidate in candidates:
+        try:
+            if candidate.exists():
+                raw = json.loads(candidate.read_text(encoding="utf-8"))
+                source = candidate
+                break
+        except (OSError, ValueError) as exc:
+            warnings.append(f"could not read config {candidate}: {exc}")
+    if source is None:
+        warnings.append("no streamer_config.json found; using built-in defaults.")
+    if not isinstance(raw, dict):
+        warnings.append("config root is not an object; using built-in defaults.")
+        raw = {}
+    params_map = raw.get("params") if isinstance(raw.get("params"), dict) else {}
+    try:
+        params = params_from_config(params_map)
+    except (TypeError, ValueError) as exc:
+        warnings.append(f"invalid params in config ({exc}); using built-in defaults.")
+        params = StreamerParams()
+    slot_mul = params_map.get("slot_mul_width", DEFAULT_SLOT_MUL_WIDTH)
+    try:
+        slot_mul = int(slot_mul)
+    except (TypeError, ValueError):
+        slot_mul = DEFAULT_SLOT_MUL_WIDTH
+    return {
+        "params": params,
+        "fpga_part": str(raw.get("fpga_part", DEFAULT_FPGA_PART)),
+        "clock_hz": float(raw.get("clock_hz", DEFAULT_CLOCK_HZ)),
+        "target_pct": float(raw.get("target_pct", DEFAULT_TARGET_PCT)),
+        "slot_mul_width": slot_mul,
+        "source": source,
+        "warnings": warnings,
+    }
+
+
+def default_params(path: str | Path | None = None) -> StreamerParams:
+    """The configured runtime geometry (config-driven, defaults if the file is absent)."""
+    return load_streamer_config(path)["params"]
+
+
+def default_part(path: str | Path | None = None) -> str:
+    return load_streamer_config(path)["fpga_part"]
+
+
+def default_target_pct(path: str | Path | None = None) -> float:
+    return load_streamer_config(path)["target_pct"]
+
+
+def default_clock_hz(path: str | Path | None = None) -> float:
+    return load_streamer_config(path)["clock_hz"]
+
+
+def check_config_capacity(path: str | Path | None = None) -> dict:
+    """Estimate whether the configured part has enough resources for the configured
+    geometry.  Returns ``{config, params, part, target_pct, report, ok, warnings}``."""
+    cfg = load_streamer_config(path)
+    params = cfg["params"]
+    report = estimate_resources(params, part=cfg["fpga_part"], target_pct=cfg["target_pct"],
+                                slot_mul_width=cfg["slot_mul_width"])
+    return {
+        "config": cfg,
+        "params": params,
+        "part": part_profile(cfg["fpga_part"]).name,
+        "part_string": cfg["fpga_part"],
+        "target_pct": cfg["target_pct"],
+        "report": report,
+        "ok": all(axis["ok"] for axis in report.values()),
+        "warnings": cfg["warnings"],
+    }
+
+
+def format_capacity_report(result: dict) -> str:
+    """Human-readable pass/fail table for :func:`check_config_capacity`."""
+    cfg = result["config"]
+    p: StreamerParams = result["params"]
+    report = result["report"]
+    src = cfg["source"]
+    lines = [
+        "ZLC pulse-streamer resource estimate",
+        f"  config:     {src if src else '(built-in defaults -- no streamer_config.json found)'}",
+        f"  part:       {result['part_string']}  (profile {result['part']})",
+        f"  target:     {result['target_pct']:g}% of each resource",
+        f"  geometry:   channels={p.channel_count} edges={p.max_edges} bank_size={p.bank_size} "
+        f"slots={p.num_slots} buses={p.bus_count}x{p.bus_width}b delay_depth={p.delay_depth}",
+        "",
+        f"  {'resource':<8} {'used':>8} {'budget':>8} {'total':>8}  {'%use':>6}  verdict",
+    ]
+    label = {"ramb36": "RAMB36", "lut": "LUT", "ff": "FF", "dsp": "DSP"}
+    for key in ("lut", "ff", "dsp", "ramb36"):
+        a = report[key]
+        verdict = "OK" if a["ok"] else "OVER BUDGET"
+        lines.append(f"  {label[key]:<8} {a['used']:>8} {a['budget']:>8} {a['total']:>8}  "
+                     f"{a['pct']:>5.1f}%  {verdict}")
+    lines.append("")
+    if result["ok"]:
+        lines.append(f"  RESULT: the {result['part_string']} HAS enough resources for this configuration "
+                     f"(every axis within {result['target_pct']:g}%).")
+    else:
+        over = [label[k] for k in ("lut", "ff", "dsp", "ramb36") if not report[k]["ok"]]
+        lines.append(f"  RESULT: INSUFFICIENT -- {', '.join(over)} exceed {result['target_pct']:g}% on "
+                     f"{result['part_string']}.  Reduce the geometry in {DEFAULT_CONFIG_FILENAME} "
+                     f"or choose a larger part (see FPGA_PARTS).")
+    for w in result.get("warnings", []):
+        lines.append(f"  note: {w}")
+    lines.append("")
+    lines.append("  final evidence: Vivado report_utilization after synthesis; this is a design-budget estimate.")
+    return "\n".join(lines)
+
+
+def _main(argv: Sequence[str] | None = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="python -m fpga.pulse_streamer.host.image",
+        description="Estimate whether the configured FPGA part has enough resources for the "
+                    "configured pulse-streamer geometry (reads fpga/board_config/streamer_config.json).",
+    )
+    parser.add_argument("--config", default=None, help="Path to streamer_config.json (default: auto-detect).")
+    parser.add_argument("--part", default=None, help="Override fpga_part for this report only.")
+    args = parser.parse_args(list(argv) if argv is not None else None)
+    result = check_config_capacity(args.config)
+    if args.part:
+        # Re-estimate against an override part without editing the file.
+        cfg = result["config"]
+        report = estimate_resources(cfg["params"], part=args.part, target_pct=cfg["target_pct"],
+                                    slot_mul_width=cfg["slot_mul_width"])
+        result = {**result, "part": part_profile(args.part).name, "part_string": args.part,
+                  "report": report, "ok": all(a["ok"] for a in report.values())}
+    print(format_capacity_report(result))
+    return 0 if result["ok"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

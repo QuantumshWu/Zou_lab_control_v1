@@ -44,6 +44,8 @@ from fpga.pulse_streamer.host.image import (
     pack_program,
     scan_bank_words,
     region_bases,
+    default_params as _default_streamer_params,
+    default_clock_hz as _default_streamer_clock_hz,
     CMD_LOAD,
     CMD_FIRE,
     CMD_SAFE,
@@ -55,7 +57,9 @@ from fpga.pulse_streamer.host.image import (
     STATUS_UNDERFLOW,
 )
 
-DEFAULT_RUNTIME_CLOCK_HZ = 50_000_000.0
+# Runtime clock + geometry default come from the single config file
+# (fpga/board_config/streamer_config.json via host.image).
+DEFAULT_RUNTIME_CLOCK_HZ = _default_streamer_clock_hz()
 
 
 class _AxiAborted(Exception):
@@ -65,8 +69,9 @@ class _AxiAborted(Exception):
 
 
 # The default host geometry MUST match the built bitstream (create_project.tcl /
-# host.image.solve_capacity for the 35T): 4096 edges + bank_size 2048.
-DEFAULT_PARAMS = StreamerParams(max_edges=4096, bank_size=2048)
+# host.image.solve_capacity for the 35T): 4096 edges + bank_size 2048.  Sourced from
+# fpga/board_config/streamer_config.json so a geometry change is edited in ONE place.
+DEFAULT_PARAMS = _default_streamer_params()
 
 
 def _default_vivado() -> str:

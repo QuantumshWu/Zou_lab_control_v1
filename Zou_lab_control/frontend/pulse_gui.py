@@ -10,17 +10,19 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Mapping, Sequence
 import os
-import re
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from Zou_lab_control.neutral_atom.timing.pulse_table import (
     DELAY_DEPTH_TICKS,
+    UNITS_TO_NS,
     PulsePeriod,
     PulseTableState,
     ScanSlot,
     default_pulse_name,
+    is_slot_ref,
     load_scan_table,
+    slot_ref_index,
     slot_var,
     snap_scan_table,
     _analog_bus_value_at_tick,
@@ -70,8 +72,6 @@ from .qt_fluent import (
     signals_blocked as _signals_blocked,
 )
 
-_SLOT_RE = re.compile(r"^s(\d+)$")
-
 try:  # Matplotlib is already a frontend dependency, but keep import errors tidy.
     from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
     import matplotlib.pyplot as plt
@@ -89,7 +89,9 @@ DURATION_UNITS = ["ns", "us", "ms", "s"]
 # make sense as units -- ms / s would always exceed the cap, and "str (ns)" (the affine
 # expression unit) is meaningless for a fixed, non-scannable delay.
 DELAY_UNITS = ["ns", "us"]
-UNIT_TO_NS = {"ns": 1.0, "us": 1_000.0, "ms": 1_000_000.0, "s": 1_000_000_000.0, "str (ns)": 1.0}
+# Unit->ns factors are owned by the timing layer (pulse_table.UNITS_TO_NS) -- import it
+# rather than keep a second near-identically-named copy that could silently drift.
+UNIT_TO_NS = UNITS_TO_NS
 ROW_HEIGHT = 30
 CHANNEL_LABEL_WIDTH = 100
 TIME_UNIT_WIDTH = 60
@@ -197,12 +199,11 @@ def _period_control_width(card_width: int) -> int:
 def _is_slot_expr(text: object) -> bool:
     """True when a field value is a bare scan-slot reference like ``s0``."""
 
-    return bool(_SLOT_RE.fullmatch(str(text or "").strip()))
+    return is_slot_ref(str(text or "").strip())
 
 
 def _slot_index_of_expr(text: object) -> int | None:
-    match = _SLOT_RE.fullmatch(str(text or "").strip())
-    return int(match.group(1)) if match else None
+    return slot_ref_index(str(text or "").strip())
 
 
 def _scan_slot_label(state: PulseTableState, index: int) -> str:

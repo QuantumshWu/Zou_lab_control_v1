@@ -1,0 +1,35 @@
+{
+  "_README": [
+    "User-editable pulse-streamer configuration -- the SINGLE source of truth for the",
+    "reconfigurable, compile-affecting hardware specifics.  The Python host (capacity",
+    "estimate, program validation, AXI runtime defaults) and the resource estimator read",
+    "this file; edit it to match your synthesized bitstream and FPGA part, then double-click",
+    "estimate_resources.bat in the repo root to check the part has enough resources.",
+    "",
+    "IMPORTANT: 'params' below MUST match the localparams the bitstream was built with",
+    "(fpga/pulse_streamer/zlc_pulse_streamer_top.v).  If you rebuild the RTL with different",
+    "geometry (more edges, deeper delay, etc.), change BOTH the .v parameters and this file.",
+    "channel_count is normally INFERRED from the board XDC (fpga/board_config/board.xdc);",
+    "the value here is only the offline/fallback default."
+  ],
+
+  "fpga_part": "xc7a35tfgg484-2",
+  "clock_hz": 50000000,
+  "target_pct": 90.0,
+
+  "params": {
+    "channel_count": 62,
+    "num_slots": 4,
+    "coeff_width": 16,
+    "tick_width": 32,
+    "coeff_frac_bits": 8,
+    "max_edges": 4096,
+    "bank_size": 2048,
+    "bus_count": 4,
+    "bus_width": 10,
+    "bus_seg_addr_width": 6,
+    "bus_sel_width": 3,
+    "slot_mul_width": 25,
+    "delay_depth": 2048
+  }
+}

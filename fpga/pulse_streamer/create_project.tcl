@@ -74,7 +74,16 @@ set project_root [zlc_default_project_root $script_dir]
 set project_name ps
 set project_dir [zlc_safe_project_dir [env_or ZLC_PS_PROJECT_DIR [file join $project_root ps]] $script_dir $project_name]
 set top zlc_pulse_streamer_top
-set part xc7a35tfgg484-2
+# Synthesis target part.  Honor ZLC_PS_FPGA_PART (set by build_and_program.bat from
+# fpga/board_config/streamer_config.json, or by the user) so a board/part change is
+# edited in ONE place; default to the 35T this design was calibrated against.  NOTE:
+# env_or normalizes to a PATH, which is wrong for a bare part string -- read it raw.
+if {[info exists ::env(ZLC_PS_FPGA_PART)] && $::env(ZLC_PS_FPGA_PART) ne ""} {
+    set part $::env(ZLC_PS_FPGA_PART)
+} else {
+    set part xc7a35tfgg484-2
+}
+puts "ZLC synthesis part: $part"
 
 # Geometry (single source: keep in sync with the top + host.image.solve_capacity).
 set zlc_edge_addr_width 12

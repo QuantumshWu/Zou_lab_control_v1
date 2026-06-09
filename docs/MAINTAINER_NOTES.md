@@ -604,3 +604,85 @@ Targeted improvement backlog (priority order; none blocking):
 These are recorded so future work is guided; the user explicitly accepts that
 many concrete neutral-atom devices/experiments are not implemented yet — the
 skeleton, contracts, and docs are the deliverable.
+
+## 13. Config Single-Source, Robustness, Audit Fixes (2026-06-09)
+
+### Single user-editable config: `fpga/board_config/streamer_config.json`
+The reconfigurable, **compile-affecting** specifics (part, clock, edge/scan/delay/bus
+geometry) now live in ONE JSON. `fpga/pulse_streamer/host/image.py` owns the loader
+(`load_streamer_config` / `params_from_config` / `default_params` / `default_part` /
+`default_clock_hz`) with a robust fallback to built-in defaults if the file is missing.
+Re-sourced from it (no more scattered literals):
+- `axi_session.DEFAULT_PARAMS` + `DEFAULT_RUNTIME_CLOCK_HZ`,
+- `fpga_pulse_streamer.DEFAULT_*` validator constants (this fixed a real drift: the old
+  `DEFAULT_MAX_EDGES=1024` was HALF the synthesized 4096),
+- the capacity estimate.
+
+`params` must match `zlc_pulse_streamer_top.v` localparams — editing the JSON does NOT
+re-synthesize; it re-aligns host validation/estimation. `test_streamer_config_is_single_
+source_for_host_geometry` guards that the config == the host constants == the shipped RTL.
+
+### `estimate_resources.bat` (repo root, double-click)
+Runs `python -m fpga.pulse_streamer.host.image --config ...` →
+`check_config_capacity` → `format_capacity_report`: a LUT/FF/DSP/RAMB36 pass-fail table for
+the configured part, exit 0 (fits) / 1 (over budget). `solve_capacity` and the config check
+share ONE accounting model: `estimate_resources(params, part, target_pct)`
+(`test_estimate_resources_matches_solve_capacity*`). `build_and_program.bat` calls the same
+CLI for its pre-build estimate, with the configured `fpga_part`.
+
+### Robustness to board / XDC / Vivado / part changes
+- **Synthesis part** now honors `streamer_config.json`'s `fpga_part` (build bat exports it
+  to `ZLC_PS_FPGA_PART`; `create_project.tcl` reads it raw — NOT via `env_or`, which
+  path-normalizes). Moving to another Artix-7 retargets the build without editing `.tcl`.
+- **Vivado discovery** adds a `for /d` glob of `C:\Xilinx\Vivado\*` / `D:\` (newest wins)
+  after the fixed version list, so a future release in the default location is auto-found;
+  `ZLC_PS_VIVADO_BIN` / PATH still override.
+- **DAC/analog ports are auto-detected** from XDC label patterns `base[bit]` (≥2 contiguous
+  bits) — verified the shipped 62-port board infers correctly (`da_clk0..3` are legitimately
+  4 of the 62 channels, NOT spurious). Order-dependence of name-only XDCs is documented in
+  `board_config/README.md`. All env knobs are tabulated there.
+
+### Correctness bugs fixed (host-side; from the adversarial audit)
+- `aligned_to_channels` dropped `clk_channels` → a clk-wired channel silently reverted to
+  engine-driven on align. Now filtered+carried.
+- `validate()` allowed a clk channel that is also a DAC-bus member (inferred OR explicit) →
+  double-drive. Now rejected at the contract gate (`__init__`/`from_dict`).
+- `snap_scan_table` silently truncated too-wide rows via `zip()` → now normalizes width
+  first (raises too-wide, pads too-short).
+- `compile_pulse_table_scan_runtime_program` didn't snap on a DIRECT call → a 0 ns scanned
+  duration became a 0-tick period. Snap now happens inside the compiler, regardless of entry
+  point. (Each guarded by a regression test.)
+- `compile_runtime_program_for_payload`: bound slots + EMPTY table intentionally degrades to
+  a static program (a run is never blocked); documented inline (a direct `compile_scan` still
+  errors — the strict explicit-scan path).
+
+### RTL bring-up checklist (NOT edited — verify on hardware; speculative RTL edits are
+forbidden because a wrong edit costs a failed synth/route cycle)
+The adversarial RTL hunt found three items to confirm on the bench rather than patch:
+- **U4 — delayed-output tail at `done`.** `bnd_delay_advance` is set only while `running`
+  (`zlc_edge_streamer.v` ~694); after a FINITE sequence finishes, the delay rings stop, so a
+  channel with delay `d` does not flush its last `d` ticks. Harmless when the final frame
+  returns to 0 (the usual case) and irrelevant for `repeat_forever` (never `done`); the
+  Python mirror agrees, so it is not a host/RTL *surprise*. If a finite run must emit a
+  non-zero delayed tail, pad the program's final tick by the max delay (HOST change) rather
+  than touch the RTL.
+- **B1/B2 — `da_clk0..3` = `out_final[28/39/50/61]`.** These DAC strobe pins are driven by the
+  engine bits for those channels (or by `clk` if the channel is clk-enabled). Confirmed the
+  board's DAC scan works as-is; if a future board needs them tied to the FPGA clk, mark those
+  channels as clk channels. Don't let a normal program toggle 28/39/50/61.
+- **B3/B4/U7 — parameterization traps** (`COEFF_BITS==64`, flags-word width, `scan_addr_of`):
+  correct at the shipped `NUM_SLOTS=4` / `BUS_WIDTH=10` / `BANK_SIZE=2048`; only a concern if
+  those change. Documented at the call sites.
+
+### DRY done + remaining backlog
+Done (safe, test-guarded): single `streamer_config.json` source; one `estimate_resources`
+accounting model; one `sN` slot-ref parser (`pulse_table.is_slot_ref`/`slot_ref_index`, reused
+by sequencer + GUI); `UNIT_TO_NS` imports the timing `UNITS_TO_NS`; `_channel_delays_list`
+helper; deleted dead `BUS_SEGMENT_MODES`.
+Backlog (deferred — larger/riskier, none blocking): unify `effective_tick` vs
+`_apply_affine_ticks` (one narrowing-aware helper); one `validate_delay_depth(tick_ns=)` (drop
+the hardcoded 20 ns in the µs hint); move `PulseTableState.bus_value`-style packing out of the
+GUI; route NamesPanel/ChannelPanel rows through `FluentLabeledField` + a `set_field_locked`
+helper; split the pure `_pulse_table_*`/`_affine_*` compiler block out of the 2.2k-line
+`sequencer.py`. The cross-layer delay-depth/`coeff_frac_bits` constants remain test-guarded
+mirrors (cross-package import direction); kept as-is.

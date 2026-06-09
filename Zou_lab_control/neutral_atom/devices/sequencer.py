@@ -30,13 +30,23 @@ from ..timing.pulse_table import (
     bus_period_levels as _bus_period_levels,
     analog_bus_ticks as _pulse_table_analog_bus_ticks,
     _analog_bus_value_at_tick as _pulse_table_analog_bus_value_at_tick,
+    snap_scan_table as _snap_scan_table,
+    slot_ref_index as _parse_slot_ref_index,
 )
 from ..timing.verilog import VerilogBuild, VerilogFiles, generate_verilog, write_verilog_bundle
 
 
 DEFAULT_RUNTIME_CLOCK_HZ = 50_000_000.0
 DEFAULT_RUNTIME_BUS_NAMES = ("da_dipole", "da_bias_y", "da_bias_x", "da_bias_z")
-BUS_SEGMENT_MODES = {"edge": 1, "ramp": 2}
+
+
+def _channel_delays_list(channel_delays: Mapping[int, int] | None, n_channels: int) -> list[int]:
+    """Dense per-channel delay list in FPGA bit order (0 where unset).
+
+    The host<->program packing of the ``{bit: delay}`` map, factored out so both
+    compilers' payload-build sites share one implementation."""
+    cd = channel_delays or {}
+    return [int(cd.get(bit, 0)) for bit in range(n_channels)]
 
 
 @dataclass(frozen=True)
@@ -399,10 +409,10 @@ def compile_pulse_table_runtime_program(
         "bus_names": bus_names,
         "bus_segments": [segment.to_dict() for segment in bus_segments],
         "bus_delays": [bd.to_dict() for bd in bus_delays],
-        "channel_delays": [int(channel_delays.get(bit, 0)) for bit in range(len(channels))],
+        "channel_delays": _channel_delays_list(channel_delays, len(channels)),
         "clk_enable": int(clk_enable),
     }
-    channel_delays_list = [int(channel_delays.get(bit, 0)) for bit in range(len(channels))] if channel_delays else None
+    channel_delays_list = _channel_delays_list(channel_delays, len(channels)) if channel_delays else None
     sequence_id = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
     return RuntimeSequenceProgram(
         sequence_id=sequence_id,
@@ -484,12 +494,19 @@ def compile_pulse_table_scan_runtime_program(
     # lockstep with the digital edges.  Ramps with fixed value endpoints therefore
     # scan their TIMING freely; ramps whose value endpoints are themselves scanned
     # use the dual start/stop value_select (see _pulse_table_bus_segments).
-    table = [[float(value) for value in row] for row in (state.scan_table if scan_table is None else scan_table)]
-    if not table:
+    raw_rows = [[float(value) for value in row] for row in (state.scan_table if scan_table is None else scan_table)]
+    if not raw_rows:
         raise ValueError("hardware scan requires at least one scan-table row.")
-    for index, row in enumerate(table):
-        if len(row) != len(state.scan_slots):
-            raise ValueError(f"scan table row {index} has {len(row)} values but {len(state.scan_slots)} slots.")
+    # Snap + clamp every scan point the SAME way PulseTableState.compile_scan / the GUI /
+    # the server do, so the uploaded program matches the hardware REGARDLESS of entry point
+    # (a scanned duration of 0 ns becomes >= 1 tick, DAC codes clamp to the bus width).  This
+    # also normalizes the column count to the slot count -- raising on a too-wide table and
+    # padding a too-short one -- instead of the old zip() silently truncating.  Previously the
+    # snap invariant held only via compile_scan; a direct call (e.g. compile_runtime_program_
+    # _for_payload) used the raw table and could emit a zero-length period.
+    table = _snap_scan_table(
+        raw_rows, state.scan_slots, time_step_ns=clock_step_ns, dac_maxes=state.scan_slot_dac_maxes()
+    )
     slot_vars = state.scan_var_names
 
     def point_slots_ns(row: Sequence[float]) -> dict[str, float]:
@@ -628,10 +645,10 @@ def compile_pulse_table_scan_runtime_program(
         "bus_names": bus_names,
         "bus_segments": [segment.to_dict() for segment in bus_segments],
         "bus_delays": [bd.to_dict() for bd in bus_delays],
-        "channel_delays": [int(channel_delays.get(bit, 0)) for bit in range(len(channels))],
+        "channel_delays": _channel_delays_list(channel_delays, len(channels)),
         "clk_enable": int(clk_enable),
     }
-    channel_delays_list = [int(channel_delays.get(bit, 0)) for bit in range(len(channels))] if channel_delays else None
+    channel_delays_list = _channel_delays_list(channel_delays, len(channels)) if channel_delays else None
     sequence_id = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
     return RuntimeSequenceProgram(
         sequence_id=sequence_id,
@@ -673,6 +690,12 @@ def compile_runtime_program_for_payload(
     """Compile either finite sequence data or GUI pulse-table data."""
 
     if isinstance(payload, PulseTableState):
+        # Scan path only when there are BOTH bound slots AND at least one scan-table row.
+        # Bound slots with an EMPTY table INTENTIONALLY degrade to a single static program
+        # at the slots' reference values (compile_pulse_table_runtime_program resolves them)
+        # -- a run is never blocked just because the table has not been filled yet.  (A
+        # DIRECT compile_scan call still errors on an empty table, which is the right strict
+        # behavior for that explicit "I am scanning" entry point.)
         if payload.scan_slots and payload.scan_table:
             return compile_pulse_table_scan_runtime_program(
                 payload,
@@ -1914,10 +1937,10 @@ def _slot_ref_index(value: object, slot_vars: Sequence[str]) -> int | None:
     text = value.strip()
     if text in slot_vars:
         return list(slot_vars).index(text)
-    if len(text) >= 2 and text[0] == "s" and text[1:].isdigit():
-        index = int(text[1:])
-        if 0 <= index < len(slot_vars):
-            return index
+    # Shared "sN" parser (the single slot-reference spelling, owned by the timing layer).
+    index = _parse_slot_ref_index(text)
+    if index is not None and 0 <= index < len(slot_vars):
+        return index
     return None
 
 
