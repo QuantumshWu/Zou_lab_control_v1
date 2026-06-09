@@ -43,10 +43,10 @@ cd D:\ZLC
 .\fpga\build_and_program.bat
 ```
 
-默认 XDC 是板级 pin map：
+默认 XDC 是板级 pin map（见 fpga\board_config\README.md）：
 
 ```text
-references\source_archives\address_switch\address_switch.srcs\constrs_1\new\addre.xdc
+fpga\board_config\board.xdc
 ```
 
 如果 Vivado 不在默认路径：
@@ -76,7 +76,7 @@ Auto Connect。
 <!-- cell:code -->
 PROJECT_ROOT = Path("..").resolve()
 FPGA_DIR = PROJECT_ROOT / "fpga" / "pulse_streamer"
-XDC = PROJECT_ROOT / "references" / "source_archives" / "address_switch" / "address_switch.srcs" / "constrs_1" / "new" / "addre.xdc"
+XDC = PROJECT_ROOT / "fpga" / "board_config" / "board.xdc"
 
 CHANNELS = na.infer_xdc_channels(XDC)
 CHANNEL_LABELS = na.infer_xdc_channel_labels(XDC)

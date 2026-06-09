@@ -94,7 +94,7 @@ control/qCMOS computer
 ```
 
 The FPGA side infers the full hardware contract from the board XDC
-(`references\source_archives\address_switch\address_switch.srcs\constrs_1\new\addre.xdc`,
+(`fpga\board_config\board.xdc` — see that folder's README; override with `ZLC_PS_XDC`;
 62 controllable outputs, fallback `ch00..ch61`). GUI visibility is a view
 operation only; the server always pads to full hardware width and zeros
 hidden/unconfigured channels.

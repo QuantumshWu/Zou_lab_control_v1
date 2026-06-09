@@ -15,15 +15,8 @@ from typing import Mapping, Sequence
 
 
 DEFAULT_PULSE_GUI_FALLBACK_CHANNELS = 62
-DEFAULT_PULSE_GUI_XDC = (
-    Path("references")
-    / "source_archives"
-    / "address_switch"
-    / "address_switch.srcs"
-    / "constrs_1"
-    / "new"
-    / "addre.xdc"
-)
+# Default board pin map: the in-repo platform-config copy (see fpga/board_config/README.md).
+DEFAULT_PULSE_GUI_XDC = Path("fpga") / "board_config" / "board.xdc"
 
 
 def _default_channels(count: int) -> list[str]:

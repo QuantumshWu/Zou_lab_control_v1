@@ -386,7 +386,7 @@ def test_pulse_gui_launcher_aligns_subset_state_to_full_hardware_channels(monkey
     args = types.SimpleNamespace(
         channels=None,
         channel_count=None,
-        xdc=root / "references" / "source_archives" / "address_switch" / "address_switch.srcs" / "constrs_1" / "new" / "addre.xdc",
+        xdc=root / "fpga" / "board_config" / "board.xdc",
         max_channel_count=62,
         trigger_channels=None,
     )
@@ -910,7 +910,7 @@ def test_fpga_pulse_streamer_xdc_infers_full_channel_count(tmp_path):
 
 def test_address_switch_xdc_infers_62_outputs_trigger_and_bus_channels():
     root = Path(__file__).resolve().parents[1]
-    xdc = root / "references" / "source_archives" / "address_switch" / "address_switch.srcs" / "constrs_1" / "new" / "addre.xdc"
+    xdc = root / "fpga" / "board_config" / "board.xdc"
     count = na.infer_xdc_channel_count(xdc, default=1, max_count=None)
     labels = na.infer_xdc_channel_labels(xdc, default=count, max_count=None)
     channels = [f"ch{index:02d}" for index in range(count)]

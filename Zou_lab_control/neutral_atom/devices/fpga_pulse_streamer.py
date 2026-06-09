@@ -570,10 +570,13 @@ def _resolve_xdc_path(xdc_path: str | Path | None) -> Path | None:
     value = os.environ.get("ZLC_PS_XDC")
     if value:
         return Path(value)
-    cwd_candidate = Path.cwd() / "references" / "source_archives" / "address_switch" / "address_switch.srcs" / "constrs_1" / "new" / "addre.xdc"
+    # Default board pin map: the in-repo platform-config copy (fpga/board_config/board.xdc,
+    # see its README).  The old references/ copy is deprecated and no longer consulted.
+    relative = Path("fpga") / "board_config" / "board.xdc"
+    cwd_candidate = Path.cwd() / relative
     if cwd_candidate.exists():
         return cwd_candidate
-    package_candidate = Path(__file__).resolve().parents[3] / "references" / "source_archives" / "address_switch" / "address_switch.srcs" / "constrs_1" / "new" / "addre.xdc"
+    package_candidate = Path(__file__).resolve().parents[3] / relative
     if package_candidate.exists():
         return package_candidate
     return None

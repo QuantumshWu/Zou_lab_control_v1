@@ -63,7 +63,7 @@ if "%ZLC_PS_MAX_CHANNEL_COUNT%"=="" (
 ) else (
   set "ZLC_PS_MAX_CHANNEL_COUNT_ARG=--max-channel-count %ZLC_PS_MAX_CHANNEL_COUNT%"
 )
-if "%ZLC_PS_XDC%"=="" if exist "%CD%\references\source_archives\address_switch\address_switch.srcs\constrs_1\new\addre.xdc" set "ZLC_PS_XDC=%CD%\references\source_archives\address_switch\address_switch.srcs\constrs_1\new\addre.xdc"
+if "%ZLC_PS_XDC%"=="" if exist "%CD%\fpga\board_config\board.xdc" set "ZLC_PS_XDC=%CD%\fpga\board_config\board.xdc"
 if "%ZLC_PS_CHANNEL_COUNT%"=="" (
   for /f "delims=" %%I in ('%ZLC_PY_CMD% -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer infer_channel_count --xdc "%ZLC_PS_XDC%" --default-count 62 %ZLC_PS_MAX_CHANNEL_COUNT_ARG% 2^>nul') do if "!ZLC_PS_CHANNEL_COUNT!"=="" set "ZLC_PS_CHANNEL_COUNT=%%I"
 )
@@ -166,7 +166,7 @@ echo   set ZLC_PS_PROJECT_DIR=%%CD%%\fpga\build\ps
 exit /b 0
 
 :zlc_verify_sources
-set "ZLC_DEFAULT_XDC=%REPO_ROOT%\references\source_archives\address_switch\address_switch.srcs\constrs_1\new\addre.xdc"
+set "ZLC_DEFAULT_XDC=%REPO_ROOT%\fpga\board_config\board.xdc"
 if not defined ZLC_PS_XDC set "ZLC_PS_XDC=%ZLC_DEFAULT_XDC%"
 if not exist "%STREAMER_DIR%\zlc_edge_streamer.v" (
   echo ERROR: missing FINAL engine HDL: %STREAMER_DIR%\zlc_edge_streamer.v

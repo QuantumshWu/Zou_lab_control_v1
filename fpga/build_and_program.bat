@@ -86,8 +86,9 @@ echo   fpga\build_and_program.bat --check      Build only (alias of --build-only
 echo   fpga\build_and_program.bat --diagnose   List Vivado hw targets/devices
 echo.
 echo Real build XDC:
-echo   references\source_archives\address_switch\address_switch.srcs\constrs_1\new\addre.xdc
-echo   This original XDC is the default 62-output pin map. For a different board, set:
+echo   fpga\board_config\board.xdc
+echo   This is the default 62-output board pin map (see fpga\board_config\README.md).
+echo   For a different board, replace board.xdc or set:
 echo   set ZLC_PS_XDC=C:\path\to\board.xdc
 echo.
 echo Optional:
@@ -96,7 +97,7 @@ echo   set ZLC_PS_PROJECT_DIR=%%CD%%\fpga\build\ps
 exit /b 0
 
 :zlc_verify_sources
-set "ZLC_DEFAULT_XDC=%REPO_ROOT%\references\source_archives\address_switch\address_switch.srcs\constrs_1\new\addre.xdc"
+set "ZLC_DEFAULT_XDC=%REPO_ROOT%\fpga\board_config\board.xdc"
 if not defined ZLC_PS_XDC set "ZLC_PS_XDC=%ZLC_DEFAULT_XDC%"
 set "ZLC_SELECTED_XDC=%ZLC_PS_XDC%"
 if not exist "%STREAMER_DIR%\zlc_edge_streamer.v" (
@@ -145,7 +146,7 @@ findstr /C:"zlc_safe_project_dir" "%STREAMER_DIR%\create_project.tcl" >nul || (
 )
 if not exist "!ZLC_SELECTED_XDC!" (
   echo ERROR: missing board XDC: !ZLC_SELECTED_XDC!
-  echo Restore references\source_archives\address_switch\address_switch.srcs\constrs_1\new\addre.xdc or set ZLC_PS_XDC.
+  echo Put your board pin map at fpga\board_config\board.xdc (see its README) or set ZLC_PS_XDC.
   exit /b 2
 )
 findstr /C:"[get_ports trig]" "!ZLC_SELECTED_XDC!" >nul || (

@@ -192,7 +192,7 @@ cd D:\ZLC
 .\fpga\build_and_program.bat            # build + program (create_project.tcl -> program_fpga.tcl)
 \end{codeblock}
 
-默认工程在 \filepath{fpga\build\ps}（短名 \pyapi{ps} 让 Vivado 深层 run/.Xil 临时路径不超过 Windows MAX\_PATH，构建仍留在仓库内），bit/ltx（\filepath{zlc_pulse_streamer_top.bit/.ltx}）在其 \filepath{ps.runs\textbackslash impl_1} 目录下。默认 XDC 是 address-switch 板的引脚图（\filepath{addre.xdc}）。相机成像预设的关键物理输出：
+默认工程在 \filepath{fpga\build\ps}（短名 \pyapi{ps} 让 Vivado 深层 run/.Xil 临时路径不超过 Windows MAX\_PATH，构建仍留在仓库内），bit/ltx（\filepath{zlc_pulse_streamer_top.bit/.ltx}）在其 \filepath{ps.runs\textbackslash impl_1} 目录下。默认 XDC 是 address-switch 板的引脚图（\filepath{fpga\textbackslash board_config\textbackslash board.xdc}，见该目录 README；用 \pyapi{$env:ZLC_PS_XDC} 覆盖）。相机成像预设的关键物理输出：
 
 \begin{codeblock}[Camera-imaging subset]
 ch09 -> trap    -> M17
@@ -1314,7 +1314,7 @@ cd D:\ZLC
 默认工程落在 \filepath{fpga\textbackslash build\textbackslash pulse\_streamer}；编译产物 \tfocus{bit 文件和 ltx 探针文件}在它的 \filepath{pulse\_streamer.runs\textbackslash impl\_1} 子目录下，文件名是 \filepath{zlc\_pulse\_streamer\_top.bit} 和 \filepath{zlc\_pulse\_streamer\_top.ltx}。
 
 \begin{notebox}[XDC 引脚映射与 .ltx 探针文件]
-默认 XDC 是 address-switch 板的引脚映射（\filepath{references\textbackslash source\_archives\textbackslash address\_switch\textbackslash address\_switch.srcs\textbackslash constrs\_1\textbackslash new\textbackslash addre.xdc}）。换板子/换线缆映射时用 \pyapi{$env:ZLC_PS_XDC} 覆盖。create-project Tcl 会生成 \pyapi{jtag_axi} + \pyapi{axi_bram_ctrl} + BRAM 这套数据通路。这一点很关键：服务器是\tfocus{靠 JTAG-to-AXI 写 BRAM 控制 FPGA}的，所以服务器加载的 \filepath{.ltx} 必须和烧进去的 bit 是\tfocus{同一次编译}产生的，否则找不到 \pyapi{jtag_axi} 核。
+默认 XDC 是 address-switch 板的引脚映射（\filepath{fpga\textbackslash board\_config\textbackslash board.xdc}，见 \filepath{fpga/board\_config/README.md}）。换板子/换线缆映射时用 \pyapi{$env:ZLC_PS_XDC} 覆盖。create-project Tcl 会生成 \pyapi{jtag_axi} + \pyapi{axi_bram_ctrl} + BRAM 这套数据通路。这一点很关键：服务器是\tfocus{靠 JTAG-to-AXI 写 BRAM 控制 FPGA}的，所以服务器加载的 \filepath{.ltx} 必须和烧进去的 bit 是\tfocus{同一次编译}产生的，否则找不到 \pyapi{jtag_axi} 核。
 \end{notebox}
 
 \section{相机成像的物理输出（必须记住的四根线）}

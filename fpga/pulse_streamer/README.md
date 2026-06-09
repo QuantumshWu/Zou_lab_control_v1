@@ -40,8 +40,9 @@ upload flow, and resource budgets) see the **FPGA manual** in
 ## Contract Summary
 
 Target FPGA is the Artix-7 35T `xc7a35tfgg484-2`. The default board XDC is
-`references\source_archives\address_switch\...\addre.xdc` (62 outputs,
-`ch00..ch61`; `emCCD=ch11/M13`, `trig=ch06/R17`). The bitstream is fixed; every
+`fpga\board_config\board.xdc` (see `fpga/board_config/README.md`; override with
+`ZLC_PS_XDC`; 62 outputs, `ch00..ch61`; `emCCD=ch11/M13`, `trig=ch06/R17`). The
+bitstream is fixed; every
 `On Pulse` packs a fresh program image and uploads it over JTAG-to-AXI through
 `axi_bram_ctrl`, then drives the CTRL mailbox. One edge row means "at this
 absolute FPGA tick, set all outputs to this mask".
