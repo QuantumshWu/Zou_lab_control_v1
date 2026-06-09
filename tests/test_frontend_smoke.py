@@ -2225,3 +2225,40 @@ def test_bus_mode_combo_fits_ramp(monkeypatch):
     # least the "Ramp" text width after that reserve.
     reserve = scaled_px(COMBO_WIDTH) + scaled_px(EDIT_PADDING_H) * 2 + scaled_px(2)
     assert combo.width() - reserve >= ramp_w
+
+
+def test_hold_field_tracks_upstream_edge_change(monkeypatch):
+    """#1 (the user's explicit worry): a HOLD period shows the value carried in from the
+    preceding edge/ramp, and that shown value UPDATES reactively when the upstream value
+    is edited (via busChanged -> _refresh_bus_displays), with no full rebuild."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.neutral_atom.timing.pulse_table import PulsePeriod, PulseTableState
+
+    ch = [f"da[{i}]" for i in range(10)] + ["trig"]
+    labels = {f"da[{i}]": f"da[{i}]" for i in range(10)}
+    state = PulseTableState(
+        channels=ch, visible_channels=ch,
+        periods=[PulsePeriod(1000, tuple([0] * 11), unit="ns") for _ in range(3)],
+        channel_labels=labels, time_step_ns=20.0,
+    )
+    state.set_analog_bus_mode(0, "da", "edge", value=100)
+    state.set_analog_bus_mode(1, "da", "hold")
+    state.set_analog_bus_mode(2, "da", "hold")
+
+    ed = dt.demo_editor(size=(1200, 820))
+    ed.load_state(state)
+    dt.settle(ed, 150)
+    cards = ed.drag_container.pulse_cards()
+    # both hold periods initially show the carried 100
+    assert cards[1].bus_value_edits["da"].text() == "100"
+    assert cards[2].bus_value_edits["da"].text() == "100"
+    # edit the upstream edge (period 0) to 500 and commit -> the reactive refresh runs
+    cards[0].bus_value_edits["da"].setText("500")
+    ed._refresh_bus_displays()
+    dt.settle(ed, 60)
+    # the downstream hold fields now track the new upstream value (no rebuild)
+    assert cards[1].bus_value_edits["da"].text() == "500"
+    assert cards[2].bus_value_edits["da"].text() == "500"
