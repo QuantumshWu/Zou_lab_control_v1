@@ -678,11 +678,14 @@ The three bring-up items from the adversarial RTL hunt are now fixed/guarded. Th
   time when DAC buses are driven while a `da_clkN`-labeled channel is neither clk-enabled
   nor toggled (a frozen DAC would otherwise be silent). A warning, not an error — driving
   the strobe as a TTL pattern stays allowed.
-- **U1 — over-steep ramp: HOST VALIDATION.** The hardware ramp engine slews at most
-  1 LSB/tick then SNAPS at `stop_tick`; the preview draws an ideal line. A ramp with
-  |Δvalue| > tick span is now REJECTED by `validate_pulse_streamer_program` (including per
-  sampled scan point — a scanned duration/DAC endpoint can make a ramp unrealizable at
-  some points only), with the needed minimum duration in the message.
+- **U1 — over-steep ramp: ALLOWED (user decision); preview made honest instead.** The
+  hardware ramp engine slews at most 1 LSB/tick then SNAPS at `stop_tick`. The user
+  accepts that jagged waveform for ANY duration, so the validator does NOT reject steep
+  ramps (an earlier reject was reverted on request). Instead the PREVIEW now draws the
+  true slew-limited trajectory (`pulse_table._analog_bus_value_at_tick` clamps the ideal
+  line to ±1 LSB/tick from the carried-in value, with the snap at the period end), so
+  what the plot shows is what the DAC does — `engine_model.bus_play` already modeled
+  this; the preview was the only ideal-line holdout.
 - **T3 — edge-BRAM latency-2 force: BUILD-TIME HARD CHECK.** `zlc_force_latency2`
   (create_project.tcl) now READS BACK both register properties and `error`s out if either
   did not take (e.g. a future Vivado renames it) — a silent latency-1 BRAM would shift

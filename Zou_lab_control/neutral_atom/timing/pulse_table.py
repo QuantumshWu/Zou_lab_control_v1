@@ -1317,7 +1317,17 @@ def _analog_bus_value_at_tick(plan: Sequence[Mapping[str, object]], starts: Sequ
         if start_tick <= tick < stop_tick:
             if mode == "ramp" and stop_tick > start_tick:
                 fraction = (tick - start_tick) / (stop_tick - start_tick)
-                return int(round(in_value + (out_value - in_value) * fraction))
+                ideal = int(round(in_value + (out_value - in_value) * fraction))
+                # HARDWARE SLEW CAP: the DAC ramp engine moves at most 1 LSB per tick from
+                # the carried-in value, then SNAPS to the target at stop_tick.  An over-steep
+                # ramp is allowed (the user accepts the jagged result) -- so the preview must
+                # draw the TRUE trajectory (crawl at 1 LSB/tick, jump at the period end), not
+                # an ideal line the hardware cannot produce.  For |delta| <= span this clamp
+                # never engages and the ideal interpolation is unchanged.
+                elapsed = int(tick) - int(start_tick)
+                if out_value >= in_value:
+                    return min(ideal, int(in_value) + elapsed)
+                return max(ideal, int(in_value) - elapsed)
             return int(out_value)
     # at/after the table end the bus holds its final level
     if tick >= levels[-1][1]:

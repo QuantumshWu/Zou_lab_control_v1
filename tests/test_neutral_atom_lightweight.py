@@ -1113,8 +1113,7 @@ def test_pulse_table_analog_bus_modes_compile_to_runtime_bus_segments(tmp_path):
         ],
     )
     state.set_analog_bus_mode(0, "da_test", "edge", value=0)
-    # ramp swing must fit 1 LSB/tick over the 5-tick period (the hardware slew cap)
-    state.set_analog_bus_mode(2, "da_test", "ramp", value=5)
+    state.set_analog_bus_mode(2, "da_test", "ramp", value=7)
     state.apply_analog_bus_modes_to_period_states()
     saved = state.save(tmp_path / "analog_bus.json")
     loaded = na.PulseTableState.load(saved)
@@ -1124,7 +1123,7 @@ def test_pulse_table_analog_bus_modes_compile_to_runtime_bus_segments(tmp_path):
     assert loaded.analog_bus_modes["da_test"] == [
         {"mode": "edge", "value": 0},
         {"mode": "hold", "value": None},
-        {"mode": "ramp", "value": 5},
+        {"mode": "ramp", "value": 7},
     ]
     # period 1 is a HOLD after the edge-0, so it carries 0 (the ramp belongs to period 2,
     # not the preceding hold -- the within-period ramp fix).
@@ -1133,7 +1132,7 @@ def test_pulse_table_analog_bus_modes_compile_to_runtime_bus_segments(tmp_path):
     assert program.masks == [0, 0, 0, 0]
     assert program.bus_names == ["da_test"]
     # The edge-0 at period 0 is a no-op (bus already 0) so it emits nothing; the ramp now
-    # spans period 2 [10,15) from the carried-in 0 to 5 (NOT the old [0,10] across periods).
+    # spans period 2 [10,15) from the carried-in 0 to 7 (NOT the old [0,10] across periods).
     assert [segment.to_dict() for segment in (program.bus_segments or [])] == [
         {
             "bus_index": 0,
@@ -1141,7 +1140,7 @@ def test_pulse_table_analog_bus_modes_compile_to_runtime_bus_segments(tmp_path):
             "start_tick": 10,
             "stop_tick": 15,
             "start_value": 0,
-            "stop_value": 5,
+            "stop_value": 7,
             "mode": "ramp",
             "value_select": 0,
             "stop_value_select": 0,
@@ -1260,8 +1259,7 @@ def test_analog_ramp_can_scan_both_value_endpoints_round_trip():
         repeat_forever=False, loop_start_index=0, loop_end_tick=200, loop_count=1,
         slot_count=2, slot_kinds=["dac", "dac"], loop_end_slot_coeffs=[0, 0],
         tick_slot_coeffs=[[0, 0], [0, 0], [0, 0]],
-        # swings (60, 50) fit the 70-tick ramp span at 1 LSB/tick (the hardware slew cap)
-        scan_points=[[100, 160], [200, 150]], scan_coeff_frac_bits=8,
+        scan_points=[[100, 900], [200, 800]], scan_coeff_frac_bits=8,
         bus_names=["da0"],
         bus_segments=[
             RuntimeBusSegment(bus_index=0, start_tick=50, stop_tick=120, start_value=0, stop_value=0,
@@ -5401,39 +5399,33 @@ def test_delay_tail_emits_after_done_contract():
     assert all(v == 0 for v in out[15:])  # then settles low -- never frozen high
 
 
-def test_validate_rejects_ramp_steeper_than_one_lsb_per_tick():
-    """U1: the hardware DAC slews 1 LSB/tick then SNAPS at stop -- a steeper ramp is
-    unrealizable and must be rejected, not silently clipped while the preview shows a line."""
+def test_steep_ramp_is_allowed_and_preview_shows_slew_limited_trajectory():
+    """U1 (user decision): an over-steep ramp is ALLOWED for any duration -- the hardware
+    slews 1 LSB/tick then snaps at stop, and the user accepts that jagged waveform.  The
+    validator must NOT reject it, and the preview must draw the TRUE slew-limited
+    trajectory (crawl, then jump at the period end), matching engine_model.bus_play."""
 
-    import pytest
     from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeBusSegment
+    from Zou_lab_control.neutral_atom.timing.pulse_table import _analog_bus_value_at_tick
 
-    def prog_with(seg, **kw):
-        return na.RuntimeSequenceProgram(
-            sequence_id="ramp", sequence_name="ramp", clock_hz=50e6,
-            channels=["a"], ticks=[0, 2000], masks=[1, 0],
-            duration=2000 * 20e-9, trigger_count=0, repeat_forever=False,
-            bus_names=["da"], bus_segments=[seg], **kw,
-        )
-
-    steep = prog_with(RuntimeBusSegment(0, 0, 10, 0, 1023, "ramp", "da"))
-    with pytest.raises(ValueError, match="1 LSB/tick"):
-        na.validate_pulse_streamer_program(steep, channel_count=1)
-    gentle = prog_with(RuntimeBusSegment(0, 0, 1500, 0, 1023, "ramp", "da"))
-    na.validate_pulse_streamer_program(gentle, channel_count=1)   # 1023 over 1500 ticks: fine
-
-    # scanned STOP endpoint: fine at point 0 (code 5), unrealizable at point 1 (code 1023)
-    scanned = na.RuntimeSequenceProgram(
-        sequence_id="rs", sequence_name="rs", clock_hz=50e6,
+    steep = na.RuntimeSequenceProgram(
+        sequence_id="ramp", sequence_name="ramp", clock_hz=50e6,
         channels=["a"], ticks=[0, 2000], masks=[1, 0],
         duration=2000 * 20e-9, trigger_count=0, repeat_forever=False,
-        slot_count=1, slot_kinds=["dac"], tick_slot_coeffs=[[0], [0]],
-        scan_points=[[5], [1023]],
-        bus_names=["da"],
-        bus_segments=[RuntimeBusSegment(0, 0, 10, 0, 0, "ramp", "da", 0, None, None, stop_value_select=1)],
+        bus_names=["da"], bus_segments=[RuntimeBusSegment(0, 0, 10, 0, 1023, "ramp", "da")],
     )
-    with pytest.raises(ValueError, match="scan point 1"):
-        na.validate_pulse_streamer_program(scanned, channel_count=1)
+    na.validate_pulse_streamer_program(steep, channel_count=1)   # accepted, no raise
+
+    # preview trajectory of a steep ramp 0 -> 1023 over 10 ticks: 1 LSB/tick crawl,
+    # then the snap to 1023 at the period end (where the next level carries 1023).
+    plan = [{"mode": "ramp", "value": 1023}, {"mode": "hold", "value": None}]
+    starts = [0, 10, 20]
+    assert _analog_bus_value_at_tick(plan, starts, 1) == 1     # capped at 1 LSB/tick
+    assert _analog_bus_value_at_tick(plan, starts, 9) == 9     # still crawling at the end
+    assert _analog_bus_value_at_tick(plan, starts, 10) == 1023  # snap at stop_tick
+    # a GENTLE ramp is untouched by the cap: ideal interpolation as before.
+    gentle = [{"mode": "ramp", "value": 8}, {"mode": "hold", "value": None}]
+    assert _analog_bus_value_at_tick(gentle, starts, 5) == 4
 
 
 def test_compile_warns_when_dac_bus_active_but_da_clk_pin_idle():
