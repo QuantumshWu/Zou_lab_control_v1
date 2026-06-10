@@ -862,6 +862,11 @@ class SequencerService:
         self.cache_prepared = bool(cache_prepared)
         self._lock = threading.RLock()
         self.prepared_program: RuntimeSequenceProgram | None = None
+        # The SOURCE payload (PulseTableState/PulseSequence dict) of the last successful
+        # prepare, as a JSON string.  This is what "sync to device" pulls: the GUI (or any
+        # raw-API caller) can reconstruct the editable state that is actually applied on
+        # the device -- the compiled program alone cannot be edited back.
+        self.last_payload_json: str | None = None
         self.state = "idle"
         self.history: list[dict[str, object]] = []
 
@@ -898,6 +903,19 @@ class SequencerService:
             if self.prepare_callback is not None and not cached:
                 self.prepare_callback(program)
             self.prepared_program = program
+            # record the SOURCE payload for sync-to-device (JSON string: crosses RPyC
+            # without netrefs and is identical for str/dict payloads and state objects).
+            if isinstance(sequence_payload, (str, bytes)):
+                self.last_payload_json = (
+                    sequence_payload.decode("utf-8")
+                    if isinstance(sequence_payload, bytes) else str(sequence_payload)
+                )
+            elif isinstance(sequence_payload, Mapping):
+                self.last_payload_json = json.dumps(dict(sequence_payload))
+            else:
+                step = 1e9 / float(self.clock_hz)
+                self.last_payload_json = json.dumps(
+                    timing_payload_to_dict(sequence_payload, time_step_ns=step))
             self.state = "prepared"
             self.history.append(
                 {
@@ -975,6 +993,10 @@ class SequencerService:
                 "state": self.state,
                 "cache_prepared": self.cache_prepared,
                 "prepared_program": None if self.prepared_program is None else self.prepared_program.to_dict(),
+                # source payload of the last prepare (JSON string) -- the sync-to-device
+                # handle: PulseTableState.from_dict(json.loads(...)) reconstructs the
+                # editable state that is actually applied on the device.
+                "last_payload_json": self.last_payload_json,
                 "history_length": len(self.history),
             }
 
@@ -1189,7 +1211,12 @@ class RemoteSequencer(SequencerDevice):
         }
         if self._conn is not None:
             try:
-                out["remote"] = dict(self._conn.root.snapshot())
+                remote = dict(self._conn.root.snapshot())
+                out["remote"] = remote
+                # flatten the sync-to-device handles (str() materialises rpyc netrefs)
+                lpj = remote.get("last_payload_json")
+                out["last_payload_json"] = None if lpj is None else str(lpj)
+                out["state"] = str(remote.get("state", ""))
             except Exception as exc:
                 out["remote_error"] = str(exc)
         return out
@@ -1354,6 +1381,74 @@ class PulseController:
             self.sequencer.set_safe_state()
         elif hasattr(self.sequencer, "abort"):
             self.sequencer.abort()
+
+    def off_pulse(self) -> None:
+        """Stop playback and drive the safe state (alias of :meth:`stop`).
+
+        The natural opposite of :meth:`on_pulse` -- a delay-calibration loop
+        reads ``pulse.set_channel_delay(ch, d).on_pulse(); ...; pulse.off_pulse()``."""
+        self.stop()
+
+    # --- pulse-table editing conveniences (channel delay calibration etc.) -----
+    def set_channel_delay(self, channel: str, delay_ns: float) -> "PulseController":
+        """Set one channel's fixed output delay (ns, may be negative) on the bound
+        :class:`PulseTableState`.  The next :meth:`prepare`/:meth:`on_pulse` compiles
+        and uploads the new delay -- the core primitive of a delay-calibration loop::
+
+            for d in np.linspace(-200, 200, 21):
+                pulse.set_channel_delay("ch11", d).on_pulse()
+                counts.append(measure())
+                pulse.off_pulse()
+        """
+        if not isinstance(self.pulse, PulseTableState):
+            raise TypeError("set_channel_delay needs a PulseTableState pulse (not a raw PulseSequence).")
+        channel = str(channel)
+        if channel not in self.pulse.channels:
+            raise ValueError(f"unknown channel {channel!r}; choices: {list(self.pulse.channels)}")
+        self.pulse.delays[channel] = float(delay_ns)
+        self.pulse.delay_units[channel] = "ns"
+        self.pulse.validate()
+        return self
+
+    def get_channel_delay(self, channel: str) -> float:
+        """Return one channel's fixed output delay in ns."""
+        if not isinstance(self.pulse, PulseTableState):
+            raise TypeError("get_channel_delay needs a PulseTableState pulse.")
+        unit = str(self.pulse.delay_units.get(str(channel), "ns"))
+        factor = {"ns": 1.0, "us": 1e3, "ms": 1e6, "s": 1e9}.get(unit, 1.0)
+        return float(self.pulse.delays.get(str(channel), 0.0)) * factor
+
+    def load_pulse(self, path: str | Path) -> "PulseController":
+        """Replace the bound pulse with a saved pulse-table JSON (GUI Save format)."""
+        self.pulse = PulseTableState.load(path)
+        self.slots = {}
+        self.scan_table = list(self.pulse.scan_table or [])
+        return self
+
+    def save_pulse(self, path: str | Path) -> Path:
+        """Save the bound PulseTableState as JSON (loadable by the GUI and load_pulse)."""
+        if not isinstance(self.pulse, PulseTableState):
+            raise TypeError("save_pulse needs a PulseTableState pulse.")
+        path = Path(path)
+        self.pulse.save(path)
+        return path
+
+    def synced_state(self) -> PulseTableState | None:
+        """Return the PulseTableState actually APPLIED on the sequencer, or None.
+
+        Reads the sequencer snapshot's ``last_payload_json`` (recorded by the
+        service at every successful prepare -- whether it came from this
+        controller, the GUI, or any other raw-API caller).  This is the same
+        source the GUI's "Sync" button uses, so notebook and GUI always agree
+        on what is running."""
+        snap = self.sequencer.snapshot() if hasattr(self.sequencer, "snapshot") else {}
+        payload = snap.get("last_payload_json")
+        if not payload:
+            return None
+        data = json.loads(payload)
+        if isinstance(data, Mapping) and "periods" in data:
+            return PulseTableState.from_dict(data)
+        return None
 
     def snapshot(self) -> dict[str, object]:
         """Return a JSON-safe summary for notebook/debug display."""

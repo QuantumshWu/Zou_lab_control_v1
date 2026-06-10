@@ -61,11 +61,16 @@ class AreaSelector:
         self.range = [None, None, None, None]
         self.callback: Optional[Callable[[], None]] = None
         self.color = _default_interaction_color(ax) if color is None else color
+        # useblit=True: the rectangle is blitted over a cached background on every
+        # mouse-motion, so it is visible (and cheap) DURING the drag.  With
+        # useblit=False each motion triggers a FULL canvas redraw -- on a large
+        # canvas (the pulse preview) that is so slow the rectangle only became
+        # visible at release.
         self.selector = RectangleSelector(
             ax,
             self.onselect,
             interactive=True,
-            useblit=False,
+            useblit=True,
             button=[1],
             props=dict(alpha=0.8, fill=False, linestyle="-", color=self.color),
             handle_props=dict(
@@ -260,9 +265,10 @@ class ZoomPan:
         self.zoom_scale = float(zoom_scale)
         self.callback: Optional[Callable[[], None]] = None
         self.dragging = False
-        self._press_xy = None
+        self._press_px = None
         self._xlim0 = None
         self._ylim0 = None
+        self._bbox_wh = (1.0, 1.0)
         self._home_xlim = ax.get_xlim()
         self._home_ylim = ax.get_ylim()
         self.image_type = "2D" if ax.images else "1D"
@@ -321,17 +327,26 @@ class ZoomPan:
             return
 
         self.dragging = True
-        self._press_xy = (event.xdata, event.ydata)
+        # Anchor the pan in PIXEL space.  event.xdata is expressed in the CURRENT
+        # data frame, which the pan itself keeps moving -- mixing the press frame
+        # with per-motion frames feeds the pan back into itself and produced the
+        # sudden jumps.  Pixels are frame-independent: delta_px * (span/width)
+        # against the limits saved at press is exact and jump-free.
+        self._press_px = (float(event.x), float(event.y))
         self._xlim0 = self.ax.get_xlim()
         self._ylim0 = self.ax.get_ylim()
+        bbox = self.ax.bbox
+        self._bbox_wh = (max(1.0, float(bbox.width)), max(1.0, float(bbox.height)))
 
     def on_motion(self, event) -> None:
-        if not self.dragging or event.inaxes != self.ax or self._press_xy is None:
+        if not self.dragging or self._press_px is None:
             return
-        if event.xdata is None or event.ydata is None:
+        if event.x is None or event.y is None:
             return
-        dx = event.xdata - self._press_xy[0]
-        dy = event.ydata - self._press_xy[1]
+        dx_px = float(event.x) - self._press_px[0]
+        dy_px = float(event.y) - self._press_px[1]
+        dx = dx_px * (self._xlim0[1] - self._xlim0[0]) / self._bbox_wh[0]
+        dy = dy_px * (self._ylim0[1] - self._ylim0[0]) / self._bbox_wh[1]
         self.ax.set_xlim(self._xlim0[0] - dx, self._xlim0[1] - dx)
         if self.image_type == "2D":
             self.ax.set_ylim(self._ylim0[0] - dy, self._ylim0[1] - dy)
@@ -340,7 +355,7 @@ class ZoomPan:
 
     def on_release(self, event) -> None:
         self.dragging = False
-        self._press_xy = None
+        self._press_px = None
 
     def destroy(self) -> None:
         canvas = self.ax.figure.canvas

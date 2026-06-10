@@ -73,8 +73,20 @@ from .qt_fluent import (
 )
 
 try:  # Matplotlib is already a frontend dependency, but keep import errors tidy.
-    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as _FigureCanvasQTAgg
     import matplotlib.pyplot as plt
+
+    class FigureCanvas(_FigureCanvasQTAgg):
+        """Preview canvas that CONSUMES wheel events.
+
+        The canvas lives inside the preview QScrollArea; without accepting the
+        Qt wheel event, a zoom scroll on the plot ALSO scrolled the parent
+        scroll area (the plot zoomed and slid away at the same time).  The
+        matplotlib zoom handler still receives the event via super()."""
+
+        def wheelEvent(self, event):  # noqa: N802 (Qt naming)
+            super().wheelEvent(event)
+            event.accept()
 except Exception:  # pragma: no cover - depends on the local desktop environment.
     FigureCanvas = None
     plt = None
@@ -554,12 +566,14 @@ class PulseStateUIManager(QtCore.QObject):
         status_dot: FluentStatusDot,
         label: FluentLabel,
         save_button: FluentButton,
+        fire_button: FluentButton | None = None,
         title_callback=None,
     ):
         super().__init__()
         self.status_dot = status_dot
         self.label = label
         self.save_button = save_button
+        self.fire_button = fire_button
         self.title_callback = title_callback
         self.address_str = ""
         self.pulse_name = "pulse"
@@ -617,6 +631,13 @@ class PulseStateUIManager(QtCore.QObject):
         # star, and a changing label made the button visibly narrow after load.
         self.save_button.setText("Save")
         self.save_button.set_color(YELLOW if star else ACCENT)
+        # Confocal-style applied-state hint: while the device is running/prepared
+        # with parameters that DIFFER from the editor (any pulse/delay/duration/
+        # DA/scan edit since the last On Pulse/Prepare), the On Pulse button turns
+        # ORANGE -- "press to apply your pending edits".  Clean state = GREEN.
+        if self.fire_button is not None:
+            self.fire_button.setText("On Pulse")
+            self.fire_button.set_color(ORANGE if self._runstate == self.RunState.UNSYNCED else GREEN)
         if self.title_callback is not None:
             self.title_callback(f"{pulse_name} - PulseGUI{star}")
 
@@ -923,6 +944,9 @@ class _DragItem:
 
 class PulseDragContainer(QtWidgets.QWidget):
     changed = QtCore.pyqtSignal()
+    # click-to-select: a click on a period card / on the gap between cards (no drag)
+    cardClicked = QtCore.pyqtSignal(int)   # index in pulse-card (period) space
+    gapClicked = QtCore.pyqtSignal(int)    # insert position in period space (0..n)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -936,10 +960,17 @@ class PulseDragContainer(QtWidgets.QWidget):
         self.layout_main.setSpacing(_px(5, minimum=3))
         self.layout_main.setAlignment(QtCore.Qt.AlignLeft)
         self.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Expanding)
-        self.insert_indicator = QtWidgets.QFrame()
-        self.insert_indicator.setFrameShape(QtWidgets.QFrame.VLine)
-        self.insert_indicator.setStyleSheet(f"background: {ACCENT}; min-width: {_px(3)}px;")
+        # The insert indicator is an OVERLAY child (absolute geometry, raised above the
+        # cards), NOT a layout member: inserting it into the layout on every dragMove
+        # re-laid-out every later card (visible jitter/teleporting during a drag).
+        self.insert_indicator = QtWidgets.QFrame(self)
+        self.insert_indicator.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.insert_indicator.setStyleSheet(f"background: {ACCENT};")
+        self.insert_indicator.setFixedWidth(_px(3))
         self.insert_indicator.hide()
+        # persistent selection highlight (click-to-select): None or period-space index/pos
+        self._selected_card: int | None = None
+        self._selected_gap: int | None = None
 
     def add_item(self, widget: QtWidgets.QWidget, item_type: str) -> None:
         self.items.append(_DragItem(widget, item_type))
@@ -957,7 +988,6 @@ class PulseDragContainer(QtWidgets.QWidget):
                 widget.setParent(None)
         for item in self.items:
             self.layout_main.addWidget(item.widget)
-        self.layout_main.addWidget(self.insert_indicator)
         self.insert_indicator.hide()
         self.update_period_titles()
         self.changed.emit()
@@ -986,17 +1016,77 @@ class PulseDragContainer(QtWidgets.QWidget):
             self.dragging_index = None
         super().mouseMoveEvent(event)
 
+    def mouseReleaseEvent(self, event):
+        # A press that never crossed the drag threshold is a CLICK: select the
+        # period card under the cursor, or the GAP between cards ("中缝") --
+        # add/remove then act on the selection instead of always on the last.
+        if event.button() == QtCore.Qt.LeftButton and self.drag_start_pos is not None:
+            index = self._index_at(event.pos())
+            if index is not None and self.items[index].item_type == "pulse":
+                self.cardClicked.emit(self._period_index_of_item(index))
+            else:
+                self.gapClicked.emit(self._period_pos_of_insert(self._insert_pos(event.pos())))
+        self.drag_start_pos = None
+        self.dragging_index = None
+        super().mouseReleaseEvent(event)
+
+    def _period_index_of_item(self, items_index: int) -> int:
+        """items-space index -> period (pulse-card) index."""
+        return sum(1 for item in self.items[:items_index] if item.item_type == "pulse")
+
+    def _period_pos_of_insert(self, items_pos: int) -> int:
+        """items-space insert position -> period-space insert position (0..n)."""
+        return sum(1 for item in self.items[:items_pos] if item.item_type == "pulse")
+
     def _start_drag(self, index: int) -> None:
         drag = QtGui.QDrag(self)
         mime = QtCore.QMimeData()
         mime.setData("application/x-zlc-pulse-card", str(index).encode("utf-8"))
         drag.setMimeData(mime)
         widget = self.items[index].widget
+        # Show WHAT is being dragged: a half-transparent snapshot of the card under
+        # the cursor (without it the drag was an empty cursor and cards seemed to
+        # "vanish" mid-drag).  Scaled down so a tall card doesn't cover the row.
+        pixmap = widget.grab()
+        if pixmap.height() > _px(180):
+            pixmap = pixmap.scaledToHeight(_px(180), QtCore.Qt.SmoothTransformation)
+        ghost = QtGui.QPixmap(pixmap.size())
+        ghost.fill(QtCore.Qt.transparent)
+        painter = QtGui.QPainter(ghost)
+        painter.setOpacity(0.65)
+        painter.drawPixmap(0, 0, pixmap)
+        painter.end()
+        drag.setPixmap(ghost)
+        drag.setHotSpot(QtCore.QPoint(ghost.width() // 2, _px(16)))
         old_style = widget.styleSheet()
         widget.setStyleSheet(old_style + "; border: 2px solid #808080;")
         drag.exec_(QtCore.Qt.MoveAction)
         widget.setStyleSheet(old_style)
+        self.insert_indicator.hide()
         self.update_period_titles()
+
+    def _ancestor_scroll_area(self) -> QtWidgets.QAbstractScrollArea | None:
+        w = self.parentWidget()
+        while w is not None and not isinstance(w, QtWidgets.QAbstractScrollArea):
+            w = w.parentWidget()
+        return w
+
+    def _autoscroll_during_drag(self, pos) -> None:
+        """Keep later periods REACHABLE while dragging: out-of-view cards used to
+        look like they had disappeared because the view cannot be scrolled by the
+        wheel mid-drag.  Nudge the surrounding scroll area when the cursor comes
+        near its left/right edge."""
+        area = self._ancestor_scroll_area()
+        if area is None:
+            return
+        viewport = area.viewport()
+        vpos = viewport.mapFromGlobal(self.mapToGlobal(pos))
+        margin = _px(56, minimum=40)
+        hbar = area.horizontalScrollBar()
+        if vpos.x() > viewport.width() - margin:
+            hbar.setValue(hbar.value() + _px(28, minimum=20))
+        elif vpos.x() < margin:
+            hbar.setValue(hbar.value() - _px(28, minimum=20))
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasFormat("application/x-zlc-pulse-card"):
@@ -1008,6 +1098,7 @@ class PulseDragContainer(QtWidgets.QWidget):
         if event.mimeData().hasFormat("application/x-zlc-pulse-card"):
             event.acceptProposedAction()
             self._show_insert_indicator(self._insert_pos(event.pos()))
+            self._autoscroll_during_drag(event.pos())
         else:
             super().dragMoveEvent(event)
 
@@ -1048,10 +1139,53 @@ class PulseDragContainer(QtWidgets.QWidget):
                 return index
         return len(self.items)
 
-    def _show_insert_indicator(self, index: int) -> None:
-        self.layout_main.removeWidget(self.insert_indicator)
-        self.layout_main.insertWidget(index, self.insert_indicator)
+    def _indicator_x_for_items_pos(self, items_pos: int) -> int:
+        spacing = self.layout_main.spacing()
+        if not self.items:
+            return _shadow_pad()
+        if items_pos >= len(self.items):
+            geo = self.items[-1].widget.geometry()
+            return geo.x() + geo.width() + max(1, spacing // 2) - _px(1)
+        geo = self.items[items_pos].widget.geometry()
+        return max(0, geo.x() - max(1, spacing // 2) - _px(1))
+
+    def _show_insert_indicator(self, items_pos: int) -> None:
+        # OVERLAY positioning: geometry only, no layout mutation (a layout insert
+        # per dragMove re-laid-out all later cards -> jitter during the drag).
+        pad = _shadow_pad()
+        self.insert_indicator.setGeometry(
+            self._indicator_x_for_items_pos(items_pos), pad,
+            self.insert_indicator.width(), max(_px(40), self.height() - 2 * pad))
         self.insert_indicator.show()
+        self.insert_indicator.raise_()
+
+    # --- click-to-select visuals (selection highlight mirrors the drag highlight) ---
+    def show_selection(self, *, card: int | None = None, gap: int | None = None) -> None:
+        """Highlight one period card (border) or one gap (persistent indicator)."""
+        self._selected_card = card
+        self._selected_gap = gap
+        cards = self.pulse_cards()
+        for index, widget in enumerate(cards):
+            base = widget.styleSheet().split("/*sel*/")[0]
+            if card is not None and index == card:
+                widget.setStyleSheet(base + f"/*sel*/; border: 2px solid {ACCENT};")
+            else:
+                widget.setStyleSheet(base)
+        if gap is not None:
+            items_pos = self._items_pos_of_period_gap(gap)
+            self._show_insert_indicator(items_pos)
+        else:
+            self.insert_indicator.hide()
+
+    def _items_pos_of_period_gap(self, period_pos: int) -> int:
+        """period-space insert position (0..n) -> items-space position."""
+        seen = 0
+        for index, item in enumerate(self.items):
+            if item.item_type == "pulse":
+                if seen == period_pos:
+                    return index
+                seen += 1
+        return len(self.items)
 
     def _bracket_ok(self, items: list[_DragItem]) -> bool:
         start = next((i for i, item in enumerate(items) if item.item_type == "bracket_start"), None)
@@ -1600,6 +1734,12 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self.scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         self.drag_container = PulseDragContainer()
         self.drag_container.changed.connect(self._mark_dirty)
+        # click-to-select a period or a gap; Add/Remove then act on the selection
+        # (no selection = the old behaviour: append/remove at the end).
+        self._selected_period: int | None = None
+        self._selected_gap: int | None = None
+        self.drag_container.cardClicked.connect(self._on_period_card_clicked)
+        self.drag_container.gapClicked.connect(self._on_period_gap_clicked)
         self.scroll.setWidget(self.drag_container)
         dataset.addWidget(self.scroll, 1)
         self.dataset_scroll.setWidget(self.dataset_body)
@@ -1650,20 +1790,26 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self.bracket_button = self._control_button("Add Bracket", self.toggle_bracket, YELLOW)
         self.save_button = self._control_button("Save", self.save_to_file, YELLOW)
         self.load_button = self._control_button("Load", self.load_from_file, ORANGE)
+        # Sync pulls the pulse actually APPLIED on the sequencer back into the editor --
+        # for when a notebook/raw-API call (PulseController.on_pulse etc.) changed the
+        # device behind the GUI's back.  Mirrors the confocal GUI's sync button.
+        self.sync_button = self._control_button("Sync", self.sync_from_device, ORANGE)
+        self.sync_button.setToolTip(
+            "Load the pulse currently applied on the sequencer into the editor\n"
+            "(use after changing the device from a notebook / raw API).")
         self.collapse_button = self._control_button("Collapse", self.toggle_left_panels, GREY)
-        for button in (
+        _control_buttons = (
             self.safe_button, self.fire_button, self.remove_button, self.add_button,
             self.bracket_button, self.collapse_button, self.save_button, self.load_button,
-        ):
+            self.sync_button,
+        )
+        for button in _control_buttons:
             button.setFixedHeight(cb_h)
             button.setMinimumWidth(_px(74, minimum=62))
             button.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
-        for index, button in enumerate((
-            self.safe_button, self.fire_button, self.remove_button, self.add_button,
-            self.bracket_button, self.collapse_button, self.save_button, self.load_button,
-        )):
-            button_layout.addWidget(button, index // 4, index % 4)
-        for col in range(4):
+        for index, button in enumerate(_control_buttons):
+            button_layout.addWidget(button, index // 3, index % 3)
+        for col in range(3):
             button_layout.setColumnStretch(col, 1)
         # Centre the buttons in the card so the (taller, height-matched) Control
         # box does not leave the grid floating with an uneven gap.
@@ -1762,8 +1908,15 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             status_dot=self.status_dot,
             label=self.label_name,
             save_button=self.save_button,
+            fire_button=self.fire_button,
             title_callback=self._set_gui_title,
         )
+        # Applied-state tracking (confocal UNSYNCED semantics): the canonical JSON of
+        # the state at the last successful prepare/fire.  Any edit afterwards flips the
+        # run state to UNSYNCED (orange On Pulse); the debounced summary pass compares
+        # the keys and restores the previous run state if the edit was undone.
+        self._applied_state_key: str | None = None
+        self._unsynced_from: str | None = None
 
     def _control_button(self, text: str, slot, color: str) -> FluentButton:
         button = FluentButton(text, color=color)
@@ -1837,7 +1990,21 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             self._rebuild_periods()  # ends with _sync_dataset_geometry()
             self._refresh_hidden_combo()
         self._building = False
+        # cards were rebuilt: any click-selection now points at dead widgets.
+        if hasattr(self, "_selected_period"):
+            self._selected_period = None
+            self._selected_gap = None
+            self.drag_container.insert_indicator.hide()
+        # a single period must not be removable (the table needs at least one).
+        if hasattr(self, "remove_button"):
+            self.remove_button.setEnabled(len(state.periods) > 1)
         self._preview_dirty = True
+        # Route EVERY load_state-based mutation (add/remove period, clear channel, clk
+        # toggle, show/hide, file load, ...) through the same dirty path as direct
+        # widget edits -- so the UNSYNCED (orange On Pulse) hint covers them all.
+        # Callers that load DEVICE/FILE state (sync_from_device, load_from_file) set
+        # the run/file state explicitly right after, overriding this.
+        self._mark_dirty()
         self._update_summary()
 
     def _clear_layout(self, layout: QtWidgets.QLayout) -> None:
@@ -2676,34 +2843,124 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             return None, None, 1
         return start, end, repeat
 
+    # --- period selection (click a card or a gap; Add/Remove act on it) ---------
+    def _on_period_card_clicked(self, index: int) -> None:
+        if self._selected_period == index:        # click again -> deselect
+            self._selected_period = None
+        else:
+            self._selected_period = index
+        self._selected_gap = None
+        self.drag_container.show_selection(card=self._selected_period, gap=None)
+
+    def _on_period_gap_clicked(self, pos: int) -> None:
+        if self._selected_gap == pos:             # click again -> deselect
+            self._selected_gap = None
+        else:
+            self._selected_gap = pos
+        self._selected_period = None
+        self.drag_container.show_selection(card=None, gap=self._selected_gap)
+
+    def _clear_period_selection(self) -> None:
+        self._selected_period = None
+        self._selected_gap = None
+        if hasattr(self, "drag_container"):
+            self.drag_container.show_selection(card=None, gap=None)
+
+    @staticmethod
+    def _shift_slot_targets(state: PulseTableState, *, inserted: int | None = None,
+                            removed: int | None = None) -> None:
+        """Re-aim scan slots after a period insert/remove at an arbitrary index.
+
+        duration slots target a period index (``target=str(i)``); dac slots target
+        ``"<bus>@<i>"``.  A slot bound to a REMOVED period is unbound; slots bound
+        past the edit point shift by one.  (ScanSlot is frozen -> rebuild.)"""
+        import dataclasses
+
+        for slot_index in reversed(range(len(state.scan_slots))):
+            slot = state.scan_slots[slot_index]
+            if slot.kind == "duration":
+                period = int(slot.target)
+            elif slot.kind == "dac":
+                period = slot.dac_period
+            else:
+                continue
+            if removed is not None:
+                if period == removed:
+                    state.unbind_slot(slot_index)
+                    continue
+                if period > removed:
+                    period -= 1
+            if inserted is not None and period >= inserted:
+                period += 1
+            new_target = str(period) if slot.kind == "duration" else f"{slot.dac_bus}@{period}"
+            if new_target != slot.target:
+                state.scan_slots[slot_index] = dataclasses.replace(slot, target=new_target)
+
+    @staticmethod
+    def _edit_analog_bus_modes(state: PulseTableState, *, inserted: int | None = None,
+                               removed: int | None = None) -> None:
+        """Keep the per-period analog bus plans aligned with a mid-list insert/remove."""
+        for bus_name in list(state.analog_bus_modes):
+            entries = [dict(entry) for entry in state.analog_bus_modes.get(bus_name, [])]
+            if removed is not None and removed < len(entries):
+                entries.pop(removed)
+            if inserted is not None:
+                entries.insert(min(inserted, len(entries)), {"mode": "hold", "value": None})
+            state.analog_bus_modes[bus_name] = entries
+
     def add_period(self) -> None:
         state = self.read_state()
-        state.periods.append(PulsePeriod(1_000, tuple(0 for _ in state.channels), unit="ns", name=""))
+        # insert position: at the selected gap, after the selected card, else append.
+        if self._selected_gap is not None:
+            insert_at = max(0, min(self._selected_gap, len(state.periods)))
+        elif self._selected_period is not None:
+            insert_at = min(self._selected_period + 1, len(state.periods))
+        else:
+            insert_at = len(state.periods)
+        state.periods.insert(insert_at, PulsePeriod(1_000, tuple(0 for _ in state.channels), unit="ns", name=""))
+        if insert_at < len(state.periods) - 1:    # mid-list: re-aim slots/plans/bracket
+            self._shift_slot_targets(state, inserted=insert_at)
+            self._edit_analog_bus_modes(state, inserted=insert_at)
+            if state.repeat_start is not None and state.repeat_start >= insert_at:
+                state.repeat_start += 1
+            if state.repeat_end is not None and state.repeat_end >= insert_at:
+                state.repeat_end += 1
         self._resize_analog_bus_modes(state)
         state.apply_analog_bus_modes_to_period_states()
         state.validate()
+        self._clear_period_selection()
         self.load_state(state)
 
     def remove_period(self) -> None:
         state = self.read_state()
-        if len(state.periods) > 1:
-            last_index = len(state.periods) - 1
-            for slot_index in reversed(range(len(state.scan_slots))):
-                slot = state.scan_slots[slot_index]
-                drop = (slot.kind == "duration" and slot.target == str(last_index)) or (
-                    slot.kind == "dac" and slot.dac_period == last_index
-                )
-                if drop:
-                    state.unbind_slot(slot_index)
-            state.periods.pop()
-            self._resize_analog_bus_modes(state)
-            state.apply_analog_bus_modes_to_period_states()
+        if len(state.periods) <= 1:
+            # the table must always keep at least one period -- removing the last
+            # one would leave nothing to edit or compile.
+            self._message("Cannot remove the only period: a pulse needs at least one.")
+            return
+        # target: the selected card, the card AFTER a selected gap, else the last.
+        if self._selected_period is not None:
+            target = min(self._selected_period, len(state.periods) - 1)
+        elif self._selected_gap is not None:
+            target = min(self._selected_gap, len(state.periods) - 1)
+        else:
+            target = len(state.periods) - 1
+        self._shift_slot_targets(state, removed=target)
+        state.periods.pop(target)
+        self._edit_analog_bus_modes(state, removed=target)
+        self._resize_analog_bus_modes(state)
+        state.apply_analog_bus_modes_to_period_states()
         if state.repeat_start is not None and state.repeat_end is not None:
+            if state.repeat_start > target:
+                state.repeat_start -= 1
+            if state.repeat_end >= target:
+                state.repeat_end -= 1
             state.repeat_end = min(state.repeat_end, len(state.periods) - 1)
-            if state.repeat_end < state.repeat_start:
+            if state.repeat_end <= state.repeat_start:
                 state.repeat_start = state.repeat_end = None
                 state.repeat_count = 1
         state.validate()
+        self._clear_period_selection()
         self.load_state(state)
 
     def toggle_bracket(self) -> None:
@@ -2848,6 +3105,12 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self.add_channel_combo.setEnabled(has_hidden)
         self.add_channel_button.setEnabled(has_hidden)
 
+    @staticmethod
+    def _state_key(state: PulseTableState) -> str:
+        import json
+
+        return json.dumps(state.to_dict(), sort_keys=True, separators=(",", ":"))
+
     def _prepare_to_device(self):
         state = self.read_state()
         clock_step_ns = self._clock_step_ns(self.sequencer)
@@ -2856,8 +3119,12 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 state.to_sequence(time_step_ns=clock_step_ns)
             else:
                 state.to_sequence()
+            self._applied_state_key = self._state_key(state)
             return None
-        return self.sequencer.prepare(state)
+        program = self.sequencer.prepare(state)
+        # record what is now APPLIED on the device (the UNSYNCED baseline)
+        self._applied_state_key = self._state_key(state)
+        return program
 
     # --- Run controls: SIMPLE + SYNCHRONOUS.  prepare/fire/safe_state just call the
     # sequencer directly on the GUI thread.  With the FPGA STATUS-clear fix, a LOAD
@@ -2901,6 +3168,47 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 elif hasattr(self.sequencer, "abort"):
                     self.sequencer.abort()
             self.stateui_manager.runstate = RunState.SAFE
+        except Exception as exc:
+            self.stateui_manager.runstate = RunState.ERROR
+            self._message(str(exc))
+
+    def sync_from_device(self) -> None:
+        """Pull the pulse actually APPLIED on the sequencer into the editor.
+
+        The sequencer service records the SOURCE payload (the PulseTableState
+        JSON) of every successful prepare -- whether it came from this GUI or a
+        notebook/raw-API call (``PulseController.on_pulse`` etc.).  Sync loads
+        that state back into the editor so the GUI again reflects the device."""
+        import json
+
+        RunState = PulseStateUIManager.RunState
+        if self.sequencer is None:
+            self._message("No sequencer attached -- nothing to sync from.")
+            return
+        try:
+            snap = self.sequencer.snapshot() if hasattr(self.sequencer, "snapshot") else {}
+            payload = (snap or {}).get("last_payload_json")
+            if not payload:
+                self._message("The sequencer has no applied pulse yet (nothing was prepared).")
+                return
+            data = json.loads(str(payload))
+            if not isinstance(data, dict) or "periods" not in data:
+                self._message("The applied payload is a raw sequence (not a pulse table); cannot sync it into the editor.")
+                return
+            state = PulseTableState.from_dict(data)
+            self.load_state(state)
+            self._applied_state_key = self._state_key(self.read_state())
+            remote_state = str((snap or {}).get("state") or "")
+            if remote_state == "running":
+                self.stateui_manager.runstate = RunState.RUNNING
+            elif remote_state == "prepared":
+                self.stateui_manager.runstate = RunState.PREPARED
+            else:
+                self.stateui_manager.runstate = RunState.STOP
+            # synced from the device, not from a file: mark unsaved so Save hints.
+            self.stateui_manager.filestate = PulseStateUIManager.FileState.UNSAVED
+            if hasattr(self, "preview_status"):
+                self.preview_status.setText("Synced from device.")
         except Exception as exc:
             self.stateui_manager.runstate = RunState.ERROR
             self._message(str(exc))
@@ -2988,6 +3296,14 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         if self._building:
             return
         self._preview_dirty = True
+        # Confocal-style UNSYNCED: an edit while the device is running/prepared means
+        # the device no longer matches the editor -> orange On Pulse hint.  Cheap here
+        # (no state serialisation); the debounced _update_summary does the accurate
+        # compare and restores the run state if the edit brought the state back.
+        RunState = PulseStateUIManager.RunState
+        if self.stateui_manager.runstate in (RunState.RUNNING, RunState.PREPARED):
+            self._unsynced_from = self.stateui_manager.runstate
+            self.stateui_manager.runstate = RunState.UNSYNCED
         self._summary_timer.start()
         if hasattr(self, "tabs") and self.tabs.currentWidget() is getattr(self, "preview_tab", None):
             self._preview_timer.start()
@@ -3002,14 +3318,20 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             # The pulse COUNT is the only thing we need from the (expensive) full expansion;
             # cache it keyed on the state so a burst of debounced refreshes for the SAME state
             # doesn't rebuild the sequence each time.  Identical display, less compute.
-            import json
-            state_key = json.dumps(state.to_dict(), sort_keys=True, separators=(",", ":"))
+            state_key = self._state_key(state)
             if state_key == getattr(self, "_summary_state_key", None):
                 pulse_count = self._summary_pulse_count
             else:
                 pulse_count = len(state.to_sequence().pulses)
                 self._summary_state_key = state_key
                 self._summary_pulse_count = pulse_count
+            # accurate UNSYNCED resolution (the cheap _mark_dirty flip was pessimistic):
+            # if the editor state matches what is applied on the device again, restore.
+            RunState = PulseStateUIManager.RunState
+            if (self.stateui_manager.runstate == RunState.UNSYNCED
+                    and self._applied_state_key is not None
+                    and state_key == self._applied_state_key):
+                self.stateui_manager.runstate = self._unsynced_from or RunState.PREPARED
             hidden = state.hidden_active_channels()
             total_ns = state.total_duration_ns()
             parts = [
@@ -3108,6 +3430,9 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             show_names=True,
             display=False,
             data_figure=False,
+            # x auto-extend: one width block per PULSE_X_PERIODS_PER_BLOCK periods
+            # (capped at PULSE_X_MAX_WIDTH_FACTOR x) -- mirrors the y row blocks.
+            period_count=len(state.periods),
         )
         bus_rows = [str(trace.get("name")) for trace in analog_traces]
         self._annotate_variable_regions(plotter, state, channels, bus_rows=bus_rows)

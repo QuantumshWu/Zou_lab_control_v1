@@ -9,7 +9,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.collections import PolyCollection
 from matplotlib.patches import Rectangle
-from matplotlib.ticker import FuncFormatter, MaxNLocator, ScalarFormatter
+from matplotlib.ticker import Formatter, FuncFormatter, MaxNLocator, ScalarFormatter
 import numpy as np
 from scipy.optimize import curve_fit
 
@@ -49,6 +49,12 @@ PULSE_COLORS = [
 # channels are shown).
 PULSE_X_MARGIN_FRAC = 0.04          # per-side x headroom, as a fraction of the time span
 PULSE_X_BRACKET_LABEL_FRAC = 0.05   # extra RIGHT headroom when a repeat x N bracket label is shown
+# X AUTO-EXTEND (mirrors the y row-block behaviour): the pulse plot grows one base-width
+# block per PULSE_X_PERIODS_PER_BLOCK periods, capped at PULSE_X_MAX_WIDTH_FACTOR x the
+# base width.  Both are user-configurable (set before building the figure):
+#   import Zou_lab_control.frontend.live as live; live.PULSE_X_PERIODS_PER_BLOCK = 4
+PULSE_X_PERIODS_PER_BLOCK = 5       # periods per horizontal width block
+PULSE_X_MAX_WIDTH_FACTOR = 3        # max width as a multiple of the base data width
 PULSE_Y_PAD_BOTTOM = 0.62           # gap below the bottom channel row (row units)
 PULSE_Y_PAD_TOP = 0.38              # gap above the top channel row (row units)
 
@@ -698,6 +704,47 @@ def _pulse_rows(sequence) -> list[dict[str, Any]]:
     return rows
 
 
+class _PulseTimeFormatter(Formatter):
+    """X-tick formatter whose precision FOLLOWS the tick spacing.
+
+    A fixed significant-figure format degenerates when the view is zoomed deep
+    into a long timeline: ticks at 8.0001/8.0002/8.0003 ms all rendered as
+    "8.000" -- every label identical, the axis unreadable (the reported "all
+    ticks become 8ms" failure).  The tick machinery stores the current tick
+    locations in ``self.locs`` before formatting, so the needed decimal count
+    is derived from the SMALLEST adjacent tick spacing -- adjacent labels are
+    then always distinct at any zoom.  Negative (cosmetic headroom) ticks stay
+    blanked.
+    """
+
+    def __init__(self, time_scale: float):
+        super().__init__()
+        self.time_scale = float(time_scale)
+
+    def _decimals(self) -> int:
+        locs_src = self.locs if self.locs is not None else []   # may be an ndarray: no `or`
+        locs = [float(l) / self.time_scale for l in locs_src if float(l) >= 0.0]
+        if len(locs) < 2:
+            return 0
+        spacing = min(abs(b - a) for a, b in zip(locs, locs[1:]) if b != a) if any(
+            b != a for a, b in zip(locs, locs[1:])) else 0.0
+        if spacing <= 0.0:
+            return 0
+        if spacing >= 1.0:
+            return 0
+        return min(9, int(np.ceil(-np.log10(spacing) - 1e-9)))
+
+    def __call__(self, value, pos=None) -> str:
+        if value < 0:
+            return ""
+        v = float(value) / self.time_scale
+        decimals = self._decimals()
+        if decimals == 0 and v != 0 and abs(v) < 1.0:
+            # single-tick / no-spacing fallback: keep the old 4-sig-fig look
+            return _float2str_eng(v, length=4)
+        return f"{v:.{decimals}f}"
+
+
 def _pulse_time_unit(span_s: float) -> tuple[float, str]:
     span = abs(float(span_s))
     if span < 1e-6:
@@ -747,14 +794,32 @@ def pulse_plot_spec(
     data_width_px: int = 520,
     rows_per_block: int = 10,
     block_height_px: int = 360,
+    period_count: int | None = None,
+    periods_per_block: int | None = None,
+    max_width_factor: int | None = None,
     margins_px: tuple[int, int, int, int] = (110, 90, 100, 50),
     dpi: int = 300,
 ) -> FigureSpec:
-    """FigureSpec sized so pulse rows stay legible beyond 10 channels."""
+    """FigureSpec sized so pulse rows stay legible beyond 10 channels.
+
+    The HEIGHT grows one block per ``rows_per_block`` channels (unchanged), and
+    -- mirroring that -- the WIDTH grows one ``data_width_px`` block per
+    ``periods_per_block`` periods when ``period_count`` is given, capped at
+    ``max_width_factor`` x the base width.  Defaults come from the module
+    constants ``PULSE_X_PERIODS_PER_BLOCK`` / ``PULSE_X_MAX_WIDTH_FACTOR`` so
+    they are configurable per-session."""
 
     rows_per_block = max(1, int(rows_per_block))
     chunks = max(1, ceil(max(1, int(channel_count)) / rows_per_block))
-    return FigureSpec(data_px=(int(data_width_px), int(block_height_px) * chunks), margins_px=margins_px, dpi=int(dpi))
+    width_blocks = 1
+    if period_count is not None:
+        per_block = PULSE_X_PERIODS_PER_BLOCK if periods_per_block is None else int(periods_per_block)
+        cap = PULSE_X_MAX_WIDTH_FACTOR if max_width_factor is None else int(max_width_factor)
+        if per_block > 0:
+            width_blocks = min(max(1, int(cap)), max(1, ceil(max(1, int(period_count)) / per_block)))
+    return FigureSpec(
+        data_px=(int(data_width_px) * width_blocks, int(block_height_px) * chunks),
+        margins_px=margins_px, dpi=int(dpi))
 
 
 def pulse_repeat_notation(
@@ -900,6 +965,7 @@ class PulseSequenceFigure(BaseLivePlot):
         repeat_brackets: Sequence[tuple[float, float, str]] | None = None,
         analog_traces: Sequence[Mapping[str, Any]] | None = None,
         auto_height: bool = True,
+        period_count: int | None = None,
         labels: Sequence[str] = ("Time (s)", "", "State"),
         **kwargs,
     ):
@@ -926,7 +992,10 @@ class PulseSequenceFigure(BaseLivePlot):
         self.channel_colors = list(colors or PULSE_COLORS)
         dummy_n = max(1, len(self.pulses))
         if auto_height and not any(key in kwargs for key in ("spec", "data_px", "margins_px")):
-            kwargs["spec"] = pulse_plot_spec(len(self.channels) + len(self.analog_traces))
+            # period_count drives the x auto-extend (one width block per
+            # PULSE_X_PERIODS_PER_BLOCK periods, capped at PULSE_X_MAX_WIDTH_FACTOR).
+            kwargs["spec"] = pulse_plot_spec(
+                len(self.channels) + len(self.analog_traces), period_count=period_count)
         super().__init__(np.arange(dummy_n, dtype=float), np.zeros((dummy_n, 1), dtype=float), labels=labels, relim_mode="tight", **kwargs)
 
     @property
@@ -1129,7 +1198,7 @@ class PulseSequenceFigure(BaseLivePlot):
             )
         self._draw_repeat_bracket(n_channels)
         self.ax.xaxis.set_major_locator(MaxNLocator(nbins=5, prune="lower"))
-        self.ax.xaxis.set_major_formatter(FuncFormatter(lambda value, _pos: "" if value < 0 else _float2str_eng(value / self.time_scale, length=4)))
+        self.ax.xaxis.set_major_formatter(_PulseTimeFormatter(self.time_scale))
         self.ax.tick_params(axis="x", which="both", bottom=True, top=False, labelbottom=True, labeltop=False, pad=2)
         self.ax.set_axisbelow(True)
         self.ax.grid(axis="x", color="0.88", linewidth=0.35, zorder=0)
