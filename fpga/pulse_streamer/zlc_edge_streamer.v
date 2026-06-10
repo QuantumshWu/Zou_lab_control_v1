@@ -67,6 +67,11 @@ module zlc_edge_streamer #(
     parameter integer BUS_WIDTH = 10,
     parameter integer BUS_SEG_ADDR_WIDTH = 6,
     parameter integer BUS_SEL_WIDTH = 3,
+    // IDLE/SAFE DAC code.  The DAC driver is bipolar OFFSET-BINARY: code 0 = NEGATIVE full
+    // scale, code 2^(B-1) (=512 for 10 bits) = true 0 V.  Every "rest" value of a bus --
+    // power-up, reset/CMD_SAFE, FIRE re-init, the delayed-read gate before the ring fills,
+    // and after done -- uses THIS mid-scale code so an idle DAC outputs 0 V, not -FS.
+    parameter integer BUS_SAFE_VALUE = (1 << (BUS_WIDTH - 1)),
     parameter integer DELAY_DEPTH = 2048,       // delay-line buffer depth in ticks (~40us @ 20ns);
                                                 // bounded cap, covers +/-15us after the global shift G
     parameter integer RD_LAT = 2,               // edge-BRAM read latency (forced)
@@ -224,6 +229,12 @@ module zlc_edge_streamer #(
 
     // ----- bus runtime --------------------------------------------------------
     reg [BUS_WIDTH-1:0] bus_value_active [0:BUS_COUNT-1];
+    // POWER-UP: Xilinx registers take their initial value at configuration, so the DAC
+    // pins sit at the SAFE mid-scale code (0 V) from the first clock -- not at code 0
+    // (negative full scale) -- even before the host's first CMD_SAFE/reset.
+    integer bus_pu;
+    initial for (bus_pu = 0; bus_pu < BUS_COUNT; bus_pu = bus_pu + 1)
+        bus_value_active[bus_pu] = BUS_SAFE_VALUE[BUS_WIDTH-1:0];
     reg [BUS_SEG_ADDR_WIDTH:0] bus_index_active [0:BUS_COUNT-1];
     reg [BUS_SEG_ADDR_WIDTH:0] bus_count_active [0:BUS_COUNT-1];
     reg bus_ramp_active [0:BUS_COUNT-1];
@@ -327,7 +338,8 @@ module zlc_edge_streamer #(
     // ----- per-bus OUTPUT merge: LITERAL per-bus delay line (combinational ring read) -----
     // A NOT-delayed bus (d_bus == 0) passes the live UNDELAYED bus_value_active straight through.
     // A DELAYED bus reads its 10-bit value d_bus writes ago from bus_ring -- gated by (del_fill >=
-    // d_bus) so it holds the safe 0 until t >= d_bus (silent until t == d).
+    // d_bus) so it holds the SAFE mid-scale code (BUS_SAFE_VALUE = 0 V on the offset-binary
+    // driver) until t >= d_bus (silent until t == d).
     reg [BUS_WIDTH-1:0] bus_out_merged [0:BUS_COUNT-1];
     integer bus_om;
     always @(*) begin
@@ -335,7 +347,7 @@ module zlc_edge_streamer #(
             if (del_bus_ticks[bus_om] != {DELAY_TICK_WIDTH{1'b0}})
                 bus_out_merged[bus_om] = (del_fill >= del_bus_ticks[bus_om])
                                          ? bus_ring[bus_om][zlc_delay_rd(del_bus_ticks[bus_om])]
-                                         : {BUS_WIDTH{1'b0}};
+                                         : BUS_SAFE_VALUE[BUS_WIDTH-1:0];
             else
                 bus_out_merged[bus_om] = bus_value_active[bus_om];
         end
@@ -413,7 +425,7 @@ module zlc_edge_streamer #(
         integer i;
         begin
             for (i = 0; i < BUS_COUNT; i = i + 1) begin
-                bus_value_active[i] <= {BUS_WIDTH{1'b0}};
+                bus_value_active[i] <= BUS_SAFE_VALUE[BUS_WIDTH-1:0];   // idle DAC = mid-scale = 0 V
                 bus_index_active[i] <= {(BUS_SEG_ADDR_WIDTH+1){1'b0}};
                 bus_count_active[i] <= {(BUS_SEG_ADDR_WIDTH+1){1'b0}};
                 bus_ramp_active[i] <= 1'b0; bus_ramp_dir_up[i] <= 1'b0;
@@ -502,7 +514,7 @@ module zlc_edge_streamer #(
                 if (reinit) begin
                     count = zlc_bus_count_at(i);
                     bus_count_active[i] <= count; bus_index_active[i] <= {(BUS_SEG_ADDR_WIDTH+1){1'b0}};
-                    bus_value_active[i] <= {BUS_WIDTH{1'b0}}; bus_ramp_active[i] <= 1'b0; bus_ramp_dir_up[i] <= 1'b0;
+                    bus_value_active[i] <= BUS_SAFE_VALUE[BUS_WIDTH-1:0]; bus_ramp_active[i] <= 1'b0; bus_ramp_dir_up[i] <= 1'b0;
                     bus_ramp_start_tick[i] <= {TICK_WIDTH{1'b0}}; bus_ramp_stop_tick[i] <= {TICK_WIDTH{1'b0}};
                     bus_ramp_target[i] <= {BUS_WIDTH{1'b0}}; bus_ramp_delta[i] <= {(BUS_WIDTH+1){1'b0}};
                     bus_ramp_denom[i] <= {TICK_WIDTH{1'b0}}; bus_ramp_accum[i] <= {(TICK_WIDTH+BUS_WIDTH+1){1'b0}};

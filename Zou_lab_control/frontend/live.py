@@ -1047,17 +1047,26 @@ class PulseSequenceFigure(BaseLivePlot):
             row_top = baseline_y + row_height
             name = str(trace.get("name", f"analog{trace_index}"))
             self._analog_baseline_y[name] = baseline_y
-            max_value = max(1, int(trace.get("max", 1)))
+            # SIGNED DAC values: trace["min"]..trace["max"] span the row (the legacy
+            # unsigned form had min=0).  0 = true 0 V; with the signed range the 0 V
+            # reference sits MID-ROW and negative values dip below it.
+            v_max = int(trace.get("max", 1))
+            v_min = int(trace.get("min", 0))
+            v_span = max(1, v_max - v_min)
+            zero_frac = min(1.0, max(0.0, (0.0 - v_min) / v_span))
+            zero_y = baseline_y + row_height * zero_frac
+            self._analog_zero_y = getattr(self, "_analog_zero_y", {})
+            self._analog_zero_y[name] = zero_y
             color = self.channel_colors[(len(self.channels) + trace_index) % len(self.channel_colors)]
             starts = np.asarray(trace.get("starts", []), dtype=float)
             values = np.asarray(trace.get("values", []), dtype=float)
-            # Dashed, semi-transparent "0" reference baseline -- the analog
-            # analogue of a digital channel's off line.  Same colour + weight as
-            # the value trace, but dashed and more transparent so it reads as a
-            # reference while the solid value line stands out on top.
+            # Dashed, semi-transparent 0 V reference line -- the analog analogue of a
+            # digital channel's off line, drawn where the SIGNED value 0 maps (mid-row
+            # for a bipolar bus).  Same colour + weight as the value trace, but dashed
+            # and more transparent so it reads as a reference.
             self.ax.plot(
                 [left_limit, right_limit],
-                [baseline_y, baseline_y],
+                [zero_y, zero_y],
                 color=color,
                 linewidth=0.65,
                 alpha=0.5,
@@ -1065,12 +1074,12 @@ class PulseSequenceFigure(BaseLivePlot):
                 zorder=pulse_zorder + 1,
             )
             if starts.size >= 2 and values.size >= 1:
-                # One continuous step line that reflects the ACTUAL DAC value
-                # (a value of 0 sits on the baseline), drawn solid on top of the
-                # dashed reference.  Same weight + opacity as the digital channel
+                # One continuous step line that reflects the ACTUAL signed DAC value
+                # (0 V on the dashed mid-row line, negatives below it), drawn solid on
+                # top of the reference.  Same weight + opacity as the digital channel
                 # lines (off_lines use linewidth=0.65, alpha=1.0).
                 x = starts[: values.size + 1]
-                y_values = baseline_y + row_height * np.clip(values[: x.size - 1] / max_value, 0.0, 1.0)
+                y_values = baseline_y + row_height * np.clip((values[: x.size - 1] - v_min) / v_span, 0.0, 1.0)
                 line_x = np.repeat(x, 2)[1:-1]
                 line_y = np.repeat(y_values, 2)
                 artist = self.ax.plot(
@@ -1083,9 +1092,9 @@ class PulseSequenceFigure(BaseLivePlot):
                 )[0]
                 self.analog_trace_artists.append(artist)
             else:
-                # No value data: a flat solid line at 0 sits on the baseline.
+                # No value data: a flat solid line at 0 V (the mid-row reference).
                 artist = self.ax.plot(
-                    [left_limit, right_limit], [baseline_y, baseline_y],
+                    [left_limit, right_limit], [zero_y, zero_y],
                     color=color, linewidth=0.65, alpha=1.0, zorder=pulse_zorder + 2,
                 )[0]
                 self.analog_trace_artists.append(artist)

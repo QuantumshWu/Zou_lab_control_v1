@@ -656,6 +656,29 @@ CLI for its pre-build estimate, with the configured `fpga_part`.
   a static program (a run is never blocked); documented inline (a direct `compile_scan` still
   errors — the strict explicit-scan path).
 
+### Signed DAC semantics + period names (2026-06-09; **REBUILD REQUIRED** — BUS_SAFE_VALUE)
+The DAC driver is bipolar OFFSET-BINARY: wire code 0 = −FS, code 2^(B−1) (=512) = true 0 V.
+- **User layer is SIGNED LSB** (−512..+511, 0 = 0 V): GUI value fields, `analog_bus_modes`
+  entries, `set_bus_value`, ScanSlot dac nominals, scan-table dac columns, JSON.  Helpers:
+  `pulse_table.bus_zero_code` / `bus_signed_range`; per-slot `scan_slot_dac_ranges()`
+  (replaces `scan_slot_dac_maxes`; `snap_scan_table(dac_ranges=...)`).
+- **Wire layer stays raw code** (`RuntimeBusSegment` values, program `scan_points` dac
+  columns, validator, packers, RTL).  The signed→code (+2^(B−1)) conversion happens in
+  exactly TWO places: `_pulse_table_bus_segments` (segment emit) and `point_slot_value`
+  (scan column) — nothing else converts.
+- **RTL idles at mid-scale** (`BUS_SAFE_VALUE = 1 << (BUS_WIDTH-1)` engine parameter):
+  power-up initial, reset/CMD_SAFE clear, FIRE re-init, and the delayed-read gate all use
+  it, so an undriven DAC outputs 0 V — never −FS.  Mirrors updated (`bus_play`,
+  `bus_value_at`, `bus_delay_line_reference`/ring mirror default safe 512).  An untouched
+  bus = all-hold plan → NO segments emitted and member bits stay 0 (the "unused" marker).
+- **Even code count**: 2^B codes have no exact middle; convention 0 V = 2^(B−1), so the
+  signed range is asymmetric by 1 LSB (−512..+511).  Preview places the 0 V dashed
+  reference mid-row and draws negatives below it; the trace dict carries min/max.
+- **Period names**: each PeriodCard has an editable name field (below the unit combo so the
+  cross-panel Duration alignment is unchanged; PANEL_TOP_HEIGHT 152→178); the card title
+  keeps "Period i/N".  `to_period` round-trips the name (it used to be dropped);
+  `unrolled_bracket` copies carry it per-copy.
+
 ### RTL findings — RESOLVED 2026-06-09 (user-authorized fixes; **REBUILD REQUIRED**)
 The three bring-up items from the adversarial RTL hunt are now fixed/guarded. The
 `zlc_edge_streamer.v` change means the next hardware session MUST re-synthesize

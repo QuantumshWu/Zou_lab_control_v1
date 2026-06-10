@@ -127,11 +127,12 @@ def delay_line_reference(undelayed: Sequence[int], channel_delays) -> list[int]:
 
 
 def bus_delay_line_reference(undelayed_bus: Sequence[int], delay: int,
-                             *, safe_value: int = 0) -> list[int]:
+                             *, safe_value: int = 512) -> list[int]:
     """Exact per-bus delay line: a 10-bit DAC value stream delayed by ``d`` (one delay
-    shared by all 10 bits), holding ``safe_value`` (0 at FIRE) before t == d.  The hardware
-    is a per-bus 10-bit-wide circular buffer, depth DELAY_DEPTH: push the undelayed value
-    each tick, read d ticks ago.  d=0 is exact passthrough."""
+    shared by all 10 bits), holding ``safe_value`` before t == d.  The hardware default is
+    the SAFE mid-scale code 512 (= BUS_SAFE_VALUE = true 0 V on the offset-binary driver).
+    The hardware is a per-bus 10-bit-wide circular buffer, depth DELAY_DEPTH: push the
+    undelayed value each tick, read d ticks ago.  d=0 is exact passthrough."""
     d = int(delay)
     out = []
     for t in range(len(undelayed_bus)):
@@ -218,12 +219,12 @@ def rtl_delay_line_mirror(undelayed: Sequence[int], channel_delays,
 
 
 def rtl_bus_delay_line_mirror(undelayed_bus: Sequence[int], delay: int,
-                              *, depth: int = DELAY_DEPTH, safe_value: int = 0) -> list[int]:
+                              *, depth: int = DELAY_DEPTH, safe_value: int = 512) -> list[int]:
     """Cycle-exact circular-buffer register mirror of the RTL per-bus (10-bit) delay line.
 
-    One ``depth``-slot ring of bus VALUES (zero at FIRE); push the undelayed value each
-    tick, read ``d`` writes ago.  Equals :func:`bus_delay_line_reference`; a d > depth
-    raises :class:`DelayDepthExceeded`."""
+    One ``depth``-slot ring of bus VALUES (the SAFE mid-scale code 512 = BUS_SAFE_VALUE =
+    0 V at FIRE); push the undelayed value each tick, read ``d`` writes ago.  Equals
+    :func:`bus_delay_line_reference`; a d > depth raises :class:`DelayDepthExceeded`."""
     d = _validate_delay_depth(delay, depth, "bus")
     slots = depth + 1                                  # see rtl_delay_line_mirror (d==depth fits)
     ring = [int(safe_value)] * slots
@@ -735,7 +736,11 @@ def bus_play(program, bus_index: int, n_ticks: int, scan_point: int = 0, *,
         ve = (point[sss - 1] & mask) if sss else (int(s.stop_value) & mask)
         return vs, ve
 
-    st = {"idx": 0, "value": 0, "ramp": False, "rstart": 0, "rstop": 0,
+    # The bus rests at the SAFE mid-scale code (BUS_SAFE_VALUE in the RTL): the DAC
+    # driver is offset-binary, so mid-code = true 0 V.  An unwritten bus therefore
+    # idles at 0 V, and a tick-0 ramp carries IN from 0 V, exactly like the hardware.
+    safe = 1 << (bus_width - 1)
+    st = {"idx": 0, "value": safe, "ramp": False, "rstart": 0, "rstop": 0,
           "target": 0, "denom": 0, "accum": 0, "up": True, "delta": 0}
 
     def apply(s):
@@ -820,7 +825,7 @@ def bus_value_at(program, bus_index: int, phase: int, scan_point: int = 0, *,
         else:
             break
     if chosen is None:
-        return 0
+        return 1 << (bus_width - 1)   # rest = BUS_SAFE_VALUE (mid code = true 0 V)
     ts = eff(chosen.start_tick, chosen.start_tick_coeffs)
     te = eff(chosen.stop_tick, chosen.stop_tick_coeffs)
     vstart = endval(int(getattr(chosen, "value_select", 0)), chosen.start_value)

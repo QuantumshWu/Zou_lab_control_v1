@@ -560,34 +560,39 @@ def compile_pulse_table_scan_runtime_program(
     # snap invariant held only via compile_scan; a direct call (e.g. compile_runtime_program_
     # _for_payload) used the raw table and could emit a zero-length period.
     table = _snap_scan_table(
-        raw_rows, state.scan_slots, time_step_ns=clock_step_ns, dac_maxes=state.scan_slot_dac_maxes()
+        raw_rows, state.scan_slots, time_step_ns=clock_step_ns, dac_ranges=state.scan_slot_dac_ranges()
     )
     slot_vars = state.scan_var_names
 
     def point_slots_ns(row: Sequence[float]) -> dict[str, float]:
-        # Time slots carry a physical time (-> ns); DAC slots carry a raw 10-bit
-        # code that must pass through untouched so the bus engine reads it directly.
+        # Time slots carry a physical time (-> ns); DAC slots carry the user-facing
+        # SIGNED value (0 = true 0 V) untouched -- the offset-binary wire code is
+        # produced below in point_slot_value (the ONE signed->code conversion point).
         return {
             slot_var(index): float(row[index]) * (1.0 if slot.kind == "dac" else UNITS_TO_NS.get(slot.unit, 1.0))
             for index, slot in enumerate(state.scan_slots)
         }
 
-    # Per-slot DAC maximum (2**width - 1) so a DAC scan point can never exceed the bus
-    # width (defense in depth -- the GUI + snapped() already clamp; this guarantees the
-    # bus engine only ever sees a legal code no matter how the program was built).
-    dac_slot_maxes = state.scan_slot_dac_maxes()
+    # Per-slot signed range + zero code so the SIGNED user value becomes the legal
+    # offset-binary CODE the bus engine reads raw via value_select (defense in depth --
+    # the GUI + snapped() already clamp the signed value; this guarantees a legal code
+    # no matter how the program was built).
+    dac_slot_ranges = state.scan_slot_dac_ranges()
 
     def point_slot_value(point_index: int, slot_index: int, ns: Mapping[str, float]) -> int:
         slot = state.scan_slots[slot_index]
         if slot.kind == "dac":
-            # Store the DAC code verbatim (no ns->tick conversion); its affine
-            # coefficient is 0 so it never enters the edge-tick formula.  Clamp to the
-            # bus bit width: a negative / over-range code is pulled into [0, max].
-            code = int(round(float(ns[slot_var(slot_index)])))
-            hi = dac_slot_maxes[slot_index]
-            if hi is not None:
-                code = max(0, min(int(hi), code))
-            return code
+            # WIRE CONVERSION: signed user value -> offset-binary code (no ns->tick
+            # conversion; the affine coefficient is 0 so it never enters the edge-tick
+            # formula).  code = signed + 2^(B-1), clamped to [0, 2^B-1].
+            signed = int(round(float(ns[slot_var(slot_index)])))
+            rng = dac_slot_ranges[slot_index]
+            if rng is not None:
+                lo, hi = int(rng[0]), int(rng[1])
+                signed = max(lo, min(hi, signed))
+                zero_code = -lo                       # lo == -2^(B-1)
+                return signed + zero_code
+            return signed
         return _time_ns_to_ticks(
             ns[slot_var(slot_index)], clock_step_ns, f"scan point {point_index} slot {slot_index}", allow_negative=True
         )
@@ -1919,6 +1924,14 @@ def _pulse_table_edge_table(
         for bus_name, members in bus_groups.items():
             bus_delay = _pulse_table_bus_delay_steps(state, members, slots=slots, time_step_ns=time_step_ns)
             plan = state.analog_bus_plan(bus_name)
+            # An UNTOUCHED bus (all-hold plan, resting at 0 V) folds NOTHING -- the
+            # hardware idles at the mid code by itself (BUS_SAFE_VALUE); folding it
+            # would put phantom mid-code bits into the masks.
+            if all(str(entry.get("mode", "hold")).lower() == "hold" for entry in plan):
+                continue
+            # plan values are SIGNED (0 = 0 V); the folded member bits carry the
+            # offset-binary CODE = signed + zero_code.
+            fold_zero_code = 1 << (len(members) - 1)
             bus_ticks = sorted(set(_pulse_table_analog_bus_ticks(plan, starts)) | {0})
             for tick in bus_ticks:
                 if tick < 0 or tick > table_end:
@@ -1929,7 +1942,7 @@ def _pulse_table_edge_table(
                 raw_delay[channel] = bus_delay
                 ivals, active = [], None
                 for tick in bus_ticks:
-                    on = (int(_pulse_table_analog_bus_value_at_tick(plan, starts, tick)) >> bit) & 1
+                    on = ((int(_pulse_table_analog_bus_value_at_tick(plan, starts, tick)) + fold_zero_code) >> bit) & 1
                     if on and active is None:
                         active = int(tick)
                     elif not on and active is not None:
@@ -2135,7 +2148,11 @@ def _pulse_table_bus_segments(
         #   hold   -> emit NO segment (the engine keeps the carried value).
         # carried_value/carried_select describe the value entering the period; the ramp's
         # START endpoint reads carried_select so a scanned hold/edge still scans the start.
-        carried_value = 0
+        # WIRE CONVERSION: plan values are SIGNED (0 = true 0 V); segments carry the
+        # offset-binary CODE = signed + zero_code.  The hardware idles at zero_code
+        # (BUS_SAFE_VALUE), so carried starts there -- an edge to signed 0 is a no-op.
+        zero_code = 1 << (len(members) - 1)
+        carried_value = zero_code
         carried_select = 0
         for period_index in range(len(state.periods)):
             entry = plan[period_index] if period_index < len(plan) else {"mode": "hold", "value": None}
@@ -2146,7 +2163,7 @@ def _pulse_table_bus_segments(
             ref_index = _slot_ref_index(value, slot_vars)
             if ref_index is not None:
                 value_select = ref_index + 1
-                value_int = 0  # placeholder; the FPGA reads the slot at runtime
+                value_int = 0  # placeholder; the FPGA reads the (code) slot at runtime
             else:
                 value_select = 0
                 # On the STATIC path (slot_vars empty -- e.g. the payload dispatcher degrades a
@@ -2161,7 +2178,8 @@ def _pulse_table_bus_segments(
                             f"analog bus {bus_name!r} references unresolved scan slot {key!r}; "
                             "provide its value or a scan table.")
                     value = slots[key]
-                value_int = max(0, min(max_value, int(round(float(value)))))
+                # signed user value -> offset-binary wire code
+                value_int = max(0, min(max_value, int(round(float(value))) + zero_code))
             start_ref, start_base, start_coeffs = _boundary(period_index)
             if start_ref < 0 or start_ref > table_end:
                 raise ValueError(f"analog bus {bus_name!r} produced segment tick {start_ref} outside the uploaded table.")

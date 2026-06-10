@@ -1112,8 +1112,8 @@ def test_pulse_table_analog_bus_modes_compile_to_runtime_bus_segments(tmp_path):
             na.PulsePeriod(100, (0, 0, 0, 0), unit="ns"),
         ],
     )
-    state.set_analog_bus_mode(0, "da_test", "edge", value=0)
-    state.set_analog_bus_mode(2, "da_test", "ramp", value=7)
+    state.set_analog_bus_mode(0, "da_test", "edge", value=0)        # signed: 0 = true 0 V
+    state.set_analog_bus_mode(2, "da_test", "ramp", value=3)        # 3-bit bus: signed -4..+3
     state.apply_analog_bus_modes_to_period_states()
     saved = state.save(tmp_path / "analog_bus.json")
     loaded = na.PulseTableState.load(saved)
@@ -1123,23 +1123,23 @@ def test_pulse_table_analog_bus_modes_compile_to_runtime_bus_segments(tmp_path):
     assert loaded.analog_bus_modes["da_test"] == [
         {"mode": "edge", "value": 0},
         {"mode": "hold", "value": None},
-        {"mode": "ramp", "value": 7},
+        {"mode": "ramp", "value": 3},
     ]
-    # period 1 is a HOLD after the edge-0, so it carries 0 (the ramp belongs to period 2,
-    # not the preceding hold -- the within-period ramp fix).
-    assert loaded.periods[1].states[:3] == (0, 0, 0)
+    # period 1 is a HOLD after the edge-0V, so it carries 0 V = wire code 4 (= 1 << 2 on a
+    # 3-bit bus) -- the member bits store the OFFSET-BINARY code, so bit 2 is set.
+    assert loaded.periods[1].states[:3] == (0, 0, 1)
     assert program.ticks == [0, 5, 10, 15]
     assert program.masks == [0, 0, 0, 0]
     assert program.bus_names == ["da_test"]
-    # The edge-0 at period 0 is a no-op (bus already 0) so it emits nothing; the ramp now
-    # spans period 2 [10,15) from the carried-in 0 to 7 (NOT the old [0,10] across periods).
+    # The edge to signed 0 (= the idle mid code 4) is a no-op so it emits nothing; the
+    # ramp spans period 2 [10,15) from the carried-in code 4 (0 V) to code 7 (+3 LSB).
     assert [segment.to_dict() for segment in (program.bus_segments or [])] == [
         {
             "bus_index": 0,
             "bus_name": "da_test",
             "start_tick": 10,
             "stop_tick": 15,
-            "start_value": 0,
+            "start_value": 4,
             "stop_value": 7,
             "mode": "ramp",
             "value_select": 0,
@@ -1185,17 +1185,18 @@ def test_dac_ramp_spans_current_period_with_hold_carry_and_edge_step():
     program = state.compile(clock_hz=50_000_000)
     wave = bus_play(program, 0, 200)   # 4 periods x 50 ticks
 
-    # period 0 (edge 100) and period 1 (hold) both sit flat at 100 -- the ramp is NOT here.
-    assert wave[0] == 100 and wave[49] == 100
-    assert min(wave[50:100]) == 100 and max(wave[50:100]) == 100   # hold carries 100, no ramp
-    # period 2 (ramp to 140) rises monotonically WITHIN [100,150): starts at the carried 100
-    # and reaches the target by the period end.
-    assert wave[100] == 100
+    # wire codes: signed v -> code v + 512 (offset-binary).  edge +100 -> code 612.
+    # period 0 (edge +100) and period 1 (hold) both sit flat at code 612 -- the ramp is NOT here.
+    assert wave[0] == 612 and wave[49] == 612
+    assert min(wave[50:100]) == 612 and max(wave[50:100]) == 612   # hold carries +100, no ramp
+    # period 2 (ramp to +140) rises monotonically WITHIN [100,150): starts at the carried
+    # +100 (code 612) and reaches the target (code 652) by the period end.
+    assert wave[100] == 612
     assert all(wave[i] <= wave[i + 1] for i in range(100, 149))     # monotone non-decreasing
-    assert wave[125] > 100 and wave[149] >= 138                     # actually ramping, ~140 by the end
-    # period 3 (edge 0) steps back to 0 (settled within the period; the boundary tick is a
-    # 1-tick registered transition)
-    assert wave[160] == 0 and wave[199] == 0
+    assert wave[125] > 612 and wave[149] >= 650                     # actually ramping, ~652 by the end
+    # period 3 (edge 0 = true 0 V) steps back to the mid code 512 (settled within the
+    # period; the boundary tick is a 1-tick registered transition)
+    assert wave[160] == 512 and wave[199] == 512
 
 
 def test_clk_channel_excluded_from_engine_and_carried_as_mask(tmp_path):
@@ -1302,7 +1303,8 @@ def test_bus_play_models_dual_endpoint_ramp_and_held_value():
                              start_tick_coeffs=[0, 0], stop_tick_coeffs=[0, 0])
     p = prog([ramp], [[100, 900], [900, 100]])
     up = bus_play(p, 0, 100, scan_point=0)        # ramp scanned-A(100) -> scanned-B(900)
-    assert up == sorted(up)                        # non-decreasing 0 -> 100 -> ... -> 900
+    assert all(v == 512 for v in up[:11])          # rest = BUS_SAFE mid code until the ramp lands
+    assert up[11:] == sorted(up[11:])              # then non-decreasing 100 -> ... -> 900
     assert 100 in up and max(up) == 900 and up[-1] == 900
     down = bus_play(p, 0, 100, scan_point=1)       # ramp scanned-A(900) -> scanned-B(100)
     assert max(down) == 900 and down[-1] == 100
@@ -1349,8 +1351,8 @@ def test_pulse_table_scan_allows_analog_bus_ramp_with_timing_scan():
     state.bind_field("duration", "0")
     state.set_scan_table([[20.0], [40.0]])
     # ... while the analog bus ramps between FIXED value endpoints: now supported.
-    state.set_analog_bus_mode(0, "da_test", "edge", value=0)
-    state.set_analog_bus_mode(1, "da_test", "ramp", value=3)
+    state.set_analog_bus_mode(0, "da_test", "edge", value=0)        # 0 = true 0 V
+    state.set_analog_bus_mode(1, "da_test", "ramp", value=1)        # 2-bit bus: signed -2..+1
 
     program = na.compile_pulse_table_scan_runtime_program(
         state, channels=["ch00", "ch01"], clock_hz=50_000_000
@@ -1358,8 +1360,9 @@ def test_pulse_table_scan_allows_analog_bus_ramp_with_timing_scan():
     ramps = [s for s in (program.bus_segments or []) if s.mode == "ramp"]
     assert ramps, "expected a ramp segment"
     r = ramps[0]
-    # fixed value endpoints (no scanned-endpoint value_select) ...
-    assert r.start_value == 0 and r.stop_value == 3 and r.value_select == 0
+    # fixed value endpoints (no scanned-endpoint value_select); wire codes on the
+    # 2-bit bus: carried-in 0 V = mid code 2, signed +1 -> code 3 ...
+    assert r.start_value == 2 and r.stop_value == 3 and r.value_select == 0
     # ... but affine ticks: the scanned-duration slot moves a ramp endpoint tick so
     # the ramp stretches in lockstep with the scan.
     assert any(c != 0 for c in (list(r.start_tick_coeffs or []) + list(r.stop_tick_coeffs or []))), \
@@ -1959,7 +1962,7 @@ def _rtl_bus_held_value(program, bus_index, tick, scan_point, *, bus_width=10):
         (s for s in (program.bus_segments or []) if int(s.bus_index) == int(bus_index)),
         key=eff_start,
     )
-    value = 0
+    value = 1 << (bus_width - 1)   # the bus rests at BUS_SAFE_VALUE (mid code = 0 V)
     for seg in segments:
         if eff_start(seg) > tick:
             break
@@ -1999,8 +2002,9 @@ def test_dac_value_scan_behavioral_model_tracks_scanned_code():
         ],
     )
     state.bind_field("dac", "da@1")                 # scan the 10-bit "da" bus in period 1
-    codes = [0, 256, 768, 1023]
-    state.set_scan_table([[c] for c in codes])
+    signed_values = [-512, -256, 256, 511]          # user layer: signed LSB (0 = 0 V)
+    codes = [v + 512 for v in signed_values]        # wire layer: offset-binary 0/256/768/1023
+    state.set_scan_table([[v] for v in signed_values])
 
     program = na.compile_pulse_table_scan_runtime_program(state, channels=hw, clock_hz=50_000_000)
     na.validate_pulse_streamer_program(program, max_edges=1024, max_scan_points=1024, tick_width=32, channel_count=12)
@@ -2015,8 +2019,8 @@ def test_dac_value_scan_behavioral_model_tracks_scanned_code():
         # During the scanned period the DAC equals THIS point's code...
         assert _rtl_bus_held_value(program, bus, int(seg.start_tick), point_index) == code
         assert _rtl_bus_held_value(program, bus, int(seg.start_tick) + 3, point_index) == code
-        # ...and the prior (period-0) level is still the unscanned 0 just before it.
-        assert _rtl_bus_held_value(program, bus, int(seg.start_tick) - 1, point_index) == 0
+        # ...and the prior (period-0) level is still the idle mid code (0 V) just before it.
+        assert _rtl_bus_held_value(program, bus, int(seg.start_tick) - 1, point_index) == 512
 
     # Consecutive scan points really produce different DAC outputs (seamless sweep).
     sweep = [_rtl_bus_held_value(program, bus, int(seg.start_tick), p) for p in range(len(codes))]
@@ -2049,8 +2053,9 @@ def test_dac_plus_duration_scan_behavioral_model_value_and_timing():
     state.bind_field("dac", "da@1")       # s1: scanned DAC level in period 1
     # rows: [period-0 duration ns, DAC code]
     durations_ns = [100, 200, 400]
-    codes = [0, 512, 1023]
-    state.set_scan_table([[d, c] for d, c in zip(durations_ns, codes)])
+    signed_values = [-512, 0, 511]                   # user layer (0 = 0 V)
+    codes = [v + 512 for v in signed_values]         # wire codes 0 / 512 / 1023
+    state.set_scan_table([[d, v] for d, v in zip(durations_ns, signed_values)])
 
     program = na.compile_pulse_table_scan_runtime_program(state, channels=hw, clock_hz=50_000_000)
     na.validate_pulse_streamer_program(program, max_edges=1024, max_scan_points=1024, tick_width=32, channel_count=12)
@@ -2065,11 +2070,11 @@ def test_dac_plus_duration_scan_behavioral_model_value_and_timing():
         eff = _apply_affine_ticks(int(seg.start_tick), seg.start_tick_coeffs, point, frac)
         dur_ticks = durations_ns[point_index] // 20
         assert eff == dur_ticks  # period-1 start = scanned period-0 duration
-        # DAC code present at/after the SHIFTED tick, and 0 just before it.
+        # DAC code present at/after the SHIFTED tick, and the idle mid code just before it.
         assert _rtl_bus_held_value(program, bus, eff, point_index) == code
         assert _rtl_bus_held_value(program, bus, eff + 5, point_index) == code
         if eff > 0:
-            assert _rtl_bus_held_value(program, bus, eff - 1, point_index) == 0
+            assert _rtl_bus_held_value(program, bus, eff - 1, point_index) == 512
 
 
 def test_pulse_table_dac_duration_delay_scan_simultaneously():
@@ -2828,19 +2833,20 @@ def test_pulse_table_snapped_snaps_literals_and_keeps_expressions():
     # the original state is untouched (snapped returns a copy)
     assert state.periods[0].duration == 50
 
-    # snap_scan_table is the shared helper used by the GUI; DAC slots round to an
-    # integer code (clamped to the bus width), duration slots snap UP to >= 1 tick.
+    # snap_scan_table is the shared helper used by the GUI; DAC slots round to a SIGNED
+    # integer (clamped to the bus's signed range), duration slots snap UP to >= 1 tick.
     dac_slot = ScanSlot(kind="dac", target="da_dipole@0", unit="value")
     time_slot = ScanSlot(kind="duration", target="1", unit="ns")
-    snapped_rows = snap_scan_table([[51.0, 512.4], [9.0, 800.6]], [time_slot, dac_slot], time_step_ns=20)
-    assert snapped_rows == [[60.0, 512.0], [20.0, 801.0]]
-    # DAC codes are clamped to [0, max]: a negative or over-range code is pulled in.
-    clamped = snap_scan_table([[-5.0, 2000.0]], [time_slot, dac_slot], time_step_ns=20, dac_maxes=[None, 1023])
-    assert clamped == [[20.0, 1023.0]]
+    snapped_rows = snap_scan_table([[51.0, 112.4], [9.0, -300.6]], [time_slot, dac_slot], time_step_ns=20)
+    assert snapped_rows == [[60.0, 112.0], [20.0, -301.0]]
+    # DAC values are clamped to the SIGNED range: an out-of-range value is pulled in.
+    clamped = snap_scan_table([[-5.0, 2000.0]], [time_slot, dac_slot], time_step_ns=20, dac_ranges=[None, (-512, 511)])
+    assert clamped == [[20.0, 511.0]]
 
 
-def test_scan_slot_dac_maxes_reports_bus_width():
-    """A DAC scan slot reports its bus's max code (2**width - 1); time slots report None."""
+def test_scan_slot_dac_ranges_report_signed_bus_width():
+    """A DAC scan slot reports its bus's SIGNED value range (-2^(B-1), +2^(B-1)-1);
+    time slots report None."""
 
     state = na.PulseTableState(
         channels=[f"da[{i}]" for i in range(10)] + ["trig"],
@@ -2851,9 +2857,9 @@ def test_scan_slot_dac_maxes_reports_bus_width():
         ],
         time_step_ns=20,
     )
-    maxes = state.scan_slot_dac_maxes()
-    assert maxes[0] == (1 << 10) - 1  # 10-bit DAC bus -> 1023
-    assert maxes[1] is None           # duration slot has no DAC max
+    ranges = state.scan_slot_dac_ranges()
+    assert ranges[0] == (-512, 511)   # 10-bit DAC bus: signed range around true 0 V
+    assert ranges[1] is None          # duration slot has no DAC range
 
 
 def test_compile_scan_clamps_dac_codes_to_bus_width():
@@ -2874,10 +2880,12 @@ def test_compile_scan_clamps_dac_codes_to_bus_width():
         time_step_ns=20.0,
     )
     state.bind_field("dac", "da@0", unit="value", label="da")
-    state.set_scan_table([[-50.0], [512.4], [2000.0]])
+    state.set_scan_table([[-600.0], [112.4], [2000.0]])
     program = state.compile_scan(clock_hz=50e6)
     codes = [point[0] for point in program.scan_points]
-    assert codes == [0, 512, 1023]  # clamped: -50->0, 512.4->512, 2000->1023
+    # signed user values are clamped to (-512, +511) then shipped as offset-binary codes:
+    # -600 -> -512 -> code 0; 112.4 -> 112 -> code 624; 2000 -> +511 -> code 1023.
+    assert codes == [0, 624, 1023]
 
 
 def test_delay_depth_constants_agree_across_layers():
@@ -4370,7 +4378,7 @@ def test_rtl_bus_delay_line_mirror_matches_physical_delay():
         U = [rng.randint(0, 1023) for _ in range(n)]          # full 10-bit DAC code stream
         mirror = em.rtl_bus_delay_line_mirror(U, d)
         assert mirror == em.bus_delay_line_reference(U, d), f"bus delay-line != reference at d={d}"
-        assert all(mirror[t] == 0 for t in range(min(d, n))), "DAC bus not held safe during startup"
+        assert all(mirror[t] == 512 for t in range(min(d, n))), "DAC bus not held safe (mid code) during startup"
     U = [rng.randint(0, 1023) for _ in range(100)]
     assert em.rtl_bus_delay_line_mirror(U, 0) == U            # d=0 exact passthrough
     with pytest.raises(em.DelayDepthExceeded, match=r"exceeds the delay-line depth DELAY_DEPTH=2048"):
@@ -4461,7 +4469,7 @@ def test_bus_delay_line_with_scanned_value_and_ramp():
             undelayed = [em.bus_value_at(prog, 0, t % T, sp) for t in range(n)]   # steady periodic stream
             rtl = em.rtl_bus_delay_line_mirror(undelayed, d)
             assert rtl == em.bus_delay_line_reference(undelayed, d), f"bus delay-line != reference (T={T}, d={d}, sp={sp})"
-            assert all(rtl[t] == 0 for t in range(min(d, n))), "DAC bus not held safe during startup"
+            assert all(rtl[t] == 512 for t in range(min(d, n))), "DAC bus not held safe (mid code) during startup"
             if d == 0:
                 assert rtl == undelayed                                          # exact passthrough
 
@@ -4521,8 +4529,9 @@ def test_scanned_dac_value_delayed_beyond_one_frame_compiles_and_streams():
         delays={f"ch{i:02d}": 1000 for i in range(10)},
         delay_units={f"ch{i:02d}": "ns" for i in range(10)})
     state.bind_field("dac", "da@1")
-    codes = [0, 256, 768, 1023]
-    state.set_scan_table([[c] for c in codes])
+    signed_values = [-512, -256, 256, 511]
+    codes = [v + 512 for v in signed_values]         # wire codes 0 / 256 / 768 / 1023
+    state.set_scan_table([[v] for v in signed_values])
 
     prog = na.compile_pulse_table_scan_runtime_program(state, channels=hw, clock_hz=50_000_000)
     na.validate_pulse_streamer_program(prog, max_edges=1024, max_scan_points=1024, tick_width=32, channel_count=12)
@@ -4538,10 +4547,10 @@ def test_scanned_dac_value_delayed_beyond_one_frame_compiles_and_streams():
     for sp, code in enumerate(codes):
         undelayed = [em.bus_value_at(prog, bus, t % T, sp) for t in range(n)]   # the steady stream
         delayed = em.rtl_bus_delay_line_mirror(undelayed, 50)                   # the literal delay line
-        # the delayed stream is EXACTLY the undelayed stream shifted by d (safe 0 before t==d).
+        # the delayed stream is EXACTLY the undelayed stream shifted by d (mid code before t==d).
         assert delayed == em.bus_delay_line_reference(undelayed, 50)
         # the scanned DAC code really reaches the (delayed) bus output for this point.
-        assert code in set(delayed) or code == 0
+        assert code in set(delayed)
 
 
 def test_fixed_dac_bus_delayed_beyond_one_frame_compiles_and_streams():
@@ -4560,8 +4569,8 @@ def test_fixed_dac_bus_delayed_beyond_one_frame_compiles_and_streams():
                  na.PulsePeriod(200, (0, 0, 0), unit="ns"),
                  na.PulsePeriod(100, (0, 0, 0), unit="ns")],
         delays={"ch00": 1000, "ch01": 1000}, delay_units={"ch00": "ns", "ch01": "ns"})
-    state.set_analog_bus_mode(0, "da", "edge", value=0)
-    state.set_analog_bus_mode(1, "da", "edge", value=3)
+    state.set_analog_bus_mode(0, "da", "edge", value=0)   # 0 = true 0 V (wire code 2)
+    state.set_analog_bus_mode(1, "da", "edge", value=1)   # 2-bit bus: signed -2..+1 -> wire code 3
     state.apply_analog_bus_modes_to_period_states()
     prog = compile_pulse_table_runtime_program(state, channels=hw, clock_hz=50e6, repeat_forever=True)
     na.validate_pulse_streamer_program(prog, max_edges=1024, max_scan_points=1024, tick_width=32, channel_count=3)
@@ -4852,7 +4861,7 @@ def test_scanned_dac_of_bracketed_period_plus_delay():
         repeat_start=1, repeat_end=1, repeat_count=2,
         delays={"ch02": 200}, delay_units={"ch02": "ns"})
     st.bind_field("dac", "da@1", unit="value", label="da")
-    st.set_scan_table([[1.0], [3.0]])
+    st.set_scan_table([[-1.0], [1.0]])                       # signed -> wire codes 1 and 3
     # the DAC slot binds a bracketed period; both unrolled copies keep the 's0' bus entry.
     u = st.unrolled_bracket()
     plan = u.analog_bus_plan("da")
@@ -4945,7 +4954,7 @@ def test_constant_delay_with_scanned_dac_value_is_output_delay_line():
             delays=delays, delay_units=({"ch03": "ns"} if delays else {}),
         )
         st.bind_field("dac", "da@1", unit="value", label="da")   # scan the DAC value -> s0
-        st.set_scan_table([[1.0], [3.0]])                        # two DAC codes
+        st.set_scan_table([[-1.0], [1.0]])                       # signed -> wire codes 1 and 3
         return st
 
     pd = cscan(build({"ch03": D_ns}), channels=chans, clock_hz=50e6, repeat_forever=True)
@@ -5261,7 +5270,7 @@ def test_dac_scan_empty_table_static_compile_uses_reference_code():
     )
     prog = na.compile_runtime_program_for_payload(st, channels=ch, clock_hz=50e6)
     segs = prog.bus_segments or []
-    assert any(int(s.start_value) == 256 and int(s.value_select) == 0 for s in segs)
+    assert any(int(s.start_value) == 768 and int(s.value_select) == 0 for s in segs)   # signed 256 -> code 768
 
 
 def test_clk_enable_mask_uses_hardware_channel_order():
@@ -5439,7 +5448,7 @@ def test_compile_warns_when_dac_bus_active_but_da_clk_pin_idle():
     base = dict(
         channels=channels, channel_labels=labels, time_step_ns=20,
         periods=[na.PulsePeriod(1000, (0, 0, 0, 1), unit="ns")],
-        analog_bus_modes={"da_x": [{"mode": "edge", "value": 3}]},
+        analog_bus_modes={"da_x": [{"mode": "edge", "value": 1}]},   # 2-bit bus: signed -2..+1
     )
     with _w.catch_warnings(record=True) as got:
         _w.simplefilter("always")
@@ -5478,3 +5487,68 @@ def test_create_project_tcl_hard_verifies_edge_bram_latency():
     assert "ZLC LATENCY-CHECK FAILED" in tcl
     assert "ZLC LATENCY-CHECK OK" in tcl
     assert tcl.count("get_property $prop [get_ips $ip]") >= 1
+
+
+# --------------------------------------------------------------------------- #
+# 2026-06-09 features: editable period names + signed DAC (0 = 0 V, mid-code idle).
+# --------------------------------------------------------------------------- #
+def test_signed_dac_user_layer_to_wire_codes_end_to_end():
+    """USER layer is signed LSB (0 = true 0 V, range -2^(B-1)..+2^(B-1)-1); the WIRE
+    layer (segments, scan_points, RTL) is offset-binary code = signed + 2^(B-1).
+    The conversion happens exactly once, in the compilers."""
+
+    from Zou_lab_control.neutral_atom.timing.pulse_table import bus_signed_range, bus_zero_code
+
+    assert bus_zero_code(10) == 512 and bus_signed_range(10) == (-512, 511)
+    ch = [f"da[{i}]" for i in range(10)] + ["trig"]
+    st = na.PulseTableState(
+        channels=ch, time_step_ns=20,
+        periods=[na.PulsePeriod(1000, tuple([0] * 10 + [1]), unit="ns"),
+                 na.PulsePeriod(1000, tuple([0] * 11), unit="ns")],
+    )
+    st.set_analog_bus_mode(0, "da", "edge", value=-200)
+    st.set_analog_bus_mode(1, "da", "ramp", value=300)
+    prog = na.compile_runtime_program_for_payload(st, channels=ch, clock_hz=50e6)
+    segs = [(s.mode, s.start_value, s.stop_value) for s in prog.bus_segments]
+    assert segs == [("edge", 312, 312), ("ramp", 312, 812)]   # codes = signed + 512
+    # user-facing views stay signed
+    assert st.analog_bus_value_at_period_start(0, "da") == -200
+    # an out-of-range signed value is rejected with the signed bounds in the message
+    import pytest
+    with pytest.raises(ValueError, match="-512 and 511"):
+        st.set_analog_bus_mode(0, "da", "edge", value=900)
+
+
+def test_untouched_dac_bus_idles_at_mid_code():
+    """An untouched bus rests at TRUE 0 V: the compiler emits no segments for it and the
+    RTL idles at BUS_SAFE_VALUE (mid code) -- locked here in the model and the RTL text."""
+
+    import re
+    from fpga.pulse_streamer.host.engine_model import bus_play
+
+    ch = [f"da[{i}]" for i in range(10)] + ["trig"]
+    st = na.PulseTableState(channels=ch, time_step_ns=20,
+                            periods=[na.PulsePeriod(1000, tuple([0] * 10 + [1]), unit="ns")])
+    prog = na.compile_runtime_program_for_payload(st, channels=ch, clock_hz=50e6)
+    assert not (prog.bus_segments or [])                      # nothing emitted
+    assert all(v == 512 for v in bus_play(prog, 0, 50))       # model idles at mid (0 V)
+
+    rtl = (Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "zlc_edge_streamer.v").read_text(encoding="utf-8")
+    assert "parameter integer BUS_SAFE_VALUE = (1 << (BUS_WIDTH - 1))" in rtl
+    # all rest paths use it: clear_runtime, FIRE re-init, the delayed-read gate, power-up
+    assert rtl.count("BUS_SAFE_VALUE[BUS_WIDTH-1:0]") >= 4
+
+
+def test_period_name_round_trips_and_survives_transforms():
+    """Editable period names: stored on PulsePeriod, kept by save/load, aligned_to_channels,
+    with_slots_resolved and unrolled_bracket (per-copy)."""
+
+    st = na.PulseTableState(
+        channels=["a", "b"], time_step_ns=20,
+        periods=[na.PulsePeriod(100, (1, 0), unit="ns", name="load"),
+                 na.PulsePeriod(200, (0, 1), unit="ns", name="image")],
+        repeat_start=0, repeat_end=1, repeat_count=2,
+    )
+    assert na.PulseTableState.from_dict(st.to_dict()).periods[0].name == "load"
+    unrolled = st.unrolled_bracket()
+    assert [p.name for p in unrolled.periods] == ["load", "image", "load", "image"]

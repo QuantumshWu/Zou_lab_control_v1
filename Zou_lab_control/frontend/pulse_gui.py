@@ -96,7 +96,7 @@ ROW_HEIGHT = 30
 CHANNEL_LABEL_WIDTH = 100
 TIME_UNIT_WIDTH = 60
 HIDE_BUTTON_WIDTH = 26
-PANEL_TOP_HEIGHT = 152
+PANEL_TOP_HEIGHT = 178   # name row + Duration label + value + unit (all four panels share it)
 CHANNEL_ROW_SPACING = 4
 PERIOD_CARD_WIDTH = 158
 DEFAULT_WINDOW_RATIO = 0.90
@@ -324,12 +324,20 @@ def _set_duration_unit_combo(combo, *, scanned: bool, unit: str) -> None:
     combo.setCurrentText("str (ns)" if scanned else (unit if unit in DURATION_UNITS else "ns"))
 
 
+def _bus_signed_bounds(max_value: int) -> tuple[int, int]:
+    """SIGNED user range of a bus whose full-scale code is ``max_value`` (2^B - 1):
+    (-2^(B-1), +2^(B-1)-1).  0 = true 0 V on the offset-binary DAC driver."""
+    half = (int(max_value) + 1) >> 1
+    return (-half, half - 1)
+
+
 def _normalize_bus_value_text(text: str, *, max_value: int) -> str:
+    lo, hi = _bus_signed_bounds(max_value)
     try:
         value = int(round(float(str(text or "0").strip())))
     except Exception as exc:
-        raise ValueError(f"analog bus value must be an integer 0..{int(max_value)}.") from exc
-    value = max(0, min(int(max_value), value))
+        raise ValueError(f"analog bus value must be an integer {lo}..{hi} (signed; 0 = 0 V).") from exc
+    value = max(lo, min(hi, value))
     return str(value)
 
 
@@ -402,33 +410,25 @@ def _display_row_label(row: Mapping[str, object], labels: Mapping[str, str] | No
     return str((labels or {}).get(key) or row.get("label") or key)
 
 
-def _bus_value_from_states(state: PulseTableState, period: PulsePeriod, bus_name: str) -> int:
-    value = 0
-    for bit, channel in enumerate(state.bus_channels()[bus_name]):
-        if int(period.states[state.channel_index(channel)]):
-            value |= 1 << bit
-    return value
-
-
 def _bus_has_signal(state: PulseTableState, bus_name: str) -> bool:
-    """True if a DAC bus carries a real signal: a non-zero code in any period, OR a
-    scanned (slot-referenced) value.  An all-zero / hold bus is treated as "off"."""
+    """True if a DAC bus carries a real signal: any edge/ramp entry (even to 0 V --
+    the user explicitly drives it), OR a scanned (slot-referenced) value.  An
+    untouched / all-hold bus rests at 0 V and is treated as "off"."""
 
-    for index in range(len(state.periods)):
-        try:
-            if state.bus_value(index, bus_name) != 0:
-                return True
-        except Exception:
-            pass
     for slot in state.scan_slots:
         if getattr(slot, "kind", "") == "dac" and slot.dac_bus == bus_name:
             return True
     for entry in state.analog_bus_modes.get(bus_name, []):
-        value = entry.get("value")
-        if isinstance(value, str) and value.strip():
+        if str(entry.get("mode", "hold")).lower() != "hold":
             return True
-        if value not in (None, 0):
-            return True
+    # No explicit plan: nonzero member bits mean a direct bit-level (code) drive.
+    if bus_name not in state.analog_bus_modes:
+        for index in range(len(state.periods)):
+            try:
+                if state.bus_value(index, bus_name) != 0:
+                    return True
+            except Exception:
+                pass
     return False
 
 
@@ -456,12 +456,16 @@ def _analog_bus_traces(state: PulseTableState, *, include_always_off: bool = Tru
         # the preview shows a concrete trace instead of crashing on int("s2").
         plan = state._resolved_bus_plan(bus_name, slots)
         bus_ticks = _analog_bus_ticks(plan, starts_steps)
+        lo_signed, hi_signed = _bus_signed_bounds((1 << len(members)) - 1)
         traces.append(
             {
                 "name": bus_name,
                 "label": _bus_display_label(bus_name),
                 "members": list(members),
-                "max": (1 << len(members)) - 1,
+                # values are SIGNED (0 = true 0 V); min/max bound the signed range so
+                # the plotter can place the 0 V baseline mid-row and show negatives.
+                "min": lo_signed,
+                "max": hi_signed,
                 "starts": [tick * state.time_step_ns * 1e-9 for tick in bus_ticks],
                 "values": [
                     _analog_bus_value_at_tick(plan, starts_steps, tick)
@@ -693,6 +697,15 @@ class PeriodCard(FluentGroupBox):
         self.unit_combo.setToolTip("Duration unit")
         self.unit_combo.setFixedWidth(control_width)
         top_layout.addWidget(_set_fixed_height(self.unit_combo))
+        # Editable period NAME (e.g. "load", "image") -- the index stays in the card
+        # title ("Period 3/5"); the name is free text saved with the pulse so the
+        # experiment log can reference periods by meaning, not number.  Placed BELOW
+        # the unit combo so Duration/unit keep their cross-panel alignment.
+        self.name_edit = FluentLineEdit(period.name or "")
+        self.name_edit.setToolTip("Period name (optional; saved with the pulse)")
+        self.name_edit.setPlaceholderText("name…")
+        self.name_edit.setFixedWidth(control_width)
+        top_layout.addWidget(_set_fixed_height(self.name_edit))
         top_layout.addStretch()
         layout.addWidget(top)
         layout.addSpacing(_px(1, minimum=0))
@@ -713,12 +726,14 @@ class PeriodCard(FluentGroupBox):
                 raw_value = entry.get("value")
                 bound = _is_slot_expr(raw_value)
                 max_value = (1 << max(1, len(members))) - 1
+                lo_signed, hi_signed = _bus_signed_bounds(max_value)
                 if bound:
                     value_display = str(raw_value)
                 elif raw_value is None:
-                    value_display = str(_bus_value_from_states(full_state, period, bus_name))
+                    # hold row: show the SIGNED value carried into this period (0 = 0 V)
+                    value_display = str(int(full_state.analog_bus_value_at_period_start(index, bus_name)))
                 else:
-                    value_display = str(max(0, min(max_value, int(raw_value))))
+                    value_display = str(max(lo_signed, min(hi_signed, int(raw_value))))
                 # The DAC row uses the SAME height as every other channel row so
                 # the period card stays aligned, row-for-row, with the Names and
                 # Delay panels (which render the bus row at row_height too).  The
@@ -739,20 +754,23 @@ class PeriodCard(FluentGroupBox):
                 combo.addItems(["Edge", "Ramp", "Hold"])
                 combo.setCurrentText(_bus_mode_title(mode))
                 # Just wide enough for "Edge"/"Ramp"/"Hold" + the dropdown arrow (the
-                # value field keeps the rest, so the widest code 1023 always shows).
+                # value field keeps the rest, so the widest value -512 always shows).
                 combo_w = _bus_mode_combo_width()
                 combo.setFixedSize(combo_w, bus_row_height)
                 combo.setToolTip(f"{bus_name}: output mode")
-                value_edit = FluentScanLineEdit(value_display, tooltip=f"{bus_name}: integer 0..{max_value}; click the dot to scan it")
+                value_edit = FluentScanLineEdit(
+                    value_display,
+                    tooltip=f"{bus_name}: signed integer {lo_signed}..{hi_signed} (0 = 0 V); click the dot to scan it",
+                )
                 value_edit.setFixedHeight(bus_row_height)
                 # Size the value field to EXACTLY the card's remaining width (combo + gap
                 # + value = card content), so it can never spill past the card's right
                 # border and clip the embedded scan dot -- independent of the font's
-                # width.  On the real (narrow) font the leftover comfortably fits "1023".
+                # width.  On the real (narrow) font the leftover comfortably fits "-512".
                 value_w = max(_px(44), (width - 2 * _px(7)) - combo_w - row_gap)
                 value_edit.setFixedWidth(value_w)
-                # DAC code is an integer in [0, max_value]; reject any other keystroke.
-                value_edit.set_numeric_validator("int", bottom=0, top=max_value)
+                # DAC value is a SIGNED integer (0 = true 0 V); reject any other keystroke.
+                value_edit.set_numeric_validator("int", bottom=lo_signed, top=hi_signed)
                 # NB: use set_editable (read-only + muted) NOT setEnabled --
                 # disabling the field would also disable the embedded scan dot,
                 # so you could never click it again to unbind the slot.
@@ -795,6 +813,7 @@ class PeriodCard(FluentGroupBox):
             layout.addWidget(checkbox)
         layout.addStretch()
 
+        self.name_edit.textChanged.connect(self.changed)
         self.duration_edit.textChanged.connect(self._handle_duration_text)
         self.duration_edit.textChanged.connect(self.changed)
         self.unit_combo.currentTextChanged.connect(self._handle_unit)
@@ -857,7 +876,7 @@ class PeriodCard(FluentGroupBox):
             self.duration_edit.text().strip(),
             tuple(states),
             unit=self.unit_combo.currentText(),
-            name="",
+            name=self.name_edit.text().strip(),
         )
         period.duration_ns(slots=slots, time_step_ns=time_step_ns)
         return period
@@ -869,7 +888,8 @@ class PeriodCard(FluentGroupBox):
             checkbox.setText(_elide_text(full, self._checkbox_text_width))
             checkbox.setToolTip(f"{channel} / {full}" if full != channel else channel)
         for bus_name, edit in self.bus_value_edits.items():
-            edit.setToolTip(f"{labels.get(_bus_key(bus_name), bus_name)}: integer value, 0..{self.bus_max_values.get(bus_name, 0)}")
+            lo_t, hi_t = _bus_signed_bounds(self.bus_max_values.get(bus_name, 1))
+            edit.setToolTip(f"{labels.get(_bus_key(bus_name), bus_name)}: signed integer {lo_t}..{hi_t} (0 = 0 V)")
 
     def bus_modes(self) -> dict[str, dict[str, object]]:
         out: dict[str, dict[str, object]] = {}
@@ -2218,13 +2238,14 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                     raw = entry.get("value")
                     bound = _is_slot_expr(raw)
                     members = buses.get(bus, [])
-                    max_value = (1 << max(1, len(members))) - 1
+                    lo_signed, hi_signed = _bus_signed_bounds((1 << max(1, len(members))) - 1)
                     if bound:
                         disp = str(raw)
                     elif raw is None:
-                        disp = str(_bus_value_from_states(state, period, bus))
+                        # hold row: SIGNED value carried into this period (0 = 0 V)
+                        disp = str(int(state.analog_bus_value_at_period_start(pidx, bus)))
                     else:
-                        disp = str(max(0, min(max_value, int(raw))))
+                        disp = str(max(lo_signed, min(hi_signed, int(raw))))
                     mode_combo = card.bus_mode_combos[bus]
                     with _signals_blocked(value_edit, mode_combo):
                         value_edit.set_scan_bound(False)
@@ -2347,7 +2368,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 load_scan_table(path, n_slots=len(state.scan_slots) or None),
                 state.scan_slots,
                 time_step_ns=state.time_step_ns,
-                dac_maxes=state.scan_slot_dac_maxes(),
+                dac_ranges=state.scan_slot_dac_ranges(),
             )
             self._scan_tables["loaded"] = loaded
             self._scan_loaded_path = path
@@ -2472,11 +2493,12 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             state = self.state
         if state.scan_slots:
             lines = ["Columns of the scan table (one row = one scan point):"]
-            maxes = state.scan_slot_dac_maxes()
+            ranges = state.scan_slot_dac_ranges()
             step = float(state.time_step_ns)
             for index, slot in enumerate(state.scan_slots):
                 if slot.kind == "dac":
-                    allowed = f"integer code 0..{maxes[index]}"
+                    rng = ranges[index] if index < len(ranges) and ranges[index] else (-512, 511)
+                    allowed = f"signed integer {rng[0]}..{rng[1]} (0 = 0 V)"
                 else:
                     allowed = f"snapped to a whole {format_compact_number(step)} ns tick (≥ 1 tick)"
                 lines.append(
@@ -2534,7 +2556,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 [[float(value) for value in row] for row in array],
                 state.scan_slots,
                 time_step_ns=state.time_step_ns,
-                dac_maxes=state.scan_slot_dac_maxes(),
+                dac_ranges=state.scan_slot_dac_ranges(),
             )
             self._scan_tables["generated"] = rows
             self._scan_use_loaded = False
@@ -3182,14 +3204,15 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 x0 = starts_ns[pidx] * 1e-9
                 x1 = starts_ns[pidx + 1] * 1e-9
                 members = bus_groups.get(bus, [])
-                max_v = max(1, (1 << len(members)) - 1)
+                lo_v, hi_v = _bus_signed_bounds((1 << max(1, len(members))) - 1)
+                span_v = max(1, hi_v - lo_v)
                 try:
                     value = float(state.analog_bus_value_at_period_start(pidx, bus))
                 except Exception:
                     value = 0.0
-                # Follow the DA LINE: highlight the trace segment at the value's
-                # height over the scanned period (not a full-row block).
-                vy = analog_y[bus] + row_h * min(1.0, max(0.0, value / max_v))
+                # Follow the DA LINE: highlight the trace segment at the SIGNED value's
+                # height over the scanned period (0 V = mid-row, negatives below).
+                vy = analog_y[bus] + row_h * min(1.0, max(0.0, (value - lo_v) / span_v))
                 if x1 - x0 < min_width:
                     x1 = x0 + min_width
                 seg = ax.plot([x0, x1], [vy, vy], color=ORANGE, linewidth=3.0, alpha=0.9,

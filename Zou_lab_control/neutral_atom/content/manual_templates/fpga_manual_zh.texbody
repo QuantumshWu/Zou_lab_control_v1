@@ -218,7 +218,7 @@ mode                    : edge/hold 或 ramp
 value_select (dual)     : start 与 stop 各一个选择子
 \end{codeblock}
 
-\pyapi{edge/hold} 段把输出保持在某个值；\pyapi{ramp} 段在 start 到 stop 之间\tfocus{线性插值}，引擎本地每步走 1 个码（不额外占边沿行）。\tfocus{dual value\_select} 让 start 与 stop 各自可以指向一个扫描 slot——于是一条 ramp 能\tfocus{同时扫两个端点}（扫描-A $\rightarrow$ 扫描-B），一条 edge/hold 段能跟随一个扫描的 DAC 码。
+总线码是\tfocus{offset-binary}：码 0 = 负满幅、码 512 = 真零点 0 V、码 1023 = 正满幅；用户层（GUI/API/扫描表）一律用带符号值 -512..+511（0 = 0 V），编译器在生成段/扫描点时自动 +512。引擎的空闲/复位/上电值是 \pyapi{BUS_SAFE_VALUE}（= 中点码 512，即 0 V），所以未驱动的总线始终输出 0 V 而不是负满幅。\pyapi{edge/hold} 段把输出保持在某个值；\pyapi{ramp} 段在 start 到 stop 之间\tfocus{线性插值}，引擎本地每步走 1 个码（不额外占边沿行）。\tfocus{dual value\_select} 让 start 与 stop 各自可以指向一个扫描 slot——于是一条 ramp 能\tfocus{同时扫两个端点}（扫描-A $\rightarrow$ 扫描-B），一条 edge/hold 段能跟随一个扫描的 DAC 码。
 
 \section{模拟 DAC ramp 与扫描端点:前端脉冲实绘}
 每条模拟总线是一张小 LUTRAM 段表(组合读),段含 start/stop tick(仿射系数)+ start/stop 值 + mode(edge/ramp)+ \tfocus{双 value\_select}(start 和 stop 各一个)。ramp 段由引擎在本地按 tick 插值生成 10-bit 阶梯(不占数字边沿行);双 value\_select 让一条 ramp 的\tfocus{两个端点各跟一个 scan slot}(scanned-A $\to$ scanned-B),edge/hold 段则跟单个被扫 DAC 码。下图是\tfocus{前端脉冲绘图器实绘}的 DAC 波形。

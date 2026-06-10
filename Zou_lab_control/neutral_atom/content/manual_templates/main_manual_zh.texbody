@@ -287,9 +287,9 @@ state.delays["probe"] = 500.0                 # 固定 500 ns 输出延时
 s0 = state.bind_field("duration", "0")        # period 0 的持续时间
 s1 = state.bind_field("dac", "da_dipole@2")   # period 2 上 da_dipole 的 DAC 码
 
-# 构造 5 个扫描点的 (N_points x 2) 表：第一列是 ns，第二列是 0..1023 的 DAC 码
+# 构造 5 个扫描点的 (N_points x 2) 表：第一列是 ns，第二列是带符号 DAC 值（0 = 0 V）
 points = np.linspace(1_000, 5_000, 5)
-codes = np.linspace(0, 1023, 5).astype(int)
+codes = np.linspace(-512, 511, 5).astype(int)
 scan_table = np.column_stack([points, codes])
 state.set_scan_table(scan_table)              # 也可 state.load_scan_table("scan.npy")
 
@@ -314,7 +314,7 @@ state = na.PulseTableState.load("pulses/camera_imaging_address_switch.json")
 # 把 da_dipole 在 period 2 的 DAC 电平绑成一个扫描 slot。
 sd = state.bind_field("dac", "da_dipole@2")        # target = "<bus>@<period_index>"
 
-# 11 个点，原始 10-bit DAC code（0..1023）。
+# 11 个点，带符号 10-bit DAC 值（-512..+511，0 = 0 V）。
 state.set_scan_table(np.linspace(0, 1000, 11).astype(int).reshape(-1, 1))
 
 program = state.compile_scan(clock_hz=exp.devices.sequencer.clock_hz)
@@ -1081,7 +1081,7 @@ print(state.scan_slots)      # 两个 ScanSlot，kind 分别是 duration/dac
 
 \begin{itemize}
 \item \tfocus{行} = 一个扫描点（一次相机曝光对应一行）。
-\item \tfocus{列 j} = slot \pyapi{s\{j\}} 在该点的取值，\tfocus{用该 slot 的显示单位}：时间类 slot 用 ns（或绑定时的单位，内部按 \pyapi{UNITS\_TO\_NS} 折算成 ns），\pyapi{dac} 类用\tfocus{原始 DAC 码}（0..1023，不是电压）。
+\item \tfocus{列 j} = slot \pyapi{s\{j\}} 在该点的取值，\tfocus{用该 slot 的显示单位}：时间类 slot 用 ns（或绑定时的单位，内部按 \pyapi{UNITS\_TO\_NS} 折算成 ns），\pyapi{dac} 类用\tfocus{带符号 DAC 值}（-512..+511，0 = 0 V；线上自动 +512 变 offset-binary 码）。
 \end{itemize}
 
 装入数据有几种方式：
@@ -1100,7 +1100,7 @@ table = np.array([
     [10.0,    0],     # 点 0：周期=10us，DAC=0
     [20.0,  256],     # 点 1
     [30.0,  768],     # 点 2
-    [40.0, 1023],     # 点 3：DAC 满量程
+    [40.0, 511],      # 点 3：DAC 正满量程
 ])
 state.set_scan_table(table)
 
@@ -1109,7 +1109,7 @@ state.set_scan_table(table)
 \end{codeblock}
 
 \begin{notebox}[单位约定再强调一次]
-时间列写你看到的数（ns/us/ms/s 取决于该 slot 的 unit）；DAC 列写\tfocus{裸 10 位码 0..1023}。1023 是满量程，不是“1.023 V”。电压到码的换算由你在写表前自己完成。
+时间列写你看到的数（ns/us/ms/s 取决于该 slot 的 unit）；DAC 列写\tfocus{带符号 10 位值 -512..+511}（0 = 0 V，+511 正满量程、-512 负满量程）。电压到 LSB 的换算由你在写表前自己完成；线上 offset-binary 码由编译器自动 +512 生成。
 \end{notebox}
 
 \section{主机如何编译：一个仿射模板 + 一张流式点表}
@@ -1171,7 +1171,7 @@ FPGA 拿到这个程序后，\tfocus{无缝地}遍历所有扫描点：每点对
 \item \tfocus{value\_select 选值来源}：每个总线段带一个选择位。\pyapi{0} 表示用字面值；\pyapi{j+1} 表示运行时从 scan slot \pyapi{j} 读取低位作为 DAC 码。绑定 \pyapi{kind="dac"} 时，编译器把对应段的 value\_select 指向那个 slot。
 \end{enumerate}
 
-绑定 DAC 用 \pyapi{target = "<bus>@<period_index>"}，扫描表对应列写\tfocus{裸 10 位 DAC 码（0..1023）}。下面是一个\tfocus{同时扫 duration 与 dac}、并给一条 channel 设\tfocus{固定}延时的可运行端到端例子：
+绑定 DAC 用 \pyapi{target = "<bus>@<period_index>"}，扫描表对应列写\tfocus{带符号 10 位 DAC 值（-512..+511，0 = 0 V）}。下面是一个\tfocus{同时扫 duration 与 dac}、并给一条 channel 设\tfocus{固定}延时的可运行端到端例子：
 
 \begin{codeblock}[Python]
 import numpy as np
@@ -1191,7 +1191,7 @@ state.set_scan_table(np.array([
     [10.0,    0],
     [20.0,  256],
     [30.0,  768],
-    [40.0, 1023],
+    [40.0, 511],
 ]))
 
 # --- 一次编译，得到一个无缝扫描程序 ---
@@ -1222,7 +1222,7 @@ assert len(program.scan_points) == 4
 \item[时间表达式必须仿射] 所有 duration 表达式必须是 slot 的一次线性组合（\pyapi{s0 + 2*s1} 可以，\pyapi{s0*s1} 或 \pyapi{s0**2} 不行）。非仿射的时序会被拒绝。（延时不参与扫描表达式——它是固定值。）
 \item[边沿顺序不能在扫描中翻转] 如果某个扫描点会让两条边沿的先后顺序交换（模板的边沿排序在不同点之间不一致），编译器拒绝。换句话说，整段扫描里边沿的相对顺序必须稳定。
 \item[ramp 端点不能是被扫的值] DAC 无缝扫描里，唯一的限制是：\tfocus{斜坡（ramp）的端点不能是被扫描的那个值}。需要扫描该值时，把该段改成\tfocus{边沿 hold}（\pyapi{mode="edge"}）而不是 ramp。
-\item[DAC 列是码不是电压] 再说一遍：\pyapi{dac} slot 的扫描表列是裸 10 位码 0..1023。
+\item[DAC 列是码不是电压] 再说一遍：\pyapi{dac} slot 的扫描表列是带符号 10 位值 -512..+511（0 = 0 V），线上才是 offset-binary 码。
 \end{description}
 
 \begin{notebox}[单点 Notebook 扫描的便捷写法]

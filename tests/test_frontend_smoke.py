@@ -890,14 +890,14 @@ def test_pulse_gui_preview_robust_across_states(monkeypatch):
 
     def scanned():
         st = dt.demo_state()
-        for p, v in enumerate([0, 300, 700, 300, 0]):
+        for p, v in enumerate([0, 300, 500, 300, 0]):
             st.set_bus_value(p, "da_dipole", v)
         return st
 
     def ramped():
         st = dt.demo_state()
         st.set_analog_bus_mode(0, "da_dipole", "edge", value=0)
-        st.set_analog_bus_mode(1, "da_dipole", "ramp", value=700)
+        st.set_analog_bus_mode(1, "da_dipole", "ramp", value=500)
         st.apply_analog_bus_modes_to_period_states()
         return st
 
@@ -1396,7 +1396,9 @@ def test_pulse_gui_constructs_xdc_channel_editor(monkeypatch, tmp_path):
         assert first_card.checks["ch00"].text() == "ch00"
         assert editor.channel_panel.channel_labels["ch00"].text() == "ch00"
         assert hasattr(first_card, "unit_combo")
-        assert not hasattr(first_card, "name_edit")
+        # The period card has an editable NAME field (the index stays in the title).
+        assert hasattr(first_card, "name_edit")
+        assert first_card.name_edit.placeholderText() != ""
         assert first_card.duration_edit.geometry().right() <= first_card.width()
         assert first_card.unit_combo.geometry().right() <= first_card.width()
         assert editor.tabs.graphicsEffect() is not None
@@ -1873,7 +1875,7 @@ def test_pulse_gui_analog_bus_uses_line_edit_and_hollow_preview(monkeypatch):
         time_step_ns=20,
     )
     state.set_analog_bus_mode(0, "da_test", "edge", value=0)
-    state.set_analog_bus_mode(1, "da_test", "ramp", value=7)
+    state.set_analog_bus_mode(1, "da_test", "ramp", value=3)   # 3-bit bus: signed -4..+3
     state.apply_analog_bus_modes_to_period_states()
     editor = PulseSequenceEditor(state=state, scale=0.86)
     try:
@@ -1887,8 +1889,8 @@ def test_pulse_gui_analog_bus_uses_line_edit_and_hollow_preview(monkeypatch):
         assert not hasattr(first_card, "bus_spins")
         second_card.bus_value_edits["da_test"].setText("2048")
         restored = editor.read_state()
-        assert editor.drag_container.pulse_cards()[1].bus_value_edits["da_test"].text() == "7"
-        assert restored.analog_bus_modes["da_test"][1] == {"mode": "ramp", "value": 7}
+        assert editor.drag_container.pulse_cards()[1].bus_value_edits["da_test"].text() == "3"
+        assert restored.analog_bus_modes["da_test"][1] == {"mode": "ramp", "value": 3}
         editor.add_period()
         app.processEvents()
         added = editor.read_state()
@@ -2031,7 +2033,7 @@ def test_preview_hides_idle_dac_when_off_rows_off(monkeypatch):
     assert off == []          # idle DAC hidden when off-rows are hidden
     assert len(on) == 1       # but shown when off-rows are shown
 
-    state.set_bus_value(0, "da", 512)   # now it carries a real value
+    state.set_bus_value(0, "da", 200)   # now it carries a real value
     off2, _ = pulse_gui._analog_bus_traces(state, include_always_off=False)
     assert len(off2) == 1     # an active DAC is shown even with off-rows hidden
 
@@ -2124,7 +2126,7 @@ def test_dac_value_field_and_dot_stay_inside_card(monkeypatch):
 
     ed = dt.demo_editor(size=(1480, 900))
     st = ed.state
-    st.set_bus_value(0, "da_dipole", 1023)   # full-scale code: the widest content
+    st.set_bus_value(0, "da_dipole", -512)   # widest signed value: the widest content
     ed.load_state(st)
     dt.settle(ed, 200)
     card = ed.drag_container.pulse_cards()[0]
@@ -2328,3 +2330,27 @@ def test_pulse_gui_dac_scan_target_follows_period_reorder(monkeypatch):
     app.processEvents()
     dac_slot2 = next(s for s in editor.read_state().scan_slots if s.kind == "dac")
     assert dac_slot2.target == f"{bus}@0"   # target followed the reorder
+
+
+def test_pulse_gui_period_name_edit_round_trips(monkeypatch):
+    """#1 (period names): each card has an editable name field; the typed name lands in
+    read_state().periods[i].name, survives load_state, and the index title stays."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    editor = dt.demo_editor(size=(1400, 860), bind_scans=False)
+    cards = editor.drag_container.pulse_cards()
+    assert cards[0].title().startswith("Period 1/")        # the i/N index display stays
+    cards[0].name_edit.setText("load")
+    cards[2].name_edit.setText("image")
+    state = editor.read_state()
+    assert state.periods[0].name == "load"
+    assert state.periods[2].name == "image"
+    assert state.periods[1].name == ""
+    editor.load_state(state)                               # rebuild restores the names
+    cards2 = editor.drag_container.pulse_cards()
+    assert cards2[0].name_edit.text() == "load"
+    assert cards2[2].name_edit.text() == "image"
+    assert cards2[0].title().startswith("Period 1/")

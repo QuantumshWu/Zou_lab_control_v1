@@ -37,6 +37,29 @@ GRID_ATOL_STEPS = 1e-9
 BUS_LABEL_RE = re.compile(r"^(?P<base>.+)\[(?P<bit>\d+)\]$")
 ANALOG_BUS_MODES = ("hold", "edge", "ramp")
 
+
+def bus_zero_code(n_bits: int) -> int:
+    """Mid-scale OFFSET-BINARY code of an n-bit DAC bus = the code for TRUE 0 V.
+
+    The DAC driver is bipolar offset-binary: wire code 0 = negative full scale,
+    code 2^(B-1) (=512 for the 10-bit buses) = 0 V, code 2^B-1 = +FS-1LSB.  A B-bit
+    bus has 2^B codes -- an EVEN count, so a symmetric range around zero is
+    impossible; the industry convention (and ours) puts true zero at 2^(B-1), making
+    the SIGNED user range asymmetric by one LSB: -2^(B-1) .. +2^(B-1)-1."""
+    return 1 << (max(1, int(n_bits)) - 1)
+
+
+def bus_signed_range(n_bits: int) -> tuple[int, int]:
+    """User-facing SIGNED value range of an n-bit bus: (-2^(B-1), +2^(B-1)-1).
+
+    ALL user-layer DAC values (GUI fields, ``analog_bus_modes`` entries, scan-table
+    dac columns, ``ScanSlot.nominal``) are SIGNED LSB counts around true zero; the
+    wire layer (RuntimeBusSegment values, program scan_points, the RTL) carries the
+    offset-binary code = signed + ``bus_zero_code``.  The conversion happens exactly
+    once, in the compilers."""
+    half = bus_zero_code(n_bits)
+    return (-half, half - 1)
+
 #: LITERAL output delay-line depth, in clock ticks.  A per-channel (TTL) or per-bus
 #: (DAC) delay ``d`` is realized as ``output[t] = undelayed[t-d]`` by a hardware
 #: delay line bounded to this many ticks.  This is the single timing-layer source of
@@ -308,8 +331,9 @@ class PulseTableState:
             if kind == "duration":
                 return self.periods[int(target)].duration_ns(slots=slots) / scale
             if kind == "dac":
+                # SIGNED value at the period start (0 = 0 V), like every user-facing DAC value
                 bus, period_index = target.split("@", 1)
-                return float(self.bus_value(int(period_index), bus))
+                return float(self.analog_bus_value_at_period_start(int(period_index), bus))
         except Exception:
             pass
         return (1000.0 / scale) if kind == "duration" else 0.0
@@ -423,17 +447,18 @@ class PulseTableState:
     def is_clk_channel(self, channel: str) -> bool:
         return str(channel) in set(self.clk_channels)
 
-    def scan_slot_dac_maxes(self) -> list[int | None]:
-        """Per-slot maximum DAC code (``2**width - 1``) for ``dac`` slots, ``None``
-        otherwise.  Aligned with :attr:`scan_slots`; pass to :func:`snap_scan_table`
-        so DAC scan points are clamped to each bus's real bit width."""
+    def scan_slot_dac_ranges(self) -> list[tuple[int, int] | None]:
+        """Per-slot SIGNED DAC value range ``(-2^(B-1), +2^(B-1)-1)`` for ``dac``
+        slots, ``None`` otherwise.  Aligned with :attr:`scan_slots`; pass to
+        :func:`snap_scan_table` so DAC scan points are clamped to each bus's real
+        signed range (0 = true 0 V on the offset-binary driver)."""
 
         buses = self.bus_channels(min_width=1)
-        out: list[int | None] = []
+        out: list[tuple[int, int] | None] = []
         for slot in self.scan_slots:
             if getattr(slot, "kind", "") == "dac":
                 width = max(1, len(buses.get(slot.dac_bus, [])))
-                out.append((1 << width) - 1)
+                out.append(bus_signed_range(width))
             else:
                 out.append(None)
         return out
@@ -543,7 +568,7 @@ class PulseTableState:
             members = known_buses[bus_name]
             if len(entries) != len(self.periods):
                 raise ValueError(f"analog bus {bus_name!r} has {len(entries)} mode entries but {len(self.periods)} periods.")
-            max_value = (1 << len(members)) - 1
+            lo, hi = bus_signed_range(len(members))
             for index, entry in enumerate(entries):
                 mode = str(entry.get("mode", "hold")).lower()
                 if mode not in ANALOG_BUS_MODES:
@@ -558,8 +583,10 @@ class PulseTableState:
                 if _is_slot_ref(value):
                     continue
                 value_int = int(value)
-                if value_int < 0 or value_int > max_value:
-                    raise ValueError(f"analog bus {bus_name!r} period {index} value must be between 0 and {max_value}.")
+                if value_int < lo or value_int > hi:
+                    raise ValueError(
+                        f"analog bus {bus_name!r} period {index} value must be between {lo} and {hi} "
+                        "(signed LSB; 0 = 0 V on the offset-binary DAC driver).")
         if self.repeat_count < 1:
             raise ValueError("repeat_count must be >= 1.")
         if (self.repeat_start is None) != (self.repeat_end is None):
@@ -727,21 +754,25 @@ class PulseTableState:
         return value
 
     def set_bus_value(self, period_index: int, bus_name: str, value: int) -> "PulseTableState":
-        """Set one logical bus value, updating its underlying TTL bit channels."""
+        """Set one logical bus value (SIGNED LSB, 0 = true 0 V), updating the TTL bits.
+
+        ``value`` is the user-facing SIGNED value (-2^(B-1) .. +2^(B-1)-1); the
+        underlying member bits store the offset-binary code = value + bus_zero_code."""
 
         period_index = int(period_index)
         groups = self.bus_channels()
         if bus_name not in groups:
             raise ValueError(f"unknown bus channel {bus_name!r}.")
         members = groups[bus_name]
-        max_value = (1 << len(members)) - 1
+        lo, hi = bus_signed_range(len(members))
         value = int(value)
-        if value < 0 or value > max_value:
-            raise ValueError(f"{bus_name} must be between 0 and {max_value}.")
+        if value < lo or value > hi:
+            raise ValueError(f"{bus_name} must be between {lo} and {hi} (signed LSB; 0 = 0 V).")
+        code = value + bus_zero_code(len(members))
         period = self.periods[period_index]
         states = list(period.states)
         for bit, channel in enumerate(members):
-            states[self.channel_index(channel)] = 1 if (value >> bit) & 1 else 0
+            states[self.channel_index(channel)] = 1 if (code >> bit) & 1 else 0
         self.periods[period_index] = PulsePeriod(period.duration, tuple(states), unit=period.unit, name=period.name)
         self.set_analog_bus_mode(period_index, bus_name, "edge", value=value, validate=False)
         self.validate()
@@ -756,15 +787,22 @@ class PulseTableState:
             raise ValueError(f"unknown bus channel {bus_name!r}.")
         if bus_name in self.analog_bus_modes:
             return [dict(item) for item in self.analog_bus_modes[bus_name]]
+        # No explicit plan.  An UNTOUCHED bus (all member bits 0 in every period) rests
+        # at true 0 V -- an all-hold plan (the hardware idles at the mid-scale code).
+        # Nonzero bits are interpreted as offset-binary CODES (the bit-level truth),
+        # so the derived plan values are SIGNED = code - bus_zero_code.
+        zero_code = bus_zero_code(len(groups[bus_name]))
+        codes = [self.bus_value(index, bus_name) for index in range(len(self.periods))]
+        if all(code == 0 for code in codes):
+            return [{"mode": "hold", "value": None} for _ in self.periods]
         out: list[dict[str, object]] = []
         previous: int | None = None
-        for index in range(len(self.periods)):
-            value = self.bus_value(index, bus_name)
-            if index == 0 or previous is None or value != previous:
-                out.append({"mode": "edge", "value": int(value)})
+        for index, code in enumerate(codes):
+            if index == 0 or previous is None or code != previous:
+                out.append({"mode": "edge", "value": int(code) - zero_code})
             else:
                 out.append({"mode": "hold", "value": None})
-            previous = value
+            previous = code
         return out
 
     def set_analog_bus_mode(
@@ -790,7 +828,9 @@ class PulseTableState:
             plan[period_index] = {"mode": "hold", "value": None}
         else:
             if value is None:
-                value = self.bus_value(period_index, bus_name)
+                # default to the SIGNED value currently encoded by the member bits
+                members = self.bus_channels(min_width=1)[bus_name]
+                value = self.bus_value(period_index, bus_name) - bus_zero_code(len(members))
             plan[period_index] = {"mode": mode, "value": _coerce_bus_value(value)}
         self.analog_bus_modes[bus_name] = plan
         if validate:
@@ -809,12 +849,22 @@ class PulseTableState:
         starts = self._period_start_steps(slots=slots, time_step_ns=self.time_step_ns)
         groups = self.bus_channels(min_width=1)
         for bus_name, members in groups.items():
-            plan = self._resolved_bus_plan(bus_name, slots)
+            zero_code = bus_zero_code(len(members))
+            code_max = (1 << len(members)) - 1
+            for_each_plan = self._resolved_bus_plan(bus_name, slots)
+            # An UNTOUCHED bus (all-hold plan, i.e. resting at 0 V) keeps its member bits
+            # at 0 -- the "unused" marker -- instead of projecting the mid code into the
+            # TTL bits (which would put phantom bits in masks/preview for a bus that does
+            # nothing; the hardware idles at the mid code by itself, BUS_SAFE_VALUE).
+            if all(str(entry.get("mode", "hold")).lower() == "hold" for entry in for_each_plan):
+                continue
             for period_index, period in enumerate(self.periods):
-                value = _analog_bus_value_at_tick(plan, starts, starts[period_index])
+                value = _analog_bus_value_at_tick(for_each_plan, starts, starts[period_index])
+                # plan values are SIGNED (0 = 0 V); member bits store the offset-binary CODE
+                code = max(0, min(code_max, int(value) + zero_code))
                 states = list(period.states)
                 for bit, channel in enumerate(members):
-                    states[self.channel_index(channel)] = 1 if (int(value) >> bit) & 1 else 0
+                    states[self.channel_index(channel)] = 1 if (code >> bit) & 1 else 0
                 self.periods[period_index] = PulsePeriod(period.duration, tuple(states), unit=period.unit, name=period.name)
         return self
 
@@ -1154,7 +1204,7 @@ class PulseTableState:
         # silently clamp it here (that would corrupt the physics) -- the GUI clamps the
         # input field, and the compiler raises a clear DelayDepthExceeded at validate.
         copy.scan_table = snap_scan_table(
-            copy.scan_table, copy.scan_slots, time_step_ns=step, dac_maxes=copy.scan_slot_dac_maxes()
+            copy.scan_table, copy.scan_slots, time_step_ns=step, dac_ranges=copy.scan_slot_dac_ranges()
         )
         copy.validate()
         return copy
@@ -1534,7 +1584,7 @@ def snap_scan_table(
     scan_slots: Sequence["ScanSlot"],
     *,
     time_step_ns: float,
-    dac_maxes: Sequence[int | None] | None = None,
+    dac_ranges: Sequence[tuple[int, int] | None] | None = None,
 ) -> list[list[float]]:
     """Snap + clamp every scan-table point to a value the hardware can actually run.
 
@@ -1543,16 +1593,18 @@ def snap_scan_table(
 
     * ``duration`` -> the nearest whole clock tick, snapped UP to at least one tick
       (a period must occupy >= 1 tick) and never negative.
-    * ``dac`` -> the nearest integer code, clamped to ``[0, max]`` where ``max`` is
-      ``dac_maxes[j]`` for that slot if given, else ``2**DEFAULT_DAC_BITS - 1`` (1023).
+    * ``dac`` -> the nearest SIGNED integer (0 = true 0 V), clamped to
+      ``dac_ranges[j]`` for that slot if given, else the default 10-bit signed range
+      ``(-2^(B-1), +2^(B-1)-1)`` = (-512, +511).  The offset-binary wire code is
+      produced later, by the compiler (code = signed + 2^(B-1)).
 
-    ``dac_maxes`` (optional) is a per-slot sequence aligned with ``scan_slots``;
+    ``dac_ranges`` (optional) is a per-slot sequence aligned with ``scan_slots``;
     entries for non-DAC slots are ignored.  One shared snap source for the GUI (so the
     displayed/saved table matches) and the server/pulse API (so the transferred pulse
     matches the hardware)."""
 
     step = positive_time_step_ns(time_step_ns)
-    default_dac_max = (1 << DEFAULT_DAC_BITS) - 1
+    default_range = bus_signed_range(DEFAULT_DAC_BITS)
     # Normalize the column count to the slot count FIRST (pads a short row with 0.0,
     # RAISES on a too-wide row) -- otherwise a mismatched loaded array would be silently
     # truncated/under-snapped by the zip() below (a column would be dropped or a slot left
@@ -1563,12 +1615,12 @@ def snap_scan_table(
         new_row: list[float] = []
         for index, (value, slot) in enumerate(zip(row, scan_slots)):
             if getattr(slot, "kind", "") == "dac":
-                hi = None
-                if dac_maxes is not None and index < len(dac_maxes):
-                    hi = dac_maxes[index]
-                hi = default_dac_max if hi is None else int(hi)
-                code = int(round(float(value)))
-                new_row.append(float(max(0, min(hi, code))))
+                rng = None
+                if dac_ranges is not None and index < len(dac_ranges):
+                    rng = dac_ranges[index]
+                lo, hi = default_range if rng is None else (int(rng[0]), int(rng[1]))
+                signed = int(round(float(value)))
+                new_row.append(float(max(lo, min(hi, signed))))
             else:
                 # A scanned period duration must be >= 1 tick and never negative.
                 snapped = _snap_literal_time_value(
