@@ -5468,6 +5468,37 @@ def test_sequencer_prepare_accepts_streamed_scan_beyond_resident_window():
 # RTL-finding fixes (2026-06-09): U4 delay-tail-at-done, U1 ramp slope cap,
 # B1/B2 da_clk idle warning, T3 latency read-back, B3/B4/U7 geometry guards.
 # --------------------------------------------------------------------------- #
+def test_scan_frame_shorter_than_read_latency_is_rejected():
+    """SAME-CLASS guard as the edge read-latency fix: the scan BRAM is read with a fixed
+    latency and the engine reads the NEXT point's slot during the CURRENT frame, so a
+    scanned frame shorter than the scan read latency would play it with the PREVIOUS
+    point's slot.  Reject such a (pathological sub-100ns) scanned frame with a clear error;
+    a normal (micro/millisecond) scanned frame passes."""
+    import pytest
+    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import (
+        validate_pulse_streamer_program, SCAN_READ_LATENCY)
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
+    # one slot scales the single period's duration; scan a 1-tick frame -> reject
+    bad = RuntimeSequenceProgram(
+        sequence_id="s", sequence_name="s", clock_hz=50e6, channels=["a", "b"],
+        ticks=[0, 1], masks=[1, 0], duration=1*20e-9, trigger_count=0, repeat_forever=False,
+        slot_count=1, slot_kinds=["dac"], tick_slot_coeffs=[[0], [0]],
+        loop_end_tick=1, loop_end_slot_coeffs=[0], loop_count=1,
+        scan_points=[[0], [1]],   # frame = 1 tick (< SCAN_READ_LATENCY=2): too short
+    )
+    with pytest.raises(ValueError, match="scan-BRAM read latency|read in time|>= %d ticks" % SCAN_READ_LATENCY):
+        validate_pulse_streamer_program(bad, channel_count=2)
+    # a normal scanned frame (>= SCAN_READ_LATENCY ticks) is accepted
+    ok = RuntimeSequenceProgram(
+        sequence_id="s2", sequence_name="s2", clock_hz=50e6, channels=["a", "b"],
+        ticks=[0, 100], masks=[1, 0], duration=100*20e-9, trigger_count=0, repeat_forever=False,
+        slot_count=1, slot_kinds=["duration"], tick_slot_coeffs=[[0], [256]],
+        loop_end_tick=100, loop_end_slot_coeffs=[256], loop_count=1,
+        scan_points=[[100], [200]],
+    )
+    validate_pulse_streamer_program(ok, channel_count=2)
+
+
 def test_top_delays_tick_read_to_align_with_asymmetric_coeff_mask():
     """REAL-HARDWARE ROOT CAUSE (emCCD 2nd pulse 40 ms; with the old `==` it instead
     DROPPED the pulse -> "only the first pulse").  The TICK edge BRAM is SYMMETRIC

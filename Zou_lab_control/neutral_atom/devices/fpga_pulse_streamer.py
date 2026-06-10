@@ -79,6 +79,10 @@ except Exception:  # pragma: no cover - fpga package not importable; use shipped
     DEFAULT_BUS_WIDTH = 10
     DEFAULT_FPGA_PART = "xc7a35tfgg484-2"
 DEFAULT_CHANNELS = [f"ch{index:02d}" for index in range(DEFAULT_FPGA_CHANNEL_COUNT)]
+# The scan/edge BRAMs are forced to READ_LATENCY_B = 2 (create_project.tcl zlc_force_latency2),
+# and the engine reads the NEXT scan point's slot vector during the CURRENT frame.  A scanned
+# frame shorter than this many ticks would play the next point with the previous point's slot.
+SCAN_READ_LATENCY = 2
 
 
 def hardware_channel_names(count: int = DEFAULT_FPGA_CHANNEL_COUNT) -> list[str]:
@@ -461,6 +465,20 @@ def validate_pulse_streamer_program(
                 if effective_tick < 0 or effective_tick > tick_limit:
                     raise ValueError(f"scan point {point_index} effective tick {effective_tick} does not fit {tick_width} bits.")
                 last_effective_tick = effective_tick
+            # SAME-CLASS GUARD as the edge tick/coeff/mask read-latency fix: the scan BRAM
+            # is read with a fixed latency (SCAN_READ_LATENCY ticks), and the engine reads
+            # the NEXT point's slot vector during the CURRENT frame (lead time == this
+            # frame's length).  A scanned frame shorter than that latency would be played
+            # with the PREVIOUS point's scanned values (a whole-frame stale slot), so
+            # reject it with a clear message instead of silently mis-scanning.  Real
+            # experiment frames are micro/milliseconds (thousands of ticks); this only
+            # ever trips a pathological sub-100 ns scanned period.
+            if 0 < last_effective_tick < SCAN_READ_LATENCY:
+                raise ValueError(
+                    f"scan point {point_index} frame is only {last_effective_tick} tick(s); a scanned "
+                    f"frame must be >= {SCAN_READ_LATENCY} ticks (the scan-BRAM read latency) so the next "
+                    "point's slot vector is read in time -- a shorter frame plays it with the PREVIOUS "
+                    "point's scanned values.  Lengthen the scanned period.")
     loop_count = int(getattr(program, "loop_count", 1))
     loop_start_index = int(getattr(program, "loop_start_index", 0))
     loop_end_tick = int(getattr(program, "loop_end_tick", 0))
