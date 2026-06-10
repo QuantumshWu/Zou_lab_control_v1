@@ -691,7 +691,10 @@ def rtl_mirror_play(program, n_ticks: int, *, rd_lat: int = 2, fifo_depth: int =
             continue
         # ---- normal cycle: exact RTL FIFO transfers ----
         landed_idx = pend[rd_lat - 1]
-        fire_arm = (ei < n) and (len(arm) != 0) and (tc == eff(arm[0], slot))
+        # >= mirrors the RTL do_fire backstop: a head edge whose effective tick was
+        # passed fires late rather than freezing the frame.  Ticks strictly increase
+        # per scan point, so on a valid program this is identical to ==.
+        fire_arm = (ei < n) and (len(arm) != 0) and (tc >= eff(arm[0], slot))
         if fire_arm:
             sm = p.masks[arm[0]]
             ei += 1
@@ -707,6 +710,81 @@ def rtl_mirror_play(program, n_ticks: int, *, rd_lat: int = 2, fifo_depth: int =
         if issue:
             fetch_idx += 1
         pend = new_pend
+    return _apply_channel_delays(out, p)
+
+
+def rtl_mirror_play_stale_seed(program, n_ticks: int, prior_count: int, *,
+                               rd_lat: int = 2, fifo_depth: int = 3) -> list[int]:
+    """Model the PRE-FIX hardware bug: at FIRE the seed read a STALE ``active_count``
+    (the previous program's edge count, ``prior_count``) because ``active_count <=
+    prog_count`` is a non-blocking write that had not committed in the seed cycle.
+
+    The first frame is seeded with ``min(fifo_depth, prior_count[-1])`` valid shadows
+    instead of the real count, so resident shadows beyond ``prior_count`` are dropped
+    and the frame's tail edges never fire.  After ``final`` the engine reseeds with the
+    (now-committed) real count, so only the FIRST frame is corrupted.  This exists ONLY
+    to prove the fix: with ``prior_count >= len(ticks)`` it must equal
+    :func:`rtl_mirror_play`; with a smaller ``prior_count`` it must drop edges.
+    """
+    p = program if isinstance(program, EngineProgram) else EngineProgram.from_program(program)
+    n = len(p.ticks)
+
+    def eff(i, slots):
+        return effective_tick(p.ticks[i], p.tick_slot_coeffs[i], slots, p.frac_bits)
+
+    arm: list[int] = []
+    pend: list = [None] * rd_lat
+    fetch_idx = 0
+    first_frame = True
+
+    def reseed_from(start_idx, cnt):
+        nonlocal fetch_idx, pend
+        arm.clear()
+        # the buggy seed admits at most (cnt - start_idx) shadows, clamped to depth
+        avail = max(0, cnt - start_idx)
+        for k in range(min(fifo_depth, avail)):
+            if start_idx + k < n:
+                arm.append(start_idx + k)
+        fetch_idx = start_idx + fifo_depth
+        pend = [None] * rd_lat
+
+    def boundary_to(cnt):
+        if cnt != 0 and eff(0, slot) == 0:
+            reseed_from(1, cnt)
+            return p.masks[0], 1, 1
+        reseed_from(0, cnt)
+        return 0, 0, 0
+
+    slot = _first_values(p)
+    final = 0 if n == 0 else eff(n - 1, slot)
+    running = n != 0
+    sm, tc, ei = (boundary_to(prior_count) if running else (0, 0, 0))
+
+    out = []
+    for _ in range(n_ticks):
+        out.append(sm)
+        if not running:
+            continue
+        if tc >= final:
+            if p.repeat_forever:
+                slot = _first_values(p)
+                final = eff(n - 1, slot)
+                first_frame = False
+                sm, tc, ei = boundary_to(n)   # subsequent frames: count is committed
+                continue
+            running = False; sm = 0; continue
+        landed_idx = pend[rd_lat - 1]
+        fire_arm = (ei < n) and (len(arm) != 0) and (tc >= eff(arm[0], slot))
+        if fire_arm:
+            sm = p.masks[arm[0]]; ei += 1; arm.pop(0)
+        if landed_idx is not None:
+            arm.append(landed_idx)
+        tc += 1
+        inflight_after = sum(1 for x in pend[0:rd_lat - 1] if x is not None)
+        issue = (len(arm) + inflight_after < fifo_depth) and (fetch_idx < n)
+        pend = [fetch_idx if issue else None] + pend[0:rd_lat - 1]
+        if issue:
+            fetch_idx += 1
     return _apply_channel_delays(out, p)
 
 

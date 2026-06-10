@@ -5468,6 +5468,91 @@ def test_sequencer_prepare_accepts_streamed_scan_beyond_resident_window():
 # RTL-finding fixes (2026-06-09): U4 delay-tail-at-done, U1 ramp slope cap,
 # B1/B2 da_clk idle warning, T3 latency read-back, B3/B4/U7 geometry guards.
 # --------------------------------------------------------------------------- #
+def test_pulse_streamer_rtl_fire_seed_uses_fresh_prog_count_not_stale_reg():
+    """REAL-HARDWARE ROOT CAUSE (multi-period dropped pulses / "off never fires").
+
+    At FIRE, ``active_count <= prog_count`` is a NON-BLOCKING write; the same-cycle
+    edge-0 seed must therefore NOT read the ``active_count`` REG (it still holds the
+    PREVIOUS program's count -- 0 right after a fresh bitstream).  A stale count
+    truncated ``arm_nv`` so the resident shadows past it were overwritten by prefetch,
+    permanently dropping the first frame's tail edges.  Lock the fix textually: the
+    seed task takes an explicit count input, FIRE threads ``prog_count`` through
+    ``bnd_count``, and the boundaries thread ``active_count``."""
+    import re
+    rtl = (Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "zlc_edge_streamer.v").read_text(encoding="utf-8")
+    # seed task signature carries an explicit count input
+    seed = re.search(r"task seed_from_edge0;(.*?)endtask", rtl, re.S)
+    assert seed is not None
+    body = seed.group(1)
+    assert "input [EDGE_ADDR_WIDTH:0] cnt;" in body, "seed must take an explicit count"
+    assert "clamp3(cnt - 1'b1)" in body and "clamp3(cnt)" in body, "seed must use cnt, not active_count"
+    assert "active_count" not in body, "seed must NOT read the stale active_count reg"
+    # FIRE site threads the FRESH prog_count (not the not-yet-committed reg)
+    assert "bnd_count = prog_count;" in rtl, "FIRE must seed with prog_count"
+    # the dispatch passes the threaded count
+    assert "seed_from_edge0(bnd_slots, bnd_count);" in rtl
+    # the default keeps the boundary seam on the (committed) active_count
+    assert "bnd_count = active_count;" in rtl
+
+
+def test_pulse_streamer_rtl_do_fire_is_self_healing_ge_not_strict_eq():
+    """do_fire must compare with >= (not strict ==): a head edge whose effective tick
+    was passed for ANY reason fires LATE instead of freezing the rest of the frame.
+    On a valid (strictly-increasing) program >= is identical to ==; it only self-heals."""
+    import re
+    rtl = (Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "zlc_edge_streamer.v").read_text(encoding="utf-8")
+    assert "do_fire = (edge_index < active_count) && (arm_nv != 0) && (time_count >= zlc_effective_tick(arm_t[0],arm_c[0],slot_active));" in rtl
+    assert "time_count == zlc_effective_tick(arm_t[0]" not in rtl, "strict == must be gone"
+
+
+def test_fire_seed_stale_count_drops_tail_edges_fixed_path_does_not():
+    """Behavioral proof of the bug + fix via the faithful stale-seed model.
+
+    A 6-period program with emCCD (ch1) ON in two non-adjacent periods compiles to a
+    4-real-edge frame.  Replaying it with a STALE prior count (3 -- a tick-0 single
+    pulse, very common while debugging) drops the second pulse's ON edge -> only ONE
+    pulse, exactly the reported symptom.  Prior count 2 (an all-off table) drops the
+    first pulse's OFF -> stuck HIGH.  The FIXED engine (rtl_mirror_play, real count)
+    shows BOTH pulses and returns low -- and equals the stale model when the prior
+    count already covers the program."""
+    import fpga.pulse_streamer.host.engine_model as em
+    ch = ["cooling", "emccd", "trig"]
+    st = na.PulseTableState(channels=ch, periods=[
+        na.PulsePeriod(100, (1, 0, 1), unit="ns"), na.PulsePeriod(100, (0, 1, 0), unit="ns"),
+        na.PulsePeriod(100, (1, 0, 0), unit="ns"), na.PulsePeriod(100, (0, 0, 0), unit="ns"),
+        na.PulsePeriod(100, (1, 1, 0), unit="ns"), na.PulsePeriod(100, (0, 0, 0), unit="ns"),
+    ], time_step_ns=20)
+    prog = st.compile(clock_hz=50e6)
+
+    def pulses(wave):
+        return sum(1 for t in range(1, len(wave)) if wave[t] == 1 and wave[t - 1] == 0) + (1 if wave[0] else 0)
+
+    N = 30   # exactly one frame (6 periods x 5 ticks) -- avoid the repeat seam
+    n_edges = len(prog.ticks)
+    fixed = [(m >> 1) & 1 for m in em.rtl_mirror_play(prog, N)]
+    fixed_full = em.rtl_mirror_play(prog, N)
+    assert pulses(fixed) == 2 and fixed[-1] == 0          # both pulses, settles low
+
+    # The seed loads FIFO_DEPTH(=3) shadows but marks only clamp3(prior_count-1) valid;
+    # so a stale count CORRUPTS the frame exactly when prior_count <= 3 (the clamp
+    # saturates at 3, hence prior_count >= 4 already covers the seed window and is
+    # harmless).  This is why it strikes "很多时候": the PREVIOUS program is usually tiny
+    # -- an all-off table (2 edges) or a tick-0 single pulse (3 edges) -- right where the
+    # bug bites.  Scan the corrupting counts and assert a dropped pulse appears.
+    seen_dropped_pulse = False
+    for prior in range(1, 4):                              # prior_count in {1,2,3}: corrupting
+        full = em.rtl_mirror_play_stale_seed(prog, N, prior_count=prior)
+        assert full != fixed_full                          # tail edges dropped -> waveform wrong
+        if pulses([(m >> 1) & 1 for m in full]) < 2:
+            seen_dropped_pulse = True                      # an emCCD pulse was merged / lost
+    assert seen_dropped_pulse, "a small stale prior count must drop an emCCD pulse"
+
+    # prior_count >= FIFO_DEPTH+1 (=4) saturates the clamp -> seed window fully covered ->
+    # identical to the fixed engine (so the bug is invisible after a big prior program).
+    for prior in range(4, n_edges + 1):
+        assert em.rtl_mirror_play_stale_seed(prog, N, prior_count=prior) == fixed_full
+
+
 def test_pulse_streamer_rtl_advances_delay_rings_after_done():
     """U4: the delay rings must KEEP shifting after done so a delayed channel flushes its
     tail (and settles low) instead of freezing at a stale -- possibly HIGH -- tap value.

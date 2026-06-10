@@ -630,17 +630,28 @@ module zlc_edge_streamer #(
     // ---- seed the prefetch from edge-0 shadows for slot vector sv (start/scan/repeat) ----
     // Mirrors engine_model.boundary_to: output edge0 directly iff eff(edge0)==0,
     // then seed FIFO_DEPTH(=3) resident shadows from the first not-yet-output edge.
+    // ``cnt`` is the program's edge count, passed in EXPLICITLY (not read from the
+    // active_count REG).  At FIRE, active_count <= prog_count is a non-blocking write
+    // that has NOT committed when this task runs the same cycle, so reading the reg
+    // here would see the PREVIOUS program's count (0 right after a fresh bitstream).
+    // That stale count truncated arm_nv -> the resident shadows beyond it were marked
+    // invalid and overwritten by prefetch, permanently dropping the first frame's tail
+    // edges (a 3-edge prior program dropped edge3 -> "second pulse never appears"; a
+    // 2-edge prior program dropped edges 2,3 -> "the OFF never fires, stuck high").
+    // The caller threads prog_count at FIRE and active_count at the (mid-run, already
+    // committed) frame/scan boundaries.
     task seed_from_edge0;
         input [SLOT_BITS-1:0] sv;
+        input [EDGE_ADDR_WIDTH:0] cnt;
         begin
             pend <= {RD_LAT{1'b0}};
-            if (active_count != 0 && zlc_effective_tick(sh_e0_t, sh_e0_c, sv) == {TICK_WIDTH{1'b0}}) begin
+            if (cnt != 0 && zlc_effective_tick(sh_e0_t, sh_e0_c, sv) == {TICK_WIDTH{1'b0}}) begin
                 state_mask <= sh_e0_m; time_count <= {{(TICK_WIDTH-1){1'b0}},1'b1};
                 edge_index <= {{EDGE_ADDR_WIDTH{1'b0}},1'b1};
                 arm_t[0]<=sh_e1_t; arm_c[0]<=sh_e1_c; arm_m[0]<=sh_e1_m;
                 arm_t[1]<=sh_e2_t; arm_c[1]<=sh_e2_c; arm_m[1]<=sh_e2_m;
                 arm_t[2]<=sh_e3_t; arm_c[2]<=sh_e3_c; arm_m[2]<=sh_e3_m;
-                arm_nv <= clamp3(active_count - 1'b1);
+                arm_nv <= clamp3(cnt - 1'b1);
                 fetch_idx <= {{(EDGE_ADDR_WIDTH-2){1'b0}},3'd4}; edge_raddr <= {{(EDGE_ADDR_WIDTH-2){1'b0}},3'd4};
             end else begin
                 state_mask <= {CHANNEL_COUNT{1'b0}}; time_count <= {TICK_WIDTH{1'b0}};
@@ -648,7 +659,7 @@ module zlc_edge_streamer #(
                 arm_t[0]<=sh_e0_t; arm_c[0]<=sh_e0_c; arm_m[0]<=sh_e0_m;
                 arm_t[1]<=sh_e1_t; arm_c[1]<=sh_e1_c; arm_m[1]<=sh_e1_m;
                 arm_t[2]<=sh_e2_t; arm_c[2]<=sh_e2_c; arm_m[2]<=sh_e2_m;
-                arm_nv <= clamp3(active_count);
+                arm_nv <= clamp3(cnt);
                 fetch_idx <= {{(EDGE_ADDR_WIDTH-1){1'b0}},2'd3}; edge_raddr <= {{(EDGE_ADDR_WIDTH-1){1'b0}},2'd3};
             end
         end
@@ -678,6 +689,8 @@ module zlc_edge_streamer #(
     reg bnd_seed;              // reseed the edge prefetch from edge-0 shadows
     reg bnd_recompute_final;   // recompute final_tick / loop_end_active
     reg [SLOT_BITS-1:0] bnd_slots;
+    reg [EDGE_ADDR_WIDTH:0] bnd_count;   // edge count to seed with: prog_count at FIRE,
+                                          // active_count at the (committed) frame/scan seams
     // LITERAL delay-line boundary work: push the undelayed state_mask / bus values into the
     // rings and advance the write pointer.  Set on EVERY tick once the engine has fired (running
     // OR done-but-emitting), so the ring shifts the WHOLE output stream -- exactly the post-play
@@ -704,7 +717,7 @@ module zlc_edge_streamer #(
 
         // boundary work-request defaults (consumed once, after the state chain)
         bnd_bus_tick = 1'b0; bnd_bus_reinit = 1'b0; bnd_seed = 1'b0;
-        bnd_recompute_final = 1'b0; bnd_slots = slot_active;
+        bnd_recompute_final = 1'b0; bnd_slots = slot_active; bnd_count = active_count;
         bnd_delay_advance = 1'b0;
 
         if (reset_sync) begin
@@ -773,6 +786,7 @@ module zlc_edge_streamer #(
             // is dispatched ONCE after the chain via these flags (see SLOT_MUL_WIDTH /
             // bnd_* notes): same cycle, same slots -> identical behavior, far fewer MACs.
             bnd_slots = scan_first_values; bnd_recompute_final = 1'b1;
+            bnd_count = prog_count;   // FIRE: active_count <= prog_count not yet committed
             bnd_bus_tick = 1'b1; bnd_bus_reinit = 1'b1; bnd_seed = 1'b1;
         end else if (running) begin
             landed = pend[RD_LAT-1];
@@ -849,7 +863,11 @@ module zlc_edge_streamer #(
                 end
             end else begin
                 bnd_bus_tick = 1'b1; bnd_bus_reinit = 1'b0; bnd_slots = slot_active;  // normal bus step
-                do_fire = (edge_index < active_count) && (arm_nv != 0) && (time_count == zlc_effective_tick(arm_t[0],arm_c[0],slot_active));
+                // >= (not ==): if the head edge's effective tick was ever passed without
+                // firing (timing slip / upstream bug), fire it LATE instead of stalling the
+                // whole frame.  Ticks are strictly increasing per scan point (host validator),
+                // so on a correct run this is exactly == ; it only ever self-heals.
+                do_fire = (edge_index < active_count) && (arm_nv != 0) && (time_count >= zlc_effective_tick(arm_t[0],arm_c[0],slot_active));
                 if (do_fire) begin
                     state_mask <= arm_m[0];
                     edge_index <= edge_index + 1'b1;
@@ -899,7 +917,7 @@ module zlc_edge_streamer #(
             loop_end_active <= zlc_effective_tick(loop_end_tick, loop_end_coeffs, bnd_slots);
         end
         if (bnd_bus_tick) zlc_bus_tick(bnd_bus_reinit, bnd_slots);
-        if (bnd_seed) seed_from_edge0(bnd_slots);
+        if (bnd_seed) seed_from_edge0(bnd_slots, bnd_count);
         // ---- LITERAL delay line: push this tick's UNDELAYED outputs into the SR / ring ----------
         // On every running output tick, SHIFT the current (pre-update) undelayed state_mask bit into
         // each channel's shift register at [0] (oldest bit falls out the top), and write each bus's
