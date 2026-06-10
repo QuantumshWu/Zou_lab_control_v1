@@ -9,10 +9,11 @@ Three models, all walking the SAME engine FSM:
   (this is the behaviour the design must reproduce; min edge spacing = 1 tick).
 
 * :func:`prefetch_play` -- the BRAM engine's EDGE path: edge tables in block RAM
-  (synchronous ``read_latency``-cycle read), hidden by a depth-(latency+1)
-  continuous prefetch FIFO + first/second-edge (and loop-start/+1) shadows, so the
-  four gapless reload sites reseed instantly and back-to-back **1-tick** edges
-  still fire one per cycle.  Proven == reference for latency 1 AND 2.
+  (synchronous ``read_latency``-cycle read behind a REGISTERED address, so the true
+  issue->data-valid latency is read_latency+1), hidden by a depth-(latency+2)
+  continuous prefetch FIFO + edge/loop-start shadows, so the four gapless reload
+  sites reseed instantly and back-to-back **1-tick** edges still fire one per cycle.
+  Proven == reference for latency 1 AND 2.
 
 * :func:`streaming_scan_play` -- the SCAN path: the scan-point table is a 2-bank
   ping-pong window of ``bank_size`` points; the host refills the idle bank behind
@@ -378,13 +379,17 @@ def reference_play(program, n_ticks: int) -> list[int]:
 # ----------------------------------------------------------------------------
 # edge FIFO prefetch (BRAM edge tables, 1-tick seamless)
 # ----------------------------------------------------------------------------
-def prefetch_play(program, n_ticks: int, *, read_latency: int = 2, fifo_depth: int = 3) -> list[int]:
+def prefetch_play(program, n_ticks: int, *, read_latency: int = 2, fifo_depth: int = 4) -> list[int]:
+    # fifo_depth = read_latency + 2 (NOT +1): the read pipeline is read_latency+1 deep because
+    # edge_raddr is a registered address (an issued read reaches the BRAM the NEXT cycle, then
+    # the BRAM adds read_latency).  Sustaining 1-tick playback needs a resident head plus one
+    # in-flight slot per pipeline stage = (read_latency+1) + 1.  See zlc_edge_streamer.v.
     p = program if isinstance(program, EngineProgram) else EngineProgram.from_program(program)
     n = len(p.ticks)
     scan_en = bool(p.scan_points)
     scan_count = len(p.scan_points)
-    if fifo_depth < read_latency + 1:
-        fifo_depth = read_latency + 1
+    if fifo_depth < read_latency + 2:
+        fifo_depth = read_latency + 2
 
     def eff(i, slots):
         return effective_tick(p.ticks[i], p.tick_slot_coeffs[i], slots, p.frac_bits)
@@ -398,20 +403,24 @@ def prefetch_play(program, n_ticks: int, *, read_latency: int = 2, fifo_depth: i
     cycle = 0
 
     def reseed(target):
+        # Seed FIFO_DEPTH resident shadows (the RTL latches FIFO_DEPTH edge shadows at every
+        # boundary).  With the issue->data-valid latency now read_latency+1 (the registered
+        # edge_raddr), 2 resident + in-flight refill would underrun 1-tick playback; the full
+        # FIFO_DEPTH resident gives the prefetch enough runway to refill behind each fire.
         nonlocal fetch_idx
         fifo.clear(); inflight.clear()
-        if target < n:
-            fifo.append(target)
-        if target + 1 < n:
-            fifo.append(target + 1)
-        fetch_idx = target + 2
+        for k in range(fifo_depth):
+            if target + k < n:
+                fifo.append(target + k)
+        fetch_idx = target + fifo_depth
         issue()
 
     def issue():
         nonlocal fetch_idx
         resident = len(fifo) + len(inflight)
         while resident < fifo_depth and fetch_idx < n:
-            inflight.append((fetch_idx, cycle + read_latency)); fetch_idx += 1; resident += 1
+            # +1 = the registered edge_raddr stage: issue->data-valid is read_latency+1 cycles.
+            inflight.append((fetch_idx, cycle + read_latency + 1)); fetch_idx += 1; resident += 1
 
     def land():
         ready = sorted([it for it in inflight if it[1] <= cycle], key=lambda t: t[0])
@@ -602,7 +611,7 @@ def streaming_scan_play(program, n_ticks: int, *, bank_size: int, refill_delay: 
     return out, stalled, spi + 1
 
 
-def rtl_mirror_play(program, n_ticks: int, *, rd_lat: int = 2, fifo_depth: int = 3) -> list[int]:
+def rtl_mirror_play(program, n_ticks: int, *, rd_lat: int = 2, fifo_depth: int = 4) -> list[int]:
     """Re-implements the EXACT register transfers of zlc_edge_streamer.v's edge
     prefetch (arm[] shift-down FIFO + nv count + pend in-flight shift + the
     issue-occupancy condition + the four boundary reseeds), so a divergence from
@@ -621,11 +630,16 @@ def rtl_mirror_play(program, n_ticks: int, *, rd_lat: int = 2, fifo_depth: int =
         return effective_tick(p.loop_end_tick, p.loop_end_slot_coeffs, slots, p.frac_bits)
 
     arm: list[int] = []                          # arm[0] = head; len(arm) = nv
-    pend: list = [None] * rd_lat                  # pend[rd_lat-1] lands this cycle
+    # PIPE = rd_lat + 1: the issue->data-valid latency INCLUDING the registered edge_raddr
+    # (an issued read reaches the BRAM address port the next cycle, then the BRAM adds rd_lat).
+    # The earlier pend depth of rd_lat fired `landed` one cycle early and dropped a streamed
+    # edge (the emCCD 40 ms bug); it must be PIPE so a read lands rd_lat+1 cycles after issue.
+    pipe = rd_lat + 1
+    pend: list = [None] * pipe                    # pend[pipe-1] lands this cycle
     fetch_idx = 0
 
     def reseed_from(start_idx):
-        # Seed FIFO_DEPTH(=RD_LAT+1) resident shadows beginning at the first
+        # Seed FIFO_DEPTH(=RD_LAT+2) resident shadows beginning at the first
         # not-yet-output edge.  That runway is exactly enough that the first
         # PREFETCHED edge (issued when the head fires) lands + registers into arm
         # in time for back-to-back 1-tick edges.  occupancy == #shadows <= depth,
@@ -637,7 +651,7 @@ def rtl_mirror_play(program, n_ticks: int, *, rd_lat: int = 2, fifo_depth: int =
             if start_idx + k < n:
                 arm.append(start_idx + k)
         fetch_idx = start_idx + fifo_depth
-        pend = [None] * rd_lat
+        pend = [None] * pipe
 
     def boundary_to(start_at_zero_mask):
         # Common start/scan-advance/repeat seed: output edge0 directly iff it
@@ -690,7 +704,7 @@ def rtl_mirror_play(program, n_ticks: int, *, rd_lat: int = 2, fifo_depth: int =
             sm, tc, ei = boundary_to(True)
             continue
         # ---- normal cycle: exact RTL FIFO transfers ----
-        landed_idx = pend[rd_lat - 1]
+        landed_idx = pend[pipe - 1]
         # >= mirrors the RTL do_fire backstop: a head edge whose effective tick was
         # passed fires late rather than freezing the frame.  Ticks strictly increase
         # per scan point, so on a valid program this is identical to ==.
@@ -702,11 +716,12 @@ def rtl_mirror_play(program, n_ticks: int, *, rd_lat: int = 2, fifo_depth: int =
         if landed_idx is not None:
             arm.append(landed_idx)   # land at tail (register: visible next cycle)
         tc += 1
-        # issue a read iff resident + still-in-flight is below depth
-        inflight_after = sum(1 for x in pend[0:rd_lat - 1] if x is not None)
+        # issue a read iff resident + still-in-flight is below depth (popcount over ALL
+        # pipe stages -- not just pend[0] -- so every in-flight read has a landing slot)
+        inflight_after = sum(1 for x in pend[0:pipe - 1] if x is not None)
         occupancy = len(arm) + inflight_after
         issue = (occupancy < fifo_depth) and (fetch_idx < n)
-        new_pend = [fetch_idx if issue else None] + pend[0:rd_lat - 1]
+        new_pend = [fetch_idx if issue else None] + pend[0:pipe - 1]
         if issue:
             fetch_idx += 1
         pend = new_pend
@@ -714,7 +729,7 @@ def rtl_mirror_play(program, n_ticks: int, *, rd_lat: int = 2, fifo_depth: int =
 
 
 def rtl_mirror_play_stale_seed(program, n_ticks: int, prior_count: int, *,
-                               rd_lat: int = 2, fifo_depth: int = 3) -> list[int]:
+                               rd_lat: int = 2, fifo_depth: int = 4) -> list[int]:
     """Model the PRE-FIX hardware bug: at FIRE the seed read a STALE ``active_count``
     (the previous program's edge count, ``prior_count``) because ``active_count <=
     prog_count`` is a non-blocking write that had not committed in the seed cycle.
@@ -733,7 +748,8 @@ def rtl_mirror_play_stale_seed(program, n_ticks: int, prior_count: int, *,
         return effective_tick(p.ticks[i], p.tick_slot_coeffs[i], slots, p.frac_bits)
 
     arm: list[int] = []
-    pend: list = [None] * rd_lat
+    pipe = rd_lat + 1                 # issue->data-valid latency incl. the registered edge_raddr
+    pend: list = [None] * pipe
     fetch_idx = 0
     first_frame = True
 
@@ -746,7 +762,7 @@ def rtl_mirror_play_stale_seed(program, n_ticks: int, prior_count: int, *,
             if start_idx + k < n:
                 arm.append(start_idx + k)
         fetch_idx = start_idx + fifo_depth
-        pend = [None] * rd_lat
+        pend = [None] * pipe
 
     def boundary_to(cnt):
         if cnt != 0 and eff(0, slot) == 0:
@@ -773,16 +789,16 @@ def rtl_mirror_play_stale_seed(program, n_ticks: int, prior_count: int, *,
                 sm, tc, ei = boundary_to(n)   # subsequent frames: count is committed
                 continue
             running = False; sm = 0; continue
-        landed_idx = pend[rd_lat - 1]
+        landed_idx = pend[pipe - 1]
         fire_arm = (ei < n) and (len(arm) != 0) and (tc >= eff(arm[0], slot))
         if fire_arm:
             sm = p.masks[arm[0]]; ei += 1; arm.pop(0)
         if landed_idx is not None:
             arm.append(landed_idx)
         tc += 1
-        inflight_after = sum(1 for x in pend[0:rd_lat - 1] if x is not None)
+        inflight_after = sum(1 for x in pend[0:pipe - 1] if x is not None)
         issue = (len(arm) + inflight_after < fifo_depth) and (fetch_idx < n)
-        pend = [fetch_idx if issue else None] + pend[0:rd_lat - 1]
+        pend = [fetch_idx if issue else None] + pend[0:pipe - 1]
         if issue:
             fetch_idx += 1
     return _apply_channel_delays(out, p)

@@ -1480,7 +1480,7 @@ def test_final_engine_model_fifo_1tick_and_streaming_scan():
     for name, pr in fifo_cases.items():
         ref = reference_play(pr, 400)
         for lat in (1, 2):
-            assert prefetch_play(pr, 400, read_latency=lat, fifo_depth=lat + 1) == ref, (name, lat)
+            assert prefetch_play(pr, 400, read_latency=lat, fifo_depth=lat + 2) == ref, (name, lat)
 
     # --- streaming: 20 points, constant duration, waveform differs per point ---
     N = 20
@@ -1504,7 +1504,8 @@ def test_final_engine_model_fifo_1tick_and_streaming_scan():
 def test_edge_streamer_rtl_mirror_matches_reference():
     """`rtl_mirror_play` re-implements the EXACT register transfers of
     fpga/pulse_streamer/zlc_edge_streamer.v (arm shift-down FIFO + nv + pend
-    in-flight shift + the issue-occupancy condition + FIFO_DEPTH-shadow boundary
+    in-flight shift (pend depth = PIPE = RD_LAT+1, modelling the registered edge_raddr) +
+    the issue-occupancy condition + FIFO_DEPTH(=RD_LAT+2)-shadow boundary
     reseeds).  It must equal the combinatorial reference for every program shape
     -- 1-tick spacing included -- at read latency 1, 2 AND 3.  This is the no-sim
     proof that the SPECIFIC RTL realisation (not just the abstract algorithm) is
@@ -1540,7 +1541,7 @@ def test_edge_streamer_rtl_mirror_matches_reference():
     for name, pr in cases.items():
         ref = reference_play(pr, N)
         for lat in (1, 2, 3):
-            assert rtl_mirror_play(pr, N, rd_lat=lat, fifo_depth=lat + 1) == ref, (name, lat)
+            assert rtl_mirror_play(pr, N, rd_lat=lat, fifo_depth=lat + 2) == ref, (name, lat)
 
     # fuzz 1-tick-heavy random programs (the spacing stress the prefetch must survive)
     rnd = random.Random(7)
@@ -1555,7 +1556,7 @@ def test_edge_streamer_rtl_mirror_matches_reference():
                   loop_count=rnd.choice([1, 1, 3]))
         ref = reference_play(pr, N)
         for lat in (1, 2):
-            assert rtl_mirror_play(pr, N, rd_lat=lat, fifo_depth=lat + 1) == ref, (ticks, masks, lat)
+            assert rtl_mirror_play(pr, N, rd_lat=lat, fifo_depth=lat + 2) == ref, (ticks, masks, lat)
 
 
 def test_edge_streamer_rtl_has_proven_structure():
@@ -5533,72 +5534,104 @@ def test_top_feeds_all_three_edge_reads_directly_no_skew_register():
     assert ".edge_mask_rdata(edge_mask_rdata_w[" in top
 
 
-def test_streaming_prefetch_plays_uploaded_table_correctly_at_aligned_latency():
-    """Faithful register-level proof that, at the REAL edge-BRAM latency (all three reads
-    ALIGNED -- measured tick_lat == mask_lat == 2 on the actual synthesised IP netlists,
-    fpga/pulse_streamer/sim/tb_bram_lat.v), the streaming prefetch plays the user's EXACT
-    uploaded edge table CORRECTLY: emCCD on e6, off e7 -> two 20 ms pulses, NOT 40 ms.
-    Models edge_raddr as an NBA register feeding the three BRAMs at independent latencies
-    so a hypothetical skew CAN be expressed -- and confirms the aligned case is correct.
-    (The genuine 40 ms root cause was the stale-active_count FIRE seed, fixed in 8ff451c
-    and locked by test_pulse_streamer_rtl_fire_seed_uses_fresh_prog_count_not_stale_reg;
-    a read-latency skew was a misdiagnosis -- 2a2c0d1/e92a78a reverted.)"""
-    RD_LAT, FIFO_DEPTH = 2, 3
-    # exact uploaded table (scaled /500), emCCD = bit 11
-    S = 500
-    ticks = [t // S for t in [0,500000,1250000,2250000,2500000,2500500,5000500,6000500,7000500,7050500]]
-    masks = [0x685,0x200,0xa08,0x200,0x200,0x200,0xa00,0x208,0x0,0x0]
-    emb = 11
+def test_streaming_prefetch_pipeline_depth_drops_edge_when_undersized():
+    """FAITHFUL register-level reproduction of the real-hardware bug (emCCD 2nd pulse
+    40 ms; edge e7 dropped), reproduced + fixed in real-IP Vivado xsim
+    (fpga/pulse_streamer/sim/tb_gapsweep.v) and locked HERE as an automated regression
+    (xsim is not in CI).
 
-    def play(tick_lat, mask_lat):
-        N = len(ticks); tc=sm=ei=0; arm_t=[0]*FIFO_DEPTH; arm_m=[0]*FIFO_DEPTH; arm_nv=0
-        pend=[0]*RD_LAT; fetch=0; er=0; erh=[0]*12; ac=N; run=N!=0; out=[]
+    ROOT CAUSE: edge_raddr is a REGISTERED address, so an issued read reaches the BRAM the
+    NEXT cycle and the data is valid PIPE = RD_LAT+1 cycles after `issue` (modelled by the
+    edge_raddr history `erh`, read at erh[-1-RD_LAT]).  The in-flight marker `pend` must be
+    PIPE-deep and the FIFO must hold FIFO_DEPTH = RD_LAT+2.  The OLD sizing (pend depth =
+    RD_LAT, FIFO_DEPTH = RD_LAT+1) fires `landed` ONE CYCLE EARLY, so when two reads land
+    back-to-back the append latches the STALE bus word and the next edge is DROPPED.
+
+    Uses the user's emCCD shape (on e6, off e7) with the real e4->e5 gap (>=10 ticks), the
+    case that TRIGGERS the bug -- a /500-scaled gap of 1 tick is the lone value that hides
+    it.  Asserts: corrected sizing -> off fires at e7 (20 ms); old sizing -> e7 dropped."""
+    RD_LAT = 2
+    # user's emCCD shape, e4->e5 gap = 10 ticks (the real /500 gap is 1000; ANY gap >= ~10
+    # triggers the drop, verified by the gap sweep 1..500 in tb_gapsweep.v).
+    ticks = [0, 1000, 2500, 4500, 5000, 5010, 10010, 12010, 14010, 14110]
+    masks = [0x685, 0x200, 0xa08, 0x200, 0x200, 0x200, 0xa00, 0x208, 0x0, 0x0]
+    emb = 11
+    e6, e7, e8 = ticks[6], ticks[7], ticks[8]
+
+    def play(fifo_depth, pend_depth):
+        """edge_raddr registered (erh) + RD_LAT BRAM latency => data valid PIPE=RD_LAT+1
+        cycles after issue.  pend_depth/fifo_depth select the buggy vs corrected sizing."""
+        N = len(ticks); tc = sm = ei = 0
+        arm_t = [0]*fifo_depth; arm_m = [0]*fifo_depth; arm_nv = 0
+        pend = [0]*pend_depth; fetch = 0; er = 0; erh = [0]*16; ac = N; run = N != 0; out = []
+
         def seed():
-            nonlocal sm,tc,ei,arm_t,arm_m,arm_nv,fetch,er,pend,erh
-            pend=[0]*RD_LAT
-            if ac and ticks[0]==0:
-                sm=masks[0]; tc=1; ei=1
-                arm_t=[ticks[i] if i<N else 0 for i in (1,2,3)]; arm_m=[masks[i] if i<N else 0 for i in (1,2,3)]
-                arm_nv=min(FIFO_DEPTH,max(0,ac-1)); fetch=4; er=4
+            nonlocal sm, tc, ei, arm_t, arm_m, arm_nv, fetch, er, pend, erh
+            pend = [0]*pend_depth
+            if ac and ticks[0] == 0:
+                sm = masks[0]; tc = 1; ei = 1
+                idx = tuple(range(1, 1+fifo_depth))
+                arm_t = [ticks[i] if i < N else 0 for i in idx]; arm_m = [masks[i] if i < N else 0 for i in idx]
+                arm_nv = min(fifo_depth, max(0, ac-1)); fetch = 1+fifo_depth; er = 1+fifo_depth
             else:
-                arm_t=[ticks[i] if i<N else 0 for i in (0,1,2)]; arm_m=[masks[i] if i<N else 0 for i in (0,1,2)]
-                arm_nv=min(FIFO_DEPTH,ac); fetch=3; er=3
-            erh=[er]*12
-        seed(); final=ticks[-1] if N else 0
+                idx = tuple(range(0, fifo_depth))
+                arm_t = [ticks[i] if i < N else 0 for i in idx]; arm_m = [masks[i] if i < N else 0 for i in idx]
+                arm_nv = min(fifo_depth, ac); fetch = fifo_depth; er = fifo_depth
+            erh = [er]*16
+
+        seed(); final = ticks[-1] if N else 0
         for _ in range(ticks[-1]+200):
             out.append(sm)
-            if not run: continue
-            rdt = ticks[erh[-1-tick_lat]] if erh[-1-tick_lat]<N else 0
-            rdm = masks[erh[-1-mask_lat]] if erh[-1-mask_lat]<N else 0
-            landed = pend[RD_LAT-1]
-            if tc>=final: seed(); final=ticks[-1] if N else 0; erh=erh[1:]+[er]; continue
-            fire=(ei<ac) and (arm_nv!=0) and (tc>=arm_t[0])
-            nsm=arm_m[0] if fire else sm; nei=ei+1 if fire else ei; nv=arm_nv-1 if fire else arm_nv
-            nt,nm=arm_t[:],arm_m[:]
+            if not run:
+                continue
+            # data valid PIPE = RD_LAT+1 cycles after the issue that set edge_raddr (the +1
+            # IS the registered edge_raddr): read the address from (RD_LAT+1) cycles back.
+            ridx = erh[-1-(RD_LAT+1)]
+            rdt = ticks[ridx] if ridx < N else 0
+            rdm = masks[ridx] if ridx < N else 0
+            landed = pend[pend_depth-1]
+            if tc >= final:
+                seed(); final = ticks[-1] if N else 0; erh = erh[1:]+[er]; continue
+            fire = (ei < ac) and (arm_nv != 0) and (tc >= arm_t[0])
+            nsm = arm_m[0] if fire else sm; nei = ei+1 if fire else ei; nv = arm_nv-1 if fire else arm_nv
+            nt, nm = arm_t[:], arm_m[:]
             if fire:
-                for k in range(FIFO_DEPTH-1): nt[k]=arm_t[k+1]; nm[k]=arm_m[k+1]
-            if landed: nt[nv]=rdt; nm[nv]=rdm; nnv=nv+1
-            else: nnv=nv
-            iss=(nv+(1 if landed else 0)+pend[0]<FIFO_DEPTH) and (fetch<ac)
-            ner=fetch if iss else er; nf=fetch+1 if iss else fetch
-            sm,ei,arm_t,arm_m,arm_nv=nsm,nei,nt,nm,nnv; er,fetch,pend=ner,nf,[iss]+pend[0:RD_LAT-1]; tc+=1
-            erh=erh[1:]+[er]
+                for k in range(fifo_depth-1):
+                    nt[k] = arm_t[k+1]; nm[k] = arm_m[k+1]
+            if landed:
+                nt[nv] = rdt; nm[nv] = rdm; nnv = nv+1
+            else:
+                nnv = nv
+            # popcount over ALL in-flight pend stages (not just pend[0])
+            infl = sum(pend[0:pend_depth])
+            iss = (nv + infl < fifo_depth) and (fetch < ac)
+            ner = fetch if iss else er; nf = fetch+1 if iss else fetch
+            sm, ei, arm_t, arm_m, arm_nv = nsm, nei, nt, nm, nnv
+            er, fetch, pend = ner, nf, [iss]+pend[0:pend_depth-1]; tc += 1
+            erh = erh[1:]+[er]
         return out
 
     def emccd_edges(w):
-        e=[]; pr=0
+        e = []; pr = 0
         for t in range(len(w)):
-            b=(w[t]>>emb)&1
-            if b!=pr: e.append((("on" if b else "off"),t)); pr=b
+            b = (w[t] >> emb) & 1
+            if b != pr:
+                e.append((("on" if b else "off"), t)); pr = b
         return e
 
-    e6, e7 = ticks[6], ticks[7]
-    # REAL hardware: all three edge reads ALIGNED at latency 2 (measured on the real IPs).
-    aligned = emccd_edges(play(tick_lat=2, mask_lat=2))
-    assert ("on", e6) in aligned and ("off", e7) in aligned, \
-        f"aligned reads must give the correct 20ms pulse (on e6, off e7), got {aligned}"
-    # and the off-edge e7 is NOT dropped (no spurious extension to e8)
-    assert ("off", ticks[8]) not in aligned, f"e7 off-edge must fire (no 40ms), got {aligned}"
+    # CORRECTED sizing (the shipped RTL): PIPE = RD_LAT+1, FIFO_DEPTH = RD_LAT+2.
+    fixed = emccd_edges(play(fifo_depth=RD_LAT+2, pend_depth=RD_LAT+1))
+    assert ("on", e6) in fixed and ("off", e7) in fixed, \
+        f"corrected sizing must give the 20 ms pulse (on e6, off e7), got {fixed}"
+    assert ("off", e8) not in fixed, f"e7 off-edge must fire (no 40 ms), got {fixed}"
+
+    # OLD undersized pipeline (pend depth = RD_LAT, FIFO_DEPTH = RD_LAT+1): drops e7 -> the
+    # emCCD pulse stretches to e8 (the observed 40 ms).  This is the bug, reproduced.
+    buggy = emccd_edges(play(fifo_depth=RD_LAT+1, pend_depth=RD_LAT))
+    assert ("off", e7) not in buggy, \
+        f"the OLD sizing MUST drop e7 (this regression guards the fix), got {buggy}"
+    assert ("off", e8) in buggy, \
+        f"the OLD sizing stretches the emCCD pulse to e8 (the 40 ms), got {buggy}"
 
 
 
@@ -5667,23 +5700,23 @@ def test_fire_seed_stale_count_drops_tail_edges_fixed_path_does_not():
     fixed_full = em.rtl_mirror_play(prog, N)
     assert pulses(fixed) == 2 and fixed[-1] == 0          # both pulses, settles low
 
-    # The seed loads FIFO_DEPTH(=3) shadows but marks only clamp3(prior_count-1) valid;
-    # so a stale count CORRUPTS the frame exactly when prior_count <= 3 (the clamp
-    # saturates at 3, hence prior_count >= 4 already covers the seed window and is
-    # harmless).  This is why it strikes "很多时候": the PREVIOUS program is usually tiny
+    # The seed loads FIFO_DEPTH(=4) shadows but marks only clamp(prior_count-1) valid;
+    # so a stale count CORRUPTS the frame exactly when prior_count <= 4 (the clamp
+    # saturates at FIFO_DEPTH=4, hence prior_count >= 5 already covers the seed window and
+    # is harmless).  This is why it strikes "很多时候": the PREVIOUS program is usually tiny
     # -- an all-off table (2 edges) or a tick-0 single pulse (3 edges) -- right where the
     # bug bites.  Scan the corrupting counts and assert a dropped pulse appears.
     seen_dropped_pulse = False
-    for prior in range(1, 4):                              # prior_count in {1,2,3}: corrupting
+    for prior in range(1, 5):                              # prior_count in {1,2,3,4}: corrupting
         full = em.rtl_mirror_play_stale_seed(prog, N, prior_count=prior)
         assert full != fixed_full                          # tail edges dropped -> waveform wrong
         if pulses([(m >> 1) & 1 for m in full]) < 2:
             seen_dropped_pulse = True                      # an emCCD pulse was merged / lost
     assert seen_dropped_pulse, "a small stale prior count must drop an emCCD pulse"
 
-    # prior_count >= FIFO_DEPTH+1 (=4) saturates the clamp -> seed window fully covered ->
+    # prior_count >= FIFO_DEPTH+1 (=5) saturates the clamp -> seed window fully covered ->
     # identical to the fixed engine (so the bug is invisible after a big prior program).
-    for prior in range(4, n_edges + 1):
+    for prior in range(5, n_edges + 1):
         assert em.rtl_mirror_play_stale_seed(prog, N, prior_count=prior) == fixed_full
 
 

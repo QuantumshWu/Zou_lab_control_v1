@@ -34,7 +34,7 @@ BRAM:        1,800 Kb (50 x 36 Kb RAMB36)   DSP: 90
 
 \section{文件}
 \begin{description}
-  \item[\filepath{fpga/pulse_streamer/zlc_edge_streamer.v}] 引擎。全局边沿表（三块并行 BRAM：tick 32b / coeff 64b / mask 62b，强制 \pyapi{READ_LATENCY_B=2}）、深度 \pyapi{FIFO_DEPTH}(=\pyapi{RD_LAT}+1=3) 的连续边沿预取、2-bank ping-pong 扫描窗口、仿射有效 tick MAC、模拟总线 DAC 引擎。
+  \item[\filepath{fpga/pulse_streamer/zlc_edge_streamer.v}] 引擎。全局边沿表（三块并行 BRAM：tick 32b / coeff 64b / mask 62b，强制 \pyapi{READ_LATENCY_B=2}）、深度 \pyapi{FIFO_DEPTH}(=\pyapi{RD_LAT}+2=4) 的连续边沿预取、2-bank ping-pong 扫描窗口、仿射有效 tick MAC、模拟总线 DAC 引擎。
   \item[\filepath{fpga/pulse_streamer/zlc_pulse_streamer_top.v}] 顶层。\pyapi{jtag_axi} $\rightarrow$ \pyapi{axi_bram_ctrl} $\rightarrow$ 区段译码的 BRAM（三块并行边沿 + 扫描窗口 + 总线映像）+ CTRL 寄存器邮箱，驱动引擎与板上 62 路输出 + 4x10b DAC 总线。
   \item[\filepath{fpga/pulse_streamer/host/image.py}] 主机$\leftrightarrow$FPGA AXI 写契约 + 容量求解器的\tfocus{单一真相源}。\pyapi{pack_program}/\pyapi{unpack_program} 打包/解码 BRAM 映像，\pyapi{solve_capacity} 从器件 RAMB36/LUT 预算推导几何。RTL localparam 与 create-project Tcl 都从它派生。
   \item[\filepath{fpga/pulse_streamer/host/engine_model.py}] 逐周期行为模型（仓库\tfocus{没有 Verilog 仿真器}，这是硬件前的正确性证明）。
@@ -112,14 +112,14 @@ bit 0 对应 \pyapi{channels[0]}。一行的含义是：\tfocus{在这个有效 
 边沿表放在 block RAM 里，而 block RAM 是\tfocus{同步读}：发出读地址后，数据要 \pyapi{RD_LAT} 个周期后才到。build tcl 用 \pyapi{zlc_force_latency2} 把边沿 BRAM 强制成 \pyapi{READ_LATENCY_B=2}，所以 \pyapi{RD_LAT=2} 是确定的。如果天真地"到点了才去读下一行"，每条边沿之间就至少要空 2 个周期——背靠背的 1-tick 边沿根本打不出来。
 
 \section{解法：深度 FIFO\_DEPTH 的连续预取 + 影子}
-引擎维护一个深度 \pyapi{FIFO_DEPTH}(=\pyapi{RD_LAT}+1=3) 的"arm" FIFO，里面装着\tfocus{接下来要打的几条边沿}。它\tfocus{每个周期发一次 BRAM 读}，把读回的边沿压进 FIFO 尾；当 \pyapi{time_count} 追上 FIFO 头那条边沿的有效 tick 时，就在\tfocus{同一周期}把它的 mask 打到输出、并把它弹出。因为 FIFO 深度比读延迟多 1，FIFO 永远不空，背靠背的 1-tick 边沿就能一拍一个地连续命中。
+引擎维护一个深度 \pyapi{FIFO_DEPTH}(=\pyapi{RD_LAT}+2=4) 的"arm" FIFO，里面装着\tfocus{接下来要打的几条边沿}。它\tfocus{每个周期发一次 BRAM 读}，把读回的边沿压进 FIFO 尾；当 \pyapi{time_count} 追上 FIFO 头那条边沿的有效 tick 时，就在\tfocus{同一周期}把它的 mask 打到输出、并把它弹出。因为 FIFO 深度比	focus{流水线延迟}（发地址$	o$数据有效 $=$ \pyapi{RD_LAT}$+1$，含寄存的 \pyapi{edge_raddr} 一拍）多 1，FIFO 永远不空，背靠背的 1-tick 边沿就能一拍一个地连续命中。
 
 \begin{notebox}[SEED 不变式（行为模型逼出来的关键）]
-在每个边界，从"第一条还没输出的边沿"开始\tfocus{播种 \pyapi{FIFO_DEPTH} 条影子}，并且边界当拍\tfocus{不发新读}（占用 == 影子数 $\le$ 深度）。3 条影子刚好够给紧跟着的 1-tick 后继留出时间；2 条影子会少一拍而丢边沿。这条不变式是逐 tick 镜像仿真"逼"出来的。
+在每个边界，从"第一条还没输出的边沿"开始\tfocus{播种 \pyapi{FIFO_DEPTH} 条影子}，并且边界当拍\tfocus{不发新读}（占用 == 影子数 $\le$ 深度）。4 条影子刚好够给紧跟着的 1-tick 后继留出时间；3 条影子会少一拍而丢边沿（这正是真机 emCCD 第二脉冲 40\,ms / e7 丢失的根因——\pyapi{edge_raddr} 是寄存器，发地址到数据有效是 \pyapi{RD_LAT}$+1$ 拍）。这条不变式是逐 tick 镜像仿真"逼"出来的。
 \end{notebox}
 
 \section{背靠背 1-tick 边沿:前端脉冲实绘}
-边沿表放在 block RAM(同步读,\pyapi{RD_LAT}=2),引擎用一条深度 \pyapi{FIFO_DEPTH}=\pyapi{RD_LAT}+1=3 的连续预取流水线把读延迟藏掉:它\tfocus{每周期发一次}BRAM 读(周期 $T$ 发出的读,数据在 $T+$\pyapi{RD_LAT} 落地),读回的边沿压进 arm FIFO 尾;当 \pyapi{time_count} 追上 FIFO 头那条边沿的有效 tick 时,在\tfocus{同一周期}把它的 mask 打到输出并弹出。因为 FIFO 深度比读延迟多 1,弹出与补充始终咬合、FIFO 不空。下图是\tfocus{前端脉冲绘图器实绘}的引擎输出:三路通道在相邻 20\,ns tick 上背靠背切换,每个 1-tick 边沿逐拍打出、中间无空拍——这正是 20\,ns 的最小脉宽与分辨率。
+边沿表放在 block RAM(同步读,\pyapi{RD_LAT}=2),引擎用一条深度 \pyapi{FIFO_DEPTH}=\pyapi{RD_LAT}+2=4 的连续预取流水线把读延迟藏掉:它\tfocus{每周期发一次}BRAM 读(周期 $T$ 发出的读,地址在 $T{+}1$ 才到 BRAM 地址口——\pyapi{edge_raddr} 是寄存器,数据在 $T+$\pyapi{RD_LAT}$+1$ 落地),读回的边沿压进 arm FIFO 尾;当 \pyapi{time_count} 追上 FIFO 头那条边沿的有效 tick 时,在\tfocus{同一周期}把它的 mask 打到输出并弹出。因为 FIFO 深度比流水线延迟(=\pyapi{RD_LAT}$+1$)多 1,弹出与补充始终咬合、FIFO 不空。下图是\tfocus{前端脉冲绘图器实绘}的引擎输出:三路通道在相邻 20\,ns tick 上背靠背切换,每个 1-tick 边沿逐拍打出、中间无空拍——这正是 20\,ns 的最小脉宽与分辨率。
 
 \begin{figure}[h]
 \centering
@@ -130,7 +130,7 @@ bit 0 对应 \pyapi{channels[0]}。一行的含义是：\tfocus{在这个有效 
 \begin{itemize}
   \item 周期 $-2,-1$ 是\tfocus{arm 阶段}（reset/LOAD 期间）：连发读把前几条边沿的影子预取进 FIFO，使 \pyapi{time_count} 从 0 开始时 FIFO 已经有货。
   \item tick 0：FIFO 头是 A 且 \pyapi{time_count==tick[A]==0}，\tfocus{当拍}输出 A 并弹出；同一拍 C 的数据正好落地补进 FIFO。
-  \item 由于 FIFO 深度 3 $>$ 读延迟 2，弹出与补充永远咬合，tick 1/2/3 连续命中 B/C/D，\tfocus{无空拍}。
+  \item 由于 FIFO 深度 4 $>$ 流水线延迟 3（$=$\pyapi{RD_LAT}$+1$，含 \pyapi{edge_raddr} 寄存器一拍），弹出与补充永远咬合，tick 连续命中 B/C/D，\tfocus{无空拍}。
 \end{itemize}
 
 \begin{notebox}[这条等价是被证明的]

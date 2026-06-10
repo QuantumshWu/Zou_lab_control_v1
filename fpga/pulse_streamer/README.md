@@ -14,7 +14,7 @@ upload flow, and resource budgets) see the **FPGA manual** in
 
 - `zlc_edge_streamer.v`: the engine. A global edge table held in three parallel
   block RAMs (tick 32b / coeff 64b / mask 62b, forced `READ_LATENCY_B=2`), a
-  depth-`FIFO_DEPTH` (=`RD_LAT`+1=3) continuous edge prefetch that hides the BRAM
+  depth-`FIFO_DEPTH` (=`RD_LAT`+2=4) continuous edge prefetch that hides the BRAM
   latency so back-to-back 1-tick (20 ns) edges fire one per clock, a 2-bank
   ping-pong scan window (`BANK_SIZE`=2048, 4096 resident points) for unbounded
   streamed scans, and the affine effective-tick MAC + analog-bus DAC engine.  A
@@ -61,7 +61,7 @@ segment, not hundreds of TTL edge rows.
 Default profile (from `host.image.StreamerParams` / `solve_capacity` on the 35T):
 `CHANNEL_COUNT=62`, `NUM_SLOTS=4`, `MAX_EDGES=4096`, `BANK_SIZE=2048` (4096
 resident points), `TICK_WIDTH=32`, `COEFF_WIDTH=16`, `COEFF_FRAC_BITS=8`,
-`RD_LAT=2`, `FIFO_DEPTH=3`, `CLOCK_HZ=50 MHz` (20 ns tick). Vivado
+`RD_LAT=2`, `FIFO_DEPTH=4`, `CLOCK_HZ=50 MHz` (20 ns tick). Vivado
 `report_utilization` is the final resource authority; the budgeted estimate is
 RAMB36 78% (LUT 26%, FF 12%, DSP 9%).
 

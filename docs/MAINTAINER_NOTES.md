@@ -258,7 +258,7 @@ BRAM: 1,800 Kb (50 x 36 Kb)   DSP: 90
 ```
 
 RTL: `fpga/pulse_streamer/zlc_edge_streamer.v` (the engine, `parameter NUM_SLOTS`,
-`COEFF_FRAC_BITS=8`, `RD_LAT=2`, `FIFO_DEPTH=3`) and
+`COEFF_FRAC_BITS=8`, `RD_LAT=2`, `FIFO_DEPTH=4`) and
 `zlc_pulse_streamer_top.v` (top, `NUM_SLOTS=4`, 62 channels + 4x10-bit DAC buses,
 `axi_bram_ctrl` + CTRL regfile + region-decoded BRAMs, no VIO). The host-side
 image packer + cycle-accurate engine model are in `fpga/pulse_streamer/host/`
@@ -268,7 +268,7 @@ stay in `Zou_lab_control/neutral_atom/devices/fpga_pulse_streamer.py`.
 Default profile (from `host.image.StreamerParams` / `solve_capacity` on the 35T):
 `CHANNEL_COUNT=62`, `MAX_EDGES=4096`, `BANK_SIZE=2048` (4096 resident scan points,
 UNBOUNDED via streaming), `NUM_SLOTS=4`, `TICK_WIDTH=32`, `COEFF_WIDTH=16`,
-`COEFF_FRAC_BITS=8`, `RD_LAT=2`, `FIFO_DEPTH=3`, `CLOCK_HZ=50e6`. The edge tables
+`COEFF_FRAC_BITS=8`, `RD_LAT=2`, `FIFO_DEPTH=4`, `CLOCK_HZ=50e6`. The edge tables
 live in three parallel block RAMs (tick 32b / coeff 64b / mask 62b, forced
 `READ_LATENCY_B=2`); the scan window is one BRAM; the bus segment tables stay in
 LUTRAM (distributed) because the bus/ramp engine reads them combinationally each
@@ -276,7 +276,8 @@ tick. Vivado `report_utilization`/`report_timing_summary` are the final authorit
 the Python estimate is a budget guide (RAMB36 78%, LUT 26%, FF 12%, DSP 9%).
 
 The minimal pulse width AND resolution is **1 tick (20 ns)**: a depth-`FIFO_DEPTH`
-(=`RD_LAT`+1=3) continuous edge prefetch hides the 2-cycle BRAM read latency, so
+(=`RD_LAT`+2=4) continuous edge prefetch hides the read pipeline (issue->data-valid =
+`RD_LAT`+1, including the registered `edge_raddr`), so
 back-to-back 1-tick edges fire one per clock. Four gapless reload sites
 (start / loop-rewind / scan-advance / repeat) reseed the FIFO with `FIFO_DEPTH`
 shadows at every boundary, so the last edge of point k and the first edge of point
@@ -316,7 +317,7 @@ stream + LOOP opcodes).
 
 **1-tick prefetch.** The edge table is three parallel block RAMs (tick 32b /
 coeff 64b / mask 62b, forced `READ_LATENCY_B=2` so `RD_LAT=2` is deterministic).
-A depth-`FIFO_DEPTH` (=`RD_LAT`+1=3) continuous prefetch issues one BRAM read per
+A depth-`FIFO_DEPTH` (=`RD_LAT`+2=4) continuous prefetch issues one BRAM read per
 cycle and an "arm" FIFO holds the next edges, reseeded with `FIFO_DEPTH` shadows
 at every boundary; that hides the 2-cycle latency so back-to-back 1-tick (20 ns)
 edges fire one per clock. Four gapless reload sites: start / loop-rewind /
