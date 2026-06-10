@@ -322,19 +322,23 @@ def _bus_mode_name(v: int) -> str:
 
 
 # --------------------------------------------------------------------------- pack
-def scan_bank_words(program, p: StreamerParams, chunk_index: int) -> dict[int, int]:
-    """Words to (re)load scan chunk ``chunk_index`` into its ping-pong bank.
+def scan_bank_words(program, p: StreamerParams, chunk_index: int,
+                    target_bank: int | None = None) -> dict[int, int]:
+    """Words to (re)load scan chunk ``chunk_index`` into a ping-pong bank.
 
-    Chunk c = scan_points[c*bank_size:(c+1)*bank_size] lives in bank c%2.  Returns
-    a sparse ``{word_offset: value}`` for just that bank, used by the host to stream
-    chunks beyond the initial two.  Empty if the chunk is out of range."""
+    Chunk c = scan_points[c*bank_size:(c+1)*bank_size].  By default it lands in bank
+    c%2 (the initial preload).  For the CONTINUOUS CYCLIC re-sweep the host streams
+    chunks 0,1,..,K-1,0,1,.. into the ALTERNATING bank by MONOTONIC position, so it
+    passes ``target_bank = mono % 2`` (which need not equal c%2 across a wrap) -- this
+    matches the engine's scan_bank_base parity so the wrap is seamless.  Returns a
+    sparse ``{word_offset: value}`` for just that bank.  Empty if the chunk is out of range."""
     bases = region_bases(p)
     points = [list(pt) for pt in (getattr(program, "scan_points", None) or [])]
     slot_count = int(getattr(program, "slot_count", 0) or 0)
     first = chunk_index * p.bank_size
     if first >= len(points):
         return {}
-    bank = chunk_index % 2
+    bank = (chunk_index % 2) if target_bank is None else (int(target_bank) & 1)
     base = bases["scan"] + bank * p.bank_size * p.scan_words
     words: dict[int, int] = {}
     for off in range(p.bank_size):

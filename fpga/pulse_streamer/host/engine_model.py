@@ -530,15 +530,28 @@ def streaming_scan_play(program, n_ticks: int, *, bank_size: int, refill_delay: 
         return effective_tick(p.loop_end_tick, p.loop_end_slot_coeffs, slots, p.frac_bits)
 
     n_chunks = (N + bank_size - 1) // bank_size
-    bank_chunk = [-1, -1]     # which chunk each bank currently holds (-1 = none)
+    bank_chunk = [-1, -1]     # which DATA chunk each bank currently holds (-1 = none)
     bank_ready = [False, False]
     pending: list[tuple[int, int, int]] = []   # (bank, chunk, ready_cycle)
+
+    # CONTINUOUS CYCLIC PING-PONG (the seamless-wrap design).  The bank a chunk lives in is
+    # NOT chunk%2 but the parity of the MONOTONIC chunk count -- so the sweep WRAP (chunk
+    # K-1 -> chunk 0) is just another chunk boundary, fed one-ahead like every other, with
+    # NO special reload and NO stall.  bank = (chunk%2) ^ scan_bank_base, where scan_bank_base
+    # toggles by (n_chunks & 1) at each wrap (0 for K even -- chunk%2 already alternates across
+    # the wrap; 1 for K odd -- chunk K-1 and chunk 0 would otherwise collide in the same bank).
+    # For a RESIDENT scan (n_chunks <= 2, fits in the 2 banks, never streamed) base stays 0 and
+    # this is byte-identical to the old chunk%2 mapping -- the proven, seamless small-scan path.
+    streaming = n_chunks > 2
+    wrap_toggle = (n_chunks & 1) if streaming else 0
 
     def load(b, chunk):
         bank_chunk[b] = chunk
         bank_ready[b] = True
 
     def preload():
+        # monotonic chunks 0 and 1 -> banks 0 and 1 (base starts at 0); for n_chunks==1 the
+        # second bank mirrors chunk 0 (1 % n_chunks) so a resident wrap still finds it.
         bank_chunk[0] = bank_chunk[1] = -1
         bank_ready[0] = bank_ready[1] = False
         pending.clear()
@@ -546,23 +559,39 @@ def streaming_scan_play(program, n_ticks: int, *, bank_size: int, refill_delay: 
         if n_chunks > 1:
             load(1, 1)
 
-    def point(idx):
-        chunk = idx // bank_size
-        b = chunk % 2
-        if bank_chunk[b] == chunk and bank_ready[b]:
-            return points[idx]
-        return None           # this chunk isn't resident yet -> underflow/stall
-
     preload()
     slot = list(points[0])
     final = eff(n - 1, slot)
     loop_end = eff_le(slot)
     loops = p.loop_count
     spi = 0
+    base = 0                  # scan_bank_base: parity offset, toggles by wrap_toggle each wrap
     running = n != 0
     stalled = False
     cycle = 0
     sm, tc, ei = (p.masks[0], 1, 1) if (running and eff(0, slot) == 0) else (0, 0, 0)
+
+    def bank_of_chunk(chunk, b):
+        return (chunk % 2) ^ b
+
+    def host_refill():
+        # one-ahead cyclic refill (streaming only): keep the bank that will hold the NEXT
+        # monotonic chunk loaded with that chunk's data.  The "next" chunk after the current
+        # (cur_chunk, base) is (cur_chunk+1) within the sweep or 0 at the wrap, and its base is
+        # base (within sweep) or base^wrap_toggle (across the wrap).
+        if not streaming:
+            return
+        cur_chunk = spi // bank_size
+        if cur_chunk + 1 < n_chunks:
+            nxt_chunk, nxt_base = cur_chunk + 1, base
+        else:
+            nxt_chunk, nxt_base = 0, base ^ wrap_toggle
+        nb = bank_of_chunk(nxt_chunk, nxt_base)
+        if (bank_ready[nb] and bank_chunk[nb] == nxt_chunk) or \
+           any(it[0] == nb and it[1] == nxt_chunk for it in pending):
+            return
+        bank_ready[nb] = False; bank_chunk[nb] = -1
+        pending.append((nb, nxt_chunk, cycle + max(0, refill_delay)))
 
     out = []
     for _ in range(n_ticks):
@@ -570,6 +599,7 @@ def streaming_scan_play(program, n_ticks: int, *, bank_size: int, refill_delay: 
         for item in [it for it in pending if it[2] <= cycle]:
             pending.remove(item)
             load(item[0], item[1])
+        host_refill()
         out.append(sm)
         if not running:
             continue
@@ -577,33 +607,26 @@ def streaming_scan_play(program, n_ticks: int, *, bank_size: int, refill_delay: 
             sm = p.masks[p.loop_start_index]; tc = eff(p.loop_start_index, slot) + 1
             ei = p.loop_start_index + 1; loops -= 1
         elif tc >= final:
-            nxt_idx = spi + 1
-            if nxt_idx < N:
-                nxt = point(nxt_idx)
-                if nxt is None:
+            last = spi + 1 >= N
+            if last and not p.repeat_forever:
+                running = False; sm = 0
+            else:
+                nxt_idx = 0 if last else spi + 1
+                cur_chunk = spi // bank_size
+                new_chunk = nxt_idx // bank_size
+                new_base = (base ^ wrap_toggle) if last else base
+                crossing = last or (new_chunk != cur_chunk)
+                nb = bank_of_chunk(new_chunk, new_base)
+                if crossing and not (bank_ready[nb] and bank_chunk[nb] == new_chunk):
                     if raise_on_underflow:
-                        raise ScanUnderflow(f"scan chunk {nxt_idx // bank_size} not ready at tick {tc}")
-                    stalled = True            # hold; re-check next tick
+                        raise ScanUnderflow(f"scan chunk {new_chunk} not ready at tick {tc}")
+                    stalled = True            # hold; re-check next tick (the gap, if host late)
                 else:
-                    old_chunk = spi // bank_size
-                    new_chunk = nxt_idx // bank_size
-                    if new_chunk != old_chunk:
-                        free_bank = old_chunk % 2
-                        bank_ready[free_bank] = False
-                        bank_chunk[free_bank] = -1
-                        refill_chunk = old_chunk + 2
-                        if refill_chunk < n_chunks:
-                            pending.append((free_bank, refill_chunk, cycle + max(0, refill_delay)))
-                    slot = list(nxt); spi = nxt_idx
+                    if crossing:
+                        base = new_base
+                    slot = list(points[nxt_idx]); spi = nxt_idx
                     final = eff(n - 1, slot); loop_end = eff_le(slot); loops = p.loop_count
                     sm, tc, ei = (p.masks[0], 1, 1) if eff(0, slot) == 0 else (0, 0, 0)
-            elif p.repeat_forever:
-                preload()
-                slot = list(points[0]); spi = 0
-                final = eff(n - 1, slot); loop_end = eff_le(slot); loops = p.loop_count
-                sm, tc, ei = (p.masks[0], 1, 1) if eff(0, slot) == 0 else (0, 0, 0)
-            else:
-                running = False; sm = 0
         else:
             if ei < n and tc == eff(ei, slot):
                 sm = p.masks[ei]; ei += 1

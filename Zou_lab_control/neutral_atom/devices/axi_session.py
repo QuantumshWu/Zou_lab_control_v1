@@ -499,20 +499,26 @@ class VivadoAxiStreamerSession:
             print(f"ZLC FIRE diag: STATUS read failed: {exc}", flush=True)
 
     # --- streaming refill primitive -----------------------------------------
-    def _load_chunk(self, sweep_chunk: int, bank_ready: int, *, stop: "threading.Event | None" = None) -> int:
-        """Load sweep-chunk ``sweep_chunk`` into its ping-pong bank and return the
-        new BANK_READY mask.  De-arm the bank, write its scan rows, record the
-        chunk index (bank_chunk handshake), then re-arm -- so the engine STALLS on
-        a bank mid-rewrite and only accepts it once it truly holds this chunk."""
+    def _load_chunk(self, mono: int, bank_ready: int, *, stop: "threading.Event | None" = None) -> int:
+        """Load MONOTONIC chunk position ``mono`` into its ping-pong bank and return the
+        new BANK_READY mask.  CONTINUOUS CYCLIC PING-PONG: the data chunk is ``mono % K``
+        and the bank is ``mono % 2`` -- so the host streams chunks 0,1,..,K-1,0,1,.. into
+        the ALTERNATING bank forever, matching the engine's scan_bank_base parity.  The
+        bank_chunk handshake records the DATA chunk (what the engine's resident check
+        compares).  De-arm, write, record chunk, re-arm -- the engine STALLS on a bank
+        mid-rewrite and only accepts it once it truly holds the right chunk.  (For a finite
+        single sweep mono < K so mono%K == mono and mono%2 == mono%2 -- identical to before.)"""
 
         p = self.params
-        bank = sweep_chunk % 2
-        refill = scan_bank_words(self._program, p, sweep_chunk)
+        k = max(1, self._total_chunks)
+        bank = mono % 2
+        data_chunk = mono % k
+        refill = scan_bank_words(self._program, p, data_chunk, target_bank=bank)
         bank_ready &= ~(1 << bank)
         self._queue_word(CtrlWords.BANK_READY, bank_ready)        # de-arm during rewrite
         for off in sorted(refill):
             self._queue_word(off, refill[off])
-        self._queue_word(CtrlWords.BANK0_CHUNK if bank == 0 else CtrlWords.BANK1_CHUNK, sweep_chunk)
+        self._queue_word(CtrlWords.BANK0_CHUNK if bank == 0 else CtrlWords.BANK1_CHUNK, data_chunk)
         bank_ready |= (1 << bank)
         self._queue_word(CtrlWords.BANK_READY, bank_ready)        # re-arm
         self._flush(stop=stop)
@@ -559,42 +565,41 @@ class VivadoAxiStreamerSession:
                 return False
             time.sleep(self.stream_poll_interval if self._next_chunk < total_chunks else 0.01)
 
-    # --- repeat_forever streamed re-sweep: background cyclic refill ----------
+    # --- repeat_forever streamed re-sweep: background CONTINUOUS CYCLIC refill ----
     def _stream_refill_loop(self) -> None:
-        """Keep a repeat_forever STREAMED scan fed forever: refill chunks 2..K-1 as
-        the cursor frees their banks, and at each sweep end (cursor reaches N) reload
-        chunks 0 and 1 so the engine's wrap (gated on bank_chunk0==0) is served.
-        Within a sweep this is gapless; the inter-sweep seam is a brief safe hold
-        (never a wrong point).  Runs until _stop_stream_thread()."""
+        """Keep a repeat_forever STREAMED scan fed forever with CONTINUOUS CYCLIC
+        ping-pong: stream MONOTONIC chunk positions 2,3,4,.. (data chunk = mono % K,
+        bank = mono % 2) one-ahead of the engine, FOREVER.  The sweep WRAP is just
+        another chunk boundary -- chunk 0 is fed into the alternating bank one-ahead
+        like every other chunk, so the re-sweep is SEAMLESS (no special reload, no
+        inter-sweep hold).  Matches the engine's scan_bank_base parity (toggles by
+        K&1 each wrap).  The engine's monotonic position is reconstructed from the
+        CURSOR plus wrap detection.  Runs until _stop_stream_thread()."""
 
         p = self.params
         bank_size = p.bank_size
-        total_chunks = self._total_chunks
+        K = max(1, self._total_chunks)
         N = self._total_points
-        next_chunk = 2
+        next_mono = 2                 # chunks 0,1 were preloaded at mono 0,1 by pack_program
         bank_ready = 0b11
+        sweeps = 0
+        prev_cursor = 0
         stop = self._stream_stop
         try:
             while not stop.is_set():
                 cursor = self._read_word(CtrlWords.CURSOR, stop=stop)
-                if cursor >= N:
-                    # sweep finished: the engine is holding at the wrap until chunk 0
-                    # (and chunk 1) are resident again.  Reload them, then it re-sweeps.
-                    bank_ready = self._load_chunk(0, bank_ready, stop=stop)
-                    if total_chunks > 1:
-                        bank_ready = self._load_chunk(1, bank_ready, stop=stop)
-                    next_chunk = 2
-                    # wait for the engine to wrap (cursor returns below N), then refill.
-                    # Bounded so a hardware fault (engine never wraps) cannot spin-poll
-                    # the AXI link forever -- fall back to the outer loop, which re-checks.
-                    for _ in range(2000):
-                        if stop.is_set() or self._read_word(CtrlWords.CURSOR, stop=stop) < N:
-                            break
-                        time.sleep(self.stream_poll_interval)
-                    continue
-                if next_chunk < total_chunks and cursor >= (next_chunk - 1) * bank_size:
-                    bank_ready = self._load_chunk(next_chunk, bank_ready, stop=stop)
-                    next_chunk += 1
+                # reconstruct the engine's MONOTONIC chunk position: each wrap (cursor
+                # decreased, or the engine published cursor==N at a stalled seam) is +K.
+                if cursor < prev_cursor:
+                    sweeps += 1
+                prev_cursor = cursor
+                eng_mono = sweeps * K + (min(cursor, N - 1) // bank_size)
+                # one-ahead: load the next monotonic chunk as soon as the engine has
+                # freed its bank (eng_mono >= next_mono - 1).  Unbounded: next_mono just
+                # keeps counting; _load_chunk maps it to (data=next_mono%K, bank=next_mono%2).
+                if eng_mono >= next_mono - 1:
+                    bank_ready = self._load_chunk(next_mono, bank_ready, stop=stop)
+                    next_mono += 1
                     continue
                 time.sleep(self.stream_poll_interval)
         except _AxiAborted:             # Off/prepare tore us down mid-read: clean exit

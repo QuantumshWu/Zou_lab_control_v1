@@ -122,8 +122,10 @@ Streaming refill: for scans larger than the resident 2-bank window the host
 refills the freed bank behind the cursor with the next chunk; the engine only
 advances into a bank when `BANK_READY` AND that bank holds the right chunk, so a
 late refill STALLs (`STATUS_UNDERFLOW`), never a wrong point. `repeat_forever`
-re-sweeps a streamed scan via a host background refill thread; the inter-sweep
-seam is a brief safe hold.
+re-sweeps a streamed scan via a host background refill thread that feeds chunks
+CONTINUOUSLY and CYCLICALLY (chunk `(mono%K)` into bank `mono%2`, one-ahead) -- the
+sweep wrap is just another chunk boundary, so the re-sweep is SEAMLESS for any N
+(`scan_bank_base` toggles by `K&1` so chunk 0 lands in the alternating bank).
 
 ## 4. N-Slot Scan Model (current design)
 
@@ -330,8 +332,9 @@ refills the freed bank behind the cursor with the next chunk. The `BANK_READY` +
 `BANK*_CHUNK` handshake means the engine only advances when the bank is ready AND
 holds the right chunk, so a late refill STALLs (hold, `STATUS_UNDERFLOW`), never a
 wrong point. `repeat_forever` re-sweeps a streamed scan via a host background
-refill thread; within a sweep it is gapless, the inter-sweep seam is a brief safe
-hold.
+refill thread that streams chunks CONTINUOUSLY and CYCLICALLY (monotonic chunk
+`mono` -> data `mono%K` into bank `mono%2`, one-ahead) -- the wrap is just another
+chunk boundary, so the WHOLE re-sweep is gapless (no inter-sweep hold).
 
 **Pieces (all in-repo, all Python-verified pre-hardware, no Verilog sim):**
 

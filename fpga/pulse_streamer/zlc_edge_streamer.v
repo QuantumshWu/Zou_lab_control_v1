@@ -218,6 +218,12 @@ module zlc_edge_streamer #(
     reg [SLOT_BITS-1:0] slot_active = {SLOT_BITS{1'b0}};
     reg [SCAN_COUNT_WIDTH-1:0] active_scan_count = {SCAN_COUNT_WIDTH{1'b0}};
     reg [SCAN_COUNT_WIDTH-1:0] scan_point_index = {SCAN_COUNT_WIDTH{1'b0}};
+    // CONTINUOUS CYCLIC PING-PONG bank parity: the bank a chunk lives in is
+    // (chunk[0] ^ scan_bank_base), and scan_bank_base toggles by (n_chunks & 1) at each sweep
+    // WRAP -- so the wrap is just another chunk boundary and the host feeds chunk 0 into the
+    // alternating bank one-ahead (seamless re-sweep for ANY N, incl. odd chunk counts).  For a
+    // RESIDENT scan (<=2 chunks) the toggle is 0 -> base stays 0 -> identical to chunk[0].
+    reg scan_bank_base = 1'b0;
     reg [31:0] loop_count_active = 32'd1;
     reg [31:0] loops_remaining = 32'd1;
 
@@ -432,13 +438,14 @@ module zlc_edge_streamer #(
     // (i.e. BANK_SIZE is a power of two and the scan window is exactly 2 banks).  A
     // mismatched geometry would silently alias both banks onto one window -- the host
     // (image.check_rtl_assumptions) rejects such configs at pack time.
+    // bank = (chunk[0]) ^ scan_bank_base -- cyclic ping-pong parity (see scan_bank_base).
     function [SCAN_ADDR_WIDTH-1:0] scan_addr_of;
         input [SCAN_COUNT_WIDTH-1:0] idx;
-        begin scan_addr_of = {idx[BANK_BITS], idx[BANK_BITS-1:0]}; end   // bank*BANK_SIZE + offset
+        begin scan_addr_of = {idx[BANK_BITS] ^ scan_bank_base, idx[BANK_BITS-1:0]}; end
     endfunction
     function bank_of;
         input [SCAN_COUNT_WIDTH-1:0] idx;
-        begin bank_of = idx[BANK_BITS]; end
+        begin bank_of = idx[BANK_BITS] ^ scan_bank_base; end
     endfunction
     function [SCAN_COUNT_WIDTH-1:0] chunk_of;        // which sweep chunk a point belongs to
         input [SCAN_COUNT_WIDTH-1:0] idx;
@@ -452,10 +459,24 @@ module zlc_edge_streamer #(
         input [SCAN_COUNT_WIDTH-1:0] idx;
         reg b;
         begin
-            b = idx[BANK_BITS];
+            b = idx[BANK_BITS] ^ scan_bank_base;
             scan_point_resident = bank_ready[b] && ((b ? bank_chunk1 : bank_chunk0) == chunk_of(idx));
         end
     endfunction
+
+    // ---- cyclic re-sweep helpers (combinational, off active_scan_count) ----
+    // n_chunks = ceil(N / BANK_SIZE); STREAMED iff > 2 banks (else resident: never overwritten).
+    wire [SCAN_COUNT_WIDTH-1:0] scan_n_chunks =
+        (active_scan_count + (BANK_SIZE[SCAN_COUNT_WIDTH-1:0] - 1'b1)) >> BANK_BITS;
+    wire scan_streamed       = scan_n_chunks > {{(SCAN_COUNT_WIDTH-2){1'b0}}, 2'd2};
+    // toggle base by n_chunks parity ONLY when streamed; resident scans keep base = 0.
+    wire scan_wrap_toggle    = scan_streamed ? scan_n_chunks[0] : 1'b0;
+    wire scan_wrap_base_next = scan_bank_base ^ scan_wrap_toggle;
+    // point 0 (chunk 0) lives in bank scan_wrap_base_next after the wrap; resident iff that
+    // bank is armed and actually holds chunk 0 (the host fed it one-ahead).
+    wire scan_point0_ready_next =
+        bank_ready[scan_wrap_base_next] &&
+        ((scan_wrap_base_next ? bank_chunk1 : bank_chunk0) == {SCAN_COUNT_WIDTH{1'b0}});
 
     task zlc_bus_clear_runtime;
         integer i;
@@ -801,7 +822,8 @@ module zlc_edge_streamer #(
             scan_enable_active <= scan_enable && scan_count != 0; active_scan_count <= scan_count;
             slot_active <= scan_first_values; scan_point_index <= {SCAN_COUNT_WIDTH{1'b0}};
             scan_cursor <= {SCAN_COUNT_WIDTH{1'b0}};
-            scan_raddr <= scan_addr_of({{(SCAN_COUNT_WIDTH-1){1'b0}},1'b1});      // pre-read point 1
+            scan_bank_base <= 1'b0;                                                // sweep 0: chunk c in bank c[0]
+            scan_raddr <= {{(SCAN_ADDR_WIDTH-1){1'b0}}, 1'b1};                     // pre-read point 1 (bank 0)
             loop_count_active <= (loop_count==0)?32'd1:loop_count;
             loops_remaining <= (loop_count==0)?32'd1:loop_count;
             // AT FIRE: latch the LITERAL delay-line amounts from the held CTRL words and reset the
@@ -871,24 +893,22 @@ module zlc_edge_streamer #(
                         fetch_idx <= {1'b0,loop_start_addr}+3'd5; edge_raddr <= loop_start_addr+3'd5;
                         pend <= {PIPE{1'b0}};
                         bnd_bus_tick = 1'b1; bnd_bus_reinit = 1'b1; bnd_slots = slot_active;
-                    // Otherwise restart the sweep at point 0.  For a STREAMING scan the
-                    // host has overwritten bank 0 with a later chunk, so wait until it
-                    // reloads chunk 0 (bank_chunk0==0) before wrapping -- the re-sweep is
-                    // then seamless (resident scans pass instantly; streamed ones stall
-                    // only at the seam, never emit a wrong point).
-                    end else if (scan_enable_active && !(bank_ready[1'b0] && bank_chunk0 == {SCAN_COUNT_WIDTH{1'b0}})) begin
-                        // STREAMED re-sweep seam: bank 0 still holds a later chunk, so we must
-                        // wait for the host to reload chunk 0.  Publish scan_cursor = N (the full
-                        // count) so the host's refill loop (which reloads chunk 0 only when
-                        // CURSOR >= N) actually fires -- otherwise the cursor would stay at N-1,
-                        // the host would never reload, and the engine would stall here forever
-                        // (the scan stops after exactly one sweep).
+                    // CONTINUOUS CYCLIC PING-PONG re-sweep: the wrap is just another chunk
+                    // boundary.  scan_bank_base toggles by (n_chunks & 1) so chunk 0 lands in the
+                    // bank the host fed it ONE-AHEAD (bank scan_wrap_base_next, NOT necessarily
+                    // bank 0); for a RESIDENT scan (<=2 chunks) the toggle is 0 so chunk 0 stays
+                    // in bank 0 (identical to before).  Proceed the instant point 0 is resident
+                    // in that bank -- seamless; STALL (safe hold) only if the host is genuinely
+                    // behind.  scan_cursor is published = N so a late host still gets the signal.
+                    end else if (scan_enable_active && !scan_point0_ready_next) begin
                         underflow <= 1'b1;
                         scan_cursor <= active_scan_count;
                     end else begin
                         underflow <= 1'b0;
+                        scan_bank_base <= scan_wrap_base_next;     // cyclic bank flip (0 if resident)
                         slot_active <= scan_first_values; scan_point_index <= {SCAN_COUNT_WIDTH{1'b0}}; scan_cursor <= {SCAN_COUNT_WIDTH{1'b0}};
-                        scan_raddr <= scan_addr_of({{(SCAN_COUNT_WIDTH-1){1'b0}},1'b1});
+                        // pre-read point 1 (chunk 0) from the NEW base's bank
+                        scan_raddr <= {scan_wrap_base_next, {(SCAN_ADDR_WIDTH-2){1'b0}}, 1'b1};
                         loops_remaining <= loop_count_active;
                         bnd_slots = scan_first_values; bnd_recompute_final = 1'b1;
                         bnd_bus_tick = 1'b1; bnd_bus_reinit = 1'b1; bnd_seed = 1'b1;

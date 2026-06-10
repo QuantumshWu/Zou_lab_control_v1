@@ -145,7 +145,7 @@ __FPGA_FIG_REPEAT__
 \chapter{无限流式扫描：2-bank ping-pong}
 
 \section{窗口 + 流式回填}
-扫描窗口在硬件里是一个 \tfocus{2-bank ping-pong}（\pyapi{BANK_SIZE}=2048，是 2 的幂；两 bank 共 4096 个常驻扫描点），放在一块 BRAM 里。引擎依次播放点 \pyapi{0..N-1}，用 \pyapi{(idx/BANK_SIZE) mod 2} 选 bank，并把已消费点数写进 \pyapi{CURSOR}。主机读 \pyapi{CURSOR}，把游标已经走过的那个 bank 回填\tfocus{下一段 chunk}，并更新 \pyapi{BANK_READY}/\pyapi{BANK*_CHUNK}。这样扫描点文件虽然有限，但\tfocus{大小无上限}。
+扫描窗口在硬件里是一个 \tfocus{2-bank ping-pong}（\pyapi{BANK_SIZE}=2048，是 2 的幂；两 bank 共 4096 个常驻扫描点），放在一块 BRAM 里。引擎依次播放点 \pyapi{0..N-1}，用 \pyapi{((idx/BANK_SIZE) mod 2) XOR scan_bank_base} 选 bank（\pyapi{scan_bank_base} 实现连续循环 ping-pong，见下"无缝重复扫描"），并把已消费点数写进 \pyapi{CURSOR}。主机读 \pyapi{CURSOR}，把游标已经走过的那个 bank 回填\tfocus{下一段 chunk}，并更新 \pyapi{BANK_READY}/\pyapi{BANK*_CHUNK}。这样扫描点文件虽然有限，但\tfocus{大小无上限}。
 
 \begin{figure}[htbp]
   \centering

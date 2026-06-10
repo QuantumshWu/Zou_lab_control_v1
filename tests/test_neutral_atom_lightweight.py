@@ -1501,6 +1501,38 @@ def test_final_engine_model_fifo_1tick_and_streaming_scan():
         streaming_scan_play(sp, NT, bank_size=4, refill_delay=10 ** 9, raise_on_underflow=True)
 
 
+def test_streaming_scan_repeat_wrap_is_seamless_continuous_cyclic():
+    """CORE REQUIREMENT: a repeat_forever STREAMED scan (N > 2 banks) re-sweeps with NO
+    gap at the wrap.  The continuous cyclic ping-pong feeds chunks 0,1,..,K-1,0,1,..
+    one-ahead into the ALTERNATING bank, so the sweep wrap is just another chunk boundary
+    -- seamless for ANY chunk count K (odd included, where bank=chunk%2 used to collide
+    chunk K-1 and chunk 0 in the same bank and force a reactive reload -> the blank the
+    user saw).  Plays MANY sweeps and asserts gapless == reference with a realistic
+    refill latency, for K = 1,2,3,4,5 (resident through streamed, both parities)."""
+
+    from fpga.pulse_streamer.host.engine_model import (
+        EngineProgram, reference_play, streaming_scan_play,
+    )
+
+    def prog(N):
+        return EngineProgram(
+            ticks=[0, 5], masks=[0b01, 0b00], tick_slot_coeffs=[[0], [1]],
+            scan_points=[[i] for i in range(N)], slot_count=1, frac_bits=0,
+            loop_start_index=0, loop_end_tick=0, loop_end_slot_coeffs=[0],
+            loop_count=1, repeat_forever=True)
+
+    bank = 8
+    for N, K in [(8, 1), (16, 2), (17, 3), (24, 3), (40, 5), (41, 6)]:
+        assert (N + bank - 1) // bank == K
+        pr = prog(N)
+        nt = 3000                      # >= 4 full sweeps for the streamed cases
+        ref = reference_play(pr, nt)
+        # a realistic one-chunk-ahead refill latency (small vs a chunk's tick span)
+        out, stalled, _ = streaming_scan_play(pr, nt, bank_size=bank, refill_delay=6)
+        assert not stalled, f"N={N} K={K}: the cyclic re-sweep must never stall (the wrap gap)"
+        assert out == ref, f"N={N} K={K}: cyclic streamed playback must match reference over all sweeps"
+
+
 def test_edge_streamer_rtl_mirror_matches_reference():
     """`rtl_mirror_play` re-implements the EXACT register transfers of
     fpga/pulse_streamer/zlc_edge_streamer.v (arm shift-down FIFO + nv + pend
@@ -1711,8 +1743,9 @@ def test_vivado_axi_session_tolerates_transient_underflow(tmp_path):
 
 def test_edge_streamer_repeat_streaming_structure():
     """Engine + top carry the bank_chunk handshake: the scan advance is gated on the
-    bank holding the RIGHT chunk (never a stale point), and the repeat_forever wrap
-    waits for chunk 0 to be reloaded -- so a finite streamed scan re-sweeps."""
+    bank holding the RIGHT chunk (never a stale point).  The repeat_forever wrap is a
+    CONTINUOUS CYCLIC ping-pong chunk boundary -- scan_bank_base toggles by (n_chunks&1)
+    so chunk 0 is fed into the alternating bank ONE-AHEAD (seamless re-sweep, any N)."""
 
     import pathlib
     root = pathlib.Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer"
@@ -1720,7 +1753,11 @@ def test_edge_streamer_repeat_streaming_structure():
     top = (root / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
     assert "bank_chunk0" in eng and "bank_chunk1" in eng
     assert "scan_point_resident" in eng                       # advance gated on ready AND right chunk
-    assert "bank_chunk0 == {SCAN_COUNT_WIDTH{1'b0}}" in eng   # repeat wrap waits for chunk 0
+    # continuous cyclic ping-pong: bank parity offset that toggles at the wrap, and the
+    # wrap proceeds the instant point 0 is resident in the alternating bank (no stall gate).
+    assert "scan_bank_base" in eng
+    assert "scan_wrap_base_next" in eng and "scan_point0_ready_next" in eng
+    assert "bank_chunk0 == {SCAN_COUNT_WIDTH{1'b0}}" not in eng   # old reactive wrap gate removed
     assert "C_BANK0_CHUNK" in top and "C_BANK1_CHUNK" in top
     assert "bank_chunk0(ctrl_reg[C_BANK0_CHUNK]" in top and "bank_chunk1(ctrl_reg[C_BANK1_CHUNK]" in top
 
@@ -1837,9 +1874,12 @@ def test_vivado_axi_session_rejects_nonmonotonic_program(tmp_path):
 
 
 def test_vivado_axi_session_repeat_streaming_refills_cyclically(tmp_path):
-    """repeat_forever over a FINITE STREAMED scan (N > 2*bank_size) re-sweeps: the
-    background refill thread reloads chunk 0 (and 1) at each sweep seam, cyclically,
-    keeping the engine fed across re-sweeps.  Never raises; safe_state stops it."""
+    """repeat_forever over a FINITE STREAMED scan (N > 2*bank_size) re-sweeps SEAMLESSLY
+    via CONTINUOUS CYCLIC ping-pong: the background thread streams monotonic chunks
+    2,3,4,.. (data = mono%K into bank mono%2) ONE-AHEAD forever, so the engine wraps
+    0->N-1->0 with no reactive reload.  Models the cyclic engine: cursor wraps on its
+    own each sweep; asserts the engine re-sweeps and the host keeps re-feeding data
+    chunk 0 across sweeps.  Never raises; safe_state stops it."""
 
     import re as _re, time as _time
     from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
@@ -1861,7 +1901,8 @@ def test_vivado_axi_session_repeat_streaming_refills_cyclically(tmp_path):
 
     class Hw:
         def __init__(self):
-            self.bram = {}; self.status = 0; self.fired = False; self.cursor = 0; self.reloads0 = 0
+            self.bram = {}; self.status = 0; self.fired = False; self.cursor = 0
+            self.sweeps = 0; self.chunk0_feeds = 0
         def __call__(self, lines, action, timeout):
             text = "\n".join(lines)
             for w, v in _decode_axi_writes(text):
@@ -1869,17 +1910,22 @@ def test_vivado_axi_session_repeat_streaming_refills_cyclically(tmp_path):
                 if w == CtrlWords.COMMAND and v & CMD_LOAD: self.status = STATUS_LOADED
                 if w == CtrlWords.COMMAND and v & CMD_FIRE: self.fired = True; self.status = STATUS_RUNNING; self.cursor = 0
                 if w == CtrlWords.COMMAND and v & CMD_SAFE: self.status = 0; self.fired = False
-                # the engine wraps once the host reloads chunk 0 at the sweep seam
-                if w == CtrlWords.BANK0_CHUNK and v == 0 and self.cursor >= N:
-                    self.reloads0 += 1; self.cursor = 0
+                # count the host (re)feeding DATA chunk 0 into either bank AFTER fire -- the
+                # cyclic stream keeps reloading chunk 0 (mono = K, 2K, ..) across sweeps.
+                if self.fired and w in (CtrlWords.BANK0_CHUNK, CtrlWords.BANK1_CHUNK) and v == 0:
+                    self.chunk0_feeds += 1
             m = _re.search(r"-address ([0-9A-Fa-f]+) -len 1 -type read", text)
             if m:
                 w = int(m.group(1), 16) // 4
                 if w == CtrlWords.STATUS:
                     return f"ZLCDATA {self.status:08X}\n"
                 if w == CtrlWords.CURSOR:
-                    if self.fired and self.cursor < N:
-                        self.cursor = min(N, self.cursor + params.bank_size)
+                    # the engine plays a chunk's worth of points per poll and WRAPS on its
+                    # own at N (seamless cyclic re-sweep -- no reactive reload needed).
+                    if self.fired:
+                        self.cursor += params.bank_size
+                        if self.cursor >= N:
+                            self.cursor -= N; self.sweeps += 1
                     return f"ZLCDATA {self.cursor:08X}\n"
                 return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
             return "ok\n"
@@ -1891,11 +1937,12 @@ def test_vivado_axi_session_repeat_streaming_refills_cyclically(tmp_path):
         session.fire()
         assert session.wait_done(timeout=1.0) is True       # RUNNING -> returns; thread feeds
         deadline = _time.monotonic() + 3.0
-        while hw.reloads0 < 2 and _time.monotonic() < deadline:
+        while (hw.sweeps < 3 or hw.chunk0_feeds < 1) and _time.monotonic() < deadline:
             _time.sleep(0.02)
     finally:
         session.safe_state()
-    assert hw.reloads0 >= 2, f"expected the streamed scan to re-sweep cyclically, got {hw.reloads0}"
+    assert hw.sweeps >= 3, f"expected the streamed scan to re-sweep, got {hw.sweeps} sweeps"
+    assert hw.chunk0_feeds >= 1, f"expected the cyclic host to re-feed chunk 0, got {hw.chunk0_feeds}"
 
 
 def test_pulse_table_state_compiles_pair_array_scan_to_full_40ch_template():
