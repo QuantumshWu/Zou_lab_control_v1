@@ -96,3 +96,7 @@ docs/**/*_zh.txt
 # Scratch GUI verification screenshots (devtools output, not deliverables)
 /_gui_shots/
 pulses/
+
+# xsim litter (simulation runs anywhere in the tree)
+xsim.dir/
+*.pb

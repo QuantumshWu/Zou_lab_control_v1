@@ -762,6 +762,18 @@ scan_table = np.column_stack([D.ravel(), C.ravel()])  # 形状 (88, 2)
 DAC 值、duration、delay 三类槽\tfocus{可以在同一轮里一起扫}。你在 Edit 页绑定几个字段、Scan 页就给几列填数，硬件会按行无缝执行这张多列扫描表，每个扫描点照常发一次相机触发。这让"沿某条轨迹同步改变多个参数"或"多维网格扫描"成为一次 On Pulse 就能完成的事。
 \end{notebox}
 
+\section{Sync 按钮、UNSYNCED 状态与 period 选择（2026-06 新增）}
+
+\begin{itemize}
+  \item \tfocus{Sync（橙色）}：把"sequencer 上实际应用的脉冲"拉回编辑器。当你在 notebook 里用 \pyapi{PulseController}（\pyapi{on_pulse}/\pyapi{set_channel_delay} 等）改了设备而 GUI 没跟上时，点一下即恢复一致——服务端在每次成功 prepare 时记录源 payload，GUI 与 API 读的是同一份。
+  \item \tfocus{UNSYNCED（橙色 On Pulse）}：设备在 RUNNING/PREPARED 状态下，\tfocus{任何}编辑（duration/delay/DA/scan/clk/显隐/载入……）都会把 On Pulse 按钮和状态点变橙——提示"设备上跑的已不是你眼前的参数，按一下应用"。若把修改改回原样，橙色自动恢复；重新 On Pulse 即清除。Save 的黄色+星号语义不变（未保存到文件）。
+  \item \tfocus{点选 period / 中缝}：单击一张 period 卡片（出现高亮边框）或两张卡片之间的空隙（出现竖线指示），Add Period 就插到所选位置、Remove 删除所选；再点一次取消选择；无选择时维持旧行为（加/删最后一个）。扫描 slot 绑定、DAC 总线计划与 repeat bracket 会随中间插入/删除自动重定位。
+  \item \tfocus{单 period 保护}：只剩一个 period 时 Remove 被禁用（脉冲表至少要有一个 period）。
+  \item \tfocus{拖动排序}：拖动时光标下有半透明卡片缩略图，插入位置竖线为覆盖层（不再引起整行重排抖动），拖到视口边缘会自动滚动——后面的 period 始终可达。
+  \item \tfocus{预览横轴自动加宽}：与纵轴的行块一致，每 5 个 period 增加一个基础宽度块，最多 3 倍（\pyapi{live.PULSE_X_PERIODS_PER_BLOCK} / \pyapi{PULSE_X_MAX_WIDTH_FACTOR} 可配置）。深度缩放下刻度标签按间距自适应精度，不再退化成一排相同的 "8ms"。
+  \item \tfocus{通道延时}：上限现在约 $\pm 42.9$ s（FPGA 端事件调度器；毫秒级 emCCD 延时直接填入即可）。约束变为"任一延时窗口内该通道翻转 $\le 16$ 次"——稀疏触发信号天然满足，超限会在编译时给出明确报错。
+\end{itemize}
+
 \chapter{完整走一遍（新手教程）}
 本章假设你\tfocus{从零开始}，一步步搭一个真实的脉冲序列、预览、再加一个扫描。每一步对应上一章讲过的控件，配合 Edit/Preview/Scan 三张截图看。
 

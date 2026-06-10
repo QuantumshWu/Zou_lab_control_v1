@@ -434,116 +434,46 @@ refills the bank behind the consumed `CURSOR` with the next chunk and re-arms
 `BANK_READY` (see section 3 and 6). Total scan points are limited only by host memory, and
 a late refill STALLs (`STATUS_UNDERFLOW`, hold), never a wrong point.
 
-## 8. Unbounded Per-Channel OUTPUT Delay (the membership delay line)
+## 8. Per-Channel OUTPUT Delay (TTL event scheduler + DAC rings)
 
 A channel delay is a **physical OUTPUT delay**, not baked into the edge ticks:
-`output_delayed[t] = output_undelayed[t - d]`, **zero before fire**, with the loop period
-preserved at the frame length `T`. The edge table is emitted UNDELAYED (every channel at
-its nominal position); the delay rides `channel_delays` / `delay_channels`. This is the
-literal physical delay -- **ANY** length (positive, negative, zero, arbitrarily large or
-small), it never disturbs another channel, and the first frame is REAL (silent until
-`t = d`, no cyclic wrapped-in tail). The compilers are
-`compile_pulse_table_runtime_program` -> `_pulse_table_edge_table` (constant frame) and
-`compile_pulse_table_scan_runtime_program` -> `_pulse_table_affine_delay_channels` (scan),
-both in `sequencer.py`.
+`output_delayed[t] = output_undelayed[t - d]`, **zero before fire**, never disturbing
+another channel; negative delays fold via the global shift `G = max(0, -min(delays))`.
+The edge table is emitted UNDELAYED; the delays ride `channel_delays` (TTL, one 32-bit
+word per channel in the AXI DELAY register region R_DELAY_BASE) and `bus_delays`
+(DAC, dense CTRL words).
 
-THE KEY DESIGN -- no buffer, no cap. The RTL (`zlc_edge_streamer.v`) does **NOT** buffer the
-delayed signal. A buffer of depth `N` would cap the frame period at `N` ticks; the old
-design used a per-channel SRL ring of depth `DELAY_DEPTH=2048` and so capped `T <= 2048`.
-Instead, each delayed channel stores its **own** undelayed ON intervals `[a_i, b_i)` over
-`[0, T)` in a tiny per-channel LUTRAM (`del_iv_start_mem` / `del_iv_stop_mem` +
-`ram_style="distributed"`, with affine tick coeffs so a scanned DURATION moves the
-interval), and produces the delayed bit COMBINATIONALLY each tick by **evaluating
-membership** at the shifted phase:
+**TTL = EVENT SCHEDULER** (`zlc_edge_streamer.v`): a TTL waveform is toggle-sparse, so
+the engine queues TOGGLES instead of buffering one bit per tick.  When the undelayed bit
+flips at tick `t`, it pushes `{t + d - 1, level}` into that channel's EVT_DEPTH(16)-deep
+49-bit LUTRAM FIFO; a free-running 48-bit `g_time` pops it by equality into the output
+register (`d == 1` is one register; `d == 0` bypasses).  Storage scales with toggles IN
+FLIGHT, not delay length: the TTL bound is the 32-bit field (~42.9 s, ms-scale emCCD
+delays included) at ~2k LUTs for 62 channels (the old per-tick SRL lines cost ~4.1k LUTs
+and capped d at DELAY_DEPTH = 2048 ticks ~ 41 us).  The host validates the new contract:
+per channel, at most EVT_FIFO_DEPTH toggles inside any window of its own delay length
+(incl. across the repeat seam).  **DAC buses keep the 2048-deep value rings** (one
+10-bit ring per bus, ~1.3k LUTs, 41 us cap) -- DAC delays are short compensations.
 
-```
-shifted = (time_count - off) mod T        # off = d mod T, the FULL phase (TICK_WIDTH)
-bit     = OR_i (a_i <= shifted < b_i)      # over the channel's resolved ON intervals
-out_bit = started ? bit : 0
-```
+Proven: `delay_line_reference` (out[t]=in[t-d]) is the unchanged ground truth;
+`engine_model.rtl_delay_line_mirror` mirrors the scheduler cycle-exactly (incl. the
+overflow-drop guard); `fpga/pulse_streamer/sim/tb_delay_sched.v` verifies the REAL RTL
+in xsim (delays {0,1,2,7,1000}, 1-tick toggles, repeat seams: 11,996 cycles, 0
+mismatches).  Capacity: 14,056 -> 12,184 LUTs (58.6% of the 35T).
 
-No buffer -> `T` (and the delay) are **UNBOUNDED**. `off` is now the full `TICK_WIDTH` phase
-(not a ring index), the modulo is a single conditional `+T`, and `skip = floor(d/T)` whole
-periods are handled by a startup gate -- so the delay LENGTH is unbounded too.
+## 9. Pulse API, sync-to-device and GUI state semantics
 
-Startup gate (silent first frame, opens at EXACTLY `t = d`). Purely COMBINATIONAL from the
-engine's own `time_count` and a per-player `del_frame_idx` (frames elapsed since fire, ++ at
-each gapless seam) vs the targets `del_skip` / `del_off`:
-
-```
-started = (frame_idx > skip) || (frame_idx == skip && time_count >= off)   # == t >= d
-```
-
-No decrementing counter, no off-by-one. `off==0 && skip==0` (zero delay) => `started` from
-`t=0` and `shifted == time_count` => passthrough.
-
-Merge (unchanged shape): `out = (state_mask & ~delayed_mask) | delayed_out`. The delayed
-channel is cleared from the undelayed mask and re-driven by its membership result.
-
-Negative / zero / huge. A NEGATIVE delay re-translates the WHOLE frame: the host folds the
-global shift `G = max(0, -min(delays))` into EVERY channel's delay (a causal delay line
-cannot lead), so every `off`/`skip` handed to the player is `>= 0`. Zero is passthrough.
-A huge delay is just a wider `skip` (a 32-bit-plus counter).
-
-Host -> FPGA contract (`fpga/pulse_streamer/host/image.py`). Per delayed channel the CTRL
-regfile carries `delay_count` / packed `delay_bits` / per-channel `delay_off` (one 32-bit
-word -- the full phase) / packed `delay_iv_counts` / per-channel `delay_skip`; the ON
-intervals (+ affine coeffs) go into the **DELAY image** region (one of the 6 BRAMs). The
-top's delay mini-loader copies the image rows into the engine's per-channel interval LUTRAM
-via `delay_prog_*` (a `prog_we`-toggle loader, exactly like the bus-segment loader). `off`
-and `skip` are computed on the host from `T = loop_end_tick` (constant `T` => constant
-`off`/`skip`; the affine ON intervals carry the per-scan-point period shift via the shared
-MAC `zlc_effective_tick`). There is NO HW divider.
-
-DAC buses. A DAC value reaching the output via the TTL-folded path (fixed bus values,
-`fold_analog_buses`) inherits the membership player directly -- each bus bit is a delayed
-TTL channel, so its delay is unbounded with identical capability. A DAC value reaching the
-output via the value-engine / `value_select` path (a scanned DAC value, OR a fixed bus value
-emitted as bus segments) is now ALSO delayed by an UNBOUNDED membership BUS-delay player --
-the DAC-value counterpart of the TTL player. The bus SEGMENTS stay at their NOMINAL phase
-(the delay is no longer baked into the segment ticks, which capped it at one frame and
-rejected `d > T`); the per-bus delay is carried as a separate `RuntimeBusDelay`
-(`bus_index`, `delay`), packed into the `BUS_DELAY_*` CTRL words as `off = d mod T` /
-`skip = floor(d/T)`, and the engine produces the delayed value by EVALUATING the bus value
-at the shifted phase `(time_count - off) mod T` (RTL `zlc_bus_value_at`: walk the segments,
-hold the active one, resolve literal/`value_select` value, closed-form ramp staircase),
-gated by the SAME `skip`/`off` startup as the TTL player -- NO buffer, so a scanned DAC value
-is delayable by ANY amount, incl. `> one frame`, positive/negative-via-G/zero. The per-bus
-delay shares the SAME global shift `G` as the TTL channels. Proven by
-`engine_model.bus_value_at` (== `bus_play` undelayed) + `engine_model.rtl_bus_delay_play`
-(== `membership_bus_delay_play` delayed) in
-`test_bus_value_at_combinational_equals_bus_play_undelayed`,
-`test_rtl_bus_delay_player_no_cap_extreme_battery`,
-`test_scanned_dac_value_delayed_beyond_one_frame_compiles_and_streams`,
-`test_image_bus_delay_ctrl_packing_roundtrip`, and the RTL structure lock
-`test_edge_streamer_has_unbounded_bus_delay_path`.
-
-Capacity. The per-channel interval tables are LUTRAM (+0 RAMB36); the only RAMB36 cost is
-the small DELAY image staging BRAM (`blk_mem_gen_delayimg`, 8*8*6 = 384 words = 1 RAMB36,
-the 6th BRAM). `NUM_DELAYS=8` delayed channels, `MAX_DELAY_INTERVALS=8` ON intervals each
-(`DEFAULT_NUM_DELAYS` / `DEFAULT_MAX_DELAY_INTERVALS` in `fpga_pulse_streamer.py`, matching
-the RTL params). `validate_pulse_streamer_program` enforces only `count <= num_delays` and
-`intervals <= max_delay_intervals` -- there is **NO** frame-period / delay-length cap.
-The per-bus DAC delay is likewise enforced only as `count <= bus_count` and a valid
-`bus_index` -- **NO** frame-period / delay-length cap on a DAC value either (`off`/`skip`
-in `BUS_DELAY_*` CTRL words, the bus value evaluated at the shifted phase, no buffer).
-
-Tick-0 seed anchor (unchanged). The engine seeds its time counter from edge 0, so the
-UNDELAYED edge table must begin at tick 0 at every scan point; every compiler path prepends
-an all-off tick-0 edge and `validate_pulse_streamer_program` backstops it. (Because the edge
-table is undelayed, no channel reorders -- the delay is entirely on the output -- so the old
-"delay lane" / reordering machinery is gone.)
-
-Proof (no Verilog simulator). `engine_model.delay_line_reference` is the exact buffered
-ground truth; `phase_offset_play` and `membership_delay_play` / `membership_bus_delay_play`
-are the no-buffer realisations, proven == the reference for the full battery (off far above
-2048, `T` up to 100000, `d` up to 10^7, zero, negative-via-G, multi-channel) by
-`test_membership_delay_no_cap_extreme_battery` / `test_membership_bus_delay_no_cap_extreme_battery`.
-`test_rtl_delay_player_mirror_matches_physical_delay_any_length` walks the EXACT registers
-of the RTL membership player (per-channel interval LUTRAM eval at the shifted phase +
-`del_frame_idx` startup gate, NO buffer) and equals all three. `test_image_delay_ctrl_packing_matches_rtl_unpack`
-round-trips the host->image->RTL contract (off/skip/iv_counts + intervals). The contract
-test asserts the RTL has NO `ring` / `DELAY_DEPTH` / lane strings.
+`PulseController` (sequencer.py) is the notebook-facing API and shares the exact
+sequencer path with the GUI: `on_pulse()/off_pulse()`, `set_channel_delay()/
+get_channel_delay()` (delay calibration), `load_pulse()/save_pulse()`,
+`set_scan_table()`, `synced_state()`.  `SequencerService.prepare` records the SOURCE
+payload (`last_payload_json`) of every successful prepare -- from the GUI or any raw-API
+caller -- and publishes it in `snapshot()`; `RemoteSequencer` flattens it across RPyC.
+The GUI's **Sync** button and `pulse.synced_state()` both read this single source of
+truth.  GUI state semantics (confocal style): any edit while RUNNING/PREPARED turns the
+On Pulse button + status dot ORANGE (UNSYNCED); the debounced summary pass compares the
+state key against the applied key and restores the run state if the edit was reverted;
+Save dirty stays yellow + star.
 
 ## 10. Building The Manuals
 

@@ -3,7 +3,7 @@
 
 \begin{document}
 \frontmatter
-\zlctitlepage{ZLC FPGA Pulse Streamer 手册}{Artix-7 35T 边沿流送器 / 1-tick 预取 / 无限流式扫描 / JTAG-to-AXI}{RTL、1-tick 预取、双 bank 流式、仿射扫描引擎、模拟总线 DAC、编译上传流程、资源预算}{2026-06-09}
+\zlctitlepage{ZLC FPGA Pulse Streamer 手册}{Artix-7 35T 边沿流送器 / 1-tick 预取 / 无限流式扫描 / JTAG-to-AXI}{RTL、1-tick 预取、双 bank 流式、仿射扫描引擎、模拟总线 DAC、编译上传流程、资源预算}{2026-06-10}
 \tableofcontents
 \cleardoublepage
 \mainmatter
@@ -29,7 +29,7 @@ BRAM:        1,800 Kb (50 x 36 Kb RAMB36)   DSP: 90
 \section{两句话能力总结}
 \begin{itemize}
   \item \tfocus{最小脉冲宽度与分辨率 = 1 个 tick（20 ns）}。背靠背的 1-tick 边沿能逐周期、一拍一个地打出来——靠的是一条连续预取流水线把 BRAM 读延迟藏掉（见第三章）。
-  \item \tfocus{扫描点数无上限}。常驻一个 2-bank ping-pong 窗口（4096 点），主机在游标后面把空出来的 bank 流式回填下一段（见第五章）。配合 N-slot 仿射扫描，\tfocus{duration 与 DAC 值}（仅这两类可扫）可以\tfocus{在一次连续运行里任意组合地无缝扫描}；channel 延时\tfocus{不是}扫描量，它是一条加在输出上的逐通道\tfocus{字面延时线}（每条 channel 一个固定值，正/负/零，范围 $\pm 15\,\mu$s，由有界深度 \pyapi{DELAY_DEPTH} 的环形缓冲实现，见第六章）。
+  \item \tfocus{扫描点数无上限}。常驻一个 2-bank ping-pong 窗口（4096 点），主机在游标后面把空出来的 bank 流式回填下一段（见第五章）。配合 N-slot 仿射扫描，\tfocus{duration 与 DAC 值}（仅这两类可扫）可以\tfocus{在一次连续运行里任意组合地无缝扫描}；channel 延时\tfocus{不是}扫描量，它是加在输出上的逐通道\tfocus{事件调度延时}（每条 channel 一个固定值，正/负/零；TTL 上限由 32 位字段决定，约 $\pm 42.9$ s——毫秒级 emCCD 延时直接可用；DAC 总线延时仍走深度 \pyapi{DELAY_DEPTH} 的环形缓冲，上限 $\sim 41\,\mu$s，见第六章）。
 \end{itemize}
 
 \section{文件}
@@ -112,7 +112,7 @@ bit 0 对应 \pyapi{channels[0]}。一行的含义是：\tfocus{在这个有效 
 边沿表放在 block RAM 里，而 block RAM 是\tfocus{同步读}：发出读地址后，数据要 \pyapi{RD_LAT} 个周期后才到。build tcl 用 \pyapi{zlc_force_latency2} 把边沿 BRAM 强制成 \pyapi{READ_LATENCY_B=2}，所以 \pyapi{RD_LAT=2} 是确定的。如果天真地"到点了才去读下一行"，每条边沿之间就至少要空 2 个周期——背靠背的 1-tick 边沿根本打不出来。
 
 \section{解法：深度 FIFO\_DEPTH 的连续预取 + 影子}
-引擎维护一个深度 \pyapi{FIFO_DEPTH}(=\pyapi{RD_LAT}+2=4) 的"arm" FIFO，里面装着\tfocus{接下来要打的几条边沿}。它\tfocus{每个周期发一次 BRAM 读}，把读回的边沿压进 FIFO 尾；当 \pyapi{time_count} 追上 FIFO 头那条边沿的有效 tick 时，就在\tfocus{同一周期}把它的 mask 打到输出、并把它弹出。因为 FIFO 深度比	focus{流水线延迟}（发地址$	o$数据有效 $=$ \pyapi{RD_LAT}$+1$，含寄存的 \pyapi{edge_raddr} 一拍）多 1，FIFO 永远不空，背靠背的 1-tick 边沿就能一拍一个地连续命中。
+引擎维护一个深度 \pyapi{FIFO_DEPTH}(=\pyapi{RD_LAT}+2=4) 的"arm" FIFO，里面装着\tfocus{接下来要打的几条边沿}。它\tfocus{每个周期发一次 BRAM 读}，把读回的边沿压进 FIFO 尾；当 \pyapi{time_count} 追上 FIFO 头那条边沿的有效 tick 时，就在\tfocus{同一周期}把它的 mask 打到输出、并把它弹出。因为 FIFO 深度比\tfocus{流水线延迟}（发地址$	o$数据有效 $=$ \pyapi{RD_LAT}$+1$，含寄存的 \pyapi{edge_raddr} 一拍）多 1，FIFO 永远不空，背靠背的 1-tick 边沿就能一拍一个地连续命中。
 
 \begin{notebox}[SEED 不变式（行为模型逼出来的关键）]
 在每个边界，从"第一条还没输出的边沿"开始\tfocus{播种 \pyapi{FIFO_DEPTH} 条影子}，并且边界当拍\tfocus{不发新读}（占用 == 影子数 $\le$ 深度）。4 条影子刚好够给紧跟着的 1-tick 后继留出时间；3 条影子会少一拍而丢边沿（这正是真机 emCCD 第二脉冲 40\,ms / e7 丢失的根因——\pyapi{edge_raddr} 是寄存器，发地址到数据有效是 \pyapi{RD_LAT}$+1$ 拍）。这条不变式是逐 tick 镜像仿真"逼"出来的。
@@ -292,7 +292,7 @@ delay line (硬件, 真相): [.....0.....][原信号右移 d.....]   <- fire 前
 
 机理要点（\tfocus{一块普通环形缓冲，存输出、延后放出}）：
 \begin{itemize}
-  \item \tfocus{TTL：62 路全部可独立延时。} 引擎维护\tfocus{一条} \pyapi{CHANNEL_COUNT} 位宽的环（\pyapi{ttl_ring}，深度 \pyapi{DELAY_DEPTH}+1），每拍把当前的无延时 \pyapi{state_mask} 写进环、写指针 \pyapi{del_wptr} 前移一格。每条 channel 读它\tfocus{自己}那一位在 \pyapi{wptr - d_ch} 处的历史值（\pyapi{del_ch_ticks} 保存每条 channel 的 $d$）。\pyapi{d=0} 就是逐位精确直通。合并出最终输出位掩码 \pyapi{out = (state_mask & ~delayed_mask) | delayed_out}：被延时的位用环里取出的延时结果，其余位原样直通，于是延时\tfocus{绝不}打扰别的 channel。
+  \item \tfocus{TTL：62 路全部可独立延时——事件调度器（event scheduler）。} TTL 波形是\tfocus{翻转稀疏}的，所以不再每拍存一位（旧 SRL 线 $\sim$4.1k LUT、上限 41 $\mu$s），改为存\tfocus{翻转事件}：无延时位在 tick $t$ 翻转时，向该 channel 的小事件 FIFO（深 \pyapi{EVT_DEPTH}=16，每项 49 bit）推入 $(t+d-1,\ \text{新电平})$；一个自由运行的 48 位全局计数器 \pyapi{g_time} 等值弹出到输出寄存器——于是 \pyapi{out[t]=in[t-d]} 精确成立（首个事件前为 0；$d=1$ 走一级寄存器；$d=0$ 直通）。存储随\tfocus{在途翻转数}（主机校验 $\le$ \pyapi{EVT_DEPTH}：任一 $d$ 窗口内该通道翻转 $\le 16$ 次）而非延时长度增长：62 路共 $\sim$2k LUT，TTL 延时上限提升到 32 位字段（$\sim$42.9 s——毫秒级 emCCD 延时直接可用）。每通道 32 位延时值经独立的 DELAY 寄存器区（\pyapi{R_DELAY_BASE}，每 channel 一个 32 位字）上传。合并仍是不相交直通：被延时位用调度结果，其余位原样——延时\tfocus{绝不}打扰别的 channel。
   \item \tfocus{DAC：4 条总线各自可延时，一条总线的 10 位共享一个延时。} 每条 10-bit 总线有一条\tfocus{10 位宽的环}（\pyapi{bus_ring}），机制与 TTL 完全相同：存下该总线的无延时输出值，$d$ 个 tick 后放出。一条总线的 10 个 bit\tfocus{共享同一个}逐总线延时（\pyapi{del_bus_ticks}），所以整条总线（固定值、被扫值、或 ramp）都被整体延后，而不是每 bit 单独延。
   \item \tfocus{负延时 = 全局平移 $G$。} 一条 channel 的 $-d$ 等价于其它\tfocus{所有} channel 都 $+|d|$。主机把全局平移 $G=\max(0,-\min(\text{delays}))$ 折进每条 channel 的有效延时，使最早的那条 channel 落在 0、缓冲只会看到 $\ge 0$ 的延时。零延时即直通。
   \item \tfocus{有界（这是字面延时线的根本性质）。} 延时范围是 $\pm 15\,\mu$s；缓冲深度 \pyapi{DELAY_DEPTH = 2048} 个 tick（20\,ns/tick 下约 40\,$\mu$s）足以覆盖它（折进 $G$ 后有效延时可达约 30\,$\mu$s）。要把一个\tfocus{非重复}信号延时 $d$，你\tfocus{必须}存下它 $d$ 个 tick 的输出——这是字面延时线的本质；但缓冲存的是\tfocus{输出}（不是整张序列），所以它很小。超过 \pyapi{DELAY_DEPTH} 的延时会在 validate 与映像打包时\tfocus{被清晰报错拒绝}（在上硬件之前，绝不静默）。

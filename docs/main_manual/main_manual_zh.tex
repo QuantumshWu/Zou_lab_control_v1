@@ -3,7 +3,7 @@
 
 \begin{document}
 \frontmatter
-\zlctitlepage{Zou\_lab\_control 主手册}{notebook-first + PyQt GUI + remote FPGA pulse-streamer 系统总览}{架构、session/devices/timing 分层、sequencer 生命周期、真实硬件 runbook 与 N-slot 扫描模型}{2026-06-09}
+\zlctitlepage{Zou\_lab\_control 主手册}{notebook-first + PyQt GUI + remote FPGA pulse-streamer 系统总览}{架构、session/devices/timing 分层、sequencer 生命周期、真实硬件 runbook 与 N-slot 扫描模型}{2026-06-10}
 \tableofcontents
 \cleardoublepage
 \mainmatter
@@ -1459,6 +1459,52 @@ exp.timing.plot_sequence()
 
 \begin{notebox}[日常启动顺序（背下来）]
 （FPGA 机）确认 bit 已烧 → \filepath{run\_server.bat -{}-check-config} 核对 → \filepath{run\_server.bat} 起服务并\tfocus{保持窗口开着}；（控制机）\pyapi{na.connect("remote_template", sequencer=..., open_devices=True)} → \pyapi{configure_imaging(...)} → \pyapi{preflight().raise_if_failed()} → 采集。只有改过 RTL/引脚映射时才需要重新 \filepath{build\_and\_program.bat}。
+\end{notebox}
+
+\chapter{Pulse API：脚本控制与延时校准}
+
+GUI 之外，同一套接口可以在 notebook / 脚本里直接驱动 sequencer——\tfocus{GUI 与 API 走完全相同的路径}（同一个 \pyapi{sequencer.prepare/fire/set_safe_state}，同一个 payload 记录），所以两边永远可以互相同步。核心对象是 \pyapi{PulseController}（\pyapi{bind_pulse(sequencer, pulse)} 创建）：
+
+\begin{codeblock}[Pulse API 一览]
+from Zou_lab_control.neutral_atom.devices.sequencer import RemoteSequencer, bind_pulse
+from Zou_lab_control.neutral_atom import PulseTableState
+
+seq = RemoteSequencer(host="...", port=18861, channels=[f"ch{i:02d}" for i in range(62)])
+pulse = bind_pulse(seq, PulseTableState.load("pulses/T.json"))   # 或 pulse.load_pulse(path)
+
+pulse.on_pulse()                      # 编译 + 上传 + FIRE（=GUI 的 On Pulse）
+pulse.off_pulse()                     # 停止并回安全态（=GUI 的 Stop Pulse）
+pulse.set_channel_delay("ch11", 250)  # 设 emCCD 延时 250 ns（链式可连写）
+pulse.get_channel_delay("ch11")       # 读回（ns）
+pulse.set_scan_table([[10],[20]])     # 上硬件扫描表
+pulse.save_pulse("pulses/T2.json")    # 存盘（GUI 可直接 Load）
+state = pulse.synced_state()          # 读回"设备上实际应用的"PulseTableState
+\end{codeblock}
+
+\section{延时校准完整示例}
+
+逐通道延时（事件调度，上限约 $\pm 42.9$ s，毫秒级 emCCD 延时直接可用）的典型校准循环——扫一组延时、每个点 on/off 一次、采一组计数，最后用前端接口画图：
+
+\begin{codeblock}[channel delay calibration]
+import numpy as np
+import Zou_lab_control.frontend as zf
+
+delays_ns = np.linspace(-400, 400, 41)
+signal = []
+for d in delays_ns:
+    pulse.set_channel_delay("ch11", float(d)).on_pulse()
+    signal.append(measure())        # 你的采集函数（相机计数/PMT 等）
+    pulse.off_pulse()
+
+fig = zf.plot(delays_ns, np.asarray(signal), kind="1d",
+              labels=("delay (ns)", "counts", ""), display=False)
+fig.fig.savefig("delay_calibration.png")
+best = delays_ns[int(np.argmax(signal))]
+pulse.set_channel_delay("ch11", float(best)).on_pulse()   # 应用最优延时
+\end{codeblock}
+
+\begin{notebox}
+脚本改完设备后回到 GUI，点 \tfocus{Sync} 即把"设备上实际应用的脉冲"拉回编辑器（服务端在每次成功 prepare 时记录源 payload，GUI 与 \pyapi{pulse.synced_state()} 读的是同一份）。反过来，GUI 在 RUNNING 状态下被编辑会把 On Pulse 按钮变橙（UNSYNCED）——再点一次即应用。
 \end{notebox}
 
 \chapter{修改指南}
