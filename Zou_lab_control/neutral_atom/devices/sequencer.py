@@ -49,6 +49,21 @@ def _channel_delays_list(channel_delays: Mapping[int, int] | None, n_channels: i
     return [int(cd.get(bit, 0)) for bit in range(n_channels)]
 
 
+def _clk_enable_mask_for_channels(channels: Sequence[str], clk_channels: Sequence[str]) -> int:
+    """clk-enable bitmask in the COMPILED hardware channel order (bit n = ``channels[n]``).
+
+    The program's edge masks are in the order passed to the compiler (which may differ from
+    ``state.channels``); using ``state.clk_enable_mask()`` (state-order) would point the mask
+    at the wrong bits and could clear a real engine bit.  Always derive it from the order the
+    masks actually use."""
+    clk_set = {str(c) for c in clk_channels}
+    mask = 0
+    for index, channel in enumerate(channels):
+        if str(channel) in clk_set:
+            mask |= 1 << index
+    return mask
+
+
 @dataclass(frozen=True)
 class RuntimeBusDelay:
     """One delayed analog DAC bus for the LITERAL per-bus delay line.
@@ -89,8 +104,9 @@ class RuntimeBusSegment:
     stop_tick_coeffs: list[int] | None = None
     """Per-slot affine coefficients for the segment's start/stop tick.  The FPGA
     computes ``effective_tick = start_tick + (sum coeff_j*slot_j) >> frac`` so a
-    scanned duration/delay moves the segment in lockstep with the digital edges
-    -- this is what lets DAC value + duration + delay scan simultaneously."""
+    scanned DURATION moves the segment in lockstep with the digital edges -- this is
+    what lets a DAC value + duration scan simultaneously.  (A channel DELAY is a fixed
+    per-channel value and is NOT a scan slot.)"""
     stop_value_select: int = 0
     """STOP-endpoint scan-slot select (``j+1`` = stop value reads slot ``j``).  For
     edge/hold segments it equals ``value_select`` (start==stop).  Independent from
@@ -388,8 +404,9 @@ def compile_pulse_table_runtime_program(
         repeat_from_index = 0   # a finite bracket replays the whole program on repeat
 
     # Channels wired to clk are driven by the top's clk mux, NOT the engine: force their
-    # bits to 0 in every edge mask so the engine never fights the clk routing.
-    clk_enable = state.clk_enable_mask()
+    # bits to 0 in every edge mask so the engine never fights the clk routing.  Compute the
+    # mask in the COMPILED channel order (masks use that order, which may differ from state).
+    clk_enable = _clk_enable_mask_for_channels(channels, state.clk_channels)
     if clk_enable:
         masks = [int(mask) & ~clk_enable for mask in masks]
     effective_duration_ticks = _pulse_table_effective_duration_ticks(state, slots=slot_values, time_step_ns=clock_step_ns)
@@ -465,15 +482,14 @@ def compile_pulse_table_scan_runtime_program(
     clock_hz = positive_float(clock_hz, "clock_hz")
     clock_step_ns = 1e9 / clock_hz
     if not state.scan_slots:
-        raise ValueError("hardware scan requires at least one bound scan slot; bind a duration/delay/DAC first.")
+        raise ValueError("hardware scan requires at least one bound scan slot; bind a duration or DAC value first.")
 
-    # A channel delay (constant OR scanned) inside a finite repeat bracket: UNROLL the
-    # bracket into a flat period list first, then compile with the flat affine machinery
-    # (additive global shift G + affine scan + reordering delay lanes).  Once flat there
-    # is no inner-loop boundary for a delayed edge to cross, so a scanned delay works in
-    # ANY form -- crossing the (former) boundary, reordering, negative, or frame-extending.
-    # This also closes a latent hole: the scan path never validated a delay crossing the
-    # bracket boundary, so scan+bracket+crossing-delay was silently wrong before.
+    # A (constant) channel delay inside a finite repeat bracket: UNROLL the bracket into a flat
+    # period list first, then compile with the flat affine machinery (additive global shift G +
+    # affine duration scan + reordering delay lanes).  Once flat there is no inner-loop boundary
+    # for a delayed edge to cross, so a constant delay works in ANY form -- crossing the (former)
+    # boundary, reordering, negative, or frame-extending.  (A channel delay is a FIXED value and
+    # cannot itself be scanned; a delay expression referencing a scanned slot is rejected below.)
     has_bracket = state.repeat_start is not None and state.repeat_end is not None
     if has_bracket and _pulse_table_has_any_delay(state):
         unrolled = state.unrolled_bracket()
@@ -488,12 +504,12 @@ def compile_pulse_table_scan_runtime_program(
             coeff_frac_bits=coeff_frac_bits,
         )
 
-    # DAC value + duration + delay scan simultaneously: every analog-bus segment's
-    # ticks are emitted as affine expressions (base + per-slot coeffs), so a scanned
-    # duration/delay moves the segment -- and any ramp's start/stop ticks -- in
-    # lockstep with the digital edges.  Ramps with fixed value endpoints therefore
-    # scan their TIMING freely; ramps whose value endpoints are themselves scanned
-    # use the dual start/stop value_select (see _pulse_table_bus_segments).
+    # DAC value + duration scan simultaneously: every analog-bus segment's ticks are
+    # emitted as affine expressions (base + per-slot coeffs), so a scanned DURATION moves
+    # the segment -- and any ramp's start/stop ticks -- in lockstep with the digital edges.
+    # Ramps with fixed value endpoints therefore scan their TIMING freely; ramps whose value
+    # endpoints are themselves scanned use the dual start/stop value_select (see
+    # _pulse_table_bus_segments).  (A channel delay is fixed and is not a scan slot.)
     raw_rows = [[float(value) for value in row] for row in (state.scan_table if scan_table is None else scan_table)]
     if not raw_rows:
         raise ValueError("hardware scan requires at least one scan-table row.")
@@ -579,10 +595,30 @@ def compile_pulse_table_scan_runtime_program(
     # delays so a negative bus delay also lands >= 0), then are realised by the LITERAL per-bus
     # delay line (a 10-bit circular buffer) -- bounded to delay_depth ticks (the host validates).
     hardware_bits = {ch: index for index, ch in enumerate(channel_names(channels, "channels"))}
-    raw_delay = {
-        ch: state.delay_steps(ch, slots=state.reference_slots(), time_step_ns=clock_step_ns)
-        for ch in state.channels if ch not in bus_members and ch in hardware_bits
-    }
+    # A channel delay is a FIXED per-channel OUTPUT delay -- it cannot vary per scan point.
+    # Reject a delay EXPRESSION that references a scanned slot (a nonzero affine coeff): it would
+    # otherwise be silently FROZEN at the reference value (channel_delays is one constant array,
+    # not per-point).  Scan the duration instead.
+    for ch, raw in state.delays.items():
+        if isinstance(raw, str):
+            _, dcoeffs = affine_coeffs(raw, slot_vars=slot_vars,
+                                       unit=state.delay_units.get(ch, "ns"),
+                                       time_step_ns=clock_step_ns, coeff_frac_bits=coeff_frac_bits)
+            if any(int(c) != 0 for c in dcoeffs):
+                raise ValueError(
+                    f"channel {ch!r} delay {raw!r} references a scanned slot; a channel delay is "
+                    "a fixed per-channel value and cannot be scanned (scan the duration instead).")
+    clk_set = set(state.clk_channels)
+    raw_delay = {}
+    for ch in state.channels:
+        # clk channels are clk-mux driven (no engine output); OFF channels emit nothing -- neither
+        # may contribute a delay that would shift the global frame G and delay ACTIVE channels.
+        if ch in bus_members or ch not in hardware_bits or ch in clk_set:
+            continue
+        ch_index = state.channel_index(ch)
+        if not any(int(period.states[ch_index]) for period in state.periods):
+            continue
+        raw_delay[ch] = state.delay_steps(ch, slots=state.reference_slots(), time_step_ns=clock_step_ns)
     all_raw = list(raw_delay.values()) + list(raw_bus_delays.values())
     global_shift = max(0, -min(all_raw)) if all_raw else 0
     channel_delays = {
@@ -607,7 +643,8 @@ def compile_pulse_table_scan_runtime_program(
     ticks = [row[0] for row in rows]
     masks = [row[1] for row in rows]
     # Channels wired to clk are driven by the top's clk mux, not the engine -> 0 in masks.
-    clk_enable = state.clk_enable_mask()
+    # Mask in the COMPILED channel order (not state.channels) so it lands on the right bits.
+    clk_enable = _clk_enable_mask_for_channels(channels, state.clk_channels)
     if clk_enable:
         masks = [int(mask) & ~clk_enable for mask in masks]
     tick_slot_coeffs = [list(row[2]) for row in rows]
@@ -788,6 +825,13 @@ class SequencerService:
             clock_hz=self.clock_hz,
             trigger_channels=self.trigger_channels,
         )
+        # Backstop: validate the compiled program against the FPGA geometry / delay-line depth
+        # REGARDLESS of which backend's prepare_callback runs.  An AXI backend validates with its
+        # own params, but a mock/no-op backend would otherwise cache an invalid program (e.g.
+        # channel_delays beyond DELAY_DEPTH).  Local import breaks the fpga_pulse_streamer <->
+        # sequencer import cycle.
+        from .fpga_pulse_streamer import validate_pulse_streamer_program
+        validate_pulse_streamer_program(program, channel_count=len(self.channels))
         with self._lock:
             cached = (
                 self.cache_prepared
@@ -906,11 +950,13 @@ class RuntimeSequencer(SequencerDevice):
         self.last_program: RuntimeSequenceProgram | None = None
 
     def prepare(self, sequence: PulseSequence | PulseTableState) -> RuntimeSequenceProgram:
-        self.last_program = RuntimeSequenceProgram.from_dict(self.service.prepare(timing_payload_to_dict(sequence)))
+        step = 1e9 / float(self.clock_hz)
+        self.last_program = RuntimeSequenceProgram.from_dict(self.service.prepare(timing_payload_to_dict(sequence, time_step_ns=step)))
         return self.last_program
 
     def fire(self, sequence: PulseSequence | PulseTableState | None = None) -> None:
-        self.service.fire(None if sequence is None else timing_payload_to_dict(sequence))
+        step = 1e9 / float(self.clock_hz)
+        self.service.fire(None if sequence is None else timing_payload_to_dict(sequence, time_step_ns=step))
 
     def wait_done(self, timeout: float | None = None) -> bool:
         return self.service.wait_done(timeout)
@@ -1050,14 +1096,16 @@ class RemoteSequencer(SequencerDevice):
 
     def prepare(self, sequence: PulseSequence | PulseTableState) -> RuntimeSequenceProgram:
         self.open()
-        program = self._conn.root.prepare(json.dumps(timing_payload_to_dict(sequence)))
+        step = 1e9 / float(self.clock_hz)
+        program = self._conn.root.prepare(json.dumps(timing_payload_to_dict(sequence, time_step_ns=step)))
         payload = json.loads(program) if isinstance(program, (str, bytes)) else dict(program)
         self._last_program = RuntimeSequenceProgram.from_dict(payload)
         return self._last_program
 
     def fire(self, sequence: PulseSequence | PulseTableState | None = None) -> None:
         self.open()
-        self._conn.root.fire(None if sequence is None else json.dumps(timing_payload_to_dict(sequence)))
+        step = 1e9 / float(self.clock_hz)
+        self._conn.root.fire(None if sequence is None else json.dumps(timing_payload_to_dict(sequence, time_step_ns=step)))
 
     def wait_done(self, timeout: float | None = None) -> bool:
         self.open()
@@ -1134,7 +1182,20 @@ class PulseController:
         return self.set_slot(name, value_ns)
 
     def set_scan_table(self, rows: Sequence[Sequence[float]] | None) -> "PulseController":
-        self.scan_table = [list(map(float, row)) for row in (rows or [])]
+        # Accept a NumPy array as well as a list-of-lists: `rows or []` / `if rows:` raise
+        # "truth value of an array is ambiguous" on an ndarray.  A 1-D array is read as a
+        # COLUMN of points (N x 1), matching load_scan_table's single-slot convention.
+        if rows is None:
+            self.scan_table = []
+            return self
+        import numpy as np
+
+        array = np.asarray(rows, dtype=float)
+        if array.ndim == 1:
+            array = array.reshape(-1, 1)
+        if array.ndim != 2:
+            raise ValueError("scan_table must be a 1-D or 2-D array.")
+        self.scan_table = [[float(v) for v in row] for row in array]
         return self
 
     def payload(
@@ -1148,7 +1209,7 @@ class PulseController:
             table = self.scan_table if scan_table is None else scan_table
             merged = dict(self.slots)
             merged.update(slots or {})
-            if table:
+            if table is not None and len(table) > 0:   # len(): numpy-array-safe (no truth value)
                 data = self.pulse.to_dict()
                 data["scan_table"] = [list(row) for row in table]
                 payload = PulseTableState.from_dict(data)
@@ -1323,16 +1384,22 @@ class VerilogSequencer(SequencerDevice):
         pass
 
 
-def timing_payload_to_dict(payload: PulseSequence | PulseTableState) -> dict[str, object]:
+def timing_payload_to_dict(payload: PulseSequence | PulseTableState, *, time_step_ns: float | None = None) -> dict[str, object]:
     """Return the JSON-safe timing payload for a sequence or pulse table.
 
     A ``PulseTableState`` is SNAPPED to the clock-tick grid before serialization, so
     the pulse transferred to the server/hardware carries the same whole-tick values
     the GUI displays and the compiler would land on -- there is no place where an
-    off-grid value silently slips through the pulse-transfer API."""
+    off-grid value silently slips through the pulse-transfer API.
+
+    ``time_step_ns`` MUST be the TARGET sequencer's tick (``1e9 / clock_hz``) so the
+    snap lands on the grid the SERVER will compile at -- otherwise a state saved at a
+    different ``time_step_ns`` would be pre-snapped on the wrong grid and the Remote/Runtime
+    result would diverge from a direct local compile at the same clock.  Defaults to the
+    payload's own ``time_step_ns`` only when no target is supplied."""
 
     if isinstance(payload, PulseTableState):
-        return payload.snapped().to_dict()
+        return payload.snapped(time_step_ns=time_step_ns).to_dict()
     if isinstance(payload, PulseSequence):
         return payload.to_dict()
     if isinstance(payload, Mapping):
@@ -1788,10 +1855,11 @@ def _pulse_table_edge_table(
     # --- per-channel UN-delayed ON intervals over [0, T) + each channel's raw delay ---
     base_intervals: dict[str, list[tuple[int, int]]] = {}
     raw_delay: dict[str, int] = {}
+    clk_set = set(state.clk_channels)
     for channel_index, channel in enumerate(state.channels):
-        if channel in bus_members or channel not in channel_bits:
+        # clk channels are driven by the top's clk mux, not the engine -> no edges, no delay.
+        if channel in bus_members or channel not in channel_bits or channel in clk_set:
             continue
-        raw_delay[channel] = state.delay_steps(channel, slots=slots, time_step_ns=time_step_ns)
         ivals, active = [], None
         for period_index, period in enumerate(state.periods):
             if int(period.states[channel_index]) and active is None:
@@ -1800,6 +1868,12 @@ def _pulse_table_edge_table(
                 ivals.append((active, int(starts[period_index]))); active = None
         if active is not None:
             ivals.append((active, table_end))
+        # An OFF channel (no ON interval) emits nothing; its (possibly negative) delay must NOT
+        # enter raw_delay -- otherwise it would shift the global frame G and delay other ACTIVE
+        # channels for no physical reason.  Only delay channels that actually output.
+        if not ivals:
+            continue
+        raw_delay[channel] = state.delay_steps(channel, slots=slots, time_step_ns=time_step_ns)
         base_intervals[channel] = ivals
     if fold_analog_buses:
         for bus_name, members in bus_groups.items():
@@ -2035,7 +2109,19 @@ def _pulse_table_bus_segments(
                 value_int = 0  # placeholder; the FPGA reads the slot at runtime
             else:
                 value_select = 0
-                value_int = max(0, min(max_value, int(value)))
+                # On the STATIC path (slot_vars empty -- e.g. the payload dispatcher degrades a
+                # bound-but-unfilled DAC scan to a static program), a value may still be a slot
+                # ref like "s0".  Resolve it from the provided slots (reference values) instead
+                # of int("s0")-crashing.
+                slot_idx = _parse_slot_ref_index(value)
+                if slot_idx is not None:
+                    key = str(value).strip()
+                    if slots is None or key not in slots:
+                        raise ValueError(
+                            f"analog bus {bus_name!r} references unresolved scan slot {key!r}; "
+                            "provide its value or a scan table.")
+                    value = slots[key]
+                value_int = max(0, min(max_value, int(round(float(value)))))
             start_ref, start_base, start_coeffs = _boundary(period_index)
             if start_ref < 0 or start_ref > table_end:
                 raise ValueError(f"analog bus {bus_name!r} produced segment tick {start_ref} outside the uploaded table.")

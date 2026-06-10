@@ -156,6 +156,11 @@ class PulsePeriod:
         unit = str(self.unit or "ns")
         if unit not in UNITS_TO_NS:
             raise ValueError(f"unsupported pulse duration unit {unit!r}.")
+        # A NEGATIVE literal period duration is almost always an input error; raise instead of
+        # silently snapping it up to one tick.  (Scan-table durations are clamped UI-side by
+        # snap_scan_table; this guards the literal/period path, which validate() exercises.)
+        if value < 0:
+            raise ValueError(f"period duration must be >= 0 (got {value:g} {unit}).")
         return quantized_time_steps(value * UNITS_TO_NS[unit], time_step_ns=time_step_ns, name="period duration", allow_zero=False)
 
     def duration_ns(self, *, slots: Mapping[str, float] | None = None, time_step_ns: float | None = None) -> float:
@@ -441,8 +446,13 @@ class PulseTableState:
         """
 
         new = PulseTableState.from_dict(self.to_dict())
+        # Missing slots default to their NOMINAL (reference) value, NOT 0 -- so a single-shot
+        # resolve like set_time({"s0": ...}) only changes s0 and leaves the other slots at their
+        # nominal, instead of silently zeroing those periods/DAC levels.
+        resolved = new.reference_slots()
+        resolved.update({str(k): float(v) for k, v in dict(slots or {}).items()})
         for index, slot in enumerate(new.scan_slots):
-            value = float(slots.get(slot_var(index), 0.0))
+            value = float(resolved.get(slot_var(index), float(slot.nominal)))
             if slot.kind == "duration":
                 period_index = int(slot.target)
                 period = new.periods[period_index]
@@ -489,8 +499,11 @@ class PulseTableState:
             raise ValueError(f"channel label keys are not in hardware channels: {unknown_labels}.")
         bus_members: list[str] = []
         for name, members in self.analog_buses.items():
-            if not members:
-                raise ValueError(f"analog bus {name!r} must contain at least one channel.")
+            # A DAC bus is multi-bit; a 1-channel "bus" is just a TTL channel and is only
+            # half-supported (bus_value()/preview use min_width=2 and would not see it),
+            # so reject it up front instead of letting it crash deeper.
+            if len(members) < 2:
+                raise ValueError(f"analog bus {name!r} must contain at least two channels.")
             unknown_members = [channel for channel in members if channel not in self.channels]
             if unknown_members:
                 raise ValueError(f"analog bus {name!r} contains channels not in hardware channels: {unknown_members}.")

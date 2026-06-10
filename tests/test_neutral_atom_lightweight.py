@@ -5246,3 +5246,120 @@ def test_eval_time_expr_unbound_slot_raises_only_with_slot_context():
     assert eval_time_expr("s5", slots={}) == 0.0                      # empty context -> lenient
     with pytest.raises(ValueError, match="unbound scan slot"):
         eval_time_expr("s5", slots={"s0": 100.0})                    # typo with context -> raise
+
+
+def test_dac_scan_empty_table_static_compile_uses_reference_code():
+    # BUG: a DAC value bound to "s0" with an EMPTY scan table dispatches to the STATIC
+    # compiler (slot_vars empty), which used int("s0") and crashed; it must resolve the
+    # slot from the reference values instead.
+    ch = [f"da[{i}]" for i in range(10)] + ["trig"]
+    st = na.PulseTableState(
+        channels=ch, periods=[na.PulsePeriod(1000, tuple([0] * 10 + [1]), unit="ns")],
+        scan_slots=[{"kind": "dac", "target": "da@0", "unit": "value", "nominal": 256.0}],
+        analog_bus_modes={"da": [{"mode": "edge", "value": "s0"}]},
+        scan_table=[], time_step_ns=20,
+    )
+    prog = na.compile_runtime_program_for_payload(st, channels=ch, clock_hz=50e6)
+    segs = prog.bus_segments or []
+    assert any(int(s.start_value) == 256 and int(s.value_select) == 0 for s in segs)
+
+
+def test_clk_enable_mask_uses_hardware_channel_order():
+    # BUG: clk_enable was computed in state.channels order but the edge masks use the
+    # COMPILED channel order; a different order pointed the mask at the wrong bit.
+    st = na.PulseTableState(channels=["a", "clk"], periods=[na.PulsePeriod(100, (1, 0), unit="ns")],
+                            clk_channels=["clk"], time_step_ns=20)
+    prog = na.compile_runtime_program_for_payload(st, channels=["clk", "a"], clock_hz=50e6)
+    assert prog.channels == ["clk", "a"]
+    assert prog.clk_enable == 1   # clk is channels[0] in the compiled order -> bit 0
+
+
+def test_off_or_clk_channel_delay_does_not_shift_active_channels():
+    # BUG: an OFF channel (or a clk channel) with a (negative) delay entered the global
+    # shift G and delayed OTHER active channels for no physical reason.
+    off = na.PulseTableState(channels=["a", "b"], periods=[na.PulsePeriod(100, (1, 0), unit="ns")],
+                             delays={"b": -20}, delay_units={"b": "ns"}, time_step_ns=20)
+    assert not na.compile_runtime_program_for_payload(off, channels=["a", "b"], clock_hz=50e6).channel_delays
+    clk = na.PulseTableState(channels=["clk", "a"], periods=[na.PulsePeriod(100, (0, 1), unit="ns")],
+                             clk_channels=["clk"], delays={"clk": -20}, delay_units={"clk": "ns"}, time_step_ns=20)
+    assert not na.compile_runtime_program_for_payload(clk, channels=["clk", "a"], clock_hz=50e6).channel_delays
+
+
+def test_with_slots_resolved_missing_slots_use_reference_not_zero():
+    # BUG: with_slots_resolved defaulted unspecified slots to 0, silently zeroing other
+    # periods/DAC levels; they must keep their nominal (reference) value.
+    st = na.PulseTableState(
+        channels=["a"],
+        periods=[na.PulsePeriod("s0", (1,), unit="str (ns)"), na.PulsePeriod("s1", (1,), unit="str (ns)")],
+        scan_slots=[{"kind": "duration", "target": "0", "unit": "ns", "nominal": 60.0},
+                    {"kind": "duration", "target": "1", "unit": "ns", "nominal": 80.0}],
+        time_step_ns=20,
+    )
+    resolved = st.with_slots_resolved({"s0": 100.0})
+    assert float(resolved.periods[0].duration) == 100.0
+    assert float(resolved.periods[1].duration) == 80.0
+
+
+def test_delay_expression_referencing_scanned_slot_is_rejected():
+    # BUG: a channel delay expression referencing a SCANNED slot was silently FROZEN at the
+    # reference value in a scan compile; the scan compiler must reject it.
+    import pytest
+    st = na.PulseTableState(
+        channels=["a", "trig"],
+        periods=[na.PulsePeriod(100, (1, 0), unit="ns"), na.PulsePeriod("s0", (0, 1), unit="str (ns)")],
+        scan_slots=[{"kind": "duration", "target": "1", "unit": "ns", "nominal": 100.0}],
+        scan_table=[[100.0], [200.0]],
+        delays={"a": "s0/2"}, delay_units={"a": "str (ns)"}, time_step_ns=20,
+    )
+    with pytest.raises(ValueError, match="cannot be scanned"):
+        na.compile_pulse_table_scan_runtime_program(st, channels=["a", "trig"], clock_hz=50e6)
+
+
+def test_timing_payload_to_dict_snaps_to_target_clock():
+    # BUG: timing_payload_to_dict pre-snapped on the PAYLOAD grid; a state saved at 20 ns
+    # diverged from a direct compile at the server's clock. It must snap to the target tick.
+    from Zou_lab_control.neutral_atom.devices.sequencer import timing_payload_to_dict
+    st = na.PulseTableState(channels=["a"], periods=[na.PulsePeriod(14, (1,), unit="ns")], time_step_ns=20)
+    assert float(timing_payload_to_dict(st, time_step_ns=10.0)["periods"][0]["duration"]) == 10.0
+    assert float(timing_payload_to_dict(st)["periods"][0]["duration"]) == 20.0
+
+
+def test_negative_literal_duration_rejected():
+    # BUG: a negative literal period duration was silently snapped up to one tick.
+    import pytest
+    with pytest.raises(ValueError, match="must be >= 0"):
+        na.PulseTableState(channels=["a"], periods=[na.PulsePeriod(-100, (1,), unit="ns")], time_step_ns=20)
+
+
+def test_pulse_controller_set_scan_table_accepts_numpy():
+    # BUG: set_scan_table/payload used `rows or []` / `if table:`, raising on a NumPy array.
+    seq = na.RuntimeSequencer(channels=["a", "trig"], clock_hz=50e6, trigger_channels=["trig"])
+    st = na.PulseTableState(
+        channels=["a", "trig"], periods=[na.PulsePeriod("s0", (1, 0), unit="str (ns)")],
+        scan_slots=[{"kind": "duration", "target": "0", "unit": "ns", "nominal": 100.0}],
+        scan_table=[[100.0]], time_step_ns=20,
+    )
+    ctl = na.bind_pulse(seq, st)
+    ctl.set_scan_table(np.array([[20.0], [40.0]]))
+    assert ctl.scan_table == [[20.0], [40.0]]
+    ctl.set_scan_table(np.array([20.0, 40.0]))
+    assert ctl.scan_table == [[20.0], [40.0]]
+
+
+def test_explicit_one_channel_analog_bus_rejected():
+    # BUG: an explicit 1-channel analog bus passed validate() but crashed deeper.
+    import pytest
+    with pytest.raises(ValueError, match="at least two channels"):
+        na.PulseTableState(channels=["b0", "trig"], periods=[na.PulsePeriod(100, (0, 0), unit="ns")],
+                           analog_buses={"one": ["b0"]}, time_step_ns=20)
+
+
+def test_sequencer_prepare_backstops_invalid_program_geometry():
+    # BUG: SequencerService.prepare cached the program before any geometry check; a mock
+    # backend would accept channel_delays beyond DELAY_DEPTH. A backstop validate rejects it.
+    import pytest
+    seq = na.RuntimeSequencer(channels=["a", "b"], clock_hz=50e6, trigger_channels=["a"])
+    st = na.PulseTableState(channels=["a", "b"], periods=[na.PulsePeriod(100, (1, 1), unit="ns")],
+                            delays={"a": -40960, "b": 40960}, delay_units={"a": "ns", "b": "ns"}, time_step_ns=20)
+    with pytest.raises(ValueError, match="exceeds the del"):
+        seq.prepare(st)

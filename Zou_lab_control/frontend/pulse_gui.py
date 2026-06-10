@@ -1409,12 +1409,22 @@ class ChannelPanel(FluentGroupBox):
             key = str(row_info["key"])
             if key not in self.delay_edits:
                 continue
-            raw = self.delay_edits[key].text().strip() or 0
+            raw = self.delay_edits[key].text().strip()
             unit = self.delay_units[key].currentText()
+            try:
+                is_zero = float(raw) == 0.0   # numeric 0 / 0.0
+            except (TypeError, ValueError):
+                is_zero = (raw == "")         # empty -> no delay; an expression like "s0" is kept
             for channel in row_info.get("channels", [key]):
                 channel = str(channel)
-                state.delays[channel] = raw
-                state.delay_units[channel] = unit
+                # Don't persist a zero/empty delay: it adds noise to the saved JSON and makes a
+                # genuinely-stale delay harder to spot.  A real (nonzero / expression) delay stays.
+                if is_zero:
+                    state.delays.pop(channel, None)
+                    state.delay_units.pop(channel, None)
+                else:
+                    state.delays[channel] = raw
+                    state.delay_units[channel] = unit
 
     def set_channel_display_labels(self, labels: Mapping[str, str]) -> None:
         for channel, label in self.channel_labels.items():
@@ -2026,7 +2036,11 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         ]
         scan_slots = self._reconcile_scan_slots(periods)
         n_slots = len(scan_slots)
-        scan_table = [list(row)[:n_slots] + [0.0] * max(0, n_slots - len(row)) for row in self.state.scan_table]
+        # Pad a short row (e.g. after binding a NEW slot) with that slot's NOMINAL (reference)
+        # value, not 0 -- so a freshly-added scan dimension starts at the field's current value
+        # rather than silently forcing a 0 ns duration / 0 DAC code.
+        slot_defaults = [float(slot.nominal) for slot in self.state.scan_slots]
+        scan_table = [list(row)[:n_slots] + slot_defaults[len(row):n_slots] for row in self.state.scan_table]
         analog_bus_modes: dict[str, list[dict[str, object]]] = {}
         for card in cards:
             for bus_name, entry in card.bus_modes().items():
@@ -2161,8 +2175,11 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                     state.analog_bus_modes[bus] = plan
                     state.apply_analog_bus_modes_to_period_states()
             state.validate()
-        except Exception:
-            pass
+        except Exception as exc:
+            # Restoring is best-effort (the field may have moved/changed since it was cached),
+            # but don't SILENTLY swallow it -- surface a short note so a real state-sync error
+            # (stale DAC target after a reorder, missing bus, invalid slot) is visible.
+            self._message(f"could not restore {kind} field {target!r} after unbind: {exc}")
 
     def _apply_scan_state_in_place(self, state: PulseTableState) -> bool:
         """Refresh scan-binding visuals on the EXISTING widgets, no rebuild.

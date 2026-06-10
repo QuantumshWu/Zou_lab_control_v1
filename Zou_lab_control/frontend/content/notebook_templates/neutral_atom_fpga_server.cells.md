@@ -291,9 +291,10 @@ One edge row is a complete state mask at a time point. If trap and emCCD change
 at the same tick, that is still one row, not two. GUI hidden channels do not
 change row width; they simply have zero bits in the uploaded masks.
 
-A hardware scan binds duration / delay / DAC-value fields to slots `s0..sN`; the
+A hardware scan binds duration / DAC-value fields to slots `s0..sN`; the
 scan table is one row per scan point. Because the edge ticks are affine in the
-slots, a scanned duration/delay moves the edges (and any analog ramp) in lockstep.
+slots, a scanned duration moves the edges (and any analog ramp) in lockstep.
+(A channel delay is a fixed per-channel value and is not a scan slot.)
 The compiler/host reject a scan only when it would make the merged edge order
 non-monotonic at some scan point (split the scan or simplify timing).
 
