@@ -5468,6 +5468,99 @@ def test_sequencer_prepare_accepts_streamed_scan_beyond_resident_window():
 # RTL-finding fixes (2026-06-09): U4 delay-tail-at-done, U1 ramp slope cap,
 # B1/B2 da_clk idle warning, T3 latency read-back, B3/B4/U7 geometry guards.
 # --------------------------------------------------------------------------- #
+def test_top_aligns_coeff_mask_reads_to_tick_read():
+    """REAL-HARDWARE ROOT CAUSE (emCCD 2nd pulse 40 ms / on one period early; with the old
+    `==` it instead DROPPED the pulse -> "only the first pulse").  The TICK edge BRAM is
+    symmetric (32/32); COEFF and MASK are asymmetric (32-write/64-read) and on hardware
+    present doutb ONE CYCLE EARLIER.  The streaming prefetch captures all three at the same
+    RD_LAT=2 landed cycle, so it paired edge K's tick with edge K+1's mask -> a streamed
+    pulse fired one edge (period) early.  Lock the fix: top.v delays coeff+mask by one
+    register and feeds the *registered* versions to the engine."""
+    import re
+    top = (Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
+    assert "edge_coeff_rdata_q" in top and "edge_mask_rdata_q" in top
+    assert re.search(r"edge_coeff_rdata_q\s*<=\s*edge_coeff_rdata_w", top)
+    assert re.search(r"edge_mask_rdata_q\s*<=\s*edge_mask_rdata_w", top)
+    assert ".edge_coeff_rdata(edge_coeff_rdata_q[" in top
+    assert ".edge_mask_rdata(edge_mask_rdata_q[" in top
+    assert ".edge_mask_rdata(edge_mask_rdata_w[" not in top   # un-aligned wiring is gone
+    assert ".edge_coeff_rdata(edge_coeff_rdata_w[" not in top
+
+
+def test_streaming_prefetch_mask_skew_reproduces_then_fixes_early_pulse():
+    """Faithful register-level proof of the bug + fix.  Models the streaming prefetch with
+    edge_raddr as an NBA register feeding three BRAMs at INDEPENDENT latencies (the layer
+    the abstract mirror cannot see).  A 1-cycle mask/tick skew makes a channel turn on one
+    edge EARLY (the 40 ms emCCD bug); equal latencies (the top.v alignment register) give
+    the correct waveform.  Built from the user's exact edge structure."""
+    RD_LAT, FIFO_DEPTH = 2, 3
+
+    def play(ticks, masks, n_ticks, tick_lat, mask_lat, ge=True):
+        n = len(ticks)
+        tc = sm = ei = 0
+        arm_t = [0] * FIFO_DEPTH; arm_m = [0] * FIFO_DEPTH; arm_nv = 0
+        pend = [0] * RD_LAT; fetch = 0; er = 0; erh = [0] * 8; ac = n; running = n != 0
+        out = []
+
+        def seed():
+            nonlocal sm, tc, ei, arm_t, arm_m, arm_nv, fetch, er, pend, erh
+            pend = [0] * RD_LAT
+            if ac and ticks[0] == 0:
+                sm = masks[0]; tc = 1; ei = 1
+                arm_t = [ticks[i] if i < n else 0 for i in (1, 2, 3)]
+                arm_m = [masks[i] if i < n else 0 for i in (1, 2, 3)]
+                arm_nv = min(FIFO_DEPTH, max(0, ac - 1)); fetch = 4; er = 4
+            else:
+                sm = tc = ei = 0
+                arm_t = [ticks[i] if i < n else 0 for i in (0, 1, 2)]
+                arm_m = [masks[i] if i < n else 0 for i in (0, 1, 2)]
+                arm_nv = min(FIFO_DEPTH, ac); fetch = 3; er = 3
+            erh = [er] * 8
+        seed()
+        final = ticks[-1] if n else 0
+        for _ in range(n_ticks):
+            out.append(sm)
+            if not running:
+                continue
+            tk = ticks[erh[-1 - tick_lat]] if erh[-1 - tick_lat] < n else 0
+            mk = masks[erh[-1 - mask_lat]] if erh[-1 - mask_lat] < n else 0
+            landed = pend[RD_LAT - 1]
+            if tc >= final:
+                seed(); final = ticks[-1] if n else 0; erh = erh[1:] + [er]; continue
+            cmp = (tc >= arm_t[0]) if ge else (tc == arm_t[0])
+            fire = (ei < ac) and (arm_nv != 0) and cmp
+            nsm = arm_m[0] if fire else sm; nei = ei + 1 if fire else ei
+            nv = arm_nv - 1 if fire else arm_nv
+            nt, nm = arm_t[:], arm_m[:]
+            if fire:
+                for k in range(FIFO_DEPTH - 1):
+                    nt[k] = arm_t[k + 1]; nm[k] = arm_m[k + 1]
+            if landed:
+                nt[nv] = tk; nm[nv] = mk; nnv = nv + 1
+            else:
+                nnv = nv
+            issue = (nv + (1 if landed else 0) + pend[0] < FIFO_DEPTH) and (fetch < ac)
+            ner = fetch if issue else er; nf = fetch + 1 if issue else fetch
+            sm, ei, arm_t, arm_m, arm_nv = nsm, nei, nt, nm, nnv
+            er, fetch, pend = ner, nf, [issue] + pend[0:RD_LAT - 1]; tc += 1
+            erh = erh[1:] + [er]
+        return out
+
+    S = 500
+    ticks = [t // S for t in [0, 500000, 1250000, 2250000, 2500000, 2500500, 5000500, 6000500, 7000500, 7050500]]
+    masks = [0x73, 0x23, 0xa4, 0x20, 0x20, 0x20, 0x20, 0xa4, 0x00, 0x00]
+    emb = 7
+    N = ticks[-1] + 200
+
+    def emccd_on(w):
+        return [t for t in range(1, len(w)) if (w[t] >> emb) & 1 and not (w[t - 1] >> emb) & 1]
+
+    bug = emccd_on(play(ticks, masks, N, tick_lat=2, mask_lat=1, ge=True))
+    assert 10001 in bug and 12001 not in bug, f"skew must reproduce the early-on bug, got {bug}"
+    fixed = emccd_on(play(ticks, masks, N, tick_lat=2, mask_lat=2, ge=True))
+    assert fixed[:2] == [2500, 12001], f"aligned reads must give the correct 2 pulses, got {fixed}"
+
+
 def test_pulse_streamer_rtl_fire_seed_uses_fresh_prog_count_not_stale_reg():
     """REAL-HARDWARE ROOT CAUSE (multi-period dropped pulses / "off never fires").
 

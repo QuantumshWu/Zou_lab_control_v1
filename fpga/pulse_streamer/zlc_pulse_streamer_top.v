@@ -276,6 +276,24 @@ module zlc_pulse_streamer_top #(
         .addrb(edge_raddr), .dinb({MASK_PORTB_BITS{1'b0}}), .doutb(edge_mask_rdata_w)
     );
 
+    // --- ALIGN coeff/mask reads to the tick read (HARDWARE BUG FIX) --------------
+    // The TICK BRAM is symmetric (32b write / 32b read); COEFF and MASK are ASYMMETRIC
+    // (32b write / 64b read).  On hardware the wide-read asymmetric BRAMs present doutb
+    // ONE CYCLE EARLIER than the symmetric tick BRAM.  The STREAMING prefetch captures
+    // all three at the SAME fixed RD_LAT=2 "landed" cycle, so it paired edge K's tick
+    // with edge K+1's mask -> a streamed edge fired at edge K's tick using edge K+1's
+    // mask, i.e. a pulse turned on ONE PERIOD EARLY (the reproduced emCCD 40 ms bug;
+    // with the old `==` compare the same skew instead DROPPED the pulse -> "only the
+    // first pulse").  Delaying coeff+mask by ONE register makes all three land
+    // coherently.  The seeded arm_step path (ARM_SETTLE=4) absorbs the extra cycle, and
+    // the tick read (which drives do_fire timing + RD_LAT) is unchanged.
+    reg [COEFF_PORTB_BITS-1:0] edge_coeff_rdata_q;
+    reg [MASK_PORTB_BITS-1:0]  edge_mask_rdata_q;
+    always @(posedge axi_clk) begin
+        edge_coeff_rdata_q <= edge_coeff_rdata_w;
+        edge_mask_rdata_q  <= edge_mask_rdata_w;
+    end
+
     // --- SCAN BRAM (port A 32b write, port B 128b read; 2*BANK_SIZE deep) ------
     wire [SCAN_PORTB_BITS-1:0] scan_rdata_w;
     wire [SCAN_ADDR_WIDTH-1:0] scan_raddr;
@@ -463,8 +481,8 @@ module zlc_pulse_streamer_top #(
         .scan_count(ctrl_reg[C_SCAN_COUNT][SCAN_COUNT_WIDTH-1:0]),
         .edge_raddr(edge_raddr),
         .edge_tick_rdata(edge_tick_rdata),
-        .edge_coeff_rdata(edge_coeff_rdata_w[COEFF_BITS-1:0]),
-        .edge_mask_rdata(edge_mask_rdata_w[CHANNEL_COUNT-1:0]),
+        .edge_coeff_rdata(edge_coeff_rdata_q[COEFF_BITS-1:0]),
+        .edge_mask_rdata(edge_mask_rdata_q[CHANNEL_COUNT-1:0]),
         .scan_raddr(scan_raddr), .scan_rdata(scan_rdata_w),
         .bank_ready(ctrl_reg[C_BANK_READY][1:0]),
         .bank_chunk0(ctrl_reg[C_BANK0_CHUNK][SCAN_COUNT_WIDTH-1:0]),
