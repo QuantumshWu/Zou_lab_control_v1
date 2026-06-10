@@ -88,11 +88,13 @@ pulse_plot = zf.plot(
 Pulse GUI 的 Edit 页可以按这个顺序读：
 
 ```text
-Channel Names and Duration: pulse 名字、总时长、可见 channel 的 display name。
-Delay and Scan:             Step、Use Y、Scan X/Scan XY、每个 channel delay。
-Period cards:               每个 period 的 duration/unit 和 channel on/off。
-Control Buttons:            Stop Pulse、On Pulse、Add/Remove Column、Add Bracket、Save/Load。
-Channel View:               Add Channel、Hide Off、Show All 和 visible/hidden 计数。
+Channel Names:   pulse 名字、总时长、可见 channel 的 display name。
+Delay / Scan:    FPGA clock(只读显示)、每通道 delay(ns/us)+X 清除按钮+clk 按钮。
+Period cards:    每个 period 的 duration/unit + scan 圆点(绑定 s0..)、
+                 DAC bus 行(Edge/Ramp/Hold + 值 + scan 圆点)、channel on/off。
+Control:         Stop Pulse、On Pulse、Add/Del Column、Add/Del Bracket、Save/Load。
+Channels:        Add Channel、Hide Off、Show All 和 visible/hidden 计数。
+Scan tab:        已绑定 slot 列表、代码生成/Load Array 两种 scan_table 来源、Run。
 ```
 
 Name 面板左侧 raw column 在 standalone address-switch 路线下显示 XDC package pin，
@@ -114,7 +116,6 @@ pulse_state = na.PulseTableState(
     channels=[f"ch{i:02d}" for i in range(62)],
     visible_channels=["ch09", "ch00", "ch03", "ch11"],
     channel_labels={"ch09": "trap", "ch00": "cooling", "ch03": "probe", "ch11": "emCCD"},
-    x_ns=60,
     time_step_ns=20,
 )
 pulse_state.set_period_state(0, "ch09", 1)
@@ -132,24 +133,32 @@ api_pulse_plot = zf.plot(
 # pulse_gui = zf.show_pulse_gui(state=pulse_state, scale=0.82, window_ratio=0.90)
 
 <!-- cell:markdown -->
-`x_ns` 可以临时覆盖，用来扫某个 duration 或 delay。下面这个例子不打开 GUI，只用 API 生成四个不同宽度的 sequence，并编译成 50 MHz FPGA 的 integer tick edge table。GUI 里的同一件事是：把 period duration 写成 `x` 或 `100000-x`，在 `Scan X` 输入 `[240, 500, 1000, 2000]`；如果要二维扫描，打开 `Use Y`，这一行会变成 `Scan XY`，输入 `[(x0, y0), (x1, y1), ...]`。scan 数值会用和 duration/delay 一样的 resolution 逻辑对齐到 active step。
+扫描用**命名 scan slot**（`s0, s1, ...`）。`bind_field(kind, target)` 把一个字段绑定成下一个 slot：`kind="duration"` 时 `target` 是 period 序号，`kind="dac"` 时是 `"bus@period"`（channel delay 是固定量，不能绑定）。绑定后该字段的值变成 slot 表达式（如 `"s0"`），再用 `set_scan_table` 提供一张 `N_points x N_slots` 的表；`compile_scan` 把整张表编译成**一个**硬件 program——FPGA 在扫描点之间无缝切换（affine tick：`effective_tick = base + (coeff*s0)>>8`），不需要逐点重新上传。GUI 里的同一件事是：点 duration/DAC 输入框右侧的圆点（变橙色、显示 slot 号），再到 Scan 页生成或 Load Array 一张 scan table。下面这个例子不打开 GUI，只用 API 扫 `image` period 的宽度。
 
 <!-- cell:code -->
-x_scan_state = na.PulseTableState(
+scan_state = na.PulseTableState(
     channels=["ch09", "ch03", "ch11"],
     channel_labels={"ch09": "trap", "ch03": "probe", "ch11": "emCCD"},
     time_step_ns=20,
     periods=[
         na.PulsePeriod(1000, (1, 0, 0), unit="ns", name="pre"),
-        na.PulsePeriod("x", (1, 1, 1), unit="str (ns)", name="image"),
+        na.PulsePeriod(240, (1, 1, 1), unit="ns", name="image"),
         na.PulsePeriod(1000, (0, 0, 0), unit="ns", name="idle"),
     ],
 )
+scan_state.bind_field("duration", "1", label="image width")   # period 1 duration -> s0
+scan_state = scan_state.set_scan_table([[240], [500], [1000], [2000]])  # N_points x N_slots, ns
 
-x_widths_ns = [240, 500, 1000, 2000]
-x_sequences = [x_scan_state.to_sequence(x_ns=width, time_step_ns=20) for width in x_widths_ns]
-x_programs = [x_scan_state.compile(clock_hz=50_000_000, x_ns=width) for width in x_widths_ns]
-[(x_scan_state.total_duration_steps(x_ns=width, time_step_ns=20), program.ticks[-1]) for width, program in zip(x_widths_ns, x_programs)]
+scan_program = scan_state.compile_scan(clock_hz=50_000_000, trigger_channels=["ch11"])
+scan_program.scan_points, scan_program.ticks  # 一个 program 携带全部扫描点(tick 单位)
+
+<!-- cell:code -->
+# 单点检查：with_slots_resolved 把 s0 换成一个具体值(其余 slot 保持 nominal)，
+# 得到一张普通的静态表；compile(slots=...) 等价。
+single = scan_state.with_slots_resolved({"s0": 500})
+single_program = single.compile(clock_hz=50_000_000, trigger_channels=["ch11"])
+[(width, scan_state.total_duration_steps(slots={"s0": width}, time_step_ns=20))
+ for width in [240, 500, 1000, 2000]], single_program.ticks
 
 <!-- cell:markdown -->
 For real hardware, do not let the GUI invent hardware. Start the server on the

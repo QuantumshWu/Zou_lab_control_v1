@@ -30,8 +30,8 @@ ch11 emCCD
 The same XDC also has `ch06 trig`, but the checked-in camera preset uses
 `ch11/emCCD/M13` as the qCMOS/emCCD trigger.
 
-默认 clock 是 50 MHz，也就是 20 ns step。所有 duration、delay、scan x/y
-值都必须对齐到这个 step。
+默认 clock 是 50 MHz，也就是 20 ns step。所有 duration、delay 和 scan
+table 的值都会自动对齐(snap)到这个 step——硬件只能落在整数 tick 上。
 
 <!-- cell:code -->
 {{BOOTSTRAP_CELL}}
@@ -100,15 +100,20 @@ Pulse GUI 的实际工作方式：
 
 ```text
 Edit tab
-  Channel Names and Duration: display label、total duration、visible count
-  Delay and Scan:             Step、Use Y、Scan X/Scan XY、per-channel delay
-  Period cards:               duration/unit 和每个 visible channel 的 on/off
-  Control Buttons:            On/Stop、Add/Remove Column、Add Bracket、Save/Load
-  Channel View:               Add Channel、Hide Off、Show All
+  Channel Names:  display label、total duration、visible count
+  Delay / Scan:   FPGA clock(只读)、per-channel delay(ns/us)+X 清除+clk 按钮
+  Period cards:   duration/unit + scan 圆点(绑定 s0..)、DAC bus 行
+                  (Edge/Ramp/Hold + 值 + scan 圆点)、每个 visible channel 的 on/off
+  Control:        On/Stop、Add/Del Column、Add/Del Bracket、Save/Load
+  Channels:       Add Channel、Hide Off、Show All
 
 Preview tab
   自动画当前 PulseTableState，不需要手动 refresh。
   默认只画 active channel；Show off rows 会显示完整 channel list。
+  被扫描的字段用透明橙色 band + slot 编号标出，不展开全部扫描点。
+
+Scan tab
+  已绑定 slot 列表；scan_table 的两种来源(代码生成 / Load Array 文件)；Run。
 ```
 
 Name 面板左侧 raw column 在 address-switch 路线下显示 XDC package pin。例如
@@ -207,24 +212,25 @@ occupancy_grid = shot.occupied.reshape(grid_shape)
 occupancy_grid, shot.summary()
 
 <!-- cell:markdown -->
-## Bind a pulse for x/y scans
+## Bind a pulse for hardware scans
 
 对于 readout-time 或曝光宽度扫描，可以把一张 `PulseTableState` 绑定到当前
 session 的 sequencer。仓库里的
 `pulses/camera_imaging_address_switch.json` 已经把 `camera_exposure` period
-写成 `duration="x", unit="str (ns)"`，默认 `x_ns=19_980_000`，所以
-`pulse.x` 就是 probe/readout exposure 的 ns 数。
+绑定为 scan slot `s0`（`duration="s0", unit="str (ns)"`，nominal
+19,980,000 ns），所以这张 pulse 的 exposure 是一个可设置/可扫描的命名量。
 
-GUI/API 的 scan array 是一个字段；GUI 左侧会随开关显示 `Scan X` 或
-`Scan XY`：
+扫描用命名 slot + scan table（GUI 里点 duration/DAC 框旁的圆点绑定，
+Scan 页提供表；API 里 `bind_field` + `set_scan_table`）：
 
 ```text
-Use Y off / Scan X:  [x0, x1, ...]
-Use Y on  / Scan XY: [(x0, y0), (x1, y1), ...]
+单点设置:  pulse.set_time(2_000_000)            # 第一个 duration slot, ns
+           pulse.set_slot("s0", 2_000_000)      # 任意 slot 按名字设
+硬件扫描:  pulse.set_scan_table([[w0], [w1], ...])   # N_points x N_slots, ns
 ```
 
-所有值是 ns，必须对齐到 20 ns。Preview 不展开所有 scan points，而是把
-包含 `x`、`y` 或 `100000-x` 这类表达式的时间段标出来。
+所有值是 ns，会自动对齐到 20 ns tick。Preview 不展开所有 scan points，
+而是把被扫描的时间段用透明橙色 band + slot 编号标出来。
 
 传给 camera acquisition 时，`exp.readout.detection_time(..., pulse=pulse)`
 会用同一张 pulse 先拍 long-reference，再为每个扫描点临时生成刚好 `shots`
@@ -234,16 +240,16 @@ Use Y on  / Scan XY: [(x0, y0), (x1, y1), ...]
 pulse = exp.timing.bind_pulse("pulses/camera_imaging_address_switch.json")
 pulse.snapshot()
 
-# This does not fire hardware; it shows that x controls the finite readout
-# sequence duration before you run the scan.
+# This does not fire hardware; it shows that the exposure slot (s0) controls
+# the finite readout sequence duration before you run the scan.
 test_widths_ns = [2_000_000, 4_000_000, 8_000_000]
-[(width, pulse.frame_sequence(1, x_ns=width).duration) for width in test_widths_ns]
+[(width, pulse.frame_sequence(1, time_ns=width).duration) for width in test_widths_ns]
 
 RUN_SINGLE_PULSE_TEST = False
 
 single_program = None
 if RUN_SINGLE_PULSE_TEST:
-    pulse.x = 2_000_000  # ns
+    pulse.set_time(2_000_000)  # exposure slot s0, ns
     single_program = pulse.on_pulse(wait=True, timeout=10.0, repeat_forever=False)
 single_program
 
