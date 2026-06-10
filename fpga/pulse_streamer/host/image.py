@@ -144,6 +144,27 @@ class StreamerParams:
         return _ceil(self.bus_count * self.delay_tick_width, 32)
 
     @property
+    def clk_enable_words(self) -> int:
+        # per-channel clk mask: 1 bit per channel, in 32b words
+        return _ceil(self.channel_count, 32)
+
+    @property
+    def ctrl_scratch_base(self) -> int:
+        """First CTRL word ABOVE every defined/used word -- command words (0..19),
+        DELAY_TICKS, BUS_DELAY_TICKS and CLK_ENABLE.  ``axi_self_test`` may scribble
+        ONLY at/above this index (hardware regression: a stale hard-coded scratch of
+        32 landed inside the later-added delay/CLK_ENABLE words, clk-enabling random
+        channels at server bring-up -- pins ran at 50 MHz before any pulse)."""
+        base = int(CtrlWords.CLK_ENABLE) + self.clk_enable_words
+        if base + 2 > CTRL_WORDS:
+            raise ValueError(
+                f"CTRL register file has no scratch room: defined words reach {base} "
+                f"but the file holds only {CTRL_WORDS} words; grow CTRL_WORDS / the RTL "
+                "ctrl_reg file in lock-step."
+            )
+        return base
+
+    @property
     def coeff_bits(self) -> int:
         return self.num_slots * self.coeff_width
 

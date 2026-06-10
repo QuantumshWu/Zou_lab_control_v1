@@ -154,6 +154,12 @@ def run_server(
         if warm_start:
             print("Starting persistent Vivado JTAG-to-AXI session before accepting clients...")
             hardware_backend.start()
+            # Always boot into a clean idle state: zero the host-owned CTRL config
+            # (per-channel/per-bus delays + the per-channel CLK mask) and halt.  Without
+            # this, leftovers on a running board (e.g. a clk_en bit) persist until the
+            # first prepare -- a channel would keep running on the FPGA clock.
+            print("Clearing host-owned CTRL config (delays + clk mask) to a safe idle state...")
+            hardware_backend.clear_host_config()
             # Fail-fast bring-up check: a burst write + single-beat read-back proves the
             # AXI4 INCR-burst upload path works (right -data byte order, AXI4 -- not
             # Lite -- bitstream) BEFORE any client uploads a pulse.  Disable with

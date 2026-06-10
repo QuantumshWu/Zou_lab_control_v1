@@ -407,15 +407,20 @@ class VivadoAxiStreamerSession:
         silent failure mode -- a wrong ``create_hw_axi_txn -data`` burst byte order (or a
         still-AXI4-Lite bitstream that ignores ``-len``) -- BEFORE any real pulse upload.
 
-        The scratch words sit ABOVE every defined CTRL word (the highest,
-        ``REPEAT_FROM_LOOP_START``, is index 19), so writing them has no side effect (no
-        COMMAND/BANK_READY/loop fields are touched) and the next ``prepare`` overwrites only
-        the low command words.  Returns True on success; raises on mismatch."""
+        The scratch words sit ABOVE every defined CTRL word -- the highest is the top
+        CLK_ENABLE word (params.ctrl_scratch_base - 1; commands 0..19, then DELAY_TICKS /
+        BUS_DELAY_TICKS / CLK_ENABLE) -- so writing them has NO side effect: no COMMAND,
+        no delay, and critically no CLK_ENABLE bit is touched (a clk_en bit set here
+        would drive that channel's pin at 50 MHz until the next prepare).  HARDWARE
+        REGRESSION GUARD: a stale hard-coded scratch=32 used to land inside the
+        later-added delay/CLK_ENABLE words and clk-enabled random channels at server
+        bring-up.  The scratch is zeroed afterwards.  Returns True on success; raises
+        on mismatch."""
 
         from fpga.pulse_streamer.host.image import CTRL_WORDS
 
         ctrl_base = region_bases(self.params)["ctrl"]
-        scratch = 32                              # safely above all defined CtrlWords (<= 19)
+        scratch = self.params.ctrl_scratch_base   # first word above ALL defined CtrlWords
         n = max(2, min(int(count), CTRL_WORDS - scratch))
         base = ctrl_base + scratch
         pattern = [(0xC0DE0000 + i) & 0xFFFFFFFF for i in range(n)]
@@ -433,7 +438,27 @@ class VivadoAxiStreamerSession:
                 f"read={[hex(v) for v in read[:4]]}...  If read is all-zero, re-run "
                 "build_and_program to load the CURRENT bitstream, then restart the server."
             )
+        # leave the register file as we found it (all-zero scratch)
+        for offset in range(n):
+            self._queue_word(base + offset, 0)
+        self._flush()
         return True
+
+    def clear_host_config(self) -> None:
+        """Zero every host-owned CTRL CONFIG word -- per-channel delays, per-bus
+        delays and the per-channel CLK mask -- then halt the engine (CMD_SAFE).
+
+        Run at server bring-up so a restart ALWAYS lands in a clean, silent state:
+        leftovers from a prior session (or from the historic self-test bug that
+        scribbled into the delay/CLK_ENABLE words) cannot keep a channel running on
+        the FPGA clock with no program loaded.  prepare() rewrites these words from
+        the program image anyway; this only guarantees the idle state."""
+
+        ctrl_base = region_bases(self.params)["ctrl"]
+        for word in range(CtrlWords.DELAY_TICKS, self.params.ctrl_scratch_base):
+            self._queue_word(ctrl_base + word, 0)
+        self._flush()
+        self._command(CMD_SAFE)
 
     def fire(self, program=None) -> None:
         if program is not None:

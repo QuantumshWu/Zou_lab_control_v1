@@ -2973,6 +2973,76 @@ def test_axi_session_self_test_catches_scrambled_burst(tmp_path):
         bad.axi_self_test(count=8)
 
 
+def test_axi_self_test_scratch_sits_above_all_defined_ctrl_words(tmp_path):
+    """HARDWARE REGRESSION: the self-test used a stale hard-coded scratch base of 32 --
+    'above all CtrlWords' when the highest was 19 -- but the delay redesign later defined
+    words 20..43 (DELAY_TICKS), 44..45 (BUS_DELAY_TICKS) and 46..47 (CLK_ENABLE).  At
+    run_server bring-up the 0xC0DE.. test burst landed in CLK_ENABLE and clk-enabled
+    random channels: their pins ran at 50 MHz before any on_pulse, and off_pulse
+    (CMD_SAFE only, no config rewrite) could not clear it.  Lock: the scratch base is
+    derived from the layout, sits ABOVE every defined word, the self-test never writes
+    below it, and it zeroes the scratch afterwards."""
+
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+    from fpga.pulse_streamer.host.image import CTRL_WORDS, CtrlWords, default_params
+
+    p = default_params()
+    assert p.ctrl_scratch_base == CtrlWords.CLK_ENABLE + p.clk_enable_words == 48
+    assert p.ctrl_scratch_base + 2 <= CTRL_WORDS
+
+    class Hw:
+        def __init__(self):
+            self.bram = {}
+        def __call__(self, lines, action, timeout):
+            text = "\n".join(lines)
+            for w, v in _decode_axi_writes(text):
+                self.bram[w] = v
+            m = re.search(r"-address ([0-9A-Fa-f]+) -len 1 -type read", text)
+            if m:
+                return f"ZLCDATA {self.bram.get(int(m.group(1), 16) // 4, 0):08X}\n"
+            return "ok\n"
+
+    hw = Hw()
+    session = VivadoAxiStreamerSession(state_dir=tmp_path, tcl_executor=hw)
+    assert session.axi_self_test() is True
+    # every word it touched is at/above the scratch base -- delays/CLK_ENABLE untouched
+    assert hw.bram and min(hw.bram) >= 48 and max(hw.bram) < CTRL_WORDS
+    assert 46 not in hw.bram and 47 not in hw.bram
+    # and the register file is left as found: all scratch words zeroed
+    assert all(v == 0 for v in hw.bram.values())
+
+
+def test_clear_host_config_zeroes_delays_and_clk_mask(tmp_path):
+    """Server bring-up self-heal: clear_host_config() must zero EVERY host-owned config
+    word (per-channel delays 20..43, per-bus delays 44..45, CLK mask 46..47) and halt
+    (CMD_SAFE) -- so a board polluted by the historic self-test bug (or any leftover
+    clk_en bit driving a pin at 50 MHz) recovers on server restart, no on_pulse needed."""
+
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+    from fpga.pulse_streamer.host.image import CMD_SAFE, CtrlWords
+
+    class Hw:
+        def __init__(self):
+            # a polluted board: 0xC0DE.. sitting in delay + CLK_ENABLE words
+            self.bram = {25: 0xC0DE0007, 44: 0xC0DE000C, 46: 0xC0DE000E, 47: 0xC0DE000F}
+        def __call__(self, lines, action, timeout):
+            text = "\n".join(lines)
+            for w, v in _decode_axi_writes(text):
+                self.bram[w] = v
+            m = re.search(r"-address ([0-9A-Fa-f]+) -len 1 -type read", text)
+            if m:
+                return f"ZLCDATA {self.bram.get(int(m.group(1), 16) // 4, 0):08X}\n"
+            return "ok\n"
+
+    hw = Hw()
+    session = VivadoAxiStreamerSession(state_dir=tmp_path, tcl_executor=hw)
+    session.clear_host_config()
+    p = session.params
+    for word in range(CtrlWords.DELAY_TICKS, p.ctrl_scratch_base):
+        assert hw.bram.get(word, 0) == 0, f"ctrl word {word} not cleared"
+    assert hw.bram.get(CtrlWords.COMMAND) == CMD_SAFE   # engine halted afterwards
+
+
 def test_pulse_sequence_clock_validation_rejects_off_tick_edges():
     seq = na.PulseSequence(name="off_grid").pulse("trap", 0.0, 25e-9)
     report = seq.validate(clock_hz=100e6, channels=["trap"])
@@ -3264,6 +3334,9 @@ def test_sequencer_server_jtag_axi_backend_warm_starts_axi_session(tmp_path, mon
             events.append("start")
             return self
 
+        def clear_host_config(self):
+            events.append("clear_config")
+
         def axi_self_test(self, **kwargs):
             events.append("self_test")
             return True
@@ -3301,7 +3374,9 @@ def test_sequencer_server_jtag_axi_backend_warm_starts_axi_session(tmp_path, mon
 
     # warm start: construct -> start the Vivado session -> AXI burst self-test (fail-fast
     # bring-up check) -> serve.
-    assert events[:4] == ["init:state_loader:clk=50000000", "start", "self_test", "serve:127.0.0.1:18861"]
+    # bring-up ORDER matters: clear the host config (delays + clk mask) BEFORE the
+    # self-test so the boot state is clean even if the self-test raises.
+    assert events[:5] == ["init:state_loader:clk=50000000", "start", "clear_config", "self_test", "serve:127.0.0.1:18861"]
     assert service is not None
 
 
