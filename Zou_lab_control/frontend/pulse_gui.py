@@ -2550,7 +2550,11 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         state = self.read_state()
         rows = self._scan_tables.get("loaded" if self._scan_use_loaded else "generated", [])
         n = len(state.scan_slots)
-        rows = [list(row)[:n] + [0.0] * max(0, n - len(row)) for row in rows]
+        # Pad a short row with the slot's NOMINAL (reference) value, not 0 -- same rule as
+        # read_state, so a newly-bound slot starts at the field's current value instead of
+        # silently forcing a 0 ns duration / 0 DAC code.
+        slot_defaults = [float(slot.nominal) for slot in state.scan_slots]
+        rows = [list(row)[:n] + slot_defaults[len(row):n] for row in rows]
         state.set_scan_table(rows)
         self.load_state(state)
 
