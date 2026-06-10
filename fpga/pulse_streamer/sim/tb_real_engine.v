@@ -71,15 +71,13 @@ module tb_real_engine;
       o_prev<=out; r_prev<=edge_raddr;
     end
   end
-  reg prev=0; reg em;
-  integer on1=-1,off1=-1,on2=-1,off2=-1;
+  reg prev=0; reg em; integer lastOn=-1;
   always @(posedge clk) begin
     if (running||done) tcount=tcount+1;
     em=out[11];
     if (running && em!==prev) begin
-      if (em) begin if(on1<0)on1=tcount; else if(on2<0)on2=tcount; end
-      else    begin if(off1<0)off1=tcount; else if(off2<0)off2=tcount; end
-      $display("[t=%0d] emCCD %s out=0x%h", tcount, em?"ON ":"OFF", out[15:0]);
+      if (em) lastOn=tcount;
+      else $display("[PULSE] on=%0d off=%0d width=%0d", lastOn, tcount, tcount-lastOn);
       prev=em;
     end
   end
@@ -91,9 +89,8 @@ module tb_real_engine;
   end
   initial begin
     wait (reset==1); wait (reset==0);
-    repeat (16000) @(posedge clk);
-    $display("==== pulse1 w=%0d  pulse2 on=%0d off=%0d w=%0d ====", off1-on1, on2,off2,off2-on2);
-    $display("EXPECT correct pulse2 width=2000 (20ms) ; 40ms-bug=4000");
+    repeat (52000) @(posedge clk);
+    $display("==== DONE (correct = every pulse pair 1000/2000 wide) ====");
     $finish;
   end
 endmodule
