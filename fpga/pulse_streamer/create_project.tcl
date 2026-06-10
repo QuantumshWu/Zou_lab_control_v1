@@ -122,10 +122,27 @@ proc zlc_dump_ip {ip} {
     }
     puts "ZLC IPDUMP ===== end $ip ====="
 }
-# force port-B read latency 2 (deterministic) on an edge BRAM; verify the dump.
+# force port-B read latency 2 (deterministic) on an edge BRAM, then HARD-VERIFY it
+# took effect.  The engine's 1-tick prefetch is tuned to RD_LAT=2: if a future Vivado
+# renames these CONFIG properties the set would silently no-op and every edge would
+# land a cycle early ON HARDWARE with no error anywhere -- so a failed set OR a
+# failed read-back must kill the BUILD, not the experiment.
 proc zlc_force_latency2 {ip} {
     zlc_try "$ip regPrimB" {set_property CONFIG.Register_PortB_Output_of_Memory_Primitives {true} [get_ips $ip]}
     zlc_try "$ip regCoreB" {set_property CONFIG.Register_PortB_Output_of_Memory_Core {true} [get_ips $ip]}
+    foreach prop {CONFIG.Register_PortB_Output_of_Memory_Primitives CONFIG.Register_PortB_Output_of_Memory_Core} {
+        if {[catch {set got [get_property $prop [get_ips $ip]]} zlc_e]} {
+            error "ZLC LATENCY-CHECK FAILED: cannot read $prop on $ip ($zlc_e).\
+ This Vivado version may have renamed the property; the edge prefetch REQUIRES port-B\
+ read latency 2 (see zlc_pulse_streamer_top.v RD_LAT notes). Fix the property name in\
+ zlc_force_latency2 before building -- do NOT ship a bitstream without this check."
+        }
+        if {![string is true -strict [string tolower $got]]} {
+            error "ZLC LATENCY-CHECK FAILED: $prop on $ip is '$got' (expected true).\
+ Port-B read latency would be 1 and every edge would fire a cycle early on hardware."
+        }
+    }
+    puts "ZLC LATENCY-CHECK OK: $ip port-B output registers (primitives+core) = true (RD_LAT=2)"
 }
 
 if {[file exists $project_dir]} { file delete -force $project_dir }

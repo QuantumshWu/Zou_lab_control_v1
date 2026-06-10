@@ -656,23 +656,43 @@ CLI for its pre-build estimate, with the configured `fpga_part`.
   a static program (a run is never blocked); documented inline (a direct `compile_scan` still
   errors — the strict explicit-scan path).
 
-### RTL bring-up checklist (NOT edited — verify on hardware; speculative RTL edits are
-forbidden because a wrong edit costs a failed synth/route cycle)
-The adversarial RTL hunt found three items to confirm on the bench rather than patch:
-- **U4 — delayed-output tail at `done`.** `bnd_delay_advance` is set only while `running`
-  (`zlc_edge_streamer.v` ~694); after a FINITE sequence finishes, the delay rings stop, so a
-  channel with delay `d` does not flush its last `d` ticks. Harmless when the final frame
-  returns to 0 (the usual case) and irrelevant for `repeat_forever` (never `done`); the
-  Python mirror agrees, so it is not a host/RTL *surprise*. If a finite run must emit a
-  non-zero delayed tail, pad the program's final tick by the max delay (HOST change) rather
-  than touch the RTL.
-- **B1/B2 — `da_clk0..3` = `out_final[28/39/50/61]`.** These DAC strobe pins are driven by the
-  engine bits for those channels (or by `clk` if the channel is clk-enabled). Confirmed the
-  board's DAC scan works as-is; if a future board needs them tied to the FPGA clk, mark those
-  channels as clk channels. Don't let a normal program toggle 28/39/50/61.
-- **B3/B4/U7 — parameterization traps** (`COEFF_BITS==64`, flags-word width, `scan_addr_of`):
-  correct at the shipped `NUM_SLOTS=4` / `BUS_WIDTH=10` / `BANK_SIZE=2048`; only a concern if
-  those change. Documented at the call sites.
+### RTL findings — RESOLVED 2026-06-09 (user-authorized fixes; **REBUILD REQUIRED**)
+The three bring-up items from the adversarial RTL hunt are now fixed/guarded. The
+`zlc_edge_streamer.v` change means the next hardware session MUST re-synthesize
+(`fpga\build_and_program.bat`) — the deployed bitstream still has the old behavior.
+- **U4 — delayed-output tail at `done`: FIXED IN RTL.** The state chain now has a
+  `done`-but-emitting branch that keeps `bnd_delay_advance` high after the final tick, so
+  the delay rings keep shifting: a channel/bus with delay `d` flushes its remaining `d`
+  ticks and settles LOW (pushes are zeros — `state_mask`/`bus_value_active` are cleared at
+  `done`). Before the fix the rings FROZE at `done` and a delayed channel could hold a
+  stale HIGH tap for the ms-scale window until the host reacted. This realizes exactly the
+  contract `rtl_mirror_play`/`delay_line_reference` always promised (out[t]=in[t-d] for the
+  whole stream); `repeat_forever` was never affected (never reaches `done`). Locked by
+  `test_pulse_streamer_rtl_advances_delay_rings_after_done` +
+  `test_delay_tail_emits_after_done_contract`. NOTE: the agent-suggested
+  `del_fill < DELAY_DEPTH` gate was rejected — `del_fill` saturates during any run longer
+  than 2048 ticks, which would disable the fix exactly when it matters.
+- **B1/B2 — `da_clk0..3` = `out_final[28/39/50/61]`: BY DESIGN (no RTL change).** The clk
+  button (clk_channels → CLK_ENABLE mux) exists precisely to wire these strobe pins to the
+  FPGA clk. New safety net: `_warn_idle_dac_clock_pins` (sequencer.py) warns at compile
+  time when DAC buses are driven while a `da_clkN`-labeled channel is neither clk-enabled
+  nor toggled (a frozen DAC would otherwise be silent). A warning, not an error — driving
+  the strobe as a TTL pattern stays allowed.
+- **U1 — over-steep ramp: HOST VALIDATION.** The hardware ramp engine slews at most
+  1 LSB/tick then SNAPS at `stop_tick`; the preview draws an ideal line. A ramp with
+  |Δvalue| > tick span is now REJECTED by `validate_pulse_streamer_program` (including per
+  sampled scan point — a scanned duration/DAC endpoint can make a ramp unrealizable at
+  some points only), with the needed minimum duration in the message.
+- **T3 — edge-BRAM latency-2 force: BUILD-TIME HARD CHECK.** `zlc_force_latency2`
+  (create_project.tcl) now READS BACK both register properties and `error`s out if either
+  did not take (e.g. a future Vivado renames it) — a silent latency-1 BRAM would shift
+  every edge a cycle early on hardware with no error anywhere.
+- **B3/B4/U7 — parameterization traps: GUARDED.** Comment guards at the RTL call sites
+  (`COEFF_BITS==64` cap assembly, 32b flags word, `scan_addr_of` bank concat) + a host hard
+  gate `image.check_rtl_assumptions` called by `pack_program` (and surfaced as
+  `streamer_config.json` load warnings): geometries the shipped RTL would silently corrupt
+  (num_slots*coeff_width != 64, flags > 32b, non-pow2 bank/edges, tick_width != 32) cannot
+  reach the FPGA.
 
 ### DRY done + remaining backlog
 Done (safe, test-guarded): single `streamer_config.json` source; one `estimate_resources`

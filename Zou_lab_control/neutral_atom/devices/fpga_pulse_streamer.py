@@ -345,6 +345,7 @@ def validate_pulse_streamer_program(
     program_slot_count = int(getattr(program, "slot_count", 0))
     bus_segment_counts = [0 for _ in range(bus_count)]
     bus_value_limit = (1 << bus_width) - 1
+    ramp_segments: list[tuple] = []   # collected for the 1-LSB/tick slope check below
     for index, segment in enumerate(bus_segments):
         bus_index = int(getattr(segment, "bus_index", segment.get("bus_index") if isinstance(segment, Mapping) else 0))
         start_tick = int(getattr(segment, "start_tick", segment.get("start_tick") if isinstance(segment, Mapping) else 0))
@@ -372,11 +373,34 @@ def validate_pulse_streamer_program(
                 )
             if sel > 0 and not scan_points:
                 raise ValueError(f"bus segment {index} {sel_name} requires a scan-point table.")
+        if mode == "ramp":
+            start_coeffs = list(getattr(segment, "start_tick_coeffs", segment.get("start_tick_coeffs") if isinstance(segment, Mapping) else None) or [])
+            stop_coeffs = list(getattr(segment, "stop_tick_coeffs", segment.get("stop_tick_coeffs") if isinstance(segment, Mapping) else None) or [])
+            ramp_segments.append((index, bus_index, start_tick, stop_tick, start_coeffs, stop_coeffs,
+                                  start_value, stop_value, value_select, stop_value_select))
         bus_segment_counts[bus_index] += 1
         if bus_segment_counts[bus_index] > max_bus_segments:
             raise ValueError(f"bus {bus_index} has {bus_segment_counts[bus_index]} segments, above max_bus_segments={max_bus_segments}.")
     if bus_segments and (int(getattr(program, "loop_count", 1)) > 1 and int(getattr(program, "loop_start_index", 0)) != 0):
         raise ValueError("bus_segments do not currently support finite inner repeat brackets.")
+
+    # RAMP SLOPE: the hardware ramp engine slews AT MOST 1 LSB per tick (a sigma-delta
+    # accumulator) and SNAPS to the target at stop_tick -- a ramp steeper than 1 LSB/tick is
+    # UNREALIZABLE: on hardware it would crawl then JUMP at the end while the preview shows a
+    # smooth line.  Reject it with the needed duration.  Scanned endpoints/spans are checked
+    # per (sampled) scan point further below.
+    def _ramp_slope_check(seg_index: int, seg_bus: int, span: int, v_start: int, v_stop: int, where: str) -> None:
+        swing = abs(int(v_stop) - int(v_start))
+        if swing > max(0, int(span)):
+            raise ValueError(
+                f"bus segment {seg_index} (bus {seg_bus}{where}) ramps {int(v_start)}->{int(v_stop)} over "
+                f"{int(span)} tick(s); the DAC slews 1 LSB/tick, so this ramp needs >= {swing} ticks. "
+                "Lengthen the ramp period or use an edge step instead.")
+
+    if not scan_points:
+        for seg_index, seg_bus, seg_start, seg_stop, _, _, v0, v1, sel0, sel1 in ramp_segments:
+            if sel0 == 0 and sel1 == 0:   # scanned endpoints require scan_points (rejected above)
+                _ramp_slope_check(seg_index, seg_bus, seg_stop - seg_start, v0, v1, "")
     # Per-bus DAC DELAY -- the LITERAL per-bus delay line (a 10-bit circular buffer, one delay
     # shared by all 10 bits).  Each bus may be delayed by up to delay_depth ticks (the same
     # bounded cap as the per-channel delay).
@@ -456,6 +480,15 @@ def validate_pulse_streamer_program(
                 if effective_tick < 0 or effective_tick > tick_limit:
                     raise ValueError(f"scan point {point_index} effective tick {effective_tick} does not fit {tick_width} bits.")
                 last_effective_tick = effective_tick
+            # ramp slope per point: a scanned duration shrinks the span and a scanned DAC
+            # endpoint changes the swing -- both can make a ramp unrealizable at SOME point
+            # even when the reference point is fine.
+            for seg_index, seg_bus, seg_start, seg_stop, c0, c1, v0, v1, sel0, sel1 in ramp_segments:
+                eff_start = _apply_scan_tick(seg_start, (c0 or [0] * slot_count), point, frac_bits)
+                eff_stop = _apply_scan_tick(seg_stop, (c1 or [0] * slot_count), point, frac_bits)
+                ev0 = int(point[sel0 - 1]) if sel0 > 0 else v0
+                ev1 = int(point[sel1 - 1]) if sel1 > 0 else v1
+                _ramp_slope_check(seg_index, seg_bus, eff_stop - eff_start, ev0, ev1, f" at scan point {point_index}")
     loop_count = int(getattr(program, "loop_count", 1))
     loop_start_index = int(getattr(program, "loop_start_index", 0))
     loop_end_tick = int(getattr(program, "loop_end_tick", 0))

@@ -1113,7 +1113,8 @@ def test_pulse_table_analog_bus_modes_compile_to_runtime_bus_segments(tmp_path):
         ],
     )
     state.set_analog_bus_mode(0, "da_test", "edge", value=0)
-    state.set_analog_bus_mode(2, "da_test", "ramp", value=7)
+    # ramp swing must fit 1 LSB/tick over the 5-tick period (the hardware slew cap)
+    state.set_analog_bus_mode(2, "da_test", "ramp", value=5)
     state.apply_analog_bus_modes_to_period_states()
     saved = state.save(tmp_path / "analog_bus.json")
     loaded = na.PulseTableState.load(saved)
@@ -1123,7 +1124,7 @@ def test_pulse_table_analog_bus_modes_compile_to_runtime_bus_segments(tmp_path):
     assert loaded.analog_bus_modes["da_test"] == [
         {"mode": "edge", "value": 0},
         {"mode": "hold", "value": None},
-        {"mode": "ramp", "value": 7},
+        {"mode": "ramp", "value": 5},
     ]
     # period 1 is a HOLD after the edge-0, so it carries 0 (the ramp belongs to period 2,
     # not the preceding hold -- the within-period ramp fix).
@@ -1132,7 +1133,7 @@ def test_pulse_table_analog_bus_modes_compile_to_runtime_bus_segments(tmp_path):
     assert program.masks == [0, 0, 0, 0]
     assert program.bus_names == ["da_test"]
     # The edge-0 at period 0 is a no-op (bus already 0) so it emits nothing; the ramp now
-    # spans period 2 [10,15) from the carried-in 0 to 7 (NOT the old [0,10] across periods).
+    # spans period 2 [10,15) from the carried-in 0 to 5 (NOT the old [0,10] across periods).
     assert [segment.to_dict() for segment in (program.bus_segments or [])] == [
         {
             "bus_index": 0,
@@ -1140,7 +1141,7 @@ def test_pulse_table_analog_bus_modes_compile_to_runtime_bus_segments(tmp_path):
             "start_tick": 10,
             "stop_tick": 15,
             "start_value": 0,
-            "stop_value": 7,
+            "stop_value": 5,
             "mode": "ramp",
             "value_select": 0,
             "stop_value_select": 0,
@@ -1259,7 +1260,8 @@ def test_analog_ramp_can_scan_both_value_endpoints_round_trip():
         repeat_forever=False, loop_start_index=0, loop_end_tick=200, loop_count=1,
         slot_count=2, slot_kinds=["dac", "dac"], loop_end_slot_coeffs=[0, 0],
         tick_slot_coeffs=[[0, 0], [0, 0], [0, 0]],
-        scan_points=[[100, 900], [200, 800]], scan_coeff_frac_bits=8,
+        # swings (60, 50) fit the 70-tick ramp span at 1 LSB/tick (the hardware slew cap)
+        scan_points=[[100, 160], [200, 150]], scan_coeff_frac_bits=8,
         bus_names=["da0"],
         bus_segments=[
             RuntimeBusSegment(bus_index=0, start_tick=50, stop_tick=120, start_value=0, stop_value=0,
@@ -5363,3 +5365,124 @@ def test_sequencer_prepare_backstops_invalid_program_geometry():
                             delays={"a": -40960, "b": 40960}, delay_units={"a": "ns", "b": "ns"}, time_step_ns=20)
     with pytest.raises(ValueError, match="exceeds the del"):
         seq.prepare(st)
+
+
+# --------------------------------------------------------------------------- #
+# RTL-finding fixes (2026-06-09): U4 delay-tail-at-done, U1 ramp slope cap,
+# B1/B2 da_clk idle warning, T3 latency read-back, B3/B4/U7 geometry guards.
+# --------------------------------------------------------------------------- #
+def test_pulse_streamer_rtl_advances_delay_rings_after_done():
+    """U4: the delay rings must KEEP shifting after done so a delayed channel flushes its
+    tail (and settles low) instead of freezing at a stale -- possibly HIGH -- tap value.
+    Locks the RTL done-but-emitting branch the Python mirror/reference already contract."""
+
+    import re
+    rtl = (Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "zlc_edge_streamer.v").read_text(encoding="utf-8")
+    match = re.search(r"end else if \(done\) begin(.*?)\bend\b", rtl, re.S)
+    assert match is not None, "RTL must have the done-but-emitting branch (U4 fix)"
+    assert "bnd_delay_advance = 1'b1;" in match.group(1)
+
+
+def test_delay_tail_emits_after_done_contract():
+    """U4 contract: the Python mirror promises out[t] = in[t-d] for the WHOLE stream --
+    including the tail AFTER the final tick (which the fixed RTL now realises)."""
+
+    import fpga.pulse_streamer.host.engine_model as em
+
+    prog = na.RuntimeSequenceProgram(
+        sequence_id="tail", sequence_name="tail", clock_hz=50e6,
+        channels=["a"], ticks=[0, 10], masks=[1, 0],
+        duration=10 * 20e-9, trigger_count=0, repeat_forever=False,
+        channel_delays=[5],
+    )
+    out = em.rtl_mirror_play(prog, 40)
+    assert out[5] == 1 and out[14] == 1   # the pulse, shifted by d=5
+    assert out[15] == 0                   # tail END lands AFTER final_tick=10 (at 10+5)
+    assert all(v == 0 for v in out[15:])  # then settles low -- never frozen high
+
+
+def test_validate_rejects_ramp_steeper_than_one_lsb_per_tick():
+    """U1: the hardware DAC slews 1 LSB/tick then SNAPS at stop -- a steeper ramp is
+    unrealizable and must be rejected, not silently clipped while the preview shows a line."""
+
+    import pytest
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeBusSegment
+
+    def prog_with(seg, **kw):
+        return na.RuntimeSequenceProgram(
+            sequence_id="ramp", sequence_name="ramp", clock_hz=50e6,
+            channels=["a"], ticks=[0, 2000], masks=[1, 0],
+            duration=2000 * 20e-9, trigger_count=0, repeat_forever=False,
+            bus_names=["da"], bus_segments=[seg], **kw,
+        )
+
+    steep = prog_with(RuntimeBusSegment(0, 0, 10, 0, 1023, "ramp", "da"))
+    with pytest.raises(ValueError, match="1 LSB/tick"):
+        na.validate_pulse_streamer_program(steep, channel_count=1)
+    gentle = prog_with(RuntimeBusSegment(0, 0, 1500, 0, 1023, "ramp", "da"))
+    na.validate_pulse_streamer_program(gentle, channel_count=1)   # 1023 over 1500 ticks: fine
+
+    # scanned STOP endpoint: fine at point 0 (code 5), unrealizable at point 1 (code 1023)
+    scanned = na.RuntimeSequenceProgram(
+        sequence_id="rs", sequence_name="rs", clock_hz=50e6,
+        channels=["a"], ticks=[0, 2000], masks=[1, 0],
+        duration=2000 * 20e-9, trigger_count=0, repeat_forever=False,
+        slot_count=1, slot_kinds=["dac"], tick_slot_coeffs=[[0], [0]],
+        scan_points=[[5], [1023]],
+        bus_names=["da"],
+        bus_segments=[RuntimeBusSegment(0, 0, 10, 0, 0, "ramp", "da", 0, None, None, stop_value_select=1)],
+    )
+    with pytest.raises(ValueError, match="scan point 1"):
+        na.validate_pulse_streamer_program(scanned, channel_count=1)
+
+
+def test_compile_warns_when_dac_bus_active_but_da_clk_pin_idle():
+    """B1/B2: the DAC latches its bus on the da_clkN pin; driving a bus while that pin is
+    neither clk-enabled nor toggled silently freezes the DAC -- the compiler warns."""
+
+    import warnings as _w
+
+    channels = ["b0", "b1", "clkpin", "trig"]
+    labels = {"b0": "da_x[0]", "b1": "da_x[1]", "clkpin": "da_clk0"}
+    base = dict(
+        channels=channels, channel_labels=labels, time_step_ns=20,
+        periods=[na.PulsePeriod(1000, (0, 0, 0, 1), unit="ns")],
+        analog_bus_modes={"da_x": [{"mode": "edge", "value": 3}]},
+    )
+    with _w.catch_warnings(record=True) as got:
+        _w.simplefilter("always")
+        na.compile_runtime_program_for_payload(na.PulseTableState(**base), channels=channels, clock_hz=50e6)
+    assert any("da_clk0" in str(w.message) for w in got)
+
+    with _w.catch_warnings(record=True) as got:
+        _w.simplefilter("always")
+        na.compile_runtime_program_for_payload(
+            na.PulseTableState(**base, clk_channels=["clkpin"]), channels=channels, clock_hz=50e6)
+    assert not any("da_clk0" in str(w.message) for w in got)   # clk-enabled -> no warning
+
+
+def test_check_rtl_assumptions_guards_shipped_geometry():
+    """B3/B4/U7: geometries the shipped RTL would silently corrupt are rejected at pack
+    time (coeff assembly assumes 64 coeff bits; flags fit one 32b word; pow2 bank/edges)."""
+
+    import dataclasses
+    import pytest
+    import fpga.pulse_streamer.host.image as im
+
+    im.check_rtl_assumptions(im.StreamerParams())   # shipped geometry passes
+    with pytest.raises(ValueError, match=r"num_slots\*coeff_width"):
+        im.check_rtl_assumptions(dataclasses.replace(im.StreamerParams(), num_slots=8))
+    with pytest.raises(ValueError, match="power of two"):
+        im.check_rtl_assumptions(dataclasses.replace(im.StreamerParams(), bank_size=3000))
+    with pytest.raises(ValueError, match="flags word"):
+        im.check_rtl_assumptions(dataclasses.replace(im.StreamerParams(), bus_width=14, bus_sel_width=4))
+
+
+def test_create_project_tcl_hard_verifies_edge_bram_latency():
+    """T3: the latency-2 force must be READ BACK and hard-fail the build if it did not
+    take (a silent latency-1 BRAM would shift every edge a cycle early on hardware)."""
+
+    tcl = (Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "create_project.tcl").read_text(encoding="utf-8")
+    assert "ZLC LATENCY-CHECK FAILED" in tcl
+    assert "ZLC LATENCY-CHECK OK" in tcl
+    assert tcl.count("get_property $prop [get_ips $ip]") >= 1

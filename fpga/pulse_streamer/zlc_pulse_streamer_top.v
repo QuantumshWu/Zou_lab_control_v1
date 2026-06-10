@@ -395,10 +395,17 @@ module zlc_pulse_streamer_top #(
             bus_prog_bus <= bcur[BUS_INDEX_WIDTH-1:0];
             bus_prog_addr <= baddr[BUS_SEG_ADDR_WIDTH-1:0];
             bus_prog_start_tick <= cap[0]; bus_prog_stop_tick <= cap[1];
+            // PARAMETERIZATION GUARD: this 2-word coeff assembly assumes COEFF_BITS == 64
+            // (NUM_SLOTS=4 x COEFF_WIDTH=16).  Any other geometry silently truncates the
+            // high coeffs (cap[] words are 32b) -- the host (image.check_rtl_assumptions)
+            // REJECTS such configs at pack time; fix this assembly before changing NUM_SLOTS.
             bus_prog_start_tick_coeffs <= {cap[3][COEFF_BITS-33:0], cap[2]};
             bus_prog_stop_tick_coeffs <= {cap[5][COEFF_BITS-33:0], cap[4]};
             bus_prog_start_value <= cap[6][BUS_WIDTH-1:0];
             bus_prog_stop_value <= cap[6][2*BUS_WIDTH-1:BUS_WIDTH];
+            // PARAMETERIZATION GUARD: the flags word packs 2*BUS_WIDTH + 2 + 2*BUS_SEL_WIDTH
+            // bits into ONE 32b cap word (28 bits at the shipped 10/3 widths).  Wider buses /
+            // selects would overflow it -- also rejected host-side at pack time.
             bus_prog_mode <= cap[6][2*BUS_WIDTH+1:2*BUS_WIDTH];
             bus_prog_value_select <= cap[6][2*BUS_WIDTH+2+BUS_SEL_WIDTH-1:2*BUS_WIDTH+2];
             bus_prog_stop_value_select <= cap[6][2*BUS_WIDTH+2+2*BUS_SEL_WIDTH-1:2*BUS_WIDTH+2+BUS_SEL_WIDTH];

@@ -34,7 +34,7 @@ from typing import Mapping, Sequence
 __all__ = [
     "StreamerParams", "CtrlWords", "FpgaPartProfile", "FPGA_PARTS", "part_profile",
     "SolvedCapacity", "solve_capacity", "estimate_resources",
-    "pack_program", "unpack_program", "scan_bank_words", "region_bases",
+    "pack_program", "unpack_program", "scan_bank_words", "region_bases", "check_rtl_assumptions",
     "CMD_LOAD", "CMD_FIRE", "CMD_RESET", "CMD_SAFE",
     "STATUS_LOADED", "STATUS_RUNNING", "STATUS_DONE", "STATUS_ERROR", "STATUS_UNDERFLOW",
     "IMAGE_MAGIC",
@@ -254,6 +254,39 @@ def _unpack_coeffs(value: int, p: StreamerParams) -> list[int]:
             for j in range(p.num_slots)]
 
 
+def check_rtl_assumptions(p: StreamerParams) -> None:
+    """Reject a geometry the SHIPPED RTL cannot realise (it would synthesize but
+    silently corrupt data).  These mirror comment guards in the .v sources:
+
+    * the top's bus-loader assembles the coeff words as exactly TWO 32b caps, so
+      ``num_slots * coeff_width`` must be 64 (zlc_pulse_streamer_top.v L_EMIT);
+    * the bus flags word packs ``2*bus_width + 2 + 2*bus_sel_width`` bits into ONE
+      32b cap (same place);
+    * ``scan_addr_of`` concatenates ``{bank_bit, offset}``, so ``bank_size`` must be
+      a power of two (zlc_edge_streamer.v scan_addr_of);
+    * ``MAX_EDGES = 1 << EDGE_ADDR_WIDTH`` and the tick BRAM port is 32b wide.
+
+    Change the RTL first, then relax the matching check here."""
+    if p.num_slots * p.coeff_width != 64:
+        raise ValueError(
+            f"num_slots*coeff_width must be 64 for the shipped RTL (got {p.num_slots}*{p.coeff_width}="
+            f"{p.num_slots * p.coeff_width}); the top's 2-word coeff assembly would truncate. "
+            "Fix zlc_pulse_streamer_top.v L_EMIT before changing this geometry.")
+    flags_bits = 2 * p.bus_width + 2 + 2 * p.bus_sel_width
+    if flags_bits > 32:
+        raise ValueError(
+            f"bus flags word needs {flags_bits} bits (> 32) at bus_width={p.bus_width}, "
+            f"bus_sel_width={p.bus_sel_width}; the top packs it into ONE 32b cap word.")
+    if p.bank_size <= 0 or (p.bank_size & (p.bank_size - 1)) != 0:
+        raise ValueError(
+            f"bank_size must be a power of two (got {p.bank_size}); scan_addr_of concatenates "
+            "{bank_bit, offset} and would alias the two banks otherwise.")
+    if p.max_edges <= 0 or (p.max_edges & (p.max_edges - 1)) != 0:
+        raise ValueError(f"max_edges must be a power of two (got {p.max_edges}); MAX_EDGES = 1 << EDGE_ADDR_WIDTH.")
+    if p.tick_width != 32:
+        raise ValueError(f"tick_width must be 32 (got {p.tick_width}); the tick BRAM port and CTRL words are 32b.")
+
+
 def _bus_mode_value(mode) -> int:
     m = str(mode).strip().lower()
     return {"edge": 1, "ramp": 2}.get(m, 0) or _raise_mode(m)
@@ -301,6 +334,7 @@ def pack_program(program, params: StreamerParams | None = None) -> dict[int, int
     (the rest are streamed via :func:`scan_bank_words`); bus -> BUS region; scalars
     -> CTRL.  COMMAND/STATUS/CURSOR/BANK_READY are runtime mailbox words."""
     p = params or StreamerParams()
+    check_rtl_assumptions(p)   # hard gate: never pack for a geometry the shipped RTL corrupts
     bases = region_bases(p)
     ticks = [int(t) for t in program.ticks]
     masks = [int(m) for m in program.masks]
@@ -751,6 +785,12 @@ def load_streamer_config(path: str | Path | None = None) -> dict:
         slot_mul = int(slot_mul)
     except (TypeError, ValueError):
         slot_mul = DEFAULT_SLOT_MUL_WIDTH
+    # Surface (don't fail) RTL-assumption violations at load time -- estimation should
+    # still answer, but pack_program will hard-reject the same geometry before upload.
+    try:
+        check_rtl_assumptions(params)
+    except ValueError as exc:
+        warnings.append(f"geometry violates a shipped-RTL assumption: {exc}")
     return {
         "params": params,
         "fpga_part": str(raw.get("fpga_part", DEFAULT_FPGA_PART)),

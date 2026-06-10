@@ -380,6 +380,10 @@ module zlc_edge_streamer #(
     endfunction
 
     // scan-window address for point idx (2 banks, BANK_SIZE pow2)
+    // PARAMETERIZATION GUARD: this concatenation assumes SCAN_ADDR_WIDTH == BANK_BITS+1
+    // (i.e. BANK_SIZE is a power of two and the scan window is exactly 2 banks).  A
+    // mismatched geometry would silently alias both banks onto one window -- the host
+    // (image.check_rtl_assumptions) rejects such configs at pack time.
     function [SCAN_ADDR_WIDTH-1:0] scan_addr_of;
         input [SCAN_COUNT_WIDTH-1:0] idx;
         begin scan_addr_of = {idx[BANK_BITS], idx[BANK_BITS-1:0]}; end   // bank*BANK_SIZE + offset
@@ -788,6 +792,16 @@ module zlc_edge_streamer #(
                 if (issue) begin edge_raddr <= fetch_idx; fetch_idx <= fetch_idx + 1'b1; end
                 pend <= {pend[RD_LAT-2:0], issue};
             end
+        end else if (done) begin
+            // DONE-but-emitting: keep shifting the delay rings after the final tick so a
+            // DELAYED channel/bus flushes its remaining tail (up to delay_depth ticks) and
+            // then settles LOW -- state_mask and bus_value_active were cleared at done, so
+            // the pushes are zeros and out[t] = in[t-d] holds for the WHOLE stream, exactly
+            // the delay_line_reference / rtl_mirror_play contract.  Without this the rings
+            // FREEZE at done and a delayed channel holds a STALE (possibly HIGH) tap value
+            // until the host reacts (ms over JTAG).  A new FIRE takes the start_event branch
+            // above (resets del_wptr/del_fill), so this free-running shift is never harmful.
+            bnd_delay_advance = 1'b1;
         end
 
         // ---- dispatch the boundary's heavy affine work ONCE (a single shared MAC
