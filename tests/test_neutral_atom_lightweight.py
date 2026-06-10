@@ -1560,9 +1560,10 @@ def test_edge_streamer_rtl_mirror_matches_reference():
 
 def test_edge_streamer_rtl_has_proven_structure():
     """Lock the final RTL engine to the proven design so it cannot silently drift
-    from rtl_mirror_play: FIFO_DEPTH(=RD_LAT+1) shadow seed, parallel tick/coeff/
-    mask edge read, 2-bank streaming with bank_ready stall + cursor, bus LUTRAM,
-    and no leftover WIP/do-not-build marker."""
+    from rtl_mirror_play: a PIPE(=RD_LAT+1)-deep in-flight pipeline (the registered
+    edge_raddr adds a cycle before the BRAM), a FIFO_DEPTH(=RD_LAT+2) shadow seed,
+    parallel tick/coeff/mask edge read, 2-bank streaming with bank_ready stall +
+    cursor, bus LUTRAM, and no leftover WIP/do-not-build marker."""
 
     import pathlib
     src = pathlib.Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "zlc_edge_streamer.v"
@@ -1570,12 +1571,20 @@ def test_edge_streamer_rtl_has_proven_structure():
     # one clean module, no abandoned draft marker
     assert "module zlc_edge_streamer" in text and text.count("endmodule") == 1
     assert "WIP" not in text and "do-not-build" not in text.lower()
-    # depth-(latency+1) prefetch FIFO + the issue-occupancy guard
+    # in-flight pipeline tracks the FULL issue->data latency PIPE = RD_LAT+1 (the extra
+    # cycle is the registered edge_raddr).  landed = pend[PIPE-1]; pend shifts PIPE-wide.
+    # The earlier 2-stage pend (RD_LAT only) fired `landed` a cycle early and dropped a
+    # streamed edge -- the emCCD "40 ms / e7 vanished" hardware bug.
     assert "RD_LAT" in text and "FIFO_DEPTH" in text
-    assert "pend <= {pend[RD_LAT-2:0], issue}" in text
+    assert "PIPE = RD_LAT + 1" in text
+    assert "FIFO_DEPTH = RD_LAT + 2" in text
+    assert "landed = pend[PIPE-1]" in text
+    assert "pend <= {pend[PIPE-2:0], issue}" in text
     assert "nv_after_fire" in text and "clamp3" in text
-    # 8 boundary shadows (e0..e3 + ls0..ls3) -> FIFO_DEPTH-shadow seed
-    for sh in ("sh_e0_t", "sh_e1_t", "sh_e2_t", "sh_e3_t", "sh_ls0_t", "sh_ls1_t", "sh_ls2_t", "sh_ls3_t"):
+    # 10 boundary shadows (e0..e4 + ls0..ls4) -> FIFO_DEPTH(=4)-shadow seed (one more than
+    # the old RD_LAT+1=3, because FIFO_DEPTH grew to RD_LAT+2 to keep 1-tick playback).
+    for sh in ("sh_e0_t", "sh_e1_t", "sh_e2_t", "sh_e3_t", "sh_e4_t",
+               "sh_ls0_t", "sh_ls1_t", "sh_ls2_t", "sh_ls3_t", "sh_ls4_t"):
         assert sh in text, sh
     assert "seed_from_edge0" in text
     # 3 PARALLEL edge BRAMs read in lockstep (whole edge per access)

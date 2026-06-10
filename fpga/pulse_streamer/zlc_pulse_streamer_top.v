@@ -463,7 +463,10 @@ module zlc_pulse_streamer_top #(
         .BUS_COUNT(BUS_COUNT), .BUS_INDEX_WIDTH(BUS_INDEX_WIDTH), .BUS_WIDTH(BUS_WIDTH),
         .BUS_SEG_ADDR_WIDTH(BUS_SEG_ADDR_WIDTH), .BUS_SEL_WIDTH(BUS_SEL_WIDTH),
         .DELAY_DEPTH(DELAY_DEPTH),
-        .RD_LAT(2), .FIFO_DEPTH(3)
+        // RD_LAT = the forced edge-BRAM read latency.  FIFO_DEPTH = RD_LAT + 2: the prefetch
+        // pipeline is RD_LAT+1 deep (the registered edge_raddr adds a cycle before the BRAM),
+        // so sustaining 1-tick playback needs a resident head + (RD_LAT+1) in-flight slots.
+        .RD_LAT(2), .FIFO_DEPTH(4)
     ) zlc_engine_i (
         .clk(axi_clk), .reset(eng_reset), .start(eng_start),
         .prog_count(ctrl_reg[C_PROG_COUNT][EDGE_ADDR_WIDTH:0]),

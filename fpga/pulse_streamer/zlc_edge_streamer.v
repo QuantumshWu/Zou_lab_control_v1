@@ -75,7 +75,14 @@ module zlc_edge_streamer #(
     parameter integer DELAY_DEPTH = 2048,       // delay-line buffer depth in ticks (~40us @ 20ns);
                                                 // bounded cap, covers +/-15us after the global shift G
     parameter integer RD_LAT = 2,               // edge-BRAM read latency (forced)
-    parameter integer FIFO_DEPTH = 3,           // == RD_LAT + 1 for 1-tick spacing
+    // The PREFETCH pipeline from `issue` to data-valid is RD_LAT + 1 (the extra cycle is
+    // the registered `edge_raddr`: an issued read only reaches the BRAM address port the
+    // NEXT cycle, then the BRAM adds RD_LAT).  For sustained 1-tick (20 ns) playback the
+    // FIFO must hold a resident head PLUS one in-flight read per pipeline stage, i.e.
+    // FIFO_DEPTH = (RD_LAT+1) + 1 = RD_LAT + 2.  (The earlier value RD_LAT+1 under-counted
+    // the edge_raddr stage: `landed` fired a cycle early, the append latched a stale bus
+    // word, and a streamed edge was dropped -- the emCCD "40 ms / e7 vanished" bug.)
+    parameter integer FIFO_DEPTH = RD_LAT + 2,
     parameter integer ARM_SETTLE = 4,           // generous one-time arm read settle
     // delay-tick field width; DECLARED HERE (not as a body localparam) so the port
     // declarations below can use it.  A body localparam is referenced-before-declaration,
@@ -215,12 +222,14 @@ module zlc_edge_streamer #(
     reg [31:0] loops_remaining = 32'd1;
 
     // shadows latched at arm time (BRAM pre-reads while reset is asserted)
-    reg [TICK_WIDTH-1:0]  sh_e0_t, sh_e1_t, sh_e2_t, sh_e3_t;
-    reg [COEFF_BITS-1:0]  sh_e0_c, sh_e1_c, sh_e2_c, sh_e3_c;
-    reg [CHANNEL_COUNT-1:0] sh_e0_m, sh_e1_m, sh_e2_m, sh_e3_m;
-    reg [TICK_WIDTH-1:0]  sh_ls0_t, sh_ls1_t, sh_ls2_t, sh_ls3_t;
-    reg [COEFF_BITS-1:0]  sh_ls0_c, sh_ls1_c, sh_ls2_c, sh_ls3_c;
-    reg [CHANNEL_COUNT-1:0] sh_ls0_m, sh_ls1_m, sh_ls2_m, sh_ls3_m;
+    // FIFO_DEPTH(=4) resident shadows are seeded at every boundary, so we pre-read that
+    // many edges (e0..e4) and loop-start edges (ls0..ls4) -- one more than the old 4.
+    reg [TICK_WIDTH-1:0]  sh_e0_t, sh_e1_t, sh_e2_t, sh_e3_t, sh_e4_t;
+    reg [COEFF_BITS-1:0]  sh_e0_c, sh_e1_c, sh_e2_c, sh_e3_c, sh_e4_c;
+    reg [CHANNEL_COUNT-1:0] sh_e0_m, sh_e1_m, sh_e2_m, sh_e3_m, sh_e4_m;
+    reg [TICK_WIDTH-1:0]  sh_ls0_t, sh_ls1_t, sh_ls2_t, sh_ls3_t, sh_ls4_t;
+    reg [COEFF_BITS-1:0]  sh_ls0_c, sh_ls1_c, sh_ls2_c, sh_ls3_c, sh_ls4_c;
+    reg [CHANNEL_COUNT-1:0] sh_ls0_m, sh_ls1_m, sh_ls2_m, sh_ls3_m, sh_ls4_m;
     reg [TICK_WIDTH-1:0]  sh_final_t;
     reg [COEFF_BITS-1:0]  sh_final_c;
     reg [SLOT_BITS-1:0] scan_first_values;
@@ -231,7 +240,15 @@ module zlc_edge_streamer #(
     reg [CHANNEL_COUNT-1:0] arm_m [0:FIFO_DEPTH-1];
     reg [2:0] arm_nv;                         // valid arm entries (0..FIFO_DEPTH)
     reg [EDGE_ADDR_WIDTH:0] fetch_idx;        // next edge index to read
-    reg [RD_LAT-1:0] pend;                    // in-flight read markers (1 bit/latency-stage)
+    // In-flight read markers, ONE BIT PER PIPELINE STAGE from `issue` to data-valid.  The
+    // true latency is RD_LAT+1, NOT RD_LAT: `edge_raddr` is a REGISTER (issue decides at
+    // cycle T, the address only reaches the BRAM at T+1), then the BRAM adds RD_LAT.  So a
+    // read issued at T lands (edge_*_rdata valid) at T+RD_LAT+1.  Tracking only RD_LAT made
+    // `landed` fire ONE CYCLE EARLY, so when two reads landed back-to-back the append
+    // latched the STALE (previous) bus word twice and silently dropped the next edge -- the
+    // "second emCCD pulse is 40 ms / e7 vanished" hardware bug (reproduced in real-IP xsim).
+    localparam integer PIPE = RD_LAT + 1;     // issue -> data-valid latency (incl. edge_raddr reg)
+    reg [PIPE-1:0] pend;                       // in-flight read markers (1 bit/pipeline-stage)
 
     // ----- bus runtime --------------------------------------------------------
     reg [BUS_WIDTH-1:0] bus_value_active [0:BUS_COUNT-1];
@@ -650,23 +667,25 @@ module zlc_edge_streamer #(
         input [SLOT_BITS-1:0] sv;
         input [EDGE_ADDR_WIDTH:0] cnt;
         begin
-            pend <= {RD_LAT{1'b0}};
+            pend <= {PIPE{1'b0}};
             if (cnt != 0 && zlc_effective_tick(sh_e0_t, sh_e0_c, sv) == {TICK_WIDTH{1'b0}}) begin
                 state_mask <= sh_e0_m; time_count <= {{(TICK_WIDTH-1){1'b0}},1'b1};
                 edge_index <= {{EDGE_ADDR_WIDTH{1'b0}},1'b1};
                 arm_t[0]<=sh_e1_t; arm_c[0]<=sh_e1_c; arm_m[0]<=sh_e1_m;
                 arm_t[1]<=sh_e2_t; arm_c[1]<=sh_e2_c; arm_m[1]<=sh_e2_m;
                 arm_t[2]<=sh_e3_t; arm_c[2]<=sh_e3_c; arm_m[2]<=sh_e3_m;
+                arm_t[3]<=sh_e4_t; arm_c[3]<=sh_e4_c; arm_m[3]<=sh_e4_m;
                 arm_nv <= clamp3(cnt - 1'b1);
-                fetch_idx <= {{(EDGE_ADDR_WIDTH-2){1'b0}},3'd4}; edge_raddr <= {{(EDGE_ADDR_WIDTH-2){1'b0}},3'd4};
+                fetch_idx <= {{(EDGE_ADDR_WIDTH-2){1'b0}},3'd5}; edge_raddr <= {{(EDGE_ADDR_WIDTH-2){1'b0}},3'd5};
             end else begin
                 state_mask <= {CHANNEL_COUNT{1'b0}}; time_count <= {TICK_WIDTH{1'b0}};
                 edge_index <= {(EDGE_ADDR_WIDTH+1){1'b0}};
                 arm_t[0]<=sh_e0_t; arm_c[0]<=sh_e0_c; arm_m[0]<=sh_e0_m;
                 arm_t[1]<=sh_e1_t; arm_c[1]<=sh_e1_c; arm_m[1]<=sh_e1_m;
                 arm_t[2]<=sh_e2_t; arm_c[2]<=sh_e2_c; arm_m[2]<=sh_e2_m;
+                arm_t[3]<=sh_e3_t; arm_c[3]<=sh_e3_c; arm_m[3]<=sh_e3_m;
                 arm_nv <= clamp3(cnt);
-                fetch_idx <= {{(EDGE_ADDR_WIDTH-1){1'b0}},2'd3}; edge_raddr <= {{(EDGE_ADDR_WIDTH-1){1'b0}},2'd3};
+                fetch_idx <= {{(EDGE_ADDR_WIDTH-2){1'b0}},3'd4}; edge_raddr <= {{(EDGE_ADDR_WIDTH-2){1'b0}},3'd4};
             end
         end
     endtask
@@ -682,7 +701,9 @@ module zlc_edge_streamer #(
     reg do_fire;
     reg issue;
     reg [2:0] nv_after_fire;
+    reg [2:0] inflight;        // popcount(pend): reads owned by the read pipeline this cycle
     integer k;
+    integer pk;
 
     // Boundary work-request flags (blocking, set inside the playback if-else chain,
     // consumed ONCE after it).  This makes the expensive affine tasks -- bus tick,
@@ -729,7 +750,7 @@ module zlc_edge_streamer #(
         if (reset_sync) begin
             running <= 1'b0; done <= 1'b0; underflow <= 1'b0;
             state_mask <= {CHANNEL_COUNT{1'b0}};
-            arm_nv <= 3'd0; pend <= {RD_LAT{1'b0}};
+            arm_nv <= 3'd0; pend <= {PIPE{1'b0}};
             zlc_bus_clear_runtime();
             zlc_delay_clear_runtime();
             // --- settle-based ARM read sequence (no timing pressure) ---
@@ -749,21 +770,27 @@ module zlc_edge_streamer #(
             end else if (arm_wait != 0) begin
                 arm_wait <= arm_wait - 1'b1;
             end else begin
+                // Pre-read FIFO_DEPTH(=5 shadows: e0..e4) edges + the loop-start window
+                // (ls0..ls4) + final + scan0.  ARM_SETTLE (>= PIPE) cycles between reads, so
+                // these latch the SETTLED bus -- the streaming-prefetch off-by-one cannot
+                // touch the seed shadows.  Steps: 0-4 e0..e4, 5-9 ls0..ls4, 10 final, 11 scan0.
                 case (arm_step)
                     4'd0: begin sh_e0_t<=edge_tick_rdata; sh_e0_c<=edge_coeff_rdata; sh_e0_m<=edge_mask_rdata; edge_raddr<={{(EDGE_ADDR_WIDTH-1){1'b0}},1'b1}; end
                     4'd1: begin sh_e1_t<=edge_tick_rdata; sh_e1_c<=edge_coeff_rdata; sh_e1_m<=edge_mask_rdata; edge_raddr<={{(EDGE_ADDR_WIDTH-2){1'b0}},2'd2}; end
                     4'd2: begin sh_e2_t<=edge_tick_rdata; sh_e2_c<=edge_coeff_rdata; sh_e2_m<=edge_mask_rdata; edge_raddr<={{(EDGE_ADDR_WIDTH-2){1'b0}},2'd3}; end
-                    4'd3: begin sh_e3_t<=edge_tick_rdata; sh_e3_c<=edge_coeff_rdata; sh_e3_m<=edge_mask_rdata; edge_raddr<=loop_start_addr; end
-                    4'd4: begin sh_ls0_t<=edge_tick_rdata; sh_ls0_c<=edge_coeff_rdata; sh_ls0_m<=edge_mask_rdata; edge_raddr<=loop_start_addr+1'b1; end
-                    4'd5: begin sh_ls1_t<=edge_tick_rdata; sh_ls1_c<=edge_coeff_rdata; sh_ls1_m<=edge_mask_rdata; edge_raddr<=loop_start_addr+2'd2; end
-                    4'd6: begin sh_ls2_t<=edge_tick_rdata; sh_ls2_c<=edge_coeff_rdata; sh_ls2_m<=edge_mask_rdata; edge_raddr<=loop_start_addr+2'd3; end
-                    4'd7: begin sh_ls3_t<=edge_tick_rdata; sh_ls3_c<=edge_coeff_rdata; sh_ls3_m<=edge_mask_rdata;
+                    4'd3: begin sh_e3_t<=edge_tick_rdata; sh_e3_c<=edge_coeff_rdata; sh_e3_m<=edge_mask_rdata; edge_raddr<={{(EDGE_ADDR_WIDTH-3){1'b0}},3'd4}; end
+                    4'd4: begin sh_e4_t<=edge_tick_rdata; sh_e4_c<=edge_coeff_rdata; sh_e4_m<=edge_mask_rdata; edge_raddr<=loop_start_addr; end
+                    4'd5: begin sh_ls0_t<=edge_tick_rdata; sh_ls0_c<=edge_coeff_rdata; sh_ls0_m<=edge_mask_rdata; edge_raddr<=loop_start_addr+1'b1; end
+                    4'd6: begin sh_ls1_t<=edge_tick_rdata; sh_ls1_c<=edge_coeff_rdata; sh_ls1_m<=edge_mask_rdata; edge_raddr<=loop_start_addr+2'd2; end
+                    4'd7: begin sh_ls2_t<=edge_tick_rdata; sh_ls2_c<=edge_coeff_rdata; sh_ls2_m<=edge_mask_rdata; edge_raddr<=loop_start_addr+2'd3; end
+                    4'd8: begin sh_ls3_t<=edge_tick_rdata; sh_ls3_c<=edge_coeff_rdata; sh_ls3_m<=edge_mask_rdata; edge_raddr<=loop_start_addr+3'd4; end
+                    4'd9: begin sh_ls4_t<=edge_tick_rdata; sh_ls4_c<=edge_coeff_rdata; sh_ls4_m<=edge_mask_rdata;
                                 edge_raddr<=(prog_count==0)?{EDGE_ADDR_WIDTH{1'b0}}:(prog_count[EDGE_ADDR_WIDTH-1:0]-1'b1); end
-                    4'd8: begin sh_final_t<=edge_tick_rdata; sh_final_c<=edge_coeff_rdata; scan_raddr<={SCAN_ADDR_WIDTH{1'b0}}; end
-                    4'd9: begin scan_first_values<=(scan_enable && scan_count!=0)?scan_rdata:{SLOT_BITS{1'b0}}; end
+                    4'd10: begin sh_final_t<=edge_tick_rdata; sh_final_c<=edge_coeff_rdata; scan_raddr<={SCAN_ADDR_WIDTH{1'b0}}; end
+                    4'd11: begin scan_first_values<=(scan_enable && scan_count!=0)?scan_rdata:{SLOT_BITS{1'b0}}; end
                     default: ;
                 endcase
-                if (arm_step < 4'd9) begin arm_step <= arm_step + 1'b1; arm_wait <= ARM_SETTLE[3:0]; end
+                if (arm_step < 4'd11) begin arm_step <= arm_step + 1'b1; arm_wait <= ARM_SETTLE[3:0]; end
                 else begin   // wrap: re-arm continuously while reset is held (see above)
                     arm_step <= 4'd0; edge_raddr <= {EDGE_ADDR_WIDTH{1'b0}}; arm_wait <= ARM_SETTLE[3:0];
                 end
@@ -795,7 +822,7 @@ module zlc_edge_streamer #(
             bnd_count = prog_count;   // FIRE: active_count <= prog_count not yet committed
             bnd_bus_tick = 1'b1; bnd_bus_reinit = 1'b1; bnd_seed = 1'b1;
         end else if (running) begin
-            landed = pend[RD_LAT-1];
+            landed = pend[PIPE-1];   // data valid PIPE (=RD_LAT+1) cycles after issue
             // every RUNNING output tick pushes the undelayed state_mask + bus values into the
             // delay rings (the literal delay line); the ring read d ticks ago IS the delayed
             // output.  A circular buffer needs no frame seam / skip counter -- it shifts the
@@ -808,9 +835,10 @@ module zlc_edge_streamer #(
                 arm_t[0]<=sh_ls1_t; arm_c[0]<=sh_ls1_c; arm_m[0]<=sh_ls1_m;
                 arm_t[1]<=sh_ls2_t; arm_c[1]<=sh_ls2_c; arm_m[1]<=sh_ls2_m;
                 arm_t[2]<=sh_ls3_t; arm_c[2]<=sh_ls3_c; arm_m[2]<=sh_ls3_m;
+                arm_t[3]<=sh_ls4_t; arm_c[3]<=sh_ls4_c; arm_m[3]<=sh_ls4_m;
                 arm_nv <= clamp3(active_count - ({1'b0,loop_start_addr}+1'b1));
-                fetch_idx <= {1'b0,loop_start_addr}+3'd4; edge_raddr <= loop_start_addr+3'd4;
-                pend <= {RD_LAT{1'b0}};
+                fetch_idx <= {1'b0,loop_start_addr}+3'd5; edge_raddr <= loop_start_addr+3'd5;
+                pend <= {PIPE{1'b0}};
                 bnd_bus_tick = 1'b1; bnd_bus_reinit = 1'b1; bnd_slots = slot_active;  // re(start) bus, keep slots
             end else if (time_count >= final_tick) begin
                 if (scan_enable_active && (scan_point_index+1'b1) < active_scan_count) begin
@@ -838,9 +866,10 @@ module zlc_edge_streamer #(
                         arm_t[0]<=sh_ls1_t; arm_c[0]<=sh_ls1_c; arm_m[0]<=sh_ls1_m;
                         arm_t[1]<=sh_ls2_t; arm_c[1]<=sh_ls2_c; arm_m[1]<=sh_ls2_m;
                         arm_t[2]<=sh_ls3_t; arm_c[2]<=sh_ls3_c; arm_m[2]<=sh_ls3_m;
+                        arm_t[3]<=sh_ls4_t; arm_c[3]<=sh_ls4_c; arm_m[3]<=sh_ls4_m;
                         arm_nv <= clamp3(active_count - ({1'b0,loop_start_addr}+1'b1));
-                        fetch_idx <= {1'b0,loop_start_addr}+3'd4; edge_raddr <= loop_start_addr+3'd4;
-                        pend <= {RD_LAT{1'b0}};
+                        fetch_idx <= {1'b0,loop_start_addr}+3'd5; edge_raddr <= loop_start_addr+3'd5;
+                        pend <= {PIPE{1'b0}};
                         bnd_bus_tick = 1'b1; bnd_bus_reinit = 1'b1; bnd_slots = slot_active;
                     // Otherwise restart the sweep at point 0.  For a STREAMING scan the
                     // host has overwritten bank 0 with a later chunk, so wait until it
@@ -894,12 +923,18 @@ module zlc_edge_streamer #(
                 end else begin
                     arm_nv <= nv_after_fire;
                 end
-                // --- issue a read iff resident + still-in-flight is below depth ---
-                // resident-after = nv_after_fire + landed ; still-in-flight (RD_LAT=2) = pend[0].
-                issue = ((nv_after_fire + (landed ? 1'b1 : 1'b0) + pend[0]) < FIFO_DEPTH[2:0])
+                // --- issue a read iff the pipeline+FIFO would not overflow ---
+                // Every read the pipeline OWNS (resident shadows + ALL in-flight reads that
+                // will still append) must have a landing slot: owned_next = nv_after_fire +
+                // popcount(pend) + issue <= FIFO_DEPTH.  popcount(pend) spans the full PIPE
+                // stages (the previous code summed only landed+pend[0], which silently
+                // assumed PIPE==2 and under-counted in-flight reads once PIPE grew to 3).
+                inflight = {3{1'b0}};
+                for (pk = 0; pk < PIPE; pk = pk + 1) inflight = inflight + {2'b0, pend[pk]};
+                issue = ((nv_after_fire + inflight) < FIFO_DEPTH[2:0])
                         && (fetch_idx < active_count);
                 if (issue) begin edge_raddr <= fetch_idx; fetch_idx <= fetch_idx + 1'b1; end
-                pend <= {pend[RD_LAT-2:0], issue};
+                pend <= {pend[PIPE-2:0], issue};
             end
         end else if (done) begin
             // DONE-but-emitting: keep shifting the delay rings after the final tick so a
