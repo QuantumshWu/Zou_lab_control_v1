@@ -76,7 +76,12 @@ module zlc_edge_streamer #(
                                                 // bounded cap, covers +/-15us after the global shift G
     parameter integer RD_LAT = 2,               // edge-BRAM read latency (forced)
     parameter integer FIFO_DEPTH = 3,           // == RD_LAT + 1 for 1-tick spacing
-    parameter integer ARM_SETTLE = 4            // generous one-time arm read settle
+    parameter integer ARM_SETTLE = 4,           // generous one-time arm read settle
+    // delay-tick field width; DECLARED HERE (not as a body localparam) so the port
+    // declarations below can use it.  A body localparam is referenced-before-declaration,
+    // which the Vivado synth frontend only warns about but STRICT tools (xsim, other FPGA
+    // flows) reject -- a portability hazard across "different FPGA" builds.
+    parameter integer DELAY_TICK_WIDTH = $clog2(DELAY_DEPTH + 1)
 )(
     input  wire clk,
     input  wire reset,
@@ -180,7 +185,8 @@ module zlc_edge_streamer #(
     // holds a delay in [0, DELAY_DEPTH]; DELAY_ADDR_WIDTH indexes the ring.
     localparam integer DELAY_SLOTS = DELAY_DEPTH + 1;
     localparam integer DELAY_ADDR_WIDTH = $clog2(DELAY_SLOTS);
-    localparam integer DELAY_TICK_WIDTH = $clog2(DELAY_DEPTH + 1);
+    // DELAY_TICK_WIDTH is now a module parameter (declared before the ports) so the port
+    // widths can use it without a referenced-before-declaration error on strict tools.
 
     // ----- bus segment tables: LUTRAM (per-tick combinatorial read) -----------
     (* ram_style = "distributed" *) reg [TICK_WIDTH-1:0] bus_start_tick_mem [0:MAX_BUS_SEGMENT_ROWS-1];

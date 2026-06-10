@@ -5499,37 +5499,41 @@ def test_scan_frame_shorter_than_read_latency_is_rejected():
     validate_pulse_streamer_program(ok, channel_count=2)
 
 
-def test_top_delays_tick_read_to_align_with_asymmetric_coeff_mask():
-    """REAL-HARDWARE ROOT CAUSE (emCCD 2nd pulse 40 ms; with the old `==` it instead
-    DROPPED the pulse -> "only the first pulse").  The TICK edge BRAM is SYMMETRIC
-    (32/32); COEFF and MASK are ASYMMETRIC (32-write / 64-WIDE-read), whose width
-    conversion makes their doutb arrive ONE CYCLE LATER than the tick.  The streaming
-    prefetch captures all three at the same RD_LAT landed cycle, so the faster tick was
-    captured one fetch AHEAD of mask/coeff -> an edge paired with a stale mask -> the
-    off-edge was effectively dropped -> 40 ms.  Verified against the real uploaded edge
-    table.  FIX: delay the TICK by one register so it lands with the slower coeff/mask
-    (asymmetric reads are never faster than symmetric, so the tick is always the one to
-    delay).  Lock it."""
-    import re
+def test_top_feeds_all_three_edge_reads_directly_no_skew_register():
+    """The three edge BRAMs (tick / coeff / mask) are read in lockstep and fed to the
+    engine DIRECTLY -- no realignment register on ANY of them.  There is NO read-latency
+    skew to compensate: each port B is symmetric WITHIN ITSELF (tick 32/32, coeff/mask
+    64/64), so all three read at the SAME latency.  This was MEASURED on the actual
+    synthesised blk_mem_gen IP netlists (xsim, fpga/pulse_streamer/sim/tb_bram_lat.v:
+    tick latency == mask latency == 2), and the real zlc_edge_streamer driven by those
+    real IPs plays the uploaded edge table CORRECTLY end-to-end (tb_real_engine.v: two
+    20 ms emCCD pulses).  Commits 2a2c0d1 (delay coeff/mask) and e92a78a (delay tick)
+    "fixed" a skew that does not exist -- e92a78a's register actually CREATES a tick>mask
+    skew that corrupts streamed edges in sim (tb_real_e92.v).  Both are reverted; lock the
+    direct (register-free) wiring so neither is re-introduced.  The genuine emCCD 40 ms
+    root cause was the stale-active_count FIRE seed -- see
+    test_pulse_streamer_rtl_fire_seed_uses_fresh_prog_count_not_stale_reg."""
     top = (Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
-    assert "edge_tick_rdata_q" in top, "tick alignment register must exist"
-    assert re.search(r"edge_tick_rdata_q\s*<=\s*edge_tick_rdata\b", top)
-    # the ENGINE is fed the DELAYED tick and the DIRECT coeff/mask (mutually coherent)
-    assert ".edge_tick_rdata(edge_tick_rdata_q)" in top
+    # NO realignment registers on any edge read
+    assert "edge_tick_rdata_q" not in top, "e92a78a tick register must be reverted (no skew exists)"
+    assert "edge_coeff_rdata_q" not in top and "edge_mask_rdata_q" not in top, \
+        "2a2c0d1 coeff/mask registers must be reverted"
+    # all three reads fed to the engine DIRECTLY
+    assert ".edge_tick_rdata(edge_tick_rdata)" in top
     assert ".edge_coeff_rdata(edge_coeff_rdata_w[" in top
     assert ".edge_mask_rdata(edge_mask_rdata_w[" in top
-    # the WRONG-direction 2a2c0d1 wiring (delaying coeff/mask) must be gone
-    assert "edge_coeff_rdata_q" not in top and "edge_mask_rdata_q" not in top
 
 
-def test_streaming_prefetch_tick_skew_reproduces_then_fixes_40ms():
-    """Faithful register-level proof of the bug + fix, built from the ACTUAL uploaded edge
-    table from the user's hardware (emCCD = bit 11; e6=trap+emCCD on, e7=probe+trap off).
-    Models edge_raddr as an NBA register feeding the three BRAMs at INDEPENDENT latencies
-    (the layer the abstract mirror cannot see).  With the asymmetric mask/coeff one cycle
-    BEHIND the tick (tick_lat=2, mask_lat=3) the streaming capture drops the off-edge ->
-    emCCD stays on e6->e8 = 40 ms.  Delaying the tick to match (tick_lat=mask_lat=3) gives
-    the correct 20 ms pulse e6->e7."""
+def test_streaming_prefetch_plays_uploaded_table_correctly_at_aligned_latency():
+    """Faithful register-level proof that, at the REAL edge-BRAM latency (all three reads
+    ALIGNED -- measured tick_lat == mask_lat == 2 on the actual synthesised IP netlists,
+    fpga/pulse_streamer/sim/tb_bram_lat.v), the streaming prefetch plays the user's EXACT
+    uploaded edge table CORRECTLY: emCCD on e6, off e7 -> two 20 ms pulses, NOT 40 ms.
+    Models edge_raddr as an NBA register feeding the three BRAMs at independent latencies
+    so a hypothetical skew CAN be expressed -- and confirms the aligned case is correct.
+    (The genuine 40 ms root cause was the stale-active_count FIRE seed, fixed in 8ff451c
+    and locked by test_pulse_streamer_rtl_fire_seed_uses_fresh_prog_count_not_stale_reg;
+    a read-latency skew was a misdiagnosis -- 2a2c0d1/e92a78a reverted.)"""
     RD_LAT, FIFO_DEPTH = 2, 3
     # exact uploaded table (scaled /500), emCCD = bit 11
     S = 500
@@ -5579,13 +5583,13 @@ def test_streaming_prefetch_tick_skew_reproduces_then_fixes_40ms():
             if b!=pr: e.append((("on" if b else "off"),t)); pr=b
         return e
 
-    e6, e7, e8 = ticks[6], ticks[7], ticks[8]
-    bug = emccd_edges(play(tick_lat=2, mask_lat=3))   # real hw: mask/coeff lag tick
-    assert ("on", e6) in bug and ("off", e8) in bug and ("off", e7) not in bug, \
-        f"skew must reproduce the 40ms (on e6, off e8, e7 dropped), got {bug}"
-    fixed = emccd_edges(play(tick_lat=3, mask_lat=3))  # fix: tick delayed to match
-    assert ("on", e6) in fixed and ("off", e7) in fixed, \
-        f"aligned reads must give the correct 20ms pulse (on e6, off e7), got {fixed}"
+    e6, e7 = ticks[6], ticks[7]
+    # REAL hardware: all three edge reads ALIGNED at latency 2 (measured on the real IPs).
+    aligned = emccd_edges(play(tick_lat=2, mask_lat=2))
+    assert ("on", e6) in aligned and ("off", e7) in aligned, \
+        f"aligned reads must give the correct 20ms pulse (on e6, off e7), got {aligned}"
+    # and the off-edge e7 is NOT dropped (no spurious extension to e8)
+    assert ("off", ticks[8]) not in aligned, f"e7 off-edge must fire (no 40ms), got {aligned}"
 
 
 
