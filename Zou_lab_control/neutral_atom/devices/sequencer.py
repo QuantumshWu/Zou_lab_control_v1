@@ -879,7 +879,16 @@ class SequencerService:
         # channel_delays beyond DELAY_DEPTH).  Local import breaks the fpga_pulse_streamer <->
         # sequencer import cycle.
         from .fpga_pulse_streamer import validate_pulse_streamer_program
-        validate_pulse_streamer_program(program, channel_count=len(self.channels))
+        # Scan points STREAM through the 2-bank window, so their count is UNBOUNDED --
+        # pass the program's own count (like the AXI backend does), never the resident
+        # window size, and sample the per-point monotonicity sweep so a huge scan does
+        # not stall prepare().
+        validate_pulse_streamer_program(
+            program,
+            channel_count=len(self.channels),
+            max_scan_points=max(1, len(program.scan_points or [])),
+            max_validated_scan_points=4096,
+        )
         with self._lock:
             cached = (
                 self.cache_prepared

@@ -1367,18 +1367,16 @@ def _analog_bus_value_at_tick(plan: Sequence[Mapping[str, object]], starts: Sequ
     for start_tick, stop_tick, in_value, out_value, mode in levels:
         if start_tick <= tick < stop_tick:
             if mode == "ramp" and stop_tick > start_tick:
-                fraction = (tick - start_tick) / (stop_tick - start_tick)
-                ideal = int(round(in_value + (out_value - in_value) * fraction))
-                # HARDWARE SLEW CAP: the DAC ramp engine moves at most 1 LSB per tick from
-                # the carried-in value, then SNAPS to the target at stop_tick.  An over-steep
-                # ramp is allowed (the user accepts the jagged result) -- so the preview must
-                # draw the TRUE trajectory (crawl at 1 LSB/tick, jump at the period end), not
-                # an ideal line the hardware cannot produce.  For |delta| <= span this clamp
-                # never engages and the ideal interpolation is unchanged.
-                elapsed = int(tick) - int(start_tick)
-                if out_value >= in_value:
-                    return min(ideal, int(in_value) + elapsed)
-                return max(ideal, int(in_value) - elapsed)
+                # The hardware ramp engine is a Bresenham stepper: after k ticks it has
+                # moved floor(k*|delta|/span) codes from the carried-in value (multiple
+                # LSBs per tick for steep ramps), landing exactly on the target at
+                # stop_tick.  The preview draws that same integer staircase -- works
+                # unchanged in this SIGNED user domain (the offset cancels in delta).
+                span = int(stop_tick) - int(start_tick)
+                delta = abs(int(out_value) - int(in_value))
+                k = int(tick) - int(start_tick)
+                moves = min(delta, (k * delta) // span)
+                return int(in_value) + (moves if out_value >= in_value else -moves)
             return int(out_value)
     # at/after the table end the bus holds its final level
     if tick >= levels[-1][1]:
@@ -1388,7 +1386,8 @@ def _analog_bus_value_at_tick(plan: Sequence[Mapping[str, object]], starts: Sequ
 
 def analog_bus_ticks(plan: Sequence[Mapping[str, object]], starts: Sequence[int]) -> list[int]:
     """Breakpoint ticks for drawing/expanding the bus waveform: every period boundary
-    plus, inside each ramp period, one tick per 1-LSB DAC step (a monotone staircase)."""
+    plus sample ticks inside each ramp period (at most one per tick -- a steep Bresenham
+    ramp moves multiple LSBs per tick, so per-tick sampling captures every level)."""
 
     levels = bus_period_levels(plan, starts)
     ticks = {0}

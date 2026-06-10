@@ -242,7 +242,17 @@ module zlc_edge_streamer #(
     reg [TICK_WIDTH-1:0] bus_ramp_start_tick [0:BUS_COUNT-1];
     reg [TICK_WIDTH-1:0] bus_ramp_stop_tick [0:BUS_COUNT-1];
     reg [BUS_WIDTH-1:0] bus_ramp_target [0:BUS_COUNT-1];
-    reg [BUS_WIDTH:0] bus_ramp_delta [0:BUS_COUNT-1];
+    // Bresenham ramp stepping: value(k) = vstart +/- floor(k*delta/span).  Per tick the
+    // value moves by step (= delta/span, >1 for STEEP ramps) plus 1 on a remainder-
+    // accumulator carry, so ANY slope tracks the ideal line exactly and lands on the
+    // target at stop_tick (no 1-LSB/tick crawl + end snap).
+    reg [BUS_WIDTH:0] bus_ramp_step [0:BUS_COUNT-1];
+    reg [BUS_WIDTH:0] bus_ramp_rem [0:BUS_COUNT-1];
+    // The d/span divmod for a STEEP ramp is DEFERRED from segment apply to the first
+    // stepping tick (>= 1 full cycle later): the divider then reads REGISTERED operands
+    // (rem temporarily holds d), keeping the LUTRAM-read/endpoint-mux logic off its
+    // timing path, and lives at ONE site per bus instead of one per apply call site.
+    reg bus_ramp_steep [0:BUS_COUNT-1];
     reg [TICK_WIDTH-1:0] bus_ramp_denom [0:BUS_COUNT-1];
     reg [TICK_WIDTH+BUS_WIDTH:0] bus_ramp_accum [0:BUS_COUNT-1];
 
@@ -280,6 +290,9 @@ module zlc_edge_streamer #(
     integer bus_loop;
     reg [BUS_INDEX_WIDTH+BUS_SEG_ADDR_WIDTH-1:0] bus_prog_flat_addr, bus_runtime_addr;
     reg [TICK_WIDTH+BUS_WIDTH:0] bus_accum_next;
+    reg [BUS_WIDTH:0] bus_inc;        // this tick's ramp movement: step or step+1
+    reg [BUS_WIDTH:0] bus_v_next;     // widened value+inc for target saturation
+    reg [2*BUS_WIDTH+1:0] bus_qr;     // {step, rem} from the deferred ramp divmod
 
     wire start_event = start_sync && !start_prev;
     wire bus_prog_we_event = bus_prog_we_sync != bus_prog_we_prev;
@@ -430,7 +443,7 @@ module zlc_edge_streamer #(
                 bus_count_active[i] <= {(BUS_SEG_ADDR_WIDTH+1){1'b0}};
                 bus_ramp_active[i] <= 1'b0; bus_ramp_dir_up[i] <= 1'b0;
                 bus_ramp_start_tick[i] <= {TICK_WIDTH{1'b0}}; bus_ramp_stop_tick[i] <= {TICK_WIDTH{1'b0}};
-                bus_ramp_target[i] <= {BUS_WIDTH{1'b0}}; bus_ramp_delta[i] <= {(BUS_WIDTH+1){1'b0}};
+                bus_ramp_target[i] <= {BUS_WIDTH{1'b0}}; bus_ramp_step[i] <= {(BUS_WIDTH+1){1'b0}}; bus_ramp_rem[i] <= {(BUS_WIDTH+1){1'b0}}; bus_ramp_steep[i] <= 1'b0;
                 bus_ramp_denom[i] <= {TICK_WIDTH{1'b0}}; bus_ramp_accum[i] <= {(TICK_WIDTH+BUS_WIDTH+1){1'b0}};
             end
         end
@@ -456,6 +469,30 @@ module zlc_edge_streamer #(
     // the whole engine evaluates only ~2 affine ticks per bus per cycle instead of
     // recomputing the same segment 3x in each branch.  Values + cycle timing are
     // identical to recomputing in-line (this is a pure resource dedup).
+    // Quotient + remainder of delta/span for a STEEP ramp (span < delta <= 2^BUS_WIDTH-1,
+    // so both operands fit BUS_WIDTH+1 bits).  Restoring division, fully combinational:
+    // BUS_WIDTH+1 subtract/compare stages, evaluated once per segment APPLY (not per tick)
+    // and comfortably within a 20 ns cycle.  For gentle ramps (delta <= span) the caller
+    // skips it (step = 0, rem = delta -- the historic 0/1-steps-per-tick behaviour).
+    function [2*BUS_WIDTH+1:0] zlc_bus_ramp_divmod;
+        input [BUS_WIDTH:0] num;
+        input [BUS_WIDTH:0] den;
+        reg [BUS_WIDTH:0] q, r;
+        integer k;
+        begin
+            q = {(BUS_WIDTH+1){1'b0}};
+            r = {(BUS_WIDTH+1){1'b0}};
+            for (k = BUS_WIDTH; k >= 0; k = k - 1) begin
+                r = {r[BUS_WIDTH-1:0], num[k]};
+                if (r >= den) begin
+                    r = r - den;
+                    q[k] = 1'b1;
+                end
+            end
+            zlc_bus_ramp_divmod = {q, r};
+        end
+    endfunction
+
     task zlc_bus_apply_segment;
         input integer i;
         input [BUS_INDEX_WIDTH+BUS_SEG_ADDR_WIDTH-1:0] addr;
@@ -465,6 +502,7 @@ module zlc_edge_streamer #(
         reg [TICK_WIDTH-1:0] span;
         reg [BUS_SEL_WIDTH-1:0] start_sel, stop_sel;
         reg [BUS_WIDTH-1:0] vstart, vstop;
+        reg [BUS_WIDTH:0] d;
         begin
             // Independent start/stop value selects: each endpoint either takes its
             // literal value or reads its own scan slot.  A ramp can therefore go
@@ -478,12 +516,20 @@ module zlc_edge_streamer #(
                      ? slot_vec[(stop_sel  - 1'b1)*TICK_WIDTH +: BUS_WIDTH] : bus_stop_value_mem[addr];
             if (bus_mode_mem[addr] == BUS_MODE_RAMP && tkstop > tkstart) begin
                 span = tkstop - tkstart;
+                if (vstop >= vstart) begin bus_ramp_dir_up[i] <= 1'b1; d = vstop - vstart; end
+                else begin bus_ramp_dir_up[i] <= 1'b0; d = vstart - vstop; end
+                // Bresenham split: per-tick base step = d/span, remainder feeds the carry
+                // accumulator.  GENTLE (d <= span) is final as-is; STEEP defers the d/span
+                // divmod to the first stepping tick (see bus_ramp_steep), with rem
+                // temporarily holding d.  Steep => span < d <= 2^BUS_WIDTH-1, so span
+                // fits the divider's BUS_WIDTH+1 bits.
+                bus_ramp_step[i] <= {(BUS_WIDTH+1){1'b0}};
+                bus_ramp_rem[i] <= d;
+                bus_ramp_steep[i] <= (span < d);
                 bus_value_active[i] <= vstart; bus_ramp_active[i] <= 1'b1;
                 bus_ramp_start_tick[i] <= tkstart; bus_ramp_stop_tick[i] <= tkstop;
                 bus_ramp_target[i] <= vstop; bus_ramp_denom[i] <= span;
                 bus_ramp_accum[i] <= {(TICK_WIDTH+BUS_WIDTH+1){1'b0}};
-                if (vstop >= vstart) begin bus_ramp_dir_up[i] <= 1'b1; bus_ramp_delta[i] <= vstop - vstart; end
-                else begin bus_ramp_dir_up[i] <= 1'b0; bus_ramp_delta[i] <= vstart - vstop; end
             end else begin
                 bus_value_active[i] <= vstop; bus_ramp_active[i] <= 1'b0;
                 bus_ramp_accum[i] <= {(TICK_WIDTH+BUS_WIDTH+1){1'b0}};
@@ -516,7 +562,7 @@ module zlc_edge_streamer #(
                     bus_count_active[i] <= count; bus_index_active[i] <= {(BUS_SEG_ADDR_WIDTH+1){1'b0}};
                     bus_value_active[i] <= BUS_SAFE_VALUE[BUS_WIDTH-1:0]; bus_ramp_active[i] <= 1'b0; bus_ramp_dir_up[i] <= 1'b0;
                     bus_ramp_start_tick[i] <= {TICK_WIDTH{1'b0}}; bus_ramp_stop_tick[i] <= {TICK_WIDTH{1'b0}};
-                    bus_ramp_target[i] <= {BUS_WIDTH{1'b0}}; bus_ramp_delta[i] <= {(BUS_WIDTH+1){1'b0}};
+                    bus_ramp_target[i] <= {BUS_WIDTH{1'b0}}; bus_ramp_step[i] <= {(BUS_WIDTH+1){1'b0}}; bus_ramp_rem[i] <= {(BUS_WIDTH+1){1'b0}}; bus_ramp_steep[i] <= 1'b0;
                     bus_ramp_denom[i] <= {TICK_WIDTH{1'b0}}; bus_ramp_accum[i] <= {(TICK_WIDTH+BUS_WIDTH+1){1'b0}};
                     if (count != 0 && s_eff == {TICK_WIDTH{1'b0}}) begin
                         zlc_bus_apply_segment(i, addr, slot_vec, s_eff, e_eff);
@@ -534,15 +580,42 @@ module zlc_edge_streamer #(
                             end
                         end
                     end else if (time_count > bus_ramp_start_tick[i] && bus_ramp_denom[i] != 0) begin
-                        bus_accum_next = bus_ramp_accum[i] + bus_ramp_delta[i];
-                        if (bus_accum_next >= bus_ramp_denom[i]) begin
-                            bus_ramp_accum[i] <= bus_accum_next - bus_ramp_denom[i];
-                            if (bus_ramp_dir_up[i]) begin
-                                if (bus_value_active[i] < bus_ramp_target[i]) bus_value_active[i] <= bus_value_active[i] + 1'b1;
+                        if (bus_ramp_steep[i]) begin
+                            // First stepping tick of a STEEP ramp: split d (parked in rem)
+                            // into step + remainder from REGISTERED operands.  accum is
+                            // still 0 and rem < span by construction, so this tick can
+                            // never carry: inc is exactly the new step -- identical to
+                            // having divided at apply, but with a register-fed divider.
+                            bus_qr = zlc_bus_ramp_divmod(bus_ramp_rem[i], bus_ramp_denom[i][BUS_WIDTH:0]);
+                            bus_ramp_step[i] <= bus_qr[2*BUS_WIDTH+1:BUS_WIDTH+1];
+                            bus_ramp_rem[i] <= bus_qr[BUS_WIDTH:0];
+                            bus_ramp_steep[i] <= 1'b0;
+                            bus_ramp_accum[i] <= {{(TICK_WIDTH){1'b0}}, bus_qr[BUS_WIDTH:0]};
+                            bus_inc = bus_qr[2*BUS_WIDTH+1:BUS_WIDTH+1];
+                        end else begin
+                            bus_accum_next = bus_ramp_accum[i] + bus_ramp_rem[i];
+                            if (bus_accum_next >= bus_ramp_denom[i]) begin
+                                bus_ramp_accum[i] <= bus_accum_next - bus_ramp_denom[i];
+                                bus_inc = bus_ramp_step[i] + 1'b1;
                             end else begin
-                                if (bus_value_active[i] > bus_ramp_target[i]) bus_value_active[i] <= bus_value_active[i] - 1'b1;
+                                bus_ramp_accum[i] <= bus_accum_next;
+                                bus_inc = bus_ramp_step[i];
                             end
-                        end else bus_ramp_accum[i] <= bus_accum_next;
+                        end
+                        // Move by the full Bresenham increment, saturating AT the target
+                        // (widened compares cannot overflow: value+inc <= 2^(W+1)-1).
+                        if (bus_inc != {(BUS_WIDTH+1){1'b0}}) begin
+                            if (bus_ramp_dir_up[i]) begin
+                                bus_v_next = {1'b0, bus_value_active[i]} + bus_inc;
+                                bus_value_active[i] <= (bus_v_next >= {1'b0, bus_ramp_target[i]})
+                                                       ? bus_ramp_target[i] : bus_v_next[BUS_WIDTH-1:0];
+                            end else begin
+                                if ({1'b0, bus_value_active[i]} <= {1'b0, bus_ramp_target[i]} + bus_inc)
+                                    bus_value_active[i] <= bus_ramp_target[i];
+                                else
+                                    bus_value_active[i] <= bus_value_active[i] - bus_inc[BUS_WIDTH-1:0];
+                            end
+                        end
                     end
                 end else if (bus_index_active[i] < bus_count_active[i]) begin
                     if (time_count >= s_eff) begin

@@ -701,14 +701,24 @@ The three bring-up items from the adversarial RTL hunt are now fixed/guarded. Th
   time when DAC buses are driven while a `da_clkN`-labeled channel is neither clk-enabled
   nor toggled (a frozen DAC would otherwise be silent). A warning, not an error — driving
   the strobe as a TTL pattern stays allowed.
-- **U1 — over-steep ramp: ALLOWED (user decision); preview made honest instead.** The
-  hardware ramp engine slews at most 1 LSB/tick then SNAPS at `stop_tick`. The user
-  accepts that jagged waveform for ANY duration, so the validator does NOT reject steep
-  ramps (an earlier reject was reverted on request). Instead the PREVIEW now draws the
-  true slew-limited trajectory (`pulse_table._analog_bus_value_at_tick` clamps the ideal
-  line to ±1 LSB/tick from the carried-in value, with the snap at the period end), so
-  what the plot shows is what the DAC does — `engine_model.bus_play` already modeled
-  this; the preview was the only ideal-line holdout.
+- **U1 (superseded 2026-06-09) — ramp engine is now a multi-LSB Bresenham stepper.** The
+  original engine moved at most 1 LSB/tick then snapped at `stop_tick`; the user ruled
+  that out ("按照计算出来的 step 来尽量靠近 ramp"). The RTL now computes `step = Δ//span`
+  and `rem = Δ%span` (a combinational BUS_WIDTH+1-bit restoring divider,
+  `zlc_bus_ramp_divmod`, engaged only when span < Δ ≤ 2^BUS_WIDTH−1) and per tick moves
+  `step` (+1 on remainder-accumulator carry), saturating AT the target. TIMING/AREA: the
+  divmod is DEFERRED from segment apply to the FIRST stepping tick (`bus_ramp_steep`
+  flag; `rem` parks Δ in between) — the divider reads registered operands (short path,
+  off the LUTRAM-read/endpoint-mux cone) and is instantiated once per bus, not once per
+  apply call site; the first tick provably cannot carry (accum = rem < span), so the
+  output is bit-identical to dividing at apply —
+  i.e. `value(k) = vstart ± floor(k·Δ/span)` for ANY slope, landing exactly on the
+  target at `stop_tick`. Gentle ramps (Δ ≤ span) keep the historic carry-only path,
+  bit-identical to before. Mirrors updated in lockstep: `engine_model.bus_play`
+  (step/rem state), `engine_model.bus_value_at` (unified closed form `floor(k·Δ/span)`,
+  feeds the bus delay line), and the preview `pulse_table._analog_bus_value_at_tick`
+  (same staircase in the signed user domain). Steep ramps remain ALLOWED for any
+  duration (validator does not reject). **Bitstream REBUILD REQUIRED.**
 - **T3 — edge-BRAM latency-2 force: BUILD-TIME HARD CHECK.** `zlc_force_latency2`
   (create_project.tcl) now READS BACK both register properties and `error`s out if either
   did not take (e.g. a future Vivado renames it) — a silent latency-1 BRAM would shift

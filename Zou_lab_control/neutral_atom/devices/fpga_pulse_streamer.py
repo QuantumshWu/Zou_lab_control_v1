@@ -377,11 +377,11 @@ def validate_pulse_streamer_program(
             raise ValueError(f"bus {bus_index} has {bus_segment_counts[bus_index]} segments, above max_bus_segments={max_bus_segments}.")
     if bus_segments and (int(getattr(program, "loop_count", 1)) > 1 and int(getattr(program, "loop_start_index", 0)) != 0):
         raise ValueError("bus_segments do not currently support finite inner repeat brackets.")
-    # RAMP SLOPE: deliberately NOT validated.  The hardware ramp engine slews at most
-    # 1 LSB/tick and SNAPS to the target at stop_tick; a steeper ramp therefore comes out
-    # as a 1 LSB/tick crawl ending in a jump.  The user explicitly accepts that jagged
-    # waveform for any duration, and the PREVIEW draws the same slew-limited trajectory
-    # (see pulse_table._analog_bus_value_at_tick), so what you see is what the DAC does.
+    # RAMP SLOPE: deliberately NOT validated.  The hardware ramp engine is a Bresenham
+    # stepper -- per tick it moves floor-line-tracking increments (multiple LSBs for steep
+    # ramps), so ANY duration yields the closest realizable staircase to the ideal line,
+    # landing exactly on the target at stop_tick.  The preview draws the same staircase
+    # (pulse_table._analog_bus_value_at_tick), so what you see is what the DAC does.
     # Per-bus DAC DELAY -- the LITERAL per-bus delay line (a 10-bit circular buffer, one delay
     # shared by all 10 bits).  Each bus may be delayed by up to delay_depth ticks (the same
     # bounded cap as the per-channel delay).

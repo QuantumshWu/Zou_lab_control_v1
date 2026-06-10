@@ -1176,8 +1176,8 @@ def test_dac_ramp_spans_current_period_with_hold_carry_and_edge_step():
         time_step_ns=20.0,   # 1000 ns / 20 = 50 ticks per period
         name="ramp_within_period",
     )
-    # Use a representable slope: the DAC ramps at most 1 LSB/tick, so keep the magnitude
-    # (40 LSB) within the period length (50 ticks).
+    # A gentle slope (40 LSB over 50 ticks); steeper ramps are equally fine -- the
+    # Bresenham stepper moves multiple LSBs per tick to track the ideal line.
     state.set_analog_bus_mode(0, "da", "edge", value=100)
     state.set_analog_bus_mode(1, "da", "hold")
     state.set_analog_bus_mode(2, "da", "ramp", value=140)
@@ -5376,6 +5376,19 @@ def test_sequencer_prepare_backstops_invalid_program_geometry():
         seq.prepare(st)
 
 
+def test_sequencer_prepare_accepts_streamed_scan_beyond_resident_window():
+    # REGRESSION: the prepare() backstop used the DEFAULT max_scan_points (the 2-bank
+    # resident window, 4096) and rejected larger STREAMED scans (e.g. 9999 points),
+    # which the architecture explicitly supports (points stream through the window).
+    seq = na.RuntimeSequencer(channels=["a", "b"], clock_hz=50e6, trigger_channels=["a"])
+    st = na.PulseTableState(channels=["a", "b"], periods=[na.PulsePeriod(100, (1, 1), unit="ns")],
+                            time_step_ns=20)
+    st.bind_field("duration", "0")
+    st.set_scan_table([[100.0 + 20.0 * (i % 50)] for i in range(9999)])
+    prog = seq.prepare(st)
+    assert len(prog.scan_points) == 9999
+
+
 # --------------------------------------------------------------------------- #
 # RTL-finding fixes (2026-06-09): U4 delay-tail-at-done, U1 ramp slope cap,
 # B1/B2 da_clk idle warning, T3 latency read-back, B3/B4/U7 geometry guards.
@@ -5410,14 +5423,16 @@ def test_delay_tail_emits_after_done_contract():
     assert all(v == 0 for v in out[15:])  # then settles low -- never frozen high
 
 
-def test_steep_ramp_is_allowed_and_preview_shows_slew_limited_trajectory():
-    """U1 (user decision): an over-steep ramp is ALLOWED for any duration -- the hardware
-    slews 1 LSB/tick then snaps at stop, and the user accepts that jagged waveform.  The
-    validator must NOT reject it, and the preview must draw the TRUE slew-limited
-    trajectory (crawl, then jump at the period end), matching engine_model.bus_play."""
+def test_steep_ramp_tracks_ideal_line_with_multi_lsb_bresenham_steps():
+    """An over-steep ramp is ALLOWED for any duration, and the engine must approach the
+    ideal line as closely as a 20 ns tick permits: per tick the value moves by the
+    CALCULATED step (multiple LSBs -- Bresenham value(k) = vstart +/- floor(k*delta/span)),
+    NOT a 1-LSB/tick crawl with an end snap.  Locks validator acceptance, the engine
+    mirror, the closed form, and the preview to that one trajectory."""
 
     from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeBusSegment
     from Zou_lab_control.neutral_atom.timing.pulse_table import _analog_bus_value_at_tick
+    import fpga.pulse_streamer.host.engine_model as em
 
     steep = na.RuntimeSequenceProgram(
         sequence_id="ramp", sequence_name="ramp", clock_hz=50e6,
@@ -5427,16 +5442,42 @@ def test_steep_ramp_is_allowed_and_preview_shows_slew_limited_trajectory():
     )
     na.validate_pulse_streamer_program(steep, channel_count=1)   # accepted, no raise
 
-    # preview trajectory of a steep ramp 0 -> 1023 over 10 ticks: 1 LSB/tick crawl,
-    # then the snap to 1023 at the period end (where the next level carries 1023).
+    # engine mirror: 0 -> 1023 over 10 ticks moves ~102 codes per tick along the floor
+    # line and lands EXACTLY on 1023 at stop_tick (output registered: out[t] has k=t-1).
+    out = em.bus_play(steep, 0, 16)
+    for t in range(1, 11):
+        assert out[t] == ((t - 1) * 1023) // 10
+    assert out[11] == 1023 and out[15] == 1023
+    # closed form agrees tick-for-tick (it feeds the bus delay line)
+    assert [em.bus_value_at(steep, 0, t, 0) for t in range(16)] == out
+
+    # preview draws the same staircase: k*delta//span from the carried-in value.
     plan = [{"mode": "ramp", "value": 1023}, {"mode": "hold", "value": None}]
     starts = [0, 10, 20]
-    assert _analog_bus_value_at_tick(plan, starts, 1) == 1     # capped at 1 LSB/tick
-    assert _analog_bus_value_at_tick(plan, starts, 9) == 9     # still crawling at the end
-    assert _analog_bus_value_at_tick(plan, starts, 10) == 1023  # snap at stop_tick
-    # a GENTLE ramp is untouched by the cap: ideal interpolation as before.
+    assert _analog_bus_value_at_tick(plan, starts, 1) == 102   # multi-LSB step, no crawl
+    assert _analog_bus_value_at_tick(plan, starts, 9) == 920
+    assert _analog_bus_value_at_tick(plan, starts, 10) == 1023  # lands ON target
+    # a GENTLE ramp keeps the historic staircase (step = 0, carry-only).
     gentle = [{"mode": "ramp", "value": 8}, {"mode": "hold", "value": None}]
     assert _analog_bus_value_at_tick(gentle, starts, 5) == 4
+
+
+def test_pulse_streamer_rtl_has_bresenham_ramp_stepper():
+    """No Verilog simulator in the repo -> lock the RTL structure of the multi-LSB ramp
+    stepper: the divmod function computing step/rem at segment APPLY, the step+carry
+    increment, and the saturating move toward the target."""
+
+    rtl = (Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "zlc_edge_streamer.v").read_text(encoding="utf-8")
+    assert "function [2*BUS_WIDTH+1:0] zlc_bus_ramp_divmod;" in rtl
+    assert "bus_ramp_step" in rtl and "bus_ramp_rem" in rtl
+    assert "bus_ramp_delta" not in rtl                      # the 1-LSB/tick crawl is GONE
+    assert "bus_inc = bus_ramp_step[i] + 1'b1;" in rtl      # carry tick: step+1
+    # the divider is DEFERRED to the first stepping tick and fed from registers
+    assert "bus_qr = zlc_bus_ramp_divmod(bus_ramp_rem[i], bus_ramp_denom[i][BUS_WIDTH:0]);" in rtl
+    assert "bus_ramp_steep" in rtl
+    # saturating moves (both directions) land exactly on the target
+    assert "? bus_ramp_target[i] : bus_v_next[BUS_WIDTH-1:0];" in rtl
+    assert "bus_value_active[i] <= bus_value_active[i] - bus_inc[BUS_WIDTH-1:0];" in rtl
 
 
 def test_compile_warns_when_dac_bus_active_but_da_clk_pin_idle():

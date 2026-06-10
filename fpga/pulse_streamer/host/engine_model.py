@@ -741,15 +741,24 @@ def bus_play(program, bus_index: int, n_ticks: int, scan_point: int = 0, *,
     # idles at 0 V, and a tick-0 ramp carries IN from 0 V, exactly like the hardware.
     safe = 1 << (bus_width - 1)
     st = {"idx": 0, "value": safe, "ramp": False, "rstart": 0, "rstop": 0,
-          "target": 0, "denom": 0, "accum": 0, "up": True, "delta": 0}
+          "target": 0, "denom": 0, "accum": 0, "up": True, "step": 0, "rem": 0}
 
     def apply(s):
         vs, ve = endpoints(s)
         ts = eff(s.start_tick, s.start_tick_coeffs)
         te = eff(s.stop_tick, s.stop_tick_coeffs)
         if str(s.mode).lower() == "ramp" and te > ts:
-            st.update(value=vs, ramp=True, rstart=ts, rstop=te, target=ve, denom=te - ts,
-                      accum=0, up=ve >= vs, delta=(ve - vs) if ve >= vs else (vs - ve))
+            # Bresenham split (mirrors zlc_bus_apply_segment): per-tick base step =
+            # delta//span with the remainder feeding the carry accumulator, so a STEEP
+            # ramp moves multiple LSBs per tick and tracks floor(k*delta/span) exactly.
+            span = te - ts
+            delta = (ve - vs) if ve >= vs else (vs - ve)
+            if span < delta:
+                step, rem = divmod(delta, span)
+            else:
+                step, rem = 0, delta
+            st.update(value=vs, ramp=True, rstart=ts, rstop=te, target=ve, denom=span,
+                      accum=0, up=ve >= vs, step=step, rem=rem)
         else:
             st.update(value=ve, ramp=False, accum=0)
 
@@ -765,13 +774,16 @@ def bus_play(program, bus_index: int, n_ticks: int, scan_point: int = 0, *,
                 if st["idx"] < len(segs) and eff(segs[st["idx"]].start_tick, segs[st["idx"]].start_tick_coeffs) <= t:
                     apply(segs[st["idx"]]); st["idx"] += 1
             elif t > st["rstart"] and st["denom"]:
-                st["accum"] += st["delta"]
+                st["accum"] += st["rem"]
+                inc = st["step"]
                 if st["accum"] >= st["denom"]:
                     st["accum"] -= st["denom"]
-                    if st["up"] and st["value"] < st["target"]:
-                        st["value"] += 1
-                    elif (not st["up"]) and st["value"] > st["target"]:
-                        st["value"] -= 1
+                    inc += 1
+                if inc:
+                    if st["up"]:
+                        st["value"] = min(st["target"], st["value"] + inc)
+                    else:
+                        st["value"] = max(st["target"], st["value"] - inc)
         elif st["idx"] < len(segs) and t >= eff(segs[st["idx"]].start_tick, segs[st["idx"]].start_tick_coeffs):
             apply(segs[st["idx"]]); st["idx"] += 1
     return out
@@ -839,12 +851,9 @@ def bus_value_at(program, bus_index: int, phase: int, scan_point: int = 0, *,
         denom = te - ts
         delta = abs(vstop - vstart)
         k = (phase - 1) - ts             # accumulator-increment ticks elapsed (registered)
-        if delta == 0 or denom == 0:
-            moves = 0
-        elif delta <= denom:             # <= 1 crossing/tick -> #moves == #crossings
-            moves = (k * delta) // denom
-        else:                            # delta > denom -> every tick crosses (value +1/tick)
-            moves = k
+        # Unified Bresenham closed form, ANY slope: after k stepping ticks the engine
+        # has moved floor(k*delta/denom) codes (steep ramps move >1 LSB per tick).
+        moves = 0 if (delta == 0 or denom == 0) else (k * delta) // denom
         if moves > delta:
             moves = delta
         return (vstart + moves) if vstop >= vstart else (vstart - moves)
