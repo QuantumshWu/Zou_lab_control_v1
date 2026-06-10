@@ -466,8 +466,9 @@ class PulseTableState:
     def with_slots_resolved(self, slots: Mapping[str, float]) -> "PulseTableState":
         """Return a non-scan copy with each slot replaced by a constant value.
 
-        Time slots take ns values; ``dac`` slots take integer DAC codes.  Used
-        for terse single-point notebook scans where one value is set per shot.
+        Time slots take ns values; ``dac`` slots take SIGNED integer values
+        (0 = true 0 V; the offset-binary wire code is produced by the compiler).
+        Used for terse single-point notebook scans where one value is set per shot.
         """
 
         new = PulseTableState.from_dict(self.to_dict())

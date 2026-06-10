@@ -1050,6 +1050,9 @@ class PulseSequenceFigure(BaseLivePlot):
             # SIGNED DAC values: trace["min"]..trace["max"] span the row (the legacy
             # unsigned form had min=0).  0 = true 0 V; with the signed range the 0 V
             # reference sits MID-ROW and negative values dip below it.
+            # CONTRACT: trace builders (pulse_gui._analog_bus_traces, manual figure code)
+            # must supply BOTH "min" and "max" for signed scaling; the 0/1 fallbacks below
+            # only keep a hand-rolled legacy unsigned trace from crashing.
             v_max = int(trace.get("max", 1))
             v_min = int(trace.get("min", 0))
             v_span = max(1, v_max - v_min)
