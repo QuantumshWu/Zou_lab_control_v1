@@ -308,6 +308,8 @@ def _delay_cap_text(time_step_ns: float) -> str:
     """Human description of the per-channel delay magnitude cap (the delay-line depth)."""
 
     max_us = DELAY_DEPTH_TICKS * float(time_step_ns) / 1000.0
+    if max_us >= 1e6:
+        return f"±{format_compact_number(max_us / 1e6)} s (event-scheduled; ms-scale delays OK)"
     return f"±{format_compact_number(max_us)} us ({DELAY_DEPTH_TICKS} ticks)"
 
 

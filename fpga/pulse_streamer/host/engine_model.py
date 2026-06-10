@@ -52,7 +52,9 @@ __all__ = [
 # DELAY_DEPTH localparam and host.image / fpga_pulse_streamer DEFAULT_DELAY_DEPTH.
 # A bounded cap: 2048 ticks * 20 ns = ~40 us (covers +/-15 us after the negative-delay
 # global shift G, which can push an effective delay to ~30 us).
-DELAY_DEPTH = 2048
+DELAY_DEPTH = 2048            # DAC bus ring depth (TTL no longer uses it)
+TTL_DELAY_MAX_TICKS = (1 << 31) - 1
+EVT_FIFO_DEPTH = 16
 
 
 class DelayDepthExceeded(ValueError):
@@ -176,48 +178,51 @@ def _validate_delay_depth(d: int, depth: int, what: str) -> int:
 
 
 def rtl_delay_line_mirror(undelayed: Sequence[int], channel_delays,
-                          *, depth: int = DELAY_DEPTH) -> list[int]:
-    """Cycle-exact register mirror of the RTL per-channel delay line -- now a per-channel
-    variable-tap SHIFT REGISTER (``ttl_sr[ch]``, the SRL primitive), NOT an addressed ring.
+                          *, depth: int = TTL_DELAY_MAX_TICKS,
+                          evt_depth: int = EVT_FIFO_DEPTH) -> list[int]:
+    """Cycle-exact register mirror of the RTL per-channel TTL delay -- now the EVENT
+    SCHEDULER (``evt_mem``/``evt_out``/``g_time``), NOT the old per-tick shift register.
 
-    Per delayed bit a ``depth+1``-bit shift register, zero at FIRE.  Each running tick:
-    read the OUTPUT for tick ``t`` as the gated tap (the value pushed ``d`` ticks ago), THEN
-    shift this tick's undelayed bit in at index 0 (oldest falls off the top).  Modelling the
-    RTL exactly:
+    Faithfully modelling the RTL:
 
-      * the SR shifts the newest bit in at ``[0]`` on the clock edge (nonblocking), so the
-        COMBINATIONAL tap this cycle sees the PRE-shift contents: ``sr[k]`` == the bit pushed
-        ``k+1`` ticks ago.  The value pushed ``d`` ticks ago is therefore the tap ``sr[d-1]``
-        (the RTL ``ttl_sr[ch][d_ch-1]``) -- exactly the old ring read ``ring[wptr-d]``.
-      * ``del_fill`` (running tick index, saturating at ``depth``) gates the tap to 0 until
-        ``del_fill >= d`` i.e. ``t >= d`` -- the SRL has no synchronous bulk clear, so this
-        startup gate IS the FIRE-time-0 ``out[t]=in[t-d], 0 before fire`` behaviour.
+      * during cycle t the undelayed bit differs from ``prev_undelayed`` (the toggle AT
+        t) -> push ``(t + d - 1, new_level)`` into that channel's ``evt_depth``-deep FIFO
+        (``d >= 2``; ``d == 1`` is served by the prev register; ``d == 0`` bypasses);
+      * during cycle u == t + d - 1 the head time equals ``g_time`` -> the level registers
+        into ``evt_out`` (visible at t + d)  ==>  out[t] = in[t-d], 0 before the first
+        scheduled toggle -- byte-identical to :func:`delay_line_reference`;
+      * a push into a FULL FIFO is DROPPED (the RTL guard) -- the host validator
+        prevents ever getting there (toggle-density window check).
 
     Equals :func:`delay_line_reference` for every d in [0, depth]; a d > depth raises
-    :class:`DelayDepthExceeded` (the bounded cap)."""
+    :class:`DelayDepthExceeded` (the 32-bit field cap)."""
     cds = {int(b): _validate_delay_depth(d, depth, f"channel bit {b}")
            for b, d in dict(channel_delays).items() if int(d) != 0}
     delayed_mask = 0
     for b in cds:
         delayed_mask |= 1 << b
-    # depth+1 SR bits so a delay of EXACTLY DELAY_DEPTH (tap index depth-1) is representable.
-    width = depth + 1
-    srs = {b: [0] * width for b in cds}                # sr[0] = newest pushed
-    del_fill = 0                                       # running tick index, saturating at depth
+    queues = {b: [] for b in cds}              # per-channel [(scheduled_time, level)]
+    evt_out = {b: 0 for b in cds}
+    prev = 0
     out = []
     for t in range(len(undelayed)):
-        u = int(undelayed[t])
-        m = u & ~delayed_mask                          # non-delayed channels: passthrough
-        for bit, d in cds.items():
-            sr = srs[bit]
-            if del_fill >= d and sr[d - 1]:            # gated tap: value pushed d ticks ago
-                m |= 1 << bit
-            srs[bit] = [(u >> bit) & 1] + sr[:-1]      # shift newest in at [0] (oldest drops)
-        if del_fill < depth:
-            del_fill += 1
+        cur = int(undelayed[t])
+        # OUTPUT for cycle t (registers updated at the END of the cycle, like the RTL)
+        m = cur & ~delayed_mask
+        for b, d in cds.items():
+            level = (prev >> b) & 1 if d == 1 else evt_out[b]
+            m |= (level & 1) << b
         out.append(m)
+        # end-of-cycle register updates: pops (head == t), then pushes (toggle at t)
+        for b, d in cds.items():
+            q = queues[b]
+            if q and q[0][0] == t:
+                evt_out[b] = q.pop(0)[1]
+            if d >= 2 and (((cur ^ prev) >> b) & 1):
+                if len(q) < evt_depth:          # overflow guard: drop (validator prevents)
+                    q.append((t + d - 1, (cur >> b) & 1))
+        prev = cur
     return out
-
 
 def rtl_bus_delay_line_mirror(undelayed_bus: Sequence[int], delay: int,
                               *, depth: int = DELAY_DEPTH, safe_value: int = 512) -> list[int]:

@@ -99,7 +99,13 @@ module zlc_pulse_streamer_top #(
     localparam integer R_MASK_BASE  = R_COEFF_BASE + MAX_EDGES * COEFF_WORDS;
     localparam integer R_SCAN_BASE  = R_MASK_BASE  + MAX_EDGES * MASK_WORDS;
     localparam integer R_BUS_BASE   = R_SCAN_BASE  + SCAN_DEPTH * SCAN_WORDS;
-    localparam integer R_TOTAL_WORDS = R_BUS_BASE   + BUS_ROWS * BUS_WORDS;
+    // TTL DELAY register region: ONE 32-bit word per channel (the event-scheduler
+    // delays outgrew the dense 12-bit CTRL fields; the old CTRL DELAY_TICKS words
+    // 20..43 are now reserved/unused).  64 words of headroom regardless of channel
+    // count so the layout is stable across configs.
+    localparam integer R_DELAY_BASE  = R_BUS_BASE   + BUS_ROWS * BUS_WORDS;
+    localparam integer R_DELAY_WORDS = 64;
+    localparam integer R_TOTAL_WORDS = R_DELAY_BASE + R_DELAY_WORDS;
 
     // CTRL regfile word offsets (== host.image.CtrlWords).
     localparam integer C_MAGIC = 0;
@@ -143,12 +149,14 @@ module zlc_pulse_streamer_top #(
     wire zlc_running, zlc_done, zlc_underflow;
     wire [SCAN_COUNT_WIDTH-1:0] zlc_cursor;
 
-    // --- LITERAL delay line: assemble the DENSE delay-tick busses from consecutive CTRL words.
-    // delay_ticks (CHANNEL_COUNT*DELAY_TICK_WIDTH bits) spans DELAY_TICKS_WORDS words;
-    // bus_delay_ticks (BUS_COUNT*DELAY_TICK_WIDTH bits) spans BUS_DELAY_TICKS_WORDS words.
-    wire [DELAY_TICKS_WORDS*32-1:0] delay_ticks_pack;
+    // --- delays: TTL = the 32b/channel DELAY register region (event scheduler, long
+    // delays); DAC buses = the DENSE 12-bit CTRL fields (ring-buffered, ring-capped).
+    localparam integer TTL_DELAY_WIDTH = 32;
+    reg  [31:0] delay_reg [0:CHANNEL_COUNT-1];
+    integer dri;
+    initial for (dri = 0; dri < CHANNEL_COUNT; dri = dri + 1) delay_reg[dri] = 32'b0;
+    wire [CHANNEL_COUNT*TTL_DELAY_WIDTH-1:0] delay_ticks_w;
     wire [BUS_DELAY_TICKS_WORDS*32-1:0] bus_delay_ticks_pack;
-    wire [CHANNEL_COUNT*DELAY_TICK_WIDTH-1:0] delay_ticks_w;
     wire [BUS_COUNT*DELAY_TICK_WIDTH-1:0] bus_delay_ticks_w;
 
     // --- per-channel CLK mask + muxed output: a channel wired to clk outputs the FPGA
@@ -190,12 +198,14 @@ module zlc_pulse_streamer_top #(
     wire sel_coeff = (word_addr >= R_COEFF_BASE) && (word_addr < R_MASK_BASE);
     wire sel_mask  = (word_addr >= R_MASK_BASE)  && (word_addr < R_SCAN_BASE);
     wire sel_scan  = (word_addr >= R_SCAN_BASE)  && (word_addr < R_BUS_BASE);
-    wire sel_bus   = (word_addr >= R_BUS_BASE)   && (word_addr < R_TOTAL_WORDS);
+    wire sel_bus   = (word_addr >= R_BUS_BASE)   && (word_addr < R_DELAY_BASE);
+    wire sel_delay = (word_addr >= R_DELAY_BASE) && (word_addr < R_TOTAL_WORDS);
     wire [29:0] tick_word_off  = word_addr - R_TICK_BASE[29:0];
     wire [29:0] coeff_word_off = word_addr - R_COEFF_BASE[29:0];
     wire [29:0] mask_word_off  = word_addr - R_MASK_BASE[29:0];
     wire [29:0] scan_word_off  = word_addr - R_SCAN_BASE[29:0];
     wire [29:0] bus_word_off   = word_addr - R_BUS_BASE[29:0];
+    wire [29:0] delay_word_off = word_addr - R_DELAY_BASE[29:0];
 
     // --- CTRL regfile ---------------------------------------------------------
     reg [31:0] ctrl_reg [0:R_CTRL_WORDS-1];
@@ -207,14 +217,13 @@ module zlc_pulse_streamer_top #(
     // (the upper pad bits of the last word are 0 from the host).
     genvar dw;
     generate
-        for (dw = 0; dw < DELAY_TICKS_WORDS; dw = dw + 1) begin : zlc_delay_ticks_pack_gen
-            assign delay_ticks_pack[dw*32 +: 32] = ctrl_reg[C_DELAY_TICKS + dw];
+        for (dw = 0; dw < CHANNEL_COUNT; dw = dw + 1) begin : zlc_delay_reg_pack_gen
+            assign delay_ticks_w[dw*TTL_DELAY_WIDTH +: TTL_DELAY_WIDTH] = delay_reg[dw];
         end
         for (dw = 0; dw < BUS_DELAY_TICKS_WORDS; dw = dw + 1) begin : zlc_bus_delay_ticks_pack_gen
             assign bus_delay_ticks_pack[dw*32 +: 32] = ctrl_reg[C_BUS_DELAY_TICKS + dw];
         end
     endgenerate
-    assign delay_ticks_w = delay_ticks_pack[CHANNEL_COUNT*DELAY_TICK_WIDTH-1:0];
     assign bus_delay_ticks_w = bus_delay_ticks_pack[BUS_COUNT*DELAY_TICK_WIDTH-1:0];
 
     // Assemble the per-channel clk mask from its CTRL words, then mux clk onto each pin.
@@ -239,6 +248,8 @@ module zlc_pulse_streamer_top #(
 
     always @(posedge clk) begin
         if (bram_ena && wr && sel_ctrl) ctrl_reg[word_addr[5:0]] <= bram_dina;
+        if (bram_ena && wr && sel_delay && (delay_word_off < CHANNEL_COUNT))
+            delay_reg[delay_word_off[5:0]] <= bram_dina;
         if (ldr_status_we) ctrl_reg[C_STATUS] <= ldr_status_val;
         if (ldr_cmd_clear) ctrl_reg[C_COMMAND] <= 32'b0;
         ctrl_reg[C_CURSOR] <= zlc_cursor;        // engine cursor visible to host

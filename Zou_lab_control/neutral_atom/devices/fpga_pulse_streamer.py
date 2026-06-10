@@ -53,6 +53,8 @@ try:  # pragma: no cover - exercised whenever the fpga package is importable (th
     DEFAULT_SCAN_COEFF_FRAC_BITS = int(_CFG_PARAMS.coeff_frac_bits)
     DEFAULT_NUM_SLOTS = int(_CFG_PARAMS.num_slots)
     DEFAULT_DELAY_DEPTH = int(_CFG_PARAMS.delay_depth)
+    TTL_DELAY_MAX_TICKS = int(getattr(_CFG_PARAMS, "ttl_delay_max_ticks", (1 << 31) - 1))
+    EVT_FIFO_DEPTH = int(getattr(_CFG_PARAMS, "evt_fifo_depth", 16))
     DEFAULT_SLOT_MUL_WIDTH = int(_STREAMER_CFG["slot_mul_width"])
     DEFAULT_BUS_COUNT = int(_CFG_PARAMS.bus_count)
     DEFAULT_BUS_WIDTH = int(_CFG_PARAMS.bus_width)
@@ -69,6 +71,8 @@ except Exception:  # pragma: no cover - fpga package not importable; use shipped
     # LITERAL OUTPUT delay-line depth in ticks (must match zlc_edge_streamer.v DELAY_DEPTH and
     # host.image / engine_model DELAY_DEPTH).  Bounded cap: 2048 * 20 ns = ~40 us.
     DEFAULT_DELAY_DEPTH = 2048
+    TTL_DELAY_MAX_TICKS = (1 << 31) - 1
+    EVT_FIFO_DEPTH = 16
     # Affine-MAC slot operand width -- MUST match zlc_edge_streamer.v SLOT_MUL_WIDTH and
     # engine_model.SLOT_MUL_WIDTH.  Each scan slot VALUE x a 16-bit coeff fits one DSP48E1
     # (25x18), so the slot operand is the low 25 bits as signed; the validator rejects a
@@ -307,17 +311,47 @@ def validate_pulse_streamer_program(
         raise ValueError(f"program has {len(program.ticks)} edges, but the FPGA streamer only accepts {max_edges}.")
     if len(program.channels) > channel_count:
         raise ValueError(f"program uses {len(program.channels)} channels, but the FPGA streamer has {channel_count}.")
-    # PER-CHANNEL OUTPUT DELAY -- a LITERAL delay line (a per-channel circular buffer of depth
-    # delay_depth).  ALL channels are independently delayable, but each effective delay is
-    # BOUNDED by the buffer depth (a bounded cap; the user accepted the +/-15us bound).  A delay
-    # is constant (never scanned), positive/negative-via-the-folded-global-shift/zero.
-    delay_depth = _positive_int(delay_depth, "delay_depth")
+    # PER-CHANNEL TTL OUTPUT DELAY -- the EVENT SCHEDULER.  A delay is constant (never
+    # scanned), bounded only by its 32-bit field (TTL_DELAY_MAX_TICKS ~ 42.9 s) -- e.g.
+    # millisecond emCCD delays.  The hardware constraint moves from delay LENGTH to
+    # toggles IN FLIGHT: a channel may have at most EVT_FIFO_DEPTH toggles inside any
+    # window of its own delay length (each in-flight toggle holds one event-FIFO slot).
+    delay_depth = _positive_int(delay_depth, "delay_depth")   # still bounds BUS delays
     channel_delays = [int(d) for d in (getattr(program, "channel_delays", None) or [])]
     for b, d in enumerate(channel_delays):
-        if d < 0 or d > delay_depth:
+        if d < 0 or d > TTL_DELAY_MAX_TICKS:
             raise ValueError(
-                f"channel-delay output bit {b}: delay {d} ticks exceeds the delay-line depth "
-                f"DELAY_DEPTH={delay_depth} (~{delay_depth * 20 / 1000:.0f}us); reduce the delay.")
+                f"channel-delay output bit {b}: delay {d} ticks is outside "
+                f"[0, {TTL_DELAY_MAX_TICKS}] (~{TTL_DELAY_MAX_TICKS * 20e-9:.1f} s at 20 ns/tick).")
+    if any(channel_delays):
+        # toggle-density window check against the per-channel event FIFO depth
+        base_ticks = [int(t) for t in program.ticks]
+        base_masks = [int(m) for m in program.masks]
+        frame_len = base_ticks[-1] if base_ticks else 0
+        for b, d in enumerate(channel_delays):
+            if d <= 1:
+                continue          # d==0 bypass; d==1 is a plain register (no FIFO slot)
+            toggles = []
+            prev_bit = 0
+            for tick, mask in zip(base_ticks, base_masks):
+                bit = (mask >> b) & 1
+                if bit != prev_bit:
+                    toggles.append(tick)
+                    prev_bit = bit
+            # repeat_forever wraps the stream: duplicate one frame ahead so a window
+            # crossing the seam is counted too.
+            if bool(getattr(program, "repeat_forever", False)) and frame_len > 0:
+                toggles = toggles + [t + frame_len for t in toggles]
+            lo = 0
+            for hi in range(len(toggles)):
+                while toggles[hi] - toggles[lo] >= d:
+                    lo += 1
+                if hi - lo + 1 > EVT_FIFO_DEPTH:
+                    raise ValueError(
+                        f"channel-delay output bit {b}: more than {EVT_FIFO_DEPTH} output "
+                        f"toggles fall inside one {d}-tick delay window (the per-channel "
+                        f"event FIFO holds {EVT_FIFO_DEPTH} in-flight toggles). Reduce the "
+                        f"delay or the toggle rate on this channel.")
     tick_limit = (1 << tick_width) - 1
     mask_limit = (1 << channel_count) - 1
     scan_points = list(getattr(program, "scan_points", None) or [])

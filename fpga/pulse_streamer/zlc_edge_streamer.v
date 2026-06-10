@@ -40,11 +40,12 @@
 // whole edge arrives per access with no width padding; scan is one BRAM.
 //
 // OUTPUT DELAY -- a LITERAL delay line:
-//   * TTL: each channel has its OWN variable-tap SHIFT REGISTER ttl_sr[ch] (a packed
-//     DELAY_DEPTH+1-bit reg -- the textbook SRL primitive, infers as SRLC32E, NOT an addressed
-//     RAM).  Each tick shift the channel's undelayed bit in at [0]; the value pushed d ticks ago
-//     is the tap ttl_sr[ch][d-1], so out_delayed[t] = out_undelayed[t-d] -- ALL 62 channels
-//     independently delayable, 0 before fire (del_fill gates the tap to 0 until t >= d).
+//   * TTL: a per-channel EVENT SCHEDULER -- when the undelayed bit toggles at tick t the
+//     engine pushes {t + d_ch - 1, level} into that channel's small event FIFO and pops it
+//     against a free-running global counter, so out_delayed[t] = out_undelayed[t-d] with the
+//     storage scaling in TOGGLES IN FLIGHT (<= EVT_DEPTH, host-validated), not delay length:
+//     delays up to TTL_DELAY_WIDTH (32b, ~85.9 s) at ~2k LUTs for all 62 channels (the old
+//     per-tick SRL lines cost ~4.1k LUTs and capped d at DELAY_DEPTH ~41 us).
 //   * DAC: ONE BUS_WIDTH(10)-wide ring per bus (a 2D word array Vivado DOES infer as 3D RAM; one
 //     delay shared by all 10 bits), read at (del_wptr - d_bus).
 //   d=0 is exact passthrough (the non-delayed bits/buses bypass the line entirely).  The
@@ -88,7 +89,16 @@ module zlc_edge_streamer #(
     // declarations below can use it.  A body localparam is referenced-before-declaration,
     // which the Vivado synth frontend only warns about but STRICT tools (xsim, other FPGA
     // flows) reject -- a portability hazard across "different FPGA" builds.
-    parameter integer DELAY_TICK_WIDTH = $clog2(DELAY_DEPTH + 1)
+    parameter integer DELAY_TICK_WIDTH = $clog2(DELAY_DEPTH + 1),
+    // ----- TTL EVENT-SCHEDULER delay geometry ------------------------------------------
+    // TTL channel delays are NO LONGER bounded by DELAY_DEPTH: each channel schedules its
+    // output TOGGLES (time + level) in a small event FIFO against a free-running global
+    // tick counter, so the storage scales with the number of IN-FLIGHT TOGGLES (validated
+    // <= EVT_DEPTH by the host), not with the delay length.  TTL_DELAY_WIDTH bounds one
+    // delay (32b = ~85.9 s at 20 ns); GTIME_WIDTH bounds one RUN (48b = ~65 days).
+    parameter integer TTL_DELAY_WIDTH = 32,
+    parameter integer EVT_DEPTH = 16,
+    parameter integer GTIME_WIDTH = 48
 )(
     input  wire clk,
     input  wire reset,
@@ -161,8 +171,9 @@ module zlc_edge_streamer #(
     // Bounded: d <= DELAY_DEPTH (validated by the host).  Proven == engine_model.
     // rtl_delay_line_mirror == delay_line_reference for ANY d in [0, DELAY_DEPTH], zero, and --
     // via the host's folded global shift G -- negative.
-    //   * delay_ticks : per-channel delay d in ticks (0 = no delay), one DELAY_TICK_WIDTH slice/ch
-    input  wire [CHANNEL_COUNT*DELAY_TICK_WIDTH-1:0] delay_ticks,
+    //   * delay_ticks : per-channel delay d in ticks (0 = no delay), one TTL_DELAY_WIDTH (32b)
+    //     slice per channel -- the event scheduler supports delays far beyond the bus ring depth
+    input  wire [CHANNEL_COUNT*TTL_DELAY_WIDTH-1:0] delay_ticks,
 
     output wire [CHANNEL_COUNT-1:0] out,
     output wire [BUS_COUNT*BUS_WIDTH-1:0] bus_out,
@@ -285,25 +296,41 @@ module zlc_edge_streamer #(
     reg [TICK_WIDTH-1:0] bus_ramp_denom [0:BUS_COUNT-1];
     reg [TICK_WIDTH+BUS_WIDTH:0] bus_ramp_accum [0:BUS_COUNT-1];
 
-    // ----- LITERAL delay-line runtime (per-channel TTL SRL + per-bus DAC ring) ---------------
-    // TTL: each channel's UNDELAYED output bit is delayed by its OWN variable-tap SHIFT REGISTER
-    // ttl_sr[ch] (a packed DELAY_SLOTS-bit reg, the standard SRL primitive -- infers as SRLC32E,
-    // NOT an addressed RAM).  Each running tick shift the newest undelayed bit in at [0] (oldest
-    // falls out the top); the value pushed d ticks ago is the tap ttl_sr[ch][d-1].  62 SEPARATE
-    // shift registers, each unambiguously an SRL (a 2D array of 1-bit SCALARS read at a per-channel
-    // index is NOT an SRL -- Vivado calls it a 3D RAM and explodes it into flip-flops, hanging
-    // synth; a packed shift-reg with a tap select is the textbook inferrable delay line).
+    // ----- delay runtime (per-channel TTL EVENT SCHEDULER + per-bus DAC ring) -----------------
+    // TTL: see the EVENT SCHEDULER declarations below -- toggles are queued against a global
+    // counter instead of shifting one bit per tick, so the TTL delay bound is TTL_DELAY_WIDTH
+    // (~85.9 s) at a fraction of the old SRL cost.
     // DAC: each bus's UNDELAYED 10-bit value history is a BUS_WIDTH-wide ring bus_ring[bus] (a 2D
     // array of 10-bit words -- Vivado DOES recognise this as a 3D RAM and infers it; it is read at
     // (del_wptr - d_bus)), left exactly as is.  d_ch / d_bus are held CTRL (a delay is constant,
     // never scanned), latched into del_ch_ticks / del_bus_ticks at FIRE.  del_fill gates both reads
     // to 0 before the line has filled d deep, so a read before fill returns 0 -> silent until t == d
     // (real startup, for free; no bulk clear needed).
-    reg [DELAY_SLOTS-1:0] ttl_sr [0:CHANNEL_COUNT-1];   // 62 packed shift registers (newest at [0]); infers SRL
     (* ram_style = "distributed" *) reg [BUS_WIDTH-1:0] bus_ring [0:BUS_COUNT-1][0:DELAY_SLOTS-1];
-    reg [DELAY_ADDR_WIDTH-1:0] del_wptr = {DELAY_ADDR_WIDTH{1'b0}};   // write pointer -- bus_ring only (the SRL self-shifts)
-    reg [DELAY_TICK_WIDTH-1:0] del_ch_ticks  [0:CHANNEL_COUNT-1];  // per-channel d (0 = passthrough)
+    reg [DELAY_ADDR_WIDTH-1:0] del_wptr = {DELAY_ADDR_WIDTH{1'b0}};   // write pointer (bus_ring)
+    reg [TTL_DELAY_WIDTH-1:0]  del_ch_ticks  [0:CHANNEL_COUNT-1];  // per-channel d (0 = passthrough)
     reg [DELAY_TICK_WIDTH-1:0] del_bus_ticks [0:BUS_COUNT-1];      // per-bus d (0 = passthrough)
+    // ----- TTL EVENT SCHEDULER (replaces the 62 per-channel SRL delay lines) -----------
+    // The old SRLs stored ONE BIT PER TICK of delay (DELAY_DEPTH=2048 -> 65 SRL32 + tap
+    // mux per channel = ~4.1k LUTs, delay capped at ~41 us).  A TTL waveform is toggle-
+    // sparse, so store the TOGGLES instead: when the engine's undelayed bit for channel
+    // ch flips at global tick t, push {t + d_ch - 1, new_level} into ch's EVT_DEPTH-deep
+    // event FIFO; when the free-running g_time reaches the head's time, pop it into the
+    // output register (visible the NEXT cycle -> level appears exactly at t + d_ch, i.e.
+    // out[t] = in[t-d], identical to the SRL/ring semantics, 0 before the first event).
+    // d == 1 cannot use the queue (the entry would have to pop the cycle it is pushed),
+    // so it is served by the prev_undelayed register (a 1-tick delay IS one register).
+    // Cost ~ EVT_DEPTH x (GTIME_WIDTH+1)b LUTRAM + one GTIME_WIDTH comparator per channel
+    // (~2k LUTs total) and the delay bound becomes TTL_DELAY_WIDTH (32b = ~85.9 s) -- the
+    // host validates <= EVT_DEPTH toggles in flight per channel inside any d-window.
+    reg [GTIME_WIDTH-1:0] g_time = {GTIME_WIDTH{1'b0}};         // free-running ticks since FIRE
+    reg [CHANNEL_COUNT-1:0] prev_undelayed = {CHANNEL_COUNT{1'b0}};
+    (* ram_style = "distributed" *) reg [GTIME_WIDTH:0] evt_mem [0:CHANNEL_COUNT-1][0:EVT_DEPTH-1];
+    localparam integer EVT_ADDR = $clog2(EVT_DEPTH);
+    reg [EVT_ADDR-1:0] evt_wr  [0:CHANNEL_COUNT-1];
+    reg [EVT_ADDR-1:0] evt_rd  [0:CHANNEL_COUNT-1];
+    reg [EVT_ADDR:0]   evt_cnt [0:CHANNEL_COUNT-1];
+    reg [CHANNEL_COUNT-1:0] evt_out = {CHANNEL_COUNT{1'b0}};    // scheduled (delayed) levels
     // del_fill = number of UNDELAYED samples pushed BEFORE this tick (== the running tick index t
     // since FIRE), saturating at DELAY_DEPTH.  A read at distance d is valid (returns the value
     // pushed d ticks ago) once del_fill >= d, i.e. t >= d -- the slot d ago was actually written
@@ -326,10 +353,10 @@ module zlc_edge_streamer #(
     wire start_event = start_sync && !start_prev;
     wire bus_prog_we_event = bus_prog_we_sync != bus_prog_we_prev;
 
-    // ---- per-channel / per-bus held delay slices (one DELAY_TICK_WIDTH field each) ----
-    function [DELAY_TICK_WIDTH-1:0] zlc_delay_ch_at;
+    // ---- per-channel / per-bus held delay slices ----
+    function [TTL_DELAY_WIDTH-1:0] zlc_delay_ch_at;
         input integer ch;
-        begin zlc_delay_ch_at = delay_ticks[ch*DELAY_TICK_WIDTH +: DELAY_TICK_WIDTH]; end
+        begin zlc_delay_ch_at = delay_ticks[ch*TTL_DELAY_WIDTH +: TTL_DELAY_WIDTH]; end
     endfunction
     function [DELAY_TICK_WIDTH-1:0] zlc_delay_bus_at;
         input integer b;
@@ -346,32 +373,27 @@ module zlc_edge_streamer #(
         end
     endfunction
 
-    // Per-channel OUTPUT-delay merge (combinational tap of each channel's SHIFT REGISTER).
-    // delayed_mask[b] marks the bits a delayed channel owns (cleared from the undelayed
-    // state_mask); delayed_out[b] is that channel's bit pushed d_ch writes ago -- gated by
-    // (del_fill >= d_ch) so it is 0 until t >= d_ch this run (silent startup, no bulk clear).
-    //
-    // TAP = d-1 (proven == the old circular read): the SR shifts the newest undelayed bit in at [0]
-    // each running tick (nonblocking, so this cycle ttl_sr[ch][0] still holds the bit pushed LAST
-    // tick).  Hence combinationally ttl_sr[ch][k] == the bit pushed (k+1) ticks ago, so the value
-    // pushed d ticks ago is ttl_sr[ch][d-1].  d_ch != 0 here (d==0 is bypassed via state_mask), so
-    // d-1 is always a valid in-range tap; this is byte-identical to the old ring read at
-    // (del_wptr - d), which the delay_line_reference (out[t]=in[t-d]) proves.
+    // Per-channel OUTPUT-delay merge.  delayed_mask[b] marks the bits a delayed channel owns
+    // (cleared from the undelayed state_mask); delayed_out[b] is the SCHEDULED level for that
+    // channel: evt_out (event scheduler, d >= 2) or prev_undelayed (a register IS a 1-tick
+    // delay, d == 1).  Both are 0 until the first scheduled toggle -> out[t] = in[t-d], 0
+    // before t = d, exactly the proven delay_line_reference semantics.
     // out = (state_mask & ~delayed_mask) | delayed_out -- a non-delayed channel passes straight
-    // through; a delay never touches another channel.  d_ch == 0 never reaches here, so the host
-    // never delays a channel by 0.
+    // through; a delay never touches another channel.  d_ch == 0 never reaches here.
     reg [CHANNEL_COUNT-1:0] delayed_mask;   // bit b set iff channel b is delayed (d_ch != 0)
-    reg [CHANNEL_COUNT-1:0] delayed_out;    // delayed value per owned bit (pushed d_ch writes ago)
+    reg [CHANNEL_COUNT-1:0] delayed_out;    // delayed value per owned bit
     integer del_m;
     always @(*) begin
         delayed_mask = {CHANNEL_COUNT{1'b0}};
         delayed_out  = {CHANNEL_COUNT{1'b0}};
         for (del_m = 0; del_m < CHANNEL_COUNT; del_m = del_m + 1) begin
-            if (del_ch_ticks[del_m] != {DELAY_TICK_WIDTH{1'b0}}) begin
+            if (del_ch_ticks[del_m] != {TTL_DELAY_WIDTH{1'b0}}) begin
                 delayed_mask[del_m] = 1'b1;
-                // channel del_m's OWN shift register, tapped d_ch-1 (== d_ch writes ago)
-                delayed_out[del_m] = (del_fill >= del_ch_ticks[del_m])
-                                     ? ttl_sr[del_m][del_ch_ticks[del_m] - 1'b1] : 1'b0;
+                // d == 1: a single register IS a 1-tick delay (the event queue cannot
+                // pop an entry the same cycle it is pushed).  d >= 2: the scheduled
+                // level register (out[t] = in[t-d], 0 before the first scheduled event).
+                delayed_out[del_m] = (del_ch_ticks[del_m] == {{(TTL_DELAY_WIDTH-1){1'b0}}, 1'b1})
+                                     ? prev_undelayed[del_m] : evt_out[del_m];
             end
         end
     end
@@ -502,7 +524,7 @@ module zlc_edge_streamer #(
         begin
             del_wptr <= {DELAY_ADDR_WIDTH{1'b0}};
             del_fill <= {DELAY_TICK_WIDTH{1'b0}};
-            for (i = 0; i < CHANNEL_COUNT; i = i + 1) del_ch_ticks[i] <= {DELAY_TICK_WIDTH{1'b0}};
+            for (i = 0; i < CHANNEL_COUNT; i = i + 1) del_ch_ticks[i] <= {TTL_DELAY_WIDTH{1'b0}};
             for (i = 0; i < BUS_COUNT; i = i + 1) del_bus_ticks[i] <= {DELAY_TICK_WIDTH{1'b0}};
         end
     endtask
@@ -979,24 +1001,73 @@ module zlc_edge_streamer #(
         end
         if (bnd_bus_tick) zlc_bus_tick(bnd_bus_reinit, bnd_slots);
         if (bnd_seed) seed_from_edge0(bnd_slots, bnd_count);
-        // ---- LITERAL delay line: push this tick's UNDELAYED outputs into the SR / ring ----------
-        // On every running output tick, SHIFT the current (pre-update) undelayed state_mask bit into
-        // each channel's shift register at [0] (oldest bit falls out the top), and write each bus's
-        // current undelayed value into its ring slot del_wptr, then advance del_wptr + the fill
-        // counter.  This is the SAME timing as the old circular write (gated by bnd_delay_advance,
-        // ONE nonblocking write per channel/bus per tick -- NO added pipeline stage / cycle of
-        // latency).  The combinational TTL tap reads ttl_sr[ch][d-1] (== d ticks ago, see merge
-        // above), byte-identical to the old ring read (del_wptr - d).  bus_ring keeps the ring read
-        // (del_wptr - d).  del_fill gates both reads to 0 until d pushes have happened -> silent
-        // until t == d (no bulk clear).
+        // ---- DAC delay ring: push this tick's UNDELAYED bus values ------------------------------
+        // (TTL no longer uses a per-tick line: see the EVENT SCHEDULER block below.)  Write each
+        // bus's current undelayed value into its ring slot del_wptr, advance del_wptr + the fill
+        // counter; the combinational ring read at (del_wptr - d) with the del_fill gate is the
+        // proven out[t] = in[t-d] / safe-before-fill behaviour.
         if (bnd_delay_advance) begin
-            for (del_i = 0; del_i < CHANNEL_COUNT; del_i = del_i + 1)
-                ttl_sr[del_i] <= { ttl_sr[del_i][DELAY_SLOTS-2:0], state_mask[del_i] };  // shift newest in at [0]
             for (del_i = 0; del_i < BUS_COUNT; del_i = del_i + 1)
                 bus_ring[del_i][del_wptr] <= bus_value_active[del_i];
             del_wptr <= (del_wptr == DELAY_SLOTS-1) ? {DELAY_ADDR_WIDTH{1'b0}} : (del_wptr + 1'b1);
             if (del_fill < DELAY_DEPTH[DELAY_TICK_WIDTH-1:0])   // saturate at the max valid d
                 del_fill <= del_fill + 1'b1;
+        end
+    end
+
+    // ----- TTL EVENT SCHEDULER runtime -------------------------------------------------------
+    // Self-contained block (its own reset/FIRE handling so the main playback chain is
+    // untouched).  Timeline (g_time == running tick t, both reset at FIRE):
+    //   * cycle t: the undelayed state_mask differs from prev_undelayed on channel ch
+    //     (the toggle that happened AT t) -> push {g_time + d_ch - 1, new_level} into ch's
+    //     event FIFO (d_ch >= 2 here; d == 1 is the prev_undelayed register, d == 0 bypass).
+    //   * cycle u == t + d - 1: the head matches g_time -> evt_out[ch] <= level (NBA),
+    //     visible during cycle t + d  ==>  out[t] = in[t-d] exactly, 0 before the first event.
+    //   * g_time keeps counting after done so a long delayed tail drains; CMD_SAFE (reset)
+    //     clears the queues and drops the outputs immediately (same as the old line).
+    // Per-channel pushes are strictly time-ordered (one toggle per cycle per channel), so a
+    // plain FIFO + equality compare is exact.  The host validates that no more than
+    // EVT_DEPTH toggles are in flight inside any d-window; the guard below additionally
+    // drops (rather than corrupts) on an impossible overflow.
+    integer ev_i;
+    reg ev_push, ev_pop;
+    always @(posedge clk) begin
+        if (reset_sync) begin
+            g_time <= {GTIME_WIDTH{1'b0}};
+            prev_undelayed <= {CHANNEL_COUNT{1'b0}};
+            evt_out <= {CHANNEL_COUNT{1'b0}};
+            for (ev_i = 0; ev_i < CHANNEL_COUNT; ev_i = ev_i + 1) begin
+                evt_wr[ev_i] <= {EVT_ADDR{1'b0}};
+                evt_rd[ev_i] <= {EVT_ADDR{1'b0}};
+                evt_cnt[ev_i] <= {(EVT_ADDR+1){1'b0}};
+            end
+        end else begin
+            g_time <= g_time + 1'b1;
+            prev_undelayed <= state_mask;
+            for (ev_i = 0; ev_i < CHANNEL_COUNT; ev_i = ev_i + 1) begin
+                ev_push = (state_mask[ev_i] != prev_undelayed[ev_i])
+                          && (del_ch_ticks[ev_i] > {{(TTL_DELAY_WIDTH-1){1'b0}}, 1'b1})
+                          && (evt_cnt[ev_i] != EVT_DEPTH[EVT_ADDR:0]);
+                ev_pop = (evt_cnt[ev_i] != {(EVT_ADDR+1){1'b0}})
+                         && (evt_mem[ev_i][evt_rd[ev_i]][GTIME_WIDTH:1] == g_time);
+                if (ev_push) begin
+                    // zero-EXTEND the 32b delay to the 48b time base (an out-of-range
+                    // part-select here would X-poison the entry and kill the compare)
+                    evt_mem[ev_i][evt_wr[ev_i]] <= {
+                        g_time + {{(GTIME_WIDTH-TTL_DELAY_WIDTH){1'b0}}, del_ch_ticks[ev_i]} - 1'b1,
+                        state_mask[ev_i] };
+                    evt_wr[ev_i] <= evt_wr[ev_i] + 1'b1;
+                end
+                if (ev_pop) begin
+                    evt_out[ev_i] <= evt_mem[ev_i][evt_rd[ev_i]][0];
+                    evt_rd[ev_i] <= evt_rd[ev_i] + 1'b1;
+                end
+                case ({ev_push, ev_pop})
+                    2'b10: evt_cnt[ev_i] <= evt_cnt[ev_i] + 1'b1;
+                    2'b01: evt_cnt[ev_i] <= evt_cnt[ev_i] - 1'b1;
+                    default: ;
+                endcase
+            end
         end
     end
 

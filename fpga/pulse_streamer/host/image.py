@@ -18,8 +18,9 @@ no width padding) so max_edges is large; the scan window is small (2 banks) and
 the host streams the rest -> UNBOUNDED scan points.  Bus tables stay LUTRAM.
 
 The per-channel / per-bus OUTPUT delay is a LITERAL delay line (a distributed-RAM circular
-buffer of depth delay_depth ticks) -- its delays ride DENSE CTRL words (DELAY_TICKS /
-BUS_DELAY_TICKS), there is NO delay BRAM image / region.
+buffer of depth delay_depth ticks for the DAC buses).  TTL channel delays are EVENT-
+SCHEDULED (queued toggles, 32-bit delay bound) and live in their own DELAY register
+region; bus delays still ride the dense BUS_DELAY_TICKS CTRL words.
 """
 
 from __future__ import annotations
@@ -86,7 +87,7 @@ class CtrlWords:
     # into a per-channel ring each tick and reads (wptr - delay_ticks[ch]) -- so out[t]=in[t-d],
     # 0 before fire.  Bounded: d <= delay_depth (the host validates this).  Layout is for the
     # DEFAULT channel_count=62 (locked to zlc_pulse_streamer_top.v by test_final_top_regions_match_image).
-    DELAY_TICKS = 20     # dense per-channel delay (delay_tick_width bits each) -> ceil(62*12/32)=24 words (20..43)
+    DELAY_TICKS = 20     # RESERVED (was the dense per-channel delay; TTL delays moved to the DELAY region)
     # PER-BUS DAC DELAY -- the same LITERAL delay line, one delay shared by all 10 bits of a bus:
     # bus b is delayed by ``bus_delay_ticks[b]`` ticks (0 = passthrough), dense per-bus.
     BUS_DELAY_TICKS = 44  # dense per-bus delay (delay_tick_width bits each) -> ceil(4*12/32)=2 words (44..45)
@@ -113,12 +114,19 @@ class StreamerParams:
     bus_width: int = 10
     bus_seg_addr_width: int = 6
     bus_sel_width: int = 3
-    # LITERAL OUTPUT delay line: a per-channel / per-bus circular buffer of depth delay_depth
-    # ticks.  delay_depth bounds the maximum delay (2048 * 20 ns = ~40 us, covers +/-15 us after
-    # the negative-delay global shift G).  delay_tick_width holds a delay in [0, delay_depth].
-    # ALL channel_count channels and ALL bus_count buses are independently delayable; the host
-    # validates every effective delay <= delay_depth.
+    # DAC delay ring: a per-bus circular buffer of depth delay_depth ticks.  delay_depth
+    # bounds the maximum BUS delay (2048 * 20 ns = ~41 us); delay_tick_width holds it.
     delay_depth: int = 2048
+    # TTL EVENT SCHEDULER: per-channel delays are queued TOGGLES against a free-running
+    # global counter, so a TTL delay is bounded only by its 32-bit field
+    # (ttl_delay_max_ticks ~ 42.9 s at 20 ns) -- e.g. millisecond emCCD delays.  The
+    # constraint moves from delay LENGTH to toggles IN FLIGHT: at most evt_fifo_depth
+    # toggles of one channel may fall inside any window of that channel's delay length
+    # (validated at compile/pack time; sparse experiment triggers are far below this).
+    ttl_delay_max_ticks: int = (1 << 31) - 1
+    evt_fifo_depth: int = 16
+    # TTL DELAY register region: one 32b word per channel, 64 words reserved.
+    delay_region_words: int = 64
 
     @property
     def channel_bit_width(self) -> int:
@@ -224,17 +232,20 @@ def _addr_width(depth: int) -> int:
 def region_bases(p: StreamerParams) -> dict:
     """Word-address bases of each AXI write region (the host<->top contract).
 
-    The LITERAL delay line carries its delays in DENSE CTRL words (no BRAM image), so there
-    is NO delay region -- the last region is the bus image."""
+    TTL channel delays live in their own DELAY register region (one 32-bit word per
+    channel, delay_region_words reserved) -- the event scheduler's delays outgrew the
+    dense 12-bit CTRL fields, whose words (20..43) are now reserved/unused.  Bus delays
+    (ring-capped) and the clk mask stay in CTRL."""
     ctrl = 0
     tick = CTRL_WORDS
     coeff = tick + p.max_edges * 1
     mask = coeff + p.max_edges * p.coeff_words
     scan = mask + p.max_edges * p.mask_words
     bus = scan + 2 * p.bank_size * p.scan_words
-    total = bus + p.bus_rows * p.bus_words
+    delay = bus + p.bus_rows * p.bus_words
+    total = delay + p.delay_region_words
     return {"ctrl": ctrl, "tick": tick, "coeff": coeff, "mask": mask,
-            "scan": scan, "bus": bus, "total": total}
+            "scan": scan, "bus": bus, "delay": delay, "total": total}
 
 
 # --------------------------------------------------------------------------- bits
@@ -306,6 +317,10 @@ def check_rtl_assumptions(p: StreamerParams) -> None:
         raise ValueError(f"max_edges must be a power of two (got {p.max_edges}); MAX_EDGES = 1 << EDGE_ADDR_WIDTH.")
     if p.tick_width != 32:
         raise ValueError(f"tick_width must be 32 (got {p.tick_width}); the tick BRAM port and CTRL words are 32b.")
+    if p.channel_count > p.delay_region_words:
+        raise ValueError(
+            f"channel_count {p.channel_count} exceeds the TTL DELAY register region "
+            f"({p.delay_region_words} words; one 32b delay word per channel).")
 
 
 def _bus_mode_value(mode) -> int:
@@ -440,22 +455,24 @@ def pack_program(program, params: StreamerParams | None = None) -> dict[int, int
             w[row + 2 + 2 * p.coeff_words] = flags
     w[CtrlWords.BUS_COUNTS] = bus_counts
 
-    # PER-CHANNEL OUTPUT DELAY -- a LITERAL delay line.  Pack a DENSE per-channel delay tick
-    # count: field ch = delay_ticks[ch] in ticks (0 = passthrough), delay_tick_width bits each,
-    # LSB-first across the C_DELAY_TICKS CTRL words.  Validate every delay <= delay_depth (the
-    # bounded circular-buffer cap); no intervals, no off/skip, no BRAM image.
+    # PER-CHANNEL TTL OUTPUT DELAY -- the EVENT SCHEDULER.  One 32-bit word per channel in
+    # the DELAY register region (0 = passthrough).  A delay is bounded by ttl_delay_max_ticks
+    # (32-bit field, ~42.9 s), NOT by the bus-ring depth; pack always writes ALL channel
+    # words so stale delays from a previous program can never linger.
     channel_delays = [int(d) for d in (getattr(program, "channel_delays", None) or [])]
     dtw = p.delay_tick_width
-    delay_word = 0
     for ch, d in enumerate(channel_delays):
         if ch >= p.channel_count:
             if d:
                 raise ValueError(f"channel-delay bit {ch} is outside channel_count {p.channel_count}.")
             continue
-        _validate_delay_depth(d, p.delay_depth, f"channel bit {ch}")
-        delay_word |= (d & ((1 << dtw) - 1)) << (ch * dtw)
-    for i in range(p.delay_ticks_words):
-        w[CtrlWords.DELAY_TICKS + i] = (delay_word >> (32 * i)) & 0xFFFFFFFF
+        if d < 0 or d > p.ttl_delay_max_ticks:
+            raise ValueError(
+                f"channel bit {ch} delay {d} ticks is outside [0, {p.ttl_delay_max_ticks}] "
+                f"(~{p.ttl_delay_max_ticks * 20e-9:.1f} s at 20 ns/tick).")
+    for ch in range(p.channel_count):
+        d = channel_delays[ch] if ch < len(channel_delays) else 0
+        w[bases["delay"] + ch] = _to_unsigned(d, 32)
 
     # PER-BUS DAC DELAY -- the same LITERAL delay line, one delay shared by all 10 bits of a bus.
     # Pack a DENSE per-bus delay tick count (delay_tick_width bits each, LSB-first).
@@ -536,9 +553,7 @@ def unpack_program(words: Mapping[int, int], params: StreamerParams | None = Non
     # PER-CHANNEL OUTPUT DELAY -- a LITERAL delay line: reconstruct the DENSE per-channel delay
     # tick count exactly as zlc_pulse_streamer_top.v slices it (one delay_tick_width field/channel).
     dtw = p.delay_tick_width
-    delay_word = _unfield([g(CtrlWords.DELAY_TICKS + i) for i in range(p.delay_ticks_words)],
-                          p.channel_count * dtw)
-    channel_delays = [(delay_word >> (ch * dtw)) & ((1 << dtw) - 1) for ch in range(p.channel_count)]
+    channel_delays = [int(g(bases["delay"] + ch)) for ch in range(p.channel_count)]
     bus_delay_word = _unfield([g(CtrlWords.BUS_DELAY_TICKS + i) for i in range(p.bus_delay_ticks_words)],
                               p.bus_count * dtw)
     bus_delays = [{"bus_index": b, "delay": (bus_delay_word >> (b * dtw)) & ((1 << dtw) - 1)}
@@ -644,9 +659,13 @@ def estimate_resources(params: StreamerParams, *, part, target_pct: float = 90.0
                         + 2 + 2 * params.bus_sel_width) * params.bus_rows, 64)
     # LITERAL delay line LUT cost: TTL = SRL32 chain + tap mux/ch; DAC = distributed-RAM ring.
     delay_slots = params.delay_depth + 1
-    ttl_srl_luts = params.channel_count * (_ceil(delay_slots, 32) + 1)
+    # TTL EVENT SCHEDULER (per channel): an EVT_DEPTH x 49b LUTRAM event FIFO (~12 LUTs),
+    # a 48b equality comparator (~14) and push/pop control (~6) -- ~32 LUTs/channel, vs the
+    # old per-tick SRL lines at ceil(delay_slots/32)+1 (~66 LUTs/channel at depth 2048) --
+    # AND the TTL delay bound grows from delay_depth (~41 us) to 32 bits (~42.9 s).
+    ttl_sched_luts = params.channel_count * 32
     dac_ring_luts = (params.bus_count * params.bus_width) * _ceil(delay_slots, 64)
-    delay_lutram = ttl_srl_luts + dac_ring_luts
+    delay_lutram = ttl_sched_luts + dac_ring_luts
     # DSP: engine affine-MAC call sites (2 evals/bus + 5 main) x num_slots products,
     # each coeff(<=18b) x slot(slot_mul_width); slot operand <=25b fits ONE DSP48E1.
     if engine_dsp is None:

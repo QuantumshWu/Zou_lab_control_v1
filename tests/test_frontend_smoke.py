@@ -2094,10 +2094,13 @@ def test_delay_edit_caps_at_delay_depth(monkeypatch):
     channel = next(iter(panel.delay_edits))
     edit = panel.delay_edits[channel]
     panel.delay_units[channel].setCurrentText("us")
-    edit.setText("999")                  # 999 us >> 40.96 us cap
+    edit.setText("999")                  # 999 us: inside the new ~42.9 s TTL bound -> UNCHANGED
+    panel._clamp_delay_edit(channel, edit)
+    assert abs(float(edit.text()) - 999.0) < 1e-6
+    edit.setText(str(10 ** 9))           # 1e9 us = 1000 s: beyond the 32-bit field -> clamped
     panel._clamp_delay_edit(channel, edit)
     capped_us = DELAY_DEPTH_TICKS * ed.state.time_step_ns / 1000.0
-    assert abs(float(edit.text()) - capped_us) < 1e-6
+    assert abs(float(edit.text()) - capped_us) <= max(1e-6, capped_us * 1e-9)
 
 
 def test_delay_unit_combo_only_ns_and_us(monkeypatch):
