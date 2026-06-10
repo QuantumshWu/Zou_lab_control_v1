@@ -5525,6 +5525,34 @@ def test_sequencer_prepare_accepts_streamed_scan_beyond_resident_window():
 # RTL-finding fixes (2026-06-09): U4 delay-tail-at-done, U1 ramp slope cap,
 # B1/B2 da_clk idle warning, T3 latency read-back, B3/B4/U7 geometry guards.
 # --------------------------------------------------------------------------- #
+def test_counter_width_guards_reject_silent_wrap():
+    """32-bit counter guards: a frame longer than the 32-bit time counter, a scan with
+    more than 2^32 points, or a loop_count beyond 2^32 must be REJECTED with a clear
+    message -- never silently wrapped on hardware (the '太长/太多会不会卡死' audit)."""
+
+    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import validate_pulse_streamer_program
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
+
+    def prog(**kw):
+        base = dict(
+            sequence_id="cw", sequence_name="cw", clock_hz=50e6,
+            channels=[f"ch{i:02d}" for i in range(62)],
+            ticks=[0, 100], masks=[1, 0], duration=4e-6, trigger_count=0,
+            repeat_forever=False, loop_start_index=0, loop_end_tick=100, loop_count=1,
+        )
+        base.update(kw)
+        return RuntimeSequenceProgram(**base)
+
+    # frame longer than the 32-bit tick counter (~85.9 s at 20 ns): friendly message
+    with pytest.raises(ValueError, match="32-bit|32 bits"):
+        validate_pulse_streamer_program(prog(ticks=[0, 1 << 32], masks=[1, 0]))
+    # loop_count beyond the 32-bit LOOP_COUNT ctrl word
+    with pytest.raises(ValueError, match="LOOP_COUNT"):
+        validate_pulse_streamer_program(prog(loop_count=1 << 32))
+    # a sane program still passes
+    validate_pulse_streamer_program(prog())
+
+
 def test_scan_frame_shorter_than_read_latency_is_rejected():
     """SAME-CLASS guard as the edge read-latency fix: the scan BRAM is read with a fixed
     latency and the engine reads the NEXT point's slot during the CURRENT frame, so a

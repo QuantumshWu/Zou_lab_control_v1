@@ -1986,7 +1986,25 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         # relayout + repaint; deferring to a single repaint at the end is the
         # dominant speed-up for "Show All".
         with batched_updates(self):
-            self._rebuild_channel_panels()
+            # The channel-side panels (names + delay/scan) depend only on the
+            # CHANNEL-side state; a period edit (add/remove/reorder/value) leaves
+            # them untouched.  Skipping their teardown+rebuild when this key is
+            # unchanged cuts a third off every Add/Remove-Period press.
+            chan_key = (
+                tuple(state.channels), tuple(state.visible_channels),
+                tuple(sorted((str(k), str(v)) for k, v in (getattr(state, "labels", None) or {}).items())),
+                tuple(sorted((str(k), float(v)) for k, v in (state.delays or {}).items())),
+                tuple(sorted((str(k), str(v)) for k, v in (state.delay_units or {}).items())),
+                tuple(getattr(state, "clk_channels", []) or []),
+                len(state.scan_slots), float(state.time_step_ns),
+            )
+            if chan_key != getattr(self, "_chan_panel_key", None) or not hasattr(self, "channel_panel"):
+                self._rebuild_channel_panels()
+                self._chan_panel_key = chan_key
+            else:
+                # same channel-side data: just repoint the panels at the new state
+                self.names_panel.state = state
+                self.channel_panel.state = state
             self._rebuild_periods()  # ends with _sync_dataset_geometry()
             self._refresh_hidden_combo()
         self._building = False

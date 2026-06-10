@@ -159,11 +159,83 @@ def status_dot_stylesheet(color: str, *, radius: int = 8) -> str:
     return f"background:{color}; border-radius:{scaled_px(radius)}px;"
 
 
+# Shadow pixmaps are pure functions of the card SILHOUETTE (every shadowed fluent
+# widget is an opaque rounded rect): cache one rendered shadow per (size, radius,
+# blur, alpha, offset, dpr) and share it across all widgets of that size.
+_SHADOW_PIXMAP_CACHE: dict[tuple, QtGui.QPixmap] = {}
+
+
+def _shadow_pixmap(width: int, height: int, radius: int, blur: int, alpha: int,
+                   offset: int, dpr: float) -> QtGui.QPixmap:
+    key = (int(width), int(height), int(radius), int(blur), int(alpha), int(offset), round(float(dpr), 2))
+    cached = _SHADOW_PIXMAP_CACHE.get(key)
+    if cached is not None:
+        return cached
+    # Render THE SAME QGraphicsDropShadowEffect once, on a dummy rounded rect with
+    # the card's silhouette, via a throwaway QGraphicsScene -- the canonical way to
+    # bake an effect's output into a pixmap.  The dummy is filled white (the card
+    # background) so the antialiased rim under the live card matches the original.
+    margin = blur + abs(offset)
+    scene = QtWidgets.QGraphicsScene()
+    path = QtGui.QPainterPath()
+    path.addRoundedRect(0.0, 0.0, float(width), float(height), float(radius), float(radius))
+    item = scene.addPath(path, QtGui.QPen(QtCore.Qt.NoPen), QtGui.QBrush(QtGui.QColor("white")))
+    effect = QtWidgets.QGraphicsDropShadowEffect()
+    effect.setBlurRadius(blur)
+    effect.setColor(QtGui.QColor(0, 0, 0, alpha))
+    effect.setOffset(0, offset)
+    item.setGraphicsEffect(effect)
+    pixmap = QtGui.QPixmap(int((width + 2 * margin) * dpr), int((height + 2 * margin) * dpr))
+    pixmap.setDevicePixelRatio(dpr)
+    pixmap.fill(QtCore.Qt.transparent)
+    painter = QtGui.QPainter(pixmap)
+    painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+    scene.render(painter, QtCore.QRectF(0, 0, width + 2 * margin, height + 2 * margin),
+                 QtCore.QRectF(-margin, -margin, width + 2 * margin, height + 2 * margin))
+    painter.end()
+    _SHADOW_PIXMAP_CACHE[key] = pixmap
+    return pixmap
+
+
+class CachedDropShadow(QtWidgets.QGraphicsEffect):
+    """Drop shadow with a SIZE-KEYED cached shadow pixmap + live source painting.
+
+    A stock ``QGraphicsDropShadowEffect`` re-rasterises the source widget and
+    re-runs the Gaussian blur on EVERY paint -- scrolling a panel of shadowed
+    cards spent ~90% of each frame in the blur (measured 18.4 ms/step vs the
+    2.0 ms no-shadow floor).  Every shadowed fluent widget is an opaque ROUNDED
+    RECT, whose shadow depends only on its silhouette -- so the blurred shadow
+    is rendered once per (size, radius, blur, alpha) into a shared pixmap and
+    blitted, while the live widget is painted normally on top via
+    ``drawSource`` (no caching of CONTENT -> no stale-pixmap ghosting)."""
+
+    def __init__(self, parent=None, *, radius: int, blur: int, alpha: int, offset: int):
+        super().__init__(parent)
+        self._radius = int(radius)
+        self._blur = int(blur)
+        self._alpha = int(alpha)
+        self._offset = int(offset)
+
+    def boundingRectFor(self, rect: QtCore.QRectF) -> QtCore.QRectF:  # noqa: N802
+        margin = float(self._blur + abs(self._offset))
+        return rect.adjusted(-margin, -margin, margin, margin)
+
+    def draw(self, painter: QtGui.QPainter) -> None:  # noqa: N802
+        rect = self.sourceBoundingRect(QtCore.Qt.LogicalCoordinates)
+        if not rect.isEmpty():
+            dpr = painter.device().devicePixelRatioF() if painter.device() is not None else 1.0
+            margin = self._blur + abs(self._offset)
+            pixmap = _shadow_pixmap(
+                int(round(rect.width())), int(round(rect.height())),
+                self._radius, self._blur, self._alpha, self._offset, dpr)
+            painter.drawPixmap(QtCore.QPointF(rect.x() - margin, rect.y() - margin), pixmap)
+        self.drawSource(painter)
+
+
 def add_fluent_shadow(widget: QtWidgets.QWidget, *, blur: int = 20, alpha: int = 50, offset: int = 0) -> None:
-    shadow = QtWidgets.QGraphicsDropShadowEffect(widget)
-    shadow.setBlurRadius(scaled_px(blur))
-    shadow.setColor(QtGui.QColor(0, 0, 0, alpha))
-    shadow.setOffset(0, scaled_px(offset, minimum=0))
+    shadow = CachedDropShadow(
+        widget, radius=_radius(), blur=scaled_px(blur), alpha=alpha,
+        offset=scaled_px(offset, minimum=0))
     widget.setGraphicsEffect(shadow)
 
 

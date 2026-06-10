@@ -321,6 +321,14 @@ def validate_pulse_streamer_program(
     tick_limit = (1 << tick_width) - 1
     mask_limit = (1 << channel_count) - 1
     scan_points = list(getattr(program, "scan_points", None) or [])
+    # 32-bit COUNTER guards (the FPGA's SCAN_COUNT / LOOP_COUNT CTRL words and the
+    # frame time counter are 32 bits): reject anything that would silently wrap.
+    counter_limit = (1 << 32) - 1
+    if len(scan_points) > counter_limit:
+        raise ValueError(f"{len(scan_points)} scan points exceed the 32-bit SCAN_COUNT counter.")
+    loop_count_value = int(getattr(program, "loop_count", 1) or 1)
+    if loop_count_value > counter_limit:
+        raise ValueError(f"loop_count {loop_count_value} exceeds the 32-bit LOOP_COUNT counter.")
     require_base_ticks_increasing = not scan_points
     last_tick = -1
     for tick in program.ticks:
@@ -328,7 +336,14 @@ def validate_pulse_streamer_program(
         if require_base_ticks_increasing and tick <= last_tick:
             raise ValueError("program ticks must be strictly increasing.")
         if tick < 0 or tick > tick_limit:
-            raise ValueError(f"program tick {tick} does not fit {tick_width} bits.")
+            # tick_width=32 at 20 ns/tick caps one frame at ~85.9 s -- say so, the raw
+            # bit-count message reads as a bug rather than a physical limit.
+            seconds = tick * 20e-9
+            raise ValueError(
+                f"program tick {tick} does not fit {tick_width} bits: the frame time "
+                f"counter is {tick_width}-bit, one frame must stay under "
+                f"{((1 << tick_width) - 1) * 20e-9:.1f} s at 20 ns/tick (this edge is at "
+                f"~{seconds:.1f} s). Split the sequence or use repeat/loop instead.")
         last_tick = tick
     for mask in program.masks:
         mask = int(mask)
