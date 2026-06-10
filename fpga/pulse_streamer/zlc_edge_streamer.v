@@ -807,8 +807,9 @@ module zlc_edge_streamer #(
         end else if (done) begin
             // DONE-but-emitting: keep shifting the delay rings after the final tick so a
             // DELAYED channel/bus flushes its remaining tail (up to delay_depth ticks) and
-            // then settles LOW -- state_mask and bus_value_active were cleared at done, so
-            // the pushes are zeros and out[t] = in[t-d] holds for the WHOLE stream, exactly
+            // then settles at its REST value -- state_mask was cleared to 0 and
+            // bus_value_active to BUS_SAFE_VALUE (mid code = 0 V) at done, so the pushes are
+            // those rest values and out[t] = in[t-d] holds for the WHOLE stream, exactly
             // the delay_line_reference / rtl_mirror_play contract.  Without this the rings
             // FREEZE at done and a delayed channel holds a STALE (possibly HIGH) tap value
             // until the host reacts (ms over JTAG).  A new FIRE takes the start_event branch

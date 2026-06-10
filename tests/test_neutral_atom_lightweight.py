@@ -1444,6 +1444,8 @@ def test_final_image_solver_90pct_and_packs_round_trip():
     assert out["scan_points_resident"] == [list(pt) for pt in prog.scan_points]
     assert out["scan_count"] == 5 and out["loop_count"] == 3 and out["repeat_forever"]
     b = out["bus_segments"][0]
+    # stop_value=1023 is a WIRE-LAYER offset-binary code (= signed +511); pack/unpack
+    # operate purely on the wire layer, so raw codes are correct here.
     assert b["mode"] == "ramp" and b["stop_value"] == 1023 and b["value_select"] == 2
     # a streamed chunk (beyond the resident window) packs into the right bank.
     assert scan_bank_words(prog, p, 0)  # chunk 0 non-empty

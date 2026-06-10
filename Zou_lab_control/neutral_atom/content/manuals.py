@@ -151,13 +151,14 @@ def generate_fpga_manual_figures(asset_dir: str | Path) -> dict[str, Path]:
                                        show_names=True, repeat_bracket=(0.0, dur, "repeat x N (HW loop, seamless)"),
                                        caption="硬件重复 loop")
 
-    # (4) analog DAC ramp via the frontend analog trace: hold 0 -> ramp 0..1023 -> hold.
+    # (4) analog DAC ramp via the frontend analog trace: rest at 0 V -> ramp the SIGNED
+    # value -512..+511 -> hold (the user layer is signed LSB; 0 V sits mid-row).
     ramp_t = list(np.linspace(1e-6, 3e-6, 21))
-    ramp_v = [int(v) for v in np.linspace(0, 1023, 21)]
+    ramp_v = [int(v) for v in np.linspace(-512, 511, 21)]
     starts = [0.0, 1e-6] + ramp_t[1:] + [4e-6]
-    values = [0] + ramp_v[1:] + [1023]
+    values = [0] + ramp_v[1:] + [511]
     dac_trace = {"name": "da_dipole", "label": "da_dipole (DAC)", "members": [f"d{i}" for i in range(10)],
-                 "max": 1023, "starts": starts, "values": values}
+                 "min": -512, "max": 511, "starts": starts, "values": values}
     # start + end marker pulses so the timeline x-axis spans the full 0..4 us and the
     # ramp (1..3 us) is on-screen.
     dctx = na.PulseTableState(

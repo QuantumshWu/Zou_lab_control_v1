@@ -587,12 +587,15 @@ def compile_pulse_table_scan_runtime_program(
             # formula).  code = signed + 2^(B-1), clamped to [0, 2^B-1].
             signed = int(round(float(ns[slot_var(slot_index)])))
             rng = dac_slot_ranges[slot_index]
-            if rng is not None:
-                lo, hi = int(rng[0]), int(rng[1])
-                signed = max(lo, min(hi, signed))
-                zero_code = -lo                       # lo == -2^(B-1)
-                return signed + zero_code
-            return signed
+            if rng is None:
+                # scan_slot_dac_ranges() returns a range for EVERY dac slot; a missing one
+                # means the slot/bus wiring is broken -- never leak a SIGNED value into the
+                # wire-layer scan_points (the FPGA would read it as a raw code).
+                raise ValueError(f"dac scan slot {slot_index} has no bus range; cannot convert to a wire code.")
+            lo, hi = int(rng[0]), int(rng[1])
+            signed = max(lo, min(hi, signed))
+            zero_code = -lo                           # lo == -2^(B-1)
+            return signed + zero_code
         return _time_ns_to_ticks(
             ns[slot_var(slot_index)], clock_step_ns, f"scan point {point_index} slot {slot_index}", allow_negative=True
         )
@@ -1214,6 +1217,11 @@ class PulseController:
         self.last_program: RuntimeSequenceProgram | None = None
 
     def set_slot(self, key: int | str, value: float) -> "PulseController":
+        """Set one scan-slot value for single-shot resolves.
+
+        Time slots take ns.  DAC slots take the SIGNED user value (0 = true 0 V,
+        -2^(B-1)..+2^(B-1)-1); the offset-binary wire code is produced by the
+        compiler -- never pass a raw 0..1023 code here."""
         name = key if isinstance(key, str) else slot_var(int(key))
         self.slots[name] = float(value)
         return self

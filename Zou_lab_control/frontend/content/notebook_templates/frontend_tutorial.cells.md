@@ -192,7 +192,7 @@ arms qCMOS first and then fires a finite trigger sequence. Free-running
 `repeat_forever=True` is useful for scope checks, not for a finite camera stack.
 
 Analog bus rows such as `da_dipole` or `da_bias_x/y/z` are folded views of
-10-bit TTL groups. Their GUI value field is a line edit clamped to `0..1023`.
+10-bit TTL groups. Their GUI value field is a line edit clamped to the SIGNED range `-512..+511` (0 = true 0 V; the offset-binary wire code = value + 512 is produced by the compiler).
 Preview draws one hollow stair-step analog trace. The runtime uploads these rows
 through the FPGA analog-bus segment table, so a long bus ramp costs one bus
 segment instead of one ordinary TTL `prog_mask` edge per stair step.

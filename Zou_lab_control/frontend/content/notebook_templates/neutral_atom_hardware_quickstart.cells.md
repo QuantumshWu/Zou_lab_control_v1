@@ -269,9 +269,12 @@ ramp: linearly move from the previous value to the target value over the period
 hold: keep the current value; no numeric field is shown
 ```
 
-The numeric field is a line edit, not a spinbox. For a 10-bit bus the GUI clamps
-the value to `0..1023`. Preview draws one hollow stair-step line for the bus
-value instead of drawing all ten TTL bits. The runtime uploads bus rows through
+The numeric field is a line edit, not a spinbox. Values are SIGNED LSB counts:
+for a 10-bit bus the GUI clamps to `-512..+511`, and `0` means TRUE 0 V (the
+driver is offset-binary; the wire code = value + 512 is produced by the
+compiler, and an idle bus rests at 0 V). Preview draws one stair-step line for
+the bus value instead of drawing all ten TTL bits, with the 0 V dashed
+reference mid-row and negative values below it. The runtime uploads bus rows through
 the FPGA analog-bus segment table, not by expanding every stair step into the
 ordinary digital edge table, so the digital edge budget remains available for
 lasers, shutters, camera, and trigger TTLs.
