@@ -121,10 +121,14 @@ try:  # the eligible-channel count is a fixed hardware fact (board layout)
 except Exception:  # pragma: no cover - host tooling optional
     NUM_DELAY_CHANNELS = 10 ** 9   # unknown -> allow everything (host/RTL still gate)
 
-try:  # the configured per-channel event-FIFO depth (toggles-in-flight cap); shown in tips
-    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import EVT_FIFO_DEPTH as _EVT_DEPTH
+try:  # the configured event-FIFO depths (changes-in-flight caps); shown in delay tips
+    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import (
+        EVT_FIFO_DEPTH as _EVT_DEPTH,           # per TTL channel
+        BUS_EVT_FIFO_DEPTH as _BUS_EVT_DEPTH,   # per DA bus bit
+    )
 except Exception:  # pragma: no cover - host tooling optional
     _EVT_DEPTH = 256
+    _BUS_EVT_DEPTH = 64
 # Unit->ns factors are owned by the timing layer (pulse_table.UNITS_TO_NS) -- import it
 # rather than keep a second near-identically-named copy that could silently drift.
 UNIT_TO_NS = UNITS_TO_NS
@@ -1488,8 +1492,9 @@ class ChannelPanel(FluentGroupBox):
                     "by d, out[t] = in[t-d], first frame correct -- now event-scheduled per bit "
                     "just like a TTL channel (the bus's 10 bits share this one delay), so the "
                     f"range matches TTL: up to {_delay_cap_text(state.time_step_ns)}. The limit is "
-                    "the number of value changes in flight (<= the DA event-FIFO depth), not the "
-                    "delay length; a long delayed ramp is the only thing that can exceed it."
+                    f"the number of value changes in flight per bit (<= {_BUS_EVT_DEPTH}, the DA "
+                    "per-bit event-FIFO depth), not the delay length; a long delayed ramp is the "
+                    "only thing that can exceed it."
                 )
             else:
                 delay_edit.setToolTip(
@@ -3465,7 +3470,10 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 parts.append(f"table restart high every {_summary_time_text(total_ns)}: {', '.join(labels)}{suffix}")
             self.summary.setText(" | ".join(parts))
             if hasattr(self, "names_panel"):
-                self.names_panel.total_label.setText(f"{total_ns:.9g} ns")
+                # Clean, auto-scaled units (1e9 ns -> "1 s", 1.5e6 ns -> "1.5 ms", ...) instead
+                # of a long raw-ns number.  Tooltip keeps the exact ns for when it matters.
+                self.names_panel.total_label.setText(_summary_time_text(total_ns))
+                self.names_panel.total_label.setToolTip(f"{total_ns:.9g} ns total (one frame)")
                 self.names_panel.periods_label.setText(f"{len(state.periods)}")
                 self.names_panel.visible_label.setText(f"{len(state.visible_channels)}/{len(state.channels)}")
             if hasattr(self, "visible_label"):
