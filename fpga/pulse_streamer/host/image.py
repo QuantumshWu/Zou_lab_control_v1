@@ -659,11 +659,13 @@ def estimate_resources(params: StreamerParams, *, part, target_pct: float = 90.0
                         + 2 + 2 * params.bus_sel_width) * params.bus_rows, 64)
     # LITERAL delay line LUT cost: TTL = SRL32 chain + tap mux/ch; DAC = distributed-RAM ring.
     delay_slots = params.delay_depth + 1
-    # TTL EVENT SCHEDULER (per channel): an EVT_DEPTH x 49b LUTRAM event FIFO (~12 LUTs),
-    # a 48b equality comparator (~14) and push/pop control (~6) -- ~32 LUTs/channel, vs the
-    # old per-tick SRL lines at ceil(delay_slots/32)+1 (~66 LUTs/channel at depth 2048) --
-    # AND the TTL delay bound grows from delay_depth (~41 us) to 32 bits (~42.9 s).
-    ttl_sched_luts = params.channel_count * 32
+    # TTL EVENT SCHEDULER (per channel): an EVT_DEPTH x 49b LUTRAM event FIFO
+    # (~ceil(EVT_DEPTH*49/64) RAM LUTs), a 48b equality comparator (~14) and push/pop
+    # control (~6) -- ~32 LUTs/channel at the default depth 16, vs the old per-tick SRL
+    # lines at ceil(delay_slots/32)+1 (~66 LUTs/channel at depth 2048) -- AND the TTL
+    # delay bound grows from delay_depth (~41 us) to 32 bits (~42.9 s).
+    evt_depth = max(1, int(getattr(params, "evt_fifo_depth", 16)))
+    ttl_sched_luts = params.channel_count * (20 + _ceil(evt_depth * 49, 64))
     dac_ring_luts = (params.bus_count * params.bus_width) * _ceil(delay_slots, 64)
     delay_lutram = ttl_sched_luts + dac_ring_luts
     # DSP: engine affine-MAC call sites (2 evals/bus + 5 main) x num_slots products,

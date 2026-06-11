@@ -4804,6 +4804,199 @@ def test_delay_line_bounded_cap_rejected_clearly():
         validate_pulse_streamer_program(prog(cd=cd_burst, ticks=ticks, masks=masks), channel_count=62)
 
 
+def test_delay_event_capacity_counts_full_schedule():
+    """The in-flight analysis must count the REAL schedule, not one base frame.
+
+    The old check slid a window over a single frame (duplicating it once for
+    repeat) -- it undercounted (a) windows spanning several frames (d > frame)
+    and (b) windows crossing scan-point seams.  Both are caught now."""
+    import pytest
+    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import (
+        validate_pulse_streamer_program, EVT_FIFO_DEPTH)
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
+
+    chans = [f"ch{i:02d}" for i in range(62)]
+    bit = 3
+
+    def prog(ticks, masks, cd, **kw):
+        defaults = dict(
+            sequence_id="o", sequence_name="o", clock_hz=50e6, channels=chans,
+            ticks=list(ticks), masks=list(masks), duration=1e-6, trigger_count=0,
+            loop_end_tick=int(ticks[-1]), loop_count=1, slot_count=0,
+            channel_delays=cd)
+        defaults.update(kw)
+        return RuntimeSequenceProgram(**defaults)
+
+    # (a) repeat-forever, d spanning MANY frames: 4 toggles/frame x 10 frames in
+    # flight = 40 >> 16.  The old one-frame duplication saw at most 8.
+    ticks = [0, 10, 20, 30, 40, 100]
+    masks = [0, 1 << bit, 0, 1 << bit, 0, 0]
+    cd = [0] * 62
+    cd[bit] = 1000
+    with pytest.raises(ValueError, match="congruent delay"):
+        validate_pulse_streamer_program(prog(ticks, masks, cd, repeat_forever=True), channel_count=62)
+    # a short in-frame delay on the same stream passes
+    cd_ok = [0] * 62
+    cd_ok[bit] = 60
+    validate_pulse_streamer_program(prog(ticks, masks, cd_ok, repeat_forever=True), channel_count=62)
+
+    # (a2) d >= period but SPARSE: fits the FIFO even unreduced -> accepted.
+    sparse_masks = [0, 1 << bit, 0, 0, 0, 0]
+    cd_sparse = [0] * 62
+    cd_sparse[bit] = 350                     # ~3.5 frames x 2 toggles = ~8 in flight
+    validate_pulse_streamer_program(prog(ticks, sparse_masks, cd_sparse, repeat_forever=True), channel_count=62)
+
+    # (a3) the periodic count is EXACT: 4 toggles/frame, period 100, d=450 covers
+    # up to 5 frames -> 20 in flight (the naive 4*(450//100)=16 estimate would pass).
+    cd_450 = [0] * 62
+    cd_450[bit] = 450
+    with pytest.raises(ValueError, match="congruent delay"):
+        validate_pulse_streamer_program(prog(ticks, masks, cd_450, repeat_forever=True), channel_count=62)
+
+    # (b) scan-point SEAM: 10 toggles at the start of the frame + 10 at the end;
+    # a 20-tick window across the seam holds 20 > 16, while any window inside
+    # ONE frame holds at most 11 (the old base-frame check passed this).
+    seam_ticks = [0] + list(range(1, 11)) + list(range(90, 100)) + [100]
+    val = 0
+    seam_masks = [0]
+    for _ in range(20):
+        val ^= (1 << bit)
+        seam_masks.append(val)
+    seam_masks.append(0)
+    n_edges = len(seam_ticks)
+    base = dict(slot_count=1, tick_slot_coeffs=[[0]] * n_edges, loop_end_slot_coeffs=[0],
+                scan_points=[[0], [0]])
+    cd_seam = [0] * 62
+    cd_seam[bit] = 20
+    with pytest.raises(ValueError, match="event FIFO"):
+        validate_pulse_streamer_program(prog(seam_ticks, seam_masks, cd_seam, **base), channel_count=62)
+    # the same frame with a window too short to bridge the seam passes
+    cd_short = [0] * 62
+    cd_short[bit] = 5
+    validate_pulse_streamer_program(prog(seam_ticks, seam_masks, cd_short, **base), channel_count=62)
+
+
+def test_delay_event_capacity_matches_scheduler_occupancy():
+    """The analytic window maximum mirrors true event-FIFO occupancy.
+
+    Randomized cross-checks: (1) the analytic count equals brute-force push/pop
+    occupancy within its documented +1 closed-window conservatism; (2) the
+    periodic formula equals explicit unrolling; (3) whenever the analysis says
+    a stream fits depth K, the RTL mirror with a K-deep FIFO reproduces the
+    ideal delayed waveform bit-exactly."""
+    import random
+    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import (
+        _max_in_flight_toggles, _max_in_flight_periodic)
+    from fpga.pulse_streamer.host.engine_model import (
+        delay_line_reference, rtl_delay_line_mirror)
+
+    rng = random.Random(20260610)
+    for _ in range(200):
+        n = rng.randint(1, 40)
+        toggles = sorted(rng.sample(range(0, 400), n))
+        d = rng.randint(2, 300)
+        analytic = _max_in_flight_toggles(toggles, d)
+        # an entry pushed at t occupies the FIFO during [t, t+d-1]
+        brute = max(sum(1 for u in toggles if u <= t <= u + d - 1) for t in toggles)
+        assert brute <= analytic <= brute + 1, (toggles, d, brute, analytic)
+
+    for _ in range(100):
+        n = rng.randint(1, 8)
+        period = rng.randint(20, 60)
+        steady = sorted(rng.sample(range(0, period), n))
+        d = rng.randint(period, period * 6)
+        unrolled = sorted(t + k * period for k in range(10) for t in steady)
+        exact = _max_in_flight_periodic(steady, period, d)
+        brute = max(sum(1 for u in unrolled if t - d <= u <= t) for t in unrolled)
+        assert exact == brute, (steady, period, d, exact, brute)
+
+    for _ in range(40):
+        n = rng.randint(1, 12)
+        toggle_at = set(rng.sample(range(1, 150), n))
+        d = rng.randint(2, 80)
+        stream, level = [], 0
+        for t in range(240):
+            if t in toggle_at:
+                level ^= 1
+            stream.append(level)
+        depth_needed = _max_in_flight_toggles(sorted(toggle_at), d)
+        mirrored = rtl_delay_line_mirror(stream, {0: d}, evt_depth=depth_needed)
+        ideal = delay_line_reference(stream, {0: d})
+        assert mirrored == ideal, (sorted(toggle_at), d, depth_needed)
+
+
+def test_repeat_forever_delay_reduced_modulo_sweep_period():
+    """The compiler programs repeat-forever delays modulo the sweep period.
+
+    A delay of several sweep periods is congruent to d % S on a periodic
+    stream: the programmed (reduced) delay produces the SAME steady-state
+    output, and without the reduction the event FIFO would need
+    ~toggles_per_sweep * d/S slots.  The user-entered delay survives untouched
+    in the source pulse table."""
+    import dataclasses
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import (
+        steady_sweep_ticks, validate_pulse_streamer_program)
+    from Zou_lab_control.neutral_atom.devices.sequencer import compile_pulse_table_runtime_program
+    from fpga.pulse_streamer.host.engine_model import delay_line_reference, reference_play
+
+    state = na.PulseTableState(
+        channels=["ch00", "ch01"], visible_channels=["ch00", "ch01"],
+        periods=[na.PulsePeriod(1000, (1, 0), unit="ns"),
+                 na.PulsePeriod(1000, (0, 1), unit="ns")],
+        time_step_ns=20,
+        delays={"ch01": "250000"},          # 12,500 ticks >> the 100-tick frame
+    )
+    program = compile_pulse_table_runtime_program(state, repeat_forever=True)
+    period = steady_sweep_ticks(program)
+    assert period > 0
+    bit = program.channels.index("ch01")
+    reduced = int(program.channel_delays[bit])
+    assert reduced == 12_500 % period
+    assert reduced < period
+    validate_pulse_streamer_program(program, channel_count=len(program.channels))
+    # the user's delay is still in the source table
+    assert program.source_table["delays"]["ch01"] == "250000"
+
+    # steady-state equivalence: play the program (reduced delay) and compare its
+    # ch01 output to the ideal UNREDUCED d=12,500 delay of the undelayed stream.
+    undelayed = dataclasses.replace(program, channel_delays=None)
+    n_ticks = 12_500 + 4 * period
+    raw = reference_play(undelayed, n_ticks)
+    ideal_full = delay_line_reference([(m >> bit) & 1 for m in raw], {0: 12_500})
+    played = reference_play(program, n_ticks)
+    got = [(m >> bit) & 1 for m in played]
+    assert got[12_500:] == ideal_full[12_500:]   # tick-exact steady state
+
+
+def test_evt_fifo_depth_single_source_contract():
+    """The delay event-FIFO depth must agree across its three declarations:
+    streamer_config.json (what the VALIDATOR enforces), the top's RTL parameter
+    default (what gets SYNTHESIZED), and the engine-model constant.  A config
+    edited deeper than the bitstream would make the validator pass programs the
+    real FIFO silently drops."""
+    import json
+    import pathlib
+    import re
+    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import EVT_FIFO_DEPTH
+    from fpga.pulse_streamer.host import engine_model
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    config = json.loads((root / "fpga" / "board_config" / "streamer_config.json").read_text(encoding="utf-8"))
+    top = (root / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
+    eng = (root / "fpga" / "pulse_streamer" / "zlc_edge_streamer.v").read_text(encoding="utf-8")
+    cfg_depth = int(config["params"]["evt_fifo_depth"])
+    top_match = re.search(r"parameter\s+integer\s+EVT_FIFO_DEPTH\s*=\s*(\d+)", top)
+    eng_match = re.search(r"parameter\s+integer\s+EVT_DEPTH\s*=\s*(\d+)", eng)
+    assert top_match and eng_match
+    assert int(top_match.group(1)) == cfg_depth, "top.v EVT_FIFO_DEPTH != streamer_config.json"
+    assert int(eng_match.group(1)) == cfg_depth, "engine EVT_DEPTH default != streamer_config.json"
+    assert EVT_FIFO_DEPTH == cfg_depth
+    assert int(engine_model.EVT_FIFO_DEPTH) == cfg_depth
+    # and the top must actually pass the parameter to the engine instance
+    assert ".EVT_DEPTH(EVT_FIFO_DEPTH)" in top
+
+
 def test_no_delay_image_or_membership_residue():
     """Grep guard: the LITERAL delay line leaves NO membership / interval / skip / off / delay-image
     residue anywhere (RTL, host, top, tcl).  The only delay machinery is the bounded circular

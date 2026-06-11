@@ -49,6 +49,36 @@ def _channel_delays_list(channel_delays: Mapping[int, int] | None, n_channels: i
     return [int(cd.get(bit, 0)) for bit in range(n_channels)]
 
 
+def _with_effective_delays(program: "RuntimeSequenceProgram") -> "RuntimeSequenceProgram":
+    """Reduce repeat-forever channel delays modulo the sweep period.
+
+    Under ``repeat_forever`` the undelayed stream is periodic, so ``d`` and
+    ``d % sweep_period`` produce the SAME steady-state output -- the reduced
+    delay is what gets programmed (an unreduced multi-sweep delay would need
+    ``~toggles_per_sweep * d/period`` event-FIFO slots and overflow).  Only the
+    startup differs: the delayed channel begins after ``d % period`` ticks
+    instead of staying silent for the full ``d``.  The SOURCE delay the user
+    typed stays untouched in the payload/pulse table."""
+    if not program.channel_delays:
+        return program
+    from dataclasses import replace
+    from .fpga_pulse_streamer import TTL_DELAY_MAX_TICKS, effective_channel_delays
+    # The 32-bit delay field (~42.9 s) is a USER-FACING cap on the entered delay;
+    # enforce it on the RAW value (the mod-period reduction below could otherwise
+    # silently legalise an over-cap entry).
+    for b, d in enumerate(program.channel_delays):
+        if int(d) > TTL_DELAY_MAX_TICKS:
+            raise ValueError(
+                f"channel-delay output bit {b}: delay {int(d)} ticks is outside "
+                f"[0, {TTL_DELAY_MAX_TICKS}] (~{TTL_DELAY_MAX_TICKS * 20e-9:.1f} s at 20 ns/tick).")
+    if not program.repeat_forever:
+        return program
+    reduced = effective_channel_delays(program)
+    if reduced != [int(d) for d in program.channel_delays]:
+        program = replace(program, channel_delays=reduced)
+    return program
+
+
 def _clk_enable_mask_for_channels(channels: Sequence[str], clk_channels: Sequence[str]) -> int:
     """clk-enable bitmask in the COMPILED hardware channel order (bit n = ``channels[n]``).
 
@@ -470,7 +500,7 @@ def compile_pulse_table_runtime_program(
     }
     channel_delays_list = _channel_delays_list(channel_delays, len(channels)) if channel_delays else None
     sequence_id = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
-    return RuntimeSequenceProgram(
+    return _with_effective_delays(RuntimeSequenceProgram(
         sequence_id=sequence_id,
         sequence_name=state.name,
         clock_hz=clock_hz,
@@ -491,7 +521,7 @@ def compile_pulse_table_runtime_program(
         bus_delays=bus_delays or None,
         channel_delays=channel_delays_list,
         clk_enable=int(clk_enable),
-    )
+    ))
 
 
 def compile_pulse_table_scan_runtime_program(
@@ -735,7 +765,7 @@ def compile_pulse_table_scan_runtime_program(
     }
     channel_delays_list = _channel_delays_list(channel_delays, len(channels)) if channel_delays else None
     sequence_id = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
-    return RuntimeSequenceProgram(
+    return _with_effective_delays(RuntimeSequenceProgram(
         sequence_id=sequence_id,
         sequence_name=state.name,
         clock_hz=clock_hz,
@@ -762,7 +792,7 @@ def compile_pulse_table_scan_runtime_program(
         bus_delays=bus_delays or None,
         channel_delays=channel_delays_list,
         clk_enable=int(clk_enable),
-    )
+    ))
 
 
 def compile_runtime_program_for_payload(
