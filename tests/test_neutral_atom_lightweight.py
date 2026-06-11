@@ -534,7 +534,7 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     # final top: 62-pin board map + the FINAL engine instance + forced-latency build.
     assert "module zlc_pulse_streamer_top" in top
     assert "parameter integer CHANNEL_COUNT = 62" in top
-    # The pin map drives out_final (the clk-muxed engine output: out_final[n] = clk_en[n] ? clk : out[n]).
+    # The pin map drives out_final (the clk-muxed engine output: out_final[n] = clk_en[n] ? ~clk : out[n]).
     assert "assign trig = out_final[6];" in top
     assert "assign trap = out_final[9];" in top
     assert "assign probe = out_final[3];" in top
@@ -1230,14 +1230,21 @@ def test_clk_channel_excluded_from_engine_and_carried_as_mask(tmp_path):
 
 
 def test_top_has_per_channel_clk_mux():
-    """The board top muxes clk onto a channel's pin via a runtime CTRL clk-enable mask
-    (out_final[n] = clk_en[n] ? clk : out[n]); the pin map drives out_final, and the CTRL
-    word offset matches host.image.CtrlWords.CLK_ENABLE.  (No Verilog sim -> structure check.)"""
+    """The board top muxes the DAC-latch strobe onto a clk channel's pin via a runtime CTRL
+    clk-enable mask.  The strobe is the PHASE-INVERTED clk (out_final[n] = clk_en[n] ? ~clk
+    : out[n]) so the DAC latches the parallel word at the CENTRE of its data eye (clk
+    falling edge) instead of coincident with the posedge data change -- that coincidence was
+    the "third DA value between two edge periods" race (sim/tb_da_clk_phase.v).  The pin map
+    drives out_final, and the CTRL word offset matches host.image.CtrlWords.CLK_ENABLE.
+    (No Verilog sim -> structure check.)"""
 
     root = Path(__file__).resolve().parents[1]
     top = (root / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
     assert "C_CLK_ENABLE" in top
-    assert "out_final[cmx] = clk_en[cmx] ? clk : out[cmx]" in top
+    # ~clk, NOT plain clk: latch the DAC at the data-eye centre (do not regress this).
+    assert "out_final[cmx] = clk_en[cmx] ? ~clk : out[cmx]" in top
+    assert "out_final[cmx] = clk_en[cmx] ? clk : out[cmx]" not in top
+    assert "DAC LATCH PHASE" in top                    # rationale comment is present
     assert "assign cooling = out_final[0]" in top      # the pin map is driven by the muxed output
     assert "assign da_clk0 = out_final[28]" in top
     # the CTRL offset lines up with the host image layout

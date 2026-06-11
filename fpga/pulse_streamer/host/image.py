@@ -91,8 +91,9 @@ class CtrlWords:
     # PER-BUS DAC DELAY -- the same LITERAL delay line, one delay shared by all 10 bits of a bus:
     # bus b is delayed by ``bus_delay_ticks[b]`` ticks (0 = passthrough), dense per-bus.
     BUS_DELAY_TICKS = 44  # dense per-bus delay (delay_tick_width bits each) -> ceil(4*12/32)=2 words (44..45)
-    # PER-CHANNEL CLK MASK -- channels wired directly to the FPGA clk (output = clk).  One
-    # bit per channel; the top muxes clk onto those pins (out_final[n]=clk_en[n]?clk:out[n])
+    # PER-CHANNEL CLK MASK -- channels wired to the FPGA clk (a DAC latch strobe).  One bit
+    # per channel; the top muxes the strobe onto those pins (out_final[n]=clk_en[n]?~clk:out[n],
+    # the INVERTED clk so the DAC latches at its data-eye centre -- see top "DAC LATCH PHASE")
     # and the engine's bit for them is forced 0 so it never fights the clk.  ceil(62/32)=2
     # words (46..47); locked to zlc_pulse_streamer_top.v by test_final_top_regions_match_image.
     CLK_ENABLE = 46

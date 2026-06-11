@@ -671,12 +671,30 @@ The three bring-up items from the adversarial RTL hunt are now fixed/guarded. Th
   `test_delay_tail_emits_after_done_contract`. NOTE: the agent-suggested
   `del_fill < DELAY_DEPTH` gate was rejected — `del_fill` saturates during any run longer
   than 2048 ticks, which would disable the fix exactly when it matters.
-- **B1/B2 — `da_clk0..3` = `out_final[28/39/50/61]`: BY DESIGN (no RTL change).** The clk
-  button (clk_channels → CLK_ENABLE mux) exists precisely to wire these strobe pins to the
-  FPGA clk. New safety net: `_warn_idle_dac_clock_pins` (sequencer.py) warns at compile
-  time when DAC buses are driven while a `da_clkN`-labeled channel is neither clk-enabled
-  nor toggled (a frozen DAC would otherwise be silent). A warning, not an error — driving
-  the strobe as a TTL pattern stays allowed.
+- **B1/B2 — `da_clk0..3` = `out_final[28/39/50/61]`: the clk button wires these strobe pins
+  to the FPGA clk.** New safety net: `_warn_idle_dac_clock_pins` (sequencer.py) warns at
+  compile time when DAC buses are driven while a `da_clkN`-labeled channel is neither
+  clk-enabled nor toggled (a frozen DAC would otherwise be silent). A warning, not an error.
+- **B1/B2 — REVISED 2026-06-11 (⚠️ needs bitstream rebuild): the strobe is now `~clk`, NOT
+  `clk` — the "third DA value between two edge periods" race.** The earlier note said "BY
+  DESIGN, no RTL change"; that was WRONG and missed a real source-synchronous output hazard.
+  The 40 DAC data bits (`zlc_bus_out` → `da_bias_*`/`da_dipole`) are launched on `posedge clk`,
+  so a DAC value CHANGES on the rising edge. With the strobe = plain `clk` the DAC latched on
+  that SAME rising edge — coincident with the data transition AND (at a period boundary) with
+  ~30 TTL outputs all switching — so a value change was captured half-old/half-new = a
+  sporadic THIRD code. User-visible on `pulses/T.json` (da_bias_y steps −192→388 = code
+  320→900): a third level appeared sporadically between the two edge periods, and a ~200 ms
+  HOLD gap "fixed" it only by moving the DAC step off the busy boundary (a band-aid). FIX:
+  the clk mux now drives `out_final[n] = clk_en[n] ? ~clk : out[n]`, so the DAC latches on the
+  clk FALLING edge = the CENTRE of the data eye (~10 ns settled each side at 50 MHz) and the
+  quiet half-cycle (nothing else switches there) → always captures the clean settled word, no
+  gap needed, for every DAC and every transition. The latch interface is otherwise
+  unconstrained in `board.xdc` (no `create_generated_clock`/`set_output_delay`); the
+  half-period margin is what makes it robust at 50 MHz (add ODDR clock-forwarding + output
+  constraints if the rate ever rises). Proven in `sim/tb_da_clk_phase.v` (the engine step is
+  glitch-free tick-by-tick; a coincident latch captures a third code for realistic per-bit
+  skew, the eye-centre latch never does). Locked by `test_top_has_per_channel_clk_mux`
+  (asserts `~clk` and the "DAC LATCH PHASE" rationale comment, rejects plain `clk`).
 - **U1 (superseded 2026-06-09) — ramp engine is now a multi-LSB Bresenham stepper.** The
   original engine moved at most 1 LSB/tick then snapped at `stop_tick`; the user ruled
   that out ("按照计算出来的 step 来尽量靠近 ramp"). The RTL now computes `step = Δ//span`

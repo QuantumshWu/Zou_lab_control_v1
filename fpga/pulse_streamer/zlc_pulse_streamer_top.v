@@ -169,7 +169,22 @@ module zlc_pulse_streamer_top #(
     wire [BUS_COUNT*TTL_DELAY_WIDTH-1:0] bus_delay_ticks_w;
 
     // --- per-channel CLK mask + muxed output: a channel wired to clk outputs the FPGA
-    // clk on its pin; otherwise it outputs the engine bit.  out_final feeds the pin map.
+    // clk on its pin (PHASE-INVERTED, see below); otherwise it outputs the engine bit.
+    // out_final feeds the pin map.
+    //
+    // DAC LATCH PHASE (critical -- do NOT change back to plain `clk`): the clk pins are
+    // the parallel-DAC latch strobes (da_clk0..3, wired here via the GUI clk button).  The
+    // 40 DAC DATA bits (da_bias_*/da_dipole = zlc_bus_out) are registered on `posedge clk`,
+    // so the parallel word CHANGES on the rising edge.  If the strobe were plain `clk` the
+    // DAC would latch on that SAME rising edge -- coincident with the data transition AND
+    // with the ~30 TTL outputs all switching at a period boundary -- so a value change is
+    // captured half-old/half-new = a sporadic THIRD code (the "third DA value between two
+    // edge periods" bug; a long HOLD gap only masked it by moving the DAC step off the
+    // busy edge).  Driving the strobe as ~clk moves the DAC latch to the clk FALLING edge =
+    // the CENTRE of the data eye (~10 ns settled each side at 50 MHz) and the quiet half-
+    // cycle (nothing else switches there), so the DAC always captures the clean settled
+    // word.  Proven in sim/tb_da_clk_phase.v (engine step is glitch-free; coincident latch
+    // captures a third code for realistic skews, eye-centre latch never does).
     wire [CLK_ENABLE_WORDS*32-1:0] clk_enable_pack;
     wire [CHANNEL_COUNT-1:0] clk_en;
     wire [CHANNEL_COUNT-1:0] out_final;
@@ -235,7 +250,9 @@ module zlc_pulse_streamer_top #(
         end
     endgenerate
 
-    // Assemble the per-channel clk mask from its CTRL words, then mux clk onto each pin.
+    // Assemble the per-channel clk mask from its CTRL words, then mux the strobe onto each
+    // clk pin.  The strobe is ~clk (clk FALLING edge) so the DAC latches the parallel word
+    // at the centre of its data eye -- see the DAC LATCH PHASE note above.
     genvar cw;
     generate
         for (cw = 0; cw < CLK_ENABLE_WORDS; cw = cw + 1) begin : zlc_clk_enable_pack_gen
@@ -246,7 +263,7 @@ module zlc_pulse_streamer_top #(
     genvar cmx;
     generate
         for (cmx = 0; cmx < CHANNEL_COUNT; cmx = cmx + 1) begin : zlc_clk_mux_gen
-            assign out_final[cmx] = clk_en[cmx] ? clk : out[cmx];
+            assign out_final[cmx] = clk_en[cmx] ? ~clk : out[cmx];
         end
     endgenerate
 

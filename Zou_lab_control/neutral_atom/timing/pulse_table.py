@@ -440,7 +440,9 @@ class PulseTableState:
     def clk_enable_mask(self) -> int:
         """Bitmask (bit n = channel ``self.channels[n]``) of channels wired to the FPGA
         clk.  The compiler forces these bits to 0 in the edge table and ships this mask so
-        the top muxes clk onto their pins (out_final[n] = clk_en[n] ? clk : engine_out[n])."""
+        the top muxes the DAC strobe onto their pins (out_final[n] = clk_en[n] ? ~clk :
+        engine_out[n]) -- the INVERTED clk so the DAC latches the parallel word at its
+        data-eye centre (see zlc_pulse_streamer_top.v "DAC LATCH PHASE")."""
 
         mask = 0
         for channel in self.clk_channels:
