@@ -1875,10 +1875,13 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             "Load the pulse currently applied on the sequencer into the editor\n"
             "(use after changing the device from a notebook / raw API).")
         self.collapse_button = self._control_button("Collapse", self.toggle_left_panels, GREY)
+        # 3x3 grid, row-major.  Keep the intuitive PAIRS side-by-side as the first two of
+        # each row: On|Off (run/stop), Add|Remove (period), Save|Load (file).  The 3rd
+        # column holds the standalone actions (Sync / Add Bracket / Collapse).
         _control_buttons = (
-            self.safe_button, self.fire_button, self.remove_button, self.add_button,
-            self.bracket_button, self.collapse_button, self.save_button, self.load_button,
-            self.sync_button,
+            self.fire_button, self.safe_button, self.sync_button,
+            self.add_button, self.remove_button, self.bracket_button,
+            self.save_button, self.load_button, self.collapse_button,
         )
         for button in _control_buttons:
             button.setFixedHeight(cb_h)
