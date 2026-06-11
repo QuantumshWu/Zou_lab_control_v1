@@ -458,8 +458,8 @@ Storage scales with toggles IN FLIGHT, not delay length: the bound is the 32-bit
 Each delay slot owns its own 2D `(* ram_style="distributed" *) reg [48:0] fifo[0:EVT_DEPTH-1]`
 with its own wr/rd/cnt/obit, instantiated in a `generate` loop; `evt_out` is the OR of the
 per-slot contributions.  A single flat 3D array `evt_mem[slot][depth]` does **not** infer
-as distributed RAM (each slot has an INDEPENDENT wr/rd pointer, unlike `bus_ring`'s shared
-write pointer), so Vivado falls back to flip-flops -- at depth 256 that is 18*256*49 = 226k
+as distributed RAM (each slot has an INDEPENDENT wr/rd pointer; a single shared write pointer
+would let it infer), so Vivado falls back to flip-flops -- at depth 256 that is 18*256*49 = 226k
 FF + 256:1 read muxes, which the 35T cannot place (a real build failed exactly this way).
 The FIFOs are **COMPACTED** to the delay-eligible channels only (the 18 real TTL outputs,
 `DELAY_COMPACT`/`NUM_DELAY_CH`/`DELAY_CH_MAP`); the 40 DAC-bus bits (pin driven by `bus_out`)
@@ -476,8 +476,8 @@ in-flight count exceeds `EVT_DEPTH` is REJECTED with the longest physical delay 
 nothing is silently dropped.  **DAC buses are UNIFIED into the same event scheduler**: each DA
 bit is its own 1-bit event FIFO (`g_busdly`, fed from `bus_value_active`, reset to that bit's
 `BUS_SAFE_VALUE` level so an untouched bus idles at 0 V), and the bus's `BUS_WIDTH` bits share one
-per-bus 32-bit delay (`del_bus_ticks`) -- so the DAC delay range NOW MATCHES TTL (the 2048-tick
-ring is gone) and a negative TTL delay's global shift G can reach the buses with no mismatch.  The
+per-bus 32-bit delay (`del_bus_ticks`) -- so the DAC delay range MATCHES TTL and a negative TTL
+delay's global shift G can reach the buses with no mismatch.  The
 per-bit FIFO is shallower (`BUS_EVT_DEPTH`, default 64; there are bus_count*bus_width = 40 of them)
 to fit LUT -- per the conservative model per-bit @256 = 102.9% (over the device), @64 = ~81%.
 Capacity = value-change events in flight per bit <= `BUS_EVT_DEPTH`; the only stressor is a long
@@ -485,7 +485,7 @@ DELAYED ramp (one event/step).  `bus_evt_fifo_depth` is reconfigurable from stre
 
 **Reconfigurable depth (single source).**  `evt_fifo_depth` lives only in
 `streamer_config.json`.  The host (validator/estimate) reads it; the BUILD reads it too --
-`image.emit_geom_tcl` turns the config into `$zlc_top_generics` (EVT_FIFO_DEPTH, DELAY_DEPTH,
+`image.emit_geom_tcl` turns the config into `$zlc_top_generics` (EVT_FIFO_DEPTH,
 EDGE_ADDR_WIDTH, BANK_SIZE), `build_and_program.bat --emit-geom-tcl` generates `geom.tcl`,
 and `create_project.tcl` sources it + `set_property generic ... [current_fileset]` so editing
 the JSON changes the SYNTHESIZED bitstream (e.g. 256->128 if a build is LUT-tight).  A
@@ -497,7 +497,7 @@ verified in xsim -- `tb_delay_sched.v` (delays {0,1,2,7,1000}, 1-tick toggles, r
 11,996 cycles, 0 mismatches, DELAY-SCHED-OK), `tb_delay_compact.v` (non-identity slot->channel
 map at depth 256, COMPACT-MAP-OK), `tb_evt_depth.v` (FIFO-depth boundary pinned at 16,
 EVT-DEPTH-OK).  Estimate at depth 256: 67.7% LUT / 21.6% FF on the 35T (the per-slot LUTRAM
-is ~0.7-1.0 LUT per 64x1 cell, measured against this design's `bus_ring`).
+is ~0.7-1.0 LUT per 64x1 cell).
 
 ## 9. Pulse API, sync-to-device and GUI state semantics
 
@@ -661,16 +661,18 @@ The three bring-up items from the adversarial RTL hunt are now fixed/guarded. Th
 (`fpga\build_and_program.bat`) — the deployed bitstream still has the old behavior.
 - **U4 — delayed-output tail at `done`: FIXED IN RTL.** The state chain now has a
   `done`-but-emitting branch that keeps `bnd_delay_advance` high after the final tick, so
-  the delay rings keep shifting: a channel/bus with delay `d` flushes its remaining `d`
-  ticks and settles LOW (pushes are zeros — `state_mask`/`bus_value_active` are cleared at
-  `done`). Before the fix the rings FROZE at `done` and a delayed channel could hold a
-  stale HIGH tap for the ms-scale window until the host reacted. This realizes exactly the
+  the event schedulers' `g_time` keeps advancing: a channel/bus with delay `d` drains the
+  events still QUEUED in its FIFO (its last `d` ticks of toggles) and settles LOW (those
+  tail values are the rest state — `state_mask`/`bus_value_active` are cleared at `done`).
+  Before the fix `g_time` FROZE at `done` and a delayed channel could hold a stale HIGH
+  value for the ms-scale window until the host reacted. This realizes exactly the
   contract `rtl_mirror_play`/`delay_line_reference` always promised (out[t]=in[t-d] for the
   whole stream); `repeat_forever` was never affected (never reaches `done`). Locked by
   `test_pulse_streamer_rtl_advances_delay_rings_after_done` +
-  `test_delay_tail_emits_after_done_contract`. NOTE: the agent-suggested
-  `del_fill < DELAY_DEPTH` gate was rejected — `del_fill` saturates during any run longer
-  than 2048 ticks, which would disable the fix exactly when it matters.
+  `test_delay_tail_emits_after_done_contract`. NOTE: an agent-suggested gate on a
+  fill counter was rejected — such a counter saturates on long runs, which would disable
+  the fix exactly when it matters; the unconditional advance is safe (a new FIRE clears
+  every scheduler's wr/rd/cnt).
 - **B1/B2 — `da_clk0..3` = `out_final[28/39/50/61]`: the clk button wires these strobe pins
   to the FPGA clk.** New safety net: `_warn_idle_dac_clock_pins` (sequencer.py) warns at
   compile time when DAC buses are driven while a `da_clkN`-labeled channel is neither
@@ -730,8 +732,8 @@ accounting model; one `sN` slot-ref parser (`pulse_table.is_slot_ref`/`slot_ref_
 by sequencer + GUI); `UNIT_TO_NS` imports the timing `UNITS_TO_NS`; `_channel_delays_list`
 helper; deleted dead `BUS_SEGMENT_MODES`.
 Backlog (deferred — larger/riskier, none blocking): unify `effective_tick` vs
-`_apply_affine_ticks` (one narrowing-aware helper); one `validate_delay_depth(tick_ns=)` (drop
-the hardcoded 20 ns in the µs hint); move `PulseTableState.bus_value`-style packing out of the
+`_apply_affine_ticks` (one narrowing-aware helper); thread `tick_ns` into `_check_delay_cap`
+(drop the hardcoded 20 ns in the seconds hint); move `PulseTableState.bus_value`-style packing out of the
 GUI; route NamesPanel/ChannelPanel rows through `FluentLabeledField` + a `set_field_locked`
 helper; split the pure `_pulse_table_*`/`_affine_*` compiler block out of the 2.2k-line
 `sequencer.py`. The cross-layer delay-depth/`coeff_frac_bits` constants remain test-guarded

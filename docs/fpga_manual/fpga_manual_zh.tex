@@ -29,7 +29,7 @@ BRAM:        1,800 Kb (50 x 36 Kb RAMB36)   DSP: 90
 \section{两句话能力总结}
 \begin{itemize}
   \item \tfocus{最小脉冲宽度与分辨率 = 1 个 tick（20 ns）}。背靠背的 1-tick 边沿能逐周期、一拍一个地打出来——靠的是一条连续预取流水线把 BRAM 读延迟藏掉（见第三章）。
-  \item \tfocus{扫描点数无上限}。常驻一个 2-bank ping-pong 窗口（4096 点），主机在游标后面把空出来的 bank 流式回填下一段（见第五章）。配合 N-slot 仿射扫描，\tfocus{duration 与 DAC 值}（仅这两类可扫）可以\tfocus{在一次连续运行里任意组合地无缝扫描}；channel 延时\tfocus{不是}扫描量，它是加在输出上的逐通道\tfocus{事件调度延时}（每条 channel 一个固定值，正/负/零；TTL 上限由 32 位字段决定，约 $\pm 42.9$ s——毫秒级 emCCD 延时直接可用；DAC 总线延时仍走深度 \pyapi{DELAY_DEPTH} 的环形缓冲，上限 $\sim 41\,\mu$s，见第六章）。
+  \item \tfocus{扫描点数无上限}。常驻一个 2-bank ping-pong 窗口（4096 点），主机在游标后面把空出来的 bank 流式回填下一段（见第五章）。配合 N-slot 仿射扫描，\tfocus{duration 与 DAC 值}（仅这两类可扫）可以\tfocus{在一次连续运行里任意组合地无缝扫描}；channel 延时\tfocus{不是}扫描量，它是加在输出上的逐信号\tfocus{事件调度延时}（每条 channel / 每条 DAC 总线一个固定值，正/负/零；TTL 与 DAC \tfocus{同源同范围}，上限均由 32 位字段决定，约 $\pm 42.9$ s——毫秒级 emCCD 延时直接可用，见第六章）。
 \end{itemize}
 
 \section{文件}
@@ -256,7 +256,7 @@ value_select (dual)     : start 与 stop 各一个选择子
 
 \chapter{三个子系统的深入讨论}
 
-本章把两个互相支撑的子系统讲透：\tfocus{AXI4 突发上传}（怎么把程序映像快速写进 FPGA），以及\tfocus{逐通道字面输出延时线}（一个 channel 被延时后到底输出什么）。延时线\tfocus{独立于}仿射扫描引擎：边沿表始终按无延时的标称位置生成，延时只是一块加在引擎输出上的小型环形缓冲，把那条 channel 的输出整体往后推 $d$ 个 tick。
+本章把两个互相支撑的子系统讲透：\tfocus{AXI4 突发上传}（怎么把程序映像快速写进 FPGA），以及\tfocus{逐信号输出延时（事件调度器）}（一个 channel / DAC 总线被延时后到底输出什么）。延时\tfocus{独立于}仿射扫描引擎：边沿表始终按无延时的标称位置生成，延时只是加在引擎输出上的逐信号事件调度器，把那条 channel / 总线的输出整体往后推 $d$ 个 tick。
 
 \section{AXI4 突发上传}
 主机到 FPGA 的传输是 JTAG-to-AXI：\pyapi{jtag_axi_0}（一个由 Vivado Tcl 经 JTAG 线驱动的 AXI 主机）$\rightarrow$ \pyapi{axi_bram_ctrl_0} $\rightarrow$ 顶层后面区段译码的 BRAM 映像。架构上的关键事实是：这两个 IP 都配成\tfocus{完整 AXI4，而不是 AXI4-Lite}。
@@ -280,38 +280,38 @@ value_select (dual)     : start 与 stop 各一个选择子
 
 \textbf{上传不会随扫描点无界增长。} 点数超过 \pyapi{2*bank_size} 的扫描，引擎播 2-bank ping-pong 窗口、主机\tfocus{流式}回填（见前面"无限流式扫描"一章）：在游标 \pyapi{CURSOR} 之后把空出的 bank 填上下一段并重置 \pyapi{BANK_READY}。总扫描点数只受主机内存限制，晚到的回填只会 STALL（\pyapi{STATUS_UNDERFLOW}），\tfocus{绝不}给出错误点。
 
-\section{逐通道字面输出延时线（delay line）}
-channel 延时是一条加在引擎\tfocus{输出}上的\tfocus{字面延时线}，而\tfocus{不是}烤进边沿表里的平移。定义极其简单：被延时 $d$ 个 tick 的 channel，其延时后输出 \pyapi{output_delayed[t] = output_undelayed[t-d]}，\pyapi{t < d} 之前恒为 0（fire 之前为 0）。硬件就是一块\tfocus{普通的环形缓冲（circular buffer）}：它存下引擎那条 channel 的\tfocus{无延时输出}，再在 $d$ 个 tick 之后原样放出来。它只是把那条 channel 的输出整体延后，因此对\tfocus{任意}信号都正确——周期的、非周期的、被 duration 扫描平移过的——都一样。这里\tfocus{没有任何周期性假设}，\tfocus{不}"跳整周期"，\tfocus{没有}移位相位/成员关系，\tfocus{也没有}逐扫描点的延时。一个 channel 的延时\tfocus{绝不}改变另一个 channel 的时序（合并是不相交的直通 \pyapi{out = (state_mask & ~delayed_mask) | delayed_out}）。延时\tfocus{均匀地}与 duration 扫描、DAC 扫描、内层 repeat bracket 组合——"延时后的序列"恒等于"把那条 channel 延时 $d$ 的无延时序列"。它\tfocus{不是扫描量}：延时是每条 channel 的一个固定值，由主机作为常数携带（\pyapi{channel_delays}）。编译它的是 \pyapi{compile_pulse_table_runtime_program} $\rightarrow$ \pyapi{_pulse_table_edge_table}（\filepath{sequencer.py}）。
+\section{逐通道输出延时（事件调度器 event scheduler）}
+channel 延时是一条加在引擎\tfocus{输出}上的延时，而\tfocus{不是}烤进边沿表里的平移。定义极其简单：被延时 $d$ 个 tick 的 channel，其延时后输出 \pyapi{output_delayed[t] = output_undelayed[t-d]}，\pyapi{t < d} 之前恒为 0（fire 之前为 0）。硬件是一个\tfocus{逐信号的事件调度器（event scheduler）}：当引擎那条 channel 的\tfocus{无延时输出翻转}时，把 $(\text{翻转时刻}+d,\ \text{新电平})$ 排进该 channel 的一个小事件 FIFO，一个自由运行的全局 tick 计数器到时把它弹出到输出寄存器——于是输出整体延后 $d$。它只是把那条 channel 的输出整体延后，因此对\tfocus{任意}信号都正确——周期的、非周期的、被 duration 扫描平移过的——都一样。这里\tfocus{没有任何周期性假设}，\tfocus{不}"跳整周期"，\tfocus{没有}移位相位/成员关系，\tfocus{也没有}逐扫描点的延时。一个 channel 的延时\tfocus{绝不}改变另一个 channel 的时序（合并是不相交的直通 \pyapi{out = (state_mask & ~delayed_mask) | delayed_out}）。延时\tfocus{均匀地}与 duration 扫描、DAC 扫描、内层 repeat bracket 组合——"延时后的序列"恒等于"把那条 channel 延时 $d$ 的无延时序列"。它\tfocus{不是扫描量}：延时是每条 channel 的一个固定值，由主机作为常数携带（\pyapi{channel_delays}）。编译它的是 \pyapi{compile_pulse_table_runtime_program} $\rightarrow$ \pyapi{_pulse_table_edge_table}（\filepath{sequencer.py}）。
 
-\textbf{为什么是字面延时线，不是循环。} 循环视角（GUI \tfocus{预览}显示的就是它）会在 $t=0$ 伪造一段"绕回来的尾巴"，于是 fire 之后的头几个脉冲变成序列尾部的幻影，\tfocus{破坏真实的实验起始}。环形缓冲在 fire 时被清零，所以延时线让这头几个真实脉冲正确——\tfocus{第一帧是真实的}（在 $t=d$ 之前那条 channel 安静、保持 0，不是循环 \%$T$ 的预览样子）。延一个 channel 不会改变任何其它 channel 的周期，所以 $T$ 保持不变。
+\textbf{为什么是真实延时，不是循环。} 循环视角（GUI \tfocus{预览}显示的就是它）会在 $t=0$ 伪造一段"绕回来的尾巴"，于是 fire 之后的头几个脉冲变成序列尾部的幻影，\tfocus{破坏真实的实验起始}。事件调度器在 fire 时被清零，所以它让这头几个真实脉冲正确——\tfocus{第一帧是真实的}（在 $t=d$ 之前那条 channel 安静、保持 0，不是循环 \%$T$ 的预览样子）。延一个 channel 不会改变任何其它 channel 的周期，所以 $T$ 保持不变。
 
-\begin{codeblock}[literal delay line（延时 d）]
-cyclic (预览, 仅显示):  [尾巴绕回][.....原信号右移.....]   <- t=0 处有幻影
-delay line (硬件, 真相): [.....0.....][原信号右移 d.....]   <- fire 前恒 0，第一帧真实
+\begin{codeblock}[output delay（延时 d）]
+cyclic (预览, 仅显示):     [尾巴绕回][.....原信号右移.....]   <- t=0 处有幻影
+event scheduler (硬件, 真相): [.....0.....][原信号右移 d.....]   <- fire 前恒 0，第一帧真实
 \end{codeblock}
 
-机理要点（\tfocus{一块普通环形缓冲，存输出、延后放出}）：
+机理要点（\tfocus{排翻转事件、到时弹出}；TTL 与 DAC 同源）：
 \begin{itemize}
-  \item \tfocus{TTL：62 路全部可独立延时——事件调度器（event scheduler）。} TTL 波形是\tfocus{翻转稀疏}的，所以不再每拍存一位（旧 SRL 线 $\sim$4.1k LUT、上限 41 $\mu$s），改为存\tfocus{翻转事件}：无延时位在 tick $t$ 翻转时，向该 channel 的小事件 FIFO（深 \pyapi{EVT_DEPTH}=16，每项 49 bit）推入 $(t+d-1,\ \text{新电平})$；一个自由运行的 48 位全局计数器 \pyapi{g_time} 等值弹出到输出寄存器——于是 \pyapi{out[t]=in[t-d]} 精确成立（首个事件前为 0；$d=1$ 走一级寄存器；$d=0$ 直通）。存储随\tfocus{在途翻转数}而非延时长度增长：62 路共 $\sim$2k LUT，TTL 延时上限提升到 32 位字段（$\sim$42.9 s——毫秒级 emCCD 延时直接可用）。每通道 32 位延时值经独立的 DELAY 寄存器区（\pyapi{R_DELAY_BASE}，每 channel 一个 32 位字）上传。合并仍是不相交直通：被延时位用调度结果，其余位原样——延时\tfocus{绝不}打扰别的 channel。
+  \item \tfocus{TTL：62 路全部可独立延时——事件调度器（event scheduler）。} TTL 波形是\tfocus{翻转稀疏}的，所以不每拍存一位，而是存\tfocus{翻转事件}：无延时位在 tick $t$ 翻转时，向该 channel 的小事件 FIFO（深 \pyapi{EVT_DEPTH}，默认 128，每项 49 bit）推入 $(t+d-1,\ \text{新电平})$；一个自由运行的 48 位全局计数器 \pyapi{g_time} 等值弹出到输出寄存器——于是 \pyapi{out[t]=in[t-d]} 精确成立（首个事件前为 0；$d=1$ 走一级寄存器；$d=0$ 直通）。存储随\tfocus{在途翻转数}而非延时长度增长：62 路共 $\sim$2k LUT，TTL 延时上限是 32 位字段（$\sim$42.9 s——毫秒级 emCCD 延时直接可用）。每通道 32 位延时值经独立的 DELAY 寄存器区（\pyapi{R_DELAY_BASE}，每 channel 一个 32 位字）上传。合并仍是不相交直通：被延时位用调度结果，其余位原样——延时\tfocus{绝不}打扰别的 channel。
   \item \tfocus{容量契约：在途翻转数 $\le$ \pyapi{EVT_DEPTH}（默认 128，可配置）。} 在 tick $t$ 推入的事件在 FIFO 里停留到 $t+d-1$，所以 FIFO 占用 = 该通道\tfocus{自己的 $d$ 窗口}内的翻转数。主机校验器对\tfocus{完整日程}做精确计数——每个扫描点按各自的仿射平移后的边沿时刻、bracket 循环、\pyapi{repeat_forever} 的回绕缝、以及\tfocus{跨多帧}的长窗口全部计入（早期版本只查单帧、漏掉了扫描缝和 $d>$ 帧长的情况）；超限在上硬件前清晰报错。深度可整体重建调整：\filepath{streamer_config.json} 的 \pyapi{evt_fifo_depth} + 顶层参数 \pyapi{EVT_FIFO_DEPTH} 保持一致即可。
-  \item \tfocus{repeat\_forever 下长延时自动按周期取模。} 无限循环时无延时流是周期 $S$（一次完整扫掠的 tick 数）的周期函数，于是 $d \ge S$ 与 $d \bmod S$ \tfocus{稳态逐 tick 等价}——编译器自动把这样的延时按 $d \bmod S$ 写入寄存器（\pyapi{effective_channel_delays}），否则在途翻转数会按 $\sim$每扫掠翻转数 $\times d/S$ 增长而溢出。唯一差别在启动期：被延时通道从 $d \bmod S$ 起就开始输出（提前了 $\lfloor d/S \rfloor$ 个扫掠），而不是沉默整个 $d$；用户在脉冲表里写的原始延时原样保留。有限次运行不做此变换。
-  \item \tfocus{DAC：4 条总线各自可延时，一条总线的 10 位共享一个延时。} 每条 10-bit 总线有一条\tfocus{10 位宽的环}（\pyapi{bus_ring}），机制与 TTL 完全相同：存下该总线的无延时输出值，$d$ 个 tick 后放出。一条总线的 10 个 bit\tfocus{共享同一个}逐总线延时（\pyapi{del_bus_ticks}），所以整条总线（固定值、被扫值、或 ramp）都被整体延后，而不是每 bit 单独延。
-  \item \tfocus{负延时 = 全局平移 $G$。} 一条 channel 的 $-d$ 等价于其它\tfocus{所有} channel 都 $+|d|$。主机把全局平移 $G=\max(0,-\min(\text{delays}))$ 折进每条 channel 的有效延时，使最早的那条 channel 落在 0、缓冲只会看到 $\ge 0$ 的延时。零延时即直通。
-  \item \tfocus{DAC 总线延时有界（环形缓冲的根本性质）。} 与 TTL 的事件调度器不同，DAC 总线延时仍是每拍存值的环形缓冲：深度 \pyapi{DELAY_DEPTH = 2048} 个 tick（20\,ns/tick 下约 40\,$\mu$s）。要把一个\tfocus{非重复}的总线值流延时 $d$，必须存下它 $d$ 个 tick 的输出——这是字面延时线的本质；但缓冲存的是\tfocus{输出}（不是整张序列），所以它很小。超过 \pyapi{DELAY_DEPTH} 的总线延时会在 validate 与映像打包时\tfocus{被清晰报错拒绝}（在上硬件之前，绝不静默）。TTL 延时\tfocus{不受}此深度约束（32 位字段，受上面的在途翻转契约约束）。
+  \item \tfocus{延时是物理的。} 写进寄存器的就是用户的原始 $d$（\pyapi{repeat_forever} 也一样），所以\tfocus{第一帧永远真实}：被延时通道在 fire 后安静整整 $d$ 个 tick 才开始输出，绝不"提前几个扫掠"。代价是无限循环下长延时的在途翻转数按 $\sim$每扫掠翻转数 $\times d/S$ 增长（$S$ = 一次完整扫掠的 tick 数）——这正是下面容量契约要对完整日程精确计数、超限即报错的原因。
+  \item \tfocus{DAC：4 条总线各自可延时，一条总线的 10 位共享一个延时——与 TTL 同源。} 每条 10-bit 总线的\tfocus{每一个 bit}都是它自己的 1 位事件调度器（\pyapi{g_busdly}，每 bit 深 \pyapi{BUS_EVT_DEPTH}，默认 64），机制与 TTL 完全相同：值变化时排进事件、$d$ 个 tick 后弹出。一条总线的 10 个 bit\tfocus{共享同一个}逐总线延时（\pyapi{del_bus_ticks}），所以整条总线（固定值、被扫值、或 ramp）被同一个 $d$ 整体延后，而不是每 bit 各延各的。延时值与 TTL 一样是一个 32 位字、走同一个 \pyapi{R_DELAY} 寄存器区——所以 DAC 与 TTL 的延时\tfocus{范围相同}（都 $\sim$42.9 s）。
+  \item \tfocus{负延时 = 全局平移 $G$。} 一条 channel 的 $-d$ 等价于其它\tfocus{所有} channel 都 $+|d|$。主机把全局平移 $G=\max(0,-\min(\text{delays}))$ 折进每条 channel 与每条总线的有效延时（TTL 与 DAC 共享\tfocus{同一个} $G$），使最早的那条信号落在 0、调度器只会看到 $\ge 0$ 的延时。零延时即直通。因为 TTL 与 DAC 用同一个 32 位范围、同一套事件调度器，负延时的全局平移在两者之间\tfocus{一致}，绝不会出现"某条信号超范围被拒、另一条没事"的不匹配。
+  \item \tfocus{DAC 容量契约：在途值变化数 $\le$ \pyapi{BUS_EVT_DEPTH}（默认 64，可配置 \pyapi{bus_evt_fifo_depth}）。} 与 TTL 完全同型：占用 = 该 bit\tfocus{自己的 $d$ 窗口}内的值变化数，随\tfocus{在途事件数}而非延时长度增长，所以大 $d$ 不再受限。唯一现实压力源是一条\tfocus{被延时的密集 ramp}（每 tick 都变）；超限在 validate 与映像打包时\tfocus{被清晰报错拒绝}（在上硬件之前，绝不静默）。
   \item \pyapi{repeat_forever} 倒回\tfocus{边沿 0}、重放\tfocus{整张帧}——因为延时是加在输出上的逐通道延时线（不烘进边沿），没有需要跳过的"加性延时前导帧"。编译器恒发 \pyapi{repeat_from_index}=0；RTL（\filepath{zlc_edge_streamer.v} 与顶层）仍保留 \pyapi{repeat_from_loop_start} 倒回稳态帧的分支，但对当前实发的程序而言是死路径。
 \end{itemize}
 
 \begin{notebox}[如何证明]
-预览保持循环（只为显示）。硬件/编译路径由一个字面延时真值预言 \pyapi{delay_line_reference}（\pyapi{output_delayed[t]=output_undelayed[t-d]}，fire 前为 0）加上 \filepath{host/engine_model.py} 的事件调度器/环形缓冲镜像逐周期模型证明：编译出的程序过这些周期模型后，与延时线真值\tfocus{逐 tick 相同}（覆盖 TTL 多 channel、DAC 逐总线、负延时折 $G$、与 duration 扫描组合）。容量契约由三层证据锁定：（1）随机化测试证明解析的在途计数 = 逐拍 push/pop 占用的暴力模拟，且周期公式 = 显式展开；（2）只要解析说"装得下深度 $K$"，$K$ 深 FIFO 镜像就逐 tick 复现理想延时；（3）xsim 测试台 \filepath{sim/tb_evt_depth.v} 在\tfocus{真 RTL 引擎}上验证边界：恰好 16 个在途翻转 = tick 级精确，16+2 个 = 只丢弃多余的 2 个翻转（输出只缺那一个脉冲，绝无污染）。超过 \pyapi{DELAY_DEPTH}=2048 的\tfocus{总线}延时在 \pyapi{validate_pulse_streamer_program} 与 \pyapi{pack_program} 处都被清晰拒绝。
+预览保持循环（只为显示）。硬件/编译路径由一个延时真值预言 \pyapi{delay_line_reference}（\pyapi{output_delayed[t]=output_undelayed[t-d]}，fire 前为 0）加上 \filepath{host/engine_model.py} 的事件调度器寄存器镜像（\pyapi{rtl_delay_line_mirror} / \pyapi{rtl_bus_delay_line_mirror}）逐周期模型证明：编译出的程序过这些周期模型后，与延时真值\tfocus{逐 tick 相同}（覆盖 TTL 多 channel、DAC 逐总线、负延时折 $G$、与 duration 扫描组合）。容量契约由三层证据锁定：（1）随机化测试证明解析的在途计数 = 逐拍 push/pop 占用的暴力模拟；（2）只要解析说"装得下深度 $K$"，$K$ 深 FIFO 镜像就逐 tick 复现理想延时；（3）xsim 测试台 \filepath{sim/tb_evt_depth.v} 在\tfocus{真 RTL 引擎}上验证边界：恰好 $K$ 个在途翻转 = tick 级精确，$K{+}2$ 个 = 只丢弃多余的 2 个翻转（输出只缺那一个脉冲，绝无污染）。在途事件数超过 \pyapi{EVT_DEPTH}（TTL）/ \pyapi{BUS_EVT_DEPTH}（DAC）的延时在 \pyapi{validate_pulse_streamer_program} 与 \pyapi{pack_program} 处都被清晰拒绝。
 \end{notebox}
 
 \section{DAC 总线延时与 TTL 完全同源}
-模拟总线（DAC）的延时机制和 TTL\tfocus{完全相同}：每条总线一条 10 位宽的环（\pyapi{bus_ring}），存下该总线的无延时输出，$d$ 个 tick 后放出。一条总线的\tfocus{10 个 bit 共享一个}逐总线延时（\pyapi{del_bus_ticks}），所以无论这个 DAC 值是\tfocus{固定}值、\tfocus{被扫}值，还是\tfocus{斜坡（ramp）}，整条总线都被同一个 $d$ 整体延后；在 $t < d$ 之前总线输出为 0。逐总线延时与 TTL 共享\tfocus{同一个}全局平移 $G$，并受\tfocus{同一个}有界深度 \pyapi{DELAY_DEPTH} 约束（超过即清晰拒绝）。主机把每条总线的延时 tick 数作为常数携带（\pyapi{bus_delays}）。
+模拟总线（DAC）的延时机制和 TTL\tfocus{完全相同}：每条总线的\tfocus{每一个 bit}是它自己的 1 位事件调度器（\pyapi{g_busdly}），值变化时排进事件、$d$ 个 tick 后弹出。一条总线的\tfocus{10 个 bit 共享一个}逐总线延时（\pyapi{del_bus_ticks}），所以无论这个 DAC 值是\tfocus{固定}值、\tfocus{被扫}值，还是\tfocus{斜坡（ramp）}，整条总线都被同一个 $d$ 整体延后；在 $t < d$ 之前总线保持其安全码（\pyapi{BUS_SAFE_VALUE}，中点码 = 0\,V）。逐总线延时与 TTL 共享\tfocus{同一个}全局平移 $G$、\tfocus{同一个} 32 位范围（$\sim$42.9 s）、\tfocus{同一型}容量契约（在途值变化数 $\le$ \pyapi{BUS_EVT_DEPTH}，超过即清晰拒绝）。主机把每条总线的延时 tick 数作为常数携带（\pyapi{bus_delays}）。
 
-\textbf{成本小结。} TTL 用\tfocus{一条} \pyapi{CHANNEL_COUNT} 位宽的环、每条 DAC 总线用一条 10 位宽的环；这些环都是\tfocus{分布式 RAM（LUTRAM / distributed）}，\tfocus{不占额外 BRAM}（\pyapi{ram_style="distributed"}）。延时 tick 数走稠密的 CTRL 字（\pyapi{delay_ticks} / \pyapi{bus_delay_ticks}）下发，\tfocus{没有}延时上传映像、\tfocus{没有}迷你装载器。在 35T（\pyapi{xc7a35t}）上整套延时落地后仍有余量：LUT 约 59\%、BRAM 39/50、DSP 约 58\%。
+\textbf{成本小结。} TTL 每条 channel、DAC 每个 bit 各一个事件 FIFO；这些 FIFO 都是\tfocus{分布式 RAM（LUTRAM / distributed）}，\tfocus{不占额外 BRAM}（\pyapi{ram_style="distributed"}）。每个信号的 32 位延时值走 \pyapi{R_DELAY} 寄存器区下发，\tfocus{没有}延时上传映像、\tfocus{没有}延时 CTRL 字、\tfocus{没有}迷你装载器。在 35T（\pyapi{xc7a35t}）上整套延时落地后仍有余量：LUT 约 59\%、BRAM 39/50、DSP 约 58\%。
 
 \section{逐通道 clk 输出（把某通道直接接到时钟）}
-有时需要某个 TTL 引脚直接输出 FPGA 的 \pyapi{clk}（例如给外部 DAC 喂时钟），而引擎按 tick 寄存的输出本身\tfocus{产生不出}一个时钟方波。为此顶层在引脚映射上加了一层\tfocus{运行时可选的 clk 复用}：一个 \pyapi{CHANNEL_COUNT} 位的 \pyapi{clk\_enable} 掩码（CTRL 字 \pyapi{C_CLK_ENABLE}，紧接 \pyapi{BUS_DELAY_TICKS} 之后，62 位占 2 个字）随程序映像下发，顶层据此把每个引脚选成
+有时需要某个 TTL 引脚直接输出 FPGA 的 \pyapi{clk}（例如给外部 DAC 喂时钟），而引擎按 tick 寄存的输出本身\tfocus{产生不出}一个时钟方波。为此顶层在引脚映射上加了一层\tfocus{运行时可选的 clk 复用}：一个 \pyapi{CHANNEL_COUNT} 位的 \pyapi{clk\_enable} 掩码（CTRL 字 \pyapi{C_CLK_ENABLE}，紧接 20 个命令字之后 = 字 20，62 位占 2 个字；CTRL 块里\tfocus{没有任何延时字}，延时都在 \pyapi{R_DELAY} 寄存器区）随程序映像下发，顶层据此把每个引脚选成
 \begin{codeblock}[逐通道 clk 复用（zlc\_pulse\_streamer\_top.v）]
 assign out_final[n] = clk_en[n] ? ~clk : out[n];  // n: 0..CHANNEL_COUNT-1（strobe = 反相 clk）
 // 引脚映射改为驱动 out_final（不是 out）：assign trig = out_final[6]; assign da_clk0 = out_final[28]; ...
@@ -335,7 +335,7 @@ assign out_final[n] = clk_en[n] ? ~clk : out[n];  // n: 0..CHANNEL_COUNT-1（str
 RAMB36: 39/50 = 78%      LUT: 26%   FF: 12%   DSP: 9%
 \end{codeblock}
 
-三块并行边沿 BRAM（tick/coeff/mask）+ 扫描窗口 BRAM 占了 RAMB36 预算的大头；\tfocus{总线段表是 LUTRAM（distributed），不占 RAMB36}——因为总线/ramp 引擎每 tick 组合读它们，搬进 BRAM 会破坏组合读。\tfocus{字面延时线}（TTL 的 \pyapi{CHANNEL_COUNT} 位宽环 + 每条 DAC 总线的 10 位宽环，深度 \pyapi{DELAY_DEPTH}=2048）同样是分布式 RAM，\tfocus{不占额外 BRAM}——这正是字面延时线能放进 35T 的原因：它存的是\tfocus{输出}（而非整张序列），所以缓冲很小。把延时线一并算进去后，35T 的整体落地约为 LUT 59\%、BRAM 39/50、DSP 58\%。Vivado \pyapi{report_utilization} / \pyapi{report_timing_summary} 是最终权威，Python 估算只是预算指引。
+三块并行边沿 BRAM（tick/coeff/mask）+ 扫描窗口 BRAM 占了 RAMB36 预算的大头；\tfocus{总线段表是 LUTRAM（distributed），不占 RAMB36}——因为总线/ramp 引擎每 tick 组合读它们，搬进 BRAM 会破坏组合读。\tfocus{延时事件调度器}（TTL 每条 channel 一个深 \pyapi{EVT_DEPTH} 的事件 FIFO + 每个 DAC bit 一个深 \pyapi{BUS_EVT_DEPTH} 的事件 FIFO）同样是分布式 RAM，\tfocus{不占额外 BRAM}——这正是它能放进 35T 的原因：每个 FIFO 只存\tfocus{在途翻转事件}（而非整张序列、也非每拍一格），所以很小。把延时一并算进去后，35T 的整体落地约为 LUT 59\%、BRAM 39/50、DSP 58\%。Vivado \pyapi{report_utilization} / \pyapi{report_timing_summary} 是最终权威，Python 估算只是预算指引。
 
 \section{64 位 tick 架构评估（何时需要、怎么改、资源够不够）}
 当前 32 位 tick（20 ns）封顶的是\tfocus{单个帧}的时长 $\sim$85.9 s——不是总运行时长（repeat forever 无限跑、扫掠点数无上限、实验循环不受限），TTL 延时另有 32 位字段（$\sim$42.9 s，且 repeat forever 下更长的延时自动按周期取模）。真正的长期隐患只有一个：调度器的自由运行计数器 \pyapi{g_time} 是 48 位，连续运行 $\sim$65 天后回绕。
@@ -354,7 +354,7 @@ FPGA 侧只有一个入口 \filepath{fpga\textbackslash build\_and\_program.bat}
 .\fpga\run_server.bat                    # 启动常驻 hw_axi server (host 0.0.0.0, port 18861)
 \end{codeblock}
 
-\pyapi{create_project.tcl} 生成 \pyapi{jtag_axi} + \pyapi{axi_bram_ctrl} + 5 块 BRAM（三块并行边沿 tick/coeff/mask + 扫描窗口 + 总线映像），并用 \pyapi{zlc_force_latency2} 把边沿 BRAM 强制成 \pyapi{READ_LATENCY_B=2}。逐通道/逐总线的字面延时线是\tfocus{分布式 RAM（LUTRAM）}环形缓冲，\tfocus{不占额外 BRAM}、也没有延时上传映像。产物 \filepath{zlc_pulse_streamer_top.\{bit,ltx\}} 落在 \filepath{fpga\textbackslash build\textbackslash ps\textbackslash ps.runs\textbackslash impl_1}（工程用短名 \pyapi{ps} 是为了让 Vivado 深层的 run / \filepath{.Xil} 临时路径不超过 Windows MAX\_PATH 限制，同时构建仍然留在仓库内的 \filepath{fpga\textbackslash build}，不挪到别处）。server 加载 \filepath{.ltx} 是为了在比特流里定位 \pyapi{jtag_axi} 核（即 \pyapi{hw_axi}），所以 bit 与 ltx 必须来自\tfocus{同一次编译}。
+\pyapi{create_project.tcl} 生成 \pyapi{jtag_axi} + \pyapi{axi_bram_ctrl} + 5 块 BRAM（三块并行边沿 tick/coeff/mask + 扫描窗口 + 总线映像），并用 \pyapi{zlc_force_latency2} 把边沿 BRAM 强制成 \pyapi{READ_LATENCY_B=2}。逐通道/逐总线的输出延时事件调度器是\tfocus{分布式 RAM（LUTRAM）}事件 FIFO，\tfocus{不占额外 BRAM}、也没有延时上传映像。产物 \filepath{zlc_pulse_streamer_top.\{bit,ltx\}} 落在 \filepath{fpga\textbackslash build\textbackslash ps\textbackslash ps.runs\textbackslash impl_1}（工程用短名 \pyapi{ps} 是为了让 Vivado 深层的 run / \filepath{.Xil} 临时路径不超过 Windows MAX\_PATH 限制，同时构建仍然留在仓库内的 \filepath{fpga\textbackslash build}，不挪到别处）。server 加载 \filepath{.ltx} 是为了在比特流里定位 \pyapi{jtag_axi} 核（即 \pyapi{hw_axi}），所以 bit 与 ltx 必须来自\tfocus{同一次编译}。
 
 \section{一次上传里发生了什么}
 \begin{enumerate}
