@@ -100,7 +100,25 @@ DURATION_UNITS = ["ns", "us", "ms", "s"]
 # A per-channel delay is bounded to the delay-line depth (~+/-40 us), so only ns / us
 # make sense as units -- ms / s would always exceed the cap, and "str (ns)" (the affine
 # expression unit) is meaningless for a fixed, non-scannable delay.
-DELAY_UNITS = ["ns", "us"]
+# The per-channel TTL delay is a TRUE physical delay bounded by the 32-bit field
+# (~42.9 s), so ms/s are valid units now (the old ns/us limit was the ~41 us ring).
+DELAY_UNITS = ["ns", "us", "ms", "s"]
+
+
+def _delay_eligible_position(channel_key: str) -> int | None:
+    """Hardware bit position of a ``chNN`` channel, else None (cannot tell)."""
+    text = str(channel_key)
+    if text.startswith("ch") and text[2:].isdigit():
+        return int(text[2:])
+    return None
+
+
+try:  # the eligible-channel count is a fixed hardware fact (board layout)
+    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import (
+        DEFAULT_FPGA_CHANNEL_COUNT as _FPGA_CH, delay_eligible_channel_count as _elig_count)
+    NUM_DELAY_CHANNELS = _elig_count(_FPGA_CH)
+except Exception:  # pragma: no cover - host tooling optional
+    NUM_DELAY_CHANNELS = 10 ** 9   # unknown -> allow everything (host/RTL still gate)
 # Unit->ns factors are owned by the timing layer (pulse_table.UNITS_TO_NS) -- import it
 # rather than keep a second near-identically-named copy that could silently drift.
 UNIT_TO_NS = UNITS_TO_NS
@@ -1487,10 +1505,18 @@ class ChannelPanel(FluentGroupBox):
                 )
                 clk_btn.clicked.connect(lambda _=False, ch=key: self.clkRequested.emit(ch))
             self.clk_buttons[key] = clk_btn
-            if is_clk:
-                # A clk channel's delay/unit are meaningless -> grey them out.
+            # A delay needs an event FIFO; only the real TTL outputs have one.  A clk-mode
+            # channel (pin = clk) or a da_clk-pin channel (hardware position past the
+            # delay-eligible set) cannot be delayed -> grey out its delay field.
+            hw_pos = _delay_eligible_position(key)
+            not_eligible = (not is_bus) and hw_pos is not None and hw_pos >= NUM_DELAY_CHANNELS
+            if is_clk or not_eligible:
                 delay_edit.setEnabled(False)
                 unit.setEnabled(False)
+                if not_eligible and not is_clk:
+                    delay_edit.setToolTip(
+                        "This channel (a da_clk / clock pin) has no delay line and cannot be "
+                        "delayed -- only the real TTL outputs can.")
 
             self.delay_edits[key] = delay_edit
             self.delay_units[key] = unit

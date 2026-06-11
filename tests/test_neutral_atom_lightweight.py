@@ -4922,6 +4922,30 @@ def test_delay_event_capacity_matches_scheduler_occupancy():
         assert mirrored == ideal, (sorted(toggle_at), d, depth_needed)
 
 
+def test_delay_eligibility_enforced_in_api():
+    """Only the real TTL outputs have a delay line; a delay on a bus-member bit or a
+    da_clk pin (hardware position past the eligible count) is rejected by the API."""
+    import pytest
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import delay_eligible_channel_count
+
+    assert delay_eligible_channel_count(62, 4, 10) == 18      # board: 18 real TTL outputs
+    assert delay_eligible_channel_count(8, 0, 0) == 8         # no buses -> all eligible
+
+    seq = na.RuntimeSequencer(channels=[f"ch{i:02d}" for i in range(62)],
+                              clock_hz=50e6, trigger_channels=["ch11"])
+    st = na.PulseTableState(channels=[f"ch{i:02d}" for i in range(62)],
+                            periods=[na.PulsePeriod(1000, (0,) * 62, unit="ns")], time_step_ns=20)
+    ctl = na.bind_pulse(seq, st)
+    ctl.set_channel_delay("ch11", 1000.0)                     # eligible (position 11) -> OK
+    assert ctl.get_channel_delay("ch11") == 1000.0
+    for bad in ("ch28", "ch40", "ch61"):                     # da_clk + bus-member bits
+        with pytest.raises(ValueError, match="not delay-eligible"):
+            ctl.set_channel_delay(bad, 1000.0)
+    # setting an ineligible channel back to 0 is always allowed
+    ctl.set_channel_delay("ch28", 0.0)
+
+
 def test_repeat_forever_delay_is_physical_not_reduced():
     """The compiler programs the TRUE PHYSICAL delay -- NO modulo reduction.
 

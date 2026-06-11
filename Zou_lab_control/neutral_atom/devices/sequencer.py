@@ -1426,6 +1426,15 @@ class PulseController:
         channel = str(channel)
         if channel not in self.pulse.channels:
             raise ValueError(f"unknown channel {channel!r}; choices: {list(self.pulse.channels)}")
+        # Only the real TTL outputs have a delay line; a delay on a bus-member bit or a
+        # da_clk pin has no hardware effect, so reject it here (the RTL also gates it to a
+        # passthrough).  Eligible = hardware position < the eligible count.
+        if float(delay_ns) != 0.0 and channel.startswith("ch") and channel[2:].isdigit():
+            from .fpga_pulse_streamer import DEFAULT_FPGA_CHANNEL_COUNT, delay_eligible_channel_count
+            if int(channel[2:]) >= delay_eligible_channel_count(DEFAULT_FPGA_CHANNEL_COUNT):
+                raise ValueError(
+                    f"channel {channel!r} is not delay-eligible (it is a bus-member bit or a "
+                    f"da_clk pin, which has no delay line); only the real TTL outputs can be delayed.")
         self.pulse.delays[channel] = float(delay_ns)
         self.pulse.delay_units[channel] = "ns"
         self.pulse.validate()

@@ -2379,9 +2379,10 @@ def test_delay_edit_caps_at_delay_depth(monkeypatch):
     assert abs(float(edit.text()) - capped_us) <= max(1e-6, capped_us * 1e-9)
 
 
-def test_delay_unit_combo_only_ns_and_us(monkeypatch):
-    """The per-channel delay unit combo offers only ns/us (ms/s exceed the delay-line
-    depth; 'str (ns)' is meaningless for a fixed non-scannable delay)."""
+def test_delay_unit_combo_offers_ns_us_ms_s(monkeypatch):
+    """The per-channel delay unit combo offers ns/us/ms/s -- the TTL delay is now a true
+    physical delay bounded by the 32-bit field (~42.9 s), not the old ~41 us ring, so
+    ms/s are valid. ('str (ns)' stays excluded: a fixed delay is not scannable.)"""
 
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
@@ -2391,7 +2392,7 @@ def test_delay_unit_combo_only_ns_and_us(monkeypatch):
     dt.settle(ed, 120)
     for combo in ed.channel_panel.delay_units.values():
         items = [combo.itemText(i) for i in range(combo.count())]
-        assert items == ["ns", "us"], items
+        assert items == ["ns", "us", "ms", "s"], items
 
 
 def test_dac_value_field_and_dot_stay_inside_card(monkeypatch):
