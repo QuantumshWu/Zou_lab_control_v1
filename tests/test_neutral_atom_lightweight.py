@@ -1252,6 +1252,29 @@ def test_top_has_per_channel_clk_mux():
     assert CtrlWords.CLK_ENABLE == 46
 
 
+def test_build_input_files_are_utf8():
+    """The build-input HDL/constraint/tcl/config files must be valid UTF-8 -- a GBK-encoded
+    file (Chinese comments) shows up as mojibake in git/editors/non-CJK-locale tools and is a
+    recurring papercut (board.xdc was GBK).  Guards the active fpga/ build inputs (NOT the
+    references/source_archives snapshots, which may legitimately keep their original bytes)."""
+
+    root = Path(__file__).resolve().parents[1]
+    roots = [root / "fpga" / "board_config", root / "fpga" / "pulse_streamer"]
+    exts = {".xdc", ".v", ".vh", ".sv", ".tcl", ".json", ".bat"}
+    bad = []
+    for base in roots:
+        for p in base.rglob("*"):
+            if not p.is_file() or p.suffix.lower() not in exts:
+                continue
+            if "build" in p.parts or "references" in p.parts:   # generated / archived
+                continue
+            try:
+                p.read_bytes().decode("utf-8")
+            except UnicodeDecodeError as exc:
+                bad.append(f"{p.relative_to(root)} ({exc})")
+    assert not bad, "non-UTF-8 build-input files (re-save as UTF-8): " + "; ".join(bad)
+
+
 def test_analog_ramp_can_scan_both_value_endpoints_round_trip():
     """R16: a ramp may scan BOTH value endpoints independently -- the start reads one
     scan slot, the stop another -- via the dual value_select.  The host image

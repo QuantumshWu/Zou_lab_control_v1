@@ -1,4 +1,4 @@
- #IO π‹Ω≈‘º ¯
+ #IO ÁÆ°ËÑöÁ∫¶Êùü
 set_property -dict {PACKAGE_PIN R4 IOSTANDARD LVCMOS33} [get_ports clk]     
 set_property -dict {PACKAGE_PIN R2 IOSTANDARD LVCMOS33} [get_ports {led[0]}]
 set_property -dict {PACKAGE_PIN R3 IOSTANDARD LVCMOS33} [get_ports {led[1]}]
@@ -35,7 +35,7 @@ set_property -dict {PACKAGE_PIN K17 IOSTANDARD LVCMOS33} [get_ports GND14]
 set_property -dict {PACKAGE_PIN K18 IOSTANDARD LVCMOS33} [get_ports bias]
 set_property -dict {PACKAGE_PIN K19 IOSTANDARD LVCMOS33} [get_ports GND15]
 
-#daƒ£øÈµƒconstrains
+#daÊ®°ÂùóÁöÑconstrains
 set_property PACKAGE_PIN V9 [get_ports {da_dipole[0]}]
 set_property PACKAGE_PIN W9 [get_ports {da_dipole[1]}]
 set_property PACKAGE_PIN Y9 [get_ports {da_dipole[2]}]
@@ -82,7 +82,7 @@ set_property IOSTANDARD LVCMOS33 [get_ports {da_bias_y[0]}]
 set_property IOSTANDARD LVCMOS33 [get_ports da_clk1]
 set_property PACKAGE_PIN R14 [get_ports da_clk1]
 
-#da_ƒ£øÈ2”√
+#da_Ê®°Âùó2Áî®
 set_property PACKAGE_PIN N22 [get_ports {da_bias_x[0]}]
 set_property PACKAGE_PIN M22 [get_ports {da_bias_x[1]}]
 set_property PACKAGE_PIN M21 [get_ports {da_bias_x[2]}]
@@ -130,7 +130,7 @@ set_property IOSTANDARD LVCMOS33 [get_ports da_clk3]
 set_property PACKAGE_PIN F21 [get_ports da_clk3]
 
 
-#¿˝ªØ
+#‰æãÂåñ
 set_property CFGBVS VCCO [current_design]
 set_property CONFIG_VOLTAGE 3.3 [current_design]
 set_property BITSTREAM.GENERAL.COMPRESS true [current_design]
