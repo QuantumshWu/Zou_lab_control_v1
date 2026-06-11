@@ -4590,25 +4590,33 @@ def test_rtl_delay_line_mirror_matches_physical_delay():
 
 
 def test_rtl_bus_delay_line_mirror_matches_physical_delay():
-    """RTL per-bus DELAY-LINE proof: the cycle-exact register mirror of the 10-bit-wide per-bus
-    circular buffer (engine_model.rtl_bus_delay_line_mirror) == bus_delay_line_reference (the bus
-    VALUE stream delayed by d, ONE delay shared by all 10 bits, safe 0 before t == d) for d=0
-    (passthrough), d up to DELAY_DEPTH, and the +/-15us range.  Plus the bounded-cap rejection."""
+    """RTL per-DA-bit EVENT-SCHEDULER delay proof: the cycle-exact mirror (g_busdly, each of the
+    bus's bits a 1-bit FIFO sharing the per-bus delay) == bus_delay_line_reference (the bus VALUE
+    stream delayed by d, safe mid-code 512 before t == d) for d=0 (passthrough), d=1 (register),
+    and -- now that the DAC range is UNIFIED with TTL (the 2048-tick ring is gone) -- LARGE d too,
+    as long as no bit's value-change events in flight exceed the FIFO depth.  An over-capacity
+    (per-tick-toggling) delayed stream is BOUNDED by dropping the excess, not by a ring cap."""
     from fpga.pulse_streamer.host import engine_model as em
-    import random, pytest
+    import random
 
-    depth = em.DELAY_DEPTH
+    depth = em.BUS_EVT_FIFO_DEPTH
     rng = random.Random(424242)
-    for d in [0, 1, 7, 200, 750, depth]:
-        n = max(4 * d + 50, 400)
-        U = [rng.randint(0, 1023) for _ in range(n)]          # full 10-bit DAC code stream
+    STEP = 80                                     # value changes every STEP ticks -> <= depth in flight
+    for d in [0, 1, 7, 200, 4000]:                # 4000 >> the old 2048 ring -- valid now
+        n = max(4 * d + 200, 600)
+        vals = [rng.randint(0, 1023) for _ in range(n // STEP + 2)]
+        U = [vals[t // STEP] for t in range(n)]   # sparse stream: per-bit in-flight changes <= depth
         mirror = em.rtl_bus_delay_line_mirror(U, d)
-        assert mirror == em.bus_delay_line_reference(U, d), f"bus delay-line != reference at d={d}"
+        assert mirror == em.bus_delay_line_reference(U, d), f"bus delay != reference at d={d}"
         assert all(mirror[t] == 512 for t in range(min(d, n))), "DAC bus not held safe (mid code) during startup"
-    U = [rng.randint(0, 1023) for _ in range(100)]
-    assert em.rtl_bus_delay_line_mirror(U, 0) == U            # d=0 exact passthrough
-    with pytest.raises(em.DelayDepthExceeded, match=r"exceeds the delay-line depth DELAY_DEPTH=2048"):
-        em.rtl_bus_delay_line_mirror([1] * 10, depth + 5)
+    U0 = [rng.randint(0, 1023) for _ in range(100)]
+    assert em.rtl_bus_delay_line_mirror(U0, 0) == U0          # d=0 exact passthrough
+    # CAPACITY: bit0 toggling EVERY tick, delayed by d > depth, overflows that bit's FIFO -- the
+    # excess value-change events are DROPPED (bounded, no crash), so it diverges from the ideal.
+    Udense = [(t & 1) * 1 for t in range(4 * depth)]          # bit0 flips every tick
+    over = em.rtl_bus_delay_line_mirror(Udense, depth + 50)
+    assert len(over) == len(Udense)                           # bounded, no crash / no exception
+    assert over != em.bus_delay_line_reference(Udense, depth + 50)   # dropped beyond depth
 
 
 def test_negative_via_global_shift_equals_plus_on_others():

@@ -52,9 +52,10 @@ __all__ = [
 # DELAY_DEPTH localparam and host.image / fpga_pulse_streamer DEFAULT_DELAY_DEPTH.
 # A bounded cap: 2048 ticks * 20 ns = ~40 us (covers +/-15 us after the negative-delay
 # global shift G, which can push an effective delay to ~30 us).
-DELAY_DEPTH = 2048            # DAC bus ring depth (TTL no longer uses it)
+DELAY_DEPTH = 2048            # (legacy) -- both TTL and DAC delays are event-scheduled now
 TTL_DELAY_MAX_TICKS = (1 << 31) - 1
 EVT_FIFO_DEPTH = 256          # per-channel TTL event FIFO depth (in-flight edges)
+BUS_EVT_FIFO_DEPTH = 64       # per-DA-bit event FIFO depth (in-flight value changes per bit)
 
 
 class DelayDepthExceeded(ValueError):
@@ -157,15 +158,15 @@ def bus_delay_line_reference(undelayed_bus: Sequence[int], delay: int,
 #   The pre-shift tap sr[k] == the bit pushed k+1 ticks ago, so sr[d-1] == d ticks ago; del_fill
 #   (running tick index) gates it to 0 until t>=d.  d==0 is bypassed (passthrough).
 #
-#   DAC (rtl_bus_delay_line_mirror): a 10-bit-wide circular buffer of DELAY_DEPTH+1 slots (zero
-#   at FIRE; wptr=0).  Each RUNNING tick:
-#       ring[wptr] = undelayed_value                                 # push this tick's value
-#       delayed_value = ring[(wptr - d) mod (DELAY_DEPTH+1)]         # value pushed d ago
-#       wptr = (wptr + 1) mod (DELAY_DEPTH+1)
-#   d=0 reads the slot just written this tick -> exact passthrough; d>0 before the buffer has
-#   filled (t<d) reads a still-zero slot -> silent until t>=d.
+#   DAC (rtl_bus_delay_line_mirror): UNIFIED with TTL -- each of the bus's bits is its own 1-bit
+#   EVENT FIFO (g_busdly) that shares the per-bus delay d (no more 2048-tick ring, so the range
+#   matches TTL).  Per bit, push {g_time+d-1, level} on a change, pop by g_time equality into the
+#   output register; d==1 is the prev register; before t==d the bit holds its BUS_SAFE_VALUE
+#   level.  Storage scales with value-change events IN FLIGHT per bit (<= BUS_EVT_FIFO_DEPTH),
+#   not delay length; an overflow drops the excess (a too-dense delayed ramp).
 #
-#   Both are out[t]=in[t-d], 0 before fire, byte-for-byte == the *_reference functions.
+#   Both are out[t]=in[t-d] before any overflow, == the *_reference functions (TTL safe 0, DAC
+#   safe = BUS_SAFE_VALUE), with the in-flight-count capacity bound instead of a delay-length cap.
 
 
 def _validate_delay_depth(d: int, depth: int, what: str) -> int:
@@ -225,21 +226,36 @@ def rtl_delay_line_mirror(undelayed: Sequence[int], channel_delays,
     return out
 
 def rtl_bus_delay_line_mirror(undelayed_bus: Sequence[int], delay: int,
-                              *, depth: int = DELAY_DEPTH, safe_value: int = 512) -> list[int]:
-    """Cycle-exact circular-buffer register mirror of the RTL per-bus (10-bit) delay line.
+                              *, depth: int = BUS_EVT_FIFO_DEPTH, bus_width: int = 10,
+                              safe_value: int = 512) -> list[int]:
+    """Cycle-exact mirror of the RTL per-DA-bit EVENT-SCHEDULER delay (``g_busdly``).
 
-    One ``depth``-slot ring of bus VALUES (the SAFE mid-scale code 512 = BUS_SAFE_VALUE =
-    0 V at FIRE); push the undelayed value each tick, read ``d`` writes ago.  Equals
-    :func:`bus_delay_line_reference`; a d > depth raises :class:`DelayDepthExceeded`."""
-    d = _validate_delay_depth(delay, depth, "bus")
-    slots = depth + 1                                  # see rtl_delay_line_mirror (d==depth fits)
-    ring = [int(safe_value)] * slots
-    wptr = 0
-    out = []
-    for t in range(len(undelayed_bus)):
-        ring[wptr] = int(undelayed_bus[t])             # push this tick's undelayed value
-        out.append(ring[(wptr - d) % slots])           # value pushed d ticks ago
-        wptr = (wptr + 1) % slots
+    Each of the bus's ``bus_width`` bits is its OWN 1-bit event FIFO that SHARES the per-bus
+    delay ``d`` (so the whole DAC value shifts coherently).  out[t] = in[t-d], holding that bit's
+    SAFE level (from 512 = BUS_SAFE_VALUE = 0 V) before t == d, first frame correct.  d==0 is
+    exact passthrough; d==1 is a single register.  Capacity is the number of value-change events
+    in flight PER BIT (<= ``depth``); a push when that bit's FIFO is full is DROPPED, matching the
+    RTL overflow guard (the only realistic stressor is a too-dense DELAYED ramp).  Equals
+    :func:`bus_delay_line_reference` whenever no bit exceeds ``depth`` events in flight -- and,
+    unlike the old 2048-tick ring, a large ``d`` is fine (the bound is in-flight count, not d)."""
+    d = int(delay)
+    n = len(undelayed_bus)
+    if d == 0:
+        return [int(v) for v in undelayed_bus]
+    out = [0] * n
+    for k in range(bus_width):
+        safe_bit = (int(safe_value) >> k) & 1
+        fifo: list[tuple[int, int]] = []           # (deadline, level), FIFO order
+        prev = safe_bit                            # prev UNDELAYED bit (the d==1 register)
+        obit = safe_bit                            # scheduled (delayed) bit (d>=2)
+        for t in range(n):
+            und = (int(undelayed_bus[t]) >> k) & 1
+            out[t] |= (prev if d == 1 else obit) << k   # output reads the registers PRE-pop
+            if d >= 2 and fifo and fifo[0][0] == t:     # pop the head whose deadline == g_time
+                obit = fifo.pop(0)[1]                    # (takes effect next tick, like the reg)
+            if und != prev and d >= 2 and len(fifo) < depth:
+                fifo.append((t + d - 1, und))            # push on change, unless the FIFO is full
+            prev = und
     return out
 
 
