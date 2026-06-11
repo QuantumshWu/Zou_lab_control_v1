@@ -1570,12 +1570,16 @@ def test_pulse_gui_constructs_xdc_channel_editor(monkeypatch, tmp_path):
         app.processEvents()
         assert editor.names_panel_holder.isHidden()
         assert editor.channel_panel_holder.isHidden()
+        # the collapsed stub lives in a shadow-pad holder (so its drop shadow renders); the
+        # holder is the toggle, the stub follows its parent's visibility.
+        assert not editor.left_panel_stub_holder.isHidden()
         assert editor.left_panel_stub.isVisible()
         editor.show_left_panels()
         app.processEvents()
         assert not editor.names_panel_holder.isHidden()
         assert not editor.channel_panel_holder.isHidden()
-        assert editor.left_panel_stub.isHidden()
+        assert editor.left_panel_stub_holder.isHidden()
+        assert not editor.left_panel_stub.isVisible()
         assert editor.tabs.currentWidget() is editor.edit_tab
         editor.tabs.setCurrentWidget(editor.preview_tab)
         app.processEvents()

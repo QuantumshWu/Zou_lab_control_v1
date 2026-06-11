@@ -4730,8 +4730,10 @@ def test_fixed_dac_bus_delayed_beyond_one_frame_compiles_and_streams():
 
 def test_edge_streamer_has_literal_delay_line_path():
     """Lock the RTL delay architecture into zlc_edge_streamer.v + the top:
-      (1) TTL = the per-channel EVENT SCHEDULER (event FIFO + free-running g_time +
-          prev_undelayed register for d==1); the old per-tick SRL lines are GONE;
+      (1) TTL = the per-SLOT EVENT SCHEDULER: each delay slot owns its OWN 2D distributed-RAM
+          event FIFO instantiated in the g_evtfifo generate loop (a flat 3D reg array with
+          independent per-slot pointers does NOT infer as RAM -> 226k FF, does not fit), plus
+          the free-running g_time + prev_undelayed register for d==1.  SRL lines are GONE;
       (2) DAC = the per-bus LUTRAM ring with write pointer + fill counter (ring-capped);
       (3) the disjoint merge out = (state_mask & ~delayed_mask) | delayed_out;
       (4) the top has the 32b/channel DELAY register region wired to the engine."""
@@ -4739,11 +4741,18 @@ def test_edge_streamer_has_literal_delay_line_path():
     root = pathlib.Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer"
     eng = (root / "zlc_edge_streamer.v").read_text(encoding="utf-8")
     top = (root / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
-    # (1) the scheduler elements; the SRL lines are gone
-    for tok in ("evt_mem", "evt_wr", "evt_rd", "evt_cnt", "evt_out", "g_time",
-                "prev_undelayed", "TTL_DELAY_WIDTH", "EVT_DEPTH", "GTIME_WIDTH"):
+    # (1) the per-slot event-FIFO scheduler; the SRL lines AND the old shared 3D evt_mem
+    # (which fell back to flip-flops) are gone.
+    for tok in ("g_evtfifo", "evt_out_contrib", "evt_out", "g_time", "prev_undelayed",
+                "TTL_DELAY_WIDTH", "EVT_DEPTH", "EVT_ADDR", "GTIME_WIDTH", "DELAY_CH_MAP"):
         assert tok in eng, tok
+    # the FIFO must be a per-slot distributed-RAM array, never a flat 3D reg (FF fallback)
+    assert "ram_style = \"distributed\" *) reg [GTIME_WIDTH:0] fifo" in eng
     assert "ttl_sr" not in eng
+    # the old shared 3D event memory declaration must be gone (the name may appear in a
+    # comment explaining why, but never as a real reg array)
+    assert "reg [GTIME_WIDTH:0] evt_mem" not in eng
+    assert "evt_mem [" not in eng
     # (2) bus ring + pointers + held delays
     for tok in ("bus_ring", "del_wptr", "del_fill", "del_ch_ticks", "del_bus_ticks",
                 "DELAY_DEPTH", "DELAY_SLOTS"):

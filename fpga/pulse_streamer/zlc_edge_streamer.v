@@ -340,12 +340,24 @@ module zlc_edge_streamer #(
     // Event FIFOs are stored by DELAY SLOT (0..NUM_DELAY_CH-1), not by channel: slot s
     // serves channel evt_ch_of(s).  Only pin-driving channels get a slot, so the deep
     // (EVT_DEPTH) distributed RAM is not paid for the bus-member bits.
-    (* ram_style = "distributed" *) reg [GTIME_WIDTH:0] evt_mem [0:NUM_DELAY_CH-1][0:EVT_DEPTH-1];
+    // Each slot is its OWN 2D distributed-RAM FIFO, instantiated in the g_evtfifo generate
+    // loop near the runtime block below.  A single 3D reg array (evt_mem[slot][depth]) does
+    // NOT infer as distributed RAM here: every slot has an INDEPENDENT wr/rd pointer (unlike
+    // bus_ring, whose banks share one write pointer), so Vivado's 3D-RAM inference bails and
+    // implements the whole array in flip-flops -- at EVT_DEPTH=256 that is 18*256*49 = 226k
+    // FF + 256:1 read muxes and does not fit.  Per-slot 2D arrays each map to one simple-
+    // dual-port LUTRAM (1 sync write @wr + 1 async read @rd).
     localparam integer EVT_ADDR = $clog2(EVT_DEPTH);
-    reg [EVT_ADDR-1:0] evt_wr  [0:NUM_DELAY_CH-1];
-    reg [EVT_ADDR-1:0] evt_rd  [0:NUM_DELAY_CH-1];
-    reg [EVT_ADDR:0]   evt_cnt [0:NUM_DELAY_CH-1];
-    reg [CHANNEL_COUNT-1:0] evt_out = {CHANNEL_COUNT{1'b0}};    // scheduled (delayed) levels, by channel
+    // Each slot drives ONLY its one owned channel bit (obit << evt_ch_of(slot)); evt_out is
+    // their OR, so un-served channels read 0 (the un-driven / before-first-event level).
+    wire [CHANNEL_COUNT-1:0] evt_out_contrib [0:NUM_DELAY_CH-1];
+    reg  [CHANNEL_COUNT-1:0] evt_out;                          // scheduled (delayed) levels, by channel
+    integer evt_ob;
+    always @(*) begin
+        evt_out = {CHANNEL_COUNT{1'b0}};
+        for (evt_ob = 0; evt_ob < NUM_DELAY_CH; evt_ob = evt_ob + 1)
+            evt_out = evt_out | evt_out_contrib[evt_ob];
+    end
     // slot s -> channel: identity when not compacted, else the packed map.
     function integer evt_ch_of;
         input integer s;
@@ -1063,48 +1075,67 @@ module zlc_edge_streamer #(
     // plain FIFO + equality compare is exact.  The host validates that no more than
     // EVT_DEPTH toggles are in flight inside any d-window; the guard below additionally
     // drops (rather than corrupts) on an impossible overflow.
-    integer ev_s, ev_c;
-    reg ev_push, ev_pop;
+    // Shared free-running time + the previous-undelayed snapshot (read by every slot FIFO).
     always @(posedge clk) begin
         if (reset_sync) begin
             g_time <= {GTIME_WIDTH{1'b0}};
             prev_undelayed <= {CHANNEL_COUNT{1'b0}};
-            evt_out <= {CHANNEL_COUNT{1'b0}};
-            for (ev_s = 0; ev_s < NUM_DELAY_CH; ev_s = ev_s + 1) begin
-                evt_wr[ev_s] <= {EVT_ADDR{1'b0}};
-                evt_rd[ev_s] <= {EVT_ADDR{1'b0}};
-                evt_cnt[ev_s] <= {(EVT_ADDR+1){1'b0}};
-            end
         end else begin
             g_time <= g_time + 1'b1;
             prev_undelayed <= state_mask;
-            for (ev_s = 0; ev_s < NUM_DELAY_CH; ev_s = ev_s + 1) begin
-                ev_c = evt_ch_of(ev_s);                       // channel this slot serves
-                ev_push = (state_mask[ev_c] != prev_undelayed[ev_c])
-                          && (del_ch_ticks[ev_c] > {{(TTL_DELAY_WIDTH-1){1'b0}}, 1'b1})
-                          && (evt_cnt[ev_s] != EVT_DEPTH[EVT_ADDR:0]);
-                ev_pop = (evt_cnt[ev_s] != {(EVT_ADDR+1){1'b0}})
-                         && (evt_mem[ev_s][evt_rd[ev_s]][GTIME_WIDTH:1] == g_time);
-                if (ev_push) begin
+        end
+    end
+    // One independent FIFO per delay slot.  Each is its own 2D distributed-RAM (sync write @wr,
+    // async read @rd) so the 226k-FF 3D fallback is gone; behaviour is bit-identical to the old
+    // shared loop (xsim tb_delay_sched / tb_delay_compact).
+    genvar gevs;
+    generate
+    for (gevs = 0; gevs < NUM_DELAY_CH; gevs = gevs + 1) begin : g_evtfifo
+        localparam integer GEVC = (DELAY_COMPACT != 0)
+            ? DELAY_CH_MAP[gevs*DELAY_CH_IDX_W +: DELAY_CH_IDX_W]
+            : gevs;                                            // channel this slot serves (constant)
+        (* ram_style = "distributed" *) reg [GTIME_WIDTH:0] fifo [0:EVT_DEPTH-1];
+        reg [EVT_ADDR-1:0] wr  = {EVT_ADDR{1'b0}};
+        reg [EVT_ADDR-1:0] rd  = {EVT_ADDR{1'b0}};
+        reg [EVT_ADDR:0]   cnt = {(EVT_ADDR+1){1'b0}};
+        reg                obit = 1'b0;                        // this channel's scheduled (delayed) level
+        reg pushf, popf;
+        wire [GTIME_WIDTH:0] headw = fifo[rd];                 // async-read FIFO head (LUTRAM read port)
+        // obit -> bit GEVC; un-served channels contribute 0 (GEVC is a per-instance constant)
+        assign evt_out_contrib[gevs] = {{(CHANNEL_COUNT-1){1'b0}}, obit} << GEVC;
+        always @(posedge clk) begin
+            if (reset_sync) begin
+                wr   <= {EVT_ADDR{1'b0}};
+                rd   <= {EVT_ADDR{1'b0}};
+                cnt  <= {(EVT_ADDR+1){1'b0}};
+                obit <= 1'b0;
+            end else begin
+                pushf = (state_mask[GEVC] != prev_undelayed[GEVC])
+                        && (del_ch_ticks[GEVC] > {{(TTL_DELAY_WIDTH-1){1'b0}}, 1'b1})
+                        && (cnt != EVT_DEPTH[EVT_ADDR:0]);
+                popf  = (cnt != {(EVT_ADDR+1){1'b0}})
+                        && (headw[GTIME_WIDTH:1] == g_time);
+                if (pushf) begin
                     // zero-EXTEND the 32b delay to the 48b time base (an out-of-range
                     // part-select here would X-poison the entry and kill the compare)
-                    evt_mem[ev_s][evt_wr[ev_s]] <= {
-                        g_time + {{(GTIME_WIDTH-TTL_DELAY_WIDTH){1'b0}}, del_ch_ticks[ev_c]} - 1'b1,
-                        state_mask[ev_c] };
-                    evt_wr[ev_s] <= evt_wr[ev_s] + 1'b1;
+                    fifo[wr] <= {
+                        g_time + {{(GTIME_WIDTH-TTL_DELAY_WIDTH){1'b0}}, del_ch_ticks[GEVC]} - 1'b1,
+                        state_mask[GEVC] };
+                    wr <= wr + 1'b1;
                 end
-                if (ev_pop) begin
-                    evt_out[ev_c] <= evt_mem[ev_s][evt_rd[ev_s]][0];
-                    evt_rd[ev_s] <= evt_rd[ev_s] + 1'b1;
+                if (popf) begin
+                    obit <= headw[0];
+                    rd <= rd + 1'b1;
                 end
-                case ({ev_push, ev_pop})
-                    2'b10: evt_cnt[ev_s] <= evt_cnt[ev_s] + 1'b1;
-                    2'b01: evt_cnt[ev_s] <= evt_cnt[ev_s] - 1'b1;
+                case ({pushf, popf})
+                    2'b10: cnt <= cnt + 1'b1;
+                    2'b01: cnt <= cnt - 1'b1;
                     default: ;
                 endcase
             end
         end
     end
+    endgenerate
 
     initial begin arm_kicked = 1'b0; arm_step = 4'd0; arm_wait = 4'd0; end
 endmodule

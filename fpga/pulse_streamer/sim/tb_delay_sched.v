@@ -99,7 +99,7 @@ module tb_delay_sched;
   integer dbg=0;
   always @(posedge clk) if (started && dbg<25) begin
     $display("  dbg t=%0d sm=%h prev=%h dct2=%0d cnt2=%0d out2=%b evtout2=%b g=%0d",
-      t, dut.state_mask, dut.prev_undelayed, dut.del_ch_ticks[2], dut.evt_cnt[2],
+      t, dut.state_mask, dut.prev_undelayed, dut.del_ch_ticks[2], dut.g_evtfifo[2].cnt,
       out[2], dut.evt_out[2], dut.g_time);
     dbg=dbg+1;
   end

@@ -669,6 +669,13 @@ def estimate_resources(params: StreamerParams, *, part, target_pct: float = 90.0
     # Delay-eligible channels = real TTL outputs: not bus-member bits (bus_count*bus_width,
     # pin driven by bus_out) and not the per-bus dedicated clk pins (bus_count, da_clk*).
     num_delay_ch = max(0, params.channel_count - params.bus_count * (params.bus_width + 1))
+    # Each slot's FIFO is a SIMPLE-DUAL-PORT distributed RAM (sync write @wr, async read @rd
+    # at an INDEPENDENT address), instantiated once per slot in the g_evtfifo generate loop.
+    # It MUST be RAM, not a flat 3D reg array: a 3D array with per-slot independent pointers
+    # does NOT infer as distributed RAM (Vivado falls back to registers -> 226k FF at depth
+    # 256, which does not fit).  7-series packs SDP LUTRAM at ~0.7-1.0 LUT per 64x1 cell
+    # (measured against this design's bus_ring), so ceil(EVT_DEPTH*49/64) LUTs per slot plus
+    # ~20 LUTs of pointer/comparator control is an honest, slightly-conservative estimate.
     ttl_sched_luts = num_delay_ch * (20 + _ceil(evt_depth * 49, 64))
     dac_ring_luts = (params.bus_count * params.bus_width) * _ceil(delay_slots, 64)
     delay_lutram = ttl_sched_luts + dac_ring_luts

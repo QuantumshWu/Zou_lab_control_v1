@@ -1746,6 +1746,13 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self.channel_panel_layout.setSpacing(0)
         dataset.addWidget(self.channel_panel_holder)
 
+        # The collapsed stub gets the SAME shadow-pad holder as the panels above so its
+        # drop shadow has room to render -- without it the stub's edge shadow is clipped
+        # flush against the layout (the "no shadow after collapse" report).
+        self.left_panel_stub_holder = QtWidgets.QWidget()
+        stub_holder_layout = QtWidgets.QVBoxLayout(self.left_panel_stub_holder)
+        stub_holder_layout.setContentsMargins(shadow_pad, shadow_pad, shadow_pad, shadow_pad)
+        stub_holder_layout.setSpacing(0)
         self.left_panel_stub = FluentFrame()
         self.left_panel_stub.setFixedWidth(_px(82, minimum=68))
         stub_layout = QtWidgets.QVBoxLayout(self.left_panel_stub)
@@ -1759,8 +1766,9 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self.stub_show_button.clicked.connect(self.show_left_panels)
         stub_layout.addWidget(self.stub_show_button)
         stub_layout.addStretch()
-        self.left_panel_stub.hide()
-        dataset.addWidget(self.left_panel_stub)
+        stub_holder_layout.addWidget(self.left_panel_stub)
+        self.left_panel_stub_holder.hide()
+        dataset.addWidget(self.left_panel_stub_holder)
 
         self.scroll = FluentScrollArea()
         self.scroll.setWidgetResizable(False)
@@ -1979,13 +1987,13 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self._left_panels_collapsed = True
         self.names_panel_holder.hide()
         self.channel_panel_holder.hide()
-        self.left_panel_stub.show()
+        self.left_panel_stub_holder.show()
         self.collapse_button.setText("Show Left")
         self._sync_dataset_geometry()
 
     def show_left_panels(self) -> None:
         self._left_panels_collapsed = False
-        self.left_panel_stub.hide()
+        self.left_panel_stub_holder.hide()
         self.names_panel_holder.show()
         self.channel_panel_holder.show()
         self.collapse_button.setText("Collapse")
@@ -2169,7 +2177,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         drag_height = (max(card_hints) if card_hints else 0) + vertical_margins(self.drag_container.layout_main)
         names_height = 0 if self.names_panel_holder.isHidden() else self.names_panel.sizeHint().height() + vertical_margins(self.names_panel_layout)
         channel_height = 0 if self.channel_panel_holder.isHidden() else self.channel_panel.sizeHint().height() + vertical_margins(self.channel_panel_layout)
-        stub_height = self.left_panel_stub.sizeHint().height() if hasattr(self, "left_panel_stub") and not self.left_panel_stub.isHidden() else 0
+        stub_height = self.left_panel_stub.sizeHint().height() if hasattr(self, "left_panel_stub_holder") and not self.left_panel_stub_holder.isHidden() else 0
         content_height = max(
             names_height,
             channel_height,
@@ -2177,7 +2185,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             drag_height,
         )
         content_height += _px(2, minimum=1)
-        for widget in (self.names_panel_holder, self.channel_panel_holder, self.left_panel_stub, self.scroll, self.drag_container):
+        for widget in (self.names_panel_holder, self.channel_panel_holder, self.left_panel_stub_holder, self.scroll, self.drag_container):
             widget.setMinimumHeight(content_height)
         self.dataset_body.setMinimumHeight(content_height + vertical_margins(self.dataset_body.layout()))
         container_width = self._drag_container_width()
@@ -2228,7 +2236,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self.timeline_hbar.setVisible(source.maximum() > source.minimum())
         if hasattr(self, "timeline_hbar_spacer"):
             left_width = 0
-            for widget in (self.names_panel_holder, self.channel_panel_holder, getattr(self, "left_panel_stub", None)):
+            for widget in (self.names_panel_holder, self.channel_panel_holder, getattr(self, "left_panel_stub_holder", None)):
                 if widget is None or widget.isHidden():
                     continue
                 width = widget.width() or widget.sizeHint().width()
