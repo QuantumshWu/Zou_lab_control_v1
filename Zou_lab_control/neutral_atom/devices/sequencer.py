@@ -434,7 +434,14 @@ def compile_pulse_table_runtime_program(
     _warn_idle_dac_clock_pins(state)
     # When buses are emitted as SEGMENTS, their (now nominal-phase) delay is realised by the
     # LITERAL per-bus delay line; pass the raw bus delays so they share the SAME global shift G
-    # as the TTL channels (a negative bus delay also lands >= 0).
+    # as the TTL channels (a negative bus delay also lands >= 0).  EVERY DRIVEN bus (one that
+    # emits >= 1 segment) must be passed -- even with NO explicit delay (raw 0) -- so a negative
+    # TTL delay that shifts the whole frame by G also shifts the DAC buses; otherwise they keep
+    # their nominal phase and visibly LEAD (the "-2 s emCCD shows DA_bias_y first" bug).
+    driven_bus_raw = (
+        {seg.bus_index: int(raw_bus_delays.get(seg.bus_index, 0)) for seg in bus_segments}
+        if bus_segments else None
+    )
     ticks, masks, channels, loop_end, repeat_from_index, channel_delays, bus_delays_by_index = _pulse_table_edge_table(
         state,
         channels=channels,
@@ -442,7 +449,7 @@ def compile_pulse_table_runtime_program(
         time_step_ns=clock_step_ns,
         fold_analog_buses=not bool(bus_segments),
         repeat_forever=bool(repeat_forever) and not has_bracket,
-        extra_raw_delays=raw_bus_delays if bus_segments else None,
+        extra_raw_delays=driven_bus_raw,
     )
     bus_delays = [
         RuntimeBusDelay(bus_index=bus_index, delay=int(bus_delays_by_index[bus_index]))
@@ -694,10 +701,14 @@ def compile_pulse_table_scan_runtime_program(
         hardware_bits[ch]: raw_delay[ch] + global_shift
         for ch in raw_delay if (raw_delay[ch] + global_shift) != 0
     }
+    # EVERY DRIVEN bus (emits >= 1 segment) inherits the global shift G, even with no explicit
+    # delay of its own -- so a negative TTL delay shifts the DAC buses in lockstep with the TTLs
+    # instead of letting them lead (the "-2 s emCCD shows DA_bias_y first" bug).
+    driven_bus_indices = sorted({seg.bus_index for seg in bus_segments})
     bus_delays = [
-        RuntimeBusDelay(bus_index=bus_index, delay=raw_bus_delays[bus_index] + global_shift)
-        for bus_index in sorted(raw_bus_delays)
-        if (raw_bus_delays[bus_index] + global_shift) != 0
+        RuntimeBusDelay(bus_index=b, delay=raw_bus_delays.get(b, 0) + global_shift)
+        for b in driven_bus_indices
+        if (raw_bus_delays.get(b, 0) + global_shift) != 0
     ]
 
     rows = _pulse_table_affine_rows(

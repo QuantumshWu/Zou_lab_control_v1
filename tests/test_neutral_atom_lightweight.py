@@ -1155,6 +1155,44 @@ def test_pulse_table_analog_bus_modes_compile_to_runtime_bus_segments(tmp_path):
     na.validate_pulse_streamer_program(program, max_edges=16, max_bus_segments=4, tick_width=32, channel_count=4)
 
 
+def _neg_delay_bus_state():
+    """A driven DAC bus + a NEGATIVE-delay TTL channel + a plain (undelayed) TTL channel.
+    The negative delay forces a global shift G; the DAC bus has NO explicit delay of its
+    own, so it must still be shifted by G (lockstep with the plain TTL) -- otherwise it
+    leads (the "-2 s emCCD shows DA_bias_y first" bug)."""
+    channels = ["ch00", "ch01", "ch02", "ch03", "ch04"]
+    labels = {"ch00": "da_test[0]", "ch01": "da_test[1]", "ch02": "da_test[2]",
+              "ch03": "emCCD", "ch04": "trap"}
+    state = na.PulseTableState(
+        channels=channels, channel_labels=labels, visible_channels=channels, time_step_ns=20,
+        periods=[na.PulsePeriod(1000, (0, 0, 0, 1, 1), unit="ns"),
+                 na.PulsePeriod(1000, (0, 0, 0, 1, 1), unit="ns")],
+    )
+    state.set_analog_bus_mode(0, "da_test", "edge", value=3)   # nonzero -> a real segment
+    state.apply_analog_bus_modes_to_period_states()
+    state.delays["ch03"] = "-1000"                              # -1000 ns = -50 ticks @ 20 ns
+    state.delay_units["ch03"] = "ns"
+    return state
+
+
+def test_negative_delay_global_shift_also_shifts_undelayed_dac_bus_nonscan():
+    """REGRESSION (the -2 s bug): a negative TTL delay shifts the whole frame by G; an
+    undelayed but DRIVEN DAC bus must be shifted by the SAME G as a plain TTL, so it does
+    not visibly lead.  Non-scan compile path (compile_pulse_table_runtime_program)."""
+    state = _neg_delay_bus_state()
+    program = state.compile(clock_hz=50_000_000, repeat_forever=True)
+    # G = max(0, 50) = 50 ticks.  emCCD (-50) folds to 0; the plain TTL (trap, 0) -> 50.
+    bits = {name: i for i, name in enumerate(program.channels)}
+    cd = program.channel_delays or []
+    assert cd[bits["ch04"]] == 50, "plain TTL must be shifted by G"
+    assert cd[bits["ch03"]] == 0, "the -50 negative-delay channel folds to 0 (it leads)"
+    # The DRIVEN DAC bus has NO explicit delay yet MUST land at G, in lockstep with the TTL.
+    bus_delay = {bd.bus_index: bd.delay for bd in (program.bus_delays or [])}
+    assert bus_delay.get(0) == 50, (
+        "driven DAC bus must inherit the global negative-delay shift G (=50), not lead at 0; "
+        f"got {program.bus_delays!r}")
+
+
 def test_dac_ramp_spans_current_period_with_hold_carry_and_edge_step():
     """The within-period DAC semantics (the user's ramp/edge/hold fix), proven end-to-end
     through the compiler + the cycle-accurate engine model:
