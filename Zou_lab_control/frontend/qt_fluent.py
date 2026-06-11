@@ -159,83 +159,184 @@ def status_dot_stylesheet(color: str, *, radius: int = 8) -> str:
     return f"background:{color}; border-radius:{scaled_px(radius)}px;"
 
 
-# Shadow pixmaps are pure functions of the card SILHOUETTE (every shadowed fluent
-# widget is an opaque rounded rect): cache one rendered shadow per (size, radius,
-# blur, alpha, offset, dpr) and share it across all widgets of that size.
+# CachedDropShadow caches BAKED SHADOWS keyed by the widget's SILHOUETTE -- the
+# geometry that determines the shadow (size + corner radii, or the tab-bar step
+# for the tab widget) -- so the expensive Gaussian blur runs once per shape, not
+# on every repaint.  The live widget content is rasterised fresh each paint (via
+# Qt's own sourcePixmap machinery, which also keeps NESTED effects working).
+# Contract: a shadowed widget must paint an opaque silhouette matching its
+# declared path; widgets with other shapes need a silhouette provider like the
+# tab widget's (see _tab_widget_silhouette).
 _SHADOW_PIXMAP_CACHE: dict[tuple, QtGui.QPixmap] = {}
 
 
-def _shadow_pixmap(width: int, height: int, radius: int, blur: int, alpha: int,
-                   offset: int, dpr: float) -> QtGui.QPixmap:
-    key = (int(width), int(height), int(radius), int(blur), int(alpha), int(offset), round(float(dpr), 2))
+def _baked_silhouette_shadow(key: tuple, path: QtGui.QPainterPath, width: int, height: int,
+                             margin: int, blur: int, alpha: int, offset: int,
+                             dpr: float = 1.0) -> QtGui.QPixmap:
+    """Shadow+silhouette composite for an opaque white shape, cached by ``key``.
+
+    ``path`` is in widget LOGICAL coordinates; ``width``/``height`` are the
+    padded effective rect in DEVICE pixels (logical * dpr).  The bake scales
+    the path geometry, blur and offset by ``dpr`` so the shadow is rendered at
+    the screen's native resolution; the returned pixmap is a plain dpr=1
+    device-pixel image (blitted 1:1 under an identity transform).  Baked by
+    running the real ``QGraphicsDropShadowEffect`` once in a throwaway scene,
+    so the blur kernel/rounding are exactly the stock effect's.
+    """
     cached = _SHADOW_PIXMAP_CACHE.get(key)
     if cached is not None:
         return cached
-    # Render THE SAME QGraphicsDropShadowEffect once, on a dummy rounded rect with
-    # the card's silhouette, via a throwaway QGraphicsScene -- the canonical way to
-    # bake an effect's output into a pixmap.  The dummy is filled white (the card
-    # background) so the antialiased rim under the live card matches the original.
-    margin = blur + abs(offset)
+    if len(_SHADOW_PIXMAP_CACHE) > 256:   # bound a long session full of resizes
+        _SHADOW_PIXMAP_CACHE.clear()
     scene = QtWidgets.QGraphicsScene()
-    path = QtGui.QPainterPath()
-    path.addRoundedRect(0.0, 0.0, float(width), float(height), float(radius), float(radius))
     item = scene.addPath(path, QtGui.QPen(QtCore.Qt.NoPen), QtGui.QBrush(QtGui.QColor("white")))
     effect = QtWidgets.QGraphicsDropShadowEffect()
     effect.setBlurRadius(blur)
     effect.setColor(QtGui.QColor(0, 0, 0, alpha))
     effect.setOffset(0, offset)
     item.setGraphicsEffect(effect)
-    pixmap = QtGui.QPixmap(int((width + 2 * margin) * dpr), int((height + 2 * margin) * dpr))
+    # The dpr-tagged pixmap makes the painter rasterise at DEVICE resolution
+    # while the scene/path/effect stay in logical units -- the same machinery
+    # the stock effect goes through on a high-DPI screen.
+    log_w, log_h = width / dpr, height / dpr
+    pixmap = QtGui.QPixmap(width, height)
     pixmap.setDevicePixelRatio(dpr)
     pixmap.fill(QtCore.Qt.transparent)
     painter = QtGui.QPainter(pixmap)
     painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
-    scene.render(painter, QtCore.QRectF(0, 0, width + 2 * margin, height + 2 * margin),
-                 QtCore.QRectF(-margin, -margin, width + 2 * margin, height + 2 * margin))
+    scene.render(painter, QtCore.QRectF(0, 0, log_w, log_h),
+                 QtCore.QRectF(-margin, -margin, log_w, log_h))
     painter.end()
     _SHADOW_PIXMAP_CACHE[key] = pixmap
     return pixmap
 
 
+def _tab_widget_silhouette(widget: QtWidgets.QTabWidget):
+    """Silhouette of a FluentTabWidget: tab strip (rounded tops) + pane.
+
+    The widget is NOT an opaque rounded rect -- the area right of the tabs is
+    transparent (the window background shows through), so a rounded-rect bake
+    would paint a white band there and cast shadow where the stock effect casts
+    none.  The 2 px notches between individual tabs are washed out by the blur,
+    so one strip spanning the tabs matches the stock shadow visually.
+    """
+    bar = widget.tabBar()
+    geo = bar.geometry()
+    last = bar.tabRect(bar.count() - 1) if bar.count() else QtCore.QRect(0, 0, 0, 0)
+    strip_w = min(geo.width(), last.x() + last.width())
+    w, h, r = widget.width(), widget.height(), _radius()
+    pane_top = geo.height()
+    key = ("tabs", w, h, pane_top, strip_w, geo.x(), geo.y(), r)
+    pane = QtGui.QPainterPath()
+    # WindingFill: overlapping subpaths must UNION (the default odd-even rule
+    # would XOR the corner square into a hole inside the pane).
+    pane.setFillRule(QtCore.Qt.WindingFill)
+    pane.addRoundedRect(0.0, float(pane_top), float(w), float(h - pane_top), float(r), float(r))
+    pane.addRect(0.0, float(pane_top), float(2 * r), float(2 * r))   # square NW corner (tabs sit on it)
+    strip = QtGui.QPainterPath()
+    strip.addRoundedRect(float(geo.x()), float(geo.y()), float(strip_w), float(geo.height() + r), float(r), float(r))
+    return key, pane.united(strip).simplified()
+
+
 class CachedDropShadow(QtWidgets.QGraphicsEffect):
-    """Drop shadow with a SIZE-KEYED cached shadow pixmap + live source painting.
+    """Drop shadow with a silhouette-cached blur + live source painting.
 
     A stock ``QGraphicsDropShadowEffect`` re-rasterises the source widget and
     re-runs the Gaussian blur on EVERY paint -- scrolling a panel of shadowed
-    cards spent ~90% of each frame in the blur (measured 18.4 ms/step vs the
-    2.0 ms no-shadow floor).  Every shadowed fluent widget is an opaque ROUNDED
-    RECT, whose shadow depends only on its silhouette -- so the blurred shadow
-    is rendered once per (size, radius, blur, alpha) into a shared pixmap and
-    blitted, while the live widget is painted normally on top via
-    ``drawSource`` (no caching of CONTENT -> no stale-pixmap ghosting)."""
+    cards spent ~90% of each frame in the blur.  Here the blurred shadow is
+    baked once per silhouette (size + shape) by the real stock effect and
+    blitted, while the live widget is rasterised through Qt's own
+    ``sourcePixmap`` machinery and drawn on top (fresh content every paint ->
+    no ghosting).
 
-    def __init__(self, parent=None, *, radius: int, blur: int, alpha: int, offset: int):
+    Two hard-won correctness points (do not "simplify" these away):
+
+    * ``draw`` must follow the stock structure -- ``sourcePixmap`` in DEVICE
+      coordinates, paint under an identity world transform at the returned
+      offset.  Calling ``drawSource`` instead breaks the paint context of any
+      NESTED graphics effect (children render with a (0,0)/identity painter
+      and their shadows disappear), which blanked every card shadow inside
+      the shadowed tab widget.
+    * The silhouette must be the widget's TRUE opaque outline.  ``silhouette``
+      (when given) returns (cache-key, QPainterPath) for non-rounded-rect
+      widgets such as the tab widget; the default is a rounded rect with this
+      effect's corner radii.
+    """
+
+    def __init__(self, parent=None, *, radius: int, blur: int, alpha: int, offset: int,
+                 corner_radii: tuple = None, silhouette=None):
         super().__init__(parent)
         self._radius = int(radius)
         self._blur = int(blur)
         self._alpha = int(alpha)
         self._offset = int(offset)
+        self._corner_radii = corner_radii   # (tl, tr, br, bl) or None -> uniform radius
+        self._silhouette = silhouette       # callable(widget) -> (key, QPainterPath)
 
     def boundingRectFor(self, rect: QtCore.QRectF) -> QtCore.QRectF:  # noqa: N802
         margin = float(self._blur + abs(self._offset))
         return rect.adjusted(-margin, -margin, margin, margin)
 
+    def _default_silhouette(self, width: float, height: float):
+        radii = self._corner_radii or (self._radius,) * 4
+        tl, tr, br, bl = (float(v) for v in radii)
+        path = QtGui.QPainterPath()
+        if tl == tr == br == bl:
+            path.addRoundedRect(0.0, 0.0, width, height, tl, tl)
+        else:
+            # Per-corner radii (FluentFrame's round=(...) option).
+            path.moveTo(tl, 0.0)
+            path.lineTo(width - tr, 0.0)
+            path.arcTo(width - 2 * tr, 0.0, 2 * tr, 2 * tr, 90.0, -90.0)
+            path.lineTo(width, height - br)
+            path.arcTo(width - 2 * br, height - 2 * br, 2 * br, 2 * br, 0.0, -90.0)
+            path.lineTo(bl, height)
+            path.arcTo(0.0, height - 2 * bl, 2 * bl, 2 * bl, -90.0, -90.0)
+            path.lineTo(0.0, tl)
+            path.arcTo(0.0, 0.0, 2 * tl, 2 * tl, 180.0, -90.0)
+            path.closeSubpath()
+        key = ("rrect", int(width), int(height), tl, tr, br, bl)
+        return key, path
+
     def draw(self, painter: QtGui.QPainter) -> None:  # noqa: N802
-        rect = self.sourceBoundingRect(QtCore.Qt.LogicalCoordinates)
-        if not rect.isEmpty():
-            dpr = painter.device().devicePixelRatioF() if painter.device() is not None else 1.0
-            margin = self._blur + abs(self._offset)
-            pixmap = _shadow_pixmap(
-                int(round(rect.width())), int(round(rect.height())),
-                self._radius, self._blur, self._alpha, self._offset, dpr)
-            painter.drawPixmap(QtCore.QPointF(rect.x() - margin, rect.y() - margin), pixmap)
-        self.drawSource(painter)
+        if self._blur <= 0 and self._offset == 0:
+            self.drawSource(painter)
+            return
+        # Stock-effect structure: sourcePixmap() triggers Qt's proper
+        # (nested-safe) source rendering and yields the device-coordinate
+        # offset to paint at.
+        src, off = self.sourcePixmap(QtCore.Qt.DeviceCoordinates,
+                                     QtWidgets.QGraphicsEffect.PadToEffectiveBoundingRect)
+        if src.isNull():
+            return
+        # `src` is a device-resolution pixmap tagged with the screen dpr; the
+        # returned offset is LOGICAL, and under the identity world transform a
+        # dpr-tagged pixmap drawn at a logical position lands exactly on its
+        # device pixels (the painter keeps the dpr device transform).  The bake
+        # mirrors that: device-resolution pixels, logical geometry.
+        dpr = float(src.devicePixelRatioF() or 1.0)
+        margin = self._blur + abs(self._offset)
+        widget = self.parent()
+        if self._silhouette is not None and widget is not None:
+            sil_key, path = self._silhouette(widget)
+        else:
+            sil_key, path = self._default_silhouette(
+                src.width() / dpr - 2.0 * margin, src.height() / dpr - 2.0 * margin)
+        key = sil_key + (self._blur, self._alpha, self._offset, round(dpr, 2))
+        shadow = _baked_silhouette_shadow(key, path, src.width(), src.height(),
+                                          margin, self._blur, self._alpha, self._offset, dpr)
+        restore = painter.worldTransform()
+        painter.setWorldTransform(QtGui.QTransform())
+        painter.drawPixmap(off, shadow)
+        painter.drawPixmap(off, src)
+        painter.setWorldTransform(restore)
 
 
-def add_fluent_shadow(widget: QtWidgets.QWidget, *, blur: int = 20, alpha: int = 50, offset: int = 0) -> None:
+def add_fluent_shadow(widget: QtWidgets.QWidget, *, blur: int = 20, alpha: int = 50, offset: int = 0,
+                      corner_radii: tuple = None, silhouette=None) -> None:
     shadow = CachedDropShadow(
         widget, radius=_radius(), blur=scaled_px(blur), alpha=alpha,
-        offset=scaled_px(offset, minimum=0))
+        offset=scaled_px(offset, minimum=0), corner_radii=corner_radii, silhouette=silhouette)
     widget.setGraphicsEffect(shadow)
 
 
@@ -364,7 +465,7 @@ class FluentFrame(QtWidgets.QFrame):
             """
         )
         if shadow:
-            add_fluent_shadow(self)
+            add_fluent_shadow(self, corner_radii=(top_left, top_right, bottom_right, bottom_left))
 
 
 class FluentGroupBox(QtWidgets.QGroupBox):
@@ -692,7 +793,8 @@ class FluentTabWidget(QtWidgets.QTabWidget):
             }}
             """
         )
-        add_fluent_shadow(self, blur=10, alpha=50, offset=2)
+        add_fluent_shadow(self, blur=10, alpha=50, offset=2,
+                          silhouette=_tab_widget_silhouette)
 
 
 class FluentSwitch(QtWidgets.QAbstractButton):

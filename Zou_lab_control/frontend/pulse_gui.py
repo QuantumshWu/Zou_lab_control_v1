@@ -602,11 +602,17 @@ class PulseStateUIManager(QtCore.QObject):
         self._update()
 
     def _update(self) -> None:
+        # Confocal state semantics: BUTTON BASE COLOURS NEVER CHANGE with run
+        # state (a colour-coded state on one button is indistinguishable from
+        # the other permanently-coloured buttons).  Run state is shown by the
+        # STATUS DOT colour plus a confocal-style ``*`` suffix on On Pulse:
+        # the star means "pressing this would apply something new" -- it is
+        # present in every state except RUNNING-and-in-sync.
         colors = {
             self.RunState.INIT: GREY,
             self.RunState.PREPARED: YELLOW,
             self.RunState.RUNNING: GREEN,
-            self.RunState.STOP: GREEN,
+            self.RunState.STOP: RED,
             self.RunState.SAFE: RED,
             self.RunState.ERROR: RED,
             self.RunState.UNSYNCED: ORANGE,
@@ -628,18 +634,18 @@ class PulseStateUIManager(QtCore.QObject):
         else:
             text = f"PulseGUI - {pulse_name} ({status}){star}"
         self.label.setText(text)
-        # Keep the button label fixed-width ("Save", never "Save*"): the dirty
-        # state is already shown by the button COLOUR (yellow) and the title-bar
-        # star, and a changing label made the button visibly narrow after load.
-        self.save_button.setText("Save")
+        # Save: star + yellow while there are unsaved changes, accent when clean
+        # (same rule as confocal's btn_save).  The buttons sit in equal-stretch
+        # grid columns, so the text change cannot alter their width.
+        self.save_button.setText("Save*" if star else "Save")
         self.save_button.set_color(YELLOW if star else ACCENT)
-        # Confocal-style applied-state hint: while the device is running/prepared
-        # with parameters that DIFFER from the editor (any pulse/delay/duration/
-        # DA/scan edit since the last On Pulse/Prepare), the On Pulse button turns
-        # ORANGE -- "press to apply your pending edits".  Clean state = GREEN.
         if self.fire_button is not None:
-            self.fire_button.setText("On Pulse")
-            self.fire_button.set_color(ORANGE if self._runstate == self.RunState.UNSYNCED else GREEN)
+            # On Pulse stays GREEN; the star marks every state where pressing
+            # it would apply/run something new (UNSYNCED edits, stopped, error,
+            # prepared-but-not-fired...).  RUNNING in sync = no star.
+            running_clean = self._runstate == self.RunState.RUNNING
+            self.fire_button.setText("On Pulse" if running_clean else "On Pulse*")
+            self.fire_button.set_color(GREEN)
         if self.title_callback is not None:
             self.title_callback(f"{pulse_name} - PulseGUI{star}")
 
@@ -1787,9 +1793,15 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         button_layout.setSpacing(_px(6, minimum=4))
         self.safe_button = self._control_button("Stop Pulse", self.safe_state, RED)
         self.fire_button = self._control_button("On Pulse", self.fire, GREEN)
+        self.fire_button.setToolTip(
+            "Apply the editor's pulse to the device and run it.\n"
+            "* = pressing would apply something new (edits not yet applied,\n"
+            "or the device is not currently running).")
         self.remove_button = self._control_button("Remove", self.remove_period, ORANGE)
         self.add_button = self._control_button("Add Period", self.add_period, ACCENT)
-        self.bracket_button = self._control_button("Add Bracket", self.toggle_bracket, YELLOW)
+        # ACCENT, not yellow: yellow is reserved for the Save button's dirty
+        # state -- a permanently-yellow base button would read as "highlighted".
+        self.bracket_button = self._control_button("Add Bracket", self.toggle_bracket, ACCENT)
         self.save_button = self._control_button("Save", self.save_to_file, YELLOW)
         self.load_button = self._control_button("Load", self.load_from_file, ORANGE)
         # Sync pulls the pulse actually APPLIED on the sequencer back into the editor --
@@ -1891,6 +1903,12 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self.preview_scroll.setWidgetResizable(False)
         self.preview_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         self.preview_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        # A wheel over the PLOT must zoom the plot ONLY -- never also scroll this page.
+        # Accepting on the canvas alone is not enough on every delivery path (Qt can
+        # route the wheel to the scroll-area viewport), so filter at the VIEWPORT:
+        # any wheel whose position lies on the canvas is forwarded to the canvas and
+        # CONSUMED here, regardless of how Qt delivered it.
+        self.preview_scroll.viewport().installEventFilter(self)
         self.preview_body = QtWidgets.QWidget()
         self.preview_body_layout = QtWidgets.QVBoxLayout(self.preview_body)
         self.preview_body_layout.setContentsMargins(_px(8), _px(8), _px(8), _px(8))
@@ -3317,9 +3335,10 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             return
         self._preview_dirty = True
         # Confocal-style UNSYNCED: an edit while the device is running/prepared means
-        # the device no longer matches the editor -> orange On Pulse hint.  Cheap here
-        # (no state serialisation); the debounced _update_summary does the accurate
-        # compare and restores the run state if the edit brought the state back.
+        # the device no longer matches the editor -> orange status dot + "On Pulse*"
+        # star.  Cheap here (no state serialisation); the debounced _update_summary
+        # does the accurate compare and restores the run state if the edit brought
+        # the state back.
         RunState = PulseStateUIManager.RunState
         if self.stateui_manager.runstate in (RunState.RUNNING, RunState.PREPARED):
             self._unsynced_from = self.stateui_manager.runstate
@@ -3614,26 +3633,63 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         try:
             state = self.read_state()
             include_always_off = self.preview_include_off.isChecked()
+            # Rebuilding the figure + canvas costs ~130 ms; every visit to the
+            # Preview tab used to pay it even with NOTHING changed.  Skip the
+            # rebuild when the rendered (state, toggle) pair is identical -- the
+            # existing canvas already shows exactly this plot.  Restoring the
+            # home view keeps the OLD observable behaviour (a rebuild always
+            # came back at the default zoom).
+            render_key = (self._state_key(state), bool(include_always_off))
+            if (self._preview_canvas is not None
+                    and render_key == getattr(self, "_preview_render_key", None)):
+                tools = getattr(self._preview_plot, "tools", None)
+                zoom = getattr(tools, "zoom", None)
+                needs_redraw = False
+                if zoom is not None:
+                    ax = zoom.ax
+                    if (tuple(ax.get_xlim()) != tuple(zoom._home_xlim)
+                            or tuple(ax.get_ylim()) != tuple(zoom._home_ylim)):
+                        ax.set_xlim(zoom._home_xlim)
+                        ax.set_ylim(zoom._home_ylim)
+                        needs_redraw = True
+                area = getattr(tools, "area", None)
+                if area is not None and (area.text is not None or area.range != [None] * 4):
+                    area.clear()
+                    needs_redraw = True
+                cross = getattr(tools, "cross", None)
+                if cross is not None and cross.point is not None:
+                    cross.remove_point()
+                    needs_redraw = True
+                if needs_redraw:
+                    self._preview_canvas.draw_idle()
+                self._preview_dirty = False
+                return
             plotter, channels, repeat = self._create_preview_plot(state, include_always_off=include_always_off)
             self._replace_preview_canvas(plotter)
             repeat_part = f" | {repeat}" if repeat else ""
             mode = "all channels" if include_always_off else "active channels"
             self.preview_status.setText(f"{len(channels)}/{len(state.channels)} plotted ({mode}){repeat_part}")
             self._preview_dirty = False
+            self._preview_render_key = render_key
             self._update_file_state(state)
         except Exception as exc:
+            self._preview_render_key = None
             self.preview_status.setText(str(exc))
 
     def _replace_preview_canvas(self, plotter) -> None:
+        # Null the references FIRST: if canvas construction below raises, the
+        # wheel eventFilter must not keep dereferencing a deleteLater()'d widget
+        # (a dead sip wrapper inside a Qt callback aborts the process).
+        old_plot, self._preview_plot, self._preview_canvas = self._preview_plot, None, None
         while self.preview_body_layout.count():
             item = self.preview_body_layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
                 widget.setParent(None)
                 widget.deleteLater()
-        if self._preview_plot is not None and plt is not None:
+        if old_plot is not None and plt is not None:
             try:
-                plt.close(self._preview_plot.fig)
+                plt.close(old_plot.fig)
             except Exception:
                 pass
         canvas = FigureCanvas(plotter.fig)
@@ -3648,6 +3704,30 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         )
         self._preview_plot = plotter
         self._preview_canvas = canvas
+
+    def eventFilter(self, obj, event):  # noqa: N802 (Qt naming)
+        # Preview viewport wheel isolation: a wheel whose position is on the pulse-plot
+        # canvas zooms the plot and is CONSUMED -- the preview page must never scroll
+        # underneath it.  Wheels off the canvas (margins, placeholder) scroll normally.
+        if (event.type() == QtCore.QEvent.Wheel
+                and hasattr(self, "preview_scroll")
+                and obj is self.preview_scroll.viewport()):
+            canvas = getattr(self, "_preview_canvas", None)
+            if canvas is not None:
+                global_pos = event.globalPos() if hasattr(event, "globalPos") else event.globalPosition().toPoint()
+                local = canvas.mapFromGlobal(global_pos)
+                if canvas.rect().contains(local):
+                    # Re-issue the wheel in CANVAS coordinates: the original event
+                    # is viewport-local, and forwarding it unchanged would zoom
+                    # about the wrong point (or miss the axes entirely).
+                    mapped = QtGui.QWheelEvent(
+                        QtCore.QPointF(local), QtCore.QPointF(global_pos),
+                        event.pixelDelta(), event.angleDelta(),
+                        event.buttons(), event.modifiers(),
+                        event.phase(), event.inverted())
+                    QtWidgets.QApplication.sendEvent(canvas, mapped)
+                    return True          # consumed: the page does not scroll
+        return super().eventFilter(obj, event)
 
     def _message(self, text: str) -> None:
         if os.environ.get("QT_QPA_PLATFORM", "").lower() == "offscreen":

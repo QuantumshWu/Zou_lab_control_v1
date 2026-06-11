@@ -122,6 +122,24 @@ class AreaSelector:
         self.ax.figure.canvas.draw_idle()
         self._call()
 
+    def clear(self) -> None:
+        """Reset to the no-selection state (range, label and drawn rectangle)."""
+        self.range = [None, None, None, None]
+        if self.text is not None:
+            try:
+                self.text.remove()
+            except Exception:
+                pass
+            self.text = None
+        try:
+            self.selector.clear()
+        except Exception:
+            try:
+                for artist in self.selector.artists:
+                    artist.set_visible(False)
+            except Exception:
+                pass
+
     def destroy(self) -> None:
         try:
             self.selector.set_active(False)

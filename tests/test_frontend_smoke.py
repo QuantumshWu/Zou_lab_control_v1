@@ -1157,6 +1157,87 @@ def test_pulse_gui_save_button_keeps_width_on_state_change(monkeypatch):
     assert abs(editor.save_button.width() - width0) <= 1, (width0, editor.save_button.width())
 
 
+def test_pulse_gui_confocal_star_state_semantics(monkeypatch):
+    """State indication follows confocal: stars + status dot, NEVER base colours.
+
+    The user's complaints this guards:
+    * an orange UNSYNCED On Pulse was indistinguishable from the permanently
+      orange Remove/Load/Sync buttons ("你根本就不知道哪个是高亮的");
+    * Add Bracket was permanently yellow, colliding with Save's dirty yellow;
+    * the confocal '*' suffix was missing, and only Save reflected state while
+      On Pulse did not.
+    """
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5 import QtGui
+
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.qt_fluent import ACCENT, GREEN, ORANGE, RED, YELLOW
+
+    def bg(button):
+        return button._current_bg
+
+    editor = dt.demo_editor(size=(1480, 900))
+    try:
+        dt.settle(editor, 100)
+        manager = editor.stateui_manager
+        RunState = type(manager).RunState
+        FileState = type(manager).FileState
+        green = QtGui.QColor(GREEN).name(QtGui.QColor.HexRgb)
+        yellow = QtGui.QColor(YELLOW).name(QtGui.QColor.HexRgb)
+        accent = QtGui.QColor(ACCENT).name(QtGui.QColor.HexRgb)
+
+        # Base palette must not reuse the state colours: Add Bracket is accent
+        # (yellow is reserved for Save-dirty).
+        assert bg(editor.bracket_button) == accent
+
+        # INIT: editor not applied anywhere -> star, GREEN (colour fixed).
+        assert editor.fire_button.text() == "On Pulse*"
+        assert bg(editor.fire_button) == green
+
+        # RUNNING and in sync: the ONLY state without the star.
+        manager.runstate = RunState.RUNNING
+        assert editor.fire_button.text() == "On Pulse"
+        assert bg(editor.fire_button) == green
+
+        # An edit while running -> UNSYNCED: star comes back, colour STAYS green
+        # (the orange is on the status dot, not the button).
+        editor._mark_dirty()
+        assert manager.runstate == RunState.UNSYNCED
+        assert editor.fire_button.text() == "On Pulse*"
+        assert bg(editor.fire_button) == green
+        dot_style = editor.status_dot.styleSheet().lower()
+        assert ORANGE.lower() in dot_style
+
+        # Every other run state keeps the star and the green colour.
+        for state in (RunState.PREPARED, RunState.STOP, RunState.SAFE, RunState.ERROR):
+            manager.runstate = state
+            assert editor.fire_button.text() == "On Pulse*", state
+            assert bg(editor.fire_button) == green, state
+
+        # Save: confocal FileState semantics -- star+yellow dirty, plain+accent clean.
+        manager.filestate = FileState.UNSAVED
+        assert editor.save_button.text() == "Save*"
+        assert bg(editor.save_button) == yellow
+        manager.filestate = FileState.LOAD
+        assert editor.save_button.text() == "Save"
+        assert bg(editor.save_button) == accent
+        manager.filestate = FileState.UNTITLED
+        assert editor.save_button.text() == "Save*"
+        assert bg(editor.save_button) == yellow
+
+        # The stars must not change button geometry (equal-stretch grid columns).
+        manager.runstate = RunState.RUNNING
+        dt.settle(editor, 40)
+        width_clean = editor.fire_button.width()
+        manager.runstate = RunState.UNSYNCED
+        dt.settle(editor, 40)
+        assert abs(editor.fire_button.width() - width_clean) <= 1
+    finally:
+        editor.close()
+
+
 def test_pulse_gui_scan_unbind_restores_field_state(monkeypatch):
     """Unbinding a scan slot must restore the field's ORIGINAL value/mode.
 
@@ -1676,7 +1757,8 @@ def test_pulse_gui_controls_call_attached_address_switch_sequencer(monkeypatch):
         editor.show()
         app.processEvents()
 
-        assert editor.fire_button.text() == "On Pulse"
+        # INIT: nothing applied yet -> confocal star ("pressing would apply").
+        assert editor.fire_button.text() == "On Pulse*"
         assert editor.safe_button.text() == "Stop Pulse"
         assert editor.names_panel.raw_label_widgets["ch00"].text() == "F15"
         assert editor.names_panel.raw_label_widgets["ch11"].text() == "M13"
@@ -1765,6 +1847,190 @@ def test_pulse_gui_repeat_preview_uses_unexpanded_periods(monkeypatch):
         x_tick_labels = [tick.get_text().strip() for tick in editor._preview_plot.ax.get_xticklabels() if tick.get_visible()]
         assert all(not label.startswith("-") for label in x_tick_labels if label)
         assert editor._preview_plot.channels == channels
+    finally:
+        editor.close()
+
+
+def test_pulse_gui_preview_refresh_skips_rebuild_when_unchanged(monkeypatch):
+    """Revisiting the Preview tab with an UNCHANGED state must not rebuild the
+    ~130 ms figure+canvas -- but must look exactly like a rebuild: the view
+    returns to the home zoom and any selection rectangle is cleared.  A real
+    edit or the Show-off-rows toggle still rebuilds."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.pulse_gui import FigureCanvas
+
+    if FigureCanvas is None:
+        pytest.skip("Matplotlib Qt canvas is unavailable")
+
+    editor = dt.demo_editor(size=(1480, 900))
+    try:
+        editor.tabs.setCurrentWidget(editor.preview_tab)
+        dt.settle(editor, 200)
+        canvas = editor._preview_canvas
+        assert canvas is not None
+
+        # unchanged state -> the canvas object survives (no rebuild)
+        editor.refresh_preview()
+        assert editor._preview_canvas is canvas
+
+        # ...but a zoomed view returns to home (identical to the old rebuild)
+        zoom = editor._preview_plot.tools.zoom
+        home = tuple(zoom.ax.get_xlim())
+        zoom.ax.set_xlim(home[0], home[1] * 0.5)
+        editor.refresh_preview()
+        assert tuple(zoom.ax.get_xlim()) == home
+        assert editor._preview_canvas is canvas
+
+        # a real edit rebuilds
+        editor.drag_container.pulse_cards()[0].duration_edit.setText("1234567")
+        dt.settle(editor, 50)
+        editor.refresh_preview()
+        assert editor._preview_canvas is not canvas
+
+        # the Show-off-rows toggle rebuilds too
+        canvas = editor._preview_canvas
+        editor.preview_include_off.setChecked(True)
+        dt.settle(editor, 400)
+        assert editor._preview_canvas is not canvas
+    finally:
+        editor.close()
+
+
+def test_pulse_gui_shadows_pixel_match_stock_effect(monkeypatch):
+    """CachedDropShadow must render the editor pixel-identical to the stock
+    QGraphicsDropShadowEffect (the look is mandatory; only the implementation
+    may differ).
+
+    Guards two real regressions the user caught on screen:
+    * drawSource()-based effects silently break NESTED effects (every card
+      shadow inside the shadowed tab widget vanished);
+    * a rounded-rect silhouette bake painted a white band over the transparent
+      strip right of the tabs (the tab widget is not an opaque rounded rect).
+    """
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from PyQt5 import QtGui, QtWidgets
+
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend import qt_fluent as qf
+
+    def grab_editor() -> np.ndarray:
+        editor = dt.demo_editor(size=(1480, 900))
+        dt.settle(editor)
+        image = editor.grab().toImage().convertToFormat(QtGui.QImage.Format_ARGB32)
+        w, h = image.width(), image.height()
+        ptr = image.bits()
+        ptr.setsize(h * image.bytesPerLine())
+        arr = np.frombuffer(ptr, np.uint8).reshape(h, image.bytesPerLine() // 4, 4)[:, :w, :3].copy()
+        editor.close()
+        return arr.astype(int)
+
+    cached = grab_editor()
+
+    def add_stock_shadow(widget, *, blur=20, alpha=50, offset=0, **_ignored):
+        effect = QtWidgets.QGraphicsDropShadowEffect(widget)
+        effect.setBlurRadius(qf.scaled_px(blur))
+        effect.setColor(QtGui.QColor(0, 0, 0, alpha))
+        effect.setOffset(0, qf.scaled_px(offset, minimum=0))
+        widget.setGraphicsEffect(effect)
+
+    monkeypatch.setattr(qf, "add_fluent_shadow", add_stock_shadow)
+    stock = grab_editor()
+
+    diff = np.abs(stock - cached).max(axis=2)
+    # measured: 3 px differ by <= 12 (a sub-pixel at the tab widget's square NW
+    # corner); shadows missing or a white band would differ by thousands of px.
+    assert int((diff > 4).sum()) < 200, (int(diff.max()), int((diff > 4).sum()))
+    assert int(diff.max()) <= 40
+
+    # ... and the shadows must actually exist (compare against no effect at all):
+    monkeypatch.setattr(qf, "add_fluent_shadow", lambda widget, **kw: None)
+    none = grab_editor()
+    presence = np.abs(stock - none).max(axis=2)
+    presence_cached = np.abs(cached - none).max(axis=2)
+    assert int((presence > 10).sum()) > 10_000          # stock shadows touch many px
+    assert int((presence_cached > 10).sum()) > 10_000   # ours must too
+
+
+def test_pulse_gui_preview_wheel_over_plot_never_scrolls_page(monkeypatch):
+    """A wheel over the pulse plot must zoom the plot ONLY -- the preview page
+    must not scroll underneath it, no matter how Qt delivers the wheel.
+
+    Guards the user report: "在preview的pulse plot区滚滚轮，整个preview页面的
+    scroll还是会响应".  Accepting on the canvas is NOT enough: Qt can deliver
+    the wheel straight to the scroll-area viewport, which is why the editor
+    installs a viewport event filter.  This test injects the wheel on the
+    VIEWPORT (the previously-broken delivery path) and on the canvas, and also
+    checks that off-canvas wheels still scroll the page.
+    """
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from PyQt5 import QtCore, QtGui, QtWidgets
+
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.pulse_gui import FigureCanvas
+
+    if FigureCanvas is None:
+        pytest.skip("Matplotlib Qt canvas is unavailable")
+
+    editor = dt.demo_editor(size=(1200, 800))
+    try:
+        editor.tabs.setCurrentWidget(editor.preview_tab)
+        dt.settle(editor)
+        canvas = editor._preview_canvas
+        assert canvas is not None
+        scroll = editor.preview_scroll
+        vp = scroll.viewport()
+        vbar = scroll.verticalScrollBar()
+        # Make the page genuinely scrollable (same situation as a many-channel
+        # preview taller than the window).
+        editor.preview_body.setFixedHeight(vp.height() + 600)
+        dt.settle(editor)
+        assert vbar.maximum() > 0
+
+        def wheel(target, pos_local, delta=-120):
+            event = QtGui.QWheelEvent(
+                QtCore.QPointF(pos_local),
+                QtCore.QPointF(target.mapToGlobal(pos_local)),
+                QtCore.QPoint(0, 0), QtCore.QPoint(0, delta),
+                QtCore.Qt.NoButton, QtCore.Qt.NoModifier,
+                QtCore.Qt.NoScrollPhase, False)
+            QtWidgets.QApplication.sendEvent(target, event)
+
+        # 1) the broken path: wheel delivered to the viewport at a point over
+        #    the canvas -> must be consumed (page does not move)...
+        over_canvas = vp.mapFromGlobal(canvas.mapToGlobal(canvas.rect().center()))
+        vbar.setValue(0)
+        ax = canvas.figure.axes[0]
+        xlim_before = ax.get_xlim()
+        wheel(vp, over_canvas, delta=120)   # zoom IN (zoom-out is clamped at full view)
+        dt.settle(editor)
+        assert vbar.value() == 0
+        # ...and the plot itself must have responded (zoom changed the x-range).
+        assert ax.get_xlim() != xlim_before
+
+        # 2) wheel delivered directly to the canvas -> also no page scroll.
+        vbar.setValue(0)
+        wheel(canvas, canvas.rect().center())
+        dt.settle(editor)
+        assert vbar.value() == 0
+
+        # 3) wheel on the viewport OFF the canvas -> normal page scrolling.
+        canvas_in_vp = QtCore.QRect(
+            vp.mapFromGlobal(canvas.mapToGlobal(canvas.rect().topLeft())), canvas.size())
+        off_canvas = QtCore.QPoint(vp.width() - 4, vp.height() - 4)
+        if not canvas_in_vp.contains(off_canvas):
+            vbar.setValue(0)
+            wheel(vp, off_canvas)
+            dt.settle(editor)
+            assert vbar.value() > 0
     finally:
         editor.close()
 
