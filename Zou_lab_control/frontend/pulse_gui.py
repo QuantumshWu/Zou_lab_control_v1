@@ -3662,13 +3662,19 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                     needs_redraw = True
                 if needs_redraw:
                     self._preview_canvas.draw_idle()
+                # Restore the "N/M plotted" status a rebuild would have shown -- an
+                # auxiliary message left by Save-figure / scan-load / sync since the
+                # last build must not linger when re-entering an unchanged preview.
+                if getattr(self, "_preview_status_text", None) is not None:
+                    self.preview_status.setText(self._preview_status_text)
                 self._preview_dirty = False
                 return
             plotter, channels, repeat = self._create_preview_plot(state, include_always_off=include_always_off)
             self._replace_preview_canvas(plotter)
             repeat_part = f" | {repeat}" if repeat else ""
             mode = "all channels" if include_always_off else "active channels"
-            self.preview_status.setText(f"{len(channels)}/{len(state.channels)} plotted ({mode}){repeat_part}")
+            self._preview_status_text = f"{len(channels)}/{len(state.channels)} plotted ({mode}){repeat_part}"
+            self.preview_status.setText(self._preview_status_text)
             self._preview_dirty = False
             self._preview_render_key = render_key
             self._update_file_state(state)

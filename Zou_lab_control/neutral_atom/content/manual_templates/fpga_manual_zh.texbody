@@ -271,7 +271,7 @@ delay line (硬件, 真相): [.....0.....][原信号右移 d.....]   <- fire 前
   \item \tfocus{DAC：4 条总线各自可延时，一条总线的 10 位共享一个延时。} 每条 10-bit 总线有一条\tfocus{10 位宽的环}（\pyapi{bus_ring}），机制与 TTL 完全相同：存下该总线的无延时输出值，$d$ 个 tick 后放出。一条总线的 10 个 bit\tfocus{共享同一个}逐总线延时（\pyapi{del_bus_ticks}），所以整条总线（固定值、被扫值、或 ramp）都被整体延后，而不是每 bit 单独延。
   \item \tfocus{负延时 = 全局平移 $G$。} 一条 channel 的 $-d$ 等价于其它\tfocus{所有} channel 都 $+|d|$。主机把全局平移 $G=\max(0,-\min(\text{delays}))$ 折进每条 channel 的有效延时，使最早的那条 channel 落在 0、缓冲只会看到 $\ge 0$ 的延时。零延时即直通。
   \item \tfocus{DAC 总线延时有界（环形缓冲的根本性质）。} 与 TTL 的事件调度器不同，DAC 总线延时仍是每拍存值的环形缓冲：深度 \pyapi{DELAY_DEPTH = 2048} 个 tick（20\,ns/tick 下约 40\,$\mu$s）。要把一个\tfocus{非重复}的总线值流延时 $d$，必须存下它 $d$ 个 tick 的输出——这是字面延时线的本质；但缓冲存的是\tfocus{输出}（不是整张序列），所以它很小。超过 \pyapi{DELAY_DEPTH} 的总线延时会在 validate 与映像打包时\tfocus{被清晰报错拒绝}（在上硬件之前，绝不静默）。TTL 延时\tfocus{不受}此深度约束（32 位字段，受上面的在途翻转契约约束）。
-  \item \pyapi{repeat_forever} 把循环倒回稳态帧（\pyapi{loop_start_addr}），\tfocus{而不是}倒回边沿 0；RTL（\filepath{zlc_edge_streamer.v} 与顶层）里这是 \pyapi{repeat_from_loop_start}。
+  \item \pyapi{repeat_forever} 倒回\tfocus{边沿 0}、重放\tfocus{整张帧}——因为延时是加在输出上的逐通道延时线（不烘进边沿），没有需要跳过的"加性延时前导帧"。编译器恒发 \pyapi{repeat_from_index}=0；RTL（\filepath{zlc_edge_streamer.v} 与顶层）仍保留 \pyapi{repeat_from_loop_start} 倒回稳态帧的分支，但对当前实发的程序而言是死路径。
 \end{itemize}
 
 \begin{notebox}[如何证明]

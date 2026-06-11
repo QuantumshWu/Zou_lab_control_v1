@@ -1884,6 +1884,16 @@ def test_pulse_gui_preview_refresh_skips_rebuild_when_unchanged(monkeypatch):
         assert tuple(zoom.ax.get_xlim()) == home
         assert editor._preview_canvas is canvas
 
+        # ...and an auxiliary status message (Save-figure / sync / scan-load) left
+        # on the shared status label must NOT linger across an unchanged re-entry;
+        # the skip-path restores the "N/M plotted" line a rebuild would have shown.
+        plotted = editor.preview_status.text()
+        assert "plotted" in plotted
+        editor.preview_status.setText("Saved figure: foo.png")
+        editor.refresh_preview()
+        assert editor._preview_canvas is canvas          # still skipped (no rebuild)
+        assert editor.preview_status.text() == plotted    # status restored
+
         # a real edit rebuilds
         editor.drag_container.pulse_cards()[0].duration_edit.setText("1234567")
         dt.settle(editor, 50)
