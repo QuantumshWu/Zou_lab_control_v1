@@ -450,16 +450,39 @@ flips at tick `t`, it pushes `{t + d - 1, level}` into that channel's EVT_DEPTH(
 register (`d == 1` is one register; `d == 0` bypasses).  Storage scales with toggles IN
 FLIGHT, not delay length: the TTL bound is the 32-bit field (~42.9 s, ms-scale emCCD
 delays included) at ~2k LUTs for 62 channels (the old per-tick SRL lines cost ~4.1k LUTs
-and capped d at DELAY_DEPTH = 2048 ticks ~ 41 us).  The host validates the new contract:
-per channel, at most EVT_FIFO_DEPTH toggles inside any window of its own delay length
-(incl. across the repeat seam).  **DAC buses keep the 2048-deep value rings** (one
-10-bit ring per bus, ~1.3k LUTs, 41 us cap) -- DAC delays are short compensations.
+and capped d at DELAY_DEPTH = 2048 ticks ~ 41 us).
+
+**Capacity contract (EXACT, full schedule).**  An event pushed at tick `t` occupies the
+FIFO until `t + d - 1`, so occupancy == the channel's toggle count inside its own d-window.
+`_check_delay_event_capacity` (fpga_pulse_streamer.py) reconstructs the channel's UNDELAYED
+toggle stream over the WHOLE program -- every scan point at its affine-shifted edge times,
+bracket loops, the repeat-forever wrap -- and takes the exact maximum window count (a
+periodic-stream formula handles d >= sweep period; an early version slid a window over ONE
+frame and undercounted scan seams and d > frame).  EVT depth is configurable: keep
+`evt_fifo_depth` (streamer_config.json) == `EVT_FIFO_DEPTH` (zlc_pulse_streamer_top.v).
+
+**Repeat-forever delays are programmed modulo the sweep period** (`_with_effective_delays`
+in sequencer.py -> `effective_channel_delays`): the undelayed stream is periodic with the
+sweep period S, so `d` and `d % S` give the SAME steady-state output, while an unreduced
+multi-sweep delay would keep ~toggles_per_sweep*d/S events in flight and overflow.  Only
+startup differs (output begins after `d % S` ticks instead of staying silent for d; the
+user's raw delay survives in the source table, and the raw value is still capped at the
+32-bit field).  Finite (non-forever) programs are never reduced.  **DAC buses keep the
+2048-deep value rings** (one 10-bit ring per bus, ~1.3k LUTs, 41 us cap) -- DAC delays
+are short compensations.
 
 Proven: `delay_line_reference` (out[t]=in[t-d]) is the unchanged ground truth;
 `engine_model.rtl_delay_line_mirror` mirrors the scheduler cycle-exactly (incl. the
 overflow-drop guard); `fpga/pulse_streamer/sim/tb_delay_sched.v` verifies the REAL RTL
 in xsim (delays {0,1,2,7,1000}, 1-tick toggles, repeat seams: 11,996 cycles, 0
-mismatches).  Capacity: 14,056 -> 12,184 LUTs (58.6% of the 35T).
+mismatches); `sim/tb_evt_depth.v` verifies the FIFO depth BOUNDARY on the real RTL
+(exactly 16 toggles in flight = tick-exact; 18 = only the 2 excess toggles dropped,
+never corruption: EVT-DEPTH-OK).  Randomized tests prove the analytic in-flight count
+== brute-force push/pop occupancy, the periodic formula == explicit unrolling, and
+"fits depth K" => a K-deep mirror reproduces the ideal delay bit-exactly.  The mod-S
+reduction is proven tick-exact in steady state against the unreduced ideal delay
+(test_repeat_forever_delay_reduced_modulo_sweep_period).  Capacity: 14,056 -> 12,184
+LUTs (58.6% of the 35T).
 
 ## 9. Pulse API, sync-to-device and GUI state semantics
 
@@ -470,10 +493,14 @@ get_channel_delay()` (delay calibration), `load_pulse()/save_pulse()`,
 payload (`last_payload_json`) of every successful prepare -- from the GUI or any raw-API
 caller -- and publishes it in `snapshot()`; `RemoteSequencer` flattens it across RPyC.
 The GUI's **Sync** button and `pulse.synced_state()` both read this single source of
-truth.  GUI state semantics (confocal style): any edit while RUNNING/PREPARED turns the
-On Pulse button + status dot ORANGE (UNSYNCED); the debounced summary pass compares the
-state key against the applied key and restores the run state if the edit was reverted;
-Save dirty stays yellow + star.
+truth.  GUI state semantics (confocal style -- stars + status dot, never button base
+colours): any edit while RUNNING/PREPARED adds the `*` suffix to On Pulse ("On Pulse*")
+and turns the STATUS DOT orange (UNSYNCED); the button itself stays green so it cannot
+be confused with the permanently-orange Remove/Load/Sync.  The star is present in every
+run state except RUNNING-in-sync ("pressing would apply something new").  The debounced
+summary pass compares the state key against the applied key and restores the run state
+if the edit was reverted.  Save shows "Save*" + yellow while dirty, "Save" + accent when
+clean; Add Bracket is accent (yellow is reserved for Save-dirty).
 
 ## 10. Building The Manuals
 
@@ -676,3 +703,43 @@ GUI; route NamesPanel/ChannelPanel rows through `FluentLabeledField` + a `set_fi
 helper; split the pure `_pulse_table_*`/`_affine_*` compiler block out of the 2.2k-line
 `sequencer.py`. The cross-layer delay-depth/`coeff_frac_bits` constants remain test-guarded
 mirrors (cross-package import direction); kept as-is.
+
+## 14. 64-bit Tick Architecture Study (feasibility, design, verdict)
+
+What "going 64-bit" would actually mean, what it costs on the xc7a35t, and whether it is
+needed.  Baseline (current 32-bit ticks, estimate_resources on xc7a35tfgg484-2):
+RAMB36 27/50 (54%), LUT 12,246/20,800 (58.9%), FF ~9,000 (21.6%), DSP 52/90 (57.8%).
+
+**What 32 bits caps today.**  A 32-bit tick at 20 ns is ~85.9 s.  That bounds ONE frame
+(a single scan point's duration), NOT total runtime: repeat_forever runs indefinitely,
+sweeps can hold millions of points, and the experiment loop is unbounded.  The TTL delay
+field is likewise 32-bit (~42.9 s), and with repeat_forever a longer delay is reduced
+modulo the sweep period anyway (§8).  Separately, the scheduler's free-running `g_time`
+is 48-bit: it wraps after ~65 days of continuous uptime -- the one true long-run hazard.
+
+**Design if needed (the key trick: split base from offsets).**
+- Widen the BASE timeline only: edge base ticks, `tc` frame counter, `loop_end_tick`,
+  comparators -> 64-bit.  Keep SCAN-POINT slot values and coefficients at 32/16-bit: a
+  per-point affine OFFSET stays bounded (+-42.9 s per point is plenty), so the
+  `coeff x slot` products and ALL 52 DSP mappings are untouched; only the final
+  accumulate/add widens (LUT carry chains, not DSPs).
+- Edge tick BRAM 4096x32 -> 4096x64: +4 RAMB36 (27 -> 31, 62% of budget).  Mask/coeff
+  BRAMs unchanged.
+- CTRL layout: `LOOP_END_TICK` becomes LO/HI (loop-end coeffs already are); the packed
+  image's tick words double (pack/unpack/verify_upload/host mirrors updated in lockstep
+  -- no compat needed, one rebuild).
+- Prefetch shadows (sh_e0..e4) and comparators widen: ~+1k LUT, ~+1.5k FF.  A 64-bit
+  carry chain is ~17 CARRY4 (~4 ns), comfortably inside the 20 ns tick -- no extra
+  pipeline stage, the 1-tick playback contract is unaffected.
+- While in there: widen `g_time` 48 -> 64 (+16 FF + comparator slice per channel,
+  negligible) to remove the 65-day wrap.
+
+**Projected totals**: RAMB36 31/50 (69% of the 45-block budget), LUT ~13.3k (64%),
+FF ~10.5k (25%), DSP 52 (unchanged).  Verdict: FEASIBLE on the 35T with margin.
+
+**Verdict / recommendation.**  Not needed now -- no experiment requires a single frame
+longer than 85.9 s, and delays are covered by the mod-period reduction.  If a >85.9 s
+frame ever appears, the split-width design above is the path (do NOT widen slot values:
+that would triple DSP usage for nothing).  The cheap `g_time` 48->64 widening is worth
+folding into whatever rebuild happens next if multi-month uninterrupted uptime becomes
+a real operating mode.

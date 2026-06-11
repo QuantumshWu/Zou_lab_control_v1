@@ -1504,7 +1504,7 @@ pulse.set_channel_delay("ch11", float(best)).on_pulse()   # 应用最优延时
 \end{codeblock}
 
 \begin{notebox}
-脚本改完设备后回到 GUI，点 \tfocus{Sync} 即把"设备上实际应用的脉冲"拉回编辑器（服务端在每次成功 prepare 时记录源 payload，GUI 与 \pyapi{pulse.synced_state()} 读的是同一份）。反过来，GUI 在 RUNNING 状态下被编辑会把 On Pulse 按钮变橙（UNSYNCED）——再点一次即应用。
+脚本改完设备后回到 GUI，点 \tfocus{Sync} 即把"设备上实际应用的脉冲"拉回编辑器（服务端在每次成功 prepare 时记录源 payload，GUI 与 \pyapi{pulse.synced_state()} 读的是同一份）。反过来，GUI 在 RUNNING 状态下被编辑会让 On Pulse 按钮带上星号（\pyapi{On Pulse*}）、标题栏状态点变橙（UNSYNCED）——再点一次即应用。
 \end{notebox}
 
 \chapter{修改指南}
