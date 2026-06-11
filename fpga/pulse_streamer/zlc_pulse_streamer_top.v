@@ -55,7 +55,7 @@ module zlc_pulse_streamer_top #(
     parameter integer BUS_SEG_ADDR_WIDTH = 6,
     parameter integer BUS_SEL_WIDTH = 3,
     parameter integer DELAY_DEPTH = 2048,       // (legacy) -- DAC delay is now event-scheduled, not a ring
-    parameter integer EVT_FIFO_DEPTH = 256,     // TTL delay event FIFO depth (in-flight edges per
+    parameter integer EVT_FIFO_DEPTH = 128,     // TTL delay event FIFO depth (in-flight edges per
                                                 // channel; keep = streamer_config.json evt_fifo_depth)
     parameter integer BUS_EVT_FIFO_DEPTH = 64   // per-DA-bit delay FIFO depth (40 of them, so shallower
                                                 // than TTL to fit LUT; = streamer_config.json bus_evt_fifo_depth)

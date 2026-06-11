@@ -54,8 +54,16 @@ __all__ = [
 # global shift G, which can push an effective delay to ~30 us).
 DELAY_DEPTH = 2048            # (legacy) -- both TTL and DAC delays are event-scheduled now
 TTL_DELAY_MAX_TICKS = (1 << 31) - 1
-EVT_FIFO_DEPTH = 256          # per-channel TTL event FIFO depth (in-flight edges)
-BUS_EVT_FIFO_DEPTH = 64       # per-DA-bit event FIFO depth (in-flight value changes per bit)
+# Event-FIFO depths: SINGLE SOURCE = fpga/board_config/streamer_config.json (same file the
+# RTL generics + validator read), so the model never drifts from the synthesized bitstream.
+try:
+    from fpga.pulse_streamer.host.image import load_streamer_config as _load_cfg
+    _CFG = _load_cfg().get("params")                          # a StreamerParams
+    EVT_FIFO_DEPTH = int(getattr(_CFG, "evt_fifo_depth", 128))      # per-channel TTL event FIFO depth
+    BUS_EVT_FIFO_DEPTH = int(getattr(_CFG, "bus_evt_fifo_depth", 64))  # per-DA-bit event FIFO depth
+except Exception:
+    EVT_FIFO_DEPTH = 128
+    BUS_EVT_FIFO_DEPTH = 64
 
 
 class DelayDepthExceeded(ValueError):

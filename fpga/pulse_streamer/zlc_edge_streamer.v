@@ -97,7 +97,7 @@ module zlc_edge_streamer #(
     // <= EVT_DEPTH by the host), not with the delay length.  TTL_DELAY_WIDTH bounds one
     // delay (32b = ~85.9 s at 20 ns); GTIME_WIDTH bounds one RUN (48b = ~65 days).
     parameter integer TTL_DELAY_WIDTH = 32,
-    parameter integer EVT_DEPTH = 256,
+    parameter integer EVT_DEPTH = 128,
     // DAC delay FIFO depth: each DA bit is its OWN event-scheduler channel, but there are
     // bus_count*bus_width = 40 of them, so the per-bit FIFO is SHALLOWER than the 18 TTL ones to
     // stay within LUT budget (value-change events in flight per DA bit <= BUS_EVT_DEPTH).

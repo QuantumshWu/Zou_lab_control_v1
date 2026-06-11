@@ -1446,9 +1446,12 @@ def test_final_image_solver_90pct_and_packs_round_trip():
     s = solve_capacity("xc7a35t", channel_count=62, target_pct=90.0)
     assert s.params.max_edges >= 4096
     assert s.params.bank_size >= 512
-    # every axis (RAMB36/LUT/FF/DSP) must stay <=90% of the part.
-    assert s.all_within_budget() and s.resource_report["ramb36"]["pct"] <= 90.0
-    assert all(r["pct"] <= 90.0 for r in s.resource_report.values())
+    # RAMB36 is the solver's BINDING axis (edges are BRAM-bound) and stays <=90% of the part.
+    # LUT is the TIGHT axis now (~97% at the accepted TTL=128 / DA=64 event-FIFO depths -- the
+    # estimate is calibrated to a real 35T placement, see image.estimate_resources), so every
+    # axis is checked against the DEVICE (<=100%), not the 90% soft target.
+    assert s.resource_report["ramb36"]["pct"] <= 90.0
+    assert all(r["pct"] <= 100.0 for r in s.resource_report.values())
     # DSP = the affine-MAC eval sites (bus start/stop + the 5 main sites); must match the engine.
     assert s.resource_report["dsp"]["used"] == (2 * s.params.bus_count + 5) * s.params.num_slots
     big = solve_capacity("xc7a200t", channel_count=62)
@@ -2988,7 +2991,7 @@ def test_delay_depth_constants_agree_across_layers():
 
     assert DELAY_DEPTH_TICKS == TTL_DELAY_MAX_TICKS == (1 << 31) - 1
     assert BUS_DELAY_DEPTH_TICKS == DEFAULT_DELAY_DEPTH == 2048
-    assert EVT_FIFO_DEPTH == 256
+    assert EVT_FIFO_DEPTH == 128
     try:
         import importlib.util as _ilu
         import pathlib as _pl
@@ -4967,7 +4970,7 @@ def test_delay_event_capacity_counts_full_schedule():
         return RuntimeSequenceProgram(**defaults)
 
     # (a) repeat-forever, d spanning MANY frames is counted ACROSS frames (no modulo):
-    # 4 toggles / 100-tick frame, d=10000 -> ~400 edges in flight >> 256 -> rejected with
+    # 4 toggles / 100-tick frame, d=10000 -> ~400 edges in flight >> 128 -> rejected with
     # the longest physical delay reported (the old one-frame check saw at most 8).
     ticks = [0, 10, 20, 30, 40, 100]
     masks = [0, 1 << bit, 0, 1 << bit, 0, 0]
@@ -4975,15 +4978,15 @@ def test_delay_event_capacity_counts_full_schedule():
     cd[bit] = 10000
     with pytest.raises(ValueError, match="longest physical delay"):
         validate_pulse_streamer_program(prog(ticks, masks, cd, repeat_forever=True), channel_count=62)
-    # a delay whose in-flight count fits passes (d=6000 -> 4*60 = 240 <= 256).
+    # a delay whose in-flight count fits passes (d=3000 -> 121 edges in flight <= 128).
     cd_ok = [0] * 62
-    cd_ok[bit] = 6000
+    cd_ok[bit] = 3000
     validate_pulse_streamer_program(prog(ticks, masks, cd_ok, repeat_forever=True), channel_count=62)
 
-    # (a3) the periodic count is EXACT: 4/frame, period 100, d=6450 covers up to 66
-    # frames -> 264 in flight; the naive 4*(6450//100)=256 estimate would (just) pass.
+    # (a3) the periodic count is EXACT: 4/frame, period 100, d=3225 -> 131 in flight;
+    # the naive 4*(3225//100)=128 estimate would (just) pass, but the exact count rejects.
     cd_exact = [0] * 62
-    cd_exact[bit] = 6450
+    cd_exact[bit] = 3225
     with pytest.raises(ValueError, match="longest physical delay"):
         validate_pulse_streamer_program(prog(ticks, masks, cd_exact, repeat_forever=True), channel_count=62)
 
@@ -5711,8 +5714,10 @@ def test_streamer_config_is_single_source_for_host_geometry():
 
 def test_estimate_resources_matches_solve_capacity_and_reports_pass_fail():
     """solve_capacity now delegates its accounting to estimate_resources (one model), and
-    check_config_capacity (the estimate_resources.bat backend) reports the configured part
-    fits within the target budget on every axis."""
+    check_config_capacity (the estimate_resources.bat backend) reports per-axis fit.  The
+    configured 35T design FITS THE DEVICE on every axis, but LUT runs over the 90% soft
+    target (~97% at the accepted TTL=128 / DA=64 event-FIFO depths -- calibrated to a real
+    placement), so the overall 'ok' is False while ff/dsp/ramb36 individually stay in budget."""
 
     from fpga.pulse_streamer.host import image as im
 
@@ -5720,10 +5725,12 @@ def test_estimate_resources_matches_solve_capacity_and_reports_pass_fail():
     assert im.estimate_resources(s.params, part="xc7a35t", target_pct=90.0) == s.resource_report
 
     result = im.check_config_capacity()
-    assert result["ok"] is True
-    assert all(result["report"][axis]["ok"] for axis in ("lut", "ff", "dsp", "ramb36"))
+    assert result["report"]["lut"]["pct"] <= 100.0                 # LUT fits the device...
+    assert not result["report"]["lut"]["ok"]                       # ...but is over the 90% target
+    assert all(result["report"][axis]["ok"] for axis in ("ff", "dsp", "ramb36"))
     text = im.format_capacity_report(result)
-    assert "HAS enough resources" in text and "RAMB36" in text
+    # honest verdict: LUT is over the 90% target at the accepted TTL=128/DA=64 depths.
+    assert "INSUFFICIENT" in text and "LUT" in text and "RAMB36" in text
 
 
 # --------------------------------------------------------------------------- #
@@ -6904,8 +6911,10 @@ def test_streamer_config_is_single_source_for_host_geometry():
 
 def test_estimate_resources_matches_solve_capacity_and_reports_pass_fail():
     """solve_capacity now delegates its accounting to estimate_resources (one model), and
-    check_config_capacity (the estimate_resources.bat backend) reports the configured part
-    fits within the target budget on every axis."""
+    check_config_capacity (the estimate_resources.bat backend) reports per-axis fit.  The
+    configured 35T design FITS THE DEVICE on every axis, but LUT runs over the 90% soft
+    target (~97% at the accepted TTL=128 / DA=64 event-FIFO depths -- calibrated to a real
+    placement), so the overall 'ok' is False while ff/dsp/ramb36 individually stay in budget."""
 
     from fpga.pulse_streamer.host import image as im
 
@@ -6913,10 +6922,12 @@ def test_estimate_resources_matches_solve_capacity_and_reports_pass_fail():
     assert im.estimate_resources(s.params, part="xc7a35t", target_pct=90.0) == s.resource_report
 
     result = im.check_config_capacity()
-    assert result["ok"] is True
-    assert all(result["report"][axis]["ok"] for axis in ("lut", "ff", "dsp", "ramb36"))
+    assert result["report"]["lut"]["pct"] <= 100.0                 # LUT fits the device...
+    assert not result["report"]["lut"]["ok"]                       # ...but is over the 90% target
+    assert all(result["report"][axis]["ok"] for axis in ("ff", "dsp", "ramb36"))
     text = im.format_capacity_report(result)
-    assert "HAS enough resources" in text and "RAMB36" in text
+    # honest verdict: LUT is over the 90% target at the accepted TTL=128/DA=64 depths.
+    assert "INSUFFICIENT" in text and "LUT" in text and "RAMB36" in text
 
 
 # --------------------------------------------------------------------------- #
