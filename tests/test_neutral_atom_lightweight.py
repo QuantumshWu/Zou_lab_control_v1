@@ -4775,6 +4775,50 @@ def test_bus_delay_line_with_scanned_value_and_ramp():
                 assert rtl == undelayed                                          # exact passthrough
 
 
+def test_image_pack_zeros_all_bus_delays_no_stale():
+    """A program with FEWER (or zero) bus delays than the previous one MUST still write a 0
+    into every other bus's R_DELAY word -- otherwise the DAC bus keeps the PREVIOUS program's
+    delay on hardware.  This is the real bug behind "I delayed emCCD but DA got delayed" /
+    "DA_delay_test shows DA lagging": a negative-delay run globally shifts (delays) all driven
+    DA buses, and the next no-delay run left those bus R_DELAY words UNWRITTEN -> stale.
+
+    pack_program already wrote ALL channel words (zeroing undelayed ones); this asserts the
+    SAME full-region rule for the bus words."""
+    import dataclasses
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.devices.sequencer import compile_pulse_table_runtime_program
+    from fpga.pulse_streamer.host import image as img
+
+    # An active TTL channel with a NEGATIVE delay -> global shift G delays the DA bus.
+    state = na.PulseTableState(
+        channels=["ch0", "ch1", "ch2"],
+        channel_labels={"ch0": "cooling", "ch1": "da_dipole[0]", "ch2": "da_dipole[1]"},
+        visible_channels=["ch0", "ch1", "ch2"], time_step_ns=20.0,
+        periods=[na.PulsePeriod(200, (1, 0, 0), unit="ns")],
+        analog_bus_modes={"da_dipole": [{"mode": "edge", "value": 1}]},
+        delays={"ch0": -100.0}, delay_units={"ch0": "ns"})  # -100 ns -> G=5 ticks on the bus
+    prog = compile_pulse_table_runtime_program(state, channels=list(state.channels), clock_hz=50e6)
+    assert prog.bus_delays, "an active negative delay should give the driven DA bus a (global-shift) delay"
+
+    p = img.StreamerParams()
+    img_with = img.pack_program(prog, p)
+    img_without = img.pack_program(dataclasses.replace(prog, bus_delays=None), p)
+
+    # locate the R_DELAY base: the channel-0 delay word holds prog.channel_delays[0]
+    ch0_delay = (prog.channel_delays or [0])[0]
+    # find via the bus-delay word we DO know: every bus delay word offset must appear in BOTH
+    # images, nonzero in img_with, and ZERO in img_without (the stale-clear contract).
+    nonzero_bus_words = {off for off, val in img_with.items()
+                         if val != 0 and off in img_without and img_without[off] == 0}
+    assert nonzero_bus_words, "expected at least one bus delay word set in the delayed image"
+    # The two images must write the EXACT SAME set of offsets (full region every time) so the
+    # upload of the no-delay program overwrites every bus delay word the delayed one set.
+    assert set(img_with) == set(img_without), "pack must write the same word set regardless of how many bus delays are present"
+    # And every bus delay word in the no-delay image is 0 (no stale value can survive upload).
+    for off in nonzero_bus_words:
+        assert img_without[off] == 0
+
+
 def test_image_bus_delay_ctrl_packing_roundtrip():
     """Host->RTL per-bus DAC-delay contract (no Verilog sim): image.pack_program packs each
     delayed bus's d into the R_DELAY register region (one 32-bit word/bus, after the channels);

@@ -452,6 +452,12 @@ def pack_program(program, params: StreamerParams | None = None) -> dict[int, int
     # PER-BUS DAC DELAY -- each DA bit is now its OWN event-scheduler channel (the bus's 10 bits
     # share one 32-bit delay), so a bus delay is 32-bit like TTL and rides the SAME R_DELAY region,
     # one 32b word per bus right after the channels (words channel_count .. channel_count+bus_count-1).
+    # Pack ALL bus_count words (0 = passthrough for any bus NOT in bus_delays) -- exactly like the
+    # channel loop above.  Writing only the listed buses left every OTHER bus's R_DELAY word at its
+    # PREVIOUS program's value, so after a negative-delay run (global shift G delays all driven
+    # buses) a following no-delay program left the DAC buses STILL delayed on hardware -- the
+    # "I delayed emCCD but DA got delayed / DA_delay_test shows DA lagging" bug.  Always zero them.
+    bus_delay_by_index: dict[int, int] = {}
     for bd in (getattr(program, "bus_delays", None) or []):
         if isinstance(bd, Mapping):
             b, d = int(bd.get("bus_index", 0)), int(bd.get("delay", 0))
@@ -463,7 +469,9 @@ def pack_program(program, params: StreamerParams | None = None) -> dict[int, int
             raise ValueError(
                 f"bus {b} delay {d} ticks is outside [0, {p.ttl_delay_max_ticks}] "
                 f"(~{p.ttl_delay_max_ticks * 20e-9:.1f} s at 20 ns/tick).")
-        w[bases["delay"] + p.channel_count + b] = _to_unsigned(d, 32)
+        bus_delay_by_index[b] = d
+    for b in range(p.bus_count):
+        w[bases["delay"] + p.channel_count + b] = _to_unsigned(bus_delay_by_index.get(b, 0), 32)
 
     # PER-CHANNEL CLK MASK -- 1 bit per channel (bit b = channel b's pin driven by clk).
     # The compiler already forced these bits to 0 in the edge masks; the top muxes clk on.
