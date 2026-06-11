@@ -680,8 +680,17 @@ class VivadoAxiStreamerSession:
         self._stream_stop = None
 
     def safe_state(self) -> None:
-        self._stop_stream_thread()
+        # Stop the ENGINE first so the outputs go safe immediately, THEN reap the streaming
+        # refill thread.  Old order (join-then-CMD_SAFE) made "Stop" wait out the refill
+        # thread's join (up to action_timeout+5 s) before the engine was even told to stop,
+        # so stopping a STREAMED scan felt very slow.  Signalling _stream_stop before CMD_SAFE
+        # means the refill loop is already exiting by the time we join, and CMD_SAFE itself
+        # only waits for at most one in-flight refill AXI transaction (they share _io_lock).
+        # A non-streamed pulse has no thread, so this is identical to before (just CMD_SAFE).
+        if self._stream_stop is not None:
+            self._stream_stop.set()
         self._command(CMD_SAFE)
+        self._stop_stream_thread()
 
     # ------------------------------------------------------------------ mailbox
     def _command(self, command: int, *, wait_mask: int | None = None,
