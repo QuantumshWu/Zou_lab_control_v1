@@ -2360,8 +2360,8 @@ def test_scan_default_template_adapts_to_slot_count(monkeypatch):
     assert "2 bound slot(s)" in code
 
 
-def test_delay_edit_caps_at_delay_depth(monkeypatch):
-    """#1: a delay larger than the delay-line depth is clamped on the field."""
+def test_delay_edit_caps_at_field_max(monkeypatch):
+    """#1: a delay larger than the 32-bit field max is clamped on the field."""
 
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")

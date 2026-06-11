@@ -594,7 +594,7 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     assert "membership" not in engine.lower()
     assert "MAX_DELAY_INTERVALS" not in engine and "NUM_DELAYS" not in engine and "SKIP_WIDTH" not in engine
     assert "delay_prog" not in engine and "delay_prog" not in top
-    # both TTL and DAC delays are event-scheduled (no ring, no DELAY_DEPTH any more)
+    # both TTL and DAC delays are event-scheduled (32-bit field, capacity = events in flight)
     for tok in ("evt_mem", "evt_out", "g_time", "prev_undelayed", "EVT_DEPTH", "GTIME_WIDTH"):
         assert tok in engine, tok
     assert "ttl_sr" not in engine                                 # the old per-tick SRL lines are GONE
@@ -4660,9 +4660,9 @@ def test_rtl_bus_delay_line_mirror_matches_physical_delay():
     """RTL per-DA-bit EVENT-SCHEDULER delay proof: the cycle-exact mirror (g_busdly, each of the
     bus's bits a 1-bit FIFO sharing the per-bus delay) == bus_delay_line_reference (the bus VALUE
     stream delayed by d, safe mid-code 512 before t == d) for d=0 (passthrough), d=1 (register),
-    and -- now that the DAC range is UNIFIED with TTL (the 2048-tick ring is gone) -- LARGE d too,
+    and -- the DAC range is UNIFIED with TTL (the same 32-bit field) -- LARGE d too,
     as long as no bit's value-change events in flight exceed the FIFO depth.  An over-capacity
-    (per-tick-toggling) delayed stream is BOUNDED by dropping the excess, not by a ring cap."""
+    (per-tick-toggling) delayed stream is BOUNDED by dropping the excess."""
     from fpga.pulse_streamer.host import engine_model as em
     import random
 
@@ -4777,9 +4777,9 @@ def test_bus_delay_line_with_scanned_value_and_ramp():
 
 def test_image_bus_delay_ctrl_packing_roundtrip():
     """Host->RTL per-bus DAC-delay contract (no Verilog sim): image.pack_program packs each
-    delayed bus's d into the DENSE BUS_DELAY_TICKS CTRL words (one delay_tick_width field/bus);
+    delayed bus's d into the R_DELAY register region (one 32-bit word/bus, after the channels);
     reading them back EXACTLY as zlc_pulse_streamer_top.v slices them must reconstruct d
-    byte-for-byte.  Covers d < T, d = T-ish, and d >> T (still within the bounded depth)."""
+    byte-for-byte.  Covers d < T, d = T-ish, and d >> T (the event scheduler is not frame-bound)."""
     import Zou_lab_control.neutral_atom as na
     from fpga.pulse_streamer.host import image as img
 
@@ -4804,8 +4804,8 @@ def test_image_bus_delay_ctrl_packing_roundtrip():
         u = img.unpack_program(w, p)
         recon = {bd["bus_index"]: bd["delay"] for bd in u["bus_delays"]}
         for bd in prog.bus_delays:
-            assert recon[bd.bus_index] == bd.delay        # d reconstructs exactly (dense, no off/skip)
-            # the bus delay can EXCEED one frame (the buffer is independent of the frame period).
+            assert recon[bd.bus_index] == bd.delay        # d reconstructs exactly (32-bit word, no off/skip)
+            # the bus delay can EXCEED one frame (the event scheduler is independent of the frame period).
             assert bd.delay > T or d_ns < 2000
 
 
@@ -4926,10 +4926,9 @@ def test_edge_streamer_has_literal_delay_line_path():
 
 
 def test_delay_line_bounded_cap_rejected_clearly():
-    """TTL AND DAC-bus delays are both event-scheduled now, so both accept ring-busting values
-    up to the SAME 32-bit cap and reject beyond it (the old 2048-tick bus ring is gone -- ranges
-    unified); a toggle burst denser than the event FIFO inside one delay window is still rejected
-    with a clear message."""
+    """TTL AND DAC-bus delays are both event-scheduled, so both accept large values
+    up to the SAME 32-bit cap and reject beyond it (ranges unified); a toggle burst denser than
+    the event FIFO inside one delay window is still rejected with a clear message."""
     import pytest
     from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import (
         validate_pulse_streamer_program, TTL_DELAY_MAX_TICKS, EVT_FIFO_DEPTH)
@@ -4958,9 +4957,9 @@ def test_delay_line_bounded_cap_rejected_clearly():
         validate_pulse_streamer_program(prog(cd=cd_over), channel_count=62)
     with pytest.raises(ValueError, match="outside"):
         img.pack_program(prog(cd=cd_over), img.StreamerParams())
-    # a per-BUS delay is now event-scheduled per DA bit (the bus's 10 bits share one delay),
-    # SAME 32-bit range as TTL -- the old 2048-tick ring cap is gone, so a delay past the old
-    # ring is VALID now and only the 32-bit field cap rejects it (range unified with TTL).
+    # a per-BUS delay is event-scheduled per DA bit (the bus's 10 bits share one delay),
+    # SAME 32-bit range as TTL -- a large delay is VALID and only the 32-bit field cap
+    # rejects it (range unified with TTL).
     busok = prog(bus_delays=[RuntimeBusDelay(bus_index=1, delay=depth + 1)])
     validate_pulse_streamer_program(busok, channel_count=62)
     img.pack_program(busok, img.StreamerParams())
@@ -5935,7 +5934,7 @@ def test_explicit_one_channel_analog_bus_rejected():
 
 def test_sequencer_prepare_backstops_invalid_program_geometry():
     # BUG: SequencerService.prepare cached the program before any geometry check; a mock
-    # backend would accept channel_delays beyond DELAY_DEPTH. A backstop validate rejects it.
+    # backend would accept channel_delays beyond the 32-bit cap. A backstop validate rejects it.
     import pytest
     seq = na.RuntimeSequencer(channels=["a", "b"], clock_hz=50e6, trigger_channels=["a"])
     # a delay beyond the 32-bit TTL field (~42.9 s) must still be rejected by the backstop
@@ -7131,7 +7130,7 @@ def test_explicit_one_channel_analog_bus_rejected():
 
 def test_sequencer_prepare_backstops_invalid_program_geometry():
     # BUG: SequencerService.prepare cached the program before any geometry check; a mock
-    # backend would accept channel_delays beyond DELAY_DEPTH. A backstop validate rejects it.
+    # backend would accept channel_delays beyond the 32-bit cap. A backstop validate rejects it.
     import pytest
     seq = na.RuntimeSequencer(channels=["a", "b"], clock_hz=50e6, trigger_channels=["a"])
     # a delay beyond the 32-bit TTL field (~42.9 s) must still be rejected by the backstop
