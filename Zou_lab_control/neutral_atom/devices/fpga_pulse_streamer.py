@@ -414,19 +414,22 @@ def validate_pulse_streamer_program(
     # ramps), so ANY duration yields the closest realizable staircase to the ideal line,
     # landing exactly on the target at stop_tick.  The preview draws the same staircase
     # (pulse_table._analog_bus_value_at_tick), so what you see is what the DAC does.
-    # Per-bus DAC DELAY -- the LITERAL per-bus delay line (a 10-bit circular buffer, one delay
-    # shared by all 10 bits).  Each bus may be delayed by up to delay_depth ticks (the same
-    # bounded cap as the per-channel delay).
+    # Per-bus DAC DELAY -- each DA bit is now its OWN event-scheduler channel (the bus's 10 bits
+    # share one delay), so a bus delay has the SAME 32-bit physical range as a TTL channel (the old
+    # 2048-tick ring cap is gone).  Capacity is bounded by value-change events in flight per bit
+    # (<= the event-FIFO depth), like TTL -- sparse DAC use is far below it; a delayed long ramp is
+    # the only stressor.  Here we enforce the 32-bit field bound; the per-bit in-flight count rides
+    # the same event-FIFO contract as TTL.
     bus_delays = list(getattr(program, "bus_delays", None) or [])
     for bd in bus_delays:
         bdi = int(getattr(bd, "bus_index", bd.get("bus_index") if isinstance(bd, Mapping) else 0))
         bdd = int(getattr(bd, "delay", bd.get("delay") if isinstance(bd, Mapping) else 0))
         if bdi < 0 or bdi >= bus_count:
             raise ValueError(f"bus delay bus_index {bdi} is outside bus_count={bus_count}.")
-        if bdd < 0 or bdd > delay_depth:
+        if bdd < 0 or bdd > TTL_DELAY_MAX_TICKS:
             raise ValueError(
-                f"bus delay bus_index {bdi}: delay {bdd} ticks exceeds the delay-line depth "
-                f"DELAY_DEPTH={delay_depth} (~{delay_depth * 20 / 1000:.0f}us); reduce the delay.")
+                f"bus delay bus_index {bdi}: delay {bdd} ticks is outside [0, {TTL_DELAY_MAX_TICKS}] "
+                f"(~{TTL_DELAY_MAX_TICKS * 20e-9:.1f} s at 20 ns/tick); reduce the delay.")
     slot_count = int(getattr(program, "slot_count", 0))
     tick_slot_coeffs = list(getattr(program, "tick_slot_coeffs", None) or [[0] * slot_count for _ in program.ticks])
     if len(tick_slot_coeffs) != len(program.ticks):

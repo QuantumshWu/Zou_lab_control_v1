@@ -99,10 +99,10 @@ TIME_UNITS = ["ns", "us", "ms", "s", "str (ns)"]
 # duration ("s0" expression); it is set automatically when you bind via the scan dot and
 # is NOT offered in the dropdown for a normal (unbound) duration.
 DURATION_UNITS = ["ns", "us", "ms", "s"]
-# The per-channel TTL delay is a TRUE physical delay (out[t] = in[t-d], first frame
-# correct, no modulo) bounded only by the 32-bit field (~42.9 s at 20 ns/tick), so
-# ms / s are valid units.  (DAC-bus delays are still bounded by the 2048-tick ring,
-# ~41 us -- see _bus_delay_cap_text; the bus event-FIFO unification is future work.)
+# TTL AND DAC-bus delays are both TRUE physical delays now (out[t] = in[t-d], first frame
+# correct, no modulo), event-scheduled per bit, bounded only by the 32-bit field (~42.9 s at
+# 20 ns/tick) -- so ms / s are valid units for both and the ranges match (a negative TTL delay's
+# global shift can reach the buses, no more range mismatch).
 DELAY_UNITS = ["ns", "us", "ms", "s"]
 
 
@@ -1484,11 +1484,12 @@ class ChannelPanel(FluentGroupBox):
             delay_edit = FluentLineEdit(str(delay_value))
             if is_bus:
                 delay_edit.setToolTip(
-                    "Physical DAC-bus output delay (may be negative): the whole bus waveform "
-                    "shifts by d, out[t] = in[t-d]. "
-                    f"|delay| is capped at {_bus_delay_cap_text(state.time_step_ns)} -- the DAC "
-                    "bus still uses the per-tick output ring, so it cannot reach the long "
-                    "32-bit delays the real TTL channels can."
+                    "Physical DAC-bus output delay (may be negative): the whole bus value shifts "
+                    "by d, out[t] = in[t-d], first frame correct -- now event-scheduled per bit "
+                    "just like a TTL channel (the bus's 10 bits share this one delay), so the "
+                    f"range matches TTL: up to {_delay_cap_text(state.time_step_ns)}. The limit is "
+                    "the number of value changes in flight (<= the DA event-FIFO depth), not the "
+                    "delay length; a long delayed ramp is the only thing that can exceed it."
                 )
             else:
                 delay_edit.setToolTip(
@@ -1614,8 +1615,9 @@ class ChannelPanel(FluentGroupBox):
         unit_combo = self.delay_units.get(channel)
         unit_text = unit_combo.currentText() if unit_combo is not None else "ns"
         factor = UNIT_TO_NS.get(unit_text, 1.0) or 1.0
-        cap_ticks = BUS_DELAY_DEPTH_TICKS if str(channel).startswith("bus:") else DELAY_DEPTH_TICKS
-        max_ns = cap_ticks * float(self.state.time_step_ns)
+        # TTL and DAC-bus delays are now both event-scheduled with the SAME 32-bit range, so the
+        # magnitude cap is identical for channels and buses (the old 2048-tick bus ring is gone).
+        max_ns = DELAY_DEPTH_TICKS * float(self.state.time_step_ns)
         value_ns = value * factor
         if abs(value_ns) > max_ns + 1e-6:
             clamped = max(-max_ns, min(max_ns, value_ns)) / factor

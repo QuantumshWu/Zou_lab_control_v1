@@ -125,8 +125,12 @@ class StreamerParams:
     # (validated at compile/pack time; sparse experiment triggers are far below this).
     ttl_delay_max_ticks: int = (1 << 31) - 1
     evt_fifo_depth: int = 256
-    # TTL DELAY register region: one 32b word per channel, 64 words reserved.
-    delay_region_words: int = 64
+    # per-DA-bit delay FIFO depth (bus_count*bus_width of them, shallower than TTL to fit LUT).
+    bus_evt_fifo_depth: int = 64
+    # DELAY register region: one 32b word per delay-eligible signal -- channel_count TTL channels
+    # then bus_count per-bus DAC delays (both 32b now: DAC is event-scheduled per bit, not the old
+    # 12b ring, so TTL and DAC ranges match).  128 words reserved (>= channel_count + bus_count).
+    delay_region_words: int = 128
 
     @property
     def channel_bit_width(self) -> int:
@@ -317,10 +321,10 @@ def check_rtl_assumptions(p: StreamerParams) -> None:
         raise ValueError(f"max_edges must be a power of two (got {p.max_edges}); MAX_EDGES = 1 << EDGE_ADDR_WIDTH.")
     if p.tick_width != 32:
         raise ValueError(f"tick_width must be 32 (got {p.tick_width}); the tick BRAM port and CTRL words are 32b.")
-    if p.channel_count > p.delay_region_words:
+    if p.channel_count + p.bus_count > p.delay_region_words:
         raise ValueError(
-            f"channel_count {p.channel_count} exceeds the TTL DELAY register region "
-            f"({p.delay_region_words} words; one 32b delay word per channel).")
+            f"channel_count {p.channel_count} + bus_count {p.bus_count} exceeds the DELAY register "
+            f"region ({p.delay_region_words} words; one 32b delay word per channel, then per bus).")
 
 
 def _bus_mode_value(mode) -> int:
@@ -474,9 +478,9 @@ def pack_program(program, params: StreamerParams | None = None) -> dict[int, int
         d = channel_delays[ch] if ch < len(channel_delays) else 0
         w[bases["delay"] + ch] = _to_unsigned(d, 32)
 
-    # PER-BUS DAC DELAY -- the same LITERAL delay line, one delay shared by all 10 bits of a bus.
-    # Pack a DENSE per-bus delay tick count (delay_tick_width bits each, LSB-first).
-    bus_delay_word = 0
+    # PER-BUS DAC DELAY -- each DA bit is now its OWN event-scheduler channel (the bus's 10 bits
+    # share one 32-bit delay), so a bus delay is 32-bit like TTL and rides the SAME R_DELAY region,
+    # one 32b word per bus right after the channels (words channel_count .. channel_count+bus_count-1).
     for bd in (getattr(program, "bus_delays", None) or []):
         if isinstance(bd, Mapping):
             b, d = int(bd.get("bus_index", 0)), int(bd.get("delay", 0))
@@ -484,10 +488,11 @@ def pack_program(program, params: StreamerParams | None = None) -> dict[int, int
             b, d = int(getattr(bd, "bus_index", 0)), int(getattr(bd, "delay", 0))
         if b < 0 or b >= p.bus_count:
             raise ValueError(f"bus delay bus_index {b} is outside bus_count {p.bus_count}.")
-        _validate_delay_depth(d, p.delay_depth, f"bus {b}")
-        bus_delay_word |= (d & ((1 << dtw) - 1)) << (b * dtw)
-    for i in range(p.bus_delay_ticks_words):
-        w[CtrlWords.BUS_DELAY_TICKS + i] = (bus_delay_word >> (32 * i)) & 0xFFFFFFFF
+        if d < 0 or d > p.ttl_delay_max_ticks:
+            raise ValueError(
+                f"bus {b} delay {d} ticks is outside [0, {p.ttl_delay_max_ticks}] "
+                f"(~{p.ttl_delay_max_ticks * 20e-9:.1f} s at 20 ns/tick).")
+        w[bases["delay"] + p.channel_count + b] = _to_unsigned(d, 32)
 
     # PER-CHANNEL CLK MASK -- 1 bit per channel (bit b = channel b's pin driven by clk).
     # The compiler already forced these bits to 0 in the edge masks; the top muxes clk on.
@@ -550,15 +555,12 @@ def unpack_program(words: Mapping[int, int], params: StreamerParams | None = Non
                 "value_select": (flags >> (2 * p.bus_width + 2)) & ((1 << p.bus_sel_width) - 1),
                 "stop_value_select": (flags >> (2 * p.bus_width + 2 + p.bus_sel_width)) & ((1 << p.bus_sel_width) - 1),
             })
-    # PER-CHANNEL OUTPUT DELAY -- a LITERAL delay line: reconstruct the DENSE per-channel delay
-    # tick count exactly as zlc_pulse_streamer_top.v slices it (one delay_tick_width field/channel).
-    dtw = p.delay_tick_width
+    # PER-SIGNAL OUTPUT DELAY -- one 32b R_DELAY word per channel, then one per bus (both
+    # event-scheduled, 32b), exactly as zlc_pulse_streamer_top.v slices R_DELAY.
     channel_delays = [int(g(bases["delay"] + ch)) for ch in range(p.channel_count)]
-    bus_delay_word = _unfield([g(CtrlWords.BUS_DELAY_TICKS + i) for i in range(p.bus_delay_ticks_words)],
-                              p.bus_count * dtw)
-    bus_delays = [{"bus_index": b, "delay": (bus_delay_word >> (b * dtw)) & ((1 << dtw) - 1)}
+    bus_delays = [{"bus_index": b, "delay": int(g(bases["delay"] + p.channel_count + b))}
                   for b in range(p.bus_count)
-                  if ((bus_delay_word >> (b * dtw)) & ((1 << dtw) - 1)) != 0]
+                  if int(g(bases["delay"] + p.channel_count + b)) != 0]
     clk_enable = 0
     for i in range((p.channel_count + 31) // 32):
         clk_enable |= (g(CtrlWords.CLK_ENABLE + i) & 0xFFFFFFFF) << (32 * i)
@@ -666,6 +668,7 @@ def estimate_resources(params: StreamerParams, *, part, target_pct: float = 90.0
     # bus_out, their `out` bit is always 0).  At deep EVT_DEPTH this is what keeps the
     # event RAM inside the 400 Kb distributed-RAM budget (every channel would not fit).
     evt_depth = max(1, int(getattr(params, "evt_fifo_depth", 256)))
+    bus_evt_depth = max(1, int(getattr(params, "bus_evt_fifo_depth", 64)))
     # Delay-eligible channels = real TTL outputs: not bus-member bits (bus_count*bus_width,
     # pin driven by bus_out) and not the per-bus dedicated clk pins (bus_count, da_clk*).
     num_delay_ch = max(0, params.channel_count - params.bus_count * (params.bus_width + 1))
@@ -677,8 +680,12 @@ def estimate_resources(params: StreamerParams, *, part, target_pct: float = 90.0
     # (measured against this design's bus_ring), so ceil(EVT_DEPTH*49/64) LUTs per slot plus
     # ~20 LUTs of pointer/comparator control is an honest, slightly-conservative estimate.
     ttl_sched_luts = num_delay_ch * (20 + _ceil(evt_depth * 49, 64))
-    dac_ring_luts = (params.bus_count * params.bus_width) * _ceil(delay_slots, 64)
-    delay_lutram = ttl_sched_luts + dac_ring_luts
+    # DAC delay is now event-scheduled PER DA BIT (bus_count*bus_width 1-bit channels), each its
+    # own EVT_DEPTH-deep 49b FIFO exactly like a TTL channel (the bus's bits share one delay), so
+    # TTL and DAC delay ranges match (the old 2048-tick ring is gone).  This is ~bus_width x the
+    # ring's LUTs but it removes the 32-bit-vs-ring range mismatch on a negative-delay global shift.
+    dac_evt_luts = (params.bus_count * params.bus_width) * (20 + _ceil(bus_evt_depth * 49, 64))
+    delay_lutram = ttl_sched_luts + dac_evt_luts
     # DSP: engine affine-MAC call sites (2 evals/bus + 5 main) x num_slots products,
     # each coeff(<=18b) x slot(slot_mul_width); slot operand <=25b fits ONE DSP48E1.
     if engine_dsp is None:
@@ -944,6 +951,7 @@ def vivado_generics(params: "StreamerParams") -> "list[str]":
         f"BANK_SIZE={params.bank_size}",
         f"DELAY_DEPTH={params.delay_depth}",
         f"EVT_FIFO_DEPTH={params.evt_fifo_depth}",
+        f"BUS_EVT_FIFO_DEPTH={params.bus_evt_fifo_depth}",
     ]
 
 

@@ -54,9 +54,11 @@ module zlc_pulse_streamer_top #(
     parameter integer BUS_WIDTH = 10,
     parameter integer BUS_SEG_ADDR_WIDTH = 6,
     parameter integer BUS_SEL_WIDTH = 3,
-    parameter integer DELAY_DEPTH = 2048,       // DAC bus delay-ring depth (ticks, ~40us)
-    parameter integer EVT_FIFO_DEPTH = 256      // TTL delay event FIFO depth (in-flight edges per
+    parameter integer DELAY_DEPTH = 2048,       // (legacy) -- DAC delay is now event-scheduled, not a ring
+    parameter integer EVT_FIFO_DEPTH = 256,     // TTL delay event FIFO depth (in-flight edges per
                                                 // channel; keep = streamer_config.json evt_fifo_depth)
+    parameter integer BUS_EVT_FIFO_DEPTH = 64   // per-DA-bit delay FIFO depth (40 of them, so shallower
+                                                // than TTL to fit LUT; = streamer_config.json bus_evt_fifo_depth)
 )(
     input  wire clk,
     output wire [1:0] led,
@@ -106,7 +108,7 @@ module zlc_pulse_streamer_top #(
     // 20..43 are now reserved/unused).  64 words of headroom regardless of channel
     // count so the layout is stable across configs.
     localparam integer R_DELAY_BASE  = R_BUS_BASE   + BUS_ROWS * BUS_WORDS;
-    localparam integer R_DELAY_WORDS = 64;
+    localparam integer R_DELAY_WORDS = 128;   // >= CHANNEL_COUNT + BUS_COUNT, headroom; 7-bit index
     localparam integer R_TOTAL_WORDS = R_DELAY_BASE + R_DELAY_WORDS;
 
     // CTRL regfile word offsets (== host.image.CtrlWords).
@@ -154,12 +156,17 @@ module zlc_pulse_streamer_top #(
     // --- delays: TTL = the 32b/channel DELAY register region (event scheduler, long
     // delays); DAC buses = the DENSE 12-bit CTRL fields (ring-buffered, ring-capped).
     localparam integer TTL_DELAY_WIDTH = 32;
-    reg  [31:0] delay_reg [0:CHANNEL_COUNT-1];
+    // R_DELAY carries ONE 32-bit word per delay-eligible signal: the CHANNEL_COUNT TTL channels
+    // first, then the BUS_COUNT per-bus DAC delays.  The DAC delay is now 32-bit too (event-
+    // scheduled per bit, NOT the old 12-bit ring), so TTL and DAC ranges MATCH -- a negative TTL
+    // delay's global shift G can reach the buses, no more range mismatch.  (The dense CTRL
+    // DELAY_TICKS / BUS_DELAY_TICKS words 20..45 are now reserved/unused.)
+    localparam integer DELAY_REG_COUNT = CHANNEL_COUNT + BUS_COUNT;
+    reg  [31:0] delay_reg [0:DELAY_REG_COUNT-1];
     integer dri;
-    initial for (dri = 0; dri < CHANNEL_COUNT; dri = dri + 1) delay_reg[dri] = 32'b0;
+    initial for (dri = 0; dri < DELAY_REG_COUNT; dri = dri + 1) delay_reg[dri] = 32'b0;
     wire [CHANNEL_COUNT*TTL_DELAY_WIDTH-1:0] delay_ticks_w;
-    wire [BUS_DELAY_TICKS_WORDS*32-1:0] bus_delay_ticks_pack;
-    wire [BUS_COUNT*DELAY_TICK_WIDTH-1:0] bus_delay_ticks_w;
+    wire [BUS_COUNT*TTL_DELAY_WIDTH-1:0] bus_delay_ticks_w;
 
     // --- per-channel CLK mask + muxed output: a channel wired to clk outputs the FPGA
     // clk on its pin; otherwise it outputs the engine bit.  out_final feeds the pin map.
@@ -222,11 +229,11 @@ module zlc_pulse_streamer_top #(
         for (dw = 0; dw < CHANNEL_COUNT; dw = dw + 1) begin : zlc_delay_reg_pack_gen
             assign delay_ticks_w[dw*TTL_DELAY_WIDTH +: TTL_DELAY_WIDTH] = delay_reg[dw];
         end
-        for (dw = 0; dw < BUS_DELAY_TICKS_WORDS; dw = dw + 1) begin : zlc_bus_delay_ticks_pack_gen
-            assign bus_delay_ticks_pack[dw*32 +: 32] = ctrl_reg[C_BUS_DELAY_TICKS + dw];
+        // per-bus DAC delays ride the SAME R_DELAY region, just after the channels.
+        for (dw = 0; dw < BUS_COUNT; dw = dw + 1) begin : zlc_bus_delay_reg_pack_gen
+            assign bus_delay_ticks_w[dw*TTL_DELAY_WIDTH +: TTL_DELAY_WIDTH] = delay_reg[CHANNEL_COUNT + dw];
         end
     endgenerate
-    assign bus_delay_ticks_w = bus_delay_ticks_pack[BUS_COUNT*DELAY_TICK_WIDTH-1:0];
 
     // Assemble the per-channel clk mask from its CTRL words, then mux clk onto each pin.
     genvar cw;
@@ -250,8 +257,8 @@ module zlc_pulse_streamer_top #(
 
     always @(posedge clk) begin
         if (bram_ena && wr && sel_ctrl) ctrl_reg[word_addr[5:0]] <= bram_dina;
-        if (bram_ena && wr && sel_delay && (delay_word_off < CHANNEL_COUNT))
-            delay_reg[delay_word_off[5:0]] <= bram_dina;
+        if (bram_ena && wr && sel_delay && (delay_word_off < DELAY_REG_COUNT))
+            delay_reg[delay_word_off[6:0]] <= bram_dina;
         if (ldr_status_we) ctrl_reg[C_STATUS] <= ldr_status_val;
         if (ldr_cmd_clear) ctrl_reg[C_COMMAND] <= 32'b0;
         ctrl_reg[C_CURSOR] <= zlc_cursor;        // engine cursor visible to host
@@ -480,6 +487,7 @@ module zlc_pulse_streamer_top #(
         // evt_fifo_depth in fpga/board_config/streamer_config.json -- the host
         // validator rejects programs that would overflow this depth.
         .EVT_DEPTH(EVT_FIFO_DEPTH),
+        .BUS_EVT_DEPTH(BUS_EVT_FIFO_DEPTH),
         // Event FIFOs are COMPACTED to the delay-eligible channels (the real TTL outputs
         // ch0..17): the 40 bus-member bits (pins driven by bus_out) and the 4 da_clk
         // pins are NOT delay targets, so they get no FIFO -- this is what keeps the deep

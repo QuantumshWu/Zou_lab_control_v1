@@ -98,6 +98,10 @@ module zlc_edge_streamer #(
     // delay (32b = ~85.9 s at 20 ns); GTIME_WIDTH bounds one RUN (48b = ~65 days).
     parameter integer TTL_DELAY_WIDTH = 32,
     parameter integer EVT_DEPTH = 256,
+    // DAC delay FIFO depth: each DA bit is its OWN event-scheduler channel, but there are
+    // bus_count*bus_width = 40 of them, so the per-bit FIFO is SHALLOWER than the 18 TTL ones to
+    // stay within LUT budget (value-change events in flight per DA bit <= BUS_EVT_DEPTH).
+    parameter integer BUS_EVT_DEPTH = 64,
     parameter integer GTIME_WIDTH = 48,
     // Event-FIFO COMPACTION.  Only channels that can carry a TTL delay (the real
     // outputs -- NOT the bus-member bits, whose pins are driven by bus_out and whose
@@ -171,7 +175,7 @@ module zlc_edge_streamer #(
     // 0 -> the bus is silent until t>=d, for free.  Bounded: d <= DELAY_DEPTH (validated by the
     // host).  Proven == engine_model.rtl_bus_delay_line_mirror == bus_delay_line_reference.
     //   * bus_delay_ticks : per-bus delay d in ticks (0 = no delay = passthrough)
-    input  wire [BUS_COUNT*DELAY_TICK_WIDTH-1:0] bus_delay_ticks,
+    input  wire [BUS_COUNT*TTL_DELAY_WIDTH-1:0] bus_delay_ticks,
 
     // PHYSICAL per-channel OUTPUT DELAY -- a LITERAL delay line (a per-channel variable-tap SHIFT
     // REGISTER of depth DELAY_DEPTH, the SRL primitive).  A channel delay is NOT baked into the
@@ -312,16 +316,16 @@ module zlc_edge_streamer #(
     // TTL: see the EVENT SCHEDULER declarations below -- toggles are queued against a global
     // counter instead of shifting one bit per tick, so the TTL delay bound is TTL_DELAY_WIDTH
     // (~85.9 s) at a fraction of the old SRL cost.
-    // DAC: each bus's UNDELAYED 10-bit value history is a BUS_WIDTH-wide ring bus_ring[bus] (a 2D
-    // array of 10-bit words -- Vivado DOES recognise this as a 3D RAM and infers it; it is read at
-    // (del_wptr - d_bus)), left exactly as is.  d_ch / d_bus are held CTRL (a delay is constant,
-    // never scanned), latched into del_ch_ticks / del_bus_ticks at FIRE.  del_fill gates both reads
-    // to 0 before the line has filled d deep, so a read before fill returns 0 -> silent until t == d
-    // (real startup, for free; no bulk clear needed).
-    (* ram_style = "distributed" *) reg [BUS_WIDTH-1:0] bus_ring [0:BUS_COUNT-1][0:DELAY_SLOTS-1];
-    reg [DELAY_ADDR_WIDTH-1:0] del_wptr = {DELAY_ADDR_WIDTH{1'b0}};   // write pointer (bus_ring)
+    // DAC: each DA BIT is now its OWN 1-bit EVENT-SCHEDULER channel, exactly like a TTL output
+    // (the old per-tick bus_ring is gone -- it capped d at the 2048-tick ring ~41 us and could not
+    // match the TTL 32-bit range, so a negative TTL delay's global shift G could push a bus past
+    // the ring and get rejected).  The 40 DA bits (BUS_COUNT*BUS_WIDTH) feed a parallel per-bit
+    // event scheduler (g_busdly below), each a 256-deep 49-bit LUTRAM FIFO; the 10 bits of a bus
+    // SHARE the one per-bus d (del_bus_ticks[bus]), so the whole DAC value shifts coherently.
+    // d_ch / d_bus are held CTRL (a delay is constant, never scanned), latched at FIRE; both are
+    // now TTL_DELAY_WIDTH (32b) so TTL and DAC ranges MATCH and the global negative-shift is uniform.
     reg [TTL_DELAY_WIDTH-1:0]  del_ch_ticks  [0:CHANNEL_COUNT-1];  // per-channel d (0 = passthrough)
-    reg [DELAY_TICK_WIDTH-1:0] del_bus_ticks [0:BUS_COUNT-1];      // per-bus d (0 = passthrough)
+    reg [TTL_DELAY_WIDTH-1:0]  del_bus_ticks [0:BUS_COUNT-1];      // per-bus d, shared by the bus's 10 bits
     // ----- TTL EVENT SCHEDULER (replaces the 62 per-channel SRL delay lines) -----------
     // The old SRLs stored ONE BIT PER TICK of delay (DELAY_DEPTH=2048 -> 65 SRL32 + tap
     // mux per channel = ~4.1k LUTs, delay capped at ~41 us).  A TTL waveform is toggle-
@@ -348,6 +352,7 @@ module zlc_edge_streamer #(
     // FF + 256:1 read muxes and does not fit.  Per-slot 2D arrays each map to one simple-
     // dual-port LUTRAM (1 sync write @wr + 1 async read @rd).
     localparam integer EVT_ADDR = $clog2(EVT_DEPTH);
+    localparam integer BEVT_ADDR = $clog2(BUS_EVT_DEPTH);   // DA-bit FIFO address width
     // Each slot drives ONLY its one owned channel bit (obit << evt_ch_of(slot)); evt_out is
     // their OR, so un-served channels read 0 (the un-driven / before-first-event level).
     wire [CHANNEL_COUNT-1:0] evt_out_contrib [0:NUM_DELAY_CH-1];
@@ -377,13 +382,6 @@ module zlc_edge_streamer #(
         for (em_s = 0; em_s < NUM_DELAY_CH; em_s = em_s + 1)
             evt_eligible_mask[evt_ch_of(em_s)] = 1'b1;
     end
-    // del_fill = number of UNDELAYED samples pushed BEFORE this tick (== the running tick index t
-    // since FIRE), saturating at DELAY_DEPTH.  A read at distance d is valid (returns the value
-    // pushed d ticks ago) once del_fill >= d, i.e. t >= d -- the slot d ago was actually written
-    // this run.  Before that (t < d) the read returns 0: out[t]=in[t-d], 0 before fire.  ONE shared
-    // counter -- it gives the "0 before fire" startup for the distributed-RAM ring WITHOUT a
-    // (non-synthesizable) bulk RAM clear, exactly == delay_line_reference's 0-init startup.
-    reg [DELAY_TICK_WIDTH-1:0] del_fill = {DELAY_TICK_WIDTH{1'b0}};
     integer del_i;
 
     reg reset_meta = 1'b0, reset_sync = 1'b0;
@@ -404,19 +402,9 @@ module zlc_edge_streamer #(
         input integer ch;
         begin zlc_delay_ch_at = delay_ticks[ch*TTL_DELAY_WIDTH +: TTL_DELAY_WIDTH]; end
     endfunction
-    function [DELAY_TICK_WIDTH-1:0] zlc_delay_bus_at;
+    function [TTL_DELAY_WIDTH-1:0] zlc_delay_bus_at;
         input integer b;
-        begin zlc_delay_bus_at = bus_delay_ticks[b*DELAY_TICK_WIDTH +: DELAY_TICK_WIDTH]; end
-    endfunction
-    // ring read index "d writes ago" with one conditional +DELAY_SLOTS (no divider).
-    function [DELAY_ADDR_WIDTH-1:0] zlc_delay_rd;
-        input [DELAY_TICK_WIDTH-1:0] d;
-        reg signed [DELAY_ADDR_WIDTH:0] idx;
-        begin
-            idx = $signed({1'b0, del_wptr}) - $signed({1'b0, d});
-            if (idx < 0) idx = idx + DELAY_SLOTS;
-            zlc_delay_rd = idx[DELAY_ADDR_WIDTH-1:0];
-        end
+        begin zlc_delay_bus_at = bus_delay_ticks[b*TTL_DELAY_WIDTH +: TTL_DELAY_WIDTH]; end
     endfunction
 
     // Per-channel OUTPUT-delay merge.  delayed_mask[b] marks the bits a delayed channel owns
@@ -445,28 +433,63 @@ module zlc_edge_streamer #(
     end
     assign out = (state_mask & ~delayed_mask) | delayed_out;
 
-    // ----- per-bus OUTPUT merge: LITERAL per-bus delay line (combinational ring read) -----
-    // A NOT-delayed bus (d_bus == 0) passes the live UNDELAYED bus_value_active straight through.
-    // A DELAYED bus reads its 10-bit value d_bus writes ago from bus_ring -- gated by (del_fill >=
-    // d_bus) so it holds the SAFE mid-scale code (BUS_SAFE_VALUE = 0 V on the offset-binary
-    // driver) until t >= d_bus (silent until t == d).
-    reg [BUS_WIDTH-1:0] bus_out_merged [0:BUS_COUNT-1];
-    integer bus_om;
-    always @(*) begin
-        for (bus_om = 0; bus_om < BUS_COUNT; bus_om = bus_om + 1) begin
-            if (del_bus_ticks[bus_om] != {DELAY_TICK_WIDTH{1'b0}})
-                bus_out_merged[bus_om] = (del_fill >= del_bus_ticks[bus_om])
-                                         ? bus_ring[bus_om][zlc_delay_rd(del_bus_ticks[bus_om])]
-                                         : BUS_SAFE_VALUE[BUS_WIDTH-1:0];
-            else
-                bus_out_merged[bus_om] = bus_value_active[bus_om];
+    // ----- per-DA-BIT OUTPUT delay: each DA bit is its OWN 1-bit EVENT SCHEDULER (g_busdly) -----
+    // out_bus[t] = in_bus[t-d_bus]; before the first scheduled change the bit holds its idle level
+    // (the BUS_SAFE_VALUE mid-scale code = 0 V on the offset-binary driver), so the first frame is
+    // correct.  The 10 bits of a bus SHARE del_bus_ticks[bus], so the whole DAC value shifts
+    // coherently.  d_bus==0 -> live passthrough; d_bus==1 -> one register; d_bus>=2 -> the FIFO.
+    // Each bit gets its OWN 2D distributed-RAM FIFO (a flat 3D reg array falls to flip-flops -- see
+    // g_evtfifo).  Capacity = value-change events in flight per bit <= EVT_DEPTH (host-validated).
+    genvar gbb, gbk;
+    generate
+    for (gbb = 0; gbb < BUS_COUNT; gbb = gbb + 1) begin : g_busdly
+        for (gbk = 0; gbk < BUS_WIDTH; gbk = gbk + 1) begin : g_bit
+            localparam integer SAFE_BIT = (BUS_SAFE_VALUE >> gbk) & 1; // idle level of this bit
+            (* ram_style = "distributed" *) reg [GTIME_WIDTH:0] bfifo [0:BUS_EVT_DEPTH-1];
+            reg [BEVT_ADDR-1:0] bwr  = {BEVT_ADDR{1'b0}};
+            reg [BEVT_ADDR-1:0] brd  = {BEVT_ADDR{1'b0}};
+            reg [BEVT_ADDR:0]   bcnt = {(BEVT_ADDR+1){1'b0}};
+            reg                bobit = SAFE_BIT[0];   // scheduled (delayed) level (d>=2)
+            reg                bprev = SAFE_BIT[0];    // prev UNDELAYED level (for d==1)
+            reg bpushf, bpopf;
+            wire und = bus_value_active[gbb][gbk];                 // this tick's UNDELAYED bus bit
+            wire [TTL_DELAY_WIDTH-1:0] dbus = del_bus_ticks[gbb];
+            wire [GTIME_WIDTH:0] bhead = bfifo[brd];                // async-read FIFO head
+            assign bus_out[gbb*BUS_WIDTH + gbk] =
+                (dbus == {TTL_DELAY_WIDTH{1'b0}}) ? und :
+                (dbus == {{(TTL_DELAY_WIDTH-1){1'b0}}, 1'b1}) ? bprev : bobit;
+            always @(posedge clk) begin
+                if (reset_sync) begin
+                    bwr   <= {BEVT_ADDR{1'b0}};
+                    brd   <= {BEVT_ADDR{1'b0}};
+                    bcnt  <= {(BEVT_ADDR+1){1'b0}};
+                    bobit <= SAFE_BIT[0];
+                    bprev <= SAFE_BIT[0];
+                end else begin
+                    bprev <= und;
+                    bpushf = (und != bprev)
+                             && (dbus > {{(TTL_DELAY_WIDTH-1){1'b0}}, 1'b1})
+                             && (bcnt != BUS_EVT_DEPTH[BEVT_ADDR:0]);
+                    bpopf  = (bcnt != {(BEVT_ADDR+1){1'b0}})
+                             && (bhead[GTIME_WIDTH:1] == g_time);
+                    if (bpushf) begin
+                        bfifo[bwr] <= {
+                            g_time + {{(GTIME_WIDTH-TTL_DELAY_WIDTH){1'b0}}, dbus} - 1'b1, und };
+                        bwr <= bwr + 1'b1;
+                    end
+                    if (bpopf) begin
+                        bobit <= bhead[0];
+                        brd <= brd + 1'b1;
+                    end
+                    case ({bpushf, bpopf})
+                        2'b10: bcnt <= bcnt + 1'b1;
+                        2'b01: bcnt <= bcnt - 1'b1;
+                        default: ;
+                    endcase
+                end
+            end
         end
     end
-    genvar gi;
-    generate
-        for (gi = 0; gi < BUS_COUNT; gi = gi + 1) begin : zlc_bus_out_assign
-            assign bus_out[gi*BUS_WIDTH +: BUS_WIDTH] = bus_out_merged[gi];
-        end
     endgenerate
 
     function [TICK_WIDTH-1:0] zlc_effective_tick;
@@ -561,17 +584,14 @@ module zlc_edge_streamer #(
         end
     endtask
 
-    // Clear the LITERAL delay-line runtime (used on reset/FIRE): zero the per-channel + per-bus
-    // delay amounts, the write pointer, and the fill counter.  The ring RAM is NOT bulk-cleared
-    // (distributed RAM has no synchronous bulk reset); del_fill gates the read to 0 until the
-    // ring has filled d deep this run, which IS the FIRE-time-0 startup (silent until t == d).
+    // Clear the per-channel + per-bus delay amounts (used on reset/FIRE).  The event-FIFO state
+    // (wr/rd/cnt/obit) is cleared inside each scheduler's own reset_sync branch (g_evtfifo /
+    // g_busdly), so there is nothing ring-related to reset here any more.
     task zlc_delay_clear_runtime;
         integer i;
         begin
-            del_wptr <= {DELAY_ADDR_WIDTH{1'b0}};
-            del_fill <= {DELAY_TICK_WIDTH{1'b0}};
             for (i = 0; i < CHANNEL_COUNT; i = i + 1) del_ch_ticks[i] <= {TTL_DELAY_WIDTH{1'b0}};
-            for (i = 0; i < BUS_COUNT; i = i + 1) del_bus_ticks[i] <= {DELAY_TICK_WIDTH{1'b0}};
+            for (i = 0; i < BUS_COUNT; i = i + 1) del_bus_ticks[i] <= {TTL_DELAY_WIDTH{1'b0}};
         end
     endtask
 
@@ -894,13 +914,10 @@ module zlc_edge_streamer #(
             scan_raddr <= {{(SCAN_ADDR_WIDTH-1){1'b0}}, 1'b1};                     // pre-read point 1 (bank 0)
             loop_count_active <= (loop_count==0)?32'd1:loop_count;
             loops_remaining <= (loop_count==0)?32'd1:loop_count;
-            // AT FIRE: latch the LITERAL delay-line amounts from the held CTRL words and reset the
-            // write pointer + fill counter (del_fill gates the read to 0 until the ring fills d
-            // deep -> silent until t == d, real startup -- no bulk RAM clear).  A delay is constant
-            // (never scanned), so the per-channel d_ch and per-bus d_bus are plain held values; ALL
-            // 62 channels and ALL 4 buses are independently delayable (d == 0 => passthrough).
-            del_wptr <= {DELAY_ADDR_WIDTH{1'b0}};
-            del_fill <= {DELAY_TICK_WIDTH{1'b0}};
+            // AT FIRE: latch the per-channel / per-bus delay amounts from the held CTRL words.  A
+            // delay is constant (never scanned), so d_ch and d_bus are plain held values; all 18
+            // TTL outputs and all 4 DAC buses are independently delayable (d == 0 => passthrough,
+            // the per-FIFO startup gives "silent until t == d" / SAFE-until-t==d for free).
             for (del_i = 0; del_i < CHANNEL_COUNT; del_i = del_i + 1)
                 del_ch_ticks[del_i] <= zlc_delay_ch_at(del_i);
             for (del_i = 0; del_i < BUS_COUNT; del_i = del_i + 1)
@@ -1047,18 +1064,8 @@ module zlc_edge_streamer #(
         end
         if (bnd_bus_tick) zlc_bus_tick(bnd_bus_reinit, bnd_slots);
         if (bnd_seed) seed_from_edge0(bnd_slots, bnd_count);
-        // ---- DAC delay ring: push this tick's UNDELAYED bus values ------------------------------
-        // (TTL no longer uses a per-tick line: see the EVENT SCHEDULER block below.)  Write each
-        // bus's current undelayed value into its ring slot del_wptr, advance del_wptr + the fill
-        // counter; the combinational ring read at (del_wptr - d) with the del_fill gate is the
-        // proven out[t] = in[t-d] / safe-before-fill behaviour.
-        if (bnd_delay_advance) begin
-            for (del_i = 0; del_i < BUS_COUNT; del_i = del_i + 1)
-                bus_ring[del_i][del_wptr] <= bus_value_active[del_i];
-            del_wptr <= (del_wptr == DELAY_SLOTS-1) ? {DELAY_ADDR_WIDTH{1'b0}} : (del_wptr + 1'b1);
-            if (del_fill < DELAY_DEPTH[DELAY_TICK_WIDTH-1:0])   // saturate at the max valid d
-                del_fill <= del_fill + 1'b1;
-        end
+        // (The DAC delay no longer uses a per-tick ring here: each DA bit is event-scheduled in the
+        // g_busdly generate block, fed directly from bus_value_active.  bnd_delay_advance is unused.)
     end
 
     // ----- TTL EVENT SCHEDULER runtime -------------------------------------------------------

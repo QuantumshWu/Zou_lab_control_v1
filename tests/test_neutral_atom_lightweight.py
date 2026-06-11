@@ -4852,9 +4852,10 @@ def test_edge_streamer_has_literal_delay_line_path():
 
 
 def test_delay_line_bounded_cap_rejected_clearly():
-    """TTL delays accept ring-busting values (event scheduler) up to the 32-bit cap and
-    reject beyond it; BUS delays keep the 2048-tick ring cap; a toggle burst denser than
-    the event FIFO inside one delay window is rejected with a clear message."""
+    """TTL AND DAC-bus delays are both event-scheduled now, so both accept ring-busting values
+    up to the SAME 32-bit cap and reject beyond it (the old 2048-tick bus ring is gone -- ranges
+    unified); a toggle burst denser than the event FIFO inside one delay window is still rejected
+    with a clear message."""
     import pytest
     from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import (
         validate_pulse_streamer_program, DEFAULT_DELAY_DEPTH, TTL_DELAY_MAX_TICKS, EVT_FIFO_DEPTH)
@@ -4883,9 +4884,14 @@ def test_delay_line_bounded_cap_rejected_clearly():
         validate_pulse_streamer_program(prog(cd=cd_over), channel_count=62)
     with pytest.raises(ValueError, match="outside"):
         img.pack_program(prog(cd=cd_over), img.StreamerParams())
-    # a per-BUS delay over the ring depth is rejected as before
-    busover = prog(bus_delays=[RuntimeBusDelay(bus_index=1, delay=depth + 1)])
-    with pytest.raises(ValueError, match="DELAY_DEPTH=2048"):
+    # a per-BUS delay is now event-scheduled per DA bit (the bus's 10 bits share one delay),
+    # SAME 32-bit range as TTL -- the old 2048-tick ring cap is gone, so a delay past the old
+    # ring is VALID now and only the 32-bit field cap rejects it (range unified with TTL).
+    busok = prog(bus_delays=[RuntimeBusDelay(bus_index=1, delay=depth + 1)])
+    validate_pulse_streamer_program(busok, channel_count=62)
+    img.pack_program(busok, img.StreamerParams())
+    busover = prog(bus_delays=[RuntimeBusDelay(bus_index=1, delay=TTL_DELAY_MAX_TICKS + 1)])
+    with pytest.raises(ValueError, match="outside"):
         validate_pulse_streamer_program(busover, channel_count=62)
     # toggle burst denser than the event FIFO inside one delay window -> clear error
     # (PHYSICAL delay, no modulo: more than EVT_FIFO_DEPTH edges in the d-window is rejected
@@ -6336,8 +6342,11 @@ def test_untouched_dac_bus_idles_at_mid_code():
 
     rtl = (Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "zlc_edge_streamer.v").read_text(encoding="utf-8")
     assert "parameter integer BUS_SAFE_VALUE = (1 << (BUS_WIDTH - 1))" in rtl
-    # all rest paths use it: clear_runtime, FIRE re-init, the delayed-read gate, power-up
-    assert rtl.count("BUS_SAFE_VALUE[BUS_WIDTH-1:0]") >= 4
+    # each DA bit's event-FIFO output (bobit) AND its d==1 register (bprev) reset to that bit's
+    # SAFE level (derived from BUS_SAFE_VALUE), so an untouched/not-yet-scheduled bus idles at
+    # the mid-code (0 V).
+    assert "SAFE_BIT = (BUS_SAFE_VALUE >> gbk) & 1" in rtl
+    assert rtl.count("<= SAFE_BIT[0]") >= 2   # bobit + bprev reset paths
 
 
 def test_period_name_round_trips_and_survives_transforms():
@@ -7526,8 +7535,11 @@ def test_untouched_dac_bus_idles_at_mid_code():
 
     rtl = (Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "zlc_edge_streamer.v").read_text(encoding="utf-8")
     assert "parameter integer BUS_SAFE_VALUE = (1 << (BUS_WIDTH - 1))" in rtl
-    # all rest paths use it: clear_runtime, FIRE re-init, the delayed-read gate, power-up
-    assert rtl.count("BUS_SAFE_VALUE[BUS_WIDTH-1:0]") >= 4
+    # each DA bit's event-FIFO output (bobit) AND its d==1 register (bprev) reset to that bit's
+    # SAFE level (derived from BUS_SAFE_VALUE), so an untouched/not-yet-scheduled bus idles at
+    # the mid-code (0 V).
+    assert "SAFE_BIT = (BUS_SAFE_VALUE >> gbk) & 1" in rtl
+    assert rtl.count("<= SAFE_BIT[0]") >= 2   # bobit + bprev reset paths
 
 
 def test_period_name_round_trips_and_survives_transforms():
