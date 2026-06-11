@@ -14,8 +14,7 @@ import os
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from Zou_lab_control.neutral_atom.timing.pulse_table import (
-    DELAY_DEPTH_TICKS,
-    BUS_DELAY_DEPTH_TICKS,
+    DELAY_MAX_TICKS,
     UNITS_TO_NS,
     PulsePeriod,
     PulseTableState,
@@ -333,19 +332,19 @@ def _format_clock_text(time_step_ns: float) -> str:
 
 
 def _delay_cap_text(time_step_ns: float) -> str:
-    """Human description of the per-channel TTL delay magnitude cap (the 32-bit field)."""
+    """Human description of the per-signal delay magnitude cap (the 32-bit field).  Same
+    for TTL channels and DAC buses (both event-scheduled)."""
 
-    max_us = DELAY_DEPTH_TICKS * float(time_step_ns) / 1000.0
+    max_us = DELAY_MAX_TICKS * float(time_step_ns) / 1000.0
     if max_us >= 1e6:
         return f"±{format_compact_number(max_us / 1e6)} s (event-scheduled; ms-scale delays OK)"
-    return f"±{format_compact_number(max_us)} us ({DELAY_DEPTH_TICKS} ticks)"
+    return f"±{format_compact_number(max_us)} us ({DELAY_MAX_TICKS} ticks)"
 
 
 def _bus_delay_cap_text(time_step_ns: float) -> str:
-    """Human description of the DAC-bus delay magnitude cap (the 2048-tick output ring)."""
+    """DAC-bus delay magnitude cap -- identical to the TTL cap (both event-scheduled)."""
 
-    max_us = BUS_DELAY_DEPTH_TICKS * float(time_step_ns) / 1000.0
-    return f"±{format_compact_number(max_us)} us ({BUS_DELAY_DEPTH_TICKS}-tick ring)"
+    return _delay_cap_text(time_step_ns)
 
 
 def _bus_mode_combo_width() -> int:
@@ -1622,7 +1621,7 @@ class ChannelPanel(FluentGroupBox):
         factor = UNIT_TO_NS.get(unit_text, 1.0) or 1.0
         # TTL and DAC-bus delays are now both event-scheduled with the SAME 32-bit range, so the
         # magnitude cap is identical for channels and buses (the old 2048-tick bus ring is gone).
-        max_ns = DELAY_DEPTH_TICKS * float(self.state.time_step_ns)
+        max_ns = DELAY_MAX_TICKS * float(self.state.time_step_ns)
         value_ns = value * factor
         if abs(value_ns) > max_ns + 1e-6:
             clamped = max(-max_ns, min(max_ns, value_ns)) / factor

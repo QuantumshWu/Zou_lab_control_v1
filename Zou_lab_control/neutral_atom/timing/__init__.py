@@ -15,7 +15,7 @@ from .sequence import (
 )
 from .pulse_table import (
     ANALOG_BUS_MODES,
-    DELAY_DEPTH_TICKS,
+    DELAY_MAX_TICKS,
     SCAN_SLOT_KINDS,
     PulsePeriod,
     PulseTableState,
@@ -38,7 +38,7 @@ from .verilog import CONTROL_PORTS, VerilogBuild, VerilogFiles, generate_verilog
 __all__ = [
     "CONTROL_PORTS",
     "ANALOG_BUS_MODES",
-    "DELAY_DEPTH_TICKS",
+    "DELAY_MAX_TICKS",
     "SCAN_SLOT_KINDS",
     "DEFAULT_CAMERA_TRIGGER_CHANNELS",
     "Pulse",

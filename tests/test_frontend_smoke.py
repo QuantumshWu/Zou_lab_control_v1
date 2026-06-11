@@ -2366,7 +2366,7 @@ def test_delay_edit_caps_at_delay_depth(monkeypatch):
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from Zou_lab_control.frontend import devtools as dt
-    from Zou_lab_control.neutral_atom.timing.pulse_table import DELAY_DEPTH_TICKS
+    from Zou_lab_control.neutral_atom.timing.pulse_table import DELAY_MAX_TICKS
 
     ed = dt.demo_editor(size=(1400, 880))
     dt.settle(ed, 120)
@@ -2379,7 +2379,7 @@ def test_delay_edit_caps_at_delay_depth(monkeypatch):
     assert abs(float(edit.text()) - 999.0) < 1e-6
     edit.setText(str(10 ** 9))           # 1e9 us = 1000 s: beyond the 32-bit field -> clamped
     panel._clamp_delay_edit(channel, edit)
-    capped_us = DELAY_DEPTH_TICKS * ed.state.time_step_ns / 1000.0
+    capped_us = DELAY_MAX_TICKS * ed.state.time_step_ns / 1000.0
     assert abs(float(edit.text()) - capped_us) <= max(1e-6, capped_us * 1e-9)
 
 

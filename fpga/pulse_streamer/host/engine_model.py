@@ -28,7 +28,7 @@ The per-channel / per-bus OUTPUT delay is a LITERAL delay line (a plain circular
 :func:`delay_line_reference` / :func:`bus_delay_line_reference` are the exact stream-shift
 ground truth (out[t]=in[t-d], 0 before fire), and :func:`rtl_delay_line_mirror` /
 :func:`rtl_bus_delay_line_mirror` are the cycle-exact register mirrors of the RTL circular
-buffer (bounded to :data:`DELAY_DEPTH`; a d past it raises :class:`DelayDepthExceeded`).
+buffer (the 32-bit delay field; a d past it raises :class:`DelayTooLargeError`).
 ``reference_play`` / ``prefetch_play`` / ``rtl_mirror_play`` apply the channel delay line as a
 post-play shift via :func:`_apply_channel_delays`.
 """
@@ -42,17 +42,15 @@ from typing import Sequence
 __all__ = [
     "EngineProgram", "effective_tick", "reference_play", "prefetch_play",
     "streaming_scan_play", "rtl_mirror_play", "bus_play", "min_edge_spacing",
-    "PrefetchStall", "ScanUnderflow", "DelayDepthExceeded", "DELAY_DEPTH",
+    "PrefetchStall", "ScanUnderflow", "DelayTooLargeError",
     "delay_line_reference", "bus_delay_line_reference",
     "rtl_delay_line_mirror", "rtl_bus_delay_line_mirror",
     "bus_value_at",
 ]
 
-# Per-channel / per-bus OUTPUT delay-line depth (in ticks) -- MUST match the RTL
-# DELAY_DEPTH localparam and host.image / fpga_pulse_streamer DEFAULT_DELAY_DEPTH.
-# A bounded cap: 2048 ticks * 20 ns = ~40 us (covers +/-15 us after the negative-delay
-# global shift G, which can push an effective delay to ~30 us).
-DELAY_DEPTH = 2048            # (legacy) -- both TTL and DAC delays are event-scheduled now
+# OUTPUT delay cap (in ticks): the 32-bit delay field, the SAME for TTL channels and DAC
+# buses (both event-scheduled).  A delay past it raises DelayTooLargeError; the real working
+# limit is toggles IN FLIGHT (<= the event-FIFO depths below), validated at compile time.
 TTL_DELAY_MAX_TICKS = (1 << 31) - 1
 # Event-FIFO depths: SINGLE SOURCE = fpga/board_config/streamer_config.json (same file the
 # RTL generics + validator read), so the model never drifts from the synthesized bitstream.
@@ -66,8 +64,8 @@ except Exception:
     BUS_EVT_FIFO_DEPTH = 64
 
 
-class DelayDepthExceeded(ValueError):
-    """An effective channel/bus delay exceeds the bounded delay-line depth."""
+class DelayTooLargeError(ValueError):
+    """An effective channel/bus delay exceeds the 32-bit delay field."""
 
 
 class PrefetchStall(RuntimeError):
@@ -177,12 +175,12 @@ def bus_delay_line_reference(undelayed_bus: Sequence[int], delay: int,
 #   safe = BUS_SAFE_VALUE), with the in-flight-count capacity bound instead of a delay-length cap.
 
 
-def _validate_delay_depth(d: int, depth: int, what: str) -> int:
+def _check_delay_cap(d: int, cap: int, what: str) -> int:
     d = int(d)
-    if d < 0 or d > depth:
-        raise DelayDepthExceeded(
-            f"{what} delay {d} ticks exceeds the delay-line depth DELAY_DEPTH={depth} "
-            f"(~{depth * 20 / 1000:.0f}us); reduce the delay.")
+    if d < 0 or d > cap:
+        raise DelayTooLargeError(
+            f"{what} delay {d} ticks exceeds the 32-bit delay field cap {cap} "
+            f"(~{cap * 20e-9:.1f}s); reduce the delay.")
     return d
 
 
@@ -204,8 +202,8 @@ def rtl_delay_line_mirror(undelayed: Sequence[int], channel_delays,
         prevents ever getting there (toggle-density window check).
 
     Equals :func:`delay_line_reference` for every d in [0, depth]; a d > depth raises
-    :class:`DelayDepthExceeded` (the 32-bit field cap)."""
-    cds = {int(b): _validate_delay_depth(d, depth, f"channel bit {b}")
+    :class:`DelayTooLargeError` (the 32-bit field cap)."""
+    cds = {int(b): _check_delay_cap(d, depth, f"channel bit {b}")
            for b, d in dict(channel_delays).items() if int(d) != 0}
     delayed_mask = 0
     for b in cds:
@@ -311,8 +309,8 @@ class EngineProgram:
 def _apply_channel_delays(out: list[int], p: "EngineProgram") -> list[int]:
     """Apply the per-channel OUTPUT delay (the literal delay line) to a finished play.
     No-op when no channel is delayed.  This is the EXACT ``delay_line_reference`` (the
-    ground truth); the RTL realises the same with a per-channel circular buffer (depth
-    DELAY_DEPTH), proven equal by ``rtl_delay_line_mirror``."""
+    ground truth); the RTL realises the same with a per-channel event scheduler, proven
+    equal by ``rtl_delay_line_mirror``."""
     if not p.channel_delays or not any(p.channel_delays):
         return out
     cds = {b: int(d) for b, d in enumerate(p.channel_delays) if int(d)}

@@ -17,10 +17,9 @@ The edge fields are separate BRAMs read in PARALLEL (one whole edge per access,
 no width padding) so max_edges is large; the scan window is small (2 banks) and
 the host streams the rest -> UNBOUNDED scan points.  Bus tables stay LUTRAM.
 
-The per-channel / per-bus OUTPUT delay is a LITERAL delay line (a distributed-RAM circular
-buffer of depth delay_depth ticks for the DAC buses).  TTL channel delays are EVENT-
-SCHEDULED (queued toggles, 32-bit delay bound) and live in their own DELAY register
-region; bus delays still ride the dense BUS_DELAY_TICKS CTRL words.
+The per-channel / per-bus OUTPUT delay is EVENT-SCHEDULED (queued toggles against a
+free-running counter, 32-bit delay bound) for BOTH the TTL channels and the DAC buses; both
+live as one 32-bit word per signal in the R_DELAY register region -- no dense delay CTRL words.
 """
 
 from __future__ import annotations
@@ -80,23 +79,14 @@ class CtrlWords:
     BANK1_CHUNK = 18      # host -> top: sweep-chunk index currently resident in bank 1
     REPEAT_FROM_LOOP_START = 19  # repeat_forever rewinds to LOOP_START; with no channel
     #                              delay this is the whole frame (bracket loop start)
-    # PER-CHANNEL OUTPUT DELAY -- a LITERAL delay line (a circular buffer; NO membership /
-    # intervals / off / skip).  The delay is a plain DENSE per-channel tick count: channel ch is
-    # delayed by ``delay_ticks[ch]`` ticks (0 = passthrough), one delay_tick_width field per
-    # channel packed LSB-first into 32b CTRL words.  The engine pushes the undelayed state_mask
-    # into a per-channel ring each tick and reads (wptr - delay_ticks[ch]) -- so out[t]=in[t-d],
-    # 0 before fire.  Bounded: d <= delay_depth (the host validates this).  Layout is for the
-    # DEFAULT channel_count=62 (locked to zlc_pulse_streamer_top.v by test_final_top_regions_match_image).
-    DELAY_TICKS = 20     # RESERVED (was the dense per-channel delay; TTL delays moved to the DELAY region)
-    # PER-BUS DAC DELAY -- the same LITERAL delay line, one delay shared by all 10 bits of a bus:
-    # bus b is delayed by ``bus_delay_ticks[b]`` ticks (0 = passthrough), dense per-bus.
-    BUS_DELAY_TICKS = 44  # dense per-bus delay (delay_tick_width bits each) -> ceil(4*12/32)=2 words (44..45)
     # PER-CHANNEL CLK MASK -- channels wired to the FPGA clk (a DAC latch strobe).  One bit
     # per channel; the top muxes the strobe onto those pins (out_final[n]=clk_en[n]?~clk:out[n],
     # the INVERTED clk so the DAC latches at its data-eye centre -- see top "DAC LATCH PHASE")
-    # and the engine's bit for them is forced 0 so it never fights the clk.  ceil(62/32)=2
-    # words (46..47); locked to zlc_pulse_streamer_top.v by test_final_top_regions_match_image.
-    CLK_ENABLE = 46
+    # and the engine's bit for them is forced 0 so it never fights the clk.  Sits right after the
+    # command words (ceil(62/32)=2 words, 20..21) -- there are NO dense delay-tick CTRL words any
+    # more (TTL+DAC delays are 32-bit-per-signal in the R_DELAY region).  Locked to
+    # zlc_pulse_streamer_top.v by test_final_top_regions_match_image.
+    CLK_ENABLE = 20
 
 
 CTRL_WORDS = 64
@@ -115,10 +105,7 @@ class StreamerParams:
     bus_width: int = 10
     bus_seg_addr_width: int = 6
     bus_sel_width: int = 3
-    # DAC delay ring: a per-bus circular buffer of depth delay_depth ticks.  delay_depth
-    # bounds the maximum BUS delay (2048 * 20 ns = ~41 us); delay_tick_width holds it.
-    delay_depth: int = 2048
-    # TTL EVENT SCHEDULER: per-channel delays are queued TOGGLES against a free-running
+    # EVENT SCHEDULER (TTL channels AND DAC buses): a delay is queued TOGGLES against a free-running
     # global counter, so a TTL delay is bounded only by its 32-bit field
     # (ttl_delay_max_ticks ~ 42.9 s at 20 ns) -- e.g. millisecond emCCD delays.  The
     # constraint moves from delay LENGTH to toggles IN FLIGHT: at most evt_fifo_depth
@@ -142,32 +129,16 @@ class StreamerParams:
         return _addr_width(max(2, self.bus_count))       # bits to index a DAC bus
 
     @property
-    def delay_tick_width(self) -> int:
-        # bits to hold a delay in [0, delay_depth]
-        return max(1, (self.delay_depth).bit_length())
-
-    @property
-    def delay_ticks_words(self) -> int:
-        # dense per-channel delay: channel_count fields of delay_tick_width bits, in 32b words
-        return _ceil(self.channel_count * self.delay_tick_width, 32)
-
-    @property
-    def bus_delay_ticks_words(self) -> int:
-        # dense per-bus delay: bus_count fields of delay_tick_width bits, in 32b words
-        return _ceil(self.bus_count * self.delay_tick_width, 32)
-
-    @property
     def clk_enable_words(self) -> int:
         # per-channel clk mask: 1 bit per channel, in 32b words
         return _ceil(self.channel_count, 32)
 
     @property
     def ctrl_scratch_base(self) -> int:
-        """First CTRL word ABOVE every defined/used word -- command words (0..19),
-        DELAY_TICKS, BUS_DELAY_TICKS and CLK_ENABLE.  ``axi_self_test`` may scribble
-        ONLY at/above this index (hardware regression: a stale hard-coded scratch of
-        32 landed inside the later-added delay/CLK_ENABLE words, clk-enabling random
-        channels at server bring-up -- pins ran at 50 MHz before any pulse)."""
+        """First CTRL word ABOVE every defined/used word -- command words (0..19) then
+        CLK_ENABLE (20..21).  ``axi_self_test`` may scribble ONLY at/above this index
+        (hardware regression: a stale hard-coded scratch once landed inside the CLK_ENABLE
+        words, clk-enabling random channels at server bring-up -- pins ran at 50 MHz)."""
         base = int(CtrlWords.CLK_ENABLE) + self.clk_enable_words
         if base + 2 > CTRL_WORDS:
             raise ValueError(
@@ -465,7 +436,6 @@ def pack_program(program, params: StreamerParams | None = None) -> dict[int, int
     # (32-bit field, ~42.9 s), NOT by the bus-ring depth; pack always writes ALL channel
     # words so stale delays from a previous program can never linger.
     channel_delays = [int(d) for d in (getattr(program, "channel_delays", None) or [])]
-    dtw = p.delay_tick_width
     for ch, d in enumerate(channel_delays):
         if ch >= p.channel_count:
             if d:
@@ -501,16 +471,6 @@ def pack_program(program, params: StreamerParams | None = None) -> dict[int, int
     for i in range((p.channel_count + 31) // 32):
         w[CtrlWords.CLK_ENABLE + i] = (clk_enable >> (32 * i)) & 0xFFFFFFFF
     return w
-
-
-def _validate_delay_depth(d: int, depth: int, what: str) -> None:
-    """A bounded cap: every effective delay must be in [0, delay_depth] (the literal
-    circular-buffer depth).  A negative delay can never reach here (the host folds the global
-    shift G so every delay handed in is >= 0)."""
-    if int(d) < 0 or int(d) > int(depth):
-        raise ValueError(
-            f"{what} delay {int(d)} ticks exceeds the delay-line depth DELAY_DEPTH={int(depth)} "
-            f"(~{int(depth) * 20 / 1000:.0f}us); reduce the delay.")
 
 
 def unpack_program(words: Mapping[int, int], params: StreamerParams | None = None) -> dict:
@@ -667,8 +627,6 @@ def estimate_resources(params: StreamerParams, *, part, target_pct: float = 90.0
     # (2*bus_sel_width -- a ramp can scan both endpoints).
     bus_lutram = _ceil((2 * params.tick_width + 2 * params.coeff_bits + 2 * params.bus_width
                         + 2 + 2 * params.bus_sel_width) * params.bus_rows, 64)
-    # LITERAL delay line LUT cost: TTL = SRL32 chain + tap mux/ch; DAC = distributed-RAM ring.
-    delay_slots = params.delay_depth + 1
     # TTL EVENT SCHEDULER: an EVT_DEPTH x 49b LUTRAM event FIFO (~ceil(EVT_DEPTH*49/64)
     # RAM LUTs), a 48b equality comparator (~14) and push/pop control (~6) per channel.
     # The FIFOs are COMPACTED to the channels that can carry a delay -- only channels
@@ -922,7 +880,8 @@ def format_capacity_report(result: dict) -> str:
         f"  part:       {result['part_string']}  (profile {result['part']})",
         f"  target:     {result['target_pct']:g}% of each resource",
         f"  geometry:   channels={p.channel_count} edges={p.max_edges} bank_size={p.bank_size} "
-        f"slots={p.num_slots} buses={p.bus_count}x{p.bus_width}b delay_depth={p.delay_depth}",
+        f"slots={p.num_slots} buses={p.bus_count}x{p.bus_width}b "
+        f"evt_fifo={p.evt_fifo_depth} bus_evt_fifo={p.bus_evt_fifo_depth}",
         "",
         f"  {'resource':<8} {'used':>8} {'budget':>8} {'total':>8}  {'%use':>6}  verdict",
     ]
@@ -957,7 +916,6 @@ def vivado_generics(params: "StreamerParams") -> "list[str]":
     return [
         f"EDGE_ADDR_WIDTH={params.edge_addr_width}",
         f"BANK_SIZE={params.bank_size}",
-        f"DELAY_DEPTH={params.delay_depth}",
         f"EVT_FIFO_DEPTH={params.evt_fifo_depth}",
         f"BUS_EVT_FIFO_DEPTH={params.bus_evt_fifo_depth}",
     ]
@@ -974,7 +932,6 @@ def emit_geom_tcl(params: "StreamerParams") -> str:
         "# Sets the BRAM-IP sizing vars + the top-module -generic overrides for synth.\n"
         f"set zlc_edge_addr_width {params.edge_addr_width}\n"
         f"set zlc_bank_size {params.bank_size}\n"
-        f"set zlc_delay_depth {params.delay_depth}\n"
         f"set zlc_evt_fifo_depth {params.evt_fifo_depth}\n"
         f"set zlc_top_generics {{{generics}}}\n"
     )
@@ -993,7 +950,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--emit-geom-tcl", default=None, metavar="PATH",
                         help="Write the Vivado geometry/generics Tcl (derived from the config) to "
                              "PATH and exit -- create_project.tcl sources it so the bitstream geometry "
-                             "(EVT_FIFO_DEPTH, DELAY_DEPTH, EDGE_ADDR_WIDTH, BANK_SIZE) follows the config.")
+                             "(EVT_FIFO_DEPTH, BUS_EVT_FIFO_DEPTH, EDGE_ADDR_WIDTH, BANK_SIZE) follows the config.")
     args = parser.parse_args(list(argv) if argv is not None else None)
     if args.emit_geom_tcl:
         import pathlib

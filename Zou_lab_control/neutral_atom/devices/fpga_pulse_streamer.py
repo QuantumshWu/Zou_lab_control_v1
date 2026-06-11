@@ -52,7 +52,6 @@ try:  # pragma: no cover - exercised whenever the fpga package is importable (th
     DEFAULT_SCAN_COEFF_WIDTH = int(_CFG_PARAMS.coeff_width)
     DEFAULT_SCAN_COEFF_FRAC_BITS = int(_CFG_PARAMS.coeff_frac_bits)
     DEFAULT_NUM_SLOTS = int(_CFG_PARAMS.num_slots)
-    DEFAULT_DELAY_DEPTH = int(_CFG_PARAMS.delay_depth)
     TTL_DELAY_MAX_TICKS = int(getattr(_CFG_PARAMS, "ttl_delay_max_ticks", (1 << 31) - 1))
     EVT_FIFO_DEPTH = int(getattr(_CFG_PARAMS, "evt_fifo_depth", 16))
     BUS_EVT_FIFO_DEPTH = int(getattr(_CFG_PARAMS, "bus_evt_fifo_depth", 64))
@@ -69,9 +68,6 @@ except Exception:  # pragma: no cover - fpga package not importable; use shipped
     DEFAULT_SCAN_COEFF_WIDTH = 16
     DEFAULT_SCAN_COEFF_FRAC_BITS = 8
     DEFAULT_NUM_SLOTS = 4
-    # LITERAL OUTPUT delay-line depth in ticks (must match zlc_edge_streamer.v DELAY_DEPTH and
-    # host.image / engine_model DELAY_DEPTH).  Bounded cap: 2048 * 20 ns = ~40 us.
-    DEFAULT_DELAY_DEPTH = 2048
     TTL_DELAY_MAX_TICKS = (1 << 31) - 1
     EVT_FIFO_DEPTH = 16
     BUS_EVT_FIFO_DEPTH = 64
@@ -284,7 +280,6 @@ def validate_pulse_streamer_program(
     bus_count: int = DEFAULT_BUS_COUNT,
     bus_width: int = DEFAULT_BUS_WIDTH,
     slot_mul_width: int = DEFAULT_SLOT_MUL_WIDTH,
-    delay_depth: int = DEFAULT_DELAY_DEPTH,
     max_validated_scan_points: int | None = None,
 ) -> None:
     """Validate that a runtime edge table fits the fixed FPGA streamer.
@@ -318,7 +313,6 @@ def validate_pulse_streamer_program(
     # millisecond emCCD delays.  The hardware constraint moves from delay LENGTH to
     # toggles IN FLIGHT: a channel may have at most EVT_FIFO_DEPTH toggles inside any
     # window of its own delay length (each in-flight toggle holds one event-FIFO slot).
-    delay_depth = _positive_int(delay_depth, "delay_depth")   # still bounds BUS delays
     channel_delays = [int(d) for d in (getattr(program, "channel_delays", None) or [])]
     for b, d in enumerate(channel_delays):
         if d < 0 or d > TTL_DELAY_MAX_TICKS:

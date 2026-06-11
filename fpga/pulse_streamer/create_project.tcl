@@ -98,7 +98,6 @@ if {[info exists ::env(ZLC_PS_GEOM_TCL)] && $::env(ZLC_PS_GEOM_TCL) ne "" && [fi
 # geom.tcl did not already (so the config overrides, the literals are the fallback).
 if {![info exists zlc_edge_addr_width]} { set zlc_edge_addr_width 12 }
 if {![info exists zlc_bank_size]}       { set zlc_bank_size 2048 }
-if {![info exists zlc_delay_depth]}     { set zlc_delay_depth 2048 }
 if {![info exists zlc_top_generics]}    { set zlc_top_generics {} }
 # Derived sizes (recomputed from the base vars, whatever their source).
 set zlc_scan_depth [expr {2 * $zlc_bank_size}]

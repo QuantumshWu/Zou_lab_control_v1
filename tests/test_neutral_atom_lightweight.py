@@ -594,20 +594,18 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     assert "membership" not in engine.lower()
     assert "MAX_DELAY_INTERVALS" not in engine and "NUM_DELAYS" not in engine and "SKIP_WIDTH" not in engine
     assert "delay_prog" not in engine and "delay_prog" not in top
-    # the DAC ring keeps the bounded depth DELAY_DEPTH; TTL uses the event scheduler
-    assert "DELAY_DEPTH" in engine and "DELAY_DEPTH" in top and "DELAY_DEPTH" in create_tcl
+    # both TTL and DAC delays are event-scheduled (no ring, no DELAY_DEPTH any more)
     for tok in ("evt_mem", "evt_out", "g_time", "prev_undelayed", "EVT_DEPTH", "GTIME_WIDTH"):
         assert tok in engine, tok
     assert "ttl_sr" not in engine                                 # the old per-tick SRL lines are GONE
-    assert "bus_ring" in engine
-    assert "del_wptr" in engine and "del_ch_ticks" in engine and "del_bus_ticks" in engine
-    assert 'ram_style = "distributed"' in engine                  # the bus ring is LUTRAM, NOT BRAM
+    assert "g_busdly" in engine                                   # per-DA-bit event scheduler
+    assert "del_ch_ticks" in engine and "del_bus_ticks" in engine
+    assert 'ram_style = "distributed"' in engine                  # the event FIFOs are LUTRAM, NOT BRAM
     # the per-channel output-delay merge: out = (state_mask & ~delayed_mask) | delayed_out
     assert "(state_mask & ~delayed_mask) | delayed_out" in engine
-    # TTL delays ride the 32b/channel DELAY register region; bus delays stay in CTRL words
+    # BOTH TTL and DAC delays ride the 32b-per-signal R_DELAY register region
     assert "R_DELAY_BASE" in top and "delay_reg" in top and "sel_delay" in top
     assert "delay_ticks" in top and "bus_delay_ticks" in top
-    assert "C_BUS_DELAY_TICKS" in top
     assert "set top zlc_pulse_streamer_top" in program_tcl
     assert "ps.runs" in program_tcl
     assert "pulse_streamer.runs" not in program_tcl
@@ -1287,7 +1285,7 @@ def test_top_has_per_channel_clk_mux():
     assert "assign da_clk0 = out_final[28]" in top
     # the CTRL offset lines up with the host image layout
     from fpga.pulse_streamer.host.image import CtrlWords
-    assert CtrlWords.CLK_ENABLE == 46
+    assert CtrlWords.CLK_ENABLE == 20
 
 
 def test_build_input_files_are_utf8():
@@ -3018,17 +3016,16 @@ def test_compile_scan_clamps_dac_codes_to_bus_width():
     assert codes == [0, 624, 1023]
 
 
-def test_delay_depth_constants_agree_across_layers():
-    """Delay bounds must be ONE number per kind across the timing model, the device
-    validator and the fpga host: TTL channel delays are bounded by the 32-bit event-
-    scheduler field; DAC BUS delays keep the 2048-tick ring depth."""
+def test_delay_cap_constants_agree_across_layers():
+    """The OUTPUT delay cap is ONE number across the timing model, the device validator
+    and the fpga host: the 32-bit event-scheduler field, the SAME for TTL channels and
+    DAC buses (no per-design ring depth any more)."""
 
-    from Zou_lab_control.neutral_atom.timing.pulse_table import DELAY_DEPTH_TICKS, BUS_DELAY_DEPTH_TICKS
+    from Zou_lab_control.neutral_atom.timing.pulse_table import DELAY_MAX_TICKS
     from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import (
-        DEFAULT_DELAY_DEPTH, TTL_DELAY_MAX_TICKS, EVT_FIFO_DEPTH)
+        TTL_DELAY_MAX_TICKS, EVT_FIFO_DEPTH)
 
-    assert DELAY_DEPTH_TICKS == TTL_DELAY_MAX_TICKS == (1 << 31) - 1
-    assert BUS_DELAY_DEPTH_TICKS == DEFAULT_DELAY_DEPTH == 2048
+    assert DELAY_MAX_TICKS == TTL_DELAY_MAX_TICKS == (1 << 31) - 1
     assert EVT_FIFO_DEPTH == 128
     try:
         import importlib.util as _ilu
@@ -3040,7 +3037,6 @@ def test_delay_depth_constants_agree_across_layers():
         im = _ilu.module_from_spec(spec)
         spec.loader.exec_module(im)
         params = im.StreamerParams()
-        assert params.delay_depth == BUS_DELAY_DEPTH_TICKS
         assert params.ttl_delay_max_ticks == TTL_DELAY_MAX_TICKS
         assert params.evt_fifo_depth == EVT_FIFO_DEPTH
     except Exception:  # pragma: no cover - host tooling import is environment-dependent
@@ -3110,7 +3106,7 @@ def test_axi_session_self_test_catches_scrambled_burst(tmp_path):
 def test_axi_self_test_scratch_sits_above_all_defined_ctrl_words(tmp_path):
     """HARDWARE REGRESSION: the self-test used a stale hard-coded scratch base of 32 --
     'above all CtrlWords' when the highest was 19 -- but the delay redesign later defined
-    words 20..43 (DELAY_TICKS), 44..45 (BUS_DELAY_TICKS) and 46..47 (CLK_ENABLE).  At
+    word 20..21 (CLK_ENABLE).  At
     run_server bring-up the 0xC0DE.. test burst landed in CLK_ENABLE and clk-enabled
     random channels: their pins ran at 50 MHz before any on_pulse, and off_pulse
     (CMD_SAFE only, no config rewrite) could not clear it.  Lock: the scratch base is
@@ -3121,7 +3117,7 @@ def test_axi_self_test_scratch_sits_above_all_defined_ctrl_words(tmp_path):
     from fpga.pulse_streamer.host.image import CTRL_WORDS, CtrlWords, default_params
 
     p = default_params()
-    assert p.ctrl_scratch_base == CtrlWords.CLK_ENABLE + p.clk_enable_words == 48
+    assert p.ctrl_scratch_base == CtrlWords.CLK_ENABLE + p.clk_enable_words == 22
     assert p.ctrl_scratch_base + 2 <= CTRL_WORDS
 
     class Hw:
@@ -3139,16 +3135,16 @@ def test_axi_self_test_scratch_sits_above_all_defined_ctrl_words(tmp_path):
     hw = Hw()
     session = VivadoAxiStreamerSession(state_dir=tmp_path, tcl_executor=hw)
     assert session.axi_self_test() is True
-    # every word it touched is at/above the scratch base -- delays/CLK_ENABLE untouched
-    assert hw.bram and min(hw.bram) >= 48 and max(hw.bram) < CTRL_WORDS
-    assert 46 not in hw.bram and 47 not in hw.bram
+    # every word it touched is at/above the scratch base -- CLK_ENABLE untouched
+    assert hw.bram and min(hw.bram) >= 22 and max(hw.bram) < CTRL_WORDS
+    assert 20 not in hw.bram and 21 not in hw.bram
     # and the register file is left as found: all scratch words zeroed
     assert all(v == 0 for v in hw.bram.values())
 
 
 def test_clear_host_config_zeroes_delays_and_clk_mask(tmp_path):
     """Server bring-up self-heal: clear_host_config() must zero EVERY host-owned config
-    word (per-channel delays 20..43, per-bus delays 44..45, CLK mask 46..47) and halt
+    word (the CLK mask 20..21) and halt
     (CMD_SAFE) -- so a board polluted by the historic self-test bug (or any leftover
     clk_en bit driving a pin at 50 MHz) recovers on server restart, no on_pulse needed."""
 
@@ -3158,7 +3154,7 @@ def test_clear_host_config_zeroes_delays_and_clk_mask(tmp_path):
     class Hw:
         def __init__(self):
             # a polluted board: 0xC0DE.. sitting in delay + CLK_ENABLE words
-            self.bram = {25: 0xC0DE0007, 44: 0xC0DE000C, 46: 0xC0DE000E, 47: 0xC0DE000F}
+            self.bram = {20: 0xC0DE000E, 21: 0xC0DE000F}
         def __call__(self, lines, action, timeout):
             text = "\n".join(lines)
             for w, v in _decode_axi_writes(text):
@@ -3172,7 +3168,7 @@ def test_clear_host_config_zeroes_delays_and_clk_mask(tmp_path):
     session = VivadoAxiStreamerSession(state_dir=tmp_path, tcl_executor=hw)
     session.clear_host_config()
     p = session.params
-    for word in range(CtrlWords.DELAY_TICKS, p.ctrl_scratch_base):
+    for word in range(CtrlWords.CLK_ENABLE, p.ctrl_scratch_base):
         assert hw.bram.get(word, 0) == 0, f"ctrl word {word} not cleared"
     assert hw.bram.get(CtrlWords.COMMAND) == CMD_SAFE   # engine halted afterwards
 
@@ -4619,14 +4615,14 @@ def test_rtl_delay_line_mirror_matches_physical_delay():
     tick, read the slot d ticks ago) -- engine_model.rtl_delay_line_mirror.  It must equal the
     EXACT delay_line_reference (out[t]=in[t-d], 0 before fire) for:
       * d = 0 (EXACT passthrough);
-      * d up to DELAY_DEPTH (the bounded buffer depth -- d == DELAY_DEPTH must be representable);
+      * d up to a few thousand ticks (a representative bounded delay);
       * SEVERAL independent TTL channels delayed at once (a delay never disturbs another channel);
       * the +/-15 us range (750 ticks at 20 ns).
-    Plus the bounded-cap rejection: d > DELAY_DEPTH raises a CLEAR DelayDepthExceeded error."""
+    Plus the cap rejection: d > the 32-bit field raises a CLEAR DelayTooLargeError."""
     from fpga.pulse_streamer.host import engine_model as em
     import random, pytest
 
-    depth = em.DELAY_DEPTH
+    depth = 2048   # a representative bounded delay for the sweep (no design ring cap any more)
     rng = random.Random(20260608)
 
     # hand cases: d=0 passthrough, several independent channels, the +/-15us range, d==depth.
@@ -4654,9 +4650,9 @@ def test_rtl_delay_line_mirror_matches_physical_delay():
         assert em.rtl_delay_line_mirror(Uf, delays, evt_depth=10**9) == em.delay_line_reference(Uf, delays), (delays,)
 
     # TTL CAP: the event-scheduler bound is the 32-bit field; beyond it raises clearly.
-    with pytest.raises(em.DelayDepthExceeded):
+    with pytest.raises(em.DelayTooLargeError):
         em.rtl_delay_line_mirror([1] * 10, {0: em.TTL_DELAY_MAX_TICKS + 1})
-    # the OLD ring depth is no longer a TTL bound: depth+1 is fine now
+    # a delay past the old 2048 ring depth is fine now (event-scheduled)
     assert em.rtl_delay_line_mirror([1] * 10, {0: depth + 1}) == [0] * 10  # all pre-delay
 
 
@@ -4758,13 +4754,13 @@ def test_bus_delay_line_with_scanned_value_and_ramp():
     """The LITERAL per-bus delay line carries a SCANNED DAC value (value_select) and a RAMP
     through unchanged: the delayed bus stream (engine_model.rtl_bus_delay_line_mirror of the
     undelayed bus_value_at stream) == bus_delay_line_reference (the value stream literally
-    delayed by d, safe 0 before t==d) for d in [0, DELAY_DEPTH] including d > one frame, across
+    delayed by d, safe 0 before t==d) for d in [0, a few thousand] including d > one frame, across
     several scan points + ramps.  d=0 is exact passthrough; the scanned code reaches the output."""
     from fpga.pulse_streamer.host import engine_model as em
     import random
     rng = random.Random(424242)
 
-    depth = em.DELAY_DEPTH
+    depth = 2048   # a representative bounded delay (no design ring cap any more)
     # (T, d): sub-frame, across a frame, zero, far-above a frame, and at the bounded depth.
     battery = [(60, 30), (100, 350), (200, 1000), (50, 0), (100, 1500), (256, depth)]
     for T, d in battery:
@@ -4830,7 +4826,7 @@ def test_scanned_dac_value_delayed_beyond_one_frame_compiles_and_streams():
                  na.PulsePeriod(200, tuple([0] * 12), unit="ns"),
                  na.PulsePeriod(100, tuple([0] * 12), unit="ns")],
         # delay the DAC bus by 1000 ns = 50 ticks; the frame is (100+200+100)/20 = 20 ticks,
-        # so the delay is 2.5 frames -- still fine (the circular buffer is depth DELAY_DEPTH).
+        # so the delay is 2.5 frames -- still fine (event-scheduled, 32-bit delay field).
         delays={f"ch{i:02d}": 1000 for i in range(10)},
         delay_units={f"ch{i:02d}": "ns" for i in range(10)})
     state.bind_field("dac", "da@1")
@@ -4897,7 +4893,7 @@ def test_edge_streamer_has_literal_delay_line_path():
           event FIFO instantiated in the g_evtfifo generate loop (a flat 3D reg array with
           independent per-slot pointers does NOT infer as RAM -> 226k FF, does not fit), plus
           the free-running g_time + prev_undelayed register for d==1.  SRL lines are GONE;
-      (2) DAC = the per-bus LUTRAM ring with write pointer + fill counter (ring-capped);
+      (2) DAC = the per-DA-bit event FIFO (g_busdly), one delay shared by the bus's bits;
       (3) the disjoint merge out = (state_mask & ~delayed_mask) | delayed_out;
       (4) the top has the 32b/channel DELAY register region wired to the engine."""
     import pathlib
@@ -4917,8 +4913,7 @@ def test_edge_streamer_has_literal_delay_line_path():
     assert "reg [GTIME_WIDTH:0] evt_mem" not in eng
     assert "evt_mem [" not in eng
     # (2) bus ring + pointers + held delays
-    for tok in ("bus_ring", "del_wptr", "del_fill", "del_ch_ticks", "del_bus_ticks",
-                "DELAY_DEPTH", "DELAY_SLOTS"):
+    for tok in ("g_busdly", "del_ch_ticks", "del_bus_ticks", "BUS_EVT_DEPTH", "bfifo"):
         assert tok in eng, tok
     assert 'ram_style = "distributed"' in eng
     # (3) the disjoint merge
@@ -4937,11 +4932,11 @@ def test_delay_line_bounded_cap_rejected_clearly():
     with a clear message."""
     import pytest
     from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import (
-        validate_pulse_streamer_program, DEFAULT_DELAY_DEPTH, TTL_DELAY_MAX_TICKS, EVT_FIFO_DEPTH)
+        validate_pulse_streamer_program, TTL_DELAY_MAX_TICKS, EVT_FIFO_DEPTH)
     from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram, RuntimeBusDelay
     from fpga.pulse_streamer.host import image as img
 
-    depth = DEFAULT_DELAY_DEPTH
+    depth = 2048   # the old ring depth, now just a representative 'big' delay
     chans = [f"ch{i:02d}" for i in range(62)]
 
     def prog(cd=None, bus_delays=None, ticks=(0, 10), masks=(0, 0)):
@@ -5228,7 +5223,6 @@ def test_build_geometry_driven_from_config_via_generics():
     # the generics carry the freely-resizable depths and match the config
     names = {g.split("=")[0]: int(g.split("=")[1]) for g in generics}
     assert names["EVT_FIFO_DEPTH"] == params.evt_fifo_depth
-    assert names["DELAY_DEPTH"] == params.delay_depth
     assert names["BANK_SIZE"] == params.bank_size
     assert names["EDGE_ADDR_WIDTH"] == params.edge_addr_width
     # EVERY generic must be an actual top-module parameter (or Vivado ignores it silently)
@@ -5251,7 +5245,7 @@ def test_build_geometry_driven_from_config_via_generics():
 def test_no_delay_image_or_membership_residue():
     """Grep guard: the LITERAL delay line leaves NO membership / interval / skip / off / delay-image
     residue anywhere (RTL, host, top, tcl).  The only delay machinery is the bounded circular
-    buffer (DELAY_DEPTH) + the dense CTRL words."""
+    event scheduler (per-signal event FIFOs) in the R_DELAY register region."""
     import pathlib
     root = pathlib.Path(__file__).resolve().parents[1]
     eng = (root / "fpga" / "pulse_streamer" / "zlc_edge_streamer.v").read_text(encoding="utf-8")
@@ -5736,12 +5730,11 @@ def test_streamer_config_is_single_source_for_host_geometry():
     cfg = im.load_streamer_config()
     p = cfg["params"]
     assert cfg["warnings"] == []                      # the shipped config file loads cleanly
-    assert (p.max_edges, p.bank_size, p.delay_depth) == (4096, 2048, 2048)
+    assert (p.max_edges, p.bank_size) == (4096, 2048)
     assert (p.channel_count, p.num_slots, p.bus_count, p.bus_width) == (62, 4, 4, 10)
 
     from Zou_lab_control.neutral_atom.devices import fpga_pulse_streamer as fps
     assert fps.DEFAULT_MAX_EDGES == p.max_edges
-    assert fps.DEFAULT_DELAY_DEPTH == p.delay_depth
     assert fps.DEFAULT_NUM_SLOTS == p.num_slots
     assert fps.DEFAULT_BUS_WIDTH == p.bus_width
     assert fps.DEFAULT_FPGA_CHANNEL_COUNT == p.channel_count
@@ -6448,7 +6441,7 @@ def test_period_name_round_trips_and_survives_transforms():
 def test_no_delay_image_or_membership_residue():
     """Grep guard: the LITERAL delay line leaves NO membership / interval / skip / off / delay-image
     residue anywhere (RTL, host, top, tcl).  The only delay machinery is the bounded circular
-    buffer (DELAY_DEPTH) + the dense CTRL words."""
+    event scheduler (per-signal event FIFOs) in the R_DELAY register region."""
     import pathlib
     root = pathlib.Path(__file__).resolve().parents[1]
     eng = (root / "fpga" / "pulse_streamer" / "zlc_edge_streamer.v").read_text(encoding="utf-8")
@@ -6933,12 +6926,11 @@ def test_streamer_config_is_single_source_for_host_geometry():
     cfg = im.load_streamer_config()
     p = cfg["params"]
     assert cfg["warnings"] == []                      # the shipped config file loads cleanly
-    assert (p.max_edges, p.bank_size, p.delay_depth) == (4096, 2048, 2048)
+    assert (p.max_edges, p.bank_size) == (4096, 2048)
     assert (p.channel_count, p.num_slots, p.bus_count, p.bus_width) == (62, 4, 4, 10)
 
     from Zou_lab_control.neutral_atom.devices import fpga_pulse_streamer as fps
     assert fps.DEFAULT_MAX_EDGES == p.max_edges
-    assert fps.DEFAULT_DELAY_DEPTH == p.delay_depth
     assert fps.DEFAULT_NUM_SLOTS == p.num_slots
     assert fps.DEFAULT_BUS_WIDTH == p.bus_width
     assert fps.DEFAULT_FPGA_CHANNEL_COUNT == p.channel_count

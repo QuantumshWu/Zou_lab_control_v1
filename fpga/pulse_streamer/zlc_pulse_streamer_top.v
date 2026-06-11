@@ -54,7 +54,6 @@ module zlc_pulse_streamer_top #(
     parameter integer BUS_WIDTH = 10,
     parameter integer BUS_SEG_ADDR_WIDTH = 6,
     parameter integer BUS_SEL_WIDTH = 3,
-    parameter integer DELAY_DEPTH = 2048,       // (legacy) -- DAC delay is now event-scheduled, not a ring
     parameter integer EVT_FIFO_DEPTH = 128,     // TTL delay event FIFO depth (in-flight edges per
                                                 // channel; keep = streamer_config.json evt_fifo_depth)
     parameter integer BUS_EVT_FIFO_DEPTH = 64   // per-DA-bit delay FIFO depth (40 of them, so shallower
@@ -89,13 +88,10 @@ module zlc_pulse_streamer_top #(
     localparam integer MAX_BUS_SEGMENTS = (1 << BUS_SEG_ADDR_WIDTH);
     localparam integer BUS_ROWS = BUS_COUNT * MAX_BUS_SEGMENTS;
     localparam integer BUS_WORDS = 2 + 2 * ((COEFF_BITS + 31) / 32) + 1;   // 7
-    // LITERAL delay line: a distributed-RAM circular buffer, depth DELAY_DEPTH+1.  DELAY_TICK_WIDTH
-    // holds a delay in [0, DELAY_DEPTH]; the delays ride DENSE CTRL words (no BRAM image).
-    localparam integer DELAY_TICK_WIDTH = $clog2(DELAY_DEPTH + 1);         // 12 for 2048
 
     // --- word-address region bases (== host.image.region_bases) ---------------
-    // The LITERAL OUTPUT delay line carries its delays in DENSE CTRL words (DELAY_TICKS /
-    // BUS_DELAY_TICKS) -- there is NO delay BRAM image / region, so the last region is the bus image.
+    // Per-signal OUTPUT delays live in the R_DELAY register region (one 32-bit word each), NOT
+    // in CTRL and NOT in a BRAM image, so the last region before R_DELAY is the bus image.
     localparam integer R_CTRL_BASE = 0;
     localparam integer R_CTRL_WORDS = 64;
     localparam integer R_TICK_BASE  = R_CTRL_BASE + R_CTRL_WORDS;
@@ -103,10 +99,9 @@ module zlc_pulse_streamer_top #(
     localparam integer R_MASK_BASE  = R_COEFF_BASE + MAX_EDGES * COEFF_WORDS;
     localparam integer R_SCAN_BASE  = R_MASK_BASE  + MAX_EDGES * MASK_WORDS;
     localparam integer R_BUS_BASE   = R_SCAN_BASE  + SCAN_DEPTH * SCAN_WORDS;
-    // TTL DELAY register region: ONE 32-bit word per channel (the event-scheduler
-    // delays outgrew the dense 12-bit CTRL fields; the old CTRL DELAY_TICKS words
-    // 20..43 are now reserved/unused).  64 words of headroom regardless of channel
-    // count so the layout is stable across configs.
+    // DELAY register region: ONE 32-bit word per delay-eligible signal (channels then buses),
+    // the event-scheduler delay in ticks.  128 words of headroom regardless of channel count
+    // so the layout is stable across configs.
     localparam integer R_DELAY_BASE  = R_BUS_BASE   + BUS_ROWS * BUS_WORDS;
     localparam integer R_DELAY_WORDS = 128;   // >= CHANNEL_COUNT + BUS_COUNT, headroom; 7-bit index
     localparam integer R_TOTAL_WORDS = R_DELAY_BASE + R_DELAY_WORDS;
@@ -133,19 +128,11 @@ module zlc_pulse_streamer_top #(
     localparam integer C_BANK1_CHUNK = 18;  // host -> engine: sweep chunk resident in bank 1
     localparam integer C_REPEAT_FROM_LOOP_START = 19;  // repeat_forever rewinds to LOOP_START
                                                        // (additive-delay steady frame), not edge 0
-    // --- LITERAL delay line: DENSE per-channel / per-bus delay tick counts in CTRL words.
-    // DELAY_TICKS    = CHANNEL_COUNT * DELAY_TICK_WIDTH bits (62*12 = 744) -> ceil/32 = 24 words
-    // BUS_DELAY_TICKS= BUS_COUNT * DELAY_TICK_WIDTH bits     (4*12 = 48)   -> ceil/32 = 2 words
-    localparam integer DELAY_TICKS_BITS      = CHANNEL_COUNT * DELAY_TICK_WIDTH;   // 744
-    localparam integer DELAY_TICKS_WORDS     = (DELAY_TICKS_BITS + 31) / 32;       // 24
-    localparam integer BUS_DELAY_TICKS_BITS  = BUS_COUNT * DELAY_TICK_WIDTH;       // 48
-    localparam integer BUS_DELAY_TICKS_WORDS = (BUS_DELAY_TICKS_BITS + 31) / 32;   // 2
-    localparam integer C_DELAY_TICKS = 20;                               // dense per-channel d (24 words: 20..43)
-    localparam integer C_BUS_DELAY_TICKS = C_DELAY_TICKS + DELAY_TICKS_WORDS;  // 44: dense per-bus d (2 words: 44..45)
     // --- per-channel CLK mask: bit b drives channel b's PIN from the FPGA clk
-    // (== host.image.CtrlWords.CLK_ENABLE).  CHANNEL_COUNT bits -> ceil/32 words.
+    // (== host.image.CtrlWords.CLK_ENABLE).  Sits right after the command words: there are NO
+    // dense delay-tick CTRL words any more (TTL+DAC delays live in the R_DELAY region).
     localparam integer CLK_ENABLE_WORDS = (CHANNEL_COUNT + 31) / 32;            // 2
-    localparam integer C_CLK_ENABLE = C_BUS_DELAY_TICKS + BUS_DELAY_TICKS_WORDS; // 46: per-channel clk mask (2 words: 46..47)
+    localparam integer C_CLK_ENABLE = C_REPEAT_FROM_LOOP_START + 1;             // 20: per-channel clk mask (2 words: 20..21)
 
     // engine outputs
     wire [CHANNEL_COUNT-1:0] out;
@@ -499,7 +486,6 @@ module zlc_pulse_streamer_top #(
         .TICK_WIDTH(TICK_WIDTH), .NUM_SLOTS(NUM_SLOTS), .COEFF_WIDTH(COEFF_WIDTH), .COEFF_FRAC_BITS(COEFF_FRAC_BITS),
         .BUS_COUNT(BUS_COUNT), .BUS_INDEX_WIDTH(BUS_INDEX_WIDTH), .BUS_WIDTH(BUS_WIDTH),
         .BUS_SEG_ADDR_WIDTH(BUS_SEG_ADDR_WIDTH), .BUS_SEL_WIDTH(BUS_SEL_WIDTH),
-        .DELAY_DEPTH(DELAY_DEPTH),
         // EVT_DEPTH = per-channel delay event FIFO depth (in-flight edges).  MUST match
         // evt_fifo_depth in fpga/board_config/streamer_config.json -- the host
         // validator rejects programs that would overflow this depth.

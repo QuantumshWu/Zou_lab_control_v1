@@ -502,7 +502,7 @@ class VivadoAxiStreamerSession:
         the program image anyway; this only guarantees the idle state."""
 
         ctrl_base = region_bases(self.params)["ctrl"]
-        for word in range(CtrlWords.DELAY_TICKS, self.params.ctrl_scratch_base):
+        for word in range(CtrlWords.CLK_ENABLE, self.params.ctrl_scratch_base):
             self._queue_word(ctrl_base + word, 0)
         self._flush()
         self._command(CMD_SAFE)

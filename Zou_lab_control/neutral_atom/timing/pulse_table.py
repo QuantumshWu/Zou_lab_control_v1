@@ -60,19 +60,12 @@ def bus_signed_range(n_bits: int) -> tuple[int, int]:
     half = bus_zero_code(n_bits)
     return (-half, half - 1)
 
-#: LITERAL output delay-line depth, in clock ticks.  A per-channel (TTL) or per-bus
-#: (DAC) delay ``d`` is realized as ``output[t] = undelayed[t-d]`` by a hardware
-#: delay line bounded to this many ticks.  This is the single timing-layer source of
-#: truth for the cap; it MUST match ``DEFAULT_DELAY_DEPTH`` (devices.fpga_pulse_streamer),
-#: ``DELAY_DEPTH`` (fpga host engine_model / image) and the RTL ``DELAY_DEPTH`` localparam.
-#: A contract test asserts they agree.  At the default 20 ns tick this is ~40.96 us,
-#: which covers the user's +/-15 us range with headroom for the negative-delay global
-#: shift G (the GUI clamps each |delay| <= this; the compiler rejects anything past it).
-# TTL channel-delay bound: the event-scheduler delay field is 32 bits (~42.9 s at 20 ns).
-# (DELAY_DEPTH_TICKS used to be the 2048-tick ring depth; the per-channel TTL delay is no
-# longer ring-buffered -- only the DAC BUS delays keep the 2048-tick ring cap.)
-DELAY_DEPTH_TICKS = (1 << 31) - 1
-BUS_DELAY_DEPTH_TICKS = 2048
+#: OUTPUT delay magnitude cap, in clock ticks.  A per-channel (TTL) OR per-bus (DAC) delay
+#: ``d`` is realized as ``output[t] = undelayed[t-d]`` by a per-signal EVENT SCHEDULER; the
+#: cap is the 32-bit delay field (~42.9 s at 20 ns), the SAME for channels and buses.  The
+#: GUI clamps each |delay| <= this; the real working limit is toggles IN FLIGHT (the
+#: event-FIFO depth), which the compiler checks and reports.
+DELAY_MAX_TICKS = (1 << 31) - 1
 
 #: Scan-slot kinds.  ``duration`` binds a period duration, ``delay`` binds a
 #: channel delay, ``dac`` binds one analog-bus value in one period.
@@ -1207,9 +1200,9 @@ class PulseTableState:
             )
             for channel, value in copy.delays.items()
         }
-        # A per-channel delay past +/- DELAY_DEPTH_TICKS can never be realized; do NOT
+        # A per-channel delay past +/- DELAY_MAX_TICKS can never be realized; do NOT
         # silently clamp it here (that would corrupt the physics) -- the GUI clamps the
-        # input field, and the compiler raises a clear DelayDepthExceeded at validate.
+        # input field, and the compiler raises a clear DelayTooLargeError at validate.
         copy.scan_table = snap_scan_table(
             copy.scan_table, copy.scan_slots, time_step_ns=step, dac_ranges=copy.scan_slot_dac_ranges()
         )

@@ -30,7 +30,6 @@
     "bus_seg_addr_width": 6,
     "bus_sel_width": 3,
     "slot_mul_width": 25,
-    "delay_depth": 2048,
     "evt_fifo_depth": 128,
     "bus_evt_fifo_depth": 64
   }

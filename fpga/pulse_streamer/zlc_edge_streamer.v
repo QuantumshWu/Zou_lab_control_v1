@@ -39,17 +39,12 @@
 // Edge fields are 3 PARALLEL BRAMs read in lockstep (tick / coeffs / mask) so a
 // whole edge arrives per access with no width padding; scan is one BRAM.
 //
-// OUTPUT DELAY -- a LITERAL delay line:
-//   * TTL: a per-channel EVENT SCHEDULER -- when the undelayed bit toggles at tick t the
-//     engine pushes {t + d_ch - 1, level} into that channel's small event FIFO and pops it
-//     against a free-running global counter, so out_delayed[t] = out_undelayed[t-d] with the
-//     storage scaling in TOGGLES IN FLIGHT (<= EVT_DEPTH, host-validated), not delay length:
-//     delays up to TTL_DELAY_WIDTH (32b, ~85.9 s) at ~2k LUTs for all 62 channels (the old
-//     per-tick SRL lines cost ~4.1k LUTs and capped d at DELAY_DEPTH ~41 us).
-//   * DAC: ONE BUS_WIDTH(10)-wide ring per bus (a 2D word array Vivado DOES infer as 3D RAM; one
-//     delay shared by all 10 bits), read at (del_wptr - d_bus).
-//   d=0 is exact passthrough (the non-delayed bits/buses bypass the line entirely).  The
-//   delay is BOUNDED to DELAY_DEPTH ticks (~40 us @ 20 ns; the host validates d <= DELAY_DEPTH).
+// OUTPUT DELAY -- a per-signal EVENT SCHEDULER (TTL channels AND DAC bits, same mechanism):
+//   when the undelayed level toggles at tick t the engine pushes {t + d - 1, level} into that
+//   signal's small event FIFO and pops it against a free-running global counter, so
+//   out_delayed[t] = out_undelayed[t-d].  Storage scales with TOGGLES IN FLIGHT (TTL <= EVT_DEPTH,
+//   each DA bit <= BUS_EVT_DEPTH; host-validated), NOT with delay length: a delay can be up to
+//   the 32-bit TTL_DELAY_WIDTH field (~85.9 s).  d=0 is exact passthrough; d=1 is one register.
 //   Proven cycle-exact by engine_model.rtl_delay_line_mirror / rtl_bus_delay_line_mirror.
 // =============================================================================
 
@@ -73,8 +68,6 @@ module zlc_edge_streamer #(
     // power-up, reset/CMD_SAFE, FIRE re-init, the delayed-read gate before the ring fills,
     // and after done -- uses THIS mid-scale code so an idle DAC outputs 0 V, not -FS.
     parameter integer BUS_SAFE_VALUE = (1 << (BUS_WIDTH - 1)),
-    parameter integer DELAY_DEPTH = 2048,       // delay-line buffer depth in ticks (~40us @ 20ns);
-                                                // bounded cap, covers +/-15us after the global shift G
     parameter integer RD_LAT = 2,               // edge-BRAM read latency (forced)
     // The PREFETCH pipeline from `issue` to data-valid is RD_LAT + 1 (the extra cycle is
     // the registered `edge_raddr`: an issued read only reaches the BRAM address port the
@@ -85,11 +78,6 @@ module zlc_edge_streamer #(
     // word, and a streamed edge was dropped -- the emCCD "40 ms / e7 vanished" bug.)
     parameter integer FIFO_DEPTH = RD_LAT + 2,
     parameter integer ARM_SETTLE = 4,           // generous one-time arm read settle
-    // delay-tick field width; DECLARED HERE (not as a body localparam) so the port
-    // declarations below can use it.  A body localparam is referenced-before-declaration,
-    // which the Vivado synth frontend only warns about but STRICT tools (xsim, other FPGA
-    // flows) reject -- a portability hazard across "different FPGA" builds.
-    parameter integer DELAY_TICK_WIDTH = $clog2(DELAY_DEPTH + 1),
     // ----- TTL EVENT-SCHEDULER delay geometry ------------------------------------------
     // TTL channel delays are NO LONGER bounded by DELAY_DEPTH: each channel schedules its
     // output TOGGLES (time + level) in a small event FIFO against a free-running global
@@ -213,14 +201,6 @@ module zlc_edge_streamer #(
     localparam integer SLOT_MUL_WIDTH = 25;
     localparam integer BANK_BITS = $clog2(BANK_SIZE);
     localparam [1:0] BUS_MODE_RAMP = 2'd2;
-    // ----- LITERAL delay-line geometry --------------------------------------------------
-    // The ring has DELAY_DEPTH+1 slots so a delay of EXACTLY DELAY_DEPTH is representable (the
-    // slot written d ticks ago must not be the slot we overwrite this tick).  DELAY_TICK_WIDTH
-    // holds a delay in [0, DELAY_DEPTH]; DELAY_ADDR_WIDTH indexes the ring.
-    localparam integer DELAY_SLOTS = DELAY_DEPTH + 1;
-    localparam integer DELAY_ADDR_WIDTH = $clog2(DELAY_SLOTS);
-    // DELAY_TICK_WIDTH is now a module parameter (declared before the ports) so the port
-    // widths can use it without a referenced-before-declaration error on strict tools.
 
     // ----- bus segment tables: LUTRAM (per-tick combinatorial read) -----------
     (* ram_style = "distributed" *) reg [TICK_WIDTH-1:0] bus_start_tick_mem [0:MAX_BUS_SEGMENT_ROWS-1];
