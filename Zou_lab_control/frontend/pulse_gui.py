@@ -1604,9 +1604,9 @@ class ChannelPanel(FluentGroupBox):
             edit.set_resolution(_unit_resolution(self.state.time_step_ns, unit))
 
     def _clamp_delay_edit(self, channel: str, edit: FluentLineEdit) -> None:
-        """Clamp a finished delay entry to its physical magnitude cap: the 32-bit field
-        for a real TTL channel, or the 2048-tick output ring for a DAC bus.  A larger
-        delay can never be realized.  The compiler still raises a clear error if the
+        """Clamp a finished delay entry to its physical magnitude cap: the 32-bit delay
+        field (the same for a real TTL channel and a DAC bus -- both event-scheduled).  A
+        larger delay can never be realized.  The compiler still raises a clear error if the
         *span* / in-flight count exceeds the limit after the global shift."""
 
         text = edit.text().strip()
@@ -1619,8 +1619,8 @@ class ChannelPanel(FluentGroupBox):
         unit_combo = self.delay_units.get(channel)
         unit_text = unit_combo.currentText() if unit_combo is not None else "ns"
         factor = UNIT_TO_NS.get(unit_text, 1.0) or 1.0
-        # TTL and DAC-bus delays are now both event-scheduled with the SAME 32-bit range, so the
-        # magnitude cap is identical for channels and buses (the old 2048-tick bus ring is gone).
+        # TTL and DAC-bus delays are both event-scheduled with the SAME 32-bit range, so the
+        # magnitude cap is identical for channels and buses.
         max_ns = DELAY_MAX_TICKS * float(self.state.time_step_ns)
         value_ns = value * factor
         if abs(value_ns) > max_ns + 1e-6:

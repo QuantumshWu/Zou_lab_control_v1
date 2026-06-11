@@ -455,14 +455,13 @@ class VivadoAxiStreamerSession:
         still-AXI4-Lite bitstream that ignores ``-len``) -- BEFORE any real pulse upload.
 
         The scratch words sit ABOVE every defined CTRL word -- the highest is the top
-        CLK_ENABLE word (params.ctrl_scratch_base - 1; commands 0..19, then DELAY_TICKS /
-        BUS_DELAY_TICKS / CLK_ENABLE) -- so writing them has NO side effect: no COMMAND,
-        no delay, and critically no CLK_ENABLE bit is touched (a clk_en bit set here
+        CLK_ENABLE word (params.ctrl_scratch_base - 1; commands 0..19, then the CLK_ENABLE
+        mask -- there are no delay-tick CTRL words) -- so writing them has NO side effect:
+        no COMMAND, and critically no CLK_ENABLE bit is touched (a clk_en bit set here
         would drive that channel's pin at 50 MHz until the next prepare).  HARDWARE
-        REGRESSION GUARD: a stale hard-coded scratch=32 used to land inside the
-        later-added delay/CLK_ENABLE words and clk-enabled random channels at server
-        bring-up.  The scratch is zeroed afterwards.  Returns True on success; raises
-        on mismatch."""
+        REGRESSION GUARD: a stale hard-coded scratch=32 used to land inside CTRL words
+        and clk-enabled random channels at server bring-up.  The scratch is zeroed
+        afterwards.  Returns True on success; raises on mismatch."""
 
         from fpga.pulse_streamer.host.image import CTRL_WORDS
 

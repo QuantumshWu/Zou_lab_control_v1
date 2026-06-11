@@ -79,7 +79,7 @@ module zlc_edge_streamer #(
     parameter integer FIFO_DEPTH = RD_LAT + 2,
     parameter integer ARM_SETTLE = 4,           // generous one-time arm read settle
     // ----- TTL EVENT-SCHEDULER delay geometry ------------------------------------------
-    // TTL channel delays are NO LONGER bounded by DELAY_DEPTH: each channel schedules its
+    // TTL channel delays are NOT bounded by a fixed delay-line depth: each channel schedules its
     // output TOGGLES (time + level) in a small event FIFO against a free-running global
     // tick counter, so the storage scales with the number of IN-FLIGHT TOGGLES (validated
     // <= EVT_DEPTH by the host), not with the delay length.  TTL_DELAY_WIDTH bounds one
@@ -155,28 +155,32 @@ module zlc_edge_streamer #(
     input  wire [BUS_SEL_WIDTH-1:0] bus_prog_stop_value_select,
     input  wire [BUS_COUNT*(BUS_SEG_ADDR_WIDTH+1)-1:0] bus_counts,
 
-    // PHYSICAL per-bus DAC DELAY -- a LITERAL per-bus delay line (a 10-bit-wide circular buffer
-    // of depth DELAY_DEPTH).  The DAC value stream is NOT baked into the segment ticks: each
-    // tick the engine's UNDELAYED bus value (bus_value_active) is pushed into the ring, and the
-    // delayed bus value = the value pushed d_bus ticks ago (one delay shared by all 10 bits).
-    // d=0 is exact passthrough; before the buffer fills (t<d) the read slot is still its FIRE-time
-    // 0 -> the bus is silent until t>=d, for free.  Bounded: d <= DELAY_DEPTH (validated by the
-    // host).  Proven == engine_model.rtl_bus_delay_line_mirror == bus_delay_line_reference.
+    // PHYSICAL per-bus DAC DELAY -- EVENT-SCHEDULED (see the g_busdly generate below): each DA
+    // BIT is its own 1-bit event-scheduler channel.  The DAC value stream is NOT baked into the
+    // segment ticks; when the engine's UNDELAYED bus value (bus_value_active) changes, the new
+    // level of each bit is queued at {g_time + d_bus - 1} in that bit's event FIFO and pops into
+    // the output exactly d_bus ticks later -> bus_out[t] = bus_undelayed[t - d_bus].  The 10 bits
+    // of a bus SHARE one d (del_bus_ticks[bus]) so the DAC value shifts coherently.  d=0 is exact
+    // passthrough; before the first queued event the gated output holds its FIRE-time 0 -> the bus
+    // is silent until t>=d, for free.  Storage scales with VALUE-CHANGE EVENTS IN FLIGHT (host-
+    // validated <= BUS_EVT_DEPTH), NOT with d, so d shares the TTL TTL_DELAY_WIDTH range.
+    // Proven == engine_model.rtl_bus_delay_line_mirror == bus_delay_line_reference.
     //   * bus_delay_ticks : per-bus delay d in ticks (0 = no delay = passthrough)
     input  wire [BUS_COUNT*TTL_DELAY_WIDTH-1:0] bus_delay_ticks,
 
-    // PHYSICAL per-channel OUTPUT DELAY -- a LITERAL delay line (a per-channel variable-tap SHIFT
-    // REGISTER of depth DELAY_DEPTH, the SRL primitive).  A channel delay is NOT baked into the
-    // edges -- it is applied to the engine OUTPUT: out_delayed[t] = out_undelayed[t - d], 0 before
-    // fire.  Each running tick the channel's undelayed bit is shifted into its OWN shift register;
-    // the value pushed d_ch ticks ago is the tap at index d_ch-1, so ALL 62 channels are
-    // independently delayable.  d=0 is exact passthrough; before the SR fills (t<d) the gated tap
-    // returns its FIRE-time 0 -> the channel is silent until t>=d, for free.
-    // Bounded: d <= DELAY_DEPTH (validated by the host).  Proven == engine_model.
-    // rtl_delay_line_mirror == delay_line_reference for ANY d in [0, DELAY_DEPTH], zero, and --
-    // via the host's folded global shift G -- negative.
+    // PHYSICAL per-channel OUTPUT DELAY -- EVENT-SCHEDULED (see the g_evtfifo generate below).
+    // A channel delay is NOT baked into the edges -- it is applied to the engine OUTPUT:
+    // out_delayed[t] = out_undelayed[t - d], 0 before fire.  When the channel's undelayed bit
+    // toggles at global tick t the engine queues {t + d_ch - 1, new_level} in that channel's
+    // EVT_DEPTH-deep event FIFO; the free-running g_time pops it so the level appears exactly at
+    // t + d_ch.  All 62 channels are independently delayable.  d=0 is exact passthrough; before
+    // the first event the gated output holds its FIRE-time 0 -> silent until t>=d, for free.
+    // Storage scales with TOGGLES IN FLIGHT (host-validated <= EVT_DEPTH), NOT with d, so the
+    // bound is TTL_DELAY_WIDTH (32b = ~85.9 s).  Proven == engine_model.rtl_delay_line_mirror ==
+    // delay_line_reference for ANY d (zero, positive, and -- via the host's folded global shift
+    // G -- negative).
     //   * delay_ticks : per-channel delay d in ticks (0 = no delay), one TTL_DELAY_WIDTH (32b)
-    //     slice per channel -- the event scheduler supports delays far beyond the bus ring depth
+    //     slice per channel
     input  wire [CHANNEL_COUNT*TTL_DELAY_WIDTH-1:0] delay_ticks,
 
     output wire [CHANNEL_COUNT-1:0] out,
@@ -297,19 +301,19 @@ module zlc_edge_streamer #(
     // counter instead of shifting one bit per tick, so the TTL delay bound is TTL_DELAY_WIDTH
     // (~85.9 s) at a fraction of the old SRL cost.
     // DAC: each DA BIT is now its OWN 1-bit EVENT-SCHEDULER channel, exactly like a TTL output
-    // (the old per-tick bus_ring is gone -- it capped d at the 2048-tick ring ~41 us and could not
-    // match the TTL 32-bit range, so a negative TTL delay's global shift G could push a bus past
-    // the ring and get rejected).  The 40 DA bits (BUS_COUNT*BUS_WIDTH) feed a parallel per-bit
-    // event scheduler (g_busdly below), each a 256-deep 49-bit LUTRAM FIFO; the 10 bits of a bus
+    // (the earlier per-tick delay buffer is gone -- it capped d at a fixed ring depth and could
+    // not match the TTL 32-bit range, so a negative TTL delay's global shift G could push a bus
+    // past that cap and get rejected).  The 40 DA bits (BUS_COUNT*BUS_WIDTH) feed a parallel per-
+    // bit event scheduler (g_busdly below), each a BUS_EVT_DEPTH-deep 49-bit LUTRAM FIFO; the 10 bits of a bus
     // SHARE the one per-bus d (del_bus_ticks[bus]), so the whole DAC value shifts coherently.
     // d_ch / d_bus are held CTRL (a delay is constant, never scanned), latched at FIRE; both are
     // now TTL_DELAY_WIDTH (32b) so TTL and DAC ranges MATCH and the global negative-shift is uniform.
     reg [TTL_DELAY_WIDTH-1:0]  del_ch_ticks  [0:CHANNEL_COUNT-1];  // per-channel d (0 = passthrough)
     reg [TTL_DELAY_WIDTH-1:0]  del_bus_ticks [0:BUS_COUNT-1];      // per-bus d, shared by the bus's 10 bits
-    // ----- TTL EVENT SCHEDULER (replaces the 62 per-channel SRL delay lines) -----------
-    // The old SRLs stored ONE BIT PER TICK of delay (DELAY_DEPTH=2048 -> 65 SRL32 + tap
-    // mux per channel = ~4.1k LUTs, delay capped at ~41 us).  A TTL waveform is toggle-
-    // sparse, so store the TOGGLES instead: when the engine's undelayed bit for channel
+    // ----- TTL EVENT SCHEDULER (replaces the old per-channel per-tick delay lines) ------
+    // The earlier delay line stored ONE BIT PER TICK of delay (a deep per-channel shift
+    // register + tap mux = thousands of LUTs, delay capped at the ring depth).  A TTL
+    // waveform is toggle-sparse, so store the TOGGLES instead: when the engine's undelayed bit for channel
     // ch flips at global tick t, push {t + d_ch - 1, new_level} into ch's EVT_DEPTH-deep
     // event FIFO; when the free-running g_time reaches the head's time, pop it into the
     // output register (visible the NEXT cycle -> level appears exactly at t + d_ch, i.e.
@@ -326,8 +330,8 @@ module zlc_edge_streamer #(
     // (EVT_DEPTH) distributed RAM is not paid for the bus-member bits.
     // Each slot is its OWN 2D distributed-RAM FIFO, instantiated in the g_evtfifo generate
     // loop near the runtime block below.  A single 3D reg array (evt_mem[slot][depth]) does
-    // NOT infer as distributed RAM here: every slot has an INDEPENDENT wr/rd pointer (unlike
-    // bus_ring, whose banks share one write pointer), so Vivado's 3D-RAM inference bails and
+    // NOT infer as distributed RAM here: every slot has an INDEPENDENT wr/rd pointer (a single
+    // shared write pointer would let it infer), so Vivado's 3D-RAM inference bails and
     // implements the whole array in flip-flops -- at EVT_DEPTH=256 that is 18*256*49 = 226k
     // FF + 256:1 read muxes and does not fit.  Per-slot 2D arrays each map to one simple-
     // dual-port LUTRAM (1 sync write @wr + 1 async read @rd).
@@ -807,11 +811,11 @@ module zlc_edge_streamer #(
     reg [SLOT_BITS-1:0] bnd_slots;
     reg [EDGE_ADDR_WIDTH:0] bnd_count;   // edge count to seed with: prog_count at FIRE,
                                           // active_count at the (committed) frame/scan seams
-    // LITERAL delay-line boundary work: push the undelayed state_mask / bus values into the
-    // rings and advance the write pointer.  Set on EVERY tick once the engine has fired (running
-    // OR done-but-emitting), so the ring shifts the WHOLE output stream -- exactly the post-play
-    // delay_line_reference shift.  No frame seam / skip counter -- a circular buffer needs none.
-    reg bnd_delay_advance;     // push state_mask + bus values into the rings this tick
+    // EVENT-SCHEDULER boundary work: keep g_time advancing so queued toggles / value-changes pop.
+    // Set on EVERY tick once the engine has fired (running OR done-but-emitting), so the
+    // schedulers delay the WHOLE output stream -- exactly the post-play delay_line_reference
+    // shift.  No frame seam / skip counter -- the event schedulers need none.
+    reg bnd_delay_advance;     // advance the event schedulers' free-running g_time this tick
 
     always @(posedge clk) begin
         reset_meta <= reset; reset_sync <= reset_meta;
@@ -910,10 +914,10 @@ module zlc_edge_streamer #(
             bnd_bus_tick = 1'b1; bnd_bus_reinit = 1'b1; bnd_seed = 1'b1;
         end else if (running) begin
             landed = pend[PIPE-1];   // data valid PIPE (=RD_LAT+1) cycles after issue
-            // every RUNNING output tick pushes the undelayed state_mask + bus values into the
-            // delay rings (the literal delay line); the ring read d ticks ago IS the delayed
-            // output.  A circular buffer needs no frame seam / skip counter -- it shifts the
-            // whole stream uniformly, exactly the post-play delay_line_reference shift.
+            // every RUNNING output tick advances the event schedulers' g_time; a toggle pushed at
+            // t pops d ticks later, so the scheduled output IS the delayed output.  The event
+            // schedulers need no frame seam / skip counter -- they delay the whole stream
+            // uniformly, exactly the post-play delay_line_reference shift.
             bnd_delay_advance = 1'b1;
             if (loop_count_active>32'd1 && loops_remaining>32'd1 && time_count>=loop_end_active) begin
                 // loop rewind: output loop_start mask, seed arm from loop_start+1
@@ -1022,15 +1026,15 @@ module zlc_edge_streamer #(
                 pend <= {pend[PIPE-2:0], issue};
             end
         end else if (done) begin
-            // DONE-but-emitting: keep shifting the delay rings after the final tick so a
-            // DELAYED channel/bus flushes its remaining tail (up to delay_depth ticks) and
-            // then settles at its REST value -- state_mask was cleared to 0 and
-            // bus_value_active to BUS_SAFE_VALUE (mid code = 0 V) at done, so the pushes are
-            // those rest values and out[t] = in[t-d] holds for the WHOLE stream, exactly
-            // the delay_line_reference / rtl_mirror_play contract.  Without this the rings
-            // FREEZE at done and a delayed channel holds a STALE (possibly HIGH) tap value
-            // until the host reacts (ms over JTAG).  A new FIRE takes the start_event branch
-            // above (resets del_wptr/del_fill), so this free-running shift is never harmful.
+            // DONE-but-emitting: keep the free-running g_time advancing after the final tick so a
+            // DELAYED channel/bus drains the events still QUEUED in its scheduler (the last d
+            // ticks of toggles) and then settles at its REST value -- state_mask was cleared to 0
+            // and bus_value_active to BUS_SAFE_VALUE (mid code = 0 V) at done, so the queued tail
+            // carries those rest values and out[t] = in[t-d] holds for the WHOLE stream, exactly
+            // the delay_line_reference / rtl_mirror_play contract.  Without this g_time would
+            // FREEZE at done and a delayed channel would hold a STALE (possibly HIGH) value until
+            // the host reacts (ms over JTAG).  A new FIRE takes the start_event branch above
+            // (clears every scheduler's wr/rd/cnt), so this free-running advance is never harmful.
             bnd_delay_advance = 1'b1;
         end
 

@@ -50,7 +50,7 @@ part change is made **once** here instead of in scattered constants:
 | `fpga_part` | Vivado part string (e.g. `xc7a35tfgg484-2`). Drives the capacity estimate **and**, via `build_and_program.bat`, the synthesis target (`create_project.tcl`'s `set part`). |
 | `clock_hz` | sequencer clock (50 MHz → 20 ns tick); the ns↔tick conversion + delay-µs labels. |
 | `target_pct` | resource-budget target for the estimate (e.g. 90). |
-| `params.max_edges` / `bank_size` / `delay_depth` | edge-table depth, resident scan ping-pong bank, delay-line depth. |
+| `params.max_edges` / `bank_size` / `evt_fifo_depth` | edge-table depth, resident scan ping-pong bank, per-signal delay event-FIFO depth. |
 | `params.channel_count` / `num_slots` / `bus_count` / `bus_width` / widths | the rest of the geometry. |
 
 > **Important:** `params` must match the localparams the **bitstream** was built with

@@ -23,9 +23,9 @@
 #   BANK_SIZE=2048 -> scan depth 2*2048=4096:
 #     scan  BRAM 32b(A)/128b(B) port-A depth 16384, port-B depth 4096
 #   bus image 256*7=1792 words; CTRL 64 -> axi_bram depth 65536.
-#   The OUTPUT delay is a LITERAL delay line: a per-channel / per-bus distributed-RAM circular
-#   buffer of depth DELAY_DEPTH(2048) inferred inside the engine (ram_style="distributed", +0
-#   RAMB36).  Its delays ride DENSE CTRL words (DELAY_TICKS / BUS_DELAY_TICKS) -- NO delay BRAM.
+#   The OUTPUT delay is a per-signal EVENT SCHEDULER: per-channel / per-DA-bit event FIFOs in
+#   distributed RAM inferred inside the engine (ram_style="distributed", +0 RAMB36).  Each delay
+#   value is one 32-bit word in the R_DELAY register region -- NO delay BRAM, NO delay CTRL words.
 
 set script_dir [file normalize [file dirname [info script]]]
 proc env_or {name default} {
@@ -108,9 +108,9 @@ set zlc_scan_portb_bits 128
 set zlc_coeff_porta_depth [expr {$zlc_max_edges * ($zlc_coeff_portb_bits / 32)}]
 set zlc_mask_porta_depth  [expr {$zlc_max_edges * ($zlc_mask_portb_bits / 32)}]
 set zlc_scan_porta_depth  [expr {$zlc_scan_depth * ($zlc_scan_portb_bits / 32)}]
-# LITERAL OUTPUT delay line: a per-channel / per-bus distributed-RAM circular buffer of depth
-# DELAY_DEPTH ticks, inferred inside zlc_edge_streamer (ram_style="distributed", +0 RAMB36).
-# The TTL event-scheduler FIFO depth (EVT_FIFO_DEPTH) is a top -generic, not a BRAM size.
+# OUTPUT delay: a per-signal EVENT SCHEDULER -- per-channel / per-DA-bit event FIFOs in
+# distributed RAM, inferred inside zlc_edge_streamer (ram_style="distributed", +0 RAMB36).
+# The event-scheduler FIFO depth (EVT_FIFO_DEPTH) is a top -generic, not a BRAM size.
 set zlc_axi_bram_depth 65536
 
 puts "ZLC create_project: FINAL engine (1-tick FIFO prefetch + 2-bank streaming), 4096 edges + bank 2048"
@@ -291,10 +291,10 @@ zlc_try "busimg noRSTB" {set_property CONFIG.Use_RSTB_Pin {false} [get_ips blk_m
 zlc_dump_ip blk_mem_gen_busimg
 generate_target all [get_ips blk_mem_gen_busimg]
 
-# NOTE: the LITERAL OUTPUT delay line (per-channel TTL ring + per-bus DAC ring, depth
-# DELAY_DEPTH) is inferred distributed-RAM / LUTRAM inside zlc_edge_streamer
-# (ram_style="distributed", +0 RAMB36, +0 DSP).  Its delays ride DENSE CTRL words latched at
-# FIRE -- there is NO delay image BRAM and NO mini-loader to build (only 5 BRAMs: 3 edge + scan
+# NOTE: the OUTPUT delay event scheduler (per-channel TTL + per-DA-bit DAC event FIFOs) is
+# inferred distributed-RAM / LUTRAM inside zlc_edge_streamer (ram_style="distributed", +0
+# RAMB36, +0 DSP).  Each delay value is one 32-bit R_DELAY register word latched at FIRE --
+# there is NO delay image BRAM and NO mini-loader to build (only 5 BRAMs: 3 edge + scan
 # + bus image).
 
 update_compile_order -fileset sources_1

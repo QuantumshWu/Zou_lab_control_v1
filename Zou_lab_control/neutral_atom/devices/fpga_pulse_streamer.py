@@ -35,7 +35,7 @@ from ..timing.verilog import CONTROL_PORTS, safe_identifier
 # geometry change is edited in ONE place and flows to validation + capacity together.
 # These module constants MIRROR that config; the literal fallback (kept identical to the
 # shipped config) keeps this module importable if the fpga package is unavailable.
-# NOTE: max_edges/bank_size/delay_depth etc. are baked into the synthesized bitstream
+# NOTE: max_edges/bank_size/evt_fifo_depth etc. are baked into the synthesized bitstream
 # (zlc_pulse_streamer_top.v localparams) -- changing the JSON does NOT re-synthesize; it
 # only re-aligns host validation/estimation.  Double-click estimate_resources.bat after
 # editing to check the part still fits, and rebuild the RTL to actually change the geometry.
@@ -410,9 +410,9 @@ def validate_pulse_streamer_program(
     # ramps), so ANY duration yields the closest realizable staircase to the ideal line,
     # landing exactly on the target at stop_tick.  The preview draws the same staircase
     # (pulse_table._analog_bus_value_at_tick), so what you see is what the DAC does.
-    # Per-bus DAC DELAY -- each DA bit is now its OWN event-scheduler channel (the bus's 10 bits
-    # share one delay), so a bus delay has the SAME 32-bit physical range as a TTL channel (the old
-    # 2048-tick ring cap is gone).  Capacity is bounded by value-change events in flight per bit
+    # Per-bus DAC DELAY -- each DA bit is its OWN event-scheduler channel (the bus's 10 bits
+    # share one delay), so a bus delay has the SAME 32-bit physical range as a TTL channel.
+    # Capacity is bounded by value-change events in flight per bit
     # (<= the event-FIFO depth), like TTL -- sparse DAC use is far below it; a delayed long ramp is
     # the only stressor.  Here we enforce the 32-bit field bound; the per-bit in-flight count rides
     # the same event-FIFO contract as TTL.

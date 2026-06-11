@@ -642,14 +642,14 @@ def estimate_resources(params: StreamerParams, *, part, target_pct: float = 90.0
     # at an INDEPENDENT address), instantiated once per slot in the g_evtfifo generate loop.
     # It MUST be RAM, not a flat 3D reg array: a 3D array with per-slot independent pointers
     # does NOT infer as distributed RAM (Vivado falls back to registers -> 226k FF at depth
-    # 256, which does not fit).  7-series packs SDP LUTRAM at ~0.7-1.0 LUT per 64x1 cell
-    # (measured against this design's bus_ring), so ceil(EVT_DEPTH*49/64) LUTs per slot plus
-    # ~20 LUTs of pointer/comparator control is an honest, slightly-conservative estimate.
+    # 256, which does not fit).  7-series packs SDP LUTRAM at ~0.7-1.0 LUT per 64x1 cell, so
+    # ceil(EVT_DEPTH*49/64) LUTs per slot plus ~20 LUTs of pointer/comparator control is an
+    # honest, slightly-conservative estimate.
     ttl_sched_luts = num_delay_ch * (20 + _ceil(evt_depth * 49, 64))
-    # DAC delay is now event-scheduled PER DA BIT (bus_count*bus_width 1-bit channels), each its
-    # own EVT_DEPTH-deep 49b FIFO exactly like a TTL channel (the bus's bits share one delay), so
-    # TTL and DAC delay ranges match (the old 2048-tick ring is gone).  This is ~bus_width x the
-    # ring's LUTs but it removes the 32-bit-vs-ring range mismatch on a negative-delay global shift.
+    # DAC delay is event-scheduled PER DA BIT (bus_count*bus_width 1-bit channels), each its own
+    # BUS_EVT_DEPTH-deep 49b FIFO exactly like a TTL channel (the bus's bits share one delay), so
+    # TTL and DAC delay use the same 32-bit range and the same mechanism -- a negative-delay global
+    # shift G reaches the buses with no range mismatch.
     dac_evt_luts = (params.bus_count * params.bus_width) * (20 + _ceil(bus_evt_depth * 49, 64))
     delay_lutram = ttl_sched_luts + dac_evt_luts
     # DSP: engine affine-MAC call sites (2 evals/bus + 5 main) x num_slots products,
@@ -695,9 +695,9 @@ def solve_capacity(part, *, channel_count: int = 62, num_slots: int = 4, coeff_w
                           bank_size=bank_size, bus_count=bus_count, bus_width=bus_width,
                           bus_seg_addr_width=bus_seg_addr_width, bus_sel_width=bus_sel_width)
     # bus image is a small 32b BRAM (bus_rows*bus_words words); bus tables themselves
-    # live in engine LUTRAM (counted under distributed RAM / LUT, not RAMB36).  The LITERAL
-    # delay line is a per-channel / per-bus distributed-RAM circular buffer (NO BRAM image and
-    # NO BRAM ring -- ram_style="distributed"), so it costs LUTs, not RAMB36.
+    # live in engine LUTRAM (counted under distributed RAM / LUT, not RAMB36).  The OUTPUT delay
+    # event scheduler is per-channel / per-DA-bit distributed-RAM event FIFOs (NO BRAM image --
+    # ram_style="distributed"), so it costs LUTs, not RAMB36.
     bus_img_ram = _ceil(base.bus_rows * base.bus_words, 1024)
     scan_ram = _scan_ramb(bank_size, base)
     ctrl_ram = 1

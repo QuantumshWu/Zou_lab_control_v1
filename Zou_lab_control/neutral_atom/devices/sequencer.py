@@ -233,16 +233,16 @@ class RuntimeSequenceProgram:
     scan_coeff_frac_bits: int = 8
     bus_names: list[str] | None = None
     bus_segments: list[RuntimeBusSegment] | None = None
-    # PHYSICAL DAC-BUS DELAY: per-bus delay in ticks, realised by the LITERAL per-bus delay line
-    # (a 10-bit circular buffer; one delay shared by all 10 bits).  The DAC-value counterpart of
-    # ``channel_delays``; empty/None = no bus delayed.  Bounded to the delay-line depth.
+    # PHYSICAL DAC-BUS DELAY: per-bus delay in ticks, realised by the per-signal EVENT SCHEDULER
+    # (each DA bit its own event FIFO; one delay shared by all 10 bits).  The DAC-value counterpart
+    # of ``channel_delays``; empty/None = no bus delayed.  Bounded by events in flight, not length.
     bus_delays: list[RuntimeBusDelay] | None = None
-    # PHYSICAL CHANNEL DELAY: per-channel-bit delay in ticks, applied to the engine OUTPUT by a
-    # LITERAL delay line (a per-channel variable-tap shift register / SRL), NOT baked into ``ticks``.
+    # PHYSICAL CHANNEL DELAY: per-channel-bit delay in ticks, applied to the engine OUTPUT by the
+    # per-signal EVENT SCHEDULER, NOT baked into ``ticks``.
     # ``ticks``/``masks`` are the UNDELAYED frame; the engine delays bit ``b`` by
     # ``channel_delays[b]`` -- out[t]=in[t-d], 0 before fire (see engine_model.delay_line_reference).
-    # Any d in [0, delay_depth]; never disturbs another channel; first frame real.  The global
-    # negative-delay shift G is folded in so every entry is >= 0.  Empty/None = no channel delayed.
+    # Any d in [0, the 32-bit field cap]; never disturbs another channel; first frame real.  The
+    # global negative-delay shift G is folded in so every entry is >= 0.  Empty/None = none delayed.
     channel_delays: list[int] | None = None
     # Bitmask (bit b = channel b) of channels wired directly to the FPGA clk.  These bits
     # are forced 0 in every edge mask (the engine does not drive them); the top muxes clk
@@ -668,8 +668,8 @@ def compile_pulse_table_scan_runtime_program(
     # table is emitted UNDELAYED and the loop period is the plain (affine-in-duration) frame,
     # so a delay of ANY length never disturbs another channel and never changes the period.
     # The DAC BUSES go through the SAME global shift G (their delays are folded with the TTL
-    # delays so a negative bus delay also lands >= 0), then are realised by the LITERAL per-bus
-    # delay line (a 10-bit circular buffer) -- bounded to delay_depth ticks (the host validates).
+    # delays so a negative bus delay also lands >= 0), then are realised by the SAME per-signal
+    # event scheduler as the TTL channels (32-bit range; the host validates events-in-flight).
     hardware_bits = {ch: index for index, ch in enumerate(channel_names(channels, "channels"))}
     # A channel delay is a FIXED per-channel OUTPUT delay -- it cannot vary per scan point.
     # Reject a delay EXPRESSION that references a scanned slot (a nonzero affine coeff): it would
@@ -2266,9 +2266,9 @@ def _pulse_table_bus_segments(
 
     The per-bus DELAY is NOT baked into the segment ticks (that capped it at one
     frame).  Segments are emitted at their NOMINAL phase and the bus delay is
-    returned as ``{bus_index: delay_steps}`` (third element), realised by the
-    engine's LITERAL per-bus delay line (a 10-bit circular buffer, depth delay_depth)
-    -- so a DAC value can be delayed by more than one frame, exactly like a TTL channel.
+    returned as ``{bus_index: delay_steps}`` (third element), realised by the SAME
+    per-signal event scheduler as the TTL channels -- so a DAC value can be delayed by
+    more than one frame, exactly like a TTL channel.
     """
 
     slot_vars = list(slot_vars or [])
@@ -2292,10 +2292,10 @@ def _pulse_table_bus_segments(
             continue
         # A bus delay is NOT baked into the segment ticks (that capped it at one frame).
         # Segments are emitted at their NOMINAL (undelayed) phase; the per-bus delay is
-        # returned separately and realised by the engine's LITERAL per-bus delay line (push
-        # the undelayed bus value into a 10-bit circular buffer each tick, read d ticks ago).
-        # This matches the TTL delay line exactly, so a DAC value can be delayed by more than
-        # one frame (the buffer depth is independent of the frame period; bounded by delay_depth).
+        # returned separately and realised by the engine's per-signal EVENT SCHEDULER (each DA
+        # bit queues its value-changes against the global tick counter; out[t]=in[t-d]).
+        # This is the SAME mechanism as the TTL channels, so a DAC value can be delayed by more
+        # than one frame (storage scales with events in flight, not with the delay length).
         delay_steps = _pulse_table_bus_delay_steps(state, members, slots=slots, time_step_ns=time_step_ns)
         if delay_steps:
             bus_delays[bus_index] = int(delay_steps)

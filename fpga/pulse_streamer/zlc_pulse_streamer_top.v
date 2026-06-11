@@ -140,14 +140,14 @@ module zlc_pulse_streamer_top #(
     wire zlc_running, zlc_done, zlc_underflow;
     wire [SCAN_COUNT_WIDTH-1:0] zlc_cursor;
 
-    // --- delays: TTL = the 32b/channel DELAY register region (event scheduler, long
-    // delays); DAC buses = the DENSE 12-bit CTRL fields (ring-buffered, ring-capped).
+    // --- delays: BOTH TTL channels AND DAC buses use the 32b/word R_DELAY register region,
+    // driving the per-signal event scheduler (long delays; see zlc_edge_streamer).
     localparam integer TTL_DELAY_WIDTH = 32;
     // R_DELAY carries ONE 32-bit word per delay-eligible signal: the CHANNEL_COUNT TTL channels
-    // first, then the BUS_COUNT per-bus DAC delays.  The DAC delay is now 32-bit too (event-
-    // scheduled per bit, NOT the old 12-bit ring), so TTL and DAC ranges MATCH -- a negative TTL
-    // delay's global shift G can reach the buses, no more range mismatch.  (The dense CTRL
-    // DELAY_TICKS / BUS_DELAY_TICKS words 20..45 are now reserved/unused.)
+    // first, then the BUS_COUNT per-bus DAC delays.  TTL and DAC delays share the SAME 32-bit
+    // range and the SAME event-scheduler mechanism, so a negative TTL delay's global shift G can
+    // reach the buses with no range mismatch.  (There are no dense delay-tick CTRL words: the
+    // CTRL block is the 20 command words 0..19 then the clk mask -- nothing delay-related.)
     localparam integer DELAY_REG_COUNT = CHANNEL_COUNT + BUS_COUNT;
     reg  [31:0] delay_reg [0:DELAY_REG_COUNT-1];
     integer dri;
@@ -532,8 +532,8 @@ module zlc_pulse_streamer_top #(
         .bus_prog_mode(bus_prog_mode), .bus_prog_value_select(bus_prog_value_select),
         .bus_prog_stop_value_select(bus_prog_stop_value_select),
         .bus_counts(ctrl_reg[C_BUS_COUNTS][BUS_COUNT*(BUS_SEG_ADDR_WIDTH+1)-1:0]),
-        // LITERAL OUTPUT delay line -- dense per-channel / per-bus delay tick counts (the engine
-        // pushes the undelayed outputs into a circular buffer and reads (wptr - d)).
+        // OUTPUT delay event scheduler -- per-channel / per-bus delay tick counts (the engine
+        // queues each output's toggles against g_time and pops them d ticks later).
         .bus_delay_ticks(bus_delay_ticks_w),
         .delay_ticks(delay_ticks_w),
         .out(out), .bus_out(zlc_bus_out), .running(zlc_running), .done(zlc_done)

@@ -24,11 +24,11 @@ Three models, all walking the SAME engine FSM:
 The RTL combines the edge FIFO and the scan ping-pong; each is verified here
 independently and against the same ``reference_play`` ground truth.
 
-The per-channel / per-bus OUTPUT delay is a LITERAL delay line (a plain circular buffer):
+The per-channel / per-bus OUTPUT delay is a per-signal EVENT SCHEDULER:
 :func:`delay_line_reference` / :func:`bus_delay_line_reference` are the exact stream-shift
 ground truth (out[t]=in[t-d], 0 before fire), and :func:`rtl_delay_line_mirror` /
-:func:`rtl_bus_delay_line_mirror` are the cycle-exact register mirrors of the RTL circular
-buffer (the 32-bit delay field; a d past it raises :class:`DelayTooLargeError`).
+:func:`rtl_bus_delay_line_mirror` are the cycle-exact register mirrors of the RTL event
+schedulers (the 32-bit delay field; a d past it raises :class:`DelayTooLargeError`).
 ``reference_play`` / ``prefetch_play`` / ``rtl_mirror_play`` apply the channel delay line as a
 post-play shift via :func:`_apply_channel_delays`.
 """
@@ -109,12 +109,12 @@ def effective_tick(base_tick: int, coeffs: Sequence[int], slots: Sequence[int], 
 # PHYSICAL CHANNEL DELAY -- a literal OUTPUT delay line (the final, correct model)
 # ----------------------------------------------------------------------------
 # A channel delay is NOT baked into the edge ticks; it is a per-channel delay on the engine
-# OUTPUT:  output_delayed[t] = output_undelayed[t - d], zero before fire.  The TTL hardware is a
-# per-channel variable-tap SHIFT REGISTER (the SRL primitive, depth DELAY_DEPTH, 1 bit): each
-# tick shift the channel's UNDELAYED output bit in at [0]; the delayed bit is the tap at index
-# d-1 (the value pushed d ticks ago).  d=0 is exact passthrough; d>0 reads a tap whose startup
-# gate holds its FIRE-time 0 until t>=d (silent startup, for free).  Bounded to DELAY_DEPTH ticks
-# (~40 us at 20 ns/tick).  (The DAC bus delay is still a 10-bit-wide circular buffer.)
+# OUTPUT:  output_delayed[t] = output_undelayed[t - d], zero before fire.  The hardware is the
+# per-signal EVENT SCHEDULER (see zlc_edge_streamer): each toggle is queued at {t + d - 1} and
+# pops d ticks later, so storage scales with toggles IN FLIGHT (not with d) and the delay range is
+# the full 32-bit field.  d=0 is exact passthrough; before the first scheduled toggle the gated
+# output holds its FIRE-time 0 (silent startup, for free).  These reference functions express the
+# ideal out[t]=in[t-d] semantics; the cycle-exact event-scheduler register mirrors are below.
 #
 #   * delay_line_reference     -- the EXACT stream-shift ground truth.
 #   * rtl_delay_line_mirror    -- the cycle-exact RTL shift-register register mirror.
@@ -141,8 +141,8 @@ def bus_delay_line_reference(undelayed_bus: Sequence[int], delay: int,
     """Exact per-bus delay line: a 10-bit DAC value stream delayed by ``d`` (one delay
     shared by all 10 bits), holding ``safe_value`` before t == d.  The hardware default is
     the SAFE mid-scale code 512 (= BUS_SAFE_VALUE = true 0 V on the offset-binary driver).
-    The hardware is a per-bus 10-bit-wide circular buffer, depth DELAY_DEPTH: push the
-    undelayed value each tick, read d ticks ago.  d=0 is exact passthrough."""
+    The hardware schedules each DA bit's value-changes as events (per-bit, sharing one per-bus d),
+    so out[t] = in[t-d].  d=0 is exact passthrough."""
     d = int(delay)
     out = []
     for t in range(len(undelayed_bus)):
@@ -154,25 +154,23 @@ def bus_delay_line_reference(undelayed_bus: Sequence[int], delay: int,
 # ----------------------------------------------------------------------------
 # CYCLE-EXACT REGISTER MIRRORS of the literal delay-line hardware (no Verilog sim)
 # ----------------------------------------------------------------------------
-# These reproduce the EXACT registers of zlc_edge_streamer.v's delay line so a divergence
-# from delay_line_reference / bus_delay_line_reference flags an RTL bug.  The two paths differ:
+# These reproduce the EXACT registers of zlc_edge_streamer.v's EVENT SCHEDULER so a divergence
+# from delay_line_reference / bus_delay_line_reference flags an RTL bug.  TTL and DAC use the SAME
+# mechanism (per-signal event FIFO against the free-running g_time):
 #
-#   TTL (rtl_delay_line_mirror): a per-channel variable-tap SHIFT REGISTER (the SRL primitive,
-#   DELAY_DEPTH+1 bits, zero at FIRE).  Each RUNNING tick read the gated tap THEN shift in:
-#       delayed_bit[ch] = (del_fill >= d_ch) ? sr[ch][d_ch - 1] : 0   # value pushed d_ch ago
-#       sr[ch] = {sr[ch][DELAY_DEPTH-1:0], undelayed_bit[ch]}         # shift newest in at [0]
-#   The pre-shift tap sr[k] == the bit pushed k+1 ticks ago, so sr[d-1] == d ticks ago; del_fill
-#   (running tick index) gates it to 0 until t>=d.  d==0 is bypassed (passthrough).
+#   TTL (rtl_delay_line_mirror): per channel, on a toggle at t push {t + d - 1, new_level} into an
+#   EVT_FIFO_DEPTH-deep FIFO; when g_time reaches the head time pop it into the output register
+#   (visible at t + d).  d==1 is served by the prev-undelayed register; d==0 bypasses.
 #
-#   DAC (rtl_bus_delay_line_mirror): UNIFIED with TTL -- each of the bus's bits is its own 1-bit
-#   EVENT FIFO (g_busdly) that shares the per-bus delay d (no more 2048-tick ring, so the range
-#   matches TTL).  Per bit, push {g_time+d-1, level} on a change, pop by g_time equality into the
-#   output register; d==1 is the prev register; before t==d the bit holds its BUS_SAFE_VALUE
-#   level.  Storage scales with value-change events IN FLIGHT per bit (<= BUS_EVT_FIFO_DEPTH),
-#   not delay length; an overflow drops the excess (a too-dense delayed ramp).
+#   DAC (rtl_bus_delay_line_mirror): each of the bus's bits is its own 1-bit event FIFO (g_busdly)
+#   sharing the per-bus delay d, so the whole DAC value shifts coherently.  Per bit, push
+#   {g_time + d - 1, level} on a change, pop by g_time equality into the output register; d==1 is
+#   the prev register; before t==d the bit holds its BUS_SAFE_VALUE level.
 #
-#   Both are out[t]=in[t-d] before any overflow, == the *_reference functions (TTL safe 0, DAC
-#   safe = BUS_SAFE_VALUE), with the in-flight-count capacity bound instead of a delay-length cap.
+#   For BOTH, storage scales with value-change events IN FLIGHT per signal (<= the FIFO depth), not
+#   with delay length; an overflow drops the excess (a too-dense delayed ramp).  Both are
+#   out[t]=in[t-d] before any overflow, == the *_reference functions (TTL safe 0, DAC safe =
+#   BUS_SAFE_VALUE), with the in-flight-count capacity bound instead of a delay-length cap.
 
 
 def _check_delay_cap(d: int, cap: int, what: str) -> int:
@@ -242,8 +240,8 @@ def rtl_bus_delay_line_mirror(undelayed_bus: Sequence[int], delay: int,
     exact passthrough; d==1 is a single register.  Capacity is the number of value-change events
     in flight PER BIT (<= ``depth``); a push when that bit's FIFO is full is DROPPED, matching the
     RTL overflow guard (the only realistic stressor is a too-dense DELAYED ramp).  Equals
-    :func:`bus_delay_line_reference` whenever no bit exceeds ``depth`` events in flight -- and,
-    unlike the old 2048-tick ring, a large ``d`` is fine (the bound is in-flight count, not d)."""
+    :func:`bus_delay_line_reference` whenever no bit exceeds ``depth`` events in flight -- a
+    large ``d`` is fine (the bound is the in-flight event count, not d)."""
     d = int(delay)
     n = len(undelayed_bus)
     if d == 0:
@@ -934,11 +932,11 @@ def bus_play(program, bus_index: int, n_ticks: int, scan_point: int = 0, *,
 
 
 # ----------------------------------------------------------------------------
-# UNDELAYED DAC-BUS VALUE evaluator (sampled, then fed to the bus delay line)
+# UNDELAYED DAC-BUS VALUE evaluator (sampled, then fed to the bus event scheduler)
 # ----------------------------------------------------------------------------
-# A DELAYED DAC bus value is the bus's UNDELAYED value stream delayed by d (a per-bus
-# 10-bit circular buffer -- see bus_delay_line_reference / rtl_bus_delay_line_mirror).
-# To build that undelayed stream tick-by-tick (so the delay line can shift it), the
+# A DELAYED DAC bus value is the bus's UNDELAYED value stream delayed by d (the per-DA-bit
+# event scheduler -- see bus_delay_line_reference / rtl_bus_delay_line_mirror).
+# To build that undelayed stream tick-by-tick (so the scheduler can delay it), the
 # engine reads the active bus segment combinationally at each tick:
 # :func:`bus_value_at` is the COMBINATIONAL evaluator (the RTL ``zlc_bus_value_at``
 # function); it is byte-identical to :func:`bus_play` when evaluated at the running
