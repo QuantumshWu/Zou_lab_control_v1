@@ -507,6 +507,12 @@ class FluentButton(QtWidgets.QPushButton):
     def __init__(self, text: str = "", parent=None, *, color: str = ACCENT):
         super().__init__(text, parent)
         self._current_bg = None
+        # Confocal-style dirty state (see set_dirty): the CLEAN base colour is
+        # remembered so a dirty colour never leaks into it, and toggling the
+        # trailing '*' is width-stable.
+        self._dirty = False
+        self._dirty_color = None   # remembered so a dirty colour can always be reverted
+        self._base_color = QtGui.QColor(color).name(QtGui.QColor.HexRgb)
         self.setMinimumHeight(scaled_px(30, minimum=22))
         # Default sizing is set ONCE here, not inside set_color -- callers that
         # opt into Expanding (e.g. a button grid) would otherwise have their
@@ -518,6 +524,10 @@ class FluentButton(QtWidgets.QPushButton):
 
     def set_color(self, color: str) -> None:
         bg = QtGui.QColor(color).name(QtGui.QColor.HexRgb)
+        # Remember the CLEAN base colour only while not dirty, so set_dirty's
+        # transient dirty colour can always be reverted.
+        if not self._dirty:
+            self._base_color = bg
         if bg == self._current_bg:
             return
         self._current_bg = bg
@@ -536,6 +546,30 @@ class FluentButton(QtWidgets.QPushButton):
             QPushButton:disabled {{ background: {PLACEHOLDER}; color: {BG}; }}
             """
         )
+
+    def set_dirty(self, dirty: bool = True, *, dirty_color: str | None = None) -> None:
+        """Confocal-style dirty indicator, reusable on any FluentButton.
+
+        A trailing ``*`` means "pressing this would apply / recompute something
+        new" (exactly the ``On Pulse*`` / ``Save*`` convention used by the editor
+        title bar).  By default ONLY the star toggles and the base colour is left
+        unchanged (the action-button rule -- e.g. ``On Pulse`` stays GREEN).  Pass
+        ``dirty_color`` for the save-button rule (e.g. YELLOW while dirty, base
+        colour when clean).  Idempotent and width-stable -- the base label/colour
+        are remembered so repeated calls never accumulate stars or lose the colour."""
+        dirty = bool(dirty)
+        if dirty_color is not None:
+            self._dirty_color = dirty_color   # persist so clean can revert it
+        base = self.text()
+        if base.endswith("*"):
+            base = base[:-1]
+        self._dirty = dirty
+        QtWidgets.QPushButton.setText(self, base + ("*" if dirty else ""))
+        if self._dirty_color is not None:
+            self.set_color(self._dirty_color if dirty else self._base_color)
+
+    def is_dirty(self) -> bool:
+        return self._dirty
 
 
 class FluentLineEdit(QtWidgets.QLineEdit):

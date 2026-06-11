@@ -1399,6 +1399,53 @@ def test_pulse_save_bundles_artifacts(monkeypatch, tmp_path):
     assert "Saved:" in editor.preview_status.text()
 
 
+def test_fluent_button_dirty_semantics(monkeypatch):
+    """Reusable confocal dirty state on FluentButton (the 'On Pulse*' convention):
+    a trailing '*' toggles width-stably; by default the base colour is untouched
+    (action-button rule), and an optional dirty_color reverts to the clean base."""
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5 import QtGui
+    from Zou_lab_control.frontend.qt_fluent import ACCENT, GREEN, YELLOW, FluentButton, ensure_qt_app
+
+    ensure_qt_app()
+    # action-button rule: star only, colour unchanged, idempotent
+    run = FluentButton("Run", color=GREEN)
+    base = run._base_color
+    run.set_dirty(True)
+    assert run.text() == "Run*" and run._current_bg == base and run.is_dirty()
+    run.set_dirty(True)
+    assert run.text() == "Run*"          # no accumulated stars
+    run.set_dirty(False)
+    assert run.text() == "Run" and run._current_bg == base and not run.is_dirty()
+    # save-button rule: dirty_color while dirty, reverts to the clean base when clean
+    save = FluentButton("Save", color=ACCENT)
+    clean = save._base_color
+    save.set_dirty(True, dirty_color=YELLOW)
+    assert save.text() == "Save*" and save._current_bg == QtGui.QColor(YELLOW).name(QtGui.QColor.HexRgb)
+    save.set_dirty(False)
+    assert save.text() == "Save" and save._current_bg == clean
+
+
+def test_scan_run_button_dirty_on_code_edit(monkeypatch):
+    """#5: editing the Scan-tab code marks Run dirty (Run*); a successful Run clears it."""
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
+
+    ensure_qt_app()
+    editor = PulseSequenceEditor(state=na.PulseTableState(
+        channels=["ch0", "ch1"], channel_labels={"ch0": "cooling", "ch1": "da_dipole[0]"},
+        visible_channels=["ch0", "ch1"], time_step_ns=20.0,
+        periods=[na.PulsePeriod(100, (1, 0), unit="ns")]))
+    assert hasattr(editor, "scan_run_button")
+    editor.scan_run_button.set_dirty(False)        # baseline clean
+    editor.scan_code.setPlainText("scan_table = [[1.0]]")   # edit -> dirty
+    assert editor.scan_run_button.is_dirty() and editor.scan_run_button.text() == "Run*"
+
+
 def test_fluent_combo_popup_fits_widest_item(monkeypatch):
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")

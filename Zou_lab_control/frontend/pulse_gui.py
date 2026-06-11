@@ -2721,6 +2721,12 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         run_btn.setFixedHeight(_row_height())
         run_btn.setToolTip("Run the code; assign an N_points x N_slots array to 'scan_table'.")
         run_btn.clicked.connect(self._run_scan_code)
+        # Confocal dirty semantics (same convention as 'On Pulse*'): a trailing '*'
+        # means the editor code changed but has NOT been re-Run, so the scan table
+        # on screen is stale.  Editing the code (typing, template insert, load) marks
+        # it dirty; a successful Run clears it.  Reuses FluentButton.set_dirty.
+        self.scan_run_button = run_btn
+        self.scan_code.textChanged.connect(lambda: self.scan_run_button.set_dirty(True))
         save_btn = FluentButton("Save Array", color=YELLOW)
         save_btn.setFixedHeight(_row_height())
         save_btn.setToolTip("Save the generated scan table to a .npy/.csv file.")
@@ -2841,6 +2847,9 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             self._scan_use_loaded = False
             self._apply_scan_source()
             self._open_scan_tab()
+            # Successful run -> the on-screen table matches the code: clear the dirty star.
+            # (_apply_scan_source -> load_state may re-touch scan_code; clear AFTER it.)
+            self.scan_run_button.set_dirty(False)
         except Exception as exc:
             self._message(f"Scan code error: {exc}")
 
