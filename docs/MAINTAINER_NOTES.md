@@ -473,9 +473,15 @@ channel's UNDELAYED toggle stream over the WHOLE program -- every scan point at 
 affine-shifted edge times, bracket loops, the repeat-forever wrap -- and takes the exact
 maximum window count (a periodic-stream formula handles `d >= sweep period`).  A delay whose
 in-flight count exceeds `EVT_DEPTH` is REJECTED with the longest physical delay reported;
-nothing is silently dropped.  **DAC buses keep the 2048-deep value rings** (one 10-bit ring
-per bus, ~1.3k LUTs, ~41 us cap) -- DAC delays are short compensations (per-bus event-FIFO
-unification is future work; the GUI tooltip + clamp use the bus ring cap, not the TTL cap).
+nothing is silently dropped.  **DAC buses are UNIFIED into the same event scheduler**: each DA
+bit is its own 1-bit event FIFO (`g_busdly`, fed from `bus_value_active`, reset to that bit's
+`BUS_SAFE_VALUE` level so an untouched bus idles at 0 V), and the bus's `BUS_WIDTH` bits share one
+per-bus 32-bit delay (`del_bus_ticks`) -- so the DAC delay range NOW MATCHES TTL (the 2048-tick
+ring is gone) and a negative TTL delay's global shift G can reach the buses with no mismatch.  The
+per-bit FIFO is shallower (`BUS_EVT_DEPTH`, default 64; there are bus_count*bus_width = 40 of them)
+to fit LUT -- per the conservative model per-bit @256 = 102.9% (over the device), @64 = ~81%.
+Capacity = value-change events in flight per bit <= `BUS_EVT_DEPTH`; the only stressor is a long
+DELAYED ramp (one event/step).  `bus_evt_fifo_depth` is reconfigurable from streamer_config.json.
 
 **Reconfigurable depth (single source).**  `evt_fifo_depth` lives only in
 `streamer_config.json`.  The host (validator/estimate) reads it; the BUILD reads it too --
