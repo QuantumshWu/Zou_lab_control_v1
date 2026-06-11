@@ -674,9 +674,10 @@ The three bring-up items from the adversarial RTL hunt are now fixed/guarded. Th
   the fix exactly when it matters; the unconditional advance is safe (a new FIRE clears
   every scheduler's wr/rd/cnt).
 - **B1/B2 — `da_clk0..3` = `out_final[28/39/50/61]`: the clk button wires these strobe pins
-  to the FPGA clk.** New safety net: `_warn_idle_dac_clock_pins` (sequencer.py) warns at
-  compile time when DAC buses are driven while a `da_clkN`-labeled channel is neither
-  clk-enabled nor toggled (a frozen DAC would otherwise be silent). A warning, not an error.
+  to the FPGA clk.** (The former compile-time `_warn_idle_dac_clock_pins` warning -- fired when
+  a `da_clkN` pin was driven-but-idle -- was REMOVED at the user's request: it was noisy and
+  read as an inexplicable error.  Enabling the da_clk pins is still the user's responsibility
+  via the GUI clk button.)
 - **B1/B2 — REVISED 2026-06-11 (⚠️ needs bitstream rebuild): the strobe is now `~clk`, NOT
   `clk` — the "third DA value between two edge periods" race.** The earlier note said "BY
   DESIGN, no RTL change"; that was WRONG and missed a real source-synchronous output hazard.

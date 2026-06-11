@@ -6363,31 +6363,6 @@ def test_pulse_streamer_rtl_has_bresenham_ramp_stepper():
     assert "bus_value_active[i] <= bus_value_active[i] - bus_inc[BUS_WIDTH-1:0];" in rtl
 
 
-def test_compile_warns_when_dac_bus_active_but_da_clk_pin_idle():
-    """B1/B2: the DAC latches its bus on the da_clkN pin; driving a bus while that pin is
-    neither clk-enabled nor toggled silently freezes the DAC -- the compiler warns."""
-
-    import warnings as _w
-
-    channels = ["b0", "b1", "clkpin", "trig"]
-    labels = {"b0": "da_x[0]", "b1": "da_x[1]", "clkpin": "da_clk0"}
-    base = dict(
-        channels=channels, channel_labels=labels, time_step_ns=20,
-        periods=[na.PulsePeriod(1000, (0, 0, 0, 1), unit="ns")],
-        analog_bus_modes={"da_x": [{"mode": "edge", "value": 1}]},   # 2-bit bus: signed -2..+1
-    )
-    with _w.catch_warnings(record=True) as got:
-        _w.simplefilter("always")
-        na.compile_runtime_program_for_payload(na.PulseTableState(**base), channels=channels, clock_hz=50e6)
-    assert any("da_clk0" in str(w.message) for w in got)
-
-    with _w.catch_warnings(record=True) as got:
-        _w.simplefilter("always")
-        na.compile_runtime_program_for_payload(
-            na.PulseTableState(**base, clk_channels=["clkpin"]), channels=channels, clock_hz=50e6)
-    assert not any("da_clk0" in str(w.message) for w in got)   # clk-enabled -> no warning
-
-
 def test_check_rtl_assumptions_guards_shipped_geometry():
     """B3/B4/U7: geometries the shipped RTL would silently corrupt are rejected at pack
     time (coeff assembly assumes 64 coeff bits; flags fit one 32b word; pow2 bank/edges)."""
@@ -7557,31 +7532,6 @@ def test_pulse_streamer_rtl_has_bresenham_ramp_stepper():
     # saturating moves (both directions) land exactly on the target
     assert "? bus_ramp_target[i] : bus_v_next[BUS_WIDTH-1:0];" in rtl
     assert "bus_value_active[i] <= bus_value_active[i] - bus_inc[BUS_WIDTH-1:0];" in rtl
-
-
-def test_compile_warns_when_dac_bus_active_but_da_clk_pin_idle():
-    """B1/B2: the DAC latches its bus on the da_clkN pin; driving a bus while that pin is
-    neither clk-enabled nor toggled silently freezes the DAC -- the compiler warns."""
-
-    import warnings as _w
-
-    channels = ["b0", "b1", "clkpin", "trig"]
-    labels = {"b0": "da_x[0]", "b1": "da_x[1]", "clkpin": "da_clk0"}
-    base = dict(
-        channels=channels, channel_labels=labels, time_step_ns=20,
-        periods=[na.PulsePeriod(1000, (0, 0, 0, 1), unit="ns")],
-        analog_bus_modes={"da_x": [{"mode": "edge", "value": 1}]},   # 2-bit bus: signed -2..+1
-    )
-    with _w.catch_warnings(record=True) as got:
-        _w.simplefilter("always")
-        na.compile_runtime_program_for_payload(na.PulseTableState(**base), channels=channels, clock_hz=50e6)
-    assert any("da_clk0" in str(w.message) for w in got)
-
-    with _w.catch_warnings(record=True) as got:
-        _w.simplefilter("always")
-        na.compile_runtime_program_for_payload(
-            na.PulseTableState(**base, clk_channels=["clkpin"]), channels=channels, clock_hz=50e6)
-    assert not any("da_clk0" in str(w.message) for w in got)   # clk-enabled -> no warning
 
 
 def test_check_rtl_assumptions_guards_shipped_geometry():

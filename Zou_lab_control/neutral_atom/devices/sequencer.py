@@ -85,44 +85,6 @@ def _clk_enable_mask_for_channels(channels: Sequence[str], clk_channels: Sequenc
     return mask
 
 
-def _warn_idle_dac_clock_pins(state: PulseTableState) -> None:
-    """Warn when DAC buses are driven but a ``da_clkN`` pin is completely idle.
-
-    On this board each DAC latches its 10-bit parallel bus on the ``da_clkN`` pin,
-    which is an ordinary engine channel -- normally wired to the FPGA clk via the GUI
-    clk button (``clk_channels``).  Driving a bus while its clock pin is neither
-    clk-enabled nor toggled leaves the DAC silently frozen at its old code.  This is
-    a WARNING (not an error): an exotic setup may strobe the DAC with its own TTL
-    pattern, and that stays allowed."""
-
-    import re
-    import warnings
-
-    if not _pulse_table_has_analog_activity(state):
-        return
-    clk_set = set(state.clk_channels)
-    idle: list[str] = []
-    for channel in state.channels:
-        label = str(state.channel_labels.get(channel, channel)).strip()
-        if not re.fullmatch(r"da_clk\d+", label.lower()):
-            continue
-        if channel in clk_set:
-            continue
-        index = state.channel_index(channel)
-        if any(int(period.states[index]) for period in state.periods):
-            continue  # user drives the strobe as a TTL pattern -- their call
-        idle.append(f"{channel} ({label})")
-    if idle:
-        warnings.warn(
-            "DAC buses are driven but the DAC clock pin(s) "
-            + ", ".join(idle)
-            + " are idle (not clk-enabled, never toggled) -- the DAC will not latch new values. "
-            "Click the clk button on that channel in the GUI Delay/Scan panel (adds it to "
-            "clk_channels) so the pin outputs the FPGA clock.",
-            stacklevel=3,
-        )
-
-
 @dataclass(frozen=True)
 class RuntimeBusDelay:
     """One delayed analog DAC bus for the LITERAL per-bus delay line.
@@ -431,7 +393,6 @@ def compile_pulse_table_runtime_program(
         slots=slot_values,
         time_step_ns=clock_step_ns,
     )
-    _warn_idle_dac_clock_pins(state)
     # When buses are emitted as SEGMENTS, their (now nominal-phase) delay is realised by the
     # LITERAL per-bus delay line; pass the raw bus delays so they share the SAME global shift G
     # as the TTL channels (a negative bus delay also lands >= 0).  EVERY DRIVEN bus (one that
@@ -658,7 +619,6 @@ def compile_pulse_table_scan_runtime_program(
             coeff_frac_bits=coeff_frac_bits,
         )
         bus_members = [channel for members in state.bus_channels().values() for channel in members]
-        _warn_idle_dac_clock_pins(state)
 
     # PHYSICAL CHANNEL DELAY: a delay is NOT scanned and NOT baked into the edges -- it is a
     # CONSTANT per-channel OUTPUT delay (a delay line; see engine_model.delay_line_reference).
