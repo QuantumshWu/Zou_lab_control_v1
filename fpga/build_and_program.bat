@@ -53,6 +53,7 @@ call :zlc_default_paths
 call :zlc_verify_sources
 if errorlevel 1 exit /b 1
 call :zlc_resolve_part
+call :zlc_emit_geom
 call :zlc_print_capacity_estimate
 
 if /I "%MODE%"=="diagnose" (
@@ -174,6 +175,23 @@ if not exist "%ZLC_CFG_JSON%" goto :zlc_resolve_part_done
 for /f "delims=" %%I in ('python -c "import json;print(json.load(open(r'%ZLC_CFG_JSON%'))['fpga_part'])" 2^>nul') do set "ZLC_PS_FPGA_PART=%%I"
 :zlc_resolve_part_done
 if not "%ZLC_PS_FPGA_PART%"=="" echo ZLC synthesis part: %ZLC_PS_FPGA_PART% (from streamer_config.json / env)
+exit /b 0
+
+:zlc_emit_geom
+rem Single source: generate the Vivado geometry tcl (BRAM sizes + top -generic overrides) from
+rem streamer_config.json so editing the config changes the SYNTHESIZED bitstream (e.g.
+rem EVT_FIFO_DEPTH 256->128).  create_project.tcl sources it via ZLC_PS_GEOM_TCL; when this step
+rem is skipped the tcl uses its literal defaults.  Pure read; never fails the build.
+if not "%ZLC_PS_GEOM_TCL%"=="" goto :zlc_emit_geom_done
+where python >nul 2>nul
+if errorlevel 1 goto :zlc_emit_geom_done
+set "ZLC_GEOM_OUT=%ZLC_PS_BUILD_ROOT%\geom.tcl"
+pushd "%REPO_ROOT%"
+set "PYTHONPATH=%CD%;%PYTHONPATH%"
+python -m fpga.pulse_streamer.host.image --emit-geom-tcl "%ZLC_GEOM_OUT%" >nul 2>nul && set "ZLC_PS_GEOM_TCL=%ZLC_GEOM_OUT%"
+popd
+:zlc_emit_geom_done
+if not "%ZLC_PS_GEOM_TCL%"=="" echo ZLC geometry tcl: %ZLC_PS_GEOM_TCL% (from streamer_config.json)
 exit /b 0
 
 :zlc_print_capacity_estimate

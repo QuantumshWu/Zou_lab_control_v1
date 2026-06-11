@@ -149,7 +149,13 @@ class VivadoAxiStreamerSession:
         self._total_chunks = 1
         self._next_chunk = 2          # finite-streaming cursor (instance state -> re-entrant)
         self._bank_ready = 0b11
-        self._io_lock = threading.Lock()    # serialise AXI access (main + stream thread)
+        # RLock (not Lock): a transaction runs under this lock, and if the persistent
+        # Vivado was torn down (a prior action timeout / broken pipe), the NEXT _execute
+        # auto-restarts via start() -> _run_tcl, which RE-acquires this lock on the SAME
+        # thread.  A plain Lock would deadlock there (the restart would hang forever and
+        # force a server restart); RLock lets the same thread re-enter while still
+        # excluding the streaming-refill thread.
+        self._io_lock = threading.RLock()   # serialise AXI access (main + stream thread)
         self._stream_thread: threading.Thread | None = None
         self._stream_stop: threading.Event | None = None
 
@@ -165,6 +171,10 @@ class VivadoAxiStreamerSession:
     def start(self) -> "VivadoAxiStreamerSession":
         if self._external_executor is not None or self._process is not None:
             return self
+        # (Re)opening: clear the closed flag so a later close() actually tears the new
+        # process down (otherwise a session that was close()d once then restarted would
+        # never close again -- the double-close guard would short-circuit it).
+        self._closed = False
         try:
             self._process = subprocess.Popen(
                 [self.vivado, "-mode", "tcl", "-nolog", "-nojournal"],
@@ -208,6 +218,43 @@ class VivadoAxiStreamerSession:
         except subprocess.TimeoutExpired:
             process.terminate()
         self._process = None
+
+    def _ensure_process(self) -> None:
+        """(Re)start the persistent Vivado for the NEXT transaction, retrying the
+        hardware/debug-core reconnect a few times.  After a close() (an action timeout or
+        broken pipe replaced a wedged Vivado), the freshly spawned process can briefly
+        fail ``get_hw_axis`` with a 'debug core' / 'No JTAG-to-AXI core' error because the
+        previous process has not yet released the JTAG / dbg_hub lock.  A short backoff
+        lets the lock release so the session SELF-HEALS instead of forcing the user to
+        restart the whole server.  No-op (and zero risk) on the happy path: returns
+        immediately while the process is already running."""
+        if self._external_executor is not None or self._process is not None:
+            return
+        attempts = max(1, int(getattr(self, "restart_attempts", 3)))
+        last_exc: "Exception | None" = None
+        for i in range(attempts):
+            try:
+                self.start()
+                return
+            except Exception as exc:           # bring-up / reconnect failed -> drop + retry
+                last_exc = exc
+                self._kill_process()
+                if i + 1 < attempts:
+                    time.sleep(min(5.0, 1.0 * (i + 1)))
+        if last_exc is not None:
+            raise last_exc
+
+    def _kill_process(self) -> None:
+        """Force-kill the persistent Vivado WITHOUT close()'s stream-thread join: this
+        runs from _ensure_process while the caller may hold _io_lock, and joining the
+        refill thread (which itself can want _io_lock) there could deadlock."""
+        proc = self._process
+        self._process = None
+        if proc is not None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------ Tcl build
     def _init_tcl(self) -> list[str]:
@@ -672,8 +719,7 @@ class VivadoAxiStreamerSession:
 
     def _execute(self, lines: Sequence[str], *, action: str, timeout: float | None,
                  stop: "threading.Event | None" = None) -> str:
-        if self._process is None:
-            self.start()
+        self._ensure_process()             # restart + retry the reconnect if a prior op closed us
         process = self._process
         if process is None or process.stdin is None:
             raise RuntimeError("persistent Vivado hw_axi session is not running.")

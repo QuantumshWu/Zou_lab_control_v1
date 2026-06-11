@@ -445,44 +445,53 @@ word per channel in the AXI DELAY register region R_DELAY_BASE) and `bus_delays`
 
 **TTL = EVENT SCHEDULER** (`zlc_edge_streamer.v`): a TTL waveform is toggle-sparse, so
 the engine queues TOGGLES instead of buffering one bit per tick.  When the undelayed bit
-flips at tick `t`, it pushes `{t + d - 1, level}` into that channel's EVT_DEPTH(16)-deep
-49-bit LUTRAM FIFO; a free-running 48-bit `g_time` pops it by equality into the output
-register (`d == 1` is one register; `d == 0` bypasses).  Storage scales with toggles IN
-FLIGHT, not delay length: the TTL bound is the 32-bit field (~42.9 s, ms-scale emCCD
-delays included) at ~2k LUTs for 62 channels (the old per-tick SRL lines cost ~4.1k LUTs
-and capped d at DELAY_DEPTH = 2048 ticks ~ 41 us).
+flips at tick `t`, it pushes `{t + d - 1, level}` into that channel's `EVT_DEPTH`-deep
+(default 256) 49-bit LUTRAM FIFO; a free-running 48-bit `g_time` pops it by equality into
+the output register (`d == 1` is one register; `d == 0` bypasses).  This is a **TRUE
+physical delay**: `out[t] = in[t-d]` for every `t`, **silent for the first `d` ticks**
+(first frame already correct), with **NO modulo / cyclic reduction** -- the old
+`d % sweep_period` reduction (which played the first `floor(d/S)` sweeps early) is GONE.
+Storage scales with toggles IN FLIGHT, not delay length: the bound is the 32-bit field
+(~42.9 s at 20 ns/tick).
 
-**Capacity contract (EXACT, full schedule).**  An event pushed at tick `t` occupies the
-FIFO until `t + d - 1`, so occupancy == the channel's toggle count inside its own d-window.
-`_check_delay_event_capacity` (fpga_pulse_streamer.py) reconstructs the channel's UNDELAYED
-toggle stream over the WHOLE program -- every scan point at its affine-shifted edge times,
-bracket loops, the repeat-forever wrap -- and takes the exact maximum window count (a
-periodic-stream formula handles d >= sweep period; an early version slid a window over ONE
-frame and undercounted scan seams and d > frame).  EVT depth is configurable: keep
-`evt_fifo_depth` (streamer_config.json) == `EVT_FIFO_DEPTH` (zlc_pulse_streamer_top.v).
+**Per-SLOT distributed-RAM FIFO (g_evtfifo generate loop) -- do NOT use a 3D reg array.**
+Each delay slot owns its own 2D `(* ram_style="distributed" *) reg [48:0] fifo[0:EVT_DEPTH-1]`
+with its own wr/rd/cnt/obit, instantiated in a `generate` loop; `evt_out` is the OR of the
+per-slot contributions.  A single flat 3D array `evt_mem[slot][depth]` does **not** infer
+as distributed RAM (each slot has an INDEPENDENT wr/rd pointer, unlike `bus_ring`'s shared
+write pointer), so Vivado falls back to flip-flops -- at depth 256 that is 18*256*49 = 226k
+FF + 256:1 read muxes, which the 35T cannot place (a real build failed exactly this way).
+The FIFOs are **COMPACTED** to the delay-eligible channels only (the 18 real TTL outputs,
+`DELAY_COMPACT`/`NUM_DELAY_CH`/`DELAY_CH_MAP`); the 40 DAC-bus bits (pin driven by `bus_out`)
+and the 4 `da_clk` pins do NOT get a FIFO, so the deep LUTRAM is paid only where it can be
+used.  GUI greys out + the API rejects a delay on a non-eligible channel.
 
-**Repeat-forever delays are programmed modulo the sweep period** (`_with_effective_delays`
-in sequencer.py -> `effective_channel_delays`): the undelayed stream is periodic with the
-sweep period S, so `d` and `d % S` give the SAME steady-state output, while an unreduced
-multi-sweep delay would keep ~toggles_per_sweep*d/S events in flight and overflow.  Only
-startup differs (output begins after `d % S` ticks instead of staying silent for d; the
-user's raw delay survives in the source table, and the raw value is still capped at the
-32-bit field).  Finite (non-forever) programs are never reduced.  **DAC buses keep the
-2048-deep value rings** (one 10-bit ring per bus, ~1.3k LUTs, 41 us cap) -- DAC delays
-are short compensations.
+**Capacity contract (EXACT, full schedule, no modulo).**  An event pushed at tick `t`
+occupies the FIFO until `t + d - 1`, so occupancy == the channel's toggle count inside its
+own d-window.  `_check_delay_event_capacity` (fpga_pulse_streamer.py) reconstructs the
+channel's UNDELAYED toggle stream over the WHOLE program -- every scan point at its
+affine-shifted edge times, bracket loops, the repeat-forever wrap -- and takes the exact
+maximum window count (a periodic-stream formula handles `d >= sweep period`).  A delay whose
+in-flight count exceeds `EVT_DEPTH` is REJECTED with the longest physical delay reported;
+nothing is silently dropped.  **DAC buses keep the 2048-deep value rings** (one 10-bit ring
+per bus, ~1.3k LUTs, ~41 us cap) -- DAC delays are short compensations (per-bus event-FIFO
+unification is future work; the GUI tooltip + clamp use the bus ring cap, not the TTL cap).
+
+**Reconfigurable depth (single source).**  `evt_fifo_depth` lives only in
+`streamer_config.json`.  The host (validator/estimate) reads it; the BUILD reads it too --
+`image.emit_geom_tcl` turns the config into `$zlc_top_generics` (EVT_FIFO_DEPTH, DELAY_DEPTH,
+EDGE_ADDR_WIDTH, BANK_SIZE), `build_and_program.bat --emit-geom-tcl` generates `geom.tcl`,
+and `create_project.tcl` sources it + `set_property generic ... [current_fileset]` so editing
+the JSON changes the SYNTHESIZED bitstream (e.g. 256->128 if a build is LUT-tight).  A
+contract test asserts every generic names a real top parameter (else Vivado ignores it).
 
 Proven: `delay_line_reference` (out[t]=in[t-d]) is the unchanged ground truth;
-`engine_model.rtl_delay_line_mirror` mirrors the scheduler cycle-exactly (incl. the
-overflow-drop guard); `fpga/pulse_streamer/sim/tb_delay_sched.v` verifies the REAL RTL
-in xsim (delays {0,1,2,7,1000}, 1-tick toggles, repeat seams: 11,996 cycles, 0
-mismatches); `sim/tb_evt_depth.v` verifies the FIFO depth BOUNDARY on the real RTL
-(exactly 16 toggles in flight = tick-exact; 18 = only the 2 excess toggles dropped,
-never corruption: EVT-DEPTH-OK).  Randomized tests prove the analytic in-flight count
-== brute-force push/pop occupancy, the periodic formula == explicit unrolling, and
-"fits depth K" => a K-deep mirror reproduces the ideal delay bit-exactly.  The mod-S
-reduction is proven tick-exact in steady state against the unreduced ideal delay
-(test_repeat_forever_delay_reduced_modulo_sweep_period).  Capacity: 14,056 -> 12,184
-LUTs (58.6% of the 35T).
+`engine_model.rtl_delay_line_mirror` mirrors the scheduler cycle-exactly; the REAL RTL is
+verified in xsim -- `tb_delay_sched.v` (delays {0,1,2,7,1000}, 1-tick toggles, repeat seams:
+11,996 cycles, 0 mismatches, DELAY-SCHED-OK), `tb_delay_compact.v` (non-identity slot->channel
+map at depth 256, COMPACT-MAP-OK), `tb_evt_depth.v` (FIFO-depth boundary pinned at 16,
+EVT-DEPTH-OK).  Estimate at depth 256: 67.7% LUT / 21.6% FF on the 35T (the per-slot LUTRAM
+is ~0.7-1.0 LUT per 64x1 cell, measured against this design's `bus_ring`).
 
 ## 9. Pulse API, sync-to-device and GUI state semantics
 

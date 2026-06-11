@@ -15,6 +15,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 from Zou_lab_control.neutral_atom.timing.pulse_table import (
     DELAY_DEPTH_TICKS,
+    BUS_DELAY_DEPTH_TICKS,
     UNITS_TO_NS,
     PulsePeriod,
     PulseTableState,
@@ -57,6 +58,7 @@ from .qt_fluent import (
     FluentTabWidget,
     FluentWindow,
     Metrics,
+    apply_fluent_scrollbars,
     ensure_qt_app,
     fluent_font_size,
     fluent_scrollbar_stylesheet,
@@ -97,11 +99,10 @@ TIME_UNITS = ["ns", "us", "ms", "s", "str (ns)"]
 # duration ("s0" expression); it is set automatically when you bind via the scan dot and
 # is NOT offered in the dropdown for a normal (unbound) duration.
 DURATION_UNITS = ["ns", "us", "ms", "s"]
-# A per-channel delay is bounded to the delay-line depth (~+/-40 us), so only ns / us
-# make sense as units -- ms / s would always exceed the cap, and "str (ns)" (the affine
-# expression unit) is meaningless for a fixed, non-scannable delay.
-# The per-channel TTL delay is a TRUE physical delay bounded by the 32-bit field
-# (~42.9 s), so ms/s are valid units now (the old ns/us limit was the ~41 us ring).
+# The per-channel TTL delay is a TRUE physical delay (out[t] = in[t-d], first frame
+# correct, no modulo) bounded only by the 32-bit field (~42.9 s at 20 ns/tick), so
+# ms / s are valid units.  (DAC-bus delays are still bounded by the 2048-tick ring,
+# ~41 us -- see _bus_delay_cap_text; the bus event-FIFO unification is future work.)
 DELAY_UNITS = ["ns", "us", "ms", "s"]
 
 
@@ -119,6 +120,11 @@ try:  # the eligible-channel count is a fixed hardware fact (board layout)
     NUM_DELAY_CHANNELS = _elig_count(_FPGA_CH)
 except Exception:  # pragma: no cover - host tooling optional
     NUM_DELAY_CHANNELS = 10 ** 9   # unknown -> allow everything (host/RTL still gate)
+
+try:  # the configured per-channel event-FIFO depth (toggles-in-flight cap); shown in tips
+    from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import EVT_FIFO_DEPTH as _EVT_DEPTH
+except Exception:  # pragma: no cover - host tooling optional
+    _EVT_DEPTH = 256
 # Unit->ns factors are owned by the timing layer (pulse_table.UNITS_TO_NS) -- import it
 # rather than keep a second near-identically-named copy that could silently drift.
 UNIT_TO_NS = UNITS_TO_NS
@@ -323,12 +329,19 @@ def _format_clock_text(time_step_ns: float) -> str:
 
 
 def _delay_cap_text(time_step_ns: float) -> str:
-    """Human description of the per-channel delay magnitude cap (the delay-line depth)."""
+    """Human description of the per-channel TTL delay magnitude cap (the 32-bit field)."""
 
     max_us = DELAY_DEPTH_TICKS * float(time_step_ns) / 1000.0
     if max_us >= 1e6:
         return f"±{format_compact_number(max_us / 1e6)} s (event-scheduled; ms-scale delays OK)"
     return f"±{format_compact_number(max_us)} us ({DELAY_DEPTH_TICKS} ticks)"
+
+
+def _bus_delay_cap_text(time_step_ns: float) -> str:
+    """Human description of the DAC-bus delay magnitude cap (the 2048-tick output ring)."""
+
+    max_us = BUS_DELAY_DEPTH_TICKS * float(time_step_ns) / 1000.0
+    return f"±{format_compact_number(max_us)} us ({BUS_DELAY_DEPTH_TICKS}-tick ring)"
 
 
 def _bus_mode_combo_width() -> int:
@@ -1469,10 +1482,23 @@ class ChannelPanel(FluentGroupBox):
             # A per-channel delay is a FIXED output delay (a delay line) and is not
             # scannable, so the field is a plain numeric input -- no scan dot.
             delay_edit = FluentLineEdit(str(delay_value))
-            delay_edit.setToolTip(
-                "Fixed per-channel output delay (may be negative). "
-                f"|delay| is capped at {_delay_cap_text(state.time_step_ns)}."
-            )
+            if is_bus:
+                delay_edit.setToolTip(
+                    "Physical DAC-bus output delay (may be negative): the whole bus waveform "
+                    "shifts by d, out[t] = in[t-d]. "
+                    f"|delay| is capped at {_bus_delay_cap_text(state.time_step_ns)} -- the DAC "
+                    "bus still uses the per-tick output ring, so it cannot reach the long "
+                    "32-bit delays the real TTL channels can."
+                )
+            else:
+                delay_edit.setToolTip(
+                    "Physical per-channel output delay (may be negative): the whole channel "
+                    "waveform shifts by d, out[t] = in[t-d] -- the first frame is already "
+                    "correct (no wrap, no modulo). "
+                    f"|delay| up to {_delay_cap_text(state.time_step_ns)}. The real limit is the "
+                    f"number of edges in flight at once (<= {_EVT_DEPTH}, the event-FIFO depth), "
+                    "not the delay length; the compiler reports the worst-case count if exceeded."
+                )
             delay_edit.setFixedSize(delay_w, row_height)
             # A delay is a number (digits / decimal point / e-notation / sign only).
             delay_edit.set_numeric_validator("float")
@@ -1515,8 +1541,9 @@ class ChannelPanel(FluentGroupBox):
                 unit.setEnabled(False)
                 if not_eligible and not is_clk:
                     delay_edit.setToolTip(
-                        "This channel (a da_clk / clock pin) has no delay line and cannot be "
-                        "delayed -- only the real TTL outputs can.")
+                        f"This is a da_clk / clock pin (hardware position past the "
+                        f"{NUM_DELAY_CHANNELS} delay-eligible outputs); it has no event FIFO and "
+                        "cannot be delayed. Only the real TTL outputs can be delayed.")
 
             self.delay_edits[key] = delay_edit
             self.delay_units[key] = unit
@@ -1572,9 +1599,10 @@ class ChannelPanel(FluentGroupBox):
             edit.set_resolution(_unit_resolution(self.state.time_step_ns, unit))
 
     def _clamp_delay_edit(self, channel: str, edit: FluentLineEdit) -> None:
-        """Clamp a finished delay entry to ±DELAY_DEPTH_TICKS ticks (the delay-line
-        depth); a larger delay can never be realized.  The compiler still raises a
-        clear error if the *span* of delays exceeds the depth after the global shift."""
+        """Clamp a finished delay entry to its physical magnitude cap: the 32-bit field
+        for a real TTL channel, or the 2048-tick output ring for a DAC bus.  A larger
+        delay can never be realized.  The compiler still raises a clear error if the
+        *span* / in-flight count exceeds the limit after the global shift."""
 
         text = edit.text().strip()
         if not text:
@@ -1586,7 +1614,8 @@ class ChannelPanel(FluentGroupBox):
         unit_combo = self.delay_units.get(channel)
         unit_text = unit_combo.currentText() if unit_combo is not None else "ns"
         factor = UNIT_TO_NS.get(unit_text, 1.0) or 1.0
-        max_ns = DELAY_DEPTH_TICKS * float(self.state.time_step_ns)
+        cap_ticks = BUS_DELAY_DEPTH_TICKS if str(channel).startswith("bus:") else DELAY_DEPTH_TICKS
+        max_ns = cap_ticks * float(self.state.time_step_ns)
         value_ns = value * factor
         if abs(value_ns) > max_ns + 1e-6:
             clamped = max(-max_ns, min(max_ns, value_ns)) / factor
@@ -2653,6 +2682,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             f'border: 1px solid #A19F9D; border-radius: {scaled_px(4)}px; '
             f'font: {fluent_font_size()}pt "Consolas", "Courier New", monospace; padding: {_px(4)}px; }}'
         )
+        apply_fluent_scrollbars(self.scan_code)   # match the Edit-tab Fluent scrollbar
         # Top row: load a saved program (.py) or drop in a template that adapts to the
         # currently bound slot count (column_stack is the default starting point).
         template_buttons = QtWidgets.QHBoxLayout()
@@ -2704,6 +2734,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             f'border-radius: {scaled_px(4)}px; font: {fluent_font_size()}pt "Consolas", "Courier New", monospace; '
             f'padding: {_px(4)}px; }}'
         )
+        apply_fluent_scrollbars(self.scan_table_view)   # the scan-points scroll matches Edit tab
         preview_layout.setSpacing(_px(6, minimum=4))
         preview_layout.addWidget(self.scan_table_view, 1)
         # Mirror the left column's button-row footprint so the two boxes share an

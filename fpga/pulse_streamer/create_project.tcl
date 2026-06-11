@@ -85,9 +85,22 @@ if {[info exists ::env(ZLC_PS_FPGA_PART)] && $::env(ZLC_PS_FPGA_PART) ne ""} {
 }
 puts "ZLC synthesis part: $part"
 
-# Geometry (single source: keep in sync with the top + host.image.solve_capacity).
-set zlc_edge_addr_width 12
-set zlc_bank_size 2048
+# Geometry SINGLE SOURCE: streamer_config.json.  build_and_program.bat generates a geom.tcl
+# (python -m fpga.pulse_streamer.host.image --emit-geom-tcl) that sets the base sizing vars +
+# $zlc_top_generics, and points ZLC_PS_GEOM_TCL at it.  Sourcing it BEFORE the literal
+# defaults below lets the config win; when the env var is unset (direct tcl run / no python)
+# the in-file literals are used and the build is byte-identical to before.
+if {[info exists ::env(ZLC_PS_GEOM_TCL)] && $::env(ZLC_PS_GEOM_TCL) ne "" && [file exists $::env(ZLC_PS_GEOM_TCL)]} {
+    puts "ZLC geometry from config: $::env(ZLC_PS_GEOM_TCL)"
+    source $::env(ZLC_PS_GEOM_TCL)
+}
+# Base sizing vars: keep in sync with the top defaults + host.image.  Set ONLY if the sourced
+# geom.tcl did not already (so the config overrides, the literals are the fallback).
+if {![info exists zlc_edge_addr_width]} { set zlc_edge_addr_width 12 }
+if {![info exists zlc_bank_size]}       { set zlc_bank_size 2048 }
+if {![info exists zlc_delay_depth]}     { set zlc_delay_depth 2048 }
+if {![info exists zlc_top_generics]}    { set zlc_top_generics {} }
+# Derived sizes (recomputed from the base vars, whatever their source).
 set zlc_scan_depth [expr {2 * $zlc_bank_size}]
 set zlc_max_edges [expr {1 << $zlc_edge_addr_width}]
 set zlc_coeff_portb_bits 64
@@ -97,9 +110,8 @@ set zlc_coeff_porta_depth [expr {$zlc_max_edges * ($zlc_coeff_portb_bits / 32)}]
 set zlc_mask_porta_depth  [expr {$zlc_max_edges * ($zlc_mask_portb_bits / 32)}]
 set zlc_scan_porta_depth  [expr {$zlc_scan_depth * ($zlc_scan_portb_bits / 32)}]
 # LITERAL OUTPUT delay line: a per-channel / per-bus distributed-RAM circular buffer of depth
-# DELAY_DEPTH(2048) ticks (~40us), inferred inside zlc_edge_streamer (ram_style="distributed",
-# +0 RAMB36).  Its delays ride DENSE CTRL words -- there is NO delay image BRAM to build.
-set zlc_delay_depth 2048
+# DELAY_DEPTH ticks, inferred inside zlc_edge_streamer (ram_style="distributed", +0 RAMB36).
+# The TTL event-scheduler FIFO depth (EVT_FIFO_DEPTH) is a top -generic, not a BRAM size.
 set zlc_axi_bram_depth 65536
 
 puts "ZLC create_project: FINAL engine (1-tick FIFO prefetch + 2-bank streaming), 4096 edges + bank 2048"
@@ -154,6 +166,15 @@ read_verilog [file join $script_dir zlc_edge_streamer.v]
 read_verilog [file join $script_dir zlc_pulse_streamer_top.v]
 read_xdc $xdc_path
 set_property top $top [current_fileset]
+# Override the top's Verilog parameter DEFAULTS with the config-derived geometry so editing
+# streamer_config.json actually changes the synthesized bitstream (e.g. EVT_FIFO_DEPTH 256->128).
+# Empty when no geom.tcl was sourced -> the .v defaults stand.  Read back + echo so a typo'd /
+# silently-ignored generic is visible in the build log (Vivado does not error on an unknown one).
+if {[info exists zlc_top_generics] && [llength $zlc_top_generics]} {
+    set_property generic $zlc_top_generics [current_fileset]
+    puts "ZLC top generics (from config): $zlc_top_generics"
+    puts "ZLC top generics (read-back):   [get_property generic [current_fileset]]"
+}
 
 # --- jtag_axi master ------------------------------------------------------
 # FULL AXI4 (not AXI4-Lite) so the host can issue INCR burst writes -- one

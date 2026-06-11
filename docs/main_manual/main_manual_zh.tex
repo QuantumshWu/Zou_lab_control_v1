@@ -1194,7 +1194,7 @@ s0 = state.bind_field("duration", "1", unit="us")   # s0: 第1周期时长(us)
 s1 = state.bind_field("dac", "da_dipole@2")         # s1: 周期2 上 da_dipole 的 DAC 值
 
 # --- 一个固定的（不可扫）每通道延时，叠加在输出上 ---
-state.delays["cooling"] = 150.0                     # 固定 150 ns 延时线（上限 DELAY_DEPTH≈±40us）
+state.delays["cooling"] = 150.0                     # 固定 150 ns 物理延时（TTL 上限约 ±42.9 s）
 
 # --- 扫描表：4 个点，列顺序 = s0(us), s1(DAC码) ---
 state.set_scan_table(np.array([

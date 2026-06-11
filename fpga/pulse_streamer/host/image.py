@@ -933,6 +933,37 @@ def format_capacity_report(result: dict) -> str:
     return "\n".join(lines)
 
 
+def vivado_generics(params: "StreamerParams") -> "list[str]":
+    """Verilog top-module parameter overrides that make the SYNTHESIZED bitstream match
+    streamer_config.json.  Only the freely-resizable DEPTHS are emitted: the pin-map-coupled
+    geometry (channel_count, num_slots/coeff_width with COEFF_BITS==64, bus_count/bus_width)
+    is locked to the hand-written board pinout + DELAY_CH_MAP in the top, so changing it needs
+    an RTL + XDC edit, not just a generic -- a JSON-vs-.v-default contract test guards those."""
+    return [
+        f"EDGE_ADDR_WIDTH={params.edge_addr_width}",
+        f"BANK_SIZE={params.bank_size}",
+        f"DELAY_DEPTH={params.delay_depth}",
+        f"EVT_FIFO_DEPTH={params.evt_fifo_depth}",
+    ]
+
+
+def emit_geom_tcl(params: "StreamerParams") -> str:
+    """A tiny Tcl snippet that create_project.tcl sources so the BRAM-IP sizing variables AND
+    the top-module generics come from streamer_config.json (one source of truth).  When the
+    env var pointing here is unset, create_project.tcl falls back to its in-file literals, so
+    the current build is byte-identical -- this only takes effect for a config that differs."""
+    generics = " ".join(vivado_generics(params))
+    return (
+        "# AUTO-GENERATED from streamer_config.json by image.emit_geom_tcl -- do not edit.\n"
+        "# Sets the BRAM-IP sizing vars + the top-module -generic overrides for synth.\n"
+        f"set zlc_edge_addr_width {params.edge_addr_width}\n"
+        f"set zlc_bank_size {params.bank_size}\n"
+        f"set zlc_delay_depth {params.delay_depth}\n"
+        f"set zlc_evt_fifo_depth {params.evt_fifo_depth}\n"
+        f"set zlc_top_generics {{{generics}}}\n"
+    )
+
+
 def _main(argv: Sequence[str] | None = None) -> int:
     import argparse
 
@@ -943,7 +974,17 @@ def _main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--config", default=None, help="Path to streamer_config.json (default: auto-detect).")
     parser.add_argument("--part", default=None, help="Override fpga_part for this report only.")
+    parser.add_argument("--emit-geom-tcl", default=None, metavar="PATH",
+                        help="Write the Vivado geometry/generics Tcl (derived from the config) to "
+                             "PATH and exit -- create_project.tcl sources it so the bitstream geometry "
+                             "(EVT_FIFO_DEPTH, DELAY_DEPTH, EDGE_ADDR_WIDTH, BANK_SIZE) follows the config.")
     args = parser.parse_args(list(argv) if argv is not None else None)
+    if args.emit_geom_tcl:
+        import pathlib
+        params = default_params(args.config)
+        pathlib.Path(args.emit_geom_tcl).write_text(emit_geom_tcl(params), encoding="utf-8")
+        print(f"wrote geometry tcl -> {args.emit_geom_tcl}")
+        return 0
     result = check_config_capacity(args.config)
     if args.part:
         # Re-estimate against an override part without editing the file.

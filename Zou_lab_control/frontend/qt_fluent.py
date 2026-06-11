@@ -1119,6 +1119,18 @@ class FluentScrollArea(QtWidgets.QScrollArea):
         )
 
 
+def apply_fluent_scrollbars(widget: "QtWidgets.QAbstractScrollArea") -> None:
+    """Give any scroll-area-based widget (QPlainTextEdit, QTextEdit, QTableView, ...) the
+    SAME Fluent scrollbar look that FluentScrollArea uses, sourced from the one shared
+    ``fluent_scrollbar_stylesheet``.  Appends to (never clobbers) the widget's existing
+    stylesheet, so its own background/border/padding rules are preserved.  Use this when
+    the widget cannot be a FluentScrollArea (e.g. a QPlainTextEdit, which IS already a
+    scroll area and must not be double-nested)."""
+
+    existing = widget.styleSheet()
+    widget.setStyleSheet((existing + "\n" if existing else "") + fluent_scrollbar_stylesheet("QScrollBar"))
+
+
 class FluentWindow(FramelessWindow):
     """Frameless Confocal-style wrapper for PyQt frontends.
 
@@ -1585,6 +1597,7 @@ __all__ = [
     "fluent_font_size",
     "fluent_scale",
     "fluent_scrollbar_stylesheet",
+    "apply_fluent_scrollbars",
     "fluent_spinbox_stylesheet",
     "fluent_text_width",
     "fluent_widget_stylesheet",

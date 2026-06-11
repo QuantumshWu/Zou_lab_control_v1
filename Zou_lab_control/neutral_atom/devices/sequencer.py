@@ -893,28 +893,48 @@ class SequencerService:
 
     def prepare(self, sequence_payload) -> dict[str, object]:
         timing_payload = timing_from_payload(sequence_payload)
-        program = compile_runtime_program_for_payload(
-            timing_payload,
-            channels=self.channels,
-            clock_hz=self.clock_hz,
-            trigger_channels=self.trigger_channels,
-        )
-        # Backstop: validate the compiled program against the FPGA geometry / delay-line depth
-        # REGARDLESS of which backend's prepare_callback runs.  An AXI backend validates with its
-        # own params, but a mock/no-op backend would otherwise cache an invalid program (e.g.
-        # channel_delays beyond DELAY_DEPTH).  Local import breaks the fpga_pulse_streamer <->
-        # sequencer import cycle.
-        from .fpga_pulse_streamer import validate_pulse_streamer_program
-        # Scan points STREAM through the 2-bank window, so their count is UNBOUNDED --
-        # pass the program's own count (like the AXI backend does), never the resident
-        # window size, and sample the per-point monotonicity sweep so a huge scan does
-        # not stall prepare().
-        validate_pulse_streamer_program(
-            program,
-            channel_count=len(self.channels),
-            max_scan_points=max(1, len(program.scan_points or [])),
-            max_validated_scan_points=4096,
-        )
+        try:
+            program = compile_runtime_program_for_payload(
+                timing_payload,
+                channels=self.channels,
+                clock_hz=self.clock_hz,
+                trigger_channels=self.trigger_channels,
+            )
+            # Backstop: validate the compiled program against the FPGA geometry / delay-line
+            # depth REGARDLESS of which backend's prepare_callback runs.  An AXI backend
+            # validates with its own params, but a mock/no-op backend would otherwise cache an
+            # invalid program (e.g. channel_delays beyond the event-FIFO capacity).  Local
+            # import breaks the fpga_pulse_streamer <-> sequencer import cycle.
+            from .fpga_pulse_streamer import validate_pulse_streamer_program
+            # Scan points STREAM through the 2-bank window, so their count is UNBOUNDED --
+            # pass the program's own count (like the AXI backend does), never the resident
+            # window size, and sample the per-point monotonicity sweep so a huge scan does
+            # not stall prepare().
+            validate_pulse_streamer_program(
+                program,
+                channel_count=len(self.channels),
+                max_scan_points=max(1, len(program.scan_points or [])),
+                max_validated_scan_points=4096,
+            )
+        except Exception:
+            # A REJECTED program (e.g. a channel delay over the event-FIFO capacity) raises
+            # HERE, before prepare_callback -- so the backend's own stop/safe never runs.  If
+            # a prior repeat_forever STREAMED scan is still being fed by the backend's
+            # background refill thread, leaving it alive lets it keep using the single Vivado
+            # Tcl session and wedge the NEXT (good) On Pulse.  Best-effort safe the backend so
+            # the orphaned stream is stopped; never mask the original validation error.
+            prev = self.prepared_program
+            streamed = bool(
+                prev is not None
+                and getattr(prev, "repeat_forever", False)
+                and getattr(prev, "scan_points", None)
+            )
+            if streamed and self.safe_state_callback is not None:
+                try:
+                    self.safe_state_callback()
+                except Exception:
+                    pass
+            raise
         with self._lock:
             cached = (
                 self.cache_prepared

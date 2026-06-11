@@ -3325,6 +3325,90 @@ def test_sequencer_service_safe_state_invalidates_prepare_cache():
     assert [row["invalidated"] for row in service.history if row["action"] in {"safe", "abort"}] == [True, True]
 
 
+def test_rejected_streamed_prepare_safes_backend_then_recovers(monkeypatch):
+    """A REJECTED program (e.g. a delay over the event-FIFO capacity) raises in
+    SequencerService.prepare before prepare_callback.  If a prior repeat_forever STREAMED
+    scan was running, leaving its backend refill thread alive wedges the NEXT On Pulse, so
+    the reject must best-effort safe the backend.  And the next (good) prepare must just
+    work -- no teardown, no server restart."""
+    import pytest
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.devices import fpga_pulse_streamer as fps
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
+
+    safe_calls: list[bool] = []
+    prepared: list[str] = []
+    service = na.SequencerService(
+        channels=["ch00", "ch03"],
+        clock_hz=100_000_000,
+        prepare_callback=lambda p: prepared.append(p.sequence_id),
+        safe_state_callback=lambda: safe_calls.append(True),
+    )
+    # pretend a repeat_forever STREAMED scan is the currently-applied program
+    service.prepared_program = RuntimeSequenceProgram(
+        sequence_id="prior", sequence_name="prior", clock_hz=100e6,
+        channels=["ch00", "ch03"], ticks=[0, 10], masks=[1, 0], duration=1e-6,
+        trigger_count=0, loop_end_tick=10, loop_count=1, slot_count=1,
+        repeat_forever=True, scan_points=[[0], [1]])
+
+    state = na.PulseTableState(
+        channels=["ch00", "ch03"],
+        periods=[na.PulsePeriod(20, (1, 1), unit="ns"), na.PulsePeriod(20, (0, 0), unit="ns")],
+        time_step_ns=10, repeat_forever=True)
+
+    def _boom(*_a, **_k):
+        raise ValueError("channel ch00 delay exceeds the per-channel event FIFO")
+
+    orig = fps.validate_pulse_streamer_program
+    monkeypatch.setattr(fps, "validate_pulse_streamer_program", _boom)
+    with pytest.raises(ValueError):
+        service.prepare(state)
+    assert safe_calls == [True]          # orphaned stream stopped on reject
+    assert prepared == []                # the bad program never reached the backend
+
+    monkeypatch.setattr(fps, "validate_pulse_streamer_program", orig)
+    service.prepare(state)               # the next (good) On Pulse just works
+    assert prepared                      # backend prepared the recovered program
+    assert safe_calls == [True]          # a SUCCESSFUL prepare does not extra-safe
+
+
+def test_axi_session_recovers_from_close_without_server_restart(tmp_path, monkeypatch):
+    """The persistent Vivado session must SELF-HEAL after a close() (action timeout /
+    broken pipe): (1) _io_lock is reentrant so the auto-restart start()->_run_tcl does not
+    deadlock under the lock it already holds; (2) _ensure_process retries the hw/debug-core
+    reconnect so a transient 'debug core' failure recovers instead of needing a server
+    restart."""
+    import threading
+    from Zou_lab_control.neutral_atom.devices import axi_session as axi_mod
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+
+    s = VivadoAxiStreamerSession(state_dir=tmp_path, tcl_executor=lambda *a: "ok\n")
+    # reentrant: the SAME thread can acquire twice (a plain Lock would fail the 2nd).
+    assert s._io_lock.acquire(blocking=False)
+    assert s._io_lock.acquire(blocking=False)
+    s._io_lock.release()
+    s._io_lock.release()
+    assert isinstance(s._io_lock, type(threading.RLock()))
+
+    # reconnect retry: a real (executor-less) session whose first 2 starts fail with a
+    # debug-core error must retry and succeed on the 3rd, leaving a live process.
+    s2 = VivadoAxiStreamerSession(state_dir=tmp_path)
+    monkeypatch.setattr(axi_mod.time, "sleep", lambda *_a, **_k: None)
+    calls = {"n": 0}
+
+    def flaky_start():
+        calls["n"] += 1
+        s2._process = object()           # a process spawned...
+        if calls["n"] < 3:
+            raise RuntimeError("failed to connect to debug core / No JTAG-to-AXI core")
+        return s2                        # ...and the 3rd reconnect succeeds
+
+    monkeypatch.setattr(s2, "start", flaky_start)
+    s2._ensure_process()
+    assert calls["n"] == 3
+    assert s2._process is not None
+
+
 class _FakeVivadoStdout:
     def __init__(self):
         self.items: queue.Queue[str | None] = queue.Queue()
@@ -5036,6 +5120,45 @@ def test_evt_fifo_depth_single_source_contract():
     assert int(eng_match.group(1)) == cfg_depth, "engine EVT_DEPTH default != streamer_config.json"
     assert EVT_FIFO_DEPTH == cfg_depth
     assert int(engine_model.EVT_FIFO_DEPTH) == cfg_depth
+
+
+def test_build_geometry_driven_from_config_via_generics():
+    """Editing streamer_config.json must change the SYNTHESIZED bitstream, not just the host:
+    image.emit_geom_tcl turns the config into the BRAM sizing vars + top -generic overrides,
+    build_and_program.bat generates it, and create_project.tcl sources it + applies the
+    generics.  EVERY emitted generic must name a REAL top parameter, else Vivado silently
+    ignores it and the bitstream keeps the .v default (the exact silent-divergence we fix)."""
+    import pathlib
+    import re
+    from fpga.pulse_streamer.host import image as im
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    params = im.default_params()
+    generics = im.vivado_generics(params)
+    geom = im.emit_geom_tcl(params)
+    top = (root / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
+    tcl = (root / "fpga" / "pulse_streamer" / "create_project.tcl").read_text(encoding="utf-8")
+    bat = (root / "fpga" / "build_and_program.bat").read_text(encoding="utf-8")
+
+    # the generics carry the freely-resizable depths and match the config
+    names = {g.split("=")[0]: int(g.split("=")[1]) for g in generics}
+    assert names["EVT_FIFO_DEPTH"] == params.evt_fifo_depth
+    assert names["DELAY_DEPTH"] == params.delay_depth
+    assert names["BANK_SIZE"] == params.bank_size
+    assert names["EDGE_ADDR_WIDTH"] == params.edge_addr_width
+    # EVERY generic must be an actual top-module parameter (or Vivado ignores it silently)
+    top_params = set(re.findall(r"parameter\s+integer\s+(\w+)\s*=", top))
+    for name in names:
+        assert name in top_params, f"generic {name} is not a zlc_pulse_streamer_top parameter"
+    # the emitted geom.tcl sets the sizing vars + the generics var the tcl consumes
+    assert "set zlc_evt_fifo_depth" in geom and "set zlc_top_generics {" in geom
+    # create_project.tcl sources the config geom + applies the generics with a read-back echo
+    assert "ZLC_PS_GEOM_TCL" in tcl
+    assert "source $::env(ZLC_PS_GEOM_TCL)" in tcl
+    assert "set_property generic $zlc_top_generics [current_fileset]" in tcl
+    assert "get_property generic [current_fileset]" in tcl   # read-back so a bad generic is visible
+    # build_and_program.bat generates the geom tcl and points the env var at it
+    assert "--emit-geom-tcl" in bat and "ZLC_PS_GEOM_TCL=" in bat and "call :zlc_emit_geom" in bat
     # and the top must actually pass the parameter to the engine instance
     assert ".EVT_DEPTH(EVT_FIFO_DEPTH)" in top
 
