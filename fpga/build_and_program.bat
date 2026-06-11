@@ -41,7 +41,11 @@ if /I "%~1"=="--check" set "MODE=check"
 if /I "%~1"=="--diagnose" set "MODE=diagnose"
 if /I "%~1"=="--build-only" set "MODE=build"
 if /I "%~1"=="--program-only" set "MODE=program"
-if not "%~1"=="" if "%MODE%"=="all" (
+rem --force-build / --rebuild: rebuild even if the sources are unchanged (default mode otherwise
+rem skips the build and programs the existing bitstream when nothing changed).
+if /I "%~1"=="--force-build" set "ZLC_FORCE_BUILD=1"
+if /I "%~1"=="--rebuild" set "ZLC_FORCE_BUILD=1"
+if not "%~1"=="" if "%MODE%"=="all" if not defined ZLC_FORCE_BUILD (
   echo Unknown option: %~1
   echo.
   goto zlc_help
@@ -63,9 +67,21 @@ if /I "%MODE%"=="diagnose" (
 
 if /I "%MODE%"=="program" goto zlc_program
 
+rem Skip the (slow) synth+impl when a bitstream already exists and NONE of the sources that go
+rem into it changed since it was built -- just program the existing .bit.  Only in the default
+rem (build+program) mode, and only when --force-build / --rebuild was NOT given.
+call :zlc_check_prebuilt
+if /I "%MODE%"=="all" if not defined ZLC_FORCE_BUILD if defined ZLC_PREBUILT (
+  echo ZLC bitstream is up to date ^(sources unchanged since last build^) -- skipping build.
+  echo ZLC   bit: !ZLC_BIT!
+  echo ZLC   ^(force a rebuild with: build_and_program.bat --force-build^)
+  goto zlc_program
+)
+
 echo ZLC FPGA pulse streamer: build FINAL bitstream (1-tick FIFO prefetch + streaming, JTAG-to-AXI)
 call :zlc_run_tcl "!ZLC_CREATE_TCL!"
 if errorlevel 1 exit /b 1
+call :zlc_save_src_hash
 
 if /I "%MODE%"=="build" exit /b 0
 if /I "%MODE%"=="check" exit /b 0
@@ -81,11 +97,17 @@ echo Control path: JTAG-to-AXI master -^> AXI BRAM controller -^> edge/scan BRAM
 echo Engine: 1-tick (20 ns) FIFO prefetch + unbounded 2-bank streaming scan.
 echo.
 echo Usage:
-echo   fpga\build_and_program.bat              Build and program
+echo   fpga\build_and_program.bat              Build (only if sources changed) and program
+echo   fpga\build_and_program.bat --force-build Rebuild even if the sources are unchanged
 echo   fpga\build_and_program.bat --build-only Build only
 echo   fpga\build_and_program.bat --program-only Program existing bitstream
 echo   fpga\build_and_program.bat --check      Build only (alias of --build-only)
 echo   fpga\build_and_program.bat --diagnose   List Vivado hw targets/devices
+echo.
+echo The default mode SKIPS the (slow) synth+impl when a bitstream already exists and none of
+echo the sources that go into it (engine/top HDL, create/program tcl, board XDC, streamer_config,
+echo geom tcl) changed since it was built -- it just programs the existing .bit.  --force-build
+echo (or --rebuild) forces a rebuild.  The build-cache key is fpga\build\ps\.zlc_src_hash.
 echo.
 echo Real build XDC:
 echo   fpga\board_config\board.xdc
@@ -192,6 +214,42 @@ python -m fpga.pulse_streamer.host.image --emit-geom-tcl "%ZLC_GEOM_OUT%" >nul 2
 popd
 :zlc_emit_geom_done
 if not "%ZLC_PS_GEOM_TCL%"=="" echo ZLC geometry tcl: %ZLC_PS_GEOM_TCL% (from streamer_config.json)
+exit /b 0
+
+:zlc_compute_src_hash
+rem Hash the files that go into the bitstream (engine + top + build tcl + program tcl + XDC +
+rem board config + the generated geom tcl).  ZLC_SRC_HASH stays empty if python is missing ->
+rem then the skip is simply disabled (always rebuild), never a wrong skip.
+set "ZLC_SRC_HASH="
+where python >nul 2>nul
+if errorlevel 1 exit /b 0
+set "ZLC_HASH_GEOM="
+if defined ZLC_PS_GEOM_TCL if exist "%ZLC_PS_GEOM_TCL%" set "ZLC_HASH_GEOM=%ZLC_PS_GEOM_TCL%"
+for /f "delims=" %%H in ('python "%STREAMER_DIR%\host\src_hash.py" "%STREAMER_DIR%\zlc_edge_streamer.v" "%STREAMER_DIR%\zlc_pulse_streamer_top.v" "%STREAMER_DIR%\!ZLC_CREATE_TCL!" "%STREAMER_DIR%\!ZLC_PROGRAM_TCL!" "!ZLC_SELECTED_XDC!" "%REPO_ROOT%\fpga\board_config\streamer_config.json" "!ZLC_HASH_GEOM!" 2^>nul') do set "ZLC_SRC_HASH=%%H"
+exit /b 0
+
+:zlc_check_prebuilt
+rem Set ZLC_PREBUILT=1 iff the bitstream exists AND the stored source hash matches the current
+rem sources (i.e. nothing that affects the .bit changed since it was built).
+set "ZLC_PREBUILT="
+set "ZLC_BIT=%ZLC_PS_PROJECT_DIR%\%ZLC_PROJ_SUB%.runs\impl_1\zlc_pulse_streamer_top.bit"
+set "ZLC_HASHFILE=%ZLC_PS_PROJECT_DIR%\.zlc_src_hash"
+if not exist "%ZLC_BIT%" exit /b 0
+if not exist "%ZLC_HASHFILE%" exit /b 0
+call :zlc_compute_src_hash
+if not defined ZLC_SRC_HASH exit /b 0
+set "ZLC_STORED_HASH="
+set /p ZLC_STORED_HASH=<"%ZLC_HASHFILE%"
+if "%ZLC_STORED_HASH%"=="%ZLC_SRC_HASH%" set "ZLC_PREBUILT=1"
+exit /b 0
+
+:zlc_save_src_hash
+rem Record the current source hash next to the freshly built bitstream so the next default-mode
+rem run can skip the build when nothing changed.
+call :zlc_compute_src_hash
+if not defined ZLC_SRC_HASH exit /b 0
+if not exist "%ZLC_PS_PROJECT_DIR%\" exit /b 0
+> "%ZLC_PS_PROJECT_DIR%\.zlc_src_hash" echo %ZLC_SRC_HASH%
 exit /b 0
 
 :zlc_print_capacity_estimate
