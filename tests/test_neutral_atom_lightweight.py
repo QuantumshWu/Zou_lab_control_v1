@@ -2958,7 +2958,7 @@ def test_delay_depth_constants_agree_across_layers():
 
     assert DELAY_DEPTH_TICKS == TTL_DELAY_MAX_TICKS == (1 << 31) - 1
     assert BUS_DELAY_DEPTH_TICKS == DEFAULT_DELAY_DEPTH == 2048
-    assert EVT_FIFO_DEPTH == 16
+    assert EVT_FIFO_DEPTH == 256
     try:
         import importlib.util as _ilu
         import pathlib as _pl
@@ -4795,11 +4795,13 @@ def test_delay_line_bounded_cap_rejected_clearly():
     with pytest.raises(ValueError, match="DELAY_DEPTH=2048"):
         validate_pulse_streamer_program(busover, channel_count=62)
     # toggle burst denser than the event FIFO inside one delay window -> clear error
+    # (PHYSICAL delay, no modulo: more than EVT_FIFO_DEPTH edges in the d-window is rejected
+    # with the longest delay that would fit).
     n = EVT_FIFO_DEPTH + 2
-    ticks = [0] + [10 + 2 * i for i in range(n)] + [1000]
+    ticks = [0] + [10 + i for i in range(n)] + [10 + n + 600]
     masks = [0] + [(i % 2 == 0) and (1 << 3) or 0 for i in range(n)] + [0]
     cd_burst = [0] * 62
-    cd_burst[3] = 500                          # window >> burst span
+    cd_burst[3] = 500                          # window >> burst span -> all n edges in flight
     with pytest.raises(ValueError, match="event FIFO"):
         validate_pulse_streamer_program(prog(cd=cd_burst, ticks=ticks, masks=masks), channel_count=62)
 
@@ -4827,39 +4829,34 @@ def test_delay_event_capacity_counts_full_schedule():
         defaults.update(kw)
         return RuntimeSequenceProgram(**defaults)
 
-    # (a) repeat-forever, d spanning MANY frames: 4 toggles/frame x 10 frames in
-    # flight = 40 >> 16.  The old one-frame duplication saw at most 8.
+    # (a) repeat-forever, d spanning MANY frames is counted ACROSS frames (no modulo):
+    # 4 toggles / 100-tick frame, d=10000 -> ~400 edges in flight >> 256 -> rejected with
+    # the longest physical delay reported (the old one-frame check saw at most 8).
     ticks = [0, 10, 20, 30, 40, 100]
     masks = [0, 1 << bit, 0, 1 << bit, 0, 0]
     cd = [0] * 62
-    cd[bit] = 1000
-    with pytest.raises(ValueError, match="congruent delay"):
+    cd[bit] = 10000
+    with pytest.raises(ValueError, match="longest physical delay"):
         validate_pulse_streamer_program(prog(ticks, masks, cd, repeat_forever=True), channel_count=62)
-    # a short in-frame delay on the same stream passes
+    # a delay whose in-flight count fits passes (d=6000 -> 4*60 = 240 <= 256).
     cd_ok = [0] * 62
-    cd_ok[bit] = 60
+    cd_ok[bit] = 6000
     validate_pulse_streamer_program(prog(ticks, masks, cd_ok, repeat_forever=True), channel_count=62)
 
-    # (a2) d >= period but SPARSE: fits the FIFO even unreduced -> accepted.
-    sparse_masks = [0, 1 << bit, 0, 0, 0, 0]
-    cd_sparse = [0] * 62
-    cd_sparse[bit] = 350                     # ~3.5 frames x 2 toggles = ~8 in flight
-    validate_pulse_streamer_program(prog(ticks, sparse_masks, cd_sparse, repeat_forever=True), channel_count=62)
+    # (a3) the periodic count is EXACT: 4/frame, period 100, d=6450 covers up to 66
+    # frames -> 264 in flight; the naive 4*(6450//100)=256 estimate would (just) pass.
+    cd_exact = [0] * 62
+    cd_exact[bit] = 6450
+    with pytest.raises(ValueError, match="longest physical delay"):
+        validate_pulse_streamer_program(prog(ticks, masks, cd_exact, repeat_forever=True), channel_count=62)
 
-    # (a3) the periodic count is EXACT: 4 toggles/frame, period 100, d=450 covers
-    # up to 5 frames -> 20 in flight (the naive 4*(450//100)=16 estimate would pass).
-    cd_450 = [0] * 62
-    cd_450[bit] = 450
-    with pytest.raises(ValueError, match="congruent delay"):
-        validate_pulse_streamer_program(prog(ticks, masks, cd_450, repeat_forever=True), channel_count=62)
-
-    # (b) scan-point SEAM: 10 toggles at the start of the frame + 10 at the end;
-    # a 20-tick window across the seam holds 20 > 16, while any window inside
-    # ONE frame holds at most 11 (the old base-frame check passed this).
-    seam_ticks = [0] + list(range(1, 11)) + list(range(90, 100)) + [100]
+    # (b) scan-point SEAM: 140 toggles at the start of the frame + 140 at the end; a
+    # window bridging the seam holds 280 > 256, while any window inside ONE frame holds
+    # at most ~141 (the old base-frame check passed this).
+    seam_ticks = [0] + list(range(1, 141)) + list(range(900, 1040)) + [1040]
     val = 0
     seam_masks = [0]
-    for _ in range(20):
+    for _ in range(280):
         val ^= (1 << bit)
         seam_masks.append(val)
     seam_masks.append(0)
@@ -4867,7 +4864,7 @@ def test_delay_event_capacity_counts_full_schedule():
     base = dict(slot_count=1, tick_slot_coeffs=[[0]] * n_edges, loop_end_slot_coeffs=[0],
                 scan_points=[[0], [0]])
     cd_seam = [0] * 62
-    cd_seam[bit] = 20
+    cd_seam[bit] = 300                       # window spans frame-1 end + frame-2 start (280 edges)
     with pytest.raises(ValueError, match="event FIFO"):
         validate_pulse_streamer_program(prog(seam_ticks, seam_masks, cd_seam, **base), channel_count=62)
     # the same frame with a window too short to bridge the seam passes
@@ -4925,14 +4922,13 @@ def test_delay_event_capacity_matches_scheduler_occupancy():
         assert mirrored == ideal, (sorted(toggle_at), d, depth_needed)
 
 
-def test_repeat_forever_delay_reduced_modulo_sweep_period():
-    """The compiler programs repeat-forever delays modulo the sweep period.
+def test_repeat_forever_delay_is_physical_not_reduced():
+    """The compiler programs the TRUE PHYSICAL delay -- NO modulo reduction.
 
-    A delay of several sweep periods is congruent to d % S on a periodic
-    stream: the programmed (reduced) delay produces the SAME steady-state
-    output, and without the reduction the event FIFO would need
-    ~toggles_per_sweep * d/S slots.  The user-entered delay survives untouched
-    in the source pulse table."""
+    A repeat-forever delay of several frames stays exactly as entered (the first
+    frame is correct: the channel is silent for the full d, not playing early).
+    It validates only while the in-flight edge count fits the event FIFO, and the
+    played output equals the ideal delay line for EVERY tick (including startup)."""
     import dataclasses
     import Zou_lab_control.neutral_atom as na
     from Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer import (
@@ -4940,33 +4936,47 @@ def test_repeat_forever_delay_reduced_modulo_sweep_period():
     from Zou_lab_control.neutral_atom.devices.sequencer import compile_pulse_table_runtime_program
     from fpga.pulse_streamer.host.engine_model import delay_line_reference, reference_play
 
+    # frame = 2 * 1000 ns / 20 = 100 ticks; ch01 toggles ~twice/frame.  d = 6000 ticks
+    # spans 60 frames -> ~120 edges in flight, which FITS the depth-256 event FIFO.
     state = na.PulseTableState(
         channels=["ch00", "ch01"], visible_channels=["ch00", "ch01"],
         periods=[na.PulsePeriod(1000, (1, 0), unit="ns"),
                  na.PulsePeriod(1000, (0, 1), unit="ns")],
         time_step_ns=20,
-        delays={"ch01": "250000"},          # 12,500 ticks >> the 100-tick frame
+        delays={"ch01": "120000"},          # 6,000 ticks (60 frames)
     )
     program = compile_pulse_table_runtime_program(state, repeat_forever=True)
     period = steady_sweep_ticks(program)
     assert period > 0
     bit = program.channels.index("ch01")
-    reduced = int(program.channel_delays[bit])
-    assert reduced == 12_500 % period
-    assert reduced < period
+    d = int(program.channel_delays[bit])
+    assert d == 6_000                       # NOT reduced -- the true physical delay
+    assert d > period                       # genuinely spans many frames
     validate_pulse_streamer_program(program, channel_count=len(program.channels))
-    # the user's delay is still in the source table
-    assert program.source_table["delays"]["ch01"] == "250000"
+    assert program.source_table["delays"]["ch01"] == "120000"
 
-    # steady-state equivalence: play the program (reduced delay) and compare its
-    # ch01 output to the ideal UNREDUCED d=12,500 delay of the undelayed stream.
+    # physical: out[t] = in[t-d] for EVERY t, 0 for t < d (first frame correct).
     undelayed = dataclasses.replace(program, channel_delays=None)
-    n_ticks = 12_500 + 4 * period
+    n_ticks = d + 4 * period
     raw = reference_play(undelayed, n_ticks)
-    ideal_full = delay_line_reference([(m >> bit) & 1 for m in raw], {0: 12_500})
+    ideal_full = delay_line_reference([(m >> bit) & 1 for m in raw], {0: d})
     played = reference_play(program, n_ticks)
     got = [(m >> bit) & 1 for m in played]
-    assert got[12_500:] == ideal_full[12_500:]   # tick-exact steady state
+    assert got == ideal_full                # tick-exact from t=0, including the silent startup
+    assert all(v == 0 for v in got[:d])     # channel silent for the full physical delay
+
+    # ...and a delay so long the in-flight edges exceed the FIFO is REJECTED (no
+    # modulo papers over it), with the longest physical delay reported.
+    state2 = na.PulseTableState(
+        channels=["ch00", "ch01"], visible_channels=["ch00", "ch01"],
+        periods=[na.PulsePeriod(1000, (1, 0), unit="ns"),
+                 na.PulsePeriod(1000, (0, 1), unit="ns")],
+        time_step_ns=20,
+        delays={"ch01": "2000000"},        # 100,000 ticks, ~2000 edges in flight
+    )
+    prog2 = compile_pulse_table_runtime_program(state2, repeat_forever=True)
+    with pytest.raises(ValueError, match="longest physical delay"):
+        validate_pulse_streamer_program(prog2, channel_count=len(prog2.channels))
 
 
 def test_evt_fifo_depth_single_source_contract():

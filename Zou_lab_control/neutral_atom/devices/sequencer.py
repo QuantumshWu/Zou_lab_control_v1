@@ -50,32 +50,23 @@ def _channel_delays_list(channel_delays: Mapping[int, int] | None, n_channels: i
 
 
 def _with_effective_delays(program: "RuntimeSequenceProgram") -> "RuntimeSequenceProgram":
-    """Reduce repeat-forever channel delays modulo the sweep period.
+    """Enforce the 32-bit delay-field cap on the PHYSICAL channel delays.
 
-    Under ``repeat_forever`` the undelayed stream is periodic, so ``d`` and
-    ``d % sweep_period`` produce the SAME steady-state output -- the reduced
-    delay is what gets programmed (an unreduced multi-sweep delay would need
-    ``~toggles_per_sweep * d/period`` event-FIFO slots and overflow).  Only the
-    startup differs: the delayed channel begins after ``d % period`` ticks
-    instead of staying silent for the full ``d``.  The SOURCE delay the user
-    typed stays untouched in the payload/pulse table."""
+    The delay is a TRUE physical delay -- ``out[t] = in[t-d]``, the channel
+    silent for the first ``d`` ticks -- with NO modulo-by-period reduction (a
+    reduction would make the first sweeps play early; the first frame must be
+    correct).  The only host-side bound is the 32-bit delay field; whether the
+    in-flight edge count fits the event FIFO is checked separately by
+    ``validate_pulse_streamer_program`` (which rejects, with the max delay, if
+    the delay is too long for that channel's toggle rate)."""
     if not program.channel_delays:
         return program
-    from dataclasses import replace
-    from .fpga_pulse_streamer import TTL_DELAY_MAX_TICKS, effective_channel_delays
-    # The 32-bit delay field (~42.9 s) is a USER-FACING cap on the entered delay;
-    # enforce it on the RAW value (the mod-period reduction below could otherwise
-    # silently legalise an over-cap entry).
+    from .fpga_pulse_streamer import TTL_DELAY_MAX_TICKS
     for b, d in enumerate(program.channel_delays):
         if int(d) > TTL_DELAY_MAX_TICKS:
             raise ValueError(
                 f"channel-delay output bit {b}: delay {int(d)} ticks is outside "
                 f"[0, {TTL_DELAY_MAX_TICKS}] (~{TTL_DELAY_MAX_TICKS * 20e-9:.1f} s at 20 ns/tick).")
-    if not program.repeat_forever:
-        return program
-    reduced = effective_channel_delays(program)
-    if reduced != [int(d) for d in program.channel_delays]:
-        program = replace(program, channel_delays=reduced)
     return program
 
 

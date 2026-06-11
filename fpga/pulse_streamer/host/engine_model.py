@@ -54,7 +54,7 @@ __all__ = [
 # global shift G, which can push an effective delay to ~30 us).
 DELAY_DEPTH = 2048            # DAC bus ring depth (TTL no longer uses it)
 TTL_DELAY_MAX_TICKS = (1 << 31) - 1
-EVT_FIFO_DEPTH = 16
+EVT_FIFO_DEPTH = 256          # per-channel TTL event FIFO depth (in-flight edges)
 
 
 class DelayDepthExceeded(ValueError):

@@ -323,6 +323,11 @@ def validate_pulse_streamer_program(
             raise ValueError(
                 f"channel-delay output bit {b}: delay {d} ticks is outside "
                 f"[0, {TTL_DELAY_MAX_TICKS}] (~{TTL_DELAY_MAX_TICKS * 20e-9:.1f} s at 20 ns/tick).")
+    # (Delay-ELIGIBILITY -- only the real TTL outputs have an event FIFO, not the bus
+    # bits / da_clk pins -- is enforced user-facing at the GUI/API level by HARDWARE
+    # position; the RTL also gates a stray non-eligible delay to a passthrough.  It is
+    # not re-checked here: this validator sees only the program's channel SUBSET, whose
+    # index does not map to the hardware position.)
     # (the event-FIFO capacity analysis runs at the END of this validator, after
     # the tick/loop/scan geometry checks -- it assumes validated geometry, e.g.
     # loop_end > loop_start at every scan point)
@@ -731,23 +736,15 @@ def steady_sweep_ticks(program, *, frac_bits: int | None = None) -> int:
 
 
 def effective_channel_delays(program, *, frac_bits: int | None = None) -> list[int]:
-    """Channel delays as they should be PROGRAMMED into the delay registers.
+    """Channel delays as PROGRAMMED -- the TRUE physical delays, unchanged.
 
-    Under ``repeat_forever`` the undelayed stream is periodic with the sweep
-    period ``S``, so a delay ``d >= S`` is congruent to ``d % S``: the steady
-    state is tick-exact, and only the startup differs (the delayed channel
-    starts producing after ``d % S`` ticks instead of staying silent for the
-    full ``d`` -- the first ``floor(d/S)`` sweeps play "early").  Without the
-    reduction such delays would need ``~toggles_per_sweep * d/S`` FIFO slots
-    and overflow the event scheduler.  Finite programs are returned unchanged
-    (the reduction is only valid for a periodic stream)."""
-    delays = [int(d) for d in (getattr(program, "channel_delays", None) or [])]
-    if not delays or not any(delays) or not bool(getattr(program, "repeat_forever", False)):
-        return delays
-    period = steady_sweep_ticks(program, frac_bits=frac_bits)
-    if period <= 0:
-        return delays
-    return [d % period if d >= period else d for d in delays]
+    The delay is genuinely physical (``out[t]=in[t-d]``, silent for the first
+    ``d`` ticks; the first frame is correct).  There is NO modulo-by-period
+    reduction -- whether the in-flight edge count fits the event FIFO is a
+    capacity question enforced by ``validate_pulse_streamer_program``, not
+    something papered over by rewriting the delay.  Kept as an identity helper
+    so callers have one named place for "the delays that hit the hardware"."""
+    return [int(d) for d in (getattr(program, "channel_delays", None) or [])]
 
 
 def _max_in_flight_toggles(toggles: Sequence[int], d: int) -> int:
@@ -864,12 +861,14 @@ def _check_delay_event_capacity(program, *, evt_depth: int, frac_bits: int,
             per_frame = per_frame_counts.get(b, 0) + 1   # +1 for a possible seam toggle
             bound = per_frame * (d // min_frame + 2)
             if bound > evt_depth:
+                max_d = max(0, evt_depth * min_frame // max(1, per_frame))
                 raise ValueError(
-                    f"channel-delay output bit {b}: up to ~{bound} toggles could be in flight "
-                    f"inside one {d}-tick delay window (conservative estimate; the sweep is too "
-                    f"large to verify exactly), but the per-channel event FIFO holds {evt_depth}. "
-                    f"Reduce the delay or the toggle rate on this channel, or rebuild the "
-                    f"bitstream with a larger evt_fifo_depth.")
+                    f"channel-delay output bit {b}: a PHYSICAL delay of {d} ticks could keep up to "
+                    f"~{bound} edges in flight (conservative estimate; the sweep is too large to "
+                    f"verify exactly), but the per-channel event FIFO holds {evt_depth}. The longest "
+                    f"physical delay this channel's toggle rate allows is about {max_d} ticks. "
+                    f"Reduce the delay or the channel's toggle rate, or rebuild the bitstream with a "
+                    f"larger evt_fifo_depth.")
         return
 
     sweep_a, period_a = _sweep_events(program, frac_bits, start_index=0)
@@ -883,30 +882,27 @@ def _check_delay_event_capacity(program, *, evt_depth: int, frac_bits: int,
         toggles, end_bit = _channel_toggle_times(sweep_a, b, 0)
         if forever and sweep_b:
             if d >= period_b > 0:
-                # A delay spanning whole sweeps: the steady stream is periodic,
-                # so compute the EXACT periodic window maximum (a finite
-                # unrolling would undercount here).  The compiler avoids this
-                # case entirely by programming d % period -- suggest it.
+                # TRUE PHYSICAL delay spanning whole sweeps (no modulo reduction):
+                # the steady stream is periodic, so the exact in-flight count is the
+                # periodic d-window maximum.  The longest delay that fits the FIFO is
+                # ~ depth * period / toggles_per_period.
                 steady_toggles, _ = _channel_toggle_times(sweep_b, b, end_bit)
-                # cheap upper bound first: the exact formula is O(n^2)
-                cheap = len(steady_toggles) * (d // period_b + 2)
+                per_period = max(1, len(steady_toggles))
+                cheap = per_period * (d // period_b + 2)   # cheap upper bound (exact is O(n^2))
                 if cheap <= evt_depth:
                     continue
-                if len(steady_toggles) ** 2 > max_work:
-                    raise ValueError(
-                        f"channel-delay output bit {b}: up to ~{cheap} toggles could be in "
-                        f"flight inside one {d}-tick delay window (conservative bound; the "
-                        f"stream is too dense to verify exactly), but the event FIFO holds "
-                        f"{evt_depth}. With repeat_forever program the congruent delay "
-                        f"d % period = {d % period_b} instead.")
-                worst = _max_in_flight_periodic(steady_toggles, period_b, d)
+                worst = (cheap if per_period ** 2 > max_work
+                         else _max_in_flight_periodic(steady_toggles, period_b, d))
                 if worst > evt_depth:
+                    max_d = max(0, evt_depth * period_b // per_period)
                     raise ValueError(
-                        f"channel-delay output bit {b}: delay {d} ticks spans {d // period_b} full "
-                        f"repeat-forever sweeps (period {period_b} ticks), keeping up to {worst} "
-                        f"toggles in flight -- the event FIFO holds {evt_depth}. With repeat_forever "
-                        f"the stream is periodic, so program the congruent delay d % period = "
-                        f"{d % period_b} instead (effective_channel_delays() does this).")
+                        f"channel-delay output bit {b}: a PHYSICAL delay of {d} ticks "
+                        f"({d * 20e-9 * 1e3:.3f} ms) spans {d // period_b} repeating frames "
+                        f"(period {period_b} ticks) and keeps up to {worst} edges in flight, but "
+                        f"the per-channel event FIFO holds {evt_depth}. The longest physical delay "
+                        f"this channel's toggle rate allows is about {max_d} ticks "
+                        f"({max_d * 20e-9 * 1e3:.3f} ms). Reduce the delay or the channel's toggle "
+                        f"rate, or rebuild the bitstream with a larger evt_fifo_depth.")
                 continue
             # d < period: the first sweep plus TWO steady sweeps cover every
             # window, including all wrap seams.
@@ -917,13 +913,18 @@ def _check_delay_event_capacity(program, *, evt_depth: int, frac_bits: int,
                 offset += period_b
         worst = _max_in_flight_toggles(toggles, d)
         if worst > evt_depth:
+            # longest delay that fits: shrink d until the worst window holds <= depth.
+            span = max(1, (toggles[-1] - toggles[0]) if len(toggles) > 1 else d)
+            density = worst / max(1, d)
+            max_d = max(0, int(evt_depth / density)) if density > 0 else d
             raise ValueError(
-                f"channel-delay output bit {b}: {worst} output toggles fall inside one "
-                f"{d}-tick delay window (counted over the full schedule: every scan point, "
-                f"bracket loops and the repeat seam) -- the per-channel event FIFO holds "
-                f"{evt_depth} in-flight toggles. Reduce the delay or the toggle rate on this "
-                f"channel, or rebuild the bitstream with a larger evt_fifo_depth "
-                f"(streamer_config.json + EVT_DEPTH in the RTL).")
+                f"channel-delay output bit {b}: a PHYSICAL delay of {d} ticks "
+                f"({d * 20e-9 * 1e3:.3f} ms) keeps {worst} output edges in flight (counted over "
+                f"the full schedule: every scan point, bracket loops and the repeat seam), but the "
+                f"per-channel event FIFO holds {evt_depth}. The longest physical delay this "
+                f"channel's toggle rate allows is about {max_d} ticks ({max_d * 20e-9 * 1e3:.3f} ms). "
+                f"Reduce the delay or the channel's toggle rate, or rebuild the bitstream with a "
+                f"larger evt_fifo_depth.")
 
 
 def _safe_channel_identifiers(channels: Sequence[str], *, reserved: set[str]) -> list[str]:
@@ -952,6 +953,20 @@ def _label_from_xdc_comment(comment: str, channel: str) -> str:
     text = re.sub(r"\s+", "_", text)
     text = re.sub(r"[^0-9A-Za-z_\[\]-]+", "", text)
     return text
+
+
+def delay_eligible_channel_count(channel_count: int, bus_count: int = DEFAULT_BUS_COUNT,
+                                 bus_width: int = DEFAULT_BUS_WIDTH) -> int:
+    """Number of leading channels that can carry a TTL output delay.
+
+    A channel is delay-eligible iff its engine bit drives a real TTL pin -- i.e. it is
+    NOT a bus-member bit (``bus_count*bus_width`` of them, pins driven by ``bus_out``)
+    and NOT a per-bus ``da_clk`` pin (``bus_count`` of them).  The board lays the real
+    TTL outputs out FIRST, so the eligible set is the leading
+    ``channel_count - bus_count*(bus_width+1)`` indices -- matching the RTL's compacted
+    (identity) event-FIFO map.  Only these get an event FIFO (deep enough at depth 256
+    only because the bus/clk channels are excluded)."""
+    return max(0, int(channel_count) - int(bus_count) * (int(bus_width) + 1))
 
 
 def _positive_int(value, name: str) -> int:
@@ -1001,6 +1016,7 @@ __all__ = [
     "DEFAULT_BUS_COUNT",
     "DEFAULT_BUS_WIDTH",
     "effective_channel_delays",
+    "delay_eligible_channel_count",
     "steady_sweep_ticks",
     "hardware_channel_names",
     "capacity_estimate_text",

@@ -54,8 +54,8 @@ module zlc_pulse_streamer_top #(
     parameter integer BUS_WIDTH = 10,
     parameter integer BUS_SEG_ADDR_WIDTH = 6,
     parameter integer BUS_SEL_WIDTH = 3,
-    parameter integer DELAY_DEPTH = 2048,       // LITERAL delay-line buffer depth (ticks, ~40us)
-    parameter integer EVT_FIFO_DEPTH = 16       // TTL delay event FIFO depth (in-flight toggles per
+    parameter integer DELAY_DEPTH = 2048,       // DAC bus delay-ring depth (ticks, ~40us)
+    parameter integer EVT_FIFO_DEPTH = 256      // TTL delay event FIFO depth (in-flight edges per
                                                 // channel; keep = streamer_config.json evt_fifo_depth)
 )(
     input  wire clk,
@@ -476,10 +476,19 @@ module zlc_pulse_streamer_top #(
         .BUS_COUNT(BUS_COUNT), .BUS_INDEX_WIDTH(BUS_INDEX_WIDTH), .BUS_WIDTH(BUS_WIDTH),
         .BUS_SEG_ADDR_WIDTH(BUS_SEG_ADDR_WIDTH), .BUS_SEL_WIDTH(BUS_SEL_WIDTH),
         .DELAY_DEPTH(DELAY_DEPTH),
-        // EVT_DEPTH = per-channel delay event FIFO (in-flight toggles).  MUST match
+        // EVT_DEPTH = per-channel delay event FIFO depth (in-flight edges).  MUST match
         // evt_fifo_depth in fpga/board_config/streamer_config.json -- the host
         // validator rejects programs that would overflow this depth.
         .EVT_DEPTH(EVT_FIFO_DEPTH),
+        // Event FIFOs are COMPACTED to the delay-eligible channels (the real TTL outputs
+        // ch0..17): the 40 bus-member bits (pins driven by bus_out) and the 4 da_clk
+        // pins are NOT delay targets, so they get no FIFO -- this is what keeps the deep
+        // EVT_DEPTH event RAM inside the 400 Kb distributed-RAM budget.  For THIS board
+        // the eligible channels are the contiguous first 18, so the slot->channel map is
+        // the identity.  The host must never place a delay on channel >= 18.
+        .DELAY_COMPACT(1), .NUM_DELAY_CH(18), .DELAY_CH_IDX_W(6),
+        .DELAY_CH_MAP({6'd17,6'd16,6'd15,6'd14,6'd13,6'd12,6'd11,6'd10,6'd9,
+                       6'd8,6'd7,6'd6,6'd5,6'd4,6'd3,6'd2,6'd1,6'd0}),
         // RD_LAT = the forced edge-BRAM read latency.  FIFO_DEPTH = RD_LAT + 2: the prefetch
         // pipeline is RD_LAT+1 deep (the registered edge_raddr adds a cycle before the BRAM),
         // so sustaining 1-tick playback needs a resident head + (RD_LAT+1) in-flight slots.

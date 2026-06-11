@@ -31,6 +31,6 @@
     "bus_sel_width": 3,
     "slot_mul_width": 25,
     "delay_depth": 2048,
-    "evt_fifo_depth": 16
+    "evt_fifo_depth": 256
   }
 }

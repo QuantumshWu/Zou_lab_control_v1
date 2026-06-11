@@ -97,8 +97,20 @@ module zlc_edge_streamer #(
     // <= EVT_DEPTH by the host), not with the delay length.  TTL_DELAY_WIDTH bounds one
     // delay (32b = ~85.9 s at 20 ns); GTIME_WIDTH bounds one RUN (48b = ~65 days).
     parameter integer TTL_DELAY_WIDTH = 32,
-    parameter integer EVT_DEPTH = 16,
-    parameter integer GTIME_WIDTH = 48
+    parameter integer EVT_DEPTH = 256,
+    parameter integer GTIME_WIDTH = 48,
+    // Event-FIFO COMPACTION.  Only channels that can carry a TTL delay (the real
+    // outputs -- NOT the bus-member bits, whose pins are driven by bus_out and whose
+    // engine `out` bit is always 0) get an EVT_DEPTH-deep event FIFO.  At depth 256 a
+    // FIFO for every one of CHANNEL_COUNT=62 bits would need 62*256*49b ~ 760 Kb of
+    // distributed RAM (the part has 400 Kb), so the top instantiates only NUM_DELAY_CH
+    // FIFOs and slot s serves channel DELAY_CH_MAP[s*DELAY_CH_IDX_W +: DELAY_CH_IDX_W].
+    // Default (DELAY_COMPACT=0): one FIFO per channel, slot == channel -- standalone /
+    // testbench use, where the distributed-RAM cap is irrelevant.
+    parameter integer DELAY_COMPACT = 0,
+    parameter integer NUM_DELAY_CH = CHANNEL_COUNT,
+    parameter integer DELAY_CH_IDX_W = 6,                 // bits/slot in the map (>= clog2(CHANNEL_COUNT))
+    parameter [NUM_DELAY_CH*DELAY_CH_IDX_W-1:0] DELAY_CH_MAP = {(NUM_DELAY_CH*DELAY_CH_IDX_W){1'b0}}
 )(
     input  wire clk,
     input  wire reset,
@@ -325,12 +337,34 @@ module zlc_edge_streamer #(
     // host validates <= EVT_DEPTH toggles in flight per channel inside any d-window.
     reg [GTIME_WIDTH-1:0] g_time = {GTIME_WIDTH{1'b0}};         // free-running ticks since FIRE
     reg [CHANNEL_COUNT-1:0] prev_undelayed = {CHANNEL_COUNT{1'b0}};
-    (* ram_style = "distributed" *) reg [GTIME_WIDTH:0] evt_mem [0:CHANNEL_COUNT-1][0:EVT_DEPTH-1];
+    // Event FIFOs are stored by DELAY SLOT (0..NUM_DELAY_CH-1), not by channel: slot s
+    // serves channel evt_ch_of(s).  Only pin-driving channels get a slot, so the deep
+    // (EVT_DEPTH) distributed RAM is not paid for the bus-member bits.
+    (* ram_style = "distributed" *) reg [GTIME_WIDTH:0] evt_mem [0:NUM_DELAY_CH-1][0:EVT_DEPTH-1];
     localparam integer EVT_ADDR = $clog2(EVT_DEPTH);
-    reg [EVT_ADDR-1:0] evt_wr  [0:CHANNEL_COUNT-1];
-    reg [EVT_ADDR-1:0] evt_rd  [0:CHANNEL_COUNT-1];
-    reg [EVT_ADDR:0]   evt_cnt [0:CHANNEL_COUNT-1];
-    reg [CHANNEL_COUNT-1:0] evt_out = {CHANNEL_COUNT{1'b0}};    // scheduled (delayed) levels
+    reg [EVT_ADDR-1:0] evt_wr  [0:NUM_DELAY_CH-1];
+    reg [EVT_ADDR-1:0] evt_rd  [0:NUM_DELAY_CH-1];
+    reg [EVT_ADDR:0]   evt_cnt [0:NUM_DELAY_CH-1];
+    reg [CHANNEL_COUNT-1:0] evt_out = {CHANNEL_COUNT{1'b0}};    // scheduled (delayed) levels, by channel
+    // slot s -> channel: identity when not compacted, else the packed map.
+    function integer evt_ch_of;
+        input integer s;
+        begin
+            evt_ch_of = (DELAY_COMPACT != 0)
+                ? DELAY_CH_MAP[s*DELAY_CH_IDX_W +: DELAY_CH_IDX_W]
+                : s;
+        end
+    endfunction
+    // Channels served by a FIFO (1 = delay-eligible).  Used to GATE the delay merge so a
+    // stray delay on a non-eligible channel (a host bug) plays the channel UNDELAYED
+    // instead of sticking it at the un-driven evt_out (0).  Elaboration-time constant.
+    reg [CHANNEL_COUNT-1:0] evt_eligible_mask;
+    integer em_s;
+    initial begin
+        evt_eligible_mask = {CHANNEL_COUNT{1'b0}};
+        for (em_s = 0; em_s < NUM_DELAY_CH; em_s = em_s + 1)
+            evt_eligible_mask[evt_ch_of(em_s)] = 1'b1;
+    end
     // del_fill = number of UNDELAYED samples pushed BEFORE this tick (== the running tick index t
     // since FIRE), saturating at DELAY_DEPTH.  A read at distance d is valid (returns the value
     // pushed d ticks ago) once del_fill >= d, i.e. t >= d -- the slot d ago was actually written
@@ -387,7 +421,7 @@ module zlc_edge_streamer #(
         delayed_mask = {CHANNEL_COUNT{1'b0}};
         delayed_out  = {CHANNEL_COUNT{1'b0}};
         for (del_m = 0; del_m < CHANNEL_COUNT; del_m = del_m + 1) begin
-            if (del_ch_ticks[del_m] != {TTL_DELAY_WIDTH{1'b0}}) begin
+            if (del_ch_ticks[del_m] != {TTL_DELAY_WIDTH{1'b0}} && evt_eligible_mask[del_m]) begin
                 delayed_mask[del_m] = 1'b1;
                 // d == 1: a single register IS a 1-tick delay (the event queue cannot
                 // pop an entry the same cycle it is pushed).  d >= 2: the scheduled
@@ -1029,42 +1063,43 @@ module zlc_edge_streamer #(
     // plain FIFO + equality compare is exact.  The host validates that no more than
     // EVT_DEPTH toggles are in flight inside any d-window; the guard below additionally
     // drops (rather than corrupts) on an impossible overflow.
-    integer ev_i;
+    integer ev_s, ev_c;
     reg ev_push, ev_pop;
     always @(posedge clk) begin
         if (reset_sync) begin
             g_time <= {GTIME_WIDTH{1'b0}};
             prev_undelayed <= {CHANNEL_COUNT{1'b0}};
             evt_out <= {CHANNEL_COUNT{1'b0}};
-            for (ev_i = 0; ev_i < CHANNEL_COUNT; ev_i = ev_i + 1) begin
-                evt_wr[ev_i] <= {EVT_ADDR{1'b0}};
-                evt_rd[ev_i] <= {EVT_ADDR{1'b0}};
-                evt_cnt[ev_i] <= {(EVT_ADDR+1){1'b0}};
+            for (ev_s = 0; ev_s < NUM_DELAY_CH; ev_s = ev_s + 1) begin
+                evt_wr[ev_s] <= {EVT_ADDR{1'b0}};
+                evt_rd[ev_s] <= {EVT_ADDR{1'b0}};
+                evt_cnt[ev_s] <= {(EVT_ADDR+1){1'b0}};
             end
         end else begin
             g_time <= g_time + 1'b1;
             prev_undelayed <= state_mask;
-            for (ev_i = 0; ev_i < CHANNEL_COUNT; ev_i = ev_i + 1) begin
-                ev_push = (state_mask[ev_i] != prev_undelayed[ev_i])
-                          && (del_ch_ticks[ev_i] > {{(TTL_DELAY_WIDTH-1){1'b0}}, 1'b1})
-                          && (evt_cnt[ev_i] != EVT_DEPTH[EVT_ADDR:0]);
-                ev_pop = (evt_cnt[ev_i] != {(EVT_ADDR+1){1'b0}})
-                         && (evt_mem[ev_i][evt_rd[ev_i]][GTIME_WIDTH:1] == g_time);
+            for (ev_s = 0; ev_s < NUM_DELAY_CH; ev_s = ev_s + 1) begin
+                ev_c = evt_ch_of(ev_s);                       // channel this slot serves
+                ev_push = (state_mask[ev_c] != prev_undelayed[ev_c])
+                          && (del_ch_ticks[ev_c] > {{(TTL_DELAY_WIDTH-1){1'b0}}, 1'b1})
+                          && (evt_cnt[ev_s] != EVT_DEPTH[EVT_ADDR:0]);
+                ev_pop = (evt_cnt[ev_s] != {(EVT_ADDR+1){1'b0}})
+                         && (evt_mem[ev_s][evt_rd[ev_s]][GTIME_WIDTH:1] == g_time);
                 if (ev_push) begin
                     // zero-EXTEND the 32b delay to the 48b time base (an out-of-range
                     // part-select here would X-poison the entry and kill the compare)
-                    evt_mem[ev_i][evt_wr[ev_i]] <= {
-                        g_time + {{(GTIME_WIDTH-TTL_DELAY_WIDTH){1'b0}}, del_ch_ticks[ev_i]} - 1'b1,
-                        state_mask[ev_i] };
-                    evt_wr[ev_i] <= evt_wr[ev_i] + 1'b1;
+                    evt_mem[ev_s][evt_wr[ev_s]] <= {
+                        g_time + {{(GTIME_WIDTH-TTL_DELAY_WIDTH){1'b0}}, del_ch_ticks[ev_c]} - 1'b1,
+                        state_mask[ev_c] };
+                    evt_wr[ev_s] <= evt_wr[ev_s] + 1'b1;
                 end
                 if (ev_pop) begin
-                    evt_out[ev_i] <= evt_mem[ev_i][evt_rd[ev_i]][0];
-                    evt_rd[ev_i] <= evt_rd[ev_i] + 1'b1;
+                    evt_out[ev_c] <= evt_mem[ev_s][evt_rd[ev_s]][0];
+                    evt_rd[ev_s] <= evt_rd[ev_s] + 1'b1;
                 end
                 case ({ev_push, ev_pop})
-                    2'b10: evt_cnt[ev_i] <= evt_cnt[ev_i] + 1'b1;
-                    2'b01: evt_cnt[ev_i] <= evt_cnt[ev_i] - 1'b1;
+                    2'b10: evt_cnt[ev_s] <= evt_cnt[ev_s] + 1'b1;
+                    2'b01: evt_cnt[ev_s] <= evt_cnt[ev_s] - 1'b1;
                     default: ;
                 endcase
             end

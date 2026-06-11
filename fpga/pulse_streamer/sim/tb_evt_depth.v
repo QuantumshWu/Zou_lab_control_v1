@@ -48,7 +48,7 @@ module tb_evt_depth;
 
   wire [11:0] scan_raddr; wire [CH-1:0] out; wire [BUSC*BW-1:0] bus_out;
   wire running, done; wire [31:0] scan_cursor; wire underflow;
-  zlc_edge_streamer #(.CHANNEL_COUNT(CH), .NUM_SLOTS(NS)) dut (
+  zlc_edge_streamer #(.CHANNEL_COUNT(CH), .NUM_SLOTS(NS), .EVT_DEPTH(16)) dut (
     .clk(clk),.reset(reset),.start(start),.prog_count(13'd21),.repeat_forever(1'b1),
     .loop_start_addr({EAW{1'b0}}),.loop_end_tick(32'd501),.loop_end_coeffs({NS*CW{1'b0}}),
     .loop_count(32'd1),.repeat_from_loop_start(1'b0),.scan_enable(1'b0),.scan_count(32'd0),
