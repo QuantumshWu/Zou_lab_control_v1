@@ -1743,6 +1743,52 @@ def test_final_top_regions_match_image_and_has_structure():
     assert "jtag_axi_0" in text and "axi_bram_ctrl_0" in text
 
 
+def test_register_layout_handshake_rtl_matches_host():
+    """CTRL word 63 must read back the HARDWIRED layout id, equal to host
+    image.REGISTER_LAYOUT_ID.  This is the host<->bitstream layout handshake: a host built
+    for one CtrlWords layout REFUSES a bitstream built for another (the CLK_ENABLE 46->20
+    move ran mismatched on real hardware and garbled the DAC strobes -- silently)."""
+
+    import pathlib, re
+    from fpga.pulse_streamer.host import image as im
+
+    top = (pathlib.Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
+    m = re.search(r"localparam integer C_LAYOUT_ID\s*=\s*(\d+);", top)
+    assert m and int(m.group(1)) == im.CtrlWords.LAYOUT_ID == 63
+    m = re.search(r"localparam \[31:0\] ZLC_LAYOUT_ID\s*=\s*32'h([0-9A-Fa-f_]+);", top)
+    assert m, "ZLC_LAYOUT_ID missing from the top"
+    assert int(m.group(1).replace("_", ""), 16) == im.REGISTER_LAYOUT_ID
+    # the read mux must return the constant for word 63 (write-proof read-back)
+    assert re.search(r"word_addr\[5:0\] == C_LAYOUT_ID\[5:0\]", top)
+    # pack_program must NEVER occupy the layout word (or the COMMAND/STATUS mailbox)
+    prog = _minimal_runtime_program()
+    words = im.pack_program(prog, im.StreamerParams())
+    for off in (im.CtrlWords.LAYOUT_ID, im.CtrlWords.COMMAND, im.CtrlWords.STATUS):
+        assert off not in words, f"pack_program must not write CTRL word {off}"
+
+
+def test_axi_session_refuses_mismatched_register_layout(tmp_path):
+    """prepare() and axi_self_test() must FAIL FAST with a rebuild instruction when the
+    bitstream's layout id differs from the host's (e.g. an old .bit returning 0)."""
+
+    import pytest
+    from Zou_lab_control.neutral_atom.devices import axi_session as ax
+
+    session = ax.VivadoAxiStreamerSession.__new__(ax.VivadoAxiStreamerSession)
+    session._read_word = lambda off, **kw: 0  # old bitstream: ctrl_reg[63] powers up 0
+    with pytest.raises(RuntimeError, match=r"register-layout mismatch.*[Rr]ebuild"):
+        session.check_register_layout()
+    session._read_word = lambda off, **kw: ax.REGISTER_LAYOUT_ID
+    session.check_register_layout()  # matching id -> no raise
+
+
+def _minimal_runtime_program():
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
+    return RuntimeSequenceProgram(
+        sequence_id=1, sequence_name="t", clock_hz=50e6, channels=["a"],
+        ticks=[0, 10], masks=[1, 0], duration=200.0, trigger_count=0)
+
+
 def test_final_status_bits_match_host():
     """The top STATUS bit map MUST equal host.image STATUS_*; in particular the
     streaming UNDERFLOW bit must be a DISTINCT bit from the host's fatal ERROR bit,
@@ -1801,6 +1847,8 @@ def test_vivado_axi_session_tolerates_transient_underflow(tmp_path):
                             return f"ZLCDATA {STATUS_RUNNING | STATUS_UNDERFLOW:08X}\n"
                         return f"ZLCDATA {STATUS_RUNNING | STATUS_DONE:08X}\n"
                     return f"ZLCDATA {self.status:08X}\n"
+                if w == 63:   # hardwired register-layout id (current bitstream)
+                    return "ZLCDATA 5A4C4C02\n"
                 return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
             return "ok\n"
 
@@ -1899,6 +1947,8 @@ def test_vivado_axi_session_wait_done_is_reentrant(tmp_path):
                         if self.cursor >= N:
                             self.status |= STATUS_DONE
                     return f"ZLCDATA {self.status:08X}\n"
+                if w == 63:   # hardwired register-layout id (current bitstream)
+                    return "ZLCDATA 5A4C4C02\n"
                 return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
             return "ok\n"
 
@@ -1996,6 +2046,8 @@ def test_vivado_axi_session_repeat_streaming_refills_cyclically(tmp_path):
                         if self.cursor >= N:
                             self.cursor -= N; self.sweeps += 1
                     return f"ZLCDATA {self.cursor:08X}\n"
+                if w == 63:   # hardwired register-layout id (current bitstream)
+                    return "ZLCDATA 5A4C4C02\n"
                 return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
             return "ok\n"
 
@@ -3093,7 +3145,10 @@ def test_axi_session_self_test_catches_scrambled_burst(tmp_path):
                 self.bram[w] = v
             m = re.search(r"-address ([0-9A-Fa-f]+) -len 1 -type read", text)
             if m:
-                return f"ZLCDATA {self.bram.get(int(m.group(1), 16) // 4, 0):08X}\n"
+                w = int(m.group(1), 16) // 4
+                if w == 63:   # hardwired register-layout id (current bitstream)
+                    return "ZLCDATA 5A4C4C02\n"
+                return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
             return "ok\n"
 
     good = VivadoAxiStreamerSession(state_dir=tmp_path, tcl_executor=Hw(scramble=False))
@@ -3129,7 +3184,10 @@ def test_axi_self_test_scratch_sits_above_all_defined_ctrl_words(tmp_path):
                 self.bram[w] = v
             m = re.search(r"-address ([0-9A-Fa-f]+) -len 1 -type read", text)
             if m:
-                return f"ZLCDATA {self.bram.get(int(m.group(1), 16) // 4, 0):08X}\n"
+                w = int(m.group(1), 16) // 4
+                if w == 63:   # hardwired register-layout id (current bitstream)
+                    return "ZLCDATA 5A4C4C02\n"
+                return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
             return "ok\n"
 
     hw = Hw()
@@ -3161,7 +3219,10 @@ def test_clear_host_config_zeroes_delays_and_clk_mask(tmp_path):
                 self.bram[w] = v
             m = re.search(r"-address ([0-9A-Fa-f]+) -len 1 -type read", text)
             if m:
-                return f"ZLCDATA {self.bram.get(int(m.group(1), 16) // 4, 0):08X}\n"
+                w = int(m.group(1), 16) // 4
+                if w == 63:   # hardwired register-layout id (current bitstream)
+                    return "ZLCDATA 5A4C4C02\n"
+                return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
             return "ok\n"
 
     hw = Hw()
@@ -3653,6 +3714,8 @@ class _FakeStreamerHardware:
                     else:
                         self.status |= STATUS_DONE
                 return f"ZLCDATA {self.status:08X}\n"
+            if word == 63:   # hardwired register-layout id (current bitstream)
+                return "ZLCDATA 5A4C4C02\n"
             return f"ZLCDATA {self.bram.get(word, 0):08X}\n"
         return "ok\n"
 

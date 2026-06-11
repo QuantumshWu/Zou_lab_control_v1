@@ -55,6 +55,7 @@ from fpga.pulse_streamer.host.image import (
     STATUS_DONE,
     STATUS_ERROR,
     STATUS_UNDERFLOW,
+    REGISTER_LAYOUT_ID,
 )
 
 # Runtime clock + geometry default come from the single config file
@@ -391,6 +392,29 @@ class VivadoAxiStreamerSession:
             self._run_tcl(lines, action="axi_write", timeout=self.action_timeout, stop=stop)
 
     # --------------------------------------------------------------- sequencer API
+    def check_register_layout(self) -> None:
+        """Verify the bitstream's hardwired register-layout id matches this host.
+
+        The top returns ``ZLC_LAYOUT_ID`` on every AXI read of CTRL word 63
+        (``CtrlWords.LAYOUT_ID``); it must equal ``image.REGISTER_LAYOUT_ID``.  A mismatch
+        means the programmed bitstream was built for a DIFFERENT CtrlWords layout than this
+        host -- every layout-dependent write (the clk mask, the scratch/self-test range,
+        future moves) would silently land in the wrong registers.  That EXACTLY happened
+        when CLK_ENABLE moved 46->20 without a rebuild: the mask went to dead words, the
+        real clk mask kept a stale value, and the DAC strobes ran uncontrolled (garbled
+        first-frame DA output on real hardware).  Fail FAST and tell the user to rebuild."""
+
+        got = self._read_word(CtrlWords.LAYOUT_ID)
+        if got != REGISTER_LAYOUT_ID:
+            raise RuntimeError(
+                f"register-layout mismatch: bitstream reports 0x{got & 0xFFFFFFFF:08X} at CTRL "
+                f"word {CtrlWords.LAYOUT_ID} but this host expects 0x{REGISTER_LAYOUT_ID:08X}. "
+                "The programmed bitstream was built for a different register layout than this "
+                "host software (an old .bit returns 0 here).  Rebuild the bitstream "
+                "(fpga/build_and_program.bat) and restart the server TOGETHER -- running a "
+                "mismatched pair silently writes the wrong registers (e.g. the DAC clk mask)."
+            )
+
     def prepare(self, program) -> None:
         """Pack the program into the BRAM image, upload it over AXI, then command
         the top's mini-loader to copy the bus image into the engine (LOAD)."""
@@ -421,6 +445,10 @@ class VivadoAxiStreamerSession:
             max_validated_scan_points=max(4096, 2 * p.bank_size),
         )
         image = pack_program(program, p)
+        # Before the FIRST hardware write: refuse a bitstream built for another register
+        # layout (validation above is pure software, so a bad program errors without
+        # touching hardware; a mismatched bitstream errors before any register changes).
+        self.check_register_layout()
         # Halt + reset first so a prior run cannot drive outputs while we rewrite BRAM.
         self._command(CMD_SAFE)
         for word_offset in sorted(image):
@@ -464,6 +492,10 @@ class VivadoAxiStreamerSession:
         afterwards.  Returns True on success; raises on mismatch."""
 
         from fpga.pulse_streamer.host.image import CTRL_WORDS
+
+        # FIRST: refuse a bitstream built for a different register layout -- writing the
+        # scratch ramp (or anything else) into a mismatched layout scribbles real registers.
+        self.check_register_layout()
 
         ctrl_base = region_bases(self.params)["ctrl"]
         scratch = self.params.ctrl_scratch_base   # first word above ALL defined CtrlWords

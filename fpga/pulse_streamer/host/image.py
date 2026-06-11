@@ -37,13 +37,24 @@ __all__ = [
     "pack_program", "unpack_program", "scan_bank_words", "region_bases", "check_rtl_assumptions",
     "CMD_LOAD", "CMD_FIRE", "CMD_RESET", "CMD_SAFE",
     "STATUS_LOADED", "STATUS_RUNNING", "STATUS_DONE", "STATUS_ERROR", "STATUS_UNDERFLOW",
-    "IMAGE_MAGIC",
+    "IMAGE_MAGIC", "REGISTER_LAYOUT_ID",
     "DEFAULT_CONFIG_PATH", "load_streamer_config", "params_from_config", "default_params",
     "default_part", "default_target_pct", "default_clock_hz",
     "check_config_capacity", "format_capacity_report",
 ]
 
 IMAGE_MAGIC = 0x5A4C4532   # "ZLE2"
+
+# REGISTER-LAYOUT HANDSHAKE.  Must equal zlc_pulse_streamer_top.v's ZLC_LAYOUT_ID, which the
+# top returns on every AXI read of CTRL word 63 (hardwired -- writes are never read back).
+# The host verifies it BEFORE writing anything layout-dependent (axi_session checks it at
+# self-test and at every prepare), so a host built for one CtrlWords layout can never silently
+# mis-drive a bitstream built for another.  BUMP BOTH on ANY CtrlWords/region change.
+# History: v2 = CLK_ENABLE@20 (dense delay words deleted).  The v1->v2 move shipped WITHOUT
+# this handshake; running the v2 host on a v1 bitstream put the clk mask in dead words and left
+# the REAL clk mask (46/47) stale -> uncontrolled da_clk strobes, garbled first-frame DAC output
+# on real hardware.  An old bitstream reads back ctrl_reg[63] (power-up 0) -> clear error.
+REGISTER_LAYOUT_ID = 0x5A4C4C02   # 'ZLL' + layout v2
 
 CMD_LOAD = 1 << 0
 CMD_FIRE = 1 << 1
@@ -87,6 +98,10 @@ class CtrlWords:
     # more (TTL+DAC delays are 32-bit-per-signal in the R_DELAY region).  Locked to
     # zlc_pulse_streamer_top.v by test_final_top_regions_match_image.
     CLK_ENABLE = 20
+    # READ-ONLY register-layout id (top hardwires the read of this word to ZLC_LAYOUT_ID ==
+    # REGISTER_LAYOUT_ID; writes land in ctrl_reg[63] but are never read back).  NEVER pack
+    # anything here.
+    LAYOUT_ID = 63
 
 
 CTRL_WORDS = 64

@@ -779,3 +779,28 @@ frame ever appears, the split-width design above is the path (do NOT widen slot 
 that would triple DSP usage for nothing).  The cheap `g_time` 48->64 widening is worth
 folding into whatever rebuild happens next if multi-month uninterrupted uptime becomes
 a real operating mode.
+
+## 15. Register-layout handshake (2026-06-11; root cause of the garbled-first-frame DA)
+
+**Incident.** Commit 6d60e53 (08:44) moved `CtrlWords.CLK_ENABLE` 46->20 (delay_depth removal)
+and required a bitstream rebuild.  The user's board still ran the 03:57 bitstream (layout v1,
+clk mask at 46/47) when the 11:57 server session started with the NEW host -- the session log
+(`fpga/build/state/vivado_axi_session.log`) proves it: the self-test ramp went to words 22..37
+(the v2 scratch).  Consequences of the silent mismatch: the host wrote the clk mask into v1's
+DEAD reserved words 20/21, the REAL clk mask (46/47) was never written or cleared (stale /
+power-up value), so the `da_clkN` DAC strobes ran uncontrolled -- garbled, first-frame-vs-
+steady-state-inconsistent DAC output on the scope while every simulated layer (engine xsim,
+full-top xsim with the real IPs and the real command flow, host pack/flush) is provably
+frame-identical when layouts agree.  A second simulated demonstration: packing with
+`bank_size=512` against a top elaborated with the default 2048 sends the bus image into the
+scan region -- the mini-loader copies zeros and ALL DA output is silently wrong.
+
+**Fix (the handshake).** The top hardwires CTRL word 63 readback to `ZLC_LAYOUT_ID`
+(32'h5A4C4C02 = layout v2; writes land in `ctrl_reg[63]` but are never read back).  The host
+(`image.REGISTER_LAYOUT_ID`, `CtrlWords.LAYOUT_ID`) verifies it in `axi_self_test` (server
+bring-up) and at every `prepare()` (after the pure-software validation, before the first
+hardware write).  A mismatch -- e.g. an old bitstream returning power-up 0 -- raises
+immediately with a "rebuild the bitstream + restart the server together" instruction instead
+of silently mis-driving registers.  BUMP BOTH IDs on ANY CtrlWords/region change.  Locked by
+`test_register_layout_handshake_rtl_matches_host` (RTL<->host id equality + pack never
+occupies words 1/2/63) and `test_axi_session_refuses_mismatched_register_layout`.

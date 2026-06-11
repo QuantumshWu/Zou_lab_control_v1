@@ -269,8 +269,18 @@ module zlc_pulse_streamer_top #(
     end
 
     // --- read mux back to AXI -------------------------------------------------
+    // CTRL word 63 reads back a HARDWIRED register-layout id (writes land in ctrl_reg[63]
+    // but are never read back).  The host (image.REGISTER_LAYOUT_ID) verifies it BEFORE
+    // writing anything layout-dependent, so a host built for one CtrlWords layout can
+    // NEVER silently mis-drive a bitstream built for another (e.g. the CLK_ENABLE 46->20
+    // move: the mask landed in dead words and the real clk mask kept a stale value --
+    // uncontrolled da_clk strobes, garbled DAC output).  An OLD bitstream returns
+    // ctrl_reg[63] (power-up 0) here, so a new host refuses it with a clear error.
+    localparam integer C_LAYOUT_ID = 63;
+    localparam [31:0] ZLC_LAYOUT_ID = 32'h5A4C4C02;   // 'ZLL' + layout v2 (CLK_ENABLE@20)
     always @(*) begin
-        if (sel_ctrl) bram_douta = ctrl_reg[word_addr[5:0]];
+        if (sel_ctrl) bram_douta = (word_addr[5:0] == C_LAYOUT_ID[5:0])
+                                   ? ZLC_LAYOUT_ID : ctrl_reg[word_addr[5:0]];
         else bram_douta = 32'b0;
     end
 

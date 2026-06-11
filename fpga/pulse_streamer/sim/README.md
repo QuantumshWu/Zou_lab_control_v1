@@ -67,3 +67,13 @@ IPM=../../build/ps/ps.srcs/sources_1/ip/blk_mem_gen_edge_mask
 "$VIV/xelab" work.tb_real_engine -s sreal
 "$VIV/xsim" sreal -runall
 ```
+
+- **`tb_t_ff.v` + `_gen_replay_t.py` + `replay_t.vh`** — full-chain FIRST-FRAME regression:
+  the real top + engine + five real BRAM IPs, fed a T.json-structured program packed by the
+  REAL host pack_program (durations scaled to a 116-tick frame), through the real
+  SAFE->upload->LOAD->FIRE command flow TWICE (consecutive on_pulse).  Asserts every frame of
+  da_bias_y and cooling is identical (T-FF-OK).  Regenerate the .vh with python _gen_replay_t.py.
+  NOTE: instantiate the top with the streamer_config.json geometry (e.g. BANK_SIZE=512) -- the
+  default 2048 puts R_BUS_BASE at 36928 while the host packs at 24640 (the loader then copies
+  zeros and ALL DA output is wrong; geometry/layout mismatches are exactly what the CTRL word-63
+  REGISTER_LAYOUT_ID handshake now refuses at runtime).
