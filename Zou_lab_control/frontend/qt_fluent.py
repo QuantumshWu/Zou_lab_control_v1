@@ -60,12 +60,41 @@ def fluent_scale() -> float:
     return _FLUENT_SCALE
 
 
+# The fluent design-basis window: the automatic scale fits this logical size
+# into the primary screen's available geometry.  EVERY GUI window must resolve
+# its automatic scale through this ONE rule -- two windows on the same screen
+# must end up with identical control sizes (pulse editor == task console).
+_AUTO_SCALE_BASIS = (1280, 790)
+_AUTO_SCALE_MARGIN = (48, 88)
+
+
+def resolve_fluent_auto_scale(app: QtWidgets.QApplication | None = None) -> float:
+    """The shared automatic fluent scale for the current primary screen."""
+
+    app = app or QtWidgets.QApplication.instance()
+    screen = app.primaryScreen() if app is not None else None
+    if screen is None:
+        return 1.0
+    available = screen.availableGeometry()
+    basis_w, basis_h = _AUTO_SCALE_BASIS
+    margin_w, margin_h = _AUTO_SCALE_MARGIN
+    return min(
+        1.0,
+        max(0.1, (available.width() - margin_w) / basis_w),
+        max(0.1, (available.height() - margin_h) / basis_h),
+    )
+
+
 def set_fluent_scale(scale: float | None = None) -> float:
-    """Set the scale used by subsequently created Fluent widgets."""
+    """Set the scale used by subsequently created Fluent widgets.
+
+    ``None`` means AUTOMATIC: resolve from the primary screen via
+    :func:`resolve_fluent_auto_scale` (never a silent 1.0 -- a fixed fallback
+    is how two GUIs ended up with different control sizes on the same screen)."""
 
     global _FLUENT_SCALE
     if scale is None:
-        scale = 1.0
+        scale = resolve_fluent_auto_scale()
     _FLUENT_SCALE = max(0.72, min(1.25, float(scale)))
     app = QtWidgets.QApplication.instance()
     if app is not None:
@@ -1666,6 +1695,7 @@ __all__ = [
     "fluent_widget_stylesheet",
     "format_compact_number",
     "run_fluent_window",
+    "resolve_fluent_auto_scale",
     "scaled_px",
     "set_fluent_scale",
     "status_dot_stylesheet",

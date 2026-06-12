@@ -4024,22 +4024,9 @@ class PulseSequenceEditor(QtWidgets.QWidget):
 
     @staticmethod
     def _resolve_scale(scale: float | None, *, app: QtWidgets.QApplication) -> float:
-        if scale is not None:
-            return set_fluent_scale(scale)
-        screen = app.primaryScreen()
-        if screen is None:
-            return set_fluent_scale(1.0)
-        available = screen.availableGeometry()
-        target_w = 1280
-        target_h = 790
-        margin_w = 48
-        margin_h = 88
-        auto = min(
-            1.0,
-            max(0.1, (available.width() - margin_w) / target_w),
-            max(0.1, (available.height() - margin_h) / target_h),
-        )
-        return set_fluent_scale(auto)
+        # None -> the SHARED automatic rule in qt_fluent (resolve_fluent_auto_scale):
+        # every GUI window must agree on the control size for a given screen.
+        return set_fluent_scale(scale)
 
 
 def show_pulse_gui(

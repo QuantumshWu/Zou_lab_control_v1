@@ -1153,6 +1153,68 @@ def test_task_console_drag_snaps_to_grid(monkeypatch):
     console.shutdown()
 
 
+def test_fluent_auto_scale_is_shared_between_guis(monkeypatch):
+    """REGRESSION: with scale=None the pulse editor used a screen-fit rule while
+    the task console silently fell back to 1.0 -- on small screens the two GUIs
+    rendered different control sizes (the user saw mismatched lineedits).  Both
+    must resolve through qt_fluent.resolve_fluent_auto_scale."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend.qt_fluent import (
+        ensure_qt_app, fluent_scale, resolve_fluent_auto_scale, set_fluent_scale)
+    from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
+
+    app = ensure_qt_app()
+    try:
+        console_path = set_fluent_scale(None)         # the task-console call
+        pulse_path = PulseSequenceEditor._resolve_scale(None, app=app)
+        assert console_path == pulse_path
+        # and both equal the one shared rule (after the [0.72, 1.25] clamp)
+        assert console_path == max(0.72, min(1.25, resolve_fluent_auto_scale(app)))
+        assert fluent_scale() == pulse_path
+    finally:
+        set_fluent_scale(1.0)
+
+
+def test_task_console_drag_pushes_overlapped_cards_down(monkeypatch):
+    """Cards never overlap: dropping a card onto occupied slots keeps the
+    dragged card there and pushes the cards underneath down, cascading."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.task_console import _slots_overlap, _slot_to_pos
+
+    console = dt.demo_console(shots=3)
+    dragged = console.cards[1]                    # the 1x2 hist card @ (0, 2)
+    dragged.config.row, dragged.config.col = 0, 0  # drop onto the 2x2 image card
+    dragged.layout_changed.emit()                  # console._arrange sees the sender
+    configs = [c.config for c in console.cards]
+    assert (dragged.config.row, dragged.config.col) == (0, 0)   # winner keeps the slot
+    for i, a in enumerate(configs):
+        for b in configs[i + 1:]:
+            assert not _slots_overlap(a, b), (a.title, b.title)
+    # the pushed cards really moved on the board too
+    for card in console.cards:
+        assert (card.x(), card.y()) == _slot_to_pos(card.config.row, card.config.col)
+    console.shutdown()
+
+
+def test_task_console_cards_have_fluent_shadow(monkeypatch):
+    """Panel cards reuse the fluent card design: the CachedDropShadow effect
+    must be attached (the flat 1px-border look was a regression)."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    console = dt.demo_console(shots=3)
+    for card in console.cards:
+        assert card.graphicsEffect() is not None, card.config.title
+    console.shutdown()
+
+
 def test_task_console_cards_are_modular(monkeypatch):
     """Card size = the frontend panel's on-screen canvas + the card chrome; every
     kind shares one plot region per size (the confocal rule), so same-size cards

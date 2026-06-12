@@ -138,6 +138,36 @@ def _pos_to_slot(x: int, y: int) -> tuple[int, int]:
     return int(row), int(col)
 
 
+def _slots_overlap(a, b) -> bool:
+    return (a.col < b.col + b.cols and b.col < a.col + a.cols
+            and a.row < b.row + b.rows and b.row < a.row + a.rows)
+
+
+def _resolve_collisions(configs: Sequence["PanelConfig"], active: "PanelConfig") -> bool:
+    """Push cards DOWN so no two overlap; ``active`` keeps its slot.
+
+    Cards never overlap on the board: when a drag (or a size change) lands a
+    card on occupied slots, the cards underneath move down just far enough to
+    clear, cascading.  Pushes only ever increase ``row`` and never touch the
+    active card, so the loop terminates.  Returns True when anything moved."""
+
+    moved_any = False
+    for _ in range(len(configs) * len(configs) + 1):
+        ordered = sorted((c for c in configs if c is not active),
+                         key=lambda c: (c.row, c.col))
+        placed = [active]
+        moved = False
+        for config in ordered:
+            for blocker in placed:
+                if _slots_overlap(config, blocker):
+                    config.row = blocker.row + blocker.rows
+                    moved = moved_any = True
+            placed.append(config)
+        if not moved:
+            break
+    return moved_any
+
+
 def _task_files_dir() -> Path:
     root = os.environ.get(TASK_FILES_ENV)
     path = Path(root) if root else Path(__file__).resolve().parents[2] / "tasks"
@@ -285,7 +315,7 @@ class PanelCard(FluentGroupBox):
     remove_requested = QtCore.pyqtSignal(object)
 
     def __init__(self, config: PanelConfig, parent=None):
-        super().__init__(PANEL_KINDS[config.kind], parent, shadow=False)
+        super().__init__(PANEL_KINDS[config.kind], parent, shadow=True)
         self.config = config
         self.plotter = None
         self.canvas = None
@@ -792,6 +822,12 @@ class TaskConsole(QtWidgets.QWidget):
         self.cards.append(card)
 
     def _arrange(self) -> None:
+        # the card that was just dragged / resized wins its slot; everyone it
+        # now overlaps is pushed down (cards never overlap on the board)
+        active = self.sender()
+        if isinstance(active, PanelCard) and len(self.cards) > 1:
+            if _resolve_collisions([c.config for c in self.cards], active.config):
+                self._mark_dirty()
         self.board.arrange(self.cards)
         self._update_summary()
 
