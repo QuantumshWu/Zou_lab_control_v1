@@ -1166,7 +1166,13 @@ class RemoteSequencer(SequencerDevice):
 
     def open(self) -> "RemoteSequencer":
         if self._conn is not None:
-            return self
+            if not getattr(self._conn, "closed", False):
+                return self
+            # The link died (server restart / network drop): a dead connection object
+            # would otherwise be returned FOREVER and every call would keep raising
+            # EOFError until the user restarted the GUI/notebook too.  Drop it and
+            # reconnect transparently on this call.
+            self._conn = None
         try:
             import rpyc
         except ImportError as exc:  # pragma: no cover - depends on lab install

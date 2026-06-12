@@ -117,7 +117,11 @@ class VivadoAxiStreamerSession:
         clock_hz: float = DEFAULT_RUNTIME_CLOCK_HZ,
         params: StreamerParams | None = None,
         startup_timeout: float = 180.0,
-        action_timeout: float | None = 30.0,
+        # Per-transaction ceiling.  Generous on purpose: JTAG ops normally finish in
+        # well under a second, but ONE transient slow transaction (USB hiccup, busy
+        # hw_server) must not tear the whole persistent session down -- a timeout here
+        # closes the session and forces a restart cycle.
+        action_timeout: float | None = 120.0,
         load_timeout: float = 5.0,
         write_batch: int = 200,
         stream_poll_interval: float = 0.005,
@@ -185,8 +189,12 @@ class VivadoAxiStreamerSession:
         # process down (otherwise a session that was close()d once then restarted would
         # never close again -- the double-close guard would short-circuit it).
         self._closed = False
+        # A fresh session is a CLEAN SLATE: words queued by a transaction that died with
+        # the previous process must not be flushed into the new one (they belong to an
+        # upload that will be re-packed from scratch by the next prepare()).
+        self._pending = []
         try:
-            self._process = subprocess.Popen(
+            process = subprocess.Popen(
                 [self.vivado, "-mode", "tcl", "-nolog", "-nojournal"],
                 cwd=self.state_dir,
                 stdin=subprocess.PIPE,
@@ -204,7 +212,19 @@ class VivadoAxiStreamerSession:
             raise RuntimeError(
                 f"pulse-streamer session could not start persistent Vivado. See {self.state_dir / 'vivado_axi_session_start.log'}."
             ) from exc
-        self._reader = threading.Thread(target=self._read_stdout, name="zlc-vivado-axi-reader", daemon=True)
+        self._process = process
+        # Each process GENERATION gets its OWN stdout queue, and the reader thread is
+        # bound to (process, queue) ARGUMENTS -- never to self.  The old generation's
+        # reader pushes its EOF sentinel (None) into the OLD queue only.  With a single
+        # shared queue, that stale sentinel POISONED every restart: the next transaction
+        # read it and raised "process exited unexpectedly", the retry killed its fresh
+        # process (whose reader enqueued the next sentinel), and so on forever -- the
+        # session could never self-heal and the whole server had to be restarted.
+        generation_queue: "queue.Queue[str | None]" = queue.Queue()
+        self._queue = generation_queue
+        self._reader = threading.Thread(
+            target=self._read_stdout, args=(process, generation_queue),
+            name="zlc-vivado-axi-reader", daemon=True)
         self._reader.start()
         self._run_tcl(self._init_tcl(), action="vivado_axi_session_start", timeout=self.startup_timeout)
         return self
@@ -213,7 +233,12 @@ class VivadoAxiStreamerSession:
         if self._closed:
             return
         self._closed = True
-        self._stop_stream_thread()
+        # SHORT join only: close() often runs on a failure path while THIS thread holds
+        # _io_lock (e.g. the transaction-timeout path inside _read_until_marker), and the
+        # stream thread may be blocked waiting for that very lock -- it cannot exit until
+        # we release it, so a long join here just stalls the teardown.  A still-alive
+        # thread keeps its handle and is reaped by the next prepare()/safe_state().
+        self._stop_stream_thread(join_timeout=2.0)
         process = self._process
         if process is None:
             return
@@ -281,7 +306,12 @@ class VivadoAxiStreamerSession:
             "set zlc_targets [get_hw_targets]",
             'if {$zlc_targets eq ""} { error "No Vivado hardware target. Check the JTAG cable and board power." }',
             "current_hw_target [lindex $zlc_targets 0]",
-            "if {[catch {open_hw_target}]} { catch {close_hw_target}; open_hw_target -jtag_mode on }",
+            # Retry a failed open PLAINLY after a short settle (the previous -- killed --
+            # process may not have released the target yet).  NEVER fall back to
+            # `open_hw_target -jtag_mode on`: raw JTAG mode does not enumerate debug
+            # cores, so get_hw_axis comes back empty and every restart attempt then
+            # fails with a "no debug core" error until the whole server is rebooted.
+            "if {[catch {open_hw_target}]} { catch {close_hw_target}; after 2000; open_hw_target }",
             "current_hw_device [lindex [get_hw_devices] 0]",
         ]
         if self.probes:
@@ -461,12 +491,26 @@ class VivadoAxiStreamerSession:
         # DELAY-TAIL DRAIN: if the PREVIOUS finite run had delayed signals, its event
         # schedulers are still emitting the queued tail after DONE (out[t] = in[t-d]
         # holds for the whole stream).  CMD_SAFE would chop that tail, so wait out the
-        # remaining drain deadline first.  An explicit safe_state()/off_pulse does NOT
-        # wait -- stopping immediately is its job.
-        remaining = self._drain_until - time.monotonic()
-        if remaining > 0:
-            time.sleep(min(remaining, float(self.action_timeout or 600.0)))
-        self._drain_until = 0.0
+        # remainder -- but ONLY when the undelayed stream has already ENDED
+        # (STATUS_DONE).  Preparing over a still-RUNNING program is an explicit
+        # program switch and keeps the abort-immediately semantics; an explicit
+        # safe_state()/off_pulse does not wait either -- stopping at once is its job.
+        if self._drain_until > 0.0:
+            remaining = self._drain_until - time.monotonic()
+            if remaining > 0:
+                try:
+                    st = int(self._read_word(CtrlWords.STATUS))
+                except Exception:
+                    st = 0
+                if st & STATUS_DONE:
+                    # wait_done() re-anchors _drain_until at the OBSERVED done instant,
+                    # so `remaining` is exact in the normal prepare->fire->wait_done
+                    # flow; without a wait_done the fire-time estimate applies, capped
+                    # at one full tail (the 32-bit delay field, <= ~42.9 s).
+                    # _tail_seconds still holds the PREVIOUS program's tail here -- it
+                    # is recomputed for the new program below.
+                    time.sleep(min(remaining, self._tail_seconds))
+            self._drain_until = 0.0
         # this program's own tail (max channel/bus delay), used by fire()/wait_done()
         clock = float(getattr(program, "clock_hz", 0.0) or 50e6)
         tail_ticks = [int(d) for d in (getattr(program, "channel_delays", None) or [])]
@@ -661,11 +705,17 @@ class VivadoAxiStreamerSession:
             status = self._read_word(CtrlWords.STATUS)
             if status & STATUS_DONE:
                 # DONE means the UNDELAYED stream ended; delayed signals keep emitting
-                # their queued tail for up to max(delay) more.  Wait it out (bounded by
-                # the caller's deadline) so "done" means the PHYSICAL output is done.
+                # their queued tail for up to max(delay) more.  Re-anchor the drain
+                # deadline at the OBSERVED done instant (the fire-time estimate cannot
+                # see streaming stalls), wait it out within the caller's budget, and
+                # clear it ONLY once fully drained -- if the budget runs out first the
+                # deadline stays armed so the next prepare() still cannot chop the
+                # remaining tail.
                 if self._tail_seconds > 0:
+                    self._drain_until = time.monotonic() + self._tail_seconds
                     time.sleep(max(0.0, min(self._tail_seconds, deadline - time.monotonic())))
-                self._drain_until = 0.0    # tail drained; the next prepare need not wait
+                if time.monotonic() >= self._drain_until:
+                    self._drain_until = 0.0
                 return True
             if self._repeat_forever and (status & STATUS_RUNNING):
                 return True            # background thread keeps a streamed re-sweep fed
@@ -741,10 +791,15 @@ class VivadoAxiStreamerSession:
                 target=self._stream_refill_loop, name="zlc-scan-stream", daemon=True)
             self._stream_thread.start()
 
-    def _stop_stream_thread(self) -> None:
+    def _stop_stream_thread(self, *, join_timeout: float | None = None) -> None:
         if self._stream_stop is not None:
             self._stream_stop.set()
         thread = self._stream_thread
+        if thread is not None and thread is threading.current_thread():
+            # close() reached from INSIDE the stream thread (its own transaction timed
+            # out): a thread can never join itself.  The stop event is set, so the
+            # thread exits at its next abort point; the owner thread reaps the handle.
+            return
         if thread is not None and thread.is_alive():
             # The refill thread can be mid-AXI-read holding _io_lock; that read is
             # itself bounded by action_timeout and then self-clears.  Wait long
@@ -752,7 +807,9 @@ class VivadoAxiStreamerSession:
             # if it is still alive, KEEP the handle so a later stop retries the
             # join instead of orphaning a thread that still holds _io_lock (which
             # would make the NEXT prepare/safe_state block on the lock).
-            thread.join(timeout=float(self.action_timeout or 120.0) + 5.0)
+            effective = (float(self.action_timeout or 120.0) + 5.0
+                         if join_timeout is None else float(join_timeout))
+            thread.join(timeout=effective)
             if thread.is_alive():
                 return
         self._stream_thread = None
@@ -810,6 +867,12 @@ class VivadoAxiStreamerSession:
 
     def _execute(self, lines: Sequence[str], *, action: str, timeout: float | None,
                  stop: "threading.Event | None" = None) -> str:
+        # A transaction whose owner is being torn down (the streaming-refill thread
+        # after Off/prepare set its stop event) must abort BEFORE touching the process:
+        # otherwise a dying stream thread could trigger the restart machinery below and
+        # spawn a competing Vivado that fights the main thread over the JTAG target.
+        if stop is not None and stop.is_set():
+            raise _AxiAborted(f"hw_axi {action} aborted before issue (stop requested).")
         self._ensure_process()             # restart + retry the reconnect if a prior op closed us
         process = self._process
         if process is None or process.stdin is None:
@@ -879,18 +942,21 @@ class VivadoAxiStreamerSession:
             if f"{marker}_END" in item:
                 return "".join(lines)
 
-    def _read_stdout(self) -> None:
-        assert self._process is not None
-        stdout = self._process.stdout
+    def _read_stdout(self, process, generation_queue) -> None:
+        # Bound to ONE process generation: reads that process's stdout into that
+        # generation's queue.  Never touches self._process/self._queue -- after a
+        # restart this thread (still draining the dead process) must not be able to
+        # poison the new generation's queue with stale lines or its EOF sentinel.
+        stdout = process.stdout
         if stdout is None:
-            self._queue.put(None)
+            generation_queue.put(None)
             return
         with self._log_path.open("a", encoding="utf-8", errors="replace") as log:
             for line in stdout:
                 log.write(line)
                 log.flush()
-                self._queue.put(line)
-        self._queue.put(None)
+                generation_queue.put(line)
+        generation_queue.put(None)
 
     def _write_action_log(self, action: str, text: str) -> None:
         (self.state_dir / f"{action}.log").write_text(text, encoding="utf-8", errors="replace")

@@ -6812,3 +6812,192 @@ def test_wait_done_drains_the_delayed_tail_and_prepare_does_not_chop_it(tmp_path
     session.fire()
     session.safe_state()
     assert session._drain_until == 0.0
+
+
+def test_drain_tail_short_budget_keeps_guard_and_running_prepare_aborts_instantly(tmp_path):
+    """Two drain-tail edge cases.
+
+    1. wait_done() with a budget SHORTER than the tail returns True on DONE but must
+       leave the drain deadline ARMED, so the next prepare() still waits out the
+       un-drained remainder (clearing it unconditionally would chop the tail).
+    2. prepare() over a still-RUNNING program (no DONE) is an explicit program switch
+       and must NOT wait -- the abort-immediately semantics; only DONE-with-pending-tail
+       blocks it.
+    """
+
+    import re as _re
+    import time as _time
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+
+    class Hw:
+        def __init__(self, status):
+            self.status = status
+            self.bram = {2: status}
+        def __call__(self, lines, action, timeout):
+            text = "\n".join(lines)
+            for w, v in _decode_axi_writes(text):
+                self.bram[w] = v
+                if w == 1:                 # any COMMAND keeps the scripted STATUS
+                    self.bram[2] = self.status
+            m = _re.search(r"-address ([0-9a-fA-F]+) -len 1 -type read", text)
+            if m:
+                w = int(m.group(1), 16) // 4
+                if w == 63:
+                    return "ZLCDATA 5A4C4C02\n"
+                return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
+            return "ok\n"
+
+    # --- case 1: DONE, 100 ms tail, but only a 20 ms wait_done budget -----------------
+    session = VivadoAxiStreamerSession(state_dir=tmp_path / "done", tcl_executor=Hw(0b101))
+    prog = na.RuntimeSequenceProgram(
+        sequence_id=1, sequence_name="d", clock_hz=50e6, channels=["a"],
+        ticks=[0, 10], masks=[1, 0], duration=200.0, trigger_count=0,
+        channel_delays=[5_000_000])                      # 100 ms tail
+    session.prepare(prog)
+    session.fire()
+    assert session.wait_done(timeout=0.02)               # budget < tail: returns on DONE
+    assert session._drain_until > 0.0, "under-drained tail must keep the guard armed"
+    t0 = _time.monotonic()
+    session.prepare(prog)                                # must wait out the remainder
+    assert _time.monotonic() - t0 >= 0.05, "prepare chopped an under-drained tail"
+
+    # --- case 2: still RUNNING (never DONE) -> prepare aborts immediately -------------
+    session2 = VivadoAxiStreamerSession(state_dir=tmp_path / "run", tcl_executor=Hw(0b011))
+    prog2 = na.RuntimeSequenceProgram(
+        sequence_id=2, sequence_name="r", clock_hz=50e6, channels=["a"],
+        ticks=[0, 10], masks=[1, 0], duration=200.0, trigger_count=0,
+        channel_delays=[10_000_000])                     # 200 ms tail
+    session2.prepare(prog2)
+    session2.fire()
+    assert session2._drain_until > 0.0
+    t1 = _time.monotonic()
+    session2.prepare(prog2)                              # program switch: no tail wait
+    assert _time.monotonic() - t1 < 0.1, "prepare must not stall on a RUNNING program"
+
+
+class _FakeVivadoProc:
+    """In-process stand-in for the persistent ``vivado -mode tcl`` child.
+
+    ``stdin.write`` receives one whole wrapped script per transaction; the fake parses
+    its unique marker and synthesises the marker protocol on ``stdout`` (BEGIN / an
+    optional ZLCDATA reply for reads / OK / END).  ``exit``/kill/terminate end the
+    process: stdout EOFs, so the session's reader thread enqueues its None sentinel
+    exactly like a real dead Vivado."""
+
+    def __init__(self):
+        import queue as _queue
+        self._out: "_queue.Queue[str | None]" = _queue.Queue()
+        self.stdin = self
+        self.stdout = self
+        self.returncode = None
+
+    # --- stdin side -------------------------------------------------------------
+    def write(self, text: str) -> None:
+        import re as _re
+        m = _re.search(r"(ZLC_AXI_\d+)_BEGIN", text)
+        if m is None:
+            if text.strip() == "exit":
+                self._exit()
+            return
+        marker = m.group(1)
+        self._out.put(f"{marker}_BEGIN\n")
+        if "-type read" in text:
+            self._out.put("ZLCDATA 5A4C4C02\n")          # REGISTER_LAYOUT_ID readback
+        self._out.put(f"{marker}_OK\n")
+        self._out.put(f"{marker}_END\n")
+
+    def flush(self) -> None:
+        pass
+
+    # --- stdout side (iterated by the session's reader thread) -------------------
+    def __iter__(self):
+        while True:
+            item = self._out.get()
+            if item is None:
+                return
+            yield item
+
+    # --- process control ----------------------------------------------------------
+    def _exit(self) -> None:
+        if self.returncode is None:
+            self.returncode = 0
+            self._out.put(None)                          # EOF for the reader thread
+
+    def wait(self, timeout=None):
+        self._exit()
+        return 0
+
+    def terminate(self) -> None:
+        self._exit()
+
+    def kill(self) -> None:
+        self._exit()
+
+
+def test_axi_session_self_heals_after_close_restart(monkeypatch, tmp_path):
+    """A close() -> restart cycle must be CLEAN: the dead generation's reader thread
+    EOF-sentinels its OWN queue, never the new generation's.
+
+    With the queue shared across generations (the old code), the stale ``None``
+    poisoned every restart: the next transaction raised "process exited
+    unexpectedly", the retry killed its fresh process (whose reader enqueued the
+    next sentinel), and so on forever -- after ONE transient failure (e.g. a delay
+    error followed by an action timeout) no pulse could ever be applied again and
+    the whole server had to be restarted."""
+
+    from Zou_lab_control.neutral_atom.devices import axi_session as ax
+
+    made = []
+
+    def fake_popen(cmd, **kwargs):
+        proc = _FakeVivadoProc()
+        made.append(proc)
+        return proc
+
+    monkeypatch.setattr(ax.subprocess, "Popen", fake_popen)
+    session = ax.VivadoAxiStreamerSession(state_dir=tmp_path, vivado="fake-vivado")
+    session.start()
+    assert session._read_word(63) == 0x5A4C4C02
+
+    old_reader = session._reader
+    session.close()                       # generation 1 dies; its reader EOF-sentinels its queue
+    old_reader.join(timeout=2.0)
+    assert not old_reader.is_alive()
+
+    # the next transaction must transparently restart a fresh Vivado and SUCCEED
+    assert session._read_word(63) == 0x5A4C4C02
+    assert len(made) == 2, "expected exactly one transparent restart"
+    session.close()
+
+
+def test_axi_session_init_tcl_never_uses_raw_jtag_mode(tmp_path):
+    """`open_hw_target -jtag_mode on` must never be the reconnect fallback: raw JTAG
+    mode does not enumerate debug cores, so get_hw_axis comes back empty and every
+    restart then fails with a "no debug core" error until the server is rebooted."""
+
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+
+    session = VivadoAxiStreamerSession(
+        state_dir=tmp_path, vivado="fake-vivado", tcl_executor=lambda lines, a, t: "ok\n")
+    tcl = "\n".join(session._init_tcl())
+    assert "-jtag_mode" not in tcl
+    assert "open_hw_target" in tcl
+
+
+def test_torn_down_stream_transaction_never_spawns_a_new_vivado(monkeypatch, tmp_path):
+    """A transaction whose stop event is already set (the streaming-refill thread being
+    torn down by Off/prepare) must abort BEFORE the restart machinery -- a dying stream
+    thread spawning a competing Vivado would fight the main thread over the JTAG target."""
+
+    import threading as _threading
+    from Zou_lab_control.neutral_atom.devices import axi_session as ax
+
+    def explode(*args, **kwargs):
+        raise AssertionError("a stopped transaction must not spawn a new Vivado")
+
+    monkeypatch.setattr(ax.subprocess, "Popen", explode)
+    session = ax.VivadoAxiStreamerSession(state_dir=tmp_path, vivado="fake-vivado")
+    stop = _threading.Event()
+    stop.set()
+    with pytest.raises(ax._AxiAborted):
+        session._run_tcl(["puts hi"], action="x", timeout=1.0, stop=stop)

@@ -841,3 +841,44 @@ guarantee there is NO DROPPED EDGES; the TB prints the slip count rather than fa
 Real experiment pulses (us/ms periods) never produce 7+ consecutive 20 ns edges, so this is
 a microbenchmark-only startup-window effect.  Eliminating it would need a deeper shadow
 preload (FIFO_DEPTH+shadow growth + rebuild) -- deliberately NOT done before delivery.
+
+## 17. Persistent-Vivado self-heal: the "debug core, must restart server" wedge (2026-06-12)
+
+**Symptom (real machine, reported many times).** After any error (typically a rejected
+delay) followed by a retry, On Pulse failed with a debug-core-flavoured error and NO pulse
+could ever be applied again -- only a full server restart helped.
+
+**Root cause: the restart machinery itself had never once worked.** Three independent
+defects, all in `axi_session.py`:
+
+1. **Stale-sentinel queue poisoning (the permanence).** `self._queue` was created once in
+   `__init__` and SHARED across process generations.  When a session closed (one transient
+   action timeout / broken pipe is enough), the dead generation's reader thread EOF'd and
+   pushed its `None` sentinel into that shared queue.  The next transaction (on the freshly
+   restarted Vivado) read the stale `None` and raised "process exited unexpectedly"; the
+   retry killed ITS fresh process, whose reader enqueued the NEXT sentinel -- every retry
+   consumed one stale sentinel and produced a new one, forever.  The session could never
+   self-heal.  Fix: every `start()` creates a NEW queue, and the reader thread is bound to
+   `(process, queue)` ARGUMENTS, never to `self` -- a dead generation can only poison its
+   own queue.  Regression: `test_axi_session_self_heals_after_close_restart` (fails on the
+   old code with exactly the observed error).
+2. **`open_hw_target -jtag_mode on` fallback (the "debug core" message).** Raw JTAG mode
+   does not enumerate debug cores, so after a reconnect that took this fallback,
+   `get_hw_axis` came back empty and init failed with the "No JTAG-to-AXI core" error on
+   every attempt.  Fix: retry a plain `open_hw_target` after `close_hw_target` + a 2 s
+   settle; never raw mode.  Pinned by `test_axi_session_init_tcl_never_uses_raw_jtag_mode`.
+3. **Teardown races.** A stream-refill transaction whose stop event is set now aborts
+   BEFORE `_ensure_process` (a dying stream thread could otherwise spawn a competing Vivado
+   fighting over the JTAG target); `close()` joins the stream thread for 2 s only (it may be
+   blocked on the `_io_lock` WE hold on the failure path); `_stop_stream_thread` never
+   self-joins (close() reached from inside the stream thread's own timeout).  `start()`
+   clears `_pending` so a dead transaction's queued words never leak into the new session.
+
+Also: `action_timeout` default 30 s -> 120 s (one transient slow JTAG transaction must not
+tear the session down), and `RemoteSequencer.open()` drops a CLOSED connection and
+reconnects (a dead conn object used to be returned forever, so even restarting the server
+did not revive an open GUI/notebook).
+
+**Earlier diagnosis was incomplete:** commit 87ea492 fixed a real `_io_lock` re-entrancy
+deadlock in the same path, but the restart it unblocked then ALWAYS failed on defect 1 --
+which is why the "fixed" bug kept coming back on the real machine.
