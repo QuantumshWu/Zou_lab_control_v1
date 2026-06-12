@@ -1047,33 +1047,38 @@ def test_pulse_gui_scan_dot_retoggle_preserves_values(monkeypatch):
     assert editor.state.scan_table == [[100.0], [200.0], [300.0]]
 
 
-def test_panel_plot_spec_size_presets_keep_fonts_fixed():
-    """frontend.panel_plot_spec contract: a LIMITED size list; bigger sizes grow the
-    data area only (dpi -- and with it every font size -- never changes); unknown
-    sizes/kinds and unreadably small combinations are rejected."""
+def test_panel_plot_spec_is_the_confocal_modular_region():
+    """frontend.panel_plot_spec contract (the confocal rule): ONE plot region and
+    ONE margin set for EVERY kind, "2x2" IS the stock 480x360 frontend region,
+    "RxC" spans height/width halves of it, dpi never changes, and the geometry
+    is not configurable from outside (size is the only knob)."""
+
+    import inspect
 
     from Zou_lab_control.frontend.live import (
-        PANEL_DISPLAY_SCALE, PANEL_SIZES, panel_plot_spec, panel_size_cells)
+        PANEL_DISPLAY_SCALE, PANEL_SIZES, panel_display_size, panel_plot_spec,
+        panel_size_cells)
+    from Zou_lab_control.frontend.canvas import FigureSpec
 
-    assert PANEL_SIZES == ("2x1", "2x2", "3x1", "3x2", "4x1", "4x2")
-    assert panel_size_cells("4x2") == (4, 2)
-    small = panel_plot_spec("1d", "2x1")
-    big = panel_plot_spec("1d", "4x2")
-    # ONE font/dpi system for every frontend figure: panels never fork it.
-    # On-screen sizing is a DISPLAY concern (EmbeddedFigureCanvas display_scale).
-    assert big.dpi == small.dpi == 300
+    assert PANEL_SIZES == ("1x2", "2x2", "1x4", "2x4", "4x4")
+    assert panel_size_cells("1x4") == (1, 4)
+    stock = panel_plot_spec("2x2")
+    assert stock.data_px == FigureSpec().data_px == (480, 360)   # THE stock plot region
+    assert stock.dpi == 300
+    half = panel_plot_spec("1x2")
+    assert half.data_px == (480, 180)             # half height, same width
+    assert half.margins_px == stock.margins_px == (110, 110, 100, 70)
+    wide = panel_plot_spec("2x4")
+    assert wide.data_px == (960, 360)
+    # the 2D internal split [0.75, 0.1, 0.1] makes the stock image axes square
+    assert round(stock.data_px[0] * 0.75) == stock.data_px[1] == 360
+    # the public surface takes ONLY the size preset -- no geometry knobs
+    assert list(inspect.signature(panel_plot_spec).parameters) == ["size"]
     assert 0 < PANEL_DISPLAY_SCALE < 1
-    # the spec is in FIGURE pixels = display pixels / display_scale (supersampled)
-    one_to_one = panel_plot_spec("1d", "2x1", display_scale=1.0)
-    assert small.data_px[0] == round(one_to_one.data_px[0] / PANEL_DISPLAY_SCALE)
-    assert big.data_px[0] > small.data_px[0] and big.data_px[1] > small.data_px[1]
-    assert big.margins_px == small.margins_px     # design margins are size-invariant
+    width, height = panel_display_size("2x2")
+    assert (width, height) == (round(700 * PANEL_DISPLAY_SCALE), round(530 * PANEL_DISPLAY_SCALE))
     with pytest.raises(ValueError):
         panel_size_cells("5x5")
-    with pytest.raises(ValueError):
-        panel_plot_spec("pulse", "2x2")           # not a dashboard panel kind
-    with pytest.raises(ValueError):               # unreadably small -> rejected
-        panel_plot_spec("2d", "2x1", cell_px=(120, 90))
 
 
 @pytest.mark.parametrize("scale_factor", ["1.0", "1.25", "1.5"])
@@ -1104,8 +1109,9 @@ def test_embedded_canvas_invariants_across_screen_scales(scale_factor):
         "assert tuple(round(float(v), 4) for v in fig.get_size_inches()) == design_inches\n"
         "# invariant 2: dpi = design dpi x REAL screen ratio (retina supersampling)\n"
         "assert abs(fig.dpi - 300 * real) < 1e-6, fig.dpi\n"
-        "# invariant 3: the LOGICAL widget size is scale-independent (+-1 px rounding)\n"
-        "assert abs(c.width() - 588) <= 1 and abs(c.height() - 500) <= 1, (c.width(), c.height())\n"
+        "# invariant 3: the LOGICAL widget size is scale-independent (+-1 px rounding):\n"
+        "# the 2x2 stock region 480x360 + margins (110,110,100,70) = 700x530 figure px\n"
+        "assert abs(c.width() - 490) <= 1 and abs(c.height() - 371) <= 1, (c.width(), c.height())\n"
         "print('DPR-INVARIANTS-OK')\n"
     )
     env = dict(__import__("os").environ)
@@ -1116,23 +1122,25 @@ def test_embedded_canvas_invariants_across_screen_scales(scale_factor):
     assert "DPR-INVARIANTS-OK" in result.stdout, result.stdout + result.stderr
 
 
-def test_task_console_cards_align_to_the_grid(monkeypatch):
-    """A card's fixed size equals EXACTLY its spanned cells (incl. swallowed gaps),
-    so mixed-size cards line up on the console grid."""
+def test_task_console_cards_are_modular(monkeypatch):
+    """Card size = the frontend panel's on-screen canvas + the card chrome; every
+    kind shares one plot region per size (the confocal rule), so same-size cards
+    are identical and the canvas always fits its card."""
 
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from Zou_lab_control.frontend import devtools as dt
-    from Zou_lab_control.frontend.live import PANEL_CELL_PX, PANEL_GAP_PX
+    from Zou_lab_control.frontend.live import panel_display_size
+    from Zou_lab_control.frontend.task_console import _CARD_CHROME
 
     console = dt.demo_console(shots=3)
     for card in console.cards:
-        cols, rows = card.config.cols, card.config.rows
-        assert card.width() == cols * PANEL_CELL_PX[0] + (cols - 1) * PANEL_GAP_PX
-        assert card.height() == rows * PANEL_CELL_PX[1] + (rows - 1) * PANEL_GAP_PX
+        canvas_w, canvas_h = panel_display_size(card.config.size)
+        assert card.width() == canvas_w + _CARD_CHROME[0], card.config.size
+        assert card.height() == canvas_h + _CARD_CHROME[1], card.config.size
         if card.canvas is not None:               # the canvas must FIT inside its card
-            assert card.canvas.width() <= card.width()
-            assert card.canvas.height() <= card.height()
+            assert abs(card.canvas.width() - canvas_w) <= 1
+            assert abs(card.canvas.height() - canvas_h) <= 1
             # the figure renders FULL SIZE in the ONE 300-dpi design system and
             # is shown scaled; under the high-DPI canvas path matplotlib stores
             # the design dpi in _original_dpi and inflates fig.dpi by the ratio
@@ -1140,6 +1148,12 @@ def test_task_console_cards_align_to_the_grid(monkeypatch):
             fig = card.plotter.fig
             assert getattr(fig, "_original_dpi", fig.dpi) == 300
             assert card.canvas.width() < fig.get_size_inches()[0] * fig.dpi
+    # same size -> identical card (the hist and monitor 1x2 cards)
+    sizes = {}
+    for card in console.cards:
+        sizes.setdefault(card.config.size, set()).add((card.width(), card.height()))
+    for size, dims in sizes.items():
+        assert len(dims) == 1, (size, dims)
     console.shutdown()
 
 

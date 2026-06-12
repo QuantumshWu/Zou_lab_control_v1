@@ -95,4 +95,14 @@ else:
             event.accept()
 
 
-__all__ = ["EmbeddedFigureCanvas"]
+def panel_canvas(figure):
+    """The canvas for a dashboard panel figure: the panel display scale is a
+    frontend design constant, not a host knob."""
+
+    if EmbeddedFigureCanvas is None:  # pragma: no cover - matplotlib-qt missing
+        raise RuntimeError("matplotlib Qt canvas is not available")
+    from .live import PANEL_DISPLAY_SCALE
+    return EmbeddedFigureCanvas(figure, display_scale=PANEL_DISPLAY_SCALE)
+
+
+__all__ = ["EmbeddedFigureCanvas", "panel_canvas"]

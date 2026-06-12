@@ -226,10 +226,13 @@ class BaseLivePlot:
             # panel) axes never crowd their labels; the caps saturate at the
             # stock 8 for full-size notebook figures.
             data_w, data_h = self.spec.data_px
+            # scale the tick caps with the data area RELATIVE TO the stock
+            # 480x360 region, so full-size figures keep the stock 8 and a
+            # half-height panel gets proportionally fewer, never-crowded ticks
             apply_smart_ticks(
                 self.ax,
-                max_ticks_x=max(4, min(8, int(data_w) // 130)),
-                max_ticks_y=max(4, min(8, int(data_h) // 90)),
+                max_ticks_x=max(3, min(8, round(8 * int(data_w) / 480))),
+                max_ticks_y=max(3, min(8, round(8 * int(data_h) / 360))),
             )
         self.init_core()
         self._apply_title()
@@ -797,108 +800,71 @@ def pulse_plot_channels(
 
 
 # --------------------------------------------------------------------- panels
-# Dashboard panel presets: a LIMITED set of grid sizes ("cols x rows") whose
-# pixel geometry follows one rule, while dpi and therefore every font size stay
-# FIXED -- exactly the pulse_plot_spec discipline: a bigger panel gets more data
-# area, never bigger titles/labels.  The margins per kind are design constants
-# (the 2D kind pays extra right margin for its side distribution + colorbar).
-PANEL_SIZES = ("2x1", "2x2", "3x1", "3x2", "4x1", "4x2")
-# There is ONE font/dpi system for every frontend figure (style.DEFAULT_STYLE,
-# dpi=300) -- panels do NOT fork it.  A panel figure renders at full size and
-# is DISPLAYED scaled by PANEL_DISPLAY_SCALE through the standard high-DPI
-# canvas path (qt_canvas.EmbeddedFigureCanvas), so on screen the text sits at
-# ~70% of a notebook/pulse-preview figure, matching the smaller data areas,
-# while the figure itself stays a perfectly ordinary 300 dpi frontend figure.
+# Dashboard panel presets.  THE design rule (the confocal rule): every panel
+# kind shares ONE plot region and ONE margin set, so panels of any kind line
+# up exactly.  "2x2" is the stock frontend plot region (480x360 data px); a
+# size "RxC" spans R height-halves x C width-halves of it ("1x2" = the stock
+# region at half height).  The 2D kind splits ITS region internally
+# ([0.75, 0.1, 0.1] -> image + side distribution + colorbar), which at "2x2"
+# makes the image exactly 360x360 -- square, and aligned with the distribution
+# and colorbar.  dpi and every font size never change with size.
+#
+# The geometry below is NOT a public knob: hosts pick a kind and a size preset,
+# nothing else -- the visual language is owned here.
+PANEL_SIZES = ("1x2", "2x2", "1x4", "2x4", "4x4")
+PANEL_UNIT_PX = (180, 240)     # (height, width) of one half-unit of the stock region
+PANEL_MARGINS_PX = (110, 110, 100, 70)   # stock margins (L, R, B, T) with the title
+                                         # top slot ALWAYS reserved: a panel has one
+                                         # size whether or not it carries a title
+# Panels are DISPLAYED scaled through the standard high-DPI canvas path
+# (qt_canvas.panel_canvas), so on screen their text sits at ~70% of a
+# notebook/pulse-preview figure while the figure stays an ordinary 300 dpi
+# frontend figure.
 PANEL_DISPLAY_SCALE = 0.7
-# All PANEL_* geometry below is in DISPLAY pixels (what the user sees / what
-# the host grid is built from); panel_plot_spec converts to figure pixels by
-# dividing by PANEL_DISPLAY_SCALE.  Margins follow the create_axes_fixed order
-# (LEFT, RIGHT, BOTTOM, TOP): bottom clears the x label + ticks, top clears the
-# in-figure title; the 2D kind pays extra right margin for its side
-# distribution + colorbar.
-PANEL_MARGINS = {
-    "2d": (84, 55, 52, 50),
-    "1d": (84, 26, 52, 50),
-    "monitor": (84, 26, 52, 50),
-    "hist": (84, 26, 52, 50),
-}
-PANEL_CELL_PX = (300, 300)     # design grid-cell size (display px; layouts stay machine-portable)
-PANEL_GAP_PX = 8               # gap between grid cells (display px)
-PANEL_CHROME_PX = (20, 108)    # host-card overhead around the canvas (display px)
-PANEL_MIN_DATA_PX = 70         # below this the axes are unreadable -> reject the combo (display px)
 
 
 def panel_size_cells(size: str) -> tuple[int, int]:
-    """Parse a panel size ("cols x rows") against the LIMITED preset list."""
+    """Parse a panel size ("rows x cols" in half-units) against the preset list."""
 
     key = str(size).strip().lower().replace(" ", "")
     if key not in PANEL_SIZES:
         raise ValueError(f"unknown panel size {size!r}; choose from {', '.join(PANEL_SIZES)}.")
-    cols, rows = key.split("x")
-    return int(cols), int(rows)
+    rows, cols = key.split("x")
+    return int(rows), int(cols)
 
 
-def panel_plot_spec(
-    kind: str = "1d",
-    size: str = "2x2",
-    *,
-    cell_px: tuple[int, int] = PANEL_CELL_PX,
-    gap_px: int = PANEL_GAP_PX,
-    chrome_px: tuple[int, int] = PANEL_CHROME_PX,
-    display_scale: float = PANEL_DISPLAY_SCALE,
-) -> FigureSpec:
-    """FigureSpec for a dashboard panel spanning ``size`` grid cells.
+def panel_plot_spec(size: str = "2x2") -> FigureSpec:
+    """FigureSpec for a dashboard panel: the stock plot region scaled in
+    half-units, with the stock margins -- identical for EVERY panel kind."""
 
-    The DISPLAYED canvas fills the spanned cells (including the swallowed
-    inter-cell gaps) minus the host card's chrome; the data area is the canvas
-    minus the kind's design margins -- all in DISPLAY pixels.  The returned
-    spec is in FIGURE pixels (display / ``display_scale``) at the frontend's
-    one and only dpi, so the figure is an ordinary 300 dpi frontend figure that
-    the host shows scaled (qt_canvas.EmbeddedFigureCanvas).  A combination
-    whose displayed data area would be unreadably small is rejected."""
-
-    kind = _normalize_kind(kind)
-    if kind not in PANEL_MARGINS:
-        raise ValueError(f"panel kind {kind!r} is not a dashboard panel; choose from {sorted(PANEL_MARGINS)}.")
-    cols, rows = panel_size_cells(size)
-    margins = PANEL_MARGINS[kind]
-    canvas_w = cols * int(cell_px[0]) + (cols - 1) * int(gap_px) - int(chrome_px[0])
-    canvas_h = rows * int(cell_px[1]) + (rows - 1) * int(gap_px) - int(chrome_px[1])
-    data_w = canvas_w - margins[0] - margins[1]
-    data_h = canvas_h - margins[2] - margins[3]
-    if data_w < PANEL_MIN_DATA_PX or data_h < PANEL_MIN_DATA_PX:
-        raise ValueError(
-            f"panel size {size!r} is too small for a {kind!r} panel at cell {cell_px}"
-            f" (displayed data area {data_w}x{data_h} px); pick a bigger size.")
-    scale = max(0.1, float(display_scale))
+    rows, cols = panel_size_cells(size)
     return FigureSpec(
-        data_px=(round(data_w / scale), round(data_h / scale)),
-        margins_px=tuple(round(m / scale) for m in margins))
+        data_px=(cols * PANEL_UNIT_PX[1], rows * PANEL_UNIT_PX[0]),
+        margins_px=PANEL_MARGINS_PX)
 
 
-def panel_plot(
-    data_x,
-    data_y=None,
-    *,
-    kind: str,
-    size: str = "2x2",
-    cell_px: tuple[int, int] = PANEL_CELL_PX,
-    gap_px: int = PANEL_GAP_PX,
-    chrome_px: tuple[int, int] = PANEL_CHROME_PX,
-    display_scale: float = PANEL_DISPLAY_SCALE,
-    **kwargs,
-):
+def panel_display_size(size: str = "2x2") -> tuple[int, int]:
+    """On-screen (logical px) canvas size of a panel of ``size`` -- what a host
+    reserves for the canvas built by ``qt_canvas.panel_canvas``."""
+
+    spec = panel_plot_spec(size)
+    left, right, bottom, top = spec.margins_px
+    width = spec.data_px[0] + left + right
+    height = spec.data_px[1] + bottom + top
+    return (round(width * PANEL_DISPLAY_SCALE), round(height * PANEL_DISPLAY_SCALE))
+
+
+def panel_plot(data_x, data_y=None, *, kind: str, size: str = "2x2", **kwargs):
     """``plot()`` preset for dashboard panels: pick a kind and one of the
     LIMITED ``PANEL_SIZES`` and get a correctly sized, consistently styled live
     plot (no display, no DataFigure -- the host embeds the figure through
-    ``qt_canvas.EmbeddedFigureCanvas(fig, display_scale=...)``).
+    ``qt_canvas.panel_canvas``).  Everything else IS the plot() factory,
+    including the 2D square + aligned side-distribution/colorbar design.
 
-    Everything else IS the plot() factory -- including the design rule that 2D
-    figures are always SQUARE with the side distribution and colorbar aligned
-    (a non-square camera frame sits centred in the square extents)."""
+    ``kwargs`` are the plot()/plotter DATA options (labels, title, cmap, bins,
+    relim_mode, ...) -- the panel GEOMETRY is not configurable from outside."""
 
-    spec = panel_plot_spec(kind, size, cell_px=cell_px, gap_px=gap_px,
-                           chrome_px=chrome_px, display_scale=display_scale)
+    spec = panel_plot_spec(size)
     return plot(data_x, data_y, kind=kind, spec=spec, display=False, data_figure=False, **kwargs)
 
 
@@ -1725,6 +1691,7 @@ __all__ = [
     "LiveLiveDis",
     "PANEL_DISPLAY_SCALE",
     "PANEL_SIZES",
+    "panel_display_size",
     "PulseSequenceFigure",
     "panel_plot",
     "panel_plot_spec",

@@ -33,11 +33,8 @@ import numpy as np
 from PyQt5 import QtCore, QtWidgets
 
 from .live import (
-    PANEL_CELL_PX,
-    PANEL_CHROME_PX,
-    PANEL_DISPLAY_SCALE,
-    PANEL_GAP_PX,
     PANEL_SIZES,
+    panel_display_size,
     panel_plot,
     panel_size_cells,
 )
@@ -66,12 +63,10 @@ from .qt_fluent import (
 
 try:  # guarded like pulse_gui: the console degrades without matplotlib-qt
     import matplotlib.pyplot as plt
-    from .qt_canvas import EmbeddedFigureCanvas
-    if EmbeddedFigureCanvas is None:
-        raise ImportError("matplotlib qt canvas unavailable")
+    from .qt_canvas import panel_canvas
 except Exception:  # pragma: no cover - depends on the local matplotlib install
     plt = None
-    EmbeddedFigureCanvas = None
+    panel_canvas = None
 
 
 TASK_FILES_ENV = "ZLC_TASK_DIR"
@@ -92,14 +87,17 @@ _DEFAULT_SOURCES = {
     "hist": "value = history('counts', 200).ravel()",
 }
 
-# PanelCard chrome (RAW px, matching the raw-px canvas geometry): these row
-# heights are built into the card below and MUST stay <= PANEL_CHROME_PX, or
-# the canvas would overflow its grid cells.
+# PanelCard chrome (the console's OWN UI overhead around the frontend canvas;
+# the plot geometry itself is owned by frontend.panel_plot and not configurable
+# from here).
 _HEADER_H = 30
 _SOURCE_H = 30
 _STATUS_H = 16
 _CARD_PAD = 8
 _CARD_SPACING = 5
+_CARD_CHROME = (2 * _CARD_PAD + 4,
+                2 * _CARD_PAD + _HEADER_H + _SOURCE_H + _STATUS_H + 3 * _CARD_SPACING)
+_GRID_GAP = 8
 
 
 def _task_files_dir() -> Path:
@@ -136,11 +134,11 @@ class PanelConfig:
         self.params = dict(params or {})
 
     @property
-    def cols(self) -> int:
+    def rows(self) -> int:
         return panel_size_cells(self.size)[0]
 
     @property
-    def rows(self) -> int:
+    def cols(self) -> int:
         return panel_size_cells(self.size)[1]
 
     def to_dict(self) -> dict[str, object]:
@@ -226,11 +224,11 @@ def default_console_state() -> TaskConsoleState:
         panels=[
             PanelConfig(kind="2d", title="Loading image", row=0, col=0, size="2x2",
                         source="value = frame"),
-            PanelConfig(kind="hist", title="Counts distribution", row=0, col=2, size="2x1",
+            PanelConfig(kind="hist", title="Counts distribution", row=0, col=2, size="1x2",
                         source="value = history('counts', 200).ravel()", params={"bins": 80}),
-            PanelConfig(kind="monitor", title="Loading rate", row=1, col=2, size="2x1",
+            PanelConfig(kind="monitor", title="Loading rate", row=1, col=2, size="1x2",
                         source="value = rate", params={"length": 300}),
-            PanelConfig(kind="1d", title="Per-site loading rate", row=2, col=0, size="4x2",
+            PanelConfig(kind="1d", title="Per-site loading rate", row=2, col=0, size="2x4",
                         source="value = rate_sites"),
         ],
     )
@@ -340,12 +338,11 @@ class PanelCard(FluentGroupBox):
 
     # ------------------------------------------------------------- geometry
     def _apply_fixed_size(self) -> None:
-        """Pin the card to EXACTLY its spanned grid cells (incl. swallowed gaps),
-        so every card lines up on the console grid regardless of content."""
-        cols, rows = self.config.cols, self.config.rows
-        width = cols * PANEL_CELL_PX[0] + (cols - 1) * PANEL_GAP_PX
-        height = rows * PANEL_CELL_PX[1] + (rows - 1) * PANEL_GAP_PX
-        self.setFixedSize(width, height)
+        """Card size = the frontend panel's on-screen canvas + the card chrome.
+        Because every kind shares one plot region per size (the confocal rule),
+        same-size cards are identical and half-height cards stack to a full one."""
+        canvas_w, canvas_h = panel_display_size(self.config.size)
+        self.setFixedSize(canvas_w + _CARD_CHROME[0], canvas_h + _CARD_CHROME[1])
 
     # ------------------------------------------------------------- config edits
     def _on_title(self, text: str) -> None:
@@ -481,7 +478,7 @@ class PanelCard(FluentGroupBox):
 
     # ------------------------------------------------------------- plot lifecycle
     def _build_plot(self, value) -> None:
-        if EmbeddedFigureCanvas is None:
+        if panel_canvas is None:
             raise RuntimeError("matplotlib Qt canvas is not available")
         self._teardown_plot()
         kind = self.config.kind
@@ -516,8 +513,8 @@ class PanelCard(FluentGroupBox):
                 labels=("Site", label, "Z"), relim_mode="tight",
                 title=self.config.title or None)
         # the figure is an ordinary full-size 300 dpi frontend figure; the canvas
-        # DISPLAYS it scaled (supersampled, exact interaction coordinates)
-        self.canvas = EmbeddedFigureCanvas(self.plotter.fig, display_scale=PANEL_DISPLAY_SCALE)
+        # DISPLAYS it at the frontend's panel scale (supersampled, exact coords)
+        self.canvas = panel_canvas(self.plotter.fig)
         self.canvas.draw()
         self.canvas.setFixedSize(self.canvas.sizeHint())
         self.canvas_holder.addWidget(self.canvas, alignment=QtCore.Qt.AlignCenter)
@@ -647,7 +644,7 @@ class TaskConsole(QtWidgets.QWidget):
         self.grid_body = QtWidgets.QWidget()
         self.grid_body.setStyleSheet("background: transparent;")
         self.grid = QtWidgets.QGridLayout(self.grid_body)
-        gap = PANEL_GAP_PX
+        gap = _GRID_GAP
         self.grid.setContentsMargins(gap, gap, gap, gap)
         self.grid.setHorizontalSpacing(gap)
         self.grid.setVerticalSpacing(gap)
@@ -687,17 +684,14 @@ class TaskConsole(QtWidgets.QWidget):
         self.cards.append(card)
 
     def _regrid(self) -> None:
-        """Pin every card to its grid cells: fixed-size rows/columns make spanned
-        cards line up exactly (a card's fixed size equals its spanned cells)."""
+        """Place every card at its grid position, spanning its size in half-units.
+        The cards themselves are modular (one plot region per size), so spanned
+        placements line up without forcing uniform row/column sizes."""
 
         for card in self.cards:
             self.grid.removeWidget(card)
         rows = max((c.config.row + c.config.rows for c in self.cards), default=1)
         cols = max((c.config.col + c.config.cols for c in self.cards), default=1)
-        for r in range(rows):
-            self.grid.setRowMinimumHeight(r, PANEL_CELL_PX[1])
-        for c in range(cols):
-            self.grid.setColumnMinimumWidth(c, PANEL_CELL_PX[0])
         for card in self.cards:
             cfg = card.config
             self.grid.addWidget(card, cfg.row, cfg.col, cfg.rows, cfg.cols,
@@ -710,7 +704,7 @@ class TaskConsole(QtWidgets.QWidget):
     def _add_panel(self) -> None:
         kind = self.kind_combo.currentData() or "1d"
         rows = max((c.config.row + c.config.rows for c in self.cards), default=0)
-        config = PanelConfig(kind=str(kind), row=rows, col=0, size="2x1")
+        config = PanelConfig(kind=str(kind), row=rows, col=0, size="1x2")
         card = PanelCard(config)
         self._attach_card(card)
         self._regrid()
