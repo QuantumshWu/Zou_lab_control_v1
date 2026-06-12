@@ -907,8 +907,10 @@ value = np.log1p(frame[20:60, 30:90])  # 任意 numpy 运算 / 切片
 \end{codeblock}
 命名空间里有：\tfocus{每个信号名}（最新值直接可用）、\pyapi{history(name, n)}（最近 $n$ 个 shot 堆叠，axis 0 是 shot）、\pyapi{latest(name)}、\pyapi{names()}、\pyapi{shot}、\pyapi{np}、\pyapi{math}。改完点 \pyapi{Apply}（未应用的编辑显示 \pyapi{Apply*} 星号）。某个面板表达式报错时，错误只显示在\tfocus{该面板自己的状态行}（红字），其余面板照常刷新。
 
-\section{布局与参数}
-每张面板卡的头部是：标题框、网格位置 \pyapi{R/C}（行/列）与跨度 \pyapi{H/W}（高/宽，格子数）、各类型自己的参数（2D 的 colormap、滚动轨迹的历史长度、直方图的 bin 数）、移除按钮 \pyapi{X}。标题栏的 \pyapi{Add Panel} 按所选类型加新面板；\pyapi{Pause/Resume} 暂停/恢复刷新；\pyapi{Save}/\pyapi{Load} 把\tfocus{整个布局}（面板、位置、表达式、参数）存成一个 JSON（默认在 \filepath{tasks/} 目录），\pyapi{Save*} 黄色星号语义与脉冲编辑器一致。面板值的形状变化（换表达式 / 改跨度 / 改参数）会自动重建该面板的图。
+\section{布局与参数：有限尺寸预设 + 钉格子}
+面板尺寸不是自由数值，而是\tfocus{有限的预设组合}（\pyapi{frontend.PANEL\_SIZES}：\pyapi{2x1 / 2x2 / 3x1 / 3x2 / 4x1 / 4x2}，单位是网格格子，列$\times$行）。这套预设由 frontend 的公共接口实现——\pyapi{panel\_plot\_spec(kind, size)} 与 \pyapi{panel\_plot(...)}（\filepath{frontend/live.py}），遵守与 \pyapi{pulse\_plot\_spec} 相同的设计纪律：\tfocus{尺寸变化只改数据区像素，dpi 与全部字号（标题/坐标label/刻度）保持不变}，所以不同大小的面板共享同一套视觉语言。Notebook 里也可以直接调它拿一张"仪表盘规格"的图。格子的像素尺寸是 frontend 设计常量（不进布局文件），所以布局 JSON \tfocus{跨机器一致}。
+
+每张面板卡的头部一行：标题框、\pyapi{R/C}（钉到的网格行/列）、\pyapi{size} 预设下拉、各类型自己的参数（2D 的 colormap、滚动轨迹的历史长度、直方图的 bin 数）、移除按钮 \pyapi{X}。卡片的实际大小\tfocus{严格等于}它跨过的格子（含吞掉的格间距），所以所有卡片在网格上严丝合缝。标题栏的 \pyapi{Add Panel} 按所选类型加新面板；\pyapi{Pause/Resume} 暂停/恢复刷新；\pyapi{Save}/\pyapi{Load} 把\tfocus{整个布局}（面板、位置、尺寸、表达式、参数）存成一个 JSON（默认在 \filepath{tasks/} 目录），\pyapi{Save*} 黄色星号语义与脉冲编辑器一致。面板值的形状变化（换表达式 / 换尺寸 / 改参数）会自动重建该面板的图。窗口大小沿用脉冲编辑器的规则按主屏自适应，超出窗口的格子用滚动条到达。
 
 \section{启动与接线}
 双击 \filepath{task\_console.bat}（或 \pyapi{python task\_console.py}）即以\tfocus{虚拟实验}启动：主 feed + 一个 \pyapi{b\_} 前缀的副 feed（装载率不同），所以 $A-B$ 类表达式开箱有数据。常用参数：\pyapi{--rate 4}（shot/s）、\pyapi{--seed 7}（可复现）、\pyapi{--single}（只开主 feed）、\pyapi{--state xxx.json}（启动即载入布局）、\pyapi{--no-feed}（不开虚拟源，自己接 hub）。

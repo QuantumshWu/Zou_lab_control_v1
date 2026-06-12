@@ -190,10 +190,9 @@ def demo_console(*, scale: float = 1.0, size=(1480, 980), seed: int = 11, shots:
     for _ in range(max(1, int(shots))):
         for feed in feeds:
             feed.step()
-    console = TaskConsole(hub=hub, state=state or default_console_state(), feeds=feeds, scale=scale)
+    console = TaskConsole(hub=hub, state=state or default_console_state(), feeds=feeds,
+                          scale=scale, window_px=size)
     console._timer.stop()          # deterministic: tests drive refresh_once() themselves
-    if size is not None:
-        console.setFixedSize(int(size[0]), int(size[1]))
     console.show()
     console.refresh_once()
     return console

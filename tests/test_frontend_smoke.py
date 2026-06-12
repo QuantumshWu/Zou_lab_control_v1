@@ -1047,6 +1047,48 @@ def test_pulse_gui_scan_dot_retoggle_preserves_values(monkeypatch):
     assert editor.state.scan_table == [[100.0], [200.0], [300.0]]
 
 
+def test_panel_plot_spec_size_presets_keep_fonts_fixed():
+    """frontend.panel_plot_spec contract: a LIMITED size list; bigger sizes grow the
+    data area only (dpi -- and with it every font size -- never changes); unknown
+    sizes/kinds and unreadably small combinations are rejected."""
+
+    from Zou_lab_control.frontend.live import PANEL_SIZES, panel_plot_spec, panel_size_cells
+
+    assert PANEL_SIZES == ("2x1", "2x2", "3x1", "3x2", "4x1", "4x2")
+    assert panel_size_cells("4x2") == (4, 2)
+    small = panel_plot_spec("1d", "2x1")
+    big = panel_plot_spec("1d", "4x2")
+    assert big.dpi == small.dpi == 300            # fonts identical across sizes
+    assert big.data_px[0] > small.data_px[0] and big.data_px[1] > small.data_px[1]
+    assert big.margins_px == small.margins_px     # design margins are size-invariant
+    with pytest.raises(ValueError):
+        panel_size_cells("5x5")
+    with pytest.raises(ValueError):
+        panel_plot_spec("pulse", "2x2")           # not a dashboard panel kind
+    with pytest.raises(ValueError):
+        panel_plot_spec("2d", "2x1")              # too small for the 2d margins -> rejected
+
+
+def test_task_console_cards_align_to_the_grid(monkeypatch):
+    """A card's fixed size equals EXACTLY its spanned cells (incl. swallowed gaps),
+    so mixed-size cards line up on the console grid."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.live import PANEL_CELL_PX, PANEL_GAP_PX
+
+    console = dt.demo_console(shots=3)
+    for card in console.cards:
+        cols, rows = card.config.cols, card.config.rows
+        assert card.width() == cols * PANEL_CELL_PX[0] + (cols - 1) * PANEL_GAP_PX
+        assert card.height() == rows * PANEL_CELL_PX[1] + (rows - 1) * PANEL_GAP_PX
+        if card.canvas is not None:               # the canvas must FIT inside its card
+            assert card.canvas.width() <= card.width()
+            assert card.canvas.height() <= card.height()
+    console.shutdown()
+
+
 def test_task_console_panels_render_and_update(monkeypatch):
     """The default console layout builds all four panel kinds against the virtual
     feed and keeps updating them on subsequent shots."""
@@ -1089,9 +1131,8 @@ def test_task_console_cross_signal_expression_and_error_isolation(monkeypatch):
 
     console = dt.demo_console(shots=20, dual=True)
     diff = PanelCard(
-        PanelConfig(kind="2d", title="A-B rate", row=4, col=0, rowspan=2, colspan=2,
-                    source="value = rate_grid - b_rate_grid"),
-        cell_px=console.state.cell_px)
+        PanelConfig(kind="2d", title="A-B rate", row=4, col=0, size="2x2",
+                    source="value = rate_grid - b_rate_grid"))
     console._attach_card(diff)
     console._regrid()
     console.refresh_once()
@@ -1101,7 +1142,7 @@ def test_task_console_cross_signal_expression_and_error_isolation(monkeypatch):
 
     # break ONE panel: it reports, the siblings keep updating
     victim = next(card for card in console.cards if card.config.kind == "monitor")
-    victim.source_edit.setPlainText("value = this_signal_does_not_exist")
+    victim.source_edit.setText("value = this_signal_does_not_exist")
     victim._apply_source()
     for feed in console.feeds:
         feed.step()

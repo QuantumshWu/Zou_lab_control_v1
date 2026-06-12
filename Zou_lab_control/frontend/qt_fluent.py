@@ -1219,13 +1219,17 @@ class FluentWindow(FramelessWindow):
             title_bar = StandardTitleBar(self)
             title_bar.setTitle(title)
             title_bar.iconLabel.setFixedSize(0, 0)
+            # With the icon collapsed the title is the FIRST thing on the bar, so it
+            # needs a real left inset (4 px hugged the window edge) and explicit
+            # vertical centering inside the 32 px bar.
+            title_bar.titleLabel.setAlignment(QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft)
             title_bar.titleLabel.setStyleSheet(
                 f"""
                 QLabel {{
                     background: transparent;
                     color: {TEXT};
                     font: {fluent_font_size()}pt "{FONT}";
-                    padding: 0 {scaled_px(4)}px;
+                    padding: 0 {scaled_px(6)}px 0 {scaled_px(14)}px;
                 }}
                 """
             )

@@ -788,6 +788,87 @@ def pulse_plot_channels(
     return visible if explicit_channels else (visible or ["pulse"])
 
 
+# --------------------------------------------------------------------- panels
+# Dashboard panel presets: a LIMITED set of grid sizes ("cols x rows") whose
+# pixel geometry follows one rule, while dpi and therefore every font size stay
+# FIXED -- exactly the pulse_plot_spec discipline: a bigger panel gets more data
+# area, never bigger titles/labels.  The margins per kind are design constants
+# (the 2D kind pays extra right margin for its side distribution + colorbar).
+PANEL_SIZES = ("2x1", "2x2", "3x1", "3x2", "4x1", "4x2")
+PANEL_MARGINS = {
+    "2d": (85, 60, 65, 38),
+    "1d": (85, 30, 60, 38),
+    "monitor": (85, 30, 60, 38),
+    "hist": (85, 30, 60, 38),
+}
+PANEL_CELL_PX = (300, 280)     # design grid-cell size (raw px; layouts stay machine-portable)
+PANEL_GAP_PX = 8               # gap between grid cells
+PANEL_CHROME_PX = (20, 108)    # host-card overhead around the canvas (w, h)
+PANEL_MIN_DATA_PX = 70         # below this the axes are unreadable -> reject the combo
+
+
+def panel_size_cells(size: str) -> tuple[int, int]:
+    """Parse a panel size ("cols x rows") against the LIMITED preset list."""
+
+    key = str(size).strip().lower().replace(" ", "")
+    if key not in PANEL_SIZES:
+        raise ValueError(f"unknown panel size {size!r}; choose from {', '.join(PANEL_SIZES)}.")
+    cols, rows = key.split("x")
+    return int(cols), int(rows)
+
+
+def panel_plot_spec(
+    kind: str = "1d",
+    size: str = "2x2",
+    *,
+    cell_px: tuple[int, int] = PANEL_CELL_PX,
+    gap_px: int = PANEL_GAP_PX,
+    chrome_px: tuple[int, int] = PANEL_CHROME_PX,
+    dpi: int = 300,
+) -> FigureSpec:
+    """FigureSpec for a dashboard panel spanning ``size`` grid cells.
+
+    The CANVAS fills the spanned cells (including the swallowed inter-cell gaps)
+    minus the host card's chrome; the data area is the canvas minus the kind's
+    design margins.  ``dpi`` (and with it every font size) never changes with
+    ``size``, so panels of different sizes share one visual language.  A
+    combination whose data area would be unreadably small is rejected."""
+
+    kind = _normalize_kind(kind)
+    if kind not in PANEL_MARGINS:
+        raise ValueError(f"panel kind {kind!r} is not a dashboard panel; choose from {sorted(PANEL_MARGINS)}.")
+    cols, rows = panel_size_cells(size)
+    margins = PANEL_MARGINS[kind]
+    canvas_w = cols * int(cell_px[0]) + (cols - 1) * int(gap_px) - int(chrome_px[0])
+    canvas_h = rows * int(cell_px[1]) + (rows - 1) * int(gap_px) - int(chrome_px[1])
+    data_w = canvas_w - margins[0] - margins[1]
+    data_h = canvas_h - margins[2] - margins[3]
+    if data_w < PANEL_MIN_DATA_PX or data_h < PANEL_MIN_DATA_PX:
+        raise ValueError(
+            f"panel size {size!r} is too small for a {kind!r} panel at cell {cell_px}"
+            f" (data area {data_w}x{data_h} px); pick a bigger size.")
+    return FigureSpec(data_px=(data_w, data_h), margins_px=margins, dpi=int(dpi))
+
+
+def panel_plot(
+    data_x,
+    data_y=None,
+    *,
+    kind: str,
+    size: str = "2x2",
+    cell_px: tuple[int, int] = PANEL_CELL_PX,
+    gap_px: int = PANEL_GAP_PX,
+    chrome_px: tuple[int, int] = PANEL_CHROME_PX,
+    **kwargs,
+):
+    """``plot()`` preset for dashboard panels: pick a kind and one of the
+    LIMITED ``PANEL_SIZES`` and get a correctly sized, consistently styled live
+    plot (no display, no DataFigure -- the host embeds the figure)."""
+
+    spec = panel_plot_spec(kind, size, cell_px=cell_px, gap_px=gap_px, chrome_px=chrome_px)
+    return plot(data_x, data_y, kind=kind, spec=spec, display=False, data_figure=False, **kwargs)
+
+
 def pulse_plot_spec(
     channel_count: int,
     *,
@@ -1609,7 +1690,11 @@ __all__ = [
     "Live1D",
     "Live2DDis",
     "LiveLiveDis",
+    "PANEL_SIZES",
     "PulseSequenceFigure",
+    "panel_plot",
+    "panel_plot_spec",
+    "panel_size_cells",
     "plot",
     "pulse_plot_channels",
     "pulse_plot_spec",

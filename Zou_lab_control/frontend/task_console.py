@@ -1,18 +1,23 @@
 """Task console: a configurable grid dashboard of live experiment panels.
 
 Each panel is one live plot (2D image / 1D vector / rolling monitor / distribution)
-wired to the experiment through a small SOURCE EXPRESSION evaluated against the
-named signals of a :class:`~Zou_lab_control.neutral_atom.core.signals.SignalHub`
+in one of the LIMITED frontend size presets (``frontend.PANEL_SIZES``, "cols x
+rows" grid cells), pinned to a grid position.  The plot itself comes from the
+frontend's :func:`~Zou_lab_control.frontend.live.panel_plot` preset, so every
+size shares one visual language (fixed dpi -> fixed title/label sizes), and the
+console only owns wiring + layout.
+
+A panel's data source is a one-line expression evaluated against the named
+signals of a :class:`~Zou_lab_control.neutral_atom.core.signals.SignalHub`
 (the same trusted-local-code posture as the pulse GUI's Scan tab):
 
     value = frame                       # show the latest camera frame
     value = rate_grid - b_rate_grid     # arbitrary math across signals
     value = history('counts', 200).ravel()
 
-The plots are the existing frontend live classes (Live2DDis with side
-distribution + draggable clim, Live1D, LiveLiveDis rolling trace + distribution,
-HistogramFigure with bimodal fit + draggable thresholds); the console only owns
-layout, wiring and the refresh timer.  Layouts save/load as one JSON.
+Layouts (panels + positions + sizes + expressions + params) save/load as ONE
+JSON and are machine-portable: the grid-cell pixel geometry is a frontend
+design constant, never part of the layout.
 """
 
 from __future__ import annotations
@@ -27,8 +32,14 @@ import numpy as np
 
 from PyQt5 import QtCore, QtWidgets
 
-from .canvas import FigureSpec
-from .live import plot as frontend_plot
+from .live import (
+    PANEL_CELL_PX,
+    PANEL_CHROME_PX,
+    PANEL_GAP_PX,
+    PANEL_SIZES,
+    panel_plot,
+    panel_size_cells,
+)
 from .qt_fluent import (
     ACCENT,
     GREEN,
@@ -46,7 +57,6 @@ from .qt_fluent import (
     FluentScrollArea,
     FluentStatusDot,
     FluentWindow,
-    apply_fluent_scrollbars,
     ensure_qt_app,
     fluent_widget_stylesheet,
     scaled_px,
@@ -86,14 +96,14 @@ _DEFAULT_SOURCES = {
     "hist": "value = history('counts', 200).ravel()",
 }
 
-# data-area margins (left, right, top, bottom) px around each panel's axes;
-# the 2D kind needs extra right room for its side distribution + colorbar labels
-_KIND_MARGINS = {
-    "2d": (85, 60, 65, 38),
-    "1d": (85, 30, 60, 38),
-    "monitor": (85, 30, 60, 38),
-    "hist": (85, 30, 60, 38),
-}
+# PanelCard chrome (RAW px, matching the raw-px canvas geometry): these row
+# heights are built into the card below and MUST stay <= PANEL_CHROME_PX, or
+# the canvas would overflow its grid cells.
+_HEADER_H = 30
+_SOURCE_H = 30
+_STATUS_H = 16
+_CARD_PAD = 8
+_CARD_SPACING = 5
 
 
 def _task_files_dir() -> Path:
@@ -105,7 +115,7 @@ def _task_files_dir() -> Path:
 
 # ====================================================================== state
 class PanelConfig:
-    """One panel: kind + grid placement + source expression + display params."""
+    """One panel: kind + a size PRESET + the grid cell it is pinned to."""
 
     def __init__(
         self,
@@ -114,21 +124,28 @@ class PanelConfig:
         title: str = "",
         row: int = 0,
         col: int = 0,
-        rowspan: int = 1,
-        colspan: int = 1,
+        size: str = "2x2",
         source: str | None = None,
         params: Mapping[str, object] | None = None,
     ):
         if kind not in PANEL_KINDS:
             raise ValueError(f"unknown panel kind {kind!r}; choose from {sorted(PANEL_KINDS)}.")
+        panel_size_cells(size)              # validate against the limited preset list
         self.kind = str(kind)
         self.title = str(title)
         self.row = max(0, int(row))
         self.col = max(0, int(col))
-        self.rowspan = max(1, int(rowspan))
-        self.colspan = max(1, int(colspan))
+        self.size = str(size)
         self.source = str(source) if source is not None else _DEFAULT_SOURCES[self.kind]
         self.params = dict(params or {})
+
+    @property
+    def cols(self) -> int:
+        return panel_size_cells(self.size)[0]
+
+    @property
+    def rows(self) -> int:
+        return panel_size_cells(self.size)[1]
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -136,8 +153,7 @@ class PanelConfig:
             "title": self.title,
             "row": self.row,
             "col": self.col,
-            "rowspan": self.rowspan,
-            "colspan": self.colspan,
+            "size": self.size,
             "source": self.source,
             "params": dict(self.params),
         }
@@ -149,30 +165,27 @@ class PanelConfig:
             title=str(payload.get("title", "")),
             row=int(payload.get("row", 0)),
             col=int(payload.get("col", 0)),
-            rowspan=int(payload.get("rowspan", 1)),
-            colspan=int(payload.get("colspan", 1)),
+            size=str(payload.get("size", "2x2")),
             source=payload.get("source"),
             params=payload.get("params") or {},
         )
 
 
 class TaskConsoleState:
-    """The whole console layout: serialised as ONE JSON file."""
+    """The whole console layout: serialised as ONE machine-portable JSON file."""
 
     schema = "Zou_lab_control.frontend.TaskConsoleState"
-    version = 1
+    version = 2
 
     def __init__(
         self,
         *,
         name: str = "task",
         interval_ms: int = 400,
-        cell_px: tuple[int, int] = (185, 130),
         panels: Sequence[PanelConfig | Mapping[str, object]] | None = None,
     ):
         self.name = str(name)
         self.interval_ms = max(50, int(interval_ms))
-        self.cell_px = (int(cell_px[0]), int(cell_px[1]))
         self.panels = [
             panel if isinstance(panel, PanelConfig) else PanelConfig.from_dict(panel)
             for panel in (panels or [])
@@ -184,7 +197,6 @@ class TaskConsoleState:
             "version": self.version,
             "name": self.name,
             "interval_ms": self.interval_ms,
-            "cell_px": list(self.cell_px),
             "panels": [panel.to_dict() for panel in self.panels],
         }
 
@@ -193,7 +205,6 @@ class TaskConsoleState:
         return cls(
             name=str(payload.get("name", "task")),
             interval_ms=int(payload.get("interval_ms", 400)),
-            cell_px=tuple(payload.get("cell_px", (185, 130))),
             panels=payload.get("panels") or [],
         )
 
@@ -212,18 +223,18 @@ class TaskConsoleState:
 
 def default_console_state() -> TaskConsoleState:
     """The reference layout: 2x2 loading image, 2x1 distribution + 2x1 rate trace
-    on the right, and a 4x2 per-site loading-rate panel along the bottom."""
+    on the right, and a 4x2 per-site loading-rate strip along the bottom."""
 
     return TaskConsoleState(
         name="atom_loading",
         panels=[
-            PanelConfig(kind="2d", title="Loading image", row=0, col=0, rowspan=2, colspan=2,
+            PanelConfig(kind="2d", title="Loading image", row=0, col=0, size="2x2",
                         source="value = frame"),
-            PanelConfig(kind="hist", title="Counts distribution", row=0, col=2, rowspan=1, colspan=2,
+            PanelConfig(kind="hist", title="Counts distribution", row=0, col=2, size="2x1",
                         source="value = history('counts', 200).ravel()", params={"bins": 80}),
-            PanelConfig(kind="monitor", title="Loading rate", row=1, col=2, rowspan=1, colspan=2,
+            PanelConfig(kind="monitor", title="Loading rate", row=1, col=2, size="2x1",
                         source="value = rate", params={"length": 300}),
-            PanelConfig(kind="1d", title="Per-site loading rate", row=2, col=0, rowspan=2, colspan=4,
+            PanelConfig(kind="1d", title="Per-site loading rate", row=2, col=0, size="4x2",
                         source="value = rate_sites"),
         ],
     )
@@ -231,88 +242,114 @@ def default_console_state() -> TaskConsoleState:
 
 # ====================================================================== panels
 class PanelCard(FluentGroupBox):
-    """One dashboard panel: header (title + grid placement + params), source
-    expression with Apply, live plot canvas, and a status line."""
+    """One dashboard panel, pinned to its grid cells: a compact header (title +
+    position + size preset + kind params), a one-line source expression with
+    Apply, the live plot canvas, and a status line."""
 
     changed = QtCore.pyqtSignal()          # any config edit (console marks dirty)
-    layout_changed = QtCore.pyqtSignal()   # grid placement edit (console re-grids)
+    layout_changed = QtCore.pyqtSignal()   # grid placement/size edit (console re-grids)
     remove_requested = QtCore.pyqtSignal(object)
 
-    def __init__(self, config: PanelConfig, *, cell_px: tuple[int, int], parent=None):
+    def __init__(self, config: PanelConfig, parent=None):
         super().__init__(PANEL_KINDS[config.kind], parent)
         self.config = config
-        self.cell_px = cell_px
         self.plotter = None
         self.canvas = None
         self._value_shape: tuple[int, ...] | None = None
         self._compiled_source = config.source
 
         outer = QtWidgets.QVBoxLayout(self)
-        pad = scaled_px(8)
-        outer.setContentsMargins(pad, pad, pad, pad)
-        outer.setSpacing(scaled_px(5, minimum=3))
+        outer.setContentsMargins(_CARD_PAD, _CARD_PAD, _CARD_PAD, _CARD_PAD)
+        outer.setSpacing(_CARD_SPACING)
 
-        # --- header: title + grid placement + kind params + remove ------------
-        head = QtWidgets.QHBoxLayout()
-        head.setSpacing(scaled_px(5, minimum=3))
+        # --- header (one compact row) ------------------------------------------
+        head_row = QtWidgets.QWidget()
+        head_row.setStyleSheet("background: transparent;")
+        head_row.setFixedHeight(_HEADER_H)
+        head = QtWidgets.QHBoxLayout(head_row)
+        head.setContentsMargins(0, 0, 0, 0)
+        head.setSpacing(_CARD_SPACING)
+
         self.title_edit = FluentLineEdit(config.title)
         self.title_edit.setPlaceholderText("panel title…")
-        self.title_edit.setMinimumWidth(scaled_px(110))
+        self.title_edit.setMinimumWidth(scaled_px(90))
         self.title_edit.textChanged.connect(self._on_title)
         head.addWidget(self.title_edit, 1)
 
         self.place_spins: dict[str, FluentDoubleSpinBox] = {}
-        for key, label, maximum in (("row", "R", 15), ("col", "C", 15), ("rowspan", "H", 8), ("colspan", "W", 8)):
+        for key, label, tip in (("row", "R", "Grid row this panel is pinned to"),
+                                ("col", "C", "Grid column this panel is pinned to")):
             tag = FluentLabel(label)
-            tag.setToolTip({"row": "Grid row", "col": "Grid column",
-                            "rowspan": "Height in grid cells", "colspan": "Width in grid cells"}[key])
+            tag.setToolTip(tip)
             head.addWidget(tag)
             spin = FluentDoubleSpinBox(length=2, allow_minus=False)
             spin.setDecimals(0)
-            spin.setRange(0 if key in ("row", "col") else 1, maximum)
+            spin.setRange(0, 15)
             spin.setValue(getattr(config, key))
-            spin.setFixedWidth(scaled_px(46, minimum=40))
+            spin.setFixedWidth(scaled_px(44, minimum=38))
             spin.valueChanged.connect(lambda _v, k=key: self._on_place(k))
             head.addWidget(spin)
             self.place_spins[key] = spin
 
+        self.size_combo = FluentComboBox()
+        self.size_combo.addItems(list(PANEL_SIZES))
+        self.size_combo.setCurrentText(config.size)
+        self.size_combo.setFixedWidth(scaled_px(58, minimum=50))
+        self.size_combo.setToolTip("Panel size preset (grid cells, cols x rows)")
+        self.size_combo.currentTextChanged.connect(self._on_size)
+        head.addWidget(self.size_combo)
+
         self._build_param_widgets(head)
 
         remove = FluentButton("X", color=ORANGE)
-        remove.setFixedWidth(scaled_px(28, minimum=24))
+        remove.setFixedSize(scaled_px(26, minimum=22), _HEADER_H - 4)
         remove.setToolTip("Remove this panel")
         remove.clicked.connect(lambda: self.remove_requested.emit(self))
         head.addWidget(remove)
-        outer.addLayout(head)
+        outer.addWidget(head_row)
 
-        # --- source expression + Apply (the Scan-tab Run pattern) -------------
-        src = QtWidgets.QHBoxLayout()
-        src.setSpacing(scaled_px(5, minimum=3))
-        self.source_edit = QtWidgets.QPlainTextEdit(config.source)
+        # --- one-line source expression + Apply (the Scan-tab Run pattern) -----
+        source_row = QtWidgets.QWidget()
+        source_row.setStyleSheet("background: transparent;")
+        source_row.setFixedHeight(_SOURCE_H)
+        src = QtWidgets.QHBoxLayout(source_row)
+        src.setContentsMargins(0, 0, 0, 0)
+        src.setSpacing(_CARD_SPACING)
+        self.source_edit = FluentLineEdit(config.source)
         self.source_edit.setStyleSheet(
-            f"QPlainTextEdit {{ background: white; border: 1px solid #E1DFDD; border-radius: {scaled_px(4)}px;"
-            f" font-family: Consolas, monospace; font-size: {scaled_px(11)}px; padding: {scaled_px(2)}px; }}")
-        apply_fluent_scrollbars(self.source_edit)
-        self.source_edit.setFixedHeight(scaled_px(44, minimum=36))
+            self.source_edit.styleSheet() + " QLineEdit { font-family: Consolas, monospace; }")
         self.source_edit.setToolTip(
-            "Panel data source: Python evaluated against the live signals.\n"
+            "Panel data source: one line of Python evaluated against the live signals.\n"
             "Assign the result to `value`.  Namespace: every signal name (latest value),\n"
             "history(name, n), latest(name), names(), shot, np, math.")
         self.apply_button = FluentButton("Apply", color=GREEN)
-        self.apply_button.setFixedWidth(scaled_px(64, minimum=54))
+        self.apply_button.setFixedSize(scaled_px(60, minimum=52), _SOURCE_H - 4)
         self.apply_button.clicked.connect(self._apply_source)
         self.source_edit.textChanged.connect(lambda: self.apply_button.set_dirty(True))
+        self.source_edit.returnPressed.connect(self._apply_source)
         src.addWidget(self.source_edit, 1)
         src.addWidget(self.apply_button)
-        outer.addLayout(src)
+        outer.addWidget(source_row)
 
         # --- plot area + status ------------------------------------------------
         self.canvas_holder = QtWidgets.QVBoxLayout()
         self.canvas_holder.setContentsMargins(0, 0, 0, 0)
         outer.addLayout(self.canvas_holder, 1)
         self.status = FluentLabel("waiting for data…")
+        self.status.setFixedHeight(_STATUS_H)
         self.status.setStyleSheet(f"color: {GREY}; background: transparent;")
         outer.addWidget(self.status)
+
+        self._apply_fixed_size()
+
+    # ------------------------------------------------------------- geometry
+    def _apply_fixed_size(self) -> None:
+        """Pin the card to EXACTLY its spanned grid cells (incl. swallowed gaps),
+        so every card lines up on the console grid regardless of content."""
+        cols, rows = self.config.cols, self.config.rows
+        width = cols * PANEL_CELL_PX[0] + (cols - 1) * PANEL_GAP_PX
+        height = rows * PANEL_CELL_PX[1] + (rows - 1) * PANEL_GAP_PX
+        self.setFixedSize(width, height)
 
     # ------------------------------------------------------------- config edits
     def _on_title(self, text: str) -> None:
@@ -324,7 +361,13 @@ class PanelCard(FluentGroupBox):
 
     def _on_place(self, key: str) -> None:
         setattr(self.config, key, int(self.place_spins[key].value()))
-        self._reset_plot()      # the panel's pixel size changes with its span
+        self.changed.emit()
+        self.layout_changed.emit()
+
+    def _on_size(self, size: str) -> None:
+        self.config.size = str(size)
+        self._reset_plot()
+        self._apply_fixed_size()
         self.changed.emit()
         self.layout_changed.emit()
 
@@ -336,7 +379,7 @@ class PanelCard(FluentGroupBox):
             current = str(self.config.params.get("cmap", "inferno"))
             if current in CMAPS:
                 self.cmap_combo.setCurrentText(current)
-            self.cmap_combo.setFixedWidth(scaled_px(86, minimum=74))
+            self.cmap_combo.setFixedWidth(scaled_px(82, minimum=70))
             self.cmap_combo.setToolTip("Colormap")
             self.cmap_combo.currentTextChanged.connect(self._on_param)
             head.addWidget(self.cmap_combo)
@@ -345,7 +388,7 @@ class PanelCard(FluentGroupBox):
             self.length_spin.setDecimals(0)
             self.length_spin.setRange(20, 10_000)
             self.length_spin.setValue(int(self.config.params.get("length", 300)))
-            self.length_spin.setFixedWidth(scaled_px(62, minimum=54))
+            self.length_spin.setFixedWidth(scaled_px(58, minimum=50))
             self.length_spin.setToolTip("Rolling history length (shots kept on screen)")
             self.length_spin.valueChanged.connect(self._on_param)
             head.addWidget(self.length_spin)
@@ -354,7 +397,7 @@ class PanelCard(FluentGroupBox):
             self.bins_spin.setDecimals(0)
             self.bins_spin.setRange(5, 500)
             self.bins_spin.setValue(int(self.config.params.get("bins", 60)))
-            self.bins_spin.setFixedWidth(scaled_px(56, minimum=48))
+            self.bins_spin.setFixedWidth(scaled_px(52, minimum=46))
             self.bins_spin.setToolTip("Histogram bins")
             self.bins_spin.valueChanged.connect(self._on_param)
             head.addWidget(self.bins_spin)
@@ -371,7 +414,7 @@ class PanelCard(FluentGroupBox):
         self.changed.emit()
 
     def _apply_source(self) -> None:
-        self.config.source = self.source_edit.toPlainText()
+        self.config.source = self.source_edit.text()
         self._compiled_source = self.config.source
         self._reset_plot()      # output shape may change with the expression
         self.apply_button.set_dirty(False)
@@ -441,47 +484,41 @@ class PanelCard(FluentGroupBox):
             self.plotter.update(value)
 
     # ------------------------------------------------------------- plot lifecycle
-    def _figure_spec(self) -> FigureSpec:
-        margins = _KIND_MARGINS[self.config.kind]
-        width = self.config.colspan * self.cell_px[0]
-        height = self.config.rowspan * self.cell_px[1]
-        return FigureSpec(data_px=(width, height), margins_px=margins)
-
     def _build_plot(self, value) -> None:
         if FigureCanvas is None:
             raise RuntimeError("matplotlib Qt canvas is not available")
         self._teardown_plot()
         kind = self.config.kind
-        spec = self._figure_spec()
+        size = self.config.size
         label = self.config.title or PANEL_KINDS[kind]
         if kind == "2d":
             arr = np.asarray(value, dtype=float)
             ny, nx = arr.shape
             xx, yy = np.meshgrid(np.arange(nx, dtype=float), np.arange(ny, dtype=float))
             data_x = np.column_stack([xx.ravel(), yy.ravel()])
-            self.plotter = frontend_plot(
-                data_x, arr.ravel(), kind="2d", display=False, data_figure=False,
-                spec=spec, cmap=str(self.config.params.get("cmap", "inferno")),
+            self.plotter = panel_plot(
+                data_x, arr.ravel(), kind="2d", size=size,
+                cmap=str(self.config.params.get("cmap", "inferno")),
                 labels=("X (px)", "Y (px)", label), title=self.config.title or None)
         elif kind == "monitor":
             length = max(20, int(self.config.params.get("length", 300)))
             history = np.full(length, np.nan)
-            self.plotter = frontend_plot(
-                np.arange(length, dtype=float), history, kind="monitor", display=False,
-                data_figure=False, spec=spec, labels=("Shots ago", label, "Z"),
-                title=self.config.title or None, relim_mode="tight")
+            self.plotter = panel_plot(
+                np.arange(length, dtype=float), history, kind="monitor", size=size,
+                labels=("Shots ago", label, "Z"), title=self.config.title or None,
+                relim_mode="tight")
             self.plotter.roll(float(value))
         elif kind == "hist":
-            self.plotter = frontend_plot(
-                np.asarray(value, dtype=float), kind="hist", display=False, data_figure=False,
-                spec=spec, bins=int(self.config.params.get("bins", 60)),
+            self.plotter = panel_plot(
+                np.asarray(value, dtype=float), kind="hist", size=size,
+                bins=int(self.config.params.get("bins", 60)),
                 labels=("Value", "Shots", "Population"), title=self.config.title or None)
         else:  # 1d
             vec = np.asarray(value, dtype=float).reshape(-1)
-            self.plotter = frontend_plot(
-                np.arange(len(vec), dtype=float), vec, kind="1d", display=False,
-                data_figure=False, spec=spec, labels=("Site", label, "Z"),
-                title=self.config.title or None, relim_mode="tight")
+            self.plotter = panel_plot(
+                np.arange(len(vec), dtype=float), vec, kind="1d", size=size,
+                labels=("Site", label, "Z"), title=self.config.title or None,
+                relim_mode="tight")
         if self.config.title:
             self.plotter.ax.set_title(self.config.title)
         self.canvas = FigureCanvas(self.plotter.fig)
@@ -510,7 +547,7 @@ class PanelCard(FluentGroupBox):
 
 # ====================================================================== console
 class TaskConsole(QtWidgets.QWidget):
-    """The dashboard window body: header bar + panel grid + refresh timer."""
+    """The dashboard window body: header bar + pinned panel grid + refresh timer."""
 
     def __init__(
         self,
@@ -519,6 +556,8 @@ class TaskConsole(QtWidgets.QWidget):
         state: TaskConsoleState | None = None,
         feeds: Sequence[object] = (),
         scale: float | None = None,
+        window_ratio: float = 0.84,
+        window_px: tuple[int, int] | None = None,
     ):
         ensure_qt_app()
         set_fluent_scale(scale)
@@ -526,6 +565,8 @@ class TaskConsole(QtWidgets.QWidget):
         self.hub = hub
         self.feeds = list(feeds)
         self.state = state or default_console_state()
+        self.window_ratio = float(window_ratio)
+        self._window_px = window_px
         self.cards: list[PanelCard] = []
         self._last_version = -1
         self._building = False
@@ -540,9 +581,31 @@ class TaskConsole(QtWidgets.QWidget):
         self._timer.start()
 
     # ------------------------------------------------------------------ UI
+    def _target_console_size(self) -> QtCore.QSize:
+        """Window size from the primary screen (the pulse-editor sizing rule)."""
+
+        if self._window_px is not None:
+            return QtCore.QSize(int(self._window_px[0]), int(self._window_px[1]))
+        app = QtWidgets.QApplication.instance()
+        screen = app.primaryScreen() if app is not None else None
+        if screen is None:
+            return QtCore.QSize(scaled_px(1280, minimum=960), scaled_px(760, minimum=620))
+        available = screen.availableGeometry()
+        titlebar_allowance = scaled_px(36, minimum=28)
+        margin_w = scaled_px(40, minimum=28)
+        margin_h = scaled_px(48, minimum=32)
+        max_w = max(360, available.width() - margin_w)
+        max_h = max(320, available.height() - titlebar_allowance - margin_h)
+        min_w = min(scaled_px(980, minimum=820), max_w)
+        min_h = min(scaled_px(640, minimum=560), max_h)
+        desired_w = min(max_w, int(available.width() * self.window_ratio))
+        desired_h = min(max_h, int(available.height() * self.window_ratio) - titlebar_allowance)
+        return QtCore.QSize(max(min_w, desired_w), max(min_h, desired_h))
+
     def _build_ui(self) -> None:
         self.setWindowTitle("TaskConsole@Zou lab")
         self.setStyleSheet(fluent_widget_stylesheet())
+        self.setFixedSize(self._target_console_size())
         root = QtWidgets.QVBoxLayout(self)
         margin = scaled_px(14)
         root.setContentsMargins(margin, scaled_px(8), margin, scaled_px(8))
@@ -588,7 +651,7 @@ class TaskConsole(QtWidgets.QWidget):
         self.grid_body = QtWidgets.QWidget()
         self.grid_body.setStyleSheet("background: transparent;")
         self.grid = QtWidgets.QGridLayout(self.grid_body)
-        gap = scaled_px(8, minimum=5)
+        gap = PANEL_GAP_PX
         self.grid.setContentsMargins(gap, gap, gap, gap)
         self.grid.setHorizontalSpacing(gap)
         self.grid.setVerticalSpacing(gap)
@@ -600,7 +663,6 @@ class TaskConsole(QtWidgets.QWidget):
         return TaskConsoleState(
             name=self.name_edit.text().strip() or "task",
             interval_ms=self.state.interval_ms,
-            cell_px=self.state.cell_px,
             panels=[card.config for card in self.cards],
         )
 
@@ -615,7 +677,7 @@ class TaskConsole(QtWidgets.QWidget):
             self.cards = []
             self.name_edit.setText(state.name)
             for config in state.panels:
-                self._attach_card(PanelCard(config, cell_px=state.cell_px))
+                self._attach_card(PanelCard(config))
             self._regrid()
         finally:
             self._building = False
@@ -629,13 +691,21 @@ class TaskConsole(QtWidgets.QWidget):
         self.cards.append(card)
 
     def _regrid(self) -> None:
+        """Pin every card to its grid cells: fixed-size rows/columns make spanned
+        cards line up exactly (a card's fixed size equals its spanned cells)."""
+
         for card in self.cards:
             self.grid.removeWidget(card)
+        rows = max((c.config.row + c.config.rows for c in self.cards), default=1)
+        cols = max((c.config.col + c.config.cols for c in self.cards), default=1)
+        for r in range(rows):
+            self.grid.setRowMinimumHeight(r, PANEL_CELL_PX[1])
+        for c in range(cols):
+            self.grid.setColumnMinimumWidth(c, PANEL_CELL_PX[0])
         for card in self.cards:
             cfg = card.config
-            self.grid.addWidget(card, cfg.row, cfg.col, cfg.rowspan, cfg.colspan)
-        rows = max((c.config.row + c.config.rowspan for c in self.cards), default=1)
-        cols = max((c.config.col + c.config.colspan for c in self.cards), default=1)
+            self.grid.addWidget(card, cfg.row, cfg.col, cfg.rows, cfg.cols,
+                                QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
         self.grid.setRowStretch(rows, 1)
         self.grid.setColumnStretch(cols, 1)
         self._update_summary()
@@ -643,9 +713,9 @@ class TaskConsole(QtWidgets.QWidget):
     # ------------------------------------------------------------------ actions
     def _add_panel(self) -> None:
         kind = self.kind_combo.currentData() or "1d"
-        rows = max((c.config.row + c.config.rowspan for c in self.cards), default=0)
-        config = PanelConfig(kind=str(kind), row=rows, col=0, rowspan=1, colspan=2)
-        card = PanelCard(config, cell_px=self.state.cell_px)
+        rows = max((c.config.row + c.config.rows for c in self.cards), default=0)
+        config = PanelConfig(kind=str(kind), row=rows, col=0, size="2x1")
+        card = PanelCard(config)
         self._attach_card(card)
         self._regrid()
         self._mark_dirty()
@@ -766,14 +836,17 @@ def show_task_console(
     state: TaskConsoleState | None = None,
     feeds: Sequence[object] = (),
     scale: float | None = None,
+    window_ratio: float = 0.84,
     title: str = "TaskConsole@Zou lab",
 ):
-    """Open the console in a Fluent window (mirrors ``show_pulse_gui``)."""
+    """Open the console in a Fluent window (mirrors ``show_pulse_gui``: the body
+    sizes itself from the primary screen; the window wraps it exactly)."""
 
     app = ensure_qt_app()
-    console = TaskConsole(hub=hub, state=state, feeds=feeds, scale=scale)
+    console = TaskConsole(hub=hub, state=state, feeds=feeds, scale=scale, window_ratio=window_ratio)
     window = FluentWindow(widget=console, title=title, hide_on_close=False)
-    window.resize(scaled_px(1500), scaled_px(950))
+    window.adjustSize()
+    window.setFixedSize(window.size())
     window.show()
     if not hasattr(app, "_zlc_task_windows"):
         app._zlc_task_windows = []
