@@ -795,11 +795,20 @@ def pulse_plot_channels(
 # area, never bigger titles/labels.  The margins per kind are design constants
 # (the 2D kind pays extra right margin for its side distribution + colorbar).
 PANEL_SIZES = ("2x1", "2x2", "3x1", "3x2", "4x1", "4x2")
+# Panels render at their OWN dpi tier: FigureSpec.data_px are real pixels, so a
+# lower dpi only shrinks the pt->px font conversion -- panel text sits at ~70%
+# of the big-figure (notebook / pulse-preview, dpi=300) text, matching the much
+# smaller data areas.  Within the panel tier every size shares the same fonts.
+PANEL_DPI = 210
+# (left, right, top, bottom) around the data area, tuned for the panel font
+# tier; panels carry NO in-figure title (the host card titles them), so the top
+# margin only clears the tick labels.  The 2D kind pays extra right margin for
+# its side distribution + colorbar.
 PANEL_MARGINS = {
-    "2d": (85, 60, 65, 38),
-    "1d": (85, 30, 60, 38),
-    "monitor": (85, 30, 60, 38),
-    "hist": (85, 30, 60, 38),
+    "2d": (72, 55, 25, 52),
+    "1d": (72, 26, 25, 52),
+    "monitor": (72, 26, 25, 52),
+    "hist": (72, 26, 25, 52),
 }
 PANEL_CELL_PX = (300, 280)     # design grid-cell size (raw px; layouts stay machine-portable)
 PANEL_GAP_PX = 8               # gap between grid cells
@@ -824,7 +833,7 @@ def panel_plot_spec(
     cell_px: tuple[int, int] = PANEL_CELL_PX,
     gap_px: int = PANEL_GAP_PX,
     chrome_px: tuple[int, int] = PANEL_CHROME_PX,
-    dpi: int = 300,
+    dpi: int = PANEL_DPI,
 ) -> FigureSpec:
     """FigureSpec for a dashboard panel spanning ``size`` grid cells.
 
@@ -859,13 +868,24 @@ def panel_plot(
     cell_px: tuple[int, int] = PANEL_CELL_PX,
     gap_px: int = PANEL_GAP_PX,
     chrome_px: tuple[int, int] = PANEL_CHROME_PX,
+    square: bool = False,
     **kwargs,
 ):
     """``plot()`` preset for dashboard panels: pick a kind and one of the
     LIMITED ``PANEL_SIZES`` and get a correctly sized, consistently styled live
-    plot (no display, no DataFigure -- the host embeds the figure)."""
+    plot (no display, no DataFigure -- the host embeds the figure).
+
+    Panels carry no in-figure title (the host card titles them).  The 2D kind
+    defaults to NON-square extents (a camera frame keeps its aspect ratio); this
+    is the sanctioned internal Live2DDis use the plot() factory points to."""
 
     spec = panel_plot_spec(kind, size, cell_px=cell_px, gap_px=gap_px, chrome_px=chrome_px)
+    if _normalize_kind(kind) == "2d":
+        x = _as_data_x(data_x)
+        y = _as_data_y(data_y, len(x))
+        labels = tuple(kwargs.pop("labels", ("X", "Y", "Z")))
+        plotter = Live2DDis(x, y, labels=labels, square=bool(square), spec=spec, **kwargs)
+        return plotter.show(display=False)
     return plot(data_x, data_y, kind=kind, spec=spec, display=False, data_figure=False, **kwargs)
 
 

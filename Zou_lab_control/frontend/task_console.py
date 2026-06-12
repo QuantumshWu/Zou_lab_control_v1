@@ -353,10 +353,9 @@ class PanelCard(FluentGroupBox):
 
     # ------------------------------------------------------------- config edits
     def _on_title(self, text: str) -> None:
+        # the title lives on the CARD only -- panels carry no in-figure title
+        # (it would duplicate the card header and eat panel height)
         self.config.title = str(text)
-        if self.plotter is not None and getattr(self.plotter, "ax", None) is not None:
-            self.plotter.ax.set_title(self.config.title)
-            self.plotter.draw()
         self.changed.emit()
 
     def _on_place(self, key: str) -> None:
@@ -499,28 +498,24 @@ class PanelCard(FluentGroupBox):
             self.plotter = panel_plot(
                 data_x, arr.ravel(), kind="2d", size=size,
                 cmap=str(self.config.params.get("cmap", "inferno")),
-                labels=("X (px)", "Y (px)", label), title=self.config.title or None)
+                labels=("X (px)", "Y (px)", ""))
         elif kind == "monitor":
             length = max(20, int(self.config.params.get("length", 300)))
             history = np.full(length, np.nan)
             self.plotter = panel_plot(
                 np.arange(length, dtype=float), history, kind="monitor", size=size,
-                labels=("Shots ago", label, "Z"), title=self.config.title or None,
-                relim_mode="tight")
+                labels=("Shots ago", label, "Z"), relim_mode="tight")
             self.plotter.roll(float(value))
         elif kind == "hist":
             self.plotter = panel_plot(
                 np.asarray(value, dtype=float), kind="hist", size=size,
                 bins=int(self.config.params.get("bins", 60)),
-                labels=("Value", "Shots", "Population"), title=self.config.title or None)
+                labels=("Value", "Shots", "Population"))
         else:  # 1d
             vec = np.asarray(value, dtype=float).reshape(-1)
             self.plotter = panel_plot(
                 np.arange(len(vec), dtype=float), vec, kind="1d", size=size,
-                labels=("Site", label, "Z"), title=self.config.title or None,
-                relim_mode="tight")
-        if self.config.title:
-            self.plotter.ax.set_title(self.config.title)
+                labels=("Site", label, "Z"), relim_mode="tight")
         self.canvas = FigureCanvas(self.plotter.fig)
         self.canvas.draw()
         self.canvas.setFixedSize(self.canvas.sizeHint())

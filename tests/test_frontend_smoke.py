@@ -1052,21 +1052,23 @@ def test_panel_plot_spec_size_presets_keep_fonts_fixed():
     data area only (dpi -- and with it every font size -- never changes); unknown
     sizes/kinds and unreadably small combinations are rejected."""
 
-    from Zou_lab_control.frontend.live import PANEL_SIZES, panel_plot_spec, panel_size_cells
+    from Zou_lab_control.frontend.live import PANEL_DPI, PANEL_SIZES, panel_plot_spec, panel_size_cells
 
     assert PANEL_SIZES == ("2x1", "2x2", "3x1", "3x2", "4x1", "4x2")
     assert panel_size_cells("4x2") == (4, 2)
     small = panel_plot_spec("1d", "2x1")
     big = panel_plot_spec("1d", "4x2")
-    assert big.dpi == small.dpi == 300            # fonts identical across sizes
+    # one font tier for ALL panel sizes -- and it is the PANEL tier, smaller
+    # than the big-figure (notebook / pulse-preview) 300 dpi tier
+    assert big.dpi == small.dpi == PANEL_DPI < 300
     assert big.data_px[0] > small.data_px[0] and big.data_px[1] > small.data_px[1]
     assert big.margins_px == small.margins_px     # design margins are size-invariant
     with pytest.raises(ValueError):
         panel_size_cells("5x5")
     with pytest.raises(ValueError):
         panel_plot_spec("pulse", "2x2")           # not a dashboard panel kind
-    with pytest.raises(ValueError):
-        panel_plot_spec("2d", "2x1")              # too small for the 2d margins -> rejected
+    with pytest.raises(ValueError):               # unreadably small -> rejected
+        panel_plot_spec("2d", "2x1", cell_px=(120, 90))
 
 
 def test_task_console_cards_align_to_the_grid(monkeypatch):
