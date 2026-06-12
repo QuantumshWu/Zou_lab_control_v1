@@ -1060,7 +1060,7 @@ def test_panel_plot_spec_is_the_confocal_modular_region():
         panel_size_cells)
     from Zou_lab_control.frontend.canvas import FigureSpec
 
-    assert PANEL_SIZES == ("1x2", "2x2", "1x4", "2x4", "4x4")
+    assert PANEL_SIZES == ("1x2", "2x2", "1x4", "2x4")
     assert panel_size_cells("1x4") == (1, 4)
     stock = panel_plot_spec("2x2")
     assert stock.data_px == FigureSpec().data_px == (480, 360)   # THE stock plot region
@@ -1122,6 +1122,37 @@ def test_embedded_canvas_invariants_across_screen_scales(scale_factor):
     assert "DPR-INVARIANTS-OK" in result.stdout, result.stdout + result.stderr
 
 
+def test_task_console_drag_snaps_to_grid(monkeypatch):
+    """Dropping a card snaps it to the half-card pitch grid and records the slot
+    in the config (so the layout JSON round-trips drag positions)."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5 import QtCore
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.task_console import _grid_pitch, _pos_to_slot, _slot_to_pos
+
+    console = dt.demo_console(shots=3)
+    card = console.cards[1]                       # the 1x2 distribution panel
+    pitch_x, pitch_y = _grid_pitch()
+    # simulate a drop near slot (4, 1): position the card a few px off the slot
+    target_x, target_y = _slot_to_pos(4, 1)
+    card.move(target_x + 11, target_y - 9)
+    card._drag_offset = QtCore.QPoint(1, 1)       # as if a drag was in flight
+    class _Ev:                                    # minimal release-event stand-in
+        def button(self): return QtCore.Qt.LeftButton
+        def pos(self): return QtCore.QPoint(1, 1)
+    try:
+        card.mouseReleaseEvent(_Ev())
+    except TypeError:                             # super() needs a real QEvent; snap already ran
+        pass
+    assert (card.config.row, card.config.col) == (4, 1)
+    assert (card.x(), card.y()) == _slot_to_pos(4, 1)
+    assert _pos_to_slot(*_slot_to_pos(7, 3)) == (7, 3)   # slot<->pos round-trip
+    assert console.save_button.is_dirty()         # a moved panel is an unsaved edit
+    console.shutdown()
+
+
 def test_task_console_cards_are_modular(monkeypatch):
     """Card size = the frontend panel's on-screen canvas + the card chrome; every
     kind shares one plot region per size (the confocal rule), so same-size cards
@@ -1131,13 +1162,19 @@ def test_task_console_cards_are_modular(monkeypatch):
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from Zou_lab_control.frontend import devtools as dt
     from Zou_lab_control.frontend.live import panel_display_size
-    from Zou_lab_control.frontend.task_console import _CARD_CHROME
+    from Zou_lab_control.frontend.task_console import _GRID_GAP, _card_size
+
+    # THE tiling contract: a 2-row card is exactly two 1-row cards + gap, and a
+    # 4-column card is exactly two 2-column cards + gap (the frame's footer and
+    # side margins absorb the figure-margin slack, so cards tile on one grid).
+    assert _card_size("2x2")[1] == 2 * _card_size("1x2")[1] + _GRID_GAP
+    assert _card_size("1x4")[0] == 2 * _card_size("1x2")[0] + _GRID_GAP
 
     console = dt.demo_console(shots=3)
     for card in console.cards:
+        assert (card.width(), card.height()) == _card_size(card.config.size), card.config.size
         canvas_w, canvas_h = panel_display_size(card.config.size)
-        assert card.width() == canvas_w + _CARD_CHROME[0], card.config.size
-        assert card.height() == canvas_h + _CARD_CHROME[1], card.config.size
+        assert card.width() >= canvas_w and card.height() >= canvas_h
         if card.canvas is not None:               # the canvas must FIT inside its card
             assert abs(card.canvas.width() - canvas_w) <= 1
             assert abs(card.canvas.height() - canvas_h) <= 1
@@ -1202,7 +1239,7 @@ def test_task_console_cross_signal_expression_and_error_isolation(monkeypatch):
         PanelConfig(kind="2d", title="A-B rate", row=4, col=0, size="2x2",
                     source="value = rate_grid - b_rate_grid"))
     console._attach_card(diff)
-    console._regrid()
+    console._arrange()
     console.refresh_once()
     assert diff.plotter is not None and diff.status.text().startswith("shot ")
     grid_shape = console.hub.latest("rate_grid").shape

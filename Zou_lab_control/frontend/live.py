@@ -534,14 +534,16 @@ class LiveLiveDis(Live1D):
         if np.isfinite(newest):
             label = f"{newest:.6g}"
             if self.text is None:
+                # inside the axes (top-right corner): the band above the axes
+                # belongs to the centred title, which may be arbitrarily long
                 self.text = self.ax.text(
-                    0.9,
-                    1.005,
+                    0.97,
+                    0.95,
                     label,
                     transform=self.ax.transAxes,
                     color="grey",
                     ha="right",
-                    va="bottom",
+                    va="top",
                     fontsize=matplotlib.rcParams["legend.fontsize"],
                 )
             else:
@@ -566,12 +568,15 @@ class Live2DDis(BaseLivePlot):
         self.square = square
 
     def fill_grid(self) -> np.ndarray:
+        # vectorised point->grid scatter (the per-point Python loop took ~50 ms
+        # per refresh on a camera-frame panel); same semantics as the old loop:
+        # searchsorted indices, out-of-range points dropped, and on duplicate
+        # indices the LAST point wins (C-order fancy assignment).
         grid = np.full(self.data_shape, np.nan)
-        for (x, y), z in zip(self.data_x, self.data_y[:, 0]):
-            ix = int(np.searchsorted(self.x_array, x))
-            iy = int(np.searchsorted(self.y_array, y))
-            if 0 <= iy < grid.shape[0] and 0 <= ix < grid.shape[1]:
-                grid[iy, ix] = z
+        ix = np.searchsorted(self.x_array, self.data_x[:, 0])
+        iy = np.searchsorted(self.y_array, self.data_x[:, 1])
+        ok = (ix < grid.shape[1]) & (iy < grid.shape[0])
+        grid[iy[ok], ix[ok]] = self.data_y[ok, 0]
         return grid
 
     def init_core(self) -> None:
@@ -811,7 +816,7 @@ def pulse_plot_channels(
 #
 # The geometry below is NOT a public knob: hosts pick a kind and a size preset,
 # nothing else -- the visual language is owned here.
-PANEL_SIZES = ("1x2", "2x2", "1x4", "2x4", "4x4")
+PANEL_SIZES = ("1x2", "2x2", "1x4", "2x4")
 PANEL_UNIT_PX = (180, 240)     # (height, width) of one half-unit of the stock region
 PANEL_MARGINS_PX = (110, 110, 100, 70)   # stock margins (L, R, B, T) with the title
                                          # top slot ALWAYS reserved: a panel has one
