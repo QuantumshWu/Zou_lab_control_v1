@@ -165,6 +165,39 @@ def demo_editor(*, scale: float = 1.0, size=(1440, 880), bind_scans: bool = True
     return ed
 
 
+
+def demo_console(*, scale: float = 1.0, size=(1480, 980), seed: int = 11, shots: int = 40,
+                 dual: bool = True, state=None):
+    """Return a shown :class:`TaskConsole` fed by seeded virtual loading feeds.
+
+    ``dual=True`` adds a second feed under the ``b_`` prefix so A-B expressions
+    (e.g. ``value = rate_grid - b_rate_grid``) have data.  Feeds are stepped
+    SYNCHRONOUSLY ``shots`` times (no threads) so screenshots and tests are
+    deterministic; call ``feed.step()``/``console.refresh_once()`` for more.
+    """
+
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.neutral_atom.operations.feeds import VirtualLoadingFeed
+
+    ensure_qt_app()
+    install_screenshot_font()  # before building so build-time text metrics match the render font
+    hub = SignalHub()
+    feeds = [VirtualLoadingFeed(hub, seed=seed)]
+    if dual:
+        feeds.append(VirtualLoadingFeed(hub, prefix="b_", seed=seed + 11, loading_probability=0.35))
+    for _ in range(max(1, int(shots))):
+        for feed in feeds:
+            feed.step()
+    console = TaskConsole(hub=hub, state=state or default_console_state(), feeds=feeds, scale=scale)
+    console._timer.stop()          # deterministic: tests drive refresh_once() themselves
+    if size is not None:
+        console.setFixedSize(int(size[0]), int(size[1]))
+    console.show()
+    console.refresh_once()
+    return console
+
 def capture_gallery(out_dir, *, settle_ms: int = 550) -> dict[str, Path]:
     """Render the editor in several states for a visual self-check sweep."""
 
@@ -184,4 +217,4 @@ def capture_gallery(out_dir, *, settle_ms: int = 550) -> dict[str, Path]:
     return paths
 
 
-__all__ = ["settle", "screenshot", "screenshot_tab", "demo_state", "demo_editor", "capture_gallery"]
+__all__ = ["settle", "screenshot", "screenshot_tab", "demo_state", "demo_editor", "demo_console", "capture_gallery"]

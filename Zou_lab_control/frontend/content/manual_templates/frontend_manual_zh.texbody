@@ -870,9 +870,56 @@ scan_table = np.linspace(0, 1000, 11).astype(int).reshape(-1, 1)
 \section{遇到问题先看哪里}
 \begin{description}
   \item[Preview 不出图] 切一下 \pyapi{Show off rows} 触发重画；确认脉冲表非空、最后一段把所有 channel 归零。
-  \item[扫描报错] 确认每个扫描点是 20 ns 的整数倍（时间 slot）；DAC 用原始码；duration 扫描不要和 DAC 扫描混用。
+  \item[扫描报错] 确认每个时间扫描点是 20 ns 的整数倍；DAC 列填带符号码（$-512..+511$）。duration 与 DAC 可以同时扫（仿射总线 tick），报错信息会指出具体哪一列哪个点不合法。
   \item[On Pulse 无信号] 见主手册“真实硬件 Runbook / 常见问题”。
 \end{description}
+
+\chapter{Task 控制台（实验仪表盘）}
+
+\section{它是什么}
+Task 控制台（\filepath{task\_console.bat} / \pyapi{frontend.show\_task\_console}）是\tfocus{实验侧}的可配置仪表盘：一个网格里摆任意多个\tfocus{实时面板}（2D 图像 / 1D 向量 / 滚动轨迹 / 分布直方图），每个面板自带参数控件，数据来源用一小段\tfocus{表达式}接到实验信号上。典型布局：左上一张 $2\times2$ 的原子装载图像，右边 $2\times1$ 的计数分布（自动双高斯拟合）与 $2\times1$ 的装载率滚动轨迹，底部一条 $4\times2$ 的逐站装载率。
+
+数据通路分三层，互相只通过\tfocus{信号集线器（SignalHub）}耦合：
+\begin{description}
+  \item[\pyapi{SignalHub}（\filepath{neutral\_atom/core/signals.py}）] 线程安全的命名信号环：实验循环每个 shot \pyapi{publish} 一批命名值（标量或数组），控制台轮询 \pyapi{latest}/\pyapi{history}，用版本号跳过无新数据的刷新。
+  \item[Feed（\filepath{neutral\_atom/operations/feeds.py}）] 生产者循环。\pyapi{VirtualLoadingFeed} 是自带的虚拟原子装载实验：内部用 \pyapi{VirtualTrapArray} 渲染荧光帧，并用与真实流水线\tfocus{相同}的 \pyapi{find\_site\_centers}/\pyapi{roi\_counts}/Otsu 阈值自标定，每个 shot 发布 \pyapi{frame}（相机帧）、\pyapi{counts}（逐站计数）、\pyapi{occupied}（占据）、\pyapi{rate}（滚动装载率）、\pyapi{rate\_sites}/\pyapi{rate\_grid}（逐站/网格装载率图）、\pyapi{shot}。可同步驱动（\pyapi{step()}，测试/Notebook）或后台线程（\pyapi{start(rate\_hz=...)}）。
+  \item[面板（panel）] 即现有 live 绘图类的复用：2D=\pyapi{Live2DDis}（自带右侧分布 + 可拖 clim 上下限），分布=\pyapi{HistogramFigure}（自动双高斯拟合 + 可拖阈值线 + 保真度文本），滚动=\pyapi{LiveLiveDis}（轨迹 + 右侧分布），1D=\pyapi{Live1D}。所有图内交互（滚轮缩放、中键平移、右键十字、框选）原样可用。
+\end{description}
+
+\section{面板数据来源：表达式而不是下拉框}
+每个面板的数据来源是一小段 Python（与 Scan 页代码框同一套信任模型：本地工具、只跑你自己写的代码），把结果赋给 \pyapi{value}：
+\begin{codeblock}[Python]
+value = frame                          # 最新相机帧（任何 2D 数组表达式都行）
+value = rate                           # 标量 -> 滚动轨迹面板
+value = history('counts', 200).ravel() # 最近 200 shot 的逐站计数 -> 分布面板
+value = rate_grid - b_rate_grid        # 两个实验的装载率图相减 -> 2D 面板
+value = np.log1p(frame[20:60, 30:90])  # 任意 numpy 运算 / 切片
+\end{codeblock}
+命名空间里有：\tfocus{每个信号名}（最新值直接可用）、\pyapi{history(name, n)}（最近 $n$ 个 shot 堆叠，axis 0 是 shot）、\pyapi{latest(name)}、\pyapi{names()}、\pyapi{shot}、\pyapi{np}、\pyapi{math}。改完点 \pyapi{Apply}（未应用的编辑显示 \pyapi{Apply*} 星号）。某个面板表达式报错时，错误只显示在\tfocus{该面板自己的状态行}（红字），其余面板照常刷新。
+
+\section{布局与参数}
+每张面板卡的头部是：标题框、网格位置 \pyapi{R/C}（行/列）与跨度 \pyapi{H/W}（高/宽，格子数）、各类型自己的参数（2D 的 colormap、滚动轨迹的历史长度、直方图的 bin 数）、移除按钮 \pyapi{X}。标题栏的 \pyapi{Add Panel} 按所选类型加新面板；\pyapi{Pause/Resume} 暂停/恢复刷新；\pyapi{Save}/\pyapi{Load} 把\tfocus{整个布局}（面板、位置、表达式、参数）存成一个 JSON（默认在 \filepath{tasks/} 目录），\pyapi{Save*} 黄色星号语义与脉冲编辑器一致。面板值的形状变化（换表达式 / 改跨度 / 改参数）会自动重建该面板的图。
+
+\section{启动与接线}
+双击 \filepath{task\_console.bat}（或 \pyapi{python task\_console.py}）即以\tfocus{虚拟实验}启动：主 feed + 一个 \pyapi{b\_} 前缀的副 feed（装载率不同），所以 $A-B$ 类表达式开箱有数据。常用参数：\pyapi{--rate 4}（shot/s）、\pyapi{--seed 7}（可复现）、\pyapi{--single}（只开主 feed）、\pyapi{--state xxx.json}（启动即载入布局）、\pyapi{--no-feed}（不开虚拟源，自己接 hub）。
+
+从 Notebook 接\tfocus{真实实验}：建一个 hub，把控制台开起来，然后在你的实验循环里每个 shot publish 一次——控制台自动跟上：
+\begin{codeblock}[Python]
+from Zou_lab_control import frontend as zf
+from Zou_lab_control.neutral_atom.core.signals import SignalHub
+import Zou_lab_control.neutral_atom as na
+
+hub = SignalHub()
+console = zf.show_task_console(hub=hub)
+
+exp = na.connect("virtual")            # 真实实验换成对应 config
+for shot in range(1000):
+    frame = exp.camera.acquire(1, sequence=exp.sequence,
+                               sequencer=exp.devices.sequencer)[0]
+    det = exp.readout.from_image(frame, display=False)
+    hub.publish({"frame": frame, "counts": det.counts,
+                 "occupied": det.occupied.astype(float)})
+\end{codeblock}
 
 \chapter{绘图 API}
 

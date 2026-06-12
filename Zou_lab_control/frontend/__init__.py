@@ -68,12 +68,16 @@ LiveHistogram = HistogramFigure
 
 
 _PULSE_GUI_EXPORTS = {"PulseSequenceEditor", "show_pulse_gui"}
+_TASK_CONSOLE_EXPORTS = {"TaskConsole", "TaskConsoleState", "PanelConfig", "default_console_state", "show_task_console"}
 
 
 def __getattr__(name: str):
     if name in _PULSE_GUI_EXPORTS:
         pulse_gui = import_module(".pulse_gui", __name__)
         return getattr(pulse_gui, name)
+    if name in _TASK_CONSOLE_EXPORTS:
+        task_console = import_module(".task_console", __name__)
+        return getattr(task_console, name)
     raise AttributeError(name)
 
 
@@ -135,6 +139,7 @@ __all__ = [
     "run",
     "save_figure_data",
     "show_pulse_gui",
+    "show_task_console",
     "split_axes_horizontally",
     "style_context",
     "use_widget_backend",

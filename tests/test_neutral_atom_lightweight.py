@@ -482,14 +482,16 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     fpga_notebook_text = "\n".join(cell["source"] for cell in neutral_atom_fpga_server_cells())
     hardware_notebook_text = "\n".join(cell["source"] for cell in neutral_atom_hardware_tutorial_cells())
 
-    for name in ("install_requirements.bat", "pulse_gui.bat", "start_tutorials_jupyter_lab.bat",
-                 "estimate_resources.bat"):
+    for name in ("install_requirements.bat", "pulse_gui.bat", "task_console.bat",
+                 "start_tutorials_jupyter_lab.bat", "estimate_resources.bat"):
         assert (root / name).exists(), name
     assert not (root / "build_and_program.bat").exists()
     assert not (root / "run_server.bat").exists()
     assert {path.name for path in root.glob("*.bat")} == {
         "install_requirements.bat",
         "pulse_gui.bat",
+        # live experiment dashboard (virtual feed by default)
+        "task_console.bat",
         "start_tutorials_jupyter_lab.bat",
         # double-click capacity check against fpga/board_config/streamer_config.json
         "estimate_resources.bat",
@@ -863,6 +865,7 @@ def test_repo_bat_entrypoints_are_minimal_and_grouped_by_submodule():
         "install_requirements.bat",
         "pulse_gui.bat",
         "start_tutorials_jupyter_lab.bat",
+        "task_console.bat",
     ]
     assert not any("4ch" in path.lower() or "smoke" in path.lower() or "simulate" in path.lower() for path in bat_files)
 
@@ -6873,6 +6876,63 @@ def test_drain_tail_short_budget_keeps_guard_and_running_prepare_aborts_instantl
     t1 = _time.monotonic()
     session2.prepare(prog2)                              # program switch: no tail wait
     assert _time.monotonic() - t1 < 0.1, "prepare must not stall on a RUNNING program"
+
+
+def test_signal_hub_publish_latest_history_and_versioning():
+    """SignalHub: per-shot named signals with bounded history and change detection."""
+
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+
+    hub = SignalHub(history=8)
+    assert hub.version == 0
+    hub.publish({"rate": 0.5, "counts": np.array([1.0, 2.0, 3.0])})
+    hub.publish({"rate": 0.7, "counts": np.array([4.0, 5.0, 6.0])})
+    assert hub.version == 2 and hub.shot == 2
+    assert hub.latest("rate") == 0.7
+    assert np.array_equal(hub.latest("counts"), [4.0, 5.0, 6.0])
+    assert hub.history("rate").shape == (2,)
+    assert hub.history("counts", 1).shape == (1, 3)
+    # history is bounded by the ring length
+    for i in range(20):
+        hub.publish({"rate": float(i)})
+    assert hub.history("rate").shape == (8,)
+    # a shape change keeps only the most recent same-shape run
+    hub.publish({"counts": np.zeros(5)})
+    assert hub.history("counts").shape == (1, 5)
+    with pytest.raises(KeyError):
+        hub.latest("nope")
+    # the consumer namespace is a plain dict of copies
+    snap = hub.snapshot_latest()
+    assert set(snap) == {"rate", "counts"}
+    snap["counts"][0] = 999.0
+    assert hub.latest("counts")[0] != 999.0
+
+
+def test_virtual_loading_feed_publishes_standard_signals():
+    """VirtualLoadingFeed self-calibrates and publishes the console signal set;
+    the running loading rate lands near the configured probability."""
+
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.neutral_atom.operations.feeds import VirtualLoadingFeed
+
+    hub = SignalHub()
+    feed = VirtualLoadingFeed(hub, seed=5, loading_probability=0.55, ema=0.2)
+    for _ in range(60):
+        feed.step()
+    assert set(hub.names()) == {"frame", "counts", "occupied", "rate", "rate_sites", "rate_grid", "shot"}
+    assert hub.latest("frame").shape == (96, 128)
+    assert hub.latest("counts").shape == (feed.trap.n_sites,)
+    assert hub.latest("rate_grid").shape == feed.trap.grid_shape
+    assert 0.0 <= hub.latest("rate") <= 1.0
+    # the long-run occupancy mean tracks loading_probability (loose: lifetime losses)
+    occupancy = hub.history("occupied", 60)
+    assert 0.30 <= float(occupancy.mean()) <= 0.80
+    # a prefixed second feed coexists in the same hub for A-B expressions
+    feed_b = VirtualLoadingFeed(hub, prefix="b_", seed=6, loading_probability=0.3, ema=0.2)
+    for _ in range(10):
+        feed_b.step()
+    diff = hub.latest("rate_grid") - hub.latest("b_rate_grid")
+    assert diff.shape == feed.trap.grid_shape
 
 
 class _FakeVivadoProc:

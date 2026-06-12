@@ -1,0 +1,55 @@
+@echo off
+setlocal EnableExtensions EnableDelayedExpansion
+
+if not defined ZLC_TASK_CONSOLE_INNER (
+    set "ZLC_TASK_CONSOLE_INNER=1"
+    call "%~f0" %*
+    set "ZLC_STATUS=!ERRORLEVEL!"
+    if "!ZLC_STATUS!"=="0" (
+        rem GUI closed normally -> close this console window automatically (no pause).
+        rem Only keep the window open on FAILURE so the error messages stay readable.
+        exit /b 0
+    ) else (
+        echo.
+        echo ZLC task console failed with code !ZLC_STATUS!.
+        echo Keep this window open and read the messages above.
+        if "%ZLC_NO_PAUSE%"=="" pause
+    )
+    exit /b !ZLC_STATUS!
+)
+
+cd /d "%~dp0"
+
+if defined ZLC_TASK_CONSOLE_PYTHON (
+    if exist "%ZLC_TASK_CONSOLE_PYTHON%" (
+        "%ZLC_TASK_CONSOLE_PYTHON%" "%~dp0task_console.py" %*
+    ) else (
+        %ZLC_TASK_CONSOLE_PYTHON% "%~dp0task_console.py" %*
+    )
+    exit /b !ERRORLEVEL!
+)
+
+if exist "%~dp0.zlc_python_path" (
+    set /p "ZLC_STORED_PY="<"%~dp0.zlc_python_path"
+    if exist "!ZLC_STORED_PY!" (
+        "!ZLC_STORED_PY!" "%~dp0task_console.py" %*
+        exit /b !ERRORLEVEL!
+    )
+    echo Ignoring stale .zlc_python_path: !ZLC_STORED_PY!
+)
+
+where python >nul 2>nul
+if %ERRORLEVEL%==0 (
+    python "%~dp0task_console.py" %*
+    exit /b !ERRORLEVEL!
+)
+
+where py >nul 2>nul
+if %ERRORLEVEL%==0 (
+    py -3 "%~dp0task_console.py" %*
+    exit /b !ERRORLEVEL!
+)
+
+echo Could not find python or py on PATH.
+echo Run install_requirements.bat, set ZLC_TASK_CONSOLE_PYTHON, or start this from the same terminal/kernel environment that has Zou_lab_control installed.
+exit /b 1

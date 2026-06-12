@@ -1047,6 +1047,118 @@ def test_pulse_gui_scan_dot_retoggle_preserves_values(monkeypatch):
     assert editor.state.scan_table == [[100.0], [200.0], [300.0]]
 
 
+def test_task_console_panels_render_and_update(monkeypatch):
+    """The default console layout builds all four panel kinds against the virtual
+    feed and keeps updating them on subsequent shots."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    console = dt.demo_console(shots=25)
+    kinds = {card.config.kind: card for card in console.cards}
+    assert set(kinds) == {"2d", "1d", "monitor", "hist"}
+    for card in console.cards:
+        assert card.plotter is not None, card.config.kind
+        assert card.status.text().startswith("shot "), (card.config.kind, card.status.text())
+    assert type(kinds["2d"].plotter).__name__ == "Live2DDis"
+    assert type(kinds["hist"].plotter).__name__ == "HistogramFigure"
+    assert type(kinds["monitor"].plotter).__name__ == "LiveLiveDis"
+    assert type(kinds["1d"].plotter).__name__ == "Live1D"
+
+    # more shots -> the monitor's rolling history grows; the 2d image refreshes
+    before = kinds["monitor"].plotter.points_done
+    image_before = np.array(kinds["2d"].plotter.grid, copy=True)
+    for feed in console.feeds:
+        feed.step()
+    console.refresh_once()
+    assert kinds["monitor"].plotter.points_done == before + 1
+    assert not np.array_equal(np.array(kinds["2d"].plotter.grid), image_before)
+    console.shutdown()
+
+
+def test_task_console_cross_signal_expression_and_error_isolation(monkeypatch):
+    """A panel source may combine signals arbitrarily (the A-B loading-rate map);
+    a broken expression lands in that panel's status line and never disturbs the
+    other panels or the console loop."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.task_console import PanelCard, PanelConfig
+
+    console = dt.demo_console(shots=20, dual=True)
+    diff = PanelCard(
+        PanelConfig(kind="2d", title="A-B rate", row=4, col=0, rowspan=2, colspan=2,
+                    source="value = rate_grid - b_rate_grid"),
+        cell_px=console.state.cell_px)
+    console._attach_card(diff)
+    console._regrid()
+    console.refresh_once()
+    assert diff.plotter is not None and diff.status.text().startswith("shot ")
+    grid_shape = console.hub.latest("rate_grid").shape
+    assert tuple(diff.plotter.data_shape) == grid_shape
+
+    # break ONE panel: it reports, the siblings keep updating
+    victim = next(card for card in console.cards if card.config.kind == "monitor")
+    victim.source_edit.setPlainText("value = this_signal_does_not_exist")
+    victim._apply_source()
+    for feed in console.feeds:
+        feed.step()
+    console.refresh_once()
+    assert "this_signal_does_not_exist" in victim.status.text()
+    healthy = next(card for card in console.cards if card.config.kind == "2d")
+    assert healthy.status.text().startswith("shot ")
+    console.shutdown()
+
+
+def test_task_console_state_roundtrip(tmp_path, monkeypatch):
+    """Layout JSON: read_state -> save -> load reproduces every panel."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.task_console import TaskConsoleState
+
+    console = dt.demo_console(shots=3)
+    state = console.read_state()
+    path = state.save(tmp_path / "layout.json")
+    loaded = TaskConsoleState.load(path)
+    assert loaded.to_dict() == state.to_dict()
+    console.load_state(loaded)
+    console.refresh_once()
+    assert len(console.cards) == len(loaded.panels)
+    console.shutdown()
+
+
+def test_task_console_add_remove_and_dirty_star(tmp_path, monkeypatch):
+    """Add Panel/remove mark the Save button dirty (confocal star); saving through
+    the stubbed file dialog clears it."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5 import QtWidgets
+    from Zou_lab_control.frontend import devtools as dt
+
+    console = dt.demo_console(shots=3)
+    assert not console.save_button.is_dirty()
+    n_before = len(console.cards)
+    console._add_panel()
+    assert len(console.cards) == n_before + 1
+    assert console.save_button.is_dirty()
+
+    console._remove_panel(console.cards[-1])
+    assert len(console.cards) == n_before
+
+    target = tmp_path / "console.json"
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName",
+                        staticmethod(lambda *a, **k: (str(target), "")))
+    console.save_to_file()
+    assert target.exists()
+    assert not console.save_button.is_dirty()
+    console.shutdown()
+
+
 def test_pulse_gui_clear_all_resets_to_single_blank_1us_period(monkeypatch):
     """The header Clear All button wipes the SCHEDULE (periods, delays, DA plans,
     scan bindings, repeat bracket) down to one blank 1 us period with no channel on,

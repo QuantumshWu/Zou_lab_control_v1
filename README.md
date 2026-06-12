@@ -11,6 +11,7 @@ real qCMOS hardware, and a remote FPGA sequencer.
 install_requirements.bat            # install the editable package + record .zlc_python_path
 start_tutorials_jupyter_lab.bat     # open the checked-in tutorials
 pulse_gui.bat                        # open the pulse editor (offline if no server)
+task_console.bat                     # open the live experiment dashboard (virtual feed)
 ```
 
 The installer records the selected interpreter in the ignored local file
@@ -112,6 +113,15 @@ the editor remotely or offline:
 pulse_gui.bat --remote-host 192.168.0.20 --state .\pulses\camera_imaging_address_switch.json
 pulse_gui.bat --no-sequencer --state .\pulses\camera_imaging_address_switch.json
 ```
+
+The **task console** (`task_console.bat`) is the experiment-side dashboard: a
+configurable grid of live panels (2D image with side distribution and draggable
+clim, rolling trace, bimodal-fit histogram, 1D vector), each wired to named
+experiment signals through a small Python expression (`value = rate_grid -
+b_rate_grid`).  It starts against the built-in virtual atom-loading feed; wire a
+real experiment by publishing into a `SignalHub` from your acquisition loop (see
+the frontend manual's Task-console chapter).  Layouts save/load as one JSON in
+`tasks/`.
 
 ## Targeted Verification
 
