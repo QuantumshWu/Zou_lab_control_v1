@@ -6919,8 +6919,11 @@ def test_virtual_loading_feed_publishes_standard_signals():
     feed = VirtualLoadingFeed(hub, seed=5, loading_probability=0.55, ema=0.2)
     for _ in range(60):
         feed.step()
-    assert set(hub.names()) == {"frame", "counts", "occupied", "rate", "rate_sites", "rate_grid", "shot"}
+    assert set(hub.names()) == {"frame", "counts", "occupied", "rate", "rate_sites", "rate_grid",
+                                "centers", "thresholds", "shot"}
     assert hub.latest("frame").shape == (96, 128)
+    assert hub.latest("centers").shape == (feed.trap.n_sites, 2)   # the site-map panel's anchor
+    assert hub.latest("thresholds").shape == (feed.trap.n_sites,)
     assert hub.latest("counts").shape == (feed.trap.n_sites,)
     assert hub.latest("rate_grid").shape == feed.trap.grid_shape
     assert 0.0 <= hub.latest("rate") <= 1.0

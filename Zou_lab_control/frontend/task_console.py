@@ -62,6 +62,7 @@ from .qt_fluent import (
     fluent_widget_stylesheet,
     scaled_px,
     set_fluent_scale,
+    signals_blocked as _signals_blocked,
 )
 
 try:  # guarded like pulse_gui: the console degrades without matplotlib-qt
@@ -76,6 +77,7 @@ TASK_FILES_ENV = "ZLC_TASK_DIR"
 
 PANEL_KINDS: dict[str, str] = {
     "2d": "2D image",
+    "sites": "Site map",
     "1d": "1D vector",
     "monitor": "Rolling trace",
     "hist": "Distribution",
@@ -85,9 +87,51 @@ CMAPS = ("inferno", "viridis", "magma", "plasma", "gray", "coolwarm")
 
 _DEFAULT_SOURCES = {
     "2d": "value = frame",
+    "sites": "value = occupied",
     "1d": "value = rate_sites",
     "monitor": "value = rate",
     "hist": "value = history('counts', 200).ravel()",
+}
+
+
+class ParamSpec:
+    """One declarative panel parameter: the Setting popup generates its widget
+    from this spec (confocal style -- adding a parameter is ONE line here, the
+    GUI, the JSON params and the plot rebuild all follow)."""
+
+    def __init__(self, key: str, label: str, kind: str, default, *,
+                 choices: Sequence[str] = (), lo: float = 0, hi: float = 1e9, tooltip: str = ""):
+        self.key = str(key)
+        self.label = str(label)
+        self.kind = str(kind)              # "choice" | "int" | "signal"
+        self.default = default
+        self.choices = tuple(choices)
+        self.lo, self.hi = lo, hi
+        self.tooltip = str(tooltip)
+
+    def get(self, params: Mapping[str, object]):
+        return params.get(self.key, self.default)
+
+
+PANEL_PARAMS: dict[str, tuple[ParamSpec, ...]] = {
+    "2d": (
+        ParamSpec("cmap", "colormap", "choice", "inferno", choices=CMAPS, tooltip="Image colormap"),
+    ),
+    "sites": (
+        ParamSpec("centers", "centers", "signal", "centers",
+                  tooltip="Signal holding the (N, 2) site centers in camera px"),
+        ParamSpec("image", "image", "signal", "frame",
+                  tooltip="Signal for the camera-frame underlay (blank for none)"),
+        ParamSpec("cmap", "colormap", "choice", "viridis", choices=CMAPS, tooltip="Site-value colormap"),
+    ),
+    "1d": (),
+    "monitor": (
+        ParamSpec("length", "history", "int", 300, lo=20, hi=10_000,
+                  tooltip="Rolling history length (shots kept on screen)"),
+    ),
+    "hist": (
+        ParamSpec("bins", "bins", "int", 60, lo=5, hi=500, tooltip="Histogram bins"),
+    ),
 }
 
 # Card geometry (raw px, matching the raw-px canvas).  The card is a titled
@@ -283,23 +327,86 @@ class TaskConsoleState:
         return cls.from_dict(payload)
 
 
-def default_console_state() -> TaskConsoleState:
-    """The reference layout: 2x2 loading image, half-height distribution + rate
-    trace stacked on the right, and a double-width per-site strip below."""
+def _atom_loading_monitor_state() -> TaskConsoleState:
+    """The atom-loading dashboard: camera image + occupancy site map on top,
+    counts distribution + loading-rate trace in the middle, per-site strip below."""
 
     return TaskConsoleState(
-        name="atom_loading",
+        name="atom_loading_monitor",
         panels=[
             PanelConfig(kind="2d", title="Loading image", row=0, col=0, size="2x2",
                         source="value = frame"),
-            PanelConfig(kind="hist", title="Counts distribution", row=0, col=2, size="1x2",
+            PanelConfig(kind="sites", title="Occupancy", row=0, col=2, size="2x2",
+                        source="value = occupied"),
+            PanelConfig(kind="hist", title="Counts distribution", row=2, col=0, size="1x2",
                         source="value = history('counts', 200).ravel()", params={"bins": 80}),
-            PanelConfig(kind="monitor", title="Loading rate", row=1, col=2, size="1x2",
+            PanelConfig(kind="monitor", title="Loading rate", row=2, col=2, size="1x2",
                         source="value = rate", params={"length": 300}),
-            PanelConfig(kind="1d", title="Per-site loading rate", row=2, col=0, size="2x4",
+            PanelConfig(kind="1d", title="Per-site loading rate", row=3, col=0, size="2x4",
                         source="value = rate_sites"),
         ],
     )
+
+
+def _loading_rate_live_state() -> TaskConsoleState:
+    """A lightweight rate-watch layout (no camera image): rate trace + counts
+    distribution on top, per-site rate map + strip below."""
+
+    return TaskConsoleState(
+        name="loading_rate_live",
+        panels=[
+            PanelConfig(kind="monitor", title="Loading rate", row=0, col=0, size="1x2",
+                        source="value = rate", params={"length": 500}),
+            PanelConfig(kind="hist", title="Counts distribution", row=0, col=2, size="1x2",
+                        source="value = history('counts', 200).ravel()", params={"bins": 80}),
+            PanelConfig(kind="sites", title="Per-site rate", row=1, col=0, size="2x2",
+                        source="value = rate_sites", params={"image": ""}),
+            PanelConfig(kind="1d", title="Per-site loading rate", row=1, col=2, size="1x2",
+                        source="value = rate_sites"),
+        ],
+    )
+
+
+# Named, reusable dashboards ("task GUIs"): designed once, saved by name, and
+# loaded back from the GUI preset picker, `--task <name>` or
+# `show_task_console(task=...)`.  A JSON file in tasks/ with the same stem
+# OVERRIDES the built-in (so the lab can evolve a stock layout in place).
+BUILTIN_TASKS: dict[str, object] = {
+    "atom_loading_monitor": _atom_loading_monitor_state,
+    "loading_rate_live": _loading_rate_live_state,
+}
+
+
+def default_console_state() -> TaskConsoleState:
+    return _atom_loading_monitor_state()
+
+
+def list_task_presets() -> list[str]:
+    """All loadable task names: built-ins + every tasks/*.json (deduplicated)."""
+
+    names = set(BUILTIN_TASKS)
+    try:
+        names.update(path.stem for path in _task_files_dir().glob("*.json"))
+    except Exception:
+        pass
+    return sorted(names)
+
+
+def resolve_task_state(task: str) -> TaskConsoleState:
+    """Resolve a task by FILE PATH, tasks/<name>.json, or built-in name."""
+
+    text = str(task).strip()
+    path = Path(text)
+    if path.suffix.lower() == ".json" and path.exists():
+        return TaskConsoleState.load(path)
+    saved = _task_files_dir() / f"{text}.json"
+    if saved.exists():
+        return TaskConsoleState.load(saved)
+    if text in BUILTIN_TASKS:
+        return BUILTIN_TASKS[text]()
+    raise ValueError(
+        f"unknown task {task!r}: not a layout file, not in {_task_files_dir()}, and not one of "
+        f"{', '.join(sorted(BUILTIN_TASKS))}.")
 
 
 # ====================================================================== panels
@@ -314,9 +421,10 @@ class PanelCard(FluentGroupBox):
     layout_changed = QtCore.pyqtSignal()   # size/slot change (console re-arranges)
     remove_requested = QtCore.pyqtSignal(object)
 
-    def __init__(self, config: PanelConfig, parent=None):
+    def __init__(self, config: PanelConfig, parent=None, *, names_provider=None):
         super().__init__(PANEL_KINDS[config.kind], parent, shadow=True)
         self.config = config
+        self.names_provider = names_provider   # callable -> live signal names (Setting combo)
         self.plotter = None
         self.canvas = None
         self._value_shape: tuple[int, ...] | None = None
@@ -360,8 +468,11 @@ class PanelCard(FluentGroupBox):
 
     # ------------------------------------------------------------- settings UI
     def _build_settings(self) -> None:
-        """The confocal-style settings popup; every widget keeps the stock
-        fluent size (no squeezed rows)."""
+        """The confocal-style settings popup, organised the way an experimenter
+        thinks: WHAT to show (Source: pick a live signal, or write an
+        expression), HOW to show it (Display: size + the panel kind's
+        declarative parameters, all applied instantly), and the panel itself
+        (title, Remove).  Every widget keeps the stock fluent size."""
 
         popup = QtWidgets.QFrame(self, QtCore.Qt.Popup)
         popup.setStyleSheet(
@@ -379,25 +490,25 @@ class PanelCard(FluentGroupBox):
                 line.addWidget(widget, 1 if (stretch_first and index == 0) else 0)
             form.addLayout(line)
 
-        self.title_edit = FluentLineEdit(self.config.title)
-        self.title_edit.setPlaceholderText("panel title…")
-        self.title_edit.textChanged.connect(self._on_title)
-        kind_tag = FluentLabel(PANEL_KINDS[self.config.kind])
-        kind_tag.setStyleSheet(f"color: {GREY}; background: transparent;")
-        row(self.title_edit, kind_tag)
+        def section(text):
+            label = FluentLabel(text)
+            label.setStyleSheet(f"color: {GREY}; background: transparent; border: none; font-weight: bold;")
+            form.addWidget(label)
 
-        self.size_combo = FluentComboBox()
-        self.size_combo.addItems(list(PANEL_SIZES))
-        self.size_combo.setCurrentText(self.config.size)
-        self.size_combo.setToolTip("Panel size preset (height x width half-units; 2x2 = the stock plot region)")
-        self.size_combo.currentTextChanged.connect(self._on_size)
-        size_tag = FluentLabel("size")
-        size_tag.setStyleSheet(f"color: {GREY}; background: transparent;")
-        param_widget = self._build_param_widget()
-        if param_widget is not None:
-            row(self.size_combo, size_tag, param_widget, stretch_first=False)
-        else:
-            row(self.size_combo, size_tag, stretch_first=False)
+        def tag(text):
+            label = FluentLabel(text)
+            label.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+            return label
+
+        # ---- Source: pick a signal, or write an expression -----------------
+        section("Source")
+        self.signal_combo = FluentComboBox()
+        self.signal_combo.setMinimumWidth(scaled_px(150, minimum=120))
+        self.signal_combo.setToolTip(
+            "Pick a live signal to show it directly (sets the expression to\n"
+            "`value = <signal>`).  Choose (expression) to write your own.")
+        self.signal_combo.activated.connect(self._on_signal_pick)
+        row(self.signal_combo, tag("signal"), stretch_first=False)
 
         self.source_edit = FluentLineEdit(self.config.source)
         self.source_edit.setMinimumWidth(scaled_px(340, minimum=280))
@@ -414,43 +525,65 @@ class PanelCard(FluentGroupBox):
         row(self.source_edit, self.apply_button)
 
         self.status = FluentLabel("")
-        self.status.setStyleSheet(f"color: {GREY}; background: transparent;")
+        self.status.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+        form.addWidget(self.status)
+
+        # ---- Display: size + the kind's declarative parameters -------------
+        section("Display")
+        self.size_combo = FluentComboBox()
+        self.size_combo.addItems(list(PANEL_SIZES))
+        self.size_combo.setCurrentText(self.config.size)
+        self.size_combo.setFixedWidth(scaled_px(64, minimum=56))
+        self.size_combo.setToolTip("Panel size preset (height x width half-units; 2x2 = the stock plot region)")
+        self.size_combo.currentTextChanged.connect(self._on_size)
+        display_row = [self.size_combo, tag("size")]
+        self.param_widgets: dict[str, QtWidgets.QWidget] = {}
+        for spec in PANEL_PARAMS.get(self.config.kind, ()):
+            widget = self._make_param_widget(spec)
+            self.param_widgets[spec.key] = widget
+            display_row.extend([widget, tag(spec.label)])
+        row(*display_row, stretch_first=False)
+
+        # ---- Panel: title + remove -----------------------------------------
+        section("Panel")
+        self.title_edit = FluentLineEdit(self.config.title)
+        self.title_edit.setPlaceholderText("panel title…")
+        self.title_edit.textChanged.connect(self._on_title)
         remove = FluentButton("Remove", color=ORANGE)
         remove.clicked.connect(lambda: self.remove_requested.emit(self))
-        row(self.status, remove)
+        row(self.title_edit, remove)
 
         self.settings_popup = popup
 
-    def _build_param_widget(self):
-        kind = self.config.kind
-        if kind == "2d":
-            self.cmap_combo = FluentComboBox()
-            self.cmap_combo.addItems(list(CMAPS))
-            current = str(self.config.params.get("cmap", "inferno"))
-            if current in CMAPS:
-                self.cmap_combo.setCurrentText(current)
-            self.cmap_combo.setToolTip("Colormap")
-            self.cmap_combo.currentTextChanged.connect(self._on_param)
-            return self.cmap_combo
-        if kind == "monitor":
-            self.length_spin = FluentDoubleSpinBox(length=5, allow_minus=False)
-            self.length_spin.setDecimals(0)
-            self.length_spin.setRange(20, 10_000)
-            self.length_spin.setValue(int(self.config.params.get("length", 300)))
-            self.length_spin.setToolTip("Rolling history length (shots kept on screen)")
-            self.length_spin.valueChanged.connect(self._on_param)
-            return self.length_spin
-        if kind == "hist":
-            self.bins_spin = FluentDoubleSpinBox(length=4, allow_minus=False)
-            self.bins_spin.setDecimals(0)
-            self.bins_spin.setRange(5, 500)
-            self.bins_spin.setValue(int(self.config.params.get("bins", 60)))
-            self.bins_spin.setToolTip("Histogram bins")
-            self.bins_spin.valueChanged.connect(self._on_param)
-            return self.bins_spin
-        return None
+    def _make_param_widget(self, spec: ParamSpec) -> QtWidgets.QWidget:
+        """One widget per declarative ParamSpec; edits apply INSTANTLY."""
+
+        current = self.config.params.get(spec.key, spec.default)
+        if spec.kind == "choice":
+            combo = FluentComboBox()
+            combo.addItems(list(spec.choices))
+            if str(current) in spec.choices:
+                combo.setCurrentText(str(current))
+            combo.setToolTip(spec.tooltip)
+            combo.currentTextChanged.connect(lambda text, k=spec.key: self._set_param(k, str(text)))
+            return combo
+        if spec.kind == "int":
+            spin = FluentDoubleSpinBox(length=max(4, len(str(int(spec.hi)))), allow_minus=False)
+            spin.setDecimals(0)
+            spin.setRange(spec.lo, spec.hi)
+            spin.setValue(int(current))
+            spin.setToolTip(spec.tooltip)
+            spin.valueChanged.connect(lambda v, k=spec.key: self._set_param(k, int(v)))
+            return spin
+        # "signal": a free-form signal name (blank allowed where documented)
+        edit = FluentLineEdit(str(current))
+        edit.setFixedWidth(scaled_px(96, minimum=80))
+        edit.setToolTip(spec.tooltip)
+        edit.editingFinished.connect(lambda k=spec.key, w=edit: self._set_param(k, w.text().strip()))
+        return edit
 
     def _open_settings(self) -> None:
+        self._refresh_signal_combo()
         anchor = self.setting_button.mapToGlobal(
             QtCore.QPoint(self.setting_button.width(), self.setting_button.height()))
         popup = self.settings_popup
@@ -458,10 +591,35 @@ class PanelCard(FluentGroupBox):
         popup.move(anchor.x() - popup.width(), anchor.y() + scaled_px(2))
         popup.show()
 
+    def _refresh_signal_combo(self) -> None:
+        """Fill the signal picker with the hub's CURRENT signal names."""
+        names = []
+        if callable(self.names_provider):
+            try:
+                names = sorted(str(n) for n in self.names_provider())
+            except Exception:
+                names = []
+        combo = self.signal_combo
+        with _signals_blocked(combo):
+            combo.clear()
+            combo.addItem("(expression)")
+            combo.addItems(names)
+            # reflect a plain `value = <signal>` source in the picker
+            source = (self.config.source or "").strip()
+            picked = source[len("value ="):].strip() if source.startswith("value =") else ""
+            combo.setCurrentText(picked if picked in names else "(expression)")
+
+    def _on_signal_pick(self, index: int) -> None:
+        name = self.signal_combo.currentText()
+        if not name or name == "(expression)":
+            return
+        self.source_edit.setText(f"value = {name}")
+        self._apply_source()                      # picking a signal applies instantly
+
     def set_status(self, text: str, *, error: bool) -> None:
         self.status.setText(str(text)[:200])
         self.status.setStyleSheet(
-            f"color: {RED if error else GREY}; background: transparent;")
+            f"color: {RED if error else GREY}; background: transparent; border: none;")
         colour = RED if error else GREY
         self.setting_button.set_color(colour)
         self.setting_button.setToolTip(f"Panel settings — {text}" if text else "Panel settings")
@@ -514,14 +672,11 @@ class PanelCard(FluentGroupBox):
         self.changed.emit()
         self.layout_changed.emit()
 
-    def _on_param(self, *_args) -> None:
-        kind = self.config.kind
-        if kind == "2d":
-            self.config.params["cmap"] = self.cmap_combo.currentText()
-        elif kind == "monitor":
-            self.config.params["length"] = int(self.length_spin.value())
-        elif kind == "hist":
-            self.config.params["bins"] = int(self.bins_spin.value())
+    def _set_param(self, key: str, value) -> None:
+        """A declarative parameter edit: store, rebuild the plot, mark dirty."""
+        if self.config.params.get(key) == value:
+            return
+        self.config.params[key] = value
         self._reset_plot()
         self.changed.emit()
 
@@ -540,7 +695,7 @@ class PanelCard(FluentGroupBox):
 
         try:
             value = self._evaluate(dict(namespace))
-            self._feed(value)
+            self._feed(value, namespace)
         except Exception as exc:
             self.set_status(str(exc).splitlines()[0][:160] or type(exc).__name__, error=True)
             return
@@ -574,9 +729,26 @@ class PanelCard(FluentGroupBox):
         flat = arr.reshape(-1)
         if flat.size < 1:
             raise ValueError("panel value is empty")
+        if kind == "sites" and flat.size > 4096:
+            raise ValueError(f"site-map panel needs one value per site (got {flat.size} values)")
         return flat
 
-    def _feed(self, value) -> None:
+    def _sites_aux(self, namespace: Mapping[str, object]):
+        """The site-map panel's two auxiliary signals: centers + optional image."""
+        centers_name = str(self.config.params.get("centers", "centers")).strip()
+        image_name = str(self.config.params.get("image", "frame")).strip()
+        centers = namespace.get(centers_name) if centers_name else None
+        if centers is None:
+            raise ValueError(
+                f"site-map panel needs a `{centers_name or 'centers'}` signal with the (N, 2) site centers"
+                " (set its name in Setting -> centers)")
+        centers = np.asarray(centers, dtype=float)
+        if centers.ndim != 2 or centers.shape[1] < 2:
+            raise ValueError(f"centers signal must have shape (N, 2); got {centers.shape}")
+        image = namespace.get(image_name) if image_name else None
+        return centers[:, :2], (None if image is None else np.asarray(image, dtype=float))
+
+    def _feed(self, value, namespace: Mapping[str, object] | None = None) -> None:
         # PERFORMANCE: feed data with draw=False and queue ONE draw_idle per
         # panel -- rendering happens in Qt's paint pass (coalesced per frame),
         # never synchronously inside the refresh tick.  hist accepts any sample
@@ -585,30 +757,53 @@ class PanelCard(FluentGroupBox):
         value = self._coerce(value)
         kind = self.config.kind
         rebuild = self.plotter is None
-        if not rebuild and kind in ("2d", "1d"):
+        if not rebuild and kind in ("2d", "1d", "sites"):
             rebuild = tuple(np.shape(value)) != self._value_shape
         if rebuild:
-            self._build_plot(value)
+            self._build_plot(value, namespace)
             self._value_shape = (1,) if isinstance(value, float) else tuple(np.shape(value))
             return
         if kind == "2d":
             self.plotter.update(np.asarray(value).ravel(), draw=False)
         elif kind == "monitor":
             self.plotter.roll(value, draw=False)
+        elif kind == "sites":
+            self.plotter.update(value, draw=False)
+            if namespace is not None:           # refresh the camera underlay too
+                _, image = self._sites_aux(namespace)
+                self.plotter.set_background(image)
         else:  # hist / 1d
             self.plotter.update(value, draw=False)
         if self.canvas is not None:
             self.canvas.draw_idle()
 
     # ------------------------------------------------------------- plot lifecycle
-    def _build_plot(self, value) -> None:
+    def _build_plot(self, value, namespace: Mapping[str, object] | None = None) -> None:
         if panel_canvas is None:
             raise RuntimeError("matplotlib Qt canvas is not available")
         self._teardown_plot()
         kind = self.config.kind
         size = self.config.size
         label = self.config.title or PANEL_KINDS[kind]
-        if kind == "2d":
+        if kind == "sites":
+            centers, image = self._sites_aux(namespace or {})
+            vec = np.asarray(value, dtype=float).reshape(-1)
+            if len(vec) != len(centers):
+                raise ValueError(
+                    f"site-map value has {len(vec)} entries but the centers signal has {len(centers)} sites")
+            spacing = 6.0
+            if len(centers) > 1:
+                deltas = np.linalg.norm(np.diff(centers, axis=0), axis=1)
+                deltas = deltas[deltas > 0]
+                if deltas.size:
+                    spacing = float(np.min(deltas))
+            self.plotter = panel_plot(
+                centers, vec, kind="sites", size=size,
+                cmap=str(self.config.params.get("cmap", "viridis")),
+                image=image, roi_radius=max(1.5, 0.3 * spacing),
+                labels=("Camera x (px)", "Camera y (px)", label),
+                title=self.config.title or None)
+        elif kind == "2d":
             arr = np.asarray(value, dtype=float)
             ny, nx = arr.shape
             xx, yy = np.meshgrid(np.arange(nx, dtype=float), np.arange(ny, dtype=float))
@@ -758,6 +953,13 @@ class TaskConsole(QtWidgets.QWidget):
         self.name_edit.setPlaceholderText("task name")
         self.name_edit.setFixedWidth(scaled_px(150, minimum=110))
         self.name_edit.textChanged.connect(self._mark_dirty)
+        self.preset_combo = FluentComboBox()
+        self.preset_combo.setFixedWidth(scaled_px(170, minimum=130))
+        self.preset_combo.setToolTip(
+            "Named task dashboards: built-ins plus every layout saved in tasks/.\n"
+            "Picking one loads it (Save stores the current design under its name).")
+        self._refresh_presets()
+        self.preset_combo.activated.connect(self._on_preset_pick)
         self.summary = FluentLineEdit("")
         self.summary.setEnabled(False)
 
@@ -774,7 +976,7 @@ class TaskConsole(QtWidgets.QWidget):
         load_button = FluentButton("Load", color=ORANGE)
         load_button.clicked.connect(self.load_from_file)
 
-        for widget in (self.status_dot, self.name_edit):
+        for widget in (self.status_dot, self.name_edit, self.preset_combo):
             header.addWidget(widget)
         header.addWidget(self.summary, 1)
         for widget in (self.kind_combo, add_button, self.pause_button, self.save_button, load_button):
@@ -806,7 +1008,8 @@ class TaskConsole(QtWidgets.QWidget):
             self.cards = []
             self.name_edit.setText(state.name)
             for config in state.panels:
-                self._attach_card(PanelCard(config, parent=self.board))
+                self._attach_card(PanelCard(config, parent=self.board,
+                                            names_provider=self.hub.names))
             self._arrange()
         finally:
             self._building = False
@@ -836,7 +1039,7 @@ class TaskConsole(QtWidgets.QWidget):
         kind = self.kind_combo.currentData() or "1d"
         rows = max((c.config.row + c.config.rows for c in self.cards), default=0)
         config = PanelConfig(kind=str(kind), row=rows, col=0, size="1x2")
-        card = PanelCard(config, parent=self.board)
+        card = PanelCard(config, parent=self.board, names_provider=self.hub.names)
         self._attach_card(card)
         self._arrange()
         self._mark_dirty()
@@ -866,6 +1069,28 @@ class TaskConsole(QtWidgets.QWidget):
             return
         self.save_button.set_dirty(True, dirty_color=YELLOW)
         self._update_summary()
+
+    # ------------------------------------------------------------------ presets
+    def _refresh_presets(self) -> None:
+        with _signals_blocked(self.preset_combo):
+            self.preset_combo.clear()
+            self.preset_combo.addItem("Presets…")
+            self.preset_combo.addItems(list_task_presets())
+            self.preset_combo.setCurrentIndex(0)
+
+    def _on_preset_pick(self, index: int) -> None:
+        name = self.preset_combo.currentText()
+        if not name or name == "Presets…":
+            return
+        try:
+            state = resolve_task_state(name)
+        except Exception as exc:
+            self._message(f"Load preset failed: {exc}")
+            return
+        self._address = None
+        self.load_state(state)
+        self.save_button.set_dirty(False)
+        self._refresh_presets()
 
     # ------------------------------------------------------------------ refresh
     def _expression_namespace(self) -> dict[str, object]:
@@ -912,6 +1137,7 @@ class TaskConsole(QtWidgets.QWidget):
             state.save(path)
             self._address = path
             self.save_button.set_dirty(False)
+            self._refresh_presets()             # a layout saved into tasks/ is a named preset
             self._message(f"Saved: {path}")
         except Exception as exc:
             self._message(f"Save failed: {exc}")
@@ -955,15 +1181,21 @@ def show_task_console(
     *,
     hub,
     state: TaskConsoleState | None = None,
+    task: str | None = None,
     feeds: Sequence[object] = (),
     scale: float | None = None,
     window_ratio: float = 0.84,
     title: str = "TaskConsole@Zou lab",
 ):
     """Open the console in a Fluent window (mirrors ``show_pulse_gui``: the body
-    sizes itself from the primary screen; the window wraps it exactly)."""
+    sizes itself from the primary screen; the window wraps it exactly).
+
+    ``task`` loads a NAMED dashboard: a built-in (``atom_loading_monitor``,
+    ``loading_rate_live``), a layout saved in tasks/, or a JSON path."""
 
     app = ensure_qt_app()
+    if state is None and task is not None:
+        state = resolve_task_state(task)
     console = TaskConsole(hub=hub, state=state, feeds=feeds, scale=scale, window_ratio=window_ratio)
     window = FluentWindow(widget=console, title=title, hide_on_close=False)
     window.adjustSize()

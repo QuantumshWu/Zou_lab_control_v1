@@ -200,8 +200,13 @@ def demo_console(*, scale: float = 1.0, size=(1480, 980), seed: int = 11, shots:
 
 def capture_user_view(target: str, out_dir, *, scales=(1.0, 1.25, 1.5), size=(1480, 1000),
                       shots: int = 60, settle_ms: int = 900, timeout: float = 300.0):
-    """Render ``target`` ("console" or "editor") AS THE USER SEES IT and save one
-    full-window screenshot per Windows display scale.
+    """Render ``target`` ("console", "editor" or "parity") AS THE USER SEES IT
+    and save one full-window screenshot per Windows display scale.
+
+    ``parity`` opens BOTH GUIs in one process with scale=None (each window's
+    REAL automatic-scale path, sharing one screen) and fails if their fluent
+    control sizes disagree -- the check that catches cross-GUI scaling drift
+    the per-GUI captures cannot see (both demo helpers pin scale=1.0).
 
     This is THE visual-acceptance interface: every UI/plot change must pass it,
     not a DPR=1 screenshot.  Each scale runs in a SUBPROCESS with
@@ -247,7 +252,7 @@ def _capture_main(argv=None) -> int:
     import argparse
 
     parser = argparse.ArgumentParser(description="Render a frontend GUI offscreen and screenshot it.")
-    parser.add_argument("--capture", required=True, choices=("console", "editor"))
+    parser.add_argument("--capture", required=True, choices=("console", "editor", "parity"))
     parser.add_argument("--out", required=True)
     parser.add_argument("--size", default="1480x1000")
     parser.add_argument("--shots", type=int, default=60)
@@ -256,6 +261,44 @@ def _capture_main(argv=None) -> int:
 
     width, height = (int(v) for v in args.size.lower().split("x"))
     from Zou_lab_control.frontend.qt_fluent import FluentWindow
+
+    if args.capture == "parity":
+        # BOTH GUIs, REAL automatic scale, ONE (offscreen) screen: their fluent
+        # controls must be pixel-identical or the capture fails.
+        from PyQt5 import QtGui
+        from Zou_lab_control.frontend.qt_fluent import FluentLineEdit
+
+        editor = demo_editor(scale=None, size=(width, height))
+        console = demo_console(scale=None, shots=args.shots, size=(width, height))
+        wins = [FluentWindow(widget=editor, title="PulseGUI@Zou lab", hide_on_close=False),
+                FluentWindow(widget=console, title="TaskConsole@Zou lab", hide_on_close=False)]
+        for win in wins:
+            win.adjustSize(); win.setFixedSize(win.size()); win.show()
+        settle(wins[0], args.settle_ms)
+        console.refresh_once()
+        settle(wins[1], args.settle_ms)
+        heights = []
+        for body in (editor, console):
+            hs = sorted({w.height() for w in body.findChildren(FluentLineEdit) if w.isVisible()})
+            heights.append(hs)
+        # the STANDARD fluent row (the 30px basis) must match exactly; the pulse
+        # editor also carries its intentional dense per-channel rows (26px basis
+        # beyond 16 channels), so compare the standard = tallest control.
+        grabs = [win.grab() for win in wins]
+        gap = 12
+        combined = QtGui.QPixmap(grabs[0].width() + gap + grabs[1].width(),
+                                 max(grabs[0].height(), grabs[1].height()))
+        combined.fill(QtGui.QColor("white"))
+        painter = QtGui.QPainter(combined)
+        painter.drawPixmap(0, 0, grabs[0])
+        painter.drawPixmap(grabs[0].width() + gap, 0, grabs[1])
+        painter.end()
+        combined.save(str(args.out))
+        print(f"parity lineedit heights: editor={heights[0]} console={heights[1]} -> {args.out}")
+        if max(heights[0]) != max(heights[1]):
+            print("PARITY FAILED: the standard fluent row differs between the two GUIs")
+            return 2
+        return 0
 
     if args.capture == "console":
         body = demo_console(shots=args.shots, size=(width, height))

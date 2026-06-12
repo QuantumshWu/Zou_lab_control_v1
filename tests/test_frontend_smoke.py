@@ -1257,7 +1257,7 @@ def test_task_console_cards_are_modular(monkeypatch):
 
 
 def test_task_console_panels_render_and_update(monkeypatch):
-    """The default console layout builds all four panel kinds against the virtual
+    """The default console layout builds all five panel kinds against the virtual
     feed and keeps updating them on subsequent shots."""
 
     pytest.importorskip("PyQt5")
@@ -1266,11 +1266,12 @@ def test_task_console_panels_render_and_update(monkeypatch):
 
     console = dt.demo_console(shots=25)
     kinds = {card.config.kind: card for card in console.cards}
-    assert set(kinds) == {"2d", "1d", "monitor", "hist"}
+    assert set(kinds) == {"2d", "sites", "1d", "monitor", "hist"}
     for card in console.cards:
         assert card.plotter is not None, card.config.kind
         assert card.status.text().startswith("shot "), (card.config.kind, card.status.text())
     assert type(kinds["2d"].plotter).__name__ == "Live2DDis"
+    assert type(kinds["sites"].plotter).__name__ == "LiveSiteMap"
     assert type(kinds["hist"].plotter).__name__ == "HistogramFigure"
     assert type(kinds["monitor"].plotter).__name__ == "LiveLiveDis"
     assert type(kinds["1d"].plotter).__name__ == "Live1D"
@@ -1283,6 +1284,85 @@ def test_task_console_panels_render_and_update(monkeypatch):
     console.refresh_once()
     assert kinds["monitor"].plotter.points_done == before + 1
     assert not np.array_equal(np.array(kinds["2d"].plotter.grid), image_before)
+    console.shutdown()
+
+
+def test_task_console_named_presets_resolve_and_roundtrip(tmp_path, monkeypatch):
+    """Task dashboards are reusable by NAME: built-ins resolve, a JSON saved in
+    tasks/ shows up in the preset list and OVERRIDES a same-named built-in."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    monkeypatch.setenv("ZLC_TASK_DIR", str(tmp_path))
+    from Zou_lab_control.frontend.task_console import (
+        BUILTIN_TASKS, TaskConsoleState, list_task_presets, resolve_task_state)
+
+    assert {"atom_loading_monitor", "loading_rate_live"} <= set(BUILTIN_TASKS)
+    state = resolve_task_state("atom_loading_monitor")
+    assert state.name == "atom_loading_monitor"
+    assert {p.kind for p in state.panels} == {"2d", "sites", "hist", "monitor", "1d"}
+
+    # a saved layout becomes a named preset; same stem overrides the built-in
+    custom = resolve_task_state("loading_rate_live")
+    custom.name = "atom_temp_monitor"
+    custom.save(tmp_path / "atom_temp_monitor.json")
+    override = TaskConsoleState(name="patched", panels=state.panels)
+    override.save(tmp_path / "atom_loading_monitor.json")
+    names = list_task_presets()
+    assert "atom_temp_monitor" in names and "atom_loading_monitor" in names
+    assert resolve_task_state("atom_temp_monitor").name == "atom_temp_monitor"
+    assert resolve_task_state("atom_loading_monitor").name == "patched"
+    with pytest.raises(ValueError, match="unknown task"):
+        resolve_task_state("nonexistent_dashboard")
+
+
+def test_task_console_signal_picker_and_declarative_params(monkeypatch):
+    """The Setting popup works the way an experimenter expects: the signal
+    picker lists the hub's live signals and picking one rewires the panel
+    instantly; declarative ParamSpec edits apply instantly too."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    console = dt.demo_console(shots=10)
+    card = next(c for c in console.cards if c.config.kind == "2d")
+    card._refresh_signal_combo()
+    names = [card.signal_combo.itemText(i) for i in range(card.signal_combo.count())]
+    assert names[0] == "(expression)"
+    assert "rate_grid" in names and "frame" in names
+    assert card.signal_combo.currentText() == "frame"      # mirrors `value = frame`
+
+    card.signal_combo.setCurrentText("rate_grid")
+    card._on_signal_pick(names.index("rate_grid"))
+    assert card.config.source == "value = rate_grid"
+    console.refresh_once()
+    assert card.status.text().startswith("shot ")           # applied instantly + healthy
+
+    # declarative param: one _set_param call -> stored + plot rebuilt
+    plot_before = card.plotter
+    card._set_param("cmap", "gray")
+    assert card.config.params["cmap"] == "gray"
+    console.refresh_once()
+    assert card.plotter is not plot_before
+    console.shutdown()
+
+
+def test_task_console_sites_panel_bad_centers_isolated(monkeypatch):
+    """A site-map panel pointing at a missing centers signal reports the error
+    on ITS status line; the other panels keep refreshing."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    console = dt.demo_console(shots=10)
+    sites = next(c for c in console.cards if c.config.kind == "sites")
+    sites._set_param("centers", "no_such_signal")
+    console.refresh_once()
+    assert "no_such_signal" in sites.status.text()
+    healthy = [c for c in console.cards if c is not sites]
+    assert all(c.status.text().startswith("shot ") for c in healthy)
     console.shutdown()
 
 

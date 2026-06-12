@@ -691,6 +691,107 @@ class Live2DDis(BaseLivePlot):
         )
 
 
+class LiveSiteMap(BaseLivePlot):
+    """Live atom-array site map: trap sites as filled circles coloured by a
+    per-site value (occupancy 0/1, per-site loading rate, fidelity, ...) over
+    an optional camera-frame underlay.
+
+    Same array contract as every live plot: ``data_x`` is the ``(N, 2)`` site
+    centers in camera pixels (x, y) and ``data_y`` is ``(N, 1)`` per-site
+    values.  The internal split is identical to :class:`Live2DDis`
+    ([0.75, 0.1, 0.1]); the side-distribution band stays empty, so the square
+    main image and the colorbar line up exactly with the 2D panels."""
+
+    plot_type = "SITES"
+
+    def __init__(self, *args, cmap: str = "viridis", image=None, roi_radius: float = 3.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.data_x.shape[1] != 2:
+            raise ValueError("LiveSiteMap requires data_x with shape (N, 2) site centers.")
+        self.cmap = cmap
+        self.background = None if image is None else np.asarray(image, dtype=float)
+        self.roi_radius = max(0.5, float(roi_radius))
+
+    # the dashboard refreshes the underlay every shot (set, don't rebuild)
+    def set_background(self, image, *, draw: bool = False) -> None:
+        if image is None:
+            return
+        arr = np.asarray(image, dtype=float)
+        if self.background is not None and getattr(self, "_bg_image", None) is not None \
+                and arr.shape == self.background.shape:
+            self.background = arr
+            self._bg_image.set_data(arr)
+            self._bg_image.set_clim(float(np.nanmin(arr)), max(float(np.nanmax(arr)), float(np.nanmin(arr)) + 1.0))
+            if draw:
+                self.update_figure()
+        else:
+            self.background = arr               # shape changed: rebuilt by the host
+
+    def _value_limits(self) -> tuple[float, float]:
+        vals = self.data_y[:, 0]
+        vals = vals[np.isfinite(vals)]
+        if not vals.size:
+            return 0.0, 1.0
+        lo, hi = float(np.nanmin(vals)), float(np.nanmax(vals))
+        if 0.0 <= lo and hi <= 1.0:             # occupancy / rates: keep a stable 0..1 scale
+            return 0.0, 1.0
+        if hi - lo == 0:
+            pad = abs(hi) * 0.1 if hi else 0.5
+            return lo - pad, hi + pad
+        return lo, hi
+
+    def init_core(self) -> None:
+        from matplotlib.collections import EllipseCollection
+
+        self.ax, self.axdis, self.cax = split_axes_horizontally(self.fig, self.ax, [0.75, 0.1, 0.1], [0.025, 0.025])
+        self.axes = self.ax
+        self.axdis.set_visible(False)           # sites carry no side distribution
+        centers = self.data_x[:, :2]
+        if self.background is not None:
+            h, w = self.background.shape
+            extent = [-0.5, w - 0.5, h - 0.5, -0.5]
+        else:
+            pad = 2.5 * self.roi_radius
+            extent = [float(centers[:, 0].min()) - pad, float(centers[:, 0].max()) + pad,
+                      float(centers[:, 1].max()) + pad, float(centers[:, 1].min()) - pad]
+        self.extent = extent
+        if self.background is not None:
+            self._bg_image = self.ax.imshow(self.background, cmap="gray", extent=extent, interpolation="none")
+        else:
+            self._bg_image = None
+        diameter = 2.0 * self.roi_radius
+        self.sites = EllipseCollection(
+            widths=diameter, heights=diameter, angles=0.0, units="xy",
+            offsets=centers, transOffset=self.ax.transData,
+            cmap=self.cmap, edgecolors="white", linewidths=0.6, alpha=0.95, zorder=5)
+        self.sites.set_array(self.data_y[:, 0])
+        lo, hi = self._value_limits()
+        self.sites.set_clim(lo, hi)
+        self.ax.add_collection(self.sites)
+        self.lines = [self.sites]
+        self.ax.set_anchor("W")
+        self.ax.set_aspect("equal", adjustable="box")
+        self.extents_square = _square_extent(list(extent))
+        self.ax.set_xlim(self.extents_square[0], self.extents_square[1])
+        self.ax.set_ylim(self.extents_square[2], self.extents_square[3])
+        self.ax.set_xlabel(self.xlabel)
+        self.ax.set_ylabel(self.ylabel)
+        self.cbar = self.fig.colorbar(self.sites, cax=self.cax)
+        self.cbar.set_label(self.zlabel)
+        self.cax.set_yticks([lo, hi])
+        self.cax.set_yticklabels([_float2str_eng(v, length=5) for v in (lo, hi)])
+
+    def update_core(self) -> None:
+        self.sites.set_array(self.data_y[:, 0])
+        lo, hi = self._value_limits()
+        self.sites.set_clim(lo, hi)
+        self.cax.set_yticks([lo, hi])
+        self.cax.set_yticklabels([_float2str_eng(v, length=5) for v in (lo, hi)])
+
+    def _install_state(self) -> None:
+        self.fig._zlc_state = PlotState(plot_type="SITES", x_array=self.data_x[:, 0], y_array=self.data_y, cax=self.cax)
+
+
 def _pulse_attr(row, name: str, default=None):
     if isinstance(row, Mapping):
         return row.get(name, default)
@@ -1614,6 +1715,9 @@ def _normalize_kind(kind: str | None) -> str:
         "live-dis": "monitor",
         "live-distribution": "monitor",
         "rolling": "monitor",
+        "site-map": "sites",
+        "sitemap": "sites",
+        "site": "sites",
     }
     return aliases.get(normalized, normalized)
 
@@ -1671,8 +1775,10 @@ def plot(
             plotter = Live2DDis(x, y, labels=labels, square=True, **kwargs).show(display=display)
         elif normalized_kind == "monitor":
             plotter = LiveLiveDis(x, y, labels=labels, **kwargs).show(display=display)
+        elif normalized_kind == "sites":
+            plotter = LiveSiteMap(x, y, labels=labels, **kwargs).show(display=display)
         else:
-            raise ValueError("kind must be auto, 1d, 2d, monitor, hist, or pulse.")
+            raise ValueError("kind must be auto, 1d, 2d, monitor, hist, sites, or pulse.")
 
     if should_watch:
         plotter.watch(
@@ -1694,6 +1800,7 @@ __all__ = [
     "Live1D",
     "Live2DDis",
     "LiveLiveDis",
+    "LiveSiteMap",
     "PANEL_DISPLAY_SCALE",
     "PANEL_SIZES",
     "panel_display_size",

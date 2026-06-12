@@ -94,6 +94,8 @@ class VirtualLoadingFeed(ExperimentFeed):
     ``rate``        scalar running loading rate (EMA over shots)
     ``rate_sites``  (N_sites,) per-site running loading rate (EMA)
     ``rate_grid``   grid-shaped per-site running loading rate (2D map)
+    ``centers``     (N_sites, 2) calibrated site centers in camera px (x, y)
+    ``thresholds``  (N_sites,) per-site Otsu thresholds (counts)
     ``shot``        scalar shot counter
     """
 
@@ -158,6 +160,8 @@ class VirtualLoadingFeed(ExperimentFeed):
             "rate": self._rate,
             "rate_sites": self._rate_sites.copy(),
             "rate_grid": self._rate_sites.reshape(self.trap.grid_shape).copy(),
+            "centers": np.asarray(self.centers, dtype=float).copy(),
+            "thresholds": np.asarray(self.thresholds, dtype=float).reshape(-1).copy(),
             "shot": float(self.shots + 1),
         }
 

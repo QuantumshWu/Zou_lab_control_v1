@@ -22,6 +22,9 @@ import sys
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Zou-lab task console (live dashboard).")
     parser.add_argument("--state", type=str, default=None, help="task layout JSON to load on start.")
+    parser.add_argument("--task", type=str, default=None,
+                        help="named task dashboard: a built-in (atom_loading_monitor, loading_rate_live),"
+                             " a layout saved in tasks/, or a JSON path.")
     parser.add_argument("--scale", type=float, default=None, help="UI scale factor (default: auto).")
     parser.add_argument("--rate", type=float, default=4.0, help="virtual feed rate in shots/s (default 4).")
     parser.add_argument("--seed", type=int, default=None, help="virtual feed seed (default: random).")
@@ -36,7 +39,8 @@ def main(argv: list[str] | None = None) -> int:
     from PyQt5 import QtCore, QtWidgets
 
     from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
-    from Zou_lab_control.frontend.task_console import TaskConsoleState, default_console_state, show_task_console
+    from Zou_lab_control.frontend.task_console import (
+        TaskConsoleState, default_console_state, resolve_task_state, show_task_console)
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
     from Zou_lab_control.neutral_atom.operations.feeds import VirtualLoadingFeed
 
@@ -52,7 +56,12 @@ def main(argv: list[str] | None = None) -> int:
         for feed in feeds:
             feed.start(rate_hz=args.rate)
 
-    state = TaskConsoleState.load(args.state) if args.state else default_console_state()
+    if args.state:
+        state = TaskConsoleState.load(args.state)
+    elif args.task:
+        state = resolve_task_state(args.task)
+    else:
+        state = default_console_state()
     show_task_console(hub=hub, state=state, feeds=feeds, scale=args.scale)
 
     auto_close_ms = os.environ.get("ZLC_TASK_CONSOLE_AUTO_CLOSE_MS")
