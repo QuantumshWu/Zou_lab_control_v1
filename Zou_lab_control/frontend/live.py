@@ -795,25 +795,29 @@ def pulse_plot_channels(
 # area, never bigger titles/labels.  The margins per kind are design constants
 # (the 2D kind pays extra right margin for its side distribution + colorbar).
 PANEL_SIZES = ("2x1", "2x2", "3x1", "3x2", "4x1", "4x2")
-# Panels render at their OWN dpi tier: FigureSpec.data_px are real pixels, so a
-# lower dpi only shrinks the pt->px font conversion -- panel text sits at ~70%
-# of the big-figure (notebook / pulse-preview, dpi=300) text, matching the much
-# smaller data areas.  Within the panel tier every size shares the same fonts.
-PANEL_DPI = 210
-# (left, right, top, bottom) around the data area, tuned for the panel font
-# tier; panels carry NO in-figure title (the host card titles them), so the top
-# margin only clears the tick labels.  The 2D kind pays extra right margin for
-# its side distribution + colorbar.
+# There is ONE font/dpi system for every frontend figure (style.DEFAULT_STYLE,
+# dpi=300) -- panels do NOT fork it.  A panel figure renders at full size and
+# is DISPLAYED scaled by PANEL_DISPLAY_SCALE through the standard high-DPI
+# canvas path (qt_canvas.EmbeddedFigureCanvas), so on screen the text sits at
+# ~70% of a notebook/pulse-preview figure, matching the smaller data areas,
+# while the figure itself stays a perfectly ordinary 300 dpi frontend figure.
+PANEL_DISPLAY_SCALE = 0.7
+# All PANEL_* geometry below is in DISPLAY pixels (what the user sees / what
+# the host grid is built from); panel_plot_spec converts to figure pixels by
+# dividing by PANEL_DISPLAY_SCALE.  (left, right, top, bottom) margins around
+# the data area: panels carry NO in-figure title (the host card titles them),
+# so the top margin only clears the tick labels; the 2D kind pays extra right
+# margin for its side distribution + colorbar.
 PANEL_MARGINS = {
     "2d": (72, 55, 25, 52),
     "1d": (72, 26, 25, 52),
     "monitor": (72, 26, 25, 52),
     "hist": (72, 26, 25, 52),
 }
-PANEL_CELL_PX = (300, 280)     # design grid-cell size (raw px; layouts stay machine-portable)
-PANEL_GAP_PX = 8               # gap between grid cells
-PANEL_CHROME_PX = (20, 108)    # host-card overhead around the canvas (w, h)
-PANEL_MIN_DATA_PX = 70         # below this the axes are unreadable -> reject the combo
+PANEL_CELL_PX = (300, 280)     # design grid-cell size (display px; layouts stay machine-portable)
+PANEL_GAP_PX = 8               # gap between grid cells (display px)
+PANEL_CHROME_PX = (20, 108)    # host-card overhead around the canvas (display px)
+PANEL_MIN_DATA_PX = 70         # below this the axes are unreadable -> reject the combo (display px)
 
 
 def panel_size_cells(size: str) -> tuple[int, int]:
@@ -833,15 +837,17 @@ def panel_plot_spec(
     cell_px: tuple[int, int] = PANEL_CELL_PX,
     gap_px: int = PANEL_GAP_PX,
     chrome_px: tuple[int, int] = PANEL_CHROME_PX,
-    dpi: int = PANEL_DPI,
+    display_scale: float = PANEL_DISPLAY_SCALE,
 ) -> FigureSpec:
     """FigureSpec for a dashboard panel spanning ``size`` grid cells.
 
-    The CANVAS fills the spanned cells (including the swallowed inter-cell gaps)
-    minus the host card's chrome; the data area is the canvas minus the kind's
-    design margins.  ``dpi`` (and with it every font size) never changes with
-    ``size``, so panels of different sizes share one visual language.  A
-    combination whose data area would be unreadably small is rejected."""
+    The DISPLAYED canvas fills the spanned cells (including the swallowed
+    inter-cell gaps) minus the host card's chrome; the data area is the canvas
+    minus the kind's design margins -- all in DISPLAY pixels.  The returned
+    spec is in FIGURE pixels (display / ``display_scale``) at the frontend's
+    one and only dpi, so the figure is an ordinary 300 dpi frontend figure that
+    the host shows scaled (qt_canvas.EmbeddedFigureCanvas).  A combination
+    whose displayed data area would be unreadably small is rejected."""
 
     kind = _normalize_kind(kind)
     if kind not in PANEL_MARGINS:
@@ -855,8 +861,11 @@ def panel_plot_spec(
     if data_w < PANEL_MIN_DATA_PX or data_h < PANEL_MIN_DATA_PX:
         raise ValueError(
             f"panel size {size!r} is too small for a {kind!r} panel at cell {cell_px}"
-            f" (data area {data_w}x{data_h} px); pick a bigger size.")
-    return FigureSpec(data_px=(data_w, data_h), margins_px=margins, dpi=int(dpi))
+            f" (displayed data area {data_w}x{data_h} px); pick a bigger size.")
+    scale = max(0.1, float(display_scale))
+    return FigureSpec(
+        data_px=(round(data_w / scale), round(data_h / scale)),
+        margins_px=tuple(round(m / scale) for m in margins))
 
 
 def panel_plot(
@@ -868,18 +877,21 @@ def panel_plot(
     cell_px: tuple[int, int] = PANEL_CELL_PX,
     gap_px: int = PANEL_GAP_PX,
     chrome_px: tuple[int, int] = PANEL_CHROME_PX,
+    display_scale: float = PANEL_DISPLAY_SCALE,
     square: bool = False,
     **kwargs,
 ):
     """``plot()`` preset for dashboard panels: pick a kind and one of the
     LIMITED ``PANEL_SIZES`` and get a correctly sized, consistently styled live
-    plot (no display, no DataFigure -- the host embeds the figure).
+    plot (no display, no DataFigure -- the host embeds the figure through
+    ``qt_canvas.EmbeddedFigureCanvas(fig, display_scale=...)``).
 
     Panels carry no in-figure title (the host card titles them).  The 2D kind
     defaults to NON-square extents (a camera frame keeps its aspect ratio); this
     is the sanctioned internal Live2DDis use the plot() factory points to."""
 
-    spec = panel_plot_spec(kind, size, cell_px=cell_px, gap_px=gap_px, chrome_px=chrome_px)
+    spec = panel_plot_spec(kind, size, cell_px=cell_px, gap_px=gap_px,
+                           chrome_px=chrome_px, display_scale=display_scale)
     if _normalize_kind(kind) == "2d":
         x = _as_data_x(data_x)
         y = _as_data_y(data_y, len(x))
@@ -1710,6 +1722,7 @@ __all__ = [
     "Live1D",
     "Live2DDis",
     "LiveLiveDis",
+    "PANEL_DISPLAY_SCALE",
     "PANEL_SIZES",
     "PulseSequenceFigure",
     "panel_plot",

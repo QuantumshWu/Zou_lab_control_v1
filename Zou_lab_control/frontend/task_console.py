@@ -35,6 +35,7 @@ from PyQt5 import QtCore, QtWidgets
 from .live import (
     PANEL_CELL_PX,
     PANEL_CHROME_PX,
+    PANEL_DISPLAY_SCALE,
     PANEL_GAP_PX,
     PANEL_SIZES,
     panel_plot,
@@ -63,19 +64,14 @@ from .qt_fluent import (
     set_fluent_scale,
 )
 
-try:  # same guarded import as pulse_gui: the console degrades without matplotlib-qt
+try:  # guarded like pulse_gui: the console degrades without matplotlib-qt
     import matplotlib.pyplot as plt
-    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as _FigureCanvasQTAgg
-
-    class FigureCanvas(_FigureCanvasQTAgg):
-        """Canvas whose wheel events never leak into the surrounding scroll area."""
-
-        def wheelEvent(self, event):  # noqa: N802 - Qt naming
-            super().wheelEvent(event)
-            event.accept()
+    from .qt_canvas import EmbeddedFigureCanvas
+    if EmbeddedFigureCanvas is None:
+        raise ImportError("matplotlib qt canvas unavailable")
 except Exception:  # pragma: no cover - depends on the local matplotlib install
     plt = None
-    FigureCanvas = None
+    EmbeddedFigureCanvas = None
 
 
 TASK_FILES_ENV = "ZLC_TASK_DIR"
@@ -484,7 +480,7 @@ class PanelCard(FluentGroupBox):
 
     # ------------------------------------------------------------- plot lifecycle
     def _build_plot(self, value) -> None:
-        if FigureCanvas is None:
+        if EmbeddedFigureCanvas is None:
             raise RuntimeError("matplotlib Qt canvas is not available")
         self._teardown_plot()
         kind = self.config.kind
@@ -516,7 +512,9 @@ class PanelCard(FluentGroupBox):
             self.plotter = panel_plot(
                 np.arange(len(vec), dtype=float), vec, kind="1d", size=size,
                 labels=("Site", label, "Z"), relim_mode="tight")
-        self.canvas = FigureCanvas(self.plotter.fig)
+        # the figure is an ordinary full-size 300 dpi frontend figure; the canvas
+        # DISPLAYS it scaled (supersampled, exact interaction coordinates)
+        self.canvas = EmbeddedFigureCanvas(self.plotter.fig, display_scale=PANEL_DISPLAY_SCALE)
         self.canvas.draw()
         self.canvas.setFixedSize(self.canvas.sizeHint())
         self.canvas_holder.addWidget(self.canvas, alignment=QtCore.Qt.AlignCenter)

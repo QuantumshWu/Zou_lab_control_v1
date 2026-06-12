@@ -1052,15 +1052,20 @@ def test_panel_plot_spec_size_presets_keep_fonts_fixed():
     data area only (dpi -- and with it every font size -- never changes); unknown
     sizes/kinds and unreadably small combinations are rejected."""
 
-    from Zou_lab_control.frontend.live import PANEL_DPI, PANEL_SIZES, panel_plot_spec, panel_size_cells
+    from Zou_lab_control.frontend.live import (
+        PANEL_DISPLAY_SCALE, PANEL_SIZES, panel_plot_spec, panel_size_cells)
 
     assert PANEL_SIZES == ("2x1", "2x2", "3x1", "3x2", "4x1", "4x2")
     assert panel_size_cells("4x2") == (4, 2)
     small = panel_plot_spec("1d", "2x1")
     big = panel_plot_spec("1d", "4x2")
-    # one font tier for ALL panel sizes -- and it is the PANEL tier, smaller
-    # than the big-figure (notebook / pulse-preview) 300 dpi tier
-    assert big.dpi == small.dpi == PANEL_DPI < 300
+    # ONE font/dpi system for every frontend figure: panels never fork it.
+    # On-screen sizing is a DISPLAY concern (EmbeddedFigureCanvas display_scale).
+    assert big.dpi == small.dpi == 300
+    assert 0 < PANEL_DISPLAY_SCALE < 1
+    # the spec is in FIGURE pixels = display pixels / display_scale (supersampled)
+    one_to_one = panel_plot_spec("1d", "2x1", display_scale=1.0)
+    assert small.data_px[0] == round(one_to_one.data_px[0] / PANEL_DISPLAY_SCALE)
     assert big.data_px[0] > small.data_px[0] and big.data_px[1] > small.data_px[1]
     assert big.margins_px == small.margins_px     # design margins are size-invariant
     with pytest.raises(ValueError):
@@ -1088,6 +1093,13 @@ def test_task_console_cards_align_to_the_grid(monkeypatch):
         if card.canvas is not None:               # the canvas must FIT inside its card
             assert card.canvas.width() <= card.width()
             assert card.canvas.height() <= card.height()
+            # the figure renders FULL SIZE in the ONE 300-dpi design system and
+            # is shown scaled; under the high-DPI canvas path matplotlib stores
+            # the design dpi in _original_dpi and inflates fig.dpi by the ratio
+            # (the same thing a real high-DPI screen does to every figure).
+            fig = card.plotter.fig
+            assert getattr(fig, "_original_dpi", fig.dpi) == 300
+            assert card.canvas.width() < fig.get_size_inches()[0] * fig.dpi
     console.shutdown()
 
 

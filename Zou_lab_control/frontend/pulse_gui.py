@@ -74,20 +74,12 @@ from .qt_fluent import (
 )
 
 try:  # Matplotlib is already a frontend dependency, but keep import errors tidy.
-    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as _FigureCanvasQTAgg
     import matplotlib.pyplot as plt
-
-    class FigureCanvas(_FigureCanvasQTAgg):
-        """Preview canvas that CONSUMES wheel events.
-
-        The canvas lives inside the preview QScrollArea; without accepting the
-        Qt wheel event, a zoom scroll on the plot ALSO scrolled the parent
-        scroll area (the plot zoomed and slid away at the same time).  The
-        matplotlib zoom handler still receives the event via super()."""
-
-        def wheelEvent(self, event):  # noqa: N802 (Qt naming)
-            super().wheelEvent(event)
-            event.accept()
+    # The ONE figure-in-Qt wrapper (wheel isolation + optional display scale);
+    # the preview shows 1:1, so the default display_scale=1.0 applies.
+    from .qt_canvas import EmbeddedFigureCanvas as FigureCanvas
+    if FigureCanvas is None:
+        raise ImportError("matplotlib qt canvas unavailable")
 except Exception:  # pragma: no cover - depends on the local desktop environment.
     FigureCanvas = None
     plt = None
