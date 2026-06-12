@@ -349,9 +349,10 @@ class PanelCard(FluentGroupBox):
 
     # ------------------------------------------------------------- config edits
     def _on_title(self, text: str) -> None:
-        # the title lives on the CARD only -- panels carry no in-figure title
-        # (it would duplicate the card header and eat panel height)
         self.config.title = str(text)
+        if self.plotter is not None and getattr(self.plotter, "ax", None) is not None:
+            self.plotter.ax.set_title(self.config.title)
+            self.plotter.draw()
         self.changed.emit()
 
     def _on_place(self, key: str) -> None:
@@ -494,24 +495,26 @@ class PanelCard(FluentGroupBox):
             self.plotter = panel_plot(
                 data_x, arr.ravel(), kind="2d", size=size,
                 cmap=str(self.config.params.get("cmap", "inferno")),
-                labels=("X (px)", "Y (px)", ""))
+                labels=("X (px)", "Y (px)", ""), title=self.config.title or None)
         elif kind == "monitor":
             length = max(20, int(self.config.params.get("length", 300)))
             history = np.full(length, np.nan)
             self.plotter = panel_plot(
                 np.arange(length, dtype=float), history, kind="monitor", size=size,
-                labels=("Shots ago", label, "Z"), relim_mode="tight")
+                labels=("Shots ago", label, "Z"), relim_mode="tight",
+                title=self.config.title or None)
             self.plotter.roll(float(value))
         elif kind == "hist":
             self.plotter = panel_plot(
                 np.asarray(value, dtype=float), kind="hist", size=size,
                 bins=int(self.config.params.get("bins", 60)),
-                labels=("Value", "Shots", "Population"))
+                labels=("Value", "Shots", "Population"), title=self.config.title or None)
         else:  # 1d
             vec = np.asarray(value, dtype=float).reshape(-1)
             self.plotter = panel_plot(
                 np.arange(len(vec), dtype=float), vec, kind="1d", size=size,
-                labels=("Site", label, "Z"), relim_mode="tight")
+                labels=("Site", label, "Z"), relim_mode="tight",
+                title=self.config.title or None)
         # the figure is an ordinary full-size 300 dpi frontend figure; the canvas
         # DISPLAYS it scaled (supersampled, exact interaction coordinates)
         self.canvas = EmbeddedFigureCanvas(self.plotter.fig, display_scale=PANEL_DISPLAY_SCALE)

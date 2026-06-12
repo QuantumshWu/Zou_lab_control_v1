@@ -222,7 +222,15 @@ class BaseLivePlot:
         self.ax = create_axes_fixed(self.fig, self.spec.data_px, self.spec.margins_px)
         self.axes = self.ax
         if self.smart_ticks:
-            apply_smart_ticks(self.ax)
+            # cap the tick count by the DATA-AREA size so small (dashboard
+            # panel) axes never crowd their labels; the caps saturate at the
+            # stock 8 for full-size notebook figures.
+            data_w, data_h = self.spec.data_px
+            apply_smart_ticks(
+                self.ax,
+                max_ticks_x=max(4, min(8, int(data_w) // 130)),
+                max_ticks_y=max(4, min(8, int(data_h) // 90)),
+            )
         self.init_core()
         self._apply_title()
         self._install_state()
@@ -804,17 +812,17 @@ PANEL_SIZES = ("2x1", "2x2", "3x1", "3x2", "4x1", "4x2")
 PANEL_DISPLAY_SCALE = 0.7
 # All PANEL_* geometry below is in DISPLAY pixels (what the user sees / what
 # the host grid is built from); panel_plot_spec converts to figure pixels by
-# dividing by PANEL_DISPLAY_SCALE.  (left, right, top, bottom) margins around
-# the data area: panels carry NO in-figure title (the host card titles them),
-# so the top margin only clears the tick labels; the 2D kind pays extra right
-# margin for its side distribution + colorbar.
+# dividing by PANEL_DISPLAY_SCALE.  Margins follow the create_axes_fixed order
+# (LEFT, RIGHT, BOTTOM, TOP): bottom clears the x label + ticks, top clears the
+# in-figure title; the 2D kind pays extra right margin for its side
+# distribution + colorbar.
 PANEL_MARGINS = {
-    "2d": (72, 55, 25, 52),
-    "1d": (72, 26, 25, 52),
-    "monitor": (72, 26, 25, 52),
-    "hist": (72, 26, 25, 52),
+    "2d": (84, 55, 52, 50),
+    "1d": (84, 26, 52, 50),
+    "monitor": (84, 26, 52, 50),
+    "hist": (84, 26, 52, 50),
 }
-PANEL_CELL_PX = (300, 280)     # design grid-cell size (display px; layouts stay machine-portable)
+PANEL_CELL_PX = (300, 300)     # design grid-cell size (display px; layouts stay machine-portable)
 PANEL_GAP_PX = 8               # gap between grid cells (display px)
 PANEL_CHROME_PX = (20, 108)    # host-card overhead around the canvas (display px)
 PANEL_MIN_DATA_PX = 70         # below this the axes are unreadable -> reject the combo (display px)
@@ -878,7 +886,6 @@ def panel_plot(
     gap_px: int = PANEL_GAP_PX,
     chrome_px: tuple[int, int] = PANEL_CHROME_PX,
     display_scale: float = PANEL_DISPLAY_SCALE,
-    square: bool = False,
     **kwargs,
 ):
     """``plot()`` preset for dashboard panels: pick a kind and one of the
@@ -886,18 +893,12 @@ def panel_plot(
     plot (no display, no DataFigure -- the host embeds the figure through
     ``qt_canvas.EmbeddedFigureCanvas(fig, display_scale=...)``).
 
-    Panels carry no in-figure title (the host card titles them).  The 2D kind
-    defaults to NON-square extents (a camera frame keeps its aspect ratio); this
-    is the sanctioned internal Live2DDis use the plot() factory points to."""
+    Everything else IS the plot() factory -- including the design rule that 2D
+    figures are always SQUARE with the side distribution and colorbar aligned
+    (a non-square camera frame sits centred in the square extents)."""
 
     spec = panel_plot_spec(kind, size, cell_px=cell_px, gap_px=gap_px,
                            chrome_px=chrome_px, display_scale=display_scale)
-    if _normalize_kind(kind) == "2d":
-        x = _as_data_x(data_x)
-        y = _as_data_y(data_y, len(x))
-        labels = tuple(kwargs.pop("labels", ("X", "Y", "Z")))
-        plotter = Live2DDis(x, y, labels=labels, square=bool(square), spec=spec, **kwargs)
-        return plotter.show(display=False)
     return plot(data_x, data_y, kind=kind, spec=spec, display=False, data_figure=False, **kwargs)
 
 

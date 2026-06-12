@@ -1010,7 +1010,7 @@ editor.grab_screenshot(path, settle_ms=1000)        # 首选 helper
 # app.processEvents(); QtTest.QTest.qWait(1000); app.processEvents(); editor.grab().save(path)
 \end{codeblock}
 
-离屏截图可能漏字，所以截图只作视觉 QA；按钮文字、几何、状态仍要用 object-level 测试断言。更多规则见 \filepath{docs/MAINTAINER_NOTES.md}。
+离屏截图可能漏字，所以截图只作视觉 QA；按钮文字、几何、状态仍要用 object-level 测试断言。涉及可视化的改动必须用 \pyapi{devtools.capture\_user\_view("console"/"editor", out\_dir)} 验收：它在子进程里按 \pyapi{QT\_SCALE\_FACTOR} = 1.0/1.25/1.5 三档各渲染一次完整窗口（重现 Windows 显示缩放下用户真正看到的效果）并保存截图——DPR=1 的单张截图通过\tfocus{不算}通过。更多规则见 \filepath{docs/MAINTAINER_NOTES.md}。
 
 \section{我要改本手册}
 正文模板在 \filepath{Zou_lab_control/frontend/content/manual_templates/frontend_manual_zh.texbody}，示例图由 \filepath{Zou_lab_control/frontend/content/manuals.py} 的 \pyapi{generate_frontend_manual_figures} 生成。改完用 \pyapi{build_frontend_manual()} 重建 PDF。

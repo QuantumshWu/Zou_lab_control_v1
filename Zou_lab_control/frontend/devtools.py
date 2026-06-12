@@ -197,6 +197,85 @@ def demo_console(*, scale: float = 1.0, size=(1480, 980), seed: int = 11, shots:
     console.refresh_once()
     return console
 
+
+def capture_user_view(target: str, out_dir, *, scales=(1.0, 1.25, 1.5), size=(1480, 1000),
+                      shots: int = 60, settle_ms: int = 900, timeout: float = 300.0):
+    """Render ``target`` ("console" or "editor") AS THE USER SEES IT and save one
+    full-window screenshot per Windows display scale.
+
+    This is THE visual-acceptance interface: every UI/plot change must pass it,
+    not a DPR=1 screenshot.  Each scale runs in a SUBPROCESS with
+    ``QT_SCALE_FACTOR`` set (Qt reads it once at QApplication creation; the
+    offscreen platform honours it, reproducing scaled Windows screens), the
+    window settles ``settle_ms`` before grabbing (fonts/canvases render late),
+    and the saved PNGs are meant to be inspected as 1:1 pixel crops.
+
+    Returns ``{scale: Path}``.  Also runnable from a shell::
+
+        python -m Zou_lab_control.frontend.devtools --capture console --out shots/
+    """
+
+    import os
+    import subprocess
+    import sys
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    results: dict[float, Path] = {}
+    for scale in scales:
+        out_path = out_dir / f"{target}_sf{scale}.png"
+        env = dict(os.environ)
+        env["QT_QPA_PLATFORM"] = "offscreen"
+        env["QT_SCALE_FACTOR"] = str(scale)
+        command = [
+            sys.executable, "-m", "Zou_lab_control.frontend.devtools",
+            "--capture", str(target), "--out", str(out_path),
+            "--size", f"{int(size[0])}x{int(size[1])}",
+            "--shots", str(int(shots)), "--settle-ms", str(int(settle_ms)),
+        ]
+        result = subprocess.run(command, capture_output=True, text=True, env=env, timeout=timeout)
+        if result.returncode != 0 or not out_path.exists():
+            raise RuntimeError(
+                f"capture_user_view({target!r}, scale={scale}) failed:\n{result.stdout}\n{result.stderr}")
+        results[float(scale)] = out_path
+    return results
+
+
+def _capture_main(argv=None) -> int:
+    """CLI driver for capture_user_view's per-scale subprocesses."""
+
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Render a frontend GUI offscreen and screenshot it.")
+    parser.add_argument("--capture", required=True, choices=("console", "editor"))
+    parser.add_argument("--out", required=True)
+    parser.add_argument("--size", default="1480x1000")
+    parser.add_argument("--shots", type=int, default=60)
+    parser.add_argument("--settle-ms", type=int, default=900)
+    args = parser.parse_args(argv)
+
+    width, height = (int(v) for v in args.size.lower().split("x"))
+    from Zou_lab_control.frontend.qt_fluent import FluentWindow
+
+    if args.capture == "console":
+        body = demo_console(shots=args.shots, size=(width, height))
+        title = "TaskConsole@Zou lab"
+    else:
+        body = demo_editor(size=(width, height))
+        title = "PulseGUI@Zou lab"
+    window = FluentWindow(widget=body, title=title, hide_on_close=False)
+    window.adjustSize()
+    window.setFixedSize(window.size())
+    window.show()
+    settle(window, args.settle_ms)
+    if args.capture == "console":
+        body.refresh_once()
+        settle(window, args.settle_ms)
+    screenshot(window, args.out)
+    print(f"captured {args.capture} -> {args.out}")
+    return 0
+
+
 def capture_gallery(out_dir, *, settle_ms: int = 550) -> dict[str, Path]:
     """Render the editor in several states for a visual self-check sweep."""
 
@@ -216,4 +295,10 @@ def capture_gallery(out_dir, *, settle_ms: int = 550) -> dict[str, Path]:
     return paths
 
 
-__all__ = ["settle", "screenshot", "screenshot_tab", "demo_state", "demo_editor", "demo_console", "capture_gallery"]
+__all__ = ["settle", "screenshot", "screenshot_tab", "demo_state", "demo_editor", "demo_console",
+           "capture_gallery", "capture_user_view"]
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised through capture_user_view subprocesses
+    import sys as _sys
+    _sys.exit(_capture_main())
