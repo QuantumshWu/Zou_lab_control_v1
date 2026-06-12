@@ -1047,6 +1047,67 @@ def test_pulse_gui_scan_dot_retoggle_preserves_values(monkeypatch):
     assert editor.state.scan_table == [[100.0], [200.0], [300.0]]
 
 
+def test_pulse_gui_clear_all_resets_to_single_blank_1us_period(monkeypatch):
+    """The header Clear All button wipes the SCHEDULE (periods, delays, DA plans,
+    scan bindings, repeat bracket) down to one blank 1 us period with no channel on,
+    while keeping the hardware hookup (channel names/labels, visibility, bus wiring,
+    clk assignments)."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    editor = dt.demo_editor(size=(1480, 900))
+    before = editor.read_state()
+    assert len(before.periods) > 1 and before.scan_slots   # demo has real content to clear
+
+    editor.clear_all_button.click()
+    dt.settle(editor, 200)
+    state = editor.read_state()
+
+    assert len(state.periods) == 1
+    assert float(state.periods[0].duration) == 1.0 and state.periods[0].unit == "us"
+    assert not any(state.periods[0].states)
+    assert not any(float(v or 0) for v in state.delays.values())
+    assert not state.scan_slots and not state.scan_table
+    assert state.repeat_start is None and state.repeat_end is None
+    for bus, plan in state.analog_bus_modes.items():
+        for entry in plan:                                   # all-hold/None == not driven
+            assert (entry or {}).get("mode", "hold") == "hold", (bus, entry)
+            assert (entry or {}).get("value") is None, (bus, entry)
+    # hookup preserved
+    assert state.channels == before.channels
+    assert state.visible_channels == before.visible_channels
+    assert state.channel_labels == before.channel_labels
+    assert state.analog_buses == before.analog_buses
+    assert state.clk_channels == before.clk_channels
+
+
+def test_pulse_gui_selection_outlines_the_card_edge_not_child_widgets(monkeypatch):
+    """Click-to-select draws ONE rounded outline on the card's outer edge (painted in
+    FluentGroupBox.set_outline), never a stylesheet border -- an unscoped `border:`
+    appended to the card's styleSheet cascades to every child, boxing each inner
+    checkbox/lineedit (the 'ugly selection' report)."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.qt_fluent import ACCENT
+
+    editor = dt.demo_editor(size=(1480, 900))
+    container = editor.drag_container
+    cards = container.pulse_cards()
+
+    container.show_selection(card=1)
+    assert getattr(cards[1], "_zlc_outline", None) == ACCENT
+    assert all(getattr(c, "_zlc_outline", None) is None for i, c in enumerate(cards) if i != 1)
+    # no stylesheet border on the card (it would cascade to all children)
+    assert "border: 2px" not in cards[1].styleSheet()
+
+    container.show_selection(card=None)
+    assert all(getattr(c, "_zlc_outline", None) is None for c in cards)
+
+
 def test_pulse_gui_differing_bus_member_delays_survive_read_state(monkeypatch):
     """Per-member DAC-bus delays (set from the notebook API, valid in saved JSON)
     must NOT be silently flattened by the GUI's first read_state.

@@ -1100,10 +1100,9 @@ class PulseDragContainer(QtWidgets.QWidget):
         painter.end()
         drag.setPixmap(ghost)
         drag.setHotSpot(QtCore.QPoint(ghost.width() // 2, _px(16)))
-        old_style = widget.styleSheet()
-        widget.setStyleSheet(old_style + "; border: 2px solid #808080;")
+        widget.set_outline("#808080")      # whole-card edge marker for the drag source
         drag.exec_(QtCore.Qt.MoveAction)
-        widget.setStyleSheet(old_style)
+        widget.set_outline(None)
         self.insert_indicator.hide()
         self.update_period_titles()
 
@@ -1206,13 +1205,11 @@ class PulseDragContainer(QtWidgets.QWidget):
         """Highlight one period card (border) or one gap (persistent indicator)."""
         self._selected_card = card
         self._selected_gap = gap
+        # outline drawn on the card's outer edge (FluentGroupBox.set_outline) -- a
+        # stylesheet border here would cascade to every child widget inside the card.
         cards = self.pulse_cards()
         for index, widget in enumerate(cards):
-            base = widget.styleSheet().split("/*sel*/")[0]
-            if card is not None and index == card:
-                widget.setStyleSheet(base + f"/*sel*/; border: 2px solid {ACCENT};")
-            else:
-                widget.setStyleSheet(base)
+            widget.set_outline(ACCENT if (card is not None and index == card) else None)
         if gap is not None:
             items_pos = self._items_pos_of_period_gap(gap)
             self._show_insert_indicator(items_pos)
@@ -1768,9 +1765,17 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self.label_name.setAlignment(QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft)
         self.summary = FluentLineEdit("")
         self.summary.setEnabled(False)
+        self.clear_all_button = FluentButton("Clear All", color=ORANGE)
+        self.clear_all_button.setToolTip(
+            "Reset the schedule: remove every period and every channel delay, leaving one "
+            "blank 1 µs period with no channel on.\n"
+            "Channel names, visibility and clk assignments are kept."
+        )
+        self.clear_all_button.clicked.connect(self._clear_all)
         header.addWidget(self.status_dot)
         header.addWidget(self.label_name)
         header.addWidget(self.summary, 1)
+        header.addWidget(self.clear_all_button)
         root.addWidget(header_frame)
 
         self.tabs = FluentTabWidget()
@@ -2136,6 +2141,27 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         # the run/file state explicitly right after, overriding this.
         self._mark_dirty()
         self._update_summary()
+
+    def _clear_all(self) -> None:
+        """Header Clear All: reset the SCHEDULE to a single blank 1 us period.
+
+        Cleared: all periods, all channel/bus delays, DA bus plans, scan bindings +
+        table, and the repeat bracket (they all describe the schedule being wiped).
+        Kept: channel names/labels, visibility, bus wiring and clk assignments --
+        those describe the hardware hookup, not the pulse."""
+
+        state = self.read_state()
+        blank = PulseTableState(
+            channels=list(state.channels),
+            periods=[PulsePeriod(1.0, tuple(0 for _ in state.channels), unit="us")],
+            name=state.name,
+            time_step_ns=state.time_step_ns,
+            visible_channels=list(state.visible_channels),
+            channel_labels=dict(state.channel_labels),
+            analog_buses={bus: list(members) for bus, members in state.analog_buses.items()},
+            clk_channels=list(state.clk_channels),
+        )
+        self.load_state(blank)
 
     def _clear_layout(self, layout: QtWidgets.QLayout) -> None:
         while layout.count():

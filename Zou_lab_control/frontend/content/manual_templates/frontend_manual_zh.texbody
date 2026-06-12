@@ -777,7 +777,8 @@ DAC 值与 duration 两类槽\tfocus{可以在同一轮里一起扫}（通道延
 \begin{itemize}
   \item \tfocus{Sync（橙色）}：把"sequencer 上实际应用的脉冲"拉回编辑器。当你在 notebook 里用 \pyapi{PulseController}（\pyapi{on_pulse}/\pyapi{set_channel_delay} 等）改了设备而 GUI 没跟上时，点一下即恢复一致——服务端在每次成功 prepare 时记录源 payload，GUI 与 API 读的是同一份。
   \item \tfocus{UNSYNCED（\pyapi{On Pulse*} 星号 + 橙色状态点）}：设备在 RUNNING/PREPARED 状态下，\tfocus{任何}编辑（duration/delay/DA/scan/clk/显隐/载入……）都会给 On Pulse 按钮加上 confocal 同款的\tfocus{星号}并把\tfocus{标题栏状态点}变橙——提示"设备上跑的已不是你眼前的参数，按一下应用"。按钮本身\tfocus{保持绿色}（颜色不用于表达状态，避免与 Remove/Load/Sync 的常驻橙色混淆）。若把修改改回原样，星号与橙点自动消失；重新 On Pulse 即清除。Save 的 \pyapi{Save*} 黄色+星号语义表示"未保存到文件"，与运行状态相互独立。
-  \item \tfocus{点选 period / 中缝}：单击一张 period 卡片（出现高亮边框）或两张卡片之间的空隙（出现竖线指示），Add Period 就插到所选位置、Remove 删除所选；再点一次取消选择；无选择时维持旧行为（加/删最后一个）。扫描 slot 绑定、DAC 总线计划与 repeat bracket 会随中间插入/删除自动重定位。
+  \item \tfocus{点选 period / 中缝}：单击一张 period 卡片（\tfocus{整张卡片的外缘}出现一圈圆角描边——只描卡片边缘，不影响卡内任何控件）或两张卡片之间的空隙（出现竖线指示），Add Period 就插到所选位置、Remove 删除所选；再点一次取消选择；无选择时维持旧行为（加/删最后一个）。扫描 slot 绑定、DAC 总线计划与 repeat bracket 会随中间插入/删除自动重定位。
+  \item \tfocus{Clear All（标题栏右端，橙色）}：一键把\tfocus{日程}清空——删除所有 period 与所有通道/总线延时，只留下\tfocus{一个 1 \textmu s 的空白 period}（没有任何通道为 on，DA 总线为 Hold 空闲）；扫描绑定、扫描表与 repeat bracket 同时清除。\tfocus{保留}的是硬件接线层信息：通道名/语义标签、显示/隐藏状态、DA 总线分组与 clk 指派。清空属于普通编辑：会照常触发 \pyapi{Save*}（未保存）与 UNSYNCED 星号，不会自动写盘或上传——从零搭一个新脉冲前先点它最方便。
   \item \tfocus{单 period 保护}：只剩一个 period 时 Remove 被禁用（脉冲表至少要有一个 period）。
   \item \tfocus{拖动排序}：拖动时光标下有半透明卡片缩略图，插入位置竖线为覆盖层（不再引起整行重排抖动），拖到视口边缘会自动滚动——后面的 period 始终可达。
   \item \tfocus{预览横轴自动加宽}：与纵轴的行块一致，每 5 个 period 增加一个基础宽度块，最多 3 倍（\pyapi{live.PULSE_X_PERIODS_PER_BLOCK} / \pyapi{PULSE_X_MAX_WIDTH_FACTOR} 可配置）。深度缩放下刻度标签按间距自适应精度，不再退化成一排相同的 "8ms"。
@@ -804,7 +805,7 @@ ed = PulseSequenceEditor()        # 空白脉冲表
 ed.show(); app.exec_()
 \end{codeblock}
 
-打开后默认停在 \tfocus{Edit} 页。顶部三个标签 \pyapi{Edit / Preview / Scan}，顶部状态条显示可见数、period 数、step、总时长等。
+打开后默认停在 \tfocus{Edit} 页。顶部三个标签 \pyapi{Edit / Preview / Scan}，顶部状态条显示可见数、period 数、step、总时长等；状态条右端是 \pyapi{Clear All} 按钮（一键清空日程到一个 1 \textmu s 的空白 period，通道名/显隐/总线分组/clk 指派保留——从零开始搭新脉冲时先点它）。
 
 \section{第 1 步：理解“一段就是一张卡片”}
 脉冲序列不是网格表，而是一排\tfocus{周期卡片（period）}，每张卡是一段持续时间。中间区域横向排着 \pyapi{Period 1/5}、\pyapi{Period 2/5}……每张卡上有这一段的时长、单位、和每条 channel 的勾选框。时间从左到右流动。

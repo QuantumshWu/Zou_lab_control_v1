@@ -502,6 +502,31 @@ class FluentGroupBox(QtWidgets.QGroupBox):
         if shadow:
             add_fluent_shadow(self)
 
+    def set_outline(self, color: str | None) -> None:
+        """Draw (color) or clear (None) a 2 px rounded outline on THIS card's outer
+        edge, painted in paintEvent.  Never do this via stylesheet: an unscoped
+        ``border:`` declaration appended to the widget's styleSheet cascades to every
+        CHILD widget, so each inner checkbox/lineedit grew its own box."""
+        value = str(color) if color else None
+        if getattr(self, "_zlc_outline", None) != value:
+            self._zlc_outline = value
+            self.update()
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        color = getattr(self, "_zlc_outline", None)
+        if color:
+            painter = QtGui.QPainter(self)
+            painter.setRenderHint(QtGui.QPainter.Antialiasing)
+            pen = QtGui.QPen(QtGui.QColor(color))
+            pen.setWidthF(2.0)
+            painter.setPen(pen)
+            painter.setBrush(QtCore.Qt.NoBrush)
+            radius = float(_radius())
+            # inset by the half pen width so the stroke hugs the card edge unclipped
+            rect = QtCore.QRectF(self.rect()).adjusted(1.0, 1.0, -1.0, -1.0)
+            painter.drawRoundedRect(rect, radius, radius)
+
 
 class FluentButton(QtWidgets.QPushButton):
     def __init__(self, text: str = "", parent=None, *, color: str = ACCENT):
