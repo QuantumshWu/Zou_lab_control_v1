@@ -328,8 +328,21 @@ class PulseTableState:
             if kind == "duration":
                 return self.periods[int(target)].duration_ns(slots=slots) / scale
             if kind == "dac":
-                # SIGNED value at the period start (0 = 0 V), like every user-facing DAC value
+                # SIGNED value (0 = 0 V), like every user-facing DAC value.  The bound
+                # field is the period's OWN target: an edge steps to it at the period
+                # start, a RAMP reaches it at the period END -- so read the plan entry's
+                # value, not the period-start (carried-in) level, which for a ramp is the
+                # PREVIOUS period's value.  Only a hold (no value of its own) falls back
+                # to the carried-in level.
                 bus, period_index = target.split("@", 1)
+                plan = self.analog_bus_plan(bus)
+                entry = plan[int(period_index)] if int(period_index) < len(plan) else {}
+                value = entry.get("value")
+                if str(entry.get("mode", "hold")).strip().lower() in ("edge", "ramp") and value is not None:
+                    slots = dict(slots)
+                    if is_slot_ref(value):   # already bound elsewhere: its reference value
+                        return float(slots.get(str(value).strip(), 0.0))
+                    return float(value)
                 return float(self.analog_bus_value_at_period_start(int(period_index), bus))
         except Exception:
             pass
@@ -398,7 +411,15 @@ class PulseTableState:
         elif slot.kind == "dac":
             bus, period_index = slot.dac_bus, slot.dac_period
             plan = self.analog_bus_plan(bus)
-            plan[period_index] = {"mode": "edge", "value": var}
+            # PRESERVE the period's waveform mode: a scanned EDGE steps to the scanned
+            # value, a scanned RAMP ramps (from the carried-in value) TO the scanned value
+            # -- both are hardware-seamless (the segment's stop endpoint reads the scan
+            # slot at runtime via stop_value_select; see _pulse_table_bus_segments and the
+            # RTL's dual start/stop selects).  Only a HOLD (no value of its own) becomes
+            # an edge when bound.  This used to force "edge" and silently destroyed a
+            # ramp the moment its dot was clicked.
+            mode = str(plan[period_index].get("mode", "hold")).strip().lower() if period_index < len(plan) else "hold"
+            plan[period_index] = {"mode": mode if mode == "ramp" else "edge", "value": var}
             self.analog_bus_modes[bus] = plan
 
     def _clear_slot_binding(self, index: int, restore: float | str | None) -> None:
@@ -414,7 +435,15 @@ class PulseTableState:
             bus, period_index = slot.dac_bus, slot.dac_period
             plan = self.analog_bus_plan(bus)
             if period_index < len(plan) and str(plan[period_index].get("value")) == var:
-                plan[period_index] = {"mode": "hold", "value": None}
+                # Unbinding keeps the period's waveform mode (edge stays edge, ramp stays
+                # ramp) and restores a concrete value: the caller's ``restore`` (the GUI
+                # remembers the pre-binding text) or, failing that, the slot's nominal.
+                mode = str(plan[period_index].get("mode", "hold")).strip().lower()
+                value = restore if restore is not None else slot.nominal
+                if mode in ("edge", "ramp") and value is not None:
+                    plan[period_index] = {"mode": mode, "value": value}
+                else:
+                    plan[period_index] = {"mode": "hold", "value": None}
                 self.analog_bus_modes[bus] = plan
 
     def _renumber_slot_bindings(self) -> None:

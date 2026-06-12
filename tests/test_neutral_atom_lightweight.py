@@ -2112,6 +2112,9 @@ def test_pulse_table_state_compiles_pair_array_scan_to_full_40ch_template():
     na.validate_pulse_streamer_program(program, max_edges=1024, max_scan_points=1024, tick_width=32, channel_count=40)
 
 
+from Zou_lab_control.neutral_atom.timing.pulse_table import ScanSlot as _ScanSlot
+
+
 def _rtl_bus_held_value(program, bus_index, tick, scan_point, *, bus_width=10):
     """Python re-implementation of the RTL bus engine's held DAC value.
 
@@ -2121,10 +2124,15 @@ def _rtl_bus_held_value(program, bus_index, tick, scan_point, *, bus_width=10):
     effective start tick <= ``tick``.  The effective tick applies the segment's
     affine coefficients to the current scan point (so a scanned duration moves
     the segment).  For an edge/hold segment the RTL holds ``vstop`` (the STOP
-    endpoint), so a held value with ``stop_value_select = j+1`` reads the low
-    ``bus_width`` bits of scan slot ``j`` (so the DAC value tracks the scan).
-    Together this models the simultaneous DA-value + duration + delay scan.
-    """
+    endpoint); a RAMP segment inside its [eff_start, eff_stop) window is the
+    Bresenham staircase from vstart to vstop (floor line-tracking: after k ticks
+    the value has moved floor(k*|delta|/span) codes -- the same integer staircase
+    the RTL stepper produces and the preview draws), landing on vstop at
+    eff_stop.  EITHER endpoint may read scan slot j at runtime via its select
+    (``value_select`` for the start, ``stop_value_select`` for the stop), so a
+    ramp can go from a scanned level and/or TO a scanned level -- the edge+ramp
+    DAC scan.  Together this models the simultaneous DA-value (edge AND ramp)
+    + duration + delay scan."""
 
     from Zou_lab_control.neutral_atom.devices.sequencer import _apply_affine_ticks
 
@@ -2132,11 +2140,19 @@ def _rtl_bus_held_value(program, bus_index, tick, scan_point, *, bus_width=10):
     frac = int(getattr(program, "scan_coeff_frac_bits", 8))
     point = list(program.scan_points[scan_point]) if program.scan_points else []
 
-    def eff_start(seg):
-        coeffs = getattr(seg, "start_tick_coeffs", None)
+    def eff(base, coeffs):
         if coeffs and point:
-            return _apply_affine_ticks(int(seg.start_tick), coeffs, point, frac)
-        return int(seg.start_tick)
+            return _apply_affine_ticks(int(base), coeffs, point, frac)
+        return int(base)
+
+    def eff_start(seg):
+        return eff(seg.start_tick, getattr(seg, "start_tick_coeffs", None))
+
+    def endpoint(seg, *, stop):
+        sel = int(getattr(seg, "stop_value_select" if stop else "value_select", 0) or 0)
+        if sel:
+            return int(point[sel - 1]) & mask
+        return int(seg.stop_value if stop else seg.start_value) & mask
 
     segments = sorted(
         (s for s in (program.bus_segments or []) if int(s.bus_index) == int(bus_index)),
@@ -2144,15 +2160,17 @@ def _rtl_bus_held_value(program, bus_index, tick, scan_point, *, bus_width=10):
     )
     value = 1 << (bus_width - 1)   # the bus rests at BUS_SAFE_VALUE (mid code = 0 V)
     for seg in segments:
-        if eff_start(seg) > tick:
+        s_eff = eff_start(seg)
+        if s_eff > tick:
             break
-        # edge/hold holds vstop in the RTL -> use the STOP endpoint select (which for
-        # an edge/hold segment equals value_select, since start==stop).
-        sel = int(getattr(seg, "stop_value_select", getattr(seg, "value_select", 0)))
-        if sel:
-            value = int(point[sel - 1]) & mask
+        e_eff = eff(seg.stop_tick, getattr(seg, "stop_tick_coeffs", None))
+        vstart, vstop = endpoint(seg, stop=False), endpoint(seg, stop=True)
+        if str(seg.mode).lower() == "ramp" and e_eff > s_eff and tick < e_eff:
+            span, delta, k = e_eff - s_eff, abs(vstop - vstart), tick - s_eff
+            moves = min(delta, (k * delta) // span)
+            value = vstart + (moves if vstop >= vstart else -moves)
         else:
-            value = int(seg.stop_value) & mask
+            value = vstop
     return value
 
 
@@ -2205,6 +2223,153 @@ def test_dac_value_scan_behavioral_model_tracks_scanned_code():
     # Consecutive scan points really produce different DAC outputs (seamless sweep).
     sweep = [_rtl_bus_held_value(program, bus, int(seg.start_tick), p) for p in range(len(codes))]
     assert sweep == codes
+
+
+def test_dac_scan_bind_preserves_ramp_mode_and_unbind_restores():
+    """Clicking the DAC scan dot on a RAMP period must scan the RAMP (its stop endpoint),
+    NOT silently rewrite the period to an edge; unbinding restores the ramp with a
+    concrete value (the caller's restore, else the slot nominal).  Regression guard:
+    _apply_slot_binding used to force {"mode": "edge"} unconditionally."""
+
+    state = na.PulseTableState(
+        name="rb", channels=["b0", "b1", "t"],
+        channel_labels={"b0": "da_x[0]", "b1": "da_x[1]"},
+        visible_channels=["b0", "b1", "t"], time_step_ns=20.0,
+        periods=[na.PulsePeriod(200, (0, 0, 1), unit="ns"), na.PulsePeriod(400, (0, 0, 0), unit="ns")],
+        analog_bus_modes={"da_x": [{"mode": "edge", "value": 1}, {"mode": "ramp", "value": -2}]})
+
+    idx = state.bind_field("dac", "da_x@1")
+    entry = state.analog_bus_plan("da_x")[1]
+    assert entry["mode"] == "ramp" and str(entry["value"]) == f"s{idx}"
+    assert state.scan_slots[idx].nominal == -2  # nominal read from the ramp target
+
+    # an edge period still binds as an edge; a hold becomes an edge (it has no own value)
+    idx0 = state.bind_field("dac", "da_x@0")
+    assert state.analog_bus_plan("da_x")[0]["mode"] == "edge"
+
+    state.unbind_slot(idx0)
+    state.unbind_slot(state.slot_index_for("dac", "da_x@1"))
+    plan = state.analog_bus_plan("da_x")
+    assert plan[1] == {"mode": "ramp", "value": -2}, "unbind keeps the ramp + restores the nominal"
+    assert plan[0]["mode"] == "edge" and plan[0]["value"] == 1
+
+
+def test_dac_ramp_endpoint_scan_compiles_and_tracks_every_point():
+    """End-to-end edge+RAMP DAC scan: a ramp whose STOP endpoint is a scan slot compiles
+    to a ramp segment with stop_value_select = slot+1, validates, packs, and -- per the
+    faithful RTL bus model -- produces, at EVERY scan point, the Bresenham staircase from
+    the carried-in level to THAT point's code, landing exactly on it at the ramp end."""
+
+    state = na.PulseTableState(
+        name="ramp_scan", channels=["b0", "b1", "t"],
+        channel_labels={"b0": "da_x[0]", "b1": "da_x[1]"},
+        visible_channels=["b0", "b1", "t"], time_step_ns=20.0,
+        periods=[na.PulsePeriod(200, (0, 0, 1), unit="ns"),
+                 na.PulsePeriod(400, (0, 0, 0), unit="ns"),
+                 na.PulsePeriod(200, (0, 0, 0), unit="ns")],
+        analog_bus_modes={"da_x": [{"mode": "edge", "value": 1},
+                                   {"mode": "ramp", "value": "s0"},
+                                   {"mode": "hold", "value": None}]},
+        scan_slots=[_ScanSlot(kind="dac", target="da_x@1", unit="", nominal=0.0)],
+        scan_table=[[-2.0], [0.0], [1.0]])
+
+    program = na.compile_pulse_table_scan_runtime_program(
+        state, channels=list(state.channels), clock_hz=50_000_000, scan_table=state.scan_table)
+    na.validate_pulse_streamer_program(program, max_edges=1024, max_scan_points=1024,
+                                       tick_width=32, channel_count=3, bus_count=4, bus_width=2)
+    from fpga.pulse_streamer.host import image as img
+    img.pack_program(program, img.StreamerParams())   # packs cleanly
+
+    ramps = [s for s in (program.bus_segments or []) if s.mode == "ramp"]
+    assert len(ramps) == 1
+    seg = ramps[0]
+    zero = 1 << (2 - 1)                                # 2-bit bus: signed 0 -> code 2
+    assert int(seg.value_select) == 0 and int(seg.start_value) == 1 + zero  # carried edge 1
+    assert int(seg.stop_value_select) == 1             # stop endpoint reads scan slot 0
+    s_tick, e_tick = int(seg.start_tick), int(seg.stop_tick)
+    assert (s_tick, e_tick) == (10, 30)                # period-1 window in ticks
+
+    for point_index, signed in enumerate([-2.0, 0.0, 1.0]):
+        code = int(signed) + zero
+        bus = int(seg.bus_index)
+        # before the ramp: the carried edge level; at the ramp end (and after): the code
+        assert _rtl_bus_held_value(program, bus, s_tick - 1, point_index, bus_width=2) == 1 + zero
+        assert _rtl_bus_held_value(program, bus, e_tick, point_index, bus_width=2) == code
+        assert _rtl_bus_held_value(program, bus, e_tick + 5, point_index, bus_width=2) == code
+        # inside the ramp: the Bresenham staircase floor((k*delta)/span) from the start
+        vstart, span, delta = 1 + zero, e_tick - s_tick, abs(code - (1 + zero))
+        for k in (1, span // 2, span - 1):
+            expect = vstart + ((min(delta, (k * delta) // span)) if code >= vstart else -(min(delta, (k * delta) // span)))
+            assert _rtl_bus_held_value(program, bus, s_tick + k, point_index, bus_width=2) == expect
+
+
+def test_dac_ramp_from_scanned_edge_carries_start_select():
+    """The OTHER direction: an edge bound to a slot followed by a literal-target ramp.
+    The ramp must START from the scanned level at runtime -- its value_select (start
+    endpoint) carries the slot, while the stop endpoint stays literal."""
+
+    state = na.PulseTableState(
+        name="carry", channels=["b0", "b1", "t"],
+        channel_labels={"b0": "da_x[0]", "b1": "da_x[1]"},
+        visible_channels=["b0", "b1", "t"], time_step_ns=20.0,
+        periods=[na.PulsePeriod(200, (0, 0, 1), unit="ns"), na.PulsePeriod(400, (0, 0, 0), unit="ns")],
+        analog_bus_modes={"da_x": [{"mode": "edge", "value": "s0"},
+                                   {"mode": "ramp", "value": 1}]},
+        scan_slots=[_ScanSlot(kind="dac", target="da_x@0", unit="", nominal=0.0)],
+        scan_table=[[-2.0], [1.0]])
+
+    program = na.compile_pulse_table_scan_runtime_program(
+        state, channels=list(state.channels), clock_hz=50_000_000, scan_table=state.scan_table)
+    ramps = [s for s in (program.bus_segments or []) if s.mode == "ramp"]
+    assert len(ramps) == 1
+    seg = ramps[0]
+    zero = 1 << (2 - 1)
+    assert int(seg.value_select) == 1, "ramp start endpoint must carry the scanned slot"
+    assert int(seg.stop_value_select) == 0 and int(seg.stop_value) == 1 + zero
+    # model: at each point the ramp starts FROM that point's scanned code
+    for point_index, signed in enumerate([-2.0, 1.0]):
+        code = int(signed) + zero
+        assert _rtl_bus_held_value(program, int(seg.bus_index), int(seg.start_tick) - 1,
+                                   point_index, bus_width=2) == code
+
+
+def test_delayed_scanned_ramp_capacity_is_enforced():
+    """A ramp on a DELAYED bus is the one realistic per-DA-bit event-FIFO stressor: every
+    Bresenham stepping tick inside the delay window is an in-flight event.  The validator
+    must reject when min(delay, span, swing) exceeds the per-bit FIFO depth -- with the
+    full-scale worst case for a SCANNED endpoint -- and pass the same ramp undelayed or
+    delay-bounded."""
+
+    import dataclasses
+    import pytest
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeBusSegment, RuntimeBusDelay
+
+    def prog(span_ticks, delay_ticks, *, sel=1):
+        ticks = [0, span_ticks + 100]
+        return na.RuntimeSequenceProgram(
+            sequence_id=1, sequence_name="r", clock_hz=50e6, channels=["a"],
+            ticks=ticks, masks=[1, 0], duration=(span_ticks + 100) * 20.0, trigger_count=0,
+            slot_count=1, slot_kinds=["dac"],
+            tick_slot_coeffs=[[0], [0]], loop_end_slot_coeffs=[0],
+            scan_points=[[100], [900]],
+            bus_segments=[RuntimeBusSegment(0, 10, 10 + span_ticks, 512, 0, "ramp", "da_x",
+                                            0, None, None, stop_value_select=sel)],
+            bus_delays=[RuntimeBusDelay(0, delay_ticks)] if delay_ticks else None,
+        )
+
+    kw = dict(max_edges=1024, max_scan_points=16, tick_width=32, channel_count=1)
+    # long scanned ramp + long delay -> full-scale worst-case in-flight bound -> reject
+    with pytest.raises(ValueError, match="DELAYED ramp"):
+        na.validate_pulse_streamer_program(prog(2000, 5000), **kw)
+    # the same ramp UNDELAYED passes
+    na.validate_pulse_streamer_program(prog(2000, 0), **kw)
+    # a short delay bounds the window -> passes (min(d, span, delta) <= depth)
+    na.validate_pulse_streamer_program(prog(2000, 64), **kw)
+    # a literal small swing passes even with a long delay (delta bounds it)
+    small = prog(2000, 5000, sel=0)
+    small.bus_segments[0] = dataclasses.replace(
+        small.bus_segments[0], start_value=512, stop_value=512 + 40, stop_value_select=0)
+    na.validate_pulse_streamer_program(small, **kw)
 
 
 def test_dac_plus_duration_scan_behavioral_model_value_and_timing():

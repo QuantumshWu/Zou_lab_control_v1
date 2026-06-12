@@ -2824,3 +2824,48 @@ def test_scan_tab_ingests_py_npy_pulse_and_program(monkeypatch, tmp_path):
                                      "scan_points": [[50], [100]]}), encoding="utf-8")
     editor._ingest_scan_program_file(Path(prog_json))
     assert [row[0] for row in editor._scan_tables["loaded"]] == [1000.0, 2000.0]
+
+
+def test_pulse_gui_dac_dot_on_ramp_period_scans_the_ramp(monkeypatch):
+    """Clicking the DAC scan dot on a RAMP period must keep the period a RAMP (scanning
+    its stop endpoint), show s0 in the locked value box, and unbinding must restore the
+    ramp with its original value.  Regression guard for the real GUI bug: binding used
+    to flip the mode combo to Edge, so a ramp could never be scanned from the GUI."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.neutral_atom.timing.pulse_table import PulsePeriod, PulseTableState
+
+    editor = dt.demo_editor(size=(1480, 900), bind_scans=False)
+    dt.settle(editor, 200)
+    state = PulseTableState(
+        name="rampgui", channels=["b0", "b1", "t"],
+        channel_labels={"b0": "da_x[0]", "b1": "da_x[1]"},
+        visible_channels=["b0", "b1", "t"], time_step_ns=20.0,
+        periods=[PulsePeriod(200, (0, 0, 1), unit="ns"), PulsePeriod(400, (0, 0, 0), unit="ns")],
+        analog_bus_modes={"da_x": [{"mode": "edge", "value": 1}, {"mode": "ramp", "value": -2}]})
+    editor.load_state(state)
+    dt.settle(editor, 150)
+
+    card = editor.drag_container.pulse_cards()[1]
+    combo, edit = card.bus_mode_combos["da_x"], card.bus_value_edits["da_x"]
+    assert "ramp" in combo.currentText().lower()
+
+    editor._toggle_dac_scan(card, "da_x")          # bind: the dot click
+    dt.settle(editor, 100)
+    card = editor.drag_container.pulse_cards()[1]
+    combo, edit = card.bus_mode_combos["da_x"], card.bus_value_edits["da_x"]
+    assert "ramp" in combo.currentText().lower(), "binding must NOT flip the ramp to edge"
+    assert edit.text().startswith("s"), "the bound ramp endpoint shows its slot variable"
+    st = editor.read_state()
+    assert st.analog_bus_plan("da_x")[1]["mode"] == "ramp"
+    assert st.scan_slots and st.scan_slots[0].kind == "dac"
+
+    editor._toggle_dac_scan(card, "da_x")          # unbind: second click restores
+    dt.settle(editor, 100)
+    card = editor.drag_container.pulse_cards()[1]
+    combo, edit = card.bus_mode_combos["da_x"], card.bus_value_edits["da_x"]
+    assert "ramp" in combo.currentText().lower()
+    assert edit.text() == "-2", "unbind restores the original ramp target"
+    assert not editor.read_state().scan_slots

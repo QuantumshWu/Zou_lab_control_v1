@@ -50,6 +50,10 @@ They were written to settle the "emCCD 2nd pulse = 40 ms" hardware report. The c
   last session in `fpga/build/state/vivado_axi_session.log`; see the decode snippet in
   the git history of this investigation.)
 
+
+- **`tb_ramp_scan.v`** — REAL-engine proof of the edge+RAMP DAC scan: a ramp whose STOP endpoint reads scan slot 0 at runtime (`stop_value_select=1`), two STEEP scan points; every tick of both points must equal the Bresenham staircase `v=vstart+floor(k*delta/span)` (RAMP-SCAN-OK).
+- **`tb_t_ff.v` + `replay_t.vh`/`_gen_replay_t.py`** — FULL-CHAIN first-frame regression: real top + real engine + the five real BRAM IPs, fed a T.json-structured image packed by the REAL pack_program through SAFE->upload->LOAD->FIRE twice; every frame of da_bias_y + cooling must be identical (T-FF-OK).  NOTE: the TB passes the streamer_config.json geometry (BANK_SIZE=512) to the top -- the default 2048 would mis-place the register regions exactly like a host/bitstream geometry mismatch.
+
 ## Running them
 
 ```sh
