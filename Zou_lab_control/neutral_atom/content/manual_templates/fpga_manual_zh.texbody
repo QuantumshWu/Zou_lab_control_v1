@@ -333,6 +333,7 @@ FPGA 侧只有一个入口 \filepath{fpga\textbackslash build\_and\_program.bat}
 \begin{enumerate}
   \item 主机校验程序：\pyapi{validate_pulse_streamer_program} 检查边沿/扫描点/位宽/通道不越界，并校验\tfocus{全局有效 tick 单调}（扫描不会把合并后的边沿顺序打乱；会打乱顺序的扫描被拒绝，而不是悄悄丢点）。
   \item \pyapi{host.image.pack_program} 把整张程序打包成 32-bit BRAM 映像：CTRL 标量 + 三块并行边沿表 + 2-bank 扫描窗口 + 总线段映像。
+  \item \tfocus{寄存器布局握手}：在写任何寄存器之前，主机读 CTRL 字 63——顶层把它\tfocus{硬连线}成布局版本号 \pyapi{ZLC_LAYOUT_ID}（写进去的值永远读不回来）。它必须等于主机的 \pyapi{image.REGISTER_LAYOUT_ID}，否则 prepare 立刻报错"重建 bitstream 并重启 server"。这一步杜绝\tfocus{主机与 bitstream 寄存器布局不匹配的静默混跑}——例如 \pyapi{CLK_ENABLE} 从字 46 移到字 20 的那次变更：不匹配时 clk 掩码写进死字、真正的掩码残留旧值，\pyapi{da_clk} 选通失控、DAC 输出第一帧错乱。旧 bitstream 在字 63 返回上电值 0，必然触发清晰报错。\tfocus{任何改 CtrlWords/寄存器区布局的提交必须同时 bump 两边的 ID。}server 启动的 \pyapi{axi_self_test} 也先做同样的校验。
   \item \pyapi{prepare}：发 SAFE $\rightarrow$ AXI 写映像 $\rightarrow$ arm 两个扫描 bank（写 \pyapi{BANK_READY}/\pyapi{BANK*_CHUNK}）$\rightarrow$ 发 LOAD（等 \pyapi{STATUS_LOADED}）。
   \item \pyapi{fire}：发 FIRE；对流式/重复扫描，启动后台回填线程。
   \item \pyapi{wait_done}：轮询 STATUS（DONE 位），并跟随 CURSOR 回填空出来的 bank。\pyapi{repeat_forever} 永不置 DONE，所以必须给 timeout 或主动 stop。

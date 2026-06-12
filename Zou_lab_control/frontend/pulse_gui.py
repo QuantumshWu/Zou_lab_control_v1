@@ -2883,17 +2883,82 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         try:
             start = str(Path(self.address_str).parent if self.address_str else _pulse_files_dir())
             path, _ = QtWidgets.QFileDialog.getOpenFileName(
-                self, "Load scan program", start, "Python program (*.py *.txt)"
+                self, "Load scan program / table", start,
+                "Scan program or saved table (*.py *.txt *.npy *.csv *.json);;"
+                "Python program (*.py *.txt);;"
+                "Scan array (*.npy *.csv);;"
+                "Saved pulse / program (*.json)",
             )
             if not path:
                 return
-            self.scan_code.setPlainText(Path(path).read_text(encoding="utf-8"))
+            self._ingest_scan_program_file(Path(path))
+        except Exception as exc:
+            self._message(f"Load program error: {exc}")
+
+    def _ingest_scan_program_file(self, path: Path) -> None:
+        """Load a scan source in ANY of the formats Save/notebooks produce.
+
+        * ``.py`` / ``.txt`` -- Python that builds ``scan_table`` (goes into the editor);
+        * ``.npy`` / ``.csv`` -- a saved scan ARRAY (the ``<stem>_scan.npy`` bundle file);
+        * ``.json``          -- a saved PULSE (its embedded scan table) or a saved compiled
+          PROGRAM (``<stem>_program.json``; its wire-domain ``scan_points`` are converted
+          back to user units: duration ticks -> ns, DAC offset-binary codes -> signed).
+
+        Arrays/tables land in the loaded-file source (exactly like Load Array) and are
+        snapped to the bound slots; Python lands in the code editor."""
+
+        suffix = path.suffix.lower()
+        if suffix in ("", ".py", ".txt"):
+            self.scan_code.setPlainText(path.read_text(encoding="utf-8"))
             # A loaded program is user content -> stop auto-regenerating the default.
             self._scan_auto_code = ""
             if hasattr(self, "preview_status"):
-                self.preview_status.setText(f"Loaded scan program: {Path(path).name}")
-        except Exception as exc:
-            self._message(f"Load program error: {exc}")
+                self.preview_status.setText(f"Loaded scan program: {path.name}")
+            return
+
+        state = self.read_state()
+        if not state.scan_slots:
+            raise ValueError("bind at least one field to a scan slot (click a dot) before loading a table.")
+        if suffix in (".npy", ".csv"):
+            table = load_scan_table(path, n_slots=len(state.scan_slots) or None)
+        elif suffix == ".json":
+            import json
+
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict) and "periods" in payload:        # a saved pulse
+                table = [list(row) for row in (payload.get("scan_table") or [])]
+                if not table:
+                    raise ValueError(f"{path.name} is a saved pulse with no scan table.")
+            elif isinstance(payload, dict) and "ticks" in payload:        # a saved compiled program
+                points = [list(p) for p in (payload.get("scan_points") or [])]
+                if not points:
+                    raise ValueError(f"{path.name} is a compiled program with no scan points.")
+                kinds = [str(k) for k in (payload.get("slot_kinds") or [])]
+                step = float(state.time_step_ns)
+                zero_code = 1 << (10 - 1)   # 10-bit DAC wire code, 512 == signed 0 (true 0 V)
+                table = []
+                for row in points:
+                    user_row = []
+                    for j, raw in enumerate(row):
+                        kind = kinds[j] if j < len(kinds) else "duration"
+                        user_row.append(float(raw) * step if kind == "duration" else float(raw) - zero_code)
+                    table.append(user_row)
+            else:
+                raise ValueError(f"{path.name} is neither a saved pulse nor a compiled program.")
+        else:
+            raise ValueError(f"unsupported scan source {path.suffix!r} (use .py, .npy, .csv or .json).")
+
+        loaded = snap_scan_table(
+            table, state.scan_slots,
+            time_step_ns=state.time_step_ns,
+            dac_ranges=state.scan_slot_dac_ranges(),
+        )
+        self._scan_tables["loaded"] = loaded
+        self._scan_loaded_path = str(path)
+        self._scan_use_loaded = True
+        self._apply_scan_source()
+        if hasattr(self, "preview_status"):
+            self.preview_status.setText(f"Loaded {len(loaded)} scan points from {path.name}")
 
     def _insert_scan_template(self, kind: str) -> None:
         try:
@@ -3370,16 +3435,26 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                         saved.append(scan_path.name)
                     except Exception as exc:
                         failed.append(f"scan data ({exc})")
-                if state.scan_slots:
-                    try:
-                        import json
+                # The compiled, FPGA-ready program is ALWAYS part of the bundle (scan or
+                # not): the payload dispatcher picks the scan path when slots + a table
+                # are bound and the plain runtime program otherwise -- exactly what On
+                # Pulse uploads.
+                try:
+                    import json
 
-                        program = state.compile_scan(clock_hz=1e9 / float(state.time_step_ns))
-                        program_path = path_obj.with_name(path_obj.stem + "_program.json")
-                        program_path.write_text(json.dumps(program.to_dict(), indent=2), encoding="utf-8")
-                        saved.append(program_path.name)
-                    except Exception as exc:
-                        failed.append(f"scan program ({exc})")
+                    from Zou_lab_control.neutral_atom.devices.sequencer import (
+                        compile_runtime_program_for_payload,
+                    )
+
+                    program = compile_runtime_program_for_payload(
+                        state, channels=list(state.channels),
+                        clock_hz=1e9 / float(state.time_step_ns),
+                    )
+                    program_path = path_obj.with_name(path_obj.stem + "_program.json")
+                    program_path.write_text(json.dumps(program.to_dict(), indent=2), encoding="utf-8")
+                    saved.append(program_path.name)
+                except Exception as exc:
+                    failed.append(f"program ({exc})")
                 self.address_str = str(path_obj)
                 self._last_save_state = state.to_dict()
                 self._last_load_state = None
@@ -3398,15 +3473,40 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             start = str(Path(self.address_str).parent if self.address_str else _pulse_files_dir())
             path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load pulse", start, "ZLC pulse (*.json)")
             if path:
+                # Picking a sibling artifact of a saved bundle (<stem>_program.json /
+                # <stem>_scan.npy) is an easy mistake -- redirect to the pulse itself.
+                path_obj = Path(path)
+                for suffix, strip in (("_program.json", "_program"), ("_scan.npy", "_scan")):
+                    if path_obj.name.endswith(suffix):
+                        candidate = path_obj.with_name(path_obj.name[: -len(suffix)] + ".json")
+                        if candidate.exists():
+                            path_obj = candidate
+                            self._message(f"That file is a saved artifact; loading the pulse {candidate.name} instead.")
+                        break
+                path = str(path_obj)
                 state = PulseTableState.load(path)
                 self.address_str = path
                 self._last_load_state = state.to_dict()
                 self._last_save_state = None
-                # A freshly opened pulse's scan table becomes the "generated" source;
-                # the loaded-file source resets until the user picks a file.
+                # A freshly opened pulse's scan table becomes the "generated" source.
+                # If the saved bundle's scan array (<stem>_scan.npy) sits next to the
+                # pulse, restore it as the loaded-file source too (same numbers as the
+                # embedded table at save time) so Load round-trips the WHOLE bundle.
                 self._scan_tables = {"generated": [list(row) for row in state.scan_table], "loaded": []}
                 self._scan_loaded_path = ""
                 self._scan_use_loaded = False
+                sibling_npy = path_obj.with_name(path_obj.stem + "_scan.npy")
+                if sibling_npy.exists() and state.scan_slots:
+                    try:
+                        self._scan_tables["loaded"] = snap_scan_table(
+                            load_scan_table(sibling_npy, n_slots=len(state.scan_slots) or None),
+                            state.scan_slots,
+                            time_step_ns=state.time_step_ns,
+                            dac_ranges=state.scan_slot_dac_ranges(),
+                        )
+                        self._scan_loaded_path = str(sibling_npy)
+                    except Exception:
+                        pass  # a stale/incompatible sibling never blocks the pulse load
                 self.stateui_manager.address_str = path
                 self.stateui_manager.filestate = PulseStateUIManager.FileState.LOAD
                 self.load_state(state)

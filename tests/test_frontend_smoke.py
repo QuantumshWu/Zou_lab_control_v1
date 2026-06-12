@@ -2685,3 +2685,142 @@ def test_pulse_gui_period_name_edit_round_trips(monkeypatch):
     assert cards2[0].name_edit.text() == "load"
     assert cards2[2].name_edit.text() == "image"
     assert cards2[0].title().startswith("Period 1/")
+
+
+def _scanable_state():
+    """A small, COMPILABLE pulse: 2 channels, 2 periods, duration of P0 bound to s0."""
+    from Zou_lab_control.neutral_atom.timing.pulse_table import PulsePeriod, PulseTableState, ScanSlot
+
+    return PulseTableState(
+        name="bundle_test",
+        channels=["ch0", "ch1"],
+        visible_channels=["ch0", "ch1"],
+        time_step_ns=20.0,
+        periods=[PulsePeriod("s0", (1, 0), unit="ns", name="A"),
+                 PulsePeriod(400, (0, 1), unit="ns", name="B")],
+        scan_slots=[ScanSlot(kind="duration", target=0, unit="ns", nominal=200.0)],
+        scan_table=[[200.0], [400.0]],
+    )
+
+
+def test_pulse_gui_save_bundle_always_includes_program(monkeypatch, tmp_path):
+    """Save writes the WHOLE bundle: pulse.json + preview.png + the compiled FPGA-ready
+    _program.json -- for a NON-scan pulse too (it used to skip the program without scan
+    slots), plus _scan.npy when a scan table exists."""
+
+    import json
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5 import QtWidgets
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.neutral_atom.timing.pulse_table import PulsePeriod, PulseTableState
+
+    editor = dt.demo_editor(size=(1480, 900), bind_scans=False)
+    dt.settle(editor, 200)
+
+    # --- non-scan pulse: program STILL saved ---
+    plain = PulseTableState(
+        name="plain", channels=["ch0", "ch1"], visible_channels=["ch0", "ch1"],
+        time_step_ns=20.0,
+        periods=[PulsePeriod(200, (1, 0), unit="ns"), PulsePeriod(400, (0, 1), unit="ns")])
+    editor.load_state(plain)
+    dt.settle(editor, 100)
+    target = tmp_path / "plain.json"
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName",
+                        staticmethod(lambda *a, **k: (str(target), "")))
+    editor.save_to_file()
+    assert target.exists()
+    prog_path = tmp_path / "plain_program.json"
+    assert prog_path.exists(), "non-scan save must still write the compiled program"
+    prog = json.loads(prog_path.read_text(encoding="utf-8"))
+    assert prog.get("ticks") and prog.get("masks")
+    assert (tmp_path / "plain.png").exists()
+    assert not (tmp_path / "plain_scan.npy").exists()
+
+    # --- scan pulse: full 4-piece bundle ---
+    editor.load_state(_scanable_state())
+    dt.settle(editor, 100)
+    target2 = tmp_path / "scan.json"
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName",
+                        staticmethod(lambda *a, **k: (str(target2), "")))
+    editor.save_to_file()
+    for name in ("scan.json", "scan.png", "scan_scan.npy", "scan_program.json"):
+        assert (tmp_path / name).exists(), name
+    prog2 = json.loads((tmp_path / "scan_program.json").read_text(encoding="utf-8"))
+    assert prog2.get("scan_points"), "scan save embeds the compiled scan points"
+
+
+def test_pulse_gui_load_restores_bundle_and_redirects_artifacts(monkeypatch, tmp_path):
+    """Load round-trips the bundle: the sibling _scan.npy is re-attached as the
+    loaded-file source, and picking _program.json by mistake redirects to the pulse."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5 import QtWidgets
+    from Zou_lab_control.frontend import devtools as dt
+
+    editor = dt.demo_editor(size=(1480, 900), bind_scans=False)
+    dt.settle(editor, 200)
+    editor.load_state(_scanable_state())
+    dt.settle(editor, 100)
+    target = tmp_path / "bundle.json"
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName",
+                        staticmethod(lambda *a, **k: (str(target), "")))
+    editor.save_to_file()
+    assert (tmp_path / "bundle_scan.npy").exists()
+
+    # load the pulse -> the sibling scan array re-attaches as the loaded source
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName",
+                        staticmethod(lambda *a, **k: (str(target), "")))
+    editor.load_from_file()
+    assert editor._scan_loaded_path.endswith("bundle_scan.npy")
+    assert editor._scan_tables["loaded"], "sibling _scan.npy restored as the loaded source"
+    assert not editor._scan_use_loaded  # the embedded table stays the active source
+
+    # picking the saved program by mistake -> redirected to the pulse json
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName",
+                        staticmethod(lambda *a, **k: (str(tmp_path / "bundle_program.json"), "")))
+    editor.load_from_file()
+    assert editor.address_str.endswith("bundle.json")
+
+
+def test_scan_tab_ingests_py_npy_pulse_and_program(monkeypatch, tmp_path):
+    """The Scan tab's Load Program accepts every format Save/notebooks produce:
+    .py -> code editor; .npy -> loaded array; saved pulse .json -> its embedded table;
+    compiled _program.json -> wire-domain scan_points converted BACK to user units
+    (duration ticks*step -> ns, DAC offset-binary code-512 -> signed)."""
+
+    import json
+    import numpy as np
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from pathlib import Path
+    from Zou_lab_control.frontend import devtools as dt
+
+    editor = dt.demo_editor(size=(1480, 900), bind_scans=False)
+    dt.settle(editor, 200)
+    editor.load_state(_scanable_state())
+    dt.settle(editor, 100)
+
+    py = tmp_path / "gen.py"
+    py.write_text("import numpy as np\nscan_table = np.linspace(100, 500, 5)\n", encoding="utf-8")
+    editor._ingest_scan_program_file(Path(py))
+    assert "linspace" in editor.scan_code.toPlainText()
+
+    npy = tmp_path / "arr.npy"
+    np.save(npy, np.asarray([[120.0], [240.0], [360.0]]))
+    editor._ingest_scan_program_file(Path(npy))
+    assert len(editor._scan_tables["loaded"]) == 3 and editor._scan_use_loaded
+
+    pulse_json = tmp_path / "other.json"
+    pulse_json.write_text(json.dumps({"periods": [], "scan_table": [[111.0], [222.0]]}), encoding="utf-8")
+    editor._ingest_scan_program_file(Path(pulse_json))
+    assert [row[0] for row in editor._scan_tables["loaded"]] == [120.0, 220.0]  # snapped to 20 ns
+
+    prog_json = tmp_path / "other_program.json"
+    # wire domain: duration slot -> ticks (50 ticks * 20 ns = 1000 ns)
+    prog_json.write_text(json.dumps({"ticks": [0, 10], "masks": [1, 0],
+                                     "slot_kinds": ["duration"],
+                                     "scan_points": [[50], [100]]}), encoding="utf-8")
+    editor._ingest_scan_program_file(Path(prog_json))
+    assert [row[0] for row in editor._scan_tables["loaded"]] == [1000.0, 2000.0]
