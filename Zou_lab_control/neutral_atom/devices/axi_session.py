@@ -41,6 +41,7 @@ from .fpga_pulse_streamer import validate_pulse_streamer_program
 from fpga.pulse_streamer.host.image import (
     StreamerParams,
     CtrlWords,
+    CTRL_WORDS,
     pack_program,
     scan_bank_words,
     region_bases,
@@ -523,18 +524,31 @@ class VivadoAxiStreamerSession:
         return True
 
     def clear_host_config(self) -> None:
-        """Zero every host-owned CTRL CONFIG word -- per-channel delays, per-bus
-        delays and the per-channel CLK mask -- then halt the engine (CMD_SAFE).
+        """Zero every host-owned CONFIG register -- LAYOUT-AGNOSTICALLY -- then halt the
+        engine (CMD_SAFE).
 
-        Run at server bring-up so a restart ALWAYS lands in a clean, silent state:
-        leftovers from a prior session (or from the historic self-test bug that
-        scribbled into the delay/CLK_ENABLE words) cannot keep a channel running on
-        the FPGA clock with no program loaded.  prepare() rewrites these words from
-        the program image anyway; this only guarantees the idle state."""
+        Run at server bring-up so a restart ALWAYS lands in a clean, silent state.
 
-        ctrl_base = region_bases(self.params)["ctrl"]
-        for word in range(CtrlWords.CLK_ENABLE, self.params.ctrl_scratch_base):
-            self._queue_word(ctrl_base + word, 0)
+        The sweep deliberately does NOT derive its range from the CURRENT CtrlWords map:
+        that was a real bug.  The old loop cleared only the words this host's map called
+        config (CLK_ENABLE..scratch_base = words 20..21 on layout v2), so on a bitstream
+        built for ANOTHER layout the stale registers it actually mattered to clear -- the
+        v1 clk mask at words 46/47 -- stayed live, and the uncontrolled da_clk strobes
+        garbled the DAC output.  In EVERY layout version, CTRL words 0..19 are the
+        command/status/streaming mailbox (never written blind) and words 20..63 have only
+        ever held host-owned config (dense delay words / clk mask / scratch / reserved;
+        word 63's readback is the hardwired layout id, so writing it is a no-op on v2),
+        so zeroing the WHOLE 20..63 span is always safe and clears the stale config of
+        whatever layout the bitstream was built for.  The R_DELAY register region is
+        host-owned config too: zero its full reserved span (delay_region_words), not just
+        the words the current geometry uses.  prepare() rewrites everything it needs from
+        the program image; this only guarantees the idle state."""
+
+        bases = region_bases(self.params)
+        for word in range(20, CTRL_WORDS):
+            self._queue_word(bases["ctrl"] + word, 0)
+        for word in range(self.params.delay_region_words):
+            self._queue_word(bases["delay"] + word, 0)
         self._flush()
         self._command(CMD_SAFE)
 

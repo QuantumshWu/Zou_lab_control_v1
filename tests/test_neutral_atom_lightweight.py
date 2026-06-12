@@ -3201,18 +3201,24 @@ def test_axi_self_test_scratch_sits_above_all_defined_ctrl_words(tmp_path):
 
 
 def test_clear_host_config_zeroes_delays_and_clk_mask(tmp_path):
-    """Server bring-up self-heal: clear_host_config() must zero EVERY host-owned config
-    word (the CLK mask 20..21) and halt
-    (CMD_SAFE) -- so a board polluted by the historic self-test bug (or any leftover
-    clk_en bit driving a pin at 50 MHz) recovers on server restart, no on_pulse needed."""
+    """Server bring-up self-heal must be LAYOUT-AGNOSTIC: clear_host_config() zeroes the
+    WHOLE host-owned CTRL config span (words 20..63 -- NOT just the words the current
+    CtrlWords map calls config) plus the entire R_DELAY register region, then halts
+    (CMD_SAFE).  Regression guard for the real garbled-DA incident: the old loop cleared
+    only the v2 map's words (20..21), so a bitstream built for the v1 layout kept its
+    STALE clk mask at words 46/47 live -> uncontrolled da_clk strobes."""
 
     from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
-    from fpga.pulse_streamer.host.image import CMD_SAFE, CtrlWords
+    from fpga.pulse_streamer.host.image import CMD_SAFE, CtrlWords, region_bases
 
     class Hw:
-        def __init__(self):
-            # a polluted board: 0xC0DE.. sitting in delay + CLK_ENABLE words
-            self.bram = {20: 0xC0DE000E, 21: 0xC0DE000F}
+        def __init__(self, delay_base):
+            # a polluted board: garbage in the v2 clk-mask words (20/21), in the v1
+            # clk-mask words (46/47, what the incident left live), in dense-delay-era
+            # words, AND a stale bus delay in the R_DELAY region.
+            self.bram = {20: 0xC0DE000E, 21: 0xC0DE000F,
+                         30: 0x00000FFF, 46: 0x10000000, 47: 0x20040080,
+                         delay_base + 5: 100_000_000}
         def __call__(self, lines, action, timeout):
             text = "\n".join(lines)
             for w, v in _decode_axi_writes(text):
@@ -3225,12 +3231,15 @@ def test_clear_host_config_zeroes_delays_and_clk_mask(tmp_path):
                 return f"ZLCDATA {self.bram.get(w, 0):08X}\n"
             return "ok\n"
 
-    hw = Hw()
+    session = VivadoAxiStreamerSession(state_dir=tmp_path)
+    bases = region_bases(session.params)
+    hw = Hw(bases["delay"])
     session = VivadoAxiStreamerSession(state_dir=tmp_path, tcl_executor=hw)
     session.clear_host_config()
-    p = session.params
-    for word in range(CtrlWords.CLK_ENABLE, p.ctrl_scratch_base):
-        assert hw.bram.get(word, 0) == 0, f"ctrl word {word} not cleared"
+    for word in range(20, 64):
+        assert hw.bram.get(word, 0) == 0, f"ctrl word {word} not cleared (layout-agnostic sweep)"
+    for word in range(session.params.delay_region_words):
+        assert hw.bram.get(bases["delay"] + word, 0) == 0, f"R_DELAY word {word} not cleared"
     assert hw.bram.get(CtrlWords.COMMAND) == CMD_SAFE   # engine halted afterwards
 
 
