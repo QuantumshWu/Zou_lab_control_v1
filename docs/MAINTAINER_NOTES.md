@@ -73,7 +73,7 @@ Invariants:
   into a heavyweight dependency-injection framework.
 - **Sequencer / streamer is purely a player.** The sequencer and the FPGA edge
   streamer contain NO camera/trigger judgment. The streamer only plays digital
-  edges, analog-bus segments, and delay lanes; the engine HDL
+  edges, analog-bus segments, and event-scheduler output delays; the engine HDL
   (`zlc_edge_streamer.v`) has no camera/acquire/readout/detect logic at all. A
   trigger channel is just one more digital output the player drives — the decision
   about *when* to count or threshold lives in the acquisition/feedback subsystem
@@ -227,7 +227,10 @@ or replace the editor with plain tables.
   use `×∞` / `×N` (never the literal `inf`), slot-bound regions are drawn as
   spanning translucent markers, analog-bus rows are hollow stair-steps.
 - Saving writes the bundle together: pulse `.json` + preview `.png` +
-  `<stem>_scan.npy` (when a scan table exists).
+  `<stem>_program.json` (the compiled runtime program, wire domain) +
+  `<stem>_scan.npy` (when a scan table exists).  Loading accepts any bundle
+  member and redirects to the pulse `.json` (picking `<stem>_program.json` /
+  `<stem>_scan.npy` by mistake is handled).
 - Raw left column shows package pins (`M17`, `M13`) when the XDC map is
   available; `chNN` stays in tooltip and saved/API state. Hiding is a view op;
   `Hide Off` hides channels with no period on; clearing a channel turns its
@@ -285,7 +288,8 @@ back-to-back 1-tick edges fire one per clock. Four gapless reload sites
 shadows at every boundary, so the last edge of point k and the first edge of point
 k+1 are adjacent with no gap. Cycle behavior is proven by
 `host.engine_model.rtl_mirror_play == reference_play` at read latency 1/2/3 + 200
-fuzz programs (no Verilog simulator in repo).
+fuzz programs, plus the xsim testbenches in `fpga/pulse_streamer/sim/` running the
+real RTL.
 
 Build/program workflow on the Vivado computer:
 
@@ -336,7 +340,7 @@ refill thread that streams chunks CONTINUOUSLY and CYCLICALLY (monotonic chunk
 `mono` -> data `mono%K` into bank `mono%2`, one-ahead) -- the wrap is just another
 chunk boundary, so the WHOLE re-sweep is gapless (no inter-sweep hold).
 
-**Pieces (all in-repo, all Python-verified pre-hardware, no Verilog sim):**
+**Pieces (all in-repo, Python-verified + xsim-verified pre-hardware):**
 
 - **Image layout / packer + capacity (`fpga/pulse_streamer/host/image.py`).**
   Single source of truth for the host<->FPGA AXI write contract AND the geometry
@@ -352,8 +356,9 @@ chunk boundary, so the WHOLE re-sweep is gapless (no inter-sweep hold).
   Python mirror. `rtl_mirror_play == reference_play` at read latency 1/2/3 + 200
   fuzz programs proves the 1-tick prefetch; `streaming_scan_play` proves the 2-bank
   ping-pong + late-refill STALL; `bus_play` proves the bus/ramp engine incl.
-  scanned ramp endpoints. This is the pre-hardware proof (no Verilog simulator is
-  in the repo).
+  scanned ramp endpoints. The second pre-hardware layer is the xsim testbenches
+  in `fpga/pulse_streamer/sim/` running the real RTL (real BRAM IP netlists where
+  it matters).
 - **Top (`zlc_pulse_streamer_top.v`).** `jtag_axi` -> `axi_bram_ctrl` -> region-
   decoded BRAMs (3 parallel edge + scan + bus image) + CTRL regfile, driving the
   engine; engine `out` (62) + `bus_out` (4x10b DACs) go to the board pins.
@@ -434,19 +439,21 @@ refills the bank behind the consumed `CURSOR` with the next chunk and re-arms
 `BANK_READY` (see section 3 and 6). Total scan points are limited only by host memory, and
 a late refill STALLs (`STATUS_UNDERFLOW`, hold), never a wrong point.
 
-## 8. Per-Channel OUTPUT Delay (TTL event scheduler + DAC rings)
+## 8. Per-Channel OUTPUT Delay (TTL + DAC event schedulers)
 
 A channel delay is a **physical OUTPUT delay**, not baked into the edge ticks:
 `output_delayed[t] = output_undelayed[t - d]`, **zero before fire**, never disturbing
 another channel; negative delays fold via the global shift `G = max(0, -min(delays))`.
-The edge table is emitted UNDELAYED; the delays ride `channel_delays` (TTL, one 32-bit
-word per channel in the AXI DELAY register region R_DELAY_BASE) and `bus_delays`
-(DAC, dense CTRL words).
+The edge table is emitted UNDELAYED; the delays ride `channel_delays` (TTL) and
+`bus_delays` (DAC) -- one 32-bit word per channel and per bus in the AXI DELAY
+register region (`R_DELAY_BASE`, see `image.region_bases`).  `pack_program` writes
+ALL delay words every upload (zero when undelayed) so no value from a previous
+program can linger (the real-machine "DA inherits the last program's delay" bug).
 
 **TTL = EVENT SCHEDULER** (`zlc_edge_streamer.v`): a TTL waveform is toggle-sparse, so
 the engine queues TOGGLES instead of buffering one bit per tick.  When the undelayed bit
 flips at tick `t`, it pushes `{t + d - 1, level}` into that channel's `EVT_DEPTH`-deep
-(default 256) 49-bit LUTRAM FIFO; a free-running 48-bit `g_time` pops it by equality into
+(default 128) 49-bit LUTRAM FIFO; a free-running 48-bit `g_time` pops it by equality into
 the output register (`d == 1` is one register; `d == 0` bypasses).  This is a **TRUE
 physical delay**: `out[t] = in[t-d]` for every `t`, **silent for the first `d` ticks**
 (first frame already correct), with **NO modulo / cyclic reduction** -- the old
@@ -459,8 +466,9 @@ Each delay slot owns its own 2D `(* ram_style="distributed" *) reg [48:0] fifo[0
 with its own wr/rd/cnt/obit, instantiated in a `generate` loop; `evt_out` is the OR of the
 per-slot contributions.  A single flat 3D array `evt_mem[slot][depth]` does **not** infer
 as distributed RAM (each slot has an INDEPENDENT wr/rd pointer; a single shared write pointer
-would let it infer), so Vivado falls back to flip-flops -- at depth 256 that is 18*256*49 = 226k
-FF + 256:1 read muxes, which the 35T cannot place (a real build failed exactly this way).
+would let it infer), so Vivado falls back to flip-flops -- at the then-default depth 256
+that was 18*256*49 = 226k FF + 256:1 read muxes, which the 35T cannot place (a real build
+failed exactly this way).
 The FIFOs are **COMPACTED** to the delay-eligible channels only (the 18 real TTL outputs,
 `DELAY_COMPACT`/`NUM_DELAY_CH`/`DELAY_CH_MAP`); the 40 DAC-bus bits (pin driven by `bus_out`)
 and the 4 `da_clk` pins do NOT get a FIFO, so the deep LUTRAM is paid only where it can be
@@ -488,16 +496,19 @@ DELAYED ramp (one event/step).  `bus_evt_fifo_depth` is reconfigurable from stre
 `image.emit_geom_tcl` turns the config into `$zlc_top_generics` (EVT_FIFO_DEPTH,
 EDGE_ADDR_WIDTH, BANK_SIZE), `build_and_program.bat --emit-geom-tcl` generates `geom.tcl`,
 and `create_project.tcl` sources it + `set_property generic ... [current_fileset]` so editing
-the JSON changes the SYNTHESIZED bitstream (e.g. 256->128 if a build is LUT-tight).  A
-contract test asserts every generic names a real top parameter (else Vivado ignores it).
+the JSON changes the SYNTHESIZED bitstream (exactly how the default became 128 when the
+256 build was LUT-tight).  A contract test asserts every generic names a real top
+parameter (else Vivado ignores it).
 
 Proven: `delay_line_reference` (out[t]=in[t-d]) is the unchanged ground truth;
 `engine_model.rtl_delay_line_mirror` mirrors the scheduler cycle-exactly; the REAL RTL is
 verified in xsim -- `tb_delay_sched.v` (delays {0,1,2,7,1000}, 1-tick toggles, repeat seams:
 11,996 cycles, 0 mismatches, DELAY-SCHED-OK), `tb_delay_compact.v` (non-identity slot->channel
-map at depth 256, COMPACT-MAP-OK), `tb_evt_depth.v` (FIFO-depth boundary pinned at 16,
-EVT-DEPTH-OK).  Estimate at depth 256: 67.7% LUT / 21.6% FF on the 35T (the per-slot LUTRAM
-is ~0.7-1.0 LUT per 64x1 cell).
+map, COMPACT-MAP-OK), `tb_evt_depth.v` (FIFO-depth boundary behavior pinned at a small
+EVT_DEPTH=16 so the TB can actually hit the boundary, EVT-DEPTH-OK).  Conservative
+estimate at the current defaults (EVT=128, BUS_EVT=64): RAMB36 78% / LUT ~97% / FF ~22% /
+DSP ~58% on the 35T -- tight on LUTs but the real implementation closes (the estimate
+overcounts distributed RAM; the per-slot LUTRAM is ~0.7-1.0 LUT per 64x1 cell).
 
 ## 9. Pulse API, sync-to-device and GUI state semantics
 
@@ -804,3 +815,29 @@ immediately with a "rebuild the bitstream + restart the server together" instruc
 of silently mis-driving registers.  BUMP BOTH IDs on ANY CtrlWords/region change.  Locked by
 `test_register_layout_handshake_rtl_matches_host` (RTL<->host id equality + pack never
 occupies words 1/2/63) and `test_axi_session_refuses_mismatched_register_layout`.
+
+## 16. Pre-delivery audit notes (2026-06-12)
+
+**Duplicate-test purge.** `tests/test_neutral_atom_lightweight.py` carried a ~1300-line
+duplicated region: 50 top-level functions (48 tests + 2 helpers) were defined TWICE with
+byte-identical bodies -- the second definition shadowed the first, so the first copies never
+ran (pure dead weight, no lost coverage).  Removed via an AST-exact pass; the collected test
+count is unchanged.  If you ever see pytest collect fewer tests than `def test_` greps,
+check for shadowed duplicates first.
+
+**StreamerParams defaults are LOCKED to streamer_config.json.**  `bank_size` had drifted
+(dataclass default 512 vs config 2048).  The runtime path was safe -- `axi_session` uses
+`default_params()` (the config read) and the build uses `emit_geom_tcl` (same source), so
+host and bitstream agreed at 2048 -- but every direct `StreamerParams()` user (tests, the
+tb_t_ff image generator) silently packed a 512-bank register geometry.  Defaults now equal
+the config and `test_streamer_params_defaults_match_config` pins every field.
+
+**Known limitation: dense 1-tick edge bursts slip 1 tick at the prefetch handover.**
+`tb_1tick.v` (real BRAM IPs): in a run of BACK-TO-BACK 1-tick-spaced edges, edges 7..10 fire
+one tick late (the streaming prefetch takes over from the 5 ARM-preloaded shadows; the
+self-healing `>=` fire makes up the slack inside the burst, nothing is dropped, and the next
+burst after any idle gap is exactly on time).  Present since the dd5d72d prefetch fix (the
+guarantee there is NO DROPPED EDGES; the TB prints the slip count rather than failing).
+Real experiment pulses (us/ms periods) never produce 7+ consecutive 20 ns edges, so this is
+a microbenchmark-only startup-window effect.  Eliminating it would need a deeper shadow
+preload (FIFO_DEPTH+shadow growth + rebuild) -- deliberately NOT done before delivery.

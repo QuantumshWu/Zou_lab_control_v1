@@ -29,20 +29,21 @@ Zou_lab_control/
 fpga/             standalone JTAG-to-AXI pulse-streamer build/server side
 pulses/           checked-in PulseTableState presets
 tutorials/        generated Jupyter notebooks
-docs/             the three manuals, maintainer notes, generated PDFs
+docs/             the four manuals, maintainer notes, generated PDFs
 tests/            targeted verification matrix and tests
 references/       historical source archives (ignored by git)
 ```
 
 ## Documentation
 
-There are exactly **three tutorial PDF manuals**, plus one maintainer note.
+There are exactly **four tutorial PDF manuals**, plus one maintainer note.
 
 | Manual | Source dir | Covers |
 | --- | --- | --- |
 | Main | `docs/main_manual/` | System architecture, neutral-atom session/devices/timing, `PulseSequence` vs `PulseTableState`, the sequencer lifecycle (prepare/fire/wait_done/safe_state), the real-hardware runbook, and the N-slot scan model end to end |
 | Frontend | `docs/frontend_manual/` | The `qt_fluent` widget library and layout primitives, the pulse GUI (Edit/Preview/Scan tabs), the per-field scan-dot workflow, the plotting API, and PDF rendering |
-| FPGA | `docs/fpga_manual/` | The Artix-7 35T edge-table pulse-streamer RTL, the 1-tick FIFO prefetch pipeline, the 2-bank streaming scan window, the affine N-slot scan engine, the analog-bus DAC engine, the JTAG-to-AXI host upload flow, and the resource budget |
+| FPGA | `docs/fpga_manual/` | The Artix-7 35T edge-table pulse-streamer RTL, the 1-tick FIFO prefetch pipeline, the 2-bank streaming scan window, the affine N-slot scan engine, the analog-bus DAC engine, the event-scheduler output delays, the JTAG-to-AXI host upload flow, and the resource budget |
+| Device | `docs/device_manual/` | Device configuration/contracts, `load_devices`, camera acquisition, the readout pipeline (sitemap/thresholds/detect), trap calibration, and the virtual backends |
 
 - Maintainer/agent notes (architecture invariants, anti-patterns, QA): see
   [docs/MAINTAINER_NOTES.md](docs/MAINTAINER_NOTES.md).
@@ -59,7 +60,7 @@ compiled with XeLaTeX (2-pass, in a temporary build dir). XeLaTeX must be on
 PATH.
 
 ```powershell
-python -c "from Zou_lab_control.neutral_atom.content.manuals import build_main_manual, build_fpga_manual; build_main_manual(); build_fpga_manual()"
+python -c "from Zou_lab_control.neutral_atom.notes import build_main_manual, build_fpga_manual, build_device_manual; build_main_manual(); build_fpga_manual(); build_device_manual()"
 python -c "from Zou_lab_control.frontend.notes import build_frontend_manual; build_frontend_manual()"
 ```
 

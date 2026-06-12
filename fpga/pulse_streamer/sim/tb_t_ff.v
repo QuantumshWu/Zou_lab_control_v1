@@ -112,9 +112,13 @@ module tb_t_ff;
   wire [9:0] da_dipole, da_bias_y, da_bias_x, da_bias_z;
   wire da_clk0, da_clk1, da_clk2, da_clk3;
 
-  // BANK_SIZE=512 == streamer_config.json == the real bitstream's geometry (geom.tcl);
-  // the default 2048 here would put R_BUS_BASE at 36928 while the host packs at 24640.
-  zlc_pulse_streamer_top #(.BANK_SIZE(512)) dut (
+  // The top's BANK_SIZE default (2048) == streamer_config.json == the real bitstream's
+  // geometry (geom.tcl) == what _gen_replay_t.py packs with (image.StreamerParams(), whose
+  // defaults are LOCKED to the config by test_streamer_params_defaults_match_config).  A
+  // mismatched override here would land the bus image in the scan region -- the loader
+  // would copy zeros and ALL DA output would be silently wrong (we demonstrated exactly
+  // that with a deliberate 512-vs-2048 skew).
+  zlc_pulse_streamer_top dut (
     .clk(clk), .led(led),
     .cooling(cooling), .cooling_pgc(cooling_pgc), .repump(repump), .probe(probe),
     .pushout(pushout), .state_pre(state_pre), .trig(trig), .coil(coil),

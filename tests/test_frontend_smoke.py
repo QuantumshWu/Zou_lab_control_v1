@@ -1047,6 +1047,47 @@ def test_pulse_gui_scan_dot_retoggle_preserves_values(monkeypatch):
     assert editor.state.scan_table == [[100.0], [200.0], [300.0]]
 
 
+def test_pulse_gui_differing_bus_member_delays_survive_read_state(monkeypatch):
+    """Per-member DAC-bus delays (set from the notebook API, valid in saved JSON)
+    must NOT be silently flattened by the GUI's first read_state.
+
+    The bus row shows ONE delay box for the whole bus.  When the members' delays
+    differ, the box shows a "(mixed)" placeholder and read_values() skips it, so
+    an untouched mixed field never overwrites the per-member state.  Typing in
+    the box clears the protection and applies one delay to all members as before.
+    """
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.neutral_atom.timing.pulse_table import PulsePeriod, PulseTableState
+
+    editor = dt.demo_editor(size=(1480, 900), bind_scans=False)
+    state = PulseTableState(
+        name="mix",
+        channels=["b0", "b1", "t"],
+        channel_labels={"b0": "da_x[0]", "b1": "da_x[1]"},
+        visible_channels=["b0", "b1", "t"],
+        time_step_ns=20.0,
+        periods=[PulsePeriod(200, (0, 0, 1), unit="ns")],
+        analog_bus_modes={"da_x": [{"mode": "edge", "value": 1}]},
+        delays={"b0": 100.0, "b1": 300.0},
+        delay_units={"b0": "ns", "b1": "ns"},
+    )
+    editor.load_state(state)
+    dt.settle(editor, 100)
+
+    out = editor.read_state()
+    assert out.delays.get("b0") == 100.0, out.delays
+    assert out.delays.get("b1") == 300.0, out.delays
+
+    # A second round-trip must be just as safe (the box is rebuilt as "(mixed)").
+    editor.load_state(out)
+    dt.settle(editor, 100)
+    again = editor.read_state()
+    assert again.delays.get("b0") == 100.0 and again.delays.get("b1") == 300.0, again.delays
+
+
 def test_pulse_gui_scan_tab_columns_bottom_aligned(monkeypatch):
     """The Scan tab's code box and table box must share a bottom edge.
 

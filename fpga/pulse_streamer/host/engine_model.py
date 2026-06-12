@@ -1,6 +1,7 @@
 """Cycle-accurate behavioural models of the FINAL affine edge-table engine
 (``fpga/pulse_streamer/zlc_edge_streamer.v``), used to prove tick-exactness +
-gaplessness BEFORE hardware (no Verilog simulator in this repo).
+gaplessness BEFORE hardware (the second pre-hardware layer is the xsim
+testbenches in ``fpga/pulse_streamer/sim/`` running the real RTL).
 
 Three models, all walking the SAME engine FSM:
 

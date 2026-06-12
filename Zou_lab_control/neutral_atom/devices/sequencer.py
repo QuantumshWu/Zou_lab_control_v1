@@ -514,7 +514,7 @@ def compile_pulse_table_scan_runtime_program(
 
     # A (constant) channel delay inside a finite repeat bracket: UNROLL the bracket into a flat
     # period list first, then compile with the flat affine machinery (additive global shift G +
-    # affine duration scan + reordering delay lanes).  Once flat there is no inner-loop boundary
+    # affine duration scan).  Once flat there is no inner-loop boundary
     # for a delayed edge to cross, so a constant delay works in ANY form -- crossing the (former)
     # boundary, reordering, negative, or frame-extending.  (A channel delay is a FIXED value and
     # cannot itself be scanned; a delay expression referencing a scanned slot is rejected below.)
@@ -1754,10 +1754,10 @@ def _pulse_table_affine_rows(
 
     Every channel's rise/fall edge is a period boundary ``period_start`` evaluated affinely
     in the bound scan slots (the scanned DURATIONS).  Channel DELAYS are NOT applied here:
-    a delay is a per-channel OUTPUT delay (``channel_delays``, a delay line), never baked
-    into the edges.  Because every edge sits on a monotone period boundary, the merged edge
+    a delay is a per-channel OUTPUT delay (``channel_delays``, the FPGA event scheduler),
+    never baked into the edges.  Because every edge sits on a monotone period boundary, the merged edge
     list is globally tick-monotone at every scan point automatically -- no channel reorders,
-    so no global shift G and no delay lane are needed.  ``_stable_affine_groups`` still
+    so no global shift G is needed.  ``_stable_affine_groups`` still
     validates per-channel + cross-channel ordering at every scan point as a safety net."""
 
     hardware_channels = list(channel_names(channels, "channels"))
@@ -1865,11 +1865,10 @@ def _stable_affine_groups(
         if len(channel_exprs) > 1:
             raise ValueError(
                 "this scan moves one channel's edges PAST another channel's edges as the "
-                "scanned delay sweeps (the channels reorder), which the single global edge "
-                "table cannot play.  Keep the scanned delay small enough that the channel "
-                "stays in its own slot relative to the others, OR scan a DAC delay (analog "
-                "buses are independent timelines and may reorder freely).  Reordering "
-                "digital-delay scans need the per-channel delay-lane path (planned)."
+                "scan slots sweep (the channels reorder), which the single global edge "
+                "table cannot play.  Narrow the scan range so every channel stays in its "
+                "own slot relative to the others, OR scan a DAC value instead (analog "
+                "buses are independent timelines and may reorder freely)."
             )
         # All events here share a reference tick.  A no-op ANCHOR (final/loop marker) that
         # coincides with a real edge at the reference but DIVERGES at other points is kept
@@ -1919,9 +1918,9 @@ def _stable_affine_groups(
             if last is not None and tick <= last:
                 raise ValueError(
                     "this scan moves one channel's edges PAST another channel's edges as the "
-                    "scanned delay sweeps (the channels reorder), which the single global edge "
-                    "table cannot play.  Reordering digital-delay scans use the per-channel "
-                    "delay-lane path."
+                    "scan slots sweep (the channels reorder), which the single global edge "
+                    "table cannot play.  Narrow the scan range so every channel stays in "
+                    "its own slot relative to the others."
                 )
             last = tick
     return grouped

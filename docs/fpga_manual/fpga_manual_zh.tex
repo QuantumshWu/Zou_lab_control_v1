@@ -37,7 +37,7 @@ BRAM:        1,800 Kb (50 x 36 Kb RAMB36)   DSP: 90
   \item[\filepath{fpga/pulse_streamer/zlc_edge_streamer.v}] 引擎。全局边沿表（三块并行 BRAM：tick 32b / coeff 64b / mask 62b，强制 \pyapi{READ_LATENCY_B=2}）、深度 \pyapi{FIFO_DEPTH}(=\pyapi{RD_LAT}+2=4) 的连续边沿预取、2-bank ping-pong 扫描窗口、仿射有效 tick MAC、模拟总线 DAC 引擎。
   \item[\filepath{fpga/pulse_streamer/zlc_pulse_streamer_top.v}] 顶层。\pyapi{jtag_axi} $\rightarrow$ \pyapi{axi_bram_ctrl} $\rightarrow$ 区段译码的 BRAM（三块并行边沿 + 扫描窗口 + 总线映像）+ CTRL 寄存器邮箱，驱动引擎与板上 62 路输出 + 4x10b DAC 总线。
   \item[\filepath{fpga/pulse_streamer/host/image.py}] 主机$\leftrightarrow$FPGA AXI 写契约 + 容量求解器的\tfocus{单一真相源}。\pyapi{pack_program}/\pyapi{unpack_program} 打包/解码 BRAM 映像，\pyapi{solve_capacity} 从器件 RAMB36/LUT 预算推导几何。RTL localparam 与 create-project Tcl 都从它派生。
-  \item[\filepath{fpga/pulse_streamer/host/engine_model.py}] 逐周期行为模型（仓库\tfocus{没有 Verilog 仿真器}，这是硬件前的正确性证明）。
+  \item[\filepath{fpga/pulse_streamer/host/engine_model.py}] 逐周期行为模型——硬件前正确性证明的第一层；第二层是 \filepath{fpga/pulse_streamer/sim/} 里跑\tfocus{真实 RTL}（关键处还接真实 BRAM IP 网表）的 xsim 测试台。
   \item[\filepath{Zou_lab_control/neutral_atom/devices/axi_session.py}] 主机会话 \pyapi{VivadoAxiStreamerSession}：常驻 Vivado \pyapi{hw_axi}，打包上传 + 驱动 CTRL 邮箱 + 流式回填。
 \end{description}
 
@@ -134,7 +134,7 @@ bit 0 对应 \pyapi{channels[0]}。一行的含义是：\tfocus{在这个有效 
 \end{itemize}
 
 \begin{notebox}[这条等价是被证明的]
-\pyapi{host.engine_model.rtl_mirror_play} 在读延迟 1/2/3 下逐 tick 等于组合参考播放器 \pyapi{reference_play}，并跑了 200 个 fuzz 程序（含背靠背 1-tick、扫描 1-tick、loop 1-tick）。仓库无 Verilog 仿真器，这个逐周期镜像就是硬件前最强证据。
+\pyapi{host.engine_model.rtl_mirror_play} 在读延迟 1/2/3 下逐 tick 等于组合参考播放器 \pyapi{reference_play}，并跑了 200 个 fuzz 程序（含背靠背 1-tick、扫描 1-tick、loop 1-tick）。在此之上，\filepath{fpga/pulse_streamer/sim/} 的 xsim 测试台直接跑\tfocus{真实 RTL}（预取流水、无缝扫描回绕、事件调度延时、ramp 扫描、DA 时钟相位、全链首帧回归），关键测试台还挂真实 BRAM IP 网表——两层证据互为印证。
 \end{notebox}
 
 \chapter{无缝边界：四个 gapless 重装点}
@@ -208,7 +208,7 @@ case B 晚到:  游标到 4096 但 bank0 还不是 chunk2
 \end{codeblock}
 
 \section{repeat\_forever 流式重扫}
-\pyapi{repeat_forever} 对一个有限（但很大）的流式扫描做反复扫掠：\pyapi{fire} 时启动一个主机\tfocus{后台回填线程}，循环把下一段填进空出的 bank。一次扫掠之内是\tfocus{无缝}的；扫掠与扫掠之间的接缝是一个\tfocus{短暂的安全 hold}（重新从 chunk 0 播种）。\pyapi{host.engine_model.streaming_scan_play} 证明了播放序列、CURSOR 推进、以及晚到 STALL 行为。
+\pyapi{repeat_forever} 对一个有限（但很大）的流式扫描做反复扫掠：\pyapi{fire} 时启动一个主机\tfocus{后台回填线程}，循环把下一段填进空出的 bank。bank 选择是\tfocus{连续循环 ping-pong}（$\text{bank}=(\text{chunk}\bmod 2)\oplus\text{base}$，base 在每次回绕时按 chunk 数的奇偶翻转），所以扫掠回绕只是又一个普通的 chunk 边界——\tfocus{扫掠之内与扫掠之间都无缝}，任意点数 $N$ 成立。\pyapi{host.engine_model.streaming_scan_play} 证明了播放序列、CURSOR 推进、以及晚到 STALL 行为；\filepath{sim/tb\_scan\_wrap.v} 在真实 RTL 上跑了 $K=3$、9 次扫掠的无缝回绕（SEAMLESS-OK）。
 
 \chapter{N-slot 仿射扫描引擎}
 

@@ -53,7 +53,7 @@ try:  # pragma: no cover - exercised whenever the fpga package is importable (th
     DEFAULT_SCAN_COEFF_FRAC_BITS = int(_CFG_PARAMS.coeff_frac_bits)
     DEFAULT_NUM_SLOTS = int(_CFG_PARAMS.num_slots)
     TTL_DELAY_MAX_TICKS = int(getattr(_CFG_PARAMS, "ttl_delay_max_ticks", (1 << 31) - 1))
-    EVT_FIFO_DEPTH = int(getattr(_CFG_PARAMS, "evt_fifo_depth", 16))
+    EVT_FIFO_DEPTH = int(getattr(_CFG_PARAMS, "evt_fifo_depth", 128))
     BUS_EVT_FIFO_DEPTH = int(getattr(_CFG_PARAMS, "bus_evt_fifo_depth", 64))
     DEFAULT_SLOT_MUL_WIDTH = int(_STREAMER_CFG["slot_mul_width"])
     DEFAULT_BUS_COUNT = int(_CFG_PARAMS.bus_count)
@@ -69,7 +69,7 @@ except Exception:  # pragma: no cover - fpga package not importable; use shipped
     DEFAULT_SCAN_COEFF_FRAC_BITS = 8
     DEFAULT_NUM_SLOTS = 4
     TTL_DELAY_MAX_TICKS = (1 << 31) - 1
-    EVT_FIFO_DEPTH = 16
+    EVT_FIFO_DEPTH = 128
     BUS_EVT_FIFO_DEPTH = 64
     # Affine-MAC slot operand width -- MUST match zlc_edge_streamer.v SLOT_MUL_WIDTH and
     # engine_model.SLOT_MUL_WIDTH.  Each scan slot VALUE x a 16-bit coeff fits one DSP48E1
@@ -405,6 +405,16 @@ def validate_pulse_streamer_program(
             raise ValueError(f"bus {bus_index} has {bus_segment_counts[bus_index]} segments, above max_bus_segments={max_bus_segments}.")
     if bus_segments and (int(getattr(program, "loop_count", 1)) > 1 and int(getattr(program, "loop_start_index", 0)) != 0):
         raise ValueError("bus_segments do not currently support finite inner repeat brackets.")
+    if int(getattr(program, "repeat_from_index", 0) or 0) != 0:
+        # No compiler emits a nonzero rewind index any more (the additive-delay preamble
+        # design is gone; delays are event-scheduled at the OUTPUT).  The RTL retains the
+        # repeat_from_loop_start branch with zero testbench coverage, and rewinding the
+        # bus segment table mid-timeline would sweep stale stop values across the DAC
+        # pins -- so a hand-built payload setting it is rejected outright.
+        raise ValueError(
+            "repeat_from_index != 0 is not supported: the compiler always rewinds "
+            "repeat_forever from edge 0 (delays are physical output delays, not baked "
+            "preambles).  Remove repeat_from_index from the payload.")
     # RAMP SLOPE: deliberately NOT validated.  The hardware ramp engine is a Bresenham
     # stepper -- per tick it moves floor-line-tracking increments (multiple LSBs for steep
     # ramps), so ANY duration yields the closest realizable staircase to the ideal line,
@@ -428,18 +438,21 @@ def validate_pulse_streamer_program(
                 f"(~{TTL_DELAY_MAX_TICKS * 20e-9:.1f} s at 20 ns/tick); reduce the delay.")
         if bdd == 0:
             continue
-        # DELAYED-RAMP capacity (the one realistic per-DA-bit event-FIFO stressor): a ramp
-        # changes the bus value on up to min(delta, span) ticks (the Bresenham stepping
-        # ticks), and every change inside the delay window d is one in-flight event per
-        # changing bit.  Conservative per-bit bound for a ramp on a DELAYED bus:
-        # min(d, span, delta); a SCANNED endpoint (value_select != 0) is unknown at
-        # compile time, so delta takes its full-scale worst case.  Undelayed buses and
-        # edge segments are not the stressor (an edge is one event per bit; segment count
-        # is capped at max_bus_segments).
+        # DELAYED-bus per-DA-bit event-FIFO capacity.  Every bus value change inside the
+        # delay window d is one in-flight event per changing bit, so the bound is the
+        # number of CHANGES in any d-window: an edge segment contributes 1, a ramp up to
+        # min(delta, span) (one per Bresenham stepping tick; a SCANNED endpoint --
+        # value_select != 0 -- takes its full-scale worst case), and under repeat_forever
+        # a window longer than one frame sees ceil(d / frame) frames' worth of changes.
+        per_frame = 0
+        scanned_any = False
         for seg in (getattr(program, "bus_segments", None) or []):
             sbi = int(getattr(seg, "bus_index", seg.get("bus_index") if isinstance(seg, Mapping) else 0))
+            if sbi != bdi:
+                continue
             smode = str(getattr(seg, "mode", seg.get("mode", "edge") if isinstance(seg, Mapping) else "edge")).lower()
-            if sbi != bdi or smode != "ramp":
+            if smode != "ramp":
+                per_frame += 1
                 continue
             s_tick = int(getattr(seg, "start_tick", seg.get("start_tick") if isinstance(seg, Mapping) else 0))
             e_tick = int(getattr(seg, "stop_tick", seg.get("stop_tick", s_tick) if isinstance(seg, Mapping) else s_tick))
@@ -447,17 +460,21 @@ def validate_pulse_streamer_program(
             v1 = int(getattr(seg, "stop_value", seg.get("stop_value", v0) if isinstance(seg, Mapping) else v0))
             sel0 = int(getattr(seg, "value_select", seg.get("value_select", 0) if isinstance(seg, Mapping) else 0))
             sel1 = int(getattr(seg, "stop_value_select", seg.get("stop_value_select", 0) if isinstance(seg, Mapping) else 0))
-            full_scale = (1 << bus_width) - 1
-            delta = full_scale if (sel0 or sel1) else abs(v1 - v0)
-            span = max(0, e_tick - s_tick)
-            bound = min(bdd, span, delta)
-            if bound > BUS_EVT_FIFO_DEPTH:
-                raise ValueError(
-                    f"bus {bdi}: a DELAYED ramp can hold ~{bound} value-change events in flight "
-                    f"per DA bit (delay {bdd} ticks, ramp span {span} ticks, swing {delta} codes"
-                    f"{' worst-case: a scanned endpoint' if (sel0 or sel1) else ''}), above the "
-                    f"per-bit event FIFO depth {BUS_EVT_FIFO_DEPTH}. Shorten the ramp, reduce the "
-                    f"bus delay, lower the swing, or raise bus_evt_fifo_depth (rebuild).")
+            scanned_any = scanned_any or bool(sel0 or sel1)
+            delta = ((1 << bus_width) - 1) if (sel0 or sel1) else abs(v1 - v0)
+            per_frame += min(delta, max(0, e_tick - s_tick))
+        if per_frame == 0:
+            continue
+        frame_ticks = max(1, int(getattr(program, "loop_end_tick", 0) or 0) or int(program.ticks[-1]))
+        windows = (-(-bdd // frame_ticks)) if bool(getattr(program, "repeat_forever", False)) else 1
+        bound = min(bdd, windows * per_frame)
+        if bound > BUS_EVT_FIFO_DEPTH:
+            raise ValueError(
+                f"bus {bdi}: with a {bdd}-tick delay, up to ~{bound} value-change events sit in "
+                f"flight per DA bit ({per_frame} changes/frame x {windows} frame(s) in the delay "
+                f"window{'; scanned ramp endpoints counted at full scale' if scanned_any else ''}), "
+                f"above the per-bit event FIFO depth {BUS_EVT_FIFO_DEPTH}. Shorten the ramp(s), "
+                f"reduce the bus delay, lower the swing, or raise bus_evt_fifo_depth (rebuild).")
     slot_count = int(getattr(program, "slot_count", 0))
     tick_slot_coeffs = list(getattr(program, "tick_slot_coeffs", None) or [[0] * slot_count for _ in program.ticks])
     if len(tick_slot_coeffs) != len(program.ticks):

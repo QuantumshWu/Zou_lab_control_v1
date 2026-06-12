@@ -512,8 +512,15 @@ class PulseTableState:
                 period = new.periods[period_index]
                 new.periods[period_index] = PulsePeriod(value, period.states, unit="ns", name=period.name)
             elif slot.kind == "dac":
+                # PRESERVE the period's waveform mode (same rule as _apply_slot_binding):
+                # resolving a RAMP-bound slot keeps it a ramp to the resolved value -- it
+                # used to force "edge", so a single-point notebook run of a ramp-bound
+                # pulse played a step instead of the ramp.
                 plan = new.analog_bus_plan(slot.dac_bus)
-                plan[slot.dac_period] = {"mode": "edge", "value": int(round(value))}
+                entry = plan[slot.dac_period] if slot.dac_period < len(plan) else {}
+                mode = str(entry.get("mode", "edge")).strip().lower()
+                plan[slot.dac_period] = {"mode": mode if mode == "ramp" else "edge",
+                                         "value": int(round(value))}
                 new.analog_bus_modes[slot.dac_bus] = plan
         new.scan_slots = []
         new.scan_table = []
@@ -994,11 +1001,11 @@ class PulseTableState:
         """Return a NEW state with the inner finite repeat bracket fully UNROLLED into a
         flat period list (``repeat_count`` becomes 1, the bracket is cleared).
 
-        This is the unifying trick that makes a (constant OR scanned) channel delay work
-        with an inner bracket: once the bracket is flat there is no inner-loop boundary
+        This is the unifying trick that makes a constant channel delay work with an
+        inner bracket: once the bracket is flat there is no inner-loop boundary
         for an additively-shifted edge to cross, so the existing flat machinery (additive
-        delay + reordering delay lanes + affine scan + repeat_forever) handles delays in
-        ANY form.  The whole flat frame can still repeat via ``repeat_forever``.
+        delay + affine scan + repeat_forever) handles delays in ANY form.  The whole
+        flat frame can still repeat via ``repeat_forever``.
 
         Each bracketed ``PulsePeriod`` is duplicated to its new indices -- carrying its
         duration expression (incl. ``sN``), states, unit and name automatically -- and so

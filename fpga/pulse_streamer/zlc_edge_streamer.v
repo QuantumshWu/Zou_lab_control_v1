@@ -7,7 +7,7 @@
 //     points); bus segment tables in LUTRAM (the bus/ramp engine reads them
 //     combinationally every tick, so they MUST stay async-read).
 //   * a depth-FIFO_DEPTH continuous PREFETCH of the next edges (one BRAM read per
-//     cycle, fixed RD_LAT-cycle latency) + FIFO_DEPTH(=RD_LAT+1) edge SHADOWS
+//     cycle, RD_LAT+1-cycle issue-to-data latency) + FIFO_DEPTH(=RD_LAT+2) edge SHADOWS
 //     latched at arm time per boundary, so the four gapless reload sites
 //     (start / loop-rewind / scan-advance / repeat) reseed instantly and
 //     back-to-back **1-tick (20 ns) edges** play one per cycle.
@@ -17,20 +17,23 @@
 //     not-yet-refilled bank STALLS the engine (holds, flags STATUS underflow) --
 //     never emits a wrong point.
 //
-// PROVEN PRE-HARDWARE (no Verilog sim in repo): this module's exact register
-// transfers are mirrored cycle-for-cycle by engine_model.rtl_mirror_play, which
-// is byte-identical to the combinatorial reference_play for every program shape
-// (1-tick spacing included) at read latency 1, 2 AND 3, over hand cases
-// (b2b1/scan1tick/loop1tick) + 400 fuzz programs.  The streaming ping-pong is
-// proven by streaming_scan_play.  See test_final_engine_model_* /
-// test_edge_streamer_rtl_mirror_*.
+// PROVEN PRE-HARDWARE: this module's exact register transfers are mirrored
+// cycle-for-cycle by engine_model.rtl_mirror_play, which is byte-identical to
+// the combinatorial reference_play for every program shape (1-tick spacing
+// included) at read latency 1, 2 AND 3, over hand cases (b2b1/scan1tick/
+// loop1tick) + 400 fuzz programs.  The streaming ping-pong is proven by
+// streaming_scan_play.  On top of that, the xsim testbenches in sim/ run the
+// REAL RTL (and real block-RAM netlists where it matters).  See
+// test_final_engine_model_* / test_edge_streamer_rtl_mirror_* / sim/README.md.
 //
 // SEED INVARIANT (the subtle part the mirror forced out): at every boundary, seed
 // FIFO_DEPTH resident shadows starting at the FIRST not-yet-output edge, and
 // issue NO read at the boundary (occupancy == #shadows <= depth).  The first
 // PREFETCHED edge is issued only when the head fires and frees a slot; with
-// FIFO_DEPTH = RD_LAT+1 that read lands and registers into arm exactly in time
-// for a 1-tick successor.  A 2-shadow seed is one cycle short and drops edges.
+// FIFO_DEPTH = RD_LAT+2 that read lands and registers into arm exactly in time
+// for a 1-tick successor (the issue-to-data latency is RD_LAT+1 because
+// edge_raddr is itself a register -- see the PIPE note at the pend logic).
+// A shorter seed is one cycle short and drops edges.
 //
 // RD_LAT MUST equal the synthesised edge-BRAM read latency; the build tcl FORCES
 // the edge BRAMs to READ_LATENCY_B = 2 so RD_LAT=2 is deterministic.  BANK_SIZE

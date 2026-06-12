@@ -145,6 +145,14 @@ class VivadoAxiStreamerSession:
         self.stream_poll_interval = float(stream_poll_interval)
 
         self._pending: list[tuple[int, int]] = []  # (byte_addr, value) queued writes
+        # DELAY-TAIL DRAIN accounting.  The engine raises DONE the instant the UNDELAYED
+        # stream ends; the event schedulers then keep EMITTING the queued tail for up to
+        # max(delay) more ticks (out[t] = in[t-d] must hold for the WHOLE stream).  The
+        # host owns that tail: wait_done() waits it out after DONE, and prepare()/fire()
+        # refuse to reset/restart the engine before the previous run's drain deadline
+        # (an EXPLICIT safe_state()/off_pulse stays immediate by design).
+        self._tail_seconds: float = 0.0      # max(channel+bus delay) of the prepared program
+        self._drain_until: float = 0.0       # monotonic deadline of the previous finite run
         self._repeat_forever = False
         self._program = None          # last prepared program (for streaming refills)
         self._total_points = 0
@@ -450,6 +458,20 @@ class VivadoAxiStreamerSession:
         # layout (validation above is pure software, so a bad program errors without
         # touching hardware; a mismatched bitstream errors before any register changes).
         self.check_register_layout()
+        # DELAY-TAIL DRAIN: if the PREVIOUS finite run had delayed signals, its event
+        # schedulers are still emitting the queued tail after DONE (out[t] = in[t-d]
+        # holds for the whole stream).  CMD_SAFE would chop that tail, so wait out the
+        # remaining drain deadline first.  An explicit safe_state()/off_pulse does NOT
+        # wait -- stopping immediately is its job.
+        remaining = self._drain_until - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(remaining, float(self.action_timeout or 600.0)))
+        self._drain_until = 0.0
+        # this program's own tail (max channel/bus delay), used by fire()/wait_done()
+        clock = float(getattr(program, "clock_hz", 0.0) or 50e6)
+        tail_ticks = [int(d) for d in (getattr(program, "channel_delays", None) or [])]
+        tail_ticks += [int(getattr(bd, "delay", 0)) for bd in (getattr(program, "bus_delays", None) or [])]
+        self._tail_seconds = (max(tail_ticks) / clock) if tail_ticks else 0.0
         # Halt + reset first so a prior run cannot drive outputs while we rewrite BRAM.
         self._command(CMD_SAFE)
         for word_offset in sorted(image):
@@ -578,6 +600,12 @@ class VivadoAxiStreamerSession:
             st_before = -1
         self._command(CMD_FIRE)
         (self.state_dir / "fire_time.txt").write_text(str(time.monotonic()), encoding="utf-8")
+        # finite run with delayed signals: record the drain deadline (fire + undelayed
+        # duration + tail) so a back-to-back prepare() cannot chop the delayed tail.
+        # repeat_forever has no natural end -- switching programs is an explicit stop.
+        if not self._repeat_forever and self._tail_seconds > 0:
+            dur_s = float(getattr(self._program, "duration", 0.0) or 0.0) * 1e-9
+            self._drain_until = time.monotonic() + dur_s + self._tail_seconds
         # a repeat_forever STREAMED scan (> 2 banks) must be fed continuously while it
         # re-sweeps; a background thread keeps the ping-pong banks loaded.  Start it FIRST,
         # then read STATUS (a plain read, no sleep) so the diagnostic never delays streaming.
@@ -632,6 +660,12 @@ class VivadoAxiStreamerSession:
         while True:
             status = self._read_word(CtrlWords.STATUS)
             if status & STATUS_DONE:
+                # DONE means the UNDELAYED stream ended; delayed signals keep emitting
+                # their queued tail for up to max(delay) more.  Wait it out (bounded by
+                # the caller's deadline) so "done" means the PHYSICAL output is done.
+                if self._tail_seconds > 0:
+                    time.sleep(max(0.0, min(self._tail_seconds, deadline - time.monotonic())))
+                self._drain_until = 0.0    # tail drained; the next prepare need not wait
                 return True
             if self._repeat_forever and (status & STATUS_RUNNING):
                 return True            # background thread keeps a streamed re-sweep fed
@@ -736,6 +770,9 @@ class VivadoAxiStreamerSession:
             self._stream_stop.set()
         self._command(CMD_SAFE)
         self._stop_stream_thread()
+        # an EXPLICIT stop abandons any delayed tail on purpose -- the next prepare()
+        # must not wait out a drain deadline the user just cancelled.
+        self._drain_until = 0.0
 
     # ------------------------------------------------------------------ mailbox
     def _command(self, command: int, *, wait_mask: int | None = None,

@@ -1474,17 +1474,33 @@ class ChannelPanel(FluentGroupBox):
             label.setFixedSize(label_w, row_height)
             self.channel_labels[key] = label
 
+            mixed_delay = False
             if is_bus:
                 member_values = [state.delays.get(channel, 0) for channel in members]
                 member_units = [state.delay_units.get(channel, "ns") for channel in members]
-                delay_value = member_values[0] if member_values and all(value == member_values[0] for value in member_values) else 0
-                delay_unit = member_units[0] if member_units and all(unit == member_units[0] for unit in member_units) else "ns"
+                uniform = member_values and all(value == member_values[0] for value in member_values) \
+                    and all(unit == member_units[0] for unit in member_units)
+                # A notebook can legally give the bus MEMBERS different delays.  The single
+                # bus field cannot show them -- displaying 0 and writing it back on the next
+                # read_state used to SILENTLY DELETE the per-member values.  Show "(mixed)"
+                # instead and leave the state untouched until the user actually types here.
+                mixed_delay = bool(member_values) and not uniform
+                delay_value = member_values[0] if uniform else ""
+                delay_unit = member_units[0] if uniform else "ns"
             else:
                 delay_value = state.delays.get(key, 0)
                 delay_unit = state.delay_units.get(key, "ns")
             # A per-channel delay is a FIXED output delay (a delay line) and is not
             # scannable, so the field is a plain numeric input -- no scan dot.
             delay_edit = FluentLineEdit(str(delay_value))
+            if mixed_delay:
+                delay_edit.setPlaceholderText("(mixed)")
+                delay_edit.setToolTip("Members of this bus carry DIFFERENT delays (set via the "
+                                      "API).  Typing a value here applies it to ALL members; "
+                                      "leaving it untouched keeps the per-member values.")
+                delay_edit._zlc_mixed = True
+                delay_edit.textEdited.connect(
+                    lambda _t, e=delay_edit: setattr(e, "_zlc_mixed", False))
             if is_bus:
                 delay_edit.setToolTip(
                     "Physical DAC-bus output delay (may be negative): the whole bus value shifts "
@@ -1631,6 +1647,10 @@ class ChannelPanel(FluentGroupBox):
         for row_info in self.rows:
             key = str(row_info["key"])
             if key not in self.delay_edits:
+                continue
+            # an untouched "(mixed)" bus field keeps the per-member delays exactly as the
+            # API set them; only an actual edit overwrites all members uniformly.
+            if getattr(self.delay_edits[key], "_zlc_mixed", False):
                 continue
             raw = self.delay_edits[key].text().strip()
             unit = self.delay_units[key].currentText()
@@ -2541,8 +2561,18 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                     members = buses.get(str(key).split(":", 1)[1], [])
                     vals = [state.delays.get(c, 0) for c in members]
                     units = [state.delay_units.get(c, "ns") for c in members]
-                    dval = vals[0] if vals and all(v == vals[0] for v in vals) else 0
-                    dunit = units[0] if units and all(u == units[0] for u in units) else "ns"
+                    uniform = vals and all(v == vals[0] for v in vals) and all(u == units[0] for u in units)
+                    if vals and not uniform:
+                        # per-member delays differ (API-set): show "(mixed)" and protect
+                        # them from being flattened by the next read_values
+                        with _signals_blocked(edit):
+                            edit.setText("")
+                            edit.setPlaceholderText("(mixed)")
+                            edit._zlc_mixed = True
+                        continue
+                    edit._zlc_mixed = False
+                    dval = vals[0] if vals else 0
+                    dunit = units[0] if units else "ns"
                 else:
                     dval = state.delays.get(key, 0)
                     dunit = state.delay_units.get(key, "ns")
@@ -2567,6 +2597,10 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             self._remember_scan_column(state, kind, target, slot_index)
             state.unbind_slot(slot_index)
             self._restore_field_state(state, kind, target)  # put the field back exactly as it was
+        # A dot toggle CHANGES the program that On Pulse would upload -- it must get the
+        # same confocal UNSYNCED treatment as any other edit (the fast path below bypasses
+        # the widget signals that normally call _mark_dirty).
+        self._mark_dirty()
         # Fast path: a scan toggle keeps the structure, so update the existing
         # widgets in place (milliseconds) instead of a full rebuild (~400 ms with
         # all channels shown).  Fall back to load_state if anything looks off.
@@ -2813,8 +2847,14 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         current = self.scan_code.toPlainText()
         if not current.strip() or current == getattr(self, "_scan_auto_code", ""):
             fresh = _default_scan_code(max(1, len(state.scan_slots)))
+            was_dirty = self.scan_run_button.is_dirty()
             self.scan_code.setPlainText(fresh)
             self._scan_auto_code = fresh
+            # This branch only runs when the user has NEVER edited the code (it is
+            # empty or still the previous auto template).  The setPlainText above
+            # fires textChanged -> set_dirty(True), which put a spurious star on
+            # Run every time the tab was opened -- restore the pre-refresh state.
+            self.scan_run_button.set_dirty(was_dirty)
 
     def _run_scan_code(self) -> None:
         try:

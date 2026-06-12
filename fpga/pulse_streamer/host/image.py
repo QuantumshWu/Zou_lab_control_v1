@@ -115,7 +115,11 @@ class StreamerParams:
     tick_width: int = 32
     coeff_frac_bits: int = 8
     max_edges: int = 4096
-    bank_size: int = 512          # scan points per bank (2 banks resident)
+    bank_size: int = 2048         # scan points per bank (2 banks resident).  MUST equal
+    #                               streamer_config.json -- a bare StreamerParams() with a
+    #                               drifted default packs/decodes a DIFFERENT register
+    #                               geometry than the deployed bitstream (locked by
+    #                               test_streamer_params_defaults_match_config).
     bus_count: int = 4
     bus_width: int = 10
     bus_seg_addr_width: int = 6
@@ -224,8 +228,9 @@ def region_bases(p: StreamerParams) -> dict:
     """Word-address bases of each AXI write region (the host<->top contract).
 
     TTL channel delays live in their own DELAY register region (one 32-bit word per
-    channel, delay_region_words reserved) -- the event scheduler's delays outgrew the
-    dense 12-bit CTRL fields, whose words (20..43) are now reserved/unused.  Bus delays
+    channel, delay_region_words reserved).  The CTRL block is the 20 command/mailbox
+    words 0..19, the CLK_ENABLE mask at 20..21, scratch from ctrl_scratch_base, and the
+    hardwired LAYOUT_ID readback at word 63 -- no delay words in CTRL.  Bus delays
     (ring-capped) and the clk mask stay in CTRL."""
     ctrl = 0
     tick = CTRL_WORDS
@@ -699,7 +704,7 @@ def solve_capacity(part, *, channel_count: int = 62, num_slots: int = 4, coeff_w
                    tick_width: int = 32, coeff_frac_bits: int = 8, bus_count: int = 4,
                    bus_width: int = 10, bus_seg_addr_width: int = 6, bus_sel_width: int = 3,
                    slot_mul_width: int = 25,
-                   target_pct: float = 90.0, bank_size: int = 512,
+                   target_pct: float = 90.0, bank_size: int = 2048,
                    max_edges_cap: int = 16384,
                    engine_logic_luts: int = 14405, engine_ff: int = 9000, engine_dsp: int | None = None) -> SolvedCapacity:
     """Maximise max_edges under <=target_pct of the part's RAMB36 (edges are the

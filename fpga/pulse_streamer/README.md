@@ -16,16 +16,17 @@ upload flow, and resource budgets) see the **FPGA manual** in
   block RAMs (tick 32b / coeff 64b / mask 62b, forced `READ_LATENCY_B=2`), a
   depth-`FIFO_DEPTH` (=`RD_LAT`+2=4) continuous edge prefetch that hides the BRAM
   latency so back-to-back 1-tick (20 ns) edges fire one per clock, a 2-bank
-  ping-pong scan window (`BANK_SIZE`=2048, 4096 resident points) for unbounded
-  streamed scans, and the affine effective-tick MAC + analog-bus DAC engine.  A
-  scanned digital DELAY whose edges reorder past other channels is pulled out of
-  the global table onto its own DISJOINT output bit and played by a 1-bit affine
-  sub-player ("delay lane") -- LUTRAM tables, the shared MAC, +0 RAMB36/+0 DSP.
+  continuous cyclic ping-pong scan window (`BANK_SIZE`=2048, 4096 resident
+  points) for unbounded streamed scans, the affine effective-tick MAC + analog-bus
+  DAC engine, and the per-channel/per-DA-bit event-scheduler output delays
+  (`out[t]=in[t-d]`, event FIFOs popped against a free-running 48-bit `g_time`).
 - `zlc_pulse_streamer_top.v`: top wrapper. Region-decoded BRAMs behind an
-  `axi_bram_ctrl` (edge tables + scan window + bus image + lane image) plus a CTRL
-  register file (the COMMAND/STATUS mailbox + streaming `CURSOR`/`BANK_READY`/
-  `BANK*_CHUNK` handshake), driving the engine and the board output pins / four
-  10-bit DAC buses.  A mini-loader copies the bus + lane images into the engine
+  `axi_bram_ctrl` (edge tables + scan window + bus image) plus a CTRL
+  register file (the COMMAND/STATUS mailbox, the streaming `CURSOR`/`BANK_READY`/
+  `BANK*_CHUNK` handshake, the per-channel/per-bus DELAY words, the CLK_ENABLE
+  mask, and the hardwired `LAYOUT_ID` readback word used by the host
+  register-layout handshake), driving the engine and the board output pins /
+  four 10-bit DAC buses.  A mini-loader copies the bus image into the engine
   LUTRAM at LOAD.
 - `create_project.tcl`: create project (jtag_axi + axi_bram_ctrl + 6 BRAMs),
   `zlc_force_latency2` forces the edge BRAMs to `READ_LATENCY_B=2`, synth,
@@ -35,7 +36,12 @@ upload flow, and resource budgets) see the **FPGA manual** in
 - `host/`: the host-side Python that the runtime uses --- `image.py` packs the
   compiled program into the BRAM image and reports `solve_capacity`;
   `engine_model.py` is the cycle-accurate behavioral model used by the contract
-  tests (no Verilog simulator is in the repo).
+  tests.
+- `sim/`: xsim (Vivado simulator) testbenches that run the REAL RTL --- and,
+  where it matters, the real block-RAM IP netlists --- covering the prefetch
+  pipeline, seamless scan wrap, event-scheduler delays, ramp scans, DA clock
+  phase, and a full-chain first-frame regression (`tb_t_ff.v`).  See
+  `sim/README.md` for how to run them.
 
 ## Contract Summary
 
@@ -61,9 +67,11 @@ segment, not hundreds of TTL edge rows.
 Default profile (from `host.image.StreamerParams` / `solve_capacity` on the 35T):
 `CHANNEL_COUNT=62`, `NUM_SLOTS=4`, `MAX_EDGES=4096`, `BANK_SIZE=2048` (4096
 resident points), `TICK_WIDTH=32`, `COEFF_WIDTH=16`, `COEFF_FRAC_BITS=8`,
-`RD_LAT=2`, `FIFO_DEPTH=4`, `CLOCK_HZ=50 MHz` (20 ns tick). Vivado
-`report_utilization` is the final resource authority; the budgeted estimate is
-RAMB36 78% (LUT 26%, FF 12%, DSP 9%).
+`RD_LAT=2`, `FIFO_DEPTH=4`, `EVT_FIFO_DEPTH=128`, `BUS_EVT_FIFO_DEPTH=64`,
+`CLOCK_HZ=50 MHz` (20 ns tick). Vivado `report_utilization` is the final
+resource authority; the conservative host-side estimate (`estimate_resources.bat`)
+is RAMB36 78%, LUT ~97%, FF ~22%, DSP ~58% --- tight on LUTs but the real
+implementation closes (the estimate overcounts distributed RAM).
 
 ## CTRL Register-File Mailbox
 
@@ -82,7 +90,14 @@ BANK_SIZE / SLOT_COUNT
 CURSOR      top -> host   scan points consumed so far (drives streaming refill)
 BANK_READY  host -> top   bit b = bank b is loaded and ready
 BANK0_CHUNK / BANK1_CHUNK host -> top   sweep-chunk index resident in each bank
+CLK_ENABLE  host -> top   per-channel mask: output the 50 MHz clock instead of data
+LAYOUT_ID   top -> host   hardwired register-layout ID (word 63); the host refuses
+                          to drive a bitstream whose layout differs from its own
 ```
+
+Per-channel TTL delays and per-bus DA delays upload through the dedicated
+DELAY register region (one 32-bit word per channel and per bus; see
+`host.image.region_bases`).
 
 Lifecycle: `prepare` (SAFE, upload image, arm banks, LOAD) / `fire` (FIRE) /
 `wait_done` (poll STATUS; stream-refill the freed scan bank behind the cursor) /
