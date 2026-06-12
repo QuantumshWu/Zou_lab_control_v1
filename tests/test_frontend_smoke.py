@@ -1076,6 +1076,46 @@ def test_panel_plot_spec_size_presets_keep_fonts_fixed():
         panel_plot_spec("2d", "2x1", cell_px=(120, 90))
 
 
+@pytest.mark.parametrize("scale_factor", ["1.0", "1.25", "1.5"])
+def test_embedded_canvas_invariants_across_screen_scales(scale_factor):
+    """EmbeddedFigureCanvas geometry invariants at every Windows display scale
+    (the bug class: the stock backend re-derived the figure FROM the widget on
+    ratio syncs, warping the fixed-inches axes on scaled screens -- panels
+    collapsed into a corner on the user's real machine while DPR=1 offscreen
+    looked perfect).  Each scale runs in a SUBPROCESS because QT_SCALE_FACTOR
+    is read once at QApplication creation."""
+
+    import subprocess
+    import sys
+
+    code = (
+        "import numpy as np\n"
+        "from Zou_lab_control.frontend.qt_fluent import ensure_qt_app\n"
+        "ensure_qt_app()\n"
+        "from Zou_lab_control.frontend.live import panel_plot\n"
+        "from Zou_lab_control.frontend.qt_canvas import EmbeddedFigureCanvas\n"
+        "p = panel_plot(np.arange(50.0), np.random.rand(50), kind='1d', size='2x2')\n"
+        "fig = p.fig\n"
+        "design_inches = tuple(round(float(v), 4) for v in fig.get_size_inches())\n"
+        "c = EmbeddedFigureCanvas(fig, display_scale=0.7)\n"
+        "c.setFixedSize(c.sizeHint())\n"
+        "real = float(__import__('os').environ.get('QT_SCALE_FACTOR', '1.0'))\n"
+        "# invariant 1: design inches never change\n"
+        "assert tuple(round(float(v), 4) for v in fig.get_size_inches()) == design_inches\n"
+        "# invariant 2: dpi = design dpi x REAL screen ratio (retina supersampling)\n"
+        "assert abs(fig.dpi - 300 * real) < 1e-6, fig.dpi\n"
+        "# invariant 3: the LOGICAL widget size is scale-independent\n"
+        "assert (c.width(), c.height()) == (588, 459), (c.width(), c.height())\n"
+        "print('DPR-INVARIANTS-OK')\n"
+    )
+    env = dict(__import__("os").environ)
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    env["QT_SCALE_FACTOR"] = scale_factor
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                            env=env, timeout=180)
+    assert "DPR-INVARIANTS-OK" in result.stdout, result.stdout + result.stderr
+
+
 def test_task_console_cards_align_to_the_grid(monkeypatch):
     """A card's fixed size equals EXACTLY its spanned cells (incl. swallowed gaps),
     so mixed-size cards line up on the console grid."""

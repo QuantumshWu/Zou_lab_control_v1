@@ -2,14 +2,26 @@
 
 Figures keep the single frontend font/geometry system (style.DEFAULT_STYLE,
 dpi=300) -- font sizes are NEVER forked per host.  How large a figure APPEARS in
-a Qt window is a display concern, handled here through matplotlib's standard
-device-pixel-ratio path: the canvas reports an inflated ratio, so the figure
-renders at its full pixel size and Qt shows it scaled by ``display_scale`` --
-exactly like an OS high-DPI screen.  Interaction coordinates stay exact (the Qt
-backend converts mouse positions through the same ratio) and the result is
-supersampled, never blurry.
+a Qt window is a display concern, handled here.
 
-Every Qt host that embeds a figure should use :class:`EmbeddedFigureCanvas`
+The frontend's figures have SPEC-OWNED geometry: ``create_axes_fixed`` pins the
+axes at fixed inch offsets, so the figure's size-in-inches is part of the design
+and must NEVER change.  The three invariants this canvas maintains, at every
+screen scale (Windows display scaling, QT_SCALE_FACTOR, screen moves):
+
+1. ``figure.get_size_inches()`` stays at its construction value forever.
+2. ``figure.dpi = design_dpi x REAL screen ratio`` -- genuine high-DPI screens
+   get the standard "retina" supersampling, nothing else touches the dpi.
+3. The widget's LOGICAL size is ``design_px x display_scale`` -- our
+   ``display_scale`` is a pure display zoom on top, with exact interaction
+   coordinates (the backend converts mouse positions through the same ratio).
+
+The stock Qt backend instead re-derives the figure size FROM the widget size on
+every resize/ratio sync, which warps the fixed-inches axes layout the moment
+the ratio changes (panels collapsed into a corner on scaled Windows screens) --
+so ``resizeEvent`` here deliberately never touches the figure.
+
+Every Qt host that embeds a figure must use :class:`EmbeddedFigureCanvas`
 (``display_scale=1.0`` shows 1:1); it also stops wheel events from leaking into
 a surrounding QScrollArea, so in-plot zoom never scrolls the page.
 """
@@ -17,6 +29,7 @@ a surrounding QScrollArea, so in-plot zoom never scrolls the page.
 from __future__ import annotations
 
 try:
+    from PyQt5 import QtWidgets
     from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as _FigureCanvasQTAgg
 except Exception:  # pragma: no cover - depends on the local matplotlib install
     _FigureCanvasQTAgg = None
@@ -30,43 +43,52 @@ else:
         """Matplotlib Qt canvas with a display scale and wheel isolation."""
 
         def __init__(self, figure, *, display_scale: float = 1.0):
-            # must exist BEFORE super().__init__: the base class reads
+            # both must exist BEFORE super().__init__: the base class reads
             # devicePixelRatioF() (overridden below) during construction.
             self._zlc_ratio = 1.0 / max(0.1, float(display_scale))
+            self._zlc_inches = tuple(float(v) for v in figure.get_size_inches())
             super().__init__(figure)
-            # The backend normally syncs its cached ratio in showEvent (via the
-            # window's screen signals) -- too late here, and never offscreen.
-            # Sync NOW.  The sync re-derives the FIGURE size from the widget's
-            # current logical size (inflating the figure by our ratio), so pin
-            # the figure back to its own pixel size and give the widget the
-            # corresponding logical size; the resulting resizeEvent re-derives
-            # the figure at exactly its original pixels.  Later screen changes
-            # still re-sync through the stock signals (times our factor).
-            width_px, height_px = map(float, figure.bbox.max)
-            self._update_pixel_ratio()
-            ratio = self.devicePixelRatioF() or 1.0
-            figure.set_size_inches(width_px / figure.dpi, height_px / figure.dpi, forward=False)
-            self.resize(round(width_px / ratio), round(height_px / ratio))
+            # the backend syncs only in showEvent / on screen signals (never
+            # offscreen) -- establish the invariants NOW
+            self._zlc_sync()
 
+        # ------------------------------------------------------------- ratio math
         def devicePixelRatioF(self):  # noqa: N802 - Qt naming
             # The backend derives the render-buffer size, sizeHint, mouse-event
             # coordinates and the painter's image scaling from this one ratio.
             return (super().devicePixelRatioF() or 1.0) * self._zlc_ratio
 
         def _set_device_pixel_ratio(self, ratio):
-            # The stock implementation also MAGNIFIES figure.dpi by the ratio --
-            # the "retina" semantics: same on-screen size, more pixels.  Our
-            # display_scale wants the OPPOSITE: keep the figure's design pixels
-            # and show them SMALLER.  So inflate the dpi only by the REAL screen
-            # ratio (preserving genuine high-DPI behaviour) and never by our
-            # display factor, which therefore acts as a pure display zoom.
+            # Reroute every stock sync (showEvent, screen/dpi-change signals)
+            # through our math: the stock implementation magnifies figure.dpi by
+            # the FULL ratio ("retina": same on-screen size) and then re-derives
+            # the figure from the widget -- both break the spec-owned geometry.
             if getattr(self, "_device_pixel_ratio", None) == ratio:
                 return False
-            real = super().devicePixelRatioF() or 1.0
-            self.figure._set_dpi(self.figure._original_dpi * real, forward=False)
-            self._device_pixel_ratio = ratio
+            self._zlc_sync()
             return True
 
+        def _zlc_sync(self) -> None:
+            real = super().devicePixelRatioF() or 1.0
+            figure = self.figure
+            # invariant 1: the design inches NEVER change (fixed-inches axes)
+            figure.set_size_inches(*self._zlc_inches, forward=False)
+            # invariant 2: retina supersampling by the REAL screen ratio only
+            figure._set_dpi(figure._original_dpi * real, forward=False)
+            self._device_pixel_ratio = real * self._zlc_ratio
+            # invariant 3: logical widget size = design px x display_scale
+            width_px, height_px = map(float, figure.bbox.max)
+            self.resize(round(width_px / self._device_pixel_ratio),
+                        round(height_px / self._device_pixel_ratio))
+
+        def resizeEvent(self, event):  # noqa: N802 - Qt naming
+            # spec-owned figure: NEVER re-derive the figure geometry from the
+            # widget size (the stock handler does, and any transient mismatch
+            # warps the fixed-inches axes layout).  Accept the size, repaint.
+            QtWidgets.QWidget.resizeEvent(self, event)
+            self.draw_idle()
+
+        # ------------------------------------------------------------- behaviour
         def wheelEvent(self, event):  # noqa: N802 - Qt naming
             # in-plot wheel zoom must never double as a page scroll
             super().wheelEvent(event)
