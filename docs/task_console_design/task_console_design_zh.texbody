@@ -1,0 +1,449 @@
+% Source of the Task-console design review document.
+% Rebuild (only the PDF lands here; this .texbody is the tracked source):
+%   python docs/task_console_design/build.py
+% Figures are regenerated into assets/ by the same script.
+
+\chapter{这份文档讲什么}
+
+这是一份\tfocus{独立的设计审查文档}，专讲实验侧的 Task 控制台（task console）及其依赖的 frontend 组件。目标是把\tfocus{设计思路、实现方式、以及如何接到真实设备上}一次讲透，供你审查并决定下一步方向。它不是面向终端用户的操作手册（那部分在 frontend 中文手册的"Task 控制台"与"对外接口完整参考"两章），而是面向\tfocus{维护者与你本人}的架构说明。
+
+\section{覆盖范围}
+\begin{itemize}
+  \item 动机：为什么要做实验侧仪表盘，它在整个系统里的位置。
+  \item 三层架构与解耦：\pyapi{SignalHub} / Feed / \pyapi{TaskConsole}，以及它们\tfocus{只通过信号集线器耦合}这一原则。
+  \item 每一层的契约与实现细节，连同关键的"坑"与设计取舍。
+  \item 面板几何的 confocal 模数规则，以及 frontend 的\tfocus{密封 API 契约}（美术/几何/dpi 由 frontend 拥有）。
+  \item Setting 弹窗、Panel Editor 标签页、暂停语义、命名任务、状态保存、性能优化。
+  \item \tfocus{如何扩展到真实设备}（重点章节），含与 references 里 Rb87 qCMOS 读出流程的对接。
+  \item 测试覆盖、公共/内部函数索引、已知限制与待决方向。
+\end{itemize}
+
+\section{涉及的源文件}
+\begin{description}
+  \item[\filepath{frontend/task\_console.py}] 控制台主体：\pyapi{TaskConsole}、\pyapi{PanelCard}、\pyapi{PanelConfig}、\pyapi{TaskConsoleState}、Panel Editor、命名任务。
+  \item[\filepath{neutral\_atom/core/signals.py}] \pyapi{SignalHub}：线程安全命名信号环。
+  \item[\filepath{neutral\_atom/operations/feeds.py}] \pyapi{ExperimentFeed} / \pyapi{VirtualLoadingFeed}：数据生产者循环。
+  \item[\filepath{frontend/live.py}] 绘图工厂 \pyapi{plot}/\pyapi{panel\_plot}、五个 live 绘图类、\pyapi{FigureSpec} 几何、\pyapi{panel\_plot\_spec}。
+  \item[\filepath{frontend/qt\_canvas.py}] \pyapi{EmbeddedFigureCanvas}/\pyapi{panel\_canvas}：高 DPI 嵌入封装。
+  \item[\filepath{frontend/qt\_fluent.py}] Fluent 控件库 + \pyapi{resolve\_fluent\_auto\_scale} + \pyapi{FluentTabWidget}。
+  \item[\filepath{frontend/data\_figure.py}] \pyapi{DataFigure}：拟合 / 存图 / 单位换算（编辑器复用）。
+  \item[\filepath{task\_console.py} / \filepath{task\_console.bat}] 根启动器。
+\end{description}
+
+\section{如何重建本文档}
+源是同目录的 \filepath{task\_console\_design\_zh.texbody}；运行 \filepath{docs/task\_console\_design/build.py} 会重新生成 \filepath{assets/} 里的截图并在临时目录里编译，\tfocus{只把 PDF 拷回本目录}（走 frontend 的密封 PDF 接口 \pyapi{render\_notes\_pdf}，不留任何 .tex/.aux/.log 等中间产物）。
+
+
+\chapter{总览:实验侧的可配置仪表盘}
+
+\section{它解决什么问题}
+脉冲编辑器（pulse GUI）解决的是\tfocus{实验的输出侧}——怎么定义并下发时序到 FPGA。Task 控制台解决的是\tfocus{实验的输入/监控侧}——实验跑起来之后，怎么\tfocus{实时看}原子装载、计数分布、读出保真度、逐站占据这些量，并且让这套监控\tfocus{可配置、可保存、可在不同实验间复用}。
+
+一句话：它是一个网格仪表盘，里面摆任意多个\tfocus{实时面板}，每个面板用一小段\tfocus{表达式}接到实验信号上，整套布局存成一个命名的"任务"，需要时一键载回。
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\textwidth]{assets/dashboard.png}
+  \caption{默认任务 \pyapi{atom\_loading\_monitor}：左上相机帧、右上占据站点图、计数分布(自动双高斯)、装载率滚动轨迹、底部逐站装载率。顶栏:任务名 / Presets 下拉 / 摘要 / 面板类型 / Add Panel / Pause Plot / Pause Meas. / Save / Load;两个标签页 Dashboard 与 Panel Editor。}
+\end{figure}
+
+\section{设计原则(贯穿全文)}
+\begin{enumerate}
+  \item \tfocus{三层解耦，只经 hub 通信}。采集线程、数据生产者、GUI 三者互不直接引用，唯一的共享态是 \pyapi{SignalHub}。这让虚拟实验与真机、单 feed 与多 feed、notebook 与独立窗口都能复用同一套面板。
+  \item \tfocus{数据来源是表达式，不是下拉框}。面板不绑定到某个固定信号，而是跑一行 Python（\pyapi{value = ...}），所以"两个实验装载率相减"这种需求天然支持，且新增信号无需改 GUI。
+  \item \tfocus{美术/几何由 frontend 拥有，对外密封}。面板尺寸只能从有限预设里选，dpi/边距/字号/阴影/缩放规则外部都改不了——这样任意类型/尺寸的面板能严丝合缝拼接，且在不同 Windows DPI 下不崩。
+  \item \tfocus{轻控件常驻、重控件进标签页}（借鉴 confocal）。Setting 弹窗只放高频的数据/显示配置；命令行拟合、x/y 范围、单位换算、存图这些重控件放到 Panel Editor 标签页，避免 Setting 过载。
+  \item \tfocus{虚拟与真机零修改通用}。虚拟 feed 发布的信号名（\pyapi{frame}/\pyapi{counts}/\pyapi{occupied}/\pyapi{centers}/\pyapi{rate}……）就是约定；真机沿用同名发布，同一个命名任务在两边都能用。
+\end{enumerate}
+
+
+\chapter{三层架构与解耦}
+
+\section{数据流}
+\begin{codeblock}[text]
+  采集 / 实验循环                Feed (生产者)              TaskConsole (消费者/GUI)
+  ───────────────               ──────────────             ──────────────────────
+  相机/检测产生一个 shot   →     shot() 组装命名值     →    QTimer 轮询 hub.version
+                                hub.publish({...})          有新版本 → 每个面板
+                                                            refresh(namespace):
+                                                              exec 表达式 → value
+                                                              _feed(value) → 更新图
+\end{codeblock}
+
+三者\tfocus{只通过 \pyapi{SignalHub} 耦合}：
+\begin{itemize}
+  \item Feed 只知道"往 hub publish 命名值"，不知道有没有 GUI、有几个面板。
+  \item TaskConsole 只知道"从 hub 读最新值/历史"，不知道数据是虚拟渲染的还是真相机来的。
+  \item 采集循环（真机）可以是 Feed 的后台线程，也可以是 notebook 里你自己的 \pyapi{for} 循环——只要每个 shot 调一次 \pyapi{hub.publish}。
+\end{itemize}
+
+\section{为什么这样分}
+这套分层直接决定了"扩展到真机"有多容易（见第 \ref{ch:realdevice} 章）：把虚拟 Feed 换成真机采集循环，GUI 一行都不用改。解耦的代价是多了一层 hub 的拷贝/版本管理，但换来的是\tfocus{可测试}（同步 \pyapi{step()} 驱动，无线程）、\tfocus{可移植}（布局 JSON 不含任何机器相关的几何）、\tfocus{可复用}（多 feed 同 hub 做 A$-$B）。
+
+
+\chapter{SignalHub:数据契约}
+
+\pyapi{SignalHub}（\filepath{neutral\_atom/core/signals.py}）是采集侧与 GUI 之间\tfocus{唯一的共享态}：一个线程安全的命名信号环。
+
+\section{发布侧}
+\pyapi{hub.publish(values: Mapping[str, object], *, shot=None) -> int}：把一批命名值写入。每个值被\tfocus{强制转成 float ndarray（标量变成 0 维）并拷贝}——所以生产者可以随意复用自己的缓冲区，不必担心 GUI 读到半写状态。返回新的 version 号。
+
+\section{消费侧}
+\begin{description}
+  \item[\pyapi{latest(name)}] 最新值：0 维返回 float，否则返回 ndarray 的拷贝；不存在抛 \pyapi{KeyError}（错误信息列出可用名）。
+  \item[\pyapi{history(name, n=None) -> ndarray}] 最近若干 shot 堆叠，\tfocus{形状 (shots, *value\_shape)}，axis 0 是 shot；不足 n 返回现有；值的形状变过时只保留最近一段同形状的连续区。
+  \item[\pyapi{names() -> list[str]}] 当前所有信号名（排序）。Setting 的信号下拉就是调它。
+  \item[\pyapi{snapshot\_latest() -> dict}] 一致快照（一次性拿到所有最新值）——这就是面板表达式求值的命名空间底座。
+  \item[\pyapi{version} / \pyapi{shot}] 版本计数 / shot 计数。控制台用 version 跳过"没有新数据"的刷新。
+\end{description}
+
+\section{线程安全与 version 跳刷}
+publish 与读取都在锁内做副本，所以采集线程和 GUI 线程互不撕裂。控制台的 \pyapi{\_tick} 先比较 \pyapi{hub.version}：没变就直接返回，不做任何绘图工作——空闲时近乎零开销。
+
+\section{约定俗成的信号名}
+虚拟 feed 发布、且真机建议沿用的一组名字（沿用它们 = 同一命名任务在虚拟/真机间零修改通用）：
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+信号 & 形状 & 含义 \\
+\midrule
+\pyapi{frame} & (H, W) & 最新相机帧 \\
+\pyapi{counts} & (N\_sites,) & 逐站 ROI 计数 \\
+\pyapi{occupied} & (N\_sites,) & 逐站 0/1 占据 \\
+\pyapi{rate} & 标量 & 滚动装载率 \\
+\pyapi{rate\_sites} & (N\_sites,) & 逐站滚动装载率 \\
+\pyapi{rate\_grid} & (rows, cols) & 网格形状的逐站率 \\
+\pyapi{centers} & (N\_sites, 2) & 标定的站点中心(相机像素) \\
+\pyapi{thresholds} & (N\_sites,) & 逐站阈值 \\
+\pyapi{shot} & 标量 & shot 计数 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+
+\chapter{Feed:数据生产者}
+
+\section{ExperimentFeed 基类}
+\filepath{neutral\_atom/operations/feeds.py} 的 \pyapi{ExperimentFeed} 拥有发布循环；子类只实现一个 \pyapi{shot()}（产一个 shot 的 \{名:值\}）。
+\begin{description}
+  \item[\pyapi{step()}] 同步跑一个 shot 并 publish（加 \pyapi{prefix}）。测试/notebook 用——无线程、确定性。
+  \item[\pyapi{start(rate\_hz=5.0)}] 守护线程按速率循环 \pyapi{step}；记住 \pyapi{rate\_hz} 以便 Pause/Resume 用原速率恢复。线程里 \pyapi{shot()} 抛异常会退避重试而不是静默杀掉线程（控制台显示陈旧数据）。
+  \item[\pyapi{stop()} / \pyapi{running}] 停线程 / 是否在跑。
+  \item[\pyapi{prefix}] 多 feed 同 hub 时的命名前缀（如 \pyapi{b\_}）——这就是 A$-$B 的基础。
+\end{description}
+
+\section{VirtualLoadingFeed:自含虚拟装载实验}
+\pyapi{VirtualLoadingFeed} 内部用 \pyapi{VirtualTrapArray} 渲染荧光帧，并用\tfocus{与真实流水线相同}的 \pyapi{find\_site\_centers} / \pyapi{roi\_counts} / Otsu 阈值\tfocus{自标定}。每个 shot 发布上表那组信号。这一点很关键：虚拟 feed 不是"假数据"，它走的是和真机一样的检测原语，所以面板表达式、拟合、站点图在虚拟上验证通过 = 在真机上同样成立。
+
+\section{多 feed 做 A$-$B}
+默认启动开两个 feed：主 feed（无前缀）+ 一个 \pyapi{b\_} 前缀的副 feed（装载率不同）。于是 \pyapi{value = rate\_grid - b\_rate\_grid} 这种跨实验相减开箱即用。
+
+
+\chapter{面板模型}
+
+\section{五种面板类型(kind)}
+\begin{center}
+\begin{tabular}{@{}llp{0.5\textwidth}@{}}
+\toprule
+kind & 绘图类 & 用途 \\
+\midrule
+\pyapi{2d} & \pyapi{Live2DDis} & 图像+侧分布+colorbar+可拖 clim（相机帧、网格率） \\
+\pyapi{sites} & \pyapi{LiveSiteMap} & 原子阵列站点图:每站一个实心圆按值着色+可垫相机帧 \\
+\pyapi{1d} & \pyapi{Live1D} & 一维折线（逐站量、横轴站号） \\
+\pyapi{monitor} & \pyapi{LiveLiveDis} & 标量滚动轨迹+侧分布 \\
+\pyapi{hist} & \pyapi{HistogramFigure} & 直方图+自动双高斯+可拖阈值线+保真度 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{来源=表达式}
+每个面板的数据来源是一行 Python，赋给 \pyapi{value}（与脉冲 GUI 的 Scan 页同一套"本地可信代码"信任模型——只跑你自己写的）：
+\begin{codeblock}[Python]
+value = frame                          # 最新相机帧 -> 2D
+value = occupied                       # 每站 0/1 占据 -> Site map
+value = rate_sites                     # 逐站装载率 -> Site map / 1D
+value = history('counts', 200).ravel() # 最近 200 shot 计数 -> Distribution
+value = rate_grid - b_rate_grid        # 两个实验相减 -> 2D
+\end{codeblock}
+命名空间 = hub 的一致快照（每个信号名直接可用）+ \pyapi{history}/\pyapi{latest}/\pyapi{names}/\pyapi{shot}/\pyapi{np}/\pyapi{math}。
+
+\section{错误隔离与形状自适应}
+\pyapi{PanelCard.refresh(namespace)} 把表达式求值与喂图包在 try 里：\tfocus{某个面板表达式报错，错误只显示在该面板自己的状态行（红字）}，其余面板照常刷新，控制台循环不受影响。\pyapi{\_coerce} 按 kind 校验/降采样 value（2D 对 >192 维做步进降采样保证每 tick 便宜；sites 限站点数）。\pyapi{\_feed} 里只有当 value 形状变化（换表达式/尺寸/参数）才重建该面板的图，否则增量更新。
+
+
+\chapter{面板几何:confocal 模数规则}
+
+这是面板能整齐拼接的根本，也是 frontend 密封 API 的核心体现。
+
+\section{所有 kind 共享同一块 plot 区域}
+\pyapi{panel\_plot\_spec(size)}（\filepath{frontend/live.py}）对\tfocus{每一种 kind} 返回同一套几何：
+\begin{itemize}
+  \item \pyapi{PANEL\_SIZES = ("1x2", "2x2", "1x4", "2x4")}，含义是"行$\times$列的半单元数"。
+  \item \pyapi{2x2} = frontend 的标准 plot 区域，数据区 $480\times360$，边距 \pyapi{(110,110,100,70)}（左右下上；顶 70 是 title 槽，常备，与有没有标题无关）。
+  \item \pyapi{1x2} = 半高，\pyapi{2x4} = 双宽。
+  \item 2D 与 Site map 在\tfocus{自己的区域内部}做 $[0.75, 0.1, 0.1]$ 水平分割（主图+侧分布+colorbar），所以 \pyapi{2x2} 主图恰好 $360\times360$ \tfocus{正方形}且与 colorbar 顶底对齐——这正是不同类型面板能整齐排版的原因。
+\end{itemize}
+对外接口只有 \pyapi{panel\_plot(data, kind=, size=)} 与 \pyapi{panel\_plot\_spec(size)}：\tfocus{尺寸是唯一旋钮}，几何/dpi/边距不可外部配置（\pyapi{panel\_size\_cells} 校验尺寸，非预设抛错）。
+
+\section{显示缩放:qt\_canvas 三不变量}
+面板图通过 \pyapi{qt\_canvas.panel\_canvas(figure)} 嵌入，封装常数 \pyapi{PANEL\_DISPLAY\_SCALE=0.7}。\pyapi{EmbeddedFigureCanvas} 维持三条不变量（在 QT\_SCALE\_FACTOR 1.0/1.25/1.5 三档离屏复现+验证）：① figure inches 构造后永不变；② \pyapi{fig.dpi} = 设计 dpi $\times$ 真实屏幕比例（标准 retina，显示因子绝不进 dpi）；③ 控件逻辑尺寸 = 设计 px $\times$ display\_scale。\pyapi{resizeEvent} 故意不从控件尺寸反推 figure——这是高 DPI 真机布局曾经崩坏的根因修复（见性能/契约章）。
+
+
+\chapter{卡片与布局}
+
+\section{卡片=带标题的 Fluent 卡}
+\pyapi{PanelCard} 继承 \pyapi{FluentGroupBox}，卡框标题=面板类型（2D image / Site map / …），带 fluent 阴影（\pyapi{CachedDropShadow}，按 silhouette 缓存、move 时不重新模糊）。画布下方、卡片底部一行灰色状态行（当前 shot + 来源表达式回显）。标题行右端一个 \pyapi{Setting} 文字按钮（出错变红、错误进 tooltip）。
+
+\section{模数闭合:footer 吸收差额}
+图本身=plot 区域+边距，边距不随数据区折半，所以\tfocus{光靠 canvas 永远对不齐网格}。卡框的状态行区按行数\tfocus{吸收这点差额}：\pyapi{\_card\_size(size) = rows$\times$pitch\_y - gap}，使得\tfocus{一张 2x2 卡严格等于两张 1x2 卡叠起来加一道间隙}（竖直 pitch 323、水平 259，契约测试锁定 \pyapi{2$\times$315+8 == 638}）。任意尺寸混排严丝合缝。
+
+\section{拖动吸附 + 推挤防重叠}
+排版不用填行列数字：\tfocus{按住卡片边框（画布以外的空白）拖动}，松手 \pyapi{\_pos\_to\_slot} 吸附到网格槽并写回 config。\tfocus{卡片间不允许重叠}——\pyapi{\_resolve\_collisions} 在落点被占时把被压住的卡向下\tfocus{级联挤开}，拖动的卡始终保住目标槽（推挤只增加 row、不动 active 卡，保证收敛）。
+
+
+\chapter{Setting 弹窗:轻量配置}
+
+卡片标题行的 \pyapi{Setting} 按钮打开该面板的设置弹窗（confocal 风格），从上到下三/四组——\tfocus{换数据动 Source、换显示动 Display、即时生效}：
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.62\textwidth]{assets/setting.png}
+  \caption{Site map 面板的 Setting 弹窗:Source(信号下拉/表达式+Apply)、Display(size + 声明式参数 centers/image/colormap)、Panel(标题/Edit…/Save Fig/Remove)。边框按 objectName 作用域,不级联到子控件。}
+\end{figure}
+
+\begin{description}
+  \item[Source] \pyapi{signal} 下拉列出 hub 此刻真实存在的所有信号名——选一个面板立即切到 \pyapi{value = 信号名}；要做运算就在表达式框写一行点 \pyapi{Apply}。出错时 \pyapi{Setting} 按钮变红。
+  \item[Display] \pyapi{size} 预设 + 该类型自己的\tfocus{声明式参数}（\pyapi{PANEL\_PARAMS} 里一行一个 \pyapi{ParamSpec}，控件自动生成、随布局 JSON 保存）：2D 的 colormap；Site map 的 centers/image 信号名+colormap；Rolling/1D 的 relim（tight/normal）；Rolling 的历史长度；Distribution 的 bins。
+  \item[Fit（仅线型面板）] 预设模型快速拟合当前数据（重的命令行拟合在 Editor 里）。
+  \item[Panel] 标题、\pyapi{Edit…}（跳 Panel Editor）、\pyapi{Save Fig}（一键存图）、\pyapi{Remove}。
+\end{description}
+
+\begin{notebox}
+\textbf{坑（已修）}：弹窗边框必须按 objectName 作用域 \pyapi{QFrame\#zlcPanelSettings}。裸 \pyapi{QFrame \{ border \}} 会级联到所有 QFrame 派生子控件——而 QLabel/QComboBox/QSpinBox 内部都是 QFrame，曾导致每个标签/控件周围多出 1px 杂线。容器描边一律用 \pyapi{\#objectName} 或 \pyapi{paintEvent}。
+\end{notebox}
+
+\section{声明式参数:加一个旋钮=一行}
+\pyapi{ParamSpec(key, label, kind, default, choices=, lo=, hi=, tooltip=)}，\pyapi{kind} 取 \pyapi{choice}/\pyapi{int}/\pyapi{signal}。Setting 控件、JSON 持久化、改动后重建全部自动跟上；\pyapi{\_set\_param} 是唯一写入口。要给某类面板加一个可配置项，就在 \pyapi{PANEL\_PARAMS[kind]} 加一行——不用写 bespoke 控件。
+
+
+\chapter{Panel Editor 标签页:重控件之家}
+
+\section{为什么是一个标签页}
+confocal 里可配置项极多（命令拟合、x/y 范围、单位、存图……），全塞进 Setting 弹窗会过载。借鉴脉冲 GUI 的多标签布局，控制台是一个 \pyapi{FluentTabWidget}：\pyapi{Dashboard}（实时网格）+ \pyapi{Panel Editor}（重控件）。在面板 Setting 里点 \pyapi{Edit…} 即跳到编辑页。
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\textwidth]{assets/editor.png}
+  \caption{Panel Editor:绑定面板当前数据的快照(灰散点),命令行拟合叠加(橙色高斯曲线+蓝色公式+参数读数),Fit 行(模型+自由文本 args+Fit+Clear),Axes 行(x/y limits+Apply+Unit+relim),Save Fig + Refresh,状态行。}
+\end{figure}
+
+\section{快照模型(关键设计)}
+点 Edit 时，编辑器\tfocus{绑定该面板当前数据的一份快照}——用 \pyapi{panel\_plot} 在更大尺寸（\pyapi{2x4}）重建一个\tfocus{独立的 plotter}（不是 live 卡那个）。理由：
+\begin{itemize}
+  \item 天然契合"\tfocus{冻结细看}"工作流（配合 Pause Plot 更稳）：编辑器看的是一帧定格数据，不会被实时刷新搅动。
+  \item \tfocus{不打扰仪表盘}：编辑/拟合/改范围都作用在编辑器自己的图上，Dashboard 照常实时刷新。
+  \item \pyapi{Refresh} 重新抓一份当前快照。
+\end{itemize}
+
+\section{编辑器控件(详细参考 confocal)}
+\begin{description}
+  \item[命令行拟合] 模型下拉（Lorentzian/Gaussian/Exp decay/Rabi）+ 一行\tfocus{自由文本参数}，注入到拟合调用（本地可信代码，\pyapi{eval(f"\_df.\{method\}(\{cmd\})")}，与 confocal 的 \pyapi{:} 框同理）：\pyapi{p0=[...]} 给初值、\pyapi{名字=值} 固定某命名参数、\pyapi{is\_fit=False} 只按初值叠加。橙色拟合曲线+公式+参数读数叠加在图上，\pyapi{Clear} 移除。底层是 \pyapi{DataFigure}（与 notebook 的 \pyapi{p.data\_figure.lorent()} 同源）。
+  \item[x/y 范围] 四框 + \pyapi{Apply lim}（\pyapi{DataFigure.xlim/ylim}）；打开时自动回填当前坐标范围。
+  \item[Unit] 在已定义的单位环上循环（GHz/nm/MHz 或 ns/us/ms，\pyapi{DataFigure.change\_unit}）。
+  \item[relim] tight/normal，即时重建编辑快照并记到该面板的 config。
+  \item[Save Fig] \pyapi{<标题>.png} + 数据 \pyapi{.npz}（时间戳）到 \filepath{tasks/}（\pyapi{DataFigure.save} 返回 \{figure, data\}）。
+\end{description}
+
+\begin{notebox}
+\textbf{坑（已修）}：编辑器改 relim \tfocus{不能}走 \pyapi{card.\_set\_param}——它内部 \pyapi{\_reset\_plot} 会把 live 卡的 plotter 置 None，编辑器随后从 \pyapi{card.plotter} 读快照就会崩。正确做法:直接写 \pyapi{card.config.params}+标脏+只重建编辑器快照。
+\end{notebox}
+
+
+\chapter{暂停语义:两个独立的冻结}
+
+实验里"暂停"有两层含义，控制台给了\tfocus{两个独立按钮}：
+\begin{description}
+  \item[Pause Plot] 停面板刷新 timer。\tfocus{数据仍在流进 hub}，只是画面冻结——正是"冻结后做拟合/细看"的场景。
+  \item[Pause Meas.] 停/启 feeds（实验数据源本身，不再产新 shot）。无可控 feed（如 notebook 自管循环）时禁用。
+\end{description}
+两者正交：冻结画面不影响采集，暂停采集不影响 timer。典型流程:Pause Plot → 在 Editor 里 Fit/细看 → Resume Plot。
+
+
+\chapter{命名任务仪表盘}
+
+布局（面板、位置、尺寸、表达式、参数）整包存成\tfocus{一个 JSON}，文件名即任务名。三个入口等价：
+\begin{itemize}
+  \item GUI：顶栏 \pyapi{Presets…} 下拉列出全部可载任务（内置 + \filepath{tasks/} 里每个 JSON），选中即整套载入；\pyapi{Save} 默认存到 \filepath{tasks/任务名.json}。\pyapi{Save*} 黄星=有未保存改动。
+  \item 命令行：\pyapi{task\_console.bat --task atom\_loading\_monitor}。
+  \item Notebook：\pyapi{zf.show\_task\_console(hub=hub, task="atom\_loading\_monitor")}。
+\end{itemize}
+内置出厂任务 \pyapi{BUILTIN\_TASKS}：\pyapi{atom\_loading\_monitor}（装载图+占据站点图+计数分布+装载率+逐站条）与 \pyapi{loading\_rate\_live}（轻量装载率监控）。\tfocus{在 tasks/ 里存同名 JSON 即覆盖内置版本}——想改造出厂布局，载入、拖一拖、Save 就行。配一套新任务（如 \pyapi{atom\_temp\_monitor}）：载入最接近的现有任务 → 增删面板、把 Source 指到温度实验发布的信号 → 改任务名 → Save。
+
+\section{状态序列化}
+\pyapi{TaskConsoleState}（schema/version 2）：\pyapi{name}/\pyapi{interval\_ms}/\pyapi{panels[]}；每个 \pyapi{PanelConfig} 含 \pyapi{kind/title/row/col/size/source/params}，\pyapi{to\_dict}/\pyapi{from\_dict} 往返。\tfocus{布局 JSON 不含任何几何像素}（几何归 frontend），所以跨机器可移植。
+
+
+\chapter{性能}
+
+\section{瓶颈定位}
+对 refresh tick 做 cProfile（离屏、5 面板、96$\times$128 帧 + 35 站 + 增长历史）：约 \tfocus{90\% 的时间在两处 scipy \pyapi{curve\_fit}}——直方图双高斯拟合 \pyapi{HistogramFigure.\_fit\_bimodal} 与滚动轨迹高斯拟合 \pyapi{LiveLiveDis.\_update\_gauss\_fit}，都在为 scipy 的有限差分 Jacobian 买单。
+
+\section{优化(全部 logic/appearance-neutral)}
+\begin{itemize}
+  \item \tfocus{解析 Jacobian}:给两处 \pyapi{curve\_fit} 提供解析梯度(\pyapi{\_bimodal\_jac}/\pyapi{\_gauss\_func\_jac})。同模型同 p0 同 bounds → 收敛参数完全一致(实测 popt 相对差 1e-10),只是去掉了有限差分的目标重算。
+  \item 可复用守卫 \pyapi{BaseLivePlot.\_set\_colorbar\_ticks}:limits 不变时跳过 colorbar 重标(occupancy 钉 0..1 时常发生),标签相同故外观一致。
+  \item \pyapi{set\_status} 仅在 ok$\leftrightarrow$error 跳变时重设样式表,不每 tick 重建同一串。
+\end{itemize}
+结果:稳态 refresh 均值 \tfocus{14.55 → 9.64 ms}(中位 14.43 → 9.61),完全不改逻辑/外观。拖拽路径 0.015 ms/op(非瓶颈);阴影按 silhouette 缓存,move 不重新模糊。不做"降低拟合频率"那类会改刷新节奏=改外观的优化。
+
+
+\chapter{frontend 密封 API 契约}
+
+frontend 对外暴露一个\tfocus{小而密封}的接口:外部只传数据+少量语义选项,拿回正确的美术/几何/dpi/字体,\tfocus{绝不能通过任何公共接口搞乱视觉设计}。权威定义在 \filepath{frontend/\_\_init\_\_.py} 模块文档 + \filepath{frontend/AGENTS.md} + \filepath{docs/MAINTAINER\_NOTES.md} §18。六条规则:
+\begin{enumerate}
+  \item 几何被拥有、永不外传:\pyapi{plot()}/\pyapi{panel\_plot()} 拒绝 \pyapi{spec}/\pyapi{data\_px}/\pyapi{margins\_px}/\pyapi{dpi}/\pyapi{bad\_color}/\pyapi{colors}(内部几何走私有 \pyapi{plot(\_spec=)})。
+  \item 尺寸/cmap 是 curated 且入口校验(\pyapi{PANEL\_SIZES}/\pyapi{panel\_size\_cells});pulse 几何常量私有化。
+  \item 一套排版一个 dpi:\pyapi{style.DEFAULT\_STYLE} 是只读 \pyapi{MappingProxyType}。
+  \item 一条缩放规则:\pyapi{resolve\_fluent\_auto\_scale}(GUI)+\pyapi{panel\_canvas}/\pyapi{PANEL\_DISPLAY\_SCALE}(嵌入图);\pyapi{show\_*} 默认 \pyapi{scale=None}。
+  \item 带美术的 fluent 控件保持内部:\pyapi{qt\_fluent.*}/\pyapi{qt\_canvas.*} 不进 \pyapi{\_\_all\_\_}(阴影/边框/圆角是构造细节)。
+  \item 加公共参数前先分类:DATA(labels/title/bins/thresholds/relim/cmap-from-list/channels)允许;ART/GEOMETRY/TYPOGRAPHY 只能在内部类上。
+\end{enumerate}
+Task 控制台严格遵守:面板只通过 \pyapi{panel\_plot}+size 预设作图,拟合只经 \pyapi{DataFigure(card.plotter)},改图只改 \pyapi{config}+重建——从不戳 figure inches/边距。
+
+
+\chapter{frontend 绘图组件参考}
+
+\section{工厂与 live 类}
+\pyapi{plot(data\_x, data\_y, *, kind, update, labels, display, data\_figure, ...)} 是统一工厂(数组契约 \pyapi{data\_x=(N,coord\_dim)}/\pyapi{data\_y=(N,channel\_dim)});\pyapi{panel\_plot(data, *, kind, size)} 是它的仪表盘特化(不 display、不附 DataFigure,由宿主嵌 canvas)。五个 live 类:\pyapi{Live1D}/\pyapi{Live2DDis}/\pyapi{LiveLiveDis}/\pyapi{HistogramFigure}/\pyapi{LiveSiteMap},都公共导出、可直接构造,但首选 \pyapi{plot()}。
+
+\section{LiveSiteMap(本轮新增)}
+原子阵列站点图:\pyapi{data\_x} 是 \pyapi{(N,2)} 站点中心(相机像素),\pyapi{data\_y} 是逐站值;每站一个 \pyapi{EllipseCollection} 实心圆按值着色,可选 \pyapi{image} 垫相机帧底图、\pyapi{cmap}、\pyapi{roi\_radius}。\tfocus{同 2D 的 [0.75,0.1,0.1] 分割},square 主图与 colorbar 逐像素对齐——融入既有几何而非另起炉灶。
+
+\section{DataFigure(拟合/存图/单位)}
+\pyapi{DataFigure(live\_plot)} 从一个 live 绘图对象建数据句柄。关键方法:\pyapi{lorent}/\pyapi{gaussian}/\pyapi{decay}/\pyapi{rabi}/\pyapi{lorent\_zeeman}/\pyapi{center}(都接 \pyapi{p0=}/\pyapi{is\_fit=}/\pyapi{\*\*kwargs} 固定命名参数)、\pyapi{xlim}/\pyapi{ylim}、\pyapi{change\_unit}(单位环)、\pyapi{clear}、\pyapi{save(path)}(写 png+npz、时间戳、返回 \{figure,data\})。编辑器与 Setting 的拟合/存图全部复用它。
+
+\section{新增一种 plot type 的方法(以 sites 为模板)}
+\begin{enumerate}
+  \item 在 \filepath{live.py} 写一个 \pyapi{BaseLivePlot} 子类,几何\tfocus{必须}走 \pyapi{panel\_plot\_spec} 的共享区域(用 \pyapi{split\_axes\_horizontally} 等),并进 \pyapi{plot()} 工厂的 kind 分发 + \pyapi{\_normalize\_kind} 别名。
+  \item 在 \filepath{task\_console.py} 的 \pyapi{PANEL\_KINDS}/\pyapi{\_DEFAULT\_SOURCES}/\pyapi{PANEL\_PARAMS} 各加一项;\pyapi{\_coerce}/\pyapi{\_build\_plot}/\pyapi{\_feed} 各加一个分支。
+  \item 若需要辅助信号(如 sites 的 centers/image),在 \pyapi{\_xxx\_aux(namespace)} 里取并校验,错误进该面板状态行。
+  \item 可视化改动必须用 \pyapi{devtools.capture\_user\_view} 三档缩放截图验收(\pyapi{parity} 目标对比两 GUI 控件尺寸)。
+\end{enumerate}
+
+
+\chapter{扩展到真实设备}
+\label{ch:realdevice}
+
+这是你最关心的部分:虚拟仪表盘怎么变成真机监控台。\tfocus{核心结论:GUI 一行不用改,只需把虚拟 feed 换成真机采集循环、按约定信号名 publish。}
+
+\section{最小接线(notebook,自管循环)}
+\begin{codeblock}[Python]
+from Zou_lab_control import frontend as zf
+from Zou_lab_control.neutral_atom.core.signals import SignalHub
+import Zou_lab_control.neutral_atom as na
+
+hub = SignalHub()
+console = zf.show_task_console(hub=hub, task="atom_loading_monitor")
+
+exp = na.connect("virtual")            # 真机换成对应 config
+centers = exp.readout.sitemap(frames=12, display=False).calibration.centers
+rate = None
+for shot in range(100000):
+    frame = exp.camera.acquire(1, sequence=exp.sequence,
+                               sequencer=exp.devices.sequencer)[0]
+    det = exp.readout.from_image(frame, display=False)   # AtomDetection
+    occ = det.occupied.astype(float)
+    rate = occ.mean() if rate is None else 0.95*rate + 0.05*occ.mean()
+    hub.publish({"frame": frame, "counts": det.counts, "occupied": occ,
+                 "centers": centers, "rate": rate, "shot": float(shot)})
+\end{codeblock}
+要点:① 沿用约定信号名,\pyapi{atom\_loading\_monitor} 任务零修改即工作;② \pyapi{centers} 来自一次 sitemap 标定(\pyapi{TrapCalibration.centers}),让 Site map 面板有站点坐标;③ \pyapi{readout.from_image} 走的就是虚拟 feed 自标定用的同一套检测原语,所以行为一致。
+
+\section{后台 feed 类(推荐的真机封装)}
+更干净的做法是写一个 \pyapi{ExperimentFeed} 子类,把上面循环体放进 \pyapi{shot()},然后 \pyapi{feed.start(rate\_hz=...)} 跑后台线程、\pyapi{show\_task\_console(hub=hub, feeds=[feed])}。这样 Pause Meas. 按钮能直接停/启采集。骨架:
+\begin{codeblock}[Python]
+class AtomLoadingFeed(ExperimentFeed):
+    def __init__(self, hub, session, *, prefix=""):
+        super().__init__(hub, prefix=prefix)
+        self.exp = session
+        self.centers = session.readout.sitemap(frames=12, display=False).calibration.centers
+        self._rate = None
+    def shot(self):
+        frame = self.exp.camera.acquire(1, sequence=self.exp.sequence,
+                                        sequencer=self.exp.devices.sequencer)[0]
+        det = self.exp.readout.from_image(frame, display=False)
+        occ = det.occupied.astype(float)
+        self._rate = occ.mean() if self._rate is None else 0.95*self._rate + 0.05*occ.mean()
+        return {"frame": frame, "counts": det.counts, "occupied": occ,
+                "centers": self.centers, "rate": self._rate}
+\end{codeblock}
+\tfocus{线程安全}:\pyapi{shot()} 只产数据、\pyapi{publish} 负责拷贝,GUI 在另一线程读副本——生产者可放心复用缓冲。阻塞式硬件采集放在 feed 线程,绝不放 UI 线程。
+
+\section{对接 references 里的 Rb87 qCMOS 读出}
+\filepath{references/.../rb87\_readout\_v16} 是一套真实 qCMOS 读出流程:4-shot group(20ms 参考$\times$3 + 短曝光读出)、模板找站点(\pyapi{find\_sites\_from\_template}, 35 站)、PSF 加权提取标量信号(box/psf/weighted-logpsf)、20ms 参考双高斯定阈值、短曝光 per-site 阈值训练出保真度 \pyapi{F\_bal}、单帧 \pyapi{single\_predict} 出占据。映射到本仪表盘:
+\begin{center}
+\begin{tabular}{@{}p{0.46\textwidth}p{0.46\textwidth}@{}}
+\toprule
+Rb87 读出产出 & 仪表盘信号 / 面板 \\
+\midrule
+短曝光帧 & \pyapi{frame} → 2D image \\
+\pyapi{single\_predict} 占据 (35,) & \pyapi{occupied} → Site map(占据)/1D \\
+per-site 信号 (photons) & \pyapi{counts} → Distribution(双高斯+阈值) \\
+站点格点中心 (35,2) & \pyapi{centers} → Site map 站点坐标 \\
+装载率 = mean(occupied) & \pyapi{rate} → Rolling trace \\
+逐站 F\_bal / 阈值 & \pyapi{fidelity\_sites} / \pyapi{thresholds} → 1D / Site map \\
+\bottomrule
+\end{tabular}
+\end{center}
+也就是说:把 Rb87 读出循环的每个 group 算完后 \pyapi{hub.publish} 这些量,现成的 \pyapi{atom\_loading\_monitor} 任务就直接显示;保真度、参考标签有效率这类\tfocus{慢量}另开 Rolling trace/1D 面板把 Source 指过去即可。\pyapi{rb\_plots.py} 里现有的画图(per-site 分布网格、参考双高斯、ablation 曲线)中,分布/站点图/滚动量都已被现有面板覆盖;\tfocus{时序漂移、per-site 保真度条、ablation 曲线}是目前面板覆盖不到、值得新增的类型(见下章待决方向)。
+
+\section{真机 vs 虚拟的唯一差别}
+虚拟 feed 用 \pyapi{VirtualTrapArray} 渲帧,真机用相机;两者都走 \pyapi{find\_site\_centers}/\pyapi{roi\_counts}/Otsu。所以:\tfocus{在虚拟上设计好的任务、验证过的面板/拟合,接真机时不需要改任何 GUI 代码},只换数据源。这正是三层解耦的回报。
+
+
+\chapter{测试与验收}
+
+\begin{itemize}
+  \item 契约/渲染:hub 契约、feed 信号+收敛、五种面板渲染+更新、A$-$B 表达式+错误隔离、布局 JSON 往返、增删+脏星+存盘、命名任务往返+覆盖、信号下拉、Site map 坏 centers 隔离。
+  \item 几何/缩放:confocal 模数契约(签名=["size"]、dpi、margins、PANEL\_SIZES)、卡片 tiling(\pyapi{2x(1x2)+gap==2x2})、\pyapi{EmbeddedFigureCanvas} 三档缩放不变量、两 GUI auto-scale parity。
+  \item 密封 API:\pyapi{plot/panel\_plot} 拒绝几何 kwargs、\pyapi{DEFAULT\_STYLE} 只读、\pyapi{pulse\_plot\_spec} 无 margins/dpi。
+  \item 性能中立:解析 Jacobian 与有限差分收敛参数 1e-10 一致。
+  \item 编辑器:多 tab、Edit 绑定快照、命令拟合叠加、Apply lim、Save Fig 产 png+npz、Clear。
+  \item PDF 接口:\pyapi{render\_tex\_pdf} 临时目录只产 pdf、\pyapi{render\_notes\_pdf} docs 只留 pdf。
+  \item \tfocus{可视化验收强制规则}:任何 UI/plot 改动必须 \pyapi{capture\_user\_view} 三档 QT\_SCALE\_FACTOR(1.0/1.25/1.5)整窗截图 + 1:1 裁剪;DPR=1 离屏通过不算通过。
+\end{itemize}
+当前全量 286 测试绿。
+
+
+\chapter{公共接口与内部结构索引}
+
+\section{对外公共(notebook/实验室会调)}
+\begin{description}
+  \item[\pyapi{zf.show\_task\_console(*, hub, state=None, task=None, feeds=(), scale=None, window\_ratio=0.84, title=...)}] 开控制台窗口。
+  \item[\pyapi{zf.panel\_plot(data\_x, data\_y=None, *, kind, size="2x2", \*\*kwargs)}] 仪表盘面板工厂。
+  \item[\pyapi{zf.plot(...)}] 通用绘图工厂(notebook)。
+  \item[\pyapi{SignalHub} / \pyapi{publish}/\pyapi{latest}/\pyapi{history}/\pyapi{names}/\pyapi{snapshot\_latest}] 数据契约。
+  \item[\pyapi{ExperimentFeed}/\pyapi{VirtualLoadingFeed}] 生产者基类与虚拟实现。
+\end{description}
+
+\section{task\_console.py 内部要点}
+\pyapi{PANEL\_KINDS}/\pyapi{PANEL\_PARAMS}/\pyapi{ParamSpec}/\pyapi{FIT\_MODELS}/\pyapi{FITTABLE\_KINDS};\pyapi{BUILTIN\_TASKS}/\pyapi{resolve\_task\_state}/\pyapi{list\_task\_presets};几何 \pyapi{\_grid\_pitch}/\pyapi{\_card\_size}/\pyapi{\_pos\_to\_slot}/\pyapi{\_resolve\_collisions};\pyapi{PanelCard}(\pyapi{\_build\_settings}/\pyapi{\_make\_param\_widget}/\pyapi{\_feed}/\pyapi{\_build\_plot}/\pyapi{\_do\_fit}/\pyapi{\_save\_fig});\pyapi{TaskConsole}(\pyapi{\_build\_ui}/\pyapi{\_build\_editor\_tab}/\pyapi{\_edit\_card}/\pyapi{\_editor\_rebuild}/\pyapi{\_editor\_do\_fit}/\pyapi{\_toggle\_pause}/\pyapi{\_toggle\_measurement})。
+
+
+\chapter{已知限制与待决方向}
+
+下面是\tfocus{留给你决定}的方向(按我判断的价值排序)，每条注明现状与代价。
+
+\begin{enumerate}
+  \item \tfocus{真机 feed 类入库}。现在只有 \pyapi{VirtualLoadingFeed};建议加一个从 \pyapi{NeutralAtomSession} 采集循环 publish 的 \pyapi{AtomLoadingFeed}(上一章给了骨架),让真机开箱即用。代价小、价值高。
+  \item \tfocus{保真度/温度等"派生量"的标准产出}。Rb87 读出的 \pyapi{F\_bal}、参考标签有效率、release-recapture 温度等慢量,目前要用户自己在循环里算并 publish。可考虑在 readout 子系统里提供"逐 shot 派生量"helper,使 \pyapi{atom\_temp\_monitor}/\pyapi{fidelity\_monitor} 这类任务也开箱即用。
+  \item \tfocus{时序/漂移面板}。现有 monitor 是单标量滚动;Rb87 的"站点中心随 group 漂移""逐站 F\_bal 条形""drop-worst-sites ablation 曲线"是新面板类型(多线/条形/scatter)。要不要加,取决于你日常盯哪些量。
+  \item \tfocus{编辑器是否要直接编辑 live 图}。目前编辑器是\tfocus{快照}(冻结、独立)。若你想在编辑器里直接调 live 卡的 clim/范围并实时反映到 Dashboard,需要 reparent live canvas 或双向同步,复杂度上一个台阶。我倾向保持快照模型(简单、安全),除非你明确要 live 编辑。
+  \item \tfocus{2D 的 clim 数值框}。现在 2D clim 靠侧分布拖拽(交互式);要不要在编辑器给 2D 加 clim 数值框 + cmap 下拉(\pyapi{DataFigure.change\_cmap} 已有)。
+  \item \tfocus{拟合模型扩展}。现有 Lorentzian/Gaussian/Exp decay/Rabi;Rb87 常用的双高斯(分布面板已自动做)、lorentz\_zeeman 等可加进编辑器下拉(DataFigure 已支持)。
+  \item \tfocus{控制台↔脉冲 GUI 联动}。同一进程里共享 sequencer,在控制台里直接触发 on\_pulse / 改 detection time 并看结果——把"配置脉冲→采集→监控"闭环到一个窗口。这是较大的一步,需要想清交互。
+  \item \tfocus{多 group / 4-shot 结构}。Rb87 是 4-shot group;若要在仪表盘层面理解 group(而不是把 group 算完再 publish 一个标量),需要 hub/feed 支持 group 语义。多数情况下"循环里算完再 publish"已足够,不必上 group 抽象。
+\end{enumerate}
+
+\section{我的建议}
+按价值/代价,我建议下一步优先 (1) 真机 feed 类 + (2) 派生量 helper,让真机监控开箱即用;(3) 时序/保真度面板按你实际要盯的量再定。(4)(7) 是更大的架构决定,建议你审查本文后明确方向再做。
