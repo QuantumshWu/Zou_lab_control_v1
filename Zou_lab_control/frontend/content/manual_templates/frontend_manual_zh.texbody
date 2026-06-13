@@ -897,9 +897,13 @@ Task 控制台（\filepath{task\_console.bat} / \pyapi{frontend.show\_task\_cons
 卡片标题行右端的 \pyapi{Setting} 文字按钮打开该面板的设置弹窗（confocal 风格），从上到下三组——\tfocus{你想换数据就动 Source，想换显示就动 Display，全部即时生效}：
 \begin{description}
   \item[Source（接什么数据）] \pyapi{signal} 下拉列出 hub 里\tfocus{此刻真实存在的所有信号名}——选一个，面板立即切到 \pyapi{value = 信号名}，不用打字。要做运算（差值、切片、历史堆叠）就在下面的表达式框写一行 Python 并点 \pyapi{Apply}（或回车）；下拉会自动回显纯信号表达式。命名空间：每个信号名（最新值）、\pyapi{history(name, n)}、\pyapi{latest(name)}、\pyapi{names()}、\pyapi{shot}、\pyapi{np}、\pyapi{math}。表达式出错时 \pyapi{Setting} 按钮变红，错误只落在\tfocus{该面板自己}的状态行，其余面板照常刷新。
-  \item[Display（怎么显示）] \pyapi{size} 尺寸预设 + 该类型自己的参数，全部\tfocus{改动即生效}：2D 的 colormap；Site map 的 \pyapi{centers}/\pyapi{image} 信号名与 colormap（\pyapi{image} 留空＝不垫相机帧）；Rolling trace 的历史长度；Distribution 的 bin 数。这些参数是\tfocus{声明式}的（\pyapi{PANEL\_PARAMS} 里一行一个 \pyapi{ParamSpec}），控件由声明自动生成，并随布局 JSON 一起保存。
+  \item[Display（怎么显示）] \pyapi{size} 尺寸预设 + 该类型自己的参数，全部\tfocus{改动即生效}：2D 的 colormap；Site map 的 \pyapi{centers}/\pyapi{image} 信号名与 colormap（\pyapi{image} 留空＝不垫相机帧）；Rolling trace / 1D vector 的 \pyapi{relim}（\pyapi{tight}＝紧贴数据 / \pyapi{normal}＝留边距）；Rolling trace 的历史长度；Distribution 的 bin 数。这些参数是\tfocus{声明式}的（\pyapi{PANEL\_PARAMS} 里一行一个 \pyapi{ParamSpec}），控件由声明自动生成，并随布局 JSON 一起保存。
+  \item[Fit（仅线型面板：1D vector / Rolling trace）] 选拟合模型（Lorentzian / Gaussian / Exp decay / Rabi）点 \pyapi{Fit}，对面板\tfocus{当前显示的数据}拟合并叠加曲线、参数显示在状态行；\pyapi{Clear} 移除。\tfocus{典型用法：先点标题栏 Pause Plot 冻结画面，再 Fit、细看}（线型面板每帧重建，不冻结则叠加只存活一帧）。复用 \pyapi{DataFigure} 拟合（与 notebook 的 \pyapi{p.data\_figure.lorent()} 同源）。
   \item[Panel（这张卡）] 面板标题（显示在图内）与 \pyapi{Remove} 移除。
 \end{description}
+\begin{notebox}
+弹窗边框\tfocus{只描在弹窗自身}（作用域 \pyapi{QFrame\#zlcPanelSettings}）。教训：裸 \pyapi{QFrame \{ border \}} 会级联到所有 QFrame 派生子控件——QLabel/QComboBox/QSpinBox 内部都是 QFrame，曾在每个标签/控件周围多出 1px 杂线。容器描边一律用 \pyapi{\#objectName} 作用域或 \pyapi{paintEvent}，绝不拼无作用域 \pyapi{border}。
+\end{notebox}
 常用表达式示例：
 \begin{codeblock}[Python]
 value = frame                          # 最新相机帧 -> 2D
@@ -912,7 +916,7 @@ value = rate_grid - b_rate_grid        # 两个实验相减 -> 2D
 \section{布局：拖动吸附的模数化卡片}
 面板尺寸是\tfocus{有限的预设组合}（\pyapi{frontend.PANEL\_SIZES}：\pyapi{1x2 / 2x2 / 1x4 / 2x4}，行$\times$列的"半单元"数）。设计规则与 confocal 一致：\tfocus{所有面板类型共享同一块 plot 区域和同一组边距}——\pyapi{2x2} 就是 frontend 的标准 plot 区域（数据区 $480\times360$），\pyapi{1x2} 是它的半高，\pyapi{2x4} 是双宽。2D 与 Site map 在\tfocus{自己的区域内部}做 $[0.75, 0.1, 0.1]$ 水平分割，所以 \pyapi{2x2} 的主图恰好 $360\times360$ \tfocus{正方形}且与 colorbar 顶底对齐——不同类型面板因此能整齐排版。接口只有 \pyapi{panel\_plot(data, kind=..., size=...)} 与 \pyapi{panel\_plot\_spec(size)}（\filepath{frontend/live.py}）：\tfocus{尺寸是唯一旋钮，几何与美术不对外暴露}。
 
-每个面板是一张\tfocus{带阴影的标题卡片}（fluent 卡片设计），卡框标题＝面板类型，画布下方、卡片底部一行灰色状态行（当前 shot 与来源表达式回显）。排版不用填行列数字：\tfocus{按住卡片边框（画布以外的任何空白处）拖动}，松手时卡片自动\tfocus{吸附到网格槽}；\tfocus{卡片间不允许重叠}——落点被占时，被压住的卡会被向下\tfocus{挤开}（级联让位），拖动的卡始终落在你放下的位置。卡片外框恰好等于整数个布局槽（卡框状态行区吸收图边距的模数差额），所以\tfocus{一张 $2\times2$ 卡严格等于两张 $1\times2$ 卡叠起来加一道间隙}，任意尺寸混排严丝合缝。标题栏：\pyapi{Add Panel} 按所选类型加面板，\pyapi{Pause/Resume} 暂停刷新，面板值形状变化（换表达式/尺寸/参数）自动重建该面板。
+每个面板是一张\tfocus{带阴影的标题卡片}（fluent 卡片设计），卡框标题＝面板类型，画布下方、卡片底部一行灰色状态行（当前 shot 与来源表达式回显）。排版不用填行列数字：\tfocus{按住卡片边框（画布以外的任何空白处）拖动}，松手时卡片自动\tfocus{吸附到网格槽}；\tfocus{卡片间不允许重叠}——落点被占时，被压住的卡会被向下\tfocus{挤开}（级联让位），拖动的卡始终落在你放下的位置。卡片外框恰好等于整数个布局槽（卡框状态行区吸收图边距的模数差额），所以\tfocus{一张 $2\times2$ 卡严格等于两张 $1\times2$ 卡叠起来加一道间隙}，任意尺寸混排严丝合缝。标题栏：\pyapi{Add Panel} 按所选类型加面板；\tfocus{两个独立的暂停按钮}——\pyapi{Pause Plot} 冻结面板刷新（数据仍流进 hub，便于冻结画面做拟合/细看）、\pyapi{Pause Meas.} 停/启 feeds（实验数据源本身，无可控 feed 时禁用）；面板值形状变化（换表达式/尺寸/参数）自动重建该面板。
 
 \section{命名任务仪表盘：设计一次，随处载回}
 布局（面板、位置、尺寸、表达式、参数）整包存成\tfocus{一个 JSON}，文件名就是任务名。三个入口完全等价：

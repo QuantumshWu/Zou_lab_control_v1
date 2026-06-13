@@ -50,6 +50,7 @@ class ExperimentFeed:
         """Publish shots from a daemon thread at ``rate_hz`` until ``stop()``."""
         if self._thread is not None and self._thread.is_alive():
             return self
+        self.rate_hz = float(rate_hz)   # remembered so a paused feed can resume at the same rate
         self._stop.clear()
         period = 1.0 / max(0.1, float(rate_hz))
 

@@ -124,15 +124,32 @@ PANEL_PARAMS: dict[str, tuple[ParamSpec, ...]] = {
                   tooltip="Signal for the camera-frame underlay (blank for none)"),
         ParamSpec("cmap", "colormap", "choice", "viridis", choices=CMAPS, tooltip="Site-value colormap"),
     ),
-    "1d": (),
+    "1d": (
+        ParamSpec("relim", "relim", "choice", "tight", choices=("tight", "normal"),
+                  tooltip="Auto-scale mode: tight = fit the data exactly, normal = pad the limits"),
+    ),
     "monitor": (
         ParamSpec("length", "history", "int", 300, lo=20, hi=10_000,
                   tooltip="Rolling history length (shots kept on screen)"),
+        ParamSpec("relim", "relim", "choice", "tight", choices=("tight", "normal"),
+                  tooltip="Auto-scale mode: tight = fit the data exactly, normal = pad the limits"),
     ),
     "hist": (
         ParamSpec("bins", "bins", "int", 60, lo=5, hi=500, tooltip="Histogram bins"),
     ),
 }
+
+# Curve-fit overlays a panel can run on its CURRENT data (pair with "Pause Plot"
+# to freeze the trace, fit, and inspect).  label -> DataFigure method name; only
+# the line kinds (1d / monitor) support fitting -- hist already auto-fits a
+# bimodal, 2d/sites don't apply.
+FIT_MODELS: dict[str, str] = {
+    "Lorentzian": "lorent",
+    "Gaussian": "gaussian",
+    "Exp decay": "decay",
+    "Rabi": "rabi",
+}
+FITTABLE_KINDS = ("1d", "monitor")
 
 # Card geometry (raw px, matching the raw-px canvas).  The card is a titled
 # frame (title = panel kind) whose FOOTER absorbs the modulus difference: the
@@ -430,6 +447,7 @@ class PanelCard(FluentGroupBox):
         self._value_shape: tuple[int, ...] | None = None
         self._compiled_source = config.source
         self._drag_offset: QtCore.QPoint | None = None
+        self._fit_df = None                        # DataFigure holding the current fit overlay
         self.setCursor(QtCore.Qt.OpenHandCursor)   # the frame border drags
 
         holder = QtWidgets.QVBoxLayout(self)
@@ -475,8 +493,13 @@ class PanelCard(FluentGroupBox):
         (title, Remove).  Every widget keeps the stock fluent size."""
 
         popup = QtWidgets.QFrame(self, QtCore.Qt.Popup)
+        # SCOPE the border to the popup itself by objectName: a bare `QFrame { border }`
+        # rule cascades to every QFrame-derived child -- and QLabel/QComboBox/QSpinBox
+        # internals ARE QFrames, so the unscoped rule drew stray 1px lines around the
+        # labels and controls inside.  `#id` keeps the border on the popup only.
+        popup.setObjectName("zlcPanelSettings")
         popup.setStyleSheet(
-            f"QFrame {{ background: white; border: 1px solid {DIVIDER};"
+            f"QFrame#zlcPanelSettings {{ background: white; border: 1px solid {DIVIDER};"
             f" border-radius: {scaled_px(6)}px; }}")
         form = QtWidgets.QVBoxLayout(popup)
         pad = scaled_px(10)
@@ -543,6 +566,20 @@ class PanelCard(FluentGroupBox):
             self.param_widgets[spec.key] = widget
             display_row.extend([widget, tag(spec.label)])
         row(*display_row, stretch_first=False)
+
+        # ---- Fit: fit the CURRENT data and overlay (line kinds only) --------
+        if self.config.kind in FITTABLE_KINDS:
+            section("Fit")
+            self.fit_combo = FluentComboBox()
+            self.fit_combo.addItems(list(FIT_MODELS))
+            self.fit_combo.setMinimumWidth(scaled_px(120, minimum=96))
+            self.fit_combo.setToolTip("Curve to fit to the panel's current data")
+            fit_button = FluentButton("Fit", color=ACCENT)
+            fit_button.setToolTip("Fit the curve to the data shown now (pause the plot first to fit a frozen trace)")
+            fit_button.clicked.connect(self._do_fit)
+            clear_fit = FluentButton("Clear", color=GREY)
+            clear_fit.clicked.connect(self._clear_fit)
+            row(self.fit_combo, fit_button, clear_fit, stretch_first=False)
 
         # ---- Panel: title + remove -----------------------------------------
         section("Panel")
@@ -615,6 +652,46 @@ class PanelCard(FluentGroupBox):
             return
         self.source_edit.setText(f"value = {name}")
         self._apply_source()                      # picking a signal applies instantly
+
+    # ------------------------------------------------------------- fit overlay
+    def _do_fit(self) -> None:
+        """Fit the chosen curve to the panel's CURRENT data and overlay it.
+
+        Pair with "Pause Plot": freeze the trace, fit, read off the params.  A
+        live (unpaused) panel rebuilds every tick, so the overlay would only
+        survive one frame -- that is the intended workflow, not a bug."""
+        if self.plotter is None or self.canvas is None:
+            self.set_status("no data to fit yet", error=True)
+            return
+        method = FIT_MODELS.get(self.fit_combo.currentText())
+        if method is None:
+            return
+        try:
+            from .data_figure import DataFigure
+            if self._fit_df is not None:
+                self._fit_df.clear()
+            self._fit_df = DataFigure(self.plotter)
+            result, _ = getattr(self._fit_df, method)(is_display=True)
+            self.canvas.draw_idle()
+            popt = getattr(result, "popt", None)
+            names = getattr(result, "names", None) or []
+            if popt is None:
+                self.set_status(f"fit {self.fit_combo.currentText()}: did not converge", error=True)
+                return
+            shown = ", ".join(f"{n}={v:.4g}" for n, v in zip(names, popt)) or "done"
+            self.set_status(f"fit {self.fit_combo.currentText()}: {shown}", error=False)
+        except Exception as exc:
+            self.set_status(f"fit failed: {str(exc).splitlines()[0][:120]}", error=True)
+
+    def _clear_fit(self) -> None:
+        if self._fit_df is not None:
+            try:
+                self._fit_df.clear()
+            except Exception:
+                pass
+            self._fit_df = None
+            if self.canvas is not None:
+                self.canvas.draw_idle()
 
     def set_status(self, text: str, *, error: bool) -> None:
         # Text changes every tick ("shot N") -- but the COLOUR/stylesheet only
@@ -822,7 +899,8 @@ class PanelCard(FluentGroupBox):
             history = np.full(length, np.nan)
             self.plotter = panel_plot(
                 np.arange(length, dtype=float), history, kind="monitor", size=size,
-                labels=("Shots ago", label, "Z"), relim_mode="tight",
+                labels=("Shots ago", label, "Z"),
+                relim_mode=str(self.config.params.get("relim", "tight")),
                 title=self.config.title or None)
             self.plotter.roll(float(value), draw=False)
         elif kind == "hist":
@@ -834,7 +912,8 @@ class PanelCard(FluentGroupBox):
             vec = np.asarray(value, dtype=float).reshape(-1)
             self.plotter = panel_plot(
                 np.arange(len(vec), dtype=float), vec, kind="1d", size=size,
-                labels=("Site", label, "Z"), relim_mode="tight",
+                labels=("Site", label, "Z"),
+                relim_mode=str(self.config.params.get("relim", "tight")),
                 title=self.config.title or None)
         self.canvas = panel_canvas(self.plotter.fig)
         self.canvas_holder.insertWidget(0, self.canvas, alignment=QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop)
@@ -853,6 +932,7 @@ class PanelCard(FluentGroupBox):
         canvas, plotter = self.canvas, self.plotter
         self.canvas = None
         self.plotter = None
+        self._fit_df = None     # the fit overlay references the old axes; drop it
         if canvas is not None:
             self.canvas_holder.removeWidget(canvas)
             canvas.deleteLater()
@@ -974,8 +1054,17 @@ class TaskConsole(QtWidgets.QWidget):
         self.kind_combo.setFixedWidth(scaled_px(108, minimum=92))
         add_button = FluentButton("Add Panel", color=ACCENT)
         add_button.clicked.connect(self._add_panel)
-        self.pause_button = FluentButton("Pause", color=ACCENT)
+        # Two independent freezes (see _toggle_pause / _toggle_measurement):
+        #  Pause Plot  -> stop refreshing the panels; data still flows into the hub,
+        #                 so you can freeze the display and fit / inspect carefully.
+        #  Pause Meas. -> stop the feeds (the experiment data source) themselves.
+        self.pause_button = FluentButton("Pause Plot", color=ACCENT)
+        self.pause_button.setToolTip("Freeze the panel display (data keeps arriving) — fit / inspect, then Resume")
         self.pause_button.clicked.connect(self._toggle_pause)
+        self.meas_button = FluentButton("Pause Meas.", color=ACCENT)
+        self.meas_button.setToolTip("Pause the measurement feeds (stop producing new shots)")
+        self.meas_button.clicked.connect(self._toggle_measurement)
+        self.meas_button.setEnabled(bool(self._controllable_feeds()))
         self.save_button = FluentButton("Save", color=ACCENT)
         self.save_button.clicked.connect(self.save_to_file)
         load_button = FluentButton("Load", color=ORANGE)
@@ -984,7 +1073,8 @@ class TaskConsole(QtWidgets.QWidget):
         for widget in (self.status_dot, self.name_edit, self.preset_combo):
             header.addWidget(widget)
         header.addWidget(self.summary, 1)
-        for widget in (self.kind_combo, add_button, self.pause_button, self.save_button, load_button):
+        for widget in (self.kind_combo, add_button, self.pause_button, self.meas_button,
+                       self.save_button, load_button):
             header.addWidget(widget)
         root.addWidget(header_frame)
 
@@ -1060,14 +1150,49 @@ class TaskConsole(QtWidgets.QWidget):
             self._mark_dirty()
 
     def _toggle_pause(self) -> None:
+        """Pause/resume the PLOT refresh: freezes the display while data keeps
+        flowing into the hub, so you can fit and inspect a frozen trace."""
         if self._timer.isActive():
             self._timer.stop()
-            self.pause_button.setText("Resume")
+            self.pause_button.setText("Resume Plot")
             self.status_dot.set_color(YELLOW)
         else:
             self._timer.start()
-            self.pause_button.setText("Pause")
-            self.status_dot.set_color(GREEN)
+            self.pause_button.setText("Pause Plot")
+            self.status_dot.set_color(GREEN if self._feeds_running() else GREY)
+
+    def _controllable_feeds(self) -> list:
+        """Feeds the console can start/stop (have start+stop+running)."""
+        return [f for f in self.feeds
+                if all(hasattr(f, attr) for attr in ("start", "stop", "running"))]
+
+    def _feeds_running(self) -> bool:
+        feeds = self._controllable_feeds()
+        return bool(feeds) and any(getattr(f, "running", False) for f in feeds)
+
+    def _toggle_measurement(self) -> None:
+        """Pause/resume the MEASUREMENT: stop/start the feeds (the experiment data
+        source) themselves -- distinct from freezing the plot."""
+        feeds = self._controllable_feeds()
+        if not feeds:
+            return
+        if self._feeds_running():
+            for feed in feeds:
+                try:
+                    feed.stop()
+                except Exception:
+                    pass
+            self.meas_button.setText("Resume Meas.")
+            if self._timer.isActive():
+                self.status_dot.set_color(GREY)   # plot live but no new data
+        else:
+            for feed in feeds:
+                try:
+                    feed.start(rate_hz=getattr(feed, "rate_hz", 5.0))
+                except Exception:
+                    pass
+            self.meas_button.setText("Pause Meas.")
+            self.status_dot.set_color(GREEN if self._timer.isActive() else YELLOW)
 
     def _mark_dirty(self, *_args) -> None:
         if self._building:

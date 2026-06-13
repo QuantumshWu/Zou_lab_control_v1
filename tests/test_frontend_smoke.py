@@ -1418,6 +1418,81 @@ def test_task_console_signal_picker_and_declarative_params(monkeypatch):
     console.shutdown()
 
 
+def test_task_console_setting_popup_border_is_scoped(monkeypatch):
+    """The Setting popup's border must be scoped to the popup by objectName --
+    a bare `QFrame { border }` rule cascades to every QFrame-derived child
+    (QLabel/QComboBox internals are QFrames) and drew stray lines inside."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    console = dt.demo_console(shots=3)
+    card = console.cards[0]
+    assert card.settings_popup.objectName() == "zlcPanelSettings"
+    sheet = card.settings_popup.styleSheet()
+    assert "QFrame#zlcPanelSettings" in sheet and "QFrame {" not in sheet
+    console.shutdown()
+
+
+def test_task_console_fit_overlay_and_relim_param(monkeypatch):
+    """A line panel can fit its current data and overlay the curve (pair with
+    Pause Plot), Clear removes it, and relim is a per-panel Display param."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    import numpy as np
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.task_console import (
+        FIT_MODELS, FITTABLE_KINDS, PanelCard, PanelConfig)
+
+    assert set(FIT_MODELS) >= {"Lorentzian", "Gaussian"}
+    console = dt.demo_console(shots=5)
+    card = PanelCard(PanelConfig(kind="1d", title="bump", row=0, col=0, size="2x2",
+                                 source="value = bump"), parent=console.board)
+    x = np.linspace(-5, 5, 60)
+    card.refresh({"bump": 3.0 * np.exp(-(x ** 2) / (2 * 1.2 ** 2)) + 0.1, "shot": 1})
+    base = len(card.plotter.ax.lines)
+    card.fit_combo.setCurrentText("Gaussian")
+    card._do_fit()
+    assert card._fit_df is not None and card._fit_df.fit is not None
+    assert len(card.plotter.ax.lines) == base + 1            # one overlay line added
+    card._clear_fit()
+    assert card._fit_df is None and len(card.plotter.ax.lines) == base
+    # relim is a per-panel param and rebuilds the plotter with the new mode
+    assert "1d" in FITTABLE_KINDS
+    card._set_param("relim", "normal")
+    card.refresh({"bump": np.ones(60), "shot": 2})
+    assert card.plotter.relim_mode == "normal"
+    card.shutdown()
+    console.shutdown()
+
+
+def test_task_console_pause_plot_and_measurement_are_independent(monkeypatch):
+    """Two freezes: Pause Plot stops the refresh timer (data still flows);
+    Pause Meas. stops/starts the feeds (the data source)."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    console = dt.demo_console(shots=3)
+    console._timer.start()      # demo_console stops it for determinism; start to test the toggle
+    # Pause Plot toggles the refresh timer only
+    assert console._timer.isActive()
+    console._toggle_pause()
+    assert not console._timer.isActive() and console.pause_button.text() == "Resume Plot"
+    console._toggle_pause()
+    assert console._timer.isActive() and console.pause_button.text() == "Pause Plot"
+    # Pause Meas. controls the feeds (start->stop), independent of the timer
+    console._toggle_measurement()
+    assert console._feeds_running()                  # demo feeds were not threaded; first toggle starts
+    assert console._timer.isActive()                 # plot timer untouched
+    console._toggle_measurement()
+    assert not console._feeds_running() and console.meas_button.text() == "Resume Meas."
+    console.shutdown()
+
+
 def test_task_console_sites_panel_bad_centers_isolated(monkeypatch):
     """A site-map panel pointing at a missing centers signal reports the error
     on ITS status line; the other panels keep refreshing."""
