@@ -45,6 +45,7 @@ from .qt_fluent import (
     GREY,
     ORANGE,
     RED,
+    TEXT,
     YELLOW,
     DIVIDER,
     FluentButton,
@@ -56,6 +57,7 @@ from .qt_fluent import (
     FluentLineEdit,
     FluentScrollArea,
     FluentStatusDot,
+    FluentTabWidget,
     FluentWindow,
     add_fluent_shadow,
     ensure_qt_app,
@@ -437,6 +439,7 @@ class PanelCard(FluentGroupBox):
     changed = QtCore.pyqtSignal()          # any config edit (console marks dirty)
     layout_changed = QtCore.pyqtSignal()   # size/slot change (console re-arranges)
     remove_requested = QtCore.pyqtSignal(object)
+    edit_requested = QtCore.pyqtSignal(object)   # "Edit…" -> open the Panel Editor tab
 
     def __init__(self, config: PanelConfig, parent=None, *, names_provider=None):
         super().__init__(PANEL_KINDS[config.kind], parent, shadow=True)
@@ -581,7 +584,7 @@ class PanelCard(FluentGroupBox):
             clear_fit.clicked.connect(self._clear_fit)
             row(self.fit_combo, fit_button, clear_fit, stretch_first=False)
 
-        # ---- Panel: title + remove -----------------------------------------
+        # ---- Panel: title + edit/save/remove --------------------------------
         section("Panel")
         self.title_edit = FluentLineEdit(self.config.title)
         self.title_edit.setPlaceholderText("panel title…")
@@ -589,6 +592,15 @@ class PanelCard(FluentGroupBox):
         remove = FluentButton("Remove", color=ORANGE)
         remove.clicked.connect(lambda: self.remove_requested.emit(self))
         row(self.title_edit, remove)
+        # heavy controls (command fit, axes, units) live in the Panel Editor tab,
+        # not this lightweight popup; Save Fig is the basic one-click export.
+        edit_button = FluentButton("Edit…", color=ACCENT)
+        edit_button.setToolTip("Open the Panel Editor tab: command-line fit, x/y limits, units, Save Fig")
+        edit_button.clicked.connect(lambda: (self.settings_popup.hide(), self.edit_requested.emit(self)))
+        save_fig = FluentButton("Save Fig", color=GREY)
+        save_fig.setToolTip("Save this panel as <title>.png + <title>.npz (timestamped) in tasks/")
+        save_fig.clicked.connect(self._save_fig)
+        row(edit_button, save_fig, stretch_first=False)
 
         self.settings_popup = popup
 
@@ -692,6 +704,21 @@ class PanelCard(FluentGroupBox):
             self._fit_df = None
             if self.canvas is not None:
                 self.canvas.draw_idle()
+
+    def _save_fig(self) -> None:
+        """Save this panel: <title>.png + <title>.npz (timestamped) in tasks/."""
+        if self.plotter is None:
+            self.set_status("no plot to save yet", error=True)
+            return
+        try:
+            from .data_figure import DataFigure
+            df = self._fit_df or DataFigure(self.plotter)
+            stem = (self.config.title or PANEL_KINDS[self.config.kind]).strip() or self.config.kind
+            out = df.save(_task_files_dir() / stem,
+                          extra_info={"source": self.config.source, "kind": self.config.kind})
+            self.set_status(f"saved {out['figure'].name}", error=False)
+        except Exception as exc:
+            self.set_status(f"save fig failed: {str(exc).splitlines()[0][:120]}", error=True)
 
     def set_status(self, text: str, *, error: bool) -> None:
         # Text changes every tick ("shot N") -- but the COLOUR/stylesheet only
@@ -986,6 +1013,12 @@ class TaskConsole(QtWidgets.QWidget):
         self._last_version = -1
         self._building = False
         self._address: str | None = None
+        # Panel Editor state: a FROZEN snapshot plot of the card being edited,
+        # plus a DataFigure for fit / limits / units / save.
+        self._editor_card: PanelCard | None = None
+        self._editor_plotter = None
+        self._editor_canvas = None
+        self._editor_df = None
 
         self._build_ui()
         self.load_state(self.state)
@@ -1078,11 +1111,23 @@ class TaskConsole(QtWidgets.QWidget):
             header.addWidget(widget)
         root.addWidget(header_frame)
 
+        # Two tabs (like the pulse GUI): the live dashboard grid, and a per-panel
+        # editor for the heavier confocal-style controls (command fit, x/y limits,
+        # units, Save Fig) that would overload the lightweight Setting popup.
+        self.tabs = FluentTabWidget()
+        dash_tab = QtWidgets.QWidget()
+        dash_tab.setStyleSheet("background: transparent;")
+        dash_layout = QtWidgets.QVBoxLayout(dash_tab)
+        dash_layout.setContentsMargins(0, 0, 0, 0)
         self.scroll = FluentScrollArea()
         self.scroll.setWidgetResizable(True)
         self.board = _PanelBoard()
         self.scroll.setWidget(self.board)
-        root.addWidget(self.scroll, 1)
+        dash_layout.addWidget(self.scroll, 1)
+        self.tabs.addTab(dash_tab, "Dashboard")
+        self.tabs.addTab(self._build_editor_tab(), "Panel Editor")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        root.addWidget(self.tabs, 1)
 
     # ------------------------------------------------------------------ state
     def read_state(self) -> TaskConsoleState:
@@ -1117,7 +1162,277 @@ class TaskConsole(QtWidgets.QWidget):
         card.changed.connect(self._mark_dirty)
         card.layout_changed.connect(self._arrange)
         card.remove_requested.connect(self._remove_panel)
+        card.edit_requested.connect(self._edit_card)
         self.cards.append(card)
+
+    # ------------------------------------------------------------- panel editor
+    def _build_editor_tab(self) -> QtWidgets.QWidget:
+        """The second tab: a frozen snapshot of one panel with the heavier
+        confocal-style controls (command-line fit, x/y limits, unit cycle,
+        relim, Save Fig).  Kept off the lightweight Setting popup on purpose."""
+        page = QtWidgets.QWidget()
+        page.setStyleSheet("background: transparent;")
+        outer = QtWidgets.QVBoxLayout(page)
+        m = scaled_px(8, minimum=5)
+        outer.setContentsMargins(m, m, m, m)
+        outer.setSpacing(scaled_px(6, minimum=4))
+
+        head = QtWidgets.QHBoxLayout()
+        self.ed_title = FluentLabel("Panel Editor — select a panel's Edit… button")
+        self.ed_title.setStyleSheet(f"color: {TEXT}; background: transparent; border: none; font-weight: bold;")
+        self.ed_refresh = FluentButton("Refresh", color=GREY)
+        self.ed_refresh.setToolTip("Re-snapshot the panel's current data into the editor")
+        self.ed_refresh.clicked.connect(lambda: self._edit_card(self._editor_card) if self._editor_card else None)
+        self.ed_savefig = FluentButton("Save Fig", color=ACCENT)
+        self.ed_savefig.setToolTip("Save the edited figure (png) + data (npz), timestamped, into tasks/")
+        self.ed_savefig.clicked.connect(self._editor_save)
+        head.addWidget(self.ed_title, 1)
+        head.addWidget(self.ed_refresh)
+        head.addWidget(self.ed_savefig)
+        outer.addLayout(head)
+
+        self.ed_canvas_holder = QtWidgets.QVBoxLayout()
+        self.ed_canvas_holder.setContentsMargins(0, 0, 0, 0)
+        outer.addLayout(self.ed_canvas_holder)
+
+        def labeled(text):
+            lab = FluentLabel(text)
+            lab.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+            return lab
+
+        # Fit row: model + free-text command (confocal ":" params) + Fit + Clear
+        fit_row = QtWidgets.QHBoxLayout()
+        self.ed_fit_combo = FluentComboBox()
+        self.ed_fit_combo.addItems(list(FIT_MODELS))
+        self.ed_fit_combo.setFixedWidth(scaled_px(120, minimum=96))
+        self.ed_fit_cmd = FluentLineEdit("")
+        self.ed_fit_cmd.setPlaceholderText("fit args, e.g.  p0=[1,0,1,0], B=0.1, is_fit=False")
+        self.ed_fit_cmd.setStyleSheet(self.ed_fit_cmd.styleSheet() + " QLineEdit { font-family: Consolas, monospace; }")
+        self.ed_fit_cmd.setToolTip(
+            "Optional fit arguments injected into the call (trusted local code):\n"
+            "p0=[...] initial guess; NAME=value fixes a named parameter; is_fit=False just overlays p0.")
+        self.ed_fit_cmd.returnPressed.connect(self._editor_do_fit)
+        ed_fit = FluentButton("Fit", color=ACCENT)
+        ed_fit.clicked.connect(self._editor_do_fit)
+        ed_clear = FluentButton("Clear", color=GREY)
+        ed_clear.clicked.connect(self._editor_clear_fit)
+        fit_row.addWidget(labeled("Fit"))
+        fit_row.addWidget(self.ed_fit_combo)
+        fit_row.addWidget(self.ed_fit_cmd, 1)
+        fit_row.addWidget(ed_fit)
+        fit_row.addWidget(ed_clear)
+        outer.addLayout(fit_row)
+
+        # Axes row: x/y limits + Apply + Unit cycle + relim
+        ax_row = QtWidgets.QHBoxLayout()
+        self.ed_xmin = FluentLineEdit(""); self.ed_xmax = FluentLineEdit("")
+        self.ed_ymin = FluentLineEdit(""); self.ed_ymax = FluentLineEdit("")
+        for w in (self.ed_xmin, self.ed_xmax, self.ed_ymin, self.ed_ymax):
+            w.setFixedWidth(scaled_px(72, minimum=56))
+            w.returnPressed.connect(self._editor_apply_limits)
+        ed_apply = FluentButton("Apply lim", color=ACCENT)
+        ed_apply.clicked.connect(self._editor_apply_limits)
+        ed_unit = FluentButton("Unit", color=GREY)
+        ed_unit.setToolTip("Cycle the x-axis unit (GHz/nm/MHz or ns/us/ms) where defined")
+        ed_unit.clicked.connect(self._editor_unit)
+        self.ed_relim = FluentComboBox()
+        self.ed_relim.addItems(["tight", "normal"])
+        self.ed_relim.setFixedWidth(scaled_px(74, minimum=60))
+        self.ed_relim.activated.connect(self._editor_set_relim)
+        ax_row.addWidget(labeled("x"))
+        ax_row.addWidget(self.ed_xmin); ax_row.addWidget(self.ed_xmax)
+        ax_row.addWidget(labeled("y"))
+        ax_row.addWidget(self.ed_ymin); ax_row.addWidget(self.ed_ymax)
+        ax_row.addWidget(ed_apply)
+        ax_row.addWidget(ed_unit)
+        ax_row.addWidget(labeled("relim"))
+        ax_row.addWidget(self.ed_relim)
+        ax_row.addStretch(1)
+        outer.addLayout(ax_row)
+
+        self.ed_status = FluentLabel("")
+        self.ed_status.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+        outer.addWidget(self.ed_status)
+        outer.addStretch(1)
+        self._editor_controls = [self.ed_fit_combo, self.ed_fit_cmd, ed_fit, ed_clear,
+                                 self.ed_xmin, self.ed_xmax, self.ed_ymin, self.ed_ymax,
+                                 ed_apply, ed_unit, self.ed_relim, self.ed_savefig, self.ed_refresh]
+        for w in self._editor_controls:
+            w.setEnabled(False)
+        return page
+
+    def _edit_card(self, card: "PanelCard") -> None:
+        """Bind the editor to a card (snapshot its current data) and show the tab."""
+        if card is None or card.plotter is None:
+            self._message("Open a panel with data first (the panel must be showing a plot).")
+            return
+        self._editor_card = card
+        self._editor_rebuild()
+        self.ed_title.setText(f"Panel Editor — {card.config.title or PANEL_KINDS[card.config.kind]}"
+                              f"  ({PANEL_KINDS[card.config.kind]})")
+        with _signals_blocked(self.ed_relim):
+            self.ed_relim.setCurrentText(str(card.config.params.get("relim", "tight")))
+        for w in self._editor_controls:
+            w.setEnabled(True)
+        self.tabs.setCurrentWidget(self.tabs.widget(1))
+
+    def _editor_teardown(self) -> None:
+        if self._editor_canvas is not None:
+            self.ed_canvas_holder.removeWidget(self._editor_canvas)
+            self._editor_canvas.deleteLater()
+        if self._editor_plotter is not None and plt is not None and self._editor_plotter.fig is not None:
+            plt.close(self._editor_plotter.fig)
+        self._editor_canvas = None
+        self._editor_plotter = None
+        self._editor_df = None
+
+    def _editor_rebuild(self) -> None:
+        """Build a fresh, larger snapshot plot of the bound card's CURRENT data."""
+        card = self._editor_card
+        if card is None or card.plotter is None or panel_canvas is None:
+            return
+        self._editor_teardown()
+        src = card.plotter
+        kind = card.config.kind
+        size = "2x4"
+        title = card.config.title or PANEL_KINDS[kind]
+        relim = str(card.config.params.get("relim", "tight"))
+        cmap = str(card.config.params.get("cmap", "inferno" if kind == "2d" else "viridis"))
+        try:
+            if kind == "2d":
+                self._editor_plotter = panel_plot(np.array(src.data_x, dtype=float),
+                                                  np.array(src.data_y[:, 0], dtype=float), kind="2d",
+                                                  size=size, cmap=cmap, labels=tuple(src.labels), title=title)
+            elif kind == "sites":
+                self._editor_plotter = panel_plot(np.array(src.data_x[:, :2], dtype=float),
+                                                  np.array(src.data_y[:, 0], dtype=float), kind="sites",
+                                                  size=size, cmap=cmap, image=getattr(src, "background", None),
+                                                  roi_radius=getattr(src, "roi_radius", 3.0),
+                                                  labels=tuple(src.labels), title=title)
+            elif kind == "hist":
+                self._editor_plotter = panel_plot(np.array(src.values, dtype=float), kind="hist", size=size,
+                                                  bins=int(card.config.params.get("bins", 60)),
+                                                  labels=tuple(src.labels), title=title)
+            else:  # 1d / monitor -> a line snapshot
+                self._editor_plotter = panel_plot(np.array(src.data_x[:, 0], dtype=float),
+                                                  np.array(src.data_y[:, 0], dtype=float),
+                                                  kind=kind, size=size, relim_mode=relim,
+                                                  labels=tuple(src.labels), title=title)
+        except Exception as exc:
+            self.ed_status.setText(f"could not snapshot: {str(exc).splitlines()[0][:120]}")
+            return
+        self._editor_canvas = panel_canvas(self._editor_plotter.fig)
+        self.ed_canvas_holder.addWidget(self._editor_canvas, alignment=QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop)
+        self._editor_canvas.draw_idle()
+        self._editor_df = None
+        self._editor_fill_limits()
+        self.ed_status.setText("snapshot of current data — fit / set limits / save are frozen here")
+
+    def _editor_df_for(self):
+        from .data_figure import DataFigure
+        if self._editor_df is None:
+            self._editor_df = DataFigure(self._editor_plotter)
+        return self._editor_df
+
+    def _editor_do_fit(self) -> None:
+        if self._editor_plotter is None:
+            return
+        method = FIT_MODELS.get(self.ed_fit_combo.currentText())
+        if method is None:
+            return
+        cmd = self.ed_fit_cmd.text().strip()
+        try:
+            df = self._editor_df_for()
+            if df.fit is not None:
+                df.clear()
+            # trusted-local-tool posture (same as the Scan tab's exec): the args
+            # the user types are injected into the fit call -- p0/fixed-params/is_fit.
+            call = f"_df.{method}({cmd})" if cmd else f"_df.{method}(is_display=True)"
+            result, _ = eval(call, {"_df": df, "np": np})  # noqa: S307 - local experiment tool
+            self._editor_canvas.draw_idle()
+            popt = getattr(result, "popt", None)
+            names = getattr(result, "names", None) or []
+            if popt is None:
+                self.ed_status.setText(f"fit {self.ed_fit_combo.currentText()}: did not converge")
+                return
+            self.ed_status.setText(f"fit {self.ed_fit_combo.currentText()}: "
+                                   + ", ".join(f"{n}={v:.4g}" for n, v in zip(names, popt)))
+        except Exception as exc:
+            self.ed_status.setText(f"fit failed: {str(exc).splitlines()[0][:140]}")
+
+    def _editor_clear_fit(self) -> None:
+        if self._editor_df is not None:
+            try:
+                self._editor_df.clear()
+            except Exception:
+                pass
+            self._editor_df = None
+            if self._editor_canvas is not None:
+                self._editor_canvas.draw_idle()
+            self.ed_status.setText("fit cleared")
+
+    def _editor_fill_limits(self) -> None:
+        if self._editor_plotter is None:
+            return
+        ax = getattr(self._editor_plotter, "ax", None)
+        if ax is None:
+            return
+        xlo, xhi = ax.get_xlim()
+        ylo, yhi = ax.get_ylim()
+        with _signals_blocked(self.ed_xmin, self.ed_xmax, self.ed_ymin, self.ed_ymax):
+            self.ed_xmin.setText(f"{xlo:.6g}"); self.ed_xmax.setText(f"{xhi:.6g}")
+            self.ed_ymin.setText(f"{ylo:.6g}"); self.ed_ymax.setText(f"{yhi:.6g}")
+
+    def _editor_apply_limits(self) -> None:
+        if self._editor_plotter is None:
+            return
+        try:
+            df = self._editor_df_for()
+            df.xlim(float(self.ed_xmin.text()), float(self.ed_xmax.text()))
+            df.ylim(float(self.ed_ymin.text()), float(self.ed_ymax.text()))
+            self._editor_canvas.draw_idle()
+            self.ed_status.setText("limits applied")
+        except Exception as exc:
+            self.ed_status.setText(f"bad limits: {str(exc).splitlines()[0][:100]}")
+
+    def _editor_unit(self) -> None:
+        if self._editor_plotter is None:
+            return
+        try:
+            self._editor_df_for().change_unit()
+            self._editor_canvas.draw_idle()
+            self._editor_fill_limits()
+            self.ed_status.setText("unit cycled")
+        except Exception as exc:
+            self.ed_status.setText(f"unit cycle n/a: {str(exc).splitlines()[0][:100]}")
+
+    def _editor_set_relim(self, *_args) -> None:
+        if self._editor_card is None:
+            return
+        # persist on the card config (remembered + saved) then rebuild the EDITOR
+        # snapshot only -- do NOT tear the live card down here (that would null its
+        # plotter and the editor reads from it).
+        self._editor_card.config.params["relim"] = self.ed_relim.currentText()
+        self._mark_dirty()
+        self._editor_rebuild()
+
+    def _editor_save(self) -> None:
+        if self._editor_plotter is None:
+            return
+        try:
+            df = self._editor_df_for()
+            stem = (self._editor_card.config.title or self._editor_card.config.kind).strip() or "panel"
+            out = df.save(_task_files_dir() / stem,
+                          extra_info={"source": self._editor_card.config.source,
+                                      "kind": self._editor_card.config.kind})
+            self.ed_status.setText(f"saved {out['figure'].name} + {out['data'].name}")
+        except Exception as exc:
+            self.ed_status.setText(f"save failed: {str(exc).splitlines()[0][:120]}")
+
+    def _on_tab_changed(self, _index: int) -> None:
+        # refresh the editor snapshot when its tab is shown (data may have moved)
+        if self.tabs.currentIndex() == 1 and self._editor_card is not None:
+            self._editor_fill_limits()
 
     def _arrange(self) -> None:
         # the card that was just dragged / resized wins its slot; everyone it
@@ -1299,6 +1614,7 @@ class TaskConsole(QtWidgets.QWidget):
                 feed.stop()
             except Exception:
                 pass
+        self._editor_teardown()
         for card in self.cards:
             card.shutdown()
 

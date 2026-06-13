@@ -918,6 +918,18 @@ value = rate_grid - b_rate_grid        # 两个实验相减 -> 2D
 
 每个面板是一张\tfocus{带阴影的标题卡片}（fluent 卡片设计），卡框标题＝面板类型，画布下方、卡片底部一行灰色状态行（当前 shot 与来源表达式回显）。排版不用填行列数字：\tfocus{按住卡片边框（画布以外的任何空白处）拖动}，松手时卡片自动\tfocus{吸附到网格槽}；\tfocus{卡片间不允许重叠}——落点被占时，被压住的卡会被向下\tfocus{挤开}（级联让位），拖动的卡始终落在你放下的位置。卡片外框恰好等于整数个布局槽（卡框状态行区吸收图边距的模数差额），所以\tfocus{一张 $2\times2$ 卡严格等于两张 $1\times2$ 卡叠起来加一道间隙}，任意尺寸混排严丝合缝。标题栏：\pyapi{Add Panel} 按所选类型加面板；\tfocus{两个独立的暂停按钮}——\pyapi{Pause Plot} 冻结面板刷新（数据仍流进 hub，便于冻结画面做拟合/细看）、\pyapi{Pause Meas.} 停/启 feeds（实验数据源本身，无可控 feed 时禁用）；面板值形状变化（换表达式/尺寸/参数）自动重建该面板。
 
+\section{Panel Editor 标签页：细看 / 命令行拟合 / 存图}
+窗口像脉冲编辑器一样分\tfocus{两个标签页}：\pyapi{Dashboard}（上面那一整块网格）与 \pyapi{Panel Editor}。把\tfocus{重量级、用得少}的 confocal 式控件放进编辑页，正是为了不把 Setting 弹窗压垮。在任意面板的 Setting 里点 \pyapi{Edit…} 即跳到编辑页，并\tfocus{绑定该面板当前数据的快照}（天然契合"冻结细看"——配合 \pyapi{Pause Plot} 更稳）。编辑页提供（详细参考 confocal GUI）：
+\begin{description}
+  \item[命令行拟合] 模型下拉（Lorentzian / Gaussian / Exp decay / Rabi）+ 一行\tfocus{自由文本拟合参数}（与 confocal 的 \pyapi{:} 框同理，按"本地可信代码"注入到拟合调用）：\pyapi{p0=[...]} 给初值、\pyapi{名字=值} 固定某个命名参数、\pyapi{is_fit=False} 只按初值叠加不优化。拟合曲线（橙色）+ 公式 + 参数读数叠加在图上，\pyapi{Clear} 移除。底层是 frontend 的 \pyapi{DataFigure}（与 notebook 的 \pyapi{p.data\_figure.lorent()} 同源）。
+  \item[x / y 范围] 四个数字框 + \pyapi{Apply lim}（调 \pyapi{DataFigure.xlim/ylim}）；打开时自动回填当前坐标范围。
+  \item[Unit 单位循环] \pyapi{Unit} 按钮在已定义的单位环上循环（GHz/nm/MHz 或 ns/us/ms，\pyapi{DataFigure.change\_unit}）。
+  \item[relim] tight（紧贴数据）/ normal（留边距），即时重建编辑快照并记到该面板。
+  \item[Save Fig] 把当前编辑的图存成 \pyapi{<标题>.png} + 数据 \pyapi{.npz}（时间戳命名）到 \filepath{tasks/}（\pyapi{DataFigure.save}）。Setting 弹窗里也有一个一键 \pyapi{Save Fig} 走同一条路径。
+  \item[Refresh] 重新从面板抓一份当前数据快照。
+\end{description}
+编辑页是\tfocus{独立快照}，不打扰仪表盘的实时刷新；切回 Dashboard 一切照常。
+
 \section{命名任务仪表盘：设计一次，随处载回}
 布局（面板、位置、尺寸、表达式、参数）整包存成\tfocus{一个 JSON}，文件名就是任务名。三个入口完全等价：
 \begin{itemize}

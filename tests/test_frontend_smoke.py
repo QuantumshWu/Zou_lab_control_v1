@@ -1418,6 +1418,48 @@ def test_task_console_signal_picker_and_declarative_params(monkeypatch):
     console.shutdown()
 
 
+def test_task_console_panel_editor_tab(monkeypatch, tmp_path):
+    """The console has Dashboard + Panel Editor tabs; a card's Edit opens the
+    editor bound to a frozen snapshot, where a command-line fit, x/y limits and
+    Save Fig work (the confocal-style heavy controls, kept off the Setting popup)."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    monkeypatch.setenv("ZLC_TASK_DIR", str(tmp_path))
+    from Zou_lab_control.frontend import devtools as dt
+
+    console = dt.demo_console(shots=20)
+    assert [console.tabs.tabText(i) for i in range(console.tabs.count())] == ["Dashboard", "Panel Editor"]
+
+    card = next(c for c in console.cards if c.config.kind == "1d")
+    console._edit_card(card)
+    assert console._editor_card is card and console._editor_plotter is not None
+    assert console.tabs.currentIndex() == 1                  # switched to the editor
+    assert console.ed_xmin.text() and console.ed_xmax.text()  # limits prefilled from the axes
+
+    # command-line fit (preset model + free-text args) draws an overlay
+    console.ed_fit_combo.setCurrentText("Gaussian")
+    console.ed_fit_cmd.setText("")
+    console._editor_do_fit()
+    assert console._editor_df is not None and console._editor_df.fit is not None
+
+    # x/y limits apply to the editor axes
+    console.ed_xmin.setText("0"); console.ed_xmax.setText("9")
+    console.ed_ymin.setText("0"); console.ed_ymax.setText("2")
+    console._editor_apply_limits()
+    assert console._editor_plotter.ax.get_xlim() == (0.0, 9.0)
+
+    # Save Fig writes png + npz into the task dir
+    console._editor_save()
+    saved = sorted(p.suffix for p in tmp_path.iterdir())
+    assert ".png" in saved and ".npz" in saved
+
+    # the editor snapshot is independent of the live card (frozen)
+    console._editor_clear_fit()
+    assert console._editor_df is None
+    console.shutdown()
+
+
 def test_task_console_setting_popup_border_is_scoped(monkeypatch):
     """The Setting popup's border must be scoped to the popup by objectName --
     a bare `QFrame { border }` rule cascades to every QFrame-derived child
