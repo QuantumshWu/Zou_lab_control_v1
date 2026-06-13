@@ -526,8 +526,6 @@ Control 卡片一共有 8 个按钮，排成 2 行 4 列。最重要、也最需
 请牢记：Channels 卡片里的下拉框、Add、Hide Off、Show All 全部只改变\tfocus{画面上看到哪些通道}，丝毫不改变 FPGA 实际输出的脉冲。把一条通道藏起来，它在硬件上该高还是高、该低还是低；调出来也只是让你重新看见而已。真正改变运行行为的，是左边 Control 卡片里的 On Pulse / Stop Pulse。
 \end{notebox}
 
-The source confirms all the facts. Now I'll produce the LaTeX fragment.
-
 \section{Preview 页与扫描高亮在预览里怎么显示（逐元素详解）}
 
 Preview（预览）页是你在真正把脉冲发到 FPGA 之前，用来"用眼睛检查一遍"序列长什么样的地方。它把你在 Edit 页里搭好的周期表（period table）画成一张时间图：横轴是时间，纵轴是一行一行的通道。本节假设你\tfocus{从来没见过这个界面}，所以我们会把页面上每一个开关、按钮、每一种颜色的含义都讲透——它们各自\tfocus{有什么作用}、\tfocus{接受什么值}、\tfocus{点下去或切换后会发生什么}、\tfocus{常见的坑}，以及\tfocus{一个实用提示}。
@@ -954,6 +952,180 @@ for shot in range(1000):
 \section{给维护者：扩展面板}
 给某类面板\tfocus{加一个参数}＝在 \filepath{frontend/task\_console.py} 的 \pyapi{PANEL\_PARAMS} 里加一行 \pyapi{ParamSpec(键, 标签, 类型, 默认值, ...)}（类型 \pyapi{choice}/\pyapi{int}/\pyapi{signal}），Setting 控件、JSON 保存与图重建全部自动跟上；在对应的 \pyapi{\_build\_plot} 分支里消费 \pyapi{config.params[键]}。\tfocus{加一种新面板类型}：在 \filepath{frontend/live.py} 写一个 \pyapi{BaseLivePlot} 子类并进 \pyapi{plot()} 工厂的 kind 分发（几何必须走 \pyapi{panel\_plot\_spec} 的共享区域与边距），然后在 \pyapi{PANEL\_KINDS}/\pyapi{\_DEFAULT\_SOURCES}/\pyapi{PANEL\_PARAMS} 各加一项、\pyapi{\_coerce}/\pyapi{\_build\_plot}/\pyapi{\_feed} 各加一个分支。可视化改动必须用 \pyapi{devtools.capture\_user\_view} 三档缩放截图验收（\pyapi{parity} 目标同屏对比两个 GUI 的控件尺寸）。
 
+
+\chapter{对外接口完整参考}
+
+读完这一章，你应当能在 notebook 里\tfocus{自信地调用每一个公共函数并预期到正确结果}。每个接口按统一六段式写：\tfocus{一句话用途 / 完整签名 / 每个参数 / 数组(数据)契约 / 可运行示例 / 不可配置的边界}。约定 \pyapi{from Zou_lab_control import frontend as zf}，全章用 \pyapi{zf.} 前缀。
+
+\section{先读：密封 API 的设计契约}
+frontend 对外暴露一个\tfocus{小而密封}的接口。外部调用者只传\tfocus{数据 + 少量语义选项}（labels、kind、size、bins、thresholds……），拿回\tfocus{正确的美术、几何、dpi、字体}。\tfocus{几何、边距、dpi、配色、阴影、缩放规则由 frontend 拥有，不对外开放}。
+
+\begin{notebox}
+\textbf{为什么几何不是旋钮？}（这样你就不会困惑“我想改边距怎么没有参数”）
+\begin{itemize}
+  \item 全项目只有\tfocus{一套 300\,dpi 排版系统}和\tfocus{一条 auto-scale 规则}：外部乱改会在不同 Windows DPI 缩放下破坏对齐契约（历史上真出过两个 GUI 控件大小不一致、高 DPI 下图变形的事故）。
+  \item 所有面板\tfocus{共享同一块 plot 区域和同一组边距}，才能让任意类型/尺寸的面板严丝合缝拼接（confocal 模数规则）。
+  \item 2D / Site map 图\tfocus{恒为 square}且与 colorbar 对齐，这是设计的一部分，不是可关掉的开关。
+\end{itemize}
+\end{notebox}
+
+\begin{center}
+\begin{tabular}{@{}p{0.46\textwidth}p{0.46\textwidth}@{}}
+\toprule
+\textbf{你\tfocus{能}配置（DATA）} & \textbf{你\tfocus{不能}配置（由 frontend 拥有）} \\
+\midrule
+数据数组、\pyapi{labels}、\pyapi{title} & \pyapi{data_px} / \pyapi{margins_px} / \pyapi{spec}（几何） \\
+\pyapi{kind}、\pyapi{size}（从预设里选） & \pyapi{dpi}、字号、字体 \\
+\pyapi{bins} / \pyapi{thresholds} / \pyapi{cmap} & \pyapi{bad_color} / 调色板 / 阴影 \\
+\pyapi{update} 模式、是否 \pyapi{display} & 缩放系数（\pyapi{scale} 仅 \pyapi{None}=自动） \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+试图传被密封的参数会\tfocus{直接报 TypeError}（不是被悄悄忽略），错误信息会告诉你该用什么。权威定义见源码 \filepath{frontend/\_\_init\_\_.py} 模块文档（六条规则）与 \filepath{frontend/AGENTS.md}。
+
+\section{zf.plot() —— 绘图工厂（最常用）}
+\textbf{一句话用途}：从统一数组契约一次性创建静态或实时 notebook 图，自动选图型、自动套 300\,dpi 排版。
+
+\textbf{完整签名}：
+\begin{codeblock}[Python]
+zf.plot(data_x, data_y=None, *, kind="auto", update="once", labels=None,
+        display=True, data_figure=True, watch_interval=None,
+        stop_when_full=True, done=None, points_done=None,
+        copy=False, lock=None, **kwargs)
+\end{codeblock}
+
+\textbf{每个参数}：
+\begin{description}
+  \item[\pyapi{data_x} / \pyapi{data_y}] 见下方数组契约。
+  \item[\pyapi{kind}] 图型：\pyapi{auto}（按 coord\_dim 自动选 1d/2d）、\pyapi{1d}（折线，别名 line/trace）、\pyapi{2d}（图像，别名 image/map）、\pyapi{hist}（直方图，别名 distribution）、\pyapi{monitor}（滚动轨迹+侧分布，别名 rolling）、\pyapi{sites}（原子站点图，别名 site-map/sitemap）、\pyapi{pulse}（静态时序图，别名 sequence/timing）。\tfocus{注意：}\pyapi{kind="pulse"} 不支持 \pyapi{update="watch"}（会报错）。
+  \item[\pyapi{update}] \pyapi{once}（默认，静态）或 \pyapi{watch}（启动前端定时器，从共享数组刷新）。watch 模型：采集线程在另一侧\tfocus{原地修改}数组，前端拥有 artist 与刷新。
+  \item[\pyapi{labels}] \pyapi{(xlabel, ylabel, zlabel)}；各 kind 有不同默认（1d/2d=(X,Y,Z)、hist=(Counts,Shots,Population)、pulse=(Time (s), 空, State)）。
+  \item[\pyapi{display}] 是否立刻在 notebook 显示。
+  \item[\pyapi{data_figure}] 是否附 \pyapi{DataFigure} 句柄（用于 \pyapi{.lorent()}/\pyapi{.decay()} 等拟合）。
+  \item[\pyapi{watch_interval} / \pyapi{stop_when_full} / \pyapi{done} / \pyapi{points_done} / \pyapi{copy} / \pyapi{lock}] watch 模式的刷新间隔、满即停、完成回调/标志、是否拷贝、线程锁。\tfocus{线程契约}：阻塞式硬件采集不能跑在 UI 线程里。
+  \item[\pyapi{**kwargs}] 透传给具体 plotter 的\tfocus{数据}选项：\pyapi{cmap}、\pyapi{bins}、\pyapi{thresholds}、\pyapi{relim_mode}、\pyapi{title}……\tfocus{这些是数据选项，不是几何选项}。传 \pyapi{data_px}/\pyapi{margins_px}/\pyapi{spec}/\pyapi{dpi}/\pyapi{bad_color} 会报 TypeError。
+\end{description}
+
+\textbf{数组契约}：\pyapi{data_x} 是 \pyapi{(N, coord_dim)}（一维自动升维）；\pyapi{data_y} 是 \pyapi{(N, channel_dim)}，长度须等于 N；\pyapi{coord_dim==1} 画一维线图、\pyapi{==2} 画二维扫描图；\pyapi{kind="hist"} 把 \pyapi{data_x} 当数值数组；未完成的点用 \pyapi{NaN}（前端据此推断进度）。
+
+\textbf{可运行示例}：
+\begin{codeblock}[Python]
+import numpy as np
+from Zou_lab_control import frontend as zf
+
+# 一维 + 洛伦兹拟合
+x = np.linspace(737.0, 737.2, 220).reshape(-1, 1)
+y = (lorentzian(x) + noise).reshape(-1, 1)
+p = zf.plot(x, y, labels=("Wavelength (nm)", "Counts/0.1s", "Counts"))
+p.data_figure.lorent(is_display=True)
+
+# 二维扫描： data_x=(N,2)
+zf.plot(coords_xy, signal.reshape(-1, 1), kind="2d", labels=("X", "Y", "Counts"))
+\end{codeblock}
+
+\textbf{不可配置的边界}：2D 图\tfocus{恒为 square}（传 \pyapi{square=False} 会报错；要非方形请直接用内部类 \pyapi{Live2DDis}）；dpi/边距/字号不可传，由 \pyapi{FigureSpec} 内部决定。
+
+\section{各图型速查（plot(kind=...) 的七个面孔）}
+这些 plotter 类都公共导出、可直接构造，但\tfocus{首选 \pyapi{plot()}}：
+\begin{description}
+  \item[\pyapi{1d} -> \pyapi{zf.Live1D}] 一维折线。
+  \item[\pyapi{2d} -> \pyapi{zf.Live2DDis}] 图像 + 右侧分布 + colorbar + 可拖 clim（\pyapi{cmap} 可选）。
+  \item[\pyapi{hist} -> \pyapi{zf.HistogramFigure}] 直方图 + 自动双高斯拟合 + 可拖阈值线（\pyapi{bins}/\pyapi{thresholds}，方法 \pyapi{classify}/\pyapi{fractions}）。
+  \item[\pyapi{monitor} -> \pyapi{zf.LiveLiveDis}] 标量滚动轨迹 + 侧分布。
+  \item[\pyapi{sites} -> \pyapi{zf.LiveSiteMap}] 原子阵列站点图：\pyapi{data_x} 是 \pyapi{(N,2)} 站点中心(相机像素)，\pyapi{data_y} 是逐站值；可选 \pyapi{cmap}/\pyapi{image}(相机帧底图)/\pyapi{roi_radius}。
+  \item[\pyapi{pulse} -> \pyapi{zf.PulseSequenceFigure}] 静态脉冲时序图。
+\end{description}
+
+\section{zf.panel\_plot() 与尺寸预设（仪表盘面板）}
+\textbf{一句话用途}：\pyapi{plot()} 的仪表盘特化——选一个 kind + 一个 \pyapi{PANEL_SIZES} 预设，拿到尺寸正确、风格一致的实时面板（不 display、不附 DataFigure，由宿主嵌入 canvas）。
+
+\textbf{完整签名}：\pyapi{zf.panel_plot(data_x, data_y=None, *, kind, size="2x2", **kwargs)}
+
+\textbf{每个参数}：\pyapi{kind}（同 plot，面板常用 2d/sites/1d/monitor/hist）；\pyapi{size}（见下枚举）；\pyapi{**kwargs} 为数据选项；\tfocus{几何不可配}。
+
+\textbf{尺寸枚举与辅助}：
+\begin{itemize}
+  \item \pyapi{zf.PANEL_SIZES = ("1x2", "2x2", "1x4", "2x4")}：含义=\tfocus{行×列的“半单元”数}。\pyapi{2x2}=标准 plot 区域(数据区 480×360)，\pyapi{1x2}=半高，\pyapi{2x4}=双宽。
+  \item \pyapi{zf.panel_plot_spec(size="2x2") -> FigureSpec}：返回该尺寸的几何规格（所有面板类型共用边距，签名只有 \pyapi{size}）。
+  \item \pyapi{zf.panel_size_cells(size) -> (rows, cols)}：解析尺寸串；非法尺寸报 \pyapi{ValueError}。
+\end{itemize}
+
+\textbf{示例}：\pyapi{panel = zf.panel_plot(frame, kind="2d", size="2x2", labels=(...))}
+
+\textbf{不可配置的边界}：\tfocus{尺寸是唯一旋钮}（只能从 \pyapi{PANEL_SIZES} 选）；所有面板共享同一 plot 区域和同一组边距，故 \pyapi{2x2} 主图恰好 360×360 方形、与 colorbar 顶底对齐，\pyapi{2x2}＝两张 \pyapi{1x2}＋间隙。普通用户用 Task 控制台 GUI 即可，这几个是给\tfocus{自定义宿主}程序化排版用的。
+
+\section{zf.show\_pulse\_gui() —— 脉冲编辑器入口}
+\textbf{一句话用途}：在独立 Fluent 窗口里打开脉冲编辑器；notebook 里编辑/上传脉冲的首选入口。
+
+\textbf{完整签名}：
+\begin{codeblock}[Python]
+zf.show_pulse_gui(*, state=None, channels=None, sequencer=None,
+                  experiment=None, channel_labels=None, channel_pins=None,
+                  scale=None, window_ratio=...) -> PulseSequenceEditor
+\end{codeblock}
+
+\textbf{每个参数}：\pyapi{state}（PulseTableState，None=空白）；\pyapi{channels}（通道名序列）；\pyapi{sequencer}（传入的 SequencerDevice，On Pulse 用它上传——\tfocus{frontend 不拥有硬件动作}）；\pyapi{experiment}（可选实验对象）；\pyapi{channel_labels}/\pyapi{channel_pins}（显示名 / 物理引脚映射）；\pyapi{scale}（\pyapi{None}=自动，见边界）；\pyapi{window_ratio}（窗口占屏比例）。
+
+\textbf{示例}：\pyapi{ed = zf.show_pulse_gui(sequencer=exp.devices.sequencer, channels=[...])}；命令行入口是 \filepath{pulse\_gui.bat}。逐控件操作见前面“逐个按钮”章。
+
+\textbf{不可配置的边界}：\pyapi{scale=None} 时走\tfocus{唯一的 auto-scale 规则}（不要手动钉 scale，否则破坏高 DPI 视觉一致性）；窗口几何/Fluent 样式由 frontend 拥有。
+
+\section{zf.show\_task\_console() —— Task 控制台入口}
+\textbf{一句话用途}：打开可配置实时仪表盘窗口，把面板接到 \pyapi{SignalHub} 信号上。
+
+\textbf{完整签名}：
+\begin{codeblock}[Python]
+zf.show_task_console(*, hub, state=None, task=None, feeds=(),
+                     scale=None, window_ratio=0.84,
+                     title="TaskConsole@Zou lab") -> TaskConsole
+\end{codeblock}
+
+\textbf{每个参数}：\pyapi{hub}（必填，SignalHub 实例——数据总线）；\pyapi{state}（显式 TaskConsoleState 布局）；\pyapi{task}（\tfocus{命名任务}：内置 \pyapi{atom_loading_monitor}/\pyapi{loading_rate_live}、\pyapi{tasks/} 里的 JSON、或 JSON 路径；\pyapi{state} 优先于 \pyapi{task}）；\pyapi{feeds}（后台生产者循环序列）；\pyapi{scale}/\pyapi{window_ratio}/\pyapi{title}（窗口外观）。
+
+\textbf{示例}：\pyapi{console = zf.show_task_console(hub=hub, task="atom_loading_monitor")}，然后实验循环里 \pyapi{hub.publish(...)}（见“Task 控制台”章接线示例）。
+
+\textbf{不可配置的边界}：面板几何/卡片排版/吸附网格由 frontend 拥有；可配的只有 kind + size + Source 表达式 + 声明式参数。
+
+\section{SignalHub —— 仪表盘数据契约}
+\textbf{导入}：\pyapi{from Zou_lab_control.neutral_atom.core.signals import SignalHub}（它是控制台的数据总线）。
+
+\textbf{发布侧} \pyapi{hub.publish(values, *, shot=None) -> int}：每个值被\tfocus{强制转成 float ndarray（标量->0 维）并拷贝}（生产者可随意复用缓冲），返回新 version。
+
+\textbf{消费侧}：\pyapi{latest(name)}（0 维->float，否则 ndarray 拷贝；不存在报 KeyError）、\pyapi{history(name, n=None) -> ndarray}（\tfocus{形状 (shots, *value\_shape)}，axis 0 是 shot；形状变过只保留最近同形状连续段）、\pyapi{names() -> list}、\pyapi{snapshot_latest() -> dict}（一致快照=表达式命名空间）、属性 \pyapi{version}/\pyapi{shot}。
+
+\textbf{约定俗成的信号名}（沿用它们->同一命名任务在虚拟/真机间零修改通用）：\pyapi{frame}（相机帧）、\pyapi{counts}、\pyapi{occupied}、\pyapi{rate}、\pyapi{rate_sites}、\pyapi{rate_grid}、\pyapi{centers}（站点中心 \pyapi{(N,2)}）、\pyapi{thresholds}、\pyapi{shot}。
+
+\textbf{示例}：\pyapi{hub.publish(\{"counts": c, "rate": r, "shot": float(s)\})}，再开一个 Rolling trace 面板把 Source 指到信号名即可。
+
+\section{PDF 渲染 API}
+\textbf{\pyapi{zf.render_tex_pdf(tex, output_pdf, *, runs=2, xelatex=None, halt_on_error=True, assets=None) -> Path}（首选）}：从 \tfocus{TeX 串或 .tex 路径}一次性出 PDF。在\tfocus{临时目录}里 XeLaTeX 两遍，\tfocus{只把最终 PDF 拷回}目标，绝不在目标目录留 .tex/.aux/.log/.toc/.sty。\pyapi{tex} 是字符串时，\pyapi{assets=<目录>} 会被拷进临时构建树（让 \pyapi{assets/foo.png} 这类相对引用可用）；失败时只在 \pyapi{output_pdf} 旁留一个 \pyapi{.build.log}。
+\begin{codeblock}[Python]
+from Zou_lab_control import frontend as zf
+# 直接给字符串
+zf.render_tex_pdf(r"\documentclass{article}\begin{document}你好\end{document}", "out.pdf")
+# 或给一个 .tex 文件（同目录 assets 自动随行）
+zf.render_tex_pdf("notes/manual.tex", "notes/manual.pdf")
+\end{codeblock}
+
+\textbf{\pyapi{zf.render_notes_pdf(output_dir, *, filename, title, ..., body, compile_pdf=True, ...) -> NotesBuildResult}（整本手册）}：在内存里拼装标题页+目录+正文，再经 \pyapi{render_tex_pdf} 在临时目录编译，\tfocus{output\_dir 里只留 .pdf}（外加它引用的 \pyapi{assets/}）。本手册自身就是用这条路径生成的（见 \filepath{frontend/notes.py} 的 \pyapi{build_frontend_manual}）。\pyapi{render_latex_pdf_clean} 是 \pyapi{render_tex_pdf} 的向后兼容别名；\pyapi{write_notes_tex}/\pyapi{compile_notes_pdf} 是\tfocus{遗留/调试}用的就地写盘助手，不在默认构建路径上。
+
+\section{一页速查（“我想做 X -> 调用 Y”）}
+\begin{center}
+\begin{tabular}{@{}p{0.5\textwidth}p{0.46\textwidth}@{}}
+\toprule
+\textbf{我想……} & \textbf{调用} \\
+\midrule
+画一维/二维/直方图/脉冲/站点图 & \pyapi{zf.plot(x, y, kind=...)} \\
+做仪表盘面板（嵌进宿主） & \pyapi{zf.panel_plot(x, y, kind=, size=)} \\
+打开脉冲编辑器 GUI & \pyapi{zf.show_pulse_gui(sequencer=)} \\
+打开实时监控台 & \pyapi{zf.show_task_console(hub=, task=)} \\
+推送一个 shot 给监控台 & \pyapi{hub.publish(...)} \\
+TeX/字符串 -> PDF & \pyapi{zf.render_tex_pdf(tex, out)} \\
+\bottomrule
+\end{tabular}
+\end{center}
+每一行的共同前提：\tfocus{美术/几何/dpi 由 frontend 拥有}，你给数据和语义选项，拿回正确的图。
 
 \chapter{绘图 API}
 
