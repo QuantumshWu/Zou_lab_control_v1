@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Iterator, Mapping
 
 import matplotlib
@@ -31,7 +32,10 @@ if FONT_PATH.exists():
 
 SANS_SERIF = ([_FONT_NAME] if _FONT_NAME else []) + ["Arial"]
 
-DEFAULT_STYLE: dict[str, Any] = {
+# The ONE typography/dpi system.  The mutable dict is PRIVATE so the owned
+# defaults can never be mutated in place from outside (the public name below is
+# a read-only view); see the frontend/__init__.py design contract.
+_DEFAULT_STYLE: dict[str, Any] = {
     "axes.labelsize": 7.5,
     "legend.fontsize": 6.5,
     "xtick.labelsize": 6.5,
@@ -81,6 +85,9 @@ DEFAULT_STYLE: dict[str, Any] = {
     "ytick.color": NEW_BLACK,
 }
 
+# Public, READ-ONLY view of the owned style (mutating it raises TypeError).
+DEFAULT_STYLE: Mapping[str, Any] = MappingProxyType(_DEFAULT_STYLE)
+
 
 def use_widget_backend() -> None:
     """Switch Matplotlib to the Jupyter widget backend."""
@@ -112,7 +119,7 @@ def enable_long_output() -> None:
 
 def apply_style(overrides: Mapping[str, Any] | None = None) -> None:
     """Apply the Confocal_GUIv2-derived publication/notebook style."""
-    style = DEFAULT_STYLE.copy()
+    style = dict(_DEFAULT_STYLE)
     if overrides:
         style.update(dict(overrides))
     matplotlib.rcParams.update(style)
@@ -121,7 +128,7 @@ def apply_style(overrides: Mapping[str, Any] | None = None) -> None:
 @contextmanager
 def style_context(overrides: Mapping[str, Any] | None = None) -> Iterator[None]:
     """Temporarily apply the front-end plotting style."""
-    style = DEFAULT_STYLE.copy()
+    style = dict(_DEFAULT_STYLE)
     if overrides:
         style.update(dict(overrides))
     with matplotlib.rc_context(style):

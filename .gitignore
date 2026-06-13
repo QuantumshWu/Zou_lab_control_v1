@@ -78,7 +78,13 @@ desktop.ini
 *.run.xml
 *.synctex.gz
 *.toc
+*.build.log
 docs/**/*_zh.txt
+# Manual sources are build intermediates: only the PDF (+ assets/) belongs in
+# docs/.  The real source is the .texbody templates + the build_* functions;
+# render_notes_pdf compiles in a temp dir and copies back ONLY the .pdf.
+docs/**/*.tex
+docs/**/*.sty
 
 # Vivado / FPGA generated working files
 .Xil/

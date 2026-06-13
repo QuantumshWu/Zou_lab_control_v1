@@ -536,9 +536,33 @@ python -c "from Zou_lab_control.frontend.notes import build_frontend_manual; bui
 ```
 
 Each builder generates example figures into `assets/`, fills the `.texbody`
-template, writes the `.tex` wrapper, and runs `render_tex_pdf` (XeLaTeX, 2-pass,
-in a temp dir). XeLaTeX must be on PATH (or pass `xelatex=`). A failed build
-leaves only a `.build.log` next to the target PDF.
+template, assembles the `.tex` wrapper **in memory**, and runs `render_tex_pdf`
+(XeLaTeX, 2-pass, in a temp dir) with `assets=<dir>` so figures resolve. XeLaTeX
+must be on PATH (or pass `xelatex=`). **Only the `.pdf` lands in `docs/<manual>/`**
+(plus the committed `assets/`); no `.tex`/`.sty`/`.aux`/`.log`/`.toc`/`.out` is
+ever written there (`docs/**/*.tex` and `*.sty` are gitignored). A failed build
+leaves only a `.build.log` next to the target PDF. `render_tex_pdf(tex, out_pdf)`
+accepts a tex **string** or a `.tex` **path**; `write_notes_tex` /
+`compile_notes_pdf` are legacy in-place helpers kept for debug, NOT on the build
+path. See §18.
+
+## §18. frontend public-API seal (the visual-design contract)
+
+The frontend exposes a **small, sealed** surface: callers pass DATA, the frontend
+owns ART/GEOMETRY/dpi/typography. The authoritative statement is the
+`frontend/__init__.py` module docstring; the rationale + failure history is in
+`Zou_lab_control/frontend/AGENTS.md`. Six rules, enforced in code:
+1. `plot()`/`panel_plot()` reject `data_px`/`margins_px`/`spec`/`dpi`/`bad_color`/
+   `colors` (`live._SEALED_PLOT_KWARGS`); internal geometry rides the private
+   `plot(_spec=...)` channel.
+2. Panel size validated against `PANEL_SIZES`; pulse geometry constants are
+   `_`-private (`live._PULSE_*`, `_PULSE_MARGINS_PX`, `_PULSE_DPI`).
+3. `style.DEFAULT_STYLE` is a read-only `MappingProxyType` over `_DEFAULT_STYLE`.
+4. One scale rule: `qt_fluent.resolve_fluent_auto_scale` + `qt_canvas.panel_canvas`.
+5. `qt_fluent.*` / `qt_canvas.*` (shadows, canvases) are NOT re-exported.
+6. New public params must be DATA, not ART. Contract tests live in
+   `tests/test_frontend_smoke.py` (sealed-kwargs rejection, DEFAULT_STYLE
+   read-only, scale parity).
 
 ## 11. Verification
 

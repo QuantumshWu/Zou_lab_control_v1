@@ -472,7 +472,9 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     maintainer_notes = (root / "docs" / "MAINTAINER_NOTES.md").read_text(encoding="utf-8")
     main_manual_template = (root / "Zou_lab_control" / "neutral_atom" / "content" / "manual_templates" / "main_manual_zh.texbody").read_text(encoding="utf-8")
     fpga_manual_template = (root / "Zou_lab_control" / "neutral_atom" / "content" / "manual_templates" / "fpga_manual_zh.texbody").read_text(encoding="utf-8")
-    fpga_manual_tex = (root / "docs" / "fpga_manual" / "fpga_manual_zh.tex").read_text(encoding="utf-8")
+    # The rendered docs/fpga_manual/fpga_manual_zh.tex is a build INTERMEDIATE that
+    # render_notes_pdf assembles in a temp dir and never writes to docs/ (only the
+    # .pdf lands there).  Assert facts against the .texbody source of truth instead.
     fpga_readme = (root / "fpga" / "README.md").read_text(encoding="utf-8")
     streamer_readme = (fpga / "README.md").read_text(encoding="utf-8")
     frontend_readme = (root / "Zou_lab_control" / "frontend" / "README.md").read_text(encoding="utf-8")
@@ -658,7 +660,6 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
         maintainer_notes,
         main_manual_template,
         fpga_manual_template,
-        fpga_manual_tex,
         fpga_readme,
         streamer_readme,
         frontend_readme,

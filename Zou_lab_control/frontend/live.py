@@ -47,16 +47,18 @@ PULSE_COLORS = [
 # the margin scales with the data/zoom); Y uses a fixed gap in channel-row units
 # (rows are unit-spaced, so a fixed gap reads the same regardless of how many
 # channels are shown).
-PULSE_X_MARGIN_FRAC = 0.04          # per-side x headroom, as a fraction of the time span
-PULSE_X_BRACKET_LABEL_FRAC = 0.05   # extra RIGHT headroom when a repeat x N bracket label is shown
+# PULSE PLOT GEOMETRY -- OWNED by frontend, NOT a public knob (private `_`-prefixed
+# so the package surface can never set them; see frontend/__init__.py contract).
+_PULSE_X_MARGIN_FRAC = 0.04          # per-side x headroom, as a fraction of the time span
+_PULSE_X_BRACKET_LABEL_FRAC = 0.05   # extra RIGHT headroom when a repeat x N bracket label is shown
 # X AUTO-EXTEND (mirrors the y row-block behaviour): the pulse plot grows one base-width
-# block per PULSE_X_PERIODS_PER_BLOCK periods, capped at PULSE_X_MAX_WIDTH_FACTOR x the
-# base width.  Both are user-configurable (set before building the figure):
-#   import Zou_lab_control.frontend.live as live; live.PULSE_X_PERIODS_PER_BLOCK = 4
-PULSE_X_PERIODS_PER_BLOCK = 5       # periods per horizontal width block
-PULSE_X_MAX_WIDTH_FACTOR = 3        # max width as a multiple of the base data width
-PULSE_Y_PAD_BOTTOM = 0.62           # gap below the bottom channel row (row units)
-PULSE_Y_PAD_TOP = 0.38              # gap above the top channel row (row units)
+# block per _PULSE_X_PERIODS_PER_BLOCK periods, capped at _PULSE_X_MAX_WIDTH_FACTOR x the base width.
+_PULSE_X_PERIODS_PER_BLOCK = 5       # periods per horizontal width block
+_PULSE_X_MAX_WIDTH_FACTOR = 3        # max width as a multiple of the base data width
+_PULSE_Y_PAD_BOTTOM = 0.62           # gap below the bottom channel row (row units)
+_PULSE_Y_PAD_TOP = 0.38              # gap above the top channel row (row units)
+_PULSE_MARGINS_PX = (110, 90, 100, 50)   # owned pulse-plot margins (L, R, B, T)
+_PULSE_DPI = 300                          # the ONE design dpi (never per-call)
 
 
 def _as_data_x(data_x) -> np.ndarray:
@@ -968,10 +970,11 @@ def panel_plot(data_x, data_y=None, *, kind: str, size: str = "2x2", **kwargs):
     including the 2D square + aligned side-distribution/colorbar design.
 
     ``kwargs`` are the plot()/plotter DATA options (labels, title, cmap, bins,
-    relim_mode, ...) -- the panel GEOMETRY is not configurable from outside."""
+    relim_mode, ...) -- the panel GEOMETRY is not configurable from outside
+    (the size preset is the only sizing knob; geometry kwargs are rejected)."""
 
     spec = panel_plot_spec(size)
-    return plot(data_x, data_y, kind=kind, spec=spec, display=False, data_figure=False, **kwargs)
+    return plot(data_x, data_y, kind=kind, _spec=spec, display=False, data_figure=False, **kwargs)
 
 
 def pulse_plot_spec(
@@ -983,29 +986,27 @@ def pulse_plot_spec(
     period_count: int | None = None,
     periods_per_block: int | None = None,
     max_width_factor: int | None = None,
-    margins_px: tuple[int, int, int, int] = (110, 90, 100, 50),
-    dpi: int = 300,
 ) -> FigureSpec:
     """FigureSpec sized so pulse rows stay legible beyond 10 channels.
 
-    The HEIGHT grows one block per ``rows_per_block`` channels (unchanged), and
-    -- mirroring that -- the WIDTH grows one ``data_width_px`` block per
-    ``periods_per_block`` periods when ``period_count`` is given, capped at
-    ``max_width_factor`` x the base width.  Defaults come from the module
-    constants ``PULSE_X_PERIODS_PER_BLOCK`` / ``PULSE_X_MAX_WIDTH_FACTOR`` so
-    they are configurable per-session."""
+    The HEIGHT grows one block per ``rows_per_block`` channels, and -- mirroring
+    that -- the WIDTH grows one ``data_width_px`` block per ``periods_per_block``
+    periods when ``period_count`` is given, capped at ``max_width_factor`` x the
+    base width (content-driven legibility knobs).  Margins and dpi are OWNED by
+    the frontend visual system (``_PULSE_MARGINS_PX`` / ``_PULSE_DPI``), never
+    set per-call."""
 
     rows_per_block = max(1, int(rows_per_block))
     chunks = max(1, ceil(max(1, int(channel_count)) / rows_per_block))
     width_blocks = 1
     if period_count is not None:
-        per_block = PULSE_X_PERIODS_PER_BLOCK if periods_per_block is None else int(periods_per_block)
-        cap = PULSE_X_MAX_WIDTH_FACTOR if max_width_factor is None else int(max_width_factor)
+        per_block = _PULSE_X_PERIODS_PER_BLOCK if periods_per_block is None else int(periods_per_block)
+        cap = _PULSE_X_MAX_WIDTH_FACTOR if max_width_factor is None else int(max_width_factor)
         if per_block > 0:
             width_blocks = min(max(1, int(cap)), max(1, ceil(max(1, int(period_count)) / per_block)))
     return FigureSpec(
         data_px=(int(data_width_px) * width_blocks, int(block_height_px) * chunks),
-        margins_px=margins_px, dpi=int(dpi))
+        margins_px=_PULSE_MARGINS_PX, dpi=_PULSE_DPI)
 
 
 def pulse_repeat_notation(
@@ -1179,7 +1180,7 @@ class PulseSequenceFigure(BaseLivePlot):
         dummy_n = max(1, len(self.pulses))
         if auto_height and not any(key in kwargs for key in ("spec", "data_px", "margins_px")):
             # period_count drives the x auto-extend (one width block per
-            # PULSE_X_PERIODS_PER_BLOCK periods, capped at PULSE_X_MAX_WIDTH_FACTOR).
+            # _PULSE_X_PERIODS_PER_BLOCK periods, capped at _PULSE_X_MAX_WIDTH_FACTOR).
             kwargs["spec"] = pulse_plot_spec(
                 len(self.channels) + len(self.analog_traces), period_count=period_count)
         super().__init__(np.arange(dummy_n, dtype=float), np.zeros((dummy_n, 1), dtype=float), labels=labels, relim_mode="tight", **kwargs)
@@ -1194,7 +1195,7 @@ class PulseSequenceFigure(BaseLivePlot):
         """Display x-limits, deliberately a bit wider than ``[start_min, stop_max]``.
 
         A symmetric margin (a fraction of the time span, see
-        ``PULSE_X_MARGIN_FRAC``) is added on each side and the left edge is
+        ``_PULSE_X_MARGIN_FRAC``) is added on each side and the left edge is
         *never* clamped to 0, so a first edge at ``t=0`` still gets breathing
         room instead of sitting flush on the spine.  Negative-time headroom is
         cosmetic only -- the x-axis formatter blanks tick labels for ``value <
@@ -1204,11 +1205,11 @@ class PulseSequenceFigure(BaseLivePlot):
         limits, which keeps the intentional full-bleed baseline look.
         """
         span = max(float(stop_max - start_min), 1e-12)
-        margin_x = max(span * PULSE_X_MARGIN_FRAC, 1e-12)
+        margin_x = max(span * _PULSE_X_MARGIN_FRAC, 1e-12)
         left_limit = start_min - margin_x
         right_limit = stop_max + margin_x
         if has_bracket:
-            right_limit += span * PULSE_X_BRACKET_LABEL_FRAC
+            right_limit += span * _PULSE_X_BRACKET_LABEL_FRAC
         return left_limit, right_limit
 
     def init_core(self) -> None:
@@ -1290,10 +1291,10 @@ class PulseSequenceFigure(BaseLivePlot):
                 )
 
         self.ax.set_xlim(left_limit, right_limit)
-        ylim_top = n_channels - PULSE_Y_PAD_TOP
+        ylim_top = n_channels - _PULSE_Y_PAD_TOP
         if self.repeat_brackets:
             ylim_top = n_channels + 0.78 + 0.26 * max(0, len(self.repeat_brackets) - 1)
-        self.ax.set_ylim(-PULSE_Y_PAD_BOTTOM, ylim_top)
+        self.ax.set_ylim(-_PULSE_Y_PAD_BOTTOM, ylim_top)
         self.analog_trace_artists = []
         self.analog_trace_labels = []
         for trace_index, (key, trace) in enumerate(zip(analog_keys, self.analog_traces)):
@@ -1722,6 +1723,27 @@ def _normalize_kind(kind: str | None) -> str:
     return aliases.get(normalized, normalized)
 
 
+# Geometry / dpi / NaN-and-palette colours are OWNED by the frontend visual
+# system (see the frontend/__init__.py contract): the public factories reject
+# any attempt to set them per call.  ``spec`` is the INTERNAL geometry channel
+# (panel_plot/pulse spec pass it via the private ``_spec`` argument), so a
+# caller can never inject a FigureSpec through the public surface either.
+_SEALED_PLOT_KWARGS = ("spec", "data_px", "margins_px", "dpi", "bad_color", "colors")
+
+
+def _reject_sealed_kwargs(kwargs: dict) -> None:
+    leaked = [key for key in _SEALED_PLOT_KWARGS if key in kwargs]
+    if leaked:
+        raise TypeError(
+            "frontend.plot()/panel_plot() do not accept "
+            + ", ".join(leaked)
+            + ": figure geometry, margins, dpi and NaN/palette colours are owned by "
+            "the frontend visual system and are not configurable per call. Pick a panel "
+            "size from PANEL_SIZES for sizing; labels/title/cmap/bins/thresholds/relim_mode "
+            "are the data options you may pass."
+        )
+
+
 def plot(
     data_x,
     data_y=None,
@@ -1737,6 +1759,7 @@ def plot(
     points_done=None,
     copy: bool = False,
     lock=None,
+    _spec: "FigureSpec | None" = None,
     **kwargs,
 ):
     """Create a static or live notebook plot from the same array contract.
@@ -1746,7 +1769,14 @@ def plot(
     2D scan image. ``kind="hist"`` treats ``data_x`` as the values array. With
     ``update="watch"``, the returned object starts a frontend timer and refreshes
     from the same shared arrays while acquisition code mutates them.
+
+    Figure geometry/dpi/margins are owned by the frontend, not arguments here
+    (``_spec`` is the internal channel used by ``panel_plot``); see the
+    package-level design contract in ``frontend/__init__.py``.
     """
+    _reject_sealed_kwargs(kwargs)
+    if _spec is not None:
+        kwargs = {**kwargs, "spec": _spec}
     normalized_kind = _normalize_kind(kind)
     should_watch = _is_watch_update(update)
 

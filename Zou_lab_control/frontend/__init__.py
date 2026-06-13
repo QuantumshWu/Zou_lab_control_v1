@@ -3,6 +3,37 @@
 The module keeps the Confocal_GUIv2 visual language while exposing a
 hardware-decoupled API for notebook plotting, live updates, selectors, fitting,
 unit conversion, and neutral-atom histogram/readout views.
+
+============================================================================
+SEALED-API DESIGN CONTRACT (authoritative; mirrored in frontend/AGENTS.md and
+docs/MAINTAINER_NOTES.md).  The frontend exposes a SMALL public surface so an
+external caller (notebook / lab) gets correct art, geometry, dpi and typography
+WITHOUT being able to break the visual design.  Six rules:
+
+1. Geometry is OWNED, never passed in.  No public callable accepts ``data_px``,
+   ``margins_px``, ``spec`` or ``dpi``.  Sizes come only from ``FigureSpec``
+   defaults, ``panel_plot_spec``, ``pulse_plot_spec`` and ``create_axes_fixed``.
+   ``plot()``/``panel_plot()`` REJECT those keys (``_SEALED_PLOT_KWARGS``); the
+   internal geometry channel is the private ``plot(_spec=...)`` argument.
+2. Sizes/colormaps are curated, validated on entry.  Panel size is one of
+   ``PANEL_SIZES`` (``panel_size_cells`` raises otherwise); an invalid cmap
+   raises rather than silently falling back.
+3. ONE typography system, one dpi.  ``style.DEFAULT_STYLE`` (300 dpi, fixed font
+   sizes) is the only typography source and is exported READ-ONLY
+   (MappingProxyType); there is no public font-size/colour/dpi override.
+4. ONE display-scale rule.  On-screen scale comes only from
+   ``qt_fluent.resolve_fluent_auto_scale`` (GUI controls) and
+   ``qt_canvas.panel_canvas`` / ``PANEL_DISPLAY_SCALE`` (embedded figures).
+   Public ``show_*`` entry points default to ``scale=None`` (auto).
+5. Art-bearing fluent widgets stay INTERNAL.  ``qt_fluent.*`` / ``qt_canvas.*``
+   (incl. ``FluentGroupBox(shadow=)``, ``add_fluent_shadow``,
+   ``EmbeddedFigureCanvas``) are NOT re-exported here.  Shadows / borders /
+   corner radii are construction details, never public knobs.
+6. Adding a public parameter requires classifying it.  DATA (labels, title,
+   bins, thresholds, relim_mode, cmap-from-a-list, channels) is allowed on the
+   public surface; ART / GEOMETRY / TYPOGRAPHY (margins, dpi, colours, sizes,
+   shadow, fonts) lives on INTERNAL classes only.
+============================================================================
 """
 
 from importlib import import_module

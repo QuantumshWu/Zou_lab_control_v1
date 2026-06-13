@@ -51,28 +51,27 @@ def _latex_text(text: str) -> str:
     return "".join(replacements.get(char, char) for char in str(text))
 
 
-def write_notes_tex(
-    output_dir: str | Path,
+def build_notes_tex_string(
     *,
-    filename: str = "notes.tex",
     title: str,
     subtitle: str = "",
     description: str = "",
     body: str,
     doc_date: str | None = None,
     template_package: str = "zlc_frontend_notes",
-) -> Path:
-    """Write a XeLaTeX notes document using the front-end notes style."""
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    _copy_template_files(output_dir)
-    tex_path = output_dir / filename
+) -> str:
+    """Assemble a complete notes document as a TeX STRING (no filesystem writes).
+
+    This is the single source of the document wrapper (title page + TOC + body);
+    callers compile it through :func:`render_tex_pdf`, so the template structure
+    is guaranteed and no intermediates are written to the output directory."""
+
     doc_date = doc_date or date.today().isoformat()
     title_tex = _latex_text(title)
     subtitle_tex = _latex_text(subtitle)
     description_tex = _latex_text(description)
     date_tex = _latex_text(doc_date)
-    tex = rf"""\documentclass[11pt,oneside,openany]{{book}}
+    return rf"""\documentclass[11pt,oneside,openany]{{book}}
 \usepackage{{{template_package}}}
 
 \begin{{document}}
@@ -86,6 +85,32 @@ def write_notes_tex(
 
 \end{{document}}
 """
+
+
+def write_notes_tex(
+    output_dir: str | Path,
+    *,
+    filename: str = "notes.tex",
+    title: str,
+    subtitle: str = "",
+    description: str = "",
+    body: str,
+    doc_date: str | None = None,
+    template_package: str = "zlc_frontend_notes",
+) -> Path:
+    """Write a XeLaTeX notes document IN PLACE (legacy/debug; leaves a .tex+.sty).
+
+    The default manual build does NOT use this -- it assembles the tex in memory
+    via :func:`build_notes_tex_string` and compiles through :func:`render_tex_pdf`
+    so the output directory keeps only the PDF.  Use this only when you
+    deliberately want the source ``.tex`` on disk for inspection."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _copy_template_files(output_dir)
+    tex_path = output_dir / filename
+    tex = build_notes_tex_string(
+        title=title, subtitle=subtitle, description=description, body=body,
+        doc_date=doc_date, template_package=template_package)
     tex_path.write_text(tex, encoding="utf-8")
     return tex_path
 
@@ -140,14 +165,18 @@ def render_tex_pdf(
     runs: int = 2,
     xelatex: str | None = None,
     halt_on_error: bool = True,
+    assets: str | Path | None = None,
 ) -> Path:
     """Compile TeX to PDF without leaving auxiliary files beside the output.
 
     ``tex`` may be a complete TeX string or a path to a ``.tex`` file.  When a
     file path is supplied, its sibling files and folders are copied to a
     temporary build directory so relative assets such as ``assets/foo.pdf`` keep
-    working.  On success, only ``output_pdf`` is copied back.  On failure, a
-    ``.build.log`` next to ``output_pdf`` records the XeLaTeX output.
+    working.  When a STRING is supplied and ``assets`` names a directory, that
+    directory is copied into the temp build dir as ``assets/`` so figures
+    referenced as ``assets/foo.png`` resolve.  On success, ONLY ``output_pdf`` is
+    copied back -- nothing else is written anywhere.  On failure, a ``.build.log``
+    next to ``output_pdf`` records the XeLaTeX output.
     """
 
     output_pdf = Path(output_pdf).resolve()
@@ -180,6 +209,10 @@ def render_tex_pdf(
         else:
             tex_name = "document.tex"
             (build_dir / tex_name).write_text(str(tex), encoding="utf-8")
+            if assets is not None:
+                asset_dir = Path(assets)
+                if asset_dir.is_dir():
+                    shutil.copytree(asset_dir, build_dir / "assets", dirs_exist_ok=True)
 
         combined: list[str] = []
         for _ in range(max(1, int(runs))):
@@ -233,46 +266,37 @@ def render_notes_pdf(
     body: str,
     doc_date: str | None = None,
     compile_pdf: bool = True,
-    clean_compile: bool = True,
     runs: int = 2,
     xelatex: str | None = None,
     halt_on_error: bool = True,
 ) -> NotesBuildResult:
-    """Write and optionally compile a note document in the package style."""
-    tex_path = write_notes_tex(
-        output_dir,
-        filename=filename,
-        title=title,
-        subtitle=subtitle,
-        description=description,
-        body=body,
-        doc_date=doc_date,
-    )
-    if compile_pdf:
-        if clean_compile:
-            pdf_path = render_tex_pdf(
-                tex_path,
-                tex_path.with_suffix(".pdf"),
-                runs=runs,
-                xelatex=xelatex,
-                halt_on_error=halt_on_error,
-            )
-            return NotesBuildResult(
-                tex_path=tex_path,
-                pdf_path=pdf_path,
-                build_dir=tex_path.parent,
-                log_path=None,
-            )
-        return compile_notes_pdf(
-            tex_path,
-            runs=runs,
-            xelatex=xelatex,
-            halt_on_error=halt_on_error,
-        )
+    """Build a manual PDF, leaving ONLY the ``.pdf`` in ``output_dir``.
+
+    The document is assembled in memory (:func:`build_notes_tex_string`) and
+    compiled through :func:`render_tex_pdf` in a temporary directory, so no
+    ``.tex``/``.sty``/``.aux``/``.log``/``.toc``/``.out`` is ever written to
+    ``output_dir`` -- only the final ``<filename stem>.pdf`` (alongside any
+    committed ``assets/`` it embeds).  ``compile_pdf=False`` is an explicit
+    inspection mode that writes the source ``.tex`` (legacy in-place path)."""
+    output_dir = Path(output_dir)
+    pdf_path = output_dir / f"{Path(filename).stem}.pdf"
+    if not compile_pdf:
+        tex_path = write_notes_tex(
+            output_dir, filename=filename, title=title, subtitle=subtitle,
+            description=description, body=body, doc_date=doc_date)
+        return NotesBuildResult(tex_path=tex_path, pdf_path=pdf_path,
+                                build_dir=output_dir, log_path=None)
+    tex = build_notes_tex_string(
+        title=title, subtitle=subtitle, description=description, body=body,
+        doc_date=doc_date)
+    asset_dir = output_dir / "assets"
+    pdf_path = render_tex_pdf(
+        tex, pdf_path, runs=runs, xelatex=xelatex, halt_on_error=halt_on_error,
+        assets=asset_dir if asset_dir.is_dir() else None)
     return NotesBuildResult(
-        tex_path=tex_path,
-        pdf_path=tex_path.with_suffix(".pdf"),
-        build_dir=tex_path.parent,
+        tex_path=output_dir / filename,   # nominal source path; NOT written on the clean path
+        pdf_path=pdf_path,
+        build_dir=output_dir,
         log_path=None,
     )
 

@@ -111,19 +111,27 @@ def test_render_latex_pdf_clean_copies_only_final_pdf(tmp_path, monkeypatch):
     assert out2.read_bytes().startswith(b"%PDF")
     assert not (tmp_path / "manual2.aux").exists()
 
+    # the DEFAULT manual build leaves ONLY the .pdf in the output dir -- no
+    # .tex/.sty/.aux is written there (the document is assembled in memory and
+    # compiled in a temp dir).  This is the "zero junk in docs/" contract.
+    notes_dir = tmp_path / "notes"
     result = zf.render_notes_pdf(
-        tmp_path / "notes",
+        notes_dir,
         filename="quick_note.tex",
         title="Quick Note",
         body="hello",
         xelatex="fake-xelatex",
         runs=1,
     )
+    assert result.pdf_path == (notes_dir / "quick_note.pdf").resolve()
     assert result.pdf_path.read_bytes().startswith(b"%PDF")
-    assert result.tex_path.name == "quick_note.tex"
-    assert not (result.tex_path.parent / "quick_note.aux").exists()
+    assert sorted(p.name for p in notes_dir.iterdir()) == ["quick_note.pdf"]
+    assert not (notes_dir / "quick_note.tex").exists()
+    assert not (notes_dir / "quick_note.aux").exists()
+    assert not (notes_dir / "zlc_frontend_notes.sty").exists()
     assert result.log_path is None
 
+    # compile_pdf=False is the explicit inspection mode that DOES write the .tex
     draft = zf.render_notes_pdf(
         tmp_path / "draft",
         filename="draft_note.tex",
@@ -1079,6 +1087,39 @@ def test_panel_plot_spec_is_the_confocal_modular_region():
     assert (width, height) == (round(700 * PANEL_DISPLAY_SCALE), round(530 * PANEL_DISPLAY_SCALE))
     with pytest.raises(ValueError):
         panel_size_cells("5x5")
+
+
+def test_frontend_public_api_seals_art_and_geometry():
+    """The sealed-API design contract (frontend/__init__.py rules 1-3): external
+    callers pass DATA, never ART/GEOMETRY/dpi/typography.  plot()/panel_plot()
+    reject geometry+colour kwargs, and DEFAULT_STYLE is read-only -- this is the
+    enforcement that stops a notebook from breaking the visual design."""
+
+    import numpy as np
+    import Zou_lab_control.frontend as zf
+
+    x = np.arange(6, dtype=float).reshape(-1, 1)
+    y = np.arange(6, dtype=float).reshape(-1, 1)
+    # rule 1: figure geometry / dpi / NaN colour are owned, not per-call knobs
+    for leaked in ("data_px", "margins_px", "dpi", "spec", "bad_color", "colors"):
+        with pytest.raises(TypeError):
+            zf.plot(x, y, kind="1d", display=False, data_figure=False, **{leaked: object()})
+        with pytest.raises(TypeError):
+            zf.panel_plot(x, y, kind="1d", size="1x2", **{leaked: object()})
+    # internal geometry still flows: panel_plot sizes correctly via the size preset
+    panel = zf.panel_plot(x, y, kind="1d", size="1x2")
+    assert panel.spec.data_px == (480, 180)
+    # legitimate DATA options still pass (labels/title/relim_mode)
+    ok = zf.plot(x, y, kind="1d", labels=("t", "v", "z"), title="ok",
+                 relim_mode="tight", display=False, data_figure=False)
+    assert ok.title == "ok"
+    # rule 3: the one typography system is read-only
+    with pytest.raises(TypeError):
+        zf.DEFAULT_STYLE["axes.labelsize"] = 99
+    # pulse_plot_spec owns margins/dpi (no per-call geometry knobs left)
+    import inspect
+    params = set(inspect.signature(zf.pulse_plot_spec).parameters)
+    assert not ({"margins_px", "dpi"} & params), params
 
 
 @pytest.mark.parametrize("scale_factor", ["1.0", "1.25", "1.5"])
