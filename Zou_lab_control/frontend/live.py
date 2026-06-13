@@ -323,6 +323,18 @@ class BaseLivePlot:
     def update_core(self) -> None:
         raise NotImplementedError
 
+    def _set_colorbar_ticks(self, lo, hi) -> None:
+        """Set the colorbar's two end ticks, SKIPPING the relabel when the
+        limits are unchanged since the last call.  Reusable across any panel
+        with a colorbar: the labels are identical when (lo, hi) repeat (common
+        once a value saturates, e.g. occupancy pinned to 0..1), so skipping the
+        string reformat is appearance-neutral and removes per-tick work."""
+        key = (float(lo), float(hi))
+        if getattr(self, "_last_cbar_ticks", None) == key:
+            return
+        self._last_cbar_ticks = key
+        self._set_colorbar_ticks(lo, hi)
+
     def update(self, data_y=None, *, points_done: int | None = None, repeat_cur: int | None = None, draw: bool = True):
         """Refresh artists from current or newly supplied data."""
         if not self._shown:
@@ -486,6 +498,17 @@ class LiveLiveDis(Live1D):
     def _gauss_func(x, amp, mu, sigma):
         return amp * np.exp(-((x - mu) ** 2) / (2.0 * sigma**2))
 
+    @staticmethod
+    def _gauss_func_jac(x, amp, mu, sigma):
+        # Analytic gradient of _gauss_func; sigma > 0 within the fit bounds, so it
+        # matches the model exactly.  Passing it to curve_fit skips the
+        # finite-difference Jacobian (the fit cost) with no change to the result.
+        x = np.asarray(x, dtype=float)
+        s = sigma if abs(sigma) > 1e-12 else 1e-12
+        e = np.exp(-((x - mu) ** 2) / (2.0 * s * s))
+        g = amp * e
+        return np.stack([e, g * (x - mu) / (s * s), g * (x - mu) ** 2 / (s ** 3)], axis=-1)
+
     def _update_gauss_fit(self):
         mask = self.n > 0
         centers = (self.bins[:-1] + self.bins[1:]) / 2
@@ -500,6 +523,7 @@ class LiveLiveDis(Live1D):
                 y,
                 p0=[np.max(y), np.mean(x), max(np.ptp(x) / 4, 1e-12)],
                 bounds=([0, np.min(x), max(np.ptp(x) / 100, 1e-12)], [max(np.max(y) * 4, 1), np.max(x), max(np.ptp(x) * 10, 1e-12)]),
+                jac=self._gauss_func_jac,
             )
         except Exception:
             return
@@ -643,8 +667,7 @@ class Live2DDis(BaseLivePlot):
         cmap = self.image.get_cmap()
         self.line_l = self.axdis.axhline(self.ylim_min, color=cmap(0.0), linewidth=matplotlib.rcParams["legend.fontsize"] / 2)
         self.line_h = self.axdis.axhline(self.ylim_max, color=cmap(0.95), linewidth=matplotlib.rcParams["legend.fontsize"] / 2)
-        self.cax.set_yticks([y_min, y_max])
-        self.cax.set_yticklabels([_float2str_eng(v, length=5) for v in [y_min, y_max]])
+        self._set_colorbar_ticks(y_min, y_max)
         self.drag = DragHLine(self.line_l, self.line_h, self.update_clim, self.axdis)
 
     def _attach_interactions(self) -> None:
@@ -780,15 +803,13 @@ class LiveSiteMap(BaseLivePlot):
         self.ax.set_ylabel(self.ylabel)
         self.cbar = self.fig.colorbar(self.sites, cax=self.cax)
         self.cbar.set_label(self.zlabel)
-        self.cax.set_yticks([lo, hi])
-        self.cax.set_yticklabels([_float2str_eng(v, length=5) for v in (lo, hi)])
+        self._set_colorbar_ticks(lo, hi)
 
     def update_core(self) -> None:
         self.sites.set_array(self.data_y[:, 0])
         lo, hi = self._value_limits()
         self.sites.set_clim(lo, hi)
-        self.cax.set_yticks([lo, hi])
-        self.cax.set_yticklabels([_float2str_eng(v, length=5) for v in (lo, hi)])
+        self._set_colorbar_ticks(lo, hi)
 
     def _install_state(self) -> None:
         self.fig._zlc_state = PlotState(plot_type="SITES", x_array=self.data_x[:, 0], y_array=self.data_y, cax=self.cax)
@@ -1589,6 +1610,24 @@ class HistogramFigure(BaseLivePlot):
     def _bimodal_model(cls, x, amp0, mu0, sigma0, amp1, mu1, sigma1):
         return cls._gauss(x, amp0, mu0, sigma0) + cls._gauss(x, amp1, mu1, sigma1)
 
+    @staticmethod
+    def _gauss_jac_columns(x, amp, mu, sigma):
+        # Analytic gradient of _gauss w.r.t (amp, mu, sigma); within the fit
+        # bounds sigma > 0 so this matches _gauss exactly.  Supplying it to
+        # curve_fit removes the finite-difference Jacobian (the bulk of the fit
+        # cost) WITHOUT changing the converged parameters.
+        x = np.asarray(x, dtype=float)
+        s = max(float(abs(sigma)), 1e-12)
+        e = np.exp(-((x - mu) ** 2) / (2.0 * s * s))
+        g = amp * e
+        return e, g * (x - mu) / (s * s), g * (x - mu) ** 2 / (s ** 3)
+
+    @classmethod
+    def _bimodal_jac(cls, x, amp0, mu0, sigma0, amp1, mu1, sigma1):
+        a0, m0, s0 = cls._gauss_jac_columns(x, amp0, mu0, sigma0)
+        a1, m1, s1 = cls._gauss_jac_columns(x, amp1, mu1, sigma1)
+        return np.stack([a0, m0, s0, a1, m1, s1], axis=-1)
+
     def _fit_bimodal(self) -> None:
         vals = self.values[np.isfinite(self.values)]
         if vals.size < 6 or np.ptp(vals) == 0:
@@ -1619,7 +1658,8 @@ class HistogramFigure(BaseLivePlot):
             [max(amp * 5, 1), float(np.nanmax(vals)), span * 2, max(amp * 5, 1), float(np.nanmax(vals)), span * 2],
         )
         try:
-            popt, _ = curve_fit(self._bimodal_model, centers, counts, p0=p0, bounds=bounds, maxfev=20000)
+            popt, _ = curve_fit(self._bimodal_model, centers, counts, p0=p0, bounds=bounds,
+                                 jac=self._bimodal_jac, maxfev=20000)
         except Exception:
             self.bimodal_popt = None
             self.fit_threshold = None

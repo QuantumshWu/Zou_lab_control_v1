@@ -617,14 +617,19 @@ class PanelCard(FluentGroupBox):
         self._apply_source()                      # picking a signal applies instantly
 
     def set_status(self, text: str, *, error: bool) -> None:
+        # Text changes every tick ("shot N") -- but the COLOUR/stylesheet only
+        # changes on the ok<->error transition.  Restyle only on that transition
+        # (rebuilding the same stylesheet string every tick was pure waste);
+        # appearance-neutral because the colour is identical when error is.
         self.status.setText(str(text)[:200])
-        self.status.setStyleSheet(
-            f"color: {RED if error else GREY}; background: transparent; border: none;")
-        colour = RED if error else GREY
-        self.setting_button.set_color(colour)
-        self.setting_button.setToolTip(f"Panel settings — {text}" if text else "Panel settings")
         self.footer.setText(f"{text}   ·   {self.config.source}"[:160])
-        self.footer.setStyleSheet(f"color: {colour}; background: transparent;")
+        self.setting_button.setToolTip(f"Panel settings — {text}" if text else "Panel settings")
+        if error is not getattr(self, "_status_error", None):
+            self._status_error = bool(error)
+            colour = RED if error else GREY
+            self.status.setStyleSheet(f"color: {colour}; background: transparent; border: none;")
+            self.footer.setStyleSheet(f"color: {colour}; background: transparent;")
+            self.setting_button.set_color(colour)
 
     # ------------------------------------------------------------- drag to grid
     def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt naming
