@@ -122,6 +122,8 @@ def test_grid_focus_zoom_enlarges_one_cell_and_returns():
     (full selectors), unfocus()/double-click returns to the grid."""
     import numpy as np
 
+    from matplotlib.backend_bases import MouseEvent
+
     rng = np.random.default_rng(3)
     sites = [np.concatenate([rng.normal(3, 1, 50), rng.normal(40, 3, 60)]) for _ in range(6)]
     g = zf.site_histogram_grid(sites, thresholds=[20.0] * 6, display=False)
@@ -131,9 +133,22 @@ def test_grid_focus_zoom_enlarges_one_cell_and_returns():
         assert g._focused == 2 and g.focus_ax is not None
         assert all(not ax.get_visible() for ax in g.site_axes)  # grid hidden
         assert g._focus_tools.zoom is not None                  # enlarged cell has its own selectors
-        g.unfocus()                                             # back to the grid
-        assert g._focused is None and g.focus_ax is None
+        # grid area selectors are suspended while focused (no residual box on return)
+        assert all(not b.area.selector.active for b in g._cell_interactions)
+
+        # a NON-left double-click (scroll wheel / middle button) must NOT exit focus
+        def _dbl(ax, button):
+            e = MouseEvent("button_press_event", g.fig.canvas, *ax.transData.transform((20, 1)))
+            e.dblclick, e.button, e.inaxes = True, button, ax
+            g.fig.canvas.callbacks.process("button_press_event", e)
+        _dbl(g.focus_ax, 2)
+        assert g._focused == 2                                  # middle double-click did not exit
+        _dbl(g.focus_ax, 1)
+        assert g._focused is None and g.focus_ax is None        # left double-click returns to grid
         assert all(ax.get_visible() for ax in g.site_axes)
+        # grid area selectors re-armed AND cleared of any residue
+        assert all(b.area.selector.active and b.area.range == [None, None, None, None]
+                   for b in g._cell_interactions)
     finally:
         plt.close(g.fig)
 

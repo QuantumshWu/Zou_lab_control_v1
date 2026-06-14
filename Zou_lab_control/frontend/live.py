@@ -2029,13 +2029,31 @@ class GridPlot(BaseLivePlot):
 
     # ----------------------------------------------------------- focus-zoom
     def _on_click(self, event) -> None:
-        if not getattr(event, "dblclick", False):
+        # Only a LEFT double-click toggles focus.  Some backends report the scroll
+        # wheel / middle button as button 2/4/5 press pairs with dblclick=True, which
+        # otherwise kicked us out of the enlarged view while scrolling.
+        if not getattr(event, "dblclick", False) or getattr(event, "button", 1) != 1:
             return
         if self._focused is None:
             if event.inaxes in self.site_axes:
                 self.focus(self.site_axes.index(event.inaxes))
         else:
             self.unfocus()
+
+    def _set_grid_areas_active(self, active: bool) -> None:
+        """Clear and (de)activate every grid cell's area selector.  Clearing wipes
+        the residual selection box the focus double-click leaves on a cell (it would
+        otherwise reappear when the grid returns); deactivating stops hidden cells
+        reacting while focused."""
+        for bundle in self._cell_interactions:
+            area = getattr(bundle, "area", None)
+            if area is None:
+                continue
+            try:
+                area.clear()
+                area.selector.set_active(active)
+            except Exception:
+                pass
 
     def _on_key(self, event) -> None:
         if getattr(event, "key", None) == "escape" and self._focused is not None:
@@ -2054,6 +2072,7 @@ class GridPlot(BaseLivePlot):
         self._hidden_texts = [t for t in self.fig.texts if t.get_visible()]
         for t in self._hidden_texts:
             t.set_visible(False)
+        self._set_grid_areas_active(False)   # no residual box from the focus double-click
         # A clean, comfortably-margined single plot: room on the left for the counts
         # axis + ylabel, on the bottom for the xlabel, on top for the title.
         self.focus_ax = self.fig.add_axes([0.10, 0.13, 0.85, 0.77])
@@ -2085,6 +2104,7 @@ class GridPlot(BaseLivePlot):
         for t in getattr(self, "_hidden_texts", []):    # restore the grid's outer labels/title
             t.set_visible(True)
         self._hidden_texts = []
+        self._set_grid_areas_active(True)               # re-arm grid area selectors, residue cleared
         self.fig._zlc_tools = self.tools
         self.draw()
 
