@@ -224,6 +224,47 @@ threshold = exp.readout.thresholds(frames=120, site=0)
 shot      = exp.readout.detect()
 \end{codeblock}
 
+\chapter{读出测量:扫描读出时长与一键测温}
+
+标定（sitemap / thresholds）之后，\pyapi{exp.readout} 还提供两类\tfocus{扫描测量}：扫描读出时长得保真度曲线，以及 release-recapture（弹道重捕）\tfocus{测温}。两者都是同一台\tfocus{通用扫描引擎}（\pyapi{operations/measurement.py}）的实例——扫一个被绑定的脉冲参数、每点采几帧、把帧约简成一个数做成 live 曲线——只换扫描轴 / 每点采帧方式 / 约简器。它们只走相机 / sequencer / 标定契约，所以\tfocus{虚拟与真机同一代码路径}（换真机只改 \pyapi{na.connect}）。
+
+\begin{notebox}[单一真相源]
+notebook 一行（\pyapi{exp.readout.temperature(...)}）与 Task 控制台 GUI 的一键 Start \tfocus{调同一个建器}（\pyapi{build\_temperature\_scan} / \pyapi{build\_detection\_scan}），所以 API 与 GUI 永远不漂移。GUI 路径见 frontend 手册"Task 控制台"章。
+\end{notebox}
+
+\section{读出时长 → 保真度}
+\pyapi{exp.readout.readout\_duration\_fidelity(times, *, shots=60, site=None, ...)}（语义别名 \pyapi{detection\_time}）扫一组成像/探测时长 \pyapi{times}（秒），每个时长对 ROI 计数分布做 Otsu 阈值 + 双高斯保真度估计，返回随时长增长的单发保真度曲线。默认 \pyapi{live=True}（前端定时刷新，\pyapi{scan.stop()} 提前停）。
+
+\section{一键测温:release-recapture}
+\tfocus{物理}：两次成像之间把 trap 关掉 \pyapi{t\_off}，原子按热速度自由飞；再开 trap，问还有多少原子近到能被重捕。越热飞得越远，存活随 \pyapi{t\_off} 衰减越快——\tfocus{survival-vs-t\_off 曲线编码了温度}。曲线只定 $r_c/\sqrt{T}$，所以\tfocus{必须}从阱几何给出捕获半径 \pyapi{capture\_radius}（米）才能定出 \pyapi{T}。
+
+\begin{codeblock}[Python]
+import numpy as np
+import Zou_lab_control.neutral_atom as na
+
+exp = na.connect("virtual", sitemap={"grid_shape": (5, 7)})  # 真机换成对应 config
+exp.readout.sitemap(method="box"); exp.readout.thresholds()
+
+# 6 周期双触发序列:trap_off 周期的 duration 绑到 scan slot s0(= t_off)
+state = na.build_release_recapture_pulse(channels=list(exp.devices.sequencer.channels))
+pulse = na.bind_pulse(exp.devices.sequencer, state)
+
+# 扫 t_off,每点 2 帧(成像1/成像2),按 calibration.detect 算逐点存活率
+res = exp.readout.temperature(np.linspace(0, 300e-6, 13), pulse=pulse, shots=16)
+
+# 纯后处理拟合温度(capture_radius 必填,米)
+fit = na.fit_temperature(res.x, res.y, capture_radius=6e-6)
+print(fit.summary())   # {'temperature_uK': ~44..50, 'capture_radius_m': 6e-06, ...}
+\end{codeblock}
+
+\textbf{涉及的 API}：
+\begin{description}
+  \item[\pyapi{exp.readout.temperature(t\_off\_s, *, pulse, shots=1, per\_site=False, live=True, ...)}] 扫 \pyapi{t\_off\_s}（秒），每点经 \pyapi{ReleaseRecapturePlan} 采两帧、\pyapi{SurvivalReducer} 出存活，返回 \pyapi{ScanResult}（\pyapi{res.x}=t\_off、\pyapi{res.y}=存活）。需要已定阈值的标定（存活是二值占据比较）。\pyapi{per\_site=True} 返回逐站存活。
+  \item[\pyapi{na.build\_release\_recapture\_pulse(*, channels, exposure=20e-3, trap\_off\_nominal=20e-6, ...)}] 建 6 周期 \pyapi{PulseTableState}（两相机触发夹一段 trap-off），trap-off 周期的 duration 经 \pyapi{bind\_field} 绑到 scan slot \pyapi{s0}=\pyapi{t\_off}（与扫描读出时长同一种可扫量）。\tfocus{必须}是单条双触发序列、不能重复单帧序列（两帧要同一次装载、中间夹 trap=0）。
+  \item[\pyapi{na.fit\_temperature(t\_off, survival, *, capture\_radius, mass=RB87\_MASS, fit\_baseline=True)}] \tfocus{纯后处理}（不进采集循环）：把弹道重捕模型拟合到存活曲线，回 \pyapi{TemperatureFit}（\pyapi{temperature\_uK} 等）。\pyapi{capture\_radius} 是已知输入（量级简并），只拟合 \pyapi{T}（与可选 baseline）。
+  \item[底层组件] \pyapi{operations.temperature} 还导出 \pyapi{ReleaseRecapturePlan}（两帧 plan）、\pyapi{SurvivalReducer}（逐点存活，标量或逐站）、\pyapi{release\_recapture\_survival}（物理模型）；以及 \pyapi{exp.readout.build\_temperature\_scan(...)} / \pyapi{build\_detection\_scan(...)}（单一真相源建器，返回未跑的 \pyapi{ScannedMeasurement}）、\pyapi{exp.readout.measurement\_specs()}（给 GUI 的测量目录）。
+\end{description}
+
 \chapter{N-slot 扫描模型}
 
 \section{为什么是“命名 slot”}

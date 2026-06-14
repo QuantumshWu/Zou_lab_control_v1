@@ -5,17 +5,19 @@
 
 ## 当前焦点(2026-06)
 
-notebook 调用侧的解耦 + Rb87 读出**已落地**(见下"已完成");下一步是真机 qCMOS 接线与 GUI 回归。
+notebook 调用侧的解耦 + Rb87 读出 + **task_console 大改(Monitor/Control + 通用 Measurement 框架 + 一键温度)已落地**(见下"已完成");下一步是真机 qCMOS 接线与性能激进档拍板。
 
 **已完成(2026-06)**
 1. **解耦**:`neutral_atom` 不再 import `frontend`(IoC viewer 注册表 `_viewer_registry`,双向 import 期互不拉对方;实验层可 headless 导入)。
 2. **子系统拥有逻辑**:读出编排(sitemap/thresholds/detect/detection-time)从 `session` 上帝对象搬进 `ReadoutSubsystem`,session 退成门面;签名明确不再 `**kwargs` 转发。
 3. **Rb87 读出接入**:PSF 匹配滤波提取(`core/psf.py`)+ 双高斯定阈/保真度(`core/bimodal.py`),`TrapCalibration` 加 `method='box'|'psf'` 经 `signals()`/`detect()` 单点分派(box 仍默认);`readout.sitemap(method="psf")` / `thresholds(method="bimodal")`;虚拟后端端到端可测。**只移植算法,不带 rb_qcmos 的文件IO/缓存/批处理脚手架**。
 4. **虚拟==实机机械强制**:核心准则"虚拟测试走实机同一代码路径,只 fake 数据源"写进 AGENTS §2 并由 `tests/test_virtual_equals_real_contract.py` 强制(分析层 import 具体后端/读仿真真值即挂测,含 `session.py`)。配套:`session.connect()` 去掉对 `VirtualTrapArray` 的 import + 字段内省(虚拟配置搬进后端,经 registry `resolve_connect_config` 分派);task-console feed 从绑死虚拟 trap 的 `VirtualLoadingFeed` 重构成走 `CameraDevice` 契约的 backend-agnostic `LoadingFeed`(即原计划的 `AtomLoadingFeed`,真机只换相机),虚拟便利工厂 `devices/virtual.virtual_loading_feed`。读出数学(高斯/正态CDF/双高斯/保真度)提到 dependency-free `_readout_math.py`,core 与 frontend 共用一份(`tests/test_readout_math_single_source.py` 守);所有 plot 必须继承 `BaseLivePlot`(`tests/test_frontend_plot_contract.py` 守)。
+5. **task_console 大改(commit 4525c1e,对抗式验收 PASS)**:① Tab 改 **Monitor**(实时拖拽 live 网格)+ **Control**(Processing 处理/保存 + Measurement);② 每图 **Setting 瘦身**=只放基本(信号源/size/colormap/colorbar 显隐/unit 切换/lim auto-manual),Fit + 自适应 range 迁 Control,cbar/unit/lim 持久化进 `PanelConfig.params` 重建时重应用;③ **通用 Measurement 框架**(`operations/measurement.py`):`MeasurementSpec`/`ParamDecl` 声明式单一真相源 → `ScanAxis`/`ShotPlan`/`PointReducer` 三角色 → `ScannedMeasurement` 引擎 → `ScannedMeasurementFeed` 推扫描点到 hub(自停);单一真相源建器 `build_*_scan`,GUI 目录 `exp.readout.measurement_specs()`;④ **一键温度**(`operations/temperature.py`):release-recapture 弹道重捕(6 周期双触发、t_off=duration scan slot、`SurvivalReducer`、`fit_temperature` 纯后处理、capture_radius 简并),虚拟 trap-off 损失模型只在数据源侧;⑤ **空白收紧** `PANEL_MARGINS_PX (110,110,100,70)→(92,86,80,52)` + footer 紧贴 canvas(残留右 gutter/tiling slack 是固定拖拽网格的结构性权衡);⑥ **性能结论(诚实)**:瓶颈=密封 300dpi 文字栅格化(intrinsic ~72ms/5面板),blit 与位置冻结实测否决,激进提速需用户拍板。文档:`docs/task_console_design/`(Monitor/Control + Measurement + 一键温度 + 性能) + frontend/main 手册 + MAINTAINER_NOTES §19 + tutorial 一键测温小节。
 
 **下一步(待做)**
-- 真机 qCMOS 相机后端(`devices/qcmos.py`)接 PSF/bimodal 读出,在真实数据上验证保真度;4-shot group / 参考帧定 ground-truth 标签作为可选标定流程(算法已具备,缺采集编排)。换真机时:`na.connect("qcmos", ...)` + `LoadingFeed(hub, exp.camera, sequencer=..., grid_shape=...)`,分析/feed 代码不动。
-- 回头调 GUI(见下"暂缓:GUI 相关")。
+- 真机 qCMOS 相机后端(`devices/qcmos.py`)接 PSF/bimodal 读出,在真实数据上验证保真度;4-shot group / 参考帧定 ground-truth 标签作为可选标定流程(算法已具备,缺采集编排)。换真机时:`na.connect("qcmos", ...)` + `LoadingFeed(hub, exp.camera, ...)`,分析/feed 代码不动;**温度/读出测量(`exp.readout.temperature`/`readout_duration_fidelity` 与 GUI 一键 Start)走同一路径**,只换 connect。
+- **性能激进档需用户拍板**:迟滞 autoscale / 错峰重绘 / 嵌入面板低 dpi 性能模式(均改可见行为或视觉,见性能结论)。
+- 其余 GUI 待决方向(见下"暂缓:GUI 相关")。
 
 > `references/` 是历史源码归档(`rb87_readout_v16`、confocal GUI 等),**git ignore、只在本地存在**,是借鉴/移植的来源,不是被本仓库 import 的依赖(见 README 目录树)。
 > **最小跑通入口**:`task_console.bat`(虚拟 feed 仪表盘)/ `tutorials/` 里的 notebook / `na.connect("virtual")` 起一个全虚拟 session——先在虚拟后端把调用链串通,再换真机后端。
@@ -50,13 +52,14 @@ notebook-first;子模块只经接口互联(解耦);无后向兼容;前端密封;
 - 控制台 ↔ 脉冲 GUI 联动(同进程触发 on_pulse / 改 detection time)。
 - 多 group / 4-shot 结构在仪表盘层的抽象(多数情况"循环里算完再 publish"已足够)。
 
-## 暂缓:真机 feed 类与派生量(notebook 侧定稿后做)
-- 入库一个从 `NeutralAtomSession` 采集循环 publish 的 `AtomLoadingFeed`(骨架见设计文档),让真机监控开箱即用。
-- readout 提供"逐 shot 派生量"helper(保真度/温度),让 `atom_temp_monitor`/`fidelity_monitor` 类任务开箱即用。
+## 真机 feed 类与测量(已落地)
+- ~~入库一个从 `NeutralAtomSession` 采集循环 publish 的 `AtomLoadingFeed`~~ → 已落地为 backend-agnostic `LoadingFeed`(走 `CameraDevice` 契约,虚拟便利工厂 `virtual_loading_feed`)。
+- ~~readout 提供"逐 shot 派生量"helper(保真度/温度)~~ → 已落地为通用 Measurement 框架 + 一键温度(`exp.readout.temperature`/`readout_duration_fidelity`/`measurement_specs`);GUI Control 段一键 Start。`atom_temp_monitor` 类任务现可直接由 Measurement 段驱动。
 
 ---
 
 ## 要你拍板的决定(开放)
+- **task_console 性能激进档**:瓶颈=密封 300dpi 文字栅格化(intrinsic),合规提速(空白收紧)已做;再快需迟滞 autoscale / 错峰重绘 / 低 dpi 性能模式——均会改可见行为或视觉,**要不要做、接受哪档由你定**(blit 与位置冻结已实测否决)。
 - root `AGENTS.md` 之外是否还要单独 `CLAUDE.md`?(目前合并在 AGENTS。)
 - 常犯错误目录的"自动记录"是否要加 Stop hook 提醒?(目前靠版本化目录 + MEMORY 指针 + 收尾自觉追加。)
 - notebook 实验任务是否采用 confocal 式声明式装饰器(想法 1),还是更轻的约定?

@@ -906,3 +906,118 @@ did not revive an open GUI/notebook).
 **Earlier diagnosis was incomplete:** commit 87ea492 fixed a real `_io_lock` re-entrancy
 deadlock in the same path, but the restart it unblocked then ALWAYS failed on defect 1 --
 which is why the "fixed" bug kept coming back on the real machine.
+
+## 19. Generic scanned-measurement abstraction + release-recapture thermometry (2026-06-14)
+
+Design doc: `docs/task_console_design/` (Measurement + one-key-temperature chapters).
+This section is the maintainer-side condensate.
+
+### The one engine behind every live scan
+
+A "scanned measurement" = sweep one bound pulse parameter, acquire a few camera
+frames per point, reduce those frames to a number (or one number per site) that
+becomes the live curve's y. Detection-time/fidelity and release-recapture
+temperature are the SAME shape; only three roles differ, so each is a role, not a
+new scan loop (`operations/measurement.py`):
+
+- **`ScanAxis(slot, values, label, unit, kind)`** — WHAT is swept: a named slot
+  (`duration` set via `pulse.set_time`, taking ns at the wire; or `dac` set via
+  `pulse.set_slot`, signed user value). `values`/`unit` stay in the user unit;
+  `scale_to_ns` converts.
+- **`ShotPlan` (protocol)** — HOW MANY frames + how the per-point sequence is
+  built (`frame_sequence` only). `NFramePlan` = N independent frames, one trigger
+  each (detection-time). `ReleaseRecapturePlan` = one acquire returns `[f0, f1]`.
+- **`PointReducer` (protocol)** — HOW frames + calibration become y.
+  `OtsuFidelityReducer` (pool `calibration.signals`, otsu split, gaussian-split
+  fidelity). `SurvivalReducer` (occupancy compare on two frames).
+
+Engine: **`ScannedMeasurement(pulse, camera, sequencer, calibration, axis, plan,
+reducer, shots_per_point)`**. `measure(value, index)` = `axis.apply` →
+`plan.sequence_for` → `camera.acquire(plan.n_frames, ...)` → `reducer.reduce`
+(averaged over `shots_per_point`) — this is the per-point callback. `run(live=...)`
+hands it to `active_plotter().run` when a viewer is registered (background worker,
+UI-thread refresh, cooperative `stop()`), else runs the same callback synchronously
+and still returns a complete `ScanResult` (x + `data_y` `(n_points, n_series)`).
+
+### Single source of truth: build_*_scan + declarative spec
+
+`ReadoutSubsystem.build_temperature_scan(...)` / `build_detection_scan(...)` are the
+ONLY assemblers. Both `exp.readout.temperature(...)` (runs it) and the GUI's
+`measurement_specs()` closures call them, so the notebook one-liner and the GUI
+Start button drive identical acquisition — they cannot drift.
+
+`MeasurementSpec` / `ParamDecl` (declared once; API default AND GUI control derive
+from the one declaration — explicit declaration, NOT signature reflection/AST, to
+avoid the confocal AST-guess pitfall). `ParamDecl.kind` ∈
+float/int/axis_range/bool/choice; **no value is ever `eval`'d** — consumers
+validate/coerce by kind (the confocal free-text-eval lesson). `MeasurementSpec.build`
+closure captures `exp`, so the console never holds the session (decoupling).
+
+`ScannedMeasurementFeed` (`operations/feeds.py`) wraps a measurement as a console
+feed: each `shot()` advances ONE scan point and publishes the CUMULATIVE
+`{x_key: x[:k], y_key: y[:k], scan_done, shot}`; finite-scan **self-stop** (sets its
+own stop event after the last point, so a background `start()` thread exits).
+`run_to_completion()` for headless/tests.
+
+**Virtual == real guard.** Engine + feed touch only `camera.acquire` /
+sequencer (via pulse) / `calibration.signals|detect` / `active_plotter().run` — zero
+import of virtual/qcmos, zero simulation ground truth. Living in `operations/` they
+are caught by `tests/test_virtual_equals_real_contract.py`.
+
+### Release-recapture thermometry physics (`operations/temperature.py`)
+
+Trap OFF for `t_off` → atoms fly ballistically → trap ON → survival = recaptured /
+initially-occupied. Model (`release_recapture_survival`, 3-D isotropic point source,
+initial position spread neglected = short-time tight-trap approx): per-axis recapture
+is the Gaussian velocity fraction inside `|v| < r_c/t`, isotropic survival =
+`baseline · P_axis(t)**3`, with 1-D spread `σ_v = sqrt(k_B T / m)`. Uses the shared
+`normal_cdf` from `_readout_math.py` (does NOT re-implement erf). Ref: Tuchendler et
+al., PRA 78, 033425 (2008).
+
+- **Capture-radius degeneracy (key).** The curve fixes only `r_c / sqrt(T)`, so
+  `capture_radius` (metres, from trap geometry ≈ tweezer waist) MUST be supplied;
+  `fit_temperature` takes it as a known input and fits T (+ optional baseline) only.
+- **The 6-period pulse** (`build_release_recapture_pulse`): image1_expose,
+  image1_settle, **trap_off (duration bound to scan slot s0 = t_off)**,
+  trap_recapture, image2_expose, image2_settle — two emCCD triggers, one trap-off
+  between. Bound via `bind_field("duration","2")` — the SAME slot mechanism a scanned
+  readout duration uses, so hardware can stream a whole t_off table. Must be a SINGLE
+  two-trigger sequence, NOT a repeated single-frame sequence: `finite_frame_sequence`
+  reloads atoms between frames, so the two images would be different loadings with no
+  trap-off between — survival needs the SAME atoms imaged before/after one trap-off.
+- **`fit_temperature` is pure post-processing** on a finished `ScanResult` — it never
+  runs inside the acquire loop, keeping the live engine free of physics models.
+
+### Virtual trap-off loss model (data-source side ONLY)
+
+The virtual camera models release-recapture loss **at the data source**: it parses
+the trap-off duration out of the FIRED `PulseSequence`, computes a recapture survival
+probability with stdlib `erf`, and drops atoms accordingly. `reload()` is once-per-shot
+to avoid compounding loss across shots. This does NOT pollute the analysis layer (the
+analysis only ever sees camera frames and runs `detect`). End to end on virtual,
+survival decays ~0.97 → ~0.06 over 0..300 µs and `fit_temperature` recovers ~44–52 µK
+(injected 50 µK). This is "fake only the lowest data source" in action — the same
+discipline as the loading model.
+
+### task_console live-refresh performance floor (honest verdict)
+
+Source: `_redesign/03b_perf_conclusion.md`; memory note `task-console-live-perf-floor`.
+demo_console = 5 panels, offscreen: compute/tick ≈ 13 ms (small); **draw/tick ≈ 72–75 ms**
+and steady-draw (no new data) ≈ 72 ms ⇒ **the redraw cost is intrinsic, independent of
+whether limits change.** cProfile top: `draw_text` (glyph rasterization across ~10 axes
+@300 dpi) — the bottleneck, independent of margin/limit/blit.
+
+Two main speed-ups were **measured and rejected**:
+- **blit incremental redraw — 152 ms/tick (60% SLOWER than full draw).** Live autoscale
+  changes limits almost every tick so the fast-path rarely fires; and on a 300 dpi
+  buffer `copy_from_bbox`/`blit` themselves cost ~11 ms/panel. blit only wins when
+  limits are stable, which live autoscale breaks.
+- **Freezing title/xlabel positions — violates DPR neutrality.** draw −19% but sf1.5
+  flips 4845 px (freeze-vs-freeze self-diff = 0 confirms it's freeze-introduced):
+  `show()`'s first draw freezes the position at the wrong dpr; sf1.5 rounding flips.
+
+Compliant speed-up that landed = **tightening figure margins** (`PANEL_MARGINS_PX`
+(110,110,100,70) → (92,86,80,52)): smaller agg buffer makes the ~30–40% of draw cost
+that scales with area faster (`draw_text` unchanged). More aggressive options (hysteretic
+autoscale, staggered redraw, low-dpi panel mode) change visible behavior/visuals and are
+**left for the user to authorize** — not done unilaterally.

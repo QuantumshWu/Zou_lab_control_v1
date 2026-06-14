@@ -257,6 +257,31 @@ fit_result, popt = scan.data_figure.decay()
 scan.summary(), fit_result, popt
 
 <!-- cell:markdown -->
+## 一键测温：release-recapture（弹道重捕）
+
+测温与上面的读出时长扫描**是同一台通用扫描引擎**的另一个实例——只换扫描轴 / 每点采帧方式 / 约简器：两次成像之间把 trap 关掉 `t_off`，原子按热速度自由飞，再开 trap，看还有多少能被重捕。越热飞得越远，存活随 `t_off` 衰减越快——**survival-vs-`t_off` 曲线编码了温度**。曲线只定 `r_c/sqrt(T)`，所以**必须**从阱几何给出捕获半径 `capture_radius`（米）才能定出 T。
+
+下面是**实机一字不变**的配方（唯一虚拟之处仍是相机）。`build_release_recapture_pulse` 建一个 6 周期双触发序列，trap-off 周期的 duration 绑到 scan slot `s0`=`t_off`（与扫描读出时长同一种可扫量）；`exp.readout.temperature` 每点采两帧、按 `calibration.detect` 算逐点存活；`fit_temperature` 是纯后处理。
+
+> **一键 GUI 路径**：同一测量在 Task 控制台里走 `zf.show_task_console(hub=..., measurements=exp.readout.measurement_specs())`——Control 标签页选 Temperature、填范围/shots/capture_radius、点 Start，Monitor 出 survival 曲线、跑完自动显示 T。GUI 的 Start 与下面这行 API 调**同一个建器**，不会漂移。
+
+<!-- cell:code -->
+# 6 周期双触发序列：trap_off 周期的 duration 绑到 scan slot s0(= t_off)。
+rr_state = na.build_release_recapture_pulse(channels=list(exp.devices.sequencer.channels))
+rr_pulse = na.bind_pulse(exp.devices.sequencer, rr_state)
+
+# 扫 t_off(0..300us, 13 点),每点 shots=16 次装载求均存活。live=False 直接跑完。
+t_off_s = np.linspace(0, 300e-6, 13)
+temp_scan = exp.readout.temperature(t_off_s, pulse=rr_pulse, shots=16, live=False, display=True)
+print("t_off (us):", np.round(temp_scan.x * 1e6, 1).tolist())
+print("survival  :", np.round(temp_scan.y, 3).tolist())
+
+<!-- cell:code -->
+# 纯后处理拟合温度(capture_radius 必填,米;这里 ~6um 量级的子阱)。
+temp_fit = na.fit_temperature(temp_scan.x, temp_scan.y, capture_radius=6e-6)
+temp_fit.summary()   # {'temperature_uK': ~44..50, 'capture_radius_m': 6e-06, 'success': True}
+
+<!-- cell:markdown -->
 ## Save calibration, status, and Verilog
 
 `write_verilog` 导出的是一个轻量 edge-table 片段，便于离线检查 timing/channel/tick。真实硬件上传走的是 host 把程序打包成 BRAM image、经 JTAG-to-AXI 写进 `zlc_pulse_streamer_top` 的路径(见 FPGA manual)。
