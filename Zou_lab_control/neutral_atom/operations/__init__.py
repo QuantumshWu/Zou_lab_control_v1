@@ -11,6 +11,7 @@ from .fidelity import (
     reference_labels,
     train_test_split,
 )
+from .imageio import RunIndex, frame_files, index_run, load_frame, save_frame
 
 __all__ = [
     "calibrate_sitemap_from_images",
@@ -18,8 +19,13 @@ __all__ = [
     "characterize_readout",
     "detect_image",
     "FidelityReport",
+    "frame_files",
+    "index_run",
+    "load_frame",
     "ReferenceLabels",
     "reference_labels",
+    "RunIndex",
+    "save_frame",
     "SiteFidelity",
     "train_test_split",
     "TrainTestSplit",

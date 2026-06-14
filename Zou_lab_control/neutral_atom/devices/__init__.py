@@ -18,7 +18,7 @@ from .sequencer import (
     finite_frame_sequence,
     serve_runtime_sequencer,
 )
-from .virtual import DEFAULT_CHANNELS, VirtualCamera, VirtualSequencer, VirtualTrapArray, virtual_config
+from .virtual import DEFAULT_CHANNELS, VirtualCamera, VirtualSequencer, VirtualTrapArray, virtual_config, write_virtual_run
 
 _REGISTRY_EXPORTS = {
     "DEVICE_CLASSES",
@@ -116,6 +116,7 @@ __all__ = [
     "validate_pulse_streamer_program",
     "validate_device_contract",
     "virtual_config",
+    "write_virtual_run",
     "compile_runtime_program",
     "compile_pulse_table_runtime_program",
     "compile_pulse_table_scan_runtime_program",

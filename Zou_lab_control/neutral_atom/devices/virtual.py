@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Sequence
 import time
 
@@ -291,6 +292,59 @@ def virtual_loading_feed(
     )
 
 
+def write_virtual_run(
+    data_dir: str | Path,
+    prefix: str = "img",
+    *,
+    groups: int = 120,
+    shots_per_group: int = 4,
+    short_shot: int = 3,
+    ref_shots: Sequence[int] = (1, 2, 4),
+    short_exposure: float = 3e-3,
+    reference_exposure: float = 20e-3,
+    grid_shape: tuple[int, int] = (5, 7),
+    loading_probability: float = 0.55,
+    seed: int | None = None,
+    suffix: str = ".npy",
+    trap_array: "VirtualTrapArray | None" = None,
+) -> dict[str, object]:
+    """Render a virtual atom-loading RUN to ``data_dir`` as ``PREFIX<n>`` frames.
+
+    This is the FAKE DATA SOURCE: it stands in for the real experiment + camera
+    that would write these raw frames to disk.  Each of ``groups`` atom loadings
+    is imaged ``shots_per_group`` times (the SAME atoms, no reload between shots,
+    so the per-shot loss model makes the reference frames a meaningful ground
+    truth); the ``short_shot`` frame uses ``short_exposure`` (the readout being
+    characterized) and the ``ref_shots`` use ``reference_exposure`` (high SNR).
+    Frames are numbered contiguously ``prefix1..prefixN`` so
+    ``operations.index_run`` regroups them exactly.  The downstream analysis is
+    the SAME on these files as on a real run -- only who wrote them differs.
+    """
+
+    from ..operations.imageio import save_frame  # lazy: keep devices->operations off the import graph
+
+    trap = trap_array if trap_array is not None else VirtualTrapArray(
+        grid_shape=tuple(grid_shape), loading_probability=float(loading_probability), seed=seed
+    )
+    data_dir = Path(data_dir).expanduser()
+    refs = tuple(int(s) for s in ref_shots)
+    spg = positive_int(shots_per_group, "shots_per_group")
+    n_groups = positive_int(groups, "groups")
+    n = 0
+    for _ in range(n_groups):
+        trap.reload()  # one atom loading, imaged shots_per_group times below
+        for shot in range(1, spg + 1):
+            exposure = float(short_exposure) if shot == int(short_shot) else float(reference_exposure)
+            frame = trap.render_image(exposure=exposure)
+            n += 1
+            save_frame(data_dir / f"{prefix}{n}{suffix}", frame)
+    return {
+        "folder": str(data_dir), "prefix": str(prefix), "n_frames": n, "groups": n_groups,
+        "shots_per_group": spg, "short_shot": int(short_shot), "ref_shots": refs,
+        "grid_shape": tuple(trap.grid_shape),
+    }
+
+
 def virtual_config() -> dict[str, object]:
     return {
         "trap_array": {"type": "VirtualTrapArray"},
@@ -406,4 +460,5 @@ __all__ = [
     "virtual_config",
     "virtual_config_with_overrides",
     "virtual_loading_feed",
+    "write_virtual_run",
 ]

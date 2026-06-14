@@ -74,7 +74,8 @@ from .timing import (
     sequence_for_frame_count,
 )
 from .timing.verilog import VerilogBuild, VerilogFiles, generate_verilog, write_verilog_bundle
-from .devices import DEFAULT_CHANNELS, VirtualCamera, VirtualSequencer, VirtualTrapArray, virtual_config
+from .devices import DEFAULT_CHANNELS, VirtualCamera, VirtualSequencer, VirtualTrapArray, virtual_config, write_virtual_run
+from .operations import RunIndex, frame_files, index_run, load_frame, save_frame
 from .session import (
     CaptureResult,
     DetectionResult,
@@ -241,6 +242,12 @@ __all__ = [
     "sequence_for_frame_count",
     "sort_centers_grid",
     "virtual_config",
+    "write_virtual_run",
+    "index_run",
+    "load_frame",
+    "save_frame",
+    "frame_files",
+    "RunIndex",
     "validate_pulse_streamer_program",
     "validate_device_contract",
     "write_verilog_bundle",

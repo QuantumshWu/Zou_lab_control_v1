@@ -172,24 +172,32 @@ print("method:", psf_cal.method, "| psf weights:", psf_cal.psf_weights.shape)
 na.detect_image(exp.camera.capture(display=False).image, psf_cal, display=True).occupied.sum()
 
 <!-- cell:markdown -->
-## Per-site readout fidelity from data (Rb87 flow)
+## Per-site readout fidelity from data — Rb87 文件夹工作流(与真机完全一致)
 
-完整复刻 Rb87 用实验数据**逐站点定阈值**的流程（虚拟后端）。每个 group 在 SHORT 读出曝光下成像一次，再在高 SNR 的 reference 长曝光下成像几次（同一批原子）：
+这是 **Rb87 真机读出流程**,和 `references/rb87_readout_v16` 一样是**文件夹式**:实验把相机原始帧逐张存到**一个数据文件夹**,命名 `PREFIX<n>`;分析**指向那个文件夹**,把帧按 `shots_per_group` 一组(每次装载成像几张,同一批原子)索引,`short_shot` 是待表征的短读出帧、`ref_shots` 是高 SNR 参考帧:
 
-1. reference 帧用双高斯**严格共识**给出每个 `(group, site)` 的 ground-truth 亮/暗标签；
-2. 在随机 **train** 划分上为**每个站点单独**训练阈值；
-3. 在 **held-out test** 上诚实报告保真度；
-4. 再给一个全局单阈值对比 + drop-worst-site 消融。
+1. 平均参考帧得到全亮模板 → **从模板图像检测站点** + 拟合 PSF;
+2. reference 帧双高斯**严格共识**给出每个 `(group, site)` 的真值亮/暗标签;
+3. 随机 **train** 划分上**逐站点**训练阈值,**held-out test** 上诚实报告保真度;
+4. 全局单阈值对比 + drop-worst-site 消融;结果写到 `<data_dir>_results/`。
 
-`exp.readout.characterize(...)` 把训练出的逐站点阈值写回标定（`method=per_site_reference`）。下面用 PSF 提取（上一步已 `sitemap(method="psf")`）。
+**唯一虚拟之处:数据文件夹由 `na.write_virtual_run` 写假帧填充**(真机上这一格删掉——你的实验/相机已经把帧写进文件夹了)。下面**分析两行真机一字不改**,只把第一格的 `na.connect("virtual",...)` 换成 `na.connect("qcmos", <设备配置>)`。
 
 <!-- cell:code -->
-exp.readout.sitemap(method="psf", frames=8, display=False)     # PSF 提取
-report = exp.readout.characterize(
-    groups=150, reference_shots=3,
-    short_exposure=3e-3, reference_exposure=20e-3,             # short=待表征读出, reference=高 SNR 真值
-    train_fraction=0.9, seed=1,
+# 数据文件夹(真机:相机/DAQ 把 PREFIX<n> 原始帧写到这里)。改成你的实验路径即可。
+data_dir = "results/rb87_run01"
+# 【仅虚拟】把假原始帧写进该文件夹,模拟真机采集(真机:删除这一格)。
+# 每次装载成像 shots_per_group=4 张:short_shot=3 是短读出,ref_shots=(1,2,4) 是高 SNR 参考。
+na.write_virtual_run(
+    data_dir, prefix="img", groups=150, shots_per_group=4, short_shot=3, ref_shots=(1, 2, 4),
+    short_exposure=3e-3, reference_exposure=20e-3,
+    grid_shape=exp.devices.trap_array.grid_shape, seed=1,
 )
+
+<!-- cell:code -->
+# 【真机一字不变】从文件夹读图 → 检测站点+PSF(method="psf") → 逐站点定阈值+保真度。
+exp.readout.sitemap_from_dir(data_dir, prefix="img", method="psf")
+report = exp.readout.characterize_from_dir(data_dir, prefix="img", train_fraction=0.9, seed=1)
 report.summary()
 
 <!-- cell:markdown -->

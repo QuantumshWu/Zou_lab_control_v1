@@ -7248,15 +7248,30 @@ def test_site_histogram_grid_is_general_in_n():
         plt.close(g.fig)
 
 
-def test_readout_characterize_end_to_end_on_virtual_backend():
-    exp = na.connect("virtual", sitemap={"loading_probability": 0.55}, loss_rate=0.02, seed=9)
-    exp.readout.sitemap(method="psf", frames=6, display=False)
-    report = exp.readout.characterize(groups=80, reference_shots=3, short_exposure=5e-3,
-                                      reference_exposure=20e-3, seed=2)
-    assert report.n_sites == exp.devices.trap_array.n_sites
+def test_readout_characterize_from_dir_on_virtual_backend(tmp_path):
+    """The REAL Rb87 workflow on virtual data: the experiment (here the virtual
+    writer) saves raw frames to a FOLDER; the SAME analysis indexes that folder,
+    detects sites, and characterizes per-site fidelity. Switching to real hardware
+    changes only who wrote the frames (na.connect backend), not these lines."""
+    data_dir = tmp_path / "rb87_run01"
+    info = na.write_virtual_run(str(data_dir), prefix="img", groups=80, shots_per_group=4,
+                                short_shot=3, ref_shots=(1, 2, 4), short_exposure=5e-3,
+                                reference_exposure=20e-3, grid_shape=(5, 7),
+                                loading_probability=0.55, seed=9)
+    assert info["n_frames"] == 80 * 4                            # frames live on disk
+    assert len(list(data_dir.glob("img*.npy"))) == 320
+
+    exp = na.connect("virtual", sitemap={"grid_shape": (5, 7)})
+    exp.readout.sitemap_from_dir(str(data_dir), prefix="img", method="psf")   # sites DETECTED from folder
+    report = exp.readout.characterize_from_dir(str(data_dir), prefix="img", seed=2)
+    assert report.n_sites == 35
     assert report.aggregate_fidelity > 0.9
     cal = exp.readout.current
     assert cal.metadata.get("threshold_method") == "per_site_reference"
     assert np.all(np.isfinite(cal.thresholds))                  # data-trained thresholds stored back
+    # results written to a sibling results folder (mirrors the real {run}_results)
+    results = data_dir.parent / (data_dir.name + "_results")
+    assert (results / "characterize_summary.json").exists()
+    assert (results / "characterize_signals.npz").exists()
     values, occupied = report.per_site_arrays()
     assert len(values) == report.n_sites
