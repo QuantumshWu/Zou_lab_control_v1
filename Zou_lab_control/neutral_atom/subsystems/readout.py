@@ -9,7 +9,7 @@ import numpy as np
 
 from Zou_lab_control._viewer_registry import active_plotter
 
-from ..core.analysis import estimate_threshold_fidelity, otsu_threshold, positive_int, roi_counts
+from ..core.analysis import estimate_threshold_fidelity, otsu_threshold, positive_int
 from ..core.calibration import TrapCalibration
 from ..core.results import DetectionResult, DetectionTimeScanResult, SitemapResult, ThresholdResult
 from ..core.utils import site_index
@@ -179,9 +179,10 @@ class ReadoutSubsystem(ExperimentSubsystem):
             sequence=reference_sequence,
             sequencer=reference_sequencer,
         )
-        reference_counts = np.vstack(
-            [roi_counts(image, calibration.centers, radius=calibration.roi_radius, reducer=calibration.reducer) for image in reference_images]
-        )
+        # Extract through the calibration's own method (box or PSF), so a
+        # detection-time scan on a PSF calibration uses PSF signals -- the same
+        # quantity detect() compares.
+        reference_counts = np.vstack([calibration.signals(image) for image in reference_images])
         if site is None:
             reference_values = reference_counts.reshape(-1)
         else:
@@ -213,9 +214,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
                 sequence = frame_sequence(shots, time_ns=x_ns)
                 sequencer = getattr(pulse, "sequencer", getattr(s.devices, "sequencer", None))
             images = s.devices.camera.acquire(shots, sequence=sequence, sequencer=sequencer)
-            counts = np.vstack(
-                [roi_counts(image, calibration.centers, radius=calibration.roi_radius, reducer=calibration.reducer) for image in images]
-            )
+            counts = np.vstack([calibration.signals(image) for image in images])
             if site is None:
                 values = counts.reshape(-1)
             else:

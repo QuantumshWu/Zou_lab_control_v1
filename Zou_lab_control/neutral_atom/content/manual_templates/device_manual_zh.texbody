@@ -1030,7 +1030,7 @@ bin 太少会让阈值"量化"得太粗（分辨不出谷底）；bin 太多则�
 
 \section{进阶读出：PSF 加权提取 + 双高斯阈值（Rb87）}
 
-方框计数 + Otsu 是\tfocus{默认}方法，简单稳健。但在低光子数（成像时间短）或位点密集、点扩散函数（PSF）有重叠时，方框把信号像素和背景像素\tfocus{等权}相加，信噪比会被边缘背景拖低。Rb87 qCMOS 读出用两点改进，二者都接在同一套 \pyapi{TrapCalibration.signals/detect} 契约后面，方框法仍是默认，可逐项开启。
+方框计数 + Otsu 是\tfocus{默认}方法，简单稳健。但在低光子数（成像时间短）或弱信号下，方框把信号像素和背景像素\tfocus{等权}相加，信噪比会被边缘背景拖低（位点密集、PSF 边缘交叠时尤甚）。Rb87 qCMOS 读出用两点改进，二者都接在同一套 \pyapi{TrapCalibration.signals/detect} 契约后面，方框法仍是默认，可逐项开启；\pyapi{detection_time} 时间扫描也会跟着用标定自己的提取方法。
 
 \subsection{PSF 加权提取：method="psf"}
 
@@ -1038,7 +1038,11 @@ bin 太少会让阈值"量化"得太粗（分辨不出谷底）；bin 太多则�
 sm = exp.readout.sitemap(method="psf", psf_half_width=3, frames=20)
 \end{codeblock}
 
-\pyapi{sitemap(method="psf")} 在找出中心之后，额外从\tfocus{全亮模板}（所有位点都有原子时的多帧平均）里给每个位点拟合一张归一化的 PSF 权重图（\pyapi{(2*psf_half_width+1)} 见方，默认 7×7）。逐发提取时，信号 = 该位点 box 内\tfocus{背景扣除后的像素}与这张权重图的\tfocus{点积}（匹配滤波）。匹配滤波是"已知形状、加性噪声"下信噪比最优的线性提取：靠近原子的像素权重大，远离的接近 0，背景被自然压制。标定对象因此多带 \pyapi{psf_weights (N,h,w)} 与 \pyapi{psf_boxes (N,4)} 两个字段，\pyapi{save/load}（JSON 与 npz）都会原样往返。
+\pyapi{sitemap(method="psf")} 在找出中心之后，额外从\tfocus{全亮模板}（所有位点都有原子时的多帧平均）里给每个位点拟合一张归一化的 PSF 权重图（\pyapi{(2*psf_half_width+1)} 见方，默认 7×7）。逐发提取时，信号 = 该位点 box 内\tfocus{背景扣除后的像素}与这张权重图的\tfocus{点积}（匹配滤波）。匹配滤波是"已知形状、加性噪声"下信噪比最优的线性提取：靠近原子的像素权重大，远离的接近 0，背景被自然压制。逐发提取默认用\tfocus{环形本底}（box 外圈像素的中值）做局部背景扣除，对慢漂移背景自适应。标定对象因此多带 \pyapi{psf_weights (N,h,w)} 与 \pyapi{psf_boxes (N,4)} 两个字段，\pyapi{save/load}（JSON 与 npz）都会原样往返。无 session 时直接用 standalone 接口：\pyapi{na.calibrate_sitemap_from_images(images, grid_shape=..., method="psf")}。
+
+\begin{notebox}[贴边站点会报错]
+PSF 读出要求每个站点都能取到完整的 \pyapi{(2*psf_half_width+1)} 见方 box；若某站点离图像边缘太近、box 被裁，\pyapi{fit_site_psfs} 会直接 \pyapi{raise}（而不是悄悄用一个小 box）。必要时减小 \pyapi{psf_half_width}，或确保成像视场对每个阱位都留足边距。
+\end{notebox}
 
 \subsection{双高斯阈值：method="bimodal"}
 

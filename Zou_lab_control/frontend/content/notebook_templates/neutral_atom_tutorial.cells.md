@@ -139,7 +139,7 @@ standalone_shot.occupied.shape
 <!-- cell:markdown -->
 ## Advanced readout: PSF + bimodal (Rb87)
 
-方框计数 + Otsu 是默认读出。光子数少或位点密集、PSF 重叠时，可换成 Rb87 的匹配滤波读出，二者都接在同一套 `TrapCalibration.detect` 契约后面，box/otsu 仍是默认：
+方框计数 + Otsu 是默认读出。光子数少或弱信号下（位点密集、PSF 边缘交叠时尤甚），可换成 Rb87 的匹配滤波读出，二者都接在同一套 `TrapCalibration.detect` 契约后面，box/otsu 仍是默认：
 
 - `method="psf"`：从全亮模板给每个位点拟合归一化 PSF 权重，逐发提取改成 PSF 加权点积（匹配滤波，已知形状 + 加性噪声下信噪比最优）。标定多带 `psf_weights`，`save`/`load` 原样往返。
 - `method="bimodal"`：拟合暗/亮双高斯峰核，阈值放在两高斯总错判率最小处，并给出模型保真度。
