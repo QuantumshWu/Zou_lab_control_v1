@@ -298,6 +298,68 @@ def virtual_config() -> dict[str, object]:
     }
 
 
+def virtual_config_with_overrides(
+    *,
+    trap_array: dict[str, object] | None = None,
+    sitemap: dict[str, object] | None = None,
+    camera: dict[str, object] | None = None,
+    sequencer: dict[str, object] | None = None,
+    params: dict[str, object] | None = None,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Translate ``connect("virtual", ...)`` convenience kwargs into a device
+    config + inferred session defaults.
+
+    The virtual backend OWNS this mapping (its own field names, aliases and the
+    ``loss_rate``/``sitemap`` conveniences) so the orchestration layer never has
+    to know about ``VirtualTrapArray`` internals -- it just asks the registry to
+    resolve the named backend.  Returns ``(config_dict, defaults_dict)``.
+    """
+
+    cfg = virtual_config()
+    trap_params = dict(trap_array or {})
+    sitemap_params = dict(sitemap or {})
+    camera_params = dict(camera or {})
+    sequencer_params = dict(sequencer or {})
+    defaults: dict[str, object] = {}
+    trap_fields = set(VirtualTrapArray.__dataclass_fields__)
+    aliases = {
+        "bright_count_rate": "atom_rate",
+        "atom_bright_rate": "atom_rate",
+        "background_count_rate": "background_rate",
+        "load_probability": "loading_probability",
+    }
+    for key, value in sitemap_params.items():
+        target = aliases.get(key, key)
+        if target in trap_fields:
+            trap_params[target] = value
+        elif key in {"roi_radius", "sitemap_exposure", "detection_times"}:
+            defaults[key] = value
+        else:
+            raise TypeError(f"unknown sitemap configuration parameter {key!r}.")
+    for key, value in dict(params or {}).items():
+        if key == "loss_rate":
+            loss_rate = float(value)
+            if not np.isfinite(loss_rate) or loss_rate <= 0:
+                raise ValueError("loss_rate must be positive and finite.")
+            trap_params["detection_lifetime"] = 1.0 / loss_rate
+        elif key in {"sitemap_exposure", "detection_times", "roi_radius"}:
+            defaults[key] = value
+        else:
+            target = aliases.get(key, key)
+            if target in trap_fields:
+                trap_params[target] = value
+            elif key in {"exposure", "timeout"}:
+                camera_params[key] = value
+            elif key in {"clock_hz", "sleep_scale", "channels"}:
+                sequencer_params[key] = value
+            else:
+                raise TypeError(f"unknown virtual configuration parameter {key!r}.")
+    cfg["trap_array"].setdefault("params", {}).update(trap_params)
+    cfg["camera"].setdefault("params", {}).update(camera_params)
+    cfg["sequencer"].setdefault("params", {}).update(sequencer_params)
+    return cfg, defaults
+
+
 def sequence_requests_load(sequence: PulseSequence | None) -> bool:
     if sequence is None:
         return False
@@ -350,5 +412,6 @@ __all__ = [
     "VirtualSequencer",
     "VirtualTrapArray",
     "virtual_config",
+    "virtual_config_with_overrides",
     "virtual_loading_feed",
 ]

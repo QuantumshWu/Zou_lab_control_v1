@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
-from .virtual import virtual_config
+from .virtual import virtual_config, virtual_config_with_overrides
 from .base import CameraDevice, SequencerDevice, TrapArrayDevice, validate_device_contract
 
 
@@ -165,6 +165,43 @@ def load_devices(
     return device_set
 
 
+def resolve_connect_config(
+    config: str | Path | Mapping[str, Any],
+    *,
+    trap_array: Mapping[str, Any] | None = None,
+    sitemap: Mapping[str, Any] | None = None,
+    camera: Mapping[str, Any] | None = None,
+    sequencer: Mapping[str, Any] | None = None,
+    params: Mapping[str, Any] | None = None,
+) -> tuple[Any, dict[str, dict[str, Any]] | None, dict[str, Any]]:
+    """Resolve a ``connect()`` request into ``(device_config, overrides, defaults)``.
+
+    Backend-specific config shortcuts live with the BACKEND (the device layer),
+    not the orchestration facade: the virtual backend owns its ``sitemap`` /
+    ``loss_rate`` / alias translation.  A real config (named JSON / path / dict)
+    takes only per-device override mappings and rejects the virtual-only
+    shortcuts.  ``session.connect`` calls this so it never imports a concrete
+    backend or reads a backend's internal fields (keeps virtual == real)."""
+
+    params = dict(params or {})
+    if isinstance(config, str) and config.lower() == "virtual":
+        cfg, defaults = virtual_config_with_overrides(
+            trap_array=dict(trap_array) if trap_array else None,
+            sitemap=dict(sitemap) if sitemap else None,
+            camera=dict(camera) if camera else None,
+            sequencer=dict(sequencer) if sequencer else None,
+            params=params,
+        )
+        return cfg, None, defaults
+    if sitemap or params:
+        raise ValueError("sitemap and virtual shortcut parameters are only supported with config='virtual'.")
+    overrides: dict[str, dict[str, Any]] = {}
+    for name, device_params in (("trap_array", trap_array), ("camera", camera), ("sequencer", sequencer)):
+        if device_params:
+            overrides[name] = dict(device_params)
+    return config, (overrides or None), {}
+
+
 def read_config(config: str | Path | Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(config, Mapping):
         return deepcopy(dict(config))
@@ -256,4 +293,5 @@ __all__ = [
     "read_config",
     "register_device_class",
     "resolve_class",
+    "resolve_connect_config",
 ]

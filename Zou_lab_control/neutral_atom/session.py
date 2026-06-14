@@ -26,8 +26,7 @@ from .core.results import (
     ThresholdResult,
 )
 from .core.utils import html_summary, json_ready
-from .devices import CameraDevice, DeviceSet, SequencerDevice, load_devices
-from .devices.virtual import VirtualTrapArray, virtual_config
+from .devices import CameraDevice, DeviceSet, SequencerDevice, load_devices, resolve_connect_config
 from .operations import calibrate_sitemap_from_images, calibrate_threshold_from_images, detect_image
 from .timing import PulseSequence, imaging_sequence
 from .timing.verilog import generate_verilog, write_verilog_bundle
@@ -219,85 +218,23 @@ def connect(
     """Load devices and return a notebook-facing neutral-atom session."""
 
     default_values = dict(defaults or {})
-    device_config = config
-    device_overrides: dict[str, dict[str, Any]] = {}
-    if _is_virtual_config(config):
-        device_config, inferred_defaults = _virtual_config_with_overrides(
-            trap_array=trap_array,
-            sitemap=sitemap,
-            camera=camera,
-            sequencer=sequencer,
-            params=virtual_params,
-        )
-        default_values.update(inferred_defaults)
-    else:
-        if sitemap or virtual_params:
-            raise ValueError("sitemap and virtual shortcut parameters are only supported with config='virtual'.")
-        for device_name, params in (("trap_array", trap_array), ("camera", camera), ("sequencer", sequencer)):
-            if params:
-                device_overrides[device_name] = dict(params)
+    # The device layer (registry) owns backend dispatch + any backend-specific
+    # config shortcuts; the session never imports a concrete backend or reads its
+    # internal fields, so virtual <-> real is a one-line `config` change.
+    device_config, device_overrides, inferred_defaults = resolve_connect_config(
+        config,
+        trap_array=trap_array,
+        sitemap=sitemap,
+        camera=camera,
+        sequencer=sequencer,
+        params=virtual_params,
+    )
+    default_values.update(inferred_defaults)
     return NeutralAtomSession(
-        load_devices(device_config, overrides=device_overrides or None, open_devices=open_devices),
+        load_devices(device_config, overrides=device_overrides, open_devices=open_devices),
         name=name,
         defaults=default_values,
     )
-
-
-def _is_virtual_config(config) -> bool:
-    return isinstance(config, str) and config.lower() == "virtual"
-
-
-def _virtual_config_with_overrides(
-    *,
-    trap_array: dict[str, Any] | None = None,
-    sitemap: dict[str, Any] | None = None,
-    camera: dict[str, Any] | None = None,
-    sequencer: dict[str, Any] | None = None,
-    params: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    cfg = virtual_config()
-    trap_params = dict(trap_array or {})
-    sitemap_params = dict(sitemap or {})
-    camera_params = dict(camera or {})
-    sequencer_params = dict(sequencer or {})
-    defaults: dict[str, Any] = {}
-    trap_fields = set(VirtualTrapArray.__dataclass_fields__)
-    aliases = {
-        "bright_count_rate": "atom_rate",
-        "atom_bright_rate": "atom_rate",
-        "background_count_rate": "background_rate",
-        "load_probability": "loading_probability",
-    }
-    for key, value in sitemap_params.items():
-        target = aliases.get(key, key)
-        if target in trap_fields:
-            trap_params[target] = value
-        elif key in {"roi_radius", "sitemap_exposure", "detection_times"}:
-            defaults[key] = value
-        else:
-            raise TypeError(f"unknown sitemap configuration parameter {key!r}.")
-    for key, value in dict(params or {}).items():
-        if key == "loss_rate":
-            loss_rate = float(value)
-            if not np.isfinite(loss_rate) or loss_rate <= 0:
-                raise ValueError("loss_rate must be positive and finite.")
-            trap_params["detection_lifetime"] = 1.0 / loss_rate
-        elif key in {"sitemap_exposure", "detection_times", "roi_radius"}:
-            defaults[key] = value
-        else:
-            target = aliases.get(key, key)
-            if target in trap_fields:
-                trap_params[target] = value
-            elif key in {"exposure", "timeout"}:
-                camera_params[key] = value
-            elif key in {"clock_hz", "sleep_scale", "channels"}:
-                sequencer_params[key] = value
-            else:
-                raise TypeError(f"unknown virtual configuration parameter {key!r}.")
-    cfg["trap_array"].setdefault("params", {}).update(trap_params)
-    cfg["camera"].setdefault("params", {}).update(camera_params)
-    cfg["sequencer"].setdefault("params", {}).update(sequencer_params)
-    return cfg, defaults
 
 
 __all__ = [

@@ -31,6 +31,7 @@ _REGISTRY_EXPORTS = {
     "read_config",
     "register_device_class",
     "resolve_class",
+    "resolve_connect_config",
 }
 
 _PULSE_STREAMER_EXPORTS = {

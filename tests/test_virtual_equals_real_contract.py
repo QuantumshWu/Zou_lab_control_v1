@@ -31,6 +31,9 @@ import Zou_lab_control.neutral_atom as na
 
 _NA = Path(na.__file__).resolve().parent
 _ANALYSIS_DIRS = [_NA / "core", _NA / "operations", _NA / "subsystems"]
+# session.py is the orchestration facade: it picks a backend by NAME via the
+# registry but must not import a concrete backend or read its internal fields.
+_ANALYSIS_FILES = [_NA / "session.py"]
 
 # Concrete camera backends the analysis must NOT import (frames arrive via the
 # CameraDevice contract). devices/base.py (the abstract contract) is allowed;
@@ -44,6 +47,9 @@ _GROUND_TRUTH = re.compile(r"\.(?:occupancy|render_image|_site_centers)\b|\bforc
 def _analysis_files():
     for d in _ANALYSIS_DIRS:
         yield from sorted(d.glob("*.py"))
+    for f in _ANALYSIS_FILES:
+        if f.exists():
+            yield f
 
 
 def test_analysis_layer_never_imports_a_concrete_camera_backend():
