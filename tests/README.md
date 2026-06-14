@@ -1,6 +1,15 @@
 # Test Strategy
 
-Run the smallest check that proves the changed boundary still works.  Full `pytest -q` is reserved for broad handoff, release-like sweeps, or changes that touch multiple subsystems at once.
+Run the smallest check that proves the changed boundary still works.  Full `pytest -q` is reserved for broad handoff, release-like sweeps, or changes that touch multiple subsystems at once.  A small change you are confident in does not need a full-suite run.
+
+## Principles (see the repo-root `AGENTS.md` for the full rules)
+
+- **Contract tests, Python side only.** There is no iverilog/cocotb in the repo: RTL behaviour is checked by a faithful Python mirror plus `xsim` (the real IP netlist — the strongest hardware evidence), and verilog port widths are locked by a Python contract test (`test_..._vio_widths_match_python_generator`).
+- **Visual changes must be verified as the user sees them.**  Use
+  `Zou_lab_control.frontend.devtools.capture_user_view(target, out_dir, scales=(1.0, 1.25, 1.5))`
+  — three `QT_SCALE_FACTOR` whole-window screenshots, inspected as 1:1 pixel crops; the `parity` target compares the two GUIs' control sizes on one screen.  A DPR=1 offscreen pass is **not** acceptance.  Popups / sub-widgets: `widget.grab()`.  Settle ≥ 800 ms before grabbing.
+- **Performance optimizations must be logic/appearance-neutral.**  Only make the same output faster (analytic Jacobian, skip-if-unchanged guards, cached invariants); never change cadence/appearance.  Prove equivalence (e.g. fit `popt` agrees numerically).
+- **After delete/refactor:** `git grep` of the dead identifier == 0; `python -m compileall` clean; no stray TODO/FIXME.
 
 ## Targeted Matrix
 
@@ -31,7 +40,8 @@ python -m json.tool tutorials\neutral_atom_hardware_quickstart.ipynb > $null
 python -m json.tool tutorials\neutral_atom_tutorial.ipynb > $null
 ```
 
-For Python syntax after focused edits:
+For Python syntax after focused edits (`rg`/ripgrep on PATH; or substitute
+`Get-ChildItem -Recurse -Filter *.py`):
 
 ```powershell
 python -m py_compile (rg --files -g "*.py" Zou_lab_control tests)
@@ -41,6 +51,9 @@ python -m py_compile (rg --files -g "*.py" Zou_lab_control tests)
 
 The normal unit tests do not build or program hardware.  Use Vivado commands
 only when HDL/Tcl/XDC/batch behavior changed and a Vivado machine is available.
+These are run by the user on the FPGA/Vivado computer — an agent never launches
+a Vivado build/synth/program itself (see the repo-root `AGENTS.md` §1); `xsim` /
+`xvlog` / `xelatex` are fine.
 
 ```powershell
 cmd /c fpga\build_and_program.bat --help
