@@ -10,7 +10,7 @@ The authoritative statement of this contract is the module docstring of
 `frontend/__init__.py`. This file adds the rationale and the failure history so
 the rules don't get re-broken.
 
-## The six rules
+## The rules
 
 1. **Geometry is owned, never passed in.** No public callable accepts `data_px`,
    `margins_px`, `spec` or `dpi`. Sizes come only from `FigureSpec` defaults,
@@ -38,6 +38,21 @@ the rules don't get re-broken.
    bins, thresholds, relim_mode, cmap-from-a-list, channels, roi_radius) is
    allowed on the public surface; **ART / GEOMETRY / TYPOGRAPHY** (margins, dpi,
    colours, sizes, shadow, fonts, bad_color) lives on **internal classes only**.
+7. **Every plot IS a `BaseLivePlot` — the reusable layer is not optional.** The
+   reason this package exists is that every plot reuses ONE layer: the selectors
+   (`selectors.py`: zoom/pan, area, cross, draggable lines) and the `DataFigure`
+   fitting/post-processing stack. A plot type gets that layer **only** by
+   subclassing `live.BaseLivePlot` and rendering through its `show()` lifecycle
+   (`_create_axes` → `init_core` → `_attach_interactions` → `to_data_figure`).
+   **Never hand-roll a raw-matplotlib figure for a plot** — it silently loses all
+   of it. Multi-axes plots override `_create_axes` to build their layout, set
+   `self.axes`, and attach per-cell tools; `DataFigure(ax=...)` binds the stack
+   to one cell so even a grid cell fits like a standalone plot. Design tokens
+   (sizes/colours/title) come from `style.py` (PALETTE, `apply_title`,
+   `*_fontsize`), never re-picked per plot. **Enforced** by
+   `tests/test_frontend_plot_contract.py`: a plot-shaped class that bypasses
+   `BaseLivePlot`, or an entry point whose figure has no selectors / no
+   `DataFigure`, fails the build.
 
 ## The patterns that already seal correctly (copy these)
 
@@ -62,6 +77,13 @@ the rules don't get re-broken.
   wrote intermediates in place → `render_notes_pdf` now assembles the tex in
   memory and compiles via `render_tex_pdf` in a temp dir (only the `.pdf` lands
   in `docs/`); `docs/**/*.tex` and `*.sty` are gitignored.
+- **The multi-site histogram grid shipped with no selectors and no `data_figure`**
+  (2026-06): it was written as a bare matplotlib figure (`class SiteHistogramGrid:`)
+  instead of a `BaseLivePlot`, so the entire reusable layer — the whole point of
+  the frontend — was silently lost. The principle existed only as prose, so
+  nothing failed. → rule 7, now mechanically enforced by
+  `tests/test_frontend_plot_contract.py`. **Lesson: a design principle that CAN be
+  a test MUST be one — prose alone gets re-broken.**
 
 ## Layout: no overlap, no cutoff, aligned (composite / multi-panel figures)
 

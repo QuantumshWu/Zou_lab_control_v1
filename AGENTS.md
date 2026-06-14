@@ -31,6 +31,7 @@
   - 跨模块调用走**文档化的接口**,不伸手进别的模块内部:Task 控制台三层只经 `SignalHub` 耦合(采集/feed/GUI 互不直接引用);frontend 对外只暴露密封接口(见下条)。
   - 新代码沿用这条:加功能先想"它通过哪个接口接入",而不是直接 import 别人的内部实现。
 - **单一真相源**:同一事实只有一个权威定义处。例:板级/容量配置只在 `fpga/board_config/streamer_config.json`;前端排版只有一套 300dpi 体系;memory 对原则只放指针,权威定义在仓库 AGENTS。
+- **能机械强制的设计准则,必须写成测试,不能只留在文档里**(架构契约测试 / fitness function)。只写在 `.md` 里的准则会被(包括我自己,尤其长会话里局部模式匹配时)悄悄违背且无人报错——这正是整理这些 `.md` 却仍被违背的根因。所以:每立一条"所有 X 都必须 Y"的结构性准则(例:**所有 plot 都必须继承 `BaseLivePlot`** 才能复用 selectors/data_figure),就同时写一个会在违背时**失败**的测试(例:`tests/test_frontend_plot_contract.py`),并在准则旁注明强制它的测试。文档讲"为什么",测试保证"不退化"。
 - **借鉴参考实现:取原则,不照搬具体设计**。`references/` 里的实现(confocal GUI、rb87 readout 等)是灵感来源,要遵守的是上面这些**设计原则**,不是它们的具体形态/代码结构;有更干净的思路就用自己的,别为"照着参考写"而牺牲解耦或引入残留。
 - **前端密封 API**:几何/dpi/字号/配色/阴影/缩放**由 frontend 拥有**,外部只传数据。完整六规则见 `frontend/AGENTS.md`——加任何前端公共参数前先读它,并把参数分类为 DATA(允许)还是 ART/几何(禁止)。
 - **改寄存器映射必带版本握手**:改 host↔RTL 的寄存器布局必须 bump 两边的 LAYOUT_ID 并在 prepare 时校验,不匹配明确报"重建+重启"(否则新主机配旧 bitstream 会踩进死字)。
@@ -74,6 +75,7 @@
 8. **真机错而模型全绿**:别改正确的代码,查 pack/上传残留、跨程序寄存器状态、固件/主机版本错配;在真实文件上诊断。(见 §1)
 9. **编辑器/联动改 config 别走会 teardown 的路径**:如 task console 编辑器改 relim 不能调 `card._set_param`(它 `_reset_plot` 把 plotter 置 None,随后读到 None 崩)→ 直接写 `config.params` + 重建本地视图。
 10. **markdown 里别用 LaTeX 排版宏**:`.md`(AGENTS/MEMORY/ROADMAP/README)用 markdown 语法(`**粗体**`、`` `代码` ``);`\tfocus{}`/`\pyapi{}`/`\filepath{}` 只属于 `.texbody`。写 .md 误用 `\tfocus{}` 会原样显示。(整理本文件时刚犯,30 处;用 chr(92) 脚本批量改回——同坑 #6。)
+11. **新增 plot 写成裸 matplotlib 图,绕过 `BaseLivePlot`**:`site_histogram_grid` 曾写成 `class SiteHistogramGrid:`(裸图),于是 selectors(缩放/拖阈值线)和 `data_figure`(拟合栈)**全部用不上**——而复用这层正是 frontend 存在的意义。根因不只是写错,而是该准则只在文档里、没有测试守。→ 新 plot **必须**继承 `BaseLivePlot` 走其 `show()` 生命周期(多轴图 override `_create_axes` + 每格挂工具,`DataFigure(ax=...)` 绑定单格);现已由 `tests/test_frontend_plot_contract.py` 强制(裸 plot 类直接挂测)。配套总纲见 §2「能机械强制的准则必须写成测试」。
 
 ### 如何持续记录(防上下文压缩遗忘)
 - 每当我造成一个**自造的或重复的 bug**,立刻在上面加一条(一句话:现象 → 根因 → 规则)。这是标准收尾动作,和"跑测试/截图验收"同级。

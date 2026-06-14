@@ -41,7 +41,10 @@ class DataFigure:
     """Data and post-processing handle for a front-end figure.
 
     A DataFigure can be created from a ``Live1D``/``Live2DDis``/``HistogramFigure``
-    object, or from explicit ``fig``, ``data_x`` and ``data_y`` handles.
+    object, or from explicit ``fig``, ``data_x`` and ``data_y`` handles.  Pass an
+    explicit ``ax`` to bind the fitting/post-processing to ONE axes of a
+    multi-axes figure (e.g. a single cell of a site-histogram grid), so the same
+    reusable stack works per cell instead of only on ``fig.axes[0]``.
     """
 
     def __init__(
@@ -49,6 +52,7 @@ class DataFigure:
         live_plot=None,
         *,
         fig: plt.Figure | None = None,
+        ax: plt.Axes | None = None,
         data_x=None,
         data_y=None,
         labels: Sequence[str] | None = None,
@@ -72,6 +76,10 @@ class DataFigure:
             raise ValueError("DataFigure needs either live_plot or fig/data_x/data_y.")
 
         self.fig = fig
+        # The single axes this DataFigure draws on / reads limits from.  Defaults
+        # to the figure's first axes (single-axes plots); an explicit ``ax`` binds
+        # it to one cell of a multi-axes figure so the stack is reusable per cell.
+        self._ax = ax if ax is not None else self.fig.axes[0]
         self.data_x = np.asarray(data_x, dtype=float)
         if self.data_x.ndim == 1:
             self.data_x = self.data_x[:, None]
@@ -89,7 +97,7 @@ class DataFigure:
             self.zoom = getattr(live_plot, "zoom", self.zoom)
             self.cross = getattr(live_plot, "cross", self.cross)
 
-        first_ax = self.fig.axes[0]
+        first_ax = self._ax
         self.plot_type = "2D" if first_ax.images else "1D"
         self.ylabel_original = self.labels[1] if len(self.labels) > 1 else first_ax.get_ylabel()
         self.unit = unit or self._infer_unit(first_ax.get_xlabel())
@@ -130,11 +138,11 @@ class DataFigure:
         self._update_transform_back()
 
     def xlim(self, x_min: float, x_max: float) -> None:
-        self.fig.axes[0].set_xlim(x_min, x_max)
+        self._ax.set_xlim(x_min, x_max)
         self.fig.canvas.draw_idle()
 
     def ylim(self, y_min: float, y_max: float) -> None:
-        self.fig.axes[0].set_ylim(y_min, y_max)
+        self._ax.set_ylim(y_min, y_max)
         self.fig.canvas.draw_idle()
 
     def save(
@@ -199,7 +207,7 @@ class DataFigure:
             y = self.data_y[valid_index, 0]
             area = getattr(self.area, "range", [None, None, None, None])
             if area[0] is None:
-                xlim = self.fig.axes[0].get_xlim()
+                xlim = self._ax.get_xlim()
                 xl, xh = sorted(xlim)
             else:
                 xl, xh = sorted(area[:2])
@@ -213,8 +221,8 @@ class DataFigure:
         z_all = self.data_y[valid_index, 0]
         area = getattr(self.area, "range", [None, None, None, None])
         if area[0] is None:
-            xl, xh = sorted(self.fig.axes[0].get_xlim())
-            yl, yh = sorted(self.fig.axes[0].get_ylim())
+            xl, xh = sorted(self._ax.get_xlim())
+            yl, yh = sorted(self._ax.get_ylim())
         else:
             xl, xh, yl, yh = area
             xl, xh = sorted([xl, xh])
@@ -277,11 +285,11 @@ class DataFigure:
 
         if is_display:
             if self.text is None:
-                self.text = self.fig.axes[0].text(
+                self.text = self._ax.text(
                     0.5,
                     0.5,
                     result,
-                    transform=self.fig.axes[0].transAxes,
+                    transform=self._ax.transAxes,
                     color="blue",
                     ha="center",
                     va="center",
@@ -289,12 +297,12 @@ class DataFigure:
                 )
             else:
                 self.text.set_text(result)
-            self._place_text(self.fig.axes[0], self.text)
+            self._place_text(self._ax, self.text)
         elif self.text is not None:
             self.text.remove()
             self.text = None
 
-        lines = getattr(self.live_plot, "lines", None) if self.live_plot is not None else self.fig.axes[0].lines
+        lines = getattr(self.live_plot, "lines", None) if self.live_plot is not None else self._ax.lines
         for line in lines:
             if hasattr(line, "set_alpha"):
                 line.set_alpha(0.5)
@@ -340,7 +348,7 @@ class DataFigure:
 
         self.popt = popt
         self._display_popt(popt, self.popt_str, is_display)
-        ax = self.fig.axes[0]
+        ax = self._ax
         if self.plot_type == "1D":
             yfit = self._fit_func(self.data_x[:, 0], *popt)
             if self.fit is None:
@@ -568,7 +576,7 @@ class DataFigure:
                     pass
             self.fit = None
         self._scatter_to_line()
-        lines = getattr(self.live_plot, "lines", None) if self.live_plot is not None else self.fig.axes[0].lines
+        lines = getattr(self.live_plot, "lines", None) if self.live_plot is not None else self._ax.lines
         for line in lines:
             if hasattr(line, "set_alpha"):
                 line.set_alpha(1)
@@ -577,8 +585,8 @@ class DataFigure:
     def _line_to_scatter(self) -> None:
         if self.plot_type != "1D" or self._scatter_list:
             return
-        ax = self.fig.axes[0]
-        line = self.fig.axes[0].lines[0] if self.fig.axes[0].lines else None
+        ax = self._ax
+        line = self._ax.lines[0] if self._ax.lines else None
         if line is None:
             return
         x = np.asarray(line.get_xdata())
@@ -594,8 +602,8 @@ class DataFigure:
             except Exception:
                 pass
         self._scatter_list = []
-        if self.fig.axes and self.fig.axes[0].lines:
-            self.fig.axes[0].lines[0].set_visible(True)
+        if self.fig.axes and self._ax.lines:
+            self._ax.lines[0].set_visible(True)
 
     def _update_transform_back(self) -> None:
         transforms: list[Callable[[Any], Any]] = []
@@ -620,7 +628,7 @@ class DataFigure:
         self.transform_back = _composed if transforms else _identity
 
     def _update_unit(self, transform: Callable[[Any], Any]) -> None:
-        ax = self.fig.axes[0]
+        ax = self._ax
         for line in ax.lines:
             data_x = np.asarray(line.get_xdata())
             if data_x.size == 2 and np.array_equal(data_x, np.array([0, 1])):
@@ -659,7 +667,7 @@ class DataFigure:
         if self.plot_type == "2D" or self.conversion_map is None:
             return
         new_unit, conversion_func = self.conversion_map[self.unit]
-        ax = self.fig.axes[0]
+        ax = self._ax
         old_xlabel = ax.get_xlabel()
         if re.search(r"\((.+)\)$", old_xlabel):
             ax.set_xlabel(re.sub(r"\((.+)\)$", f"({new_unit})", old_xlabel))
@@ -682,7 +690,7 @@ class DataFigure:
         bad_color = getattr(self.live_plot, "bad_color", "white")
         new_cmap.set_bad(bad_color)
 
-        ax0 = self.fig.axes[0]
+        ax0 = self._ax
         if not ax0.images:
             return
         mappable = ax0.images[0]

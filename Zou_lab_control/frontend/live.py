@@ -14,7 +14,7 @@ import numpy as np
 from scipy.optimize import curve_fit
 
 from .canvas import FigureSpec, configure_canvas, create_axes_fixed, create_axes_grid, design_dpi, display_figure, grid_shape_for, new_figure, split_axes_horizontally
-from .selectors import DragHLine, DragVLine, InteractionBundle, PlotState, attach_interaction
+from .selectors import DragHLine, DragVLine, InteractionBundle, PlotState, ZoomPan, attach_interaction
 from .style import (
     PALETTE,
     apply_style,
@@ -232,8 +232,9 @@ class BaseLivePlot:
         else:
             configure_canvas(self.fig)
             self.fig.clear()
-        self.ax = create_axes_fixed(self.fig, self.spec.data_px, self.spec.margins_px)
-        self.axes = self.ax
+        self.ax = self._create_axes()
+        if self.axes is None:
+            self.axes = self.ax
         if self.smart_ticks:
             # cap the tick count by the DATA-AREA size so small (dashboard
             # panel) axes never crowd their labels; the caps saturate at the
@@ -313,12 +314,27 @@ class BaseLivePlot:
             self._watcher.stop()
         return self
 
+    def _create_axes(self):
+        """Create this plot's axes and return the PRIMARY axes.
+
+        Single-axes plots get one fixed-pixel data box.  Multi-axes plots (e.g.
+        the site-histogram grid) override this to build their full layout and set
+        ``self.axes`` to the list of all axes; ``show()`` then keeps that list."""
+        return create_axes_fixed(self.fig, self.spec.data_px, self.spec.margins_px)
+
     def _install_state(self) -> None:
         self.fig._zlc_state = PlotState(plot_type=self.plot_type)
 
     def _attach_interactions(self) -> None:
         self.tools = attach_interaction(self.ax)
         self.area, self.cross, self.zoom, self.drag = self.tools.area, self.tools.cross, self.tools.zoom, self.tools.drag
+
+    def interaction_handles(self) -> list:
+        """Every active selector/interaction object on this plot (zoom/pan, area,
+        cross, drag).  The reusable-interaction contract: a shown plot returns a
+        NON-EMPTY list -- enforced for every plot type by the plot-contract test,
+        so a hand-rolled figure that skips selectors cannot ship."""
+        return [h for h in (self.zoom, self.area, self.cross, self.drag) if h is not None]
 
     def _apply_title(self) -> None:
         if self.ax is not None:
@@ -1791,21 +1807,6 @@ def _reject_sealed_kwargs(kwargs: dict) -> None:
         )
 
 
-class SiteHistogramGrid:
-    """A grid of per-site histograms (the return value of ``site_histogram_grid``)."""
-
-    def __init__(self, fig, axes, n_sites):
-        self.fig = fig
-        self.axes = list(axes)
-        self.site_axes = self.axes[:n_sites]
-        self.ax = self.axes[0] if self.axes else None
-
-    def save(self, path, **kwargs):
-        kwargs.setdefault("dpi", design_dpi(self.fig))
-        self.fig.savefig(path, **kwargs)
-        return path
-
-
 def _as_per_site_list(per_site_values, n_sites: int | None = None):
     """Normalize ``(n_sites, n_samples)`` array OR list-of-1D-arrays to a list."""
 
@@ -1816,6 +1817,227 @@ def _as_per_site_list(per_site_values, n_sites: int | None = None):
     if n_sites is not None and len(out) != n_sites:
         raise ValueError(f"expected {n_sites} sites, got {len(out)}.")
     return out
+
+
+class _SiteGridData:
+    """Composite ``DataFigure`` handle for a :class:`SiteHistogramGrid`: one
+    per-cell :class:`DataFigure` (so each site's histogram fits with the SAME
+    reusable stack as any plot) plus a whole-grid ``save``."""
+
+    def __init__(self, grid: "SiteHistogramGrid"):
+        self.grid = grid
+        self.fig = grid.fig
+        self.cells = grid.data_figures
+
+    def cell(self, k: int):
+        return self.cells[k]
+
+    def save(self, path: str = "", **kwargs):
+        return self.grid.save(path, **kwargs)
+
+
+class SiteHistogramGrid(BaseLivePlot):
+    """One histogram per site on an aligned, non-overlapping grid (general N) --
+    a FIRST-CLASS plot (subclasses :class:`BaseLivePlot`), so it gets the same
+    reusable layer as every other plot: per-cell scroll-zoom / middle-drag pan, a
+    draggable per-site threshold line, and a per-cell :class:`DataFigure` for
+    fitting.  It is never a hand-rolled raw-matplotlib figure -- that would lose
+    the selectors / data_figure that are the whole point of the frontend layer.
+
+    ``per_site_values`` is ``(n_sites, n_samples)`` or a list of 1D arrays (ragged
+    allowed).  ``occupied`` (same shape, bool) colours each site's dark/bright
+    populations separately; ``thresholds`` (``(n_sites,)``) draws a draggable
+    per-site threshold; ``site_fidelities`` annotates each cell.  ``grid_shape``
+    sets the ``(rows, cols)`` layout (defaults to near-square); all cells share
+    the x range for comparability.  Geometry, gaps, colours, dpi and fonts are
+    owned by the frontend -- cells never overlap, nothing is cut off, all align.
+    """
+
+    plot_type = "site_grid"
+
+    def __init__(
+        self,
+        per_site_values,
+        *,
+        thresholds=None,
+        occupied=None,
+        grid_shape: tuple[int, int] | None = None,
+        bins: int = 36,
+        site_fidelities=None,
+        labels: Sequence[str] = ("Signal", "Shots"),
+        **kwargs,
+    ):
+        values = _as_per_site_list(per_site_values)
+        self.site_values = values
+        self.n_sites = len(values)
+        if self.n_sites == 0:
+            raise ValueError("per_site_values must contain at least one site.")
+        self.site_occupied = None if occupied is None else _as_per_site_list(occupied, self.n_sites)
+        thr = None if thresholds is None else np.asarray(thresholds, dtype=float).reshape(-1)
+        if thr is not None and thr.size != self.n_sites:
+            raise ValueError("thresholds must have one value per site.")
+        self.thresholds = None if thr is None else [float(t) for t in thr]
+        self.site_fidelities = None if site_fidelities is None else np.asarray(site_fidelities, dtype=float).reshape(-1)
+        self.bins_arg = int(bins)
+        self.nrows, self.ncols = grid_shape_for(self.n_sites, prefer=grid_shape, max_cols=_SITE_MAX_COLS)
+        # The cells set their own ticks; the base single-axes smart-tick pass
+        # must not touch cell 0 (it would differ from the other cells).
+        super().__init__(np.arange(self.n_sites), labels=labels, smart_ticks=False, **kwargs)
+        self.site_axes: list = []
+        self.threshold_lines: list = []
+        self.tag_texts: list = []
+        self.cell_edges = None
+        self.cell_counts: list = []
+        self._cell_interactions: list = []
+
+    def _create_axes(self):
+        axes = create_axes_grid(
+            self.fig, self.nrows, self.ncols,
+            cell_px=_SITE_CELL_PX, col_gap_px=_SITE_COL_GAP_PX,
+            row_gap_px=_SITE_ROW_GAP_PX, margins_px=_SITE_GRID_MARGINS_PX,
+        )
+        self.axes = axes
+        return axes[0]
+
+    def init_core(self) -> None:
+        axes = self.axes
+        values = self.site_values
+        occ = self.site_occupied
+        fids = self.site_fidelities
+        # Shared x-range (robust) across all sites, so cells are directly comparable.
+        pooled = np.concatenate([v[np.isfinite(v)] for v in values if v.size]) if any(v.size for v in values) else np.array([0.0, 1.0])
+        lo, hi = np.quantile(pooled, [0.002, 0.998]) if pooled.size > 2 else (float(np.min(pooled)), float(np.max(pooled)))
+        if not np.isfinite([lo, hi]).all() or hi <= lo:
+            lo, hi = float(np.min(pooled)), float(np.max(pooled)) + 1.0
+        span = hi - lo
+        lo -= 0.04 * span
+        hi += 0.04 * span
+        self.x_lo, self.x_hi = float(lo), float(hi)
+        edges = np.linspace(lo, hi, self.bins_arg + 1)
+        self.cell_edges = edges
+        small = small_fontsize()
+        self.site_axes = []
+        self.threshold_lines = [None] * self.n_sites
+        self.tag_texts = [None] * self.n_sites
+        self.cell_counts = [None] * self.n_sites
+
+        for k, ax in enumerate(axes):
+            if k >= self.n_sites:
+                ax.set_visible(False)
+                continue
+            self.site_axes.append(ax)
+            v = values[k]
+            v = v[np.isfinite(v)]
+            if occ is not None and occ[k].size == values[k].size:
+                mask = np.asarray(occ[k], dtype=bool)[np.isfinite(values[k])]
+                dark = v[~mask]
+                bright = v[mask]
+                if dark.size or bright.size:
+                    ax.hist([dark, bright], bins=edges, stacked=True, color=[PALETTE["dark"], PALETTE["bright"]], edgecolor="none")
+            elif v.size:
+                ax.hist(v, bins=edges, color=PALETTE["hist_fill"], edgecolor="none")
+            # Total per-bin counts (stack-independent) for this cell's DataFigure.
+            self.cell_counts[k] = np.histogram(v, bins=edges)[0].astype(float) if v.size else np.zeros(self.bins_arg)
+            if self.thresholds is not None and np.isfinite(self.thresholds[k]):
+                self.threshold_lines[k] = ax.axvline(float(self.thresholds[k]), **threshold_line_kwargs(1.4))
+            ax.set_xlim(lo, hi)
+            top = ax.get_ylim()[1]
+            ax.set_ylim(0, top * 1.45 if top > 0 else 1.0)  # headroom so the stacked tag clears the bars
+            # Tag stacked at top-left (site id over fidelity) so it fits a narrow cell
+            # with no horizontal collision even for two-digit sites at 100%.
+            tag = f"s{k}" if fids is None or not np.isfinite(fids[k]) else f"s{k}\n{fids[k] * 100:.0f}%"
+            self.tag_texts[k] = ax.text(0.06, 0.95, tag, transform=ax.transAxes, ha="left", va="top",
+                                        fontsize=small, color=PALETTE["annotation"], linespacing=0.92)
+            ax.tick_params(labelsize=tick_fontsize(), length=2)
+            ax.set_yticklabels([])           # counts scale varies per cell; shape is the point
+            is_bottom = (k + self.ncols >= self.n_sites)  # last filled cell in its column
+            if not is_bottom:
+                ax.set_xticklabels([])
+
+    def update_core(self) -> None:
+        # A per-site readout snapshot; a fresh acquisition rebuilds via show().
+        pass
+
+    def _apply_title(self) -> None:
+        # Outer x/y labels (axis-label size, matching every other plot) + the
+        # shared title mechanism, all placed in the owned margins.
+        labels = self.labels
+        self.fig.text(0.5, 0.012, str(labels[0]), ha="center", va="bottom", fontsize=axis_label_fontsize())
+        self.fig.text(0.008, 0.5, str(labels[1]) if len(labels) > 1 else "Shots", ha="left", va="center",
+                      rotation="vertical", fontsize=axis_label_fontsize())
+        apply_title(self.fig, self.title)
+
+    def _install_state(self) -> None:
+        self.fig._zlc_state = PlotState(plot_type=self.plot_type)
+
+    def _attach_interactions(self) -> None:
+        # Per cell: scroll-zoom / middle-drag pan, plus a draggable threshold line
+        # where one exists.  Each handler filters on ``event.inaxes`` so it only
+        # responds to its own cell; we keep strong refs so they are not GC'd.
+        self._cell_interactions = []
+        for k, ax in enumerate(self.site_axes):
+            line = self.threshold_lines[k] if k < len(self.threshold_lines) else None
+            drag = DragVLine(line, self._make_threshold_cb(k), ax) if line is not None else None
+            self._cell_interactions.append(InteractionBundle(zoom=ZoomPan(ax), drag=drag, axdis=ax))
+        if self._cell_interactions:
+            self.tools = self._cell_interactions[0]
+            self.zoom, self.drag = self.tools.zoom, self.tools.drag
+
+    def interaction_handles(self) -> list:
+        out: list = []
+        for bundle in self._cell_interactions:
+            out.extend(h for h in (bundle.zoom, bundle.drag, bundle.area, bundle.cross) if h is not None)
+        return out
+
+    def _make_threshold_cb(self, k: int):
+        def _cb(x: float) -> None:
+            if self.thresholds is None:
+                self.thresholds = [float("nan")] * self.n_sites
+            self.thresholds[k] = float(x)
+            self._refresh_tag(k)
+        return _cb
+
+    def _refresh_tag(self, k: int) -> None:
+        v = self.site_values[k]
+        v = v[np.isfinite(v)]
+        thr = self.thresholds[k]
+        bright = float(np.mean(v > thr)) if (v.size and np.isfinite(thr)) else float("nan")
+        fid = None if (self.site_fidelities is None or not np.isfinite(self.site_fidelities[k])) else self.site_fidelities[k]
+        head = f"s{k}" if fid is None else f"s{k}\n{fid * 100:.0f}%"
+        self.tag_texts[k].set_text(head if not np.isfinite(bright) else f"{head}\nP={bright * 100:.0f}%")
+
+    def cell(self, k: int):
+        """A per-cell :class:`DataFigure` for site ``k`` -- the SAME fitting stack
+        every other plot exposes, bound to that cell's axes (so e.g.
+        ``grid.cell(3).gaussian()`` fits site 3's histogram)."""
+        from .data_figure import DataFigure
+
+        centers = (self.cell_edges[:-1] + self.cell_edges[1:]) / 2
+        ylabel = self.labels[1] if len(self.labels) > 1 else "Shots"
+        return DataFigure(fig=self.fig, ax=self.site_axes[k], data_x=centers,
+                          data_y=self.cell_counts[k], labels=(self.labels[0], ylabel), name=f"site{k}")
+
+    @property
+    def data_figures(self) -> list:
+        return [self.cell(k) for k in range(len(self.site_axes))]
+
+    def to_data_figure(self):
+        self.data_figure = _SiteGridData(self)
+        return self.data_figure
+
+    def classify(self, k: int, values=None) -> np.ndarray:
+        vals = self.site_values[k] if values is None else np.asarray(values, dtype=float)
+        if self.thresholds is not None and np.isfinite(self.thresholds[k]):
+            thr = self.thresholds[k]
+        else:
+            finite = vals[np.isfinite(vals)]
+            thr = float(np.nanmedian(finite)) if finite.size else 0.0
+        return (vals > thr).astype(int)
+
+    def save(self, path: str = "", **kwargs):
+        kwargs.setdefault("dpi", design_dpi(self.fig))
+        self.fig.savefig(path, **kwargs)
+        return path
 
 
 def site_histogram_grid(
@@ -1829,90 +2051,27 @@ def site_histogram_grid(
     labels: Sequence[str] = ("Signal", "Shots"),
     title: str = "",
     display: bool = True,
-):
+) -> SiteHistogramGrid:
     """Plot one histogram per site on an aligned, non-overlapping grid (general N).
 
-    ``per_site_values`` is ``(n_sites, n_samples)`` or a list of 1D arrays (ragged
-    allowed).  ``occupied`` (same shape, bool) colours each site's dark/bright
-    populations separately; ``thresholds`` (``(n_sites,)``) draws a per-site
-    threshold line; ``site_fidelities`` annotates each cell.  ``grid_shape`` sets
-    the ``(rows, cols)`` layout (defaults to near-square); all cells share the x
-    range for comparability.  Geometry, gaps, colours, dpi and fonts are owned by
-    the frontend -- cells never overlap, nothing is cut off, all cells align.
+    Returns a :class:`SiteHistogramGrid` -- a first-class plot, so it is
+    interactive (per-cell zoom/pan + a draggable per-site threshold) and every
+    cell exposes a :class:`DataFigure` for fitting via ``grid.cell(k)``, exactly
+    like every other front-end plot.  See :class:`SiteHistogramGrid` for the
+    argument semantics; geometry/gaps/colours/dpi/fonts are owned by the frontend
+    (cells never overlap, nothing is cut off, all cells align).
     """
 
-    values = _as_per_site_list(per_site_values)
-    n_sites = len(values)
-    if n_sites == 0:
-        raise ValueError("per_site_values must contain at least one site.")
-    occ = None if occupied is None else _as_per_site_list(occupied, n_sites)
-    thr = None if thresholds is None else np.asarray(thresholds, dtype=float).reshape(-1)
-    if thr is not None and thr.size != n_sites:
-        raise ValueError("thresholds must have one value per site.")
-    fids = None if site_fidelities is None else np.asarray(site_fidelities, dtype=float).reshape(-1)
-
-    nrows, ncols = grid_shape_for(n_sites, prefer=grid_shape, max_cols=_SITE_MAX_COLS)
-
-    # Shared x-range (robust) across all sites, so cells are directly comparable.
-    pooled = np.concatenate([v[np.isfinite(v)] for v in values if v.size]) if any(v.size for v in values) else np.array([0.0, 1.0])
-    lo, hi = np.quantile(pooled, [0.002, 0.998]) if pooled.size > 2 else (float(np.min(pooled)), float(np.max(pooled)))
-    if not np.isfinite([lo, hi]).all() or hi <= lo:
-        lo, hi = float(np.min(pooled)), float(np.max(pooled)) + 1.0
-    span = hi - lo
-    lo -= 0.04 * span
-    hi += 0.04 * span
-    edges = np.linspace(lo, hi, int(bins) + 1)
-
-    fig = new_figure(spec=FigureSpec())
-    axes = create_axes_grid(
-        fig, nrows, ncols,
-        cell_px=_SITE_CELL_PX, col_gap_px=_SITE_COL_GAP_PX,
-        row_gap_px=_SITE_ROW_GAP_PX, margins_px=_SITE_GRID_MARGINS_PX,
-    )
-    small = small_fontsize()
-
-    for k, ax in enumerate(axes):
-        if k >= n_sites:
-            ax.set_visible(False)
-            continue
-        v = values[k]
-        v = v[np.isfinite(v)]
-        if occ is not None and occ[k].size == values[k].size:
-            mask = np.asarray(occ[k], dtype=bool)[np.isfinite(values[k])]
-            dark = v[~mask]
-            bright = v[mask]
-            if dark.size or bright.size:
-                ax.hist([dark, bright], bins=edges, stacked=True, color=[PALETTE["dark"], PALETTE["bright"]], edgecolor="none")
-        elif v.size:
-            ax.hist(v, bins=edges, color=PALETTE["hist_fill"], edgecolor="none")
-        if thr is not None and np.isfinite(thr[k]):
-            ax.axvline(float(thr[k]), **threshold_line_kwargs(1.4))
-        ax.set_xlim(lo, hi)
-        top = ax.get_ylim()[1]
-        ax.set_ylim(0, top * 1.45 if top > 0 else 1.0)  # headroom so the stacked tag clears the bars
-        # Tag stacked at top-left (site id over fidelity) so it fits a narrow cell
-        # with no horizontal collision even for two-digit sites at 100%.
-        tag = f"s{k}" if fids is None or not np.isfinite(fids[k]) else f"s{k}\n{fids[k] * 100:.0f}%"
-        ax.text(0.06, 0.95, tag, transform=ax.transAxes, ha="left", va="top",
-                fontsize=small, color=PALETTE["annotation"], linespacing=0.92)
-        ax.tick_params(labelsize=tick_fontsize(), length=2)
-        ax.set_yticklabels([])           # counts scale varies per cell; shape is the point
-        row, col = divmod(k, ncols)
-        is_bottom = (k + ncols >= n_sites)  # last filled cell in its column
-        if not is_bottom:
-            ax.set_xticklabels([])
-
-    # Outer x/y labels (axis-label size, matching every other plot) + the shared
-    # title mechanism, all placed in the owned margins.
-    fig.text(0.5, 0.012, str(labels[0]), ha="center", va="bottom", fontsize=axis_label_fontsize())
-    fig.text(0.008, 0.5, str(labels[1]) if len(labels) > 1 else "Shots", ha="left", va="center",
-             rotation="vertical", fontsize=axis_label_fontsize())
-    apply_title(fig, title)
-
-    grid = SiteHistogramGrid(fig, axes, n_sites)
-    if display:
-        display_figure(fig)
-    return grid
+    return SiteHistogramGrid(
+        per_site_values,
+        thresholds=thresholds,
+        occupied=occupied,
+        grid_shape=grid_shape,
+        bins=bins,
+        site_fidelities=site_fidelities,
+        labels=labels,
+        title=title,
+    ).show(display=display)
 
 
 def plot(
