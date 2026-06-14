@@ -15,25 +15,23 @@ from scipy.optimize import curve_fit
 
 from .canvas import FigureSpec, configure_canvas, create_axes_fixed, create_axes_grid, design_dpi, display_figure, grid_shape_for, new_figure, split_axes_horizontally
 from .selectors import DragHLine, DragVLine, InteractionBundle, PlotState, attach_interaction
-from .style import apply_style
+from .style import (
+    PALETTE,
+    apply_style,
+    apply_title,
+    axis_label_fontsize,
+    small_fontsize,
+    smaller_fontsize,
+    threshold_line_kwargs,
+    tick_fontsize,
+)
 from .ticks import apply_smart_ticks
 
 
-DEFAULT_COLORS = ["grey", "skyblue", "tab:blue", "tab:orange"]
-PULSE_COLORS = [
-    "#5D7583",
-    "#C37D5A",
-    "#6F8D73",
-    "#A66E87",
-    "#7A6FA4",
-    "#B5A262",
-    "#5E9A9A",
-    "#9A765E",
-    "#7890B5",
-    "#8B8B8B",
-    "#B97878",
-    "#679174",
-]
+# Colours/sizes come from the one owned source in style.py (style.PALETTE / the
+# fontsize accessors); these module names stay as convenience aliases.
+DEFAULT_COLORS = list(PALETTE["series"])
+PULSE_COLORS = list(PALETTE["pulse_cycle"])
 
 
 # --- Pulse-plot display margins -------------------------------------------
@@ -323,12 +321,8 @@ class BaseLivePlot:
         self.area, self.cross, self.zoom, self.drag = self.tools.area, self.tools.cross, self.tools.zoom, self.tools.drag
 
     def _apply_title(self) -> None:
-        if self.title and self.ax is not None:
-            self.ax.set_title(
-                self.title,
-                fontsize=matplotlib.rcParams["axes.labelsize"],
-                pad=max(float(matplotlib.rcParams.get("axes.titlepad", 1.5)), 2.5),
-            )
+        if self.ax is not None:
+            apply_title(self.ax, self.title)
 
     def init_core(self) -> None:
         raise NotImplementedError
@@ -492,7 +486,7 @@ class LiveLiveDis(Live1D):
         self.n, self.bins = self._hist()
         self.verts = np.empty((self.n_bins, 4, 2), dtype=float)
         _update_verts(self.bins, self.n, self.verts, mode="horizontal")
-        self.poly = PolyCollection(self.verts, facecolors="grey")
+        self.poly = PolyCollection(self.verts, facecolors=PALETTE["hist_fill"])
         self.axdis.add_collection(self.poly)
         self.counts_max = max(10, int(np.nanmax(self.n) + 5 if self.n.size else 10))
         self.axdis.set_xlim(0, self.counts_max)
@@ -598,7 +592,7 @@ class Live2DDis(BaseLivePlot):
 
     plot_type = "2D"
 
-    def __init__(self, *args, cmap: str = "inferno", bad_color: str = "white", square: bool = True, **kwargs):
+    def __init__(self, *args, cmap: str = PALETTE["cmap_scan"], bad_color: str = PALETTE["bad"], square: bool = True, **kwargs):
         super().__init__(*args, **kwargs)
         if self.data_x.shape[1] != 2:
             raise ValueError("Live2DDis requires data_x with shape (N, 2).")
@@ -668,7 +662,7 @@ class Live2DDis(BaseLivePlot):
         self.n, self.bins = np.histogram(vals if vals.size else [0], bins=self.n_bins, range=(self.ylim_min, self.ylim_max))
         self.verts = np.empty((self.n_bins, 4, 2), dtype=float)
         _update_verts(self.bins, self.n, self.verts, mode="horizontal")
-        self.poly = PolyCollection(self.verts, facecolors="grey")
+        self.poly = PolyCollection(self.verts, facecolors=PALETTE["hist_fill"])
         self.axdis.add_collection(self.poly)
         self.axdis.set_xlim(0, max(10, int(np.max(self.n) + 5)))
         self.axdis.xaxis.set_major_locator(MaxNLocator(nbins=1, prune="lower"))
@@ -742,7 +736,7 @@ class LiveSiteMap(BaseLivePlot):
 
     plot_type = "SITES"
 
-    def __init__(self, *args, cmap: str = "viridis", image=None, roi_radius: float = 3.0, **kwargs):
+    def __init__(self, *args, cmap: str = PALETTE["cmap_site"], image=None, roi_radius: float = 3.0, **kwargs):
         super().__init__(*args, **kwargs)
         if self.data_x.shape[1] != 2:
             raise ValueError("LiveSiteMap requires data_x with shape (N, 2) site centers.")
@@ -794,14 +788,14 @@ class LiveSiteMap(BaseLivePlot):
                       float(centers[:, 1].max()) + pad, float(centers[:, 1].min()) - pad]
         self.extent = extent
         if self.background is not None:
-            self._bg_image = self.ax.imshow(self.background, cmap="gray", extent=extent, interpolation="none")
+            self._bg_image = self.ax.imshow(self.background, cmap=PALETTE["cmap_camera"], extent=extent, interpolation="none")
         else:
             self._bg_image = None
         diameter = 2.0 * self.roi_radius
         self.sites = EllipseCollection(
             widths=diameter, heights=diameter, angles=0.0, units="xy",
             offsets=centers, transOffset=self.ax.transData,
-            cmap=self.cmap, edgecolors="white", linewidths=0.6, alpha=0.95, zorder=5)
+            cmap=self.cmap, edgecolors=PALETTE["site_ring"], linewidths=0.6, alpha=0.95, zorder=5)
         self.sites.set_array(self.data_y[:, 0])
         lo, hi = self._value_limits()
         self.sites.set_clim(lo, hi)
@@ -1318,8 +1312,8 @@ class PulseSequenceFigure(BaseLivePlot):
                     row["name"],
                     ha="center",
                     va="center",
-                    color="white",
-                    fontsize=max(4.8, matplotlib.rcParams["legend.fontsize"] - 1.2),
+                    color=PALETTE["pulse_name"],
+                    fontsize=smaller_fontsize(1.2, 4.8),
                     clip_on=True,
                     zorder=pulse_zorder + 1,
                 )
@@ -1414,15 +1408,15 @@ class PulseSequenceFigure(BaseLivePlot):
                 transform=self.ax.transAxes,
                 ha="right",
                 va="bottom",
-                color="0.35",
-                fontsize=max(5.5, matplotlib.rcParams["legend.fontsize"] - 1.0),
+                color=PALETTE["pulse_repeat_note"],
+                fontsize=smaller_fontsize(1.0, 5.5),
             )
         self._draw_repeat_bracket(n_channels)
         self.ax.xaxis.set_major_locator(MaxNLocator(nbins=5, prune="lower"))
         self.ax.xaxis.set_major_formatter(_PulseTimeFormatter(self.time_scale))
         self.ax.tick_params(axis="x", which="both", bottom=True, top=False, labelbottom=True, labeltop=False, pad=2)
         self.ax.set_axisbelow(True)
-        self.ax.grid(axis="x", color="0.88", linewidth=0.35, zorder=0)
+        self.ax.grid(axis="x", color=PALETTE["pulse_grid"], linewidth=0.35, zorder=0)
         for gridline in self.ax.get_xgridlines():
             gridline.set_zorder(0)
         self.ax.spines[["top", "right"]].set_visible(False)
@@ -1434,7 +1428,7 @@ class PulseSequenceFigure(BaseLivePlot):
     def _draw_repeat_bracket(self, n_channels: int) -> None:
         if not self.repeat_brackets:
             return
-        colors = ("#6A6A6A", "#C96F3D", "#4F7EA8", "#8B6BB8")
+        colors = PALETTE["bracket_cycle"]
         self.repeat_bracket_artists = []
         self.repeat_bracket_labels = []
         xlim = self.ax.get_xlim()
@@ -1490,7 +1484,7 @@ class PulseSequenceFigure(BaseLivePlot):
                 color=color,
                 fontfamily="DejaVu Sans",
                 alpha=alpha,
-                fontsize=max(5.5, matplotlib.rcParams["legend.fontsize"] - 0.8),
+                fontsize=smaller_fontsize(0.8, 5.5),
                 clip_on=False,
                 zorder=9 + index,
             )
@@ -1538,11 +1532,11 @@ class HistogramFigure(BaseLivePlot):
         self.n, self.bins = np.histogram(vals, bins=self.bins_arg)
         self.verts = np.empty((len(self.n), 4, 2), dtype=float)
         _update_verts(self.bins, self.n, self.verts, mode="vertical")
-        self.poly = PolyCollection(self.verts, facecolors="grey")
+        self.poly = PolyCollection(self.verts, facecolors=PALETTE["hist_fill"])
         self.ax.add_collection(self.poly)
-        (self.fit_line_left,) = self.ax.plot([], [], color="skyblue", linewidth=1, alpha=0.8)
-        (self.fit_line_right,) = self.ax.plot([], [], color="orange", linewidth=1, alpha=0.8)
-        (self.fit_line_total,) = self.ax.plot([], [], color="black", linewidth=1, alpha=0.35)
+        (self.fit_line_left,) = self.ax.plot([], [], color=PALETTE["fit_left"], linewidth=1, alpha=0.8)
+        (self.fit_line_right,) = self.ax.plot([], [], color=PALETTE["fit_right"], linewidth=1, alpha=0.8)
+        (self.fit_line_total,) = self.ax.plot([], [], color=PALETTE["fit_total"], linewidth=1, alpha=0.35)
         self.bimodal_popt = None
         self.fit_threshold = None
         self._fit_bimodal()
@@ -1551,7 +1545,7 @@ class HistogramFigure(BaseLivePlot):
         self.threshold_lines = []
         self.threshold_draggers = []
         for threshold in self.thresholds:
-            line = self.ax.axvline(threshold, color="orange", linewidth=1.9, alpha=0.95, zorder=5)
+            line = self.ax.axvline(threshold, **threshold_line_kwargs())
             self.threshold_lines.append(line)
             self.threshold_draggers.append(DragVLine(line, self._on_threshold_drag, self.ax))
         self.stats_text = self.ax.text(
@@ -1561,8 +1555,8 @@ class HistogramFigure(BaseLivePlot):
             transform=self.ax.transAxes,
             ha="right",
             va="top",
-            color="black",
-            fontsize=matplotlib.rcParams["legend.fontsize"],
+            color=PALETTE["annotation"],
+            fontsize=small_fontsize(),
         )
         self.ax.set_xlim(self.bins[0], self.bins[-1])
         self.ax.set_ylim(0, max(1, float(np.max(self.n) * 1.2)))
@@ -1591,7 +1585,7 @@ class HistogramFigure(BaseLivePlot):
         self.ax.set_ylim(0, max(1, float(np.max(self.n) * 1.2)))
         self._fit_bimodal()
         while len(self.threshold_lines) < len(self.thresholds):
-            line = self.ax.axvline(self.thresholds[len(self.threshold_lines)], color="orange", linewidth=1.9, alpha=0.95, zorder=5)
+            line = self.ax.axvline(self.thresholds[len(self.threshold_lines)], **threshold_line_kwargs())
             self.threshold_lines.append(line)
             self.threshold_draggers.append(DragVLine(line, self._on_threshold_drag, self.ax))
         for line, threshold in zip(self.threshold_lines, self.thresholds):
@@ -1875,7 +1869,7 @@ def site_histogram_grid(
         cell_px=_SITE_CELL_PX, col_gap_px=_SITE_COL_GAP_PX,
         row_gap_px=_SITE_ROW_GAP_PX, margins_px=_SITE_GRID_MARGINS_PX,
     )
-    small = matplotlib.rcParams["legend.fontsize"]
+    small = small_fontsize()
 
     for k, ax in enumerate(axes):
         if k >= n_sites:
@@ -1888,11 +1882,11 @@ def site_histogram_grid(
             dark = v[~mask]
             bright = v[mask]
             if dark.size or bright.size:
-                ax.hist([dark, bright], bins=edges, stacked=True, color=["grey", "skyblue"], edgecolor="none")
+                ax.hist([dark, bright], bins=edges, stacked=True, color=[PALETTE["dark"], PALETTE["bright"]], edgecolor="none")
         elif v.size:
-            ax.hist(v, bins=edges, color="grey", edgecolor="none")
+            ax.hist(v, bins=edges, color=PALETTE["hist_fill"], edgecolor="none")
         if thr is not None and np.isfinite(thr[k]):
-            ax.axvline(float(thr[k]), color="orange", linewidth=1.4, alpha=0.95, zorder=5)
+            ax.axvline(float(thr[k]), **threshold_line_kwargs(1.4))
         ax.set_xlim(lo, hi)
         top = ax.get_ylim()[1]
         ax.set_ylim(0, top * 1.45 if top > 0 else 1.0)  # headroom so the stacked tag clears the bars
@@ -1900,21 +1894,20 @@ def site_histogram_grid(
         # with no horizontal collision even for two-digit sites at 100%.
         tag = f"s{k}" if fids is None or not np.isfinite(fids[k]) else f"s{k}\n{fids[k] * 100:.0f}%"
         ax.text(0.06, 0.95, tag, transform=ax.transAxes, ha="left", va="top",
-                fontsize=small, color="black", linespacing=0.92)
-        ax.tick_params(labelsize=small, length=2)
+                fontsize=small, color=PALETTE["annotation"], linespacing=0.92)
+        ax.tick_params(labelsize=tick_fontsize(), length=2)
         ax.set_yticklabels([])           # counts scale varies per cell; shape is the point
         row, col = divmod(k, ncols)
         is_bottom = (k + ncols >= n_sites)  # last filled cell in its column
         if not is_bottom:
             ax.set_xticklabels([])
 
-    # One outer x/y label and an optional title, placed in the owned margins.
-    fig.text(0.5, 0.012, str(labels[0]), ha="center", va="bottom", fontsize=small)
+    # Outer x/y labels (axis-label size, matching every other plot) + the shared
+    # title mechanism, all placed in the owned margins.
+    fig.text(0.5, 0.012, str(labels[0]), ha="center", va="bottom", fontsize=axis_label_fontsize())
     fig.text(0.008, 0.5, str(labels[1]) if len(labels) > 1 else "Shots", ha="left", va="center",
-             rotation="vertical", fontsize=small)
-    if title:
-        fig.text(0.5, 0.992, str(title), ha="center", va="top",
-                 fontsize=matplotlib.rcParams["axes.labelsize"])
+             rotation="vertical", fontsize=axis_label_fontsize())
+    apply_title(fig, title)
 
     grid = SiteHistogramGrid(fig, axes, n_sites)
     if display:
