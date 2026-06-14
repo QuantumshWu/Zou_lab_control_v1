@@ -242,6 +242,77 @@ def split_axes_horizontally(
     return axes
 
 
+def create_axes_grid(
+    fig: plt.Figure,
+    nrows: int,
+    ncols: int,
+    *,
+    cell_px: tuple[int, int] = (170, 130),
+    col_gap_px: int = 30,
+    row_gap_px: int = 40,
+    margins_px: tuple[int, int, int, int] = (78, 34, 60, 54),
+) -> list[plt.Axes]:
+    """Create ``nrows*ncols`` fixed-pixel cells in row-major (top-left first) order.
+
+    Every cell is the same fixed logical-pixel size and the gaps between them are
+    explicit, so cells never overlap; the figure is sized to fit all cells plus
+    margins, so nothing is cut off; and the shared fixed grid keeps every cell
+    aligned.  ``cell_px`` is ``(width, height)`` of one cell's full box (axes +
+    its own ticks); ``margins_px`` is ``(left, right, bottom, top)`` around the
+    whole grid (top leaves room for a suptitle).
+    """
+
+    nrows, ncols = max(1, int(nrows)), max(1, int(ncols))
+    dpi = design_dpi(fig)
+    cw_in, ch_in = cell_px[0] / dpi, cell_px[1] / dpi
+    cgap, rgap = col_gap_px / dpi, row_gap_px / dpi
+    L, R, B, T = [m / dpi for m in margins_px]
+
+    fig_w = L + ncols * cw_in + (ncols - 1) * cgap + R
+    fig_h = B + nrows * ch_in + (nrows - 1) * rgap + T
+    fig.set_size_inches(fig_w, fig_h, forward=True)
+
+    horiz: list[Any] = [Size.Fixed(L)]
+    for c in range(ncols):
+        horiz.append(Size.Fixed(cw_in))
+        if c < ncols - 1:
+            horiz.append(Size.Fixed(cgap))
+    horiz.append(Size.Fixed(R))
+    vert: list[Any] = [Size.Fixed(B)]
+    for r in range(nrows):
+        vert.append(Size.Fixed(ch_in))
+        if r < nrows - 1:
+            vert.append(Size.Fixed(rgap))
+    vert.append(Size.Fixed(T))
+
+    divider = Divider(fig, (0, 0, 1, 1), horizontal=horiz, vertical=vert)
+    axes: list[plt.Axes] = []
+    for r in range(nrows):  # row 0 = TOP
+        for c in range(ncols):
+            ax = fig.add_axes([0, 0, 1, 1])
+            ax.set_axes_locator(divider.new_locator(nx=1 + 2 * c, ny=1 + 2 * (nrows - 1 - r)))
+            axes.append(ax)
+    fig._zlc_grid = (nrows, ncols)
+    return axes
+
+
+def grid_shape_for(n: int, *, max_cols: int = 8, prefer: tuple[int, int] | None = None) -> tuple[int, int]:
+    """Choose ``(nrows, ncols)`` for ``n`` panels: an explicit ``prefer`` if it
+    fits, else a near-square layout capped at ``max_cols`` columns."""
+
+    n = max(1, int(n))
+    if prefer is not None:
+        pr, pc = int(prefer[0]), int(prefer[1])
+        if pr > 0 and pc > 0 and pr * pc >= n:
+            return pr, pc
+    import math
+
+    ncols = min(int(max_cols), int(math.ceil(math.sqrt(n))))
+    ncols = max(1, ncols)
+    nrows = int(math.ceil(n / ncols))
+    return nrows, ncols
+
+
 def auto_data_size_px(
     ncols: int = 1,
     nrows: int = 1,
@@ -300,8 +371,10 @@ __all__ = [
     "close_all",
     "configure_canvas",
     "create_axes_fixed",
+    "create_axes_grid",
     "design_dpi",
     "display_figure",
+    "grid_shape_for",
     "new_figure",
     "save_figure_data",
     "split_axes_horizontally",

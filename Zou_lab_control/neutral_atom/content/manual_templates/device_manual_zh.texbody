@@ -1056,6 +1056,40 @@ th = exp.readout.thresholds(method="bimodal", frames=120)
 这套实现移植自 \filepath{references/.../rb87\_readout\_v16} 的\tfocus{算法}（PSF 拟合、双高斯定阈、匹配滤波提取），但参考归档里那套面向离线批处理的文件 IO / 流式缓存 / 输出目录命名 / 重复别名\tfocus{没有}带进来——在线控制库只要算法，按本仓库的分层（原语在 \filepath{core/}，标定在 \filepath{operations/}，编排在 \pyapi{ReadoutSubsystem}）重写。
 \end{notebox}
 
+\subsection{用实验数据逐站点定阈值 + 保真度：characterize}
+
+前两步给的是"一条分布定一条阈值"。Rb87 真正的做法是用\tfocus{参考帧给出的 ground-truth 标签}来逐站点训练并\tfocus{诚实评估}阈值。\pyapi{exp.readout.characterize(...)} 完整复刻这套流程：
+
+\begin{codeblock}[Python]
+report = exp.readout.characterize(
+    groups=150, reference_shots=3,
+    short_exposure=3e-3,        # 待表征的读出曝光
+    reference_exposure=20e-3,   # 高 SNR 参考曝光（给真值标签）
+    train_fraction=0.9, seed=1,
+)
+report.summary()                # aggregate/global/min 保真度、ambiguous 比例
+\end{codeblock}
+
+每个 group 在 short 曝光下成像一次、在 reference 长曝光下成像 \pyapi{reference_shots} 次（\tfocus{同一批原子}）。流程：参考帧逐站点双高斯拟合 → 严格共识（一组的所有参考帧同亮/同暗才算定，否则 ambiguous）给出 \pyapi{(group, site)} 真值标签 → 在随机 \pyapi{train} 划分上为\tfocus{每个站点单独}训练阈值 → 在 held-out \pyapi{test} 上算保真度 → 另给一个全局单阈值对比 + drop-worst-site 消融。\pyapi{store_thresholds=True}（默认）把训练出的逐站点阈值写回标定（\pyapi{metadata["threshold_method"]="per_site_reference"}）。提取走\tfocus{当前标定的方法}（box 或 PSF），所以阈值定在 detect 实际用的信号上。
+
+返回 \pyapi{FidelityReport}：\pyapi{per_site}（逐站 \pyapi{SiteFidelity}）、\pyapi{thresholds (N,)}、\pyapi{aggregate_fidelity}（逐站阈值 held-out）、\pyapi{global_fidelity}（单阈值 held-out）、\pyapi{ablation}（drop-worst-k 行）、\pyapi{labels}/\pyapi{split}，以及 \pyapi{per_site_arrays()} 给绘图用的逐站 \pyapi{(values, occupied)}。
+
+\subsection{逐站点直方图网格：site\_histogram\_grid}
+
+把每个站点的读出分布画成一张小直方图，按 trap 网格排布，一眼看出哪个站点分得开、阈值卡得对：
+
+\begin{codeblock}[Python]
+values, occupied = report.per_site_arrays()
+zf.site_histogram_grid(
+    values, occupied=occupied, thresholds=report.thresholds,
+    site_fidelities=report.site_fidelities,
+    grid_shape=exp.devices.trap_array.grid_shape,   # 例如 (5, 7) = 35 站
+    labels=("PSF signal (counts)", "Shots"),
+)
+\end{codeblock}
+
+每格：暗=灰、亮=蓝、橙线=该站阈值、标题=站号+保真度；所有格共享 x 轴便于比较。这是 frontend 的\tfocus{通用}多面板图（站点数任意，不写死 35），建在 \pyapi{canvas.create_axes_grid} 上——固定格 + 显式间距 + 图尺寸自适应，因此\tfocus{不重叠、不裁切、对齐}由构造保证（见 \filepath{frontend/AGENTS.md} 的 Layout 节）。
+
 \section{第三步：detect 探测（逐发判定）}
 
 \subsection{调用与返回}

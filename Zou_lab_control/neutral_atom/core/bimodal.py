@@ -114,6 +114,13 @@ def optimal_gaussian_threshold(mu_dark, sigma_dark, mu_bright, sigma_bright, *, 
     return float(res.x if res.success else 0.5 * (lo + hi)), bright_above
 
 
+def classify_threshold(values, threshold: float, bright_above: bool = True) -> np.ndarray:
+    """Boolean bright/dark classification of ``values`` against ``threshold``."""
+
+    arr = np.asarray(values, dtype=float)
+    return arr > threshold if bright_above else arr < threshold
+
+
 def gaussian_fidelity(mu_dark, sigma_dark, mu_bright, sigma_bright, threshold, bright_above) -> tuple[float, float, float]:
     """``(F_dark, F_bright, 0.5*(F_dark+F_bright))`` for a threshold between two Gaussians."""
 
@@ -192,6 +199,7 @@ def fit_bimodal_per_site(signals) -> tuple[np.ndarray, list[BimodalFit]]:
 
 __all__ = [
     "BimodalFit",
+    "classify_threshold",
     "exact_otsu_threshold",
     "fit_bimodal",
     "fit_bimodal_per_site",

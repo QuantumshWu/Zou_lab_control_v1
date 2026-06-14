@@ -167,6 +167,52 @@ print("method:", psf_cal.method, "| psf weights:", psf_cal.psf_weights.shape)
 na.detect_image(exp.camera.capture(display=False).image, psf_cal, display=True).occupied.sum()
 
 <!-- cell:markdown -->
+## Per-site readout fidelity from data (Rb87 flow)
+
+完整复刻 Rb87 用实验数据**逐站点定阈值**的流程（虚拟后端）。每个 group 在 SHORT 读出曝光下成像一次，再在高 SNR 的 reference 长曝光下成像几次（同一批原子）：
+
+1. reference 帧用双高斯**严格共识**给出每个 `(group, site)` 的 ground-truth 亮/暗标签；
+2. 在随机 **train** 划分上为**每个站点单独**训练阈值；
+3. 在 **held-out test** 上诚实报告保真度；
+4. 再给一个全局单阈值对比 + drop-worst-site 消融。
+
+`exp.readout.characterize(...)` 把训练出的逐站点阈值写回标定（`method=per_site_reference`）。下面用 PSF 提取（上一步已 `sitemap(method="psf")`）。
+
+<!-- cell:code -->
+exp.readout.sitemap(method="psf", frames=8, display=False)     # PSF 提取
+report = exp.readout.characterize(
+    groups=150, reference_shots=3,
+    short_exposure=3e-3, reference_exposure=20e-3,             # short=待表征读出, reference=高 SNR 真值
+    train_fraction=0.9, seed=1,
+)
+report.summary()
+
+<!-- cell:markdown -->
+## The per-site readout histogram grid（通用 N，这里 35 站）
+
+每个站点一张直方图：暗=灰、亮=蓝、橙线=该站**训练出的**阈值，标题给 held-out 保真度；按 trap 网格 `(rows, cols)` 排布。布局由 frontend 拥有——**不重叠、不裁切、对齐**，且通用任意站点数（不写死 35）。
+
+<!-- cell:code -->
+values, occupied = report.per_site_arrays()
+grid = zf.site_histogram_grid(
+    values, occupied=occupied, thresholds=report.thresholds,
+    site_fidelities=report.site_fidelities, grid_shape=exp.devices.trap_array.grid_shape,
+    labels=("PSF signal (counts)", "Shots"),
+    title=f"Per-site readout histograms (held-out F={report.aggregate_fidelity:.3f})",
+)
+
+<!-- cell:markdown -->
+## Global vs per-site threshold, and the drop-worst-site ablation
+
+逐站点阈值通常优于一个全局阈值；drop-worst-site 消融显示忽略最差的 K 个站点后，held-out 保真度如何回升。
+
+<!-- cell:code -->
+print(f"global one-threshold held-out fidelity: {report.global_fidelity:.4f}")
+print(f"per-site             held-out fidelity: {report.aggregate_fidelity:.4f}")
+for row in report.ablation:
+    print(f"  drop worst {row['drop_worst_k']}: F={row['fidelity']:.4f}  kept={row['kept_sites']}  errors={row['errors']}")
+
+<!-- cell:markdown -->
 ## Scan detection time and fidelity
 
 `detection_time` 不使用 virtual ground truth。它先拍 long-exposure reference images，然后对每个 detection time 的 ROI count distribution 做 threshold 和 Gaussian split fidelity 估计。接口默认 `live=True`；这里保留 live scan，cell 返回后 acquisition worker 和 frontend plot 会继续更新。等图跑完或想提前停止时，运行下一格 `scan.stop()`，再在后面的 cell 里做 decay fit。

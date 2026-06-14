@@ -63,9 +63,33 @@ the rules don't get re-broken.
   memory and compiles via `render_tex_pdf` in a temp dir (only the `.pdf` lands
   in `docs/`); `docs/**/*.tex` and `*.sty` are gitignored.
 
+## Layout: no overlap, no cutoff, aligned (composite / multi-panel figures)
+
+A figure is only correct if every element is fully visible and orderly. This is
+a core art principle, not a nicety:
+
+- **No overlap.** Panels/cells never overlap each other; annotations (per-cell
+  labels, threshold lines, stats text) never sit on top of the data bars/points
+  — give the axes headroom so labels float in clear space.
+- **No cutoff.** Nothing is clipped by the figure edge: titles, tick labels,
+  outer axis labels and the last row/column must all fit inside the canvas.
+- **Aligned.** Cells in a grid share one fixed grid and (where comparable) one
+  shared data range, so they line up exactly.
+
+Build multi-panel figures on `canvas.create_axes_grid` (fixed-pixel cells +
+explicit gaps + a figure sized to fit them + margins) so these three hold **by
+construction**; `grid_shape_for` picks a general `(rows, cols)` for any N (do not
+hard-code a site count). `site_histogram_grid` is the reference implementation.
+
 ## Verifying visual changes
 
 Any UI/plot change must pass `devtools.capture_user_view` at QT_SCALE_FACTOR
 1.0 / 1.25 / 1.5 (three-scale screenshots, inspected as 1:1 crops). The
 `parity` target opens both GUIs in one process on one screen and fails if their
 fluent control sizes disagree. A DPR=1 offscreen pass alone is NOT acceptance.
+
+For a static notebook figure (matplotlib, fixed-inch geometry, dpi-invariant
+layout) the equivalent acceptance is: **render the actual output and inspect it**
+for the no-overlap / no-cutoff / aligned rules above — at a representative size
+AND a stress count (e.g. an N-site grid), not just one hand-picked case. Reading
+the rendered PNG is the check; an object-level "it ran" is not.

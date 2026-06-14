@@ -7170,3 +7170,91 @@ def test_box_otsu_readout_is_still_the_default():
     assert sitemap.calibration.psf_weights is None
     exp.readout.thresholds(frames=60, display=False)
     assert exp.readout.current.metadata.get("threshold_method") == "otsu"
+
+
+# --------------------------------------------------------------------------- #
+# Per-site readout-fidelity characterization (Rb87 flow): reference labels,
+# train/test split, held-out per-site fidelity, drop-worst ablation, and the
+# general N-site histogram grid.
+# --------------------------------------------------------------------------- #
+def _synth_fidelity_data(rng, *, n_sites=8, n_groups=240, bad_sites=()):
+    truth = rng.random((n_groups, n_sites)) < 0.5
+    ref = np.empty((n_groups, 3, n_sites))
+    short = np.empty((n_groups, n_sites))
+    for j in range(n_sites):
+        ref[:, :, j] = np.where(truth[:, j][:, None], 80.0, 2.0) + rng.normal(0, 1.5, (n_groups, 3))
+        if j in bad_sites:  # short readout barely separates dark from bright
+            short[:, j] = np.where(truth[:, j], 12.0, 6.0) + rng.normal(0, 3.0, n_groups)
+        else:
+            short[:, j] = np.where(truth[:, j], 50.0, 3.0) + rng.normal(0, 4.0, n_groups)
+    return short, ref, truth
+
+
+def test_reference_labels_recover_truth_and_flag_ambiguous():
+    from Zou_lab_control.neutral_atom.operations.fidelity import reference_labels
+
+    rng = np.random.default_rng(0)
+    _, ref, truth = _synth_fidelity_data(rng, n_sites=6, n_groups=200)
+    labels = reference_labels(ref)
+    assert labels.occupied.shape == truth.shape
+    assert np.mean(labels.valid) > 0.95                         # clean reference -> almost all decisive
+    assert np.all(labels.occupied[labels.valid] == truth[labels.valid])
+
+
+def test_train_test_split_is_disjoint_and_covers_valid():
+    from Zou_lab_control.neutral_atom.operations.fidelity import reference_labels, train_test_split
+
+    rng = np.random.default_rng(1)
+    _, ref, _ = _synth_fidelity_data(rng, n_sites=5, n_groups=200)
+    labels = reference_labels(ref)
+    split = train_test_split(labels, train_fraction=0.8, seed=3)
+    assert not np.any(split.train & split.test)                 # disjoint
+    assert np.all((split.train | split.test) <= labels.valid)   # only valid groups used
+    assert split.train.sum() > split.test.sum() > 0             # ~80/20
+
+
+def test_characterize_per_site_beats_global_and_ablation_helps():
+    from Zou_lab_control.neutral_atom.operations.fidelity import characterize_readout
+
+    rng = np.random.default_rng(2)
+    short, ref, _ = _synth_fidelity_data(rng, n_sites=8, n_groups=300, bad_sites=(0,))
+    report = characterize_readout(short, ref, train_fraction=0.85, seed=5, max_drop=3)
+    assert report.n_sites == 8
+    assert np.all(np.isfinite(report.thresholds))
+    # the overlapping site is the worst, and dropping it raises held-out fidelity
+    assert report.worst_sites[0] == 0
+    others = np.nanmean([s.fidelity for s in report.per_site[1:]])
+    assert report.per_site[0].fidelity < others
+    assert report.ablation[1]["fidelity"] >= report.ablation[0]["fidelity"] - 1e-9
+    assert len(report.ablation) == 4                            # k = 0..max_drop
+    vals, occ = report.per_site_arrays()
+    assert len(vals) == 8 and len(occ) == 8
+
+
+def test_site_histogram_grid_is_general_in_n():
+    import Zou_lab_control.frontend as zf
+
+    rng = np.random.default_rng(0)
+    for n_sites, grid in ((35, (5, 7)), (12, None), (3, None)):
+        vals = [np.concatenate([rng.normal(3, 1, 60), rng.normal(50, 3, 70)]) for _ in range(n_sites)]
+        occ = [np.array([False] * 60 + [True] * 70) for _ in range(n_sites)]
+        g = zf.site_histogram_grid(vals, occupied=occ, thresholds=[25.0] * n_sites,
+                                   site_fidelities=[0.99] * n_sites, grid_shape=grid, display=False)
+        assert sum(a.get_visible() for a in g.axes) == n_sites   # exactly N cells shown
+        assert g.fig.get_size_inches()[0] > 0
+        import matplotlib.pyplot as plt
+        plt.close(g.fig)
+
+
+def test_readout_characterize_end_to_end_on_virtual_backend():
+    exp = na.connect("virtual", sitemap={"loading_probability": 0.55}, loss_rate=0.02, seed=9)
+    exp.readout.sitemap(method="psf", frames=6, display=False)
+    report = exp.readout.characterize(groups=80, reference_shots=3, short_exposure=5e-3,
+                                      reference_exposure=20e-3, seed=2)
+    assert report.n_sites == exp.devices.trap_array.n_sites
+    assert report.aggregate_fidelity > 0.9
+    cal = exp.readout.current
+    assert cal.metadata.get("threshold_method") == "per_site_reference"
+    assert np.all(np.isfinite(cal.thresholds))                  # data-trained thresholds stored back
+    values, occupied = report.per_site_arrays()
+    assert len(values) == report.n_sites

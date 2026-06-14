@@ -13,7 +13,7 @@ from matplotlib.ticker import Formatter, FuncFormatter, MaxNLocator, ScalarForma
 import numpy as np
 from scipy.optimize import curve_fit
 
-from .canvas import FigureSpec, configure_canvas, create_axes_fixed, display_figure, new_figure, split_axes_horizontally
+from .canvas import FigureSpec, configure_canvas, create_axes_fixed, create_axes_grid, design_dpi, display_figure, grid_shape_for, new_figure, split_axes_horizontally
 from .selectors import DragHLine, DragVLine, InteractionBundle, PlotState, attach_interaction
 from .style import apply_style
 from .ticks import apply_smart_ticks
@@ -1784,6 +1784,125 @@ def _reject_sealed_kwargs(kwargs: dict) -> None:
         )
 
 
+class SiteHistogramGrid:
+    """A grid of per-site histograms (the return value of ``site_histogram_grid``)."""
+
+    def __init__(self, fig, axes, n_sites):
+        self.fig = fig
+        self.axes = list(axes)
+        self.site_axes = self.axes[:n_sites]
+        self.ax = self.axes[0] if self.axes else None
+
+    def save(self, path, **kwargs):
+        kwargs.setdefault("dpi", design_dpi(self.fig))
+        self.fig.savefig(path, **kwargs)
+        return path
+
+
+def _as_per_site_list(per_site_values, n_sites: int | None = None):
+    """Normalize ``(n_sites, n_samples)`` array OR list-of-1D-arrays to a list."""
+
+    if isinstance(per_site_values, np.ndarray) and per_site_values.ndim == 2:
+        out = [np.asarray(row, dtype=float).reshape(-1) for row in per_site_values]
+    else:
+        out = [np.asarray(v, dtype=float).reshape(-1) for v in per_site_values]
+    if n_sites is not None and len(out) != n_sites:
+        raise ValueError(f"expected {n_sites} sites, got {len(out)}.")
+    return out
+
+
+def site_histogram_grid(
+    per_site_values,
+    *,
+    thresholds=None,
+    occupied=None,
+    grid_shape: tuple[int, int] | None = None,
+    bins: int = 36,
+    site_fidelities=None,
+    labels: Sequence[str] = ("Signal", "Shots"),
+    title: str = "",
+    display: bool = True,
+):
+    """Plot one histogram per site on an aligned, non-overlapping grid (general N).
+
+    ``per_site_values`` is ``(n_sites, n_samples)`` or a list of 1D arrays (ragged
+    allowed).  ``occupied`` (same shape, bool) colours each site's dark/bright
+    populations separately; ``thresholds`` (``(n_sites,)``) draws a per-site
+    threshold line; ``site_fidelities`` annotates each cell.  ``grid_shape`` sets
+    the ``(rows, cols)`` layout (defaults to near-square); all cells share the x
+    range for comparability.  Geometry, gaps, colours, dpi and fonts are owned by
+    the frontend -- cells never overlap, nothing is cut off, all cells align.
+    """
+
+    values = _as_per_site_list(per_site_values)
+    n_sites = len(values)
+    if n_sites == 0:
+        raise ValueError("per_site_values must contain at least one site.")
+    occ = None if occupied is None else _as_per_site_list(occupied, n_sites)
+    thr = None if thresholds is None else np.asarray(thresholds, dtype=float).reshape(-1)
+    if thr is not None and thr.size != n_sites:
+        raise ValueError("thresholds must have one value per site.")
+    fids = None if site_fidelities is None else np.asarray(site_fidelities, dtype=float).reshape(-1)
+
+    nrows, ncols = grid_shape_for(n_sites, prefer=grid_shape)
+
+    # Shared x-range (robust) across all sites, so cells are directly comparable.
+    pooled = np.concatenate([v[np.isfinite(v)] for v in values if v.size]) if any(v.size for v in values) else np.array([0.0, 1.0])
+    lo, hi = np.quantile(pooled, [0.002, 0.998]) if pooled.size > 2 else (float(np.min(pooled)), float(np.max(pooled)))
+    if not np.isfinite([lo, hi]).all() or hi <= lo:
+        lo, hi = float(np.min(pooled)), float(np.max(pooled)) + 1.0
+    span = hi - lo
+    lo -= 0.04 * span
+    hi += 0.04 * span
+    edges = np.linspace(lo, hi, int(bins) + 1)
+
+    fig = new_figure(spec=FigureSpec())
+    axes = create_axes_grid(fig, nrows, ncols)
+    small = matplotlib.rcParams["legend.fontsize"]
+
+    for k, ax in enumerate(axes):
+        if k >= n_sites:
+            ax.set_visible(False)
+            continue
+        v = values[k]
+        v = v[np.isfinite(v)]
+        if occ is not None and occ[k].size == values[k].size:
+            mask = np.asarray(occ[k], dtype=bool)[np.isfinite(values[k])]
+            dark = v[~mask]
+            bright = v[mask]
+            if dark.size or bright.size:
+                ax.hist([dark, bright], bins=edges, stacked=True, color=["grey", "skyblue"], edgecolor="none")
+        elif v.size:
+            ax.hist(v, bins=edges, color="grey", edgecolor="none")
+        if thr is not None and np.isfinite(thr[k]):
+            ax.axvline(float(thr[k]), color="orange", linewidth=1.4, alpha=0.95, zorder=5)
+        ax.set_xlim(lo, hi)
+        top = ax.get_ylim()[1]
+        ax.set_ylim(0, top * 1.34 if top > 0 else 1.0)  # headroom so the label clears the bars
+        tag = f"s{k}" if fids is None or not np.isfinite(fids[k]) else f"s{k}  {fids[k]*100:.1f}%"
+        ax.text(0.045, 0.93, tag, transform=ax.transAxes, ha="left", va="top",
+                fontsize=small, color="black")
+        ax.tick_params(labelsize=small, length=2)
+        ax.set_yticklabels([])           # counts scale varies per cell; shape is the point
+        row, col = divmod(k, ncols)
+        is_bottom = (k + ncols >= n_sites)  # last filled cell in its column
+        if not is_bottom:
+            ax.set_xticklabels([])
+
+    # One outer x/y label and an optional title, placed in the owned margins.
+    fig.text(0.5, 0.012, str(labels[0]), ha="center", va="bottom", fontsize=small)
+    fig.text(0.008, 0.5, str(labels[1]) if len(labels) > 1 else "Shots", ha="left", va="center",
+             rotation="vertical", fontsize=small)
+    if title:
+        fig.text(0.5, 0.992, str(title), ha="center", va="top",
+                 fontsize=matplotlib.rcParams["axes.titlesize"])
+
+    grid = SiteHistogramGrid(fig, axes, n_sites)
+    if display:
+        display_figure(fig)
+    return grid
+
+
 def plot(
     data_x,
     data_y=None,
@@ -1875,10 +1994,12 @@ __all__ = [
     "PANEL_SIZES",
     "panel_display_size",
     "PulseSequenceFigure",
+    "SiteHistogramGrid",
     "panel_plot",
     "panel_plot_spec",
     "panel_size_cells",
     "plot",
+    "site_histogram_grid",
     "pulse_plot_channels",
     "pulse_plot_spec",
     "pulse_repeat_marker",

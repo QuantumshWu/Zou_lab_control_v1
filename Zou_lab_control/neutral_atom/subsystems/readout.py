@@ -14,6 +14,7 @@ from ..core.calibration import TrapCalibration
 from ..core.results import DetectionResult, DetectionTimeScanResult, SitemapResult, ThresholdResult
 from ..core.utils import site_index
 from ..operations import calibrate_sitemap_from_images, calibrate_threshold_from_images, detect_image
+from ..operations.fidelity import FidelityReport, characterize_readout
 from ..views.plots import plot_detection_scan
 from .base import ExperimentSubsystem
 
@@ -127,6 +128,65 @@ class ReadoutSubsystem(ExperimentSubsystem):
         result = detect_image(image, calibration, sequence=s.sequence, **kwargs)
         s.history.append(result)
         return result
+
+    def characterize(
+        self,
+        *,
+        groups: int = 200,
+        reference_shots: int = 3,
+        short_exposure: float | None = None,
+        reference_exposure: float | None = None,
+        train_fraction: float = 0.9,
+        seed: int = 0,
+        store_thresholds: bool = True,
+    ) -> FidelityReport:
+        """Per-site readout fidelity from data with reference ground-truth labels.
+
+        Acquires ``groups`` loadings; each is imaged once at the SHORT readout
+        exposure and ``reference_shots`` times at a high-SNR ``reference_exposure``
+        (the same atoms).  Per-site signals are extracted with the current
+        calibration's method (box or PSF), reference shots define strict-consensus
+        ground-truth labels, a per-site threshold is trained on a random split and
+        scored on the held-out test set, and a single global threshold + a
+        drop-worst-site ablation are reported.  ``store_thresholds`` writes the
+        data-trained per-site thresholds back into the session calibration.
+        """
+
+        s = self._session
+        cal = s.require_calibration(require_thresholds=False)
+        short_exp = float(s._camera_exposure() if short_exposure is None else short_exposure)
+        ref_exp = float(short_exp * 4.0 if reference_exposure is None else reference_exposure)
+        n_groups = positive_int(groups, "groups")
+        n_ref = positive_int(reference_shots, "reference_shots")
+        sequencer = getattr(s.devices, "sequencer", None)
+        short_seq = s._imaging_sequence(exposure=short_exp, load=True, name="readout")
+        ref_seq = s._imaging_sequence(exposure=ref_exp, load=False, name="reference")
+
+        short = np.empty((n_groups, cal.n_sites), dtype=float)
+        ref = np.empty((n_groups, n_ref, cal.n_sites), dtype=float)
+        for g in range(n_groups):
+            # Load fresh atoms + image at the short readout exposure, then image
+            # the SAME atoms at the long reference exposure (no reload).
+            short_image = s.devices.camera.acquire(1, sequence=short_seq, sequencer=sequencer)[-1]
+            short[g] = cal.signals(short_image)
+            for r, image in enumerate(s.devices.camera.acquire(n_ref, sequence=ref_seq, sequencer=sequencer)):
+                ref[g, r] = cal.signals(image)
+
+        report = characterize_readout(short, ref, train_fraction=train_fraction, seed=seed)
+        if store_thresholds:
+            thresholds = report.thresholds.copy()
+            bad = ~np.isfinite(thresholds)
+            if np.any(bad):
+                fallback = report.global_threshold
+                if not np.isfinite(fallback):
+                    finite = thresholds[~bad]
+                    fallback = float(np.median(finite)) if finite.size else 0.0
+                thresholds[bad] = fallback
+            s._calibration = cal.with_thresholds(
+                thresholds, stage="characterized", thresholds_calibrated=True, threshold_method="per_site_reference"
+            )
+        s.history.append(report)
+        return report
 
     def detection_time(self, times: Sequence[float] | None = None, **kwargs) -> DetectionTimeScanResult:
         if times is None:

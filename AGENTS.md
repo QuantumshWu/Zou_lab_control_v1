@@ -43,7 +43,8 @@
 - **跑能证明"改动边界"的最小检查**。**小且你很确定的改动可以不跑 full pytest**,省时间;full `pytest -q` 留给大改、跨多子系统、或交付前的扫尾。
 - **性能优化必须 logic/appearance-neutral**:只能让同样的输出更快(如解析 Jacobian、skip-if-unchanged 守卫、缓存不变量),**不能改刷新节奏/外观**(如降低拟合频率就是改外观,不做)。改完要能证明等价(如 popt 数值一致)。
 - **Python 侧契约测试**:仓库**没有 iverilog/cocotb**。RTL 行为用 Python 忠实镜像 + `xsim`(真 IP 网表,最强证据)验证;verilog 端口宽度由 Python 契约测试核对。
-- **所有可视化改动都要"看到用户所见"再算通过**:三档 QT_SCALE_FACTOR(1.0/1.25/1.5)整窗截图 + 1:1 像素裁剪。**DPR=1 离屏通过不算通过**,否则就是"瞎改"浪费时间。
+- **所有可视化改动都要"看到用户所见"再算通过**:三档 QT_SCALE_FACTOR(1.0/1.25/1.5)整窗截图 + 1:1 像素裁剪。**DPR=1 离屏通过不算通过**,否则就是"瞎改"浪费时间。静态 notebook 图(matplotlib)则**渲染实际输出并肉眼检查**。
+- **布局美术铁律:不重叠、不裁切、对齐**(复合/多面板图同样适用,注记不许压在数据上)。多面板用 `frontend.canvas.create_axes_grid`(固定格 + 显式间距 + 图尺寸自适应)使三者天然成立,通用 N 不写死站点数;细则见 `frontend/AGENTS.md`「Layout」节。
 - **删除/重构后**:`git grep` 死标识符 = 0;`python -m compileall` 干净;无遗留 TODO/FIXME。
 
 ---
