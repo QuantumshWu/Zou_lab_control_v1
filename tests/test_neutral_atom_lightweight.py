@@ -7066,3 +7066,107 @@ def test_torn_down_stream_transaction_never_spawns_a_new_vivado(monkeypatch, tmp
     stop.set()
     with pytest.raises(ax._AxiAborted):
         session._run_tcl(["puts hi"], action="x", timeout=1.0, stop=stop)
+
+
+# --------------------------------------------------------------------------- #
+# Rb87-style PSF + bimodal readout (decision 2): the matched-filter extraction
+# strategy, the dark/bright bimodal threshold fit, and an end-to-end PSF readout
+# on the virtual backend.  The box/otsu path stays the default and unchanged.
+# --------------------------------------------------------------------------- #
+def _psf_template(centers, *, shape=(40, 40), bg=5.0, amp=200.0, sigma=1.2):
+    h, w = shape
+    yy, xx = np.mgrid[0:h, 0:w]
+    img = np.full((h, w), float(bg))
+    for cx, cy in np.asarray(centers, dtype=float):
+        img = img + amp * np.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * sigma ** 2))
+    return img
+
+
+def test_fit_site_psfs_returns_normalized_weights_in_fixed_boxes():
+    from Zou_lab_control.neutral_atom.core.psf import fit_site_psfs, psf_boxes_array, psf_weights_array
+
+    centers = np.array([[10.0, 12.0], [28.0, 14.0], [18.0, 30.0]])
+    psfs = fit_site_psfs(_psf_template(centers), centers, half_width=3)
+    assert len(psfs) == 3
+    for psf in psfs:
+        assert psf.weight.shape == (7, 7)
+        assert abs(float(psf.weight.sum()) - 1.0) < 1e-9
+        assert float(psf.weight.min()) >= 0.0
+    assert psf_weights_array(psfs).shape == (3, 7, 7)
+    assert psf_boxes_array(psfs).shape == (3, 4)
+
+
+def test_psf_signals_are_brighter_for_occupied_sites():
+    from Zou_lab_control.neutral_atom.core.psf import fit_site_psfs, psf_boxes_array, psf_signals, psf_weights_array
+
+    centers = np.array([[10.0, 12.0], [28.0, 28.0]])
+    psfs = fit_site_psfs(_psf_template(centers), centers, half_width=3)
+    weights, boxes = psf_weights_array(psfs), psf_boxes_array(psfs)
+    frame = _psf_template(centers[:1])  # only site 0 occupied
+    signals = psf_signals(frame, weights, boxes, background="annulus")
+    assert signals[0] > signals[1] + 5.0
+
+
+def test_psf_edge_site_raises_for_clipped_box():
+    from Zou_lab_control.neutral_atom.core.psf import fit_site_psfs
+
+    with pytest.raises(ValueError):
+        fit_site_psfs(np.ones((20, 20)), np.array([[1.0, 1.0]]), half_width=3)
+
+
+def test_fit_bimodal_recovers_two_gaussians_and_threshold():
+    from Zou_lab_control.neutral_atom.core.bimodal import fit_bimodal
+
+    rng = np.random.default_rng(1)
+    values = np.concatenate([rng.normal(10.0, 1.0, 400), rng.normal(40.0, 2.0, 400)])
+    fit = fit_bimodal(values)
+    assert fit.ok and fit.bright_above
+    assert 7.0 < fit.dark_mean < 13.0
+    assert 36.0 < fit.bright_mean < 44.0
+    assert fit.dark_mean < fit.threshold < fit.bright_mean
+    assert fit.fidelity > 0.99
+
+
+def test_fit_bimodal_degenerate_is_not_ok():
+    from Zou_lab_control.neutral_atom.core.bimodal import fit_bimodal
+
+    assert not fit_bimodal(np.full(50, 7.0)).ok
+
+
+def test_psf_bimodal_readout_end_to_end_on_virtual_backend():
+    exp = na.connect("virtual", sitemap={"loading_probability": 0.6}, loss_rate=0.001, seed=11)
+    sitemap = exp.readout.sitemap(method="psf", frames=6, display=False)
+    assert sitemap.calibration.method == "psf"
+    assert sitemap.calibration.psf_weights.shape[0] == sitemap.calibration.n_sites
+    exp.readout.thresholds(method="bimodal", frames=120, display=False)
+    cal = exp.readout.current
+    assert cal.method == "psf"
+    assert cal.metadata.get("threshold_method") == "bimodal"
+    assert np.all(np.isfinite(cal.thresholds))
+    exp.devices.trap_array.set_occupancy([0, 1, 2, 5, 9])
+    image = exp.devices.camera.acquire(1, force_all_sites=False)[-1]
+    assert cal.detect(image).occupied_indices == [0, 1, 2, 5, 9]
+
+
+def test_psf_calibration_serialization_round_trip(tmp_path):
+    exp = na.connect("virtual", loss_rate=0.001, seed=5)
+    exp.readout.sitemap(method="psf", frames=4, display=False)
+    exp.readout.thresholds(method="bimodal", frames=80, display=False)
+    cal = exp.readout.current
+    for suffix in (".json", ".npz"):
+        path = tmp_path / f"cal{suffix}"
+        cal.save(path)
+        loaded = na.TrapCalibration.load(path)
+        assert loaded.method == "psf"
+        assert np.allclose(loaded.psf_weights, cal.psf_weights)
+        assert np.array_equal(loaded.psf_boxes, cal.psf_boxes)
+        assert np.allclose(loaded.thresholds, cal.thresholds)
+
+
+def test_box_otsu_readout_is_still_the_default():
+    exp = na.connect("virtual", seed=2)
+    sitemap = exp.readout.sitemap(frames=4, display=False)
+    assert sitemap.calibration.method == "box"
+    assert sitemap.calibration.psf_weights is None
+    exp.readout.thresholds(frames=60, display=False)
+    assert exp.readout.current.metadata.get("threshold_method") == "otsu"

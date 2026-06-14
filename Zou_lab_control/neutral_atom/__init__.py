@@ -20,7 +20,9 @@ from .core.analysis import (
     roi_counts,
     sort_centers_grid,
 )
+from .core.bimodal import BimodalFit, fit_bimodal, fit_bimodal_per_site, gaussian_fidelity
 from .core.calibration import TrapCalibration
+from .core.psf import SitePSF, fit_site_psfs, psf_signals
 from .devices import DEFAULT_DCAM_MODULE, QCMOSCamera, QCMOSConfig
 from .devices import (
     BaseDevice,
@@ -138,6 +140,7 @@ except Exception:  # pragma: no cover - notes import should not block experiment
 __all__ = [
     "AtomDetection",
     "BaseDevice",
+    "BimodalFit",
     "CaptureResult",
     "CameraDevice",
     "CommandSequencerBackend",
@@ -171,6 +174,7 @@ __all__ = [
     "RuntimeSequencer",
     "SequencerDevice",
     "SequencerService",
+    "SitePSF",
     "SitemapResult",
     "ThresholdResult",
     "TimingSubsystem",
@@ -206,6 +210,10 @@ __all__ = [
     "exposure_from_sequence",
     "find_site_centers",
     "finite_frame_sequence",
+    "fit_bimodal",
+    "fit_bimodal_per_site",
+    "fit_site_psfs",
+    "gaussian_fidelity",
     "generate_verilog",
     "hardware_channel_names",
     "image_to_points",
@@ -223,6 +231,7 @@ __all__ = [
     "plot_site_values",
     "plot_threshold_hist",
     "positive_time_step_ns",
+    "psf_signals",
     "quantized_time_ns",
     "quantized_time_steps",
     "roi_counts",

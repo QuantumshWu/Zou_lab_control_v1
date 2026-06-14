@@ -49,9 +49,16 @@ class ReadoutSubsystem(ExperimentSubsystem):
         ordering: str = "row-major",
         roi_radius: int | None = None,
         reducer: str = "mean",
+        method: str = "box",
+        psf_half_width: int = 3,
         display: bool = True,
     ) -> SitemapResult:
-        """Calibrate site centers from freshly acquired all-sites frames."""
+        """Calibrate site centers from freshly acquired all-sites frames.
+
+        ``method='psf'`` additionally fits a per-site PSF weight from the
+        all-sites average, so subsequent thresholds/detection use matched-filter
+        (Rb87) readout instead of the square-ROI box reducer.
+        """
 
         s = self._session
         grid_shape = s._grid_shape(grid_shape)
@@ -62,7 +69,8 @@ class ReadoutSubsystem(ExperimentSubsystem):
             positive_int(frames, "frames"), sequence=sequence, sequencer=getattr(s.devices, "sequencer", None)
         )
         result = calibrate_sitemap_from_images(
-            images, grid_shape=grid_shape, ordering=ordering, roi_radius=roi_radius, reducer=reducer, display=display
+            images, grid_shape=grid_shape, ordering=ordering, roi_radius=roi_radius, reducer=reducer,
+            method=method, psf_half_width=psf_half_width, display=display,
         )
         s._calibration = result.calibration
         s.history.append(result)
@@ -75,8 +83,12 @@ class ReadoutSubsystem(ExperimentSubsystem):
         s.history.append(result)
         return result
 
-    def thresholds(self, *, frames: int = 100, site: int = 0, exposure: float | None = None, display: bool = True) -> ThresholdResult:
-        """Calibrate per-site thresholds from freshly acquired frames."""
+    def thresholds(self, *, frames: int = 100, site: int = 0, exposure: float | None = None, method: str = "otsu", display: bool = True) -> ThresholdResult:
+        """Calibrate per-site thresholds from freshly acquired frames.
+
+        ``method='bimodal'`` fits dark/bright Gaussian cores per site (Rb87);
+        ``'otsu'`` (default) is the single-split threshold.
+        """
 
         s = self._session
         calibration = s.require_calibration(require_thresholds=False)
@@ -84,7 +96,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
         images = s.devices.camera.acquire(
             positive_int(frames, "frames"), sequence=sequence, sequencer=getattr(s.devices, "sequencer", None)
         )
-        result = calibrate_threshold_from_images(images, calibration, site=site, display=display)
+        result = calibrate_threshold_from_images(images, calibration, site=site, method=method, display=display)
         s._calibration = result.calibration
         s.history.append(result)
         return result
