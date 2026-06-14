@@ -3,6 +3,8 @@
 
 这个 notebook 展示第一版轻量中性原子实验线路：连接 device，配置 pulse sequence，拍 camera 图，校准 sitemap，校准 threshold，探测 occupancy，最后得到 detection time 和 fidelity 曲线。
 
+> **虚拟 == 实机（核心准则）。** 下面**每一步都是真机上要跑的完整流程**：从相机图像**提取**每个 site 的位置、从数据**拟合** PSF、从计数分布**学习**每个 site 的阈值、从 reference 帧**推**保真度。**唯一虚拟的是相机数据**——它由一个实现了和真机相机相同 `CameraDevice` 契约的 `VirtualCamera` fake 出来。换到真机时**只改第一格的 `na.connect("virtual", ...)` → `na.connect("qcmos", ...)`**(连一个 JSON 设备图),下面的分析代码一行都不用动。所以在虚拟上跑通 = 在真机上跑通。
+
 第一格直接把 `..` 加入 `sys.path` / `PYTHONPATH`，然后导入 `Zou_lab_control.frontend`，不需要先安装本仓库。
 
 <!-- cell:code -->
@@ -84,21 +86,24 @@ capture = exp.camera.capture(display=True)
 capture.summary()
 
 <!-- cell:markdown -->
-## Calibrate sitemap
+## Calibrate sitemap（从图像**提取**每个 site 的位置）
 
-`sitemap` 只回答“每个 trap site 在 camera 上在哪里”。输出包含 `centers`、`calibration`、`average_image` 和 frontend plot handle。
+`sitemap` 回答“每个 trap site 在 camera 上在哪里”。这就是实机第一步:**它没有任何 site 坐标的先验**——它拍一组全亮模板帧,在平均图上用 `core.analysis.find_site_centers`(高斯平滑 + 找局部极大 + 按 trap 网格排序)**从图像里检测**出中心。换真机时这一格不变:真机相机拍的全亮帧(满载模板)走的是同一段检测代码。输出含 `centers`、`calibration`、`average_image` 和 plot handle。
 
 <!-- cell:code -->
 sitemap = exp.readout.sitemap(frames=12, display=True)
+# centers 是从图像检测出来的(不是设备给的);打印头几个确认它确实定位到了亮斑:
+print("detected centers (from the image):", sitemap.calibration.centers[:3].round(1).tolist(), "...")
 sitemap.summary()
 
 <!-- cell:markdown -->
-## Calibrate thresholds
+## Calibrate thresholds（从计数分布**学习**阈值）
 
-这个步骤依赖 sitemap。histogram 里的 threshold 线可拖动；右上角显示当前 threshold、左右比例、双峰 Gaussian fidelity 和模型交点 `fit cut`。
+这个步骤依赖 sitemap。它拍一批随机装载帧,用标定的方式逐 site 提取计数,然后**从这堆实验计数的分布里**定阈值(Otsu / 双高斯)——阈值不是手填的常数,而是从数据学出来的,真机同样如此。histogram 里的 threshold 线可拖动;右上角显示当前 threshold、左右比例、双峰 Gaussian fidelity 和模型交点 `fit cut`。
 
 <!-- cell:code -->
 threshold = exp.readout.thresholds(frames=80, site=0, display=True)
+print("thresholds learned from the count distribution:", threshold.calibration.thresholds[:3].round(1).tolist(), "...")
 threshold.summary()
 
 <!-- cell:code -->
@@ -137,14 +142,14 @@ standalone_shot = na.detect_image(capture.image, standalone_threshold.calibratio
 standalone_shot.occupied.shape
 
 <!-- cell:markdown -->
-## Advanced readout: PSF + bimodal (Rb87)
+## Rb87 读出：PSF 匹配滤波 + 双高斯（完整实机流程）
 
-方框计数 + Otsu 是默认读出。光子数少或弱信号下（位点密集、PSF 边缘交叠时尤甚），可换成 Rb87 的匹配滤波读出，二者都接在同一套 `TrapCalibration.detect` 契约后面，box/otsu 仍是默认：
+这一节就是 **Rb87 的真实读出流程**:位点密集、PSF 边缘交叠、光子数少时,方框计数会糊在一起,换成匹配滤波读出。整条链路全部**从实验数据来**(真机一模一样,只有相机是虚拟的):
 
-- `method="psf"`：从全亮模板给每个位点拟合归一化 PSF 权重，逐发提取改成 PSF 加权点积（匹配滤波，已知形状 + 加性噪声下信噪比最优）。标定多带 `psf_weights`，`save`/`load` 原样往返。
-- `method="bimodal"`：拟合暗/亮双高斯峰核，阈值放在两高斯总错判率最小处，并给出模型保真度。
+1. **从全亮模板图像提取 PSF**(`method="psf"`):`core.psf.fit_site_psfs` 对每个检测到的 site 裁框、扣环形背景、拟合 2D 高斯,得到**逐站点归一化 PSF 权重**;逐发提取改成 PSF 加权点积(已知形状 + 加性噪声下信噪比最优)。权重是**拟合出来的**,不是预设的——下面 `psf_cal.psf_weights.shape` 就是它。
+2. **从计数分布定阈值**(`method="bimodal"`):拟合暗/亮双高斯峰核,阈值放在两高斯总错判率最小处,并给出模型保真度。
 
-下面用 standalone 路径演示，不改动上面 session 的 box 标定。
+二者都接在同一套 `TrapCalibration.detect` 契约后面(box/otsu 仍是默认)。下面用 standalone 路径演示,不改动上面 session 的 box 标定。`psf_template_images` 这里由 `exp.camera.acquire(...)` 拿到(虚拟相机产帧);真机上同一行换成真相机即可,`calibrate_sitemap_from_images`/`calibrate_threshold_from_images` 一字不改。
 
 <!-- cell:code -->
 psf_template_images = exp.camera.acquire(

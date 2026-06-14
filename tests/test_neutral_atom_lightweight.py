@@ -6911,33 +6911,35 @@ def test_signal_hub_publish_latest_history_and_versioning():
 
 
 def test_virtual_loading_feed_publishes_standard_signals():
-    """VirtualLoadingFeed self-calibrates and publishes the console signal set;
-    the running loading rate lands near the configured probability."""
+    """The atom-loading feed self-calibrates through the CameraDevice contract and
+    publishes the console signal set; the running loading rate lands near the
+    configured probability.  ``virtual_loading_feed`` only swaps in a virtual
+    camera -- the LoadingFeed it builds is the same one real hardware uses."""
 
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
-    from Zou_lab_control.neutral_atom.operations.feeds import VirtualLoadingFeed
+    from Zou_lab_control.neutral_atom.devices.virtual import virtual_loading_feed
 
     hub = SignalHub()
-    feed = VirtualLoadingFeed(hub, seed=5, loading_probability=0.55, ema=0.2)
+    feed = virtual_loading_feed(hub, seed=5, loading_probability=0.55, ema=0.2)
     for _ in range(60):
         feed.step()
     assert set(hub.names()) == {"frame", "counts", "occupied", "rate", "rate_sites", "rate_grid",
                                 "centers", "thresholds", "shot"}
     assert hub.latest("frame").shape == (96, 128)
-    assert hub.latest("centers").shape == (feed.trap.n_sites, 2)   # the site-map panel's anchor
-    assert hub.latest("thresholds").shape == (feed.trap.n_sites,)
-    assert hub.latest("counts").shape == (feed.trap.n_sites,)
-    assert hub.latest("rate_grid").shape == feed.trap.grid_shape
+    assert hub.latest("centers").shape == (feed.n_sites, 2)   # the site-map panel's anchor
+    assert hub.latest("thresholds").shape == (feed.n_sites,)
+    assert hub.latest("counts").shape == (feed.n_sites,)
+    assert hub.latest("rate_grid").shape == feed.grid_shape
     assert 0.0 <= hub.latest("rate") <= 1.0
     # the long-run occupancy mean tracks loading_probability (loose: lifetime losses)
     occupancy = hub.history("occupied", 60)
     assert 0.30 <= float(occupancy.mean()) <= 0.80
     # a prefixed second feed coexists in the same hub for A-B expressions
-    feed_b = VirtualLoadingFeed(hub, prefix="b_", seed=6, loading_probability=0.3, ema=0.2)
+    feed_b = virtual_loading_feed(hub, prefix="b_", seed=6, loading_probability=0.3, ema=0.2)
     for _ in range(10):
         feed_b.step()
     diff = hub.latest("rate_grid") - hub.latest("b_rate_grid")
-    assert diff.shape == feed.trap.grid_shape
+    assert diff.shape == feed.grid_shape
 
 
 class _FakeVivadoProc:

@@ -247,6 +247,49 @@ class VirtualSequencer(SequencerDevice):
         pass
 
 
+def virtual_loading_feed(
+    hub,
+    *,
+    prefix: str = "",
+    grid_shape: tuple[int, int] = (5, 7),
+    loading_probability: float = 0.55,
+    exposure: float = 0.02,
+    roi_radius: int = 1,
+    ema: float = 0.05,
+    seed: int | None = None,
+    calibration_frames: int = 4,
+    threshold_frames: int = 24,
+    trap_array: "VirtualTrapArray | None" = None,
+):
+    """Build a :class:`~..operations.feeds.LoadingFeed` driven by a virtual camera.
+
+    This is the ONLY virtual-specific glue for the task-console producer: it wires
+    a ``VirtualTrapArray`` behind a ``VirtualCamera`` and hands that camera to the
+    backend-agnostic ``LoadingFeed``.  The feed itself is identical on real
+    hardware -- there you build ``LoadingFeed(hub, exp.camera,
+    sequencer=exp.devices.sequencer, grid_shape=...)`` instead.  Faking lives only
+    here, at the data source; the feed's analysis path does not change.
+    """
+
+    from ..operations.feeds import LoadingFeed  # lazy: keep devices->operations off the import graph
+
+    trap = trap_array if trap_array is not None else VirtualTrapArray(
+        grid_shape=tuple(grid_shape), loading_probability=float(loading_probability), seed=seed
+    )
+    camera = VirtualCamera(trap, exposure=float(exposure))
+    return LoadingFeed(
+        hub,
+        camera,
+        prefix=prefix,
+        grid_shape=trap.grid_shape,
+        exposure=float(exposure),
+        roi_radius=roi_radius,
+        ema=ema,
+        calibration_frames=calibration_frames,
+        threshold_frames=threshold_frames,
+    )
+
+
 def virtual_config() -> dict[str, object]:
     return {
         "trap_array": {"type": "VirtualTrapArray"},
@@ -307,4 +350,5 @@ __all__ = [
     "VirtualSequencer",
     "VirtualTrapArray",
     "virtual_config",
+    "virtual_loading_feed",
 ]

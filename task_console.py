@@ -42,17 +42,17 @@ def main(argv: list[str] | None = None) -> int:
     from Zou_lab_control.frontend.task_console import (
         TaskConsoleState, default_console_state, resolve_task_state, show_task_console)
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
-    from Zou_lab_control.neutral_atom.operations.feeds import VirtualLoadingFeed
+    from Zou_lab_control.neutral_atom.devices.virtual import virtual_loading_feed
 
     app = ensure_qt_app()
     hub = SignalHub()
     feeds = []
     if not args.no_feed:
         print("Starting virtual atom-loading feed (calibrating site map + thresholds)...")
-        feeds.append(VirtualLoadingFeed(hub, seed=args.seed))
+        feeds.append(virtual_loading_feed(hub, seed=args.seed))
         if not args.single:
             seed_b = None if args.seed is None else args.seed + 11
-            feeds.append(VirtualLoadingFeed(hub, prefix="b_", seed=seed_b, loading_probability=0.35))
+            feeds.append(virtual_loading_feed(hub, prefix="b_", seed=seed_b, loading_probability=0.35))
         for feed in feeds:
             feed.start(rate_hz=args.rate)
 

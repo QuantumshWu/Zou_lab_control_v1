@@ -30,6 +30,15 @@
   - 上层依赖**抽象契约**而非具体类:`devices/base.py` 的 `CameraDevice`/`SequencerDevice`/`TrapArrayDevice` 让 readout/timing 不绑死具体硬件(虚拟/真机/远程三后端共享同一 session)。
   - 跨模块调用走**文档化的接口**,不伸手进别的模块内部:Task 控制台三层只经 `SignalHub` 耦合(采集/feed/GUI 互不直接引用);frontend 对外只暴露密封接口(见下条)。
   - 新代码沿用这条:加功能先想"它通过哪个接口接入",而不是直接 import 别人的内部实现。
+- **复用优先:同一件事只实现一次,到处复用**(解耦的另一面,直接关系到正确性——重复实现必然漂移出 bug)。
+  - 加任何功能,先找"已有哪个原语/层能复用",别重造:frontend 可复用层(`BaseLivePlot`/selectors/`data_figure`/`style.py` 设计 token——见 `frontend/AGENTS.md` 规则7)、`core/` 纯算法 + `operations/` 标准array函数(box/otsu/psf/bimodal/fidelity 各只一份)、`SignalHub`、单一配置源。
+  - 同一算法/常量/样式出现第二处 = 提成共享函数/令牌,不复制粘贴。提取后用等价证明(像素 diff / 数值一致)确认无行为漂移。
+  - 共享件要可复用就得**解耦**:它只依赖抽象契约、不反向依赖调用方;这样"加新 plot / 新设备 / 新面板"都是复用既有层,而不是另起炉灶。
+- **虚拟(假数据)测试必须走与实机完全相同的代码路径——只有最底层数据源是假的。** 这是"为真机做准备"的全部意义:换真机时只改 `na.connect("virtual", ...)` → `na.connect("qcmos", ...)`,其余每一格 notebook、每一行分析代码不动就能跑对。
+  - 分析/编排层(`core/`、`operations/`、`subsystems/`)**只依赖设备抽象契约**(`devices/base.py`),**绝不 import 具体后端**(`devices/virtual.py`、`qcmos.py`),**绝不读仿真真值**(`occupancy`、已知站点中心 `_site_centers`、`render_image` 等):站点中心从图像**检测**(`find_site_centers`),PSF 从数据**拟合**(`fit_site_psfs`),阈值从数据分布**学习**(bimodal/otsu),保真度从 reference 帧**严格共识**推——全是真机要跑的同一函数。
+  - 虚拟后端只 fake **数据源**(相机帧),并实现与真机**相同的 `CameraDevice` 契约**,是 drop-in 替换;假只能假在"帧怎么来",不能假在"帧怎么被分析"。
+  - tutorial 必须把这条流程**显式**走出来(让读者看到"从图像提取站点 / 从数据拟合 PSF / 从数据分布定阈值 / 从 reference 推保真度"),而不是黑盒一行带过;并写明"唯一虚拟之处是相机数据,换真机只改 connect"。
+  - 由 `tests/test_virtual_equals_real_contract.py` 强制(分析层一旦 import 具体后端或读仿真真值即挂测)。配套总纲见下条「能机械强制的准则必须写成测试」。
 - **单一真相源**:同一事实只有一个权威定义处。例:板级/容量配置只在 `fpga/board_config/streamer_config.json`;前端排版只有一套 300dpi 体系;memory 对原则只放指针,权威定义在仓库 AGENTS。
 - **能机械强制的设计准则,必须写成测试,不能只留在文档里**(架构契约测试 / fitness function)。只写在 `.md` 里的准则会被(包括我自己,尤其长会话里局部模式匹配时)悄悄违背且无人报错——这正是整理这些 `.md` 却仍被违背的根因。所以:每立一条"所有 X 都必须 Y"的结构性准则(例:**所有 plot 都必须继承 `BaseLivePlot`** 才能复用 selectors/data_figure),就同时写一个会在违背时**失败**的测试(例:`tests/test_frontend_plot_contract.py`),并在准则旁注明强制它的测试。文档讲"为什么",测试保证"不退化"。
 - **借鉴参考实现:取原则,不照搬具体设计**。`references/` 里的实现(confocal GUI、rb87 readout 等)是灵感来源,要遵守的是上面这些**设计原则**,不是它们的具体形态/代码结构;有更干净的思路就用自己的,别为"照着参考写"而牺牲解耦或引入残留。

@@ -179,14 +179,14 @@ def demo_console(*, scale: float = 1.0, size=(1480, 980), seed: int = 11, shots:
     from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
     from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
-    from Zou_lab_control.neutral_atom.operations.feeds import VirtualLoadingFeed
+    from Zou_lab_control.neutral_atom.devices.virtual import virtual_loading_feed
 
     ensure_qt_app()
     install_screenshot_font()  # before building so build-time text metrics match the render font
     hub = SignalHub()
-    feeds = [VirtualLoadingFeed(hub, seed=seed)]
+    feeds = [virtual_loading_feed(hub, seed=seed)]
     if dual:
-        feeds.append(VirtualLoadingFeed(hub, prefix="b_", seed=seed + 11, loading_probability=0.35))
+        feeds.append(virtual_loading_feed(hub, prefix="b_", seed=seed + 11, loading_probability=0.35))
     for _ in range(max(1, int(shots))):
         for feed in feeds:
             feed.step()

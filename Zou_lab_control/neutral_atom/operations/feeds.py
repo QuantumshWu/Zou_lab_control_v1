@@ -1,11 +1,20 @@
 """Experiment feeds: loops that publish per-shot signals into a SignalHub.
 
 A feed is the producer half of the task-console contract (the console is the
-consumer).  ``VirtualLoadingFeed`` is the self-contained virtual source used to
-develop and test console layouts without hardware: it owns a ``VirtualTrapArray``,
-self-calibrates (site centers from all-sites frames, per-site Otsu thresholds from
-sample frames -- the same core/analysis primitives the real pipeline uses), then
-publishes one atom-loading shot per ``step()``.
+consumer).  :class:`LoadingFeed` is the standard atom-loading producer: it pulls
+frames through the :class:`CameraDevice` CONTRACT, self-calibrates with the SAME
+``core``/``operations`` primitives the real readout uses (site centers from
+all-sites frames, per-site Otsu thresholds from sample frames), then publishes
+one atom-loading shot per ``step()``.
+
+Because it only ever touches the camera CONTRACT (``camera.acquire(...)``) and the
+backend-neutral ``imaging_sequence`` helper, the feed is backend-agnostic: pass
+``exp.camera`` (+ ``exp.devices.sequencer``) for real hardware, or a
+``VirtualCamera`` for offline development -- it is the SAME feed, only the data
+source changes.  That is the "virtual == real" core principle (AGENTS.md §2): the
+console/feed validated on virtual data runs verbatim on the real machine.  For
+the offline convenience wrapper that builds a ``VirtualCamera`` see
+``neutral_atom.devices.virtual.virtual_loading_feed``.
 
 Feeds run either synchronously (call ``step()`` yourself: deterministic tests) or
 in a background thread (``start(rate_hz)``); the hub is the only shared state.
@@ -18,9 +27,10 @@ import time
 
 import numpy as np
 
-from ..core.analysis import estimate_thresholds, find_site_centers, roi_counts
+from ..core.analysis import estimate_thresholds, find_site_centers, grid_shape_tuple, positive_int, roi_counts
 from ..core.signals import SignalHub
-from ..devices.virtual import VirtualTrapArray
+from ..devices.base import CameraDevice
+from ..timing import imaging_sequence
 
 
 class ExperimentFeed:
@@ -84,8 +94,14 @@ class ExperimentFeed:
         return self._thread is not None and self._thread.is_alive()
 
 
-class VirtualLoadingFeed(ExperimentFeed):
-    """Virtual atom-loading experiment publishing the standard console signals.
+class LoadingFeed(ExperimentFeed):
+    """Atom-loading experiment producer over the :class:`CameraDevice` contract.
+
+    Backend-agnostic: identical with a real camera or a ``VirtualCamera`` -- only
+    the ``camera`` you pass differs.  It self-calibrates exactly as the real
+    readout does (site centers detected from an all-sites template via
+    ``find_site_centers``; per-site Otsu thresholds learned from sample frames via
+    ``estimate_thresholds``), then images one loading shot per ``shot()``.
 
     Published per shot (all behind ``prefix``):
 
@@ -103,49 +119,46 @@ class VirtualLoadingFeed(ExperimentFeed):
     def __init__(
         self,
         hub: SignalHub,
+        camera: CameraDevice,
         *,
+        sequencer: object | None = None,
         prefix: str = "",
         grid_shape: tuple[int, int] = (5, 7),
-        loading_probability: float = 0.55,
         exposure: float = 0.02,
         roi_radius: int = 1,
         ema: float = 0.05,
-        seed: int | None = None,
         calibration_frames: int = 4,
         threshold_frames: int = 24,
-        trap_array: VirtualTrapArray | None = None,
     ):
         super().__init__(hub, prefix=prefix)
+        self.camera = camera
+        self.sequencer = sequencer
+        self.grid_shape = grid_shape_tuple(grid_shape)
         self.exposure = float(exposure)
         self.roi_radius = int(roi_radius)
         self.ema = float(ema)
-        self.trap = trap_array if trap_array is not None else VirtualTrapArray(
-            grid_shape=tuple(grid_shape),
-            loading_probability=float(loading_probability),
-            seed=seed,
-        )
-        # --- self-calibration with the SAME primitives as the real pipeline ---
-        # site centers: average a few all-sites frames (every trap rendered occupied)
-        self.trap.reload()
-        all_sites = np.mean(
-            [self.trap.render_image(exposure=self.exposure, all_sites=True).astype(float)
-             for _ in range(max(1, int(calibration_frames)))],
-            axis=0,
-        )
-        self.centers = find_site_centers(all_sites, self.trap.grid_shape)
-        # per-site thresholds: Otsu over sample frames with fresh random loading
-        samples = []
-        for _ in range(max(2, int(threshold_frames))):
-            self.trap.reload()
-            samples.append(self.trap.render_image(exposure=self.exposure).astype(float))
-        self.thresholds = estimate_thresholds(samples, self.centers, radius=self.roi_radius)
-        self._rate_sites = np.full(self.trap.n_sites, np.nan)
+        # Two backend-neutral sequences, built ONCE: an all-sites template (the
+        # virtual camera renders every trap occupied for ``name="sitemap"``; real
+        # hardware runs its deterministic-fill template) and a per-shot readout
+        # with fresh loading (``load=True`` -> the camera reloads each frame).
+        self._sitemap_seq = imaging_sequence(exposure=self.exposure, load=True, name="sitemap")
+        self._readout_seq = imaging_sequence(exposure=self.exposure, load=True, name="readout")
+        # --- self-calibration through the contract, SAME primitives as the real readout ---
+        template = self._acquire(max(1, int(calibration_frames)), self._sitemap_seq)
+        average = np.mean([np.asarray(img, dtype=float) for img in template], axis=0)
+        self.centers = find_site_centers(average, self.grid_shape)
+        self.n_sites = len(self.centers)
+        samples = [np.asarray(img, dtype=float) for img in self._acquire(max(2, int(threshold_frames)), self._readout_seq)]
+        self.thresholds = np.asarray(estimate_thresholds(samples, self.centers, radius=self.roi_radius), dtype=float)
+        self._rate_sites = np.full(self.n_sites, np.nan)
         self._rate = float("nan")
 
+    def _acquire(self, frames: int, sequence) -> list[np.ndarray]:
+        return self.camera.acquire(positive_int(frames, "frames"), sequence=sequence, sequencer=self.sequencer)
+
     def shot(self) -> dict[str, object]:
-        self.trap.reload()
-        frame = self.trap.render_image(exposure=self.exposure)
-        counts = roi_counts(frame.astype(float), self.centers, radius=self.roi_radius)
+        frame = self._acquire(1, self._readout_seq)[-1]
+        counts = roi_counts(np.asarray(frame, dtype=float), self.centers, radius=self.roi_radius)
         occupied = (counts > self.thresholds).astype(float)
         # EMA running rates (first shot seeds the average)
         if np.isnan(self._rate):
@@ -160,11 +173,11 @@ class VirtualLoadingFeed(ExperimentFeed):
             "occupied": occupied,
             "rate": self._rate,
             "rate_sites": self._rate_sites.copy(),
-            "rate_grid": self._rate_sites.reshape(self.trap.grid_shape).copy(),
+            "rate_grid": self._rate_sites.reshape(self.grid_shape).copy(),
             "centers": np.asarray(self.centers, dtype=float).copy(),
             "thresholds": np.asarray(self.thresholds, dtype=float).reshape(-1).copy(),
             "shot": float(self.shots + 1),
         }
 
 
-__all__ = ["ExperimentFeed", "VirtualLoadingFeed"]
+__all__ = ["ExperimentFeed", "LoadingFeed"]
