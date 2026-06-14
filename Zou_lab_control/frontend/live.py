@@ -1867,16 +1867,25 @@ class HistogramCell(GridCell):
             line = ax.axvline(float(self.thresholds[k]), **threshold_line_kwargs(1.4 if not detail else 1.9))
         ax.set_xlim(self.x_lo, self.x_hi)
         top = ax.get_ylim()[1]
-        ax.set_ylim(0, top * 1.45 if top > 0 else 1.0)   # headroom so the tag clears the bars
-        ax.text(0.06, 0.95, self._tag_text(k), transform=ax.transAxes, ha="left", va="top",
-                fontsize=small_fontsize(), color=PALETTE["annotation"], linespacing=0.92)
-        ax.tick_params(labelsize=tick_fontsize(), length=2)
-        ax.set_yticklabels([])               # counts scale varies per cell; shape is the point
-        if detail:                            # enlarged focus view: full decoration
+        if detail:
+            # Enlarged single-cell view: a PROPER standalone plot -- show the counts
+            # axis, both axis labels, and ONE title naming the site (no tiny corner
+            # tag, no doubled labels; the grid's outer labels are hidden in focus).
+            ax.set_ylim(0, top * 1.18 if top > 0 else 1.0)
+            fid = self.site_fidelities
+            ftxt = "" if (fid is None or not np.isfinite(fid[k])) else f"   F={fid[k] * 100:.1f}%"
             ax.set_xlabel(self.labels[0], fontsize=axis_label_fontsize())
-            apply_title(ax, f"site {k}")
+            ax.set_ylabel(self.labels[1] if len(self.labels) > 1 else "Shots", fontsize=axis_label_fontsize())
+            ax.tick_params(labelsize=axis_label_fontsize(), length=2.5)
+            apply_title(ax, f"site {k}{ftxt}")
         else:
-            self.threshold_lines[k] = line    # grid line, kept for per-cell drag
+            # Grid cell (unchanged, byte-identical): corner tag, hidden counts axis.
+            ax.set_ylim(0, top * 1.45 if top > 0 else 1.0)   # headroom so the tag clears the bars
+            ax.text(0.06, 0.95, self._tag_text(k), transform=ax.transAxes, ha="left", va="top",
+                    fontsize=small_fontsize(), color=PALETTE["annotation"], linespacing=0.92)
+            ax.tick_params(labelsize=tick_fontsize(), length=2)
+            ax.set_yticklabels([])               # counts scale varies per cell; shape is the point
+            self.threshold_lines[k] = line       # grid line, kept for per-cell drag
         return line
 
     def threshold_line(self, k: int):
@@ -2035,15 +2044,19 @@ class GridPlot(BaseLivePlot):
     def focus(self, k: int) -> None:
         """Enlarge cell ``k`` to fill the figure (see detail); call again or
         :meth:`unfocus` to return to the grid."""
-        from matplotlib.transforms import Bbox
-
         if self._focused is not None:
             self.unfocus()
         k = int(k)
-        rect = Bbox.union([ax.get_position() for ax in self.site_axes])
         for ax in self.axes:
             ax.set_visible(False)
-        self.focus_ax = self.fig.add_axes([rect.x0, rect.y0, rect.width, rect.height])
+        # Hide the grid's OUTER labels/title while focused, so the enlarged cell's
+        # own xlabel/ylabel/title do not collide / double up with them.
+        self._hidden_texts = [t for t in self.fig.texts if t.get_visible()]
+        for t in self._hidden_texts:
+            t.set_visible(False)
+        # A clean, comfortably-margined single plot: room on the left for the counts
+        # axis + ylabel, on the bottom for the xlabel, on top for the title.
+        self.focus_ax = self.fig.add_axes([0.10, 0.13, 0.85, 0.77])
         line = self.cell_renderer.draw(self.focus_ax, k, detail=True)
         area = AreaSelector(self.focus_ax)
         cross = CrossSelector(self.focus_ax)
@@ -2069,6 +2082,9 @@ class GridPlot(BaseLivePlot):
         self._focused = None
         for ax in self.site_axes:
             ax.set_visible(True)
+        for t in getattr(self, "_hidden_texts", []):    # restore the grid's outer labels/title
+            t.set_visible(True)
+        self._hidden_texts = []
         self.fig._zlc_tools = self.tools
         self.draw()
 
