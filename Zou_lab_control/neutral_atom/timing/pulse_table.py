@@ -616,7 +616,7 @@ class PulseTableState:
                     continue
                 if value is None:
                     raise ValueError(f"analog bus {bus_name!r} period {index} {mode} mode requires a value.")
-                if _is_slot_ref(value):
+                if is_slot_ref(value):
                     continue
                 value_int = int(value)
                 if value_int < lo or value_int > hi:
@@ -911,7 +911,7 @@ class PulseTableState:
         resolved: list[dict[str, object]] = []
         for entry in plan:
             value = entry.get("value")
-            if _is_slot_ref(value):
+            if is_slot_ref(value):
                 value = int(round(float(slots.get(str(value), 0.0))))
             resolved.append({"mode": entry.get("mode", "hold"), "value": value})
         return resolved
@@ -1461,14 +1461,10 @@ def slot_ref_index(value: object) -> int | None:
     return int(match.group("index")) if match else None
 
 
-# Backwards-compatible private alias for the in-module callers.
-_is_slot_ref = is_slot_ref
-
-
 def _coerce_bus_value(value: object) -> object:
     if value is None:
         return None
-    if _is_slot_ref(value):
+    if is_slot_ref(value):
         return value.strip()
     return int(value)
 

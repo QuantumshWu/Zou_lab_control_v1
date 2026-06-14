@@ -124,11 +124,10 @@ def compile_notes_pdf(
 ) -> NotesBuildResult:
     """Compile a notes ``.tex`` file in place with XeLaTeX.
 
-    This is the legacy/debug compiler: TeX auxiliary files and a build log stay
-    beside ``tex_path`` so a failed document can be inspected.  User-facing code
-    should prefer :func:`render_tex_pdf` or ``render_notes_pdf(clean_compile=True)``
-    when it only wants ``tex -> pdf`` without temporary files in the output
-    directory.
+    This is the debug compiler: TeX auxiliary files and a build log stay beside
+    ``tex_path`` so a failed document can be inspected.  User-facing code should
+    prefer :func:`render_tex_pdf` (or :func:`render_notes_pdf`) when it only
+    wants ``tex -> pdf`` without temporary files in the output directory.
     """
     tex_path = Path(tex_path).resolve()
     build_dir = tex_path.parent
@@ -235,25 +234,6 @@ def render_tex_pdf(
             raise RuntimeError(f"xelatex completed but did not produce {built_pdf.name}.")
         shutil.copy2(built_pdf, output_pdf)
     return output_pdf
-
-
-def render_latex_pdf_clean(
-    tex: str | Path,
-    output_pdf: str | Path,
-    *,
-    runs: int = 2,
-    xelatex: str | None = None,
-    halt_on_error: bool = True,
-) -> Path:
-    """Backward-compatible alias for :func:`render_tex_pdf`."""
-
-    return render_tex_pdf(
-        tex,
-        output_pdf,
-        runs=runs,
-        xelatex=xelatex,
-        halt_on_error=halt_on_error,
-    )
 
 
 def render_notes_pdf(
@@ -380,7 +360,6 @@ __all__ = [
     "build_frontend_manual",
     "compile_notes_pdf",
     "notes_template_dir",
-    "render_latex_pdf_clean",
     "render_tex_pdf",
     "render_notes_pdf",
     "write_notes_tex",

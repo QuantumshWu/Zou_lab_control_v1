@@ -68,7 +68,7 @@ def test_frontend_2d_and_histogram():
     assert "fit cut=" in hist.stats_text.get_text()
 
 
-def test_render_latex_pdf_clean_copies_only_final_pdf(tmp_path, monkeypatch):
+def test_render_tex_pdf_copies_only_final_pdf(tmp_path, monkeypatch):
     import Zou_lab_control.frontend.notes as notes
 
     calls = []
@@ -87,7 +87,7 @@ def test_render_latex_pdf_clean_copies_only_final_pdf(tmp_path, monkeypatch):
     monkeypatch.setattr(notes.subprocess, "run", fake_run)
     out = tmp_path / "manual.pdf"
 
-    pdf = zf.render_latex_pdf_clean(
+    pdf = zf.render_tex_pdf(
         r"\documentclass{article}\begin{document}hello\end{document}",
         out,
         xelatex="fake-xelatex",

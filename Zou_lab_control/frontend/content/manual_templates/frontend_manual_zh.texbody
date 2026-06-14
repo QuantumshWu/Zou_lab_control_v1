@@ -1124,7 +1124,7 @@ zf.render_tex_pdf(r"\documentclass{article}\begin{document}你好\end{document}"
 zf.render_tex_pdf("notes/manual.tex", "notes/manual.pdf")
 \end{codeblock}
 
-\textbf{\pyapi{zf.render_notes_pdf(output_dir, *, filename, title, ..., body, compile_pdf=True, ...) -> NotesBuildResult}（整本手册）}：在内存里拼装标题页+目录+正文，再经 \pyapi{render_tex_pdf} 在临时目录编译，\tfocus{output\_dir 里只留 .pdf}（外加它引用的 \pyapi{assets/}）。本手册自身就是用这条路径生成的（见 \filepath{frontend/notes.py} 的 \pyapi{build_frontend_manual}）。\pyapi{render_latex_pdf_clean} 是 \pyapi{render_tex_pdf} 的向后兼容别名；\pyapi{write_notes_tex}/\pyapi{compile_notes_pdf} 是\tfocus{遗留/调试}用的就地写盘助手，不在默认构建路径上。
+\textbf{\pyapi{zf.render_notes_pdf(output_dir, *, filename, title, ..., body, compile_pdf=True, ...) -> NotesBuildResult}（整本手册）}：在内存里拼装标题页+目录+正文，再经 \pyapi{render_tex_pdf} 在临时目录编译，\tfocus{output\_dir 里只留 .pdf}（外加它引用的 \pyapi{assets/}）。本手册自身就是用这条路径生成的（见 \filepath{frontend/notes.py} 的 \pyapi{build_frontend_manual}）。\pyapi{write_notes_tex}/\pyapi{compile_notes_pdf} 是\tfocus{调试}用的就地写盘助手，不在默认构建路径上。
 
 \section{一页速查（“我想做 X -> 调用 Y”）}
 \begin{center}
@@ -1200,7 +1200,7 @@ render_tex_pdf("docs/main_manual/main_manual_zh.tex",
 输入是 \filepath{.tex} 文件时，同目录的资产（如 \filepath{assets/foo.pdf}）会被拷进临时构建树，但同名的旧输出（\filepath{.pdf}/\filepath{.aux}/\filepath{.log}/\filepath{.build.log}）不会被拷。构建失败时只在输出 PDF 旁留一个 \filepath{.build.log} 供诊断（包括 XeLaTeX 缺失或路径错误的情况）。
 
 \section{notes 风格的整本手册}
-\pyapi{render_notes_pdf(..., clean_compile=True)} 用同一个干净编译器，自动套用本仓库的标题页与目录样式。\pyapi{render_latex_pdf_clean(...)} 是兼容别名。本手册自身就是用这条路径生成的（见 \filepath{Zou_lab_control/frontend/notes.py} 里的 \pyapi{build_frontend_manual}）。
+\pyapi{render_notes_pdf(...)} 用同一个干净编译器（默认 \pyapi{compile_pdf=True}，临时目录编译、只产 PDF），自动套用本仓库的标题页与目录样式。本手册自身就是用这条路径生成的（见 \filepath{Zou_lab_control/frontend/notes.py} 里的 \pyapi{build_frontend_manual}）。
 
 \chapter{修改指南}
 

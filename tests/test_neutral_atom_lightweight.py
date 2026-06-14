@@ -6045,11 +6045,10 @@ def test_slot_ref_helpers_are_the_single_parser():
     """The "sN" scan-slot reference parser lives once in the timing layer and is reused by
     the sequencer compiler and the GUI (no more 3 private regexes that could drift)."""
 
-    from Zou_lab_control.neutral_atom.timing.pulse_table import is_slot_ref, slot_ref_index, _is_slot_ref
+    from Zou_lab_control.neutral_atom.timing.pulse_table import is_slot_ref, slot_ref_index
 
     assert is_slot_ref("s0") and is_slot_ref(" s12 ") and not is_slot_ref("x0") and not is_slot_ref("s")
     assert slot_ref_index("s3") == 3 and slot_ref_index("sX") is None and slot_ref_index(7) is None
-    assert _is_slot_ref is is_slot_ref   # private alias kept for in-module callers
 
 
 def test_streamer_config_is_single_source_for_host_geometry():
