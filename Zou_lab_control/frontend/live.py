@@ -14,7 +14,7 @@ import numpy as np
 from scipy.optimize import curve_fit
 
 from .canvas import FigureSpec, configure_canvas, create_axes_fixed, create_axes_grid, design_dpi, display_figure, grid_shape_for, new_figure, split_axes_horizontally
-from .selectors import DragHLine, DragVLine, InteractionBundle, PlotState, ZoomPan, attach_interaction
+from .selectors import AreaSelector, CrossSelector, DragHLine, DragVLine, InteractionBundle, PlotState, ZoomPan, attach_interaction
 from Zou_lab_control._readout_math import (
     bimodal_jacobian,
     bimodal_model,
@@ -1927,17 +1927,29 @@ class SiteHistogramGrid(BaseLivePlot):
         self.fig._zlc_state = PlotState(plot_type=self.plot_type)
 
     def _attach_interactions(self) -> None:
-        # Per cell: scroll-zoom / middle-drag pan, plus a draggable threshold line
-        # where one exists.  Each handler filters on ``event.inaxes`` so it only
-        # responds to its own cell; we keep strong refs so they are not GC'd.
+        # Every cell gets the SAME selector bundle a standalone plot does -- area
+        # box-select, cross crosshair, scroll-zoom / middle-drag pan -- plus a
+        # draggable threshold line where one exists.  Each handler filters on
+        # ``event.inaxes`` so it only responds to its own cell.
         self._cell_interactions = []
         for k, ax in enumerate(self.site_axes):
+            area = AreaSelector(ax)
+            cross = CrossSelector(ax)
+            zoom = ZoomPan(ax, area_selector=area)
             line = self.threshold_lines[k] if k < len(self.threshold_lines) else None
             drag = DragVLine(line, self._make_threshold_cb(k), ax) if line is not None else None
-            self._cell_interactions.append(InteractionBundle(zoom=ZoomPan(ax), drag=drag, axdis=ax))
+            self._cell_interactions.append(InteractionBundle(area=area, cross=cross, zoom=zoom, drag=drag, axdis=ax))
         if self._cell_interactions:
             self.tools = self._cell_interactions[0]
-            self.zoom, self.drag = self.tools.zoom, self.tools.drag
+            self.area, self.cross, self.zoom, self.drag = self.tools.area, self.tools.cross, self.tools.zoom, self.tools.drag
+        # Pin the tools to the FIGURE (every other plot does this via
+        # attach_interaction).  Without it the per-cell selectors lived only on
+        # the returned object, so in a notebook they were collected while the
+        # displayed figure stayed -> "no selector".  The figure outlives the
+        # returned handle, so the whole grid stays interactive; the cleanup path
+        # (canvas._destroy_frontend_tools) also finds them via _zlc_grid_tools.
+        self.fig._zlc_tools = self.tools
+        self.fig._zlc_grid_tools = self._cell_interactions
 
     def interaction_handles(self) -> list:
         out: list = []

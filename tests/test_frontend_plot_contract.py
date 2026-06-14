@@ -95,9 +95,14 @@ def test_site_grid_exposes_per_cell_selectors_and_fitting():
     g = zf.site_histogram_grid(sites, occupied=occ, thresholds=[25.0] * 8, display=False)
     try:
         assert isinstance(g, SiteHistogramGrid) and isinstance(g, BaseLivePlot)
-        # one zoom + one threshold dragger per visible cell
-        assert sum(b.zoom is not None for b in g._cell_interactions) == 8
-        assert sum(b.drag is not None for b in g._cell_interactions) == 8
+        # the FULL selector bundle per visible cell (area + cross + zoom + drag),
+        # same as a standalone plot -- not just zoom/drag
+        for name in ("area", "cross", "zoom", "drag"):
+            assert sum(getattr(b, name) is not None for b in g._cell_interactions) == 8, name
+        # tools pinned to the FIGURE (the lifecycle fix: without this the per-cell
+        # selectors were collected in a notebook -> "no selector" / unresponsive)
+        assert getattr(g.fig, "_zlc_tools", None) is not None
+        assert len(getattr(g.fig, "_zlc_grid_tools", [])) == 8
         # per-cell DataFigure exists and fits without raising
         data = g.to_data_figure()
         assert len(data.cells) == 8

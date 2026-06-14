@@ -56,18 +56,28 @@ def _get_notebook_context() -> tuple[Optional[str], Optional[str]]:
 
 
 def _destroy_frontend_tools(fig: plt.Figure) -> None:
-    for attr in ("_zlc_tools", "_npt_tools"):
-        tools = getattr(fig, attr, None)
-        if tools is None:
-            continue
+    def _destroy_bundle(bundle) -> None:
         for name in ("area", "cross", "zoom", "drag"):
-            handler = getattr(tools, name, None)
+            handler = getattr(bundle, name, None)
             if handler is not None and hasattr(handler, "destroy"):
                 try:
                     handler.destroy()
                 except Exception:
                     pass
+
+    for attr in ("_zlc_tools", "_npt_tools"):
+        tools = getattr(fig, attr, None)
+        if tools is None:
+            continue
+        _destroy_bundle(tools)
         setattr(fig, attr, None)
+    # Multi-axes plots (the site-histogram grid) keep one selector bundle PER
+    # cell on the figure; destroy them all so a cell rerun does not leak them.
+    grid_tools = getattr(fig, "_zlc_grid_tools", None)
+    if grid_tools:
+        for bundle in grid_tools:
+            _destroy_bundle(bundle)
+        fig._zlc_grid_tools = None
 
 
 def _close_fig_num(fig_num: int) -> None:
