@@ -5,9 +5,17 @@
 
 ## 当前焦点(2026-06)
 
-把**notebook 调用侧**做完整、跑通、架构满意——然后再回头调 GUI。
-1. **notebook 实验调用链完整可用**:`na.connect(...)` → session(devices/timing/readout/operations)→ 一个干净的实验循环 → `hub.publish(...)` → Task 控制台监控。接口清晰、解耦、可测。
-2. **整合 references 的 Rb87 qCMOS 读出**(`references/source_archives/rb87_readout_v16`):把它的 4-shot group / 模板找站点 / PSF 加权提取 / 双高斯定阈值 / per-site 保真度 / 单帧预测,接进我们的 readout 子系统与信号约定(`frame`/`counts`/`occupied`/`centers`/`rate`/`thresholds`…)。映射细节见 `docs/task_console_design/` 的"扩展到真实设备"章。
+notebook 调用侧的解耦 + Rb87 读出**已落地**(见下"已完成");下一步是真机 qCMOS 接线与 GUI 回归。
+
+**已完成(2026-06)**
+1. **解耦**:`neutral_atom` 不再 import `frontend`(IoC viewer 注册表 `_viewer_registry`,双向 import 期互不拉对方;实验层可 headless 导入)。
+2. **子系统拥有逻辑**:读出编排(sitemap/thresholds/detect/detection-time)从 `session` 上帝对象搬进 `ReadoutSubsystem`,session 退成门面;签名明确不再 `**kwargs` 转发。
+3. **Rb87 读出接入**:PSF 匹配滤波提取(`core/psf.py`)+ 双高斯定阈/保真度(`core/bimodal.py`),`TrapCalibration` 加 `method='box'|'psf'` 经 `signals()`/`detect()` 单点分派(box 仍默认);`readout.sitemap(method="psf")` / `thresholds(method="bimodal")`;虚拟后端端到端可测。**只移植算法,不带 rb_qcmos 的文件IO/缓存/批处理脚手架**。
+
+**下一步(待做)**
+- 真机 qCMOS 相机后端(`devices/qcmos.py`)接 PSF/bimodal 读出,在真实数据上验证保真度;4-shot group / 参考帧定 ground-truth 标签作为可选标定流程(算法已具备,缺采集编排)。
+- 真机 feed 类(`AtomLoadingFeed`)从 `NeutralAtomSession` 采集循环 publish(骨架见设计文档)。
+- 回头调 GUI(见下"暂缓:GUI 相关")。
 
 > `references/` 是历史源码归档(`rb87_readout_v16`、confocal GUI 等),**git ignore、只在本地存在**,是借鉴/移植的来源,不是被本仓库 import 的依赖(见 README 目录树)。
 > **最小跑通入口**:`task_console.bat`(虚拟 feed 仪表盘)/ `tutorials/` 里的 notebook / `na.connect("virtual")` 起一个全虚拟 session——先在虚拟后端把调用链串通,再换真机后端。

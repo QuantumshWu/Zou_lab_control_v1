@@ -137,6 +137,36 @@ standalone_shot = na.detect_image(capture.image, standalone_threshold.calibratio
 standalone_shot.occupied.shape
 
 <!-- cell:markdown -->
+## Advanced readout: PSF + bimodal (Rb87)
+
+方框计数 + Otsu 是默认读出。光子数少或位点密集、PSF 重叠时，可换成 Rb87 的匹配滤波读出，二者都接在同一套 `TrapCalibration.detect` 契约后面，box/otsu 仍是默认：
+
+- `method="psf"`：从全亮模板给每个位点拟合归一化 PSF 权重，逐发提取改成 PSF 加权点积（匹配滤波，已知形状 + 加性噪声下信噪比最优）。标定多带 `psf_weights`，`save`/`load` 原样往返。
+- `method="bimodal"`：拟合暗/亮双高斯峰核，阈值放在两高斯总错判率最小处，并给出模型保真度。
+
+下面用 standalone 路径演示，不改动上面 session 的 box 标定。
+
+<!-- cell:code -->
+psf_template_images = exp.camera.acquire(
+    8, sequence=na.imaging_sequence(exposure=exp.camera.exposure, load=True, name="sitemap")
+)
+psf_sitemap = na.calibrate_sitemap_from_images(
+    psf_template_images,
+    grid_shape=exp.devices.trap_array.grid_shape,
+    method="psf",
+    display=False,
+)
+psf_threshold = na.calibrate_threshold_from_images(
+    exp.camera.capture(frames=120, display=False).images,
+    psf_sitemap.calibration,
+    method="bimodal",
+    display=False,
+)
+psf_cal = psf_threshold.calibration
+print("method:", psf_cal.method, "| psf weights:", psf_cal.psf_weights.shape)
+na.detect_image(exp.camera.capture(display=False).image, psf_cal, display=True).occupied.sum()
+
+<!-- cell:markdown -->
 ## Scan detection time and fidelity
 
 `detection_time` 不使用 virtual ground truth。它先拍 long-exposure reference images，然后对每个 detection time 的 ROI count distribution 做 threshold 和 Gaussian split fidelity 估计。接口默认 `live=True`；这里保留 live scan，cell 返回后 acquisition worker 和 frontend plot 会继续更新。等图跑完或想提前停止时，运行下一格 `scan.stop()`，再在后面的 cell 里做 decay fit。

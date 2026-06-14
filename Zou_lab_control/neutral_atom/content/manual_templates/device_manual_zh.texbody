@@ -1028,6 +1028,30 @@ bin 太少会让阈值"量化"得太粗（分辨不出谷底）；bin 太多则�
 
 一个好的读出，单位点保真度通常应在 0.99 以上；如果 \pyapi{res.fidelity} 偏低，往往是成像时间不够（亮峰不够亮）或背景太高（暗峰漂移）。
 
+\section{进阶读出：PSF 加权提取 + 双高斯阈值（Rb87）}
+
+方框计数 + Otsu 是\tfocus{默认}方法，简单稳健。但在低光子数（成像时间短）或位点密集、点扩散函数（PSF）有重叠时，方框把信号像素和背景像素\tfocus{等权}相加，信噪比会被边缘背景拖低。Rb87 qCMOS 读出用两点改进，二者都接在同一套 \pyapi{TrapCalibration.signals/detect} 契约后面，方框法仍是默认，可逐项开启。
+
+\subsection{PSF 加权提取：method="psf"}
+
+\begin{codeblock}[Python]
+sm = exp.readout.sitemap(method="psf", psf_half_width=3, frames=20)
+\end{codeblock}
+
+\pyapi{sitemap(method="psf")} 在找出中心之后，额外从\tfocus{全亮模板}（所有位点都有原子时的多帧平均）里给每个位点拟合一张归一化的 PSF 权重图（\pyapi{(2*psf_half_width+1)} 见方，默认 7×7）。逐发提取时，信号 = 该位点 box 内\tfocus{背景扣除后的像素}与这张权重图的\tfocus{点积}（匹配滤波）。匹配滤波是"已知形状、加性噪声"下信噪比最优的线性提取：靠近原子的像素权重大，远离的接近 0，背景被自然压制。标定对象因此多带 \pyapi{psf_weights (N,h,w)} 与 \pyapi{psf_boxes (N,4)} 两个字段，\pyapi{save/load}（JSON 与 npz）都会原样往返。
+
+\subsection{双高斯阈值：method="bimodal"}
+
+\begin{codeblock}[Python]
+th = exp.readout.thresholds(method="bimodal", frames=120)
+\end{codeblock}
+
+\pyapi{thresholds(method="bimodal")} 不再只取一条 Otsu 谷底，而是：先用精确 1D Otsu 在排序样本上做一次经验劈分，再对暗、亮两侧\tfocus{各自}估计\tfocus{单侧峰核}的均值与宽度（只用远离峰间桥的那一侧分位数，避免部分丢失/弱发的"桥"样本把亮峰宽度撑大），最后把阈值放在两个高斯\tfocus{总错判率最小}的点上，并按模型给出 \pyapi{0.5*(F_dark+F_bright)} 的保真度。阈值仍是逐位点的 \pyapi{(N,)} 数组；提取用的是\tfocus{该标定自己的方法}（\pyapi{calibration.signals}），所以 PSF 标定下阈值天然定在 PSF 信号上，和 \pyapi{detect} 完全一致。某位点样本退化拟合不出时，会自动回退到该位点的 Otsu 阈值，保证标定全有限。
+
+\begin{notebox}[取原则，不照搬]
+这套实现移植自 \filepath{references/.../rb87\_readout\_v16} 的\tfocus{算法}（PSF 拟合、双高斯定阈、匹配滤波提取），但参考归档里那套面向离线批处理的文件 IO / 流式缓存 / 输出目录命名 / 重复别名\tfocus{没有}带进来——在线控制库只要算法，按本仓库的分层（原语在 \filepath{core/}，标定在 \filepath{operations/}，编排在 \pyapi{ReadoutSubsystem}）重写。
+\end{notebox}
+
 \section{第三步：detect 探测（逐发判定）}
 
 \subsection{调用与返回}
