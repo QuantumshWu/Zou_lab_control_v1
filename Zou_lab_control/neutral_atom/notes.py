@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from datetime import date
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-
-from Zou_lab_control.frontend.notes import NotesBuildResult, render_notes_pdf
+if TYPE_CHECKING:  # pragma: no cover - annotation only; manual building is a frontend-backed authoring action
+    from Zou_lab_control.frontend.notes import NotesBuildResult
 
 from .content.manuals import (
     device_manual_body,
@@ -27,6 +28,8 @@ def build_main_manual(
     The main manual uses inline TikZ diagrams only, so it has no figure
     dependencies and compiles directly from the template.
     """
+
+    from Zou_lab_control.frontend.notes import render_notes_pdf
 
     return render_notes_pdf(
         Path(output_dir),
@@ -51,6 +54,8 @@ def build_fpga_manual(
     (generate_fpga_manual_figures) into ``<output_dir>/assets`` and injected via
     fpga_manual_body; block-diagram TikZ stays inline.
     """
+
+    from Zou_lab_control.frontend.notes import render_notes_pdf
 
     output_dir = Path(output_dir)
     asset_dir = output_dir / "assets"
@@ -80,6 +85,8 @@ def build_device_manual(
     flow.  Embeds the real threshold-calibration histogram rendered offline via
     the virtual backend (with a placeholder fallback).
     """
+
+    from Zou_lab_control.frontend.notes import render_notes_pdf
 
     output_dir = Path(output_dir)
     asset_dir = output_dir / "assets"

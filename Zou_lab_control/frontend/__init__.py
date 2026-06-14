@@ -117,6 +117,28 @@ def __getattr__(name: str):
     raise AttributeError(name)
 
 
+def _register_neutral_atom_viewer() -> None:
+    """Register this frontend as the experiment layer's viewer.
+
+    Inversion of control: ``neutral_atom`` never imports the frontend; it routes
+    optional plotting through ``Zou_lab_control._viewer_registry``, and the
+    frontend opts in here on import.  The registry is a dependency-free leaf, so
+    this does not pull ``neutral_atom`` into the frontend import.
+    """
+
+    try:
+        from types import SimpleNamespace
+
+        from Zou_lab_control._viewer_registry import register_plotter
+
+        register_plotter(SimpleNamespace(plot=plot, display_figure=display_figure, run=run))
+    except Exception:  # pragma: no cover - plotting registration must never block import
+        pass
+
+
+_register_neutral_atom_viewer()
+
+
 __all__ = [
     "AreaSelector",
     "BaseLivePlot",

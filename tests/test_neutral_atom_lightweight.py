@@ -768,16 +768,18 @@ def test_user_facing_markdown_local_links_exist():
     discovered = {path.relative_to(root).as_posix() for path in markdown_files}
     expected_present = {
         "README.md",
+        "AGENTS.md",
+        "docs/ROADMAP.md",
         "docs/MAINTAINER_NOTES.md",
         "fpga/README.md",
         "fpga/pulse_streamer/README.md",
         "pulses/README.md",
         "Zou_lab_control/frontend/README.md",
+        "Zou_lab_control/frontend/AGENTS.md",
         "tests/README.md",
     }
     assert expected_present.issubset(discovered), expected_present - discovered
     for deleted in (
-        "AGENTS.md",
         "docs/PROJECT_OVERVIEW.md",
         "docs/DOCUMENTATION_GUIDE.md",
         "docs/FPGA_PULSE_STREAMER_CAPACITY.md",

@@ -39,6 +39,7 @@ from .timing import PulseSequence, imaging_sequence
 from .timing.verilog import generate_verilog, write_verilog_bundle
 from .views.plots import plot_detection_scan
 from .subsystems import ExperimentSubsystem, ReadoutSubsystem, TimingSubsystem
+from Zou_lab_control._viewer_registry import active_plotter
 
 
 class NeutralAtomSession:
@@ -263,10 +264,9 @@ class NeutralAtomSession:
             result.model_fidelities.append(fidelity)
             return fidelity
 
-        if live:
-            from Zou_lab_control import frontend as zf
-
-            result.measurement = zf.run(
+        plotter = active_plotter()
+        if live and plotter is not None:
+            result.measurement = plotter.run(
                 times.reshape(-1, 1),
                 measure,
                 data_y=data_y,
@@ -277,6 +277,8 @@ class NeutralAtomSession:
             )
             result.plot = result.measurement.plot
         else:
+            # No viewer registered (headless / frontend not imported): run the
+            # scan synchronously and still return a complete result.
             for index, time_s in enumerate(times):
                 data_y[index, 0] = measure(float(time_s), index)
             result.plot = plot_detection_scan(times, data_y[:, 0], display=display)

@@ -17,9 +17,11 @@ notebook-first;子模块只经接口互联(解耦);无后向兼容;前端密封;
 
 ---
 
-## 下一阶段值得采纳的设计想法(来自 confocal GUI,用户认可的设计)
+## 下一阶段值得采纳的设计想法(灵感来自 confocal GUI)
 
-这些是 confocal 里成熟、且我们**实验/notebook 层还没采纳但应该采纳**的模式(来源 `references/.../Confocal_GUIv2_refactored_v6`):
+> **这些只是想法库,不是必须照搬的规范。** 要遵守的是**设计原则**(解耦 / 只经接口互联 / 单一真相源 / 虚拟可替换 / 显式优于隐式),**不是 confocal 的具体实现**。哪条有更好的思路就用更好的——confocal 只是一个被认可的参考实现,不是模板。
+>
+> (来源 `references/.../Confocal_GUIv2_refactored_v6`,git-ignore 历史归档。)
 
 1. **声明式实验/测量元数据**:一个测量类用装饰器(confocal 的 `@measurement_gui_meta`)或 `caller()` 签名**自带它的参数与分类**(context / 要保存的 config / 设备槽 device-overrides / 额外参数),单位和默认值就在签名里。借鉴:让每个"实验任务"自带参数接口,notebook/GUI 从签名/schema 生成交互面板,不手写。(我们的 frontend `ParamSpec` 是这个思想在面板层的局部实现,可向实验层推广。)
 2. **设备契约 + 注册表**:设备通过抽象基类定义契约(`BaseCounter`/`BaseLaser`…),上层不绑死硬件;按名字注册/取设备(device manager)。我们已有 `devices/base.py` 三契约 + registry,继续沿用并补齐。
@@ -28,7 +30,7 @@ notebook-first;子模块只经接口互联(解耦);无后向兼容;前端密封;
 5. **协作式取消(cancellation token)**:`cancel()`/`check_cancel()`/`reset_cancel()` + 阻塞操作后放检查点,优于 `is_cancel` 布尔属性。借鉴:长采集/扫描的可中断性标准化成一个小模块。
 6. **分层 cleanup 钩子**:base 类在 `__init_subclass__` 里 wrap `close()`,分层清理(monitor → remote → user → 缓存)+ atexit。借鉴:Task/Device/Session 关闭时自动清 worker 线程、临时文件、远程连接。
 
-> 这些是"想法库",不是必须全做;接 notebook+Rb87 时按需取用,核心是**声明式 + 接口解耦 + 虚拟可替换 + 显式 dispatch**。
+> 接 notebook+Rb87 时**按需取用**:能让架构更解耦/更可测/更易扩展就用,否则不用。核心是原则,不是具体形态。
 
 ---
 

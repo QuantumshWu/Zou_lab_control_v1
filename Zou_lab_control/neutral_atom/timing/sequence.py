@@ -402,12 +402,15 @@ def exposure_from_sequence(sequence: PulseSequence | None, *, default: float, ch
 
 
 def plot_sequence(sequence: PulseSequence, *, clock_hz: float = 50_000_000.0, display: bool = True):
-    """Plot a pulse timeline with ``Zou_lab_control.frontend``."""
+    """Plot a pulse timeline through the registered viewer (``None`` if headless)."""
 
-    from Zou_lab_control import frontend as zf
+    from Zou_lab_control._viewer_registry import active_plotter
 
+    plotter = active_plotter()
+    if plotter is None:
+        return None
     channels = sequence.edges(clock_hz=clock_hz)[2]
-    return zf.plot(sequence, kind="pulse", channels=channels, labels=("Time (s)", "", "State"), title=sequence.name, display=display)
+    return plotter.plot(sequence, kind="pulse", channels=channels, labels=("Time (s)", "", "State"), title=sequence.name, display=display)
 
 
 def state_to_mask(state: dict[str, int], channels: Sequence[str]) -> int:
