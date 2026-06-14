@@ -57,10 +57,11 @@
 
 > 这里只写**原则**;具体命令、targeted matrix、截图函数签名都在 `tests/README.md`(单一真相源,别在这里复制命令)。
 
-- **跑能证明"改动边界"的最小检查**。**小且你很确定的改动可以不跑 full pytest**,省时间;full `pytest -q` 留给大改、跨多子系统、或交付前的扫尾。
+- **只跑能证明"改动边界"的测试,别为"求安心"跑 full pytest**(铁律,反复栽过)。改了哪层就跑那层对应的几个测试文件:改 `neutral_atom`/分析/某个 plot → 跑 `test_neutral_atom_lightweight` + 相关契约(`test_virtual_equals_real_contract` / `test_readout_math_single_source` / `test_frontend_plot_contract`)+ 该 plot 的 smoke;**不碰 pulse GUI / task_console 的测试**。`full pytest -q` 只在**用户说大改 / 跨多子系统 / 交付扫尾**时跑(大不大由用户定,不要自作主张全量)。
+  - **`test_frontend_smoke` 里的 GUI 测试(`demo_editor`/`demo_console`)跑的是 demo fixture(`demo_state()`、且不套真窗口 `FluentWindow`),不是用户真正打开的 `show_pulse_gui`/`show_task_console`;满载下还偶发 flaky**。所以:**非 GUI 改动绝不跑它们**——否则它们的 flaky 会反复制造与你改动无关的 "X failed",反复浪费双方注意力(这正是 neutral_atom 改动里反复栽的坑)。
 - **性能优化必须 logic/appearance-neutral**:只能让同样的输出更快(如解析 Jacobian、skip-if-unchanged 守卫、缓存不变量),**不能改刷新节奏/外观**(如降低拟合频率就是改外观,不做)。改完要能证明等价(如 popt 数值一致)。
 - **Python 侧契约测试**:仓库**没有 iverilog/cocotb**。RTL 行为用 Python 忠实镜像 + `xsim`(真 IP 网表,最强证据)验证;verilog 端口宽度由 Python 契约测试核对。
-- **所有可视化改动都要"看到用户所见"再算通过**:三档 QT_SCALE_FACTOR(1.0/1.25/1.5)整窗截图 + 1:1 像素裁剪。**DPR=1 离屏通过不算通过**,否则就是"瞎改"浪费时间。静态 notebook 图(matplotlib)则**渲染实际输出并肉眼检查**。
+- **所有可视化改动都要"看到用户所见"再算通过**:三档 QT_SCALE_FACTOR(1.0/1.25/1.5)整窗截图 + 1:1 像素裁剪。**DPR=1 离屏通过不算通过**,否则就是"瞎改"浪费时间。**截图/验收必须对着用户真正打开的入口**(`show_pulse_gui`/`show_task_console` 的真窗口),**不是测试用的 demo fixture**——测到的必须是你真正看到的那个东西。静态 notebook 图(matplotlib)则**渲染实际输出并肉眼检查**。
 - **布局美术铁律:不重叠、不裁切、对齐**(复合/多面板图同样适用,注记不许压在数据上)。多面板用 `frontend.canvas.create_axes_grid`(固定格 + 显式间距 + 图尺寸自适应)使三者天然成立,通用 N 不写死站点数;细则见 `frontend/AGENTS.md`「Layout」节。
 - **删除/重构后**:`git grep` 死标识符 = 0;`python -m compileall` 干净;无遗留 TODO/FIXME。
 
@@ -91,6 +92,7 @@
 9. **编辑器/联动改 config 别走会 teardown 的路径**:如 task console 编辑器改 relim 不能调 `card._set_param`(它 `_reset_plot` 把 plotter 置 None,随后读到 None 崩)→ 直接写 `config.params` + 重建本地视图。
 10. **markdown 里别用 LaTeX 排版宏**:`.md`(AGENTS/MEMORY/ROADMAP/README)用 markdown 语法(`**粗体**`、`` `代码` ``);`\tfocus{}`/`\pyapi{}`/`\filepath{}` 只属于 `.texbody`。写 .md 误用 `\tfocus{}` 会原样显示。(整理本文件时刚犯,30 处;用 chr(92) 脚本批量改回——同坑 #6。)
 11. **新增 plot 写成裸 matplotlib 图,绕过 `BaseLivePlot`**:`site_histogram_grid` 曾写成 `class SiteHistogramGrid:`(裸图),于是 selectors(缩放/拖阈值线)和 `data_figure`(拟合栈)**全部用不上**——而复用这层正是 frontend 存在的意义。根因不只是写错,而是该准则只在文档里、没有测试守。→ 新 plot **必须**继承 `BaseLivePlot` 走其 `show()` 生命周期(多轴图 override `_create_axes` + 每格挂工具,`DataFigure(ax=...)` 绑定单格);现已由 `tests/test_frontend_plot_contract.py` 强制(裸 plot 类直接挂测)。配套总纲见 §2「能机械强制的准则必须写成测试」。
+12. **改 scoped 的东西却跑 full pytest "求安心"**:改 neutral_atom/分析/单个 plot,却跑了整套(含 ~98 个 `demo_editor`/`demo_console` 的 GUI 测试),把满载下偶发 flaky 的 pulse GUI/task_console 测试反复拖进来,造出一堆与改动无关的 "15 failed",反复浪费双方注意力去排查。**根因**:把"想要信心"等同于"跑全部",违背 §3「只跑改动边界」。→ 只跑改动边界那几个文件;full 只在用户定的大改/交付时跑;**GUI smoke 是 demo fixture 不是真窗口,非 GUI 改动绝不跑**。见 §3。
 
 ### 如何持续记录(防上下文压缩遗忘)
 - 每当我造成一个**自造的或重复的 bug**,立刻在上面加一条(一句话:现象 → 根因 → 规则)。这是标准收尾动作,和"跑测试/截图验收"同级。
