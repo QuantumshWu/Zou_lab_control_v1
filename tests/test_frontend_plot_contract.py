@@ -115,3 +115,42 @@ def test_site_grid_exposes_per_cell_selectors_and_fitting():
         assert g.thresholds[3] == 33.0
     finally:
         plt.close(g.fig)
+
+
+def test_grid_focus_zoom_enlarges_one_cell_and_returns():
+    """Multi-panel zoom = focus one cell: focus(k) enlarges it to fill the figure
+    (full selectors), unfocus()/double-click returns to the grid."""
+    import numpy as np
+
+    rng = np.random.default_rng(3)
+    sites = [np.concatenate([rng.normal(3, 1, 50), rng.normal(40, 3, 60)]) for _ in range(6)]
+    g = zf.site_histogram_grid(sites, thresholds=[20.0] * 6, display=False)
+    try:
+        assert g.focus_ax is None and g._focused is None
+        g.focus(2)                                              # enlarge cell 2
+        assert g._focused == 2 and g.focus_ax is not None
+        assert all(not ax.get_visible() for ax in g.site_axes)  # grid hidden
+        assert g._focus_tools.zoom is not None                  # enlarged cell has its own selectors
+        g.unfocus()                                             # back to the grid
+        assert g._focused is None and g.focus_ax is None
+        assert all(ax.get_visible() for ax in g.site_axes)
+    finally:
+        plt.close(g.fig)
+
+
+def test_grid_plot_is_reusable_for_other_cell_types():
+    """The grid framework is general: GridPlot drives any GridCell.  Today only the
+    HistogramCell exists; future Image2DCell/Line1DCell plug in the same way."""
+    import numpy as np
+    from Zou_lab_control.frontend.live import GridPlot, GridCell, HistogramCell
+
+    assert issubclass(HistogramCell, GridCell)
+    rng = np.random.default_rng(4)
+    sites = [rng.normal(5, 1, 40) for _ in range(5)]
+    g = GridPlot(HistogramCell(sites, labels=("sig", "shots")), labels=("sig", "shots")).show(display=False)
+    try:
+        assert isinstance(g, BaseLivePlot) and len(g.site_axes) == 5
+        assert len(g.interaction_handles()) >= 5                # selectors attached
+        assert g.to_data_figure().cell(0) is not None           # per-cell DataFigure
+    finally:
+        plt.close(g.fig)

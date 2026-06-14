@@ -1775,15 +1775,147 @@ def _as_per_site_list(per_site_values, n_sites: int | None = None):
     return out
 
 
-class _SiteGridData:
-    """Composite ``DataFigure`` handle for a :class:`SiteHistogramGrid`: one
-    per-cell :class:`DataFigure` (so each site's histogram fits with the SAME
-    reusable stack as any plot) plus a whole-grid ``save``."""
+class GridCell:
+    """Strategy for ONE cell of a :class:`GridPlot` -- subclass per multi-panel
+    plot type (``HistogramCell`` now; future ``Image2DCell`` / ``Line1DCell``).
 
-    def __init__(self, grid: "SiteHistogramGrid"):
+    The GridPlot owns everything generic (layout, focus-zoom, per-cell selectors,
+    DataFigure plumbing); the cell only knows how to DRAW one panel and what its
+    threshold/DataFigure are.  ``draw(ax, k, detail=False)`` must work at any axes
+    size -- the same method draws the small grid cell AND the enlarged focus view,
+    which is exactly why the focus-zoom is plot-type-agnostic."""
+
+    n_cells: int = 0
+
+    def prepare(self) -> None:
+        """Compute any shared state (e.g. common histogram bin edges) once."""
+
+    def draw(self, ax, k: int, *, detail: bool = False):
+        """Draw cell ``k`` into ``ax``.  ``detail=True`` is the enlarged focus view
+        (full ticks/labels/title).  Return the cell's draggable threshold line or
+        ``None``."""
+        raise NotImplementedError
+
+    def threshold_line(self, k: int):
+        return None
+
+    def on_threshold_drag(self, k: int, x: float) -> None:
+        """Called while a threshold is dragged (update data + any annotation)."""
+
+    def data_figure(self, fig, ax, k: int):
+        """The per-cell :class:`DataFigure` (reusable fitting stack)."""
+        raise NotImplementedError
+
+
+class HistogramCell(GridCell):
+    """A GridPlot cell that is a per-site count histogram (the distribution grid).
+
+    ``per_site_values`` is ``(n, n_samples)`` or a list of 1D arrays; ``occupied``
+    colours dark/bright populations; ``thresholds`` draws a draggable cut;
+    ``site_fidelities`` annotates each cell."""
+
+    def __init__(self, per_site_values, *, occupied=None, thresholds=None,
+                 site_fidelities=None, bins: int = 36, labels: Sequence[str] = ("Signal", "Shots")):
+        self.values = _as_per_site_list(per_site_values)
+        self.n_cells = len(self.values)
+        if self.n_cells == 0:
+            raise ValueError("per_site_values must contain at least one cell.")
+        self.occupied = None if occupied is None else _as_per_site_list(occupied, self.n_cells)
+        thr = None if thresholds is None else np.asarray(thresholds, dtype=float).reshape(-1)
+        if thr is not None and thr.size != self.n_cells:
+            raise ValueError("thresholds must have one value per cell.")
+        self.thresholds = None if thr is None else [float(t) for t in thr]
+        self.site_fidelities = None if site_fidelities is None else np.asarray(site_fidelities, dtype=float).reshape(-1)
+        self.bins_arg = int(bins)
+        self.labels = tuple(labels)
+        self.edges = None
+        self.threshold_lines: list = [None] * self.n_cells
+        self.tag_texts: list = [None] * self.n_cells
+        self.cell_counts: list = [None] * self.n_cells
+
+    def prepare(self) -> None:
+        vals = self.values
+        pooled = np.concatenate([v[np.isfinite(v)] for v in vals if v.size]) if any(v.size for v in vals) else np.array([0.0, 1.0])
+        lo, hi = np.quantile(pooled, [0.002, 0.998]) if pooled.size > 2 else (float(np.min(pooled)), float(np.max(pooled)))
+        if not np.isfinite([lo, hi]).all() or hi <= lo:
+            lo, hi = float(np.min(pooled)), float(np.max(pooled)) + 1.0
+        span = hi - lo
+        self.x_lo, self.x_hi = float(lo - 0.04 * span), float(hi + 0.04 * span)
+        self.edges = np.linspace(self.x_lo, self.x_hi, self.bins_arg + 1)
+
+    def _tag_text(self, k: int) -> str:
+        fids = self.site_fidelities
+        return f"s{k}" if fids is None or not np.isfinite(fids[k]) else f"s{k}\n{fids[k] * 100:.0f}%"
+
+    def draw(self, ax, k: int, *, detail: bool = False):
+        if self.edges is None:
+            self.prepare()
+        edges = self.edges
+        v = self.values[k]
+        v = v[np.isfinite(v)]
+        occ = self.occupied
+        if occ is not None and occ[k].size == self.values[k].size:
+            mask = np.asarray(occ[k], dtype=bool)[np.isfinite(self.values[k])]
+            dark, bright = v[~mask], v[mask]
+            if dark.size or bright.size:
+                ax.hist([dark, bright], bins=edges, stacked=True, color=[PALETTE["dark"], PALETTE["bright"]], edgecolor="none")
+        elif v.size:
+            ax.hist(v, bins=edges, color=PALETTE["hist_fill"], edgecolor="none")
+        self.cell_counts[k] = np.histogram(v, bins=edges)[0].astype(float) if v.size else np.zeros(self.bins_arg)
+        line = None
+        if self.thresholds is not None and np.isfinite(self.thresholds[k]):
+            line = ax.axvline(float(self.thresholds[k]), **threshold_line_kwargs(1.4 if not detail else 1.9))
+        ax.set_xlim(self.x_lo, self.x_hi)
+        top = ax.get_ylim()[1]
+        ax.set_ylim(0, top * 1.45 if top > 0 else 1.0)   # headroom so the tag clears the bars
+        ax.text(0.06, 0.95, self._tag_text(k), transform=ax.transAxes, ha="left", va="top",
+                fontsize=small_fontsize(), color=PALETTE["annotation"], linespacing=0.92)
+        ax.tick_params(labelsize=tick_fontsize(), length=2)
+        ax.set_yticklabels([])               # counts scale varies per cell; shape is the point
+        if detail:                            # enlarged focus view: full decoration
+            ax.set_xlabel(self.labels[0], fontsize=axis_label_fontsize())
+            apply_title(ax, f"site {k}")
+        else:
+            self.threshold_lines[k] = line    # grid line, kept for per-cell drag
+        return line
+
+    def threshold_line(self, k: int):
+        return self.threshold_lines[k] if k < len(self.threshold_lines) else None
+
+    def on_threshold_drag(self, k: int, x: float) -> None:
+        if self.thresholds is None:
+            self.thresholds = [float("nan")] * self.n_cells
+        self.thresholds[k] = float(x)
+        grid_line = self.threshold_lines[k]
+        if grid_line is not None:             # keep the grid line synced with a focus-view drag
+            grid_line.set_xdata([x, x])
+
+    def data_figure(self, fig, ax, k: int):
+        from .data_figure import DataFigure
+        centers = (self.edges[:-1] + self.edges[1:]) / 2
+        ylabel = self.labels[1] if len(self.labels) > 1 else "Shots"
+        return DataFigure(fig=fig, ax=ax, data_x=centers, data_y=self.cell_counts[k],
+                          labels=(self.labels[0], ylabel), name=f"site{k}")
+
+    def classify(self, k: int, values=None) -> np.ndarray:
+        vals = self.values[k] if values is None else np.asarray(values, dtype=float)
+        if self.thresholds is not None and np.isfinite(self.thresholds[k]):
+            thr = self.thresholds[k]
+        else:
+            finite = vals[np.isfinite(vals)]
+            thr = float(np.nanmedian(finite)) if finite.size else 0.0
+        return (vals > thr).astype(int)
+
+
+class _GridData:
+    """Composite ``DataFigure`` handle for a :class:`GridPlot`: one per-cell
+    :class:`DataFigure` (each panel fits with the SAME stack as any plot) + a
+    whole-grid ``save``."""
+
+    def __init__(self, grid: "GridPlot"):
         self.grid = grid
         self.fig = grid.fig
-        self.cells = grid.data_figures
+        self.cells = [grid.cell_renderer.data_figure(grid.fig, ax, k) for k, ax in enumerate(grid.site_axes)]
 
     def cell(self, k: int):
         return self.cells[k]
@@ -1792,59 +1924,34 @@ class _SiteGridData:
         return self.grid.save(path, **kwargs)
 
 
-class SiteHistogramGrid(BaseLivePlot):
-    """One histogram per site on an aligned, non-overlapping grid (general N) --
-    a FIRST-CLASS plot (subclasses :class:`BaseLivePlot`), so it gets the same
-    reusable layer as every other plot: per-cell scroll-zoom / middle-drag pan, a
-    draggable per-site threshold line, and a per-cell :class:`DataFigure` for
-    fitting.  It is never a hand-rolled raw-matplotlib figure -- that would lose
-    the selectors / data_figure that are the whole point of the frontend layer.
+class GridPlot(BaseLivePlot):
+    """A general multi-panel plot: N aligned cells, the cell CONTENT pluggable via
+    a :class:`GridCell` (``HistogramCell`` now; future ``Image2DCell`` /
+    ``Line1DCell``).  A FIRST-CLASS plot (subclasses :class:`BaseLivePlot`), so it
+    reuses the frontend layer: per-cell selectors, per-cell :class:`DataFigure`,
+    and a **focus-zoom** -- double-click a cell to enlarge it to the whole figure
+    (full ticks/labels + that cell's selectors) to see detail, double-click or
+    press Esc to return to the grid.  Geometry/gaps/colours/dpi/fonts are owned by
+    the frontend -- cells never overlap, nothing is cut off, all cells align."""
 
-    ``per_site_values`` is ``(n_sites, n_samples)`` or a list of 1D arrays (ragged
-    allowed).  ``occupied`` (same shape, bool) colours each site's dark/bright
-    populations separately; ``thresholds`` (``(n_sites,)``) draws a draggable
-    per-site threshold; ``site_fidelities`` annotates each cell.  ``grid_shape``
-    sets the ``(rows, cols)`` layout (defaults to near-square); all cells share
-    the x range for comparability.  Geometry, gaps, colours, dpi and fonts are
-    owned by the frontend -- cells never overlap, nothing is cut off, all align.
-    """
+    plot_type = "grid"
 
-    plot_type = "site_grid"
-
-    def __init__(
-        self,
-        per_site_values,
-        *,
-        thresholds=None,
-        occupied=None,
-        grid_shape: tuple[int, int] | None = None,
-        bins: int = 36,
-        site_fidelities=None,
-        labels: Sequence[str] = ("Signal", "Shots"),
-        **kwargs,
-    ):
-        values = _as_per_site_list(per_site_values)
-        self.site_values = values
-        self.n_sites = len(values)
-        if self.n_sites == 0:
-            raise ValueError("per_site_values must contain at least one site.")
-        self.site_occupied = None if occupied is None else _as_per_site_list(occupied, self.n_sites)
-        thr = None if thresholds is None else np.asarray(thresholds, dtype=float).reshape(-1)
-        if thr is not None and thr.size != self.n_sites:
-            raise ValueError("thresholds must have one value per site.")
-        self.thresholds = None if thr is None else [float(t) for t in thr]
-        self.site_fidelities = None if site_fidelities is None else np.asarray(site_fidelities, dtype=float).reshape(-1)
-        self.bins_arg = int(bins)
-        self.nrows, self.ncols = grid_shape_for(self.n_sites, prefer=grid_shape, max_cols=_SITE_MAX_COLS)
-        # The cells set their own ticks; the base single-axes smart-tick pass
-        # must not touch cell 0 (it would differ from the other cells).
-        super().__init__(np.arange(self.n_sites), labels=labels, smart_ticks=False, **kwargs)
+    def __init__(self, cell: GridCell, *, grid_shape: tuple[int, int] | None = None,
+                 labels: Sequence[str] = ("X", "Y"), **kwargs):
+        self.cell_renderer = cell
+        self.n_cells = int(cell.n_cells)
+        if self.n_cells == 0:
+            raise ValueError("a GridPlot needs at least one cell.")
+        cell.prepare()
+        self.nrows, self.ncols = grid_shape_for(self.n_cells, prefer=grid_shape, max_cols=_SITE_MAX_COLS)
+        # cells set their own ticks; the base single-axes smart-tick pass would
+        # only touch cell 0 and make it differ from the rest.
+        super().__init__(np.arange(self.n_cells), labels=labels, smart_ticks=False, **kwargs)
         self.site_axes: list = []
-        self.threshold_lines: list = []
-        self.tag_texts: list = []
-        self.cell_edges = None
-        self.cell_counts: list = []
         self._cell_interactions: list = []
+        self.focus_ax = None
+        self._focused: int | None = None
+        self._focus_tools = None
 
     def _create_axes(self):
         axes = create_axes_grid(
@@ -1856,67 +1963,21 @@ class SiteHistogramGrid(BaseLivePlot):
         return axes[0]
 
     def init_core(self) -> None:
-        axes = self.axes
-        values = self.site_values
-        occ = self.site_occupied
-        fids = self.site_fidelities
-        # Shared x-range (robust) across all sites, so cells are directly comparable.
-        pooled = np.concatenate([v[np.isfinite(v)] for v in values if v.size]) if any(v.size for v in values) else np.array([0.0, 1.0])
-        lo, hi = np.quantile(pooled, [0.002, 0.998]) if pooled.size > 2 else (float(np.min(pooled)), float(np.max(pooled)))
-        if not np.isfinite([lo, hi]).all() or hi <= lo:
-            lo, hi = float(np.min(pooled)), float(np.max(pooled)) + 1.0
-        span = hi - lo
-        lo -= 0.04 * span
-        hi += 0.04 * span
-        self.x_lo, self.x_hi = float(lo), float(hi)
-        edges = np.linspace(lo, hi, self.bins_arg + 1)
-        self.cell_edges = edges
-        small = small_fontsize()
         self.site_axes = []
-        self.threshold_lines = [None] * self.n_sites
-        self.tag_texts = [None] * self.n_sites
-        self.cell_counts = [None] * self.n_sites
-
-        for k, ax in enumerate(axes):
-            if k >= self.n_sites:
+        for k, ax in enumerate(self.axes):
+            if k >= self.n_cells:
                 ax.set_visible(False)
                 continue
             self.site_axes.append(ax)
-            v = values[k]
-            v = v[np.isfinite(v)]
-            if occ is not None and occ[k].size == values[k].size:
-                mask = np.asarray(occ[k], dtype=bool)[np.isfinite(values[k])]
-                dark = v[~mask]
-                bright = v[mask]
-                if dark.size or bright.size:
-                    ax.hist([dark, bright], bins=edges, stacked=True, color=[PALETTE["dark"], PALETTE["bright"]], edgecolor="none")
-            elif v.size:
-                ax.hist(v, bins=edges, color=PALETTE["hist_fill"], edgecolor="none")
-            # Total per-bin counts (stack-independent) for this cell's DataFigure.
-            self.cell_counts[k] = np.histogram(v, bins=edges)[0].astype(float) if v.size else np.zeros(self.bins_arg)
-            if self.thresholds is not None and np.isfinite(self.thresholds[k]):
-                self.threshold_lines[k] = ax.axvline(float(self.thresholds[k]), **threshold_line_kwargs(1.4))
-            ax.set_xlim(lo, hi)
-            top = ax.get_ylim()[1]
-            ax.set_ylim(0, top * 1.45 if top > 0 else 1.0)  # headroom so the stacked tag clears the bars
-            # Tag stacked at top-left (site id over fidelity) so it fits a narrow cell
-            # with no horizontal collision even for two-digit sites at 100%.
-            tag = f"s{k}" if fids is None or not np.isfinite(fids[k]) else f"s{k}\n{fids[k] * 100:.0f}%"
-            self.tag_texts[k] = ax.text(0.06, 0.95, tag, transform=ax.transAxes, ha="left", va="top",
-                                        fontsize=small, color=PALETTE["annotation"], linespacing=0.92)
-            ax.tick_params(labelsize=tick_fontsize(), length=2)
-            ax.set_yticklabels([])           # counts scale varies per cell; shape is the point
-            is_bottom = (k + self.ncols >= self.n_sites)  # last filled cell in its column
-            if not is_bottom:
+            self.cell_renderer.draw(ax, k, detail=False)
+            if (k + self.ncols) < self.n_cells:        # hide x tick labels off the bottom row
                 ax.set_xticklabels([])
 
     def update_core(self) -> None:
-        # A per-site readout snapshot; a fresh acquisition rebuilds via show().
+        # A snapshot plot; a fresh acquisition rebuilds via show().
         pass
 
     def _apply_title(self) -> None:
-        # Outer x/y labels (axis-label size, matching every other plot) + the
-        # shared title mechanism, all placed in the owned margins.
         labels = self.labels
         self.fig.text(0.5, 0.012, str(labels[0]), ha="center", va="bottom", fontsize=axis_label_fontsize())
         self.fig.text(0.008, 0.5, str(labels[1]) if len(labels) > 1 else "Shots", ha="left", va="center",
@@ -1927,29 +1988,26 @@ class SiteHistogramGrid(BaseLivePlot):
         self.fig._zlc_state = PlotState(plot_type=self.plot_type)
 
     def _attach_interactions(self) -> None:
-        # Every cell gets the SAME selector bundle a standalone plot does -- area
-        # box-select, cross crosshair, scroll-zoom / middle-drag pan -- plus a
-        # draggable threshold line where one exists.  Each handler filters on
-        # ``event.inaxes`` so it only responds to its own cell.
+        # Every cell gets the SAME selector bundle a standalone plot does (area +
+        # cross + zoom + draggable threshold), filtered by event.inaxes.
         self._cell_interactions = []
         for k, ax in enumerate(self.site_axes):
             area = AreaSelector(ax)
             cross = CrossSelector(ax)
             zoom = ZoomPan(ax, area_selector=area)
-            line = self.threshold_lines[k] if k < len(self.threshold_lines) else None
+            line = self.cell_renderer.threshold_line(k)
             drag = DragVLine(line, self._make_threshold_cb(k), ax) if line is not None else None
             self._cell_interactions.append(InteractionBundle(area=area, cross=cross, zoom=zoom, drag=drag, axdis=ax))
         if self._cell_interactions:
             self.tools = self._cell_interactions[0]
             self.area, self.cross, self.zoom, self.drag = self.tools.area, self.tools.cross, self.tools.zoom, self.tools.drag
-        # Pin the tools to the FIGURE (every other plot does this via
-        # attach_interaction).  Without it the per-cell selectors lived only on
-        # the returned object, so in a notebook they were collected while the
-        # displayed figure stayed -> "no selector".  The figure outlives the
-        # returned handle, so the whole grid stays interactive; the cleanup path
-        # (canvas._destroy_frontend_tools) also finds them via _zlc_grid_tools.
+        # Pin to the FIGURE so the selectors outlive the returned handle (a notebook
+        # keeps the figure, not necessarily the object) -- otherwise "no selector".
         self.fig._zlc_tools = self.tools
         self.fig._zlc_grid_tools = self._cell_interactions
+        # Focus-zoom: double-click a cell to enlarge it; double-click / Esc to return.
+        self._click_cid = self.fig.canvas.mpl_connect("button_press_event", self._on_click)
+        self._key_cid = self.fig.canvas.mpl_connect("key_press_event", self._on_key)
 
     def interaction_handles(self) -> list:
         out: list = []
@@ -1958,54 +2016,117 @@ class SiteHistogramGrid(BaseLivePlot):
         return out
 
     def _make_threshold_cb(self, k: int):
-        def _cb(x: float) -> None:
-            if self.thresholds is None:
-                self.thresholds = [float("nan")] * self.n_sites
-            self.thresholds[k] = float(x)
-            self._refresh_tag(k)
-        return _cb
+        return lambda x: self.cell_renderer.on_threshold_drag(k, float(x))
 
-    def _refresh_tag(self, k: int) -> None:
-        v = self.site_values[k]
-        v = v[np.isfinite(v)]
-        thr = self.thresholds[k]
-        bright = float(np.mean(v > thr)) if (v.size and np.isfinite(thr)) else float("nan")
-        fid = None if (self.site_fidelities is None or not np.isfinite(self.site_fidelities[k])) else self.site_fidelities[k]
-        head = f"s{k}" if fid is None else f"s{k}\n{fid * 100:.0f}%"
-        self.tag_texts[k].set_text(head if not np.isfinite(bright) else f"{head}\nP={bright * 100:.0f}%")
+    # ----------------------------------------------------------- focus-zoom
+    def _on_click(self, event) -> None:
+        if not getattr(event, "dblclick", False):
+            return
+        if self._focused is None:
+            if event.inaxes in self.site_axes:
+                self.focus(self.site_axes.index(event.inaxes))
+        else:
+            self.unfocus()
 
-    def cell(self, k: int):
-        """A per-cell :class:`DataFigure` for site ``k`` -- the SAME fitting stack
-        every other plot exposes, bound to that cell's axes (so e.g.
-        ``grid.cell(3).gaussian()`` fits site 3's histogram)."""
-        from .data_figure import DataFigure
+    def _on_key(self, event) -> None:
+        if getattr(event, "key", None) == "escape" and self._focused is not None:
+            self.unfocus()
 
-        centers = (self.cell_edges[:-1] + self.cell_edges[1:]) / 2
-        ylabel = self.labels[1] if len(self.labels) > 1 else "Shots"
-        return DataFigure(fig=self.fig, ax=self.site_axes[k], data_x=centers,
-                          data_y=self.cell_counts[k], labels=(self.labels[0], ylabel), name=f"site{k}")
+    def focus(self, k: int) -> None:
+        """Enlarge cell ``k`` to fill the figure (see detail); call again or
+        :meth:`unfocus` to return to the grid."""
+        from matplotlib.transforms import Bbox
 
-    @property
-    def data_figures(self) -> list:
-        return [self.cell(k) for k in range(len(self.site_axes))]
+        if self._focused is not None:
+            self.unfocus()
+        k = int(k)
+        rect = Bbox.union([ax.get_position() for ax in self.site_axes])
+        for ax in self.axes:
+            ax.set_visible(False)
+        self.focus_ax = self.fig.add_axes([rect.x0, rect.y0, rect.width, rect.height])
+        line = self.cell_renderer.draw(self.focus_ax, k, detail=True)
+        area = AreaSelector(self.focus_ax)
+        cross = CrossSelector(self.focus_ax)
+        zoom = ZoomPan(self.focus_ax, area_selector=area)
+        drag = DragVLine(line, self._make_threshold_cb(k), self.focus_ax) if line is not None else None
+        self._focus_tools = InteractionBundle(area=area, cross=cross, zoom=zoom, drag=drag, axdis=self.focus_ax)
+        self.fig._zlc_tools = self._focus_tools
+        self._focused = k
+        self.draw()
+
+    def unfocus(self) -> None:
+        """Return from the enlarged single-cell view to the grid."""
+        if self._focused is None:
+            return
+        for name in ("area", "cross", "zoom", "drag"):
+            handler = getattr(self._focus_tools, name, None)
+            if handler is not None and hasattr(handler, "destroy"):
+                handler.destroy()
+        if self.focus_ax is not None:
+            self.fig.delaxes(self.focus_ax)
+            self.focus_ax = None
+        self._focus_tools = None
+        self._focused = None
+        for ax in self.site_axes:
+            ax.set_visible(True)
+        self.fig._zlc_tools = self.tools
+        self.draw()
 
     def to_data_figure(self):
-        self.data_figure = _SiteGridData(self)
+        self.data_figure = _GridData(self)
         return self.data_figure
-
-    def classify(self, k: int, values=None) -> np.ndarray:
-        vals = self.site_values[k] if values is None else np.asarray(values, dtype=float)
-        if self.thresholds is not None and np.isfinite(self.thresholds[k]):
-            thr = self.thresholds[k]
-        else:
-            finite = vals[np.isfinite(vals)]
-            thr = float(np.nanmedian(finite)) if finite.size else 0.0
-        return (vals > thr).astype(int)
 
     def save(self, path: str = "", **kwargs):
         kwargs.setdefault("dpi", design_dpi(self.fig))
         self.fig.savefig(path, **kwargs)
         return path
+
+
+class SiteHistogramGrid(GridPlot):
+    """One histogram per site on an aligned grid (a :class:`GridPlot` whose cell is
+    a :class:`HistogramCell`).  Kept as a named type for the readout site-grid; for
+    other multi-panel plots build ``GridPlot(SomeCell(...))`` directly."""
+
+    plot_type = "site_grid"
+
+    def __init__(self, per_site_values, *, thresholds=None, occupied=None,
+                 grid_shape: tuple[int, int] | None = None, bins: int = 36,
+                 site_fidelities=None, labels: Sequence[str] = ("Signal", "Shots"), **kwargs):
+        cell = HistogramCell(per_site_values, occupied=occupied, thresholds=thresholds,
+                             site_fidelities=site_fidelities, bins=bins, labels=labels)
+        super().__init__(cell, grid_shape=grid_shape, labels=labels, **kwargs)
+
+    # the readout site-grid's public surface delegates to the histogram cell
+    @property
+    def n_sites(self) -> int:
+        return self.n_cells
+
+    @property
+    def site_values(self) -> list:
+        return self.cell_renderer.values
+
+    @property
+    def thresholds(self):
+        return self.cell_renderer.thresholds
+
+    @property
+    def site_fidelities(self):
+        return self.cell_renderer.site_fidelities
+
+    @property
+    def threshold_lines(self) -> list:
+        return self.cell_renderer.threshold_lines
+
+    @property
+    def cell_edges(self):
+        return self.cell_renderer.edges
+
+    @property
+    def cell_counts(self) -> list:
+        return self.cell_renderer.cell_counts
+
+    def classify(self, k: int, values=None) -> np.ndarray:
+        return self.cell_renderer.classify(k, values)
 
 
 def site_histogram_grid(
@@ -2022,13 +2143,12 @@ def site_histogram_grid(
 ) -> SiteHistogramGrid:
     """Plot one histogram per site on an aligned, non-overlapping grid (general N).
 
-    Returns a :class:`SiteHistogramGrid` -- a first-class plot, so it is
-    interactive (per-cell zoom/pan + a draggable per-site threshold) and every
-    cell exposes a :class:`DataFigure` for fitting via ``grid.cell(k)``, exactly
-    like every other front-end plot.  See :class:`SiteHistogramGrid` for the
-    argument semantics; geometry/gaps/colours/dpi/fonts are owned by the frontend
-    (cells never overlap, nothing is cut off, all cells align).
-    """
+    Returns a :class:`SiteHistogramGrid` (a :class:`GridPlot` of histogram cells):
+    a first-class plot, so it is interactive (per-cell selectors + a draggable
+    per-site threshold, and **double-click a cell to enlarge it to see detail**)
+    and every cell exposes a :class:`DataFigure` via ``grid.to_data_figure().cell(k)``.
+    Geometry/gaps/colours/dpi/fonts are owned by the frontend (cells never overlap,
+    nothing is cut off, all cells align)."""
 
     return SiteHistogramGrid(
         per_site_values,
@@ -2133,6 +2253,9 @@ __all__ = [
     "PANEL_SIZES",
     "panel_display_size",
     "PulseSequenceFigure",
+    "GridPlot",
+    "GridCell",
+    "HistogramCell",
     "SiteHistogramGrid",
     "panel_plot",
     "panel_plot_spec",
