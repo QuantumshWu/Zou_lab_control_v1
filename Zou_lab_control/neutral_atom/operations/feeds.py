@@ -180,4 +180,124 @@ class LoadingFeed(ExperimentFeed):
         }
 
 
-__all__ = ["ExperimentFeed", "LoadingFeed"]
+class ScannedMeasurementFeed(ExperimentFeed):
+    """Drive a :class:`ScannedMeasurement` one scan point per ``shot()``, into a hub.
+
+    Wraps a swept measurement as a console feed (``start``/``stop``/``running``)
+    so a finite scan grows a live curve in the task console exactly as the
+    free-running loading feed grows a rate trace.  Each ``shot()`` advances ONE
+    scan point through the measurement's contract path
+    (``measurement.measure(value, index)`` -> ``camera.acquire`` + ``calibration``)
+    and publishes the CUMULATIVE curve so far, so a Monitor 1-D panel
+    (``value = <y_key>`` vs ``x_key``) fills in as the scan runs.
+
+    It touches ONLY ``measurement.measure`` (the camera/sequencer/calibration
+    contract) and ``hub.publish`` -- it imports no concrete backend and reads no
+    simulation ground truth, so it is guarded by
+    ``tests/test_virtual_equals_real_contract.py`` like the rest of the analysis
+    layer.
+
+    Published per shot (behind ``prefix``):
+
+    ``<x_key>``         (k,) cumulative scan x values (the points done so far)
+    ``<y_key>``         (k,) cumulative scalar curve (series 0 of the reducer)
+    ``<y_key>_sites``   (n_series,) the LATEST point's per-site vector (per-site only)
+    ``<y_key>_grid``    grid-shaped latest per-site vector (per-site only, if grid_shape)
+    ``scan_done``       0 while running, 1 once the final point has been published
+    ``shot``            scalar shot counter
+
+    Finite-scan semantics: after the last point is published the feed sets its
+    own stop event, so a background ``start()`` thread exits on its own once the
+    sweep completes; ``finished`` reports completion and ``run_to_completion()``
+    runs every remaining point synchronously (tests / headless).
+    """
+
+    def __init__(
+        self,
+        hub: SignalHub,
+        measurement,
+        *,
+        x_key: str = "x",
+        y_key: str = "y",
+        grid_shape: tuple[int, int] | None = None,
+        prefix: str = "",
+    ):
+        super().__init__(hub, prefix=prefix)
+        self.measurement = measurement
+        self.x_key = str(x_key)
+        self.y_key = str(y_key)
+        self.grid_shape = None if grid_shape is None else grid_shape_tuple(grid_shape)
+        # The measurement owns the swept values (single source of truth); the feed
+        # only walks its index and accumulates the (x, y) seen so far.
+        self._values = np.asarray(measurement.axis.values, dtype=float).reshape(-1)
+        self._index = 0
+        self._x_done: list[float] = []
+        self._y_done: list[float] = []
+
+    @property
+    def n_points(self) -> int:
+        return int(self._values.size)
+
+    @property
+    def points_done(self) -> int:
+        return int(self._index)
+
+    @property
+    def finished(self) -> bool:
+        """True once every scan point has been measured and published."""
+
+        return self._index >= self.n_points
+
+    def shot(self) -> dict[str, object]:
+        """Advance ONE scan point and return the cumulative curve so far.
+
+        Raises ``StopIteration`` if called after the sweep is finished -- the
+        ``start()`` loop never does (the feed stops itself), and tests check
+        ``finished`` first.
+        """
+
+        if self.finished:
+            raise StopIteration("ScannedMeasurementFeed: scan already complete.")
+        index = self._index
+        value = float(self._values[index])
+        row = np.atleast_1d(np.asarray(self.measurement.measure(value, index), dtype=float))
+        self._index += 1
+        self._x_done.append(value)
+        self._y_done.append(float(row[0]))
+
+        out: dict[str, object] = {
+            self.x_key: np.asarray(self._x_done, dtype=float).copy(),
+            self.y_key: np.asarray(self._y_done, dtype=float).copy(),
+            "scan_done": 1.0 if self.finished else 0.0,
+            "shot": float(self._index),
+        }
+        if row.size > 1:
+            # A per-site reducer: publish the latest point's per-site vector (and a
+            # grid map when a shape is known) alongside the scalar curve.
+            out[self.y_key + "_sites"] = row.copy()
+            if self.grid_shape is not None and row.size == int(np.prod(self.grid_shape)):
+                out[self.y_key + "_grid"] = row.reshape(self.grid_shape).copy()
+        return out
+
+    def step(self) -> dict[str, object]:
+        """Run one point, publish it, and self-stop once the final point lands.
+
+        Reuses the base publish path; the only addition is the finite-scan stop:
+        after the last point's signals are on the hub, the stop event is set so a
+        background ``start()`` thread's loop exits cleanly.
+        """
+
+        named = super().step()
+        if self.finished:
+            self._stop.set()
+        return named
+
+    def run_to_completion(self) -> "ScannedMeasurementFeed":
+        """Synchronously run + publish every remaining scan point (test/headless)."""
+
+        while not self.finished:
+            self.step()
+        return self
+
+
+__all__ = ["ExperimentFeed", "LoadingFeed", "ScannedMeasurementFeed"]

@@ -119,7 +119,16 @@ def _square_extent(extent: Sequence[float]) -> list[float]:
 def _float2str_eng(x: float, length: int = 5) -> str:
     if not np.isfinite(x):
         return "nan"
-    return f"{float(x):.{max(0, length - 1)}g}"
+    s = f"{float(x):.{max(0, length - 1)}g}"
+    if "e" not in s and "E" not in s:
+        return s                              # small values (865, 0.5, 1500) unchanged
+    # Compact the scientific form so big values fit a tight colorbar margin:
+    # 1-decimal mantissa, drop trailing zeros, strip the exponent's '+' and
+    # leading zeros (e.g. "1.234e+04" 9ch -> "1.2e4" 5ch, "5e+05" -> "5e5").
+    mant, exp = f"{float(x):.1e}".split("e")
+    if "." in mant:
+        mant = mant.rstrip("0").rstrip(".")
+    return f"{mant}e{int(exp)}"
 
 
 def _positive_float(value, name: str) -> float:
@@ -353,18 +362,6 @@ class BaseLivePlot:
     def update_core(self) -> None:
         raise NotImplementedError
 
-    def _set_colorbar_ticks(self, lo, hi) -> None:
-        """Set the colorbar's two end ticks, SKIPPING the relabel when the
-        limits are unchanged since the last call.  Reusable across any panel
-        with a colorbar: the labels are identical when (lo, hi) repeat (common
-        once a value saturates, e.g. occupancy pinned to 0..1), so skipping the
-        string reformat is appearance-neutral and removes per-tick work."""
-        key = (float(lo), float(hi))
-        if getattr(self, "_last_cbar_ticks", None) == key:
-            return
-        self._last_cbar_ticks = key
-        self._set_colorbar_ticks(lo, hi)
-
     def update(self, data_y=None, *, points_done: int | None = None, repeat_cur: int | None = None, draw: bool = True):
         """Refresh artists from current or newly supplied data."""
         if not self._shown:
@@ -419,6 +416,11 @@ class BaseLivePlot:
         return self.update(points_done=self.points_done, draw=draw)
 
     def relim(self, values=None) -> bool:
+        # "off": the y-limits are pinned by the caller (a dashboard panel with a
+        # manual ylim); keep ylim_min/ylim_max frozen so update_core's set_ylim
+        # re-applies the same fixed range instead of re-autoscaling each tick.
+        if self.relim_mode == "off":
+            return False
         vals = np.asarray(self.data_y[:, 0] if values is None else values, dtype=float)
         vals = vals[np.isfinite(vals)]
         if vals.size == 0:
@@ -465,7 +467,12 @@ class Live1D(BaseLivePlot):
             line.set_color(DEFAULT_COLORS[i % len(DEFAULT_COLORS)])
         self.ax.set_xlabel(self.xlabel)
         self.ax.set_ylabel(self.ylabel)
-        self.ax.set_xlim(self.data_x[0, 0], self.data_x[-1, 0])
+        # Only pin xlim when there are >=2 distinct x values; a single unique x
+        # (e.g. a 1-point first frame) would make low==high and trip a
+        # matplotlib "Attempting to set identical low and high xlims" warning --
+        # skip it and let matplotlib pick a default until more points arrive.
+        if np.unique(self.data_x[:, 0]).size >= 2:
+            self.ax.set_xlim(self.data_x[0, 0], self.data_x[-1, 0])
         self.relim()
         self.ax.set_ylim(self.ylim_min, self.ylim_max)
 
@@ -682,7 +689,7 @@ class Live2DDis(BaseLivePlot):
         cmap = self.image.get_cmap()
         self.line_l = self.axdis.axhline(self.ylim_min, color=cmap(0.0), linewidth=matplotlib.rcParams["legend.fontsize"] / 2)
         self.line_h = self.axdis.axhline(self.ylim_max, color=cmap(0.95), linewidth=matplotlib.rcParams["legend.fontsize"] / 2)
-        self._set_colorbar_ticks(y_min, y_max)
+        # colorbar end ticks are set by update_core (cax.set_yticks/labels)
         self.drag = DragHLine(self.line_l, self.line_h, self.update_clim, self.axdis)
 
     def _attach_interactions(self) -> None:
@@ -729,6 +736,14 @@ class Live2DDis(BaseLivePlot):
             extents_square=self.extents_square,
             bad_color=self.bad_color,
         )
+
+    def set_colorbar_visible(self, visible: bool) -> None:
+        """Show / hide the colorbar axes (the ``cax`` band).  A basic display
+        toggle for the dashboard Setting popup; the figure GEOMETRY (the split
+        widths) is unchanged -- only the colorbar axis is hidden, so the main
+        image keeps its place and size."""
+        if getattr(self, "cax", None) is not None:
+            self.cax.set_visible(bool(visible))
 
 
 class LiveSiteMap(BaseLivePlot):
@@ -818,16 +833,23 @@ class LiveSiteMap(BaseLivePlot):
         self.ax.set_ylabel(self.ylabel)
         self.cbar = self.fig.colorbar(self.sites, cax=self.cax)
         self.cbar.set_label(self.zlabel)
-        self._set_colorbar_ticks(lo, hi)
+        # colorbar ticks: matplotlib auto-ticks (occupancy/rate are 0..1)
 
     def update_core(self) -> None:
         self.sites.set_array(self.data_y[:, 0])
         lo, hi = self._value_limits()
         self.sites.set_clim(lo, hi)
-        self._set_colorbar_ticks(lo, hi)
 
     def _install_state(self) -> None:
         self.fig._zlc_state = PlotState(plot_type="SITES", x_array=self.data_x[:, 0], y_array=self.data_y, cax=self.cax)
+
+    def set_colorbar_visible(self, visible: bool) -> None:
+        """Show / hide the colorbar axes (the ``cax`` band).  A basic display
+        toggle for the dashboard Setting popup; the figure GEOMETRY (the split
+        widths) is unchanged -- only the colorbar axis is hidden, so the square
+        site image keeps its place and size."""
+        if getattr(self, "cax", None) is not None:
+            self.cax.set_visible(bool(visible))
 
 
 def _pulse_attr(row, name: str, default=None):
@@ -957,7 +979,16 @@ def pulse_plot_channels(
 # nothing else -- the visual language is owned here.
 PANEL_SIZES = ("1x2", "2x2", "1x4", "2x4")
 PANEL_UNIT_PX = (180, 240)     # (height, width) of one half-unit of the stock region
-PANEL_MARGINS_PX = (110, 110, 100, 70)   # stock margins (L, R, B, T) with the title
+PANEL_MARGINS_PX = (92, 86, 80, 52)      # stock margins (L, R, B, T) with the title.
+                                         # Tightened from (110,110,100,70): the data
+                                         # area was only ~47% of each figure (too much
+                                         # frame whitespace) AND the (B+T) margin is the
+                                         # exact per-figure-px slack a multi-row card's
+                                         # footer must absorb, so trimming it shrinks the
+                                         # visible bottom void too.  Held large enough for
+                                         # the y-label+ticks (L), the 2D/sites colorbar
+                                         # tick labels + z-label (R), the x-label+ticks (B)
+                                         # and the title strip (T) -- verified at 3 DPRs.
                                          # top slot ALWAYS reserved: a panel has one
                                          # size whether or not it carries a title
 # Panels are DISPLAYED scaled through the standard high-DPI canvas path

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import erf, sqrt
 from pathlib import Path
 from typing import Sequence
 import time
@@ -12,7 +13,20 @@ import numpy as np
 from ..core.analysis import finite_float, grid_shape_tuple, positive_int
 from ..core.utils import site_index
 from .base import CameraDevice, SequencerDevice, TrapArrayDevice
-from ..timing import PulseSequence, exposure_from_sequence, sequence_for_frame_count
+from ..timing import (
+    DEFAULT_CAMERA_TRIGGER_CHANNELS,
+    PulseSequence,
+    exposure_from_sequence,
+    sequence_for_frame_count,
+)
+
+
+# Boltzmann constant, atomic mass unit, and the Rb87 mass (SI).  Used ONLY by the
+# virtual data source's release-recapture loss model (below); the analysis layer
+# never sees these -- it only receives the resulting camera frames.
+_K_B = 1.380649e-23
+_AMU = 1.66053906660e-27
+_RB87_MASS = 86.909180527 * _AMU
 
 
 DEFAULT_CHANNELS = (
@@ -40,6 +54,23 @@ class VirtualTrapArray(TrapArrayDevice):
     read_noise_e: float = 0.43
     atom_sigma_px: float = 1.35
     detection_lifetime: float = 10.0
+    # --- Release-recapture loss model (data-source side only) -----------------
+    # When a fired sequence switches the trap OFF for ``t_off`` seconds between
+    # two camera exposures, atoms fly ballistically and are lost unless they stay
+    # within the capture region; the survival probability falls off with ``t_off``.
+    # The model is the standard ballistic release-recapture survival (3-D
+    # isotropic, point source): per axis an atom is recaptured if its speed obeys
+    # ``|v| < r_c / t_off``, so for a Maxwell-Boltzmann spread
+    # ``sigma_v = sqrt(k_B T / m)`` the per-axis fraction is ``erf(r_c / (sqrt2
+    # sigma_v t_off))`` and 3-D survival is that cubed.  ``recapture_temperature_K``
+    # sets the velocity spread (hotter -> faster decay) and ``capture_radius_m``
+    # the trap geometry; together they fix the characteristic ``t_off`` scale.
+    # Defaults give a clearly non-flat demo curve over ~0..300 us: survival is
+    # ~1 near t_off=0 and falls smoothly through ~0.5 around 75 us to a few % by
+    # 300 us (the half-survival scale is r_c / sqrt(2) sigma_v).
+    recapture_temperature_K: float = 50e-6
+    capture_radius_m: float = 6.0e-6
+    recapture_mass_kg: float = _RB87_MASS
     seed: int | None = 7
     occupancy: np.ndarray | None = None
     rng: np.random.Generator = field(init=False, repr=False)
@@ -57,6 +88,9 @@ class VirtualTrapArray(TrapArrayDevice):
         self.read_noise_e = nonnegative_float(self.read_noise_e, "read_noise_e")
         self.atom_sigma_px = positive_float(self.atom_sigma_px, "atom_sigma_px")
         self.detection_lifetime = positive_float(self.detection_lifetime, "detection_lifetime")
+        self.recapture_temperature_K = positive_float(self.recapture_temperature_K, "recapture_temperature_K")
+        self.capture_radius_m = positive_float(self.capture_radius_m, "capture_radius_m")
+        self.recapture_mass_kg = positive_float(self.recapture_mass_kg, "recapture_mass_kg")
         self.rng = np.random.default_rng(self.seed)
         if self.origin_px is None:
             ny, nx = self.grid_shape
@@ -123,6 +157,42 @@ class VirtualTrapArray(TrapArrayDevice):
             self.occupancy = next_occupancy
         return np.clip(noisy, 0, np.iinfo(np.uint16).max).astype(np.uint16)
 
+    def recapture_survival_probability(self, t_off: float) -> float:
+        """Ballistic release-recapture survival probability after a trap-off of ``t_off`` s.
+
+        Per axis an atom is recaptured if its ballistic displacement stays inside
+        the capture radius ``r_c``, i.e. ``|v| < r_c / t_off``; for a 1-D thermal
+        spread ``sigma_v = sqrt(k_B T / m)`` that fraction is
+        ``erf(r_c / (sqrt(2) sigma_v t_off))``, and the isotropic 3-D survival is
+        the cube.  ``t_off <= 0`` -> 1.0 (the atom cannot move).  This is the SAME
+        physics the analysis-side fit assumes, so a fitted temperature recovers a
+        value near ``recapture_temperature_K`` -- but it lives ONLY here, in the
+        data source; the analysis layer never reads it.
+        """
+
+        t = float(t_off)
+        if not np.isfinite(t) or t <= 0.0:
+            return 1.0
+        sigma_v = sqrt(_K_B * self.recapture_temperature_K / self.recapture_mass_kg)
+        arg = self.capture_radius_m / (sqrt(2.0) * sigma_v * t)
+        p_axis = erf(arg)
+        return float(p_axis**3)
+
+    def apply_recapture_loss(self, t_off: float) -> np.ndarray:
+        """Randomly drop currently-occupied atoms with the release-recapture model.
+
+        Mutates ``self.occupancy`` in place (the same atom loading is imaged again
+        afterward) and returns the new occupancy.  Each occupied site survives
+        independently with probability :meth:`recapture_survival_probability`.
+        """
+
+        p_survive = self.recapture_survival_probability(t_off)
+        if p_survive >= 1.0:
+            return self.occupancy.copy()
+        survive = self.rng.random(self.n_sites) < p_survive
+        self.occupancy = self.occupancy & survive
+        return self.occupancy.copy()
+
     def snapshot(self) -> dict[str, object]:
         return {
             "type": type(self).__name__,
@@ -131,6 +201,8 @@ class VirtualTrapArray(TrapArrayDevice):
             "offset_counts": self.offset_counts,
             "conversion_e_per_count": self.conversion_e_per_count,
             "read_noise_e": self.read_noise_e,
+            "recapture_temperature_K": self.recapture_temperature_K,
+            "capture_radius_m": self.capture_radius_m,
         }
 
     def close(self) -> None:
@@ -188,9 +260,32 @@ class VirtualCamera(CameraDevice):
             if force_all_sites is not None
             else (sequence is not None and sequence.name == "sitemap")
         )
-        for _ in range(frames):
+        # RELEASE-RECAPTURE LOSS (data-source side): if the fired sequence holds
+        # the trap OFF between two camera triggers (the release-recapture pulse),
+        # atoms fly ballistically during that gap and some are lost before the
+        # next frame.  We parse the per-frame trap-off time from the SAME sequence
+        # the analysis layer built, then apply the loss to the shared occupancy
+        # right before rendering the frame that follows the gap.  No analysis code
+        # learns of this: it only receives the resulting frames.
+        trigger_channels = getattr(sequencer, "trigger_channels", None)
+        trap_off_per_frame = trap_off_durations_per_frame(
+            sequence, frames, trigger_channels=trigger_channels
+        )
+        # One ``acquire`` is one experimental shot.  A load-each-frame imaging
+        # sequence reloads atoms before EVERY frame (its repeated cooling pulse =
+        # separate loadings).  A release-recapture sequence instead has ONE loading
+        # imaged twice with a trap-off between -- it carries no cooling pulse, so
+        # reload_each is False; we must still reload ONCE at the start of the shot
+        # so survival is measured against a FRESH loading each shot (otherwise the
+        # trap-off loss would compound across shots and drive survival to zero).
+        has_trap_off = any(t > 0.0 for t in trap_off_per_frame)
+        if has_trap_off and not reload_each and not all_sites:
+            self.trap_array.reload()
+        for frame_index in range(frames):
             if reload_each:
                 self.trap_array.reload()
+            elif trap_off_per_frame[frame_index] > 0.0:
+                self.trap_array.apply_recapture_loss(trap_off_per_frame[frame_index])
             image = self.trap_array.render_image(exposure=exposure, all_sites=all_sites)
             images.append(image)
         if sequencer is not None and sequence is not None:
@@ -382,6 +477,10 @@ def virtual_config_with_overrides(
         "atom_bright_rate": "atom_rate",
         "background_count_rate": "background_rate",
         "load_probability": "loading_probability",
+        # Release-recapture loss model conveniences (the demo temperature curve).
+        "temperature_K": "recapture_temperature_K",
+        "recapture_temperature": "recapture_temperature_K",
+        "capture_radius": "capture_radius_m",
     }
     for key, value in sitemap_params.items():
         target = aliases.get(key, key)
@@ -421,6 +520,73 @@ def sequence_requests_load(sequence: PulseSequence | None) -> bool:
     return any(pulse.channel in {"cooling", "mot", "load"} and pulse.value for pulse in sequence.effective_pulses())
 
 
+# The trap channel whose OFF gaps drive the release-recapture loss model.  The
+# release-recapture pulse (operations/temperature.build_release_recapture_pulse)
+# and the virtual config both name it "trap"; aliases cover common variants.
+DEFAULT_TRAP_CHANNELS = ("trap", "tweezer", "dipole")
+
+
+def trap_off_durations_per_frame(
+    sequence: PulseSequence | None,
+    frames: int,
+    *,
+    trigger_channels: Sequence[str] | None = None,
+    trap_channels: Sequence[str] = DEFAULT_TRAP_CHANNELS,
+) -> list[float]:
+    """Trap-off duration (s) that PRECEDES each acquired frame.
+
+    Parses the SAME ``PulseSequence`` the analysis layer fired.  Frames are bounded
+    by camera-trigger rises (``trigger_channels``); within the window between
+    trigger ``k-1`` and trigger ``k`` we look at the trap channel
+    (``trap_channels``) ON intervals and return the largest contiguous OFF gap --
+    that is ``t_off`` for the release-recapture pulse, whose trap-off period sits
+    exactly there.  The returned list has length ``frames``; entry 0 is always 0.0
+    (nothing precedes the first frame), and any frame with no intervening trap-off
+    (ordinary imaging, where the trap is held ON the whole time) is 0.0.
+
+    This is the data source's view of the hardware timing -- the only thing the
+    virtual backend reads to reproduce trap-off atom loss.  On real hardware the
+    physics does this for free; here we model it from the fired sequence so the
+    virtual survival curve is non-flat.
+    """
+
+    out = [0.0] * int(frames)
+    if sequence is None or frames < 2 or not hasattr(sequence, "effective_pulses"):
+        return out
+
+    trig_set = {str(c) for c in (DEFAULT_CAMERA_TRIGGER_CHANNELS if trigger_channels is None else trigger_channels)}
+    trap_set = {str(c) for c in trap_channels}
+    pulses = sequence.effective_pulses()
+
+    # Camera-trigger rise times define the frame boundaries.
+    trigger_starts = sorted(p.start for p in pulses if p.value and p.channel in trig_set)
+    if len(trigger_starts) < 2:
+        return out
+
+    # Trap ON intervals (merged is unnecessary: gaps are computed from sorted edges).
+    trap_intervals = sorted((p.start, p.stop) for p in pulses if p.value and p.channel in trap_set)
+
+    n = min(int(frames), len(trigger_starts))
+    for k in range(1, n):
+        window_lo = trigger_starts[k - 1]
+        window_hi = trigger_starts[k]
+        # Largest trap-off gap strictly inside (window_lo, window_hi): the union of
+        # trap-ON intervals leaves gaps; the trap-off period is the biggest one.
+        cursor = window_lo
+        biggest_gap = 0.0
+        for start, stop in trap_intervals:
+            if stop <= window_lo or start >= window_hi:
+                continue
+            clipped_start = max(start, window_lo)
+            if clipped_start > cursor:
+                biggest_gap = max(biggest_gap, clipped_start - cursor)
+            cursor = max(cursor, min(stop, window_hi))
+        if window_hi > cursor:
+            biggest_gap = max(biggest_gap, window_hi - cursor)
+        out[k] = float(biggest_gap)
+    return out
+
+
 def point_tuple(value, name: str) -> tuple[float, float]:
     try:
         raw = tuple(value)
@@ -454,9 +620,11 @@ def probability(value, name: str) -> float:
 
 __all__ = [
     "DEFAULT_CHANNELS",
+    "DEFAULT_TRAP_CHANNELS",
     "VirtualCamera",
     "VirtualSequencer",
     "VirtualTrapArray",
+    "trap_off_durations_per_frame",
     "virtual_config",
     "virtual_config_with_overrides",
     "virtual_loading_feed",

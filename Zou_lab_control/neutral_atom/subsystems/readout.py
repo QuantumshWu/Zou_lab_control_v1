@@ -8,8 +8,6 @@ from typing import TYPE_CHECKING, Any, Sequence
 
 import numpy as np
 
-from Zou_lab_control._viewer_registry import active_plotter
-
 from ..core.analysis import estimate_threshold_fidelity, otsu_threshold, positive_int
 from ..core.calibration import TrapCalibration
 from ..core.results import DetectionResult, DetectionTimeScanResult, SitemapResult, ThresholdResult
@@ -17,7 +15,17 @@ from ..core.utils import json_ready, site_index
 from ..operations import calibrate_sitemap_from_images, calibrate_threshold_from_images, detect_image
 from ..operations.fidelity import FidelityReport, characterize_readout
 from ..operations.imageio import index_run
-from ..views.plots import plot_detection_scan
+from ..operations.measurement import (
+    MeasurementSpec,
+    NFramePlan,
+    OtsuFidelityReducer,
+    ParamDecl,
+    ScanAxis,
+    ScanResult,
+    ScannedMeasurement,
+)
+from ..operations.temperature import ReleaseRecapturePlan, SurvivalReducer, build_release_recapture_pulse
+from ..timing import PulseTableState
 from .base import ExperimentSubsystem
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -257,6 +265,51 @@ class ReadoutSubsystem(ExperimentSubsystem):
             )
         return self._scan_detection_time(times, **kwargs)
 
+    def readout_duration_fidelity(self, times: Sequence[float] | None = None, **kwargs) -> DetectionTimeScanResult:
+        """Semantic alias of :meth:`detection_time`.
+
+        A detection-time scan IS a readout-duration-vs-fidelity measurement (it
+        sweeps the imaging/probe duration and reports single-shot fidelity).  This
+        name reads clearly next to :meth:`temperature` for callers/GUI that pick a
+        measurement by intent."""
+
+        return self.detection_time(times, **kwargs)
+
+    def build_detection_scan(
+        self,
+        times: Sequence[float],
+        *,
+        shots: int = 60,
+        site: int | None = None,
+        pulse: Any | None = None,
+    ) -> ScannedMeasurement:
+        """Build (but do not run) the readout-duration -> fidelity scan.
+
+        The exposure axis (``times`` seconds) x an ``NFramePlan`` x an
+        ``OtsuFidelityReducer`` over the one scan engine; ``pulse is None`` drives
+        the session imaging path (the ``_SessionImagingController`` adapter), a
+        bound ``PulseController`` drives its exposure slot and configures the real
+        camera per point.  Single source of truth for the detection-time scan:
+        both :meth:`_scan_detection_time` (live result wrapper) and the
+        Readout-duration measurement spec / feed call this same builder."""
+
+        s = self._session
+        times = np.asarray(times, dtype=float).reshape(-1)
+        if times.size == 0 or not np.all(np.isfinite(times)) or np.any(times <= 0):
+            raise ValueError("times must contain positive finite detection times.")
+        calibration = s.require_calibration(require_thresholds=False)
+        controller = self._scan_pulse(pulse, name="detect_time_scan")
+        axis = ScanAxis(slot="exposure", values=times, label="Detection time (s)", unit="s", kind="duration")
+        reducer = OtsuFidelityReducer(site=site)
+        plan: Any = NFramePlan(n_frames=positive_int(shots, "shots"))
+        if pulse is not None:
+            # Configure the real camera exposure per point, matching the prior path.
+            plan = _ExposureConfiguringPlan(plan, s.devices.camera)
+        return ScannedMeasurement(
+            controller, s.devices.camera, controller.sequencer, calibration,
+            axis, plan, reducer, shots_per_point=1,
+        )
+
     def _scan_detection_time(
         self,
         times: Sequence[float],
@@ -277,28 +330,22 @@ class ReadoutSubsystem(ExperimentSubsystem):
             raise ValueError("times must contain positive finite detection times.")
         shots = positive_int(shots, "shots")
         reference_shots = positive_int(reference_shots, "reference_shots")
-        data_y = np.full((len(times), 1), np.nan, dtype=float)
         reference_exposure = float(max(np.nanmax(times) * 3.0, s._camera_exposure()) if reference_exposure is None else reference_exposure)
         if not np.isfinite(reference_exposure) or reference_exposure <= 0:
             raise ValueError("reference_exposure must be positive and finite.")
 
-        if pulse is None:
-            reference_sequence = s._imaging_sequence(exposure=reference_exposure, load=True, name="reference_threshold")
-            reference_sequencer = getattr(s.devices, "sequencer", None)
-        else:
-            reference_x_ns = float(reference_exposure) * 1e9
-            configure = getattr(s.devices.camera, "configure", None)
-            if callable(configure):
-                configure(exposure=float(reference_exposure))
-            frame_sequence = getattr(pulse, "frame_sequence", None)
-            if not callable(frame_sequence):
-                raise TypeError("pulse must be a PulseController returned by exp.timing.bind_pulse(...) or na.bind_pulse(...).")
-            reference_sequence = frame_sequence(reference_shots, time_ns=reference_x_ns)
-            reference_sequencer = getattr(pulse, "sequencer", getattr(s.devices, "sequencer", None))
+        # The detection-time scan IS a ScannedMeasurement over the exposure axis
+        # with an N-frame plan and an otsu-fidelity reducer; build the controller
+        # (the session imaging path when no GUI pulse is bound) and reuse the one
+        # engine.  The reference-threshold acquisition stays here -- it is part of
+        # this specific result object, not of the generic scan loop.
+        reference_controller = self._scan_pulse(pulse, name="reference_threshold")
+        configure = getattr(s.devices.camera, "configure", None)
+        if pulse is not None and callable(configure):
+            configure(exposure=float(reference_exposure))
+        reference_sequence = reference_controller.frame_sequence(reference_shots, time_ns=float(reference_exposure) * 1e9)
         reference_images = s.devices.camera.acquire(
-            reference_shots,
-            sequence=reference_sequence,
-            sequencer=reference_sequencer,
+            reference_shots, sequence=reference_sequence, sequencer=reference_controller.sequencer,
         )
         # Extract through the calibration's own method (box or PSF), so a
         # detection-time scan on a PSF calibration uses PSF signals -- the same
@@ -311,65 +358,200 @@ class ReadoutSubsystem(ExperimentSubsystem):
             reference_values = reference_counts[:, site_idx_ref]
         reference_threshold = otsu_threshold(reference_values)
         reference_fidelity = estimate_threshold_fidelity(reference_values, reference_threshold)
+
+        scan = self.build_detection_scan(times, shots=shots, site=site, pulse=pulse)
+        reducer = scan.reducer
+        inner = scan.run(
+            live=live, update_time=update_time, display=display,
+            stop_hint="Live measurement started. Call scan.stop() to stop measurement and plot.",
+        )
+        # Share the reducer's list objects (not copies): a live scan fills them on
+        # the worker thread, so the returned result must see those same growing
+        # lists -- exactly as the prior inline `result.thresholds.append(...)` did.
         result = DetectionTimeScanResult(
             times=times,
-            data_y=data_y,
+            data_y=inner.data_y,
+            thresholds=reducer.thresholds,
+            model_fidelities=reducer.fidelities,
             reference_exposure=reference_exposure,
             reference_threshold=float(reference_threshold),
             reference_fidelity=None if not np.isfinite(reference_fidelity.fidelity) else float(reference_fidelity.fidelity),
             reference_counts=reference_counts,
+            measurement=inner.measurement,
+            plot=inner.plot,
         )
-
-        def measure(time_s: float, index: int | None = None) -> float:
-            if pulse is None:
-                sequence = s._imaging_sequence(exposure=float(time_s), load=True, name="detect_time_scan")
-                sequencer = getattr(s.devices, "sequencer", None)
-            else:
-                x_ns = float(time_s) * 1e9
-                configure = getattr(s.devices.camera, "configure", None)
-                if callable(configure):
-                    configure(exposure=float(time_s))
-                frame_sequence = getattr(pulse, "frame_sequence", None)
-                if not callable(frame_sequence):
-                    raise TypeError("pulse must be a PulseController returned by exp.timing.bind_pulse(...) or na.bind_pulse(...).")
-                sequence = frame_sequence(shots, time_ns=x_ns)
-                sequencer = getattr(pulse, "sequencer", getattr(s.devices, "sequencer", None))
-            images = s.devices.camera.acquire(shots, sequence=sequence, sequencer=sequencer)
-            counts = np.vstack([calibration.signals(image) for image in images])
-            if site is None:
-                values = counts.reshape(-1)
-            else:
-                site_idx = site_index(site, counts.shape[1])
-                values = counts[:, site_idx]
-            threshold = otsu_threshold(values)
-            model = estimate_threshold_fidelity(values, threshold)
-            fidelity = float(model.fidelity)
-            if not np.isfinite(fidelity):
-                fidelity = 0.5
-            result.thresholds.append(float(threshold))
-            result.model_fidelities.append(fidelity)
-            return fidelity
-
-        plotter = active_plotter()
-        if live and plotter is not None:
-            result.measurement = plotter.run(
-                times.reshape(-1, 1),
-                measure,
-                data_y=data_y,
-                labels=("Detection time (s)", "Fidelity", "Fidelity"),
-                update_time=update_time,
-                display=display,
-                stop_hint="Live measurement started. Call scan.stop() to stop measurement and plot.",
-            )
-            result.plot = result.measurement.plot
-        else:
-            # No viewer registered (headless / frontend not imported): run the
-            # scan synchronously and still return a complete result.
-            for index, time_s in enumerate(times):
-                data_y[index, 0] = measure(float(time_s), index)
-            result.plot = plot_detection_scan(times, data_y[:, 0], display=display)
         s.history.append(result)
         return result
+
+    def _scan_pulse(self, pulse: Any | None, *, name: str):
+        """Return the PulseController-shaped object the scan engine drives.
+
+        A GUI/bound ``PulseController`` is used directly; with ``pulse is None``
+        the scan falls back to the session's imaging sequence wrapped in a tiny
+        adapter that exposes the SAME ``frame_sequence``/``sequencer`` contract,
+        so the engine has a single code path."""
+
+        if pulse is not None:
+            if not callable(getattr(pulse, "frame_sequence", None)):
+                raise TypeError("pulse must be a PulseController returned by exp.timing.bind_pulse(...) or na.bind_pulse(...).")
+            return pulse
+        return _SessionImagingController(self._session, name=name)
+
+    def build_temperature_scan(
+        self,
+        t_off_s: Sequence[float],
+        *,
+        pulse: Any,
+        shots: int = 1,
+        per_site: bool = False,
+    ) -> ScannedMeasurement:
+        """Build (but do not run) the release-recapture survival scan.
+
+        The trap-off axis (``t_off_s`` seconds, bound slot ``s0``) x a
+        ``ReleaseRecapturePlan`` (two frames per point) x a ``SurvivalReducer``
+        over the one scan engine.  Single source of truth for release-recapture:
+        both :meth:`temperature` (which runs it) and the Temperature measurement
+        spec / feed call this same builder, so the API one-liner and the GUI
+        Start button drive identical acquisition.  Validates the bound pulse and
+        requires a thresholded calibration (survival is a binary occupancy
+        comparison)."""
+
+        s = self._session
+        t_off = np.asarray(t_off_s, dtype=float).reshape(-1)
+        if t_off.size == 0 or not np.all(np.isfinite(t_off)) or np.any(t_off < 0):
+            raise ValueError("t_off_s must contain non-negative finite trap-off times.")
+        calibration = s.require_calibration(require_thresholds=True)
+        if not callable(getattr(pulse, "frame_sequence", None)):
+            raise TypeError("pulse must be a PulseController returned by exp.timing.bind_pulse(...) or na.bind_pulse(...).")
+        if isinstance(getattr(pulse, "pulse", None), PulseTableState) and pulse.pulse.primary_time_slot() is None:
+            raise ValueError(
+                "release-recapture pulse has no duration scan slot for t_off; bind the trap-off "
+                "period via the GUI scan dot or build it with operations.temperature.build_release_recapture_pulse(...)."
+            )
+        reducer = SurvivalReducer(per_site=per_site)
+        if per_site:
+            reducer.bind_calibration(calibration)
+        axis = ScanAxis(slot="s0", values=t_off, label="Trap-off time (s)", unit="s", kind="duration")
+        return ScannedMeasurement(
+            pulse, s.devices.camera, getattr(pulse, "sequencer", getattr(s.devices, "sequencer", None)),
+            calibration, axis, ReleaseRecapturePlan(), reducer, shots_per_point=positive_int(shots, "shots"),
+        )
+
+    def temperature(
+        self,
+        t_off_s: Sequence[float] | None = None,
+        *,
+        pulse: Any,
+        shots: int = 1,
+        per_site: bool = False,
+        live: bool = True,
+        update_time: float = 0.05,
+        display: bool = True,
+    ) -> ScanResult:
+        """Release-recapture thermometry: sweep trap-off time, report survival.
+
+        Drives the bound release-recapture ``pulse`` (its trap-off period bound to
+        the primary time slot) over ``t_off_s`` (seconds), acquiring two frames per
+        point and reducing them to survival via ``calibration.detect``.  Requires a
+        thresholded calibration (survival is a binary occupancy comparison).
+        Returns a :class:`ScanResult`; post-process with
+        :func:`operations.temperature.fit_temperature` to recover the temperature."""
+
+        s = self._session
+        if t_off_s is None:
+            t_off_s = s.defaults.get(
+                "release_recapture_t_off",
+                np.array([0.0, 5e-6, 1e-5, 2e-5, 4e-5, 8e-5, 1.6e-4, 3.2e-4]),
+            )
+        scan = self.build_temperature_scan(t_off_s, pulse=pulse, shots=shots, per_site=per_site)
+        result = scan.run(
+            live=live, update_time=update_time, display=display,
+            stop_hint="Live release-recapture started. Call scan.stop() to stop measurement and plot.",
+        )
+        s.history.append(result)
+        return result
+
+    # --------------------------------------------------- declarative spec catalog
+    def measurement_specs(self) -> list[MeasurementSpec]:
+        """Declarative catalog of the readout measurements a GUI can drive.
+
+        Each :class:`MeasurementSpec` declares its parameters ONCE (the single
+        source of truth a GUI form and the API default both derive from) and a
+        ``build(**param_values)`` closure that returns an UNRUN
+        :class:`ScannedMeasurement` (a :class:`ScannedMeasurementFeed` then drives
+        it point-by-point into the console).  The closures capture this subsystem
+        (hence ``self._session`` = the experiment), so the console never needs to
+        hold the session.  Both closures route through the SAME builders the API
+        uses (:meth:`build_temperature_scan` / :meth:`build_detection_scan`), so
+        the GUI and the notebook one-liner cannot drift apart."""
+
+        return [self._temperature_spec(), self._readout_duration_spec()]
+
+    def _temperature_spec(self) -> MeasurementSpec:
+        s = self._session
+
+        def build(*, t_off=(0.0, 300.0, 13), shots=16, capture_radius=6.0, per_site=False, **_ignored):
+            t_min_us, t_max_us, points = _axis_range_tuple(t_off, "t_off")
+            t_off_s = np.linspace(float(t_min_us) * 1e-6, float(t_max_us) * 1e-6, int(points))
+            state = build_release_recapture_pulse(channels=list(s.devices.sequencer.channels))
+            from ..devices import bind_pulse  # lazy: keep subsystems->devices.sequencer off import-time graph
+
+            pulse = bind_pulse(s.devices.sequencer, state)
+            return self.build_temperature_scan(
+                t_off_s, pulse=pulse, shots=positive_int(shots, "shots"), per_site=bool(per_site),
+            )
+
+        params = (
+            ParamDecl("t_off", "Trap-off time", "axis_range", default=(0.0, 300.0, 13), unit="us",
+                      lo=0.0, hi=1e4, tooltip="Trap-off sweep min/max (us) and number of points."),
+            ParamDecl("shots", "Shots / point", "int", default=16, lo=1, hi=100_000,
+                      tooltip="Loadings averaged at each t_off (more = lower survival noise)."),
+            ParamDecl("capture_radius", "Capture radius", "float", default=6.0, unit="um", required=True,
+                      lo=1e-3, hi=1e3, tooltip="Trap capture radius (um); fixes the temperature scale for the fit."),
+            ParamDecl("per_site", "Per-site survival", "bool", default=False,
+                      tooltip="Report one survival column per site (else the array mean)."),
+        )
+        grid = None
+        trap = getattr(s.devices, "trap_array", None)
+        grid_shape = getattr(trap, "grid_shape", None)
+        if grid_shape is not None:
+            grid = (int(grid_shape[0]), int(grid_shape[1]))
+        return MeasurementSpec(
+            name="Temperature (release-recapture)",
+            params=params,
+            result_labels=("Trap-off time (s)", "Survival"),
+            x_key="rr_t_off",
+            y_key="rr_survival",
+            build=build,
+            grid_shape=grid,
+            # The fit needs the capture radius in METRES; the GUI param is um, so
+            # record the converter the consumer applies before calling fit_temperature.
+            metadata={"fit": "fit_temperature", "fit_param": "capture_radius", "fit_param_scale": 1e-6},
+        )
+
+    def _readout_duration_spec(self) -> MeasurementSpec:
+        def build(*, duration=(2.0, 5000.0, 11), shots=60, site=None, **_ignored):
+            d_min_us, d_max_us, points = _axis_range_tuple(duration, "duration")
+            times = np.linspace(float(d_min_us) * 1e-6, float(d_max_us) * 1e-6, int(points))
+            site_val = None if site in (None, "", -1) else int(site)
+            return self.build_detection_scan(times, shots=positive_int(shots, "shots"), site=site_val, pulse=None)
+
+        params = (
+            ParamDecl("duration", "Detection time", "axis_range", default=(2.0, 5000.0, 11), unit="us",
+                      lo=1e-3, hi=1e6, tooltip="Readout-duration sweep min/max (us) and number of points."),
+            ParamDecl("shots", "Shots / point", "int", default=60, lo=1, hi=100_000,
+                      tooltip="Frames pooled per point for the Otsu fidelity estimate."),
+            ParamDecl("site", "Site (optional)", "int", default=None, lo=0, hi=100_000,
+                      tooltip="Restrict the fidelity to one site index; leave blank to pool all sites."),
+        )
+        return MeasurementSpec(
+            name="Readout duration -> fidelity",
+            params=params,
+            result_labels=("Detection time (s)", "Fidelity"),
+            x_key="dur_detection_time",
+            y_key="dur_fidelity",
+            build=build,
+        )
 
     # ------------------------------------------------------------- persistence
     def load(self, path: str | Path) -> TrapCalibration:
@@ -380,6 +562,78 @@ class ReadoutSubsystem(ExperimentSubsystem):
 
     def clear(self) -> None:
         self._session._calibration = None
+
+
+def _axis_range_tuple(value, name: str) -> tuple[float, float, int]:
+    """Coerce an ``axis_range`` param value to ``(min, max, points)``.
+
+    Accepts a 3-tuple/list ``(min, max, points)`` (the GUI form's three boxes) and
+    validates it -- ``points`` >= 2, ``max`` > ``min``.  Kept dependency-free so
+    both the spec build closures and the GUI consumer can share one interpreter of
+    an axis-range value (no free-text eval)."""
+
+    try:
+        lo, hi, points = value
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be an (min, max, points) axis range, got {value!r}.")
+    lo, hi, points = float(lo), float(hi), int(points)
+    if not (np.isfinite(lo) and np.isfinite(hi)):
+        raise ValueError(f"{name} range bounds must be finite.")
+    if points < 2:
+        raise ValueError(f"{name} needs at least 2 points.")
+    if hi <= lo:
+        raise ValueError(f"{name} max ({hi}) must exceed min ({lo}).")
+    return lo, hi, points
+
+
+class _SessionImagingController:
+    """PulseController-shaped adapter over the session's imaging sequence.
+
+    Lets the detection-time scan run through the SAME ``ScannedMeasurement``
+    engine whether or not a GUI pulse is bound.  ``frame_sequence`` returns the
+    session's single-trigger imaging sequence at the requested exposure (the
+    camera repeats it per frame); ``set_time``/``set_slot`` are no-ops because the
+    exposure is carried by the sequence itself, not a scan slot."""
+
+    def __init__(self, session, *, name: str):
+        self._session = session
+        self._name = str(name)
+        self.sequencer = getattr(session.devices, "sequencer", None)
+        self.pulse = None
+
+    def set_time(self, value_ns: float) -> "_SessionImagingController":
+        return self
+
+    def set_slot(self, key, value: float) -> "_SessionImagingController":
+        return self
+
+    def frame_sequence(self, frames: int, *, time_ns: float | None = None, slots=None, trigger_channels=None):
+        exposure = self._session._camera_exposure() if time_ns is None else float(time_ns) * 1e-9
+        return self._session._imaging_sequence(exposure=exposure, load=True, name=self._name)
+
+
+class _ExposureConfiguringPlan:
+    """Wrap an N-frame plan to set the real camera exposure before each acquire.
+
+    The legacy detection-time scan called ``camera.configure(exposure=t)`` ahead
+    of every bound-pulse acquire so a real camera's integration window tracks the
+    scanned probe duration (the virtual camera derives exposure from the sequence
+    and ignores it -- harmless).  ``sequence_for`` runs immediately before
+    ``acquire`` in the engine, so configuring here keeps the prior ordering."""
+
+    def __init__(self, inner: NFramePlan, camera):
+        self.inner = inner
+        self._camera = camera
+
+    @property
+    def n_frames(self) -> int:
+        return self.inner.n_frames
+
+    def sequence_for(self, pulse, axis: ScanAxis, value: float):
+        configure = getattr(self._camera, "configure", None)
+        if callable(configure):
+            configure(exposure=float(value))
+        return self.inner.sequence_for(pulse, axis, value)
 
 
 __all__ = ["ReadoutSubsystem"]

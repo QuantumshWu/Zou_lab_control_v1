@@ -1420,8 +1420,8 @@ def test_task_console_signal_picker_and_declarative_params(monkeypatch):
 
 
 def test_task_console_panel_editor_tab(monkeypatch, tmp_path):
-    """The console has Dashboard + Panel Editor tabs; a card's Edit opens the
-    editor bound to a frozen snapshot, where a command-line fit, x/y limits and
+    """The console has Monitor + Control tabs; a card's Edit opens the Control
+    tab bound to a frozen snapshot, where a command-line fit, x/y limits and
     Save Fig work (the confocal-style heavy controls, kept off the Setting popup)."""
 
     pytest.importorskip("PyQt5")
@@ -1430,7 +1430,7 @@ def test_task_console_panel_editor_tab(monkeypatch, tmp_path):
     from Zou_lab_control.frontend import devtools as dt
 
     console = dt.demo_console(shots=20)
-    assert [console.tabs.tabText(i) for i in range(console.tabs.count())] == ["Dashboard", "Panel Editor"]
+    assert [console.tabs.tabText(i) for i in range(console.tabs.count())] == ["Monitor", "Control"]
 
     card = next(c for c in console.cards if c.config.kind == "1d")
     console._edit_card(card)
@@ -1478,9 +1478,10 @@ def test_task_console_setting_popup_border_is_scoped(monkeypatch):
     console.shutdown()
 
 
-def test_task_console_fit_overlay_and_relim_param(monkeypatch):
-    """A line panel can fit its current data and overlay the curve (pair with
-    Pause Plot), Clear removes it, and relim is a per-panel Display param."""
+def test_task_console_control_tab_fit_and_relim(monkeypatch):
+    """Curve fit and relim now live in the CONTROL tab (P4 moved them off the
+    lightweight Setting popup): a line panel's Control-tab fit overlays the
+    curve, Clear removes it, and the relim combo rebuilds the live card."""
 
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
@@ -1490,24 +1491,37 @@ def test_task_console_fit_overlay_and_relim_param(monkeypatch):
         FIT_MODELS, FITTABLE_KINDS, PanelCard, PanelConfig)
 
     assert set(FIT_MODELS) >= {"Lorentzian", "Gaussian"}
+    assert "1d" in FITTABLE_KINDS
     console = dt.demo_console(shots=5)
     card = PanelCard(PanelConfig(kind="1d", title="bump", row=0, col=0, size="2x2",
                                  source="value = bump"), parent=console.board)
+    console._attach_card(card)
     x = np.linspace(-5, 5, 60)
     card.refresh({"bump": 3.0 * np.exp(-(x ** 2) / (2 * 1.2 ** 2)) + 0.1, "shot": 1})
-    base = len(card.plotter.ax.lines)
-    card.fit_combo.setCurrentText("Gaussian")
-    card._do_fit()
-    assert card._fit_df is not None and card._fit_df.fit is not None
-    assert len(card.plotter.ax.lines) == base + 1            # one overlay line added
-    card._clear_fit()
-    assert card._fit_df is None and len(card.plotter.ax.lines) == base
-    # relim is a per-panel param and rebuilds the plotter with the new mode
-    assert "1d" in FITTABLE_KINDS
-    card._set_param("relim", "normal")
+
+    # the Setting popup has NO popup-fit handles anymore (moved to Control)
+    assert not hasattr(card, "fit_combo") and not hasattr(card, "_do_fit")
+
+    # Control tab: bind the card, fit a Gaussian on the frozen snapshot
+    console._edit_card(card)
+    base = len(console._editor_plotter.ax.lines)
+    console.ed_fit_combo.setCurrentText("Gaussian")
+    console.ed_fit_cmd.setText("")
+    console._editor_do_fit()
+    assert console._editor_df is not None and console._editor_df.fit is not None
+    assert len(console._editor_plotter.ax.lines) == base + 1
+    console._editor_clear_fit()
+    assert console._editor_df is None
+
+    # relim combo in Control persists config.params["relim"]; the live card
+    # picks it up on its next rebuild (the editor does NOT tear the live card
+    # down -- it reads from its plotter -- so persistence is the contract here)
+    console.ed_relim.setCurrentText("normal")
+    console._editor_set_relim()
+    assert card.config.params["relim"] == "normal"
+    card._reset_plot()                                       # force a fresh build
     card.refresh({"bump": np.ones(60), "shot": 2})
     assert card.plotter.relim_mode == "normal"
-    card.shutdown()
     console.shutdown()
 
 

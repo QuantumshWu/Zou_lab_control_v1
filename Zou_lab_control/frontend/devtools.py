@@ -198,6 +198,40 @@ def demo_console(*, scale: float = 1.0, size=(1480, 980), seed: int = 11, shots:
     return console
 
 
+def demo_console_measurements(*, scale: float = 1.0, size=(1480, 980), grid=(5, 7)):
+    """Return a shown :class:`TaskConsole` wired with the readout measurement
+    catalog (P5): the Control tab's Measurement section is the live form +
+    one-click Start, fed by a calibrated VIRTUAL session.
+
+    Only the camera frames are virtual -- the session calibrates and the specs
+    build through the SAME contract path real hardware uses, so this exercises
+    exactly what the lab sees (AGENTS.md "virtual == real").  The timer is left
+    RUNNING (unlike ``demo_console``) so a Start actually streams a curve; tests
+    drive ``run_to_completion()`` + ``refresh_once()`` for determinism.
+    """
+
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.task_console import TaskConsole, TaskConsoleState
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    import Zou_lab_control.neutral_atom as na
+
+    ensure_qt_app()
+    install_screenshot_font()
+    exp = na.connect("virtual", sitemap={"grid_shape": tuple(grid)})
+    exp.readout.sitemap(method="box", frames=4, display=False)
+    exp.readout.thresholds(frames=24, display=False)
+    measurements = exp.readout.measurement_specs()
+    hub = SignalHub()
+    # Start with an EMPTY board: the only Monitor panel is the result curve a
+    # Start click adds, so the measurement flow is the whole story.
+    console = TaskConsole(hub=hub, state=TaskConsoleState(name="measurements"), feeds=[],
+                          measurements=measurements, scale=scale, window_px=size)
+    console.show()
+    # Park on the Control tab so the Measurement form is the visible state.
+    console.tabs.setCurrentIndex(1)
+    return console
+
+
 def capture_user_view(target: str, out_dir, *, scales=(1.0, 1.25, 1.5), size=(1480, 1000),
                       shots: int = 60, settle_ms: int = 900, timeout: float = 300.0):
     """Render ``target`` ("console", "editor" or "parity") AS THE USER SEES IT
@@ -339,7 +373,7 @@ def capture_gallery(out_dir, *, settle_ms: int = 550) -> dict[str, Path]:
 
 
 __all__ = ["settle", "screenshot", "screenshot_tab", "demo_state", "demo_editor", "demo_console",
-           "capture_gallery", "capture_user_view"]
+           "demo_console_measurements", "capture_gallery", "capture_user_view"]
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised through capture_user_view subprocesses
