@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import erf, sqrt
 from typing import Sequence
 
 import numpy as np
 from scipy import ndimage
+
+from Zou_lab_control._readout_math import confidence_weighted_fidelity
 
 
 SUPPORTED_REDUCERS = ("mean", "sum", "median", "max")
@@ -200,16 +201,11 @@ def estimate_threshold_fidelity(values, threshold: float) -> FidelityEstimate:
     mu0, mu1 = float(np.mean(left)), float(np.mean(right))
     s0 = max(float(np.std(left, ddof=1)), 1e-12)
     s1 = max(float(np.std(right, ddof=1)), 1e-12)
-    w0, w1 = float(len(left)), float(len(right))
-    p_dark_correct = _normal_cdf(threshold, mu0, s0)
-    p_bright_correct = 1.0 - _normal_cdf(threshold, mu1, s1)
-    separation = abs(mu1 - mu0) / sqrt(s0 * s0 + s1 * s1)
-    raw_fidelity = (w0 * p_dark_correct + w1 * p_bright_correct) / (w0 + w1)
-    balance = 2.0 * min(left_fraction, right_fraction)
-    effective_separation = max(0.0, separation - 2.0)
-    separation_confidence = 1.0 - np.exp(-0.5 * effective_separation * effective_separation)
-    confidence = float(np.clip(balance * separation_confidence, 0.0, 1.0))
-    fidelity = 0.5 + (raw_fidelity - 0.5) * confidence
+    # Confidence-weighted fidelity, shared with the live histogram (one formula,
+    # so the saved-calibration fidelity and the GUI "fit F" can never disagree).
+    fidelity, _raw, separation = confidence_weighted_fidelity(
+        threshold, mu0, s0, float(len(left)), mu1, s1, float(len(right))
+    )
     return FidelityEstimate(threshold, float(fidelity), left_fraction, right_fraction, float(separation), mu0, mu1, s0, s1)
 
 
@@ -309,8 +305,6 @@ def reject_bool_values(values, name: str) -> None:
         raise ValueError(f"{name} must contain numeric values, not booleans.")
 
 
-def _normal_cdf(x: float, mu: float, sigma: float) -> float:
-    return 0.5 * (1.0 + erf((x - mu) / (sigma * sqrt(2.0))))
 
 
 __all__ = [

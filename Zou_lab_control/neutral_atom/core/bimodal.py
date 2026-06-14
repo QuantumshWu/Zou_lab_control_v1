@@ -19,7 +19,8 @@ import math
 
 import numpy as np
 from scipy.optimize import minimize_scalar
-from scipy.special import erf
+
+from Zou_lab_control._readout_math import normal_cdf
 
 
 @dataclass(frozen=True)
@@ -38,12 +39,6 @@ class BimodalFit:
     bright_above: bool
     ok: bool
     message: str = ""
-
-
-def _norm_cdf(x, mu: float, sigma: float):
-    sigma = max(float(sigma), 1e-12)
-    arr = 0.5 * (1.0 + erf((np.asarray(x, dtype=float) - mu) / (sigma * math.sqrt(2.0))))
-    return float(arr) if arr.ndim == 0 else arr
 
 
 def exact_otsu_threshold(values, *, min_fraction: float = 0.02) -> float:
@@ -103,11 +98,11 @@ def optimal_gaussian_threshold(mu_dark, sigma_dark, mu_bright, sigma_bright, *, 
 
     def err(t: float) -> float:
         if bright_above:
-            dark_err = 1.0 - float(_norm_cdf(t, mu_dark, sigma_dark))
-            bright_err = float(_norm_cdf(t, mu_bright, sigma_bright))
+            dark_err = 1.0 - float(normal_cdf(t, mu_dark, sigma_dark))
+            bright_err = float(normal_cdf(t, mu_bright, sigma_bright))
         else:
-            dark_err = float(_norm_cdf(t, mu_dark, sigma_dark))
-            bright_err = 1.0 - float(_norm_cdf(t, mu_bright, sigma_bright))
+            dark_err = float(normal_cdf(t, mu_dark, sigma_dark))
+            bright_err = 1.0 - float(normal_cdf(t, mu_bright, sigma_bright))
         return prior_dark * dark_err + prior_bright * bright_err
 
     res = minimize_scalar(err, bounds=(lo, hi), method="bounded")
@@ -127,11 +122,11 @@ def gaussian_fidelity(mu_dark, sigma_dark, mu_bright, sigma_bright, threshold, b
     if not np.isfinite([mu_dark, sigma_dark, mu_bright, sigma_bright, threshold]).all():
         return float("nan"), float("nan"), float("nan")
     if bright_above:
-        f_dark = float(_norm_cdf(threshold, mu_dark, sigma_dark))
-        f_bright = 1.0 - float(_norm_cdf(threshold, mu_bright, sigma_bright))
+        f_dark = float(normal_cdf(threshold, mu_dark, sigma_dark))
+        f_bright = 1.0 - float(normal_cdf(threshold, mu_bright, sigma_bright))
     else:
-        f_dark = 1.0 - float(_norm_cdf(threshold, mu_dark, sigma_dark))
-        f_bright = float(_norm_cdf(threshold, mu_bright, sigma_bright))
+        f_dark = 1.0 - float(normal_cdf(threshold, mu_dark, sigma_dark))
+        f_bright = float(normal_cdf(threshold, mu_bright, sigma_bright))
     return f_dark, f_bright, 0.5 * (f_dark + f_bright)
 
 

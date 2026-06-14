@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from math import ceil, erf, sqrt
+from math import ceil
 from typing import Any, Mapping, Sequence
 
 import matplotlib
@@ -15,6 +15,13 @@ from scipy.optimize import curve_fit
 
 from .canvas import FigureSpec, configure_canvas, create_axes_fixed, create_axes_grid, design_dpi, display_figure, grid_shape_for, new_figure, split_axes_horizontally
 from .selectors import DragHLine, DragVLine, InteractionBundle, PlotState, ZoomPan, attach_interaction
+from Zou_lab_control._readout_math import (
+    bimodal_jacobian,
+    bimodal_model,
+    confidence_weighted_fidelity,
+    gaussian,
+    gaussian_jacobian,
+)
 from .style import (
     PALETTE,
     apply_style,
@@ -517,21 +524,6 @@ class LiveLiveDis(Live1D):
             vals = np.array([0.0])
         return np.histogram(vals, bins=self.n_bins, range=(self.ylim_min, self.ylim_max))
 
-    @staticmethod
-    def _gauss_func(x, amp, mu, sigma):
-        return amp * np.exp(-((x - mu) ** 2) / (2.0 * sigma**2))
-
-    @staticmethod
-    def _gauss_func_jac(x, amp, mu, sigma):
-        # Analytic gradient of _gauss_func; sigma > 0 within the fit bounds, so it
-        # matches the model exactly.  Passing it to curve_fit skips the
-        # finite-difference Jacobian (the fit cost) with no change to the result.
-        x = np.asarray(x, dtype=float)
-        s = sigma if abs(sigma) > 1e-12 else 1e-12
-        e = np.exp(-((x - mu) ** 2) / (2.0 * s * s))
-        g = amp * e
-        return np.stack([e, g * (x - mu) / (s * s), g * (x - mu) ** 2 / (s ** 3)], axis=-1)
-
     def _update_gauss_fit(self):
         mask = self.n > 0
         centers = (self.bins[:-1] + self.bins[1:]) / 2
@@ -541,17 +533,17 @@ class LiveLiveDis(Live1D):
             return
         try:
             popt, _ = curve_fit(
-                self._gauss_func,
+                gaussian,
                 x,
                 y,
                 p0=[np.max(y), np.mean(x), max(np.ptp(x) / 4, 1e-12)],
                 bounds=([0, np.min(x), max(np.ptp(x) / 100, 1e-12)], [max(np.max(y) * 4, 1), np.max(x), max(np.ptp(x) * 10, 1e-12)]),
-                jac=self._gauss_func_jac,
+                jac=gaussian_jacobian,
             )
         except Exception:
             return
         x_fit = np.linspace(self.ylim_min, self.ylim_max, 100)
-        self.gauss_line.set_data(self._gauss_func(x_fit, *popt), x_fit)
+        self.gauss_line.set_data(gaussian(x_fit, *popt), x_fit)
         if popt[1] <= 0:
             label = r"$\sigma$=0"
         else:
@@ -1624,33 +1616,6 @@ class HistogramFigure(BaseLivePlot):
             return {}
         return {int(state): float(np.mean(states == state)) for state in np.unique(states)}
 
-    @staticmethod
-    def _gauss(x, amp, mu, sigma):
-        sigma = max(float(abs(sigma)), 1e-12)
-        return amp * np.exp(-((x - mu) ** 2) / (2 * sigma**2))
-
-    @classmethod
-    def _bimodal_model(cls, x, amp0, mu0, sigma0, amp1, mu1, sigma1):
-        return cls._gauss(x, amp0, mu0, sigma0) + cls._gauss(x, amp1, mu1, sigma1)
-
-    @staticmethod
-    def _gauss_jac_columns(x, amp, mu, sigma):
-        # Analytic gradient of _gauss w.r.t (amp, mu, sigma); within the fit
-        # bounds sigma > 0 so this matches _gauss exactly.  Supplying it to
-        # curve_fit removes the finite-difference Jacobian (the bulk of the fit
-        # cost) WITHOUT changing the converged parameters.
-        x = np.asarray(x, dtype=float)
-        s = max(float(abs(sigma)), 1e-12)
-        e = np.exp(-((x - mu) ** 2) / (2.0 * s * s))
-        g = amp * e
-        return e, g * (x - mu) / (s * s), g * (x - mu) ** 2 / (s ** 3)
-
-    @classmethod
-    def _bimodal_jac(cls, x, amp0, mu0, sigma0, amp1, mu1, sigma1):
-        a0, m0, s0 = cls._gauss_jac_columns(x, amp0, mu0, sigma0)
-        a1, m1, s1 = cls._gauss_jac_columns(x, amp1, mu1, sigma1)
-        return np.stack([a0, m0, s0, a1, m1, s1], axis=-1)
-
     def _fit_bimodal(self) -> None:
         vals = self.values[np.isfinite(self.values)]
         if vals.size < 6 or np.ptp(vals) == 0:
@@ -1681,8 +1646,8 @@ class HistogramFigure(BaseLivePlot):
             [max(amp * 5, 1), float(np.nanmax(vals)), span * 2, max(amp * 5, 1), float(np.nanmax(vals)), span * 2],
         )
         try:
-            popt, _ = curve_fit(self._bimodal_model, centers, counts, p0=p0, bounds=bounds,
-                                 jac=self._bimodal_jac, maxfev=20000)
+            popt, _ = curve_fit(bimodal_model, centers, counts, p0=p0, bounds=bounds,
+                                 jac=bimodal_jacobian, maxfev=20000)
         except Exception:
             self.bimodal_popt = None
             self.fit_threshold = None
@@ -1692,20 +1657,15 @@ class HistogramFigure(BaseLivePlot):
             popt = np.array([popt[3], popt[4], popt[5], popt[0], popt[1], popt[2]], dtype=float)
         self.bimodal_popt = popt
         x_fit = np.linspace(self.bins[0], self.bins[-1], 400)
-        y0 = self._gauss(x_fit, *popt[:3])
-        y1 = self._gauss(x_fit, *popt[3:])
+        y0 = gaussian(x_fit, *popt[:3])
+        y1 = gaussian(x_fit, *popt[3:])
         self.fit_line_left.set_data(x_fit, y0)
         self.fit_line_right.set_data(x_fit, y1)
         self.fit_line_total.set_data(x_fit, y0 + y1)
         lo, hi = float(popt[1]), float(popt[4])
         x_mid = np.linspace(lo, hi, 400)
-        diff = np.abs(self._gauss(x_mid, *popt[:3]) - self._gauss(x_mid, *popt[3:]))
+        diff = np.abs(gaussian(x_mid, *popt[:3]) - gaussian(x_mid, *popt[3:]))
         self.fit_threshold = float(x_mid[int(np.nanargmin(diff))])
-
-    @staticmethod
-    def _normal_cdf(x, mu, sigma):
-        sigma = max(float(abs(sigma)), 1e-12)
-        return 0.5 * (1 + erf((float(x) - float(mu)) / (sigma * sqrt(2))))
 
     def _fit_fidelity(self, threshold: float) -> float | None:
         if self.bimodal_popt is None:
@@ -1715,14 +1675,10 @@ class HistogramFigure(BaseLivePlot):
         w1 = abs(amp1 * sigma1)
         if (w0 + w1) == 0:
             return None
-        left_ok = self._normal_cdf(threshold, mu0, sigma0)
-        right_ok = 1 - self._normal_cdf(threshold, mu1, sigma1)
-        raw = float((w0 * left_ok + w1 * right_ok) / (w0 + w1))
-        separation = abs(float(mu1) - float(mu0)) / sqrt(float(sigma0) ** 2 + float(sigma1) ** 2)
-        balance = 2.0 * min(w0, w1) / (w0 + w1)
-        effective_separation = max(0.0, separation - 2.0)
-        confidence = float(np.clip(balance * (1.0 - np.exp(-0.5 * effective_separation * effective_separation)), 0.0, 1.0))
-        return float(0.5 + (raw - 0.5) * confidence)
+        # The ONE confidence-weighted fidelity formula, shared with the
+        # saved-calibration fidelity (core) so the GUI and the record never drift.
+        fidelity, _raw, _sep = confidence_weighted_fidelity(threshold, mu0, sigma0, w0, mu1, sigma1, w1)
+        return float(fidelity)
 
     def _on_threshold_drag(self, x: float) -> None:
         if not self.thresholds:
