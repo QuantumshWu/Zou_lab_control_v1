@@ -144,7 +144,10 @@ def generate_fpga_manual_figures(asset_dir: str | Path) -> dict[str, Path]:
         periods=[na.PulsePeriod(40, (1, 0), unit="ns"), na.PulsePeriod(40, (0, 1), unit="ns"),
                  na.PulsePeriod(40, (0, 0), unit="ns")])
     rep_seq = rep.to_sequence(expand_repeat=False)
-    dur = max((float(r["stop"]) for r in __import__("Zou_lab_control.frontend.live", fromlist=["_pulse_rows"])._pulse_rows(rep_seq)), default=120e-9)
+    # Use the sequence's own duration (timing layer) rather than reaching into a
+    # private frontend symbol -- the manual generator must not depend on
+    # frontend internals (decoupling; see AGENTS.md §2).
+    dur = float(getattr(rep_seq, "duration", 0.0)) or 120e-9
     # in-figure text must be ASCII (the bundled DejaVu Sans has no CJK glyphs); the
     # Chinese explanation lives in the LaTeX \caption rendered by xelatex.
     figs["repeat"] = _render_pulse_png(asset_dir / "fpga_repeat.png", rep_seq, channels=["ch00", "ch01"],

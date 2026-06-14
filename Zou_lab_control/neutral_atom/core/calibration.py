@@ -18,7 +18,7 @@ from typing import Any, Sequence
 
 import numpy as np
 
-from .analysis import AtomDetection, centers_array, grid_shape_tuple, roi_counts, threshold_array
+from .analysis import AtomDetection, centers_array, grid_shape_tuple, nonnegative_int, roi_counts, threshold_array
 from .psf import psf_signals
 
 SUPPORTED_METHODS = ("box", "psf")
@@ -179,15 +179,6 @@ class TrapCalibration:
                 metadata=metadata,
             )
         return cls.from_dict(json.loads(path.read_text(encoding="utf-8")))
-
-
-def nonnegative_int(value, name: str) -> int:
-    if isinstance(value, (bool, np.bool_)):
-        raise ValueError(f"{name} must be a non-negative integer.")
-    numeric = float(value)
-    if not np.isfinite(numeric) or int(numeric) != numeric or numeric < 0:
-        raise ValueError(f"{name} must be a non-negative integer.")
-    return int(numeric)
 
 
 __all__ = ["TrapCalibration", "SUPPORTED_METHODS"]

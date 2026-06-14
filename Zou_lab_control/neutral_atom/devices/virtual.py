@@ -9,6 +9,7 @@ import time
 import numpy as np
 
 from ..core.analysis import finite_float, grid_shape_tuple, positive_int
+from ..core.utils import site_index
 from .base import CameraDevice, SequencerDevice, TrapArrayDevice
 from ..timing import PulseSequence, exposure_from_sequence, sequence_for_frame_count
 
@@ -364,15 +365,6 @@ def sequence_requests_load(sequence: PulseSequence | None) -> bool:
     if sequence is None:
         return False
     return any(pulse.channel in {"cooling", "mot", "load"} and pulse.value for pulse in sequence.effective_pulses())
-
-
-def site_index(value, n_sites: int) -> int:
-    if isinstance(value, (bool, np.bool_)):
-        raise ValueError("site index must be an integer, not a boolean.")
-    numeric = finite_float(value, "site index")
-    if int(numeric) != numeric or numeric < 0 or numeric >= n_sites:
-        raise ValueError(f"site index must be in [0, {n_sites}).")
-    return int(numeric)
 
 
 def point_tuple(value, name: str) -> tuple[float, float]:
