@@ -60,6 +60,19 @@ _PULSE_Y_PAD_TOP = 0.38              # gap above the top channel row (row units)
 _PULSE_MARGINS_PX = (110, 90, 100, 50)   # owned pulse-plot margins (L, R, B, T)
 _PULSE_DPI = 300                          # the ONE design dpi (never per-call)
 
+# Owned geometry for the per-site histogram grid (site_histogram_grid).  Mirrors
+# the pulse-plot many-data policy: a FIXED small per-cell box, COLUMNS capped so
+# the figure never runs off-screen sideways, and ROWS that grow (wrap) for large
+# N.  Sized so a typical trap grid (e.g. 5x7) lands near one standard plot's
+# 700x500 px footprint instead of ~2x it.
+_SITE_CELL_PX = (104, 84)                 # (width, height) of one site cell box
+_SITE_COL_GAP_PX = 12
+_SITE_ROW_GAP_PX = 16
+# (L, R, B, T) around the whole grid: B holds the bottom-row tick labels AND the
+# outer x-axis label (two text rows, so it is generous); T holds the suptitle.
+_SITE_GRID_MARGINS_PX = (54, 20, 62, 42)
+_SITE_MAX_COLS = 7                        # column cap (pulse-style width cap); extra sites wrap to rows
+
 
 def _as_data_x(data_x) -> np.ndarray:
     x = np.asarray(data_x, dtype=float)
@@ -1844,7 +1857,7 @@ def site_histogram_grid(
         raise ValueError("thresholds must have one value per site.")
     fids = None if site_fidelities is None else np.asarray(site_fidelities, dtype=float).reshape(-1)
 
-    nrows, ncols = grid_shape_for(n_sites, prefer=grid_shape)
+    nrows, ncols = grid_shape_for(n_sites, prefer=grid_shape, max_cols=_SITE_MAX_COLS)
 
     # Shared x-range (robust) across all sites, so cells are directly comparable.
     pooled = np.concatenate([v[np.isfinite(v)] for v in values if v.size]) if any(v.size for v in values) else np.array([0.0, 1.0])
@@ -1857,7 +1870,11 @@ def site_histogram_grid(
     edges = np.linspace(lo, hi, int(bins) + 1)
 
     fig = new_figure(spec=FigureSpec())
-    axes = create_axes_grid(fig, nrows, ncols)
+    axes = create_axes_grid(
+        fig, nrows, ncols,
+        cell_px=_SITE_CELL_PX, col_gap_px=_SITE_COL_GAP_PX,
+        row_gap_px=_SITE_ROW_GAP_PX, margins_px=_SITE_GRID_MARGINS_PX,
+    )
     small = matplotlib.rcParams["legend.fontsize"]
 
     for k, ax in enumerate(axes):
@@ -1878,10 +1895,12 @@ def site_histogram_grid(
             ax.axvline(float(thr[k]), color="orange", linewidth=1.4, alpha=0.95, zorder=5)
         ax.set_xlim(lo, hi)
         top = ax.get_ylim()[1]
-        ax.set_ylim(0, top * 1.34 if top > 0 else 1.0)  # headroom so the label clears the bars
-        tag = f"s{k}" if fids is None or not np.isfinite(fids[k]) else f"s{k}  {fids[k]*100:.1f}%"
-        ax.text(0.045, 0.93, tag, transform=ax.transAxes, ha="left", va="top",
-                fontsize=small, color="black")
+        ax.set_ylim(0, top * 1.45 if top > 0 else 1.0)  # headroom so the stacked tag clears the bars
+        # Tag stacked at top-left (site id over fidelity) so it fits a narrow cell
+        # with no horizontal collision even for two-digit sites at 100%.
+        tag = f"s{k}" if fids is None or not np.isfinite(fids[k]) else f"s{k}\n{fids[k] * 100:.0f}%"
+        ax.text(0.06, 0.95, tag, transform=ax.transAxes, ha="left", va="top",
+                fontsize=small, color="black", linespacing=0.92)
         ax.tick_params(labelsize=small, length=2)
         ax.set_yticklabels([])           # counts scale varies per cell; shape is the point
         row, col = divmod(k, ncols)
@@ -1895,7 +1914,7 @@ def site_histogram_grid(
              rotation="vertical", fontsize=small)
     if title:
         fig.text(0.5, 0.992, str(title), ha="center", va="top",
-                 fontsize=matplotlib.rcParams["axes.titlesize"])
+                 fontsize=matplotlib.rcParams["axes.labelsize"])
 
     grid = SiteHistogramGrid(fig, axes, n_sites)
     if display:
