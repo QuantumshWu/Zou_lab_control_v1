@@ -35,12 +35,18 @@ cam.snapshot()
 <!-- cell:markdown -->
 ## 2. 先抓一帧（确认相机 + 触发都通了）
 
-`acquire(1)` 等**一个**外部触发沿、返回一帧。卡住约 2 秒后 `TimeoutError` = 没收到触发（去看你的 sequencer 触发是否在发、接线对不对）。这一帧用 `zf.plot(..., kind="2d")` 静态显示。
+`acquire(1)` 等**一个**外部触发沿、返回一帧。卡住约 2 秒后 `TimeoutError` = 没收到触发（去看你的 sequencer 触发是否在发、接线对不对）。
+
+原始帧是 `(H, W)` 数组；框架的 2D 图按“每像素 `(x, y)` + 计数值”渲染（task console 的 2D 面板内部也是这么转的——**不能**把 `(H,W)` 直接丢给 `zf.plot(..., kind="2d")`，它要的是 `(N, 2)` 坐标）。下面把帧摊成坐标 + 一列值再画。
 
 <!-- cell:code -->
 frame = cam.acquire(1)[0]
 print("frame:", frame.shape, frame.dtype, "min/max =", int(frame.min()), int(frame.max()))
-zf.plot(frame, kind="2d")
+
+ny, nx = frame.shape
+xx, yy = np.meshgrid(np.arange(nx), np.arange(ny))
+zf.plot(np.column_stack([xx.ravel(), yy.ravel()]), frame.ravel(),
+        kind="2d", labels=("X (px)", "Y (px)", "counts"))
 
 <!-- cell:markdown -->
 ## 3. 实时 2D：一个抓帧 feed + task console
