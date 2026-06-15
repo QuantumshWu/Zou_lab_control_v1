@@ -61,6 +61,7 @@ from .jupyter import (
     write_frontend_tutorial,
     write_neutral_atom_fpga_server_tutorial,
     write_neutral_atom_hardware_tutorial,
+    write_neutral_atom_qcmos_live_tutorial,
     write_neutral_atom_tutorial,
     write_notebook,
 )
@@ -214,6 +215,7 @@ __all__ = [
     "write_frontend_tutorial",
     "write_neutral_atom_fpga_server_tutorial",
     "write_neutral_atom_hardware_tutorial",
+    "write_neutral_atom_qcmos_live_tutorial",
     "write_neutral_atom_tutorial",
     "write_notebook",
     "write_notes_tex",
