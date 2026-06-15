@@ -60,51 +60,63 @@ def _console(measurements):
     return console
 
 
+def _open_measurement_editor(console, index=0):
+    """Create a measurement panel via the header's Add Panel and return
+    (spec, result_card, panel_editor, meas_form) -- the form lives in the
+    panel's OWN Edit tab now, not a global Control launcher."""
+    spec = console.measurements[index]
+    kc = console.kind_combo
+    i = next(j for j in range(kc.count()) if kc.itemData(j) == ("measurement", spec.name))
+    kc.setCurrentIndex(i)
+    console._add_panel()
+    card = next(c for c in console.cards if c.config.params.get("measurement") == spec.name)
+    editor = console._panel_editors[id(card)]
+    return spec, card, editor, editor.meas_panel
+
+
 # ----------------------------------------------------------------- plumbing
-def test_no_measurements_keeps_placeholder_disabled():
-    """Omitting measurements leaves the section a disabled placeholder (no
-    backward-compat break for the plain console)."""
+def test_no_measurements_no_measurement_entries_in_add_panel():
+    """With no measurements wired, the Add Panel combo lists ONLY plot kinds (no
+    measurement entries), and there is no global measurement form (the empty
+    Control launcher is gone)."""
     console = _console(())
     try:
-        assert console.measurement_group is not None
-        assert not console.measurement_group.isEnabled()
+        kc = console.kind_combo
+        data = [kc.itemData(i) for i in range(kc.count())]
+        assert not any(isinstance(d, tuple) and d and d[0] == "measurement" for d in data)
         assert console.measurement_panel is None
-        assert console.measurement_placeholder is not None
+        assert console.measurement_group is None
     finally:
         console.shutdown()
 
 
-def test_measurements_enable_section_and_list_specs():
+def test_measurements_listed_in_add_panel():
     exp = _calibrated_virtual_session()
     specs = exp.readout.measurement_specs()
     console = _console(specs)
     try:
-        assert console.measurement_group.isEnabled()
-        panel = console.measurement_panel
-        names = [panel.type_combo.itemText(i) for i in range(panel.type_combo.count())]
-        assert names == [s.name for s in specs]
+        kc = console.kind_combo
+        entries = [kc.itemData(i) for i in range(kc.count())]
+        meas = [d[1] for d in entries if isinstance(d, tuple) and d and d[0] == "measurement"]
+        assert meas == [s.name for s in specs]
     finally:
         console.shutdown()
 
 
-def test_selecting_temperature_generates_typed_form_with_required_param():
+def test_measurement_panel_edit_generates_typed_form_with_required_param():
     exp = _calibrated_virtual_session()
     specs = exp.readout.measurement_specs()
     console = _console(specs)
     try:
-        panel = console.measurement_panel
-        panel.type_combo.setCurrentIndex(0)        # Temperature
-        panel._rebuild_form()
-        spec = panel.current_spec()
-        # one widget entry per declared param, keyed by param key
-        assert set(panel._widgets) == {d.key for d in spec.params}
-        # widget kinds follow the declarations
-        assert panel._widgets["t_off"][0] == "axis_range"     # min/max/points triplet
-        assert panel._widgets["shots"][0] == "int"
-        assert panel._widgets["capture_radius"][0] == "float"
-        assert panel._widgets["per_site"][0] == "bool"
-        # the required capture_radius control exists and is read back by kind
-        vals = panel.collect_values()
+        spec, card, editor, form = _open_measurement_editor(console, 0)
+        # the measurement's parameters are an auto-generated form IN the Edit tab
+        assert form is not None
+        assert set(form._widgets) == {d.key for d in spec.params}
+        assert form._widgets["t_off"][0] == "axis_range"     # min/max/points triplet
+        assert form._widgets["shots"][0] == "int"
+        assert form._widgets["capture_radius"][0] == "float"
+        assert form._widgets["per_site"][0] == "bool"
+        vals = form.collect_values()
         assert set(vals) == {d.key for d in spec.params}
         assert isinstance(vals["t_off"], tuple) and len(vals["t_off"]) == 3
         assert vals["capture_radius"] == pytest.approx(spec.param("capture_radius").default)
@@ -113,108 +125,63 @@ def test_selecting_temperature_generates_typed_form_with_required_param():
         console.shutdown()
 
 
-# ----------------------------------------------------------------- one-click Start
-def test_start_builds_feed_registers_and_adds_result_panel():
+# ----------------------------------------------------------------- Start RE-RUNS
+def test_edit_start_reruns_into_same_result_panel():
+    """Start in a measurement panel's Edit streams the scan into THAT panel
+    (reusing the card Add Panel created -- no pile-up), and the result is the
+    SAME decaying survival contract real hardware runs."""
     exp = _calibrated_virtual_session(grid=(5, 7))
     specs = exp.readout.measurement_specs()
     console = _console(specs)
     try:
         from Zou_lab_control.neutral_atom.operations.feeds import ScannedMeasurementFeed
 
-        panel = console.measurement_panel
-        panel.type_combo.setCurrentIndex(0)
-        panel._rebuild_form()
-        # small, fast scan
-        _, lo, hi, pts = panel._widgets["t_off"]
+        spec, card, editor, form = _open_measurement_editor(console, 0)
+        _, lo, hi, pts = form._widgets["t_off"]
         lo.setValue(0.0); hi.setValue(120.0); pts.setValue(5)
-        panel._widgets["shots"][1].setValue(8)
+        form._widgets["shots"][1].setValue(8)
 
-        n_feeds, n_cards = len(console.feeds), len(console.cards)
-        console._start_measurement(panel.current_spec())
-
-        # a ScannedMeasurementFeed was registered (so Pause Meas. can manage it)
-        assert len(console.feeds) == n_feeds + 1
+        n_cards = len(console.cards)
+        console._start_measurement(form)
         feed = console._meas_feed
-        assert isinstance(feed, ScannedMeasurementFeed)
-        assert feed in console._controllable_feeds()
-        # a result panel was added to the Monitor board
-        assert len(console.cards) == n_cards + 1
-        spec = panel.current_spec()
+        assert isinstance(feed, ScannedMeasurementFeed) and feed in console.feeds
+        # NO new card: Start re-runs the panel Add Panel already created
+        assert len(console.cards) == n_cards
         result = [c for c in console.cards if c.config.params.get("measurement") == spec.name]
-        assert len(result) == 1 and result[0].config.kind == "1d"
+        assert len(result) == 1 and result[0] is card
 
-        # run it to completion (the background thread self-stops; we drive it sync)
         feed.stop()
         feed.run_to_completion()
-        console.refresh_once()     # poll completion + refresh the curve panel
+        console.refresh_once()
 
         x = console.hub.latest(spec.x_key)
         y = console.hub.latest(spec.y_key)
         assert x.shape == (5,) and y.shape == (5,)
         assert np.all(np.isfinite(y)) and np.all((y >= 0) & (y <= 1))
-        # decaying survival (the SAME contract path real hardware runs)
         assert y[0] > y[-1] + 0.3
-        # the result curve panel plots y vs the scan x (col 0), not arange
-        plotter = result[0].plotter
-        assert plotter is not None
-        assert np.allclose(plotter.data_x[:, 0], x)
-        # the spec's fit ran and the panel reports a temperature
-        assert "T" in panel.status.text() and "µK" in panel.status.text()
+        assert np.allclose(card.plotter.data_x[:, 0], x)
+        assert "T" in form.status.text() and "µK" in form.status.text()
     finally:
         console.shutdown()
 
 
-def test_finished_feed_is_not_restarted_by_resume():
-    """A scan that has run to completion must not be restarted by "Resume
-    Meas.": a finished ScannedMeasurementFeed is excluded from the controllable
-    set, so _toggle_measurement never re-starts it (which would spawn an idle
-    daemon thread spinning on StopIteration)."""
+def test_edit_start_then_stop_releases_controls_and_stops_feed():
     exp = _calibrated_virtual_session(grid=(2, 3))
     specs = exp.readout.measurement_specs()
     console = _console(specs)
     try:
-        panel = console.measurement_panel
-        panel.type_combo.setCurrentIndex(0)
-        panel._rebuild_form()
-        _, lo, hi, pts = panel._widgets["t_off"]
+        spec, card, editor, form = _open_measurement_editor(console, 0)
+        _, lo, hi, pts = form._widgets["t_off"]
         lo.setValue(0.0); hi.setValue(60.0); pts.setValue(3)
-        panel._widgets["shots"][1].setValue(2)
+        form._widgets["shots"][1].setValue(2)
 
-        console._start_measurement(panel.current_spec())
-        feed = console._meas_feed
-        # run the scan to completion synchronously (no background thread)
-        feed.stop()
-        feed.run_to_completion()
-        assert feed.finished
-
-        # the finished feed drops out of the controllable set -> never resumed
-        assert feed not in console._controllable_feeds()
-        console._toggle_measurement()              # "Resume Meas." click
-        assert feed.running is False                # no idle daemon thread spawned
-    finally:
-        console.shutdown()
-
-
-def test_start_then_stop_releases_controls_and_stops_feed():
-    exp = _calibrated_virtual_session(grid=(2, 3))
-    specs = exp.readout.measurement_specs()
-    console = _console(specs)
-    try:
-        panel = console.measurement_panel
-        panel.type_combo.setCurrentIndex(0)
-        panel._rebuild_form()
-        _, lo, hi, pts = panel._widgets["t_off"]
-        lo.setValue(0.0); hi.setValue(60.0); pts.setValue(3)
-        panel._widgets["shots"][1].setValue(2)
-
-        console._start_measurement(panel.current_spec())
+        console._start_measurement(form)
         feed = console._meas_feed
         console._stop_measurement()
-        # cooperative stop: the feed's stop event is set; Start is re-enabled
         feed.stop()
         assert feed.running is False
-        assert panel.start_button.isEnabled()
-        assert not panel.stop_button.isEnabled()
+        assert form.start_button.isEnabled()
+        assert not form.stop_button.isEnabled()
     finally:
         console.shutdown()
 

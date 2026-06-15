@@ -1,8 +1,11 @@
 """Standalone launcher for the Zou_lab_control pulse GUI.
 
-This entrypoint is intentionally independent from experiment configs.  It can
-open an offline/local RuntimeSequencer editor, or connect directly to a running
-FPGA sequencer server through RemoteSequencer.
+This entrypoint is intentionally independent from experiment configs.  By
+default it opens with a VIRTUAL (in-memory) sequencer, and the GUI's in-window
+Connection control then lets you switch to a remote FPGA sequencer server
+(host:port) or to offline edit-only AFTER opening -- the backend is no longer
+fixed on the command line.  An explicit ``--remote-host`` still auto-connects at
+launch (for scripted / headless use), and ``--no-sequencer`` opens offline.
 """
 
 from __future__ import annotations
@@ -217,7 +220,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     sequencer = None
     startup_notice = None
     if not args.no_sequencer:
-        if args.remote_host:
+        if explicit_remote:
             sequencer, channels, trigger_channels, startup_notice = _connect_remote_or_offline(
                 args,
                 state,
@@ -225,6 +228,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 explicit_remote=explicit_remote,
             )
         else:
+            # Default: open with a VIRTUAL (in-memory) sequencer.  The GUI's
+            # Connection control lets you switch to a remote FPGA server
+            # (host:port) or offline AFTER opening -- the backend is no longer
+            # fixed on the command line.  An explicit --remote-host still
+            # auto-connects at launch for scripted/headless use.
             channels = _resolve_channels(args, state)
             channel_labels = _resolve_channel_labels(args, channels, state)
             trigger_channels = _resolve_trigger_channels(args, channels, channel_labels)

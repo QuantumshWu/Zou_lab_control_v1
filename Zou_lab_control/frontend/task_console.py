@@ -47,7 +47,6 @@ from .qt_fluent import (
     RED,
     TEXT,
     YELLOW,
-    DIVIDER,
     FluentButton,
     FluentCheckBox,
     FluentComboBox,
@@ -56,7 +55,10 @@ from .qt_fluent import (
     FluentGroupBox,
     FluentLabel,
     FluentLineEdit,
+    FluentPopup,
     FluentScrollArea,
+    FluentSectionLabel,
+    FluentSettingRow,
     FluentStatusDot,
     FluentTabWidget,
     FluentWindow,
@@ -83,6 +85,7 @@ PANEL_KINDS: dict[str, str] = {
     "sites": "Site map",
     "1d": "1D vector",
     "monitor": "Rolling trace",
+    "monitor_nodist": "Rolling trace (no dist)",
     "hist": "Distribution",
 }
 
@@ -93,6 +96,7 @@ _DEFAULT_SOURCES = {
     "sites": "value = occupied",
     "1d": "value = rate_sites",
     "monitor": "value = rate",
+    "monitor_nodist": "value = rate",
     "hist": "value = history('counts', 200).ravel()",
 }
 
@@ -103,7 +107,8 @@ class ParamSpec:
     GUI, the JSON params and the plot rebuild all follow)."""
 
     def __init__(self, key: str, label: str, kind: str, default, *,
-                 choices: Sequence[str] = (), lo: float = 0, hi: float = 1e9, tooltip: str = ""):
+                 choices: Sequence[str] = (), lo: float = 0, hi: float = 1e9, tooltip: str = "",
+                 display: bool = False):
         self.key = str(key)
         self.label = str(label)
         self.kind = str(kind)              # "choice" | "int" | "signal"
@@ -111,6 +116,12 @@ class ParamSpec:
         self.choices = tuple(choices)
         self.lo, self.hi = lo, hi
         self.tooltip = str(tooltip)
+        # display=True  -> a BASIC display knob, rendered in the Setting popup
+        #                  (e.g. the colormap / colorset chooser).
+        # display=False -> a FUNCTIONAL plot-API parameter, rendered as a GUI
+        #                  control in the panel's Edit tab (length / bins /
+        #                  centers / image), so Setting and Edit never duplicate.
+        self.display = bool(display)
 
     def get(self, params: Mapping[str, object]):
         return params.get(self.key, self.default)
@@ -118,20 +129,25 @@ class ParamSpec:
 
 PANEL_PARAMS: dict[str, tuple[ParamSpec, ...]] = {
     "2d": (
-        ParamSpec("cmap", "colormap", "choice", "inferno", choices=CMAPS, tooltip="Image colormap"),
+        ParamSpec("cmap", "colormap", "choice", "inferno", choices=CMAPS, tooltip="Image colormap", display=True),
     ),
     "sites": (
+        ParamSpec("cmap", "colormap", "choice", "viridis", choices=CMAPS, tooltip="Site-value colormap", display=True),
         ParamSpec("centers", "centers", "signal", "centers",
                   tooltip="Signal holding the (N, 2) site centers in camera px"),
         ParamSpec("image", "image", "signal", "frame",
                   tooltip="Signal for the camera-frame underlay (blank for none)"),
-        ParamSpec("cmap", "colormap", "choice", "viridis", choices=CMAPS, tooltip="Site-value colormap"),
     ),
-    # relim is NOT a Setting param: it lives in the Control tab (the processing
-    # panel) -- _editor_set_relim writes it back to config.params["relim"] and
-    # rebuilds, so a live card's relim is still settable there.
+    # The colormap / colorset chooser is the only per-kind knob that stays in the
+    # Setting popup (display=True); the FUNCTIONAL params below (length / bins /
+    # centers / image) are rendered in each panel's Edit tab instead, so the two
+    # surfaces never duplicate.
     "1d": (),
     "monitor": (
+        ParamSpec("length", "history", "int", 300, lo=20, hi=10_000,
+                  tooltip="Rolling history length (shots kept on screen)"),
+    ),
+    "monitor_nodist": (
         ParamSpec("length", "history", "int", 300, lo=20, hi=10_000,
                   tooltip="Rolling history length (shots kept on screen)"),
     ),
@@ -140,27 +156,45 @@ PANEL_PARAMS: dict[str, tuple[ParamSpec, ...]] = {
     ),
 }
 
-# Curve-fit overlays the CONTROL tab can run on a frozen panel snapshot (pair
-# with "Pause Plot" to freeze the trace, fit, and inspect).  label -> DataFigure
-# method name; only the line kinds (1d / monitor) support fitting -- hist already
-# auto-fits a bimodal, 2d/sites don't apply.  The Setting popup carries NO fit
-# controls (basic display only); fitting lives in the Control tab.
+# Curve fits a panel's Edit tab can run on its frozen snapshot -- the FULL
+# DataFigure model set (confocal's combo_fit plus gaussian), available for EVERY
+# plot kind (DataFigure picks the 1D or 2D path from the snapshot, so a 2D image
+# fits the 2D-Gaussian ``center`` model).  label -> DataFigure method name.  The
+# Setting popup carries NO fit controls (basic display only); fitting lives in
+# each panel's own Edit tab.
 FIT_MODELS: dict[str, str] = {
     "Lorentzian": "lorent",
     "Gaussian": "gaussian",
-    "Exp decay": "decay",
+    "Lorentzian (Zeeman)": "lorent_zeeman",
     "Rabi": "rabi",
+    "Exp decay": "decay",
+    "2D center": "center",
 }
-FITTABLE_KINDS = ("1d", "monitor")
 
-# Basic display toggles the Setting popup persists into config.params and
-# RE-APPLIES on every _build_plot (the panel rebuilds each time its data shape
-# changes, so a toggle that was not re-applied would silently revert):
-#  - colorbar   : show/hide the colorbar band (image kinds only).
-#  - unit_index : how many times to cycle the x-axis unit from its original
-#                 (reuses DataFigure.change_unit's GHz/nm/MHz | ns/us/ms cycle).
-#  - xlim/ylim  : None = auto, or (lo, hi) = manual (autoscale off on that axis).
-COLORBAR_KINDS = ("2d", "sites")     # the kinds that own a colorbar to toggle
+
+def _py_to_text(value) -> str:
+    """A Python value as an editable one-line string (confocal python2str): a
+    tuple/list keeps its literal form, scalars use repr.  Round-trips through
+    ``_text_to_py``."""
+    if value is None:
+        return ""
+    return repr(value)
+
+
+def _text_to_py(text: str):
+    """Parse an edited acquisition-parameter field back to a Python value
+    (confocal str2python): literal first, then a plain float, else the string."""
+    import ast
+    raw = str(text).strip()
+    if not raw:
+        return None
+    try:
+        return ast.literal_eval(raw)
+    except (ValueError, SyntaxError):
+        try:
+            return float(raw)
+        except ValueError:
+            return raw
 
 # Card geometry (raw px, matching the raw-px canvas).  The card is a titled
 # frame (title = panel kind) whose FOOTER absorbs the modulus difference: the
@@ -210,34 +244,39 @@ def _pos_to_slot(x: int, y: int) -> tuple[int, int]:
     return int(row), int(col)
 
 
-def _slots_overlap(a, b) -> bool:
-    return (a.col < b.col + b.cols and b.col < a.col + a.cols
-            and a.row < b.row + b.rows and b.row < a.row + a.rows)
+def _columns_overlap(a, b) -> bool:
+    """True when two cards share at least one column (overlap horizontally)."""
+    return a.col < b.col + b.cols and b.col < a.col + a.cols
 
 
-def _resolve_collisions(configs: Sequence["PanelConfig"], active: "PanelConfig") -> bool:
-    """Push cards DOWN so no two overlap; ``active`` keeps its slot.
+def _compact(configs: Sequence["PanelConfig"], active: "PanelConfig | None" = None) -> bool:
+    """Gravity layout: pull every card UP within its columns until it rests on
+    the card above it (or the board top).
 
-    Cards never overlap on the board: when a drag (or a size change) lands a
-    card on occupied slots, the cards underneath move down just far enough to
-    clear, cascading.  Pushes only ever increase ``row`` and never touch the
-    active card, so the loop terminates.  Returns True when anything moved."""
+    This single rule is what keeps the board tidy after any drag, resize, add
+    or remove.  It does BOTH jobs at once -- a card always settles strictly
+    below every card it shares columns with (so nothing overlaps) AND it never
+    floats above free space (so there are no vertical gaps).  The result is
+    always a gap-free, top-packed grid; the previous push-DOWN-only resolver
+    cleared overlaps but left holes and let the board drift downward over
+    repeated drags.
 
-    moved_any = False
-    for _ in range(len(configs) * len(configs) + 1):
-        ordered = sorted((c for c in configs if c is not active),
-                         key=lambda c: (c.row, c.col))
-        placed = [active]
-        moved = False
-        for config in ordered:
-            for blocker in placed:
-                if _slots_overlap(config, blocker):
-                    config.row = blocker.row + blocker.rows
-                    moved = moved_any = True
-            placed.append(config)
-        if not moved:
-            break
-    return moved_any
+    Cards settle in reading order (row, then col); ``active`` (the card the user
+    just dropped) wins ties so it keeps its column/row while the others reflow
+    around it.  Returns True when any card moved."""
+
+    moved = False
+    placed: list["PanelConfig"] = []
+    for config in sorted(configs, key=lambda c: (c.row, c.col, 0 if c is active else 1)):
+        target = 0
+        for blocker in placed:
+            if _columns_overlap(config, blocker):
+                target = max(target, blocker.row + blocker.rows)
+        if config.row != target:
+            config.row = target
+            moved = True
+        placed.append(config)
+    return moved
 
 
 def _task_files_dir() -> Path:
@@ -368,7 +407,7 @@ def _atom_loading_monitor_state() -> TaskConsoleState:
                         source="value = occupied"),
             PanelConfig(kind="hist", title="Counts distribution", row=2, col=0, size="1x2",
                         source="value = history('counts', 200).ravel()", params={"bins": 80}),
-            PanelConfig(kind="monitor", title="Loading rate", row=2, col=2, size="1x2",
+            PanelConfig(kind="monitor_nodist", title="Loading rate", row=2, col=2, size="1x2",
                         source="value = rate", params={"length": 300}),
             PanelConfig(kind="1d", title="Per-site loading rate", row=3, col=0, size="2x4",
                         source="value = rate_sites"),
@@ -383,7 +422,7 @@ def _loading_rate_live_state() -> TaskConsoleState:
     return TaskConsoleState(
         name="loading_rate_live",
         panels=[
-            PanelConfig(kind="monitor", title="Loading rate", row=0, col=0, size="1x2",
+            PanelConfig(kind="monitor_nodist", title="Loading rate", row=0, col=0, size="1x2",
                         source="value = rate", params={"length": 500}),
             PanelConfig(kind="hist", title="Counts distribution", row=0, col=2, size="1x2",
                         source="value = history('counts', 200).ravel()", params={"bins": 80}),
@@ -405,8 +444,24 @@ BUILTIN_TASKS: dict[str, object] = {
 }
 
 
+def _single_live_state() -> TaskConsoleState:
+    """The BARE default the console opens with: ONE rolling loading-rate trace
+    (no side distribution).  Deliberately minimal -- you add panels from the
+    header ("Add Panel") to build the task group you want.  The richer named
+    dashboards (``atom_loading_monitor``, ``loading_rate_live``) stay one click
+    away in the preset picker / ``--task``."""
+
+    return TaskConsoleState(
+        name="live",
+        panels=[
+            PanelConfig(kind="monitor_nodist", title="Loading rate", row=0, col=0, size="2x4",
+                        source="value = rate", params={"length": 300}),
+        ],
+    )
+
+
 def default_console_state() -> TaskConsoleState:
-    return _atom_loading_monitor_state()
+    return _single_live_state()
 
 
 def list_task_presets() -> list[str]:
@@ -448,7 +503,7 @@ class PanelCard(FluentGroupBox):
     changed = QtCore.pyqtSignal()          # any config edit (console marks dirty)
     layout_changed = QtCore.pyqtSignal()   # size/slot change (console re-arranges)
     remove_requested = QtCore.pyqtSignal(object)
-    edit_requested = QtCore.pyqtSignal(object)   # "Edit…" -> open the Control tab
+    edit_requested = QtCore.pyqtSignal(object)   # "Edit…" -> open the panel's Edit tab
 
     def __init__(self, config: PanelConfig, parent=None, *, names_provider=None):
         super().__init__(PANEL_KINDS[config.kind], parent, shadow=True)
@@ -497,57 +552,68 @@ class PanelCard(FluentGroupBox):
 
     # ------------------------------------------------------------- settings UI
     def _build_settings(self) -> None:
-        """The confocal-style settings popup, organised the way an experimenter
-        thinks: WHAT to show (Source: pick a live signal, or write an
-        expression), HOW to show it (Display: size + colormap + the basic
-        display toggles: colorbar, unit, axis limits), and the panel itself
-        (title, Remove).  Only BASIC display lives here -- the heavier
-        processing (curve fit, command-line fit, relim, units cycle, Save Fig)
-        is in the Control tab.  Every widget keeps the stock fluent size."""
+        """Confocal-style VERTICAL settings popup.
 
-        popup = QtWidgets.QFrame(self, QtCore.Qt.Popup)
-        # SCOPE the border to the popup itself by objectName: a bare `QFrame { border }`
-        # rule cascades to every QFrame-derived child -- and QLabel/QComboBox/QSpinBox
-        # internals ARE QFrames, so the unscoped rule drew stray 1px lines around the
-        # labels and controls inside.  `#id` keeps the border on the popup only.
-        popup.setObjectName("zlcPanelSettings")
-        popup.setStyleSheet(
-            f"QFrame#zlcPanelSettings {{ background: white; border: 1px solid {DIVIDER};"
-            f" border-radius: {scaled_px(6)}px; }}")
-        form = QtWidgets.QVBoxLayout(popup)
+        Layout idiom borrowed from ``Confocal_GUIv2/gui/gui_individual.py``'s
+        ``BaseLivePlotGUI`` settings page: one section header per group (bold,
+        own line), then one control per row underneath the header as a
+        ``[fixed-width label | control]`` cell.  Five sections stacked top-to-
+        bottom:
+
+        * **Source** -- pick a signal or write an expression + ``Apply``.
+        * **Display** -- size + (for image kinds) colormap (the COLORSET
+          chooser; there is no separate cbar show/hide toggle), plus each
+          kind's declarative ``PANEL_PARAMS`` widget.
+        * **Unit** -- ``Unit`` cycle button + current unit label.
+        * **Limits** -- ``auto``/``manual`` mode combo + a 3-column mini-grid
+          of ``[axis | lo | hi]`` rows (axis labels left, lo/hi headers top).
+        * **Panel** -- title edit, then a single row of
+          ``Remove | Edit… | <stretch> | Save Fig``.
+
+        Every edit is LIVE-applied -- there is no global ``Apply`` button for
+        the popup itself (Source has its own Apply because the expression is
+        validated separately).  Lifted helpers ``FluentSectionLabel`` and
+        ``FluentSettingRow`` (in ``qt_fluent.py``) own the visual rhythm so
+        future settings popups stay identical."""
+
+        # The rounded card is painted by FluentPopup (translucent, frameless),
+        # NOT a stylesheet border-radius on an opaque popup -- that left a
+        # square white nub past the arc at the corners + a native popup shadow.
+        # Painting the card also means no border stylesheet rule can cascade
+        # onto child labels/controls.
+        popup = FluentPopup(self)
+        root = QtWidgets.QVBoxLayout(popup)
         pad = scaled_px(10)
-        form.setContentsMargins(pad, pad, pad, pad)
-        form.setSpacing(scaled_px(6, minimum=4))
+        root.setContentsMargins(pad, pad, pad, pad)
+        root.setSpacing(scaled_px(10, minimum=6))
 
-        def row(*widgets, stretch_first=True):
-            line = QtWidgets.QHBoxLayout()
-            line.setSpacing(scaled_px(6, minimum=4))
-            for index, widget in enumerate(widgets):
-                line.addWidget(widget, 1 if (stretch_first and index == 0) else 0)
-            form.addLayout(line)
+        # fixed left-label column.  Widest known label is "colormap" -- bumping
+        # to 80 px gives it space without crowding the controls (one-char "x"/"y"
+        # axis labels in the limits grid use the same column width, so the
+        # x/y/lo/hi grid still aligns with the section rows above).
+        label_w = scaled_px(80, minimum=56)
 
-        def section(text):
-            label = FluentLabel(text)
-            label.setStyleSheet(f"color: {GREY}; background: transparent; border: none; font-weight: bold;")
-            form.addWidget(label)
+        def section_box(title: str) -> QtWidgets.QVBoxLayout:
+            """Header label + inner VBox; rows added to the inner VBox stack
+            tightly under the header (own-line, vertical, confocal style)."""
+            root.addWidget(FluentSectionLabel(title))
+            inner = QtWidgets.QVBoxLayout()
+            inner.setContentsMargins(0, 0, 0, 0)
+            inner.setSpacing(scaled_px(6, minimum=4))
+            root.addLayout(inner)
+            return inner
 
-        def tag(text):
-            label = FluentLabel(text)
-            label.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
-            return label
-
-        # ---- Source: pick a signal, or write an expression -----------------
-        section("Source")
+        # ---- Source --------------------------------------------------------
+        sec = section_box("Source")
         self.signal_combo = FluentComboBox()
-        self.signal_combo.setMinimumWidth(scaled_px(150, minimum=120))
         self.signal_combo.setToolTip(
             "Pick a live signal to show it directly (sets the expression to\n"
             "`value = <signal>`).  Choose (expression) to write your own.")
         self.signal_combo.activated.connect(self._on_signal_pick)
-        row(self.signal_combo, tag("signal"), stretch_first=False)
+        sec.addWidget(FluentSettingRow("signal", self.signal_combo, label_width=label_w))
 
         self.source_edit = FluentLineEdit(self.config.source)
-        self.source_edit.setMinimumWidth(scaled_px(340, minimum=280))
+        self.source_edit.setMinimumWidth(scaled_px(280, minimum=220))
         self.source_edit.setStyleSheet(
             self.source_edit.styleSheet() + " QLineEdit { font-family: Consolas, monospace; }")
         self.source_edit.setToolTip(
@@ -555,100 +621,120 @@ class PanelCard(FluentGroupBox):
             "Assign the result to `value`.  Namespace: every signal name (latest value),\n"
             "history(name, n), latest(name), names(), shot, np, math.")
         self.apply_button = FluentButton("Apply", color=GREEN)
+        self.apply_button.setFixedWidth(scaled_px(64, minimum=52))
         self.apply_button.clicked.connect(self._apply_source)
         self.source_edit.textChanged.connect(lambda: self.apply_button.set_dirty(True))
         self.source_edit.returnPressed.connect(self._apply_source)
-        row(self.source_edit, self.apply_button)
+        expr_row = QtWidgets.QHBoxLayout()
+        expr_row.setContentsMargins(0, 0, 0, 0)
+        expr_row.setSpacing(scaled_px(6, minimum=4))
+        expr_row.addWidget(self.source_edit, 1)
+        expr_row.addWidget(self.apply_button, 0)
+        sec.addLayout(expr_row)
 
         self.status = FluentLabel("")
+        self.status.setWordWrap(True)
         self.status.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
-        form.addWidget(self.status)
+        sec.addWidget(self.status)
 
-        # ---- Display: size + the kind's declarative parameters -------------
-        section("Display")
+        # ---- Display -------------------------------------------------------
+        sec = section_box("Display")
         self.size_combo = FluentComboBox()
         self.size_combo.addItems(list(PANEL_SIZES))
         self.size_combo.setCurrentText(self.config.size)
-        self.size_combo.setFixedWidth(scaled_px(64, minimum=56))
         self.size_combo.setToolTip("Panel size preset (height x width half-units; 2x2 = the stock plot region)")
         self.size_combo.currentTextChanged.connect(self._on_size)
-        display_row = [self.size_combo, tag("size")]
+        sec.addWidget(FluentSettingRow("size", self.size_combo, label_width=label_w))
+
+        # one ParamSpec widget per row -- this is where the kind's `cmap`
+        # colormap lives (the colorbar COLORSET chooser; there is no separate
+        # cbar show/hide toggle).
         self.param_widgets: dict[str, QtWidgets.QWidget] = {}
         for spec in PANEL_PARAMS.get(self.config.kind, ()):
+            if not spec.display:
+                continue            # FUNCTIONAL params live in the Edit tab, not here
             widget = self._make_param_widget(spec)
             self.param_widgets[spec.key] = widget
-            display_row.extend([widget, tag(spec.label)])
-        row(*display_row, stretch_first=False)
+            sec.addWidget(FluentSettingRow(spec.label, widget, label_width=label_w))
 
-        # colorbar toggle (image kinds only): persisted + re-applied on rebuild
-        self.cbar_check = None
-        if self.config.kind in COLORBAR_KINDS:
-            self.cbar_check = FluentCheckBox("colorbar")
-            self.cbar_check.setChecked(bool(self.config.params.get("colorbar", True)))
-            self.cbar_check.setToolTip("Show the colorbar band next to the image")
-            self.cbar_check.toggled.connect(self._on_colorbar_toggle)
-            row(self.cbar_check, stretch_first=False)
+        # relim mode (confocal_gui's combo_relim semantics EXACTLY: ``tight`` /
+        # ``normal``).  Persisted as ``config.params["relim"]`` -- the SAME key
+        # the Edit tab's ed_relim writes to, so Setting and Edit never
+        # drift apart.  No "manual" mode, no x/y typed limits: live autoscale
+        # is the right tool here; if you need to inspect a frozen range, use
+        # zoom/pan on the canvas or Edit… into the panel's Edit tab.
+        self.lim_combo = FluentComboBox()
+        self.lim_combo.addItems(["tight", "normal"])
+        self.lim_combo.setToolTip(
+            "Relim mode (confocal_gui combo_relim naming):\n"
+            "  tight  = autoscale hugs the data\n"
+            "  normal = autoscale with the matplotlib default margin")
+        self.lim_combo.setCurrentText(str(self.config.params.get("relim", "tight")))
+        self.lim_combo.currentTextChanged.connect(self._on_relim_mode)
+        sec.addWidget(FluentSettingRow("relim", self.lim_combo, label_width=label_w))
 
-        # unit cycle (generic): reuse DataFigure.change_unit's unit families.
-        # We store how many cycles from the original; the rebuild re-applies them.
+        # unit cycle: a single row [Unit button | <stretch> | current unit text]
+        # under the "unit" label, so the layout rhythm stays one-control-per-row.
         self.unit_button = FluentButton("Unit", color=GREY)
+        self.unit_button.setFixedWidth(scaled_px(70, minimum=56))
         self.unit_button.setToolTip(
             "Cycle the x-axis unit (GHz/nm/MHz or ns/us/ms) where the axis label\n"
             "declares one; persisted and re-applied to the live panel")
         self.unit_button.clicked.connect(self._on_unit_cycle)
-        self.unit_label = tag(self._current_unit_text())
-        row(self.unit_button, self.unit_label, stretch_first=False)
+        self.unit_label = FluentLabel(self._current_unit_text())
+        self.unit_label.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+        self.unit_label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        unit_inner = QtWidgets.QWidget()
+        unit_inner_layout = QtWidgets.QHBoxLayout(unit_inner)
+        unit_inner_layout.setContentsMargins(0, 0, 0, 0)
+        unit_inner_layout.setSpacing(scaled_px(6, minimum=4))
+        unit_inner_layout.addWidget(self.unit_button, 0)
+        unit_inner_layout.addStretch(1)
+        unit_inner_layout.addWidget(self.unit_label, 0)
+        sec.addWidget(FluentSettingRow("unit", unit_inner, label_width=label_w))
 
-        # axis limits (generic): auto, or manual lo/hi per axis (autoscale off)
-        self.lim_combo = FluentComboBox()
-        self.lim_combo.addItems(["auto", "manual"])
-        self.lim_combo.setFixedWidth(scaled_px(74, minimum=60))
-        self.lim_combo.setToolTip("auto = autoscale to the data; manual = fix the x/y limits below")
-        manual = self.config.params.get("xlim") is not None or self.config.params.get("ylim") is not None
-        self.lim_combo.setCurrentText("manual" if manual else "auto")
-        self.lim_combo.currentTextChanged.connect(self._on_lim_mode)
-        row(self.lim_combo, tag("limits"), stretch_first=False)
-
-        def _lim_edit(value):
-            edit = FluentLineEdit("" if value is None else f"{float(value):.6g}")
-            edit.setFixedWidth(scaled_px(72, minimum=56))
-            edit.setEnabled(manual)
-            edit.editingFinished.connect(self._on_lim_values)
-            edit.returnPressed.connect(self._on_lim_values)
-            return edit
-
-        xlim = self.config.params.get("xlim") or (None, None)
-        ylim = self.config.params.get("ylim") or (None, None)
-        self.xmin_edit, self.xmax_edit = _lim_edit(xlim[0]), _lim_edit(xlim[1])
-        self.ymin_edit, self.ymax_edit = _lim_edit(ylim[0]), _lim_edit(ylim[1])
-        self.lim_edits = (self.xmin_edit, self.xmax_edit, self.ymin_edit, self.ymax_edit)
-        row(tag("x"), self.xmin_edit, self.xmax_edit,
-            tag("y"), self.ymin_edit, self.ymax_edit, stretch_first=False)
-
-        # ---- Panel: title + edit/save/remove --------------------------------
-        section("Panel")
+        # ---- Panel ---------------------------------------------------------
+        sec = section_box("Panel")
         self.title_edit = FluentLineEdit(self.config.title)
         self.title_edit.setPlaceholderText("panel title…")
         self.title_edit.textChanged.connect(self._on_title)
+        sec.addWidget(FluentSettingRow("title", self.title_edit, label_width=label_w))
+
+        # Action row: Remove on the left (destructive, ORANGE), Edit… opens
+        # the panel's Edit tab for the heavier processing (fit / relim / per-axis
+        # detail), Save Fig is the one-click export.  The stretch between Edit…
+        # and Save Fig keeps the destructive button visually separated from the
+        # routine "open / export" actions.
         remove = FluentButton("Remove", color=ORANGE)
+        remove.setFixedWidth(scaled_px(72, minimum=58))
         remove.clicked.connect(lambda: self.remove_requested.emit(self))
-        row(self.title_edit, remove)
-        # heavy controls (curve fit, command fit, relim, units cycle, Save Fig)
-        # live in the Control tab, not this lightweight popup; Save Fig here is
-        # the basic one-click export.
         edit_button = FluentButton("Edit…", color=ACCENT)
-        edit_button.setToolTip("Open the Control tab: curve fit, command-line fit, x/y limits, units, relim, Save Fig")
+        edit_button.setFixedWidth(scaled_px(64, minimum=52))
+        edit_button.setToolTip("Open this panel's Edit tab: curve fit, command-line fit, relim, Save Fig")
         edit_button.clicked.connect(lambda: (self.settings_popup.hide(), self.edit_requested.emit(self)))
-        save_fig = FluentButton("Save Fig", color=GREY)
+        save_fig = FluentButton("Save Fig", color=YELLOW)
+        save_fig.setFixedWidth(scaled_px(80, minimum=64))
         save_fig.setToolTip("Save this panel as <title>.png + <title>.npz (timestamped) in tasks/")
         save_fig.clicked.connect(self._save_fig)
-        row(edit_button, save_fig, stretch_first=False)
+        action_row = QtWidgets.QHBoxLayout()
+        action_row.setContentsMargins(0, 0, 0, 0)
+        action_row.setSpacing(scaled_px(6, minimum=4))
+        action_row.addWidget(remove, 0)
+        action_row.addWidget(edit_button, 0)
+        action_row.addStretch(1)
+        action_row.addWidget(save_fig, 0)
+        sec.addLayout(action_row)
 
         self.settings_popup = popup
 
-    def _make_param_widget(self, spec: ParamSpec) -> QtWidgets.QWidget:
-        """One widget per declarative ParamSpec; edits apply INSTANTLY."""
+    def _make_param_widget(self, spec: ParamSpec, *, apply=None) -> QtWidgets.QWidget:
+        """One widget per declarative ParamSpec; edits apply INSTANTLY.
 
+        ``apply`` overrides where the edit goes (default ``self._set_param``); the
+        Edit tab passes its own callback so a functional-param edit re-renders the
+        live panel AND its snapshot.  Same builder for both surfaces (DRY)."""
+
+        cb = apply if apply is not None else self._set_param
         current = self.config.params.get(spec.key, spec.default)
         if spec.kind == "choice":
             combo = FluentComboBox()
@@ -656,7 +742,7 @@ class PanelCard(FluentGroupBox):
             if str(current) in spec.choices:
                 combo.setCurrentText(str(current))
             combo.setToolTip(spec.tooltip)
-            combo.currentTextChanged.connect(lambda text, k=spec.key: self._set_param(k, str(text)))
+            combo.currentTextChanged.connect(lambda text, k=spec.key: cb(k, str(text)))
             return combo
         if spec.kind == "int":
             spin = FluentDoubleSpinBox(length=max(4, len(str(int(spec.hi)))), allow_minus=False)
@@ -664,13 +750,13 @@ class PanelCard(FluentGroupBox):
             spin.setRange(spec.lo, spec.hi)
             spin.setValue(int(current))
             spin.setToolTip(spec.tooltip)
-            spin.valueChanged.connect(lambda v, k=spec.key: self._set_param(k, int(v)))
+            spin.valueChanged.connect(lambda v, k=spec.key: cb(k, int(v)))
             return spin
         # "signal": a free-form signal name (blank allowed where documented)
         edit = FluentLineEdit(str(current))
         edit.setFixedWidth(scaled_px(96, minimum=80))
         edit.setToolTip(spec.tooltip)
-        edit.editingFinished.connect(lambda k=spec.key, w=edit: self._set_param(k, w.text().strip()))
+        edit.editingFinished.connect(lambda k=spec.key, w=edit: cb(k, w.text().strip()))
         return edit
 
     def _open_settings(self) -> None:
@@ -708,15 +794,6 @@ class PanelCard(FluentGroupBox):
         self._apply_source()                      # picking a signal applies instantly
 
     # ------------------------------------------------ basic display toggles
-    def _on_colorbar_toggle(self, checked: bool) -> None:
-        """Persist + apply the colorbar toggle (image kinds).  Applied LIVE on
-        the current plotter and stored so the next rebuild keeps it."""
-        self.config.params["colorbar"] = bool(checked)
-        self._apply_display_params()
-        if self.canvas is not None:
-            self.canvas.draw_idle()
-        self.changed.emit()
-
     def _current_unit_text(self) -> str:
         n = int(self.config.params.get("unit_index", 0) or 0)
         return "unit" if n == 0 else f"unit x{n}"
@@ -732,7 +809,7 @@ class PanelCard(FluentGroupBox):
         df = self._unit_df()
         length = len(df.conversion_map) if getattr(df, "conversion_map", None) else 0
         if length:
-            df.change_unit()            # cycle the live curve + label in place
+            df.change_unit()
             self.config.params["unit_index"] = (
                 int(self.config.params.get("unit_index", 0) or 0) + 1) % length
             self.changed.emit()
@@ -741,35 +818,77 @@ class PanelCard(FluentGroupBox):
         if self.canvas is not None:
             self.canvas.draw_idle()
 
-    def _on_lim_mode(self, mode: str) -> None:
-        manual = str(mode) == "manual"
-        for edit in getattr(self, "lim_edits", ()):
-            edit.setEnabled(manual)
-        if not manual:
-            self.config.params["xlim"] = None
-            self.config.params["ylim"] = None
-            self._reset_plot()          # rebuild so autoscale comes back
-            self.changed.emit()
-        else:
-            self._on_lim_values()       # apply whatever is typed (may be partial)
+    def _on_relim_mode(self, mode: str) -> None:
+        """Persist + apply the relim mode (confocal_gui naming: ``tight`` /
+        ``normal``).
 
-    def _on_lim_values(self, *_args) -> None:
-        if self.lim_combo.currentText() != "manual":
-            return
-
-        def pair(lo_edit, hi_edit):
-            try:
-                lo, hi = float(lo_edit.text()), float(hi_edit.text())
-            except (TypeError, ValueError):
-                return None
-            return (lo, hi) if lo != hi else None
-
-        self.config.params["xlim"] = pair(self.xmin_edit, self.xmax_edit)
-        self.config.params["ylim"] = pair(self.ymin_edit, self.ymax_edit)
-        self._apply_display_params()
+        Writes to the SAME ``config.params["relim"]`` key the Edit tab's
+        ``ed_relim`` writes to, so the two never drift apart."""
+        self.config.params["relim"] = str(mode)
+        if self.plotter is not None and hasattr(self.plotter, "relim_mode"):
+            self.plotter.relim_mode = str(mode)
         if self.canvas is not None:
             self.canvas.draw_idle()
         self.changed.emit()
+
+    # --------------------------------------------- basic display application
+    def _apply_display_params(self) -> None:
+        """Apply the persisted Setting toggles (relim mode + unit cycle) to
+        the current plotter -- called after every rebuild and on each edit.
+
+        Two persisted knobs: ``config.params["relim"]`` (confocal naming:
+        ``tight`` / ``normal``) and ``config.params["unit_index"]`` (the
+        x-axis unit cycle count).  There is no manual xlim/ylim path -- the
+        Setting popup has no manual lim controls (zoom/pan + Edit… to the
+        panel's Edit tab handle interactive ranging), and a colorbar visibility
+        path is absent because the colormap chooser IS the colorset chooser."""
+        if self.plotter is None:
+            return
+        if hasattr(self.plotter, "relim_mode"):
+            self.plotter.relim_mode = str(self.config.params.get("relim", "tight"))
+        self._apply_unit()
+
+    def _unit_df(self):
+        """A DataFigure bound to the current plotter's figure/axes whose unit is
+        inferred from the LIVE x-axis label.  Built from fig/data (NOT live_plot)
+        on purpose: DataFigure(live_plot=...) overrides the unit with the
+        plotter's own ``unit`` (defaults to '1'), which would mask a unit-bearing
+        label like 'Detuning (GHz)'.  change_unit operates on ax.lines, so the
+        cycle still rewrites the live panel's curve in place."""
+        from .data_figure import DataFigure
+        ax = getattr(self.plotter, "ax", None)
+        unit = DataFigure._infer_unit(ax.get_xlabel()) if ax is not None else None
+        return DataFigure(fig=self.plotter.fig, ax=ax,
+                          data_x=self.plotter.data_x, data_y=self.plotter.data_y,
+                          labels=getattr(self.plotter, "labels", None), unit=unit)
+
+    def _unit_cycle_len(self) -> int:
+        """Length of the x-axis unit cycle for the CURRENT plotter (0 if none)."""
+        if self.plotter is None:
+            return 0
+        try:
+            cmap = getattr(self._unit_df(), "conversion_map", None)
+        except Exception:
+            return 0
+        return len(cmap) if cmap else 0
+
+    def _apply_unit(self) -> bool:
+        """Cycle the x-axis unit ``unit_index`` times from its original (reuse
+        DataFigure.change_unit).  Returns True if any conversion was applied."""
+        if self.plotter is None:
+            return False
+        index = int(self.config.params.get("unit_index", 0) or 0)
+        if index <= 0:
+            return False
+        try:
+            df = self._unit_df()
+            if not getattr(df, "conversion_map", None):
+                return False
+            for _ in range(index % max(1, len(df.conversion_map))):
+                df.change_unit()
+            return True
+        except Exception:
+            return False
 
     def _save_fig(self) -> None:
         """Save this panel: <title>.png + <title>.npz (timestamped) in tasks/."""
@@ -833,9 +952,19 @@ class PanelCard(FluentGroupBox):
 
     # ------------------------------------------------------------- config edits
     def _on_title(self, text: str) -> None:
+        """Update the plot title via the FRONTEND'S sealed title API.
+
+        ``BaseLivePlot.title`` is the single source of truth and
+        ``BaseLivePlot._apply_title`` routes through ``style.apply_title``,
+        which paints the title at ``title_fontsize()`` with the correct pad.
+        Calling ``ax.set_title(text)`` directly bypasses both -- matplotlib
+        then uses its OWN ``axes.titlesize`` rcParam (NOT the frontend's
+        ``axes.labelsize``-derived size), so the title visibly shrinks /
+        grows after every edit.  Always go through the sealed API."""
         self.config.title = str(text)
         if self.plotter is not None and getattr(self.plotter, "ax", None) is not None:
-            self.plotter.ax.set_title(self.config.title)
+            self.plotter.title = self.config.title
+            self.plotter._apply_title()
             if self.canvas is not None:
                 self.canvas.draw_idle()
         self.changed.emit()
@@ -909,7 +1038,7 @@ class PanelCard(FluentGroupBox):
             sy = max(1, int(np.ceil(arr.shape[0] / 192)))
             sx = max(1, int(np.ceil(arr.shape[1] / 192)))
             return arr[::sy, ::sx]
-        if kind == "monitor":
+        if kind in ("monitor", "monitor_nodist"):
             flat = arr.reshape(-1)
             if flat.size != 1:
                 raise ValueError(f"rolling-trace panel needs a scalar value (got shape {arr.shape})")
@@ -953,7 +1082,7 @@ class PanelCard(FluentGroupBox):
             return
         if kind == "2d":
             self.plotter.update(np.asarray(value).ravel(), draw=False)
-        elif kind == "monitor":
+        elif kind in ("monitor", "monitor_nodist"):
             self.plotter.roll(value, draw=False)
         elif kind == "sites":
             self.plotter.update(value, draw=False)
@@ -991,7 +1120,7 @@ class PanelCard(FluentGroupBox):
                 if deltas.size:
                     spacing = float(np.min(deltas))
             self.plotter = panel_plot(
-                centers, vec, kind="sites", size=size,
+                centers, vec, kind="sites", size=size, interactions=False,
                 cmap=str(self.config.params.get("cmap", "viridis")),
                 image=image, roi_radius=max(1.5, 0.3 * spacing),
                 labels=("Camera x (px)", "Camera y (px)", label),
@@ -1002,21 +1131,21 @@ class PanelCard(FluentGroupBox):
             xx, yy = np.meshgrid(np.arange(nx, dtype=float), np.arange(ny, dtype=float))
             data_x = np.column_stack([xx.ravel(), yy.ravel()])
             self.plotter = panel_plot(
-                data_x, arr.ravel(), kind="2d", size=size,
+                data_x, arr.ravel(), kind="2d", size=size, interactions=False,
                 cmap=str(self.config.params.get("cmap", "inferno")),
                 labels=("X (px)", "Y (px)", ""), title=self.config.title or None)
-        elif kind == "monitor":
+        elif kind in ("monitor", "monitor_nodist"):
             length = max(20, int(self.config.params.get("length", 300)))
             history = np.full(length, np.nan)
             self.plotter = panel_plot(
-                np.arange(length, dtype=float), history, kind="monitor", size=size,
+                np.arange(length, dtype=float), history, kind=kind, size=size, interactions=False,
                 labels=("Shots ago", label, "Z"),
                 relim_mode=str(self.config.params.get("relim", "tight")),
                 title=self.config.title or None)
             self.plotter.roll(float(value), draw=False)
         elif kind == "hist":
             self.plotter = panel_plot(
-                np.asarray(value, dtype=float), kind="hist", size=size,
+                np.asarray(value, dtype=float), kind="hist", size=size, interactions=False,
                 bins=int(self.config.params.get("bins", 60)),
                 labels=("Value", "Shots", "Population"), title=self.config.title or None)
         else:  # 1d
@@ -1033,11 +1162,14 @@ class PanelCard(FluentGroupBox):
                 data_x = np.arange(len(vec), dtype=float)
                 xlabel, ylabel = "Site", label
             self.plotter = panel_plot(
-                data_x, vec, kind="1d", size=size,
+                data_x, vec, kind="1d", size=size, interactions=False,
                 labels=(xlabel, ylabel, "Z"),
                 relim_mode=str(self.config.params.get("relim", "tight")),
                 title=self.config.title or None)
-        self.canvas = panel_canvas(self.plotter.fig)
+        # Monitor cards are display-only: NO selectors (interactions=False above)
+        # and the wheel scrolls the board (isolate_wheel=False) instead of being
+        # swallowed.  Interactive zoom / select lives in the Edit tab.
+        self.canvas = panel_canvas(self.plotter.fig, isolate_wheel=False)
         self.canvas_holder.insertWidget(0, self.canvas, alignment=QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop)
         if self.canvas_holder.indexOf(self.footer) < 0:
             # footer (status line) sits DIRECTLY under the canvas, then the
@@ -1046,90 +1178,12 @@ class PanelCard(FluentGroupBox):
             # the plot and its status line.
             self.canvas_holder.addWidget(self.footer)
             self.canvas_holder.addStretch(1)
-        # re-apply the persisted basic display toggles to the FRESH plotter:
-        # the panel rebuilds whenever its data shape changes, so a toggle that
-        # was not re-applied here would silently revert every such rebuild.
+        # re-apply persisted Setting toggles (unit + manual x/y limits) to the
+        # FRESH plotter every rebuild -- the panel rebuilds whenever its data
+        # shape changes, so without this the toggle would silently revert.
         self._apply_display_params()
         self.canvas.draw_idle()
         self._place_setting_button()
-
-    # --------------------------------------------- basic display application
-    def _apply_display_params(self) -> None:
-        """Apply the persisted basic display toggles (colorbar, unit, x/y limits)
-        to the current plotter -- called after every rebuild and on each edit."""
-        if self.plotter is None:
-            return
-        if self.config.kind in COLORBAR_KINDS and hasattr(self.plotter, "set_colorbar_visible"):
-            self.plotter.set_colorbar_visible(bool(self.config.params.get("colorbar", True)))
-        self._apply_unit()
-        self._apply_limits()
-
-    def _unit_df(self):
-        """A DataFigure bound to the current plotter's figure/axes whose unit is
-        inferred from the LIVE x-axis label.  Built from fig/data (NOT live_plot)
-        on purpose: DataFigure(live_plot=...) overrides the unit with the
-        plotter's own ``unit`` (defaults to '1'), which would mask a unit-bearing
-        label like 'Detuning (GHz)'.  change_unit operates on ax.lines, so the
-        cycle still rewrites the live panel's curve in place."""
-        from .data_figure import DataFigure
-        ax = getattr(self.plotter, "ax", None)
-        unit = DataFigure._infer_unit(ax.get_xlabel()) if ax is not None else None
-        return DataFigure(fig=self.plotter.fig, ax=ax,
-                          data_x=self.plotter.data_x, data_y=self.plotter.data_y,
-                          labels=getattr(self.plotter, "labels", None), unit=unit)
-
-    def _unit_cycle_len(self) -> int:
-        """Length of the x-axis unit cycle for the CURRENT plotter (0 if none)."""
-        if self.plotter is None:
-            return 0
-        try:
-            cmap = getattr(self._unit_df(), "conversion_map", None)
-        except Exception:
-            return 0
-        return len(cmap) if cmap else 0
-
-    def _apply_unit(self) -> bool:
-        """Cycle the x-axis unit ``unit_index`` times from its original (reuse
-        DataFigure.change_unit).  Returns True if any conversion was applied."""
-        if self.plotter is None:
-            return False
-        index = int(self.config.params.get("unit_index", 0) or 0)
-        if index <= 0:
-            return False
-        try:
-            df = self._unit_df()
-            if not getattr(df, "conversion_map", None):
-                return False
-            for _ in range(index % max(1, len(df.conversion_map))):
-                df.change_unit()
-            return True
-        except Exception:
-            return False
-
-    def _apply_limits(self) -> None:
-        """Apply manual x/y limits (autoscale off on the fixed axis); None = auto.
-
-        For a live line panel (1d / monitor) the per-tick relim would re-autoscale
-        y, so a manual ylim also pins relim_mode='off' and the plotter's frozen
-        ylim_min/ylim_max to the requested range (relim then re-applies it)."""
-        ax = getattr(self.plotter, "ax", None)
-        if ax is None:
-            return
-        xlim = self.config.params.get("xlim")
-        ylim = self.config.params.get("ylim")
-        if xlim is not None:
-            ax.set_autoscalex_on(False)
-            ax.set_xlim(float(xlim[0]), float(xlim[1]))
-        if ylim is not None:
-            lo, hi = float(ylim[0]), float(ylim[1])
-            ax.set_autoscaley_on(False)
-            ax.set_ylim(lo, hi)
-            if hasattr(self.plotter, "relim_mode"):
-                self.plotter.relim_mode = "off"
-                self.plotter.ylim_min, self.plotter.ylim_max = lo, hi
-        elif hasattr(self.plotter, "relim_mode") and self.plotter.relim_mode == "off":
-            # ylim cleared back to auto: restore the panel's normal relim mode
-            self.plotter.relim_mode = str(self.config.params.get("relim", "tight"))
 
     def _reset_plot(self) -> None:
         """Drop the plot so the next refresh rebuilds it (size/params/source changed)."""
@@ -1151,9 +1205,9 @@ class PanelCard(FluentGroupBox):
 
 
 class MeasurementPanel(QtWidgets.QWidget):
-    """The Control tab's Measurement section: pick a measurement, set its
-    declared parameters in an AUTO-GENERATED + validated form, Start (one click)
-    to stream the scan into a Monitor panel, Stop to cooperatively cancel.
+    """A measurement panel's Edit-tab Measurement section: pick a measurement, set
+    its declared parameters in an AUTO-GENERATED + validated form, Start (one
+    click) to stream the scan into a Monitor panel, Stop to cooperatively cancel.
 
     The form is built entirely from a :class:`MeasurementSpec`'s ``params``
     (the single source of truth -- the API default and this control derive from
@@ -1164,13 +1218,14 @@ class MeasurementPanel(QtWidgets.QWidget):
     params with an empty value disable Start with a hint.
     """
 
-    start_requested = QtCore.pyqtSignal(object)    # emits the chosen MeasurementSpec
+    start_requested = QtCore.pyqtSignal(object)    # emits THIS MeasurementPanel (read spec + values off it)
     stop_requested = QtCore.pyqtSignal()
 
-    def __init__(self, measurements: Sequence[object], parent=None):
+    def __init__(self, measurements: Sequence[object], parent=None, *, single: bool = False):
         super().__init__(parent)
         self.setStyleSheet("background: transparent;")
         self._specs = list(measurements)
+        self._single = bool(single)               # bound to ONE spec (per-panel Edit) -> hide the picker
         self._widgets: dict[str, object] = {}     # param key -> widget (or tuple for axis_range)
         self._running = False
 
@@ -1178,7 +1233,8 @@ class MeasurementPanel(QtWidgets.QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(scaled_px(6, minimum=4))
 
-        # measurement type picker
+        # measurement type picker (hidden in single-spec mode: the panel already
+        # knows which measurement it edits, so the picker would be noise)
         pick_row = QtWidgets.QHBoxLayout()
         pick_row.setSpacing(scaled_px(6, minimum=4))
         self.type_combo = FluentComboBox()
@@ -1187,9 +1243,13 @@ class MeasurementPanel(QtWidgets.QWidget):
             self.type_combo.addItem(str(spec.name), index)
         self.type_combo.setToolTip("Pick a measurement; its scanned parameters appear below.")
         self.type_combo.activated.connect(lambda *_: self._rebuild_form())
-        pick_row.addWidget(self._tag("measurement"))
+        self._pick_label = self._tag("measurement")
+        pick_row.addWidget(self._pick_label)
         pick_row.addWidget(self.type_combo, 1)
         root.addLayout(pick_row)
+        if self._single:
+            self._pick_label.hide()
+            self.type_combo.hide()
 
         # auto-generated parameter form (rebuilt when the type changes)
         self.form = QtWidgets.QFormLayout()
@@ -1348,6 +1408,18 @@ class MeasurementPanel(QtWidgets.QWidget):
                 values[key] = float(entry[1].value())
         return values
 
+    def set_axis_range(self, lo: float, hi: float) -> bool:
+        """Fill the FIRST axis_range param's Min/Max from a selected region
+        (confocal _read_range: a plot selection becomes the next scan's range).
+        Returns True if an axis_range param was found and set."""
+        for entry in self._widgets.values():
+            if entry[0] == "axis_range":
+                _, lo_spin, hi_spin, _pts = entry
+                lo_spin.setValue(float(min(lo, hi)))
+                hi_spin.setValue(float(max(lo, hi)))
+                return True
+        return False
+
     def _missing_required(self) -> list[str]:
         """Required params whose value is empty (only the optional-int line edit
         can be blank; spin boxes always hold a number)."""
@@ -1380,7 +1452,35 @@ class MeasurementPanel(QtWidgets.QWidget):
         spec = self.current_spec()
         if spec is None or self._missing_required():
             return
-        self.start_requested.emit(spec)
+        self.start_requested.emit(self)
+
+    def seed_values(self, values: Mapping[str, object]) -> None:
+        """Pre-fill the form widgets from a saved ``{key: value}`` dict (e.g. the
+        params the panel last ran with), so a per-panel Edit reopens on the
+        last-used values rather than the declared defaults.  Unknown keys and
+        shape mismatches are ignored -- the declared form is the source of truth."""
+        for key, entry in self._widgets.items():
+            if key not in values:
+                continue
+            val = values[key]
+            tag = entry[0]
+            try:
+                if tag == "axis_range" and isinstance(val, (tuple, list)) and len(val) == 3:
+                    entry[1].setValue(float(val[0])); entry[2].setValue(float(val[1]))
+                    entry[3].setValue(int(val[2]))
+                elif tag == "bool":
+                    entry[1].setChecked(bool(val))
+                elif tag == "choice":
+                    entry[1].setCurrentText(str(val))
+                elif tag == "int":
+                    entry[1].setValue(int(val))
+                elif tag == "int_opt":
+                    entry[1].setText("" if val is None else str(int(val)))
+                elif tag == "float":
+                    entry[1].setValue(float(val))
+            except (TypeError, ValueError):
+                continue
+        self._refresh_start_enabled()
 
     def set_running(self, running: bool) -> None:
         self._running = bool(running)
@@ -1394,6 +1494,376 @@ class MeasurementPanel(QtWidgets.QWidget):
     def set_status(self, text: str, *, error: bool) -> None:
         self.status.setText(str(text)[:200])
         self.status.setStyleSheet(f"color: {RED if error else GREY}; background: transparent; border: none;")
+
+
+class PanelEditor(QtWidgets.QWidget):
+    """One panel's processing tab (confocal per-plot control card).
+
+    Opened from a panel's ``Edit...`` button as its OWN closable tab, so several
+    panels can be edited side by side.  Holds a FROZEN snapshot of that panel's
+    current data plus the heavy controls that do NOT belong in the lightweight
+    Setting popup AND do NOT duplicate it (Setting owns source / size / colormap
+    / relim / unit):
+
+      * curve fit  -- model (gated by the panel's plot kind) + free-text args +
+        Fit / Clear, run on the snapshot via :class:`DataFigure`;
+      * manual x/y limits + Save Fig;
+      * for a panel that came from a measurement, that measurement's
+        AUTO-generated parameter form (the same ParamDecl form the launcher
+        uses, bound to the one spec) whose Start RE-RUNS the measurement into
+        this very Monitor panel with the edited params.
+
+    The whole page lives in a scroll area, so the snapshot never pushes the
+    fit/limits row off-screen (the old single-editor cutoff)."""
+
+    def __init__(self, card: "PanelCard", console: "TaskConsole", parent=None):
+        super().__init__(parent)
+        self.card = card
+        self.console = console
+        self.setStyleSheet("background: transparent;")
+        self._plotter = None
+        self._canvas = None
+        self._df = None
+        self.meas_panel = None
+        self._feed = None                       # the feed that produces this panel's data
+        self._feed_widgets: dict = {}           # acquisition-param name -> editable field
+        self._feed_now_labels: dict = {}        # acquisition-param name -> "now: X" reference
+
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = FluentScrollArea()
+        scroll.setWidgetResizable(True)
+        outer.addWidget(scroll)
+        page = QtWidgets.QWidget()
+        page.setStyleSheet("background: transparent;")
+        scroll.setWidget(page)
+        col = QtWidgets.QVBoxLayout(page)
+        m = scaled_px(10, minimum=6)
+        col.setContentsMargins(m, m, m, m)
+        col.setSpacing(scaled_px(6, minimum=4))
+
+        def section(text):
+            lab = FluentLabel(text)
+            lab.setStyleSheet(f"color: {GREY}; background: transparent; border: none; font-weight: bold;")
+            col.addWidget(lab)
+
+        def labeled(text):
+            lab = FluentLabel(text)
+            lab.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+            return lab
+
+        # ---- Measurement (only when this panel came from a measurement) -----
+        # The measurement's OWN API parameters, auto-generated as a GUI form from
+        # its ParamDecls; Start RE-RUNS the scan into this Monitor panel with the
+        # edited params.
+        spec = console._spec_for_card(card)
+        if spec is not None:
+            section("Measurement")
+            self.meas_panel = MeasurementPanel([spec], single=True)
+            self.meas_panel.seed_values(card.config.params.get("measurement_values") or {})
+            self.meas_panel.start_requested.connect(console._start_measurement)
+            self.meas_panel.stop_requested.connect(console._stop_measurement)
+            col.addWidget(self.meas_panel)
+
+        # ---- Acquisition: the params of the FEED that PRODUCES this panel's data
+        # (a loading-image panel is produced by a LoadingFeed -> exposure /
+        # roi_radius / grid_shape / ema / *_frames), auto-discovered from the
+        # feed's __init__ signature (confocal "caller signature = source of
+        # truth").  Each field is PREFILLED with the CURRENT running value and
+        # shows it as a "now: X" reference, so you edit against what's live;
+        # Restart rebuilds the feed.  Measurement panels use the Measurement form
+        # above instead (that IS their producer), so this is skipped for them.
+        if spec is None:
+            self._feed = console._producing_feed(card)
+            for name, current in console._feed_params(self._feed):
+                if not self._feed_widgets:
+                    section("Acquisition")
+                edit = FluentLineEdit(_py_to_text(current))
+                edit.setFixedWidth(scaled_px(110, minimum=84))
+                self._feed_widgets[name] = edit
+                now = labeled(f"now: {_py_to_text(current)}")
+                self._feed_now_labels[name] = now
+                holder = QtWidgets.QWidget()
+                hl = QtWidgets.QHBoxLayout(holder)
+                hl.setContentsMargins(0, 0, 0, 0)
+                hl.setSpacing(scaled_px(6, minimum=4))
+                hl.addWidget(edit, 0)
+                hl.addWidget(now, 0)
+                hl.addStretch(1)
+                # widest feed-param label is "calibration_frames" (18 chars) --
+                # 150 clipped its trailing 's'; 170 fits the longest name in full.
+                col.addWidget(FluentSettingRow(name, holder, label_width=scaled_px(170, minimum=140)))
+            if self._feed_widgets:
+                self.feed_restart_button = FluentButton("Restart feed", color=ACCENT)
+                self.feed_restart_button.setToolTip(
+                    "Rebuild the producing feed with the edited acquisition parameters\n"
+                    "and restart it (re-calibrates, like a measurement re-run).")
+                self.feed_restart_button.clicked.connect(self._restart_feed)
+                col.addWidget(self.feed_restart_button)
+
+        # ---- Parameters: the PLOT's own tunable API params as GUI controls,
+        # auto-discovered from the kind's declarative specs.  Each edit re-renders
+        # the LIVE panel AND this snapshot.  This is where "the params the plot
+        # call exposes" live -- NOT in the basic Setting popup (which keeps only
+        # source / size / colormap / relim / unit), so the two never duplicate.
+        functional = [s for s in PANEL_PARAMS.get(card.config.kind, ()) if not s.display]
+        if functional:
+            section("Parameters")
+            for s in functional:
+                widget = card._make_param_widget(s, apply=self._edit_param)
+                col.addWidget(FluentSettingRow(s.label, widget, label_width=scaled_px(96, minimum=72)))
+
+        # ---- Processing: frozen snapshot + fit + limits + save -------------
+        section("Processing")
+        head = QtWidgets.QHBoxLayout()
+        head.addWidget(labeled("frozen snapshot of current data"), 1)
+        self.refresh_button = FluentButton("Refresh", color=GREY)
+        self.refresh_button.setToolTip("Re-snapshot the panel's current data")
+        self.refresh_button.clicked.connect(self.rebuild)
+        self.save_button = FluentButton("Save Fig", color=ACCENT)
+        self.save_button.setToolTip("Save the edited figure (png) + data (npz), timestamped, into tasks/")
+        self.save_button.clicked.connect(self.save)
+        head.addWidget(self.refresh_button)
+        head.addWidget(self.save_button)
+        col.addLayout(head)
+
+        self.canvas_holder = QtWidgets.QVBoxLayout()
+        self.canvas_holder.setContentsMargins(0, 0, 0, 0)
+        col.addLayout(self.canvas_holder)
+
+        # Fit: the FULL DataFigure model set, available for EVERY kind (no
+        # gating).  DataFigure picks the 1D / 2D path from the snapshot, so a 2D
+        # image fits the 2D-Gaussian "2D center" model and lines fit the rest.
+        section("Fit")
+        fit_row = QtWidgets.QHBoxLayout()
+        self.fit_combo = FluentComboBox()
+        self.fit_combo.addItems(list(FIT_MODELS))
+        self.fit_combo.setFixedWidth(scaled_px(150, minimum=120))
+        self.fit_combo.setToolTip(
+            "Curve-fit model (the full DataFigure set).  '2D center' fits a 2D image\n"
+            "(2D Gaussian); the others fit the 1D trace.")
+        self.fit_cmd = FluentLineEdit("")
+        self.fit_cmd.setPlaceholderText("fit args, e.g.  p0=[1,0,1,0], B=0.1, is_fit=False")
+        self.fit_cmd.setStyleSheet(self.fit_cmd.styleSheet() + " QLineEdit { font-family: Consolas, monospace; }")
+        self.fit_cmd.setToolTip(
+            "Optional fit arguments injected into the call (trusted local code):\n"
+            "p0=[...] initial guess; NAME=value fixes a named parameter; is_fit=False just overlays p0.")
+        self.fit_cmd.returnPressed.connect(self.do_fit)
+        fit_btn = FluentButton("Fit", color=ACCENT)
+        fit_btn.clicked.connect(self.do_fit)
+        clear_btn = FluentButton("Clear", color=GREY)
+        clear_btn.clicked.connect(self.clear_fit)
+        fit_row.addWidget(labeled("model"))
+        fit_row.addWidget(self.fit_combo)
+        fit_row.addWidget(self.fit_cmd, 1)
+        fit_row.addWidget(fit_btn)
+        fit_row.addWidget(clear_btn)
+        col.addLayout(fit_row)
+
+        # manual x/y limits (DataFigure.xlim/ylim) -- NOT in Setting, so they
+        # live here.  Unit + relim are deliberately ABSENT (Setting owns them).
+        ax_row = QtWidgets.QHBoxLayout()
+        self.xmin = FluentLineEdit(""); self.xmax = FluentLineEdit("")
+        self.ymin = FluentLineEdit(""); self.ymax = FluentLineEdit("")
+        for w in (self.xmin, self.xmax, self.ymin, self.ymax):
+            w.setFixedWidth(scaled_px(72, minimum=56))
+            w.returnPressed.connect(self.apply_limits)
+        apply_btn = FluentButton("Apply lim", color=ACCENT)
+        apply_btn.clicked.connect(self.apply_limits)
+        ax_row.addWidget(labeled("x")); ax_row.addWidget(self.xmin); ax_row.addWidget(self.xmax)
+        ax_row.addWidget(labeled("y")); ax_row.addWidget(self.ymin); ax_row.addWidget(self.ymax)
+        ax_row.addWidget(apply_btn)
+        ax_row.addStretch(1)
+        col.addLayout(ax_row)
+
+        self.status = FluentLabel("")
+        self.status.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+        col.addWidget(self.status)
+        col.addStretch(1)
+
+        self.rebuild()
+
+    # ------------------------------------------------------------- snapshot
+    def teardown(self) -> None:
+        if self._canvas is not None:
+            self.canvas_holder.removeWidget(self._canvas)
+            self._canvas.deleteLater()
+        if self._plotter is not None and plt is not None and self._plotter.fig is not None:
+            plt.close(self._plotter.fig)
+        self._canvas = None
+        self._plotter = None
+        self._df = None
+
+    def rebuild(self) -> None:
+        """Snapshot the bound card's CURRENT data, MIRRORING the Monitor frame.
+
+        The snapshot uses the card's OWN size (not a forced 2x4) so it looks
+        exactly like the Monitor panel and can never overflow the Edit page (the
+        Monitor card already fits) -- and unlike the Monitor card it is built
+        INTERACTIVE (default selectors on), so zoom / region-select work here."""
+        card = self.card
+        if card is None or card.plotter is None or panel_canvas is None:
+            self.status.setText("open the panel with data first")
+            return
+        self.teardown()
+        src = card.plotter
+        kind = card.config.kind
+        size = card.config.size          # mirror the Monitor frame, never force 2x4
+        title = card.config.title or PANEL_KINDS[kind]
+        relim = str(card.config.params.get("relim", "tight"))
+        cmap = str(card.config.params.get("cmap", "inferno" if kind == "2d" else "viridis"))
+        try:
+            if kind == "2d":
+                self._plotter = panel_plot(np.array(src.data_x, dtype=float),
+                                           np.array(src.data_y[:, 0], dtype=float), kind="2d",
+                                           size=size, cmap=cmap, labels=tuple(src.labels), title=title)
+            elif kind == "sites":
+                self._plotter = panel_plot(np.array(src.data_x[:, :2], dtype=float),
+                                           np.array(src.data_y[:, 0], dtype=float), kind="sites",
+                                           size=size, cmap=cmap, image=getattr(src, "background", None),
+                                           roi_radius=getattr(src, "roi_radius", 3.0),
+                                           labels=tuple(src.labels), title=title)
+            elif kind == "hist":
+                self._plotter = panel_plot(np.array(src.values, dtype=float), kind="hist", size=size,
+                                           bins=int(card.config.params.get("bins", 60)),
+                                           labels=tuple(src.labels), title=title)
+            else:  # 1d / monitor / monitor_nodist -> a line snapshot
+                self._plotter = panel_plot(np.array(src.data_x[:, 0], dtype=float),
+                                           np.array(src.data_y[:, 0], dtype=float),
+                                           kind=kind, size=size, relim_mode=relim,
+                                           labels=tuple(src.labels), title=title)
+        except Exception as exc:
+            self.status.setText(f"could not snapshot: {str(exc).splitlines()[0][:120]}")
+            return
+        self._canvas = panel_canvas(self._plotter.fig)
+        self.canvas_holder.addWidget(self._canvas, alignment=QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop)
+        self._canvas.draw_idle()
+        self._df = None
+        self.fill_limits()
+        # confocal-style auto-range: on a MEASUREMENT panel, a region selected on
+        # this (interactive) Edit plot fills the measurement's scan x-range.
+        area = getattr(self._plotter, "area", None)
+        if self.meas_panel is not None and area is not None:
+            area.callback = self._read_scan_range
+        self.status.setText("snapshot of current data — fit / set limits / save are frozen here")
+
+    def _edit_param(self, key: str, value) -> None:
+        """A plot-param edit from the Edit tab: apply to the LIVE panel (re-renders
+        it) and re-snapshot here, so the change shows in both surfaces."""
+        if self.card is not None:
+            self.card._set_param(key, value)
+        self.rebuild()
+
+    def _read_scan_range(self) -> None:
+        """Confocal ``_read_range``: a region SELECTED (left-drag) on the Edit
+        plot fills this measurement's scan x-range Min/Max -- the NEXT scan's
+        range.  Wide scan -> drag the feature -> Start re-scans just it.  No-op
+        without a measurement form or an active selection."""
+        if self.meas_panel is None or self._plotter is None:
+            return
+        rng = getattr(getattr(self._plotter, "area", None), "range", None)
+        if not rng or rng[0] is None:
+            return
+        x1, x2 = float(rng[0]), float(rng[1])
+        if self.meas_panel.set_axis_range(x1, x2):
+            self.status.setText(f"scan range set from selection: {x1:.4g} … {x2:.4g}")
+
+    def _restart_feed(self) -> None:
+        """Rebuild the producing feed with the edited Acquisition params and
+        restart it; refresh the 'now:' references + re-snapshot."""
+        if self._feed is None:
+            return
+        new_params = {name: _text_to_py(w.text()) for name, w in self._feed_widgets.items()}
+        try:
+            self._feed = self.console._restart_feed(self._feed, new_params)
+        except Exception as exc:
+            self.status.setText(f"restart failed: {str(exc).splitlines()[0][:120]}")
+            return
+        for name, current in self.console._feed_params(self._feed):
+            if name in self._feed_now_labels:
+                self._feed_now_labels[name].setText(f"now: {_py_to_text(current)}")
+        self.status.setText("feed restarted with new acquisition parameters")
+        self.rebuild()
+
+    def _df_for(self):
+        from .data_figure import DataFigure
+        if self._df is None:
+            self._df = DataFigure(self._plotter)
+        return self._df
+
+    def do_fit(self) -> None:
+        if self._plotter is None or self.fit_combo is None:
+            return
+        method = FIT_MODELS.get(self.fit_combo.currentText())
+        if method is None:
+            return
+        cmd = self.fit_cmd.text().strip()
+        try:
+            df = self._df_for()
+            if df.fit is not None:
+                df.clear()
+            # trusted-local-tool posture: the typed args are injected into the
+            # fit call -- p0 / fixed-params / is_fit.
+            call = f"_df.{method}({cmd})" if cmd else f"_df.{method}(is_display=True)"
+            result, _ = eval(call, {"_df": df, "np": np})  # noqa: S307 - local experiment tool
+            self._canvas.draw_idle()
+            popt = getattr(result, "popt", None)
+            names = getattr(result, "names", None) or []
+            if popt is None:
+                self.status.setText(f"fit {self.fit_combo.currentText()}: did not converge")
+                return
+            self.status.setText(f"fit {self.fit_combo.currentText()}: "
+                                + ", ".join(f"{n}={v:.4g}" for n, v in zip(names, popt)))
+        except Exception as exc:
+            self.status.setText(f"fit failed: {str(exc).splitlines()[0][:140]}")
+
+    def clear_fit(self) -> None:
+        if self._df is not None:
+            try:
+                self._df.clear()
+            except Exception:
+                pass
+            self._df = None
+            if self._canvas is not None:
+                self._canvas.draw_idle()
+            self.status.setText("fit cleared")
+
+    def fill_limits(self) -> None:
+        if self._plotter is None:
+            return
+        ax = getattr(self._plotter, "ax", None)
+        if ax is None:
+            return
+        xlo, xhi = ax.get_xlim()
+        ylo, yhi = ax.get_ylim()
+        with _signals_blocked(self.xmin, self.xmax, self.ymin, self.ymax):
+            self.xmin.setText(f"{xlo:.6g}"); self.xmax.setText(f"{xhi:.6g}")
+            self.ymin.setText(f"{ylo:.6g}"); self.ymax.setText(f"{yhi:.6g}")
+
+    def apply_limits(self) -> None:
+        if self._plotter is None:
+            return
+        try:
+            df = self._df_for()
+            df.xlim(float(self.xmin.text()), float(self.xmax.text()))
+            df.ylim(float(self.ymin.text()), float(self.ymax.text()))
+            self._canvas.draw_idle()
+            self.status.setText("limits applied")
+        except Exception as exc:
+            self.status.setText(f"bad limits: {str(exc).splitlines()[0][:100]}")
+
+    def save(self) -> None:
+        if self._plotter is None:
+            return
+        try:
+            df = self._df_for()
+            stem = (self.card.config.title or self.card.config.kind).strip() or "panel"
+            out = df.save(_task_files_dir() / stem,
+                          extra_info={"source": self.card.config.source,
+                                      "kind": self.card.config.kind})
+            self.status.setText(f"saved {out['figure'].name} + {out['data'].name}")
+        except Exception as exc:
+            self.status.setText(f"save failed: {str(exc).splitlines()[0][:120]}")
 
 
 class _PanelBoard(QtWidgets.QWidget):
@@ -1439,6 +1909,13 @@ class TaskConsole(QtWidgets.QWidget):
         self.measurements = list(measurements)
         self._meas_feed = None          # the ScannedMeasurementFeed of the active run
         self._meas_spec = None
+        # The measurement form now lives in EACH measurement panel's own Edit tab
+        # (no global Control launcher); _active_meas_panel is the form that owns
+        # the running scan.  measurement_panel stays None (kept for the stop/poll
+        # fallback) since there is no single shared form any more.
+        self.measurement_panel = None
+        self.measurement_group = None
+        self.measurement_placeholder = None
         self.state = state or default_console_state()
         self.window_ratio = float(window_ratio)
         self._window_px = window_px
@@ -1446,12 +1923,12 @@ class TaskConsole(QtWidgets.QWidget):
         self._last_version = -1
         self._building = False
         self._address: str | None = None
-        # Control-tab state: a FROZEN snapshot plot of the card being edited,
-        # plus a DataFigure for fit / limits / units / save.
-        self._editor_card: PanelCard | None = None
-        self._editor_plotter = None
-        self._editor_canvas = None
-        self._editor_df = None
+        # Per-panel editors: one PanelEditor per opened panel, hosted as a
+        # closable tab (keyed by id(card)).  The measurement panel that started
+        # the active run (global launcher OR a per-panel editor) is tracked so
+        # poll/stop route their status to the right place.
+        self._panel_editors: dict[int, "PanelEditor"] = {}
+        self._active_meas_panel = None
 
         self._build_ui()
         self.load_state(self.state)
@@ -1517,20 +1994,14 @@ class TaskConsole(QtWidgets.QWidget):
         self.kind_combo = FluentComboBox()
         for key, label in PANEL_KINDS.items():
             self.kind_combo.addItem(label, key)
-        self.kind_combo.setFixedWidth(scaled_px(108, minimum=92))
+        # The measurement catalog is offered RIGHT HERE (no separate Control tab):
+        # picking one + Add Panel creates a result panel and opens its Edit tab,
+        # where the measurement's parameters + Start live.
+        for spec in self.measurements:
+            self.kind_combo.addItem(f"Measurement: {spec.name}", ("measurement", spec.name))
+        self.kind_combo.setFixedWidth(scaled_px(132, minimum=104))
         add_button = FluentButton("Add Panel", color=ACCENT)
         add_button.clicked.connect(self._add_panel)
-        # Two independent freezes (see _toggle_pause / _toggle_measurement):
-        #  Pause Plot  -> stop refreshing the panels; data still flows into the hub,
-        #                 so you can freeze the display and fit / inspect carefully.
-        #  Pause Meas. -> stop the feeds (the experiment data source) themselves.
-        self.pause_button = FluentButton("Pause Plot", color=ACCENT)
-        self.pause_button.setToolTip("Freeze the panel display (data keeps arriving) — fit / inspect, then Resume")
-        self.pause_button.clicked.connect(self._toggle_pause)
-        self.meas_button = FluentButton("Pause Meas.", color=ACCENT)
-        self.meas_button.setToolTip("Pause the measurement feeds (stop producing new shots)")
-        self.meas_button.clicked.connect(self._toggle_measurement)
-        self.meas_button.setEnabled(bool(self._controllable_feeds()))
         self.save_button = FluentButton("Save", color=ACCENT)
         self.save_button.clicked.connect(self.save_to_file)
         load_button = FluentButton("Load", color=ORANGE)
@@ -1539,16 +2010,14 @@ class TaskConsole(QtWidgets.QWidget):
         for widget in (self.status_dot, self.name_edit, self.preset_combo):
             header.addWidget(widget)
         header.addWidget(self.summary, 1)
-        for widget in (self.kind_combo, add_button, self.pause_button, self.meas_button,
-                       self.save_button, load_button):
+        for widget in (self.kind_combo, add_button, self.save_button, load_button):
             header.addWidget(widget)
         root.addWidget(header_frame)
 
-        # Two tabs (like the pulse GUI): Monitor = the live drag-and-snap panel
-        # grid; Control = the per-panel processing/save panel (curve fit,
-        # command fit, x/y limits, units, relim, Save Fig) plus the Measurement
-        # section (P5) -- the heavier controls that would overload the
-        # lightweight Setting popup.
+        # ONE permanent tab: Monitor = the live drag-and-snap panel grid.
+        # Measurements are launched from the header's Add Panel (no Control tab);
+        # each panel's Edit... opens its OWN closable tab (a PanelEditor) carrying
+        # that panel's params / fit / limits / save / re-run (+ Measurement form).
         self.tabs = FluentTabWidget()
         dash_tab = QtWidgets.QWidget()
         dash_tab.setStyleSheet("background: transparent;")
@@ -1559,9 +2028,9 @@ class TaskConsole(QtWidgets.QWidget):
         self.board = _PanelBoard()
         self.scroll.setWidget(self.board)
         dash_layout.addWidget(self.scroll, 1)
-        self.tabs.addTab(dash_tab, "Monitor")
-        self.tabs.addTab(self._build_editor_tab(), "Control")
+        self.tabs.add_permanent_tab(dash_tab, "Monitor")
         self.tabs.currentChanged.connect(self._on_tab_changed)
+        self.tabs.tab_close_requested.connect(self._on_editor_tab_closed)
         root.addWidget(self.tabs, 1)
 
     # ------------------------------------------------------------------ state
@@ -1576,7 +2045,8 @@ class TaskConsole(QtWidgets.QWidget):
         self._building = True
         try:
             self.state = state
-            for card in self.cards:
+            for card in list(self.cards):
+                self._close_panel_editor(card)   # drop any open Edit tab for this card
                 card.shutdown()
                 card.setParent(None)
                 card.deleteLater()
@@ -1601,324 +2071,164 @@ class TaskConsole(QtWidgets.QWidget):
         self.cards.append(card)
 
     # ----------------------------------------------------------------- control
-    def _build_editor_tab(self) -> QtWidgets.QWidget:
-        """The Control tab: the per-panel PROCESSING / SAVE panel (confocal
-        style).  A frozen snapshot of one panel plus the heavier controls
-        (command-line fit, x/y limits, unit cycle, relim, Save Fig) that are
-        kept off the lightweight Setting popup -- organised into labelled
-        sections, with a Measurement section reserved at the top for P5."""
-        page = QtWidgets.QWidget()
-        page.setStyleSheet("background: transparent;")
-        outer = QtWidgets.QVBoxLayout(page)
-        m = scaled_px(8, minimum=5)
-        outer.setContentsMargins(m, m, m, m)
-        outer.setSpacing(scaled_px(6, minimum=4))
+    def _spec_for_card(self, card: "PanelCard"):
+        """The MeasurementSpec a result panel came from (None for plain panels)."""
+        name = card.config.params.get("measurement")
+        if not name:
+            return None
+        return next((s for s in self.measurements if getattr(s, "name", None) == name), None)
 
-        def section(text):
-            label = FluentLabel(text)
-            label.setStyleSheet(f"color: {GREY}; background: transparent; border: none; font-weight: bold;")
-            outer.addWidget(label)
-            return label
+    # ---- producing-feed discovery: a panel's data comes from a feed; its Edit
+    # exposes THAT feed's acquisition parameters (e.g. a loading-image panel is
+    # produced by a LoadingFeed -> exposure / roi_radius / grid_shape / ...).
+    @staticmethod
+    def _referenced_signals(source: str) -> set:
+        """The hub signal names a panel's source expression reads (AST Name nodes
+        minus the namespace builtins) -- used to map the panel to its feed."""
+        import ast
+        try:
+            tree = ast.parse(str(source or ""), mode="exec")
+        except SyntaxError:
+            return set()
+        names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+        return names - {"np", "numpy", "math", "history", "latest", "names", "shot", "value"}
 
-        # ---- Measurement (P5): pick -> auto-form -> one-click Start ---------
-        # With NO measurements the group stays a disabled placeholder so the
-        # Control tab keeps its intended top-down shape (Measurement ->
-        # Processing -> Axes); with specs the placeholder is replaced by the
-        # auto-generated, validated parameter form + Start/Stop.
-        self.measurement_group = FluentGroupBox("Measurement", shadow=False)
-        meas_box = QtWidgets.QVBoxLayout(self.measurement_group)
-        meas_box.setContentsMargins(scaled_px(10), scaled_px(8), scaled_px(10), scaled_px(8))
-        self.measurement_placeholder = None
-        self.measurement_panel = None
-        if self.measurements:
-            self.measurement_group.setEnabled(True)
-            self.measurement_panel = MeasurementPanel(self.measurements)
-            self.measurement_panel.start_requested.connect(self._start_measurement)
-            self.measurement_panel.stop_requested.connect(self._stop_measurement)
-            meas_box.addWidget(self.measurement_panel)
-        else:
-            self.measurement_group.setEnabled(False)
-            self.measurement_placeholder = FluentLabel(
-                "Measurement controls land here: pick a measurement, set its scanned\n"
-                "parameters, Start to stream the scan into a Monitor panel.")
-            self.measurement_placeholder.setStyleSheet(
-                f"color: {GREY}; background: transparent; border: none;")
-            meas_box.addWidget(self.measurement_placeholder)
-        outer.addWidget(self.measurement_group)
+    def _producing_feed(self, card: "PanelCard"):
+        """The feed whose published signals the panel's source reads (None if the
+        expression touches no feed signal, e.g. a pure constant)."""
+        refs = self._referenced_signals(card.config.source)
+        if not refs:
+            return None
+        for feed in self.feeds:
+            published = feed.published_signals() if hasattr(feed, "published_signals") else frozenset()
+            if refs & set(published):
+                return feed
+        return None
 
-        # ---- Processing: the bound panel snapshot + fit / axes / save ------
-        section("Processing")
-        head = QtWidgets.QHBoxLayout()
-        self.ed_title = FluentLabel("Control — select a panel's Edit… button")
-        self.ed_title.setStyleSheet(f"color: {TEXT}; background: transparent; border: none; font-weight: bold;")
-        self.ed_refresh = FluentButton("Refresh", color=GREY)
-        self.ed_refresh.setToolTip("Re-snapshot the panel's current data into the Control tab")
-        self.ed_refresh.clicked.connect(lambda: self._edit_card(self._editor_card) if self._editor_card else None)
-        self.ed_savefig = FluentButton("Save Fig", color=ACCENT)
-        self.ed_savefig.setToolTip("Save the edited figure (png) + data (npz), timestamped, into tasks/")
-        self.ed_savefig.clicked.connect(self._editor_save)
-        head.addWidget(self.ed_title, 1)
-        head.addWidget(self.ed_refresh)
-        head.addWidget(self.ed_savefig)
-        outer.addLayout(head)
+    @staticmethod
+    def _feed_params(feed) -> list:
+        """``[(name, current_value)]`` for a feed's TUNABLE __init__ params
+        (confocal "caller signature is the source of truth"): every keyword whose
+        current value is readable off the instance, minus the wiring args
+        (hub / camera / sequencer / prefix) and *args/**kwargs."""
+        if feed is None:
+            return []
+        import inspect
+        exclude = {"self", "hub", "camera", "sequencer", "prefix"}
+        try:
+            params = inspect.signature(type(feed).__init__).parameters
+        except (TypeError, ValueError):
+            return []
+        out = []
+        for name, p in params.items():
+            if name in exclude or p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD):
+                continue
+            if hasattr(feed, name):
+                out.append((name, getattr(feed, name)))
+        return out
 
-        self.ed_canvas_holder = QtWidgets.QVBoxLayout()
-        self.ed_canvas_holder.setContentsMargins(0, 0, 0, 0)
-        outer.addLayout(self.ed_canvas_holder)
-
-        def labeled(text):
-            lab = FluentLabel(text)
-            lab.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
-            return lab
-
-        section("Fit & axes")
-        # Fit row: model + free-text command (confocal ":" params) + Fit + Clear
-        fit_row = QtWidgets.QHBoxLayout()
-        self.ed_fit_combo = FluentComboBox()
-        self.ed_fit_combo.addItems(list(FIT_MODELS))
-        self.ed_fit_combo.setFixedWidth(scaled_px(120, minimum=96))
-        self.ed_fit_cmd = FluentLineEdit("")
-        self.ed_fit_cmd.setPlaceholderText("fit args, e.g.  p0=[1,0,1,0], B=0.1, is_fit=False")
-        self.ed_fit_cmd.setStyleSheet(self.ed_fit_cmd.styleSheet() + " QLineEdit { font-family: Consolas, monospace; }")
-        self.ed_fit_cmd.setToolTip(
-            "Optional fit arguments injected into the call (trusted local code):\n"
-            "p0=[...] initial guess; NAME=value fixes a named parameter; is_fit=False just overlays p0.")
-        self.ed_fit_cmd.returnPressed.connect(self._editor_do_fit)
-        ed_fit = FluentButton("Fit", color=ACCENT)
-        ed_fit.clicked.connect(self._editor_do_fit)
-        ed_clear = FluentButton("Clear", color=GREY)
-        ed_clear.clicked.connect(self._editor_clear_fit)
-        fit_row.addWidget(labeled("Fit"))
-        fit_row.addWidget(self.ed_fit_combo)
-        fit_row.addWidget(self.ed_fit_cmd, 1)
-        fit_row.addWidget(ed_fit)
-        fit_row.addWidget(ed_clear)
-        outer.addLayout(fit_row)
-
-        # Axes row: x/y limits + Apply + Unit cycle + relim
-        ax_row = QtWidgets.QHBoxLayout()
-        self.ed_xmin = FluentLineEdit(""); self.ed_xmax = FluentLineEdit("")
-        self.ed_ymin = FluentLineEdit(""); self.ed_ymax = FluentLineEdit("")
-        for w in (self.ed_xmin, self.ed_xmax, self.ed_ymin, self.ed_ymax):
-            w.setFixedWidth(scaled_px(72, minimum=56))
-            w.returnPressed.connect(self._editor_apply_limits)
-        ed_apply = FluentButton("Apply lim", color=ACCENT)
-        ed_apply.clicked.connect(self._editor_apply_limits)
-        ed_unit = FluentButton("Unit", color=GREY)
-        ed_unit.setToolTip("Cycle the x-axis unit (GHz/nm/MHz or ns/us/ms) where defined")
-        ed_unit.clicked.connect(self._editor_unit)
-        self.ed_relim = FluentComboBox()
-        self.ed_relim.addItems(["tight", "normal"])
-        self.ed_relim.setFixedWidth(scaled_px(74, minimum=60))
-        self.ed_relim.activated.connect(self._editor_set_relim)
-        ax_row.addWidget(labeled("x"))
-        ax_row.addWidget(self.ed_xmin); ax_row.addWidget(self.ed_xmax)
-        ax_row.addWidget(labeled("y"))
-        ax_row.addWidget(self.ed_ymin); ax_row.addWidget(self.ed_ymax)
-        ax_row.addWidget(ed_apply)
-        ax_row.addWidget(ed_unit)
-        ax_row.addWidget(labeled("relim"))
-        ax_row.addWidget(self.ed_relim)
-        ax_row.addStretch(1)
-        outer.addLayout(ax_row)
-
-        self.ed_status = FluentLabel("")
-        self.ed_status.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
-        outer.addWidget(self.ed_status)
-        outer.addStretch(1)
-        self._editor_controls = [self.ed_fit_combo, self.ed_fit_cmd, ed_fit, ed_clear,
-                                 self.ed_xmin, self.ed_xmax, self.ed_ymin, self.ed_ymax,
-                                 ed_apply, ed_unit, self.ed_relim, self.ed_savefig, self.ed_refresh]
-        for w in self._editor_controls:
-            w.setEnabled(False)
-        return page
+    def _restart_feed(self, feed, new_params: dict):
+        """Rebuild ``feed``'s type with edited acquisition params (keeping the
+        wiring args + restarting at the same rate) and swap it into ``self.feeds``.
+        Returns the new feed.  Raises if the feed cannot be rebuilt."""
+        if feed is None or feed not in self.feeds:
+            return feed
+        camera = getattr(feed, "camera", None)
+        if camera is None:
+            raise RuntimeError("this panel's feed has no camera to rebuild from")
+        kwargs = {"prefix": getattr(feed, "prefix", "")}
+        sequencer = getattr(feed, "sequencer", None)
+        if sequencer is not None:
+            kwargs["sequencer"] = sequencer
+        kwargs.update(new_params)
+        rate = float(getattr(feed, "rate_hz", 4.0))
+        was_running = feed.running
+        feed.stop()
+        rebuilt = type(feed)(self.hub, camera, **kwargs)
+        self.feeds[self.feeds.index(feed)] = rebuilt
+        if was_running:
+            rebuilt.start(rate_hz=rate)
+        return rebuilt
 
     def _edit_card(self, card: "PanelCard") -> None:
-        """Bind the editor to a card (snapshot its current data) and show the tab."""
-        if card is None or card.plotter is None:
-            self._message("Open a panel with data first (the panel must be showing a plot).")
-            return
-        self._editor_card = card
-        self._editor_rebuild()
-        self.ed_title.setText(f"Control — {card.config.title or PANEL_KINDS[card.config.kind]}"
-                              f"  ({PANEL_KINDS[card.config.kind]})")
-        with _signals_blocked(self.ed_relim):
-            self.ed_relim.setCurrentText(str(card.config.params.get("relim", "tight")))
-        for w in self._editor_controls:
-            w.setEnabled(True)
-        self.tabs.setCurrentWidget(self.tabs.widget(1))
+        """Open (or focus) this panel's OWN closable Edit tab (a PanelEditor).
 
-    def _editor_teardown(self) -> None:
-        if self._editor_canvas is not None:
-            self.ed_canvas_holder.removeWidget(self._editor_canvas)
-            self._editor_canvas.deleteLater()
-        if self._editor_plotter is not None and plt is not None and self._editor_plotter.fig is not None:
-            plt.close(self._editor_plotter.fig)
-        self._editor_canvas = None
-        self._editor_plotter = None
-        self._editor_df = None
+        Opens even BEFORE the panel has data -- a measurement panel's Edit is
+        exactly where you set its parameters and press Start to PRODUCE the data,
+        and a plain panel's parameters are editable straight away.  The snapshot
+        section just shows "waiting for data" until a plot exists."""
+        if card is None:
+            return
+        existing = self._panel_editors.get(id(card))
+        if existing is not None:
+            self.tabs.setCurrentWidget(existing)
+            existing.rebuild()
+            return
+        editor = PanelEditor(card, self)
+        self._panel_editors[id(card)] = editor
+        title = (card.config.title or PANEL_KINDS[card.config.kind]).strip() or "panel"
+        self.tabs.add_closable_tab(editor, title)
 
-    def _editor_rebuild(self) -> None:
-        """Build a fresh, larger snapshot plot of the bound card's CURRENT data."""
-        card = self._editor_card
-        if card is None or card.plotter is None or panel_canvas is None:
+    def _close_panel_editor(self, card: "PanelCard") -> None:
+        """Close a card's Edit tab if open (called when the card is removed)."""
+        editor = self._panel_editors.pop(id(card), None)
+        if editor is None:
             return
-        self._editor_teardown()
-        src = card.plotter
-        kind = card.config.kind
-        size = "2x4"
-        title = card.config.title or PANEL_KINDS[kind]
-        relim = str(card.config.params.get("relim", "tight"))
-        cmap = str(card.config.params.get("cmap", "inferno" if kind == "2d" else "viridis"))
-        try:
-            if kind == "2d":
-                self._editor_plotter = panel_plot(np.array(src.data_x, dtype=float),
-                                                  np.array(src.data_y[:, 0], dtype=float), kind="2d",
-                                                  size=size, cmap=cmap, labels=tuple(src.labels), title=title)
-            elif kind == "sites":
-                self._editor_plotter = panel_plot(np.array(src.data_x[:, :2], dtype=float),
-                                                  np.array(src.data_y[:, 0], dtype=float), kind="sites",
-                                                  size=size, cmap=cmap, image=getattr(src, "background", None),
-                                                  roi_radius=getattr(src, "roi_radius", 3.0),
-                                                  labels=tuple(src.labels), title=title)
-            elif kind == "hist":
-                self._editor_plotter = panel_plot(np.array(src.values, dtype=float), kind="hist", size=size,
-                                                  bins=int(card.config.params.get("bins", 60)),
-                                                  labels=tuple(src.labels), title=title)
-            else:  # 1d / monitor -> a line snapshot
-                self._editor_plotter = panel_plot(np.array(src.data_x[:, 0], dtype=float),
-                                                  np.array(src.data_y[:, 0], dtype=float),
-                                                  kind=kind, size=size, relim_mode=relim,
-                                                  labels=tuple(src.labels), title=title)
-        except Exception as exc:
-            self.ed_status.setText(f"could not snapshot: {str(exc).splitlines()[0][:120]}")
-            return
-        self._editor_canvas = panel_canvas(self._editor_plotter.fig)
-        self.ed_canvas_holder.addWidget(self._editor_canvas, alignment=QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop)
-        self._editor_canvas.draw_idle()
-        self._editor_df = None
-        self._editor_fill_limits()
-        self.ed_status.setText("snapshot of current data — fit / set limits / save are frozen here")
+        if editor.meas_panel is not None and editor.meas_panel is self._active_meas_panel:
+            self._active_meas_panel = None     # don't write status to a deleted form
+        index = self.tabs.indexOf(editor)
+        if index >= 0:
+            self.tabs.removeTab(index)
+        editor.teardown()
+        editor.setParent(None)
+        editor.deleteLater()
 
-    def _editor_df_for(self):
-        from .data_figure import DataFigure
-        if self._editor_df is None:
-            self._editor_df = DataFigure(self._editor_plotter)
-        return self._editor_df
-
-    def _editor_do_fit(self) -> None:
-        if self._editor_plotter is None:
+    def _on_editor_tab_closed(self, widget) -> None:
+        """X on a PanelEditor tab: tear it down + drop it from the registry.
+        The permanent Monitor tab carries no X, so it never arrives here."""
+        if not isinstance(widget, PanelEditor):
             return
-        method = FIT_MODELS.get(self.ed_fit_combo.currentText())
-        if method is None:
-            return
-        cmd = self.ed_fit_cmd.text().strip()
-        try:
-            df = self._editor_df_for()
-            if df.fit is not None:
-                df.clear()
-            # trusted-local-tool posture (same as the Scan tab's exec): the args
-            # the user types are injected into the fit call -- p0/fixed-params/is_fit.
-            call = f"_df.{method}({cmd})" if cmd else f"_df.{method}(is_display=True)"
-            result, _ = eval(call, {"_df": df, "np": np})  # noqa: S307 - local experiment tool
-            self._editor_canvas.draw_idle()
-            popt = getattr(result, "popt", None)
-            names = getattr(result, "names", None) or []
-            if popt is None:
-                self.ed_status.setText(f"fit {self.ed_fit_combo.currentText()}: did not converge")
-                return
-            self.ed_status.setText(f"fit {self.ed_fit_combo.currentText()}: "
-                                   + ", ".join(f"{n}={v:.4g}" for n, v in zip(names, popt)))
-        except Exception as exc:
-            self.ed_status.setText(f"fit failed: {str(exc).splitlines()[0][:140]}")
-
-    def _editor_clear_fit(self) -> None:
-        if self._editor_df is not None:
-            try:
-                self._editor_df.clear()
-            except Exception:
-                pass
-            self._editor_df = None
-            if self._editor_canvas is not None:
-                self._editor_canvas.draw_idle()
-            self.ed_status.setText("fit cleared")
-
-    def _editor_fill_limits(self) -> None:
-        if self._editor_plotter is None:
-            return
-        ax = getattr(self._editor_plotter, "ax", None)
-        if ax is None:
-            return
-        xlo, xhi = ax.get_xlim()
-        ylo, yhi = ax.get_ylim()
-        with _signals_blocked(self.ed_xmin, self.ed_xmax, self.ed_ymin, self.ed_ymax):
-            self.ed_xmin.setText(f"{xlo:.6g}"); self.ed_xmax.setText(f"{xhi:.6g}")
-            self.ed_ymin.setText(f"{ylo:.6g}"); self.ed_ymax.setText(f"{yhi:.6g}")
-
-    def _editor_apply_limits(self) -> None:
-        if self._editor_plotter is None:
-            return
-        try:
-            df = self._editor_df_for()
-            df.xlim(float(self.ed_xmin.text()), float(self.ed_xmax.text()))
-            df.ylim(float(self.ed_ymin.text()), float(self.ed_ymax.text()))
-            self._editor_canvas.draw_idle()
-            self.ed_status.setText("limits applied")
-        except Exception as exc:
-            self.ed_status.setText(f"bad limits: {str(exc).splitlines()[0][:100]}")
-
-    def _editor_unit(self) -> None:
-        if self._editor_plotter is None:
-            return
-        try:
-            self._editor_df_for().change_unit()
-            self._editor_canvas.draw_idle()
-            self._editor_fill_limits()
-            self.ed_status.setText("unit cycled")
-        except Exception as exc:
-            self.ed_status.setText(f"unit cycle n/a: {str(exc).splitlines()[0][:100]}")
-
-    def _editor_set_relim(self, *_args) -> None:
-        if self._editor_card is None:
-            return
-        # persist on the card config (remembered + saved) then rebuild the EDITOR
-        # snapshot only -- do NOT tear the live card down here (that would null its
-        # plotter and the editor reads from it).
-        self._editor_card.config.params["relim"] = self.ed_relim.currentText()
-        self._mark_dirty()
-        self._editor_rebuild()
-
-    def _editor_save(self) -> None:
-        if self._editor_plotter is None:
-            return
-        try:
-            df = self._editor_df_for()
-            stem = (self._editor_card.config.title or self._editor_card.config.kind).strip() or "panel"
-            out = df.save(_task_files_dir() / stem,
-                          extra_info={"source": self._editor_card.config.source,
-                                      "kind": self._editor_card.config.kind})
-            self.ed_status.setText(f"saved {out['figure'].name} + {out['data'].name}")
-        except Exception as exc:
-            self.ed_status.setText(f"save failed: {str(exc).splitlines()[0][:120]}")
+        if widget.meas_panel is not None and widget.meas_panel is self._active_meas_panel:
+            self._active_meas_panel = None     # don't write status to a deleted form
+        index = self.tabs.indexOf(widget)
+        if index >= 0:
+            self.tabs.removeTab(index)
+        for key, editor in list(self._panel_editors.items()):
+            if editor is widget:
+                del self._panel_editors[key]
+        widget.teardown()
+        widget.setParent(None)
+        widget.deleteLater()
 
     def _on_tab_changed(self, _index: int) -> None:
-        # refresh the editor snapshot when its tab is shown (data may have moved)
-        if self.tabs.currentIndex() == 1 and self._editor_card is not None:
-            self._editor_fill_limits()
+        # re-snapshot a PanelEditor's frozen limits when its tab is shown
+        widget = self.tabs.currentWidget()
+        if isinstance(widget, PanelEditor):
+            widget.fill_limits()
 
     def _arrange(self) -> None:
-        # the card that was just dragged / resized wins its slot; everyone it
-        # now overlaps is pushed down (cards never overlap on the board)
+        # gravity: the just-dragged / resized card keeps its dropped slot (it
+        # wins ties) and every other card falls UP to fill gaps, so the board
+        # stays gap-free, top-packed and overlap-free (see _compact).
         active = self.sender()
-        if isinstance(active, PanelCard) and len(self.cards) > 1:
-            if _resolve_collisions([c.config for c in self.cards], active.config):
-                self._mark_dirty()
+        active_cfg = active.config if isinstance(active, PanelCard) and active in self.cards else None
+        if _compact([c.config for c in self.cards], active_cfg):
+            self._mark_dirty()
         self.board.arrange(self.cards)
         self._update_summary()
 
     # ------------------------------------------------------------------ actions
     def _add_panel(self) -> None:
-        kind = self.kind_combo.currentData() or "1d"
+        data = self.kind_combo.currentData()
+        # A measurement entry: create (or focus) its result panel and open its
+        # Edit tab, where the auto-generated parameter form + Start live.
+        if isinstance(data, tuple) and len(data) == 2 and data[0] == "measurement":
+            spec = next((s for s in self.measurements if s.name == data[1]), None)
+            if spec is not None:
+                card = self._ensure_result_panel(spec)
+                self._edit_card(card)
+            return
+        kind = data or "1d"
         rows = max((c.config.row + c.config.rows for c in self.cards), default=0)
         config = PanelConfig(kind=str(kind), row=rows, col=0, size="1x2")
         card = PanelCard(config, parent=self.board, names_provider=self.hub.names)
@@ -1929,63 +2239,13 @@ class TaskConsole(QtWidgets.QWidget):
     def _remove_panel(self, card: PanelCard) -> None:
         if card in self.cards:
             card.settings_popup.hide()
+            self._close_panel_editor(card)     # drop this card's Edit tab too
             self.cards.remove(card)
             card.shutdown()
             card.setParent(None)
             card.deleteLater()
             self._arrange()
             self._mark_dirty()
-
-    def _toggle_pause(self) -> None:
-        """Pause/resume the PLOT refresh: freezes the display while data keeps
-        flowing into the hub, so you can fit and inspect a frozen trace."""
-        if self._timer.isActive():
-            self._timer.stop()
-            self.pause_button.setText("Resume Plot")
-            self.status_dot.set_color(YELLOW)
-        else:
-            self._timer.start()
-            self.pause_button.setText("Pause Plot")
-            self.status_dot.set_color(GREEN if self._feeds_running() else GREY)
-
-    def _controllable_feeds(self) -> list:
-        """Feeds the console can start/stop (have start+stop+running).
-
-        A feed that reports ``finished`` (a completed ScannedMeasurementFeed) is
-        excluded: re-starting it would clear its stop event and spawn a daemon
-        thread whose first shot() raises StopIteration, leaving the loop spinning
-        idle forever.  So "Resume Meas." never restarts an exhausted scan."""
-        return [f for f in self.feeds
-                if all(hasattr(f, attr) for attr in ("start", "stop", "running"))
-                and not getattr(f, "finished", False)]
-
-    def _feeds_running(self) -> bool:
-        feeds = self._controllable_feeds()
-        return bool(feeds) and any(getattr(f, "running", False) for f in feeds)
-
-    def _toggle_measurement(self) -> None:
-        """Pause/resume the MEASUREMENT: stop/start the feeds (the experiment data
-        source) themselves -- distinct from freezing the plot."""
-        feeds = self._controllable_feeds()
-        if not feeds:
-            return
-        if self._feeds_running():
-            for feed in feeds:
-                try:
-                    feed.stop()
-                except Exception:
-                    pass
-            self.meas_button.setText("Resume Meas.")
-            if self._timer.isActive():
-                self.status_dot.set_color(GREY)   # plot live but no new data
-        else:
-            for feed in feeds:
-                try:
-                    feed.start(rate_hz=getattr(feed, "rate_hz", 5.0))
-                except Exception:
-                    pass
-            self.meas_button.setText("Pause Meas.")
-            self.status_dot.set_color(GREEN if self._timer.isActive() else YELLOW)
 
     # --------------------------------------------------------- measurement (P5)
     def _measurement_source(self, spec) -> str:
@@ -2018,17 +2278,20 @@ class TaskConsole(QtWidgets.QWidget):
         self._mark_dirty()
         return card
 
-    def _start_measurement(self, spec) -> None:
-        """One-click Start: build the measurement, wrap it in a feed, ensure a
-        Monitor result panel, register the feed, and run it."""
-        panel = self.measurement_panel
-        if panel is None:
+    def _start_measurement(self, meas_panel) -> None:
+        """Start (or RE-RUN) a measurement from the given MeasurementPanel -- a
+        measurement panel's own Edit form.  Reads the spec +
+        param values off that panel; the scan streams into the spec's result
+        panel (created if missing, REUSED on re-run, so editing a panel's params
+        and hitting Start restarts that same Monitor panel)."""
+        spec = meas_panel.current_spec() if meas_panel is not None else None
+        if spec is None:
             return
         if self._meas_feed is not None and getattr(self._meas_feed, "running", False):
-            panel.set_status("a measurement is already running -- Stop it first", error=True)
+            meas_panel.set_status("a measurement is already running -- Stop it first", error=True)
             return
         try:
-            values = panel.collect_values()
+            values = meas_panel.collect_values()
             measurement = spec.build(**values)
             # Lazy import (frontend stays decoupled from the neutral_atom backend
             # at import time; the feed only ever touches the measurement contract
@@ -2039,7 +2302,7 @@ class TaskConsole(QtWidgets.QWidget):
                 self.hub, measurement, x_key=spec.x_key, y_key=spec.y_key, grid_shape=spec.grid_shape,
             )
         except Exception as exc:
-            panel.set_status(f"build failed: {str(exc).splitlines()[0][:140]}", error=True)
+            meas_panel.set_status(f"build failed: {str(exc).splitlines()[0][:140]}", error=True)
             return
 
         # drop a previous (finished) measurement feed so feeds don't pile up
@@ -2047,20 +2310,20 @@ class TaskConsole(QtWidgets.QWidget):
             self.feeds.remove(self._meas_feed)
         self._meas_feed = feed
         self._meas_spec = spec
+        self._active_meas_panel = meas_panel
         self.feeds.append(feed)
-        self.meas_button.setEnabled(bool(self._controllable_feeds()))
-        self._ensure_result_panel(spec)
+        card = self._ensure_result_panel(spec)
+        card.config.params["measurement_values"] = dict(values)   # seed the next Edit reopen
         if not self._timer.isActive():           # make sure the curve actually refreshes
             self._timer.start()
-            self.pause_button.setText("Pause Plot")
-        panel.set_running(True)
-        panel.set_status(f"running 0/{feed.n_points}…", error=False)
+        meas_panel.set_running(True)
+        meas_panel.set_status(f"running 0/{feed.n_points}…", error=False)
         self.status_dot.set_color(GREEN)
         try:
             feed.start(rate_hz=getattr(feed, "rate_hz", 5.0))
         except Exception as exc:
-            panel.set_running(False)
-            panel.set_status(f"start failed: {str(exc).splitlines()[0][:140]}", error=True)
+            meas_panel.set_running(False)
+            meas_panel.set_status(f"start failed: {str(exc).splitlines()[0][:140]}", error=True)
 
     def _stop_measurement(self) -> None:
         feed = self._meas_feed
@@ -2070,16 +2333,17 @@ class TaskConsole(QtWidgets.QWidget):
             feed.stop()
         except Exception:
             pass
-        if self.measurement_panel is not None:
-            self.measurement_panel.set_running(False)
+        panel = self._active_meas_panel or self.measurement_panel
+        if panel is not None:
+            panel.set_running(False)
             done = getattr(feed, "points_done", 0)
-            self.measurement_panel.set_status(f"stopped at {done}/{getattr(feed, 'n_points', 0)} points", error=False)
+            panel.set_status(f"stopped at {done}/{getattr(feed, 'n_points', 0)} points", error=False)
 
     def _poll_measurement(self) -> None:
         """Called each tick: surface progress, and once the scan completes show
         the result (for temperature, fit T from the form's capture radius)."""
         feed = self._meas_feed
-        panel = self.measurement_panel
+        panel = self._active_meas_panel or self.measurement_panel
         if feed is None or panel is None:
             return
         if not getattr(feed, "finished", False):
@@ -2229,7 +2493,9 @@ class TaskConsole(QtWidgets.QWidget):
                 feed.stop()
             except Exception:
                 pass
-        self._editor_teardown()
+        for editor in list(self._panel_editors.values()):
+            editor.teardown()
+        self._panel_editors.clear()
         for card in self.cards:
             card.shutdown()
 
@@ -2256,9 +2522,11 @@ def show_task_console(
     ``loading_rate_live``), a layout saved in tasks/, or a JSON path.
 
     ``measurements`` is the declarative measurement catalog
-    (``exp.readout.measurement_specs()``): pass it to turn the Control tab's
-    Measurement section into the auto-generated parameter form + one-click Start;
-    omit it and that section stays a disabled placeholder."""
+    (``exp.readout.measurement_specs()`` -- an AUTO-DISCOVERED list, built-ins +
+    any ``@measurement`` / ``register_measurement``): pass it and every spec is
+    listed in the header's Add Panel dropdown; picking one + Add Panel creates a
+    result panel and opens its Edit tab (auto-generated parameter form + one-click
+    Start).  Omit it and the dropdown carries only plot kinds."""
 
     app = ensure_qt_app()
     if state is None and task is not None:

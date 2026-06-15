@@ -81,6 +81,29 @@ class ParamDecl:
         object.__setattr__(self, "choices", tuple(self.choices))
 
 
+def axis_range_tuple(value, name: str) -> tuple[float, float, int]:
+    """Coerce an ``axis_range`` param value to ``(min, max, points)``.
+
+    Accepts a 3-tuple/list ``(min, max, points)`` (the GUI form's three boxes) and
+    validates it -- ``points`` >= 2, ``max`` > ``min``.  Kept dependency-free so
+    both the spec build closures and the GUI consumer share ONE interpreter of an
+    axis-range value (the ``axis_range`` ParamDecl contract owns its coercion; no
+    free-text eval)."""
+
+    try:
+        lo, hi, points = value
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be an (min, max, points) axis range, got {value!r}.")
+    lo, hi, points = float(lo), float(hi), int(points)
+    if not (np.isfinite(lo) and np.isfinite(hi)):
+        raise ValueError(f"{name} range bounds must be finite.")
+    if points < 2:
+        raise ValueError(f"{name} needs at least 2 points.")
+    if hi <= lo:
+        raise ValueError(f"{name} max ({hi}) must exceed min ({lo}).")
+    return lo, hi, points
+
+
 @dataclass(frozen=True)
 class MeasurementSpec:
     """A named measurement + its declared parameters + a build closure.

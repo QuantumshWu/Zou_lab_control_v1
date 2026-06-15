@@ -208,8 +208,18 @@ def read_config(config: str | Path | Mapping[str, Any]) -> dict[str, Any]:
     if str(config).lower() == "virtual":
         return virtual_config()
     path = Path(config)
-    if not path.exists() and path.suffix == "":
-        path = device_config_dir() / f"{config}.json"
+    if not path.exists():
+        name = str(config)
+        # A BARE config name (no directory component) resolves from the bundled
+        # configs/ dir, WITH or WITHOUT an explicit .json suffix -- so both
+        # ``remote_template`` and ``remote_template.json`` find the bundled file
+        # (a natural thing to type that would otherwise be a FileNotFoundError).
+        # A real path (absolute or with a directory) is used verbatim.
+        if Path(name).parent == Path("."):
+            for candidate in (device_config_dir() / name, device_config_dir() / f"{name}.json"):
+                if candidate.exists():
+                    path = candidate
+                    break
     if not path.exists():
         raise FileNotFoundError(f"device config not found: {config}")
     return json.loads(path.read_text(encoding="utf-8"))

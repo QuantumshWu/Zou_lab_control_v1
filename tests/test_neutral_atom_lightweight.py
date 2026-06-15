@@ -4255,6 +4255,13 @@ def test_real_device_templates_load_without_hardware_connection():
     assert exp.camera.dcam_module_name == na.DEFAULT_DCAM_MODULE
     assert exp.sequence.channels == ["ch00", "ch03", "ch09", "ch11"]
 
+    # a BARE config name resolves the bundled file WITH or WITHOUT a .json suffix
+    # (a natural thing to type -- must not raise FileNotFoundError).
+    suffixed = na.connect("remote_template.json", sequencer={"host": "192.168.0.22"})
+    assert isinstance(suffixed.devices.sequencer, na.RemoteSequencer)
+    assert suffixed.devices.sequencer.host == "192.168.0.22"
+    assert suffixed.sequence.channels == ["ch00", "ch03", "ch09", "ch11"]
+
     try:
         na.load_devices("remote_template", overrides={"sequencer": {"host": "0.0.0.0"}})
     except ValueError as exc:

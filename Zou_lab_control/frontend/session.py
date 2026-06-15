@@ -10,7 +10,7 @@ from typing import Any, Callable, Sequence
 
 import numpy as np
 
-from .live import _as_data_x, _as_data_y, plot
+from .live import _as_data_x, _as_data_y, _normalize_kind, plot
 
 
 def _is_integer_scalar(value) -> bool:
@@ -97,7 +97,12 @@ class RunSession:
     ):
         self.source = source
         self.kind = "hist" if kind is None and _is_integer_scalar(data_x) else (kind or "auto")
-        self.mode = mode or ("roll" if self.kind in {"monitor", "rolling", "live-distribution"} else "append")
+        # Rolling kinds default to roll, fixed kinds to append.  Normalise first
+        # so BOTH live types roll: "monitor" (with side-distribution) AND
+        # "monitor-nodist" (the bare loading-rate trace) and all their aliases
+        # (loading-rate, rolling, live-distribution, ...) collapse to the two
+        # canonical kinds the factory dispatches on.
+        self.mode = mode or ("roll" if _normalize_kind(self.kind) in {"monitor", "monitor-nodist"} else "append")
         self.labels = labels
         self.update_time = _positive_float(update_time, "update_time")
         self.max_points = None if max_points is None else _positive_int(max_points, "max_points")

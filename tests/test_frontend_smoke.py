@@ -1248,28 +1248,50 @@ def test_fluent_auto_scale_is_shared_between_guis(monkeypatch):
         set_fluent_scale(1.0)
 
 
-def test_task_console_drag_pushes_overlapped_cards_down(monkeypatch):
-    """Cards never overlap: dropping a card onto occupied slots keeps the
-    dragged card there and pushes the cards underneath down, cascading."""
+def test_task_console_layout_is_gravity_compacted():
+    """The board auto-layout is GRAVITY compaction (``_compact``): every card
+    falls UP within its columns until it rests on the card above or the top, so
+    the result is always overlap-free AND gap-free (top-packed).  The dragged
+    (``active``) card wins ties so it keeps the slot the user dropped it on.
 
-    pytest.importorskip("PyQt5")
-    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
-    from Zou_lab_control.frontend import devtools as dt
-    from Zou_lab_control.frontend.task_console import _slots_overlap, _slot_to_pos
+    Pure-function contract (PanelConfig has no Qt), so it does NOT pull in the
+    flaky demo_console GUI fixture.  Guards both jobs the single rule must do:
+    push overlapped cards out of the way, and pull cards up to fill holes."""
 
-    console = dt.demo_console(shots=3)
-    dragged = console.cards[1]                    # the 1x2 hist card @ (0, 2)
-    dragged.config.row, dragged.config.col = 0, 0  # drop onto the 2x2 image card
-    dragged.layout_changed.emit()                  # console._arrange sees the sender
-    configs = [c.config for c in console.cards]
-    assert (dragged.config.row, dragged.config.col) == (0, 0)   # winner keeps the slot
-    for i, a in enumerate(configs):
-        for b in configs[i + 1:]:
-            assert not _slots_overlap(a, b), (a.title, b.title)
-    # the pushed cards really moved on the board too
-    for card in console.cards:
-        assert (card.x(), card.y()) == _slot_to_pos(card.config.row, card.config.col)
-    console.shutdown()
+    from Zou_lab_control.frontend.task_console import PanelConfig, _compact, _columns_overlap
+
+    def no_overlap(cfgs):
+        for i, a in enumerate(cfgs):
+            for b in cfgs[i + 1:]:
+                if _columns_overlap(a, b):
+                    assert not (a.row < b.row + b.rows and b.row < a.row + a.rows), (a.title, b.title)
+
+    # (1) drop a card onto an occupied column: active keeps (0,0), the other is
+    #     pushed strictly below -- no overlap.
+    a = PanelConfig(kind="2d", title="A", row=0, col=0, size="2x2")
+    b = PanelConfig(kind="2d", title="B", row=0, col=0, size="2x2")   # dropped onto A
+    _compact([a, b], active=b)
+    assert (b.row, b.col) == (0, 0)            # the dragged card wins its slot
+    assert a.row == 2                          # pushed down to clear (2 rows tall)
+    no_overlap([a, b])
+
+    # (2) gravity fills vertical gaps: a lone card left floating falls to the top.
+    x = PanelConfig(kind="1d", title="X", row=0, col=0, size="1x2")
+    y = PanelConfig(kind="1d", title="Y", row=5, col=0, size="1x2")   # big gap below X
+    assert _compact([x, y]) is True
+    assert (x.row, y.row) == (0, 1)            # Y rose to sit right under X, no gap
+
+    # (3) independent columns coexist on the same rows (no false collisions).
+    left = PanelConfig(kind="1d", title="L", row=4, col=0, size="1x2")
+    right = PanelConfig(kind="1d", title="R", row=9, col=2, size="1x2")
+    _compact([left, right])
+    assert left.row == 0 and right.row == 0    # both float up to the top, side by side
+    no_overlap([left, right])
+
+    # (4) already top-packed layout is a no-op (returns False, nothing moves).
+    p = PanelConfig(kind="2d", title="P", row=0, col=0, size="2x2")
+    q = PanelConfig(kind="hist", title="Q", row=0, col=2, size="1x2")
+    assert _compact([p, q]) is False
 
 
 def test_task_console_cards_have_fluent_shadow(monkeypatch):
@@ -1328,8 +1350,13 @@ def test_task_console_cards_are_modular(monkeypatch):
 
 
 def test_task_console_panels_render_and_update(monkeypatch):
-    """The default console layout builds all five panel kinds against the virtual
-    feed and keeps updating them on subsequent shots."""
+    """The demo board builds EVERY panel kind against the virtual feed -- both
+    rolling-trace plot types included -- and keeps updating them on later shots.
+
+    ``monitor`` (with side distribution) and ``monitor_nodist`` (the bare
+    loading-rate trace) are SEPARATE plot types: ``LiveLiveDis`` extends
+    ``LiveLive`` rather than toggling a flag, so each maps to a distinct class.
+    """
 
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
@@ -1337,7 +1364,7 @@ def test_task_console_panels_render_and_update(monkeypatch):
 
     console = dt.demo_console(shots=25)
     kinds = {card.config.kind: card for card in console.cards}
-    assert set(kinds) == {"2d", "sites", "1d", "monitor", "hist"}
+    assert set(kinds) == {"2d", "sites", "1d", "monitor", "monitor_nodist", "hist"}
     for card in console.cards:
         assert card.plotter is not None, card.config.kind
         assert card.status.text().startswith("shot "), (card.config.kind, card.status.text())
@@ -1345,6 +1372,10 @@ def test_task_console_panels_render_and_update(monkeypatch):
     assert type(kinds["sites"].plotter).__name__ == "LiveSiteMap"
     assert type(kinds["hist"].plotter).__name__ == "HistogramFigure"
     assert type(kinds["monitor"].plotter).__name__ == "LiveLiveDis"
+    # the no-dist live is its OWN plot type (the bare base), not LiveLiveDis
+    assert type(kinds["monitor_nodist"].plotter).__name__ == "LiveLive"
+    assert kinds["monitor_nodist"].plotter.plot_type == "live"
+    assert kinds["monitor"].plotter.plot_type == "live-distribution"
     assert type(kinds["1d"].plotter).__name__ == "Live1D"
 
     # more shots -> the monitor's rolling history grows; the 2d image refreshes
@@ -1371,7 +1402,9 @@ def test_task_console_named_presets_resolve_and_roundtrip(tmp_path, monkeypatch)
     assert {"atom_loading_monitor", "loading_rate_live"} <= set(BUILTIN_TASKS)
     state = resolve_task_state("atom_loading_monitor")
     assert state.name == "atom_loading_monitor"
-    assert {p.kind for p in state.panels} == {"2d", "sites", "hist", "monitor", "1d"}
+    # the loading-rate panel is the no-dist live (a right-side distribution on a
+    # running rate has no physical meaning) -> "monitor_nodist", not "monitor".
+    assert {p.kind for p in state.panels} == {"2d", "sites", "hist", "monitor_nodist", "1d"}
 
     # a saved layout becomes a named preset; same stem overrides the built-in
     custom = resolve_task_state("loading_rate_live")
@@ -1385,6 +1418,26 @@ def test_task_console_named_presets_resolve_and_roundtrip(tmp_path, monkeypatch)
     assert resolve_task_state("atom_loading_monitor").name == "patched"
     with pytest.raises(ValueError, match="unknown task"):
         resolve_task_state("nonexistent_dashboard")
+
+
+def test_default_console_state_is_one_nodist_live(monkeypatch):
+    """The BARE default the app opens with is a SINGLE no-dist live trace (the
+    user grows their own task group by adding panels) -- not the rich
+    atom-loading dashboard, which is now an opt-in named preset."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend.task_console import default_console_state
+
+    state = default_console_state()
+    assert len(state.panels) == 1
+    panel = state.panels[0]
+    assert panel.kind == "monitor_nodist"
+    assert panel.source == "value = rate"
+    # round-trips like any layout (the default is a normal saveable state)
+    from Zou_lab_control.frontend.task_console import TaskConsoleState
+    again = TaskConsoleState.from_dict(state.to_dict())
+    assert [p.kind for p in again.panels] == ["monitor_nodist"]
 
 
 def test_task_console_signal_picker_and_declarative_params(monkeypatch):
@@ -1420,9 +1473,10 @@ def test_task_console_signal_picker_and_declarative_params(monkeypatch):
 
 
 def test_task_console_panel_editor_tab(monkeypatch, tmp_path):
-    """The console has Monitor + Control tabs; a card's Edit opens the Control
-    tab bound to a frozen snapshot, where a command-line fit, x/y limits and
-    Save Fig work (the confocal-style heavy controls, kept off the Setting popup)."""
+    """A card's Edit... opens its OWN closable tab (a PanelEditor) bound to a
+    frozen snapshot, where command-line fit, x/y limits and Save Fig work; the
+    tab's X tears it down.  These heavy controls are kept off the Setting popup,
+    and each panel gets its own editor (re-clicking Edit focuses, not dupes)."""
 
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
@@ -1430,34 +1484,52 @@ def test_task_console_panel_editor_tab(monkeypatch, tmp_path):
     from Zou_lab_control.frontend import devtools as dt
 
     console = dt.demo_console(shots=20)
-    assert [console.tabs.tabText(i) for i in range(console.tabs.count())] == ["Monitor", "Control"]
+    # Monitor is the ONLY permanent tab (no global Control); Edit tabs open to its right
+    titles = [console.tabs.tabText(i) for i in range(console.tabs.count())]
+    assert titles[0] == "Monitor" and "Control" not in titles
 
     card = next(c for c in console.cards if c.config.kind == "1d")
+    n_tabs = console.tabs.count()
     console._edit_card(card)
-    assert console._editor_card is card and console._editor_plotter is not None
-    assert console.tabs.currentIndex() == 1                  # switched to the editor
-    assert console.ed_xmin.text() and console.ed_xmax.text()  # limits prefilled from the axes
+    editor = console._panel_editors[id(card)]
+    assert editor._plotter is not None
+    assert console.tabs.count() == n_tabs + 1                 # a new closable tab opened
+    assert console.tabs.currentWidget() is editor
+    assert editor.xmin.text() and editor.xmax.text()          # limits prefilled from the axes
+    # the Edit tab carries a (custom, subtle) close button; Monitor has none
+    from PyQt5 import QtWidgets as _qtw
+    _bar = console.tabs.tabBar()
+    assert _bar.tabButton(console.tabs.indexOf(editor), _qtw.QTabBar.RightSide) is not None
+    assert _bar.tabButton(0, _qtw.QTabBar.RightSide) is None
+
+    # re-clicking Edit focuses the SAME tab (no duplicate)
+    console._edit_card(card)
+    assert console.tabs.count() == n_tabs + 1
 
     # command-line fit (preset model + free-text args) draws an overlay
-    console.ed_fit_combo.setCurrentText("Gaussian")
-    console.ed_fit_cmd.setText("")
-    console._editor_do_fit()
-    assert console._editor_df is not None and console._editor_df.fit is not None
+    editor.fit_combo.setCurrentText("Gaussian")
+    editor.fit_cmd.setText("")
+    editor.do_fit()
+    assert editor._df is not None and editor._df.fit is not None
 
     # x/y limits apply to the editor axes
-    console.ed_xmin.setText("0"); console.ed_xmax.setText("9")
-    console.ed_ymin.setText("0"); console.ed_ymax.setText("2")
-    console._editor_apply_limits()
-    assert console._editor_plotter.ax.get_xlim() == (0.0, 9.0)
+    editor.xmin.setText("0"); editor.xmax.setText("9")
+    editor.ymin.setText("0"); editor.ymax.setText("2")
+    editor.apply_limits()
+    assert editor._plotter.ax.get_xlim() == (0.0, 9.0)
 
     # Save Fig writes png + npz into the task dir
-    console._editor_save()
+    editor.save()
     saved = sorted(p.suffix for p in tmp_path.iterdir())
     assert ".png" in saved and ".npz" in saved
 
-    # the editor snapshot is independent of the live card (frozen)
-    console._editor_clear_fit()
-    assert console._editor_df is None
+    editor.clear_fit()
+    assert editor._df is None
+
+    # the X on the tab tears the editor down and drops it from the registry
+    console._on_editor_tab_closed(editor)
+    assert id(card) not in console._panel_editors
+    assert console.tabs.count() == n_tabs
     console.shutdown()
 
 
@@ -1478,20 +1550,23 @@ def test_task_console_setting_popup_border_is_scoped(monkeypatch):
     console.shutdown()
 
 
-def test_task_console_control_tab_fit_and_relim(monkeypatch):
-    """Curve fit and relim now live in the CONTROL tab (P4 moved them off the
-    lightweight Setting popup): a line panel's Control-tab fit overlays the
-    curve, Clear removes it, and the relim combo rebuilds the live card."""
+def test_task_console_panel_editor_fit_and_setting_relim(monkeypatch):
+    """Curve fit lives in the per-panel Edit tab (PanelEditor); a line panel's
+    Edit fit overlays the snapshot curve and Clear removes it.  relim lives in
+    the SETTING popup (tight/normal) and persists onto config.params, so the
+    live card picks it up on its next rebuild."""
 
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     import numpy as np
     from Zou_lab_control.frontend import devtools as dt
     from Zou_lab_control.frontend.task_console import (
-        FIT_MODELS, FITTABLE_KINDS, PanelCard, PanelConfig)
+        FIT_MODELS, PanelCard, PanelConfig)
 
-    assert set(FIT_MODELS) >= {"Lorentzian", "Gaussian"}
-    assert "1d" in FITTABLE_KINDS
+    # the FULL DataFigure model set is offered, including the 2D-Gaussian
+    # "2D center" fit -- and it is NOT gated by plot kind (fit on every kind).
+    assert set(FIT_MODELS) >= {"Lorentzian", "Gaussian", "Lorentzian (Zeeman)",
+                               "Rabi", "Exp decay", "2D center"}
     console = dt.demo_console(shots=5)
     card = PanelCard(PanelConfig(kind="1d", title="bump", row=0, col=0, size="2x2",
                                  source="value = bump"), parent=console.board)
@@ -1499,25 +1574,25 @@ def test_task_console_control_tab_fit_and_relim(monkeypatch):
     x = np.linspace(-5, 5, 60)
     card.refresh({"bump": 3.0 * np.exp(-(x ** 2) / (2 * 1.2 ** 2)) + 0.1, "shot": 1})
 
-    # the Setting popup has NO popup-fit handles anymore (moved to Control)
+    # the Setting popup has NO popup-fit handles (fit is in the per-panel Edit)
     assert not hasattr(card, "fit_combo") and not hasattr(card, "_do_fit")
 
-    # Control tab: bind the card, fit a Gaussian on the frozen snapshot
+    # per-panel Edit tab: fit a Gaussian on the frozen snapshot
     console._edit_card(card)
-    base = len(console._editor_plotter.ax.lines)
-    console.ed_fit_combo.setCurrentText("Gaussian")
-    console.ed_fit_cmd.setText("")
-    console._editor_do_fit()
-    assert console._editor_df is not None and console._editor_df.fit is not None
-    assert len(console._editor_plotter.ax.lines) == base + 1
-    console._editor_clear_fit()
-    assert console._editor_df is None
+    editor = console._panel_editors[id(card)]
+    base = len(editor._plotter.ax.lines)
+    editor.fit_combo.setCurrentText("Gaussian")
+    editor.fit_cmd.setText("")
+    editor.do_fit()
+    assert editor._df is not None and editor._df.fit is not None
+    assert len(editor._plotter.ax.lines) == base + 1
+    editor.clear_fit()
+    assert editor._df is None
 
-    # relim combo in Control persists config.params["relim"]; the live card
-    # picks it up on its next rebuild (the editor does NOT tear the live card
-    # down -- it reads from its plotter -- so persistence is the contract here)
-    console.ed_relim.setCurrentText("normal")
-    console._editor_set_relim()
+    # relim is owned by the SETTING popup now (tight/normal), persisted on the
+    # card config; the live card picks it up on its next rebuild.
+    card.lim_combo.setCurrentText("normal")
+    card._on_relim_mode("normal")
     assert card.config.params["relim"] == "normal"
     card._reset_plot()                                       # force a fresh build
     card.refresh({"bump": np.ones(60), "shot": 2})
@@ -1525,29 +1600,136 @@ def test_task_console_control_tab_fit_and_relim(monkeypatch):
     console.shutdown()
 
 
-def test_task_console_pause_plot_and_measurement_are_independent(monkeypatch):
-    """Two freezes: Pause Plot stops the refresh timer (data still flows);
-    Pause Meas. stops/starts the feeds (the data source)."""
+def test_task_console_edit_fits_2d_with_center_model(monkeypatch):
+    """The Edit tab exposes the FULL DataFigure fit set for EVERY kind -- a 2D
+    image fits the 2D-Gaussian "2D center" model (the fit was previously gated
+    out for 2d/sites/hist)."""
 
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from Zou_lab_control.frontend import devtools as dt
 
-    console = dt.demo_console(shots=3)
-    console._timer.start()      # demo_console stops it for determinism; start to test the toggle
-    # Pause Plot toggles the refresh timer only
-    assert console._timer.isActive()
-    console._toggle_pause()
-    assert not console._timer.isActive() and console.pause_button.text() == "Resume Plot"
-    console._toggle_pause()
-    assert console._timer.isActive() and console.pause_button.text() == "Pause Plot"
-    # Pause Meas. controls the feeds (start->stop), independent of the timer
-    console._toggle_measurement()
-    assert console._feeds_running()                  # demo feeds were not threaded; first toggle starts
-    assert console._timer.isActive()                 # plot timer untouched
-    console._toggle_measurement()
-    assert not console._feeds_running() and console.meas_button.text() == "Resume Meas."
-    console.shutdown()
+    console = dt.demo_console(shots=30)
+    try:
+        card = next(c for c in console.cards if c.config.kind == "2d")
+        console._edit_card(card)
+        editor = console._panel_editors[id(card)]
+        models = [editor.fit_combo.itemText(i) for i in range(editor.fit_combo.count())]
+        assert "2D center" in models
+        editor.fit_combo.setCurrentText("2D center")
+        editor.do_fit()
+        assert editor._df is not None and editor._df.fit is not None
+    finally:
+        console.shutdown()
+
+
+def test_pulse_gui_tabs_have_no_close_button(monkeypatch):
+    """The pulse editor's Edit / Preview / Scan tabs must ALWAYS exist -- a plain
+    ``addTab`` carries NO close affordance (only ``add_closable_tab`` does), so
+    none of the three views can be closed."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5 import QtWidgets
+    from Zou_lab_control.frontend import devtools as dt
+
+    ed = dt.demo_editor(size=(1200, 800))
+    try:
+        bar = ed.tabs.tabBar()
+        assert [ed.tabs.tabText(i) for i in range(ed.tabs.count())] == ["Edit", "Preview", "Scan"]
+        for i in range(ed.tabs.count()):
+            assert bar.tabButton(i, QtWidgets.QTabBar.RightSide) is None, ed.tabs.tabText(i)
+    finally:
+        ed.close()
+
+
+def test_monitor_panels_have_no_selectors_and_wheel_scrolls(monkeypatch):
+    """Monitor cards are display-only: NO interactive selectors (so a drag /
+    right-click never starts a zoom/area/cross) and the canvas lets the wheel
+    bubble up (isolate_wheel=False) so the board scrolls under the cursor.  The
+    interactive selectors live in the Edit tab instead."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    console = dt.demo_console(shots=20)
+    try:
+        for card in console.cards:
+            assert card.plotter is not None, card.config.kind
+            assert card.plotter.interactions is False, card.config.kind
+            assert card.plotter.tools.area is None and card.plotter.tools.zoom is None
+            assert card.canvas._zlc_isolate_wheel is False, card.config.kind
+        # the Edit snapshot, by contrast, IS interactive (selectors attached)
+        card = console.cards[0]
+        console._edit_card(card)
+        editor = console._panel_editors[id(card)]
+        assert editor._plotter.interactions is True
+        assert editor._plotter.tools.area is not None
+        # and it MIRRORS the Monitor frame size (never a forced 2x4)
+        assert editor._plotter.spec.data_px == card.plotter.spec.data_px
+    finally:
+        console.shutdown()
+
+
+def test_edit_exposes_producing_feed_acquisition_params(monkeypatch):
+    """A plain panel's Edit auto-discovers the parameters of the FEED that
+    produces its data (a loading-image panel is produced by a LoadingFeed ->
+    exposure / roi_radius / grid_shape / ema / *_frames), each prefilled with the
+    CURRENT running value and shown as a 'now: X' reference; Restart rebuilds the
+    feed.  (This is the fix for the loading-image Edit showing zero params.)"""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.task_console import resolve_task_state
+
+    console = dt.demo_console(shots=20, state=resolve_task_state("atom_loading_monitor"))
+    try:
+        img = next(c for c in console.cards if c.config.kind == "2d")   # "Loading image"
+        console._edit_card(img)
+        editor = console._panel_editors[id(img)]
+        assert type(editor._feed).__name__ == "LoadingFeed"
+        assert {"exposure", "roi_radius", "grid_shape", "ema"} <= set(editor._feed_widgets)
+        # fields PREFILLED with current running values + a "now:" reference
+        assert editor._feed_widgets["exposure"].text() == repr(editor._feed.exposure)
+        assert "now:" in editor._feed_now_labels["exposure"].text()
+        # editing + Restart rebuilds the feed with the new value
+        editor._feed_widgets["exposure"].setText("0.05")
+        editor._restart_feed()
+        assert editor._feed.exposure == 0.05
+        assert editor._feed in console.feeds
+    finally:
+        console.shutdown()
+
+
+def test_edit_area_select_fills_measurement_scan_range(monkeypatch):
+    """Confocal auto-range: a region selected on a measurement panel's Edit plot
+    fills that measurement's scan x-range Min/Max (the NEXT scan), via the area
+    selector's callback -> MeasurementPanel.set_axis_range."""
+
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend import devtools as dt
+
+    console = dt.demo_console_measurements()
+    try:
+        result = next(c for c in console.cards if c.config.params.get("measurement"))
+        editor = console._panel_editors[id(result)]
+        form = editor.meas_panel
+        _, lo, hi, pts = form._widgets["t_off"]
+        lo.setValue(0.0); hi.setValue(120.0); pts.setValue(5)
+        form._widgets["shots"][1].setValue(6)
+        console._start_measurement(form)
+        console._meas_feed.stop(); console._meas_feed.run_to_completion(); console.refresh_once()
+        editor.rebuild()                       # re-snapshot now that the curve has data
+        # the area selector's callback is wired to fill the scan range
+        assert editor._plotter.area.callback.__name__ == "_read_scan_range"
+        editor._plotter.area.range = [18.0, 91.0, 0.0, 1.0]
+        editor._plotter.area.callback()        # what a real drag-select triggers
+        assert lo.value() == 18.0 and hi.value() == 91.0
+    finally:
+        console.shutdown()
 
 
 def test_task_console_sites_panel_bad_centers_isolated(monkeypatch):
@@ -2532,6 +2714,52 @@ def test_pulse_gui_controls_call_attached_address_switch_sequencer(monkeypatch):
         assert isinstance(sequencer.prepared, na.PulseTableState)
         assert sequencer.prepared.to_sequence(expand_repeat=False).validate(clock_hz=50e6, channels=channels).ok
         assert editor.last_program.repeat_forever is True
+    finally:
+        editor.close()
+
+
+def test_pulse_gui_runtime_connection_control(monkeypatch):
+    """The Connection control lets the user pick the sequencer backend AFTER
+    opening (Virtual / Remote / Offline), instead of fixing it on the command
+    line.  Virtual swaps in a RuntimeSequencer built with the editor's OWN
+    channels; Offline detaches (the editor stays usable); a failed Remote
+    connect is reported and leaves the current connection untouched."""
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor, ensure_qt_app
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequencer
+
+    ensure_qt_app()
+    channels = [f"ch{i:02d}" for i in range(12)]
+    seq = RuntimeSequencer(channels=channels, trigger_channels=["ch11"])
+    editor = PulseSequenceEditor(channels=channels, sequencer=seq)
+    try:
+        # opens reflecting the launch (virtual) sequencer; host:port disabled
+        items = [editor.conn_target_combo.itemData(i) for i in range(editor.conn_target_combo.count())]
+        assert items == ["virtual", "remote", "offline"]
+        assert editor.conn_target_combo.currentData() == "virtual"
+        assert editor.conn_addr_edit.isEnabled() is False
+        assert editor.conn_status.text() == "Virtual (sim)"
+
+        # Offline -> detaches (None); a prepare still validates without a backend
+        editor.conn_target_combo.setCurrentIndex(editor.conn_target_combo.findData("offline"))
+        editor._apply_connection()
+        assert editor.sequencer is None
+        assert editor.conn_status.text() == "Offline (edit only)"
+        editor.prepare()  # must not raise with no sequencer attached
+
+        # Virtual -> swaps in a fresh RuntimeSequencer with the editor's channels
+        editor.conn_target_combo.setCurrentIndex(editor.conn_target_combo.findData("virtual"))
+        editor._apply_connection()
+        assert type(editor.sequencer).__name__ == "RuntimeSequencer"
+        assert list(editor.sequencer.channels) == channels
+
+        # Remote to a dead address -> reported, connection unchanged (stays virtual)
+        editor.conn_target_combo.setCurrentIndex(editor.conn_target_combo.findData("remote"))
+        assert editor.conn_addr_edit.isEnabled() is True
+        editor.conn_addr_edit.setText("127.0.0.1:1")
+        editor._apply_connection()
+        assert type(editor.sequencer).__name__ == "RuntimeSequencer"
     finally:
         editor.close()
 

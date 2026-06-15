@@ -42,11 +42,16 @@ else:
     class EmbeddedFigureCanvas(_FigureCanvasQTAgg):
         """Matplotlib Qt canvas with a display scale and wheel isolation."""
 
-        def __init__(self, figure, *, display_scale: float = 1.0):
+        def __init__(self, figure, *, display_scale: float = 1.0, isolate_wheel: bool = True):
             # both must exist BEFORE super().__init__: the base class reads
             # devicePixelRatioF() (overridden below) during construction.
             self._zlc_ratio = 1.0 / max(0.1, float(display_scale))
             self._zlc_inches = tuple(float(v) for v in figure.get_size_inches())
+            # isolate_wheel=True: in-plot wheel zoom never leaks to a surrounding
+            # scroll area (interactive plots).  False: the wheel PROPAGATES, so a
+            # display-only panel (Monitor card, NO selectors) lets the dashboard
+            # board scroll under the cursor instead of swallowing the wheel.
+            self._zlc_isolate_wheel = bool(isolate_wheel)
             super().__init__(figure)
             # the backend syncs only in showEvent / on screen signals (never
             # offscreen) -- establish the invariants NOW
@@ -90,19 +95,26 @@ else:
 
         # ------------------------------------------------------------- behaviour
         def wheelEvent(self, event):  # noqa: N802 - Qt naming
-            # in-plot wheel zoom must never double as a page scroll
+            if not self._zlc_isolate_wheel:
+                # display-only panel: let the wheel bubble up to the scroll area
+                # so the dashboard board scrolls under the cursor.
+                event.ignore()
+                return
+            # interactive plot: in-plot wheel zoom must never double as a page scroll
             super().wheelEvent(event)
             event.accept()
 
 
-def panel_canvas(figure):
+def panel_canvas(figure, *, isolate_wheel: bool = True):
     """The canvas for a dashboard panel figure: the panel display scale is a
-    frontend design constant, not a host knob."""
+    frontend design constant, not a host knob.  ``isolate_wheel=False`` lets a
+    display-only (Monitor) panel's wheel scroll the board instead of being
+    swallowed; interactive (Edit) panels keep the default isolation."""
 
     if EmbeddedFigureCanvas is None:  # pragma: no cover - matplotlib-qt missing
         raise RuntimeError("matplotlib Qt canvas is not available")
     from .live import PANEL_DISPLAY_SCALE
-    return EmbeddedFigureCanvas(figure, display_scale=PANEL_DISPLAY_SCALE)
+    return EmbeddedFigureCanvas(figure, display_scale=PANEL_DISPLAY_SCALE, isolate_wheel=isolate_wheel)
 
 
 __all__ = ["EmbeddedFigureCanvas", "panel_canvas"]

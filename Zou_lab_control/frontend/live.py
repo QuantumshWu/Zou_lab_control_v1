@@ -491,13 +491,22 @@ class Live1D(BaseLivePlot):
         self.fig._zlc_state = PlotState(plot_type="1D", x_array=self.data_x[:, 0], y_array=self.data_y)
 
 
-class LiveLiveDis(Live1D):
-    """Live rolling trace plus side distribution and Gaussian width monitor."""
+class LiveLive(Live1D):
+    """Live rolling trace: a 1-D curve that rolls newest-first, with a
+    latest-value readout in the top-right corner and NO side distribution.
 
-    plot_type = "live-distribution"
+    This is the BARE rolling-trace plot type.  The distribution variant is a
+    SEPARATE plot type, :class:`LiveLiveDis`, which EXTENDS this one by adding a
+    right-side histogram + Gaussian-sigma band -- it is not a boolean toggle on
+    one class.  Loading-rate-like quantities use this bare type, because a
+    right-side histogram + Gaussian-sigma fit carries no physical meaning for a
+    running rate.  Geometry stays inside the plot class, so no ``split`` /
+    ``distribution`` art kwarg ever crosses the sealed ``plot()`` /
+    ``panel_plot()`` surface."""
+
+    plot_type = "live"
 
     def init_core(self) -> None:
-        self.ax, self.axdis = split_axes_horizontally(self.fig, self.ax, [0.825, 0.15], [0.025])
         self.axes = self.ax
         self.lines = self.ax.plot(self.data_x[:, 0], self.data_y, alpha=1)
         for i, line in enumerate(self.lines):
@@ -507,6 +516,49 @@ class LiveLiveDis(Live1D):
         self.ax.set_xlim(np.nanmin(self.data_x[:, 0]), np.nanmax(self.data_x[:, 0]))
         self.relim()
         self.ax.set_ylim(self.ylim_min, self.ylim_max)
+        self.text = None
+
+    def update_core(self) -> None:
+        super().update_core()
+        # latest-value readout in the top-right corner (inside the axes; the
+        # band above the axes belongs to the centred title, which may be long)
+        newest = self.data_y[0, 0]
+        if np.isfinite(newest):
+            label = f"{newest:.6g}"
+            if self.text is None:
+                self.text = self.ax.text(
+                    0.97,
+                    0.95,
+                    label,
+                    transform=self.ax.transAxes,
+                    color="grey",
+                    ha="right",
+                    va="top",
+                    fontsize=matplotlib.rcParams["legend.fontsize"],
+                )
+            else:
+                self.text.set_text(label)
+
+    def _install_state(self) -> None:
+        self.fig._zlc_state = PlotState(plot_type="1D", x_array=self.data_x[:, 0], y_array=self.data_y)
+
+
+class LiveLiveDis(LiveLive):
+    """Live rolling trace PLUS a right-side distribution band (histogram +
+    Gaussian-sigma fit).  A SEPARATE plot type that EXTENDS :class:`LiveLive`
+    with the side-distribution axes -- the bare rolling trace is its own type,
+    this ADDS to it rather than flipping a flag.  Geometry stays inside the plot
+    class, so no ``split`` / ``distribution`` art kwarg ever crosses the sealed
+    ``plot()`` / ``panel_plot()`` surface."""
+
+    plot_type = "live-distribution"
+
+    def init_core(self) -> None:
+        # carve the side band off FIRST so the base draws the trace into the
+        # narrowed main axes
+        self.ax, self.axdis = split_axes_horizontally(self.fig, self.ax, [0.825, 0.15], [0.025])
+        super().init_core()
+        self.fit_text = None
         self.axdis.set_ylim(self.ylim_min, self.ylim_max)
         self.axdis.tick_params(axis="y", which="both", left=False, right=False, labelleft=False)
         self.axdis.tick_params(axis="both", which="both", bottom=False, top=False)
@@ -521,8 +573,6 @@ class LiveLiveDis(Live1D):
         self.counts_max = max(10, int(np.nanmax(self.n) + 5 if self.n.size else 10))
         self.axdis.set_xlim(0, self.counts_max)
         (self.gauss_line,) = self.axdis.plot([], [], color="orange", alpha=1)
-        self.text = None
-        self.fit_text = None
 
     def _hist(self):
         vals = self.data_y[: max(self.points_done, 1), 0]
@@ -571,31 +621,13 @@ class LiveLiveDis(Live1D):
             self.fit_text.set_text(label)
 
     def update_core(self) -> None:
-        super().update_core()
+        super().update_core()           # rolling trace + latest-value readout
         self.axdis.set_ylim(self.ylim_min, self.ylim_max)
         self.n, self.bins = self._hist()
         _update_verts(self.bins, self.n, self.verts, mode="horizontal")
         self.poly.set_verts(self.verts)
         counts_max = max(10, int(max(np.nanmax(self.n) + 5, np.nanmax(self.n) * 1.5)))
         self.axdis.set_xlim(0, counts_max)
-        newest = self.data_y[0, 0]
-        if np.isfinite(newest):
-            label = f"{newest:.6g}"
-            if self.text is None:
-                # inside the axes (top-right corner): the band above the axes
-                # belongs to the centred title, which may be arbitrarily long
-                self.text = self.ax.text(
-                    0.97,
-                    0.95,
-                    label,
-                    transform=self.ax.transAxes,
-                    color="grey",
-                    ha="right",
-                    va="top",
-                    fontsize=matplotlib.rcParams["legend.fontsize"],
-                )
-            else:
-                self.text.set_text(label)
         self._update_gauss_fit()
 
     def _install_state(self) -> None:
@@ -842,14 +874,6 @@ class LiveSiteMap(BaseLivePlot):
 
     def _install_state(self) -> None:
         self.fig._zlc_state = PlotState(plot_type="SITES", x_array=self.data_x[:, 0], y_array=self.data_y, cax=self.cax)
-
-    def set_colorbar_visible(self, visible: bool) -> None:
-        """Show / hide the colorbar axes (the ``cax`` band).  A basic display
-        toggle for the dashboard Setting popup; the figure GEOMETRY (the split
-        widths) is unchanged -- only the colorbar axis is hidden, so the square
-        site image keeps its place and size."""
-        if getattr(self, "cax", None) is not None:
-            self.cax.set_visible(bool(visible))
 
 
 def _pulse_attr(row, name: str, default=None):
@@ -1766,6 +1790,11 @@ def _normalize_kind(kind: str | None) -> str:
         "live-dis": "monitor",
         "live-distribution": "monitor",
         "rolling": "monitor",
+        "monitor-nodist": "monitor-nodist",
+        "monitor-no-dist": "monitor-nodist",
+        "live-nodist": "monitor-nodist",
+        "rolling-nodist": "monitor-nodist",
+        "loading-rate": "monitor-nodist",
         "site-map": "sites",
         "sitemap": "sites",
         "site": "sites",
@@ -2290,10 +2319,12 @@ def plot(
             plotter = Live2DDis(x, y, labels=labels, square=True, **kwargs).show(display=display)
         elif normalized_kind == "monitor":
             plotter = LiveLiveDis(x, y, labels=labels, **kwargs).show(display=display)
+        elif normalized_kind == "monitor-nodist":
+            plotter = LiveLive(x, y, labels=labels, **kwargs).show(display=display)
         elif normalized_kind == "sites":
             plotter = LiveSiteMap(x, y, labels=labels, **kwargs).show(display=display)
         else:
-            raise ValueError("kind must be auto, 1d, 2d, monitor, hist, sites, or pulse.")
+            raise ValueError("kind must be auto, 1d, 2d, monitor, monitor_nodist, hist, sites, or pulse.")
 
     if should_watch:
         plotter.watch(
@@ -2314,6 +2345,7 @@ __all__ = [
     "HistogramFigure",
     "Live1D",
     "Live2DDis",
+    "LiveLive",
     "LiveLiveDis",
     "LiveSiteMap",
     "PANEL_DISPLAY_SCALE",

@@ -19,12 +19,11 @@ from ..operations.measurement import (
     MeasurementSpec,
     NFramePlan,
     OtsuFidelityReducer,
-    ParamDecl,
     ScanAxis,
     ScanResult,
     ScannedMeasurement,
 )
-from ..operations.temperature import ReleaseRecapturePlan, SurvivalReducer, build_release_recapture_pulse
+from ..operations.temperature import ReleaseRecapturePlan, SurvivalReducer
 from ..timing import PulseTableState
 from .base import ExperimentSubsystem
 
@@ -473,85 +472,23 @@ class ReadoutSubsystem(ExperimentSubsystem):
 
     # --------------------------------------------------- declarative spec catalog
     def measurement_specs(self) -> list[MeasurementSpec]:
-        """Declarative catalog of the readout measurements a GUI can drive.
+        """Auto-discovered catalog of the measurements a GUI can drive.
 
+        The catalog is NOT a hardcoded list -- it is assembled by the open
+        measurement registry: every ``@measurement`` factory in
+        ``operations/measurements/`` (the built-ins live there) plus anything a
+        notebook registered via ``register_measurement(...)``.  Drop a new module
+        into that package and it shows up here (and in the console's Add Panel)
+        automatically.  Each factory receives THIS subsystem, so its
+        ``build(**param_values)`` closure captures the session and routes through
+        the SAME builders the API uses (:meth:`build_temperature_scan` /
+        :meth:`build_detection_scan`) -- GUI and notebook one-liner cannot drift.
         Each :class:`MeasurementSpec` declares its parameters ONCE (the single
-        source of truth a GUI form and the API default both derive from) and a
-        ``build(**param_values)`` closure that returns an UNRUN
-        :class:`ScannedMeasurement` (a :class:`ScannedMeasurementFeed` then drives
-        it point-by-point into the console).  The closures capture this subsystem
-        (hence ``self._session`` = the experiment), so the console never needs to
-        hold the session.  Both closures route through the SAME builders the API
-        uses (:meth:`build_temperature_scan` / :meth:`build_detection_scan`), so
-        the GUI and the notebook one-liner cannot drift apart."""
+        source of truth a GUI form and the API default both derive from)."""
 
-        return [self._temperature_spec(), self._readout_duration_spec()]
+        from ..operations.measurement_registry import discovered_specs
 
-    def _temperature_spec(self) -> MeasurementSpec:
-        s = self._session
-
-        def build(*, t_off=(0.0, 300.0, 13), shots=16, capture_radius=6.0, per_site=False, **_ignored):
-            t_min_us, t_max_us, points = _axis_range_tuple(t_off, "t_off")
-            t_off_s = np.linspace(float(t_min_us) * 1e-6, float(t_max_us) * 1e-6, int(points))
-            state = build_release_recapture_pulse(channels=list(s.devices.sequencer.channels))
-            from ..devices import bind_pulse  # lazy: keep subsystems->devices.sequencer off import-time graph
-
-            pulse = bind_pulse(s.devices.sequencer, state)
-            return self.build_temperature_scan(
-                t_off_s, pulse=pulse, shots=positive_int(shots, "shots"), per_site=bool(per_site),
-            )
-
-        params = (
-            ParamDecl("t_off", "Trap-off time", "axis_range", default=(0.0, 300.0, 13), unit="us",
-                      lo=0.0, hi=1e4, tooltip="Trap-off sweep min/max (us) and number of points."),
-            ParamDecl("shots", "Shots / point", "int", default=16, lo=1, hi=100_000,
-                      tooltip="Loadings averaged at each t_off (more = lower survival noise)."),
-            ParamDecl("capture_radius", "Capture radius", "float", default=6.0, unit="um", required=True,
-                      lo=1e-3, hi=1e3, tooltip="Trap capture radius (um); fixes the temperature scale for the fit."),
-            ParamDecl("per_site", "Per-site survival", "bool", default=False,
-                      tooltip="Report one survival column per site (else the array mean)."),
-        )
-        grid = None
-        trap = getattr(s.devices, "trap_array", None)
-        grid_shape = getattr(trap, "grid_shape", None)
-        if grid_shape is not None:
-            grid = (int(grid_shape[0]), int(grid_shape[1]))
-        return MeasurementSpec(
-            name="Temperature (release-recapture)",
-            params=params,
-            result_labels=("Trap-off time (s)", "Survival"),
-            x_key="rr_t_off",
-            y_key="rr_survival",
-            build=build,
-            grid_shape=grid,
-            # The fit needs the capture radius in METRES; the GUI param is um, so
-            # record the converter the consumer applies before calling fit_temperature.
-            metadata={"fit": "fit_temperature", "fit_param": "capture_radius", "fit_param_scale": 1e-6},
-        )
-
-    def _readout_duration_spec(self) -> MeasurementSpec:
-        def build(*, duration=(2.0, 5000.0, 11), shots=60, site=None, **_ignored):
-            d_min_us, d_max_us, points = _axis_range_tuple(duration, "duration")
-            times = np.linspace(float(d_min_us) * 1e-6, float(d_max_us) * 1e-6, int(points))
-            site_val = None if site in (None, "", -1) else int(site)
-            return self.build_detection_scan(times, shots=positive_int(shots, "shots"), site=site_val, pulse=None)
-
-        params = (
-            ParamDecl("duration", "Detection time", "axis_range", default=(2.0, 5000.0, 11), unit="us",
-                      lo=1e-3, hi=1e6, tooltip="Readout-duration sweep min/max (us) and number of points."),
-            ParamDecl("shots", "Shots / point", "int", default=60, lo=1, hi=100_000,
-                      tooltip="Frames pooled per point for the Otsu fidelity estimate."),
-            ParamDecl("site", "Site (optional)", "int", default=None, lo=0, hi=100_000,
-                      tooltip="Restrict the fidelity to one site index; leave blank to pool all sites."),
-        )
-        return MeasurementSpec(
-            name="Readout duration -> fidelity",
-            params=params,
-            result_labels=("Detection time (s)", "Fidelity"),
-            x_key="dur_detection_time",
-            y_key="dur_fidelity",
-            build=build,
-        )
+        return discovered_specs(self)
 
     # ------------------------------------------------------------- persistence
     def load(self, path: str | Path) -> TrapCalibration:
@@ -562,28 +499,6 @@ class ReadoutSubsystem(ExperimentSubsystem):
 
     def clear(self) -> None:
         self._session._calibration = None
-
-
-def _axis_range_tuple(value, name: str) -> tuple[float, float, int]:
-    """Coerce an ``axis_range`` param value to ``(min, max, points)``.
-
-    Accepts a 3-tuple/list ``(min, max, points)`` (the GUI form's three boxes) and
-    validates it -- ``points`` >= 2, ``max`` > ``min``.  Kept dependency-free so
-    both the spec build closures and the GUI consumer can share one interpreter of
-    an axis-range value (no free-text eval)."""
-
-    try:
-        lo, hi, points = value
-    except (TypeError, ValueError):
-        raise ValueError(f"{name} must be an (min, max, points) axis range, got {value!r}.")
-    lo, hi, points = float(lo), float(hi), int(points)
-    if not (np.isfinite(lo) and np.isfinite(hi)):
-        raise ValueError(f"{name} range bounds must be finite.")
-    if points < 2:
-        raise ValueError(f"{name} needs at least 2 points.")
-    if hi <= lo:
-        raise ValueError(f"{name} max ({hi}) must exceed min ({lo}).")
-    return lo, hi, points
 
 
 class _SessionImagingController:

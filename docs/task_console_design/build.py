@@ -46,13 +46,16 @@ def _generate_figures() -> None:
     sites.settings_popup.grab().save(str(ASSETS / "setting.png"))
     sites.settings_popup.hide()
 
-    # 3. Panel Editor bound to the 1D panel, with a Gaussian command fit
+    # 3. Panel Editor bound to the 1D panel, with a Gaussian command fit.
+    # The fit controls live on the per-panel PanelEditor (registered under
+    # id(card)), not on the console -- the Edit redesign moved them there.
     card = next(c for c in console.cards if c.config.kind == "1d")
     console._edit_card(card)
     settle(console, 400)
-    console.ed_fit_combo.setCurrentText("Gaussian")
-    console.ed_fit_cmd.setText("")
-    console._editor_do_fit()
+    editor = console._panel_editors[id(card)]
+    editor.fit_combo.setCurrentText("Gaussian")
+    editor.fit_cmd.setText("")
+    editor.do_fit()
     settle(console, 400)
     screenshot(console, str(ASSETS / "editor.png"))
     console.shutdown()

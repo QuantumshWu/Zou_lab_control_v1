@@ -166,6 +166,36 @@ def demo_editor(*, scale: float = 1.0, size=(1440, 880), bind_scans: bool = True
 
 
 
+def _demo_board_state():
+    """A board exercising EVERY panel kind -- both live types included.
+
+    The bare app default (``default_console_state``) is a single no-dist live
+    trace; this richer board is the demo/test fixture, so a screenshot or smoke
+    test still covers all six kinds and BOTH rolling-trace plot types: the
+    bare ``monitor_nodist`` (-> :class:`LiveLive`) AND the side-distribution
+    ``monitor`` (-> :class:`LiveLiveDis`)."""
+
+    from Zou_lab_control.frontend.task_console import PanelConfig, TaskConsoleState
+
+    return TaskConsoleState(
+        name="demo_all_kinds",
+        panels=[
+            PanelConfig(kind="2d", title="Loading image", row=0, col=0, size="2x2",
+                        source="value = frame"),
+            PanelConfig(kind="sites", title="Occupancy", row=0, col=2, size="2x2",
+                        source="value = occupied"),
+            PanelConfig(kind="monitor", title="Loading rate (dist)", row=0, col=4, size="1x2",
+                        source="value = rate", params={"length": 300}),
+            PanelConfig(kind="monitor_nodist", title="Loading rate", row=1, col=4, size="1x2",
+                        source="value = rate", params={"length": 300}),
+            PanelConfig(kind="hist", title="Counts distribution", row=2, col=0, size="1x2",
+                        source="value = history('counts', 200).ravel()", params={"bins": 80}),
+            PanelConfig(kind="1d", title="Per-site loading rate", row=2, col=2, size="2x4",
+                        source="value = rate_sites"),
+        ],
+    )
+
+
 def demo_console(*, scale: float = 1.0, size=(1480, 980), seed: int = 11, shots: int = 40,
                  dual: bool = True, state=None):
     """Return a shown :class:`TaskConsole` fed by seeded virtual loading feeds.
@@ -174,10 +204,13 @@ def demo_console(*, scale: float = 1.0, size=(1480, 980), seed: int = 11, shots:
     (e.g. ``value = rate_grid - b_rate_grid``) have data.  Feeds are stepped
     SYNCHRONOUSLY ``shots`` times (no threads) so screenshots and tests are
     deterministic; call ``feed.step()``/``console.refresh_once()`` for more.
+
+    The default state is the all-kinds demo board (not the bare app default),
+    so a single ``demo_console()`` shows every panel kind at once.
     """
 
     from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
-    from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
+    from Zou_lab_control.frontend.task_console import TaskConsole
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
     from Zou_lab_control.neutral_atom.devices.virtual import virtual_loading_feed
 
@@ -190,7 +223,7 @@ def demo_console(*, scale: float = 1.0, size=(1480, 980), seed: int = 11, shots:
     for _ in range(max(1, int(shots))):
         for feed in feeds:
             feed.step()
-    console = TaskConsole(hub=hub, state=state or default_console_state(), feeds=feeds,
+    console = TaskConsole(hub=hub, state=state or _demo_board_state(), feeds=feeds,
                           scale=scale, window_px=size)
     console._timer.stop()          # deterministic: tests drive refresh_once() themselves
     console.show()
@@ -200,8 +233,9 @@ def demo_console(*, scale: float = 1.0, size=(1480, 980), seed: int = 11, shots:
 
 def demo_console_measurements(*, scale: float = 1.0, size=(1480, 980), grid=(5, 7)):
     """Return a shown :class:`TaskConsole` wired with the readout measurement
-    catalog (P5): the Control tab's Measurement section is the live form +
-    one-click Start, fed by a calibrated VIRTUAL session.
+    catalog (P5): a measurement is created from the header's Add Panel, and its
+    OWN Edit tab carries the live parameter form + one-click Start (there is no
+    global Control tab), fed by a calibrated VIRTUAL session.
 
     Only the camera frames are virtual -- the session calibrates and the specs
     build through the SAME contract path real hardware uses, so this exercises
@@ -227,8 +261,16 @@ def demo_console_measurements(*, scale: float = 1.0, size=(1480, 980), grid=(5, 
     console = TaskConsole(hub=hub, state=TaskConsoleState(name="measurements"), feeds=[],
                           measurements=measurements, scale=scale, window_px=size)
     console.show()
-    # Park on the Control tab so the Measurement form is the visible state.
-    console.tabs.setCurrentIndex(1)
+    # Create the first measurement's panel from Add Panel and open its Edit tab,
+    # so the demo opens showing the measurement form (its params + Start) -- the
+    # whole measurement flow, with no global Control tab.
+    if measurements:
+        kc = console.kind_combo
+        target = ("measurement", measurements[0].name)
+        idx = next((i for i in range(kc.count()) if kc.itemData(i) == target), -1)
+        if idx >= 0:
+            kc.setCurrentIndex(idx)
+            console._add_panel()
     return console
 
 

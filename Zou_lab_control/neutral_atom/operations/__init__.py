@@ -23,6 +23,14 @@ from .measurement import (
     ScanResult,
     ScannedMeasurement,
     ShotPlan,
+    axis_range_tuple,
+)
+from .measurement_registry import (
+    discovered_specs,
+    measurement,
+    register_measurement,
+    registered_measurements,
+    unregister_measurement,
 )
 from .temperature import (
     ReleaseRecapturePlan,
@@ -34,14 +42,20 @@ from .temperature import (
 )
 
 __all__ = [
+    "axis_range_tuple",
     "build_release_recapture_pulse",
     "calibrate_sitemap_from_images",
     "calibrate_threshold_from_images",
     "characterize_readout",
     "detect_image",
+    "discovered_specs",
     "ExperimentFeed",
     "FidelityReport",
     "fit_temperature",
+    "measurement",
+    "register_measurement",
+    "registered_measurements",
+    "unregister_measurement",
     "frame_files",
     "index_run",
     "load_frame",

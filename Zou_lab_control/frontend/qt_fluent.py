@@ -490,6 +490,43 @@ class FluentFrame(QtWidgets.QFrame):
             add_fluent_shadow(self, corner_radii=(top_left, top_right, bottom_right, bottom_left))
 
 
+class FluentPopup(QtWidgets.QFrame):
+    """A top-level ``Qt.Popup`` with a CLEAN rounded white-card chrome.
+
+    A rounded card on a popup must NOT be done with a stylesheet ``border-radius``
+    on an opaque top-level window: the square window stays opaque behind the arc,
+    so the corner triangles outside the radius show a square white nub past the
+    rounded border (and Windows adds a native popup shadow) -- that nub reads as
+    the stray line at the bottom corners.  WA_TranslucentBackground alone is not
+    enough either: it stops the stylesheet background painting at all, leaving the
+    card see-through.
+
+    So this paints the card itself: a TRANSLUCENT, frameless popup whose
+    paintEvent strokes ONE antialiased rounded rect (fill + 1 px border).  The
+    corners are truly rounded with nothing outside them, and because the border is
+    painted (not a stylesheet rule) it can never cascade onto child widgets."""
+
+    def __init__(self, parent=None, *, radius: float | None = None,
+                 border: str = DIVIDER, fill: str = "white"):
+        super().__init__(parent, QtCore.Qt.Popup | QtCore.Qt.FramelessWindowHint
+                         | QtCore.Qt.NoDropShadowWindowHint)
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+        self._radius = float(_radius() if radius is None else radius)
+        self._border = QtGui.QColor(border)
+        self._fill = QtGui.QColor(fill)
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        pen = QtGui.QPen(self._border)
+        pen.setWidthF(1.0)
+        painter.setPen(pen)
+        painter.setBrush(self._fill)
+        # inset by the half pen width so the 1 px stroke hugs the edge unclipped
+        rect = QtCore.QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        painter.drawRoundedRect(rect, self._radius, self._radius)
+
+
 class FluentGroupBox(QtWidgets.QGroupBox):
     def __init__(self, title: str = "", parent=None, *, shadow: bool = True):
         super().__init__(title, parent)
@@ -699,6 +736,54 @@ class FluentLineEdit(QtWidgets.QLineEdit):
             self.setText(after)
 
 
+class FluentSectionLabel(QtWidgets.QLabel):
+    """Bold, own-line section header for confocal-style vertical settings popups.
+
+    Confocal's per-plot settings page uses ONE QGroupBox to mark sections; we use a
+    bold dim label per section instead so multiple sections stack cleanly in a
+    single VBox without nested borders.  Reuse this for every settings popup so the
+    visual rhythm is identical across GUIs."""
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(text, parent)
+        font = self.font()
+        font.setBold(True)
+        font.setPointSize(fluent_font_size())
+        self.setFont(font)
+        self.setStyleSheet(f"color: {TEXT}; background: transparent; border: none;")
+        self.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        self.setContentsMargins(0, scaled_px(4), 0, 0)
+
+
+class FluentSettingRow(QtWidgets.QWidget):
+    """One settings row: [fixed-width label | control flush-left, expanding].
+
+    Mirrors confocal_gui's `[QLabel(110x30, centred) | widget(100x30)]` row template
+    (`gui_individual.py`), but here the label is left-aligned (compact label-column
+    look) and the control is allowed to expand so long text fields fill the popup
+    width.  Use inside a settings popup VBox under a :class:`FluentSectionLabel`;
+    do NOT nest in a QGroupBox -- the section label is the section marker."""
+
+    def __init__(
+        self,
+        label: str,
+        control: QtWidgets.QWidget,
+        *,
+        label_width: int | None = None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        h = QtWidgets.QHBoxLayout(self)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(scaled_px(6, minimum=4))
+        lbl = QtWidgets.QLabel(label)
+        lbl.setFixedWidth(int(label_width) if label_width is not None else scaled_px(60, minimum=48))
+        lbl.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        lbl.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+        h.addWidget(lbl)
+        h.addWidget(control, 1)
+
+
 class FloatLineEdit(FluentLineEdit):
     pass
 
@@ -818,12 +903,73 @@ class FluentComboBox(QtWidgets.QComboBox):
         event.ignore()
 
 
+class _FluentTabCloseButton(QtWidgets.QAbstractButton):
+    """The close affordance for a closable tab: a CENTRED "x" (two painted
+    strokes) inside a CENTRED circular hover highlight.  Painting both about the
+    same centre GUARANTEES the x and its background circle align -- a text "x"
+    in a QToolButton drifts off its rounded background by font metrics.  The
+    glyph is soft grey, darkening on hover; the circle only appears on hover /
+    press.  Frontend-owned, reused via :meth:`FluentTabWidget.add_closable_tab`."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        size = scaled_px(18, minimum=14)
+        self.setFixedSize(size, size)
+        self.setCursor(QtCore.Qt.PointingHandCursor)
+        self.setToolTip("Close this tab")
+        self.setFocusPolicy(QtCore.Qt.NoFocus)
+
+    def enterEvent(self, event):  # noqa: N802 - Qt naming
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):  # noqa: N802 - Qt naming
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, event):  # noqa: N802 - Qt naming
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        rect = QtCore.QRectF(self.rect())
+        centre = rect.center()
+        radius = min(rect.width(), rect.height()) / 2.0
+        hovered = self.underMouse() or self.isDown()
+        if hovered:                                   # centred circular highlight
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.setBrush(QtGui.QColor(0, 0, 0, 70 if self.isDown() else 40))
+            painter.drawEllipse(centre, radius, radius)
+        d = radius * 0.42                             # the x: two strokes about the SAME centre
+        pen = QtGui.QPen(QtGui.QColor(TEXT if hovered else GREY))
+        pen.setWidthF(max(1.2, radius * 0.16))
+        pen.setCapStyle(QtCore.Qt.RoundCap)
+        painter.setPen(pen)
+        cx, cy = centre.x(), centre.y()
+        painter.drawLine(QtCore.QPointF(cx - d, cy - d), QtCore.QPointF(cx + d, cy + d))
+        painter.drawLine(QtCore.QPointF(cx - d, cy + d), QtCore.QPointF(cx + d, cy - d))
+        painter.end()
+
+
 class FluentTabWidget(QtWidgets.QTabWidget):
+    """Pivot-underline tab widget that also supports CLOSABLE tabs.
+
+    Permanent tabs (Monitor / Control) are added with :meth:`add_permanent_tab`
+    (no close button); on-demand tabs (e.g. a per-panel Edit) are added with
+    :meth:`add_closable_tab`, which shows the native close affordance and emits
+    :attr:`tab_close_requested` with the page widget when its X is clicked, so a
+    host can tear the page down.  Reusable across GUIs (frontend-owned)."""
+
+    tab_close_requested = QtCore.pyqtSignal(QtWidgets.QWidget)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setTabPosition(QtWidgets.QTabWidget.North)
         self.tabBar().setExpanding(False)
         self.setUsesScrollButtons(True)
+        # No NATIVE close buttons.  A plain ``addTab()`` tab is PERMANENT (no X),
+        # so GUIs that use ``addTab`` directly (e.g. the pulse editor's
+        # Edit / Preview / Scan, which must always exist) never get a close
+        # affordance.  ``add_closable_tab`` opts in a CUSTOM, subtle close button
+        # (a soft grey "x" that highlights on hover -- not the harsh native X).
         self.setStyleSheet(
             f"""
             QTabWidget {{
@@ -876,6 +1022,29 @@ class FluentTabWidget(QtWidgets.QTabWidget):
         )
         add_fluent_shadow(self, blur=10, alpha=50, offset=2,
                           silhouette=_tab_widget_silhouette)
+
+    def add_permanent_tab(self, widget: QtWidgets.QWidget, title: str) -> int:
+        """Add a fixture tab with NO close button (e.g. Monitor).  A plain
+        ``addTab`` is already permanent, so this is just an explicit alias."""
+        return self.addTab(widget, title)
+
+    def add_closable_tab(self, widget: QtWidgets.QWidget, title: str, *,
+                         focus: bool = True) -> int:
+        """Add a tab WITH a subtle custom close button.  Clicking it emits
+        :attr:`tab_close_requested` with ``widget`` so the host can tear it down."""
+        index = self.addTab(widget, title)
+        self.tabBar().setTabButton(index, QtWidgets.QTabBar.RightSide,
+                                   self._make_close_button(widget))
+        if focus:
+            self.setCurrentIndex(index)
+        return index
+
+    def _make_close_button(self, widget: QtWidgets.QWidget) -> "_FluentTabCloseButton":
+        """A custom-PAINTED close affordance whose "x" is guaranteed centred in
+        its hover circle (a text "x" in a QToolButton drifts off-centre)."""
+        btn = _FluentTabCloseButton(self)
+        btn.clicked.connect(lambda: self.tab_close_requested.emit(widget))
+        return btn
 
 
 class FluentSwitch(QtWidgets.QAbstractButton):

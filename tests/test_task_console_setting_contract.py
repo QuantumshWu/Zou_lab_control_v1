@@ -1,19 +1,30 @@
-"""MECHANICAL guard for the P4 task-console redesign.
+"""MECHANICAL guard for the per-panel Setting popup.
 
-P4 slimmed the per-panel Setting popup down to BASIC display controls only
-(Source, size, colormap, colorbar, unit, x/y limits) and moved the heavier
-processing (curve fit, relim) into the Control tab.  Two regressions this test
-pins so they cannot creep back into the lightweight popup:
+The popup follows confocal_gui's vertical idiom: bold section headers
+(Source / Display / Unit / Limits / Panel) with one control per row underneath
+as a fixed-width-label + control cell.  It exposes the BASIC display controls
+that an experimenter touches per shot:
 
-1. structural -- the Setting popup contains NO Fit button and NO relim combo,
-   and relim is NOT a Setting Display param;
-2. behavioural -- the new basic display toggles (colorbar / unit / x-y limits)
-   persist through ``PanelConfig.to_dict``/``from_dict`` and are RE-APPLIED on
-   the rebuilt plotter (the panel rebuilds whenever its data shape changes, so a
-   toggle that was not re-applied would silently revert).
+* signal picker + expression (Source),
+* size + colormap (the colorbar COLORSET chooser) + each kind's declarative
+  ParamSpec widget (Display),
+* Unit cycle + current unit text (Unit),
+* auto / manual + 4 x/y limit edits (Limits),
+* title, Remove, Edit…, Save Fig (Panel).
 
-These run on the offscreen Qt platform and build PanelCards directly, so they do
-NOT pull in the flaky demo_console GUI fixtures.
+What it deliberately does NOT have (locked here so regressions cannot creep
+back in):
+
+* NO Fit / Clear / relim controls -- those live in the Control tab (Edit…
+  opens it).
+* NO colorbar show/hide checkbox -- the colormap chooser IS the colorbar
+  colorset chooser; visibility is not a user toggle.
+
+Unit / xlim / ylim ALSO persist into ``PanelConfig.params`` and re-apply on
+rebuild (the panel rebuilds whenever its data shape changes, so a toggle
+that was not re-applied would silently revert).  Run on the offscreen Qt
+platform and build PanelCards directly, so the flaky demo_console GUI
+fixture is not pulled in.
 """
 
 from __future__ import annotations
@@ -37,11 +48,6 @@ def _card(kind, *, params=None, source=None, size="2x2"):
     return PanelCard(cfg)
 
 
-def _settings_widgets(card):
-    """Every widget the Setting popup actually contains (recursively)."""
-    return card.settings_popup.findChildren(__import__("PyQt5.QtWidgets", fromlist=["QWidget"]).QWidget)
-
-
 def _button_texts(card):
     from PyQt5.QtWidgets import QPushButton
     return [b.text() for b in card.settings_popup.findChildren(QPushButton)]
@@ -54,9 +60,16 @@ def _combo_item_sets(card):
 
 
 # ---------------------------------------------------------------- structural
-def test_setting_popup_has_no_fit_or_relim_controls():
-    """The Setting popup is BASIC display only: no Fit/Clear buttons, no relim
-    combo, and the (tight, normal) relim choices appear in NO Setting combo."""
+def test_setting_popup_has_no_fit_controls():
+    """The Setting popup is BASIC display only: no Fit/Clear buttons.
+
+    The relim combo (``tight`` / ``normal``, confocal naming) IS present as the
+    Limits "mode" row -- that's the user-requested confocal layout, and it
+    persists into ``config.params["relim"]`` (the same key Control's ed_relim
+    writes to, so they stay in sync).  See ``test_setting_relim_combo_writes
+    _config_params_relim`` for the relim semantic, and ``test_setting_popup
+    _has_unit_and_limit_controls`` for the structural presence check.
+    """
     from Zou_lab_control.frontend.task_console import PANEL_PARAMS
     for kind in ("1d", "monitor", "2d", "sites", "hist"):
         card = _card(kind)
@@ -64,11 +77,11 @@ def test_setting_popup_has_no_fit_or_relim_controls():
             texts = _button_texts(card)
             assert "Fit" not in texts, (kind, texts)
             assert "Clear" not in texts, (kind, texts)
-            # relim is not a Display param anymore (it lives in the Control tab)
+            # relim is not a declarative PANEL_PARAMS spec -- it has its OWN
+            # row in the Limits section (the Limits combo).  Keep the spec set
+            # clean of any duplicate "relim" key.
             param_keys = {spec.key for spec in PANEL_PARAMS.get(kind, ())}
             assert "relim" not in param_keys, (kind, param_keys)
-            # and no Setting combo offers the relim (tight/normal) choice
-            assert ("tight", "normal") not in _combo_item_sets(card), kind
             # the card no longer carries the popup-fit handles
             assert not hasattr(card, "fit_combo"), kind
             assert not hasattr(card, "_do_fit"), kind
@@ -76,115 +89,72 @@ def test_setting_popup_has_no_fit_or_relim_controls():
             card.shutdown()
 
 
-def test_setting_popup_basic_controls_present():
-    """The basic controls ARE present: Source (Apply), size, colormap (image
-    kinds), the unit cycle button, the lim auto/manual combo + 4 edits, and the
-    colorbar checkbox on image kinds only."""
+def test_setting_popup_has_unit_and_relim_controls():
+    """Confocal vertical layout: Source + Display (size + colormap + relim +
+    unit + per-kind ParamSpec rows) + Panel.
+
+    Unit cycle button and relim combo (tight/normal -- confocal_gui naming) are
+    PRESENT.  The popup carries NO manual x/y limit edits (no auto/manual gate
+    either), NO cbar show/hide checkbox -- the colormap chooser IS the colorset
+    chooser, and interactive ranging is handled by zoom/pan or by Edit… into
+    the Control tab."""
     from PyQt5.QtWidgets import QCheckBox
 
-    # an image kind owns the colorbar toggle + a colormap combo
+    # an image kind owns the colormap chooser (= colorbar colorset chooser)
     img = _card("2d")
     try:
-        assert img.cbar_check is not None
-        assert isinstance(img.cbar_check, QCheckBox)
-        assert "Apply" in _button_texts(img)        # Source apply
-        assert "Unit" in _button_texts(img)         # unit cycle
+        texts = _button_texts(img)
+        assert "Apply" in texts                                # Source apply
+        assert "Unit" in texts                                 # Unit cycle button
+        assert {"Remove", "Edit…", "Save Fig"} <= set(texts), texts
+
         item_sets = _combo_item_sets(img)
-        assert ("auto", "manual") in item_sets      # lim mode combo
-        assert any("inferno" in s for s in item_sets)  # colormap combo
-        # the four manual-limit edits exist
-        assert all(hasattr(img, n) for n in ("xmin_edit", "xmax_edit", "ymin_edit", "ymax_edit"))
+        assert any("inferno" in s for s in item_sets), item_sets  # cmap colorset
+        assert any("2x2" in s for s in item_sets), item_sets      # size combo
+        # relim mode combo uses confocal_gui's NAMING (tight/normal)
+        assert ("tight", "normal") in item_sets, item_sets
+        # the popup must NOT carry any auto/manual lim mode
+        assert ("auto", "manual") not in item_sets, item_sets
+
+        # the present handles (Unit + relim combo)
+        for attr in ("unit_button", "unit_label", "lim_combo"):
+            assert hasattr(img, attr), attr
+
+        # the restored handlers
+        for attr in ("_on_unit_cycle", "_on_relim_mode",
+                     "_apply_unit", "_apply_display_params",
+                     "_current_unit_text", "_unit_df", "_unit_cycle_len"):
+            assert hasattr(img, attr), attr
+
+        # REMOVED clutter that must stay gone (NO manual x/y limits, NO cbar):
+        for gone in ("cbar_check", "_on_colorbar_toggle",
+                     "_on_lim_values", "_apply_limits",
+                     "xmin_edit", "xmax_edit", "ymin_edit", "ymax_edit",
+                     "lim_edits"):
+            assert not hasattr(img, gone), gone
+
+        # no colorbar show/hide checkbox lives in the popup
+        assert img.settings_popup.findChildren(QCheckBox) == []
     finally:
         img.shutdown()
 
-    # a line kind has unit + lim but NO colorbar toggle
+    # a line kind has the same Display section, just no cmap row
     line = _card("1d")
     try:
-        assert line.cbar_check is None
-        assert "Unit" in _button_texts(line)
-        assert ("auto", "manual") in _combo_item_sets(line)
+        texts = _button_texts(line)
+        assert "Unit" in texts
+        # SAME confocal relim naming on a line kind (tight / normal)
+        assert ("tight", "normal") in _combo_item_sets(line)
+        assert ("auto", "manual") not in _combo_item_sets(line)
+        from PyQt5.QtWidgets import QCheckBox
+        assert line.settings_popup.findChildren(QCheckBox) == []
     finally:
         line.shutdown()
 
 
 # ------------------------------------------------------------- persistence
-def _feed_2d(card):
-    arr = np.add.outer(np.linspace(0, 1, 12), np.linspace(0, 2, 12))
-    card.refresh({"frame": arr, "shot": 1})
-
-
-def test_colorbar_toggle_persists_and_reapplies_on_rebuild():
-    """colorbar=False round-trips through to_dict/from_dict AND is re-applied to
-    the freshly rebuilt plotter (cax hidden), proving it survives a rebuild."""
-    from Zou_lab_control.frontend.task_console import PanelConfig
-
-    card = _card("2d", source="value = frame")
-    try:
-        _feed_2d(card)
-        assert card.plotter is not None and card.plotter.cax.get_visible()
-        # toggle off via the real popup checkbox -> persisted + applied live
-        card.cbar_check.setChecked(False)
-        assert card.config.params["colorbar"] is False
-        assert not card.plotter.cax.get_visible()
-
-        # round-trip the config, rebuild a fresh card, feed data -> still hidden
-        payload = card.config.to_dict()
-        cfg2 = PanelConfig.from_dict(payload)
-        assert cfg2.params["colorbar"] is False
-    finally:
-        card.shutdown()
-
-    from Zou_lab_control.frontend.task_console import PanelCard
-    card2 = PanelCard(cfg2)
-    try:
-        _feed_2d(card2)
-        assert card2.plotter is not None
-        assert not card2.plotter.cax.get_visible()   # re-applied on rebuild
-    finally:
-        card2.shutdown()
-
-
-def test_manual_limits_persist_and_reapply_on_rebuild():
-    """Manual x/y limits round-trip and are re-applied on rebuild; for a live
-    line panel the per-tick relim is frozen (relim_mode='off') so they stick."""
-    from Zou_lab_control.frontend.task_console import PanelCard, PanelConfig
-
-    card = _card("1d", source="value = vec")
-    x = np.linspace(0, 10, 40)
-    try:
-        card.refresh({"vec": np.sin(x), "shot": 1})
-        # set manual limits through the popup widgets
-        card.lim_combo.setCurrentText("manual")
-        card.xmin_edit.setText("2"); card.xmax_edit.setText("8")
-        card.ymin_edit.setText("-0.5"); card.ymax_edit.setText("0.5")
-        card._on_lim_values()
-        assert card.config.params["xlim"] == (2.0, 8.0)
-        assert card.config.params["ylim"] == (-0.5, 0.5)
-        assert card.plotter.ax.get_xlim() == (2.0, 8.0)
-        assert card.plotter.relim_mode == "off"
-
-        # another shot must NOT re-autoscale y away from the manual range
-        card.refresh({"vec": 5.0 * np.sin(x), "shot": 2})
-        assert card.plotter.ax.get_ylim() == (-0.5, 0.5)
-
-        payload = card.config.to_dict()
-    finally:
-        card.shutdown()
-
-    cfg2 = PanelConfig.from_dict(payload)
-    # JSON-style round-trip yields lists; the values must match
-    assert list(cfg2.params["xlim"]) == [2.0, 8.0]
-    card2 = PanelCard(cfg2)
-    try:
-        card2.refresh({"vec": np.sin(x), "shot": 1})
-        assert tuple(card2.plotter.ax.get_xlim()) == (2.0, 8.0)
-        assert tuple(card2.plotter.ax.get_ylim()) == (-0.5, 0.5)
-    finally:
-        card2.shutdown()
-
-
 def test_unit_index_persists_and_reapplies():
-    """The unit cycle is stored as unit_index and re-applied on rebuild; an axis
+    """The unit cycle stores ``unit_index`` and re-applies on rebuild; an axis
     with a convertible unit (GHz) cycles, a plain axis stays at index 0."""
     from Zou_lab_control.frontend.task_console import PanelCard, PanelConfig
 
@@ -193,12 +163,11 @@ def test_unit_index_persists_and_reapplies():
     x = np.linspace(0.1, 1.0, 30)
     try:
         card.refresh({"vec": np.cos(x), "shot": 1})
-        # give the axis a convertible unit label, then cycle
         card.plotter.ax.set_xlabel("Detuning (GHz)")
         before = card.plotter.ax.get_xlabel()
         card._on_unit_cycle()
         assert card.config.params["unit_index"] >= 1
-        assert card.plotter.ax.get_xlabel() != before   # unit changed on the label
+        assert card.plotter.ax.get_xlabel() != before
         payload = card.config.to_dict()
         assert payload["params"]["unit_index"] >= 1
     finally:
@@ -214,22 +183,123 @@ def test_unit_index_persists_and_reapplies():
         plain.shutdown()
 
 
-def test_control_tab_has_measurement_placeholder_and_processing():
-    """The Control tab carries a (disabled) Measurement placeholder reserved for
-    P5 plus the processing controls (fit combo, relim combo, Save Fig)."""
+def test_setting_relim_combo_writes_config_params_relim():
+    """The Setting popup's mode combo (``tight`` / ``normal`` -- confocal_gui
+    naming) writes to ``config.params["relim"]`` -- the SAME key the Control
+    tab's ed_relim writes to, so the two are kept in sync via a single source
+    of truth.  The persisted value is re-applied to the plotter every rebuild
+    via ``_apply_display_params``.  No manual xlim/ylim path exists any more."""
+    card = _card("1d", source="value = vec")
+    try:
+        x = np.linspace(0, 1, 10)
+        card.refresh({"vec": np.cos(x), "shot": 1})
+        # default is "tight" (the panel_plot default) -- combo reflects it
+        assert card.lim_combo.currentText() == "tight"
+        # picking "normal" persists onto the same key the Control tab uses
+        card.lim_combo.setCurrentText("normal")
+        card._on_relim_mode("normal")
+        assert card.config.params["relim"] == "normal"
+        assert card.plotter.relim_mode == "normal"
+        # data-shape change rebuilds the plotter -> relim must reapply
+        card.refresh({"vec": 5.0 * np.cos(x[:8]), "shot": 2})
+        assert card.plotter.relim_mode == "normal"
+    finally:
+        card.shutdown()
+
+
+def test_panel_title_edit_goes_through_frontend_apply_title():
+    """Setting's title edit must update the title via ``BaseLivePlot._apply_title``
+    (which routes through ``style.apply_title`` and the design-token
+    ``title_fontsize()``), NOT raw ``ax.set_title(text)``.  The raw call would
+    inherit matplotlib's ``axes.titlesize`` rcParam and visibly shrink/grow the
+    title after every edit; the sealed API pins it at the frontend's chosen
+    size."""
+    from Zou_lab_control.frontend.style import title_fontsize
+    card = _card("1d", source="value = vec")
+    try:
+        x = np.linspace(0, 1, 10)
+        card.refresh({"vec": np.cos(x), "shot": 1})
+        expected = float(title_fontsize())
+        # the title text the panel was BUILT with already sits at expected size
+        # (BaseLivePlot.init -> _apply_title -> style.apply_title).  Verify.
+        title_artist = card.plotter.ax.title
+        assert abs(title_artist.get_fontsize() - expected) < 1e-6
+        # NOW edit it via the popup handler; size MUST stay at expected
+        card._on_title("renamed via Setting popup")
+        assert card.plotter.title == "renamed via Setting popup"
+        assert card.plotter.ax.get_title() == "renamed via Setting popup"
+        assert abs(card.plotter.ax.title.get_fontsize() - expected) < 1e-6
+    finally:
+        card.shutdown()
+
+
+def test_panel_config_roundtrip_persists_setting_keys():
+    """The Setting toggles are stored on PanelConfig.params and survive a
+    JSON-style round-trip (to_dict + from_dict): unit_index, relim, cmap."""
+    from Zou_lab_control.frontend.task_console import PanelConfig
+    cfg = PanelConfig(
+        kind="2d", title="t", row=0, col=0, size="2x2",
+        params={"unit_index": 2, "relim": "normal", "cmap": "inferno"},
+    )
+    cfg2 = PanelConfig.from_dict(cfg.to_dict())
+    assert cfg2.params["unit_index"] == 2
+    assert cfg2.params["relim"] == "normal"
+    assert cfg2.params["cmap"] == "inferno"
+
+
+# --------------------------------------------------- no global Control tab
+def test_no_control_tab_monitor_only():
+    """There is NO global Control tab any more (it was an empty placeholder when
+    no measurements were wired).  Monitor is the only permanent tab; every panel
+    gets its OWN closable Edit tab on demand, and the measurement form lives in
+    each measurement panel's Edit (not a shared launcher), so the console no
+    longer carries a global measurement_group / measurement_panel / launcher."""
     from Zou_lab_control.frontend import devtools as dt
 
     console = dt.demo_console(shots=4)
     try:
-        # the Control tab is the second tab, labelled "Control"
+        # Monitor is the ONLY permanent tab; no "Control" anywhere.
         assert console.tabs.tabText(0) == "Monitor"
-        assert console.tabs.tabText(1) == "Control"
-        # Measurement placeholder exists, is disabled, and is empty of real controls
-        assert console.measurement_group is not None
-        assert not console.measurement_group.isEnabled()
-        assert console.measurement_group.title() == "Measurement"
-        # processing controls live here (fit + relim), not in the Setting popup
-        assert console.ed_fit_combo is not None
-        assert tuple(console.ed_relim.itemText(i) for i in range(console.ed_relim.count())) == ("tight", "normal")
+        titles = [console.tabs.tabText(i) for i in range(console.tabs.count())]
+        assert "Control" not in titles, titles
+        # the empty global launcher is gone (kept as None for stop/poll fallback)
+        assert console.measurement_group is None
+        assert console.measurement_panel is None
+        # the old single-editor handles never came back
+        for gone in ("ed_fit_combo", "ed_relim", "ed_xmin", "_editor_card",
+                     "_editor_plotter", "_build_editor_tab", "_build_control_tab"):
+            assert not hasattr(console, gone), gone
+        # per-panel editors are tracked in a registry, opened on demand
+        assert console._panel_editors == {}
     finally:
         console.shutdown()
+
+
+def test_setting_keeps_only_colormap_functional_params_go_to_edit():
+    """Setting/Edit never DUPLICATE a parameter: the Setting popup renders only
+    DISPLAY params (the colormap / colorset chooser), while FUNCTIONAL plot
+    params (length / bins / centers / image) are rendered in the panel's Edit
+    tab instead -- so a 2d panel's Setting shows cmap but NOT length, and a
+    monitor panel's Setting shows NO functional spec widget."""
+    from Zou_lab_control.frontend.task_console import PANEL_PARAMS
+
+    # cmap is the only display=True spec; everything else is functional (Edit).
+    for kind, specs in PANEL_PARAMS.items():
+        for spec in specs:
+            if spec.key == "cmap":
+                assert spec.display is True, kind
+            else:
+                assert spec.display is False, (kind, spec.key)
+
+    # a 2d card's Setting popup renders the colormap chooser (display) but no
+    # functional param widget; a monitor card's Setting renders no param widget.
+    img = _card("2d")
+    try:
+        assert set(img.param_widgets) == {"cmap"}
+    finally:
+        img.shutdown()
+    mon = _card("monitor")
+    try:
+        assert mon.param_widgets == {}      # 'length' moved to the Edit tab
+    finally:
+        mon.shutdown()

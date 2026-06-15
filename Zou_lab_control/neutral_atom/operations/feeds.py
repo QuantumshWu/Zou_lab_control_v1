@@ -93,6 +93,13 @@ class ExperimentFeed:
     def running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
+    def published_signals(self) -> frozenset:
+        """The signal names this feed publishes (behind ``prefix``).  Lets a
+        consumer (e.g. the task console) map a panel back to the feed that
+        produces its data, then expose THAT feed's parameters.  Subclasses with
+        a fixed signal set override this; the base publishes nothing structured."""
+        return frozenset()
+
 
 class LoadingFeed(ExperimentFeed):
     """Atom-loading experiment producer over the :class:`CameraDevice` contract.
@@ -137,6 +144,11 @@ class LoadingFeed(ExperimentFeed):
         self.exposure = float(exposure)
         self.roi_radius = int(roi_radius)
         self.ema = float(ema)
+        # Kept as attributes (not just __init__ locals) so the task-console Edit
+        # tab can auto-discover them via inspect.signature + getattr and rebuild
+        # the feed with edited acquisition parameters.
+        self.calibration_frames = int(calibration_frames)
+        self.threshold_frames = int(threshold_frames)
         # Two backend-neutral sequences, built ONCE: an all-sites template (the
         # virtual camera renders every trap occupied for ``name="sitemap"``; real
         # hardware runs its deterministic-fill template) and a per-shot readout
@@ -144,11 +156,11 @@ class LoadingFeed(ExperimentFeed):
         self._sitemap_seq = imaging_sequence(exposure=self.exposure, load=True, name="sitemap")
         self._readout_seq = imaging_sequence(exposure=self.exposure, load=True, name="readout")
         # --- self-calibration through the contract, SAME primitives as the real readout ---
-        template = self._acquire(max(1, int(calibration_frames)), self._sitemap_seq)
+        template = self._acquire(max(1, self.calibration_frames), self._sitemap_seq)
         average = np.mean([np.asarray(img, dtype=float) for img in template], axis=0)
         self.centers = find_site_centers(average, self.grid_shape)
         self.n_sites = len(self.centers)
-        samples = [np.asarray(img, dtype=float) for img in self._acquire(max(2, int(threshold_frames)), self._readout_seq)]
+        samples = [np.asarray(img, dtype=float) for img in self._acquire(max(2, self.threshold_frames), self._readout_seq)]
         self.thresholds = np.asarray(estimate_thresholds(samples, self.centers, radius=self.roi_radius), dtype=float)
         self._rate_sites = np.full(self.n_sites, np.nan)
         self._rate = float("nan")
@@ -178,6 +190,11 @@ class LoadingFeed(ExperimentFeed):
             "thresholds": np.asarray(self.thresholds, dtype=float).reshape(-1).copy(),
             "shot": float(self.shots + 1),
         }
+
+    def published_signals(self) -> frozenset:
+        keys = ("frame", "counts", "occupied", "rate", "rate_sites", "rate_grid",
+                "centers", "thresholds", "shot")
+        return frozenset(self.prefix + key for key in keys)
 
 
 class ScannedMeasurementFeed(ExperimentFeed):
@@ -298,6 +315,11 @@ class ScannedMeasurementFeed(ExperimentFeed):
         while not self.finished:
             self.step()
         return self
+
+    def published_signals(self) -> frozenset:
+        keys = (self.x_key, self.y_key, self.y_key + "_sites", self.y_key + "_grid",
+                "scan_done", "shot")
+        return frozenset(self.prefix + key for key in keys)
 
 
 __all__ = ["ExperimentFeed", "LoadingFeed", "ScannedMeasurementFeed"]

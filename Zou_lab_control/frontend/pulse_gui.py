@@ -1710,6 +1710,13 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self.state = state
         self.channel_pins = {str(channel): str(pin) for channel, pin in dict(channel_pins or {}).items()}
         self.sequencer = sequencer or (getattr(getattr(experiment, "devices", None), "sequencer", None) if experiment is not None else None)
+        # Connection seeds for the runtime Connection control: a virtual or remote
+        # sequencer built later (the user picks the backend AFTER opening, instead
+        # of fixing it at launch) reuses the SAME channels the editor shows, so a
+        # transport swap never churns the channel layout.
+        self._clock_hz = float(getattr(self.sequencer, "clock_hz", None) or (1e9 / self.state.time_step_ns))
+        self._trigger_channels = list(getattr(self.sequencer, "trigger_channels", []) or [])
+        self._connection_label = ""
         self.last_program = None
         self.bracket_exists = False
         self.address_str = ""
@@ -1736,6 +1743,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self._preview_timer.timeout.connect(self.refresh_preview)
         self._build_ui()
         self.load_state(self.state)
+        self._init_connection_ui()
 
     def _build_ui(self) -> None:
         self.setWindowTitle("PulseGUI@Zou lab")
@@ -1920,6 +1928,48 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         control_col.addLayout(button_layout)
         control_col.addStretch(1)
         bar.addWidget(control_area, 1)
+
+        # --- Connection: pick the sequencer backend AFTER opening (Virtual sim /
+        # a remote FPGA server / Offline edit-only), instead of fixing it on the
+        # command line.  On Pulse / Stop / Sync already guard ``sequencer is None``
+        # so the editor stays fully usable while offline; this just swaps the
+        # transport the run controls talk to. ---
+        conn_area = FluentGroupBox("Connection")
+        conn_area.setFixedWidth(_px(252, minimum=212))
+        conn_col = QtWidgets.QVBoxLayout(conn_area)
+        conn_col.setContentsMargins(_px(8), _px(2), _px(8), _px(6))
+        conn_col.setSpacing(_px(4, minimum=3))
+        self.conn_target_combo = FluentComboBox()
+        self.conn_target_combo.setFixedHeight(cb_h)
+        self.conn_target_combo.addItem("Virtual (sim)", "virtual")
+        self.conn_target_combo.addItem("Remote server", "remote")
+        self.conn_target_combo.addItem("Offline (edit only)", "offline")
+        self.conn_target_combo.setToolTip(
+            "Virtual: a local in-memory sequencer (edit + fire in simulation).\n"
+            "Remote: connect to a running FPGA sequencer server (host:port).\n"
+            "Offline: edit only, no backend calls.")
+        self.conn_target_combo.currentIndexChanged.connect(self._on_conn_target_changed)
+        conn_col.addWidget(self.conn_target_combo)
+        conn_row = QtWidgets.QHBoxLayout()
+        conn_row.setContentsMargins(0, 0, 0, 0)
+        conn_row.setSpacing(_px(6, minimum=4))
+        self.conn_addr_edit = FluentLineEdit("127.0.0.1:18861")
+        self.conn_addr_edit.setFixedHeight(cb_h)
+        self.conn_addr_edit.setToolTip("Remote sequencer server address as host:port.")
+        self.conn_connect_button = FluentButton("Connect", color=ACCENT)
+        self.conn_connect_button.setFixedHeight(cb_h)
+        self.conn_connect_button.setMinimumWidth(_px(64, minimum=54))
+        self.conn_connect_button.setToolTip("Apply the selected connection.")
+        self.conn_connect_button.clicked.connect(self._apply_connection)
+        conn_row.addWidget(self.conn_addr_edit, 1)
+        conn_row.addWidget(self.conn_connect_button)
+        conn_col.addLayout(conn_row)
+        self.conn_status = FluentLineEdit("")
+        self.conn_status.setEnabled(False)
+        self.conn_status.setFixedHeight(_row_height())
+        conn_col.addWidget(self.conn_status)
+        conn_col.addStretch(1)
+        bar.addWidget(conn_area)
 
         view_area = FluentGroupBox("Channels")
         view_area.setFixedWidth(_px(286, minimum=246))
@@ -3456,6 +3506,101 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         except Exception as exc:
             self.stateui_manager.runstate = RunState.ERROR
             self._message(str(exc))
+
+    # --- Connection control: pick the sequencer backend AFTER opening ----------
+    def _on_conn_target_changed(self) -> None:
+        """Enable the host:port field only when the Remote target is selected."""
+        self.conn_addr_edit.setEnabled(self.conn_target_combo.currentData() == "remote")
+
+    def _parse_addr(self, text: str) -> tuple[str, int]:
+        raw = str(text).strip()
+        if not raw:
+            raise ValueError("Enter the server address as host:port.")
+        if ":" in raw:
+            host, _, port_text = raw.rpartition(":")
+            host, port = host.strip(), int(port_text.strip())
+        else:
+            host, port = raw, 18861
+        if not host:
+            raise ValueError("Enter the server address as host:port.")
+        return host, port
+
+    def _apply_connection(self) -> None:
+        """Swap the sequencer transport to the chosen backend.
+
+        Virtual / Remote rebuild a sequencer with the editor's OWN channels (so a
+        transport swap never churns the channel layout); Offline detaches.  On
+        Pulse / Stop / Sync already guard a missing sequencer, so an offline
+        editor stays fully usable -- this only changes what the run controls talk
+        to."""
+        target = self.conn_target_combo.currentData()
+        if target == "offline":
+            self._set_sequencer(None, label="Offline (edit only)")
+            self._message("Offline: editing only, no backend calls.")
+            return
+        from Zou_lab_control.neutral_atom.devices.sequencer import RemoteSequencer, RuntimeSequencer
+
+        kwargs = {"channels": list(self.state.channels), "clock_hz": self._clock_hz}
+        if self._trigger_channels:
+            kwargs["trigger_channels"] = list(self._trigger_channels)
+        try:
+            if target == "virtual":
+                self._set_sequencer(RuntimeSequencer(**kwargs), label="Virtual (sim)")
+                self._message("Connected to a virtual (in-memory) sequencer.")
+            else:
+                host, port = self._parse_addr(self.conn_addr_edit.text())
+                self._set_sequencer(
+                    RemoteSequencer(host=host, port=port, connect_on_init=True, **kwargs),
+                    label=f"{host}:{port}")
+                self._message(f"Connected to sequencer server at {host}:{port}.")
+        except Exception as exc:
+            # leave the current connection untouched; just report the failure
+            self._refresh_connection_label()
+            self._message(f"Connection failed: {exc}")
+
+    def _set_sequencer(self, sequencer, *, label: str) -> None:
+        RunState = PulseStateUIManager.RunState
+        old = self.sequencer
+        if old is not None and old is not sequencer and hasattr(old, "close"):
+            try:
+                old.close()
+            except Exception:
+                pass
+        self.sequencer = sequencer
+        if sequencer is not None:
+            self._clock_hz = float(getattr(sequencer, "clock_hz", self._clock_hz))
+            triggers = list(getattr(sequencer, "trigger_channels", []) or [])
+            if triggers:
+                self._trigger_channels = triggers
+        self._connection_label = label
+        self._refresh_connection_label()
+        # a fresh connection has nothing of ours applied yet -> the editor's pulse
+        # is "not on the device" (On Pulse* hint), or plain INIT when detached.
+        self._applied_state_key = None
+        self.stateui_manager.runstate = RunState.UNSYNCED if sequencer is not None else RunState.INIT
+
+    def _refresh_connection_label(self) -> None:
+        if hasattr(self, "conn_status"):
+            self.conn_status.setText(self._connection_label or "Offline (edit only)")
+
+    def _init_connection_ui(self) -> None:
+        """Reflect the launch sequencer in the Connection control."""
+        seq = self.sequencer
+        if seq is None:
+            target, label = "offline", "Offline (edit only)"
+        elif hasattr(seq, "host") and hasattr(seq, "port"):
+            target = "remote"
+            label = f"{getattr(seq, 'host', '')}:{getattr(seq, 'port', '')}"
+            self.conn_addr_edit.setText(label)
+        else:
+            target, label = "virtual", "Virtual (sim)"
+        index = self.conn_target_combo.findData(target)
+        if index >= 0:
+            with _signals_blocked(self.conn_target_combo):
+                self.conn_target_combo.setCurrentIndex(index)
+        self._connection_label = label
+        self._on_conn_target_changed()
+        self._refresh_connection_label()
 
     def save_to_file(self) -> None:
         try:
