@@ -46,13 +46,10 @@ FONT_SIZE = 12
 PADDING_V = 1
 PADDING_H = 1
 EDIT_PADDING_H = 4
-# Left column of the window body content (the standard 14 px content margin) --
-# the title is aligned to THIS column.  StandardTitleBar's content sits ~9 design
-# px right of that column (an intrinsic qframelesswindow offset, measured stable
-# across DPRs), so the title label's own left padding is the column minus that
-# offset; the two then share one left edge instead of the title floating indented.
+# Left column of the window body content (the standard 14 px content margin).
+# FluentWindow pins the title bar's title to THIS column (see _align_title_bar),
+# so the title text shares one left edge with the body cards/tabs.
 TITLE_LEFT_INSET = 14
-_STD_TITLEBAR_LEFT_OFFSET = 9
 COMBO_WIDTH = 16
 COMBO_TRI_SIZE = 8
 STEP_WIDTH = 6
@@ -859,24 +856,21 @@ class FluentTabWidget(QtWidgets.QTabWidget):
                 background: transparent;
             }}
             QTabBar::tab {{
-                background: {BG};
-                color: {TEXT};
+                background: transparent;
+                color: {GREY};
                 border: none;
-                border-top-left-radius: {_radius()}px;
-                border-top-right-radius: {_radius()}px;
-                min-width: {scaled_px(82, minimum=68)}px;
-                height: {scaled_px(30, minimum=24)}px;
-                padding: {scaled_px(PADDING_V)}px {scaled_px(PADDING_H)}px;
-                margin-right: {scaled_px(2)}px;
+                border-bottom: {scaled_px(2, minimum=2)}px solid transparent;
+                height: {scaled_px(28, minimum=22)}px;
+                padding: 0px {scaled_px(16, minimum=12)}px;
+                margin-right: {scaled_px(6)}px;
                 font: {fluent_font_size()}pt "{FONT}";
             }}
             QTabBar::tab:selected {{
-                background: white;
                 color: {TEXT};
+                border-bottom: {scaled_px(2, minimum=2)}px solid {ACCENT};
             }}
             QTabBar::tab:!selected:hover {{
-                background: {ACCENT};
-                color: white;
+                color: {TEXT};
             }}
             """
         )
@@ -1247,27 +1241,6 @@ class FluentWindow(FramelessWindow):
             title_bar = StandardTitleBar(self)
             title_bar.setTitle(title)
             title_bar.iconLabel.setFixedSize(0, 0)
-            # StandardTitleBar lays out [leading spacer, icon, title, stretch,
-            # min/max/close].  With the icon collapsed, that FIXED leading spacer
-            # (~icon width) still pushes the title ~19 px in -- so a 14 px padding
-            # landed the title at x~33, indented PAST the window body column (x~14)
-            # and reading as a misaligned, edge-floating title.  Zero the leading
-            # spacer so the title's ONLY inset is the padding below: the title text
-            # then sits on the SAME left edge as the body content (alignment), and
-            # is vertically centred in the 32 px bar.
-            _tb_lay = getattr(title_bar, "hBoxLayout", None) or title_bar.layout()
-            if _tb_lay is not None:
-                it0 = _tb_lay.itemAt(0) if _tb_lay.count() else None
-                if it0 is not None and it0.spacerItem() is not None:
-                    it0.spacerItem().changeSize(0, 0)
-                # The collapsed icon still reserves layout width (setFixedSize(0,0)
-                # alone left ~9 px), so DROP it from the layout: the title's only
-                # remaining inset is then its padding -> it lands exactly on the
-                # body's left column.
-                _tb_lay.removeWidget(title_bar.iconLabel)
-                title_bar.iconLabel.hide()
-                _tb_lay.setSpacing(0)
-                _tb_lay.invalidate()
             title_bar.titleLabel.setAlignment(QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft)
             title_bar.titleLabel.setStyleSheet(
                 f"""
@@ -1275,11 +1248,20 @@ class FluentWindow(FramelessWindow):
                     background: transparent;
                     color: {TEXT};
                     font: {fluent_font_size()}pt "{FONT}";
-                    padding: 0 {scaled_px(6)}px 0 {scaled_px(max(0, TITLE_LEFT_INSET - _STD_TITLEBAR_LEFT_OFFSET))}px;
+                    padding: 0 {scaled_px(6)}px 0 0;
                 }}
                 """
             )
             self.setTitleBar(title_bar)
+            self._zlc_title_bar = title_bar
+            self._align_title_bar()
+            # The wrapped GUI re-sets the window title at runtime (file name +
+            # dirty star), which RE-ACTIVATES StandardTitleBar's layout and would
+            # otherwise restore its default left inset -- the bug where the pulse
+            # GUI title floated hard against the window edge while the console title
+            # (set once, never re-activated) looked fine.  Re-align on every title
+            # change so the title ALWAYS lands on the body's left content column.
+            self.windowTitleChanged.connect(self._align_title_bar)
             top_margin = scaled_px(32)
         else:
             self.setWindowTitle(title)
@@ -1303,6 +1285,46 @@ class FluentWindow(FramelessWindow):
             self.titleBar.raise_()
         self.loaded.adjustSize()
         self.resize(max(scaled_px(900, minimum=680), self.loaded.width()), self.loaded.height() + top_margin)
+
+    def _align_title_bar(self, *_args) -> None:
+        """Pin the StandardTitleBar title to the body's left content column.
+
+        StandardTitleBar lays out [leading spacer, icon, title, stretch, buttons].
+        The spacer/icon insets are version- and timing-dependent: nudging the title
+        label's padding worked by accident in one path (title set once) and broke in
+        another (title re-set at runtime, which re-activated the layout and changed
+        the inset).  So instead of tuning padding we make the title the FIRST item
+        at a FIXED left contents-margin equal to the body content margin -- nothing
+        variable sits to its left, so the title text lands deterministically on the
+        body column at every DPR and on every (re)title.  Idempotent."""
+        tb = getattr(self, "_zlc_title_bar", None)
+        lay = (getattr(tb, "hBoxLayout", None) or tb.layout()) if tb is not None else None
+        if lay is None:
+            return
+        try:
+            # drop every item before the title label (leading spacer + collapsed icon)
+            while lay.count():
+                item = lay.itemAt(0)
+                if item.widget() is tb.titleLabel:
+                    break
+                taken = lay.takeAt(0)
+                w = taken.widget()
+                if w is not None:
+                    w.hide()
+            right = lay.getContentsMargins()[2]
+            lay.setContentsMargins(scaled_px(TITLE_LEFT_INSET), 0, right, 0)
+            lay.setSpacing(0)
+            lay.invalidate()
+            lay.activate()   # settle NOW; a title set once (no later windowTitleChanged) must align too
+        except Exception:  # pragma: no cover - defensive across qframelesswindow versions
+            pass
+
+    def showEvent(self, event):  # noqa: N802 - Qt naming
+        # Re-pin the title once the window is realised: at construction the title
+        # bar layout is not fully activated, so a title set ONCE (e.g. the console)
+        # would otherwise keep StandardTitleBar's default inset.  Idempotent.
+        super().showEvent(event)
+        self._align_title_bar()
 
     def closeEvent(self, event):
         self.hidden.emit()
