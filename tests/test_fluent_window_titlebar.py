@@ -45,15 +45,23 @@ def test_title_label_sits_on_content_column_even_after_dynamic_retitle():
     win.show()
     _settle(app)
     target = qf.scaled_px(qf.TITLE_LEFT_INSET)
-    label = win.titleBar.titleLabel
+    # FluentWindow owns the title via its OWN free-child label (the built-in one is
+    # hidden); it must sit on the body content column and TRACK the window title.
+    label = win._zlc_title
+    assert label is not None and label.isVisible()
     x0 = label.mapTo(win, QtCore.QPoint(0, 0)).x()
     assert abs(x0 - target) <= 1, f"title label x={x0}, expected content column {target}"
-    # the real GUIs re-set the window title at runtime (file name + dirty star);
-    # that must NOT push the title back to the title bar's default inset
+    assert label.text() == "Initial Title"
+    # the real GUIs re-set the window title at runtime (file name + dirty star) AND
+    # some (pulse_gui) call titleBar.setTitle right after -- none of that may move
+    # OUR label, because it is not in the title bar layout
     win.setWindowTitle("some_file_20260614 - App (new)*")
+    if win.titleBar is not None and hasattr(win.titleBar, "setTitle"):
+        win.titleBar.setTitle("some_file_20260614 - App (new)*")  # the pulse_gui double-set
     _settle(app)
     x1 = label.mapTo(win, QtCore.QPoint(0, 0)).x()
     assert abs(x1 - target) <= 1, f"after re-title, label x={x1}, expected {target}"
+    assert label.text() == "some_file_20260614 - App (new)*"
     win.close()
 
 

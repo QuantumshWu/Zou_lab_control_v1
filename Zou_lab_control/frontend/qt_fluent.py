@@ -1237,31 +1237,37 @@ class FluentWindow(FramelessWindow):
         self.setObjectName("FluentWindow")
         self.setStyleSheet(f"QWidget#FluentWindow {{ background: {BG}; }}")
 
+        self._zlc_title_bar = None
+        self._zlc_title = None
         if StandardTitleBar is not None:
             title_bar = StandardTitleBar(self)
-            title_bar.setTitle(title)
             title_bar.iconLabel.setFixedSize(0, 0)
-            title_bar.titleLabel.setAlignment(QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft)
-            title_bar.titleLabel.setStyleSheet(
-                f"""
-                QLabel {{
-                    background: transparent;
-                    color: {TEXT};
-                    font: {fluent_font_size()}pt "{FONT}";
-                    padding: 0 {scaled_px(6)}px 0 0;
-                }}
-                """
-            )
+            # FluentWindow OWNS the title rendering.  StandardTitleBar positions its
+            # own title label via an internal layout whose left inset is version
+            # dependent AND is re-activated by any later title set -- e.g. the pulse
+            # GUI's _set_gui_title() calls titleBar.setTitle() right after
+            # setWindowTitle(), which kept undoing an external alignment (console,
+            # set once, looked fine; pulse, re-set at runtime, floated to the edge).
+            # So HIDE the built-in label and draw the title ourselves with a FREE
+            # child label pinned to the body content column -- it is NOT in the title
+            # bar layout, so no title-setting path and no qframelesswindow version
+            # can move it.  Fix once here => every FluentWindow GUI is fixed alike.
+            try:
+                title_bar.titleLabel.hide()
+            except Exception:  # pragma: no cover - defensive across versions
+                pass
             self.setTitleBar(title_bar)
             self._zlc_title_bar = title_bar
-            self._align_title_bar()
-            # The wrapped GUI re-sets the window title at runtime (file name +
-            # dirty star), which RE-ACTIVATES StandardTitleBar's layout and would
-            # otherwise restore its default left inset -- the bug where the pulse
-            # GUI title floated hard against the window edge while the console title
-            # (set once, never re-activated) looked fine.  Re-align on every title
-            # change so the title ALWAYS lands on the body's left content column.
-            self.windowTitleChanged.connect(self._align_title_bar)
+            self.setWindowTitle(title)
+            self._zlc_title = QtWidgets.QLabel(title, title_bar)
+            self._zlc_title.setObjectName("zlcWindowTitle")
+            self._zlc_title.setStyleSheet(
+                f'QLabel#zlcWindowTitle {{ background: transparent; color: {TEXT};'
+                f' font: {fluent_font_size()}pt "{FONT}"; }}')
+            self._zlc_title.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+            self._zlc_title.setAlignment(QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft)
+            self._zlc_title.show()
+            self.windowTitleChanged.connect(self._zlc_title.setText)
             top_margin = scaled_px(32)
         else:
             self.setWindowTitle(title)
@@ -1286,52 +1292,40 @@ class FluentWindow(FramelessWindow):
         self.loaded.adjustSize()
         self.resize(max(scaled_px(900, minimum=680), self.loaded.width()), self.loaded.height() + top_margin)
 
-    def _align_title_bar(self, *_args) -> None:
-        """Pin the StandardTitleBar title to the body's left content column.
+    def _position_window_title(self) -> None:
+        """Keep FluentWindow's own title label pinned to the body content column.
 
-        StandardTitleBar lays out [leading spacer, icon, title, stretch, buttons].
-        The spacer/icon insets are version- and timing-dependent: nudging the title
-        label's padding worked by accident in one path (title set once) and broke in
-        another (title re-set at runtime, which re-activated the layout and changed
-        the inset).  So instead of tuning padding we make the title the FIRST item
-        at a FIXED left contents-margin equal to the body content margin -- nothing
-        variable sits to its left, so the title text lands deterministically on the
-        body column at every DPR and on every (re)title.  Idempotent."""
+        The label spans from ``TITLE_LEFT_INSET`` to just left of the first window
+        control button, vertically centred in the 32 px bar.  Being a free child of
+        the title bar (NOT in its layout), it is immune to title-set churn and to
+        qframelesswindow's version-dependent default insets -- the title therefore
+        sits on the SAME left column as the body content on every GUI and DPR."""
+        lab = getattr(self, "_zlc_title", None)
         tb = getattr(self, "_zlc_title_bar", None)
-        lay = (getattr(tb, "hBoxLayout", None) or tb.layout()) if tb is not None else None
-        if lay is None:
+        if lab is None or tb is None:
             return
         try:
-            # locate the title label; drop ONLY the leading items before it
-            # (spacer + collapsed icon).  If a foreign qframelesswindow build does
-            # not keep the title in this layout, do nothing -- never strip past it
-            # into the min/max/close buttons.
-            ti = -1
-            for i in range(lay.count()):
-                if lay.itemAt(i).widget() is tb.titleLabel:
-                    ti = i
-                    break
-            if ti < 0:
-                return
-            for _ in range(ti):
-                taken = lay.takeAt(0)
-                w = taken.widget()
-                if w is not None:
-                    w.hide()
-            right = lay.getContentsMargins()[2]
-            lay.setContentsMargins(scaled_px(TITLE_LEFT_INSET), 0, right, 0)
-            lay.setSpacing(0)
-            lay.invalidate()
-            lay.activate()   # settle NOW; a title set once (no later windowTitleChanged) must align too
+            x = scaled_px(TITLE_LEFT_INSET)
+            right = tb.width()
+            for child in tb.findChildren(QtWidgets.QAbstractButton):
+                if child.isVisible() and child.width() > 0:
+                    right = min(right, child.x())
+            lab.setGeometry(x, 0, max(0, right - x - scaled_px(8)), tb.height())
+            lab.raise_()
         except Exception:  # pragma: no cover - defensive across qframelesswindow versions
             pass
 
     def showEvent(self, event):  # noqa: N802 - Qt naming
-        # Re-pin the title once the window is realised: at construction the title
-        # bar layout is not fully activated, so a title set ONCE (e.g. the console)
-        # would otherwise keep StandardTitleBar's default inset.  Idempotent.
         super().showEvent(event)
-        self._align_title_bar()
+        self._position_window_title()
+        # the title bar / buttons may finish their geometry one event-loop tick
+        # after show; re-pin then so the right edge is computed against real button
+        # positions
+        QtCore.QTimer.singleShot(0, self._position_window_title)
+
+    def resizeEvent(self, event):  # noqa: N802 - Qt naming
+        super().resizeEvent(event)
+        self._position_window_title()
 
     def closeEvent(self, event):
         self.hidden.emit()
