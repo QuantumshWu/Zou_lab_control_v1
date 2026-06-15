@@ -1302,11 +1302,18 @@ class FluentWindow(FramelessWindow):
         if lay is None:
             return
         try:
-            # drop every item before the title label (leading spacer + collapsed icon)
-            while lay.count():
-                item = lay.itemAt(0)
-                if item.widget() is tb.titleLabel:
+            # locate the title label; drop ONLY the leading items before it
+            # (spacer + collapsed icon).  If a foreign qframelesswindow build does
+            # not keep the title in this layout, do nothing -- never strip past it
+            # into the min/max/close buttons.
+            ti = -1
+            for i in range(lay.count()):
+                if lay.itemAt(i).widget() is tb.titleLabel:
+                    ti = i
                     break
+            if ti < 0:
+                return
+            for _ in range(ti):
                 taken = lay.takeAt(0)
                 w = taken.widget()
                 if w is not None:
