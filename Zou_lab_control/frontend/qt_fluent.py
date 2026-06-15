@@ -46,6 +46,13 @@ FONT_SIZE = 12
 PADDING_V = 1
 PADDING_H = 1
 EDIT_PADDING_H = 4
+# Left column of the window body content (the standard 14 px content margin) --
+# the title is aligned to THIS column.  StandardTitleBar's content sits ~9 design
+# px right of that column (an intrinsic qframelesswindow offset, measured stable
+# across DPRs), so the title label's own left padding is the column minus that
+# offset; the two then share one left edge instead of the title floating indented.
+TITLE_LEFT_INSET = 14
+_STD_TITLEBAR_LEFT_OFFSET = 9
 COMBO_WIDTH = 16
 COMBO_TRI_SIZE = 8
 STEP_WIDTH = 6
@@ -241,30 +248,19 @@ def _baked_silhouette_shadow(key: tuple, path: QtGui.QPainterPath, width: int, h
 
 
 def _tab_widget_silhouette(widget: QtWidgets.QTabWidget):
-    """Silhouette of a FluentTabWidget: tab strip (rounded tops) + pane.
+    """Silhouette of a FluentTabWidget: ONE rounded-rect card.
 
-    The widget is NOT an opaque rounded rect -- the area right of the tabs is
-    transparent (the window background shows through), so a rounded-rect bake
-    would paint a white band there and cast shadow where the stock effect casts
-    none.  The 2 px notches between individual tabs are washed out by the blur,
-    so one strip spanning the tabs matches the stock shadow visually.
-    """
-    bar = widget.tabBar()
-    geo = bar.geometry()
-    last = bar.tabRect(bar.count() - 1) if bar.count() else QtCore.QRect(0, 0, 0, 0)
-    strip_w = min(geo.width(), last.x() + last.width())
+    The widget paints as a single white rounded card: the tab strip and the pane
+    share the card, and the area to the RIGHT of the tabs is the card (white), not
+    the window background.  Earlier this region was left transparent so the window
+    grey showed through -- which read as an ugly grey sliver beside the right-most
+    selected (white) tab.  As one opaque rounded card the shadow is clean and that
+    grey edge is gone."""
     w, h, r = widget.width(), widget.height(), _radius()
-    pane_top = geo.height()
-    key = ("tabs", w, h, pane_top, strip_w, geo.x(), geo.y(), r)
-    pane = QtGui.QPainterPath()
-    # WindingFill: overlapping subpaths must UNION (the default odd-even rule
-    # would XOR the corner square into a hole inside the pane).
-    pane.setFillRule(QtCore.Qt.WindingFill)
-    pane.addRoundedRect(0.0, float(pane_top), float(w), float(h - pane_top), float(r), float(r))
-    pane.addRect(0.0, float(pane_top), float(2 * r), float(2 * r))   # square NW corner (tabs sit on it)
-    strip = QtGui.QPainterPath()
-    strip.addRoundedRect(float(geo.x()), float(geo.y()), float(strip_w), float(geo.height() + r), float(r), float(r))
-    return key, pane.united(strip).simplified()
+    key = ("tabcard", w, h, r)
+    path = QtGui.QPainterPath()
+    path.addRoundedRect(0.0, 0.0, float(w), float(h), float(r), float(r))
+    return key, path
 
 
 class CachedDropShadow(QtWidgets.QGraphicsEffect):
@@ -833,12 +829,17 @@ class FluentTabWidget(QtWidgets.QTabWidget):
         self.setUsesScrollButtons(True)
         self.setStyleSheet(
             f"""
+            QTabWidget {{
+                background: white;
+                margin: 0px;
+                padding: 0px;
+                border-radius: {_radius()}px;
+            }}
             QTabWidget::pane {{
                 background: white;
                 margin: 0px;
                 padding: 0px;
                 border: none;
-                border-top-right-radius: {_radius()}px;
                 border-bottom-left-radius: {_radius()}px;
                 border-bottom-right-radius: {_radius()}px;
             }}
@@ -847,17 +848,15 @@ class FluentTabWidget(QtWidgets.QTabWidget):
                 border: none;
                 margin: 0px;
                 padding: 0px;
-                border-top-right-radius: {_radius()}px;
                 border-bottom-left-radius: {_radius()}px;
                 border-bottom-right-radius: {_radius()}px;
-            }}
-            QTabWidget {{
-                margin: 0px;
-                padding: 0px;
             }}
             QTabWidget::tab-bar {{
                 margin: 0px;
                 padding: 0px;
+            }}
+            QTabBar {{
+                background: transparent;
             }}
             QTabBar::tab {{
                 background: {BG};
@@ -1248,9 +1247,27 @@ class FluentWindow(FramelessWindow):
             title_bar = StandardTitleBar(self)
             title_bar.setTitle(title)
             title_bar.iconLabel.setFixedSize(0, 0)
-            # With the icon collapsed the title is the FIRST thing on the bar, so it
-            # needs a real left inset (4 px hugged the window edge) and explicit
-            # vertical centering inside the 32 px bar.
+            # StandardTitleBar lays out [leading spacer, icon, title, stretch,
+            # min/max/close].  With the icon collapsed, that FIXED leading spacer
+            # (~icon width) still pushes the title ~19 px in -- so a 14 px padding
+            # landed the title at x~33, indented PAST the window body column (x~14)
+            # and reading as a misaligned, edge-floating title.  Zero the leading
+            # spacer so the title's ONLY inset is the padding below: the title text
+            # then sits on the SAME left edge as the body content (alignment), and
+            # is vertically centred in the 32 px bar.
+            _tb_lay = getattr(title_bar, "hBoxLayout", None) or title_bar.layout()
+            if _tb_lay is not None:
+                it0 = _tb_lay.itemAt(0) if _tb_lay.count() else None
+                if it0 is not None and it0.spacerItem() is not None:
+                    it0.spacerItem().changeSize(0, 0)
+                # The collapsed icon still reserves layout width (setFixedSize(0,0)
+                # alone left ~9 px), so DROP it from the layout: the title's only
+                # remaining inset is then its padding -> it lands exactly on the
+                # body's left column.
+                _tb_lay.removeWidget(title_bar.iconLabel)
+                title_bar.iconLabel.hide()
+                _tb_lay.setSpacing(0)
+                _tb_lay.invalidate()
             title_bar.titleLabel.setAlignment(QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft)
             title_bar.titleLabel.setStyleSheet(
                 f"""
@@ -1258,7 +1275,7 @@ class FluentWindow(FramelessWindow):
                     background: transparent;
                     color: {TEXT};
                     font: {fluent_font_size()}pt "{FONT}";
-                    padding: 0 {scaled_px(6)}px 0 {scaled_px(14)}px;
+                    padding: 0 {scaled_px(6)}px 0 {scaled_px(max(0, TITLE_LEFT_INSET - _STD_TITLEBAR_LEFT_OFFSET))}px;
                 }}
                 """
             )
