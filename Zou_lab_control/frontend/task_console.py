@@ -1565,14 +1565,15 @@ class PanelEditor(QtWidgets.QWidget):
             self.meas_panel.stop_requested.connect(console._stop_measurement)
             col.addWidget(self.meas_panel)
 
-        # ---- Acquisition: the params of the FEED that PRODUCES this panel's data
-        # (a loading-image panel is produced by a LoadingFeed -> exposure /
-        # roi_radius / grid_shape / ema / *_frames), auto-discovered from the
-        # feed's __init__ signature (confocal "caller signature = source of
-        # truth").  Each field is PREFILLED with the CURRENT running value and
-        # shows it as a "now: X" reference, so you edit against what's live;
-        # Restart rebuilds the feed.  Measurement panels use the Measurement form
-        # above instead (that IS their producer), so this is skipped for them.
+        # ---- Acquisition: the editable parameters of the DATA SOURCE behind this
+        # panel.  A panel is a VIEW; the producing feed declares what its source
+        # exposes via acquisition_parameters() -- a raw-frame panel's source is the
+        # camera (exposure / ROI, reconfigured live), a loading-image panel's is
+        # the LoadingFeed analysis (exposure / roi_radius / grid / ema / *_frames,
+        # re-calibrated).  Each field is PREFILLED with the CURRENT value (with a
+        # "now: X" reference), and Apply pushes the edits to the source in place.
+        # Measurement panels use the Measurement form above instead (that IS their
+        # source), so this section is skipped for them.
         if spec is None:
             self._feed = console._producing_feed(card)
             for name, current in console._feed_params(self._feed):
@@ -1594,10 +1595,10 @@ class PanelEditor(QtWidgets.QWidget):
                 # 150 clipped its trailing 's'; 170 fits the longest name in full.
                 col.addWidget(FluentSettingRow(name, holder, label_width=scaled_px(170, minimum=140)))
             if self._feed_widgets:
-                self.feed_restart_button = FluentButton("Restart feed", color=ACCENT)
+                self.feed_restart_button = FluentButton("Apply", color=ACCENT)
                 self.feed_restart_button.setToolTip(
-                    "Rebuild the producing feed with the edited acquisition parameters\n"
-                    "and restart it (re-calibrates, like a measurement re-run).")
+                    "Apply the edited acquisition parameters to the data source in place\n"
+                    "(reconfigure the camera live, or re-calibrate) -- the panel keeps streaming.")
                 self.feed_restart_button.clicked.connect(self._restart_feed)
                 col.addWidget(self.feed_restart_button)
 
@@ -1634,47 +1635,60 @@ class PanelEditor(QtWidgets.QWidget):
         # Fit: the FULL DataFigure model set, available for EVERY kind (no
         # gating).  DataFigure picks the 1D / 2D path from the snapshot, so a 2D
         # image fits the 2D-Gaussian "2D center" model and lines fit the rest.
+        # Same [label | control] row idiom as the sections above (aligned label
+        # column), so Fit / limits don't read as a cramped one-line jumble.
+        proc_lw = scaled_px(96, minimum=72)
+
+        def _inline(*widgets, trailing=None):
+            host = QtWidgets.QWidget()
+            row = QtWidgets.QHBoxLayout(host)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(scaled_px(6, minimum=4))
+            for w in widgets:
+                row.addWidget(w, 0)
+            row.addStretch(1)
+            if trailing is not None:
+                row.addWidget(trailing, 0)
+            return host
+
         section("Fit")
-        fit_row = QtWidgets.QHBoxLayout()
         self.fit_combo = FluentComboBox()
         self.fit_combo.addItems(list(FIT_MODELS))
         self.fit_combo.setFixedWidth(scaled_px(150, minimum=120))
         self.fit_combo.setToolTip(
             "Curve-fit model (the full DataFigure set).  '2D center' fits a 2D image\n"
             "(2D Gaussian); the others fit the 1D trace.")
+        fit_btn = FluentButton("Fit", color=ACCENT)
+        fit_btn.clicked.connect(self.do_fit)
+        clear_btn = FluentButton("Clear", color=GREY)
+        clear_btn.clicked.connect(self.clear_fit)
+        # model row: the picker on the left, the Fit / Clear actions on the right.
+        model_row = _inline(self.fit_combo, trailing=fit_btn)
+        model_row.layout().addWidget(clear_btn, 0)
+        col.addWidget(FluentSettingRow("model", model_row, label_width=proc_lw))
+        # args on its OWN full-width row (it needs the room; jamming it next to
+        # the combo squeezed both).
         self.fit_cmd = FluentLineEdit("")
-        self.fit_cmd.setPlaceholderText("fit args, e.g.  p0=[1,0,1,0], B=0.1, is_fit=False")
+        self.fit_cmd.setPlaceholderText("p0=[1,0,1,0], B=0.1, is_fit=False")
         self.fit_cmd.setStyleSheet(self.fit_cmd.styleSheet() + " QLineEdit { font-family: Consolas, monospace; }")
         self.fit_cmd.setToolTip(
             "Optional fit arguments injected into the call (trusted local code):\n"
             "p0=[...] initial guess; NAME=value fixes a named parameter; is_fit=False just overlays p0.")
         self.fit_cmd.returnPressed.connect(self.do_fit)
-        fit_btn = FluentButton("Fit", color=ACCENT)
-        fit_btn.clicked.connect(self.do_fit)
-        clear_btn = FluentButton("Clear", color=GREY)
-        clear_btn.clicked.connect(self.clear_fit)
-        fit_row.addWidget(labeled("model"))
-        fit_row.addWidget(self.fit_combo)
-        fit_row.addWidget(self.fit_cmd, 1)
-        fit_row.addWidget(fit_btn)
-        fit_row.addWidget(clear_btn)
-        col.addLayout(fit_row)
+        col.addWidget(FluentSettingRow("args", self.fit_cmd, label_width=proc_lw))
 
         # manual x/y limits (DataFigure.xlim/ylim) -- NOT in Setting, so they
         # live here.  Unit + relim are deliberately ABSENT (Setting owns them).
-        ax_row = QtWidgets.QHBoxLayout()
+        section("Limits")
         self.xmin = FluentLineEdit(""); self.xmax = FluentLineEdit("")
         self.ymin = FluentLineEdit(""); self.ymax = FluentLineEdit("")
         for w in (self.xmin, self.xmax, self.ymin, self.ymax):
-            w.setFixedWidth(scaled_px(72, minimum=56))
+            w.setFixedWidth(scaled_px(88, minimum=68))   # wide enough not to clip "-0.4960"
             w.returnPressed.connect(self.apply_limits)
         apply_btn = FluentButton("Apply lim", color=ACCENT)
         apply_btn.clicked.connect(self.apply_limits)
-        ax_row.addWidget(labeled("x")); ax_row.addWidget(self.xmin); ax_row.addWidget(self.xmax)
-        ax_row.addWidget(labeled("y")); ax_row.addWidget(self.ymin); ax_row.addWidget(self.ymax)
-        ax_row.addWidget(apply_btn)
-        ax_row.addStretch(1)
-        col.addLayout(ax_row)
+        col.addWidget(FluentSettingRow("x range", _inline(self.xmin, self.xmax), label_width=proc_lw))
+        col.addWidget(FluentSettingRow("y range", _inline(self.ymin, self.ymax, trailing=apply_btn), label_width=proc_lw))
 
         self.status = FluentLabel("")
         self.status.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
@@ -1769,20 +1783,20 @@ class PanelEditor(QtWidgets.QWidget):
             self.status.setText(f"scan range set from selection: {x1:.4g} … {x2:.4g}")
 
     def _restart_feed(self) -> None:
-        """Rebuild the producing feed with the edited Acquisition params and
-        restart it; refresh the 'now:' references + re-snapshot."""
+        """Apply the edited Acquisition params to the data source IN PLACE;
+        refresh the 'now:' references + re-snapshot."""
         if self._feed is None:
             return
         new_params = {name: _text_to_py(w.text()) for name, w in self._feed_widgets.items()}
         try:
-            self._feed = self.console._restart_feed(self._feed, new_params)
+            self.console._restart_feed(self._feed, new_params)
         except Exception as exc:
-            self.status.setText(f"restart failed: {str(exc).splitlines()[0][:120]}")
+            self.status.setText(f"apply failed: {str(exc).splitlines()[0][:120]}")
             return
         for name, current in self.console._feed_params(self._feed):
             if name in self._feed_now_labels:
                 self._feed_now_labels[name].setText(f"now: {_py_to_text(current)}")
-        self.status.setText("feed restarted with new acquisition parameters")
+        self.status.setText("acquisition parameters applied to the data source")
         self.rebuild()
 
     def _df_for(self):
@@ -2107,48 +2121,23 @@ class TaskConsole(QtWidgets.QWidget):
 
     @staticmethod
     def _feed_params(feed) -> list:
-        """``[(name, current_value)]`` for a feed's TUNABLE __init__ params
-        (confocal "caller signature is the source of truth"): every keyword whose
-        current value is readable off the instance, minus the wiring args
-        (hub / camera / sequencer / prefix) and *args/**kwargs."""
-        if feed is None:
+        """``[(name, current_value)]`` for the editable parameters of the data
+        SOURCE behind ``feed`` -- a camera's exposure/ROI, or the feed's own
+        analysis settings.  The feed declares them via ``acquisition_parameters()``
+        (the source decides what is tunable, not __init__ reflection)."""
+        if feed is None or not hasattr(feed, "acquisition_parameters"):
             return []
-        import inspect
-        exclude = {"self", "hub", "camera", "sequencer", "prefix"}
-        try:
-            params = inspect.signature(type(feed).__init__).parameters
-        except (TypeError, ValueError):
-            return []
-        out = []
-        for name, p in params.items():
-            if name in exclude or p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD):
-                continue
-            if hasattr(feed, name):
-                out.append((name, getattr(feed, name)))
-        return out
+        return list(feed.acquisition_parameters().items())
 
     def _restart_feed(self, feed, new_params: dict):
-        """Rebuild ``feed``'s type with edited acquisition params (keeping the
-        wiring args + restarting at the same rate) and swap it into ``self.feeds``.
-        Returns the new feed.  Raises if the feed cannot be rebuilt."""
-        if feed is None or feed not in self.feeds:
-            return feed
-        camera = getattr(feed, "camera", None)
-        if camera is None:
-            raise RuntimeError("this panel's feed has no camera to rebuild from")
-        kwargs = {"prefix": getattr(feed, "prefix", "")}
-        sequencer = getattr(feed, "sequencer", None)
-        if sequencer is not None:
-            kwargs["sequencer"] = sequencer
-        kwargs.update(new_params)
-        rate = float(getattr(feed, "rate_hz", 4.0))
-        was_running = feed.running
-        feed.stop()
-        rebuilt = type(feed)(self.hub, camera, **kwargs)
-        self.feeds[self.feeds.index(feed)] = rebuilt
-        if was_running:
-            rebuilt.start(rate_hz=rate)
-        return rebuilt
+        """Apply edited acquisition parameters to ``feed`` IN PLACE: the feed
+        re-configures its source live (e.g. ``camera.configure``) or re-calibrates,
+        and the SAME running feed keeps publishing under the same signal names.
+        Returns the feed.  Raises if the feed has no editable acquisition params."""
+        if feed is None or not hasattr(feed, "set_acquisition_parameters"):
+            raise RuntimeError("this panel's data source exposes no editable acquisition parameters")
+        feed.set_acquisition_parameters(**new_params)
+        return feed
 
     def _edit_card(self, card: "PanelCard") -> None:
         """Open (or focus) this panel's OWN closable Edit tab (a PanelEditor).

@@ -903,50 +903,40 @@ class FluentComboBox(QtWidgets.QComboBox):
         event.ignore()
 
 
-class _FluentTabCloseButton(QtWidgets.QAbstractButton):
-    """The close affordance for a closable tab: a CENTRED "x" (two painted
-    strokes) inside a CENTRED circular hover highlight.  Painting both about the
-    same centre GUARANTEES the x and its background circle align -- a text "x"
-    in a QToolButton drifts off its rounded background by font metrics.  The
-    glyph is soft grey, darkening on hover; the circle only appears on hover /
-    press.  Frontend-owned, reused via :meth:`FluentTabWidget.add_closable_tab`."""
+class _FluentTabCloseButton(QtWidgets.QToolButton):
+    """The close affordance for a closable tab: a small "x" glyph that darkens on
+    hover with a subtle round highlight.
+
+    It draws the "x" as TEXT (``QToolButton``), not a custom ``paintEvent`` on a
+    ``QAbstractButton`` -- the latter does not composite as a ``QTabBar`` tab
+    button (it renders blank), so the close mark was invisible.  A QToolButton's
+    text is centred and the hover background is the button rect rounded to a
+    circle, so glyph and highlight are concentric by construction.  Frontend-
+    owned, reused via :meth:`FluentTabWidget.add_closable_tab`."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         size = scaled_px(18, minimum=14)
         self.setFixedSize(size, size)
+        self.setText("✕")                       # heavy multiplication x
         self.setCursor(QtCore.Qt.PointingHandCursor)
-        self.setToolTip("Close this tab")
         self.setFocusPolicy(QtCore.Qt.NoFocus)
-
-    def enterEvent(self, event):  # noqa: N802 - Qt naming
-        self.update()
-        super().enterEvent(event)
-
-    def leaveEvent(self, event):  # noqa: N802 - Qt naming
-        self.update()
-        super().leaveEvent(event)
-
-    def paintEvent(self, event):  # noqa: N802 - Qt naming
-        painter = QtGui.QPainter(self)
-        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
-        rect = QtCore.QRectF(self.rect())
-        centre = rect.center()
-        radius = min(rect.width(), rect.height()) / 2.0
-        hovered = self.underMouse() or self.isDown()
-        if hovered:                                   # centred circular highlight
-            painter.setPen(QtCore.Qt.NoPen)
-            painter.setBrush(QtGui.QColor(0, 0, 0, 70 if self.isDown() else 40))
-            painter.drawEllipse(centre, radius, radius)
-        d = radius * 0.42                             # the x: two strokes about the SAME centre
-        pen = QtGui.QPen(QtGui.QColor(TEXT if hovered else GREY))
-        pen.setWidthF(max(1.2, radius * 0.16))
-        pen.setCapStyle(QtCore.Qt.RoundCap)
-        painter.setPen(pen)
-        cx, cy = centre.x(), centre.y()
-        painter.drawLine(QtCore.QPointF(cx - d, cy - d), QtCore.QPointF(cx + d, cy + d))
-        painter.drawLine(QtCore.QPointF(cx - d, cy + d), QtCore.QPointF(cx + d, cy - d))
-        painter.end()
+        self.setToolTip("Close this tab")
+        font = self.font()
+        font.setPixelSize(max(9, int(size * 0.62)))
+        font.setBold(True)
+        self.setFont(font)
+        radius = size // 2
+        # Clearly-visible grey at rest (a near-white "x" disappears on the tab
+        # bar), darkening to TEXT on hover/press with a concentric round
+        # highlight -- subtle, not the harsh native red X.
+        self.setStyleSheet(
+            f"""
+            QToolButton {{ border: none; background: transparent; color: #6E6E6E; padding: 0px; }}
+            QToolButton:hover {{ background: rgba(0, 0, 0, 38); border-radius: {radius}px; color: {TEXT}; }}
+            QToolButton:pressed {{ background: rgba(0, 0, 0, 64); border-radius: {radius}px; color: {TEXT}; }}
+            """
+        )
 
 
 class FluentTabWidget(QtWidgets.QTabWidget):

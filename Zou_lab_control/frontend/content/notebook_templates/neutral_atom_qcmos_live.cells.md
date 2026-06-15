@@ -49,32 +49,20 @@ zf.plot(np.column_stack([xx.ravel(), yy.ravel()]), frame.ravel(),
         kind="2d", labels=("X (px)", "Y (px)", "counts"))
 
 <!-- cell:markdown -->
-## 3. 实时 2D：一个抓帧 feed + task console
+## 3. 实时 2D：CameraFrameFeed + task console
 
-写一个最小的 `ExperimentFeed`：每个 shot 抓一帧、publish 成信号 `frame`。task console 的 **2D image** 面板默认就读 `frame`，所以开一个**只有一张 live 2D** 的看板即可。
+框架自带 `CameraFrameFeed`：每个 shot 抓一帧、publish 成信号 `frame`。它的**数据源就是相机**——在看板里点这张 2D 面板的 **Edit…**，标签里的 **Acquisition** 段会列出相机的 `exposure` / `roi`，改了点 **Apply** 就**实时重配相机**（不用重开）。task console 的 **2D image** 面板默认读 `frame`，所以开一个**只有一张 live 2D** 的看板即可。
 
-`%gui qt` 让 Jupyter 在 cell 之间替 Qt 窗口跑事件循环（看板的刷新 timer 才会动）；抓帧在 feed 自己的后台线程里，通过线程安全的 `SignalHub` 交给看板——这正是 task console 的设计。`rate_hz` 是抓帧节奏，真正多快还受你的触发频率 + 曝光限制。
+`%gui qt` 让 Jupyter 在 cell 之间替 Qt 窗口跑事件循环（看板的刷新 timer 才会动）；抓帧在 feed 的后台线程里，经线程安全的 `SignalHub` 交给看板。`rate_hz` 是抓帧节奏，真正多快还受触发频率 + 曝光限制。
 
 <!-- cell:code -->
 %gui qt
 
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
-from Zou_lab_control.neutral_atom.operations.feeds import ExperimentFeed
-
-
-class FrameFeed(ExperimentFeed):
-    """每 shot 抓一帧 qCMOS 图，publish 成 'frame'（task console 的 2D 面板读它）。"""
-
-    def __init__(self, hub, camera, *, prefix=""):
-        super().__init__(hub, prefix=prefix)
-        self.camera = camera
-
-    def shot(self):
-        return {"frame": self.camera.acquire(1)[0]}
-
+from Zou_lab_control.neutral_atom.operations.feeds import CameraFrameFeed
 
 hub = SignalHub()
-feed = FrameFeed(hub, cam).start(rate_hz=4)
+feed = CameraFrameFeed(hub, cam).start(rate_hz=4)
 
 state = zf.TaskConsoleState(
     name="qcmos_live",

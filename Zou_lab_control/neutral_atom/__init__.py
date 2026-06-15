@@ -76,6 +76,7 @@ from .timing import (
 from .timing.verilog import VerilogBuild, VerilogFiles, generate_verilog, write_verilog_bundle
 from .devices import DEFAULT_CHANNELS, VirtualCamera, VirtualSequencer, VirtualTrapArray, virtual_config, write_virtual_run
 from .operations import (
+    CameraFrameFeed,
     ExperimentFeed,
     LoadingFeed,
     MeasurementSpec,
@@ -181,6 +182,7 @@ __all__ = [
     "DetectionResult",
     "DetectionTimeScanResult",
     "DeviceSet",
+    "CameraFrameFeed",
     "ExperimentFeed",
     "ExperimentSubsystem",
     "FidelityEstimate",

@@ -2,7 +2,7 @@
 
 from .calibration import calibrate_sitemap_from_images, calibrate_threshold_from_images
 from .detection import detect_image
-from .feeds import ExperimentFeed, LoadingFeed, ScannedMeasurementFeed
+from .feeds import CameraFrameFeed, ExperimentFeed, LoadingFeed, ScannedMeasurementFeed
 from .fidelity import (
     FidelityReport,
     ReferenceLabels,
@@ -47,6 +47,7 @@ __all__ = [
     "calibrate_sitemap_from_images",
     "calibrate_threshold_from_images",
     "characterize_readout",
+    "CameraFrameFeed",
     "detect_image",
     "discovered_specs",
     "ExperimentFeed",

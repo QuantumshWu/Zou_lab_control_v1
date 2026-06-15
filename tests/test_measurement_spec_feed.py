@@ -195,3 +195,47 @@ def test_temperature_feed_start_thread_auto_stops_when_scan_completes():
     y = hub.latest(spec.y_key)
     assert y.shape == (4,)
     assert np.all(np.isfinite(y))
+
+
+# ------------------------------------------------ acquisition-parameter protocol
+
+
+def test_camera_frame_feed_exposes_camera_params_and_applies_them_live():
+    """A panel is a VIEW; the feed's SOURCE owns the editable params.  A raw-frame
+    feed's source is the camera, so acquisition_parameters() reports the camera's
+    exposure and set_acquisition_parameters() reconfigures the camera in place --
+    no rebuild, same feed keeps publishing 'frame'."""
+    exp = na.connect("virtual")
+    cam = exp.devices.camera
+    hub = SignalHub()
+    feed = na.CameraFrameFeed(hub, cam)
+
+    assert feed.published_signals() == frozenset({"frame"})
+    params = feed.acquisition_parameters()
+    assert "exposure" in params and params["exposure"] == float(cam.exposure)
+
+    feed.set_acquisition_parameters(exposure=0.05)
+    assert float(cam.exposure) == 0.05                      # applied to the camera in place
+    assert feed.acquisition_parameters()["exposure"] == 0.05
+
+    feed.step()
+    frame = hub.latest("frame")
+    assert np.ndim(frame) == 2                              # a real 2-D camera frame
+
+
+def test_loading_feed_acquisition_params_reapply_in_place():
+    """LoadingFeed's source is its own analysis; editing a param re-calibrates the
+    SAME running feed (no instance swap)."""
+    exp = na.connect("virtual", sitemap={"grid_shape": (5, 7)})
+    hub = SignalHub()
+    feed = na.LoadingFeed(hub, exp.devices.camera, sequencer=exp.devices.sequencer, grid_shape=(5, 7))
+    params = feed.acquisition_parameters()
+    for key in ("exposure", "roi_radius", "grid_shape", "ema", "calibration_frames", "threshold_frames"):
+        assert key in params
+
+    same = feed
+    feed.set_acquisition_parameters(roi_radius=2)
+    assert feed is same                                     # in place, not a new instance
+    assert feed.roi_radius == 2
+    assert feed.acquisition_parameters()["roi_radius"] == 2
+    assert len(feed.centers) > 0 and feed.thresholds.shape[0] == len(feed.centers)  # re-calibrated

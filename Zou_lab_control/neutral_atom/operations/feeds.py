@@ -100,6 +100,23 @@ class ExperimentFeed:
         a fixed signal set override this; the base publishes nothing structured."""
         return frozenset()
 
+    # --------------------------------------------------- acquisition parameters
+    # A panel is a VIEW; the feed is the producer; behind the feed sits the data
+    # SOURCE (a camera, or the feed's own analysis).  A panel's Edit tab edits the
+    # source through these two methods, so e.g. a raw-frame panel can tune the
+    # camera's exposure/ROI.  The source -- not __init__ reflection -- decides
+    # what is editable.
+    def acquisition_parameters(self) -> dict[str, object]:
+        """Editable parameters of the data SOURCE behind this feed, as
+        ``{name: current_value}`` (e.g. a camera's ``exposure``/``roi``, or this
+        feed's analysis settings).  Default: nothing editable."""
+        return {}
+
+    def set_acquisition_parameters(self, **values) -> None:
+        """Apply edited acquisition parameters IN PLACE (re-configure the source
+        live, or re-calibrate); the same running feed keeps publishing.  Default:
+        no editable parameters, nothing to do."""
+
 
 class LoadingFeed(ExperimentFeed):
     """Atom-loading experiment producer over the :class:`CameraDevice` contract.
@@ -149,13 +166,19 @@ class LoadingFeed(ExperimentFeed):
         # the feed with edited acquisition parameters.
         self.calibration_frames = int(calibration_frames)
         self.threshold_frames = int(threshold_frames)
-        # Two backend-neutral sequences, built ONCE: an all-sites template (the
-        # virtual camera renders every trap occupied for ``name="sitemap"``; real
-        # hardware runs its deterministic-fill template) and a per-shot readout
-        # with fresh loading (``load=True`` -> the camera reloads each frame).
+        self._calibrate()
+
+    def _calibrate(self) -> None:
+        """(Re)build the imaging sequences and self-calibrate from fresh frames:
+        site centers from an all-sites template, per-site Otsu thresholds from
+        sample frames -- the SAME primitives the real readout uses.  Run at
+        construction and whenever the acquisition parameters change."""
+        # Two backend-neutral sequences: an all-sites template (the virtual camera
+        # renders every trap occupied for ``name="sitemap"``; real hardware runs
+        # its deterministic-fill template) and a per-shot readout with fresh
+        # loading (``load=True`` -> the camera reloads each frame).
         self._sitemap_seq = imaging_sequence(exposure=self.exposure, load=True, name="sitemap")
         self._readout_seq = imaging_sequence(exposure=self.exposure, load=True, name="readout")
-        # --- self-calibration through the contract, SAME primitives as the real readout ---
         template = self._acquire(max(1, self.calibration_frames), self._sitemap_seq)
         average = np.mean([np.asarray(img, dtype=float) for img in template], axis=0)
         self.centers = find_site_centers(average, self.grid_shape)
@@ -164,6 +187,34 @@ class LoadingFeed(ExperimentFeed):
         self.thresholds = np.asarray(estimate_thresholds(samples, self.centers, radius=self.roi_radius), dtype=float)
         self._rate_sites = np.full(self.n_sites, np.nan)
         self._rate = float("nan")
+
+    def acquisition_parameters(self) -> dict[str, object]:
+        """The atom-loading analysis settings this feed applies to camera frames."""
+        return {
+            "grid_shape": self.grid_shape,
+            "exposure": self.exposure,
+            "roi_radius": self.roi_radius,
+            "ema": self.ema,
+            "calibration_frames": self.calibration_frames,
+            "threshold_frames": self.threshold_frames,
+        }
+
+    def set_acquisition_parameters(self, **values) -> None:
+        """Update the analysis settings and re-calibrate in place (the running
+        feed keeps publishing under the same signal names)."""
+        if "grid_shape" in values:
+            self.grid_shape = grid_shape_tuple(values["grid_shape"])
+        if "exposure" in values:
+            self.exposure = float(values["exposure"])
+        if "roi_radius" in values:
+            self.roi_radius = int(values["roi_radius"])
+        if "ema" in values:
+            self.ema = float(values["ema"])
+        if "calibration_frames" in values:
+            self.calibration_frames = int(values["calibration_frames"])
+        if "threshold_frames" in values:
+            self.threshold_frames = int(values["threshold_frames"])
+        self._calibrate()
 
     def _acquire(self, frames: int, sequence) -> list[np.ndarray]:
         return self.camera.acquire(positive_int(frames, "frames"), sequence=sequence, sequencer=self.sequencer)
@@ -195,6 +246,45 @@ class LoadingFeed(ExperimentFeed):
         keys = ("frame", "counts", "occupied", "rate", "rate_sites", "rate_grid",
                 "centers", "thresholds", "shot")
         return frozenset(self.prefix + key for key in keys)
+
+
+class CameraFrameFeed(ExperimentFeed):
+    """Stream RAW camera frames into the hub: one ``frame`` signal per shot, no
+    site analysis.  The data SOURCE is the camera itself, so the editable
+    acquisition parameters ARE the camera's own settings -- ``exposure`` and
+    ``roi`` -- and a panel's Edit tab applies them by reconfiguring the camera
+    live (``camera.configure``), no rebuild.  Backend-agnostic: identical with a
+    real camera or a ``VirtualCamera``; only the ``camera`` differs.  Drive a 2D
+    ``frame`` panel with it to watch a live image while tuning exposure/ROI."""
+
+    def __init__(self, hub: SignalHub, camera: CameraDevice, *, sequencer: object | None = None, prefix: str = ""):
+        super().__init__(hub, prefix=prefix)
+        self.camera = camera
+        self.sequencer = sequencer
+
+    def shot(self) -> dict[str, object]:
+        frame = self.camera.acquire(1, sequencer=self.sequencer)[-1]
+        return {"frame": np.asarray(frame, dtype=float)}
+
+    def published_signals(self) -> frozenset:
+        return frozenset({self.prefix + "frame"})
+
+    def acquisition_parameters(self) -> dict[str, object]:
+        params: dict[str, object] = {"exposure": float(self.camera.exposure)}
+        roi = getattr(getattr(self.camera, "config", None), "roi", None)
+        if roi is not None:
+            params["roi"] = list(roi)
+        return params
+
+    def set_acquisition_parameters(self, **values) -> None:
+        kw: dict[str, object] = {}
+        if "exposure" in values:
+            kw["exposure"] = float(values["exposure"])
+        if "roi" in values:
+            roi = values["roi"]
+            kw["roi"] = None if roi in (None, "", "None") else list(roi)
+        if kw:
+            self.camera.configure(**kw)   # live on the camera -- no rebuild
 
 
 class ScannedMeasurementFeed(ExperimentFeed):
@@ -322,4 +412,4 @@ class ScannedMeasurementFeed(ExperimentFeed):
         return frozenset(self.prefix + key for key in keys)
 
 
-__all__ = ["ExperimentFeed", "LoadingFeed", "ScannedMeasurementFeed"]
+__all__ = ["CameraFrameFeed", "ExperimentFeed", "LoadingFeed", "ScannedMeasurementFeed"]

@@ -200,7 +200,7 @@ value = rate_grid - b_rate_grid        # 两个实验相减 -> 2D
 对外接口只有 \pyapi{panel\_plot(data, kind=, size=)} 与 \pyapi{panel\_plot\_spec(size)}：\tfocus{尺寸是唯一旋钮}，几何/dpi/边距不可外部配置（\pyapi{panel\_size\_cells} 校验尺寸，非预设抛错）。
 
 \section{显示缩放:qt\_canvas 三不变量}
-面板图通过 \pyapi{qt\_canvas.panel\_canvas(figure)} 嵌入，封装常数 \pyapi{PANEL\_DISPLAY\_SCALE=0.7}。\pyapi{EmbeddedFigureCanvas} 维持三条不变量（在 QT\_SCALE\_FACTOR 1.0/1.25/1.5 三档离屏复现+验证）：① figure inches 构造后永不变；② \pyapi{fig.dpi} = 设计 dpi $\times$ 真实屏幕比例（标准 retina，显示因子绝不进 dpi）；③ 控件逻辑尺寸 = 设计 px $\times$ display\_scale。\pyapi{resizeEvent} 故意不从控件尺寸反推 figure——这是高 DPI 真机布局曾经崩坏的根因修复（见性能/契约章）。
+面板图通过 \pyapi{qt\_canvas.panel\_canvas(figure)} 嵌入，封装常数 \pyapi{PANEL\_DISPLAY\_SCALE=0.7}。\pyapi{EmbeddedFigureCanvas} 维持三条不变量（在 QT\_SCALE\_FACTOR 1.0/1.25/1.5 三档离屏复现+验证）：① figure inches 构造后永不变；② \pyapi{fig.dpi} = 设计 dpi $\times$ 真实屏幕比例（标准 retina，显示因子绝不进 dpi）；③ 控件逻辑尺寸 = 设计 px $\times$ display\_scale。\pyapi{resizeEvent} 故意不从控件尺寸反推 figure——这是高 DPI 屏幕下布局不变形的关键（见性能/契约章）。
 
 
 \chapter{卡片与布局}
@@ -212,12 +212,12 @@ value = rate_grid - b_rate_grid        # 两个实验相减 -> 2D
 图本身=plot 区域+边距，边距不随数据区折半，所以\tfocus{光靠 canvas 永远对不齐网格}。卡框的状态行区按行数\tfocus{吸收这点差额}：\pyapi{\_card\_size(size) = rows$\times$pitch\_y - gap}，使得\tfocus{一张 2x2 卡严格等于两张 1x2 卡叠起来加一道间隙}（竖直 pitch 323、水平 259，契约测试锁定 \pyapi{2$\times$315+8 == 638}）。任意尺寸混排严丝合缝。
 
 \section{拖动吸附 + 重力压实}
-排版不用填行列数字：\tfocus{按住卡片边框（画布以外的空白）拖动}，松手 \pyapi{\_pos\_to\_slot} 吸附到网格槽并写回 config。布局走\tfocus{重力压实}（\pyapi{\_compact}）——每张卡按读序（row→col）在\tfocus{自己的列内向上落}到上方卡或顶端为止。这\tfocus{一条规则同时}做了两件事：卡总是落在与它共列的卡\tfocus{严格下方}（无重叠），且\tfocus{不悬空在空位之上}（无竖向空隙），所以结果恒为顶部紧凑、无洞的网格。刚拖动的 \pyapi{active} 卡\tfocus{平局优先}——保住放下的列/行，其余卡绕它回流。\tfocus{设计改动}：旧版 \pyapi{\_resolve\_collisions} 只把被压的卡\tfocus{向下推}，能消重叠却\tfocus{留洞}、且反复拖动会让整板持续下移；压实把"下推"换成"上落"，删卡或拖走后的空位被自动回填。
+排版不用填行列数字：\tfocus{按住卡片边框（画布以外的空白）拖动}，松手 \pyapi{\_pos\_to\_slot} 吸附到网格槽并写回 config。布局走\tfocus{重力压实}（\pyapi{\_compact}）——每张卡按读序（row→col）在\tfocus{自己的列内向上落}到上方卡或顶端为止。这\tfocus{一条规则同时}做了两件事：卡总是落在与它共列的卡\tfocus{严格下方}（无重叠），且\tfocus{不悬空在空位之上}（无竖向空隙），所以结果恒为顶部紧凑、无洞的网格。刚拖动的 \pyapi{active} 卡\tfocus{平局优先}——保住放下的列/行，其余卡绕它回流。删卡或拖走后留下的空位被自动回填，整板始终顶部紧凑、无洞。
 
 
 \chapter{Setting 弹窗:瘦身后的基本配置}
 
-\tfocus{设计改动（无后向兼容）}：Setting 弹窗按 confocal\_gui 的\tfocus{竖排范式}重做——粗体小标题占独立一行 \pyapi{FluentSectionLabel}，下方每行 \pyapi{[64px 标签 | 控件]}（\pyapi{FluentSettingRow}）；原先的 Fit 区与 relim 全部迁到\tfocus{每面板的 Edit 标签}（见第 \ref{ch:control} 章）。轻量、高频的"换数据/换显示/切单位/钉 lim"留在 Setting 即时生效；重量级处理（命令行拟合 / relim / Measurement）集中到该面板的 Edit 标签。
+Setting 弹窗按 confocal\_gui 的\tfocus{竖排范式}排布——粗体小标题占独立一行 \pyapi{FluentSectionLabel}，下方每行 \pyapi{[64px 标签 | 控件]}（\pyapi{FluentSettingRow}）。轻量、高频的"换数据 / 换显示 / 切单位 / 钉 lim"留在 Setting 即时生效；重量级处理（命令行拟合 / relim / Measurement）在\tfocus{每面板的 Edit 标签}（见第 \ref{ch:control} 章），避免弹窗过载。
 
 卡片标题行的 \pyapi{Setting} 按钮打开该面板的设置弹窗（confocal 风格），从上到下五段——\tfocus{Source / Display / Unit / Limits / Panel，全部即时生效}：
 
@@ -254,10 +254,10 @@ Setting 改的每一项——\pyapi{size}、\pyapi{colormap}、声明式参数�
 \chapter{Monitor 标签页 + 每面板 Edit 架构}
 \label{ch:control}
 
-\tfocus{设计改动（取代旧 Dashboard / Panel Editor + 旧单实例 Processing + 旧空 Control 标签，无后向兼容）}：控制台是一个 \pyapi{FluentTabWidget}，只有\tfocus{一个常驻标签} + \tfocus{按需的每面板 Edit 标签}：
+控制台是一个 \pyapi{FluentTabWidget}，只有\tfocus{一个常驻标签} + \tfocus{按需的每面板 Edit 标签}：
 \begin{description}
-  \item[\pyapi{Monitor}（默认、唯一常驻，不可关）] = 拖拽 live 网格，纯做\tfocus{实时监控}。面板、Setting（瘦身后基本控件）、拖动吸附 + 重力压实都在这里。
-  \item[新建测量面板 = 从 \pyapi{Add Panel}] 标题栏的 \pyapi{Add Panel} 下拉除了 6 种 plot kind，还\tfocus{自动列出项目里每个可用 measurement}（来自 \pyapi{measurement\_specs()} 的\tfocus{自动发现目录}——内置 + 任何 \pyapi{@measurement}/\pyapi{register\_measurement} 的,见"自动发现的测量目录"节）；选一个就在 Monitor 板建结果面板\tfocus{并打开它的 Edit}。\tfocus{没有空的全局 Control 标签}——旧设计里无测量时它是一块空白占位，已删。
+  \item[\pyapi{Monitor}（默认、唯一常驻，不可关）] = 拖拽 live 网格，纯做\tfocus{实时监控}。面板、Setting（基本配置控件）、拖动吸附 + 重力压实都在这里。
+  \item[新建测量面板 = 从 \pyapi{Add Panel}] 标题栏的 \pyapi{Add Panel} 下拉除了 6 种 plot kind，还\tfocus{自动列出项目里每个可用 measurement}（来自 \pyapi{measurement\_specs()} 的\tfocus{自动发现目录}——内置 + 任何 \pyapi{@measurement}/\pyapi{register\_measurement} 的，见"自动发现的测量目录"节）；选一个就在 Monitor 板建结果面板\tfocus{并打开它的 Edit}。测量从这里发起，没有单独的全局发起器标签。
   \item[每面板 \pyapi{Edit} 标签（\pyapi{PanelEditor}，可关闭）] = 点面板的 \pyapi{Edit…} 多开一个\tfocus{可关闭标签}（右上一个\tfocus{柔和的自定义 × 关闭键}，灰色悬停才高亮，非刺眼原生红叉），承载\tfocus{那个面板专属}的：plot 的 API 参数（自动发现）+ 全套 data\_figure 拟合 + 手动 x/y lim + Save Fig；\tfocus{measurement 结果面板}还内嵌该测量的参数表单 + Start——\tfocus{改参数 Start 即用新参数重跑这张面板}。多个面板可同时各开一个 Edit，互不影响。
 \end{description}
 理由：严格落实"\tfocus{每个面板各自 edit、方便实验}"的设计意图；可关闭标签复用 \pyapi{FluentTabWidget.add\_closable\_tab}（frontend 件，自定义柔和关闭键；裸 \pyapi{addTab} 无关闭键，故脉冲 GUI 的 Edit/Preview/Scan 三页\tfocus{永不可关}）；Edit 内容\tfocus{不与 Setting 重叠}（源/尺寸/colormap/relim/unit 只在 Setting，功能参数只在 Edit）。
@@ -269,7 +269,7 @@ Setting 改的每一项——\pyapi{size}、\pyapi{colormap}、声明式参数�
 \end{figure}
 
 \section{每面板 Edit:冻结快照模型(关键设计)}
-点面板 \pyapi{Edit…} 打开它的 Edit 标签时，\pyapi{PanelEditor} \tfocus{绑定该面板当前数据的一份快照}——用 \pyapi{panel\_plot} \tfocus{照搬 Monitor 那张卡的 size}（\pyapi{size=card.config.size}，与活面板\tfocus{同尺寸}）重建一个\tfocus{独立的 plotter}（不是 Monitor 卡那个），整页放进 \pyapi{FluentScrollArea}（快照再大也不裁底部控件——根治旧单实例无滚动的 cutoff）。\tfocus{曾踩的坑}：强塞一个固定 \pyapi{2x4}（约 797px）会撑破窄视区导致快照 cutoff——照搬 Monitor size 后此问题消失。\tfocus{选择器只在 Edit 启用}：Edit 快照 \pyapi{interactions=True}（缩放/拖阈值线/\pyapi{AreaSelector} 框选），Monitor 卡 \pyapi{interactions=False} + \pyapi{isolate\_wheel=False}（滚轮滚仪表盘、不被框选吞）。理由：
+点面板 \pyapi{Edit…} 打开它的 Edit 标签时，\pyapi{PanelEditor} \tfocus{绑定该面板当前数据的一份快照}——用 \pyapi{panel\_plot} \tfocus{照搬 Monitor 那张卡的 size}（\pyapi{size=card.config.size}，与活面板\tfocus{同尺寸}）重建一个\tfocus{独立的 plotter}（不是 Monitor 卡那个），整页放进 \pyapi{FluentScrollArea}，所以快照再大也不会把底部控件挤出可视区，且快照与活面板尺寸一致。\tfocus{选择器只在 Edit 启用}：Edit 快照 \pyapi{interactions=True}（缩放 / 拖阈值线 / \pyapi{AreaSelector} 框选），Monitor 卡 \pyapi{interactions=False} + \pyapi{isolate\_wheel=False}（滚轮滚仪表盘、不被框选吞）。理由：
 \begin{itemize}
   \item 天然契合"\tfocus{冻结细看}"工作流：看的是一帧定格快照，不会被实时刷新搅动（\pyapi{Refresh} 才重抓）。
   \item \tfocus{不打扰仪表盘}：拟合/改范围都作用在 Edit 自己的图上，Monitor 照常实时刷新。
@@ -278,7 +278,7 @@ Setting 改的每一项——\pyapi{size}、\pyapi{colormap}、声明式参数�
 
 \section{Edit 控件(详细参考 confocal)}
 \begin{description}
-  \item[Acquisition（驱动该面板的采集 feed 参数）] 普通（非 measurement）面板——如 Loading image——的数据来自一个后台 \pyapi{ExperimentFeed}（如 \pyapi{LoadingFeed}）。Edit 顶部\tfocus{自动发现该 feed 的采集参数}并铺成控件：\pyapi{\_producing\_feed(card)} 用 \pyapi{feed.published\_signals()} $\cap$ 面板表达式引用的信号名反查“谁产这张图依赖的信号”，\pyapi{\_feed\_params(feed)} 再 \pyapi{inspect.signature} 取构造参数（减 \pyapi{self/hub/camera/sequencer/prefix}，从实例 \pyapi{getattr} 读当前值）。每格预填当前值并在下标 \pyapi{now: <值>} 供改参参照；\pyapi{Restart feed} 经 \pyapi{\_restart\_feed} 用新参数 \pyapi{type(feed)(...)} 重建、在 \pyapi{self.feeds} 原位热替换并按原 \pyapi{rate\_hz} 重启（同一信号名，活面板无缝续刷）。\tfocus{填上了“Loading image 打开 0 参数”的洞}——API 里有的采集参数这里都能调。
+  \item[Acquisition（编辑数据源的采集参数）] 一个 plot 面板是\tfocus{视图}；它的数据由一个 \pyapi{ExperimentFeed} 生产，feed 背后是\tfocus{数据源}——相机本身，或 feed 自己的分析。Edit 顶部列出\tfocus{数据源的可编辑参数}：\pyapi{\_producing\_feed(card)} 用 \pyapi{feed.published\_signals()} $\cap$ 面板表达式引用的信号名找到产这张图的 feed，feed 经 \pyapi{acquisition\_parameters()} \tfocus{自报}哪些可调（\tfocus{由源决定}，不靠反射 \pyapi{\_\_init\_\_}）。一张原始相机帧面板的源是相机（\pyapi{CameraFrameFeed}），列出 \pyapi{exposure} / \pyapi{roi}；一张装载图面板的源是它的分析（\pyapi{LoadingFeed}），列出 \pyapi{exposure} / \pyapi{roi\_radius} / \pyapi{grid\_shape} / \pyapi{ema} / \pyapi{*\_frames}。每格预填当前值并在下标 \pyapi{now: <值>} 供改参参照；点 \pyapi{Apply} 经 \pyapi{set\_acquisition\_parameters(...)} 把改动\tfocus{原地}推给源——相机就 \pyapi{camera.configure(...)} 实时重配，分析参数就重标定——同一 feed 以同一信号名继续发布。
   \item[Parameters（plot 的 API 参数）] 该面板 plot 调用的\tfocus{可变参数}自动铺成 GUI 控件（\pyapi{length}/\pyapi{bins}/\pyapi{centers}/\pyapi{image}……，从该 kind 的声明 \pyapi{PANEL\_PARAMS}\tfocus{自动发现}，复用 \pyapi{\_make\_param\_widget}）；改一下经 \pyapi{card.\_set\_param} \tfocus{实时重渲染}活面板并重抓 Edit 快照。\pyapi{cmap}（\pyapi{display=True}）是唯一留在 Setting 的；其余 \pyapi{display=False} 的功能参数都在这里——两边永不重复。
   \item[Fit（全套 data\_figure，不门控）] 模型下拉是\tfocus{完整的 DataFigure 集合}：Lorentzian / Gaussian / Lorentzian (Zeeman) / Rabi / Exp decay / \tfocus{2D center}，\tfocus{对所有 plot 类型都可用}（DataFigure 从快照自取 1D/2D 路径——2D 图用 2D 高斯 \pyapi{center} 拟合，其余拟合 1D 轨迹）。一行\tfocus{自由文本参数}注入拟合调用（\pyapi{eval(f"\_df.\{method\}(\{cmd\})")}，与 confocal 的 \pyapi{:} 框同理）：\pyapi{p0=[...]} 初值、\pyapi{名字=值} 固定、\pyapi{is\_fit=False} 只叠加。\pyapi{Clear} 移除；底层 \pyapi{DataFigure}。
   \item[手动 x/y lim] 四框 + \pyapi{Apply lim}（\pyapi{DataFigure.xlim/ylim}）；打开时自动回填当前坐标范围。\tfocus{relim/unit 不在 Edit}——它们在 Setting，避免重复。
@@ -287,14 +287,14 @@ Setting 改的每一项——\pyapi{size}、\pyapi{colormap}、声明式参数�
 \end{description}
 
 \begin{notebox}
-\textbf{坑（已修）}：Edit 不能用 \pyapi{card.\_set\_param} 改 Monitor 卡——它内部 \pyapi{\_reset\_plot} 会把 Monitor 卡的 plotter 置 None，随后从 \pyapi{card.plotter} 读快照就会崩。\pyapi{PanelEditor} 持有\tfocus{自己的}独立 plotter/\pyapi{DataFigure}，只读 \pyapi{card.plotter} 取数据,与 Monitor 卡解耦。另:Edit 标签关闭时若它正承载在跑的 measurement,需把 \pyapi{\_active\_meas\_panel} 复位,避免把状态写进已删的表单。
+\textbf{解耦要点}：\pyapi{PanelEditor} 持有\tfocus{自己的}独立 plotter / \pyapi{DataFigure}，只\tfocus{读} \pyapi{card.plotter} 取数据，与 Monitor 卡解耦——它不通过 \pyapi{card.\_set\_param} 去改 Monitor 卡（那条路径会 \pyapi{\_reset\_plot} 把 Monitor 卡的 plotter 置 None，Edit 的快照随即失去依据）。Edit 标签关闭时若它正承载在跑的 measurement，会把 \pyapi{\_active\_meas\_panel} 复位，避免把状态写进已销毁的表单。
 \end{notebox}
 
 
 \chapter{通用 Measurement 框架}
 \label{ch:measurement}
 
-这是本轮最大的新增能力：把"\tfocus{扫一个被绑定的脉冲参数、每点采几帧、把帧约简成一个数（或逐站点向量）做成 live 曲线}"抽象成\tfocus{一套引擎}，让读出时长$\to$保真度、release-recapture 测温这类测量\tfocus{都是同一形状}，而不是各写一份扫描循环。代码在 \filepath{operations/measurement.py}（引擎 + 声明）、\filepath{operations/feeds.py}（feed 包装）、\filepath{subsystems/readout.py}（单一真相源建器 + 目录）。
+通用 Measurement 框架把"\tfocus{扫一个被绑定的脉冲参数、每点采几帧、把帧约简成一个数（或逐站点向量）做成 live 曲线}"抽象成\tfocus{一套引擎}，让读出时长$\to$保真度、release-recapture 测温这类测量\tfocus{都是同一形状}，而不必各写一份扫描循环。代码在 \filepath{operations/measurement.py}（引擎 + 声明）、\filepath{operations/feeds.py}（feed 包装）、\filepath{subsystems/readout.py}（单一真相源建器 + 目录）。
 
 \section{三角色解耦:Axis × Plan × Reducer}
 一个被扫描的测量，差别只在三件事，各抽成一个角色：
@@ -321,7 +321,7 @@ Setting 改的每一项——\pyapi{size}、\pyapi{colormap}、声明式参数�
 \end{description}
 
 \section{自动发现的测量目录:开放注册表}
-\pyapi{ReadoutSubsystem.measurement\_specs()} 返回 GUI 能驱动的测量目录,但它\tfocus{不再是写死的 list}——而是由开放注册表 \filepath{operations/measurement\_registry.py} 装配:\pyapi{operations/measurements/} 包里\tfocus{每个 \pyapi{@measurement} 装饰的工厂} + notebook 里 \pyapi{register\_measurement(...)} 注册的临时工厂。一个测量工厂是 \pyapi{build(readout) -> MeasurementSpec},接收 readout 子系统(于是 spec 的 \pyapi{build} 闭包能捕获 session、复用子系统建器)。\pyapi{discovered\_specs(readout)} 首次调用时 \pyapi{pkgutil} 把整个包逐模块导入一遍(每个 \pyapi{@measurement} 随之注册),之后用 readout 现造每个 spec,按 \pyapi{order}(内置在前)再注册序排序、按 \pyapi{name} 去重(后注册覆盖)。
+\pyapi{ReadoutSubsystem.measurement\_specs()} 返回 GUI 能驱动的测量目录,由开放注册表 \filepath{operations/measurement\_registry.py} \tfocus{自动发现}装配:\pyapi{operations/measurements/} 包里\tfocus{每个 \pyapi{@measurement} 装饰的工厂} + notebook 里 \pyapi{register\_measurement(...)} 注册的临时工厂。一个测量工厂是 \pyapi{build(readout) -> MeasurementSpec},接收 readout 子系统(于是 spec 的 \pyapi{build} 闭包能捕获 session、复用子系统建器)。\pyapi{discovered\_specs(readout)} 首次调用时 \pyapi{pkgutil} 把整个包逐模块导入一遍(每个 \pyapi{@measurement} 随之注册),之后用 readout 现造每个 spec,按 \pyapi{order}(内置在前)再注册序排序、按 \pyapi{name} 去重(后注册覆盖)。
 
 \tfocus{加一个新测量 = 往 \pyapi{operations/measurements/} 丢一个 \pyapi{@measurement} 文件}(或 notebook 里 \pyapi{na.register\_measurement(...)}),它就\tfocus{自动出现在 Add Panel 列表里}可被选中连接——没有任何"目录 list"要改,内置的温度/读出时长两个 spec 也住在这个包里、与新测量平权。下划线开头的模块(如 \pyapi{\_helpers.py})被发现机制跳过,可放包内私有助手。
 
@@ -349,7 +349,7 @@ Setting 改的每一项——\pyapi{size}、\pyapi{colormap}、声明式参数�
 \chapter{一键温度:release-recapture 测温}
 \label{ch:temperature}
 
-仓库原先\tfocus{没有测温}。本轮加了 release-recapture（弹道重捕）测温，作为通用 Measurement 框架的第一个"非保真度"测量，\tfocus{一键启动}。
+release-recapture（弹道重捕）测温是通用 Measurement 框架里第一个"非保真度"测量，\tfocus{一键启动}：扫 trap-off 时间、逐点测存活、拟合出温度。
 
 \section{物理:弹道重捕}
 两次成像之间把 trap\tfocus{关掉} \pyapi{t\_off}，原子按热速度自由飞；再开 trap，问还有多少原子近到能被重捕。越热的原子热速度展宽越大、飞得越远，存活随 \pyapi{t\_off} 衰减越快——\tfocus{survival-vs-t\_off 曲线就编码了温度}。模型（\pyapi{release\_recapture\_survival}，3D 各向同性点源、忽略初始位置展宽的短时紧阱近似）：每轴重捕概率是高斯速度分布落在 $|v|<r_c/t$ 窗内的比例（误差函数），各向同性存活 $= \text{baseline}\cdot P_\text{axis}(t)^3$，其中 1D 速度展宽 $\sigma_v=\sqrt{k_B T/m}$。误差函数复用共享的 \pyapi{normal\_cdf}（不另抄一份）。
@@ -464,7 +464,7 @@ Task 控制台严格遵守:面板只通过 \pyapi{panel\_plot}+size 预设作图
 \section{工厂与 live 类}
 \pyapi{plot(data\_x, data\_y, *, kind, update, labels, display, data\_figure, ...)} 是统一工厂(数组契约 \pyapi{data\_x=(N,coord\_dim)}/\pyapi{data\_y=(N,channel\_dim)});\pyapi{panel\_plot(data, *, kind, size)} 是它的仪表盘特化(不 display、不附 DataFigure,由宿主嵌 canvas)。五个 live 类:\pyapi{Live1D}/\pyapi{Live2DDis}/\pyapi{LiveLiveDis}/\pyapi{HistogramFigure}/\pyapi{LiveSiteMap},都公共导出、可直接构造,但首选 \pyapi{plot()}。
 
-\section{LiveSiteMap(本轮新增)}
+\section{LiveSiteMap}
 原子阵列站点图:\pyapi{data\_x} 是 \pyapi{(N,2)} 站点中心(相机像素),\pyapi{data\_y} 是逐站值;每站一个 \pyapi{EllipseCollection} 实心圆按值着色,可选 \pyapi{image} 垫相机帧底图、\pyapi{cmap}、\pyapi{roi\_radius}。\tfocus{同 2D 的 [0.75,0.1,0.1] 分割},square 主图与 colorbar 逐像素对齐——融入既有几何而非另起炉灶。
 
 \section{DataFigure(拟合/存图/单位)}
@@ -551,7 +551,7 @@ per-site 信号 (photons) & \pyapi{counts} → Distribution(双高斯+阈值) \\
   \item \tfocus{通用 Measurement}:spec 参数 round-trip、\pyapi{ScannedMeasurementFeed} 走契约不读真值且自停、虚拟 e2e 出曲线（survival 单调衰减 + 拟合 T）、\pyapi{SurvivalReducer} 正确性；扩进 \pyapi{test\_virtual\_equals\_real\_contract}（measurement/temperature 不 import virtual/qcmos、不读 ground-truth）。
   \item Processing:每面板 Edit 标签绑定快照、命令拟合叠加（全套模型含 2D center）、Apply lim、Save Fig 产 png+npz、Clear。
   \item PDF 接口:\pyapi{render\_tex\_pdf} 临时目录只产 pdf、\pyapi{render\_notes\_pdf} docs 只留 pdf。
-  \item \tfocus{可视化验收强制规则}:任何 UI/plot 改动必须 \pyapi{capture\_user\_view} 三档 QT\_SCALE\_FACTOR(1.0/1.25/1.5)整窗截图 + 1:1 裁剪;DPR=1 离屏通过不算通过（本轮 Monitor/Setting/Edit 测量表单+参数+全拟合/结果曲线四场景三档 DPR 已验收 PASS）。
+  \item \tfocus{可视化验收强制规则}:任何 UI/plot 改动必须 \pyapi{capture\_user\_view} 三档 QT\_SCALE\_FACTOR(1.0/1.25/1.5)整窗截图 + 1:1 裁剪;DPR=1 离屏通过不算通过。
 \end{itemize}
 
 
@@ -577,7 +577,7 @@ per-site 信号 (photons) & \pyapi{counts} → Distribution(双高斯+阈值) \\
 下面是\tfocus{留给你决定}的方向(按我判断的价值排序)，每条注明现状与代价。
 
 \begin{enumerate}
-  \item \tfocus{[已落地] 真机 feed 类 + 通用测量 + 一键温度}。\pyapi{LoadingFeed}（走相机契约、自标定）、通用 Measurement 框架（\pyapi{MeasurementSpec}/三角色/\pyapi{ScannedMeasurementFeed}）与 release-recapture 一键温度均已入库；换真机 \pyapi{na.connect("qcmos", ...)} 后走同一路径。本条留作历史。
+  \item \tfocus{真机 feed + 通用测量 + 一键温度（现状基线）}。\pyapi{LoadingFeed} / \pyapi{CameraFrameFeed}（走相机契约、自标定）、通用 Measurement 框架（\pyapi{MeasurementSpec} / 三角色 / \pyapi{ScannedMeasurementFeed}）与 release-recapture 一键温度都在库里；换真机 \pyapi{na.connect("qcmos", ...)} 走同一路径。下面的方向在此基线上展开。
   \item \tfocus{性能激进档需用户拍板}。瓶颈=密封 300dpi 文字栅格化（intrinsic），blit / 位置冻结已实测否决。迟滞 autoscale / 错峰重绘 / 嵌入面板低 dpi 性能模式能进一步提速,但都改可见行为或视觉,需要你决定是否接受（见性能结论章）。
   \item \tfocus{(N,2) x-y 形状启发式收口}。结果曲线靠"列数==2"判 x-y;建议改为只在"measurement 结果卡"（\pyapi{config.params} 带 \pyapi{measurement}）才走 x-y 分支,避免普通 1D 面板碰巧产 (N,2) 被误判。
   \item \tfocus{死码/残留清理（minor）}。\pyapi{live.py} 的 \pyapi{\_set\_colorbar\_ticks} 自递归 no-op（2D 靠 \pyapi{update\_core} 内联设刻度、sites 靠 matplotlib auto-tick，"修"它会改 sites 基线 → 删或显式注释 no-op，走零基线漂移）；\pyapi{PanelCard.\_fit\_df} / \pyapi{FITTABLE\_KINDS} 随 Fit 迁走后只剩测试消费，可干净删除。
@@ -587,5 +587,5 @@ per-site 信号 (photons) & \pyapi{counts} → Distribution(双高斯+阈值) \\
   \item \tfocus{多 group / 4-shot 结构}。Rb87 是 4-shot group;若要在仪表盘层面理解 group,需要 hub/feed 支持 group 语义。多数情况下"循环里算完再 publish"已足够,不必上 group 抽象。
 \end{enumerate}
 
-\section{我的建议}
-本轮 (1) 已落地。下一步优先 (2) 性能激进档由你拍板是否接受行为/视觉变化、(3)(4) 顺手的形状启发式收口与死码清理;(5)(6)(7) 是更大的架构决定,建议你审查本文后明确方向再做。
+\section{优先级}
+(1) 是现状基线。其上的优先级:(2) 性能激进档需先定是否接受行为/视觉变化、(3)(4) 形状启发式收口与死码清理较顺手、(5)(6)(7) 是更大的架构决定,定方向后再做。

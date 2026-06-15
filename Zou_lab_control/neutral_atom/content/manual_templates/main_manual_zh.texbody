@@ -269,7 +269,7 @@ print(fit.summary())   # {'temperature_uK': ~44..50, 'capture_radius_m': 6e-06, 
 \chapter{N-slot 扫描模型}
 
 \section{为什么是“命名 slot”}
-这是当前唯一的扫描概念。它取代了旧的 \pyapi{x}/\pyapi{y} 二变量仿射扫描——\tfocus{已经没有 x/y 的说法了}。
+这是唯一的扫描概念：被扫的量由你绑定的\tfocus{命名 slot}（\pyapi{s0}/\pyapi{s1}/……）决定，\tfocus{没有 x/y 二变量的说法}。
 
 任何\tfocus{逐字段}的值都可以\tfocus{绑定到一个命名 slot}：
 
@@ -1057,7 +1057,7 @@ seq.set_safe_state()                            # 6) 回到安全空闲
 
 \section{为什么是“命名 slot”而不是 x/y}
 
-旧版本的扫描引擎硬编码了两个扫描轴 \pyapi{x} 和 \pyapi{y}。这套设计已经\tfocus{彻底废除}——现在没有 x，也没有 y。取而代之的是任意多个\tfocus{命名 slot}：\pyapi{s0}、\pyapi{s1}、\pyapi{s2}、……每个 slot 是一个独立的扫描维度。
+扫描引擎用任意多个\tfocus{命名 slot}：\pyapi{s0}、\pyapi{s1}、\pyapi{s2}、……每个 slot 是一个独立的扫描维度（\tfocus{没有 x/y 二轴的概念}）。
 
 一个 slot 由三件东西定义：
 

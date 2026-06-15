@@ -75,6 +75,7 @@
 - **文档要达到"陌生人看完能上手"的程度**;改或加文档时,跑一个**假装完全不懂这个项目的 agent 做对抗式独立审查**——它能否仅凭文档理解设计/原理/用法?不能就补。这种审查很有用,需要时多用,**不必担心 token**。
 - **教程(notebook)承接文档**:教基本用法,内容与文档一致(文档讲清楚,教程带着走一遍)。改了接口要同步教程。
 - 手册用**中立教学语气**;agent/审查/维护注记进 AGENTS 或 MAINTAINER_NOTES,**不进用户手册**。
+- **用户文档 = 对"当前系统"的教学,不是版本更新 / changelog**。绝不写**对比历史**的措辞:"旧设计 / 本轮 / 取代了 X / 无后向兼容 / 填了…的洞 / 设计改动 / 原先 / 曾经"。用户读文档是要**学会怎么用 + 为什么这么设计**,不是看 diff;变更史属于 git/commit。写每一句自问:"一个第一次看这份文档、根本不知道有过旧版本的用户,需要这句吗?"——不需要就删。这条对**手册和设计文档同样适用**(设计文档讲"现在为什么这么分层/这么设计",不讲"从前是什么、这轮改了什么")。
 - PDF 一律走 `frontend.render_tex_pdf` / `render_notes_pdf`:临时目录编译、**只产 .pdf**(失败留 `.build.log`);`docs/**/*.tex`、`*.sty` 是中间产物,已 gitignore,不入库。
 
 ---
@@ -95,6 +96,7 @@
 10. **markdown 里别用 LaTeX 排版宏**:`.md`(AGENTS/MEMORY/ROADMAP/README)用 markdown 语法(`**粗体**`、`` `代码` ``);`\tfocus{}`/`\pyapi{}`/`\filepath{}` 只属于 `.texbody`。写 .md 误用 `\tfocus{}` 会原样显示。(整理本文件时刚犯,30 处;用 chr(92) 脚本批量改回——同坑 #6。)
 11. **新增 plot 写成裸 matplotlib 图,绕过 `BaseLivePlot`**:`site_histogram_grid` 曾写成 `class SiteHistogramGrid:`(裸图),于是 selectors(缩放/拖阈值线)和 `data_figure`(拟合栈)**全部用不上**——而复用这层正是 frontend 存在的意义。根因不只是写错,而是该准则只在文档里、没有测试守。→ 新 plot **必须**继承 `BaseLivePlot` 走其 `show()` 生命周期(多轴图 override `_create_axes` + 每格挂工具,`DataFigure(ax=...)` 绑定单格);现已由 `tests/test_frontend_plot_contract.py` 强制(裸 plot 类直接挂测)。配套总纲见 §2「能机械强制的准则必须写成测试」。
 12. **改 scoped 的东西却跑 full pytest "求安心"**:改 neutral_atom/分析/单个 plot,却跑了整套(含 ~98 个 `demo_editor`/`demo_console` 的 GUI 测试),把满载下偶发 flaky 的 pulse GUI/task_console 测试反复拖进来,造出一堆与改动无关的 "15 failed",反复浪费双方注意力去排查。**根因**:把"想要信心"等同于"跑全部",违背 §3「只跑改动边界」。→ 只跑改动边界那几个文件;full 只在用户定的大改/交付时跑;**GUI smoke 是 demo fixture 不是真窗口,非 GUI 改动绝不跑**。见 §3。
+13. **文档写成版本更新 / changelog 形式**:手册和设计文档里混入"旧设计 / 本轮 / 取代了 X / 无后向兼容 / 填了…的洞 / 设计改动 / 原先"等**对比历史**的话(2026-06 反复栽:把 registry/Edit 文档写成"不再是写死的 list""取代旧 Dashboard""填上 0 参数的洞")。**根因**:把"我刚改了什么"当成文档内容,而用户读文档是要**学会用 + 懂为什么**,根本不知道有过旧版本。→ 用户文档只描述**当前系统怎么用 / 为什么这么设计**(present-tense 教学);变更史留给 git/commit。见 §4。
 
 ### 如何持续记录(防上下文压缩遗忘)
 - 每当我造成一个**自造的或重复的 bug**,立刻在上面加一条(一句话:现象 → 根因 → 规则)。这是标准收尾动作,和"跑测试/截图验收"同级。

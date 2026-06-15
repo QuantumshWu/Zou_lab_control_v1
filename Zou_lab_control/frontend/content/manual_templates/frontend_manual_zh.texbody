@@ -280,7 +280,7 @@ Channel Names 面板是 Edit 页\tfocus{最左边}的一张白色、带标题的
 面板顶部有两条\tfocus{只读}信息。只读的意思是它们只用来\tfocus{显示状态}，你无法直接在上面打字修改；它们的内容会随着你在别处的操作自动更新。
 
 \begin{description}
-\item[Clock] 作用：\tfocus{只读}显示当前测序器（sequencer）的\tfocus{时钟频率与节拍长度}，形如 \pyapi{50 MHz · 20 ns}——前者是硬件时钟，后者是一个节拍（tick）的时间，也是硬件最小的时间分辨率。它\tfocus{由硬件固定、不可编辑}（这也是为什么这里是一个灰色只读框，而不是旧版那个可填的“Step”输入框：节拍不是用户能改的量，改它没有意义）。关键影响：你在本软件里输入的\tfocus{任何时间量}（周期时长、通道延迟、扫描表里的 duration）都会被自动\tfocus{量化}成这个节拍的整数倍。例如节拍是 \pyapi{20 ns} 时你填 \pyapi{30 ns}，会被对齐到最接近的倍数（\pyapi{20} 或 \pyapi{40 ns}）。常见的坑：新手会奇怪“为什么我填的数被改了”——这正是量化在起作用，不是 bug。实用提示：先把目标时间换算成节拍的整数倍再填，所见即所得。
+\item[Clock] 作用：\tfocus{只读}显示当前测序器（sequencer）的\tfocus{时钟频率与节拍长度}，形如 \pyapi{50 MHz · 20 ns}——前者是硬件时钟，后者是一个节拍（tick）的时间，也是硬件最小的时间分辨率。它\tfocus{由硬件固定、不可编辑}（所以这里是一个灰色只读框：节拍不是用户能改的量，改它没有意义）。关键影响：你在本软件里输入的\tfocus{任何时间量}（周期时长、通道延迟、扫描表里的 duration）都会被自动\tfocus{量化}成这个节拍的整数倍。例如节拍是 \pyapi{20 ns} 时你填 \pyapi{30 ns}，会被对齐到最接近的倍数（\pyapi{20} 或 \pyapi{40 ns}）。常见的坑：新手会奇怪“为什么我填的数被改了”——这正是量化在起作用，不是 bug。实用提示：先把目标时间换算成节拍的整数倍再填，所见即所得。
 
 \item[Scan] 作用：用一行简短文字\tfocus{汇总}当前已经绑定的扫描槽（slot）数量和扫描点数，形如 \pyapi{3 slots · 3 pts}，意思是“当前绑定了 3 个扫描槽、扫描表里有 3 个扫描点”。它接受的同样不是输入，而是自动统计。点击或输入：你不能在这里点或改，它只随你在各处绑定/解绑扫描圆点、或载入扫描表而变化。常见的坑：当这里显示 \pyapi{0 slots} 时，说明你还没有绑定任何扫描变量，这次运行就是一次普通的单点序列，而不是扫描。实用提示：每次绑定完圆点后瞄一眼这里，确认 slots 数和 pts 数都符合你的预期，是排查“为什么没在扫”的最快办法。
 \end{description}
@@ -294,7 +294,7 @@ Channel Names 面板是 Edit 页\tfocus{最左边}的一张白色、带标题的
 
 \item[来源开关（Use loaded file）] 作用：一个\tfocus{切换开关}，决定本次运行用哪份扫描表。\tfocus{关}（默认）= 用 Scan 页代码 \pyapi{Run} 出来的“生成”扫描表；\tfocus{开} = 用 \pyapi{Load Array} 载入的那份“载入”数组。点击后会发生什么：立即切换活动来源并重画预览/汇总，\tfocus{不需要重跑}代码。常见的坑：开关打开但还没载入任何文件时，会提示你先用 Load Array，并自动回到“生成”来源。实用提示：把同一组绑定下“代码生成”和“外部文件”两套扫描表都准备好，用这个开关一键对比，省去反复 Run/Load。
 
-\item[去哪写扫描代码] 旧版那个“Scan Tab”按钮已\tfocus{取消}——直接点界面顶部的 \pyapi{Scan} 标签即可进入 Scan 页写代码（见“按字段扫描点工作流”一节）。
+\item[去哪写扫描代码] 点界面顶部的 \pyapi{Scan} 标签即进入 Scan 页写代码（见“按字段扫描点工作流”一节）。
 \end{description}
 
 \subsection{每个通道一行：延迟输入框（delay field）}
@@ -931,7 +931,7 @@ value = rate_grid - b_rate_grid        # 两个实验相减 -> 2D
 \subsection{Edit 标签（PanelEditor）的内容}
 整页\tfocus{可滚动}（快照再大也不会把底部控件挤出可视区）。内容\tfocus{不与 Setting 重叠}（Setting 只留 源 / 尺寸 / colormap / relim / unit）：
 \begin{description}
-  \item[Acquisition（驱动该面板的采集 feed 参数）] 普通（非测量）面板——如 Loading image——的数据来自一个后台 \pyapi{ExperimentFeed}（如 \pyapi{LoadingFeed}）。Edit 顶部\tfocus{自动发现该 feed 的采集参数}（\pyapi{exposure} / \pyapi{roi\_radius} / \pyapi{grid\_shape} / \pyapi{ema} / \pyapi{calibration\_frames} / \pyapi{threshold\_frames}……，由 \pyapi{published\_signals()} 反查“谁在产这张图依赖的信号”、再 \pyapi{inspect.signature} 取参得到），每格预填\tfocus{当前正在跑的值}并在下方标 \pyapi{now: <值>} 供改参时参照；改完点 \pyapi{Restart feed} 就\tfocus{用新参数重建并热替换那个 feed}（同一信号名，活面板无缝续刷）。这填上了过去“Loading image 打开 0 参数”的洞——\tfocus{API 里有的采集参数这里都能调}。
+  \item[Acquisition（编辑数据源的采集参数）] 一张普通（非测量）面板是\tfocus{视图}，它的数据由一个后台 \pyapi{ExperimentFeed} 生产，feed 背后是\tfocus{数据源}——相机本身，或 feed 自己的分析。Edit 顶部列出该\tfocus{数据源的可编辑参数}：一张原始相机帧面板（\pyapi{CameraFrameFeed}）列出相机的 \pyapi{exposure} / \pyapi{roi}；一张装载图面板（\pyapi{LoadingFeed}）列出它的分析参数 \pyapi{exposure} / \pyapi{roi\_radius} / \pyapi{grid\_shape} / \pyapi{ema} / \pyapi{calibration\_frames} / \pyapi{threshold\_frames}。每格预填\tfocus{当前正在跑的值}并在下方标 \pyapi{now: <值>} 供改参时参照；改完点 \pyapi{Apply} 就把改动\tfocus{原地}推给数据源（相机即 \pyapi{configure} 实时重配，分析参数则重标定），活面板以同一信号名无缝续刷。\tfocus{所以一张 qCMOS live 2D 的 Edit 就能直接调相机曝光/ROI}。
   \item[Parameters（plot 的 API 参数）] 该面板\tfocus{plot 调用里可变的参数}自动铺成 GUI 控件（\pyapi{length} / \pyapi{bins} / \pyapi{centers} / \pyapi{image}……，由该 kind 的声明\tfocus{自动发现}）；改一下就\tfocus{实时重渲染}活面板与快照。colormap 是\tfocus{唯一}留在 Setting 的显示旋钮，其余功能参数都在这里——两边永不重复。
   \item[Measurement（测量面板专属）] 若该面板来自一个 measurement，顶部内嵌\tfocus{该测量的参数表单（自动生成、带校验）+ Start/Stop}：扫描范围 → min/max/points 三框、标量 → spin（带 lo/hi/unit）、布尔 → 复选、必填缺失带 \pyapi{*}。\tfocus{改完参数点 Start 就用新参数重跑这张 Monitor 面板}（复用同一张卡，不堆叠）；参数随面板存，重开自动回填。GUI 的 Start 与 notebook 一行（如 \pyapi{exp.readout.temperature(...)}）\tfocus{调同一个建器}，两边不漂移。普通（非测量）面板没有这一段。\tfocus{框选自动读范围}：在 Edit 快照上拖一个矩形区域，\pyapi{AreaSelector} 的 x 范围\tfocus{自动填进上面测量表单的 x 扫描参数}的 min/max 框（学 \pyapi{confocal\_gui} 的 \pyapi{area.callback}）——填的是\tfocus{扫描参数}本身、不是坐标轴 lim。
   \item[Fit（全套 data\_figure）] 模型下拉是\tfocus{完整的 DataFigure 集合}（Lorentzian / Gaussian / Lorentzian (Zeeman) / Rabi / Exp decay / \tfocus{2D center}），\tfocus{不按 plot 类型门控}——2D 图用 2D 高斯 \pyapi{center} 拟合，其余拟合 1D 轨迹。一行自由文本拟合参数（\pyapi{p0=[...]} 初值、\pyapi{名字=值} 固定、\pyapi{is\_fit=False} 只叠加不优化）+ \pyapi{Fit}/\pyapi{Clear}；底层 \pyapi{DataFigure}（与 notebook 的 \pyapi{p.data\_figure.lorent()} 同源）。
@@ -988,7 +988,7 @@ frontend 对外暴露一个\tfocus{小而密封}的接口。外部调用者只�
 \begin{notebox}
 \textbf{为什么几何不是旋钮？}（这样你就不会困惑“我想改边距怎么没有参数”）
 \begin{itemize}
-  \item 全项目只有\tfocus{一套 300\,dpi 排版系统}和\tfocus{一条 auto-scale 规则}：外部乱改会在不同 Windows DPI 缩放下破坏对齐契约（历史上真出过两个 GUI 控件大小不一致、高 DPI 下图变形的事故）。
+  \item 全项目只有\tfocus{一套 300\,dpi 排版系统}和\tfocus{一条 auto-scale 规则}：外部乱改会在不同 Windows DPI 缩放下破坏对齐契约（典型后果：两个 GUI 控件大小不一致、高 DPI 下图变形）。
   \item 所有面板\tfocus{共享同一块 plot 区域和同一组边距}，才能让任意类型/尺寸的面板严丝合缝拼接（confocal 模数规则）。
   \item 2D / Site map 图\tfocus{恒为 square}且与 colorbar 对齐，这是设计的一部分，不是可关掉的开关。
 \end{itemize}
