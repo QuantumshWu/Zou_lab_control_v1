@@ -2694,9 +2694,18 @@ class TaskConsole(QtWidgets.QWidget):
         keys = tuple(getattr(spec, "result_keys", ()) or ())
         value_key = str(getattr(spec, "default_value_key", "") or (keys[0] if keys else ""))
         source = f"value = {value_key}" if value_key else "value = np.zeros(1)"
+        params = {"processor": spec.name}
+        # A 'sites' default view needs its centers (and optional underlay image)
+        # signals; the spec names the published keys for them in its metadata so the
+        # panel reads the processor's OWN outputs (no collision with a live feed).
+        if kind == "sites":
+            md = getattr(spec, "metadata", None) or {}
+            params["centers"] = str(md.get("centers_key", "centers"))
+            if md.get("image_key"):
+                params["image"] = str(md.get("image_key"))
         rows = max((c.config.row + c.config.rows for c in self.cards), default=0)
         config = PanelConfig(kind=kind, title=spec.name, row=rows, col=0, size="2x2",
-                             source=source, params={"processor": spec.name})
+                             source=source, params=params)
         card = PanelCard(config, parent=self.board, names_provider=self.hub.names)
         self._attach_card(card)
         self._arrange()

@@ -83,3 +83,50 @@ def test_add_panel_data_processing_runs_and_publishes(tmp_path):
         assert card.plotter is not None
     finally:
         console.shutdown()
+
+
+def test_detect_sites_action_shows_detected_site_map(tmp_path):
+    """The 'Detect sites' data-processing action goes frame -> sites -> display: it
+    detects centers from saved frames and its result panel is a 'sites' atom map
+    wired to the processor's OWN centers + underlay signals (no live feed needed)."""
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+
+    data_dir = tmp_path / "run"
+    na.write_virtual_run(str(data_dir), prefix="img", groups=40, shots_per_group=4,
+                         short_shot=3, ref_shots=(1, 2, 4), grid_shape=(4, 5),
+                         loading_probability=0.5, seed=5)
+    # NOT pre-calibrated: "Detect sites" IS the detection.
+    exp = na.connect("virtual", sitemap={"grid_shape": (4, 5)})
+
+    console = TaskConsole(hub=SignalHub(), state=default_console_state(),
+                          processors=exp.readout.processor_specs())
+    console._timer.stop()
+    try:
+        kc = console.kind_combo
+        idx = next(j for j in range(kc.count())
+                   if kc.itemData(j) == ("processor", "Detect sites"))
+        kc.setCurrentIndex(idx)
+        console._add_panel()
+        card = next(c for c in console.cards if c.config.params.get("processor") == "Detect sites")
+        # a 'sites' atom map wired to the processor's OWN centers + underlay signals
+        assert card.config.kind == "sites"
+        assert card.config.params.get("centers") == "site_centers"
+        assert card.config.params.get("image") == "sitemap_frame"
+
+        editor = console._panel_editors[id(card)]
+        editor.meas_panel._widgets["data_dir"][1].setText(str(data_dir))
+        console._start_processor(editor.meas_panel)
+        feed = console._active_proc_feed
+        deadline = time.monotonic() + 8.0
+        while not getattr(feed, "finished", False) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert feed.finished
+        assert np.asarray(console.hub.latest("site_centers")).shape == (20, 2)   # detected centers
+        assert np.asarray(console.hub.latest("sitemap_frame")).ndim == 2          # underlay image
+        # the site map builds with the detected centers over the template
+        console.refresh_once()
+        assert card.plotter is not None
+    finally:
+        console.shutdown()
