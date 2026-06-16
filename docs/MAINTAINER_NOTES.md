@@ -996,6 +996,37 @@ sequencer (via pulse) / `calibration.signals|detect` / `active_plotter().run` �
 import of virtual/qcmos, zero simulation ground truth. Living in `operations/` they
 are caught by `tests/test_virtual_equals_real_contract.py`.
 
+### Data-processing actions: ProcessorSpec (the one-shot sibling of a measurement)
+
+A measurement SWEEPS a parameter into a live curve; a **processor** runs ONCE over
+freshly-acquired or saved frames and produces a structured result (per-site arrays +
+scalars). They are the SAME shape — declared params (`ParamDecl`) in, named data out
+— differing only in execution (swept vs one-shot) and whether a default plot is
+declared. To add one: drop a module into `operations/processors/` with a
+`@processor` factory `build(readout) -> ProcessorSpec` (auto-discovered by
+`processor_registry`, exactly like `@measurement`); it appears in
+`exp.readout.processor_specs()` and the console's Add-Panel **"Data processing"**
+category with no catalog edit.
+
+- `ProcessorSpec` (`operations/processor.py`): `params` (`ParamDecl`, reused — incl.
+  the `text` kind for a folder path), `run(ctx) -> {signal: value}`, `result_keys`,
+  `summary_keys` (scalars), and the OPTIONAL default-view binding
+  `default_kind`/`default_value_key` (e.g. `sites` + `fidelity_site` — empty
+  `default_kind` = a pure data action whose outputs the user wires manually).
+- `run(ctx)` DRIVES existing analysis (the built-in `readout_fidelity` calls
+  `ReadoutSubsystem.characterize_from_dir`) — it re-implements no readout/fidelity
+  math; `readout` is captured in the factory closure so the console stays decoupled
+  (it drives the action through the plain spec list, never holding the subsystem).
+- `ProcessorFeed` (`operations/feeds.py`) runs the spec ONCE on its owner thread,
+  publishes the result (+ a `processor_done` scalar) to the hub, and self-stops; the
+  cooperative-stop event is shared so a long grab cancels cleanly. The console's
+  result panel reuses the EXISTING `sites` atom kind (camera underlay + per-site
+  circles); the scalars are visible in every panel's signal legend.
+- `discovered_processor_specs` FAILS LOUD on duplicate `result_keys` (two processors
+  would clobber a shared-hub signal). Virtual==real: a processor's only data source
+  is `camera.acquire` or a saved folder, so it is caught by the same
+  `test_virtual_equals_real_contract` guard.
+
 ### Release-recapture thermometry physics (`operations/temperature.py`)
 
 Trap OFF for `t_off` → atoms fly ballistically → trap ON → survival = recaptured /
