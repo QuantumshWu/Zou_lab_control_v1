@@ -236,3 +236,128 @@ def test_1d_panel_without_xy_marker_flattens_n_by_2():
         assert np.allclose(card.plotter.data_y[:, 0], arr.reshape(-1))
     finally:
         card.shutdown()
+
+
+# ------------------------------------ coordinate axes = source param space (G1)
+# confocal_gui's core coupling: a plot's axes ARE the producing source's
+# parameter space, and a region selected on the plot writes that parameter back.
+# For a camera-frame 2D panel the parameter is the qCMOS ROI: the image x/y are
+# the REAL pixel coordinates (the ROI origin), NOT 0..N, and an area-select fills
+# the ROI field.  This is the 2D analogue of the 1D scan-range writeback above.
+def test_2d_panel_axes_use_source_roi_coordinates():
+    """A 2D panel whose source reads a ROI-bearing camera signal builds its axes
+    in the camera's real pixel space: x in [x0, x0+w-1], y in [y0, y0+h-1], with
+    'Camera x/y (px)' labels -- so the displayed coordinates ARE the qCMOS ROI."""
+    from Zou_lab_control.frontend.task_console import PanelCard, PanelConfig
+
+    card = PanelCard(PanelConfig(kind="2d", source="value = frame"))
+    try:
+        frame = np.random.rand(16, 24) * 100.0           # h=16, w=24
+        roi = [1648, 24, 1144, 16]                        # (x, w, y, h)
+        card.refresh({"frame": frame, "__coord_frames__": {"frame": roi}, "shot": 1})
+        p = card.plotter
+        assert np.isclose(p.x_array[0], 1648) and np.isclose(p.x_array[-1], 1648 + 24 - 1)
+        assert np.isclose(p.y_array[0], 1144) and np.isclose(p.y_array[-1], 1144 + 16 - 1)
+        assert p.ax.get_xlabel() == "Camera x (px)"
+        assert p.ax.get_ylabel() == "Camera y (px)"
+    finally:
+        card.shutdown()
+
+
+def test_2d_panel_axes_default_to_index_without_coord_frame():
+    """No coordinate frame (the source isn't a ROI-bearing camera) -> the 2D axes
+    fall back to plain 0..N indices, the generic behaviour."""
+    from Zou_lab_control.frontend.task_console import PanelCard, PanelConfig
+
+    card = PanelCard(PanelConfig(kind="2d", source="value = frame"))
+    try:
+        frame = np.random.rand(16, 24) * 100.0
+        card.refresh({"frame": frame, "shot": 1})
+        p = card.plotter
+        assert np.isclose(p.x_array[0], 0) and np.isclose(p.x_array[-1], 23)
+        assert np.isclose(p.y_array[0], 0) and np.isclose(p.y_array[-1], 15)
+    finally:
+        card.shutdown()
+
+
+def test_2d_panel_rebuilds_when_roi_shifts_same_shape():
+    """A ROI that SHIFTS without resizing keeps the frame shape; the axes must
+    still follow it.  The shape-only rebuild gate would skip this, so the panel
+    also rebuilds when the source coordinate frame changes (else stale coords)."""
+    from Zou_lab_control.frontend.task_console import PanelCard, PanelConfig
+
+    card = PanelCard(PanelConfig(kind="2d", source="value = frame"))
+    try:
+        frame = np.random.rand(16, 24) * 100.0
+        card.refresh({"frame": frame, "__coord_frames__": {"frame": [1648, 24, 1144, 16]}, "shot": 1})
+        assert np.isclose(card.plotter.x_array[0], 1648)
+        # same-shape frame, SHIFTED ROI origin -> axes track the new origin
+        card.refresh({"frame": frame, "__coord_frames__": {"frame": [100, 24, 200, 16]}, "shot": 2})
+        assert np.isclose(card.plotter.x_array[0], 100)
+        assert np.isclose(card.plotter.y_array[0], 200)
+    finally:
+        card.shutdown()
+
+
+def test_edit_area_select_writes_camera_roi():
+    """The WRITE-back half of G1: a region selected on a camera-frame 2D panel's
+    (interactive) Edit plot fills the ROI field [x, w, y, h] from the selection,
+    and Apply reconfigures the camera to that ROI -- same gesture and intent as
+    the 1D scan-range writeback, routed through the acquisition-param protocol.
+
+    Only the lowest data source is faked (a camera that owns a ROI and returns a
+    frame over it); everything above is the real task-console path."""
+    import Zou_lab_control.frontend as zf
+    from Zou_lab_control.frontend.task_console import TaskConsole
+    from Zou_lab_control.neutral_atom.operations.feeds import CameraFrameFeed
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.neutral_atom.devices.base import CameraDevice
+
+    class _RoiCamera(CameraDevice):
+        def __init__(self, roi=(1648, 64, 1144, 64)):
+            self._exposure = 0.02
+            self._roi = tuple(int(v) for v in roi)
+
+        @property
+        def exposure(self):
+            return self._exposure
+
+        @property
+        def roi(self):
+            return self._roi
+
+        def configure(self, *, exposure=None, **kw):
+            if exposure is not None:
+                self._exposure = float(exposure)
+            if kw.get("roi") is not None:
+                self._roi = tuple(int(v) for v in kw["roi"])
+
+        def acquire(self, frames=1, *, sequence=None, sequencer=None, stop=None, **kw):
+            w, h = self._roi[1], self._roi[3]
+            return [np.full((h, w), 50.0)]
+
+    hub = SignalHub()
+    cam = _RoiCamera()
+    feed = CameraFrameFeed(hub, cam)
+    state = zf.TaskConsoleState(name="t", panels=[
+        zf.PanelConfig(kind="2d", title="cam", size="2x2", source="value = frame")])
+    console = TaskConsole(hub=hub, state=state, feeds=[feed])
+    console._timer.stop()
+    try:
+        feed.step()
+        console.refresh_once()
+        card = console.cards[0]
+        console._edit_card(card)
+        editor = console._panel_editors[id(card)]
+        editor.rebuild()
+        # the selector's callback is the ROI writeback, NOT the scan-range one
+        assert editor._plotter.area.callback.__name__ == "_read_roi"
+        # a rectangle selected in pixel (= ROI) coordinates -> ROI [x, w, y, h]
+        editor._plotter.area.range = [1670.0, 1690.0, 1166.0, 1186.0]
+        editor._plotter.area.callback()
+        assert editor._feed_widgets["roi"].text() == "[1670, 20, 1166, 20]"
+        # Apply pushes the selected ROI onto the camera in place
+        editor._restart_feed()
+        assert cam.roi == (1670, 20, 1166, 20)
+    finally:
+        console.shutdown()

@@ -522,6 +522,9 @@ class PanelCard(FluentGroupBox):
         self._last_monitor_key: object = _MONITOR_UNSET
         self._ref_src: str | None = None
         self._ref_names: frozenset = frozenset()
+        # 2D coordinate frame: the ROI the axes were built from, so a ROI that
+        # SHIFTS (same shape, new origin) still triggers an axes rebuild.
+        self._roi_built: list | None = None
         self._drag_offset: QtCore.QPoint | None = None
         self.setCursor(QtCore.Qt.OpenHandCursor)   # the frame border drags
 
@@ -763,7 +766,7 @@ class PanelCard(FluentGroupBox):
             return spin
         # "signal": a free-form signal name (blank allowed where documented)
         edit = FluentLineEdit(str(current))
-        edit.setFixedWidth(scaled_px(96, minimum=80))
+        edit.setMinimumWidth(scaled_px(96, minimum=80))   # expands in its row; long signal names not cut off
         edit.setToolTip(spec.tooltip)
         edit.editingFinished.connect(lambda k=spec.key, w=edit: cb(k, w.text().strip()))
         return edit
@@ -836,6 +839,11 @@ class PanelCard(FluentGroupBox):
         self.config.params["relim"] = str(mode)
         if self.plotter is not None and hasattr(self.plotter, "relim_mode"):
             self.plotter.relim_mode = str(mode)
+            # apply the switch NOW (2D colorbar / 1D y-axis), bypassing the relim
+            # dead-band -- otherwise a 2D image's clim only changes on the next
+            # frame (or never, for a static panel), so the toggle looks dead.
+            if hasattr(self.plotter, "apply_relim_now"):
+                self.plotter.apply_relim_now()
         if self.canvas is not None:
             self.canvas.draw_idle()
         self.changed.emit()
@@ -1074,20 +1082,37 @@ class PanelCard(FluentGroupBox):
         image = namespace.get(image_name) if image_name else None
         return centers[:, :2], (None if image is None else np.asarray(image, dtype=float))
 
+    def _co_names(self) -> frozenset:
+        """The identifiers this panel's source expression references (cached).
+        Used to map the source to its signal(s) -- for the monitor roll-gate and
+        for the 2D coordinate-frame (ROI) lookup."""
+        src = self._compiled_source
+        if src != self._ref_src:               # (re)derive on source change
+            self._ref_src = src
+            try:
+                self._ref_names = frozenset(compile(str(src), "<panel-source>", "exec").co_names)
+            except Exception:
+                self._ref_names = frozenset()
+        return self._ref_names
+
+    def _source_coord_frame(self, namespace: Mapping[str, object] | None):
+        """The ROI ([x, w, y, h]) of the camera signal this 2D panel's source
+        reads, or None -- so the image axes can be real pixel coordinates."""
+        frames = (namespace or {}).get("__coord_frames__")
+        if not isinstance(frames, dict) or not frames:
+            return None
+        for name in self._co_names():
+            if name in frames:
+                return frames[name]
+        return None
+
     def _monitor_source_key(self, namespace: Mapping[str, object] | None):
         """Version key of the signals this panel's source reads, or None when
         none are detectable.  None => caller rolls every tick (safe fallback)."""
         versions = (namespace or {}).get("__sig_versions__")
         if not isinstance(versions, dict) or not versions:
             return None
-        src = self._compiled_source
-        if src != self._ref_src:               # (re)derive referenced names on source change
-            self._ref_src = src
-            try:
-                self._ref_names = frozenset(compile(str(src), "<panel-source>", "exec").co_names)
-            except Exception:
-                self._ref_names = frozenset()
-        refs = [n for n in self._ref_names if n in versions]
+        refs = [n for n in self._co_names() if n in versions]
         if not refs:
             return None
         return tuple(sorted((n, versions[n]) for n in refs))
@@ -1103,6 +1128,11 @@ class PanelCard(FluentGroupBox):
         rebuild = self.plotter is None
         if not rebuild and kind in ("2d", "1d", "sites"):
             rebuild = tuple(np.shape(value)) != self._value_shape
+        if not rebuild and kind == "2d":
+            # A ROI that *shifts* without resizing keeps the frame shape, but the
+            # image's pixel coordinates moved -- rebuild so the axes track the ROI.
+            roi = self._source_coord_frame(namespace)
+            rebuild = (list(roi) if roi else None) != getattr(self, "_roi_built", None)
         if rebuild:
             self._build_plot(value, namespace)
             self._value_shape = (1,) if isinstance(value, float) else tuple(np.shape(value))
@@ -1169,12 +1199,25 @@ class PanelCard(FluentGroupBox):
         elif kind == "2d":
             arr = np.asarray(value, dtype=float)
             ny, nx = arr.shape
-            xx, yy = np.meshgrid(np.arange(nx, dtype=float), np.arange(ny, dtype=float))
+            # Coordinate axes ARE the source's pixel space: when the producing feed
+            # declares a camera ROI (x, w, y, h), the image x/y are the REAL pixel
+            # coordinates (x0..x0+w, y0..y0+h), not 0..N -- so the axes match the
+            # ROI and an area-select maps straight back to a new ROI.
+            roi = self._source_coord_frame(namespace)
+            self._roi_built = list(roi) if roi else None
+            if roi and len(roi) >= 4:
+                x0, y0 = float(roi[0]), float(roi[2])
+                xlabel, ylabel = "Camera x (px)", "Camera y (px)"
+            else:
+                x0, y0 = 0.0, 0.0
+                xlabel, ylabel = "X (px)", "Y (px)"
+            xx, yy = np.meshgrid(x0 + np.arange(nx, dtype=float), y0 + np.arange(ny, dtype=float))
             data_x = np.column_stack([xx.ravel(), yy.ravel()])
             self.plotter = panel_plot(
                 data_x, arr.ravel(), kind="2d", size=size, interactions=False,
                 cmap=str(self.config.params.get("cmap", "inferno")),
-                labels=("X (px)", "Y (px)", ""), title=self.config.title or None)
+                relim_mode=str(self.config.params.get("relim", "tight")),
+                labels=(xlabel, ylabel, ""), title=self.config.title or None)
         elif kind in ("monitor", "monitor_nodist"):
             length = max(20, int(self.config.params.get("length", 300)))
             history = np.full(length, np.nan)
@@ -1298,6 +1341,11 @@ class MeasurementPanel(QtWidgets.QWidget):
         self.form.setLabelAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         self.form.setHorizontalSpacing(scaled_px(8, minimum=5))
         self.form.setVerticalSpacing(scaled_px(5, minimum=3))
+        # Fields fill the available width (the Edit page is wide): an expanding
+        # control -- a free-form value edit -- grows so its value is never cut off
+        # and the right-side space is used; fixed-size spins keep their natural
+        # width.  (cutoff is a core rule.)
+        self.form.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
         root.addLayout(self.form)
 
         # Start / Stop + status
@@ -1411,7 +1459,7 @@ class MeasurementPanel(QtWidgets.QWidget):
                 # with a default use a spin box.
                 if decl.default is None and not decl.required:
                     edit = FluentLineEdit("")
-                    edit.setFixedWidth(scaled_px(96, minimum=80))
+                    edit.setMinimumWidth(scaled_px(96, minimum=80))   # grows with the form field; no cutoff
                     edit.setPlaceholderText("(all)")
                     edit.setToolTip(decl.tooltip)
                     edit.textChanged.connect(self._refresh_start_enabled)
@@ -1621,7 +1669,11 @@ class PanelEditor(QtWidgets.QWidget):
                 if not self._feed_widgets:
                     section("Acquisition")
                 edit = FluentLineEdit(_py_to_text(current))
-                edit.setFixedWidth(scaled_px(110, minimum=84))
+                # EXPAND to fill the row (stretch=1), not a fixed 110 px: a value
+                # like a 4-int ROI [1648, 64, 1144, 64] was clipped while the right
+                # half of the page sat empty.  The edit takes the slack; the live
+                # "now:" reference trails it.  (cutoff is a core rule.)
+                edit.setMinimumWidth(scaled_px(150, minimum=120))
                 self._feed_widgets[name] = edit
                 now = labeled(f"now: {_py_to_text(current)}")
                 self._feed_now_labels[name] = now
@@ -1629,9 +1681,8 @@ class PanelEditor(QtWidgets.QWidget):
                 hl = QtWidgets.QHBoxLayout(holder)
                 hl.setContentsMargins(0, 0, 0, 0)
                 hl.setSpacing(scaled_px(6, minimum=4))
-                hl.addWidget(edit, 0)
+                hl.addWidget(edit, 1)
                 hl.addWidget(now, 0)
-                hl.addStretch(1)
                 # widest feed-param label is "calibration_frames" (18 chars) --
                 # 150 clipped its trailing 's'; 170 fits the longest name in full.
                 col.addWidget(FluentSettingRow(name, holder, label_width=scaled_px(170, minimum=140)))
@@ -1771,7 +1822,8 @@ class PanelEditor(QtWidgets.QWidget):
             if kind == "2d":
                 self._plotter = panel_plot(np.array(src.data_x, dtype=float),
                                            np.array(src.data_y[:, 0], dtype=float), kind="2d",
-                                           size=size, cmap=cmap, labels=tuple(src.labels), title=title)
+                                           size=size, cmap=cmap, relim_mode=relim,
+                                           labels=tuple(src.labels), title=title)
             elif kind == "sites":
                 self._plotter = panel_plot(np.array(src.data_x[:, :2], dtype=float),
                                            np.array(src.data_y[:, 0], dtype=float), kind="sites",
@@ -1800,11 +1852,18 @@ class PanelEditor(QtWidgets.QWidget):
         self._canvas.draw_idle()
         self._df = None
         self.fill_limits()
-        # confocal-style auto-range: on a MEASUREMENT panel, a region selected on
-        # this (interactive) Edit plot fills the measurement's scan x-range.
+        # confocal-style auto-range: a region selected on this (interactive) Edit
+        # plot fills the source's parameter that the axes represent --
+        #   * MEASUREMENT panel: the scan x-range (1D scan param);
+        #   * camera-frame 2D panel: the camera ROI (the axes ARE pixel coords).
+        # Same gesture (left-drag a feature), same intent (the next acquisition
+        # covers just the selection).
         area = getattr(self._plotter, "area", None)
-        if self.meas_panel is not None and area is not None:
-            area.callback = self._read_scan_range
+        if area is not None:
+            if self.meas_panel is not None:
+                area.callback = self._read_scan_range
+            elif kind == "2d" and "roi" in self._feed_widgets:
+                area.callback = self._read_roi
         self.status.setText("snapshot of current data — fit / set limits / save are frozen here")
 
     def _edit_param(self, key: str, value) -> None:
@@ -1827,6 +1886,27 @@ class PanelEditor(QtWidgets.QWidget):
         x1, x2 = float(rng[0]), float(rng[1])
         if self.meas_panel.set_axis_range(x1, x2):
             self.status.setText(f"scan range set from selection: {x1:.4g} … {x2:.4g}")
+
+    def _read_roi(self) -> None:
+        """Confocal ``_read_range`` for a camera-frame 2D panel: a rectangle
+        SELECTED (left-drag) on the image fills the camera's ROI field.  The image
+        axes ARE the camera's pixel coordinates (``_build_plot`` builds them from
+        the feed's ROI), so the selection rectangle maps STRAIGHT back to a new
+        ROI ``[x, w, y, h]`` -- drag a feature -> Apply -> the camera acquires just
+        that window.  Mirrors the 1D scan-range gesture; no-op without a ROI field
+        or an active selection."""
+        if self._feed is None or self._plotter is None:
+            return
+        edit = self._feed_widgets.get("roi")
+        if edit is None:
+            return
+        rng = getattr(getattr(self._plotter, "area", None), "range", None)
+        if not rng or rng[0] is None:
+            return
+        x1, x2, y1, y2 = (float(v) for v in rng)
+        roi = [int(round(x1)), int(round(x2 - x1)), int(round(y1)), int(round(y2 - y1))]
+        edit.setText(_py_to_text(roi))
+        self.status.setText(f"ROI set from selection: {roi} — Apply to retune the camera")
 
     def _restart_feed(self) -> None:
         """Apply the edited Acquisition params to the data source IN PLACE;
@@ -2458,7 +2538,31 @@ class TaskConsole(QtWidgets.QWidget):
         # Per-signal publish counters (reserved key) so a rolling monitor can tell
         # a new sample of its own source from an unrelated feed's version bump.
         namespace["__sig_versions__"] = self.hub.signal_versions()
+        # Coordinate frames (reserved key): {signal_name: [x, w, y, h]} from any
+        # feed whose acquisition source declares a ROI.  A 2D panel reads its
+        # source signal's frame so the image axes are the REAL camera pixel
+        # coordinates (ROI), not 0..N -- and an area-select maps back to the ROI.
+        namespace["__coord_frames__"] = self._coord_frames()
         return namespace
+
+    def _coord_frames(self) -> dict[str, list]:
+        """Map each feed-published signal to its source ROI ([x, w, y, h]) when the
+        feed declares one (a camera frame), so a panel can use real pixel axes."""
+        frames: dict[str, list] = {}
+        for feed in self.feeds:
+            try:
+                roi = feed.acquisition_parameters().get("roi")
+            except Exception:
+                roi = None
+            if not roi:
+                continue
+            try:
+                sigs = feed.published_signals() if hasattr(feed, "published_signals") else ()
+            except Exception:
+                sigs = ()
+            for s in sigs:
+                frames[str(s)] = list(roi)
+        return frames
 
     def _tick(self) -> None:
         # poll the measurement EVERY tick (even when no new signal arrived) so

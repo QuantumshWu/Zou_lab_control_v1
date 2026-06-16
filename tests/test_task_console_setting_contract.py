@@ -207,6 +207,49 @@ def test_setting_relim_combo_writes_config_params_relim():
         card.shutdown()
 
 
+def test_2d_relim_normal_anchors_colorbar_at_zero_tight_brackets():
+    """G3: the 2D colorbar (clim) is the image analogue of the 1D y-axis and MUST
+    obey relim_mode.  ``normal`` anchors clim at 0 (counts read against zero);
+    ``tight`` brackets the data away from 0.  Previously the 2D clim was hard-coded
+    tight, so the Setting's normal did nothing -- this pins both modes."""
+    normal = _card("2d", source="value = frame", params={"relim": "normal"})
+    try:
+        frame = np.full((8, 8), 50.0)
+        frame[3:5, 3:5] = 250.0                       # data spans 50..250
+        normal.refresh({"frame": frame, "shot": 1})
+        assert normal.plotter.ylim_min == 0.0         # normal: clim anchored at 0
+        assert normal.plotter.ylim_max > 250.0
+    finally:
+        normal.shutdown()
+
+    tight = _card("2d", source="value = frame", params={"relim": "tight"})
+    try:
+        frame = np.full((8, 8), 50.0)
+        frame[3:5, 3:5] = 250.0
+        tight.refresh({"frame": frame, "shot": 1})
+        assert tight.plotter.ylim_min > 0.0           # tight: brackets data, not 0
+    finally:
+        tight.shutdown()
+
+
+def test_2d_relim_toggle_remaps_colorbar_both_ways():
+    """The runtime half of G3: switching the relim combo on a LIVE 2D panel
+    re-maps the clim immediately (apply_relim_now), in BOTH directions -- a
+    normal<->tight toggle visibly re-colours the image and colorbar."""
+    card = _card("2d", source="value = frame", params={"relim": "tight"})
+    try:
+        frame = np.full((8, 8), 50.0)
+        frame[3:5, 3:5] = 250.0
+        card.refresh({"frame": frame, "shot": 1})
+        assert card.plotter.ylim_min > 0.0            # built tight
+        card._on_relim_mode("normal")
+        assert card.plotter.ylim_min == 0.0           # re-mapped to normal live
+        card._on_relim_mode("tight")
+        assert card.plotter.ylim_min > 0.0            # back to tight live
+    finally:
+        card.shutdown()
+
+
 def test_panel_title_edit_goes_through_frontend_apply_title():
     """Setting's title edit must update the title via ``BaseLivePlot._apply_title``
     (which routes through ``style.apply_title`` and the design-token

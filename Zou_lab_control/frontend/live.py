@@ -420,10 +420,23 @@ class BaseLivePlot:
         self.points_done = min(self.points_total, self.points_done + 1)
         return self.update(points_done=self.points_done, draw=draw)
 
-    def relim(self, values=None) -> bool:
+    def _mode_target(self, min_y: float, max_y: float) -> tuple[float, float]:
+        """The (lo, hi) limits for the current ``relim_mode`` -- the ONE place the
+        normal-vs-tight rule lives, shared by the 1D/monitor y-axis (``relim``) and
+        the 2D colour-limit (``Live2DDis``).  ``normal`` anchors at 0 (a counts-like
+        quantity reads against zero); ``tight`` brackets the data with 10% padding.
+        Negative data forces tight (anchoring at 0 would hide it)."""
+        rng = (max_y - min_y) or (abs(max_y) or 1.0)
+        if self.relim_mode == "normal" and min_y >= 0:
+            return 0.0, (max_y * 1.2 if max_y else 1.0)
+        return min_y - 0.1 * rng, max_y + 0.1 * rng
+
+    def relim(self, values=None, *, force: bool = False) -> bool:
         # "off": the y-limits are pinned by the caller (a dashboard panel with a
         # manual ylim); keep ylim_min/ylim_max frozen so update_core's set_ylim
         # re-applies the same fixed range instead of re-autoscaling each tick.
+        # ``force`` bypasses the dead-band: a relim_mode SWITCH must rescale NOW
+        # (the band assumes the mode is unchanged, so it would otherwise refuse).
         if self.relim_mode == "off":
             return False
         vals = np.asarray(self.data_y[:, 0] if values is None else values, dtype=float)
@@ -434,10 +447,6 @@ class BaseLivePlot:
         min_y = float(np.nanmin(vals))
         if min_y < 0:
             self.relim_mode = "tight"
-        data_range = (max_y - min_y) if self.relim_mode == "tight" else (max_y - 0)
-        if data_range == 0:
-            data_range = abs(max_y) if max_y else 1.0
-
         old = (self.ylim_min, self.ylim_max)
         lo, hi = self.ylim_min, self.ylim_max
         # Dead-band hysteresis: only rescale when the data leaves a band inside the
@@ -447,19 +456,26 @@ class BaseLivePlot:
         # set_ylim(ylim_min, ylim_max) in update_core is then a no-op.  Rescaling
         # always happens when data would clip, so a point is never hidden.
         if self.relim_mode == "normal":
-            if hi > 0 and (0.7 * hi) <= max_y <= hi:
+            if not force and hi > 0 and (0.7 * hi) <= max_y <= hi:
                 return False                          # within band -> no rescale
-            self.ylim_min = 0
-            self.ylim_max = max_y * 1.2 if max_y else 1
+            self.ylim_min, self.ylim_max = self._mode_target(min_y, max_y)
         else:
             span = hi - lo
             clips = (min_y < lo) or (max_y > hi)
             too_empty = span > 0 and (max_y < hi - 0.35 * span or min_y > lo + 0.35 * span)
-            if span > 0 and not clips and not too_empty:
+            if not force and span > 0 and not clips and not too_empty:
                 return False                          # within band -> no rescale
-            self.ylim_min = min_y - 0.1 * data_range
-            self.ylim_max = max_y + 0.1 * data_range
+            self.ylim_min, self.ylim_max = self._mode_target(min_y, max_y)
         return old != (self.ylim_min, self.ylim_max)
+
+    def apply_relim_now(self) -> None:
+        """Force the axis limits to the current relim_mode and redraw immediately.
+        Called when the mode toggles (Setting combo) -- a switch must take effect
+        now, not wait for the next data frame, and must bypass relim's dead-band.
+        1D/monitor: rescale the y-axis.  Live2DDis overrides for the colour limit."""
+        self.relim(force=True)
+        if self.ax is not None:
+            self.ax.set_ylim(self.ylim_min, self.ylim_max)
 
     def after_plot(self):
         """Create and attach a DataFigure handle."""
@@ -703,6 +719,15 @@ class Live2DDis(BaseLivePlot):
         self.ax.set_ylim(self.extents_square[2], self.extents_square[3])
         self.ax.set_xlabel(self.xlabel)
         self.ax.set_ylabel(self.ylabel)
+        # Image coordinates are the source's real space (a camera ROI can put the
+        # origin at a 4-5 digit pixel like 1648); at panel size the standard ~7-8
+        # ticks of such wide labels crowd into an unreadable blur.  Re-apply the
+        # frontend's smart locator/formatter PAIR with a tighter cap (replacing
+        # both as a unit -- swapping only the locator would orphan the paired
+        # formatter and blank every label) so the square image keeps a few legible
+        # ticks on each axis whatever the ROI origin.
+        if self.smart_ticks:
+            apply_smart_ticks(self.ax, max_ticks_x=4, max_ticks_y=4)
         self.cbar = self.fig.colorbar(self.image, cax=self.cax)
         self.cbar.set_label(self.zlabel)
         self._init_distribution()
@@ -718,11 +743,11 @@ class Live2DDis(BaseLivePlot):
             y_max = float(np.nanmax(vals))
         else:
             y_min, y_max = 0.0, 1.0
-        span = y_max - y_min
-        if span == 0:
-            span = abs(y_max) if y_max else 1.0
-        self.ylim_min = y_min - 0.1 * span
-        self.ylim_max = y_max + 0.1 * span
+        # The colour limit is the 2D analogue of the 1D y-axis, so it obeys the
+        # SAME relim_mode via the shared _mode_target: "normal" anchors the colorbar
+        # at 0 (counts read against zero), "tight" brackets the data.  (Previously
+        # this was hard-coded tight, so the Setting's normal/tight did nothing.)
+        self.ylim_min, self.ylim_max = self._mode_target(y_min, y_max)
         self.image.set_clim(self.ylim_min, self.ylim_max)
         self.axdis.set_ylim(self.ylim_min, self.ylim_max)
         self.n_bins = int(max(8, min(max(self.points_total, 1) // 4, 50)))
@@ -751,6 +776,21 @@ class Live2DDis(BaseLivePlot):
     def update_clim(self) -> None:
         self.image.set_clim(float(self.line_l.get_ydata()[0]), float(self.line_h.get_ydata()[0]))
 
+    def apply_relim_now(self) -> None:
+        # 2D analogue of the y-axis rescale: recompute the colour limit for the
+        # current relim_mode and re-apply it + the draggable clim lines now, so a
+        # normal<->tight switch in Setting visibly re-maps the colorbar.
+        vals = self._finite_values()
+        if not vals.size:
+            return
+        y_min = float(np.nanmin(vals))
+        y_max = float(np.nanmax(vals))
+        self.ylim_min, self.ylim_max = self._mode_target(y_min, y_max)
+        self.image.set_clim(self.ylim_min, self.ylim_max)
+        self.axdis.set_ylim(self.ylim_min, self.ylim_max)
+        self.line_l.set_ydata([self.ylim_min, self.ylim_min])
+        self.line_h.set_ydata([self.ylim_max, self.ylim_max])
+
     def update_core(self) -> None:
         self.grid = self.fill_grid()
         self.image.set_array(self.grid)
@@ -758,11 +798,7 @@ class Live2DDis(BaseLivePlot):
         if vals.size:
             y_min = float(np.nanmin(vals))
             y_max = float(np.nanmax(vals))
-            span = y_max - y_min
-            if span == 0:
-                span = abs(y_max) if y_max else 1.0
-            self.ylim_min = y_min - 0.1 * span
-            self.ylim_max = y_max + 0.1 * span
+            self.ylim_min, self.ylim_max = self._mode_target(y_min, y_max)   # normal=from 0, tight=bracket
             self.axdis.set_ylim(self.ylim_min, self.ylim_max)
             self.n, self.bins = np.histogram(vals, bins=self.n_bins, range=(self.ylim_min, self.ylim_max))
             _update_verts(self.bins, self.n, self.verts, mode="horizontal")
