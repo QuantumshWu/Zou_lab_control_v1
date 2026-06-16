@@ -402,6 +402,23 @@ def test_2d_zoom_updates_region_from_view_area_overrides():
         console.shutdown()
 
 
+def test_camera_frames_per_cycle_is_adjustable_in_the_gui():
+    """frames_per_cycle (one frame per emCCD trigger) is tunable IN task_console, not
+    only via the constructor: it auto-surfaces in the 2D panel's Edit -> Acquisition
+    form (it is in acquisition_parameters()), and Apply pushes it to the feed live so
+    the second trigger (frame_1) starts publishing -- no notebook edit needed."""
+    console, feed, cam, card, editor = _camera_console()
+    try:
+        assert "frames_per_cycle" in editor._feed_widgets        # auto-surfaced in the Edit form
+        assert "frame_1" not in feed.published_signals()         # default: first trigger only
+        editor._feed_widgets["frames_per_cycle"].setText("2")
+        editor._restart_feed()                                   # the GUI Apply button
+        assert feed.frames_per_cycle == 2                        # applied to the source live
+        assert "frame_1" in feed.published_signals()             # second trigger now published
+    finally:
+        console.shutdown()
+
+
 def test_feed_now_labels_track_applied_params_on_tick():
     """The Acquisition 'now:' references follow the source's CURRENT values via the
     console's per-tick refresh of the VISIBLE Edit tab (one general hook, not a
