@@ -824,18 +824,18 @@ close()     # 关闭设备，释放句柄
 
 这样产出的图像虽是合成的，但格式与真机一致（原始像素），所以 sitemap/detect 等下游照常工作，你可以在没有原子、没有相机的桌面上完整验证读出逻辑。
 
-\subsection{\pyapi{force\_all\_sites} 参数与“sitemap”遗留行为}
+\subsection{\pyapi{force\_all\_sites}：渲染满阵列（仿真专属）}
 
-\pyapi{VirtualCamera.acquire} 有一个\tfocus{显式的 \pyapi{force_all_sites} 参数}。它的来历值得说清楚，因为这是一个仿真专属的细节：
+\pyapi{VirtualCamera.acquire} 接受一个 \pyapi{force_all_sites} 参数，用来\tfocus{显式}控制“是否把所有站点都视为已装载（loaded）”。这是一个仿真专属的细节：
 
 \begin{description}
-\item[新接口] \pyapi{force_all_sites} 显式控制“是否强制所有站点都视为已装载（loaded）”。需要渲染“满阵列”图像（例如生成 sitemap 标定图）时把它打开即可。
-\item[遗留回退（legacy fallback）] 历史上，这个行为是\tfocus{隐式地}靠序列名判断的：当 \pyapi{sequence} 的名字等于 \pyapi{"sitemap"} 时，就当作“所有站点都装载”。这是一个\tfocus{仅限仿真}的便利约定。
-\item[与真机的本质区别] 真实硬件\tfocus{没有}这种捷径：要得到“所有站点都亮”的图像，必须真的把原子装载到每个站点上。仿真可以“假装”全装载，真机不行。把这一点记牢，能避免你在真机上误以为传个名字叫 \pyapi{"sitemap"} 的序列就能得到满阵列。
+\item[作用] 需要一张“满阵列”图像时（典型场景是生成 site-map 标定图，要求每个光阱都亮），传 \pyapi{force_all_sites=True}，渲染器就把每个站点都画成一个原子。不传时，按本帧实际装载情况渲染。
+\item[一个便利约定] 若没有\tfocus{显式}传 \pyapi{force_all_sites}，而 \pyapi{sequence} 的名字恰为 \pyapi{"sitemap"}，渲染器也会当作满阵列——这让标定序列无需额外参数即可拿到满阵列图。显式传入的值\tfocus{始终优先}于这个按名字的约定。
+\item[与真机的本质区别] 真实硬件\tfocus{没有}这种捷径：要得到“所有站点都亮”的图像，必须真的把原子装载到每个站点上。仿真可以“假装”全装载，真机不行——所以在真机上不要指望传个名叫 \pyapi{"sitemap"} 的序列就能得到满阵列。
 \end{description}
 
-\begin{notebox}[迁移提示]
-新代码应当用显式的 \pyapi{force_all_sites=True} 来表达“渲染满阵列”，而不是依赖 \pyapi{sequence.name == "sitemap"} 这个隐式约定。显式参数让意图清晰，也避免把仿真专属行为误带进期望在真机上同样生效的代码路径。
+\begin{notebox}[写法建议]
+表达“我要满阵列”时优先用显式的 \pyapi{force_all_sites=True}：意图清晰，且不依赖序列名这个仿真约定，也就不会把仿真专属行为误带进期望在真机上同样生效的代码路径。
 \end{notebox}
 
 \section{一个可运行的采集示例}
@@ -871,12 +871,10 @@ raw = camera.acquire(frames=3, sequence=imaging_seq, sequencer=sequencer)
 \item \pyapi{capture()} 画出来\tfocus{有圆圈或阈值}？——架构 bug，标定状态被放进了相机层，应移回 readout（sitemap/detect）。
 \item 想改曝光却去调 \pyapi{camera.configure(exposure=...)}？——在外触发实验里请改序列：\pyapi{exp.timing.configure_imaging(exposure=...)}。
 \item 真机采集报句柄无效？——检查是否漏了 \pyapi{open()}（此时 \pyapi{_dcam is None}），顺序应为 open→configure→acquire→close。
-\item 仿真想要满阵列图？——用显式 \pyapi{force_all_sites=True}，别再依赖序列名 \pyapi{"sitemap"} 的遗留回退；真机则必须真正装载原子。
+\item 仿真想要满阵列图？——优先用显式 \pyapi{force_all_sites=True}（比按序列名 \pyapi{"sitemap"} 的约定更清晰）；真机则必须真正装载原子。
 \item 帧数与触发数对不上？——别在 acquire 之外手动驱动时序器，让 \pyapi{acquire(...)} 把序列扩展到恰好 \pyapi{frames} 个触发。
 \end{itemize}
 \end{notebox}
-
-The code confirms and enriches the FACTS. I have enough grounding to write the chapter. Here is the LaTeX texbody fragment.
 
 \chapter{相机读出教程与原理（深入）}
 

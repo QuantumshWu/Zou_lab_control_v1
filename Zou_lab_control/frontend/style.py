@@ -209,6 +209,9 @@ _PALETTE: dict[str, Any] = {
     "threshold": "orange",   # threshold cut line + Gaussian-width fit line
     "annotation": NEW_BLACK,  # stats / tag text
     "readout": "grey",       # newest-value readout text
+    "fit_text": "blue",      # post-run fit-result value text (DataFigure)
+    "guide": "grey",         # faint min/max reference guide lines
+    "data_scatter": "lightgrey",  # raw data points under a post-run fit
     "pulse_name": "white",   # name drawn inside a coloured pulse bar
     "pulse_grid": "0.88",
     "pulse_repeat_note": "0.35",

@@ -129,6 +129,19 @@ def discovered_specs(readout):
         else:
             pos[name] = len(out)
             out.append(spec)
+    # Two specs publishing the same x_key/y_key would overwrite each other on the
+    # shared SignalHub (and their _sites/_grid derivatives) -- a silent data mix-up.
+    # Fail loud at discovery so a new measurement must pick a unique signal key.
+    seen: dict[str, str] = {}
+    for spec in out:
+        for key in (getattr(spec, "x_key", None), getattr(spec, "y_key", None)):
+            if not key:
+                continue
+            if key in seen and seen[key] != spec.name:
+                raise ValueError(
+                    f"measurements {seen[key]!r} and {spec.name!r} both publish signal {key!r}; "
+                    "give each measurement a unique x_key/y_key (e.g. a per-measurement prefix).")
+            seen[key] = spec.name
     return out
 
 

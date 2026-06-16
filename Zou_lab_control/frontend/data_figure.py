@@ -16,6 +16,8 @@ from scipy.optimize import OptimizeWarning, curve_fit
 from scipy.signal import find_peaks
 import warnings
 
+from .style import PALETTE, small_fontsize
+
 
 VALID_FIT_FUNCS = ["lorent", "lorent_zeeman", "rabi", "decay", "center", "gaussian"]
 
@@ -290,10 +292,10 @@ class DataFigure:
                     0.5,
                     result,
                     transform=self._ax.transAxes,
-                    color="blue",
+                    color=PALETTE["fit_text"],
                     ha="center",
                     va="center",
-                    fontsize=matplotlib.rcParams["legend.fontsize"],
+                    fontsize=small_fontsize(),
                 )
             else:
                 self.text.set_text(result)
@@ -352,16 +354,16 @@ class DataFigure:
         if self.plot_type == "1D":
             yfit = self._fit_func(self.data_x[:, 0], *popt)
             if self.fit is None:
-                self.fit = ax.plot(self.data_x[:, 0], yfit, color="orange", linestyle="-", linewidth=2, alpha=0.5)
+                self.fit = ax.plot(self.data_x[:, 0], yfit, color=PALETTE["fit_right"], linestyle="-", linewidth=2, alpha=0.5)
             else:
                 self.fit[0].set_data(self.data_x[:, 0], yfit)
         else:
             if self.fit is None:
-                self.fit = [ax.scatter(popt[-2], popt[-1], color="orange", s=50)]
+                self.fit = [ax.scatter(popt[-2], popt[-1], color=PALETTE["fit_right"], s=50)]
                 circle = matplotlib.patches.Circle(
                     (popt[-2], popt[-1]),
                     radius=abs(popt[-3]),
-                    edgecolor="orange",
+                    edgecolor=PALETTE["fit_right"],
                     facecolor="none",
                     linewidth=2,
                     alpha=0.5,
@@ -591,7 +593,7 @@ class DataFigure:
             return
         x = np.asarray(line.get_xdata())
         y = np.asarray(line.get_ydata())
-        sc = ax.scatter(x, y, s=20, color="lightgrey", edgecolors="none")
+        sc = ax.scatter(x, y, s=20, color=PALETTE["data_scatter"], edgecolors="none")
         self._scatter_list.append(sc)
         line.set_visible(False)
 

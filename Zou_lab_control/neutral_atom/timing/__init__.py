@@ -8,6 +8,7 @@ from .sequence import (
     channel_names,
     count_trigger_pulses,
     exposure_from_sequence,
+    imaging_channel_kwargs,
     imaging_sequence,
     plot_sequence,
     positive_float,

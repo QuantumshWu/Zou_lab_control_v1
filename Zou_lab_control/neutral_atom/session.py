@@ -28,7 +28,7 @@ from .core.results import (
 from .core.utils import html_summary, json_ready
 from .devices import CameraDevice, DeviceSet, SequencerDevice, load_devices, resolve_connect_config
 from .operations import calibrate_sitemap_from_images, calibrate_threshold_from_images, detect_image
-from .timing import PulseSequence, imaging_sequence
+from .timing import PulseSequence, imaging_channel_kwargs, imaging_sequence
 from .timing.verilog import generate_verilog, write_verilog_bundle
 from .subsystems import ExperimentSubsystem, ReadoutSubsystem, TimingSubsystem
 
@@ -92,24 +92,9 @@ class NeutralAtomSession:
         return imaging_sequence(**kwargs, **self._imaging_channel_kwargs())
 
     def _imaging_channel_kwargs(self) -> dict[str, str]:
-        sequencer = getattr(self.devices, "sequencer", None)
-        channels = list(getattr(sequencer, "channels", ()))
-        trigger_channels = list(getattr(sequencer, "trigger_channels", ()))
-        if all(channel in channels for channel in ("ch00", "ch03", "ch09")) and trigger_channels and trigger_channels[0] in channels:
-            return {
-                "trap_channel": "ch09",
-                "cooling_channel": "ch00",
-                "probe_channel": "ch03",
-                "trigger_channel": trigger_channels[0],
-            }
-        if all(channel in channels for channel in ("trap", "cooling", "probe", "emCCD")):
-            return {
-                "trap_channel": "trap",
-                "cooling_channel": "cooling",
-                "probe_channel": "probe",
-                "trigger_channel": "emCCD",
-            }
-        return {}
+        # Single source of truth lives in timing.imaging_channel_kwargs so the
+        # session and the loading feed map channels identically (see M4 / feeds).
+        return imaging_channel_kwargs(getattr(self.devices, "sequencer", None))
 
     def _preflight(self, *, sequence: PulseSequence | None = None, verilog: bool = True) -> PreflightReport:
         sequence = sequence or self.sequence

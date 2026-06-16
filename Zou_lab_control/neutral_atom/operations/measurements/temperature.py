@@ -12,6 +12,7 @@ from __future__ import annotations
 import numpy as np
 
 from ...core.analysis import positive_int
+from ...timing import imaging_channel_kwargs
 from ..measurement import MeasurementSpec, ParamDecl, axis_range_tuple
 from ..measurement_registry import measurement
 from ..temperature import build_release_recapture_pulse
@@ -24,7 +25,14 @@ def temperature_release_recapture(readout) -> MeasurementSpec:
     def build(*, t_off=(0.0, 300.0, 13), shots=16, capture_radius=6.0, per_site=False, **_ignored):
         t_min_us, t_max_us, points = axis_range_tuple(t_off, "t_off")
         t_off_s = np.linspace(float(t_min_us) * 1e-6, float(t_max_us) * 1e-6, int(points))
-        state = build_release_recapture_pulse(channels=list(s.devices.sequencer.channels))
+        # Target the channels the bound sequencer actually exposes (real configs
+        # name them ch00..chNN -> probe=ch03 etc.): otherwise the builder's
+        # trap/probe/emCCD placeholder roles aren't in the channel list and it
+        # raises on a real streamer.  Same single source as the imaging path; {}
+        # on a virtual/named sequencer keeps the builder's placeholder defaults.
+        kw = imaging_channel_kwargs(s.devices.sequencer)
+        role_kwargs = {k: kw[k] for k in ("trap_channel", "probe_channel", "trigger_channel") if k in kw}
+        state = build_release_recapture_pulse(channels=list(s.devices.sequencer.channels), **role_kwargs)
         from ...devices import bind_pulse  # lazy: keep operations->devices off import-time graph
 
         pulse = bind_pulse(s.devices.sequencer, state)

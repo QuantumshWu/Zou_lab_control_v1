@@ -31,7 +31,7 @@ class InteractionBundle:
     area: Optional["AreaSelector"] = None
     cross: Optional["CrossSelector"] = None
     zoom: Optional["ZoomPan"] = None
-    drag: Optional["DragHLine"] = None
+    drag: Optional["DragHLine | DragVLine"] = None   # 2-D clim drag is DragHLine; 1-D threshold drag is DragVLine
     axdis: Optional[plt.Axes] = None
     cax: Optional[plt.Axes] = None
 

@@ -1209,8 +1209,12 @@ class RemoteSequencer(SequencerDevice):
         return bool(self._conn.root.wait_done(timeout))
 
     def abort(self) -> None:
-        if self._conn is not None:
-            self._conn.root.abort()
+        # Reconnect first, exactly like fire/wait_done/set_safe_state.  abort runs
+        # on the error / safing path -- precisely when a server restart or network
+        # drop may have killed the link.  A bare "if self._conn is not None" would
+        # silently no-op on a dropped connection and leave the FPGA outputs running.
+        self.open()
+        self._conn.root.abort()
 
     def set_safe_state(self) -> None:
         self.open()
@@ -2530,6 +2534,16 @@ def serve_runtime_sequencer(
         raise RuntimeError("serve_runtime_sequencer requires `rpyc` on the FPGA computer.") from exc
 
     class RPyCSequencerService(rpyc.Service):
+        def on_disconnect(self, conn):
+            # The control client dropped (GUI closed / crashed / link lost).  A
+            # repeat_forever streamed program would otherwise keep driving the
+            # FPGA outputs with nobody watching -- leave hardware in the safe
+            # state on disconnect.  Best-effort: nothing to propagate to here.
+            try:
+                service.set_safe_state()
+            except Exception:
+                pass
+
         def exposed_prepare(self, sequence_payload):
             return json.dumps(service.prepare(sequence_payload))
 

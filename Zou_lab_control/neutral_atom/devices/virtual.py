@@ -17,6 +17,7 @@ from ..timing import (
     DEFAULT_CAMERA_TRIGGER_CHANNELS,
     PulseSequence,
     exposure_from_sequence,
+    imaging_channel_kwargs,
     sequence_for_frame_count,
 )
 
@@ -248,7 +249,11 @@ class VirtualCamera(CameraDevice):
             )
             sequencer.prepare(runtime_sequence)
             sequencer.fire(runtime_sequence)
-        exposure = exposure_from_sequence(sequence, default=self.exposure)
+        # Infer from the channel the imaging sequence actually used (probe -> ch03
+        # on a chNN sequencer); same single source as the real adapter so virtual
+        # and real track exposure identically.
+        probe_channel = imaging_channel_kwargs(sequencer).get("probe_channel", "probe")
+        exposure = exposure_from_sequence(sequence, default=self.exposure, channel=probe_channel)
         reload_each = sequence_requests_load(sequence)
         images: list[np.ndarray] = []
         # "All sites loaded" (for sitemap calibration) is best requested

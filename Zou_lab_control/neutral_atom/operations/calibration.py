@@ -59,6 +59,10 @@ def calibrate_sitemap_from_images(
     average = np.mean(np.stack(stack, axis=0), axis=0)
     centers = find_site_centers(average, grid_shape, ordering=ordering)
     thresholds = np.zeros(len(centers), dtype=float)
+    # Fingerprint the frame geometry the centers were detected on, so a later
+    # ROI change is caught at readout (TrapCalibration.signals) instead of
+    # silently extracting the wrong pixels.
+    image_shape = [int(average.shape[0]), int(average.shape[1])]
 
     if method == "psf":
         psfs = fit_site_psfs(average, centers, half_width=psf_half_width)
@@ -72,7 +76,7 @@ def calibrate_sitemap_from_images(
             psf_weights=psf_weights_array(psfs),
             psf_boxes=psf_boxes_array(psfs),
             background=background,
-            metadata={"stage": "sitemap", "thresholds_calibrated": False, "method": "psf", "psf_half_width": int(psf_half_width)},
+            metadata={"stage": "sitemap", "thresholds_calibrated": False, "method": "psf", "psf_half_width": int(psf_half_width), "image_shape": image_shape},
         )
     else:
         calibration = TrapCalibration(
@@ -82,7 +86,7 @@ def calibrate_sitemap_from_images(
             roi_radius=roi_radius,
             reducer=reducer,
             method="box",
-            metadata={"stage": "sitemap", "thresholds_calibrated": False, "method": "box"},
+            metadata={"stage": "sitemap", "thresholds_calibrated": False, "method": "box", "image_shape": image_shape},
         )
     plot = plot_image(average, centers=centers, roi_radius=roi_radius, display=display)
     return SitemapResult(calibration, average, stack, plot=plot)

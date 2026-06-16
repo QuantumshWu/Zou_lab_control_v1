@@ -28,6 +28,11 @@ class SignalHub:
         self._signals: dict[str, deque] = {}
         self._version = 0
         self._shot = 0
+        # Per-signal publish counter: lets a consumer tell "MY signal got a new
+        # sample" from "the global version bumped because some OTHER feed
+        # published" -- e.g. a rolling monitor must append one point per sample
+        # of its own source, not one per unrelated feed tick.
+        self._sig_version: dict[str, int] = {}
 
     # ------------------------------------------------------------- publish side
     def publish(self, values: Mapping[str, object], *, shot: int | None = None) -> int:
@@ -47,14 +52,24 @@ class SignalHub:
                     ring = deque(maxlen=self._history_len)
                     self._signals[key] = ring
                 ring.append(arr)
+                self._sig_version[key] = self._sig_version.get(key, 0) + 1
             self._version += 1
             return self._version
 
     def clear(self) -> None:
         with self._lock:
             self._signals.clear()
+            self._sig_version.clear()
             self._version += 1
             self._shot = 0
+
+    def signal_versions(self) -> dict[str, int]:
+        """``{name: publish_count}`` snapshot -- one counter per signal, bumped
+        each time that name is published.  A consumer compares a name's counter
+        across ticks to detect a NEW sample of THAT signal (vs. a global version
+        bump caused by an unrelated feed)."""
+        with self._lock:
+            return dict(self._sig_version)
 
     # ------------------------------------------------------------- consumer side
     @property

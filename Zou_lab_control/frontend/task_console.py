@@ -493,6 +493,9 @@ def resolve_task_state(task: str) -> TaskConsoleState:
 
 
 # ====================================================================== panels
+_MONITOR_UNSET = object()   # sentinel: a monitor panel that has never rolled yet
+
+
 class PanelCard(FluentGroupBox):
     """One dashboard panel: a titled frame (title = the panel KIND) holding the
     frontend canvas, a status footer, and a text "Setting" button on the title
@@ -513,6 +516,12 @@ class PanelCard(FluentGroupBox):
         self.canvas = None
         self._value_shape: tuple[int, ...] | None = None
         self._compiled_source = config.source
+        # Monitor roll-gate: remembers the per-signal version of this panel's
+        # source at the last roll, so an unrelated feed's version bump does not
+        # append a duplicate point.  `_MONITOR_UNSET` = never rolled yet.
+        self._last_monitor_key: object = _MONITOR_UNSET
+        self._ref_src: str | None = None
+        self._ref_names: frozenset = frozenset()
         self._drag_offset: QtCore.QPoint | None = None
         self.setCursor(QtCore.Qt.OpenHandCursor)   # the frame border drags
 
@@ -1065,6 +1074,24 @@ class PanelCard(FluentGroupBox):
         image = namespace.get(image_name) if image_name else None
         return centers[:, :2], (None if image is None else np.asarray(image, dtype=float))
 
+    def _monitor_source_key(self, namespace: Mapping[str, object] | None):
+        """Version key of the signals this panel's source reads, or None when
+        none are detectable.  None => caller rolls every tick (safe fallback)."""
+        versions = (namespace or {}).get("__sig_versions__")
+        if not isinstance(versions, dict) or not versions:
+            return None
+        src = self._compiled_source
+        if src != self._ref_src:               # (re)derive referenced names on source change
+            self._ref_src = src
+            try:
+                self._ref_names = frozenset(compile(str(src), "<panel-source>", "exec").co_names)
+            except Exception:
+                self._ref_names = frozenset()
+        refs = [n for n in self._ref_names if n in versions]
+        if not refs:
+            return None
+        return tuple(sorted((n, versions[n]) for n in refs))
+
     def _feed(self, value, namespace: Mapping[str, object] | None = None) -> None:
         # PERFORMANCE: feed data with draw=False and queue ONE draw_idle per
         # panel -- rendering happens in Qt's paint pass (coalesced per frame),
@@ -1079,10 +1106,24 @@ class PanelCard(FluentGroupBox):
         if rebuild:
             self._build_plot(value, namespace)
             self._value_shape = (1,) if isinstance(value, float) else tuple(np.shape(value))
+            if kind in ("monitor", "monitor_nodist"):
+                # The build already plotted this value as the first point; record
+                # its source version so the next UNRELATED bump won't duplicate it.
+                self._last_monitor_key = self._monitor_source_key(namespace)
             return
         if kind == "2d":
             self.plotter.update(np.asarray(value).ravel(), draw=False)
         elif kind in ("monitor", "monitor_nodist"):
+            # Roll ONE point per new sample of this monitor's own source.  With
+            # several feeds, an unrelated feed bumps hub.version and refreshes
+            # every panel; without this gate the monitor would append a duplicate
+            # point each time.  When the source's referenced signals are
+            # undetectable (e.g. it reads via history("name")) we fall back to
+            # rolling every tick -- never worse than before.
+            key = self._monitor_source_key(namespace)
+            if key is not None and key == self._last_monitor_key:
+                return
+            self._last_monitor_key = key
             self.plotter.roll(value, draw=False)
         elif kind == "sites":
             self.plotter.update(value, draw=False)
@@ -1750,6 +1791,11 @@ class PanelEditor(QtWidgets.QWidget):
             self.status.setText(f"could not snapshot: {str(exc).splitlines()[0][:120]}")
             return
         self._canvas = panel_canvas(self._plotter.fig)
+        # The Edit page lives in a scroll area; without a floor its QVBoxLayout
+        # SQUISHES the canvas below the figure's design height (clipping the plot
+        # and the y-axis label -- the snapshot then looks empty/broken).  Pin the
+        # minimum to the figure's own size so the page SCROLLS instead of squishing.
+        self._canvas.setMinimumSize(self._canvas.sizeHint())
         self.canvas_holder.addWidget(self._canvas, alignment=QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop)
         self._canvas.draw_idle()
         self._df = None
@@ -2409,6 +2455,9 @@ class TaskConsole(QtWidgets.QWidget):
         namespace["latest"] = self.hub.latest
         namespace["names"] = self.hub.names
         namespace["shot"] = self.hub.shot
+        # Per-signal publish counters (reserved key) so a rolling monitor can tell
+        # a new sample of its own source from an unrelated feed's version bump.
+        namespace["__sig_versions__"] = self.hub.signal_versions()
         return namespace
 
     def _tick(self) -> None:
@@ -2435,9 +2484,20 @@ class TaskConsole(QtWidgets.QWidget):
             n_signals = len(self.hub.names())
         except Exception:
             n_signals = 0
-        self.summary.setText(
-            f"{len(self.cards)} panels | {n_signals} signals | shot {self.hub.shot}"
-            f" | every {self.state.interval_ms} ms")
+        # A wedged feed must not fail silently: if any feed recorded an error,
+        # raise a red banner naming it instead of just showing frozen data.
+        faulted = [f for f in self.feeds if getattr(f, "last_error", None)]
+        if faulted:
+            f = faulted[0]
+            who = (getattr(f, "prefix", "") or "feed").rstrip(":")
+            n = int(getattr(f, "consecutive_errors", 1))
+            self.summary.set_danger(True)
+            self.summary.setText(f"⚠ FEED ERROR ({who}, ×{n}): {f.last_error}"[:200])
+        else:
+            self.summary.set_danger(False)
+            self.summary.setText(
+                f"{len(self.cards)} panels | {n_signals} signals | shot {self.hub.shot}"
+                f" | every {self.state.interval_ms} ms")
 
     # ------------------------------------------------------------------ files
     def save_to_file(self) -> None:

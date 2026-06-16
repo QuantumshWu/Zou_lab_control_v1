@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import importlib
+import time
 from typing import Any, Sequence
 
 import numpy as np
 
 from ..core.analysis import finite_float, positive_int
-from ..timing import DEFAULT_CAMERA_TRIGGER_CHANNELS, exposure_from_sequence
-from .base import CameraDevice
+from ..timing import DEFAULT_CAMERA_TRIGGER_CHANNELS, exposure_from_sequence, imaging_channel_kwargs
+from .base import AcquisitionCancelled, CameraDevice
 from .sequencer import PulseController, finite_frame_sequence
 
 
@@ -23,6 +24,13 @@ class QCMOSConfig:
     roi: tuple[int, int, int, int] | None = None
     device_index: int = 0
     timeout_ms: int = 10_000
+    # Shutter/exposure scheme.  Left None = the camera's power-on default
+    # (ORCA-qCMOS is rolling-shutter AREA), which staggers row exposure relative
+    # to the single FPGA trigger.  Synchronous atom imaging usually wants a
+    # consciously chosen mode -- set these (raw DCAMPROP enum ints) in the camera
+    # config to pin it; they are written + read back only when not None.
+    sensor_mode: int | None = None
+    trigger_global_exposure: int | None = None
 
     def __post_init__(self) -> None:
         self.exposure = positive_float(self.exposure, "exposure")
@@ -31,6 +39,10 @@ class QCMOSConfig:
         self.timeout_ms = positive_int(self.timeout_ms, "timeout_ms")
         if self.roi is not None:
             self.roi = normalize_roi(self.roi)
+        if self.sensor_mode is not None:
+            self.sensor_mode = nonnegative_int(self.sensor_mode, "sensor_mode")
+        if self.trigger_global_exposure is not None:
+            self.trigger_global_exposure = nonnegative_int(self.trigger_global_exposure, "trigger_global_exposure")
 
 
 DEFAULT_DCAM_MODULE = "Zou_lab_control.neutral_atom.devices.drivers.dcam.dcam"
@@ -54,6 +66,10 @@ class QCMOSCamera(CameraDevice):
     @property
     def exposure(self) -> float:
         return self.config.exposure
+
+    @property
+    def roi(self) -> tuple[int, int, int, int] | None:
+        return self.config.roi
 
     def configure(self, *, exposure: float | None = None, readout_speed: int | None = None, roi: Sequence[int] | None | object = None) -> None:
         if exposure is not None:
@@ -81,14 +97,19 @@ class QCMOSCamera(CameraDevice):
         self._write_settings()
         return self
 
-    def acquire(self, frames: int = 1, *, sequence=None, sequencer=None, timeout_ms: int | None = None) -> list[np.ndarray]:
+    def acquire(self, frames: int = 1, *, sequence=None, sequencer=None, timeout_ms: int | None = None, stop=None) -> list[np.ndarray]:
         frames = positive_int(frames, "frames")
         self.open()
         if sequencer is None and isinstance(sequence, PulseController):
             sequencer = sequence.sequencer
         runtime_sequence = self._sequence_for_frames(sequence, frames=frames, sequencer=sequencer)
         if sequence is not None:
-            sequence_exposure = exposure_from_sequence(runtime_sequence, default=self.config.exposure)
+            # Read exposure off the SAME channel the imaging sequence put the probe
+            # pulse on: imaging_channel_kwargs maps probe -> ch03 on a real chNN
+            # streamer, so inferring from the placeholder "probe" name would miss
+            # it and silently pin the camera at config exposure (a flat scan).
+            probe_channel = imaging_channel_kwargs(sequencer).get("probe_channel", "probe")
+            sequence_exposure = exposure_from_sequence(runtime_sequence, default=self.config.exposure, channel=probe_channel)
             if sequence_exposure != self.config.exposure:
                 self.config.exposure = sequence_exposure
                 self._write_settings()
@@ -110,9 +131,24 @@ class QCMOSCamera(CameraDevice):
                     raise RuntimeError("sequencer must expose fire(sequence) for real qCMOS acquire.")
                 fire(runtime_sequence)
             timeout = self.config.timeout_ms if timeout_ms is None else positive_int(timeout_ms, "timeout_ms")
+            # When a live feed passes a stop event, wait in short slices and check
+            # it between slices so Stop interrupts a wedged trigger within ~one
+            # slice instead of blocking the full timeout.  Without a stop event,
+            # one wait of the full timeout (the original behaviour).
+            poll_ms = min(timeout, 200) if stop is not None else timeout
             next_frame = 0
+            deadline = time.monotonic() + timeout / 1000.0
             while next_frame < frames:
-                if dcam.wait_capevent_frameready(timeout) is False:
+                if stop is not None and stop.is_set():
+                    raise AcquisitionCancelled(f"qCMOS acquire cancelled while waiting for frame {next_frame}.")
+                slice_ms = poll_ms
+                if stop is not None:
+                    slice_ms = max(1, min(poll_ms, int((deadline - time.monotonic()) * 1000)))
+                if dcam.wait_capevent_frameready(slice_ms) is False:
+                    if stop is not None and not stop.is_set() and time.monotonic() < deadline:
+                        continue  # slice expired but neither stopped nor timed out -- keep polling
+                    if stop is not None and stop.is_set():
+                        raise AcquisitionCancelled(f"qCMOS acquire cancelled while waiting for frame {next_frame}.")
                     raise TimeoutError(f"qCMOS timed out after {timeout} ms waiting for frame {next_frame}.")
                 info = dcam.cap_transferinfo()
                 available = int(getattr(info, "nFrameCount", next_frame + 1)) if info is not False else next_frame + 1
@@ -160,21 +196,53 @@ class QCMOSCamera(CameraDevice):
             trigger_channels=trigger_channels if trigger_channels is not None else DEFAULT_CAMERA_TRIGGER_CHANNELS,
         )
 
+    def _set_prop(self, idprop, value, name: str, *, verify: bool = False) -> None:
+        """Write a DCAM property and FAIL LOUDLY if the camera rejects it.
+
+        ``prop_setvalue`` returns False (and sets ``lasterr``) on a rejected
+        write, so an unchecked write leaves the camera silently in its prior
+        state -- e.g. a rejected external-trigger write keeps internal trigger,
+        and the next acquire just times out with a confusing message.  ``verify``
+        additionally reads the value back (critical trigger props) so a clamp /
+        silent substitution also fails here, not at first light."""
+        dcam = self._dcam
+        if dcam.prop_setvalue(idprop, value) is False:
+            raise RuntimeError(f"qCMOS rejected {name} = {value}: {dcam.lasterr()}")
+        if verify:
+            read = dcam.prop_getvalue(idprop)
+            if read is False:
+                raise RuntimeError(f"qCMOS could not read back {name}: {dcam.lasterr()}")
+            # DCAM round-trips properties as doubles; compare numerically with a
+            # tolerance, falling back to equality for non-numeric enum sentinels.
+            try:
+                mismatch = abs(float(read) - float(value)) > 1e-9
+            except (TypeError, ValueError):
+                mismatch = read != value
+            if mismatch:
+                raise RuntimeError(f"qCMOS {name} read back {read!r}, expected {value!r} "
+                                   "(property clamped/substituted by the camera).")
+
     def _write_settings(self) -> None:
         mod = self._module
-        dcam = self._dcam
-        dcam.prop_setvalue(mod.DCAM_IDPROP.EXPOSURETIME, self.config.exposure)
-        dcam.prop_setvalue(mod.DCAM_IDPROP.TRIGGERSOURCE, mod.DCAMPROP.TRIGGERSOURCE.EXTERNAL)
-        dcam.prop_setvalue(mod.DCAM_IDPROP.TRIGGERACTIVE, mod.DCAMPROP.TRIGGERACTIVE.EDGE)
-        dcam.prop_setvalue(mod.DCAM_IDPROP.TRIGGERPOLARITY, mod.DCAMPROP.TRIGGERPOLARITY.POSITIVE)
-        dcam.prop_setvalue(mod.DCAM_IDPROP.READOUTSPEED, self.config.readout_speed)
+        self._set_prop(mod.DCAM_IDPROP.EXPOSURETIME, self.config.exposure, "exposure")
+        # External rising-edge trigger is the imaging scheme -- verify the camera
+        # actually accepted it (these are the writes that fail silently on a
+        # mis-set / unsupported camera and then hang acquire).
+        self._set_prop(mod.DCAM_IDPROP.TRIGGERSOURCE, mod.DCAMPROP.TRIGGERSOURCE.EXTERNAL, "trigger_source", verify=True)
+        self._set_prop(mod.DCAM_IDPROP.TRIGGERACTIVE, mod.DCAMPROP.TRIGGERACTIVE.EDGE, "trigger_active", verify=True)
+        self._set_prop(mod.DCAM_IDPROP.TRIGGERPOLARITY, mod.DCAMPROP.TRIGGERPOLARITY.POSITIVE, "trigger_polarity", verify=True)
+        self._set_prop(mod.DCAM_IDPROP.READOUTSPEED, self.config.readout_speed, "readout_speed")
+        if self.config.sensor_mode is not None:
+            self._set_prop(mod.DCAM_IDPROP.SENSORMODE, self.config.sensor_mode, "sensor_mode", verify=True)
+        if self.config.trigger_global_exposure is not None:
+            self._set_prop(mod.DCAM_IDPROP.TRIGGER_GLOBALEXPOSURE, self.config.trigger_global_exposure, "trigger_global_exposure", verify=True)
         if self.config.roi is not None:
             x, width, y, height = self.config.roi
-            dcam.prop_setvalue(mod.DCAM_IDPROP.SUBARRAYMODE, mod.DCAMPROP.MODE.ON)
-            dcam.prop_setvalue(mod.DCAM_IDPROP.SUBARRAYHSIZE, width)
-            dcam.prop_setvalue(mod.DCAM_IDPROP.SUBARRAYHPOS, x)
-            dcam.prop_setvalue(mod.DCAM_IDPROP.SUBARRAYVSIZE, height)
-            dcam.prop_setvalue(mod.DCAM_IDPROP.SUBARRAYVPOS, y)
+            self._set_prop(mod.DCAM_IDPROP.SUBARRAYMODE, mod.DCAMPROP.MODE.ON, "subarray_mode")
+            self._set_prop(mod.DCAM_IDPROP.SUBARRAYHSIZE, width, "subarray_hsize")
+            self._set_prop(mod.DCAM_IDPROP.SUBARRAYHPOS, x, "subarray_hpos")
+            self._set_prop(mod.DCAM_IDPROP.SUBARRAYVSIZE, height, "subarray_vsize")
+            self._set_prop(mod.DCAM_IDPROP.SUBARRAYVPOS, y, "subarray_vpos")
 
     def close(self) -> None:
         if self._dcam is not None:

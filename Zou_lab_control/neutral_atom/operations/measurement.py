@@ -20,6 +20,7 @@ test_virtual_equals_real_contract.py`` guards this).
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol, runtime_checkable
 
@@ -241,6 +242,14 @@ class OtsuFidelityReducer:
     pools all sites; an int restricts to one site.  Each reduce records its
     threshold/fidelity in ``thresholds``/``fidelities`` so the detection-time
     wrapper can surface them.
+
+    Scope: this is a LIVE quick-look estimate -- a Gaussian two-population MODEL
+    fidelity from the same shots it thresholds (no train/test split, no truth
+    labels), which is the right cheap signal to optimize a detection time on a
+    rolling curve.  For a rigorous HELD-OUT, per-site empirical fidelity (truth
+    from reference shots, threshold trained on a split, fidelity scored on the
+    held-out split), run ``exp.readout.characterize(...)`` -- a separate
+    characterization that acquires the reference frames the live scan does not.
     """
 
     site: int | None = None
@@ -331,6 +340,23 @@ class ScannedMeasurement:
                 "pulse must be a PulseController returned by exp.timing.bind_pulse(...) "
                 "or na.bind_pulse(...)."
             )
+        # Fail early on a DAC axis whose slot the bound pulse doesn't have: a bad
+        # slot key is otherwise silently stored by set_slot and never applied, so
+        # the scan runs but moves nothing -- a wrong experiment with no error.
+        # (e.g. slot=0 stringifies to "0", not "s0"; a typo "s5" on a 3-slot pulse.)
+        if self.axis.kind == "dac":
+            underlying = getattr(self.pulse, "pulse", None)
+            # PulseTableState exposes its scan-slot keys as the `scan_var_names`
+            # property ("s0".."sN"); validate against it when present.
+            known = getattr(underlying, "scan_var_names", None)
+            if known and self.axis.slot not in known:
+                raise ValueError(
+                    f"ScanAxis.slot {self.axis.slot!r} is not a scan slot of the bound pulse "
+                    f"(known slots: {list(known)}); a DAC scan must target one of them.")
+        # A driver (e.g. ScannedMeasurementFeed) sets this to its stop Event so a
+        # Stop interrupts a wedged trigger DURING a scan point, not just between
+        # points; None = the synchronous notebook path (no mid-point cancel).
+        self.stop_event = None
 
     def _sequencer(self):
         # Prefer the sequencer the pulse is bound to (single source of truth);
@@ -345,9 +371,17 @@ class ScannedMeasurement:
         sequencer = self._sequencer()
         rows = []
         for _ in range(self.shots_per_point):
-            frames = self.camera.acquire(self.plan.n_frames, sequence=sequence, sequencer=sequencer)
+            frames = self.camera.acquire(self.plan.n_frames, sequence=sequence, sequencer=sequencer,
+                                         stop=self.stop_event)
             rows.append(np.atleast_1d(np.asarray(self.reducer.reduce(frames, self.calibration), dtype=float)))
-        return np.mean(np.vstack(rows), axis=0)
+        # nanmean, not mean: a per-site reducer returns NaN for a site that was
+        # empty on a given shot (no atom -> survival undefined).  Plain mean would
+        # let one NaN shot poison that site's entire scan point to NaN.  nanmean
+        # averages the shots where the site was occupied; a site empty across ALL
+        # shots stays NaN (correctly: no data), with the all-NaN warning silenced.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            return np.nanmean(np.vstack(rows), axis=0)
 
     def run(self, *, live: bool = True, update_time: float = 0.05, display: bool = True,
             stop_hint: str | bool = True) -> ScanResult:

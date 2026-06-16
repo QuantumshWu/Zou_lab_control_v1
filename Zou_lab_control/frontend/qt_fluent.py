@@ -662,22 +662,40 @@ class FluentLineEdit(QtWidgets.QLineEdit):
         self._res_step: float | None = None
         self._allow_any = True
         self.setMinimumHeight(scaled_px(30, minimum=22))
+        self._danger = False
+        self._apply_style()
+        self.setText(str(text))
+        self.editingFinished.connect(self._snap_to_resolution)
+
+    def _apply_style(self) -> None:
+        # One owned stylesheet; the text/border colour swaps to the shared RED
+        # error token when in the danger state (e.g. surfacing a wedged feed).
+        colour = RED if self._danger else TEXT
+        border = RED if self._danger else PLACEHOLDER
+        # A read-only status line is often disabled; the :disabled colour must
+        # still honour danger or a red banner would render grey.
+        disabled_colour = RED if self._danger else PLACEHOLDER
         self.setStyleSheet(
             f"""
             QLineEdit {{
                 background: white;
-                border: 1px solid {PLACEHOLDER};
+                border: 1px solid {border};
                 border-radius: {_radius()}px;
                 padding: {scaled_px(PADDING_V)}px {scaled_px(EDIT_PADDING_H)}px;
-                color: {TEXT};
+                color: {colour};
                 font: {fluent_font_size()}pt "{FONT}";
             }}
             QLineEdit:focus {{ border: 1px solid {ACCENT}; }}
-            QLineEdit:disabled {{ background: {BG}; color: {PLACEHOLDER}; }}
+            QLineEdit:disabled {{ background: {BG}; color: {disabled_colour}; }}
             """
         )
-        self.setText(str(text))
-        self.editingFinished.connect(self._snap_to_resolution)
+
+    def set_danger(self, on: bool) -> None:
+        """Toggle a red error styling (used for inline status/banner widgets)."""
+        on = bool(on)
+        if on != self._danger:
+            self._danger = on
+            self._apply_style()
 
     def setText(self, text: str) -> None:  # noqa: N802 - Qt API name
         text = str(text)

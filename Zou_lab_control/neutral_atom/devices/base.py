@@ -8,6 +8,14 @@ from typing import Any
 import numpy as np
 
 
+class AcquisitionCancelled(Exception):
+    """Raised by ``acquire`` when its optional ``stop`` event fires mid-wait.
+
+    Distinct from ``TimeoutError`` (a real fault): cancellation is an
+    intentional Stop, so the feed loop treats it as a clean exit rather than a
+    recorded error / banner."""
+
+
 class BaseDevice(ABC):
     """Common device lifecycle.
 
@@ -44,13 +52,30 @@ class CameraDevice(BaseDevice):
     def exposure(self) -> float:
         """Current default exposure in seconds."""
 
+    @property
+    def roi(self) -> tuple[int, int, int, int] | None:
+        """Sub-array readout window ``(x, width, y, height)``, or None for full frame.
+
+        Part of the contract so a consumer (e.g. a raw-frame feed's Edit panel)
+        reads ROI without reaching into a backend's private ``config``.  Default
+        None: a camera with no sub-array concept (the virtual renderer) honestly
+        has no ROI; the real qCMOS overrides this."""
+        return None
+
     @abstractmethod
     def configure(self, *, exposure: float | None = None, **kwargs) -> None:
         """Configure camera settings that are stable across an acquisition."""
 
     @abstractmethod
     def acquire(self, frames: int = 1, *, sequence=None, sequencer=None, **kwargs) -> list[np.ndarray]:
-        """Acquire ``frames`` images and return one numpy array per frame."""
+        """Acquire ``frames`` images and return one numpy array per frame.
+
+        Optional ``stop`` kwarg: a ``threading.Event`` a live feed can set to
+        interrupt a blocking wait (e.g. a camera awaiting an external trigger
+        that never comes).  Implementations that honour it poll the event while
+        waiting and raise :class:`AcquisitionCancelled` when it is set, instead
+        of blocking for the full timeout; implementations that cannot interrupt
+        may ignore it."""
 
     def capture(self, *, frames: int = 1, exposure: float | None = None, sequence=None, display: bool = True, **kwargs):
         """Acquire images and return a notebook-friendly ``CaptureResult``.

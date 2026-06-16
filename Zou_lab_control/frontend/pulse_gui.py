@@ -1868,7 +1868,11 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         # visual consistency.  Kept compact (single-line buttons, tight 2x4 grid,
         # small margins) so the name/delay/period area keeps its vertical room. ---
         self.button_frame = FluentFrame(shadow=False)
-        self.button_frame.setStyleSheet("QFrame { background: transparent; border: none; }")
+        # Scope the reset to THIS frame via an ID selector: a bare `QFrame { ... }`
+        # cascades `border: none` onto the titled Control/Channels cards nested
+        # inside it and strips their group-box borders (root AGENTS §5.1).
+        self.button_frame.setObjectName("zlcPulseButtonBar")
+        self.button_frame.setStyleSheet("QFrame#zlcPulseButtonBar { background: transparent; border: none; }")
         bar = QtWidgets.QHBoxLayout(self.button_frame)
         # Inset the Control / Channels group boxes by the shadow pad on every side
         # so their drop shadows have room to render inside the frame instead of

@@ -332,6 +332,36 @@ def imaging_sequence(
     return seq
 
 
+def imaging_channel_kwargs(sequencer: object) -> dict[str, str]:
+    """Channel kwargs for :func:`imaging_sequence`, derived from a bound sequencer.
+
+    Single source of truth shared by the session and the loading feed: a real
+    streamer config names channels ``ch00..chNN`` (the imaging sequence must
+    target THOSE, not the ``trap``/``cooling``/``probe``/``emCCD`` placeholder
+    names, or every pulse references a channel the device does not have).  Maps
+    the conventional roles onto whatever the sequencer actually exposes; returns
+    ``{}`` when neither convention is present so the caller falls back to
+    :func:`imaging_sequence`'s own placeholder defaults (virtual / notebook use)."""
+
+    channels = list(getattr(sequencer, "channels", ()) or ())
+    trigger_channels = list(getattr(sequencer, "trigger_channels", ()) or ())
+    if all(ch in channels for ch in ("ch00", "ch03", "ch09")) and trigger_channels and trigger_channels[0] in channels:
+        return {
+            "trap_channel": "ch09",
+            "cooling_channel": "ch00",
+            "probe_channel": "ch03",
+            "trigger_channel": trigger_channels[0],
+        }
+    if all(ch in channels for ch in ("trap", "cooling", "probe", "emCCD")):
+        return {
+            "trap_channel": "trap",
+            "cooling_channel": "cooling",
+            "probe_channel": "probe",
+            "trigger_channel": "emCCD",
+        }
+    return {}
+
+
 DEFAULT_CAMERA_TRIGGER_CHANNELS = ("emCCD",)
 
 

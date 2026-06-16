@@ -484,7 +484,7 @@ class PulseTableState:
         buses = self.bus_channels(min_width=1)
         out: list[tuple[int, int] | None] = []
         for slot in self.scan_slots:
-            if getattr(slot, "kind", "") == "dac":
+            if slot.kind == "dac":
                 width = max(1, len(buses.get(slot.dac_bus, [])))
                 out.append(bus_signed_range(width))
             else:
@@ -1645,7 +1645,7 @@ def snap_scan_table(
     for row in normalized:
         new_row: list[float] = []
         for index, (value, slot) in enumerate(zip(row, scan_slots)):
-            if getattr(slot, "kind", "") == "dac":
+            if slot.kind == "dac":
                 rng = None
                 if dac_ranges is not None and index < len(dac_ranges):
                     rng = dac_ranges[index]

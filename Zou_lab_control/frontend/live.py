@@ -269,6 +269,11 @@ class BaseLivePlot:
         self._install_state()
         if self.interactions:
             self._attach_interactions()
+        # Strong self-ref on the figure (confocal's `fig._live_plotter` pattern):
+        # the nb live loop / QTimer hold the plotter, but an explicit anchor keeps
+        # it alive for the figure's lifetime even if a caller drops its reference,
+        # rather than relying only on the transitive `_zlc_tools` -> bound-method ref.
+        self.fig._zlc_plotter = self
         self._shown = True
         if display:
             display_figure(self.fig)
@@ -434,10 +439,24 @@ class BaseLivePlot:
             data_range = abs(max_y) if max_y else 1.0
 
         old = (self.ylim_min, self.ylim_max)
+        lo, hi = self.ylim_min, self.ylim_max
+        # Dead-band hysteresis: only rescale when the data leaves a band inside the
+        # current view, so a noisy rolling trace does not jitter its y-limits (and
+        # re-blit) every single frame.  When the data still sits comfortably in the
+        # view, freeze the limits and return False -- the unconditional
+        # set_ylim(ylim_min, ylim_max) in update_core is then a no-op.  Rescaling
+        # always happens when data would clip, so a point is never hidden.
         if self.relim_mode == "normal":
+            if hi > 0 and (0.7 * hi) <= max_y <= hi:
+                return False                          # within band -> no rescale
             self.ylim_min = 0
             self.ylim_max = max_y * 1.2 if max_y else 1
         else:
+            span = hi - lo
+            clips = (min_y < lo) or (max_y > hi)
+            too_empty = span > 0 and (max_y < hi - 0.35 * span or min_y > lo + 0.35 * span)
+            if span > 0 and not clips and not too_empty:
+                return False                          # within band -> no rescale
             self.ylim_min = min_y - 0.1 * data_range
             self.ylim_max = max_y + 0.1 * data_range
         return old != (self.ylim_min, self.ylim_max)
@@ -531,10 +550,10 @@ class LiveLive(Live1D):
                     0.95,
                     label,
                     transform=self.ax.transAxes,
-                    color="grey",
+                    color=PALETTE["readout"],
                     ha="right",
                     va="top",
-                    fontsize=matplotlib.rcParams["legend.fontsize"],
+                    fontsize=small_fontsize(),
                 )
             else:
                 self.text.set_text(label)
@@ -572,7 +591,7 @@ class LiveLiveDis(LiveLive):
         self.axdis.add_collection(self.poly)
         self.counts_max = max(10, int(np.nanmax(self.n) + 5 if self.n.size else 10))
         self.axdis.set_xlim(0, self.counts_max)
-        (self.gauss_line,) = self.axdis.plot([], [], color="orange", alpha=1)
+        (self.gauss_line,) = self.axdis.plot([], [], color=PALETTE["fit_right"], alpha=1)
 
     def _hist(self):
         vals = self.data_y[: max(self.points_done, 1), 0]
@@ -612,10 +631,10 @@ class LiveLiveDis(LiveLive):
                 1.005,
                 label,
                 transform=self.axdis.transAxes,
-                color="orange",
+                color=PALETTE["fit_right"],
                 ha="center",
                 va="bottom",
-                fontsize=matplotlib.rcParams["legend.fontsize"],
+                fontsize=small_fontsize(),
             )
         else:
             self.fit_text.set_text(label)
@@ -626,7 +645,8 @@ class LiveLiveDis(LiveLive):
         self.n, self.bins = self._hist()
         _update_verts(self.bins, self.n, self.verts, mode="horizontal")
         self.poly.set_verts(self.verts)
-        counts_max = max(10, int(max(np.nanmax(self.n) + 5, np.nanmax(self.n) * 1.5)))
+        peak = np.nanmax(self.n)
+        counts_max = max(10, int(max(peak + 5, peak * 1.5)))
         self.axdis.set_xlim(0, counts_max)
         self._update_gauss_fit()
 
@@ -716,11 +736,11 @@ class Live2DDis(BaseLivePlot):
         self.axdis.xaxis.set_major_formatter(ScalarFormatter())
         self.axdis.tick_params(axis="x", which="both", bottom=True, top=False, labelbottom=True, labeltop=False)
         self.axdis.tick_params(axis="y", which="both", left=True, right=False, labelleft=False, labelright=False)
-        self.line_min = self.axdis.axhline(y_min, color="grey", linewidth=matplotlib.rcParams["legend.fontsize"] / 2, alpha=0.3)
-        self.line_max = self.axdis.axhline(y_max, color="grey", linewidth=matplotlib.rcParams["legend.fontsize"] / 2, alpha=0.3)
+        self.line_min = self.axdis.axhline(y_min, color=PALETTE["guide"], linewidth=small_fontsize() / 2, alpha=0.3)
+        self.line_max = self.axdis.axhline(y_max, color=PALETTE["guide"], linewidth=small_fontsize() / 2, alpha=0.3)
         cmap = self.image.get_cmap()
-        self.line_l = self.axdis.axhline(self.ylim_min, color=cmap(0.0), linewidth=matplotlib.rcParams["legend.fontsize"] / 2)
-        self.line_h = self.axdis.axhline(self.ylim_max, color=cmap(0.95), linewidth=matplotlib.rcParams["legend.fontsize"] / 2)
+        self.line_l = self.axdis.axhline(self.ylim_min, color=cmap(0.0), linewidth=small_fontsize() / 2)
+        self.line_h = self.axdis.axhline(self.ylim_max, color=cmap(0.95), linewidth=small_fontsize() / 2)
         # colorbar end ticks are set by update_core (cax.set_yticks/labels)
         self.drag = DragHLine(self.line_l, self.line_h, self.update_clim, self.axdis)
 
@@ -2338,6 +2358,40 @@ def plot(
     elif data_figure:
         plotter.to_data_figure()
     return plotter
+
+
+def load(path, *, kind: str | None = "auto", display: bool = True):
+    """Reopen a ``.npz`` saved by :meth:`DataFigure.save` as a static, refittable
+    figure -- the read-back counterpart of save.
+
+    The saved payload carries the original ``data_x``/``data_y`` plus an ``info``
+    dict (labels, unit, name).  This rebuilds the figure through the SAME
+    :func:`plot` renderer (so the reloaded figure looks identical to the live
+    one), restores the recorded unit/name, and returns the :class:`DataFigure`
+    handle -- so an overnight scan saved to disk can be reopened weeks later to
+    re-fit, change units, or re-save without any hardware or session.
+
+    ``kind`` defaults to ``"auto"`` (1d/2d inferred from ``data_x`` shape, the
+    usual scan case); pass an explicit kind to reopen a ``hist``/``sites`` save.
+    """
+    data = np.load(str(path), allow_pickle=True)
+    if "data_x" not in data.files or "data_y" not in data.files:
+        raise ValueError(f"{path} is not a DataFigure save (missing data_x/data_y).")
+    data_x = data["data_x"]
+    data_y = data["data_y"]
+    info = data["info"].item() if "info" in data.files else {}
+    labels = info.get("labels")
+    plotter = plot(data_x, data_y, kind=kind, labels=labels, update=False,
+                   display=display, data_figure=True)
+    df = plotter.data_figure if plotter.data_figure is not None else plotter.to_data_figure()
+    # Restore provenance so unit conversion + a re-save round-trip identically.
+    df.info = {**df.info, **info}
+    if info.get("name"):
+        df.name = info["name"]
+    if info.get("unit"):
+        df.unit = info["unit"]
+        df.unit_original = info["unit"]
+    return df
 
 
 __all__ = [

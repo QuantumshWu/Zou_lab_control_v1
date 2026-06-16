@@ -30,7 +30,7 @@ import numpy as np
 from ..core.analysis import estimate_thresholds, find_site_centers, grid_shape_tuple, positive_int, roi_counts
 from ..core.signals import SignalHub
 from ..devices.base import CameraDevice
-from ..timing import imaging_sequence
+from ..timing import imaging_channel_kwargs, imaging_sequence
 
 
 class ExperimentFeed:
@@ -42,6 +42,11 @@ class ExperimentFeed:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self.shots = 0
+        # Health: a wedged source must not fail silently.  The loop records the
+        # last exception + a consecutive-failure count and publishes them as
+        # signals so the console can raise a visible banner (M7).
+        self.last_error: str | None = None
+        self.consecutive_errors = 0
 
     # ------------------------------------------------------------------ loop
     def shot(self) -> dict[str, object]:  # pragma: no cover - abstract
@@ -69,11 +74,23 @@ class ExperimentFeed:
                 started = time.monotonic()
                 try:
                     self.step()
-                except Exception:
-                    # A wedged source must not kill the daemon silently mid-run;
-                    # back off and keep trying (the console shows stale data).
-                    time.sleep(period)
+                except Exception as exc:
+                    if self._stop.is_set():
+                        return  # asked to stop mid-shot -- a clean exit, not a fault
+                    # A wedged source must not kill the daemon silently mid-run, but
+                    # it must NOT fail silently either: record the error + a running
+                    # count and publish the count so the console raises a banner
+                    # (the operator otherwise just sees frozen, stale data).
+                    self.last_error = f"{type(exc).__name__}: {exc}"
+                    self.consecutive_errors += 1
+                    self.hub.publish({self.prefix + "feed_error": float(self.consecutive_errors)})
+                    self._stop.wait(period)
                     continue
+                if self.consecutive_errors:
+                    # Recovered: clear the banner so a transient hiccup doesn't stick.
+                    self.last_error = None
+                    self.consecutive_errors = 0
+                    self.hub.publish({self.prefix + "feed_error": 0.0})
                 remaining = period - (time.monotonic() - started)
                 if remaining > 0:
                     self._stop.wait(remaining)
@@ -177,8 +194,14 @@ class LoadingFeed(ExperimentFeed):
         # renders every trap occupied for ``name="sitemap"``; real hardware runs
         # its deterministic-fill template) and a per-shot readout with fresh
         # loading (``load=True`` -> the camera reloads each frame).
-        self._sitemap_seq = imaging_sequence(exposure=self.exposure, load=True, name="sitemap")
-        self._readout_seq = imaging_sequence(exposure=self.exposure, load=True, name="readout")
+        # Target whatever channels the bound sequencer actually exposes (real
+        # configs name them ch00..chNN): without this, the imaging sequence would
+        # reference the trap/cooling/probe/emCCD placeholders and every pulse on a
+        # real streamer would hit a non-existent channel.  Same single-source
+        # mapping the session uses; {} on a virtual/notebook sequencer -> defaults.
+        channel_kwargs = imaging_channel_kwargs(self.sequencer)
+        self._sitemap_seq = imaging_sequence(exposure=self.exposure, load=True, name="sitemap", **channel_kwargs)
+        self._readout_seq = imaging_sequence(exposure=self.exposure, load=True, name="readout", **channel_kwargs)
         template = self._acquire(max(1, self.calibration_frames), self._sitemap_seq)
         average = np.mean([np.asarray(img, dtype=float) for img in template], axis=0)
         self.centers = find_site_centers(average, self.grid_shape)
@@ -217,7 +240,10 @@ class LoadingFeed(ExperimentFeed):
         self._calibrate()
 
     def _acquire(self, frames: int, sequence) -> list[np.ndarray]:
-        return self.camera.acquire(positive_int(frames, "frames"), sequence=sequence, sequencer=self.sequencer)
+        # Pass the feed's stop event so a Stop interrupts a wedged trigger wait
+        # promptly (a camera that cannot interrupt simply ignores it).
+        return self.camera.acquire(positive_int(frames, "frames"), sequence=sequence,
+                                   sequencer=self.sequencer, stop=self._stop)
 
     def shot(self) -> dict[str, object]:
         frame = self._acquire(1, self._readout_seq)[-1]
@@ -263,7 +289,7 @@ class CameraFrameFeed(ExperimentFeed):
         self.sequencer = sequencer
 
     def shot(self) -> dict[str, object]:
-        frame = self.camera.acquire(1, sequencer=self.sequencer)[-1]
+        frame = self.camera.acquire(1, sequencer=self.sequencer, stop=self._stop)[-1]
         return {"frame": np.asarray(frame, dtype=float)}
 
     def published_signals(self) -> frozenset:
@@ -271,7 +297,7 @@ class CameraFrameFeed(ExperimentFeed):
 
     def acquisition_parameters(self) -> dict[str, object]:
         params: dict[str, object] = {"exposure": float(self.camera.exposure)}
-        roi = getattr(getattr(self.camera, "config", None), "roi", None)
+        roi = self.camera.roi   # contract property (None for a camera with no ROI), not backend-private config
         if roi is not None:
             params["roi"] = list(roi)
         return params
@@ -331,6 +357,13 @@ class ScannedMeasurementFeed(ExperimentFeed):
     ):
         super().__init__(hub, prefix=prefix)
         self.measurement = measurement
+        # Share the feed's stop event so a Stop interrupts a wedged trigger
+        # MID-scan-point (the engine's per-point camera.acquire honours it), not
+        # only between points.
+        try:
+            self.measurement.stop_event = self._stop
+        except AttributeError:
+            pass
         self.x_key = str(x_key)
         self.y_key = str(y_key)
         self.grid_shape = None if grid_shape is None else grid_shape_tuple(grid_shape)

@@ -4378,6 +4378,13 @@ def test_qcmos_camera_acquire_uses_dcam_and_expanded_sequencer(monkeypatch):
             self.props.append((prop, value))
             return True
 
+        def prop_getvalue(self, prop):
+            # echo the most recent value set for this prop (read-back verify)
+            for p, v in reversed(self.props):
+                if p == prop:
+                    return v
+            return False
+
         def buf_alloc(self, frames):
             self.frames = int(frames)
             return True

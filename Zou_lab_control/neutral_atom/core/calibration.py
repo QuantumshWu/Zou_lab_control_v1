@@ -76,6 +76,18 @@ class TrapCalibration:
     def signals(self, image) -> np.ndarray:
         """One scalar per site for ``image`` using this calibration's method."""
 
+        # ROI fingerprint: the centers/PSF boxes are absolute camera pixels, so a
+        # frame from a DIFFERENT camera ROI (same size but shifted) would silently
+        # extract the WRONG pixels -- in-bounds, no error, every count wrong.  When
+        # the calibration recorded the image shape it was built on, fail loud on a
+        # mismatch instead (raise -> recalibrate) rather than corrupt results.
+        expected = self.metadata.get("image_shape")
+        if expected is not None:
+            got = tuple(int(v) for v in np.shape(image)[:2])
+            if got != tuple(int(v) for v in expected):
+                raise ValueError(
+                    f"image shape {got} does not match the calibration's {tuple(expected)} "
+                    "(camera ROI changed since calibration?) -- recalibrate before reading out.")
         if self.method == "psf":
             return psf_signals(image, self.psf_weights, self.psf_boxes, background=self.background or "annulus")
         return roi_counts(image, self.centers, radius=self.roi_radius, reducer=self.reducer)
