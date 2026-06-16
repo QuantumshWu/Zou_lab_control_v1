@@ -299,14 +299,11 @@ def test_2d_panel_rebuilds_when_roi_shifts_same_shape():
         card.shutdown()
 
 
-def test_edit_area_select_writes_camera_roi():
-    """The WRITE-back half of G1: a region selected on a camera-frame 2D panel's
-    (interactive) Edit plot fills the ROI field [x, w, y, h] from the selection,
-    and Apply reconfigures the camera to that ROI -- same gesture and intent as
-    the 1D scan-range writeback, routed through the acquisition-param protocol.
-
-    Only the lowest data source is faked (a camera that owns a ROI and returns a
-    frame over it); everything above is the real task-console path."""
+def _camera_console(roi=(1648, 64, 1144, 64)):
+    """A console driving a 2D panel from a faked ROI-bearing camera, with the
+    panel's Edit tab opened.  Only the lowest data source (the camera frame +
+    its ROI) is faked; everything above is the real task-console path.  Returns
+    (console, feed, cam, card, editor)."""
     import Zou_lab_control.frontend as zf
     from Zou_lab_control.frontend.task_console import TaskConsole
     from Zou_lab_control.neutral_atom.operations.feeds import CameraFrameFeed
@@ -314,7 +311,7 @@ def test_edit_area_select_writes_camera_roi():
     from Zou_lab_control.neutral_atom.devices.base import CameraDevice
 
     class _RoiCamera(CameraDevice):
-        def __init__(self, roi=(1648, 64, 1144, 64)):
+        def __init__(self, roi):
             self._exposure = 0.02
             self._roi = tuple(int(v) for v in roi)
 
@@ -337,27 +334,108 @@ def test_edit_area_select_writes_camera_roi():
             return [np.full((h, w), 50.0)]
 
     hub = SignalHub()
-    cam = _RoiCamera()
+    cam = _RoiCamera(roi)
     feed = CameraFrameFeed(hub, cam)
     state = zf.TaskConsoleState(name="t", panels=[
         zf.PanelConfig(kind="2d", title="cam", size="2x2", source="value = frame")])
     console = TaskConsole(hub=hub, state=state, feeds=[feed])
     console._timer.stop()
+    feed.step()
+    console.refresh_once()
+    card = console.cards[0]
+    console._edit_card(card)
+    editor = console._panel_editors[id(card)]
+    editor.rebuild()
+    return console, feed, cam, card, editor
+
+
+def test_edit_area_select_writes_camera_roi_and_apply_restarts_monitor():
+    """The WRITE-back + RESTART half of G1: a region selected on a camera-frame 2D
+    panel's Edit plot fills the ROI field [x, w, y, h], and Apply RESTARTS the feed
+    so the camera re-arms AND the live Monitor panel (not just the Edit snapshot)
+    re-acquires under the new ROI."""
+    console, feed, cam, card, editor = _camera_console()
     try:
-        feed.step()
-        console.refresh_once()
-        card = console.cards[0]
-        console._edit_card(card)
-        editor = console._panel_editors[id(card)]
-        editor.rebuild()
-        # the selector's callback is the ROI writeback, NOT the scan-range one
+        # the selector callback is the ROI writeback, NOT the scan-range one,
+        # and it is bound to BOTH the area selector and the zoom handler
         assert editor._plotter.area.callback.__name__ == "_read_roi"
+        assert editor._plotter.zoom.callback.__name__ == "_read_roi"
         # a rectangle selected in pixel (= ROI) coordinates -> ROI [x, w, y, h]
         editor._plotter.area.range = [1670.0, 1690.0, 1166.0, 1186.0]
         editor._plotter.area.callback()
         assert editor._feed_widgets["roi"].text() == "[1670, 20, 1166, 20]"
-        # Apply pushes the selected ROI onto the camera in place
+        # Apply re-arms the camera AND the live Monitor card re-acquires (its axes
+        # become the new ROI, not only the Edit snapshot's)
         editor._restart_feed()
         assert cam.roi == (1670, 20, 1166, 20)
+        assert np.isclose(card.plotter.x_array[0], 1670)
+        assert np.isclose(card.plotter.x_array[-1], 1670 + 20 - 1)
+    finally:
+        console.shutdown()
+
+
+def test_2d_zoom_updates_roi_from_view_area_overrides():
+    """G-fix #1: ZOOM/PAN alone updates the ROI from the current view limits (the
+    area selector is NOT required); when a rectangle IS drawn it OVERRIDES the
+    view.  This is confocal's exact precedence (area else view)."""
+    console, feed, cam, card, editor = _camera_console()
+    try:
+        # ZOOM with no area selection -> ROI follows the view box
+        editor._plotter.area.range = [None, None, None, None]
+        editor._plotter.ax.set_xlim(1660, 1690)
+        editor._plotter.ax.set_ylim(1190, 1160)        # image y runs high->low
+        editor._plotter.zoom.callback()
+        assert editor._feed_widgets["roi"].text() == "[1660, 30, 1160, 30]"
+        # now draw an area rectangle: it OVERRIDES the view even when the zoom
+        # callback fires
+        editor._plotter.area.range = [1672.0, 1682.0, 1170.0, 1180.0]
+        editor._plotter.zoom.callback()
+        assert editor._feed_widgets["roi"].text() == "[1672, 10, 1170, 10]"
+    finally:
+        console.shutdown()
+
+
+def test_apply_roi_restarts_running_feed():
+    """G-fix #2: Apply on a RUNNING acquisition restarts it (stop -> reconfigure ->
+    start), so a streaming camera re-arms with the new ROI -- an in-place
+    reconfigure would be ignored mid-stream and the Monitor would stay stale."""
+    import time
+    console, feed, cam, card, editor = _camera_console()
+    try:
+        feed.start(rate_hz=50.0)
+        time.sleep(0.08)
+        tid_before = feed._thread.ident
+        console._restart_feed(feed, {"roi": [100, 20, 200, 20]})
+        time.sleep(0.05)
+        assert feed.running
+        assert feed._thread.ident != tid_before     # a FRESH acquisition thread
+        assert cam.roi == (100, 20, 200, 20)
+    finally:
+        feed.stop()
+        console.shutdown()
+
+
+def test_zoom_updates_measurement_scan_range():
+    """G-fix #1 for a measurement panel: ZOOM on the 1D scan plot updates the
+    measurement form's scan x-range (read by Start), the same way confocal binds
+    zoom + area to ``_read_range``."""
+    exp = _calibrated_virtual_session(grid=(2, 3))
+    specs = exp.readout.measurement_specs()
+    console = _console(specs)
+    try:
+        spec, card, editor, form = _open_measurement_editor(console, 0)
+        _, lo, hi, pts = form._widgets["t_off"]
+        lo.setValue(0.0); hi.setValue(120.0); pts.setValue(5)
+        form._widgets["shots"][1].setValue(4)
+        console._start_measurement(form)
+        feed = console._meas_feed
+        feed.stop(); feed.run_to_completion(); console.refresh_once()
+        editor.rebuild()
+        assert editor._plotter.zoom.callback.__name__ == "_read_scan_range"
+        # ZOOM to a sub-range -> the form's Min/Max follow the view
+        editor._plotter.ax.set_xlim(30.0, 70.0)
+        editor._plotter.zoom.callback()
+        assert form._widgets["t_off"][1].value() == pytest.approx(30.0, abs=1e-6)
+        assert form._widgets["t_off"][2].value() == pytest.approx(70.0, abs=1e-6)
     finally:
         console.shutdown()

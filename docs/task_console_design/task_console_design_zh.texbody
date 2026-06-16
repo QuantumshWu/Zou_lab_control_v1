@@ -290,17 +290,27 @@ Setting 改的每一项——\pyapi{size}、\pyapi{colormap}、声明式参数�
 \textbf{解耦要点}：\pyapi{PanelEditor} 持有\tfocus{自己的}独立 plotter / \pyapi{DataFigure}，只\tfocus{读} \pyapi{card.plotter} 取数据，与 Monitor 卡解耦——它不通过 \pyapi{card.\_set\_param} 去改 Monitor 卡（那条路径会 \pyapi{\_reset\_plot} 把 Monitor 卡的 plotter 置 None，Edit 的快照随即失去依据）。Edit 标签关闭时若它正承载在跑的 measurement，会把 \pyapi{\_active\_meas\_panel} 复位，避免把状态写进已销毁的表单。
 \end{notebox}
 
-\section{坐标轴 = 源的参数空间;框选回写(confocal 核心耦合)}
+\section{坐标轴 = 源的参数空间;缩放/框选回写 + Apply 重启(confocal 核心耦合)}
 \label{sec:coord-writeback}
-Confocal\_gui 的核心思想:一张图的坐标轴\tfocus{就是}产生它的源的参数空间,而在图上\tfocus{框选一块区域}就把"该轴代表的源参数"回写成"下次采集只覆盖这块"。控制台对每种空间/参数轴都落实同一条耦合——同一手势(Edit 图上左键拖一个矩形)、同一意图(下次采集只覆盖选区),只是回写到的参数不同:
+Confocal\_gui 的核心思想:一张图的坐标轴\tfocus{就是}产生它的源的参数空间;\tfocus{改变可视范围}就把"该轴代表的源参数"回写成"下次采集只覆盖这块",而\tfocus{重新采集}才让活面板真正换上新参数的数据。两件事缺一不可,控制台对每种空间/参数轴都落实同一条耦合。
+
+\paragraph{(1) 缩放或框选 → 回写参数(\tfocus{view-limits-else-area} 优先级)。}
+confocal 把\tfocus{同一个回写回调}同时绑到\tfocus{滚轮缩放/中键平移}(\pyapi{ZoomPan})\tfocus{和}\tfocus{左键框选}(\pyapi{AreaSelector})两个交互上(\pyapi{gui\_individual.\_read\_range})。回调的取值规则:\tfocus{若画了框选矩形就用框选范围,否则用当前坐标轴的可视范围}(\pyapi{ax.get\_xlim()/get\_ylim()})。所以——\tfocus{光滚轮缩放}就能把范围缩到当前视野(不需要先框选),\tfocus{框一个矩形}则\tfocus{覆盖}视野、把范围钉得更精确。控制台两个回写函数(\pyapi{PanelEditor.\_read\_scan\_range} / \pyapi{\_read\_roi})都走 \pyapi{\_selected\_xrange} / \pyapi{\_selected\_rect} 这条同款优先级,并同时挂到 \pyapi{plotter.area.callback} \tfocus{和} \pyapi{plotter.zoom.callback}:
 
 \begin{description}
-  \item[1D 扫描曲线 → 扫描范围] 扫描结果的横轴是\tfocus{真实物理量}（t\_off 秒、detection time 秒，见 \pyapi{(N,2)} x-y 节），不是 0,1,2 index。在 measurement 面板的 Edit 图上框一段，\pyapi{PanelEditor.\_read\_scan\_range} 把选区 \pyapi{[x1,x2]} 写进该 measurement 表单的扫描 Min/Max（\pyapi{MeasurementPanel.set\_axis\_range}）——宽扫一遍 → 框住特征 → Start 只重扫这一段。
-  \item[2D 相机图 → 相机 ROI] 一张相机帧 2D 面板（\pyapi{Live2DDis}，源是 \pyapi{CameraFrameFeed}）的图像 x/y \tfocus{就是相机的真实像素坐标(ROI 原点),不是 0..N}：面板构建时经 \pyapi{\_source\_coord\_frame} 取源信号的 ROI \pyapi{[x,w,y,h]}，以 \pyapi{x0=roi[0]}、\pyapi{y0=roi[2]} 为原点建网格，轴标 \pyapi{Camera x/y (px)}。在 Edit 图上框一个矩形，\pyapi{\_read\_roi} 把选区 \pyapi{[min x, max x, min y, max y]} 换算成 ROI \pyapi{[round(min x), round(宽), round(min y), round(高)]} 填进 Acquisition 的 \pyapi{roi} 框；点 \pyapi{Apply} 经 \pyapi{set\_acquisition\_parameters(roi=...)} 让相机原地重配，把视场缩到刚框的窗口。ROI 像素坐标常是 4--5 位，2D 图复用 frontend 的智能刻度\tfocus{对}（\pyapi{apply\_smart\_ticks}，定位器+格式器成对替换）并收紧每轴刻度数，宽标签不会挤成糊。
+  \item[1D 扫描曲线 → 扫描范围] 扫描结果的横轴是\tfocus{真实物理量}（t\_off 秒、detection time 秒，见 \pyapi{(N,2)} x-y 节），不是 0,1,2 index。Edit 图上\tfocus{滚轮缩放或框一段}，\pyapi{\_read\_scan\_range} 把范围写进该 measurement 表单的扫描 Min/Max（\pyapi{MeasurementPanel.set\_axis\_range}）——宽扫一遍 → 缩放/框住特征 → Start 只重扫这一段。
+  \item[2D 相机图 → 相机 ROI] 一张相机帧 2D 面板（\pyapi{Live2DDis}，源是 \pyapi{CameraFrameFeed}）的图像 x/y \tfocus{就是相机的真实像素坐标(ROI 原点),不是 0..N}：面板构建时经 \pyapi{\_source\_coord\_frame} 取源信号的 ROI \pyapi{[x,w,y,h]}，以 \pyapi{x0=roi[0]}、\pyapi{y0=roi[2]} 为原点建网格，轴标 \pyapi{Camera x/y (px)}。Edit 图上\tfocus{滚轮缩放或框一个矩形}，\pyapi{\_read\_roi} 把范围 \pyapi{[min x, max x, min y, max y]} 换算成 ROI \pyapi{[round(min x), round(宽), round(min y), round(高)]} 填进 Acquisition 的 \pyapi{roi} 框。ROI 像素坐标常是 4--5 位，2D 图复用 frontend 的智能刻度\tfocus{对}（\pyapi{apply\_smart\_ticks}，定位器+格式器成对替换）并收紧每轴刻度数，宽标签不会挤成糊。
 \end{description}
 
+\paragraph{(2) Apply / Start → \tfocus{重启采集},活面板才换上新数据。}
+回写只改了\tfocus{参数框}的值;真正让 Monitor 面板显示新参数下的数据,要\tfocus{重新跑一次采集}——这是 confocal 的 \pyapi{on\_start} 用新参数\tfocus{重建一个测量}并运行的语义,绝不是"原地改一下还在跑的那次"。控制台据此分两路:
+\begin{itemize}
+  \item measurement 面板:Start(\pyapi{\_start\_measurement}) 用表单当前值\tfocus{新建}一个 \pyapi{ScannedMeasurementFeed} 重跑进同一结果卡。
+  \item 相机/采集面板:Apply(\pyapi{\_restart\_feed}) \tfocus{停→改源参数→重启} feed(\pyapi{stop}→\pyapi{set\_acquisition\_parameters}→\pyapi{start})。\tfocus{流式相机在采集开始时锁定 ROI/曝光,运行中的原地 \pyapi{configure} 会被忽略},所以必须停掉、空闲时重配、再开一次新采集,下一帧(和 Monitor)才换上新视场;不在跑的 feed 则 \pyapi{step()} 一帧让 Monitor 立刻反映。Apply 后随手 \pyapi{console.refresh\_once()} 推一拍,Monitor 当场更新而不必等下个定时器节拍。
+\end{itemize}
+
 \begin{notebox}
-\textbf{为什么是统一的架构而非各打补丁}：坐标系信息走一条与 1D 扫描回写\tfocus{同形}的解耦缝——\pyapi{TaskConsole.\_coord\_frames()} 把"每个声明了 ROI 的 feed 的 published 信号 → 该 ROI"汇成保留键 \pyapi{\_\_coord\_frames\_\_} 注入表达式命名空间；\pyapi{PanelCard.\_source\_coord\_frame} 用面板源表达式引用的信号名（\pyapi{\_co\_names}）在里面查，任何空间轴的面板都能问"我的源坐标系是什么"。\pyapi{frame} 形状不变但 ROI \tfocus{平移}时，面板按坐标系变化（不只看形状）触发重建，轴永远跟着 ROI 走。这条缝对未来其它"轴=源参数"的图同样可用，不必每种图各写一遍。
+\textbf{为什么是统一的架构而非各打补丁}：坐标系信息走一条与 1D 扫描回写\tfocus{同形}的解耦缝——\pyapi{TaskConsole.\_coord\_frames()} 把"每个声明了 ROI 的 feed 的 published 信号 → 该 ROI"汇成保留键 \pyapi{\_\_coord\_frames\_\_} 注入表达式命名空间；\pyapi{PanelCard.\_source\_coord\_frame} 用面板源表达式引用的信号名（\pyapi{\_co\_names}）在里面查，任何空间轴的面板都能问"我的源坐标系是什么"。\pyapi{frame} 形状不变但 ROI \tfocus{平移}时，面板按坐标系变化（不只看形状）触发重建，轴永远跟着 ROI 走。\tfocus{回写}(缩放/框选,view-else-area)与\tfocus{重启}(Apply/Start 重建采集)是两件正交的事,前者改参数、后者才换数据——两者都缺会让"改了却看不到效果"。这条缝对未来其它"轴=源参数"的图同样可用，不必每种图各写一遍。
 \end{notebox}
 
 

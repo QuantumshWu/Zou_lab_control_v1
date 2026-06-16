@@ -1852,18 +1852,28 @@ class PanelEditor(QtWidgets.QWidget):
         self._canvas.draw_idle()
         self._df = None
         self.fill_limits()
-        # confocal-style auto-range: a region selected on this (interactive) Edit
-        # plot fills the source's parameter that the axes represent --
+        # confocal-style auto-range: interacting with this (interactive) Edit plot
+        # fills the source's parameter that the axes represent --
         #   * MEASUREMENT panel: the scan x-range (1D scan param);
         #   * camera-frame 2D panel: the camera ROI (the axes ARE pixel coords).
-        # Same gesture (left-drag a feature), same intent (the next acquisition
-        # covers just the selection).
+        # Confocal binds the SAME callback to BOTH the zoom/scroll AND the area
+        # selector: ZOOM/PAN updates the range from the current view limits, and
+        # the area selector OVERRIDES that when one is drawn (precedence handled in
+        # the writeback).  So scroll-zoom alone narrows the next acquisition; a
+        # drag-rectangle pins it exactly.  (Wiring only the area selector -- the bug
+        # this fixes -- meant zoom did nothing.)
         area = getattr(self._plotter, "area", None)
-        if area is not None:
-            if self.meas_panel is not None:
-                area.callback = self._read_scan_range
-            elif kind == "2d" and "roi" in self._feed_widgets:
-                area.callback = self._read_roi
+        zoom = getattr(self._plotter, "zoom", None)
+        writeback = None
+        if self.meas_panel is not None:
+            writeback = self._read_scan_range
+        elif kind == "2d" and "roi" in self._feed_widgets:
+            writeback = self._read_roi
+        if writeback is not None:
+            if area is not None:
+                area.callback = writeback
+            if zoom is not None:
+                zoom.callback = writeback
         self.status.setText("snapshot of current data — fit / set limits / save are frozen here")
 
     def _edit_param(self, key: str, value) -> None:
@@ -1873,44 +1883,76 @@ class PanelEditor(QtWidgets.QWidget):
             self.card._set_param(key, value)
         self.rebuild()
 
+    def _selected_xrange(self):
+        """Confocal precedence (the X view): the area selection if one is drawn,
+        ELSE the current axis view limits (from zoom/pan).  Returns (lo, hi)
+        sorted, or (None, None).  This is what makes scroll-zoom alone set the
+        range, with a drag-rectangle overriding it."""
+        plotter = self._plotter
+        if plotter is None or plotter.ax is None:
+            return (None, None)
+        area = getattr(plotter, "area", None)
+        if area is not None and area.range[0] is not None:
+            return (float(area.range[0]), float(area.range[1]))
+        lo, hi = sorted(float(v) for v in plotter.ax.get_xlim())
+        return (lo, hi)
+
+    def _selected_rect(self):
+        """2D analogue of :meth:`_selected_xrange`: the area rectangle if drawn,
+        ELSE the current view box (x AND y view limits).  Returns
+        (xlo, xhi, ylo, yhi) sorted, or all None."""
+        plotter = self._plotter
+        if plotter is None or plotter.ax is None:
+            return (None, None, None, None)
+        area = getattr(plotter, "area", None)
+        if area is not None and area.range[0] is not None:
+            x1, x2, y1, y2 = (float(v) for v in area.range)
+            return (min(x1, x2), max(x1, x2), min(y1, y2), max(y1, y2))
+        xlo, xhi = sorted(float(v) for v in plotter.ax.get_xlim())
+        ylo, yhi = sorted(float(v) for v in plotter.ax.get_ylim())
+        return (xlo, xhi, ylo, yhi)
+
     def _read_scan_range(self) -> None:
-        """Confocal ``_read_range``: a region SELECTED (left-drag) on the Edit
-        plot fills this measurement's scan x-range Min/Max -- the NEXT scan's
-        range.  Wide scan -> drag the feature -> Start re-scans just it.  No-op
-        without a measurement form or an active selection."""
+        """Confocal ``_read_range``: ZOOM/PAN or an area SELECTION on the Edit plot
+        fills this measurement's scan x-range Min/Max -- the NEXT scan's range.
+        Scroll-zoom to narrow, or drag a rectangle to pin it exactly (the
+        selection overrides the view); then Start re-scans just that range.  No-op
+        without a measurement form."""
         if self.meas_panel is None or self._plotter is None:
             return
-        rng = getattr(getattr(self._plotter, "area", None), "range", None)
-        if not rng or rng[0] is None:
+        x1, x2 = self._selected_xrange()
+        if x1 is None:
             return
-        x1, x2 = float(rng[0]), float(rng[1])
         if self.meas_panel.set_axis_range(x1, x2):
-            self.status.setText(f"scan range set from selection: {x1:.4g} … {x2:.4g}")
+            self.status.setText(f"scan range set from view: {x1:.4g} … {x2:.4g}")
 
     def _read_roi(self) -> None:
-        """Confocal ``_read_range`` for a camera-frame 2D panel: a rectangle
-        SELECTED (left-drag) on the image fills the camera's ROI field.  The image
-        axes ARE the camera's pixel coordinates (``_build_plot`` builds them from
-        the feed's ROI), so the selection rectangle maps STRAIGHT back to a new
-        ROI ``[x, w, y, h]`` -- drag a feature -> Apply -> the camera acquires just
-        that window.  Mirrors the 1D scan-range gesture; no-op without a ROI field
-        or an active selection."""
+        """Confocal ``_read_range`` for a camera-frame 2D panel: ZOOM/PAN or an
+        area SELECTION on the image fills the camera's ROI field.  The image axes
+        ARE the camera's pixel coordinates (``_build_plot`` builds them from the
+        feed's ROI), so the current view box (or the drawn rectangle, which
+        overrides it) maps STRAIGHT back to a new ROI ``[x, w, y, h]`` -- scroll to
+        zoom in / drag a feature -> Apply -> the camera re-arms on just that
+        window.  No-op without a ROI field or a degenerate view."""
         if self._feed is None or self._plotter is None:
             return
         edit = self._feed_widgets.get("roi")
         if edit is None:
             return
-        rng = getattr(getattr(self._plotter, "area", None), "range", None)
-        if not rng or rng[0] is None:
+        x1, x2, y1, y2 = self._selected_rect()
+        if x1 is None:
             return
-        x1, x2, y1, y2 = (float(v) for v in rng)
         roi = [int(round(x1)), int(round(x2 - x1)), int(round(y1)), int(round(y2 - y1))]
+        if roi[1] <= 0 or roi[3] <= 0:        # a degenerate (zero-area) view -- ignore
+            return
         edit.setText(_py_to_text(roi))
-        self.status.setText(f"ROI set from selection: {roi} — Apply to retune the camera")
+        self.status.setText(f"ROI set from view: {roi} — Apply to re-arm the camera")
 
     def _restart_feed(self) -> None:
-        """Apply the edited Acquisition params to the data source IN PLACE;
-        refresh the 'now:' references + re-snapshot."""
+        """Apply the edited Acquisition params: RESTART the data source so the
+        Monitor re-acquires under the new params (e.g. the camera re-arms with the
+        new ROI), refresh the 'now:' references, push one console tick so the
+        Monitor reflects it now, then re-snapshot this Edit."""
         if self._feed is None:
             return
         new_params = {name: _text_to_py(w.text()) for name, w in self._feed_widgets.items()}
@@ -1922,7 +1964,11 @@ class PanelEditor(QtWidgets.QWidget):
         for name, current in self.console._feed_params(self._feed):
             if name in self._feed_now_labels:
                 self._feed_now_labels[name].setText(f"now: {_py_to_text(current)}")
-        self.status.setText("acquisition parameters applied to the data source")
+        # the restarted feed has published a fresh frame under the new params --
+        # tick the console so the live Monitor panel rebuilds with it right away
+        # (not only after the next timer beat).
+        self.console.refresh_once()
+        self.status.setText("acquisition restarted with the new parameters")
         self.rebuild()
 
     def _df_for(self):
@@ -2256,13 +2302,26 @@ class TaskConsole(QtWidgets.QWidget):
         return list(feed.acquisition_parameters().items())
 
     def _restart_feed(self, feed, new_params: dict):
-        """Apply edited acquisition parameters to ``feed`` IN PLACE: the feed
-        re-configures its source live (e.g. ``camera.configure``) or re-calibrates,
-        and the SAME running feed keeps publishing under the same signal names.
-        Returns the feed.  Raises if the feed has no editable acquisition params."""
+        """RESTART the producing feed with edited acquisition parameters, so the
+        Monitor actually re-acquires under the new params (this is confocal's
+        model: Start builds a FRESH acquisition rather than mutating a running
+        one).  A streaming camera latches its ROI/exposure when the acquisition
+        is armed and IGNORES an in-place ``configure`` mid-stream, so applying a
+        new ROI means: STOP the run, reconfigure the source while idle, then
+        START a fresh run -- only then does the next frame (and the Monitor) show
+        the new window.  A feed that is not currently running is reconfigured and
+        stepped ONCE so the Monitor reflects the change immediately.  Returns the
+        feed.  Raises if the feed has no editable acquisition params."""
         if feed is None or not hasattr(feed, "set_acquisition_parameters"):
             raise RuntimeError("this panel's data source exposes no editable acquisition parameters")
+        was_running = bool(getattr(feed, "running", False))
+        if was_running and hasattr(feed, "stop"):
+            feed.stop()                                  # halt so the source reconfigures idle
         feed.set_acquisition_parameters(**new_params)
+        if was_running and hasattr(feed, "start"):
+            feed.start(rate_hz=getattr(feed, "rate_hz", 5.0))   # re-arm: fresh acquisition
+        elif hasattr(feed, "step"):
+            feed.step()                                  # not in a run loop: publish one fresh shot now
         return feed
 
     def _edit_card(self, card: "PanelCard") -> None:
