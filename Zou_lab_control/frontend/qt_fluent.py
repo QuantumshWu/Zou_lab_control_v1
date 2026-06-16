@@ -15,9 +15,21 @@ import sys
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-try:  # Optional, but used when available to match Confocal_GUIv2 windows.
+try:  # Provided by the PyQt5-Frameless-Window distribution (module qframelesswindow).
     from qframelesswindow import FramelessWindow, StandardTitleBar
-except Exception:  # pragma: no cover - depends on optional desktop package.
+except ImportError:  # pragma: no cover - depends on the desktop package.
+    # Degrade to a plain top-level window, but make the missing dependency LOUD:
+    # a silent fallback once hid a requirements typo and shipped a frameless-less
+    # GUI on the real machine.  Install "PyQt5-Frameless-Window" to get the
+    # Fluent title bar.
+    import warnings
+
+    warnings.warn(
+        "qframelesswindow not installed (pip install PyQt5-Frameless-Window); "
+        "falling back to a plain window without the Fluent title bar.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
     FramelessWindow = QtWidgets.QWidget
     StandardTitleBar = None
 
@@ -1446,7 +1458,8 @@ class FluentWindow(FramelessWindow):
     installed and falls back to a regular QWidget otherwise.
     """
 
-    hidden = QtCore.pyqtSignal()
+    hidden = QtCore.pyqtSignal()   # fires on close OR hide/minimize (event-loop quit)
+    closed = QtCore.pyqtSignal()   # fires ONLY on a genuine close, never on hide/minimize
 
     def __init__(
         self,
@@ -1559,6 +1572,7 @@ class FluentWindow(FramelessWindow):
             event.ignore()
             self.hide()
             return
+        self.closed.emit()   # a genuine close (NOT hide/minimize): hosts release resources here
         super().closeEvent(event)
 
     def hideEvent(self, event):

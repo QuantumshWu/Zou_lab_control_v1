@@ -55,6 +55,10 @@ class ExperimentFeed:
         # acquire() calls on one camera at once (a deadlock/freeze).
         self._pending_params: dict[str, object] | None = None
         self._params_lock = threading.Lock()
+        # Increments each time a QUEUED edit has been applied AND its fresh frame
+        # published (see acquisition_epoch): the GUI polls this to re-snapshot the
+        # Edit panel on the FIRST post-edit frame instead of the stale pre-edit one.
+        self._apply_epoch = 0
 
     # ------------------------------------------------------------------ loop
     def shot(self) -> dict[str, object]:  # pragma: no cover - abstract
@@ -81,8 +85,12 @@ class ExperimentFeed:
             while not self._stop.is_set():
                 started = time.monotonic()
                 try:
-                    self._apply_pending_params()   # owner thread applies edits BETWEEN shots
+                    applied = self._apply_pending_params()   # owner thread applies edits BETWEEN shots
                     self.step()
+                    if applied:
+                        # the just-published frame is the FIRST computed with the edited
+                        # params -- mark the epoch so a waiting GUI re-snapshots THIS frame
+                        self._apply_epoch += 1
                 except Exception as exc:
                     if self._stop.is_set():
                         return  # asked to stop mid-shot -- a clean exit, not a fault
@@ -162,16 +170,31 @@ class ExperimentFeed:
         else:
             self.set_acquisition_parameters(**values)
             self.step()
+            self._apply_epoch += 1   # idle: applied + published synchronously, right here
 
-    def _apply_pending_params(self) -> None:
+    def acquisition_epoch(self) -> int:
+        """A counter incremented each time a QUEUED acquisition-parameter edit has
+        been applied AND its resulting frame published (or, when idle, applied +
+        published synchronously by ``apply_acquisition_parameters``).
+
+        A GUI that queued an edit can poll this to learn WHEN the first frame
+        computed with the new params is on the hub, and re-snapshot its Edit panel
+        then -- instead of reading the stale pre-edit frame the instant it queues
+        (the queue-then-apply-between-shots latency)."""
+        return self._apply_epoch
+
+    def _apply_pending_params(self) -> bool:
         """Drain and apply queued acquisition-parameter edits.  Called by the
         acquisition loop BETWEEN shots, so the source is reconfigured in its sole
-        owner thread (a streaming camera re-arms cleanly, no concurrent acquire)."""
+        owner thread (a streaming camera re-arms cleanly, no concurrent acquire).
+        Returns whether anything was applied (so the loop can bump the epoch)."""
         with self._params_lock:
             pending = self._pending_params
             self._pending_params = None
         if pending:
             self.set_acquisition_parameters(**pending)
+            return True
+        return False
 
     # ----------------------------------------------- plot region -> source params
     def region_to_acquisition_parameters(self, x_min, x_max, y_min, y_max) -> dict[str, object]:

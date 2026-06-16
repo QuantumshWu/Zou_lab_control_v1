@@ -1078,7 +1078,7 @@ def pulse_plot_channels(
 #
 # The geometry below is NOT a public knob: hosts pick a kind and a size preset,
 # nothing else -- the visual language is owned here.
-PANEL_SIZES = ("1x2", "2x2", "1x4", "2x4")
+PANEL_SIZES = ("1x2", "2x2", "1x4", "2x4", "4x4")
 PANEL_UNIT_PX = (180, 240)     # (height, width) of one half-unit of the stock region
 PANEL_MARGINS_PX = (STOCK_MARGINS_PX[0], 86, 80, TITLE_SLOT_PX)   # stock margins (L, R, B, T).
                                          # L = STOCK_MARGINS_PX[0] (confocal's left, 110) and

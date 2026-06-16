@@ -1979,29 +1979,56 @@ class PanelEditor(QtWidgets.QWidget):
                 label.setText(f"now: {_py_to_text(current)}")
 
     def _restart_feed(self) -> None:
-        """Apply the edited Acquisition params to the data source.  The change is
-        routed through the feed's safe entry: while the acquisition loop runs it is
-        applied BETWEEN shots in the loop's own thread (the live Monitor keeps
-        streaming, no GUI stall); Apply also START s an idle source so it goes live.
-        The 'now:' references update via the console's per-tick refresh (reused
-        here for an immediate read), and the Edit snapshot re-snapshots."""
+        """Apply the edited Acquisition params to the data source, routed through the
+        feed's safe entry (queued + applied BETWEEN shots in the loop's own thread,
+        never a GUI-thread stop/start); Apply also STARTs an idle source so it goes
+        live.
+
+        Re-snapshot timing is the subtle part.  An IDLE feed applies + publishes the
+        new-param frame SYNCHRONOUSLY (inside ``apply_acquisition_parameters``), so we
+        refresh + re-snapshot right away.  A RUNNING feed only publishes the new-param
+        frame on its NEXT loop iteration, so reading the hub now would snapshot the
+        STALE pre-edit frame -- so we wait for the feed's acquisition epoch to advance
+        (the first frame computed with the new params is on the hub) and re-snapshot
+        THAT, polled off the GUI critical path (no acquire from this thread)."""
         if self._feed is None:
             return
         new_params = {name: _text_to_py(w.text()) for name, w in self._feed_widgets.items()}
         running = bool(getattr(self._feed, "running", False))
+        epoch0 = int(getattr(self._feed, "acquisition_epoch", lambda: 0)())
         try:
             self.console._restart_feed(self._feed, new_params)
         except Exception as exc:
             self.status.setText(f"apply failed: {str(exc).splitlines()[0][:120]}")
             return
-        # tick the console so an IDLE feed's freshly-published frame shows now; a
-        # running feed updates on its own next loop iteration + timer beat.
-        self.console.refresh_once()
         self.refresh_feed_now_labels()        # reuse the same refresh the tick uses
-        self.status.setText(
-            "acquisition parameters queued — Monitor updates on the next frame"
-            if running else "acquisition started with the new parameters")
-        self.rebuild()
+        if running:
+            # queued: the loop has not yet produced a new-param frame -- defer the snapshot
+            self.status.setText("acquisition parameters queued — Monitor updates on the next frame")
+            self._await_fresh_frame(self._feed, epoch0)
+        else:
+            # idle: apply published a fresh frame synchronously, so it is already here
+            self.console.refresh_once()
+            self.status.setText("acquisition started with the new parameters")
+            self.rebuild()
+
+    def _await_fresh_frame(self, feed, epoch0: int, *, _tries: int = 0) -> None:
+        """Poll (off the GUI critical path) until the running feed has published its
+        FIRST frame computed with the just-queued params -- detected by its
+        ``acquisition_epoch`` advancing past ``epoch0`` -- then refresh + re-snapshot
+        the Edit panel.  Bounded so a wedged/slow feed never spins forever (it falls
+        back to a refresh after the cap).  Aborts if the editor moved to another feed
+        or was torn down."""
+        if self._feed is not feed or feed is None:
+            return
+        epoch = int(getattr(feed, "acquisition_epoch", lambda: epoch0 + 1)())
+        if epoch > epoch0 or _tries >= 600:    # ~600 * 25 ms = 15 s safety cap
+            self.console.refresh_once()
+            self.refresh_feed_now_labels()
+            self.rebuild()
+            return
+        from PyQt5 import QtCore
+        QtCore.QTimer.singleShot(25, lambda: self._await_fresh_frame(feed, epoch0, _tries=_tries + 1))
 
     def _df_for(self):
         from .data_figure import DataFigure
@@ -2725,6 +2752,18 @@ class TaskConsole(QtWidgets.QWidget):
 
     # ------------------------------------------------------------------ teardown
     def shutdown(self) -> None:
+        """Stop the refresh timer and every feed's owner thread, then release the
+        editors/cards.  IDEMPOTENT -- it is reached from both the window close
+        (``show_task_console`` wires ``window.hidden`` here) and an explicit
+        ``with show_task_console(...)`` / re-run, which can both fire.
+
+        Stopping a feed sets its cooperative-cancel event (M5), so a feed thread
+        blocked in ``camera.acquire`` unwinds and the camera is released -- this is
+        what keeps a closed dashboard from leaving a live acquire thread (and a held
+        camera / RPyC connection) behind, which previously wedged the kernel."""
+        if getattr(self, "_shut", False):
+            return
+        self._shut = True
         self._timer.stop()
         for feed in self.feeds:
             try:
@@ -2736,10 +2775,23 @@ class TaskConsole(QtWidgets.QWidget):
         self._panel_editors.clear()
         for card in self.cards:
             card.shutdown()
+        on_close = getattr(self, "_on_close", None)
+        if on_close is not None:
+            try:
+                on_close()
+            except Exception:
+                pass
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
         self.shutdown()
         super().closeEvent(event)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.shutdown()
+        return False
 
 
 def show_task_console(
@@ -2752,6 +2804,7 @@ def show_task_console(
     scale: float | None = None,
     window_ratio: float = 0.84,
     title: str = "TaskConsole@Zou lab",
+    on_close=None,
 ):
     """Open the console in a Fluent window (mirrors ``show_pulse_gui``: the body
     sizes itself from the primary screen; the window wraps it exactly).
@@ -2764,13 +2817,22 @@ def show_task_console(
     any ``@measurement`` / ``register_measurement``): pass it and every spec is
     listed in the header's Add Panel dropdown; picking one + Add Panel creates a
     result panel and opens its Edit tab (auto-generated parameter form + one-click
-    Start).  Omit it and the dropdown carries only plot kinds."""
+    Start).  Omit it and the dropdown carries only plot kinds.
+
+    Teardown: closing the window stops the refresh timer and every feed's owner
+    thread (the cooperative-cancel path), so no acquire thread is left holding the
+    camera -- closing the dashboard genuinely releases it.  Pass ``on_close`` (e.g.
+    ``exp.close``) to ALSO disconnect/safe the devices the caller owns when the
+    window closes.  In a notebook the returned console is also a context manager
+    (``with show_task_console(...) as console:``) and exposes ``console.shutdown()``
+    for deterministic teardown on a cell re-run."""
 
     app = ensure_qt_app()
     if state is None and task is not None:
         state = resolve_task_state(task)
     console = TaskConsole(hub=hub, state=state, feeds=feeds, measurements=measurements,
                           scale=scale, window_ratio=window_ratio)
+    console._on_close = on_close
     # A passed-in producer feed should stream the moment the window opens -- so the
     # Monitor is live without the caller having to remember feed.start().  start()
     # is idempotent, so a feed the caller already started (e.g. bring-up's
@@ -2781,6 +2843,12 @@ def show_task_console(
         if not getattr(feed, "running", False) and hasattr(feed, "start"):
             feed.start(rate_hz=getattr(feed, "rate_hz", 5.0))
     window = FluentWindow(widget=console, title=title, hide_on_close=False)
+    # Closing the window must tear the console down: the console is a CHILD of the
+    # window, so its own closeEvent never fires on a window close -- without this the
+    # feed owner threads keep running (blocked in camera.acquire, holding the camera /
+    # RPyC link), which wedges the kernel.  `closed` fires only on a genuine close, so
+    # minimising the dashboard does NOT stop the feeds.
+    window.closed.connect(console.shutdown)
     window.adjustSize()
     window.setFixedSize(window.size())
     window.show()

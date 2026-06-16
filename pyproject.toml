@@ -18,7 +18,7 @@ dependencies = [
     "nbformat",
     "notebook",
     "numpy",
-    "PyQt-Frameless-Window",
+    "PyQt5-Frameless-Window",
     "PyQt5",
     "rpyc",
     "scipy",

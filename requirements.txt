@@ -10,7 +10,7 @@ scipy
 
 # PyQt pulse GUI
 PyQt5
-PyQt-Frameless-Window
+PyQt5-Frameless-Window
 
 # Jupyter notebook/widget plotting
 ipympl

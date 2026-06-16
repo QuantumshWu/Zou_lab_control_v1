@@ -1074,7 +1074,7 @@ def test_panel_plot_spec_is_the_confocal_modular_region():
     # margin) therefore propagates here automatically and can never leave a stale
     # green assertion (the drift that once asserted (110,110,100,70) long after the
     # code had moved on).
-    assert PANEL_SIZES == ("1x2", "2x2", "1x4", "2x4")
+    assert PANEL_SIZES == ("1x2", "2x2", "1x4", "2x4", "4x4")
     assert panel_size_cells("1x4") == (1, 4)
     stock = panel_plot_spec("2x2")
     assert stock.data_px == FigureSpec().data_px        # "2x2" IS the stock frontend region
@@ -1083,6 +1083,8 @@ def test_panel_plot_spec_is_the_confocal_modular_region():
     assert half.data_px == (stock.data_px[0], stock.data_px[1] // 2)   # half height, same width
     wide = panel_plot_spec("2x4")
     assert wide.data_px == (stock.data_px[0] * 2, stock.data_px[1])    # double width, same height
+    big = panel_plot_spec("4x4")
+    assert big.data_px == (stock.data_px[0] * 2, stock.data_px[1] * 2)  # double width AND height
     # every panel shares ONE margin set, and it is the owned constant
     assert half.margins_px == stock.margins_px == PANEL_MARGINS_PX
     # the un-clip invariant: the panel's LEFT margin equals the stock confocal left
