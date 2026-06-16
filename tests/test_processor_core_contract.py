@@ -61,6 +61,33 @@ def test_readout_fidelity_processor_drives_characterize(tmp_path):
     assert np.all(np.isfinite(exp.readout.current.thresholds))
 
 
+def test_processor_feed_runs_once_and_publishes_to_hub(tmp_path):
+    """ProcessorFeed runs the spec ONCE, publishes its result dict (+ processor_done)
+    to the hub, self-stops, and reaches frames only via the saved dir (no backend)."""
+    from Zou_lab_control.neutral_atom.operations.feeds import ProcessorFeed
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+
+    data_dir = tmp_path / "run02"
+    na.write_virtual_run(str(data_dir), prefix="img", groups=60, shots_per_group=4,
+                         short_shot=3, ref_shots=(1, 2, 4), grid_shape=(4, 5),
+                         loading_probability=0.5, seed=3)
+    exp = na.connect("virtual", sitemap={"grid_shape": (4, 5)})
+    exp.readout.sitemap_from_dir(str(data_dir), prefix="img", method="psf")
+    spec = next(s for s in exp.readout.processor_specs() if s.name == "Readout fidelity")
+
+    hub = SignalHub()
+    params = {**spec.defaults(), "data_dir": str(data_dir), "seed": 1}
+    feed = ProcessorFeed(hub, spec, readout=exp.readout, params=params)
+    feed.run_to_completion()
+
+    assert feed.finished
+    assert float(hub.latest("processor_done")) == 1.0
+    assert np.asarray(hub.latest("fidelity_site")).shape == (20,)            # 4x5 sites
+    assert (set(spec.result_keys) | {"processor_done"}) <= set(hub.names())  # all declared landed
+    assert set(spec.result_keys) | {"processor_done"} == set(feed.published_signals())
+    assert exp.readout.current.metadata.get("threshold_method") == "per_site_reference"
+
+
 def test_processor_registry_rejects_duplicate_result_keys():
     a = lambda readout: ProcessorSpec(name="A", params=(), run=lambda c: {}, result_keys=("dup",))
     b = lambda readout: ProcessorSpec(name="B", params=(), run=lambda c: {}, result_keys=("dup",))

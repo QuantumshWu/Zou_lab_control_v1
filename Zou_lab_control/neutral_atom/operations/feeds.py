@@ -547,4 +547,54 @@ class ScannedMeasurementFeed(ExperimentFeed):
         return frozenset(self.prefix + key for key in keys)
 
 
-__all__ = ["CameraFrameFeed", "ExperimentFeed", "LoadingFeed", "ScannedMeasurementFeed"]
+class ProcessorFeed(ExperimentFeed):
+    """One-shot DATA-PROCESSING action feed: runs a :class:`ProcessorSpec` ONCE,
+    publishes its result dict to the hub, and self-stops -- the discrete sibling of
+    :class:`ScannedMeasurementFeed` (a finite scan).  It DRIVES the spec's
+    ``run(ctx)`` and owns no analysis itself.
+
+    The cooperative-stop event is shared with the run via the context, so a long
+    camera grab inside ``run`` cancels cleanly on ``stop()`` (the SOLE-camera-owner
+    invariant: the run executes on this feed's own thread, never a second acquire)."""
+
+    def __init__(self, hub: SignalHub, spec, *, readout, camera=None,
+                 sequencer: object | None = None, params: dict | None = None, prefix: str = ""):
+        super().__init__(hub, prefix=prefix)
+        self.spec = spec
+        self._readout = readout
+        self._camera = camera
+        self._sequencer = sequencer
+        self._params = dict(params or {})
+        self.finished = False
+        self.result: dict = {}
+
+    def shot(self) -> dict[str, object]:
+        from .processor import ProcessorContext
+
+        # One-shot: stop the loop after THIS publish no matter what.  Setting the
+        # stop up front means a run() that raises (reported by the loop as
+        # feed_error) is NOT retried -- a deterministic processing action runs once.
+        self._stop.set()
+        ctx = ProcessorContext(
+            readout=self._readout, params=self._params,
+            camera=self._camera, sequencer=self._sequencer, stop=self._stop)
+        result = self.spec.run(ctx)
+        self.result = {str(key): value for key, value in dict(result).items()}
+        self.finished = True
+        out = dict(self.result)
+        out["processor_done"] = 1.0
+        return out
+
+    def run_to_completion(self) -> "ProcessorFeed":
+        """Run the action once synchronously and publish its result (test/headless)."""
+
+        if not self.finished:
+            self.step()
+        return self
+
+    def published_signals(self) -> frozenset:
+        keys = tuple(self.spec.result_keys) + ("processor_done",)
+        return frozenset(self.prefix + key for key in keys)
+
+
+__all__ = ["CameraFrameFeed", "ExperimentFeed", "LoadingFeed", "ProcessorFeed", "ScannedMeasurementFeed"]
