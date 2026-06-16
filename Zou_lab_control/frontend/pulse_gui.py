@@ -67,6 +67,7 @@ from .qt_fluent import (
     mark_scan_field,
     measure_text_width,
     scaled_px,
+    screen_fit_window_size,
     set_fluent_scale,
     align_to_resolution,
     batched_updates,
@@ -2109,24 +2110,9 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self._sync_dataset_geometry()
 
     def _target_editor_size(self) -> QtCore.QSize:
-        app = QtWidgets.QApplication.instance()
-        screen = app.primaryScreen() if app is not None else None
-        if screen is None:
-            return QtCore.QSize(_px(1280, minimum=960), _px(760, minimum=620))
-        available = screen.availableGeometry()
-        titlebar_allowance = _px(36, minimum=28)
-        margin_w = _px(40, minimum=28)
-        margin_h = _px(48, minimum=32)
-        max_w = max(360, available.width() - margin_w)
-        max_h = max(320, available.height() - titlebar_allowance - margin_h)
-        min_w = min(_px(980, minimum=820), max_w)
-        min_h = min(_px(640, minimum=560), max_h)
-        desired_w = min(max_w, int(available.width() * self.window_ratio))
-        desired_h = min(max_h, int(available.height() * self.window_ratio) - titlebar_allowance)
-        return QtCore.QSize(
-            max(min_w, desired_w),
-            max(min_h, desired_h),
-        )
+        # The shared screen-fit rule (qt_fluent.screen_fit_window_size) -- identical
+        # to the task console's, so the two GUIs never diverge on window sizing.
+        return screen_fit_window_size(self.window_ratio)
 
     def _set_gui_title(self, title: str) -> None:
         self.setWindowTitle(title)

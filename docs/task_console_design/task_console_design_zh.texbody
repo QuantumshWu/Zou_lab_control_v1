@@ -193,9 +193,9 @@ value = rate_grid - b_rate_grid        # 两个实验相减 -> 2D
 \pyapi{panel\_plot\_spec(size)}（\filepath{frontend/live.py}）对\tfocus{每一种 kind} 返回同一套几何：
 \begin{itemize}
   \item \pyapi{PANEL\_SIZES = ("1x2", "2x2", "1x4", "2x4")}，含义是"行$\times$列的半单元数"。
-  \item \pyapi{2x2} = frontend 的标准 plot 区域，数据区 $480\times360$，边距 \pyapi{(110,110,100,70)}（左右下上；顶 70 是 title 槽，常备，与有没有标题无关）。
+  \item \pyapi{2x2} = frontend 的标准 plot 区域，数据区 $480\times360$，边距 \pyapi{PANEL\_MARGINS\_PX = (110, 86, 80, 70)}（左右下上）：左 \pyapi{110} 取自 \pyapi{STOCK\_MARGINS\_PX} 的 confocal 左边距，是容纳 4--5 位 y 刻度标签（如 qCMOS 像素 \pyapi{1180}）+ 旋转 y 轴标题\tfocus{不被裁切}的最小值；右 \pyapi{86}、下 \pyapi{80} 相对 confocal 收紧以提高数据占比；顶 \pyapi{70} = \pyapi{TITLE\_SLOT\_PX} 的 title 槽，常备，与有没有标题无关。
   \item \pyapi{1x2} = 半高，\pyapi{2x4} = 双宽。
-  \item 2D 与 Site map 在\tfocus{自己的区域内部}做 $[0.75, 0.1, 0.1]$ 水平分割（主图+侧分布+colorbar），所以 \pyapi{2x2} 主图恰好 $360\times360$ \tfocus{正方形}且与 colorbar 顶底对齐——这正是不同类型面板能整齐排版的原因。
+  \item 2D 与 Site map 在\tfocus{自己的区域内部}按 \pyapi{\_IMAGE\_SPLIT}（$[0.75, 0.1, 0.1]$ = 主图+侧分布+colorbar）水平分割，所以 \pyapi{2x2} 主图恰好 $360\times360$ \tfocus{正方形}且与 colorbar 顶底对齐——这正是不同类型面板能整齐排版的原因。
 \end{itemize}
 对外接口只有 \pyapi{panel\_plot(data, kind=, size=)} 与 \pyapi{panel\_plot\_spec(size)}：\tfocus{尺寸是唯一旋钮}，几何/dpi/边距不可外部配置（\pyapi{panel\_size\_cells} 校验尺寸，非预设抛错）。
 
@@ -436,9 +436,15 @@ GUI 的 Start 调的就是同一个 \pyapi{build\_temperature\_scan}（spec.buil
 
 \chapter{空白收紧}
 
-\tfocus{用户反馈}：frame 里空白太大。\tfocus{根因}：\pyapi{PANEL\_MARGINS\_PX}（\filepath{live.py}）原为 \pyapi{(110,110,100,70)}（左右下上），使数据区只占 figure 面积约 46.6\%；卡高远大于 canvas，footer + \pyapi{addStretch} 又吃掉一截竖直空间。
+\pyapi{PANEL\_MARGINS\_PX}（\filepath{live.py}）= \pyapi{(110, 86, 80, 70)}（左右下上），所有 kind 共用同一套——这是\tfocus{少留白}与\tfocus{不裁切}的平衡：
 
-\tfocus{改动}：\pyapi{PANEL\_MARGINS\_PX} 收紧到 \pyapi{(92,86,80,52)}（data 占比 47\% → ~58\%），并让 footer\tfocus{紧贴 canvas}。三档 DPR 真实入口截图验过不裁切、不重叠、对齐；现有 5 类 plot 的几何只在 panel 路径上按预期变化。
+\begin{itemize}
+  \item 左 \pyapi{110}（= \pyapi{STOCK\_MARGINS\_PX[0]}，confocal 左边距）是容纳 4--5 位 y 刻度标签（如 qCMOS ROI 像素 \pyapi{1180}）+ 旋转 y 轴标题的\tfocus{最小值}；再窄，y 轴标题就会被挤出 figure 左缘（每种 kind 都如此）。这一侧不能为了省空白而收窄。
+  \item 右 \pyapi{86}、下 \pyapi{80} 相对 confocal 的 \pyapi{110/100} 收紧，使数据区占 figure 面积约 \pyapi{50\%}，卡片不留多余横向空白，且 footer \tfocus{紧贴 canvas}（不靠 \pyapi{addStretch} 撑高）。
+  \item 顶 \pyapi{70} = \pyapi{TITLE\_SLOT\_PX} 的 title 槽，常备。\pyapi{\_with\_title\_margin} 的下限与它读\tfocus{同一常数}，故有无标题的面板一样高、\pyapi{panel\_display\_size} 不会少算卡片高度。
+\end{itemize}
+
+三档 DPR 真实入口截图验过不裁切、不重叠、对齐；现有 5 类 plot 的几何只在 panel 路径上按预期变化。收紧让 agg buffer 变小，也顺带降一点重绘成本（见性能章）。
 
 \begin{notebox}
 \textbf{结构性残留（已 flag、未强改）}：右侧仍有一段 gutter，多行卡片 tiling 也有 slack。这是\tfocus{固定拖拽网格 + 密封几何}的\tfocus{结构性权衡}——用户喜欢的拖拽-吸附网格按整数布局槽排，卡片外框必须吸收图边距的模数差额，于是窗口宽度不被面板占满时出现右 gutter。三档 DPR 表现一致，非回归。要消掉需改成"面板默认占满窗口宽度"或自由布局，是更大的取舍，留给用户拍板。

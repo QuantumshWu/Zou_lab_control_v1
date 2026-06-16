@@ -56,6 +56,12 @@ STEP_WIDTH = 6
 
 _QT_APP = None
 _FLUENT_SCALE = 1.0
+# The fluent scale is clamped to a usable band: below the min the controls become
+# unreadable, above the max they waste space.  ONE source -- set_fluent_scale and
+# the scale-sharing contract test both read these (the test must not re-type the
+# band, or the two could silently disagree).
+FLUENT_SCALE_MIN = 0.72
+FLUENT_SCALE_MAX = 1.25
 # Matches one float token; used by align_to_resolution to snap numbers inside a value.
 _FLOAT_TOKEN_RE = re.compile(r"(?<![A-Za-z_])[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?")
 
@@ -70,6 +76,21 @@ def fluent_scale() -> float:
 # must end up with identical control sizes (pulse editor == task console).
 _AUTO_SCALE_BASIS = (1280, 790)
 _AUTO_SCALE_MARGIN = (48, 88)
+
+# Initial-window sizing for the two top-level GUIs (task console + pulse editor).
+# Both windows fit themselves to the screen with the SAME rule; it used to be
+# copied verbatim into each file (every literal duplicated), so a tweak in one
+# silently diverged the other.  These are the ONE source -- see
+# screen_fit_window_size below.  (height, width) where a pair is (w, h).
+_WINDOW_FALLBACK_PX = (1280, 760)       # size when no screen can be queried
+_WINDOW_FALLBACK_MIN_PX = (960, 620)    # scaled_px floor for the fallback
+_WINDOW_MIN_PX = (980, 640)             # minimum window before clamping to screen
+_WINDOW_MIN_FLOOR_PX = (820, 560)       # scaled_px floor for that minimum
+_WINDOW_MARGIN_PX = (40, 48)            # (w, h) breathing room left around the screen
+_WINDOW_MARGIN_FLOOR_PX = (28, 32)      # scaled_px floor for those margins
+_WINDOW_TITLEBAR_PX = 36                # title-bar height allowance
+_WINDOW_TITLEBAR_FLOOR_PX = 28          # scaled_px floor for the title bar
+_WINDOW_MAX_FLOOR_PX = (360, 320)       # absolute (w, h) floor for the screen-fit max
 
 
 def resolve_fluent_auto_scale(app: QtWidgets.QApplication | None = None) -> float:
@@ -99,7 +120,7 @@ def set_fluent_scale(scale: float | None = None) -> float:
     global _FLUENT_SCALE
     if scale is None:
         scale = resolve_fluent_auto_scale()
-    _FLUENT_SCALE = max(0.72, min(1.25, float(scale)))
+    _FLUENT_SCALE = max(FLUENT_SCALE_MIN, min(FLUENT_SCALE_MAX, float(scale)))
     app = QtWidgets.QApplication.instance()
     if app is not None:
         app.setFont(QtGui.QFont(FONT, fluent_font_size()))
@@ -108,6 +129,34 @@ def set_fluent_scale(scale: float | None = None) -> float:
 
 def scaled_px(value: int | float, *, minimum: int = 1) -> int:
     return max(int(minimum), int(round(float(value) * _FLUENT_SCALE)))
+
+
+def screen_fit_window_size(window_ratio: float) -> QtCore.QSize:
+    """Initial window size for a top-level GUI, fit to the primary screen.
+
+    The task console and the pulse editor share this ONE rule (it was duplicated
+    verbatim in both, every literal copied -- so a change in one silently diverged
+    the other, the same failure class as the scale rule).  ``window_ratio`` is the
+    fraction of the screen the window aims for; the result is clamped to a usable
+    minimum and to what the screen can actually show."""
+
+    app = QtWidgets.QApplication.instance()
+    screen = app.primaryScreen() if app is not None else None
+    if screen is None:
+        return QtCore.QSize(
+            scaled_px(_WINDOW_FALLBACK_PX[0], minimum=_WINDOW_FALLBACK_MIN_PX[0]),
+            scaled_px(_WINDOW_FALLBACK_PX[1], minimum=_WINDOW_FALLBACK_MIN_PX[1]))
+    available = screen.availableGeometry()
+    titlebar_allowance = scaled_px(_WINDOW_TITLEBAR_PX, minimum=_WINDOW_TITLEBAR_FLOOR_PX)
+    margin_w = scaled_px(_WINDOW_MARGIN_PX[0], minimum=_WINDOW_MARGIN_FLOOR_PX[0])
+    margin_h = scaled_px(_WINDOW_MARGIN_PX[1], minimum=_WINDOW_MARGIN_FLOOR_PX[1])
+    max_w = max(_WINDOW_MAX_FLOOR_PX[0], available.width() - margin_w)
+    max_h = max(_WINDOW_MAX_FLOOR_PX[1], available.height() - titlebar_allowance - margin_h)
+    min_w = min(scaled_px(_WINDOW_MIN_PX[0], minimum=_WINDOW_MIN_FLOOR_PX[0]), max_w)
+    min_h = min(scaled_px(_WINDOW_MIN_PX[1], minimum=_WINDOW_MIN_FLOOR_PX[1]), max_h)
+    desired_w = min(max_w, int(available.width() * window_ratio))
+    desired_h = min(max_h, int(available.height() * window_ratio) - titlebar_allowance)
+    return QtCore.QSize(max(min_w, desired_w), max(min_h, desired_h))
 
 
 def fluent_font_size() -> int:

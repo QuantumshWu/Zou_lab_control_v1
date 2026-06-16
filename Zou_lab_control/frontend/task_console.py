@@ -66,6 +66,7 @@ from .qt_fluent import (
     ensure_qt_app,
     fluent_widget_stylesheet,
     scaled_px,
+    screen_fit_window_size,
     set_fluent_scale,
     signals_blocked as _signals_blocked,
 )
@@ -2157,25 +2158,11 @@ class TaskConsole(QtWidgets.QWidget):
 
     # ------------------------------------------------------------------ UI
     def _target_console_size(self) -> QtCore.QSize:
-        """Window size from the primary screen (the pulse-editor sizing rule)."""
+        """Window size from the primary screen (the shared GUI sizing rule)."""
 
         if self._window_px is not None:
             return QtCore.QSize(int(self._window_px[0]), int(self._window_px[1]))
-        app = QtWidgets.QApplication.instance()
-        screen = app.primaryScreen() if app is not None else None
-        if screen is None:
-            return QtCore.QSize(scaled_px(1280, minimum=960), scaled_px(760, minimum=620))
-        available = screen.availableGeometry()
-        titlebar_allowance = scaled_px(36, minimum=28)
-        margin_w = scaled_px(40, minimum=28)
-        margin_h = scaled_px(48, minimum=32)
-        max_w = max(360, available.width() - margin_w)
-        max_h = max(320, available.height() - titlebar_allowance - margin_h)
-        min_w = min(scaled_px(980, minimum=820), max_w)
-        min_h = min(scaled_px(640, minimum=560), max_h)
-        desired_w = min(max_w, int(available.width() * self.window_ratio))
-        desired_h = min(max_h, int(available.height() * self.window_ratio) - titlebar_allowance)
-        return QtCore.QSize(max(min_w, desired_w), max(min_h, desired_h))
+        return screen_fit_window_size(self.window_ratio)
 
     def _build_ui(self) -> None:
         self.setWindowTitle("TaskConsole@Zou lab")

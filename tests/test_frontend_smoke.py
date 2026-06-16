@@ -1064,27 +1064,45 @@ def test_panel_plot_spec_is_the_confocal_modular_region():
     import inspect
 
     from Zou_lab_control.frontend.live import (
-        PANEL_DISPLAY_SCALE, PANEL_SIZES, panel_display_size, panel_plot_spec,
-        panel_size_cells)
+        PANEL_DISPLAY_SCALE, PANEL_MARGINS_PX, PANEL_SIZES, TITLE_SLOT_PX,
+        _IMAGE_SPLIT, panel_display_size, panel_plot_spec, panel_size_cells)
     from Zou_lab_control.frontend.canvas import FigureSpec
+    from Zou_lab_control.frontend.style import DESIGN_DPI
 
+    # NOTE: this test DERIVES every expectation from the owned constants -- it never
+    # re-types a margin/size/scale literal.  A value change (e.g. tightening a
+    # margin) therefore propagates here automatically and can never leave a stale
+    # green assertion (the drift that once asserted (110,110,100,70) long after the
+    # code had moved on).
     assert PANEL_SIZES == ("1x2", "2x2", "1x4", "2x4")
     assert panel_size_cells("1x4") == (1, 4)
     stock = panel_plot_spec("2x2")
-    assert stock.data_px == FigureSpec().data_px == (480, 360)   # THE stock plot region
-    assert stock.dpi == 300
+    assert stock.data_px == FigureSpec().data_px        # "2x2" IS the stock frontend region
+    assert stock.dpi == DESIGN_DPI                      # dpi never changes with size
     half = panel_plot_spec("1x2")
-    assert half.data_px == (480, 180)             # half height, same width
-    assert half.margins_px == stock.margins_px == (110, 110, 100, 70)
+    assert half.data_px == (stock.data_px[0], stock.data_px[1] // 2)   # half height, same width
     wide = panel_plot_spec("2x4")
-    assert wide.data_px == (960, 360)
-    # the 2D internal split [0.75, 0.1, 0.1] makes the stock image axes square
-    assert round(stock.data_px[0] * 0.75) == stock.data_px[1] == 360
+    assert wide.data_px == (stock.data_px[0] * 2, stock.data_px[1])    # double width, same height
+    # every panel shares ONE margin set, and it is the owned constant
+    assert half.margins_px == stock.margins_px == PANEL_MARGINS_PX
+    # the un-clip invariant: the panel's LEFT margin equals the stock confocal left
+    # (the minimum that holds a 4-5 digit y-tick + the rotated y-title), so a panel
+    # can never clip the y-title where the stock plot does not.
+    assert PANEL_MARGINS_PX[0] == FigureSpec().margins_px[0]
+    # the TOP margin IS the always-reserved title slot (= _with_title_margin's floor),
+    # so panel_display_size matches the real titled figure instead of under-reporting it.
+    assert PANEL_MARGINS_PX[3] == TITLE_SLOT_PX
+    # the 2D internal split's image fraction makes the stock image axes square
+    assert round(stock.data_px[0] * _IMAGE_SPLIT[0][0]) == stock.data_px[1]
     # the public surface takes ONLY the size preset -- no geometry knobs
     assert list(inspect.signature(panel_plot_spec).parameters) == ["size"]
     assert 0 < PANEL_DISPLAY_SCALE < 1
-    width, height = panel_display_size("2x2")
-    assert (width, height) == (round(700 * PANEL_DISPLAY_SCALE), round(530 * PANEL_DISPLAY_SCALE))
+    # the on-screen size is EXACTLY the scaled figure (data + margins) -- derived,
+    # so it tracks any margin change with no hand-edited number here.
+    left, right, bottom, top = stock.margins_px
+    assert panel_display_size("2x2") == (
+        round((stock.data_px[0] + left + right) * PANEL_DISPLAY_SCALE),
+        round((stock.data_px[1] + bottom + top) * PANEL_DISPLAY_SCALE))
     with pytest.raises(ValueError):
         panel_size_cells("5x5")
 
@@ -1168,21 +1186,23 @@ def test_embedded_canvas_invariants_across_screen_scales(scale_factor):
         "import numpy as np\n"
         "from Zou_lab_control.frontend.qt_fluent import ensure_qt_app\n"
         "ensure_qt_app()\n"
-        "from Zou_lab_control.frontend.live import panel_plot\n"
+        "from Zou_lab_control.frontend.live import panel_plot, panel_display_size, PANEL_DISPLAY_SCALE\n"
+        "from Zou_lab_control.frontend.style import DESIGN_DPI\n"
         "from Zou_lab_control.frontend.qt_canvas import EmbeddedFigureCanvas\n"
         "p = panel_plot(np.arange(50.0), np.random.rand(50), kind='1d', size='2x2')\n"
         "fig = p.fig\n"
         "design_inches = tuple(round(float(v), 4) for v in fig.get_size_inches())\n"
-        "c = EmbeddedFigureCanvas(fig, display_scale=0.7)\n"
+        "c = EmbeddedFigureCanvas(fig, display_scale=PANEL_DISPLAY_SCALE)\n"
         "c.setFixedSize(c.sizeHint())\n"
         "real = float(__import__('os').environ.get('QT_SCALE_FACTOR', '1.0'))\n"
         "# invariant 1: design inches never change\n"
         "assert tuple(round(float(v), 4) for v in fig.get_size_inches()) == design_inches\n"
         "# invariant 2: dpi = design dpi x REAL screen ratio (retina supersampling)\n"
-        "assert abs(fig.dpi - 300 * real) < 1e-6, fig.dpi\n"
-        "# invariant 3: the LOGICAL widget size is scale-independent (+-1 px rounding):\n"
-        "# the 2x2 stock region 480x360 + margins (110,110,100,70) = 700x530 figure px\n"
-        "assert abs(c.width() - 490) <= 1 and abs(c.height() - 371) <= 1, (c.width(), c.height())\n"
+        "assert abs(fig.dpi - DESIGN_DPI * real) < 1e-6, fig.dpi\n"
+        "# invariant 3: the LOGICAL widget size is scale-independent (+-1 px) and EQUALS\n"
+        "# panel_display_size -- DERIVED from the owned geometry, so it tracks margin changes.\n"
+        "exp_w, exp_h = panel_display_size('2x2')\n"
+        "assert abs(c.width() - exp_w) <= 1 and abs(c.height() - exp_h) <= 1, (c.width(), c.height())\n"
         "print('DPR-INVARIANTS-OK')\n"
     )
     env = dict(__import__("os").environ)
@@ -1233,7 +1253,8 @@ def test_fluent_auto_scale_is_shared_between_guis(monkeypatch):
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from Zou_lab_control.frontend.qt_fluent import (
-        ensure_qt_app, fluent_scale, resolve_fluent_auto_scale, set_fluent_scale)
+        FLUENT_SCALE_MAX, FLUENT_SCALE_MIN, ensure_qt_app, fluent_scale,
+        resolve_fluent_auto_scale, set_fluent_scale)
     from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
 
     app = ensure_qt_app()
@@ -1241,8 +1262,9 @@ def test_fluent_auto_scale_is_shared_between_guis(monkeypatch):
         console_path = set_fluent_scale(None)         # the task-console call
         pulse_path = PulseSequenceEditor._resolve_scale(None, app=app)
         assert console_path == pulse_path
-        # and both equal the one shared rule (after the [0.72, 1.25] clamp)
-        assert console_path == max(0.72, min(1.25, resolve_fluent_auto_scale(app)))
+        # and both equal the one shared rule, after the owned clamp band (imported,
+        # not re-typed -- so the test tracks the band instead of going stale).
+        assert console_path == max(FLUENT_SCALE_MIN, min(FLUENT_SCALE_MAX, resolve_fluent_auto_scale(app)))
         assert fluent_scale() == pulse_path
     finally:
         set_fluent_scale(1.0)
@@ -1317,6 +1339,7 @@ def test_task_console_cards_are_modular(monkeypatch):
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from Zou_lab_control.frontend import devtools as dt
     from Zou_lab_control.frontend.live import panel_display_size
+    from Zou_lab_control.frontend.style import DESIGN_DPI
     from Zou_lab_control.frontend.task_console import _GRID_GAP, _card_size
 
     # THE tiling contract: a 2-row card is exactly two 1-row cards + gap, and a
@@ -1338,7 +1361,7 @@ def test_task_console_cards_are_modular(monkeypatch):
             # the design dpi in _original_dpi and inflates fig.dpi by the ratio
             # (the same thing a real high-DPI screen does to every figure).
             fig = card.plotter.fig
-            assert getattr(fig, "_original_dpi", fig.dpi) == 300
+            assert getattr(fig, "_original_dpi", fig.dpi) == DESIGN_DPI
             assert card.canvas.width() < fig.get_size_inches()[0] * fig.dpi
     # same size -> identical card (the hist and monitor 1x2 cards)
     sizes = {}

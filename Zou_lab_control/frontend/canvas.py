@@ -10,7 +10,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 from mpl_toolkits.axes_grid1 import Divider, Size
 
-from .style import apply_style
+from .style import DESIGN_DPI, STOCK_DATA_PX, STOCK_MARGINS_PX, apply_style
 
 try:
     from IPython import get_ipython
@@ -22,11 +22,15 @@ except Exception:  # pragma: no cover - only absent outside IPython.
 
 @dataclass(frozen=True)
 class FigureSpec:
-    """Fixed logical-pixel layout for a notebook figure."""
+    """Fixed logical-pixel layout for a notebook figure.
 
-    data_px: tuple[int, int] = (480, 360)
-    margins_px: tuple[int, int, int, int] = (110, 110, 100, 40)
-    dpi: int = 300
+    The defaults ARE the stock confocal single-axes region; they read the geometry
+    tokens in ``style.py`` (the single source) so this and ``style.figure.figsize``
+    can never drift apart."""
+
+    data_px: tuple[int, int] = STOCK_DATA_PX
+    margins_px: tuple[int, int, int, int] = STOCK_MARGINS_PX
+    dpi: int = DESIGN_DPI
 
 
 _CELL_FIGS: dict[str, list[int]] = {}
@@ -323,20 +327,29 @@ def grid_shape_for(n: int, *, max_cols: int = 8, prefer: tuple[int, int] | None 
     return nrows, ncols
 
 
+# Growth steps for auto_data_size_px (notebook multi-panel auto-sizing): the data
+# box grows one step per extra column / row, capped.  Named so the numbers live in
+# one place rather than inline in the expression.
+_AUTO_COL_STEP_PX = 80       # extra data width per column beyond the first
+_AUTO_ROW_STEP_PX = 90       # extra data height per row beyond the first
+_AUTO_MULTI_BASE_W_PX = 420  # base width when ncols > 1 (before adding column steps)
+_AUTO_MAX_H_PX = 620         # cap on the grown height
+
+
 def auto_data_size_px(
     ncols: int = 1,
     nrows: int = 1,
     aspect: float | None = None,
-    min_w: int = 420,
+    min_w: int = _AUTO_MULTI_BASE_W_PX,
     max_w: int = 760,
-    base_h: int = 360,
+    base_h: int = STOCK_DATA_PX[1],
 ) -> tuple[int, int]:
     """Choose a conservative fixed data-box size for notebook plots."""
     ncols = max(1, int(ncols))
     nrows = max(1, int(nrows))
     if aspect is None:
-        width = 480 if ncols == 1 else min(max_w, 420 + 80 * (ncols - 1))
-        height = base_h if nrows == 1 else min(620, base_h + 90 * (nrows - 1))
+        width = STOCK_DATA_PX[0] if ncols == 1 else min(max_w, _AUTO_MULTI_BASE_W_PX + _AUTO_COL_STEP_PX * (ncols - 1))
+        height = base_h if nrows == 1 else min(_AUTO_MAX_H_PX, base_h + _AUTO_ROW_STEP_PX * (nrows - 1))
         return int(width), int(height)
     width = int(np_clip(base_h * float(aspect), min_w, max_w))
     return width, int(base_h)

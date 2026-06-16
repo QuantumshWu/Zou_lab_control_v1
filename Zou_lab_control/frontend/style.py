@@ -32,6 +32,24 @@ if FONT_PATH.exists():
 
 SANS_SERIF = ([_FONT_NAME] if _FONT_NAME else []) + ["Arial"]
 
+# --------------------------------------------------------------------------- #
+# Geometry design tokens.  style.py is the lowest-level frontend module (no
+# internal imports), so the ONE stock-figure geometry + the ONE design dpi live
+# here and every other module (canvas.FigureSpec, live's panel/pulse specs) reads
+# them -- a value is written ONCE and never re-typed, so nothing can drift.
+# These are OWNED constants of the frontend visual system, NOT per-call knobs.
+# --------------------------------------------------------------------------- #
+DESIGN_DPI = 300                          # the one design dpi; every figure renders at this
+STOCK_DATA_PX = (480, 360)                # the stock single-axes data region (confocal)
+STOCK_MARGINS_PX = (110, 110, 100, 40)    # confocal stock margins (L, R, B, T)
+
+# Stock figure size in inches = (data + L + R, data + B + T) / dpi.  Derived, so
+# it can never disagree with FigureSpec's defaults (which read the same tokens).
+_STOCK_FIGSIZE = [
+    (STOCK_DATA_PX[0] + STOCK_MARGINS_PX[0] + STOCK_MARGINS_PX[1]) / DESIGN_DPI,
+    (STOCK_DATA_PX[1] + STOCK_MARGINS_PX[2] + STOCK_MARGINS_PX[3]) / DESIGN_DPI,
+]
+
 # The ONE typography/dpi system.  The mutable dict is PRIVATE so the owned
 # defaults can never be mutated in place from outside (the public name below is
 # a read-only view); see the frontend/__init__.py design contract.
@@ -40,7 +58,7 @@ _DEFAULT_STYLE: dict[str, Any] = {
     "legend.fontsize": 6.5,
     "xtick.labelsize": 6.5,
     "ytick.labelsize": 6.5,
-    "figure.figsize": [700 / 300, 500 / 300],
+    "figure.figsize": _STOCK_FIGSIZE,
     "lines.linewidth": 1,
     "scatter.edgecolors": NEW_BLACK,
     "legend.numpoints": 1,
@@ -233,10 +251,13 @@ def threshold_line_kwargs(linewidth: float = 1.9) -> dict[str, Any]:
 
 __all__ = [
     "DEFAULT_STYLE",
+    "DESIGN_DPI",
     "FONT_PATH",
     "NEW_BLACK",
     "PALETTE",
     "SANS_SERIF",
+    "STOCK_DATA_PX",
+    "STOCK_MARGINS_PX",
     "apply_style",
     "apply_title",
     "axis_label_fontsize",

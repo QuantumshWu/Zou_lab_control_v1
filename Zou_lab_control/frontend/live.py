@@ -23,7 +23,9 @@ from Zou_lab_control._readout_math import (
     gaussian_jacobian,
 )
 from .style import (
+    DESIGN_DPI,
     PALETTE,
+    STOCK_MARGINS_PX,
     apply_style,
     apply_title,
     axis_label_fontsize,
@@ -63,7 +65,26 @@ _PULSE_X_MAX_WIDTH_FACTOR = 3        # max width as a multiple of the base data 
 _PULSE_Y_PAD_BOTTOM = 0.62           # gap below the bottom channel row (row units)
 _PULSE_Y_PAD_TOP = 0.38              # gap above the top channel row (row units)
 _PULSE_MARGINS_PX = (110, 90, 100, 50)   # owned pulse-plot margins (L, R, B, T)
-_PULSE_DPI = 300                          # the ONE design dpi (never per-call)
+_PULSE_DPI = DESIGN_DPI                    # the ONE design dpi (never per-call; one source)
+
+# SHARED PLOT GEOMETRY -- OWNED by the frontend, never per-call.  These are the
+# few raw numbers the plot layouts used to spell inline; naming them ONCE here
+# means a value is written in a single place (and the contract tests DERIVE from
+# these rather than re-typing the literal, so they cannot silently go stale).
+TITLE_SLOT_PX = 70                         # vertical px a centred plot title needs.
+                                           # A titled figure floors its TOP margin
+                                           # here (_with_title_margin), and a panel
+                                           # ALWAYS reserves it so a panel is ONE size
+                                           # whether or not it carries a title -- ONE
+                                           # source so PANEL_MARGINS_PX[3] and the
+                                           # title-margin floor can never disagree (the
+                                           # desync that made panel_display_size
+                                           # under-report the card height).
+# Horizontal axes splits for the composite plots (fractions of the data width that
+# go to image | side-distribution | colorbar, with the inter-band gaps).  0.75 is
+# what makes the "2x2" 2D image square (480 * 0.75 = 360).
+_DIST_SPLIT = ([0.825, 0.15], [0.025])             # 1D + side distribution (plot | dist)
+_IMAGE_SPLIT = ([0.75, 0.1, 0.1], [0.025, 0.025])  # 2D image | side dist | colorbar
 
 # Owned geometry for the per-site histogram grid (site_histogram_grid).  Mirrors
 # the pulse-plot many-data policy: a FIXED small per-cell box, COLUMNS capped so
@@ -144,7 +165,7 @@ def _with_title_margin(spec: FigureSpec, title: str, margins_supplied: bool) -> 
     if not title or margins_supplied:
         return spec
     left, right, bottom, top = spec.margins_px
-    return FigureSpec(data_px=spec.data_px, margins_px=(left, right, bottom, max(top, 70)), dpi=spec.dpi)
+    return FigureSpec(data_px=spec.data_px, margins_px=(left, right, bottom, max(top, TITLE_SLOT_PX)), dpi=spec.dpi)
 
 
 def _update_verts(bins, counts, verts, mode: str = "horizontal") -> None:
@@ -591,7 +612,7 @@ class LiveLiveDis(LiveLive):
     def init_core(self) -> None:
         # carve the side band off FIRST so the base draws the trace into the
         # narrowed main axes
-        self.ax, self.axdis = split_axes_horizontally(self.fig, self.ax, [0.825, 0.15], [0.025])
+        self.ax, self.axdis = split_axes_horizontally(self.fig, self.ax, *_DIST_SPLIT)
         super().init_core()
         self.fit_text = None
         self.axdis.set_ylim(self.ylim_min, self.ylim_max)
@@ -696,7 +717,7 @@ class Live2DDis(BaseLivePlot):
         return grid
 
     def init_core(self) -> None:
-        self.ax, self.axdis, self.cax = split_axes_horizontally(self.fig, self.ax, [0.75, 0.1, 0.1], [0.025, 0.025])
+        self.ax, self.axdis, self.cax = split_axes_horizontally(self.fig, self.ax, *_IMAGE_SPLIT)
         self.axes = self.ax
         self.x_array = np.unique(self.data_x[:, 0])
         self.y_array = np.unique(self.data_x[:, 1])
@@ -886,7 +907,7 @@ class LiveSiteMap(BaseLivePlot):
     def init_core(self) -> None:
         from matplotlib.collections import EllipseCollection
 
-        self.ax, self.axdis, self.cax = split_axes_horizontally(self.fig, self.ax, [0.75, 0.1, 0.1], [0.025, 0.025])
+        self.ax, self.axdis, self.cax = split_axes_horizontally(self.fig, self.ax, *_IMAGE_SPLIT)
         self.axes = self.ax
         self.axdis.set_visible(False)           # sites carry no side distribution
         centers = self.data_x[:, :2]
@@ -1059,18 +1080,22 @@ def pulse_plot_channels(
 # nothing else -- the visual language is owned here.
 PANEL_SIZES = ("1x2", "2x2", "1x4", "2x4")
 PANEL_UNIT_PX = (180, 240)     # (height, width) of one half-unit of the stock region
-PANEL_MARGINS_PX = (92, 86, 80, 52)      # stock margins (L, R, B, T) with the title.
-                                         # Tightened from (110,110,100,70): the data
-                                         # area was only ~47% of each figure (too much
-                                         # frame whitespace) AND the (B+T) margin is the
-                                         # exact per-figure-px slack a multi-row card's
-                                         # footer must absorb, so trimming it shrinks the
-                                         # visible bottom void too.  Held large enough for
-                                         # the y-label+ticks (L), the 2D/sites colorbar
-                                         # tick labels + z-label (R), the x-label+ticks (B)
-                                         # and the title strip (T) -- verified at 3 DPRs.
-                                         # top slot ALWAYS reserved: a panel has one
-                                         # size whether or not it carries a title
+PANEL_MARGINS_PX = (STOCK_MARGINS_PX[0], 86, 80, TITLE_SLOT_PX)   # stock margins (L, R, B, T).
+                                         # L = STOCK_MARGINS_PX[0] (confocal's left, 110) and
+                                         # is the MINIMUM that holds a 4-5 digit y-tick label
+                                         # ("1180", a qCMOS ROI pixel) PLUS the rotated y-title:
+                                         # at the earlier L=92 the title was pushed ~11 px past
+                                         # the figure's left edge and CLIPPED (every panel kind,
+                                         # 2D and 1D).  Sharing the constant guarantees a panel
+                                         # never clips where the stock plot does not.
+                                         # T = TITLE_SLOT_PX (the always-reserved title slot, =
+                                         # _with_title_margin's floor, so panel_display_size --
+                                         # which reads this top -- matches the real titled figure
+                                         # instead of under-reporting the card height).
+                                         # R/B stay tightened from the old (110,110,100,70)
+                                         # -- they never clipped (R holds the 2D colorbar
+                                         # tick labels + z-label, B the x-label+ticks) and
+                                         # keep the data area dense (~71% wide).
 # Panels are DISPLAYED scaled through the standard high-DPI canvas path
 # (qt_canvas.panel_canvas), so on screen their text sits at ~70% of a
 # notebook/pulse-preview figure while the figure stays an ordinary 300 dpi

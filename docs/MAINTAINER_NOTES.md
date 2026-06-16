@@ -1048,8 +1048,32 @@ Two main speed-ups were **measured and rejected**:
   flips 4845 px (freeze-vs-freeze self-diff = 0 confirms it's freeze-introduced):
   `show()`'s first draw freezes the position at the wrong dpr; sf1.5 rounding flips.
 
-Compliant speed-up that landed = **tightening figure margins** (`PANEL_MARGINS_PX`
-(110,110,100,70) → (92,86,80,52)): smaller agg buffer makes the ~30–40% of draw cost
-that scales with area faster (`draw_text` unchanged). More aggressive options (hysteretic
+Compliant speed-up that landed = **tightening figure margins**. `PANEL_MARGINS_PX`
+is `(110, 86, 80, 70)` (L, R, B, T): R/B/T are pulled in from confocal's stock
+`(110,110,100,40)` so the data area fills ~50% of the figure (a smaller agg buffer makes
+the ~30–40% of draw cost that scales with area faster; `draw_text` unchanged). The LEFT
+stays at the confocal `110` — it is `STOCK_MARGINS_PX[0]`, the minimum that holds a 4–5
+digit y-tick label (e.g. a qCMOS ROI pixel like `1180`) PLUS the rotated y-title; tighter
+clips the y-title past the figure's left edge (true for every panel kind). T `70` is the
+always-reserved title slot (`TITLE_SLOT_PX`). More aggressive options (hysteretic
 autoscale, staggered redraw, low-dpi panel mode) change visible behavior/visuals and are
 **left for the user to authorize** — not done unilaterally.
+
+**Frontend geometry tokens have ONE source each (no inline magic, no re-typed test
+literals).** The visual design is owned by the frontend, never a per-call/host knob; but a
+value is written ONCE and everything (including tests) reads/derives from it, so a tweak
+propagates and nothing drifts. Where they live: `style.py` owns the stock figure geometry
+(`DESIGN_DPI = 300`, `STOCK_DATA_PX = (480,360)`, `STOCK_MARGINS_PX = (110,110,100,40)`;
+`figure.figsize` and `canvas.FigureSpec` defaults derive from these). `live.py` owns the
+panel/pulse/site geometry plus `TITLE_SLOT_PX = 70` (the title-slot floor used by BOTH
+`PANEL_MARGINS_PX[3]` and `_with_title_margin`, so they can never disagree) and the named
+axes splits `_DIST_SPLIT` / `_IMAGE_SPLIT`. `qt_fluent.py` owns `FLUENT_SCALE_MIN/MAX`
+(the scale clamp band) and `screen_fit_window_size(window_ratio)` — the ONE screen-fit
+window rule the task console AND the pulse editor both call (it was duplicated verbatim in
+both, the same drift class as the shared scale rule). The contract tests in
+`test_frontend_smoke.py` (`test_panel_plot_spec_is_the_confocal_modular_region`,
+`test_embedded_canvas_invariants_across_screen_scales`, `test_task_console_cards_are_modular`,
+`test_fluent_auto_scale_is_shared_between_guis`) IMPORT these constants and assert
+RELATIONS (e.g. `panel_display_size == round((data+margins)*scale)`), never re-typing the
+literal — the fix for the bug where a test asserted a stale `(110,110,100,70)` long after
+the code had moved on.
