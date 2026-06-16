@@ -1948,12 +1948,27 @@ class PanelEditor(QtWidgets.QWidget):
         edit.setText(_py_to_text(roi))
         self.status.setText(f"ROI set from view: {roi} — Apply to re-arm the camera")
 
+    def refresh_feed_now_labels(self) -> None:
+        """Update the 'now: <value>' references beside each Acquisition field to the
+        source's CURRENT values.  The console calls this each tick for the visible
+        Edit tab (one general hook, not a per-field signal), so after the loop
+        applies a queued edit the references catch up on their own -- no manual
+        wiring per parameter, and the frozen snapshot / Refresh / Fit controls are
+        untouched."""
+        if self._feed is None or not self._feed_now_labels:
+            return
+        for name, current in self.console._feed_params(self._feed):
+            label = self._feed_now_labels.get(name)
+            if label is not None:
+                label.setText(f"now: {_py_to_text(current)}")
+
     def _restart_feed(self) -> None:
         """Apply the edited Acquisition params to the data source.  The change is
         routed through the feed's safe entry: while the acquisition loop runs it is
         applied BETWEEN shots in the loop's own thread (the live Monitor keeps
-        streaming and the next frame shows the new params -- no GUI stall), so the
-        'now:' references and Edit snapshot catch up on the following ticks."""
+        streaming, no GUI stall); Apply also START s an idle source so it goes live.
+        The 'now:' references update via the console's per-tick refresh (reused
+        here for an immediate read), and the Edit snapshot re-snapshots."""
         if self._feed is None:
             return
         new_params = {name: _text_to_py(w.text()) for name, w in self._feed_widgets.items()}
@@ -1966,12 +1981,10 @@ class PanelEditor(QtWidgets.QWidget):
         # tick the console so an IDLE feed's freshly-published frame shows now; a
         # running feed updates on its own next loop iteration + timer beat.
         self.console.refresh_once()
-        for name, current in self.console._feed_params(self._feed):
-            if name in self._feed_now_labels:
-                self._feed_now_labels[name].setText(f"now: {_py_to_text(current)}")
+        self.refresh_feed_now_labels()        # reuse the same refresh the tick uses
         self.status.setText(
             "acquisition parameters queued — Monitor updates on the next frame"
-            if running else "acquisition parameters applied")
+            if running else "acquisition started with the new parameters")
         self.rebuild()
 
     def _df_for(self):
@@ -2318,6 +2331,12 @@ class TaskConsole(QtWidgets.QWidget):
         if feed is None or not hasattr(feed, "apply_acquisition_parameters"):
             raise RuntimeError("this panel's data source exposes no editable acquisition parameters")
         feed.apply_acquisition_parameters(**new_params)
+        # Edit's Apply makes the source LIVE: if its acquisition loop is not
+        # running (a fresh feed, or one the user stopped), start it so the Monitor
+        # streams under the new params.  start() is idempotent, so a feed that is
+        # already running just keeps its loop (the edit was queued above).
+        if not getattr(feed, "running", False) and hasattr(feed, "start"):
+            feed.start(rate_hz=getattr(feed, "rate_hz", 5.0))
         return feed
 
     def _edit_card(self, card: "PanelCard") -> None:
@@ -2631,6 +2650,12 @@ class TaskConsole(QtWidgets.QWidget):
         namespace = self._expression_namespace()
         for card in self.cards:
             card.refresh(namespace)
+        # keep the visible Edit tab's 'now:' acquisition references live, so a
+        # queued parameter edit shows as applied once the loop picks it up (one
+        # general hook on the current tab -- no per-field wiring).
+        editor = self.tabs.currentWidget()
+        if isinstance(editor, PanelEditor):
+            editor.refresh_feed_now_labels()
         self._update_summary()
 
     def refresh_once(self) -> None:
@@ -2741,6 +2766,15 @@ def show_task_console(
         state = resolve_task_state(task)
     console = TaskConsole(hub=hub, state=state, feeds=feeds, measurements=measurements,
                           scale=scale, window_ratio=window_ratio)
+    # A passed-in producer feed should stream the moment the window opens -- so the
+    # Monitor is live without the caller having to remember feed.start().  start()
+    # is idempotent, so a feed the caller already started (e.g. bring-up's
+    # LoadingFeed(...).start(rate_hz=4)) keeps its own rate; only NON-running feeds
+    # are launched here.  (TaskConsole.__init__ deliberately does NOT do this, so
+    # tests/notebooks keep deterministic manual stepping.)
+    for feed in feeds:
+        if not getattr(feed, "running", False) and hasattr(feed, "start"):
+            feed.start(rate_hz=getattr(feed, "rate_hz", 5.0))
     window = FluentWindow(widget=console, title=title, hide_on_close=False)
     window.adjustSize()
     window.setFixedSize(window.size())

@@ -364,12 +364,16 @@ def test_edit_area_select_writes_camera_roi_and_apply_restarts_monitor():
         editor._plotter.area.range = [1670.0, 1690.0, 1166.0, 1186.0]
         editor._plotter.area.callback()
         assert editor._feed_widgets["roi"].text() == "[1670, 20, 1166, 20]"
-        # Apply re-arms the camera AND the live Monitor card re-acquires (its axes
-        # become the new ROI, not only the Edit snapshot's)
+        # Apply on an IDLE feed re-arms the camera, AUTO-STARTS it (goes live),
+        # the Monitor card re-acquires under the new ROI, and the 'now:' reference
+        # tracks the applied value.
+        assert not feed.running
         editor._restart_feed()
+        assert feed.running                              # Apply made the source live
         assert cam.roi == (1670, 20, 1166, 20)
         assert np.isclose(card.plotter.x_array[0], 1670)
         assert np.isclose(card.plotter.x_array[-1], 1670 + 20 - 1)
+        assert editor._feed_now_labels["roi"].text() == "now: [1670, 20, 1166, 20]"
     finally:
         console.shutdown()
 
@@ -393,6 +397,49 @@ def test_2d_zoom_updates_roi_from_view_area_overrides():
         assert editor._feed_widgets["roi"].text() == "[1672, 10, 1170, 10]"
     finally:
         console.shutdown()
+
+
+def test_feed_now_labels_track_applied_params_on_tick():
+    """The Acquisition 'now:' references follow the source's CURRENT values via the
+    console's per-tick refresh of the VISIBLE Edit tab (one general hook, not a
+    per-field signal) -- so a queued edit on a running feed shows as applied once
+    the loop picks it up."""
+    import time
+    console, feed, cam, card, editor = _camera_console()
+    try:
+        console.tabs.setCurrentWidget(editor)        # the per-tick hook refreshes the visible editor
+        feed.start(rate_hz=50.0)
+        console._restart_feed(feed, {"roi": [1700, 16, 1180, 16]})   # running -> queued
+        deadline = time.monotonic() + 2.0
+        while cam.roi != (1700, 16, 1180, 16) and time.monotonic() < deadline:
+            console.refresh_once()
+            time.sleep(0.02)
+        console.refresh_once()                        # a tick after the loop applied
+        assert cam.roi == (1700, 16, 1180, 16)
+        assert editor._feed_now_labels["roi"].text() == "now: [1700, 16, 1180, 16]"
+    finally:
+        feed.stop()
+        console.shutdown()
+
+
+def test_show_task_console_auto_starts_passed_feeds():
+    """show_task_console makes a passed-in producer feed LIVE on open, so the
+    Monitor streams without the caller remembering feed.start(); shutdown stops it.
+    start() is idempotent, so an already-running feed keeps its own rate."""
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.frontend.task_console import show_task_console
+    from Zou_lab_control.neutral_atom.operations.feeds import CameraFrameFeed
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+
+    hub = SignalHub()
+    feed = CameraFrameFeed(hub, na.connect("virtual").devices.camera)
+    assert not feed.running
+    console = show_task_console(hub=hub, feeds=[feed], title="autostart-test")
+    try:
+        assert feed.running                          # launched on open, no manual start()
+    finally:
+        console.shutdown()
+    assert not feed.running                           # shutdown stopped it
 
 
 def test_apply_roi_to_running_feed_applies_in_loop_no_restart():
