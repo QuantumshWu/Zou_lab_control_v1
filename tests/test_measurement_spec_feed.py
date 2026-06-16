@@ -311,17 +311,22 @@ def test_qcmos_subarray_snaps_writes_and_reads_back():
 def test_region_to_acquisition_parameters_is_owned_by_the_source():
     """The plot selector is a GENERIC interface -- it yields a rectangle as four
     endpoints (x_min, x_max, y_min, y_max) in plot coords and knows nothing about
-    cameras.  Each SOURCE converts that rectangle to its own params: a camera feed
-    maps it to a ROI rect (position+size); a source with no spatial region returns
-    {} (the selection is a no-op for it).  So the frontend never encodes a
-    device-specific shape -- the conversion lives in the acquisition layer."""
+    cameras.  Each SOURCE converts that rectangle to its own ACQUISITION params,
+    which stay in PLOT coordinates: a camera feed keeps it as ``region`` endpoints
+    (the device-ROI conversion is hidden in set_acquisition_parameters); a source
+    with no spatial region returns {} (the selection is a no-op for it).  So the
+    frontend never encodes a device-specific shape."""
     exp = na.connect("virtual", sitemap={"grid_shape": (2, 3), "image_shape": (64, 80)})
     hub = SignalHub()
     cam_feed = na.CameraFrameFeed(hub, exp.devices.camera)
-    # endpoints (x:10..30, y:6..22) -> ROI [x, w, y, h] = [10, 20, 6, 16]
-    assert cam_feed.region_to_acquisition_parameters(10, 30, 6, 22) == {"roi": [10, 20, 6, 16]}
-    # endpoints come in any order -> still a well-formed (sorted) rectangle
-    assert cam_feed.region_to_acquisition_parameters(30, 10, 22, 6) == {"roi": [10, 20, 6, 16]}
+    # endpoints stay endpoints (NOT collapsed to position+size) -- plot format
+    assert cam_feed.region_to_acquisition_parameters(10, 30, 6, 22) == {"region": [10, 30, 6, 22]}
+    # endpoints come in any order -> sorted endpoints
+    assert cam_feed.region_to_acquisition_parameters(30, 10, 22, 6) == {"region": [10, 30, 6, 22]}
+    # the round trip through the camera: set region endpoints -> device ROI -> read
+    # back as endpoints (full sensor 64x80, no snap needed for /4-aligned values)
+    cam_feed.set_acquisition_parameters(region=[8, 28, 12, 28])
+    assert cam_feed.acquisition_parameters()["region"] == [8, 28, 12, 28]
     # a non-spatial source (loading analysis) has no rectangle param -> no-op
     load_feed = na.LoadingFeed(hub, exp.devices.camera, grid_shape=(2, 3))
     assert load_feed.region_to_acquisition_parameters(10, 30, 6, 22) == {}
@@ -414,8 +419,9 @@ def test_running_feed_applies_params_in_owner_thread_no_concurrent_acquire():
         while feed.shots < 2 and time.monotonic() < deadline:
             time.sleep(0.02)
         thread_before = feed._thread
-        # an edit from THIS (non-owner) thread -- must be queued, not applied here
-        feed.apply_acquisition_parameters(roi=[1664, 32, 1160, 32])
+        # an edit from THIS (non-owner) thread -- must be queued, not applied here.
+        # region endpoints [1664,1696,1160,1192] -> internal device ROI (1664,32,1160,32)
+        feed.apply_acquisition_parameters(region=[1664, 1696, 1160, 1192])
         deadline = time.monotonic() + 2.0
         while cam.roi != (1664, 32, 1160, 32) and time.monotonic() < deadline:
             time.sleep(0.02)

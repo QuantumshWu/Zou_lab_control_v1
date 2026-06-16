@@ -1200,9 +1200,10 @@ class PanelCard(FluentGroupBox):
             arr = np.asarray(value, dtype=float)
             ny, nx = arr.shape
             # Coordinate axes ARE the source's pixel space: when the producing feed
-            # declares a camera ROI (x, w, y, h), the image x/y are the REAL pixel
-            # coordinates (x0..x0+w, y0..y0+h), not 0..N -- so the axes match the
-            # ROI and an area-select maps straight back to a new ROI.
+            # declares a spatial region, its endpoints [x_min, x_max, y_min, y_max]
+            # give the axis ORIGIN (index 0 = x_min, index 2 = y_min); the image x/y
+            # are the REAL pixels (x_min..x_min+nx), not 0..N -- so the axes match
+            # the camera window and a selection maps straight back to a new region.
             roi = self._source_coord_frame(namespace)
             self._roi_built = list(roi) if roi else None
             if roi and len(roi) >= 4:
@@ -1808,7 +1809,14 @@ class PanelEditor(QtWidgets.QWidget):
         Monitor card already fits) -- and unlike the Monitor card it is built
         INTERACTIVE (default selectors on), so zoom / region-select work here."""
         card = self.card
-        if card is None or card.plotter is None or panel_canvas is None:
+        if card is None or panel_canvas is None:
+            self.status.setText("open the panel with data first")
+            return
+        # Snapshot the MOST RECENT frame: pull the latest hub data into the Monitor
+        # card first (one synchronous tick), so Refresh mirrors what the camera just
+        # produced -- not the last timer-tick render (which can lag by a beat).
+        self.console.refresh_once()
+        if card.plotter is None:
             self.status.setText("open the panel with data first")
             return
         self.teardown()
@@ -2627,22 +2635,25 @@ class TaskConsole(QtWidgets.QWidget):
         return namespace
 
     def _coord_frames(self) -> dict[str, list]:
-        """Map each feed-published signal to its source ROI ([x, w, y, h]) when the
-        feed declares one (a camera frame), so a panel can use real pixel axes."""
+        """Map each feed-published signal to its source's spatial ``region``
+        endpoints ``[x_min, x_max, y_min, y_max]`` (the acquisition-layer format)
+        when the feed declares one (a camera frame), so a panel can put its axes in
+        real source pixels.  A panel reads index 0 (x_min) and index 2 (y_min) as
+        the axis origin, so this is robust to endpoints vs any position+size form."""
         frames: dict[str, list] = {}
         for feed in self.feeds:
             try:
-                roi = feed.acquisition_parameters().get("roi")
+                region = feed.acquisition_parameters().get("region")
             except Exception:
-                roi = None
-            if not roi:
+                region = None
+            if not region:
                 continue
             try:
                 sigs = feed.published_signals() if hasattr(feed, "published_signals") else ()
             except Exception:
                 sigs = ()
             for s in sigs:
-                frames[str(s)] = list(roi)
+                frames[str(s)] = list(region)
         return frames
 
     def _tick(self) -> None:

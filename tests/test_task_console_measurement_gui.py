@@ -253,8 +253,9 @@ def test_2d_panel_axes_use_source_roi_coordinates():
     card = PanelCard(PanelConfig(kind="2d", source="value = frame"))
     try:
         frame = np.random.rand(16, 24) * 100.0           # h=16, w=24
-        roi = [1648, 24, 1144, 16]                        # (x, w, y, h)
-        card.refresh({"frame": frame, "__coord_frames__": {"frame": roi}, "shot": 1})
+        # coord frame = the source's spatial region ENDPOINTS [x_min,x_max,y_min,y_max]
+        region = [1648, 1672, 1144, 1160]                 # origin (1648,1144), 24x16
+        card.refresh({"frame": frame, "__coord_frames__": {"frame": region}, "shot": 1})
         p = card.plotter
         assert np.isclose(p.x_array[0], 1648) and np.isclose(p.x_array[-1], 1648 + 24 - 1)
         assert np.isclose(p.y_array[0], 1144) and np.isclose(p.y_array[-1], 1144 + 16 - 1)
@@ -289,10 +290,10 @@ def test_2d_panel_rebuilds_when_roi_shifts_same_shape():
     card = PanelCard(PanelConfig(kind="2d", source="value = frame"))
     try:
         frame = np.random.rand(16, 24) * 100.0
-        card.refresh({"frame": frame, "__coord_frames__": {"frame": [1648, 24, 1144, 16]}, "shot": 1})
+        card.refresh({"frame": frame, "__coord_frames__": {"frame": [1648, 1672, 1144, 1160]}, "shot": 1})
         assert np.isclose(card.plotter.x_array[0], 1648)
-        # same-shape frame, SHIFTED ROI origin -> axes track the new origin
-        card.refresh({"frame": frame, "__coord_frames__": {"frame": [100, 24, 200, 16]}, "shot": 2})
+        # same-shape frame, SHIFTED region origin -> axes track the new origin
+        card.refresh({"frame": frame, "__coord_frames__": {"frame": [100, 124, 200, 216]}, "shot": 2})
         assert np.isclose(card.plotter.x_array[0], 100)
         assert np.isclose(card.plotter.y_array[0], 200)
     finally:
@@ -349,54 +350,54 @@ def _camera_console(roi=(1648, 64, 1144, 64)):
     return console, feed, cam, card, editor
 
 
-def test_edit_area_select_writes_camera_roi_and_apply_restarts_monitor():
+def test_edit_area_select_writes_camera_region_and_apply_restarts_monitor():
     """The WRITE-back + RESTART half of G1: a region selected on a camera-frame 2D
-    panel's Edit plot fills the ROI field [x, w, y, h], and Apply RESTARTS the feed
-    so the camera re-arms AND the live Monitor panel (not just the Edit snapshot)
-    re-acquires under the new ROI."""
+    panel's Edit plot fills the acquisition ``region`` field as plot-coord ENDPOINTS
+    [x_min,x_max,y_min,y_max] (NOT the device [x,w,y,h]); Apply restarts the feed so
+    the camera re-arms AND the live Monitor panel re-acquires under the new window;
+    the camera's device ROI is the INTERNAL conversion."""
     console, feed, cam, card, editor = _camera_console()
     try:
-        # the selector callback is the GENERIC region writeback (not a ROI-specific
-        # one), bound to BOTH the area selector and the zoom handler; the FEED turns
-        # the rectangle endpoints into its own {"roi": [...]} param
+        # the selector callback is the GENERIC region writeback (not ROI-specific),
+        # bound to BOTH the area selector and the zoom handler; the FEED keeps the
+        # rectangle as endpoints in its {"region": [...]} param
         assert editor._plotter.area.callback.__name__ == "_read_region"
         assert editor._plotter.zoom.callback.__name__ == "_read_region"
-        # a rectangle selected in pixel coords (endpoints x:1670..1690, y:1166..1186)
-        # -> the camera feed maps it to ROI [x, w, y, h]
+        # a rectangle selected in pixel coords -> region ENDPOINTS, verbatim
         editor._plotter.area.range = [1670.0, 1690.0, 1166.0, 1186.0]
         editor._plotter.area.callback()
-        assert editor._feed_widgets["roi"].text() == "[1670, 20, 1166, 20]"
-        # Apply on an IDLE feed re-arms the camera, AUTO-STARTS it (goes live),
-        # the Monitor card re-acquires under the new ROI, and the 'now:' reference
-        # tracks the applied value.
+        assert editor._feed_widgets["region"].text() == "[1670, 1690, 1166, 1186]"
+        # Apply on an IDLE feed converts region->device ROI internally, AUTO-STARTS
+        # it (goes live), the Monitor re-acquires, and 'now:' tracks the applied
+        # window (reported back as endpoints).
         assert not feed.running
         editor._restart_feed()
         assert feed.running                              # Apply made the source live
-        assert cam.roi == (1670, 20, 1166, 20)
+        assert cam.roi == (1670, 20, 1166, 20)           # device ROI = internal conversion
         assert np.isclose(card.plotter.x_array[0], 1670)
         assert np.isclose(card.plotter.x_array[-1], 1670 + 20 - 1)
-        assert editor._feed_now_labels["roi"].text() == "now: [1670, 20, 1166, 20]"
+        assert editor._feed_now_labels["region"].text() == "now: [1670, 1690, 1166, 1186]"
     finally:
         console.shutdown()
 
 
-def test_2d_zoom_updates_roi_from_view_area_overrides():
-    """G-fix #1: ZOOM/PAN alone updates the ROI from the current view limits (the
+def test_2d_zoom_updates_region_from_view_area_overrides():
+    """G-fix #1: ZOOM/PAN alone updates the region from the current view limits (the
     area selector is NOT required); when a rectangle IS drawn it OVERRIDES the
-    view.  This is confocal's exact precedence (area else view)."""
+    view.  The region param is plot-coord ENDPOINTS (area else view precedence)."""
     console, feed, cam, card, editor = _camera_console()
     try:
-        # ZOOM with no area selection -> ROI follows the view box
+        # ZOOM with no area selection -> region follows the view box (endpoints)
         editor._plotter.area.range = [None, None, None, None]
         editor._plotter.ax.set_xlim(1660, 1690)
         editor._plotter.ax.set_ylim(1190, 1160)        # image y runs high->low
         editor._plotter.zoom.callback()
-        assert editor._feed_widgets["roi"].text() == "[1660, 30, 1160, 30]"
+        assert editor._feed_widgets["region"].text() == "[1660, 1690, 1160, 1190]"
         # now draw an area rectangle: it OVERRIDES the view even when the zoom
         # callback fires
         editor._plotter.area.range = [1672.0, 1682.0, 1170.0, 1180.0]
         editor._plotter.zoom.callback()
-        assert editor._feed_widgets["roi"].text() == "[1672, 10, 1170, 10]"
+        assert editor._feed_widgets["region"].text() == "[1672, 1682, 1170, 1180]"
     finally:
         console.shutdown()
 
@@ -411,14 +412,15 @@ def test_feed_now_labels_track_applied_params_on_tick():
     try:
         console.tabs.setCurrentWidget(editor)        # the per-tick hook refreshes the visible editor
         feed.start(rate_hz=50.0)
-        console._restart_feed(feed, {"roi": [1700, 16, 1180, 16]})   # running -> queued
+        # region endpoints [1700,1716,1180,1196] -> internal device ROI (1700,16,1180,16)
+        console._restart_feed(feed, {"region": [1700, 1716, 1180, 1196]})   # running -> queued
         deadline = time.monotonic() + 2.0
         while cam.roi != (1700, 16, 1180, 16) and time.monotonic() < deadline:
             console.refresh_once()
             time.sleep(0.02)
         console.refresh_once()                        # a tick after the loop applied
         assert cam.roi == (1700, 16, 1180, 16)
-        assert editor._feed_now_labels["roi"].text() == "now: [1700, 16, 1180, 16]"
+        assert editor._feed_now_labels["region"].text() == "now: [1700, 1716, 1180, 1196]"
     finally:
         feed.stop()
         console.shutdown()
@@ -457,7 +459,7 @@ def test_apply_roi_to_running_feed_applies_in_loop_no_restart():
         feed.start(rate_hz=50.0)
         time.sleep(0.08)
         thread_before = feed._thread
-        console._restart_feed(feed, {"roi": [100, 20, 200, 20]})
+        console._restart_feed(feed, {"region": [100, 120, 200, 220]})   # endpoints -> device ROI (100,20,200,20)
         deadline = time.monotonic() + 2.0
         while cam.roi != (100, 20, 200, 20) and time.monotonic() < deadline:
             time.sleep(0.02)

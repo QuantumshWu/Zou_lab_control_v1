@@ -110,25 +110,37 @@ Key fixed facts:
   `ch03 probe (N15)`, `ch11 emCCD (M13)`.
 - Four 10-bit analog buses: `da_dipole`, `da_bias_y`, `da_bias_x`, `da_bias_z`.
 
-**Plot region → device, coordinate contract (who converts what).** A plot's
-selector/zoom is a GENERIC interface: it yields a rectangle as four endpoints
-`(x_min, x_max, y_min, y_max)` in the panel's axis coordinates, and serves EVERY
-2-D panel (a camera frame, a 2-D parameter scan, …). The frontend
-(`PanelEditor._read_region`) never reshapes that into a device format; it hands
-the endpoints to the producing source's `ExperimentFeed.region_to_acquisition_
-parameters(...)`, which OWNS the conversion: `CameraFrameFeed` → `{"roi":
-[x,w,y,h]}` (position+size); a 2-D-scan source would return its axis ranges.
-The **device layer** then adapts to hardware: `QCMOSCamera` SNAPS the requested
-ROI to the camera's sub-array grid (`SUBARRAY*` must be **multiples of 4** — query
-`prop_getattr` step/max), writes it in the safe order (positions→0, then sizes,
-then positions, `SUBARRAYMODE` ON last), and READS BACK the actually-applied
-window via `prop_setgetvalue`; `camera.roi` reports that read-back (not the raw
-request), so `acquisition_parameters()["roi"]`, the 2-D panel axes and the Edit
-`now:` all show the region the camera truly images. An unchecked write would be
-silently clamped → the camera would image the wrong region (the bug this fixed).
-`VirtualCamera` mirrors the same: `configure(roi=...)` snaps (shared
-`devices.base.snap_subarray`) and `acquire()` CROPS to it, so a virtual test
-exercises the SAME ROI path real hardware does (default `roi=None` = full frame).
+**Plot region → device, coordinate contract (who converts what; THREE layers).**
+A plot's selector/zoom is a GENERIC interface: it yields a rectangle as four
+endpoints `(x_min, x_max, y_min, y_max)` in the panel's axis coordinates, and
+serves EVERY 2-D panel (a camera frame, a 2-D parameter scan, …).
+
+1. **Frontend** (`PanelEditor._read_region`): hands the endpoints, unchanged, to
+   the producing source's `region_to_acquisition_parameters(...)` and fills the
+   named Edit fields. No device shape, ever.
+2. **Acquisition layer** (the feed): speaks PLOT coordinates. `CameraFrameFeed`'s
+   spatial acquisition parameter is `region = [x_min, x_max, y_min, y_max]`
+   ENDPOINTS — NOT the device `[x,w,y,h]` — exposed by `acquisition_parameters()`
+   and accepted by `set_acquisition_parameters(region=...)`. (A 2-D-scan source
+   would expose its axis ranges the same way.) The endpoint→device-ROI conversion
+   is hidden INSIDE `set_acquisition_parameters` (`region → [x, w, y, h] →
+   camera.configure(roi=...)`). So the Edit box shows endpoints matching the
+   selector; everything in the acquisition/measurement layer stays plot-shaped.
+3. **Device layer** (`QCMOSCamera`): adapts to hardware. SNAPS the ROI to the
+   camera's sub-array grid (`SUBARRAY*` must be **multiples of 4** — query
+   `prop_getattr` step/max), writes it in the safe order (positions→0, then sizes,
+   then positions, `SUBARRAYMODE` ON last), and READS BACK the applied window via
+   `prop_setgetvalue`; `camera.roi` reports that read-back. So the feed's `region`,
+   the 2-D panel axes and the Edit `now:` all reflect what the camera truly images.
+   An unchecked write would be silently clamped → wrong region (the bug this fixed).
+
+`VirtualCamera` mirrors the device layer: `configure(roi=...)` snaps (shared
+`devices.base.snap_subarray`) and `acquire()` CROPS to it, so a virtual test runs
+the SAME ROI path real hardware does (default `roi=None` = full frame). The console
+`_coord_frames()` reads the feed's `region` endpoints (index 0 = x_min, index 2 =
+y_min give the 2-D axis origin). **Refresh** (`PanelEditor.rebuild`) first ticks
+the console (`refresh_once`) so the snapshot mirrors the MOST-RECENT hub frame, not
+the last timer-tick render.
 
 `prepare` drives SAFE, packs + uploads the BRAM image over JTAG-to-AXI, arms the
 scan banks, then drives LOAD (rising-edge COMMAND, waits `STATUS_LOADED`); it does

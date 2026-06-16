@@ -350,32 +350,46 @@ class CameraFrameFeed(ExperimentFeed):
         return frozenset({self.prefix + "frame"})
 
     def acquisition_parameters(self) -> dict[str, object]:
+        """The acquisition layer speaks PLOT coordinates: the spatial parameter is
+        ``region`` = the rectangle's ENDPOINTS ``[x_min, x_max, y_min, y_max]`` in
+        sensor pixels -- the SAME shape the plot's selector/zoom yields -- NOT the
+        camera's device-format ``[x, w, y, h]`` sub-array (that conversion is hidden
+        in ``set_acquisition_parameters``).  ``region`` reflects the camera's
+        ACTUALLY-applied window (``camera.roi`` read-back), expressed as endpoints."""
         params: dict[str, object] = {"exposure": float(self.camera.exposure)}
-        roi = self.camera.roi   # contract property (None for a camera with no ROI), not backend-private config
+        roi = self.camera.roi   # device window (x, w, y, h) or None; the snapped read-back
         if roi is not None:
-            params["roi"] = list(roi)
+            x, w, y, h = (int(v) for v in roi)
+            params["region"] = [x, x + w, y, y + h]   # -> endpoints (plot coords)
         return params
 
     def set_acquisition_parameters(self, **values) -> None:
         kw: dict[str, object] = {}
         if "exposure" in values:
             kw["exposure"] = float(values["exposure"])
-        if "roi" in values:
-            roi = values["roi"]
-            kw["roi"] = None if roi in (None, "", "None") else list(roi)
+        if "region" in values:
+            region = values["region"]
+            if region in (None, "", "None"):
+                kw["roi"] = None
+            else:
+                # endpoints (plot coords) -> the camera's device ROI rect; the
+                # camera then snaps to its sub-array grid.  This is the ONLY place
+                # the endpoint<->device-ROI conversion lives.
+                x0, x1, y0, y1 = (float(v) for v in region)
+                x0, x1 = sorted((x0, x1))
+                y0, y1 = sorted((y0, y1))
+                kw["roi"] = [int(round(x0)), int(round(x1 - x0)), int(round(y0)), int(round(y1 - y0))]
         if kw:
             self.camera.configure(**kw)   # live on the camera -- no rebuild
 
     def region_to_acquisition_parameters(self, x_min, x_max, y_min, y_max) -> dict[str, object]:
-        """A camera's spatial region IS its ROI.  Map the plot rectangle (sensor
-        pixels) to the ROI's ``(x, width, y, height)`` -- position+size, the
-        ACQUISITION-LAYER format.  The camera device then snaps this to its own
-        sub-array grid (the qCMOS step-4 SUBARRAY*), so neither the frontend nor
-        this feed encodes a hardware-specific constraint -- the frontend only ever
-        hands over the rectangle endpoints."""
+        """A camera's spatial parameter IS the plot region.  Just normalise the
+        rectangle to sorted ENDPOINTS ``[x_min, x_max, y_min, y_max]`` -- no device
+        shape here; the endpoint->ROI->sub-array conversion happens deeper
+        (``set_acquisition_parameters`` -> ``camera.configure`` -> snap)."""
         x0, x1 = sorted((float(x_min), float(x_max)))
         y0, y1 = sorted((float(y_min), float(y_max)))
-        return {"roi": [int(round(x0)), int(round(x1 - x0)), int(round(y0)), int(round(y1 - y0))]}
+        return {"region": [int(round(x0)), int(round(x1)), int(round(y0)), int(round(y1))]}
 
 
 class ScannedMeasurementFeed(ExperimentFeed):
