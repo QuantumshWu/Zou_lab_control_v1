@@ -1493,6 +1493,14 @@ class MeasurementPanel(QtWidgets.QWidget):
                     spin = self._spin(decl, integer=True)
                     self.form.addRow(label_text, spin)
                     self._widgets[decl.key] = ("int", spin)
+            elif kind == "text":
+                edit = FluentLineEdit("" if decl.default is None else str(decl.default))
+                edit.setMinimumWidth(scaled_px(160, minimum=120))   # grows with the field; no cutoff
+                edit.setPlaceholderText(decl.tooltip[:48] if decl.tooltip else "")
+                edit.setToolTip(decl.tooltip)
+                edit.textChanged.connect(self._refresh_start_enabled)
+                self.form.addRow(label_text, edit)
+                self._widgets[decl.key] = ("text", edit)
             else:  # float
                 spin = self._spin(decl, integer=False)
                 self.form.addRow(label_text, spin)
@@ -1517,6 +1525,8 @@ class MeasurementPanel(QtWidgets.QWidget):
             elif tag == "int_opt":
                 text = entry[1].text().strip()
                 values[key] = int(text) if text else None
+            elif tag == "text":
+                values[key] = entry[1].text()
             else:  # float
                 values[key] = float(entry[1].value())
         return values
@@ -1546,7 +1556,7 @@ class MeasurementPanel(QtWidgets.QWidget):
             entry = self._widgets.get(decl.key)
             if entry is None:
                 missing.append(decl.label)
-            elif entry[0] == "int_opt" and not entry[1].text().strip():
+            elif entry[0] in ("int_opt", "text") and not entry[1].text().strip():
                 missing.append(decl.label)
         return missing
 
@@ -1589,6 +1599,8 @@ class MeasurementPanel(QtWidgets.QWidget):
                     entry[1].setValue(int(val))
                 elif tag == "int_opt":
                     entry[1].setText("" if val is None else str(int(val)))
+                elif tag == "text":
+                    entry[1].setText("" if val is None else str(val))
                 elif tag == "float":
                     entry[1].setValue(float(val))
             except (TypeError, ValueError):
@@ -1676,6 +1688,20 @@ class PanelEditor(QtWidgets.QWidget):
             self.meas_panel.seed_values(card.config.params.get("measurement_values") or {})
             self.meas_panel.start_requested.connect(console._start_measurement)
             self.meas_panel.stop_requested.connect(console._stop_measurement)
+            col.addWidget(self.meas_panel)
+
+        # ---- Data processing (only when this panel came from a processor) ----
+        # The one-shot action's OWN parameters, auto-generated as a GUI form from its
+        # ParamDecls; Start runs it ONCE and the result lands on the hub + this panel.
+        # Reuses the measurement form widget (it needs only .name + .params); a card
+        # is either a measurement OR a processor, so only one branch fires.
+        proc_spec = console._processor_spec_for_card(card)
+        if proc_spec is not None:
+            section("Data processing")
+            self.meas_panel = MeasurementPanel([proc_spec], single=True)
+            self.meas_panel.seed_values(card.config.params.get("processor_values") or {})
+            self.meas_panel.start_requested.connect(console._start_processor)
+            self.meas_panel.stop_requested.connect(console._stop_processor)
             col.addWidget(self.meas_panel)
 
         # ---- Acquisition: the editable parameters of the DATA SOURCE behind this
@@ -2161,6 +2187,7 @@ class TaskConsole(QtWidgets.QWidget):
         state: TaskConsoleState | None = None,
         feeds: Sequence[object] = (),
         measurements: Sequence[object] = (),
+        processors: Sequence[object] = (),
         scale: float | None = None,
         window_ratio: float = 0.84,
         window_px: tuple[int, int] | None = None,
@@ -2174,6 +2201,13 @@ class TaskConsole(QtWidgets.QWidget):
         # section stays a disabled placeholder; with specs it becomes the
         # auto-generated form + one-click Start.
         self.measurements = list(measurements)
+        # The declarative DATA-PROCESSING catalog (the discrete sibling of
+        # measurements): one-shot ProcessorSpecs.  Add Panel lists them under
+        # "Data processing"; picking one creates its result panel + Edit form whose
+        # Start runs the action once.
+        self.processors = list(processors)
+        self._proc_feeds: list = []     # one-shot ProcessorFeeds kept alive until done
+        self._active_proc_panel = None
         self._meas_feed = None          # the ScannedMeasurementFeed of the active run
         self._meas_spec = None
         # The measurement form now lives in EACH measurement panel's own Edit tab
@@ -2245,14 +2279,19 @@ class TaskConsole(QtWidgets.QWidget):
         self.summary.setEnabled(False)
 
         self.kind_combo = FluentComboBox()
+        # Add Panel offers THREE clear categories, in order:
+        #   1. a PLOT kind -- a pure view you wire to a hub signal (value = <key>);
+        #   2. "Measurement: X" -- a swept measurement with a default-bound plot;
+        #   3. "Data processing: Y" -- a one-shot ProcessorSpec; its panel shows the
+        #      action's result (and its Edit form runs it).
+        # Picking 2 or 3 + Add Panel creates the result panel and opens its Edit tab.
         for key, label in PANEL_KINDS.items():
-            self.kind_combo.addItem(label, key)
-        # The measurement catalog is offered RIGHT HERE (no separate Control tab):
-        # picking one + Add Panel creates a result panel and opens its Edit tab,
-        # where the measurement's parameters + Start live.
+            self.kind_combo.addItem(f"Plot: {label}", key)
         for spec in self.measurements:
             self.kind_combo.addItem(f"Measurement: {spec.name}", ("measurement", spec.name))
-        self.kind_combo.setFixedWidth(scaled_px(132, minimum=104))
+        for spec in self.processors:
+            self.kind_combo.addItem(f"Data processing: {spec.name}", ("processor", spec.name))
+        self.kind_combo.setFixedWidth(scaled_px(150, minimum=120))
         add_button = FluentButton("Add Panel", color=ACCENT)
         add_button.clicked.connect(self._add_panel)
         self.save_button = FluentButton("Save", color=ACCENT)
@@ -2330,6 +2369,13 @@ class TaskConsole(QtWidgets.QWidget):
         if not name:
             return None
         return next((s for s in self.measurements if getattr(s, "name", None) == name), None)
+
+    def _processor_spec_for_card(self, card: "PanelCard"):
+        """The ProcessorSpec a result panel came from (None for plain panels)."""
+        name = card.config.params.get("processor")
+        if not name:
+            return None
+        return next((s for s in self.processors if getattr(s, "name", None) == name), None)
 
     # ---- producing-feed discovery: a panel's data comes from a feed; its Edit
     # exposes THAT feed's acquisition parameters (e.g. a loading-image panel is
@@ -2513,6 +2559,14 @@ class TaskConsole(QtWidgets.QWidget):
                 card = self._ensure_result_panel(spec)
                 self._edit_card(card)
             return
+        # A data-processing entry: create (or focus) its result panel and open its
+        # Edit tab, where the auto-generated parameter form + Start (run once) live.
+        if isinstance(data, tuple) and len(data) == 2 and data[0] == "processor":
+            spec = next((s for s in self.processors if s.name == data[1]), None)
+            if spec is not None:
+                card = self._ensure_processor_panel(spec)
+                self._edit_card(card)
+            return
         kind = data or "1d"
         rows = max((c.config.row + c.config.rows for c in self.cards), default=0)
         config = PanelConfig(kind=str(kind), row=rows, col=0, size="1x2")
@@ -2623,6 +2677,109 @@ class TaskConsole(QtWidgets.QWidget):
             panel.set_running(False)
             done = getattr(feed, "points_done", 0)
             panel.set_status(f"stopped at {done}/{getattr(feed, 'n_points', 0)} points", error=False)
+
+    # --------------------------------------------------- data processing (one-shot)
+    def _ensure_processor_panel(self, spec) -> "PanelCard":
+        """Find (or create) the result panel for a data-processing action.
+
+        If the spec declares a default view (``default_kind``) the panel is that plot
+        kind bound to the action's default result (``default_value_key`` -- e.g. the
+        per-site fidelity map on the existing 'sites' atom kind); otherwise it is a
+        pure-data panel showing the first result and the user wires the rest from the
+        hub.  Reused across re-runs by name."""
+        for card in self.cards:
+            if card.config.params.get("processor") == spec.name:
+                return card
+        kind = str(getattr(spec, "default_kind", "") or "1d")
+        keys = tuple(getattr(spec, "result_keys", ()) or ())
+        value_key = str(getattr(spec, "default_value_key", "") or (keys[0] if keys else ""))
+        source = f"value = {value_key}" if value_key else "value = np.zeros(1)"
+        rows = max((c.config.row + c.config.rows for c in self.cards), default=0)
+        config = PanelConfig(kind=kind, title=spec.name, row=rows, col=0, size="2x2",
+                             source=source, params={"processor": spec.name})
+        card = PanelCard(config, parent=self.board, names_provider=self.hub.names)
+        self._attach_card(card)
+        self._arrange()
+        self._mark_dirty()
+        return card
+
+    def _start_processor(self, panel) -> None:
+        """Run a data-processing action ONCE from its Edit form: build a
+        ProcessorFeed, register it, and start it (one shot -> publish results to the
+        hub -> self-stop).  The result panel (created/reused by name) shows the
+        published output; the scalars are visible in every panel's signal legend."""
+        spec = panel.current_spec() if panel is not None else None
+        if spec is None:
+            return
+        try:
+            values = panel.collect_values()
+            # Lazy import keeps the frontend decoupled from the backend at import time
+            # (the feed only touches the spec contract + hub.publish -- guarded by
+            # test_virtual_equals_real_contract).
+            from Zou_lab_control.neutral_atom.operations.feeds import ProcessorFeed
+
+            camera = next((getattr(f, "camera", None) for f in self.feeds
+                           if getattr(f, "camera", None) is not None), None)
+            sequencer = next((getattr(f, "sequencer", None) for f in self.feeds
+                              if getattr(f, "sequencer", None) is not None), None)
+            feed = ProcessorFeed(self.hub, spec, readout=None, camera=camera,
+                                 sequencer=sequencer, params=values)
+        except Exception as exc:
+            panel.set_status(f"build failed: {str(exc).splitlines()[0][:140]}", error=True)
+            return
+        # drop a previous run of THIS action so feeds don't pile up
+        for old in [f for f in self._proc_feeds if getattr(f, "spec", None) is not None
+                    and f.spec.name == spec.name]:
+            try:
+                old.stop()
+            except Exception:
+                pass
+            if old in self.feeds:
+                self.feeds.remove(old)
+            self._proc_feeds.remove(old)
+        self._proc_feeds.append(feed)
+        self.feeds.append(feed)
+        self._active_proc_panel = panel
+        self._active_proc_feed = feed
+        card = self._ensure_processor_panel(spec)
+        card.config.params["processor_values"] = dict(values)   # seed the next Edit reopen
+        if not self._timer.isActive():
+            self._timer.start()
+        panel.set_running(True)
+        panel.set_status("running…", error=False)
+        self.status_dot.set_color(GREEN)
+        try:
+            feed.start(rate_hz=getattr(feed, "rate_hz", 5.0))
+        except Exception as exc:
+            panel.set_running(False)
+            panel.set_status(f"start failed: {str(exc).splitlines()[0][:140]}", error=True)
+
+    def _stop_processor(self) -> None:
+        feed = getattr(self, "_active_proc_feed", None)
+        if feed is not None:
+            try:
+                feed.stop()
+            except Exception:
+                pass
+        panel = self._active_proc_panel
+        if panel is not None:
+            panel.set_running(False)
+            panel.set_status("stopped", error=False)
+
+    def _poll_processors(self) -> None:
+        """Each tick: when the active one-shot action finishes (or errors), release
+        its form's controls and report (its result is already on the hub)."""
+        panel = self._active_proc_panel
+        feed = getattr(self, "_active_proc_feed", None)
+        if panel is None or feed is None or not getattr(panel, "_running", False):
+            return
+        if getattr(feed, "finished", False):
+            panel.set_running(False)
+            self.status_dot.set_color(GREY if self._timer.isActive() else YELLOW)
+            panel.set_status("done", error=False)
+        elif getattr(feed, "last_error", None):
+            panel.set_running(False)
+            panel.set_status(f"failed: {feed.last_error}", error=True)
 
     def _poll_measurement(self) -> None:
         """Called each tick: surface progress, and once the scan completes show
@@ -2742,6 +2899,7 @@ class TaskConsole(QtWidgets.QWidget):
         # the run-complete transition is never missed if the feed self-stops
         # between version bumps.
         self._poll_measurement()
+        self._poll_processors()
         self._refresh_signal_info()   # cheap + self-guarded: tracks source/feed changes
         version = self.hub.version
         if version == self._last_version:
@@ -2869,6 +3027,7 @@ def show_task_console(
     task: str | None = None,
     feeds: Sequence[object] = (),
     measurements: Sequence[object] = (),
+    processors: Sequence[object] = (),
     scale: float | None = None,
     window_ratio: float = 0.84,
     title: str = "TaskConsole@Zou lab",
@@ -2899,7 +3058,7 @@ def show_task_console(
     if state is None and task is not None:
         state = resolve_task_state(task)
     console = TaskConsole(hub=hub, state=state, feeds=feeds, measurements=measurements,
-                          scale=scale, window_ratio=window_ratio)
+                          processors=processors, scale=scale, window_ratio=window_ratio)
     console._on_close = on_close
     # A passed-in producer feed should stream the moment the window opens -- so the
     # Monitor is live without the caller having to remember feed.start().  start()
