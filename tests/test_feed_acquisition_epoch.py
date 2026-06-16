@@ -1,4 +1,4 @@
-"""Contract: ExperimentFeed.acquisition_epoch marks the FIRST published frame
+"""Contract: Producer.acquisition_epoch marks the FIRST published frame
 computed with a just-applied acquisition-parameter edit.
 
 This is what lets the task-console Edit panel re-snapshot the fresh frame instead
@@ -7,7 +7,7 @@ it BETWEEN shots, so the new-param frame appears a beat later -- the epoch advan
 exactly when that frame is on the hub.  An idle feed applies + publishes
 synchronously, so the epoch advances immediately.
 
-Pure na-side (no Qt, no hardware): a tiny ExperimentFeed whose shot() echoes its
+Pure na-side (no Qt, no hardware): a tiny Producer whose shot() echoes its
 one editable parameter.
 """
 
@@ -21,11 +21,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if sys.path[0] != str(REPO_ROOT):
     sys.path.insert(0, str(REPO_ROOT))
 
-from Zou_lab_control.neutral_atom.operations.feeds import ExperimentFeed
+from Zou_lab_control.neutral_atom.operations.feeds import Producer
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
 
 
-class _EchoFeed(ExperimentFeed):
+class _EchoFeed(Producer):
     """Publishes its single editable parameter ``v`` each shot."""
 
     def __init__(self, hub):

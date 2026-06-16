@@ -174,7 +174,7 @@ class QCMOSCamera(CameraDevice):
                     wait_timeout = max(timeout / 1000.0, getattr(runtime_sequence, "duration", 0.0) * 2.0 + 1.0)
                     if not wait_done(wait_timeout):
                         raise TimeoutError("sequencer did not report done after qCMOS acquisition.")
-            return images
+            return self._retain(images)
         except Exception:
             acquisition_error = True
             raise

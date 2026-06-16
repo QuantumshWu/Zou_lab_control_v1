@@ -90,6 +90,26 @@ PANEL_KINDS: dict[str, str] = {
     "hist": "Distribution",
 }
 
+# A panel's ROLE -- the producer-layer node it represents -- is orthogonal to its
+# plot KIND (the view).  It is set by which Add-Panel category built the panel and
+# decides how its Edit / Setting are composed:
+#   * "plot"        -- a pure VIEW wired to hub signals.  Full plotter Edit:
+#                      curve fit (the whole DataFigure set) + manual limits +
+#                      the producing measurement's parameter form, and Setting
+#                      keeps the plot-display knobs (relim / unit).
+#   * "measurement" -- the acquisition node itself.  Its Edit is its parameter
+#                      form (the source IS the device loop) -- NO curve fit, no
+#                      manual-limit row (fitting a curve is a plotter concern,
+#                      so you Add a Plot panel for that), and Setting drops the
+#                      plot-display-only knobs.
+#   * "task"        -- an orchestrated one-shot / processor.  Same no-fit Edit as
+#                      a measurement, plus Run; mid-run output lands in its own
+#                      dedicated panel (confocal-task style).
+# This is the role gate that keeps task #176 (a PLOT exposes every fit model)
+# intact while honouring the measurement/task "no fit" request -- the fit is
+# gated by ROLE, never by plot kind.
+PANEL_ROLES = ("plot", "measurement", "task")
+
 CMAPS = ("inferno", "viridis", "magma", "plasma", "gray", "coolwarm")
 
 _DEFAULT_SOURCES = {
@@ -197,16 +217,15 @@ def _text_to_py(text: str):
         except ValueError:
             return raw
 
-# Card geometry (raw px, matching the raw-px canvas).  The canvas sits FLUSH with
-# the frame's top + left + right edges (no title strip, no side padding -- the
-# panel title lives inside the figure); only the BOTTOM carries the footer, whose
-# height absorbs the modulus difference (the figure margins do not halve with the
-# data area, so the canvases alone can never tile -- the frame makes the CARDS tile
-# instead).  A card spans rows x _pitch_y - gap, so a 2-row card is EXACTLY two
+# Card geometry (raw px, matching the raw-px canvas).  The card is a TITLED frame
+# (title strip = the panel kind, top-left; Setting button top-right) whose FOOTER
+# absorbs the modulus difference: the figure margins do not halve with the data
+# area, so the canvases alone can never tile -- the frame makes the CARDS tile
+# instead.  A card spans rows x _pitch_y - gap, so a 2-row card is EXACTLY two
 # 1-row cards plus the gap, and dragged cards snap onto one shared grid.
-_CARD_PAD = 0         # horizontal padding canvas<->frame: 0 = flush left/right
-_CARD_TITLE_H = 0     # top title strip: 0 = canvas flush with the top edge (title is in the figure)
-_CARD_VPAD = 12       # vertical padding below the canvas (above the footer)
+_CARD_PAD = 10        # horizontal padding canvas<->frame, and the drag border
+_CARD_TITLE_H = 32    # the FluentGroupBox title strip (kind title top-left + Setting top-right)
+_CARD_VPAD = 12       # vertical padding above + below the content
 _FOOTER_MIN = 26      # the status + signal-legend line every card carries under its canvas
 _GRID_GAP = 8
 
@@ -221,10 +240,7 @@ def _grid_pitch() -> tuple[int, int]:
     their canvas in the extra frame width."""
 
     half_w, half_h = panel_display_size("1x2")
-    # CEIL the half-pitch so two columns are never NARROWER than the canvas (with
-    # _CARD_PAD=0 a floor could leave the card 1 px short -> the flush canvas would
-    # overflow); the tiling contract (1x4 == 2*1x2 + gap) holds for any pitch_x.
-    pitch_x = -(-(half_w + 2 * _CARD_PAD + _GRID_GAP) // 2)
+    pitch_x = (half_w + 2 * _CARD_PAD + _GRID_GAP) // 2
     pitch_y = half_h + _CARD_TITLE_H + _CARD_VPAD + _FOOTER_MIN + _GRID_GAP
     return pitch_x, pitch_y
 
@@ -305,9 +321,12 @@ class PanelConfig:
         size: str = "2x2",
         source: str | None = None,
         params: Mapping[str, object] | None = None,
+        role: str = "plot",
     ):
         if kind not in PANEL_KINDS:
             raise ValueError(f"unknown panel kind {kind!r}; choose from {sorted(PANEL_KINDS)}.")
+        if role not in PANEL_ROLES:
+            raise ValueError(f"unknown panel role {role!r}; choose from {list(PANEL_ROLES)}.")
         panel_size_cells(size)              # validate against the limited preset list
         self.kind = str(kind)
         self.title = str(title)
@@ -316,6 +335,7 @@ class PanelConfig:
         self.size = str(size)
         self.source = str(source) if source is not None else _DEFAULT_SOURCES[self.kind]
         self.params = dict(params or {})
+        self.role = str(role)
 
     @property
     def rows(self) -> int:
@@ -334,6 +354,7 @@ class PanelConfig:
             "size": self.size,
             "source": self.source,
             "params": dict(self.params),
+            "role": self.role,
         }
 
     @classmethod
@@ -346,6 +367,7 @@ class PanelConfig:
             size=str(payload.get("size", "2x2")),
             source=payload.get("source"),
             params=payload.get("params") or {},
+            role=str(payload.get("role", "plot")),
         )
 
 
@@ -502,14 +524,12 @@ _MONITOR_UNSET = object()   # sentinel: a monitor panel that has never rolled ye
 
 
 class PanelCard(FluentGroupBox):
-    """One dashboard panel: a FLUSH frame holding the frontend canvas at the very TOP
-    (no title strip -- the panel title lives INSIDE the figure, so the image's top
-    edge meets the frame's top edge and there is no left/right padding).  Below the
-    canvas sits the status + signal-legend FOOTER, which also doubles as the DRAG
-    HANDLE (the matplotlib canvas keeps all its own zoom/pan, so it cannot be the
-    handle); the footer stretches so the card spans whole layout slots -- a 2-row
-    card is exactly two 1-row cards plus the gap.  Only the BOTTOM padding is real
-    (footer + the modulus slack that keeps the figure's aspect / tiling)."""
+    """One dashboard panel: a TITLED frame (title strip = the panel KIND, top-left)
+    holding the frontend canvas, a status + signal-legend footer, and a text
+    "Setting" button on the title strip (top-right).  The frame border is the DRAG
+    HANDLE (the matplotlib canvas keeps all its own interactions); the footer
+    stretches so the card spans whole layout slots -- a 2-row card is exactly two
+    1-row cards plus the gap."""
 
     changed = QtCore.pyqtSignal()          # any config edit (console marks dirty)
     layout_changed = QtCore.pyqtSignal()   # size/slot change (console re-arranges)
@@ -517,9 +537,9 @@ class PanelCard(FluentGroupBox):
     edit_requested = QtCore.pyqtSignal(object)   # "Edit…" -> open the panel's Edit tab
 
     def __init__(self, config: PanelConfig, parent=None, *, names_provider=None):
-        # Titleless + padding_top=0: the canvas sits flush at the top edge (the
-        # figure carries its own title); the chrome moves to the footer.
-        super().__init__("", parent, shadow=True, padding_top=0)
+        # Titled frame: the title strip carries the panel KIND (top-left) and the
+        # Setting button (top-right), so the card is delineated like the rest.
+        super().__init__(PANEL_KINDS[config.kind], parent, shadow=True)
         self.config = config
         self.names_provider = names_provider   # callable -> live signal names (Setting combo)
         self.plotter = None
@@ -536,16 +556,20 @@ class PanelCard(FluentGroupBox):
         # SHIFTS (same shape, new origin) still triggers an axes rebuild.
         self._roi_built: list | None = None
         self._drag_offset: QtCore.QPoint | None = None
-        self.setCursor(QtCore.Qt.OpenHandCursor)   # grab the footer / frame to drag
+        self.setCursor(QtCore.Qt.OpenHandCursor)   # the frame border drags
 
         holder = QtWidgets.QVBoxLayout(self)
-        # top + left + right = 0 -> canvas flush with the frame; only the bottom
-        # carries the footer (and the modulus slack below it).
-        holder.setContentsMargins(_CARD_PAD, 0, _CARD_PAD, _CARD_VPAD // 2)
+        # _CARD_PAD insets the canvas from the frame on both sides (and is the drag
+        # border); the title strip is above (padding_top), the footer below.
+        holder.setContentsMargins(_CARD_PAD, scaled_px(2), _CARD_PAD, _CARD_VPAD // 2)
         holder.setSpacing(_CARD_VPAD // 2)
         self.canvas_holder = holder
         self.footer = FluentLabel("")
-        self.footer.setStyleSheet(f"color: {GREY}; background: transparent;")
+        # L/R padding so the legend never hugs the frame edge; word-wrap on +
+        # newline-separated categories (see _refresh_signal_info) so a long
+        # signal list breaks to its own lines instead of jamming into one strip.
+        self.footer.setStyleSheet(
+            f"color: {GREY}; background: transparent; padding: {scaled_px(2)}px {scaled_px(8)}px;")
         self.footer.setAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
         self.footer.setWordWrap(True)
         # The footer carries the transient status AND a persistent SIGNAL legend
@@ -575,11 +599,10 @@ class PanelCard(FluentGroupBox):
 
     def _place_setting_button(self) -> None:
         if hasattr(self, "setting_button"):
-            # bottom-right, in the footer region -- the canvas is now flush at the
-            # TOP, so a top-right button would sit on the image.
+            # top-right, on the title strip (the title kind sits top-left).
             self.setting_button.move(
                 self.width() - self.setting_button.width() - scaled_px(8),
-                self.height() - self.setting_button.height() - scaled_px(6))
+                scaled_px(4))
             self.setting_button.raise_()
 
     # ------------------------------------------------------------- settings UI
@@ -689,41 +712,49 @@ class PanelCard(FluentGroupBox):
             self.param_widgets[spec.key] = widget
             sec.addWidget(FluentSettingRow(spec.label, widget, label_width=label_w))
 
-        # relim mode (confocal_gui's combo_relim semantics EXACTLY: ``tight`` /
-        # ``normal``).  Persisted as ``config.params["relim"]`` -- the SAME key
-        # the Edit tab's ed_relim writes to, so Setting and Edit never
-        # drift apart.  No "manual" mode, no x/y typed limits: live autoscale
-        # is the right tool here; if you need to inspect a frozen range, use
-        # zoom/pan on the canvas or Edit… into the panel's Edit tab.
-        self.lim_combo = FluentComboBox()
-        self.lim_combo.addItems(["tight", "normal"])
-        self.lim_combo.setToolTip(
-            "Relim mode (confocal_gui combo_relim naming):\n"
-            "  tight  = autoscale hugs the data\n"
-            "  normal = autoscale with the matplotlib default margin")
-        self.lim_combo.setCurrentText(str(self.config.params.get("relim", "tight")))
-        self.lim_combo.currentTextChanged.connect(self._on_relim_mode)
-        sec.addWidget(FluentSettingRow("relim", self.lim_combo, label_width=label_w))
+        # relim mode + unit cycle are PURE plot-display knobs (axis autoscale style
+        # + x-axis unit conversion).  They are "things only a plotter finds useful"
+        # (#3), so they appear ONLY on a "plot"-role panel.  A measurement / task
+        # panel's Setting keeps just source / size / colormap / title / actions --
+        # if you want to restyle a measurement's curve, Add a Plot panel for it.
+        # (size + colormap stay for every role: resizing a grid slot and choosing
+        # an image colorset are not plotter-only conveniences.)
+        if self.config.role == "plot":
+            # relim mode (confocal_gui's combo_relim semantics EXACTLY: ``tight`` /
+            # ``normal``).  Persisted as ``config.params["relim"]`` -- the SAME key
+            # the Edit tab's ed_relim writes to, so Setting and Edit never
+            # drift apart.  No "manual" mode, no x/y typed limits: live autoscale
+            # is the right tool here; if you need to inspect a frozen range, use
+            # zoom/pan on the canvas or Edit… into the panel's Edit tab.
+            self.lim_combo = FluentComboBox()
+            self.lim_combo.addItems(["tight", "normal"])
+            self.lim_combo.setToolTip(
+                "Relim mode (confocal_gui combo_relim naming):\n"
+                "  tight  = autoscale hugs the data\n"
+                "  normal = autoscale with the matplotlib default margin")
+            self.lim_combo.setCurrentText(str(self.config.params.get("relim", "tight")))
+            self.lim_combo.currentTextChanged.connect(self._on_relim_mode)
+            sec.addWidget(FluentSettingRow("relim", self.lim_combo, label_width=label_w))
 
-        # unit cycle: a single row [Unit button | <stretch> | current unit text]
-        # under the "unit" label, so the layout rhythm stays one-control-per-row.
-        self.unit_button = FluentButton("Unit", color=GREY)
-        self.unit_button.setFixedWidth(scaled_px(70, minimum=56))
-        self.unit_button.setToolTip(
-            "Cycle the x-axis unit (GHz/nm/MHz or ns/us/ms) where the axis label\n"
-            "declares one; persisted and re-applied to the live panel")
-        self.unit_button.clicked.connect(self._on_unit_cycle)
-        self.unit_label = FluentLabel(self._current_unit_text())
-        self.unit_label.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
-        self.unit_label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-        unit_inner = QtWidgets.QWidget()
-        unit_inner_layout = QtWidgets.QHBoxLayout(unit_inner)
-        unit_inner_layout.setContentsMargins(0, 0, 0, 0)
-        unit_inner_layout.setSpacing(scaled_px(6, minimum=4))
-        unit_inner_layout.addWidget(self.unit_button, 0)
-        unit_inner_layout.addStretch(1)
-        unit_inner_layout.addWidget(self.unit_label, 0)
-        sec.addWidget(FluentSettingRow("unit", unit_inner, label_width=label_w))
+            # unit cycle: a single row [Unit button | <stretch> | current unit text]
+            # under the "unit" label, so the layout rhythm stays one-control-per-row.
+            self.unit_button = FluentButton("Unit", color=GREY)
+            self.unit_button.setFixedWidth(scaled_px(70, minimum=56))
+            self.unit_button.setToolTip(
+                "Cycle the x-axis unit (GHz/nm/MHz or ns/us/ms) where the axis label\n"
+                "declares one; persisted and re-applied to the live panel")
+            self.unit_button.clicked.connect(self._on_unit_cycle)
+            self.unit_label = FluentLabel(self._current_unit_text())
+            self.unit_label.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+            self.unit_label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            unit_inner = QtWidgets.QWidget()
+            unit_inner_layout = QtWidgets.QHBoxLayout(unit_inner)
+            unit_inner_layout.setContentsMargins(0, 0, 0, 0)
+            unit_inner_layout.setSpacing(scaled_px(6, minimum=4))
+            unit_inner_layout.addWidget(self.unit_button, 0)
+            unit_inner_layout.addStretch(1)
+            unit_inner_layout.addWidget(self.unit_label, 0)
+            sec.addWidget(FluentSettingRow("unit", unit_inner, label_width=label_w))
 
         # ---- Panel ---------------------------------------------------------
         sec = section_box("Panel")
@@ -946,7 +977,8 @@ class PanelCard(FluentGroupBox):
         """status  ·  signal legend (reads / provides / duplicates), or the raw
         source when no legend has been computed yet."""
         info = self._signal_info or self.config.source
-        return f"{self._status_text}   ·   {info}"[:240]
+        # status on its own line; the signal legend (its own lines) below it
+        return f"{self._status_text}\n{info}"[:240] if info else self._status_text[:240]
 
     def set_signal_info(self, info: str) -> None:
         """Set the persistent signal legend (computed by the console: what this
@@ -1666,6 +1698,13 @@ class PanelEditor(QtWidgets.QWidget):
         self._feed = None                       # the feed that produces this panel's data
         self._feed_widgets: dict = {}           # acquisition-param name -> editable field
         self._feed_now_labels: dict = {}        # acquisition-param name -> "now: X" reference
+        # The fit + manual-limit controls exist ONLY for a "plot"-role panel (a
+        # measurement / task node's Edit carries no curve fit).  Pre-bind them to
+        # None so the do_fit / fill_limits / apply_limits handlers no-op cleanly
+        # when the section was never built.
+        self.fit_combo = None
+        self.fit_cmd = None
+        self.xmin = self.xmax = self.ymin = self.ymax = None
 
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -1689,6 +1728,18 @@ class PanelEditor(QtWidgets.QWidget):
             lab = FluentLabel(text)
             lab.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
             return lab
+
+        # ROLE decides which sections this Edit carries (see PANEL_ROLES):
+        #   * "plot"        -> the FULL plotter Edit: the producing measurement's
+        #                      param form (if any) + acquisition + plot params +
+        #                      snapshot + curve FIT + manual limits.
+        #   * "measurement" -> the measurement's OWN param form + snapshot (so the
+        #                      selector still writes a scan range back) -- NO fit,
+        #                      no manual limits, no plot params (a measurement node
+        #                      is acquisition, not curve analysis).
+        #   * "task"        -> the data-processing param form + Run + snapshot --
+        #                      same no-fit Edit; mid-run output is its own panel.
+        is_plot = card.config.role == "plot"
 
         # ---- Measurement (only when this panel came from a measurement) -----
         # The measurement's OWN API parameters, auto-generated as a GUI form from
@@ -1720,13 +1771,16 @@ class PanelEditor(QtWidgets.QWidget):
         # ---- Acquisition: the editable parameters of the DATA SOURCE behind this
         # panel.  A panel is a VIEW; the producing feed declares what its source
         # exposes via acquisition_parameters() -- a raw-frame panel's source is the
-        # camera (exposure / ROI, reconfigured live), a loading-image panel's is
-        # the LoadingFeed analysis (exposure / roi_radius / grid / ema / *_frames,
-        # re-calibrated).  Each field is PREFILLED with the CURRENT value (with a
+        # camera Measurement (exposure / ROI, reconfigured live), an occupancy
+        # panel's is the DetectProcessor (its detect settings).  Each field is
+        # PREFILLED with the CURRENT value (with a
         # "now: X" reference), and Apply pushes the edits to the source in place.
-        # Measurement panels use the Measurement form above instead (that IS their
-        # source), so this section is skipped for them.
-        if spec is None:
+        # The producing node's editable parameters.  Shown whenever there is no
+        # swept-measurement / processor form above (which already IS the node's
+        # param form): a PLOT panel edits its upstream source here (camera exposure
+        # / detect settings); a CAMERA measurement panel edits the camera itself;
+        # a TASK panel edits the task's parameters (its Apply re-runs the task).
+        if spec is None and proc_spec is None:
             self._feed = console._producing_feed(card)
             for name, current in console._feed_params(self._feed):
                 if not self._feed_widgets:
@@ -1750,8 +1804,13 @@ class PanelEditor(QtWidgets.QWidget):
                 # 150 clipped its trailing 's'; 170 fits the longest name in full.
                 col.addWidget(FluentSettingRow(name, holder, label_width=scaled_px(170, minimum=140)))
             if self._feed_widgets:
-                self.feed_restart_button = FluentButton("Apply", color=ACCENT)
+                # A task is a one-shot orchestration -> "Run" (apply params + run it);
+                # a streaming source (camera / detect) -> "Apply" (reconfigure live).
+                is_task = card.config.role == "task"
+                self.feed_restart_button = FluentButton("Run" if is_task else "Apply", color=ACCENT)
                 self.feed_restart_button.setToolTip(
+                    "Run the task with these parameters (watch its mid-run output panel)."
+                    if is_task else
                     "Apply the edited acquisition parameters to the data source in place\n"
                     "(reconfigure the camera live, or re-calibrate) -- the panel keeps streaming.")
                 self.feed_restart_button.clicked.connect(self._restart_feed)
@@ -1763,7 +1822,7 @@ class PanelEditor(QtWidgets.QWidget):
         # call exposes" live -- NOT in the basic Setting popup (which keeps only
         # source / size / colormap / relim / unit), so the two never duplicate.
         functional = [s for s in PANEL_PARAMS.get(card.config.kind, ()) if not s.display]
-        if functional:
+        if is_plot and functional:
             section("Parameters")
             for s in functional:
                 widget = card._make_param_widget(s, apply=self._edit_param)
@@ -1787,63 +1846,70 @@ class PanelEditor(QtWidgets.QWidget):
         self.canvas_holder.setContentsMargins(0, 0, 0, 0)
         col.addLayout(self.canvas_holder)
 
-        # Fit: the FULL DataFigure model set, available for EVERY kind (no
-        # gating).  DataFigure picks the 1D / 2D path from the snapshot, so a 2D
-        # image fits the 2D-Gaussian "2D center" model and lines fit the rest.
-        # Same [label | control] row idiom as the sections above (aligned label
-        # column), so Fit / limits don't read as a cramped one-line jumble.
-        proc_lw = scaled_px(96, minimum=72)
+        # Fit + manual limits: a PLOT-role concern only.  A measurement / task
+        # node's Edit (role != "plot") deliberately carries no curve fit -- fitting
+        # a curve is a plotter action, so you Add a Plot panel pointed at the
+        # measurement's result signals for that (its plotter Edit auto-carries the
+        # producing measurement's param form, see _spec_for_card).  This is the
+        # role gate that honours #3 ("measurement Edit, no fit") while keeping
+        # #176 (a PLOT exposes the FULL DataFigure model set) intact.
+        if is_plot:
+            # DataFigure picks the 1D / 2D path from the snapshot, so a 2D image
+            # fits the 2D-Gaussian "2D center" model and lines fit the rest.  Same
+            # [label | control] row idiom as the sections above (aligned label
+            # column), so Fit / limits don't read as a cramped one-line jumble.
+            proc_lw = scaled_px(96, minimum=72)
 
-        def _inline(*widgets, trailing=None):
-            host = QtWidgets.QWidget()
-            row = QtWidgets.QHBoxLayout(host)
-            row.setContentsMargins(0, 0, 0, 0)
-            row.setSpacing(scaled_px(6, minimum=4))
-            for w in widgets:
-                row.addWidget(w, 0)
-            row.addStretch(1)
-            if trailing is not None:
-                row.addWidget(trailing, 0)
-            return host
+            def _inline(*widgets, trailing=None):
+                host = QtWidgets.QWidget()
+                row = QtWidgets.QHBoxLayout(host)
+                row.setContentsMargins(0, 0, 0, 0)
+                row.setSpacing(scaled_px(6, minimum=4))
+                for w in widgets:
+                    row.addWidget(w, 0)
+                row.addStretch(1)
+                if trailing is not None:
+                    row.addWidget(trailing, 0)
+                return host
 
-        section("Fit")
-        self.fit_combo = FluentComboBox()
-        self.fit_combo.addItems(list(FIT_MODELS))
-        self.fit_combo.setFixedWidth(scaled_px(150, minimum=120))
-        self.fit_combo.setToolTip(
-            "Curve-fit model (the full DataFigure set).  '2D center' fits a 2D image\n"
-            "(2D Gaussian); the others fit the 1D trace.")
-        fit_btn = FluentButton("Fit", color=ACCENT)
-        fit_btn.clicked.connect(self.do_fit)
-        clear_btn = FluentButton("Clear", color=GREY)
-        clear_btn.clicked.connect(self.clear_fit)
-        # model row: the picker on the left, the Fit / Clear actions on the right.
-        model_row = _inline(self.fit_combo, trailing=fit_btn)
-        model_row.layout().addWidget(clear_btn, 0)
-        col.addWidget(FluentSettingRow("model", model_row, label_width=proc_lw))
-        # args on its OWN full-width row (it needs the room; jamming it next to
-        # the combo squeezed both).
-        self.fit_cmd = FluentLineEdit("")
-        self.fit_cmd.setPlaceholderText("p0=[1,0,1,0], B=0.1, is_fit=False")
-        self.fit_cmd.setStyleSheet(self.fit_cmd.styleSheet() + " QLineEdit { font-family: Consolas, monospace; }")
-        self.fit_cmd.setToolTip(
-            "Optional fit arguments injected into the call (trusted local code):\n"
-            "p0=[...] initial guess; NAME=value fixes a named parameter; is_fit=False just overlays p0.")
-        self.fit_cmd.returnPressed.connect(self.do_fit)
-        col.addWidget(FluentSettingRow("args", self.fit_cmd, label_width=proc_lw))
+            section("Fit")
+            self.fit_combo = FluentComboBox()
+            self.fit_combo.addItems(list(FIT_MODELS))
+            self.fit_combo.setFixedWidth(scaled_px(150, minimum=120))
+            self.fit_combo.setToolTip(
+                "Curve-fit model (the full DataFigure set).  '2D center' fits a 2D image\n"
+                "(2D Gaussian); the others fit the 1D trace.")
+            fit_btn = FluentButton("Fit", color=ACCENT)
+            fit_btn.clicked.connect(self.do_fit)
+            clear_btn = FluentButton("Clear", color=GREY)
+            clear_btn.clicked.connect(self.clear_fit)
+            # model row: the picker on the left, the Fit / Clear actions on the right.
+            model_row = _inline(self.fit_combo, trailing=fit_btn)
+            model_row.layout().addWidget(clear_btn, 0)
+            col.addWidget(FluentSettingRow("model", model_row, label_width=proc_lw))
+            # args on its OWN full-width row (it needs the room; jamming it next to
+            # the combo squeezed both).
+            self.fit_cmd = FluentLineEdit("")
+            self.fit_cmd.setPlaceholderText("p0=[1,0,1,0], B=0.1, is_fit=False")
+            self.fit_cmd.setStyleSheet(self.fit_cmd.styleSheet() + " QLineEdit { font-family: Consolas, monospace; }")
+            self.fit_cmd.setToolTip(
+                "Optional fit arguments injected into the call (trusted local code):\n"
+                "p0=[...] initial guess; NAME=value fixes a named parameter; is_fit=False just overlays p0.")
+            self.fit_cmd.returnPressed.connect(self.do_fit)
+            col.addWidget(FluentSettingRow("args", self.fit_cmd, label_width=proc_lw))
 
-        # manual x/y limits (DataFigure.xlim/ylim) -- NOT in Setting, so they
-        # live here.  Unit + relim are deliberately ABSENT (Setting owns them).
-        section("Limits")
-        self.xmin = FluentLineEdit(""); self.xmax = FluentLineEdit("")
-        self.ymin = FluentLineEdit(""); self.ymax = FluentLineEdit("")
-        for w in (self.xmin, self.xmax, self.ymin, self.ymax):
-            w.setFixedWidth(scaled_px(88, minimum=68))   # wide enough not to clip "-0.4960"
-            w.returnPressed.connect(self.apply_limits)
-        apply_btn = FluentButton("Apply lim", color=ACCENT)
-        apply_btn.clicked.connect(self.apply_limits)
-        col.addWidget(FluentSettingRow("x range", _inline(self.xmin, self.xmax), label_width=proc_lw))
-        col.addWidget(FluentSettingRow("y range", _inline(self.ymin, self.ymax, trailing=apply_btn), label_width=proc_lw))
+            # manual x/y limits (DataFigure.xlim/ylim) -- NOT in Setting, so they
+            # live here.  Unit + relim are deliberately ABSENT (Setting owns them).
+            section("Limits")
+            self.xmin = FluentLineEdit(""); self.xmax = FluentLineEdit("")
+            self.ymin = FluentLineEdit(""); self.ymax = FluentLineEdit("")
+            for w in (self.xmin, self.xmax, self.ymin, self.ymax):
+                w.setFixedWidth(scaled_px(88, minimum=68))   # wide enough not to clip "-0.4960"
+                w.returnPressed.connect(self.apply_limits)
+            apply_btn = FluentButton("Apply lim", color=ACCENT)
+            apply_btn.clicked.connect(self.apply_limits)
+            col.addWidget(FluentSettingRow("x range", _inline(self.xmin, self.xmax), label_width=proc_lw))
+            col.addWidget(FluentSettingRow("y range", _inline(self.ymin, self.ymax, trailing=apply_btn), label_width=proc_lw))
 
         self.status = FluentLabel("")
         self.status.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
@@ -1944,7 +2010,9 @@ class PanelEditor(QtWidgets.QWidget):
                 area.callback = writeback
             if zoom is not None:
                 zoom.callback = writeback
-        self.status.setText("snapshot of current data — fit / set limits / save are frozen here")
+        self.status.setText("snapshot of current data — fit / set limits / save are frozen here"
+                            if self.fit_combo is not None else
+                            "snapshot of current data — Save Fig is frozen here")
 
     def _edit_param(self, key: str, value) -> None:
         """A plot-param edit from the Edit tab: apply to the LIVE panel (re-renders
@@ -2135,8 +2203,8 @@ class PanelEditor(QtWidgets.QWidget):
             self.status.setText("fit cleared")
 
     def fill_limits(self) -> None:
-        if self._plotter is None:
-            return
+        if self._plotter is None or self.xmin is None:
+            return                          # no Limits section (a non-"plot" role)
         ax = getattr(self._plotter, "ax", None)
         if ax is None:
             return
@@ -2201,6 +2269,7 @@ class TaskConsole(QtWidgets.QWidget):
         feeds: Sequence[object] = (),
         measurements: Sequence[object] = (),
         processors: Sequence[object] = (),
+        tasks: Sequence[object] = (),
         session: object | None = None,
         scale: float | None = None,
         window_ratio: float = 0.84,
@@ -2220,10 +2289,15 @@ class TaskConsole(QtWidgets.QWidget):
         # "Data processing"; picking one creates its result panel + Edit form whose
         # Start runs the action once.
         self.processors = list(processors)
+        # The declarative TASK catalog (the orchestration tier): one-shot TaskSpecs.
+        # Add Panel lists them under "Task"; picking one builds the task over the
+        # session camera, drops its dedicated mid-run output panel, and runs it.
+        self.tasks = list(tasks)
         # The connected experiment session (optional): with it, Add Panel can build
-        # CONTINUOUS producers from scratch -- e.g. "Live: Loading readout" creates a
-        # LoadingFeed over the session camera so you compose loading-rate / occupancy
-        # monitoring entirely from Add Panel + Edit (no pre-wired feed in the notebook).
+        # the loading readout from scratch -- "Data processing: Loading readout"
+        # composes a calibrate task + camera measurement + detect processor over the
+        # session camera so you build loading-rate / occupancy monitoring entirely
+        # from Add Panel + Edit (no pre-wired feed in the notebook).
         self.session = session
         self._proc_feeds: list = []     # one-shot ProcessorFeeds kept alive until done
         self._active_proc_panel = None
@@ -2298,23 +2372,38 @@ class TaskConsole(QtWidgets.QWidget):
         self.summary.setEnabled(False)
 
         self.kind_combo = FluentComboBox()
-        # Add Panel offers THREE clear categories, in order:
-        #   1. a PLOT kind -- a pure view you wire to a hub signal (value = <key>);
-        #   2. "Measurement: X" -- a swept measurement with a default-bound plot;
-        #   3. "Data processing: Y" -- a one-shot ProcessorSpec; its panel shows the
-        #      action's result (and its Edit form runs it).
-        # Picking 2 or 3 + Add Panel creates the result panel and opens its Edit tab.
+        # Add Panel surfaces EVERY architecture LAYER as an addable node, so the
+        # console builds the whole experiment from primitives:
+        #   * "Plot: X"        -- a pure VIEW wired to a hub signal (value = <key>);
+        #   * "Measurement: X" -- an acquisition node: the continuous CAMERA live
+        #                         stream, or a swept measurement (temperature, ...);
+        #   * "Processor: Y"   -- a reactive transform node (the "func" layer, e.g.
+        #                         per-frame detect / per-site fidelity);
+        #   * "Task: Z"        -- a one-shot orchestration (e.g. calibrate readout),
+        #                         with Run + a mid-run output panel;
+        #   * "Readout: Loading" -- the one-click COMPOSITE (camera + detect +
+        #                         calibrate wired together).
+        # Picking a non-plot entry + Add Panel creates its node + panel and opens its
+        # Edit tab (the auto-generated parameter form).
+        readout = getattr(self.session, "readout", None)
         for key, label in PANEL_KINDS.items():
             self.kind_combo.addItem(f"Plot: {label}", key)
+        # MEASUREMENT layer: the continuous camera (a live frame stream) first, then
+        # the swept measurements from the catalog.
+        if readout is not None and hasattr(readout, "camera_measurement"):
+            self.kind_combo.addItem("Measurement: Camera (live frames)", ("camera", "live"))
         for spec in self.measurements:
             self.kind_combo.addItem(f"Measurement: {spec.name}", ("measurement", spec.name))
+        # PROCESSOR layer (the "func" nodes).
         for spec in self.processors:
-            self.kind_combo.addItem(f"Data processing: {spec.name}", ("processor", spec.name))
-        # CONTINUOUS producers (built from the session camera): the loading-rate
-        # analysis you compose loading-rate / occupancy / site monitoring from.
-        if self.session is not None and hasattr(getattr(self.session, "readout", None), "live_loading_feed"):
-            self.kind_combo.addItem("Live: Loading readout", ("live", "loading"))
-        self.kind_combo.setFixedWidth(scaled_px(150, minimum=120))
+            self.kind_combo.addItem(f"Processor: {spec.name}", ("processor", spec.name))
+        # TASK layer: one-shot orchestrations from the auto-discovered task catalog.
+        for spec in self.tasks:
+            self.kind_combo.addItem(f"Task: {spec.name}", ("task", spec.name))
+        # COMPOSITE: the one-click whole loading readout (camera + detect + calibrate).
+        if readout is not None and hasattr(readout, "live_loading_readout"):
+            self.kind_combo.addItem("Readout: Loading (camera+detect+calibrate)", ("live", "loading"))
+        self.kind_combo.setFixedWidth(scaled_px(170, minimum=130))
         add_button = FluentButton("Add Panel", color=ACCENT)
         add_button.clicked.connect(self._add_panel)
         self.save_button = FluentButton("Save", color=ACCENT)
@@ -2387,11 +2476,28 @@ class TaskConsole(QtWidgets.QWidget):
 
     # ----------------------------------------------------------------- control
     def _spec_for_card(self, card: "PanelCard"):
-        """The MeasurementSpec a result panel came from (None for plain panels)."""
+        """The MeasurementSpec behind a panel, so its Edit can carry that
+        measurement's parameter form.
+
+        Two ways a panel is bound to a measurement:
+          * EXPLICITLY -- a measurement-role result panel records
+            ``params["measurement"]`` (created by Add Panel -> "Measurement: X");
+          * BY SIGNAL -- a PLOT panel whose source expression reads a measurement's
+            result signals (its x/y keys) is, for the user, "the plotter of that
+            measurement", so its plotter Edit gets the measurement's param form too
+            (#3: the plotter Edit has fit AND the corresponding measurement's edit).
+        Returns None for a panel touching no measurement signal."""
         name = card.config.params.get("measurement")
-        if not name:
+        if name:
+            return next((s for s in self.measurements if getattr(s, "name", None) == name), None)
+        refs = self._referenced_signals(card.config.source)
+        if not refs:
             return None
-        return next((s for s in self.measurements if getattr(s, "name", None) == name), None)
+        for spec in self.measurements:
+            keys = {str(getattr(spec, "x_key", "")), str(getattr(spec, "y_key", ""))}
+            if refs & (keys - {""}):
+                return spec
+        return None
 
     def _processor_spec_for_card(self, card: "PanelCard"):
         """The ProcessorSpec a result panel came from (None for plain panels)."""
@@ -2400,9 +2506,9 @@ class TaskConsole(QtWidgets.QWidget):
             return None
         return next((s for s in self.processors if getattr(s, "name", None) == name), None)
 
-    # ---- producing-feed discovery: a panel's data comes from a feed; its Edit
-    # exposes THAT feed's acquisition parameters (e.g. a loading-image panel is
-    # produced by a LoadingFeed -> exposure / roi_radius / grid_shape / ...).
+    # ---- producing-feed discovery: a panel's data comes from a producer; its Edit
+    # exposes THAT producer's acquisition parameters (e.g. a raw-frame panel is
+    # produced by the camera measurement -> exposure / roi).
     @staticmethod
     def _referenced_signals(source: str) -> set:
         """The hub signal names a panel's source expression reads (AST Name nodes
@@ -2439,7 +2545,12 @@ class TaskConsole(QtWidgets.QWidget):
 
     @staticmethod
     def _producer_label(feed) -> str:
-        """Short human name for a producing feed (its hub prefix, else its class)."""
+        """Short LAYER name for a producer (camera / detect / calibrate / a
+        measurement's curve), NOT the Python class name -- the dashboard speaks in
+        the architecture's layers, so no "Feed" class name ever leaks into the UI."""
+        label = getattr(feed, "display_label", None)
+        if label:
+            return str(label)
         return str(getattr(feed, "prefix", "") or type(feed).__name__)
 
     def _signal_providers(self) -> dict:
@@ -2454,13 +2565,45 @@ class TaskConsole(QtWidgets.QWidget):
                 providers.setdefault(str(name), []).append(label)
         return providers
 
+    def _producer_for_signal(self, name: str):
+        """The first feed that PUBLISHES signal ``name`` (None if none does)."""
+        for feed in self.feeds:
+            if hasattr(feed, "published_signals") and name in feed.published_signals():
+                return feed
+        return None
+
+    def _producer_chain(self, feed, _seen=None) -> list:
+        """The upstream producer chain that ends at ``feed`` (oldest first) -- the
+        who -> who -> who signal flow.
+
+        e.g. ``[CameraFrameFeed, DetectProcessor]`` for a panel reading detect's
+        outputs: the camera Measurement produces ``frame``, the DetectProcessor
+        CONSUMES it to produce occupancy/rate.  A Processor declares its inputs via
+        ``consumes``; a Measurement / Task has no hub inputs (its source is the
+        device), so the chain bottoms out there.  Traced purely from the live feeds
+        -- no extra bookkeeping in the hub."""
+        _seen = set() if _seen is None else _seen
+        label = self._producer_label(feed)
+        if id(feed) in _seen:
+            return [label]                       # cycle guard
+        _seen.add(id(feed))
+        chain: list = []
+        for name in getattr(feed, "consumes", ()):
+            upstream = self._producer_for_signal(name)
+            if upstream is not None and upstream is not feed:
+                for lab in self._producer_chain(upstream, _seen):
+                    if lab not in chain:
+                        chain.append(lab)
+        chain.append(label)
+        return chain
+
     def _refresh_signal_info(self) -> None:
         """Give every panel a legend (shown in its footer) of what it READS from the
-        hub, the producer it reads FROM and what that producer PROVIDES, and any read
-        whose name is published by more than one producer (ambiguous) -- so the hub
-        namespace is legible instead of a mystery.  Self-guarded: it recomputes only
-        when the sources / feeds / published names actually change, so it is free to
-        call every tick."""
+        hub, the upstream producer FLOW it reads from (who -> who -> who) and what the
+        terminal producer PROVIDES, plus any read whose name is published by more than
+        one producer (ambiguous) -- so the hub namespace + signal flow is legible
+        instead of a mystery.  Self-guarded: it recomputes only when the sources /
+        feeds / published names actually change, so it is free to call every tick."""
         providers = self._signal_providers()
         sig = (tuple(sorted((k, len(v)) for k, v in providers.items())),
                tuple((id(c), c.config.source) for c in self.cards))
@@ -2476,11 +2619,19 @@ class TaskConsole(QtWidgets.QWidget):
             if feed is not None and hasattr(feed, "published_signals"):
                 provides = sorted(str(n) for n in feed.published_signals())
                 if provides:
-                    parts.append(f"from {self._producer_label(feed)}: " + ", ".join(provides))
+                    # the full upstream chain (camera ▸ detect ▸ …) + the terminal
+                    # producer's LAYER, then what it publishes -- the signal flow +
+                    # which layer it comes from, at a glance (answers "feed 是哪一层").
+                    flow = " ▸ ".join(self._producer_chain(feed))
+                    layer = str(getattr(feed, "layer", ""))
+                    head = f"from {flow} [{layer}]" if layer and layer != "node" else f"from {flow}"
+                    parts.append(head + ": " + ", ".join(provides))
             dups = [n for n in reads if len(providers.get(n, [])) > 1]
             if dups:
                 parts.append("⚠ duplicated: " + ", ".join(dups))
-            card.set_signal_info("   ·   ".join(parts))
+            # one category per line (reads / from / duplicated) -- a long signal list
+            # wraps within its own line instead of all jammed into one strip.
+            card.set_signal_info("\n".join(parts))
 
     def _restart_feed(self, feed, new_params: dict):
         """Apply edited acquisition parameters to the producing feed so the
@@ -2590,6 +2741,18 @@ class TaskConsole(QtWidgets.QWidget):
                 card = self._ensure_processor_panel(spec)
                 self._edit_card(card)
             return
+        # The continuous CAMERA measurement: a standalone live frame stream (the
+        # camera node on its own), with a 2-D image panel + an exposure/region Edit.
+        if isinstance(data, tuple) and len(data) == 2 and data[0] == "camera":
+            self._add_camera_measurement_panel()
+            return
+        # A TASK from the catalog: a one-shot orchestration with Run + a mid-run
+        # output panel showing its mid-run frames (confocal-task style).
+        if isinstance(data, tuple) and len(data) == 2 and data[0] == "task":
+            spec = next((s for s in self.tasks if s.name == data[1]), None)
+            if spec is not None:
+                self._add_task_panel(spec)
+            return
         # A continuous live producer (loading readout): build the feed over the
         # session camera, drop its landing view (the loading-rate monitor), and start
         # it streaming.  You then freely Add Panel more views (occupancy site map =
@@ -2639,6 +2802,7 @@ class TaskConsole(QtWidgets.QWidget):
         xlabel, ylabel = spec.result_labels
         config = PanelConfig(
             kind="1d", title=spec.name, row=rows, col=0, size="1x2", source=source,
+            role="measurement",
             params={"measurement": spec.name, "xy": True,
                     "xlabel": xlabel, "ylabel": ylabel, "relim": "normal"},
         )
@@ -2736,7 +2900,7 @@ class TaskConsole(QtWidgets.QWidget):
                 params["image"] = str(md.get("image_key"))
         rows = max((c.config.row + c.config.rows for c in self.cards), default=0)
         config = PanelConfig(kind=kind, title=spec.name, row=rows, col=0, size="2x2",
-                             source=source, params=params)
+                             source=source, params=params, role="task")
         card = PanelCard(config, parent=self.board, names_provider=self.hub.names)
         self._attach_card(card)
         self._arrange()
@@ -2823,26 +2987,70 @@ class TaskConsole(QtWidgets.QWidget):
 
     # --------------------------------------------------- live readout (continuous)
     def _add_live_loading_panel(self) -> None:
-        """Build the loading-rate producer over the session camera + its landing view.
+        """Build the loading readout over the session camera + its landing view.
 
-        Creates a LoadingFeed (calibrated lazily in its OWN thread, so adding it never
-        blocks the GUI), registers it, drops a 'Loading rate' monitor reading
-        ``value = rate``, starts it streaming, and opens that panel's Edit so the
-        grid / exposure / roi_radius / ema are tunable.  You then Add Panel more views
-        yourself -- occupancy site map (``value = occupied``), raw image
-        (``value = frame``), per-site rate (``value = rate_sites``) -- wired to the
-        signals this producer publishes."""
+        The readout is COMPOSED of separate nodes (calibrate Task + camera Measurement
+        + DetectProcessor) -- not one monolithic feed.  Calibration runs on the task's
+        OWN thread and the detector no-ops until it is ready, so adding this never
+        blocks the GUI.  All three nodes are registered (so teardown stops them), a
+        'Loading rate' monitor reading ``value = rate`` is dropped, the chain is started
+        streaming, and that panel's Edit opens.  You then Add Panel more views yourself
+        -- occupancy site map (``value = occupied``), raw image (``value = frame``),
+        per-site rate (``value = rate_sites``) -- wired to the signals it publishes."""
         if self.session is None:
             return
         try:
-            feed = self.session.readout.live_loading_feed(self.hub, calibrate_now=False)
+            readout = self.session.readout.live_loading_readout(self.hub)
         except Exception as exc:
             self._message(f"could not build loading readout: {str(exc).splitlines()[0][:160]}")
             return
-        self.feeds.append(feed)
+        # register every live node so shutdown stops their owner threads (the camera /
+        # detector stream; the calibrate task is one-shot but is stopped too).
+        self.feeds.extend([readout.calibrate_task, readout.camera, readout.detect])
         rows = max((c.config.row + c.config.rows for c in self.cards), default=0)
         config = PanelConfig(kind="monitor_nodist", title="Loading rate", row=rows, col=0,
                              size="1x2", source="value = rate", params={"length": 300})
+        card = PanelCard(config, parent=self.board, names_provider=self.hub.names)
+        self._attach_card(card)
+        # MID-RUN OUTPUT panel (confocal-task style): the calibrate Task streams its
+        # template frames under cal_frame while it runs, on its OWN thread; this panel
+        # shows that intermediate progress, then naturally goes static once the task is
+        # done.  Its signal is namespaced (cal_*) so it never clobbers the live frame.
+        cal_config = PanelConfig(kind="2d", title="Calibrating (task output)", row=rows, col=2,
+                                 size="2x2", source="value = cal_frame")
+        cal_card = PanelCard(cal_config, parent=self.board, names_provider=self.hub.names)
+        self._attach_card(cal_card)
+        self._arrange()
+        self._mark_dirty()
+        if not self._timer.isActive():
+            self._timer.start()
+        try:
+            readout.start(rate_hz=5.0)
+        except Exception as exc:
+            self._message(f"loading readout failed to start: {str(exc).splitlines()[0][:160]}")
+        self._edit_card(card)
+
+    # --------------------------------------------------- camera measurement (live)
+    def _add_camera_measurement_panel(self) -> None:
+        """Build the standalone CONTINUOUS camera Measurement (a live frame stream)
+        over the session camera + a 2-D image view.
+
+        Role = "measurement": the panel IS the camera node; its Edit is the camera's
+        own exposure / region / frames-per-cycle form (NO fit).  It streams ``frame``
+        to the hub, so you then Add Panel a Processor (detect) that consumes it, or
+        more views -- the camera measurement is a first-class addable node, not buried
+        inside the loading readout."""
+        if self.session is None:
+            return
+        try:
+            camera = self.session.readout.camera_measurement(self.hub)
+        except Exception as exc:
+            self._message(f"could not build camera measurement: {str(exc).splitlines()[0][:160]}")
+            return
+        self.feeds.append(camera)
+        rows = max((c.config.row + c.config.rows for c in self.cards), default=0)
+        config = PanelConfig(kind="2d", title="Camera (live)", row=rows, col=0, size="2x2",
+                             source="value = frame", role="measurement")
         card = PanelCard(config, parent=self.board, names_provider=self.hub.names)
         self._attach_card(card)
         self._arrange()
@@ -2850,9 +3058,46 @@ class TaskConsole(QtWidgets.QWidget):
         if not self._timer.isActive():
             self._timer.start()
         try:
-            feed.start(rate_hz=getattr(feed, "rate_hz", 5.0))
+            camera.start(rate_hz=5.0)
         except Exception as exc:
-            self._message(f"loading readout failed to start: {str(exc).splitlines()[0][:160]}")
+            self._message(f"camera measurement failed to start: {str(exc).splitlines()[0][:160]}")
+        self._edit_card(card)
+
+    # --------------------------------------------------- task (orchestration)
+    def _add_task_panel(self, spec) -> None:
+        """Build a catalog TASK over the session camera + its dedicated MID-RUN
+        output panel (confocal-task style).
+
+        Role = "task": the panel shows the task's mid-run frames (``spec.prefix +
+        spec.mid_run_key``, e.g. ``cal_frame``) streamed while it runs on its OWN
+        thread; its Edit is the task's parameter form + a Run button (apply params +
+        run once).  The task derives its artifact (e.g. a ``TrapCalibration`` a
+        DetectProcessor can then consume).  Generic over the task catalog, so a new
+        ``@task`` shows up here automatically."""
+        if self.session is None:
+            return
+        try:
+            task = spec.build(self.hub)
+        except Exception as exc:
+            self._message(f"could not build task {spec.name!r}: {str(exc).splitlines()[0][:160]}")
+            return
+        self.feeds.append(task)
+        rows = max((c.config.row + c.config.rows for c in self.cards), default=0)
+        config = PanelConfig(kind=str(getattr(spec, "default_kind", "2d")), title=spec.name,
+                             row=rows, col=0, size="2x2",
+                             source=f"value = {spec.mid_run_signal()}", role="task")
+        card = PanelCard(config, parent=self.board, names_provider=self.hub.names)
+        self._attach_card(card)
+        self._arrange()
+        self._mark_dirty()
+        if not self._timer.isActive():
+            self._timer.start()
+        # run it once now (it streams its mid-run frames to this panel as it goes);
+        # the Edit's Run re-runs it with edited parameters.
+        try:
+            task.start(rate_hz=5.0)
+        except Exception as exc:
+            self._message(f"task {spec.name!r} failed to start: {str(exc).splitlines()[0][:160]}")
         self._edit_card(card)
 
     def _poll_measurement(self) -> None:
@@ -3102,6 +3347,7 @@ def show_task_console(
     feeds: Sequence[object] = (),
     measurements: Sequence[object] = (),
     processors: Sequence[object] = (),
+    tasks: Sequence[object] = (),
     session: object | None = None,
     scale: float | None = None,
     window_ratio: float = 0.84,
@@ -3133,12 +3379,13 @@ def show_task_console(
     if state is None and task is not None:
         state = resolve_task_state(task)
     console = TaskConsole(hub=hub, state=state, feeds=feeds, measurements=measurements,
-                          processors=processors, session=session, scale=scale, window_ratio=window_ratio)
+                          processors=processors, tasks=tasks, session=session, scale=scale,
+                          window_ratio=window_ratio)
     console._on_close = on_close
     # A passed-in producer feed should stream the moment the window opens -- so the
     # Monitor is live without the caller having to remember feed.start().  start()
-    # is idempotent, so a feed the caller already started (e.g. bring-up's
-    # LoadingFeed(...).start(rate_hz=4)) keeps its own rate; only NON-running feeds
+    # is idempotent, so a producer the caller already started (e.g. bring-up's
+    # readout.start(rate_hz=4)) keeps its own rate; only NON-running producers
     # are launched here.  (TaskConsole.__init__ deliberately does NOT do this, so
     # tests/notebooks keep deterministic manual stepping.)
     for feed in feeds:

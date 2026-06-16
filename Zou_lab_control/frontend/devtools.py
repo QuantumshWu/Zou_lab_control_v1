@@ -212,17 +212,26 @@ def demo_console(*, scale: float = 1.0, size=(1480, 980), seed: int = 11, shots:
     from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
     from Zou_lab_control.frontend.task_console import TaskConsole
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
-    from Zou_lab_control.neutral_atom.devices.virtual import virtual_loading_feed
+    from Zou_lab_control.neutral_atom.devices.virtual import virtual_loading_readout
 
     ensure_qt_app()
     install_screenshot_font()  # before building so build-time text metrics match the render font
     hub = SignalHub()
-    feeds = [virtual_loading_feed(hub, seed=seed)]
+    # The loading readout is COMPOSED (calibrate task + camera measurement + detect
+    # processor); for a deterministic demo we calibrate up front, then step the camera
+    # + detector by hand.  The live producers (not the one-shot calibrate task) are the
+    # panels' feeds.
+    readouts = [virtual_loading_readout(hub, seed=seed)]
     if dual:
-        feeds.append(virtual_loading_feed(hub, prefix="b_", seed=seed + 11, loading_probability=0.35))
+        readouts.append(virtual_loading_readout(hub, prefix="b_", seed=seed + 11, loading_probability=0.35))
+    feeds = []
+    for readout in readouts:
+        readout.calibrate()
+        feeds.extend(readout.producers)
     for _ in range(max(1, int(shots))):
-        for feed in feeds:
-            feed.step()
+        for readout in readouts:
+            readout.camera.step()
+            readout.detect.step()
     console = TaskConsole(hub=hub, state=state or _demo_board_state(), feeds=feeds,
                           scale=scale, window_px=size)
     console._timer.stop()          # deterministic: tests drive refresh_once() themselves

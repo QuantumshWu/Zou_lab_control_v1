@@ -2,7 +2,18 @@
 
 from .calibration import calibrate_sitemap_from_images, calibrate_threshold_from_images
 from .detection import detect_image
-from .feeds import CameraFrameFeed, ExperimentFeed, LoadingFeed, ScannedMeasurementFeed
+from .feeds import (
+    CalibrateReadoutTask,
+    CameraFrameFeed,
+    DetectProcessor,
+    LoadingReadout,
+    Measurement,
+    Processor,
+    Producer,
+    ScannedMeasurementFeed,
+    Task,
+    build_loading_readout,
+)
 from .fidelity import (
     FidelityReport,
     ReferenceLabels,
@@ -50,7 +61,7 @@ __all__ = [
     "CameraFrameFeed",
     "detect_image",
     "discovered_specs",
-    "ExperimentFeed",
+    "Producer",
     "FidelityReport",
     "fit_temperature",
     "measurement",
@@ -60,7 +71,13 @@ __all__ = [
     "frame_files",
     "index_run",
     "load_frame",
-    "LoadingFeed",
+    "LoadingReadout",
+    "Measurement",
+    "Processor",
+    "Task",
+    "CalibrateReadoutTask",
+    "DetectProcessor",
+    "build_loading_readout",
     "MeasurementSpec",
     "NFramePlan",
     "OtsuFidelityReducer",

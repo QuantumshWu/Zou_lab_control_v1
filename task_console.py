@@ -9,8 +9,9 @@ a device config and streams live atom-loading shots into the console::
 
     python task_console.py --config remote_template.json --grid 5x7
 
-That opens the camera + remote sequencer through the SAME ``LoadingFeed``
-contract the virtual path uses (only the data source differs), and wires the
+That opens the camera + remote sequencer through the SAME composed loading
+readout (``build_loading_readout``) the virtual path uses (only the data source
+differs), and wires the
 auto-discovered readout measurement catalog (every ``@measurement`` in
 ``operations/measurements/`` + anything ``register_measurement``-ed) into the
 Add-Panel list, so you can pick any available measurement to connect.
@@ -84,37 +85,41 @@ def main(argv: list[str] | None = None) -> int:
     hub = SignalHub()
     feeds = []
     measurements = ()
+    processors = ()
+    tasks = ()
     exp = None
     # Everything that may open a device session lives in try/finally: a
-    # calibration / LoadingFeed / show failure must STILL stop the feeds and
+    # calibration / readout / show failure must STILL stop the producers and
     # close the session (a real camera + remote FPGA sequencer must reach a clean
     # safe_state, not leak open), then re-raise so the operator sees the error.
     try:
         if args.config:
-            # REAL hardware (or any device config): one-click direct run.  The
-            # LoadingFeed touches ONLY the camera.acquire contract, so this is the
-            # SAME producer the virtual path uses -- only the data source differs.
+            # REAL hardware (or any device config): one-click direct run.  The loading
+            # readout is COMPOSED (calibrate task + camera measurement + detect
+            # processor), touching ONLY the camera.acquire contract -- same nodes the
+            # virtual path uses, only the data source differs.
             import Zou_lab_control.neutral_atom as na
-            from Zou_lab_control.neutral_atom.operations.feeds import LoadingFeed
+            from Zou_lab_control.neutral_atom.operations.feeds import build_loading_readout
 
             grid = _parse_grid(args.grid)
             print(f"Connecting devices from {args.config!r} (grid {grid[0]}x{grid[1]}); "
                   "self-calibrating site map + thresholds through the readout contract...")
             exp = na.connect(args.config, open_devices=True)
-            feed = LoadingFeed(hub, exp.devices.camera, sequencer=exp.devices.sequencer, grid_shape=grid)
-            feeds.append(feed)
+            readout = build_loading_readout(hub, exp.devices.camera, sequencer=exp.devices.sequencer, grid_shape=grid)
+            feeds.extend([readout.calibrate_task, readout.camera, readout.detect])
             measurements = exp.readout.measurement_specs()
-            feed.start(rate_hz=args.rate)
+            processors = exp.readout.processor_specs()
+            tasks = exp.readout.task_specs()
+            readout.start(rate_hz=args.rate)   # non-blocking: calibrate on its own thread, then stream
         elif not args.no_feed:
-            # VIRTUAL experiment through the SAME connect() contract the real path
-            # uses (only the camera frames are simulated): the primary LoadingFeed is
-            # IDENTICAL to --config, and the readout measurement catalog is wired in
-            # so Add Panel lists every available measurement and a Start streams a
-            # real curve.  An optional b_* feed adds a second signal source for
+            # VIRTUAL experiment through the SAME connect() contract the real path uses
+            # (only the camera frames are simulated): the primary loading readout is the
+            # IDENTICAL composed chain as --config, and the readout measurement catalog
+            # is wired in.  An optional b_* readout adds a second signal source for
             # cross-signal expressions (e.g. ``value = rate_grid - b_rate_grid``).
             import Zou_lab_control.neutral_atom as na
-            from Zou_lab_control.neutral_atom.devices.virtual import virtual_loading_feed
-            from Zou_lab_control.neutral_atom.operations.feeds import LoadingFeed
+            from Zou_lab_control.neutral_atom.devices.virtual import virtual_loading_readout
+            from Zou_lab_control.neutral_atom.operations.feeds import build_loading_readout
 
             grid = _parse_grid(args.grid)
             print(f"Starting VIRTUAL experiment (grid {grid[0]}x{grid[1]}; only camera frames are simulated); "
@@ -122,13 +127,18 @@ def main(argv: list[str] | None = None) -> int:
             exp = na.connect("virtual", sitemap={"grid_shape": grid})
             exp.readout.sitemap(method="box", frames=4, display=False)
             exp.readout.thresholds(frames=24, display=False)
-            feeds.append(LoadingFeed(hub, exp.devices.camera, sequencer=exp.devices.sequencer, grid_shape=grid))
+            readouts = [build_loading_readout(hub, exp.devices.camera, sequencer=exp.devices.sequencer, grid_shape=grid)]
             if not args.single:
                 seed_b = None if args.seed is None else args.seed + 11
-                feeds.append(virtual_loading_feed(hub, prefix="b_", seed=seed_b, loading_probability=0.35))
+                readouts.append(virtual_loading_readout(hub, prefix="b_", seed=seed_b,
+                                                        loading_probability=0.35, grid_shape=grid))
+            for readout in readouts:
+                feeds.extend([readout.calibrate_task, readout.camera, readout.detect])
             measurements = exp.readout.measurement_specs()
-            for feed in feeds:
-                feed.start(rate_hz=args.rate)
+            processors = exp.readout.processor_specs()
+            tasks = exp.readout.task_specs()
+            for readout in readouts:
+                readout.start(rate_hz=args.rate)
 
         if args.state:
             state = TaskConsoleState.load(args.state)
@@ -136,7 +146,8 @@ def main(argv: list[str] | None = None) -> int:
             state = resolve_task_state(args.task)
         else:
             state = default_console_state()
-        show_task_console(hub=hub, state=state, feeds=feeds, measurements=measurements, scale=args.scale)
+        show_task_console(hub=hub, state=state, feeds=feeds, measurements=measurements,
+                          processors=processors, tasks=tasks, session=exp, scale=args.scale)
 
         auto_close_ms = os.environ.get("ZLC_TASK_CONSOLE_AUTO_CLOSE_MS")
         if auto_close_ms:

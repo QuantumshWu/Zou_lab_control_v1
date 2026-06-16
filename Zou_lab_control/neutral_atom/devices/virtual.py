@@ -322,12 +322,13 @@ class VirtualCamera(CameraDevice):
             if callable(wait_done) and not wait_done(max(self.timeout, getattr(runtime_sequence, "duration", 0.0) * 2.0 + 1.0)):
                 raise TimeoutError("virtual sequencer did not report done.")
         self.last_sequence = None if sequence is None else sequence.name
-        return images
+        return self._retain(images)
 
     def snapshot(self) -> dict[str, object]:
         return {
             "type": type(self).__name__,
             "exposure": self.exposure,
+            "roi": self._roi,
             "timeout": self.timeout,
             "last_sequence": self.last_sequence,
         }
@@ -373,7 +374,7 @@ class VirtualSequencer(SequencerDevice):
         pass
 
 
-def virtual_loading_feed(
+def virtual_loading_readout(
     hub,
     *,
     prefix: str = "",
@@ -387,23 +388,24 @@ def virtual_loading_feed(
     threshold_frames: int = 24,
     trap_array: "VirtualTrapArray | None" = None,
 ):
-    """Build a :class:`~..operations.feeds.LoadingFeed` driven by a virtual camera.
+    """Build the COMPOSED loading readout (a ``LoadingReadout``) over a virtual camera.
 
-    This is the ONLY virtual-specific glue for the task-console producer: it wires
-    a ``VirtualTrapArray`` behind a ``VirtualCamera`` and hands that camera to the
-    backend-agnostic ``LoadingFeed``.  The feed itself is identical on real
-    hardware -- there you build ``LoadingFeed(hub, exp.camera,
-    sequencer=exp.devices.sequencer, grid_shape=...)`` instead.  Faking lives only
-    here, at the data source; the feed's analysis path does not change.
+    The ONLY virtual-specific glue for the task-console producer: it wires a
+    ``VirtualTrapArray`` behind a ``VirtualCamera`` and hands that camera to the
+    backend-agnostic ``build_loading_readout`` (calibrate Task + camera Measurement +
+    DetectProcessor).  Identical on real hardware -- there you call
+    ``build_loading_readout(hub, exp.camera, sequencer=exp.devices.sequencer, ...)``.
+    Faking lives ONLY here, at the camera frames; the calibrate/detect path is the
+    production code, run as separate nodes.
     """
 
-    from ..operations.feeds import LoadingFeed  # lazy: keep devices->operations off the import graph
+    from ..operations.feeds import build_loading_readout  # lazy: keep devices->operations off import graph
 
     trap = trap_array if trap_array is not None else VirtualTrapArray(
         grid_shape=tuple(grid_shape), loading_probability=float(loading_probability), seed=seed
     )
     camera = VirtualCamera(trap, exposure=float(exposure))
-    return LoadingFeed(
+    return build_loading_readout(
         hub,
         camera,
         prefix=prefix,
@@ -656,6 +658,6 @@ __all__ = [
     "trap_off_durations_per_frame",
     "virtual_config",
     "virtual_config_with_overrides",
-    "virtual_loading_feed",
+    "virtual_loading_readout",
     "write_virtual_run",
 ]

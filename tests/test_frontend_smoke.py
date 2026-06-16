@@ -1699,8 +1699,8 @@ def test_monitor_panels_have_no_selectors_and_wheel_scrolls(monkeypatch):
 
 def test_edit_exposes_producing_feed_acquisition_params(monkeypatch):
     """A plain panel's Edit auto-discovers the parameters of the FEED that
-    produces its data (a loading-image panel is produced by a LoadingFeed ->
-    exposure / roi_radius / grid_shape / ema / *_frames), each prefilled with the
+    produces its data (a loading-image panel is produced by the camera Measurement ->
+    exposure / region / frames_per_cycle), each prefilled with the
     CURRENT running value and shown as a 'now: X' reference; Restart rebuilds the
     feed.  (This is the fix for the loading-image Edit showing zero params.)"""
 
@@ -1714,15 +1714,17 @@ def test_edit_exposes_producing_feed_acquisition_params(monkeypatch):
         img = next(c for c in console.cards if c.config.kind == "2d")   # "Loading image"
         console._edit_card(img)
         editor = console._panel_editors[id(img)]
-        assert type(editor._feed).__name__ == "LoadingFeed"
-        assert {"exposure", "roi_radius", "grid_shape", "ema"} <= set(editor._feed_widgets)
+        # the raw-frame ("Loading image") panel reads `frame`, produced by the camera
+        # MEASUREMENT (CameraFrameFeed) -- so its Edit exposes the camera's params.
+        assert type(editor._feed).__name__ == "CameraFrameFeed"
+        assert {"exposure", "frames_per_cycle"} <= set(editor._feed_widgets)
         # fields PREFILLED with current running values + a "now:" reference
-        assert editor._feed_widgets["exposure"].text() == repr(editor._feed.exposure)
+        assert float(editor._feed_widgets["exposure"].text()) == editor._feed.camera.exposure
         assert "now:" in editor._feed_now_labels["exposure"].text()
-        # editing + Restart rebuilds the feed with the new value
+        # editing + Restart reconfigures the camera with the new exposure
         editor._feed_widgets["exposure"].setText("0.05")
         editor._restart_feed()
-        assert editor._feed.exposure == 0.05
+        assert editor._feed.camera.exposure == 0.05
         assert editor._feed in console.feeds
     finally:
         console.shutdown()

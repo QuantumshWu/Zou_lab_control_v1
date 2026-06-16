@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import threading
 from abc import ABC, abstractmethod
+from collections import deque
 from typing import Any
 
 import numpy as np
@@ -39,7 +41,18 @@ class BaseDevice(ABC):
 
 
 class CameraDevice(BaseDevice):
-    """Required contract for a camera used by ``NeutralAtomSession``."""
+    """Required contract for a camera used by ``NeutralAtomSession``.
+
+    Owns a small RECENT-FRAMES ring (``recent_capacity`` frames).  The camera is
+    externally triggered, so a single fired shot can yield MORE frames than a
+    consumer requested (e.g. two ``emCCD`` triggers inside one pulse); every
+    ``acquire`` retains its frames here so a live consumer that polls :meth:`drain`
+    never misses the extra ones and :meth:`latest` always holds the newest.  This
+    lives on the base class, so the virtual and real cameras retain identically
+    (virtual == real); subclasses only call :meth:`_retain` at the end of acquire.
+    """
+
+    recent_capacity: int = 16
 
     def bind_experiment(self, session) -> "CameraDevice":
         """Attach experiment defaults used by convenience methods like capture."""
@@ -76,6 +89,66 @@ class CameraDevice(BaseDevice):
         waiting and raise :class:`AcquisitionCancelled` when it is set, instead
         of blocking for the full timeout; implementations that cannot interrupt
         may ignore it."""
+
+    # ----------------------------------------------------------- recent frames
+    def _recent_state(self) -> dict:
+        """Lazily create the recent-frames ring (subclasses define their own
+        ``__init__`` and need not call ``super().__init__()``)."""
+        state = self.__dict__.get("_zlc_recent")
+        if state is None:
+            state = {
+                "frames": deque(maxlen=max(1, int(self.recent_capacity))),
+                "lock": threading.Lock(),
+                "seq": 0,       # total frames ever retained
+                "cursor": 0,    # drain watermark
+            }
+            self.__dict__["_zlc_recent"] = state
+        return state
+
+    def _retain(self, images) -> Any:
+        """Append freshly-acquired frames to the recent-frames ring (thread-safe).
+
+        Subclasses call this once at the end of ``acquire`` and return ``images``
+        unchanged.  Returns ``images`` so ``return self._retain(images)`` reads
+        cleanly."""
+        state = self._recent_state()
+        with state["lock"]:
+            for image in images:
+                state["frames"].append(np.asarray(image))
+                state["seq"] += 1
+        return images
+
+    def recent_frames(self, n: int | None = None) -> list[np.ndarray]:
+        """The most-recent retained frames (newest last); all of them when ``n`` is None."""
+        state = self._recent_state()
+        with state["lock"]:
+            frames = list(state["frames"])
+        return frames if n is None else frames[-int(n):]
+
+    def latest(self) -> np.ndarray | None:
+        """The single newest retained frame, or None if nothing has been acquired."""
+        state = self._recent_state()
+        with state["lock"]:
+            return state["frames"][-1] if state["frames"] else None
+
+    def drain(self) -> list[np.ndarray]:
+        """Every frame retained since the previous ``drain`` (lossless up to capacity).
+
+        A live consumer polling this gets ALL frames captured between its polls --
+        so a multi-trigger shot's extra frames are never dropped on the floor."""
+        state = self._recent_state()
+        with state["lock"]:
+            frames = list(state["frames"])
+            n_new = max(0, min(len(frames), state["seq"] - state["cursor"]))
+            state["cursor"] = state["seq"]
+            return frames[-n_new:] if n_new else []
+
+    def clear_recent(self) -> None:
+        """Drop retained frames and reset the drain watermark (e.g. on reconfigure)."""
+        state = self._recent_state()
+        with state["lock"]:
+            state["frames"].clear()
+            state["cursor"] = state["seq"]
 
     def capture(self, *, frames: int = 1, exposure: float | None = None, sequence=None, display: bool = True, **kwargs):
         """Acquire images and return a notebook-friendly ``CaptureResult``.

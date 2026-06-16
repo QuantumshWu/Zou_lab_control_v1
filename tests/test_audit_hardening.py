@@ -18,7 +18,7 @@ import pytest
 
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
 from Zou_lab_control.neutral_atom.devices.base import AcquisitionCancelled
-from Zou_lab_control.neutral_atom.operations.feeds import ExperimentFeed
+from Zou_lab_control.neutral_atom.operations.feeds import Producer
 from Zou_lab_control.neutral_atom.operations.measurement import (
     ScanAxis,
     ScannedMeasurement,
@@ -49,7 +49,7 @@ def test_wedged_feed_surfaces_error_not_silent():
     never freeze silently."""
     hub = SignalHub()
 
-    class BoomFeed(ExperimentFeed):
+    class BoomFeed(Producer):
         def shot(self):
             raise RuntimeError("trigger never arrived")
 

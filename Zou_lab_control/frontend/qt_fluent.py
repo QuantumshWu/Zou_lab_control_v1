@@ -589,18 +589,13 @@ class FluentPopup(QtWidgets.QFrame):
 
 
 class FluentGroupBox(QtWidgets.QGroupBox):
-    def __init__(self, title: str = "", parent=None, *, shadow: bool = True, padding_top: int = 32):
+    def __init__(self, title: str = "", parent=None, *, shadow: bool = True):
         super().__init__(title, parent)
         # A soft drop shadow (QGraphicsDropShadowEffect) is expensive to repaint
         # -- it rasterises + blurs the whole widget every frame, which makes a
         # tall, scrolled panel stutter.  When shadow is off we draw a light 1px
         # border instead so the card is still delineated, for a fraction of the
-        # paint cost.
-        #
-        # ``padding_top`` reserves the top title strip (the default 32 px holds the
-        # ``QGroupBox::title`` chip).  A titleless card (a plot panel whose title
-        # lives INSIDE its figure) passes 0 so its content sits flush with the top
-        # edge.
+        # paint cost.  The 32 px top padding reserves the ``QGroupBox::title`` strip.
         border = "none" if shadow else f"1px solid {DIVIDER}"
         self.setStyleSheet(
             f"""
@@ -609,7 +604,7 @@ class FluentGroupBox(QtWidgets.QGroupBox):
                 border: {border};
                 border-radius: {_radius()}px;
                 margin-top: 0px;
-                padding-top: {scaled_px(padding_top)}px;
+                padding-top: {scaled_px(32)}px;
                 color: {TEXT};
                 font: {fluent_font_size()}pt "{FONT}";
             }}

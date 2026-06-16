@@ -327,9 +327,9 @@ def test_region_to_acquisition_parameters_is_owned_by_the_source():
     # back as endpoints (full sensor 64x80, no snap needed for /4-aligned values)
     cam_feed.set_acquisition_parameters(region=[8, 28, 12, 28])
     assert cam_feed.acquisition_parameters()["region"] == [8, 28, 12, 28]
-    # a non-spatial source (loading analysis) has no rectangle param -> no-op
-    load_feed = na.LoadingFeed(hub, exp.devices.camera, grid_shape=(2, 3))
-    assert load_feed.region_to_acquisition_parameters(10, 30, 6, 22) == {}
+    # a non-spatial producer (a Processor / scan measurement) has no rectangle param
+    from Zou_lab_control.neutral_atom.operations.feeds import DetectProcessor
+    assert DetectProcessor(hub, calibration=None).region_to_acquisition_parameters(10, 30, 6, 22) == {}
 
 
 # ------------------------------------------------ acquisition-parameter protocol
@@ -436,19 +436,8 @@ def test_running_feed_applies_params_in_owner_thread_no_concurrent_acquire():
         feed.stop()
 
 
-def test_loading_feed_acquisition_params_reapply_in_place():
-    """LoadingFeed's source is its own analysis; editing a param re-calibrates the
-    SAME running feed (no instance swap)."""
-    exp = na.connect("virtual", sitemap={"grid_shape": (5, 7)})
-    hub = SignalHub()
-    feed = na.LoadingFeed(hub, exp.devices.camera, sequencer=exp.devices.sequencer, grid_shape=(5, 7))
-    params = feed.acquisition_parameters()
-    for key in ("exposure", "roi_radius", "grid_shape", "ema", "calibration_frames", "threshold_frames"):
-        assert key in params
-
-    same = feed
-    feed.set_acquisition_parameters(roi_radius=2)
-    assert feed is same                                     # in place, not a new instance
-    assert feed.roi_radius == 2
-    assert feed.acquisition_parameters()["roi_radius"] == 2
-    assert len(feed.centers) > 0 and feed.thresholds.shape[0] == len(feed.centers)  # re-calibrated
+# (the old LoadingFeed in-place re-calibration test was removed with LoadingFeed:
+#  the loading readout is now COMPOSED -- calibration is the CalibrateReadoutTask and
+#  detection the DetectProcessor; their parameters come from the build signature.
+#  Composition + the real detect path are covered by tests/test_producer_split_contract.py
+#  and tests/test_neutral_atom_lightweight.py::test_virtual_loading_readout_*.)

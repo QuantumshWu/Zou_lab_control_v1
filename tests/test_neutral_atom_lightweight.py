@@ -6932,36 +6932,43 @@ def test_signal_hub_publish_latest_history_and_versioning():
     assert hub.latest("counts")[0] != 999.0
 
 
-def test_virtual_loading_feed_publishes_standard_signals():
-    """The atom-loading feed self-calibrates through the CameraDevice contract and
-    publishes the console signal set; the running loading rate lands near the
-    configured probability.  ``virtual_loading_feed`` only swaps in a virtual
-    camera -- the LoadingFeed it builds is the same one real hardware uses."""
+def test_virtual_loading_readout_publishes_standard_signals():
+    """The COMPOSED loading readout (calibrate task + camera measurement + detect
+    processor) self-calibrates through the CameraDevice contract and publishes the
+    console signal set; the running loading rate lands near the configured
+    probability.  ``virtual_loading_readout`` only swaps in a virtual camera -- the
+    composed chain is the same one real hardware uses (virtual == real)."""
 
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
-    from Zou_lab_control.neutral_atom.devices.virtual import virtual_loading_feed
+    from Zou_lab_control.neutral_atom.devices.virtual import virtual_loading_readout
 
     hub = SignalHub()
-    feed = virtual_loading_feed(hub, seed=5, loading_probability=0.55, ema=0.2)
+    readout = virtual_loading_readout(hub, seed=5, loading_probability=0.55, ema=0.2)
+    readout.calibrate()
     for _ in range(60):
-        feed.step()
-    assert set(hub.names()) == {"frame", "counts", "occupied", "rate", "rate_sites", "rate_grid",
-                                "centers", "thresholds", "shot"}
+        readout.camera.step()      # camera measurement publishes a frame
+        readout.detect.step()      # detect processor runs the REAL per-frame detect
+    n = readout.detect.calibration.n_sites
+    names = set(hub.names())
+    assert {"frame", "counts", "occupied", "rate", "rate_sites", "rate_grid",
+            "centers", "thresholds"} <= names
     assert hub.latest("frame").shape == (96, 128)
-    assert hub.latest("centers").shape == (feed.n_sites, 2)   # the site-map panel's anchor
-    assert hub.latest("thresholds").shape == (feed.n_sites,)
-    assert hub.latest("counts").shape == (feed.n_sites,)
-    assert hub.latest("rate_grid").shape == feed.grid_shape
+    assert hub.latest("centers").shape == (n, 2)   # the site-map panel's anchor
+    assert hub.latest("thresholds").shape == (n,)
+    assert hub.latest("counts").shape == (n,)
+    assert hub.latest("rate_grid").shape == readout.detect.grid_shape
     assert 0.0 <= hub.latest("rate") <= 1.0
     # the long-run occupancy mean tracks loading_probability (loose: lifetime losses)
     occupancy = hub.history("occupied", 60)
     assert 0.30 <= float(occupancy.mean()) <= 0.80
-    # a prefixed second feed coexists in the same hub for A-B expressions
-    feed_b = virtual_loading_feed(hub, prefix="b_", seed=6, loading_probability=0.3, ema=0.2)
+    # a prefixed second readout coexists in the same hub for A-B expressions
+    readout_b = virtual_loading_readout(hub, prefix="b_", seed=6, loading_probability=0.3, ema=0.2)
+    readout_b.calibrate()
     for _ in range(10):
-        feed_b.step()
+        readout_b.camera.step()
+        readout_b.detect.step()
     diff = hub.latest("rate_grid") - hub.latest("b_rate_grid")
-    assert diff.shape == feed.grid_shape
+    assert diff.shape == readout.detect.grid_shape
 
 
 class _FakeVivadoProc:

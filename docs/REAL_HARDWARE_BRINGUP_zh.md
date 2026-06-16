@@ -61,16 +61,18 @@ import Zou_lab_control.neutral_atom as na
 exp = na.connect("remote_template.json", open_devices=True)   # 开 qCMOS + RemoteSequencer
 exp.readout.sitemap(method="box", frames=20, display=True)     # 看站点中心检测
 exp.readout.thresholds(frames=100, display=True)               # 看每站点阈值直方图
-# 确认无误后再看板;feed 与虚拟同一个类(只换了相机):
+# 确认无误后再看板;loading 读出是组合节点(相机出帧 + 真 detect + 标定 task),只换相机即真机:
 from Zou_lab_control.frontend import show_task_console
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
-from Zou_lab_control.neutral_atom.operations.feeds import LoadingFeed
+from Zou_lab_control.neutral_atom.operations.feeds import build_loading_readout
 hub = SignalHub()
-feed = LoadingFeed(hub, exp.devices.camera, sequencer=exp.devices.sequencer, grid_shape=(5, 7)).start(rate_hz=4)
-show_task_console(hub=hub, feeds=[feed], measurements=exp.readout.measurement_specs())
+readout = build_loading_readout(hub, exp.devices.camera, sequencer=exp.devices.sequencer, grid_shape=(5, 7))
+readout.start(rate_hz=4)   # 非阻塞:标定在它自己的线程跑,detector 就绪前 no-op
+show_task_console(hub=hub, feeds=[readout.calibrate_task, readout.camera, readout.detect],
+                  measurements=exp.readout.measurement_specs())
 ```
 
-确认设置可信后,**例行运行可一键直跑**(自动建 `LoadingFeed`、走同一标定契约):
+确认设置可信后,**例行运行可一键直跑**(自动建组合 loading 读出、走同一标定契约):
 
 ```bash
 python task_console.py --config remote_template.json --grid 5x7

@@ -507,24 +507,76 @@ class ReadoutSubsystem(ExperimentSubsystem):
 
         return discovered_processor_specs(self)
 
-    def live_loading_feed(self, hub, *, calibrate_now: bool = False, **params):
-        """Build a CONTINUOUS loading-rate producer (a ``LoadingFeed``) over the
-        session's camera: it images one loading shot per frame and publishes ``rate``
-        / ``occupied`` / ``rate_sites`` / ``rate_grid`` / ``centers`` / ``frame`` to
-        ``hub``.  This is the single source the live readout comes from -- a notebook
-        OR the task console (Add Panel -> "Live: Loading readout") starts the same
-        feed, so they cannot drift.  ``calibrate_now=False`` (the GUI default) defers
-        the blocking calibration to the acquisition loop's OWN thread, so adding the
-        producer from the GUI never blocks; pass the grid/exposure/roi_radius/ema the
-        feed should use, or rely on the session's default grid."""
+    def task_specs(self) -> list:
+        """Auto-discovered catalog of orchestration TASKS a GUI can run.
 
-        from ..operations.feeds import LoadingFeed
+        The orchestration tier of :meth:`measurement_specs` / :meth:`processor_specs`:
+        every ``@task`` factory in ``operations/tasks/`` (the built-in readout
+        calibration lives there) plus anything a notebook registered via
+        ``register_task(...)``.  Each factory receives THIS subsystem, so its
+        ``build(hub)`` closure captures the session (camera / sequencer) and returns
+        an UNRUN :class:`~..operations.feeds.Task` that streams mid-run output to a
+        dedicated panel and derives an artifact.  Drop a new module into that package
+        and it appears here (and in the console's Add-Panel "Task" group)
+        automatically."""
+
+        from ..operations.task_registry import discovered_task_specs
+
+        return discovered_task_specs(self)
+
+    def live_loading_readout(self, hub, **params):
+        """Build the CONTINUOUS loading readout over the session's camera, COMPOSED
+        from separate nodes (a :class:`~..operations.feeds.LoadingReadout`): a
+        calibrate Task + a camera Measurement (publishes ``frame``) + a
+        :class:`DetectProcessor` (runs the REAL per-frame ``calibration.detect`` ->
+        ``rate`` / ``occupied`` / ``rate_sites`` / ``rate_grid`` / ``centers``).  This
+        is the single source the live readout comes from -- a notebook OR the task
+        console (Add Panel -> "Data processing: Loading readout") build the same
+        composed chain, so they cannot drift, and it is NON-BLOCKING: calibration runs
+        on the task's own thread and the detector no-ops until it is ready.  Pass the
+        grid/exposure/roi_radius/ema/method, or rely on the session's default grid."""
+
+        from ..operations.feeds import build_loading_readout
 
         s = self._session
         params["grid_shape"] = s._grid_shape(params.get("grid_shape"))
-        return LoadingFeed(hub, s.devices.camera,
-                           sequencer=getattr(s.devices, "sequencer", None),
-                           calibrate_now=calibrate_now, **params)
+        return build_loading_readout(hub, s.devices.camera,
+                                     sequencer=getattr(s.devices, "sequencer", None), **params)
+
+    def camera_measurement(self, hub, *, prefix: str = "", frames_per_cycle: int = 1):
+        """Build a CONTINUOUS camera Measurement over the session camera (a
+        :class:`~..operations.feeds.CameraFrameFeed` publishing raw ``frame``s).
+
+        This is the standalone live-image producer -- the SAME camera node the
+        loading readout composes, but addable on its own (Add Panel ->
+        "Measurement: Camera (live frames)").  Its editable parameters ARE the
+        camera's (exposure / region), applied live; only the camera differs on real
+        hardware (virtual == real)."""
+
+        from ..operations.feeds import CameraFrameFeed
+
+        s = self._session
+        return CameraFrameFeed(hub, s.devices.camera, sequencer=getattr(s.devices, "sequencer", None),
+                               frames_per_cycle=frames_per_cycle, prefix=prefix)
+
+    def calibrate_task(self, hub, *, prefix: str = "cal_", **params):
+        """Build the calibrate-readout TASK over the session camera (the sitemap +
+        per-site threshold calibration as a first-class one-shot
+        :class:`~..operations.feeds.CalibrateReadoutTask`).
+
+        Run it from the console (Add Panel -> "Task: Calibrate readout"): mid-run it
+        streams its template frames + a progress fraction to a dedicated panel
+        (``<prefix>frame`` / ``<prefix>progress``, confocal-task style) and produces a
+        ``TrapCalibration`` (+ optional npz artifact).  Same calibration primitives
+        the notebook/real readout uses -- only the camera frames differ."""
+
+        from ..operations.feeds import CalibrateReadoutTask
+
+        s = self._session
+        params["grid_shape"] = s._grid_shape(params.get("grid_shape"))
+        return CalibrateReadoutTask(hub, s.devices.camera,
+                                    sequencer=getattr(s.devices, "sequencer", None),
+                                    prefix=prefix, **params)
 
     # ------------------------------------------------------------- persistence
     def load(self, path: str | Path) -> TrapCalibration:
