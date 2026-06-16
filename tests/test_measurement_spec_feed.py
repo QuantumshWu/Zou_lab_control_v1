@@ -345,9 +345,12 @@ def test_camera_frame_feed_exposes_camera_params_and_applies_them_live():
     hub = SignalHub()
     feed = na.CameraFrameFeed(hub, cam)
 
-    assert feed.published_signals() == frozenset({"frame"})
+    # default frames_per_cycle=1 -> the first trigger as both 'frame' (back-compat /
+    # default 2D panel) and 'frame_0' (the per-trigger name).
+    assert feed.published_signals() == frozenset({"frame", "frame_0"})
     params = feed.acquisition_parameters()
     assert "exposure" in params and params["exposure"] == float(cam.exposure)
+    assert params["frames_per_cycle"] == 1
 
     feed.set_acquisition_parameters(exposure=0.05)
     assert float(cam.exposure) == 0.05                      # applied to the camera in place

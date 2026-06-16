@@ -352,25 +352,42 @@ class LoadingFeed(ExperimentFeed):
 
 
 class CameraFrameFeed(ExperimentFeed):
-    """Stream RAW camera frames into the hub: one ``frame`` signal per shot, no
-    site analysis.  The data SOURCE is the camera itself, so the editable
-    acquisition parameters ARE the camera's own settings -- ``exposure`` and
-    ``roi`` -- and a panel's Edit tab applies them by reconfiguring the camera
-    live (``camera.configure``), no rebuild.  Backend-agnostic: identical with a
-    real camera or a ``VirtualCamera``; only the ``camera`` differs.  Drive a 2D
-    ``frame`` panel with it to watch a live image while tuning exposure/ROI."""
+    """Stream RAW camera frames into the hub, no site analysis.  The data SOURCE is
+    the camera itself, so the editable acquisition parameters ARE the camera's own
+    settings -- ``exposure`` and ``roi`` -- applied live (``camera.configure``).
+    Backend-agnostic: identical with a real camera or a ``VirtualCamera``.
 
-    def __init__(self, hub: SignalHub, camera: CameraDevice, *, sequencer: object | None = None, prefix: str = ""):
+    MULTI-TRIGGER per cycle (``frames_per_cycle``).  One ``shot()`` reads
+    ``frames_per_cycle`` frames -- ONE per camera (emCCD) trigger in the running
+    pulse -- and publishes each as its own signal ``frame_0``, ``frame_1``, ... (the
+    first is also published as ``frame`` for back-compat / the default 2D panel).  A
+    pulse that triggers the camera TWICE (e.g. a release-recapture / two-readout "T"
+    sequence) must set ``frames_per_cycle=2``; otherwise ``acquire(1)`` reads only
+    the FIRST trigger's frame each cycle and the second is dropped -- which is why a
+    single-frame feed always shows the first emCCD image.  Put ``value = frame_0`` on
+    one panel and ``value = frame_1`` on another to watch the two triggers side by
+    side.  (``frames_per_cycle`` must match the camera-trigger count per cycle so the
+    per-trigger assignment stays phase-aligned; for a feed that FIRES the sequence,
+    ``acquire`` enforces frames == trigger count.)"""
+
+    def __init__(self, hub: SignalHub, camera: CameraDevice, *, sequencer: object | None = None,
+                 frames_per_cycle: int = 1, prefix: str = ""):
         super().__init__(hub, prefix=prefix)
         self.camera = camera
         self.sequencer = sequencer
+        self.frames_per_cycle = max(1, int(frames_per_cycle))
 
     def shot(self) -> dict[str, object]:
-        frame = self.camera.acquire(1, sequencer=self.sequencer, stop=self._stop)[-1]
-        return {"frame": np.asarray(frame, dtype=float)}
+        n = max(1, int(self.frames_per_cycle))
+        frames = self.camera.acquire(n, sequencer=self.sequencer, stop=self._stop)
+        out: dict[str, object] = {f"frame_{i}": np.asarray(f, dtype=float) for i, f in enumerate(frames)}
+        out["frame"] = out["frame_0"]   # back-compat + default 2D panel: first trigger
+        return out
 
     def published_signals(self) -> frozenset:
-        return frozenset({self.prefix + "frame"})
+        n = max(1, int(self.frames_per_cycle))
+        keys = ["frame"] + [f"frame_{i}" for i in range(n)]
+        return frozenset(self.prefix + key for key in keys)
 
     def acquisition_parameters(self) -> dict[str, object]:
         """The acquisition layer speaks PLOT coordinates: the spatial parameter is
@@ -378,8 +395,12 @@ class CameraFrameFeed(ExperimentFeed):
         sensor pixels -- the SAME shape the plot's selector/zoom yields -- NOT the
         camera's device-format ``[x, w, y, h]`` sub-array (that conversion is hidden
         in ``set_acquisition_parameters``).  ``region`` reflects the camera's
-        ACTUALLY-applied window (``camera.roi`` read-back), expressed as endpoints."""
-        params: dict[str, object] = {"exposure": float(self.camera.exposure)}
+        ACTUALLY-applied window (``camera.roi`` read-back), expressed as endpoints.
+        ``frames_per_cycle`` = camera triggers (frames) to read per cycle."""
+        params: dict[str, object] = {
+            "exposure": float(self.camera.exposure),
+            "frames_per_cycle": int(self.frames_per_cycle),
+        }
         roi = self.camera.roi   # device window (x, w, y, h) or None; the snapped read-back
         if roi is not None:
             x, w, y, h = (int(v) for v in roi)
@@ -387,6 +408,8 @@ class CameraFrameFeed(ExperimentFeed):
         return params
 
     def set_acquisition_parameters(self, **values) -> None:
+        if "frames_per_cycle" in values:
+            self.frames_per_cycle = max(1, int(values["frames_per_cycle"]))   # feed-side, not a camera prop
         kw: dict[str, object] = {}
         if "exposure" in values:
             kw["exposure"] = float(values["exposure"])
