@@ -490,6 +490,23 @@ class ReadoutSubsystem(ExperimentSubsystem):
 
         return discovered_specs(self)
 
+    def processor_specs(self) -> list:
+        """Auto-discovered catalog of one-shot DATA-PROCESSING actions a GUI can run.
+
+        The discrete sibling of :meth:`measurement_specs`: every ``@processor``
+        factory in ``operations/processors/`` (the built-in per-site fidelity
+        characterization lives there) plus anything a notebook registered via
+        ``register_processor(...)``.  Each factory receives THIS subsystem, so its
+        ``run(ctx)`` DRIVES the subsystem's own analysis (e.g.
+        :meth:`characterize_from_dir`) rather than re-implementing it, and returns a
+        ``{signal_name: value}`` dict the host publishes to the SignalHub.  Drop a
+        new module into that package and it appears here (and in the console's Add
+        Panel "Data processing" group) automatically."""
+
+        from ..operations.processor_registry import discovered_processor_specs
+
+        return discovered_processor_specs(self)
+
     # ------------------------------------------------------------- persistence
     def load(self, path: str | Path) -> TrapCalibration:
         return self._session.load_calibration(path)

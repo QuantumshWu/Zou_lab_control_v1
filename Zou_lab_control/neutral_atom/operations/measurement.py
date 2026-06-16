@@ -55,6 +55,8 @@ class ParamDecl:
                       ``unit``.
     ``"bool"``        a flag (checkbox)
     ``"choice"``      one of ``choices`` (a combo box)
+    ``"text"``        a free string (a line edit) -- e.g. a folder path or a label;
+                      taken verbatim, NEVER ``eval``'d (lo/hi/choices ignored)
 
     ``required`` marks a parameter a GUI must highlight when missing.  No value
     here is ever ``eval``'d -- the spec consumer validates/coerces by ``kind``.
@@ -73,9 +75,9 @@ class ParamDecl:
 
     def __post_init__(self) -> None:
         kind = str(self.kind).lower()
-        if kind not in ("float", "int", "axis_range", "bool", "choice"):
+        if kind not in ("float", "int", "axis_range", "bool", "choice", "text"):
             raise ValueError(
-                f"ParamDecl.kind must be one of float/int/axis_range/bool/choice, got {self.kind!r}."
+                f"ParamDecl.kind must be one of float/int/axis_range/bool/choice/text, got {self.kind!r}."
             )
         object.__setattr__(self, "kind", kind)
         object.__setattr__(self, "key", str(self.key))

@@ -1,0 +1,77 @@
+"""Per-site readout-fidelity characterization as a one-shot data-processing action.
+
+This is the user's Jupyter flow -- grab/read grouped frames, characterize per-site
+readout fidelity, get a pile of numbers + per-site arrays -- surfaced as a
+:class:`ProcessorSpec` so the task console can run it from a panel and publish its
+results to the shared SignalHub.  ``run`` DRIVES
+``ReadoutSubsystem.characterize_from_dir`` (which itself extracts per-site signals
+through the current calibration's box/PSF method and runs the held-out
+characterization in ``operations.fidelity``); it re-implements NO math and reads no
+simulation ground truth -- the only data source is a saved frames folder, so a
+virtual run (``na.write_virtual_run`` output) and a real run traverse the identical
+path, differing only in who wrote the frames.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+
+from ..processor import ParamDecl, ProcessorContext, ProcessorSpec
+from ..processor_registry import processor
+
+
+@processor(order=10)
+def readout_fidelity(readout) -> ProcessorSpec:
+    """Characterize per-site readout fidelity from a saved frames folder.
+
+    Publishes per-site arrays (``fidelity_site``, ``fidelity_threshold``) for a
+    ``sites`` map and the scalar summary (aggregate / mean / min fidelity, ...) for
+    the panel's numeric pane.  Writes the trained thresholds back into the session
+    calibration when ``store_thresholds`` is set."""
+
+    params = (
+        ParamDecl("data_dir", "Frames folder", "text", default="",
+                  required=True, tooltip="Folder of saved frames (na.write_virtual_run output, or a real run)."),
+        ParamDecl("prefix", "Frame prefix", "text", default="img"),
+        ParamDecl("shots_per_group", "Shots/group", "int", default=4, lo=2, hi=64),
+        ParamDecl("short_shot", "Short-shot index", "int", default=3, lo=0, hi=63),
+        ParamDecl("train_fraction", "Train fraction", "float", default=0.9, lo=0.5, hi=0.99),
+        ParamDecl("seed", "Seed", "int", default=0, lo=0, hi=1_000_000),
+        ParamDecl("store_thresholds", "Write thresholds back", "bool", default=True),
+    )
+
+    def run(ctx: ProcessorContext) -> dict:
+        p = ctx.params
+        report = ctx.readout.characterize_from_dir(
+            str(p["data_dir"]),
+            prefix=str(p.get("prefix", "img")),
+            shots_per_group=int(p["shots_per_group"]),
+            short_shot=int(p["short_shot"]),
+            train_fraction=float(p["train_fraction"]),
+            seed=int(p["seed"]),
+            store_thresholds=bool(p["store_thresholds"]),
+            save=False,
+        )
+        out: dict = {
+            "fidelity_site": np.asarray(report.site_fidelities, dtype=float),
+            "fidelity_threshold": np.asarray(report.thresholds, dtype=float),
+        }
+        # report.summary() is all scalars -> the numeric pane (single source: the
+        # report owns these names, we just republish them).
+        out.update({str(k): float(v) for k, v in report.summary().items()})
+        return out
+
+    summary_keys = (
+        "n_sites", "n_groups", "aggregate_fidelity", "global_fidelity",
+        "mean_site_fidelity", "min_site_fidelity", "ambiguous_fraction",
+    )
+    return ProcessorSpec(
+        name="Readout fidelity",
+        params=params,
+        run=run,
+        result_keys=("fidelity_site", "fidelity_threshold") + summary_keys,
+        summary_keys=summary_keys,
+        default_kind="sites",            # per-site fidelity map (the existing atom kind)
+        default_value_key="fidelity_site",
+        metadata={"reads_frames": "saved_dir"},
+    )
