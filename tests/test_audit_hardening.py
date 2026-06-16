@@ -177,7 +177,7 @@ def _fake_dcam_module():
     )
     DCAMPROP = ns(
         TRIGGERSOURCE=ns(EXTERNAL=2), TRIGGERACTIVE=ns(EDGE=1),
-        TRIGGERPOLARITY=ns(POSITIVE=1), MODE=ns(ON=1),
+        TRIGGERPOLARITY=ns(POSITIVE=1), MODE=ns(ON=1, OFF=0),
     )
     return ns(DCAM_IDPROP=DCAM_IDPROP, DCAMPROP=DCAMPROP)
 
@@ -198,6 +198,16 @@ class _FakeDcam:
         if idprop == self._clamp:
             return self._vals.get(idprop, 0) + 1   # substituted/clamped value
         return self._vals.get(idprop, 0)
+
+    def prop_getattr(self, idprop):
+        # full sensor 2304, sub-array step 4 (the qCMOS hardware grid)
+        return types.SimpleNamespace(valuemin=0.0, valuemax=2304.0, valuestep=4.0)
+
+    def prop_setgetvalue(self, idprop, value, option=0):
+        if idprop == self._reject:
+            return False
+        self._vals[idprop] = value      # already snapped by the adapter; echo it back
+        return float(value)
 
     def lasterr(self):
         return "DCAMERR_FAKE"

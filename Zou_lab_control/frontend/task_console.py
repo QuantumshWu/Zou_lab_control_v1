@@ -1853,22 +1853,22 @@ class PanelEditor(QtWidgets.QWidget):
         self._df = None
         self.fill_limits()
         # confocal-style auto-range: interacting with this (interactive) Edit plot
-        # fills the source's parameter that the axes represent --
-        #   * MEASUREMENT panel: the scan x-range (1D scan param);
-        #   * camera-frame 2D panel: the camera ROI (the axes ARE pixel coords).
-        # Confocal binds the SAME callback to BOTH the zoom/scroll AND the area
-        # selector: ZOOM/PAN updates the range from the current view limits, and
-        # the area selector OVERRIDES that when one is drawn (precedence handled in
-        # the writeback).  So scroll-zoom alone narrows the next acquisition; a
-        # drag-rectangle pins it exactly.  (Wiring only the area selector -- the bug
-        # this fixes -- meant zoom did nothing.)
+        # writes the region the user marked back to the source's parameters.  The
+        # selector / zoom is a GENERIC interface -- it only ever yields the
+        # rectangle (endpoints) / view limits in plot coords; the SOURCE converts
+        # that to its own format (a measurement -> scan range; a camera feed ->
+        # ROI; a 2-D scan -> axis ranges), so no device shape leaks into the GUI.
+        # The SAME callback is bound to BOTH the zoom/scroll AND the area selector:
+        # ZOOM/PAN updates from the view limits, the area selector OVERRIDES when
+        # drawn (precedence in the writeback).  (Wiring only the area selector --
+        # the earlier bug -- meant zoom did nothing.)
         area = getattr(self._plotter, "area", None)
         zoom = getattr(self._plotter, "zoom", None)
         writeback = None
         if self.meas_panel is not None:
             writeback = self._read_scan_range
-        elif kind == "2d" and "roi" in self._feed_widgets:
-            writeback = self._read_roi
+        elif kind == "2d" and self._feed is not None:
+            writeback = self._read_region
         if writeback is not None:
             if area is not None:
                 area.callback = writeback
@@ -1926,27 +1926,34 @@ class PanelEditor(QtWidgets.QWidget):
         if self.meas_panel.set_axis_range(x1, x2):
             self.status.setText(f"scan range set from view: {x1:.4g} … {x2:.4g}")
 
-    def _read_roi(self) -> None:
-        """Confocal ``_read_range`` for a camera-frame 2D panel: ZOOM/PAN or an
-        area SELECTION on the image fills the camera's ROI field.  The image axes
-        ARE the camera's pixel coordinates (``_build_plot`` builds them from the
-        feed's ROI), so the current view box (or the drawn rectangle, which
-        overrides it) maps STRAIGHT back to a new ROI ``[x, w, y, h]`` -- scroll to
-        zoom in / drag a feature -> Apply -> the camera re-arms on just that
-        window.  No-op without a ROI field or a degenerate view."""
+    def _read_region(self) -> None:
+        """Confocal ``_read_range`` for a 2D panel, GENERIC over the source.
+
+        ZOOM/PAN or an area SELECTION yields the marked rectangle as endpoints
+        (x_min, x_max, y_min, y_max) in the panel's axis coordinates (the area
+        selection overrides the view box when drawn).  Those ENDPOINTS -- the only
+        thing the selector knows -- are handed to the producing source via
+        ``region_to_acquisition_parameters``; the SOURCE converts them to its own
+        Acquisition parameters (a camera feed -> a ROI rectangle; a 2-D scan ->
+        axis ranges).  Whatever fields it names are filled in the Edit form, then
+        Apply pushes them.  The frontend encodes NO device-specific shape."""
         if self._feed is None or self._plotter is None:
             return
-        edit = self._feed_widgets.get("roi")
-        if edit is None:
+        convert = getattr(self._feed, "region_to_acquisition_parameters", None)
+        if convert is None:
             return
         x1, x2, y1, y2 = self._selected_rect()
         if x1 is None:
             return
-        roi = [int(round(x1)), int(round(x2 - x1)), int(round(y1)), int(round(y2 - y1))]
-        if roi[1] <= 0 or roi[3] <= 0:        # a degenerate (zero-area) view -- ignore
-            return
-        edit.setText(_py_to_text(roi))
-        self.status.setText(f"ROI set from view: {roi} — Apply to re-arm the camera")
+        params = convert(x1, x2, y1, y2) or {}
+        filled = {}
+        for name, value in params.items():
+            edit = self._feed_widgets.get(name)
+            if edit is not None:
+                edit.setText(_py_to_text(value))
+                filled[name] = value
+        if filled:
+            self.status.setText(f"region from view: {filled} — Apply to use it")
 
     def refresh_feed_now_labels(self) -> None:
         """Update the 'now: <value>' references beside each Acquisition field to the

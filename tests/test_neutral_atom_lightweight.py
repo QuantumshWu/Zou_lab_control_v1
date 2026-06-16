@@ -4385,6 +4385,14 @@ def test_qcmos_camera_acquire_uses_dcam_and_expanded_sequencer(monkeypatch):
                     return v
             return False
 
+        def prop_getattr(self, prop):
+            # full sensor 2304, sub-array step 4 (the qCMOS hardware grid)
+            return types.SimpleNamespace(valuemin=0.0, valuemax=2304.0, valuestep=4.0)
+
+        def prop_setgetvalue(self, prop, value, option=0):
+            self.props.append((prop, value))   # already snapped by the adapter; echo it
+            return float(value)
+
         def buf_alloc(self, frames):
             self.frames = int(frames)
             return True
@@ -4429,7 +4437,7 @@ def test_qcmos_camera_acquire_uses_dcam_and_expanded_sequencer(monkeypatch):
             TRIGGERSOURCE=types.SimpleNamespace(EXTERNAL="EXTERNAL"),
             TRIGGERACTIVE=types.SimpleNamespace(EDGE="EDGE"),
             TRIGGERPOLARITY=types.SimpleNamespace(POSITIVE="POSITIVE"),
-            MODE=types.SimpleNamespace(ON="ON"),
+            MODE=types.SimpleNamespace(ON="ON", OFF="OFF"),
         ),
     )
     monkeypatch.setitem(sys.modules, "fake_dcam_for_qcmos_test", fake_module)

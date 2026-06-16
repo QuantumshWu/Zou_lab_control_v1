@@ -110,6 +110,26 @@ Key fixed facts:
   `ch03 probe (N15)`, `ch11 emCCD (M13)`.
 - Four 10-bit analog buses: `da_dipole`, `da_bias_y`, `da_bias_x`, `da_bias_z`.
 
+**Plot region → device, coordinate contract (who converts what).** A plot's
+selector/zoom is a GENERIC interface: it yields a rectangle as four endpoints
+`(x_min, x_max, y_min, y_max)` in the panel's axis coordinates, and serves EVERY
+2-D panel (a camera frame, a 2-D parameter scan, …). The frontend
+(`PanelEditor._read_region`) never reshapes that into a device format; it hands
+the endpoints to the producing source's `ExperimentFeed.region_to_acquisition_
+parameters(...)`, which OWNS the conversion: `CameraFrameFeed` → `{"roi":
+[x,w,y,h]}` (position+size); a 2-D-scan source would return its axis ranges.
+The **device layer** then adapts to hardware: `QCMOSCamera` SNAPS the requested
+ROI to the camera's sub-array grid (`SUBARRAY*` must be **multiples of 4** — query
+`prop_getattr` step/max), writes it in the safe order (positions→0, then sizes,
+then positions, `SUBARRAYMODE` ON last), and READS BACK the actually-applied
+window via `prop_setgetvalue`; `camera.roi` reports that read-back (not the raw
+request), so `acquisition_parameters()["roi"]`, the 2-D panel axes and the Edit
+`now:` all show the region the camera truly images. An unchecked write would be
+silently clamped → the camera would image the wrong region (the bug this fixed).
+`VirtualCamera` mirrors the same: `configure(roi=...)` snaps (shared
+`devices.base.snap_subarray`) and `acquire()` CROPS to it, so a virtual test
+exercises the SAME ROI path real hardware does (default `roi=None` = full frame).
+
 `prepare` drives SAFE, packs + uploads the BRAM image over JTAG-to-AXI, arms the
 scan banks, then drives LOAD (rising-edge COMMAND, waits `STATUS_LOADED`); it does
 not start. `fire` drives FIRE; only the synchronized rising edge is a start event.

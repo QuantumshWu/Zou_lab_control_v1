@@ -174,4 +174,44 @@ def validate_device_contract(name: str, device: Any) -> None:
         )
 
 
-__all__ = ["BaseDevice", "CameraDevice", "SequencerDevice", "TrapArrayDevice", "validate_device_contract"]
+def snap_subarray(roi, *, step: int, max_w: int, max_h: int):
+    """Snap a REQUESTED sub-array window to a camera's valid sub-array grid.
+
+    A plot selection (scroll / area-select) is in continuous source-pixel
+    coordinates; a real sensor only reads sub-arrays whose origin AND size are
+    multiples of a hardware ``step`` (the Hamamatsu qCMOS requires multiples of
+    4 -- see the DCAM ``SUBARRAY*`` properties), within the sensor.  This is the
+    SINGLE source of truth for that adaptation, so the GUI/measurement layer can
+    stay in plain plot coordinates and every camera (real or virtual) snaps the
+    SAME way -- a window written raw would otherwise be silently clamped by the
+    hardware and the camera would image the wrong region.
+
+    ``roi`` is ``(x, width, y, height)``.  Returns the snapped ``(x, w, y, h)``
+    with every field a multiple of ``step``, ``w``/``h`` >= ``step`` and the
+    window fully inside ``(max_w, max_h)``.
+    """
+    step = int(step)
+    if step <= 0:
+        step = 1
+    x, w, y, h = (int(round(float(v))) for v in roi)
+
+    def _snap(v: int) -> int:
+        return int(round(v / step)) * step
+
+    max_w = (int(max_w) // step) * step
+    max_h = (int(max_h) // step) * step
+    w = min(max(step, _snap(w)), max_w)
+    h = min(max(step, _snap(h)), max_h)
+    x = min(max(0, _snap(x)), max_w - w)
+    y = min(max(0, _snap(y)), max_h - h)
+    return (x, w, y, h)
+
+
+__all__ = [
+    "BaseDevice",
+    "CameraDevice",
+    "SequencerDevice",
+    "TrapArrayDevice",
+    "snap_subarray",
+    "validate_device_contract",
+]

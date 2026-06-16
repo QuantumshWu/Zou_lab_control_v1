@@ -197,6 +197,136 @@ def test_temperature_feed_start_thread_auto_stops_when_scan_completes():
     assert np.all(np.isfinite(y))
 
 
+# ------------------------------------------------ ROI: plot-coord -> device grid
+
+
+def test_snap_subarray_rounds_to_grid_and_clamps():
+    """The single source of truth for the plot-coord -> device sub-array adaptation:
+    a requested (x, w, y, h) is rounded to the camera's step grid (the qCMOS step
+    is 4) and clamped inside the sensor, so a raw plot selection can never ask for
+    an illegal window the hardware would silently clamp."""
+    from Zou_lab_control.neutral_atom.devices.base import snap_subarray
+    assert snap_subarray([10, 20, 6, 16], step=4, max_w=80, max_h=64) == (8, 20, 8, 16)
+    assert snap_subarray([1670, 20, 1166, 20], step=4, max_w=2304, max_h=2304) == (1672, 20, 1168, 20)
+    # oversize window clamps so x+w <= max_w and y+h <= max_h, staying on the grid
+    x, w, y, h = snap_subarray([70, 40, 60, 40], step=4, max_w=80, max_h=64)
+    assert (x, w, y, h) == (40, 40, 24, 40)
+    assert x + w <= 80 and y + h <= 64 and all(v % 4 == 0 for v in (x, w, y, h))
+
+
+def test_virtual_camera_honors_roi_snaps_and_crops():
+    """The virtual camera mirrors the real sub-array: configure(roi=...) snaps the
+    request to the step grid, reports the ACTUALLY-applied window via .roi, and
+    acquire() CROPS the frame to it -- so the virtual path exercises the SAME ROI
+    contract a real qCMOS does (a ROI bug shows up in a virtual test; switching to
+    real changes only connect())."""
+    exp = na.connect("virtual", sitemap={"grid_shape": (2, 3), "image_shape": (64, 80)})
+    cam = exp.devices.camera
+    assert cam.roi is None                                  # full frame by default (unchanged)
+    cam.configure(roi=[10, 20, 6, 16])                      # x=10, y=6 are NOT multiples of 4
+    assert cam.roi == (8, 20, 8, 16)                        # snapped to the grid, reported back
+    frame = cam.acquire(1)[-1]
+    assert frame.shape == (16, 20)                          # actually CROPPED to (h, w) of the ROI
+
+
+def test_qcmos_subarray_snaps_writes_and_reads_back():
+    """The real qCMOS adapter snaps the requested ROI to the hardware grid (queried
+    via prop_getattr step/max), writes the sub-array in the safe order, and reports
+    the value the camera ACTUALLY applied (prop_setgetvalue read-back) via .roi --
+    so a raw, non-aligned plot selection images the snapped region, not whatever the
+    hardware silently clamps to.  Only the lowest layer (the DCAM device) is faked."""
+    import sys
+    import types
+    from Zou_lab_control.neutral_atom.devices.qcmos import QCMOSCamera, QCMOSConfig
+
+    ids = ["EXPOSURETIME", "TRIGGERSOURCE", "TRIGGERACTIVE", "TRIGGERPOLARITY", "READOUTSPEED",
+           "SENSORMODE", "TRIGGER_GLOBALEXPOSURE", "SUBARRAYMODE",
+           "SUBARRAYHSIZE", "SUBARRAYHPOS", "SUBARRAYVSIZE", "SUBARRAYVPOS"]
+    IDPROP = types.SimpleNamespace(**{name: i for i, name in enumerate(ids)})
+    SUBARRAY_SIZE_IDS = {IDPROP.SUBARRAYHSIZE, IDPROP.SUBARRAYVSIZE}
+    SUBARRAY_POS_IDS = {IDPROP.SUBARRAYHPOS, IDPROP.SUBARRAYVPOS}
+    DCAMPROP = types.SimpleNamespace(
+        MODE=types.SimpleNamespace(ON=2, OFF=1),
+        TRIGGERSOURCE=types.SimpleNamespace(EXTERNAL=2),
+        TRIGGERACTIVE=types.SimpleNamespace(EDGE=1),
+        TRIGGERPOLARITY=types.SimpleNamespace(POSITIVE=2),
+    )
+
+    class _Attr:
+        valuemin, valuemax, valuestep = 0.0, 2304.0, 4.0   # sensor 2304, step 4 (qCMOS)
+
+    class _Err:
+        def is_timeout(self):
+            return False
+
+    class _FakeDcam:
+        def __init__(self, _index=0):
+            self._store = {}
+
+        def dev_open(self):
+            return True
+
+        def lasterr(self):
+            return _Err()
+
+        def prop_setvalue(self, idprop, value):
+            self._store[idprop] = value
+            return True
+
+        def prop_getvalue(self, idprop):
+            return self._store.get(idprop, 0.0)
+
+        def prop_getattr(self, idprop):
+            return _Attr()
+
+        def prop_setgetvalue(self, idprop, value, option=0):
+            # faithful hardware: snap sub-array writes to the step-4 grid
+            if idprop in SUBARRAY_SIZE_IDS or idprop in SUBARRAY_POS_IDS:
+                value = int(round(value / 4)) * 4
+            self._store[idprop] = value
+            return float(value)
+
+        def dev_close(self):
+            return None
+
+    fake = types.ModuleType("zlc_fake_dcam")
+    fake.Dcamapi = types.SimpleNamespace(init=lambda: True, uninit=lambda: None)
+    fake.Dcam = _FakeDcam
+    fake.DCAM_IDPROP = IDPROP
+    fake.DCAMPROP = DCAMPROP
+    sys.modules["zlc_fake_dcam"] = fake
+    try:
+        cam = QCMOSCamera(QCMOSConfig(exposure=0.02, roi=[1670, 20, 1166, 20]),
+                          dcam_module="zlc_fake_dcam")
+        cam.open()
+        # requested x=1670, y=1166 are NOT multiples of 4 -> snapped + read back
+        assert cam.roi == (1672, 20, 1168, 20)
+        # a runtime change to another non-aligned window re-snaps + re-reports
+        cam.configure(roi=[101, 33, 201, 17])
+        assert cam.roi == (100, 32, 200, 16)
+    finally:
+        sys.modules.pop("zlc_fake_dcam", None)
+
+
+def test_region_to_acquisition_parameters_is_owned_by_the_source():
+    """The plot selector is a GENERIC interface -- it yields a rectangle as four
+    endpoints (x_min, x_max, y_min, y_max) in plot coords and knows nothing about
+    cameras.  Each SOURCE converts that rectangle to its own params: a camera feed
+    maps it to a ROI rect (position+size); a source with no spatial region returns
+    {} (the selection is a no-op for it).  So the frontend never encodes a
+    device-specific shape -- the conversion lives in the acquisition layer."""
+    exp = na.connect("virtual", sitemap={"grid_shape": (2, 3), "image_shape": (64, 80)})
+    hub = SignalHub()
+    cam_feed = na.CameraFrameFeed(hub, exp.devices.camera)
+    # endpoints (x:10..30, y:6..22) -> ROI [x, w, y, h] = [10, 20, 6, 16]
+    assert cam_feed.region_to_acquisition_parameters(10, 30, 6, 22) == {"roi": [10, 20, 6, 16]}
+    # endpoints come in any order -> still a well-formed (sorted) rectangle
+    assert cam_feed.region_to_acquisition_parameters(30, 10, 22, 6) == {"roi": [10, 20, 6, 16]}
+    # a non-spatial source (loading analysis) has no rectangle param -> no-op
+    load_feed = na.LoadingFeed(hub, exp.devices.camera, grid_shape=(2, 3))
+    assert load_feed.region_to_acquisition_parameters(10, 30, 6, 22) == {}
+
+
 # ------------------------------------------------ acquisition-parameter protocol
 
 

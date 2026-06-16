@@ -12,7 +12,7 @@ import numpy as np
 
 from ..core.analysis import finite_float, grid_shape_tuple, positive_int
 from ..core.utils import site_index
-from .base import CameraDevice, SequencerDevice, TrapArrayDevice
+from .base import CameraDevice, SequencerDevice, TrapArrayDevice, snap_subarray
 from ..timing import (
     DEFAULT_CAMERA_TRIGGER_CHANNELS,
     PulseSequence,
@@ -211,11 +211,19 @@ class VirtualTrapArray(TrapArrayDevice):
 
 
 class VirtualCamera(CameraDevice):
-    def __init__(self, trap_array: VirtualTrapArray, exposure: float = 20e-3, timeout: float = 2.0):
+    def __init__(self, trap_array: VirtualTrapArray, exposure: float = 20e-3, timeout: float = 2.0,
+                 subarray_step: int = 4):
         self.trap_array = trap_array
         self._exposure = positive_float(exposure, "exposure")
         self.timeout = positive_float(timeout, "timeout")
         self.last_sequence: str | None = None
+        # Mirror the real qCMOS sub-array: a ROI is snapped to a hardware grid
+        # (the Hamamatsu step is 4) and the rendered frame is CROPPED to it, so the
+        # virtual path exercises the SAME ROI contract a real camera does -- a ROI
+        # bug then shows up in a virtual test, and switching to real changes only
+        # connect().  None = full frame (the default; all existing behaviour).
+        self.subarray_step = int(subarray_step)
+        self._roi: tuple[int, int, int, int] | None = None
 
     @property
     def exposure(self) -> float:
@@ -225,9 +233,20 @@ class VirtualCamera(CameraDevice):
     def exposure(self, value: float) -> None:
         self._exposure = positive_float(value, "exposure")
 
-    def configure(self, *, exposure: float | None = None, **_) -> None:
+    @property
+    def roi(self) -> tuple[int, int, int, int] | None:
+        # the ACTUALLY-applied (snapped) window, like the real camera's read-back
+        return self._roi
+
+    def configure(self, *, exposure: float | None = None, roi: object = None, **_) -> None:
         if exposure is not None:
             self.exposure = positive_float(exposure, "exposure")
+        if roi is not None:
+            if roi in ("", "None"):
+                self._roi = None
+            else:
+                h, w = self.trap_array.image_shape
+                self._roi = snap_subarray(tuple(roi), step=self.subarray_step, max_w=w, max_h=h)
 
     def acquire(
         self,
@@ -292,6 +311,11 @@ class VirtualCamera(CameraDevice):
             elif trap_off_per_frame[frame_index] > 0.0:
                 self.trap_array.apply_recapture_loss(trap_off_per_frame[frame_index])
             image = self.trap_array.render_image(exposure=exposure, all_sites=all_sites)
+            if self._roi is not None:
+                # crop to the applied sub-array, exactly as a real camera reads out
+                # only its ROI -- so the displayed frame IS the ROI region (x, w, y, h)
+                x, w, y, h = self._roi
+                image = image[y:y + h, x:x + w]
             images.append(image)
         if sequencer is not None and sequence is not None:
             wait_done = getattr(sequencer, "wait_done", None)

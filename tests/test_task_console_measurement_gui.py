@@ -356,11 +356,13 @@ def test_edit_area_select_writes_camera_roi_and_apply_restarts_monitor():
     re-acquires under the new ROI."""
     console, feed, cam, card, editor = _camera_console()
     try:
-        # the selector callback is the ROI writeback, NOT the scan-range one,
-        # and it is bound to BOTH the area selector and the zoom handler
-        assert editor._plotter.area.callback.__name__ == "_read_roi"
-        assert editor._plotter.zoom.callback.__name__ == "_read_roi"
-        # a rectangle selected in pixel (= ROI) coordinates -> ROI [x, w, y, h]
+        # the selector callback is the GENERIC region writeback (not a ROI-specific
+        # one), bound to BOTH the area selector and the zoom handler; the FEED turns
+        # the rectangle endpoints into its own {"roi": [...]} param
+        assert editor._plotter.area.callback.__name__ == "_read_region"
+        assert editor._plotter.zoom.callback.__name__ == "_read_region"
+        # a rectangle selected in pixel coords (endpoints x:1670..1690, y:1166..1186)
+        # -> the camera feed maps it to ROI [x, w, y, h]
         editor._plotter.area.range = [1670.0, 1690.0, 1166.0, 1186.0]
         editor._plotter.area.callback()
         assert editor._feed_widgets["roi"].text() == "[1670, 20, 1166, 20]"

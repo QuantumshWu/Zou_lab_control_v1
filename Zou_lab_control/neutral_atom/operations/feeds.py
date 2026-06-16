@@ -173,6 +173,21 @@ class ExperimentFeed:
         if pending:
             self.set_acquisition_parameters(**pending)
 
+    # ----------------------------------------------- plot region -> source params
+    def region_to_acquisition_parameters(self, x_min, x_max, y_min, y_max) -> dict[str, object]:
+        """Convert a region the user marked on the plot into THIS source's
+        acquisition parameters.
+
+        The plot's selector / zoom is a GENERIC interface: it always yields a
+        rectangle as four endpoints ``(x_min, x_max, y_min, y_max)`` in the panel's
+        axis units (the same coordinates the axes show) -- it knows nothing about
+        cameras, ROIs or scan grids, and it serves every 2-D panel (a camera frame,
+        a 2-D parameter scan, ...).  Each source OWNS the conversion of that
+        rectangle into its own parameter format here, so the frontend never bakes
+        in a device-specific shape.  Default: a source with no spatial region
+        returns ``{}`` (the selection is a no-op for it)."""
+        return {}
+
 
 class LoadingFeed(ExperimentFeed):
     """Atom-loading experiment producer over the :class:`CameraDevice` contract.
@@ -350,6 +365,17 @@ class CameraFrameFeed(ExperimentFeed):
             kw["roi"] = None if roi in (None, "", "None") else list(roi)
         if kw:
             self.camera.configure(**kw)   # live on the camera -- no rebuild
+
+    def region_to_acquisition_parameters(self, x_min, x_max, y_min, y_max) -> dict[str, object]:
+        """A camera's spatial region IS its ROI.  Map the plot rectangle (sensor
+        pixels) to the ROI's ``(x, width, y, height)`` -- position+size, the
+        ACQUISITION-LAYER format.  The camera device then snaps this to its own
+        sub-array grid (the qCMOS step-4 SUBARRAY*), so neither the frontend nor
+        this feed encodes a hardware-specific constraint -- the frontend only ever
+        hands over the rectangle endpoints."""
+        x0, x1 = sorted((float(x_min), float(x_max)))
+        y0, y1 = sorted((float(y_min), float(y_max)))
+        return {"roi": [int(round(x0)), int(round(x1 - x0)), int(round(y0)), int(round(y1 - y0))]}
 
 
 class ScannedMeasurementFeed(ExperimentFeed):

@@ -11,7 +11,7 @@ import numpy as np
 
 from ..core.analysis import finite_float, positive_int
 from ..timing import DEFAULT_CAMERA_TRIGGER_CHANNELS, exposure_from_sequence, imaging_channel_kwargs
-from .base import AcquisitionCancelled, CameraDevice
+from .base import AcquisitionCancelled, CameraDevice, snap_subarray
 from .sequencer import PulseController, finite_frame_sequence
 
 
@@ -62,6 +62,12 @@ class QCMOSCamera(CameraDevice):
         self._module = None
         self._api = None
         self._dcam = None
+        # The sub-array the camera ACTUALLY applied (read back from DCAM after the
+        # hardware snaps the request to its valid grid).  None until an open camera
+        # has applied a ROI; the `roi` property reports this -- not the raw request
+        # -- so a consumer (the Edit 'now:' reference, the 2D panel's axes) reflects
+        # the region truly being imaged.
+        self._applied_roi: tuple[int, int, int, int] | None = None
 
     @property
     def exposure(self) -> float:
@@ -69,6 +75,10 @@ class QCMOSCamera(CameraDevice):
 
     @property
     def roi(self) -> tuple[int, int, int, int] | None:
+        # Report what the camera is ACTUALLY reading out (post hardware snap) when
+        # open; the requested config ROI only when not yet applied.
+        if self._applied_roi is not None:
+            return self._applied_roi
         return self.config.roi
 
     def configure(self, *, exposure: float | None = None, readout_speed: int | None = None, roi: Sequence[int] | None | object = None) -> None:
@@ -236,13 +246,65 @@ class QCMOSCamera(CameraDevice):
             self._set_prop(mod.DCAM_IDPROP.SENSORMODE, self.config.sensor_mode, "sensor_mode", verify=True)
         if self.config.trigger_global_exposure is not None:
             self._set_prop(mod.DCAM_IDPROP.TRIGGER_GLOBALEXPOSURE, self.config.trigger_global_exposure, "trigger_global_exposure", verify=True)
-        if self.config.roi is not None:
-            x, width, y, height = self.config.roi
-            self._set_prop(mod.DCAM_IDPROP.SUBARRAYMODE, mod.DCAMPROP.MODE.ON, "subarray_mode")
-            self._set_prop(mod.DCAM_IDPROP.SUBARRAYHSIZE, width, "subarray_hsize")
-            self._set_prop(mod.DCAM_IDPROP.SUBARRAYHPOS, x, "subarray_hpos")
-            self._set_prop(mod.DCAM_IDPROP.SUBARRAYVSIZE, height, "subarray_vsize")
-            self._set_prop(mod.DCAM_IDPROP.SUBARRAYVPOS, y, "subarray_vpos")
+        self._apply_subarray()
+
+    def _subarray_grid(self) -> tuple[int, int, int, int]:
+        """The camera's valid sub-array grid (step, max_w, max_h) queried with
+        SUBARRAYMODE OFF, where HSIZE/VSIZE max report the FULL sensor.  Falls back
+        to a step of 4 (the qCMOS hardware requirement) if the attribute query
+        is unavailable, so a request is always snapped to a legal window."""
+        mod, dcam = self._module, self._dcam
+        self._set_prop(mod.DCAM_IDPROP.SUBARRAYMODE, mod.DCAMPROP.MODE.OFF, "subarray_mode")
+
+        def _attr(idprop, field, default):
+            attr = dcam.prop_getattr(idprop)
+            if attr is False:
+                return default
+            value = getattr(attr, field, 0.0)
+            return int(value) if value else default
+
+        step = _attr(mod.DCAM_IDPROP.SUBARRAYHSIZE, "valuestep", 4) or 4
+        max_w = _attr(mod.DCAM_IDPROP.SUBARRAYHSIZE, "valuemax", 0)
+        max_h = _attr(mod.DCAM_IDPROP.SUBARRAYVSIZE, "valuemax", 0)
+        return step, max_w, max_h
+
+    def _set_get_prop(self, idprop, value, name: str) -> int:
+        """Write a sub-array property and return the value the camera ACTUALLY
+        applied (DCAM ``prop_setgetvalue`` snaps to the hardware grid and reports
+        it back), failing loudly on rejection -- so a clamped ROI is observed here
+        rather than silently imaging the wrong region."""
+        actual = self._dcam.prop_setgetvalue(idprop, value)
+        if actual is False:
+            raise RuntimeError(f"qCMOS rejected {name} = {value}: {self._dcam.lasterr()}")
+        return int(round(float(actual)))
+
+    def _apply_subarray(self) -> None:
+        """Apply the requested ROI as a valid sub-array and record what the camera
+        actually reads out.  The plot/acquisition layer hands a window in raw
+        sensor-pixel coordinates; here it is SNAPPED to the camera's grid
+        (``snap_subarray``) and written in a SAFE ORDER (positions to 0 first, then
+        sizes, then positions) so an intermediate ``pos+size`` never exceeds the
+        sensor, with SUBARRAYMODE ON last.  ``prop_setgetvalue`` gives the camera
+        the final say; the read-back tuple becomes ``self._applied_roi``."""
+        mod = self._module
+        if self.config.roi is None:
+            self._set_prop(mod.DCAM_IDPROP.SUBARRAYMODE, mod.DCAMPROP.MODE.OFF, "subarray_mode")
+            self._applied_roi = None
+            return
+        step, max_w, max_h = self._subarray_grid()
+        x, width, y, height = snap_subarray(
+            self.config.roi, step=step,
+            max_w=max_w or self.config.roi[0] + self.config.roi[1],
+            max_h=max_h or self.config.roi[2] + self.config.roi[3],
+        )
+        self._set_prop(mod.DCAM_IDPROP.SUBARRAYMODE, mod.DCAMPROP.MODE.ON, "subarray_mode")
+        self._set_get_prop(mod.DCAM_IDPROP.SUBARRAYHPOS, 0, "subarray_hpos")
+        self._set_get_prop(mod.DCAM_IDPROP.SUBARRAYVPOS, 0, "subarray_vpos")
+        applied_w = self._set_get_prop(mod.DCAM_IDPROP.SUBARRAYHSIZE, width, "subarray_hsize")
+        applied_h = self._set_get_prop(mod.DCAM_IDPROP.SUBARRAYVSIZE, height, "subarray_vsize")
+        applied_x = self._set_get_prop(mod.DCAM_IDPROP.SUBARRAYHPOS, x, "subarray_hpos")
+        applied_y = self._set_get_prop(mod.DCAM_IDPROP.SUBARRAYVPOS, y, "subarray_vpos")
+        self._applied_roi = (applied_x, applied_w, applied_y, applied_h)
 
     def close(self) -> None:
         if self._dcam is not None:
