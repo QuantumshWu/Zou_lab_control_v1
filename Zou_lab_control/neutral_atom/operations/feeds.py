@@ -247,6 +247,7 @@ class LoadingFeed(ExperimentFeed):
         ema: float = 0.05,
         calibration_frames: int = 4,
         threshold_frames: int = 24,
+        calibrate_now: bool = True,
     ):
         super().__init__(hub, prefix=prefix)
         self.camera = camera
@@ -260,7 +261,14 @@ class LoadingFeed(ExperimentFeed):
         # the feed with edited acquisition parameters.
         self.calibration_frames = int(calibration_frames)
         self.threshold_frames = int(threshold_frames)
-        self._calibrate()
+        # Calibration acquires frames (blocking on a real camera's triggers).  By
+        # default we calibrate eagerly here (notebook/bring-up build a ready feed);
+        # the GUI passes calibrate_now=False so CONSTRUCTION is instant and the first
+        # calibration runs lazily in the acquisition loop's OWN thread (no GUI-thread
+        # acquire / freeze when you Add the live-readout producer).
+        self._calibrated = False
+        if calibrate_now:
+            self._calibrate()
 
     def _calibrate(self) -> None:
         """(Re)build the imaging sequences and self-calibrate from fresh frames:
@@ -287,6 +295,7 @@ class LoadingFeed(ExperimentFeed):
         self.thresholds = np.asarray(estimate_thresholds(samples, self.centers, radius=self.roi_radius), dtype=float)
         self._rate_sites = np.full(self.n_sites, np.nan)
         self._rate = float("nan")
+        self._calibrated = True
 
     def acquisition_parameters(self) -> dict[str, object]:
         """The atom-loading analysis settings this feed applies to camera frames."""
@@ -323,6 +332,10 @@ class LoadingFeed(ExperimentFeed):
                                    sequencer=self.sequencer, stop=self._stop)
 
     def shot(self) -> dict[str, object]:
+        if not self._calibrated:
+            # deferred (calibrate_now=False): the FIRST shot calibrates here, on the
+            # acquisition loop's own thread -- never the GUI thread.
+            self._calibrate()
         frame = self._acquire(1, self._readout_seq)[-1]
         counts = roi_counts(np.asarray(frame, dtype=float), self.centers, radius=self.roi_radius)
         occupied = (counts > self.thresholds).astype(float)

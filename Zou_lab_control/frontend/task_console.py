@@ -2188,6 +2188,7 @@ class TaskConsole(QtWidgets.QWidget):
         feeds: Sequence[object] = (),
         measurements: Sequence[object] = (),
         processors: Sequence[object] = (),
+        session: object | None = None,
         scale: float | None = None,
         window_ratio: float = 0.84,
         window_px: tuple[int, int] | None = None,
@@ -2206,6 +2207,11 @@ class TaskConsole(QtWidgets.QWidget):
         # "Data processing"; picking one creates its result panel + Edit form whose
         # Start runs the action once.
         self.processors = list(processors)
+        # The connected experiment session (optional): with it, Add Panel can build
+        # CONTINUOUS producers from scratch -- e.g. "Live: Loading readout" creates a
+        # LoadingFeed over the session camera so you compose loading-rate / occupancy
+        # monitoring entirely from Add Panel + Edit (no pre-wired feed in the notebook).
+        self.session = session
         self._proc_feeds: list = []     # one-shot ProcessorFeeds kept alive until done
         self._active_proc_panel = None
         self._meas_feed = None          # the ScannedMeasurementFeed of the active run
@@ -2291,6 +2297,10 @@ class TaskConsole(QtWidgets.QWidget):
             self.kind_combo.addItem(f"Measurement: {spec.name}", ("measurement", spec.name))
         for spec in self.processors:
             self.kind_combo.addItem(f"Data processing: {spec.name}", ("processor", spec.name))
+        # CONTINUOUS producers (built from the session camera): the loading-rate
+        # analysis you compose loading-rate / occupancy / site monitoring from.
+        if self.session is not None and hasattr(getattr(self.session, "readout", None), "live_loading_feed"):
+            self.kind_combo.addItem("Live: Loading readout", ("live", "loading"))
         self.kind_combo.setFixedWidth(scaled_px(150, minimum=120))
         add_button = FluentButton("Add Panel", color=ACCENT)
         add_button.clicked.connect(self._add_panel)
@@ -2567,6 +2577,14 @@ class TaskConsole(QtWidgets.QWidget):
                 card = self._ensure_processor_panel(spec)
                 self._edit_card(card)
             return
+        # A continuous live producer (loading readout): build the feed over the
+        # session camera, drop its landing view (the loading-rate monitor), and start
+        # it streaming.  You then freely Add Panel more views (occupancy site map =
+        # value = occupied, raw image = value = frame, per-site rate = value =
+        # rate_sites) wired to the signals it publishes.
+        if isinstance(data, tuple) and len(data) == 2 and data[0] == "live":
+            self._add_live_loading_panel()
+            return
         kind = data or "1d"
         rows = max((c.config.row + c.config.rows for c in self.cards), default=0)
         config = PanelConfig(kind=str(kind), row=rows, col=0, size="1x2")
@@ -2789,6 +2807,40 @@ class TaskConsole(QtWidgets.QWidget):
         elif getattr(feed, "last_error", None):
             panel.set_running(False)
             panel.set_status(f"failed: {feed.last_error}", error=True)
+
+    # --------------------------------------------------- live readout (continuous)
+    def _add_live_loading_panel(self) -> None:
+        """Build the loading-rate producer over the session camera + its landing view.
+
+        Creates a LoadingFeed (calibrated lazily in its OWN thread, so adding it never
+        blocks the GUI), registers it, drops a 'Loading rate' monitor reading
+        ``value = rate``, starts it streaming, and opens that panel's Edit so the
+        grid / exposure / roi_radius / ema are tunable.  You then Add Panel more views
+        yourself -- occupancy site map (``value = occupied``), raw image
+        (``value = frame``), per-site rate (``value = rate_sites``) -- wired to the
+        signals this producer publishes."""
+        if self.session is None:
+            return
+        try:
+            feed = self.session.readout.live_loading_feed(self.hub, calibrate_now=False)
+        except Exception as exc:
+            self._message(f"could not build loading readout: {str(exc).splitlines()[0][:160]}")
+            return
+        self.feeds.append(feed)
+        rows = max((c.config.row + c.config.rows for c in self.cards), default=0)
+        config = PanelConfig(kind="monitor_nodist", title="Loading rate", row=rows, col=0,
+                             size="1x2", source="value = rate", params={"length": 300})
+        card = PanelCard(config, parent=self.board, names_provider=self.hub.names)
+        self._attach_card(card)
+        self._arrange()
+        self._mark_dirty()
+        if not self._timer.isActive():
+            self._timer.start()
+        try:
+            feed.start(rate_hz=getattr(feed, "rate_hz", 5.0))
+        except Exception as exc:
+            self._message(f"loading readout failed to start: {str(exc).splitlines()[0][:160]}")
+        self._edit_card(card)
 
     def _poll_measurement(self) -> None:
         """Called each tick: surface progress, and once the scan completes show
@@ -3037,6 +3089,7 @@ def show_task_console(
     feeds: Sequence[object] = (),
     measurements: Sequence[object] = (),
     processors: Sequence[object] = (),
+    session: object | None = None,
     scale: float | None = None,
     window_ratio: float = 0.84,
     title: str = "TaskConsole@Zou lab",
@@ -3067,7 +3120,7 @@ def show_task_console(
     if state is None and task is not None:
         state = resolve_task_state(task)
     console = TaskConsole(hub=hub, state=state, feeds=feeds, measurements=measurements,
-                          processors=processors, scale=scale, window_ratio=window_ratio)
+                          processors=processors, session=session, scale=scale, window_ratio=window_ratio)
     console._on_close = on_close
     # A passed-in producer feed should stream the moment the window opens -- so the
     # Monitor is live without the caller having to remember feed.start().  start()

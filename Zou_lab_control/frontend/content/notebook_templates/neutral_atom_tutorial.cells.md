@@ -282,6 +282,31 @@ temp_fit = na.fit_temperature(temp_scan.x, temp_scan.y, capture_radius=6e-6)
 temp_fit.summary()   # {'temperature_uK': ~44..50, 'capture_radius_m': 6e-06, 'success': True}
 
 <!-- cell:markdown -->
+## Task 控制台：从零搭建实时监控（loading rate / 占据 / 站点）
+
+task_console 的设计原则是**自由搭建**——看板开出来是空的，你从 **Add Panel** 一路自己搭。把 `session=exp` 传进去（让看板能用相机建连续生产者）+ `measurements` / `processors`，Add Panel 就分成清晰的几类：
+
+- **Live: Loading readout**（连续生产者）：点它 → 建一个 `LoadingFeed`（在它**自己的线程**里惰性标定，不卡界面）+ 一张 “Loading rate” 监视图，开始流式发布 `rate` / `occupied` / `centers` / `rate_sites` / `frame`。**这就是 loading rate 的来源。**
+- 然后**自由加视图**读这些信号：Add Panel → `Plot: Site map`，在 Setting 里把 source 写 `value = occupied`（占据图：圈画在相机帧上，centers 自动取 `centers` 信号）；`Plot: 2D` + `value = frame`（原始图）；`Plot: 1D` + `value = rate_sites`（逐站点装载率）。
+- **Data processing: Detect sites / Readout fidelity**（一次性）：从存盘帧检测站点 / 算逐站点保真度。
+- **Measurement: …**（扫描）：温度 / 读出时长，默认绑曲线图。
+
+每张面板底部都列出它**读 / 发**了哪些信号（重名会标 ⚠），所以不用猜 hub 里有什么名字。要调 Live readout 的 `grid_shape` / `exposure` / `roi_radius` / `ema`，在那张图的 **Edit → Acquisition** 里改 + **Apply**（两帧之间应用，不停 feed）。换实机只改 `na.connect("virtual"→"qcmos")`，这一节一字不变。
+
+<!-- cell:code -->
+%gui qt
+from Zou_lab_control.neutral_atom.core.signals import SignalHub
+
+hub = SignalHub()
+# session=exp 让 Add Panel 能从相机建 "Live: Loading readout"(连续读出生产者);
+# 看板开出来是空的 —— Add Panel -> "Live: Loading readout" 看 loading rate,
+# 再 Add Panel -> Plot: Site map (value = occupied) / Plot: 2D (value = frame) 自己搭。
+console = zf.show_task_console(hub=hub, session=exp,
+                              measurements=exp.readout.measurement_specs(),
+                              processors=exp.readout.processor_specs())
+console
+
+<!-- cell:markdown -->
 ## Save calibration, status, and Verilog
 
 `write_verilog` 导出的是一个轻量 edge-table 片段，便于离线检查 timing/channel/tick。真实硬件上传走的是 host 把程序打包成 BRAM image、经 JTAG-to-AXI 写进 `zlc_pulse_streamer_top` 的路径(见 FPGA manual)。

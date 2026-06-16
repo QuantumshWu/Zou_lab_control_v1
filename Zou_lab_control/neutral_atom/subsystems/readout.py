@@ -507,6 +507,25 @@ class ReadoutSubsystem(ExperimentSubsystem):
 
         return discovered_processor_specs(self)
 
+    def live_loading_feed(self, hub, *, calibrate_now: bool = False, **params):
+        """Build a CONTINUOUS loading-rate producer (a ``LoadingFeed``) over the
+        session's camera: it images one loading shot per frame and publishes ``rate``
+        / ``occupied`` / ``rate_sites`` / ``rate_grid`` / ``centers`` / ``frame`` to
+        ``hub``.  This is the single source the live readout comes from -- a notebook
+        OR the task console (Add Panel -> "Live: Loading readout") starts the same
+        feed, so they cannot drift.  ``calibrate_now=False`` (the GUI default) defers
+        the blocking calibration to the acquisition loop's OWN thread, so adding the
+        producer from the GUI never blocks; pass the grid/exposure/roi_radius/ema the
+        feed should use, or rely on the session's default grid."""
+
+        from ..operations.feeds import LoadingFeed
+
+        s = self._session
+        params["grid_shape"] = s._grid_shape(params.get("grid_shape"))
+        return LoadingFeed(hub, s.devices.camera,
+                           sequencer=getattr(s.devices, "sequencer", None),
+                           calibrate_now=calibrate_now, **params)
+
     # ------------------------------------------------------------- persistence
     def load(self, path: str | Path) -> TrapCalibration:
         return self._session.load_calibration(path)
