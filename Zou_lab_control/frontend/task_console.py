@@ -197,16 +197,17 @@ def _text_to_py(text: str):
         except ValueError:
             return raw
 
-# Card geometry (raw px, matching the raw-px canvas).  The card is a titled
-# frame (title = panel kind) whose FOOTER absorbs the modulus difference: the
-# figure margins do not halve with the data area, so the canvases alone can
-# never tile -- the frame makes the CARDS tile instead.  A card spans
-# rows x _pitch_y - gap, so a 2-row card is EXACTLY two 1-row cards plus the
-# gap, and dragged cards snap onto one shared grid.
-_CARD_PAD = 10        # horizontal padding canvas<->frame, and the drag border
-_CARD_TITLE_H = 32    # the FluentGroupBox title strip
-_CARD_VPAD = 12       # vertical padding above + below the content
-_FOOTER_MIN = 26      # the status line every card carries under its canvas
+# Card geometry (raw px, matching the raw-px canvas).  The canvas sits FLUSH with
+# the frame's top + left + right edges (no title strip, no side padding -- the
+# panel title lives inside the figure); only the BOTTOM carries the footer, whose
+# height absorbs the modulus difference (the figure margins do not halve with the
+# data area, so the canvases alone can never tile -- the frame makes the CARDS tile
+# instead).  A card spans rows x _pitch_y - gap, so a 2-row card is EXACTLY two
+# 1-row cards plus the gap, and dragged cards snap onto one shared grid.
+_CARD_PAD = 0         # horizontal padding canvas<->frame: 0 = flush left/right
+_CARD_TITLE_H = 0     # top title strip: 0 = canvas flush with the top edge (title is in the figure)
+_CARD_VPAD = 12       # vertical padding below the canvas (above the footer)
+_FOOTER_MIN = 26      # the status + signal-legend line every card carries under its canvas
 _GRID_GAP = 8
 
 
@@ -220,7 +221,10 @@ def _grid_pitch() -> tuple[int, int]:
     their canvas in the extra frame width."""
 
     half_w, half_h = panel_display_size("1x2")
-    pitch_x = (half_w + 2 * _CARD_PAD + _GRID_GAP) // 2
+    # CEIL the half-pitch so two columns are never NARROWER than the canvas (with
+    # _CARD_PAD=0 a floor could leave the card 1 px short -> the flush canvas would
+    # overflow); the tiling contract (1x4 == 2*1x2 + gap) holds for any pitch_x.
+    pitch_x = -(-(half_w + 2 * _CARD_PAD + _GRID_GAP) // 2)
     pitch_y = half_h + _CARD_TITLE_H + _CARD_VPAD + _FOOTER_MIN + _GRID_GAP
     return pitch_x, pitch_y
 
@@ -498,11 +502,14 @@ _MONITOR_UNSET = object()   # sentinel: a monitor panel that has never rolled ye
 
 
 class PanelCard(FluentGroupBox):
-    """One dashboard panel: a titled frame (title = the panel KIND) holding the
-    frontend canvas, a status footer, and a text "Setting" button on the title
-    strip.  The frame border is the DRAG HANDLE (the matplotlib canvas keeps
-    all its own interactions); the footer stretches so the card spans whole
-    layout slots -- a 2-row card is exactly two 1-row cards plus the gap."""
+    """One dashboard panel: a FLUSH frame holding the frontend canvas at the very TOP
+    (no title strip -- the panel title lives INSIDE the figure, so the image's top
+    edge meets the frame's top edge and there is no left/right padding).  Below the
+    canvas sits the status + signal-legend FOOTER, which also doubles as the DRAG
+    HANDLE (the matplotlib canvas keeps all its own zoom/pan, so it cannot be the
+    handle); the footer stretches so the card spans whole layout slots -- a 2-row
+    card is exactly two 1-row cards plus the gap.  Only the BOTTOM padding is real
+    (footer + the modulus slack that keeps the figure's aspect / tiling)."""
 
     changed = QtCore.pyqtSignal()          # any config edit (console marks dirty)
     layout_changed = QtCore.pyqtSignal()   # size/slot change (console re-arranges)
@@ -510,7 +517,9 @@ class PanelCard(FluentGroupBox):
     edit_requested = QtCore.pyqtSignal(object)   # "Edit…" -> open the panel's Edit tab
 
     def __init__(self, config: PanelConfig, parent=None, *, names_provider=None):
-        super().__init__(PANEL_KINDS[config.kind], parent, shadow=True)
+        # Titleless + padding_top=0: the canvas sits flush at the top edge (the
+        # figure carries its own title); the chrome moves to the footer.
+        super().__init__("", parent, shadow=True, padding_top=0)
         self.config = config
         self.names_provider = names_provider   # callable -> live signal names (Setting combo)
         self.plotter = None
@@ -527,10 +536,12 @@ class PanelCard(FluentGroupBox):
         # SHIFTS (same shape, new origin) still triggers an axes rebuild.
         self._roi_built: list | None = None
         self._drag_offset: QtCore.QPoint | None = None
-        self.setCursor(QtCore.Qt.OpenHandCursor)   # the frame border drags
+        self.setCursor(QtCore.Qt.OpenHandCursor)   # grab the footer / frame to drag
 
         holder = QtWidgets.QVBoxLayout(self)
-        holder.setContentsMargins(_CARD_PAD, scaled_px(2), _CARD_PAD, _CARD_VPAD // 2)
+        # top + left + right = 0 -> canvas flush with the frame; only the bottom
+        # carries the footer (and the modulus slack below it).
+        holder.setContentsMargins(_CARD_PAD, 0, _CARD_PAD, _CARD_VPAD // 2)
         holder.setSpacing(_CARD_VPAD // 2)
         self.canvas_holder = holder
         self.footer = FluentLabel("")
@@ -564,9 +575,11 @@ class PanelCard(FluentGroupBox):
 
     def _place_setting_button(self) -> None:
         if hasattr(self, "setting_button"):
+            # bottom-right, in the footer region -- the canvas is now flush at the
+            # TOP, so a top-right button would sit on the image.
             self.setting_button.move(
                 self.width() - self.setting_button.width() - scaled_px(8),
-                scaled_px(4))
+                self.height() - self.setting_button.height() - scaled_px(6))
             self.setting_button.raise_()
 
     # ------------------------------------------------------------- settings UI
