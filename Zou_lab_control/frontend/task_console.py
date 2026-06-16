@@ -536,6 +536,12 @@ class PanelCard(FluentGroupBox):
         self.footer = FluentLabel("")
         self.footer.setStyleSheet(f"color: {GREY}; background: transparent;")
         self.footer.setAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
+        self.footer.setWordWrap(True)
+        # The footer carries the transient status AND a persistent SIGNAL legend
+        # (what this panel READS from the hub, what its producer PROVIDES, and any
+        # name published by >1 producer) so the hub namespace is never a mystery.
+        self._status_text = ""
+        self._signal_info = ""
         # added AFTER the canvas (in _build_plot); keep a stretch so the footer
         # pins under the canvas and absorbs the modulus slack below
 
@@ -923,13 +929,29 @@ class PanelCard(FluentGroupBox):
         except Exception as exc:
             self.set_status(f"save fig failed: {str(exc).splitlines()[0][:120]}", error=True)
 
+    def _compose_footer(self) -> str:
+        """status  ·  signal legend (reads / provides / duplicates), or the raw
+        source when no legend has been computed yet."""
+        info = self._signal_info or self.config.source
+        return f"{self._status_text}   ·   {info}"[:240]
+
+    def set_signal_info(self, info: str) -> None:
+        """Set the persistent signal legend (computed by the console: what this
+        panel READS from the hub, what its producer PROVIDES, duplicate names)."""
+        info = str(info or "")
+        if info == self._signal_info:
+            return
+        self._signal_info = info
+        self.footer.setText(self._compose_footer())
+
     def set_status(self, text: str, *, error: bool) -> None:
         # Text changes every tick ("shot N") -- but the COLOUR/stylesheet only
         # changes on the ok<->error transition.  Restyle only on that transition
         # (rebuilding the same stylesheet string every tick was pure waste);
         # appearance-neutral because the colour is identical when error is.
+        self._status_text = str(text)
         self.status.setText(str(text)[:200])
-        self.footer.setText(f"{text}   ·   {self.config.source}"[:160])
+        self.footer.setText(self._compose_footer())
         self.setting_button.setToolTip(f"Panel settings — {text}" if text else "Panel settings")
         if error is not getattr(self, "_status_error", None):
             self._status_error = bool(error)
@@ -2346,6 +2368,51 @@ class TaskConsole(QtWidgets.QWidget):
             return []
         return list(feed.acquisition_parameters().items())
 
+    @staticmethod
+    def _producer_label(feed) -> str:
+        """Short human name for a producing feed (its hub prefix, else its class)."""
+        return str(getattr(feed, "prefix", "") or type(feed).__name__)
+
+    def _signal_providers(self) -> dict:
+        """``name -> [producer labels]`` for every signal currently published, so a
+        name carried by MORE THAN ONE producer can be flagged as ambiguous."""
+        providers: dict[str, list] = {}
+        for feed in self.feeds:
+            if not hasattr(feed, "published_signals"):
+                continue
+            label = self._producer_label(feed)
+            for name in feed.published_signals():
+                providers.setdefault(str(name), []).append(label)
+        return providers
+
+    def _refresh_signal_info(self) -> None:
+        """Give every panel a legend (shown in its footer) of what it READS from the
+        hub, the producer it reads FROM and what that producer PROVIDES, and any read
+        whose name is published by more than one producer (ambiguous) -- so the hub
+        namespace is legible instead of a mystery.  Self-guarded: it recomputes only
+        when the sources / feeds / published names actually change, so it is free to
+        call every tick."""
+        providers = self._signal_providers()
+        sig = (tuple(sorted((k, len(v)) for k, v in providers.items())),
+               tuple((id(c), c.config.source) for c in self.cards))
+        if sig == getattr(self, "_signal_info_sig", None):
+            return
+        self._signal_info_sig = sig
+        for card in self.cards:
+            reads = sorted(self._referenced_signals(card.config.source))
+            feed = self._producing_feed(card)
+            parts: list[str] = []
+            if reads:
+                parts.append("reads: " + ", ".join(reads))
+            if feed is not None and hasattr(feed, "published_signals"):
+                provides = sorted(str(n) for n in feed.published_signals())
+                if provides:
+                    parts.append(f"from {self._producer_label(feed)}: " + ", ".join(provides))
+            dups = [n for n in reads if len(providers.get(n, [])) > 1]
+            if dups:
+                parts.append("⚠ duplicated: " + ", ".join(dups))
+            card.set_signal_info("   ·   ".join(parts))
+
     def _restart_feed(self, feed, new_params: dict):
         """Apply edited acquisition parameters to the producing feed so the
         Monitor re-acquires under them.  This goes through the feed's SAFE entry
@@ -2675,6 +2742,7 @@ class TaskConsole(QtWidgets.QWidget):
         # the run-complete transition is never missed if the feed self-stops
         # between version bumps.
         self._poll_measurement()
+        self._refresh_signal_info()   # cheap + self-guarded: tracks source/feed changes
         version = self.hub.version
         if version == self._last_version:
             return
