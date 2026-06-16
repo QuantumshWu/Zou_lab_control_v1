@@ -1949,26 +1949,29 @@ class PanelEditor(QtWidgets.QWidget):
         self.status.setText(f"ROI set from view: {roi} — Apply to re-arm the camera")
 
     def _restart_feed(self) -> None:
-        """Apply the edited Acquisition params: RESTART the data source so the
-        Monitor re-acquires under the new params (e.g. the camera re-arms with the
-        new ROI), refresh the 'now:' references, push one console tick so the
-        Monitor reflects it now, then re-snapshot this Edit."""
+        """Apply the edited Acquisition params to the data source.  The change is
+        routed through the feed's safe entry: while the acquisition loop runs it is
+        applied BETWEEN shots in the loop's own thread (the live Monitor keeps
+        streaming and the next frame shows the new params -- no GUI stall), so the
+        'now:' references and Edit snapshot catch up on the following ticks."""
         if self._feed is None:
             return
         new_params = {name: _text_to_py(w.text()) for name, w in self._feed_widgets.items()}
+        running = bool(getattr(self._feed, "running", False))
         try:
             self.console._restart_feed(self._feed, new_params)
         except Exception as exc:
             self.status.setText(f"apply failed: {str(exc).splitlines()[0][:120]}")
             return
+        # tick the console so an IDLE feed's freshly-published frame shows now; a
+        # running feed updates on its own next loop iteration + timer beat.
+        self.console.refresh_once()
         for name, current in self.console._feed_params(self._feed):
             if name in self._feed_now_labels:
                 self._feed_now_labels[name].setText(f"now: {_py_to_text(current)}")
-        # the restarted feed has published a fresh frame under the new params --
-        # tick the console so the live Monitor panel rebuilds with it right away
-        # (not only after the next timer beat).
-        self.console.refresh_once()
-        self.status.setText("acquisition restarted with the new parameters")
+        self.status.setText(
+            "acquisition parameters queued — Monitor updates on the next frame"
+            if running else "acquisition parameters applied")
         self.rebuild()
 
     def _df_for(self):
@@ -2302,26 +2305,19 @@ class TaskConsole(QtWidgets.QWidget):
         return list(feed.acquisition_parameters().items())
 
     def _restart_feed(self, feed, new_params: dict):
-        """RESTART the producing feed with edited acquisition parameters, so the
-        Monitor actually re-acquires under the new params (this is confocal's
-        model: Start builds a FRESH acquisition rather than mutating a running
-        one).  A streaming camera latches its ROI/exposure when the acquisition
-        is armed and IGNORES an in-place ``configure`` mid-stream, so applying a
-        new ROI means: STOP the run, reconfigure the source while idle, then
-        START a fresh run -- only then does the next frame (and the Monitor) show
-        the new window.  A feed that is not currently running is reconfigured and
-        stepped ONCE so the Monitor reflects the change immediately.  Returns the
-        feed.  Raises if the feed has no editable acquisition params."""
-        if feed is None or not hasattr(feed, "set_acquisition_parameters"):
+        """Apply edited acquisition parameters to the producing feed so the
+        Monitor re-acquires under them.  This goes through the feed's SAFE entry
+        ``apply_acquisition_parameters``: while the acquisition loop runs it owns
+        the source, so the edit is queued and the loop applies it BETWEEN shots
+        (the source re-arms in its owner thread -- a streaming camera picks up the
+        new ROI/exposure -- with no GUI-thread stall and no second ``acquire()``
+        racing on one camera; an in-place reconfigure of a running stream would be
+        ignored, while stopping/starting the thread from here would block the GUI
+        and could deadlock).  An idle feed is reconfigured and stepped once.
+        Returns the feed.  Raises if the feed has no editable acquisition params."""
+        if feed is None or not hasattr(feed, "apply_acquisition_parameters"):
             raise RuntimeError("this panel's data source exposes no editable acquisition parameters")
-        was_running = bool(getattr(feed, "running", False))
-        if was_running and hasattr(feed, "stop"):
-            feed.stop()                                  # halt so the source reconfigures idle
-        feed.set_acquisition_parameters(**new_params)
-        if was_running and hasattr(feed, "start"):
-            feed.start(rate_hz=getattr(feed, "rate_hz", 5.0))   # re-arm: fresh acquisition
-        elif hasattr(feed, "step"):
-            feed.step()                                  # not in a run loop: publish one fresh shot now
+        feed.apply_acquisition_parameters(**new_params)
         return feed
 
     def _edit_card(self, card: "PanelCard") -> None:

@@ -47,6 +47,14 @@ class ExperimentFeed:
         # signals so the console can raise a visible banner (M7).
         self.last_error: str | None = None
         self.consecutive_errors = 0
+        # OWNER-THREAD parameter requests: while the acquisition loop runs, it is
+        # the SOLE owner of the source (the only thread that calls acquire/
+        # configure).  An edited parameter from another thread (the GUI) is QUEUED
+        # here and applied by the loop BETWEEN shots -- never a stop/start of the
+        # thread from outside, which would block the GUI and could run two
+        # acquire() calls on one camera at once (a deadlock/freeze).
+        self._pending_params: dict[str, object] | None = None
+        self._params_lock = threading.Lock()
 
     # ------------------------------------------------------------------ loop
     def shot(self) -> dict[str, object]:  # pragma: no cover - abstract
@@ -73,6 +81,7 @@ class ExperimentFeed:
             while not self._stop.is_set():
                 started = time.monotonic()
                 try:
+                    self._apply_pending_params()   # owner thread applies edits BETWEEN shots
                     self.step()
                 except Exception as exc:
                     if self._stop.is_set():
@@ -130,9 +139,39 @@ class ExperimentFeed:
         return {}
 
     def set_acquisition_parameters(self, **values) -> None:
-        """Apply edited acquisition parameters IN PLACE (re-configure the source
-        live, or re-calibrate); the same running feed keeps publishing.  Default:
-        no editable parameters, nothing to do."""
+        """Apply edited acquisition parameters to the source NOW, on the CALLING
+        thread (re-configure the camera, or re-calibrate).  This must only be
+        called by the OWNER of the source -- the acquisition loop (via
+        ``_apply_pending_params``) when running, or the caller of
+        ``apply_acquisition_parameters`` when idle -- never concurrently with a
+        ``shot()``.  Default: no editable parameters, nothing to do."""
+
+    def apply_acquisition_parameters(self, **values) -> None:
+        """The SAFE entry point for an edit coming from another thread (the GUI).
+
+        While the acquisition loop is running it OWNS the source, so the edit is
+        QUEUED and the loop applies it between shots (``_apply_pending_params``):
+        the source re-arms in the owning thread with no second ``acquire()`` ever
+        running on it, and the GUI never blocks on a join.  The live Monitor keeps
+        streaming and the next published frame reflects the change.  When the feed
+        is idle, the edit is applied immediately and one fresh shot is published so
+        a viewer reflects it at once."""
+        if self.running:
+            with self._params_lock:
+                self._pending_params = {**(self._pending_params or {}), **values}
+        else:
+            self.set_acquisition_parameters(**values)
+            self.step()
+
+    def _apply_pending_params(self) -> None:
+        """Drain and apply queued acquisition-parameter edits.  Called by the
+        acquisition loop BETWEEN shots, so the source is reconfigured in its sole
+        owner thread (a streaming camera re-arms cleanly, no concurrent acquire)."""
+        with self._params_lock:
+            pending = self._pending_params
+            self._pending_params = None
+        if pending:
+            self.set_acquisition_parameters(**pending)
 
 
 class LoadingFeed(ExperimentFeed):

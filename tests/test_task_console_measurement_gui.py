@@ -395,21 +395,26 @@ def test_2d_zoom_updates_roi_from_view_area_overrides():
         console.shutdown()
 
 
-def test_apply_roi_restarts_running_feed():
-    """G-fix #2: Apply on a RUNNING acquisition restarts it (stop -> reconfigure ->
-    start), so a streaming camera re-arms with the new ROI -- an in-place
-    reconfigure would be ignored mid-stream and the Monitor would stay stale."""
+def test_apply_roi_to_running_feed_applies_in_loop_no_restart():
+    """G-fix #2 (architecture): Apply on a RUNNING acquisition does NOT stop/start
+    the feed from the GUI thread (which would stall the GUI and could run two
+    acquire() calls on one camera).  The edit is queued and the loop's OWN thread
+    applies it between shots, so the camera re-arms, the Monitor keeps streaming,
+    and the SAME thread keeps running.  (See test_measurement_spec_feed for the
+    no-concurrent-acquire invariant on a blocking camera.)"""
     import time
     console, feed, cam, card, editor = _camera_console()
     try:
         feed.start(rate_hz=50.0)
         time.sleep(0.08)
-        tid_before = feed._thread.ident
+        thread_before = feed._thread
         console._restart_feed(feed, {"roi": [100, 20, 200, 20]})
-        time.sleep(0.05)
-        assert feed.running
-        assert feed._thread.ident != tid_before     # a FRESH acquisition thread
-        assert cam.roi == (100, 20, 200, 20)
+        deadline = time.monotonic() + 2.0
+        while cam.roi != (100, 20, 200, 20) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert cam.roi == (100, 20, 200, 20)        # applied by the loop, between shots
+        assert feed.running                          # still streaming
+        assert feed._thread is thread_before         # SAME thread -- no GUI-thread restart
     finally:
         feed.stop()
         console.shutdown()

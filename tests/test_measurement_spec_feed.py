@@ -223,6 +223,80 @@ def test_camera_frame_feed_exposes_camera_params_and_applies_them_live():
     assert np.ndim(frame) == 2                              # a real 2-D camera frame
 
 
+def test_running_feed_applies_params_in_owner_thread_no_concurrent_acquire():
+    """ARCHITECTURE invariant: while a feed's acquisition loop runs, it is the SOLE
+    owner of the source.  An edit from another thread goes through
+    ``apply_acquisition_parameters``, which QUEUES it; the loop applies it BETWEEN
+    shots in its own thread.  So (1) the source is reconfigured with NO second
+    ``acquire()`` ever running on it concurrently -- the deadlock/freeze that a
+    GUI-thread stop/start would cause -- (2) the feed is NOT restarted (same
+    thread keeps streaming), and (3) the change lands within ~1 shot.
+
+    Faked at the lowest level only: a camera whose ``acquire`` BLOCKS for the
+    exposure (like a real qCMOS) and records the max concurrent acquire depth."""
+    import threading
+    from Zou_lab_control.neutral_atom.devices.base import CameraDevice
+
+    class _BlockingCam(CameraDevice):
+        def __init__(self):
+            self._exposure = 0.05
+            self._roi = (1648, 64, 1144, 64)
+            self._depth = 0
+            self.max_depth = 0
+            self._lock = threading.Lock()
+
+        @property
+        def exposure(self):
+            return self._exposure
+
+        @property
+        def roi(self):
+            return self._roi
+
+        def configure(self, *, exposure=None, **kw):
+            if exposure is not None:
+                self._exposure = float(exposure)
+            if kw.get("roi") is not None:
+                self._roi = tuple(int(v) for v in kw["roi"])
+
+        def acquire(self, frames=1, *, sequence=None, sequencer=None, stop=None, **kw):
+            with self._lock:
+                self._depth += 1
+                self.max_depth = max(self.max_depth, self._depth)
+            try:
+                deadline = time.monotonic() + self._exposure
+                while time.monotonic() < deadline:
+                    if stop is not None and stop.is_set():
+                        return [None]
+                    time.sleep(0.005)
+                w, h = self._roi[1], self._roi[3]
+                return [np.zeros((h, w), dtype=float)]
+            finally:
+                with self._lock:
+                    self._depth -= 1
+
+    hub = SignalHub()
+    cam = _BlockingCam()
+    feed = na.CameraFrameFeed(hub, cam)
+    feed.start(rate_hz=40.0)
+    try:
+        deadline = time.monotonic() + 2.0
+        while feed.shots < 2 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        thread_before = feed._thread
+        # an edit from THIS (non-owner) thread -- must be queued, not applied here
+        feed.apply_acquisition_parameters(roi=[1664, 32, 1160, 32])
+        deadline = time.monotonic() + 2.0
+        while cam.roi != (1664, 32, 1160, 32) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert cam.roi == (1664, 32, 1160, 32)          # applied by the loop
+        assert feed.running                              # still streaming
+        assert feed._thread is thread_before            # SAME thread -- no restart
+        assert cam.max_depth == 1                        # never two acquire() at once
+    finally:
+        feed.stop()
+
+
 def test_loading_feed_acquisition_params_reapply_in_place():
     """LoadingFeed's source is its own analysis; editing a param re-calibrates the
     SAME running feed (no instance swap)."""

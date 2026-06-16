@@ -290,7 +290,7 @@ Setting 改的每一项——\pyapi{size}、\pyapi{colormap}、声明式参数�
 \textbf{解耦要点}：\pyapi{PanelEditor} 持有\tfocus{自己的}独立 plotter / \pyapi{DataFigure}，只\tfocus{读} \pyapi{card.plotter} 取数据，与 Monitor 卡解耦——它不通过 \pyapi{card.\_set\_param} 去改 Monitor 卡（那条路径会 \pyapi{\_reset\_plot} 把 Monitor 卡的 plotter 置 None，Edit 的快照随即失去依据）。Edit 标签关闭时若它正承载在跑的 measurement，会把 \pyapi{\_active\_meas\_panel} 复位，避免把状态写进已销毁的表单。
 \end{notebox}
 
-\section{坐标轴 = 源的参数空间;缩放/框选回写 + Apply 重启(confocal 核心耦合)}
+\section{坐标轴 = 源的参数空间;缩放/框选回写 + 采集环应用(confocal 核心耦合)}
 \label{sec:coord-writeback}
 Confocal\_gui 的核心思想:一张图的坐标轴\tfocus{就是}产生它的源的参数空间;\tfocus{改变可视范围}就把"该轴代表的源参数"回写成"下次采集只覆盖这块",而\tfocus{重新采集}才让活面板真正换上新参数的数据。两件事缺一不可,控制台对每种空间/参数轴都落实同一条耦合。
 
@@ -302,15 +302,15 @@ confocal 把\tfocus{同一个回写回调}同时绑到\tfocus{滚轮缩放/中�
   \item[2D 相机图 → 相机 ROI] 一张相机帧 2D 面板（\pyapi{Live2DDis}，源是 \pyapi{CameraFrameFeed}）的图像 x/y \tfocus{就是相机的真实像素坐标(ROI 原点),不是 0..N}：面板构建时经 \pyapi{\_source\_coord\_frame} 取源信号的 ROI \pyapi{[x,w,y,h]}，以 \pyapi{x0=roi[0]}、\pyapi{y0=roi[2]} 为原点建网格，轴标 \pyapi{Camera x/y (px)}。Edit 图上\tfocus{滚轮缩放或框一个矩形}，\pyapi{\_read\_roi} 把范围 \pyapi{[min x, max x, min y, max y]} 换算成 ROI \pyapi{[round(min x), round(宽), round(min y), round(高)]} 填进 Acquisition 的 \pyapi{roi} 框。ROI 像素坐标常是 4--5 位，2D 图复用 frontend 的智能刻度\tfocus{对}（\pyapi{apply\_smart\_ticks}，定位器+格式器成对替换）并收紧每轴刻度数，宽标签不会挤成糊。
 \end{description}
 
-\paragraph{(2) Apply / Start → \tfocus{重启采集},活面板才换上新数据。}
-回写只改了\tfocus{参数框}的值;真正让 Monitor 面板显示新参数下的数据,要\tfocus{重新跑一次采集}——这是 confocal 的 \pyapi{on\_start} 用新参数\tfocus{重建一个测量}并运行的语义,绝不是"原地改一下还在跑的那次"。控制台据此分两路:
+\paragraph{(2) Apply / Start → \tfocus{把改动应用到采集},活面板才换上新数据。}
+回写只改了\tfocus{参数框}的值;真正让 Monitor 显示新参数下的数据,要\tfocus{把改动应用到正在采集的数据源}。confocal 的 \pyapi{on\_start} 对一次\tfocus{有限扫描}是用新参数\tfocus{重建测量}再跑;对一台\tfocus{持续流式}的相机,则是让\tfocus{采集环}(数据源的唯一持有者)接住改动、在两帧之间 re-arm。两者都\tfocus{绝不是}"另一个线程原地改一下还在跑的那台相机"。控制台据此分两路:
 \begin{itemize}
   \item measurement 面板:Start(\pyapi{\_start\_measurement}) 用表单当前值\tfocus{新建}一个 \pyapi{ScannedMeasurementFeed} 重跑进同一结果卡。
-  \item 相机/采集面板:Apply(\pyapi{\_restart\_feed}) \tfocus{停→改源参数→重启} feed(\pyapi{stop}→\pyapi{set\_acquisition\_parameters}→\pyapi{start})。\tfocus{流式相机在采集开始时锁定 ROI/曝光,运行中的原地 \pyapi{configure} 会被忽略},所以必须停掉、空闲时重配、再开一次新采集,下一帧(和 Monitor)才换上新视场;不在跑的 feed 则 \pyapi{step()} 一帧让 Monitor 立刻反映。Apply 后随手 \pyapi{console.refresh\_once()} 推一拍,Monitor 当场更新而不必等下个定时器节拍。
+  \item 相机/采集面板:Apply 经 \pyapi{feed.apply\_acquisition\_parameters(...)} 把改动交给采集环。\tfocus{采集环在运行时是数据源的唯一持有者}(唯一调用 \pyapi{acquire}/\pyapi{configure} 的线程):改动被\tfocus{排队},由采集环\tfocus{在两帧之间}用它自己的线程应用(\pyapi{set\_acquisition\_parameters})——流式相机于是在自己的线程里干净 re-arm,Monitor 持续刷新、下一帧换上新视场。\tfocus{绝不从 GUI 线程停/启那条采集线程}:那会(a) 在 \pyapi{join} 上卡住 GUI,(b) 若阻塞的 \pyapi{acquire} 没及时响应停止,就会有第二个 \pyapi{acquire} 与旧线程并发跑在同一台相机上→死锁/冻结(这正是"Apply 后 Monitor 暂停"的根因)。不在跑的 feed 才原地 \pyapi{set\_acquisition\_parameters}+\pyapi{step()} 一帧。
 \end{itemize}
 
 \begin{notebox}
-\textbf{为什么是统一的架构而非各打补丁}：坐标系信息走一条与 1D 扫描回写\tfocus{同形}的解耦缝——\pyapi{TaskConsole.\_coord\_frames()} 把"每个声明了 ROI 的 feed 的 published 信号 → 该 ROI"汇成保留键 \pyapi{\_\_coord\_frames\_\_} 注入表达式命名空间；\pyapi{PanelCard.\_source\_coord\_frame} 用面板源表达式引用的信号名（\pyapi{\_co\_names}）在里面查，任何空间轴的面板都能问"我的源坐标系是什么"。\pyapi{frame} 形状不变但 ROI \tfocus{平移}时，面板按坐标系变化（不只看形状）触发重建，轴永远跟着 ROI 走。\tfocus{回写}(缩放/框选,view-else-area)与\tfocus{重启}(Apply/Start 重建采集)是两件正交的事,前者改参数、后者才换数据——两者都缺会让"改了却看不到效果"。这条缝对未来其它"轴=源参数"的图同样可用，不必每种图各写一遍。
+\textbf{为什么是统一的架构而非各打补丁}：坐标系信息走一条与 1D 扫描回写\tfocus{同形}的解耦缝——\pyapi{TaskConsole.\_coord\_frames()} 把"每个声明了 ROI 的 feed 的 published 信号 → 该 ROI"汇成保留键 \pyapi{\_\_coord\_frames\_\_} 注入表达式命名空间；\pyapi{PanelCard.\_source\_coord\_frame} 用面板源表达式引用的信号名（\pyapi{\_co\_names}）在里面查，任何空间轴的面板都能问"我的源坐标系是什么"。\pyapi{frame} 形状不变但 ROI \tfocus{平移}时，面板按坐标系变化（不只看形状）触发重建，轴永远跟着 ROI 走。\tfocus{回写}(缩放/框选,view-else-area)与\tfocus{应用}(measurement Start 重建测量 / 相机 Apply 交采集环在两帧间 re-arm)是两件正交的事,前者改参数、后者才换数据——两者都缺会让"改了却看不到效果"。\tfocus{采集环=数据源唯一持有者}的不变量(改动只由它本线程在两帧间应用,外部一律排队)是统一保证:任何 feed 改参数都不会冻 GUI、不会两个 \pyapi{acquire} 撞车,不只针对 qCMOS。这条缝对未来其它"轴=源参数"的图同样可用，不必每种图各写一遍。
 \end{notebox}
 
 
