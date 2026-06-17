@@ -579,9 +579,11 @@ class ReadoutSubsystem(ExperimentSubsystem):
             apply: dict[str, object] = {}
             if exposure is not None:
                 apply["exposure"] = float(exposure)
-            reg = _parse_region(region)
-            if reg is not None:
-                apply["region"] = reg
+            # Always push ``region`` (None for blank) so a build matches the Edit
+            # path: blank -> region=None -> roi=None -> FULL sensor, never a stale ROI
+            # left on the camera by a previous node.  Endpoints<->ROI conversion is in
+            # CameraMeasurement.set_acquisition_parameters (one source of truth).
+            apply["region"] = _parse_region(region)
             if apply and hasattr(node, "apply_acquisition_parameters"):
                 node.apply_acquisition_parameters(**apply)
             return node

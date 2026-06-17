@@ -34,7 +34,7 @@ import time
 
 import numpy as np
 
-from ..core.analysis import estimate_thresholds, find_site_centers, grid_shape_tuple, positive_int, roi_counts
+from ..core.analysis import grid_shape_tuple
 from ..core.signals import SignalHub
 from ..devices.base import CameraDevice
 from ..timing import imaging_channel_kwargs, imaging_sequence
@@ -426,34 +426,53 @@ class DetectProcessor(Processor):
 
 
 class TaskOutput:
-    """The MID-RUN output channel handed to a :class:`Task`'s ``run``.
+    """The MID-RUN output channel handed to a :class:`Task`'s ``run`` -- a per-task
+    BUFFER, NOT the SignalHub.
 
     A task publishes intermediate numeric signals (a template frame, a progress
-    fraction, partial counts) through this channel as it runs, so a DEDICATED task
-    panel shows the work in progress -- like a confocal task's live plot.  Signals go
-    on the hub behind the task's ``prefix`` (the panel subscribes to e.g.
-    ``<prefix>frame`` / ``<prefix>progress``).  The hub stores numbers/arrays only, so
-    a textual stage label is surfaced separately (``progress`` 0..1) -- not here."""
+    fraction) here as it runs, so a DEDICATED task panel shows the work in progress --
+    like a confocal task's live plot.  Task output deliberately does **not** go on the
+    hub: the hub carries ONLY measurement + processor outputs, so a one-shot task's
+    transient frames never collide with -- or masquerade as -- live readout signals.
+    The console reads ``latest`` / ``version`` to render the task's dedicated panel; a
+    textual stage is surfaced via the numeric ``progress`` 0..1."""
 
-    def __init__(self, hub: SignalHub, *, prefix: str = ""):
-        self.hub = hub
+    def __init__(self, *, prefix: str = ""):
         self.prefix = str(prefix)
         self.progress = 0.0
+        self._latest: dict[str, object] = {}
+        self._version = 0
 
     def publish(self, **signals) -> None:
         if "progress" in signals:
             self.progress = float(signals["progress"])
-        self.hub.publish({self.prefix + str(key): value for key, value in signals.items()})
+        # buffer (task-local, so raw names -- no prefix collision to guard against)
+        self._latest.update({str(key): value for key, value in signals.items()})
+        self._version += 1
+
+    def latest(self, name: str):
+        """The most recent value buffered under ``name`` (or ``None``)."""
+        return self._latest.get(str(name))
+
+    def names(self) -> list:
+        """Names buffered so far (the task's declared ``mid_run`` keys as they arrive)."""
+        return list(self._latest)
+
+    @property
+    def version(self) -> int:
+        """Bumped on every ``publish`` so a viewer can poll for fresh mid-run data."""
+        return self._version
 
 
 class Task(LogicNode):
     """A logic node that ORCHESTRATES devices/measurements/processors over a multi-step
     flow and may emit MID-RUN output to a dedicated panel (confocal-style).
 
-    One-shot: ``step()`` runs the whole ``run(out)`` flow once, publishes its final
-    result + ``task_done``, then self-stops.  ``run`` receives a :class:`TaskOutput`
-    for intermediate frames/progress.  A task's heavy artifact (e.g. a calibration
-    object, saved files) lives on the task instance, not the hub."""
+    One-shot: ``step()`` runs the whole ``run(out)`` flow once, then self-stops.  A
+    task publishes NOTHING to the hub: its result lives on ``self.result`` and its
+    heavy artifact (e.g. a calibration object, saved files) on the task instance,
+    while ``run`` writes intermediate frames/progress to its own :class:`TaskOutput`
+    buffer (``self.output``, NOT the hub) for the dedicated mid-run panel."""
 
     layer = "task"
     node_label = "task"
@@ -466,18 +485,22 @@ class Task(LogicNode):
         super().__init__(hub, prefix=prefix)
         self.finished = False
         self.result: dict = {}
+        # Mid-run output is a per-task BUFFER (NOT the hub) -- created up front so the
+        # console can bind the task's dedicated panel to it before/while it runs.
+        self.output = TaskOutput(prefix=self.prefix)
 
     def run(self, out: "TaskOutput") -> dict:  # pragma: no cover - abstract
         raise NotImplementedError
 
     def shot(self) -> dict[str, object]:
-        # One-shot: stop the loop after THIS publish (a run() that raises is reported
-        # via node_error and NOT retried), exactly like a finite scan / processor.
+        # One-shot: stop the loop after THIS run (a run() that raises is reported via
+        # node_error and NOT retried), exactly like a finite scan / processor.  The
+        # result + mid-run output stay on the INSTANCE (self.result / self.output); a
+        # task publishes NOTHING to the hub -- the hub is measurements + processors only.
         self._stop.set()
-        out = TaskOutput(self.hub, prefix=self.prefix)
-        self.result = {str(key): value for key, value in dict(self.run(out)).items()}
+        self.result = {str(key): value for key, value in dict(self.run(self.output)).items()}
         self.finished = True
-        return {**self.result, "task_done": 1.0}
+        return {}
 
     def run_to_completion(self) -> "Task":
         if not self.finished:
@@ -485,8 +508,9 @@ class Task(LogicNode):
         return self
 
     def published_signals(self) -> frozenset:
-        return frozenset(self.prefix + key
-                         for key in (tuple(self.provides) + tuple(self.mid_run) + ("task_done",)))
+        # A task publishes nothing to the hub (its result lives on the instance, its
+        # mid-run output in self.output) -- so it provides no hub signal name.
+        return frozenset()
 
 
 class CalibrateReadoutTask(Task):
@@ -507,12 +531,20 @@ class CalibrateReadoutTask(Task):
     # threshold_method) pair: box+otsu, per-site/uniform PSF + (otsu|bimodal).
     MODE_TO_SITEMAP_METHOD = {"box": "box", "per-site PSF": "psf", "uniform PSF": "uniform_psf"}
 
+    @classmethod
+    def _coerce_mode(cls, mode: str) -> str:
+        """Validate the user-facing mode name (single source for __init__ + edits)."""
+        mode = str(mode)
+        if mode not in cls.MODE_TO_SITEMAP_METHOD:
+            raise ValueError(f"mode {mode!r} must be one of {tuple(cls.MODE_TO_SITEMAP_METHOD)}.")
+        return mode
+
     def __init__(self, hub: SignalHub, camera: CameraDevice, *, sequencer: object | None = None,
                  grid_shape: tuple[int, int] = (5, 7), roi_radius: int = 1,
                  sitemap_exposure: float = 0.05, readout_exposure: float = 0.02,
                  sitemap_pulse: str | None = None, readout_pulse: str | None = None,
-                 calibration_frames: int = 4, threshold_frames: int = 24, method: str = "box",
-                 mode: str | None = None, threshold_method: str = "otsu",
+                 calibration_frames: int = 4, threshold_frames: int = 24,
+                 mode: str = "box", threshold_method: str = "otsu",
                  source: str = "live", data_dir: str | None = None,
                  save_path: str | None = None, load_path: str | None = None, prefix: str = ""):
         super().__init__(hub, prefix=prefix)
@@ -533,11 +565,8 @@ class CalibrateReadoutTask(Task):
         self.calibration_frames = max(1, int(calibration_frames))
         self.threshold_frames = max(2, int(threshold_frames))
         # ``mode`` is the user-facing name (box / per-site PSF / uniform PSF); the
-        # legacy ``method`` (box|psf|uniform_psf) is the resolved sitemap method.
-        if mode is not None:
-            self.mode = str(mode)
-        else:
-            self.mode = next((m for m, v in self.MODE_TO_SITEMAP_METHOD.items() if v == str(method)), "box")
+        # ``method`` @property resolves it to the sitemap method (box|psf|uniform_psf).
+        self.mode = self._coerce_mode(mode)
         self.threshold_method = str(threshold_method)
         self.source = str(source)
         self.data_dir = data_dir
@@ -548,7 +577,7 @@ class CalibrateReadoutTask(Task):
     @property
     def method(self) -> str:
         """Resolved sitemap method (box | psf | uniform_psf) for the chosen mode."""
-        return self.MODE_TO_SITEMAP_METHOD.get(self.mode, "box")
+        return self.MODE_TO_SITEMAP_METHOD[self.mode]
 
     def acquisition_parameters(self) -> dict[str, object]:
         """The calibrate task's tunable parameters (source + sitemap grid + frame
@@ -593,7 +622,7 @@ class CalibrateReadoutTask(Task):
         if "threshold_frames" in values:
             self.threshold_frames = max(2, int(values["threshold_frames"]))
         if "mode" in values:
-            self.mode = str(values["mode"])
+            self.mode = self._coerce_mode(values["mode"])
         if "threshold_method" in values:
             self.threshold_method = str(values["threshold_method"])
         if "save_path" in values:

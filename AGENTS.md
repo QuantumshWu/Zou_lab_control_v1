@@ -36,7 +36,7 @@
 
 - **解耦:子模块只通过接口互联**(最重要的总纲,关系到扩展性/可维护性)。
   - 上层依赖**抽象契约**而非具体类:`devices/base.py` 的 `CameraDevice`/`SequencerDevice`/`TrapArrayDevice` 让 readout/timing 不绑死具体硬件(虚拟/真机/远程三后端共享同一 session)。
-  - 跨模块调用走**文档化的接口**,不伸手进别的模块内部:Task 控制台三层只经 `SignalHub` 耦合(采集/feed/GUI 互不直接引用);frontend 对外只暴露密封接口(见下条)。
+  - 跨模块调用走**文档化的接口**,不伸手进别的模块内部:Task 控制台五层(device/measurement/processor/task/plot)只经 `SignalHub` 耦合(逻辑节点与 plot 视图互不直接引用);frontend 对外只暴露密封接口(见下条)。
   - 新代码沿用这条:加功能先想"它通过哪个接口接入",而不是直接 import 别人的内部实现。
 - **复用优先:同一件事只实现一次,到处复用**(解耦的另一面,直接关系到正确性——重复实现必然漂移出 bug)。
   - 加任何功能,先找"已有哪个原语/层能复用",别重造:frontend 可复用层(`BaseLivePlot`/selectors/`data_figure`/`style.py` 设计 token——见 `frontend/AGENTS.md` 规则7)、`core/` 纯算法 + `operations/` 标准array函数(box/otsu/psf/bimodal/fidelity 各只一份)、`SignalHub`、单一配置源。

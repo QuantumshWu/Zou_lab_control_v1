@@ -1,22 +1,33 @@
-"""Declarative one-shot DATA-PROCESSING actions (the discrete sibling of a scan).
+"""Declarative DATA-PROCESSING actions -- the "func" layer that turns signals into
+derived signals on the SignalHub.
 
-A scanned measurement SWEEPS a parameter and streams a live curve; a PROCESSOR
-runs ONCE over freshly-acquired or saved frames, produces a structured RESULT
-(per-site arrays + scalars), and hands it back as ``{signal_name: value}`` for the
-host to publish to the SignalHub.  Both are the SAME shape -- declared parameters
-(:class:`ParamDecl`) in, named data out -- differing only in execution (swept vs
-one-shot) and in whether they DECLARE a default plot binding.
+A processor publishes derived hub signals in one of two execution styles, declared
+ONCE per spec (exactly one of the two builders is set):
+
+* **reactive** (``make_node``): builds a live :class:`~.logic.Processor` node that
+  CONSUMES one or more hub signals and republishes derived ones every time an input
+  advances -- e.g. judging per-site occupancy from each camera ``frame``.  This is
+  the textbook "func" node: it runs beside the measurement that supplies it.
+* **one-shot** (``run``): runs ONCE over freshly-acquired or saved frames, produces
+  a structured RESULT (per-site arrays + scalars), and hands it back as
+  ``{signal_name: value}`` -- e.g. characterizing readout fidelity from a folder.
+  The discrete sibling of a finite scan.
+
+Either way the output goes to the hub as a PROCESSOR signal (measurements +
+processors are the only nodes that publish to the hub; a Task's artifacts do NOT go
+on the hub).  Both styles share the SAME shape: declared parameters (:class:`ParamDecl`)
+in, named data out.
 
 A processor is contributed as a FACTORY ``build(readout) -> ProcessorSpec`` and is
-auto-discovered exactly like a measurement (see :mod:`processor_registry`).  Its
-``run(ctx)`` DRIVES the existing analysis (e.g.
+auto-discovered exactly like a measurement (see :mod:`processor_registry`).  It
+DRIVES existing analysis / detection (e.g. ``calibration.detect`` or
 ``ReadoutSubsystem.characterize_from_dir``) -- it re-implements no readout /
 fidelity / threshold math -- and any calibration it derives is written back through
 the subsystem, never mutated in place.
 
 Imports no concrete backend and reads no simulation ground truth: a processor's
-only data source is ``ctx.camera.acquire`` or a saved folder, so a virtual run
-exercises the identical path a real run does
+only data source is a hub signal, ``ctx.camera.acquire`` or a saved folder, so a
+virtual run exercises the identical path a real run does
 (``tests/test_virtual_equals_real_contract.py`` guards this).
 """
 
@@ -53,12 +64,22 @@ class ProcessorContext:
 
 @dataclass(frozen=True)
 class ProcessorSpec:
-    """A named one-shot processing action + its declared parameters + a run closure.
+    """A named processing action + its declared parameters + ONE builder.
 
-    ``run(ctx) -> {signal_name: value}`` returns hub-ready numpy arrays / scalars
-    (NOT a domain object); the host publishes them under ``result_keys``.
-    ``summary_keys`` names the SCALAR results worth showing in a panel's numeric
-    pane (the rest are per-site arrays for a plot).
+    Set EXACTLY ONE of:
+
+    * ``make_node(hub, *, prefix="", **param_values) -> Processor`` -- a REACTIVE
+      live node (a :class:`~.logic.Processor` subclass) that consumes ``consumes``
+      and republishes ``result_keys`` whenever an input advances.  The factory
+      closure captures the subsystem (like a measurement's ``build``), so the
+      console stays decoupled.
+    * ``run(ctx) -> {signal_name: value}`` -- a ONE-SHOT action returning hub-ready
+      numpy arrays / scalars (NOT a domain object); the host publishes them under
+      ``result_keys``.
+
+    ``consumes`` names the hub signals a reactive processor reads (drives the signal
+    flow graph / legend); empty for a one-shot.  ``summary_keys`` names the SCALAR
+    results worth showing in a panel's numeric pane (the rest are per-site arrays).
 
     The OPTIONAL default-view binding mirrors a measurement's (and confocal's
     ``plotter`` class attribute): ``default_kind`` is the plot kind the console
@@ -71,13 +92,29 @@ class ProcessorSpec:
 
     name: str
     params: tuple[ParamDecl, ...]
-    run: Callable[["ProcessorContext"], dict]
     result_keys: tuple[str, ...]
+    run: Callable[["ProcessorContext"], dict] | None = None
+    make_node: Callable[..., Any] | None = None
+    consumes: tuple[str, ...] = ()
     summary_keys: tuple[str, ...] = ()
     default_kind: str = ""
     default_value_key: str = ""
     grid_shape: tuple[int, int] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Exactly one execution style -- a processor is reactive OR one-shot, never
+        # both/neither (clean dispatch in the console; no ambiguous half-built spec).
+        if (self.run is None) == (self.make_node is None):
+            raise ValueError(
+                f"ProcessorSpec {self.name!r} must set EXACTLY ONE of run (one-shot) "
+                "or make_node (reactive).")
+
+    @property
+    def reactive(self) -> bool:
+        """True for a live per-signal node, False for a one-shot folder/grab action."""
+
+        return self.make_node is not None
 
     def param(self, key: str) -> ParamDecl:
         """Return the declaration for ``key`` (raises ``KeyError`` if absent)."""

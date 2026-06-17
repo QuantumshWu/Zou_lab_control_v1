@@ -63,6 +63,17 @@ the rules don't get re-broken.
 - `qt_fluent.resolve_fluent_auto_scale` is the single GUI-scale owner.
 - `notes.render_tex_pdf` owns the temp-dir/2-pass/aux-skip compile; callers only
   hand it a tex string (or path) and an output pdf path — nothing is left behind.
+- `FluentComboBox` drop-down matches the `FluentPopup` Setting card: a translucent,
+  frameless container whose **event filter** (`_RoundedPopupCard`) paints one
+  antialiased rounded rect (white fill + 1 px `DIVIDER` border) and returns True to
+  suppress the default opaque square; the `QListView` viewport is genuinely
+  transparent so the card shows; the selected/hover row is a delegate-drawn
+  `::item:selected`/`::item:hover` pill (NOT `selection-background-color`, which a
+  translucent viewport drops → white-on-white); the same filter, on the Move event,
+  re-applies a few-px OUTER gap so the popup sits off the box (a `showPopup`-time
+  `move()` is overwritten by Qt's deferred flush-positioning); the scrollbar is the
+  shared `fluent_scrollbar_stylesheet`. Verify with real-window `widget.grab()` of
+  the container (offscreen does not render the top-level popup).
 
 ## Why these rules exist (failure history)
 

@@ -49,33 +49,35 @@ zf.plot(np.column_stack([xx.ravel(), yy.ravel()]), frame.ravel(),
         kind="2d", labels=("X (px)", "Y (px)", "counts"))
 
 <!-- cell:markdown -->
-## 3. 实时 2D：CameraFrameFeed + task console
+## 3. 实时 2D：相机 measurement 节点 + task console
 
-框架自带 `CameraFrameFeed`：每个 shot 抓一帧、publish 成信号 `frame`。它的**数据源就是相机**——在看板里点这张 2D 面板的 **Edit…**，标签里的 **Acquisition** 段会列出相机的 `exposure` / `roi`，改了点 **Apply** 就**实时重配相机**（不用重开）。task console 的 **2D image** 面板默认读 `frame`，所以开一个**只有一张 live 2D** 的看板即可。
+框架的 `CameraMeasurement`（相机 measurement 逻辑节点）：每个 shot 抓一帧、publish 成信号 `frame`。它的**数据源就是相机**——在看板里点这张 2D 面板的 **Edit…**，标签里的 **Acquisition** 段会列出相机的 `exposure` / `region`（ROI 端点），改了点 **Apply** 就**实时重配相机**（不用重开）。
 
-`%gui qt` 让 Jupyter 在 cell 之间替 Qt 窗口跑事件循环（看板的刷新 timer 才会动）；抓帧在 feed 的后台线程里，经线程安全的 `SignalHub` 交给看板。`rate_hz` 是抓帧节奏，真正多快还受触发频率 + 曝光限制。
+控制台是**解耦**的：plot 面板是纯视图，只有**连了 signal 且产它的节点在跑**才显示数据。所以这张 2D 面板用 `source="frame"` 显式连到 `frame`，并把相机 measurement 节点交给 `running_nodes=`（开窗即自动 `start`）。
+
+`%gui qt` 让 Jupyter 在 cell 之间替 Qt 窗口跑事件循环（看板的刷新 timer 才会动）；抓帧在节点的后台线程里，经线程安全的 `SignalHub` 交给看板。`rate_hz` 是抓帧节奏，真正多快还受触发频率 + 曝光限制。
 
 <!-- cell:code -->
 %gui qt
 
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
-from Zou_lab_control.neutral_atom.operations.feeds import CameraFrameFeed
+from Zou_lab_control.neutral_atom.operations.logic import CameraMeasurement
 
 hub = SignalHub()
-feed = CameraFrameFeed(hub, cam).start(rate_hz=4)
+node = CameraMeasurement(hub, cam).start(rate_hz=4)
 
 state = zf.TaskConsoleState(
     name="qcmos_live",
-    panels=[zf.PanelConfig(kind="2d", title="qCMOS live", size="2x2")],
+    panels=[zf.PanelConfig(kind="2d", title="qCMOS live", size="2x2", source="frame")],
 )
-console = zf.show_task_console(hub=hub, state=state, feeds=[feed])
+console = zf.show_task_console(hub=hub, state=state, running_nodes=[node])
 console
 
 <!-- cell:markdown -->
 ## 4. 收尾
 
-停 feed、关相机（关掉看板窗口本身也会停 feed）。
+停相机 measurement 节点、关相机（关掉看板窗口本身也会停所有节点）。
 
 <!-- cell:code -->
-feed.stop()
+node.stop()
 cam.close()

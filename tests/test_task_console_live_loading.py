@@ -164,10 +164,10 @@ def test_add_plot_is_blank_until_signal_set_and_node_started():
         exp.close()
 
 
-def test_task_logic_node_publishes_calibration_when_started():
-    """A calibrate Task added as a Logic node is STOPPED; Start runs it (its mid-run
-    + result land on the hub under cal_).  The whole loading readout is composed from
-    these decoupled nodes -- no monolithic composite."""
+def test_task_logic_node_produces_calibration_off_the_hub_when_started():
+    """A calibrate Task added as a Logic node is STOPPED; Start runs it.  Its result +
+    mid-run output land on the NODE (node.calibration / node.result / node.output),
+    NEVER the hub -- the hub carries only measurement + processor outputs."""
     exp = _calibrated_virtual_session()
     console = _console(exp)
     try:
@@ -176,17 +176,119 @@ def test_task_logic_node_publishes_calibration_when_started():
         _pick(console, ("task", "Calibrate readout"))
         row = console.logic_nodes[-1]
         assert console._logic_nodes[id(row)] is None      # stopped
-        assert "cal_centers" not in console.hub.names()
 
         console._start_logic_node(row)
         node = console._logic_nodes[id(row)]
         assert isinstance(node, CalibrateReadoutTask)
         deadline = time.monotonic() + 12.0
-        while "cal_centers" not in console.hub.names() and time.monotonic() < deadline:
+        while not getattr(node, "finished", False) and time.monotonic() < deadline:
             time.sleep(0.05)
-        names = set(console.hub.names())
-        assert {"cal_centers", "cal_thresholds", "cal_frame"} <= names
-        assert np.asarray(console.hub.latest("cal_centers")).shape == (12, 2)
+        assert node.finished
+        # result + calibration live on the INSTANCE; mid-run frame in the node's buffer
+        assert node.calibration is not None
+        assert np.asarray(node.result["centers"]).shape == (12, 2)
+        assert "frame" in node.output.names()
+        # the task put NOTHING on the hub (no cal_* signals leaked onto it)
+        assert not any(n.startswith("cal_") for n in console.hub.names())
+    finally:
+        console.shutdown()
+        exp.close()
+
+
+def test_running_task_takes_a_fixed_panel_and_locks_the_console():
+    """#5: while a task runs it OWNS the console (confocal-style) -- a dedicated
+    Monitor panel shows its mid-run output (read off the task's OWN buffer, not the
+    hub) and every other control is LOCKED (Add Panel / Edit no-op, header disabled);
+    only Stop / waiting is allowed.  When it finishes a tick releases the lock and the
+    transient panel is dropped."""
+    exp = _calibrated_virtual_session()
+    console = _console(exp)
+    try:
+        n_before = len(console.cards)
+        _pick(console, ("task", "Calibrate readout"))
+        row = console.logic_nodes[-1]
+        console._start_logic_node(row)
+
+        # LOCK engaged: dedicated task panel on the board + banner up + header disabled.
+        # (isHidden(), not isVisible(): the window isn't shown in a headless test, so
+        # isVisible() is always False -- isHidden() reflects the explicit shown flag.)
+        assert console._task_locked is True
+        assert console.task_banner.isHidden() is False
+        assert console._task_card is not None and console._task_card in console.cards
+        assert console.kind_combo.isEnabled() is False
+        # locked: Add Panel no-ops while a task owns the console (only the task panel
+        # was added; a second Add adds nothing).
+        console._add_panel()
+        assert len(console.cards) == n_before + 1
+
+        node = console._logic_nodes[id(row)]
+        deadline = time.monotonic() + 12.0
+        while not getattr(node, "finished", False) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert node.finished
+        assert node.output.latest("frame") is not None       # mid-run frame buffered (off hub)
+
+        # a tick detects completion -> lock released, banner hidden, transient panel gone.
+        console._tick()
+        assert console._task_locked is False
+        assert console.task_banner.isHidden() is True
+        assert console._task_card is None
+        assert console.kind_combo.isEnabled() is True
+        assert len(console.cards) == n_before
+        assert not any(n.startswith("cal_") for n in console.hub.names())
+    finally:
+        console.shutdown()
+        exp.close()
+
+
+def test_save_persists_edit_param_values_not_just_layout():
+    """#4: saving captures the CURRENT Edit-form parameter values (even for a node that
+    was never Started), not just the panel geometry; a JSON round-trip restores them."""
+    exp = _calibrated_virtual_session()
+    console = _console(exp)
+    try:
+        from Zou_lab_control.frontend.task_console import TaskConsoleState
+
+        _pick(console, ("task", "Calibrate readout"))
+        row = console.logic_nodes[-1]
+        editor = console._logic_editors[id(row)]
+        # edit a param in the Edit form WITHOUT starting the node
+        editor.form._widgets["calibration_frames"][1].setValue(9)
+        # read_state flushes the open Edit form into the node config
+        state = console.read_state()
+        assert state.logic[-1].values["calibration_frames"] == 9
+        # round-trip through JSON -> the edited value survives load
+        restored = TaskConsoleState.from_dict(state.to_dict())
+        assert restored.logic[-1].values["calibration_frames"] == 9
+    finally:
+        console.shutdown()
+        exp.close()
+
+
+def test_plot_edit_shows_producing_processor_param_form():
+    """#2: a plot's signal comes from a measurement/processor; the plot's Edit shows
+    THAT node's full parameter form (here the Judge-occupancy processor's
+    calibration/source/ema), prefilled -- not an empty section -- since the processor
+    exposes no live acquisition_parameters of its own."""
+    from Zou_lab_control.frontend.task_console import PanelConfig, PanelCard
+    exp = _calibrated_virtual_session()
+    console = _console(exp)
+    try:
+        # start a camera (publishes frame) + a Judge-occupancy processor (publishes occupied)
+        _pick(console, ("camera", "live"))
+        console._start_logic_node(console.logic_nodes[-1])
+        _pick(console, ("processor", "Judge occupancy"))
+        console._start_logic_node(console.logic_nodes[-1])
+        # a Plot reading the processor's `occupied` -> its Edit shows the processor's form
+        card = PanelCard(PanelConfig(kind="sites", source="value = occupied"),
+                         parent=console.board, names_provider=console.hub.names)
+        console._attach_card(card)
+        console._edit_card(card)
+        editor = console._panel_editors[id(card)]
+        assert editor.source_form is not None                          # not an empty source section
+        vals = editor.source_form.collect_values()
+        assert {"calibration", "source", "ema"} <= set(vals)           # the processor's full params
+        assert vals["source"] == "frame" and vals["calibration"] == ""  # prefilled defaults (#3)
     finally:
         console.shutdown()
         exp.close()

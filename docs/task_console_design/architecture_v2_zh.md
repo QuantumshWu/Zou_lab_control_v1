@@ -72,6 +72,8 @@ def live_image(camera, sequencer, *, exposure: Param(float, 0.1, unit='s'),
 - **update_mode**:`single/replace/roll/average/repeat`(注册表,可扩展);声明 `update_modes` 限定可选。
 - **publish**:返回 `{name: value}` → Hub publish(命名空间见 §8)。
 - **pulse 绑定**:扫描类用 `PulseScan('pulse_name','target')` 注解,运行时写 `PulseTableState` scan 表(已硬件化)。
+- **plot=True / plot=False 分流**:notebook 里直接 API 调一个 measurement(如 `readout.temperature(...)`)默认 `display=True` → 自动出适配的默认图(`ScannedMeasurement.run(display=True)`)。但在 task console / GUI 里,measurement 作为 logic 节点由 `ScannedMeasurementNode.step()` 逐点驱动、**只 publish 到 hub、从不调 `.run()`** ⇒ 等价 plot=False:不自动出图,用户自己加 Plot 面板按 signal 配。
+- **相机 measurement 的可编辑参数 = 相机自己的(`exposure` / `frames_per_cycle` / `region` ROI)**,经 `CameraMeasurement.acquisition_parameters / set_acquisition_parameters → camera.configure(exposure=, roi=)`。`region` 是传感器像素端点 `[x0,x1,y0,y1]`(空=全幅);端点↔设备 ROI 的换算只在 `set_acquisition_parameters` 一处。**虚拟相机与真机同一 `CameraDevice` 契约**,Edit 表单完全一致(`readout.camera_spec()` 声明这三个 ParamDecl,notebook 与 GUI 共用 `camera_spec().build(hub, exposure=, region=)`)。
 
 ## 5. Processor 层(= 用户的 func)
 
@@ -99,7 +101,16 @@ def calibrate_readout(camera, sequencer, *, n_frames: Param(int,200),
     return {'site_centers': centers, 'thresholds': thr}
 ```
 - task = 编排 measurement/processor/device + 文件夹流程;输出可为文件 + 少量标量。
-- **中途输出**:task 拿一个 `out` 通道(仿 confocal task),把中间帧/进度 publish 到一个**专用 panel**(§10)。能画的 publish 到 hub;不能画的写状态/文件。
+- **中途输出**:task 拿一个 `out`(`TaskOutput`)通道(仿 confocal task),把中间帧/进度写进它**自己的缓冲**(`node.output`),由 console 的固定面板读保留键 `__task_frame__` 显示(§10)。**不进 hub**(#6:hub 只承载 measurement+processor 输出);结果/标定留在 `node.result`/`node.calibration`,大产物写文件。
+
+### calibrate-readout task 的完整参数设计(`CalibrateReadoutTask` + `CALIBRATE_PARAMS`)
+所有参数声明一次(`operations/tasks/calibrate.py` 的 `CALIBRATE_PARAMS`,GUI 自动表单与 `readout.calibrate_task(**values)` 同读),逐项:
+- **source = live / folder**:`live` = 现在开相机直接采图;`folder`(+`data_dir`)= 用已存文件夹的图(`index_run` 读 `img<n>`)cali。
+- **两条 pulse(两个 readout duration)**:`sitemap` 这一遍用**较长** readout(更多光子 → site 中心 + PSF 拟合更干净),`threshold` 这一遍用**实际** readout(阈值要在真实读出条件下学)。各自:`sitemap_exposure`/`readout_exposure`(默认序列时长)或 `sitemap_pulse`/`readout_pulse`(已存 `PulseTableState .json`,经 `PulseTableState.load().to_sequence()` 当成像脉冲,空=默认序列)。`_imaging_seq(pulse, exposure, name)` 单点选择。
+- **mode = box / per-site PSF / uniform PSF**:`MODE_TO_SITEMAP_METHOD` 解析为 sitemap method `box`/`psf`/`uniform_psf`。
+- **threshold = otsu / bimodal**。
+- **save_path / load_path**:存/取标定(`TrapCalibration` = 站点中心 + 每站点阈值);给 `load_path` 直接复用已存 site+threshold、**不重新采图**。
+- 同一 `TrapCalibration` 契约(`calibrate_sitemap_from_images` / `calibrate_threshold_from_images`),虚拟与真机只差相机帧。守:`tests/test_task_cali_modes_and_plot_split.py`。
 
 ## 7. 参数注解 + 自动 UI 引擎
 
@@ -125,15 +136,20 @@ def calibrate_readout(camera, sequencer, *, n_frames: Param(int,200),
 ## 9. virtual == real(#2 真做)
 
 - virtual camera **只产 qCMOS 帧**(经 `acquire`/ring)。
-- "看 loading"= `live_image`(产 frame)+ `detect_occupancy`(processor 逐帧 frame→occupied/rate)两个独立节点;cali 由 `calibrate_readout`(task)先跑、存 npz,processor 读它。**由独立节点组合而成,没有单个节点全产**。
+- "看 loading"= `CameraMeasurement`(相机 measurement,产 `frame`)+ `DetectProcessor`(processor 逐帧 `frame`→`occupied`/`rate`,跑真 `calibration.detect`)两个独立节点;cali 由 `CalibrateReadoutTask`(task)先跑、写回标定 / 存 npz,DetectProcessor 用它。**由独立节点组合而成,没有单个节点全产**。
 - 由 `tests/test_virtual_equals_real_contract.py` 守:分析层不 import 后端、不读仿真真值;端到端虚拟读出走同一契约。
 
-## 10. 三种 Edit + panel Setting 清理(#3)
+## 10. 两个常驻 tab(Monitor / Logic)+ 解耦 + 三种 Edit
 
-- **Measurement Edit**:只有参数表单(§7)+ Start/Stop/update_mode;**无 fit**(无意义)。
-- **Plotter Edit**:fit 栈(DataFigure)+ relim/colorset 等 plotter 项 + **它所连 measurement 的参数表单**(可就地改重启)。
-- **Task Edit**:参数表单 + Run + 进度;中途输出 → 专用 panel。
-- panel Setting:非 plot 面板**去掉只对 plotter 有用的项**(fit/colorset/relim 只在 plotter Edit 出现)。
+- **两个不可关 tab**:`Monitor`(plot 面板的拖拽板)+ `Logic`(measurement/processor/task 逻辑节点的列表)。控制台开局 **空 hub、不自动启动任何东西**。
+- **VIEW / LOGIC 解耦**:加一个 **Plot** 面板 = 纯 VIEW,**不会启动任何 measurement**;它一开始空白,只有在 Setting 里配了 signal **且**产出该 signal 的逻辑节点被 Start 之后才显示。空 hub 时 plot 的 signal 选择器只有 `(expression)`,不会凭空冒一堆 signal。
+- 加一个 **measurement / processor / task** = 一个 **Logic 节点行**进 Logic tab,**默认停**(行点灰 GREY)。在它**自己的 Edit** 里 Start(行点绿 GREEN)/ Stop;出错红 RED(`LogicNodeRow.STATE_COLORS`)。控制台两套集合:`console.logic_nodes` = Logic 行(声明,不管跑不跑都在);`console.running_nodes` = 当前在跑的已建节点(Start 时 append、Stop 时 remove)。
+- **三种 Edit**:
+  - **Logic 节点 Edit**(measurement/processor/task/camera):其 ParamDecl 自动表单(§7;相机来自 `readout.camera_spec()`)+ Start/Stop;**无 fit**(fit 是 plotter 的事)。
+  - **Plot 面板 Edit**:Source 段 = 产出该图信号的 measurement/processor 节点的**完整参数表单**(预填其当前值;Apply 对 camera 等 live 参数原地下发、否则重建重跑该源节点,#2)+ fit 栈(DataFigure)+ relim/colorset 等 plotter 项 + manual lim;**无 Start/Stop**(节点在它自己的 Logic Edit 起停)。一个 plot 的 signal 总来自某 measurement/processor,所以从 plot 也能看/调它的源参数。
+  - measurement 在 GUI 强制 plot=False(见 §4),所以 Plot 与 measurement 解耦于**生命周期**(加 plot 不启动任何东西),但 plot Edit 仍能调它**当前所读源**的参数。
+- **没有 preset**:Add Panel 只有 plot / measurement / processor / task 四类(无自造 readout 复合体);唯一可复用的布局是你 Save 出来的文件(Load / `--task` 读回),save 含各 Edit 表单参数(#4),无内置预设。
+- **task 运行接管控制台**(#5,confocal 式):Start 一个 task 时,console 在 Monitor 开一张**固定**面板显示它的 `node.output` 中途帧(读保留键 `__task_frame__`,不经 hub,#6),顶部橙色横幅 “Task running …%”,并**禁用其他一切操作**(Add/Save/Load/Edit/其他节点 Start),只留 Stop;task 完成或 Stop 后解锁并撤掉该瞬态面板。`console._running_task_row`/`_task_card`/`_task_locked` + `_refresh_task_panel`(在 `_tick` version-gate 前,因 task 输出不 bump hub version)。
 
 ## 11. signal legend 排版(#1)
 
@@ -157,14 +173,14 @@ panel 空白处的"读/发信号"图例:加**左右 padding**,过长**按需分�
 
 - **相机最近帧 ring**:`CameraDevice` 提供 `recent_capacity`/`latest`/`drain`/`recent_frames`/`clear_recent`,`acquire` 末尾经 `_retain(images)` 入 ring(virtual 与 qcmos 共用,qcmos 不 override ⇒ virtual==real);snapshot 含 roi 对齐。
 - **节点基类与 KIND**(`operations/logic.py`):所有逻辑节点继承 `LogicNode`。`Measurement` 类节点带 `UPDATE_MODES`+`update_mode`;`CameraMeasurement` 与 `ScannedMeasurementNode` 都是其子类。`Processor` 为 reactive:`new_inputs()` 按 hub 每信号版本只在输入前进时发,`step()` 返回空 dict = no-op(skip-on-empty)。`DetectProcessor(Processor)` 逐帧跑 `calibration.detect(frame)` → `occupied/counts/rate/rate_sites/rate_grid/centers/thresholds`,是**真 detect 流程**:相机 measurement 只发 `frame`,DetectProcessor 单独跑 detect,`occupied == cal.detect(frame).occupied`。
-- **Task 层**:`Task` 基类是 one-shot——`run(out)` 跑完发 result + `task_done` 自停;`TaskOutput` 把中途数值信号(`frame`/`progress`)推到 hub 供专用 panel。`CalibrateReadoutTask` 跑真 sitemap+threshold → `self.calibration`,存 npz 产物并中途出帧。完整 loading 读出 = device + task + processor 组合(无单体节点),全程 virtual==real。
+- **Task 层**:`Task` 基类是 one-shot——`run(out)` 跑完把结果存上 `self.result` 后自停,`Task.shot()` 向 hub **发 0 信号**、`Task.published_signals()` 为空(#6:task 不进 hub)。`TaskOutput`(`node.output`)是 task 自有缓冲(非 hub),`run` 把中途数值信号(`frame`/`progress`)写进它供固定面板(`__task_frame__`)显示。`CalibrateReadoutTask` 跑真 sitemap+threshold → `self.calibration`,存 npz 产物并中途出帧。完整 loading 读出 = device + task + processor 组合(无单体节点),全程 virtual==real。
 - **update_mode 行为**:`LogicNode.step` 经 `_postprocess` 钩子分派;`Measurement._postprocess` 实现 roll/replace 透传、`single` 发一次自停、`average` 累计均值、`repeat=N` 攒 N 发均值(中途 tick suppress 返回 `{}`)。
 - **参数引擎**(`operations/params.py`):注解 spec(`Param/Choice/ScanArray/SignalRef/PulseScan`)+ `ParamField` 记录 + `params_from_signature(fn)`(用 `inspect.signature(eval_str=True)` 解 PEP 563 字符串注解,跳过 `INJECTED`=hub/camera/sequencer/out/calibration/prefix,保序)。前端 auto_form 鸭子类型读 `ParamField` 属性(不 import,保持解耦)。
 - **`auto_form`**(`frontend/auto_form.py`):`AutoForm(fields, current=, signal_names=)` 把 ParamField list 渲染成 fluent 行(float/int/str→LineEdit、bool→CheckBox、choice→Combo、signal→可编辑 Combo、array/pulse_scan→`start:stop:step`/逗号 LineEdit),`values()`/`set_values()` 往返;鸭子类型读 ParamField(不 import operations,保解耦);密封。`parse_scan_text` 解析扫描数组。
-- **节点基类复用线程/取消/参数队列**:`LogicNode` 是 worker-loop 生产者 + owner-thread 参数队列(`apply_acquisition_parameters`/`_apply_pending_params`/`acquisition_epoch`)+ 协作取消(`stop` event)+ 错误 banner(`node_error`)。`update_mode` 注册表 + 从 build 函数签名派生参数取代手列 `acquisition_parameters`。loading 读出拆成三节点:标定(find_site_centers+estimate_thresholds)→ `calibrate_readout` task;逐帧 detect(roi_counts>thresholds)→ `detect_occupancy` processor;采帧 → `live_image` measurement(只发 `frame`,多触发用 `drain()`)。`ScannedMeasurementNode` 为扫描型(update_mode='replace')。
-- **loading 组合入口**:`build_loading_readout` 产组合三节点(calibrate task + camera measurement 发 `frame` + DetectProcessor 跑真 `calibration.detect`);`virtual_loading_readout` 是其虚拟便利工厂,`readout.live_loading_readout`、launcher、console `_add_live_loading_panel` 均经它。
-- **task 中途输出专用 panel**:`build_loading_readout` 把 calibrate task 的 `TaskOutput` 命名空间设为 `<prefix>cal_`(`cal_frame`/`cal_progress`,不撞 live `frame`);`_add_live_loading_panel` 加一个 2d "Calibrating (task output)" 面板读 `value = cal_frame`(confocal task 式中途过程)。
-- **panel role 与三 Edit**(`frontend/task_console.py`):`PanelConfig.role` ∈ `PANEL_ROLES=("plot","measurement","task")`(持久化,缺省 "plot"),在 Add Panel 建面板时定——结果面板 measurement→"measurement"、processor 面板→"task"、纯图/loading 视图→"plot"。三 Edit 按 role 组装(`PanelEditor` 的 `is_plot` 门):plot=全套(产它的 measurement 参数表单 + 采集参数 + plot 参数 + 快照 + 全 fit 栈 + manual limits);measurement=measurement 参数表单 + 快照(选区→扫描范围回写)**无 fit / 无 limits / 无 plot 参数 / 无采集**;task=data-processing 参数表单 + Run + 快照,同样无 fit。`do_fit`/`fill_limits`/`apply_limits` 经 guard(`fit_combo`/`xmin` 预置 None)。fit 由 **role** 门、绝不由 plot kind 门。
-- **Setting 去 plotter-only 项**:非 plot role 不建 relim/unit 行(纯轴显示),保留 source/size/colormap/title/actions。`_spec_for_card` 双路解析(显式 `params["measurement"]` 或按 source 信号匹配 measurement 的 x/y_key),所以一张 plot-role 图指到某 measurement 的结果信号时,它的 plotter Edit 自动带上那 measurement 的参数表单。
+- **节点基类复用线程/取消/参数队列**:`LogicNode` 是 worker-loop 生产者 + owner-thread 参数队列(`apply_acquisition_parameters`/`_apply_pending_params`/`acquisition_epoch`)+ 协作取消(`stop` event)+ 错误 banner(`node_error`)。`update_mode` 注册表 + 从 build 函数签名派生参数取代手列 `acquisition_parameters`。loading 读出拆成三节点(§4–§6 代码块里的 `live_image`/`detect_occupancy`/`calibrate_readout` 是示意签名,真实节点类如下):标定(find_site_centers+estimate_thresholds)→ `CalibrateReadoutTask`(task);逐帧 detect(roi_counts>thresholds)→ `DetectProcessor`(processor);采帧 → `CameraMeasurement`(measurement,只发 `frame`,多触发用 `drain()`)。`ScannedMeasurementNode` 为扫描型(update_mode='replace')。
+- **loading 读出 = 用户用三类节点自己拼**(无 `build_loading_readout` 组合入口、无自造 "Readout: Loading" 复合体):在 Logic tab 加一个 `Measurement: Camera (live frames)`(`readout.camera_measurement`→`CameraMeasurement`,发 `frame`)+ 一个 `Processor`(逐帧 `DetectProcessor` 跑真 `calibration.detect`)+ 一个 `Task: Calibrate readout`(先跑、写回标定 / 产 npz),各自 Start,再在 Monitor 加 Plot 面板按 signal 连。launcher(`task_console.py`)`na.connect` 后只 `sitemap`/`thresholds` 自标定让 catalog 能跑,console 开 **空 hub、全停**,不自动建/启任何读出。
+- **task 输出不进 hub**(#6):`Task` 自带 `TaskOutput` 缓冲(`node.output`,非 hub),`run(out)` 把中途帧/进度写进它;`Task.shot()` 向 hub 发 **0** 信号、`Task.published_signals()` 为空,结果/标定留在 `node.result`/`node.calibration`。**hub 只承载 measurement + processor 输出**——一次性 task 的瞬态帧永不混进 live 信号或被误当读出。console 起 task 时把 `node.output` 绑到 Monitor 一张**固定**面板(保留键 `__task_frame__`,见 §10),`TaskSpec.mid_run_key` 选缓冲键(如 `frame`)。
+- **panel 永远是 plot 视图 + 两类 Edit 各属一套类**(`frontend/task_console.py`):`PanelConfig.role` ∈ `PANEL_ROLES=("plot",)`——board 上的 panel **只有 plot 一种角色**(纯视图),不再有 measurement/task 角色面板。两类 Edit 分属两套类:`PanelEditor`(plot 面板的 Edit,`is_plot` 恒真)= Acquisition(它所读信号的**产出 logic 节点**自报的源参数 + Apply 原地下发)+ Parameters(plot 自己的 API 参数)+ Processing(快照 + 全 fit 栈 + manual limits + Save);`LogicNodeEditor`(Logic tab 上 measurement/processor/task/camera 节点的 Edit)= 该节点 ParamDecl 自动表单 + Start/Stop,**无 fit / 无 limits**(拟合是 plotter 的事,去 Plot 面板做)。`do_fit`/`fill_limits`/`apply_limits` 经 guard(`fit_combo`/`xmin` 预置 None);fit 由 **role(恒 plot)** 门、绝不由 plot kind 门。
+- **plot 面板 Edit 的 Acquisition 区 = 数据源(logic 节点)自报参数**(解耦,#4):`PanelEditor` 经 `console._producing_node(card)` 找到产这张图所读信号的 logic 节点,用 `console._node_params(node)`(节点 `acquisition_parameters()` 自报)列出可编辑源参数(相机 = `exposure`/`frames_per_cycle`/`region`),每格带 `now:` 当前值,Apply 经 `_restart_node` 把改动**原地**下发(`camera.configure` 实时重配,不 start——节点从它自己的 Logic-tab Edit start)。plot 面板**绝不**自带某 measurement 的"参数表单 + Start"(`PanelEditor.meas_panel` 恒 None);要重跑一个扫描就去 Logic tab 调那节点。Setting 弹窗只留 source/size/colormap/relim/unit/title/actions。
 - **信号流向(谁→谁→谁)**:`_node_chain(node)` 沿 Processor 的 `consumes` 回溯到上游产出节点(camera ▸ detect),折进每面板 footer 的 "from …" 行。节点的 `layer`/`node_label`/`display_label` 给 footer 提供层名,footer 形如 `from camera ▸ detect [processor]`。
-- **`@task` 注册表(对称 `@processor`)**:`TaskSpec`(name/build(hub)→Task/mid_run_key/default_kind/prefix)+ `@task`/`register_task`/`discovered_task_specs`(按 prefix 去重防信号撞车)+ 内置 `@task calibrate_readout`(build 走 `readout.calibrate_task`)+ `readout.task_specs()`。console 的 `tasks=` 参数喂 kind_combo 列 `Task: <name>`,`_add_task_panel(spec)` 通用(spec.build(hub) + 中途 `spec.mid_run_signal()` 面板)。task 参数 + Run 走 Task 自己的 `acquisition_parameters`(`CalibrateReadoutTask` 含它 + `mid_run=("frame","progress")`,`Task.published_signals` 含 mid_run 让中途面板能映射回 task)。Add Panel 三类直接暴露每层:`Measurement: Camera (live frames)`(`readout.camera_measurement`→`CameraMeasurement`)、`Processor: <名>`、`Task: <名>`、`Readout: Loading(组合)`。PanelEditor Acquisition 区 gate = `spec is None and proc_spec is None`(camera/task 无 MeasurementSpec 时靠它显示参数)。
+- **`@task` 注册表(对称 `@processor`)**:`TaskSpec`(`name`/`build(hub)`→Task/`params`(ParamDecl 列)/`mid_run_key`/`default_kind`/`prefix`)+ `@task`/`register_task`/`discovered_task_specs` + 内置 `@task calibrate_readout`(build 走 `readout.calibrate_task(hub, prefix="cal_", **values)`)+ `readout.task_specs()`。console 的 `tasks=` 喂 kind_combo 列 `Task: <name>`;选中 Add Panel → `_add_logic_node(LogicNodeConfig(kind="task", name=...))` 加一个**停着的 Logic 行**(与 measurement/processor 同路),Start 时 `_build_logic_node` 走 `spec.build(self.hub, **values)`。task 参数 + Run 走 Task 自己的 `acquisition_parameters`(`CalibrateReadoutTask` 含它 + `mid_run=("frame","progress")`);**task 不向 hub publish**——中途帧在 `node.output` 缓冲,由 console 固定面板显示(§10、#6)。kind_combo 严格四类:`Plot: <kind>` / `Measurement: Camera (live frames)`(`readout.camera_measurement`→`CameraMeasurement`)+ `Measurement: <扫描名>` / `Processor: <名>`(如反应式 `Judge occupancy`)/ `Task: <名>`——无自造 "Readout: Loading" 复合体。

@@ -286,20 +286,21 @@ temp_fit.summary()   # {'temperature_uK': ~44..50, 'capture_radius_m': 6e-06, 's
 
 task_console 的设计原则是**自由搭建**——看板开出来是空的，你从 **Add Panel** 一路自己搭。把 `session=exp` 传进去（让看板能用相机建连续生产者）+ `measurements` / `processors`，Add Panel 就分成清晰的几类：
 
-- **Data processing: Loading readout**（组合读出）：点它 → 建**三个独立节点**（标定 task + 相机 measurement 发 `frame` + detect processor 跑真 `calibration.detect`）+ 一张 “Loading rate” 监视图 + 一张 “Calibrating” 中途输出图（看标定模板帧 `cal_frame`，confocal task 式）。标定在它**自己的线程**里跑、不卡界面；就绪后流式发布 `rate` / `occupied` / `centers` / `rate_sites` / `frame`。**这就是 loading rate 的来源——相机出帧、真流程检测，没有单体 feed。**
-- 然后**自由加视图**读这些信号：Add Panel → `Plot: Site map`，在 Setting 里把 source 写 `value = occupied`（占据图：圈画在相机帧上，centers 自动取 `centers` 信号）；`Plot: 2D` + `value = frame`（原始图）；`Plot: 1D` + `value = rate_sites`（逐站点装载率）。
-- **Data processing: Detect sites / Readout fidelity**（一次性）：从存盘帧检测站点 / 算逐站点保真度。
+- **Measurement: Camera (live frames)**：连续出帧的相机测量，只发一个信号 `frame`。这是整条 loading 读出链的源头——相机出帧、真流程检测，再没有别的隐藏环节。
+- **Processor: Judge occupancy**（判占据，reactive）：消费 `frame`、跑**真** `calibration.detect`，流式发布 `occupied` / `counts` / `rate` / `rate_sites` / `rate_grid` / `centers` / `thresholds`。参数是**从哪载入标定**（site/PSF/阈值，留空用 `session` 当前标定）+ `source` + `ema`。
+- **Task: Calibrate readout**（一次性工作流）：在**自己的线程**里跑标定、不卡界面；它**不往 hub 发任何信号**——结果落在 `task.result`，中途帧/进度写进它自己的 `TaskOutput` 缓冲。运行时它占一张**固定 Monitor 面板**看中途模板帧、并锁定其它操作只留 **Stop task**（confocal task 式）。
+- 然后**自由加视图**读 measurement / processor 发的信号：Add Panel → `Plot: Site map`，在 Setting 里把 source 写 `value = occupied`（占据图：圈画在相机帧上，centers 自动取 `centers` 信号）；`Plot: 2D` + `value = frame`（原始图）；`Plot: 1D` + `value = rate_sites`（逐站点装载率）。
 - **Measurement: …**（扫描）：温度 / 读出时长，默认绑曲线图。
 
-每张面板底部都列出它**读 / 发**了哪些信号（重名会标 ⚠），所以不用猜 hub 里有什么名字。要调 Live readout 的 `grid_shape` / `exposure` / `roi_radius` / `ema`，在那张图的 **Edit → Acquisition** 里改 + **Apply**（两帧之间应用，不停 feed）。换实机只改 `na.connect("virtual"→"qcmos")`，这一节一字不变。
+每张面板底部都列出它**读 / 发**了哪些信号（重名会标 ⚠），所以不用猜 hub 里有什么名字（hub 里只有 measurement + processor 的输出，没有 task）。要调相机/判占据的 `grid_shape` / `exposure` / `roi_radius` / `ema`，在那个节点**自己**的 Edit 标签里改 + **Apply**（两帧之间应用，不中断采集）；plot 面板的 Edit 直接给产它信号的那个 measurement/processor 的参数表单。换实机只改 `na.connect("virtual"→"qcmos")`，这一节一字不变。
 
 <!-- cell:code -->
 %gui qt
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
 
 hub = SignalHub()
-# session=exp 让 Add Panel 能从相机建 "Data processing: Loading readout"(组合读出);
-# 看板开出来是空的 —— Add Panel -> "Data processing: Loading readout" 看 loading rate,
+# session=exp 让 Add Panel 能从相机建 "Measurement: Camera (live frames)";
+# 看板开出来是空的 —— Add Panel -> Camera(发 frame) + Processor: Judge occupancy(真 detect),
 # 再 Add Panel -> Plot: Site map (value = occupied) / Plot: 2D (value = frame) 自己搭。
 console = zf.show_task_console(hub=hub, session=exp,
                               measurements=exp.readout.measurement_specs(),

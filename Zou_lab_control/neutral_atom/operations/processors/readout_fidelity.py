@@ -61,10 +61,12 @@ def readout_fidelity(readout) -> ProcessorSpec:
         }
         # The site centers (N, 2) so the default 'sites' atom map can place its
         # circles standalone (no live logic node needed): read from the calibration the
-        # characterization just used/updated -- not recomputed here.
+        # characterization just used/updated -- not recomputed here.  Published under a
+        # processor-UNIQUE key (the live 'Judge occupancy' processor owns plain
+        # ``centers``; two processors may not publish the same hub signal).
         cal = readout.current
         if cal is not None:
-            out["centers"] = np.asarray(cal.centers, dtype=float)
+            out["fidelity_centers"] = np.asarray(cal.centers, dtype=float)
         # report.summary() is all scalars -> the numeric pane (single source: the
         # report owns these names, we just republish them).
         out.update({str(k): float(v) for k, v in report.summary().items()})
@@ -78,7 +80,7 @@ def readout_fidelity(readout) -> ProcessorSpec:
         name="Readout fidelity",
         params=params,
         run=run,
-        result_keys=("fidelity_site", "fidelity_threshold", "centers") + summary_keys,
+        result_keys=("fidelity_site", "fidelity_threshold", "fidelity_centers") + summary_keys,
         summary_keys=summary_keys,
         default_kind="sites",            # per-site fidelity map (the existing atom kind)
         default_value_key="fidelity_site",

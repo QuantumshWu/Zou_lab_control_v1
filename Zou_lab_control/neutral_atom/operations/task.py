@@ -38,10 +38,12 @@ class TaskSpec:
     subsystem) configured with the chosen parameter values.  ``params`` declares
     the task's tunable parameters as :class:`ParamDecl`s, so a GUI auto-generates
     the SAME validated form a measurement/processor uses (single param mechanism).
-    ``mid_run_key`` is the task's mid-run output signal the dedicated panel shows
-    while it runs (e.g. ``frame`` -> the template frame), ``default_kind`` is that
-    panel's plot kind, and ``prefix`` is the task's hub namespace (so its signals
-    never clobber a live stream)."""
+    ``mid_run_key`` is the key into the task's mid-run output BUFFER
+    (:class:`~.logic.TaskOutput`) that its dedicated panel shows while it runs (e.g.
+    ``frame`` -> the template frame), ``default_kind`` is that panel's plot kind.  A
+    task's output is a per-task buffer, NOT the hub (the hub carries only measurement +
+    processor outputs), so ``prefix`` merely identifies the task node -- it namespaces
+    no hub signal."""
 
     name: str
     build: Callable[..., Any]          # build(hub, *, prefix=..., **param_values) -> Task
@@ -63,10 +65,6 @@ class TaskSpec:
         """The declared default value for every parameter, keyed by ``key``."""
 
         return {decl.key: decl.default for decl in self.params}
-
-    def mid_run_signal(self) -> str:
-        """The fully-namespaced mid-run signal a dedicated panel reads (``cal_frame``)."""
-        return f"{self.prefix}{self.mid_run_key}"
 
 
 __all__ = ["TaskSpec", "ParamDecl"]

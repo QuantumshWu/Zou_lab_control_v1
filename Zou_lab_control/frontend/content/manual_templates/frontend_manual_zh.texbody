@@ -880,11 +880,11 @@ scan_table = np.linspace(0, 1000, 11).astype(int).reshape(-1, 1)
 \section{它是什么}
 Task 控制台（\filepath{task\_console.bat} / \pyapi{frontend.show\_task\_console}）是\tfocus{实验侧}的可配置仪表盘：一个网格里摆任意多个\tfocus{实时面板}，每个面板用一个\tfocus{信号名或一小段表达式}接到实验数据上。把布局设计好之后\tfocus{按名字保存成一个"任务仪表盘"}（如 \pyapi{atom\_loading\_monitor}），以后一条命令就能整套载回——实验室里每类日常实验配一套自己的监控台。
 
-数据通路分三层，互相只通过\tfocus{信号集线器（SignalHub）}耦合：
+数据通路分五层（device / measurement / processor / task / plot），互相只通过\tfocus{信号集线器（SignalHub）}耦合：
 \begin{description}
   \item[\pyapi{SignalHub}（\filepath{neutral\_atom/core/signals.py}）] 线程安全的命名信号环：实验循环每个 shot \pyapi{publish} 一批命名值（标量或数组），控制台轮询 \pyapi{latest}/\pyapi{history}，用版本号跳过无新数据的刷新。
-  \item[生产者（\filepath{neutral\_atom/operations/feeds.py}）] 三类共用 \pyapi{Producer} 发布循环的生产节点。\pyapi{Measurement} 驱动设备采集并发命名信号（如相机 \pyapi{CameraFrameFeed} 发 \pyapi{frame}、扫描型 \pyapi{ScannedMeasurementFeed} 让有限扫描在 Monitor 里逐点长出 live 曲线、自停）；\pyapi{Processor} 是无采集的\tfocus{反应式}变换节点（“func”层），消费 hub 信号、republish 派生信号，如 \pyapi{DetectProcessor} 用与真机读出\tfocus{相同}的 \pyapi{calibration.detect} 契约把 \pyapi{frame} 变成 \pyapi{counts}（逐站计数）/\pyapi{occupied}（占据）/\pyapi{rate}（滚动装载率）/\pyapi{rate\_sites}/\pyapi{rate\_grid}/\pyapi{centers}/\pyapi{thresholds}；\pyapi{Task} 是一次性编排（如 \pyapi{CalibrateReadoutTask} 产 \pyapi{TrapCalibration}+npz 产物、中途把模板帧流到专用面板）。标准装载读出由 \pyapi{build\_loading\_readout} 把这三者\tfocus{组合}起来（标定 task + 相机 measurement + detect processor），\tfocus{没有单体 feed 一次造出所有信号}——每个节点只经 \pyapi{CameraDevice} 契约取帧,换真机只换传入的 \pyapi{camera}。离线便利工厂 \pyapi{devices.virtual.virtual\_loading\_readout} 用一个 \pyapi{VirtualCamera} 把同一组合包好（唯一虚拟之处=相机数据源）。所有生产者都可同步驱动（\pyapi{step()}，测试/Notebook）或后台线程（\pyapi{start(rate\_hz=...)}）。
-  \item[面板（panel）] 即 frontend live 绘图类的复用，所有图内交互（滚轮缩放、中键平移、右键十字、框选、拖 clim/阈值线）原样可用。
+  \item[逻辑节点（\filepath{neutral\_atom/operations/logic.py}）] 三类生产节点共用 \pyapi{LogicNode} 基类（同一 worker-loop + 协作取消 + owner-thread 参数队列）。\pyapi{Measurement} 驱动设备采集并发命名信号（相机 \pyapi{CameraMeasurement} 发 \pyapi{frame}、扫描型 \pyapi{ScannedMeasurementNode} 让有限扫描在 Monitor 里逐点长出 live 曲线、自停）；\pyapi{Processor} 是无采集的\tfocus{反应式}变换节点（“func”层），消费 hub 信号、republish 派生信号，如 \pyapi{DetectProcessor} 用与真机读出\tfocus{相同}的 \pyapi{calibration.detect} 契约把 \pyapi{frame} 变成 \pyapi{counts}（逐站计数）/\pyapi{occupied}（占据）/\pyapi{rate}（滚动装载率）/\pyapi{rate\_sites}/\pyapi{rate\_grid}/\pyapi{centers}/\pyapi{thresholds}；\pyapi{Task} 是一次性编排（如 \pyapi{CalibrateReadoutTask} 产 \pyapi{TrapCalibration}+npz 产物、中途把模板帧流到一个面板）。\tfocus{装载读出由你用这三类节点自己拼}（标定 task + 相机 measurement + detect processor），\tfocus{没有单体节点一次造出所有信号}——每个节点只经 \pyapi{CameraDevice} 契约取帧，换真机只换传入的 \pyapi{camera}（唯一虚拟之处=相机数据源）。所有节点都可同步驱动（\pyapi{step()}，测试/Notebook）或后台线程（\pyapi{start(rate\_hz=...)}）。
+  \item[面板（panel）] 即 frontend live 绘图类的复用，所有图内交互（滚轮缩放、中键平移、右键十字、框选、拖 clim/阈值线）原样可用。plot 面板是\tfocus{纯视图}，只订阅信号名，与采集\tfocus{解耦}（加一张 plot 不启动任何东西，见下）。
 \end{description}
 
 \section{六种面板类型}
@@ -893,7 +893,7 @@ Task 控制台（\filepath{task\_console.bat} / \pyapi{frontend.show\_task\_cons
   \item[Site map（\pyapi{LiveSiteMap}）] \tfocus{原子阵列站点图}：每个阱位一个实心圆，颜色编码该站的值（占据 0/1、逐站装载率、保真度……），底下可垫一张实时相机帧。站点位置来自一个 \pyapi{centers} 信号（$(N,2)$ 相机像素坐标，真实实验里就是 \pyapi{TrapCalibration.centers}）。主图与 colorbar 的几何与 2D 面板逐像素对齐。
   \item[Distribution（\pyapi{HistogramFigure}）] 直方图 + 自动双高斯拟合 + 可拖阈值线 + 保真度文本——把 \pyapi{history('counts', 200).ravel()} 接进来就是读出阈值的实时体检。
   \item[Rolling trace（\pyapi{LiveLiveDis}）] 标量滚动轨迹 + 右侧分布（直方图 + 高斯 σ 拟合），图内右上角常显最新值。保真度、温度等"一条曲线盯一个数且关心其分布"的场景用它。
-  \item[Rolling trace (no dist)（\pyapi{LiveLive}）] \tfocus{同样的滚动轨迹但去掉右侧分布带}——对装载率这类\tfocus{右侧直方图/σ 拟合没有物理意义}的量,用这个变体(整条轨迹占满宽度,仍显最新值)。它是\tfocus{独立的 plot type}：带分布的 \pyapi{LiveLiveDis} 反过来\tfocus{继承}它、在其上\tfocus{加}分布带,而不是在一个类上切布尔开关。控制台\tfocus{裸默认}就是单个这种面板（自己 Add Panel 拼出想要的 task group）;\pyapi{atom\_loading\_monitor} 预设的"Loading rate"面板也用它。
+  \item[Rolling trace (no dist)（\pyapi{LiveLive}）] \tfocus{同样的滚动轨迹但去掉右侧分布带}——对装载率这类\tfocus{右侧直方图/σ 拟合没有物理意义}的量,用这个变体(整条轨迹占满宽度,仍显最新值)。它是\tfocus{独立的 plot type}：带分布的 \pyapi{LiveLiveDis} 反过来\tfocus{继承}它、在其上\tfocus{加}分布带,而不是在一个类上切布尔开关。装载率这类量:Add 一个这种 plot 面板、把 Source 指到某 processor 发的 \pyapi{rate} 信号即可(控制台开局空,布局由你自己拼+Save,无内置预设)。
   \item[1D vector（\pyapi{Live1D}）] 一维向量逐点连线（逐站装载率、逐站计数……横轴是站号）。
 \end{description}
 
@@ -902,8 +902,8 @@ Task 控制台（\filepath{task\_console.bat} / \pyapi{frontend.show\_task\_cons
 \begin{description}
   \item[Source（接什么数据）] \pyapi{signal} 下拉列出 hub 里\tfocus{此刻真实存在的所有信号名}——选一个，面板立即切到 \pyapi{value = 信号名}，不用打字。要做运算（差值、切片、历史堆叠）就在下面的表达式框写一行 Python 并点 \pyapi{Apply}（或回车）；下拉会自动回显纯信号表达式。命名空间：每个信号名（最新值）、\pyapi{history(name, n)}、\pyapi{latest(name)}、\pyapi{names()}、\pyapi{shot}、\pyapi{np}、\pyapi{math}。表达式出错时 \pyapi{Setting} 按钮变红，错误只落在\tfocus{该面板自己}的状态行，其余面板照常刷新。
   \item[Display（怎么显示）] \pyapi{size} 尺寸预设；2D / Site map 的 \pyapi{colormap}——\tfocus{这就是改 colorbar 配色（colorset）的地方}（没有"显隐 colorbar"开关，因为带 colorbar 的图恒显 colorbar）；以及各类型的\tfocus{声明式参数}（\pyapi{PANEL\_PARAMS} 里一行一个 \pyapi{ParamSpec}，控件由声明自动生成）：Site map 的 \pyapi{centers}/\pyapi{image} 信号名（\pyapi{image} 留空＝不垫相机帧）、Rolling trace 的历史长度、Distribution 的 bin 数。
-  \item[relim 与 Unit] Display 段最后两行是\tfocus{轴控制}：\pyapi{relim} 下拉用 confocal\_gui 的 \pyapi{combo\_relim} 命名 \pyapi{tight}（紧贴数据自适应）/ \pyapi{normal}（带边距自适应），写进 \pyapi{config.params["relim"]}——这与 Control 标签页 \pyapi{ed\_relim} 是\tfocus{同一个 key}（单一真相源，绝不漂移）；\pyapi{Unit} 按钮 + 右侧当前 unit 倍数。点一次在该轴单位环上前进一档（GHz/nm/MHz 或 ns/us/ms 等，复用 \pyapi{DataFigure.change\_unit}），轴标签无定义单位时是 no-op；当前 \pyapi{unit\_index} \tfocus{随布局 JSON 一起保存}，重建时由 \pyapi{\_apply\_display\_params} 重新应用——所以"这张卡我切到 normal + us"保存/载入/重建后都保持。\tfocus{Setting 没有手动 x/y 上下限输入}（confocal\_gui 也没有）——细看用画布缩放 / 拖拽，需要 freeze 数据数字钉范围请在 \pyapi{Edit…} 进 Control 段做。
-  \item[Panel（这张卡）] 标题（显示在图内，改动通过 \pyapi{BaseLivePlot.\_apply\_title} → \pyapi{style.apply\_title} 走密封 API，字号永远是 \pyapi{title\_fontsize()}）；一行操作 \pyapi{Remove}（移除）、\pyapi{Edit…}（打开 Control 标签页做命令行拟合 / 手动 lim / 详细处理）、\pyapi{Save Fig}（一键导出 \pyapi{png} + \pyapi{npz} 到 tasks/，时间戳命名）。
+  \item[relim 与 Unit] Display 段最后两行是\tfocus{轴控制}：\pyapi{relim} 下拉用 confocal\_gui 的 \pyapi{combo\_relim} 命名 \pyapi{tight}（紧贴数据自适应）/ \pyapi{normal}（带边距自适应），写进 \pyapi{config.params["relim"]}——这与该面板 Edit 标签里的 relim 控件是\tfocus{同一个 key}（单一真相源，绝不漂移）；\pyapi{Unit} 按钮 + 右侧当前 unit 倍数。点一次在该轴单位环上前进一档（GHz/nm/MHz 或 ns/us/ms 等，复用 \pyapi{DataFigure.change\_unit}），轴标签无定义单位时是 no-op；当前 \pyapi{unit\_index} \tfocus{随布局 JSON 一起保存}，重建时由 \pyapi{\_apply\_display\_params} 重新应用——所以"这张卡我切到 normal + us"保存/载入/重建后都保持。\tfocus{Setting 没有手动 x/y 上下限输入}（confocal\_gui 也没有）——细看用画布缩放 / 拖拽，需要 freeze 数据数字钉范围请在 \pyapi{Edit…} 标签的 Processing 段做。
+  \item[Panel（这张卡）] 标题（显示在图内，改动通过 \pyapi{BaseLivePlot.\_apply\_title} → \pyapi{style.apply\_title} 走密封 API，字号永远是 \pyapi{title\_fontsize()}）；一行操作 \pyapi{Remove}（移除）、\pyapi{Edit…}（打开该面板自己的 Edit 标签做命令行拟合 / 手动 lim / 详细处理）、\pyapi{Save Fig}（一键导出 \pyapi{png} + \pyapi{npz} 到 tasks/，时间戳命名）。
 \end{description}
 \begin{notebox}
 弹窗用 \pyapi{FluentPopup}（\filepath{qt\_fluent.py}）：\tfocus{半透明、无边框}的顶层 \pyapi{Qt.Popup}，圆角白卡由 \pyapi{paintEvent} 抗锯齿描一笔（填充 + 1px 边框）。两条教训：① 不可在\tfocus{不透明}顶层弹窗上用样式表 \pyapi{border-radius}——方形窗体留在圆弧外，右下角露出方角白块（那条"奇怪的线"），Windows 还叠一层原生阴影；② 光加 \pyapi{WA\_TranslucentBackground} 不够，它会让样式表背景\tfocus{整块不画}（弹窗变透明）。所以圆角卡\tfocus{自己画}。边框是画出来的、不是样式表规则，因此也\tfocus{绝不会级联}到 QLabel/QComboBox 等子控件。
@@ -922,8 +922,8 @@ value = rate_grid - b_rate_grid        # 两个实验相减 -> 2D
 
 每个面板是一张\tfocus{带阴影的标题卡片}（fluent 卡片设计），卡框标题＝面板类型，画布下方、卡片底部一行灰色状态行（当前 shot 与来源表达式回显）。排版不用填行列数字：\tfocus{按住卡片边框（画布以外的任何空白处）拖动}，松手时卡片自动\tfocus{吸附到网格槽}；布局走\tfocus{重力压实}（\pyapi{\_compact}）——每张卡在自己的列内\tfocus{向上落}到上方卡或顶端为止，于是结果\tfocus{既不重叠、也不留竖向空隙}（拖动 / 删除 / 改尺寸后都自动重排成顶部紧凑的网格）；刚拖动的那张\tfocus{平局优先}，保留你放下的列与行，其余卡绕着它回流。卡片外框恰好等于整数个布局槽（卡框状态行区吸收图边距的模数差额），所以\tfocus{一张 $2\times2$ 卡严格等于两张 $1\times2$ 卡叠起来加一道间隙}，任意尺寸混排严丝合缝。标题栏：\pyapi{Add Panel} 按所选类型加面板、\pyapi{Save} / \pyapi{Load} 存取布局 JSON；面板值形状变化（换表达式/尺寸/参数）自动重建该面板。
 
-\section{每面板 Edit 标签：参数 / 全套拟合 / 测量重跑}
-窗口\tfocus{只有一个常驻标签} \pyapi{Monitor}（实时网格）——\tfocus{没有空的全局 Control 标签}。每个面板各有\tfocus{自己的 Edit 标签}：点面板的 \pyapi{Edit…}，标签栏多开一个\tfocus{可关闭}的处理标签（右上一个\tfocus{柔和的 × 关闭键}，灰色、悬停才高亮，不是刺眼红叉；多个面板可并排各开一个，关掉即销毁）。重控件全在这里，绝不压垮 Setting 弹窗。
+\section{两个常驻标签 + 每面板/每节点的 Edit 标签}
+窗口有\tfocus{两个常驻（不可关）标签}：\pyapi{Monitor}（plot 面板的实时拖拽网格）和 \pyapi{Logic}（measurement / processor / task 逻辑节点的列表，每行一个状态点 + Edit）——\tfocus{没有空的全局 Control 标签}。\tfocus{plot 面板}各有自己的 Edit 标签（点面板的 \pyapi{Edit…}），\tfocus{logic 节点}各有自己的 Edit 标签（点 Logic 行的 \pyapi{Edit…}）：标签栏多开一个\tfocus{可关闭}的标签（右上一个\tfocus{柔和的 × 关闭键}，灰色、悬停才高亮，不是刺眼红叉；多个可并排各开一个，关掉即销毁）。重控件全在这里，绝不压垮 Setting 弹窗。
 
 \subsection{从 Add Panel 建节点：按架构层全暴露}
 连了会话(\pyapi{show\_task\_console} 传 \pyapi{session=} + \pyapi{measurements=}/\pyapi{processors=}/\pyapi{tasks=}；\pyapi{--config} / 虚拟启动都自动传)后,标题栏的 \pyapi{Add Panel} 下拉把\tfocus{五层架构里每个可加的节点}按层列出,而不只是 6 种 plot kind:
@@ -933,45 +933,45 @@ value = rate_grid - b_rate_grid        # 两个实验相减 -> 2D
   \item \pyapi{Measurement: Camera (live frames)}——\tfocus{相机持续流}(一等可加的 measurement 节点,不再埋在 loading 读出里),其 Edit 就是相机自己的 exposure/region;
   \item \pyapi{Measurement: <扫描名>}——自动发现的扫描测量(温度、读出保真度...);
   \item \pyapi{Processor: <名>}——“func”层变换节点(逐帧 detect、逐站保真度...);
-  \item \pyapi{Task: <名>}——一次性编排(如 \pyapi{Calibrate readout}),Edit = 参数 + \pyapi{Run} + 一张专用\tfocus{中途输出}面板(看它跑时的模板帧,confocal task 式);
-  \item \pyapi{Readout: Loading (camera+detect+calibrate)}——一键\tfocus{组合}(把相机 measurement + detect processor + 标定 task 接好)。
+  \item \pyapi{Task: <名>}——一次性编排(如 \pyapi{Calibrate readout}),Edit = 参数 + \pyapi{Run}。task \tfocus{不向 hub publish}:结果/标定留在节点上,中途模板帧 + 进度写进它自己的缓冲(\pyapi{node.output})。\pyapi{Run} 时控制台在 Monitor 自动开一张\tfocus{固定}面板显示它跑时的过程(读保留键 \pyapi{\_\_task\_frame\_\_},不经 hub),并以橙色横幅\tfocus{锁定其他一切操作只留 Stop}(confocal task 式);完成/Stop 后解锁并撤掉该瞬态面板。
 \end{itemize}
+装载读出\tfocus{没有一键复合体}：自己加 \pyapi{Measurement: Camera (live frames)} + \pyapi{Processor: Judge occupancy} + \pyapi{Task: Calibrate readout} 三个节点拼出来——每层独立、信号显式相连。
 
 measurement / processor / task 三份目录都是\tfocus{自动发现的}:往 \pyapi{operations/measurements/}、\pyapi{operations/processors/}、\pyapi{operations/tasks/} 丢一个带 \pyapi{@measurement}/\pyapi{@processor}/\pyapi{@task} 装饰的工厂模块,\tfocus{下次开 task\_console 它就在对应下拉组里},无需改任何 list(临时用 \pyapi{register\_measurement}/\pyapi{register\_processor}/\pyapi{register\_task})。选一个再 \pyapi{Add Panel},就在 Monitor 板建它的节点 + 面板\tfocus{并打开它的 Edit 标签}——节点的参数表单 + Start/Run 就在那里。\tfocus{没有单独的全局发起器}。
 
-\tfocus{节点 Edit 按角色组装}:plot 面板的 Edit 有曲线 fit + 手动 lim + (若它读某测量的结果信号)那测量的参数表单;measurement / task 面板的 Edit 只有该节点自己的参数表单(\tfocus{无 fit}——拟合是 plotter 的事),task 还多一个 \pyapi{Run}。面板底部 footer 的信号图例用\tfocus{层名}显示信号来路(如 \pyapi{from camera [measurement]}、\pyapi{from camera > detect [processor]}),绝不漏 Python 类名。
+\tfocus{两类 Edit 各属一套}:plot 面板的 Edit 有曲线 fit + 手动 lim + Acquisition（它所读信号的\tfocus{产出节点}自报的源参数 + Apply），\tfocus{但绝不内嵌某测量的"参数表单 + Start"}——那在该 logic 节点自己（Logic tab）的 Edit 里；logic 节点（measurement / processor / task）的 Edit 只有该节点自己的参数表单 + Start/Stop（\tfocus{无 fit}——拟合是 plotter 的事，去 Plot 面板做），task 的 Start 即 \pyapi{Run}。面板底部 footer 的信号图例用\tfocus{层名}显示信号来路（如 \pyapi{from camera [measurement]}、\pyapi{from camera > detect [processor]}），绝不漏 Python 类名。
 
 \subsection{Edit 标签（PanelEditor）的内容}
 整页\tfocus{可滚动}（快照再大也不会把底部控件挤出可视区）。内容\tfocus{不与 Setting 重叠}（Setting 只留 源 / 尺寸 / colormap / relim / unit）：
 \begin{description}
-  \item[Acquisition（编辑数据源的采集参数）] 一张 \pyapi{plot} 角色面板是\tfocus{视图}，它的数据由一个后台 \pyapi{Producer} 生产，背后是\tfocus{数据源}——相机本身，或一个变换节点。Edit 顶部列出该\tfocus{数据源经 \pyapi{acquisition\_parameters()} 自报的可编辑参数}：一张原始相机帧面板（\pyapi{CameraFrameFeed}）列出相机的 \pyapi{exposure} / \pyapi{roi}；一张占据面板（\pyapi{DetectProcessor}）列出它的 detect 设置。每格预填\tfocus{当前正在跑的值}并在下方标 \pyapi{now: <值>} 供改参时参照；改完点 \pyapi{Apply} 就把改动\tfocus{原地}推给数据源（相机即 \pyapi{configure} 实时重配），活面板以同一信号名无缝续刷。\tfocus{所以一张 qCMOS live 2D 的 Edit 就能直接调相机曝光/ROI}。（measurement / task 角色面板的源就是它自己的参数表单，见下。）
+  \item[Acquisition（编辑数据源的采集参数）] 一张 plot 面板是\tfocus{视图}，它读的信号由某个\tfocus{逻辑节点}生产，背后是\tfocus{数据源}——相机本身，或一个变换节点。Edit 顶部列出该\tfocus{数据源经 \pyapi{acquisition\_parameters()} 自报的可编辑参数}：一张原始相机帧面板（源是 \pyapi{CameraMeasurement}）列出相机的 \pyapi{exposure} / \pyapi{region}（ROI 端点）；一张占据面板（源是 \pyapi{DetectProcessor}）列出它的 detect 设置。每格预填\tfocus{当前正在跑的值}并在下方标 \pyapi{now: <值>} 供改参时参照；改完点 \pyapi{Apply} 就把改动\tfocus{原地}推给数据源（相机即 \pyapi{configure} 实时重配，\tfocus{不重启节点}——节点从它自己在 Logic tab 的 Edit Start），活面板以同一信号名无缝续刷。\tfocus{所以一张 qCMOS live 2D 的 Edit 就能直接调相机曝光/ROI}。（plot 面板\tfocus{绝不}自带某 measurement 的"参数表单 + Start"，那在 Logic 节点自己的 Edit 里——见下。）
   \item[Parameters（plot 的 API 参数）] 该面板\tfocus{plot 调用里可变的参数}自动铺成 GUI 控件（\pyapi{length} / \pyapi{bins} / \pyapi{centers} / \pyapi{image}……，由该 kind 的声明\tfocus{自动发现}）；改一下就\tfocus{实时重渲染}活面板与快照。colormap 是\tfocus{唯一}留在 Setting 的显示旋钮，其余功能参数都在这里——两边永不重复。
-  \item[Measurement（测量面板专属）] 若该面板来自一个 measurement，顶部内嵌\tfocus{该测量的参数表单（自动生成、带校验）+ Start/Stop}：扫描范围 → min/max/points 三框、标量 → spin（带 lo/hi/unit）、布尔 → 复选、必填缺失带 \pyapi{*}。\tfocus{改完参数点 Start 就用新参数重跑这张 Monitor 面板}（复用同一张卡，不堆叠）；参数随面板存，重开自动回填。GUI 的 Start 与 notebook 一行（如 \pyapi{exp.readout.temperature(...)}）\tfocus{调同一个建器}，两边不漂移。普通（非测量）面板没有这一段。\tfocus{框选自动读范围}：在 Edit 快照上拖一个矩形区域，\pyapi{AreaSelector} 的 x 范围\tfocus{自动填进上面测量表单的 x 扫描参数}的 min/max 框（学 \pyapi{confocal\_gui} 的 \pyapi{area.callback}）——填的是\tfocus{扫描参数}本身、不是坐标轴 lim。
+  \item[框选写回源的采集参数（不再是内嵌测量表单）] plot 面板\tfocus{不}内嵌某测量的"参数表单 + Start"——那在该 measurement 作为 Logic 节点时它\tfocus{自己}的 Edit 里（Logic tab，见上）。这里保留的是\tfocus{框选写回}：在 Edit 快照上拖一个矩形（或缩放/平移），\pyapi{\_read\_region} 把端点 \pyapi{(x\_min,x\_max,y\_min,y\_max)} 交给产这张图的\tfocus{源节点}的 \pyapi{region\_to\_acquisition\_parameters}，源各转各的格式（相机节点→ROI 矩形、二维扫描→两条轴范围），\tfocus{填进上面 Acquisition 段的对应输入框}，点 \pyapi{Apply} 生效（学 \pyapi{confocal\_gui} 的 \pyapi{area.callback}；缩放/平移与框选共用同一回调，框选 OVERRIDE）。填的是\tfocus{采集参数}本身、不是坐标轴 lim。
   \item[Fit（全套 data\_figure）] 模型下拉是\tfocus{完整的 DataFigure 集合}（Lorentzian / Gaussian / Lorentzian (Zeeman) / Rabi / Exp decay / \tfocus{2D center}），\tfocus{不按 plot 类型门控}——2D 图用 2D 高斯 \pyapi{center} 拟合，其余拟合 1D 轨迹。一行自由文本拟合参数（\pyapi{p0=[...]} 初值、\pyapi{名字=值} 固定、\pyapi{is\_fit=False} 只叠加不优化）+ \pyapi{Fit}/\pyapi{Clear}；底层 \pyapi{DataFigure}（与 notebook 的 \pyapi{p.data\_figure.lorent()} 同源）。
   \item[手动 x/y lim + 冻结快照 + Save Fig] 四个数字框 + \pyapi{Apply lim}（调 \pyapi{DataFigure.xlim/ylim}，作用在快照上，打开时自动回填）；快照\tfocus{照搬 Monitor 那张卡的 size}（与活面板\tfocus{同尺寸}、绝不裁切——不再强塞一个固定 2x4 撑破窄视区）+ \pyapi{Refresh} 重抓 + \pyapi{Save Fig}（\pyapi{<标题>.png} + \pyapi{.npz} 到 \filepath{tasks/}）。
 \end{description}
 \tfocus{选择器分工}：Monitor 卡\tfocus{禁用所有选择器}（\pyapi{interactions=False} + \pyapi{isolate\_wheel=False}）——滚轮直接\tfocus{滚仪表盘}、绝不被框选/缩放吞掉；选择器（缩放、拖阈值线、\pyapi{AreaSelector} 框选读范围）\tfocus{只在 Edit 快照上启用}。每个 Edit 标签是\tfocus{独立快照}，不打扰 Monitor 实时刷新；relim / unit 这类只在 Setting，避免重复。
 
-\section{命名任务仪表盘：设计一次，随处载回}
-布局（面板、位置、尺寸、表达式、参数）整包存成\tfocus{一个 JSON}，文件名就是任务名。三个入口完全等价：
+\section{保存 / 载入布局：设计一次，随处载回}
+布局（面板、位置、尺寸、表达式、参数 + Logic 节点声明）整包存成\tfocus{一个 JSON}，文件名就是任务名。\tfocus{没有内置预设}——唯一的"任务"就是\tfocus{你自己 Save 出来的布局}。三个入口完全等价：
 \begin{itemize}
-  \item \tfocus{GUI}：标题栏的 \pyapi{Presets…} 下拉列出全部可载任务（内置 + \filepath{tasks/} 目录里的每个 JSON），选中即整套载入；\pyapi{Save} 默认存到 \filepath{tasks/任务名.json}，存完立即出现在下拉里。\pyapi{Save*} 黄星＝有未保存改动（与脉冲编辑器同语义）。
-  \item \tfocus{命令行}：\pyapi{task\_console.bat --task atom\_loading\_monitor}。
-  \item \tfocus{Notebook}：\pyapi{zf.show\_task\_console(hub=hub, task="atom\_loading\_monitor")}。
+  \item \tfocus{GUI}：标题栏 \pyapi{Save} 默认存到 \filepath{tasks/<任务名>.json}（任务名即左上的名字框）；\pyapi{Load} 选一个 JSON 整套载回。\pyapi{Save*} 黄星＝有未保存改动（与脉冲编辑器同语义）。\tfocus{没有 Presets 下拉}（删了所有内置预设）。
+  \item \tfocus{命令行}：\pyapi{task\_console.bat --task <你存的名字>}（读 \filepath{tasks/<名字>.json} 或一个 JSON 路径）。
+  \item \tfocus{Notebook}：\pyapi{zf.show\_task\_console(hub=hub, task="<你存的名字>")}。
 \end{itemize}
-内置两套出厂任务：\pyapi{atom\_loading\_monitor}（装载图 + 占据 Site map + 计数分布 + 装载率轨迹 + 逐站条）与 \pyapi{loading\_rate\_live}（轻量装载率监控，无相机大图）。\tfocus{在 \filepath{tasks/} 里保存同名 JSON 即覆盖内置版本}——想改造出厂布局，载入、拖一拖、Save 就完成了。配置一套新任务（比如 \pyapi{atom\_temp\_monitor}）的完整流程：载入最接近的现有任务 → 增删面板、把 Source 指到温度实验发布的信号 → 改任务名 → \pyapi{Save}。
+配置一套新监控台的完整流程：开一个空控制台 → 从 Add Panel 加 Logic 节点（相机 measurement / 扫描测量 / processor / task）并 Start、加 Plot 面板把 Source 指到它们发布的信号 → 改任务名 → \pyapi{Save}。以后一条命令整套载回——实验室里每类日常实验配一套自己的监控台。
 
 \section{启动与接线}
-双击 \filepath{task\_console.bat}（或 \pyapi{python task\_console.py}）即以\tfocus{虚拟实验}启动：走\tfocus{与真机同一个 \pyapi{connect()} 契约}连一个虚拟实验（只有相机帧是仿真的），主 loading 读出（\pyapi{build\_loading\_readout} 组合的标定 task + 相机 measurement + detect processor）与 \pyapi{--config} 完全一致,并\tfocus{把自动发现的测量目录接进 Add Panel}(于是开箱就能选任何测量连接、Start 真出曲线);默认再加一个 \pyapi{b\_} 前缀副读出让 $A-B$ 类表达式有数据。\tfocus{裸默认}板上只一个无侧分布的装载率 live(自己 Add Panel 拼出 task group)。常用参数：\pyapi{--config remote\_template}（\tfocus{真机直跑}:连真实设备、用同一组合读出契约流送实时装载——首光站点/阈值标定仍在 notebook 做，见 \filepath{docs/REAL\_HARDWARE\_BRINGUP\_zh.md}）、\pyapi{--grid 5x7}（阵列形状,虚拟与 \pyapi{--config} 通用）、\pyapi{--task 名字}（命名任务，如 \pyapi{atom\_loading\_monitor}）、\pyapi{--rate 4}（shot/s）、\pyapi{--seed 7}（副 feed 可复现）、\pyapi{--single}（不开 \pyapi{b\_} 副 feed）、\pyapi{--state xxx.json}（按路径载入）、\pyapi{--no-feed}（不开任何源，自己接 hub）。
+双击 \filepath{task\_console.bat}（或 \pyapi{python task\_console.py}）即以\tfocus{虚拟实验}启动：走\tfocus{与真机同一个 \pyapi{connect()} 契约}连一个虚拟实验（只有相机帧是仿真的），\pyapi{sitemap}/\pyapi{thresholds} 自标定让目录里的 measurement / processor / task 能跑，再把\tfocus{自动发现的三份目录接进 Add Panel}——但控制台开局 \tfocus{空 hub、全停}，\tfocus{不自动建/启任何读出}（解耦的 VIEW / LOGIC 模型）。看 loading 你自己从 Logic tab 加 \pyapi{Measurement: Camera (live frames)} + \pyapi{Processor: Judge occupancy} + \pyapi{Task: Calibrate readout} 并 Start，再加 Plot 面板连它们的信号。常用参数：\pyapi{--config remote\_template}（\tfocus{真机直跑}：连真实设备、同一 \pyapi{connect()} 契约——首光站点/阈值标定仍在 notebook 做，见 \filepath{docs/REAL\_HARDWARE\_BRINGUP\_zh.md}）、\pyapi{--grid 5x7}（阵列形状，虚拟与 \pyapi{--config} 通用）、\pyapi{--task 名字}（载入你存的命名布局）、\pyapi{--state xxx.json}（按路径载入布局）、\pyapi{--scale}（UI 缩放，默认 auto）、\pyapi{--no-connect}（不连任何会话，自己接 hub）。
 
-从 Notebook 接\tfocus{真实实验}：建一个 hub，开控制台，在实验循环里每个 shot publish 一次——发布的信号集尽量沿用虚拟 feed 的命名（\pyapi{frame}/\pyapi{counts}/\pyapi{occupied}/\pyapi{centers}/\pyapi{rate}……），这样同一套命名任务在虚拟和真机之间\tfocus{零修改通用}：
+从 Notebook 接\tfocus{真实实验}：建一个 hub，开控制台（开局空——自己加 Plot 面板把 Source 指到下面 publish 的信号，或 \pyapi{task="你存的布局"} 整套载回），在实验循环里每个 shot publish 一次——发布的信号集尽量沿用约定信号名（\pyapi{frame}/\pyapi{counts}/\pyapi{occupied}/\pyapi{centers}/\pyapi{rate}……），这样同一套命名布局在虚拟和真机之间\tfocus{零修改通用}：
 \begin{codeblock}[Python]
 from Zou_lab_control import frontend as zf
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
 import Zou_lab_control.neutral_atom as na
 
 hub = SignalHub()
-console = zf.show_task_console(hub=hub, task="atom_loading_monitor")
+console = zf.show_task_console(hub=hub)   # 开局空；自己加 Plot 面板把 Source 指到下面 publish 的信号
 
 exp = na.connect("virtual")            # 真实实验换成对应 config
 centers = exp.readout.sitemap(frames=12, display=False).calibration.centers
@@ -988,7 +988,7 @@ for shot in range(1000):
 读出保真度一类的慢量也一样：算出来 \pyapi{hub.publish(\{"fidelity": f\})}，再开一个 Rolling trace 面板把 Source 指到 \pyapi{fidelity} 即可。
 
 \section{给维护者：扩展面板}
-给某类面板\tfocus{加一个参数}＝在 \filepath{frontend/task\_console.py} 的 \pyapi{PANEL\_PARAMS} 里加一行 \pyapi{ParamSpec(键, 标签, 类型, 默认值, ...)}（类型 \pyapi{choice}/\pyapi{int}/\pyapi{signal}），Setting 控件、JSON 保存与图重建全部自动跟上；在对应的 \pyapi{\_build\_plot} 分支里消费 \pyapi{config.params[键]}。\tfocus{加一种新面板类型}：在 \filepath{frontend/live.py} 写一个 \pyapi{BaseLivePlot} 子类并进 \pyapi{plot()} 工厂的 kind 分发（几何必须走 \pyapi{panel\_plot\_spec} 的共享区域与边距），然后在 \pyapi{PANEL\_KINDS}/\pyapi{\_DEFAULT\_SOURCES}/\pyapi{PANEL\_PARAMS} 各加一项、\pyapi{\_coerce}/\pyapi{\_build\_plot}/\pyapi{\_feed} 各加一个分支。可视化改动必须用 \pyapi{devtools.capture\_user\_view} 三档缩放截图验收（\pyapi{parity} 目标同屏对比两个 GUI 的控件尺寸）。
+给某类面板\tfocus{加一个参数}＝在 \filepath{frontend/task\_console.py} 的 \pyapi{PANEL\_PARAMS} 里加一行 \pyapi{ParamSpec(键, 标签, 类型, 默认值, ...)}（类型 \pyapi{choice}/\pyapi{int}/\pyapi{signal}），Setting 控件、JSON 保存与图重建全部自动跟上；在对应的 \pyapi{\_build\_plot} 分支里消费 \pyapi{config.params[键]}。\tfocus{加一种新面板类型}：在 \filepath{frontend/live.py} 写一个 \pyapi{BaseLivePlot} 子类并进 \pyapi{plot()} 工厂的 kind 分发（几何必须走 \pyapi{panel\_plot\_spec} 的共享区域与边距），然后在 \pyapi{PANEL\_KINDS}/\pyapi{PANEL\_PARAMS} 各加一项、\pyapi{\_coerce}/\pyapi{\_render}/\pyapi{\_build\_plot} 各加一个分支。可视化改动必须用 \pyapi{devtools.capture\_user\_view} 三档缩放截图验收（\pyapi{parity} 目标同屏对比两个 GUI 的控件尺寸）。
 
 
 \chapter{对外接口完整参考}
@@ -1115,21 +1115,24 @@ zf.show_pulse_gui(*, state=None, channels=None, sequencer=None,
 
 \textbf{完整签名}：
 \begin{codeblock}[Python]
-zf.show_task_console(*, hub, state=None, task=None, feeds=(),
-                     measurements=(), scale=None, window_ratio=0.84,
-                     title="TaskConsole@Zou lab") -> TaskConsole
+zf.show_task_console(*, hub, state=None, task=None, running_nodes=(),
+                     measurements=(), processors=(), tasks=(), session=None,
+                     scale=None, window_ratio=0.84,
+                     title="TaskConsole@Zou lab", on_close=None) -> TaskConsole
 \end{codeblock}
 
-\textbf{每个参数}：\pyapi{hub}（必填，SignalHub 实例——数据总线）；\pyapi{state}（显式 TaskConsoleState 布局）；\pyapi{task}（\tfocus{命名任务}：内置 \pyapi{atom_loading_monitor}/\pyapi{loading_rate_live}、\pyapi{tasks/} 里的 JSON、或 JSON 路径；\pyapi{state} 优先于 \pyapi{task}）；\pyapi{feeds}（后台生产者循环序列）；\pyapi{measurements}（\tfocus{可驱动的测量目录}，一摞 \pyapi{MeasurementSpec}，通常传 \pyapi{exp.readout.measurement\_specs()}——这是个\tfocus{自动发现的目录}，内置 + 任何新写的 \pyapi{@measurement} 都在其中；传进来后每个都\tfocus{列进标题栏 Add Panel 下拉}可选中连接，为空则下拉只有 plot kind）；\pyapi{scale}/\pyapi{window_ratio}/\pyapi{title}（窗口外观）。
+\textbf{每个参数}：\pyapi{hub}（必填，SignalHub 实例——数据总线）；\pyapi{state}（显式 TaskConsoleState 布局）；\pyapi{task}（\tfocus{你存的布局}：\pyapi{tasks/} 里的 JSON 名或一个 JSON 路径，\tfocus{没有内置预设}；\pyapi{state} 优先于 \pyapi{task}）；\pyapi{running_nodes}（预挂的逻辑节点序列，开窗时\tfocus{自动 start}——已在跑的保留自己的速率；\pyapi{TaskConsole.\_\_init\_\_} 故意不 start，留给测试/Notebook 确定性手动 \pyapi{step()}）；\pyapi{measurements}/\pyapi{processors}/\pyapi{tasks}（\tfocus{自动发现}的三份目录，通常传 \pyapi{exp.readout.measurement\_specs()}/\pyapi{processor\_specs()}/\pyapi{task\_specs()}——每个都\tfocus{列进标题栏 Add Panel 下拉}的对应组，选中 Add 成一个 Logic 节点；为空则下拉只有 plot kind）；\pyapi{session}（\pyapi{exp}，相机/标定等节点建器从它取设备；\pyapi{--config}/虚拟启动都自动传）；\pyapi{scale}/\pyapi{window_ratio}/\pyapi{title}（窗口外观）；\pyapi{on_close}（关窗回调，如 \pyapi{exp.close} 一并 disconnect/safe 设备）。
 
 \textbf{示例}：
 \begin{codeblock}[Python]
-console = zf.show_task_console(hub=hub, task="atom_loading_monitor",
-                              measurements=exp.readout.measurement_specs())
+console = zf.show_task_console(hub=hub, session=exp,
+                              measurements=exp.readout.measurement_specs(),
+                              processors=exp.readout.processor_specs(),
+                              tasks=exp.readout.task_specs())
 \end{codeblock}
-然后实验循环里 \pyapi{hub.publish(...)}（见"Task 控制台"章接线示例），或从 Add Panel 选 Temperature 建面板、在它的 Edit 标签一键 Start。
+然后实验循环里 \pyapi{hub.publish(...)}（见"Task 控制台"章接线示例），或从 Add Panel 选 Temperature 建一个 Logic 节点、在它\tfocus{自己}的 Edit 标签一键 Start，再加 Plot 面板连它发布的信号。
 
-\textbf{不可配置的边界}：面板几何/卡片排版/吸附网格由 frontend 拥有；可配的只有 kind + size + Source 表达式 + 声明式参数 + Setting 的基本显示项（cbar/unit/lim）。
+\textbf{不可配置的边界}：面板几何/卡片排版/吸附网格由 frontend 拥有；可配的只有 kind + size + Source 表达式 + 声明式参数 + Setting 的基本显示项（colormap/relim/unit）。
 
 \section{SignalHub —— 仪表盘数据契约}
 \textbf{导入}：\pyapi{from Zou_lab_control.neutral_atom.core.signals import SignalHub}（它是控制台的数据总线）。
@@ -1142,8 +1145,8 @@ console = zf.show_task_console(hub=hub, task="atom_loading_monitor",
 
 \textbf{示例}：\pyapi{hub.publish(\{"counts": c, "rate": r, "shot": float(s)\})}，再开一个 Rolling trace 面板把 Source 指到信号名即可。
 
-\section{Measurement 框架 —— 给 Control 段喂可一键扫描的测量}
-\textbf{一句话用途}：把一个"扫一个被绑定的脉冲参数、每点采几帧、约简成一条曲线"的测量声明一次，\tfocus{API 一行与 GUI Start 按钮同源}地跑它。这些类在 \pyapi{Zou_lab_control.neutral_atom.operations.measurement} 与 \pyapi{...operations.feeds}；\tfocus{目录入口}是子系统方法 \pyapi{exp.readout.measurement\_specs()}。
+\section{Measurement 框架 —— 一键可扫描的测量（Logic 节点）}
+\textbf{一句话用途}：把一个"扫一个被绑定的脉冲参数、每点采几帧、约简成一条曲线"的测量声明一次，\tfocus{API 一行与 GUI Start 按钮同源}地跑它。这些类在 \pyapi{Zou_lab_control.neutral_atom.operations.measurement}（声明 \pyapi{MeasurementSpec}/\pyapi{ParamDecl}）与 \pyapi{...operations.logic}（\pyapi{ScannedMeasurementNode} 包装）；\tfocus{目录入口}是子系统方法 \pyapi{exp.readout.measurement\_specs()}。
 
 \textbf{\pyapi{exp.readout.measurement\_specs() -> list[MeasurementSpec]}}：返回 GUI 可驱动的测量目录(内置温度 + 读出时长,加上任何新发现/注册的)。\tfocus{这个目录是自动发现的、不是写死的 list}:它由 \pyapi{operations.measurement\_registry} 装配——\pyapi{operations/measurements/} 包里每个 \pyapi{@measurement} 工厂 + notebook 里 \pyapi{na.register\_measurement(...)} 的。直接传给 \pyapi{show\_task\_console(measurements=...)}。
 
@@ -1153,15 +1156,15 @@ console = zf.show_task_console(hub=hub, task="atom_loading_monitor",
 
 \textbf{\pyapi{ParamDecl}（一个参数的声明）}：\pyapi{ParamDecl(key, label, kind, default, unit="", lo=0.0, hi=1e12, required=False, choices=(), tooltip="")}。\pyapi{kind} $\in$ \{\pyapi{float}, \pyapi{int}, \pyapi{axis\_range}（值=\pyapi{(min,max,points)}，GUI 出三框）, \pyapi{bool}, \pyapi{choice}\}。\tfocus{任何值都不被 eval}——消费方按 \pyapi{kind} 校验/强转（confocal 的"不自由文本 eval"教训）。
 
-\textbf{\pyapi{ScannedMeasurementFeed}（把扫描测量包成 console feed）}：\pyapi{ScannedMeasurementFeed(hub, measurement, *, x\_key, y\_key, grid\_shape=None, prefix="")}。每个 \pyapi{shot()} 前进\tfocus{一个扫描点}并 publish 累积曲线 \pyapi{\{x\_key: x[:k], y\_key: y[:k], scan\_done, shot\}}（逐站点测量另发 \pyapi{<y\_key>\_sites}/\pyapi{<y\_key>\_grid}）。\tfocus{有限扫描自停}：最后一点发布后置 stop，后台 \pyapi{start()} 线程自退；\pyapi{finished} 报告完成，\pyapi{run\_to\_completion()} 同步跑完剩余点（测试/headless）。它只碰 \pyapi{measure} 与 \pyapi{hub.publish}，零 import 具体后端、零读仿真真值（虚拟==实机）。GUI 的一键 Start 内部就是建一个这个 feed。
+\textbf{\pyapi{ScannedMeasurementNode}（把扫描测量包成 Logic 节点）}：\pyapi{ScannedMeasurementNode(hub, measurement, *, x\_key, y\_key, grid\_shape=None, prefix="")}（在 \pyapi{operations.logic}，与 \pyapi{CameraMeasurement} 同为 \pyapi{LogicNode} 子类）。每个 \pyapi{step()} 前进\tfocus{一个扫描点}并 publish 累积曲线 \pyapi{\{x\_key: x[:k], y\_key: y[:k], scan\_done, shot\}}（逐站点测量另发 \pyapi{<y\_key>\_sites}/\pyapi{<y\_key>\_grid}）。\tfocus{有限扫描自停}：最后一点发布后置 stop，后台 \pyapi{start()} 线程自退；\pyapi{finished} 报告完成，\pyapi{run\_to\_completion()} 同步跑完剩余点（测试/headless）。它只碰 \pyapi{measure} 与 \pyapi{hub.publish}，零 import 具体后端、零读仿真真值（虚拟==实机）。GUI 里一个 \pyapi{Measurement: <扫描名>} Logic 节点 Start 时内部就是建一个这个 Node（\tfocus{只 publish 到 hub、不自动出图}——plot=False，你自己加 Plot 面板连它发布的信号）。
 
 \textbf{示例（headless 跑一个温度扫描并喂 hub）}：
 \begin{codeblock}[Python]
-from Zou_lab_control.neutral_atom.operations.feeds import ScannedMeasurementFeed
+from Zou_lab_control.neutral_atom.operations.logic import ScannedMeasurementNode
 spec = next(s for s in exp.readout.measurement_specs() if "Temperature" in s.name)
 meas = spec.build(t_off=(0.0, 300.0, 13), shots=16, capture_radius=6.0)   # us
-feed = ScannedMeasurementFeed(hub, meas, x_key=spec.x_key, y_key=spec.y_key)
-feed.run_to_completion()   # 或 feed.start(rate_hz=...) 后台跑；Monitor 1D 面板 source = value = rr_survival
+node = ScannedMeasurementNode(hub, meas, x_key=spec.x_key, y_key=spec.y_key)
+node.run_to_completion()   # 或 node.start(rate_hz=...) 后台跑；Monitor 1D 面板 source = value = rr_survival
 \end{codeblock}
 notebook 里一行起同一测量：\pyapi{exp.readout.temperature(...)}（见主手册）。\tfocus{两条路调同一个建器，不会漂移}。
 

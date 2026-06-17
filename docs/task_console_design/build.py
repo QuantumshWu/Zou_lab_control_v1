@@ -71,7 +71,7 @@ def main() -> None:
         filename="task_console_design_zh.tex",
         title="Task 控制台设计审查文档",
         subtitle="实验侧可配置仪表盘 / frontend 组件 / 扩展到真实设备",
-        description="三层解耦、SignalHub/Feed/TaskConsole、面板几何与密封 API、Panel Editor、真机接线",
+        description="五层架构（device/measurement/processor/task/plot）+ SignalHub、面板几何与密封 API、Panel Editor、真机接线",
         body=body,
         doc_date=date.today().isoformat(),
         compile_pdf=True,

@@ -1038,14 +1038,6 @@ class FluentComboBox(QtWidgets.QComboBox):
                                               combo=self, gap=self._gap, parent=container)
         container.installEventFilter(self._card_filter)
 
-    def showPopup(self) -> None:  # noqa: N802 - Qt naming
-        # The container is configured in __init__; if it was rebuilt, reconfigure.
-        # The OUTER gap (dropdown sits a few px off the box) is enforced by the
-        # container's Move event filter (_RoundedPopupCard), which beats Qt's deferred
-        # flush-positioning that a showPopup-time move() cannot.
-        self._configure_popup_container()
-        super().showPopup()
-
     def paintEvent(self, event):
         del event
         painter = QtGui.QPainter(self)
@@ -1084,7 +1076,13 @@ class FluentComboBox(QtWidgets.QComboBox):
         painter.drawPolygon(QtGui.QPolygon(points))
         painter.end()
 
-    def showPopup(self):
+    def showPopup(self):  # noqa: N802 - Qt naming
+        # Reconfigure the popup container (translucent + rounded-card event filter)
+        # in case Qt rebuilt it since __init__.  The OUTER gap (dropdown sits a few
+        # px off the box) is enforced by the container's Move event filter
+        # (_RoundedPopupCard), which beats Qt's deferred flush-positioning that a
+        # showPopup-time move() cannot.
+        self._configure_popup_container()
         # Size the dropdown to its widest item so options like "Edge"/"Ramp"/
         # "Hold" or "ns"/"us"/"ms" are never clipped when the combo itself is
         # narrow (the popup defaults to the combo width otherwise).

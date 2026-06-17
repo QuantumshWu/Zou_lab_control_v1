@@ -80,10 +80,12 @@ show_task_console(hub=hub, running_nodes=[camera, detect],
 python task_console.py --config remote_template.json --grid 5x7
 ```
 
-- 默认打开**只有一个** loading-rate 滚动 live(无侧分布)。按 **Add Panel** 自己加 2D 图 / 站点占据 /
-  计数分布 / per-site 等,拼出你要的 task group;布局可 Save/Load。
-- 富布局预设仍在(`--task atom_loading_monitor` / `loading_rate_live`,或 GUI 预设选择器)。
-- Control 标签的 Measurement 表单由 `measurement_specs()` 自动生成;改参数 Start 会用新参数 restart 对应 Monitor 面板。
+- 控制台开局**空、全停**。看 loading:从 **Add Panel** 加 `Measurement: Camera (live frames)` +
+  `Processor: Judge occupancy` + `Task: Calibrate readout` 三个 logic 节点,各自 Start,再加 Plot 面板
+  连它们发的 `frame`/`occupied`/`rate`/`rate_sites`/`centers` 等信号,拼出你要的看板;布局 Save/Load。
+- **无内置预设**——布局都是你自己拼好再 Save 出来的(`--task <你存的名字>` 载回)。
+- 每个 logic 节点的参数表单在它**自己**的 Edit 标签(由 ParamDecl 自动生成);plot 面板的 Edit 也给产它信号
+  的那个 measurement/processor 的参数表单。task 运行时占一张固定面板看中途过程、并锁定其他操作只留 Stop。
 
 ---
 

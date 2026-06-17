@@ -1368,11 +1368,13 @@ class MeasurementPanel(QtWidgets.QWidget):
     start_requested = QtCore.pyqtSignal(object)    # emits THIS MeasurementPanel (read spec + values off it)
     stop_requested = QtCore.pyqtSignal()
 
-    def __init__(self, measurements: Sequence[object], parent=None, *, single: bool = False):
+    def __init__(self, measurements: Sequence[object], parent=None, *, single: bool = False,
+                 controls: bool = True):
         super().__init__(parent)
         self.setStyleSheet("background: transparent;")
         self._specs = list(measurements)
         self._single = bool(single)               # bound to ONE spec (per-panel Edit) -> hide the picker
+        self._controls = bool(controls)           # False = no Start/Stop (e.g. a plot Edit's read-only-ish source form)
         self._widgets: dict[str, object] = {}     # param key -> widget (or tuple for axis_range)
         self._running = False
 
@@ -1424,7 +1426,13 @@ class MeasurementPanel(QtWidgets.QWidget):
         action_row.addWidget(self.start_button)
         action_row.addWidget(self.stop_button)
         action_row.addStretch(1)
-        root.addLayout(action_row)
+        # A plot Edit embeds this form to show its SOURCE node's parameters (#2) but
+        # drives its own Apply -- the node is Started from its Logic-tab Edit, not here.
+        if self._controls:
+            root.addLayout(action_row)
+        else:
+            self.start_button.hide()
+            self.stop_button.hide()
 
         self.status = FluentLabel("")
         self.status.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
@@ -1769,6 +1777,30 @@ class PanelEditor(QtWidgets.QWidget):
             self.node_apply_button.clicked.connect(self._restart_node)
             col.addWidget(self.node_apply_button)
 
+        # ---- Source: a plot's signal ALWAYS comes from a measurement/processor (#2),
+        # so show THAT node's full declarative parameter form here -- prefilled from its
+        # current values (defaults via the spec).  Shown when the node exposes no live
+        # acquisition_parameters above (a scanned measurement / a processor); Apply
+        # rebuilds + restarts the source node with the edited params (it is Started /
+        # Stopped from its OWN Logic-tab Edit, so this form carries no Start/Stop).
+        self._source_row = None
+        self.source_form = None
+        if not self._node_widgets:
+            self._source_row = console._producing_row(card)
+            source_spec = (console._spec_for_logic(self._source_row.node)
+                           if self._source_row is not None else None)
+            if source_spec is not None:
+                section(f"Source: {source_spec.name}")
+                self.source_form = MeasurementPanel([source_spec], single=True, controls=False)
+                self.source_form.seed_values(self._source_row.node.values or {})
+                col.addWidget(self.source_form)
+                self.source_apply_button = FluentButton("Apply", color=ACCENT)
+                self.source_apply_button.setToolTip(
+                    "Apply these parameters to the source node (rebuild + restart it);\n"
+                    "the plot keeps reading its published signal.")
+                self.source_apply_button.clicked.connect(self._apply_source_form)
+                col.addWidget(self.source_apply_button)
+
         # ---- Parameters: the PLOT's own tunable API params as GUI controls,
         # auto-discovered from the kind's declarative specs.  Each edit re-renders
         # the LIVE panel AND this snapshot.  This is where "the params the plot
@@ -2066,6 +2098,23 @@ class PanelEditor(QtWidgets.QWidget):
             self.status.setText("acquisition started with the new parameters")
             self.rebuild()
 
+    def _apply_source_form(self) -> None:
+        """Apply the SOURCE node's edited parameter form (#2) to the producing node --
+        rebuild + restart it (or live where it accepts), then re-snapshot."""
+        if self._source_row is None or self.source_form is None:
+            return
+        try:
+            values = self.source_form.collect_values()
+        except Exception as exc:
+            self.status.setText(f"apply failed: {str(exc).splitlines()[0][:120]}")
+            return
+        if not self.console._apply_source_params(self._source_row, values):
+            self.status.setText("locked: a task is running — Stop it first")
+            return
+        self.console.refresh_once()
+        self.status.setText("source parameters applied")
+        self.rebuild()
+
     def _await_fresh_frame(self, node, epoch0: int, *, _tries: int = 0) -> None:
         """Poll (off the GUI critical path) until the running node has published its
         FIRST frame computed with the just-queued params -- detected by its
@@ -2350,6 +2399,16 @@ class TaskConsole(QtWidgets.QWidget):
         # Per-panel editors: one PanelEditor per opened PLOT panel, hosted as a
         # closable tab (keyed by id(card)).
         self._panel_editors: dict[int, "PanelEditor"] = {}
+        # A running TASK takes over the console (confocal-style): its mid-run output
+        # occupies a FIXED panel so the operator watches the work in progress, and all
+        # other actions are LOCKED until it finishes / is stopped.  ``_running_task_row``
+        # is the LogicNodeRow of the task currently running (None when idle);
+        # ``_task_card`` is its dedicated mid-run Monitor panel.
+        self._running_task_row: "LogicNodeRow | None" = None
+        self._task_card: "PanelCard | None" = None
+        self._task_mid_key = "frame"           # which output-buffer key the task panel shows
+        self._task_card_frame = None           # last mid-run frame (kept frozen after the task ends)
+        self._task_locked = False              # True while a task runs -> all other actions blocked
 
         self._build_ui()
         self.load_state(self.state)
@@ -2430,7 +2489,32 @@ class TaskConsole(QtWidgets.QWidget):
         header.addWidget(self.summary, 1)
         for widget in (self.kind_combo, add_button, self.save_button, load_button):
             header.addWidget(widget)
+        # header controls disabled while a task runs (the lockout, #5); kept as a group
+        # so ``_set_task_running`` flips them all at once.
+        self._lockable_header = (self.kind_combo, add_button, self.save_button, load_button,
+                                 self.name_edit)
         root.addWidget(header_frame)
+
+        # Running-task LOCKOUT banner (confocal-style): a prominent strip shown ONLY
+        # while a task runs.  It names the task + progress and offers the ONE allowed
+        # action (Stop); every other control is disabled meanwhile (``_set_task_running``).
+        # Hidden by default so an idle console looks unchanged.  A plain objectName-scoped
+        # QWidget (flat fill, no cascade to children, no FluentFrame self-paint to fight).
+        self.task_banner = QtWidgets.QWidget()
+        self.task_banner.setObjectName("taskBanner")
+        self.task_banner.setStyleSheet(f"#taskBanner {{ background-color: {ORANGE}; }}")
+        banner = QtWidgets.QHBoxLayout(self.task_banner)
+        banner.setContentsMargins(scaled_px(12), scaled_px(5), scaled_px(12), scaled_px(5))
+        banner.setSpacing(scaled_px(8, minimum=4))
+        self.task_banner_label = FluentLabel("")
+        self.task_banner_label.setStyleSheet(
+            "color: white; background: transparent; border: none; font-weight: bold;")
+        self.task_stop_button = FluentButton("Stop task", color=RED)
+        self.task_stop_button.clicked.connect(self._stop_running_task)
+        banner.addWidget(self.task_banner_label, 1)
+        banner.addWidget(self.task_stop_button, 0)
+        self.task_banner.setVisible(False)
+        root.addWidget(self.task_banner)
 
         # TWO permanent tabs:
         #   * Monitor -- the live drag-and-snap board of PLOT panels (pure views);
@@ -2480,6 +2564,18 @@ class TaskConsole(QtWidgets.QWidget):
 
     # ------------------------------------------------------------------ state
     def read_state(self) -> TaskConsoleState:
+        # Flush every OPEN logic-node Edit form into its config first, so Save captures
+        # the CURRENT parameter values even when the node was never Started (#4: a
+        # layout persists Edit params, not just geometry).  Plot params already write
+        # through to ``card.config.params`` live, so panels need no flush.
+        for row in self.logic_nodes:
+            editor = self._logic_editors.get(id(row))
+            if editor is None:
+                continue
+            try:
+                row.node.values = editor.collect_values()
+            except Exception:
+                pass
         return TaskConsoleState(
             name=self.name_edit.text().strip() or "task",
             interval_ms=self.state.interval_ms,
@@ -2547,6 +2643,44 @@ class TaskConsole(QtWidgets.QWidget):
             if refs & set(published):
                 return node
         return None
+
+    def _producing_row(self, card: "PanelCard"):
+        """The Logic-tab ROW whose RUNNING node produces this panel's signal (None if
+        the producing node has no row -- e.g. a node passed via ``running_nodes=`` from
+        a notebook).  Lets a plot's Edit show the SOURCE measurement/processor's full
+        parameter form (#2)."""
+        node = self._producing_node(card)
+        if node is None:
+            return None
+        for row in self.logic_nodes:
+            if self._logic_nodes.get(id(row)) is node:
+                return row
+        return None
+
+    def _apply_source_params(self, row: "LogicNodeRow", values: dict) -> None:
+        """Apply edited SOURCE parameters (from a plot Edit's source form, #2) to the
+        producing node: live where the node accepts it (a camera's exposure/ROI), else
+        rebuild + restart the node with the new values.  Keeps the node's own Logic-tab
+        Edit form in sync so the two never diverge.  Returns False if a task lock
+        dropped the edit (so the caller does not falsely report success)."""
+        if self._task_locked:
+            return False
+        row.node.values = dict(values)
+        editor = self._logic_editors.get(id(row))
+        if editor is not None:
+            editor.form.seed_values(values)               # keep the node's own Edit consistent
+        node = self._logic_nodes.get(id(row))
+        if node is None:
+            return True                                    # not running -> values remembered for next Start
+        try:
+            live_keys = set(node.acquisition_parameters())
+        except Exception:
+            live_keys = set()
+        if any(k not in live_keys for k in values) or not live_keys:
+            self._start_logic_node(row)                   # rebuild + restart with the new values
+        elif hasattr(node, "apply_acquisition_parameters"):
+            node.apply_acquisition_parameters(**{k: v for k, v in values.items() if k in live_keys})
+        return True
 
     @staticmethod
     def _node_params(node) -> list:
@@ -2671,13 +2805,14 @@ class TaskConsole(QtWidgets.QWidget):
         return node
 
     def _edit_card(self, card: "PanelCard") -> None:
-        """Open (or focus) this PLOT panel's OWN closable Edit tab (a PanelEditor).
+        """Open (or focus) this PLOT panel's OWN closable Edit tab (a PanelEditor); a
+        running task locks every other action, so this no-ops then.
 
         Opens even BEFORE the panel has data -- the panel's plot params /
         acquisition / fit / limits are editable straight away.  The snapshot
         section just shows "waiting for data" until a plot exists (the data is
         produced by a Logic-tab node, not by this Edit)."""
-        if card is None:
+        if card is None or self._task_locked:
             return
         existing = self._panel_editors.get(id(card))
         if existing is not None:
@@ -2741,6 +2876,8 @@ class TaskConsole(QtWidgets.QWidget):
     def _add_panel(self) -> None:
         """Header "Add Panel": add either a BLANK plot panel (a plot kind) or a
         STOPPED logic node (camera / measurement / processor / task)."""
+        if self._task_locked:
+            return
         data = self.kind_combo.currentData()
         # A node LAYER -> a STOPPED logic node on the Logic tab (camera /
         # measurement / processor / task).  It publishes nothing until Started.
@@ -2760,6 +2897,10 @@ class TaskConsole(QtWidgets.QWidget):
         self._mark_dirty()
 
     def _remove_panel(self, card: PanelCard) -> None:
+        # blocked while a task owns the console (the lock is released BEFORE
+        # _clear_task_running drops the transient task panel, so this never blocks that).
+        if self._task_locked:
+            return
         if card in self.cards:
             card.settings_popup.hide()
             self._close_panel_editor(card)     # drop this card's Edit tab too
@@ -2808,6 +2949,8 @@ class TaskConsole(QtWidgets.QWidget):
 
     def _edit_logic_node(self, row: "LogicNodeRow") -> None:
         """Open (or focus) a logic node's OWN closable Edit tab (param form + Start/Stop)."""
+        if self._task_locked:
+            return
         existing = self._logic_editors.get(id(row))
         if existing is not None:
             self.tabs.setCurrentWidget(existing)
@@ -2826,6 +2969,8 @@ class TaskConsole(QtWidgets.QWidget):
         register it in ``self.running_nodes``, and ``node.start(rate_hz=...)``.  Sets
         the node's status dot green; on build/run error -> red + the error on the status
         line.  Reuses the SAME node-build paths the real readout / notebook use."""
+        if self._task_locked:
+            return                                 # a task owns the console -- no other Start
         editor = self._logic_editors.get(id(row))
         try:
             values = editor.collect_values() if editor is not None else dict(row.node.values)
@@ -2860,6 +3005,79 @@ class TaskConsole(QtWidgets.QWidget):
             editor.set_status("running", error=False)
         self.status_dot.set_color(GREEN)
         self._mark_dirty()
+        # A TASK (one-shot orchestration) TAKES OVER the console (confocal-style): show
+        # its mid-run output in a dedicated Monitor panel + LOCK every other action.
+        if getattr(node, "layer", "") == "task":
+            self._set_task_running(row, node)
+
+    def _set_task_running(self, row: "LogicNodeRow", node) -> None:
+        """Engage task-run mode: open a dedicated Monitor panel that shows the task's
+        mid-run output (read off its OWN buffer, NOT the hub -- #6), and LOCK all other
+        controls so the only actions are Stop / wait (#5, confocal task semantics)."""
+        spec = self._spec_for_logic(row.node)
+        self._task_mid_key = str(getattr(spec, "mid_run_key", "frame"))
+        self._task_card_frame = None
+        kind = str(getattr(spec, "default_kind", "2d") or "2d")
+        title = f"Task: {row.node.title}"
+        # The dedicated panel reads the reserved ``__task_frame__`` injected each tick
+        # from the task's output buffer (see _tick) -- never a hub signal.
+        config = PanelConfig(kind=kind, title=title, size="2x2",
+                             source="value = __task_frame__")
+        card = PanelCard(config, parent=self.board, names_provider=self.hub.names)
+        self._attach_card(card)
+        self._task_card = card
+        self._running_task_row = row
+        self._arrange()
+        self._apply_task_lock(True)
+        self._update_task_banner(node)
+
+    def _update_task_banner(self, node) -> None:
+        row = self._running_task_row
+        if row is None:
+            return
+        pct = int(round(float(getattr(node.output, "progress", 0.0)) * 100))
+        self.task_banner_label.setText(f"⏳  Task running: {row.node.title}  —  {pct}%  "
+                                       "(all other controls locked until it finishes / you Stop it)")
+
+    def _apply_task_lock(self, locked: bool) -> None:
+        """Disable / re-enable every mutating control while a task runs.  The banner's
+        Stop button stays enabled (it lives outside the locked groups)."""
+        self._task_locked = bool(locked)
+        self.task_banner.setVisible(bool(locked))
+        for widget in self._lockable_header:
+            widget.setEnabled(not locked)
+
+    def _stop_running_task(self) -> None:
+        """Banner 'Stop task' button: cooperatively stop the running task."""
+        row = self._running_task_row
+        if row is not None:
+            self._stop_logic_node(row)
+
+    def _clear_task_running(self) -> None:
+        """Leave task-run mode (task finished or stopped): drop the lock + banner and
+        the transient mid-run panel (its job was to show the work in progress)."""
+        self._running_task_row = None
+        card, self._task_card = self._task_card, None
+        self._apply_task_lock(False)
+        if card is not None and card in self.cards:
+            self._remove_panel(card)
+
+    def _refresh_task_panel(self) -> None:
+        """Pump the running task's mid-run output (from its OWN buffer) into the
+        dedicated panel + banner each tick, and leave task-run mode once it finishes."""
+        if self._task_card is None:
+            return
+        row = self._running_task_row
+        node = self._logic_nodes.get(id(row)) if row is not None else None
+        if node is None:
+            return
+        frame = node.output.latest(self._task_mid_key)
+        if frame is not None:
+            self._task_card_frame = frame
+        self._update_task_banner(node)
+        self._task_card.refresh(self._expression_namespace())
+        if getattr(node, "finished", False):
+            self._clear_task_running()
 
     def _build_logic_node(self, node: LogicNodeConfig, values: dict):
         """Build the node for a logic node, DISPLAY SUPPRESSED (publish-only).
@@ -2886,6 +3104,11 @@ class TaskConsole(QtWidgets.QWidget):
             return ScannedMeasurementNode(
                 self.hub, measurement, x_key=spec.x_key, y_key=spec.y_key, grid_shape=spec.grid_shape)
         if kind == "processor":
+            # REACTIVE processor (the "func" layer): a live node consuming hub signals
+            # and republishing derived ones -- e.g. judging occupancy from each frame.
+            if getattr(spec, "reactive", False):
+                return spec.make_node(self.hub, **values)
+            # ONE-SHOT processor: runs once over saved/grabbed frames and self-stops.
             from Zou_lab_control.neutral_atom.operations.logic import ProcessorRun
             camera = next((getattr(n, "camera", None) for n in self.running_nodes
                            if getattr(n, "camera", None) is not None), None)
@@ -2915,9 +3138,17 @@ class TaskConsole(QtWidgets.QWidget):
             if editor is not None:
                 editor.set_running(False)
                 editor.set_status("stopped", error=False)
+        # Leaving task-run mode when the running task is stopped (releases the lockout).
+        if row is self._running_task_row:
+            self._clear_task_running()
 
     def _remove_logic_node(self, row: "LogicNodeRow", *, _rebuild: bool = True) -> None:
         """Stop + remove a logic node (its node is stopped, its row + Edit drop)."""
+        # a running task locks the console: the per-row Remove button must no-op too
+        # (every other mutating entry guards on this).  Internal teardown (load_state)
+        # passes _rebuild=False and is never reached while locked.
+        if self._task_locked and _rebuild:
+            return
         self._stop_logic_node(row, _silent=True)
         editor = self._logic_editors.pop(id(row), None)
         if editor is not None:
@@ -2990,6 +3221,10 @@ class TaskConsole(QtWidgets.QWidget):
         # source signal's frame so the image axes are the REAL camera pixel
         # coordinates (ROI), not 0..N -- and an area-select maps back to the ROI.
         namespace["__coord_frames__"] = self._coord_frames()
+        # Reserved key for the running task's dedicated mid-run panel: the latest frame
+        # from the task's OWN output buffer (NOT the hub -- #6), kept frozen after the
+        # task ends until its transient panel is dropped.
+        namespace["__task_frame__"] = self._task_card_frame
         return namespace
 
     def _coord_frames(self) -> dict[str, list]:
@@ -3020,6 +3255,9 @@ class TaskConsole(QtWidgets.QWidget):
         # node self-stops between version bumps.
         self._poll_logic_nodes()
         self._refresh_signal_info()   # cheap + self-guarded: tracks source/node changes
+        # A running task's mid-run output is OFF the hub (#6), so it does NOT bump the
+        # hub version -- refresh its dedicated panel here, before the version gate below.
+        self._refresh_task_panel()
         version = self.hub.version
         if version == self._last_version:
             return
@@ -3062,6 +3300,8 @@ class TaskConsole(QtWidgets.QWidget):
 
     # ------------------------------------------------------------------ files
     def save_to_file(self) -> None:
+        if self._task_locked:
+            return
         try:
             state = self.read_state()
             start = self._address or str(_task_files_dir() / f"{state.name}.json")
@@ -3076,6 +3316,8 @@ class TaskConsole(QtWidgets.QWidget):
             self._message(f"Save failed: {exc}")
 
     def load_from_file(self) -> None:
+        if self._task_locked:
+            return
         try:
             start = str(Path(self._address).parent) if self._address else str(_task_files_dir())
             path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load task layout", start, "Task layout (*.json)")

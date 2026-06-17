@@ -1,13 +1,19 @@
-"""Contract: a Data-processing action is a LOGIC NODE that runs end-to-end.
+"""Contract: a processor is a LOGIC NODE that publishes to the hub end-to-end.
 
 A processor is a logic node (Logic tab), added STOPPED, with an auto-generated Edit
-form from the spec's ParamDecls (incl. the 'text' folder-path kind).  Start runs the
-action ONCE on its own thread: a ProcessorRun publishes the result to the hub (display
-suppressed -- it makes no plot).  You then add a Plot panel on the Monitor board
-pointed at a published signal to view it.
+form from the spec's ParamDecls.  Two execution styles share the model:
 
-Offscreen Qt + the saved-frames virtual==real path (na.write_virtual_run); no demo
-GUI fixtures.
+* ONE-SHOT (``Readout fidelity``): Start runs the action once on its own thread (a
+  ``ProcessorRun``) over a saved frames folder and self-stops.
+* REACTIVE (``Judge occupancy``): Start launches a live node that consumes each
+  ``frame`` signal and republishes per-site occupancy via the real
+  ``calibration.detect`` -- it keeps running until Stop.
+
+Either way display is suppressed (no auto plot); you add a Plot panel on the Monitor
+board pointed at a published signal to view it.
+
+Offscreen Qt + the virtual==real path (na.write_virtual_run / a virtual session); no
+demo GUI fixtures.
 """
 
 from __future__ import annotations
@@ -84,42 +90,48 @@ def test_processor_node_runs_and_publishes(tmp_path):
         exp.close()
 
 
-def test_detect_sites_node_publishes_detected_centers(tmp_path):
-    """The 'Detect sites' data-processing logic node detects centers from saved
-    frames and publishes its OWN centers + underlay signals (no live node needed);
-    a Plot panel can then read them."""
+def test_judge_occupancy_node_reacts_to_frames(tmp_path):
+    """The REACTIVE 'Judge occupancy' processor consumes each live ``frame`` and
+    republishes per-site occupancy/centers via the REAL ``calibration.detect`` (no
+    folder, no one-shot).  Its calibration param defaults blank = the session
+    calibration; a Plot panel can then read its published signals."""
     import Zou_lab_control.neutral_atom as na
-    from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state, PanelConfig, PanelCard
+    from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.neutral_atom.operations.logic import CameraMeasurement
 
-    data_dir = tmp_path / "run"
-    na.write_virtual_run(str(data_dir), prefix="img", groups=40, shots_per_group=4,
-                         short_shot=3, ref_shots=(1, 2, 4), grid_shape=(4, 5),
-                         loading_probability=0.5, seed=5)
-    exp = na.connect("virtual", sitemap={"grid_shape": (4, 5)})
+    exp = na.connect("virtual", sitemap={"grid_shape": (4, 5), "image_shape": (40, 50)})
+    exp.readout.sitemap(method="box", frames=4, display=False)
+    exp.readout.thresholds(frames=16, display=False)
 
-    console = TaskConsole(hub=SignalHub(), state=default_console_state(),
+    hub = SignalHub()
+    console = TaskConsole(hub=hub, state=default_console_state(),
                           processors=exp.readout.processor_specs(), session=exp)
     console._timer.stop()
     try:
-        row, editor = _add_processor_node(console, "Detect sites")
-        editor.form._widgets["data_dir"][1].setText(str(data_dir))
+        row, editor = _add_processor_node(console, "Judge occupancy")
+        assert row.node.kind == "processor"
+        # default STOPPED + defaults PREFILLED from the spec (never blank-to-guess):
+        # calibration blank = session calibration; source/ema show their declared defaults.
+        assert console._logic_nodes[id(row)] is None
+        vals = editor.collect_values()
+        assert vals["calibration"] == "" and vals["source"] == "frame" and vals["ema"] == 0.05
+
+        # a camera measurement publishes `frame`; the occupancy processor reacts to it
+        cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer)
+        cam.step()                                  # first frame on the hub
         console._start_logic_node(row)
         node = console._logic_nodes[id(row)]
         deadline = time.monotonic() + 8.0
-        while not getattr(node, "finished", False) and time.monotonic() < deadline:
-            time.sleep(0.02)
-        assert node.finished
-        assert np.asarray(console.hub.latest("site_centers")).shape == (20, 2)   # detected centers
-        assert np.asarray(console.hub.latest("sitemap_frame")).ndim == 2          # underlay image
-
-        # a Plot panel pointed at the published centers + underlay builds the site map
-        card = PanelCard(PanelConfig(kind="sites", source="value = np.ones(len(site_centers))",
-                                     params={"centers": "site_centers", "image": "sitemap_frame"}),
-                         parent=console.board, names_provider=console.hub.names)
-        console._attach_card(card)
-        console.refresh_once()
-        assert card.plotter is not None
+        while "occupied" not in hub.names() and time.monotonic() < deadline:
+            cam.step()                              # keep frames coming for the reactive node
+            time.sleep(0.03)
+        assert "occupied" in hub.names()
+        assert np.asarray(hub.latest("occupied")).shape == (20,)
+        assert np.asarray(hub.latest("centers")).shape == (20, 2)
+        # reactive: it keeps running (NOT a one-shot finished node)
+        assert getattr(node, "finished", False) is False
+        cam.stop()
     finally:
         console.shutdown()
         exp.close()

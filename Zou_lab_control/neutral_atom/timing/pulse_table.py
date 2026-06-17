@@ -971,6 +971,96 @@ class PulseTableState:
         self.validate()
         return self
 
+    def set_period_duration(self, period_index: int, duration: float | str, *, unit: str | None = None) -> "PulseTableState":
+        """Set period ``period_index``'s duration (ns by default, or a scan-expr str).
+
+        The programmatic equivalent of the pulse GUI's duration edit -- so a
+        measurement can ``PulseTableState.load(...)`` a saved program and retune e.g. a
+        readout duration without the GUI.  ``unit`` overrides the period's unit
+        (``ns``/``us``/``ms``/``s``); omit to keep it."""
+        period_index = int(period_index)
+        if period_index < 0 or period_index >= len(self.periods):
+            raise ValueError("period_index is out of range.")
+        # A period whose duration is SCAN-BOUND carries an ``sN`` expression that a scan
+        # slot targets; overwriting it would orphan that slot (a dead scan column).
+        # Fail loud -- unbind it first (``unbind_slot``), as the GUI's dot toggle does.
+        if self.slot_index_for("duration", str(period_index)) is not None:
+            raise ValueError(
+                f"period {period_index} duration is scan-bound; unbind its scan slot "
+                "(unbind_slot) before setting a fixed duration.")
+        period = self.periods[period_index]
+        self.periods[period_index] = PulsePeriod(
+            duration, tuple(period.states),
+            unit=str(unit) if unit is not None else period.unit, name=period.name)
+        self.validate()
+        return self
+
+    def set_period_name(self, period_index: int, name: str) -> "PulseTableState":
+        """Rename period ``period_index`` (the GUI's period-name edit)."""
+        period_index = int(period_index)
+        if period_index < 0 or period_index >= len(self.periods):
+            raise ValueError("period_index is out of range.")
+        period = self.periods[period_index]
+        self.periods[period_index] = PulsePeriod(
+            period.duration, tuple(period.states), unit=period.unit, name=str(name))
+        self.validate()
+        return self
+
+    def set_channel_delay(self, channel: str, delay: float | str, *, unit: str = "ns") -> "PulseTableState":
+        """Set ``channel``'s output delay (ns by default, or a scan-expr str) -- the
+        programmatic form of the GUI's per-channel delay edit."""
+        channel = str(channel)
+        if channel not in self._channel_index:
+            raise ValueError(f"unknown channel {channel!r}.")
+        self.delays[channel] = delay
+        self.delay_units[channel] = str(unit)
+        self.validate()
+        return self
+
+    def add_period(self, duration: float | str, *, name: str = "", unit: str = "ns",
+                   states: Mapping[str, int] | Sequence[int] | None = None) -> "PulseTableState":
+        """APPEND a new period (the GUI's add-period button).  ``states`` is a
+        ``{channel: 0/1}`` map or a full per-channel sequence (omitted channels off).
+
+        Append-only on purpose: inserting / removing / reordering periods would shift
+        the period indices that scan slots and the repeat bracket reference, so those
+        structural edits stay in the GUI (which reconciles them); a measurement that
+        builds a program programmatically appends its steps in order."""
+        if isinstance(states, Mapping):
+            vec = [0] * len(self.channels)
+            for channel, value in states.items():
+                vec[self.channel_index(channel)] = 1 if int(value) else 0
+        elif states is None:
+            vec = [0] * len(self.channels)
+        else:
+            vec = [1 if int(v) else 0 for v in states]
+            if len(vec) != len(self.channels):
+                raise ValueError(f"states must have one value per channel ({len(self.channels)}).")
+        self.periods.append(PulsePeriod(duration, tuple(vec), unit=str(unit), name=str(name)))
+        # Keep per-period analog-bus mode entries in step with the new period count
+        # (the same step the GUI's add-period does): a new period defaults to a HOLD
+        # mode, then the period DAC states are recomputed from the modes -- else
+        # ``validate()`` rejects the entries/periods length mismatch on ANY DAC-bus
+        # program (the realistic neutral-atom case).
+        self._grow_analog_bus_modes()
+        self.apply_analog_bus_modes_to_period_states()
+        self.validate()
+        return self
+
+    def _grow_analog_bus_modes(self) -> None:
+        """Pad/trim every analog-bus mode list to one entry per period (a new period
+        defaults to a ``hold`` mode), so the mode entries stay in step with
+        ``self.periods`` after an :meth:`add_period`."""
+        target = len(self.periods)
+        for bus_name in list(self.analog_bus_modes):
+            entries = [dict(e) if isinstance(e, Mapping) else e
+                       for e in self.analog_bus_modes.get(bus_name, [])]
+            if len(entries) < target:
+                entries.extend({"mode": "hold", "value": None} for _ in range(target - len(entries)))
+            elif len(entries) > target:
+                entries = entries[:target]
+            self.analog_bus_modes[bus_name] = entries
+
     def expanded_periods(self) -> list[PulsePeriod]:
         if self.repeat_start is None or self.repeat_end is None or self.repeat_count == 1:
             return list(self.periods)

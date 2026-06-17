@@ -31,7 +31,7 @@ def test_builtin_calibrate_task_is_discovered():
     by_name = {s.name: s for s in specs}
     assert "Calibrate readout" in by_name
     spec = by_name["Calibrate readout"]
-    assert spec.mid_run_signal() == "cal_frame"      # namespaced mid-run output
+    assert spec.mid_run_key == "frame"               # buffer key the dedicated panel shows
     assert spec.prefix == "cal_"
 
 

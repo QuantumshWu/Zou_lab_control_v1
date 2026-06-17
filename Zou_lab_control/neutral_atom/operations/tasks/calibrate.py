@@ -52,6 +52,8 @@ CALIBRATE_PARAMS = (
               tooltip="Frames averaged into the all-sites sitemap template."),
     ParamDecl("threshold_frames", "threshold frames", "int", default=24, lo=2, hi=10000,
               tooltip="Frames used to learn the per-site thresholds."),
+    ParamDecl("roi_radius", "ROI radius", "int", default=1, lo=1, hi=64,
+              tooltip="Per-site square ROI half-width in pixels (box counting / detection geometry)."),
     ParamDecl("save_path", "save to", "text", default="",
               tooltip="Save the calibration (centers + thresholds) to this .npz/.json path."),
     ParamDecl("load_path", "load from", "text", default="",
