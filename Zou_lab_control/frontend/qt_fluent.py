@@ -575,6 +575,16 @@ class FluentPopup(QtWidgets.QFrame):
         self._radius = float(_radius() if radius is None else radius)
         self._border = QtGui.QColor(border)
         self._fill = QtGui.QColor(fill)
+        # A Qt.Popup auto-closes on ANY outside mouse PRESS -- including the press on
+        # the very button that toggles it.  An anchor button therefore needs to know
+        # the popup was just auto-dismissed so its release does not RE-open it; set
+        # this hook to be notified on every hide (auto or explicit).
+        self._on_hidden = None
+
+    def hideEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if callable(self._on_hidden):
+            self._on_hidden()
+        super().hideEvent(event)
 
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt naming
         painter = QtGui.QPainter(self)

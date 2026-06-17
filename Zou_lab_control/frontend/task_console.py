@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import math as _math
 import os
+import time
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -101,6 +102,18 @@ PANEL_KINDS: dict[str, str] = {
     "hist": "Distribution",
 }
 
+# What signal SHAPE each plot kind expects as its ``value`` -- shown in the panel's
+# Setting so it is clear which signals fit (e.g. a Site map wants a per-site vector,
+# a 2D image wants a frame).  Single source for the panel's input self-documentation.
+PANEL_INPUT_FORMAT: dict[str, str] = {
+    "2d": "a 2D array / camera frame (H×W)",
+    "sites": "a per-site (N,) occupancy vector (+ a centers signal)",
+    "1d": "a 1D vector (N,) or per-site array",
+    "monitor": "a scalar per shot (rolling trace)",
+    "monitor_nodist": "a scalar per shot (rolling trace)",
+    "hist": "a 1D sample vector",
+}
+
 # Every Monitor-board panel is a PURE VIEW (role "plot"): it is fully decoupled
 # from acquisition -- it shows a hub signal and carries the full plotter Edit (the
 # whole DataFigure fit set + manual limits + the display knobs), but it NEVER
@@ -158,7 +171,9 @@ PANEL_PARAMS: dict[str, tuple[ParamSpec, ...]] = {
         ParamSpec("cmap", "colormap", "choice", "inferno", choices=CMAPS, tooltip="Image colormap", display=True),
     ),
     "sites": (
-        ParamSpec("cmap", "colormap", "choice", "viridis", choices=CMAPS, tooltip="Site-value colormap", display=True),
+        # A site map is a binary occupancy OVERLAY on the camera frame (faint ring =
+        # empty, bold ring = occupied), so it has NO colormap -- the only colorbar is
+        # the camera frame's own counts.  Its params are the two source signals.
         ParamSpec("centers", "centers", "signal", "centers",
                   tooltip="Signal holding the (N, 2) site centers in camera px"),
         ParamSpec("image", "image", "signal", "frame",
@@ -511,12 +526,15 @@ class PanelCard(FluentGroupBox):
     remove_requested = QtCore.pyqtSignal(object)
     edit_requested = QtCore.pyqtSignal(object)   # "Edit…" -> open the panel's Edit tab
 
-    def __init__(self, config: PanelConfig, parent=None, *, names_provider=None):
+    def __init__(self, config: PanelConfig, parent=None, *, names_provider=None, sources_provider=None):
         # Titled frame: the title strip carries the panel KIND (top-left) and the
         # Setting button (top-right), so the card is delineated like the rest.
         super().__init__(PANEL_KINDS[config.kind], parent, shadow=True)
         self.config = config
         self.names_provider = names_provider   # callable -> live signal names (Setting combo)
+        # callable -> {signal name: [source node labels]}, so the picker can show
+        # WHICH measurement/processor each signal comes from (not just bare names).
+        self.sources_provider = sources_provider
         self.plotter = None
         self.canvas = None
         self._value_shape: tuple[int, ...] | None = None
@@ -635,6 +653,14 @@ class PanelCard(FluentGroupBox):
 
         # ---- Source --------------------------------------------------------
         sec = section_box("Source")
+        # Tell the experimenter what SHAPE of signal this plot kind expects, so the
+        # signal picker / expression below is unambiguous (single source PANEL_INPUT_FORMAT).
+        accepts = PANEL_INPUT_FORMAT.get(self.config.kind)
+        if accepts:
+            accepts_label = FluentLabel(f"accepts {accepts}")
+            accepts_label.setWordWrap(True)
+            accepts_label.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+            sec.addWidget(accepts_label)
         self.signal_combo = FluentComboBox()
         self.signal_combo.setToolTip(
             "Pick a live signal to show it directly (sets the expression to\n"
@@ -764,6 +790,13 @@ class PanelCard(FluentGroupBox):
         sec.addLayout(action_row)
 
         self.settings_popup = popup
+        # A Qt.Popup auto-closes on the press that lands on the Setting button; record
+        # WHEN so the button's release does not immediately re-open it (real toggle).
+        self._settings_dismissed_at = 0.0
+        popup._on_hidden = self._note_settings_dismissed
+
+    def _note_settings_dismissed(self) -> None:
+        self._settings_dismissed_at = time.monotonic()
 
     def _make_param_widget(self, spec: ParamSpec, *, apply=None) -> QtWidgets.QWidget:
         """One widget per declarative ParamSpec; edits apply INSTANTLY.
@@ -798,11 +831,16 @@ class PanelCard(FluentGroupBox):
         return edit
 
     def _open_settings(self) -> None:
-        # Click-to-open / click-again-to-close TOGGLE (confocal gui_individual
-        # on_settings: `if visible: hide else: show+raise`).
+        # Click-to-open / click-again-to-close TOGGLE.  A Qt.Popup already auto-closes
+        # on the mouse PRESS that lands on this button, so by the time the button's
+        # release fires the popup is hidden -- naively re-opening it would make the
+        # button never close it.  So: if visible, hide; and if it was auto-dismissed
+        # within the last moment (this very click closed it), do NOT re-open.
         popup = self.settings_popup
         if popup.isVisible():
             popup.hide()
+            return
+        if time.monotonic() - self._settings_dismissed_at < 0.25:
             return
         self._refresh_signal_combo()
         anchor = self.setting_button.mapToGlobal(
@@ -813,26 +851,39 @@ class PanelCard(FluentGroupBox):
         popup.raise_()
 
     def _refresh_signal_combo(self) -> None:
-        """Fill the signal picker with the hub's CURRENT signal names."""
+        """Fill the signal picker with the hub's CURRENT signals, each labelled with
+        the measurement/processor that PRODUCES it (``occupied — occupancy``) so you
+        pick by origin, not a bare name.  The item TEXT carries the source label; the
+        item DATA is the plain signal name written into ``value = <name>``."""
         names = []
         if callable(self.names_provider):
             try:
                 names = sorted(str(n) for n in self.names_provider())
             except Exception:
                 names = []
+        sources: dict = {}
+        if callable(self.sources_provider):
+            try:
+                sources = dict(self.sources_provider())
+            except Exception:
+                sources = {}
         combo = self.signal_combo
         with _signals_blocked(combo):
             combo.clear()
-            combo.addItem("(expression)")
-            combo.addItems(names)
+            combo.addItem("(expression)", "")
+            for name in names:
+                producers = sources.get(name) or []
+                label = f"{name} — {', '.join(str(p) for p in producers)}" if producers else name
+                combo.addItem(label, name)         # text shows the source; data is the bare name
             # reflect a plain `value = <signal>` source in the picker
             source = (self.config.source or "").strip()
             picked = source[len("value ="):].strip() if source.startswith("value =") else ""
-            combo.setCurrentText(picked if picked in names else "(expression)")
+            idx = combo.findData(picked) if picked else 0
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
 
     def _on_signal_pick(self, index: int) -> None:
-        name = self.signal_combo.currentText()
-        if not name or name == "(expression)":
+        name = str(self.signal_combo.currentData() or "")   # bare signal name (not the labelled text)
+        if not name:
             return
         self.source_edit.setText(f"value = {name}")
         self._apply_source()                      # picking a signal applies instantly
@@ -1247,7 +1298,6 @@ class PanelCard(FluentGroupBox):
                     spacing = float(np.min(deltas))
             self.plotter = panel_plot(
                 centers, vec, kind="sites", size=size, interactions=False,
-                cmap=str(self.config.params.get("cmap", "viridis")),
                 image=image, roi_radius=max(1.5, 0.3 * spacing),
                 labels=("Camera x (px)", "Camera y (px)", label),
                 title=self.config.title or None)
@@ -1743,7 +1793,7 @@ class PanelEditor(QtWidgets.QWidget):
         # panel.  A panel is a VIEW; the LOGIC NODE whose published signals it reads
         # declares what its source exposes via acquisition_parameters() -- a
         # raw-frame panel reads the camera Measurement (exposure / ROI), an
-        # occupancy panel reads the DetectProcessor.  Each field is PREFILLED with
+        # occupancy panel reads the OccupancyProcessor.  Each field is PREFILLED with
         # the CURRENT value (with a "now: X" reference); Apply pushes the edit to
         # that source IN PLACE (it does not start anything -- the node is started
         # from its own Logic-tab Edit).
@@ -1947,7 +1997,7 @@ class PanelEditor(QtWidgets.QWidget):
             elif kind == "sites":
                 self._plotter = panel_plot(np.array(src.data_x[:, :2], dtype=float),
                                            np.array(src.data_y[:, 0], dtype=float), kind="sites",
-                                           size=size, cmap=cmap, image=getattr(src, "background", None),
+                                           size=size, image=getattr(src, "background", None),
                                            roi_radius=getattr(src, "roi_radius", 3.0),
                                            labels=tuple(src.labels), title=title)
             elif kind == "hist":
@@ -2322,13 +2372,39 @@ class LogicNodeEditor(QtWidgets.QWidget):
         self.form.start_requested.connect(lambda *_: self.console._start_logic_node(self.row))
         self.form.stop_requested.connect(lambda: self.console._stop_logic_node(self.row))
         col.addWidget(self.form)
+        # This node's OUTPUT contract, so the experimenter sees what it publishes (and
+        # in what shape) without guessing -- "occupied [per-site (N,) 0/1], rate
+        # [scalar], …".  Filled from the live node when running, the spec when stopped.
+        self.publishes_label = FluentLabel("")
+        self.publishes_label.setWordWrap(True)
+        self.publishes_label.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+        col.addWidget(self.publishes_label)
+        self.refresh_publishes()
         col.addStretch(1)
+
+    def refresh_publishes(self) -> None:
+        """Show the node's published signals + their array format (single source
+        ``logic.SIGNAL_FORMAT`` via ``node.signal_formats()``)."""
+        node = self.console._logic_nodes.get(id(self.row))
+        if node is not None and hasattr(node, "signal_formats"):
+            fmts = node.signal_formats()
+            if fmts:
+                text = "Publishes — " + ", ".join(f"{n} [{f}]" for n, f in fmts.items())
+            else:
+                text = "Publishes — (off the hub: result on the task + a frame to its mid-run panel)"
+        else:
+            keys = list(getattr(self.spec, "result_keys", ()) or [])
+            if not keys and (self.spec is None or getattr(self.row.node, "kind", "") == "camera"):
+                keys = ["frame"]
+            text = ("Publishes — " + ", ".join(keys)) if keys else "Publishes — (Start to list outputs)"
+        self.publishes_label.setText(text)
 
     def collect_values(self) -> dict:
         return self.form.collect_values()
 
     def set_running(self, running: bool) -> None:
         self.form.set_running(running)
+        self.refresh_publishes()
 
     def set_status(self, text: str, *, error: bool) -> None:
         self.form.set_status(text, error=error)
@@ -2598,7 +2674,8 @@ class TaskConsole(QtWidgets.QWidget):
             self.name_edit.setText(state.name)
             for config in state.panels:
                 self._attach_card(PanelCard(config, parent=self.board,
-                                            names_provider=self.hub.names))
+                                            names_provider=self.hub.names,
+                                            sources_provider=self._signal_providers))
             for node in state.logic:
                 self._attach_logic_node(node)    # always STOPPED -- Start is manual
             self._arrange()
@@ -2721,38 +2798,14 @@ class TaskConsole(QtWidgets.QWidget):
                 return node
         return None
 
-    def _node_chain(self, node, _seen=None) -> list:
-        """The upstream node chain that ends at ``node`` (oldest first) -- the
-        who -> who -> who signal flow.
-
-        e.g. ``[CameraMeasurement, DetectProcessor]`` for a panel reading detect's
-        outputs: the camera Measurement produces ``frame``, the DetectProcessor
-        CONSUMES it to produce occupancy/rate.  A Processor declares its inputs via
-        ``consumes``; a Measurement / Task has no hub inputs (its source is the
-        device), so the chain bottoms out there.  Traced purely from the running
-        nodes -- no extra bookkeeping in the hub."""
-        _seen = set() if _seen is None else _seen
-        label = self._node_label(node)
-        if id(node) in _seen:
-            return [label]                       # cycle guard
-        _seen.add(id(node))
-        chain: list = []
-        for name in getattr(node, "consumes", ()):
-            upstream = self._node_for_signal(name)
-            if upstream is not None and upstream is not node:
-                for lab in self._node_chain(upstream, _seen):
-                    if lab not in chain:
-                        chain.append(lab)
-        chain.append(label)
-        return chain
-
     def _refresh_signal_info(self) -> None:
-        """Give every panel a legend (shown in its footer) of what it READS from the
-        hub, the upstream node FLOW it reads from (who -> who -> who) and what the
-        terminal node PROVIDES, plus any read whose name is published by more than
-        one node (ambiguous) -- so the hub namespace + signal flow is legible
-        instead of a mystery.  Self-guarded: it recomputes only when the sources /
-        nodes / published names actually change, so it is free to call every tick."""
+        """Give every panel a legend (shown in its footer) naming, FOR EACH signal the
+        panel actually reads, WHICH node + layer produces it -- e.g.
+        ``occupied ← occupancy [processor]``.  It lists only the signals this panel
+        uses (not the producing node's whole output set), so the footer answers
+        exactly "this plot's value comes from which measurement/processor".  A read
+        published by more than one running node is flagged ambiguous.  Self-guarded:
+        recomputes only when the sources / nodes / published names change."""
         providers = self._signal_providers()
         sig = (tuple(sorted((k, len(v)) for k, v in providers.items())),
                tuple((id(c), c.config.source) for c in self.cards))
@@ -2761,25 +2814,21 @@ class TaskConsole(QtWidgets.QWidget):
         self._signal_info_sig = sig
         for card in self.cards:
             reads = sorted(self._referenced_signals(card.config.source))
-            node = self._producing_node(card)
             parts: list[str] = []
-            if reads:
-                parts.append("reads: " + ", ".join(reads))
-            if node is not None and hasattr(node, "published_signals"):
-                provides = sorted(str(n) for n in node.published_signals())
-                if provides:
-                    # the full upstream chain (camera ▸ detect ▸ …) + the terminal
-                    # node's LAYER, then what it publishes -- the signal flow +
-                    # which layer it comes from, at a glance (which layer a signal is from).
-                    flow = " ▸ ".join(self._node_chain(node))
-                    layer = str(getattr(node, "layer", ""))
-                    head = f"from {flow} [{layer}]" if layer and layer != "node" else f"from {flow}"
-                    parts.append(head + ": " + ", ".join(provides))
-            dups = [n for n in reads if len(providers.get(n, [])) > 1]
-            if dups:
-                parts.append("⚠ duplicated: " + ", ".join(dups))
-            # one category per line (reads / from / duplicated) -- a long signal list
-            # wraps within its own line instead of all jammed into one strip.
+            for name in reads:
+                src = self._node_for_signal(name)
+                if src is not None:
+                    layer = str(getattr(src, "layer", ""))
+                    tag = self._node_label(src)
+                    tag = f"{tag} [{layer}]" if layer and layer != "node" else tag
+                    note = "  ⚠ also from another node" if len(providers.get(name, [])) > 1 else ""
+                    parts.append(f"{name} ← {tag}{note}")
+                else:
+                    parts.append(f"{name} ← (no running source)")
+            if not reads:
+                parts.append("(no signal set — pick one in Setting: value = <signal>)")
+            # one read per line: "<signal> ← <node> [layer]" -- the value's origin only,
+            # not the producing node's full output list.
             card.set_signal_info("\n".join(parts))
 
     def _restart_node(self, node, new_params: dict):
@@ -2891,7 +2940,8 @@ class TaskConsole(QtWidgets.QWidget):
         kind = data or "1d"
         rows = max((c.config.row + c.config.rows for c in self.cards), default=0)
         config = PanelConfig(kind=str(kind), row=rows, col=0, size="1x2")
-        card = PanelCard(config, parent=self.board, names_provider=self.hub.names)
+        card = PanelCard(config, parent=self.board, names_provider=self.hub.names,
+                         sources_provider=self._signal_providers)
         self._attach_card(card)
         self._arrange()
         self._mark_dirty()
@@ -3023,7 +3073,8 @@ class TaskConsole(QtWidgets.QWidget):
         # from the task's output buffer (see _tick) -- never a hub signal.
         config = PanelConfig(kind=kind, title=title, size="2x2",
                              source="value = __task_frame__")
-        card = PanelCard(config, parent=self.board, names_provider=self.hub.names)
+        card = PanelCard(config, parent=self.board, names_provider=self.hub.names,
+                         sources_provider=self._signal_providers)
         self._attach_card(card)
         self._task_card = card
         self._running_task_row = row

@@ -174,8 +174,8 @@ def _demo_board_state():
     kinds and BOTH rolling-trace plot types: the bare ``monitor_nodist``
     (-> :class:`LiveLive`) AND the side-distribution ``monitor``
     (-> :class:`LiveLiveDis`).  Each panel is a pure VIEW wired to a hub signal
-    the demo's camera Measurement + DetectProcessor publish (decoupled
-    VIEW/LOGIC): the camera publishes ``frame``; the DetectProcessor publishes
+    the demo's camera Measurement + OccupancyProcessor publish (decoupled
+    VIEW/LOGIC): the camera publishes ``frame``; the OccupancyProcessor publishes
     ``counts`` / ``rate`` / ``rate_sites`` / ``centers``."""
 
     from Zou_lab_control.frontend.task_console import PanelConfig, TaskConsoleState
@@ -212,7 +212,7 @@ def demo_console(*, scale: float = 1.0, size=(1480, 980), grid=(5, 7), state=Non
       * a **camera** Measurement logic node (``CameraMeasurement``) publishing
         ``frame`` -- added + Started through the public-ish console API
         (``_add_logic_node`` / ``_start_logic_node``), exactly as Add-Panel does;
-      * a reactive **DetectProcessor** consuming ``frame`` and publishing
+      * a reactive **OccupancyProcessor** consuming ``frame`` and publishing
         ``occupied`` / ``counts`` / ``rate`` (scalar EMA) / ``rate_sites`` /
         ``rate_grid`` / ``centers`` / ``thresholds`` -- built directly (the
         Add-Panel processor flow builds a ONE-SHOT run; the live readout wires the
@@ -222,11 +222,11 @@ def demo_console(*, scale: float = 1.0, size=(1480, 980), grid=(5, 7), state=Non
     ``state`` (a :class:`TaskConsoleState`) loads THAT layout instead of the
     default six-kind board, while STILL building + Starting the camera + detect so
     ``frame`` / ``rate`` / ... are published for whatever panels it carries.  With
-    ``dual=True`` a second DetectProcessor (``prefix="b_"``) is started too, so the
+    ``dual=True`` a second OccupancyProcessor (``prefix="b_"``) is started too, so the
     ``b_rate_grid`` / ``b_counts`` / ... A/B signals exist for cross-signal panels.
 
     ``shots`` shots are stepped (camera FIRST so ``frame`` exists, then each
-    DetectProcessor) and one ``refresh_once`` rendered, so every panel holds data
+    OccupancyProcessor) and one ``refresh_once`` rendered, so every panel holds data
     and reads "shot N".  The timer is stopped: tests drive ``refresh_once`` /
     ``running_nodes`` stepping themselves.
     """
@@ -235,7 +235,7 @@ def demo_console(*, scale: float = 1.0, size=(1480, 980), grid=(5, 7), state=Non
     from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
     from Zou_lab_control.frontend.task_console import LogicNodeConfig, PanelCard, TaskConsole
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
-    from Zou_lab_control.neutral_atom.operations.logic import DetectProcessor
+    from Zou_lab_control.neutral_atom.operations.logic import OccupancyProcessor
 
     ensure_qt_app()
     install_screenshot_font()  # before building so build-time text metrics match the render font
@@ -252,7 +252,7 @@ def demo_console(*, scale: float = 1.0, size=(1480, 980), grid=(5, 7), state=Non
                           tasks=exp.readout.task_specs(), scale=scale, window_px=size)
     console._timer.stop()          # deterministic: tests drive refresh_once() themselves
 
-    # --- LOGIC NODES (decoupled): a camera Measurement + reactive DetectProcessor.
+    # --- LOGIC NODES (decoupled): a camera Measurement + reactive OccupancyProcessor.
     # The camera is added as a real Logic-tab node (so it appears on the Logic tab
     # and `_producing_node` maps a frame panel back to it for its Edit's acquisition
     # params) but is run by MANUAL STEPPING, not a background thread: the demo is a
@@ -270,11 +270,11 @@ def demo_console(*, scale: float = 1.0, size=(1480, 980), grid=(5, 7), state=Non
     camera_row.set_state("running", status="running")
 
     calibration = exp.readout.require(thresholds=True)   # the session's calibrated TrapCalibration
-    detectors = [DetectProcessor(console.hub, calibration=calibration, grid_shape=tuple(grid))]
+    detectors = [OccupancyProcessor(console.hub, calibration=calibration, grid_shape=tuple(grid))]
     if dual:
         # A second detector behind a prefix so b_rate_grid / b_counts / ... exist
         # for the A-B cross-signal panels.
-        detectors.append(DetectProcessor(console.hub, calibration=calibration,
+        detectors.append(OccupancyProcessor(console.hub, calibration=calibration,
                                          grid_shape=tuple(grid), prefix="b_"))
     for detector in detectors:
         console.running_nodes.append(detector)   # so _producing_node / tests see it

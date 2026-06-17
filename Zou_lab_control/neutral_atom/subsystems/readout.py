@@ -531,7 +531,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
 
         This is the standalone live-image logic node -- one of the primitives a
         notebook or the task console composes the loading readout from by wiring
-        it alongside a :class:`~..operations.logic.DetectProcessor` and a
+        it alongside a :class:`~..operations.logic.OccupancyProcessor` and a
         :class:`~..operations.logic.CalibrateReadoutTask`.  Its editable
         parameters ARE the camera's (exposure / region), applied live; only the
         camera differs on real hardware (virtual == real)."""
@@ -615,7 +615,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
         Run it from the console (Add Panel -> "Task: Calibrate readout"): mid-run it
         streams its template frames + a progress fraction to a dedicated panel
         (``<prefix>frame`` / ``<prefix>progress``, confocal-task style) and produces a
-        ``TrapCalibration`` (+ optional npz artifact) that a DetectProcessor then
+        ``TrapCalibration`` (+ optional npz artifact) that an OccupancyProcessor then
         consumes.  Same calibration primitives the notebook/real readout uses --
         only the camera frames differ."""
 

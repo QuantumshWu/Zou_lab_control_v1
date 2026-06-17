@@ -328,8 +328,8 @@ def test_region_to_acquisition_parameters_is_owned_by_the_source():
     cam_node.set_acquisition_parameters(region=[8, 28, 12, 28])
     assert cam_node.acquisition_parameters()["region"] == [8, 28, 12, 28]
     # a non-spatial node (a Processor / scan measurement) has no rectangle param
-    from Zou_lab_control.neutral_atom.operations.logic import DetectProcessor
-    assert DetectProcessor(hub, calibration=None).region_to_acquisition_parameters(10, 30, 6, 22) == {}
+    from Zou_lab_control.neutral_atom.operations.logic import OccupancyProcessor
+    assert OccupancyProcessor(hub, calibration=None).region_to_acquisition_parameters(10, 30, 6, 22) == {}
 
 
 # ------------------------------------------------ acquisition-parameter protocol
@@ -438,7 +438,7 @@ def test_running_node_applies_params_in_owner_thread_no_concurrent_acquire():
 
 # The old monolithic loading-readout in-place re-calibration test was removed: the
 # loading readout is now COMPOSED by the user -- a CameraMeasurement publishing
-# ``frame`` + a DetectProcessor turning ``frame`` into occupancy + a
+# ``frame`` + an OccupancyProcessor turning ``frame`` into occupancy + a
 # CalibrateReadoutTask producing the calibration -- each addressed independently.
 # Composition + the real detect path are covered by
 # tests/test_logic_node_split_contract.py.

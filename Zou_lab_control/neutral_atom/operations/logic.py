@@ -8,14 +8,14 @@ consumer).  There are three KINDs, all sharing the :class:`LogicNode` loop:
   :class:`ScannedMeasurementNode`);
 * :class:`Processor` -- a reactive TRANSFORM node with no acquisition of its own
   (the "func" layer): it consumes hub signals and republishes derived ones, e.g.
-  :class:`DetectProcessor` running the SAME ``calibration.detect`` contract the
+  :class:`OccupancyProcessor` running the SAME ``calibration.detect`` contract the
   real readout uses, frame -> occupancy/counts/rate;
 * :class:`Task` -- a one-shot orchestration (e.g. :class:`CalibrateReadoutTask`,
   which produces a ``TrapCalibration`` + an npz artifact and streams its template
   frames to a mid-run output panel).
 
 The loading readout is COMPOSED by the user from these primitives -- a camera
-Measurement publishing ``frame`` + a DetectProcessor turning ``frame`` into
+Measurement publishing ``frame`` + an OccupancyProcessor turning ``frame`` into
 occupancy/counts/rate, with calibration produced by a CalibrateReadoutTask.  No
 monolithic node fabricates every signal: each layer is independent and explicitly
 wired by the notebook or task console.  Every logic node touches only the camera
@@ -38,6 +38,41 @@ from ..core.analysis import grid_shape_tuple
 from ..core.signals import SignalHub
 from ..devices.base import CameraDevice
 from ..timing import imaging_channel_kwargs, imaging_sequence
+
+
+# Human-readable shape/format of each published signal -- the SINGLE source the GUI
+# uses to tell the experimenter what a node outputs (and what a plot can read).  Keyed
+# by the bare signal name (the hub prefix is stripped before lookup).  ``N`` = number
+# of trap sites, ``H×W`` = camera frame.  An unknown name falls back to "value".
+SIGNAL_FORMAT = {
+    "frame": "2D image H×W",
+    "occupied": "per-site (N,) 0/1",
+    "counts": "per-site (N,)",
+    "rate": "scalar (loading rate)",
+    "rate_sites": "per-site (N,)",
+    "rate_grid": "grid ny×nx",
+    "centers": "(N, 2) px",
+    "thresholds": "per-site (N,)",
+    "n_sites": "scalar",
+    "fidelity_site": "per-site (N,)",
+    "fidelity_threshold": "per-site (N,)",
+    "fidelity_centers": "(N, 2) px",
+    "x": "1D scan x",
+    "y": "1D curve",
+    "shot": "scalar",
+    "scan_done": "scalar 0/1",
+}
+
+
+def signal_format(name: str) -> str:
+    """Format string for a bare or prefixed signal name (best-effort suffix match)."""
+    key = str(name)
+    if key in SIGNAL_FORMAT:
+        return SIGNAL_FORMAT[key]
+    for base, fmt in SIGNAL_FORMAT.items():       # tolerate a hub prefix (e.g. ``b_rate``)
+        if key.endswith(base):
+            return fmt
+    return "value"
 
 
 class LogicNode:
@@ -173,6 +208,13 @@ class LogicNode:
         produces its data, then expose THAT node's parameters.  Subclasses with
         a fixed signal set override this; the base publishes nothing structured."""
         return frozenset()
+
+    def signal_formats(self) -> dict[str, str]:
+        """``{published signal name: human format}`` (e.g. ``occupied`` -> ``per-site
+        (N,) 0/1``) so the GUI can tell the experimenter what this node outputs and in
+        what shape.  Derived from :meth:`published_signals` + the single-source
+        :data:`SIGNAL_FORMAT`; a task (nothing on the hub) returns ``{}``."""
+        return {str(name): signal_format(name) for name in sorted(self.published_signals())}
 
     # --------------------------------------------------- acquisition parameters
     # A panel is a VIEW; a logic node produces the data; behind the node sits the data
@@ -360,7 +402,7 @@ class Processor(LogicNode):
         return frozenset(self.prefix + key for key in self.provides)
 
 
-class DetectProcessor(Processor):
+class OccupancyProcessor(Processor):
     """Per-frame atom detection as a live graph node -- the REAL readout pipeline.
 
     Consumes a camera ``frame`` signal and runs the SAME ``calibration.detect``
@@ -374,7 +416,7 @@ class DetectProcessor(Processor):
     ``rate`` scalar EMA loading rate, ``rate_sites`` (N,) per-site EMA, ``rate_grid``
     grid map (when grid known), ``centers`` (N,2), ``thresholds`` (N,)."""
 
-    node_label = "detect"
+    node_label = "occupancy"
     provides = ("occupied", "counts", "rate", "rate_sites", "rate_grid", "centers", "thresholds")
 
     def __init__(self, hub: SignalHub, *, calibration=None, calibration_source=None,
@@ -512,6 +554,14 @@ class Task(LogicNode):
         # mid-run output in self.output) -- so it provides no hub signal name.
         return frozenset()
 
+    def signal_formats(self) -> dict[str, str]:
+        """A task is OFF the hub, so document what it PRODUCES instead: its ``result``
+        keys (on ``self.result``) + the frames it streams to its mid-run panel."""
+        out = {f"{name} (result)": signal_format(name) for name in self.provides}
+        out.update({f"{name} (mid-run)": signal_format(name)
+                    for name in self.mid_run if name != "progress"})
+        return out
+
 
 class CalibrateReadoutTask(Task):
     """Acquire frames and run the REAL sitemap + per-site threshold calibration,
@@ -519,7 +569,7 @@ class CalibrateReadoutTask(Task):
     template + a sample frame and a
     progress fraction to a dedicated panel.  The resulting calibration is held on
     ``self.calibration`` (and optionally saved to ``save_path`` as an ``npz``) for a
-    downstream :class:`DetectProcessor`.  Same primitives as the real readout
+    downstream :class:`OccupancyProcessor`.  Same primitives as the real readout
     (``calibrate_sitemap_from_images`` / ``calibrate_threshold_from_images``), so it
     is identical on real hardware -- only the camera frames differ."""
 
@@ -993,7 +1043,7 @@ class ProcessorRun(LogicNode):
 __all__ = [
     "CalibrateReadoutTask",
     "CameraMeasurement",
-    "DetectProcessor",
+    "OccupancyProcessor",
     "Measurement",
     "Processor",
     "ProcessorRun",

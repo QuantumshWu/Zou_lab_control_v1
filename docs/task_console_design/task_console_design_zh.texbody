@@ -28,7 +28,7 @@
 \begin{description}
   \item[\filepath{frontend/task\_console.py}] 控制台主体：\pyapi{TaskConsole}、\pyapi{PanelCard}、\pyapi{LogicNodeRow}、\pyapi{LogicNodeEditor}、\pyapi{PanelEditor}、\pyapi{PanelConfig}、\pyapi{TaskConsoleState}、Monitor 网格、Logic 列表、每面板/每节点 Edit 标签、命名布局。
   \item[\filepath{neutral\_atom/core/signals.py}] \pyapi{SignalHub}：线程安全命名信号环。
-  \item[\filepath{neutral\_atom/operations/logic.py}] \pyapi{LogicNode} 共享基类 + 三类生产节点：\pyapi{CameraMeasurement} / \pyapi{ScannedMeasurementNode}（measurement）、\pyapi{Processor} / \pyapi{DetectProcessor}（processor）、\pyapi{Task} / \pyapi{CalibrateReadoutTask} + \pyapi{TaskOutput}（task）。
+  \item[\filepath{neutral\_atom/operations/logic.py}] \pyapi{LogicNode} 共享基类 + 三类生产节点：\pyapi{CameraMeasurement} / \pyapi{ScannedMeasurementNode}（measurement）、\pyapi{Processor} / \pyapi{OccupancyProcessor}（processor）、\pyapi{Task} / \pyapi{CalibrateReadoutTask} + \pyapi{TaskOutput}（task）。
   \item[\filepath{neutral\_atom/operations/processor.py}] \pyapi{ProcessorSpec}（反应式 \pyapi{make\_node} 或一次性 \pyapi{run}，二选一）+ \pyapi{ProcessorContext}；目录里的 \pyapi{Judge occupancy} / \pyapi{Readout fidelity}。
   \item[\filepath{neutral\_atom/operations/task.py}] \pyapi{TaskSpec}（\pyapi{build}/\pyapi{params}/\pyapi{mid\_run\_key}/\pyapi{default\_kind}/\pyapi{prefix}）；目录里的 \pyapi{Calibrate readout}。
   \item[\filepath{neutral\_atom/operations/measurement.py}] 通用扫描测量引擎：\pyapi{MeasurementSpec}/\pyapi{ParamDecl}（声明式单一真相源）、\pyapi{ScanAxis}/\pyapi{ShotPlan}/\pyapi{PointReducer} 三角色、\pyapi{ScannedMeasurement}/\pyapi{ScanResult}、\pyapi{axis\_range\_tuple}。
@@ -90,7 +90,7 @@
 \begin{description}
   \item[device（设备）] 相机 / sequencer。相机带防丢帧 ring-buffer（\pyapi{arm}/\pyapi{latest}/\pyapi{drain}），缓冲\tfocus{在相机里}、不在节点层；virtual 相机与真机共用同一 \pyapi{CameraDevice} 契约，只把"trigger 来帧"换成仿真帧。
   \item[measurement（测量）] 一个\tfocus{驱动设备采集}的逻辑节点：相机 \pyapi{CameraMeasurement} 发 \pyapi{frame}，扫描型 \pyapi{ScannedMeasurementNode} 让有限扫描在 Monitor 里逐点长出 live 曲线、跑完自停。
-  \item[processor（处理器，"func"层）] 一个\tfocus{无采集的反应式变换}节点：消费 hub 信号、republish 派生信号，如 \pyapi{DetectProcessor} 用与真机读出\tfocus{相同}的 \pyapi{calibration.detect} 契约把 \pyapi{frame} 变成 \pyapi{occupied}/\pyapi{counts}/\pyapi{rate} 等。
+  \item[processor（处理器，"func"层）] 一个\tfocus{无采集的反应式变换}节点：消费 hub 信号、republish 派生信号，如 \pyapi{OccupancyProcessor} 用与真机读出\tfocus{相同}的 \pyapi{calibration.detect} 契约把 \pyapi{frame} 变成 \pyapi{occupied}/\pyapi{counts}/\pyapi{rate} 等。
   \item[task（任务）] 一个\tfocus{一次性编排}节点，如 \pyapi{CalibrateReadoutTask} 产 \pyapi{TrapCalibration}+npz 产物，中途把模板帧 + 进度流到一个专用面板。
   \item[plot（面板）] 即 frontend live 绘图类的复用，\tfocus{纯消费}：订阅信号名、按版本水位定时刷新，不绑任何节点。
 \end{description}
@@ -180,7 +180,7 @@ publish 与读取都在锁内做副本，所以采集线程和 GUI 线程互不�
 \section{Processor:逐帧/反应式变换("func"层)}
 \pyapi{Processor}（\pyapi{LogicNode} 子类）\tfocus{无设备采集}：消费一个或多个 hub 信号、计算、republish 派生信号。它是\tfocus{反应式}的——只在某个被消费信号\tfocus{自上次以来前进了}才发（按 hub 每信号版本判断），所以它作为一个 live 图节点跑在产它输入的 measurement 旁边，自有轮询节律，没新数据就 no-op。
 
-\pyapi{DetectProcessor} 是\tfocus{真读出流程}的逐帧节点：消费相机 \pyapi{frame}、跑与真机读出\tfocus{相同}的 \pyapi{calibration.detect} 契约（不重实现任何检测数学），每新帧发布 \pyapi{occupied}(N,) / \pyapi{counts}(N,) / \pyapi{rate}(标量 EMA 装载率) / \pyapi{rate\_sites}(N,) / \pyapi{rate\_grid}(网格) / \pyapi{centers}(N,2) / \pyapi{thresholds}(N,)。\tfocus{这正是 virtual==real 的拆分}：相机 measurement 只发 \pyapi{frame}，detect 是\tfocus{单独}的节点；标定（站点中心 + 逐站阈值）来自先跑的 calibrate-readout task，与真机完全一致。
+\pyapi{OccupancyProcessor} 是\tfocus{真读出流程}的逐帧节点：消费相机 \pyapi{frame}、跑与真机读出\tfocus{相同}的 \pyapi{calibration.detect} 契约（不重实现任何检测数学），每新帧发布 \pyapi{occupied}(N,) / \pyapi{counts}(N,) / \pyapi{rate}(标量 EMA 装载率) / \pyapi{rate\_sites}(N,) / \pyapi{rate\_grid}(网格) / \pyapi{centers}(N,2) / \pyapi{thresholds}(N,)。\tfocus{这正是 virtual==real 的拆分}：相机 measurement 只发 \pyapi{frame}，detect 是\tfocus{单独}的节点；标定（站点中心 + 逐站阈值）来自先跑的 calibrate-readout task，与真机完全一致。
 
 \section{Task:一次性编排}
 \pyapi{Task}（\pyapi{LogicNode} 子类）\tfocus{编排}多步流程（采帧 / 标定 / 文件夹读取），可向一张专用面板发\tfocus{中途输出}（confocal 式）。one-shot：\pyapi{step()} 跑完整个 \pyapi{run(out)} 一次，自停。\tfocus{task 向 hub publish 0 个信号}——结果/标定留在实例（\pyapi{node.result}/\pyapi{node.calibration}），中途帧/进度写进它自己的 \pyapi{TaskOutput} 缓冲（\pyapi{node.output}，非 hub）。控制台把 \pyapi{node.output} 绑到一张固定面板（保留键 \pyapi{\_\_task\_frame\_\_}）显示它跑时的过程。
@@ -189,13 +189,13 @@ publish 与读取都在锁内做副本，所以采集线程和 GUI 线程互不�
 看 loading\tfocus{没有一键复合体}（没有 \pyapi{build\_loading\_readout}、没有自造的"Readout: Loading"复合节点）：你用三类节点\tfocus{自己拼}——
 \begin{enumerate}
   \item \pyapi{Measurement: Camera (live frames)}（\pyapi{CameraMeasurement}，发 \pyapi{frame}）；
-  \item \pyapi{Processor: Judge occupancy}（\pyapi{DetectProcessor}，逐帧跑真 \pyapi{calibration.detect}）；
+  \item \pyapi{Processor: Judge occupancy}（\pyapi{OccupancyProcessor}，逐帧跑真 \pyapi{calibration.detect}）；
   \item \pyapi{Task: Calibrate readout}（\pyapi{CalibrateReadoutTask}，先跑、写回标定 / 产 npz）。
 \end{enumerate}
 各自 Start，再在 Monitor 加 Plot 面板按 signal 连。\tfocus{每层独立、信号显式相连，没有单体节点一次造出所有信号}——每个节点只经 \pyapi{CameraDevice} 契约取帧，换真机只换传入的 \pyapi{camera}（唯一虚拟之处=相机数据源）。这一点很关键：节点不是"假数据"通道，它走的是和真机一样的检测原语，所以面板表达式、拟合、站点图在虚拟上验证通过 = 在真机上同样成立。
 
 \section{Judge occupancy 反应式处理器}
-\pyapi{Judge occupancy}（\filepath{operations/processors/occupancy.py}）是目录里的主读出 processor，build 一个 \pyapi{DetectProcessor}。声明参数：
+\pyapi{Judge occupancy}（\filepath{operations/processors/occupancy.py}）是目录里的主读出 processor，build 一个 \pyapi{OccupancyProcessor}。声明参数：
 \begin{description}
   \item[\pyapi{calibration}（Calibration file）] 一个已存标定的路径（\pyapi{.npz}/\pyapi{.json}：站点中心 + 逐站阈值 [+ PSF 权重]，如 calibrate-readout task 的产物）；\tfocus{留空 = 用当前会话标定}（懒取：calibrate task 还在跑时 detector 先 no-op，标定就绪后自动接上）。
   \item[\pyapi{source}（Frame signal）] 携带相机帧的 hub 信号名（默认 \pyapi{frame}）。
@@ -211,7 +211,7 @@ publish 与读取都在锁内做副本，所以采集线程和 GUI 线程互不�
 \label{ch:calibtask}
 
 \section{calibrate-readout task 的完整参数设计}
-\pyapi{CalibrateReadoutTask}（\filepath{operations/logic.py}）跑\tfocus{真}的 sitemap + 逐站阈值标定——就是 notebook 的 \pyapi{exp.readout.sitemap()} / \pyapi{thresholds()} 流程——产出一个 \pyapi{TrapCalibration} 供下游 \pyapi{DetectProcessor} 用。所有可调参数在 \pyapi{operations/tasks/calibrate.py} 的 \pyapi{CALIBRATE\_PARAMS} 声明一次（GUI 自动表单与 \pyapi{readout.calibrate\_task(**values)} 同读）：
+\pyapi{CalibrateReadoutTask}（\filepath{operations/logic.py}）跑\tfocus{真}的 sitemap + 逐站阈值标定——就是 notebook 的 \pyapi{exp.readout.sitemap()} / \pyapi{thresholds()} 流程——产出一个 \pyapi{TrapCalibration} 供下游 \pyapi{OccupancyProcessor} 用。所有可调参数在 \pyapi{operations/tasks/calibrate.py} 的 \pyapi{CALIBRATE\_PARAMS} 声明一次（GUI 自动表单与 \pyapi{readout.calibrate\_task(**values)} 同读）：
 \begin{description}
   \item[\pyapi{source} = live / folder] \pyapi{live} = 现在开相机直接采图；\pyapi{folder}（+ \pyapi{data\_dir}）= 用已存文件夹的图（\pyapi{index\_run} 读 \pyapi{img<n>}）标定。
   \item[两条 pulse（两个 readout duration）] \tfocus{sitemap 这一遍用较长 readout}（更多光子 → site 中心 + PSF 拟合更干净），\tfocus{threshold 这一遍用实际 readout}（阈值要在真实读出条件下学）。各自：\pyapi{sitemap\_exposure}/\pyapi{readout\_exposure}（默认序列时长）或 \pyapi{sitemap\_pulse}/\pyapi{readout\_pulse}（已存 \pyapi{PulseTableState} 的 \pyapi{.json}，经 \pyapi{PulseTableState.load().to\_sequence()} 当成像脉冲，空 = 默认序列）。\pyapi{\_imaging\_seq(pulse, exposure, name)} 单点选择。
@@ -372,7 +372,7 @@ Start 一个 task 时，console 在 Monitor 开一张\tfocus{固定}面板显示
 \section{Edit 控件(详细参考 confocal)}
 \subsection{plot 面板 Edit（\pyapi{PanelEditor}）}
 \begin{description}
-  \item[Acquisition（编辑数据源的采集参数）] 一个 plot 面板是\tfocus{视图}；它读的信号由某个\tfocus{逻辑节点}生产，背后是\tfocus{数据源}——相机本身，或一个变换节点。Edit 顶部列出\tfocus{数据源的可编辑参数}：\pyapi{\_producing\_node(card)} 用 \pyapi{node.published\_signals()} $\cap$ 面板表达式引用的信号名找到产这张图的逻辑节点，节点经 \pyapi{acquisition\_parameters()} \tfocus{自报}哪些可调（\tfocus{由源决定}，不靠反射 \pyapi{\_\_init\_\_}）。一张原始相机帧面板的源是 \pyapi{CameraMeasurement}，列出 \pyapi{exposure} / \pyapi{region}（ROI 端点）/ \pyapi{frames\_per\_cycle}；一张占据面板的源是 \pyapi{DetectProcessor}，列出它的 detect 设置。每格预填当前值并在下标 \pyapi{now: <值>} 供改参参照；点 \pyapi{Apply} 经 \pyapi{set\_acquisition\_parameters(...)} 把改动\tfocus{原地}推给源——相机就 \pyapi{camera.configure(...)} 实时重配——同一节点以同一信号名继续发布，\tfocus{不重启节点}（节点从它自己在 Logic tab 的 Edit Start）。plot 面板\tfocus{绝不}自带某 measurement 的"参数表单 + Start"（\pyapi{PanelEditor.meas\_panel} 恒 None）；要重跑一个扫描就去 Logic tab 调那节点。
+  \item[Acquisition（编辑数据源的采集参数）] 一个 plot 面板是\tfocus{视图}；它读的信号由某个\tfocus{逻辑节点}生产，背后是\tfocus{数据源}——相机本身，或一个变换节点。Edit 顶部列出\tfocus{数据源的可编辑参数}：\pyapi{\_producing\_node(card)} 用 \pyapi{node.published\_signals()} $\cap$ 面板表达式引用的信号名找到产这张图的逻辑节点，节点经 \pyapi{acquisition\_parameters()} \tfocus{自报}哪些可调（\tfocus{由源决定}，不靠反射 \pyapi{\_\_init\_\_}）。一张原始相机帧面板的源是 \pyapi{CameraMeasurement}，列出 \pyapi{exposure} / \pyapi{region}（ROI 端点）/ \pyapi{frames\_per\_cycle}；一张占据面板的源是 \pyapi{OccupancyProcessor}，列出它的 detect 设置。每格预填当前值并在下标 \pyapi{now: <值>} 供改参参照；点 \pyapi{Apply} 经 \pyapi{set\_acquisition\_parameters(...)} 把改动\tfocus{原地}推给源——相机就 \pyapi{camera.configure(...)} 实时重配——同一节点以同一信号名继续发布，\tfocus{不重启节点}（节点从它自己在 Logic tab 的 Edit Start）。plot 面板\tfocus{绝不}自带某 measurement 的"参数表单 + Start"（\pyapi{PanelEditor.meas\_panel} 恒 None）；要重跑一个扫描就去 Logic tab 调那节点。
   \item[Parameters（plot 的 API 参数）] 该面板 plot 调用的\tfocus{可变参数}自动铺成 GUI 控件（\pyapi{length}/\pyapi{bins}/\pyapi{centers}/\pyapi{image}……，从该 kind 的声明 \pyapi{PANEL\_PARAMS}\tfocus{自动发现}，复用 \pyapi{\_make\_param\_widget}）；改一下经 \pyapi{card.\_set\_param} \tfocus{实时重渲染}活面板并重抓 Edit 快照。\pyapi{cmap}（\pyapi{display=True}）是唯一留在 Setting 的；其余 \pyapi{display=False} 的功能参数都在这里——两边永不重复。
   \item[Fit（全套 data\_figure，不门控）] 模型下拉是\tfocus{完整的 DataFigure 集合}：Lorentzian / Gaussian / Lorentzian (Zeeman) / Rabi / Exp decay / \tfocus{2D center}，\tfocus{对所有 plot 类型都可用}（DataFigure 从快照自取 1D/2D 路径——2D 图用 2D 高斯 \pyapi{center} 拟合，其余拟合 1D 轨迹）。一行\tfocus{自由文本参数}注入拟合调用（\pyapi{eval(f"\_df.\{method\}(\{cmd\})")}，与 confocal 的 \pyapi{:} 框同理）：\pyapi{p0=[...]} 初值、\pyapi{名字=值} 固定、\pyapi{is\_fit=False} 只叠加。\pyapi{Clear} 移除；底层 \pyapi{DataFigure}。
   \item[手动 x/y lim] 四框 + \pyapi{Apply lim}（\pyapi{DataFigure.xlim/ylim}）；打开时自动回填当前坐标范围。\tfocus{relim/unit 不在 Edit}——它们在 Setting，避免重复。
@@ -637,7 +637,7 @@ for shot in range(100000):
 更干净的做法是用内置的三类逻辑节点（\filepath{operations/logic.py}）\tfocus{自己拼}——每个节点只经 \pyapi{CameraDevice} 契约取帧、用与真机相同的检测原语，换真机\tfocus{只换 \pyapi{connect()}}：
 \begin{codeblock}[Python]
 from Zou_lab_control.neutral_atom.operations.logic import (
-    CameraMeasurement, DetectProcessor, CalibrateReadoutTask)
+    CameraMeasurement, OccupancyProcessor, CalibrateReadoutTask)
 
 # 1) 先跑标定 task：产 TrapCalibration（站点中心 + 逐站阈值）
 cal = CalibrateReadoutTask(hub, exp.camera, sequencer=exp.devices.sequencer,
@@ -645,7 +645,7 @@ cal = CalibrateReadoutTask(hub, exp.camera, sequencer=exp.devices.sequencer,
 # 2) 相机 measurement：只发 frame
 cam = CameraMeasurement(hub, exp.camera, sequencer=exp.devices.sequencer)
 # 3) detect processor：逐帧 frame -> occupied/counts/rate（跑真 calibration.detect）
-detect = DetectProcessor(hub, calibration=cal.calibration, grid_shape=(5, 7))
+detect = OccupancyProcessor(hub, calibration=cal.calibration, grid_shape=(5, 7))
 
 cam.start(rate_hz=5.0); detect.start(rate_hz=5.0)
 console = zf.show_task_console(hub=hub, running_nodes=[cam, detect])
@@ -678,7 +678,7 @@ per-site 信号 (photons) & \pyapi{counts} → Distribution(双高斯+阈值) \\
 
 \begin{itemize}
   \item 契约/渲染:hub 契约、逻辑节点信号+收敛、六种面板渲染+更新(含两种 live 类型)、A$-$B 表达式+错误隔离、布局 JSON 往返、增删+脏星+存盘、命名布局往返、信号下拉、Site map 坏 centers 隔离。
-  \item 节点契约:\pyapi{DetectProcessor} 的 \pyapi{occupied == cal.detect(frame).occupied}、task 向 hub publish 0 信号且结果留实例、calibrate task 三种 mode + plot 分流（\pyapi{tests/test\_task\_cali\_modes\_and\_plot\_split.py}）。
+  \item 节点契约:\pyapi{OccupancyProcessor} 的 \pyapi{occupied == cal.detect(frame).occupied}、task 向 hub publish 0 信号且结果留实例、calibrate task 三种 mode + plot 分流（\pyapi{tests/test\_task\_cali\_modes\_and\_plot\_split.py}）。
   \item 几何/缩放:confocal 模数契约(签名=["size"]、dpi、margins、PANEL\_SIZES)、卡片 tiling(\pyapi{2x(1x2)+gap==2x2})、\pyapi{EmbeddedFigureCanvas} 三档缩放不变量、两 GUI auto-scale parity。
   \item 密封 API:\pyapi{plot/panel\_plot} 拒绝几何 kwargs、\pyapi{DEFAULT\_STYLE} 只读、\pyapi{pulse\_plot\_spec} 无 margins/dpi。
   \item Setting 瘦身契约:Setting 只含基本控件、\tfocus{无 Fit/无 relim}（扫 \pyapi{\_build\_settings} 产出的控件集；含 \pyapi{not hasattr(card, "fit\_combo")} 等断言）。
@@ -697,7 +697,7 @@ per-site 信号 (photons) & \pyapi{counts} → Distribution(双高斯+阈值) \\
   \item[\pyapi{zf.panel\_plot(data\_x, data\_y=None, *, kind, size="2x2", \*\*kwargs)}] 仪表盘面板工厂。
   \item[\pyapi{zf.plot(...)}] 通用绘图工厂(notebook)。
   \item[\pyapi{SignalHub} / \pyapi{publish}/\pyapi{latest}/\pyapi{history}/\pyapi{names}/\pyapi{snapshot\_latest}] 数据契约。
-  \item[\pyapi{LogicNode} / \pyapi{CameraMeasurement} / \pyapi{ScannedMeasurementNode} / \pyapi{Processor} / \pyapi{DetectProcessor} / \pyapi{Task} / \pyapi{CalibrateReadoutTask}] 逻辑节点基类 + 三类生产节点（\filepath{operations/logic.py}）。
+  \item[\pyapi{LogicNode} / \pyapi{CameraMeasurement} / \pyapi{ScannedMeasurementNode} / \pyapi{Processor} / \pyapi{OccupancyProcessor} / \pyapi{Task} / \pyapi{CalibrateReadoutTask}] 逻辑节点基类 + 三类生产节点（\filepath{operations/logic.py}）。
   \item[\pyapi{exp.readout.measurement\_specs()} / \pyapi{processor\_specs()} / \pyapi{task\_specs()}] GUI 可驱动的三份目录（传给 \pyapi{show\_task\_console(measurements=, processors=, tasks=)}）——\tfocus{自动发现},非写死 list。
   \item[\pyapi{na.measurement} / \pyapi{na.processor} / \pyapi{na.task}（+ \pyapi{register\_*} / \pyapi{unregister\_*}）] 把一个 \pyapi{build(readout) -> *Spec} 工厂注册进对应目录（装饰器 / 函数 / 撤销）；或直接把 \pyapi{@measurement}/\pyapi{@processor}/\pyapi{@task} 文件丢进 \filepath{operations/measurements\,|\,processors\,|\,tasks/} 自动发现。\pyapi{na.axis\_range\_tuple} 把 \pyapi{axis\_range} 参数值解释成 \pyapi{(min,max,points)}。
 \end{description}
@@ -711,7 +711,7 @@ per-site 信号 (photons) & \pyapi{counts} → Distribution(双高斯+阈值) \\
 下面是\tfocus{留给你决定}的方向(按我判断的价值排序)，每条注明现状与代价。
 
 \begin{enumerate}
-  \item \tfocus{逻辑节点 + 通用测量 + 一键温度（现状基线）}。三类逻辑节点（\pyapi{CameraMeasurement} / \pyapi{DetectProcessor} / \pyapi{CalibrateReadoutTask}，走相机契约、自标定）、通用 Measurement 框架（\pyapi{MeasurementSpec} / 三角色 / \pyapi{ScannedMeasurementNode}）与 release-recapture 一键温度都在库里；换真机 \pyapi{na.connect("qcmos", ...)} 走同一路径。下面的方向在此基线上展开。
+  \item \tfocus{逻辑节点 + 通用测量 + 一键温度（现状基线）}。三类逻辑节点（\pyapi{CameraMeasurement} / \pyapi{OccupancyProcessor} / \pyapi{CalibrateReadoutTask}，走相机契约、自标定）、通用 Measurement 框架（\pyapi{MeasurementSpec} / 三角色 / \pyapi{ScannedMeasurementNode}）与 release-recapture 一键温度都在库里；换真机 \pyapi{na.connect("qcmos", ...)} 走同一路径。下面的方向在此基线上展开。
   \item \tfocus{性能激进档需用户拍板}。瓶颈=密封 300dpi 文字栅格化（intrinsic），blit / 位置冻结已实测否决。迟滞 autoscale / 错峰重绘 / 嵌入面板低 dpi 性能模式能进一步提速,但都改可见行为或视觉,需要你决定是否接受（见性能结论章）。
   \item \tfocus{(N,2) x-y 形状启发式收口}。扫描曲线靠"列数==2"判 x-y;建议改为只在面板 source 明确引用某扫描节点的 \pyapi{x\_key}/\pyapi{y\_key} 时才走 x-y 分支,避免普通 1D 面板碰巧产 (N,2) 被误判。
   \item \tfocus{死码/残留清理（minor）}。\pyapi{live.py} 的 \pyapi{\_set\_colorbar\_ticks} 自递归 no-op（2D 靠 \pyapi{update\_core} 内联设刻度、sites 靠 matplotlib auto-tick，"修"它会改 sites 基线 → 删或显式注释 no-op，走零基线漂移）；\pyapi{PanelCard.\_fit\_df} / \pyapi{FITTABLE\_KINDS} 随 Fit 迁走后只剩测试消费，可干净删除。

@@ -42,7 +42,7 @@ def judge_occupancy(readout) -> ProcessorSpec:
         # Reactive node reuses the real readout pipeline (calibration.detect); the
         # calibration is LOADED here (saved file) or DEFERRED to the session calibration
         # -- the console never re-implements detection (single readout contract).
-        from ..logic import DetectProcessor
+        from ..logic import OccupancyProcessor
         from ...core.calibration import TrapCalibration
 
         cal_path = str(values.get("calibration", "")).strip()
@@ -58,7 +58,7 @@ def judge_occupancy(readout) -> ProcessorSpec:
             grid = readout._session._grid_shape(None)
         except Exception:
             grid = None
-        return DetectProcessor(
+        return OccupancyProcessor(
             hub, calibration=calibration, calibration_source=calibration_source,
             source=str(values.get("source", "frame")), ema=float(values.get("ema", 0.05)),
             grid_shape=grid, prefix=prefix)

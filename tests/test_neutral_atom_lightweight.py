@@ -6935,7 +6935,7 @@ def test_signal_hub_publish_latest_history_and_versioning():
 def test_user_composed_loading_readout_publishes_standard_signals():
     """The user composes the loading readout from independent nodes -- a
     CalibrateReadoutTask producing the calibration + a CameraMeasurement publishing
-    raw frames + a DetectProcessor running the REAL per-frame ``calibration.detect``
+    raw frames + an OccupancyProcessor running the REAL per-frame ``calibration.detect``
     -- exactly the same composition real hardware uses (virtual == real, only the
     camera frames are fake).  Each node is added separately and addressed
     independently; no monolithic node fabricates every signal.
@@ -6946,7 +6946,7 @@ def test_user_composed_loading_readout_publishes_standard_signals():
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
     from Zou_lab_control.neutral_atom.devices.virtual import VirtualCamera, VirtualTrapArray
     from Zou_lab_control.neutral_atom.operations.logic import (
-        CalibrateReadoutTask, CameraMeasurement, DetectProcessor)
+        CalibrateReadoutTask, CameraMeasurement, OccupancyProcessor)
 
     def _build(hub, *, prefix, seed, loading_probability, ema):
         trap = VirtualTrapArray(grid_shape=(5, 7), loading_probability=loading_probability, seed=seed)
@@ -6957,7 +6957,7 @@ def test_user_composed_loading_readout_publishes_standard_signals():
                                     prefix=f"{prefix}cal_")
         task.run_to_completion()
         cam = CameraMeasurement(hub, camera, prefix=prefix)
-        det = DetectProcessor(hub, calibration=task.calibration, source=f"{prefix}frame",
+        det = OccupancyProcessor(hub, calibration=task.calibration, source=f"{prefix}frame",
                               grid_shape=trap.grid_shape, ema=ema, prefix=prefix)
         return cam, det
 

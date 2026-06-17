@@ -234,12 +234,19 @@ _PALETTE: dict[str, Any] = {
     "pulse_grid": "0.88",
     "pulse_repeat_note": "0.35",
     "bad": "white",          # NaN / masked cell
-    "site_ring": "white",    # site-circle stroke
     "cmap_scan": "inferno",
-    "cmap_site": "viridis",
     "cmap_camera": "gray",
 }
 PALETTE: Mapping[str, Any] = MappingProxyType(_PALETTE)
+
+# Occupancy overlay on a site map: a 2D camera frame with one hollow ring per
+# tweezer, faint for an EMPTY site and bold for an OCCUPIED one (the Rb87 readout
+# look).  Single source for the site-map plot -- ring colour / opacity / stroke
+# per occupancy state (rings are always unfilled so the frame shows through).
+SITE_OCCUPANCY_STYLE: Mapping[str, Mapping[str, Any]] = MappingProxyType({
+    "empty":    MappingProxyType({"color": "#7EA5A3", "alpha": 0.24, "linewidth": 0.5}),
+    "occupied": MappingProxyType({"color": "#D07850", "alpha": 0.94, "linewidth": 1.1}),
+})
 
 
 def threshold_line_kwargs(linewidth: float = 1.9) -> dict[str, Any]:
@@ -256,6 +263,7 @@ __all__ = [
     "NEW_BLACK",
     "PALETTE",
     "SANS_SERIF",
+    "SITE_OCCUPANCY_STYLE",
     "STOCK_DATA_PX",
     "STOCK_MARGINS_PX",
     "apply_style",

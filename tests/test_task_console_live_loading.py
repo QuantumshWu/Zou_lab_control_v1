@@ -132,6 +132,68 @@ def test_add_logic_node_is_stopped_and_publishes_nothing_until_start():
         exp.close()
 
 
+def test_setting_popup_click_again_does_not_reopen_after_autoclose():
+    """A Qt.Popup auto-closes on the press that lands on the Setting button, so the
+    button's release must NOT re-open it (real toggle).  The guard: a click within
+    the just-dismissed window is a no-op (does not re-show / re-refresh)."""
+    exp = _calibrated_virtual_session()
+    console = _console(exp)
+    try:
+        _pick(console, "2d")
+        card = console.cards[-1]
+        opened = []
+        card._refresh_signal_combo = lambda: opened.append(1)   # spy: only runs on a real open
+
+        # The popup just auto-closed from THIS click -> the release must not re-open.
+        card._note_settings_dismissed()
+        card._open_settings()
+        assert opened == [] and not card.settings_popup.isVisible()
+
+        # A later click (outside the dismiss window) opens normally.
+        card._settings_dismissed_at = time.monotonic() - 1.0
+        card._open_settings()
+        assert opened == [1]
+    finally:
+        console.shutdown()
+        exp.close()
+
+
+def test_remove_logic_node_stops_it_and_freezes_its_signal():
+    """Remove = STOP and remove: after removing a running logic node, its thread is
+    stopped, it is dropped from running_nodes, and its hub signal STOPS advancing
+    (a plot reading it no longer gets new data) -- not merely the row disappearing."""
+    exp = _calibrated_virtual_session()
+    console = _console(exp)
+    try:
+        _pick(console, ("camera", "live"))
+        row = console.logic_nodes[0]
+        console._start_logic_node(row)
+        node = console._logic_nodes[id(row)]
+        deadline = time.monotonic() + 8.0
+        while "frame" not in console.hub.names() and time.monotonic() < deadline:
+            time.sleep(0.03)
+        assert "frame" in console.hub.names()
+        # it IS advancing while running
+        v0 = console.hub.signal_versions().get("frame", 0)
+        time.sleep(0.4)
+        assert console.hub.signal_versions().get("frame", 0) > v0
+
+        # Remove the node's row -> stop + drop everywhere
+        console._remove_logic_node(row)
+        assert not node.running                       # thread stopped (joined)
+        assert node not in console.running_nodes      # dropped from the running set
+        assert row not in console.logic_nodes         # row gone
+        assert id(row) not in console._logic_nodes
+
+        # and its signal no longer advances (nothing is publishing it anymore)
+        v1 = console.hub.signal_versions().get("frame", 0)
+        time.sleep(0.4)
+        assert console.hub.signal_versions().get("frame", 0) == v1
+    finally:
+        console.shutdown()
+        exp.close()
+
+
 def test_add_plot_is_blank_until_signal_set_and_node_started():
     """A Plot panel is a blank pure view: nothing shows until its source signal is
     set AND the producing logic node is Started."""

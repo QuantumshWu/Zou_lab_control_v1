@@ -111,6 +111,15 @@ class AutoForm(QtWidgets.QWidget):
                 edit.setPlaceholderText("start:stop:step  or  1, 2, 3")
         else:
             edit.setText("" if value is None else str(value))
+            # A field whose default is blank (e.g. a "blank = use the session" path)
+            # would otherwise show an empty box with no hint of the default behaviour;
+            # surface the ParamDecl tooltip as a placeholder + hover so the default is
+            # always legible for reference (#9), even when the value is empty.
+            tip = str(getattr(field, "tooltip", "") or "")
+            if tip:
+                edit.setToolTip(tip)
+                if not edit.text():
+                    edit.setPlaceholderText(tip[:64])
         edit.editingFinished.connect(self.changed.emit)
         return edit
 

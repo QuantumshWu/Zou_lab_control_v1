@@ -3,7 +3,7 @@ not one monolithic node fabricating every signal -- and detection runs the REAL
 pipeline (virtual==real).
 
 The camera Measurement (`CameraMeasurement`) publishes ONLY ``frame``.  A separate
-`DetectProcessor` consumes ``frame`` and runs the SAME ``calibration.detect``
+`OccupancyProcessor` consumes ``frame`` and runs the SAME ``calibration.detect``
 contract the notebook/real readout uses to publish per-site occupancy + rate.  The
 calibration comes from a `CalibrateReadoutTask` running the real sitemap/threshold
 path.  This is the virtual==real split: only the camera frame is simulated; site
@@ -25,7 +25,7 @@ if sys.path[0] != str(REPO_ROOT):
 def test_camera_measurement_plus_detect_processor_runs_real_pipeline():
     import Zou_lab_control.neutral_atom as na
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
-    from Zou_lab_control.neutral_atom.operations.logic import CameraMeasurement, DetectProcessor
+    from Zou_lab_control.neutral_atom.operations.logic import CameraMeasurement, OccupancyProcessor
 
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
     # calibration via the REAL path (site centers detected from frames; per-site thresholds learned)
@@ -36,7 +36,7 @@ def test_camera_measurement_plus_detect_processor_runs_real_pipeline():
 
     hub = SignalHub()
     cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer)
-    det = DetectProcessor(hub, calibration=cal, source="frame", grid_shape=(3, 4))
+    det = OccupancyProcessor(hub, calibration=cal, source="frame", grid_shape=(3, 4))
     try:
         # the camera measurement is just that -- a camera; it does NOT detect.
         assert "frame" not in det.published_signals()
@@ -75,13 +75,13 @@ def test_calibrate_task_produces_calibration_and_drives_detect_processor(tmp_pat
     """The calibrate-readout Task runs the REAL sitemap+threshold path, emits mid-run
     output (intermediate frame + progress) to its OWN buffer (NOT the hub), saves an
     npz artifact, keeps the result on the instance, and yields a calibration a
-    DetectProcessor then consumes -- the whole loading readout composed BY THE USER
+    OccupancyProcessor then consumes -- the whole loading readout composed BY THE USER
     from device + task + processor (no monolithic node)."""
     import numpy as np
     import Zou_lab_control.neutral_atom as na
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
     from Zou_lab_control.neutral_atom.operations.logic import (
-        CalibrateReadoutTask, CameraMeasurement, DetectProcessor)
+        CalibrateReadoutTask, CameraMeasurement, OccupancyProcessor)
 
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
     hub = SignalHub()
@@ -103,10 +103,10 @@ def test_calibrate_task_produces_calibration_and_drives_detect_processor(tmp_pat
         saved = np.load(cal_path)
         assert saved["centers"].shape == (12, 2) and saved["thresholds"].shape == (12,)
 
-        # composition: the task's calibration drives a DetectProcessor on live frames
+        # composition: the task's calibration drives an OccupancyProcessor on live frames
         # -- THAT (a processor) is what lands occupancy on the hub.
         cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer)
-        det = DetectProcessor(hub, calibration=task.calibration, grid_shape=(3, 4))
+        det = OccupancyProcessor(hub, calibration=task.calibration, grid_shape=(3, 4))
         cam.step()
         det.step()
         assert hub.latest("occupied").shape == (12,)
@@ -116,14 +116,14 @@ def test_calibrate_task_produces_calibration_and_drives_detect_processor(tmp_pat
 
 def test_user_composed_loading_readout_streams_real_detect_off_camera_frames():
     """The user composes the loading readout from independent nodes -- a camera
-    Measurement publishing ``frame`` + a DetectProcessor turning ``frame`` into
+    Measurement publishing ``frame`` + an OccupancyProcessor turning ``frame`` into
     occupancy/rate (via the REAL calibration.detect) -- and the live chain is
     camera -> frame -> real detect (virtual == real).  No monolithic node fabricates
     every signal; the user (notebook or task console) wires the three primitives."""
     import Zou_lab_control.neutral_atom as na
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
     from Zou_lab_control.neutral_atom.operations.logic import (
-        CalibrateReadoutTask, CameraMeasurement, DetectProcessor)
+        CalibrateReadoutTask, CameraMeasurement, OccupancyProcessor)
 
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
     hub = SignalHub()
@@ -139,8 +139,8 @@ def test_user_composed_loading_readout_streams_real_detect_off_camera_frames():
 
         # User composition step 2: a camera Measurement (publishes raw frames).
         cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer)
-        # User composition step 3: a DetectProcessor running the REAL contract.
-        det = DetectProcessor(hub, calibration=task.calibration, grid_shape=(3, 4))
+        # User composition step 3: an OccupancyProcessor running the REAL contract.
+        det = OccupancyProcessor(hub, calibration=task.calibration, grid_shape=(3, 4))
 
         cam.step()                                    # publishes frame
         det.step()                                    # consumes frame -> real detect

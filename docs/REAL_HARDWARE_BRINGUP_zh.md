@@ -64,11 +64,11 @@ exp.readout.thresholds(frames=100, display=True)               # 看每站点阈
 # 确认无误后再看板;loading 读出由独立逻辑节点组合(相机出帧 + 真 detect + 标定 task),只换相机即真机:
 from Zou_lab_control.frontend import show_task_console
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
-from Zou_lab_control.neutral_atom.operations.logic import DetectProcessor
+from Zou_lab_control.neutral_atom.operations.logic import OccupancyProcessor
 hub = SignalHub()
 camera = exp.readout.camera_measurement(hub)          # CameraMeasurement:只发 frame
 calibration = exp.readout.require(thresholds=True)    # 上面 sitemap/thresholds 标定出的 TrapCalibration
-detect = DetectProcessor(hub, calibration=calibration, grid_shape=(5, 7))  # 逐帧真 detect
+detect = OccupancyProcessor(hub, calibration=calibration, grid_shape=(5, 7))  # 逐帧真 detect
 camera.start(rate_hz=4); detect.start(rate_hz=4)      # 相机产 frame、detect 逐帧消费(reactive)
 show_task_console(hub=hub, running_nodes=[camera, detect],
                   measurements=exp.readout.measurement_specs())

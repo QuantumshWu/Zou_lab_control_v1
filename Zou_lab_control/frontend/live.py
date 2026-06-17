@@ -25,6 +25,7 @@ from Zou_lab_control._readout_math import (
 from .style import (
     DESIGN_DPI,
     PALETTE,
+    SITE_OCCUPANCY_STYLE,
     STOCK_MARGINS_PX,
     apply_style,
     apply_title,
@@ -856,23 +857,24 @@ class Live2DDis(BaseLivePlot):
 
 
 class LiveSiteMap(BaseLivePlot):
-    """Live atom-array site map: trap sites as filled circles coloured by a
-    per-site value (occupancy 0/1, per-site loading rate, fidelity, ...) over
-    an optional camera-frame underlay.
+    """Live atom-array site map: a 2D camera frame with one hollow ring per tweezer,
+    FAINT for an empty site and BOLD for an occupied one (the Rb87 readout look).
 
-    Same array contract as every live plot: ``data_x`` is the ``(N, 2)`` site
-    centers in camera pixels (x, y) and ``data_y`` is ``(N, 1)`` per-site
-    values.  The internal split is identical to :class:`Live2DDis`
-    ([0.75, 0.1, 0.1]); the side-distribution band stays empty, so the square
-    main image and the colorbar line up exactly with the 2D panels."""
+    A site map is a plain 2D image (the camera frame, with its own counts colorbar)
+    plus an occupancy OVERLAY -- not a heat-map of per-site scalars.  ``data_y[:, 0]``
+    is read as occupancy: a site is "occupied" (bold ``SITE_OCCUPANCY_STYLE`` ring)
+    when its value is >= 0.5, else "empty" (faint ring); the rings are always unfilled
+    so the underlying frame shows through.  Same array contract as every live plot:
+    ``data_x`` is the ``(N, 2)`` site centers in camera pixels (x, y).  The internal
+    split matches :class:`Live2DDis` ([0.75, 0.1, 0.1]) so the square image + colorbar
+    line up with the 2D panels (the side-distribution band stays empty)."""
 
     plot_type = "SITES"
 
-    def __init__(self, *args, cmap: str = PALETTE["cmap_site"], image=None, roi_radius: float = 3.0, **kwargs):
+    def __init__(self, *args, image=None, roi_radius: float = 3.0, **kwargs):
         super().__init__(*args, **kwargs)
         if self.data_x.shape[1] != 2:
             raise ValueError("LiveSiteMap requires data_x with shape (N, 2) site centers.")
-        self.cmap = cmap
         self.background = None if image is None else np.asarray(image, dtype=float)
         self.roi_radius = max(0.5, float(roi_radius))
 
@@ -891,18 +893,17 @@ class LiveSiteMap(BaseLivePlot):
         else:
             self.background = arr               # shape changed: rebuilt by the host
 
-    def _value_limits(self) -> tuple[float, float]:
-        vals = self.data_y[:, 0]
-        vals = vals[np.isfinite(vals)]
-        if not vals.size:
-            return 0.0, 1.0
-        lo, hi = float(np.nanmin(vals)), float(np.nanmax(vals))
-        if 0.0 <= lo and hi <= 1.0:             # occupancy / rates: keep a stable 0..1 scale
-            return 0.0, 1.0
-        if hi - lo == 0:
-            pad = abs(hi) * 0.1 if hi else 0.5
-            return lo - pad, hi + pad
-        return lo, hi
+    def _ring_styles(self, values: np.ndarray):
+        """Per-site (edge RGBA, linewidth) from occupancy: value >= 0.5 -> occupied
+        (bold ring), else empty (faint ring).  Single source = SITE_OCCUPANCY_STYLE."""
+        from matplotlib.colors import to_rgba
+
+        occupied = np.asarray(values, dtype=float).reshape(-1) >= 0.5
+        empty, occ = SITE_OCCUPANCY_STYLE["empty"], SITE_OCCUPANCY_STYLE["occupied"]
+        edge = [to_rgba(occ["color"], occ["alpha"]) if flag else to_rgba(empty["color"], empty["alpha"])
+                for flag in occupied]
+        widths = [occ["linewidth"] if flag else empty["linewidth"] for flag in occupied]
+        return edge, widths
 
     def init_core(self) -> None:
         from matplotlib.collections import EllipseCollection
@@ -924,13 +925,11 @@ class LiveSiteMap(BaseLivePlot):
         else:
             self._bg_image = None
         diameter = 2.0 * self.roi_radius
+        edge, widths = self._ring_styles(self.data_y[:, 0])
         self.sites = EllipseCollection(
             widths=diameter, heights=diameter, angles=0.0, units="xy",
             offsets=centers, transOffset=self.ax.transData,
-            cmap=self.cmap, edgecolors=PALETTE["site_ring"], linewidths=0.6, alpha=0.95, zorder=5)
-        self.sites.set_array(self.data_y[:, 0])
-        lo, hi = self._value_limits()
-        self.sites.set_clim(lo, hi)
+            facecolors="none", edgecolors=edge, linewidths=widths, zorder=5)
         self.ax.add_collection(self.sites)
         self.lines = [self.sites]
         self.ax.set_anchor("W")
@@ -940,14 +939,19 @@ class LiveSiteMap(BaseLivePlot):
         self.ax.set_ylim(self.extents_square[2], self.extents_square[3])
         self.ax.set_xlabel(self.xlabel)
         self.ax.set_ylabel(self.ylabel)
-        self.cbar = self.fig.colorbar(self.sites, cax=self.cax)
-        self.cbar.set_label(self.zlabel)
-        # colorbar ticks: matplotlib auto-ticks (occupancy/rate are 0..1)
+        # The colorbar reflects the CAMERA FRAME counts (the 2D image); occupancy is a
+        # binary ring overlay and carries no scale.  No frame -> no colorbar band.
+        if self._bg_image is not None:
+            self.cbar = self.fig.colorbar(self._bg_image, cax=self.cax)
+            self.cbar.set_label(self.zlabel)
+        else:
+            self.cbar = None
+            self.cax.set_visible(False)
 
     def update_core(self) -> None:
-        self.sites.set_array(self.data_y[:, 0])
-        lo, hi = self._value_limits()
-        self.sites.set_clim(lo, hi)
+        edge, widths = self._ring_styles(self.data_y[:, 0])
+        self.sites.set_edgecolors(edge)
+        self.sites.set_linewidths(widths)
 
     def _install_state(self) -> None:
         self.fig._zlc_state = PlotState(plot_type="SITES", x_array=self.data_x[:, 0], y_array=self.data_y, cax=self.cax)

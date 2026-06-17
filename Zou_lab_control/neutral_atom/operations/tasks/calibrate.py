@@ -4,7 +4,7 @@ The sitemap + per-site threshold calibration -- the notebook's
 ``exp.readout.sitemap()`` / ``thresholds()`` flow -- surfaced as a
 :class:`~..task.TaskSpec` so the task console can run it from a panel: it streams
 its template frames to a dedicated MID-RUN panel as it goes and produces a
-``TrapCalibration`` a DetectProcessor can then consume.  ``build`` captures the
+``TrapCalibration`` an OccupancyProcessor can then consume.  ``build`` captures the
 readout subsystem and routes through ``readout.calibrate_task`` (the SAME
 :class:`~..logic.CalibrateReadoutTask` the loading-readout composite uses), so GUI
 and notebook cannot drift, and it imports no concrete backend / reads no simulation

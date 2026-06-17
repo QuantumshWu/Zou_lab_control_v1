@@ -104,7 +104,12 @@ def main(argv: list[str] | None = None) -> int:
                 exp = na.connect(args.config, open_devices=True)
             else:
                 print(f"Starting VIRTUAL experiment (grid {grid[0]}x{grid[1]}; only camera frames simulated)...")
-                exp = na.connect("virtual", sitemap={"grid_shape": grid})
+                # Real-time sequence timing (sleep_scale=1.0) so a fired calibration /
+                # temperature scan takes a BELIEVABLE wall-clock (each frame ~ its real
+                # exposure) and its mid-run panel is actually watchable -- instead of the
+                # CPU finishing the render instantly.  Tests build the virtual backend
+                # with the default sleep_scale=0, so they stay fast.
+                exp = na.connect("virtual", sitemap={"grid_shape": grid}, sleep_scale=1.0)
             exp.readout.sitemap(method="box", frames=4, display=False)
             exp.readout.thresholds(frames=24, display=False)
             measurements = exp.readout.measurement_specs()

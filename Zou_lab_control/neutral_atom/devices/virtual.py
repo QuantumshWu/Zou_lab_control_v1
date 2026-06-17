@@ -18,6 +18,7 @@ from ..timing import (
     PulseSequence,
     exposure_from_sequence,
     imaging_channel_kwargs,
+    imaging_sequence,
     sequence_for_frame_count,
 )
 
@@ -42,19 +43,48 @@ DEFAULT_CHANNELS = (
 
 @dataclass
 class VirtualTrapArray(TrapArrayDevice):
+    """A PULSE-DRIVEN virtual atom array -- the fake data source.
+
+    Every camera shot is one experimental cycle: the atoms are first (re)loaded by
+    the cooling/MOT light (stochastic ~50% single-atom loading per tweezer) and
+    cooled by PGC to ``cooled_temperature_K``; the fired :class:`PulseSequence`
+    then EVOLVES per-site occupancy + temperature frame by frame -- cooling pulses
+    re-cool, the probe heats while it scatters the photons the camera sees, a
+    trap-off gap releases the atoms ballistically (release-recapture loss that
+    depends on the CURRENT temperature), and a pushout pulse ejects them.  So
+    loading-rate, temperature (release-recapture) and readout-fidelity measurements
+    all emerge from the SAME physics a real run would show -- recovered only through
+    the rendered camera frames (the analysis layer never reads this state, exactly
+    as on hardware).  Every field below is a tunable constant: edit it here, or pass
+    it through ``na.connect("virtual", sitemap={...})`` / the device config.
+    """
+
     grid_shape: tuple[int, int] = (5, 7)
     image_shape: tuple[int, int] = (96, 128)
     spacing_px: float = 12.0
     origin_px: tuple[float, float] | None = None
-    loading_probability: float = 0.55
-    atom_rate: float = 3_000.0
-    background_rate: float = 8.0
+    # --- Loading + camera signal/noise model ---------------------------------
+    loading_probability: float = 0.5      # single-atom loading per tweezer per shot (~50%)
+    atom_rate: float = 3_000.0            # bright-atom photon (count) rate during the probe
+    background_rate: float = 8.0          # stray-light count rate (always present)
     dark_current_e_per_s: float = 0.006
     offset_counts: float = 200.0
     conversion_e_per_count: float = 0.107
     read_noise_e: float = 0.43
-    atom_sigma_px: float = 1.35
-    detection_lifetime: float = 10.0
+    atom_sigma_px: float = 1.35           # imaging PSF width (Gaussian sigma, px)
+    detection_lifetime: float = 10.0      # atom 1/e lifetime UNDER the probe (s): sets readout loss
+    # --- Cooling / heating model (sets the temperature release-recapture sees) -
+    # An atom is loaded warm (``mot_temperature_K``) and PGC-cooled toward
+    # ``cooled_temperature_K``; the probe (imaging light) heats it at
+    # ``probe_heating_K_per_s`` whenever it is on WITHOUT cooling, and any cooling
+    # phase pulls the temperature back toward the cooled floor with time constant
+    # ``cooling_tau_s``.  A temperature scan (release-recapture vs trap-off time)
+    # therefore recovers ``cooled_temperature_K`` -- raise the heating rate and you
+    # see a hotter fitted temperature, exactly as a real heating pulse would give.
+    mot_temperature_K: float = 250e-6
+    cooled_temperature_K: float = 50e-6
+    cooling_tau_s: float = 1.0e-3
+    probe_heating_K_per_s: float = 0.0    # default 0 -> readout does not bias the temperature
     # --- Release-recapture loss model (data-source side only) -----------------
     # When a fired sequence switches the trap OFF for ``t_off`` seconds between
     # two camera exposures, atoms fly ballistically and are lost unless they stay
@@ -63,18 +93,20 @@ class VirtualTrapArray(TrapArrayDevice):
     # isotropic, point source): per axis an atom is recaptured if its speed obeys
     # ``|v| < r_c / t_off``, so for a Maxwell-Boltzmann spread
     # ``sigma_v = sqrt(k_B T / m)`` the per-axis fraction is ``erf(r_c / (sqrt2
-    # sigma_v t_off))`` and 3-D survival is that cubed.  ``recapture_temperature_K``
-    # sets the velocity spread (hotter -> faster decay) and ``capture_radius_m``
-    # the trap geometry; together they fix the characteristic ``t_off`` scale.
-    # Defaults give a clearly non-flat demo curve over ~0..300 us: survival is
-    # ~1 near t_off=0 and falls smoothly through ~0.5 around 75 us to a few % by
-    # 300 us (the half-survival scale is r_c / sqrt(2) sigma_v).
-    recapture_temperature_K: float = 50e-6
+    # sigma_v t_off))`` and 3-D survival is that cubed.  The velocity spread uses
+    # the atom's CURRENT temperature (``cooled_temperature_K`` after PGC, raised by
+    # any probe heating) and ``capture_radius_m`` the trap geometry; together they
+    # fix the characteristic ``t_off`` scale.  Defaults give a clearly non-flat demo
+    # curve over ~0..300 us: survival is ~1 near t_off=0 and falls smoothly through
+    # ~0.5 around 75 us to a few % by 300 us (half-survival scale = r_c / sqrt(2) sigma_v).
     capture_radius_m: float = 6.0e-6
     recapture_mass_kg: float = _RB87_MASS
     seed: int | None = 7
     occupancy: np.ndarray | None = None
     rng: np.random.Generator = field(init=False, repr=False)
+    # Per-atom temperature (K), evolved by the pulse (cooled on load + cooling
+    # phases, heated by the probe); seeded to ``cooled_temperature_K`` on reload.
+    temperature_K: np.ndarray = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.grid_shape = grid_shape_tuple(self.grid_shape)
@@ -89,7 +121,10 @@ class VirtualTrapArray(TrapArrayDevice):
         self.read_noise_e = nonnegative_float(self.read_noise_e, "read_noise_e")
         self.atom_sigma_px = positive_float(self.atom_sigma_px, "atom_sigma_px")
         self.detection_lifetime = positive_float(self.detection_lifetime, "detection_lifetime")
-        self.recapture_temperature_K = positive_float(self.recapture_temperature_K, "recapture_temperature_K")
+        self.mot_temperature_K = positive_float(self.mot_temperature_K, "mot_temperature_K")
+        self.cooled_temperature_K = positive_float(self.cooled_temperature_K, "cooled_temperature_K")
+        self.cooling_tau_s = positive_float(self.cooling_tau_s, "cooling_tau_s")
+        self.probe_heating_K_per_s = nonnegative_float(self.probe_heating_K_per_s, "probe_heating_K_per_s")
         self.capture_radius_m = positive_float(self.capture_radius_m, "capture_radius_m")
         self.recapture_mass_kg = positive_float(self.recapture_mass_kg, "recapture_mass_kg")
         self.rng = np.random.default_rng(self.seed)
@@ -114,82 +149,141 @@ class VirtualTrapArray(TrapArrayDevice):
         return np.asarray([[x0 + ix * self.spacing_px, y0 + iy * self.spacing_px] for iy in range(ny) for ix in range(nx)], dtype=float)
 
     def reload(self) -> np.ndarray:
+        """Load a FRESH atom array -- the cooling/MOT light + PGC at the start of a
+        shot.  Each tweezer independently captures a single atom with probability
+        ``loading_probability`` (~50%), and every loaded atom starts PGC-cooled to
+        ``cooled_temperature_K``."""
         self.occupancy = self.rng.random(self.n_sites) < self.loading_probability
+        self.temperature_K = np.full(self.n_sites, self.cooled_temperature_K, dtype=float)
+        self._pinned = False                   # a fresh stochastic loading clears any manual pin
         return self.occupancy.copy()
 
     def set_occupancy(self, occupied: Sequence[int] | np.ndarray) -> None:
+        """Force a SPECIFIC loading (a deterministic test / debug override).  The next
+        shot images exactly this occupancy instead of a fresh random loading -- a
+        ONE-SHOT pin (the shot after that reloads stochastically as usual)."""
         arr = np.asarray(occupied)
         if arr.dtype == bool:
             flat = arr.reshape(-1)
             if flat.size != self.n_sites:
                 raise ValueError(f"boolean occupancy must have length {self.n_sites}.")
             self.occupancy = flat.astype(bool, copy=True)
-            return
-        out = np.zeros(self.n_sites, dtype=bool)
-        for value in np.asarray(occupied).reshape(-1):
-            index = site_index(value, self.n_sites)
-            out[index] = True
-        self.occupancy = out
+        else:
+            out = np.zeros(self.n_sites, dtype=bool)
+            for value in np.asarray(occupied).reshape(-1):
+                index = site_index(value, self.n_sites)
+                out[index] = True
+            self.occupancy = out
+        self.temperature_K = np.full(self.n_sites, self.cooled_temperature_K, dtype=float)
+        self._pinned = True                    # image THIS loading on the next shot, then resume
 
-    def render_image(self, *, exposure: float, all_sites: bool = False) -> np.ndarray:
-        exposure = positive_float(exposure, "exposure")
+    def consume_pin(self) -> bool:
+        """Whether the next shot should image the manually-:meth:`set_occupancy` loading
+        instead of reloading; consumes the one-shot pin."""
+        pinned = bool(getattr(self, "_pinned", False))
+        self._pinned = False
+        return pinned
+
+    def cool(self, duration: float) -> None:
+        """A cooling/PGC phase of ``duration`` s relaxes every atom's temperature
+        toward the cooled floor with time constant ``cooling_tau_s`` (so a long
+        cooling pulse fully re-cools an atom heated by a prior probe)."""
+        dt = float(duration)
+        if dt <= 0.0:
+            return
+        factor = float(np.exp(-dt / self.cooling_tau_s))
+        self.temperature_K = self.cooled_temperature_K + (self.temperature_K - self.cooled_temperature_K) * factor
+
+    def heat(self, duration: float) -> None:
+        """A probe (imaging-light) phase of ``duration`` s recoil-heats every atom
+        at ``probe_heating_K_per_s`` (0 by default -> readout is temperature-neutral)."""
+        dt = float(duration)
+        if dt <= 0.0 or self.probe_heating_K_per_s <= 0.0:
+            return
+        self.temperature_K = self.temperature_K + self.probe_heating_K_per_s * dt
+
+    def _render(self, occupancy: np.ndarray, signal_time: np.ndarray, exposure: float) -> np.ndarray:
+        """Render ONE camera frame from a site occupancy + per-site bright-scatter
+        time (s).  Background scales with the frame ``exposure``; each occupied
+        site adds a Gaussian PSF of amplitude ``atom_rate * signal_time[site]``;
+        Poisson shot noise + read noise + offset as a real EMCCD/qCMOS frame."""
         h, w = self.image_shape
         yy, xx = np.mgrid[0:h, 0:w]
         expected_e = np.full((h, w), (self.background_rate + self.dark_current_e_per_s) * exposure, dtype=float)
-        occupancy_for_frame = np.ones(self.n_sites, dtype=bool) if all_sites else self.occupancy.copy()
-        next_occupancy = self.occupancy.copy()
-        for site, ((cx, cy), occupied) in enumerate(zip(self._site_centers(), occupancy_for_frame)):
-            if not occupied:
+        occ = np.asarray(occupancy, dtype=bool).reshape(-1)
+        st = np.asarray(signal_time, dtype=float).reshape(-1)
+        for (cx, cy), occupied, t_sig in zip(self._site_centers(), occ, st):
+            if not occupied or t_sig <= 0.0:
                 continue
-            if all_sites:
-                signal_time = exposure
-            else:
-                lifetime = self.rng.exponential(self.detection_lifetime)
-                signal_time = min(exposure, lifetime)
-                if lifetime < exposure:
-                    next_occupancy[site] = False
-            amplitude = self.atom_rate * signal_time
+            amplitude = self.atom_rate * float(t_sig)
             expected_e += amplitude * np.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2.0 * self.atom_sigma_px**2))
         photoelectrons = self.rng.poisson(np.clip(expected_e, 0, None)).astype(float)
         noisy = photoelectrons / self.conversion_e_per_count + self.offset_counts
         if self.read_noise_e > 0:
             noisy += self.rng.normal(0.0, self.read_noise_e / self.conversion_e_per_count, size=noisy.shape)
-        if not all_sites:
-            self.occupancy = next_occupancy
         return np.clip(noisy, 0, np.iinfo(np.uint16).max).astype(np.uint16)
 
-    def recapture_survival_probability(self, t_off: float) -> float:
+    def render_image(self, *, exposure: float, all_sites: bool = False) -> np.ndarray:
+        """Image the CURRENT atom array under the probe for ``exposure`` s.
+
+        Each occupied atom scatters for ``min(exposure, lifetime)`` where the
+        light-assisted ``lifetime ~ Exp(detection_lifetime)``; an atom whose
+        lifetime runs out mid-exposure is lost (drops from the occupancy that a
+        FOLLOWING frame of the SAME loading sees) and the probe recoil-heats the
+        survivors.  ``all_sites=True`` forces every site bright for the full
+        exposure (the sitemap template) and leaves the occupancy untouched."""
+        exposure = positive_float(exposure, "exposure")
+        occupancy_for_frame = np.ones(self.n_sites, dtype=bool) if all_sites else self.occupancy.copy()
+        signal_time = np.zeros(self.n_sites, dtype=float)
+        next_occupancy = self.occupancy.copy()
+        for site, occupied in enumerate(occupancy_for_frame):
+            if not occupied:
+                continue
+            if all_sites:
+                signal_time[site] = exposure
+            else:
+                lifetime = self.rng.exponential(self.detection_lifetime)
+                signal_time[site] = min(exposure, lifetime)
+                if lifetime < exposure:
+                    next_occupancy[site] = False
+        image = self._render(occupancy_for_frame, signal_time, exposure)
+        if not all_sites:
+            self.occupancy = next_occupancy
+            self.heat(exposure)               # the probe recoil-heats the imaged atoms
+        return image
+
+    def recapture_survival_probability(self, t_off: float, *, temperature_K: float | None = None) -> float:
         """Ballistic release-recapture survival probability after a trap-off of ``t_off`` s.
 
         Per axis an atom is recaptured if its ballistic displacement stays inside
         the capture radius ``r_c``, i.e. ``|v| < r_c / t_off``; for a 1-D thermal
         spread ``sigma_v = sqrt(k_B T / m)`` that fraction is
         ``erf(r_c / (sqrt(2) sigma_v t_off))``, and the isotropic 3-D survival is
-        the cube.  ``t_off <= 0`` -> 1.0 (the atom cannot move).  This is the SAME
-        physics the analysis-side fit assumes, so a fitted temperature recovers a
-        value near ``recapture_temperature_K`` -- but it lives ONLY here, in the
-        data source; the analysis layer never reads it.
-        """
-
+        the cube.  ``t_off <= 0`` -> 1.0 (the atom cannot move).  ``temperature_K``
+        defaults to the cooled floor; the per-atom :meth:`apply_recapture_loss` uses
+        each atom's CURRENT temperature.  This is the SAME physics the analysis-side
+        fit assumes, so a fitted temperature recovers a value near the modelled
+        temperature -- but it lives ONLY here, in the data source."""
         t = float(t_off)
         if not np.isfinite(t) or t <= 0.0:
             return 1.0
-        sigma_v = sqrt(_K_B * self.recapture_temperature_K / self.recapture_mass_kg)
+        temperature = self.cooled_temperature_K if temperature_K is None else float(temperature_K)
+        sigma_v = sqrt(_K_B * max(temperature, 1e-12) / self.recapture_mass_kg)
         arg = self.capture_radius_m / (sqrt(2.0) * sigma_v * t)
-        p_axis = erf(arg)
-        return float(p_axis**3)
+        return float(erf(arg) ** 3)
 
     def apply_recapture_loss(self, t_off: float) -> np.ndarray:
-        """Randomly drop currently-occupied atoms with the release-recapture model.
+        """Randomly drop currently-occupied atoms with the release-recapture model,
+        using EACH atom's current temperature (a hotter atom is lost more readily).
 
         Mutates ``self.occupancy`` in place (the same atom loading is imaged again
-        afterward) and returns the new occupancy.  Each occupied site survives
-        independently with probability :meth:`recapture_survival_probability`.
-        """
-
-        p_survive = self.recapture_survival_probability(t_off)
-        if p_survive >= 1.0:
+        afterward) and returns the new occupancy."""
+        t = float(t_off)
+        if not np.isfinite(t) or t <= 0.0:
             return self.occupancy.copy()
+        sigma_v = np.sqrt(_K_B * np.maximum(self.temperature_K, 1e-12) / self.recapture_mass_kg)
+        arg = self.capture_radius_m / (sqrt(2.0) * sigma_v * t)
+        p_survive = np.array([erf(a) for a in arg], dtype=float) ** 3
         survive = self.rng.random(self.n_sites) < p_survive
         self.occupancy = self.occupancy & survive
         return self.occupancy.copy()
@@ -202,7 +296,7 @@ class VirtualTrapArray(TrapArrayDevice):
             "offset_counts": self.offset_counts,
             "conversion_e_per_count": self.conversion_e_per_count,
             "read_noise_e": self.read_noise_e,
-            "recapture_temperature_K": self.recapture_temperature_K,
+            "cooled_temperature_K": self.cooled_temperature_K,
             "capture_radius_m": self.capture_radius_m,
         }
 
@@ -258,58 +352,61 @@ class VirtualCamera(CameraDevice):
         **_,
     ) -> list[np.ndarray]:
         frames = positive_int(frames, "frames")
-        runtime_sequence = sequence
-        if sequencer is not None and sequence is not None:
-            trigger_channels = getattr(sequencer, "trigger_channels", None)
-            runtime_sequence = (
-                sequence_for_frame_count(sequence, frames, trigger_channels=trigger_channels)
-                if trigger_channels is not None
-                else sequence_for_frame_count(sequence, frames)
-            )
+        trigger_channels = getattr(sequencer, "trigger_channels", None)
+        # Infer the imaging channels the same single source the real adapter uses (probe
+        # -> ch03 / cooling -> ch00 on a chNN sequencer), so virtual and real track the
+        # SAME timing.
+        channel_kwargs = imaging_channel_kwargs(sequencer)
+        probe_channel = channel_kwargs.get("probe_channel", "probe")
+        # The live monitor calls acquire() with NO sequence: a real camera is always
+        # triggered by SOME pulse, so synthesize the default "cool + image" cycle and
+        # run the SAME load->image physics (a fresh ~50% loading imaged once).
+        effective_sequence = (
+            sequence if sequence is not None
+            else imaging_sequence(exposure=self.exposure, load=True, name="live", **channel_kwargs)
+        )
+        # Expand to the requested frame count (one trigger -> N repeats) so the per-frame
+        # analysis below sees ONE trigger window per frame -- the exact runtime sequence
+        # the sequencer fires.
+        kw = {"trigger_channels": trigger_channels} if trigger_channels is not None else {}
+        runtime_sequence = sequence_for_frame_count(effective_sequence, frames, **kw)
+        if sequence is not None and sequencer is not None:
             sequencer.prepare(runtime_sequence)
             sequencer.fire(runtime_sequence)
-        # Infer from the channel the imaging sequence actually used (probe -> ch03
-        # on a chNN sequencer); same single source as the real adapter so virtual
-        # and real track exposure identically.
-        probe_channel = imaging_channel_kwargs(sequencer).get("probe_channel", "probe")
-        exposure = exposure_from_sequence(sequence, default=self.exposure, channel=probe_channel)
-        reload_each = sequence_requests_load(sequence)
-        images: list[np.ndarray] = []
-        # "All sites loaded" (for sitemap calibration) is best requested
-        # explicitly via ``force_all_sites``.  The legacy fallback keys off the
-        # sequence *name* == "sitemap"; an explicit value always wins so callers
-        # are not surprised by a hidden, virtual-only string match.
+        exposure = exposure_from_sequence(effective_sequence, default=self.exposure, channel=probe_channel)
+        # "All sites loaded" (the sitemap template) is requested explicitly via
+        # ``force_all_sites``; the legacy fallback keys off the sequence name.
         all_sites = (
-            bool(force_all_sites)
-            if force_all_sites is not None
+            bool(force_all_sites) if force_all_sites is not None
             else (sequence is not None and sequence.name == "sitemap")
         )
-        # RELEASE-RECAPTURE LOSS (data-source side): if the fired sequence holds
-        # the trap OFF between two camera triggers (the release-recapture pulse),
-        # atoms fly ballistically during that gap and some are lost before the
-        # next frame.  We parse the per-frame trap-off time from the SAME sequence
-        # the analysis layer built, then apply the loss to the shared occupancy
-        # right before rendering the frame that follows the gap.  No analysis code
-        # learns of this: it only receives the resulting frames.
-        trigger_channels = getattr(sequencer, "trigger_channels", None)
-        trap_off_per_frame = trap_off_durations_per_frame(
-            sequence, frames, trigger_channels=trigger_channels
-        )
-        # One ``acquire`` is one experimental shot.  A load-each-frame imaging
-        # sequence reloads atoms before EVERY frame (its repeated cooling pulse =
-        # separate loadings).  A release-recapture sequence instead has ONE loading
-        # imaged twice with a trap-off between -- it carries no cooling pulse, so
-        # reload_each is False; we must still reload ONCE at the start of the shot
-        # so survival is measured against a FRESH loading each shot (otherwise the
-        # trap-off loss would compound across shots and drive survival to zero).
-        has_trap_off = any(t > 0.0 for t in trap_off_per_frame)
-        if has_trap_off and not reload_each and not all_sites:
-            self.trap_array.reload()
+        # ---- PULSE-DRIVEN ATOM PHYSICS (data-source side only) ----------------
+        # Each camera frame is bounded by a camera-trigger rise.  In the window BEFORE
+        # a frame the fired pulse decides what happens to the atoms:
+        #   * a cooling/MOT pulse (re)LOADS a fresh ~50% array, PGC-cooled to the cooled
+        #     floor -- so an imaging shot, and each repeat of a threshold-calibration
+        #     sequence, is an INDEPENDENT loading;
+        #   * a trap-off gap RELEASES the current atoms ballistically (release-recapture
+        #     loss against their CURRENT temperature) -- the SAME loading imaged again,
+        #     as a temperature scan needs;
+        #   * the FIRST frame always starts from a fresh shot loading.
+        # render_image then images the survivors (probe scatter + readout loss + recoil
+        # heating).  No analysis code learns of this -- it only receives the frames.
+        cooling_loads = cooling_loads_per_frame(runtime_sequence, frames, trigger_channels=trigger_channels)
+        trap_off_per_frame = trap_off_durations_per_frame(runtime_sequence, frames, trigger_channels=trigger_channels)
+        images: list[np.ndarray] = []
         for frame_index in range(frames):
-            if reload_each:
-                self.trap_array.reload()
-            elif trap_off_per_frame[frame_index] > 0.0:
-                self.trap_array.apply_recapture_loss(trap_off_per_frame[frame_index])
+            if not all_sites:
+                if frame_index == 0:
+                    # Each shot starts from a fresh loading -- UNLESS the caller pinned a
+                    # specific occupancy (set_occupancy, a deterministic test/debug), which
+                    # this one shot images instead of reloading.
+                    if not self.trap_array.consume_pin():
+                        self.trap_array.reload()
+                elif cooling_loads[frame_index]:
+                    self.trap_array.reload()                      # fresh independent loading + PGC cool
+                elif trap_off_per_frame[frame_index] > 0.0:
+                    self.trap_array.apply_recapture_loss(trap_off_per_frame[frame_index])  # same atoms, released
             image = self.trap_array.render_image(exposure=exposure, all_sites=all_sites)
             if self._roi is not None:
                 # crop to the applied sub-array, exactly as a real camera reads out
@@ -317,7 +414,7 @@ class VirtualCamera(CameraDevice):
                 x, w, y, h = self._roi
                 image = image[y:y + h, x:x + w]
             images.append(image)
-        if sequencer is not None and sequence is not None:
+        if sequence is not None and sequencer is not None:
             wait_done = getattr(sequencer, "wait_done", None)
             if callable(wait_done) and not wait_done(max(self.timeout, getattr(runtime_sequence, "duration", 0.0) * 2.0 + 1.0)):
                 raise TimeoutError("virtual sequencer did not report done.")
@@ -464,9 +561,11 @@ def virtual_config_with_overrides(
         "atom_bright_rate": "atom_rate",
         "background_count_rate": "background_rate",
         "load_probability": "loading_probability",
-        # Release-recapture loss model conveniences (the demo temperature curve).
-        "temperature_K": "recapture_temperature_K",
-        "recapture_temperature": "recapture_temperature_K",
+        # Atom-temperature conveniences: the cooled (PGC) floor the atoms reach, which
+        # the release-recapture / temperature scan recovers.
+        "temperature_K": "cooled_temperature_K",
+        "recapture_temperature": "cooled_temperature_K",
+        "pgc_temperature": "cooled_temperature_K",
         "capture_radius": "capture_radius_m",
     }
     for key, value in sitemap_params.items():
@@ -501,16 +600,49 @@ def virtual_config_with_overrides(
     return cfg, defaults
 
 
-def sequence_requests_load(sequence: PulseSequence | None) -> bool:
-    if sequence is None:
-        return False
-    return any(pulse.channel in {"cooling", "mot", "load"} and pulse.value for pulse in sequence.effective_pulses())
-
+# Channels whose ON pulse (re)LOADS a fresh, PGC-cooled atom array -- the cooling /
+# MOT / PGC light.  A frame window that contains one of these starts an INDEPENDENT
+# loading (aliases cover the names a user might give the loading light in a pulse table).
+COOLING_CHANNELS = ("cooling", "mot", "pgc", "load")
 
 # The trap channel whose OFF gaps drive the release-recapture loss model.  The
 # release-recapture pulse (operations/temperature.build_release_recapture_pulse)
 # and the virtual config both name it "trap"; aliases cover common variants.
 DEFAULT_TRAP_CHANNELS = ("trap", "tweezer", "dipole")
+
+
+def cooling_loads_per_frame(
+    sequence: PulseSequence | None,
+    frames: int,
+    *,
+    trigger_channels: Sequence[str] | None = None,
+    cooling_channels: Sequence[str] = COOLING_CHANNELS,
+) -> list[bool]:
+    """Whether a cooling/MOT pulse (a fresh atom loading) precedes each frame.
+
+    Frames are bounded by camera-trigger rises (``trigger_channels``); ``True`` for
+    frame ``k`` means a cooling-channel pulse is ON somewhere in the window that ends
+    at trigger ``k`` (for ``k == 0`` the window runs from the sequence start to the
+    first trigger).  The virtual backend reloads a fresh ~50% loading before such a
+    frame, so an imaging shot -- and every repeat of a threshold-calibration sequence
+    -- is an INDEPENDENT loading.  Data-source side only; the analysis layer never
+    reads it (it only receives the rendered frames)."""
+    out = [False] * int(frames)
+    if sequence is None or not hasattr(sequence, "effective_pulses"):
+        return out
+    trig_set = {str(c) for c in (DEFAULT_CAMERA_TRIGGER_CHANNELS if trigger_channels is None else trigger_channels)}
+    cool_set = {str(c) for c in cooling_channels}
+    pulses = sequence.effective_pulses()
+    trigger_starts = sorted(p.start for p in pulses if p.value and p.channel in trig_set)
+    if not trigger_starts:
+        return out
+    cooling_intervals = sorted((p.start, p.stop) for p in pulses if p.value and p.channel in cool_set)
+    n = min(int(frames), len(trigger_starts))
+    for k in range(n):
+        window_lo = 0.0 if k == 0 else trigger_starts[k - 1]
+        window_hi = trigger_starts[k]
+        out[k] = any(start < window_hi and stop > window_lo for start, stop in cooling_intervals)
+    return out
 
 
 def trap_off_durations_per_frame(
@@ -606,11 +738,13 @@ def probability(value, name: str) -> float:
 
 
 __all__ = [
+    "COOLING_CHANNELS",
     "DEFAULT_CHANNELS",
     "DEFAULT_TRAP_CHANNELS",
     "VirtualCamera",
     "VirtualSequencer",
     "VirtualTrapArray",
+    "cooling_loads_per_frame",
     "trap_off_durations_per_frame",
     "virtual_config",
     "virtual_config_with_overrides",

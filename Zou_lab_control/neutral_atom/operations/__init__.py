@@ -5,7 +5,7 @@ from .detection import detect_image
 from .logic import (
     CalibrateReadoutTask,
     CameraMeasurement,
-    DetectProcessor,
+    OccupancyProcessor,
     Measurement,
     Processor,
     LogicNode,
@@ -73,7 +73,7 @@ __all__ = [
     "Processor",
     "Task",
     "CalibrateReadoutTask",
-    "DetectProcessor",
+    "OccupancyProcessor",
     "MeasurementSpec",
     "NFramePlan",
     "OtsuFidelityReducer",
