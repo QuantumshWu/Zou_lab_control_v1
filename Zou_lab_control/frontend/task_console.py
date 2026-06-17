@@ -3127,8 +3127,9 @@ class TaskConsole(QtWidgets.QWidget):
             self._task_card_frame = frame
         self._update_task_banner(node)
         self._task_card.refresh(self._expression_namespace())
-        if getattr(node, "finished", False):
-            self._clear_task_running()
+        # NB: leaving task-run mode on finish is handled in ONE place -- _poll_logic_nodes
+        # (the canonical node-lifecycle tick, which runs every tick regardless of whether
+        # a mid-run panel exists), so a self-finishing task always releases the lock.
 
     def _build_logic_node(self, node: LogicNodeConfig, values: dict):
         """Build the node for a logic node, DISPLAY SUPPRESSED (publish-only).
@@ -3241,6 +3242,12 @@ class TaskConsole(QtWidgets.QWidget):
                 if editor is not None:
                     editor.set_running(False)
                     editor.set_status("done", error=False)
+                # A one-shot TASK that finishes ON ITS OWN (not via the Stop button)
+                # must ALSO release the console lockout here -- otherwise a calibration
+                # that completes normally leaves the dashboard locked forever (only a
+                # manual Stop reaches _clear_task_running).
+                if row is self._running_task_row:
+                    self._clear_task_running()
             elif running:
                 # surface scan progress when the node reports it
                 done = getattr(node, "points_done", None)

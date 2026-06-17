@@ -303,6 +303,33 @@ def test_running_task_takes_a_fixed_panel_and_locks_the_console():
         exp.close()
 
 
+def test_self_finished_task_releases_lock_in_poll():
+    """A one-shot task that finishes ON ITS OWN (not via the Stop button) must release
+    the console lockout in the canonical node-lifecycle poll -- not only via the
+    mid-run-panel refresh (which is skipped when a task has no mid-run panel).  So a
+    completed calibration never leaves the dashboard locked forever."""
+    exp = _calibrated_virtual_session()
+    console = _console(exp)
+    try:
+        _pick(console, ("task", "Calibrate readout"))
+        row = console.logic_nodes[-1]
+        console._start_logic_node(row)
+        assert console._task_locked is True
+        node = console._logic_nodes[id(row)]
+        deadline = time.monotonic() + 12.0
+        while not getattr(node, "finished", False) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert node.finished
+        # the LIFECYCLE poll alone (no _refresh_task_panel) releases the lock
+        console._poll_logic_nodes()
+        assert console._task_locked is False
+        assert console._running_task_row is None
+        assert console.kind_combo.isEnabled() is True
+    finally:
+        console.shutdown()
+        exp.close()
+
+
 def test_save_persists_edit_param_values_not_just_layout():
     """#4: saving captures the CURRENT Edit-form parameter values (even for a node that
     was never Started), not just the panel geometry; a JSON round-trip restores them."""
