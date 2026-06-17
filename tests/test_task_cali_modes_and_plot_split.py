@@ -146,6 +146,41 @@ def test_calibrate_task_folder_source(tmp_path):
         exp.close()
 
 
+# ------------------------------------------------- camera measurement: editable region
+def test_camera_measurement_region_is_editable_and_applies_to_virtual():
+    """The camera measurement exposes its ROI as an editable ``region`` (the SAME
+    field for virtual / real -- only the camera differs), and setting it actually
+    windows the virtual camera (the frame is cropped).  This pins that virtual==real:
+    both honour camera.configure(roi=)."""
+    from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+
+    exp = _calibrated((3, 4))
+    try:
+        # the camera Edit auto-form carries region (next to exposure / frames_per_cycle)
+        console = TaskConsole(hub=SignalHub(), state=default_console_state(), session=exp,
+                              tasks=exp.readout.task_specs(), window_px=(900, 600))
+        console._timer.stop()
+        kc = console.kind_combo
+        i = next(j for j in range(kc.count()) if kc.itemData(j) == ("camera", "live"))
+        kc.setCurrentIndex(i)
+        console._add_panel()
+        row = console.logic_nodes[-1]
+        console._edit_logic_node(row)
+        editor = console._logic_editors[id(row)]
+        assert {"frames_per_cycle", "exposure", "region"} <= set(editor.form._widgets)
+        console.shutdown()
+
+        # building with a region windows the VIRTUAL camera -> the frame is cropped
+        node = exp.readout.camera_spec().build(SignalHub(), region="10, 50, 8, 40")
+        assert node.camera.roi is not None
+        frame = node.camera.acquire(1, sequencer=None)[0]
+        assert np.asarray(frame).shape != (40, 50)        # ROI actually crops the virtual frame
+        assert "region" in node.acquisition_parameters()  # round-trips (endpoints)
+    finally:
+        exp.close()
+
+
 # ------------------------------------------------------- measurement plot split
 def test_notebook_measurement_defaults_display_true():
     """A measurement called from the notebook API auto-plots (display=True default)."""

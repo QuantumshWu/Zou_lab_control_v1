@@ -548,20 +548,42 @@ class ReadoutSubsystem(ExperimentSubsystem):
         (single source of truth -- the parameters live on the logic side; the UI
         adapts to them, never the other way round).
 
-        ``frames_per_cycle`` is a build parameter; ``exposure`` is applied LIVE to
-        the camera after the node is built (it is an acquisition parameter the
-        running stream picks up).  ``build(hub, **values)`` returns the same
+        ``frames_per_cycle`` is a build parameter; ``exposure`` and ``region`` (the
+        camera ROI) are applied LIVE to the camera after the node is built (they are
+        acquisition parameters the running stream picks up).  These are the camera's
+        OWN settings, so the form is identical for a real camera or a ``VirtualCamera``
+        -- both honour ``camera.configure(exposure=, roi=)`` (only the data source
+        differs).  ``build(hub, **values)`` returns the same
         :class:`~..operations.logic.CameraMeasurement` as :meth:`camera_measurement`
-        -- so notebook (``readout.camera_spec().build(hub, exposure=...)``) and GUI
-        share one path."""
+        -- so notebook (``readout.camera_spec().build(hub, exposure=, region=)``) and
+        GUI share one path."""
 
         s = self._session
         exposure = float(s._camera_exposure())
 
-        def _build(hub, *, frames_per_cycle: int = 1, exposure: float = exposure, **_ignored):
+        def _parse_region(text):
+            """``"x0, x1, y0, y1"`` (sensor-pixel ENDPOINTS) -> a 4-list, or None for
+            the full sensor (blank).  The endpoints<->device-ROI conversion lives in
+            CameraMeasurement.set_acquisition_parameters (one source of truth)."""
+            t = str(text).strip()
+            if not t or t.lower() == "none":
+                return None
+            parts = [p for p in t.replace(";", ",").split(",") if p.strip() != ""]
+            if len(parts) != 4:
+                raise ValueError("region must be 'x0, x1, y0, y1' (4 numbers) or blank for full sensor.")
+            return [float(p) for p in parts]
+
+        def _build(hub, *, frames_per_cycle: int = 1, exposure: float = exposure,
+                   region: str = "", **_ignored):
             node = self.camera_measurement(hub, frames_per_cycle=int(frames_per_cycle))
-            if exposure is not None and hasattr(node, "apply_acquisition_parameters"):
-                node.apply_acquisition_parameters(exposure=float(exposure))
+            apply: dict[str, object] = {}
+            if exposure is not None:
+                apply["exposure"] = float(exposure)
+            reg = _parse_region(region)
+            if reg is not None:
+                apply["region"] = reg
+            if apply and hasattr(node, "apply_acquisition_parameters"):
+                node.apply_acquisition_parameters(**apply)
             return node
 
         return MeasurementSpec(
@@ -573,6 +595,10 @@ class ReadoutSubsystem(ExperimentSubsystem):
                 ParamDecl(key="exposure", label="exposure", kind="float",
                           default=exposure, unit="s", lo=0.0, hi=100.0,
                           tooltip="Camera exposure time (applied live to the camera)."),
+                ParamDecl(key="region", label="region x0,x1,y0,y1", kind="text", default="",
+                          tooltip="Camera ROI as sensor-pixel endpoints x0,x1,y0,y1 (blank = full "
+                                  "sensor).  Or drag a box on a frame plot to set it -- both go to "
+                                  "camera.configure(roi=), identical for virtual / real."),
             ),
             result_labels=("shot", "frame"),
             x_key="frame", y_key="frame",
