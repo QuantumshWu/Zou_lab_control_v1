@@ -1375,7 +1375,7 @@ def test_task_console_cards_are_modular(monkeypatch):
 
 
 def test_task_console_panels_render_and_update(monkeypatch):
-    """The demo board builds EVERY panel kind against the virtual feed -- both
+    """The demo board builds EVERY panel kind against the virtual node -- both
     rolling-trace plot types included -- and keeps updating them on later shots.
 
     ``monitor`` (with side distribution) and ``monitor_nodist`` (the bare
@@ -1406,63 +1406,51 @@ def test_task_console_panels_render_and_update(monkeypatch):
     # more shots -> the monitor's rolling history grows; the 2d image refreshes
     before = kinds["monitor"].plotter.points_done
     image_before = np.array(kinds["2d"].plotter.grid, copy=True)
-    for feed in console.feeds:
-        feed.step()
+    for node in console.running_nodes:
+        node.step()
     console.refresh_once()
     assert kinds["monitor"].plotter.points_done == before + 1
     assert not np.array_equal(np.array(kinds["2d"].plotter.grid), image_before)
     console.shutdown()
 
 
-def test_task_console_named_presets_resolve_and_roundtrip(tmp_path, monkeypatch):
-    """Task dashboards are reusable by NAME: built-ins resolve, a JSON saved in
-    tasks/ shows up in the preset list and OVERRIDES a same-named built-in."""
+def test_task_console_saved_layout_resolves_and_roundtrips(tmp_path, monkeypatch):
+    """There are NO presets.  The only reusable layout is one the USER saved to a
+    file; ``resolve_task_state`` loads it back by saved name (tasks/<name>.json) or
+    by path, and an unknown name raises.  (The default console opens EMPTY.)"""
 
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     monkeypatch.setenv("ZLC_TASK_DIR", str(tmp_path))
     from Zou_lab_control.frontend.task_console import (
-        BUILTIN_TASKS, TaskConsoleState, list_task_presets, resolve_task_state)
+        PanelConfig, TaskConsoleState, default_console_state, resolve_task_state)
 
-    assert {"atom_loading_monitor", "loading_rate_live"} <= set(BUILTIN_TASKS)
-    state = resolve_task_state("atom_loading_monitor")
-    assert state.name == "atom_loading_monitor"
-    # the loading-rate panel is the no-dist live (a right-side distribution on a
-    # running rate has no physical meaning) -> "monitor_nodist", not "monitor".
-    assert {p.kind for p in state.panels} == {"2d", "sites", "hist", "monitor_nodist", "1d"}
+    # the default opens empty -- no presets, no canned dashboard
+    assert default_console_state().panels == []
 
-    # a saved layout becomes a named preset; same stem overrides the built-in
-    custom = resolve_task_state("loading_rate_live")
-    custom.name = "atom_temp_monitor"
-    custom.save(tmp_path / "atom_temp_monitor.json")
-    override = TaskConsoleState(name="patched", panels=state.panels)
-    override.save(tmp_path / "atom_loading_monitor.json")
-    names = list_task_presets()
-    assert "atom_temp_monitor" in names and "atom_loading_monitor" in names
-    assert resolve_task_state("atom_temp_monitor").name == "atom_temp_monitor"
-    assert resolve_task_state("atom_loading_monitor").name == "patched"
+    # a user-saved layout reloads by name and by path
+    mine = TaskConsoleState(name="my_layout",
+                            panels=[PanelConfig(kind="1d", title="r", source="value = rate")])
+    mine.save(tmp_path / "my_layout.json")
+    assert resolve_task_state("my_layout").name == "my_layout"
+    assert resolve_task_state(str(tmp_path / "my_layout.json")).name == "my_layout"
     with pytest.raises(ValueError, match="unknown task"):
-        resolve_task_state("nonexistent_dashboard")
+        resolve_task_state("nonexistent_layout")
 
 
-def test_default_console_state_is_one_nodist_live(monkeypatch):
-    """The BARE default the app opens with is a SINGLE no-dist live trace (the
-    user grows their own task group by adding panels) -- not the rich
-    atom-loading dashboard, which is now an opt-in named preset."""
+def test_default_console_state_opens_empty(monkeypatch):
+    """The console opens EMPTY -- no presets, no canned panel.  The user builds the
+    dashboard themselves (Add Panel) and Saves/Loads it as a file."""
 
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
-    from Zou_lab_control.frontend.task_console import default_console_state
+    from Zou_lab_control.frontend.task_console import TaskConsoleState, default_console_state
 
     state = default_console_state()
-    assert len(state.panels) == 1
-    panel = state.panels[0]
-    assert panel.kind == "monitor_nodist"
-    assert panel.source == "value = rate"
+    assert state.panels == []
     # round-trips like any layout (the default is a normal saveable state)
-    from Zou_lab_control.frontend.task_console import TaskConsoleState
     again = TaskConsoleState.from_dict(state.to_dict())
-    assert [p.kind for p in again.panels] == ["monitor_nodist"]
+    assert again.panels == []
 
 
 def test_task_console_signal_picker_and_declarative_params(monkeypatch):
@@ -1558,20 +1546,34 @@ def test_task_console_panel_editor_tab(monkeypatch, tmp_path):
     console.shutdown()
 
 
-def test_task_console_setting_popup_border_is_scoped(monkeypatch):
-    """The Setting popup's border must be scoped to the popup by objectName --
-    a bare `QFrame { border }` rule cascades to every QFrame-derived child
-    (QLabel/QComboBox internals are QFrames) and drew stray lines inside."""
+def test_task_console_setting_popup_border_does_not_cascade(monkeypatch):
+    """The Setting popup's border must NOT cascade onto its child widgets.
+
+    The original regression was a bare ``QFrame { border }`` stylesheet rule that
+    leaked onto every QFrame-derived child (QLabel/QComboBox internals are QFrames)
+    and drew stray lines inside.  The redesign solves it structurally: the popup is
+    a :class:`FluentPopup` that PAINTS its rounded card (fill + 1px border) in
+    ``paintEvent`` -- so there is NO border STYLESHEET rule on the popup at all, and
+    nothing can cascade.  This asserts that surviving guarantee (the same intent as
+    before: no border bleed onto children)."""
 
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5 import QtWidgets
     from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.qt_fluent import FluentPopup
 
     console = dt.demo_console(shots=3)
     card = console.cards[0]
-    assert card.settings_popup.objectName() == "zlcPanelSettings"
-    sheet = card.settings_popup.styleSheet()
-    assert "QFrame#zlcPanelSettings" in sheet and "QFrame {" not in sheet
+    popup = card.settings_popup
+    # the popup paints its card itself (no stylesheet border that could cascade)
+    assert isinstance(popup, FluentPopup)
+    assert "border" not in popup.styleSheet().lower()
+    # and no child carries a border-DRAWING rule (only the benign `border: none`)
+    for child in popup.findChildren(QtWidgets.QFrame):
+        sheet = child.styleSheet().lower()
+        if "border" in sheet:
+            assert "border: none" in sheet or "border:none" in sheet, (type(child).__name__, sheet)
     console.shutdown()
 
 
@@ -1697,43 +1699,53 @@ def test_monitor_panels_have_no_selectors_and_wheel_scrolls(monkeypatch):
         console.shutdown()
 
 
-def test_edit_exposes_producing_feed_acquisition_params(monkeypatch):
-    """A plain panel's Edit auto-discovers the parameters of the FEED that
+def test_edit_exposes_producing_node_acquisition_params(monkeypatch):
+    """A plain panel's Edit auto-discovers the parameters of the NODE that
     produces its data (a loading-image panel is produced by the camera Measurement ->
     exposure / region / frames_per_cycle), each prefilled with the
     CURRENT running value and shown as a 'now: X' reference; Restart rebuilds the
-    feed.  (This is the fix for the loading-image Edit showing zero params.)"""
+    node.  (This is the fix for the loading-image Edit showing zero params.)"""
 
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from Zou_lab_control.frontend import devtools as dt
-    from Zou_lab_control.frontend.task_console import resolve_task_state
+    from Zou_lab_control.frontend.task_console import PanelConfig, TaskConsoleState
 
-    console = dt.demo_console(shots=20, state=resolve_task_state("atom_loading_monitor"))
+    # a 2-D raw-frame view (reads `frame`) -- built inline (there are no presets)
+    state = TaskConsoleState(name="raw_image",
+                             panels=[PanelConfig(kind="2d", title="Loading image", source="value = frame")])
+    console = dt.demo_console(shots=20, state=state)
     try:
         img = next(c for c in console.cards if c.config.kind == "2d")   # "Loading image"
         console._edit_card(img)
         editor = console._panel_editors[id(img)]
         # the raw-frame ("Loading image") panel reads `frame`, produced by the camera
-        # MEASUREMENT (CameraFrameFeed) -- so its Edit exposes the camera's params.
-        assert type(editor._feed).__name__ == "CameraFrameFeed"
-        assert {"exposure", "frames_per_cycle"} <= set(editor._feed_widgets)
+        # MEASUREMENT (CameraMeasurement) -- so its Edit exposes the camera's params.
+        assert type(editor._node).__name__ == "CameraMeasurement"
+        assert {"exposure", "frames_per_cycle"} <= set(editor._node_widgets)
         # fields PREFILLED with current running values + a "now:" reference
-        assert float(editor._feed_widgets["exposure"].text()) == editor._feed.camera.exposure
-        assert "now:" in editor._feed_now_labels["exposure"].text()
+        assert float(editor._node_widgets["exposure"].text()) == editor._node.camera.exposure
+        assert "now:" in editor._node_now_labels["exposure"].text()
         # editing + Restart reconfigures the camera with the new exposure
-        editor._feed_widgets["exposure"].setText("0.05")
-        editor._restart_feed()
-        assert editor._feed.camera.exposure == 0.05
-        assert editor._feed in console.feeds
+        editor._node_widgets["exposure"].setText("0.05")
+        editor._restart_node()
+        assert editor._node.camera.exposure == 0.05
+        assert editor._node in console.running_nodes
     finally:
         console.shutdown()
 
 
 def test_edit_area_select_fills_measurement_scan_range(monkeypatch):
-    """Confocal auto-range: a region selected on a measurement panel's Edit plot
-    fills that measurement's scan x-range Min/Max (the NEXT scan), via the area
-    selector's callback -> MeasurementPanel.set_axis_range."""
+    """Confocal auto-range: a marked region becomes the NEXT scan's x-range.
+
+    A measurement is now a LOGIC NODE (Logic tab); its Edit is a LogicNodeEditor
+    whose ``.form`` is the auto-generated, single-spec MeasurementPanel.  The
+    surviving confocal ``_read_range`` writeback is ``MeasurementPanel.set_axis_range``:
+    a region selected on a plot of that signal fills the first ``axis_range``
+    param's Min/Max (here the temperature scan's ``t_off``).  The plot-side
+    selector callback that drives it lives on a PLOT panel pointed at the signal
+    (a logic node never plots), so the architectural unit under test is the
+    measurement form's range writeback itself."""
 
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
@@ -1741,20 +1753,19 @@ def test_edit_area_select_fills_measurement_scan_range(monkeypatch):
 
     console = dt.demo_console_measurements()
     try:
-        result = next(c for c in console.cards if c.config.params.get("measurement"))
-        editor = console._panel_editors[id(result)]
-        form = editor.meas_panel
+        # the measurement opens with its Logic-tab Edit (LogicNodeEditor) showing
+        # its param form -- the form that carries the scan x-range.
+        editor = next(iter(console._logic_editors.values()))
+        form = editor.form
         _, lo, hi, pts = form._widgets["t_off"]
         lo.setValue(0.0); hi.setValue(120.0); pts.setValue(5)
-        form._widgets["shots"][1].setValue(6)
-        console._start_measurement(form)
-        console._meas_feed.stop(); console._meas_feed.run_to_completion(); console.refresh_once()
-        editor.rebuild()                       # re-snapshot now that the curve has data
-        # the area selector's callback is wired to fill the scan range
-        assert editor._plotter.area.callback.__name__ == "_read_scan_range"
-        editor._plotter.area.range = [18.0, 91.0, 0.0, 1.0]
-        editor._plotter.area.callback()        # what a real drag-select triggers
+        # a marked region [18, 91] (what a real drag-select on a plot of this
+        # signal yields) becomes the next scan's x-range via set_axis_range.
+        assert form.set_axis_range(18.0, 91.0) is True
         assert lo.value() == 18.0 and hi.value() == 91.0
+        # order-insensitive: a backwards drag is normalised to Min < Max.
+        assert form.set_axis_range(73.0, 22.0) is True
+        assert lo.value() == 22.0 and hi.value() == 73.0
     finally:
         console.shutdown()
 
@@ -1802,8 +1813,8 @@ def test_task_console_cross_signal_expression_and_error_isolation(monkeypatch):
     victim = next(card for card in console.cards if card.config.kind == "monitor")
     victim.source_edit.setText("value = this_signal_does_not_exist")
     victim._apply_source()
-    for feed in console.feeds:
-        feed.step()
+    for node in console.running_nodes:
+        node.step()
     console.refresh_once()
     assert "this_signal_does_not_exist" in victim.status.text()
     healthy = next(card for card in console.cards if card.config.kind == "2d")
@@ -3094,7 +3105,7 @@ def test_pulse_gui_scan_array_toggle_validates_and_marks_symbolic_regions(monkey
         assert editor.state.slot_index_for("duration", "0") == 0
         assert editor.drag_container.pulse_cards()[0].duration_dot.isChecked()
 
-        # A one-slot scan table feeds the seamless hardware scan compiler.
+        # A one-slot scan table drives the seamless hardware scan compiler.
         editor.state.set_scan_table([[20.0], [40.0]])
         editor.load_state(editor.state)
         app.processEvents()

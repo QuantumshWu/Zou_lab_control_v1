@@ -1,4 +1,4 @@
-"""Contract: a producer's parameters are derived from its signature (single source).
+"""Contract: a logic node's parameters are derived from its signature (single source).
 
 ``params_from_signature`` turns a callable's keyword parameters + typed annotations
 into ``ParamField`` records the GUI form renders and the API call shares -- injected
@@ -51,7 +51,7 @@ def test_signature_to_param_fields():
 
 
 def test_injected_and_varargs_skipped():
-    def producer(hub, camera, *, exposure: Param(float) = 0.02, **extra):
+    def node(hub, camera, *, exposure: Param(float) = 0.02, **extra):
         ...
-    names = [f.name for f in params_from_signature(producer)]
+    names = [f.name for f in params_from_signature(node)]
     assert names == ["exposure"]   # hub/camera injected, **extra dropped

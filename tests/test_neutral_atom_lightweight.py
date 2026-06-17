@@ -492,7 +492,7 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     assert {path.name for path in root.glob("*.bat")} == {
         "install_requirements.bat",
         "pulse_gui.bat",
-        # live experiment dashboard (virtual feed by default)
+        # live experiment dashboard (virtual node by default)
         "task_console.bat",
         "start_tutorials_jupyter_lab.bat",
         # double-click capacity check against fpga/board_config/streamer_config.json
@@ -1578,7 +1578,7 @@ def test_final_engine_model_fifo_1tick_and_streaming_scan():
 
 def test_streaming_scan_repeat_wrap_is_seamless_continuous_cyclic():
     """CORE REQUIREMENT: a repeat_forever STREAMED scan (N > 2 banks) re-sweeps with NO
-    gap at the wrap.  The continuous cyclic ping-pong feeds chunks 0,1,..,K-1,0,1,..
+    gap at the wrap.  The continuous cyclic ping-pong streams chunks 0,1,..,K-1,0,1,..
     one-ahead into the ALTERNATING bank, so the sweep wrap is just another chunk boundary
     -- seamless for ANY chunk count K (odd included, where bank=chunk%2 used to collide
     chunk K-1 and chunk 0 in the same bank and force a reactive reload -> the blank the
@@ -2003,7 +2003,7 @@ def test_vivado_axi_session_repeat_streaming_refills_cyclically(tmp_path):
     via CONTINUOUS CYCLIC ping-pong: the background thread streams monotonic chunks
     2,3,4,.. (data = mono%K into bank mono%2) ONE-AHEAD forever, so the engine wraps
     0->N-1->0 with no reactive reload.  Models the cyclic engine: cursor wraps on its
-    own each sweep; asserts the engine re-sweeps and the host keeps re-feeding data
+    own each sweep; asserts the engine re-sweeps and the host keeps reloading data
     chunk 0 across sweeps.  Never raises; safe_state stops it."""
 
     import re as _re, time as _time
@@ -2027,7 +2027,7 @@ def test_vivado_axi_session_repeat_streaming_refills_cyclically(tmp_path):
     class Hw:
         def __init__(self):
             self.bram = {}; self.status = 0; self.fired = False; self.cursor = 0
-            self.sweeps = 0; self.chunk0_feeds = 0
+            self.sweeps = 0; self.chunk0_reloads = 0
         def __call__(self, lines, action, timeout):
             text = "\n".join(lines)
             for w, v in _decode_axi_writes(text):
@@ -2035,10 +2035,10 @@ def test_vivado_axi_session_repeat_streaming_refills_cyclically(tmp_path):
                 if w == CtrlWords.COMMAND and v & CMD_LOAD: self.status = STATUS_LOADED
                 if w == CtrlWords.COMMAND and v & CMD_FIRE: self.fired = True; self.status = STATUS_RUNNING; self.cursor = 0
                 if w == CtrlWords.COMMAND and v & CMD_SAFE: self.status = 0; self.fired = False
-                # count the host (re)feeding DATA chunk 0 into either bank AFTER fire -- the
+                # count the host (re)loading DATA chunk 0 into either bank AFTER fire -- the
                 # cyclic stream keeps reloading chunk 0 (mono = K, 2K, ..) across sweeps.
                 if self.fired and w in (CtrlWords.BANK0_CHUNK, CtrlWords.BANK1_CHUNK) and v == 0:
-                    self.chunk0_feeds += 1
+                    self.chunk0_reloads += 1
             m = _re.search(r"-address ([0-9A-Fa-f]+) -len 1 -type read", text)
             if m:
                 w = int(m.group(1), 16) // 4
@@ -2062,14 +2062,14 @@ def test_vivado_axi_session_repeat_streaming_refills_cyclically(tmp_path):
     try:
         session.prepare(program)
         session.fire()
-        assert session.wait_done(timeout=1.0) is True       # RUNNING -> returns; thread feeds
+        assert session.wait_done(timeout=1.0) is True       # RUNNING -> returns; thread streams
         deadline = _time.monotonic() + 3.0
-        while (hw.sweeps < 3 or hw.chunk0_feeds < 1) and _time.monotonic() < deadline:
+        while (hw.sweeps < 3 or hw.chunk0_reloads < 1) and _time.monotonic() < deadline:
             _time.sleep(0.02)
     finally:
         session.safe_state()
     assert hw.sweeps >= 3, f"expected the streamed scan to re-sweep, got {hw.sweeps} sweeps"
-    assert hw.chunk0_feeds >= 1, f"expected the cyclic host to re-feed chunk 0, got {hw.chunk0_feeds}"
+    assert hw.chunk0_reloads >= 1, f"expected the cyclic host to reload chunk 0, got {hw.chunk0_reloads}"
 
 
 def test_pulse_table_state_compiles_pair_array_scan_to_full_40ch_template():
@@ -6375,8 +6375,8 @@ def test_scan_frame_shorter_than_read_latency_is_rejected():
     validate_pulse_streamer_program(ok, channel_count=2)
 
 
-def test_top_feeds_all_three_edge_reads_directly_no_skew_register():
-    """The three edge BRAMs (tick / coeff / mask) are read in lockstep and fed to the
+def test_top_routes_all_three_edge_reads_directly_no_skew_register():
+    """The three edge BRAMs (tick / coeff / mask) are read in lockstep and routed to the
     engine DIRECTLY -- no realignment register on ANY of them.  There is NO read-latency
     skew to compensate: each port B is symmetric WITHIN ITSELF (tick 32/32, coeff/mask
     64/64), so all three read at the SAME latency.  This was MEASURED on the actual
@@ -6640,7 +6640,7 @@ def test_steep_ramp_tracks_ideal_line_with_multi_lsb_bresenham_steps():
     for t in range(1, 11):
         assert out[t] == ((t - 1) * 1023) // 10
     assert out[11] == 1023 and out[15] == 1023
-    # closed form agrees tick-for-tick (it feeds the bus delay line)
+    # closed form agrees tick-for-tick (it drives the bus delay line)
     assert [em.bus_value_at(steep, 0, t, 0) for t in range(16)] == out
 
     # preview draws the same staircase: k*delta//span from the carried-in value.
@@ -6932,23 +6932,40 @@ def test_signal_hub_publish_latest_history_and_versioning():
     assert hub.latest("counts")[0] != 999.0
 
 
-def test_virtual_loading_readout_publishes_standard_signals():
-    """The COMPOSED loading readout (calibrate task + camera measurement + detect
-    processor) self-calibrates through the CameraDevice contract and publishes the
-    console signal set; the running loading rate lands near the configured
-    probability.  ``virtual_loading_readout`` only swaps in a virtual camera -- the
-    composed chain is the same one real hardware uses (virtual == real)."""
+def test_user_composed_loading_readout_publishes_standard_signals():
+    """The user composes the loading readout from independent nodes -- a
+    CalibrateReadoutTask producing the calibration + a CameraMeasurement publishing
+    raw frames + a DetectProcessor running the REAL per-frame ``calibration.detect``
+    -- exactly the same composition real hardware uses (virtual == real, only the
+    camera frames are fake).  Each node is added separately and addressed
+    independently; no monolithic node fabricates every signal.
+
+    The running loading rate lands near the configured probability, and a
+    namespaced (prefixed) second chain coexists in the same hub for A-B expressions."""
 
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
-    from Zou_lab_control.neutral_atom.devices.virtual import virtual_loading_readout
+    from Zou_lab_control.neutral_atom.devices.virtual import VirtualCamera, VirtualTrapArray
+    from Zou_lab_control.neutral_atom.operations.logic import (
+        CalibrateReadoutTask, CameraMeasurement, DetectProcessor)
+
+    def _build(hub, *, prefix, seed, loading_probability, ema):
+        trap = VirtualTrapArray(grid_shape=(5, 7), loading_probability=loading_probability, seed=seed)
+        camera = VirtualCamera(trap, exposure=0.02)
+        task = CalibrateReadoutTask(hub, camera, grid_shape=trap.grid_shape, exposure=0.02,
+                                    roi_radius=1, calibration_frames=4, threshold_frames=24,
+                                    prefix=f"{prefix}cal_")
+        task.run_to_completion()
+        cam = CameraMeasurement(hub, camera, prefix=prefix)
+        det = DetectProcessor(hub, calibration=task.calibration, source=f"{prefix}frame",
+                              grid_shape=trap.grid_shape, ema=ema, prefix=prefix)
+        return cam, det
 
     hub = SignalHub()
-    readout = virtual_loading_readout(hub, seed=5, loading_probability=0.55, ema=0.2)
-    readout.calibrate()
+    cam, det = _build(hub, prefix="", seed=5, loading_probability=0.55, ema=0.2)
     for _ in range(60):
-        readout.camera.step()      # camera measurement publishes a frame
-        readout.detect.step()      # detect processor runs the REAL per-frame detect
-    n = readout.detect.calibration.n_sites
+        cam.step()      # camera measurement publishes a frame
+        det.step()      # detect processor runs the REAL per-frame detect
+    n = det.calibration.n_sites
     names = set(hub.names())
     assert {"frame", "counts", "occupied", "rate", "rate_sites", "rate_grid",
             "centers", "thresholds"} <= names
@@ -6956,19 +6973,18 @@ def test_virtual_loading_readout_publishes_standard_signals():
     assert hub.latest("centers").shape == (n, 2)   # the site-map panel's anchor
     assert hub.latest("thresholds").shape == (n,)
     assert hub.latest("counts").shape == (n,)
-    assert hub.latest("rate_grid").shape == readout.detect.grid_shape
+    assert hub.latest("rate_grid").shape == det.grid_shape
     assert 0.0 <= hub.latest("rate") <= 1.0
     # the long-run occupancy mean tracks loading_probability (loose: lifetime losses)
     occupancy = hub.history("occupied", 60)
     assert 0.30 <= float(occupancy.mean()) <= 0.80
-    # a prefixed second readout coexists in the same hub for A-B expressions
-    readout_b = virtual_loading_readout(hub, prefix="b_", seed=6, loading_probability=0.3, ema=0.2)
-    readout_b.calibrate()
+    # a prefixed second composition coexists in the same hub for A-B expressions
+    cam_b, det_b = _build(hub, prefix="b_", seed=6, loading_probability=0.3, ema=0.2)
     for _ in range(10):
-        readout_b.camera.step()
-        readout_b.detect.step()
+        cam_b.step()
+        det_b.step()
     diff = hub.latest("rate_grid") - hub.latest("b_rate_grid")
-    assert diff.shape == readout.detect.grid_shape
+    assert diff.shape == det.grid_shape
 
 
 class _FakeVivadoProc:

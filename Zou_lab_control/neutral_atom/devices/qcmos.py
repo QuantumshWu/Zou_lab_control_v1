@@ -141,7 +141,7 @@ class QCMOSCamera(CameraDevice):
                     raise RuntimeError("sequencer must expose fire(sequence) for real qCMOS acquire.")
                 fire(runtime_sequence)
             timeout = self.config.timeout_ms if timeout_ms is None else positive_int(timeout_ms, "timeout_ms")
-            # When a live feed passes a stop event, wait in short slices and check
+            # When a live logic node passes a stop event, wait in short slices and check
             # it between slices so Stop interrupts a wedged trigger within ~one
             # slice instead of blocking the full timeout.  Without a stop event,
             # one wait of the full timeout (the original behaviour).

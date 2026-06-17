@@ -347,7 +347,7 @@ class ZoomPan:
         self.dragging = True
         # Anchor the pan in PIXEL space.  event.xdata is expressed in the CURRENT
         # data frame, which the pan itself keeps moving -- mixing the press frame
-        # with per-motion frames feeds the pan back into itself and produced the
+        # with per-motion frames pushes the pan back into itself and produced the
         # sudden jumps.  Pixels are frame-independent: delta_px * (span/width)
         # against the limits saved at press is exact and jump-free.
         self._press_px = (float(event.x), float(event.y))

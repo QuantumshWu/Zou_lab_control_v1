@@ -93,7 +93,7 @@ class NeutralAtomSession:
 
     def _imaging_channel_kwargs(self) -> dict[str, str]:
         # Single source of truth lives in timing.imaging_channel_kwargs so the
-        # session and the loading feed map channels identically (see M4 / feeds).
+        # session and the loading readout map channels identically (see M4 / logic nodes).
         return imaging_channel_kwargs(getattr(self.devices, "sequencer", None))
 
     def _preflight(self, *, sequence: PulseSequence | None = None, verilog: bool = True) -> PreflightReport:

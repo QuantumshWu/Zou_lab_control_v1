@@ -18,7 +18,7 @@ import pytest
 
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
 from Zou_lab_control.neutral_atom.devices.base import AcquisitionCancelled
-from Zou_lab_control.neutral_atom.operations.feeds import Producer
+from Zou_lab_control.neutral_atom.operations.logic import LogicNode
 from Zou_lab_control.neutral_atom.operations.measurement import (
     ScanAxis,
     ScannedMeasurement,
@@ -29,7 +29,7 @@ from Zou_lab_control.neutral_atom.timing import imaging_channel_kwargs
 # --------------------------------------------------------------------------- #11
 def test_hub_tracks_per_signal_version():
     """A rolling monitor needs to tell 'my signal got a new sample' from 'some
-    other feed bumped the global version' -- per-signal counters provide that."""
+    other node bumped the global version' -- per-signal counters provide that."""
     hub = SignalHub()
     hub.publish({"a": 1.0})
     hub.publish({"a": 2.0, "b": 9.0})
@@ -44,29 +44,29 @@ def test_hub_tracks_per_signal_version():
 
 
 # --------------------------------------------------------------------------- M7
-def test_wedged_feed_surfaces_error_not_silent():
-    """A feed whose source raises must record the error + publish a health signal,
+def test_wedged_node_surfaces_error_not_silent():
+    """A node whose source raises must record the error + publish a health signal,
     never freeze silently."""
     hub = SignalHub()
 
-    class BoomFeed(Producer):
+    class BoomNode(LogicNode):
         def shot(self):
             raise RuntimeError("trigger never arrived")
 
-    feed = BoomFeed(hub).start(rate_hz=50)
+    node = BoomNode(hub).start(rate_hz=50)
     try:
         deadline = time.monotonic() + 2.0
-        while feed.last_error is None and time.monotonic() < deadline:
+        while node.last_error is None and time.monotonic() < deadline:
             time.sleep(0.01)
-        assert feed.last_error is not None and "trigger never arrived" in feed.last_error
-        assert feed.consecutive_errors >= 1
-        assert "feed_error" in hub.names()
+        assert node.last_error is not None and "trigger never arrived" in node.last_error
+        assert node.consecutive_errors >= 1
+        assert "node_error" in hub.names()
     finally:
-        feed.stop()
+        node.stop()
 
 
 # --------------------------------------------------------------------------- M4
-def test_loading_feed_channel_mapping_follows_sequencer():
+def test_loading_node_channel_mapping_follows_sequencer():
     """imaging_channel_kwargs maps the conventional roles onto whatever channels
     the bound sequencer exposes -- a real chNN streamer must NOT get the
     trap/cooling/probe/emCCD placeholders."""
@@ -246,7 +246,7 @@ def test_qcmos_write_settings_ok_when_accepted():
 
 # --------------------------------------------------------------------------- M5
 def test_qcmos_acquire_cancels_promptly_on_stop():
-    """A live feed's Stop must interrupt a wedged trigger wait (AcquisitionCancelled),
+    """A live node's Stop must interrupt a wedged trigger wait (AcquisitionCancelled),
     not block for the whole timeout."""
 
     class _WedgedDcam(_FakeDcam):
@@ -341,9 +341,9 @@ def test_exposure_inference_follows_probe_channel_mapping():
 # --------------------------------------------------------------------------- M-B (re-audit)
 def test_scan_engine_threads_stop_into_acquire():
     """A Stop must interrupt a wedged trigger DURING a scan point, not only
-    between points: the feed shares its stop event with the measurement, which
+    between points: the node shares its stop event with the measurement, which
     passes it to camera.acquire."""
-    from Zou_lab_control.neutral_atom.operations.feeds import ScannedMeasurementFeed
+    from Zou_lab_control.neutral_atom.operations.logic import ScannedMeasurementNode
 
     hub = SignalHub()
     meas = ScannedMeasurement(
@@ -352,10 +352,10 @@ def test_scan_engine_threads_stop_into_acquire():
         axis=ScanAxis(slot="s0", values=[1.0, 2.0], kind="duration"),
         plan=_FakePlan(), reducer=_PresetReducer([[1.0, 2.0]]),
     )
-    feed = ScannedMeasurementFeed(hub, meas, x_key="x", y_key="y")
-    assert meas.stop_event is feed._stop           # feed shared its stop event
+    node = ScannedMeasurementNode(hub, meas, x_key="x", y_key="y")
+    assert meas.stop_event is node._stop           # node shared its stop event
     meas.measure(1.0)
-    assert meas.camera.last_stop is feed._stop      # ...and it reaches camera.acquire
+    assert meas.camera.last_stop is node._stop      # ...and it reaches camera.acquire
 
 
 # --------------------------------------------------------------------------- round-3 B1 (temperature chNN)
@@ -390,16 +390,17 @@ def test_calibration_rejects_wrong_image_shape():
 
 # --------------------------------------------------------------------------- round-3 plot-kind table guard
 def test_panel_kind_tables_agree():
-    """A panel kind is driven by several parallel tables (label / default source /
-    params); a new kind half-registered in only some of them is the asymmetry the
-    audit flagged.  Mechanically require every kind to appear in all of them so a
-    half-registration fails here instead of silently misbehaving in the console."""
+    """A panel kind is driven by parallel tables (label / params); a kind
+    half-registered in only some of them is the asymmetry the audit flagged.
+    Mechanically require every kind to appear in both so a half-registration fails
+    here instead of silently misbehaving in the console.  (A fresh plot is BLANK --
+    its source is kind-independent now, so there is no per-kind default-source
+    table to keep in sync.)"""
     import os
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from Zou_lab_control.frontend.task_console import PANEL_KINDS, PANEL_PARAMS, _DEFAULT_SOURCES
+    from Zou_lab_control.frontend.task_console import PANEL_KINDS, PANEL_PARAMS
 
     kinds = set(PANEL_KINDS)
-    assert set(_DEFAULT_SOURCES) == kinds, "every panel kind needs a _DEFAULT_SOURCES entry"
     assert set(PANEL_PARAMS) == kinds, "every panel kind needs a PANEL_PARAMS entry (empty tuple allowed)"
 
 
@@ -422,7 +423,7 @@ def test_edit_snapshot_canvas_keeps_design_height():
     state = zf.TaskConsoleState(name="t", panels=[
         zf.PanelConfig(kind="monitor", title="loading rate", size="2x2", source="value = rate")])
     console = TaskConsole(hub=hub, state=state)
-    for i in range(30):                       # roll real points like a live feed
+    for i in range(30):                       # roll real points like a live node
         hub.publish({"rate": float(i % 5)})
         console.refresh_once()
     editor = PanelEditor(console.cards[0], console)

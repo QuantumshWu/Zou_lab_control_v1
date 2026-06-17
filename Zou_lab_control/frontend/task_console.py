@@ -1,14 +1,25 @@
-"""Task console: a configurable grid dashboard of live experiment panels.
+"""Task console: a configurable dashboard with a clean VIEW / LOGIC split.
 
-Each panel card is JUST the plot frame: the frontend panel canvas plus a thin
-border that doubles as the DRAG HANDLE -- grab the border, drop the card, and
-it snaps to the layout grid (half-unit pitch, so half-height cards stack flush
-against full ones).  Everything else (title, size preset, kind parameters, the
-data-source expression, status, remove) lives behind the small gear button in
-the panel's top-right corner, confocal-settings style, so the frame size is
-fully controlled by the frontend's modular plot region.
+Two permanent tabs:
 
-A panel's data source is a one-line expression evaluated against the named
+* **Monitor** -- the drag-and-snap board of PLOT panels.  A plot is a PURE VIEW,
+  fully decoupled from acquisition: it shows nothing until you pick a hub signal in
+  its Setting, and it NEVER builds, owns or starts a measurement.  Each panel card
+  is JUST the plot frame (the frontend canvas + a thin border that doubles as the
+  DRAG HANDLE -- grab the border, drop the card, it snaps to the layout grid).
+  Everything else (title, size, signal source, fit, limits, save) lives behind the
+  gear button / the panel's own Edit tab.
+
+* **Logic** -- the list of LOGIC NODES (measurement / processor / task).  A logic
+  node is the thing that PRODUCES data: added STOPPED, it shows as a row with a
+  status colour dot (grey=stopped, green=running, red=error) + its name + an Edit
+  button.  Its Edit tab carries its auto-generated parameter form + Start / Stop
+  (no curve fit -- fitting is a plotter concern).  Start builds the node from
+  the form values with display SUPPRESSED (it only publishes signals to the hub --
+  never opens a matplotlib plot) and runs it; Stop cancels it.  You then Add plot
+  panels on the Monitor board pointed at the signals it publishes.
+
+A plot panel's data source is a one-line expression evaluated against the named
 signals of a :class:`~Zou_lab_control.neutral_atom.core.signals.SignalHub`
 (the same trusted-local-code posture as the pulse GUI's Scan tab):
 
@@ -16,8 +27,8 @@ signals of a :class:`~Zou_lab_control.neutral_atom.core.signals.SignalHub`
     value = rate_grid - b_rate_grid     # arbitrary math across signals
     value = history('counts', 200).ravel()
 
-Layouts (panels + positions + sizes + expressions + params) save/load as ONE
-JSON and are machine-portable: all plot geometry is owned by
+Layouts (plot panels + logic nodes + positions + sizes + expressions + params)
+save/load as ONE JSON and are machine-portable: all plot geometry is owned by
 frontend.panel_plot and never part of the layout.
 """
 
@@ -90,36 +101,30 @@ PANEL_KINDS: dict[str, str] = {
     "hist": "Distribution",
 }
 
-# A panel's ROLE -- the producer-layer node it represents -- is orthogonal to its
-# plot KIND (the view).  It is set by which Add-Panel category built the panel and
-# decides how its Edit / Setting are composed:
-#   * "plot"        -- a pure VIEW wired to hub signals.  Full plotter Edit:
-#                      curve fit (the whole DataFigure set) + manual limits +
-#                      the producing measurement's parameter form, and Setting
-#                      keeps the plot-display knobs (relim / unit).
-#   * "measurement" -- the acquisition node itself.  Its Edit is its parameter
-#                      form (the source IS the device loop) -- NO curve fit, no
-#                      manual-limit row (fitting a curve is a plotter concern,
-#                      so you Add a Plot panel for that), and Setting drops the
-#                      plot-display-only knobs.
-#   * "task"        -- an orchestrated one-shot / processor.  Same no-fit Edit as
-#                      a measurement, plus Run; mid-run output lands in its own
-#                      dedicated panel (confocal-task style).
-# This is the role gate that keeps task #176 (a PLOT exposes every fit model)
-# intact while honouring the measurement/task "no fit" request -- the fit is
-# gated by ROLE, never by plot kind.
-PANEL_ROLES = ("plot", "measurement", "task")
+# Every Monitor-board panel is a PURE VIEW (role "plot"): it is fully decoupled
+# from acquisition -- it shows a hub signal and carries the full plotter Edit (the
+# whole DataFigure fit set + manual limits + the display knobs), but it NEVER
+# builds / owns / starts a node.  The things that PRODUCE data
+# (measurement / processor / task) are LOGIC NODES on the separate Logic tab, not
+# board panels (see LogicNodeConfig / LogicNodeRow).  ``role`` stays on PanelConfig
+# (always "plot") only so an older saved layout round-trips cleanly.
+PANEL_ROLES = ("plot",)
+
+# The KINDS of LOGIC NODE the Logic tab hosts -- the node layers (measurement /
+# processor / task).  "camera" is the continuous camera Measurement (a live frame
+# stream); "measurement" a swept measurement; "processor" a reactive transform;
+# "task" a one-shot orchestration.  A node is added STOPPED and Start/Stop'd from
+# its own Edit -- it only ever publishes to the hub (display suppressed).
+LOGIC_KINDS = ("camera", "measurement", "processor", "task")
 
 CMAPS = ("inferno", "viridis", "magma", "plasma", "gray", "coolwarm")
 
-_DEFAULT_SOURCES = {
-    "2d": "value = frame",
-    "sites": "value = occupied",
-    "1d": "value = rate_sites",
-    "monitor": "value = rate",
-    "monitor_nodist": "value = rate",
-    "hist": "value = history('counts', 200).ravel()",
-}
+# A fresh plot panel is BLANK: a pure view is fully decoupled from acquisition, so
+# it shows nothing until the user picks a hub signal in its Setting (signal_combo)
+# -- it must NOT auto-bind to any node's signal.  An empty source is the blank
+# state; ``refresh`` treats it (and a source that produces None) as "pick a signal"
+# rather than an error, so a blank panel sits quietly until wired.
+_BLANK_SOURCE = ""
 
 
 class ParamSpec:
@@ -333,7 +338,10 @@ class PanelConfig:
         self.row = max(0, int(row))
         self.col = max(0, int(col))
         self.size = str(size)
-        self.source = str(source) if source is not None else _DEFAULT_SOURCES[self.kind]
+        # A pure-view plot is BLANK until the user picks a signal (decoupled from
+        # acquisition); a saved layout keeps its stored source string verbatim
+        # (including a blank one).
+        self.source = str(source) if source is not None else _BLANK_SOURCE
         self.params = dict(params or {})
         self.role = str(role)
 
@@ -371,11 +379,44 @@ class PanelConfig:
         )
 
 
+class LogicNodeConfig:
+    """One LOGIC NODE: which node it is + the param values to build it with.
+
+    A logic node lives on the Logic tab, NOT the Monitor board, and is the thing
+    that PRODUCES data.  ``kind`` is one of :data:`LOGIC_KINDS` (camera /
+    measurement / processor / task); ``name`` is the catalog spec's name (or
+    ``"Camera (live frames)"`` for the camera).  ``values`` is the last param-form
+    ``{key: value}`` it was built / run with, so reopening its Edit restores them.
+    A node is always added STOPPED -- nothing runs until Start in its Edit."""
+
+    def __init__(self, *, kind: str, name: str, title: str = "",
+                 values: Mapping[str, object] | None = None):
+        if kind not in LOGIC_KINDS:
+            raise ValueError(f"unknown logic kind {kind!r}; choose from {list(LOGIC_KINDS)}.")
+        self.kind = str(kind)
+        self.name = str(name)
+        self.title = str(title) or str(name)
+        self.values = dict(values or {})
+
+    def to_dict(self) -> dict[str, object]:
+        return {"kind": self.kind, "name": self.name, "title": self.title,
+                "values": dict(self.values)}
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "LogicNodeConfig":
+        return cls(
+            kind=str(payload["kind"]),
+            name=str(payload.get("name", "")),
+            title=str(payload.get("title", "")),
+            values=payload.get("values") or {},
+        )
+
+
 class TaskConsoleState:
     """The whole console layout: serialised as ONE machine-portable JSON file."""
 
     schema = "Zou_lab_control.frontend.TaskConsoleState"
-    version = 2
+    version = 3
 
     def __init__(
         self,
@@ -383,12 +424,20 @@ class TaskConsoleState:
         name: str = "task",
         interval_ms: int = 400,
         panels: Sequence[PanelConfig | Mapping[str, object]] | None = None,
+        logic: Sequence[LogicNodeConfig | Mapping[str, object]] | None = None,
     ):
         self.name = str(name)
         self.interval_ms = max(50, int(interval_ms))
         self.panels = [
             panel if isinstance(panel, PanelConfig) else PanelConfig.from_dict(panel)
             for panel in (panels or [])
+        ]
+        # The Logic-tab nodes (measurement / processor / task), saved alongside the
+        # plot panels so a layout restores the whole dashboard -- nodes always come
+        # back STOPPED (the layout records what to build, not a running thread).
+        self.logic = [
+            node if isinstance(node, LogicNodeConfig) else LogicNodeConfig.from_dict(node)
+            for node in (logic or [])
         ]
 
     def to_dict(self) -> dict[str, object]:
@@ -398,6 +447,7 @@ class TaskConsoleState:
             "name": self.name,
             "interval_ms": self.interval_ms,
             "panels": [panel.to_dict() for panel in self.panels],
+            "logic": [node.to_dict() for node in self.logic],
         }
 
     @classmethod
@@ -406,6 +456,7 @@ class TaskConsoleState:
             name=str(payload.get("name", "task")),
             interval_ms=int(payload.get("interval_ms", 400)),
             panels=payload.get("panels") or [],
+            logic=payload.get("logic") or [],
         )
 
     def save(self, path: str | Path) -> Path:
@@ -421,89 +472,16 @@ class TaskConsoleState:
         return cls.from_dict(payload)
 
 
-def _atom_loading_monitor_state() -> TaskConsoleState:
-    """The atom-loading dashboard: camera image + occupancy site map on top,
-    counts distribution + loading-rate trace in the middle, per-site strip below."""
-
-    return TaskConsoleState(
-        name="atom_loading_monitor",
-        panels=[
-            PanelConfig(kind="2d", title="Loading image", row=0, col=0, size="2x2",
-                        source="value = frame"),
-            PanelConfig(kind="sites", title="Occupancy", row=0, col=2, size="2x2",
-                        source="value = occupied"),
-            PanelConfig(kind="hist", title="Counts distribution", row=2, col=0, size="1x2",
-                        source="value = history('counts', 200).ravel()", params={"bins": 80}),
-            PanelConfig(kind="monitor_nodist", title="Loading rate", row=2, col=2, size="1x2",
-                        source="value = rate", params={"length": 300}),
-            PanelConfig(kind="1d", title="Per-site loading rate", row=3, col=0, size="2x4",
-                        source="value = rate_sites"),
-        ],
-    )
-
-
-def _loading_rate_live_state() -> TaskConsoleState:
-    """A lightweight rate-watch layout (no camera image): rate trace + counts
-    distribution on top, per-site rate map + strip below."""
-
-    return TaskConsoleState(
-        name="loading_rate_live",
-        panels=[
-            PanelConfig(kind="monitor_nodist", title="Loading rate", row=0, col=0, size="1x2",
-                        source="value = rate", params={"length": 500}),
-            PanelConfig(kind="hist", title="Counts distribution", row=0, col=2, size="1x2",
-                        source="value = history('counts', 200).ravel()", params={"bins": 80}),
-            PanelConfig(kind="sites", title="Per-site rate", row=1, col=0, size="2x2",
-                        source="value = rate_sites", params={"image": ""}),
-            PanelConfig(kind="1d", title="Per-site loading rate", row=1, col=2, size="1x2",
-                        source="value = rate_sites"),
-        ],
-    )
-
-
-# Named, reusable dashboards ("task GUIs"): designed once, saved by name, and
-# loaded back from the GUI preset picker, `--task <name>` or
-# `show_task_console(task=...)`.  A JSON file in tasks/ with the same stem
-# OVERRIDES the built-in (so the lab can evolve a stock layout in place).
-BUILTIN_TASKS: dict[str, object] = {
-    "atom_loading_monitor": _atom_loading_monitor_state,
-    "loading_rate_live": _loading_rate_live_state,
-}
-
-
-def _single_live_state() -> TaskConsoleState:
-    """The BARE default the console opens with: ONE rolling loading-rate trace
-    (no side distribution).  Deliberately minimal -- you add panels from the
-    header ("Add Panel") to build the task group you want.  The richer named
-    dashboards (``atom_loading_monitor``, ``loading_rate_live``) stay one click
-    away in the preset picker / ``--task``."""
-
-    return TaskConsoleState(
-        name="live",
-        panels=[
-            PanelConfig(kind="monitor_nodist", title="Loading rate", row=0, col=0, size="2x4",
-                        source="value = rate", params={"length": 300}),
-        ],
-    )
-
-
 def default_console_state() -> TaskConsoleState:
-    return _single_live_state()
+    """The console opens EMPTY.  You build the dashboard yourself (Add Panel) and
+    Save it to a file; you reuse it by Loading that file back (the Load button /
+    ``--task`` / ``show_task_console(task=)``)."""
 
-
-def list_task_presets() -> list[str]:
-    """All loadable task names: built-ins + every tasks/*.json (deduplicated)."""
-
-    names = set(BUILTIN_TASKS)
-    try:
-        names.update(path.stem for path in _task_files_dir().glob("*.json"))
-    except Exception:
-        pass
-    return sorted(names)
+    return TaskConsoleState(name="task", panels=[])
 
 
 def resolve_task_state(task: str) -> TaskConsoleState:
-    """Resolve a task by FILE PATH, tasks/<name>.json, or built-in name."""
+    """Resolve a task layout by FILE PATH or a saved tasks/<name>.json."""
 
     text = str(task).strip()
     path = Path(text)
@@ -512,11 +490,8 @@ def resolve_task_state(task: str) -> TaskConsoleState:
     saved = _task_files_dir() / f"{text}.json"
     if saved.exists():
         return TaskConsoleState.load(saved)
-    if text in BUILTIN_TASKS:
-        return BUILTIN_TASKS[text]()
     raise ValueError(
-        f"unknown task {task!r}: not a layout file, not in {_task_files_dir()}, and not one of "
-        f"{', '.join(sorted(BUILTIN_TASKS))}.")
+        f"unknown task {task!r}: not a layout file and not a saved layout in {_task_files_dir()}.")
 
 
 # ====================================================================== panels
@@ -547,7 +522,7 @@ class PanelCard(FluentGroupBox):
         self._value_shape: tuple[int, ...] | None = None
         self._compiled_source = config.source
         # Monitor roll-gate: remembers the per-signal version of this panel's
-        # source at the last roll, so an unrelated feed's version bump does not
+        # source at the last roll, so an unrelated node's version bump does not
         # append a duplicate point.  `_MONITOR_UNSET` = never rolled yet.
         self._last_monitor_key: object = _MONITOR_UNSET
         self._ref_src: str | None = None
@@ -573,8 +548,8 @@ class PanelCard(FluentGroupBox):
         self.footer.setAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
         self.footer.setWordWrap(True)
         # The footer carries the transient status AND a persistent SIGNAL legend
-        # (what this panel READS from the hub, what its producer PROVIDES, and any
-        # name published by >1 producer) so the hub namespace is never a mystery.
+        # (what this panel READS from the hub, what its node PROVIDES, and any
+        # name published by >1 node) so the hub namespace is never a mystery.
         self._status_text = ""
         self._signal_info = ""
         # added AFTER the canvas (in _build_plot); keep a stretch so the footer
@@ -823,13 +798,19 @@ class PanelCard(FluentGroupBox):
         return edit
 
     def _open_settings(self) -> None:
+        # Click-to-open / click-again-to-close TOGGLE (confocal gui_individual
+        # on_settings: `if visible: hide else: show+raise`).
+        popup = self.settings_popup
+        if popup.isVisible():
+            popup.hide()
+            return
         self._refresh_signal_combo()
         anchor = self.setting_button.mapToGlobal(
             QtCore.QPoint(self.setting_button.width(), self.setting_button.height()))
-        popup = self.settings_popup
         popup.adjustSize()
         popup.move(anchor.x() - popup.width(), anchor.y() + scaled_px(2))
         popup.show()
+        popup.raise_()
 
     def _refresh_signal_combo(self) -> None:
         """Fill the signal picker with the hub's CURRENT signal names."""
@@ -982,7 +963,7 @@ class PanelCard(FluentGroupBox):
 
     def set_signal_info(self, info: str) -> None:
         """Set the persistent signal legend (computed by the console: what this
-        panel READS from the hub, what its producer PROVIDES, duplicate names)."""
+        panel READS from the hub, what its node PROVIDES, duplicate names)."""
         info = str(info or "")
         if info == self._signal_info:
             return
@@ -1078,13 +1059,19 @@ class PanelCard(FluentGroupBox):
 
     # ------------------------------------------------------------- data path
     def refresh(self, namespace: dict[str, object]) -> None:
-        """Evaluate this panel's source against ``namespace`` and feed the plot.
+        """Evaluate this panel's source against ``namespace`` and render the plot.
         Every failure lands on the gear/status -- a bad expression in one panel
         must never break the console or its siblings."""
 
+        # A BLANK panel (a freshly added pure view, source not yet wired) sits
+        # quietly with a hint -- it is decoupled, so it shows nothing until the
+        # user picks a signal in its Setting.  Not an error.
+        if not str(self._compiled_source).strip():
+            self.set_status("pick a signal in Setting", error=False)
+            return
         try:
             value = self._evaluate(dict(namespace))
-            self._feed(value, namespace)
+            self._render(value, namespace)
         except Exception as exc:
             self.set_status(str(exc).splitlines()[0][:160] or type(exc).__name__, error=True)
             return
@@ -1105,11 +1092,11 @@ class PanelCard(FluentGroupBox):
         arr = np.asarray(value, dtype=float)
         if kind == "1d":
             # 1D panels are y-vs-index by default.  Only a panel EXPLICITLY
-            # flagged xy=True (the measurement result card built by
-            # _ensure_result_panel) reads an (N, 2) value as an x-y curve
-            # (col0 = x, col1 = y, e.g. value = column_stack([x_key, y_key])).
-            # A plain 1d panel that happens to produce (N, 2) still flattens, so
-            # the x-y meaning is opt-in, not a silent shape heuristic.
+            # flagged xy=True (e.g. a curve view whose source is
+            # value = column_stack([x_key, y_key])) reads an (N, 2) value as an
+            # x-y curve (col0 = x, col1 = y).  A plain 1d panel that happens to
+            # produce (N, 2) still flattens, so the x-y meaning is opt-in, not a
+            # silent shape heuristic.
             if self.config.params.get("xy") and arr.ndim == 2 and arr.shape[1] == 2 and arr.shape[0] >= 1:
                 return arr
             flat = arr.reshape(-1)
@@ -1185,8 +1172,8 @@ class PanelCard(FluentGroupBox):
             return None
         return tuple(sorted((n, versions[n]) for n in refs))
 
-    def _feed(self, value, namespace: Mapping[str, object] | None = None) -> None:
-        # PERFORMANCE: feed data with draw=False and queue ONE draw_idle per
+    def _render(self, value, namespace: Mapping[str, object] | None = None) -> None:
+        # PERFORMANCE: push data with draw=False and queue ONE draw_idle per
         # panel -- rendering happens in Qt's paint pass (coalesced per frame),
         # never synchronously inside the refresh tick.  hist accepts any sample
         # count (HistogramFigure.update rebins itself), so a growing history
@@ -1213,7 +1200,7 @@ class PanelCard(FluentGroupBox):
             self.plotter.update(np.asarray(value).ravel(), draw=False)
         elif kind in ("monitor", "monitor_nodist"):
             # Roll ONE point per new sample of this monitor's own source.  With
-            # several feeds, an unrelated feed bumps hub.version and refreshes
+            # several nodes, an unrelated node bumps hub.version and refreshes
             # every panel; without this gate the monitor would append a duplicate
             # point each time.  When the source's referenced signals are
             # undetectable (e.g. it reads via history("name")) we fall back to
@@ -1267,7 +1254,7 @@ class PanelCard(FluentGroupBox):
         elif kind == "2d":
             arr = np.asarray(value, dtype=float)
             ny, nx = arr.shape
-            # Coordinate axes ARE the source's pixel space: when the producing feed
+            # Coordinate axes ARE the source's pixel space: when the producing node
             # declares a spatial region, its endpoints [x_min, x_max, y_min, y_max]
             # give the axis ORIGIN (index 0 = x_min, index 2 = y_min); the image x/y
             # are the REAL pixels (x_min..x_min+nx), not 0..N -- so the axes match
@@ -1323,6 +1310,13 @@ class PanelCard(FluentGroupBox):
         # and the wheel scrolls the board (isolate_wheel=False) instead of being
         # swallowed.  Interactive zoom / select lives in the Edit tab.
         self.canvas = panel_canvas(self.plotter.fig, isolate_wheel=False)
+        # Pin the canvas to its DESIGN size so the surrounding QVBoxLayout can never
+        # squish it below the panel region: the signal-legend footer word-wraps to
+        # several lines for a rich node chain, and without a floor it would steal
+        # the canvas's height (breaking the canvas-fits-card contract).  The card
+        # is setFixedSize to exactly hold canvas + chrome, so the footer keeps its
+        # _FOOTER_MIN slot and a long legend elides rather than shrinking the plot.
+        self.canvas.setMinimumSize(self.canvas.sizeHint())
         self.canvas_holder.insertWidget(0, self.canvas, alignment=QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop)
         if self.canvas_holder.indexOf(self.footer) < 0:
             # footer (status line) sits DIRECTLY under the canvas, then the
@@ -1694,14 +1688,14 @@ class PanelEditor(QtWidgets.QWidget):
         self._plotter = None
         self._canvas = None
         self._df = None
+        # A plot panel's Edit NEVER carries a measurement/processor param form or
+        # Start/Stop -- a plot is a pure VIEW, decoupled from acquisition (the
+        # node lives on the Logic tab).  meas_panel stays None so any leftover
+        # callers no-op.
         self.meas_panel = None
-        self._feed = None                       # the feed that produces this panel's data
-        self._feed_widgets: dict = {}           # acquisition-param name -> editable field
-        self._feed_now_labels: dict = {}        # acquisition-param name -> "now: X" reference
-        # The fit + manual-limit controls exist ONLY for a "plot"-role panel (a
-        # measurement / task node's Edit carries no curve fit).  Pre-bind them to
-        # None so the do_fit / fill_limits / apply_limits handlers no-op cleanly
-        # when the section was never built.
+        self._node = None                       # the node that produces this panel's data
+        self._node_widgets: dict = {}           # acquisition-param name -> editable field
+        self._node_now_labels: dict = {}        # acquisition-param name -> "now: X" reference
         self.fit_combo = None
         self.fit_cmd = None
         self.xmin = self.xmax = self.ymin = self.ymax = None
@@ -1729,92 +1723,51 @@ class PanelEditor(QtWidgets.QWidget):
             lab.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
             return lab
 
-        # ROLE decides which sections this Edit carries (see PANEL_ROLES):
-        #   * "plot"        -> the FULL plotter Edit: the producing measurement's
-        #                      param form (if any) + acquisition + plot params +
-        #                      snapshot + curve FIT + manual limits.
-        #   * "measurement" -> the measurement's OWN param form + snapshot (so the
-        #                      selector still writes a scan range back) -- NO fit,
-        #                      no manual limits, no plot params (a measurement node
-        #                      is acquisition, not curve analysis).
-        #   * "task"        -> the data-processing param form + Run + snapshot --
-        #                      same no-fit Edit; mid-run output is its own panel.
+        # A plot panel is a PURE VIEW: its Edit carries ONLY the plotter controls
+        # (acquisition of whatever node already publishes the signal it reads --
+        # read-only-ish, snapshot, fit, manual limits, save).  It NEVER builds or
+        # starts a node -- that lives on the Logic tab.  ``is_plot`` is always
+        # True (a board panel's role is always "plot"); it is kept as a local for
+        # the section gates below so the structure stays legible.
         is_plot = card.config.role == "plot"
 
-        # ---- Measurement (only when this panel came from a measurement) -----
-        # The measurement's OWN API parameters, auto-generated as a GUI form from
-        # its ParamDecls; Start RE-RUNS the scan into this Monitor panel with the
-        # edited params.
-        spec = console._spec_for_card(card)
-        if spec is not None:
-            section("Measurement")
-            self.meas_panel = MeasurementPanel([spec], single=True)
-            self.meas_panel.seed_values(card.config.params.get("measurement_values") or {})
-            self.meas_panel.start_requested.connect(console._start_measurement)
-            self.meas_panel.stop_requested.connect(console._stop_measurement)
-            col.addWidget(self.meas_panel)
-
-        # ---- Data processing (only when this panel came from a processor) ----
-        # The one-shot action's OWN parameters, auto-generated as a GUI form from its
-        # ParamDecls; Start runs it ONCE and the result lands on the hub + this panel.
-        # Reuses the measurement form widget (it needs only .name + .params); a card
-        # is either a measurement OR a processor, so only one branch fires.
-        proc_spec = console._processor_spec_for_card(card)
-        if proc_spec is not None:
-            section("Data processing")
-            self.meas_panel = MeasurementPanel([proc_spec], single=True)
-            self.meas_panel.seed_values(card.config.params.get("processor_values") or {})
-            self.meas_panel.start_requested.connect(console._start_processor)
-            self.meas_panel.stop_requested.connect(console._stop_processor)
-            col.addWidget(self.meas_panel)
-
         # ---- Acquisition: the editable parameters of the DATA SOURCE behind this
-        # panel.  A panel is a VIEW; the producing feed declares what its source
-        # exposes via acquisition_parameters() -- a raw-frame panel's source is the
-        # camera Measurement (exposure / ROI, reconfigured live), an occupancy
-        # panel's is the DetectProcessor (its detect settings).  Each field is
-        # PREFILLED with the CURRENT value (with a
-        # "now: X" reference), and Apply pushes the edits to the source in place.
-        # The producing node's editable parameters.  Shown whenever there is no
-        # swept-measurement / processor form above (which already IS the node's
-        # param form): a PLOT panel edits its upstream source here (camera exposure
-        # / detect settings); a CAMERA measurement panel edits the camera itself;
-        # a TASK panel edits the task's parameters (its Apply re-runs the task).
-        if spec is None and proc_spec is None:
-            self._feed = console._producing_feed(card)
-            for name, current in console._feed_params(self._feed):
-                if not self._feed_widgets:
-                    section("Acquisition")
-                edit = FluentLineEdit(_py_to_text(current))
-                # EXPAND to fill the row (stretch=1), not a fixed 110 px: a value
-                # like a 4-int ROI [1648, 64, 1144, 64] was clipped while the right
-                # half of the page sat empty.  The edit takes the slack; the live
-                # "now:" reference trails it.  (cutoff is a core rule.)
-                edit.setMinimumWidth(scaled_px(150, minimum=120))
-                self._feed_widgets[name] = edit
-                now = labeled(f"now: {_py_to_text(current)}")
-                self._feed_now_labels[name] = now
-                holder = QtWidgets.QWidget()
-                hl = QtWidgets.QHBoxLayout(holder)
-                hl.setContentsMargins(0, 0, 0, 0)
-                hl.setSpacing(scaled_px(6, minimum=4))
-                hl.addWidget(edit, 1)
-                hl.addWidget(now, 0)
-                # widest feed-param label is "calibration_frames" (18 chars) --
-                # 150 clipped its trailing 's'; 170 fits the longest name in full.
-                col.addWidget(FluentSettingRow(name, holder, label_width=scaled_px(170, minimum=140)))
-            if self._feed_widgets:
-                # A task is a one-shot orchestration -> "Run" (apply params + run it);
-                # a streaming source (camera / detect) -> "Apply" (reconfigure live).
-                is_task = card.config.role == "task"
-                self.feed_restart_button = FluentButton("Run" if is_task else "Apply", color=ACCENT)
-                self.feed_restart_button.setToolTip(
-                    "Run the task with these parameters (watch its mid-run output panel)."
-                    if is_task else
-                    "Apply the edited acquisition parameters to the data source in place\n"
-                    "(reconfigure the camera live, or re-calibrate) -- the panel keeps streaming.")
-                self.feed_restart_button.clicked.connect(self._restart_feed)
-                col.addWidget(self.feed_restart_button)
+        # panel.  A panel is a VIEW; the LOGIC NODE whose published signals it reads
+        # declares what its source exposes via acquisition_parameters() -- a
+        # raw-frame panel reads the camera Measurement (exposure / ROI), an
+        # occupancy panel reads the DetectProcessor.  Each field is PREFILLED with
+        # the CURRENT value (with a "now: X" reference); Apply pushes the edit to
+        # that source IN PLACE (it does not start anything -- the node is started
+        # from its own Logic-tab Edit).
+        self._node = console._producing_node(card)
+        for name, current in console._node_params(self._node):
+            if not self._node_widgets:
+                section("Acquisition")
+            edit = FluentLineEdit(_py_to_text(current))
+            # EXPAND to fill the row (stretch=1), not a fixed 110 px: a value
+            # like a 4-int ROI [1648, 64, 1144, 64] was clipped while the right
+            # half of the page sat empty.  The edit takes the slack; the live
+            # "now:" reference trails it.  (cutoff is a core rule.)
+            edit.setMinimumWidth(scaled_px(150, minimum=120))
+            self._node_widgets[name] = edit
+            now = labeled(f"now: {_py_to_text(current)}")
+            self._node_now_labels[name] = now
+            holder = QtWidgets.QWidget()
+            hl = QtWidgets.QHBoxLayout(holder)
+            hl.setContentsMargins(0, 0, 0, 0)
+            hl.setSpacing(scaled_px(6, minimum=4))
+            hl.addWidget(edit, 1)
+            hl.addWidget(now, 0)
+            # widest node-param label is "calibration_frames" (18 chars) --
+            # 150 clipped its trailing 's'; 170 fits the longest name in full.
+            col.addWidget(FluentSettingRow(name, holder, label_width=scaled_px(170, minimum=140)))
+        if self._node_widgets:
+            self.node_apply_button = FluentButton("Apply", color=ACCENT)
+            self.node_apply_button.setToolTip(
+                "Apply the edited acquisition parameters to the data source in place\n"
+                "(reconfigure the camera live) -- the panel keeps streaming.")
+            self.node_apply_button.clicked.connect(self._restart_node)
+            col.addWidget(self.node_apply_button)
 
         # ---- Parameters: the PLOT's own tunable API params as GUI controls,
         # auto-discovered from the kind's declarative specs.  Each edit re-renders
@@ -1846,13 +1799,12 @@ class PanelEditor(QtWidgets.QWidget):
         self.canvas_holder.setContentsMargins(0, 0, 0, 0)
         col.addLayout(self.canvas_holder)
 
-        # Fit + manual limits: a PLOT-role concern only.  A measurement / task
-        # node's Edit (role != "plot") deliberately carries no curve fit -- fitting
+        # Fit + manual limits are a PLOT concern (and a plot panel is always
+        # role "plot", so they always build here).  A LOGIC NODE's Edit (on the
+        # Logic tab, a LogicNodeEditor) deliberately carries no curve fit -- fitting
         # a curve is a plotter action, so you Add a Plot panel pointed at the
-        # measurement's result signals for that (its plotter Edit auto-carries the
-        # producing measurement's param form, see _spec_for_card).  This is the
-        # role gate that honours #3 ("measurement Edit, no fit") while keeping
-        # #176 (a PLOT exposes the FULL DataFigure model set) intact.
+        # signals the node publishes for that.  A PLOT keeps the FULL DataFigure
+        # model set (#176).
         if is_plot:
             # DataFigure picks the 1D / 2D path from the snapshot, so a 2D image
             # fits the 2D-Gaussian "2D center" model and lines fit the rest.  Same
@@ -1992,7 +1944,7 @@ class PanelEditor(QtWidgets.QWidget):
         # writes the region the user marked back to the source's parameters.  The
         # selector / zoom is a GENERIC interface -- it only ever yields the
         # rectangle (endpoints) / view limits in plot coords; the SOURCE converts
-        # that to its own format (a measurement -> scan range; a camera feed ->
+        # that to its own format (a measurement -> scan range; a camera node ->
         # ROI; a 2-D scan -> axis ranges), so no device shape leaks into the GUI.
         # The SAME callback is bound to BOTH the zoom/scroll AND the area selector:
         # ZOOM/PAN updates from the view limits, the area selector OVERRIDES when
@@ -2001,9 +1953,10 @@ class PanelEditor(QtWidgets.QWidget):
         area = getattr(self._plotter, "area", None)
         zoom = getattr(self._plotter, "zoom", None)
         writeback = None
-        if self.meas_panel is not None:
-            writeback = self._read_scan_range
-        elif kind == "2d" and self._feed is not None:
+        # A plot is a pure view: the only writeback a plot Edit does is a 2D
+        # region select back to its upstream camera node's ROI (a 1D scan-range
+        # writeback belongs to the measurement's OWN Logic-tab Edit, not here).
+        if kind == "2d" and self._node is not None:
             writeback = self._read_region
         if writeback is not None:
             if area is not None:
@@ -2021,24 +1974,10 @@ class PanelEditor(QtWidgets.QWidget):
             self.card._set_param(key, value)
         self.rebuild()
 
-    def _selected_xrange(self):
-        """Confocal precedence (the X view): the area selection if one is drawn,
-        ELSE the current axis view limits (from zoom/pan).  Returns (lo, hi)
-        sorted, or (None, None).  This is what makes scroll-zoom alone set the
-        range, with a drag-rectangle overriding it."""
-        plotter = self._plotter
-        if plotter is None or plotter.ax is None:
-            return (None, None)
-        area = getattr(plotter, "area", None)
-        if area is not None and area.range[0] is not None:
-            return (float(area.range[0]), float(area.range[1]))
-        lo, hi = sorted(float(v) for v in plotter.ax.get_xlim())
-        return (lo, hi)
-
     def _selected_rect(self):
-        """2D analogue of :meth:`_selected_xrange`: the area rectangle if drawn,
-        ELSE the current view box (x AND y view limits).  Returns
-        (xlo, xhi, ylo, yhi) sorted, or all None."""
+        """The area rectangle if one is drawn, ELSE the current view box (x AND y
+        view limits).  Returns (xlo, xhi, ylo, yhi) sorted, or all None -- so
+        scroll-zoom alone sets the region, with a drag-rectangle overriding it."""
         plotter = self._plotter
         if plotter is None or plotter.ax is None:
             return (None, None, None, None)
@@ -2050,20 +1989,6 @@ class PanelEditor(QtWidgets.QWidget):
         ylo, yhi = sorted(float(v) for v in plotter.ax.get_ylim())
         return (xlo, xhi, ylo, yhi)
 
-    def _read_scan_range(self) -> None:
-        """Confocal ``_read_range``: ZOOM/PAN or an area SELECTION on the Edit plot
-        fills this measurement's scan x-range Min/Max -- the NEXT scan's range.
-        Scroll-zoom to narrow, or drag a rectangle to pin it exactly (the
-        selection overrides the view); then Start re-scans just that range.  No-op
-        without a measurement form."""
-        if self.meas_panel is None or self._plotter is None:
-            return
-        x1, x2 = self._selected_xrange()
-        if x1 is None:
-            return
-        if self.meas_panel.set_axis_range(x1, x2):
-            self.status.setText(f"scan range set from view: {x1:.4g} … {x2:.4g}")
-
     def _read_region(self) -> None:
         """Confocal ``_read_range`` for a 2D panel, GENERIC over the source.
 
@@ -2072,12 +1997,12 @@ class PanelEditor(QtWidgets.QWidget):
         selection overrides the view box when drawn).  Those ENDPOINTS -- the only
         thing the selector knows -- are handed to the producing source via
         ``region_to_acquisition_parameters``; the SOURCE converts them to its own
-        Acquisition parameters (a camera feed -> a ROI rectangle; a 2-D scan ->
+        Acquisition parameters (a camera node -> a ROI rectangle; a 2-D scan ->
         axis ranges).  Whatever fields it names are filled in the Edit form, then
         Apply pushes them.  The frontend encodes NO device-specific shape."""
-        if self._feed is None or self._plotter is None:
+        if self._node is None or self._plotter is None:
             return
-        convert = getattr(self._feed, "region_to_acquisition_parameters", None)
+        convert = getattr(self._node, "region_to_acquisition_parameters", None)
         if convert is None:
             return
         x1, x2, y1, y2 = self._selected_rect()
@@ -2086,78 +2011,78 @@ class PanelEditor(QtWidgets.QWidget):
         params = convert(x1, x2, y1, y2) or {}
         filled = {}
         for name, value in params.items():
-            edit = self._feed_widgets.get(name)
+            edit = self._node_widgets.get(name)
             if edit is not None:
                 edit.setText(_py_to_text(value))
                 filled[name] = value
         if filled:
             self.status.setText(f"region from view: {filled} — Apply to use it")
 
-    def refresh_feed_now_labels(self) -> None:
+    def refresh_node_now_labels(self) -> None:
         """Update the 'now: <value>' references beside each Acquisition field to the
         source's CURRENT values.  The console calls this each tick for the visible
         Edit tab (one general hook, not a per-field signal), so after the loop
         applies a queued edit the references catch up on their own -- no manual
         wiring per parameter, and the frozen snapshot / Refresh / Fit controls are
         untouched."""
-        if self._feed is None or not self._feed_now_labels:
+        if self._node is None or not self._node_now_labels:
             return
-        for name, current in self.console._feed_params(self._feed):
-            label = self._feed_now_labels.get(name)
+        for name, current in self.console._node_params(self._node):
+            label = self._node_now_labels.get(name)
             if label is not None:
                 label.setText(f"now: {_py_to_text(current)}")
 
-    def _restart_feed(self) -> None:
+    def _restart_node(self) -> None:
         """Apply the edited Acquisition params to the data source, routed through the
-        feed's safe entry (queued + applied BETWEEN shots in the loop's own thread,
+        node's safe entry (queued + applied BETWEEN shots in the loop's own thread,
         never a GUI-thread stop/start); Apply also STARTs an idle source so it goes
         live.
 
-        Re-snapshot timing is the subtle part.  An IDLE feed applies + publishes the
+        Re-snapshot timing is the subtle part.  An IDLE node applies + publishes the
         new-param frame SYNCHRONOUSLY (inside ``apply_acquisition_parameters``), so we
-        refresh + re-snapshot right away.  A RUNNING feed only publishes the new-param
+        refresh + re-snapshot right away.  A RUNNING node only publishes the new-param
         frame on its NEXT loop iteration, so reading the hub now would snapshot the
-        STALE pre-edit frame -- so we wait for the feed's acquisition epoch to advance
+        STALE pre-edit frame -- so we wait for the node's acquisition epoch to advance
         (the first frame computed with the new params is on the hub) and re-snapshot
         THAT, polled off the GUI critical path (no acquire from this thread)."""
-        if self._feed is None:
+        if self._node is None:
             return
-        new_params = {name: _text_to_py(w.text()) for name, w in self._feed_widgets.items()}
-        running = bool(getattr(self._feed, "running", False))
-        epoch0 = int(getattr(self._feed, "acquisition_epoch", lambda: 0)())
+        new_params = {name: _text_to_py(w.text()) for name, w in self._node_widgets.items()}
+        running = bool(getattr(self._node, "running", False))
+        epoch0 = int(getattr(self._node, "acquisition_epoch", lambda: 0)())
         try:
-            self.console._restart_feed(self._feed, new_params)
+            self.console._restart_node(self._node, new_params)
         except Exception as exc:
             self.status.setText(f"apply failed: {str(exc).splitlines()[0][:120]}")
             return
-        self.refresh_feed_now_labels()        # reuse the same refresh the tick uses
+        self.refresh_node_now_labels()        # reuse the same refresh the tick uses
         if running:
             # queued: the loop has not yet produced a new-param frame -- defer the snapshot
             self.status.setText("acquisition parameters queued — Monitor updates on the next frame")
-            self._await_fresh_frame(self._feed, epoch0)
+            self._await_fresh_frame(self._node, epoch0)
         else:
             # idle: apply published a fresh frame synchronously, so it is already here
             self.console.refresh_once()
             self.status.setText("acquisition started with the new parameters")
             self.rebuild()
 
-    def _await_fresh_frame(self, feed, epoch0: int, *, _tries: int = 0) -> None:
-        """Poll (off the GUI critical path) until the running feed has published its
+    def _await_fresh_frame(self, node, epoch0: int, *, _tries: int = 0) -> None:
+        """Poll (off the GUI critical path) until the running node has published its
         FIRST frame computed with the just-queued params -- detected by its
         ``acquisition_epoch`` advancing past ``epoch0`` -- then refresh + re-snapshot
-        the Edit panel.  Bounded so a wedged/slow feed never spins forever (it falls
-        back to a refresh after the cap).  Aborts if the editor moved to another feed
+        the Edit panel.  Bounded so a wedged/slow node never spins forever (it falls
+        back to a refresh after the cap).  Aborts if the editor moved to another node
         or was torn down."""
-        if self._feed is not feed or feed is None:
+        if self._node is not node or node is None:
             return
-        epoch = int(getattr(feed, "acquisition_epoch", lambda: epoch0 + 1)())
+        epoch = int(getattr(node, "acquisition_epoch", lambda: epoch0 + 1)())
         if epoch > epoch0 or _tries >= 600:    # ~600 * 25 ms = 15 s safety cap
             self.console.refresh_once()
-            self.refresh_feed_now_labels()
+            self.refresh_node_now_labels()
             self.rebuild()
             return
         from PyQt5 import QtCore
-        QtCore.QTimer.singleShot(25, lambda: self._await_fresh_frame(feed, epoch0, _tries=_tries + 1))
+        QtCore.QTimer.singleShot(25, lambda: self._await_fresh_frame(node, epoch0, _tries=_tries + 1))
 
     def _df_for(self):
         from .data_figure import DataFigure
@@ -2257,6 +2182,114 @@ class _PanelBoard(QtWidgets.QWidget):
         self.setMinimumSize(max_x + _GRID_GAP, max_y + _GRID_GAP)
 
 
+# ====================================================================== logic tab
+class LogicNodeRow(FluentFrame):
+    """One LOGIC NODE's row on the Logic tab: a status COLOUR dot + its name + an
+    Edit button.  The dot follows the node's run state (grey=stopped,
+    green=running, red=error), confocal's tab-icon colour map applied to a list
+    row instead of a tab.  The whole node lifecycle (param form + Start / Stop) is
+    in its Edit tab (a :class:`LogicNodeEditor`); this row is the at-a-glance
+    status + the way IN to that Edit."""
+
+    edit_requested = QtCore.pyqtSignal(object)     # "Edit" -> open the node's Edit tab
+    remove_requested = QtCore.pyqtSignal(object)
+
+    # confocal gui_combine colour map (INIT=grey / RUNNING=green / STOP/ERROR=red).
+    STATE_COLORS = {"stopped": GREY, "running": GREEN, "error": RED}
+
+    def __init__(self, node: LogicNodeConfig, parent=None):
+        super().__init__(parent, shadow=True)
+        self.node = node
+        self.setFixedHeight(scaled_px(44, minimum=36))
+        row = QtWidgets.QHBoxLayout(self)
+        row.setContentsMargins(scaled_px(12), scaled_px(6), scaled_px(12), scaled_px(6))
+        row.setSpacing(scaled_px(10, minimum=6))
+        self.dot = FluentStatusDot(size=14)
+        self.dot.set_color(GREY)
+        self.name_label = FluentLabel(node.title)
+        self.kind_label = FluentLabel(f"({node.kind})")
+        self.kind_label.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+        self.status_label = FluentLabel("stopped")
+        self.status_label.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+        edit_button = FluentButton("Edit", color=ACCENT)
+        edit_button.setFixedWidth(scaled_px(64, minimum=52))
+        edit_button.clicked.connect(lambda: self.edit_requested.emit(self))
+        remove = FluentButton("Remove", color=ORANGE)
+        remove.setFixedWidth(scaled_px(72, minimum=58))
+        remove.clicked.connect(lambda: self.remove_requested.emit(self))
+        row.addWidget(self.dot, 0)
+        row.addWidget(self.name_label, 0)
+        row.addWidget(self.kind_label, 0)
+        row.addWidget(self.status_label, 1)
+        row.addWidget(edit_button, 0)
+        row.addWidget(remove, 0)
+
+    def set_state(self, state: str, *, status: str = "") -> None:
+        """Reflect the node's run state on the dot + status text."""
+        self.dot.set_color(self.STATE_COLORS.get(state, GREY))
+        self.status_label.setText(status or state)
+        colour = RED if state == "error" else GREY
+        self.status_label.setStyleSheet(f"color: {colour}; background: transparent; border: none;")
+
+
+class LogicNodeEditor(QtWidgets.QWidget):
+    """One logic node's Edit tab (closable): its auto-generated PARAM FORM + Start /
+    Stop + a status line.  NO curve fit -- fitting a curve is a plotter concern (add
+    a Plot panel on the Monitor board pointed at the signals this node publishes).
+
+    The param form reuses :class:`MeasurementPanel` (single-spec): a camera /
+    measurement / processor / task all expose ``.name`` + ``.params`` (ParamDecls),
+    so the same form engine + Start / Stop signals drive every logic kind.  The
+    camera live Measurement's spec is ``readout.camera_spec()`` (its ParamDecls are
+    the camera's exposure / frames-per-cycle)."""
+
+    def __init__(self, row: "LogicNodeRow", console: "TaskConsole", spec, parent=None):
+        super().__init__(parent)
+        self.row = row
+        self.console = console
+        self.spec = spec
+        self.setStyleSheet("background: transparent;")
+
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = FluentScrollArea()
+        scroll.setWidgetResizable(True)
+        outer.addWidget(scroll)
+        page = QtWidgets.QWidget()
+        page.setStyleSheet("background: transparent;")
+        scroll.setWidget(page)
+        col = QtWidgets.QVBoxLayout(page)
+        m = scaled_px(10, minimum=6)
+        col.setContentsMargins(m, m, m, m)
+        col.setSpacing(scaled_px(6, minimum=4))
+
+        col.addWidget(FluentSectionLabel(row.node.title))
+        # The auto-generated parameter form + Start / Stop (reused MeasurementPanel,
+        # which already carries start_requested(self) / stop_requested + the typed,
+        # no-eval form).  A spec drives a real ParamDecl form; the camera (spec is
+        # None) shows nothing here but Start/Stop still build/run the camera node.
+        self.form = MeasurementPanel([spec] if spec is not None else [], single=True)
+        self.form.seed_values(row.node.values or {})
+        self.form.start_requested.connect(lambda *_: self.console._start_logic_node(self.row))
+        self.form.stop_requested.connect(lambda: self.console._stop_logic_node(self.row))
+        col.addWidget(self.form)
+        col.addStretch(1)
+
+    def collect_values(self) -> dict:
+        return self.form.collect_values()
+
+    def set_running(self, running: bool) -> None:
+        self.form.set_running(running)
+
+    def set_status(self, text: str, *, error: bool) -> None:
+        self.form.set_status(text, error=error)
+
+    def teardown(self) -> None:
+        # No matplotlib resources here (a logic node never plots), so teardown is a
+        # no-op -- present so the console can treat it like a PanelEditor.
+        pass
+
+
 # ====================================================================== console
 class TaskConsole(QtWidgets.QWidget):
     """The dashboard window body: header bar + drag-and-snap panel board."""
@@ -2266,7 +2299,7 @@ class TaskConsole(QtWidgets.QWidget):
         *,
         hub,
         state: TaskConsoleState | None = None,
-        feeds: Sequence[object] = (),
+        running_nodes: Sequence[object] = (),
         measurements: Sequence[object] = (),
         processors: Sequence[object] = (),
         tasks: Sequence[object] = (),
@@ -2279,50 +2312,44 @@ class TaskConsole(QtWidgets.QWidget):
         set_fluent_scale(scale)
         super().__init__()
         self.hub = hub
-        self.feeds = list(feeds)
-        # The declarative measurement catalog (P5): with none, the Measurement
-        # section stays a disabled placeholder; with specs it becomes the
-        # auto-generated form + one-click Start.
+        # Nodes that are CURRENTLY running (their owner thread is publishing to
+        # the hub).  Populated on Start (``_start_logic_node``) and drained on Stop;
+        # an externally-supplied, already-running node may be adopted here too.
+        # This is DISTINCT from ``self.logic_nodes`` (the Logic-tab ROWS): a row is a
+        # declaration that exists whether or not its node is running.
+        self.running_nodes = list(running_nodes)
+        # The declarative measurement catalog: each becomes an addable LOGIC NODE
+        # (a swept measurement) on the Logic tab; with none, only the camera /
+        # processors / tasks are offered (and only plot kinds without a session).
         self.measurements = list(measurements)
-        # The declarative DATA-PROCESSING catalog (the discrete sibling of
-        # measurements): one-shot ProcessorSpecs.  Add Panel lists them under
-        # "Data processing"; picking one creates its result panel + Edit form whose
-        # Start runs the action once.
+        # The declarative DATA-PROCESSING catalog (reactive transform nodes) and the
+        # TASK catalog (one-shot orchestrations): each is an addable LOGIC NODE.
         self.processors = list(processors)
-        # The declarative TASK catalog (the orchestration tier): one-shot TaskSpecs.
-        # Add Panel lists them under "Task"; picking one builds the task over the
-        # session camera, drops its dedicated mid-run output panel, and runs it.
         self.tasks = list(tasks)
-        # The connected experiment session (optional): with it, Add Panel can build
-        # the loading readout from scratch -- "Data processing: Loading readout"
-        # composes a calibrate task + camera measurement + detect processor over the
-        # session camera so you build loading-rate / occupancy monitoring entirely
-        # from Add Panel + Edit (no pre-wired feed in the notebook).
+        # The connected experiment session (optional): with it, the camera live
+        # Measurement is offered too (readout.camera_measurement).
         self.session = session
-        self._proc_feeds: list = []     # one-shot ProcessorFeeds kept alive until done
-        self._active_proc_panel = None
-        self._meas_feed = None          # the ScannedMeasurementFeed of the active run
-        self._meas_spec = None
-        # The measurement form now lives in EACH measurement panel's own Edit tab
-        # (no global Control launcher); _active_meas_panel is the form that owns
-        # the running scan.  measurement_panel stays None (kept for the stop/poll
-        # fallback) since there is no single shared form any more.
-        self.measurement_panel = None
-        self.measurement_group = None
-        self.measurement_placeholder = None
         self.state = state or default_console_state()
         self.window_ratio = float(window_ratio)
         self._window_px = window_px
         self.cards: list[PanelCard] = []
+        # The Logic-tab nodes.  Each entry maps a LogicNodeRow -> the live state for
+        # that node: its built node (None until Started) + its Edit tab.
+        self.logic_nodes: list[LogicNodeRow] = []
+        self._logic_nodes: dict[int, object] = {}      # id(row) -> node (or None)
+        self._logic_editors: dict[int, "LogicNodeEditor"] = {}  # id(row) -> Edit tab
         self._last_version = -1
         self._building = False
         self._address: str | None = None
-        # Per-panel editors: one PanelEditor per opened panel, hosted as a
-        # closable tab (keyed by id(card)).  The measurement panel that started
-        # the active run (global launcher OR a per-panel editor) is tracked so
-        # poll/stop route their status to the right place.
+        # No-measurement / no-processor sentinels kept so older callers / tests that
+        # probe "is there a global measurement launcher" still read None (there is
+        # no global form -- a measurement is a Logic node now).
+        self.measurement_panel = None
+        self.measurement_group = None
+        self.measurement_placeholder = None
+        # Per-panel editors: one PanelEditor per opened PLOT panel, hosted as a
+        # closable tab (keyed by id(card)).
         self._panel_editors: dict[int, "PanelEditor"] = {}
-        self._active_meas_panel = None
 
         self._build_ui()
         self.load_state(self.state)
@@ -2361,30 +2388,20 @@ class TaskConsole(QtWidgets.QWidget):
         self.name_edit.setPlaceholderText("task name")
         self.name_edit.setFixedWidth(scaled_px(150, minimum=110))
         self.name_edit.textChanged.connect(self._mark_dirty)
-        self.preset_combo = FluentComboBox()
-        self.preset_combo.setFixedWidth(scaled_px(170, minimum=130))
-        self.preset_combo.setToolTip(
-            "Named task dashboards: built-ins plus every layout saved in tasks/.\n"
-            "Picking one loads it (Save stores the current design under its name).")
-        self._refresh_presets()
-        self.preset_combo.activated.connect(self._on_preset_pick)
         self.summary = FluentLineEdit("")
         self.summary.setEnabled(False)
 
         self.kind_combo = FluentComboBox()
-        # Add Panel surfaces EVERY architecture LAYER as an addable node, so the
-        # console builds the whole experiment from primitives:
-        #   * "Plot: X"        -- a pure VIEW wired to a hub signal (value = <key>);
-        #   * "Measurement: X" -- an acquisition node: the continuous CAMERA live
-        #                         stream, or a swept measurement (temperature, ...);
-        #   * "Processor: Y"   -- a reactive transform node (the "func" layer, e.g.
-        #                         per-frame detect / per-site fidelity);
-        #   * "Task: Z"        -- a one-shot orchestration (e.g. calibrate readout),
-        #                         with Run + a mid-run output panel;
-        #   * "Readout: Loading" -- the one-click COMPOSITE (camera + detect +
-        #                         calibrate wired together).
-        # Picking a non-plot entry + Add Panel creates its node + panel and opens its
-        # Edit tab (the auto-generated parameter form).
+        # Add Panel offers EXACTLY the four kinds the user designs with -- nothing
+        # invented, no composite:
+        #   * "Plot: X"        -- a pure VIEW; shows nothing until you wire a hub
+        #                         signal in its Setting (it NEVER starts anything);
+        #   * "Measurement: X" -- an acquisition logic node (the camera live stream,
+        #                         or a swept measurement) added to the LOGIC tab;
+        #   * "Processor: Y"   -- a reactive transform logic node (the "func" layer);
+        #   * "Task: Z"        -- a one-shot orchestration logic node (e.g. calibrate).
+        # A logic node (measurement/processor/task) is added STOPPED to the Logic tab;
+        # you Start/Stop it from its own Edit.  A plot is added to the Monitor board.
         readout = getattr(self.session, "readout", None)
         for key, label in PANEL_KINDS.items():
             self.kind_combo.addItem(f"Plot: {label}", key)
@@ -2400,9 +2417,6 @@ class TaskConsole(QtWidgets.QWidget):
         # TASK layer: one-shot orchestrations from the auto-discovered task catalog.
         for spec in self.tasks:
             self.kind_combo.addItem(f"Task: {spec.name}", ("task", spec.name))
-        # COMPOSITE: the one-click whole loading readout (camera + detect + calibrate).
-        if readout is not None and hasattr(readout, "live_loading_readout"):
-            self.kind_combo.addItem("Readout: Loading (camera+detect+calibrate)", ("live", "loading"))
         self.kind_combo.setFixedWidth(scaled_px(170, minimum=130))
         add_button = FluentButton("Add Panel", color=ACCENT)
         add_button.clicked.connect(self._add_panel)
@@ -2411,17 +2425,19 @@ class TaskConsole(QtWidgets.QWidget):
         load_button = FluentButton("Load", color=ORANGE)
         load_button.clicked.connect(self.load_from_file)
 
-        for widget in (self.status_dot, self.name_edit, self.preset_combo):
+        for widget in (self.status_dot, self.name_edit):
             header.addWidget(widget)
         header.addWidget(self.summary, 1)
         for widget in (self.kind_combo, add_button, self.save_button, load_button):
             header.addWidget(widget)
         root.addWidget(header_frame)
 
-        # ONE permanent tab: Monitor = the live drag-and-snap panel grid.
-        # Measurements are launched from the header's Add Panel (no Control tab);
-        # each panel's Edit... opens its OWN closable tab (a PanelEditor) carrying
-        # that panel's params / fit / limits / save / re-run (+ Measurement form).
+        # TWO permanent tabs:
+        #   * Monitor -- the live drag-and-snap board of PLOT panels (pure views);
+        #   * Logic   -- the list of LOGIC NODES (measurement / processor / task),
+        #               each a row with a status dot + Edit.
+        # A plot panel's Edit and a logic node's Edit each open their OWN closable
+        # tab beside these two.
         self.tabs = FluentTabWidget()
         dash_tab = QtWidgets.QWidget()
         dash_tab.setStyleSheet("background: transparent;")
@@ -2433,6 +2449,31 @@ class TaskConsole(QtWidgets.QWidget):
         self.scroll.setWidget(self.board)
         dash_layout.addWidget(self.scroll, 1)
         self.tabs.add_permanent_tab(dash_tab, "Monitor")
+
+        # Logic tab: a scrolled top-packed column of LogicNodeRow cards.
+        logic_tab = QtWidgets.QWidget()
+        logic_tab.setStyleSheet("background: transparent;")
+        logic_outer = QtWidgets.QVBoxLayout(logic_tab)
+        logic_outer.setContentsMargins(0, 0, 0, 0)
+        self.logic_scroll = FluentScrollArea()
+        self.logic_scroll.setWidgetResizable(True)
+        logic_body = QtWidgets.QWidget()
+        logic_body.setStyleSheet("background: transparent;")
+        self.logic_layout = QtWidgets.QVBoxLayout(logic_body)
+        lm = scaled_px(10, minimum=6)
+        self.logic_layout.setContentsMargins(lm, lm, lm, lm)
+        self.logic_layout.setSpacing(scaled_px(8, minimum=5))
+        self.logic_hint = FluentLabel(
+            "No logic nodes yet.  Add a Measurement / Processor / Task from the header "
+            "(it starts STOPPED); open its Edit to set parameters and Start it.")
+        self.logic_hint.setWordWrap(True)
+        self.logic_hint.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+        self.logic_layout.addWidget(self.logic_hint)
+        self.logic_layout.addStretch(1)
+        self.logic_scroll.setWidget(logic_body)
+        logic_outer.addWidget(self.logic_scroll, 1)
+        self.tabs.add_permanent_tab(logic_tab, "Logic")
+
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.tabs.tab_close_requested.connect(self._on_editor_tab_closed)
         root.addWidget(self.tabs, 1)
@@ -2443,6 +2484,7 @@ class TaskConsole(QtWidgets.QWidget):
             name=self.name_edit.text().strip() or "task",
             interval_ms=self.state.interval_ms,
             panels=[card.config for card in self.cards],
+            logic=[row.node for row in self.logic_nodes],
         )
 
     def load_state(self, state: TaskConsoleState) -> None:
@@ -2455,10 +2497,14 @@ class TaskConsole(QtWidgets.QWidget):
                 card.setParent(None)
                 card.deleteLater()
             self.cards = []
+            for row in list(self.logic_nodes):
+                self._remove_logic_node(row, _rebuild=False)
             self.name_edit.setText(state.name)
             for config in state.panels:
                 self._attach_card(PanelCard(config, parent=self.board,
                                             names_provider=self.hub.names))
+            for node in state.logic:
+                self._attach_logic_node(node)    # always STOPPED -- Start is manual
             self._arrange()
         finally:
             self._building = False
@@ -2475,44 +2521,13 @@ class TaskConsole(QtWidgets.QWidget):
         self.cards.append(card)
 
     # ----------------------------------------------------------------- control
-    def _spec_for_card(self, card: "PanelCard"):
-        """The MeasurementSpec behind a panel, so its Edit can carry that
-        measurement's parameter form.
-
-        Two ways a panel is bound to a measurement:
-          * EXPLICITLY -- a measurement-role result panel records
-            ``params["measurement"]`` (created by Add Panel -> "Measurement: X");
-          * BY SIGNAL -- a PLOT panel whose source expression reads a measurement's
-            result signals (its x/y keys) is, for the user, "the plotter of that
-            measurement", so its plotter Edit gets the measurement's param form too
-            (#3: the plotter Edit has fit AND the corresponding measurement's edit).
-        Returns None for a panel touching no measurement signal."""
-        name = card.config.params.get("measurement")
-        if name:
-            return next((s for s in self.measurements if getattr(s, "name", None) == name), None)
-        refs = self._referenced_signals(card.config.source)
-        if not refs:
-            return None
-        for spec in self.measurements:
-            keys = {str(getattr(spec, "x_key", "")), str(getattr(spec, "y_key", ""))}
-            if refs & (keys - {""}):
-                return spec
-        return None
-
-    def _processor_spec_for_card(self, card: "PanelCard"):
-        """The ProcessorSpec a result panel came from (None for plain panels)."""
-        name = card.config.params.get("processor")
-        if not name:
-            return None
-        return next((s for s in self.processors if getattr(s, "name", None) == name), None)
-
-    # ---- producing-feed discovery: a panel's data comes from a producer; its Edit
-    # exposes THAT producer's acquisition parameters (e.g. a raw-frame panel is
+    # ---- producing-node discovery: a panel's data comes from a logic node; its Edit
+    # exposes THAT node's acquisition parameters (e.g. a raw-frame panel is
     # produced by the camera measurement -> exposure / roi).
     @staticmethod
     def _referenced_signals(source: str) -> set:
         """The hub signal names a panel's source expression reads (AST Name nodes
-        minus the namespace builtins) -- used to map the panel to its feed."""
+        minus the namespace builtins) -- used to map the panel to its node."""
         import ast
         try:
             tree = ast.parse(str(source or ""), mode="exec")
@@ -2521,77 +2536,77 @@ class TaskConsole(QtWidgets.QWidget):
         names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
         return names - {"np", "numpy", "math", "history", "latest", "names", "shot", "value"}
 
-    def _producing_feed(self, card: "PanelCard"):
-        """The feed whose published signals the panel's source reads (None if the
-        expression touches no feed signal, e.g. a pure constant)."""
+    def _producing_node(self, card: "PanelCard"):
+        """The running node whose published signals the panel's source reads (None if
+        the expression touches no published signal, e.g. a pure constant)."""
         refs = self._referenced_signals(card.config.source)
         if not refs:
             return None
-        for feed in self.feeds:
-            published = feed.published_signals() if hasattr(feed, "published_signals") else frozenset()
+        for node in self.running_nodes:
+            published = node.published_signals() if hasattr(node, "published_signals") else frozenset()
             if refs & set(published):
-                return feed
+                return node
         return None
 
     @staticmethod
-    def _feed_params(feed) -> list:
+    def _node_params(node) -> list:
         """``[(name, current_value)]`` for the editable parameters of the data
-        SOURCE behind ``feed`` -- a camera's exposure/ROI, or the feed's own
-        analysis settings.  The feed declares them via ``acquisition_parameters()``
+        SOURCE behind ``node`` -- a camera's exposure/ROI, or the node's own
+        analysis settings.  The node declares them via ``acquisition_parameters()``
         (the source decides what is tunable, not __init__ reflection)."""
-        if feed is None or not hasattr(feed, "acquisition_parameters"):
+        if node is None or not hasattr(node, "acquisition_parameters"):
             return []
-        return list(feed.acquisition_parameters().items())
+        return list(node.acquisition_parameters().items())
 
     @staticmethod
-    def _producer_label(feed) -> str:
-        """Short LAYER name for a producer (camera / detect / calibrate / a
+    def _node_label(node) -> str:
+        """Short LAYER name for a node (camera / detect / calibrate / a
         measurement's curve), NOT the Python class name -- the dashboard speaks in
-        the architecture's layers, so no "Feed" class name ever leaks into the UI."""
-        label = getattr(feed, "display_label", None)
+        the architecture's layers, so no class name ever leaks into the UI."""
+        label = getattr(node, "display_label", None)
         if label:
             return str(label)
-        return str(getattr(feed, "prefix", "") or type(feed).__name__)
+        return str(getattr(node, "prefix", "") or type(node).__name__)
 
     def _signal_providers(self) -> dict:
-        """``name -> [producer labels]`` for every signal currently published, so a
-        name carried by MORE THAN ONE producer can be flagged as ambiguous."""
+        """``name -> [node labels]`` for every signal currently published, so a
+        name carried by MORE THAN ONE node can be flagged as ambiguous."""
         providers: dict[str, list] = {}
-        for feed in self.feeds:
-            if not hasattr(feed, "published_signals"):
+        for node in self.running_nodes:
+            if not hasattr(node, "published_signals"):
                 continue
-            label = self._producer_label(feed)
-            for name in feed.published_signals():
+            label = self._node_label(node)
+            for name in node.published_signals():
                 providers.setdefault(str(name), []).append(label)
         return providers
 
-    def _producer_for_signal(self, name: str):
-        """The first feed that PUBLISHES signal ``name`` (None if none does)."""
-        for feed in self.feeds:
-            if hasattr(feed, "published_signals") and name in feed.published_signals():
-                return feed
+    def _node_for_signal(self, name: str):
+        """The first running node that PUBLISHES signal ``name`` (None if none does)."""
+        for node in self.running_nodes:
+            if hasattr(node, "published_signals") and name in node.published_signals():
+                return node
         return None
 
-    def _producer_chain(self, feed, _seen=None) -> list:
-        """The upstream producer chain that ends at ``feed`` (oldest first) -- the
+    def _node_chain(self, node, _seen=None) -> list:
+        """The upstream node chain that ends at ``node`` (oldest first) -- the
         who -> who -> who signal flow.
 
-        e.g. ``[CameraFrameFeed, DetectProcessor]`` for a panel reading detect's
+        e.g. ``[CameraMeasurement, DetectProcessor]`` for a panel reading detect's
         outputs: the camera Measurement produces ``frame``, the DetectProcessor
         CONSUMES it to produce occupancy/rate.  A Processor declares its inputs via
         ``consumes``; a Measurement / Task has no hub inputs (its source is the
-        device), so the chain bottoms out there.  Traced purely from the live feeds
-        -- no extra bookkeeping in the hub."""
+        device), so the chain bottoms out there.  Traced purely from the running
+        nodes -- no extra bookkeeping in the hub."""
         _seen = set() if _seen is None else _seen
-        label = self._producer_label(feed)
-        if id(feed) in _seen:
+        label = self._node_label(node)
+        if id(node) in _seen:
             return [label]                       # cycle guard
-        _seen.add(id(feed))
+        _seen.add(id(node))
         chain: list = []
-        for name in getattr(feed, "consumes", ()):
-            upstream = self._producer_for_signal(name)
-            if upstream is not None and upstream is not feed:
-                for lab in self._producer_chain(upstream, _seen):
+        for name in getattr(node, "consumes", ()):
+            upstream = self._node_for_signal(name)
+            if upstream is not None and upstream is not node:
+                for lab in self._node_chain(upstream, _seen):
                     if lab not in chain:
                         chain.append(lab)
         chain.append(label)
@@ -2599,11 +2614,11 @@ class TaskConsole(QtWidgets.QWidget):
 
     def _refresh_signal_info(self) -> None:
         """Give every panel a legend (shown in its footer) of what it READS from the
-        hub, the upstream producer FLOW it reads from (who -> who -> who) and what the
-        terminal producer PROVIDES, plus any read whose name is published by more than
-        one producer (ambiguous) -- so the hub namespace + signal flow is legible
+        hub, the upstream node FLOW it reads from (who -> who -> who) and what the
+        terminal node PROVIDES, plus any read whose name is published by more than
+        one node (ambiguous) -- so the hub namespace + signal flow is legible
         instead of a mystery.  Self-guarded: it recomputes only when the sources /
-        feeds / published names actually change, so it is free to call every tick."""
+        nodes / published names actually change, so it is free to call every tick."""
         providers = self._signal_providers()
         sig = (tuple(sorted((k, len(v)) for k, v in providers.items())),
                tuple((id(c), c.config.source) for c in self.cards))
@@ -2612,18 +2627,18 @@ class TaskConsole(QtWidgets.QWidget):
         self._signal_info_sig = sig
         for card in self.cards:
             reads = sorted(self._referenced_signals(card.config.source))
-            feed = self._producing_feed(card)
+            node = self._producing_node(card)
             parts: list[str] = []
             if reads:
                 parts.append("reads: " + ", ".join(reads))
-            if feed is not None and hasattr(feed, "published_signals"):
-                provides = sorted(str(n) for n in feed.published_signals())
+            if node is not None and hasattr(node, "published_signals"):
+                provides = sorted(str(n) for n in node.published_signals())
                 if provides:
                     # the full upstream chain (camera ▸ detect ▸ …) + the terminal
-                    # producer's LAYER, then what it publishes -- the signal flow +
-                    # which layer it comes from, at a glance (answers "feed 是哪一层").
-                    flow = " ▸ ".join(self._producer_chain(feed))
-                    layer = str(getattr(feed, "layer", ""))
+                    # node's LAYER, then what it publishes -- the signal flow +
+                    # which layer it comes from, at a glance (which layer a signal is from).
+                    flow = " ▸ ".join(self._node_chain(node))
+                    layer = str(getattr(node, "layer", ""))
                     head = f"from {flow} [{layer}]" if layer and layer != "node" else f"from {flow}"
                     parts.append(head + ": " + ", ".join(provides))
             dups = [n for n in reads if len(providers.get(n, [])) > 1]
@@ -2633,35 +2648,35 @@ class TaskConsole(QtWidgets.QWidget):
             # wraps within its own line instead of all jammed into one strip.
             card.set_signal_info("\n".join(parts))
 
-    def _restart_feed(self, feed, new_params: dict):
-        """Apply edited acquisition parameters to the producing feed so the
-        Monitor re-acquires under them.  This goes through the feed's SAFE entry
+    def _restart_node(self, node, new_params: dict):
+        """Apply edited acquisition parameters to the producing node so the
+        Monitor re-acquires under them.  This goes through the node's SAFE entry
         ``apply_acquisition_parameters``: while the acquisition loop runs it owns
         the source, so the edit is queued and the loop applies it BETWEEN shots
         (the source re-arms in its owner thread -- a streaming camera picks up the
         new ROI/exposure -- with no GUI-thread stall and no second ``acquire()``
         racing on one camera; an in-place reconfigure of a running stream would be
         ignored, while stopping/starting the thread from here would block the GUI
-        and could deadlock).  An idle feed is reconfigured and stepped once.
-        Returns the feed.  Raises if the feed has no editable acquisition params."""
-        if feed is None or not hasattr(feed, "apply_acquisition_parameters"):
+        and could deadlock).  An idle node is reconfigured and stepped once.
+        Returns the node.  Raises if the node has no editable acquisition params."""
+        if node is None or not hasattr(node, "apply_acquisition_parameters"):
             raise RuntimeError("this panel's data source exposes no editable acquisition parameters")
-        feed.apply_acquisition_parameters(**new_params)
+        node.apply_acquisition_parameters(**new_params)
         # Edit's Apply makes the source LIVE: if its acquisition loop is not
-        # running (a fresh feed, or one the user stopped), start it so the Monitor
-        # streams under the new params.  start() is idempotent, so a feed that is
+        # running (a fresh node, or one the user stopped), start it so the Monitor
+        # streams under the new params.  start() is idempotent, so a node that is
         # already running just keeps its loop (the edit was queued above).
-        if not getattr(feed, "running", False) and hasattr(feed, "start"):
-            feed.start(rate_hz=getattr(feed, "rate_hz", 5.0))
-        return feed
+        if not getattr(node, "running", False) and hasattr(node, "start"):
+            node.start(rate_hz=getattr(node, "rate_hz", 5.0))
+        return node
 
     def _edit_card(self, card: "PanelCard") -> None:
-        """Open (or focus) this panel's OWN closable Edit tab (a PanelEditor).
+        """Open (or focus) this PLOT panel's OWN closable Edit tab (a PanelEditor).
 
-        Opens even BEFORE the panel has data -- a measurement panel's Edit is
-        exactly where you set its parameters and press Start to PRODUCE the data,
-        and a plain panel's parameters are editable straight away.  The snapshot
-        section just shows "waiting for data" until a plot exists."""
+        Opens even BEFORE the panel has data -- the panel's plot params /
+        acquisition / fit / limits are editable straight away.  The snapshot
+        section just shows "waiting for data" until a plot exists (the data is
+        produced by a Logic-tab node, not by this Edit)."""
         if card is None:
             return
         existing = self._panel_editors.get(id(card))
@@ -2679,8 +2694,6 @@ class TaskConsole(QtWidgets.QWidget):
         editor = self._panel_editors.pop(id(card), None)
         if editor is None:
             return
-        if editor.meas_panel is not None and editor.meas_panel is self._active_meas_panel:
-            self._active_meas_panel = None     # don't write status to a deleted form
         index = self.tabs.indexOf(editor)
         if index >= 0:
             self.tabs.removeTab(index)
@@ -2689,19 +2702,21 @@ class TaskConsole(QtWidgets.QWidget):
         editor.deleteLater()
 
     def _on_editor_tab_closed(self, widget) -> None:
-        """X on a PanelEditor tab: tear it down + drop it from the registry.
-        The permanent Monitor tab carries no X, so it never arrives here."""
-        if not isinstance(widget, PanelEditor):
-            return
-        if widget.meas_panel is not None and widget.meas_panel is self._active_meas_panel:
-            self._active_meas_panel = None     # don't write status to a deleted form
+        """X on a PanelEditor / LogicNodeEditor tab: tear it down + drop it from the
+        registry.  The permanent Monitor / Logic tabs carry no X, so they never
+        arrive here.  A logic node's Edit only closes the TAB -- the node keeps
+        running and stays in the Logic list (reopen its Edit from its row)."""
         index = self.tabs.indexOf(widget)
         if index >= 0:
             self.tabs.removeTab(index)
         for key, editor in list(self._panel_editors.items()):
             if editor is widget:
                 del self._panel_editors[key]
-        widget.teardown()
+        for key, editor in list(self._logic_editors.items()):
+            if editor is widget:
+                del self._logic_editors[key]
+        if hasattr(widget, "teardown"):
+            widget.teardown()
         widget.setParent(None)
         widget.deleteLater()
 
@@ -2724,43 +2739,18 @@ class TaskConsole(QtWidgets.QWidget):
 
     # ------------------------------------------------------------------ actions
     def _add_panel(self) -> None:
+        """Header "Add Panel": add either a BLANK plot panel (a plot kind) or a
+        STOPPED logic node (camera / measurement / processor / task)."""
         data = self.kind_combo.currentData()
-        # A measurement entry: create (or focus) its result panel and open its
-        # Edit tab, where the auto-generated parameter form + Start live.
-        if isinstance(data, tuple) and len(data) == 2 and data[0] == "measurement":
-            spec = next((s for s in self.measurements if s.name == data[1]), None)
-            if spec is not None:
-                card = self._ensure_result_panel(spec)
-                self._edit_card(card)
+        # A node LAYER -> a STOPPED logic node on the Logic tab (camera /
+        # measurement / processor / task).  It publishes nothing until Started.
+        if isinstance(data, tuple) and len(data) == 2 and data[0] in LOGIC_KINDS:
+            kind, name = data
+            title = "Camera (live frames)" if kind == "camera" else str(name)
+            self._add_logic_node(LogicNodeConfig(kind=kind, name=name, title=title), focus=True)
             return
-        # A data-processing entry: create (or focus) its result panel and open its
-        # Edit tab, where the auto-generated parameter form + Start (run once) live.
-        if isinstance(data, tuple) and len(data) == 2 and data[0] == "processor":
-            spec = next((s for s in self.processors if s.name == data[1]), None)
-            if spec is not None:
-                card = self._ensure_processor_panel(spec)
-                self._edit_card(card)
-            return
-        # The continuous CAMERA measurement: a standalone live frame stream (the
-        # camera node on its own), with a 2-D image panel + an exposure/region Edit.
-        if isinstance(data, tuple) and len(data) == 2 and data[0] == "camera":
-            self._add_camera_measurement_panel()
-            return
-        # A TASK from the catalog: a one-shot orchestration with Run + a mid-run
-        # output panel showing its mid-run frames (confocal-task style).
-        if isinstance(data, tuple) and len(data) == 2 and data[0] == "task":
-            spec = next((s for s in self.tasks if s.name == data[1]), None)
-            if spec is not None:
-                self._add_task_panel(spec)
-            return
-        # A continuous live producer (loading readout): build the feed over the
-        # session camera, drop its landing view (the loading-rate monitor), and start
-        # it streaming.  You then freely Add Panel more views (occupancy site map =
-        # value = occupied, raw image = value = frame, per-site rate = value =
-        # rate_sites) wired to the signals it publishes.
-        if isinstance(data, tuple) and len(data) == 2 and data[0] == "live":
-            self._add_live_loading_panel()
-            return
+        # Otherwise a PLOT kind -> a BLANK pure-view panel on the Monitor board
+        # (decoupled: it shows nothing until a signal is picked in its Setting).
         kind = data or "1d"
         rows = max((c.config.row + c.config.rows for c in self.cards), default=0)
         config = PanelConfig(kind=str(kind), row=rows, col=0, size="1x2")
@@ -2780,398 +2770,209 @@ class TaskConsole(QtWidgets.QWidget):
             self._arrange()
             self._mark_dirty()
 
-    # --------------------------------------------------------- measurement (P5)
-    def _measurement_source(self, spec) -> str:
-        """The result panel's data source: an (N, 2) x-y curve grown by the feed
-        (col0 = x_key, col1 = y_key).  Both keys arrive together each shot."""
-        return (f"value = np.column_stack([np.atleast_1d({spec.x_key}), "
-                f"np.atleast_1d({spec.y_key})]) if '{spec.x_key}' in names() else np.zeros((1, 2))")
+    # ====================================================================== logic nodes
+    def _spec_for_logic(self, node: LogicNodeConfig):
+        """The declarative spec a logic node builds from -- it carries the node's
+        editable ParamDecls (so the Edit auto-form renders them) and a ``build``.
+        The camera's spec comes from ``readout.camera_spec()`` (its params are the
+        camera's exposure / frames-per-cycle), the others from the catalogs."""
+        if node.kind == "camera":
+            readout = getattr(self.session, "readout", None)
+            return readout.camera_spec() if readout is not None and hasattr(readout, "camera_spec") else None
+        if node.kind == "measurement":
+            return next((s for s in self.measurements if getattr(s, "name", None) == node.name), None)
+        if node.kind == "processor":
+            return next((s for s in self.processors if getattr(s, "name", None) == node.name), None)
+        if node.kind == "task":
+            return next((s for s in self.tasks if getattr(s, "name", None) == node.name), None)
+        return None
 
-    def _ensure_result_panel(self, spec) -> PanelCard:
-        """Find (or create) the 1-D Monitor panel that shows ``spec``'s curve.
+    def _attach_logic_node(self, node: LogicNodeConfig, *, focus: bool = False) -> "LogicNodeRow":
+        """Add a STOPPED logic-node row to the Logic tab (no node built yet)."""
+        row = LogicNodeRow(node)
+        row.edit_requested.connect(self._edit_logic_node)
+        row.remove_requested.connect(self._remove_logic_node)
+        # insert ABOVE the trailing stretch (the hint + stretch are the last 2 items)
+        self.logic_layout.insertWidget(self.logic_layout.count() - 1, row)
+        self.logic_nodes.append(row)
+        self._logic_nodes[id(row)] = None
+        self.logic_hint.hide()
+        if focus and hasattr(self.tabs, "setCurrentWidget"):
+            self._edit_logic_node(row)
+        return row
 
-        Reuses an existing card whose source already targets this spec's result
-        signals so repeated Start clicks update one panel rather than piling up;
-        otherwise adds a 1x2 line panel at the bottom of the board with the
-        spec's axis labels."""
-        source = self._measurement_source(spec)
-        for card in self.cards:
-            if card.config.kind == "1d" and card.config.params.get("measurement") == spec.name:
-                return card
-        rows = max((c.config.row + c.config.rows for c in self.cards), default=0)
-        xlabel, ylabel = spec.result_labels
-        config = PanelConfig(
-            kind="1d", title=spec.name, row=rows, col=0, size="1x2", source=source,
-            role="measurement",
-            params={"measurement": spec.name, "xy": True,
-                    "xlabel": xlabel, "ylabel": ylabel, "relim": "normal"},
-        )
-        card = PanelCard(config, parent=self.board, names_provider=self.hub.names)
-        self._attach_card(card)
-        self._arrange()
+    def _add_logic_node(self, node: LogicNodeConfig, *, focus: bool = True) -> "LogicNodeRow":
+        row = self._attach_logic_node(node, focus=focus)
         self._mark_dirty()
-        return card
+        return row
 
-    def _start_measurement(self, meas_panel) -> None:
-        """Start (or RE-RUN) a measurement from the given MeasurementPanel -- a
-        measurement panel's own Edit form.  Reads the spec +
-        param values off that panel; the scan streams into the spec's result
-        panel (created if missing, REUSED on re-run, so editing a panel's params
-        and hitting Start restarts that same Monitor panel)."""
-        spec = meas_panel.current_spec() if meas_panel is not None else None
-        if spec is None:
+    def _edit_logic_node(self, row: "LogicNodeRow") -> None:
+        """Open (or focus) a logic node's OWN closable Edit tab (param form + Start/Stop)."""
+        existing = self._logic_editors.get(id(row))
+        if existing is not None:
+            self.tabs.setCurrentWidget(existing)
             return
-        if self._meas_feed is not None and getattr(self._meas_feed, "running", False):
-            meas_panel.set_status("a measurement is already running -- Stop it first", error=True)
-            return
+        spec = self._spec_for_logic(row.node)
+        editor = LogicNodeEditor(row, self, spec)
+        # reflect the live run state on the form (a Started node reopened keeps Stop enabled)
+        node = self._logic_nodes.get(id(row))
+        editor.set_running(bool(getattr(node, "running", False)))
+        self._logic_editors[id(row)] = editor
+        self.tabs.add_closable_tab(editor, row.node.title)
+
+    def _start_logic_node(self, row: "LogicNodeRow") -> None:
+        """Build the node FROM the node's current param-form values with display
+        SUPPRESSED (it only publishes to the hub -- never opens a matplotlib plot),
+        register it in ``self.running_nodes``, and ``node.start(rate_hz=...)``.  Sets
+        the node's status dot green; on build/run error -> red + the error on the status
+        line.  Reuses the SAME node-build paths the real readout / notebook use."""
+        editor = self._logic_editors.get(id(row))
         try:
-            values = meas_panel.collect_values()
-            measurement = spec.build(**values)
-            # Lazy import (frontend stays decoupled from the neutral_atom backend
-            # at import time; the feed only ever touches the measurement contract
-            # + hub.publish, so it is guarded by test_virtual_equals_real_contract).
-            from Zou_lab_control.neutral_atom.operations.feeds import ScannedMeasurementFeed
-
-            feed = ScannedMeasurementFeed(
-                self.hub, measurement, x_key=spec.x_key, y_key=spec.y_key, grid_shape=spec.grid_shape,
-            )
-        except Exception as exc:
-            meas_panel.set_status(f"build failed: {str(exc).splitlines()[0][:140]}", error=True)
-            return
-
-        # drop a previous (finished) measurement feed so feeds don't pile up
-        if self._meas_feed is not None and self._meas_feed in self.feeds:
-            self.feeds.remove(self._meas_feed)
-        self._meas_feed = feed
-        self._meas_spec = spec
-        self._active_meas_panel = meas_panel
-        self.feeds.append(feed)
-        card = self._ensure_result_panel(spec)
-        card.config.params["measurement_values"] = dict(values)   # seed the next Edit reopen
-        if not self._timer.isActive():           # make sure the curve actually refreshes
-            self._timer.start()
-        meas_panel.set_running(True)
-        meas_panel.set_status(f"running 0/{feed.n_points}…", error=False)
-        self.status_dot.set_color(GREEN)
-        try:
-            feed.start(rate_hz=getattr(feed, "rate_hz", 5.0))
-        except Exception as exc:
-            meas_panel.set_running(False)
-            meas_panel.set_status(f"start failed: {str(exc).splitlines()[0][:140]}", error=True)
-
-    def _stop_measurement(self) -> None:
-        feed = self._meas_feed
-        if feed is None:
-            return
-        try:
-            feed.stop()
+            values = editor.collect_values() if editor is not None else dict(row.node.values)
         except Exception:
-            pass
-        panel = self._active_meas_panel or self.measurement_panel
-        if panel is not None:
-            panel.set_running(False)
-            done = getattr(feed, "points_done", 0)
-            panel.set_status(f"stopped at {done}/{getattr(feed, 'n_points', 0)} points", error=False)
-
-    # --------------------------------------------------- data processing (one-shot)
-    def _ensure_processor_panel(self, spec) -> "PanelCard":
-        """Find (or create) the result panel for a data-processing action.
-
-        If the spec declares a default view (``default_kind``) the panel is that plot
-        kind bound to the action's default result (``default_value_key`` -- e.g. the
-        per-site fidelity map on the existing 'sites' atom kind); otherwise it is a
-        pure-data panel showing the first result and the user wires the rest from the
-        hub.  Reused across re-runs by name."""
-        for card in self.cards:
-            if card.config.params.get("processor") == spec.name:
-                return card
-        kind = str(getattr(spec, "default_kind", "") or "1d")
-        keys = tuple(getattr(spec, "result_keys", ()) or ())
-        value_key = str(getattr(spec, "default_value_key", "") or (keys[0] if keys else ""))
-        source = f"value = {value_key}" if value_key else "value = np.zeros(1)"
-        params = {"processor": spec.name}
-        # A 'sites' default view needs its centers (and optional underlay image)
-        # signals; the spec names the published keys for them in its metadata so the
-        # panel reads the processor's OWN outputs (no collision with a live feed).
-        if kind == "sites":
-            md = getattr(spec, "metadata", None) or {}
-            params["centers"] = str(md.get("centers_key", "centers"))
-            if md.get("image_key"):
-                params["image"] = str(md.get("image_key"))
-        rows = max((c.config.row + c.config.rows for c in self.cards), default=0)
-        config = PanelConfig(kind=kind, title=spec.name, row=rows, col=0, size="2x2",
-                             source=source, params=params, role="task")
-        card = PanelCard(config, parent=self.board, names_provider=self.hub.names)
-        self._attach_card(card)
-        self._arrange()
-        self._mark_dirty()
-        return card
-
-    def _start_processor(self, panel) -> None:
-        """Run a data-processing action ONCE from its Edit form: build a
-        ProcessorFeed, register it, and start it (one shot -> publish results to the
-        hub -> self-stop).  The result panel (created/reused by name) shows the
-        published output; the scalars are visible in every panel's signal legend."""
-        spec = panel.current_spec() if panel is not None else None
-        if spec is None:
-            return
+            values = dict(row.node.values)
+        # stop a previous run of THIS node so running nodes don't pile up
+        self._stop_logic_node(row, _silent=True)
         try:
-            values = panel.collect_values()
-            # Lazy import keeps the frontend decoupled from the backend at import time
-            # (the feed only touches the spec contract + hub.publish -- guarded by
-            # test_virtual_equals_real_contract).
-            from Zou_lab_control.neutral_atom.operations.feeds import ProcessorFeed
-
-            camera = next((getattr(f, "camera", None) for f in self.feeds
-                           if getattr(f, "camera", None) is not None), None)
-            sequencer = next((getattr(f, "sequencer", None) for f in self.feeds
-                              if getattr(f, "sequencer", None) is not None), None)
-            feed = ProcessorFeed(self.hub, spec, readout=None, camera=camera,
-                                 sequencer=sequencer, params=values)
+            node = self._build_logic_node(row.node, values)
         except Exception as exc:
-            panel.set_status(f"build failed: {str(exc).splitlines()[0][:140]}", error=True)
+            row.set_state("error", status=f"build failed: {str(exc).splitlines()[0][:80]}")
+            if editor is not None:
+                editor.set_status(f"build failed: {str(exc).splitlines()[0][:140]}", error=True)
             return
-        # drop a previous run of THIS action so feeds don't pile up
-        for old in [f for f in self._proc_feeds if getattr(f, "spec", None) is not None
-                    and f.spec.name == spec.name]:
-            try:
-                old.stop()
-            except Exception:
-                pass
-            if old in self.feeds:
-                self.feeds.remove(old)
-            self._proc_feeds.remove(old)
-        self._proc_feeds.append(feed)
-        self.feeds.append(feed)
-        self._active_proc_panel = panel
-        self._active_proc_feed = feed
-        card = self._ensure_processor_panel(spec)
-        card.config.params["processor_values"] = dict(values)   # seed the next Edit reopen
+        row.node.values = dict(values)            # remember for the next Edit reopen + save
+        self._logic_nodes[id(row)] = node
+        if node not in self.running_nodes:
+            self.running_nodes.append(node)
         if not self._timer.isActive():
             self._timer.start()
-        panel.set_running(True)
-        panel.set_status("running…", error=False)
+        try:
+            node.start(rate_hz=getattr(node, "rate_hz", 5.0))
+        except Exception as exc:
+            row.set_state("error", status=f"start failed: {str(exc).splitlines()[0][:80]}")
+            if editor is not None:
+                editor.set_running(False)
+                editor.set_status(f"start failed: {str(exc).splitlines()[0][:140]}", error=True)
+            return
+        row.set_state("running", status="running")
+        if editor is not None:
+            editor.set_running(True)
+            editor.set_status("running", error=False)
         self.status_dot.set_color(GREEN)
-        try:
-            feed.start(rate_hz=getattr(feed, "rate_hz", 5.0))
-        except Exception as exc:
-            panel.set_running(False)
-            panel.set_status(f"start failed: {str(exc).splitlines()[0][:140]}", error=True)
+        self._mark_dirty()
 
-    def _stop_processor(self) -> None:
-        feed = getattr(self, "_active_proc_feed", None)
-        if feed is not None:
+    def _build_logic_node(self, node: LogicNodeConfig, values: dict):
+        """Build the node for a logic node, DISPLAY SUPPRESSED (publish-only).
+
+        Reuses the SAME build paths as the real readout / notebook:
+          * camera      -> readout.camera_measurement(hub)
+          * measurement -> spec.build(**values) wrapped in a ScannedMeasurementNode
+          * processor   -> a ProcessorRun driving the spec once
+          * task        -> spec.build(hub, **values)
+        None of these ever opens a matplotlib plot -- they only publish to the hub."""
+        kind = node.kind
+        if kind == "camera":
+            spec = self._spec_for_logic(node)
+            if spec is None:
+                raise RuntimeError("no session camera available")
+            # Same build path as the notebook: readout.camera_spec().build(hub, ...).
+            return spec.build(self.hub, **values)
+        spec = self._spec_for_logic(node)
+        if spec is None:
+            raise RuntimeError(f"no catalog spec named {node.name!r} for a {kind} node")
+        if kind == "measurement":
+            measurement = spec.build(**values)
+            from Zou_lab_control.neutral_atom.operations.logic import ScannedMeasurementNode
+            return ScannedMeasurementNode(
+                self.hub, measurement, x_key=spec.x_key, y_key=spec.y_key, grid_shape=spec.grid_shape)
+        if kind == "processor":
+            from Zou_lab_control.neutral_atom.operations.logic import ProcessorRun
+            camera = next((getattr(n, "camera", None) for n in self.running_nodes
+                           if getattr(n, "camera", None) is not None), None)
+            sequencer = next((getattr(n, "sequencer", None) for n in self.running_nodes
+                              if getattr(n, "sequencer", None) is not None), None)
+            readout = getattr(self.session, "readout", None)
+            return ProcessorRun(self.hub, spec, readout=readout, camera=camera,
+                                 sequencer=sequencer, params=values)
+        if kind == "task":
+            return spec.build(self.hub, **values)
+        raise RuntimeError(f"unknown logic kind {kind!r}")
+
+    def _stop_logic_node(self, row: "LogicNodeRow", *, _silent: bool = False) -> None:
+        """Stop a logic node's node (``node.stop()``) and grey its dot."""
+        node = self._logic_nodes.get(id(row))
+        if node is not None:
             try:
-                feed.stop()
+                node.stop()
             except Exception:
                 pass
-        panel = self._active_proc_panel
-        if panel is not None:
-            panel.set_running(False)
-            panel.set_status("stopped", error=False)
+            if node in self.running_nodes:
+                self.running_nodes.remove(node)
+        self._logic_nodes[id(row)] = None
+        editor = self._logic_editors.get(id(row))
+        if not _silent:
+            row.set_state("stopped", status="stopped")
+            if editor is not None:
+                editor.set_running(False)
+                editor.set_status("stopped", error=False)
 
-    def _poll_processors(self) -> None:
-        """Each tick: when the active one-shot action finishes (or errors), release
-        its form's controls and report (its result is already on the hub)."""
-        panel = self._active_proc_panel
-        feed = getattr(self, "_active_proc_feed", None)
-        if panel is None or feed is None or not getattr(panel, "_running", False):
-            return
-        if getattr(feed, "finished", False):
-            panel.set_running(False)
-            self.status_dot.set_color(GREY if self._timer.isActive() else YELLOW)
-            panel.set_status("done", error=False)
-        elif getattr(feed, "last_error", None):
-            panel.set_running(False)
-            panel.set_status(f"failed: {feed.last_error}", error=True)
+    def _remove_logic_node(self, row: "LogicNodeRow", *, _rebuild: bool = True) -> None:
+        """Stop + remove a logic node (its node is stopped, its row + Edit drop)."""
+        self._stop_logic_node(row, _silent=True)
+        editor = self._logic_editors.pop(id(row), None)
+        if editor is not None:
+            idx = self.tabs.indexOf(editor)
+            if idx >= 0:
+                self.tabs.removeTab(idx)
+            editor.teardown()
+            editor.setParent(None)
+            editor.deleteLater()
+        self._logic_nodes.pop(id(row), None)
+        if row in self.logic_nodes:
+            self.logic_nodes.remove(row)
+        self.logic_layout.removeWidget(row)
+        row.setParent(None)
+        row.deleteLater()
+        if not self.logic_nodes:
+            self.logic_hint.show()
+        if _rebuild:
+            self._mark_dirty()
 
-    # --------------------------------------------------- live readout (continuous)
-    def _add_live_loading_panel(self) -> None:
-        """Build the loading readout over the session camera + its landing view.
-
-        The readout is COMPOSED of separate nodes (calibrate Task + camera Measurement
-        + DetectProcessor) -- not one monolithic feed.  Calibration runs on the task's
-        OWN thread and the detector no-ops until it is ready, so adding this never
-        blocks the GUI.  All three nodes are registered (so teardown stops them), a
-        'Loading rate' monitor reading ``value = rate`` is dropped, the chain is started
-        streaming, and that panel's Edit opens.  You then Add Panel more views yourself
-        -- occupancy site map (``value = occupied``), raw image (``value = frame``),
-        per-site rate (``value = rate_sites``) -- wired to the signals it publishes."""
-        if self.session is None:
-            return
-        try:
-            readout = self.session.readout.live_loading_readout(self.hub)
-        except Exception as exc:
-            self._message(f"could not build loading readout: {str(exc).splitlines()[0][:160]}")
-            return
-        # register every live node so shutdown stops their owner threads (the camera /
-        # detector stream; the calibrate task is one-shot but is stopped too).
-        self.feeds.extend([readout.calibrate_task, readout.camera, readout.detect])
-        rows = max((c.config.row + c.config.rows for c in self.cards), default=0)
-        config = PanelConfig(kind="monitor_nodist", title="Loading rate", row=rows, col=0,
-                             size="1x2", source="value = rate", params={"length": 300})
-        card = PanelCard(config, parent=self.board, names_provider=self.hub.names)
-        self._attach_card(card)
-        # MID-RUN OUTPUT panel (confocal-task style): the calibrate Task streams its
-        # template frames under cal_frame while it runs, on its OWN thread; this panel
-        # shows that intermediate progress, then naturally goes static once the task is
-        # done.  Its signal is namespaced (cal_*) so it never clobbers the live frame.
-        cal_config = PanelConfig(kind="2d", title="Calibrating (task output)", row=rows, col=2,
-                                 size="2x2", source="value = cal_frame")
-        cal_card = PanelCard(cal_config, parent=self.board, names_provider=self.hub.names)
-        self._attach_card(cal_card)
-        self._arrange()
-        self._mark_dirty()
-        if not self._timer.isActive():
-            self._timer.start()
-        try:
-            readout.start(rate_hz=5.0)
-        except Exception as exc:
-            self._message(f"loading readout failed to start: {str(exc).splitlines()[0][:160]}")
-        self._edit_card(card)
-
-    # --------------------------------------------------- camera measurement (live)
-    def _add_camera_measurement_panel(self) -> None:
-        """Build the standalone CONTINUOUS camera Measurement (a live frame stream)
-        over the session camera + a 2-D image view.
-
-        Role = "measurement": the panel IS the camera node; its Edit is the camera's
-        own exposure / region / frames-per-cycle form (NO fit).  It streams ``frame``
-        to the hub, so you then Add Panel a Processor (detect) that consumes it, or
-        more views -- the camera measurement is a first-class addable node, not buried
-        inside the loading readout."""
-        if self.session is None:
-            return
-        try:
-            camera = self.session.readout.camera_measurement(self.hub)
-        except Exception as exc:
-            self._message(f"could not build camera measurement: {str(exc).splitlines()[0][:160]}")
-            return
-        self.feeds.append(camera)
-        rows = max((c.config.row + c.config.rows for c in self.cards), default=0)
-        config = PanelConfig(kind="2d", title="Camera (live)", row=rows, col=0, size="2x2",
-                             source="value = frame", role="measurement")
-        card = PanelCard(config, parent=self.board, names_provider=self.hub.names)
-        self._attach_card(card)
-        self._arrange()
-        self._mark_dirty()
-        if not self._timer.isActive():
-            self._timer.start()
-        try:
-            camera.start(rate_hz=5.0)
-        except Exception as exc:
-            self._message(f"camera measurement failed to start: {str(exc).splitlines()[0][:160]}")
-        self._edit_card(card)
-
-    # --------------------------------------------------- task (orchestration)
-    def _add_task_panel(self, spec) -> None:
-        """Build a catalog TASK over the session camera + its dedicated MID-RUN
-        output panel (confocal-task style).
-
-        Role = "task": the panel shows the task's mid-run frames (``spec.prefix +
-        spec.mid_run_key``, e.g. ``cal_frame``) streamed while it runs on its OWN
-        thread; its Edit is the task's parameter form + a Run button (apply params +
-        run once).  The task derives its artifact (e.g. a ``TrapCalibration`` a
-        DetectProcessor can then consume).  Generic over the task catalog, so a new
-        ``@task`` shows up here automatically."""
-        if self.session is None:
-            return
-        try:
-            task = spec.build(self.hub)
-        except Exception as exc:
-            self._message(f"could not build task {spec.name!r}: {str(exc).splitlines()[0][:160]}")
-            return
-        self.feeds.append(task)
-        rows = max((c.config.row + c.config.rows for c in self.cards), default=0)
-        config = PanelConfig(kind=str(getattr(spec, "default_kind", "2d")), title=spec.name,
-                             row=rows, col=0, size="2x2",
-                             source=f"value = {spec.mid_run_signal()}", role="task")
-        card = PanelCard(config, parent=self.board, names_provider=self.hub.names)
-        self._attach_card(card)
-        self._arrange()
-        self._mark_dirty()
-        if not self._timer.isActive():
-            self._timer.start()
-        # run it once now (it streams its mid-run frames to this panel as it goes);
-        # the Edit's Run re-runs it with edited parameters.
-        try:
-            task.start(rate_hz=5.0)
-        except Exception as exc:
-            self._message(f"task {spec.name!r} failed to start: {str(exc).splitlines()[0][:160]}")
-        self._edit_card(card)
-
-    def _poll_measurement(self) -> None:
-        """Called each tick: surface progress, and once the scan completes show
-        the result (for temperature, fit T from the form's capture radius)."""
-        feed = self._meas_feed
-        panel = self._active_meas_panel or self.measurement_panel
-        if feed is None or panel is None:
-            return
-        if not getattr(feed, "finished", False):
-            if getattr(feed, "running", False):
-                panel.set_status(f"running {feed.points_done}/{feed.n_points}…", error=False)
-            return
-        # finished: report once, run the optional fit, then release the controls
-        if not panel._running:
-            return
-        panel.set_running(False)
-        self.status_dot.set_color(GREY if self._timer.isActive() else YELLOW)
-        spec = self._meas_spec
-        summary = f"done: {feed.points_done} points"
-        fit_summary = self._fit_measurement(spec, feed, panel)
-        panel.set_status(summary + (f" — {fit_summary}" if fit_summary else ""), error=False)
-
-    def _fit_measurement(self, spec, feed, panel) -> str:
-        """Run the spec's declared fit (temperature) on the completed curve and
-        return a short result string; '' when the spec declares no fit."""
-        meta = getattr(spec, "metadata", None) or {}
-        if meta.get("fit") != "fit_temperature":
-            return ""
-        try:
-            import numpy as _np
-
-            x = _np.asarray(self.hub.latest(spec.x_key), dtype=float)
-            y = _np.asarray(self.hub.latest(spec.y_key), dtype=float)
-            param_key = meta.get("fit_param", "capture_radius")
-            scale = float(meta.get("fit_param_scale", 1.0))
-            radius = float(panel.collect_values().get(param_key, 0.0)) * scale
-            from Zou_lab_control.neutral_atom.operations.temperature import fit_temperature
-
-            fit = fit_temperature(x, y, capture_radius=radius)
-            t_uK = getattr(fit, "temperature_uK", None)
-            if t_uK is None:
-                t_uK = getattr(fit, "temperature_K", float("nan")) * 1e6
-            return f"T ≈ {t_uK:.1f} µK"
-        except Exception as exc:
-            return f"fit failed: {str(exc).splitlines()[0][:80]}"
+    def _poll_logic_nodes(self) -> None:
+        """Each tick: reflect each running node's state on its row + Edit (a
+        one-shot that finished -> stopped; a node that errored -> red)."""
+        for row in self.logic_nodes:
+            node = self._logic_nodes.get(id(row))
+            if node is None:
+                continue
+            editor = self._logic_editors.get(id(row))
+            error = getattr(node, "last_error", None)
+            running = bool(getattr(node, "running", False))
+            finished = bool(getattr(node, "finished", False))
+            if error:
+                row.set_state("error", status=f"error: {str(error)[:60]}")
+                if editor is not None:
+                    editor.set_running(False)
+                    editor.set_status(f"error: {error}", error=True)
+            elif finished and not running:
+                row.set_state("stopped", status="done")
+                if editor is not None:
+                    editor.set_running(False)
+                    editor.set_status("done", error=False)
+            elif running:
+                # surface scan progress when the node reports it
+                done = getattr(node, "points_done", None)
+                total = getattr(node, "n_points", None)
+                if done is not None and total:
+                    row.set_state("running", status=f"running {done}/{total}")
+                else:
+                    row.set_state("running", status="running")
 
     def _mark_dirty(self, *_args) -> None:
         if self._building:
             return
         self.save_button.set_dirty(True, dirty_color=YELLOW)
         self._update_summary()
-
-    # ------------------------------------------------------------------ presets
-    def _refresh_presets(self) -> None:
-        with _signals_blocked(self.preset_combo):
-            self.preset_combo.clear()
-            self.preset_combo.addItem("Presets…")
-            self.preset_combo.addItems(list_task_presets())
-            self.preset_combo.setCurrentIndex(0)
-
-    def _on_preset_pick(self, index: int) -> None:
-        name = self.preset_combo.currentText()
-        if not name or name == "Presets…":
-            return
-        try:
-            state = resolve_task_state(name)
-        except Exception as exc:
-            self._message(f"Load preset failed: {exc}")
-            return
-        self._address = None
-        self.load_state(state)
-        self.save_button.set_dirty(False)
-        self._refresh_presets()
 
     # ------------------------------------------------------------------ refresh
     def _expression_namespace(self) -> dict[str, object]:
@@ -3182,31 +2983,31 @@ class TaskConsole(QtWidgets.QWidget):
         namespace["names"] = self.hub.names
         namespace["shot"] = self.hub.shot
         # Per-signal publish counters (reserved key) so a rolling monitor can tell
-        # a new sample of its own source from an unrelated feed's version bump.
+        # a new sample of its own source from an unrelated node's version bump.
         namespace["__sig_versions__"] = self.hub.signal_versions()
         # Coordinate frames (reserved key): {signal_name: [x, w, y, h]} from any
-        # feed whose acquisition source declares a ROI.  A 2D panel reads its
+        # node whose acquisition source declares a ROI.  A 2D panel reads its
         # source signal's frame so the image axes are the REAL camera pixel
         # coordinates (ROI), not 0..N -- and an area-select maps back to the ROI.
         namespace["__coord_frames__"] = self._coord_frames()
         return namespace
 
     def _coord_frames(self) -> dict[str, list]:
-        """Map each feed-published signal to its source's spatial ``region``
+        """Map each node-published signal to its source's spatial ``region``
         endpoints ``[x_min, x_max, y_min, y_max]`` (the acquisition-layer format)
-        when the feed declares one (a camera frame), so a panel can put its axes in
+        when the node declares one (a camera frame), so a panel can put its axes in
         real source pixels.  A panel reads index 0 (x_min) and index 2 (y_min) as
         the axis origin, so this is robust to endpoints vs any position+size form."""
         frames: dict[str, list] = {}
-        for feed in self.feeds:
+        for node in self.running_nodes:
             try:
-                region = feed.acquisition_parameters().get("region")
+                region = node.acquisition_parameters().get("region")
             except Exception:
                 region = None
             if not region:
                 continue
             try:
-                sigs = feed.published_signals() if hasattr(feed, "published_signals") else ()
+                sigs = node.published_signals() if hasattr(node, "published_signals") else ()
             except Exception:
                 sigs = ()
             for s in sigs:
@@ -3214,12 +3015,11 @@ class TaskConsole(QtWidgets.QWidget):
         return frames
 
     def _tick(self) -> None:
-        # poll the measurement EVERY tick (even when no new signal arrived) so
-        # the run-complete transition is never missed if the feed self-stops
-        # between version bumps.
-        self._poll_measurement()
-        self._poll_processors()
-        self._refresh_signal_info()   # cheap + self-guarded: tracks source/feed changes
+        # poll the logic nodes EVERY tick (even when no new signal arrived) so a
+        # one-shot node's run-complete / error transition is never missed if the
+        # node self-stops between version bumps.
+        self._poll_logic_nodes()
+        self._refresh_signal_info()   # cheap + self-guarded: tracks source/node changes
         version = self.hub.version
         if version == self._last_version:
             return
@@ -3232,7 +3032,7 @@ class TaskConsole(QtWidgets.QWidget):
         # general hook on the current tab -- no per-field wiring).
         editor = self.tabs.currentWidget()
         if isinstance(editor, PanelEditor):
-            editor.refresh_feed_now_labels()
+            editor.refresh_node_now_labels()
         self._update_summary()
 
     def refresh_once(self) -> None:
@@ -3245,15 +3045,15 @@ class TaskConsole(QtWidgets.QWidget):
             n_signals = len(self.hub.names())
         except Exception:
             n_signals = 0
-        # A wedged feed must not fail silently: if any feed recorded an error,
+        # A wedged node must not fail silently: if any running node recorded an error,
         # raise a red banner naming it instead of just showing frozen data.
-        faulted = [f for f in self.feeds if getattr(f, "last_error", None)]
+        faulted = [n for n in self.running_nodes if getattr(n, "last_error", None)]
         if faulted:
-            f = faulted[0]
-            who = (getattr(f, "prefix", "") or "feed").rstrip(":")
-            n = int(getattr(f, "consecutive_errors", 1))
+            node = faulted[0]
+            who = (getattr(node, "prefix", "") or self._node_label(node) or "node").rstrip(":")
+            n = int(getattr(node, "consecutive_errors", 1))
             self.summary.set_danger(True)
-            self.summary.setText(f"⚠ FEED ERROR ({who}, ×{n}): {f.last_error}"[:200])
+            self.summary.setText(f"⚠ NODE ERROR ({who}, ×{n}): {node.last_error}"[:200])
         else:
             self.summary.set_danger(False)
             self.summary.setText(
@@ -3271,7 +3071,6 @@ class TaskConsole(QtWidgets.QWidget):
             state.save(path)
             self._address = path
             self.save_button.set_dirty(False)
-            self._refresh_presets()             # a layout saved into tasks/ is a named preset
             self._message(f"Saved: {path}")
         except Exception as exc:
             self._message(f"Save failed: {exc}")
@@ -3297,12 +3096,12 @@ class TaskConsole(QtWidgets.QWidget):
 
     # ------------------------------------------------------------------ teardown
     def shutdown(self) -> None:
-        """Stop the refresh timer and every feed's owner thread, then release the
-        editors/cards.  IDEMPOTENT -- it is reached from both the window close
+        """Stop the refresh timer and every running node's owner thread, then release
+        the editors/cards.  IDEMPOTENT -- it is reached from both the window close
         (``show_task_console`` wires ``window.hidden`` here) and an explicit
         ``with show_task_console(...)`` / re-run, which can both fire.
 
-        Stopping a feed sets its cooperative-cancel event (M5), so a feed thread
+        Stopping a node sets its cooperative-cancel event (M5), so a node thread
         blocked in ``camera.acquire`` unwinds and the camera is released -- this is
         what keeps a closed dashboard from leaving a live acquire thread (and a held
         camera / RPyC connection) behind, which previously wedged the kernel."""
@@ -3310,14 +3109,17 @@ class TaskConsole(QtWidgets.QWidget):
             return
         self._shut = True
         self._timer.stop()
-        for feed in self.feeds:
+        for node in list(self.running_nodes):
             try:
-                feed.stop()
+                node.stop()
             except Exception:
                 pass
         for editor in list(self._panel_editors.values()):
             editor.teardown()
         self._panel_editors.clear()
+        for editor in list(self._logic_editors.values()):
+            editor.teardown()
+        self._logic_editors.clear()
         for card in self.cards:
             card.shutdown()
         on_close = getattr(self, "_on_close", None)
@@ -3344,7 +3146,7 @@ def show_task_console(
     hub,
     state: TaskConsoleState | None = None,
     task: str | None = None,
-    feeds: Sequence[object] = (),
+    running_nodes: Sequence[object] = (),
     measurements: Sequence[object] = (),
     processors: Sequence[object] = (),
     tasks: Sequence[object] = (),
@@ -3357,8 +3159,8 @@ def show_task_console(
     """Open the console in a Fluent window (mirrors ``show_pulse_gui``: the body
     sizes itself from the primary screen; the window wraps it exactly).
 
-    ``task`` loads a NAMED dashboard: a built-in (``atom_loading_monitor``,
-    ``loading_rate_live``), a layout saved in tasks/, or a JSON path.
+    ``task`` loads a layout YOU saved (``tasks/<name>.json``) or a JSON path;
+    without one the console opens empty.
 
     ``measurements`` is the declarative measurement catalog
     (``exp.readout.measurement_specs()`` -- an AUTO-DISCOVERED list, built-ins +
@@ -3367,7 +3169,7 @@ def show_task_console(
     result panel and opens its Edit tab (auto-generated parameter form + one-click
     Start).  Omit it and the dropdown carries only plot kinds.
 
-    Teardown: closing the window stops the refresh timer and every feed's owner
+    Teardown: closing the window stops the refresh timer and every running node's owner
     thread (the cooperative-cancel path), so no acquire thread is left holding the
     camera -- closing the dashboard genuinely releases it.  Pass ``on_close`` (e.g.
     ``exp.close``) to ALSO disconnect/safe the devices the caller owns when the
@@ -3378,25 +3180,25 @@ def show_task_console(
     app = ensure_qt_app()
     if state is None and task is not None:
         state = resolve_task_state(task)
-    console = TaskConsole(hub=hub, state=state, feeds=feeds, measurements=measurements,
+    console = TaskConsole(hub=hub, state=state, running_nodes=running_nodes, measurements=measurements,
                           processors=processors, tasks=tasks, session=session, scale=scale,
                           window_ratio=window_ratio)
     console._on_close = on_close
-    # A passed-in producer feed should stream the moment the window opens -- so the
-    # Monitor is live without the caller having to remember feed.start().  start()
-    # is idempotent, so a producer the caller already started (e.g. bring-up's
-    # readout.start(rate_hz=4)) keeps its own rate; only NON-running producers
+    # A passed-in node should stream the moment the window opens -- so the Monitor
+    # is live without the caller having to remember node.start().  start() is
+    # idempotent, so a node the caller already started (e.g. bring-up's
+    # readout.start(rate_hz=4)) keeps its own rate; only NON-running nodes
     # are launched here.  (TaskConsole.__init__ deliberately does NOT do this, so
     # tests/notebooks keep deterministic manual stepping.)
-    for feed in feeds:
-        if not getattr(feed, "running", False) and hasattr(feed, "start"):
-            feed.start(rate_hz=getattr(feed, "rate_hz", 5.0))
+    for node in running_nodes:
+        if not getattr(node, "running", False) and hasattr(node, "start"):
+            node.start(rate_hz=getattr(node, "rate_hz", 5.0))
     window = FluentWindow(widget=console, title=title, hide_on_close=False)
     # Closing the window must tear the console down: the console is a CHILD of the
     # window, so its own closeEvent never fires on a window close -- without this the
-    # feed owner threads keep running (blocked in camera.acquire, holding the camera /
+    # node owner threads keep running (blocked in camera.acquire, holding the camera /
     # RPyC link), which wedges the kernel.  `closed` fires only on a genuine close, so
-    # minimising the dashboard does NOT stop the feeds.
+    # minimising the dashboard does NOT stop the nodes.
     window.closed.connect(console.shutdown)
     window.adjustSize()
     window.setFixedSize(window.size())
@@ -3408,6 +3210,7 @@ def show_task_console(
 
 
 __all__ = [
+    "LogicNodeConfig",
     "PanelConfig",
     "TaskConsole",
     "TaskConsoleState",

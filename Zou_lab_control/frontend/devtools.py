@@ -169,11 +169,14 @@ def demo_editor(*, scale: float = 1.0, size=(1440, 880), bind_scans: bool = True
 def _demo_board_state():
     """A board exercising EVERY panel kind -- both live types included.
 
-    The bare app default (``default_console_state``) is a single no-dist live
-    trace; this richer board is the demo/test fixture, so a screenshot or smoke
-    test still covers all six kinds and BOTH rolling-trace plot types: the
-    bare ``monitor_nodist`` (-> :class:`LiveLive`) AND the side-distribution
-    ``monitor`` (-> :class:`LiveLiveDis`)."""
+    The bare app default (``default_console_state``) is empty; this richer board
+    is the demo/test fixture, so a screenshot or smoke test still covers all six
+    kinds and BOTH rolling-trace plot types: the bare ``monitor_nodist``
+    (-> :class:`LiveLive`) AND the side-distribution ``monitor``
+    (-> :class:`LiveLiveDis`).  Each panel is a pure VIEW wired to a hub signal
+    the demo's camera Measurement + DetectProcessor publish (decoupled
+    VIEW/LOGIC): the camera publishes ``frame``; the DetectProcessor publishes
+    ``counts`` / ``rate`` / ``rate_sites`` / ``centers``."""
 
     from Zou_lab_control.frontend.task_console import PanelConfig, TaskConsoleState
 
@@ -182,75 +185,127 @@ def _demo_board_state():
         panels=[
             PanelConfig(kind="2d", title="Loading image", row=0, col=0, size="2x2",
                         source="value = frame"),
-            PanelConfig(kind="sites", title="Occupancy", row=0, col=2, size="2x2",
-                        source="value = occupied"),
+            PanelConfig(kind="sites", title="Per-site loading rate", row=0, col=2, size="2x2",
+                        source="value = rate_sites",
+                        params={"centers": "centers", "image": "frame"}),
             PanelConfig(kind="monitor", title="Loading rate (dist)", row=0, col=4, size="1x2",
                         source="value = rate", params={"length": 300}),
             PanelConfig(kind="monitor_nodist", title="Loading rate", row=1, col=4, size="1x2",
                         source="value = rate", params={"length": 300}),
             PanelConfig(kind="hist", title="Counts distribution", row=2, col=0, size="1x2",
-                        source="value = history('counts', 200).ravel()", params={"bins": 80}),
-            PanelConfig(kind="1d", title="Per-site loading rate", row=2, col=2, size="2x4",
-                        source="value = rate_sites"),
+                        source="value = counts", params={"bins": 80}),
+            PanelConfig(kind="1d", title="Per-site counts", row=2, col=2, size="2x4",
+                        source="value = counts"),
         ],
     )
 
 
-def demo_console(*, scale: float = 1.0, size=(1480, 980), seed: int = 11, shots: int = 40,
-                 dual: bool = True, state=None):
-    """Return a shown :class:`TaskConsole` fed by seeded virtual loading feeds.
+def demo_console(*, scale: float = 1.0, size=(1480, 980), grid=(5, 7), state=None,
+                 shots: int = 8, dual: bool = False):
+    """Return a shown :class:`TaskConsole` on a calibrated VIRTUAL session, with a
+    representative POPULATED dashboard built through the DECOUPLED API.
 
-    ``dual=True`` adds a second feed under the ``b_`` prefix so A-B expressions
-    (e.g. ``value = rate_grid - b_rate_grid``) have data.  Feeds are stepped
-    SYNCHRONOUSLY ``shots`` times (no threads) so screenshots and tests are
-    deterministic; call ``feed.step()``/``console.refresh_once()`` for more.
+    This is the demo/test fixture (the bare app still opens EMPTY -- see
+    ``default_console_state``).  It composes the loading readout from the SAME
+    primitives a notebook would, never a composite:
 
-    The default state is the all-kinds demo board (not the bare app default),
-    so a single ``demo_console()`` shows every panel kind at once.
+      * a **camera** Measurement logic node (``CameraMeasurement``) publishing
+        ``frame`` -- added + Started through the public-ish console API
+        (``_add_logic_node`` / ``_start_logic_node``), exactly as Add-Panel does;
+      * a reactive **DetectProcessor** consuming ``frame`` and publishing
+        ``occupied`` / ``counts`` / ``rate`` (scalar EMA) / ``rate_sites`` /
+        ``rate_grid`` / ``centers`` / ``thresholds`` -- built directly (the
+        Add-Panel processor flow builds a ONE-SHOT run; the live readout wires the
+        reactive detector itself, as the notebook does) and registered in
+        ``running_nodes`` so the console's node-discovery + tests see it.
+
+    ``state`` (a :class:`TaskConsoleState`) loads THAT layout instead of the
+    default six-kind board, while STILL building + Starting the camera + detect so
+    ``frame`` / ``rate`` / ... are published for whatever panels it carries.  With
+    ``dual=True`` a second DetectProcessor (``prefix="b_"``) is started too, so the
+    ``b_rate_grid`` / ``b_counts`` / ... A/B signals exist for cross-signal panels.
+
+    ``shots`` shots are stepped (camera FIRST so ``frame`` exists, then each
+    DetectProcessor) and one ``refresh_once`` rendered, so every panel holds data
+    and reads "shot N".  The timer is stopped: tests drive ``refresh_once`` /
+    ``running_nodes`` stepping themselves.
     """
 
+    import Zou_lab_control.neutral_atom as na
     from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
-    from Zou_lab_control.frontend.task_console import TaskConsole
+    from Zou_lab_control.frontend.task_console import LogicNodeConfig, PanelCard, TaskConsole
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
-    from Zou_lab_control.neutral_atom.devices.virtual import virtual_loading_readout
+    from Zou_lab_control.neutral_atom.operations.logic import DetectProcessor
 
     ensure_qt_app()
     install_screenshot_font()  # before building so build-time text metrics match the render font
-    hub = SignalHub()
-    # The loading readout is COMPOSED (calibrate task + camera measurement + detect
-    # processor); for a deterministic demo we calibrate up front, then step the camera
-    # + detector by hand.  The live producers (not the one-shot calibrate task) are the
-    # panels' feeds.
-    readouts = [virtual_loading_readout(hub, seed=seed)]
-    if dual:
-        readouts.append(virtual_loading_readout(hub, prefix="b_", seed=seed + 11, loading_probability=0.35))
-    feeds = []
-    for readout in readouts:
-        readout.calibrate()
-        feeds.extend(readout.producers)
-    for _ in range(max(1, int(shots))):
-        for readout in readouts:
-            readout.camera.step()
-            readout.detect.step()
-    console = TaskConsole(hub=hub, state=state or _demo_board_state(), feeds=feeds,
-                          scale=scale, window_px=size)
+    exp = na.connect("virtual", sitemap={"grid_shape": tuple(grid)})
+    exp.readout.sitemap(method="box", frames=4, display=False)
+    exp.readout.thresholds(frames=24, display=False)
+
+    # The layout: an explicit state overrides the default six-kind board; either
+    # way the panels are pure views wired to the signals the nodes below publish.
+    layout = state if state is not None else _demo_board_state()
+    console = TaskConsole(hub=SignalHub(), state=layout, session=exp,
+                          measurements=exp.readout.measurement_specs(),
+                          processors=exp.readout.processor_specs(),
+                          tasks=exp.readout.task_specs(), scale=scale, window_px=size)
     console._timer.stop()          # deterministic: tests drive refresh_once() themselves
-    console.show()
+
+    # --- LOGIC NODES (decoupled): a camera Measurement + reactive DetectProcessor.
+    # The camera is added as a real Logic-tab node (so it appears on the Logic tab
+    # and `_producing_node` maps a frame panel back to it for its Edit's acquisition
+    # params) but is run by MANUAL STEPPING, not a background thread: the demo is a
+    # deterministic test fixture (the timer is stopped and tests step
+    # `running_nodes` themselves), and an idle node also makes an Edit's Apply
+    # reconfigure the camera synchronously.  The detector is the reactive readout
+    # node the notebook wires by hand.  Order matters -- the camera is in
+    # `running_nodes` BEFORE the detector so one step() publishes the frame the
+    # detector then consumes.
+    camera_row = console._add_logic_node(
+        LogicNodeConfig(kind="camera", name="live", title="Camera (live frames)"), focus=False)
+    camera = console._build_logic_node(camera_row.node, dict(camera_row.node.values))
+    console._logic_nodes[id(camera_row)] = camera
+    console.running_nodes.append(camera)             # stepped manually below, no thread
+    camera_row.set_state("running", status="running")
+
+    calibration = exp.readout.require(thresholds=True)   # the session's calibrated TrapCalibration
+    detectors = [DetectProcessor(console.hub, calibration=calibration, grid_shape=tuple(grid))]
+    if dual:
+        # A second detector behind a prefix so b_rate_grid / b_counts / ... exist
+        # for the A-B cross-signal panels.
+        detectors.append(DetectProcessor(console.hub, calibration=calibration,
+                                         grid_shape=tuple(grid), prefix="b_"))
+    for detector in detectors:
+        console.running_nodes.append(detector)   # so _producing_node / tests see it
+
+    # Seed: step the camera (publishes frame) THEN every detector (reads frame ->
+    # publishes its signals), repeated `shots` times, then render once so every
+    # panel has data and shows "shot N".
+    for _ in range(max(1, int(shots))):
+        for node in console.running_nodes:
+            node.step()
     console.refresh_once()
+
+    # The demo opens CLEAN (no unsaved-edit star): wiring the nodes above marked the
+    # Save button dirty, but a freshly-built demo dashboard is not a user edit.
+    console.save_button.set_dirty(False)
+
+    console.show()
     return console
 
 
 def demo_console_measurements(*, scale: float = 1.0, size=(1480, 980), grid=(5, 7)):
     """Return a shown :class:`TaskConsole` wired with the readout measurement
-    catalog (P5): a measurement is created from the header's Add Panel, and its
-    OWN Edit tab carries the live parameter form + one-click Start (there is no
-    global Control tab), fed by a calibrated VIRTUAL session.
+    catalog: a measurement is added as a LOGIC NODE (Logic tab) from the header's
+    Add Panel, and its OWN Edit tab carries the live parameter form + Start / Stop,
+    fed by a calibrated VIRTUAL session.
 
     Only the camera frames are virtual -- the session calibrates and the specs
     build through the SAME contract path real hardware uses, so this exercises
-    exactly what the lab sees (AGENTS.md "virtual == real").  The timer is left
-    RUNNING (unlike ``demo_console``) so a Start actually streams a curve; tests
-    drive ``run_to_completion()`` + ``refresh_once()`` for determinism.
+    exactly what the lab sees (AGENTS.md "virtual == real").  Start a node from its
+    Edit to stream signals to the hub, then add a Plot panel on the Monitor board
+    pointed at them.
     """
 
     from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
@@ -265,14 +320,13 @@ def demo_console_measurements(*, scale: float = 1.0, size=(1480, 980), grid=(5, 
     exp.readout.thresholds(frames=24, display=False)
     measurements = exp.readout.measurement_specs()
     hub = SignalHub()
-    # Start with an EMPTY board: the only Monitor panel is the result curve a
-    # Start click adds, so the measurement flow is the whole story.
-    console = TaskConsole(hub=hub, state=TaskConsoleState(name="measurements"), feeds=[],
-                          measurements=measurements, scale=scale, window_px=size)
+    # Start with an EMPTY board; a measurement is a Logic node, added below, whose
+    # Edit (its params + Start/Stop) is the whole measurement flow.
+    console = TaskConsole(hub=hub, state=TaskConsoleState(name="measurements"),
+                          measurements=measurements, session=exp, scale=scale, window_px=size)
     console.show()
-    # Create the first measurement's panel from Add Panel and open its Edit tab,
-    # so the demo opens showing the measurement form (its params + Start) -- the
-    # whole measurement flow, with no global Control tab.
+    # Add the first measurement as a Logic node + open its Edit tab, so the demo
+    # opens showing the measurement form (its params + Start) on the Logic tab.
     if measurements:
         kc = console.kind_combo
         target = ("measurement", measurements[0].name)

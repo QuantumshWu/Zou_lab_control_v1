@@ -1,11 +1,11 @@
-"""Experiment producers: loops that publish per-shot signals into a SignalHub.
+"""Experiment logic nodes: loops that publish per-shot signals into a SignalHub.
 
-A producer is the upstream half of the task-console contract (the console is the
-consumer).  There are three KINDs, all sharing the :class:`Producer` loop:
+A logic node is the upstream half of the task-console contract (the console is the
+consumer).  There are three KINDs, all sharing the :class:`LogicNode` loop:
 
 * :class:`Measurement` -- drives a device acquisition loop and publishes named
-  signals (e.g. a camera :class:`CameraFrameFeed` publishing ``frame``, or a swept
-  :class:`ScannedMeasurementFeed`);
+  signals (e.g. a camera :class:`CameraMeasurement` publishing ``frame``, or a swept
+  :class:`ScannedMeasurementNode`);
 * :class:`Processor` -- a reactive TRANSFORM node with no acquisition of its own
   (the "func" layer): it consumes hub signals and republishes derived ones, e.g.
   :class:`DetectProcessor` running the SAME ``calibration.detect`` contract the
@@ -14,16 +14,16 @@ consumer).  There are three KINDs, all sharing the :class:`Producer` loop:
   which produces a ``TrapCalibration`` + an npz artifact and streams its template
   frames to a mid-run output panel).
 
-The standard atom-loading readout is COMPOSED from these (``build_loading_readout``):
-a calibrate Task + a camera Measurement (``frame``) + a DetectProcessor -- NOT one
-monolithic feed fabricating every signal.  Every producer touches only the camera
+The loading readout is COMPOSED by the user from these primitives -- a camera
+Measurement publishing ``frame`` + a DetectProcessor turning ``frame`` into
+occupancy/counts/rate, with calibration produced by a CalibrateReadoutTask.  No
+monolithic node fabricates every signal: each layer is independent and explicitly
+wired by the notebook or task console.  Every logic node touches only the camera
 CONTRACT (``camera.acquire(...)``) and backend-neutral helpers, so the SAME nodes
 run on a ``VirtualCamera`` offline and on a real qCMOS -- only the data source
-changes.  That is the "virtual == real" core principle (AGENTS.md §2).  For the
-offline convenience wrapper that builds a ``VirtualCamera`` see
-``neutral_atom.devices.virtual.virtual_loading_readout``.
+changes.  That is the "virtual == real" core principle (AGENTS.md §2).
 
-Producers run either synchronously (call ``step()`` yourself: deterministic tests)
+Logic nodes run either synchronously (call ``step()`` yourself: deterministic tests)
 or in a background thread (``start(rate_hz)``); the hub is the only shared state.
 """
 
@@ -40,15 +40,15 @@ from ..devices.base import CameraDevice
 from ..timing import imaging_channel_kwargs, imaging_sequence
 
 
-class Producer:
-    """Base producer: owns the publish loop; subclasses implement one ``shot()``.
+class LogicNode:
+    """Base logic node: owns the publish loop; subclasses implement one ``shot()``.
 
     ``layer`` names which of the five architecture layers this node IS
     (measurement / processor / task) and ``node_label`` is its short human name
     (``camera`` / ``detect`` / ``calibrate`` / a measurement's own name).  The GUI
     shows ``display_label`` (``<prefix><node_label>``) + ``layer`` in a panel's
     signal-flow legend, so the dashboard speaks in LAYER terms -- never the Python
-    class name (no "Feed" leaking into the UI)."""
+    class name."""
 
     layer = "node"
     node_label = "node"
@@ -79,7 +79,7 @@ class Producer:
 
     @property
     def display_label(self) -> str:
-        """Short human name for this producer in the GUI -- its LAYER node name
+        """Short human name for this logic node in the GUI -- its LAYER node name
         (``camera`` / ``detect`` / ``calibrate`` / a measurement's curve), NEVER the
         Python class name.  The hub prefix is a signal-namespacing detail, not part of
         the label (the namespaced signal names shown alongside disambiguate A/B)."""
@@ -94,7 +94,7 @@ class Producer:
         """Run ONE shot synchronously and publish it (test/notebook friendly).
 
         A shot that returns an EMPTY mapping is a no-op: nothing is published and the
-        shot counter does not advance.  This lets a REACTIVE producer (a
+        shot counter does not advance.  This lets a REACTIVE logic node (a
         :class:`Processor` that transforms another signal) tick at its own rate yet
         only emit when its input actually advanced."""
         values = self.shot()
@@ -102,7 +102,7 @@ class Producer:
             return {}
         values = self._postprocess(values)
         if not values:
-            return {}   # a producer (e.g. a repeat-averaging measurement) may suppress this tick
+            return {}   # a logic node (e.g. a repeat-averaging measurement) may suppress this tick
         named = {self.prefix + key: value for key, value in values.items()}
         self.hub.publish(named)
         self.shots += 1
@@ -113,11 +113,11 @@ class Producer:
         base; :class:`Measurement` applies its ``update_mode`` accumulation here."""
         return values
 
-    def start(self, *, rate_hz: float = 5.0) -> "Producer":
+    def start(self, *, rate_hz: float = 5.0) -> "LogicNode":
         """Publish shots from a daemon thread at ``rate_hz`` until ``stop()``."""
         if self._thread is not None and self._thread.is_alive():
             return self
-        self.rate_hz = float(rate_hz)   # remembered so a paused feed can resume at the same rate
+        self.rate_hz = float(rate_hz)   # remembered so a paused node can resume at the same rate
         self._stop.clear()
         period = 1.0 / max(0.1, float(rate_hz))
 
@@ -140,19 +140,19 @@ class Producer:
                     # (the operator otherwise just sees frozen, stale data).
                     self.last_error = f"{type(exc).__name__}: {exc}"
                     self.consecutive_errors += 1
-                    self.hub.publish({self.prefix + "feed_error": float(self.consecutive_errors)})
+                    self.hub.publish({self.prefix + "node_error": float(self.consecutive_errors)})
                     self._stop.wait(period)
                     continue
                 if self.consecutive_errors:
                     # Recovered: clear the banner so a transient hiccup doesn't stick.
                     self.last_error = None
                     self.consecutive_errors = 0
-                    self.hub.publish({self.prefix + "feed_error": 0.0})
+                    self.hub.publish({self.prefix + "node_error": 0.0})
                 remaining = period - (time.monotonic() - started)
                 if remaining > 0:
                     self._stop.wait(remaining)
 
-        self._thread = threading.Thread(target=_loop, name=f"zlc-feed-{self.prefix or 'main'}", daemon=True)
+        self._thread = threading.Thread(target=_loop, name=f"zlc-node-{self.prefix or 'main'}", daemon=True)
         self._thread.start()
         return self
 
@@ -168,22 +168,22 @@ class Producer:
         return self._thread is not None and self._thread.is_alive()
 
     def published_signals(self) -> frozenset:
-        """The signal names this feed publishes (behind ``prefix``).  Lets a
-        consumer (e.g. the task console) map a panel back to the feed that
-        produces its data, then expose THAT feed's parameters.  Subclasses with
+        """The signal names this logic node publishes (behind ``prefix``).  Lets a
+        consumer (e.g. the task console) map a panel back to the node that
+        produces its data, then expose THAT node's parameters.  Subclasses with
         a fixed signal set override this; the base publishes nothing structured."""
         return frozenset()
 
     # --------------------------------------------------- acquisition parameters
-    # A panel is a VIEW; the feed is the producer; behind the feed sits the data
-    # SOURCE (a camera, or the feed's own analysis).  A panel's Edit tab edits the
+    # A panel is a VIEW; a logic node produces the data; behind the node sits the data
+    # SOURCE (a camera, or the node's own analysis).  A panel's Edit tab edits the
     # source through these two methods, so e.g. a raw-frame panel can tune the
     # camera's exposure/ROI.  The source -- not __init__ reflection -- decides
     # what is editable.
     def acquisition_parameters(self) -> dict[str, object]:
-        """Editable parameters of the data SOURCE behind this feed, as
+        """Editable parameters of the data SOURCE behind this logic node, as
         ``{name: current_value}`` (e.g. a camera's ``exposure``/``roi``, or this
-        feed's analysis settings).  Default: nothing editable."""
+        node's analysis settings).  Default: nothing editable."""
         return {}
 
     def set_acquisition_parameters(self, **values) -> None:
@@ -201,7 +201,7 @@ class Producer:
         QUEUED and the loop applies it between shots (``_apply_pending_params``):
         the source re-arms in the owning thread with no second ``acquire()`` ever
         running on it, and the GUI never blocks on a join.  The live Monitor keeps
-        streaming and the next published frame reflects the change.  When the feed
+        streaming and the next published frame reflects the change.  When the node
         is idle, the edit is applied immediately and one fresh shot is published so
         a viewer reflects it at once."""
         if self.running:
@@ -252,15 +252,15 @@ class Producer:
         return {}
 
 
-# ===================================================================== producer kinds
-# The three concrete producer KINDS that compose a task console.  All share the
-# Producer worker-loop/publish/param-queue/cancel infrastructure above; they differ
+# ===================================================================== logic node kinds
+# The three concrete logic node KINDS that compose a task console.  All share the
+# LogicNode worker-loop/publish/param-queue/cancel infrastructure above; they differ
 # only in WHERE their per-shot values come from:
 #   Measurement -- ACQUIRES from devices (camera/sequencer), update_mode-driven.
 #   Processor   -- TRANSFORMS hub signals into derived signals (no acquisition).
 #   Task        -- ORCHESTRATES the others over a multi-step flow, with mid-run output.
-class Measurement(Producer):
-    """A producer that ACQUIRES data from devices and publishes named signals.
+class Measurement(LogicNode):
+    """A logic node that ACQUIRES data from devices and publishes named signals.
 
     Continuous vs swept is just ``update_mode`` (how successive shots accumulate),
     not a separate class.  Concrete measurements implement ``shot()``."""
@@ -291,7 +291,7 @@ class Measurement(Producer):
         """Apply ``update_mode`` to a raw shot before publish.
 
         ``roll`` / ``replace`` pass through (per-shot publish; the rolling-vs-overwrite
-        VIEW is the plot's relim, not the producer's job).  ``single`` publishes once
+        VIEW is the plot's relim, not the node's job).  ``single`` publishes once
         then self-stops.  ``average`` publishes the cumulative running mean of every
         numeric signal.  ``repeat`` accumulates ``repeats`` shots and publishes only
         their mean (suppressing the in-between ticks)."""
@@ -319,14 +319,14 @@ class Measurement(Producer):
         return mean
 
 
-class Processor(Producer):
-    """A producer that TRANSFORMS hub signals into derived signals (the "func" layer).
+class Processor(LogicNode):
+    """A logic node that TRANSFORMS hub signals into derived signals (the "func" layer).
 
     It consumes one or more named signals, computes, and publishes -- with NO device
     acquisition of its own.  REACTIVE: it only emits when a consumed signal advanced
     since the last tick (tracked via the hub's per-signal version), so it runs as a
-    live graph node beside the measurement that feeds it, at its own poll rate, and
-    no-ops (``shot`` returns ``{}``) when there is nothing new."""
+    live graph node beside the measurement that produces its input, at its own poll
+    rate, and no-ops (``shot`` returns ``{}``) when there is nothing new."""
 
     layer = "processor"
     node_label = "processor"
@@ -366,7 +366,7 @@ class DetectProcessor(Processor):
     Consumes a camera ``frame`` signal and runs the SAME ``calibration.detect``
     contract the notebook/real readout uses, publishing per-site occupancy/counts +
     a running loading rate.  THIS is the virtual==real split: the camera produces
-    frames (a Measurement); detection is a SEPARATE node here -- not one feed
+    frames (a Measurement); detection is a SEPARATE node here -- not one node
     fabricating every signal.  The calibration (site centers + per-site thresholds)
     comes from a prior calibrate-readout Task, exactly as on real hardware.
 
@@ -446,8 +446,8 @@ class TaskOutput:
         self.hub.publish({self.prefix + str(key): value for key, value in signals.items()})
 
 
-class Task(Producer):
-    """A producer that ORCHESTRATES devices/measurements/processors over a multi-step
+class Task(LogicNode):
+    """A logic node that ORCHESTRATES devices/measurements/processors over a multi-step
     flow and may emit MID-RUN output to a dedicated panel (confocal-style).
 
     One-shot: ``step()`` runs the whole ``run(out)`` flow once, publishes its final
@@ -472,7 +472,7 @@ class Task(Producer):
 
     def shot(self) -> dict[str, object]:
         # One-shot: stop the loop after THIS publish (a run() that raises is reported
-        # via feed_error and NOT retried), exactly like a finite scan / processor.
+        # via node_error and NOT retried), exactly like a finite scan / processor.
         self._stop.set()
         out = TaskOutput(self.hub, prefix=self.prefix)
         self.result = {str(key): value for key, value in dict(self.run(out)).items()}
@@ -503,10 +503,16 @@ class CalibrateReadoutTask(Task):
     provides = ("centers", "thresholds", "n_sites")
     mid_run = ("frame", "progress")    # streamed to the dedicated mid-run panel
 
+    # The user-facing mode names map to the calibration's (sitemap_method,
+    # threshold_method) pair: box+otsu, per-site/uniform PSF + (otsu|bimodal).
+    MODE_TO_SITEMAP_METHOD = {"box": "box", "per-site PSF": "psf", "uniform PSF": "uniform_psf"}
+
     def __init__(self, hub: SignalHub, camera: CameraDevice, *, sequencer: object | None = None,
                  grid_shape: tuple[int, int] = (5, 7), exposure: float = 0.02, roi_radius: int = 1,
                  calibration_frames: int = 4, threshold_frames: int = 24, method: str = "box",
-                 save_path: str | None = None, prefix: str = ""):
+                 mode: str | None = None, threshold_method: str = "otsu",
+                 source: str = "live", data_dir: str | None = None,
+                 save_path: str | None = None, load_path: str | None = None, prefix: str = ""):
         super().__init__(hub, prefix=prefix)
         self.camera = camera
         self.sequencer = sequencer
@@ -515,24 +521,47 @@ class CalibrateReadoutTask(Task):
         self.roi_radius = int(roi_radius)
         self.calibration_frames = max(1, int(calibration_frames))
         self.threshold_frames = max(2, int(threshold_frames))
-        self.method = str(method)
+        # ``mode`` is the user-facing name (box / per-site PSF / uniform PSF); the
+        # legacy ``method`` (box|psf|uniform_psf) is the resolved sitemap method.
+        if mode is not None:
+            self.mode = str(mode)
+        else:
+            self.mode = next((m for m, v in self.MODE_TO_SITEMAP_METHOD.items() if v == str(method)), "box")
+        self.threshold_method = str(threshold_method)
+        self.source = str(source)
+        self.data_dir = data_dir
         self.save_path = save_path
+        self.load_path = load_path
         self.calibration = None
 
+    @property
+    def method(self) -> str:
+        """Resolved sitemap method (box | psf | uniform_psf) for the chosen mode."""
+        return self.MODE_TO_SITEMAP_METHOD.get(self.mode, "box")
+
     def acquisition_parameters(self) -> dict[str, object]:
-        """The calibrate task's tunable parameters (sitemap grid + frame counts +
-        method), as ``{name: current}`` -- shown in the panel's Edit and applied
-        before the next Run."""
+        """The calibrate task's tunable parameters (source + sitemap grid + frame
+        counts + mode + threshold + save/load paths), as ``{name: current}`` --
+        shown in the panel's Edit and applied before the next Run."""
         return {
+            "source": str(self.source),
+            "data_dir": "" if self.data_dir is None else str(self.data_dir),
             "grid_shape": tuple(self.grid_shape),
             "exposure": float(self.exposure),
             "roi_radius": int(self.roi_radius),
             "calibration_frames": int(self.calibration_frames),
             "threshold_frames": int(self.threshold_frames),
-            "method": str(self.method),
+            "mode": str(self.mode),
+            "threshold_method": str(self.threshold_method),
+            "save_path": "" if self.save_path is None else str(self.save_path),
+            "load_path": "" if self.load_path is None else str(self.load_path),
         }
 
     def set_acquisition_parameters(self, **values) -> None:
+        if "source" in values:
+            self.source = str(values["source"])
+        if "data_dir" in values:
+            self.data_dir = str(values["data_dir"]) or None
         if "grid_shape" in values:
             self.grid_shape = grid_shape_tuple(values["grid_shape"])
         if "exposure" in values:
@@ -543,10 +572,45 @@ class CalibrateReadoutTask(Task):
             self.calibration_frames = max(1, int(values["calibration_frames"]))
         if "threshold_frames" in values:
             self.threshold_frames = max(2, int(values["threshold_frames"]))
-        if "method" in values:
-            self.method = str(values["method"])
+        if "mode" in values:
+            self.mode = str(values["mode"])
+        if "threshold_method" in values:
+            self.threshold_method = str(values["threshold_method"])
+        if "save_path" in values:
+            self.save_path = str(values["save_path"]) or None
+        if "load_path" in values:
+            self.load_path = str(values["load_path"]) or None
 
     def run(self, out: "TaskOutput") -> dict:
+        # Load an existing calibration outright (no acquisition) when a load path
+        # is given -- the user reuses a saved centers+thresholds artifact.
+        if self.load_path:
+            from ..core.calibration import TrapCalibration
+            self.calibration = TrapCalibration.load(self.load_path)
+            out.publish(progress=1.0)
+            centers = np.asarray(self.calibration.centers, dtype=float)
+            thr = np.asarray(self.calibration.thresholds, dtype=float).reshape(-1)
+            return {"centers": centers, "thresholds": thr, "n_sites": float(len(centers))}
+        if str(self.source) == "folder":
+            calibration = self._run_from_folder(out)
+        else:
+            calibration = self._run_live(out)
+        self.calibration = calibration
+        out.publish(progress=1.0)
+        centers = np.asarray(self.calibration.centers, dtype=float)
+        thr = np.asarray(self.calibration.thresholds, dtype=float).reshape(-1)
+        if self.save_path:
+            # A .npz / .json path saves the full calibration (so load_path can
+            # restore it); a bare path falls back to the centers+thresholds npz.
+            from pathlib import Path as _Path
+            if _Path(self.save_path).suffix.lower() in (".npz", ".json"):
+                self.calibration.save(self.save_path)
+            else:
+                np.savez(self.save_path, centers=centers, thresholds=thr)
+        return {"centers": centers, "thresholds": thr, "n_sites": float(len(centers))}
+
+    def _run_live(self, out: "TaskOutput"):
+        """Acquire frames now (camera + pulse) and calibrate the sitemap + thresholds."""
         from .calibration import calibrate_sitemap_from_images, calibrate_threshold_from_images
         channel_kwargs = imaging_channel_kwargs(self.sequencer)
         sitemap_seq = imaging_sequence(exposure=self.exposure, load=True, name="sitemap", **channel_kwargs)
@@ -556,94 +620,36 @@ class CalibrateReadoutTask(Task):
         out.publish(frame=np.asarray(template[-1], dtype=float), progress=0.4)
         sitemap = calibrate_sitemap_from_images(
             template, grid_shape=self.grid_shape, roi_radius=self.roi_radius, method=self.method, display=False)
-        calibration = sitemap.calibration
         samples = self.camera.acquire(self.threshold_frames, sequence=readout_seq,
                                       sequencer=self.sequencer, stop=self._stop)
         out.publish(frame=np.asarray(samples[-1], dtype=float), progress=0.85)
-        thresholds = calibrate_threshold_from_images(samples, calibration, display=False)
-        self.calibration = thresholds.calibration
-        out.publish(progress=1.0)
-        centers = np.asarray(self.calibration.centers, dtype=float)
-        thr = np.asarray(self.calibration.thresholds, dtype=float).reshape(-1)
-        if self.save_path:
-            np.savez(self.save_path, centers=centers, thresholds=thr)
-        return {"centers": centers, "thresholds": thr, "n_sites": float(len(centers))}
+        thresholds = calibrate_threshold_from_images(
+            samples, sitemap.calibration, method=self.threshold_method, display=False)
+        return thresholds.calibration
+
+    def _run_from_folder(self, out: "TaskOutput"):
+        """Calibrate from frames SAVED IN A FOLDER (the real-data flow): index the
+        run, fit the sitemap from the reference template, then per-site thresholds."""
+        from .calibration import calibrate_sitemap_from_images, calibrate_threshold_from_images
+        from .imageio import index_run
+        if not self.data_dir:
+            raise ValueError("source='folder' needs a data_dir folder path.")
+        run = index_run(self.data_dir, "img")
+        template_frames = list(run.template_frames())
+        if template_frames:
+            out.publish(frame=np.asarray(template_frames[-1], dtype=float), progress=0.4)
+        sitemap = calibrate_sitemap_from_images(
+            template_frames, grid_shape=self.grid_shape, roi_radius=self.roi_radius,
+            method=self.method, display=False)
+        samples = list(run.short_frames())
+        if samples:
+            out.publish(frame=np.asarray(samples[-1], dtype=float), progress=0.85)
+        thresholds = calibrate_threshold_from_images(
+            samples, sitemap.calibration, method=self.threshold_method, display=False)
+        return thresholds.calibration
 
 
-class LoadingReadout:
-    """The loading readout COMPOSED from separate nodes -- the camera produces
-    frames, detection is its own node, and calibration is a one-shot Task, so no
-    single producer fabricates every signal.
-
-    Holds a :class:`CalibrateReadoutTask` (produces the calibration), a
-    :class:`CameraFrameFeed` (the camera Measurement: publishes ``frame``), and a
-    :class:`DetectProcessor` (runs the REAL per-frame detect off ``frame``).
-    ``calibrate()`` runs the task once and wires its calibration into the detector;
-    ``start``/``stop`` run camera + detector together.  ``producers`` are the live
-    nodes a console adds as panels.  virtual == real: only the camera frames differ."""
-
-    def __init__(self, calibrate_task: "CalibrateReadoutTask", camera: "CameraFrameFeed",
-                 detect: "DetectProcessor"):
-        self.calibrate_task = calibrate_task
-        self.camera = camera
-        self.detect = detect
-
-    @property
-    def producers(self) -> tuple:
-        """The live producer nodes (camera Measurement + DetectProcessor)."""
-        return (self.camera, self.detect)
-
-    def calibrate(self):
-        """Run the calibrate task once and feed its calibration to the detector."""
-        self.calibrate_task.run_to_completion()
-        self.detect.calibration = self.calibrate_task.calibration
-        return self.detect.calibration
-
-    def start(self, *, rate_hz: float = 5.0) -> "LoadingReadout":
-        # The calibrate task runs on its OWN worker thread (one-shot, self-stops); the
-        # detector no-ops until its calibration is ready (lazy source) -- so the GUI
-        # never blocks on calibration.  Camera + detector stream from the start.
-        if self.detect.calibration is None and self.calibrate_task.calibration is None:
-            self.calibrate_task.start(rate_hz=max(float(rate_hz), 1.0))
-        self.camera.start(rate_hz=rate_hz)
-        self.detect.start(rate_hz=rate_hz)
-        return self
-
-    def stop(self) -> None:
-        self.camera.stop()
-        self.detect.stop()
-        self.calibrate_task.stop()
-
-
-def build_loading_readout(hub: SignalHub, camera: CameraDevice, *, sequencer: object | None = None,
-                          grid_shape: tuple[int, int] = (5, 7), exposure: float = 0.02,
-                          roi_radius: int = 1, ema: float = 0.05, calibration_frames: int = 4,
-                          threshold_frames: int = 24, method: str = "box",
-                          save_path: str | None = None, prefix: str = "") -> LoadingReadout:
-    """Compose the loading readout over a camera contract (real or virtual): a
-    calibrate task + a frame Measurement + a detect Processor, all sharing ``hub``.
-
-    The camera Measurement + detect Processor publish under ``prefix`` (the live
-    chain: camera -> ``frame`` -> detect -> occupied/rate).  The calibrate task
-    publishes its MID-RUN output + result under ``<prefix>cal_`` (``cal_frame`` /
-    ``cal_progress`` / ``cal_centers`` ...) so its template frames never clobber the
-    live ``frame`` -- and a dedicated 'calibrating' panel can watch ``cal_frame`` /
-    ``cal_progress``.  The detector takes the calibration OBJECT from the task (not
-    via the hub), so the chain has NO monolithic feed and no signal-name collision."""
-    task = CalibrateReadoutTask(
-        hub, camera, sequencer=sequencer, grid_shape=grid_shape, exposure=exposure,
-        roi_radius=roi_radius, calibration_frames=calibration_frames,
-        threshold_frames=threshold_frames, method=method, save_path=save_path, prefix=f"{prefix}cal_")
-    frame_measurement = CameraFrameFeed(hub, camera, sequencer=sequencer, prefix=prefix)
-    detect = DetectProcessor(hub, calibration=None, source=f"{prefix}frame", grid_shape=grid_shape,
-                             ema=ema, prefix=prefix)
-    # The detector lazily picks up the calibration the moment the task finishes, so the
-    # live chain never blocks waiting for calibration (it no-ops until then).
-    detect.calibration_source = lambda: task.calibration
-    return LoadingReadout(task, frame_measurement, detect)
-
-
-class CameraFrameFeed(Measurement):
+class CameraMeasurement(Measurement):
     """Stream RAW camera frames into the hub, no site analysis.  The data SOURCE is
     the camera itself, so the editable acquisition parameters ARE the camera's own
     settings -- ``exposure`` and ``roi`` -- applied live (``camera.configure``).
@@ -656,10 +662,10 @@ class CameraFrameFeed(Measurement):
     pulse that triggers the camera TWICE (e.g. a release-recapture / two-readout "T"
     sequence) must set ``frames_per_cycle=2``; otherwise ``acquire(1)`` reads only
     the FIRST trigger's frame each cycle and the second is dropped -- which is why a
-    single-frame feed always shows the first emCCD image.  Put ``value = frame_0`` on
+    single-frame measurement always shows the first emCCD image.  Put ``value = frame_0`` on
     one panel and ``value = frame_1`` on another to watch the two triggers side by
     side.  (``frames_per_cycle`` must match the camera-trigger count per cycle so the
-    per-trigger assignment stays phase-aligned; for a feed that FIRES the sequence,
+    per-trigger assignment stays phase-aligned; for a measurement that FIRES the sequence,
     ``acquire`` enforces frames == trigger count.)"""
 
     node_label = "camera"
@@ -703,7 +709,7 @@ class CameraFrameFeed(Measurement):
 
     def set_acquisition_parameters(self, **values) -> None:
         if "frames_per_cycle" in values:
-            self.frames_per_cycle = max(1, int(values["frames_per_cycle"]))   # feed-side, not a camera prop
+            self.frames_per_cycle = max(1, int(values["frames_per_cycle"]))   # measurement-side, not a camera prop
         kw: dict[str, object] = {}
         if "exposure" in values:
             kw["exposure"] = float(values["exposure"])
@@ -732,12 +738,12 @@ class CameraFrameFeed(Measurement):
         return {"region": [int(round(x0)), int(round(x1)), int(round(y0)), int(round(y1))]}
 
 
-class ScannedMeasurementFeed(Measurement):
+class ScannedMeasurementNode(Measurement):
     """Drive a :class:`ScannedMeasurement` one scan point per ``shot()``, into a hub.
 
-    Wraps a swept measurement as a console feed (``start``/``stop``/``running``)
+    Wraps a swept measurement as a console logic node (``start``/``stop``/``running``)
     so a finite scan grows a live curve in the task console exactly as the
-    free-running loading feed grows a rate trace.  Each ``shot()`` advances ONE
+    free-running loading rate trace grows.  Each ``shot()`` advances ONE
     scan point through the measurement's contract path
     (``measurement.measure(value, index)`` -> ``camera.acquire`` + ``calibration``)
     and publishes the CUMULATIVE curve so far, so a Monitor 1-D panel
@@ -758,7 +764,7 @@ class ScannedMeasurementFeed(Measurement):
     ``scan_done``       0 while running, 1 once the final point has been published
     ``shot``            scalar shot counter
 
-    Finite-scan semantics: after the last point is published the feed sets its
+    Finite-scan semantics: after the last point is published the node sets its
     own stop event, so a background ``start()`` thread exits on its own once the
     sweep completes; ``finished`` reports completion and ``run_to_completion()``
     runs every remaining point synchronously (tests / headless).
@@ -776,7 +782,7 @@ class ScannedMeasurementFeed(Measurement):
     ):
         super().__init__(hub, prefix=prefix)
         self.measurement = measurement
-        # Share the feed's stop event so a Stop interrupts a wedged trigger
+        # Share the node's stop event so a Stop interrupts a wedged trigger
         # MID-scan-point (the engine's per-point camera.acquire honours it), not
         # only between points.
         try:
@@ -787,7 +793,7 @@ class ScannedMeasurementFeed(Measurement):
         self.y_key = str(y_key)
         self.node_label = str(y_key)   # GUI flow legend shows the curve it produces
         self.grid_shape = None if grid_shape is None else grid_shape_tuple(grid_shape)
-        # The measurement owns the swept values (single source of truth); the feed
+        # The measurement owns the swept values (single source of truth); the node
         # only walks its index and accumulates the (x, y) seen so far.
         self._values = np.asarray(measurement.axis.values, dtype=float).reshape(-1)
         self._index = 0
@@ -812,12 +818,12 @@ class ScannedMeasurementFeed(Measurement):
         """Advance ONE scan point and return the cumulative curve so far.
 
         Raises ``StopIteration`` if called after the sweep is finished -- the
-        ``start()`` loop never does (the feed stops itself), and tests check
+        ``start()`` loop never does (the node stops itself), and tests check
         ``finished`` first.
         """
 
         if self.finished:
-            raise StopIteration("ScannedMeasurementFeed: scan already complete.")
+            raise StopIteration("ScannedMeasurementNode: scan already complete.")
         index = self._index
         value = float(self._values[index])
         row = np.atleast_1d(np.asarray(self.measurement.measure(value, index), dtype=float))
@@ -852,7 +858,7 @@ class ScannedMeasurementFeed(Measurement):
             self._stop.set()
         return named
 
-    def run_to_completion(self) -> "ScannedMeasurementFeed":
+    def run_to_completion(self) -> "ScannedMeasurementNode":
         """Synchronously run + publish every remaining scan point (test/headless)."""
 
         while not self.finished:
@@ -865,20 +871,24 @@ class ScannedMeasurementFeed(Measurement):
         return frozenset(self.prefix + key for key in keys)
 
 
-class ProcessorFeed(Producer):
-    """One-shot DATA-PROCESSING action feed: runs a :class:`ProcessorSpec` ONCE,
+class ProcessorRun(LogicNode):
+    """One-shot DATA-PROCESSING logic node: runs a :class:`ProcessorSpec` ONCE,
     publishes its result dict to the hub, and self-stops -- the discrete sibling of
-    :class:`ScannedMeasurementFeed` (a finite scan).  It DRIVES the spec's
+    :class:`ScannedMeasurementNode` (a finite scan).  It DRIVES the spec's
     ``run(ctx)`` and owns no analysis itself.
 
     The cooperative-stop event is shared with the run via the context, so a long
     camera grab inside ``run`` cancels cleanly on ``stop()`` (the SOLE-camera-owner
-    invariant: the run executes on this feed's own thread, never a second acquire)."""
+    invariant: the run executes on this node's own thread, never a second acquire)."""
+
+    layer = "processor"
+    node_label = "processor"
 
     def __init__(self, hub: SignalHub, spec, *, readout, camera=None,
                  sequencer: object | None = None, params: dict | None = None, prefix: str = ""):
         super().__init__(hub, prefix=prefix)
         self.spec = spec
+        self.node_label = getattr(spec, "name", "processor")
         self._readout = readout
         self._camera = camera
         self._sequencer = sequencer
@@ -891,7 +901,7 @@ class ProcessorFeed(Producer):
 
         # One-shot: stop the loop after THIS publish no matter what.  Setting the
         # stop up front means a run() that raises (reported by the loop as
-        # feed_error) is NOT retried -- a deterministic processing action runs once.
+        # node_error) is NOT retried -- a deterministic processing action runs once.
         self._stop.set()
         ctx = ProcessorContext(
             readout=self._readout, params=self._params,
@@ -903,7 +913,7 @@ class ProcessorFeed(Producer):
         out["processor_done"] = 1.0
         return out
 
-    def run_to_completion(self) -> "ProcessorFeed":
+    def run_to_completion(self) -> "ProcessorRun":
         """Run the action once synchronously and publish its result (test/headless)."""
 
         if not self.finished:
@@ -917,15 +927,13 @@ class ProcessorFeed(Producer):
 
 __all__ = [
     "CalibrateReadoutTask",
-    "CameraFrameFeed",
+    "CameraMeasurement",
     "DetectProcessor",
-    "LoadingReadout",
     "Measurement",
     "Processor",
-    "Producer",
-    "ProcessorFeed",
-    "ScannedMeasurementFeed",
+    "ProcessorRun",
+    "LogicNode",
+    "ScannedMeasurementNode",
     "Task",
     "TaskOutput",
-    "build_loading_readout",
 ]

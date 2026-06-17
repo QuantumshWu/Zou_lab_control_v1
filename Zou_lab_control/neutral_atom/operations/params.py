@@ -76,7 +76,7 @@ class ParamField:
 
 
 _TYPE_KIND = {float: "float", int: "int", bool: "bool", str: "str"}
-# Parameter names every producer takes by INJECTION (devices / wiring), never a UI field.
+# Parameter names every logic node takes by INJECTION (devices / wiring), never a UI field.
 INJECTED = frozenset({"self", "cls", "hub", "camera", "sequencer", "out", "calibration", "prefix"})
 
 

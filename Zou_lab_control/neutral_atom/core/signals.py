@@ -1,6 +1,6 @@
 """Named live-signal hub: the contract between an experiment loop and live views.
 
-An experiment feed (real or virtual) ``publish()``-es a dict of named values once
+An experiment logic node (real or virtual) ``publish()``-es a dict of named values once
 per shot -- scalars (loading rate) or arrays (camera frame, per-site counts).  A
 consumer (the task console) polls ``latest()``/``history()`` and uses ``version``
 to skip work when nothing new arrived.  The hub is the ONLY shared state between
@@ -29,9 +29,9 @@ class SignalHub:
         self._version = 0
         self._shot = 0
         # Per-signal publish counter: lets a consumer tell "MY signal got a new
-        # sample" from "the global version bumped because some OTHER feed
+        # sample" from "the global version bumped because some OTHER logic node
         # published" -- e.g. a rolling monitor must append one point per sample
-        # of its own source, not one per unrelated feed tick.
+        # of its own source, not one per unrelated logic node tick.
         self._sig_version: dict[str, int] = {}
 
     # ------------------------------------------------------------- publish side
@@ -39,7 +39,7 @@ class SignalHub:
         """Record one shot's worth of named values; returns the new version.
 
         Every value is coerced to a float ndarray (scalars become 0-d) and COPIED,
-        so the producer may freely reuse its buffers.
+        so the logic node may freely reuse its buffers.
         """
 
         with self._lock:
@@ -67,7 +67,7 @@ class SignalHub:
         """``{name: publish_count}`` snapshot -- one counter per signal, bumped
         each time that name is published.  A consumer compares a name's counter
         across ticks to detect a NEW sample of THAT signal (vs. a global version
-        bump caused by an unrelated feed)."""
+        bump caused by an unrelated logic node)."""
         with self._lock:
             return dict(self._sig_version)
 
@@ -100,7 +100,7 @@ class SignalHub:
         """Last ``n`` shots of ``name`` stacked on axis 0 (shape ``(shots, *value_shape)``).
 
         Shorter-than-``n`` history returns what exists; shapes that changed over time
-        keep only the run of MOST RECENT shots with the current shape (a feed that
+        keep only the run of MOST RECENT shots with the current shape (a logic node that
         reconfigured mid-run must not corrupt the stack).
         """
 

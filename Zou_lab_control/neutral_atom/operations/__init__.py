@@ -2,17 +2,15 @@
 
 from .calibration import calibrate_sitemap_from_images, calibrate_threshold_from_images
 from .detection import detect_image
-from .feeds import (
+from .logic import (
     CalibrateReadoutTask,
-    CameraFrameFeed,
+    CameraMeasurement,
     DetectProcessor,
-    LoadingReadout,
     Measurement,
     Processor,
-    Producer,
-    ScannedMeasurementFeed,
+    LogicNode,
+    ScannedMeasurementNode,
     Task,
-    build_loading_readout,
 )
 from .fidelity import (
     FidelityReport,
@@ -58,10 +56,10 @@ __all__ = [
     "calibrate_sitemap_from_images",
     "calibrate_threshold_from_images",
     "characterize_readout",
-    "CameraFrameFeed",
+    "CameraMeasurement",
     "detect_image",
     "discovered_specs",
-    "Producer",
+    "LogicNode",
     "FidelityReport",
     "fit_temperature",
     "measurement",
@@ -71,13 +69,11 @@ __all__ = [
     "frame_files",
     "index_run",
     "load_frame",
-    "LoadingReadout",
     "Measurement",
     "Processor",
     "Task",
     "CalibrateReadoutTask",
     "DetectProcessor",
-    "build_loading_readout",
     "MeasurementSpec",
     "NFramePlan",
     "OtsuFidelityReducer",
@@ -91,7 +87,7 @@ __all__ = [
     "save_frame",
     "ScanAxis",
     "ScannedMeasurement",
-    "ScannedMeasurementFeed",
+    "ScannedMeasurementNode",
     "ScanResult",
     "ShotPlan",
     "SiteFidelity",

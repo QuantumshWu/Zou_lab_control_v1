@@ -19,6 +19,7 @@ from ..operations.measurement import (
     MeasurementSpec,
     NFramePlan,
     OtsuFidelityReducer,
+    ParamDecl,
     ScanAxis,
     ScanResult,
     ScannedMeasurement,
@@ -290,7 +291,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
         bound ``PulseController`` drives its exposure slot and configures the real
         camera per point.  Single source of truth for the detection-time scan:
         both :meth:`_scan_detection_time` (live result wrapper) and the
-        Readout-duration measurement spec / feed call this same builder."""
+        Readout-duration measurement spec / logic node call this same builder."""
 
         s = self._session
         times = np.asarray(times, dtype=float).reshape(-1)
@@ -410,7 +411,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
         ``ReleaseRecapturePlan`` (two frames per point) x a ``SurvivalReducer``
         over the one scan engine.  Single source of truth for release-recapture:
         both :meth:`temperature` (which runs it) and the Temperature measurement
-        spec / feed call this same builder, so the API one-liner and the GUI
+        spec / logic node call this same builder, so the API one-liner and the GUI
         Start button drive identical acquisition.  Validates the bound pulse and
         requires a thresholded calibration (survival is a binary occupancy
         comparison)."""
@@ -515,7 +516,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
         calibration lives there) plus anything a notebook registered via
         ``register_task(...)``.  Each factory receives THIS subsystem, so its
         ``build(hub)`` closure captures the session (camera / sequencer) and returns
-        an UNRUN :class:`~..operations.feeds.Task` that streams mid-run output to a
+        an UNRUN :class:`~..operations.logic.Task` that streams mid-run output to a
         dedicated panel and derives an artifact.  Drop a new module into that package
         and it appears here (and in the console's Add-Panel "Task" group)
         automatically."""
@@ -524,53 +525,73 @@ class ReadoutSubsystem(ExperimentSubsystem):
 
         return discovered_task_specs(self)
 
-    def live_loading_readout(self, hub, **params):
-        """Build the CONTINUOUS loading readout over the session's camera, COMPOSED
-        from separate nodes (a :class:`~..operations.feeds.LoadingReadout`): a
-        calibrate Task + a camera Measurement (publishes ``frame``) + a
-        :class:`DetectProcessor` (runs the REAL per-frame ``calibration.detect`` ->
-        ``rate`` / ``occupied`` / ``rate_sites`` / ``rate_grid`` / ``centers``).  This
-        is the single source the live readout comes from -- a notebook OR the task
-        console (Add Panel -> "Data processing: Loading readout") build the same
-        composed chain, so they cannot drift, and it is NON-BLOCKING: calibration runs
-        on the task's own thread and the detector no-ops until it is ready.  Pass the
-        grid/exposure/roi_radius/ema/method, or rely on the session's default grid."""
-
-        from ..operations.feeds import build_loading_readout
-
-        s = self._session
-        params["grid_shape"] = s._grid_shape(params.get("grid_shape"))
-        return build_loading_readout(hub, s.devices.camera,
-                                     sequencer=getattr(s.devices, "sequencer", None), **params)
-
     def camera_measurement(self, hub, *, prefix: str = "", frames_per_cycle: int = 1):
         """Build a CONTINUOUS camera Measurement over the session camera (a
-        :class:`~..operations.feeds.CameraFrameFeed` publishing raw ``frame``s).
+        :class:`~..operations.logic.CameraMeasurement` publishing raw ``frame``s).
 
-        This is the standalone live-image producer -- the SAME camera node the
-        loading readout composes, but addable on its own (Add Panel ->
-        "Measurement: Camera (live frames)").  Its editable parameters ARE the
-        camera's (exposure / region), applied live; only the camera differs on real
-        hardware (virtual == real)."""
+        This is the standalone live-image logic node -- one of the primitives a
+        notebook or the task console composes the loading readout from by wiring
+        it alongside a :class:`~..operations.logic.DetectProcessor` and a
+        :class:`~..operations.logic.CalibrateReadoutTask`.  Its editable
+        parameters ARE the camera's (exposure / region), applied live; only the
+        camera differs on real hardware (virtual == real)."""
 
-        from ..operations.feeds import CameraFrameFeed
+        from ..operations.logic import CameraMeasurement
 
         s = self._session
-        return CameraFrameFeed(hub, s.devices.camera, sequencer=getattr(s.devices, "sequencer", None),
-                               frames_per_cycle=frames_per_cycle, prefix=prefix)
+        return CameraMeasurement(hub, s.devices.camera, sequencer=getattr(s.devices, "sequencer", None),
+                                 frames_per_cycle=frames_per_cycle, prefix=prefix)
+
+    def camera_spec(self) -> MeasurementSpec:
+        """The camera live stream as a DECLARATIVE spec, so a GUI auto-form renders
+        its editable parameters and the API builds it from the SAME declaration
+        (single source of truth -- the parameters live on the logic side; the UI
+        adapts to them, never the other way round).
+
+        ``frames_per_cycle`` is a build parameter; ``exposure`` is applied LIVE to
+        the camera after the node is built (it is an acquisition parameter the
+        running stream picks up).  ``build(hub, **values)`` returns the same
+        :class:`~..operations.logic.CameraMeasurement` as :meth:`camera_measurement`
+        -- so notebook (``readout.camera_spec().build(hub, exposure=...)``) and GUI
+        share one path."""
+
+        s = self._session
+        exposure = float(s._camera_exposure())
+
+        def _build(hub, *, frames_per_cycle: int = 1, exposure: float = exposure, **_ignored):
+            node = self.camera_measurement(hub, frames_per_cycle=int(frames_per_cycle))
+            if exposure is not None and hasattr(node, "apply_acquisition_parameters"):
+                node.apply_acquisition_parameters(exposure=float(exposure))
+            return node
+
+        return MeasurementSpec(
+            name="Camera (live frames)",
+            params=(
+                ParamDecl(key="frames_per_cycle", label="frames / cycle", kind="int",
+                          default=1, lo=1, hi=10000,
+                          tooltip="Camera frames acquired per publish cycle."),
+                ParamDecl(key="exposure", label="exposure", kind="float",
+                          default=exposure, unit="s", lo=0.0, hi=100.0,
+                          tooltip="Camera exposure time (applied live to the camera)."),
+            ),
+            result_labels=("shot", "frame"),
+            x_key="frame", y_key="frame",
+            build=_build,
+        )
 
     def calibrate_task(self, hub, *, prefix: str = "cal_", **params):
         """Build the calibrate-readout TASK over the session camera (the sitemap +
         per-site threshold calibration as a first-class one-shot
-        :class:`~..operations.feeds.CalibrateReadoutTask`).
+        :class:`~..operations.logic.CalibrateReadoutTask`).
 
         Run it from the console (Add Panel -> "Task: Calibrate readout"): mid-run it
         streams its template frames + a progress fraction to a dedicated panel
         (``<prefix>frame`` / ``<prefix>progress``, confocal-task style) and produces a
-        ``TrapCalibration`` (+ optional npz artifact).  Same calibration primitives
-        the notebook/real readout uses -- only the camera frames differ."""
+        ``TrapCalibration`` (+ optional npz artifact) that a DetectProcessor then
+        consumes.  Same calibration primitives the notebook/real readout uses --
+        only the camera frames differ."""
 
-        from ..operations.feeds import CalibrateReadoutTask
+        from ..operations.logic import CalibrateReadoutTask
 
         s = self._session
         params["grid_shape"] = s._grid_shape(params.get("grid_shape"))

@@ -335,7 +335,7 @@ def imaging_sequence(
 def imaging_channel_kwargs(sequencer: object) -> dict[str, str]:
     """Channel kwargs for :func:`imaging_sequence`, derived from a bound sequencer.
 
-    Single source of truth shared by the session and the loading feed: a real
+    Single source of truth shared by the session and the loading readout: a real
     streamer config names channels ``ch00..chNN`` (the imaging sequence must
     target THOSE, not the ``trap``/``cooling``/``probe``/``emCCD`` placeholder
     names, or every pulse references a channel the device does not have).  Maps

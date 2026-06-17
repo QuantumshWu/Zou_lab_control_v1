@@ -1,5 +1,5 @@
-"""Contract: the auto-generated form renders a producer's ParamField list and reads
-values back, with no per-producer hand-written UI (the P5 auto-UI engine end to end).
+"""Contract: the auto-generated form renders a logic node's ParamField list and reads
+values back, with no per-node hand-written UI (the P5 auto-UI engine end to end).
 
 Offscreen Qt; the form is built from ``params_from_signature`` (the same single source
 the API call uses), so a measurement/processor/task gets its parameter UI for free.

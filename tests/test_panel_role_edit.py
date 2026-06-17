@@ -1,19 +1,13 @@
-"""MECHANICAL guard for the P6 panel ROLE model (the Add-Panel-3-types contract).
+"""MECHANICAL guard for the corrected VIEW / LOGIC split.
 
-A panel's ROLE (orthogonal to its plot KIND) decides how its Edit + Setting are
-composed -- this is what makes "measurement has its own Edit, no fit" / "plotter
-Edit has fit + the measurement's params" / "task Edit" real instead of prose.  The
-design rule (#3) is mechanically forced here so it cannot be silently violated:
-
-  * a "measurement"-role panel's Edit carries the measurement's PARAM FORM but NO
-    curve fit and NO manual-limit row (its Setting also drops the plot-display-only
-    relim/unit knobs);
-  * a "task"-role (data-processing) panel's Edit carries the processing param form,
-    again NO fit;
-  * a "plot"-role panel keeps the FULL plotter Edit -- the whole DataFigure fit set
-    (task #176) -- AND, when its source reads a measurement's result signals, that
-    measurement's param form too (so the plotter Edit = fit + measurement edit);
-  * role round-trips through the saved-layout JSON.
+A Monitor-board PANEL is a pure VIEW: always role "plot", fully decoupled from
+acquisition.  Its Edit carries the FULL plotter set (the whole DataFigure fit set,
+task #176) + manual limits + the display knobs (relim / unit) -- but it NEVER
+carries a measurement/processor param form or a Start/Stop (a plot never produces
+data).  The nodes live on the LOGIC tab as logic nodes (measurement /
+processor / task): each node's Edit is its auto-generated param form + Start / Stop
+and NO curve fit (fitting is a plotter concern).  This is mechanically forced here
+so the decoupling cannot be silently violated.
 
 Offscreen Qt + virtual backend (the same contract path as real hardware).
 """
@@ -52,7 +46,7 @@ def _console(*, measurements=(), processors=(), tasks=(), session=None):
     from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
 
-    console = TaskConsole(hub=SignalHub(), state=default_console_state(), feeds=[],
+    console = TaskConsole(hub=SignalHub(), state=default_console_state(),
                           measurements=measurements, processors=processors, tasks=tasks,
                           session=session, window_px=(1200, 800))
     console._timer.stop()
@@ -60,7 +54,7 @@ def _console(*, measurements=(), processors=(), tasks=(), session=None):
 
 
 def _open_via_add_panel(console, data):
-    """Pick the Add-Panel entry whose itemData == ``data``, add it, return its card."""
+    """Pick the Add-Panel entry whose itemData == ``data``, add it."""
     kc = console.kind_combo
     i = next(j for j in range(kc.count()) if kc.itemData(j) == data)
     kc.setCurrentIndex(i)
@@ -71,10 +65,11 @@ def _open_via_add_panel(console, data):
 def test_panel_config_role_roundtrips_and_validates():
     from Zou_lab_control.frontend.task_console import PanelConfig
 
-    cfg = PanelConfig(kind="1d", role="measurement", source="value = rate")
-    assert cfg.role == "measurement"
-    assert cfg.to_dict()["role"] == "measurement"
-    assert PanelConfig.from_dict(cfg.to_dict()).role == "measurement"
+    # a board panel is always role "plot" -- it is the only valid panel role now
+    cfg = PanelConfig(kind="1d", role="plot", source="value = rate")
+    assert cfg.role == "plot"
+    assert cfg.to_dict()["role"] == "plot"
+    assert PanelConfig.from_dict(cfg.to_dict()).role == "plot"
     # a config WITHOUT a stored role (older layout) defaults to "plot"
     payload = cfg.to_dict(); del payload["role"]
     assert PanelConfig.from_dict(payload).role == "plot"
@@ -82,136 +77,133 @@ def test_panel_config_role_roundtrips_and_validates():
         PanelConfig(kind="1d", role="bogus")
 
 
-# ------------------------------------------------- measurement Edit: NO fit
-def test_measurement_panel_edit_has_param_form_but_no_fit():
-    exp = _calibrated_virtual_session()
-    specs = exp.readout.measurement_specs()
-    console = _console(measurements=specs)
-    try:
-        spec = specs[0]
-        _open_via_add_panel(console, ("measurement", spec.name))
-        card = next(c for c in console.cards if c.config.params.get("measurement") == spec.name)
-        assert card.config.role == "measurement"
-        editor = console._panel_editors[id(card)]
-        # the measurement's OWN param form is present...
-        assert editor.meas_panel is not None
-        # ...but a measurement node is acquisition, not curve analysis: NO fit,
-        # NO manual limits (the role gate that honours #3 without reverting #176).
-        assert editor.fit_combo is None
-        assert editor.xmin is None and editor.ymin is None
-        # its Setting also drops the plot-display-only knobs (relim / unit)
-        assert not hasattr(card, "lim_combo")
-        assert not hasattr(card, "unit_button")
-    finally:
-        console.shutdown()
+def test_logic_node_config_roundtrips_and_validates():
+    from Zou_lab_control.frontend.task_console import LogicNodeConfig
+
+    node = LogicNodeConfig(kind="measurement", name="Temperature", values={"shots": 8})
+    assert node.kind == "measurement" and node.title == "Temperature"
+    assert LogicNodeConfig.from_dict(node.to_dict()).values == {"shots": 8}
+    with pytest.raises(ValueError):
+        LogicNodeConfig(kind="bogus", name="x")
 
 
-# ------------------------------------------------- plot Edit: FULL fit (#176)
-def test_plot_panel_edit_keeps_full_fit_and_display_knobs():
+# ------------------------------------------------- plot Edit: FULL fit (#176), no node form
+def test_plot_panel_edit_keeps_full_fit_no_node_form():
     console = _console()
     try:
         _open_via_add_panel(console, "1d")              # a plain Plot: 1D vector
         card = console.cards[-1]
         assert card.config.role == "plot"
-        editor = console._panel_editors.get(id(card))
-        if editor is None:                              # plain plot opens no Edit tab itself
-            console._edit_card(card)
-            editor = console._panel_editors[id(card)]
+        assert card.config.source == ""                 # blank pure view
+        console._edit_card(card)
+        editor = console._panel_editors[id(card)]
         assert editor.fit_combo is not None             # the whole DataFigure fit set
         assert editor.xmin is not None                  # manual limits present
-        # Setting keeps the plot-display knobs for a plot-role panel
+        # a plot NEVER carries a measurement/processor param form or Start/Stop
+        assert editor.meas_panel is None
+        # Setting keeps the plot-display knobs for a plot panel
         assert hasattr(card, "lim_combo")
         assert hasattr(card, "unit_button")
     finally:
         console.shutdown()
 
 
-# --------------------------- plot reading a measurement's signals: fit + its form
-def test_plot_panel_reading_measurement_signals_links_param_form_and_keeps_fit():
+def test_plot_reading_a_signal_still_has_no_node_form():
+    """Even a plot whose source reads a measurement's result signal carries NO
+    measurement form (fully decoupled) -- you tune the measurement from its OWN
+    Logic-tab node, and you fit on the plot."""
     exp = _calibrated_virtual_session()
     specs = exp.readout.measurement_specs()
-    console = _console(measurements=specs)
+    console = _console(measurements=specs, session=exp)
     try:
         from Zou_lab_control.frontend.task_console import PanelConfig, PanelCard
         spec = specs[0]
-        # a PLOT-role panel whose source reads the measurement's result signal
         cfg = PanelConfig(kind="1d", role="plot", source=f"value = {spec.y_key}")
         card = PanelCard(cfg, parent=console.board, names_provider=console.hub.names)
         console._attach_card(card)
         console._edit_card(card)
         editor = console._panel_editors[id(card)]
-        # the plotter Edit carries the producing measurement's param form (#3)...
-        assert editor.meas_panel is not None
-        # ...AND the full fit (it is a plotter -- #176 stays intact)
-        assert editor.fit_combo is not None
+        assert editor.meas_panel is None                # decoupled: no measurement form
+        assert editor.fit_combo is not None             # the plotter Edit keeps the fit (#176)
     finally:
         console.shutdown()
+        exp.close()
 
 
-# ------------------------------------------------- task Edit: form + Run, NO fit
-def test_data_processing_panel_edit_has_form_but_no_fit():
+# ------------------------------------------- logic-node Edit: param form + Start/Stop, NO fit
+def test_measurement_logic_node_edit_has_form_start_stop_no_fit():
+    exp = _calibrated_virtual_session()
+    specs = exp.readout.measurement_specs()
+    console = _console(measurements=specs, session=exp)
+    try:
+        spec = specs[0]
+        _open_via_add_panel(console, ("measurement", spec.name))
+        row = console.logic_nodes[-1]
+        assert row.node.kind == "measurement"
+        editor = console._logic_editors[id(row)]
+        # the measurement's OWN param form is present, with Start / Stop ...
+        assert editor.form is not None
+        assert set(editor.form._widgets) == {d.key for d in spec.params}
+        assert editor.form.start_button is not None and editor.form.stop_button is not None
+        # ... but a logic node carries NO curve fit, NO manual limits
+        assert not hasattr(editor, "fit_combo")
+    finally:
+        console.shutdown()
+        exp.close()
+
+
+def test_processor_logic_node_edit_has_form_no_fit():
     from Zou_lab_control.neutral_atom.operations.processor import ProcessorSpec
 
     proc = ProcessorSpec(name="DemoProc", params=(),
-                         run=lambda readout: {"demo": 1.0}, result_keys=("demo",))
-    console = _console(processors=[proc])
+                         run=lambda ctx: {"demo": 1.0}, result_keys=("demo",))
+    exp = _calibrated_virtual_session()
+    console = _console(processors=[proc], session=exp)
     try:
         _open_via_add_panel(console, ("processor", proc.name))
-        card = next(c for c in console.cards if c.config.params.get("processor") == proc.name)
-        assert card.config.role == "task"
-        editor = console._panel_editors[id(card)]
-        assert editor.meas_panel is not None            # the data-processing form
-        assert editor.fit_combo is None                 # a task node carries no fit
-        assert not hasattr(card, "lim_combo")
+        row = console.logic_nodes[-1]
+        assert row.node.kind == "processor"
+        editor = console._logic_editors[id(row)]
+        assert editor.form is not None                  # the data-processing form
+        assert not hasattr(editor, "fit_combo")         # a logic node carries no fit
     finally:
         console.shutdown()
+        exp.close()
 
 
-# --------- Add Panel surfaces EVERY layer: camera Measurement + Task (the gap) -----
-def test_camera_measurement_and_task_are_addable_layers_with_clean_labels():
-    """The whole point of task_console: every architecture LAYER is an addable node.
-    A standalone CONTINUOUS camera Measurement and a calibrate Task must each be in
-    Add Panel (not buried in the loading composite), each with its OWN param Edit, and
-    the signal-flow legend must speak in LAYER names -- never a "Feed" class name."""
-    from Zou_lab_control.neutral_atom.operations.feeds import CameraFrameFeed, CalibrateReadoutTask
+# --------- Add Panel surfaces EVERY node layer as a clean-named logic node -----
+def test_camera_and_task_are_addable_logic_layers_with_clean_labels():
+    """Every node LAYER is an addable logic node (not buried in a composite):
+    a camera Measurement + a calibrate Task, each with its OWN param Edit + Start/Stop,
+    each STOPPED until Started, the signal-flow legend never leaking a class name."""
+    from Zou_lab_control.neutral_atom.operations.logic import CameraMeasurement, CalibrateReadoutTask
 
     exp = _calibrated_virtual_session()
     console = _console(tasks=exp.readout.task_specs(), session=exp)
     try:
         kc = console.kind_combo
         entries = {kc.itemData(i): kc.itemText(i) for i in range(kc.count())}
-        # the camera live measurement + the calibrate task are BOTH offered as layers
-        # (the task comes from the auto-discovered @task catalog, by name).
         assert ("camera", "live") in entries and entries[("camera", "live")].startswith("Measurement:")
         assert ("task", "Calibrate readout") in entries and entries[("task", "Calibrate readout")].startswith("Task:")
 
-        # a continuous CAMERA measurement: its own node (CameraFrameFeed), measurement
-        # role, an exposure Edit, NO fit -- and its label is the LAYER name "camera".
+        # camera node: STOPPED; Start builds a CameraMeasurement; label is the LAYER name
         _open_via_add_panel(console, ("camera", "live"))
-        cam_card = next(c for c in console.cards if c.config.title == "Camera (live)")
-        cam = next(f for f in console.feeds if isinstance(f, CameraFrameFeed))
-        assert cam_card.config.role == "measurement"
-        assert console._producer_label(cam) == "camera"        # layer name, not "CameraFrameFeed"
-        cam_ed = console._panel_editors[id(cam_card)]
-        assert cam_ed.fit_combo is None and "exposure" in cam_ed._feed_widgets
+        cam_row = console.logic_nodes[-1]
+        assert cam_row.node.kind == "camera"
+        assert console._logic_nodes[id(cam_row)] is None        # stopped until Start
+        console._start_logic_node(cam_row)
+        cam = console._logic_nodes[id(cam_row)]
+        assert isinstance(cam, CameraMeasurement)
+        assert console._node_label(cam) == "camera"          # layer name, not "CameraMeasurement"
 
-        # a calibrate TASK: its own node (CalibrateReadoutTask), task role, a param
-        # Edit with a Run button + NO fit, label = the layer name "calibrate".
+        # calibrate task: its own node, STOPPED, with a param Edit (no fit)
         _open_via_add_panel(console, ("task", "Calibrate readout"))
-        task_card = next(c for c in console.cards if c.config.title == "Calibrate readout")
-        task = next(f for f in console.feeds if isinstance(f, CalibrateReadoutTask))
-        assert task_card.config.role == "task"
-        assert console._producer_label(task) == "calibrate"
-        task_ed = console._panel_editors[id(task_card)]
-        assert task_ed.fit_combo is None and task_ed.feed_restart_button.text() == "Run"
-        assert "grid_shape" in task_ed._feed_widgets
-
-        # the footer signal legend never leaks a Python class name (the "Feed" the
-        # user objected to, or DetectProcessor / CalibrateReadoutTask)
-        console._refresh_signal_info()
-        for c in console.cards:
-            info = c._signal_info
-            assert "Feed" not in info
-            assert "DetectProcessor" not in info and "CalibrateReadoutTask" not in info
+        task_row = console.logic_nodes[-1]
+        assert task_row.node.kind == "task"
+        console._start_logic_node(task_row)
+        task = console._logic_nodes[id(task_row)]
+        assert isinstance(task, CalibrateReadoutTask)
+        assert console._node_label(task) == "calibrate"
     finally:
         console.shutdown()
+        exp.close()

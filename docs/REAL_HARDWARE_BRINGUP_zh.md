@@ -3,7 +3,7 @@
 > 核心原则:**虚拟 == 实机**。分析层(`core`/`operations`/`subsystems`/`session.py`)只碰
 > 设备契约(`camera.acquire(...)` / `sequencer.prepare/fire/...`),从不 import 具体后端、不读仿真真值
 > (由 `tests/test_virtual_equals_real_contract.py` 机械守卫)。所以**换真机只改 `na.connect()` 的 config**,
-> GUI / feed / 读出 / 测量代码一字不改。本清单按"先确认、再上线"的顺序,尽量不在机器前踩坑。
+> GUI / 逻辑节点 / 读出 / 测量代码一字不改。本清单按"先确认、再上线"的顺序,尽量不在机器前踩坑。
 
 > ⚠️ 运行前确认 import 的是这份代码(`python -c "import Zou_lab_control, sys; print(Zou_lab_control.__file__)"`),
 > 别误跑到机器上另一份旧 checkout。
@@ -61,14 +61,16 @@ import Zou_lab_control.neutral_atom as na
 exp = na.connect("remote_template.json", open_devices=True)   # 开 qCMOS + RemoteSequencer
 exp.readout.sitemap(method="box", frames=20, display=True)     # 看站点中心检测
 exp.readout.thresholds(frames=100, display=True)               # 看每站点阈值直方图
-# 确认无误后再看板;loading 读出是组合节点(相机出帧 + 真 detect + 标定 task),只换相机即真机:
+# 确认无误后再看板;loading 读出由独立逻辑节点组合(相机出帧 + 真 detect + 标定 task),只换相机即真机:
 from Zou_lab_control.frontend import show_task_console
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
-from Zou_lab_control.neutral_atom.operations.feeds import build_loading_readout
+from Zou_lab_control.neutral_atom.operations.logic import DetectProcessor
 hub = SignalHub()
-readout = build_loading_readout(hub, exp.devices.camera, sequencer=exp.devices.sequencer, grid_shape=(5, 7))
-readout.start(rate_hz=4)   # 非阻塞:标定在它自己的线程跑,detector 就绪前 no-op
-show_task_console(hub=hub, feeds=[readout.calibrate_task, readout.camera, readout.detect],
+camera = exp.readout.camera_measurement(hub)          # CameraMeasurement:只发 frame
+calibration = exp.readout.require(thresholds=True)    # 上面 sitemap/thresholds 标定出的 TrapCalibration
+detect = DetectProcessor(hub, calibration=calibration, grid_shape=(5, 7))  # 逐帧真 detect
+camera.start(rate_hz=4); detect.start(rate_hz=4)      # 相机产 frame、detect 逐帧消费(reactive)
+show_task_console(hub=hub, running_nodes=[camera, detect],
                   measurements=exp.readout.measurement_specs())
 ```
 

@@ -118,7 +118,7 @@ serves EVERY 2-D panel (a camera frame, a 2-D parameter scan, …).
 1. **Frontend** (`PanelEditor._read_region`): hands the endpoints, unchanged, to
    the producing source's `region_to_acquisition_parameters(...)` and fills the
    named Edit fields. No device shape, ever.
-2. **Acquisition layer** (the feed): speaks PLOT coordinates. `CameraFrameFeed`'s
+2. **Acquisition layer** (the logic node): speaks PLOT coordinates. `CameraMeasurement`'s
    spatial acquisition parameter is `region = [x_min, x_max, y_min, y_max]`
    ENDPOINTS — NOT the device `[x,w,y,h]` — exposed by `acquisition_parameters()`
    and accepted by `set_acquisition_parameters(region=...)`. (A 2-D-scan source
@@ -130,14 +130,14 @@ serves EVERY 2-D panel (a camera frame, a 2-D parameter scan, …).
    camera's sub-array grid (`SUBARRAY*` must be **multiples of 4** — query
    `prop_getattr` step/max), writes it in the safe order (positions→0, then sizes,
    then positions, `SUBARRAYMODE` ON last), and READS BACK the applied window via
-   `prop_setgetvalue`; `camera.roi` reports that read-back. So the feed's `region`,
+   `prop_setgetvalue`; `camera.roi` reports that read-back. So the node's `region`,
    the 2-D panel axes and the Edit `now:` all reflect what the camera truly images.
    An unchecked write would be silently clamped → wrong region (the bug this fixed).
 
 `VirtualCamera` mirrors the device layer: `configure(roi=...)` snaps (shared
 `devices.base.snap_subarray`) and `acquire()` CROPS to it, so a virtual test runs
 the SAME ROI path real hardware does (default `roi=None` = full frame). The console
-`_coord_frames()` reads the feed's `region` endpoints (index 0 = x_min, index 2 =
+`_coord_frames()` reads the node's `region` endpoints (index 0 = x_min, index 2 =
 y_min give the 2-D axis origin). **Refresh** (`PanelEditor.rebuild`) first ticks
 the console (`refresh_once`) so the snapshot mirrors the MOST-RECENT hub frame, not
 the last timer-tick render.
@@ -154,7 +154,7 @@ Streaming refill: for scans larger than the resident 2-bank window the host
 refills the freed bank behind the cursor with the next chunk; the engine only
 advances into a bank when `BANK_READY` AND that bank holds the right chunk, so a
 late refill STALLs (`STATUS_UNDERFLOW`), never a wrong point. `repeat_forever`
-re-sweeps a streamed scan via a host background refill thread that feeds chunks
+re-sweeps a streamed scan via a host background refill thread that supplies chunks
 CONTINUOUSLY and CYCLICALLY (chunk `(mono%K)` into bank `mono%2`, one-ahead) -- the
 sweep wrap is just another chunk boundary, so the re-sweep is SEAMLESS for any N
 (`scan_bank_base` toggles by `K&1` so chunk 0 lands in the alternating bank).
@@ -780,7 +780,7 @@ The three bring-up items from the adversarial RTL hunt are now fixed/guarded. Th
   target at `stop_tick`. Gentle ramps (Δ ≤ span) keep the historic carry-only path,
   bit-identical to before. Mirrors updated in lockstep: `engine_model.bus_play`
   (step/rem state), `engine_model.bus_value_at` (unified closed form `floor(k·Δ/span)`,
-  feeds the bus delay line), and the preview `pulse_table._analog_bus_value_at_tick`
+  drives the bus delay line), and the preview `pulse_table._analog_bus_value_at_tick`
   (same staircase in the signed user domain). Steep ramps remain ALLOWED for any
   duration (validator does not reject). **Bitstream REBUILD REQUIRED.**
 - **T3 — edge-BRAM latency-2 force: BUILD-TIME HARD CHECK.** `zlc_force_latency2`
@@ -985,13 +985,13 @@ float/int/axis_range/bool/choice; **no value is ever `eval`'d** — consumers
 validate/coerce by kind (the confocal free-text-eval lesson). `MeasurementSpec.build`
 closure captures `exp`, so the console never holds the session (decoupling).
 
-`ScannedMeasurementFeed` (`operations/feeds.py`) wraps a measurement as a console
-feed: each `shot()` advances ONE scan point and publishes the CUMULATIVE
+`ScannedMeasurementNode` (`operations/logic.py`) wraps a measurement as a console
+logic node: each `shot()` advances ONE scan point and publishes the CUMULATIVE
 `{x_key: x[:k], y_key: y[:k], scan_done, shot}`; finite-scan **self-stop** (sets its
 own stop event after the last point, so a background `start()` thread exits).
 `run_to_completion()` for headless/tests.
 
-**Virtual == real guard.** Engine + feed touch only `camera.acquire` /
+**Virtual == real guard.** Engine + node touch only `camera.acquire` /
 sequencer (via pulse) / `calibration.signals|detect` / `active_plotter().run` — zero
 import of virtual/qcmos, zero simulation ground truth. Living in `operations/` they
 are caught by `tests/test_virtual_equals_real_contract.py`.
@@ -1017,7 +1017,7 @@ category with no catalog edit.
   `ReadoutSubsystem.characterize_from_dir`) — it re-implements no readout/fidelity
   math; `readout` is captured in the factory closure so the console stays decoupled
   (it drives the action through the plain spec list, never holding the subsystem).
-- `ProcessorFeed` (`operations/feeds.py`) runs the spec ONCE on its owner thread,
+- `ProcessorRun` (`operations/logic.py`) runs the spec ONCE on its owner thread,
   publishes the result (+ a `processor_done` scalar) to the hub, and self-stops; the
   cooperative-stop event is shared so a long grab cancels cleanly. The console's
   result panel reuses the EXISTING `sites` atom kind (camera underlay + per-site

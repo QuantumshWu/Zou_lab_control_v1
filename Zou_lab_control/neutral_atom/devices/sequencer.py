@@ -497,7 +497,7 @@ def compile_pulse_table_scan_runtime_program(
 
     Each ``scan_table`` row is one scan point; column ``j`` is the value of
     slot ``j`` (named ``s{j}``, in the slot's display unit).  Bound durations and
-    delays are *time slots*: they feed the affine tick formula
+    delays are *time slots*: they enter the affine tick formula
     ``tick = base + (sum_j coeff_j * slot_tick_j) >> coeff_frac_bits``.  The
     hardware iterates the scan points seamlessly; only the template and the
     parameter table are uploaded.

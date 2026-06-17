@@ -60,7 +60,7 @@ def readout_fidelity(readout) -> ProcessorSpec:
             "fidelity_threshold": np.asarray(report.thresholds, dtype=float),
         }
         # The site centers (N, 2) so the default 'sites' atom map can place its
-        # circles standalone (no live feed needed): read from the calibration the
+        # circles standalone (no live logic node needed): read from the calibration the
         # characterization just used/updated -- not recomputed here.
         cal = readout.current
         if cal is not None:

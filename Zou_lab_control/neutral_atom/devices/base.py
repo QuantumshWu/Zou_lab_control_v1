@@ -14,7 +14,7 @@ class AcquisitionCancelled(Exception):
     """Raised by ``acquire`` when its optional ``stop`` event fires mid-wait.
 
     Distinct from ``TimeoutError`` (a real fault): cancellation is an
-    intentional Stop, so the feed loop treats it as a clean exit rather than a
+    intentional Stop, so the logic node loop treats it as a clean exit rather than a
     recorded error / banner."""
 
 
@@ -69,7 +69,7 @@ class CameraDevice(BaseDevice):
     def roi(self) -> tuple[int, int, int, int] | None:
         """Sub-array readout window ``(x, width, y, height)``, or None for full frame.
 
-        Part of the contract so a consumer (e.g. a raw-frame feed's Edit panel)
+        Part of the contract so a consumer (e.g. a raw-frame logic node's Edit panel)
         reads ROI without reaching into a backend's private ``config``.  Default
         None: a camera with no sub-array concept (the virtual renderer) honestly
         has no ROI; the real qCMOS overrides this."""
@@ -83,7 +83,7 @@ class CameraDevice(BaseDevice):
     def acquire(self, frames: int = 1, *, sequence=None, sequencer=None, **kwargs) -> list[np.ndarray]:
         """Acquire ``frames`` images and return one numpy array per frame.
 
-        Optional ``stop`` kwarg: a ``threading.Event`` a live feed can set to
+        Optional ``stop`` kwarg: a ``threading.Event`` a live logic node can set to
         interrupt a blocking wait (e.g. a camera awaiting an external trigger
         that never comes).  Implementations that honour it poll the event while
         waiting and raise :class:`AcquisitionCancelled` when it is set, instead

@@ -3,12 +3,12 @@
 The console is a CHILD of the Fluent window, so its own ``closeEvent`` never fires
 on a window close.  ``show_task_console`` therefore wires the window's ``closed``
 signal to ``console.shutdown``.  This pins the three contracts that keeps a closed
-dashboard from leaking feed owner threads (each blocked in ``camera.acquire``,
+dashboard from leaking node owner threads (each blocked in ``camera.acquire``,
 holding the camera / RPyC link -- the leak that wedged the kernel):
 
-1. a genuine CLOSE stops the refresh timer + every feed's owner thread AND fires
+1. a genuine CLOSE stops the refresh timer + every node's owner thread AND fires
    the optional ``on_close`` device-teardown hook;
-2. a MINIMISE / hide (``hidden``, not ``closed``) must NOT stop the feeds;
+2. a MINIMISE / hide (``hidden``, not ``closed``) must NOT stop the nodes;
 3. teardown is idempotent (close + an explicit shutdown / cell re-run can both fire).
 
 Built on the offscreen Qt platform -- it does NOT pull in the flaky demo GUI fixtures.
@@ -35,8 +35,8 @@ def _offscreen(monkeypatch):
     ensure_qt_app()
 
 
-class _FakeFeed:
-    """Minimal feed: records start/stop the way the real owner-thread feed would."""
+class _FakeNode:
+    """Minimal node: records start/stop the way the real owner-thread node would."""
 
     rate_hz = 5.0
 
@@ -66,32 +66,32 @@ def _open(on_close=None):
     from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
 
-    feed = _FakeFeed()
-    console = show_task_console(hub=SignalHub(), feeds=[feed], on_close=on_close)
+    node = _FakeNode()
+    console = show_task_console(hub=SignalHub(), running_nodes=[node], on_close=on_close)
     window = ensure_qt_app()._zlc_task_windows[-1]
-    return console, window, feed
+    return console, window, node
 
 
-def test_close_stops_feeds_timer_and_calls_on_close():
+def test_close_stops_nodes_timer_and_calls_on_close():
     calls = []
-    console, window, feed = _open(on_close=lambda: calls.append(1))
-    assert feed.running and feed.starts == 1        # show_task_console auto-started it
+    console, window, node = _open(on_close=lambda: calls.append(1))
+    assert node.running and node.starts == 1        # show_task_console auto-started it
     assert console._timer.isActive()
     window.closed.emit()                            # a genuine close
-    assert feed.stops == 1 and not feed.running     # feed owner thread stopped
+    assert node.stops == 1 and not node.running     # node owner thread stopped
     assert not console._timer.isActive()            # refresh timer stopped
     assert calls == [1]                             # device-teardown hook fired
 
 
-def test_minimise_does_not_stop_feeds():
-    console, window, feed = _open()
+def test_minimise_does_not_stop_nodes():
+    console, window, node = _open()
     window.hidden.emit()                            # hide / minimise -- NOT a close
-    assert feed.running and feed.stops == 0         # feeds must survive a minimise
+    assert node.running and node.stops == 0         # nodes must survive a minimise
 
 
 def test_shutdown_is_idempotent():
-    console, window, feed = _open()
+    console, window, node = _open()
     console.shutdown()
     console.shutdown()
     window.closed.emit()
-    assert feed.stops == 1                          # stopped exactly once
+    assert node.stops == 1                          # stopped exactly once

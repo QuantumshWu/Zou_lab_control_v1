@@ -37,7 +37,7 @@ def test_builtin_calibrate_task_is_discovered():
 
 def test_build_returns_an_unrun_task_over_the_session():
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
-    from Zou_lab_control.neutral_atom.operations.feeds import CalibrateReadoutTask
+    from Zou_lab_control.neutral_atom.operations.logic import CalibrateReadoutTask
 
     readout = _virtual_readout()
     spec = next(s for s in readout.task_specs() if s.name == "Calibrate readout")

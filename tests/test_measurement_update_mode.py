@@ -18,7 +18,7 @@ if sys.path[0] != str(REPO_ROOT):
     sys.path.insert(0, str(REPO_ROOT))
 
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
-from Zou_lab_control.neutral_atom.operations.feeds import Measurement
+from Zou_lab_control.neutral_atom.operations.logic import Measurement
 
 
 class _EchoMeasurement(Measurement):

@@ -1,5 +1,5 @@
-"""Auto-generated parameter form: render a producer's declared parameters as fluent
-controls, with NO per-producer hand-written UI.
+"""Auto-generated parameter form: render a node's declared parameters as fluent
+controls, with NO per-node hand-written UI.
 
 It consumes a list of ``ParamField`` records (``name`` / ``kind`` / ``default`` /
 ``unit`` / ``choices`` / ``target``) by DUCK TYPING -- it never imports the neutral-

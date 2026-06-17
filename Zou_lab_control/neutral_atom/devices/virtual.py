@@ -374,50 +374,6 @@ class VirtualSequencer(SequencerDevice):
         pass
 
 
-def virtual_loading_readout(
-    hub,
-    *,
-    prefix: str = "",
-    grid_shape: tuple[int, int] = (5, 7),
-    loading_probability: float = 0.55,
-    exposure: float = 0.02,
-    roi_radius: int = 1,
-    ema: float = 0.05,
-    seed: int | None = None,
-    calibration_frames: int = 4,
-    threshold_frames: int = 24,
-    trap_array: "VirtualTrapArray | None" = None,
-):
-    """Build the COMPOSED loading readout (a ``LoadingReadout``) over a virtual camera.
-
-    The ONLY virtual-specific glue for the task-console producer: it wires a
-    ``VirtualTrapArray`` behind a ``VirtualCamera`` and hands that camera to the
-    backend-agnostic ``build_loading_readout`` (calibrate Task + camera Measurement +
-    DetectProcessor).  Identical on real hardware -- there you call
-    ``build_loading_readout(hub, exp.camera, sequencer=exp.devices.sequencer, ...)``.
-    Faking lives ONLY here, at the camera frames; the calibrate/detect path is the
-    production code, run as separate nodes.
-    """
-
-    from ..operations.feeds import build_loading_readout  # lazy: keep devices->operations off import graph
-
-    trap = trap_array if trap_array is not None else VirtualTrapArray(
-        grid_shape=tuple(grid_shape), loading_probability=float(loading_probability), seed=seed
-    )
-    camera = VirtualCamera(trap, exposure=float(exposure))
-    return build_loading_readout(
-        hub,
-        camera,
-        prefix=prefix,
-        grid_shape=trap.grid_shape,
-        exposure=float(exposure),
-        roi_radius=roi_radius,
-        ema=ema,
-        calibration_frames=calibration_frames,
-        threshold_frames=threshold_frames,
-    )
-
-
 def write_virtual_run(
     data_dir: str | Path,
     prefix: str = "img",
@@ -658,6 +614,5 @@ __all__ = [
     "trap_off_durations_per_frame",
     "virtual_config",
     "virtual_config_with_overrides",
-    "virtual_loading_readout",
     "write_virtual_run",
 ]

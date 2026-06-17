@@ -161,6 +161,47 @@ def fit_site_psfs(
     return out
 
 
+def fit_uniform_psf(
+    template,
+    centers,
+    *,
+    half_width: int = 3,
+    bg_padding: int = 3,
+    weight_smooth_sigma: float = 0.35,
+    weight_source: str = "empirical",
+) -> list[SitePSF]:
+    """Fit ONE shared PSF weight reused by every site (the uniform-PSF readout).
+
+    Per-site :func:`fit_site_psfs` fits an independent kernel for each spot, which
+    follows real per-site spot variation but needs enough signal per site.  The
+    uniform-PSF variant instead fits ONE matched filter -- the L1-normalized
+    average of every site's background-subtracted, positive cutout (all spots
+    co-aligned on their boxes) -- and gives every site the SAME kernel.  This is
+    the right model when the spots share one shape and a per-site fit would just
+    add noise; it is a genuine shared kernel, not a per-site fit relabelled.
+
+    Each site keeps its OWN integer box (its absolute pixel location) so the
+    matched-filter dot product still reads the correct pixels; only the (h, w)
+    weight is shared.  Returns one :class:`SitePSF` per site (all carrying the
+    same ``weight``), so it packs into the same ``(N, h, w)`` array a per-site fit
+    does and flows through :func:`psf_signals` unchanged.
+    """
+
+    per_site = fit_site_psfs(
+        template, centers, half_width=half_width, bg_padding=bg_padding,
+        weight_smooth_sigma=weight_smooth_sigma, weight_source=weight_source)
+    # Average the co-aligned per-site weights into ONE shared kernel, then renormalize.
+    shared = np.mean(np.stack([p.weight for p in per_site], axis=0), axis=0)
+    total = float(np.sum(shared))
+    shared = shared / total if total > 0 else np.ones_like(shared) / float(shared.size)
+    shared = np.ascontiguousarray(shared, dtype=float)
+    return [
+        SitePSF(index=p.index, x0=p.x0, y0=p.y0, box=p.box, weight=shared.copy(),
+                sigma_x=p.sigma_x, sigma_y=p.sigma_y, fit_ok=p.fit_ok)
+        for p in per_site
+    ]
+
+
 def psf_weights_array(psfs: Sequence[SitePSF]) -> np.ndarray:
     """Pack site weights into one ``(N, h, w)`` array (raises on ragged boxes)."""
 
@@ -213,6 +254,7 @@ __all__ = [
     "annulus_background",
     "crop_box",
     "fit_site_psfs",
+    "fit_uniform_psf",
     "gaussian_psf",
     "psf_boxes_array",
     "psf_signals",

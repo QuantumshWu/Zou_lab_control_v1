@@ -25,7 +25,7 @@ from ..core.analysis import (
 )
 from ..core.bimodal import fit_bimodal_per_site
 from ..core.calibration import TrapCalibration
-from ..core.psf import fit_site_psfs, psf_boxes_array, psf_weights_array
+from ..core.psf import fit_site_psfs, fit_uniform_psf, psf_boxes_array, psf_weights_array
 from ..core.results import SitemapResult, ThresholdResult
 from ..core.utils import site_index
 from ..views.plots import plot_image, plot_threshold_hist
@@ -54,8 +54,8 @@ def calibrate_sitemap_from_images(
         raise ValueError("all sitemap frames must have the same shape.")
     grid_shape = grid_shape_tuple(grid_shape)
     method = str(method).lower()
-    if method not in ("box", "psf"):
-        raise ValueError("method must be 'box' or 'psf'.")
+    if method not in ("box", "psf", "uniform_psf"):
+        raise ValueError("method must be 'box', 'psf' (per-site) or 'uniform_psf' (one shared kernel).")
     average = np.mean(np.stack(stack, axis=0), axis=0)
     centers = find_site_centers(average, grid_shape, ordering=ordering)
     thresholds = np.zeros(len(centers), dtype=float)
@@ -64,8 +64,13 @@ def calibrate_sitemap_from_images(
     # silently extracting the wrong pixels.
     image_shape = [int(average.shape[0]), int(average.shape[1])]
 
-    if method == "psf":
-        psfs = fit_site_psfs(average, centers, half_width=psf_half_width)
+    if method in ("psf", "uniform_psf"):
+        # Per-site fits one independent kernel per spot; uniform fits ONE shared
+        # kernel reused by every site (right when the spots share one shape).  Both
+        # store method='psf' on the calibration (the same matched-filter readout
+        # path) -- the psf_mode metadata records which kernel model produced it.
+        uniform = method == "uniform_psf"
+        psfs = (fit_uniform_psf if uniform else fit_site_psfs)(average, centers, half_width=psf_half_width)
         calibration = TrapCalibration(
             centers,
             thresholds,
@@ -76,7 +81,9 @@ def calibrate_sitemap_from_images(
             psf_weights=psf_weights_array(psfs),
             psf_boxes=psf_boxes_array(psfs),
             background=background,
-            metadata={"stage": "sitemap", "thresholds_calibrated": False, "method": "psf", "psf_half_width": int(psf_half_width), "image_shape": image_shape},
+            metadata={"stage": "sitemap", "thresholds_calibrated": False, "method": "psf",
+                      "psf_mode": "uniform" if uniform else "per_site",
+                      "psf_half_width": int(psf_half_width), "image_shape": image_shape},
         )
     else:
         calibration = TrapCalibration(

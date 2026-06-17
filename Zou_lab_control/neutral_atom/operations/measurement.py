@@ -115,7 +115,7 @@ class MeasurementSpec:
     it lists the parameters ONCE (``params``), names the live curve's axes
     (``result_labels`` + ``x_key``/``y_key`` published-signal keys), and exposes
     ``build(**param_values) -> ScannedMeasurement`` returning an UNRUN measurement
-    a feed can drive point-by-point.  ``grid_shape`` is set for per-site
+    a logic node can drive point-by-point.  ``grid_shape`` is set for per-site
     measurements so a consumer can reshape a per-site result vector into a 2-D map.
     ``metadata`` carries spec-specific extras (e.g. the capture radius the
     temperature fit needs) without widening the call signature.
@@ -355,7 +355,7 @@ class ScannedMeasurement:
                 raise ValueError(
                     f"ScanAxis.slot {self.axis.slot!r} is not a scan slot of the bound pulse "
                     f"(known slots: {list(known)}); a DAC scan must target one of them.")
-        # A driver (e.g. ScannedMeasurementFeed) sets this to its stop Event so a
+        # A driver (e.g. ScannedMeasurementNode) sets this to its stop Event so a
         # Stop interrupts a wedged trigger DURING a scan point, not just between
         # points; None = the synchronous notebook path (no mid-point cancel).
         self.stop_event = None

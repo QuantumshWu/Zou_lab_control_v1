@@ -730,7 +730,7 @@ class FluentLineEdit(QtWidgets.QLineEdit):
 
     def _apply_style(self) -> None:
         # One owned stylesheet; the text/border colour swaps to the shared RED
-        # error token when in the danger state (e.g. surfacing a wedged feed).
+        # error token when in the danger state (e.g. surfacing a wedged data source).
         colour = RED if self._danger else TEXT
         border = RED if self._danger else PLACEHOLDER
         # A read-only status line is often disabled; the :disabled colour must
@@ -867,6 +867,37 @@ class FloatLineEdit(FluentLineEdit):
     pass
 
 
+class _RoundedPopupCard(QtCore.QObject):
+    """Paints a FluentPopup-style rounded card (white fill + 1 px border) onto the
+    widget it filters, suppressing that widget's default opaque square paint.
+
+    Used on a QComboBox's top-level drop-down container: the container is a private
+    C++ widget we cannot subclass, and assigning ``container.paintEvent`` does
+    nothing (Qt's C++ dispatch never calls a Python instance attribute).  An event
+    filter is the one reliable hook -- on the Paint event it strokes the card and
+    returns True so the default (square, opaque) paint is skipped; the translucent
+    container then shows nothing outside the rounded arc (no bottom-right nub)."""
+
+    def __init__(self, radius: float, border: str, parent=None):
+        super().__init__(parent)
+        self._radius = float(radius)
+        self._border = QtGui.QColor(border)
+
+    def eventFilter(self, obj, event):  # noqa: N802 - Qt naming
+        if event.type() == QtCore.QEvent.Paint and isinstance(obj, QtWidgets.QWidget):
+            painter = QtGui.QPainter(obj)
+            painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+            pen = QtGui.QPen(self._border)
+            pen.setWidthF(1.0)
+            painter.setPen(pen)
+            painter.setBrush(QtGui.QColor("white"))
+            rect = QtCore.QRectF(obj.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+            painter.drawRoundedRect(rect, self._radius, self._radius)
+            painter.end()
+            return True
+        return False
+
+
 class FluentComboBox(QtWidgets.QComboBox):
     """A non-editable Fluent combo that paints its own current text.
 
@@ -880,6 +911,35 @@ class FluentComboBox(QtWidgets.QComboBox):
         super().__init__(parent)
         self.setMinimumHeight(scaled_px(30, minimum=22))
         self.setEditable(False)
+        self._popup_styled = False
+        # The drop-down list is a top-level popup.  It must look EXACTLY like the
+        # FluentPopup card (the Setting popup): one antialiased rounded rect with a
+        # 1 px border, a few-px gap before the items, and the SHARED fluent
+        # scrollbar.  A stylesheet ``border-radius`` on the popup is NOT enough --
+        # the popup's window stays opaque + square behind the arc, so the corner
+        # triangles outside the radius show a white/grey nub (the "stray line at the
+        # bottom-right" the user hit) and Windows adds a native popup shadow.  So
+        # the popup CONTAINER is made translucent + frameless and PAINTS the card
+        # itself (see showPopup), and the item view below is transparent so that
+        # painted card shows through.
+        view = QtWidgets.QListView(self)
+        # The item view must be GENUINELY transparent so the container's painted
+        # rounded card shows through (a stylesheet ``background: transparent`` alone
+        # does not stop QAbstractScrollArea's viewport from filling its Base colour,
+        # which would paint an opaque SQUARE over the rounded card).
+        view.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+        view.viewport().setAutoFillBackground(False)
+        view.viewport().setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+        view_palette = view.palette()
+        view_palette.setColor(QtGui.QPalette.Base, QtCore.Qt.transparent)
+        view_palette.setColor(QtGui.QPalette.Window, QtCore.Qt.transparent)
+        view.setPalette(view_palette)
+        self.setView(view)
+        self._gap = scaled_px(4, minimum=3)
+        # Configure the drop-down's top-level container NOW (setView created it but it
+        # is not shown yet) -- WA_TranslucentBackground only takes effect if it is set
+        # BEFORE the native window is created, so this cannot wait until showPopup.
+        self._configure_popup_container()
         self.setStyleSheet(
             f"""
             QComboBox {{
@@ -908,16 +968,58 @@ class FluentComboBox(QtWidgets.QComboBox):
             QComboBox::drop-down:hover {{ background-color: {HOVER}; }}
             QComboBox::down-arrow {{ image: none; width: 0px; height: 0px; }}
             QComboBox QAbstractItemView {{
-                background: white;
-                border: 1px solid {PLACEHOLDER};
+                background: transparent;
+                border: none;
+                padding: {self._gap}px;
                 color: {TEXT};
                 selection-background-color: {ACCENT};
                 selection-color: white;
                 font: {fluent_font_size()}pt "{FONT}";
                 outline: none;
             }}
+            QComboBox QAbstractItemView::item {{
+                padding: {scaled_px(3, minimum=2)}px {scaled_px(6, minimum=4)}px;
+                border-radius: {_radius()}px;
+            }}
+            QComboBox QAbstractItemView::corner {{ background: transparent; border: none; }}
             """
+            + fluent_scrollbar_stylesheet("QComboBox QAbstractItemView QScrollBar")
         )
+
+    def _configure_popup_container(self) -> None:
+        """Make the drop-down's top-level container a translucent, frameless card
+        that PAINTS one rounded rect (border + fill) -- the SAME chrome FluentPopup
+        uses for the Setting popup.
+
+        The rounded card is painted by an EVENT FILTER on the container, not by
+        assigning ``container.paintEvent`` (Qt's C++ event dispatch never calls a
+        Python instance attribute, so a monkey-patched paintEvent silently does
+        nothing and the container keeps its default opaque SQUARE).  The filter
+        intercepts the Paint event, strokes the rounded card and returns True so the
+        default square paint is suppressed; the transparent item view paints its
+        rows on top.  The few-px gap before the items is the view's stylesheet
+        ``padding`` (the translucent card shows through it)."""
+        container = self.view().window()
+        if container is None or container is self or self._popup_styled:
+            return
+        self._popup_styled = True
+        container.setWindowFlags(container.windowFlags()
+                                 | QtCore.Qt.FramelessWindowHint | QtCore.Qt.NoDropShadowWindowHint)
+        container.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+        container.setAttribute(QtCore.Qt.WA_NoSystemBackground, True)
+        layout = container.layout()
+        if layout is not None:
+            layout.setContentsMargins(0, 0, 0, 0)
+        self._card_filter = _RoundedPopupCard(float(_radius()), DIVIDER, parent=container)
+        container.installEventFilter(self._card_filter)
+
+    def showPopup(self) -> None:  # noqa: N802 - Qt naming
+        # The container is configured in __init__; if it was rebuilt, reconfigure.
+        self._configure_popup_container()
+        super().showPopup()
+        container = self.view().window()
+        if container is not None and container is not self:
+            container.update()
 
     def paintEvent(self, event):
         del event

@@ -9,7 +9,9 @@ hub-ready dict.  This pins:
    default view, and its run() DRIVES ReadoutSubsystem.characterize_from_dir
    (trained thresholds land back in the session calibration) returning the declared
    result_keys with the right shapes;
-2. the registry rejects two processors that publish the same result_keys signal
+2. running the spec once and publishing the result dict to the hub is a one-line
+   pattern in user code (no monolithic node);
+3. the registry rejects two processors that publish the same result_keys signal
    (they would clobber each other on the shared SignalHub).
 
 Virtual == real: the only data source is a saved frames folder
@@ -61,10 +63,11 @@ def test_readout_fidelity_processor_drives_characterize(tmp_path):
     assert np.all(np.isfinite(exp.readout.current.thresholds))
 
 
-def test_processor_feed_runs_once_and_publishes_to_hub(tmp_path):
-    """ProcessorFeed runs the spec ONCE, publishes its result dict (+ processor_done)
-    to the hub, self-stops, and reaches frames only via the saved dir (no backend)."""
-    from Zou_lab_control.neutral_atom.operations.feeds import ProcessorFeed
+def test_processor_run_once_and_publishes_to_hub(tmp_path):
+    """Running a ProcessorSpec is a one-line pattern: build a ProcessorContext, call
+    run(ctx) to get the result dict, hub.publish() it.  No monolithic runner --
+    the user composes the action exactly like the loading readout (camera +
+    detect processor) is composed."""
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
 
     data_dir = tmp_path / "run02"
@@ -77,14 +80,13 @@ def test_processor_feed_runs_once_and_publishes_to_hub(tmp_path):
 
     hub = SignalHub()
     params = {**spec.defaults(), "data_dir": str(data_dir), "seed": 1}
-    feed = ProcessorFeed(hub, spec, readout=exp.readout, params=params)
-    feed.run_to_completion()
+    ctx = ProcessorContext(readout=exp.readout, params=params,
+                           camera=None, sequencer=None, stop=None)
+    result = spec.run(ctx)
+    hub.publish(result)
 
-    assert feed.finished
-    assert float(hub.latest("processor_done")) == 1.0
-    assert np.asarray(hub.latest("fidelity_site")).shape == (20,)            # 4x5 sites
-    assert (set(spec.result_keys) | {"processor_done"}) <= set(hub.names())  # all declared landed
-    assert set(spec.result_keys) | {"processor_done"} == set(feed.published_signals())
+    assert np.asarray(hub.latest("fidelity_site")).shape == (20,)        # 4x5 sites
+    assert set(spec.result_keys) <= set(hub.names())                     # all declared landed
     assert exp.readout.current.metadata.get("threshold_method") == "per_site_reference"
 
 

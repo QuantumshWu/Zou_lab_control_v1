@@ -111,7 +111,8 @@ LiveHistogram = HistogramFigure
 
 
 _PULSE_GUI_EXPORTS = {"PulseSequenceEditor", "show_pulse_gui"}
-_TASK_CONSOLE_EXPORTS = {"TaskConsole", "TaskConsoleState", "PanelConfig", "default_console_state", "show_task_console"}
+_TASK_CONSOLE_EXPORTS = {"TaskConsole", "TaskConsoleState", "PanelConfig", "LogicNodeConfig",
+                         "default_console_state", "show_task_console"}
 
 
 def __getattr__(name: str):

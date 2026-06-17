@@ -1,8 +1,8 @@
-"""Declarative measurement specs + ScannedMeasurementFeed (P5 backend wiring).
+"""Declarative measurement specs + ScannedMeasurementNode (P5 backend wiring).
 
 Scoped to the new ``ParamDecl``/``MeasurementSpec`` descriptors, the
-``ScannedMeasurementFeed`` console adapter, and ``ReadoutSubsystem``'s builders +
-``measurement_specs``.  The feed is exercised on the virtual backend end-to-end:
+``ScannedMeasurementNode`` console adapter, and ``ReadoutSubsystem``'s builders +
+``measurement_specs``.  The node is exercised on the virtual backend end-to-end:
 it must run the SAME contract path real hardware runs (only the camera frames are
 fake) -- guarded structurally by ``test_virtual_equals_real_contract`` -- and
 publish a survival curve that DECAYS with trap-off time (the virtual loss model
@@ -28,7 +28,7 @@ from Zou_lab_control.neutral_atom.operations.measurement import (
     ParamDecl,
     ScannedMeasurement,
 )
-from Zou_lab_control.neutral_atom.operations.feeds import ScannedMeasurementFeed
+from Zou_lab_control.neutral_atom.operations.logic import ScannedMeasurementNode
 from Zou_lab_control.neutral_atom.operations.temperature import (
     build_release_recapture_pulse,
     fit_temperature,
@@ -97,25 +97,25 @@ def test_builtin_specs_build_unrun_scanned_measurements():
     assert m_dur.axis.values.size == 11
 
 
-# ------------------------------------------------- ScannedMeasurementFeed (sync)
+# ------------------------------------------------- ScannedMeasurementNode (sync)
 
 
-def _temperature_feed(exp, hub, *, points, shots, t_max_us=300.0):
+def _temperature_node(exp, hub, *, points, shots, t_max_us=300.0):
     spec = exp.readout.measurement_specs()[0]
     measurement = spec.build(t_off=(0.0, t_max_us, points), shots=shots, capture_radius=6.0)
-    return ScannedMeasurementFeed(
+    return ScannedMeasurementNode(
         hub, measurement, x_key=spec.x_key, y_key=spec.y_key, grid_shape=spec.grid_shape,
     ), spec
 
 
-def test_temperature_feed_run_to_completion_publishes_full_decaying_curve():
+def test_temperature_node_run_to_completion_publishes_full_decaying_curve():
     exp = _calibrated_virtual_session(grid=(5, 7))
     hub = SignalHub()
-    feed, spec = _temperature_feed(exp, hub, points=13, shots=24)
+    node, spec = _temperature_node(exp, hub, points=13, shots=24)
 
-    feed.run_to_completion()
+    node.run_to_completion()
 
-    assert feed.finished
+    assert node.finished
     x = hub.latest(spec.x_key)
     y = hub.latest(spec.y_key)
     # Cumulative curve has exactly ``points`` entries when complete.
@@ -140,16 +140,16 @@ def test_temperature_feed_run_to_completion_publishes_full_decaying_curve():
     assert 25e-6 <= fit.temperature_K <= 100e-6
 
 
-def test_temperature_feed_per_site_publishes_latest_site_vector_and_grid():
+def test_temperature_node_per_site_publishes_latest_site_vector_and_grid():
     exp = _calibrated_virtual_session(grid=(2, 3))
     n_sites = exp.devices.trap_array.n_sites
     hub = SignalHub()
     spec = exp.readout.measurement_specs()[0]
     measurement = spec.build(t_off=(0.0, 80.0, 4), shots=2, capture_radius=6.0, per_site=True)
-    feed = ScannedMeasurementFeed(
+    node = ScannedMeasurementNode(
         hub, measurement, x_key=spec.x_key, y_key=spec.y_key, grid_shape=spec.grid_shape,
     )
-    feed.run_to_completion()
+    node.run_to_completion()
 
     sites = hub.latest(spec.y_key + "_sites")
     grid = hub.latest(spec.y_key + "_grid")
@@ -159,15 +159,15 @@ def test_temperature_feed_per_site_publishes_latest_site_vector_and_grid():
     assert np.all((finite >= 0.0) & (finite <= 1.0))
 
 
-def test_readout_duration_feed_runs_out_a_fidelity_curve():
+def test_readout_duration_node_runs_out_a_fidelity_curve():
     exp = na.connect("virtual")
     exp.readout.sitemap(frames=4, display=False)
     hub = SignalHub()
     spec = exp.readout.measurement_specs()[1]
     measurement = spec.build(duration=(5.0, 50.0, 4), shots=6)
-    feed = ScannedMeasurementFeed(hub, measurement, x_key=spec.x_key, y_key=spec.y_key)
+    node = ScannedMeasurementNode(hub, measurement, x_key=spec.x_key, y_key=spec.y_key)
 
-    feed.run_to_completion()
+    node.run_to_completion()
 
     x = hub.latest(spec.x_key)
     y = hub.latest(spec.y_key)
@@ -177,21 +177,21 @@ def test_readout_duration_feed_runs_out_a_fidelity_curve():
     assert np.all((y >= 0.0) & (y <= 1.0))
 
 
-# ------------------------------------------------ ScannedMeasurementFeed (thread)
+# ------------------------------------------------ ScannedMeasurementNode (thread)
 
 
-def test_temperature_feed_start_thread_auto_stops_when_scan_completes():
+def test_temperature_node_start_thread_auto_stops_when_scan_completes():
     exp = _calibrated_virtual_session(grid=(2, 3))
     hub = SignalHub()
-    feed, spec = _temperature_feed(exp, hub, points=4, shots=2, t_max_us=80.0)
+    node, spec = _temperature_node(exp, hub, points=4, shots=2, t_max_us=80.0)
 
-    feed.start(rate_hz=50.0)
+    node.start(rate_hz=50.0)
     deadline = time.perf_counter() + 10.0
-    while feed.running and time.perf_counter() < deadline:
+    while node.running and time.perf_counter() < deadline:
         time.sleep(0.02)
 
-    assert feed.finished
-    assert feed.running is False        # finite scan stopped its own daemon thread
+    assert node.finished
+    assert node.running is False        # finite scan stopped its own daemon thread
     y = hub.latest(spec.y_key)
     assert y.shape == (4,)
     assert np.all(np.isfinite(y))
@@ -312,62 +312,62 @@ def test_region_to_acquisition_parameters_is_owned_by_the_source():
     """The plot selector is a GENERIC interface -- it yields a rectangle as four
     endpoints (x_min, x_max, y_min, y_max) in plot coords and knows nothing about
     cameras.  Each SOURCE converts that rectangle to its own ACQUISITION params,
-    which stay in PLOT coordinates: a camera feed keeps it as ``region`` endpoints
+    which stay in PLOT coordinates: a camera measurement keeps it as ``region`` endpoints
     (the device-ROI conversion is hidden in set_acquisition_parameters); a source
     with no spatial region returns {} (the selection is a no-op for it).  So the
     frontend never encodes a device-specific shape."""
     exp = na.connect("virtual", sitemap={"grid_shape": (2, 3), "image_shape": (64, 80)})
     hub = SignalHub()
-    cam_feed = na.CameraFrameFeed(hub, exp.devices.camera)
+    cam_node = na.CameraMeasurement(hub, exp.devices.camera)
     # endpoints stay endpoints (NOT collapsed to position+size) -- plot format
-    assert cam_feed.region_to_acquisition_parameters(10, 30, 6, 22) == {"region": [10, 30, 6, 22]}
+    assert cam_node.region_to_acquisition_parameters(10, 30, 6, 22) == {"region": [10, 30, 6, 22]}
     # endpoints come in any order -> sorted endpoints
-    assert cam_feed.region_to_acquisition_parameters(30, 10, 22, 6) == {"region": [10, 30, 6, 22]}
+    assert cam_node.region_to_acquisition_parameters(30, 10, 22, 6) == {"region": [10, 30, 6, 22]}
     # the round trip through the camera: set region endpoints -> device ROI -> read
     # back as endpoints (full sensor 64x80, no snap needed for /4-aligned values)
-    cam_feed.set_acquisition_parameters(region=[8, 28, 12, 28])
-    assert cam_feed.acquisition_parameters()["region"] == [8, 28, 12, 28]
-    # a non-spatial producer (a Processor / scan measurement) has no rectangle param
-    from Zou_lab_control.neutral_atom.operations.feeds import DetectProcessor
+    cam_node.set_acquisition_parameters(region=[8, 28, 12, 28])
+    assert cam_node.acquisition_parameters()["region"] == [8, 28, 12, 28]
+    # a non-spatial node (a Processor / scan measurement) has no rectangle param
+    from Zou_lab_control.neutral_atom.operations.logic import DetectProcessor
     assert DetectProcessor(hub, calibration=None).region_to_acquisition_parameters(10, 30, 6, 22) == {}
 
 
 # ------------------------------------------------ acquisition-parameter protocol
 
 
-def test_camera_frame_feed_exposes_camera_params_and_applies_them_live():
-    """A panel is a VIEW; the feed's SOURCE owns the editable params.  A raw-frame
-    feed's source is the camera, so acquisition_parameters() reports the camera's
-    exposure and set_acquisition_parameters() reconfigures the camera in place --
-    no rebuild, same feed keeps publishing 'frame'."""
+def test_camera_measurement_exposes_camera_params_and_applies_them_live():
+    """A panel is a VIEW; the node's SOURCE owns the editable params.  A raw-frame
+    camera measurement's source is the camera, so acquisition_parameters() reports the
+    camera's exposure and set_acquisition_parameters() reconfigures the camera in place
+    -- no rebuild, same measurement keeps publishing 'frame'."""
     exp = na.connect("virtual")
     cam = exp.devices.camera
     hub = SignalHub()
-    feed = na.CameraFrameFeed(hub, cam)
+    cam_node = na.CameraMeasurement(hub, cam)
 
     # default frames_per_cycle=1 -> the first trigger as both 'frame' (back-compat /
     # default 2D panel) and 'frame_0' (the per-trigger name).
-    assert feed.published_signals() == frozenset({"frame", "frame_0"})
-    params = feed.acquisition_parameters()
+    assert cam_node.published_signals() == frozenset({"frame", "frame_0"})
+    params = cam_node.acquisition_parameters()
     assert "exposure" in params and params["exposure"] == float(cam.exposure)
     assert params["frames_per_cycle"] == 1
 
-    feed.set_acquisition_parameters(exposure=0.05)
+    cam_node.set_acquisition_parameters(exposure=0.05)
     assert float(cam.exposure) == 0.05                      # applied to the camera in place
-    assert feed.acquisition_parameters()["exposure"] == 0.05
+    assert cam_node.acquisition_parameters()["exposure"] == 0.05
 
-    feed.step()
+    cam_node.step()
     frame = hub.latest("frame")
     assert np.ndim(frame) == 2                              # a real 2-D camera frame
 
 
-def test_running_feed_applies_params_in_owner_thread_no_concurrent_acquire():
-    """ARCHITECTURE invariant: while a feed's acquisition loop runs, it is the SOLE
+def test_running_node_applies_params_in_owner_thread_no_concurrent_acquire():
+    """ARCHITECTURE invariant: while a node's acquisition loop runs, it is the SOLE
     owner of the source.  An edit from another thread goes through
     ``apply_acquisition_parameters``, which QUEUES it; the loop applies it BETWEEN
     shots in its own thread.  So (1) the source is reconfigured with NO second
     ``acquire()`` ever running on it concurrently -- the deadlock/freeze that a
-    GUI-thread stop/start would cause -- (2) the feed is NOT restarted (same
+    GUI-thread stop/start would cause -- (2) the node is NOT restarted (same
     thread keeps streaming), and (3) the change lands within ~1 shot.
 
     Faked at the lowest level only: a camera whose ``acquire`` BLOCKS for the
@@ -415,29 +415,30 @@ def test_running_feed_applies_params_in_owner_thread_no_concurrent_acquire():
 
     hub = SignalHub()
     cam = _BlockingCam()
-    feed = na.CameraFrameFeed(hub, cam)
-    feed.start(rate_hz=40.0)
+    cam_node = na.CameraMeasurement(hub, cam)
+    cam_node.start(rate_hz=40.0)
     try:
         deadline = time.monotonic() + 2.0
-        while feed.shots < 2 and time.monotonic() < deadline:
+        while cam_node.shots < 2 and time.monotonic() < deadline:
             time.sleep(0.02)
-        thread_before = feed._thread
+        thread_before = cam_node._thread
         # an edit from THIS (non-owner) thread -- must be queued, not applied here.
         # region endpoints [1664,1696,1160,1192] -> internal device ROI (1664,32,1160,32)
-        feed.apply_acquisition_parameters(region=[1664, 1696, 1160, 1192])
+        cam_node.apply_acquisition_parameters(region=[1664, 1696, 1160, 1192])
         deadline = time.monotonic() + 2.0
         while cam.roi != (1664, 32, 1160, 32) and time.monotonic() < deadline:
             time.sleep(0.02)
-        assert cam.roi == (1664, 32, 1160, 32)          # applied by the loop
-        assert feed.running                              # still streaming
-        assert feed._thread is thread_before            # SAME thread -- no restart
-        assert cam.max_depth == 1                        # never two acquire() at once
+        assert cam.roi == (1664, 32, 1160, 32)           # applied by the loop
+        assert cam_node.running                           # still streaming
+        assert cam_node._thread is thread_before         # SAME thread -- no restart
+        assert cam.max_depth == 1                         # never two acquire() at once
     finally:
-        feed.stop()
+        cam_node.stop()
 
 
-# (the old LoadingFeed in-place re-calibration test was removed with LoadingFeed:
-#  the loading readout is now COMPOSED -- calibration is the CalibrateReadoutTask and
-#  detection the DetectProcessor; their parameters come from the build signature.
-#  Composition + the real detect path are covered by tests/test_producer_split_contract.py
-#  and tests/test_neutral_atom_lightweight.py::test_virtual_loading_readout_*.)
+# The old monolithic loading-readout in-place re-calibration test was removed: the
+# loading readout is now COMPOSED by the user -- a CameraMeasurement publishing
+# ``frame`` + a DetectProcessor turning ``frame`` into occupancy + a
+# CalibrateReadoutTask producing the calibration -- each addressed independently.
+# Composition + the real detect path are covered by
+# tests/test_logic_node_split_contract.py.

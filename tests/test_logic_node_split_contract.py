@@ -1,12 +1,13 @@
-"""Contract: the loading readout is COMPOSED of separate producer nodes, not one
-feed fabricating every signal -- and detection runs the REAL pipeline (virtual==real).
+"""Contract: the loading readout is COMPOSED of separate logic nodes by the user,
+not one monolithic node fabricating every signal -- and detection runs the REAL
+pipeline (virtual==real).
 
-The camera Measurement (`CameraFrameFeed`) publishes ONLY ``frame``.  A separate
+The camera Measurement (`CameraMeasurement`) publishes ONLY ``frame``.  A separate
 `DetectProcessor` consumes ``frame`` and runs the SAME ``calibration.detect``
 contract the notebook/real readout uses to publish per-site occupancy + rate.  The
-calibration comes from the real sitemap/threshold path.  This is the virtual==real
-split the monolithic ``LoadingFeed`` violated: only the camera frame is simulated;
-site detection is the production code path, as a distinct graph node.
+calibration comes from a `CalibrateReadoutTask` running the real sitemap/threshold
+path.  This is the virtual==real split: only the camera frame is simulated; site
+detection is the production code path, as a distinct graph node.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ if sys.path[0] != str(REPO_ROOT):
 def test_camera_measurement_plus_detect_processor_runs_real_pipeline():
     import Zou_lab_control.neutral_atom as na
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
-    from Zou_lab_control.neutral_atom.operations.feeds import CameraFrameFeed, DetectProcessor
+    from Zou_lab_control.neutral_atom.operations.logic import CameraMeasurement, DetectProcessor
 
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
     # calibration via the REAL path (site centers detected from frames; per-site thresholds learned)
@@ -34,7 +35,7 @@ def test_camera_measurement_plus_detect_processor_runs_real_pipeline():
     assert cal is not None and cal.thresholds is not None
 
     hub = SignalHub()
-    cam = CameraFrameFeed(hub, exp.devices.camera, sequencer=exp.devices.sequencer)
+    cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer)
     det = DetectProcessor(hub, calibration=cal, source="frame", grid_shape=(3, 4))
     try:
         # the camera measurement is just that -- a camera; it does NOT detect.
@@ -70,16 +71,16 @@ def test_camera_measurement_plus_detect_processor_runs_real_pipeline():
         exp.close()
 
 
-def test_calibrate_task_produces_calibration_and_feeds_detect(tmp_path):
+def test_calibrate_task_produces_calibration_and_drives_detect_processor(tmp_path):
     """The calibrate-readout Task runs the REAL sitemap+threshold path, emits mid-run
     output (intermediate frame + progress) to the hub, saves an npz artifact, and
     yields a calibration a DetectProcessor then consumes -- the whole loading readout
-    composed from device + task + processor (no monolithic feed)."""
+    composed BY THE USER from device + task + processor (no monolithic node)."""
     import numpy as np
     import Zou_lab_control.neutral_atom as na
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
-    from Zou_lab_control.neutral_atom.operations.feeds import (
-        CalibrateReadoutTask, CameraFrameFeed, DetectProcessor)
+    from Zou_lab_control.neutral_atom.operations.logic import (
+        CalibrateReadoutTask, CameraMeasurement, DetectProcessor)
 
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
     hub = SignalHub()
@@ -101,7 +102,7 @@ def test_calibrate_task_produces_calibration_and_feeds_detect(tmp_path):
         assert saved["centers"].shape == (12, 2) and saved["thresholds"].shape == (12,)
 
         # composition: the task's calibration drives a DetectProcessor on live frames
-        cam = CameraFrameFeed(hub, exp.devices.camera, sequencer=exp.devices.sequencer)
+        cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer)
         det = DetectProcessor(hub, calibration=task.calibration, grid_shape=(3, 4))
         cam.step()
         det.step()
@@ -110,64 +111,77 @@ def test_calibrate_task_produces_calibration_and_feeds_detect(tmp_path):
         exp.close()
 
 
-def test_build_loading_readout_composes_the_whole_chain():
-    """The composed factory replaces the monolithic LoadingFeed: one call wires the
-    calibrate Task + camera Measurement + DetectProcessor, and the live chain is
-    camera -> frame -> real detect (virtual == real)."""
+def test_user_composed_loading_readout_streams_real_detect_off_camera_frames():
+    """The user composes the loading readout from independent nodes -- a camera
+    Measurement publishing ``frame`` + a DetectProcessor turning ``frame`` into
+    occupancy/rate (via the REAL calibration.detect) -- and the live chain is
+    camera -> frame -> real detect (virtual == real).  No monolithic node fabricates
+    every signal; the user (notebook or task console) wires the three primitives."""
     import Zou_lab_control.neutral_atom as na
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
-    from Zou_lab_control.neutral_atom.operations.feeds import (
-        CameraFrameFeed, DetectProcessor, build_loading_readout)
+    from Zou_lab_control.neutral_atom.operations.logic import (
+        CalibrateReadoutTask, CameraMeasurement, DetectProcessor)
 
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
     hub = SignalHub()
-    readout = build_loading_readout(
-        hub, exp.devices.camera, sequencer=exp.devices.sequencer, grid_shape=(3, 4),
-        calibration_frames=4, threshold_frames=20)
     try:
-        assert isinstance(readout.camera, CameraFrameFeed)
-        assert isinstance(readout.detect, DetectProcessor)
-        assert readout.detect.calibration is None             # not calibrated yet
-        readout.calibrate()
-        assert readout.detect.calibration is not None
-        assert readout.producers == (readout.camera, readout.detect)
+        # User composition step 1: run the calibrate task to get a TrapCalibration.
+        # (The task publishes its mid-run output under its own cal_ prefix so its
+        # template frames never clobber the live frame the user will stream next.)
+        task = CalibrateReadoutTask(
+            hub, exp.devices.camera, sequencer=exp.devices.sequencer, grid_shape=(3, 4),
+            calibration_frames=4, threshold_frames=20, method="box", prefix="cal_")
+        task.run_to_completion()
+        assert task.calibration is not None
 
-        readout.camera.step()                                 # publishes frame
-        readout.detect.step()                                 # consumes frame -> real detect
+        # User composition step 2: a camera Measurement (publishes raw frames).
+        cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer)
+        # User composition step 3: a DetectProcessor running the REAL contract.
+        det = DetectProcessor(hub, calibration=task.calibration, grid_shape=(3, 4))
+
+        cam.step()                                    # publishes frame
+        det.step()                                    # consumes frame -> real detect
         names = set(hub.names())
         assert "frame" in names and {"occupied", "rate", "centers"} <= names
         occ = hub.latest("occupied")
         assert occ.shape == (12,)
         frame = hub.latest("frame")
-        expected = np.asarray(readout.detect.calibration.detect(frame).occupied, dtype=float).reshape(-1)
+        expected = np.asarray(task.calibration.detect(frame).occupied, dtype=float).reshape(-1)
         np.testing.assert_array_equal(occ, expected)
     finally:
-        readout.stop()
+        cam.stop()
+        det.stop()
         exp.close()
 
 
-def test_loading_readout_calibrate_output_is_namespaced():
-    """The composed readout's calibrate task publishes its MID-RUN output + result
-    under a ``cal_`` namespace, so its template frames never clobber the LIVE ``frame``
-    (a dedicated 'calibrating' panel can watch ``cal_frame`` / ``cal_progress``)."""
+def test_calibrate_task_namespaces_its_output_away_from_live_frame():
+    """The calibrate task uses its OWN prefix (e.g. ``cal_``) so its mid-run + result
+    signals (cal_frame / cal_progress / cal_centers / ...) never clobber a LIVE
+    ``frame`` the camera measurement publishes alongside it.  A dedicated
+    'calibrating' panel can watch ``cal_frame`` / ``cal_progress`` while the live
+    panel watches ``frame``."""
     import Zou_lab_control.neutral_atom as na
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
-    from Zou_lab_control.neutral_atom.operations.feeds import build_loading_readout
+    from Zou_lab_control.neutral_atom.operations.logic import (
+        CalibrateReadoutTask, CameraMeasurement)
 
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
     hub = SignalHub()
-    readout = build_loading_readout(
-        hub, exp.devices.camera, sequencer=exp.devices.sequencer, grid_shape=(3, 4),
-        calibration_frames=4, threshold_frames=20)
     try:
-        assert "frame" not in hub.names()          # nothing live yet
-        readout.calibrate()                         # runs the calibrate task (cal_ namespace)
+        task = CalibrateReadoutTask(
+            hub, exp.devices.camera, sequencer=exp.devices.sequencer, grid_shape=(3, 4),
+            calibration_frames=4, threshold_frames=20, prefix="cal_")
+        assert "frame" not in hub.names()              # nothing live yet
+        task.run_to_completion()                       # runs the calibrate task (cal_ namespace)
         names = set(hub.names())
         assert {"cal_frame", "cal_progress", "cal_centers"} <= names
         assert hub.latest("cal_progress") == 1.0
-        assert "frame" not in names                 # calibration did NOT publish the live frame
-        readout.camera.step()                       # the live camera publishes its OWN frame
+        assert "frame" not in names                    # calibration did NOT publish the live frame
+
+        # The user adds the live camera measurement separately -- it publishes its
+        # OWN ``frame``, distinct from the task's ``cal_frame``.
+        cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer)
+        cam.step()
         assert "frame" in hub.names() and "cal_frame" in hub.names()   # distinct, no clobber
     finally:
-        readout.stop()
         exp.close()
