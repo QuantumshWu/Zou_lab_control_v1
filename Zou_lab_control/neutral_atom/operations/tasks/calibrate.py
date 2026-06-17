@@ -35,14 +35,19 @@ CALIBRATE_PARAMS = (
                       "uniform PSF = one shared kernel for all sites."),
     ParamDecl("threshold_method", "threshold", "choice", default="otsu", choices=("otsu", "bimodal"),
               tooltip="otsu = single split; bimodal = dark/bright Gaussian-core fit per site."),
-    ParamDecl("exposure", "exposure", "float", default=0.02, unit="s", lo=0.0, hi=10.0,
-              tooltip="Camera exposure / probe duration for the live acquisition (used when no "
-                      "pulse program is given)."),
-    ParamDecl("pulse_program", "pulse program", "text", default="",
-              tooltip="Optional saved pulse program (a PulseTableState .json from the pulse GUI) "
-                      "that drives the LIVE imaging acquisition -- it sets the camera trigger + "
-                      "durations via the pulse API.  Blank = the default imaging sequence at the "
-                      "exposure above."),
+    ParamDecl("sitemap_exposure", "sitemap exposure", "float", default=0.05, unit="s", lo=0.0, hi=10.0,
+              tooltip="LONGER readout duration for the site + PSF calibration pass (more photons "
+                      "-> cleaner centroids/PSF).  Used when no sitemap pulse is given."),
+    ParamDecl("sitemap_pulse", "sitemap pulse", "text", default="",
+              tooltip="Optional saved pulse program (a PulseTableState .json from the pulse GUI) for "
+                      "the SITE/PSF acquisition (the long readout).  Blank = default imaging "
+                      "sequence at the sitemap exposure."),
+    ParamDecl("readout_exposure", "readout exposure", "float", default=0.02, unit="s", lo=0.0, hi=10.0,
+              tooltip="ACTUAL readout duration for the threshold pass (thresholds are learnt under "
+                      "the real readout conditions).  Used when no readout pulse is given."),
+    ParamDecl("readout_pulse", "readout pulse", "text", default="",
+              tooltip="Optional saved pulse program for the ACTUAL-READOUT acquisition (thresholds). "
+                      "Blank = default imaging sequence at the readout exposure."),
     ParamDecl("calibration_frames", "sitemap frames", "int", default=4, lo=1, hi=1000,
               tooltip="Frames averaged into the all-sites sitemap template."),
     ParamDecl("threshold_frames", "threshold frames", "int", default=24, lo=2, hi=10000,

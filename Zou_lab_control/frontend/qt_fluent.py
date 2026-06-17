@@ -878,13 +878,16 @@ class _RoundedPopupCard(QtCore.QObject):
     returns True so the default (square, opaque) paint is skipped; the translucent
     container then shows nothing outside the rounded arc (no bottom-right nub)."""
 
-    def __init__(self, radius: float, border: str, parent=None):
+    def __init__(self, radius: float, border: str, *, combo=None, gap: int = 0, parent=None):
         super().__init__(parent)
         self._radius = float(radius)
         self._border = QtGui.QColor(border)
+        self._combo = combo            # the owning FluentComboBox (for the outer-gap offset)
+        self._gap = int(gap)
 
     def eventFilter(self, obj, event):  # noqa: N802 - Qt naming
-        if event.type() == QtCore.QEvent.Paint and isinstance(obj, QtWidgets.QWidget):
+        et = event.type()
+        if et == QtCore.QEvent.Paint and isinstance(obj, QtWidgets.QWidget):
             painter = QtGui.QPainter(obj)
             painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
             pen = QtGui.QPen(self._border)
@@ -895,6 +898,18 @@ class _RoundedPopupCard(QtCore.QObject):
             painter.drawRoundedRect(rect, self._radius, self._radius)
             painter.end()
             return True
+        if et == QtCore.QEvent.Move and self._combo is not None and isinstance(obj, QtWidgets.QWidget):
+            # OUTER gap: Qt drops the popup flush against the combo (in a deferred
+            # step a showPopup-time move() can't beat); re-apply the offset every time
+            # it is repositioned so the dropdown sits a few px OFF the box -- the same
+            # gap the Setting FluentPopup uses below its button.  Self-converging: once
+            # at target the guard no-ops, so the corrective move does not loop.
+            below = self._combo.mapToGlobal(QtCore.QPoint(0, self._combo.height())).y()
+            target = below + self._gap
+            geo = obj.geometry()
+            if geo.top() >= below - 2 and abs(geo.top() - target) > 1:   # opened downward, not yet offset
+                obj.move(geo.left(), target)
+            return False
         return False
 
 
@@ -980,6 +995,15 @@ class FluentComboBox(QtWidgets.QComboBox):
             QComboBox QAbstractItemView::item {{
                 padding: {scaled_px(3, minimum=2)}px {scaled_px(6, minimum=4)}px;
                 border-radius: {_radius()}px;
+                color: {TEXT};
+            }}
+            QComboBox QAbstractItemView::item:hover {{
+                background-color: {HOVER};
+                color: white;
+            }}
+            QComboBox QAbstractItemView::item:selected {{
+                background-color: {ACCENT};
+                color: white;
             }}
             QComboBox QAbstractItemView::corner {{ background: transparent; border: none; }}
             """
@@ -1010,16 +1034,17 @@ class FluentComboBox(QtWidgets.QComboBox):
         layout = container.layout()
         if layout is not None:
             layout.setContentsMargins(0, 0, 0, 0)
-        self._card_filter = _RoundedPopupCard(float(_radius()), DIVIDER, parent=container)
+        self._card_filter = _RoundedPopupCard(float(_radius()), DIVIDER,
+                                              combo=self, gap=self._gap, parent=container)
         container.installEventFilter(self._card_filter)
 
     def showPopup(self) -> None:  # noqa: N802 - Qt naming
         # The container is configured in __init__; if it was rebuilt, reconfigure.
+        # The OUTER gap (dropdown sits a few px off the box) is enforced by the
+        # container's Move event filter (_RoundedPopupCard), which beats Qt's deferred
+        # flush-positioning that a showPopup-time move() cannot.
         self._configure_popup_container()
         super().showPopup()
-        container = self.view().window()
-        if container is not None and container is not self:
-            container.update()
 
     def paintEvent(self, event):
         del event

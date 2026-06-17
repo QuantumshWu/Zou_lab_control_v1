@@ -65,7 +65,8 @@ def test_calibrate_task_live_each_mode_and_threshold(mode, resolved, threshold_m
     try:
         task = exp.readout.calibrate_task(
             SignalHub(), mode=mode, threshold_method=threshold_method,
-            calibration_frames=3, threshold_frames=16, exposure=0.02)
+            calibration_frames=3, threshold_frames=16,
+            sitemap_exposure=0.05, readout_exposure=0.02)
         assert task.method == resolved                 # mode -> sitemap method
         task.run_to_completion()
         centers = np.asarray(task.calibration.centers, dtype=float)
@@ -97,26 +98,31 @@ def test_calibrate_task_save_then_load_skips_acquisition(tmp_path):
         exp.close()
 
 
-def test_calibrate_task_live_uses_saved_pulse_program(tmp_path):
-    """A saved pulse program (a PulseTableState .json from the pulse GUI) drives the
-    LIVE imaging acquisition via the pulse API -- the cali task loads it and acquires
-    under it instead of the default imaging sequence."""
+def test_calibrate_task_live_uses_two_saved_pulse_programs(tmp_path):
+    """The cali task takes TWO saved pulse programs (PulseTableState .json from the
+    pulse GUI): a LONGER one for the site/PSF pass and the ACTUAL-readout one for the
+    threshold pass.  Each drives its acquisition via the pulse API; both round-trip in
+    the Edit (acquisition_parameters)."""
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
     from Zou_lab_control.neutral_atom.timing import imaging_sequence, PulseTableState
 
     exp = _calibrated()
     try:
-        prog = tmp_path / "imaging_program.json"
-        state = PulseTableState.from_sequence(
-            imaging_sequence(exposure=0.02, load=True, name="cali_img"),
-            channels=["trap", "cooling", "probe", "emCCD"])
-        state.save(prog)
+        chans = ["trap", "cooling", "probe", "emCCD"]
+        site_prog = tmp_path / "sitemap_long.json"      # long readout for site + PSF
+        read_prog = tmp_path / "readout_actual.json"    # actual readout for thresholds
+        PulseTableState.from_sequence(
+            imaging_sequence(exposure=0.06, load=True, name="sitemap_img"), channels=chans).save(site_prog)
+        PulseTableState.from_sequence(
+            imaging_sequence(exposure=0.02, load=True, name="readout_img"), channels=chans).save(read_prog)
 
         task = exp.readout.calibrate_task(
-            SignalHub(), source="live", pulse_program=str(prog), mode="box",
+            SignalHub(), source="live", mode="per-site PSF",
+            sitemap_pulse=str(site_prog), readout_pulse=str(read_prog),
             calibration_frames=3, threshold_frames=12)
-        assert task.pulse_program == str(prog)                  # threaded through
-        assert task.acquisition_parameters()["pulse_program"] == str(prog)  # Edit round-trips it
+        assert task.sitemap_pulse == str(site_prog) and task.readout_pulse == str(read_prog)
+        ap = task.acquisition_parameters()
+        assert ap["sitemap_pulse"] == str(site_prog) and ap["readout_pulse"] == str(read_prog)
         task.run_to_completion()
         assert np.asarray(task.calibration.centers).shape == (12, 2)
     finally:

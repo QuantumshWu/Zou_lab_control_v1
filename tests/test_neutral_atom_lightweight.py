@@ -6951,7 +6951,8 @@ def test_user_composed_loading_readout_publishes_standard_signals():
     def _build(hub, *, prefix, seed, loading_probability, ema):
         trap = VirtualTrapArray(grid_shape=(5, 7), loading_probability=loading_probability, seed=seed)
         camera = VirtualCamera(trap, exposure=0.02)
-        task = CalibrateReadoutTask(hub, camera, grid_shape=trap.grid_shape, exposure=0.02,
+        task = CalibrateReadoutTask(hub, camera, grid_shape=trap.grid_shape,
+                                    sitemap_exposure=0.05, readout_exposure=0.02,
                                     roi_radius=1, calibration_frames=4, threshold_frames=24,
                                     prefix=f"{prefix}cal_")
         task.run_to_completion()
