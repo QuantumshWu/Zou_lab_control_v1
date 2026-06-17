@@ -511,7 +511,7 @@ class CalibrateReadoutTask(Task):
                  grid_shape: tuple[int, int] = (5, 7), exposure: float = 0.02, roi_radius: int = 1,
                  calibration_frames: int = 4, threshold_frames: int = 24, method: str = "box",
                  mode: str | None = None, threshold_method: str = "otsu",
-                 source: str = "live", data_dir: str | None = None,
+                 source: str = "live", data_dir: str | None = None, pulse_program: str | None = None,
                  save_path: str | None = None, load_path: str | None = None, prefix: str = ""):
         super().__init__(hub, prefix=prefix)
         self.camera = camera
@@ -530,6 +530,7 @@ class CalibrateReadoutTask(Task):
         self.threshold_method = str(threshold_method)
         self.source = str(source)
         self.data_dir = data_dir
+        self.pulse_program = pulse_program or None
         self.save_path = save_path
         self.load_path = load_path
         self.calibration = None
@@ -546,6 +547,7 @@ class CalibrateReadoutTask(Task):
         return {
             "source": str(self.source),
             "data_dir": "" if self.data_dir is None else str(self.data_dir),
+            "pulse_program": "" if self.pulse_program is None else str(self.pulse_program),
             "grid_shape": tuple(self.grid_shape),
             "exposure": float(self.exposure),
             "roi_radius": int(self.roi_radius),
@@ -562,6 +564,8 @@ class CalibrateReadoutTask(Task):
             self.source = str(values["source"])
         if "data_dir" in values:
             self.data_dir = str(values["data_dir"]) or None
+        if "pulse_program" in values:
+            self.pulse_program = str(values["pulse_program"]) or None
         if "grid_shape" in values:
             self.grid_shape = grid_shape_tuple(values["grid_shape"])
         if "exposure" in values:
@@ -610,11 +614,21 @@ class CalibrateReadoutTask(Task):
         return {"centers": centers, "thresholds": thr, "n_sites": float(len(centers))}
 
     def _run_live(self, out: "TaskOutput"):
-        """Acquire frames now (camera + pulse) and calibrate the sitemap + thresholds."""
+        """Acquire frames now (camera + pulse) and calibrate the sitemap + thresholds.
+
+        Imaging pulse: a saved ``pulse_program`` (a PulseTableState .json from the
+        pulse GUI), when given, drives the acquisition via the pulse API -- it owns
+        the camera trigger + durations; otherwise the default imaging sequence at the
+        chosen ``exposure`` is used.  Same path on real hardware (only the camera differs)."""
         from .calibration import calibrate_sitemap_from_images, calibrate_threshold_from_images
-        channel_kwargs = imaging_channel_kwargs(self.sequencer)
-        sitemap_seq = imaging_sequence(exposure=self.exposure, load=True, name="sitemap", **channel_kwargs)
-        readout_seq = imaging_sequence(exposure=self.exposure, load=True, name="readout", **channel_kwargs)
+        if self.pulse_program:
+            from ..timing import PulseTableState
+            seq = PulseTableState.load(self.pulse_program).to_sequence(name="calibrate")
+            sitemap_seq = readout_seq = seq
+        else:
+            channel_kwargs = imaging_channel_kwargs(self.sequencer)
+            sitemap_seq = imaging_sequence(exposure=self.exposure, load=True, name="sitemap", **channel_kwargs)
+            readout_seq = imaging_sequence(exposure=self.exposure, load=True, name="readout", **channel_kwargs)
         template = self.camera.acquire(self.calibration_frames, sequence=sitemap_seq,
                                        sequencer=self.sequencer, stop=self._stop)
         out.publish(frame=np.asarray(template[-1], dtype=float), progress=0.4)

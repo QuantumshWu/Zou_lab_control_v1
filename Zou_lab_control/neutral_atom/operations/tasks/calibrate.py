@@ -36,7 +36,13 @@ CALIBRATE_PARAMS = (
     ParamDecl("threshold_method", "threshold", "choice", default="otsu", choices=("otsu", "bimodal"),
               tooltip="otsu = single split; bimodal = dark/bright Gaussian-core fit per site."),
     ParamDecl("exposure", "exposure", "float", default=0.02, unit="s", lo=0.0, hi=10.0,
-              tooltip="Camera exposure / probe duration for the live acquisition."),
+              tooltip="Camera exposure / probe duration for the live acquisition (used when no "
+                      "pulse program is given)."),
+    ParamDecl("pulse_program", "pulse program", "text", default="",
+              tooltip="Optional saved pulse program (a PulseTableState .json from the pulse GUI) "
+                      "that drives the LIVE imaging acquisition -- it sets the camera trigger + "
+                      "durations via the pulse API.  Blank = the default imaging sequence at the "
+                      "exposure above."),
     ParamDecl("calibration_frames", "sitemap frames", "int", default=4, lo=1, hi=1000,
               tooltip="Frames averaged into the all-sites sitemap template."),
     ParamDecl("threshold_frames", "threshold frames", "int", default=24, lo=2, hi=10000,

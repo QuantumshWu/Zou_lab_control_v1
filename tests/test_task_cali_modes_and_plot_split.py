@@ -97,6 +97,32 @@ def test_calibrate_task_save_then_load_skips_acquisition(tmp_path):
         exp.close()
 
 
+def test_calibrate_task_live_uses_saved_pulse_program(tmp_path):
+    """A saved pulse program (a PulseTableState .json from the pulse GUI) drives the
+    LIVE imaging acquisition via the pulse API -- the cali task loads it and acquires
+    under it instead of the default imaging sequence."""
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.neutral_atom.timing import imaging_sequence, PulseTableState
+
+    exp = _calibrated()
+    try:
+        prog = tmp_path / "imaging_program.json"
+        state = PulseTableState.from_sequence(
+            imaging_sequence(exposure=0.02, load=True, name="cali_img"),
+            channels=["trap", "cooling", "probe", "emCCD"])
+        state.save(prog)
+
+        task = exp.readout.calibrate_task(
+            SignalHub(), source="live", pulse_program=str(prog), mode="box",
+            calibration_frames=3, threshold_frames=12)
+        assert task.pulse_program == str(prog)                  # threaded through
+        assert task.acquisition_parameters()["pulse_program"] == str(prog)  # Edit round-trips it
+        task.run_to_completion()
+        assert np.asarray(task.calibration.centers).shape == (12, 2)
+    finally:
+        exp.close()
+
+
 def test_calibrate_task_folder_source(tmp_path):
     import Zou_lab_control.neutral_atom as na
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
