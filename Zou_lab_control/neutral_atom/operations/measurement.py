@@ -21,7 +21,7 @@ test_virtual_equals_real_contract.py`` guards this).
 from __future__ import annotations
 
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Protocol, runtime_checkable
 
 import numpy as np
@@ -32,6 +32,7 @@ from ..core.analysis import estimate_threshold_fidelity, otsu_threshold, positiv
 from ..core.calibration import TrapCalibration
 from ..core.results import MeasurementTaskResult
 from ..core.utils import site_index
+from ..timing.sequence import snap_seconds_to_clock
 from ..views.plots import plot_detection_scan
 
 
@@ -385,6 +386,20 @@ class ScannedMeasurement:
                 raise ValueError(
                     f"ScanAxis.slot {self.axis.slot!r} is not a scan slot of the bound pulse "
                     f"(known slots: {list(known)}); a DAC scan must target one of them.")
+        # Snap a DURATION axis to the sequencer clock grid: the hardware only lands on
+        # whole ticks, so a continuous / linspace sweep (readout-duration -> fidelity,
+        # release-recapture hold, ...) is quantized HERE, at the one place every duration
+        # scan builds its per-point sequence.  The plotted x then equals the exposures
+        # actually run and no downstream sequence trips the clock-grid validator -- the
+        # "repeat period not on the clock grid" failure.  (DAC axes are integer codes.)
+        if self.axis.is_time:
+            clock = float(getattr(self._sequencer(), "clock_hz", 0.0) or 0.0)
+            if clock > 0.0:
+                scale = float(self.axis.scale_to_ns) / 1e9      # axis unit -> seconds
+                snapped = np.array(
+                    [snap_seconds_to_clock(float(v) * scale, clock) / scale for v in self.axis.values],
+                    dtype=float)
+                self.axis = replace(self.axis, values=snapped)
         # A driver (e.g. ScannedMeasurementNode) sets this to its stop Event so a
         # Stop interrupts a wedged trigger DURING a scan point, not just between
         # points; None = the synchronous notebook path (no mid-point cancel).

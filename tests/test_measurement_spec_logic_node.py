@@ -108,7 +108,7 @@ def _temperature_node(exp, hub, *, points, shots, t_max_us=300.0):
     spec = exp.readout.measurement_specs()[0]
     measurement = spec.build(t_off=(0.0, t_max_us, points), shots=shots, capture_radius=6.0)
     return ScannedMeasurementNode(
-        hub, measurement, x_key=spec.x_key, y_key=spec.y_key, grid_shape=spec.grid_shape,
+        hub, measurement, x_key=spec.x_key, y_key=spec.y_key,
     ), spec
 
 
@@ -144,23 +144,28 @@ def test_temperature_node_run_to_completion_publishes_full_decaying_curve():
     assert 25e-6 <= fit.temperature_K <= 100e-6
 
 
-def test_temperature_node_per_site_publishes_latest_site_vector_and_grid():
+def test_temperature_node_per_site_publishes_latest_site_vector_only():
+    """A per-site scan publishes ONLY the flat per-site vector (``<y>_sites``); a site-grid
+    view is a reshape EXPRESSION on it, not a separate published signal (no ``<y>_grid``)."""
     exp = _calibrated_virtual_session(grid=(2, 3))
     n_sites = exp.devices.trap_array.n_sites
     hub = SignalHub()
     spec = exp.readout.measurement_specs()[0]
     measurement = spec.build(t_off=(0.0, 80.0, 4), shots=2, capture_radius=6.0, per_site=True)
-    node = ScannedMeasurementNode(
-        hub, measurement, x_key=spec.x_key, y_key=spec.y_key, grid_shape=spec.grid_shape,
-    )
+    node = ScannedMeasurementNode(hub, measurement, x_key=spec.x_key, y_key=spec.y_key)
     node.run_to_completion()
 
     sites = hub.latest(spec.y_key + "_sites")
-    grid = hub.latest(spec.y_key + "_grid")
     assert sites.shape == (n_sites,)
-    assert grid.shape == spec.grid_shape
     finite = sites[np.isfinite(sites)]
     assert np.all((finite >= 0.0) & (finite <= 1.0))
+    # No redundant signals: the grid + per-node shot counter are NOT published (the grid is
+    # a reshape expression; the panel namespace already carries a global ``shot``).
+    published = node.published_signals()
+    assert (spec.y_key + "_grid") not in published
+    assert "shot" not in published and (spec.y_key + "_shot") not in published
+    # ... but the per-site vector reshapes cleanly to the grid via an expression.
+    assert sites.reshape(spec.grid_shape).shape == spec.grid_shape
 
 
 def test_readout_duration_node_runs_out_a_fidelity_curve():

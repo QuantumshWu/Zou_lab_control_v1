@@ -13,7 +13,7 @@ from matplotlib.ticker import Formatter, FuncFormatter, MaxNLocator, ScalarForma
 import numpy as np
 from scipy.optimize import curve_fit
 
-from .canvas import FigureSpec, configure_canvas, create_axes_fixed, create_axes_grid, design_dpi, display_figure, grid_shape_for, new_figure, split_axes_horizontally
+from .canvas import FigureSpec, configure_canvas, create_axes_fixed, create_axes_grid, display_figure, grid_shape_for, new_figure, split_axes_horizontally
 from .selectors import AreaSelector, CrossSelector, DragHLine, DragVLine, InteractionBundle, PlotState, ZoomPan, attach_interaction
 from Zou_lab_control._readout_math import (
     bimodal_jacobian,
@@ -2274,7 +2274,9 @@ class GridPlot(BaseLivePlot):
         return self.data_figure
 
     def save(self, path: str = "", **kwargs):
-        kwargs.setdefault("dpi", design_dpi(self.fig))
+        # Saved figures use the UNIFIED high save dpi (rcParams ``savefig.dpi`` = 600), the
+        # SAME as every single-axes plot's DataFigure.save -- never the on-screen design /
+        # live-render dpi (which would write a panel's 150-dpi preview bitmap to disk).
         self.fig.savefig(path, **kwargs)
         return path
 

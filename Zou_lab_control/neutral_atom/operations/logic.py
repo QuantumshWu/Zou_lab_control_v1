@@ -1012,9 +1012,11 @@ class ScannedMeasurementNode(Measurement):
     ``<x_key>``         (k,) cumulative scan x values (the points done so far)
     ``<y_key>``         (k,) cumulative scalar curve (series 0 of the reducer)
     ``<y_key>_sites``   (n_series,) the LATEST point's per-site vector (per-site only)
-    ``<y_key>_grid``    grid-shaped latest per-site vector (per-site only, if grid_shape)
     ``scan_done``       0 while running, 1 once the final point has been published
-    ``shot``            scalar shot counter
+
+    Nothing DERIVABLE is published: the panel namespace already carries the global
+    ``shot`` counter, and a site-grid view of the per-site vector is a reshape EXPRESSION
+    (``value = <y_key>_sites.reshape(ny, nx)``) -- so neither is a separate signal.
 
     Finite-scan semantics: after the last point is published the node sets its
     own stop event, so a background ``start()`` thread exits on its own once the
@@ -1029,7 +1031,6 @@ class ScannedMeasurementNode(Measurement):
         *,
         x_key: str = "x",
         y_key: str = "y",
-        grid_shape: tuple[int, int] | None = None,
         prefix: str = "",
     ):
         super().__init__(hub, prefix=prefix)
@@ -1051,7 +1052,6 @@ class ScannedMeasurementNode(Measurement):
         # the curve is drawn vs the swept parameter with the right x-axis -- one signal pick.
         self.x_signal = self.prefix + self.x_key
         self.y_signal = self.prefix + self.y_key
-        self.grid_shape = None if grid_shape is None else grid_shape_tuple(grid_shape)
         # The measurement owns the swept values (single source of truth); they are the
         # x AXIS, known UP FRONT.  Mirroring Confocal_GUIv2's BaseMeasurement: the curve
         # is a PRE-ALLOCATED ``np.full((n_points, n_series), nan)`` array filled IN PLACE
@@ -1098,15 +1098,12 @@ class ScannedMeasurementNode(Measurement):
             self.x_key: self._values.copy(),           # the FULL x axis, stable from shot 1
             self.y_key: self.data_y[:, 0].copy(),      # full-length curve; NaN = not-yet-measured
             "scan_done": 1.0 if self.finished else 0.0,
-            "shot": float(self._index),
         }
         if self.data_y.shape[1] > 1:
-            # A per-site reducer: publish the LATEST point's per-site vector (and a grid
-            # map when a shape is known) alongside the scalar curve.
-            latest = self.data_y[index, :]
-            out[self.y_key + "_sites"] = latest.copy()
-            if self.grid_shape is not None and latest.size == int(np.prod(self.grid_shape)):
-                out[self.y_key + "_grid"] = latest.reshape(self.grid_shape).copy()
+            # A per-site reducer: publish the LATEST point's per-site VECTOR alongside the
+            # scalar curve.  A site-grid view is a reshape expression on this vector
+            # (``value = <y_key>_sites.reshape(ny, nx)``), not a separate signal.
+            out[self.y_key + "_sites"] = self.data_y[index, :].copy()
         return out
 
     def step(self) -> dict[str, object]:
@@ -1129,9 +1126,14 @@ class ScannedMeasurementNode(Measurement):
             self.step()
         return self
 
+    @property
+    def _per_site(self) -> bool:
+        return self.data_y.shape[1] > 1
+
     def published_signals(self) -> frozenset:
-        keys = (self.x_key, self.y_key, self.y_key + "_sites", self.y_key + "_grid",
-                "scan_done", "shot")
+        keys = [self.x_key, self.y_key, "scan_done"]
+        if self._per_site:                              # only a per-site reducer emits a vector
+            keys.append(self.y_key + "_sites")
         return frozenset(self.prefix + key for key in keys)
 
     def output_specs(self) -> tuple[SignalSpec, ...]:
@@ -1145,14 +1147,14 @@ class ScannedMeasurementNode(Measurement):
         ylabel = rlabels[1] if len(rlabels) > 1 else self.y_key
         xlabel = str(getattr(axis, "label", "x"))
         xunit = str(getattr(axis, "unit", ""))
-        return (
+        specs = [
             SignalSpec(p + self.x_key, xlabel, xunit, "scan x axis (the swept parameter)"),
             SignalSpec(p + self.y_key, ylabel, "", "measured curve vs the scan x axis"),
-            SignalSpec(p + self.y_key + "_sites", ylabel, "", "latest scan point, per site"),
-            SignalSpec(p + self.y_key + "_grid", ylabel, "", "latest scan point as a site grid"),
             SignalSpec(p + "scan_done", "scan complete", "", "1 once the final point is measured"),
-            SignalSpec(p + "shot", "shot", "", "scan-point counter"),
-        )
+        ]
+        if self._per_site:
+            specs.insert(2, SignalSpec(p + self.y_key + "_sites", ylabel, "", "latest scan point, per site"))
+        return tuple(specs)
 
 
 class ProcessorRun(LogicNode):

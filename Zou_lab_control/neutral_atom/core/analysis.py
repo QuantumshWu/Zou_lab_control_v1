@@ -106,10 +106,22 @@ def find_site_centers(
     smooth = ndimage.gaussian_filter(img, sigma=1.0)
     cutoff = float(np.nanmin(smooth) + threshold_rel * (np.nanmax(smooth) - np.nanmin(smooth)))
     local_max = ndimage.maximum_filter(smooth, size=min_distance)
-    candidates_yx = np.argwhere((smooth == local_max) & (smooth >= cutoff))
+    is_peak = smooth == local_max
+    candidates_yx = np.argwhere(is_peak & (smooth >= cutoff))
     if len(candidates_yx) < need:
-        flat = np.argsort(smooth.ravel())[::-1][:need]
-        candidates_yx = np.column_stack(np.unravel_index(flat, smooth.shape))
+        # Fewer peaks clear the relative cutoff than there are traps -- the usual cause
+        # is a dim site in a NON-UNIFORM averaged reference (each trap was loaded a
+        # different number of shots).  Fall back to the ``need`` BRIGHTEST LOCAL MAXIMA,
+        # which are spatially separated (one per trap), NOT the brightest PIXELS: the
+        # hottest blobs span several pixels each, so a brightest-pixel pick collapses
+        # every center onto a handful of spots and destroys the site grid.
+        peaks_yx = np.argwhere(is_peak)
+        if len(peaks_yx) >= need:
+            peak_weights = smooth[peaks_yx[:, 0], peaks_yx[:, 1]]
+            candidates_yx = peaks_yx[np.argsort(peak_weights)[::-1][:need]]
+        else:                       # genuinely peak-poor image: last-resort brightest pixels
+            flat = np.argsort(smooth.ravel())[::-1][:need]
+            candidates_yx = np.column_stack(np.unravel_index(flat, smooth.shape))
     weights = smooth[candidates_yx[:, 0], candidates_yx[:, 1]]
     selected = candidates_yx[np.argsort(weights)[::-1]][:need]
     centers_xy = np.column_stack([selected[:, 1], selected[:, 0]]).astype(float)

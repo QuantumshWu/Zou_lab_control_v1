@@ -496,6 +496,19 @@ def _time_to_clock_tick(time_s: float, clock_hz: float) -> int | None:
     return tick
 
 
+def snap_seconds_to_clock(time_s: float, clock_hz: float, *, min_ticks: int = 1) -> float:
+    """Snap a continuous time (seconds) to the nearest whole clock tick.
+
+    The hardware can only land on integer ticks (``validate`` rejects off-grid times,
+    ``edges`` rounds to them), so any CONTINUOUS user duration -- a linspace sweep point
+    (readout-duration -> fidelity), a release-recapture hold, a typed exposure -- is
+    quantized HERE, the single seconds-domain snap source.  ``min_ticks`` (>=1) clamps a
+    sub-tick request up to a realizable duration rather than to zero."""
+    clock = positive_float(clock_hz, "clock_hz")
+    tick = int(round(finite_float(time_s, "time_s") * clock))
+    return max(int(min_ticks), tick) / clock
+
+
 __all__ = [
     "Pulse",
     "PulseReport",
@@ -506,4 +519,5 @@ __all__ = [
     "imaging_sequence",
     "plot_sequence",
     "sequence_for_frame_count",
+    "snap_seconds_to_clock",
 ]

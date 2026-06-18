@@ -2729,7 +2729,12 @@ class TaskConsole(QtWidgets.QWidget):
         # The Logic-tab nodes.  Each entry maps a LogicNodeRow -> the live state for
         # that node: its built node (None until Started) + its Edit tab.
         self.logic_nodes: list[LogicNodeRow] = []
-        self._logic_nodes: dict[int, object] = {}      # id(row) -> node (or None)
+        self._logic_nodes: dict[int, object] = {}      # id(row) -> node (or None when stopped)
+        # id(row) -> the LAST built node, kept even after Stop (unlike _logic_nodes, which
+        # is None'd on stop) -- so a finished/stopped node's signals that LINGER in the hub
+        # still show WHICH node produced them in the signal picker (a stopped scan's
+        # `readout_fidelity`, a stopped camera's `frame`).  Cleared only on row removal.
+        self._last_node: dict[int, object] = {}
         self._logic_editors: dict[int, "LogicNodeEditor"] = {}  # id(row) -> Edit tab
         self._last_version = -1
         self._building = False
@@ -3059,15 +3064,25 @@ class TaskConsole(QtWidgets.QWidget):
         return str(getattr(node, "prefix", "") or type(node).__name__)
 
     def _signal_providers(self) -> dict:
-        """``name -> [node labels]`` for every signal currently published, so a
-        name carried by MORE THAN ONE node can be flagged as ambiguous."""
+        """``name -> [node labels]`` for every signal a node produces, so the picker shows
+        WHICH measurement / processor / camera each signal comes from.
+
+        Covers RUNNING nodes AND the last build of every Logic-tab node (``_last_node``,
+        kept past Stop): a finished scan's ``readout_fidelity`` or a stopped camera's
+        ``frame`` LINGER in the hub, and the picker must still name their producer rather
+        than show a bare signal.  Running nodes are listed first; a name carried by more
+        than one node lists every producer (so an ambiguous pick can be flagged)."""
         providers: dict[str, list] = {}
-        for node in self.running_nodes:
-            if not hasattr(node, "published_signals"):
+        seen: set[int] = set()
+        for node in [*self.running_nodes, *self._last_node.values()]:
+            if node is None or id(node) in seen or not hasattr(node, "published_signals"):
                 continue
+            seen.add(id(node))
             label = self._node_label(node)
             for name in node.published_signals():
-                providers.setdefault(str(name), []).append(label)
+                bucket = providers.setdefault(str(name), [])
+                if label not in bucket:
+                    bucket.append(label)
         return providers
 
     def _signal_formats(self) -> dict:
@@ -3468,6 +3483,7 @@ class TaskConsole(QtWidgets.QWidget):
             return
         row.node.values = dict(values)            # remember for the next Edit reopen + save
         self._logic_nodes[id(row)] = node
+        self._last_node[id(row)] = node           # survives Stop, for signal-source labelling
         if node not in self.running_nodes:
             self.running_nodes.append(node)
         if not self._timer.isActive():
@@ -3592,8 +3608,7 @@ class TaskConsole(QtWidgets.QWidget):
             # The node publishes under the measurement's slug (spec.key), so every signal
             # is ``<slug>_<quantity>`` (e.g. temperature_t_off) -- one name, derived.
             return ScannedMeasurementNode(
-                self.hub, measurement, x_key=spec.x_key, y_key=spec.y_key,
-                grid_shape=spec.grid_shape, prefix=f"{spec.key}_")
+                self.hub, measurement, x_key=spec.x_key, y_key=spec.y_key, prefix=f"{spec.key}_")
         if kind == "processor":
             # REACTIVE processor (the "func" layer): a live node consuming hub signals
             # and republishing derived ones -- e.g. judging occupancy from each frame.
@@ -3651,6 +3666,7 @@ class TaskConsole(QtWidgets.QWidget):
             editor.setParent(None)
             editor.deleteLater()
         self._logic_nodes.pop(id(row), None)
+        self._last_node.pop(id(row), None)
         if row in self.logic_nodes:
             self.logic_nodes.remove(row)
         self.logic_layout.removeWidget(row)

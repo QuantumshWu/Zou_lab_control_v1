@@ -37,26 +37,29 @@ def _agg_figure() -> Figure:
     return fig
 
 
-# Saved report figures use a HIGH dpi so the per-site detail (overlapping histograms,
-# threshold lines) stays crisp when zoomed -- independent of the live on-screen render dpi.
-_SAVE_DPI = 300
-
 # Readout-method key -> human label for the per-method grid titles (the calibration carries
 # all three; the report shows one grid each so the experimenter compares them side by side).
 _METHOD_LABELS = {"box": "box (square ROI)", "psf": "per-site PSF", "uniform_psf": "uniform PSF"}
 
 
-def _save(fig: Figure, path: Path, *, dpi: int = _SAVE_DPI) -> str:
-    fig.savefig(str(path), dpi=dpi, facecolor="white")
-    return str(path)
+def _save_plot(plot, path: Path) -> str:
+    """Save a report figure through the plot's OWN ``save`` (``BaseLivePlot.save`` ->
+    ``DataFigure.save`` / ``GridPlot.save``) -- the SAME save path the live "Save Fig"
+    button uses, at the UNIFIED high save dpi (``savefig.dpi`` = 600), not a hand-set dpi.
+    Returns the PNG path (a single-axes save also drops a matching ``.npz`` of the plotted
+    data beside it -- the DataFigure contract)."""
+    out = plot.save(str(path))
+    if isinstance(out, dict):
+        return str(out.get("figure", path))
+    return str(out or path)
 
 
-def _site_grid(per_method_counts, thresholds, fidelity, *, title) -> Figure:
+def _site_grid(per_method_counts, thresholds, fidelity, *, title):
     """One per-site distribution grid (one histogram per site, threshold line + fidelity)."""
     return SiteHistogramGrid(
         per_method_counts, thresholds=list(thresholds), site_fidelities=list(fidelity),
         labels=("Readout counts", "Shots"), title=title,
-        fig=_agg_figure(), interactions=False).show(display=False).fig
+        fig=_agg_figure(), interactions=False).show(display=False)
 
 
 def save_calibration_report(folder, *, counts, thresholds, fidelity, centers,
@@ -95,14 +98,14 @@ def save_calibration_report(folder, *, counts, thresholds, fidelity, centers,
             mfid = np.asarray(m["fidelity"], dtype=float).reshape(-1)
             per_site = [mc[:, k][np.isfinite(mc[:, k])] for k in range(mc.shape[1])]
             label = _METHOD_LABELS.get(str(key), str(key))
-            fig = _site_grid(per_site, mthr, mfid,
-                             title=f"Per-site readout distribution -- {label} (line = threshold)")
-            paths[f"site_distribution_{key}"] = _save(fig, folder / f"site_distribution_{key}.png")
+            grid = _site_grid(per_site, mthr, mfid,
+                              title=f"Per-site readout distribution -- {label} (line = threshold)")
+            paths[f"site_distribution_{key}"] = _save_plot(grid, folder / f"site_distribution_{key}.png")
     elif counts.size:
         per_site = [counts[:, k][np.isfinite(counts[:, k])] for k in range(counts.shape[1])]
-        fig = _site_grid(per_site, thresholds, fidelity,
-                         title="Per-site readout distribution (line = threshold)")
-        paths["site_distribution_grid"] = _save(fig, folder / "site_distribution_grid.png")
+        grid = _site_grid(per_site, thresholds, fidelity,
+                          title="Per-site readout distribution (line = threshold)")
+        paths["site_distribution_grid"] = _save_plot(grid, folder / "site_distribution_grid.png")
 
     if counts.size:
         flat = counts.reshape(-1)
@@ -113,16 +116,17 @@ def save_calibration_report(folder, *, counts, thresholds, fidelity, centers,
             labels=("Readout counts", "Shots x sites", "Population"),
             title="Pooled readout distribution", fig=_agg_figure(),
             interactions=False).show(display=False)
-        paths["global_distribution"] = _save(pooled.fig, folder / "global_distribution.png")
+        paths["global_distribution"] = _save_plot(pooled, folder / "global_distribution.png")
 
     if template is not None and centers is not None and len(centers):
         occupied = np.ones((len(centers), 1), dtype=float)   # every fitted site shown as found
         site_map = LiveSiteMap(
             centers[:, :2], occupied, image=np.asarray(template, dtype=float),
-            roi_radius=site_ring_radius(centers), labels=("Camera x (px)", "Camera y (px)"),
+            roi_radius=site_ring_radius(centers),
+            labels=("Camera x (px)", "Camera y (px)", "Counts"),
             title="Reference template + fitted sites",
             fig=_agg_figure(), interactions=False).show(display=False)
-        paths["site_map"] = _save(site_map.fig, folder / "site_map.png")
+        paths["site_map"] = _save_plot(site_map, folder / "site_map.png")
 
     return paths
 

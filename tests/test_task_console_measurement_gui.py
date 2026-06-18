@@ -184,6 +184,35 @@ def test_node_start_then_stop_releases_controls_and_stops_node():
         exp.close()
 
 
+def test_stopped_node_signals_still_name_their_producer_in_picker():
+    """A finished/stopped node's signals LINGER in the hub; the signal picker must still
+    name WHICH node produced each (a stopped scan's signal shows "— <node>", never a bare
+    name).  Regression for the picker only consulting RUNNING nodes -- a finished readout /
+    stopped camera left its signals sourceless."""
+    exp = _calibrated_virtual_session(grid=(2, 3))
+    specs = exp.readout.measurement_specs()
+    console = _console(specs, session=exp)
+    try:
+        spec, row, editor, form = _open_measurement_node(console, 0)
+        _, lo, hi, pts = form._widgets["t_off"]
+        lo.setValue(0.0); hi.setValue(60.0); pts.setValue(3)
+        form._widgets["shots"][1].setValue(2)
+
+        console._start_logic_node(row)
+        node = console._logic_nodes[id(row)]
+        produced = sorted(node.published_signals())
+        label = console._node_label(node)
+        console._stop_logic_node(row)
+        assert node not in console.running_nodes      # genuinely stopped
+
+        providers = console._signal_providers()        # built AFTER the stop
+        for name in produced:
+            assert providers.get(name) == [label], (name, providers.get(name))
+    finally:
+        console.shutdown()
+        exp.close()
+
+
 # ----------------------------------------------------------------- 1d x-y (plot view)
 def test_1d_panel_xy_curve_uses_col0_as_x():
     """An (N, 2) value plots y vs col 0 -- but ONLY when the panel is explicitly

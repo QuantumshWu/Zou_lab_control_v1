@@ -372,3 +372,29 @@ def test_readout_duration_fidelity_is_detection_time_alias():
     scan = exp.readout.readout_duration_fidelity([5e-6, 2e-5], shots=4, live=False, display=False)
     assert isinstance(scan, na.DetectionTimeScanResult)
     assert scan.summary()["finished"] is True
+
+
+def test_duration_axis_is_snapped_to_clock_grid():
+    """A continuous / off-grid duration sweep is quantized to whole clock ticks at the
+    scan engine, so the plotted x equals the exposures actually run and no built sequence
+    trips the clock-grid validator (the "repeat period not on the 5e7 clock grid" failure).
+    The engine is the SINGLE snap point shared by readout-fidelity and any duration scan."""
+
+    exp = na.connect("virtual", sitemap={"grid_shape": (1, 2), "image_shape": (32, 48)})
+    exp.readout.sitemap(method="box", frames=4, display=False)
+    clock = float(exp.devices.sequencer.clock_hz)        # 50 MHz -> 20 ns tick
+
+    # Deliberately off-grid times: a linspace whose points are not whole ticks.
+    times = np.linspace(2.0e-6, 5000.0e-6, 12)
+    raw_ticks = times * clock
+    assert np.any(np.abs(raw_ticks - np.round(raw_ticks)) > 1e-6), "fixture must be off-grid"
+
+    scan = exp.readout.build_detection_scan(times, shots=4)
+    snapped_ticks = np.asarray(scan.axis.values) * clock
+    # every swept value now lands on a whole tick ...
+    assert np.allclose(snapped_ticks, np.round(snapped_ticks), atol=1e-6)
+    # ... and stays within one tick of the requested value (an honest, minimal nudge).
+    assert np.all(np.abs(np.asarray(scan.axis.values) - times) <= 1.0 / clock + 1e-15)
+    # ... and the scan runs end-to-end without the validator rejecting an off-grid period.
+    result = scan.run(live=False, display=False)
+    assert result.summary()["finished"] is True
