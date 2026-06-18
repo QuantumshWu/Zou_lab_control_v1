@@ -190,6 +190,28 @@ class TrapCalibration:
             metadata={**self.metadata, **metadata},
         )
 
+    def with_method_thresholds(self, per_method, **metadata) -> "TrapCalibration":
+        """A copy with per-METHOD thresholds replaced.  ``per_method`` maps a method name to
+        its ``(n_sites,)`` thresholds: the calibration's OWN method updates the top-level
+        thresholds, every other method updates its ``by_method`` entry; a method absent from
+        ``per_method`` keeps its current thresholds.  Used to write the reference-bracket
+        per-site boundaries back so ``detect`` reads on the TRAINED threshold (not the otsu
+        quick split) -- the Rb87 'use the true labels to set the boundary' step."""
+        per_method = {str(k).lower(): np.asarray(v, dtype=float).reshape(-1)
+                      for k, v in dict(per_method or {}).items()}
+        top = per_method.get(self.method, self.thresholds)
+        by_method = {}
+        for name, entry in (self.by_method or {}).items():
+            updated = dict(entry)
+            if name in per_method:
+                updated["thresholds"] = per_method[name]
+            by_method[name] = updated
+        return TrapCalibration(
+            self.centers, top, grid_shape=self.grid_shape, roi_radius=self.roi_radius,
+            reducer=self.reducer, method=self.method, psf_weights=self.psf_weights,
+            psf_boxes=self.psf_boxes, background=self.background,
+            by_method=by_method or None, metadata={**self.metadata, **metadata})
+
     @staticmethod
     def _by_method_to_json(by_method) -> dict | None:
         """``by_method`` with numpy arrays -> plain lists (JSON-able)."""

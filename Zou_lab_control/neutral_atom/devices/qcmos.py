@@ -119,7 +119,18 @@ class QCMOSCamera(CameraDevice):
             # streamer, so inferring from the placeholder "probe" name would miss
             # it and silently pin the camera at config exposure (a flat scan).
             probe_channel = imaging_channel_kwargs(sequencer).get("probe_channel", "probe")
-            sequence_exposure = exposure_from_sequence(runtime_sequence, default=self.config.exposure, channel=probe_channel)
+            try:
+                sequence_exposure = exposure_from_sequence(runtime_sequence, default=self.config.exposure, channel=probe_channel)
+            except ValueError:
+                # A heterogeneous bracket (e.g. the long-short-long reference-fidelity shot)
+                # has NON-uniform probe durations: the external camera trigger gates each
+                # frame and the atoms scatter only during their OWN probe pulse, so set the
+                # global DCAM exposure to the LONGEST probe (it covers every frame; a frame's
+                # signal is bounded by its shorter probe).  Matches the virtual per-frame model.
+                probe_set = {probe_channel} | ({"ch02"} if probe_channel == "probe" else set())
+                durations = [p.duration for p in runtime_sequence.base_pulses()
+                             if p.value and p.channel in probe_set]
+                sequence_exposure = max(durations) if durations else self.config.exposure
             if sequence_exposure != self.config.exposure:
                 self.config.exposure = sequence_exposure
                 self._write_settings()

@@ -871,6 +871,25 @@ class CalibrateReadoutTask(Task):
         calibration = calibrate_all_methods_from_images(
             template, samples, grid_shape=self.grid_shape, roi_radius=self.roi_radius,
             threshold_method=self.threshold_method)
+        # Use the bracket-voted GROUND TRUTH to set each method's per-site boundary: train the
+        # threshold on the labelled short readout and write it back, so a downstream
+        # OccupancyProcessor.detect reads on the reference-trained threshold (not the otsu
+        # quick split) -- the Rb87 "use the true labels to set where the boundary is" step.
+        # NaN (a site with too few labelled shots to train) falls back to the otsu threshold.
+        from .calibration_report import _held_out_by_method
+        self._method_fidelity = _held_out_by_method(calibration, ref_groups, readout_by_group)
+        if self._method_fidelity:
+            trained: dict[str, np.ndarray] = {}
+            for m, data in self._method_fidelity.items():
+                thr = np.asarray(data["thresholds"], dtype=float).reshape(-1)
+                fallback = np.asarray(calibration.thresholds_for(m), dtype=float).reshape(-1)
+                bad = ~np.isfinite(thr)
+                if np.any(bad):
+                    thr = thr.copy()
+                    thr[bad] = fallback[bad]
+                trained[m] = thr
+            calibration = calibration.with_method_thresholds(
+                trained, threshold_method="per_site_reference")
         # Keep the readout frames + reference brackets + averaged template so run() can write
         # the rb87-style report: per-site distribution + HELD-OUT per-method fidelity scored
         # against the bracket-voted ground truth + the site map.
