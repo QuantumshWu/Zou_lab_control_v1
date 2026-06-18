@@ -1776,8 +1776,9 @@ def test_edit_area_select_fills_measurement_scan_range(monkeypatch):
 
 
 def test_task_console_sites_panel_bad_centers_isolated(monkeypatch):
-    """A site-map panel whose centres INPUT SLOT (signal[1]) points at a missing signal
-    reports the error on ITS status line; the other panels keep refreshing."""
+    """A site-map panel whose ONE occupancy signal has NO producing node that supplies centres
+    (so the centres + frame underlay cannot be auto-resolved) reports the error on ITS
+    status line; the other panels keep refreshing."""
 
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
@@ -1785,7 +1786,10 @@ def test_task_console_sites_panel_bad_centers_isolated(monkeypatch):
 
     console = dt.demo_console(shots=10)
     sites = next(c for c in console.cards if c.config.kind == "sites")
-    sites.config.inputs[1] = "no_such_signal"      # the centres slot now names a missing signal
+    # point the site map at a signal whose producing node publishes no centres -> the panel
+    # cannot resolve the centres/underlay from a producing node and surfaces the error.
+    sites.config.inputs[0] = "no_such_signal"
+    sites.config.source = "value = signal[0]"
     console.refresh_once()
     assert "no_such_signal" in sites.status.text()
     healthy = [c for c in console.cards if c is not sites]

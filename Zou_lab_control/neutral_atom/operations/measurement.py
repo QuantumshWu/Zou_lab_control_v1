@@ -55,8 +55,13 @@ class ParamDecl:
                       ``unit``.
     ``"bool"``        a flag (checkbox)
     ``"choice"``      one of ``choices`` (a combo box)
-    ``"text"``        a free string (a line edit) -- e.g. a folder path or a label;
-                      taken verbatim, NEVER ``eval``'d (lo/hi/choices ignored)
+    ``"text"``        a free string (a line edit) -- e.g. a label; taken verbatim,
+                      NEVER ``eval``'d (lo/hi/choices ignored)
+    ``"path"``        a filesystem path: a line edit + a Browse button (native dialog).
+                      ``path_mode='file'`` picks a file (filtered by ``file_filter``),
+                      ``path_mode='dir'`` picks a folder.  Taken verbatim, never eval'd.
+    ``"signal"``      the NAME of a hub signal to consume (a processor's input): a combo
+                      box of the live hub signals, like a plot's input picker.
 
     ``required`` marks a parameter a GUI must highlight when missing.  No value
     here is ever ``eval``'d -- the spec consumer validates/coerces by ``kind``.
@@ -72,12 +77,14 @@ class ParamDecl:
     required: bool = False
     choices: tuple = ()
     tooltip: str = ""
+    path_mode: str = "file"          # kind="path": "file" (open-file dialog) | "dir" (folder dialog)
+    file_filter: str = "All files (*)"  # kind="path", path_mode="file": the open-file filter
 
     def __post_init__(self) -> None:
         kind = str(self.kind).lower()
-        if kind not in ("float", "int", "axis_range", "bool", "choice", "text"):
+        if kind not in ("float", "int", "axis_range", "bool", "choice", "text", "path", "signal"):
             raise ValueError(
-                f"ParamDecl.kind must be one of float/int/axis_range/bool/choice/text, got {self.kind!r}."
+                f"ParamDecl.kind must be one of float/int/axis_range/bool/choice/text/path/signal, got {self.kind!r}."
             )
         object.__setattr__(self, "kind", kind)
         object.__setattr__(self, "key", str(self.key))

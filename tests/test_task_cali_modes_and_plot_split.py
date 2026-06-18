@@ -53,28 +53,37 @@ def _calibrated(grid=(3, 4)):
     return exp
 
 
-# ----------------------------------------------------------- calibrate task modes
-@pytest.mark.parametrize("mode, resolved", [
-    ("box", "box"),
-    ("per-site PSF", "psf"),
-    ("uniform PSF", "uniform_psf"),
-])
+# --------------------------------------------- calibrate ONCE, processor picks the method
 @pytest.mark.parametrize("threshold_method", ["otsu", "bimodal"])
-def test_calibrate_task_live_each_mode_and_threshold(mode, resolved, threshold_method):
+def test_calibrate_task_computes_every_method_processor_picks(threshold_method):
+    """The cali runs ONCE and produces a MULTI-METHOD calibration (box / per-site PSF /
+    uniform PSF), each with finite per-site thresholds; the OccupancyProcessor then reads
+    with whichever method it chooses (the method is a readout choice, not a cali choice)."""
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.neutral_atom.operations.calibration import ALL_READOUT_METHODS
+    from Zou_lab_control.neutral_atom.operations.logic import CameraMeasurement, OccupancyProcessor
 
     exp = _calibrated()
     try:
         task = exp.readout.calibrate_task(
-            SignalHub(), mode=mode, threshold_method=threshold_method,
+            SignalHub(), threshold_method=threshold_method,
             calibration_frames=3, threshold_frames=16,
             sitemap_exposure=0.05, readout_exposure=0.02)
-        assert task.method == resolved                 # mode -> sitemap method
         task.run_to_completion()
-        centers = np.asarray(task.calibration.centers, dtype=float)
-        thresholds = np.asarray(task.calibration.thresholds, dtype=float).reshape(-1)
-        assert centers.shape == (12, 2)
-        assert thresholds.shape == (12,) and np.isfinite(thresholds).all()
+        cal = task.calibration
+        assert np.asarray(cal.centers).shape == (12, 2)
+        assert set(cal.methods()) == set(ALL_READOUT_METHODS)          # cali once -> every method
+        for m in ALL_READOUT_METHODS:
+            thr = np.asarray(cal.thresholds_for(m), dtype=float).reshape(-1)
+            assert thr.shape == (12,) and np.isfinite(thr).all()
+        # the processor PICKS the method -> calibration.detect(method=...) routes correctly
+        for m in ALL_READOUT_METHODS:
+            hub = SignalHub(); cam = CameraMeasurement(hub, exp.devices.camera)
+            occ = OccupancyProcessor(hub, calibration=cal, source="frame", method=m)
+            cam.step(); occ.step()
+            assert hub.latest("occupied").shape == (12,)
+            # the judged frame is published, atomically -> rings + underlay are the same shot
+            assert np.array_equal(hub.latest("frame_judged"), hub.latest("frame"))
     finally:
         exp.close()
 
@@ -86,7 +95,7 @@ def test_calibrate_task_live_then_reload_skips_acquisition(tmp_path):
     try:
         folder = tmp_path / "cal"
         made = exp.readout.calibrate_task(
-            SignalHub(), source="live", mode="box", folder=str(folder),
+            SignalHub(), source="live", folder=str(folder),
             calibration_frames=3, threshold_frames=12)
         made.run_to_completion()
         # a live run writes its report (incl. a reloadable calibration.json) to a
@@ -105,31 +114,29 @@ def test_calibrate_task_live_then_reload_skips_acquisition(tmp_path):
         exp.close()
 
 
-def test_calibrate_task_live_uses_two_saved_pulse_programs(tmp_path):
-    """The cali task takes TWO saved pulse programs (PulseTableState .json from the
-    pulse GUI): a LONGER one for the site/PSF pass and the ACTUAL-readout one for the
-    threshold pass.  Each drives its acquisition via the pulse API; both round-trip in
-    the Edit (acquisition_parameters)."""
+def test_calibrate_task_loads_a_pulse_template_and_sets_the_exposure(tmp_path):
+    """The cali LOADS a real pulse template (a PulseTableState .json with an 'image'
+    window) and SETS that window's duration to each pass's exposure -- "load a template,
+    set the duration, run" (no opaque 'built-in' sentinel).  The template path round-trips
+    in the Edit (acquisition_parameters)."""
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
-    from Zou_lab_control.neutral_atom.timing import imaging_sequence, PulseTableState
+    from Zou_lab_control.neutral_atom.timing import default_imaging_template
 
     exp = _calibrated()
     try:
-        chans = ["trap", "cooling", "probe", "emCCD"]
-        site_prog = tmp_path / "sitemap_long.json"      # long readout for site + PSF
-        read_prog = tmp_path / "readout_actual.json"    # actual readout for thresholds
-        PulseTableState.from_sequence(
-            imaging_sequence(exposure=0.06, load=True, name="sitemap_img"), channels=chans).save(site_prog)
-        PulseTableState.from_sequence(
-            imaging_sequence(exposure=0.02, load=True, name="readout_img"), channels=chans).save(read_prog)
+        prog = tmp_path / "my_imaging.json"             # the user's own imaging program
+        default_imaging_template().save(prog)           # a real PulseTableState with an 'image' period
 
         task = exp.readout.calibrate_task(
-            SignalHub(), source="live", mode="per-site PSF",
-            sitemap_pulse=str(site_prog), readout_pulse=str(read_prog),
+            SignalHub(), source="live", pulse_template=str(prog),
+            sitemap_exposure=0.06, readout_exposure=0.02,
             calibration_frames=3, threshold_frames=12)
-        assert task.sitemap_pulse == str(site_prog) and task.readout_pulse == str(read_prog)
-        ap = task.acquisition_parameters()
-        assert ap["sitemap_pulse"] == str(site_prog) and ap["readout_pulse"] == str(read_prog)
+        assert task.pulse_template == str(prog)
+        assert task.acquisition_parameters()["pulse_template"] == str(prog)
+        # the loaded template's 'image' window is set to the pass exposure (not the file's)
+        from Zou_lab_control.neutral_atom.timing import exposure_from_sequence
+        seq = task._imaging_seq(0.02, "readout")
+        assert exposure_from_sequence(seq, default=0.05) == 0.02
         task.run_to_completion()
         assert np.asarray(task.calibration.centers).shape == (12, 2)
     finally:
@@ -145,7 +152,7 @@ def test_calibrate_task_saved_frames_source(tmp_path):
         folder = tmp_path / "run"
         na.write_virtual_run(str(folder), groups=8, grid_shape=(3, 4), seed=0)
         task = exp.readout.calibrate_task(
-            SignalHub(), source="saved frames", folder=str(folder), mode="box")
+            SignalHub(), source="saved frames", folder=str(folder))
         assert task.source == "saved frames"
         task.run_to_completion()
         assert np.asarray(task.calibration.centers).shape == (12, 2)

@@ -148,4 +148,54 @@ def calibrate_threshold_from_images(
     return ThresholdResult(updated, counts, thresholds, site, plot=plot, fidelity=fidelity)
 
 
-__all__ = ["calibrate_sitemap_from_images", "calibrate_threshold_from_images", "SUPPORTED_THRESHOLD_METHODS"]
+#: The readout methods a one-shot calibration computes so the OccupancyProcessor can
+#: pick any of them later (box square-ROI, per-site PSF, one-shared-kernel PSF).  Single
+#: source -- the cali, the calibration's ``by_method`` and the processor choice derive
+#: from this, never a retyped literal.
+ALL_READOUT_METHODS = ("box", "psf", "uniform_psf")
+
+
+def calibrate_all_methods_from_images(
+    reference_images,
+    readout_images,
+    *,
+    grid_shape: Sequence[int],
+    ordering: str = "row-major",
+    roi_radius: int = 1,
+    reducer: str = "mean",
+    threshold_method: str = "otsu",
+    psf_half_width: int = 3,
+    background: str = "annulus",
+) -> TrapCalibration:
+    """Calibrate ONCE into a single calibration that can be read with EVERY method.
+
+    The site map is found once (shared centers, from the reference average); then box,
+    per-site-PSF and uniform-PSF readouts are each calibrated (their kernels + per-site
+    thresholds) on the SAME readout frames.  Box is the default top-level readout; the
+    PSF methods are carried in ``by_method``.  So the experimenter calibrates once and the
+    downstream :class:`~..logic.OccupancyProcessor` chooses box / per-site PSF / uniform
+    PSF at read time -- the method is a READOUT choice, not a calibration choice."""
+
+    cals = {}
+    for method in ALL_READOUT_METHODS:
+        sitemap = calibrate_sitemap_from_images(
+            reference_images, grid_shape=grid_shape, ordering=ordering, roi_radius=roi_radius,
+            reducer=reducer, method=method, psf_half_width=psf_half_width,
+            background=background, display=False)
+        result = calibrate_threshold_from_images(
+            readout_images, sitemap.calibration, method=threshold_method, display=False)
+        cals[method] = result.calibration
+    box = cals["box"]
+    by_method = {
+        m: {"thresholds": np.asarray(cals[m].thresholds, dtype=float),
+            "psf_weights": cals[m].psf_weights, "psf_boxes": cals[m].psf_boxes}
+        for m in ALL_READOUT_METHODS if m != "box"
+    }
+    return TrapCalibration(
+        box.centers, box.thresholds, grid_shape=box.grid_shape, roi_radius=box.roi_radius,
+        reducer=box.reducer, method="box", background=box.background, by_method=by_method,
+        metadata={**box.metadata, "methods": list(ALL_READOUT_METHODS)})
+
+
+__all__ = ["calibrate_sitemap_from_images", "calibrate_threshold_from_images",
+           "calibrate_all_methods_from_images", "ALL_READOUT_METHODS", "SUPPORTED_THRESHOLD_METHODS"]

@@ -1,0 +1,54 @@
+{
+  "schema": "Zou_lab_control.neutral_atom.PulseTableState",
+  "version": 3,
+  "name": "imaging_template",
+  "channels": [
+    "trap",
+    "cooling",
+    "probe",
+    "emCCD"
+  ],
+  "scan_slots": [],
+  "scan_table": [],
+  "time_step_ns": 1.0,
+  "periods": [
+    {
+      "duration": 0.002,
+      "unit": "s",
+      "name": "load",
+      "states": [
+        1,
+        1,
+        0,
+        0
+      ]
+    },
+    {
+      "duration": 0.02,
+      "unit": "s",
+      "name": "image",
+      "states": [
+        1,
+        0,
+        1,
+        1
+      ]
+    }
+  ],
+  "visible_channels": [
+    "trap",
+    "cooling",
+    "probe",
+    "emCCD"
+  ],
+  "channel_labels": {},
+  "analog_buses": {},
+  "analog_bus_modes": {},
+  "delays": {},
+  "delay_units": {},
+  "repeat_start": null,
+  "repeat_end": null,
+  "repeat_count": 1,
+  "repeat_forever": true,
+  "clk_channels": []
+}

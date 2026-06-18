@@ -55,7 +55,7 @@ def test_calibrate_writes_distribution_and_fidelity_report(tmp_path):
         hub = SignalHub()
         folder = tmp_path / "cal_run"
         task = exp.readout.calibrate_task(
-            hub, source="live", mode="box", threshold_method="otsu",
+            hub, source="live", threshold_method="otsu",
             calibration_frames=10, threshold_frames=40,
             sitemap_exposure=0.05, readout_exposure=0.02, folder=str(folder))
         task.run_to_completion()

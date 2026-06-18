@@ -995,6 +995,21 @@ class PulseTableState:
         self.validate()
         return self
 
+    def with_imaging_exposure(self, seconds: float) -> "PulseTableState":
+        """Return a COPY whose imaging window lasts ``seconds`` -- the "set the exposure on
+        the loaded template" step of a calibration pass.  The imaging window is the period
+        named ``image`` (case-insensitive); failing that, the last period.  The original is
+        left unchanged (callers reuse one template for several exposures)."""
+        import copy
+        idx = next((i for i, p in enumerate(self.periods) if str(p.name).strip().lower() == "image"), None)
+        if idx is None:
+            if not self.periods:
+                return self
+            idx = len(self.periods) - 1
+        clone = copy.deepcopy(self)
+        clone.set_period_duration(idx, float(seconds), unit="s")
+        return clone
+
     def set_period_name(self, period_index: int, name: str) -> "PulseTableState":
         """Rename period ``period_index`` (the GUI's period-name edit)."""
         period_index = int(period_index)
@@ -1402,6 +1417,35 @@ def default_periods(channels: Sequence[str]) -> list[PulsePeriod]:
         PulsePeriod(1_000, tuple(1 if index == 0 else 0 for index in range(width)), name=""),
         PulsePeriod(1_000, tuple(0 for _ in range(width)), name=""),
     ]
+
+
+def default_imaging_template(
+    channels: Sequence[str] | None = None,
+    *,
+    cooling: float = 2e-3,
+    exposure: float = 20e-3,
+    trap_channel: str = "trap",
+    cooling_channel: str = "cooling",
+    probe_channel: str = "probe",
+    trigger_channel: str = "emCCD",
+) -> "PulseTableState":
+    """A clean two-period imaging program (``load`` -> ``image``) as an editable
+    :class:`PulseTableState` -- the REAL, inspectable template the Calibrate task loads
+    (no opaque "built-in" sentinel).  ``load`` cools the cloud; ``image`` turns the probe
+    on and triggers the camera for the exposure.  The Calibrate task sets the ``image``
+    period's duration per pass with :meth:`PulseTableState.with_imaging_exposure`, so the
+    workflow is literally "load a template, set the exposure, run"."""
+
+    chans = list(channels) if channels else [trap_channel, cooling_channel, probe_channel, trigger_channel]
+
+    def states(active) -> tuple[int, ...]:
+        return tuple(1 if ch in active else 0 for ch in chans)
+
+    periods = [
+        PulsePeriod(float(cooling), states({trap_channel, cooling_channel}), unit="s", name="load"),
+        PulsePeriod(float(exposure), states({trap_channel, probe_channel, trigger_channel}), unit="s", name="image"),
+    ]
+    return PulseTableState(channels=chans, periods=periods, name="imaging_template")
 
 
 def default_visible_channels(channels: Sequence[str]) -> list[str]:

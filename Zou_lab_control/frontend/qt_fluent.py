@@ -825,6 +825,67 @@ class FluentLineEdit(QtWidgets.QLineEdit):
             self.setText(after)
 
 
+class FluentPathEdit(QtWidgets.QWidget):
+    """A path field + a ``Browse…`` button -- the ONE reusable control for every path
+    parameter (a data folder, a saved pulse-template ``.json``, a calibration file).
+
+    The user can TYPE a path or click Browse to pick it in the native file/folder
+    dialog, so a path is never a bare line-edit you must hand-type into.  ``mode="dir"``
+    opens a folder chooser; ``mode="file"`` an open-file chooser filtered by
+    ``file_filter``.  Quacks like a line edit (``text`` / ``setText`` /
+    ``setPlaceholderText`` / ``setToolTip``) and emits ``changed(str)`` so a form can
+    treat it exactly like a ``FluentLineEdit``."""
+
+    changed = QtCore.pyqtSignal(str)
+
+    def __init__(self, text: str = "", *, mode: str = "file", caption: str = "Choose",
+                 file_filter: str = "All files (*)", parent=None):
+        super().__init__(parent)
+        self._mode = "dir" if str(mode) == "dir" else "file"
+        self._caption = str(caption)
+        self._filter = str(file_filter)
+        self.setStyleSheet("background: transparent;")
+        row = QtWidgets.QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(scaled_px(6, minimum=4))
+        self.edit = FluentLineEdit(str(text))
+        # a modest floor so the field + button still fit a narrow form column (the
+        # edit grows with the column via the stretch below); never a 150px floor that
+        # pushes the Browse button off a narrow Edit tab.
+        self.edit.setMinimumWidth(scaled_px(96, minimum=72))
+        self.edit.textChanged.connect(lambda t: self.changed.emit(str(t)))
+        self.browse = FluentButton("Browse…", color=GREY)
+        # size the button to its OWN label (+ padding) at the live DPR so "Browse…"
+        # is never clipped (a fixed 80px clipped it to "owse" at some scales).
+        self.browse.setFixedWidth(
+            self.browse.fontMetrics().horizontalAdvance("Browse…") + scaled_px(22, minimum=16))
+        self.browse.clicked.connect(self._browse)
+        row.addWidget(self.edit, 1)
+        row.addWidget(self.browse, 0)
+
+    def _browse(self) -> None:
+        start = self.edit.text().strip()
+        if self._mode == "dir":
+            picked = QtWidgets.QFileDialog.getExistingDirectory(self, self._caption, start)
+        else:
+            picked, _ = QtWidgets.QFileDialog.getOpenFileName(self, self._caption, start, self._filter)
+        if picked:
+            self.edit.setText(picked)   # fires textChanged -> changed
+
+    def text(self) -> str:
+        return self.edit.text()
+
+    def setText(self, text: str) -> None:  # noqa: N802 - Qt API name
+        self.edit.setText("" if text is None else str(text))
+
+    def setPlaceholderText(self, text: str) -> None:  # noqa: N802 - Qt API name
+        self.edit.setPlaceholderText(str(text))
+
+    def setToolTip(self, text: str) -> None:  # noqa: N802 - Qt API name
+        self.edit.setToolTip(str(text))
+        self.browse.setToolTip(str(text))
+
+
 class FluentSectionLabel(QtWidgets.QLabel):
     """Bold, own-line section header for confocal-style vertical settings popups.
 

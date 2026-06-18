@@ -347,13 +347,12 @@ def test_setting_keeps_display_params_functional_scalars_go_to_edit():
         assert len(mon.slot_combos) == 1
     finally:
         mon.shutdown()
-    # the site map's Setting: cmap (display param) + THREE input-slot pickers
-    # (occupancy = signal[0], centers = signal[1], image = signal[2]) chosen together,
-    # so a multi-input plot is fully configured in one place -- centers/image are SLOTS,
-    # not display params.
+    # the site map's Setting: cmap (display param) + ONE input-slot picker (the occupancy
+    # signal); its centres + frame underlay are auto-resolved from the SAME producing node,
+    # so the user picks just the one signal (centers/image are NOT slots or display params).
     sites = _card("sites")
     try:
         assert set(sites.param_widgets) == {"cmap"}
-        assert len(sites.slot_combos) == len(panel_input_slots("sites")) == 3
+        assert len(sites.slot_combos) == len(panel_input_slots("sites")) == 1
     finally:
         sites.shutdown()

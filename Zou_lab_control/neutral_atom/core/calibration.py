@@ -35,6 +35,12 @@ class TrapCalibration:
     psf_weights: np.ndarray | None = None   # (N, h, w) normalized, method='psf'
     psf_boxes: np.ndarray | None = None      # (N, 4) int (x0, y0, w, h), method='psf'
     background: str = "none"                 # extraction background: 'none' | 'annulus'
+    # OPTIONAL per-method readout data so ONE calibration supports several readout
+    # methods and the downstream OccupancyProcessor picks which to use (cali once, read
+    # many ways).  ``{method: {"thresholds": (N,), "psf_weights": (N,h,w)|None,
+    # "psf_boxes": (N,4)|None}}`` for every method OTHER than this calibration's own
+    # (which lives in the top-level fields).  None / empty = single-method (the default).
+    by_method: dict[str, Any] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -67,14 +73,57 @@ class TrapCalibration:
         else:
             object.__setattr__(self, "psf_weights", None if self.psf_weights is None else np.asarray(self.psf_weights, dtype=float))
             object.__setattr__(self, "psf_boxes", None if self.psf_boxes is None else np.asarray(self.psf_boxes, dtype=int))
+        normalized: dict[str, Any] = {}
+        for name, entry in dict(self.by_method or {}).items():
+            entry = dict(entry or {})
+            thr = entry.get("thresholds")
+            normalized[str(name).lower()] = {
+                "thresholds": None if thr is None else threshold_array(thr, len(centers)),
+                "psf_weights": None if entry.get("psf_weights") is None else np.ascontiguousarray(entry["psf_weights"], dtype=float),
+                "psf_boxes": None if entry.get("psf_boxes") is None else np.ascontiguousarray(entry["psf_boxes"], dtype=int),
+            }
+        object.__setattr__(self, "by_method", normalized or None)
         object.__setattr__(self, "metadata", dict(self.metadata or {}))
 
     @property
     def n_sites(self) -> int:
         return len(self.centers)
 
-    def signals(self, image) -> np.ndarray:
-        """One scalar per site for ``image`` using this calibration's method."""
+    def methods(self) -> tuple[str, ...]:
+        """Every readout method this calibration can read with -- its own plus any extra
+        carried in ``by_method`` (so a GUI can offer exactly the available choices)."""
+        extra = tuple(sorted(self.by_method)) if self.by_method else ()
+        return (self.method, *(m for m in extra if m != self.method))
+
+    def _resolve_method(self, method) -> str:
+        return str(self.method if method in (None, "") else method).lower()
+
+    def _kernels_for(self, method: str):
+        """PSF (weights, boxes) for a psf-type ``method`` -- the top-level fields when it
+        is this calibration's own method, else the ``by_method`` entry (raises if absent)."""
+        if method == self.method:
+            return self.psf_weights, self.psf_boxes
+        entry = (self.by_method or {}).get(method)
+        if entry is None or entry.get("psf_weights") is None or entry.get("psf_boxes") is None:
+            raise ValueError(
+                f"calibration carries no '{method}' PSF readout -- recalibrate including it.")
+        return entry["psf_weights"], entry["psf_boxes"]
+
+    def thresholds_for(self, method=None) -> np.ndarray:
+        """Per-site thresholds for ``method`` (this calibration's own, or a ``by_method``
+        entry); falls back to the top-level thresholds when the method has no own set."""
+        m = self._resolve_method(method)
+        if m == self.method:
+            return self.thresholds
+        entry = (self.by_method or {}).get(m)
+        if entry is not None and entry.get("thresholds") is not None:
+            return entry["thresholds"]
+        return self.thresholds
+
+    def signals(self, image, *, method=None) -> np.ndarray:
+        """One scalar per site for ``image``.  ``method`` (None = this calibration's own)
+        picks the readout: ``box`` square-ROI, ``psf``/``uniform_psf`` matched-filter --
+        so one calibration can be read several ways (the processor chooses)."""
 
         # ROI fingerprint: the centers/PSF boxes are absolute camera pixels, so a
         # frame from a DIFFERENT camera ROI (same size but shifted) would silently
@@ -88,15 +137,19 @@ class TrapCalibration:
                 raise ValueError(
                     f"image shape {got} does not match the calibration's {tuple(expected)} "
                     "(camera ROI changed since calibration?) -- recalibrate before reading out.")
-        if self.method == "psf":
-            return psf_signals(image, self.psf_weights, self.psf_boxes, background=self.background or "annulus")
+        m = self._resolve_method(method)
+        if "psf" in m:
+            weights, boxes = self._kernels_for(m)
+            return psf_signals(image, weights, boxes, background=self.background or "annulus")
         return roi_counts(image, self.centers, radius=self.roi_radius, reducer=self.reducer)
 
-    def detect(self, image) -> AtomDetection:
-        """Classify occupancy by thresholding the per-site signals (atoms are bright)."""
+    def detect(self, image, *, method=None) -> AtomDetection:
+        """Classify occupancy by thresholding the per-site signals (atoms are bright).
+        ``method`` selects the readout + its matching thresholds (None = this
+        calibration's own)."""
 
-        counts = np.asarray(self.signals(image), dtype=float)
-        thresholds = self.thresholds
+        counts = np.asarray(self.signals(image, method=method), dtype=float)
+        thresholds = self.thresholds_for(method)
         occupied = counts > thresholds
         return AtomDetection(
             counts=counts,
@@ -116,8 +169,22 @@ class TrapCalibration:
             psf_weights=self.psf_weights,
             psf_boxes=self.psf_boxes,
             background=self.background,
+            by_method=self.by_method,
             metadata={**self.metadata, **metadata},
         )
+
+    @staticmethod
+    def _by_method_to_json(by_method) -> dict | None:
+        """``by_method`` with numpy arrays -> plain lists (JSON-able)."""
+        if not by_method:
+            return None
+        out = {}
+        for name, entry in by_method.items():
+            out[name] = {
+                k: (None if v is None else np.asarray(v).tolist())
+                for k, v in entry.items()
+            }
+        return out
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -130,6 +197,7 @@ class TrapCalibration:
             "psf_weights": None if self.psf_weights is None else self.psf_weights.tolist(),
             "psf_boxes": None if self.psf_boxes is None else self.psf_boxes.tolist(),
             "background": self.background,
+            "by_method": self._by_method_to_json(self.by_method),
             "metadata": self.metadata,
         }
 
@@ -145,6 +213,7 @@ class TrapCalibration:
             psf_weights=payload.get("psf_weights"),
             psf_boxes=payload.get("psf_boxes"),
             background=payload.get("background", "none"),
+            by_method=payload.get("by_method"),
             metadata=payload.get("metadata", {}),
         )
 
@@ -163,6 +232,7 @@ class TrapCalibration:
                 background=np.asarray(self.background),
                 psf_weights=np.asarray([] if self.psf_weights is None else self.psf_weights),
                 psf_boxes=np.asarray([] if self.psf_boxes is None else self.psf_boxes),
+                by_method_json=np.asarray(json.dumps(self._by_method_to_json(self.by_method), ensure_ascii=False)),
                 metadata_json=np.asarray(json.dumps(self.metadata, ensure_ascii=False)),
             )
         else:
@@ -176,6 +246,7 @@ class TrapCalibration:
             data = np.load(path, allow_pickle=False)
             grid = data["grid_shape"]
             metadata = json.loads(str(data["metadata_json"].item())) if "metadata_json" in data.files else {}
+            by_method = json.loads(str(data["by_method_json"].item())) if "by_method_json" in data.files else None
             psf_weights = data["psf_weights"] if "psf_weights" in data.files else None
             psf_boxes = data["psf_boxes"] if "psf_boxes" in data.files else None
             return cls(
@@ -188,6 +259,7 @@ class TrapCalibration:
                 psf_weights=None if psf_weights is None or psf_weights.size == 0 else psf_weights,
                 psf_boxes=None if psf_boxes is None or psf_boxes.size == 0 else psf_boxes,
                 background=str(data["background"].item()) if "background" in data.files else "none",
+                by_method=by_method,
                 metadata=metadata,
             )
         return cls.from_dict(json.loads(path.read_text(encoding="utf-8")))

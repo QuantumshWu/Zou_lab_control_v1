@@ -257,6 +257,35 @@ def test_task_logic_node_produces_calibration_off_the_hub_when_started():
         exp.close()
 
 
+def test_starting_a_task_stops_other_running_nodes():
+    """#5: a task drives the device (camera + sequencer) directly, so starting it
+    AUTO-STOPS every OTHER running logic node first -- otherwise the live camera / a
+    measurement / a reactive processor would collide on the shared device and can
+    deadlock.  Here a running camera measurement is stopped the moment a task starts."""
+    exp = _calibrated_virtual_session()
+    console = _console(exp)
+    task_row = None
+    try:
+        _pick(console, ("camera", "live"))
+        cam_row = console.logic_nodes[-1]
+        console._start_logic_node(cam_row)
+        cam_node = console._logic_nodes.get(id(cam_row))
+        assert cam_node is not None and cam_node in console.running_nodes   # camera running
+
+        _pick(console, ("task", "Calibrate readout"))
+        task_row = console.logic_nodes[-1]
+        console._start_logic_node(task_row)
+        # the camera node was STOPPED the instant the task started (#5)
+        assert console._logic_nodes.get(id(cam_row)) is None
+        assert cam_node not in console.running_nodes
+        assert not getattr(cam_node, "running", True)        # its worker thread ended
+    finally:
+        if task_row is not None:
+            console._stop_logic_node(task_row)               # release the lock + stop the task
+        console.shutdown()
+        exp.close()
+
+
 def test_running_task_takes_a_fixed_panel_and_locks_the_console():
     """#5: while a task runs it OWNS the console (confocal-style) -- a dedicated
     Monitor panel shows its mid-run output (read off the task's OWN buffer, not the

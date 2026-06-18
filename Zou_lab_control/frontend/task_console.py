@@ -69,6 +69,7 @@ from .qt_fluent import (
     FluentGroupBox,
     FluentLabel,
     FluentLineEdit,
+    FluentPathEdit,
     FluentPopup,
     FluentScrollArea,
     FluentSectionLabel,
@@ -109,7 +110,7 @@ PANEL_KINDS: dict[str, str] = {
 # a 2D image wants a frame).  Single source for the panel's input self-documentation.
 PANEL_INPUT_FORMAT: dict[str, str] = {
     "2d": "a 2D array / camera frame (H×W)",
-    "sites": "a per-site (N,) occupancy vector (+ a centers signal)",
+    "sites": "a per-site (N,) occupancy vector (centres + frame come with it)",
     "1d": "a 1D vector (N,) or per-site array",
     "monitor": "a scalar per shot (rolling trace)",
     "monitor_nodist": "a scalar per shot (rolling trace)",
@@ -123,11 +124,15 @@ PANEL_INPUT_FORMAT: dict[str, str] = {
 # plot type with more inputs is just a longer slot list -- no per-kind params needed.
 # Each slot = (label, default-signal-name, tooltip).
 _DEFAULT_SLOTS = (("signal", "", "the hub signal to plot"),)
+# The site map takes ONE signal -- the per-site occupancy.  Its site CENTRES and the
+# camera-frame UNDERLAY are resolved from the SAME producing node (the OccupancyProcessor
+# publishes occupied + centers + frame_judged together, declared via its spec metadata
+# centers_key / image_key), so the rings + underlay are always the same shot and the user
+# picks just the occupancy (see PanelCard._sites_aux + TaskConsole._sites_inputs).
 PANEL_INPUT_SLOTS: dict[str, tuple[tuple[str, str, str], ...]] = {
     "sites": (
-        ("occupancy", "occupied", "per-site (N,) occupancy vector -- colours the rings (signal[0])"),
-        ("centers", "centers", "(N, 2) site centres in camera px (signal[1])"),
-        ("image", "frame", "camera-frame underlay, blank = none (signal[2])"),
+        ("occupancy", "occupied", "per-site (N,) occupancy vector -- colours the rings; its "
+                                  "producing node also supplies the centres + frame underlay"),
     ),
 }
 
@@ -577,7 +582,8 @@ class PanelCard(FluentGroupBox):
     edit_requested = QtCore.pyqtSignal(object)   # "Edit…" -> open the panel's Edit tab
 
     def __init__(self, config: PanelConfig, parent=None, *, names_provider=None,
-                 sources_provider=None, formats_provider=None, axes_provider=None):
+                 sources_provider=None, formats_provider=None, axes_provider=None,
+                 sites_inputs_provider=None):
         # Titled frame: the title strip carries the panel KIND (top-left) and the
         # Setting button (top-right), so the card is delineated like the rest.
         super().__init__(PANEL_KINDS[config.kind], parent, shadow=True)
@@ -594,6 +600,10 @@ class PanelCard(FluentGroupBox):
         # makes the signal (confocal: the measurement owns its labels), not a per-kind
         # hard-coded string.
         self.axes_provider = axes_provider
+        # callable(occupancy_signal) -> (centres_signal, image_signal): the site map takes
+        # ONE signal (occupancy) and resolves its centres + frame underlay from the SAME
+        # producing node (via that node's spec metadata), so rings + underlay are one shot.
+        self.sites_inputs_provider = sites_inputs_provider
         self.plotter = None
         self.canvas = None
         self._value_shape: tuple[int, ...] | None = None
@@ -1300,21 +1310,28 @@ class PanelCard(FluentGroupBox):
         return flat
 
     def _sites_aux(self, namespace: Mapping[str, object]):
-        """The site map's extra INPUT SLOTS: ``signal[1]`` = centres, ``signal[2]`` =
-        optional camera underlay (``signal[0]`` is the occupancy = the panel value).  The
-        namespace carries ``signal`` (the per-slot list) injected by ``_with_signal_slots``.
-        """
-        sig = namespace.get("signal") or []
-        centers = sig[1] if len(sig) > 1 else None
+        """The site map's centres + camera underlay, resolved from the SAME producing node as its
+        ONE occupancy signal (``config.inputs[0]``).  The occupancy's producing node (a
+        Judge-occupancy processor) publishes occupied + centres + the judged frame together,
+        so the console's ``sites_inputs_provider`` maps the occupancy signal -> (centres,
+        image) signal names from that node's spec metadata, and rings + underlay are always
+        the same shot.  The user therefore picks just ONE signal."""
+        occ = self.config.inputs[0] if self.config.inputs else ""
+        centers_name, image_name = (None, None)
+        if callable(self.sites_inputs_provider) and occ:
+            try:
+                centers_name, image_name = self.sites_inputs_provider(occ)
+            except Exception:
+                centers_name, image_name = (None, None)
+        centers = namespace.get(centers_name) if centers_name else None
         if centers is None:
-            slot = self.config.inputs[1] if len(self.config.inputs) > 1 else "centers"
             raise ValueError(
-                f"site map needs a centres signal in slot signal[1] (`{slot}`) with the (N, 2) "
-                "site centres -- pick it in Setting -> centers")
+                f"site map needs the centres from `{occ}`'s producing node -- point it at an occupancy "
+                "signal from a Judge-occupancy processor (it publishes occupied + centres + frame).")
         centers = np.asarray(centers, dtype=float)
         if centers.ndim != 2 or centers.shape[1] < 2:
             raise ValueError(f"centres signal must have shape (N, 2); got {centers.shape}")
-        image = sig[2] if len(sig) > 2 else None
+        image = namespace.get(image_name) if image_name else None
         return centers[:, :2], (None if image is None else np.asarray(image, dtype=float))
 
     def _co_names(self) -> frozenset:
@@ -1571,12 +1588,15 @@ class MeasurementPanel(QtWidgets.QWidget):
     stop_requested = QtCore.pyqtSignal()
 
     def __init__(self, measurements: Sequence[object], parent=None, *, single: bool = False,
-                 controls: bool = True):
+                 controls: bool = True, signals_provider=None):
         super().__init__(parent)
         self.setStyleSheet("background: transparent;")
         self._specs = list(measurements)
         self._single = bool(single)               # bound to ONE spec (per-panel Edit) -> hide the picker
         self._controls = bool(controls)           # False = no Start/Stop (e.g. a plot Edit's read-only-ish source form)
+        # A ``kind="signal"`` param (a processor's input) renders a combobox of the LIVE
+        # hub signals -- this callable returns their names (None -> a free text edit).
+        self._signals_provider = signals_provider
         self._widgets: dict[str, object] = {}     # param key -> widget (or tuple for axis_range)
         self._running = False
 
@@ -1745,6 +1765,40 @@ class MeasurementPanel(QtWidgets.QWidget):
                     spin = self._spin(decl, integer=True)
                     self.form.addRow(label_text, spin)
                     self._widgets[decl.key] = ("int", spin)
+            elif kind == "path":
+                # A path param: line edit + Browse button (native file/folder dialog) --
+                # the ONE reusable picker, never a bare hand-typed path.
+                picker = FluentPathEdit(
+                    "" if decl.default is None else str(decl.default),
+                    mode=getattr(decl, "path_mode", "file"),
+                    caption=f"Choose {decl.key}",
+                    file_filter=getattr(decl, "file_filter", "All files (*)"))
+                picker.setToolTip(decl.tooltip)
+                picker.changed.connect(lambda *_: self._refresh_start_enabled())
+                self.form.addRow(label_text, picker)
+                self._widgets[decl.key] = ("path", picker)
+            elif kind == "signal":
+                # A hub-signal input (a processor's source): a combobox of the live hub
+                # signals, like a plot's input picker -- not a hand-typed name.  The
+                # current value is kept selectable even if its producing node is not running yet.
+                combo = FluentComboBox()
+                combo.setEditable(True)            # allow a not-yet-published name to round-trip
+                names = []
+                if callable(self._signals_provider):
+                    try:
+                        names = [str(n) for n in self._signals_provider()]
+                    except Exception:
+                        names = []
+                cur = "" if decl.default is None else str(decl.default)
+                for n in names:
+                    combo.addItem(n)
+                if cur and cur not in names:
+                    combo.addItem(cur)
+                combo.setCurrentText(cur)
+                combo.setToolTip(decl.tooltip)
+                combo.activated.connect(lambda *_: self._refresh_start_enabled())
+                self.form.addRow(label_text, combo)
+                self._widgets[decl.key] = ("signal", combo)
             elif kind == "text":
                 edit = FluentLineEdit("" if decl.default is None else str(decl.default))
                 edit.setMinimumWidth(scaled_px(160, minimum=120))   # grows with the field; no cutoff
@@ -1777,8 +1831,10 @@ class MeasurementPanel(QtWidgets.QWidget):
             elif tag == "int_opt":
                 text = entry[1].text().strip()
                 values[key] = int(text) if text else None
-            elif tag == "text":
+            elif tag in ("text", "path"):
                 values[key] = entry[1].text()
+            elif tag == "signal":
+                values[key] = entry[1].currentText().strip()
             else:  # float
                 values[key] = float(entry[1].value())
         return values
@@ -1808,7 +1864,9 @@ class MeasurementPanel(QtWidgets.QWidget):
             entry = self._widgets.get(decl.key)
             if entry is None:
                 missing.append(decl.label)
-            elif entry[0] in ("int_opt", "text") and not entry[1].text().strip():
+            elif entry[0] in ("int_opt", "text", "path") and not entry[1].text().strip():
+                missing.append(decl.label)
+            elif entry[0] == "signal" and not entry[1].currentText().strip():
                 missing.append(decl.label)
         return missing
 
@@ -1851,8 +1909,10 @@ class MeasurementPanel(QtWidgets.QWidget):
                     entry[1].setValue(int(val))
                 elif tag == "int_opt":
                     entry[1].setText("" if val is None else str(int(val)))
-                elif tag == "text":
+                elif tag in ("text", "path"):
                     entry[1].setText("" if val is None else str(val))
+                elif tag == "signal":
+                    entry[1].setCurrentText("" if val is None else str(val))
                 elif tag == "float":
                     entry[1].setValue(float(val))
             except (TypeError, ValueError):
@@ -2575,7 +2635,8 @@ class LogicNodeEditor(QtWidgets.QWidget):
         # which already carries start_requested(self) / stop_requested + the typed,
         # no-eval form).  A spec drives a real ParamDecl form; the camera (spec is
         # None) shows nothing here but Start/Stop still build/run the camera node.
-        self.form = MeasurementPanel([spec] if spec is not None else [], single=True)
+        self.form = MeasurementPanel([spec] if spec is not None else [], single=True,
+                                     signals_provider=getattr(console.hub, "names", None))
         self.form.seed_values(row.node.values or {})
         self.form.start_requested.connect(lambda *_: self.console._start_logic_node(self.row))
         self.form.stop_requested.connect(lambda: self.console._stop_logic_node(self.row))
@@ -2859,7 +2920,7 @@ class TaskConsole(QtWidgets.QWidget):
             for config in state.panels:
                 self._attach_card(PanelCard(config, parent=self.board,
                                             names_provider=self.hub.names,
-                                            sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes))
+                                            sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs))
             for node in state.logic:
                 self._attach_logic_node(node)    # always STOPPED -- Start is manual
             self._arrange()
@@ -3004,6 +3065,49 @@ class TaskConsole(QtWidgets.QWidget):
             except Exception:
                 continue
         return out
+
+    def _sites_inputs(self, occ_signal) -> tuple[str | None, str | None]:
+        """For a site-map panel's ONE occupancy signal, return ``(centres_signal,
+        image_signal)`` resolved from the SAME producing node -- so the site map pulls its
+        centres + frame underlay from the one node that made the occupancy (rings + underlay
+        = same shot).  This is the #6 "one signal" wiring: the user picks occupancy, the
+        rest auto.
+
+        The producing node is found among the ACTUAL running nodes first (the live-readout /
+        notebook path wires a reactive OccupancyProcessor straight into ``running_nodes``
+        without a Logic-tab row), reading the centres/underlay output names off the node
+        itself (``sitemap_centers_key`` / ``sitemap_image_key``).  A configured-but-not-yet-
+        started Logic-tab row is the fallback, resolved from its spec metadata."""
+        occ = str(occ_signal or "")
+        if not occ:
+            return (None, None)
+        # 1) the running producing node (ground truth: whatever publishes this signal now)
+        for node in self.running_nodes:
+            ck = getattr(node, "sitemap_centers_key", "")
+            if not ck:
+                continue
+            try:
+                names = set(node.published_signals())
+            except Exception:
+                names = set()
+            if occ in names:
+                prefix = getattr(node, "prefix", "")
+                ik = getattr(node, "sitemap_image_key", "")
+                return (prefix + ck, (prefix + ik) if ik else None)
+        # 2) a configured Logic-tab row whose node has not started yet (spec metadata)
+        for row in self.logic_nodes:
+            spec = self._spec_for_logic(row.node)
+            meta = getattr(spec, "metadata", {}) or {}
+            if not meta.get("centers_key"):
+                continue
+            node = self._logic_nodes.get(id(row))
+            prefix = getattr(node, "prefix", "") if node is not None else ""
+            names = set(node.published_signals()) if node is not None else set()
+            default_occ = prefix + str(getattr(spec, "default_value_key", "") or "")
+            if occ in names or (default_occ and occ == default_occ):
+                ck, ik = meta.get("centers_key"), meta.get("image_key")
+                return ((prefix + ck) if ck else None, (prefix + ik) if ik else None)
+        return (None, None)
 
     def _live_node_formats(self, node) -> list[tuple[str, str, str]]:
         """``[(name, shape, description)]`` for a RUNNING node -- one ROW per output, each
@@ -3208,7 +3312,7 @@ class TaskConsole(QtWidgets.QWidget):
         rows = max((c.config.row + c.config.rows for c in self.cards), default=0)
         config = PanelConfig(kind=str(kind), row=rows, col=0, size="1x2")
         card = PanelCard(config, parent=self.board, names_provider=self.hub.names,
-                         sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes)
+                         sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs)
         self._attach_card(card)
         self._arrange()
         self._mark_dirty()
@@ -3298,6 +3402,15 @@ class TaskConsole(QtWidgets.QWidget):
             values = dict(row.node.values)
         # stop a previous run of THIS node so running nodes don't pile up
         self._stop_logic_node(row, _silent=True)
+        # A TASK (one-shot orchestration) drives the DEVICE directly (camera +
+        # sequencer).  Any OTHER running node (the live camera, a measurement, a
+        # reactive processor) that also touches the device would collide on the shared
+        # camera / sequencer and can DEADLOCK.  So starting a task first STOPS every
+        # other running node (#5); the operator restarts them after the task finishes.
+        if row.node.kind == "task":
+            for other in list(self.logic_nodes):
+                if other is not row and self._logic_nodes.get(id(other)) is not None:
+                    self._stop_logic_node(other)
         try:
             node = self._build_logic_node(row.node, values)
         except Exception as exc:
@@ -3345,7 +3458,7 @@ class TaskConsole(QtWidgets.QWidget):
         config = PanelConfig(kind=kind, title=title, size="2x2",
                              source="value = __task_frame__")
         card = PanelCard(config, parent=self.board, names_provider=self.hub.names,
-                         sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes)
+                         sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs)
         self._attach_card(card)
         self._task_card = card
         self._running_task_row = row

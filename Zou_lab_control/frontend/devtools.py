@@ -185,9 +185,8 @@ def _demo_board_state():
         panels=[
             PanelConfig(kind="2d", title="Loading image", row=0, col=0, size="2x2",
                         source="value = frame"),
-            PanelConfig(kind="sites", title="Per-site loading rate", row=0, col=2, size="2x2",
-                        source="value = rate_sites",
-                        params={"centers": "centers", "image": "frame"}),
+            PanelConfig(kind="sites", title="Per-site occupancy", row=0, col=2, size="2x2",
+                        source="value = occupied", inputs=["occupied"]),
             PanelConfig(kind="monitor", title="Loading rate (dist)", row=0, col=4, size="1x2",
                         source="value = rate", params={"length": 300}),
             PanelConfig(kind="monitor_nodist", title="Loading rate", row=1, col=4, size="1x2",

@@ -39,7 +39,6 @@ import numpy as np
 from ..core.analysis import grid_shape_tuple
 from ..core.signals import SignalHub
 from ..devices.base import CameraDevice
-from ..timing import imaging_channel_kwargs, imaging_sequence
 
 
 @dataclass(frozen=True)
@@ -433,11 +432,21 @@ class OccupancyProcessor(Processor):
     grid map (when grid known), ``centers`` (N,2), ``thresholds`` (N,)."""
 
     node_label = "occupancy"
-    provides = ("occupied", "counts", "rate", "rate_sites", "rate_grid", "centers", "thresholds")
+    # ``frame_judged`` = the EXACT frame this occupancy was computed from, republished so
+    # the site map's underlay is the SAME shot as the rings (the camera keeps streaming
+    # newer frames on its own thread; using the live camera frame would offset the rings).
+    provides = ("occupied", "counts", "rate", "rate_sites", "rate_grid", "centers",
+                "thresholds", "frame_judged")
+    # The site map takes ONE signal (an occupancy vector this node publishes) and resolves
+    # its ring CENTRES + frame UNDERLAY from the SAME node: these name the two outputs that
+    # carry them.  THIS is the single source -- the panel layer (ProcessorSpec.metadata) and
+    # the console's site-map resolver both read these, so "one signal" wiring never drifts.
+    sitemap_centers_key = "centers"
+    sitemap_image_key = "frame_judged"
 
     def __init__(self, hub: SignalHub, *, calibration=None, calibration_source=None,
                  source: str = "frame", grid_shape: tuple[int, int] | None = None,
-                 ema: float = 0.05, prefix: str = ""):
+                 ema: float = 0.05, method: str | None = None, prefix: str = ""):
         super().__init__(hub, consumes=(source,), prefix=prefix)
         self.calibration = calibration
         # Optional lazy source: a callable -> calibration (or None while a calibrate
@@ -448,6 +457,10 @@ class OccupancyProcessor(Processor):
         self.source = str(source)
         self.grid_shape = None if grid_shape is None else grid_shape_tuple(grid_shape)
         self.ema = float(ema)
+        # The READOUT method (box / per-site PSF / ...) is chosen HERE, not at calibration
+        # time: one calibration carries every method's geometry + thresholds, and the
+        # processor picks which to read with (None = the calibration's default).
+        self.method = None if method in (None, "") else str(method)
         self._rate = float("nan")
         self._rate_sites: np.ndarray | None = None
 
@@ -461,7 +474,7 @@ class OccupancyProcessor(Processor):
         if calibration is None:
             return {}                                       # not calibrated yet -> no-op (non-blocking)
         frame = np.asarray(inputs[self.source], dtype=float)
-        detection = calibration.detect(frame)               # the single readout contract
+        detection = calibration.detect(frame, method=self.method)   # the single readout contract
         occupied = np.asarray(detection.occupied, dtype=float).reshape(-1)
         counts = np.asarray(detection.counts, dtype=float).reshape(-1)
         if self._rate_sites is None or np.isnan(self._rate):
@@ -476,7 +489,10 @@ class OccupancyProcessor(Processor):
             "rate": self._rate,
             "rate_sites": self._rate_sites.copy(),
             "centers": np.asarray(self.calibration.centers, dtype=float),
-            "thresholds": np.asarray(self.calibration.thresholds, dtype=float).reshape(-1),
+            "thresholds": np.asarray(detection.thresholds, dtype=float).reshape(-1),
+            # publish the judged frame ATOMICALLY with the occupancy -> the site map's
+            # underlay + rings are always the same shot (root fix for the misalignment).
+            "frame_judged": frame,
         }
         if self.grid_shape is not None and occupied.size == int(np.prod(self.grid_shape)):
             out["rate_grid"] = self._rate_sites.reshape(self.grid_shape).copy()
@@ -493,6 +509,8 @@ class OccupancyProcessor(Processor):
             SignalSpec(p + "rate_grid", "loading rate", "", "per-site loading rate as a site grid"),
             SignalSpec(p + "centers", "site centre", "px", "site centres in camera pixels (N, 2)"),
             SignalSpec(p + "thresholds", "threshold", "counts", "per-site bright/dark count threshold"),
+            SignalSpec(p + "frame_judged", "camera image", "counts",
+                       "the exact camera frame this occupancy was judged from (site-map underlay)"),
         )
 
 
@@ -605,26 +623,27 @@ class CalibrateReadoutTask(Task):
     provides = ("centers", "thresholds", "n_sites")
     mid_run = ("frame", "progress", "stage")   # streamed to the dedicated mid-run panel + banner
 
-    # The user-facing mode names map to the calibration's (sitemap_method,
-    # threshold_method) pair: box+otsu, per-site/uniform PSF + (otsu|bimodal).
-    MODE_TO_SITEMAP_METHOD = {"box": "box", "per-site PSF": "psf", "uniform PSF": "uniform_psf"}
-
-    BUILTIN_PULSE = "built-in"          # sentinel: use the built-in imaging sequence
-
-    @classmethod
-    def _coerce_mode(cls, mode: str) -> str:
-        """Validate the user-facing mode name (single source for __init__ + edits)."""
-        mode = str(mode)
-        if mode not in cls.MODE_TO_SITEMAP_METHOD:
-            raise ValueError(f"mode {mode!r} must be one of {tuple(cls.MODE_TO_SITEMAP_METHOD)}.")
-        return mode
+    # The imaging pulse TEMPLATE the cali loads -- a REAL, inspectable program (no opaque
+    # "built-in" sentinel).  A bare name resolves to the shipped configs template; an
+    # absolute path to the user's own PulseTableState .json.  Each cali pass LOADS it and
+    # SETS its imaging exposure (with_imaging_exposure) -- "load a template, set the
+    # duration, on/off, run".  The cali no longer chooses a readout METHOD: it computes
+    # ALL methods (box / per-site PSF / uniform PSF) and the OccupancyProcessor picks one.
+    DEFAULT_PULSE_TEMPLATE = "imaging_template.json"
 
     @classmethod
-    def _coerce_pulse(cls, pulse) -> str | None:
-        """A pulse path of blank / None / the ``built-in`` sentinel means: use the
-        built-in imaging sequence (returns None); anything else is a saved-program path."""
-        text = str(pulse or "").strip()
-        return None if text in ("", cls.BUILTIN_PULSE) else text
+    def _resolve_template(cls, pulse_template):
+        """Load the imaging template: the given path if it is a real file, else the shipped
+        ``configs`` template of that name, else the in-memory default imaging template."""
+        from ..timing import PulseTableState, default_imaging_template
+        text = str(pulse_template or "").strip() or cls.DEFAULT_PULSE_TEMPLATE
+        path = Path(text)
+        if path.is_file():
+            return PulseTableState.load(path)
+        shipped = Path(__file__).resolve().parents[1] / "configs" / path.name
+        if shipped.is_file():
+            return PulseTableState.load(shipped)
+        return default_imaging_template()
 
     def output_specs(self) -> tuple[SignalSpec, ...]:
         """What the calibration PRODUCES (off the hub) + streams mid-run -- keyed by the
@@ -640,9 +659,9 @@ class CalibrateReadoutTask(Task):
     def __init__(self, hub: SignalHub, camera: CameraDevice, *, sequencer: object | None = None,
                  grid_shape: tuple[int, int] = (5, 7), roi_radius: int = 1,
                  sitemap_exposure: float = 0.05, readout_exposure: float = 0.02,
-                 sitemap_pulse: str | None = None, readout_pulse: str | None = None,
+                 pulse_template: str = "imaging_template.json",
                  calibration_frames: int = 30, threshold_frames: int = 100,
-                 mode: str = "box", threshold_method: str = "otsu",
+                 threshold_method: str = "otsu",
                  source: str = "live", folder: str = "calibrations",
                  calibration_sink=None, prefix: str = ""):
         super().__init__(hub, prefix=prefix)
@@ -657,51 +676,39 @@ class CalibrateReadoutTask(Task):
         self.calibration_sink = calibration_sink
         self.grid_shape = grid_shape_tuple(grid_shape)
         self.roi_radius = int(roi_radius)
-        # TWO imaging pulses: the SITEMAP/PSF pass uses a LONGER readout duration (more
-        # photons -> cleaner site centroids + PSF fit); the THRESHOLD pass uses the
-        # ACTUAL readout duration (the thresholds must be learnt under the real readout
-        # conditions).  Each is either a saved pulse program (a PulseTableState .json
-        # from the pulse GUI, which owns the camera trigger + durations) or, when blank,
-        # the default imaging sequence at the corresponding exposure.
+        # TWO exposures (set on the SAME loaded template per pass): the SITEMAP/reference
+        # pass uses a LONGER duration (more photons -> cleaner site centroids + PSF fit);
+        # the THRESHOLD pass uses the ACTUAL readout duration (thresholds learnt under real
+        # readout conditions).  The template is a real PulseTableState; ``with_imaging_exposure``
+        # sets its imaging window per pass -- "load a template, set the duration, run".
         self.sitemap_exposure = float(sitemap_exposure)
         self.readout_exposure = float(readout_exposure)
-        # A pulse path of "" / None / the "built-in" sentinel = use the built-in imaging
-        # sequence at the exposure (so the UI field is never an ambiguous blank).
-        self.sitemap_pulse = self._coerce_pulse(sitemap_pulse)
-        self.readout_pulse = self._coerce_pulse(readout_pulse)
+        self.pulse_template = str(pulse_template or self.DEFAULT_PULSE_TEMPLATE)
         self.calibration_frames = max(1, int(calibration_frames))
         self.threshold_frames = max(2, int(threshold_frames))
-        # ``mode`` is the user-facing name (box / per-site PSF / uniform PSF); the
-        # ``method`` @property resolves it to the sitemap method (box|psf|uniform_psf).
-        self.mode = self._coerce_mode(mode)
         self.threshold_method = str(threshold_method)
         # ONE folder for input + output (no blank paths); ``source`` decides how it's used.
         self.source = str(source)
         self.folder = str(folder or "calibrations")
         self.calibration = None
 
-    @property
-    def method(self) -> str:
-        """Resolved sitemap method (box | psf | uniform_psf) for the chosen mode."""
-        return self.MODE_TO_SITEMAP_METHOD[self.mode]
-
     def acquisition_parameters(self) -> dict[str, object]:
-        """The calibrate task's tunable parameters (source + folder + sitemap grid +
-        frame counts + mode + threshold), as ``{name: current}`` -- shown in the panel's
-        Edit and applied before the next Run.  Every value is concrete (no blank): a
-        built-in pulse reads back as the ``built-in`` sentinel, the folder as its path."""
+        """The calibrate task's tunable parameters (source + folder + pulse template +
+        exposures + grid + frame counts + threshold), as ``{name: current}`` -- shown in
+        the panel's Edit and applied before the next Run.  Every value is concrete (no
+        blank): the pulse template + folder read back as their paths.  NOTE the cali no
+        longer has a readout ``mode`` -- it computes every method; the OccupancyProcessor
+        chooses box / per-site PSF / uniform PSF."""
         return {
             "source": str(self.source),
             "folder": str(self.folder),
-            "sitemap_pulse": self.sitemap_pulse or self.BUILTIN_PULSE,
-            "readout_pulse": self.readout_pulse or self.BUILTIN_PULSE,
+            "pulse_template": str(self.pulse_template),
             "grid_shape": tuple(self.grid_shape),
             "sitemap_exposure": float(self.sitemap_exposure),
             "readout_exposure": float(self.readout_exposure),
             "roi_radius": int(self.roi_radius),
             "calibration_frames": int(self.calibration_frames),
             "threshold_frames": int(self.threshold_frames),
-            "mode": str(self.mode),
             "threshold_method": str(self.threshold_method),
         }
 
@@ -710,10 +717,8 @@ class CalibrateReadoutTask(Task):
             self.source = str(values["source"])
         if "folder" in values:
             self.folder = str(values["folder"]) or "calibrations"
-        if "sitemap_pulse" in values:
-            self.sitemap_pulse = self._coerce_pulse(values["sitemap_pulse"])
-        if "readout_pulse" in values:
-            self.readout_pulse = self._coerce_pulse(values["readout_pulse"])
+        if "pulse_template" in values:
+            self.pulse_template = str(values["pulse_template"]) or self.DEFAULT_PULSE_TEMPLATE
         if "grid_shape" in values:
             self.grid_shape = grid_shape_tuple(values["grid_shape"])
         if "sitemap_exposure" in values:
@@ -800,16 +805,12 @@ class CalibrateReadoutTask(Task):
             threshold_method=self.threshold_method,
             timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
-    def _imaging_seq(self, pulse: str | None, exposure: float, name: str):
-        """The acquisition sequence for one cali pass: a saved pulse program (a
-        PulseTableState .json from the pulse GUI, which owns the camera trigger +
-        durations) when ``pulse`` is given, else the default imaging sequence at
-        ``exposure``.  Same path on real hardware (only the camera frames differ)."""
-        if pulse:
-            from ..timing import PulseTableState
-            return PulseTableState.load(pulse).to_sequence(name=name)
-        return imaging_sequence(exposure=exposure, load=True, name=name,
-                                **imaging_channel_kwargs(self.sequencer))
+    def _imaging_seq(self, exposure: float, name: str):
+        """The acquisition sequence for one cali pass: LOAD the pulse template and SET its
+        imaging window to ``exposure`` -- the user's "load a template, set the duration,
+        run" workflow.  ONE template is reused for both passes (only the exposure differs).
+        Same path on real hardware (only the camera frames differ)."""
+        return self._resolve_template(self.pulse_template).with_imaging_exposure(exposure).to_sequence(name=name)
 
     def _collect_frames(self, seq, n_frames: int, out: "TaskOutput", *, stage: str,
                         progress_lo: float, progress_hi: float) -> list:
@@ -842,34 +843,35 @@ class CalibrateReadoutTask(Task):
         (the operator sees ~N reference then ~M readout frames accumulate), then the
         centers come from averaging the reference frames and the thresholds from the
         per-site count distribution of the readout frames."""
-        from .calibration import calibrate_sitemap_from_images, calibrate_threshold_from_images
+        from .calibration import calibrate_all_methods_from_images
         # name="reference" (NOT "sitemap"): the virtual camera images a REAL ~50% loading
         # at the long exposure, and averaging many such frames reveals every site -- the
         # authentic template, not a synthetic all-bright frame.
-        sitemap_seq = self._imaging_seq(self.sitemap_pulse, self.sitemap_exposure, "reference")
-        readout_seq = self._imaging_seq(self.readout_pulse, self.readout_exposure, "readout")
+        sitemap_seq = self._imaging_seq(self.sitemap_exposure, "reference")
+        readout_seq = self._imaging_seq(self.readout_exposure, "readout")
         out.publish(progress=0.0, stage="loading reference frames")
         template = self._collect_frames(sitemap_seq, self.calibration_frames, out,
                                         stage="reference frame", progress_lo=0.0, progress_hi=0.45)
-        out.publish(progress=0.5, stage="finding sites + PSF")
-        sitemap = calibrate_sitemap_from_images(
-            template, grid_shape=self.grid_shape, roi_radius=self.roi_radius, method=self.method, display=False)
         samples = self._collect_frames(readout_seq, self.threshold_frames, out,
-                                       stage="readout frame", progress_lo=0.5, progress_hi=0.92)
-        out.publish(progress=0.95, stage="fitting per-site thresholds")
-        thresholds = calibrate_threshold_from_images(
-            samples, sitemap.calibration, method=self.threshold_method, display=False)
+                                       stage="readout frame", progress_lo=0.5, progress_hi=0.9)
+        out.publish(progress=0.95, stage="finding sites + thresholds (box / PSF)")
+        # ONE multi-method calibration: the OccupancyProcessor picks box / per-site PSF /
+        # uniform PSF later, so the cali computes them all here (cali once, read many ways).
+        calibration = calibrate_all_methods_from_images(
+            template, samples, grid_shape=self.grid_shape, roi_radius=self.roi_radius,
+            threshold_method=self.threshold_method)
         # Keep the readout frames + averaged reference template so run() can write the
         # per-site distribution / fidelity report (the rb87-style artifacts).
         self._readout_samples = list(samples)
         self._reference_template = (np.mean(np.asarray(template, dtype=float), axis=0)
                                     if template else None)
-        return thresholds.calibration
+        return calibration
 
     def _run_from_folder(self, out: "TaskOutput"):
-        """Calibrate from frames SAVED IN A FOLDER (the real-data flow): index the
-        run, fit the sitemap from the reference template, then per-site thresholds."""
-        from .calibration import calibrate_sitemap_from_images, calibrate_threshold_from_images
+        """Calibrate from frames SAVED IN A FOLDER (the real-data flow): index the run,
+        find the sites from the reference template, then per-site thresholds for every
+        readout method (the OccupancyProcessor picks which to use)."""
+        from .calibration import calibrate_all_methods_from_images
         from .imageio import index_run
         if not self.folder:
             raise ValueError("source='saved frames' needs a folder of saved frames.")
@@ -877,18 +879,16 @@ class CalibrateReadoutTask(Task):
         template_frames = list(run.template_frames())
         if template_frames:
             out.publish(frame=np.asarray(template_frames[-1], dtype=float), progress=0.4)
-        sitemap = calibrate_sitemap_from_images(
-            template_frames, grid_shape=self.grid_shape, roi_radius=self.roi_radius,
-            method=self.method, display=False)
         samples = list(run.short_frames())
         if samples:
             out.publish(frame=np.asarray(samples[-1], dtype=float), progress=0.85)
-        thresholds = calibrate_threshold_from_images(
-            samples, sitemap.calibration, method=self.threshold_method, display=False)
+        calibration = calibrate_all_methods_from_images(
+            template_frames, samples, grid_shape=self.grid_shape, roi_radius=self.roi_radius,
+            threshold_method=self.threshold_method)
         self._readout_samples = list(samples)
         self._reference_template = (np.mean(np.asarray(template_frames, dtype=float), axis=0)
                                     if template_frames else None)
-        return thresholds.calibration
+        return calibration
 
 
 class CameraMeasurement(Measurement):
