@@ -1292,6 +1292,19 @@ class FluentTabWidget(QtWidgets.QTabWidget):
             QTabBar {{
                 background: transparent;
             }}
+            QTabBar::scroller {{
+                width: {scaled_px(34, minimum=28)}px;
+            }}
+            QTabBar QToolButton {{
+                background: white;
+                border: none;
+                border-radius: {_radius()}px;
+                margin: {scaled_px(3, minimum=2)}px {scaled_px(1, minimum=1)}px;
+                width: {scaled_px(15, minimum=13)}px;
+            }}
+            QTabBar QToolButton:hover {{ background: rgba(0, 0, 0, 18); }}
+            QTabBar QToolButton:pressed {{ background: rgba(0, 0, 0, 34); }}
+            QTabBar QToolButton:disabled {{ background: transparent; }}
             QTabBar::tab {{
                 background: transparent;
                 color: {GREY};
