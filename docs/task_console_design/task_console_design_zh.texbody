@@ -145,10 +145,13 @@ publish 与读取都在锁内做副本，所以采集线程和 GUI 线程互不�
 \pyapi{rate\_grid} & (rows, cols) & 网格形状的逐站率 \\
 \pyapi{centers} & (N\_sites, 2) & 标定的站点中心(相机像素) \\
 \pyapi{thresholds} & (N\_sites,) & 逐站阈值 \\
-\pyapi{shot} & 标量 & shot 计数 \\
 \bottomrule
 \end{tabular}
 \end{center}
+扫描类节点（\pyapi{ScannedMeasurementNode}）发布 \pyapi{<x>} / \pyapi{<y>} / \pyapi{scan\_done}，逐站
+reducer 另发 \pyapi{<y>\_sites}（扁平 \texttt{(N\_sites,)} 向量）。\tfocus{不发布可派生量}：逐站向量的网格视图是
+reshape 表达式（\pyapi{value = <y>\_sites.reshape(ny, nx)}），而 \pyapi{shot} 计数器是面板表达式命名空间里的全局
+变量（\pyapi{hub.shot}），都不再各做一个信号。
 
 
 \chapter{逻辑节点:数据生产者}

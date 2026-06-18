@@ -21,6 +21,25 @@ checkout. If VS Code/Jupyter already has the right kernel but PowerShell cannot
 find that Python, run `%run ../install_current_kernel.py` from a notebook in
 `tutorials/`.
 
+### First day (new lab member)
+
+Follow this order; everything before step 4 runs on a **virtual** backend (no
+hardware needed), so you can practice the whole readout flow at your desk.
+
+1. `install_requirements.bat`, then `start_tutorials_jupyter_lab.bat`.
+2. **Learn the model + scripted readout:** `tutorials/neutral_atom_tutorial.ipynb`
+   (connect virtual, calibrate, detect, scan) — start here. The plotting/pulse
+   primitives are in `tutorials/frontend_tutorial.ipynb`.
+3. **Drive the live GUI:** `tutorials/task_console_tutorial.ipynb` + `task_console.bat`
+   (Add Panel → measurement/plot, run a calibration, watch a scan fill in).
+4. **Go to real hardware:** read `docs/REAL_HARDWARE_BRINGUP_zh.md` (the
+   first-power-on checklist), start the FPGA side with
+   `tutorials/neutral_atom_fpga_server.ipynb`, then bring up the control PC with
+   `tutorials/neutral_atom_hardware_quickstart.ipynb`.
+
+A per-notebook one-liner + the recommended order also lives in
+[tutorials/README.md](tutorials/README.md).
+
 ## Repository Layout
 
 ```text
@@ -37,7 +56,13 @@ references/       historical source archives (ignored by git)
 
 ## Documentation
 
-There are exactly **four tutorial PDF manuals**, plus one maintainer note.
+Four reference PDF manuals (built from `.texbody` sources), a real-hardware
+first-day checklist, and one maintainer note:
+
+- **First-power-on checklist:** [docs/REAL_HARDWARE_BRINGUP_zh.md](docs/REAL_HARDWARE_BRINGUP_zh.md)
+  — environment prerequisites, the DCAM/`dcamapi.dll` setup, the firewall/port-18861
+  notes, the ordered first-power-on verification, and a symptom → root-cause → fix
+  table for the errors a first-timer hits at the machine. Read this before step 4 above.
 
 | Manual | Source dir | Covers |
 | --- | --- | --- |
@@ -110,7 +135,7 @@ Edit/Preview/Scan tabs, the scan-dot workflow, and the plotting/PDF API. Open
 the editor remotely or offline:
 
 ```powershell
-pulse_gui.bat --remote-host 192.168.0.20 --state .\pulses\camera_imaging_address_switch.json
+pulse_gui.bat --remote-host 192.168.0.20 --state .\pulses\camera_imaging_address_switch.json   # 192.168.0.20 = a PLACEHOLDER; use your FPGA PC's IP
 pulse_gui.bat --no-sequencer --state .\pulses\camera_imaging_address_switch.json
 ```
 

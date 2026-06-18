@@ -44,6 +44,8 @@ exp = na.connect("remote_template",
 
 session 暴露四个子系统/设备入口：\pyapi{exp.devices}（底层设备集）、\pyapi{exp.camera}（采图）、\pyapi{exp.timing}（脉冲/触发）、\pyapi{exp.readout}（标定与占据检测）。
 
+\textbf{\pyapi{connect} 怎么挑后端——没有“后端开关”。} \pyapi{connect} 的第一个参数是一份\tfocus{配置}：可以是内置名（\pyapi{"virtual"}）、一个 \filepath{.json} 路径、或一个 dict。后端\tfocus{不是}一个单独的标志位——它\tfocus{就是配置里每个设备条目的 \pyapi{type}}：\pyapi{DeviceSet} 按 \pyapi{type} 分类设备（\pyapi{VirtualCamera} vs \pyapi{QCMOSCamera}、\pyapi{VirtualSequencer} vs \pyapi{RemoteSequencer}），\tfocus{不看名字}。所以 \pyapi{"virtual"} 只是“全虚拟配置”的快捷名；要上真机就换各条目的 \pyapi{type}（这正是 \filepath{remote\_template.json} 已经替你做好的）。这就是“换真机只改 \pyapi{connect()}”的机制根源：上层 GUI / 逻辑节点 / 读出代码只认 \pyapi{NeutralAtomSession} 接口，对底下是哪种 \pyapi{type} 一无所知。\tfocus{唯一的额外差别}：虚拟后端自带 \pyapi{VirtualTrapArray}（知道阱网格），真机没有，所以真机上 \pyapi{exp.readout.sitemap(...)} 要显式传 \pyapi{grid\_shape=(ny, nx)}；其余调用完全相同。
+
 \chapter{设备配置与加载}
 
 \section{配置就是一个字典}
