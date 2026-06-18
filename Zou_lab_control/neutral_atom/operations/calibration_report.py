@@ -30,10 +30,12 @@ from Zou_lab_control._viewer_registry import active_plotter
 from ..core.analysis import estimate_threshold_fidelity
 
 
-def per_site_counts(calibration, frames) -> np.ndarray:
+def per_site_counts(calibration, frames, *, method=None) -> np.ndarray:
     """``(n_frames, n_sites)`` readout signal -- the SAME ``calibration.signals`` the
-    detector thresholds, stacked over the readout frames."""
-    rows = [np.asarray(calibration.signals(np.asarray(f, dtype=float)), dtype=float).reshape(-1)
+    detector thresholds, stacked over the readout frames.  ``method`` picks the readout
+    model (box / psf / uniform_psf); ``None`` = the calibration's default."""
+    rows = [np.asarray(calibration.signals(np.asarray(f, dtype=float), method=method),
+                       dtype=float).reshape(-1)
             for f in frames]
     if not rows:
         return np.empty((0, len(np.asarray(calibration.centers))), dtype=float)
@@ -58,7 +60,7 @@ def per_site_fidelity(counts: np.ndarray, thresholds: np.ndarray) -> np.ndarray:
 
 
 def _render_figures(folder, *, counts, thresholds, fidelity, centers, template,
-                    threshold_method, timestamp) -> dict:
+                    threshold_method, timestamp, by_method=None) -> dict:
     """Draw the report PNGs through the registered FRONTEND viewer; ``{}`` when headless
     (no viewer registered) -- the data bundle below is still written either way."""
     plotter = active_plotter()
@@ -67,10 +69,31 @@ def _render_figures(folder, *, counts, thresholds, fidelity, centers, template,
     try:
         return dict(plotter.save_calibration_report(
             folder, counts=counts, thresholds=thresholds, fidelity=fidelity,
-            centers=centers, template=template,
+            centers=centers, template=template, by_method=by_method,
             threshold_method=str(threshold_method), timestamp=str(timestamp)) or {})
     except Exception:
         return {}
+
+
+def _by_method_report(calibration, readout_frames) -> dict:
+    """For every readout method the calibration carries (box / per-site PSF / uniform PSF),
+    the per-site counts (via that method's ``calibration.signals``) + that method's
+    thresholds + per-site fidelity -- so the report shows one grid per method to compare."""
+    out: dict[str, dict] = {}
+    try:
+        methods = tuple(calibration.methods())
+    except Exception:
+        methods = ()
+    for m in methods:
+        try:
+            counts = per_site_counts(calibration, readout_frames, method=m)
+            thr = np.asarray(calibration.thresholds_for(m), dtype=float).reshape(-1)
+        except Exception:
+            continue
+        fid = (per_site_fidelity(counts, thr) if counts.size
+               else np.full(len(np.asarray(calibration.centers)), np.nan))
+        out[str(m)] = {"counts": counts, "thresholds": thr, "fidelity": fid}
+    return out
 
 
 def write_calibration_report(folder, *, calibration, readout_frames, template=None,
@@ -90,10 +113,14 @@ def write_calibration_report(folder, *, calibration, readout_frames, template=No
     counts = per_site_counts(calibration, readout_frames)
     fidelity = (per_site_fidelity(counts, thresholds) if counts.size
                 else np.full(len(centers), np.nan))
+    # one per-site grid PER readout method the calibration carries (box / per-site PSF /
+    # uniform PSF) -- the experimenter compares the three readout models side by side.
+    by_method = _by_method_report(calibration, readout_frames)
 
     paths = _render_figures(
         folder, counts=counts, thresholds=thresholds, fidelity=fidelity, centers=centers,
-        template=template, threshold_method=threshold_method, timestamp=timestamp)
+        template=template, threshold_method=threshold_method, timestamp=timestamp,
+        by_method=by_method)
 
     npz_path = folder / "calibration.npz"
     np.savez(npz_path, centers=centers, thresholds=thresholds,

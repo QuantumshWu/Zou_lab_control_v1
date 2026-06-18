@@ -64,9 +64,11 @@ def test_calibrate_writes_distribution_and_fidelity_report(tmp_path):
         report_dir = Path(task.result["report_dir"])
         assert report_dir.exists()
         assert report_dir.parent == folder
-        # the rb87-style artifacts all landed there: figures (drawn via the frontend) + the
-        # reloadable calibration + the numeric bundle
-        for name in ("site_distribution_grid.png", "global_distribution.png",
+        # the rb87-style artifacts all landed there: ONE per-site distribution grid PER
+        # readout method (box / per-site PSF / uniform PSF -- the cali computes all three),
+        # the pooled distribution + site map, the reloadable calibration + numeric bundle.
+        for name in ("site_distribution_box.png", "site_distribution_psf.png",
+                     "site_distribution_uniform_psf.png", "global_distribution.png",
                      "site_map.png", "calibration.npz", "calibration.json", "summary.json"):
             assert (report_dir / name).exists(), name
         # the report carries a FINITE per-site fidelity (the distributions separate)

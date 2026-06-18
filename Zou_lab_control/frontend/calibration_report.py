@@ -37,20 +37,39 @@ def _agg_figure() -> Figure:
     return fig
 
 
-def _save(fig: Figure, path: Path, *, dpi: int = 200) -> str:
+# Saved report figures use a HIGH dpi so the per-site detail (overlapping histograms,
+# threshold lines) stays crisp when zoomed -- independent of the live on-screen render dpi.
+_SAVE_DPI = 300
+
+# Readout-method key -> human label for the per-method grid titles (the calibration carries
+# all three; the report shows one grid each so the experimenter compares them side by side).
+_METHOD_LABELS = {"box": "box (square ROI)", "psf": "per-site PSF", "uniform_psf": "uniform PSF"}
+
+
+def _save(fig: Figure, path: Path, *, dpi: int = _SAVE_DPI) -> str:
     fig.savefig(str(path), dpi=dpi, facecolor="white")
     return str(path)
 
 
+def _site_grid(per_method_counts, thresholds, fidelity, *, title) -> Figure:
+    """One per-site distribution grid (one histogram per site, threshold line + fidelity)."""
+    return SiteHistogramGrid(
+        per_method_counts, thresholds=list(thresholds), site_fidelities=list(fidelity),
+        labels=("Readout counts", "Shots"), title=title,
+        fig=_agg_figure(), interactions=False).show(display=False).fig
+
+
 def save_calibration_report(folder, *, counts, thresholds, fidelity, centers,
                             template=None, threshold_method: str = "otsu",
-                            timestamp: str = "") -> dict:
+                            timestamp: str = "", by_method=None) -> dict:
     """Render the calibration report PNGs into ``folder`` via the frontend plot types and
     return ``{name: path}``.
 
-    * ``site_distribution_grid.png`` -- one histogram per site with its calibrated
-      threshold + held-out fidelity, on the reference :class:`SiteHistogramGrid` (the
-      same aligned, never-overlapping grid the readout site-grid uses).
+    * ``site_distribution_<method>.png`` -- one per-site histogram grid PER readout method
+      the calibration carries (box / per-site PSF / uniform PSF), each with that method's
+      per-site signals + thresholds + held-out fidelity, on the reference
+      :class:`SiteHistogramGrid`.  ``by_method`` is ``{key: {counts, thresholds, fidelity}}``;
+      without it a single ``site_distribution_grid.png`` is drawn from ``counts``.
     * ``global_distribution.png`` -- the pooled readout-count distribution on a
       :class:`HistogramFigure` (its bimodal fit + fidelity readout come for free).
     * ``site_map.png`` -- the averaged reference template with the fitted site rings on a
@@ -66,15 +85,26 @@ def save_calibration_report(folder, *, counts, thresholds, fidelity, centers,
     centers = None if centers is None else np.asarray(centers, dtype=float)
 
     paths: dict[str, str] = {}
-    if counts.size:
+    if by_method:
+        # one per-site grid per readout method (box / per-site PSF / uniform PSF).
+        for key, m in by_method.items():
+            mc = np.atleast_2d(np.asarray(m["counts"], dtype=float))
+            if not mc.size:
+                continue
+            mthr = np.asarray(m["thresholds"], dtype=float).reshape(-1)
+            mfid = np.asarray(m["fidelity"], dtype=float).reshape(-1)
+            per_site = [mc[:, k][np.isfinite(mc[:, k])] for k in range(mc.shape[1])]
+            label = _METHOD_LABELS.get(str(key), str(key))
+            fig = _site_grid(per_site, mthr, mfid,
+                             title=f"Per-site readout distribution -- {label} (line = threshold)")
+            paths[f"site_distribution_{key}"] = _save(fig, folder / f"site_distribution_{key}.png")
+    elif counts.size:
         per_site = [counts[:, k][np.isfinite(counts[:, k])] for k in range(counts.shape[1])]
-        grid = SiteHistogramGrid(
-            per_site, thresholds=list(thresholds), site_fidelities=list(fidelity),
-            labels=("Readout counts", "Shots"),
-            title="Per-site readout distribution (line = threshold)",
-            fig=_agg_figure(), interactions=False).show(display=False)
-        paths["site_distribution_grid"] = _save(grid.fig, folder / "site_distribution_grid.png")
+        fig = _site_grid(per_site, thresholds, fidelity,
+                         title="Per-site readout distribution (line = threshold)")
+        paths["site_distribution_grid"] = _save(fig, folder / "site_distribution_grid.png")
 
+    if counts.size:
         flat = counts.reshape(-1)
         flat = flat[np.isfinite(flat)]
         median_thr = float(np.nanmedian(thresholds)) if thresholds.size else None
