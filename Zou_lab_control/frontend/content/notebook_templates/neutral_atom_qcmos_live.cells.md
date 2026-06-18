@@ -53,7 +53,7 @@ zf.plot(np.column_stack([xx.ravel(), yy.ravel()]), frame.ravel(),
 
 框架的 `CameraMeasurement`（相机 measurement 逻辑节点）：每个 shot 抓一帧、publish 成信号 `frame`。它的**数据源就是相机**——在看板里点这张 2D 面板的 **Edit…**，标签里的 **Acquisition** 段会列出相机的 `exposure` / `region`（ROI 端点），改了点 **Apply** 就**实时重配相机**（不用重开）。
 
-控制台是**解耦**的：plot 面板是纯视图，只有**连了 signal 且产它的节点在跑**才显示数据。所以这张 2D 面板用 `source="frame"` 显式连到 `frame`，并把相机 measurement 节点交给 `running_nodes=`（开窗即自动 `start`）。
+控制台是**解耦**的：plot 面板是纯视图，只有**连了 signal 且产它的节点在跑**才显示数据。所以这张 2D 面板用 `source="value = frame"` 显式连到 `frame`（source 是一行赋给 `value` 的 Python，等价于在 Setting 里把 signal 槽选成 `frame`），并把相机 measurement 节点交给 `running_nodes=`（开窗即自动 `start`）。
 
 `%gui qt` 让 Jupyter 在 cell 之间替 Qt 窗口跑事件循环（看板的刷新 timer 才会动）；抓帧在节点的后台线程里，经线程安全的 `SignalHub` 交给看板。`rate_hz` 是抓帧节奏，真正多快还受触发频率 + 曝光限制。
 
@@ -68,7 +68,7 @@ node = CameraMeasurement(hub, cam).start(rate_hz=4)
 
 state = zf.TaskConsoleState(
     name="qcmos_live",
-    panels=[zf.PanelConfig(kind="2d", title="qCMOS live", size="2x2", source="frame")],
+    panels=[zf.PanelConfig(kind="2d", title="qCMOS live", size="2x2", source="value = frame")],
 )
 console = zf.show_task_console(hub=hub, state=state, running_nodes=[node])
 console

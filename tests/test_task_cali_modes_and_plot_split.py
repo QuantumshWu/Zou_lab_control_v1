@@ -4,12 +4,14 @@ These are exactly the behaviours that silently regress, so they are pinned here
 (the repo rule: a mechanically-enforceable requirement is a test, not a doc line):
 
   * the calibrate TASK really honours its declared params -- it is NOT cosmetic:
-      - source = live  -> acquire now (camera + imaging pulse at the given exposure);
-      - source = folder-> calibrate from saved frames in a folder;
+      - source = "live"             -> acquire now (camera + imaging pulse at the given exposure)
+                                       and write the report (incl. a reloadable calibration.json) to `folder`;
+      - source = "saved frames"     -> calibrate from frames already in `folder`;
+      - source = "saved calibration"-> reload a finished calibration.json from `folder`, NO acquisition;
       - mode = box / per-site PSF / uniform PSF -> the three sitemap readout models
         (resolved to box / psf / uniform_psf);
       - threshold = otsu / bimodal;
-      - save_path -> persist, load_path -> restore WITHOUT re-acquiring.
+      - one `folder` (input + output, never blank) replaces the old save_path/load_path/data_dir.
   * the measurement PLOT split: a measurement called from the NOTEBOOK API defaults
     display=True (it auto-opens its default plot); the SAME measurement driven as a
     GUI/task logic node is plot=False -- it only publishes to the hub (the user wires
@@ -77,21 +79,26 @@ def test_calibrate_task_live_each_mode_and_threshold(mode, resolved, threshold_m
         exp.close()
 
 
-def test_calibrate_task_save_then_load_skips_acquisition(tmp_path):
+def test_calibrate_task_live_then_reload_skips_acquisition(tmp_path):
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
 
     exp = _calibrated()
     try:
-        path = tmp_path / "cal.npz"
+        folder = tmp_path / "cal"
         made = exp.readout.calibrate_task(
-            SignalHub(), mode="box", save_path=str(path),
+            SignalHub(), source="live", mode="box", folder=str(folder),
             calibration_frames=3, threshold_frames=12)
         made.run_to_completion()
-        assert path.exists()
+        # a live run writes its report (incl. a reloadable calibration.json) to a
+        # timestamped sub-folder of `folder`
+        report_dir = Path(made.result["report_dir"])
+        assert report_dir.exists() and (report_dir / "calibration.json").exists()
 
-        # load_path restores the SAME calibration with no acquisition
-        loaded = exp.readout.calibrate_task(SignalHub(), load_path=str(path))
+        # source="saved calibration" restores the SAME calibration with NO acquisition
+        loaded = exp.readout.calibrate_task(
+            SignalHub(), source="saved calibration", folder=str(report_dir))
         loaded.run_to_completion()
+        assert loaded.result["report_dir"] == ""          # reload does not write a new report
         assert np.allclose(np.asarray(loaded.calibration.centers),
                            np.asarray(made.calibration.centers))
     finally:
@@ -129,7 +136,7 @@ def test_calibrate_task_live_uses_two_saved_pulse_programs(tmp_path):
         exp.close()
 
 
-def test_calibrate_task_folder_source(tmp_path):
+def test_calibrate_task_saved_frames_source(tmp_path):
     import Zou_lab_control.neutral_atom as na
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
 
@@ -138,8 +145,8 @@ def test_calibrate_task_folder_source(tmp_path):
         folder = tmp_path / "run"
         na.write_virtual_run(str(folder), groups=8, grid_shape=(3, 4), seed=0)
         task = exp.readout.calibrate_task(
-            SignalHub(), source="folder", data_dir=str(folder), mode="box")
-        assert task.source == "folder"
+            SignalHub(), source="saved frames", folder=str(folder), mode="box")
+        assert task.source == "saved frames"
         task.run_to_completion()
         assert np.asarray(task.calibration.centers).shape == (12, 2)
     finally:

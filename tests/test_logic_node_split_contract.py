@@ -86,10 +86,9 @@ def test_calibrate_task_produces_calibration_and_drives_detect_processor(tmp_pat
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
     hub = SignalHub()
     try:
-        cal_path = tmp_path / "cal.npz"
         task = CalibrateReadoutTask(
             hub, exp.devices.camera, sequencer=exp.devices.sequencer, grid_shape=(3, 4),
-            calibration_frames=4, threshold_frames=20, mode="box", save_path=str(cal_path))
+            calibration_frames=4, threshold_frames=20, mode="box", folder=str(tmp_path / "cal"))
         task.run_to_completion()
 
         assert task.finished and task.calibration is not None
@@ -99,8 +98,8 @@ def test_calibrate_task_produces_calibration_and_drives_detect_processor(tmp_pat
         assert "frame" in task.output.names() and task.output.progress == 1.0  # mid-run buffer
         assert {"centers", "thresholds", "n_sites"} <= set(task.result)         # result on instance
         assert task.result["n_sites"] == 12
-        # artifact persisted
-        saved = np.load(cal_path)
+        # artifact persisted: the report's numeric bundle in the timestamped run sub-folder
+        saved = np.load(Path(task.result["report_dir"]) / "calibration.npz")
         assert saved["centers"].shape == (12, 2) and saved["thresholds"].shape == (12,)
 
         # composition: the task's calibration drives an OccupancyProcessor on live frames

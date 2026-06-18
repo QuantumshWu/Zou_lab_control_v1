@@ -24,11 +24,24 @@ from ..task_registry import task
 # sitemap readout model (box / per-site PSF / uniform PSF -> one shared kernel);
 # ``threshold_method`` is otsu vs bimodal; ``save_path`` / ``load_path`` persist or
 # restore the resulting centers+thresholds (TrapCalibration.save/load).
+# EVERY parameter carries a REAL default (no blank fields): ``folder`` is one data
+# directory used for both input and output (a real path the experimenter sees up front,
+# like Confocal_GUIv2's configured data dir) and ``source`` decides how it is used; the
+# pulse-program overrides default to the sentinel "built-in" (= the built-in imaging
+# sequence at the given exposure), so a path field is never empty/ambiguous.
+DEFAULT_DATA_DIR = "calibrations"      # data + report folder (timestamped run subfolders)
+BUILTIN_PULSE = "built-in"             # sentinel: use the built-in imaging sequence
+
 CALIBRATE_PARAMS = (
-    ParamDecl("source", "source", "choice", default="live", choices=("live", "folder"),
-              tooltip="live = acquire now (camera + pulse); folder = use saved images from a folder."),
-    ParamDecl("data_dir", "data folder", "text", default="",
-              tooltip="Folder of saved frames (used when source = folder)."),
+    ParamDecl("source", "source", "choice", default="live",
+              choices=("live", "saved frames", "saved calibration"),
+              tooltip="live = acquire now (camera + pulse) and SAVE the result under `folder`; "
+                      "saved frames = calibrate from frames already in `folder`; "
+                      "saved calibration = reload a finished calibration.json from `folder` (no acquisition)."),
+    ParamDecl("folder", "folder", "text", default=DEFAULT_DATA_DIR, required=True,
+              tooltip="The ONE data directory (input + output).  A live run writes its calibration "
+                      "+ distribution/fidelity report to a timestamped sub-folder here; the saved-* "
+                      "sources read frames / calibration.json from here."),
     ParamDecl("mode", "mode", "choice", default="box",
               choices=("box", "per-site PSF", "uniform PSF"),
               tooltip="box = square ROI; per-site PSF = one matched filter per site; "
@@ -37,27 +50,22 @@ CALIBRATE_PARAMS = (
               tooltip="otsu = single split; bimodal = dark/bright Gaussian-core fit per site."),
     ParamDecl("sitemap_exposure", "sitemap exposure", "float", default=0.05, unit="s", lo=0.0, hi=10.0,
               tooltip="LONGER readout duration for the site + PSF calibration pass (more photons "
-                      "-> cleaner centroids/PSF).  Used when no sitemap pulse is given."),
-    ParamDecl("sitemap_pulse", "sitemap pulse", "text", default="",
-              tooltip="Optional saved pulse program (a PulseTableState .json from the pulse GUI) for "
-                      "the SITE/PSF acquisition (the long readout).  Blank = default imaging "
-                      "sequence at the sitemap exposure."),
+                      "-> cleaner centroids/PSF).  Used unless a sitemap pulse program is given."),
+    ParamDecl("sitemap_pulse", "sitemap pulse", "text", default=BUILTIN_PULSE,
+              tooltip="'built-in' = the default imaging sequence at the sitemap exposure; or a saved "
+                      "PulseTableState .json (from the pulse GUI) for the SITE/PSF acquisition."),
     ParamDecl("readout_exposure", "readout exposure", "float", default=0.02, unit="s", lo=0.0, hi=10.0,
               tooltip="ACTUAL readout duration for the threshold pass (thresholds are learnt under "
-                      "the real readout conditions).  Used when no readout pulse is given."),
-    ParamDecl("readout_pulse", "readout pulse", "text", default="",
-              tooltip="Optional saved pulse program for the ACTUAL-READOUT acquisition (thresholds). "
-                      "Blank = default imaging sequence at the readout exposure."),
+                      "the real readout conditions).  Used unless a readout pulse program is given."),
+    ParamDecl("readout_pulse", "readout pulse", "text", default=BUILTIN_PULSE,
+              tooltip="'built-in' = the default imaging sequence at the readout exposure; or a saved "
+                      "PulseTableState .json for the ACTUAL-READOUT acquisition (thresholds)."),
     ParamDecl("calibration_frames", "reference frames", "int", default=30, lo=1, hi=4000,
               tooltip="Reference (long-exposure) frames averaged into the site-finding template."),
     ParamDecl("threshold_frames", "readout frames", "int", default=100, lo=2, hi=20000,
               tooltip="Short-readout frames whose per-site count distribution sets the thresholds."),
     ParamDecl("roi_radius", "ROI radius", "int", default=1, lo=1, hi=64,
               tooltip="Per-site square ROI half-width in pixels (box counting / detection geometry)."),
-    ParamDecl("save_path", "save to", "text", default="",
-              tooltip="Save the calibration (centers + thresholds) to this .npz/.json path."),
-    ParamDecl("load_path", "load from", "text", default="",
-              tooltip="Load an existing calibration from this path INSTEAD of acquiring."),
 )
 
 
@@ -65,10 +73,12 @@ CALIBRATE_PARAMS = (
 def calibrate_readout(readout) -> TaskSpec:
     """The readout-calibration task (sitemap + per-site thresholds).
 
-    Its tunable parameters (source / mode / threshold / frame counts / save / load)
-    are declared in :data:`CALIBRATE_PARAMS` and threaded into the built
-    :class:`~..logic.CalibrateReadoutTask`; mid-run it streams the template frame to
-    its dedicated panel under the ``cal_`` namespace (``cal_frame``)."""
+    Its tunable parameters (source / folder / mode / threshold / frame counts) are
+    declared in :data:`CALIBRATE_PARAMS` -- EVERY one with a real default (no blank
+    fields): one ``folder`` (default ``calibrations``) is the data + report directory,
+    and ``source`` decides live-acquire / saved-frames / saved-calibration.  They are
+    threaded into the built :class:`~..logic.CalibrateReadoutTask`; mid-run it streams the
+    template frame to its dedicated panel under the ``cal_`` namespace (``cal_frame``)."""
 
     def build(hub, *, prefix: str = "cal_", **param_values):
         return readout.calibrate_task(hub, prefix=prefix, **param_values)

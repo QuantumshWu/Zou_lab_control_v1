@@ -138,8 +138,10 @@ def _register_neutral_atom_viewer() -> None:
         from types import SimpleNamespace
 
         from Zou_lab_control._viewer_registry import register_plotter
+        from .calibration_report import save_calibration_report
 
-        register_plotter(SimpleNamespace(plot=plot, display_figure=display_figure, run=run))
+        register_plotter(SimpleNamespace(plot=plot, display_figure=display_figure, run=run,
+                                         save_calibration_report=save_calibration_report))
     except Exception:  # pragma: no cover - plotting registration must never block import
         pass
 

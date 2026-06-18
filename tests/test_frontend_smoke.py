@@ -1467,16 +1467,17 @@ def test_task_console_signal_picker_and_declarative_params(monkeypatch):
     card._refresh_signal_combo()
     names = [card.signal_combo.itemText(i) for i in range(card.signal_combo.count())]
     datas = [card.signal_combo.itemData(i) for i in range(card.signal_combo.count())]
-    assert names[0] == "(expression)"
+    assert names[0] == "(none)"                            # blank = turn the slot off
     # items are LABELLED "<name> — <source node>  [<shape>]"; the bare signal name is the
-    # item DATA (what `value = <name>` is written from), so check the data list.
+    # item DATA (what signal[0] is filled from), so check the data list.
     assert "rate_grid" in datas and "frame" in datas
-    assert card.signal_combo.currentData() == "frame"      # mirrors `value = frame`
+    assert card.signal_combo.currentData() == "frame"      # the 2d card's primary slot = frame
 
     idx = datas.index("rate_grid")
     card.signal_combo.setCurrentIndex(idx)
-    card._on_signal_pick(idx)
-    assert card.config.source == "value = rate_grid"
+    card._on_slot_pick(0)                                   # pick the primary input slot
+    assert card.config.inputs[0] == "rate_grid"            # slot 0 now names rate_grid
+    assert card.config.source == "value = signal[0]"       # primary slot drives signal[0]
     console.refresh_once()
     assert card.status.text().startswith("shot ")           # applied instantly + healthy
 
@@ -1775,8 +1776,8 @@ def test_edit_area_select_fills_measurement_scan_range(monkeypatch):
 
 
 def test_task_console_sites_panel_bad_centers_isolated(monkeypatch):
-    """A site-map panel pointing at a missing centers signal reports the error
-    on ITS status line; the other panels keep refreshing."""
+    """A site-map panel whose centres INPUT SLOT (signal[1]) points at a missing signal
+    reports the error on ITS status line; the other panels keep refreshing."""
 
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
@@ -1784,7 +1785,7 @@ def test_task_console_sites_panel_bad_centers_isolated(monkeypatch):
 
     console = dt.demo_console(shots=10)
     sites = next(c for c in console.cards if c.config.kind == "sites")
-    sites._set_param("centers", "no_such_signal")
+    sites.config.inputs[1] = "no_such_signal"      # the centres slot now names a missing signal
     console.refresh_once()
     assert "no_such_signal" in sites.status.text()
     healthy = [c for c in console.cards if c is not sites]

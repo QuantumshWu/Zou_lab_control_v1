@@ -609,6 +609,8 @@ class CalibrateReadoutTask(Task):
     # threshold_method) pair: box+otsu, per-site/uniform PSF + (otsu|bimodal).
     MODE_TO_SITEMAP_METHOD = {"box": "box", "per-site PSF": "psf", "uniform PSF": "uniform_psf"}
 
+    BUILTIN_PULSE = "built-in"          # sentinel: use the built-in imaging sequence
+
     @classmethod
     def _coerce_mode(cls, mode: str) -> str:
         """Validate the user-facing mode name (single source for __init__ + edits)."""
@@ -616,6 +618,13 @@ class CalibrateReadoutTask(Task):
         if mode not in cls.MODE_TO_SITEMAP_METHOD:
             raise ValueError(f"mode {mode!r} must be one of {tuple(cls.MODE_TO_SITEMAP_METHOD)}.")
         return mode
+
+    @classmethod
+    def _coerce_pulse(cls, pulse) -> str | None:
+        """A pulse path of blank / None / the ``built-in`` sentinel means: use the
+        built-in imaging sequence (returns None); anything else is a saved-program path."""
+        text = str(pulse or "").strip()
+        return None if text in ("", cls.BUILTIN_PULSE) else text
 
     def output_specs(self) -> tuple[SignalSpec, ...]:
         """What the calibration PRODUCES (off the hub) + streams mid-run -- keyed by the
@@ -634,11 +643,18 @@ class CalibrateReadoutTask(Task):
                  sitemap_pulse: str | None = None, readout_pulse: str | None = None,
                  calibration_frames: int = 30, threshold_frames: int = 100,
                  mode: str = "box", threshold_method: str = "otsu",
-                 source: str = "live", data_dir: str | None = None,
-                 save_path: str | None = None, load_path: str | None = None, prefix: str = ""):
+                 source: str = "live", folder: str = "calibrations",
+                 calibration_sink=None, prefix: str = ""):
         super().__init__(hub, prefix=prefix)
         self.camera = camera
         self.sequencer = sequencer
+        # Where the finished calibration is HANDED BACK to: set by readout.calibrate_task
+        # to write the session calibration (``readout.current``), so a decoupled live
+        # OccupancyProcessor picks it up the instant this task completes -- the
+        # "cali -> occupancy" wiring with NO path to type (the bug this fixes: the task
+        # produced a calibration but never published it, so occupancy stayed on a stale /
+        # empty calibration and showed no sites).
+        self.calibration_sink = calibration_sink
         self.grid_shape = grid_shape_tuple(grid_shape)
         self.roi_radius = int(roi_radius)
         # TWO imaging pulses: the SITEMAP/PSF pass uses a LONGER readout duration (more
@@ -649,18 +665,19 @@ class CalibrateReadoutTask(Task):
         # the default imaging sequence at the corresponding exposure.
         self.sitemap_exposure = float(sitemap_exposure)
         self.readout_exposure = float(readout_exposure)
-        self.sitemap_pulse = sitemap_pulse or None
-        self.readout_pulse = readout_pulse or None
+        # A pulse path of "" / None / the "built-in" sentinel = use the built-in imaging
+        # sequence at the exposure (so the UI field is never an ambiguous blank).
+        self.sitemap_pulse = self._coerce_pulse(sitemap_pulse)
+        self.readout_pulse = self._coerce_pulse(readout_pulse)
         self.calibration_frames = max(1, int(calibration_frames))
         self.threshold_frames = max(2, int(threshold_frames))
         # ``mode`` is the user-facing name (box / per-site PSF / uniform PSF); the
         # ``method`` @property resolves it to the sitemap method (box|psf|uniform_psf).
         self.mode = self._coerce_mode(mode)
         self.threshold_method = str(threshold_method)
+        # ONE folder for input + output (no blank paths); ``source`` decides how it's used.
         self.source = str(source)
-        self.data_dir = data_dir
-        self.save_path = save_path
-        self.load_path = load_path
+        self.folder = str(folder or "calibrations")
         self.calibration = None
 
     @property
@@ -669,14 +686,15 @@ class CalibrateReadoutTask(Task):
         return self.MODE_TO_SITEMAP_METHOD[self.mode]
 
     def acquisition_parameters(self) -> dict[str, object]:
-        """The calibrate task's tunable parameters (source + sitemap grid + frame
-        counts + mode + threshold + save/load paths), as ``{name: current}`` --
-        shown in the panel's Edit and applied before the next Run."""
+        """The calibrate task's tunable parameters (source + folder + sitemap grid +
+        frame counts + mode + threshold), as ``{name: current}`` -- shown in the panel's
+        Edit and applied before the next Run.  Every value is concrete (no blank): a
+        built-in pulse reads back as the ``built-in`` sentinel, the folder as its path."""
         return {
             "source": str(self.source),
-            "data_dir": "" if self.data_dir is None else str(self.data_dir),
-            "sitemap_pulse": "" if self.sitemap_pulse is None else str(self.sitemap_pulse),
-            "readout_pulse": "" if self.readout_pulse is None else str(self.readout_pulse),
+            "folder": str(self.folder),
+            "sitemap_pulse": self.sitemap_pulse or self.BUILTIN_PULSE,
+            "readout_pulse": self.readout_pulse or self.BUILTIN_PULSE,
             "grid_shape": tuple(self.grid_shape),
             "sitemap_exposure": float(self.sitemap_exposure),
             "readout_exposure": float(self.readout_exposure),
@@ -685,19 +703,17 @@ class CalibrateReadoutTask(Task):
             "threshold_frames": int(self.threshold_frames),
             "mode": str(self.mode),
             "threshold_method": str(self.threshold_method),
-            "save_path": "" if self.save_path is None else str(self.save_path),
-            "load_path": "" if self.load_path is None else str(self.load_path),
         }
 
     def set_acquisition_parameters(self, **values) -> None:
         if "source" in values:
             self.source = str(values["source"])
-        if "data_dir" in values:
-            self.data_dir = str(values["data_dir"]) or None
+        if "folder" in values:
+            self.folder = str(values["folder"]) or "calibrations"
         if "sitemap_pulse" in values:
-            self.sitemap_pulse = str(values["sitemap_pulse"]) or None
+            self.sitemap_pulse = self._coerce_pulse(values["sitemap_pulse"])
         if "readout_pulse" in values:
-            self.readout_pulse = str(values["readout_pulse"]) or None
+            self.readout_pulse = self._coerce_pulse(values["readout_pulse"])
         if "grid_shape" in values:
             self.grid_shape = grid_shape_tuple(values["grid_shape"])
         if "sitemap_exposure" in values:
@@ -714,33 +730,30 @@ class CalibrateReadoutTask(Task):
             self.mode = self._coerce_mode(values["mode"])
         if "threshold_method" in values:
             self.threshold_method = str(values["threshold_method"])
-        if "save_path" in values:
-            self.save_path = str(values["save_path"]) or None
-        if "load_path" in values:
-            self.load_path = str(values["load_path"]) or None
 
     def run(self, out: "TaskOutput") -> dict:
-        # Load an existing calibration outright (no acquisition) when a load path
-        # is given -- the user reuses a saved centers+thresholds artifact.
-        if self.load_path:
+        # "saved calibration": reload a finished calibration.json from the folder (no
+        # acquisition) -- the user reuses a saved centers+thresholds artifact.
+        if str(self.source) == "saved calibration":
             from ..core.calibration import TrapCalibration
-            self.calibration = TrapCalibration.load(self.load_path)
-            out.publish(progress=1.0)
+            self.calibration = TrapCalibration.load(self._saved_calibration_path())
+            self._adopt()
+            out.publish(progress=1.0, stage=f"loaded calibration from {self.folder}")
             centers = np.asarray(self.calibration.centers, dtype=float)
             thr = np.asarray(self.calibration.thresholds, dtype=float).reshape(-1)
-            return {"centers": centers, "thresholds": thr, "n_sites": float(len(centers))}
-        if str(self.source) == "folder":
+            return {"centers": centers, "thresholds": thr, "n_sites": float(len(centers)),
+                    "report_dir": ""}
+        if str(self.source) == "saved frames":
             calibration = self._run_from_folder(out)
         else:
             calibration = self._run_live(out)
         self.calibration = calibration
+        self._adopt()                            # hand the calibration to the session NOW
         centers = np.asarray(self.calibration.centers, dtype=float)
         thr = np.asarray(self.calibration.thresholds, dtype=float).reshape(-1)
-        if self.save_path and Path(self.save_path).suffix.lower() in (".npz", ".json"):
-            # An explicit .npz / .json path saves the loadable calibration there too.
-            self.calibration.save(self.save_path)
         # ALWAYS write the rb87-style report (per-site distribution + fidelity + site map
-        # + npz/json) to a folder, so a calibration leaves reviewable artifacts on disk.
+        # + a loadable calibration.json/npz) to a timestamped sub-folder of ``folder``, so
+        # a calibration leaves reviewable + reloadable artifacts on disk.
         out.publish(progress=0.98, stage="writing distribution + fidelity report")
         self.report = self._write_report(self.report_dir())
         folder = self.report.get("folder") if isinstance(self.report, dict) else None
@@ -748,17 +761,30 @@ class CalibrateReadoutTask(Task):
         return {"centers": centers, "thresholds": thr, "n_sites": float(len(centers)),
                 "report_dir": str(folder or "")}
 
+    def _saved_calibration_path(self) -> "Path":
+        """Locate the saved calibration to reload from ``folder``: the folder itself if it
+        is a .json/.npz file, else ``folder/calibration.json`` (the report's artifact)."""
+        p = Path(self.folder)
+        if p.suffix.lower() in (".json", ".npz"):
+            return p
+        return p / "calibration.json"
+
+    def _adopt(self) -> None:
+        """Hand the just-produced calibration to the session via ``calibration_sink`` so a
+        decoupled OccupancyProcessor (reading ``readout.current``) starts judging sites
+        immediately -- the cali->occupancy connection, no path to type."""
+        if self.calibration_sink is not None and self.calibration is not None:
+            self.calibration_sink(self.calibration)
+
     def report_dir(self) -> "Path":
-        """The folder this calibration's artifacts are written to.  An explicit
-        ``save_path`` directory (or the parent of a ``save_path`` file) is honoured; with
-        none, a timestamped ``calibrations/calibration_<stamp>/`` under the cwd is used --
-        so figures + calibration always land somewhere the experimenter can find."""
+        """A timestamped run sub-folder under ``folder`` (e.g.
+        ``calibrations/calibration_20260617_213000/``), so each calibration's figures +
+        loadable calibration land in their own findable place and never overwrite a prior
+        run.  ``folder`` always has a real default ("calibrations"), so this is never
+        ambiguous."""
         from datetime import datetime
-        if self.save_path:
-            p = Path(self.save_path)
-            return p if p.suffix == "" else p.parent / f"{p.stem}_report"
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        return Path("calibrations") / f"calibration_{stamp}"
+        return Path(self.folder) / f"calibration_{stamp}"
 
     def _write_report(self, folder) -> dict:
         """Write the per-site distribution / fidelity / site-map report for THIS run's
@@ -845,9 +871,9 @@ class CalibrateReadoutTask(Task):
         run, fit the sitemap from the reference template, then per-site thresholds."""
         from .calibration import calibrate_sitemap_from_images, calibrate_threshold_from_images
         from .imageio import index_run
-        if not self.data_dir:
-            raise ValueError("source='folder' needs a data_dir folder path.")
-        run = index_run(self.data_dir, "img")
+        if not self.folder:
+            raise ValueError("source='saved frames' needs a folder of saved frames.")
+        run = index_run(self.folder, "img")
         template_frames = list(run.template_frames())
         if template_frames:
             out.publish(frame=np.asarray(template_frames[-1], dtype=float), progress=0.4)

@@ -123,6 +123,21 @@ def _as_data_y(data_y, n: int) -> np.ndarray:
     return y
 
 
+def site_ring_radius(centers) -> float:
+    """The occupancy-ring radius (camera px) for a site map: 30 % of the nearest
+    inter-site spacing, with a 1.5 px floor, so the rings scale with the lattice and
+    never overlap.  ONE rule shared by the live console site map and the calibration
+    report's site map, so the two never draw different-sized rings."""
+    c = np.asarray(centers, dtype=float)
+    spacing = 6.0
+    if c.ndim == 2 and len(c) > 1:
+        deltas = np.linalg.norm(np.diff(c[:, :2], axis=0), axis=1)
+        deltas = deltas[deltas > 0]
+        if deltas.size:
+            spacing = float(np.min(deltas))
+    return max(1.5, 0.3 * spacing)
+
+
 def _square_extent(extent: Sequence[float]) -> list[float]:
     left, right, bottom, upper = extent
     width = right - left
@@ -2481,6 +2496,7 @@ __all__ = [
     "panel_size_cells",
     "plot",
     "site_histogram_grid",
+    "site_ring_radius",
     "pulse_plot_channels",
     "pulse_plot_spec",
     "pulse_repeat_marker",

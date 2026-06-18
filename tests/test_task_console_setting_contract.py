@@ -319,37 +319,41 @@ def test_no_control_tab_monitor_only():
 
 
 def test_setting_keeps_display_params_functional_scalars_go_to_edit():
-    """Setting/Edit never DUPLICATE a parameter: the Setting popup renders the DISPLAY
-    params -- the colormap chooser AND each ``kind="signal"`` INPUT picker (the site
-    map's centers / image source comboboxes, so all of a multi-input plot's signal
-    slots are chosen together) -- while FUNCTIONAL scalar params (length / bins) are
-    rendered in the panel's Edit tab instead.  So a 2d panel's Setting shows cmap but
-    NOT length, and a monitor panel's Setting shows NO functional spec widget."""
-    from Zou_lab_control.frontend.task_console import PANEL_PARAMS
+    """Setting/Edit never DUPLICATE a parameter, and a plot's signal INPUTS are SLOTS,
+    not params: the Setting popup renders the colormap chooser (the only display param)
+    plus ONE signal picker per :func:`panel_input_slots` slot (signal[0], signal[1], ...),
+    while FUNCTIONAL scalar params (length / bins) live in the panel's Edit tab.  So a 2d
+    panel's Setting shows cmap but NOT length; a monitor panel shows no param widget; and
+    the site map shows its THREE input-slot pickers (occupancy + centers + image)."""
+    from Zou_lab_control.frontend.task_console import PANEL_PARAMS, panel_input_slots
 
-    # display=True iff the spec is the colormap chooser OR a signal-input slot; every
-    # other (scalar) functional param stays in the Edit tab.
+    # the ONLY display=True param is the colormap chooser; every other param is a
+    # FUNCTIONAL scalar that stays in the Edit tab (signal inputs are slots, not params).
     for kind, specs in PANEL_PARAMS.items():
         for spec in specs:
-            should_display = spec.key == "cmap" or spec.kind == "signal"
-            assert spec.display is should_display, (kind, spec.key)
+            assert spec.display is (spec.key == "cmap"), (kind, spec.key)
 
-    # a 2d card's Setting popup renders the colormap chooser (display) but no
-    # functional param widget; a monitor card's Setting renders no param widget.
+    # a 2d card's Setting popup renders the colormap chooser (display) + its ONE signal
+    # slot; a monitor card renders no param widget and one slot.
     img = _card("2d")
     try:
         assert set(img.param_widgets) == {"cmap"}
+        assert len(img.slot_combos) == len(panel_input_slots("2d")) == 1
     finally:
         img.shutdown()
     mon = _card("monitor")
     try:
         assert mon.param_widgets == {}      # 'length' moved to the Edit tab
+        assert len(mon.slot_combos) == 1
     finally:
         mon.shutdown()
-    # the site map's Setting shows all THREE inputs together: cmap + the two signal
-    # pickers (centers + image), so a multi-input plot is fully configured in one place.
+    # the site map's Setting: cmap (display param) + THREE input-slot pickers
+    # (occupancy = signal[0], centers = signal[1], image = signal[2]) chosen together,
+    # so a multi-input plot is fully configured in one place -- centers/image are SLOTS,
+    # not display params.
     sites = _card("sites")
     try:
-        assert set(sites.param_widgets) == {"cmap", "centers", "image"}
+        assert set(sites.param_widgets) == {"cmap"}
+        assert len(sites.slot_combos) == len(panel_input_slots("sites")) == 3
     finally:
         sites.shutdown()

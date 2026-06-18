@@ -42,7 +42,12 @@ def test_qcmos_frame_has_realistic_read_noise_offset_and_shot_noise():
 
 def test_calibrate_writes_distribution_and_fidelity_report(tmp_path):
     pytest.importorskip("matplotlib")
+    pytest.importorskip("PyQt5")
     import Zou_lab_control.neutral_atom as na
+    # Importing the frontend registers the viewer (the viewer-registry seam): the calibrate
+    # task then renders its report PNGs through the FRONTEND plot types (site_histogram_grid
+    # / hist / sites), not hand-rolled matplotlib -- the same path the running console uses.
+    import Zou_lab_control.frontend  # noqa: F401
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
 
     exp = na.connect("virtual", sitemap={"grid_shape": (4, 5), "image_shape": (80, 100)}, seed=5)
@@ -52,19 +57,23 @@ def test_calibrate_writes_distribution_and_fidelity_report(tmp_path):
         task = exp.readout.calibrate_task(
             hub, source="live", mode="box", threshold_method="otsu",
             calibration_frames=10, threshold_frames=40,
-            sitemap_exposure=0.05, readout_exposure=0.02, save_path=str(folder))
+            sitemap_exposure=0.05, readout_exposure=0.02, folder=str(folder))
         task.run_to_completion()
 
-        # the rb87-style artifacts all landed in the folder
+        # the report lands in a timestamped run sub-folder of `folder` (never overwriting)
+        report_dir = Path(task.result["report_dir"])
+        assert report_dir.exists()
+        assert report_dir.parent == folder
+        # the rb87-style artifacts all landed there: figures (drawn via the frontend) + the
+        # reloadable calibration + the numeric bundle
         for name in ("site_distribution_grid.png", "global_distribution.png",
-                     "site_map.png", "calibration.npz", "summary.json"):
-            assert (folder / name).exists(), name
+                     "site_map.png", "calibration.npz", "calibration.json", "summary.json"):
+            assert (report_dir / name).exists(), name
         # the report carries a FINITE per-site fidelity (the distributions separate)
         assert task.report["n_sites"] == exp.devices.trap_array.n_sites
         assert 0.5 <= task.report["mean_fidelity"] <= 1.0
-        bundle = np.load(folder / "calibration.npz")
+        bundle = np.load(report_dir / "calibration.npz")
         assert bundle["counts"].shape[0] == 40                  # the readout frames
         assert np.all(np.isfinite(bundle["thresholds"]))
-        assert task.result["report_dir"] == str(folder)
     finally:
         exp.close()

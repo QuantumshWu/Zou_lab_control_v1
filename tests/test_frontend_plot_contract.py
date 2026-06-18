@@ -169,3 +169,43 @@ def test_grid_plot_is_reusable_for_other_cell_types():
         assert g.to_data_figure().cell(0) is not None           # per-cell DataFigure
     finally:
         plt.close(g.fig)
+
+
+def test_shipped_notebook_template_panel_sources_assign_value():
+    """A shipped notebook template must actually RUN: a ``PanelConfig(source=...)`` is one
+    line of Python that has to assign ``value`` (or be blank = pick later).  A bare signal
+    name like ``source="frame"`` silently never sets ``value`` and the panel only ever shows
+    'assign the panel data to a `value = ...`' -- exactly the kind of stale-doc footgun that
+    breaks the notebook-first story.  Pin every template's panel source to the contract."""
+    from pathlib import Path
+
+    templates = Path(zf.__file__).parent / "content" / "notebook_templates"
+    sources = []
+    for md in templates.glob("*.cells.md"):
+        text = md.read_text(encoding="utf-8")
+        for m in re.finditer(r'source\s*=\s*([\'"])(.*?)\1', text):
+            sources.append((md.name, m.group(2)))
+    assert sources, "expected at least one PanelConfig(source=...) in the shipped templates"
+    bad = [(name, s) for name, s in sources if s.strip() and not s.strip().startswith("value")]
+    assert bad == [], (
+        "these shipped-template panel sources do not assign `value` (the panel would error "
+        f"with 'assign the panel data to a value = ...'): {bad}")
+
+
+def test_notebook_rolling_run_accepts_a_scalar_window():
+    """Notebook-API parity: a ROLLING live trace is sized by its WINDOW, so a notebook
+    user passes the history length as a scalar -- ``zf.run(300, source, kind="monitor")``
+    -- exactly like ``hist`` takes a count, instead of pre-building an x array.  Pins that
+    the rolling kinds accept a scalar window (they used to raise), while a FIXED kind
+    (1d) still requires a real x array (the scalar shortcut is rolling/hist only)."""
+    src = lambda: 0.5                                  # a per-shot scalar source
+    for kind, window in (("monitor", 300), ("monitor-nodist", 120), ("monitor_nodist", 64)):
+        sess = zf.run(window, src, kind=kind, autostart=False, display=False)
+        try:
+            assert sess.data_y.shape == (window, 1)    # a NaN window of the asked length
+            assert bool(np.all(np.isnan(sess.data_y)))  # fills in as shots arrive
+        finally:
+            plt.close(sess.plot.fig)
+    # a fixed (append) kind has no window meaning -> a scalar is still rejected
+    with pytest.raises((ValueError, TypeError)):
+        zf.run(50, src, kind="1d", autostart=False, display=False)

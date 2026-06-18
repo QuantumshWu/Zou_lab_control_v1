@@ -168,6 +168,20 @@ class RunSession:
             self.kind = "hist"
             return
 
+        # A ROLLING trace (monitor / monitor-nodist) is sized by its WINDOW: a notebook
+        # user passes the history length as a scalar (``run(300, source, kind="monitor")``)
+        # exactly like ``hist`` takes a count, instead of pre-building an x array.  Make a
+        # window of NaN that fills as shots arrive (the source callable yields one scalar
+        # per shot); a real x array still works (the branch below).
+        if normalized_kind in {"monitor", "monitor-nodist"} and (
+                _is_integer_scalar(data_x) or isinstance(data_x, (bool, np.bool_))):
+            count = _positive_int(data_x, "rolling window")
+            self.data_x = _as_data_x(np.arange(count))
+            self.data_y = np.full((count, 1), np.nan, dtype=float)
+            self._plot_x = self.data_x
+            self._plot_y = self.data_y
+            return
+
         self.data_x = _as_data_x(data_x)
         self.data_y = _as_data_y(data_y, len(self.data_x))
         self._plot_x = self.data_x

@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import math as _math
 import os
+import re
 import time
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -50,6 +51,7 @@ from .live import (
     panel_display_size,
     panel_plot,
     panel_size_cells,
+    site_ring_radius,
 )
 from .qt_fluent import (
     ACCENT,
@@ -114,6 +116,27 @@ PANEL_INPUT_FORMAT: dict[str, str] = {
     "hist": "a 1D sample vector",
 }
 
+# How many SIGNAL INPUT SLOTS each plot kind has, and what each slot is.  A plot is a
+# GENERIC multi-input view: it reads ``signal[0]``, ``signal[1]``, ... (a list) in its
+# source expression, one hub signal picked per slot in the Setting.  Most kinds take ONE
+# slot (the value); the site map takes THREE (occupancy + centers + image).  A future
+# plot type with more inputs is just a longer slot list -- no per-kind params needed.
+# Each slot = (label, default-signal-name, tooltip).
+_DEFAULT_SLOTS = (("signal", "", "the hub signal to plot"),)
+PANEL_INPUT_SLOTS: dict[str, tuple[tuple[str, str, str], ...]] = {
+    "sites": (
+        ("occupancy", "occupied", "per-site (N,) occupancy vector -- colours the rings (signal[0])"),
+        ("centers", "centers", "(N, 2) site centres in camera px (signal[1])"),
+        ("image", "frame", "camera-frame underlay, blank = none (signal[2])"),
+    ),
+}
+
+
+def panel_input_slots(kind: str) -> tuple[tuple[str, str, str], ...]:
+    """The input slots for a plot kind -- ``[(label, default_signal, tooltip)]``.  The
+    SINGLE source of how many signals a plot consumes and what each means."""
+    return PANEL_INPUT_SLOTS.get(str(kind), _DEFAULT_SLOTS)
+
 # Every Monitor-board panel is a PURE VIEW (role "plot"): it is fully decoupled
 # from acquisition -- it shows a hub signal and carries the full plotter Edit (the
 # whole DataFigure fit set + manual limits + the display knobs), but it NEVER
@@ -150,7 +173,7 @@ class ParamSpec:
                  display: bool = False):
         self.key = str(key)
         self.label = str(label)
-        self.kind = str(kind)              # "choice" | "int" | "signal"
+        self.kind = str(kind)              # "choice" | "int" | "text"
         self.default = default
         self.choices = tuple(choices)
         self.lo, self.hi = lo, hi
@@ -173,15 +196,11 @@ PANEL_PARAMS: dict[str, tuple[ParamSpec, ...]] = {
     "sites": (
         # A site map is a binary occupancy OVERLAY (faint ring = empty, bold ring =
         # occupied) on the camera FRAME.  The colormap applies to that frame underlay
-        # (its counts colorbar); the rings carry no scale.  It is a MULTI-INPUT plot:
-        # ``value`` = the per-site occupancy vector, plus two source signals (the site
-        # ``centers`` and the camera ``image``) -- each its own slot.
+        # (its counts colorbar); the rings carry no scale.  Its THREE signal inputs
+        # (occupancy / centers / image) are SLOTS (PANEL_INPUT_SLOTS), picked in the
+        # Setting's Source section as signal[0..2] -- NOT params here.
         ParamSpec("cmap", "colormap", "choice", "gray", choices=CMAPS,
                   tooltip="Colormap for the camera-frame underlay", display=True),
-        ParamSpec("centers", "centers", "signal", "centers", display=True,
-                  tooltip="Signal holding the (N, 2) site centers in camera px (the 2nd input)"),
-        ParamSpec("image", "image", "signal", "frame", display=True,
-                  tooltip="Signal for the camera-frame underlay (blank = no underlay)"),
     ),
     # The colormap / colorset chooser is the only per-kind knob that stays in the
     # Setting popup (display=True); the FUNCTIONAL params below (length / bins /
@@ -345,6 +364,7 @@ class PanelConfig:
         size: str = "2x2",
         source: str | None = None,
         params: Mapping[str, object] | None = None,
+        inputs: Sequence[str] | None = None,
         role: str = "plot",
     ):
         if kind not in PANEL_KINDS:
@@ -357,10 +377,34 @@ class PanelConfig:
         self.row = max(0, int(row))
         self.col = max(0, int(col))
         self.size = str(size)
-        # A pure-view plot is BLANK until the user picks a signal (decoupled from
-        # acquisition); a saved layout keeps its stored source string verbatim
-        # (including a blank one).
-        self.source = str(source) if source is not None else _BLANK_SOURCE
+        # The per-slot signal names (signal[0], signal[1], ...): one hub signal per input
+        # slot of this plot kind.  Defaults to each slot's default signal so a freshly
+        # added panel already names what it wants; a saved layout restores its picks.
+        slots = panel_input_slots(self.kind)
+        if inputs is None:
+            self.inputs = [d for _, d, _ in slots]
+        else:
+            self.inputs = [str(s) for s in inputs]
+            if len(self.inputs) < len(slots):       # pad to the kind's slot count
+                self.inputs += [d for _, d, _ in slots[len(self.inputs):]]
+        # A pure-view plot is BLANK until a signal is picked (decoupled from acquisition).
+        # When the primary slot already names a signal, the default source plots
+        # ``signal[0]``; an empty primary slot leaves it blank ("pick a signal").  A saved
+        # layout keeps its stored source verbatim.
+        if source is not None:
+            self.source = str(source)
+        elif self.inputs and self.inputs[0]:
+            self.source = "value = signal[0]"
+        else:
+            self.source = _BLANK_SOURCE
+        # A source written as a bare ``value = <signal>`` (a saved layout or a direct pick)
+        # NAMES the primary input, so reflect it in slot 0 -- the slot list and the source
+        # must never disagree (the picker would otherwise show "(none)" while the panel
+        # plots a signal).  ``value = signal[0]`` and an expression (``value = np.log(f)``)
+        # do NOT match this and leave the slots alone.
+        m = re.fullmatch(r"value\s*=\s*([A-Za-z_]\w*)", self.source.strip())
+        if m and self.inputs:
+            self.inputs[0] = m.group(1)
         self.params = dict(params or {})
         self.role = str(role)
 
@@ -381,6 +425,7 @@ class PanelConfig:
             "size": self.size,
             "source": self.source,
             "params": dict(self.params),
+            "inputs": list(self.inputs),
             "role": self.role,
         }
 
@@ -394,6 +439,7 @@ class PanelConfig:
             size=str(payload.get("size", "2x2")),
             source=payload.get("source"),
             params=payload.get("params") or {},
+            inputs=payload.get("inputs"),
             role=str(payload.get("role", "plot")),
         )
 
@@ -556,7 +602,7 @@ class PanelCard(FluentGroupBox):
         # source at the last roll, so an unrelated node's version bump does not
         # append a duplicate point.  `_MONITOR_UNSET` = never rolled yet.
         self._last_monitor_key: object = _MONITOR_UNSET
-        self._ref_src: str | None = None
+        self._ref_src: tuple | None = None      # (compiled_source, inputs) the names were derived from
         self._ref_names: frozenset = frozenset()
         # 2D coordinate frame: the ROI the axes were built from, so a ROI that
         # SHIFTS (same shape, new origin) still triggers an axes rebuild.
@@ -648,11 +694,16 @@ class PanelCard(FluentGroupBox):
         root.setContentsMargins(pad, pad, pad, pad)
         root.setSpacing(scaled_px(10, minimum=6))
 
-        # fixed left-label column.  Widest known label is "colormap" -- bumping
-        # to 80 px gives it space without crowding the controls (one-char "x"/"y"
-        # axis labels in the limits grid use the same column width, so the
-        # x/y/lo/hi grid still aligns with the section rows above).
-        label_w = scaled_px(80, minimum=56)
+        # fixed left-label column, SIZED TO CONTENT so nothing truncates: the longest
+        # label is normally "colormap", but a multi-input plot adds slot rows like
+        # "signal[0] occupancy" -- measure every label this popup will show and widen the
+        # column to the widest (floored at 80 px), so all rows still align and read fully.
+        slots = panel_input_slots(self.config.kind)
+        slot_labels = [(f"signal[{i}] {sl}" if len(slots) > 1 else "signal")
+                       for i, (sl, _d, _t) in enumerate(slots)]
+        fm = self.fontMetrics()
+        widest = max((fm.horizontalAdvance(t) for t in [*slot_labels, "colormap", "threshold"]), default=0)
+        label_w = max(scaled_px(80, minimum=56), widest + scaled_px(10))
 
         def section_box(title: str) -> QtWidgets.QVBoxLayout:
             """Header label + inner VBox; rows added to the inner VBox stack
@@ -674,12 +725,21 @@ class PanelCard(FluentGroupBox):
             accepts_label.setWordWrap(True)
             accepts_label.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
             sec.addWidget(accepts_label)
-        self.signal_combo = FluentComboBox()
-        self.signal_combo.setToolTip(
-            "Pick a live signal to show it directly (sets the expression to\n"
-            "`value = <signal>`).  Choose (expression) to write your own.")
-        self.signal_combo.activated.connect(self._on_signal_pick)
-        sec.addWidget(FluentSettingRow("signal", self.signal_combo, label_width=label_w))
+        # ONE signal picker per INPUT SLOT (signal[0], signal[1], ...).  Most plots have a
+        # single slot ("signal"); a multi-input plot (the site map) shows one combobox per
+        # slot, each picking a hub signal.  The source expression reads them as
+        # ``signal[0]``, ``signal[1]``, ...  -- so a plot with more inputs is just more
+        # slots, no special params.
+        self.slot_combos: list = []
+        multi = len(slots) > 1
+        for i, (slabel, _default, stip) in enumerate(slots):
+            combo = FluentComboBox()
+            combo.setToolTip(stip + ("\nReads into signal[%d] of the source expression." % i if multi else
+                                     "\nSets the source to `value = signal[0]`."))
+            combo.activated.connect(lambda _ix, idx=i: self._on_slot_pick(idx))
+            self.slot_combos.append(combo)
+            sec.addWidget(FluentSettingRow(slot_labels[i], combo, label_width=label_w))
+        self.signal_combo = self.slot_combos[0]    # primary-slot alias
 
         self.source_edit = FluentLineEdit(self.config.source)
         self.source_edit.setMinimumWidth(scaled_px(280, minimum=220))
@@ -836,27 +896,6 @@ class PanelCard(FluentGroupBox):
             spin.setToolTip(spec.tooltip)
             spin.valueChanged.connect(lambda v, k=spec.key: cb(k, int(v)))
             return spin
-        if spec.kind == "signal":
-            # A SIGNAL slot (the site map's centers / image inputs): a combobox of the
-            # live hub signals, labelled like the main picker (``name — source [shape]``)
-            # so it is chosen the SAME way -- not hand-typed.  The current value is kept
-            # selectable even when its source node is not running yet (so a saved layout's
-            # ``centers`` survives), and a blank "(none)" turns the slot off.
-            combo = FluentComboBox()
-            combo.setMinimumWidth(scaled_px(150, minimum=120))
-            combo.setToolTip(spec.tooltip)
-            cur = str(current or "")
-            combo.addItem("(none)", "")
-            items = self._signal_combo_items()
-            have = {bare for _, bare in items}
-            for display, bare in items:
-                combo.addItem(display, bare)
-            if cur and cur not in have:             # preserve a not-yet-published name
-                combo.addItem(f"{cur}  (not yet published)", cur)
-            idx = combo.findData(cur)
-            combo.setCurrentIndex(idx if idx >= 0 else 0)
-            combo.activated.connect(lambda _i, k=spec.key, c=combo: cb(k, str(c.currentData() or "")))
-            return combo
         # "text": a free-form value (blank allowed where documented)
         edit = FluentLineEdit(str(current))
         edit.setMinimumWidth(scaled_px(96, minimum=80))   # expands in its row; long signal names not cut off
@@ -886,8 +925,8 @@ class PanelCard(FluentGroupBox):
 
     def _signal_combo_items(self) -> list[tuple[str, str]]:
         """``[(display, bare_name)]`` for every LIVE hub signal, each labelled
-        ``name — source  [shape]`` -- the SINGLE source the main signal picker AND
-        every ``kind="signal"`` param combo (the site map's centers/image slots) share,
+        ``name — source  [shape]`` -- the SINGLE source every input-SLOT picker
+        (signal[0], signal[1], ... including the site map's centers/image slots) shares,
         so a signal is picked the same way everywhere (by origin + shape, not typed)."""
         names: list[str] = []
         if callable(self.names_provider):
@@ -919,29 +958,47 @@ class PanelCard(FluentGroupBox):
             items.append((label, name))
         return items
 
-    def _refresh_signal_combo(self) -> None:
-        """Fill the signal picker with the hub's CURRENT signals, each labelled with
-        the measurement/processor that PRODUCES it (``occupied — occupancy``) so you
-        pick by origin, not a bare name.  The item TEXT carries the source label; the
-        item DATA is the plain signal name written into ``value = <name>``."""
-        combo = self.signal_combo
+    def _fill_slot_combo(self, combo, current: str) -> None:
+        """Populate ONE slot combobox with ``(none)`` + every live hub signal (each
+        labelled ``name — source [shape]`` via :meth:`_signal_combo_items`), keeping the
+        slot's current pick selected even when its source node is not running yet (so a
+        saved layout's ``signal[1]`` survives a restart)."""
+        cur = str(current or "")
         with _signals_blocked(combo):
             combo.clear()
-            combo.addItem("(expression)", "")
-            for label, name in self._signal_combo_items():
+            combo.addItem("(none)", "")
+            items = self._signal_combo_items()
+            have = {bare for _, bare in items}
+            for label, name in items:
                 combo.addItem(label, name)         # text shows source + shape; data is the bare name
-            # reflect a plain `value = <signal>` source in the picker
-            source = (self.config.source or "").strip()
-            picked = source[len("value ="):].strip() if source.startswith("value =") else ""
-            idx = combo.findData(picked) if picked else 0
+            if cur and cur not in have:             # preserve a not-yet-published name
+                combo.addItem(f"{cur}  (not yet published)", cur)
+            idx = combo.findData(cur)
             combo.setCurrentIndex(idx if idx >= 0 else 0)
 
-    def _on_signal_pick(self, index: int) -> None:
-        name = str(self.signal_combo.currentData() or "")   # bare signal name (not the labelled text)
-        if not name:
-            return
-        self.source_edit.setText(f"value = {name}")
-        self._apply_source()                      # picking a signal applies instantly
+    def _refresh_signal_combo(self) -> None:
+        """Refresh EVERY input-slot picker with the hub's current signals, each labelled
+        with the measurement/processor that PRODUCES it (``occupied — occupancy``) so a
+        slot is filled by origin, not a bare name.  Each slot keeps its own ``config.inputs[i]``
+        selected; the source expression reads them as ``signal[0]``, ``signal[1]``, ..."""
+        for i, combo in enumerate(getattr(self, "slot_combos", [])):
+            cur = self.config.inputs[i] if i < len(self.config.inputs) else ""
+            self._fill_slot_combo(combo, cur)
+
+    def _on_slot_pick(self, idx: int) -> None:
+        """A slot picker changed: write its bare signal name into ``config.inputs[idx]``.
+        The PRIMARY slot (signal[0]) IS the "plot this signal" control, so it also points
+        the source at ``value = signal[0]`` (a blank pick blanks the panel); the EXTRA
+        slots (signal[1], signal[2], ... e.g. the site map's centres/image) only fill their
+        input and leave the source alone.  The expression box stays the advanced override
+        for a custom ``value = ...``.  Then re-apply so the pick takes effect now."""
+        name = str(self.slot_combos[idx].currentData() or "")   # bare name (not the labelled text)
+        while len(self.config.inputs) <= idx:
+            self.config.inputs.append("")
+        self.config.inputs[idx] = name
+        if idx == 0:
+            self.source_edit.setText("value = signal[0]" if name else _BLANK_SOURCE)
+        self._apply_source()                      # picking a slot applies instantly
 
     # ------------------------------------------------ basic display toggles
     def _current_unit_text(self) -> str:
@@ -1169,6 +1226,11 @@ class PanelCard(FluentGroupBox):
         Every failure lands on the gear/status -- a bad expression in one panel
         must never break the console or its siblings."""
 
+        # Inject this panel's INPUT SLOTS as ``signal`` (a list): ``signal[0]`` is the
+        # primary value, ``signal[1..]`` the extra inputs of a multi-input plot (the site
+        # map's centers + image).  The source expression and _render read these, so a plot
+        # with any number of inputs is just a longer slot list.
+        namespace = self._with_signal_slots(namespace)
         # A BLANK panel (a freshly added pure view, source not yet wired) sits
         # quietly with a hint -- it is decoupled, so it shows nothing until the
         # user picks a signal in its Setting.  Not an error.
@@ -1183,6 +1245,15 @@ class PanelCard(FluentGroupBox):
             return
         shot = namespace.get("shot")
         self.set_status(f"shot {int(shot)}" if isinstance(shot, (int, float)) else "ok", error=False)
+
+    def _with_signal_slots(self, namespace: Mapping[str, object]) -> dict[str, object]:
+        """Return a namespace copy with ``signal`` = the per-slot input values (one entry
+        per :func:`panel_input_slots` slot, taken from ``config.inputs``); a slot whose
+        signal is blank / not on the hub yet is ``None``.  So ``value = signal[0]`` plots
+        the primary input and a multi-input plot reads ``signal[1]``, ``signal[2]``, ..."""
+        ns = dict(namespace)
+        ns["signal"] = [(ns.get(str(name)) if name else None) for name in self.config.inputs]
+        return ns
 
     def _evaluate(self, namespace: dict[str, object]):
         # SECURITY: runs the panel's user-entered snippet as arbitrary Python.
@@ -1229,31 +1300,38 @@ class PanelCard(FluentGroupBox):
         return flat
 
     def _sites_aux(self, namespace: Mapping[str, object]):
-        """The site-map panel's two auxiliary signals: centers + optional image."""
-        centers_name = str(self.config.params.get("centers", "centers")).strip()
-        image_name = str(self.config.params.get("image", "frame")).strip()
-        centers = namespace.get(centers_name) if centers_name else None
+        """The site map's extra INPUT SLOTS: ``signal[1]`` = centres, ``signal[2]`` =
+        optional camera underlay (``signal[0]`` is the occupancy = the panel value).  The
+        namespace carries ``signal`` (the per-slot list) injected by ``_with_signal_slots``.
+        """
+        sig = namespace.get("signal") or []
+        centers = sig[1] if len(sig) > 1 else None
         if centers is None:
+            slot = self.config.inputs[1] if len(self.config.inputs) > 1 else "centers"
             raise ValueError(
-                f"site-map panel needs a `{centers_name or 'centers'}` signal with the (N, 2) site centers"
-                " (set its name in Setting -> centers)")
+                f"site map needs a centres signal in slot signal[1] (`{slot}`) with the (N, 2) "
+                "site centres -- pick it in Setting -> centers")
         centers = np.asarray(centers, dtype=float)
         if centers.ndim != 2 or centers.shape[1] < 2:
-            raise ValueError(f"centers signal must have shape (N, 2); got {centers.shape}")
-        image = namespace.get(image_name) if image_name else None
+            raise ValueError(f"centres signal must have shape (N, 2); got {centers.shape}")
+        image = sig[2] if len(sig) > 2 else None
         return centers[:, :2], (None if image is None else np.asarray(image, dtype=float))
 
     def _co_names(self) -> frozenset:
-        """The identifiers this panel's source expression references (cached).
-        Used to map the source to its signal(s) -- for the monitor roll-gate and
-        for the 2D coordinate-frame (ROI) lookup."""
-        src = self._compiled_source
-        if src != self._ref_src:               # (re)derive on source change
-            self._ref_src = src
+        """The hub-signal names this panel reads (cached) -- for the monitor roll-gate
+        and the 2D coordinate-frame (ROI) lookup.  This is BOTH the identifiers the
+        source expression names directly AND the slot inputs it pulls in as
+        ``signal[i]`` (the default ``value = signal[0]`` form references ``signal``, not
+        the real name, so the slot names must be folded in or version-gating misses)."""
+        key = (self._compiled_source, tuple(self.config.inputs))
+        if key != self._ref_src:               # (re)derive on source OR slot change
+            self._ref_src = key
             try:
-                self._ref_names = frozenset(compile(str(src), "<panel-source>", "exec").co_names)
+                names = set(compile(str(self._compiled_source), "<panel-source>", "exec").co_names)
             except Exception:
-                self._ref_names = frozenset()
+                names = set()
+            names.update(str(n) for n in self.config.inputs if n)   # slot signal[i] -> real name
+            self._ref_names = frozenset(names)
         return self._ref_names
 
     def _source_coord_frame(self, namespace: Mapping[str, object] | None):
@@ -1340,6 +1418,12 @@ class PanelCard(FluentGroupBox):
         if not source.startswith("value ="):
             return None
         name = source[len("value ="):].strip()
+        # The default source plots an input SLOT (``value = signal[0]``): resolve it to the
+        # real hub-signal name in that slot so its producing node's axis label is found.
+        m = re.fullmatch(r"signal\[(\d+)\]", name)
+        if m:
+            i = int(m.group(1))
+            name = self.config.inputs[i] if i < len(self.config.inputs) else ""
         if not name or not callable(self.axes_provider):
             return None
         try:
@@ -1363,15 +1447,9 @@ class PanelCard(FluentGroupBox):
             if len(vec) != len(centers):
                 raise ValueError(
                     f"site-map value has {len(vec)} entries but the centers signal has {len(centers)} sites")
-            spacing = 6.0
-            if len(centers) > 1:
-                deltas = np.linalg.norm(np.diff(centers, axis=0), axis=1)
-                deltas = deltas[deltas > 0]
-                if deltas.size:
-                    spacing = float(np.min(deltas))
             self.plotter = panel_plot(
                 centers, vec, kind="sites", size=size, interactions=False,
-                image=image, roi_radius=max(1.5, 0.3 * spacing),
+                image=image, roi_radius=site_ring_radius(centers),
                 cmap=str(self.config.params.get("cmap", "gray")),
                 labels=("Camera x (px)", "Camera y (px)", label),
                 title=self.config.title or None)

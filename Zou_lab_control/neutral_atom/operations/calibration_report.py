@@ -6,11 +6,16 @@ a pooled GLOBAL distribution annotated with the single-shot FIDELITY, the averag
 template image, and an ``.npz`` + ``summary.json`` bundle -- all written to one folder so
 a run is reproducible and reviewable offline.
 
-Analysis layer ONLY: it reads the readout CONTRACT (``calibration.signals`` /
-``centers`` / ``thresholds``) + the readout frames, and draws with a headless Agg
-canvas (no pyplot, so it is safe in the calibrate task's worker thread).  It imports no
-camera backend and no frontend, so a VIRTUAL calibration writes byte-for-byte the SAME
-report a real qCMOS run would (only the frames differ).
+Split by layer, no drift:
+  * the NUMBERS (per-site counts via the ``calibration.signals`` contract, per-site
+    fidelity, the ``.npz`` + ``summary.json`` + a reloadable ``calibration.json``) are
+    computed HERE -- analysis only, identical virtual vs real (only the frames differ);
+  * the FIGURES are drawn by the FRONTEND plot types (the distribution grid / pooled
+    histogram / site map the live console uses), routed through the viewer-registry seam
+    (:func:`Zou_lab_control._viewer_registry.active_plotter`).  This layer imports no
+    frontend and no camera backend, so the package decoupling holds; when no viewer is
+    registered (pure headless), the data bundle is still complete and the PNGs are simply
+    skipped (the registry's documented fallback).
 """
 
 from __future__ import annotations
@@ -19,18 +24,10 @@ import json
 from pathlib import Path
 
 import numpy as np
-from matplotlib.backends.backend_agg import FigureCanvasAgg
-from matplotlib.figure import Figure
 
-from ..core.analysis import estimate_threshold_fidelity, otsu_threshold
+from Zou_lab_control._viewer_registry import active_plotter
 
-
-def _grid_shape(n_sites: int) -> tuple[int, int]:
-    """A near-square (rows, cols) grid that holds ``n_sites`` cells (cols >= rows)."""
-    n = max(1, int(n_sites))
-    cols = int(np.ceil(np.sqrt(n)))
-    rows = int(np.ceil(n / cols))
-    return rows, cols
+from ..core.analysis import estimate_threshold_fidelity
 
 
 def per_site_counts(calibration, frames) -> np.ndarray:
@@ -60,78 +57,32 @@ def per_site_fidelity(counts: np.ndarray, thresholds: np.ndarray) -> np.ndarray:
     return out
 
 
-def _save(fig: Figure, path: Path) -> None:
-    FigureCanvasAgg(fig).print_figure(str(path), dpi=200, facecolor="white")
-
-
-def _distribution_grid_figure(counts, thresholds, fidelity, *, bins: int = 40) -> Figure:
-    n_sites = counts.shape[1]
-    rows, cols = _grid_shape(n_sites)
-    fig = Figure(figsize=(min(2.0 * cols, 16), min(1.6 * rows, 14)))
-    axes = fig.subplots(rows, cols, squeeze=False)
-    lo, hi = np.nanpercentile(counts, [0.5, 99.5]) if counts.size else (0.0, 1.0)
-    edges = np.linspace(lo, hi, bins + 1)
-    for k in range(rows * cols):
-        ax = axes[k // cols][k % cols]
-        if k >= n_sites:
-            ax.axis("off")
-            continue
-        col = counts[:, k]
-        ax.hist(col[np.isfinite(col)], bins=edges, color="#7E9CD8", alpha=0.9)
-        ax.axvline(float(thresholds[k]), color="#D07850", lw=1.3)
-        fid = fidelity[k]
-        ax.set_title(f"{k}: F={fid * 100:.1f}%" if np.isfinite(fid) else f"{k}",
-                     fontsize=6.5)
-        ax.tick_params(labelsize=5, length=1.5)
-    fig.suptitle("Per-site readout count distribution (orange = threshold)", fontsize=9)
-    fig.tight_layout(rect=(0, 0, 1, 0.97))
-    return fig
-
-
-def _global_distribution_figure(counts, thresholds, fidelity) -> Figure:
-    fig = Figure(figsize=(5.2, 3.6))
-    ax = fig.subplots()
-    flat = counts.reshape(-1)
-    flat = flat[np.isfinite(flat)]
-    thr = float(np.nanmedian(thresholds))
-    ax.hist(flat, bins=80, color="#9AA7B2", alpha=0.9)
-    ax.axvline(thr, color="#D07850", lw=1.8, label=f"median threshold = {thr:.0f}")
-    mean_f = float(np.nanmean(fidelity)) if np.any(np.isfinite(fidelity)) else float("nan")
-    worst = float(np.nanmin(fidelity)) if np.any(np.isfinite(fidelity)) else float("nan")
-    ax.set_xlabel("Readout counts")
-    ax.set_ylabel("Shots x sites")
-    ax.set_title("Pooled readout distribution")
-    ax.text(0.97, 0.95, f"mean fidelity {mean_f * 100:.2f}%\nworst site {worst * 100:.2f}%",
-            transform=ax.transAxes, ha="right", va="top", fontsize=8,
-            bbox=dict(boxstyle="round", fc="white", ec="0.7"))
-    ax.legend(loc="upper left", fontsize=7, frameon=False)
-    fig.tight_layout()
-    return fig
-
-
-def _template_figure(template, centers) -> Figure:
-    fig = Figure(figsize=(4.8, 3.8))
-    ax = fig.subplots()
-    im = ax.imshow(np.asarray(template, dtype=float), cmap="inferno", origin="upper")
-    if centers is not None and len(centers):
-        c = np.asarray(centers, dtype=float)
-        ax.scatter(c[:, 0], c[:, 1], s=60, facecolors="none", edgecolors="#7EA5A3", lw=0.8)
-    ax.set_xlabel("Camera x (px)")
-    ax.set_ylabel("Camera y (px)")
-    ax.set_title("Averaged reference template + sites")
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    fig.tight_layout()
-    return fig
+def _render_figures(folder, *, counts, thresholds, fidelity, centers, template,
+                    threshold_method, timestamp) -> dict:
+    """Draw the report PNGs through the registered FRONTEND viewer; ``{}`` when headless
+    (no viewer registered) -- the data bundle below is still written either way."""
+    plotter = active_plotter()
+    if plotter is None or not hasattr(plotter, "save_calibration_report"):
+        return {}
+    try:
+        return dict(plotter.save_calibration_report(
+            folder, counts=counts, thresholds=thresholds, fidelity=fidelity,
+            centers=centers, template=template,
+            threshold_method=str(threshold_method), timestamp=str(timestamp)) or {})
+    except Exception:
+        return {}
 
 
 def write_calibration_report(folder, *, calibration, readout_frames, template=None,
                              threshold_method: str = "otsu", timestamp: str = "") -> dict:
-    """Write the per-site distribution grid + global distribution(+fidelity) + template
-    PNGs and a ``calibration.npz`` + ``summary.json`` into ``folder`` (created if needed).
+    """Write the per-site distribution grid + global distribution(+fidelity) + site-map
+    PNGs (via the frontend) and a ``calibration.npz`` + ``calibration.json`` +
+    ``summary.json`` (the numbers) into ``folder`` (created if needed).
 
-    Returns a summary dict (paths + n_sites + mean fidelity).  Pure: no backend / frontend
-    / sim-truth -- the artifacts are derived from the calibration contract + the readout
-    frames, identical on real hardware."""
+    Returns a summary dict (paths + n_sites + mean fidelity).  The numbers are derived
+    purely from the calibration contract + readout frames (identical on real hardware);
+    the figures come from the registered viewer, so they use the live console's plot
+    types rather than hand-rolled matplotlib."""
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
     centers = np.asarray(calibration.centers, dtype=float)
@@ -140,18 +91,9 @@ def write_calibration_report(folder, *, calibration, readout_frames, template=No
     fidelity = (per_site_fidelity(counts, thresholds) if counts.size
                 else np.full(len(centers), np.nan))
 
-    paths: dict[str, str] = {}
-    if counts.size:
-        p = folder / "site_distribution_grid.png"
-        _save(_distribution_grid_figure(counts, thresholds, fidelity), p)
-        paths["site_distribution_grid"] = str(p)
-        p = folder / "global_distribution.png"
-        _save(_global_distribution_figure(counts, thresholds, fidelity), p)
-        paths["global_distribution"] = str(p)
-    if template is not None:
-        p = folder / "site_map.png"
-        _save(_template_figure(template, centers), p)
-        paths["site_map"] = str(p)
+    paths = _render_figures(
+        folder, counts=counts, thresholds=thresholds, fidelity=fidelity, centers=centers,
+        template=template, threshold_method=threshold_method, timestamp=timestamp)
 
     npz_path = folder / "calibration.npz"
     np.savez(npz_path, centers=centers, thresholds=thresholds,

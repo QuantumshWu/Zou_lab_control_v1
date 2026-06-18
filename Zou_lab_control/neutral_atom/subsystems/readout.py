@@ -623,9 +623,16 @@ class ReadoutSubsystem(ExperimentSubsystem):
 
         s = self._session
         params["grid_shape"] = s._grid_shape(params.get("grid_shape"))
+
+        def _adopt(calibration):
+            # The finished calibration BECOMES the session calibration (``readout.current``),
+            # so a decoupled live OccupancyProcessor begins judging sites the moment this
+            # task completes -- no path to type, the cali->occupancy connection.
+            s._calibration = calibration
+
         return CalibrateReadoutTask(hub, s.devices.camera,
                                     sequencer=getattr(s.devices, "sequencer", None),
-                                    prefix=prefix, **params)
+                                    calibration_sink=_adopt, prefix=prefix, **params)
 
     # ------------------------------------------------------------- persistence
     def load(self, path: str | Path) -> TrapCalibration:
