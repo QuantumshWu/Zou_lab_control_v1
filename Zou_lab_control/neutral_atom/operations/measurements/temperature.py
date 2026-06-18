@@ -50,11 +50,6 @@ def temperature_release_recapture(readout) -> MeasurementSpec:
         ParamDecl("per_site", "Per-site survival", "bool", default=False,
                   tooltip="Report one survival column per site (else the array mean)."),
     )
-    grid = None
-    trap = getattr(s.devices, "trap_array", None)
-    grid_shape = getattr(trap, "grid_shape", None)
-    if grid_shape is not None:
-        grid = (int(grid_shape[0]), int(grid_shape[1]))
     return MeasurementSpec(
         name="Temperature",
         key="temperature",                       # signals: temperature_t_off / temperature_survival
@@ -63,7 +58,6 @@ def temperature_release_recapture(readout) -> MeasurementSpec:
         x_key="t_off",
         y_key="survival",
         build=build,
-        grid_shape=grid,
         # The fit needs the capture radius in METRES; the GUI param is um, so
         # record the converter the consumer applies before calling fit_temperature.
         metadata={"fit": "fit_temperature", "fit_param": "capture_radius", "fit_param_scale": 1e-6},

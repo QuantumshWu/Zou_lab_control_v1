@@ -136,10 +136,10 @@ class MeasurementSpec:
     it lists the parameters ONCE (``params``), names the live curve's axes
     (``result_labels`` + ``x_key``/``y_key`` published-signal keys), and exposes
     ``build(**param_values) -> ScannedMeasurement`` returning an UNRUN measurement
-    a logic node can drive point-by-point.  ``grid_shape`` is set for per-site
-    measurements so a consumer can reshape a per-site result vector into a 2-D map.
-    ``metadata`` carries spec-specific extras (e.g. the capture radius the
-    temperature fit needs) without widening the call signature.
+    a logic node can drive point-by-point.  ``metadata`` carries spec-specific extras
+    (e.g. the capture radius the temperature fit needs) without widening the call
+    signature.  (A per-site result's 2-D map is a reshape EXPRESSION on the
+    ``<y_key>_sites`` signal, using the trap array's grid shape -- not a stored field.)
     """
 
     name: str
@@ -148,7 +148,6 @@ class MeasurementSpec:
     x_key: str
     y_key: str
     build: Callable[..., "ScannedMeasurement"]
-    grid_shape: tuple[int, int] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     # Canonical machine slug (the node prefix + signal names derive from it).  Defaults
     # to ``measurement_slug(name)`` so a measurement is named ONCE; ``x_key``/``y_key``

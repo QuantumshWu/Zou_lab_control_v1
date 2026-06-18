@@ -1345,7 +1345,8 @@ class FluentTabWidget(QtWidgets.QTabWidget):
         btn.setCursor(QtCore.Qt.PointingHandCursor)
         btn.setFocusPolicy(QtCore.Qt.NoFocus)
         btn.setToolTip("All tabs")
-        btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        # The menu is popped from the `clicked` handler (the button owns no QMenu), so the
+        # default (DelayedPopup) mode is correct -- InstantPopup would suppress `clicked`.
         size = scaled_px(26, minimum=20)
         btn.setFixedSize(size, size)
         font = btn.font()
@@ -1380,9 +1381,10 @@ class FluentTabWidget(QtWidgets.QTabWidget):
     def _schedule_overflow_update(self) -> None:
         QtCore.QTimer.singleShot(0, self._update_overflow)
 
-    def _show_overflow_menu(self) -> None:
-        """Pop a Fluent list of EVERY tab; picking one selects it (Qt scrolls it into
-        view) -- the single overflow navigation, in place of left/right scroll arrows."""
+    def _overflow_menu(self) -> QtWidgets.QMenu:
+        """Build (but do not show) the Fluent overflow menu: one checkable action per tab
+        that selects it on trigger (Qt scrolls it into view).  Split out from the popup so
+        the click->select wiring is testable without a blocking ``exec_``."""
         menu = QtWidgets.QMenu(self)
         menu.setStyleSheet(
             f"""
@@ -1400,6 +1402,12 @@ class FluentTabWidget(QtWidgets.QTabWidget):
             act.setCheckable(True)
             act.setChecked(i == current)
             act.triggered.connect(lambda _c, idx=i: self.setCurrentIndex(idx))
+        return menu
+
+    def _show_overflow_menu(self) -> None:
+        """Pop the overflow list below the ``...`` button -- the single overflow navigation,
+        in place of left/right scroll arrows."""
+        menu = self._overflow_menu()
         btn = self._overflow_btn
         menu.exec_(btn.mapToGlobal(QtCore.QPoint(0, btn.height())))
 

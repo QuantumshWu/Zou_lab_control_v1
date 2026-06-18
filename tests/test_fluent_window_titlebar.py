@@ -108,11 +108,14 @@ def test_tab_overflow_uses_a_menu_button_not_scroll_arrows():
     assert w._tabs_overflow() is True
     assert w._overflow_btn.isVisible() is True
 
-    # the overflow menu lists EVERY tab and selecting one makes it current.
-    menu = QtWidgets.QMenu(w)
-    titles = [w.tabText(i) for i in range(w.count())]
-    assert "Per-site histogram" in titles and len(titles) == w.count()
-    last = w.count() - 1
-    w.setCurrentIndex(last)
-    assert w.currentIndex() == last
+    # the overflow menu lists EVERY tab; triggering an action selects that tab (this
+    # exercises the real click->select wiring, not just a direct setCurrentIndex).
+    menu = w._overflow_menu()
+    actions = menu.actions()
+    assert len(actions) == w.count()
+    assert [a.text() for a in actions] == [w.tabText(i) for i in range(w.count())]
+    w.setCurrentIndex(0)
+    actions[-1].trigger()
+    assert w.currentIndex() == w.count() - 1
+    menu.deleteLater()
     w.deleteLater()

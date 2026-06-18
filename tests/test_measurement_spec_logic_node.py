@@ -164,8 +164,10 @@ def test_temperature_node_per_site_publishes_latest_site_vector_only():
     published = node.published_signals()
     assert (spec.y_key + "_grid") not in published
     assert "shot" not in published and (spec.y_key + "_shot") not in published
-    # ... but the per-site vector reshapes cleanly to the grid via an expression.
-    assert sites.reshape(spec.grid_shape).shape == spec.grid_shape
+    # ... but the per-site vector reshapes cleanly to the grid via an expression, using
+    # the trap array's grid shape (the source of truth -- not a stored spec field).
+    grid = exp.devices.trap_array.grid_shape
+    assert sites.reshape(grid).shape == grid
 
 
 def test_readout_duration_node_runs_out_a_fidelity_curve():

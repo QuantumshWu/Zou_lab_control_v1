@@ -37,7 +37,7 @@ def test_builtins_are_autodiscovered_in_order(exp):
     # Both built-ins come from operations/measurements/*.py (NOT a hardcoded list
     # in readout.py); order is deterministic (built-ins use small @measurement
     # order values, temperature before readout-duration).
-    assert names[:2] == ["Temperature (release-recapture)", "Readout duration -> fidelity"]
+    assert names[:2] == ["Temperature", "Readout fidelity"]
 
 
 def test_register_makes_a_new_measurement_appear_then_unregister_removes(exp):
@@ -54,7 +54,7 @@ def test_register_makes_a_new_measurement_appear_then_unregister_removes(exp):
         names = [s.name for s in exp.readout.measurement_specs()]
         assert "Demo runtime scan" in names
         # ad-hoc measurements sort AFTER the built-ins (default order)
-        assert names.index("Demo runtime scan") > names.index("Temperature (release-recapture)")
+        assert names.index("Demo runtime scan") > names.index("Temperature")
     finally:
         assert mr.unregister_measurement(_demo_runtime) is True
     assert "Demo runtime scan" not in [s.name for s in exp.readout.measurement_specs()]
