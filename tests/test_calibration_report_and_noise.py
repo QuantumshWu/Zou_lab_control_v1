@@ -101,3 +101,42 @@ def test_calibrate_writes_distribution_and_fidelity_report(tmp_path):
             assert 0.5 <= float(np.mean(fid)) <= 1.0
     finally:
         exp.close()
+
+
+def test_reference_bracket_gives_distinct_per_method_fidelity():
+    """The Rb87 readout-fidelity flow: a long-short-long reference bracket images the SAME
+    atoms, so the two long frames vote ground-truth occupancy for the short readout (atom
+    loss makes a shot ambiguous).  Each method's per-site threshold is then trained + scored
+    HELD-OUT against those labels.  Because box / per-site PSF / uniform PSF weight the
+    photons differently, their held-out fidelity at a fidelity-LIMITED (short) readout must
+    DIFFER -- regression for the bug where all three reported a bitwise-identical fidelity
+    (the affine-invariant self-consistent estimate, which cannot tell the methods apart)."""
+    pytest.importorskip("matplotlib")
+    pytest.importorskip("PyQt5")
+    import Zou_lab_control.neutral_atom as na
+    import Zou_lab_control.frontend  # noqa: F401  (registers the viewer)
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.neutral_atom.operations.calibration_report import _held_out_by_method
+
+    exp = na.connect("virtual", sitemap={"grid_shape": (4, 5), "image_shape": (80, 100)}, seed=5)
+    try:
+        task = exp.readout.calibrate_task(
+            SignalHub(), source="live", calibration_frames=6, threshold_frames=160,
+            sitemap_exposure=0.03, readout_exposure=5e-4)        # short readout -> not saturated
+        task.run_to_completion()
+        # the bracket frames were kept, grouped (n_ref long frames + one short readout each)
+        assert len(task._reference_groups) == len(task._readout_by_group) > 0
+        assert len(task._reference_groups[0]) == task.REFERENCE_FRAMES_PER_BRACKET
+
+        by_method = _held_out_by_method(task.calibration, task._reference_groups, task._readout_by_group)
+        assert set(by_method) == {"box", "psf", "uniform_psf"}
+        means = {m: float(np.nanmean(d["fidelity"])) for m, d in by_method.items()}
+        # every method is a real held-out classification fidelity (a sane 0.5..1.0)
+        assert all(0.5 <= v <= 1.0 for v in means.values())
+        # and the three are NOT all the bitwise-identical number the old estimate forced:
+        # at a fidelity-limited readout the methods genuinely separate the populations
+        # differently, so at least two differ by a real margin.
+        spread = max(means.values()) - min(means.values())
+        assert spread > 1e-3, f"per-method fidelity must differ, got {means}"
+    finally:
+        exp.close()

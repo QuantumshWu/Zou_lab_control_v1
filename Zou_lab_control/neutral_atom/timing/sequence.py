@@ -332,6 +332,59 @@ def imaging_sequence(
     return seq
 
 
+def reference_bracket_sequence(
+    *,
+    ref_exposure: float = 20e-3,
+    readout_exposure: float = 5e-3,
+    n_ref: int = 2,
+    trigger_width: float = 20e-6,
+    pre_trigger: float = 100e-6,
+    gap: float = 100e-6,
+    cooling: float = 2e-3,
+    name: str = "reference_bracket",
+    trap_channel: str = "trap",
+    cooling_channel: str = "cooling",
+    probe_channel: str = "probe",
+    trigger_channel: str = "emCCD",
+) -> PulseSequence:
+    """The Rb87 readout-fidelity bracket: ONE cooling load, then ``n_ref`` LONG reference
+    images interleaved with ONE short readout (e.g. long-short-long), all imaging the SAME
+    atoms (the trap is held on and there is NO re-cooling between triggers, so a following
+    frame sees the previous frame's survivors).  Comparing the long reference frames tells
+    whether the atom survived; when they agree they vote the GROUND-TRUTH occupancy that the
+    middle readout frame is scored against.  The readout is placed in the MIDDLE (index
+    ``n_ref // 2``); the others are references.  ``n_ref + 1`` camera triggers total."""
+
+    ref_exposure = positive_float(ref_exposure, "ref_exposure")
+    readout_exposure = positive_float(readout_exposure, "readout_exposure")
+    n_ref = positive_int(n_ref, "n_ref")
+    trigger_width = positive_float(trigger_width, "trigger_width")
+    for value, label in ((pre_trigger, "pre_trigger"), (gap, "gap"), (cooling, "cooling")):
+        if finite_float(value, label) < 0:
+            raise ValueError(f"{label} must be >= 0.")
+    trap_channel = channel_name(trap_channel)
+    cooling_channel = channel_name(cooling_channel)
+    probe_channel = channel_name(probe_channel)
+    trigger_channel = channel_name(trigger_channel)
+
+    readout_index = n_ref // 2
+    exposures = [readout_exposure if i == readout_index else ref_exposure for i in range(n_ref + 1)]
+
+    cursor = cooling + pre_trigger
+    starts: list[float] = []
+    for exposure in exposures:
+        starts.append(cursor)
+        cursor += exposure + gap
+    total = cursor
+    seq = PulseSequence(name=name).pulse(trap_channel, 0.0, total, name="trap_hold")
+    if cooling > 0:
+        seq = seq.pulse(cooling_channel, 0.0, cooling, name="load")
+    for i, (start, exposure) in enumerate(zip(starts, exposures)):
+        seq = seq.pulse(probe_channel, start, exposure, name=f"probe_{i}")
+        seq = seq.pulse(trigger_channel, start, trigger_width, name=f"camera_trigger_{i}")
+    return seq
+
+
 def imaging_channel_kwargs(sequencer: object) -> dict[str, str]:
     """Channel kwargs for :func:`imaging_sequence`, derived from a bound sequencer.
 

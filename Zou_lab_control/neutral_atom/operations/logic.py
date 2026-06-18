@@ -803,10 +803,15 @@ class CalibrateReadoutTask(Task):
         frames = list(getattr(self, "_readout_samples", []) or [])
         if not frames:
             return {}
+        # the reference brackets (if acquired) give the report ground-truth labels, so the
+        # per-method fidelity is held-out classification accuracy (distinct box / PSF / uniform),
+        # not the affine-invariant self-consistent estimate.
         return write_calibration_report(
             folder, calibration=self.calibration, readout_frames=frames,
             template=getattr(self, "_reference_template", None),
             threshold_method=self.threshold_method,
+            reference_groups=getattr(self, "_reference_groups", None),
+            readout_by_group=getattr(self, "_readout_by_group", None),
             timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
     def _imaging_seq(self, exposure: float, name: str):
@@ -852,24 +857,63 @@ class CalibrateReadoutTask(Task):
         # at the long exposure, and averaging many such frames reveals every site -- the
         # authentic template, not a synthetic all-bright frame.
         sitemap_seq = self._imaging_seq(self.sitemap_exposure, "reference")
-        readout_seq = self._imaging_seq(self.readout_exposure, "readout")
         out.publish(progress=0.0, stage="loading reference frames")
         template = self._collect_frames(sitemap_seq, self.calibration_frames, out,
-                                        stage="reference frame", progress_lo=0.0, progress_hi=0.45)
-        samples = self._collect_frames(readout_seq, self.threshold_frames, out,
-                                       stage="readout frame", progress_lo=0.5, progress_hi=0.9)
+                                        stage="reference frame", progress_lo=0.0, progress_hi=0.3)
+        # READOUT BRACKETS (the Rb87 fidelity flow): each shot images the SAME atoms
+        # long-short-long, so the two long frames vote a ground-truth occupancy label for the
+        # short readout (a shot where they disagree is an atom-loss event -> ambiguous).  The
+        # short readout frames also feed the box/PSF otsu thresholds (cali once, read many ways).
+        ref_groups, readout_by_group = self._collect_bracket_groups(
+            out, progress_lo=0.35, progress_hi=0.9)
+        samples = list(readout_by_group)
         out.publish(progress=0.95, stage="finding sites + thresholds (box / PSF)")
-        # ONE multi-method calibration: the OccupancyProcessor picks box / per-site PSF /
-        # uniform PSF later, so the cali computes them all here (cali once, read many ways).
         calibration = calibrate_all_methods_from_images(
             template, samples, grid_shape=self.grid_shape, roi_radius=self.roi_radius,
             threshold_method=self.threshold_method)
-        # Keep the readout frames + averaged reference template so run() can write the
-        # per-site distribution / fidelity report (the rb87-style artifacts).
+        # Keep the readout frames + reference brackets + averaged template so run() can write
+        # the rb87-style report: per-site distribution + HELD-OUT per-method fidelity scored
+        # against the bracket-voted ground truth + the site map.
         self._readout_samples = list(samples)
+        self._reference_groups = ref_groups
+        self._readout_by_group = list(readout_by_group)
         self._reference_template = (np.mean(np.asarray(template, dtype=float), axis=0)
                                     if template else None)
         return calibration
+
+    #: The number of long reference frames bracketing each short readout (a "20-5-20" shot):
+    #: two long images, one before and one after, vote ground truth by strict consensus.
+    REFERENCE_FRAMES_PER_BRACKET = 2
+
+    def _collect_bracket_groups(self, out: "TaskOutput", *, progress_lo: float, progress_hi: float):
+        """Acquire ``threshold_frames`` reference BRACKETS.  Each bracket is ONE correlated
+        shot -- a long-short-long camera sequence imaging the SAME atom loading (the trap is
+        held on, no re-cooling between triggers, so a following frame sees the previous
+        frame's survivors).  Returns ``(reference_groups, readout_per_group)``:
+        ``reference_groups[g]`` is the long frames that vote ground truth, and
+        ``readout_per_group[g]`` is the short readout frame scored against them.  Honours the
+        Stop event between brackets (interruptible).  Identical on real hardware -- only the
+        camera frames' author differs (``virtual == real``)."""
+        from ..timing import imaging_channel_kwargs, reference_bracket_sequence
+        n_ref = int(self.REFERENCE_FRAMES_PER_BRACKET)
+        readout_index = n_ref // 2
+        bracket = reference_bracket_sequence(
+            ref_exposure=self.sitemap_exposure, readout_exposure=self.readout_exposure,
+            n_ref=n_ref, **imaging_channel_kwargs(self.sequencer))
+        n_groups = max(2, int(self.threshold_frames))
+        reference_groups: list = []
+        readout_per_group: list = []
+        for g in range(n_groups):
+            if self._stop.is_set():
+                break
+            batch = self.camera.acquire(n_ref + 1, sequence=bracket, sequencer=self.sequencer,
+                                        stop=self._stop)
+            frames = [np.asarray(f, dtype=float) for f in batch]
+            readout_per_group.append(frames[readout_index])
+            reference_groups.append([f for i, f in enumerate(frames) if i != readout_index])
+            frac = progress_lo + (progress_hi - progress_lo) * (g + 1) / n_groups
+            out.publish(frame=frames[readout_index], progress=frac, stage=f"readout bracket {g + 1}/{n_groups}")
+        return reference_groups, readout_per_group
 
     def _run_from_folder(self, out: "TaskOutput"):
         """Calibrate from frames SAVED IN A FOLDER (the real-data flow): index the run,

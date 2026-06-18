@@ -16,7 +16,6 @@ from .base import CameraDevice, SequencerDevice, TrapArrayDevice, snap_subarray
 from ..timing import (
     DEFAULT_CAMERA_TRIGGER_CHANNELS,
     PulseSequence,
-    exposure_from_sequence,
     imaging_channel_kwargs,
     imaging_sequence,
     sequence_for_frame_count,
@@ -406,7 +405,13 @@ class VirtualCamera(CameraDevice):
         if sequence is not None and sequencer is not None:
             sequencer.prepare(runtime_sequence)
             sequencer.fire(runtime_sequence)
-        exposure = exposure_from_sequence(effective_sequence, default=self.exposure, channel=probe_channel)
+        # Per-frame integration time: a real externally-triggered camera integrates each
+        # frame for the window ITS trigger gates, so a heterogeneous bracket (long-short-long
+        # reference) images successive frames for different durations.  For a uniform repeated
+        # sequence every entry equals the one exposure (the legacy single-exposure behaviour).
+        probe_set = [probe_channel] + (["ch02"] if probe_channel == "probe" else [])
+        exposures = exposures_per_frame(runtime_sequence, frames, default=self.exposure,
+                                        trigger_channels=trigger_channels, probe_channels=probe_set)
         # "All sites loaded" (the sitemap template) is requested explicitly via
         # ``force_all_sites``; the legacy fallback keys off the sequence name.
         all_sites = (
@@ -445,7 +450,7 @@ class VirtualCamera(CameraDevice):
                     self.trap_array.reload(cooling_duration=cool_dt)  # fresh independent loading (cooling-time scaled)
                 elif trap_off_per_frame[frame_index] > 0.0:
                     self.trap_array.apply_recapture_loss(trap_off_per_frame[frame_index])  # same atoms, released
-            image = self.trap_array.render_image(exposure=exposure, all_sites=all_sites)
+            image = self.trap_array.render_image(exposure=exposures[frame_index], all_sites=all_sites)
             if self._roi is not None:
                 # crop to the applied sub-array, exactly as a real camera reads out
                 # only its ROI -- so the displayed frame IS the ROI region (x, w, y, h)
@@ -747,6 +752,45 @@ def trap_off_durations_per_frame(
     return out
 
 
+def exposures_per_frame(
+    sequence: PulseSequence | None,
+    frames: int,
+    *,
+    default: float,
+    trigger_channels: Sequence[str] | None = None,
+    probe_channels: Sequence[str] = ("probe",),
+) -> list[float]:
+    """Probe-ON integration time (s) for each acquired frame, frame by frame.
+
+    A real externally-triggered camera integrates for the window its OWN trigger gates,
+    so a sequence may image successive frames for DIFFERENT durations (e.g. a
+    long-short-long reference bracket: two 20 ms ground-truth images around a 5 ms
+    readout).  Entry ``k`` is the probe-channel ON time in the window from camera trigger
+    ``k`` to trigger ``k+1`` (the last frame runs to the sequence end).  For a uniform
+    single-trigger sequence repeated per frame, every entry equals the one exposure -- so
+    this is a no-op generalisation of :func:`exposure_from_sequence` for the render loop.
+    Data-source side only; the analysis layer never reads it."""
+    out = [float(default)] * int(frames)
+    if sequence is None or not hasattr(sequence, "effective_pulses"):
+        return out
+    trig_set = {str(c) for c in (DEFAULT_CAMERA_TRIGGER_CHANNELS if trigger_channels is None else trigger_channels)}
+    probe_set = {str(c) for c in probe_channels}
+    pulses = sequence.effective_pulses()
+    trigger_starts = sorted(p.start for p in pulses if p.value and p.channel in trig_set)
+    if not trigger_starts:
+        return out
+    probe_intervals = sorted((p.start, p.stop) for p in pulses if p.value and p.channel in probe_set)
+    duration = float(getattr(sequence, "duration", 0.0)) or max((e for _, e in probe_intervals), default=0.0)
+    n = min(int(frames), len(trigger_starts))
+    for k in range(n):
+        lo = trigger_starts[k]
+        hi = trigger_starts[k + 1] if k + 1 < len(trigger_starts) else max(duration, lo)
+        total = sum(max(0.0, min(e, hi) - max(s, lo)) for s, e in probe_intervals if s < hi and e > lo)
+        if total > 0.0:
+            out[k] = float(total)
+    return out
+
+
 def point_tuple(value, name: str) -> tuple[float, float]:
     try:
         raw = tuple(value)
@@ -786,6 +830,7 @@ __all__ = [
     "VirtualSequencer",
     "VirtualTrapArray",
     "cooling_durations_per_frame",
+    "exposures_per_frame",
     "trap_off_durations_per_frame",
     "virtual_config",
     "virtual_config_with_overrides",

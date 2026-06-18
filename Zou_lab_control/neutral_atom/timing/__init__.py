@@ -11,6 +11,7 @@ from .sequence import (
     imaging_channel_kwargs,
     imaging_sequence,
     plot_sequence,
+    reference_bracket_sequence,
     positive_float,
     sequence_for_frame_count,
 )
@@ -63,6 +64,7 @@ __all__ = [
     "generate_verilog",
     "generate_xdc",
     "imaging_sequence",
+    "reference_bracket_sequence",
     "infer_bus_channels",
     "load_scan_table",
     "plot_sequence",

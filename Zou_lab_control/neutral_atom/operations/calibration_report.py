@@ -76,9 +76,13 @@ def _render_figures(folder, *, counts, thresholds, fidelity, centers, template,
 
 
 def _by_method_report(calibration, readout_frames) -> dict:
-    """For every readout method the calibration carries (box / per-site PSF / uniform PSF),
-    the per-site counts (via that method's ``calibration.signals``) + that method's
-    thresholds + per-site fidelity -- so the report shows one grid per method to compare."""
+    """SELF-CONSISTENT fallback (no ground truth available): for every readout method the
+    calibration carries, the per-site counts + that method's otsu threshold + the two-
+    population fidelity ESTIMATE.  NOTE: that estimate is affine-invariant, so box / PSF /
+    uniform-PSF come out near-identical -- it measures the empirical bimodality of the SAME
+    photons, not classification accuracy.  Use :func:`_held_out_by_method` when reference
+    (bracket) frames give real labels; this path is only for folder runs that kept no
+    reference groups."""
     out: dict[str, dict] = {}
     try:
         methods = tuple(calibration.methods())
@@ -96,8 +100,56 @@ def _by_method_report(calibration, readout_frames) -> dict:
     return out
 
 
+def _reference_signal_array(calibration, reference_groups, *, method=None) -> np.ndarray:
+    """``(n_groups, n_ref, n_sites)`` reference signals -- the high-SNR long bracket frames
+    that vote ground truth, extracted with ONE fixed method (box on the long frames) so the
+    occupancy LABELS are identical across the readout methods being compared."""
+    n_sites = len(np.asarray(calibration.centers))
+    groups = [[np.asarray(calibration.signals(np.asarray(f, dtype=float), method=method),
+                          dtype=float).reshape(-1) for f in refs]
+              for refs in reference_groups]
+    if not groups:
+        return np.empty((0, 0, n_sites), dtype=float)
+    return np.asarray(groups, dtype=float)
+
+
+def _held_out_by_method(calibration, reference_groups, readout_by_group) -> dict:
+    """Per-method HELD-OUT fidelity against bracket-voted ground truth (the real Rb87 flow).
+
+    The long reference frames of each bracket vote a per-(group, site) occupancy label
+    (strict consensus -- a shot where they disagree is an atom-loss event, marked ambiguous
+    and dropped).  For EACH readout method the per-site threshold is then trained on a
+    training split of the SHORT readout signal and the fidelity scored on a HELD-OUT test
+    split.  Because PSF matched-filtering separates the labelled bright/dark populations
+    better than a square box (especially on the short, noisy readout), the methods get
+    DISTINCT fidelities -- the whole point of computing all three.  ``{}`` if no labels."""
+    from .fidelity import characterize_readout
+
+    reference = _reference_signal_array(calibration, reference_groups, method="box")  # fixed labels
+    if reference.size == 0 or reference.shape[1] < 1 or len(readout_by_group) != reference.shape[0]:
+        return {}
+    out: dict[str, dict] = {}
+    try:
+        methods = tuple(calibration.methods())
+    except Exception:
+        methods = ()
+    for m in methods:
+        short = np.vstack([np.asarray(calibration.signals(np.asarray(f, dtype=float), method=m),
+                                      dtype=float).reshape(-1) for f in readout_by_group])
+        try:
+            report = characterize_readout(short, reference)
+        except Exception:
+            continue
+        out[str(m)] = {"counts": short,
+                       "thresholds": np.asarray(report.thresholds, dtype=float).reshape(-1),
+                       "fidelity": np.asarray(report.site_fidelities, dtype=float),
+                       "held_out": True}
+    return out
+
+
 def write_calibration_report(folder, *, calibration, readout_frames, template=None,
-                             threshold_method: str = "otsu", timestamp: str = "") -> dict:
+                             threshold_method: str = "otsu", timestamp: str = "",
+                             reference_groups=None, readout_by_group=None) -> dict:
     """Write the per-site distribution grid + global distribution(+fidelity) + site-map
     PNGs (via the frontend) and a ``calibration.npz`` + ``calibration.json`` +
     ``summary.json`` (the numbers) into ``folder`` (created if needed).
@@ -105,17 +157,33 @@ def write_calibration_report(folder, *, calibration, readout_frames, template=No
     Returns a summary dict (paths + n_sites + mean fidelity).  The numbers are derived
     purely from the calibration contract + readout frames (identical on real hardware);
     the figures come from the registered viewer, so they use the live console's plot
-    types rather than hand-rolled matplotlib."""
+    types rather than hand-rolled matplotlib.
+
+    When ``reference_groups`` + ``readout_by_group`` are given (the Rb87 reference-bracket
+    flow -- long frames that vote ground truth around each short readout), the per-method
+    fidelity is the HELD-OUT classification fidelity against those labels, so box / per-site
+    PSF / uniform PSF get DISTINCT numbers; otherwise it falls back to the affine-invariant
+    self-consistent estimate (a folder run that kept no reference groups)."""
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
     centers = np.asarray(calibration.centers, dtype=float)
     thresholds = np.asarray(calibration.thresholds, dtype=float).reshape(-1)
     counts = per_site_counts(calibration, readout_frames)
-    fidelity = (per_site_fidelity(counts, thresholds) if counts.size
-                else np.full(len(centers), np.nan))
     # one per-site grid PER readout method the calibration carries (box / per-site PSF /
     # uniform PSF) -- the experimenter compares the three readout models side by side.
-    by_method = _by_method_report(calibration, readout_frames)
+    by_method = {}
+    if reference_groups and readout_by_group:
+        by_method = _held_out_by_method(calibration, reference_groups, readout_by_group)
+    held_out = bool(by_method)
+    if not held_out:
+        by_method = _by_method_report(calibration, readout_frames)
+    # the top-level fidelity (global distribution + summary) follows the BOX panel, so it is
+    # the held-out classification fidelity when reference labels exist, else the estimate.
+    if held_out and "box" in by_method:
+        fidelity = np.asarray(by_method["box"]["fidelity"], dtype=float)
+    else:
+        fidelity = (per_site_fidelity(counts, thresholds) if counts.size
+                    else np.full(len(centers), np.nan))
 
     paths = _render_figures(
         folder, counts=counts, thresholds=thresholds, fidelity=fidelity, centers=centers,
