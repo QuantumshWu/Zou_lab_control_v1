@@ -124,11 +124,11 @@ PANEL_INPUT_FORMAT: dict[str, str] = {
     "hist": "a 1D sample vector",
 }
 
-# How many SIGNAL INPUT SLOTS each plot kind has, and what each slot is.  A plot is a
-# GENERIC multi-input view: it reads ``signal[0]``, ``signal[1]``, ... (a list) in its
-# source expression, one hub signal picked per slot in the Setting.  Most kinds take ONE
-# slot (the value); the site map takes THREE (occupancy + centers + image).  A future
-# plot type with more inputs is just a longer slot list -- no per-kind params needed.
+# The ONE input each plot kind takes (label, default-signal, tooltip).  A plot reads its
+# picked input as ``signal`` in the source expression (``value = signal``); the site map
+# takes only its occupancy signal and resolves the ring centres + frame underlay from the
+# SAME producing node (never extra slots).  This stays a one-tuple list so the Setting's
+# slot machinery + saved-layout ``inputs`` list keep one uniform shape.
 # Each slot = (label, default-signal-name, tooltip).
 _DEFAULT_SLOTS = (("signal", "", "the hub signal to plot"),)
 # The site map takes ONE signal -- the per-site occupancy.  Its site CENTRES and the
@@ -941,8 +941,7 @@ class PanelCard(FluentGroupBox):
 
     def _signal_combo_items(self) -> list[tuple[str, str]]:
         """``[(display, bare_name)]`` for every LIVE hub signal, each labelled
-        ``name — source  [shape]`` -- the SINGLE source every input-SLOT picker
-        (signal[0], signal[1], ... including the site map's centers/image slots) shares,
+        ``name — source  [shape]`` -- the SINGLE source the panel's signal picker shares,
         so a signal is picked the same way everywhere (by origin + shape, not typed)."""
         names: list[str] = []
         if callable(self.names_provider):
@@ -993,10 +992,10 @@ class PanelCard(FluentGroupBox):
             combo.setCurrentIndex(idx if idx >= 0 else 0)
 
     def _refresh_signal_combo(self) -> None:
-        """Refresh EVERY input-slot picker with the hub's current signals, each labelled
-        with the measurement/processor that PRODUCES it (``occupied — occupancy``) so a
-        slot is filled by origin, not a bare name.  Each slot keeps its own ``config.inputs[i]``
-        selected; the source expression reads them as ``signal[0]``, ``signal[1]``, ..."""
+        """Refresh the signal picker with the hub's current signals, each labelled with the
+        measurement/processor that PRODUCES it (``occupied — occupancy``) so the input is
+        filled by origin, not a bare name.  It keeps ``config.inputs[0]`` selected; the source
+        expression reads it as ``signal`` (``value = signal``)."""
         for i, combo in enumerate(getattr(self, "slot_combos", [])):
             cur = self.config.inputs[i] if i < len(self.config.inputs) else ""
             self._fill_slot_combo(combo, cur)
@@ -1340,10 +1339,10 @@ class PanelCard(FluentGroupBox):
 
     def _co_names(self) -> frozenset:
         """The hub-signal names this panel reads (cached) -- for the monitor roll-gate
-        and the 2D coordinate-frame (ROI) lookup.  This is BOTH the identifiers the
-        source expression names directly AND the slot inputs it pulls in as
-        ``signal[i]`` (the default ``value = signal[0]`` form references ``signal``, not
-        the real name, so the slot names must be folded in or version-gating misses)."""
+        and the 2D coordinate-frame (ROI) lookup.  This is BOTH the identifiers the source
+        expression names directly AND the picked input: the default ``value = signal`` form
+        references the pseudo ``signal`` (not the real name), so ``config.inputs`` is folded
+        in or version-gating would miss the input's updates."""
         key = (self._compiled_source, tuple(self.config.inputs))
         if key != self._ref_src:               # (re)derive on source OR slot change
             self._ref_src = key
