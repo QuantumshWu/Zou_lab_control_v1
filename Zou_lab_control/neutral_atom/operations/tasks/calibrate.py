@@ -37,11 +37,12 @@ CALIBRATE_PARAMS = (
                       "saved frames = calibrate from frames already in `folder`; "
                       "saved calibration = reload a finished calibration.json from `folder` (no acquisition)."),
     ParamDecl("folder", "folder", "path", default=DEFAULT_DATA_DIR, required=True, path_mode="dir",
+              base_dir=DEFAULT_DATA_DIR,
               tooltip="The ONE data directory (input + output).  A live run writes its calibration "
                       "+ distribution/fidelity report to a timestamped sub-folder here; the saved-* "
                       "sources read frames / calibration.json from here."),
     ParamDecl("pulse_template", "pulse template", "path", default=DEFAULT_PULSE_TEMPLATE,
-              path_mode="file", file_filter="Pulse program (*.json);;All files (*)",
+              path_mode="file", file_filter="Pulse program (*.json);;All files (*)", base_dir="pulses",
               tooltip="The imaging pulse program to LOAD (a real PulseTableState .json from the pulse "
                       "GUI); each pass sets its exposure on the 'image' window.  Defaults to the shipped "
                       "imaging template -- Browse to load your own."),

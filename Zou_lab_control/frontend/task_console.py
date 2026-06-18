@@ -1795,7 +1795,8 @@ class MeasurementPanel(QtWidgets.QWidget):
                     "" if decl.default is None else str(decl.default),
                     mode=getattr(decl, "path_mode", "file"),
                     caption=f"Choose {decl.key}",
-                    file_filter=getattr(decl, "file_filter", "All files (*)"))
+                    file_filter=getattr(decl, "file_filter", "All files (*)"),
+                    base_dir=getattr(decl, "base_dir", ""))
                 picker.setToolTip(decl.tooltip)
                 picker.changed.connect(lambda *_: self._refresh_start_enabled())
                 self.form.addRow(label_text, picker)

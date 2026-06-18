@@ -79,6 +79,9 @@ class ParamDecl:
     tooltip: str = ""
     path_mode: str = "file"          # kind="path": "file" (open-file dialog) | "dir" (folder dialog)
     file_filter: str = "All files (*)"  # kind="path", path_mode="file": the open-file filter
+    base_dir: str = ""               # kind="path": the folder a Browse dialog opens in when the
+                                     # field doesn't resolve to an existing path (e.g. "pulses"
+                                     # for a pulse template, "calibrations" for a data folder)
 
     def __post_init__(self) -> None:
         kind = str(self.kind).lower()

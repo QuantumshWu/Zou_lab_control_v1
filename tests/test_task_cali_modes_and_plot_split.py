@@ -228,10 +228,11 @@ def test_gui_measurement_node_is_plot_false_publishes_to_hub_only():
         console._add_panel()
         row = console.logic_nodes[-1]
         console._start_logic_node(row)
+        published_y = f"{spec.key}_{spec.y_key}"        # node publishes under its slug
         deadline = time.monotonic() + 8.0
-        while spec.y_key not in console.hub.names() and time.monotonic() < deadline:
+        while published_y not in console.hub.names() and time.monotonic() < deadline:
             time.sleep(0.03)
-        assert spec.y_key in console.hub.names()       # data on the hub
+        assert published_y in console.hub.names()       # data on the hub
         assert console.cards == []                     # plot=False: no auto plot panel
     finally:
         console.shutdown()

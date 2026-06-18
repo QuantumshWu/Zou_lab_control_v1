@@ -839,11 +839,15 @@ class FluentPathEdit(QtWidgets.QWidget):
     changed = QtCore.pyqtSignal(str)
 
     def __init__(self, text: str = "", *, mode: str = "file", caption: str = "Choose",
-                 file_filter: str = "All files (*)", parent=None):
+                 file_filter: str = "All files (*)", base_dir: str = "", parent=None):
         super().__init__(parent)
         self._mode = "dir" if str(mode) == "dir" else "file"
         self._caption = str(caption)
         self._filter = str(file_filter)
+        # The folder the Browse dialog opens in when the field doesn't point at an existing
+        # path -- e.g. ``pulses`` for a pulse template, ``calibrations`` for a data folder --
+        # so the operator lands where the files actually live, not the process CWD.
+        self._base_dir = str(base_dir)
         self.setStyleSheet("background: transparent;")
         row = QtWidgets.QHBoxLayout(self)
         row.setContentsMargins(0, 0, 0, 0)
@@ -864,13 +868,35 @@ class FluentPathEdit(QtWidgets.QWidget):
         row.addWidget(self.browse, 0)
 
     def _browse(self) -> None:
-        start = self.edit.text().strip()
+        start = self._dialog_start()
         if self._mode == "dir":
             picked = QtWidgets.QFileDialog.getExistingDirectory(self, self._caption, start)
         else:
             picked, _ = QtWidgets.QFileDialog.getOpenFileName(self, self._caption, start, self._filter)
         if picked:
             self.edit.setText(picked)   # fires textChanged -> changed
+
+    def _dialog_start(self) -> str:
+        """Where the Browse dialog opens: the current path if it's a real file/dir or sits in
+        a real directory the user typed; otherwise ``base_dir`` (the folder these files live
+        in, created if needed) so a BARE default like ``imaging_template.json`` still lands in
+        ``pulses/`` rather than the CWD; otherwise the CWD."""
+        import os
+        cur = self.edit.text().strip()
+        if cur and os.path.exists(cur):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent and os.path.isdir(parent):       # user typed a real-dir-qualified path
+            return cur
+        if self._base_dir:
+            base = os.path.abspath(self._base_dir)
+            if not os.path.isdir(base):
+                try:
+                    os.makedirs(base, exist_ok=True)
+                except OSError:
+                    return os.getcwd()
+            return base
+        return os.getcwd()
 
     def text(self) -> str:
         return self.edit.text()

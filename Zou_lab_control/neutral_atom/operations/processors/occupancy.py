@@ -34,7 +34,7 @@ def judge_occupancy(readout) -> ProcessorSpec:
 
     params = (
         ParamDecl("calibration", "Calibration file", "path", default="", path_mode="file",
-                  file_filter="Calibration (*.json *.npz);;All files (*)",
+                  file_filter="Calibration (*.json *.npz);;All files (*)", base_dir="calibrations",
                   tooltip="A saved calibration (.npz/.json: site centers + per-site thresholds "
                           "[+ PSF kernels]) -- e.g. a Calibrate-readout task's saved artifact.  "
                           "Blank = use the CURRENT session calibration."),
