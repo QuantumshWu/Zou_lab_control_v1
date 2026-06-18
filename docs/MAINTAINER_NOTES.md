@@ -80,6 +80,56 @@ Invariants:
   (`subsystems/`, readout), not in timing. Do not push exposure/threshold/feedback
   decisions down into the sequencer; keep playback and acquisition decoupled.
 
+### Readout-fidelity calibration: the reference-bracket flow
+
+`TrapCalibration.signals(image, method=)` extracts one scalar per site by one of three
+readout models — `box` (square ROI, no background subtraction), `psf` (per-site
+matched-filter, annulus background), `uniform_psf` (one shared kernel, annulus). The
+background model is PART of the readout and is carried per method in `by_method`, so
+`signals(method=m)` reads on the SAME scale `m`'s thresholds were trained on.
+
+`CalibrateReadoutTask` (`operations/logic.py`) follows the Rb87 single-atom flow:
+
+1. **Site map + PSF** from averaging many long reference frames (each images a real ~50%
+   loading; the average reveals every trap).
+2. **Reference brackets** (`_collect_bracket_groups`): each shot is ONE correlated
+   long-short-long camera sequence (`timing.reference_bracket_sequence`) imaging the SAME
+   atoms — the trap is held on and there is NO re-cooling between triggers, so a following
+   frame sees the previous frame's survivors. Comparing the two long frames tells whether
+   the atom survived; when they AGREE (strict consensus) they vote the ground-truth
+   occupancy for the short readout, and a shot where they disagree (atom loss, modelled by
+   the virtual `detection_lifetime`) is dropped as ambiguous.
+3. **Held-out per-method fidelity** (`operations.fidelity.characterize_readout`, run per
+   method in `calibration_report._held_out_by_method`): each method's per-site threshold is
+   trained on a split of the labelled short readout and scored on a HELD-OUT split. Because
+   box / per-site PSF / uniform PSF weight the photons differently, their held-out fidelity
+   at a fidelity-limited readout DIFFERS — this is why the report computes all three. The
+   self-consistent otsu-split fidelity estimate is affine-invariant and CANNOT tell the
+   methods apart, so it is only the fallback for folder runs that kept no reference brackets.
+4. The reference-trained per-site thresholds are written back into the calibration
+   (`with_method_thresholds`, `threshold_method="per_site_reference"`) so `detect` reads on
+   the trained boundary, not the otsu quick split.
+
+**Per-frame exposure.** A real externally-triggered camera integrates each frame for the
+window ITS trigger gates, so a heterogeneous bracket images successive frames for different
+durations. The virtual camera honours this via `devices.virtual.exposures_per_frame`
+(parallel to the cooling/trap-off per-frame helpers); a uniform repeated sequence yields one
+exposure per frame, identical to the legacy behaviour. The real qCMOS adapter, given a
+non-uniform bracket, integrates for the longest probe (the trigger gates each frame; atoms
+scatter only during their own probe), keeping virtual == real.
+
+### Fluent tab bar (frontend): water-fill, no scroll arrows
+
+`FluentTabWidget` (`frontend/qt_fluent._FluentTabBar`) is a pivot-underline tab bar. When the
+tabs overflow the bar it WATER-FILLS: only the widest tabs are capped to a shared width and
+their labels elide with `...`, while short tabs (Monitor / Logic) keep their natural width;
+every tab — including its right-side close `x` — stays inside the bar, so no native scroll
+arrows ever appear and no close `x` is clipped. `sizeHint` reports the NATURAL total (so the
+QTabWidget grants the bar its full width; `tabSizeHint` caps to the actual width); reporting
+the capped sum would feed back and collapse the bar. The corner `...` overflow button lists
+every full title. Do NOT re-introduce an equal `width // count` squeeze (it crams short tabs
+to slivers) or native scroll chevrons (they crowd the close `x`).
+
 ## 3. Real Hardware Path
 
 Default real-hardware path (the only one hardware tutorials should use):
