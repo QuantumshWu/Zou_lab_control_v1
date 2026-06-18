@@ -42,10 +42,16 @@ else:
     class EmbeddedFigureCanvas(_FigureCanvasQTAgg):
         """Matplotlib Qt canvas with a display scale and wheel isolation."""
 
-        def __init__(self, figure, *, display_scale: float = 1.0, isolate_wheel: bool = True):
+        def __init__(self, figure, *, display_scale: float = 1.0, isolate_wheel: bool = True,
+                     render_scale: float = 1.0):
             # both must exist BEFORE super().__init__: the base class reads
             # devicePixelRatioF() (overridden below) during construction.
             self._zlc_ratio = 1.0 / max(0.1, float(display_scale))
+            # render_scale < 1 renders the Agg buffer at a LOWER dpi (cheaper text raster)
+            # and Qt scales it up to the SAME widget size -- it is factored into BOTH
+            # figure.dpi and the device-pixel-ratio so they cancel and the display size /
+            # fixed-inches axes layout are byte-identical (only slightly softer).
+            self._zlc_render_scale = max(0.05, float(render_scale))
             self._zlc_inches = tuple(float(v) for v in figure.get_size_inches())
             # isolate_wheel=True: in-plot wheel zoom never leaks to a surrounding
             # scroll area (interactive plots).  False: the wheel PROPAGATES, so a
@@ -60,8 +66,10 @@ else:
         # ------------------------------------------------------------- ratio math
         def devicePixelRatioF(self):  # noqa: N802 - Qt naming
             # The backend derives the render-buffer size, sizeHint, mouse-event
-            # coordinates and the painter's image scaling from this one ratio.
-            return (super().devicePixelRatioF() or 1.0) * self._zlc_ratio
+            # coordinates and the painter's image scaling from this one ratio.  The
+            # render_scale rides in here too: figure.dpi carries the SAME factor, so the
+            # buffer shrinks (cheaper raster) while widget size = buffer / this is unchanged.
+            return (super().devicePixelRatioF() or 1.0) * self._zlc_ratio * self._zlc_render_scale
 
         def _set_device_pixel_ratio(self, ratio):
             # Reroute every stock sync (showEvent, screen/dpi-change signals)
@@ -75,12 +83,14 @@ else:
 
         def _zlc_sync(self) -> None:
             real = super().devicePixelRatioF() or 1.0
+            rs = self._zlc_render_scale
             figure = self.figure
             # invariant 1: the design inches NEVER change (fixed-inches axes)
             figure.set_size_inches(*self._zlc_inches, forward=False)
-            # invariant 2: retina supersampling by the REAL screen ratio only
-            figure._set_dpi(figure._original_dpi * real, forward=False)
-            self._device_pixel_ratio = real * self._zlc_ratio
+            # invariant 2: retina supersampling by the REAL screen ratio, times the live
+            # render_scale (rs<1 -> smaller/cheaper buffer; rs cancels in the widget size).
+            figure._set_dpi(figure._original_dpi * real * rs, forward=False)
+            self._device_pixel_ratio = real * self._zlc_ratio * rs
             # invariant 3: logical widget size = design px x display_scale
             width_px, height_px = map(float, figure.bbox.max)
             self.resize(round(width_px / self._device_pixel_ratio),
@@ -114,7 +124,11 @@ def panel_canvas(figure, *, isolate_wheel: bool = True):
     if EmbeddedFigureCanvas is None:  # pragma: no cover - matplotlib-qt missing
         raise RuntimeError("matplotlib Qt canvas is not available")
     from .live import PANEL_DISPLAY_SCALE
-    return EmbeddedFigureCanvas(figure, display_scale=PANEL_DISPLAY_SCALE, isolate_wheel=isolate_wheel)
+    from .style import LIVE_RENDER_SCALE
+    # Live panels render at LIVE_RENDER_SCALE x design dpi (150 dpi) for speed; the display
+    # size is unchanged (Qt upscales the smaller buffer).  Saved figures use savefig.dpi.
+    return EmbeddedFigureCanvas(figure, display_scale=PANEL_DISPLAY_SCALE,
+                                isolate_wheel=isolate_wheel, render_scale=LIVE_RENDER_SCALE)
 
 
 __all__ = ["EmbeddedFigureCanvas", "panel_canvas"]

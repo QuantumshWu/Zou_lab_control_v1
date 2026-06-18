@@ -1358,13 +1358,15 @@ def test_task_console_cards_are_modular(monkeypatch):
         if card.canvas is not None:               # the canvas must FIT inside its card
             assert abs(card.canvas.width() - canvas_w) <= 1
             assert abs(card.canvas.height() - canvas_h) <= 1
-            # the figure renders FULL SIZE in the ONE 300-dpi design system and
-            # is shown scaled; under the high-DPI canvas path matplotlib stores
-            # the design dpi in _original_dpi and inflates fig.dpi by the ratio
-            # (the same thing a real high-DPI screen does to every figure).
+            # the figure carries the ONE design dpi in _original_dpi; the live canvas
+            # renders the Agg buffer at LIVE_RENDER_SCALE x that (cheaper text raster) and
+            # UPSCALES it to the fixed display size (asserted above) -- so the render buffer
+            # is SMALLER than the on-screen widget (the speed win), unchanged display size.
+            from Zou_lab_control.frontend.style import LIVE_RENDER_SCALE
             fig = card.plotter.fig
             assert getattr(fig, "_original_dpi", fig.dpi) == DESIGN_DPI
-            assert card.canvas.width() < fig.get_size_inches()[0] * fig.dpi
+            if LIVE_RENDER_SCALE < 1.0:
+                assert fig.get_size_inches()[0] * fig.dpi < card.canvas.width()
     # same size -> identical card (the hist and monitor 1x2 cards)
     sizes = {}
     for card in console.cards:

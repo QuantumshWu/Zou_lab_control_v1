@@ -39,7 +39,14 @@ SANS_SERIF = ([_FONT_NAME] if _FONT_NAME else []) + ["Arial"]
 # them -- a value is written ONCE and never re-typed, so nothing can drift.
 # These are OWNED constants of the frontend visual system, NOT per-call knobs.
 # --------------------------------------------------------------------------- #
-DESIGN_DPI = 300                          # the one design dpi; every figure renders at this
+DESIGN_DPI = 300                          # the one DESIGN dpi; layout geometry + saved figures use it
+# LIVE on-screen render scale: an embedded Qt canvas renders its buffer at
+# ``DESIGN_DPI * LIVE_RENDER_SCALE`` (= 150 dpi) and Qt scales that smaller bitmap up to the
+# SAME fixed widget size -- text rasterisation cost ~ dpi^2, so a half-dpi buffer is ~4x
+# cheaper to draw, while the display size is byte-identical (only slightly softer).  It is
+# factored into BOTH figure.dpi and the canvas device-pixel-ratio (see EmbeddedFigureCanvas),
+# so the fixed-inches axes layout never moves.  SAVED figures ignore it (savefig.dpi below).
+LIVE_RENDER_SCALE = 0.5
 STOCK_DATA_PX = (480, 360)                # the stock single-axes data region (confocal)
 STOCK_MARGINS_PX = (110, 110, 100, 40)    # confocal stock margins (L, R, B, T)
 
@@ -259,6 +266,7 @@ def threshold_line_kwargs(linewidth: float = 1.9) -> dict[str, Any]:
 __all__ = [
     "DEFAULT_STYLE",
     "DESIGN_DPI",
+    "LIVE_RENDER_SCALE",
     "FONT_PATH",
     "NEW_BLACK",
     "PALETTE",
