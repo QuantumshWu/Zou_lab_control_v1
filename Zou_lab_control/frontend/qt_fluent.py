@@ -1241,47 +1241,62 @@ class _FluentTabCloseButton(QtWidgets.QToolButton):
 
 
 class _FluentTabBar(QtWidgets.QTabBar):
-    """Tab bar that GUARANTEES every tab (and its close ``x``) fits the bar width.
+    """Pivot tab bar that fits every tab WITHOUT scroll arrows and WITHOUT clipping a close
+    ``x``, while keeping short tabs at full width.
 
-    When the natural tab widths would overflow the bar, each tab is capped to an EQUAL
-    share of the available width (``width // count``, floored), so ``count`` tabs always
-    sum to <= the bar width and the rightmost tab's close ``x`` is never clipped by the
-    bar / window edge (the reported "x cut off").  ``ElideRight`` then trims each label to
-    its capped box; full names stay reachable in the overflow ``...`` menu.  Below the
-    floor (many tabs) the menu is the navigation -- nothing dangles half-painted before it.
-    """
+    When the natural tab widths overflow the bar, the WIDEST tabs are capped to a shared
+    width (water-filling) and ``ElideRight`` trims only their labels: ``Monitor`` / ``Logic``
+    stay full, long Edit titles trim with a trailing ``...``, and every tab's close ``x``
+    stays painted because the cap reserves the right-side button slot.  This is the
+    squeeze-free replacement for the old ``width//count`` layout that crammed EVERY tab
+    (short ones included) to an equal sliver.  ``sizeHint`` still reports the NATURAL total
+    so the QTabWidget grants the bar its full window-capped width (``tabSizeHint`` caps to
+    that ACTUAL width); reporting the capped sum instead would feed back and collapse the
+    bar.  No tab scrolls off, so no scroll arrows appear; the corner ``...`` overflow menu
+    lists every FULL title.  Reusable, frontend-owned."""
 
-    def _natural_total(self) -> int:
+    def _natural_widths(self) -> list:
+        # Explicit base call (NOT a no-arg super(), which fails inside a comprehension frame).
         base = QtWidgets.QTabBar.tabSizeHint
-        return sum(base(self, i).width() for i in range(self.count()))
+        return [base(self, i).width() for i in range(self.count())]
 
-    def sizeHint(self):  # noqa: N802 - Qt naming
-        # Report the NATURAL total width so the QTabWidget allocates the bar its full
-        # (window-capped) width.  tabSizeHint squeezes per-tab to the bar's ACTUAL width
-        # below; if sizeHint reported the squeezed sum instead it would feed back and
-        # collapse the bar to that smaller size (then text vanishes, x crowds the edge).
-        hint = QtWidgets.QTabBar.sizeHint(self)
-        n = self.count()
-        return QtCore.QSize(self._natural_total(), hint.height()) if n > 0 else hint
+    def _shrink_cap(self):
+        """Water-filling width cap: the largest ``cap`` such that capping every tab at it
+        sums to <= the bar width.  Tabs already narrower than ``cap`` (Monitor / Logic) keep
+        their natural width; only the wide Edit tabs are capped + elided.  None when all fit."""
+        avail = self.width()
+        widths = sorted(self._natural_widths())
+        n = len(widths)
+        if n == 0 or avail <= 0 or sum(widths) <= avail:
+            return None
+        floor = scaled_px(76, minimum=60)            # never below an elided label + the close x
+        prefix = 0
+        for k in range(n):
+            cap = (avail - prefix) / (n - k)         # share the remainder among the wide tabs
+            if cap <= widths[k]:
+                return max(int(cap), floor)
+            prefix += widths[k]                      # this tab fits under the cap -> keeps natural
+        return floor
 
     def tabSizeHint(self, index):  # noqa: N802 - Qt naming
-        # NOTE: a no-arg super() does NOT work inside the generator below (its frame's first
-        # local is the iterator, not self), so call the base method EXPLICITLY.
         base = QtWidgets.QTabBar.tabSizeHint
         hint = base(self, index)
-        n = self.count()
-        avail = self.width()                             # the bar's ACTUAL allocated width
-        if n <= 0 or avail <= 0 or self._natural_total() <= avail:
-            return hint                                  # everything fits -> natural widths
-        floor = scaled_px(56, minimum=44)                # room for an elided label + the x
-        return QtCore.QSize(max(floor, avail // n), hint.height())
+        cap = self._shrink_cap()
+        if cap is None or hint.width() <= cap:
+            return hint                              # fits (or is a short tab) -> natural width
+        return QtCore.QSize(cap, hint.height())
 
-    def is_squeezed(self) -> bool:
-        """True when the NATURAL tab widths overflow the bar (tabs are being capped + their
-        text elided) -- the cue to show the overflow ``...`` menu of full names."""
-        n = self.count()
+    def sizeHint(self):  # noqa: N802 - Qt naming
+        hint = QtWidgets.QTabBar.sizeHint(self)
+        widths = self._natural_widths()
+        return QtCore.QSize(sum(widths), hint.height()) if widths else hint
+
+    def is_overflowing(self) -> bool:
+        """True when the natural tab widths exceed the bar (some labels are being elided) --
+        the cue to offer the ``...`` overflow menu of full titles."""
+        widths = self._natural_widths()
         avail = self.width()
-        return n > 0 and avail > 0 and self._natural_total() > avail
+        return bool(widths) and avail > 0 and sum(widths) > avail
 
 
 class FluentTabWidget(QtWidgets.QTabWidget):
@@ -1298,16 +1313,15 @@ class FluentTabWidget(QtWidgets.QTabWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setTabPosition(QtWidgets.QTabWidget.North)
-        self.setTabBar(_FluentTabBar(self))     # caps tab widths so the close x never clips
+        self.setTabBar(_FluentTabBar(self))     # content-width pivot tabs; elides to fit, no arrows
         self.tabBar().setExpanding(False)
-        # No left/right scroll ARROWS (the native chevrons crowd the last tab's close
-        # "x" and read as browser chrome, not Fluent).  When the tabs overflow the bar,
-        # ONE Fluent overflow button (a corner ``...``) lists every tab and jumps to the
-        # picked one -- the on-brand overflow affordance, see _build_overflow_button.
+        # No left/right scroll ARROWS (the native chevrons crowd the last tab's close "x"
+        # and read as browser chrome, not Fluent).  With scroll buttons OFF and ElideRight,
+        # Qt shrinks the OVERFLOWING tabs by eliding their labels so ALL tabs fit side by
+        # side -- short tabs (Monitor / Logic) stay full, long Edit titles trim with "..."
+        # and every tab's close "x" stays fully painted (the reported "x cut off" is gone).
+        # The corner ``...`` overflow button lists every FULL title for navigation.
         self.setUsesScrollButtons(False)
-        # Elide tab TEXT (not the close x) when the tabs would overflow the bar, so the
-        # rightmost tab + its close x are never clipped by the bar/window edge (the
-        # reported "x cut off").  Full names stay reachable via the overflow ... menu.
         self.tabBar().setElideMode(QtCore.Qt.ElideRight)
         # No NATIVE close buttons.  A plain ``addTab()`` tab is PERMANENT (no X),
         # so GUIs that use ``addTab`` directly (e.g. the pulse editor's
@@ -1403,11 +1417,11 @@ class FluentTabWidget(QtWidgets.QTabWidget):
 
     def _tabs_overflow(self) -> bool:
         bar = self.tabBar()
-        # _FluentTabBar caps tab widths so they always fit (its sizeHint then equals the bar
-        # width); ask it whether the NATURAL widths overflowed (tabs squeezed + text elided),
-        # which is the real cue to offer the overflow menu of full names.
-        if hasattr(bar, "is_squeezed"):
-            return bar.is_squeezed()
+        # _FluentTabBar keeps natural tab widths and scrolls on overflow; ask it whether the
+        # natural widths exceed the bar (some tabs scrolled off) -- the cue to offer the
+        # ``...`` menu of every tab (Qt scrolls the picked one into view).
+        if hasattr(bar, "is_overflowing"):
+            return bar.is_overflowing()
         return bar.count() > 0 and bar.sizeHint().width() > bar.width() + 1
 
     def _update_overflow(self) -> None:

@@ -119,3 +119,38 @@ def test_tab_overflow_uses_a_menu_button_not_scroll_arrows():
     assert w.currentIndex() == w.count() - 1
     menu.deleteLater()
     w.deleteLater()
+
+
+def test_overflowing_tabs_keep_short_tabs_full_and_never_clip_the_close_x():
+    """When the tabs overflow, the bar water-fills: the WIDEST tabs are capped (their labels
+    elide) while SHORT tabs (Monitor / Logic) keep their natural width, and EVERY tab's box
+    -- including the right-side close 'x' slot -- stays inside the bar (no half-painted tab,
+    no clipped 'x').  Regression for the disliked equal-sliver squeeze (every tab crammed to
+    width//count, short ones included) AND for the original 'x cut off' at the bar edge."""
+    app = qf.ensure_qt_app()
+    w = qf.FluentTabWidget()
+    w.add_permanent_tab(QtWidgets.QLabel("m"), "Monitor")
+    w.add_permanent_tab(QtWidgets.QLabel("l"), "Logic")
+    for name in ("Readout image", "Per-site occupancy", "Loading rate (dist)",
+                 "Loading rate", "Counts distribution", "Per-site counts"):
+        w.add_closable_tab(QtWidgets.QLabel(name), name, focus=False)
+    # narrow enough that the tabs overflow, wide enough that the short tabs still fit.
+    w.resize(960, 320); w.show(); _settle(app)
+    bar = w.tabBar()
+    assert bar.is_overflowing() is True
+
+    cap = bar._shrink_cap()
+    assert cap is not None
+    naturals = [QtWidgets.QTabBar.tabSizeHint(bar, i).width() for i in range(bar.count())]
+    # water-fill INVARIANT: a tab narrower than the cap keeps its natural width (Monitor /
+    # Logic are not shrunk), a wider tab is capped to the shared cap (its label elides).
+    for i, nat in enumerate(naturals):
+        assert bar.tabSizeHint(i).width() == (nat if nat <= cap else cap)
+    # the cap genuinely SPARES short tabs (some tab is below it) and is NOT the equal-sliver
+    # width//count of the old squeeze that crammed every tab (short ones included).
+    assert min(naturals) < cap
+    assert cap > bar.width() // bar.count()
+    # EVERY tab (laid out left to right) ends within the bar: no tab -- and so no close 'x'
+    # -- is clipped at the right edge.
+    assert all(bar.tabRect(i).right() <= bar.rect().right() + 1 for i in range(bar.count()))
+    w.deleteLater()
