@@ -132,6 +132,19 @@ def new_figure(*, spec: FigureSpec | None = None, track_cell: bool = True) -> pl
     global _FIG_COUNTER
 
     apply_style({"figure.dpi": spec.dpi} if spec is not None else None)
+    # OFF the GUI/main thread (e.g. a Calibrate-readout task rendering its report PNGs on
+    # its acquisition worker), build a MANAGER-LESS Agg figure: ``plt.figure`` registers
+    # with pyplot's GUI figure manager, which warns ("Starting a Matplotlib GUI outside of
+    # the main thread...") and is unsafe off-main-thread.  Such figures are saved to disk,
+    # never shown live, so they need no pyplot manager or cell tracking.
+    import threading
+    if threading.current_thread() is not threading.main_thread():
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.figure import Figure
+        fig = Figure(dpi=(spec.dpi if spec is not None else None))
+        FigureCanvasAgg(fig)
+        configure_canvas(fig)
+        return fig
     cell_id, run_id = _get_notebook_context()
 
     if track_cell and cell_id is not None and run_id is not None:
