@@ -64,7 +64,13 @@ class VirtualTrapArray(TrapArrayDevice):
     spacing_px: float = 12.0
     origin_px: tuple[float, float] | None = None
     # --- Loading + camera signal/noise model ---------------------------------
-    loading_probability: float = 0.5      # single-atom loading per tweezer per shot (~50%)
+    # Loading SATURATES with the cooling/MOT time: a tweezer fills (up to the
+    # light-assisted-collision ceiling ``loading_probability`` ~ 50%) with
+    # probability ``loading_probability * (1 - exp(-t_cool / load_time_constant_s))``,
+    # so a TOO-SHORT cooling pulse loads few atoms and a long one saturates -- editing
+    # the virtual pulse's cooling duration genuinely changes the camera image.
+    loading_probability: float = 0.5      # MAX single-atom loading per tweezer (collisional ceiling)
+    load_time_constant_s: float = 0.5e-3  # cooling time to reach 1-1/e of the loading ceiling
     atom_rate: float = 3_000.0            # bright-atom photon (count) rate during the probe
     background_rate: float = 8.0          # stray-light count rate (always present)
     dark_current_e_per_s: float = 0.006
@@ -72,7 +78,10 @@ class VirtualTrapArray(TrapArrayDevice):
     conversion_e_per_count: float = 0.107
     read_noise_e: float = 0.43
     atom_sigma_px: float = 1.35           # imaging PSF width (Gaussian sigma, px)
-    detection_lifetime: float = 10.0      # atom 1/e lifetime UNDER the probe (s): sets readout loss
+    # Atom 1/e lifetime UNDER the probe (s): a longer readout exposure scatters MORE
+    # photons (higher SNR) but also loses MORE atoms mid-readout, so the readout
+    # duration sets the real SNR-vs-survival trade-off a detection-time scan measures.
+    detection_lifetime: float = 0.2
     # --- Cooling / heating model (sets the temperature release-recapture sees) -
     # An atom is loaded warm (``mot_temperature_K``) and PGC-cooled toward
     # ``cooled_temperature_K``; the probe (imaging light) heats it at
@@ -120,6 +129,7 @@ class VirtualTrapArray(TrapArrayDevice):
         self.conversion_e_per_count = positive_float(self.conversion_e_per_count, "conversion_e_per_count")
         self.read_noise_e = nonnegative_float(self.read_noise_e, "read_noise_e")
         self.atom_sigma_px = positive_float(self.atom_sigma_px, "atom_sigma_px")
+        self.load_time_constant_s = positive_float(self.load_time_constant_s, "load_time_constant_s")
         self.detection_lifetime = positive_float(self.detection_lifetime, "detection_lifetime")
         self.mot_temperature_K = positive_float(self.mot_temperature_K, "mot_temperature_K")
         self.cooled_temperature_K = positive_float(self.cooled_temperature_K, "cooled_temperature_K")
@@ -148,12 +158,23 @@ class VirtualTrapArray(TrapArrayDevice):
         x0, y0 = self.origin_px
         return np.asarray([[x0 + ix * self.spacing_px, y0 + iy * self.spacing_px] for iy in range(ny) for ix in range(nx)], dtype=float)
 
-    def reload(self) -> np.ndarray:
+    def loading_fraction(self, cooling_duration: float | None = None) -> float:
+        """Single-atom loading probability per tweezer for a cooling/MOT pulse of
+        ``cooling_duration`` s: it SATURATES toward the collisional ceiling
+        ``loading_probability`` as ``1 - exp(-t / load_time_constant_s)``, so a short
+        cooling pulse loads few atoms.  ``None`` = assume a fully-saturated load (the
+        bare ``reload()`` / file-writer path)."""
+        if cooling_duration is None:
+            return self.loading_probability
+        t = max(0.0, float(cooling_duration))
+        return self.loading_probability * (1.0 - float(np.exp(-t / self.load_time_constant_s)))
+
+    def reload(self, *, cooling_duration: float | None = None) -> np.ndarray:
         """Load a FRESH atom array -- the cooling/MOT light + PGC at the start of a
         shot.  Each tweezer independently captures a single atom with probability
-        ``loading_probability`` (~50%), and every loaded atom starts PGC-cooled to
-        ``cooled_temperature_K``."""
-        self.occupancy = self.rng.random(self.n_sites) < self.loading_probability
+        :meth:`loading_fraction` (which grows with ``cooling_duration``), and every
+        loaded atom starts PGC-cooled to ``cooled_temperature_K``."""
+        self.occupancy = self.rng.random(self.n_sites) < self.loading_fraction(cooling_duration)
         self.temperature_K = np.full(self.n_sites, self.cooled_temperature_K, dtype=float)
         self._pinned = False                   # a fresh stochastic loading clears any manual pin
         return self.occupancy.copy()
@@ -392,19 +413,24 @@ class VirtualCamera(CameraDevice):
         #   * the FIRST frame always starts from a fresh shot loading.
         # render_image then images the survivors (probe scatter + readout loss + recoil
         # heating).  No analysis code learns of this -- it only receives the frames.
-        cooling_loads = cooling_loads_per_frame(runtime_sequence, frames, trigger_channels=trigger_channels)
+        # Cooling DURATION per frame (not just presence): a longer cooling/MOT pulse
+        # loads more atoms (loading_fraction), so editing the pulse's cooling time
+        # genuinely changes the loading you image.
+        cooling_durations = cooling_durations_per_frame(runtime_sequence, frames, trigger_channels=trigger_channels)
         trap_off_per_frame = trap_off_durations_per_frame(runtime_sequence, frames, trigger_channels=trigger_channels)
         images: list[np.ndarray] = []
         for frame_index in range(frames):
             if not all_sites:
+                cool_dt = cooling_durations[frame_index]
                 if frame_index == 0:
                     # Each shot starts from a fresh loading -- UNLESS the caller pinned a
                     # specific occupancy (set_occupancy, a deterministic test/debug), which
-                    # this one shot images instead of reloading.
+                    # this one shot images instead of reloading.  The loading scales with the
+                    # shot's cooling time (None -> saturated when the pulse has no cooling phase).
                     if not self.trap_array.consume_pin():
-                        self.trap_array.reload()
-                elif cooling_loads[frame_index]:
-                    self.trap_array.reload()                      # fresh independent loading + PGC cool
+                        self.trap_array.reload(cooling_duration=(cool_dt if cool_dt > 0.0 else None))
+                elif cool_dt > 0.0:
+                    self.trap_array.reload(cooling_duration=cool_dt)  # fresh independent loading (cooling-time scaled)
                 elif trap_off_per_frame[frame_index] > 0.0:
                     self.trap_array.apply_recapture_loss(trap_off_per_frame[frame_index])  # same atoms, released
             image = self.trap_array.render_image(exposure=exposure, all_sites=all_sites)
@@ -611,23 +637,23 @@ COOLING_CHANNELS = ("cooling", "mot", "pgc", "load")
 DEFAULT_TRAP_CHANNELS = ("trap", "tweezer", "dipole")
 
 
-def cooling_loads_per_frame(
+def cooling_durations_per_frame(
     sequence: PulseSequence | None,
     frames: int,
     *,
     trigger_channels: Sequence[str] | None = None,
     cooling_channels: Sequence[str] = COOLING_CHANNELS,
-) -> list[bool]:
-    """Whether a cooling/MOT pulse (a fresh atom loading) precedes each frame.
+) -> list[float]:
+    """Cooling/MOT ON-duration (s) in the window that precedes each frame.
 
-    Frames are bounded by camera-trigger rises (``trigger_channels``); ``True`` for
-    frame ``k`` means a cooling-channel pulse is ON somewhere in the window that ends
-    at trigger ``k`` (for ``k == 0`` the window runs from the sequence start to the
-    first trigger).  The virtual backend reloads a fresh ~50% loading before such a
-    frame, so an imaging shot -- and every repeat of a threshold-calibration sequence
-    -- is an INDEPENDENT loading.  Data-source side only; the analysis layer never
-    reads it (it only receives the rendered frames)."""
-    out = [False] * int(frames)
+    Frames are bounded by camera-trigger rises (``trigger_channels``); entry ``k`` is
+    the total cooling-channel ON time in the window ending at trigger ``k`` (for
+    ``k == 0`` the window runs from the sequence start to the first trigger).  A
+    non-zero entry means the pulse (re)LOADS a fresh array before that frame, and the
+    DURATION sets how full that loading is (:meth:`VirtualTrapArray.loading_fraction`)
+    -- so a longer cooling pulse loads more atoms.  Data-source side only; the analysis
+    layer never reads it (it only receives the rendered frames)."""
+    out = [0.0] * int(frames)
     if sequence is None or not hasattr(sequence, "effective_pulses"):
         return out
     trig_set = {str(c) for c in (DEFAULT_CAMERA_TRIGGER_CHANNELS if trigger_channels is None else trigger_channels)}
@@ -641,7 +667,10 @@ def cooling_loads_per_frame(
     for k in range(n):
         window_lo = 0.0 if k == 0 else trigger_starts[k - 1]
         window_hi = trigger_starts[k]
-        out[k] = any(start < window_hi and stop > window_lo for start, stop in cooling_intervals)
+        # sum the cooling-ON overlap with this frame's window
+        out[k] = float(sum(max(0.0, min(stop, window_hi) - max(start, window_lo))
+                           for start, stop in cooling_intervals
+                           if start < window_hi and stop > window_lo))
     return out
 
 
@@ -744,7 +773,7 @@ __all__ = [
     "VirtualCamera",
     "VirtualSequencer",
     "VirtualTrapArray",
-    "cooling_loads_per_frame",
+    "cooling_durations_per_frame",
     "trap_off_durations_per_frame",
     "virtual_config",
     "virtual_config_with_overrides",

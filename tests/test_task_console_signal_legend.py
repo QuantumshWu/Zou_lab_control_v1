@@ -31,6 +31,8 @@ def _offscreen(monkeypatch):
 class _LogicNode:
     """A node that only declares which signals it publishes."""
 
+    layer = "measurement"          # so the footer tag carries a "[layer]" like a real node
+
     def __init__(self, prefix, signals):
         self.prefix = prefix
         self.running = True
@@ -74,15 +76,17 @@ def test_footer_legend_shows_reads_provides_and_duplicates():
         occ_card = _add(console, "sites", "value = occupied")
         console._refresh_signal_info()
 
+        # Footer contract: "<signal> ← <node> [layer]", with an ambiguity flag when
+        # more than one running node publishes that signal.
         info = rate_card._signal_info
-        assert "reads: rate" in info
-        assert "from" in info and "rate" in info          # the node it reads from + its signals
-        assert "duplicated: rate" in info                 # rate is published by 2 nodes
+        assert "rate ←" in info                           # reads rate, names the node it comes from
+        assert "[measurement]" in info                    # the producing node's LAYER is shown
+        assert "also from another node" in info           # rate is published by 2 nodes -> ambiguous
 
         info2 = occ_card._signal_info
-        assert "reads: occupied" in info2
-        assert "duplicated" not in info2                  # occupied is unambiguous
+        assert "occupied ←" in info2
+        assert "also from another node" not in info2      # occupied is unambiguous
         # the legend reaches the visible footer text, not just the attribute
-        assert "reads: occupied" in occ_card.footer.text()
+        assert "occupied ←" in occ_card.footer.text()
     finally:
         console.shutdown()

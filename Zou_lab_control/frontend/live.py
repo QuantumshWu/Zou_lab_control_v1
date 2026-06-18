@@ -871,12 +871,13 @@ class LiveSiteMap(BaseLivePlot):
 
     plot_type = "SITES"
 
-    def __init__(self, *args, image=None, roi_radius: float = 3.0, **kwargs):
+    def __init__(self, *args, image=None, roi_radius: float = 3.0, cmap: str = PALETTE["cmap_camera"], **kwargs):
         super().__init__(*args, **kwargs)
         if self.data_x.shape[1] != 2:
             raise ValueError("LiveSiteMap requires data_x with shape (N, 2) site centers.")
         self.background = None if image is None else np.asarray(image, dtype=float)
         self.roi_radius = max(0.5, float(roi_radius))
+        self.cmap = str(cmap)   # colormap of the camera-FRAME underlay (the rings are fixed-colour)
 
     # the dashboard refreshes the underlay every shot (set, don't rebuild)
     def set_background(self, image, *, draw: bool = False) -> None:
@@ -921,7 +922,7 @@ class LiveSiteMap(BaseLivePlot):
                       float(centers[:, 1].max()) + pad, float(centers[:, 1].min()) - pad]
         self.extent = extent
         if self.background is not None:
-            self._bg_image = self.ax.imshow(self.background, cmap=PALETTE["cmap_camera"], extent=extent, interpolation="none")
+            self._bg_image = self.ax.imshow(self.background, cmap=self.cmap, extent=extent, interpolation="none")
         else:
             self._bg_image = None
         diameter = 2.0 * self.roi_radius

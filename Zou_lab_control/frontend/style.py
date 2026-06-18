@@ -244,8 +244,8 @@ PALETTE: Mapping[str, Any] = MappingProxyType(_PALETTE)
 # look).  Single source for the site-map plot -- ring colour / opacity / stroke
 # per occupancy state (rings are always unfilled so the frame shows through).
 SITE_OCCUPANCY_STYLE: Mapping[str, Mapping[str, Any]] = MappingProxyType({
-    "empty":    MappingProxyType({"color": "#7EA5A3", "alpha": 0.24, "linewidth": 0.5}),
-    "occupied": MappingProxyType({"color": "#D07850", "alpha": 0.94, "linewidth": 1.1}),
+    "empty":    MappingProxyType({"color": "#7EA5A3", "alpha": 0.22, "linewidth": 0.35}),
+    "occupied": MappingProxyType({"color": "#D07850", "alpha": 0.95, "linewidth": 0.7}),
 })
 
 

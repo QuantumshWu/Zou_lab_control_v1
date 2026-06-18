@@ -171,9 +171,13 @@ PANEL_PARAMS: dict[str, tuple[ParamSpec, ...]] = {
         ParamSpec("cmap", "colormap", "choice", "inferno", choices=CMAPS, tooltip="Image colormap", display=True),
     ),
     "sites": (
-        # A site map is a binary occupancy OVERLAY on the camera frame (faint ring =
-        # empty, bold ring = occupied), so it has NO colormap -- the only colorbar is
-        # the camera frame's own counts.  Its params are the two source signals.
+        # A site map is a binary occupancy OVERLAY (faint ring = empty, bold ring =
+        # occupied) on the camera FRAME.  The colormap applies to that frame underlay
+        # (its counts colorbar); the rings carry no scale.  It is a MULTI-INPUT plot:
+        # ``value`` = the per-site occupancy vector, plus two source signals (the site
+        # ``centers`` and the camera ``image``) -- each its own slot.
+        ParamSpec("cmap", "colormap", "choice", "gray", choices=CMAPS,
+                  tooltip="Colormap for the camera-frame underlay", display=True),
         ParamSpec("centers", "centers", "signal", "centers",
                   tooltip="Signal holding the (N, 2) site centers in camera px"),
         ParamSpec("image", "image", "signal", "frame",
@@ -526,7 +530,8 @@ class PanelCard(FluentGroupBox):
     remove_requested = QtCore.pyqtSignal(object)
     edit_requested = QtCore.pyqtSignal(object)   # "Edit…" -> open the panel's Edit tab
 
-    def __init__(self, config: PanelConfig, parent=None, *, names_provider=None, sources_provider=None):
+    def __init__(self, config: PanelConfig, parent=None, *, names_provider=None,
+                 sources_provider=None, formats_provider=None):
         # Titled frame: the title strip carries the panel KIND (top-left) and the
         # Setting button (top-right), so the card is delineated like the rest.
         super().__init__(PANEL_KINDS[config.kind], parent, shadow=True)
@@ -535,6 +540,9 @@ class PanelCard(FluentGroupBox):
         # callable -> {signal name: [source node labels]}, so the picker can show
         # WHICH measurement/processor each signal comes from (not just bare names).
         self.sources_provider = sources_provider
+        # callable -> {signal name: array-format}, so the picker also shows each
+        # signal's SHAPE (e.g. occupied -> per-site (N,)).
+        self.formats_provider = formats_provider
         self.plotter = None
         self.canvas = None
         self._value_shape: tuple[int, ...] | None = None
@@ -867,14 +875,25 @@ class PanelCard(FluentGroupBox):
                 sources = dict(self.sources_provider())
             except Exception:
                 sources = {}
+        formats: dict = {}
+        if callable(self.formats_provider):
+            try:
+                formats = dict(self.formats_provider())
+            except Exception:
+                formats = {}
         combo = self.signal_combo
         with _signals_blocked(combo):
             combo.clear()
             combo.addItem("(expression)", "")
             for name in names:
                 producers = sources.get(name) or []
-                label = f"{name} — {', '.join(str(p) for p in producers)}" if producers else name
-                combo.addItem(label, name)         # text shows the source; data is the bare name
+                fmt = formats.get(name)
+                label = name
+                if producers:
+                    label += f" — {', '.join(str(p) for p in producers)}"
+                if fmt:
+                    label += f"  [{fmt}]"             # show the signal's SHAPE too
+                combo.addItem(label, name)         # text shows source + shape; data is the bare name
             # reflect a plain `value = <signal>` source in the picker
             source = (self.config.source or "").strip()
             picked = source[len("value ="):].strip() if source.startswith("value =") else ""
@@ -1299,6 +1318,7 @@ class PanelCard(FluentGroupBox):
             self.plotter = panel_plot(
                 centers, vec, kind="sites", size=size, interactions=False,
                 image=image, roi_radius=max(1.5, 0.3 * spacing),
+                cmap=str(self.config.params.get("cmap", "gray")),
                 labels=("Camera x (px)", "Camera y (px)", label),
                 title=self.config.title or None)
         elif kind == "2d":
@@ -1536,7 +1556,10 @@ class MeasurementPanel(QtWidgets.QWidget):
             return
         for decl in spec.params:
             kind = decl.kind
-            label_text = decl.label + (f" ({decl.unit})" if decl.unit else "")
+            # Show the REAL parameter name (the key threaded into the build call, e.g.
+            # ``data_dir`` / ``calibration_frames``), not a hand-written prettified label
+            # -- so the form is unambiguously the node's actual parameters.
+            label_text = decl.key + (f" ({decl.unit})" if decl.unit else "")
             if decl.required:
                 label_text += " *"
             if kind == "axis_range":
@@ -1987,7 +2010,7 @@ class PanelEditor(QtWidgets.QWidget):
         size = card.config.size          # mirror the Monitor frame, never force 2x4
         title = card.config.title or PANEL_KINDS[kind]
         relim = str(card.config.params.get("relim", "tight"))
-        cmap = str(card.config.params.get("cmap", "inferno" if kind == "2d" else "viridis"))
+        cmap = str(card.config.params.get("cmap", "gray" if kind == "sites" else "inferno"))
         try:
             if kind == "2d":
                 self._plotter = panel_plot(np.array(src.data_x, dtype=float),
@@ -1998,7 +2021,7 @@ class PanelEditor(QtWidgets.QWidget):
                 self._plotter = panel_plot(np.array(src.data_x[:, :2], dtype=float),
                                            np.array(src.data_y[:, 0], dtype=float), kind="sites",
                                            size=size, image=getattr(src, "background", None),
-                                           roi_radius=getattr(src, "roi_radius", 3.0),
+                                           roi_radius=getattr(src, "roi_radius", 3.0), cmap=cmap,
                                            labels=tuple(src.labels), title=title)
             elif kind == "hist":
                 self._plotter = panel_plot(np.array(src.values, dtype=float), kind="hist", size=size,
@@ -2283,15 +2306,18 @@ class _PanelBoard(QtWidgets.QWidget):
 
 # ====================================================================== logic tab
 class LogicNodeRow(FluentFrame):
-    """One LOGIC NODE's row on the Logic tab: a status COLOUR dot + its name + an
-    Edit button.  The dot follows the node's run state (grey=stopped,
-    green=running, red=error), confocal's tab-icon colour map applied to a list
-    row instead of a tab.  The whole node lifecycle (param form + Start / Stop) is
-    in its Edit tab (a :class:`LogicNodeEditor`); this row is the at-a-glance
-    status + the way IN to that Edit."""
+    """One LOGIC NODE's CARD on the Logic tab: a status dot + name + (kind) + status on
+    the top line with Start / Stop / Edit / Remove, and a second line listing the
+    signals it PUBLISHES with their array shape (``occupied [per-site (N,)], rate
+    [scalar]``).  The dot follows the run state (grey=stopped / green=running /
+    red=error), confocal's tab-icon colour map applied to a card.  Start / Stop act
+    here directly; the full param form is in the node's Edit tab
+    (:class:`LogicNodeEditor`)."""
 
     edit_requested = QtCore.pyqtSignal(object)     # "Edit" -> open the node's Edit tab
     remove_requested = QtCore.pyqtSignal(object)
+    start_requested = QtCore.pyqtSignal(object)    # "Start" -> build + run the node
+    stop_requested = QtCore.pyqtSignal(object)     # "Stop"  -> stop the node
 
     # confocal gui_combine colour map (INIT=grey / RUNNING=green / STOP/ERROR=red).
     STATE_COLORS = {"stopped": GREY, "running": GREEN, "error": RED}
@@ -2299,10 +2325,13 @@ class LogicNodeRow(FluentFrame):
     def __init__(self, node: LogicNodeConfig, parent=None):
         super().__init__(parent, shadow=True)
         self.node = node
-        self.setFixedHeight(scaled_px(44, minimum=36))
-        row = QtWidgets.QHBoxLayout(self)
-        row.setContentsMargins(scaled_px(12), scaled_px(6), scaled_px(12), scaled_px(6))
-        row.setSpacing(scaled_px(10, minimum=6))
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(scaled_px(12), scaled_px(8), scaled_px(12), scaled_px(8))
+        outer.setSpacing(scaled_px(4, minimum=3))
+        # --- top line: status + name + (kind) + Start / Stop / Edit / Remove --------
+        top = QtWidgets.QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(scaled_px(10, minimum=6))
         self.dot = FluentStatusDot(size=14)
         self.dot.set_color(GREY)
         self.name_label = FluentLabel(node.title)
@@ -2310,25 +2339,55 @@ class LogicNodeRow(FluentFrame):
         self.kind_label.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
         self.status_label = FluentLabel("stopped")
         self.status_label.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+        self.start_button = FluentButton("Start", color=GREEN)
+        self.start_button.setFixedWidth(scaled_px(60, minimum=48))
+        self.start_button.clicked.connect(lambda: self.start_requested.emit(self))
+        self.stop_button = FluentButton("Stop", color=ORANGE)
+        self.stop_button.setFixedWidth(scaled_px(56, minimum=46))
+        self.stop_button.clicked.connect(lambda: self.stop_requested.emit(self))
+        self.stop_button.setEnabled(False)
         edit_button = FluentButton("Edit", color=ACCENT)
-        edit_button.setFixedWidth(scaled_px(64, minimum=52))
+        edit_button.setFixedWidth(scaled_px(56, minimum=46))
         edit_button.clicked.connect(lambda: self.edit_requested.emit(self))
-        remove = FluentButton("Remove", color=ORANGE)
-        remove.setFixedWidth(scaled_px(72, minimum=58))
+        remove = FluentButton("Remove", color=GREY)
+        remove.setFixedWidth(scaled_px(82, minimum=66))
         remove.clicked.connect(lambda: self.remove_requested.emit(self))
-        row.addWidget(self.dot, 0)
-        row.addWidget(self.name_label, 0)
-        row.addWidget(self.kind_label, 0)
-        row.addWidget(self.status_label, 1)
-        row.addWidget(edit_button, 0)
-        row.addWidget(remove, 0)
+        top.addWidget(self.dot, 0)
+        top.addWidget(self.name_label, 0)
+        top.addWidget(self.kind_label, 0)
+        top.addWidget(self.status_label, 1)
+        for b in (self.start_button, self.stop_button, edit_button, remove):
+            top.addWidget(b, 0)
+        outer.addLayout(top)
+        # --- second line: published signals + their array shapes --------------------
+        self.publishes_label = FluentLabel("")
+        self.publishes_label.setWordWrap(True)
+        self.publishes_label.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+        outer.addWidget(self.publishes_label)
 
     def set_state(self, state: str, *, status: str = "") -> None:
-        """Reflect the node's run state on the dot + status text."""
+        """Reflect the node's run state on the dot + status text + Start/Stop enable."""
         self.dot.set_color(self.STATE_COLORS.get(state, GREY))
         self.status_label.setText(status or state)
         colour = RED if state == "error" else GREY
         self.status_label.setStyleSheet(f"color: {colour}; background: transparent; border: none;")
+        running = state == "running"
+        self.start_button.setEnabled(not running)
+        self.stop_button.setEnabled(running)
+
+    def set_publishes(self, formats: dict) -> None:
+        """Show the node's published signals + array shape, e.g. ``publishes: occupied
+        [(35,)], rate [scalar]`` -- filled by the console from the AUTO-EXTRACTED shapes
+        of the node's real published values (``logic.describe_shape``).  A pending shape
+        (``—``, no value yet) shows the bare name, so a STOPPED node still advertises
+        what it will produce without faking a shape it hasn't emitted."""
+        if formats:
+            body = ", ".join((n if f in ("", "—") else f"{n} [{f}]") for n, f in formats.items())
+            text = "publishes: " + body
+        else:
+            text = "publishes: (nothing on the hub)"
+        if text != self.publishes_label.text():       # skip churn: shapes refresh each tick
+            self.publishes_label.setText(text)
 
 
 class LogicNodeEditor(QtWidgets.QWidget):
@@ -2372,39 +2431,15 @@ class LogicNodeEditor(QtWidgets.QWidget):
         self.form.start_requested.connect(lambda *_: self.console._start_logic_node(self.row))
         self.form.stop_requested.connect(lambda: self.console._stop_logic_node(self.row))
         col.addWidget(self.form)
-        # This node's OUTPUT contract, so the experimenter sees what it publishes (and
-        # in what shape) without guessing -- "occupied [per-site (N,) 0/1], rate
-        # [scalar], …".  Filled from the live node when running, the spec when stopped.
-        self.publishes_label = FluentLabel("")
-        self.publishes_label.setWordWrap(True)
-        self.publishes_label.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
-        col.addWidget(self.publishes_label)
-        self.refresh_publishes()
+        # (The node's published-signals + shapes are shown on its Logic-tab ROW card,
+        # the single place for that legend -- not duplicated here.)
         col.addStretch(1)
-
-    def refresh_publishes(self) -> None:
-        """Show the node's published signals + their array format (single source
-        ``logic.SIGNAL_FORMAT`` via ``node.signal_formats()``)."""
-        node = self.console._logic_nodes.get(id(self.row))
-        if node is not None and hasattr(node, "signal_formats"):
-            fmts = node.signal_formats()
-            if fmts:
-                text = "Publishes — " + ", ".join(f"{n} [{f}]" for n, f in fmts.items())
-            else:
-                text = "Publishes — (off the hub: result on the task + a frame to its mid-run panel)"
-        else:
-            keys = list(getattr(self.spec, "result_keys", ()) or [])
-            if not keys and (self.spec is None or getattr(self.row.node, "kind", "") == "camera"):
-                keys = ["frame"]
-            text = ("Publishes — " + ", ".join(keys)) if keys else "Publishes — (Start to list outputs)"
-        self.publishes_label.setText(text)
 
     def collect_values(self) -> dict:
         return self.form.collect_values()
 
     def set_running(self, running: bool) -> None:
         self.form.set_running(running)
-        self.refresh_publishes()
 
     def set_status(self, text: str, *, error: bool) -> None:
         self.form.set_status(text, error=error)
@@ -2675,7 +2710,7 @@ class TaskConsole(QtWidgets.QWidget):
             for config in state.panels:
                 self._attach_card(PanelCard(config, parent=self.board,
                                             names_provider=self.hub.names,
-                                            sources_provider=self._signal_providers))
+                                            sources_provider=self._signal_providers, formats_provider=self._signal_formats))
             for node in state.logic:
                 self._attach_logic_node(node)    # always STOPPED -- Start is manual
             self._arrange()
@@ -2790,6 +2825,65 @@ class TaskConsole(QtWidgets.QWidget):
             for name in node.published_signals():
                 providers.setdefault(str(name), []).append(label)
         return providers
+
+    def _signal_formats(self) -> dict:
+        """``name -> standardized array shape`` for every LIVE hub signal, read straight
+        off the most recent published VALUE (``logic.describe_shape``) -- AUTO from real
+        data, never a hand-typed name->format map that could drift from what a node
+        actually emits.  Lets the signal picker show each signal's SHAPE, not just its
+        name (e.g. ``occupied  [(35,)]``)."""
+        from Zou_lab_control.neutral_atom.operations.logic import describe_shape
+        out: dict[str, str] = {}
+        for name in self.hub.names():
+            try:
+                out[str(name)] = describe_shape(self.hub.latest(name))
+            except Exception:
+                continue
+        return out
+
+    def _live_node_formats(self, node) -> dict:
+        """``{published name: shape}`` for a RUNNING node, every shape read off a real
+        value via ``logic.describe_shape`` (auto, never hand-typed).  A measurement /
+        processor publishes to the hub under its prefix; a TASK is OFF the hub, so it
+        documents what it streams mid-run (its ``output`` buffer) + what it produces
+        (its ``result`` keys), shapes filled in as the values appear."""
+        from Zou_lab_control.neutral_atom.operations.logic import describe_shape
+        out: dict[str, str] = {}
+        if getattr(node, "layer", "") == "task":
+            buf = getattr(node, "output", None)
+            for key in getattr(node, "mid_run", ()):
+                if key in ("progress", "stage"):          # progress %/text live on the banner
+                    continue
+                out[f"{key} (mid-run)"] = describe_shape(buf.latest(key) if buf else None)
+            result = getattr(node, "result", None) or {}
+            for key in getattr(node, "provides", ()):
+                value = result.get(key) if isinstance(result, dict) else None
+                out[f"{key} (result)"] = describe_shape(value)
+            return out
+        for full in sorted(node.published_signals()):     # already hub names (incl. prefix)
+            try:
+                out[str(full)] = describe_shape(self.hub.latest(full))
+            except Exception:
+                out[str(full)] = "—"
+        return out
+
+    def _update_row_publishes(self, row: "LogicNodeRow") -> None:
+        """Fill a Logic-tab row's "publishes:" line with its output signals + shapes,
+        AUTO-EXTRACTED from the real published VALUES (``logic.describe_shape``) -- never
+        a hand-typed map.  Running node: live shapes off the hub (measurement/processor)
+        or its mid-run buffer + result (task).  Stopped node: just the NAMES it will
+        produce (shape unknown until it runs, shown as ``—``)."""
+        node = self._logic_nodes.get(id(row))
+        if node is not None and getattr(node, "running", False):
+            row.set_publishes(self._live_node_formats(node))
+            return
+        spec = self._spec_for_logic(row.node)
+        keys = list(getattr(spec, "result_keys", ()) or [])
+        if not keys and row.node.kind == "camera":
+            keys = ["frame"]
+        if not keys and row.node.kind == "task":          # off-hub one-shot, mid-run stream
+            keys = [f"{getattr(spec, 'mid_run_key', 'frame')} (mid-run)"]
+        row.set_publishes({k: "—" for k in keys})
 
     def _node_for_signal(self, name: str):
         """The first running node that PUBLISHES signal ``name`` (None if none does)."""
@@ -2941,7 +3035,7 @@ class TaskConsole(QtWidgets.QWidget):
         rows = max((c.config.row + c.config.rows for c in self.cards), default=0)
         config = PanelConfig(kind=str(kind), row=rows, col=0, size="1x2")
         card = PanelCard(config, parent=self.board, names_provider=self.hub.names,
-                         sources_provider=self._signal_providers)
+                         sources_provider=self._signal_providers, formats_provider=self._signal_formats)
         self._attach_card(card)
         self._arrange()
         self._mark_dirty()
@@ -2983,11 +3077,14 @@ class TaskConsole(QtWidgets.QWidget):
         row = LogicNodeRow(node)
         row.edit_requested.connect(self._edit_logic_node)
         row.remove_requested.connect(self._remove_logic_node)
+        row.start_requested.connect(self._start_logic_node)   # Start/Stop act on the row itself (#5)
+        row.stop_requested.connect(self._stop_logic_node)
         # insert ABOVE the trailing stretch (the hint + stretch are the last 2 items)
         self.logic_layout.insertWidget(self.logic_layout.count() - 1, row)
         self.logic_nodes.append(row)
         self._logic_nodes[id(row)] = None
         self.logic_hint.hide()
+        self._update_row_publishes(row)                       # show its outputs + shapes up front
         if focus and hasattr(self.tabs, "setCurrentWidget"):
             self._edit_logic_node(row)
         return row
@@ -3050,6 +3147,7 @@ class TaskConsole(QtWidgets.QWidget):
                 editor.set_status(f"start failed: {str(exc).splitlines()[0][:140]}", error=True)
             return
         row.set_state("running", status="running")
+        self._update_row_publishes(row)            # now show the LIVE node's published shapes
         if editor is not None:
             editor.set_running(True)
             editor.set_status("running", error=False)
@@ -3074,7 +3172,7 @@ class TaskConsole(QtWidgets.QWidget):
         config = PanelConfig(kind=kind, title=title, size="2x2",
                              source="value = __task_frame__")
         card = PanelCard(config, parent=self.board, names_provider=self.hub.names,
-                         sources_provider=self._signal_providers)
+                         sources_provider=self._signal_providers, formats_provider=self._signal_formats)
         self._attach_card(card)
         self._task_card = card
         self._running_task_row = row
@@ -3087,7 +3185,11 @@ class TaskConsole(QtWidgets.QWidget):
         if row is None:
             return
         pct = int(round(float(getattr(node.output, "progress", 0.0)) * 100))
-        self.task_banner_label.setText(f"⏳  Task running: {row.node.title}  —  {pct}%  "
+        # the task's current STAGE (e.g. "reference frame 23/30", "fitting per-site
+        # thresholds") so the operator sees what step the calibration is on, not just %.
+        stage = node.output.latest("stage")
+        stage_txt = f"  —  {stage}" if stage else ""
+        self.task_banner_label.setText(f"⏳  Task running: {row.node.title}  —  {pct}%{stage_txt}  "
                                        "(all other controls locked until it finishes / you Stop it)")
 
     def _apply_task_lock(self, locked: bool) -> None:
@@ -3187,6 +3289,7 @@ class TaskConsole(QtWidgets.QWidget):
         editor = self._logic_editors.get(id(row))
         if not _silent:
             row.set_state("stopped", status="stopped")
+            self._update_row_publishes(row)        # back to the spec-declared outputs
             if editor is not None:
                 editor.set_running(False)
                 editor.set_status("stopped", error=False)
@@ -3256,6 +3359,10 @@ class TaskConsole(QtWidgets.QWidget):
                     row.set_state("running", status=f"running {done}/{total}")
                 else:
                     row.set_state("running", status="running")
+                # refresh the published shapes as the node's first values land (a reactive
+                # processor publishes nothing until it consumes a frame); set_publishes is
+                # self-guarded so this is a no-op once the shapes stop changing.
+                self._update_row_publishes(row)
 
     def _mark_dirty(self, *_args) -> None:
         if self._building:

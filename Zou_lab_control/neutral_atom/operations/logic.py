@@ -40,39 +40,20 @@ from ..devices.base import CameraDevice
 from ..timing import imaging_channel_kwargs, imaging_sequence
 
 
-# Human-readable shape/format of each published signal -- the SINGLE source the GUI
-# uses to tell the experimenter what a node outputs (and what a plot can read).  Keyed
-# by the bare signal name (the hub prefix is stripped before lookup).  ``N`` = number
-# of trap sites, ``H×W`` = camera frame.  An unknown name falls back to "value".
-SIGNAL_FORMAT = {
-    "frame": "2D image H×W",
-    "occupied": "per-site (N,) 0/1",
-    "counts": "per-site (N,)",
-    "rate": "scalar (loading rate)",
-    "rate_sites": "per-site (N,)",
-    "rate_grid": "grid ny×nx",
-    "centers": "(N, 2) px",
-    "thresholds": "per-site (N,)",
-    "n_sites": "scalar",
-    "fidelity_site": "per-site (N,)",
-    "fidelity_threshold": "per-site (N,)",
-    "fidelity_centers": "(N, 2) px",
-    "x": "1D scan x",
-    "y": "1D curve",
-    "shot": "scalar",
-    "scan_done": "scalar 0/1",
-}
-
-
-def signal_format(name: str) -> str:
-    """Format string for a bare or prefixed signal name (best-effort suffix match)."""
-    key = str(name)
-    if key in SIGNAL_FORMAT:
-        return SIGNAL_FORMAT[key]
-    for base, fmt in SIGNAL_FORMAT.items():       # tolerate a hub prefix (e.g. ``b_rate``)
-        if key.endswith(base):
-            return fmt
-    return "value"
+def describe_shape(value) -> str:
+    """A standardized shape string read straight from a published VALUE -- the SINGLE
+    way the GUI says what a signal looks like, AUTO-EXTRACTED from real data rather
+    than a hand-typed name->format map (which silently drifts from what a node really
+    emits).  ``scalar`` for a 0-d / Python number, else the numpy shape tuple verbatim
+    (``(35,)`` / ``(35, 2)`` / ``(96, 128)``).  ``None`` -> ``"—"`` (no value yet)."""
+    if value is None:
+        return "—"
+    shape = np.shape(value)
+    if shape == ():
+        return "scalar"
+    if len(shape) == 1:                  # numpy 1-D repr keeps the trailing comma: (35,)
+        return f"({int(shape[0])},)"
+    return "(" + ", ".join(str(int(n)) for n in shape) + ")"
 
 
 class LogicNode:
@@ -208,13 +189,6 @@ class LogicNode:
         produces its data, then expose THAT node's parameters.  Subclasses with
         a fixed signal set override this; the base publishes nothing structured."""
         return frozenset()
-
-    def signal_formats(self) -> dict[str, str]:
-        """``{published signal name: human format}`` (e.g. ``occupied`` -> ``per-site
-        (N,) 0/1``) so the GUI can tell the experimenter what this node outputs and in
-        what shape.  Derived from :meth:`published_signals` + the single-source
-        :data:`SIGNAL_FORMAT`; a task (nothing on the hub) returns ``{}``."""
-        return {str(name): signal_format(name) for name in sorted(self.published_signals())}
 
     # --------------------------------------------------- acquisition parameters
     # A panel is a VIEW; a logic node produces the data; behind the node sits the data
@@ -535,13 +509,18 @@ class Task(LogicNode):
         raise NotImplementedError
 
     def shot(self) -> dict[str, object]:
-        # One-shot: stop the loop after THIS run (a run() that raises is reported via
-        # node_error and NOT retried), exactly like a finite scan / processor.  The
-        # result + mid-run output stay on the INSTANCE (self.result / self.output); a
+        # One-shot: stop the loop AFTER this run (a run() that raises is reported via
+        # node_error and NOT retried), exactly like a finite scan / processor.  The stop
+        # event is set in a ``finally`` -- AFTER ``run`` -- so that DURING the run it
+        # stays clear and means "cancel": ``run`` can poll ``self._stop`` (and pass it to
+        # ``camera.acquire``) to interrupt a long acquisition the moment Stop is pressed.
+        # The result + mid-run output stay on the INSTANCE (self.result / self.output); a
         # task publishes NOTHING to the hub -- the hub is measurements + processors only.
-        self._stop.set()
-        self.result = {str(key): value for key, value in dict(self.run(self.output)).items()}
-        self.finished = True
+        try:
+            self.result = {str(key): value for key, value in dict(self.run(self.output)).items()}
+            self.finished = True
+        finally:
+            self._stop.set()
         return {}
 
     def run_to_completion(self) -> "Task":
@@ -551,16 +530,10 @@ class Task(LogicNode):
 
     def published_signals(self) -> frozenset:
         # A task publishes nothing to the hub (its result lives on the instance, its
-        # mid-run output in self.output) -- so it provides no hub signal name.
+        # mid-run output in self.output) -- so it provides no hub signal name.  What it
+        # PRODUCES (``provides`` result keys + ``mid_run`` stream keys) is documented by
+        # the console from those public attrs, with shapes read off real values.
         return frozenset()
-
-    def signal_formats(self) -> dict[str, str]:
-        """A task is OFF the hub, so document what it PRODUCES instead: its ``result``
-        keys (on ``self.result``) + the frames it streams to its mid-run panel."""
-        out = {f"{name} (result)": signal_format(name) for name in self.provides}
-        out.update({f"{name} (mid-run)": signal_format(name)
-                    for name in self.mid_run if name != "progress"})
-        return out
 
 
 class CalibrateReadoutTask(Task):
@@ -575,7 +548,7 @@ class CalibrateReadoutTask(Task):
 
     node_label = "calibrate"
     provides = ("centers", "thresholds", "n_sites")
-    mid_run = ("frame", "progress")    # streamed to the dedicated mid-run panel
+    mid_run = ("frame", "progress", "stage")   # streamed to the dedicated mid-run panel + banner
 
     # The user-facing mode names map to the calibration's (sitemap_method,
     # threshold_method) pair: box+otsu, per-site/uniform PSF + (otsu|bimodal).
@@ -593,7 +566,7 @@ class CalibrateReadoutTask(Task):
                  grid_shape: tuple[int, int] = (5, 7), roi_radius: int = 1,
                  sitemap_exposure: float = 0.05, readout_exposure: float = 0.02,
                  sitemap_pulse: str | None = None, readout_pulse: str | None = None,
-                 calibration_frames: int = 4, threshold_frames: int = 24,
+                 calibration_frames: int = 30, threshold_frames: int = 100,
                  mode: str = "box", threshold_method: str = "otsu",
                  source: str = "live", data_dir: str | None = None,
                  save_path: str | None = None, load_path: str | None = None, prefix: str = ""):
@@ -719,25 +692,52 @@ class CalibrateReadoutTask(Task):
         return imaging_sequence(exposure=exposure, load=True, name=name,
                                 **imaging_channel_kwargs(self.sequencer))
 
-    def _run_live(self, out: "TaskOutput"):
-        """Acquire frames now and calibrate the sitemap + thresholds.
+    def _collect_frames(self, seq, n_frames: int, out: "TaskOutput", *, stage: str,
+                        progress_lo: float, progress_hi: float) -> list:
+        """Acquire ``n_frames`` ONE AT A TIME, streaming each to the task's mid-run
+        panel (frame + stage text + a progress fraction mapped into
+        ``[progress_lo, progress_hi]``) so the operator watches the data come in --
+        exactly the frames the extraction below runs on.  Honours the Stop event
+        between frames (a long calibration is interruptible)."""
+        frames: list = []
+        n = max(1, int(n_frames))
+        for i in range(n):
+            if self._stop.is_set():
+                break
+            batch = self.camera.acquire(1, sequence=seq, sequencer=self.sequencer, stop=self._stop)
+            frame = np.asarray(batch[-1], dtype=float)
+            frames.append(frame)
+            frac = progress_lo + (progress_hi - progress_lo) * (i + 1) / n
+            out.publish(frame=frame, progress=frac, stage=f"{stage} {i + 1}/{n}")
+        return frames
 
-        TWO pulses: the SITEMAP/PSF pass uses the LONGER readout-duration pulse
-        (``sitemap_pulse`` / ``sitemap_exposure``) for clean site centroids + PSF
-        fitting; the THRESHOLD pass uses the ACTUAL readout-duration pulse
-        (``readout_pulse`` / ``readout_exposure``) so the thresholds are learnt under
-        real readout conditions."""
+    def _run_live(self, out: "TaskOutput"):
+        """Acquire frames now and run the SAME sitemap + per-site-threshold extraction
+        the real readout uses -- the rb87-style flow.
+
+        TWO pulses: the REFERENCE pass uses the LONGER readout duration
+        (``sitemap_pulse`` / ``sitemap_exposure``) so the averaged template has high SNR
+        site centroids; the READOUT pass uses the ACTUAL (short) readout duration
+        (``readout_pulse`` / ``readout_exposure``) so per-site thresholds are learnt
+        under real readout conditions.  Both stream frame-by-frame to the mid-run panel
+        (the operator sees ~N reference then ~M readout frames accumulate), then the
+        centers come from averaging the reference frames and the thresholds from the
+        per-site count distribution of the readout frames."""
         from .calibration import calibrate_sitemap_from_images, calibrate_threshold_from_images
-        sitemap_seq = self._imaging_seq(self.sitemap_pulse, self.sitemap_exposure, "sitemap")
+        # name="reference" (NOT "sitemap"): the virtual camera images a REAL ~50% loading
+        # at the long exposure, and averaging many such frames reveals every site -- the
+        # authentic template, not a synthetic all-bright frame.
+        sitemap_seq = self._imaging_seq(self.sitemap_pulse, self.sitemap_exposure, "reference")
         readout_seq = self._imaging_seq(self.readout_pulse, self.readout_exposure, "readout")
-        template = self.camera.acquire(self.calibration_frames, sequence=sitemap_seq,
-                                       sequencer=self.sequencer, stop=self._stop)
-        out.publish(frame=np.asarray(template[-1], dtype=float), progress=0.4)
+        out.publish(progress=0.0, stage="loading reference frames")
+        template = self._collect_frames(sitemap_seq, self.calibration_frames, out,
+                                        stage="reference frame", progress_lo=0.0, progress_hi=0.45)
+        out.publish(progress=0.5, stage="finding sites + PSF")
         sitemap = calibrate_sitemap_from_images(
             template, grid_shape=self.grid_shape, roi_radius=self.roi_radius, method=self.method, display=False)
-        samples = self.camera.acquire(self.threshold_frames, sequence=readout_seq,
-                                      sequencer=self.sequencer, stop=self._stop)
-        out.publish(frame=np.asarray(samples[-1], dtype=float), progress=0.85)
+        samples = self._collect_frames(readout_seq, self.threshold_frames, out,
+                                       stage="readout frame", progress_lo=0.5, progress_hi=0.92)
+        out.publish(progress=0.95, stage="fitting per-site thresholds")
         thresholds = calibrate_threshold_from_images(
             samples, sitemap.calibration, method=self.threshold_method, display=False)
         return thresholds.calibration
@@ -1041,6 +1041,7 @@ class ProcessorRun(LogicNode):
 
 
 __all__ = [
+    "describe_shape",
     "CalibrateReadoutTask",
     "CameraMeasurement",
     "OccupancyProcessor",
