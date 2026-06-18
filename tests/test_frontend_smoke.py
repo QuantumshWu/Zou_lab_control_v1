@@ -1471,7 +1471,8 @@ def test_task_console_signal_picker_and_declarative_params(monkeypatch):
     # items are LABELLED "<name> — <source node>  [<shape>]"; the bare signal name is the
     # item DATA (what `signal` is filled from), so check the data list.
     assert "rate_grid" in datas and "frame" in datas
-    assert card.signal_combo.currentData() == "frame"      # the 2d card's input = frame
+    # the demo 2d card is the synced readout image -> its input is the judged frame (#5)
+    assert card.signal_combo.currentData() == "frame_judged"
 
     idx = datas.index("rate_grid")
     card.signal_combo.setCurrentIndex(idx)
