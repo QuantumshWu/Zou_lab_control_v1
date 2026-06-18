@@ -286,6 +286,39 @@ def test_starting_a_task_stops_other_running_nodes():
         exp.close()
 
 
+def test_starting_a_measurement_stops_other_drivers_but_keeps_processors():
+    """#6: starting ANY device-driving node (camera / measurement / task) stops every
+    OTHER running device-driver (they share the camera + pulse streamer), but a REACTIVE
+    processor (judge-occupancy reads only hub signals) keeps running."""
+    exp = _calibrated_virtual_session()
+    console = _console(exp)
+    meas_row = None
+    try:
+        _pick(console, ("camera", "live"))
+        cam_row = console.logic_nodes[-1]
+        console._start_logic_node(cam_row)
+        cam_node = console._logic_nodes.get(id(cam_row))
+        _pick(console, ("processor", "Judge occupancy"))
+        proc_row = console.logic_nodes[-1]
+        console._start_logic_node(proc_row)
+        proc_node = console._logic_nodes.get(id(proc_row))
+        assert cam_node in console.running_nodes and proc_node in console.running_nodes
+
+        # start a SECOND device-driver: the camera (a driver) is stopped; the processor stays.
+        _pick(console, ("measurement", "Temperature"))
+        meas_row = console.logic_nodes[-1]
+        console._start_logic_node(meas_row)
+        assert console._logic_nodes.get(id(cam_row)) is None          # camera (driver) stopped
+        assert cam_node not in console.running_nodes
+        assert console._logic_nodes.get(id(proc_row)) is proc_node     # processor SURVIVES
+        assert proc_node in console.running_nodes
+    finally:
+        if meas_row is not None:
+            console._stop_logic_node(meas_row)
+        console.shutdown()
+        exp.close()
+
+
 def test_running_task_takes_a_fixed_panel_and_locks_the_console():
     """#5: while a task runs it OWNS the console (confocal-style) -- a dedicated
     Monitor panel shows its mid-run output (read off the task's OWN buffer, not the

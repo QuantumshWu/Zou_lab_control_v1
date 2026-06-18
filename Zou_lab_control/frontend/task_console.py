@@ -96,6 +96,13 @@ except Exception:  # pragma: no cover - depends on the local matplotlib install
 
 TASK_FILES_ENV = "ZLC_TASK_DIR"
 
+# Logic-node kinds that DRIVE THE DEVICE (camera + sequencer): a camera live stream, a
+# scanned measurement, or a one-shot task.  Starting any one of them first stops every
+# OTHER running device-driver, so two never fight over the shared camera / pulse streamer
+# (which deadlocks real hardware).  A reactive PROCESSOR (e.g. judge-occupancy) only reads
+# hub signals -- it touches no device, so it is NOT in this set and keeps running.
+DEVICE_DRIVING_KINDS: frozenset = frozenset({"camera", "measurement", "task"})
+
 PANEL_KINDS: dict[str, str] = {
     "2d": "2D image",
     "sites": "Site map",
@@ -3442,14 +3449,15 @@ class TaskConsole(QtWidgets.QWidget):
             values = dict(row.node.values)
         # stop a previous run of THIS node so running nodes don't pile up
         self._stop_logic_node(row, _silent=True)
-        # A TASK (one-shot orchestration) drives the DEVICE directly (camera +
-        # sequencer).  Any OTHER running node (the live camera, a measurement, a
-        # reactive processor) that also touches the device would collide on the shared
-        # camera / sequencer and can DEADLOCK.  So starting a task first STOPS every
-        # other running node (#5); the operator restarts them after the task finishes.
-        if row.node.kind == "task":
+        # Starting ANY device-driving node (camera / measurement / task) first STOPS every
+        # OTHER running device-driver, so two never fight over the shared camera + pulse
+        # streamer (which deadlocks real hardware).  Reactive processors (judge-occupancy)
+        # read only hub signals -- they touch no device, so they keep running (#6).
+        if row.node.kind in DEVICE_DRIVING_KINDS:
             for other in list(self.logic_nodes):
-                if other is not row and self._logic_nodes.get(id(other)) is not None:
+                if other is row or self._logic_nodes.get(id(other)) is None:
+                    continue
+                if other.node.kind in DEVICE_DRIVING_KINDS:
                     self._stop_logic_node(other)
         try:
             node = self._build_logic_node(row.node, values)
