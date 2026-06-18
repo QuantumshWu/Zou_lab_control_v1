@@ -188,7 +188,10 @@ def calibrate_all_methods_from_images(
     box = cals["box"]
     by_method = {
         m: {"thresholds": np.asarray(cals[m].thresholds, dtype=float),
-            "psf_weights": cals[m].psf_weights, "psf_boxes": cals[m].psf_boxes}
+            "psf_weights": cals[m].psf_weights, "psf_boxes": cals[m].psf_boxes,
+            # carry each method's OWN background so signals(method=m) reads on the scale its
+            # thresholds were calibrated on (a psf method's annulus, not box's none).
+            "background": cals[m].background}
         for m in ALL_READOUT_METHODS if m != "box"
     }
     return TrapCalibration(

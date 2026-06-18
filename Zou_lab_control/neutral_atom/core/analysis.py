@@ -125,7 +125,44 @@ def find_site_centers(
     weights = smooth[candidates_yx[:, 0], candidates_yx[:, 1]]
     selected = candidates_yx[np.argsort(weights)[::-1]][:need]
     centers_xy = np.column_stack([selected[:, 1], selected[:, 0]]).astype(float)
-    return sort_centers_grid(centers_xy, (ny, nx), ordering=ordering)
+    # Sort into the regular array, then snap any center detection misplaced (a DARK site's
+    # border artifact) back onto its lattice node before applying the requested ordering.
+    row_major = sort_centers_grid(centers_xy, (ny, nx), ordering="row-major")
+    repaired = _regularize_grid(row_major, (ny, nx))
+    return sort_centers_grid(repaired, (ny, nx), ordering=ordering)
+
+
+def _regularize_grid(centers_row_major, grid_shape: Sequence[int]) -> np.ndarray:
+    """Snap centers that detection misplaced back onto the trap array's regular lattice.
+
+    The traps are an axis-aligned regular grid (real hardware and the virtual backend
+    alike), so the lattice is separable: every row shares one y, every column one x.  A
+    site that emitted no light this calibration still sits at its node -- detection cannot
+    find a peak that is not there, so without this its center lands on an image-border
+    ``maximum_filter`` artifact and a downstream PSF box (which needs a full window around
+    every site) cannot fit.  The per-row / per-column anchor is the MEDIAN of that line, so
+    a handful of dark sites never move it; only a center more than half a cell off its node
+    is replaced, leaving confidently-detected sites untouched."""
+
+    ny, nx = grid_shape_tuple(grid_shape)
+    g = np.asarray(centers_row_major, dtype=float).reshape(ny, nx, 2)
+    row_y = np.median(g[:, :, 1], axis=1)            # one y per row (median over its columns)
+    col_x = np.median(g[:, :, 0], axis=0)            # one x per column (median over its rows)
+    pitches = []
+    if ny > 1:
+        pitches.append(abs(float(np.median(np.diff(row_y)))))
+    if nx > 1:
+        pitches.append(abs(float(np.median(np.diff(col_x)))))
+    pitches = [p for p in pitches if np.isfinite(p) and p > 0]
+    if not pitches:                                  # 1x1 grid / collapsed anchors: nothing to fit
+        return g.reshape(ny * nx, 2)
+    tol = 0.5 * min(pitches)                          # "still on its node" radius = half a cell
+    lattice_x = np.broadcast_to(col_x[None, :], (ny, nx))
+    lattice_y = np.broadcast_to(row_y[:, None], (ny, nx))
+    off_node = np.hypot(g[:, :, 0] - lattice_x, g[:, :, 1] - lattice_y) > tol
+    g[off_node, 0] = lattice_x[off_node]
+    g[off_node, 1] = lattice_y[off_node]
+    return g.reshape(ny * nx, 2)
 
 
 def sort_centers_grid(centers, grid_shape: Sequence[int], *, ordering: str = "row-major") -> np.ndarray:

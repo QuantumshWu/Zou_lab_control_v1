@@ -1240,6 +1240,50 @@ class _FluentTabCloseButton(QtWidgets.QToolButton):
         )
 
 
+class _FluentTabBar(QtWidgets.QTabBar):
+    """Tab bar that GUARANTEES every tab (and its close ``x``) fits the bar width.
+
+    When the natural tab widths would overflow the bar, each tab is capped to an EQUAL
+    share of the available width (``width // count``, floored), so ``count`` tabs always
+    sum to <= the bar width and the rightmost tab's close ``x`` is never clipped by the
+    bar / window edge (the reported "x cut off").  ``ElideRight`` then trims each label to
+    its capped box; full names stay reachable in the overflow ``...`` menu.  Below the
+    floor (many tabs) the menu is the navigation -- nothing dangles half-painted before it.
+    """
+
+    def _natural_total(self) -> int:
+        base = QtWidgets.QTabBar.tabSizeHint
+        return sum(base(self, i).width() for i in range(self.count()))
+
+    def sizeHint(self):  # noqa: N802 - Qt naming
+        # Report the NATURAL total width so the QTabWidget allocates the bar its full
+        # (window-capped) width.  tabSizeHint squeezes per-tab to the bar's ACTUAL width
+        # below; if sizeHint reported the squeezed sum instead it would feed back and
+        # collapse the bar to that smaller size (then text vanishes, x crowds the edge).
+        hint = QtWidgets.QTabBar.sizeHint(self)
+        n = self.count()
+        return QtCore.QSize(self._natural_total(), hint.height()) if n > 0 else hint
+
+    def tabSizeHint(self, index):  # noqa: N802 - Qt naming
+        # NOTE: a no-arg super() does NOT work inside the generator below (its frame's first
+        # local is the iterator, not self), so call the base method EXPLICITLY.
+        base = QtWidgets.QTabBar.tabSizeHint
+        hint = base(self, index)
+        n = self.count()
+        avail = self.width()                             # the bar's ACTUAL allocated width
+        if n <= 0 or avail <= 0 or self._natural_total() <= avail:
+            return hint                                  # everything fits -> natural widths
+        floor = scaled_px(56, minimum=44)                # room for an elided label + the x
+        return QtCore.QSize(max(floor, avail // n), hint.height())
+
+    def is_squeezed(self) -> bool:
+        """True when the NATURAL tab widths overflow the bar (tabs are being capped + their
+        text elided) -- the cue to show the overflow ``...`` menu of full names."""
+        n = self.count()
+        avail = self.width()
+        return n > 0 and avail > 0 and self._natural_total() > avail
+
+
 class FluentTabWidget(QtWidgets.QTabWidget):
     """Pivot-underline tab widget that also supports CLOSABLE tabs.
 
@@ -1254,13 +1298,17 @@ class FluentTabWidget(QtWidgets.QTabWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setTabPosition(QtWidgets.QTabWidget.North)
+        self.setTabBar(_FluentTabBar(self))     # caps tab widths so the close x never clips
         self.tabBar().setExpanding(False)
         # No left/right scroll ARROWS (the native chevrons crowd the last tab's close
         # "x" and read as browser chrome, not Fluent).  When the tabs overflow the bar,
         # ONE Fluent overflow button (a corner ``...``) lists every tab and jumps to the
         # picked one -- the on-brand overflow affordance, see _build_overflow_button.
         self.setUsesScrollButtons(False)
-        self.tabBar().setElideMode(QtCore.Qt.ElideNone)
+        # Elide tab TEXT (not the close x) when the tabs would overflow the bar, so the
+        # rightmost tab + its close x are never clipped by the bar/window edge (the
+        # reported "x cut off").  Full names stay reachable via the overflow ... menu.
+        self.tabBar().setElideMode(QtCore.Qt.ElideRight)
         # No NATIVE close buttons.  A plain ``addTab()`` tab is PERMANENT (no X),
         # so GUIs that use ``addTab`` directly (e.g. the pulse editor's
         # Edit / Preview / Scan, which must always exist) never get a close
@@ -1297,25 +1345,12 @@ class FluentTabWidget(QtWidgets.QTabWidget):
             QTabBar {{
                 background: transparent;
             }}
-            QTabBar::scroller {{
-                width: {scaled_px(34, minimum=28)}px;
-            }}
-            QTabBar QToolButton {{
-                background: white;
-                border: none;
-                border-radius: {_radius()}px;
-                margin: {scaled_px(3, minimum=2)}px {scaled_px(1, minimum=1)}px;
-                width: {scaled_px(15, minimum=13)}px;
-            }}
-            QTabBar QToolButton:hover {{ background: rgba(0, 0, 0, 18); }}
-            QTabBar QToolButton:pressed {{ background: rgba(0, 0, 0, 34); }}
-            QTabBar QToolButton:disabled {{ background: transparent; }}
             QTabBar::tab {{
                 background: transparent;
                 color: {GREY};
                 border: none;
                 border-bottom: {scaled_px(2, minimum=2)}px solid transparent;
-                height: {scaled_px(28, minimum=22)}px;
+                height: {scaled_px(32, minimum=26)}px;     # room for descenders (g/y) + the 2px underline
                 padding: 0px {scaled_px(16, minimum=12)}px;
                 margin-right: {scaled_px(6)}px;
                 font: {fluent_font_size()}pt "{FONT}";
@@ -1368,6 +1403,11 @@ class FluentTabWidget(QtWidgets.QTabWidget):
 
     def _tabs_overflow(self) -> bool:
         bar = self.tabBar()
+        # _FluentTabBar caps tab widths so they always fit (its sizeHint then equals the bar
+        # width); ask it whether the NATURAL widths overflowed (tabs squeezed + text elided),
+        # which is the real cue to offer the overflow menu of full names.
+        if hasattr(bar, "is_squeezed"):
+            return bar.is_squeezed()
         return bar.count() > 0 and bar.sizeHint().width() > bar.width() + 1
 
     def _update_overflow(self) -> None:

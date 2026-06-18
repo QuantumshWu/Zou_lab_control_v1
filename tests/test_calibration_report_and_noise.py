@@ -77,5 +77,27 @@ def test_calibrate_writes_distribution_and_fidelity_report(tmp_path):
         bundle = np.load(report_dir / "calibration.npz")
         assert bundle["counts"].shape[0] == 40                  # the readout frames
         assert np.all(np.isfinite(bundle["thresholds"]))
+
+        # EVERY readout method (box / per-site PSF / uniform PSF) must read on the SAME
+        # scale its thresholds were calibrated on: signals(method=m) and thresholds_for(m)
+        # share the method's OWN background (a PSF method subtracts an annulus, box does
+        # not).  Regression for the bug where signals(psf) used box's "none" background, so
+        # the psf threshold landed BELOW every shot (all bright; the per-site figure's
+        # threshold line + fidelity vanished off-axis).
+        from Zou_lab_control.neutral_atom.operations.calibration_report import (
+            per_site_counts, per_site_fidelity)
+        cal = task.calibration
+        frames = task._readout_samples
+        assert set(cal.methods()) == {"box", "psf", "uniform_psf"}
+        for m in cal.methods():
+            counts = per_site_counts(cal, frames, method=m)
+            thr = np.asarray(cal.thresholds_for(m), dtype=float)
+            # the threshold lies INSIDE the per-site count range (separates the populations)
+            assert np.all(thr > counts.min(axis=0) - 1e-6)
+            assert np.all(thr < counts.max(axis=0) + 1e-6)
+            # ... so the held-out per-site fidelity is finite for every site
+            fid = per_site_fidelity(counts, thr)
+            assert np.all(np.isfinite(fid))
+            assert 0.5 <= float(np.mean(fid)) <= 1.0
     finally:
         exp.close()

@@ -78,3 +78,33 @@ def test_find_site_centers_uniform_template_still_one_to_one():
     img, truth = _grid_template(grid, (72, 132), amplitudes=np.full(grid[0] * grid[1], 700.0))
     centers = find_site_centers(img, grid)
     assert _is_one_to_one(centers, truth, tol=5.0)
+
+
+def test_find_site_centers_recovers_genuinely_dark_corner_sites():
+    """A trap that emitted NO light this calibration (a low-loading reference where a corner
+    site never loaded across the averaged frames) still sits at its lattice node.  Detection
+    has no peak to find there, so without the lattice repair its center lands on an image-
+    border ``maximum_filter`` artifact -- and a 7x7 PSF box (which needs a full window around
+    every site) cannot fit, crashing the calibration.  The detector must instead return a
+    COMPLETE, in-bounds regular grid: every center far enough from the edge for a PSF box."""
+    grid = (5, 7)
+    image_shape = (96, 128)
+    amps = np.full(grid[0] * grid[1], 700.0)
+    dark = (0, grid[1] - 1, (grid[0] - 1) * grid[1], grid[0] * grid[1] - 1)  # four corners dark
+    for i in dark:
+        amps[i] = 0.0
+    img, truth = _grid_template(grid, image_shape, amplitudes=amps)
+    # a REAL averaged reference frame carries qCMOS read noise, so the background is not a
+    # dead-flat plateau -- without it every background pixel is a tie-peak, a path the live
+    # camera never takes.  Match reality so the test exercises the genuine dark-site case.
+    img = img + np.random.default_rng(0).normal(0.0, 4.0, size=img.shape)
+
+    centers = find_site_centers(img, grid)
+
+    assert centers.shape == (grid[0] * grid[1], 2)
+    half = 3                                       # the PSF half-width every box must clear
+    h, w = image_shape
+    assert np.all(centers[:, 0] >= half) and np.all(centers[:, 0] <= w - 1 - half)
+    assert np.all(centers[:, 1] >= half) and np.all(centers[:, 1] <= h - 1 - half)
+    # the recovered dark-site centers land on their true lattice nodes (within half a cell)
+    assert _is_one_to_one(centers, truth, tol=7.0)

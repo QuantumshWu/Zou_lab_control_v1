@@ -81,6 +81,13 @@ class TrapCalibration:
                 "thresholds": None if thr is None else threshold_array(thr, len(centers)),
                 "psf_weights": None if entry.get("psf_weights") is None else np.ascontiguousarray(entry["psf_weights"], dtype=float),
                 "psf_boxes": None if entry.get("psf_boxes") is None else np.ascontiguousarray(entry["psf_boxes"], dtype=int),
+                # The background model is part of the READOUT: a PSF method subtracts an
+                # annulus, box subtracts nothing.  Carry it per method so signals(method=m)
+                # reads on the SAME scale its thresholds were calibrated on -- otherwise a
+                # psf threshold (annulus-subtracted) is compared to a never-subtracted
+                # signal and lands off the distribution (every shot bright; the figure's
+                # threshold line + fidelity vanish off-axis).
+                "background": entry.get("background"),
             }
         object.__setattr__(self, "by_method", normalized or None)
         object.__setattr__(self, "metadata", dict(self.metadata or {}))
@@ -108,6 +115,16 @@ class TrapCalibration:
             raise ValueError(
                 f"calibration carries no '{method}' PSF readout -- recalibrate including it.")
         return entry["psf_weights"], entry["psf_boxes"]
+
+    def _background_for(self, method: str):
+        """Background model for ``method`` -- this calibration's own (top-level), else the
+        ``by_method`` entry's, falling back to the top-level.  signals(method=m) MUST read on
+        the scale m's thresholds were calibrated on, so it uses m's OWN background, not the
+        top-level method's (box subtracts nothing; a psf method subtracts an annulus)."""
+        if method == self.method:
+            return self.background
+        entry = (self.by_method or {}).get(method) or {}
+        return entry.get("background") if entry.get("background") is not None else self.background
 
     def thresholds_for(self, method=None) -> np.ndarray:
         """Per-site thresholds for ``method`` (this calibration's own, or a ``by_method``
@@ -140,7 +157,7 @@ class TrapCalibration:
         m = self._resolve_method(method)
         if "psf" in m:
             weights, boxes = self._kernels_for(m)
-            return psf_signals(image, weights, boxes, background=self.background or "annulus")
+            return psf_signals(image, weights, boxes, background=self._background_for(m) or "annulus")
         return roi_counts(image, self.centers, radius=self.roi_radius, reducer=self.reducer)
 
     def detect(self, image, *, method=None) -> AtomDetection:
