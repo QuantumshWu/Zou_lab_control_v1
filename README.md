@@ -49,7 +49,7 @@ Zou_lab_control/
 fpga/             standalone JTAG-to-AXI pulse-streamer build/server side
 pulses/           checked-in PulseTableState presets
 tutorials/        generated Jupyter notebooks
-docs/             the four manuals, maintainer notes, generated PDFs
+docs/             reference manuals, maintainer notes, bring-up checklist, generated PDFs
 tests/            targeted verification matrix and tests
 references/       historical source archives (ignored by git)
 ```
