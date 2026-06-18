@@ -480,3 +480,37 @@ def test_relim_deadband_no_clip_no_jitter():
     fig.data_y[:] = 100.0                          # a real jump forces a rescale...
     assert fig.relim() is True
     assert fig.ylim_max >= 100.0                   # ...and still contains the data
+
+
+# --------------------------------------------------------------------------- per-frame exposure
+def test_exposures_per_frame_handles_uniform_and_heterogeneous_brackets():
+    """exposures_per_frame returns the probe-ON time gating EACH frame.  A uniform
+    single-trigger sequence repeated per frame gives every frame the same exposure (no
+    regression vs the old single-exposure path); a long-short-long reference bracket gives
+    the real per-frame durations -- the whole point of supporting a 20-5-20 shot."""
+    from Zou_lab_control.neutral_atom.devices.virtual import exposures_per_frame
+    from Zou_lab_control.neutral_atom.timing import (
+        imaging_sequence, reference_bracket_sequence, sequence_for_frame_count)
+
+    uniform = sequence_for_frame_count(imaging_sequence(exposure=8e-3, load=True), 3)
+    exps = exposures_per_frame(uniform, 3, default=20e-3, probe_channels=["probe"])
+    assert all(abs(e - 8e-3) < 1e-9 for e in exps), exps          # every frame == the one exposure
+
+    bracket = reference_bracket_sequence(ref_exposure=20e-3, readout_exposure=5e-3, n_ref=2)
+    exps = exposures_per_frame(bracket, 3, default=20e-3, probe_channels=["probe"])
+    assert [round(e * 1e3, 3) for e in exps] == [20.0, 5.0, 20.0]  # long-short-long
+
+
+def test_qcmos_exposure_fallback_uses_longest_probe_for_a_heterogeneous_bracket():
+    """The qCMOS adapter sets ONE DCAM exposure; on a heterogeneous bracket the uniform
+    exposure_from_sequence RAISES, and the adapter must fall back to the LONGEST probe (the
+    external trigger gates each frame; an atom scatters only during its own probe).  Pins the
+    fallback math the adapter uses, DCAM-free."""
+    from Zou_lab_control.neutral_atom.timing import (
+        exposure_from_sequence, reference_bracket_sequence)
+
+    bracket = reference_bracket_sequence(ref_exposure=20e-3, readout_exposure=5e-3, n_ref=2)
+    with pytest.raises(ValueError):                               # non-uniform probe durations
+        exposure_from_sequence(bracket, default=1e-3, channel="probe")
+    durations = [p.duration for p in bracket.base_pulses() if p.value and p.channel == "probe"]
+    assert max(durations) == pytest.approx(20e-3)                 # the adapter's longest-probe fallback

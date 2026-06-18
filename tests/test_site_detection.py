@@ -108,3 +108,44 @@ def test_find_site_centers_recovers_genuinely_dark_corner_sites():
     assert np.all(centers[:, 1] >= half) and np.all(centers[:, 1] <= h - 1 - half)
     # the recovered dark-site centers land on their true lattice nodes (within half a cell)
     assert _is_one_to_one(centers, truth, tol=7.0)
+
+
+def test_find_site_centers_recovers_a_whole_dark_row():
+    """An ENTIRE row never lit this calibration (its per-row anchor would be a pure border
+    artifact).  The global Theil-Sen lattice fit interpolates that row from the other rows,
+    so its centers land on the interior grid -- every center clears the PSF-box margin and
+    no center sits on the image edge.  Regression for the per-row-median repair that an
+    all-dark line tips to the border."""
+    grid = (5, 7)
+    image_shape = (96, 128)
+    amps = np.full(grid, 700.0)
+    amps[2, :] = 0.0                                   # the whole middle row is dark
+    img, truth = _grid_template(grid, image_shape, amplitudes=amps.reshape(-1))
+    img = img + np.random.default_rng(1).normal(0.0, 4.0, size=img.shape)
+
+    centers = find_site_centers(img, grid)
+    assert centers.shape == (grid[0] * grid[1], 2)
+    half = 3
+    h, w = image_shape
+    assert np.all(centers[:, 0] >= half) and np.all(centers[:, 0] <= w - 1 - half)
+    assert np.all(centers[:, 1] >= half) and np.all(centers[:, 1] <= h - 1 - half)
+    # the recovered dark row sits at its interpolated interior node, not the border
+    assert _is_one_to_one(centers, truth, tol=8.0)
+
+
+def test_find_site_centers_1d_array_with_dark_sites_stays_in_bounds():
+    """A 1xN trap line with some dark sites: the single populated axis is still fit and every
+    returned center stays inside the frame (no edge artifact -> no PSF-box crash)."""
+    grid = (1, 8)
+    image_shape = (60, 160)
+    amps = np.full(grid[0] * grid[1], 700.0)
+    amps[0] = 0.0; amps[-1] = 0.0; amps[4] = 0.0       # dark ends + one interior
+    img, truth = _grid_template(grid, image_shape, amplitudes=amps)
+    img = img + np.random.default_rng(2).normal(0.0, 4.0, size=img.shape)
+
+    centers = find_site_centers(img, grid)
+    assert centers.shape == (grid[0] * grid[1], 2)
+    half = 3
+    h, w = image_shape
+    assert np.all(centers[:, 0] >= half) and np.all(centers[:, 0] <= w - 1 - half)
+    assert np.all(centers[:, 1] >= half) and np.all(centers[:, 1] <= h - 1 - half)

@@ -8,8 +8,8 @@ These are exactly the behaviours that silently regress, so they are pinned here
                                        and write the report (incl. a reloadable calibration.json) to `folder`;
       - source = "saved frames"     -> calibrate from frames already in `folder`;
       - source = "saved calibration"-> reload a finished calibration.json from `folder`, NO acquisition;
-      - mode = box / per-site PSF / uniform PSF -> the three sitemap readout models
-        (resolved to box / psf / uniform_psf);
+      - the cali computes EVERY readout model (box / per-site PSF / uniform PSF) into ONE
+        calibration; the OccupancyProcessor picks one at read time -- there is no `mode` param;
       - threshold = otsu / bimodal;
       - one `folder` (input + output, never blank) replaces the old save_path/load_path/data_dir.
   * the measurement PLOT split: a measurement called from the NOTEBOOK API defaults
@@ -156,6 +156,49 @@ def test_calibrate_task_saved_frames_source(tmp_path):
         assert task.source == "saved frames"
         task.run_to_completion()
         assert np.asarray(task.calibration.centers).shape == (12, 2)
+    finally:
+        exp.close()
+
+
+def test_calibrate_task_saved_frames_uses_reference_brackets_for_held_out_fidelity(tmp_path):
+    """A SAVED run is grouped exactly like a live bracket (long ``ref_shots`` vote ground
+    truth around the ``short_shot`` readout).  The saved-frames flow must regroup those
+    reference frames and take the SAME held-out training path as the live flow: distinct
+    box / per-site PSF / uniform PSF fidelity + reference-trained per-site thresholds
+    (``threshold_method='per_site_reference'``) -- NOT the affine-invariant self-consistent
+    estimate that reports a bitwise-identical fidelity for every method.  Regression for the
+    folder flow silently degrading to that estimate (audit finding [1])."""
+    import Zou_lab_control.neutral_atom as na
+    import Zou_lab_control.frontend  # noqa: F401  (registers the viewer so the report renders)
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.neutral_atom.operations.calibration import ALL_READOUT_METHODS
+
+    exp = _calibrated((4, 5))
+    try:
+        folder = tmp_path / "run"
+        # a fidelity-LIMITED short readout (small exposure) so the methods genuinely separate;
+        # many groups so every site gets both bright + dark labelled shots to train on.
+        na.write_virtual_run(str(folder), groups=160, grid_shape=(4, 5),
+                             short_exposure=5e-4, seed=5)
+        task = exp.readout.calibrate_task(
+            SignalHub(), source="saved frames", folder=str(folder))
+        task.run_to_completion()
+
+        # the run's reference frames were regrouped into per-group brackets (one short readout
+        # scored against its long reference frames), exactly like the live flow.
+        n_ref = 3                                          # write_virtual_run default ref_shots
+        assert len(task._reference_groups) == len(task._readout_by_group) > 0
+        assert len(task._reference_groups[0]) == n_ref
+        # the held-out training wrote reference-trained per-site thresholds back into the cal
+        assert task.calibration.metadata.get("threshold_method") == "per_site_reference"
+
+        # every method got a real held-out classification fidelity and the three are NOT the
+        # bitwise-identical number the self-consistent estimate would force.
+        assert set(task._method_fidelity) == set(ALL_READOUT_METHODS)
+        means = {m: float(np.nanmean(d["fidelity"])) for m, d in task._method_fidelity.items()}
+        assert all(0.5 <= v <= 1.0 for v in means.values())
+        assert max(means.values()) - min(means.values()) > 1e-3, (
+            f"per-method fidelity must differ from saved frames, got {means}")
     finally:
         exp.close()
 

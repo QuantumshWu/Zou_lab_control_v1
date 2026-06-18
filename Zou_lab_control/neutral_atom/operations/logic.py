@@ -735,8 +735,6 @@ class CalibrateReadoutTask(Task):
             self.calibration_frames = max(1, int(values["calibration_frames"]))
         if "threshold_frames" in values:
             self.threshold_frames = max(2, int(values["threshold_frames"]))
-        if "mode" in values:
-            self.mode = self._coerce_mode(values["mode"])
         if "threshold_method" in values:
             self.threshold_method = str(values["threshold_method"])
 
@@ -806,10 +804,13 @@ class CalibrateReadoutTask(Task):
         # the reference brackets (if acquired) give the report ground-truth labels, so the
         # per-method fidelity is held-out classification accuracy (distinct box / PSF / uniform),
         # not the affine-invariant self-consistent estimate.
+        # Report the calibration's ACTUAL threshold method: after the held-out writeback it is
+        # "per_site_reference", not the pre-train otsu label -- so summary.json matches reality.
+        cal_method = self.calibration.metadata.get("threshold_method", self.threshold_method)
         return write_calibration_report(
             folder, calibration=self.calibration, readout_frames=frames,
             template=getattr(self, "_reference_template", None),
-            threshold_method=self.threshold_method,
+            threshold_method=cal_method,
             reference_groups=getattr(self, "_reference_groups", None),
             readout_by_group=getattr(self, "_readout_by_group", None),
             timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
@@ -871,31 +872,11 @@ class CalibrateReadoutTask(Task):
         calibration = calibrate_all_methods_from_images(
             template, samples, grid_shape=self.grid_shape, roi_radius=self.roi_radius,
             threshold_method=self.threshold_method)
-        # Use the bracket-voted GROUND TRUTH to set each method's per-site boundary: train the
-        # threshold on the labelled short readout and write it back, so a downstream
-        # OccupancyProcessor.detect reads on the reference-trained threshold (not the otsu
-        # quick split) -- the Rb87 "use the true labels to set where the boundary is" step.
-        # NaN (a site with too few labelled shots to train) falls back to the otsu threshold.
-        from .calibration_report import _held_out_by_method
-        self._method_fidelity = _held_out_by_method(calibration, ref_groups, readout_by_group)
-        if self._method_fidelity:
-            trained: dict[str, np.ndarray] = {}
-            for m, data in self._method_fidelity.items():
-                thr = np.asarray(data["thresholds"], dtype=float).reshape(-1)
-                fallback = np.asarray(calibration.thresholds_for(m), dtype=float).reshape(-1)
-                bad = ~np.isfinite(thr)
-                if np.any(bad):
-                    thr = thr.copy()
-                    thr[bad] = fallback[bad]
-                trained[m] = thr
-            calibration = calibration.with_method_thresholds(
-                trained, threshold_method="per_site_reference")
-        # Keep the readout frames + reference brackets + averaged template so run() can write
-        # the rb87-style report: per-site distribution + HELD-OUT per-method fidelity scored
-        # against the bracket-voted ground truth + the site map.
+        # Use the bracket-voted ground truth to train + write back each method's per-site
+        # boundary (so detect reads on it), and stash the groups for the held-out report.
+        calibration = self._apply_reference_thresholds(calibration, ref_groups, readout_by_group)
+        # Keep the readout frames + averaged template so run() can write the rb87-style report.
         self._readout_samples = list(samples)
-        self._reference_groups = ref_groups
-        self._readout_by_group = list(readout_by_group)
         self._reference_template = (np.mean(np.asarray(template, dtype=float), axis=0)
                                     if template else None)
         return calibration
@@ -903,6 +884,32 @@ class CalibrateReadoutTask(Task):
     #: The number of long reference frames bracketing each short readout (a "20-5-20" shot):
     #: two long images, one before and one after, vote ground truth by strict consensus.
     REFERENCE_FRAMES_PER_BRACKET = 2
+
+    def _apply_reference_thresholds(self, calibration, ref_groups, readout_by_group):
+        """Score each readout method's HELD-OUT fidelity against the bracket-voted ground
+        truth and write the reference-trained per-site thresholds back into the calibration,
+        so a downstream ``OccupancyProcessor.detect`` reads on the trained boundary (not the
+        otsu quick split) -- the Rb87 "use the true labels to set where the boundary is" step.
+        A NaN (a site with too few labelled shots to train) falls back to the otsu threshold;
+        if there is no usable ground truth at all, ``_held_out_by_method`` returns ``{}`` and
+        the calibration keeps its otsu thresholds.  Stashes the groups + per-method report so
+        ``run()`` can write the held-out report.  Shared by the live and saved-frames flows."""
+        from .calibration_report import _held_out_by_method
+        self._reference_groups = list(ref_groups or [])
+        self._readout_by_group = list(readout_by_group or [])
+        self._method_fidelity = _held_out_by_method(calibration, self._reference_groups, self._readout_by_group)
+        if not self._method_fidelity:
+            return calibration
+        trained: dict[str, np.ndarray] = {}
+        for m, data in self._method_fidelity.items():
+            thr = np.asarray(data["thresholds"], dtype=float).reshape(-1)
+            fallback = np.asarray(calibration.thresholds_for(m), dtype=float).reshape(-1)
+            bad = ~np.isfinite(thr)
+            if np.any(bad):
+                thr = thr.copy()
+                thr[bad] = fallback[bad]
+            trained[m] = thr
+        return calibration.with_method_thresholds(trained, threshold_method="per_site_reference")
 
     def _collect_bracket_groups(self, out: "TaskOutput", *, progress_lo: float, progress_hi: float):
         """Acquire ``threshold_frames`` reference BRACKETS.  Each bracket is ONE correlated
@@ -937,24 +944,41 @@ class CalibrateReadoutTask(Task):
     def _run_from_folder(self, out: "TaskOutput"):
         """Calibrate from frames SAVED IN A FOLDER (the real-data flow): index the run,
         find the sites from the reference template, then per-site thresholds for every
-        readout method (the OccupancyProcessor picks which to use)."""
+        readout method (the OccupancyProcessor picks which to use).
+
+        A saved run is grouped exactly like the live bracket -- each group holds the long
+        REFERENCE frames (``ref_shots``) that vote ground truth around its short readout
+        (``short_shot``).  Re-grouping the run's reference frames back into per-group
+        brackets lets the saved-frames flow take the SAME held-out training path as the
+        live flow (:meth:`_apply_reference_thresholds`): distinct box / PSF / uniform
+        held-out fidelity + reference-trained per-site thresholds, NOT the affine-invariant
+        self-consistent estimate.  If the run is too short to vote ground truth, the helper
+        no-ops and the calibration keeps its otsu thresholds (graceful fallback)."""
         from .calibration import calibrate_all_methods_from_images
         from .imageio import index_run
         if not self.folder:
             raise ValueError("source='saved frames' needs a folder of saved frames.")
         run = index_run(self.folder, "img")
-        template_frames = list(run.template_frames())
-        if template_frames:
-            out.publish(frame=np.asarray(template_frames[-1], dtype=float), progress=0.4)
-        samples = list(run.short_frames())
+        n_ref = len(run.ref_shots)
+        # The long reference frames (group-major) build the all-sites template AND, regrouped,
+        # vote the per-group ground truth -- read the files ONCE for both uses.
+        reference_flat = [np.asarray(f, dtype=float) for f in run.reference_frames()]
+        if reference_flat:
+            out.publish(frame=reference_flat[-1], progress=0.4)
+        samples = [np.asarray(f, dtype=float) for f in run.short_frames()]   # one readout per group
         if samples:
-            out.publish(frame=np.asarray(samples[-1], dtype=float), progress=0.85)
+            out.publish(frame=samples[-1], progress=0.85)
         calibration = calibrate_all_methods_from_images(
-            template_frames, samples, grid_shape=self.grid_shape, roi_radius=self.roi_radius,
+            reference_flat, samples, grid_shape=self.grid_shape, roi_radius=self.roi_radius,
             threshold_method=self.threshold_method)
+        n_groups = run.n_groups
+        ref_groups = ([reference_flat[g * n_ref:(g + 1) * n_ref] for g in range(n_groups)]
+                      if n_ref and len(reference_flat) >= n_groups * n_ref
+                      and len(samples) == n_groups else [])
+        calibration = self._apply_reference_thresholds(calibration, ref_groups, samples)
         self._readout_samples = list(samples)
-        self._reference_template = (np.mean(np.asarray(template_frames, dtype=float), axis=0)
-                                    if template_frames else None)
+        self._reference_template = (np.mean(np.asarray(reference_flat, dtype=float), axis=0)
+                                    if reference_flat else None)
         return calibration
 
 

@@ -128,11 +128,28 @@ def find_site_centers(
     # Sort into the regular array, then snap any center detection misplaced (a DARK site's
     # border artifact) back onto its lattice node before applying the requested ordering.
     row_major = sort_centers_grid(centers_xy, (ny, nx), ordering="row-major")
-    repaired = _regularize_grid(row_major, (ny, nx))
+    repaired = _regularize_grid(row_major, (ny, nx), img.shape)
     return sort_centers_grid(repaired, (ny, nx), ordering=ordering)
 
 
-def _regularize_grid(centers_row_major, grid_shape: Sequence[int]) -> np.ndarray:
+def _robust_axis_lattice(anchors: np.ndarray, n: int) -> np.ndarray:
+    """Fit ONE regular axis (origin + pitch) to ``n`` per-line anchor coordinates and return
+    the lattice value for every index 0..n-1.  Uses a Theil-Sen slope (median of pairwise
+    (a_j - a_i)/(j - i)) and a median-residual origin, so a few OUTLIER lines -- an
+    all-dark row/column whose anchor is an image-border artifact -- cannot tip the fit;
+    those lines get an INTERPOLATED interior node instead of staying at the edge.  ``n == 1``
+    has no pitch to fit, so the single line keeps its anchor."""
+    anchors = np.asarray(anchors, dtype=float)
+    if n <= 1:
+        return anchors.copy()
+    idx = np.arange(n, dtype=float)
+    slopes = [(anchors[j] - anchors[i]) / (j - i) for i in range(n) for j in range(i + 1, n)]
+    pitch = float(np.median(slopes)) if slopes else 0.0
+    origin = float(np.median(anchors - pitch * idx))
+    return origin + pitch * idx
+
+
+def _regularize_grid(centers_row_major, grid_shape: Sequence[int], image_shape) -> np.ndarray:
     """Snap centers that detection misplaced back onto the trap array's regular lattice.
 
     The traps are an axis-aligned regular grid (real hardware and the virtual backend
@@ -140,28 +157,36 @@ def _regularize_grid(centers_row_major, grid_shape: Sequence[int]) -> np.ndarray
     site that emitted no light this calibration still sits at its node -- detection cannot
     find a peak that is not there, so without this its center lands on an image-border
     ``maximum_filter`` artifact and a downstream PSF box (which needs a full window around
-    every site) cannot fit.  The per-row / per-column anchor is the MEDIAN of that line, so
-    a handful of dark sites never move it; only a center more than half a cell off its node
-    is replaced, leaving confidently-detected sites untouched."""
+    every site) cannot fit.  Each axis is fit GLOBALLY (robust origin + pitch via
+    :func:`_robust_axis_lattice`), so even a WHOLE dark row/column is interpolated to its
+    interior node rather than anchored on a border artifact; only a center more than half a
+    cell off its node is replaced, leaving confidently-detected sites untouched.  Finally
+    every node is clamped a quarter-cell inside the frame, so no returned center can sit on
+    the border where a PSF box would not fit."""
 
     ny, nx = grid_shape_tuple(grid_shape)
     g = np.asarray(centers_row_major, dtype=float).reshape(ny, nx, 2)
-    row_y = np.median(g[:, :, 1], axis=1)            # one y per row (median over its columns)
-    col_x = np.median(g[:, :, 0], axis=0)            # one x per column (median over its rows)
+    h, w = int(image_shape[0]), int(image_shape[1])
+    row_y = _robust_axis_lattice(np.median(g[:, :, 1], axis=1), ny)   # one y per row
+    col_x = _robust_axis_lattice(np.median(g[:, :, 0], axis=0), nx)   # one x per column
     pitches = []
     if ny > 1:
-        pitches.append(abs(float(np.median(np.diff(row_y)))))
+        pitches.append(abs(float(row_y[1] - row_y[0])))
     if nx > 1:
-        pitches.append(abs(float(np.median(np.diff(col_x)))))
+        pitches.append(abs(float(col_x[1] - col_x[0])))
     pitches = [p for p in pitches if np.isfinite(p) and p > 0]
-    if not pitches:                                  # 1x1 grid / collapsed anchors: nothing to fit
-        return g.reshape(ny * nx, 2)
-    tol = 0.5 * min(pitches)                          # "still on its node" radius = half a cell
+    pitch = float(min(pitches)) if pitches else float(min(h, w))
     lattice_x = np.broadcast_to(col_x[None, :], (ny, nx))
     lattice_y = np.broadcast_to(row_y[:, None], (ny, nx))
+    tol = 0.5 * pitch                                 # "still on its node" radius = half a cell
     off_node = np.hypot(g[:, :, 0] - lattice_x, g[:, :, 1] - lattice_y) > tol
     g[off_node, 0] = lattice_x[off_node]
     g[off_node, 1] = lattice_y[off_node]
+    # Interior clamp: a dark-site node (or a degenerate fit) can never land on the border
+    # where a PSF box cannot fit; a confidently-detected site sits well inside, so untouched.
+    margin = max(1.0, 0.25 * pitch)
+    g[:, :, 0] = np.clip(g[:, :, 0], margin, max(margin, w - 1 - margin))
+    g[:, :, 1] = np.clip(g[:, :, 1], margin, max(margin, h - 1 - margin))
     return g.reshape(ny * nx, 2)
 
 

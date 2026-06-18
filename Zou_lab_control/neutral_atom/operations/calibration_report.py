@@ -122,11 +122,22 @@ def _held_out_by_method(calibration, reference_groups, readout_by_group) -> dict
     training split of the SHORT readout signal and the fidelity scored on a HELD-OUT test
     split.  Because PSF matched-filtering separates the labelled bright/dark populations
     better than a square box (especially on the short, noisy readout), the methods get
-    DISTINCT fidelities -- the whole point of computing all three.  ``{}`` if no labels."""
-    from .fidelity import characterize_readout
+    DISTINCT fidelities -- the whole point of computing all three.  Returns ``{}`` when the
+    bracket data cannot yield usable ground truth -- too few reference shots for a bimodal
+    fit (the fit needs >= 8 pooled samples, i.e. n_ref * n_groups), or no site ends up with
+    BOTH a bright and a dark labelled shot -- so the caller falls back to the self-consistent
+    estimate instead of writing an all-NaN held-out report (and stale per-site thresholds)."""
+    from .fidelity import characterize_readout, reference_labels
 
     reference = _reference_signal_array(calibration, reference_groups, method="box")  # fixed labels
     if reference.size == 0 or reference.shape[1] < 1 or len(readout_by_group) != reference.shape[0]:
+        return {}
+    # No usable ground truth (every site ambiguous / unfittable) -> do NOT emit a degenerate
+    # all-NaN held-out report; let write_calibration_report fall back to the estimate.
+    try:
+        if int(np.count_nonzero(reference_labels(reference).valid)) == 0:
+            return {}
+    except Exception:
         return {}
     out: dict[str, dict] = {}
     try:
@@ -140,11 +151,16 @@ def _held_out_by_method(calibration, reference_groups, readout_by_group) -> dict
             report = characterize_readout(short, reference)
         except Exception:
             continue
+        fidelity = np.asarray(report.site_fidelities, dtype=float)
+        if not np.any(np.isfinite(fidelity)):
+            continue                                   # this method scored no site -> skip (not held_out)
         out[str(m)] = {"counts": short,
                        "thresholds": np.asarray(report.thresholds, dtype=float).reshape(-1),
-                       "fidelity": np.asarray(report.site_fidelities, dtype=float),
+                       "fidelity": fidelity,
                        "held_out": True}
-    return out
+    # If not every method produced a finite held-out score, the comparison is not meaningful
+    # -- fall back wholesale to the self-consistent estimate rather than mixing the two.
+    return out if len(out) == len(methods) and methods else {}
 
 
 def write_calibration_report(folder, *, calibration, readout_frames, template=None,

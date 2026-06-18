@@ -101,6 +101,11 @@ def screenshot(widget, path, *, settle_ms: int = 500) -> Path:
     settle(widget, settle_ms)
     grabbed = widget.grab()
     canvas = QtGui.QPixmap(grabbed.size())
+    # The grab's pixmap is in DEVICE pixels but carries a devicePixelRatio (N on a scaled /
+    # high-DPI screen); the canvas must share it or drawPixmap(0,0) paints the grab at its
+    # LOGICAL size into the top-left and leaves the rest white (cramming a DPR=1.5/2 capture
+    # into a corner).  Match the dpr so the flatten is device-pixel-exact and full-resolution.
+    canvas.setDevicePixelRatio(grabbed.devicePixelRatio())
     canvas.fill(QtGui.QColor("white"))
     painter = QtGui.QPainter(canvas)
     painter.drawPixmap(0, 0, grabbed)
