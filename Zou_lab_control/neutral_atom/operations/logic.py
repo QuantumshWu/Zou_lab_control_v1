@@ -1046,6 +1046,11 @@ class ScannedMeasurementNode(Measurement):
         # GUI flow legend / signal namespace: the measurement's slug (its prefix, e.g.
         # ``temperature``) -- the SAME token its hub signals carry -- not the raw y key.
         self.node_label = str(prefix).rstrip("_") or str(y_key)
+        # Full hub names of the scan's x axis + y curve.  A 1d plot wired to the y curve
+        # resolves its companion x signal (and that x's axis label/unit) from THIS node, so
+        # the curve is drawn vs the swept parameter with the right x-axis -- one signal pick.
+        self.x_signal = self.prefix + self.x_key
+        self.y_signal = self.prefix + self.y_key
         self.grid_shape = None if grid_shape is None else grid_shape_tuple(grid_shape)
         # The measurement owns the swept values (single source of truth); they are the
         # x AXIS, known UP FRONT.  Mirroring Confocal_GUIv2's BaseMeasurement: the curve

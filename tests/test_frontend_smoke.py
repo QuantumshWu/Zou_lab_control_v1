@@ -1469,15 +1469,15 @@ def test_task_console_signal_picker_and_declarative_params(monkeypatch):
     datas = [card.signal_combo.itemData(i) for i in range(card.signal_combo.count())]
     assert names[0] == "(none)"                            # blank = turn the slot off
     # items are LABELLED "<name> — <source node>  [<shape>]"; the bare signal name is the
-    # item DATA (what signal[0] is filled from), so check the data list.
+    # item DATA (what `signal` is filled from), so check the data list.
     assert "rate_grid" in datas and "frame" in datas
-    assert card.signal_combo.currentData() == "frame"      # the 2d card's primary slot = frame
+    assert card.signal_combo.currentData() == "frame"      # the 2d card's input = frame
 
     idx = datas.index("rate_grid")
     card.signal_combo.setCurrentIndex(idx)
-    card._on_slot_pick(0)                                   # pick the primary input slot
-    assert card.config.inputs[0] == "rate_grid"            # slot 0 now names rate_grid
-    assert card.config.source == "value = signal[0]"       # primary slot drives signal[0]
+    card._on_slot_pick(0)                                   # pick the input signal
+    assert card.config.inputs[0] == "rate_grid"            # input now names rate_grid
+    assert card.config.source == "value = signal"          # the picked signal IS `signal`
     console.refresh_once()
     assert card.status.text().startswith("shot ")           # applied instantly + healthy
 
@@ -1786,12 +1786,12 @@ def test_task_console_sites_panel_bad_centers_isolated(monkeypatch):
 
     console = dt.demo_console(shots=10)
     sites = next(c for c in console.cards if c.config.kind == "sites")
-    # point the site map at a signal whose producing node publishes no centres -> the panel
-    # cannot resolve the centres/underlay from a producing node and surfaces the error.
-    sites.config.inputs[0] = "no_such_signal"
-    sites.config.source = "value = signal[0]"
+    # point the site map at a signal whose producing node publishes NO centres (the camera's
+    # raw ``frame``) -> the panel cannot resolve centres/underlay from that node + errors.
+    sites.config.inputs[0] = "frame"
+    sites.config.source = "value = signal"
     console.refresh_once()
-    assert "no_such_signal" in sites.status.text()
+    assert "frame" in sites.status.text()
     healthy = [c for c in console.cards if c is not sites]
     assert all(c.status.text().startswith("shot ") for c in healthy)
     console.shutdown()

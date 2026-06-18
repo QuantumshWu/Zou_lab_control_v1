@@ -393,22 +393,21 @@ class PanelConfig:
             if len(self.inputs) < len(slots):       # pad to the kind's slot count
                 self.inputs += [d for _, d, _ in slots[len(self.inputs):]]
         # A pure-view plot is BLANK until a signal is picked (decoupled from acquisition).
-        # When the primary slot already names a signal, the default source plots
-        # ``signal[0]``; an empty primary slot leaves it blank ("pick a signal").  A saved
-        # layout keeps its stored source verbatim.
+        # When the input already names a signal, the default source is ``value = signal``;
+        # an empty input leaves it blank ("pick a signal").  A saved layout keeps its
+        # stored source verbatim.
         if source is not None:
             self.source = str(source)
         elif self.inputs and self.inputs[0]:
-            self.source = "value = signal[0]"
+            self.source = "value = signal"
         else:
             self.source = _BLANK_SOURCE
-        # A source written as a bare ``value = <signal>`` (a saved layout or a direct pick)
-        # NAMES the primary input, so reflect it in slot 0 -- the slot list and the source
-        # must never disagree (the picker would otherwise show "(none)" while the panel
-        # plots a signal).  ``value = signal[0]`` and an expression (``value = np.log(f)``)
-        # do NOT match this and leave the slots alone.
+        # A source written as a bare ``value = <hub signal>`` (a saved layout or a direct
+        # pick) NAMES the input, so reflect it in the input slot -- the picker and the source
+        # must never disagree.  The canonical ``value = signal`` and an expression
+        # (``value = np.log(f)``) do NOT match this and leave the input alone.
         m = re.fullmatch(r"value\s*=\s*([A-Za-z_]\w*)", self.source.strip())
-        if m and self.inputs:
+        if m and m.group(1) != "signal" and self.inputs:
             self.inputs[0] = m.group(1)
         self.params = dict(params or {})
         self.role = str(role)
@@ -583,7 +582,7 @@ class PanelCard(FluentGroupBox):
 
     def __init__(self, config: PanelConfig, parent=None, *, names_provider=None,
                  sources_provider=None, formats_provider=None, axes_provider=None,
-                 sites_inputs_provider=None):
+                 sites_inputs_provider=None, curve_x_provider=None):
         # Titled frame: the title strip carries the panel KIND (top-left) and the
         # Setting button (top-right), so the card is delineated like the rest.
         super().__init__(PANEL_KINDS[config.kind], parent, shadow=True)
@@ -604,6 +603,9 @@ class PanelCard(FluentGroupBox):
         # ONE signal (occupancy) and resolves its centres + frame underlay from the SAME
         # producing node (via that node's spec metadata), so rings + underlay are one shot.
         self.sites_inputs_provider = sites_inputs_provider
+        # callable(y_signal) -> companion x_signal: a 1d plot wired to a scan's y curve
+        # draws it vs the swept x from the SAME producing node (one signal pick, #3).
+        self.curve_x_provider = curve_x_provider
         self.plotter = None
         self.canvas = None
         self._value_shape: tuple[int, ...] | None = None
@@ -735,21 +737,18 @@ class PanelCard(FluentGroupBox):
             accepts_label.setWordWrap(True)
             accepts_label.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
             sec.addWidget(accepts_label)
-        # ONE signal picker per INPUT SLOT (signal[0], signal[1], ...).  Most plots have a
-        # single slot ("signal"); a multi-input plot (the site map) shows one combobox per
-        # slot, each picking a hub signal.  The source expression reads them as
-        # ``signal[0]``, ``signal[1]``, ...  -- so a plot with more inputs is just more
-        # slots, no special params.
+        # ONE signal picker: a combobox of the live hub signals.  Picking one sets the
+        # source to ``value = signal`` (the canonical form -- the picked signal IS ``signal``
+        # in the expression).  A site map needs only its occupancy signal; its ring centres
+        # + frame underlay are resolved from the SAME producing node, never extra slots.
         self.slot_combos: list = []
-        multi = len(slots) > 1
         for i, (slabel, _default, stip) in enumerate(slots):
             combo = FluentComboBox()
-            combo.setToolTip(stip + ("\nReads into signal[%d] of the source expression." % i if multi else
-                                     "\nSets the source to `value = signal[0]`."))
+            combo.setToolTip(stip + "\nSets the source to `value = signal`.")
             combo.activated.connect(lambda _ix, idx=i: self._on_slot_pick(idx))
             self.slot_combos.append(combo)
             sec.addWidget(FluentSettingRow(slot_labels[i], combo, label_width=label_w))
-        self.signal_combo = self.slot_combos[0]    # primary-slot alias
+        self.signal_combo = self.slot_combos[0]    # the signal picker
 
         self.source_edit = FluentLineEdit(self.config.source)
         self.source_edit.setMinimumWidth(scaled_px(280, minimum=220))
@@ -996,18 +995,16 @@ class PanelCard(FluentGroupBox):
             self._fill_slot_combo(combo, cur)
 
     def _on_slot_pick(self, idx: int) -> None:
-        """A slot picker changed: write its bare signal name into ``config.inputs[idx]``.
-        The PRIMARY slot (signal[0]) IS the "plot this signal" control, so it also points
-        the source at ``value = signal[0]`` (a blank pick blanks the panel); the EXTRA
-        slots (signal[1], signal[2], ... e.g. the site map's centres/image) only fill their
-        input and leave the source alone.  The expression box stays the advanced override
-        for a custom ``value = ...``.  Then re-apply so the pick takes effect now."""
+        """The signal picker changed: write its bare signal name into ``config.inputs[idx]``
+        and point the source at ``value = signal`` (a blank pick blanks the panel).  The
+        picker IS the "plot this signal" control; the expression box stays the advanced
+        override for a custom ``value = ...``.  Then re-apply so the pick takes effect now."""
         name = str(self.slot_combos[idx].currentData() or "")   # bare name (not the labelled text)
         while len(self.config.inputs) <= idx:
             self.config.inputs.append("")
         self.config.inputs[idx] = name
         if idx == 0:
-            self.source_edit.setText("value = signal[0]" if name else _BLANK_SOURCE)
+            self.source_edit.setText("value = signal" if name else _BLANK_SOURCE)
         self._apply_source()                      # picking a slot applies instantly
 
     # ------------------------------------------------ basic display toggles
@@ -1236,10 +1233,9 @@ class PanelCard(FluentGroupBox):
         Every failure lands on the gear/status -- a bad expression in one panel
         must never break the console or its siblings."""
 
-        # Inject this panel's INPUT SLOTS as ``signal`` (a list): ``signal[0]`` is the
-        # primary value, ``signal[1..]`` the extra inputs of a multi-input plot (the site
-        # map's centers + image).  The source expression and _render read these, so a plot
-        # with any number of inputs is just a longer slot list.
+        # Inject this panel's picked input as ``signal`` -- the ONE hub signal it plots.
+        # The source reads it as ``value = signal`` (a site map's centres + frame underlay
+        # come from the SAME producing node, resolved separately -- never extra slots).
         namespace = self._with_signal_slots(namespace)
         # A BLANK panel (a freshly added pure view, source not yet wired) sits
         # quietly with a hint -- it is decoupled, so it shows nothing until the
@@ -1257,12 +1253,13 @@ class PanelCard(FluentGroupBox):
         self.set_status(f"shot {int(shot)}" if isinstance(shot, (int, float)) else "ok", error=False)
 
     def _with_signal_slots(self, namespace: Mapping[str, object]) -> dict[str, object]:
-        """Return a namespace copy with ``signal`` = the per-slot input values (one entry
-        per :func:`panel_input_slots` slot, taken from ``config.inputs``); a slot whose
-        signal is blank / not on the hub yet is ``None``.  So ``value = signal[0]`` plots
-        the primary input and a multi-input plot reads ``signal[1]``, ``signal[2]``, ..."""
+        """Return a namespace copy with ``signal`` = the value of this panel's picked input
+        (``config.inputs[0]``), or ``None`` when blank / not on the hub yet.  So the default
+        source ``value = signal`` plots the picked signal; an expression can still read it as
+        ``value = np.log(signal)`` or name a hub signal directly."""
         ns = dict(namespace)
-        ns["signal"] = [(ns.get(str(name)) if name else None) for name in self.config.inputs]
+        primary = str(self.config.inputs[0]) if self.config.inputs else ""
+        ns["signal"] = ns.get(primary) if primary else None
         return ns
 
     def _evaluate(self, namespace: dict[str, object]):
@@ -1435,19 +1432,23 @@ class PanelCard(FluentGroupBox):
         if not source.startswith("value ="):
             return None
         name = source[len("value ="):].strip()
-        # The default source plots an input SLOT (``value = signal[0]``): resolve it to the
-        # real hub-signal name in that slot so its producing node's axis label is found.
-        m = re.fullmatch(r"signal\[(\d+)\]", name)
-        if m:
-            i = int(m.group(1))
-            name = self.config.inputs[i] if i < len(self.config.inputs) else ""
+        # The default source ``value = signal`` plots the picked input: resolve ``signal`` to
+        # the real hub-signal name (``config.inputs[0]``) so its producing node's axis label
+        # is found.
+        if name == "signal":
+            name = self.config.inputs[0] if self.config.inputs else ""
+        return self._axis_label_for(name)
+
+    def _axis_label_for(self, name: str | None) -> str | None:
+        """The axis label a producing node declares for hub signal ``name`` (via
+        ``axes_provider`` -> the node's :class:`SignalSpec`), or None."""
         if not name or not callable(self.axes_provider):
             return None
         try:
             axes = dict(self.axes_provider())
         except Exception:
             return None
-        entry = axes.get(name)
+        entry = axes.get(str(name))
         return entry[0] if entry else None
 
     # ------------------------------------------------------------- plot lifecycle
@@ -1518,8 +1519,23 @@ class PanelCard(FluentGroupBox):
                 ylabel = str(self.config.params.get("ylabel", "")) or label
             else:
                 vec = arr.reshape(-1)
-                data_x = np.arange(len(vec), dtype=float)
-                xlabel, ylabel = "Site", self._source_axis_label() or label
+                ylabel = self._source_axis_label() or label
+                # A scan's y curve: draw it vs the companion x signal from the SAME
+                # producing node (its axis label/unit come with it) -- so a 1d plot wired
+                # to ``temperature_survival`` reads "Trap-off time (s)" on x (#3).  Falls
+                # back to a per-site index when there is no companion x.
+                x_name = None
+                if self.config.inputs and callable(self.curve_x_provider):
+                    try:
+                        x_name = self.curve_x_provider(self.config.inputs[0])
+                    except Exception:
+                        x_name = None
+                x_vals = (namespace or {}).get(x_name) if x_name else None
+                x_arr = None if x_vals is None else np.asarray(x_vals, dtype=float).reshape(-1)
+                if x_arr is not None and x_arr.size == vec.size:
+                    data_x, xlabel = x_arr, (self._axis_label_for(x_name) or "X")
+                else:
+                    data_x, xlabel = np.arange(len(vec), dtype=float), "Site"
             self.plotter = panel_plot(
                 data_x, vec, kind="1d", size=size, interactions=False,
                 labels=(xlabel, ylabel, "Z"),
@@ -2920,7 +2936,7 @@ class TaskConsole(QtWidgets.QWidget):
             for config in state.panels:
                 self._attach_card(PanelCard(config, parent=self.board,
                                             names_provider=self.hub.names,
-                                            sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs))
+                                            sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x))
             for node in state.logic:
                 self._attach_logic_node(node)    # always STOPPED -- Start is manual
             self._arrange()
@@ -2952,12 +2968,23 @@ class TaskConsole(QtWidgets.QWidget):
         except SyntaxError:
             return set()
         names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
-        return names - {"np", "numpy", "math", "history", "latest", "names", "shot", "value"}
+        return names - {"np", "numpy", "math", "history", "latest", "names", "shot", "value", "signal"}
+
+    def _card_reads(self, card: "PanelCard") -> set:
+        """The REAL hub signal names a panel reads: its picked input(s) (``config.inputs``)
+        plus any hub signal its expression names directly.  The pseudo ``signal`` token in
+        ``value = signal`` is NOT a hub name -- it stands for ``config.inputs[0]`` -- so it
+        is excluded by :meth:`_referenced_signals` and the picked input is unioned in
+        instead.  (Without this the signal-flow legend showed ``signal ← (no running
+        source)`` for a panel that IS wired to a running node.)"""
+        reads = set(self._referenced_signals(card.config.source))
+        reads |= {str(n) for n in getattr(card.config, "inputs", ()) if n}
+        return reads
 
     def _producing_node(self, card: "PanelCard"):
         """The running node whose published signals the panel's source reads (None if
         the expression touches no published signal, e.g. a pure constant)."""
-        refs = self._referenced_signals(card.config.source)
+        refs = self._card_reads(card)
         if not refs:
             return None
         for node in self.running_nodes:
@@ -3109,6 +3136,19 @@ class TaskConsole(QtWidgets.QWidget):
                 return ((prefix + ck) if ck else None, (prefix + ik) if ik else None)
         return (None, None)
 
+    def _curve_x(self, y_signal) -> str | None:
+        """For a 1d plot wired to a scan's y CURVE, the companion x-axis signal resolved
+        from the SAME producing node (the scan node exposes ``y_signal``/``x_signal``).  So
+        wiring a 1d panel to ``temperature_survival`` draws it vs ``temperature_t_off`` with
+        the right x-axis -- the user picks ONE signal (#3, same idea as the site map)."""
+        y = str(y_signal or "")
+        if not y:
+            return None
+        for node in self.running_nodes:
+            if getattr(node, "y_signal", None) == y:
+                return getattr(node, "x_signal", None)
+        return None
+
     def _live_node_formats(self, node) -> list[tuple[str, str, str]]:
         """``[(name, shape, description)]`` for a RUNNING node -- one ROW per output, each
         shape read off a real value via ``logic.describe_shape`` (auto, never hand-typed)
@@ -3184,7 +3224,7 @@ class TaskConsole(QtWidgets.QWidget):
             return
         self._signal_info_sig = sig
         for card in self.cards:
-            reads = sorted(self._referenced_signals(card.config.source))
+            reads = sorted(self._card_reads(card))
             parts: list[str] = []
             for name in reads:
                 src = self._node_for_signal(name)
@@ -3312,7 +3352,7 @@ class TaskConsole(QtWidgets.QWidget):
         rows = max((c.config.row + c.config.rows for c in self.cards), default=0)
         config = PanelConfig(kind=str(kind), row=rows, col=0, size="1x2")
         card = PanelCard(config, parent=self.board, names_provider=self.hub.names,
-                         sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs)
+                         sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x)
         self._attach_card(card)
         self._arrange()
         self._mark_dirty()
@@ -3458,7 +3498,7 @@ class TaskConsole(QtWidgets.QWidget):
         config = PanelConfig(kind=kind, title=title, size="2x2",
                              source="value = __task_frame__")
         card = PanelCard(config, parent=self.board, names_provider=self.hub.names,
-                         sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs)
+                         sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x)
         self._attach_card(card)
         self._task_card = card
         self._running_task_row = row

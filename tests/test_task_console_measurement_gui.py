@@ -151,8 +151,9 @@ def test_node_start_builds_node_and_streams_no_auto_plot():
         node.run_to_completion()
         console.refresh_once()
 
-        x = console.hub.latest(spec.x_key)
-        y = console.hub.latest(spec.y_key)
+        # the console node publishes under the measurement slug: <key>_<quantity>.
+        x = console.hub.latest(f"{spec.key}_{spec.x_key}")
+        y = console.hub.latest(f"{spec.key}_{spec.y_key}")
         assert x.shape == (5,) and y.shape == (5,)
         assert np.all(np.isfinite(y)) and np.all((y >= 0) & (y <= 1))
         assert y[0] > y[-1] + 0.3
