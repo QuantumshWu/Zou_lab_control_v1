@@ -188,10 +188,14 @@ def test_virtual_parses_trap_off_from_release_recapture_sequence():
 # ----------------------------------------------------- virtual e2e (contract path)
 
 
-def _calibrated_virtual_session(grid=(3, 4)):
+def _calibrated_virtual_session(grid=(3, 4), readout_exposure=2e-3):
     exp = na.connect("virtual", sitemap={"grid_shape": grid, "image_shape": (64, 80)})
     exp.readout.sitemap(method="box", frames=6, display=False)
-    exp.readout.thresholds(frames=40, display=False)
+    # Calibrate the per-site threshold AT the exposure the release-recapture readout
+    # uses (a few ms): a threshold is exposure-specific (bright counts scale with the
+    # imaging time), so it must be learnt under the same readout conditions it will be
+    # applied to -- exactly as on real hardware.
+    exp.readout.thresholds(frames=40, exposure=readout_exposure, display=False)
     return exp
 
 
@@ -235,7 +239,7 @@ def test_temperature_scan_virtual_survival_decays_with_t_off():
     data-source physics matches the analysis-layer model without the analysis layer
     knowing the truth."""
 
-    exp = _calibrated_virtual_session(grid=(5, 7))
+    exp = _calibrated_virtual_session(grid=(5, 7), readout_exposure=3e-3)
     # The default loss model (50 uK, 6 um capture radius) has its half-survival near
     # ~75 us, so sweep 0..300 us to see the full fall-off.
     state = build_release_recapture_pulse(

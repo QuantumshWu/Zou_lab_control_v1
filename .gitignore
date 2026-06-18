@@ -106,3 +106,4 @@ pulses/
 # xsim litter (simulation runs anywhere in the tree)
 xsim.dir/
 *.pb
+calibrations/

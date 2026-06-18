@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import threading
 import time
+from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
@@ -38,6 +40,29 @@ from ..core.analysis import grid_shape_tuple
 from ..core.signals import SignalHub
 from ..devices.base import CameraDevice
 from ..timing import imaging_channel_kwargs, imaging_sequence
+
+
+@dataclass(frozen=True)
+class SignalSpec:
+    """What ONE output of a logic node MEANS -- the human label + unit + one-line
+    description for a signal it publishes (or, for a task, produces off-hub).
+
+    A node declares these ONCE (``output_specs``); the GUI reads them so a plot can
+    set its axis label/unit from the producing measurement (not a hard-coded per-kind
+    string) and a node's "publishes" legend reads as ``occupied  (35,)  per-site 0/1
+    occupancy`` -- every output named, shaped and explained.  ``name`` is the FULL hub
+    signal name (with the node's prefix), so a consumer maps a signal straight to its
+    meaning."""
+
+    name: str               # full published signal name (incl. the node's prefix)
+    label: str              # axis / legend label, e.g. "loading rate"
+    unit: str = ""          # physical unit, e.g. "s" / "K" (blank = dimensionless)
+    description: str = ""    # one-line human meaning for the publishes legend
+
+    @property
+    def axis_label(self) -> str:
+        """``label (unit)`` for a plot axis, or just ``label`` when dimensionless."""
+        return f"{self.label} ({self.unit})" if self.unit else self.label
 
 
 def describe_shape(value) -> str:
@@ -189,6 +214,23 @@ class LogicNode:
         produces its data, then expose THAT node's parameters.  Subclasses with
         a fixed signal set override this; the base publishes nothing structured."""
         return frozenset()
+
+    def output_specs(self) -> tuple[SignalSpec, ...]:
+        """One :class:`SignalSpec` per published signal -- the LABEL / unit / one-line
+        meaning the GUI shows (plot axis label, the "publishes" legend).  The base
+        derives a bare spec (label = name) for every :meth:`published_signals` entry;
+        a measurement/processor OVERRIDES this to give each output a real label, unit
+        and description so a plot reads its axis from the producing node, not a
+        hard-coded per-kind string.  Single source -- the node owns what its outputs
+        mean."""
+        return tuple(SignalSpec(str(name), str(name)) for name in sorted(self.published_signals()))
+
+    def signal_spec(self, name: str) -> SignalSpec | None:
+        """The :class:`SignalSpec` for one published signal name, or ``None``."""
+        for spec in self.output_specs():
+            if spec.name == str(name):
+                return spec
+        return None
 
     # --------------------------------------------------- acquisition parameters
     # A panel is a VIEW; a logic node produces the data; behind the node sits the data
@@ -440,6 +482,19 @@ class OccupancyProcessor(Processor):
             out["rate_grid"] = self._rate_sites.reshape(self.grid_shape).copy()
         return out
 
+    def output_specs(self) -> tuple[SignalSpec, ...]:
+        """Label + meaning of each detection signal (the readout pipeline's outputs)."""
+        p = self.prefix
+        return (
+            SignalSpec(p + "occupied", "occupancy", "", "per-site single-shot occupancy (0 / 1)"),
+            SignalSpec(p + "counts", "readout counts", "", "per-site integrated readout signal"),
+            SignalSpec(p + "rate", "loading rate", "", "running-mean loading rate over all sites"),
+            SignalSpec(p + "rate_sites", "loading rate", "", "per-site running-mean loading rate"),
+            SignalSpec(p + "rate_grid", "loading rate", "", "per-site loading rate as a site grid"),
+            SignalSpec(p + "centers", "site centre", "px", "site centres in camera pixels (N, 2)"),
+            SignalSpec(p + "thresholds", "threshold", "counts", "per-site bright/dark count threshold"),
+        )
+
 
 class TaskOutput:
     """The MID-RUN output channel handed to a :class:`Task`'s ``run`` -- a per-task
@@ -562,6 +617,17 @@ class CalibrateReadoutTask(Task):
             raise ValueError(f"mode {mode!r} must be one of {tuple(cls.MODE_TO_SITEMAP_METHOD)}.")
         return mode
 
+    def output_specs(self) -> tuple[SignalSpec, ...]:
+        """What the calibration PRODUCES (off the hub) + streams mid-run -- keyed by the
+        bare ``provides`` / ``mid_run`` names so the console legend reads e.g.
+        ``centers (result)  (35, 2)  fitted site coordinates``."""
+        return (
+            SignalSpec("frame", "reference frame", "counts", "long-exposure template frame (streamed live)"),
+            SignalSpec("centers", "site centres", "px", "fitted site coordinates (N, 2)"),
+            SignalSpec("thresholds", "threshold", "counts", "per-site bright/dark count threshold (N,)"),
+            SignalSpec("n_sites", "site count", "", "number of trap sites found"),
+        )
+
     def __init__(self, hub: SignalHub, camera: CameraDevice, *, sequencer: object | None = None,
                  grid_shape: tuple[int, int] = (5, 7), roi_radius: int = 1,
                  sitemap_exposure: float = 0.05, readout_exposure: float = 0.02,
@@ -668,18 +734,45 @@ class CalibrateReadoutTask(Task):
         else:
             calibration = self._run_live(out)
         self.calibration = calibration
-        out.publish(progress=1.0)
         centers = np.asarray(self.calibration.centers, dtype=float)
         thr = np.asarray(self.calibration.thresholds, dtype=float).reshape(-1)
+        if self.save_path and Path(self.save_path).suffix.lower() in (".npz", ".json"):
+            # An explicit .npz / .json path saves the loadable calibration there too.
+            self.calibration.save(self.save_path)
+        # ALWAYS write the rb87-style report (per-site distribution + fidelity + site map
+        # + npz/json) to a folder, so a calibration leaves reviewable artifacts on disk.
+        out.publish(progress=0.98, stage="writing distribution + fidelity report")
+        self.report = self._write_report(self.report_dir())
+        folder = self.report.get("folder") if isinstance(self.report, dict) else None
+        out.publish(progress=1.0, stage=(f"saved report -> {folder}" if folder else "done"))
+        return {"centers": centers, "thresholds": thr, "n_sites": float(len(centers)),
+                "report_dir": str(folder or "")}
+
+    def report_dir(self) -> "Path":
+        """The folder this calibration's artifacts are written to.  An explicit
+        ``save_path`` directory (or the parent of a ``save_path`` file) is honoured; with
+        none, a timestamped ``calibrations/calibration_<stamp>/`` under the cwd is used --
+        so figures + calibration always land somewhere the experimenter can find."""
+        from datetime import datetime
         if self.save_path:
-            # A .npz / .json path saves the full calibration (so load_path can
-            # restore it); a bare path falls back to the centers+thresholds npz.
-            from pathlib import Path as _Path
-            if _Path(self.save_path).suffix.lower() in (".npz", ".json"):
-                self.calibration.save(self.save_path)
-            else:
-                np.savez(self.save_path, centers=centers, thresholds=thr)
-        return {"centers": centers, "thresholds": thr, "n_sites": float(len(centers))}
+            p = Path(self.save_path)
+            return p if p.suffix == "" else p.parent / f"{p.stem}_report"
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return Path("calibrations") / f"calibration_{stamp}"
+
+    def _write_report(self, folder) -> dict:
+        """Write the per-site distribution / fidelity / site-map report for THIS run's
+        readout frames (no-op-safe if a folder run kept no frames)."""
+        from datetime import datetime
+        from .calibration_report import write_calibration_report
+        frames = list(getattr(self, "_readout_samples", []) or [])
+        if not frames:
+            return {}
+        return write_calibration_report(
+            folder, calibration=self.calibration, readout_frames=frames,
+            template=getattr(self, "_reference_template", None),
+            threshold_method=self.threshold_method,
+            timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
     def _imaging_seq(self, pulse: str | None, exposure: float, name: str):
         """The acquisition sequence for one cali pass: a saved pulse program (a
@@ -740,6 +833,11 @@ class CalibrateReadoutTask(Task):
         out.publish(progress=0.95, stage="fitting per-site thresholds")
         thresholds = calibrate_threshold_from_images(
             samples, sitemap.calibration, method=self.threshold_method, display=False)
+        # Keep the readout frames + averaged reference template so run() can write the
+        # per-site distribution / fidelity report (the rb87-style artifacts).
+        self._readout_samples = list(samples)
+        self._reference_template = (np.mean(np.asarray(template, dtype=float), axis=0)
+                                    if template else None)
         return thresholds.calibration
 
     def _run_from_folder(self, out: "TaskOutput"):
@@ -761,6 +859,9 @@ class CalibrateReadoutTask(Task):
             out.publish(frame=np.asarray(samples[-1], dtype=float), progress=0.85)
         thresholds = calibrate_threshold_from_images(
             samples, sitemap.calibration, method=self.threshold_method, display=False)
+        self._readout_samples = list(samples)
+        self._reference_template = (np.mean(np.asarray(template_frames, dtype=float), axis=0)
+                                    if template_frames else None)
         return thresholds.calibration
 
 
@@ -803,6 +904,16 @@ class CameraMeasurement(Measurement):
         n = max(1, int(self.frames_per_cycle))
         keys = ["frame"] + [f"frame_{i}" for i in range(n)]
         return frozenset(self.prefix + key for key in keys)
+
+    def output_specs(self) -> tuple[SignalSpec, ...]:
+        """Each camera output is a raw 2-D image (the newest ``frame`` + one
+        ``frame_i`` per per-cycle trigger)."""
+        specs = []
+        for name in sorted(self.published_signals()):
+            bare = name[len(self.prefix):] if self.prefix and name.startswith(self.prefix) else name
+            desc = "newest camera frame" if bare == "frame" else f"camera frame {bare.split('_')[-1]} of the cycle"
+            specs.append(SignalSpec(name, "camera image", "counts", desc))
+        return tuple(specs)
 
     def acquisition_parameters(self) -> dict[str, object]:
         """The acquisition layer speaks PLOT coordinates: the spatial parameter is
@@ -908,12 +1019,16 @@ class ScannedMeasurementNode(Measurement):
         self.y_key = str(y_key)
         self.node_label = str(y_key)   # GUI flow legend shows the curve it produces
         self.grid_shape = None if grid_shape is None else grid_shape_tuple(grid_shape)
-        # The measurement owns the swept values (single source of truth); the node
-        # only walks its index and accumulates the (x, y) seen so far.
+        # The measurement owns the swept values (single source of truth); they are the
+        # x AXIS, known UP FRONT.  Mirroring Confocal_GUIv2's BaseMeasurement: the curve
+        # is a PRE-ALLOCATED ``np.full((n_points, n_series), nan)`` array filled IN PLACE
+        # by scan index -- NEVER an append-and-grow list.  So the published curve has its
+        # FINAL length from the first shot (a stable x axis; unmeasured points are NaN
+        # gaps that fill in), exactly like the reference measurement.
         self._values = np.asarray(measurement.axis.values, dtype=float).reshape(-1)
         self._index = 0
-        self._x_done: list[float] = []
-        self._y_done: list[float] = []
+        n_series = max(1, int(getattr(measurement.reducer, "n_series", 1)))
+        self.data_y = np.full((self._values.size, n_series), np.nan, dtype=float)
 
     @property
     def n_points(self) -> int:
@@ -930,11 +1045,12 @@ class ScannedMeasurementNode(Measurement):
         return self._index >= self.n_points
 
     def shot(self) -> dict[str, object]:
-        """Advance ONE scan point and return the cumulative curve so far.
+        """Measure ONE scan point and FILL it into the pre-allocated curve by index.
 
-        Raises ``StopIteration`` if called after the sweep is finished -- the
-        ``start()`` loop never does (the node stops itself), and tests check
-        ``finished`` first.
+        Publishes the FULL-LENGTH x axis + curve every shot (NaN where not yet
+        measured), so the plot shows the final x range from the first point and fills
+        in -- never a growing array.  Raises ``StopIteration`` if called after the sweep
+        is finished (the ``start()`` loop self-stops; tests check ``finished`` first).
         """
 
         if self.finished:
@@ -942,22 +1058,22 @@ class ScannedMeasurementNode(Measurement):
         index = self._index
         value = float(self._values[index])
         row = np.atleast_1d(np.asarray(self.measurement.measure(value, index), dtype=float))
+        self.data_y[index, :row.size] = row          # fill IN PLACE by scan index (no append)
         self._index += 1
-        self._x_done.append(value)
-        self._y_done.append(float(row[0]))
 
         out: dict[str, object] = {
-            self.x_key: np.asarray(self._x_done, dtype=float).copy(),
-            self.y_key: np.asarray(self._y_done, dtype=float).copy(),
+            self.x_key: self._values.copy(),           # the FULL x axis, stable from shot 1
+            self.y_key: self.data_y[:, 0].copy(),      # full-length curve; NaN = not-yet-measured
             "scan_done": 1.0 if self.finished else 0.0,
             "shot": float(self._index),
         }
-        if row.size > 1:
-            # A per-site reducer: publish the latest point's per-site vector (and a
-            # grid map when a shape is known) alongside the scalar curve.
-            out[self.y_key + "_sites"] = row.copy()
-            if self.grid_shape is not None and row.size == int(np.prod(self.grid_shape)):
-                out[self.y_key + "_grid"] = row.reshape(self.grid_shape).copy()
+        if self.data_y.shape[1] > 1:
+            # A per-site reducer: publish the LATEST point's per-site vector (and a grid
+            # map when a shape is known) alongside the scalar curve.
+            latest = self.data_y[index, :]
+            out[self.y_key + "_sites"] = latest.copy()
+            if self.grid_shape is not None and latest.size == int(np.prod(self.grid_shape)):
+                out[self.y_key + "_grid"] = latest.reshape(self.grid_shape).copy()
         return out
 
     def step(self) -> dict[str, object]:
@@ -984,6 +1100,26 @@ class ScannedMeasurementNode(Measurement):
         keys = (self.x_key, self.y_key, self.y_key + "_sites", self.y_key + "_grid",
                 "scan_done", "shot")
         return frozenset(self.prefix + key for key in keys)
+
+    def output_specs(self) -> tuple[SignalSpec, ...]:
+        """x / y axis labels + units come from the swept measurement itself -- the
+        scan AXIS (``axis.label``/``axis.unit``) for x and the REDUCER labels for the
+        curve -- so a plot of this node reads its axes from the measurement, not a
+        hard-coded string."""
+        p = self.prefix
+        axis = self.measurement.axis
+        rlabels = tuple(self.measurement.reducer.labels)          # (xlabel, ylabel, zlabel)
+        ylabel = rlabels[1] if len(rlabels) > 1 else self.y_key
+        xlabel = str(getattr(axis, "label", "x"))
+        xunit = str(getattr(axis, "unit", ""))
+        return (
+            SignalSpec(p + self.x_key, xlabel, xunit, "scan x axis (the swept parameter)"),
+            SignalSpec(p + self.y_key, ylabel, "", "measured curve vs the scan x axis"),
+            SignalSpec(p + self.y_key + "_sites", ylabel, "", "latest scan point, per site"),
+            SignalSpec(p + self.y_key + "_grid", ylabel, "", "latest scan point as a site grid"),
+            SignalSpec(p + "scan_done", "scan complete", "", "1 once the final point is measured"),
+            SignalSpec(p + "shot", "shot", "", "scan-point counter"),
+        )
 
 
 class ProcessorRun(LogicNode):
@@ -1042,6 +1178,7 @@ class ProcessorRun(LogicNode):
 
 __all__ = [
     "describe_shape",
+    "SignalSpec",
     "CalibrateReadoutTask",
     "CameraMeasurement",
     "OccupancyProcessor",

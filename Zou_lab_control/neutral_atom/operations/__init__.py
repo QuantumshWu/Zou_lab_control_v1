@@ -10,7 +10,9 @@ from .logic import (
     Processor,
     LogicNode,
     ScannedMeasurementNode,
+    SignalSpec,
     Task,
+    describe_shape,
 )
 from .fidelity import (
     FidelityReport,
@@ -90,6 +92,8 @@ __all__ = [
     "ScannedMeasurementNode",
     "ScanResult",
     "ShotPlan",
+    "SignalSpec",
+    "describe_shape",
     "SiteFidelity",
     "SurvivalReducer",
     "TemperatureFit",

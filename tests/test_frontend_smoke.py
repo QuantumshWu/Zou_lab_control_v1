@@ -1466,12 +1466,16 @@ def test_task_console_signal_picker_and_declarative_params(monkeypatch):
     card = next(c for c in console.cards if c.config.kind == "2d")
     card._refresh_signal_combo()
     names = [card.signal_combo.itemText(i) for i in range(card.signal_combo.count())]
+    datas = [card.signal_combo.itemData(i) for i in range(card.signal_combo.count())]
     assert names[0] == "(expression)"
-    assert "rate_grid" in names and "frame" in names
-    assert card.signal_combo.currentText() == "frame"      # mirrors `value = frame`
+    # items are LABELLED "<name> — <source node>  [<shape>]"; the bare signal name is the
+    # item DATA (what `value = <name>` is written from), so check the data list.
+    assert "rate_grid" in datas and "frame" in datas
+    assert card.signal_combo.currentData() == "frame"      # mirrors `value = frame`
 
-    card.signal_combo.setCurrentText("rate_grid")
-    card._on_signal_pick(names.index("rate_grid"))
+    idx = datas.index("rate_grid")
+    card.signal_combo.setCurrentIndex(idx)
+    card._on_signal_pick(idx)
     assert card.config.source == "value = rate_grid"
     console.refresh_once()
     assert card.status.text().startswith("shot ")           # applied instantly + healthy

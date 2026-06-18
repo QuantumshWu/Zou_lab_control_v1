@@ -178,10 +178,10 @@ PANEL_PARAMS: dict[str, tuple[ParamSpec, ...]] = {
         # ``centers`` and the camera ``image``) -- each its own slot.
         ParamSpec("cmap", "colormap", "choice", "gray", choices=CMAPS,
                   tooltip="Colormap for the camera-frame underlay", display=True),
-        ParamSpec("centers", "centers", "signal", "centers",
-                  tooltip="Signal holding the (N, 2) site centers in camera px"),
-        ParamSpec("image", "image", "signal", "frame",
-                  tooltip="Signal for the camera-frame underlay (blank for none)"),
+        ParamSpec("centers", "centers", "signal", "centers", display=True,
+                  tooltip="Signal holding the (N, 2) site centers in camera px (the 2nd input)"),
+        ParamSpec("image", "image", "signal", "frame", display=True,
+                  tooltip="Signal for the camera-frame underlay (blank = no underlay)"),
     ),
     # The colormap / colorset chooser is the only per-kind knob that stays in the
     # Setting popup (display=True); the FUNCTIONAL params below (length / bins /
@@ -531,7 +531,7 @@ class PanelCard(FluentGroupBox):
     edit_requested = QtCore.pyqtSignal(object)   # "Edit…" -> open the panel's Edit tab
 
     def __init__(self, config: PanelConfig, parent=None, *, names_provider=None,
-                 sources_provider=None, formats_provider=None):
+                 sources_provider=None, formats_provider=None, axes_provider=None):
         # Titled frame: the title strip carries the panel KIND (top-left) and the
         # Setting button (top-right), so the card is delineated like the rest.
         super().__init__(PANEL_KINDS[config.kind], parent, shadow=True)
@@ -543,6 +543,11 @@ class PanelCard(FluentGroupBox):
         # callable -> {signal name: array-format}, so the picker also shows each
         # signal's SHAPE (e.g. occupied -> per-site (N,)).
         self.formats_provider = formats_provider
+        # callable -> {signal name: (axis_label, unit)} from the PRODUCING node's
+        # SignalSpec, so a plot reads its y-axis label/unit from the measurement that
+        # makes the signal (confocal: the measurement owns its labels), not a per-kind
+        # hard-coded string.
+        self.axes_provider = axes_provider
         self.plotter = None
         self.canvas = None
         self._value_shape: tuple[int, ...] | None = None
@@ -831,7 +836,28 @@ class PanelCard(FluentGroupBox):
             spin.setToolTip(spec.tooltip)
             spin.valueChanged.connect(lambda v, k=spec.key: cb(k, int(v)))
             return spin
-        # "signal": a free-form signal name (blank allowed where documented)
+        if spec.kind == "signal":
+            # A SIGNAL slot (the site map's centers / image inputs): a combobox of the
+            # live hub signals, labelled like the main picker (``name — source [shape]``)
+            # so it is chosen the SAME way -- not hand-typed.  The current value is kept
+            # selectable even when its source node is not running yet (so a saved layout's
+            # ``centers`` survives), and a blank "(none)" turns the slot off.
+            combo = FluentComboBox()
+            combo.setMinimumWidth(scaled_px(150, minimum=120))
+            combo.setToolTip(spec.tooltip)
+            cur = str(current or "")
+            combo.addItem("(none)", "")
+            items = self._signal_combo_items()
+            have = {bare for _, bare in items}
+            for display, bare in items:
+                combo.addItem(display, bare)
+            if cur and cur not in have:             # preserve a not-yet-published name
+                combo.addItem(f"{cur}  (not yet published)", cur)
+            idx = combo.findData(cur)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            combo.activated.connect(lambda _i, k=spec.key, c=combo: cb(k, str(c.currentData() or "")))
+            return combo
+        # "text": a free-form value (blank allowed where documented)
         edit = FluentLineEdit(str(current))
         edit.setMinimumWidth(scaled_px(96, minimum=80))   # expands in its row; long signal names not cut off
         edit.setToolTip(spec.tooltip)
@@ -858,12 +884,12 @@ class PanelCard(FluentGroupBox):
         popup.show()
         popup.raise_()
 
-    def _refresh_signal_combo(self) -> None:
-        """Fill the signal picker with the hub's CURRENT signals, each labelled with
-        the measurement/processor that PRODUCES it (``occupied — occupancy``) so you
-        pick by origin, not a bare name.  The item TEXT carries the source label; the
-        item DATA is the plain signal name written into ``value = <name>``."""
-        names = []
+    def _signal_combo_items(self) -> list[tuple[str, str]]:
+        """``[(display, bare_name)]`` for every LIVE hub signal, each labelled
+        ``name — source  [shape]`` -- the SINGLE source the main signal picker AND
+        every ``kind="signal"`` param combo (the site map's centers/image slots) share,
+        so a signal is picked the same way everywhere (by origin + shape, not typed)."""
+        names: list[str] = []
         if callable(self.names_provider):
             try:
                 names = sorted(str(n) for n in self.names_provider())
@@ -881,18 +907,28 @@ class PanelCard(FluentGroupBox):
                 formats = dict(self.formats_provider())
             except Exception:
                 formats = {}
+        items: list[tuple[str, str]] = []
+        for name in names:
+            producers = sources.get(name) or []
+            fmt = formats.get(name)
+            label = name
+            if producers:
+                label += f" — {', '.join(str(p) for p in producers)}"
+            if fmt:
+                label += f"  [{fmt}]"                 # show the signal's SHAPE too
+            items.append((label, name))
+        return items
+
+    def _refresh_signal_combo(self) -> None:
+        """Fill the signal picker with the hub's CURRENT signals, each labelled with
+        the measurement/processor that PRODUCES it (``occupied — occupancy``) so you
+        pick by origin, not a bare name.  The item TEXT carries the source label; the
+        item DATA is the plain signal name written into ``value = <name>``."""
         combo = self.signal_combo
         with _signals_blocked(combo):
             combo.clear()
             combo.addItem("(expression)", "")
-            for name in names:
-                producers = sources.get(name) or []
-                fmt = formats.get(name)
-                label = name
-                if producers:
-                    label += f" — {', '.join(str(p) for p in producers)}"
-                if fmt:
-                    label += f"  [{fmt}]"             # show the signal's SHAPE too
+            for label, name in self._signal_combo_items():
                 combo.addItem(label, name)         # text shows source + shape; data is the bare name
             # reflect a plain `value = <signal>` source in the picker
             source = (self.config.source or "").strip()
@@ -1295,6 +1331,24 @@ class PanelCard(FluentGroupBox):
         if self.canvas is not None:
             self.canvas.draw_idle()
 
+    def _source_axis_label(self) -> str | None:
+        """The y-axis label for this panel's sourced signal, taken from the PRODUCING
+        node's :class:`SignalSpec` (``axes_provider``) -- so a plot of ``rate`` is
+        labelled "loading rate" by the measurement that makes it, not a per-kind string.
+        ``None`` when the source is a free expression or its source node declares no axis."""
+        source = (self.config.source or "").strip()
+        if not source.startswith("value ="):
+            return None
+        name = source[len("value ="):].strip()
+        if not name or not callable(self.axes_provider):
+            return None
+        try:
+            axes = dict(self.axes_provider())
+        except Exception:
+            return None
+        entry = axes.get(name)
+        return entry[0] if entry else None
+
     # ------------------------------------------------------------- plot lifecycle
     def _build_plot(self, value, namespace: Mapping[str, object] | None = None) -> None:
         if panel_canvas is None:
@@ -1349,7 +1403,7 @@ class PanelCard(FluentGroupBox):
             history = np.full(length, np.nan)
             self.plotter = panel_plot(
                 np.arange(length, dtype=float), history, kind=kind, size=size, interactions=False,
-                labels=("Shots ago", label, "Z"),
+                labels=("Shots ago", self._source_axis_label() or label, "Z"),
                 relim_mode=str(self.config.params.get("relim", "tight")),
                 title=self.config.title or None)
             self.plotter.roll(float(value), draw=False)
@@ -1370,7 +1424,7 @@ class PanelCard(FluentGroupBox):
             else:
                 vec = arr.reshape(-1)
                 data_x = np.arange(len(vec), dtype=float)
-                xlabel, ylabel = "Site", label
+                xlabel, ylabel = "Site", self._source_axis_label() or label
             self.plotter = panel_plot(
                 data_x, vec, kind="1d", size=size, interactions=False,
                 labels=(xlabel, ylabel, "Z"),
@@ -2359,10 +2413,14 @@ class LogicNodeRow(FluentFrame):
         for b in (self.start_button, self.stop_button, edit_button, remove):
             top.addWidget(b, 0)
         outer.addLayout(top)
-        # --- second line: published signals + their array shapes --------------------
+        # --- published-signals legend: one signal per line (name | shape | meaning) ---
+        # Monospace so the name/shape columns ALIGN down the rows (a readable table, not a
+        # run-on line).
         self.publishes_label = FluentLabel("")
-        self.publishes_label.setWordWrap(True)
-        self.publishes_label.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+        self.publishes_label.setWordWrap(False)
+        self.publishes_label.setStyleSheet(
+            f"color: {GREY}; background: transparent; border: none; "
+            "font-family: Consolas, 'DejaVu Sans Mono', monospace;")
         outer.addWidget(self.publishes_label)
 
     def set_state(self, state: str, *, status: str = "") -> None:
@@ -2375,15 +2433,28 @@ class LogicNodeRow(FluentFrame):
         self.start_button.setEnabled(not running)
         self.stop_button.setEnabled(running)
 
-    def set_publishes(self, formats: dict) -> None:
-        """Show the node's published signals + array shape, e.g. ``publishes: occupied
-        [(35,)], rate [scalar]`` -- filled by the console from the AUTO-EXTRACTED shapes
-        of the node's real published values (``logic.describe_shape``).  A pending shape
-        (``—``, no value yet) shows the bare name, so a STOPPED node still advertises
-        what it will produce without faking a shape it hasn't emitted."""
-        if formats:
-            body = ", ".join((n if f in ("", "—") else f"{n} [{f}]") for n, f in formats.items())
-            text = "publishes: " + body
+    def set_publishes(self, rows) -> None:
+        """Show the node's outputs as a readable TABLE -- ONE signal per line, the
+        ``name`` / ``shape`` columns aligned, then the human meaning::
+
+            publishes:
+              occupied    (35,)     per-site single-shot occupancy (0 / 1)
+              rate        scalar    running-mean loading rate over all sites
+
+        ``rows`` is ``[(name, shape, description)]`` from the console (shapes
+        AUTO-EXTRACTED from the real values via ``logic.describe_shape``; meanings from
+        the node's ``output_specs``).  A pending shape (``—``) just means no value yet."""
+        rows = list(rows)
+        if rows:
+            name_w = max(len(str(n)) for n, _, _ in rows)
+            shape_w = max(len(str(s)) for _, s, _ in rows)
+            lines = ["publishes:"]
+            for name, shape, description in rows:
+                line = f"  {str(name):<{name_w}}  {str(shape):<{shape_w}}"
+                if description:
+                    line += f"  {description}"
+                lines.append(line.rstrip())
+            text = "\n".join(lines)
         else:
             text = "publishes: (nothing on the hub)"
         if text != self.publishes_label.text():       # skip churn: shapes refresh each tick
@@ -2710,7 +2781,7 @@ class TaskConsole(QtWidgets.QWidget):
             for config in state.panels:
                 self._attach_card(PanelCard(config, parent=self.board,
                                             names_provider=self.hub.names,
-                                            sources_provider=self._signal_providers, formats_provider=self._signal_formats))
+                                            sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes))
             for node in state.logic:
                 self._attach_logic_node(node)    # always STOPPED -- Start is manual
             self._arrange()
@@ -2841,38 +2912,62 @@ class TaskConsole(QtWidgets.QWidget):
                 continue
         return out
 
-    def _live_node_formats(self, node) -> dict:
-        """``{published name: shape}`` for a RUNNING node, every shape read off a real
-        value via ``logic.describe_shape`` (auto, never hand-typed).  A measurement /
-        processor publishes to the hub under its prefix; a TASK is OFF the hub, so it
-        documents what it streams mid-run (its ``output`` buffer) + what it produces
-        (its ``result`` keys), shapes filled in as the values appear."""
+    def _signal_axes(self) -> dict:
+        """``{signal name: (axis_label, unit)}`` from each RUNNING node's
+        ``output_specs`` -- so a plot reads its y-axis label/unit from the producing
+        measurement (the SignalSpec it declares), not a hard-coded per-kind string."""
+        out: dict[str, tuple[str, str]] = {}
+        for node in self.running_nodes:
+            if not hasattr(node, "output_specs"):
+                continue
+            try:
+                for spec in node.output_specs():
+                    out[str(spec.name)] = (spec.axis_label, spec.unit)
+            except Exception:
+                continue
+        return out
+
+    def _live_node_formats(self, node) -> list[tuple[str, str, str]]:
+        """``[(name, shape, description)]`` for a RUNNING node -- one ROW per output, each
+        shape read off a real value via ``logic.describe_shape`` (auto, never hand-typed)
+        and each description from the node's ``output_specs`` (what the signal MEANS).  A
+        measurement / processor publishes to the hub under its prefix; a TASK is OFF the
+        hub, so it documents what it streams mid-run (its ``output`` buffer) + what it
+        produces (its ``result`` keys), shapes filled in as the values appear."""
         from Zou_lab_control.neutral_atom.operations.logic import describe_shape
-        out: dict[str, str] = {}
+        specs = {s.name: s for s in node.output_specs()} if hasattr(node, "output_specs") else {}
+
+        def desc(name: str) -> str:
+            spec = specs.get(name)
+            return spec.description if spec is not None else ""
+
+        rows: list[tuple[str, str, str]] = []
         if getattr(node, "layer", "") == "task":
             buf = getattr(node, "output", None)
             for key in getattr(node, "mid_run", ()):
                 if key in ("progress", "stage"):          # progress %/text live on the banner
                     continue
-                out[f"{key} (mid-run)"] = describe_shape(buf.latest(key) if buf else None)
+                rows.append((f"{key} (mid-run)", describe_shape(buf.latest(key) if buf else None), desc(key)))
             result = getattr(node, "result", None) or {}
             for key in getattr(node, "provides", ()):
                 value = result.get(key) if isinstance(result, dict) else None
-                out[f"{key} (result)"] = describe_shape(value)
-            return out
+                rows.append((f"{key} (result)", describe_shape(value), desc(key)))
+            return rows
         for full in sorted(node.published_signals()):     # already hub names (incl. prefix)
             try:
-                out[str(full)] = describe_shape(self.hub.latest(full))
+                shape = describe_shape(self.hub.latest(full))
             except Exception:
-                out[str(full)] = "—"
-        return out
+                shape = "—"
+            rows.append((str(full), shape, desc(str(full))))
+        return rows
 
     def _update_row_publishes(self, row: "LogicNodeRow") -> None:
-        """Fill a Logic-tab row's "publishes:" line with its output signals + shapes,
-        AUTO-EXTRACTED from the real published VALUES (``logic.describe_shape``) -- never
-        a hand-typed map.  Running node: live shapes off the hub (measurement/processor)
-        or its mid-run buffer + result (task).  Stopped node: just the NAMES it will
-        produce (shape unknown until it runs, shown as ``—``)."""
+        """Fill a Logic-tab row's "publishes:" legend (ONE signal per line: name, shape,
+        meaning).  Shapes are AUTO-EXTRACTED from the real published VALUES
+        (``logic.describe_shape``) and the meaning from the node's ``output_specs`` --
+        never a hand-typed map.  Running node: live shapes off the hub (measurement /
+        processor) or its mid-run buffer + result (task).  Stopped node: the NAMES it
+        will produce (shape ``—`` until it runs)."""
         node = self._logic_nodes.get(id(row))
         if node is not None and getattr(node, "running", False):
             row.set_publishes(self._live_node_formats(node))
@@ -2883,7 +2978,7 @@ class TaskConsole(QtWidgets.QWidget):
             keys = ["frame"]
         if not keys and row.node.kind == "task":          # off-hub one-shot, mid-run stream
             keys = [f"{getattr(spec, 'mid_run_key', 'frame')} (mid-run)"]
-        row.set_publishes({k: "—" for k in keys})
+        row.set_publishes([(k, "—", "") for k in keys])
 
     def _node_for_signal(self, name: str):
         """The first running node that PUBLISHES signal ``name`` (None if none does)."""
@@ -3035,7 +3130,7 @@ class TaskConsole(QtWidgets.QWidget):
         rows = max((c.config.row + c.config.rows for c in self.cards), default=0)
         config = PanelConfig(kind=str(kind), row=rows, col=0, size="1x2")
         card = PanelCard(config, parent=self.board, names_provider=self.hub.names,
-                         sources_provider=self._signal_providers, formats_provider=self._signal_formats)
+                         sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes)
         self._attach_card(card)
         self._arrange()
         self._mark_dirty()
@@ -3172,7 +3267,7 @@ class TaskConsole(QtWidgets.QWidget):
         config = PanelConfig(kind=kind, title=title, size="2x2",
                              source="value = __task_frame__")
         card = PanelCard(config, parent=self.board, names_provider=self.hub.names,
-                         sources_provider=self._signal_providers, formats_provider=self._signal_formats)
+                         sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes)
         self._attach_card(card)
         self._task_card = card
         self._running_task_row = row

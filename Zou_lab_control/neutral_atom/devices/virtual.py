@@ -71,6 +71,13 @@ class VirtualTrapArray(TrapArrayDevice):
     # the virtual pulse's cooling duration genuinely changes the camera image.
     loading_probability: float = 0.5      # MAX single-atom loading per tweezer (collisional ceiling)
     load_time_constant_s: float = 0.5e-3  # cooling time to reach 1-1/e of the loading ceiling
+    # A real experiment cycle is dominated by the MOT/PGC LOAD (hundreds of ms), not the
+    # ~ms readout: the default live-monitor cycle uses this as its cooling/MOT-load
+    # duration so one virtual shot REPRESENTS a realistic ~mot_load_s cycle (with
+    # ``sleep_scale>0`` it also TAKES that long on the wall clock).  A short cooling pulse
+    # still loads fewer atoms (loading_fraction), but a full MOT load saturates the
+    # ~loading_probability ceiling.
+    mot_load_s: float = 0.30
     atom_rate: float = 3_000.0            # bright-atom photon (count) rate during the probe
     background_rate: float = 8.0          # stray-light count rate (always present)
     dark_current_e_per_s: float = 0.006
@@ -81,7 +88,10 @@ class VirtualTrapArray(TrapArrayDevice):
     # Atom 1/e lifetime UNDER the probe (s): a longer readout exposure scatters MORE
     # photons (higher SNR) but also loses MORE atoms mid-readout, so the readout
     # duration sets the real SNR-vs-survival trade-off a detection-time scan measures.
-    detection_lifetime: float = 0.2
+    # ~2 s is a realistic trap-imaging lifetime: a 20 ms readout loses ~1% (a clean
+    # bimodal readout, fidelity ~99%), while a detection-time scan out to ~100 ms still
+    # shows a visible survival roll-off -- the real SNR-vs-loss trade-off.
+    detection_lifetime: float = 2.0
     # --- Cooling / heating model (sets the temperature release-recapture sees) -
     # An atom is loaded warm (``mot_temperature_K``) and PGC-cooled toward
     # ``cooled_temperature_K``; the probe (imaging light) heats it at
@@ -130,6 +140,7 @@ class VirtualTrapArray(TrapArrayDevice):
         self.read_noise_e = nonnegative_float(self.read_noise_e, "read_noise_e")
         self.atom_sigma_px = positive_float(self.atom_sigma_px, "atom_sigma_px")
         self.load_time_constant_s = positive_float(self.load_time_constant_s, "load_time_constant_s")
+        self.mot_load_s = positive_float(self.mot_load_s, "mot_load_s")
         self.detection_lifetime = positive_float(self.detection_lifetime, "detection_lifetime")
         self.mot_temperature_K = positive_float(self.mot_temperature_K, "mot_temperature_K")
         self.cooled_temperature_K = positive_float(self.cooled_temperature_K, "cooled_temperature_K")
@@ -384,7 +395,8 @@ class VirtualCamera(CameraDevice):
         # run the SAME load->image physics (a fresh ~50% loading imaged once).
         effective_sequence = (
             sequence if sequence is not None
-            else imaging_sequence(exposure=self.exposure, load=True, name="live", **channel_kwargs)
+            else imaging_sequence(exposure=self.exposure, load=True, name="live",
+                                  cooling=self.trap_array.mot_load_s, **channel_kwargs)
         )
         # Expand to the requested frame count (one trigger -> N repeats) so the per-frame
         # analysis below sees ONE trigger window per frame -- the exact runtime sequence

@@ -179,7 +179,14 @@ def otsu_threshold(values, *, bins: int = 96) -> float:
     score = np.full_like(centers, -np.inf, dtype=float)
     valid = denom > 0
     score[valid] = (mu[-1] * omega[valid] - mu[valid]) ** 2 / denom[valid]
-    return float(centers[int(np.argmax(score))])
+    # A well-separated bimodal has an EMPTY gap between the peaks: across the gap no
+    # probability mass moves, so the Otsu score is FLAT (a plateau).  ``argmax`` would
+    # return the LEFTMOST plateau bin -- the threshold then sits at the top of the dark
+    # peak, where a dark tail misclassifies.  Return the CENTRE of the optimal plateau
+    # instead (the middle of the gap), the robust split a balanced threshold wants.
+    best = float(np.max(score[valid]))
+    plateau = np.flatnonzero(valid & (score >= best - 1e-9 * (abs(best) + 1.0)))
+    return float(np.mean(centers[plateau]))
 
 
 def estimate_threshold_fidelity(values, threshold: float) -> FidelityEstimate:
