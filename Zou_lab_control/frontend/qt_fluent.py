@@ -1255,7 +1255,12 @@ class FluentTabWidget(QtWidgets.QTabWidget):
         super().__init__(parent)
         self.setTabPosition(QtWidgets.QTabWidget.North)
         self.tabBar().setExpanding(False)
-        self.setUsesScrollButtons(True)
+        # No left/right scroll ARROWS (the native chevrons crowd the last tab's close
+        # "x" and read as browser chrome, not Fluent).  When the tabs overflow the bar,
+        # ONE Fluent overflow button (a corner ``...``) lists every tab and jumps to the
+        # picked one -- the on-brand overflow affordance, see _build_overflow_button.
+        self.setUsesScrollButtons(False)
+        self.tabBar().setElideMode(QtCore.Qt.ElideNone)
         # No NATIVE close buttons.  A plain ``addTab()`` tab is PERMANENT (no X),
         # so GUIs that use ``addTab`` directly (e.g. the pulse editor's
         # Edit / Preview / Scan, which must always exist) never get a close
@@ -1326,6 +1331,93 @@ class FluentTabWidget(QtWidgets.QTabWidget):
         )
         add_fluent_shadow(self, blur=10, alpha=50, offset=2,
                           silhouette=_tab_widget_silhouette)
+        self._overflow_btn = self._build_overflow_button()
+        self.setCornerWidget(self._overflow_btn, QtCore.Qt.TopRightCorner)
+        self._overflow_btn.hide()
+        self.currentChanged.connect(lambda _i: self._update_overflow())
+
+    def _build_overflow_button(self) -> QtWidgets.QToolButton:
+        """The Fluent overflow affordance: a subtle ``...`` button (top-right corner) that
+        replaces the native scroll arrows.  Shown only when the tabs overflow the bar;
+        clicking it lists EVERY tab and jumps to the picked one (scrolling it into view)."""
+        btn = QtWidgets.QToolButton(self)
+        btn.setText("⋯")                          # MIDLINE HORIZONTAL ELLIPSIS
+        btn.setCursor(QtCore.Qt.PointingHandCursor)
+        btn.setFocusPolicy(QtCore.Qt.NoFocus)
+        btn.setToolTip("All tabs")
+        btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
+        size = scaled_px(26, minimum=20)
+        btn.setFixedSize(size, size)
+        font = btn.font()
+        font.setPixelSize(max(11, int(size * 0.72)))
+        font.setBold(True)
+        btn.setFont(font)
+        radius = _radius()
+        btn.setStyleSheet(
+            f"""
+            QToolButton {{ border: none; background: transparent; color: {GREY};
+                           border-radius: {radius}px; padding: 0px; }}
+            QToolButton:hover {{ background: rgba(0, 0, 0, 18); color: {TEXT}; }}
+            QToolButton:pressed {{ background: rgba(0, 0, 0, 34); color: {TEXT}; }}
+            QToolButton::menu-indicator {{ image: none; width: 0px; }}
+            """
+        )
+        btn.clicked.connect(self._show_overflow_menu)
+        return btn
+
+    def _tabs_overflow(self) -> bool:
+        bar = self.tabBar()
+        return bar.count() > 0 and bar.sizeHint().width() > bar.width() + 1
+
+    def _update_overflow(self) -> None:
+        """Show the overflow ``...`` button only while the tabs do not all fit.  Run on a
+        0-ms timer after a resize / tab change so the tab bar has been re-laid-out first
+        (its width is stale inside the resize/insert event itself)."""
+        btn = getattr(self, "_overflow_btn", None)
+        if btn is not None:
+            btn.setVisible(self._tabs_overflow())
+
+    def _schedule_overflow_update(self) -> None:
+        QtCore.QTimer.singleShot(0, self._update_overflow)
+
+    def _show_overflow_menu(self) -> None:
+        """Pop a Fluent list of EVERY tab; picking one selects it (Qt scrolls it into
+        view) -- the single overflow navigation, in place of left/right scroll arrows."""
+        menu = QtWidgets.QMenu(self)
+        menu.setStyleSheet(
+            f"""
+            QMenu {{ background: white; border: 1px solid {PLACEHOLDER};
+                     border-radius: {_radius()}px; padding: {scaled_px(4, minimum=3)}px;
+                     font: {fluent_font_size()}pt "{FONT}"; color: {TEXT}; }}
+            QMenu::item {{ padding: {scaled_px(5, minimum=4)}px {scaled_px(14, minimum=10)}px;
+                          border-radius: {_radius()}px; }}
+            QMenu::item:selected {{ background: {ACCENT}; color: white; }}
+            """
+        )
+        current = self.currentIndex()
+        for i in range(self.count()):
+            act = menu.addAction(self.tabText(i))
+            act.setCheckable(True)
+            act.setChecked(i == current)
+            act.triggered.connect(lambda _c, idx=i: self.setCurrentIndex(idx))
+        btn = self._overflow_btn
+        menu.exec_(btn.mapToGlobal(QtCore.QPoint(0, btn.height())))
+
+    def resizeEvent(self, event):  # noqa: N802 - Qt naming
+        super().resizeEvent(event)
+        self._schedule_overflow_update()
+
+    def showEvent(self, event):  # noqa: N802 - Qt naming
+        super().showEvent(event)
+        self._schedule_overflow_update()
+
+    def tabInserted(self, index):  # noqa: N802 - Qt naming
+        super().tabInserted(index)
+        self._schedule_overflow_update()
+
+    def tabRemoved(self, index):  # noqa: N802 - Qt naming
+        super().tabRemoved(index)
+        self._schedule_overflow_update()
 
     def add_permanent_tab(self, widget: QtWidgets.QWidget, title: str) -> int:
         """Add a fixture tab with NO close button (e.g. Monitor).  A plain

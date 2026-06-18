@@ -80,3 +80,39 @@ def test_pivot_tabs_have_no_box_fill_and_selected_underline():
     tab_block = re.search(r"QTabBar::tab \{\{?(.*?)\}\}?", qss, re.S)
     assert tab_block is not None
     assert "background: transparent" in tab_block.group(1)
+
+
+@pytest.mark.skipif(QtWidgets is None, reason="PyQt5 not available")
+def test_tab_overflow_uses_a_menu_button_not_scroll_arrows():
+    """The tab bar has NO native scroll arrows; when the tabs overflow, ONE corner
+    overflow button (...) appears and lists EVERY tab, jumping to the picked one.  Few
+    tabs -> the button is hidden (no clutter).  Regression for the disliked left/right
+    scroll chevrons that also crowded the last tab's close 'x'."""
+    app = qf.ensure_qt_app()
+    w = qf.FluentTabWidget()
+    # the native QTabBar scroll arrows must be OFF (they are what crowded the close x).
+    assert w.usesScrollButtons() is False
+
+    w.add_permanent_tab(QtWidgets.QLabel("m"), "Monitor")
+    w.add_closable_tab(QtWidgets.QLabel("a"), "Camera (live frames)", focus=False)
+    w.resize(1400, 320); w.show(); _settle(app)
+    # two short-ish tabs in a wide bar do NOT overflow -> no overflow button.
+    assert w._tabs_overflow() is False
+    assert w._overflow_btn.isVisible() is False
+
+    for name in ("Readout fidelity", "Temperature", "Judge occupancy",
+                 "Calibrate readout", "Loading rate", "Per-site histogram"):
+        w.add_closable_tab(QtWidgets.QLabel(name), name, focus=False)
+    w.resize(560, 320); _settle(app)
+    # many tabs in a narrow bar overflow -> the overflow button shows.
+    assert w._tabs_overflow() is True
+    assert w._overflow_btn.isVisible() is True
+
+    # the overflow menu lists EVERY tab and selecting one makes it current.
+    menu = QtWidgets.QMenu(w)
+    titles = [w.tabText(i) for i in range(w.count())]
+    assert "Per-site histogram" in titles and len(titles) == w.count()
+    last = w.count() - 1
+    w.setCurrentIndex(last)
+    assert w.currentIndex() == last
+    w.deleteLater()
