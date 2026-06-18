@@ -1269,7 +1269,12 @@ class _FluentTabBar(QtWidgets.QTabBar):
         n = len(widths)
         if n == 0 or avail <= 0 or sum(widths) <= avail:
             return None
-        floor = scaled_px(76, minimum=60)            # never below an elided label + the close x
+        # The cap floor is JUST the close-x slot + a sliver of label, NOT a readable-label
+        # width: a larger floor would make n*floor exceed a narrow bar, so the rightmost tab
+        # (and its close x) would spill past the edge -- the "x cut off" bug.  Floored only
+        # this low, the tabs always sum to <= the bar (the cap falls to avail/n first), so a
+        # close x is never clipped; the heavily-elided labels stay reachable via the ... menu.
+        floor = scaled_px(34, minimum=28)
         prefix = 0
         for k in range(n):
             cap = (avail - prefix) / (n - k)         # share the remainder among the wide tabs

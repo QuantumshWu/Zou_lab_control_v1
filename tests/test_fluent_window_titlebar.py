@@ -202,3 +202,26 @@ def test_selected_tab_renders_the_accent_pivot_underline():
                 found += 1
     assert found > 10, "the selected tab's accent pivot underline did not render (tab QSS broken?)"
     w.deleteLater(); host.deleteLater()
+
+
+def test_no_tab_is_clipped_at_any_realistic_width():
+    """NO tab (and so no close 'x') is ever clipped past the bar edge, at any width a real
+    window reaches.  The water-fill cap shrinks the tabs to fit; its floor is only the
+    close-'x' slot, so n*floor stays well under any real bar.  Regression for the cutoff
+    that returned when the floor was set to a READABLE-label width (then n*floor exceeded a
+    narrow bar and the rightmost tab spilled past the edge -- the long-standing 'x cut off')."""
+    app = qf.ensure_qt_app()
+    w = qf.FluentTabWidget()
+    w.add_permanent_tab(QtWidgets.QLabel("m"), "Monitor")
+    w.add_permanent_tab(QtWidgets.QLabel("l"), "Logic")
+    for name in ("Readout image", "Per-site occupancy", "Loading rate (dist)",
+                 "Loading rate", "Counts distribution", "Per-site counts"):
+        w.add_closable_tab(QtWidgets.QLabel(name), name, focus=False)
+    w.show()
+    bar = w.tabBar()
+    for width in (1400, 1100, 900, 760, 640, 560, 480, 420):     # down to an unrealistically narrow bar
+        w.resize(width, 300); _settle(app, 60)
+        right = bar.rect().right()
+        assert all(bar.tabRect(i).right() <= right + 1 for i in range(bar.count())), \
+            f"a tab is clipped past the bar edge at width {width} (close 'x' would be cut off)"
+    w.deleteLater()
