@@ -493,7 +493,7 @@ release-recapture（弹道重捕）测温是通用 Measurement 框架里第一�
 \pyapi{SurvivalReducer} 用 \pyapi{calibration.detect} 出两帧占据 \pyapi{occ1}/\pyapi{occ2}，"存活"=两帧都占据；标量形式回\tfocus{初始占据站点中的存活比例} $(\text{occ1 \& occ2}).\text{sum}/\max(\text{occ1.sum},1)$，\pyapi{per\_site=True} 回逐站存活向量（占据处 1/0，未占据处 nan）。
 
 \section{GUI 路径(一键)}
-\pyapi{Add Panel} → 选 \pyapi{Measurement: Temperature (release-recapture)} → \pyapi{Add Panel}（在 Logic tab 建一个停着的扫描节点行并打开它自己的 Edit 标签）→ 在该节点 Edit 的表单填 \tfocus{Trap-off time}（min/max/points，us）、\tfocus{Shots/point}、\tfocus{Capture radius}（um，必填带 \pyapi{*}）、\tfocus{Per-site survival}（可选）→ \pyapi{Start}。节点只 publish 到 hub；你在 Monitor 加一张 1D Plot 面板把 Source 指 \pyapi{value = <y\_key>} vs \pyapi{<x\_key>}，就看到 survival-vs-t\_off 曲线逐点长出（x 轴是真实 t\_off 秒）。要拟合 \pyapi{T ≈ … µK}，在那张 plot 面板 Edit 的 Fit 段跑。spec 内置默认 RR 序列（用当前 sequencer 的 channels 建），无需手动绑脉冲。
+\pyapi{Add Panel} → 选 \pyapi{Measurement: Temperature} → \pyapi{Add Panel}（在 Logic tab 建一个停着的扫描节点行并打开它自己的 Edit 标签）→ 在该节点 Edit 的表单填 \tfocus{Trap-off time}（min/max/points，us）、\tfocus{Shots/point}、\tfocus{Capture radius}（um，必填带 \pyapi{*}）、\tfocus{Per-site survival}（可选）→ \pyapi{Start}。节点按测量 slug 把信号发到 hub（\pyapi{temperature\_t\_off} / \pyapi{temperature\_survival}）；你在 Monitor 加一张 1D Plot 面板，Setting 里 signal 选 \pyapi{temperature\_survival}（Source 即 \pyapi{value = signal}），就看到 survival-vs-t\_off 曲线逐点长出——x 轴标签/单位（Trap-off time (s)）与 x 值由\textbf{同一个产出节点}自动解析，只需选一个信号。要拟合 \pyapi{T ≈ … µK}，在那张 plot 面板 Edit 的 Fit 段跑。spec 内置默认 RR 序列（用当前 sequencer 的 channels 建），无需手动绑脉冲。
 
 \section{API 路径(同源)}
 \begin{codeblock}[Python]

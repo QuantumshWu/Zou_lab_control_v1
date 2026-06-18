@@ -1163,8 +1163,9 @@ console = zf.show_task_console(hub=hub, session=exp,
 from Zou_lab_control.neutral_atom.operations.logic import ScannedMeasurementNode
 spec = next(s for s in exp.readout.measurement_specs() if "Temperature" in s.name)
 meas = spec.build(t_off=(0.0, 300.0, 13), shots=16, capture_radius=6.0)   # us
-node = ScannedMeasurementNode(hub, meas, x_key=spec.x_key, y_key=spec.y_key)
-node.run_to_completion()   # 或 node.start(rate_hz=...) 后台跑；Monitor 1D 面板 source = value = rr_survival
+# 节点按测量的 slug(spec.key)发布信号：temperature_t_off / temperature_survival。
+node = ScannedMeasurementNode(hub, meas, x_key=spec.x_key, y_key=spec.y_key, prefix=f"{spec.key}_")
+node.run_to_completion()   # 或 node.start(rate_hz=...) 后台跑；1D 面板 source = value = signal,picker 选 temperature_survival
 \end{codeblock}
 notebook 里一行起同一测量：\pyapi{exp.readout.temperature(...)}（见主手册）。\tfocus{两条路调同一个建器，不会漂移}。
 
