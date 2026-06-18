@@ -211,6 +211,17 @@ cal = na.TrapCalibration.load("calib.json")
 cal.detect(image)                          # 直接用标定检测一张图
 \end{codeblock}
 
+\section{逐站点读出保真度：参考 bracket 标定}
+上面的 \pyapi{thresholds} 用单批分布的 Otsu 给每个格点定一个阈值，够日常占据判定。要\tfocus{量化读出保真度}并在多种读出模型间挑最好的，用参考 bracket 标定（\pyapi{CalibrateReadoutTask}，控制台里 Add Panel 选 “Task: Calibrate readout”，或脚本里 \pyapi{exp.readout.calibrate\_task(...)}）。它照搬单原子 Rb87 读出流程：
+
+\begin{description}
+  \item[一发 = 一个 bracket] 每发是一段\tfocus{长-短-长}相机序列（\pyapi{reference\_bracket\_sequence}），三帧成像\tfocus{同一批原子}（阱全程开、触发之间不再冷却，所以后一帧看到的是前一帧的幸存者）。两张长曝光参考帧\tfocus{严格一致}时投票出该格点的真值占据；不一致说明这一发原子丢了，标为\tfocus{歧义}并丢弃。
+  \item[逐方法 held-out 保真度] 三种读出模型——\pyapi{box}（方形 ROI）、\pyapi{psf}（逐站点匹配滤波）、\pyapi{uniform\_psf}（共享一个核）——各自在带标签的短读出帧上\tfocus{训练}一个逐站点阈值，再在\tfocus{留出}的测试集上打分。因为三种模型对光子的加权不同，在保真度受限（短）的读出下它们的保真度\tfocus{各不相同}（匹配滤波通常优于方形盒）——所以标定一次把三种都算出来，下游的 \pyapi{OccupancyProcessor} 选其一。
+  \item[真值定边界] 训练出的逐站点阈值\tfocus{写回}标定（\pyapi{threshold\_method="per\_site\_reference"}），\pyapi{detect} 据此判占据——边界来自真实标签，而非单批 Otsu 速分。
+\end{description}
+
+一份标定因此能用\tfocus{多种方法}读：顶层 \pyapi{box}，其余在 \pyapi{by\_method} 里；\pyapi{calibration.signals(image, method=...)} 与 \pyapi{thresholds\_for(method)} 按方法取，且每种方法用\tfocus{自己的背景模型}（PSF 减环形背景、box 不减），保证阈值与信号在同一尺度上。标定跑完把每种读出方式的逐站点计数分布图与保真度写进一个可复看的文件夹（\pyapi{box}/\pyapi{psf}/\pyapi{uniform\_psf} 各一张）。
+
 \section{结果对象与 history}
 每个读出/采集操作返回一个\tfocus{notebook 友好}的结果对象（\pyapi{CaptureResult}/\pyapi{SitemapResult}/\pyapi{ThresholdResult}/\pyapi{DetectionResult}/\pyapi{DetectionTimeScanResult}），都带一个 \pyapi{.plot}，并自动追加进 \pyapi{exp.history}，方便事后复盘与导出。
 

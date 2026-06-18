@@ -85,12 +85,27 @@ def settle(widget=None, ms: int = 500) -> None:
 
 
 def screenshot(widget, path, *, settle_ms: int = 500) -> Path:
-    """Settle, then grab ``widget`` to ``path`` (PNG).  Returns the path."""
+    """Settle, then grab ``widget`` to ``path`` (PNG), FLATTENED over white.  Returns the path.
+
+    ``QWidget.grab`` rasterises the widget WITHOUT its graphics effects, so a region that on
+    screen sits over an effect-painted backdrop comes out transparent -- and an offscreen
+    grab then saves it BLACK.  The Fluent tab bar is exactly this: its tabs are transparent
+    and composite over the white card painted by the drop-shadow EFFECT, which ``grab`` skips.
+    Flattening the grab onto an opaque WHITE canvas (the card colour) makes a saved figure --
+    and the PDF it lands in -- show the tabs as the running GUI renders them, not black."""
+
+    from PyQt5 import QtGui
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     settle(widget, settle_ms)
-    widget.grab().save(str(path))
+    grabbed = widget.grab()
+    canvas = QtGui.QPixmap(grabbed.size())
+    canvas.fill(QtGui.QColor("white"))
+    painter = QtGui.QPainter(canvas)
+    painter.drawPixmap(0, 0, grabbed)
+    painter.end()
+    canvas.save(str(path))
     return path
 
 
