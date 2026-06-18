@@ -20,7 +20,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
-    from PyQt5 import QtCore, QtWidgets
+    from PyQt5 import QtCore, QtGui, QtWidgets
     from Zou_lab_control.frontend import qt_fluent as qf
 except Exception:  # pragma: no cover - no Qt available
     QtWidgets = None
@@ -129,28 +129,76 @@ def test_overflowing_tabs_keep_short_tabs_full_and_never_clip_the_close_x():
     width//count, short ones included) AND for the original 'x cut off' at the bar edge."""
     app = qf.ensure_qt_app()
     w = qf.FluentTabWidget()
-    w.add_permanent_tab(QtWidgets.QLabel("m"), "Monitor")
-    w.add_permanent_tab(QtWidgets.QLabel("l"), "Logic")
+    # two genuinely SHORT tabs + several long ones, so the disparity is large regardless of
+    # the platform font metrics (the test must not be tuned to an exact pixel width).
+    w.add_permanent_tab(QtWidgets.QLabel("a"), "A")
+    w.add_permanent_tab(QtWidgets.QLabel("b"), "B")
     for name in ("Readout image", "Per-site occupancy", "Loading rate (dist)",
                  "Loading rate", "Counts distribution", "Per-site counts"):
         w.add_closable_tab(QtWidgets.QLabel(name), name, focus=False)
-    # narrow enough that the tabs overflow, wide enough that the short tabs still fit.
-    w.resize(960, 320); w.show(); _settle(app)
+    base = QtWidgets.QTabBar.tabSizeHint
+    w.resize(2200, 320); w.show(); _settle(app)          # wide: measure the TRUE natural widths
     bar = w.tabBar()
+    naturals = [base(bar, i).width() for i in range(bar.count())]
+    shortest_two = sorted(naturals)[:2]
+    # size so the tabs OVERFLOW but the bar is wide enough that water-fill spares the two
+    # short tabs (keep them natural, give the rest ~70% of their natural).
+    target = shortest_two[0] + shortest_two[1] + int(0.7 * (sum(naturals) - sum(shortest_two)))
+    w.resize(target + 90, 320); _settle(app)             # +chrome for the QTabWidget/corner
     assert bar.is_overflowing() is True
 
     cap = bar._shrink_cap()
     assert cap is not None
-    naturals = [QtWidgets.QTabBar.tabSizeHint(bar, i).width() for i in range(bar.count())]
-    # water-fill INVARIANT: a tab narrower than the cap keeps its natural width (Monitor /
-    # Logic are not shrunk), a wider tab is capped to the shared cap (its label elides).
-    for i, nat in enumerate(naturals):
+    # water-fill INVARIANT: a tab narrower than the cap keeps its natural width, a wider tab
+    # is capped to the shared cap (its label elides) -- NOT every tab crammed to width//count.
+    for i in range(bar.count()):
+        nat = base(bar, i).width()
         assert bar.tabSizeHint(i).width() == (nat if nat <= cap else cap)
-    # the cap genuinely SPARES short tabs (some tab is below it) and is NOT the equal-sliver
-    # width//count of the old squeeze that crammed every tab (short ones included).
+    # the two SHORT tabs ("A" / "B") are spared (kept at natural, well under the cap), so the
+    # cap is genuinely above the equal-sliver width//count of the old squeeze.
     assert min(naturals) < cap
     assert cap > bar.width() // bar.count()
     # EVERY tab (laid out left to right) ends within the bar: no tab -- and so no close 'x'
     # -- is clipped at the right edge.
     assert all(bar.tabRect(i).right() <= bar.rect().right() + 1 for i in range(bar.count()))
     w.deleteLater()
+
+
+def test_selected_tab_renders_the_accent_pivot_underline():
+    """The selected tab shows the Fluent PIVOT underline: a 2px accent line under its text
+    (the design the user asked to keep -- 'a line appears under the selected tab').
+
+    Regression for the bug where an inline ``#`` comment inside the tab stylesheet (Qt QSS
+    has NO ``#`` line comment -- only ``/* */``) silently broke the whole ``QTabBar::tab``
+    block, so the ``:selected`` accent underline never rendered and the tabs fell back to a
+    native dark box.  Rendered over a WHITE parent on purpose: the offscreen platform paints
+    a widget's ``transparent`` background BLACK, which is exactly why a naive dark screenshot
+    hid the missing underline -- so this guard composites over white and counts accent pixels."""
+    app = qf.ensure_qt_app()
+    # the tab stylesheet must never carry a ``#`` line comment (it aborts QSS parsing).
+    probe = qf.FluentTabWidget()
+    assert "# " not in probe.styleSheet(), "tab QSS has a '#' comment -> Qt drops the rest of the block"
+    probe.deleteLater()
+
+    host = QtWidgets.QWidget()
+    host.setAutoFillBackground(True)
+    pal = host.palette(); pal.setColor(host.backgroundRole(), QtGui.QColor("white")); host.setPalette(pal)
+    layout = QtWidgets.QVBoxLayout(host); layout.setContentsMargins(4, 4, 4, 4)
+    w = qf.FluentTabWidget()
+    w.add_permanent_tab(QtWidgets.QLabel("m"), "Monitor")
+    w.add_closable_tab(QtWidgets.QLabel("a"), "Readout image", focus=True)
+    layout.addWidget(w)
+    host.resize(520, 140); host.show(); _settle(app)
+    w.setCurrentIndex(1); _settle(app)
+
+    image = host.grab().toImage()
+    accent = QtGui.QColor(qf.ACCENT)
+    found = 0
+    for y in range(min(image.height(), 60)):          # the tab strip lives in the top band
+        for x in range(image.width()):
+            c = image.pixelColor(x, y)
+            if (abs(c.red() - accent.red()) <= 45 and abs(c.green() - accent.green()) <= 45
+                    and abs(c.blue() - accent.blue()) <= 45):
+                found += 1
+    assert found > 10, "the selected tab's accent pivot underline did not render (tab QSS broken?)"
+    w.deleteLater(); host.deleteLater()

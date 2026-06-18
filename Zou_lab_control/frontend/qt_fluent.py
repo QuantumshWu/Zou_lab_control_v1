@@ -1364,7 +1364,7 @@ class FluentTabWidget(QtWidgets.QTabWidget):
                 color: {GREY};
                 border: none;
                 border-bottom: {scaled_px(2, minimum=2)}px solid transparent;
-                height: {scaled_px(32, minimum=26)}px;     # room for descenders (g/y) + the 2px underline
+                height: {scaled_px(32, minimum=26)}px;
                 padding: 0px {scaled_px(16, minimum=12)}px;
                 margin-right: {scaled_px(6)}px;
                 font: {fluent_font_size()}pt "{FONT}";
