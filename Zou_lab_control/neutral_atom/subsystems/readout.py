@@ -299,7 +299,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
             raise ValueError("times must contain positive finite detection times.")
         calibration = s.require_calibration(require_thresholds=False)
         controller = self._scan_pulse(pulse, name="detect_time_scan")
-        axis = ScanAxis(slot="exposure", values=times, label="Detection time (s)", unit="s", kind="duration")
+        axis = ScanAxis(slot="exposure", values=times, label="Detection time", unit="s", kind="duration")
         reducer = OtsuFidelityReducer(site=site)
         plan: Any = NFramePlan(n_frames=positive_int(shots, "shots"))
         if pulse is not None:
@@ -431,7 +431,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
         reducer = SurvivalReducer(per_site=per_site)
         if per_site:
             reducer.bind_calibration(calibration)
-        axis = ScanAxis(slot="s0", values=t_off, label="Trap-off time (s)", unit="s", kind="duration")
+        axis = ScanAxis(slot="s0", values=t_off, label="Trap-off time", unit="s", kind="duration")
         return ScannedMeasurement(
             pulse, s.devices.camera, getattr(pulse, "sequencer", getattr(s.devices, "sequencer", None)),
             calibration, axis, ReleaseRecapturePlan(), reducer, shots_per_point=positive_int(shots, "shots"),

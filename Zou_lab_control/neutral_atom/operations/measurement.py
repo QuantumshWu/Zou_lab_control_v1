@@ -91,6 +91,16 @@ class ParamDecl:
         object.__setattr__(self, "choices", tuple(self.choices))
 
 
+def measurement_slug(name: str) -> str:
+    """Canonical machine token for a measurement, derived from its display ``name``
+    (lower-case, non-alphanumeric runs -> single ``_``, trimmed).  ONE source: the
+    node prefix + every published signal name derive from this, so the measurement is
+    called the same thing in the Add-Panel list, the signal-flow legend, and the hub
+    signal names -- never a separately hand-typed abbreviation that drifts."""
+    import re
+    return re.sub(r"_+", "_", re.sub(r"[^0-9a-z]+", "_", str(name).lower())).strip("_")
+
+
 def axis_range_tuple(value, name: str) -> tuple[float, float, int]:
     """Coerce an ``axis_range`` param value to ``(min, max, points)``.
 
@@ -136,6 +146,16 @@ class MeasurementSpec:
     build: Callable[..., "ScannedMeasurement"]
     grid_shape: tuple[int, int] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Canonical machine slug (the node prefix + signal names derive from it).  Defaults
+    # to ``measurement_slug(name)`` so a measurement is named ONCE; ``x_key``/``y_key``
+    # are the BARE quantity tokens (``t_off``/``survival``) -- the full hub signal is
+    # ``f"{key}_{x_key}"`` (e.g. ``temperature_t_off``), so the signal names match the
+    # display name automatically instead of a hand-typed abbreviation.
+    key: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.key:
+            object.__setattr__(self, "key", measurement_slug(self.name))
 
     def param(self, key: str) -> ParamDecl:
         """Return the declaration for ``key`` (raises ``KeyError`` if absent)."""

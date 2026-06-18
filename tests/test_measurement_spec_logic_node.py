@@ -76,18 +76,22 @@ def test_builtin_specs_build_unrun_scanned_measurements():
     exp = _calibrated_virtual_session()
     specs = exp.readout.measurement_specs()
     assert [s.name for s in specs] == [
-        "Temperature (release-recapture)",
-        "Readout duration -> fidelity",
+        "Temperature",
+        "Readout fidelity",
     ]
     temp, dur = specs
-    assert temp.x_key == "rr_t_off" and temp.y_key == "rr_survival"
-    assert temp.result_labels == ("Trap-off time (s)", "Survival")
+    # x_key/y_key are the BARE quantity tokens; the slug (key) is the single source the
+    # node prefixes every signal with -> temperature_t_off / temperature_survival.
+    assert temp.key == "temperature"
+    assert temp.x_key == "t_off" and temp.y_key == "survival"
+    assert temp.result_labels == ("Trap-off time", "Survival")
     # capture_radius -> metres conversion for fit_temperature is carried in metadata.
     assert temp.metadata["fit"] == "fit_temperature"
     assert temp.metadata["fit_param"] == "capture_radius"
     assert temp.metadata["fit_param_scale"] == pytest.approx(1e-6)
-    assert dur.x_key == "dur_detection_time" and dur.y_key == "dur_fidelity"
-    assert dur.result_labels == ("Detection time (s)", "Fidelity")
+    assert dur.key == "readout"
+    assert dur.x_key == "detection_time" and dur.y_key == "fidelity"
+    assert dur.result_labels == ("Detection time", "Fidelity")
 
     m_temp = temp.build(**temp.defaults())
     assert isinstance(m_temp, ScannedMeasurement)

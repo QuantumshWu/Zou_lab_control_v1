@@ -3541,8 +3541,11 @@ class TaskConsole(QtWidgets.QWidget):
         if kind == "measurement":
             measurement = spec.build(**values)
             from Zou_lab_control.neutral_atom.operations.logic import ScannedMeasurementNode
+            # The node publishes under the measurement's slug (spec.key), so every signal
+            # is ``<slug>_<quantity>`` (e.g. temperature_t_off) -- one name, derived.
             return ScannedMeasurementNode(
-                self.hub, measurement, x_key=spec.x_key, y_key=spec.y_key, grid_shape=spec.grid_shape)
+                self.hub, measurement, x_key=spec.x_key, y_key=spec.y_key,
+                grid_shape=spec.grid_shape, prefix=f"{spec.key}_")
         if kind == "processor":
             # REACTIVE processor (the "func" layer): a live node consuming hub signals
             # and republishing derived ones -- e.g. judging occupancy from each frame.

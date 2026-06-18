@@ -56,11 +56,12 @@ def temperature_release_recapture(readout) -> MeasurementSpec:
     if grid_shape is not None:
         grid = (int(grid_shape[0]), int(grid_shape[1]))
     return MeasurementSpec(
-        name="Temperature (release-recapture)",
+        name="Temperature",
+        key="temperature",                       # signals: temperature_t_off / temperature_survival
         params=params,
-        result_labels=("Trap-off time (s)", "Survival"),
-        x_key="rr_t_off",
-        y_key="rr_survival",
+        result_labels=("Trap-off time", "Survival"),
+        x_key="t_off",
+        y_key="survival",
         build=build,
         grid_shape=grid,
         # The fit needs the capture radius in METRES; the GUI param is um, so
