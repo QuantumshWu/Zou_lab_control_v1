@@ -183,8 +183,13 @@ def _demo_board_state():
     return TaskConsoleState(
         name="demo_all_kinds",
         panels=[
-            PanelConfig(kind="2d", title="Loading image", row=0, col=0, size="2x2",
-                        source="value = frame"),
+            # Readout image SYNCED with the site map: both read the occupancy processor's
+            # ``frame_judged`` (the exact frame it judged, co-published atomically with
+            # ``occupied``) -> the 2D image and the rings are always the SAME shot.  (A raw
+            # live-camera view would be ``value = frame``, but that runs one cycle AHEAD of
+            # the judged frame, so it would not line up with the rings.)
+            PanelConfig(kind="2d", title="Readout image", row=0, col=0, size="2x2",
+                        source="value = frame_judged", inputs=["frame_judged"]),
             PanelConfig(kind="sites", title="Per-site occupancy", row=0, col=2, size="2x2",
                         source="value = occupied", inputs=["occupied"]),
             PanelConfig(kind="monitor", title="Loading rate (dist)", row=0, col=4, size="1x2",

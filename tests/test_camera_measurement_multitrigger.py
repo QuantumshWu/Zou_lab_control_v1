@@ -22,7 +22,7 @@ if sys.path[0] != str(REPO_ROOT):
     sys.path.insert(0, str(REPO_ROOT))
 
 import Zou_lab_control.neutral_atom as na
-from Zou_lab_control.neutral_atom.operations.logic import CameraMeasurement
+from Zou_lab_control.neutral_atom.operations.logic import CameraMeasurement, OccupancyProcessor
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
 
 
@@ -45,6 +45,29 @@ def test_default_is_single_trigger_back_compat():
     cam_node = CameraMeasurement(SignalHub(), exp.camera)        # frames_per_cycle defaults to 1
     cam_node.step()
     assert set(cam_node.published_signals()) == {"frame", "frame_0"}
+
+
+def test_readout_image_frame_judged_is_synced_with_occupancy():
+    """#5: a 2D 'readout image' reads the occupancy processor's ``frame_judged``, which is
+    co-published ATOMICALLY with ``occupied`` (one transform dict) -- so the image and the
+    site-map rings are ALWAYS the same shot.  (A raw live ``frame`` panel runs one cycle
+    ahead of the judged frame; ``frame_judged`` is the bottom-up sync point.)"""
+    exp = na.connect("virtual", sitemap={"grid_shape": (3, 4)})
+    exp.readout.sitemap(frames=4, display=False)
+    exp.readout.thresholds(frames=20, display=False)
+    cal = exp.readout.current
+    hub = SignalHub()
+    cam = CameraMeasurement(hub, exp.camera)
+    det = OccupancyProcessor(hub, calibration=cal, source="frame", method="box", grid_shape=(3, 4))
+    for _ in range(4):
+        cam.step()
+        det.step()
+    frame_judged = np.asarray(hub.latest("frame_judged"))
+    occupied = np.asarray(hub.latest("occupied"))
+    assert frame_judged.ndim == 2                                   # the readout image
+    # the readout image and the rings are the SAME shot: re-judging frame_judged reproduces
+    # exactly the published occupancy (they came from one atomic publish).
+    assert np.array_equal(occupied, cal.detect(frame_judged, method="box").occupied)
 
 
 def test_frames_per_cycle_is_live_editable():
