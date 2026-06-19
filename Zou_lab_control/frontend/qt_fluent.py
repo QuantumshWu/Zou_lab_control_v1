@@ -67,6 +67,7 @@ COMBO_TRI_SIZE = 8
 STEP_WIDTH = 6
 
 _QT_APP = None
+_QT_LOOP_ENABLED = False
 _FLUENT_SCALE = 1.0
 # The fluent scale is clamped to a usable band: below the min the controls become
 # unreadable, above the max they waste space.  ONE source -- set_fluent_scale and
@@ -187,13 +188,42 @@ def _radius() -> int:
     return scaled_px(RADIUS)
 
 
+def _enable_ipython_qt_loop() -> None:
+    """Under IPython/Jupyter, install the Qt event-loop hook (the ``%gui qt`` integration) so a
+    Qt window opened from a cell keeps PROCESSING events -- it paints and stays responsive
+    instead of appearing frozen -- because the kernel pumps Qt between cells.  Without this a
+    ``show_pulse_gui()`` / ``show_task_console()`` / ``exp.pulse_gui()`` window just hangs blank
+    in a notebook.  No-op outside IPython (a script or pytest runs its own loop / is headless),
+    and done once per process.  ``%matplotlib widget`` is independent of this -- they coexist."""
+
+    global _QT_LOOP_ENABLED
+    if _QT_LOOP_ENABLED:
+        return
+    try:
+        from IPython import get_ipython
+    except Exception:        # pragma: no cover - IPython not installed (plain script)
+        return
+    ip = get_ipython()
+    if ip is None:           # not in an interactive shell (script / pytest)
+        return
+    try:
+        ip.run_line_magic("gui", "qt")     # same hook a user typing %gui qt would install
+        _QT_LOOP_ENABLED = True
+    except Exception:        # pragma: no cover - headless kernel / no display
+        pass
+
+
 def ensure_qt_app() -> QtWidgets.QApplication:
-    """Return a QApplication, creating and keeping one alive when needed."""
+    """Return a QApplication, creating and keeping one alive when needed.
+
+    Also enables the IPython Qt event loop (``%gui qt``) when running in a notebook, so a window
+    opened from a cell stays live instead of hanging blank."""
 
     global _QT_APP
     app = QtWidgets.QApplication.instance()
     if app is not None:
         _QT_APP = app
+        _enable_ipython_qt_loop()
         return app
     if hasattr(QtCore.Qt, "AA_EnableHighDpiScaling"):
         QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
@@ -203,6 +233,7 @@ def ensure_qt_app() -> QtWidgets.QApplication:
     os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.fonts=false")
     _QT_APP = QtWidgets.QApplication(sys.argv)
     _QT_APP.setFont(QtGui.QFont(FONT, fluent_font_size()))
+    _enable_ipython_qt_loop()
     return _QT_APP
 
 
