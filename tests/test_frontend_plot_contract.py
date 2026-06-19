@@ -86,6 +86,29 @@ def test_every_public_plot_is_first_class():
             plt.close(p.fig)
 
 
+def test_every_public_plot_save_writes_png_AND_data_npz(tmp_path):
+    """The DataFigure contract is universal: ``plot.save(path)`` ALWAYS writes BOTH a png
+    AND a matching ``.npz`` of the plotted data (the confocal design).  A new plot type
+    that overrides save to skip the .npz silently drops the experimenter's raw data --
+    exactly the bug the multi-panel GridPlot had (2026-06-19, only the png landed for the
+    per-site distribution grids).  This is the mechanical guard: every public plot kind
+    saves both files."""
+    plots = _build_public_plots()
+    try:
+        for kind, p in plots.items():
+            out = p.save(str(tmp_path / kind))
+            # save returns {"figure": <png>, "data": <npz>} per the DataFigure contract
+            assert isinstance(out, dict), f"{kind}.save did not return a dict"
+            assert "figure" in out and "data" in out, f"{kind}.save missing figure/data keys: {out}"
+            png, npz = out["figure"], out["data"]
+            assert str(png).endswith(".png") and str(npz).endswith(".npz"), (kind, png, npz)
+            # both files exist on disk -- not just promised
+            assert png.exists() and npz.exists(), f"{kind} did not write png+npz: {out}"
+    finally:
+        for p in plots.values():
+            plt.close(p.fig)
+
+
 def test_site_grid_exposes_per_cell_selectors_and_fitting():
     """The exact regression: the site grid must get per-cell zoom + draggable
     threshold AND a per-cell DataFigure that can actually fit."""
