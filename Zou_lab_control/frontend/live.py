@@ -1831,10 +1831,16 @@ class HistogramFigure(BaseLivePlot):
         w1 = abs(amp1 * sigma1)
         if (w0 + w1) == 0:
             return None
-        # The ONE confidence-weighted fidelity formula, shared with the
-        # saved-calibration fidelity (core) so the GUI and the record never drift.
-        fidelity, _raw, _sep = confidence_weighted_fidelity(threshold, mu0, sigma0, w0, mu1, sigma1, w1)
-        return float(fidelity)
+        # The single-shot readout fidelity = the HONEST two-Gaussian overlap about the
+        # threshold (the weighted dark-below + bright-above probability of the FITTED
+        # populations).  We deliberately use ``raw``, NOT the confidence-DAMPED value: the
+        # damping (effective_separation = sep - 2) pulls a cleanly separated distribution
+        # toward 0.5 -- a sep~2.5 split read ~0.58, contradicting the visibly separated
+        # histogram.  Because this path has a real bimodal FIT, the overlap IS the fidelity
+        # (matching the per-site grids' gaussian_fidelity); the damping only guards the
+        # threshold-SPLIT estimate (analysis.estimate_threshold_fidelity), which is untouched.
+        _fidelity, raw, _sep = confidence_weighted_fidelity(threshold, mu0, sigma0, w0, mu1, sigma1, w1)
+        return float(raw)
 
     def _on_threshold_drag(self, x: float) -> None:
         if not self.thresholds:

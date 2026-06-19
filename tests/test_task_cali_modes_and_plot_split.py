@@ -91,9 +91,10 @@ def test_calibrate_task_computes_every_method_processor_picks(threshold_method):
 
 def test_calibrate_task_live_writes_canonical_calibration_json_for_the_detector(tmp_path):
     """A live calibration writes the CANONICAL ``folder/calibration.json`` -- the stable,
-    named file the Judge-occupancy detector loads -- plus a timestamped report sub-folder.
-    Reusing it is NOT a calibration run: the file just loads (here via TrapCalibration.load,
-    in the app via the processor's calibration field), with NO second acquisition."""
+    named file the Judge-occupancy detector loads -- plus the report artifacts, ALL directly
+    in ``folder`` (no hidden timestamped sub-folder).  Reusing it is NOT a calibration run:
+    the file just loads (here via TrapCalibration.load, in the app via the processor's
+    calibration field), with NO second acquisition."""
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
     from Zou_lab_control.neutral_atom.core.calibration import TrapCalibration
 
@@ -107,8 +108,9 @@ def test_calibrate_task_live_writes_canonical_calibration_json_for_the_detector(
         # the canonical latest calibration the detector defaults to
         canonical = folder / "calibration.json"
         assert canonical.exists()
-        # plus a timestamped report sub-folder with its own reviewable artifacts
+        # the report artifacts land in the SAME explicit folder (report_dir == folder)
         report_dir = Path(made.result["report_dir"])
+        assert report_dir == folder
         assert report_dir.exists() and (report_dir / "calibration.json").exists()
         # reloading is a plain file load (no calibration re-run): same centers
         loaded = TrapCalibration.load(canonical)

@@ -43,11 +43,12 @@ CALIBRATE_PARAMS = (
                       "calibrate again: point the Judge-occupancy processor at its calibration.json.)"),
     ParamDecl("folder", "folder", "path", default=DEFAULT_DATA_DIR, required=True, path_mode="dir",
               base_dir=DEFAULT_DATA_DIR,
-              tooltip="The ONE data directory (input + output).  source=live WRITES here: the "
-                      "calibration (calibration.json) + a timestamped distribution/fidelity report "
-                      "(and, if 'save frames' is on, the raw frames img1.npy, ...).  source=saved "
-                      "frames READS the raw frame files from here -- .npy OR raw camera .tif/.tiff "
-                      "(img1.tif, ...).  Defaults to the project `calibrations/` folder."),
+              tooltip="The ONE data directory (input + output).  source=live WRITES everything "
+                      "HERE (no hidden sub-folder): calibration.json + the distribution/fidelity "
+                      "report figures + summary.json + calibration.npz (and, if 'save frames' is "
+                      "on, the raw frames img1.npy, ...).  source=saved frames READS the raw frame "
+                      "files from here -- .npy OR raw camera .tif/.tiff (img1.tif, ...).  Re-running "
+                      "overwrites; use a different folder to keep a run.  Defaults to `calibrations/`."),
     ParamDecl("save_frames", "save frames (live)", "bool", default=True,
               tooltip="When source=live, also SAVE the acquired raw frames to `folder` (img1.npy, "
                       "...) so you can re-calibrate later with source=saved frames WITHOUT "
@@ -80,10 +81,12 @@ CALIBRATE_PARAMS = (
 def calibrate_readout(readout) -> TaskSpec:
     """The readout-calibration task (sitemap + per-site thresholds).
 
-    Its tunable parameters (source / folder / mode / threshold / frame counts) are
-    declared in :data:`CALIBRATE_PARAMS` -- EVERY one with a real default (no blank
-    fields): one ``folder`` (default ``calibrations``) is the data + report directory,
-    and ``source`` decides live-acquire / saved-frames / saved-calibration.  They are
+    Its tunable parameters (source / folder / save_frames / pulse_template / threshold /
+    frame counts) are declared in :data:`CALIBRATE_PARAMS` -- EVERY one with a real default
+    (no blank fields): one ``folder`` (default ``calibrations``) is the data + report
+    directory (everything lands there, no hidden sub-folder), and ``source`` decides
+    live-acquire vs saved-frames (there is NO "saved calibration" source: reusing a finished
+    calibration just loads its calibration.json in the Judge-occupancy processor).  They are
     threaded into the built :class:`~..logic.CalibrateReadoutTask`; mid-run it streams the
     template frame to its dedicated panel under the ``cal_`` namespace (``cal_frame``)."""
 

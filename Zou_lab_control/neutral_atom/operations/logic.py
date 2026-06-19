@@ -771,22 +771,23 @@ class CalibrateReadoutTask(Task):
         thr = np.asarray(self.calibration.thresholds, dtype=float).reshape(-1)
         # Write the CANONICAL latest calibration to ``<folder>/calibration.json`` -- the stable,
         # named file the Judge-occupancy processor defaults to, so calibrate-then-judge wires up
-        # with NO path typed yet the file in use is always named.  (The timestamped report below
-        # additionally keeps every run's reviewable artifacts.)
+        # with NO path typed yet the file in use is always named.
         try:
             Path(self.folder).mkdir(parents=True, exist_ok=True)
             self.calibration.save(Path(self.folder) / "calibration.json")
         except Exception:
             pass
-        # ALWAYS write the rb87-style report (per-site distribution + fidelity + site map
-        # + a loadable calibration.json/npz) to a timestamped sub-folder of ``folder``, so
-        # a calibration leaves reviewable + reloadable artifacts on disk.
+        # ALWAYS write the rb87-style report (per-site distribution + fidelity + site map +
+        # the loadable calibration.json/npz) DIRECTLY into the user's EXPLICIT ``folder`` --
+        # ONE place, alongside calibration.json + any saved raw frames, with NO hidden
+        # timestamped sub-folder (the user picks the folder; re-running overwrites it, and a
+        # different run goes in a different folder -- explicit, never magic).
         out.publish(progress=0.98, stage="writing distribution + fidelity report")
-        self.report = self._write_report(self.report_dir())
+        self.report = self._write_report(Path(self.folder))
         folder = self.report.get("folder") if isinstance(self.report, dict) else None
-        out.publish(progress=1.0, stage=(f"saved report -> {folder}" if folder else "done"))
+        out.publish(progress=1.0, stage=(f"saved report -> {folder or self.folder}"))
         return {"centers": centers, "thresholds": thr, "n_sites": float(len(centers)),
-                "report_dir": str(folder or "")}
+                "report_dir": str(folder or self.folder)}
 
     def _adopt(self) -> None:
         """Hand the just-produced calibration to the session via ``calibration_sink`` so the
@@ -795,16 +796,6 @@ class CalibrateReadoutTask(Task):
         writes -- an explicit named file, not an implicit session handoff)."""
         if self.calibration_sink is not None and self.calibration is not None:
             self.calibration_sink(self.calibration)
-
-    def report_dir(self) -> "Path":
-        """A timestamped run sub-folder under ``folder`` (e.g.
-        ``calibrations/calibration_20260617_213000/``), so each calibration's figures +
-        loadable calibration land in their own findable place and never overwrite a prior
-        run.  ``folder`` always has a real default ("calibrations"), so this is never
-        ambiguous."""
-        from datetime import datetime
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        return Path(self.folder) / f"calibration_{stamp}"
 
     def _write_report(self, folder) -> dict:
         """Write the per-site distribution / fidelity / site-map report for THIS run's

@@ -143,8 +143,13 @@ _DEFAULT_SLOTS = (("signal", "", "the hub signal to plot"),)
 # picks just the occupancy (see PanelCard._sites_aux + TaskConsole._sites_inputs).
 PANEL_INPUT_SLOTS: dict[str, tuple[tuple[str, str, str], ...]] = {
     "sites": (
-        ("occupancy", "occupied", "per-site (N,) occupancy vector -- colours the rings; its "
-                                  "producing node also supplies the centres + frame underlay"),
+        # BLANK default (like every other plot) -- a fresh site-map panel must NOT auto-bind
+        # to a running "occupied" signal on open; the user picks the occupancy signal in the
+        # Setting, and only THEN do the centres + frame underlay auto-resolve from that signal's
+        # producing node (_sites_inputs).  A non-blank default here was the "opens already
+        # connected" bug.
+        ("occupancy", "", "per-site (N,) occupancy vector -- colours the rings; its "
+                          "producing node also supplies the centres + frame underlay"),
     ),
 }
 
@@ -2796,11 +2801,12 @@ class TaskConsole(QtWidgets.QWidget):
         root = QtWidgets.QVBoxLayout(self)
         margin = scaled_px(14)
         root.setContentsMargins(margin, scaled_px(8), margin, scaled_px(8))
-        # NO inter-row gap: the header, the (hidden) task banner and the tab card are all
-        # white and must sit FLUSH.  A non-zero spacing let the grey window background show
-        # through as a thin strip between the white header and the white tab strip -- which
-        # read as "a line above the tabs".  Flush => seamless white, no strip.
-        root.setSpacing(0)
+        # A clear GAP separating the three rows -- the header card, the (hidden) task banner
+        # and the tab card -- so they read as DISTINCT cards on the grey window background, not
+        # one stuck-together block.  (The earlier "thin line above the tabs" was NOT this gap:
+        # it was the header drop-shadow + the QTabBar base line, both now removed; with those
+        # gone a frank gap between two rounded white cards is separation, not a line.)
+        root.setSpacing(scaled_px(10, minimum=7))
 
         # FLAT header (no drop shadow): the shadow's soft bottom edge cast a thin grey line
         # into the gap right above the tab strip (the "line above the tabs").  The tab widget

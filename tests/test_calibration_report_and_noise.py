@@ -60,10 +60,11 @@ def test_calibrate_writes_distribution_and_fidelity_report(tmp_path):
             sitemap_exposure=0.05, readout_exposure=0.02, folder=str(folder))
         task.run_to_completion()
 
-        # the report lands in a timestamped run sub-folder of `folder` (never overwriting)
+        # the report lands DIRECTLY in the user's explicit `folder` -- one place, no hidden
+        # timestamped sub-folder (re-running overwrites; a different run uses a different folder).
         report_dir = Path(task.result["report_dir"])
+        assert report_dir == folder
         assert report_dir.exists()
-        assert report_dir.parent == folder
         # the rb87-style artifacts all landed there: ONE per-site distribution grid PER
         # readout method (box / per-site PSF / uniform PSF -- the cali computes all three),
         # the pooled distribution + site map, the reloadable calibration + numeric bundle.

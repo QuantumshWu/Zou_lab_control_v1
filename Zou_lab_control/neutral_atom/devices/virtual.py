@@ -77,13 +77,21 @@ class VirtualTrapArray(TrapArrayDevice):
     # still loads fewer atoms (loading_fraction), but a full MOT load saturates the
     # ~loading_probability ceiling.
     mot_load_s: float = 0.30
-    atom_rate: float = 3_000.0            # bright-atom photon (count) rate during the probe
+    # Bright-atom photoelectron rate (peak amplitude/s) during the probe.  Tuned to the REAL
+    # Rb87 qCMOS dataset (references/.../rb87_readout_v16): a bright site's 3x3-box signal is
+    # ~18-20 detected photons at a 2 ms readout -- with atom_sigma_px=0.8 and this rate a
+    # rendered all-bright 2 ms frame measures ~18-19 box photons (matched to data, not guessed).
+    atom_rate: float = 2_500.0
     background_rate: float = 8.0          # stray-light count rate (always present)
     dark_current_e_per_s: float = 0.006
-    offset_counts: float = 200.0
-    conversion_e_per_count: float = 0.107
-    read_noise_e: float = 0.43
-    atom_sigma_px: float = 1.35           # imaging PSF width (Gaussian sigma, px)
+    offset_counts: float = 200.0          # qCMOS nominal offset (reference CameraConfig)
+    conversion_e_per_count: float = 0.107  # electrons per count (reference qCMOS gain)
+    read_noise_e: float = 0.43            # read noise e-rms (reference qCMOS)
+    # Imaging PSF width (Gaussian sigma, px).  The real Rb87 qCMOS per-site PSF fits give
+    # sigma ~0.6-0.96 px (psf_sigma_x/y in the reference analysis_arrays.npz); 0.8 is the
+    # representative value (the old 1.35 rendered atoms ~1.7x too large + ~2x too many box
+    # counts).
+    atom_sigma_px: float = 0.8
     # Atom 1/e lifetime UNDER the probe (s): a longer readout exposure scatters MORE
     # photons (higher SNR) but also loses MORE atoms mid-readout, so the readout
     # duration sets the real SNR-vs-survival trade-off a detection-time scan measures.

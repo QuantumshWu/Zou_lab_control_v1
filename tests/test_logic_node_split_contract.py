@@ -98,7 +98,7 @@ def test_calibrate_task_produces_calibration_and_drives_detect_processor(tmp_pat
         assert "frame" in task.output.names() and task.output.progress == 1.0  # mid-run buffer
         assert {"centers", "thresholds", "n_sites"} <= set(task.result)         # result on instance
         assert task.result["n_sites"] == 12
-        # artifact persisted: the report's numeric bundle in the timestamped run sub-folder
+        # artifact persisted: the report's numeric bundle in the explicit run folder
         saved = np.load(Path(task.result["report_dir"]) / "calibration.npz")
         assert saved["centers"].shape == (12, 2) and saved["thresholds"].shape == (12,)
 
