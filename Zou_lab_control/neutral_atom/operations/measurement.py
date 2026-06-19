@@ -83,6 +83,9 @@ class ParamDecl:
     base_dir: str = ""               # kind="path": the folder a Browse dialog opens in when the
                                      # field doesn't resolve to an existing path (e.g. "pulses"
                                      # for a pulse template, "calibrations" for a data folder)
+    placeholder: str = ""            # greyed hint shown when the field is EMPTY -- use it to make a
+                                     # meaningful blank explicit (e.g. a path that, left blank,
+                                     # falls back to the current session calibration)
 
     def __post_init__(self) -> None:
         kind = str(self.kind).lower()

@@ -140,3 +140,50 @@ def test_reference_bracket_gives_distinct_per_method_fidelity():
         assert spread > 1e-3, f"per-method fidelity must differ, got {means}"
     finally:
         exp.close()
+
+
+def test_overlapping_readout_reports_sub_unity_fidelity_and_per_method_summary(tmp_path):
+    """Regression for the report headlining a spurious ~100% fidelity on a CLEARLY overlapping
+    distribution.  At a fidelity-LIMITED (very short) readout the dark/bright populations
+    overlap, so the per-site fidelity drawn + summarised must be the two-Gaussian MODEL
+    (overlap) fidelity -- which matches the plotted distribution and is < 1 -- NOT the small
+    held-out test-split classification accuracy that quantises onto exactly 1.000.  And
+    summary.json must report EACH readout method's fidelity (box / per-site PSF / uniform PSF),
+    not one box aggregate."""
+    pytest.importorskip("matplotlib")
+    pytest.importorskip("PyQt5")
+    import json
+    import Zou_lab_control.neutral_atom as na
+    import Zou_lab_control.frontend  # noqa: F401  (registers the viewer)
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.neutral_atom.operations.calibration import ALL_READOUT_METHODS
+    from Zou_lab_control.neutral_atom.operations.calibration_report import write_calibration_report
+
+    exp = na.connect("virtual", sitemap={"grid_shape": (4, 5), "image_shape": (80, 100)}, seed=5)
+    try:
+        task = exp.readout.calibrate_task(
+            SignalHub(), source="live", calibration_frames=6, threshold_frames=200,
+            sitemap_exposure=0.03, readout_exposure=3e-4)        # very short -> populations OVERLAP
+        task.run_to_completion()
+        summary = write_calibration_report(
+            str(tmp_path / "report"), calibration=task.calibration,
+            readout_frames=task._readout_samples, reference_groups=task._reference_groups,
+            readout_by_group=task._readout_by_group, threshold_method="otsu")
+
+        data = json.loads((Path(summary["folder"]) / "summary.json").read_text(encoding="utf-8"))
+        n_sites = int(data["n_sites"])
+        # EVERY readout method's fidelity is in the summary (not just one box aggregate)
+        assert set(data["methods"]) == set(ALL_READOUT_METHODS)
+        for m, e in data["methods"].items():
+            assert e["mean_fidelity"] is not None and 0.5 <= e["mean_fidelity"] <= 1.0
+            assert len(e["per_site_fidelity"]) == n_sites
+            assert e["held_out"] is True and e["held_out_accuracy_mean"] is not None   # out-of-sample check kept
+        # the OVERLAPPING readout does NOT report a spurious ~100%: the box model fidelity is
+        # clearly below 1, and the worst site is well under unity (a real overlap, as drawn).
+        box = data["methods"]["box"]
+        assert box["mean_fidelity"] < 0.97, box["mean_fidelity"]
+        assert box["worst_site_fidelity"] < 0.95, box["worst_site_fidelity"]
+        finite = [v for v in box["per_site_fidelity"] if v is not None]
+        assert finite and not any(v > 0.999 for v in finite)   # nothing pinned at 100%
+    finally:
+        exp.close()

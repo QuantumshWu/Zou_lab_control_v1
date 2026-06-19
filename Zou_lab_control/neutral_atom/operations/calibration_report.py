@@ -27,7 +27,7 @@ import numpy as np
 
 from Zou_lab_control._viewer_registry import active_plotter
 
-from ..core.analysis import estimate_threshold_fidelity
+from ..core.bimodal import fit_bimodal, gaussian_fidelity
 
 
 def per_site_counts(calibration, frames, *, method=None) -> np.ndarray:
@@ -43,19 +43,29 @@ def per_site_counts(calibration, frames, *, method=None) -> np.ndarray:
 
 
 def per_site_fidelity(counts: np.ndarray, thresholds: np.ndarray) -> np.ndarray:
-    """Per-site single-shot readout fidelity: the two-population Gaussian-model fidelity
-    of each site's count distribution about its calibrated threshold (the live quick-look
-    estimate -- the SAME model ``OtsuFidelityReducer`` uses on a detection-time scan)."""
+    """Per-site single-shot readout fidelity (no ground-truth labels): fit a two-Gaussian
+    (dark/bright) model to each site's POOLED count distribution and return the SMOOTH overlap
+    fidelity about its calibrated threshold -- ``0.5*(P[dark below thr] + P[bright above thr])``
+    from the fitted populations.  This is the analytic separation of the two populations the
+    histogram SHOWS, so a clearly OVERLAPPING distribution reports < 1 (never a spurious 100%)
+    and a clean, well-separated bimodal reports ~1.  Fitting the full distribution (not the
+    two threshold-split halves) is what makes the number honest: split halves are truncated
+    Gaussians whose narrowed sigmas falsely inflate the apparent separation."""
     counts = np.atleast_2d(np.asarray(counts, dtype=float))
     thr = np.asarray(thresholds, dtype=float).reshape(-1)
     out = np.full(counts.shape[1], np.nan, dtype=float)
     for j in range(counts.shape[1]):
         col = counts[:, j]
         col = col[np.isfinite(col)]
-        if col.size < 2:
+        if col.size < 4:
             continue
-        f = float(estimate_threshold_fidelity(col, float(thr[j])).fidelity)
-        out[j] = f if np.isfinite(f) else np.nan
+        fit = fit_bimodal(col)
+        if not (fit.ok and np.isfinite([fit.dark_mean, fit.dark_sigma,
+                                        fit.bright_mean, fit.bright_sigma]).all()):
+            continue
+        _, _, f = gaussian_fidelity(fit.dark_mean, fit.dark_sigma, fit.bright_mean,
+                                    fit.bright_sigma, float(thr[j]), fit.bright_above)
+        out[j] = float(f) if np.isfinite(f) else np.nan
     return out
 
 
@@ -151,12 +161,24 @@ def _held_out_by_method(calibration, reference_groups, readout_by_group) -> dict
             report = characterize_readout(short, reference)
         except Exception:
             continue
-        fidelity = np.asarray(report.site_fidelities, dtype=float)
+        # The HEADLINE per-site fidelity is the trained two-Gaussian MODEL fidelity (the smooth
+        # overlap integral of the dark/bright populations about the trained threshold) -- it
+        # matches the plotted count distribution: overlapping populations give < 1, well-
+        # separated give ~1.  We deliberately do NOT headline the held-out classification
+        # ACCURACY: on the small held-out test split (~10% of the groups) a balanced accuracy
+        # quantises and lands on exactly 1.000 even for a visibly overlapping distribution --
+        # the bug where an obviously bimodal-overlapping histogram was tagged 100%.  The
+        # held-out accuracy is kept alongside (a real out-of-sample check) for summary.json.
+        fidelity = np.asarray([s.model_fidelity for s in report.per_site], dtype=float)
+        held_out_acc = np.asarray(report.site_fidelities, dtype=float)
+        n_test = np.asarray([int(s.n_test) for s in report.per_site], dtype=float)
         if not np.any(np.isfinite(fidelity)):
             continue                                   # this method scored no site -> skip (not held_out)
         out[str(m)] = {"counts": short,
                        "thresholds": np.asarray(report.thresholds, dtype=float).reshape(-1),
                        "fidelity": fidelity,
+                       "held_out_fidelity": held_out_acc,
+                       "n_test": n_test,
                        "held_out": True}
     # If not every method produced a finite held-out score, the comparison is not meaningful
     # -- fall back wholesale to the self-consistent estimate rather than mixing the two.
@@ -218,11 +240,42 @@ def write_calibration_report(folder, *, calibration, readout_frames, template=No
     except Exception:
         pass
 
+    # PER-METHOD fidelity in the summary (box / per-site PSF / uniform PSF), so the experimenter
+    # can compare the readout models offline -- not just the single box aggregate.  The headline
+    # per-site fidelity is the two-Gaussian MODEL (overlap) fidelity, which matches the plotted
+    # distribution; when reference brackets gave ground truth, the held-out classification
+    # accuracy (with its test count) is reported alongside as an out-of-sample check.
+    def _flist(arr):
+        a = np.asarray(arr, dtype=float).reshape(-1)
+        return [None if not np.isfinite(v) else float(v) for v in a]
+
+    methods_summary: dict[str, dict] = {}
+    for m, data in by_method.items():
+        fid = np.asarray(data.get("fidelity", []), dtype=float).reshape(-1)
+        entry = {
+            "fidelity_kind": ("model overlap of labelled populations" if data.get("held_out")
+                              else "model overlap of label-free bimodal fit"),
+            "mean_fidelity": (float(np.nanmean(fid)) if np.any(np.isfinite(fid)) else None),
+            "worst_site_fidelity": (float(np.nanmin(fid)) if np.any(np.isfinite(fid)) else None),
+            "per_site_fidelity": _flist(fid),
+            "thresholds": _flist(data.get("thresholds", [])),
+            "held_out": bool(data.get("held_out", False)),
+        }
+        if "held_out_fidelity" in data:
+            hoa = np.asarray(data["held_out_fidelity"], dtype=float).reshape(-1)
+            entry["held_out_accuracy_mean"] = (float(np.nanmean(hoa))
+                                               if np.any(np.isfinite(hoa)) else None)
+            entry["held_out_accuracy_per_site"] = _flist(hoa)
+            entry["n_test_per_site"] = _flist(data.get("n_test", []))
+        methods_summary[str(m)] = entry
+
     summary = {
         "n_sites": int(len(centers)),
         "readout_frames": int(counts.shape[0]) if counts.size else 0,
+        # top-level follows the BOX panel; see "methods" for box / psf / uniform_psf each.
         "mean_fidelity": (float(np.nanmean(fidelity)) if np.any(np.isfinite(fidelity)) else None),
         "worst_site_fidelity": (float(np.nanmin(fidelity)) if np.any(np.isfinite(fidelity)) else None),
+        "methods": methods_summary,
         "threshold_method": str(threshold_method),
         "timestamp": str(timestamp),
         "files": paths,

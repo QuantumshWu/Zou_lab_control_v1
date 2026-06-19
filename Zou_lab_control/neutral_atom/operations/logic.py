@@ -692,8 +692,11 @@ class CalibrateReadoutTask(Task):
         self.threshold_frames = max(2, int(threshold_frames))
         self.threshold_method = str(threshold_method)
         # ONE folder for input + output (no blank paths); ``source`` decides how it's used.
+        # Anchor a relative folder to the PROJECT root (not the volatile CWD) so the data +
+        # report land where the GUI field says they do, wherever Python was launched.
+        from Zou_lab_control._paths import resolve_under_project
         self.source = str(source)
-        self.folder = str(folder or "calibrations")
+        self.folder = str(resolve_under_project(folder or "calibrations"))
         self.calibration = None
 
     def acquisition_parameters(self) -> dict[str, object]:

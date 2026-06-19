@@ -93,6 +93,11 @@ except Exception:  # pragma: no cover - depends on the local matplotlib install
     plt = None
     panel_canvas = None
 
+# Single source for turning a path param into an unambiguous, project-anchored display
+# string (an absolute path, never a bare CWD-relative name) -- the same seam the analysis
+# layer uses to resolve paths, so the field shows exactly the file/folder that is used.
+from Zou_lab_control._paths import display_path
+
 
 TASK_FILES_ENV = "ZLC_TASK_DIR"
 
@@ -283,6 +288,12 @@ _CARD_TITLE_H = 32    # the FluentGroupBox title strip (kind title top-left + Se
 _CARD_VPAD = 12       # vertical padding above + below the content
 _FOOTER_MIN = 26      # the status + signal-legend line every card carries under its canvas
 _GRID_GAP = 8
+
+# The header status readout (panel/signal counts, or a node-error banner) is a borderless
+# label: grey normally, red on a node error (the colour IS the danger cue -- no box border,
+# which as a line-edit drew a grey line across the header bottom above the tabs).
+_SUMMARY_STYLE = f"color: {GREY}; background: transparent; border: none;"
+_SUMMARY_STYLE_DANGER = f"color: {RED}; background: transparent; border: none;"
 
 
 def _grid_pitch() -> tuple[int, int]:
@@ -1791,11 +1802,14 @@ class MeasurementPanel(QtWidgets.QWidget):
                 # A path param: line edit + Browse button (native file/folder dialog) --
                 # the ONE reusable picker, never a bare hand-typed path.
                 picker = FluentPathEdit(
-                    "" if decl.default is None else str(decl.default),
+                    display_path(decl.default),                 # absolute, project-anchored (never bare)
                     mode=getattr(decl, "path_mode", "file"),
                     caption=f"Choose {decl.key}",
                     file_filter=getattr(decl, "file_filter", "All files (*)"),
-                    base_dir=getattr(decl, "base_dir", ""))
+                    base_dir=display_path(getattr(decl, "base_dir", "")))   # Browse lands in the real folder
+                placeholder = getattr(decl, "placeholder", "")
+                if placeholder:
+                    picker.setPlaceholderText(placeholder)     # makes a meaningful blank explicit
                 picker.setToolTip(decl.tooltip)
                 picker.changed.connect(lambda *_: self._refresh_start_enabled())
                 self.form.addRow(label_text, picker)
@@ -1932,8 +1946,10 @@ class MeasurementPanel(QtWidgets.QWidget):
                     entry[1].setValue(int(val))
                 elif tag == "int_opt":
                     entry[1].setText("" if val is None else str(int(val)))
-                elif tag in ("text", "path"):
+                elif tag == "text":
                     entry[1].setText("" if val is None else str(val))
+                elif tag == "path":
+                    entry[1].setText(display_path(val))   # absolute/project-anchored; blank stays blank
                 elif tag == "signal":
                     entry[1].setCurrentText("" if val is None else str(val))
                 elif tag == "float":
@@ -2796,8 +2812,12 @@ class TaskConsole(QtWidgets.QWidget):
         self.name_edit.setPlaceholderText("task name")
         self.name_edit.setFixedWidth(scaled_px(150, minimum=110))
         self.name_edit.textChanged.connect(self._mark_dirty)
-        self.summary = FluentLineEdit("")
-        self.summary.setEnabled(False)
+        # A READ-ONLY status readout (panel/signal/shot counts, or a node-error banner),
+        # not an input -- so it is a borderless label, never a bordered line-edit.  As a
+        # disabled line-edit its box border drew a long grey line across the header bottom
+        # that read as "a thin line above the tabs"; a label has no box.
+        self.summary = FluentLabel("")
+        self.summary.setStyleSheet(_SUMMARY_STYLE)
 
         self.kind_combo = FluentComboBox()
         # Add Panel offers EXACTLY the four kinds the user designs with -- nothing
@@ -3808,10 +3828,10 @@ class TaskConsole(QtWidgets.QWidget):
             node = faulted[0]
             who = (getattr(node, "prefix", "") or self._node_label(node) or "node").rstrip(":")
             n = int(getattr(node, "consecutive_errors", 1))
-            self.summary.set_danger(True)
+            self.summary.setStyleSheet(_SUMMARY_STYLE_DANGER)
             self.summary.setText(f"⚠ NODE ERROR ({who}, ×{n}): {node.last_error}"[:200])
         else:
-            self.summary.set_danger(False)
+            self.summary.setStyleSheet(_SUMMARY_STYLE)
             self.summary.setText(
                 f"{len(self.cards)} panels | {n_signals} signals | shot {self.hub.shot}"
                 f" | every {self.state.interval_ms} ms")

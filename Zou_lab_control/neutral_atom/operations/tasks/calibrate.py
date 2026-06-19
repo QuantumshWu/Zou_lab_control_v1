@@ -28,7 +28,9 @@ from ..task_registry import task
 # ``folder`` (a real data dir) + ``pulse_template`` (the shipped imaging program) are both
 # Browse-able paths the experimenter sees up front.
 DEFAULT_DATA_DIR = "calibrations"          # data + report folder (timestamped run subfolders)
-DEFAULT_PULSE_TEMPLATE = "imaging_template.json"   # the shipped, inspectable imaging program
+# Point at the REAL shipped file under pulses/ so the GUI field shows its full project path
+# (the form resolves it to <project>/pulses/imaging_template.json -- not a bare name).
+DEFAULT_PULSE_TEMPLATE = "pulses/imaging_template.json"   # the shipped, inspectable imaging program
 
 CALIBRATE_PARAMS = (
     ParamDecl("source", "source", "choice", default="live",
