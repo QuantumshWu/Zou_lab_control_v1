@@ -28,6 +28,7 @@ import numpy as np
 from ...core.analysis import positive_int
 from ...timing import PulseParam, enumerate_pulse_params
 from ...timing.sequence import snap_seconds_to_clock
+from ..logic import CalibrateReadoutTask          # the ONE template default + resolver (bare name -> pulses/)
 from ..measurement import MeasurementSpec, OtsuFidelityReducer, ParamDecl, axis_range_tuple
 from ..measurement_registry import measurement
 
@@ -131,15 +132,20 @@ def pulse_scan(readout) -> MeasurementSpec:
 
     s = readout.session
 
-    def build(*, template: str = "imaging_template.json", scan_target: str = "",
+    def build(*, template: str = CalibrateReadoutTask.DEFAULT_PULSE_TEMPLATE, scan_target: str = "",
               scan=(0.0, 50.0, 11), shots: int = 10, reduce: str = "counts", **_ignored):
-        from ..logic import CalibrateReadoutTask          # the ONE template resolver (bare name -> pulses/)
-
         kind, target = _split_target(scan_target)
         state = CalibrateReadoutTask._resolve_template(template)
         lo, hi, points = axis_range_tuple(scan, "scan")
-        values = np.asarray(np.linspace(float(lo), float(hi), int(points)), dtype=float)
         is_time = kind in _TIME_KINDS
+        # A duration/delay range must be >= 0: negative/zero time snaps to one clock tick
+        # (snap_seconds_to_clock's min_ticks floor), silently collapsing distinct points onto
+        # the same x.  Reject it up front rather than plot a misleading, repeated axis.  (A DAC
+        # target legitimately scans negative signed-LSB codes, so this guard is time-only.)
+        if is_time and (lo < 0 or hi < 0):
+            raise ValueError(f"a {kind} scan range must be >= 0 (got {lo}..{hi} {_TIME_UNIT}); "
+                             "negative durations/delays snap to one clock tick and collapse the axis.")
+        values = np.asarray(np.linspace(float(lo), float(hi), int(points)), dtype=float)
         unit = _TIME_UNIT if is_time else ""
         if is_time:
             # snap time values to the sequencer clock grid (the ONE place a software duration
@@ -169,7 +175,7 @@ def pulse_scan(readout) -> MeasurementSpec:
                                     calibration, reducer, n_frames=n_frames, shots_per_point=shots_per_point)
 
     params = (
-        ParamDecl("template", "Pulse template", "path", default="imaging_template.json",
+        ParamDecl("template", "Pulse template", "path", default=CalibrateReadoutTask.DEFAULT_PULSE_TEMPLATE,
                   path_mode="file", base_dir="pulses", file_filter="Pulse program (*.json);;All files (*)",
                   tooltip="The pulse program loaded each point; its periods / channels / DAC buses "
                           "populate the Target dropdown."),

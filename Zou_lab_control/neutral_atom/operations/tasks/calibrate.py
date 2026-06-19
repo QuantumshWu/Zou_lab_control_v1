@@ -13,6 +13,7 @@ ground truth -- a virtual run traverses the identical contract path a real run d
 
 from __future__ import annotations
 
+from ..logic import CalibrateReadoutTask
 from ..measurement import ParamDecl
 from ..task import TaskSpec
 from ..task_registry import task
@@ -28,9 +29,10 @@ from ..task_registry import task
 # ``folder`` (a real data dir) + ``pulse_template`` (the shipped imaging program) are both
 # Browse-able paths the experimenter sees up front.
 DEFAULT_DATA_DIR = "calibrations"          # the one data + report folder (re-running overwrites it)
-# Point at the REAL shipped file under pulses/ so the GUI field shows its full project path
-# (the form resolves it to <project>/pulses/imaging_template.json -- not a bare name).
-DEFAULT_PULSE_TEMPLATE = "pulses/imaging_template.json"   # the shipped, inspectable imaging program
+# The shipped imaging program, from the ONE canonical source (CalibrateReadoutTask): a real,
+# project-relative ``pulses/imaging_template.json`` the GUI field shows in full -- not a bare
+# name the path widget would anchor to the project root and display as a non-existent file.
+DEFAULT_PULSE_TEMPLATE = CalibrateReadoutTask.DEFAULT_PULSE_TEMPLATE
 
 CALIBRATE_PARAMS = (
     ParamDecl("source", "source", "choice", default="live",

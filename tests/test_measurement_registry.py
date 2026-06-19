@@ -37,7 +37,7 @@ def test_builtins_are_autodiscovered_in_order(exp):
     # Both built-ins come from operations/measurements/*.py (NOT a hardcoded list
     # in readout.py); order is deterministic (built-ins use small @measurement
     # order values, temperature before readout-duration).
-    assert names[:2] == ["Temperature", "Readout fidelity"]
+    assert names[:2] == ["Temperature", "Fidelity vs duration"]
 
 
 def test_register_makes_a_new_measurement_appear_then_unregister_removes(exp):

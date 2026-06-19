@@ -75,11 +75,13 @@ def _calibrated_virtual_session(grid=(2, 3)):
 def test_builtin_specs_build_unrun_scanned_measurements():
     exp = _calibrated_virtual_session()
     specs = exp.readout.measurement_specs()
-    assert [s.name for s in specs] == [
-        "Temperature",
-        "Readout fidelity",
-    ]
-    temp, dur = specs
+    by_name = {s.name: s for s in specs}
+    # The two purpose-built SCANNED readout measurements are auto-discovered alongside the
+    # generic "Pulse scan"; select them by name rather than position so adding a measurement
+    # never silently breaks this (the registry order/count is not the invariant here).
+    assert {"Temperature", "Fidelity vs duration"} <= set(by_name)
+    temp = by_name["Temperature"]
+    dur = by_name["Fidelity vs duration"]
     # x_key/y_key are the BARE quantity tokens; the slug (key) is the single source the
     # node prefixes every signal with -> temperature_t_off / temperature_survival.
     assert temp.key == "temperature"

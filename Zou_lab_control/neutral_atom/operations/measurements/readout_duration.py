@@ -31,7 +31,7 @@ def readout_duration_fidelity(readout) -> MeasurementSpec:
                   tooltip="Restrict the fidelity to one site index; leave blank to pool all sites."),
     )
     return MeasurementSpec(
-        name="Readout fidelity",
+        name="Fidelity vs duration",             # distinct from the one-shot "Readout fidelity" PROCESSOR
         key="readout",                           # signals: readout_detection_time / readout_fidelity
         params=params,
         result_labels=("Detection time", "Fidelity"),

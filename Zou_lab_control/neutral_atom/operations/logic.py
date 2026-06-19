@@ -637,13 +637,17 @@ class CalibrateReadoutTask(Task):
     # SETS its imaging exposure (with_imaging_exposure) -- "load a template, set the
     # duration, on/off, run".  The cali no longer chooses a readout METHOD: it computes
     # ALL methods (box / per-site PSF / uniform PSF) and the OccupancyProcessor picks one.
-    DEFAULT_PULSE_TEMPLATE = "imaging_template.json"
+    # The ONE canonical default imaging-template path (the cali task spec + the generic
+    # Pulse-scan measurement both reference THIS, so every GUI form shows the same real,
+    # project-relative ``pulses/imaging_template.json`` -- never a bare name that the path
+    # widget would anchor to the project ROOT and display as a non-existent file).
+    DEFAULT_PULSE_TEMPLATE = "pulses/imaging_template.json"
 
     @classmethod
     def _resolve_template(cls, pulse_template):
         """Load the imaging template: the given path if it is a real file, else the shipped
         template of that name in the repo ``pulses/`` folder (where the pulse GUI saves and
-        the Browse dialog opens -- so the default ``imaging_template.json`` is a REAL,
+        the Browse dialog opens -- so the default ``pulses/imaging_template.json`` is a REAL,
         inspectable file the experimenter can find), else the in-memory default."""
         from ..timing import PulseTableState, default_imaging_template
         text = str(pulse_template or "").strip() or cls.DEFAULT_PULSE_TEMPLATE
@@ -671,7 +675,7 @@ class CalibrateReadoutTask(Task):
     def __init__(self, hub: SignalHub, camera: CameraDevice, *, sequencer: object | None = None,
                  grid_shape: tuple[int, int] = (5, 7), roi_radius: int = 1,
                  sitemap_exposure: float = 0.05, readout_exposure: float = 0.02,
-                 pulse_template: str = "imaging_template.json",
+                 pulse_template: str = DEFAULT_PULSE_TEMPLATE,
                  calibration_frames: int = 30, threshold_frames: int = 100,
                  threshold_method: str = "otsu",
                  source: str = "live", folder: str = "calibrations",

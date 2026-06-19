@@ -208,3 +208,17 @@ def test_pulse_scan_missing_target_raises():
             spec.build(template="imaging_template.json", scan_target="", scan=(0.0, 1.0, 3))
     finally:
         exp.close()
+
+
+def test_pulse_scan_negative_time_range_raises():
+    """A duration/delay scan range with a negative bound fails LOUD: negative/zero times snap to
+    one clock tick (snap_seconds_to_clock's floor) and would silently collapse distinct points
+    onto the same x.  (A DAC target legitimately scans negative signed-LSB codes -- the guard is
+    time-only, so a duration/delay range must be >= 0.)"""
+    exp = _calibrated()
+    try:
+        spec = {s.name: s for s in exp.readout.measurement_specs()}["Pulse scan"]
+        with pytest.raises(ValueError):
+            spec.build(template="imaging_template.json", scan_target="duration:0", scan=(-0.04, 0.04, 5))
+    finally:
+        exp.close()
