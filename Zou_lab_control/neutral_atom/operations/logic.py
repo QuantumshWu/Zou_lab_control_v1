@@ -428,8 +428,11 @@ class OccupancyProcessor(Processor):
     comes from a prior calibrate-readout Task, exactly as on real hardware.
 
     Published per new frame (behind ``prefix``): ``occupied`` (N,), ``counts`` (N,),
-    ``rate`` scalar EMA loading rate, ``rate_sites`` (N,) per-site EMA, ``rate_grid``
-    grid map (when grid known), ``centers`` (N,2), ``thresholds`` (N,)."""
+    ``rate`` scalar loading fraction (cumulative running mean over all shots),
+    ``rate_sites`` (N,) per-site loading fraction, ``rate_grid`` grid map (when grid
+    known), ``centers`` (N,2), ``thresholds`` (N,).  The loading rate is the plain
+    occupancy fraction averaged over every shot so far -- the SAME quantity the Rb87
+    reference reports per batch, accumulated live; there is no smoothing/decay knob."""
 
     node_label = "occupancy"
     # ``frame_judged`` = the EXACT frame this occupancy was computed from, republished so
@@ -446,7 +449,7 @@ class OccupancyProcessor(Processor):
 
     def __init__(self, hub: SignalHub, *, calibration=None, calibration_source=None,
                  source: str = "frame", grid_shape: tuple[int, int] | None = None,
-                 ema: float = 0.05, method: str | None = None, prefix: str = ""):
+                 method: str | None = None, prefix: str = ""):
         super().__init__(hub, consumes=(source,), prefix=prefix)
         self.calibration = calibration
         # Optional lazy source: a callable -> calibration (or None while a calibrate
@@ -456,13 +459,14 @@ class OccupancyProcessor(Processor):
         self.calibration_source = calibration_source
         self.source = str(source)
         self.grid_shape = None if grid_shape is None else grid_shape_tuple(grid_shape)
-        self.ema = float(ema)
         # The READOUT method (box / per-site PSF / ...) is chosen HERE, not at calibration
         # time: one calibration carries every method's geometry + thresholds, and the
         # processor picks which to read with (None = the calibration's default).
         self.method = None if method in (None, "") else str(method)
-        self._rate = float("nan")
-        self._rate_sites: np.ndarray | None = None
+        # Loading rate = cumulative running mean of occupancy over every shot (the Rb87
+        # reference's per-batch loading fraction, accumulated live -- no smoothing/decay knob).
+        self._occ_sum: np.ndarray | None = None
+        self._n_shots = 0
 
     def _resolve_calibration(self):
         if self.calibration is None and self.calibration_source is not None:
@@ -477,17 +481,21 @@ class OccupancyProcessor(Processor):
         detection = calibration.detect(frame, method=self.method)   # the single readout contract
         occupied = np.asarray(detection.occupied, dtype=float).reshape(-1)
         counts = np.asarray(detection.counts, dtype=float).reshape(-1)
-        if self._rate_sites is None or np.isnan(self._rate):
-            self._rate_sites = occupied.copy()
-            self._rate = float(occupied.mean())
+        # Cumulative loading fraction = (sum of occupancy over all shots) / (n shots); per-site
+        # and overall.  A plain running mean -- no decay -- matching the reference's batch
+        # occupancy fraction.  (Reset by re-creating the node, e.g. Stop/Start.)
+        if self._occ_sum is None or self._occ_sum.shape != occupied.shape:
+            self._occ_sum = occupied.copy()
+            self._n_shots = 1
         else:
-            self._rate_sites = (1.0 - self.ema) * self._rate_sites + self.ema * occupied
-            self._rate = (1.0 - self.ema) * self._rate + self.ema * float(occupied.mean())
+            self._occ_sum += occupied
+            self._n_shots += 1
+        rate_sites = self._occ_sum / float(self._n_shots)
         out: dict[str, object] = {
             "occupied": occupied,
             "counts": counts,
-            "rate": self._rate,
-            "rate_sites": self._rate_sites.copy(),
+            "rate": float(rate_sites.mean()),
+            "rate_sites": rate_sites.copy(),
             "centers": np.asarray(self.calibration.centers, dtype=float),
             "thresholds": np.asarray(detection.thresholds, dtype=float).reshape(-1),
             # publish the judged frame ATOMICALLY with the occupancy -> the site map's
@@ -495,7 +503,7 @@ class OccupancyProcessor(Processor):
             "frame_judged": frame,
         }
         if self.grid_shape is not None and occupied.size == int(np.prod(self.grid_shape)):
-            out["rate_grid"] = self._rate_sites.reshape(self.grid_shape).copy()
+            out["rate_grid"] = rate_sites.reshape(self.grid_shape).copy()
         return out
 
     def output_specs(self) -> tuple[SignalSpec, ...]:
@@ -742,17 +750,10 @@ class CalibrateReadoutTask(Task):
             self.threshold_method = str(values["threshold_method"])
 
     def run(self, out: "TaskOutput") -> dict:
-        # "saved calibration": reload a finished calibration.json from the folder (no
-        # acquisition) -- the user reuses a saved centers+thresholds artifact.
-        if str(self.source) == "saved calibration":
-            from ..core.calibration import TrapCalibration
-            self.calibration = TrapCalibration.load(self._saved_calibration_path())
-            self._adopt()
-            out.publish(progress=1.0, stage=f"loaded calibration from {self.folder}")
-            centers = np.asarray(self.calibration.centers, dtype=float)
-            thr = np.asarray(self.calibration.thresholds, dtype=float).reshape(-1)
-            return {"centers": centers, "thresholds": thr, "n_sites": float(len(centers)),
-                    "report_dir": ""}
+        # TWO sources, both of which BUILD a calibration: a LIVE acquisition (camera + pulse
+        # template) or SAVED FRAMES on disk.  Reusing an already-saved calibration is NOT a
+        # calibration run -- the Judge-occupancy processor loads its calibration.json directly,
+        # so there is no "saved calibration" source here (that was a category error).
         if str(self.source) == "saved frames":
             calibration = self._run_from_folder(out)
         else:
@@ -761,6 +762,15 @@ class CalibrateReadoutTask(Task):
         self._adopt()                            # hand the calibration to the session NOW
         centers = np.asarray(self.calibration.centers, dtype=float)
         thr = np.asarray(self.calibration.thresholds, dtype=float).reshape(-1)
+        # Write the CANONICAL latest calibration to ``<folder>/calibration.json`` -- the stable,
+        # named file the Judge-occupancy processor defaults to, so calibrate-then-judge wires up
+        # with NO path typed yet the file in use is always named.  (The timestamped report below
+        # additionally keeps every run's reviewable artifacts.)
+        try:
+            Path(self.folder).mkdir(parents=True, exist_ok=True)
+            self.calibration.save(Path(self.folder) / "calibration.json")
+        except Exception:
+            pass
         # ALWAYS write the rb87-style report (per-site distribution + fidelity + site map
         # + a loadable calibration.json/npz) to a timestamped sub-folder of ``folder``, so
         # a calibration leaves reviewable + reloadable artifacts on disk.
@@ -771,18 +781,11 @@ class CalibrateReadoutTask(Task):
         return {"centers": centers, "thresholds": thr, "n_sites": float(len(centers)),
                 "report_dir": str(folder or "")}
 
-    def _saved_calibration_path(self) -> "Path":
-        """Locate the saved calibration to reload from ``folder``: the folder itself if it
-        is a .json/.npz file, else ``folder/calibration.json`` (the report's artifact)."""
-        p = Path(self.folder)
-        if p.suffix.lower() in (".json", ".npz"):
-            return p
-        return p / "calibration.json"
-
     def _adopt(self) -> None:
-        """Hand the just-produced calibration to the session via ``calibration_sink`` so a
-        decoupled OccupancyProcessor (reading ``readout.current``) starts judging sites
-        immediately -- the cali->occupancy connection, no path to type."""
+        """Hand the just-produced calibration to the session via ``calibration_sink`` so the
+        notebook API's ``readout.current`` reflects the latest calibration immediately (the
+        live OccupancyProcessor itself loads the canonical ``calibration.json`` this run also
+        writes -- an explicit named file, not an implicit session handoff)."""
         if self.calibration_sink is not None and self.calibration is not None:
             self.calibration_sink(self.calibration)
 

@@ -1807,9 +1807,6 @@ class MeasurementPanel(QtWidgets.QWidget):
                     caption=f"Choose {decl.key}",
                     file_filter=getattr(decl, "file_filter", "All files (*)"),
                     base_dir=display_path(getattr(decl, "base_dir", "")))   # Browse lands in the real folder
-                placeholder = getattr(decl, "placeholder", "")
-                if placeholder:
-                    picker.setPlaceholderText(placeholder)     # makes a meaningful blank explicit
                 picker.setToolTip(decl.tooltip)
                 picker.changed.connect(lambda *_: self._refresh_start_enabled())
                 self.form.addRow(label_text, picker)
@@ -2800,7 +2797,10 @@ class TaskConsole(QtWidgets.QWidget):
         root.setContentsMargins(margin, scaled_px(8), margin, scaled_px(8))
         root.setSpacing(scaled_px(7, minimum=5))
 
-        header_frame = FluentFrame()
+        # FLAT header (no drop shadow): the shadow's soft bottom edge cast a thin grey line
+        # into the gap right above the tab strip (the "line above the tabs").  The tab widget
+        # below carries its own card, so the header needs no elevation -- it is a plain top bar.
+        header_frame = FluentFrame(shadow=False)
         header_frame.setFixedHeight(scaled_px(48, minimum=38))
         header = QtWidgets.QHBoxLayout(header_frame)
         header.setContentsMargins(scaled_px(12), scaled_px(6), scaled_px(12), scaled_px(6))

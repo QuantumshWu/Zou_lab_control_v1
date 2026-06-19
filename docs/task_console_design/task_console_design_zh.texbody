@@ -200,11 +200,11 @@ reshape 表达式（\pyapi{value = <y>\_sites.reshape(ny, nx)}），而 \pyapi{s
 \section{Judge occupancy 反应式处理器}
 \pyapi{Judge occupancy}（\filepath{operations/processors/occupancy.py}）是目录里的主读出 processor，build 一个 \pyapi{OccupancyProcessor}。声明参数：
 \begin{description}
-  \item[\pyapi{calibration}（Calibration file）] 一个已存标定的路径（\pyapi{.npz}/\pyapi{.json}：站点中心 + 逐站阈值 [+ PSF 权重]，如 calibrate-readout task 的产物）；\tfocus{留空 = 用当前会话标定}（懒取：calibrate task 还在跑时 detector 先 no-op，标定就绪后自动接上）。
+  \item[\pyapi{calibration}（Calibration file）] detector 要 load 的\tfocus{已存标定文件}（\pyapi{.json}/\pyapi{.npz}：站点中心 + 逐站阈值 [+ PSF 权重]）。默认就是 calibrate-readout task 写的规范文件 \filepath{calibrations/calibration.json}，所以"标定完直接判占据"无需手敲路径，而\tfocus{当前用的是哪个 json 永远显式可见}（对齐 Rb87 参考的"标定即一个明确文件"，不是空着的"当前"谜团）。该文件还没在盘上时（calibrate task 可能正在跑、马上写它，或会话只在 notebook 里标定过没存盘）detector 暂时回退到\tfocus{当前会话标定}，文件一出现就 load 它。
   \item[\pyapi{source}（Frame signal）] 携带相机帧的 hub 信号名（默认 \pyapi{frame}）。
-  \item[\pyapi{ema}（Rate smoothing）] 滚动装载率的指数滑动平均权重。
+  \item[\pyapi{method}（Readout method）] box / per-site PSF / uniform PSF——在\tfocus{这里}（读出端）选；一份标定带齐所有方法的几何 + 阈值，processor 选其一读（cali 一次、读多法）。
 \end{description}
-它消费每个 \pyapi{frame}、经真 \pyapi{calibration.detect} republish 上面那组逐站信号；默认视图是按占据着色的 \pyapi{sites} 原子图。（目录里还有一个一次性的 \pyapi{Readout fidelity} processor，在一个\tfocus{已存文件夹}上跑逐站读出保真度刻画——见下面"扩展到真实设备"。）
+它消费每个 \pyapi{frame}、经真 \pyapi{calibration.detect} republish 上面那组逐站信号（含 \pyapi{rate} = 占据的\tfocus{累计运行均值}装载率，即 Rb87 参考的逐批装载分数累计——无平滑/衰减旋钮）；默认视图是按占据着色的 \pyapi{sites} 原子图。（目录里还有一个一次性的 \pyapi{Readout fidelity} processor，在一个\tfocus{已存文件夹}上跑逐站读出保真度刻画——见下面"扩展到真实设备"。）
 
 \section{多节点做 A$-$B}
 给同一台实验的两路读出分别用无前缀与 \pyapi{b\_} 前缀的节点，于是 \pyapi{value = rate\_grid - b\_rate\_grid} 这种跨实验相减开箱即用。
@@ -216,12 +216,12 @@ reshape 表达式（\pyapi{value = <y>\_sites.reshape(ny, nx)}），而 \pyapi{s
 \section{calibrate-readout task 的完整参数设计}
 \pyapi{CalibrateReadoutTask}（\filepath{operations/logic.py}）跑\tfocus{真}的 sitemap + 逐站阈值标定——就是 notebook 的 \pyapi{exp.readout.sitemap()} / \pyapi{thresholds()} 流程——产出一个 \pyapi{TrapCalibration} 供下游 \pyapi{OccupancyProcessor} 用。所有可调参数在 \pyapi{operations/tasks/calibrate.py} 的 \pyapi{CALIBRATE\_PARAMS} 声明一次（GUI 自动表单与 \pyapi{readout.calibrate\_task(**values)} 同读）：
 \begin{description}
-  \item[\pyapi{source} = live / folder] \pyapi{live} = 现在开相机直接采图；\pyapi{folder}（+ \pyapi{data\_dir}）= 用已存文件夹的图（\pyapi{index\_run} 读 \pyapi{img<n>}）标定。
-  \item[两条 pulse（两个 readout duration）] \tfocus{sitemap 这一遍用较长 readout}（更多光子 → site 中心 + PSF 拟合更干净），\tfocus{threshold 这一遍用实际 readout}（阈值要在真实读出条件下学）。各自：\pyapi{sitemap\_exposure}/\pyapi{readout\_exposure}（默认序列时长）或 \pyapi{sitemap\_pulse}/\pyapi{readout\_pulse}（已存 \pyapi{PulseTableState} 的 \pyapi{.json}，经 \pyapi{PulseTableState.load().to\_sequence()} 当成像脉冲，空 = 默认序列）。\pyapi{\_imaging\_seq(pulse, exposure, name)} 单点选择。
-  \item[\pyapi{mode} = box / per-site PSF / uniform PSF] 经 \pyapi{MODE\_TO\_SITEMAP\_METHOD} 解析为 sitemap method \pyapi{box}/\pyapi{psf}/\pyapi{uniform\_psf}。
-  \item[\pyapi{threshold\_method} = otsu / bimodal] otsu = 单点分割；bimodal = 逐站暗/亮高斯核拟合。
-  \item[\pyapi{save\_path} / \pyapi{load\_path}] 存 / 取标定（\pyapi{TrapCalibration} = 站点中心 + 逐站阈值，经 \pyapi{TrapCalibration.save}/\pyapi{load}）；给 \pyapi{load\_path} 直接复用已存 site+threshold、\tfocus{不重新采图}。
-  \item[\pyapi{calibration\_frames} / \pyapi{threshold\_frames} / \pyapi{roi\_radius} / \pyapi{grid\_shape}] 模板帧数 / 学阈值帧数 / 逐站方 ROI 半宽 / 阵列形状。
+  \item[\pyapi{source} = live / saved frames] 标定用的图\tfocus{从哪来}。\pyapi{live} = 现在开相机直接采图并写标定；\pyapi{saved frames} = 用 \pyapi{folder} 里已存的原始帧（\pyapi{index\_run} 读 \pyapi{img1.npy, img2.npy, ...}，如真机此前一次 run 或 \pyapi{na.write\_virtual\_run}）标定。\tfocus{没有 "saved calibration" 这个 source}：复用一份已存标定不是"再标定一次"——直接让 Judge-occupancy processor load 它的 \filepath{calibration.json} 即可（那是个 category error，已删）。
+  \item[\pyapi{folder}] 唯一的数据目录（输入 + 输出）。\pyapi{live} \tfocus{写}这里：规范的 \filepath{calibration.json}（detector 的默认输入）+ 一个带时间戳的分布/保真度报告子文件夹；\pyapi{saved frames} \tfocus{读}这里的原始帧。默认是项目的 \filepath{calibrations/} 目录。
+  \item[\pyapi{pulse\_template}] 要 LOAD 的成像脉冲程序（pulse GUI 存的真 \pyapi{PulseTableState} \pyapi{.json}）；每一遍把它 \pyapi{'image'} 窗口的时长设成该遍曝光——"载入模板、设时长、跑"。默认指向真实的 \filepath{pulses/imaging\_template.json}。
+  \item[两个曝光] \tfocus{sitemap 这一遍用较长曝光}（更多光子 → site 中心 + PSF 拟合更干净）= \pyapi{sitemap\_exposure}；\tfocus{threshold 这一遍用实际读出曝光}（阈值要在真实读出条件下学）= \pyapi{readout\_exposure}；两者都设到上面模板的 \pyapi{'image'} 窗口。
+  \item[\pyapi{threshold\_method} = otsu / bimodal] otsu = 单点分割；bimodal = 逐站暗/亮高斯核拟合。（cali \tfocus{不}选读出 method：它把 box / per-site PSF / uniform PSF 全算进一份标定，由 OccupancyProcessor 选其一。）
+  \item[\pyapi{calibration\_frames} / \pyapi{threshold\_frames} / \pyapi{roi\_radius} / \pyapi{grid\_shape}] 模板（参考）帧数 / 学阈值帧数 / 逐站方 ROI 半宽 / 阵列形状。
 \end{description}
 同一 \pyapi{TrapCalibration} 契约（\pyapi{calibrate\_sitemap\_from\_images} / \pyapi{calibrate\_threshold\_from\_images}），虚拟与真机只差相机帧。中途经 \pyapi{TaskOutput} 把模板帧 + 进度发到专用面板（\pyapi{mid\_run = ("frame","progress")}，\pyapi{cal\_} 命名空间），\tfocus{不进 hub}。
 

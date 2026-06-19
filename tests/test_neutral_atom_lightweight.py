@@ -6948,7 +6948,7 @@ def test_user_composed_loading_readout_publishes_standard_signals():
     from Zou_lab_control.neutral_atom.operations.logic import (
         CalibrateReadoutTask, CameraMeasurement, OccupancyProcessor)
 
-    def _build(hub, *, prefix, seed, loading_probability, ema):
+    def _build(hub, *, prefix, seed, loading_probability):
         trap = VirtualTrapArray(grid_shape=(5, 7), loading_probability=loading_probability, seed=seed)
         camera = VirtualCamera(trap, exposure=0.02)
         task = CalibrateReadoutTask(hub, camera, grid_shape=trap.grid_shape,
@@ -6957,12 +6957,13 @@ def test_user_composed_loading_readout_publishes_standard_signals():
                                     prefix=f"{prefix}cal_")
         task.run_to_completion()
         cam = CameraMeasurement(hub, camera, prefix=prefix)
+        # loading rate = cumulative running mean of occupancy (no smoothing knob)
         det = OccupancyProcessor(hub, calibration=task.calibration, source=f"{prefix}frame",
-                              grid_shape=trap.grid_shape, ema=ema, prefix=prefix)
+                              grid_shape=trap.grid_shape, prefix=prefix)
         return cam, det
 
     hub = SignalHub()
-    cam, det = _build(hub, prefix="", seed=5, loading_probability=0.55, ema=0.2)
+    cam, det = _build(hub, prefix="", seed=5, loading_probability=0.55)
     for _ in range(60):
         cam.step()      # camera measurement publishes a frame
         det.step()      # detect processor runs the REAL per-frame detect
@@ -6980,7 +6981,7 @@ def test_user_composed_loading_readout_publishes_standard_signals():
     occupancy = hub.history("occupied", 60)
     assert 0.30 <= float(occupancy.mean()) <= 0.80
     # a prefixed second composition coexists in the same hub for A-B expressions
-    cam_b, det_b = _build(hub, prefix="b_", seed=6, loading_probability=0.3, ema=0.2)
+    cam_b, det_b = _build(hub, prefix="b_", seed=6, loading_probability=0.3)
     for _ in range(10):
         cam_b.step()
         det_b.step()

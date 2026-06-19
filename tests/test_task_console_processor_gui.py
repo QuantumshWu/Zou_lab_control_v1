@@ -93,8 +93,9 @@ def test_processor_node_runs_and_publishes(tmp_path):
 def test_judge_occupancy_node_reacts_to_frames(tmp_path):
     """The REACTIVE 'Judge occupancy' processor consumes each live ``frame`` and
     republishes per-site occupancy/centers via the REAL ``calibration.detect`` (no
-    folder, no one-shot).  Its calibration param defaults blank = the session
-    calibration; a Plot panel can then read its published signals."""
+    folder, no one-shot).  Its calibration param is an EXPLICIT saved file (defaulting to
+    the canonical calibration.json the Calibrate task writes); a Plot panel can then read
+    its published signals."""
     import Zou_lab_control.neutral_atom as na
     from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
@@ -111,11 +112,20 @@ def test_judge_occupancy_node_reacts_to_frames(tmp_path):
     try:
         row, editor = _add_processor_node(console, "Judge occupancy")
         assert row.node.kind == "processor"
-        # default STOPPED + defaults PREFILLED from the spec (never blank-to-guess):
-        # calibration blank = session calibration; source/ema show their declared defaults.
+        # default STOPPED + defaults PREFILLED from the spec (never blank-to-guess): the
+        # calibration field shows the canonical calibration.json path (NOT a blank mystery),
+        # source shows its declared default.  There is no invented `ema` smoothing param.
         assert console._logic_nodes[id(row)] is None
         vals = editor.collect_values()
-        assert vals["calibration"] == "" and vals["source"] == "frame" and vals["ema"] == 0.05
+        assert vals["calibration"].replace("\\", "/").endswith("calibrations/calibration.json")
+        assert vals["source"] == "frame"
+        assert "ema" not in vals
+
+        # point the detector at a REAL saved calibration file (the reference's explicit-file
+        # model) -- the canonical default path may not exist in a fresh checkout.
+        cal_file = tmp_path / "cal.json"
+        exp.readout.save(str(cal_file))
+        editor.form._widgets["calibration"][1].setText(str(cal_file))
 
         # a camera measurement publishes `frame`; the occupancy processor reacts to it
         cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer)

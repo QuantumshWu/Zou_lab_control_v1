@@ -438,8 +438,11 @@ def test_plot_edit_shows_producing_processor_param_form():
         editor = console._panel_editors[id(card)]
         assert editor.source_form is not None                          # not an empty source section
         vals = editor.source_form.collect_values()
-        assert {"calibration", "source", "ema"} <= set(vals)           # the processor's full params
-        assert vals["source"] == "frame" and vals["calibration"] == ""  # prefilled defaults (#3)
+        assert {"calibration", "source"} <= set(vals)                  # the processor's params
+        assert "ema" not in vals                                        # no invented smoothing knob
+        assert vals["source"] == "frame"                               # prefilled default (#3)
+        # calibration prefilled with the canonical file path -- never a blank mystery
+        assert vals["calibration"].replace("\\", "/").endswith("calibrations/calibration.json")
     finally:
         console.shutdown()
         exp.close()

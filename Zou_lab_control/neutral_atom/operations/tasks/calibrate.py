@@ -34,15 +34,19 @@ DEFAULT_PULSE_TEMPLATE = "pulses/imaging_template.json"   # the shipped, inspect
 
 CALIBRATE_PARAMS = (
     ParamDecl("source", "source", "choice", default="live",
-              choices=("live", "saved frames", "saved calibration"),
-              tooltip="live = acquire now (camera + pulse template) and SAVE the result under `folder`; "
-                      "saved frames = calibrate from frames already in `folder`; "
-                      "saved calibration = reload a finished calibration.json from `folder` (no acquisition)."),
+              choices=("live", "saved frames"),
+              tooltip="WHERE the frames to calibrate from come from.  "
+                      "live = acquire now (camera + pulse template) and write the calibration; "
+                      "saved frames = build the calibration from raw frames already on disk in "
+                      "`folder` (named img1.npy, img2.npy, ... -- e.g. a prior real run, or "
+                      "na.write_virtual_run).  (To REUSE a finished calibration you do NOT "
+                      "calibrate again: point the Judge-occupancy processor at its calibration.json.)"),
     ParamDecl("folder", "folder", "path", default=DEFAULT_DATA_DIR, required=True, path_mode="dir",
               base_dir=DEFAULT_DATA_DIR,
-              tooltip="The ONE data directory (input + output).  A live run writes its calibration "
-                      "+ distribution/fidelity report to a timestamped sub-folder here; the saved-* "
-                      "sources read frames / calibration.json from here."),
+              tooltip="The ONE data directory (input + output).  source=live WRITES here: the "
+                      "calibration (calibration.json) + a timestamped distribution/fidelity report "
+                      "sub-folder.  source=saved frames READS the raw frame files (img1.npy, ...) "
+                      "from here.  Defaults to the project `calibrations/` folder."),
     ParamDecl("pulse_template", "pulse template", "path", default=DEFAULT_PULSE_TEMPLATE,
               path_mode="file", file_filter="Pulse program (*.json);;All files (*)", base_dir="pulses",
               tooltip="The imaging pulse program to LOAD (a real PulseTableState .json from the pulse "

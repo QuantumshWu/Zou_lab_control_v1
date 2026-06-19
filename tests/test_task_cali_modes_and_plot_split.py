@@ -4,10 +4,11 @@ These are exactly the behaviours that silently regress, so they are pinned here
 (the repo rule: a mechanically-enforceable requirement is a test, not a doc line):
 
   * the calibrate TASK really honours its declared params -- it is NOT cosmetic:
-      - source = "live"             -> acquire now (camera + imaging pulse at the given exposure)
-                                       and write the report (incl. a reloadable calibration.json) to `folder`;
-      - source = "saved frames"     -> calibrate from frames already in `folder`;
-      - source = "saved calibration"-> reload a finished calibration.json from `folder`, NO acquisition;
+      - source = "live"             -> acquire now (camera + imaging pulse at the given exposure),
+                                       write the canonical `folder/calibration.json` + a report;
+      - source = "saved frames"     -> calibrate from raw frames already in `folder`;
+        (there is NO "saved calibration" source: reusing a finished calibration is not a
+        calibration run -- the Judge-occupancy processor loads its calibration.json directly.)
       - the cali computes EVERY readout model (box / per-site PSF / uniform PSF) into ONE
         calibration; the OccupancyProcessor picks one at read time -- there is no `mode` param;
       - threshold = otsu / bimodal;
@@ -88,8 +89,13 @@ def test_calibrate_task_computes_every_method_processor_picks(threshold_method):
         exp.close()
 
 
-def test_calibrate_task_live_then_reload_skips_acquisition(tmp_path):
+def test_calibrate_task_live_writes_canonical_calibration_json_for_the_detector(tmp_path):
+    """A live calibration writes the CANONICAL ``folder/calibration.json`` -- the stable,
+    named file the Judge-occupancy detector loads -- plus a timestamped report sub-folder.
+    Reusing it is NOT a calibration run: the file just loads (here via TrapCalibration.load,
+    in the app via the processor's calibration field), with NO second acquisition."""
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.neutral_atom.core.calibration import TrapCalibration
 
     exp = _calibrated()
     try:
@@ -98,18 +104,15 @@ def test_calibrate_task_live_then_reload_skips_acquisition(tmp_path):
             SignalHub(), source="live", folder=str(folder),
             calibration_frames=3, threshold_frames=12)
         made.run_to_completion()
-        # a live run writes its report (incl. a reloadable calibration.json) to a
-        # timestamped sub-folder of `folder`
+        # the canonical latest calibration the detector defaults to
+        canonical = folder / "calibration.json"
+        assert canonical.exists()
+        # plus a timestamped report sub-folder with its own reviewable artifacts
         report_dir = Path(made.result["report_dir"])
         assert report_dir.exists() and (report_dir / "calibration.json").exists()
-
-        # source="saved calibration" restores the SAME calibration with NO acquisition
-        loaded = exp.readout.calibrate_task(
-            SignalHub(), source="saved calibration", folder=str(report_dir))
-        loaded.run_to_completion()
-        assert loaded.result["report_dir"] == ""          # reload does not write a new report
-        assert np.allclose(np.asarray(loaded.calibration.centers),
-                           np.asarray(made.calibration.centers))
+        # reloading is a plain file load (no calibration re-run): same centers
+        loaded = TrapCalibration.load(canonical)
+        assert np.allclose(np.asarray(loaded.centers), np.asarray(made.calibration.centers))
     finally:
         exp.close()
 

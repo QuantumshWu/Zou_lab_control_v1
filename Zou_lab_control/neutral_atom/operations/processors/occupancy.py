@@ -1,11 +1,15 @@
 """Per-frame occupancy judgement -- the REACTIVE live-readout "func" node.
 
 Given a calibration (site centers + per-site thresholds [+ PSF weights]) this consumes
-each camera ``frame`` signal and republishes per-site occupancy / counts + a rolling
-loading rate, through the SAME ``calibration.detect`` contract the notebook / real
-readout uses (it re-implements no detection math).  The calibration is LOADED from a
-saved file (a Calibrate-readout task's artifact) or, when blank, taken from the current
-session calibration -- so this node is decoupled from HOW the calibration was produced.
+each camera ``frame`` signal and republishes per-site occupancy / counts + the cumulative
+loading fraction, through the SAME ``calibration.detect`` contract the notebook / real
+readout uses (it re-implements no detection math).  The calibration is an EXPLICIT, always-
+named FILE (a Calibrate-readout task's artifact) -- the field defaults to the canonical
+``calibrations/calibration.json`` the Calibrate task writes, so a calibrate-then-judge flow
+needs no path typed, yet the file in use is always shown (never a blank mystery, matching the
+Rb87 reference's explicit-file model).  Until that file is on disk the detector falls back to
+the current session calibration, so a notebook-calibrated or mid-calibration session also
+judges immediately.
 
 Reactive: it runs beside the camera measurement that publishes ``frame``, emitting only
 when a new frame arrives.  Its output is a PROCESSOR signal on the hub (virtual==real:
@@ -18,14 +22,20 @@ from ..logic import OccupancyProcessor
 from ..processor import ParamDecl, ProcessorSpec
 from ..processor_registry import processor
 
+# The canonical calibration file the Calibrate-readout task writes (its latest result), and
+# the detector's default input -- so calibrate-then-judge wires up with no path typed, while
+# the file in use is always explicitly named (never a blank "current" mystery).
+DEFAULT_CALIBRATION_FILE = "calibrations/calibration.json"
+
 
 @processor(order=5)   # occupancy is the primary live-readout processor
 def judge_occupancy(readout) -> ProcessorSpec:
     """Judge per-site occupancy from each live ``frame`` using a loaded calibration.
 
-    Publishes ``occupied`` (N,), ``counts`` (N,), ``rate`` (scalar EMA loading rate),
-    ``rate_sites`` (N,), ``rate_grid`` (grid map), ``centers`` (N, 2) and ``thresholds``
-    (N,); the default view is the per-site 'sites' atom map coloured by occupancy."""
+    Publishes ``occupied`` (N,), ``counts`` (N,), ``rate`` (scalar cumulative loading
+    fraction), ``rate_sites`` (N,), ``rate_grid`` (grid map), ``centers`` (N, 2) and
+    ``thresholds`` (N,); the default view is the per-site 'sites' atom map coloured by
+    occupancy."""
 
     # User-facing readout-method names -> the calibration's method keys.  ONE calibration
     # carries all methods (box / per-site PSF / uniform PSF); the READOUT method is chosen
@@ -33,12 +43,14 @@ def judge_occupancy(readout) -> ProcessorSpec:
     method_labels = {"box": "box", "per-site PSF": "psf", "uniform PSF": "uniform_psf"}
 
     params = (
-        ParamDecl("calibration", "Calibration file", "path", default="", path_mode="file",
-                  file_filter="Calibration (*.json *.npz);;All files (*)", base_dir="calibrations",
-                  placeholder="(blank → current session calibration)",
-                  tooltip="A saved calibration (.npz/.json: site centers + per-site thresholds "
-                          "[+ PSF kernels]) -- e.g. a Calibrate-readout task's saved artifact.  "
-                          "Blank = use the CURRENT session calibration."),
+        ParamDecl("calibration", "Calibration file", "path", default=DEFAULT_CALIBRATION_FILE,
+                  path_mode="file", file_filter="Calibration (*.json *.npz);;All files (*)",
+                  base_dir="calibrations", required=True,
+                  tooltip="The saved calibration the detector LOADS (.json/.npz: site centers + "
+                          "per-site thresholds [+ PSF kernels]).  Defaults to the canonical file "
+                          "the Calibrate-readout task writes (calibrations/calibration.json), so "
+                          "calibrate-then-judge needs no path typed; Browse to use another.  Until "
+                          "this file exists the detector uses the current session calibration."),
         ParamDecl("source", "Frame signal", "signal", default="frame",
                   tooltip="Hub signal carrying each camera frame to judge (a processor's input, "
                           "picked like a plot's signal)."),
@@ -48,26 +60,27 @@ def judge_occupancy(readout) -> ProcessorSpec:
                           "per-site PSF = one matched filter per site; uniform PSF = one shared "
                           "kernel.  The calibration must carry this method (the Calibrate task "
                           "computes all of them)."),
-        ParamDecl("ema", "Rate smoothing (EMA)", "float", default=0.05, lo=0.0, hi=1.0,
-                  tooltip="Exponential-moving-average weight for the rolling loading rate "
-                          "(0 = freeze the first value, 1 = no smoothing)."),
     )
 
     def make_node(hub, *, prefix: str = "", **values):
-        # Reactive node reuses the real readout pipeline (calibration.detect); the
-        # calibration is LOADED here (saved file) or DEFERRED to the session calibration
-        # -- the console never re-implements detection (single readout contract).
+        # Reactive node reuses the real readout pipeline (calibration.detect); the console never
+        # re-implements detection.  The calibration field is an EXPLICIT, always-named FILE (the
+        # canonical calibration.json by default -- never a blank "current" mystery).  Loading is
+        # lazy: prefer that file; while it is not on disk yet (a Calibrate task may be mid-run,
+        # about to write it, or the session was calibrated in a notebook without saving) fall back
+        # to the in-memory session calibration, and keep retrying until the named file appears.
         from ...core.calibration import TrapCalibration
+        from Zou_lab_control._paths import resolve_under_project
 
-        cal_path = str(values.get("calibration", "")).strip()
-        if cal_path:
-            calibration = TrapCalibration.load(cal_path)
-            calibration_source = None
-        else:
-            calibration = None
-            # lazy: pick up the session calibration once it exists (a Calibrate-readout
-            # task may still be running) -- the detector no-ops until then.
-            calibration_source = lambda: readout.current
+        cal_path = resolve_under_project(values.get("calibration", "") or DEFAULT_CALIBRATION_FILE)
+
+        def _load_calibration():
+            if cal_path.is_file():
+                return TrapCalibration.load(cal_path)
+            return readout.current        # graceful fallback until the named file exists
+
+        calibration = _load_calibration()
+        calibration_source = None if calibration is not None else _load_calibration
         try:
             grid = readout._session._grid_shape(None)
         except Exception:
@@ -75,7 +88,7 @@ def judge_occupancy(readout) -> ProcessorSpec:
         method = method_labels.get(str(values.get("method", "box")), "box")
         return OccupancyProcessor(
             hub, calibration=calibration, calibration_source=calibration_source,
-            source=str(values.get("source", "frame")), ema=float(values.get("ema", 0.05)),
+            source=str(values.get("source", "frame")),
             method=method, grid_shape=grid, prefix=prefix)
 
     return ProcessorSpec(

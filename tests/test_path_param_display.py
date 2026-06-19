@@ -1,9 +1,9 @@
 """Contract: a design param panel never shows a file/folder field you cannot interpret.
 
 Every ``kind="path"`` field renders an UNAMBIGUOUS, project-anchored path -- an absolute
-path, never a bare CWD-relative name like ``calibrations`` -- and a path field whose blank
-has meaning (the occupancy processor: blank = current session calibration) declares that
-meaning with a PLACEHOLDER instead of an empty mystery box.  This pins the user's two
+path, never a bare CWD-relative name like ``calibrations`` and never a blank mystery box
+(the occupancy processor's calibration file defaults to the canonical calibration.json the
+Calibrate task writes, so the file in use is always named).  This pins the user's two
 requirements: (1) explicit, readable defaults in every file param field; (2) one shared
 path helper (:mod:`Zou_lab_control._paths`) so display + on-disk resolution agree.
 
@@ -95,17 +95,23 @@ def test_calibrate_task_path_fields_show_absolute_project_paths():
         exp.close()
 
 
-def test_occupancy_calibration_blank_declares_its_meaning_with_a_placeholder():
-    """The judge-occupancy processor's ``Calibration file`` is intentionally blank (blank =
-    use the current session calibration), but it must NOT be an empty mystery box: it shows
-    a placeholder spelling that out, so the operator always knows what is loaded."""
+def test_occupancy_calibration_field_names_the_canonical_file_not_blank():
+    """The judge-occupancy processor's ``Calibration file`` is never a blank mystery box: it
+    opens prefilled with the canonical ``calibrations/calibration.json`` (absolute, project-
+    anchored) the Calibrate task writes -- so the operator always sees which json is loaded,
+    matching the Rb87 reference's explicit-file model (no implicit 'current' calibration)."""
+    from Zou_lab_control._paths import PROJECT_ROOT
+
     exp, console = _console()
     try:
         spec = next(s for s in exp.readout.processor_specs() if "occup" in s.name.lower())
         editor = _open_editor(console, ("processor", spec.name))
-        picker = editor.form._widgets["calibration"][1]
-        assert picker.text() == ""                            # blank default (defer to session)
-        assert "session" in picker.edit.placeholderText().lower()   # but the blank is explained
+        text = editor.form._widgets["calibration"][1].text()
+        assert text != ""                                          # NOT blank
+        p = Path(text)
+        assert p.is_absolute() and p == PROJECT_ROOT / "calibrations" / "calibration.json"
+        # there is no invented `ema` smoothing param on this processor
+        assert "ema" not in editor.form._widgets
     finally:
         console.shutdown()
         exp.close()
