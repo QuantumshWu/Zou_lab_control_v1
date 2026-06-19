@@ -58,21 +58,6 @@ else:
             # display-only panel (Monitor card, NO selectors) lets the dashboard
             # board scroll under the cursor instead of swallowing the wheel.
             self._zlc_isolate_wheel = bool(isolate_wheel)
-            # DETACH the figure from pyplot before this Qt canvas adopts it.  In a notebook the
-            # active backend is ``%matplotlib widget`` (ipympl): a figure built by ``plt.figure``
-            # carries an ipympl manager that keeps RESIZING it from the notebook output area, which
-            # fights this canvas's fixed-inches geometry -- so an embedded panel (e.g. a task's
-            # mid-run Monitor) renders at the wrong size in a notebook but is fine in the standalone
-            # .bat (plain Agg, no such manager).  Unregistering its Gcf manager makes THIS Qt canvas
-            # the figure's sole owner; harmless when there is no manager (the .bat / Agg case).
-            try:
-                from matplotlib._pylab_helpers import Gcf
-                num = getattr(getattr(figure, "canvas", None), "manager", None)
-                num = getattr(num, "num", None)
-                if num is not None:
-                    Gcf.figs.pop(num, None)
-            except Exception:
-                pass
             super().__init__(figure)
             # the backend syncs only in showEvent / on screen signals (never
             # offscreen) -- establish the invariants NOW
