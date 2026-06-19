@@ -288,6 +288,39 @@ def test_calibrate_task_bool_param_renders_as_toggle_switch():
         exp.close()
 
 
+def test_pulse_scan_target_combo_populates_from_template_dependent_field():
+    """The Pulse-scan measurement's ``scan_target`` (kind ``pulse_param``) renders as a
+    DEPENDENT combo: its choices are introspected from the pulse template named in the sibling
+    ``template`` path field, each item's data is the ``"kind:target"`` token the build consumes,
+    and changing the template repopulates it (the form's inter-field reactivity)."""
+    from Zou_lab_control.frontend.task_console import MeasurementPanel
+
+    exp = _calibrated()
+    try:
+        spec = {s.name: s for s in exp.readout.measurement_specs()}["Pulse scan"]
+        panel = MeasurementPanel([spec], single=True)
+        tag, combo = panel._widgets["scan_target"]
+        assert tag == "pulse_param"
+        assert combo.count() >= 2                                  # populated from the template's params
+        # items carry a "kind:target" token as data, a human label as text
+        tokens = [combo.itemData(i) for i in range(combo.count())]
+        assert any(str(t).startswith("duration:") for t in tokens)
+        assert any(str(t).startswith("delay:") for t in tokens)   # delays included (software, non-slot)
+        combo.setCurrentIndex(1)
+        token = panel.collect_values()["scan_target"]
+        assert ":" in token                                        # collected as the kind:target token
+        # the combo is DEPENDENT on the template field: repopulating (the path-change reaction)
+        # keeps it populated via the single template resolver and PRESERVES the current pick --
+        # it never silently empties to a blank mystery.
+        panel._repopulate_pulse_param("scan_target")
+        assert combo.count() >= 2
+        assert panel.collect_values()["scan_target"] == token      # selection survives a reload
+    finally:
+        if hasattr(panel, "shutdown"):
+            panel.shutdown()
+        exp.close()
+
+
 # ------------------------------------------------- camera measurement: editable region
 def test_camera_measurement_region_is_editable_and_applies_to_virtual():
     """The camera measurement exposes its ROI as an editable ``region`` (the SAME

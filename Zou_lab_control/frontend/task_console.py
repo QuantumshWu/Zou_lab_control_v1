@@ -1741,6 +1741,10 @@ class MeasurementPanel(QtWidgets.QWidget):
     def _rebuild_form(self) -> None:
         """Rebuild the parameter form for the currently selected measurement."""
         self._clear_form()
+        # decls for the dependent ``pulse_param`` combos, keyed by their field key (kept
+        # OUT of self._widgets so its entries stay a uniform (tag, widget) shape -- set_running
+        # iterates entry[1:] and would crash on a ParamDecl).
+        self._pulse_param_decls: dict[str, object] = {}
         spec = self.current_spec()
         if spec is None:
             return
@@ -1839,6 +1843,20 @@ class MeasurementPanel(QtWidgets.QWidget):
                 combo.activated.connect(lambda *_: self._refresh_start_enabled())
                 self.form.addRow(label_text, combo)
                 self._widgets[decl.key] = ("signal", combo)
+            elif kind == "pulse_param":
+                # WHICH parameter of a pulse template to sweep: a DEPENDENT combo whose
+                # choices are introspected from the template FILE named in decl.depends_on
+                # (its periods / channels / DAC buses), repopulated whenever that path changes.
+                # Each item shows the human label; its data is the "kind:target" token the
+                # measurement build() consumes.  Editable so a saved target round-trips even
+                # before the template loads.
+                combo = FluentComboBox()
+                combo.setEditable(True)
+                combo.setToolTip(decl.tooltip)
+                combo.activated.connect(lambda *_: self._refresh_start_enabled())
+                self.form.addRow(label_text, combo)
+                self._widgets[decl.key] = ("pulse_param", combo)
+                self._pulse_param_decls[decl.key] = decl
             elif kind == "text":
                 edit = FluentLineEdit("" if decl.default is None else str(decl.default))
                 edit.setMinimumWidth(scaled_px(160, minimum=120))   # grows with the field; no cutoff
@@ -1851,7 +1869,53 @@ class MeasurementPanel(QtWidgets.QWidget):
                 spin = self._spin(decl, integer=False)
                 self.form.addRow(label_text, spin)
                 self._widgets[decl.key] = ("float", spin)
+        # Wire each pulse_param combo to its source template field (done AFTER the build loop
+        # so the source field exists regardless of declaration order), then fill it once.  This
+        # is the form's only inter-field reactivity: changing the template repopulates the
+        # scan-target choices.
+        for key, decl in self._pulse_param_decls.items():
+            src = self._widgets.get(getattr(decl, "depends_on", ""))
+            if src and src[0] == "path":
+                src[1].changed.connect(lambda *_a, k=key: self._repopulate_pulse_param(k))
+            self._repopulate_pulse_param(key)
         self._refresh_start_enabled()
+
+    def _repopulate_pulse_param(self, key: str) -> None:
+        """Fill a ``pulse_param`` combo from the pulse template named in its ``depends_on``
+        path field: each item's text is the human label, its data the ``"kind:target"`` token
+        the measurement consumes.  Preserves the current selection across a reload (the editable
+        combo lets an unknown saved target round-trip).  A bad/empty path -> empty combo (Start
+        stays disabled via ``required``)."""
+        entry = self._widgets.get(key)
+        decl = self._pulse_param_decls.get(key)
+        if entry is None or decl is None or entry[0] != "pulse_param":
+            return
+        combo = entry[1]
+        src = self._widgets.get(getattr(decl, "depends_on", ""))
+        path = src[1].text() if (src and src[0] == "path") else ""
+        keep = combo.currentData() or combo.currentText()
+        items: list[tuple[str, str]] = []   # (label, "kind:target")
+        try:
+            # lazy import (frontend stays off neutral_atom's import-time graph; this is a
+            # GUI action) -- reuse the ONE template resolver + the single-source enumerator.
+            from ..neutral_atom.operations.logic import CalibrateReadoutTask
+            from ..neutral_atom.timing import enumerate_pulse_params
+            state = CalibrateReadoutTask._resolve_template(path)
+            items = [(label, f"{kind}:{target}") for kind, target, label in enumerate_pulse_params(state)]
+        except Exception:
+            items = []
+        combo.blockSignals(True)
+        combo.clear()
+        for label, token in items:
+            combo.addItem(label, token)
+        tokens = [token for _label, token in items]
+        if keep in tokens:
+            combo.setCurrentIndex(tokens.index(keep))
+        elif keep:
+            combo.setCurrentText(str(keep))          # round-trip a saved token not in this template
+        elif items:
+            combo.setCurrentIndex(0)
+        combo.blockSignals(False)
 
     # ------------------------------------------------------------- value read
     def collect_values(self) -> dict[str, object]:
@@ -1875,6 +1939,9 @@ class MeasurementPanel(QtWidgets.QWidget):
                 values[key] = entry[1].text()
             elif tag == "signal":
                 values[key] = entry[1].currentText().strip()
+            elif tag == "pulse_param":
+                # the "kind:target" token (combo data); fall back to the typed text
+                values[key] = str(entry[1].currentData() or entry[1].currentText()).strip()
             else:  # float
                 values[key] = float(entry[1].value())
         return values
@@ -1907,6 +1974,8 @@ class MeasurementPanel(QtWidgets.QWidget):
             elif entry[0] in ("int_opt", "text", "path") and not entry[1].text().strip():
                 missing.append(decl.label)
             elif entry[0] == "signal" and not entry[1].currentText().strip():
+                missing.append(decl.label)
+            elif entry[0] == "pulse_param" and not (entry[1].currentData() or entry[1].currentText().strip()):
                 missing.append(decl.label)
         return missing
 
@@ -1955,10 +2024,17 @@ class MeasurementPanel(QtWidgets.QWidget):
                     entry[1].setText(display_path(val))   # absolute/project-anchored; blank stays blank
                 elif tag == "signal":
                     entry[1].setCurrentText("" if val is None else str(val))
+                elif tag == "pulse_param":
+                    entry[1].setCurrentText("" if val is None else str(val))
                 elif tag == "float":
                     entry[1].setValue(float(val))
             except (TypeError, ValueError):
                 continue
+        # A pulse_param combo's choices come from its (also-seeded) template field, so
+        # repopulate AFTER seeding so the saved "kind:target" token lands on a real item
+        # (the editable combo round-trips it even if the template changed).
+        for key in getattr(self, "_pulse_param_decls", {}):
+            self._repopulate_pulse_param(key)
         self._refresh_start_enabled()
 
     def set_running(self, running: bool) -> None:
