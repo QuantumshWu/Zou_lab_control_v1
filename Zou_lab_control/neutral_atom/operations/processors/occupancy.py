@@ -46,7 +46,7 @@ def judge_occupancy(readout) -> ProcessorSpec:
         ParamDecl("calibration", "Calibration file", "path", default=DEFAULT_CALIBRATION_FILE,
                   path_mode="file", file_filter="Calibration (*.json *.npz);;All files (*)",
                   base_dir="calibrations", required=True,
-                  tooltip="The saved calibration the detector LOADS (.json/.npz: site centers + "
+                  tooltip="The calibration file the detector LOADS (.json/.npz: site centers + "
                           "per-site thresholds [+ PSF kernels]).  Defaults to the canonical file "
                           "the Calibrate-readout task writes (calibrations/calibration.json), so "
                           "calibrate-then-judge needs no path typed; Browse to use another.  Until "

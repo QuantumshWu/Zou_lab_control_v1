@@ -1,12 +1,12 @@
-"""Lightweight neutral-atom control session for Jupyter.
+"""Neutral-atom control session for Jupyter.
 
-First milestone:
-    connect devices, capture camera images, calibrate site map, calibrate
-    thresholds, detect occupancy, and scan detection time/fidelity.
+It connects devices (virtual or the real qCMOS + FPGA pulse streamer), captures
+camera images, calibrates the site map + per-site thresholds, detects occupancy,
+and runs swept measurements (detection time / fidelity / release-recapture).
 
-The public notebook entry point is ``connect``.  Lower-level device/timing/
-Verilog helpers remain available so the session can grow toward real
-hardware and GUI integration without changing the notebook shape.
+The public notebook entry point is ``connect``.  The lower-level device / timing /
+Verilog helpers are also exported, so a notebook can drive the hardware directly and
+the GUIs (pulse editor, task console) build on the same session.
 """
 
 from .core.analysis import (

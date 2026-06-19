@@ -416,10 +416,36 @@ def test_save_persists_edit_param_values_not_just_layout():
         exp.close()
 
 
+def test_added_site_map_panel_opens_unbound_even_with_occupied_live():
+    """#4 regression: a freshly Added 'Plot: site map' panel opens UNBOUND.  The user picks
+    the occupancy signal in its Setting, and ONLY THEN do the centres + frame underlay
+    auto-resolve from that signal's producing node.  Adding the panel must NOT auto-connect it
+    to a running ``occupied`` signal on the hub (the 'opens already connected' bug).  Guarded
+    even with ``occupied`` live, so this can never silently regress to a non-blank default."""
+    exp = _calibrated_virtual_session()
+    console = _console(exp)
+    try:
+        # make `occupied` LIVE on the hub: a camera (publishes frame) + Judge-occupancy
+        _pick(console, ("camera", "live"))
+        console._start_logic_node(console.logic_nodes[-1])
+        _pick(console, ("processor", "Judge occupancy"))
+        console._start_logic_node(console.logic_nodes[-1])
+        # Add Panel -> Plot: site map (the exact Add-Panel path the user clicks)
+        before = list(console.cards)
+        _pick(console, "sites")
+        card = next(c for c in console.cards if c not in before)
+        assert card.config.kind == "sites"
+        assert card.config.inputs == [""]                  # UNBOUND -- no auto-connect to occupied
+        assert str(card.config.source).strip() == ""       # blank source -> "pick a signal in Setting"
+    finally:
+        console.shutdown()
+        exp.close()
+
+
 def test_plot_edit_shows_producing_processor_param_form():
     """#2: a plot's signal comes from a measurement/processor; the plot's Edit shows
     THAT node's full parameter form (here the Judge-occupancy processor's
-    calibration/source/ema), prefilled -- not an empty section -- since the processor
+    calibration/source/method), prefilled -- not an empty section -- since the processor
     exposes no live acquisition_parameters of its own."""
     from Zou_lab_control.frontend.task_console import PanelConfig, PanelCard
     exp = _calibrated_virtual_session()

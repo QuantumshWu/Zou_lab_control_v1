@@ -28,16 +28,27 @@ from Zou_lab_control.neutral_atom.devices.virtual import VirtualTrapArray
 def test_qcmos_frame_has_realistic_read_noise_offset_and_shot_noise():
     ta = VirtualTrapArray(grid_shape=(5, 7), image_shape=(96, 128), seed=7)
     ta.set_occupancy(np.ones(ta.n_sites, dtype=bool))
-    img = ta.render_image(exposure=5e-3, all_sites=False).astype(float)
-    # a background patch away from the sites: offset ~200, std ~ read-noise in ADU.
+    exposure = 5e-3
+    img = ta.render_image(exposure=exposure, all_sites=False).astype(float)
+    # A background patch away from the sites carries the qCMOS offset PLUS a realistic
+    # stray-light floor: ``background_rate`` photons/s land on EVERY pixel (the real Rb87 v16
+    # corner-median is ~16.5 counts above the 200 offset at 3 ms), so dark pixels are NOT
+    # pinned at the offset -- they sit at offset + the stray-light counts and carry its shot
+    # noise.  Everything here is derived from the sim params (single source), no magic number.
     bg = img[80:96, 0:20]
     read_noise_counts = ta.read_noise_e / ta.conversion_e_per_count
-    assert ta.offset_counts == pytest.approx(200.0)            # the Rb87 qCMOS bias
-    assert abs(bg.mean() - ta.offset_counts) < 5.0             # background sits at the offset
-    assert 0.5 * read_noise_counts < bg.std() < 2.0 * read_noise_counts  # ~read noise, NOT flat
-    assert len(np.unique(bg.astype(int))) >= 8                 # genuinely noisy, not a constant
+    floor_e = (ta.background_rate + ta.dark_current_e_per_s) * exposure        # stray-light e-/px
+    floor_counts = floor_e / ta.conversion_e_per_count                         # the floor in ADU
+    assert ta.offset_counts == pytest.approx(200.0)                            # the Rb87 qCMOS bias
+    # background sits at offset + the stray-light floor (a real, non-zero scatter level)
+    assert abs(bg.mean() - (ta.offset_counts + floor_counts)) < 6.0
+    assert floor_counts > 2.0 * read_noise_counts                              # a real floor, not just read noise
+    # std combines read noise + background shot noise -> strictly above pure read noise
+    expected_std = np.sqrt(floor_e + ta.read_noise_e**2) / ta.conversion_e_per_count
+    assert 0.5 * expected_std < bg.std() < 2.0 * expected_std
+    assert len(np.unique(bg.astype(int))) >= 8                                 # genuinely noisy, not a constant
     # an atom is far above the noise floor (a real bright/dark separation exists).
-    assert img.max() > ta.offset_counts + 10.0 * read_noise_counts
+    assert img.max() > ta.offset_counts + floor_counts + 10.0 * read_noise_counts
 
 
 def test_calibrate_writes_distribution_and_fidelity_report(tmp_path):

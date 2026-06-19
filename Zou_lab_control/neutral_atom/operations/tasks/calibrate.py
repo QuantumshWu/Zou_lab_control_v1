@@ -27,7 +27,7 @@ from ..task_registry import task
 # OccupancyProcessor picks one.  EVERY parameter carries a REAL default (no blank fields):
 # ``folder`` (a real data dir) + ``pulse_template`` (the shipped imaging program) are both
 # Browse-able paths the experimenter sees up front.
-DEFAULT_DATA_DIR = "calibrations"          # data + report folder (timestamped run subfolders)
+DEFAULT_DATA_DIR = "calibrations"          # the one data + report folder (re-running overwrites it)
 # Point at the REAL shipped file under pulses/ so the GUI field shows its full project path
 # (the form resolves it to <project>/pulses/imaging_template.json -- not a bare name).
 DEFAULT_PULSE_TEMPLATE = "pulses/imaging_template.json"   # the shipped, inspectable imaging program

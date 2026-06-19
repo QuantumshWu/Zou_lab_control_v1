@@ -2763,7 +2763,6 @@ class TaskConsole(QtWidgets.QWidget):
         # no global form -- a measurement is a Logic node now).
         self.measurement_panel = None
         self.measurement_group = None
-        self.measurement_placeholder = None
         # Per-panel editors: one PanelEditor per opened PLOT panel, hosted as a
         # closable tab (keyed by id(card)).
         self._panel_editors: dict[int, "PanelEditor"] = {}
@@ -2801,11 +2800,10 @@ class TaskConsole(QtWidgets.QWidget):
         root = QtWidgets.QVBoxLayout(self)
         margin = scaled_px(14)
         root.setContentsMargins(margin, scaled_px(8), margin, scaled_px(8))
-        # A clear GAP separating the three rows -- the header card, the (hidden) task banner
-        # and the tab card -- so they read as DISTINCT cards on the grey window background, not
-        # one stuck-together block.  (The earlier "thin line above the tabs" was NOT this gap:
-        # it was the header drop-shadow + the QTabBar base line, both now removed; with those
-        # gone a frank gap between two rounded white cards is separation, not a line.)
+        # A clear GAP separates the three rows -- the header card, the (hidden) task banner and
+        # the tab card -- so they read as DISTINCT rounded cards on the grey window background.
+        # The header is flat (no drop shadow) and the tab bar draws no top base line, so this
+        # gap reads as clean card separation rather than a hard line.
         root.setSpacing(scaled_px(10, minimum=7))
 
         # FLAT header (no drop shadow): the shadow's soft bottom edge cast a thin grey line

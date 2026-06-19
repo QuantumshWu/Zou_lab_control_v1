@@ -237,7 +237,7 @@ def demo_console(*, scale: float = 1.0, size=(1480, 980), grid=(5, 7), state=Non
         ``frame`` -- added + Started through the public-ish console API
         (``_add_logic_node`` / ``_start_logic_node``), exactly as Add-Panel does;
       * a reactive **OccupancyProcessor** consuming ``frame`` and publishing
-        ``occupied`` / ``counts`` / ``rate`` (scalar EMA) / ``rate_sites`` /
+        ``occupied`` / ``counts`` / ``rate`` (scalar cumulative loading fraction) / ``rate_sites`` /
         ``rate_grid`` / ``centers`` / ``thresholds`` -- built directly (the
         Add-Panel processor flow builds a ONE-SHOT run; the live readout wires the
         reactive detector itself, as the notebook does) and registered in

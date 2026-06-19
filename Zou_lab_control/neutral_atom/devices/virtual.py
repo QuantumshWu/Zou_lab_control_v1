@@ -60,7 +60,9 @@ class VirtualTrapArray(TrapArrayDevice):
 
     grid_shape: tuple[int, int] = (5, 7)
     image_shape: tuple[int, int] = (96, 128)
-    spacing_px: float = 12.0
+    # Site pitch (px).  The real Rb87 v16 3 ms data has a tweezer pitch of ~9.2 px on the
+    # 5x7 grid (dx 8.9 / dy 9.5 px); 9.0 matches it to <2%.
+    spacing_px: float = 9.0
     origin_px: tuple[float, float] | None = None
     # --- Loading + camera signal/noise model ---------------------------------
     # Loading SATURATES with the cooling/MOT time: a tweezer fills (up to the
@@ -79,19 +81,21 @@ class VirtualTrapArray(TrapArrayDevice):
     mot_load_s: float = 0.30
     # Bright-atom photoelectron rate (peak amplitude/s) during the probe.  Tuned to the REAL
     # Rb87 qCMOS dataset (references/.../rb87_readout_v16): a bright site's 3x3-box signal is
-    # ~18-20 detected photons at a 2 ms readout -- with atom_sigma_px=0.8 and this rate a
-    # rendered all-bright 2 ms frame measures ~18-19 box photons (matched to data, not guessed).
-    atom_rate: float = 2_500.0
-    background_rate: float = 8.0          # stray-light count rate (always present)
+    # ~18-19 detected photons at the 3 ms reference readout (35-site mean 18.7 ph), and with
+    # atom_sigma_px=0.7 this rate renders an all-bright 3 ms frame at that box level.
+    atom_rate: float = 2_150.0
+    # Stray-light + scatter floor (detected photons/s/pixel, always present).  The real v16
+    # 3 ms corner-median is ~16.5 counts/px above the 200-count offset -> ~1.8 ph/px/3 ms ->
+    # ~600 ph/s/px, so dark sites carry a realistic shot-noise floor (not a near-zero one).
+    background_rate: float = 600.0
     dark_current_e_per_s: float = 0.006
     offset_counts: float = 200.0          # qCMOS nominal offset (reference CameraConfig)
     conversion_e_per_count: float = 0.107  # electrons per count (reference qCMOS gain)
     read_noise_e: float = 0.43            # read noise e-rms (reference qCMOS)
-    # Imaging PSF width (Gaussian sigma, px).  The real Rb87 qCMOS per-site PSF fits give
-    # sigma ~0.6-0.96 px (psf_sigma_x/y in the reference analysis_arrays.npz); 0.8 is the
-    # representative value (the old 1.35 rendered atoms ~1.7x too large + ~2x too many box
-    # counts).
-    atom_sigma_px: float = 0.8
+    # Imaging PSF width (Gaussian sigma, px).  The real Rb87 v16 per-site PSF fits give
+    # sigma_x ~0.61 / sigma_y ~0.76 px (geometric mean ~0.68 px, stable across the 3 ms and
+    # 5 ms runs); the isotropic 0.7 px here matches that spot size.
+    atom_sigma_px: float = 0.7
     # Atom 1/e lifetime UNDER the probe (s): a longer readout exposure scatters MORE
     # photons (higher SNR) but also loses MORE atoms mid-readout, so the readout
     # duration sets the real SNR-vs-survival trade-off a detection-time scan measures.

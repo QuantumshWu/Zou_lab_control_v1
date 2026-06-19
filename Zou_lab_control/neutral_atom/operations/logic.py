@@ -715,9 +715,9 @@ class CalibrateReadoutTask(Task):
         """The calibrate task's tunable parameters (source + folder + pulse template +
         exposures + grid + frame counts + threshold), as ``{name: current}`` -- shown in
         the panel's Edit and applied before the next Run.  Every value is concrete (no
-        blank): the pulse template + folder read back as their paths.  NOTE the cali no
-        longer has a readout ``mode`` -- it computes every method; the OccupancyProcessor
-        chooses box / per-site PSF / uniform PSF."""
+        blank): the pulse template + folder read back as their paths.  The cali computes
+        every readout method into one calibration; the OccupancyProcessor chooses which to
+        read with (box / per-site PSF / uniform PSF), so there is no readout-method param here."""
         return {
             "source": str(self.source),
             "folder": str(self.folder),

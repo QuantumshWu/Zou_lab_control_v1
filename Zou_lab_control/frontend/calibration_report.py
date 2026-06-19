@@ -108,14 +108,30 @@ def save_calibration_report(folder, *, counts, thresholds, fidelity, centers,
         paths["site_distribution_grid"] = _save_plot(grid, folder / "site_distribution_grid.png")
 
     if counts.size:
-        flat = counts.reshape(-1)
-        flat = flat[np.isfinite(flat)]
-        median_thr = float(np.nanmedian(thresholds)) if thresholds.size else None
-        pooled = HistogramFigure(
-            flat, bins=80, thresholds=([median_thr] if median_thr is not None else None),
-            labels=("Readout counts", "Shots x sites", "Population"),
-            title="Pooled readout distribution", fig=_agg_figure(),
-            interactions=False).show(display=False)
+        # The pooled view aggregates EVERY site.  Sites have DIFFERENT dark/bright means and
+        # DIFFERENT thresholds, so pooling RAW counts smears the two populations into one wide
+        # blob -- a single bimodal fit then reports a falsely-low fidelity even when every site
+        # is cleanly separated (the per-site grids show the real separation).  Centre each site
+        # on ITS OWN threshold first (counts - threshold): all dark blobs line up below 0, all
+        # bright blobs above 0, and the cut is exactly 0, so the pooled fit + its fidelity match
+        # what the eye (and the per-site grids) see.
+        thr = np.asarray(thresholds, dtype=float).reshape(-1)
+        if thr.size == counts.shape[1] and np.isfinite(thr).any():
+            centred = counts - thr[None, :]
+            flat = centred.reshape(-1)
+            flat = flat[np.isfinite(flat)]
+            pooled = HistogramFigure(
+                flat, bins=80, thresholds=[0.0],
+                labels=("Readout counts - threshold", "Shots x sites", "Population"),
+                title="Pooled readout distribution (per-site threshold-centred)",
+                fig=_agg_figure(), interactions=False).show(display=False)
+        else:
+            flat = counts.reshape(-1)
+            flat = flat[np.isfinite(flat)]
+            pooled = HistogramFigure(
+                flat, bins=80, labels=("Readout counts", "Shots x sites", "Population"),
+                title="Pooled readout distribution", fig=_agg_figure(),
+                interactions=False).show(display=False)
         paths["global_distribution"] = _save_plot(pooled, folder / "global_distribution.png")
 
     if template is not None and centers is not None and len(centers):
