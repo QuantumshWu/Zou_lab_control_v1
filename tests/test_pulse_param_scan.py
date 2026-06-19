@@ -120,3 +120,91 @@ def test_enumerate_pulse_params_covers_durations_delays_and_dac():
     # scan-bound durations) -- they all round-trip through the real setters
     for kind, target, _label in params:
         PulseParam(kind, target, unit="us").apply(state, 1.0)
+
+
+# --------------------------------------------------------------------------- Pulse scan measurement
+def _calibrated():
+    import Zou_lab_control.neutral_atom as na
+
+    exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (48, 60)})
+    exp.readout.sitemap(method="box", frames=4, display=False)
+    exp.readout.thresholds(frames=20, display=False)
+    return exp
+
+
+def _run_pulse_scan(exp, **build_kwargs):
+    """Build the Pulse-scan measurement and drive it to completion through the SAME live node
+    the task console uses; return (x, y) published on the hub."""
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.neutral_atom.operations.logic import ScannedMeasurementNode
+
+    spec = {s.name: s for s in exp.readout.measurement_specs()}["Pulse scan"]
+    measurement = spec.build(**build_kwargs)
+    hub = SignalHub()
+    node = ScannedMeasurementNode(hub, measurement, x_key=spec.x_key, y_key=spec.y_key,
+                                  prefix=f"{spec.key}_")
+    node.run_to_completion()
+    return (np.asarray(hub.latest(f"{spec.key}_{spec.x_key}"), dtype=float),
+            np.asarray(hub.latest(f"{spec.key}_{spec.y_key}"), dtype=float),
+            measurement)
+
+
+def test_pulse_scan_spec_discovered_with_unique_keys():
+    """The generic Pulse-scan measurement is auto-discovered into the Add-Panel catalog with
+    unique x/y signal keys (the registry raises on a collision with temperature/readout)."""
+    exp = _calibrated()
+    try:
+        specs = {s.name: s for s in exp.readout.measurement_specs()}
+        assert "Pulse scan" in specs
+        spec = specs["Pulse scan"]
+        assert (spec.x_key, spec.y_key) == ("param", "signal")
+        # the scan-target field is the dynamic pulse_param control bound to the template field
+        target = next(p for p in spec.params if p.kind == "pulse_param")
+        assert target.depends_on == "template"
+    finally:
+        exp.close()
+
+
+@pytest.mark.parametrize("reduce", ["counts", "loading", "fidelity"])
+def test_pulse_scan_runs_each_reduce_mode_headless(reduce):
+    """Each reduce mode sweeps the template's first duration and yields a finite curve over the
+    SAME camera/calibration contract (virtual==real; only frames are simulated)."""
+    exp = _calibrated()
+    try:
+        x, y, m = _run_pulse_scan(exp, template="imaging_template.json", scan_target="duration:0",
+                                  scan=(10.0, 40.0, 5), shots=4, reduce=reduce)
+        assert x.shape == (5,) and y.shape == (5,)
+        assert np.isfinite(x).all() and np.isfinite(y).all()
+        assert m.reducer.labels[0].endswith("(us)")            # x-axis labelled with the param + unit
+    finally:
+        exp.close()
+
+
+def test_pulse_scan_delay_is_software_non_slot():
+    """A channel DELAY scan runs -- proving the NON-slot software path (delay is NOT a hardware
+    scan slot; it is set per point by editing the template), the capability the user asked for."""
+    from Zou_lab_control.neutral_atom.operations.logic import CalibrateReadoutTask
+    from Zou_lab_control.neutral_atom.timing import enumerate_pulse_params
+
+    exp = _calibrated()
+    try:
+        state = CalibrateReadoutTask._resolve_template("imaging_template.json")
+        kind, target, _ = next((p for p in enumerate_pulse_params(state) if p[0] == "delay"))
+        x, y, _m = _run_pulse_scan(exp, template="imaging_template.json",
+                                   scan_target=f"{kind}:{target}", scan=(0.0, 5.0, 3),
+                                   shots=3, reduce="counts")
+        assert x.shape == (3,) and np.isfinite(y).all()
+    finally:
+        exp.close()
+
+
+def test_pulse_scan_missing_target_raises():
+    """An empty scan target fails LOUD (the GUI also marks it required), never silently scans
+    nothing."""
+    exp = _calibrated()
+    try:
+        spec = {s.name: s for s in exp.readout.measurement_specs()}["Pulse scan"]
+        with pytest.raises(ValueError):
+            spec.build(template="imaging_template.json", scan_target="", scan=(0.0, 1.0, 3))
+    finally:
+        exp.close()

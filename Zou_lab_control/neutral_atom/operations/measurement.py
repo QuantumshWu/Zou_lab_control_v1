@@ -63,9 +63,15 @@ class ParamDecl:
                       ``path_mode='dir'`` picks a folder.  Taken verbatim, never eval'd.
     ``"signal"``      the NAME of a hub signal to consume (a processor's input): a combo
                       box of the live hub signals, like a plot's input picker.
+    ``"pulse_param"`` a parameter of a pulse template to sweep: a combo box whose choices are
+                      introspected from the template FILE named in the ``depends_on`` field
+                      (its periods / channels / DAC buses), so picking the template repopulates
+                      it.  The value is a ``"kind:target"`` token (e.g. ``"duration:2"``).
 
-    ``required`` marks a parameter a GUI must highlight when missing.  No value
-    here is ever ``eval``'d -- the spec consumer validates/coerces by ``kind``.
+    ``required`` marks a parameter a GUI must highlight when missing.  ``depends_on`` (kind
+    ``pulse_param``) names the sibling ``path`` field whose pulse template is introspected to
+    populate this control.  No value here is ever ``eval``'d -- the spec consumer validates /
+    coerces by ``kind``.
     """
 
     key: str
@@ -83,12 +89,15 @@ class ParamDecl:
     base_dir: str = ""               # kind="path": the folder a Browse dialog opens in when the
                                      # field doesn't resolve to an existing path (e.g. "pulses"
                                      # for a pulse template, "calibrations" for a data folder)
+    depends_on: str = ""             # kind="pulse_param": the sibling kind="path" field whose
+                                     # pulse template is introspected to populate this combo
 
     def __post_init__(self) -> None:
         kind = str(self.kind).lower()
-        if kind not in ("float", "int", "axis_range", "bool", "choice", "text", "path", "signal"):
+        if kind not in ("float", "int", "axis_range", "bool", "choice", "text", "path", "signal", "pulse_param"):
             raise ValueError(
-                f"ParamDecl.kind must be one of float/int/axis_range/bool/choice/text/path/signal, got {self.kind!r}."
+                "ParamDecl.kind must be one of "
+                f"float/int/axis_range/bool/choice/text/path/signal/pulse_param, got {self.kind!r}."
             )
         object.__setattr__(self, "kind", kind)
         object.__setattr__(self, "key", str(self.key))
