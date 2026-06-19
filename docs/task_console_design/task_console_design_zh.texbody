@@ -216,8 +216,9 @@ reshape 表达式（\pyapi{value = <y>\_sites.reshape(ny, nx)}），而 \pyapi{s
 \section{calibrate-readout task 的完整参数设计}
 \pyapi{CalibrateReadoutTask}（\filepath{operations/logic.py}）跑\tfocus{真}的 sitemap + 逐站阈值标定——就是 notebook 的 \pyapi{exp.readout.sitemap()} / \pyapi{thresholds()} 流程——产出一个 \pyapi{TrapCalibration} 供下游 \pyapi{OccupancyProcessor} 用。所有可调参数在 \pyapi{operations/tasks/calibrate.py} 的 \pyapi{CALIBRATE\_PARAMS} 声明一次（GUI 自动表单与 \pyapi{readout.calibrate\_task(**values)} 同读）：
 \begin{description}
-  \item[\pyapi{source} = live / saved frames] 标定用的图\tfocus{从哪来}。\pyapi{live} = 现在开相机直接采图并写标定；\pyapi{saved frames} = 用 \pyapi{folder} 里已存的原始帧（\pyapi{index\_run} 读 \pyapi{img1.npy, img2.npy, ...}，如真机此前一次 run 或 \pyapi{na.write\_virtual\_run}）标定。\tfocus{没有 "saved calibration" 这个 source}：复用一份已存标定不是"再标定一次"——直接让 Judge-occupancy processor load 它的 \filepath{calibration.json} 即可（那是个 category error，已删）。
-  \item[\pyapi{folder}] 唯一的数据目录（输入 + 输出）。\pyapi{live} \tfocus{写}这里：规范的 \filepath{calibration.json}（detector 的默认输入）+ 一个带时间戳的分布/保真度报告子文件夹；\pyapi{saved frames} \tfocus{读}这里的原始帧。默认是项目的 \filepath{calibrations/} 目录。
+  \item[\pyapi{source} = live / saved frames] 标定用的图\tfocus{从哪来}。\pyapi{live} = 现在开相机直接采图并写标定；\pyapi{saved frames} = 用 \pyapi{folder} 里已存的原始帧（\pyapi{index\_run} 读 \pyapi{img1, img2, ...}，每帧可是 \pyapi{.npy} \tfocus{或}原始相机 \pyapi{.tif/.tiff}，如真机此前一次 run 或 \pyapi{na.write\_virtual\_run}）标定。\tfocus{没有 "saved calibration" 这个 source}：复用一份已存标定不是"再标定一次"——直接让 Judge-occupancy processor load 它的 \filepath{calibration.json} 即可（那是个 category error，已删）。
+  \item[\pyapi{folder}] 唯一的数据目录（输入 + 输出）。\pyapi{live} \tfocus{写}这里：规范的 \filepath{calibration.json}（detector 的默认输入）+ 一个带时间戳的分布/保真度报告子文件夹（\pyapi{save\_frames} 开时还写原始帧 \pyapi{img1.npy, ...}）；\pyapi{saved frames} \tfocus{读}这里的原始帧（\pyapi{.npy/.tif}）。默认是项目的 \filepath{calibrations/} 目录。
+  \item[\pyapi{save\_frames}（bool，默认 on）] \pyapi{live} 标定时是否\tfocus{把采到的原始帧也存进 \pyapi{folder}}（\pyapi{img1.npy, ...} + 一个 \filepath{run\_schema.json} 记录分组），这样以后用 \pyapi{source=saved frames} 指向同一 \pyapi{folder} 就能\tfocus{复算而不必重新采图}；关掉则只写标定 + 报告。bool 参数在 GUI 里\tfocus{自动渲染成开关（toggle switch）}，不是复选框。
   \item[\pyapi{pulse\_template}] 要 LOAD 的成像脉冲程序（pulse GUI 存的真 \pyapi{PulseTableState} \pyapi{.json}）；每一遍把它 \pyapi{'image'} 窗口的时长设成该遍曝光——"载入模板、设时长、跑"。默认指向真实的 \filepath{pulses/imaging\_template.json}。
   \item[两个曝光] \tfocus{sitemap 这一遍用较长曝光}（更多光子 → site 中心 + PSF 拟合更干净）= \pyapi{sitemap\_exposure}；\tfocus{threshold 这一遍用实际读出曝光}（阈值要在真实读出条件下学）= \pyapi{readout\_exposure}；两者都设到上面模板的 \pyapi{'image'} 窗口。
   \item[\pyapi{threshold\_method} = otsu / bimodal] otsu = 单点分割；bimodal = 逐站暗/亮高斯核拟合。（cali \tfocus{不}选读出 method：它把 box / per-site PSF / uniform PSF 全算进一份标定，由 OccupancyProcessor 选其一。）
@@ -454,7 +455,7 @@ confocal 把\tfocus{同一个回写回调}同时绑到\tfocus{滚轮缩放/中�
 \section{GUI 段:自动参数表单 + 一键 Start}
 一个扫描 measurement 在 \pyapi{Add Panel} 选中后是 Logic tab 上一个\tfocus{默认停}的逻辑节点行；它\tfocus{自己}的 Edit（\pyapi{LogicNodeEditor}，绑这一个 spec，无类型选择器——spec 已选定）：
 \begin{enumerate}
-  \item \tfocus{由该 spec 的 \pyapi{params} 自动生成带校验的表单}：\pyapi{float}/\pyapi{int} → 带 lo/hi/unit 的 spin；\pyapi{axis\_range} → min/max/points 三框；\pyapi{bool} → 复选；\pyapi{choice} → combo。\pyapi{required} 缺失时禁用 Start 并高亮（带 \pyapi{*}）。\tfocus{绝不自由文本 eval}（confocal 教训）。
+  \item \tfocus{由该 spec 的 \pyapi{params} 自动生成带校验的表单}：\pyapi{float}/\pyapi{int} → 带 lo/hi/unit 的 spin；\pyapi{axis\_range} → min/max/points 三框；\pyapi{bool} → 开关（toggle switch）；\pyapi{choice} → combo。\pyapi{required} 缺失时禁用 Start 并高亮（带 \pyapi{*}）。\tfocus{绝不自由文本 eval}（confocal 教训）。
   \item \pyapi{Start}（一键）：按 \pyapi{kind} 收集+校验参数 → \pyapi{spec.build(**values)} 得未跑测量 → 包成 \pyapi{ScannedMeasurementNode}（\pyapi{x\_key}/\pyapi{y\_key}/\pyapi{grid\_shape} 来自 spec）登记进 \pyapi{console.running\_nodes} → \pyapi{node.start(rate\_hz=...)} 后台跑。节点\tfocus{只 publish 到 hub、不自动出图}（plot=False）；你自己在 Monitor 加一张 1D Plot 面板把 Source 指 \pyapi{value = <y\_key>} vs \pyapi{<x\_key>} 看它逐点长出。\pyapi{Stop} → \pyapi{node.stop()}（协作取消）。
   \item \pyapi{\_poll\_logic\_nodes} 每 tick 检查节点完成跃迁（即使版本不变也能捕捉自停），完成后释放控件、行点回灰（温度 spec 的结果还可由 plot 面板 Edit 的 Fit 跑 \pyapi{fit\_temperature}）。
 \end{enumerate}

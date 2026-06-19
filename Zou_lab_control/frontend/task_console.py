@@ -62,7 +62,6 @@ from .qt_fluent import (
     TEXT,
     YELLOW,
     FluentButton,
-    FluentCheckBox,
     FluentComboBox,
     FluentDoubleSpinBox,
     FluentFrame,
@@ -75,6 +74,7 @@ from .qt_fluent import (
     FluentSectionLabel,
     FluentSettingRow,
     FluentStatusDot,
+    FluentSwitch,
     FluentTabWidget,
     FluentWindow,
     add_fluent_shadow,
@@ -1767,7 +1767,8 @@ class MeasurementPanel(QtWidgets.QWidget):
                 self.form.addRow(label_text, triplet)
                 self._widgets[decl.key] = ("axis_range", lo_spin, hi_spin, pts_spin)
             elif kind == "bool":
-                check = FluentCheckBox("")
+                # A bool parameter renders as a sliding on/off toggle switch (not a checkbox).
+                check = FluentSwitch("")
                 check.setChecked(bool(decl.default))
                 check.setToolTip(decl.tooltip)
                 check.toggled.connect(self._refresh_start_enabled)
@@ -2795,7 +2796,11 @@ class TaskConsole(QtWidgets.QWidget):
         root = QtWidgets.QVBoxLayout(self)
         margin = scaled_px(14)
         root.setContentsMargins(margin, scaled_px(8), margin, scaled_px(8))
-        root.setSpacing(scaled_px(7, minimum=5))
+        # NO inter-row gap: the header, the (hidden) task banner and the tab card are all
+        # white and must sit FLUSH.  A non-zero spacing let the grey window background show
+        # through as a thin strip between the white header and the white tab strip -- which
+        # read as "a line above the tabs".  Flush => seamless white, no strip.
+        root.setSpacing(0)
 
         # FLAT header (no drop shadow): the shadow's soft bottom edge cast a thin grey line
         # into the gap right above the tab strip (the "line above the tabs").  The tab widget

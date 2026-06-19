@@ -45,8 +45,13 @@ CALIBRATE_PARAMS = (
               base_dir=DEFAULT_DATA_DIR,
               tooltip="The ONE data directory (input + output).  source=live WRITES here: the "
                       "calibration (calibration.json) + a timestamped distribution/fidelity report "
-                      "sub-folder.  source=saved frames READS the raw frame files (img1.npy, ...) "
-                      "from here.  Defaults to the project `calibrations/` folder."),
+                      "(and, if 'save frames' is on, the raw frames img1.npy, ...).  source=saved "
+                      "frames READS the raw frame files from here -- .npy OR raw camera .tif/.tiff "
+                      "(img1.tif, ...).  Defaults to the project `calibrations/` folder."),
+    ParamDecl("save_frames", "save frames (live)", "bool", default=True,
+              tooltip="When source=live, also SAVE the acquired raw frames to `folder` (img1.npy, "
+                      "...) so you can re-calibrate later with source=saved frames WITHOUT "
+                      "re-acquiring.  Off = only write the calibration + report, not the frames."),
     ParamDecl("pulse_template", "pulse template", "path", default=DEFAULT_PULSE_TEMPLATE,
               path_mode="file", file_filter="Pulse program (*.json);;All files (*)", base_dir="pulses",
               tooltip="The imaging pulse program to LOAD (a real PulseTableState .json from the pulse "

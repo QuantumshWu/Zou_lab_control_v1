@@ -19,7 +19,7 @@ import numpy as np
 from PyQt5 import QtCore, QtWidgets
 
 from .qt_fluent import (
-    FluentCheckBox, FluentComboBox, FluentLabeledField, FluentLineEdit, scaled_px)
+    FluentComboBox, FluentLabeledField, FluentLineEdit, FluentSwitch, scaled_px)
 
 
 def parse_scan_text(text):
@@ -84,9 +84,10 @@ class AutoForm(QtWidgets.QWidget):
     def _build_widget(self, field, value) -> QtWidgets.QWidget:
         kind = field.kind
         if kind == "bool":
-            box = FluentCheckBox("")
+            # A bool parameter renders as a sliding on/off toggle switch (not a checkbox).
+            box = FluentSwitch("")
             box.setChecked(bool(value))
-            box.stateChanged.connect(lambda *_: self.changed.emit())
+            box.toggled.connect(lambda *_: self.changed.emit())
             return box
         if kind == "choice":
             combo = FluentComboBox()

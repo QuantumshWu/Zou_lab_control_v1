@@ -675,6 +675,7 @@ class CalibrateReadoutTask(Task):
                  calibration_frames: int = 30, threshold_frames: int = 100,
                  threshold_method: str = "otsu",
                  source: str = "live", folder: str = "calibrations",
+                 save_frames: bool = True,
                  calibration_sink=None, prefix: str = ""):
         super().__init__(hub, prefix=prefix)
         self.camera = camera
@@ -705,6 +706,9 @@ class CalibrateReadoutTask(Task):
         from Zou_lab_control._paths import resolve_under_project
         self.source = str(source)
         self.folder = str(resolve_under_project(folder or "calibrations"))
+        # source=live: also SAVE the acquired raw frames to ``folder`` (img1.npy, ...) so a
+        # later source="saved frames" run re-calibrates from them without re-acquiring.
+        self.save_frames = bool(save_frames)
         self.calibration = None
 
     def acquisition_parameters(self) -> dict[str, object]:
@@ -717,6 +721,7 @@ class CalibrateReadoutTask(Task):
         return {
             "source": str(self.source),
             "folder": str(self.folder),
+            "save_frames": bool(self.save_frames),
             "pulse_template": str(self.pulse_template),
             "grid_shape": tuple(self.grid_shape),
             "sitemap_exposure": float(self.sitemap_exposure),
@@ -732,6 +737,8 @@ class CalibrateReadoutTask(Task):
             self.source = str(values["source"])
         if "folder" in values:
             self.folder = str(values["folder"]) or "calibrations"
+        if "save_frames" in values:
+            self.save_frames = bool(values["save_frames"])
         if "pulse_template" in values:
             self.pulse_template = str(values["pulse_template"]) or self.DEFAULT_PULSE_TEMPLATE
         if "grid_shape" in values:
@@ -873,6 +880,10 @@ class CalibrateReadoutTask(Task):
         # short readout frames also feed the box/PSF otsu thresholds (cali once, read many ways).
         ref_groups, readout_by_group = self._collect_bracket_groups(
             out, progress_lo=0.35, progress_hi=0.9)
+        # Optionally SAVE the acquired raw frames so a later source="saved frames" run
+        # re-calibrates from them without re-acquiring (the "don't re-run every time" ask).
+        if self.save_frames:
+            self._save_live_frames(ref_groups, readout_by_group)
         samples = list(readout_by_group)
         out.publish(progress=0.95, stage="finding sites + thresholds (box / PSF)")
         calibration = calibrate_all_methods_from_images(
@@ -947,6 +958,50 @@ class CalibrateReadoutTask(Task):
             out.publish(frame=frames[readout_index], progress=frac, stage=f"readout bracket {g + 1}/{n_groups}")
         return reference_groups, readout_per_group
 
+    def _save_live_frames(self, ref_groups, readout_by_group) -> None:
+        """Write the live brackets to ``folder`` as a contiguous ``img<n>.npy`` run plus a
+        ``run_schema.json`` describing the grouping, so a later source="saved frames" run
+        re-indexes them with ``index_run`` and re-calibrates WITHOUT re-acquiring.  Each group
+        is written in trigger order (the short readout in the middle of its reference frames),
+        and the schema records ``shots_per_group`` / ``short_shot`` / ``ref_shots`` so the
+        reader reconstructs the exact bracket -- no frame duplication, no hard-coded layout."""
+        import json
+        from .imageio import save_frame
+        folder = Path(self.folder)
+        folder.mkdir(parents=True, exist_ok=True)
+        n_ref = int(self.REFERENCE_FRAMES_PER_BRACKET)
+        readout_index = n_ref // 2
+        n = 0
+        for refs, short in zip(ref_groups, readout_by_group):
+            refs = list(refs)
+            group = refs[:readout_index] + [short] + refs[readout_index:]   # trigger order
+            for fr in group:
+                n += 1
+                save_frame(folder / f"img{n}.npy", np.asarray(fr, dtype=float))
+        short_shot = readout_index + 1                       # 1-based position of the short frame
+        ref_shots = [i for i in range(1, n_ref + 2) if i != short_shot]
+        schema = {"prefix": "img", "shots_per_group": n_ref + 1, "short_shot": short_shot,
+                  "ref_shots": ref_shots, "n_groups": int(len(readout_by_group))}
+        (folder / "run_schema.json").write_text(json.dumps(schema, indent=2), encoding="utf-8")
+
+    def _index_saved_run(self):
+        """Index the saved frames in ``folder``, honouring a ``run_schema.json`` if the live
+        run wrote one (so a live-saved bracket re-reads with its real grouping); otherwise the
+        index_run defaults (the write_virtual_run / 4-shot convention)."""
+        import json
+        from .imageio import index_run
+        schema_path = Path(self.folder) / "run_schema.json"
+        if schema_path.is_file():
+            try:
+                s = json.loads(schema_path.read_text(encoding="utf-8"))
+                return index_run(self.folder, str(s.get("prefix", "img")),
+                                 shots_per_group=int(s["shots_per_group"]),
+                                 short_shot=int(s["short_shot"]),
+                                 ref_shots=tuple(int(v) for v in s["ref_shots"]))
+            except Exception:
+                pass
+        return index_run(self.folder, "img")
+
     def _run_from_folder(self, out: "TaskOutput"):
         """Calibrate from frames SAVED IN A FOLDER (the real-data flow): index the run,
         find the sites from the reference template, then per-site thresholds for every
@@ -961,10 +1016,9 @@ class CalibrateReadoutTask(Task):
         self-consistent estimate.  If the run is too short to vote ground truth, the helper
         no-ops and the calibration keeps its otsu thresholds (graceful fallback)."""
         from .calibration import calibrate_all_methods_from_images
-        from .imageio import index_run
         if not self.folder:
             raise ValueError("source='saved frames' needs a folder of saved frames.")
-        run = index_run(self.folder, "img")
+        run = self._index_saved_run()
         n_ref = len(run.ref_shots)
         # The long reference frames (group-major) build the all-sites template AND, regrouped,
         # vote the per-group ground truth -- read the files ONCE for both uses.

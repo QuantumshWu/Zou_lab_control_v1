@@ -206,6 +206,80 @@ def test_calibrate_task_saved_frames_uses_reference_brackets_for_held_out_fideli
         exp.close()
 
 
+def test_calibrate_task_live_save_frames_round_trip(tmp_path):
+    """source=live with save_frames=True WRITES the acquired raw frames (img<n>.npy) + a
+    run_schema.json into `folder`, so a later source="saved frames" run re-calibrates from
+    them WITHOUT re-acquiring (the "don't re-run every time" ask).  The saved run round-trips
+    through index_run via the schema sidecar (no frame duplication, no hard-coded layout)."""
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+
+    exp = _calibrated()
+    try:
+        folder = tmp_path / "live_saved"
+        n_groups = 12
+        made = exp.readout.calibrate_task(
+            SignalHub(), source="live", folder=str(folder), save_frames=True,
+            calibration_frames=3, threshold_frames=n_groups)
+        made.run_to_completion()
+        # raw frames + schema written: one contiguous run, 3 frames/group (ref-short-ref)
+        imgs = sorted(folder.glob("img*.npy"))
+        assert len(imgs) == n_groups * 3
+        assert (folder / "run_schema.json").exists()
+        # re-calibrate from those saved frames -- no second acquisition, same site count
+        reused = exp.readout.calibrate_task(
+            SignalHub(), source="saved frames", folder=str(folder))
+        reused.run_to_completion()
+        assert np.asarray(reused.calibration.centers).shape == (12, 2)
+    finally:
+        exp.close()
+
+
+def test_calibrate_task_live_save_frames_off_writes_no_frames(tmp_path):
+    """save_frames=False writes ONLY the calibration + report -- no raw frames, no schema."""
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+
+    exp = _calibrated()
+    try:
+        folder = tmp_path / "no_save"
+        made = exp.readout.calibrate_task(
+            SignalHub(), source="live", folder=str(folder), save_frames=False,
+            calibration_frames=3, threshold_frames=8)
+        made.run_to_completion()
+        assert (folder / "calibration.json").exists()       # the calibration is still written
+        assert sorted(folder.glob("img*.npy")) == []        # but NO raw frames
+        assert not (folder / "run_schema.json").exists()
+    finally:
+        exp.close()
+
+
+def test_calibrate_task_bool_param_renders_as_toggle_switch():
+    """A bool task param (save frames) renders in the Edit form as a sliding on/off toggle
+    SWITCH (FluentSwitch), not a checkbox -- the user's "bool -> toggle widget" UI rule."""
+    from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
+    from Zou_lab_control.frontend.qt_fluent import FluentSwitch
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+
+    exp = _calibrated()
+    try:
+        console = TaskConsole(hub=SignalHub(), state=default_console_state(), session=exp,
+                              tasks=exp.readout.task_specs(), window_px=(900, 600))
+        console._timer.stop()
+        kc = console.kind_combo
+        spec = exp.readout.task_specs()[0]
+        i = next(j for j in range(kc.count()) if kc.itemData(j) == ("task", spec.name))
+        kc.setCurrentIndex(i)
+        console._add_panel()
+        row = console.logic_nodes[-1]
+        console._edit_logic_node(row)
+        editor = console._logic_editors[id(row)]
+        entry = editor.form._widgets["save_frames"]
+        assert entry[0] == "bool"
+        assert isinstance(entry[1], FluentSwitch)
+    finally:
+        console.shutdown()
+        exp.close()
+
+
 # ------------------------------------------------- camera measurement: editable region
 def test_camera_measurement_region_is_editable_and_applies_to_virtual():
     """The camera measurement exposes its ROI as an editable ``region`` (the SAME
