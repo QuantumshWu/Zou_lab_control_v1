@@ -3960,6 +3960,23 @@ class TaskConsole(QtWidgets.QWidget):
         QtWidgets.QMessageBox.information(self, "Task console", str(text))  # pragma: no cover
 
     # ------------------------------------------------------------------ teardown
+    def stop_all_nodes(self) -> None:
+        """Stop every running node's owner thread (so the camera / sequencer are released) but
+        KEEP the panels + editors intact.  This is the notebook close = "hide" path: closing the
+        window halts all running processes, yet the layout is preserved so reopening the
+        session-bound console (``exp.task_console()``) restores the SAME interface rather than a
+        blank new one.  Distinct from :meth:`shutdown`, which also tears the cards/editors down
+        (the standalone-window / explicit-teardown path)."""
+        for node in list(self.running_nodes):
+            try:
+                node.stop()
+            except Exception:
+                pass
+        try:
+            self._tick()   # one refresh so the stopped nodes' rows repaint with grey dots
+        except Exception:
+            pass
+
     def shutdown(self) -> None:
         """Stop the refresh timer and every running node's owner thread, then release
         the editors/cards.  IDEMPOTENT -- it is reached from both the window close
@@ -4020,6 +4037,7 @@ def show_task_console(
     window_ratio: float = 0.84,
     title: str = "TaskConsole@Zou lab",
     on_close=None,
+    hide_on_close: bool = False,
 ):
     """Open the console in a Fluent window (mirrors ``show_pulse_gui``: the body
     sizes itself from the primary screen; the window wraps it exactly).
@@ -4058,13 +4076,19 @@ def show_task_console(
     for node in running_nodes:
         if not getattr(node, "running", False) and hasattr(node, "start"):
             node.start(rate_hz=getattr(node, "rate_hz", 5.0))
-    window = FluentWindow(widget=console, title=title, hide_on_close=False)
-    # Closing the window must tear the console down: the console is a CHILD of the
-    # window, so its own closeEvent never fires on a window close -- without this the
-    # node owner threads keep running (blocked in camera.acquire, holding the camera /
-    # RPyC link), which wedges the kernel.  `closed` fires only on a genuine close, so
-    # minimising the dashboard does NOT stop the nodes.
-    window.closed.connect(console.shutdown)
+    window = FluentWindow(widget=console, title=title, hide_on_close=hide_on_close)
+    # Closing the window must stop the node owner threads (else they keep running, blocked in
+    # camera.acquire holding the camera / RPyC link, wedging the kernel).  The console is a CHILD
+    # of the window so its own closeEvent never fires on a window close -- we wire the window's
+    # signals instead.  Minimising NEVER stops the nodes (only the X / a genuine close does).
+    if hide_on_close:
+        # Session-bound (notebook) console: the X HIDES the window (keeps the panel layout so a
+        # later exp.task_console() restores the SAME interface) and stops every running node so
+        # the devices are released.  close_requested fires on the X, not on minimize.
+        window.close_requested.connect(console.stop_all_nodes)
+    else:
+        # Standalone window (.bat / explicit): the X fully tears the console down.
+        window.closed.connect(console.shutdown)
     window.adjustSize()
     window.setFixedSize(window.size())
     window.show()

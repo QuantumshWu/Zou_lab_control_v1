@@ -19,46 +19,87 @@ from __future__ import annotations
 from typing import Any
 
 
-def open_task_console(session: Any, *, task: str | None = None, **kwargs):
-    """Open the Task console bound to ``session``.
+def _alive(widget) -> bool:
+    """True if a Qt widget's underlying C++ object still exists (not destroyed)."""
 
-    Fills the SignalHub + the auto-discovered measurement / processor / task catalogs from
-    the session, so a notebook needs only ``exp.task_console()``.  ``task`` loads a saved
-    layout (``tasks/<name>.json``)."""
+    try:
+        widget.objectName()      # raises RuntimeError once the C++ object is gone
+        return True
+    except (RuntimeError, ReferenceError, AttributeError):
+        return False
+
+
+def _reshow(window) -> None:
+    """Bring a hidden / minimised window back to the front."""
+
+    if window is None:
+        return
+    window.showNormal()
+    window.raise_()
+    window.activateWindow()
+
+
+def open_task_console(session: Any, *, task: str | None = None, **kwargs):
+    """Open the Task console bound to ``session`` -- ONE per session (confocal-style singleton).
+
+    The first call builds it (filling the SignalHub + the auto-discovered measurement /
+    processor / task catalogs; ``task`` loads a saved ``tasks/<name>.json`` layout).  A later
+    call RESHOWS the SAME console -- so a notebook never accumulates duplicate windows, and
+    reopening restores the previous interface.  Closing its window (the X) STOPS every running
+    node (releasing the camera / sequencer) but keeps the layout, since the window only hides."""
 
     from Zou_lab_control.frontend.task_console import show_task_console
 
     from .core.signals import SignalHub
 
+    existing = getattr(session, "_zlc_task_console", None)
+    if existing is not None and _alive(existing):
+        _reshow(existing.window())          # singleton: reuse + restore, never a second window
+        return existing
+
     readout = session.readout
-    return show_task_console(
+    console = show_task_console(
         hub=SignalHub(),
         session=session,
         task=task,
         measurements=readout.measurement_specs(),
         processors=readout.processor_specs(),
         tasks=readout.task_specs(),
+        hide_on_close=True,                 # close = stop nodes + hide (reopen restores)
         **kwargs,
     )
+    session._zlc_task_console = console
+    return console
 
 
 def open_pulse_gui(session: Any = None, *, state=None, **kwargs):
     """Open the pulse-sequence editor.
 
     With a ``session`` the editor binds to that experiment (channels / sequencer come from it,
-    and a measurement can later read the edited program back).  With ``session=None`` it runs
-    STANDALONE -- the editor picks its own server connection and needs no experiment."""
+    and a measurement can later read the edited program back) and is a ONE-per-session singleton:
+    a later ``exp.pulse_gui()`` reshows the SAME editor (its loaded program + edits) instead of a
+    new window; closing it just hides it.  With ``session=None`` it runs STANDALONE -- the editor
+    picks its own server connection, needs no experiment, and each call is its own window."""
 
     from Zou_lab_control.frontend.pulse_gui import show_pulse_gui
 
     if session is None:
         return show_pulse_gui(state=state, **kwargs)
-    return show_pulse_gui(
+
+    existing = getattr(session, "_zlc_pulse_gui", None)
+    if existing is not None and _alive(existing):
+        _reshow(getattr(existing, "_zlc_window", None) or existing.window())
+        return existing
+
+    editor = show_pulse_gui(
         experiment=session,
         sequencer=getattr(session, "sequencer", None),
         state=state,
+        hide_on_close=True,
         **kwargs,
     )
+    session._zlc_pulse_gui = editor
+    return editor
 
 
 __all__ = ["open_task_console", "open_pulse_gui"]

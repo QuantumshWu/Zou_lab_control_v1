@@ -4174,6 +4174,7 @@ def show_pulse_gui(
     channel_pins: Mapping[str, str] | None = None,
     scale: float | None = None,
     window_ratio: float = DEFAULT_WINDOW_RATIO,
+    hide_on_close: bool = False,
 ) -> PulseSequenceEditor:
     app = ensure_qt_app()
     editor = PulseSequenceEditor(
@@ -4186,7 +4187,10 @@ def show_pulse_gui(
         scale=scale,
         window_ratio=window_ratio,
     )
-    window = FluentWindow(widget=editor, title="PulseGUI@Zou lab", hide_on_close=False)
+    # hide_on_close=True (the session-bound notebook editor): the X HIDES the window so a later
+    # exp.pulse_gui() restores the SAME editor (its loaded program + edits) instead of a blank
+    # new one.  The standalone .bat keeps the default destroy-on-close.
+    window = FluentWindow(widget=editor, title="PulseGUI@Zou lab", hide_on_close=hide_on_close)
     editor._set_gui_title(editor.windowTitle())
     window.adjustSize()
     window.setFixedSize(window.size())

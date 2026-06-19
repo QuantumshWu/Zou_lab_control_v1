@@ -416,6 +416,57 @@ def test_save_persists_edit_param_values_not_just_layout():
         exp.close()
 
 
+def test_session_gui_is_a_singleton_that_reopens_the_same_window():
+    """``exp.task_console()`` / ``exp.pulse_gui()`` are PER-SESSION singletons (confocal-style):
+    a second call REUSES the same window rather than opening a duplicate, and closing the window
+    (the X) hides it -- so reopening restores the SAME interface, not a blank new one.  The
+    standalone ``show_pulse_gui()`` (no session) stays a fresh window per call."""
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.neutral_atom._gui import open_pulse_gui
+
+    app = ensure_qt_app()
+    exp = _calibrated_virtual_session()
+    try:
+        before = len(getattr(app, "_zlc_task_windows", []))
+        c1 = exp.task_console()
+        c2 = exp.task_console()
+        assert c1 is c2                                          # singleton: the SAME console
+        assert len(app._zlc_task_windows) == before + 1         # exactly ONE window created
+        c1.window().close()                                     # X -> hide (hide_on_close), not destroy
+        c3 = exp.task_console()
+        assert c3 is c1                                         # reopen reuses + restores it
+        assert len(app._zlc_task_windows) == before + 1         # still no duplicate window
+
+        e1 = exp.pulse_gui()
+        e2 = exp.pulse_gui()
+        assert e1 is e2                                         # pulse editor singleton too
+        assert open_pulse_gui() is not open_pulse_gui()         # standalone (no session): per-call window
+    finally:
+        exp.close()
+
+
+def test_embedded_canvas_detaches_figure_from_pyplot():
+    """An embedded panel figure is unregistered from pyplot's Gcf so a notebook backend
+    (``%matplotlib widget``) cannot keep RESIZING it from the notebook layout -- the cause of
+    wrong embedded panel sizes in a notebook (a task's Monitor) that the standalone .bat (plain
+    Agg) never hit.  The figure's design size is preserved."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib._pylab_helpers import Gcf
+
+    from Zou_lab_control.frontend.qt_canvas import EmbeddedFigureCanvas
+
+    if EmbeddedFigureCanvas is None:
+        pytest.skip("matplotlib Qt canvas unavailable")
+    fig = plt.figure(dpi=300, figsize=(3, 2))
+    num = fig.canvas.manager.num
+    assert num in Gcf.figs                                      # pyplot is managing it
+    EmbeddedFigureCanvas(fig, display_scale=1.0)
+    assert num not in Gcf.figs                                  # the Qt canvas detached it
+    assert tuple(fig.get_size_inches()) == (3.0, 2.0)           # design size untouched
+
+
 def test_session_gui_launchers_delegate_and_pulse_runs_standalone(monkeypatch):
     """``exp.task_console()`` / ``exp.pulse_gui()`` are confocal-style session sugar that
     delegate to the frontend launchers via the GUI-action module (``neutral_atom`` reaches the

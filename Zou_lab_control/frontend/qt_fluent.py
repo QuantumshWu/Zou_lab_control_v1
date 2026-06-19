@@ -1877,6 +1877,7 @@ class FluentWindow(FramelessWindow):
 
     hidden = QtCore.pyqtSignal()   # fires on close OR hide/minimize (event-loop quit)
     closed = QtCore.pyqtSignal()   # fires ONLY on a genuine close, never on hide/minimize
+    close_requested = QtCore.pyqtSignal()  # fires on the X/close (before hide-or-destroy), NOT on minimize
 
     def __init__(
         self,
@@ -1984,6 +1985,7 @@ class FluentWindow(FramelessWindow):
         self._position_window_title()
 
     def closeEvent(self, event):
+        self.close_requested.emit()   # the X was pressed (NOT a minimize); fires whether we hide or destroy
         self.hidden.emit()
         if self._hide_on_close:
             event.ignore()
