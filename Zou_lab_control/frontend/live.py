@@ -2097,7 +2097,40 @@ class _GridData:
         return self.cells[k]
 
     def save(self, path: str = "", **kwargs):
-        return self.grid.save(path, **kwargs)
+        """Save the whole grid the SAME way DataFigure saves a single plot: ONE png AND
+        ONE matching ``.npz`` of the plotted data (here the per-cell raw distributions).
+        The path-stem logic mirrors :meth:`DataFigure.save` so the caller passes a path the
+        same way."""
+        import time
+        from pathlib import Path
+        current_time = time.strftime("%Y_%m_%d_%H_%M_%S", time.localtime())
+        stem = current_time
+        p = Path(path)
+        if str(p) in ("", "."):
+            base = Path(stem)
+        elif p.is_dir() or str(p).endswith(("/", "\\")):
+            base = p / stem
+        elif p.suffix:
+            base = p.with_suffix("")
+        else:
+            base = Path(f"{p}_{stem}")
+        base.parent.mkdir(parents=True, exist_ok=True)
+        image_path = base.with_suffix(".png")
+        data_path = base.with_suffix(".npz")
+        self.fig.savefig(image_path, **kwargs)
+        # Pack each cell's DataFigure data (data_x / data_y) into the .npz, one key per
+        # cell; the experimenter can reload the per-site distributions identically to a
+        # single-plot save.
+        bundle: dict[str, np.ndarray] = {}
+        for k, c in enumerate(self.cells):
+            try:
+                bundle[f"cell{k}_data_x"] = np.asarray(c.data_x, dtype=float)
+                bundle[f"cell{k}_data_y"] = np.asarray(c.data_y, dtype=float)
+            except Exception:
+                continue
+        bundle["n_cells"] = np.asarray(len(self.cells), dtype=int)
+        np.savez(data_path, **bundle)
+        return {"figure": image_path, "data": data_path}
 
 
 class GridPlot(BaseLivePlot):
@@ -2278,13 +2311,10 @@ class GridPlot(BaseLivePlot):
     def to_data_figure(self):
         self.data_figure = _GridData(self)
         return self.data_figure
-
-    def save(self, path: str = "", **kwargs):
-        # Saved figures use the UNIFIED high save dpi (rcParams ``savefig.dpi`` = 600), the
-        # SAME as every single-axes plot's DataFigure.save -- never the on-screen design /
-        # live-render dpi (which would write a panel's 150-dpi preview bitmap to disk).
-        self.fig.savefig(path, **kwargs)
-        return path
+    # No ``save`` override here: ``BaseLivePlot.save`` -> ``to_data_figure().save`` ->
+    # ``_GridData.save`` writes BOTH the png AND a matching ``.npz`` of every cell's data
+    # (the DataFigure contract).  The saved png picks up the UNIFIED high save dpi from
+    # ``rcParams['savefig.dpi'] = 600``, the same as every single-axes DataFigure.save.
 
 
 class SiteHistogramGrid(GridPlot):
