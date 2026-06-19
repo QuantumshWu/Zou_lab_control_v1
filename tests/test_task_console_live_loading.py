@@ -83,6 +83,34 @@ def test_removed_loading_composite_is_not_offered():
         exp.close()
 
 
+def test_embedded_canvas_pins_design_dpi_against_backend_inflation():
+    """An embedded panel figure must size from the DESIGN dpi captured when the canvas adopts it,
+    NOT from a later-inflated ``figure._original_dpi``.  On a high-DPI screen under ``%matplotlib
+    widget`` (ipympl, the notebook backend) the Qt backend inflates ``_original_dpi`` by the screen
+    ratio (e.g. 300 -> 750), which made a task's mid-run Monitor figure render ~2.5x too big and
+    clip (title cut, colorbar/dist off-screen) -- in the notebook only; the standalone .bat (Agg)
+    kept _original_dpi=300.  Guard: even if _original_dpi is inflated after construction, the
+    canvas's _zlc_sync uses the captured design dpi, so figure.dpi tracks the design, not 999."""
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib.figure import Figure
+
+    from Zou_lab_control.frontend.qt_canvas import EmbeddedFigureCanvas
+    from Zou_lab_control.frontend.style import DESIGN_DPI, LIVE_RENDER_SCALE
+
+    if EmbeddedFigureCanvas is None:
+        pytest.skip("matplotlib Qt canvas unavailable")
+    fig = Figure(dpi=DESIGN_DPI)
+    fig.set_size_inches(2.0, 1.5)
+    cv = EmbeddedFigureCanvas(fig, display_scale=1.0, render_scale=LIVE_RENDER_SCALE)
+    assert cv._zlc_design_dpi == float(DESIGN_DPI)        # captured the design dpi
+    fig._original_dpi = 999.0                              # simulate the backend inflating it later
+    cv._zlc_sync()
+    real = float(super(type(cv), cv).devicePixelRatioF()) or 1.0
+    # figure.dpi follows the DESIGN dpi (x real x render_scale), NOT the inflated 999
+    assert abs(fig.dpi - DESIGN_DPI * real * LIVE_RENDER_SCALE) < 1e-6
+
+
 def test_two_permanent_tabs_monitor_and_logic():
     exp = _calibrated_virtual_session()
     console = _console(exp)

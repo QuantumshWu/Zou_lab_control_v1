@@ -58,7 +58,17 @@ else:
             # display-only panel (Monitor card, NO selectors) lets the dashboard
             # board scroll under the cursor instead of swallowing the wheel.
             self._zlc_isolate_wheel = bool(isolate_wheel)
+            # Capture the figure's DESIGN dpi NOW, before FigureCanvasQTAgg adopts it.  On a
+            # high-DPI screen under ``%matplotlib widget`` (ipympl, the notebook backend), the Qt
+            # backend's __init__ INFLATES ``figure._original_dpi`` by the screen ratio (e.g. the
+            # 300-dpi design figure becomes 750 on a 2.5x screen).  _zlc_sync would then render the
+            # figure at design_dpi x that inflation x retina -> ~2.5x too big, overflowing the panel
+            # card (title clipped, colorbar/dist off-screen).  The standalone .bat uses plain Agg, so
+            # _original_dpi stays at the design value -- this captures it so notebook == .bat.
+            self._zlc_design_dpi = float(getattr(figure, "_original_dpi", None) or figure.dpi)
             super().__init__(figure)
+            # undo any backend dpi inflation so design_dpi(fig) (and _zlc_sync) see the true design.
+            figure._original_dpi = self._zlc_design_dpi
             # the backend syncs only in showEvent / on screen signals (never
             # offscreen) -- establish the invariants NOW
             self._zlc_sync()
@@ -89,7 +99,7 @@ else:
             figure.set_size_inches(*self._zlc_inches, forward=False)
             # invariant 2: retina supersampling by the REAL screen ratio, times the live
             # render_scale (rs<1 -> smaller/cheaper buffer; rs cancels in the widget size).
-            figure._set_dpi(figure._original_dpi * real * rs, forward=False)
+            figure._set_dpi(self._zlc_design_dpi * real * rs, forward=False)
             self._device_pixel_ratio = real * self._zlc_ratio * rs
             # invariant 3: logical widget size = design px x display_scale
             width_px, height_px = map(float, figure.bbox.max)
