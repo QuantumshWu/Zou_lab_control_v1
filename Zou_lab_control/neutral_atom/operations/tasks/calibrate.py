@@ -43,12 +43,14 @@ CALIBRATE_PARAMS = (
                       "calibrate again: point the Judge-occupancy processor at its calibration.json.)"),
     ParamDecl("folder", "folder", "path", default=DEFAULT_DATA_DIR, required=True, path_mode="dir",
               base_dir=DEFAULT_DATA_DIR,
-              tooltip="The ONE data directory (input + output).  source=live WRITES everything "
-                      "HERE (no hidden sub-folder): calibration.json + the distribution/fidelity "
-                      "report figures + summary.json + calibration.npz (and, if 'save frames' is "
-                      "on, the raw frames img1.npy, ...).  source=saved frames READS the raw frame "
-                      "files from here -- .npy OR raw camera .tif/.tiff (img1.tif, ...).  Re-running "
-                      "overwrites; use a different folder to keep a run.  Defaults to `calibrations/`."),
+              tooltip="The ONE data directory.  source=live WRITES at the root: calibration.json "
+                      "+ calibration.npz + summary.json + the (png + npz) figure pairs; if "
+                      "'save frames' is on, the raw camera frames go into a clean `frames/` "
+                      "sub-folder (img1.npy, ...) -- the cali root stays uncluttered.  "
+                      "source=saved frames READS those raw frames (.npy OR raw camera .tif/.tiff) "
+                      "from the same `frames/` sub-folder (or, for compatibility, a flat root of "
+                      "img<n> files).  Re-running overwrites; use a different folder to keep a "
+                      "run.  Defaults to `calibrations/`."),
     ParamDecl("save_frames", "save frames (live)", "bool", default=True,
               tooltip="When source=live, also SAVE the acquired raw frames to `folder` (img1.npy, "
                       "...) so you can re-calibrate later with source=saved frames WITHOUT "

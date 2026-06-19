@@ -209,10 +209,11 @@ def test_calibrate_task_saved_frames_uses_reference_brackets_for_held_out_fideli
 
 
 def test_calibrate_task_live_save_frames_round_trip(tmp_path):
-    """source=live with save_frames=True WRITES the acquired raw frames (img<n>.npy) + a
-    run_schema.json into `folder`, so a later source="saved frames" run re-calibrates from
-    them WITHOUT re-acquiring (the "don't re-run every time" ask).  The saved run round-trips
-    through index_run via the schema sidecar (no frame duplication, no hard-coded layout)."""
+    """source=live with save_frames=True puts the acquired raw frames in a clean
+    ``<folder>/frames/`` sub-folder (img<n>.npy) -- NOT at the root, so the cali folder root
+    stays uncluttered (canonical artifacts + paired figure saves only).  A run_schema.json at
+    the root records the layout (incl. ``frames_subdir``) so a later source="saved frames" run
+    re-calibrates from those frames WITHOUT re-acquiring."""
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
 
     exp = _calibrated()
@@ -223,9 +224,12 @@ def test_calibrate_task_live_save_frames_round_trip(tmp_path):
             SignalHub(), source="live", folder=str(folder), save_frames=True,
             calibration_frames=3, threshold_frames=n_groups)
         made.run_to_completion()
-        # raw frames + schema written: one contiguous run, 3 frames/group (ref-short-ref)
-        imgs = sorted(folder.glob("img*.npy"))
-        assert len(imgs) == n_groups * 3
+        # raw frames in a CLEAN sub-folder, NOT at the root (cali folder root stays tidy)
+        assert sorted(folder.glob("img*.npy")) == [], "raw frames must NOT be at the cali root"
+        frames_dir = folder / "frames"
+        assert frames_dir.is_dir()
+        imgs = sorted(frames_dir.glob("img*.npy"))
+        assert len(imgs) == n_groups * 3                # 3 frames/group (ref-short-ref)
         assert (folder / "run_schema.json").exists()
         # re-calibrate from those saved frames -- no second acquisition, same site count
         reused = exp.readout.calibrate_task(
@@ -237,7 +241,8 @@ def test_calibrate_task_live_save_frames_round_trip(tmp_path):
 
 
 def test_calibrate_task_live_save_frames_off_writes_no_frames(tmp_path):
-    """save_frames=False writes ONLY the calibration + report -- no raw frames, no schema."""
+    """save_frames=False writes ONLY the calibration + report -- no raw frames, no schema,
+    no frames sub-folder."""
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
 
     exp = _calibrated()
@@ -248,7 +253,8 @@ def test_calibrate_task_live_save_frames_off_writes_no_frames(tmp_path):
             calibration_frames=3, threshold_frames=8)
         made.run_to_completion()
         assert (folder / "calibration.json").exists()       # the calibration is still written
-        assert sorted(folder.glob("img*.npy")) == []        # but NO raw frames
+        assert sorted(folder.glob("img*.npy")) == []        # no frames at root
+        assert not (folder / "frames").exists()             # no frames sub-folder either
         assert not (folder / "run_schema.json").exists()
     finally:
         exp.close()

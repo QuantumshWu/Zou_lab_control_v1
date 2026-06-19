@@ -949,17 +949,28 @@ class CalibrateReadoutTask(Task):
             out.publish(frame=frames[readout_index], progress=frac, stage=f"readout bracket {g + 1}/{n_groups}")
         return reference_groups, readout_per_group
 
+    # Raw camera frames are an INPUT-format artifact (the round-trip data for a later
+    # source="saved frames" re-cali), NOT a "save action".  They live in this explicit
+    # semantic sub-folder of ``folder`` so the cali folder root stays clean -- only the
+    # canonical artifacts (calibration.json / .npz / summary.json / run_schema.json) and
+    # the paired (.png + .npz) figure saves live at the root.  An explicit named sub-folder
+    # is NOT the "hidden timestamp" the user banned in #3 -- this name is fixed, predictable,
+    # and the GUI's "folder" field still points at the user-chosen root.
+    FRAMES_SUBDIR = "frames"
+
     def _save_live_frames(self, ref_groups, readout_by_group) -> None:
-        """Write the live brackets to ``folder`` as a contiguous ``img<n>.npy`` run plus a
-        ``run_schema.json`` describing the grouping, so a later source="saved frames" run
-        re-indexes them with ``index_run`` and re-calibrates WITHOUT re-acquiring.  Each group
-        is written in trigger order (the short readout in the middle of its reference frames),
-        and the schema records ``shots_per_group`` / ``short_shot`` / ``ref_shots`` so the
-        reader reconstructs the exact bracket -- no frame duplication, no hard-coded layout."""
+        """Write the live brackets to ``<folder>/frames/`` as a contiguous ``img<n>.npy`` run
+        plus a ``run_schema.json`` at the cali folder root describing the grouping (and the
+        frames sub-folder), so a later source="saved frames" run re-indexes them with
+        ``index_run`` and re-calibrates WITHOUT re-acquiring.  Each group is written in trigger
+        order (the short readout in the middle of its reference frames); the schema records
+        ``shots_per_group`` / ``short_shot`` / ``ref_shots`` / ``frames_subdir`` so the reader
+        reconstructs the exact bracket -- no frame duplication, no hard-coded layout."""
         import json
         from .imageio import save_frame
         folder = Path(self.folder)
-        folder.mkdir(parents=True, exist_ok=True)
+        frames_dir = folder / self.FRAMES_SUBDIR
+        frames_dir.mkdir(parents=True, exist_ok=True)
         n_ref = int(self.REFERENCE_FRAMES_PER_BRACKET)
         readout_index = n_ref // 2
         n = 0
@@ -968,30 +979,40 @@ class CalibrateReadoutTask(Task):
             group = refs[:readout_index] + [short] + refs[readout_index:]   # trigger order
             for fr in group:
                 n += 1
-                save_frame(folder / f"img{n}.npy", np.asarray(fr, dtype=float))
+                save_frame(frames_dir / f"img{n}.npy", np.asarray(fr, dtype=float))
         short_shot = readout_index + 1                       # 1-based position of the short frame
         ref_shots = [i for i in range(1, n_ref + 2) if i != short_shot]
         schema = {"prefix": "img", "shots_per_group": n_ref + 1, "short_shot": short_shot,
-                  "ref_shots": ref_shots, "n_groups": int(len(readout_by_group))}
+                  "ref_shots": ref_shots, "n_groups": int(len(readout_by_group)),
+                  "frames_subdir": self.FRAMES_SUBDIR}
         (folder / "run_schema.json").write_text(json.dumps(schema, indent=2), encoding="utf-8")
 
     def _index_saved_run(self):
-        """Index the saved frames in ``folder``, honouring a ``run_schema.json`` if the live
-        run wrote one (so a live-saved bracket re-reads with its real grouping); otherwise the
-        index_run defaults (the write_virtual_run / 4-shot convention)."""
+        """Index the saved frames, honouring ``run_schema.json`` (the live run wrote it) so a
+        live-saved bracket re-reads with its real grouping + its ``frames_subdir``.  If no
+        schema, fall back to the index_run defaults (the write_virtual_run / 4-shot convention)
+        at the folder root."""
         import json
         from .imageio import index_run
-        schema_path = Path(self.folder) / "run_schema.json"
+        root = Path(self.folder)
+        schema_path = root / "run_schema.json"
         if schema_path.is_file():
             try:
                 s = json.loads(schema_path.read_text(encoding="utf-8"))
-                return index_run(self.folder, str(s.get("prefix", "img")),
+                sub = str(s.get("frames_subdir", "") or "")
+                data_dir = root / sub if sub else root
+                return index_run(data_dir, str(s.get("prefix", "img")),
                                  shots_per_group=int(s["shots_per_group"]),
                                  short_shot=int(s["short_shot"]),
                                  ref_shots=tuple(int(v) for v in s["ref_shots"]))
             except Exception:
                 pass
-        return index_run(self.folder, "img")
+        # No schema: try the named sub-folder first (cleaner layout), else the root (legacy /
+        # write_virtual_run convention -- a flat folder of img<n>.npy).
+        sub = root / self.FRAMES_SUBDIR
+        if sub.is_dir() and any(sub.glob("img*.npy")) or any(sub.glob("img*.tif*")):
+            return index_run(sub, "img")
+        return index_run(root, "img")
 
     def _run_from_folder(self, out: "TaskOutput"):
         """Calibrate from frames SAVED IN A FOLDER (the real-data flow): index the run,
