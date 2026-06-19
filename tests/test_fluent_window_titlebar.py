@@ -75,6 +75,10 @@ def test_pivot_tabs_have_no_box_fill_and_selected_underline():
     assert "QTabBar::tab" in qss
     # selected tab is marked by an accent bottom border (underline), not a fill
     assert "border-bottom" in qss and qf.ACCENT in qss
+    # the QTabBar "base" line (drawn across the WHOLE bar width, so it grows with the tab
+    # count) must be OFF -- otherwise it shows as a thin line on the bar's top edge, above
+    # the labels (the reported "tab 上方的细黑线").
+    assert tabs.tabBar().drawBase() is False
     # no per-tab background FILL colour (BG) that would draw grey boxes on the card
     import re
     tab_block = re.search(r"QTabBar::tab \{\{?(.*?)\}\}?", qss, re.S)

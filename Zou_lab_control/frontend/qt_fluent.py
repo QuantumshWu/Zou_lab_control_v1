@@ -1240,6 +1240,13 @@ class _FluentTabBar(QtWidgets.QTabBar):
     bar.  No tab scrolls off, so no scroll arrows appear; the corner ``...`` overflow menu
     lists every FULL title.  Reusable, frontend-owned."""
 
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # Pivot tabs carry their own accent UNDERLINE; QTabBar's default "base" -- a line the
+        # style strokes across the WHOLE bar width (and so grows with the tab count) -- would
+        # show as a thin line on the bar's top edge, above the labels.  Turn it off.
+        self.setDrawBase(False)
+
     def _natural_widths(self) -> list:
         # Explicit base call (NOT a no-arg super(), which fails inside a comprehension frame).
         base = QtWidgets.QTabBar.tabSizeHint
