@@ -1001,7 +1001,7 @@ class PulseTableState:
         named ``image`` (case-insensitive); failing that, the last period.  The original is
         left unchanged (callers reuse one template for several exposures)."""
         import copy
-        idx = next((i for i, p in enumerate(self.periods) if str(p.name).strip().lower() == "image"), None)
+        idx = period_index_by_name(self, "image")
         if idx is None:
             if not self.periods:
                 return self
@@ -1943,12 +1943,89 @@ def _insert_implicit_mul(text: str) -> str:
     return text
 
 
+@dataclass(frozen=True)
+class PulseParam:
+    """One addressable, software-settable pulse parameter for a per-point scan.
+
+    A measurement scans a parameter by, PER POINT, loading the base template, calling
+    :meth:`apply` to set this parameter to the point's value, compiling ``to_sequence()`` and
+    firing -- the "non-slot" software scan: no hardware scan slot is needed, so it can sweep a
+    period DURATION, a channel DELAY, or a DAC bus level of ANY loaded program (delay and a
+    not-yet-slotted duration are settable here even though the streaming scan slots only cover
+    duration/dac).
+
+    ``kind``   -- ``"duration"`` | ``"delay"`` | ``"dac"``.
+    ``target`` -- duration: the period index as a string; delay: the channel name;
+                  dac: ``"<bus>@<period_index>"``.
+    ``unit``   -- time unit for duration / delay (``ns``/``us``/``ms``/``s``); IGNORED for dac
+                  (DAC values are unitless signed LSB codes, 0 = 0 V).
+    """
+
+    kind: str
+    target: str
+    unit: str = "ns"
+
+    def apply(self, state: "PulseTableState", value: float) -> "PulseTableState":
+        """Return a NEW state (the input is never mutated) with this parameter set to ``value``.
+
+        Deep-copies first (the ``set_*`` methods mutate in place) and delegates to the existing
+        ``PulseTableState`` setters, so it inherits every guard they carry -- a scan-bound
+        duration raises, a DAC value outside the bus signed range raises -- rather than touching
+        the periods directly."""
+        import copy
+
+        clone = copy.deepcopy(state)
+        if self.kind == "duration":
+            clone.set_period_duration(int(self.target), float(value), unit=self.unit)
+        elif self.kind == "delay":
+            clone.set_channel_delay(str(self.target), float(value), unit=self.unit)
+        elif self.kind == "dac":
+            bus, _, period = str(self.target).partition("@")
+            clone.set_analog_bus_mode(int(period), bus, "edge", value=int(round(float(value))))
+        else:
+            raise ValueError(f"unknown PulseParam kind {self.kind!r} (expected duration/delay/dac).")
+        return clone
+
+
+def period_index_by_name(state: "PulseTableState", name: str) -> int | None:
+    """Index of the first period whose name matches ``name`` (case-insensitive, stripped), or
+    ``None`` if no period carries that name.  The single source for name->index resolution
+    (``with_imaging_exposure`` and the scan-target enumeration both use it)."""
+
+    key = str(name).strip().lower()
+    return next((i for i, p in enumerate(state.periods)
+                 if str(p.name).strip().lower() == key), None)
+
+
+def enumerate_pulse_params(state: "PulseTableState") -> list[tuple[str, str, str]]:
+    """Every software-scannable parameter of ``state`` as ``(kind, target, label)`` triples --
+    the ONE source the GUI scan-target dropdown and a notebook both read.  Covers every period
+    DURATION, every channel DELAY, and every DAC bus level per period; a duration already bound
+    to a scan slot is flagged in its label (setting it raises until the slot is unbound)."""
+
+    out: list[tuple[str, str, str]] = []
+    for i, period in enumerate(state.periods):
+        pname = str(period.name).strip() or f"period {i}"
+        bound = state.slot_index_for("duration", str(i)) is not None
+        out.append(("duration", str(i), f"{pname} duration" + (" (scan-bound)" if bound else "")))
+    for channel in state.channels:
+        out.append(("delay", str(channel), f"{state.label_for(channel)} delay"))
+    for bus in state.bus_channels(min_width=1):
+        for i, period in enumerate(state.periods):
+            pname = str(period.name).strip() or f"period {i}"
+            out.append(("dac", f"{bus}@{i}", f"{bus} @ {pname} (DAC, signed LSB)"))
+    return out
+
+
 __all__ = [
     "ANALOG_BUS_MODES",
     "SCAN_SLOT_KINDS",
+    "PulseParam",
     "PulsePeriod",
     "PulseTableState",
     "ScanSlot",
+    "enumerate_pulse_params",
+    "period_index_by_name",
     "affine_coeffs",
     "default_pulse_name",
     "default_periods",
