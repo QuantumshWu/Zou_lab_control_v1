@@ -416,6 +416,36 @@ def test_save_persists_edit_param_values_not_just_layout():
         exp.close()
 
 
+def test_session_gui_launchers_delegate_and_pulse_runs_standalone(monkeypatch):
+    """``exp.task_console()`` / ``exp.pulse_gui()`` are confocal-style session sugar that
+    delegate to the frontend launchers via the GUI-action module (``neutral_atom`` reaches the
+    frontend ONLY here, lazily -- never on its analysis-path import).  task_console fills the
+    hub + the auto-discovered catalogs; pulse_gui binds the experiment.  The pulse editor also
+    runs STANDALONE with no session (``open_pulse_gui()`` -> no ``experiment`` kwarg)."""
+    import Zou_lab_control.frontend.pulse_gui as pgmod
+    import Zou_lab_control.frontend.task_console as tcmod
+    import Zou_lab_control.neutral_atom._gui as gui
+
+    calls: dict = {}
+    monkeypatch.setattr(tcmod, "show_task_console", lambda **kw: (calls.__setitem__("tc", kw), "CONSOLE")[1])
+    monkeypatch.setattr(pgmod, "show_pulse_gui", lambda **kw: (calls.setdefault("pg", []).append(kw), "EDITOR")[1])
+
+    exp = _calibrated_virtual_session()
+    try:
+        assert exp.task_console(task="foo") == "CONSOLE"
+        tc = calls["tc"]
+        assert tc["session"] is exp and tc["task"] == "foo"
+        assert {"hub", "measurements", "processors", "tasks"} <= set(tc)   # catalogs filled from session
+
+        assert exp.pulse_gui() == "EDITOR"
+        assert calls["pg"][-1]["experiment"] is exp                        # bound to the session
+
+        gui.open_pulse_gui()                                               # STANDALONE
+        assert "experiment" not in calls["pg"][-1]                         # no session needed
+    finally:
+        exp.close()
+
+
 def test_added_site_map_panel_opens_unbound_even_with_occupied_live():
     """#4 regression: a freshly Added 'Plot: site map' panel opens UNBOUND.  The user picks
     the occupancy signal in its Setting, and ONLY THEN do the centres + frame underlay

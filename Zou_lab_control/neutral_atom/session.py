@@ -77,6 +77,29 @@ class NeutralAtomSession:
             self._timing_subsystem = TimingSubsystem(self)
         return self._timing_subsystem
 
+    # ---- GUI launchers (confocal-style ``exp.task_console()`` / ``exp.pulse_gui()``) --------
+    # The windows live in the frontend; these are thin sugar reached LAZILY through the
+    # GUI-action module ``_gui`` (which imports the frontend only when a window is opened), so
+    # the analysis path (connect / sitemap / thresholds / detect) never pulls the frontend and
+    # virtual==real stays headless.  ``session.py`` references only ``_gui`` -- never the
+    # frontend itself -- keeping the one-directional neutral_atom -> frontend seal.
+    def task_console(self, *, task: str | None = None, **kwargs):
+        """Open the Task console GUI bound to this session.
+
+        Sugar over ``frontend.show_task_console``: fills the hub + the auto-discovered
+        measurement / processor / task catalogs from this session.  ``task`` loads a saved
+        layout (``tasks/<name>.json``)."""
+        from ._gui import open_task_console
+        return open_task_console(self, task=task, **kwargs)
+
+    def pulse_gui(self, *, state=None, **kwargs):
+        """Open the pulse-sequence editor GUI bound to this session, so a measurement can read
+        the edited program back.  To run the editor WITHOUT a session (it picks its own server
+        connection, needing no experiment) call ``Zou_lab_control.frontend.show_pulse_gui()``
+        directly."""
+        from ._gui import open_pulse_gui
+        return open_pulse_gui(self, state=state, **kwargs)
+
     def _configure_imaging(self, *, exposure: float | None = None, load: bool = True, trigger_width: float = 20e-6, pre_trigger: float = 100e-6) -> PulseSequence:
         if exposure is not None and hasattr(self.devices.camera, "configure"):
             self.devices.camera.configure(exposure=exposure)
