@@ -3910,7 +3910,7 @@ class TaskConsole(QtWidgets.QWidget):
         faulted = [n for n in self.running_nodes if getattr(n, "last_error", None)]
         if faulted:
             node = faulted[0]
-            who = (getattr(node, "prefix", "") or self._node_label(node) or "node").rstrip(":")
+            who = (getattr(node, "prefix", "") or self._node_label(node) or "node").rstrip("_:")
             n = int(getattr(node, "consecutive_errors", 1))
             self.summary.setStyleSheet(_SUMMARY_STYLE_DANGER)
             self.summary.setText(f"⚠ NODE ERROR ({who}, ×{n}): {node.last_error}"[:200])

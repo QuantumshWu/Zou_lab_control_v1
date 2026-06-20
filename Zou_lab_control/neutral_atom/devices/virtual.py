@@ -104,16 +104,13 @@ class VirtualTrapArray(TrapArrayDevice):
     # shows a visible survival roll-off -- the real SNR-vs-loss trade-off.
     detection_lifetime: float = 2.0
     # --- Cooling / heating model (sets the temperature release-recapture sees) -
-    # An atom is loaded warm (``mot_temperature_K``) and PGC-cooled toward
-    # ``cooled_temperature_K``; the probe (imaging light) heats it at
-    # ``probe_heating_K_per_s`` whenever it is on WITHOUT cooling, and any cooling
-    # phase pulls the temperature back toward the cooled floor with time constant
-    # ``cooling_tau_s``.  A temperature scan (release-recapture vs trap-off time)
-    # therefore recovers ``cooled_temperature_K`` -- raise the heating rate and you
-    # see a hotter fitted temperature, exactly as a real heating pulse would give.
-    mot_temperature_K: float = 250e-6
+    # A freshly loaded atom starts PGC-cooled at ``cooled_temperature_K``; the probe
+    # (imaging light) recoil-heats it at ``probe_heating_K_per_s`` per second of
+    # exposure (0 by default -> readout is temperature-neutral).  A temperature scan
+    # (release-recapture vs trap-off time) therefore recovers ``cooled_temperature_K``
+    # -- raise the heating rate and you see a hotter fitted temperature, exactly as a
+    # real heating pulse would give.
     cooled_temperature_K: float = 50e-6
-    cooling_tau_s: float = 1.0e-3
     probe_heating_K_per_s: float = 0.0    # default 0 -> readout does not bias the temperature
     # --- Release-recapture loss model (data-source side only) -----------------
     # When a fired sequence switches the trap OFF for ``t_off`` seconds between
@@ -153,9 +150,7 @@ class VirtualTrapArray(TrapArrayDevice):
         self.load_time_constant_s = positive_float(self.load_time_constant_s, "load_time_constant_s")
         self.mot_load_s = positive_float(self.mot_load_s, "mot_load_s")
         self.detection_lifetime = positive_float(self.detection_lifetime, "detection_lifetime")
-        self.mot_temperature_K = positive_float(self.mot_temperature_K, "mot_temperature_K")
         self.cooled_temperature_K = positive_float(self.cooled_temperature_K, "cooled_temperature_K")
-        self.cooling_tau_s = positive_float(self.cooling_tau_s, "cooling_tau_s")
         self.probe_heating_K_per_s = nonnegative_float(self.probe_heating_K_per_s, "probe_heating_K_per_s")
         self.capture_radius_m = positive_float(self.capture_radius_m, "capture_radius_m")
         self.recapture_mass_kg = positive_float(self.recapture_mass_kg, "recapture_mass_kg")
@@ -227,16 +222,6 @@ class VirtualTrapArray(TrapArrayDevice):
         self._pinned = False
         return pinned
 
-    def cool(self, duration: float) -> None:
-        """A cooling/PGC phase of ``duration`` s relaxes every atom's temperature
-        toward the cooled floor with time constant ``cooling_tau_s`` (so a long
-        cooling pulse fully re-cools an atom heated by a prior probe)."""
-        dt = float(duration)
-        if dt <= 0.0:
-            return
-        factor = float(np.exp(-dt / self.cooling_tau_s))
-        self.temperature_K = self.cooled_temperature_K + (self.temperature_K - self.cooled_temperature_K) * factor
-
     def heat(self, duration: float) -> None:
         """A probe (imaging-light) phase of ``duration`` s recoil-heats every atom
         at ``probe_heating_K_per_s`` (0 by default -> readout is temperature-neutral)."""
@@ -294,26 +279,6 @@ class VirtualTrapArray(TrapArrayDevice):
             self.occupancy = next_occupancy
             self.heat(exposure)               # the probe recoil-heats the imaged atoms
         return image
-
-    def recapture_survival_probability(self, t_off: float, *, temperature_K: float | None = None) -> float:
-        """Ballistic release-recapture survival probability after a trap-off of ``t_off`` s.
-
-        Per axis an atom is recaptured if its ballistic displacement stays inside
-        the capture radius ``r_c``, i.e. ``|v| < r_c / t_off``; for a 1-D thermal
-        spread ``sigma_v = sqrt(k_B T / m)`` that fraction is
-        ``erf(r_c / (sqrt(2) sigma_v t_off))``, and the isotropic 3-D survival is
-        the cube.  ``t_off <= 0`` -> 1.0 (the atom cannot move).  ``temperature_K``
-        defaults to the cooled floor; the per-atom :meth:`apply_recapture_loss` uses
-        each atom's CURRENT temperature.  This is the SAME physics the analysis-side
-        fit assumes, so a fitted temperature recovers a value near the modelled
-        temperature -- but it lives ONLY here, in the data source."""
-        t = float(t_off)
-        if not np.isfinite(t) or t <= 0.0:
-            return 1.0
-        temperature = self.cooled_temperature_K if temperature_K is None else float(temperature_K)
-        sigma_v = sqrt(_K_B * max(temperature, 1e-12) / self.recapture_mass_kg)
-        arg = self.capture_radius_m / (sqrt(2.0) * sigma_v * t)
-        return float(erf(arg) ** 3)
 
     def apply_recapture_loss(self, t_off: float) -> np.ndarray:
         """Randomly drop currently-occupied atoms with the release-recapture model,

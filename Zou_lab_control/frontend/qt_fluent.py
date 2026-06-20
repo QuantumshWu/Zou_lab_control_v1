@@ -1577,10 +1577,9 @@ class FluentSwitch(QtWidgets.QAbstractButton):
         painter.end()
 
     def mouseReleaseEvent(self, event) -> None:
-        if event.button() == QtCore.Qt.LeftButton and self.isEnabled():
-            super().mouseReleaseEvent(event)
-        else:
-            super().mouseReleaseEvent(event)
+        # QAbstractButton already gates toggling on the left button + enabled state,
+        # so the release is forwarded unconditionally.
+        super().mouseReleaseEvent(event)
 
     def _checked_offset(self, track_w: int | None = None, thumb_d: int | None = None, margin: int | None = None) -> float:
         track_w = scaled_px(60, minimum=48) if track_w is None else int(track_w)

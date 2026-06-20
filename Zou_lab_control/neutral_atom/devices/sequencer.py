@@ -1713,41 +1713,6 @@ def _pulse_table_affine_period_starts(
     return starts
 
 
-def _pulse_table_affine_all_edge_exprs(
-    state: PulseTableState,
-    *,
-    slot_vars: Sequence[str],
-    time_step_ns: float,
-    coeff_frac_bits: int,
-    exclude_channels: Sequence[str] = (),
-) -> list[tuple[int, tuple[int, ...]]]:
-    """Every channel's delayed rise/fall edge expr (period_start +/- delay), affine in the
-    scan slots, over ALL non-excluded channels INCLUDING ones that will become delay
-    lanes.  The shared root for the global shift G and the global frame end so the main
-    table and the lanes agree on both."""
-
-    exclude = set(exclude_channels)
-    starts = _pulse_table_affine_period_starts(state, slot_vars=slot_vars, time_step_ns=time_step_ns, coeff_frac_bits=coeff_frac_bits)
-    exprs: list[tuple[int, tuple[int, ...]]] = [(0, tuple(0 for _ in slot_vars)), starts[-1]]
-    for channel_index, channel in enumerate(state.channels):
-        if channel in exclude:
-            continue
-        delay = _affine_expr(state.delays.get(channel, 0.0), state.delay_units.get(channel, "ns"), slot_vars, time_step_ns, coeff_frac_bits)
-        active_start: tuple[int, tuple[int, ...]] | None = None
-        for period_index, period in enumerate(state.periods):
-            value = int(period.states[channel_index])
-            if value and active_start is None:
-                active_start = starts[period_index]
-            elif not value and active_start is not None:
-                exprs.append(_affine_add(active_start, delay))
-                exprs.append(_affine_add(starts[period_index], delay))
-                active_start = None
-        if active_start is not None:
-            exprs.append(_affine_add(active_start, delay))
-            exprs.append(_affine_add(starts[-1], delay))
-    return exprs
-
-
 def _pulse_table_affine_rows(
     state: PulseTableState,
     *,
@@ -1950,33 +1915,6 @@ def _affine_add(left: tuple[int, tuple[int, ...]], right: tuple[int, tuple[int, 
 def _apply_affine_ticks(base: int, coeffs: Sequence[int], slot_ticks: Sequence[int], coeff_frac_bits: int) -> int:
     total = sum(int(coeff) * int(tick) for coeff, tick in zip(coeffs, slot_ticks))
     return int(base) + (total >> int(coeff_frac_bits))
-
-
-def _affine_ticks_matrix(exprs, scan_points, coeff_frac_bits):
-    """``(len(exprs), N)`` numpy int64 array of effective ticks for every expr at every
-    scan point -- the VECTORISED form of ``_apply_affine_ticks`` over a whole sweep.  The
-    affine compile evaluates the same exprs at every scan point several times (global
-    shift G, frame-end domination, global monotonicity); at thousands of points a Python
-    double loop dominates ``compile_scan`` (~0.7 s at 4096 pts).  numpy's ``@`` + arithmetic
-    ``>>`` (sign-extending = floor, identical to Python ``>>``) make it ~milliseconds and
-    BIT-IDENTICAL to ``_apply_affine_ticks``.  ``np.int64`` holds the worst-case dot
-    (coeff 2^15 x slot 2^24 x 4 slots = 2^41)."""
-    import numpy as np
-
-    points = [list(p) for p in scan_points] or [[]]
-    n = len(points)
-    frac = int(coeff_frac_bits)
-    slots = len(points[0]) if points and points[0] else max((len(c) for _b, c in exprs), default=0)
-    if not exprs:
-        return np.zeros((0, n), dtype=np.int64)
-    if slots == 0:
-        return np.array([[int(base)] * n for base, _c in exprs], dtype=np.int64)
-    pts = np.array([(list(p) + [0] * slots)[:slots] for p in points], dtype=np.int64)  # (N, slots)
-    rows = []
-    for base, coeffs in exprs:
-        c = np.array((list(coeffs) + [0] * slots)[:slots], dtype=np.int64)
-        rows.append(int(base) + ((pts @ c) >> frac))
-    return np.stack(rows)
 
 
 def _time_ns_to_ticks(value_ns: float, time_step_ns: float, name: str, *, allow_negative: bool = False) -> int:

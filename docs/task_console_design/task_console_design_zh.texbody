@@ -572,7 +572,7 @@ GUI 的 Start 调的就是同一个 \pyapi{build\_temperature\_scan}（spec.buil
 \section{合规提速 + 留给用户的开关}
 \tfocus{已落地的合规提速 = 空白收紧}（上一章）：figure 像素面积下降 → agg buffer 与面积成正比的 fill/resample/draw\_path/copy-to-Qt 那约 30--40\% 变快（\pyapi{draw\_text} 本身不变）。即空白修复同时是\tfocus{合规的提速}，且正是用户想要的视觉改进。
 
-更激进的提速会\tfocus{改变可见行为或视觉}，\tfocus{不擅自做，标记给用户拍板}：迟滞 / sticky autoscale（让 limit 稳定从而 blit 生效）、错峰重绘（不每 tick 重画全部面板）、嵌入面板低 dpi 性能模式。三者都能显著提速但改 limit 跟踪 / 刷新语义 / 视觉，不在"不改外观不改逻辑"内。
+嵌入面板的低 dpi live-render 性能模式已落地（\pyapi{LIVE\_RENDER\_SCALE}：live 栅格降到约 150 dpi 提速,但显示尺寸与存图 600 dpi 不变,因此不改密封视觉契约）。其余更激进的提速会\tfocus{改变可见行为或视觉}，\tfocus{不擅自做，标记给用户拍板}：迟滞 / sticky autoscale（让 limit 稳定从而 blit 生效）、错峰重绘（不每 tick 重画全部面板）。两者都能显著提速但改 limit 跟踪 / 刷新语义，不在"不改外观不改逻辑"内。
 
 
 \chapter{frontend 密封 API 契约}
@@ -716,7 +716,7 @@ per-site 信号 (photons) & \pyapi{counts} → Distribution(双高斯+阈值) \\
 
 \begin{enumerate}
   \item \tfocus{逻辑节点 + 通用测量 + 一键温度（现状基线）}。三类逻辑节点（\pyapi{CameraMeasurement} / \pyapi{OccupancyProcessor} / \pyapi{CalibrateReadoutTask}，走相机契约、自标定）、通用 Measurement 框架（\pyapi{MeasurementSpec} / 三角色 / \pyapi{ScannedMeasurementNode}）与 release-recapture 一键温度都在库里；换真机 \pyapi{na.connect("qcmos", ...)} 走同一路径。下面的方向在此基线上展开。
-  \item \tfocus{性能激进档需用户拍板}。瓶颈=密封 300dpi 文字栅格化（intrinsic），blit / 位置冻结已实测否决。迟滞 autoscale / 错峰重绘 / 嵌入面板低 dpi 性能模式能进一步提速,但都改可见行为或视觉,需要你决定是否接受（见性能结论章）。
+  \item \tfocus{性能激进档需用户拍板}。瓶颈=密封 300dpi 文字栅格化（intrinsic），blit / 位置冻结已实测否决；嵌入面板低 dpi live-render 已落地（\pyapi{LIVE\_RENDER\_SCALE}，不改显示/存图）。迟滞 autoscale / 错峰重绘能进一步提速,但都改可见行为或视觉,需要你决定是否接受（见性能结论章）。
   \item \tfocus{(N,2) x-y 形状启发式收口}。扫描曲线靠"列数==2"判 x-y;建议改为只在面板 source 明确引用某扫描节点的 \pyapi{x\_key}/\pyapi{y\_key} 时才走 x-y 分支,避免普通 1D 面板碰巧产 (N,2) 被误判。
   \item \tfocus{死码/残留清理（minor）}。\pyapi{live.py} 的 \pyapi{\_set\_colorbar\_ticks} 自递归 no-op（2D 靠 \pyapi{update\_core} 内联设刻度、sites 靠 matplotlib auto-tick，"修"它会改 sites 基线 → 删或显式注释 no-op，走零基线漂移）；\pyapi{PanelCard.\_fit\_df} / \pyapi{FITTABLE\_KINDS} 随 Fit 迁走后只剩测试消费，可干净删除。
   \item \tfocus{时序/漂移面板}。现有 monitor 是单标量滚动;Rb87 的"站点中心随 group 漂移""逐站 F\_bal 条形""drop-worst-sites ablation 曲线"是新面板类型(多线/条形/scatter)。要不要加,取决于你日常盯哪些量。
