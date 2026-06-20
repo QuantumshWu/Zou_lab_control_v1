@@ -510,7 +510,7 @@ class VivadoAxiStreamerSession:
                     time.sleep(min(remaining, self._tail_seconds))
             self._drain_until = 0.0
         # this program's own tail (max channel/bus delay), used by fire()/wait_done()
-        clock = float(getattr(program, "clock_hz", 0.0) or 50e6)
+        clock = float(getattr(program, "clock_hz", 0.0) or DEFAULT_RUNTIME_CLOCK_HZ)
         tail_ticks = [int(d) for d in (getattr(program, "channel_delays", None) or [])]
         tail_ticks += [int(getattr(bd, "delay", 0)) for bd in (getattr(program, "bus_delays", None) or [])]
         self._tail_seconds = (max(tail_ticks) / clock) if tail_ticks else 0.0
