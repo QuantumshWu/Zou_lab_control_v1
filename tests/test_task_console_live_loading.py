@@ -141,6 +141,43 @@ def test_embedded_canvas_first_figure_boosted_dpi_unset_original_still_design_si
     assert cv.width() == round(2.0 * DESIGN_DPI)
 
 
+def test_first_and_second_task_panel_build_both_design_sized_under_ipympl_boost():
+    """The user's literal report: "open task_console, open task -> Monitor size wrong; only the SECOND
+    task is right."  That is a stale-cached OLD build (which inflated to the boosted dpi every time);
+    the CURRENT code must show FIRST == SECOND == design-sized.  Build the task-panel canvas TWICE in
+    ONE process (= one session) under the EXACT live-browser bug condition each time (figure.dpi boosted
+    300->750 with _original_dpi UNSET -- ipympl on a 2.5x browser) and pin minimumSize the way PanelCard
+    does; both builds must be design-sized and IDENTICAL (no first-wrong-second-right)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib.figure import Figure
+
+    from Zou_lab_control.frontend.qt_canvas import EmbeddedFigureCanvas
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.style import DESIGN_DPI, LIVE_RENDER_SCALE
+
+    if EmbeddedFigureCanvas is None:
+        pytest.skip("matplotlib Qt canvas unavailable")
+    app = ensure_qt_app()
+
+    def build_task_panel():
+        fig = Figure(dpi=DESIGN_DPI)
+        fig.set_size_inches(2.0, 1.5)
+        if hasattr(fig, "_original_dpi"):
+            del fig._original_dpi                              # _original_dpi UNSET (first-figure state)
+        fig._set_dpi(float(DESIGN_DPI) * 2.5, forward=False)  # ipympl 2.5x browser boost: 300 -> 750
+        cv = EmbeddedFigureCanvas(fig, display_scale=1.0, render_scale=LIVE_RENDER_SCALE)
+        cv.setMinimumSize(cv.sizeHint())                      # the floor PanelCard pins at build
+        app.processEvents()                                   # fire the deferred singleShot(0) resync
+        return cv._zlc_design_dpi, cv.width(), cv.height(), cv.minimumWidth()
+
+    first = build_task_panel()
+    second = build_task_panel()
+    assert first == second                                    # NO "first wrong, second right"
+    # both builds are design-sized (NOT the boosted 2.5x), incl. the minimumSize floor
+    assert first == (float(DESIGN_DPI), round(2.0 * DESIGN_DPI), round(1.5 * DESIGN_DPI), round(2.0 * DESIGN_DPI))
+
+
 def test_embedded_canvas_deferred_resync_corrects_stale_layout_size():
     """The OTHER half of "first task wrong, second right": layout TIMING.  The construction-time sync
     runs before the canvas is inserted into its parent layout, so the sizeHint/minimumSize it first
