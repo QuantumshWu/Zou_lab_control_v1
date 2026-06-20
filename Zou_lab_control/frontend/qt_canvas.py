@@ -79,6 +79,17 @@ else:
             # offscreen) -- establish the invariants NOW
             self._zlc_sync()
 
+        def showEvent(self, event):  # noqa: N802 - Qt naming
+            # Re-establish the size invariants + redraw the FIRST time the canvas actually becomes
+            # visible.  A panel built on a not-yet-shown board (the FIRST task-takeover Monitor panel
+            # of a just-opened console) can take its construction-time sync before the window settled
+            # on its real screen; showEvent fires once it is genuinely on screen, so re-syncing here
+            # makes that first panel render at the correct size without needing a second task run.
+            # Idempotent: when the construction sync was already correct this only repaints.
+            super().showEvent(event)
+            self._zlc_sync()
+            self.draw_idle()
+
         # ------------------------------------------------------------- ratio math
         def devicePixelRatioF(self):  # noqa: N802 - Qt naming
             # The backend derives the render-buffer size, sizeHint, mouse-event
