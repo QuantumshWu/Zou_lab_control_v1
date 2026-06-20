@@ -165,11 +165,15 @@ def test_embedded_canvas_deferred_resync_corrects_stale_layout_size():
     cv = EmbeddedFigureCanvas(fig, display_scale=1.0, render_scale=LIVE_RENDER_SCALE)
     assert hasattr(cv, "_zlc_resync")                     # the deferred-resync hook exists
     app.processEvents()                                   # fire the queued singleShot(0, _zlc_resync)
-    # leave the widget a WRONG size (as a pre-layout/stale geometry would) and confirm the resync
-    # restores the canonical design size -- this is what fixes the first card without a second run.
+    # Pin a STALE, too-big minimum floor (as a pre-layout build-time setMinimumSize would) AND leave
+    # the widget a wrong size; the resync must clear the floor and restore the canonical design size --
+    # a stale floor would otherwise pin the canvas too big forever (the "first wrong, second right"
+    # trap, since resize cannot go below a stale minimum).
+    cv.setMinimumSize(9999, 9999)
     cv.resize(9999, 9999)
     cv._zlc_resync()
     assert cv._zlc_design_dpi == float(DESIGN_DPI)
+    assert cv.minimumWidth() == round(2.0 * DESIGN_DPI)   # stale floor cleared to the design floor
     assert cv.width() == round(2.0 * DESIGN_DPI)          # design-sized again after resync
     cv._zlc_resync()                                      # idempotent: no drift on a second call
     assert cv.width() == round(2.0 * DESIGN_DPI)

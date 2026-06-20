@@ -92,10 +92,17 @@ else:
             # us is re-measured -- not just the canvas.  Guarded: the deferred call may fire after the
             # C++ widget was torn down (panel closed) -> skip silently.
             try:
-                self._zlc_sync()
+                self._zlc_sync()                       # 1) set the figure to the correct design dpi
             except RuntimeError:
                 return
-            self.updateGeometry()
+            # 2) Re-PUBLISH the size floor from the now-settled sizeHint.  The host (PanelCard) pins
+            # ``setMinimumSize(sizeHint())`` at BUILD time; if that build ran before the layout settled
+            # the floor is stale-too-big and would pin the canvas at the wrong size -- the exact "first
+            # wrong, second right" trap (a resize cannot go below a stale minimum).  Re-assert it from
+            # the SAME source (sizeHint) to clear any stale floor...
+            self.setMinimumSize(self.sizeHint())
+            self._zlc_sync()                           # 3) ...then resize again, now free of that floor
+            self.updateGeometry()                      # 4) let the parent CARD re-measure us
             self.draw_idle()
 
         def showEvent(self, event):  # noqa: N802 - Qt naming
