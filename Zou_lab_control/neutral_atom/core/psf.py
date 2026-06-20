@@ -43,11 +43,6 @@ class SitePSF:
     sigma_y: float
     fit_ok: bool
 
-    @property
-    def n_eff_pixels(self) -> float:
-        s2 = float(np.sum(self.weight ** 2))
-        return float(1.0 / s2) if s2 > 0 else float("nan")
-
 
 def crop_box(shape: tuple[int, int], x: float, y: float, half_width: int) -> tuple[int, int, int, int]:
     """Integer ``(x0, y0, w, h)`` box of half-width ``half_width`` around ``(x, y)``."""
