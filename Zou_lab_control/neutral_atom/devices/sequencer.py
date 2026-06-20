@@ -27,7 +27,6 @@ from ..timing import (
 )
 from ..timing.pulse_table import (
     UNITS_TO_NS,
-    bus_period_levels as _bus_period_levels,
     analog_bus_ticks as _pulse_table_analog_bus_ticks,
     _analog_bus_value_at_tick as _pulse_table_analog_bus_value_at_tick,
     snap_scan_table as _snap_scan_table,
@@ -2358,14 +2357,6 @@ def _pulse_table_has_analog_activity(state: PulseTableState) -> bool:
     return False
 
 
-def _pulse_table_has_analog_ramp(state: PulseTableState) -> bool:
-    for bus_name in state.bus_channels():
-        for entry in state.analog_bus_plan(bus_name):
-            if str(entry.get("mode", "hold")).lower() == "ramp":
-                return True
-    return False
-
-
 def _pulse_table_has_any_delay(state: PulseTableState) -> bool:
     """True if any channel has a delay that is nonzero OR scanned (a slot expression).
 
@@ -2418,13 +2409,6 @@ def _check_unrolled_edge_budget(
             "OUTER loop, fewer inner iterations, or remove the channel delay so the bracket can "
             "stay a compact hardware loop instead of being unrolled."
         )
-
-
-def _edge_index_at_or_after(ticks: Sequence[int], tick: int) -> int:
-    for index, candidate in enumerate(ticks):
-        if int(candidate) >= int(tick):
-            return index
-    raise ValueError(f"repeat bracket starts at tick {tick}, but no edge exists at or after that tick.")
 
 
 def _pulse_table_trigger_count(

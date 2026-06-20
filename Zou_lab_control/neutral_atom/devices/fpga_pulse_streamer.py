@@ -12,16 +12,10 @@ session were removed with the rest of the legacy control path.)
 from __future__ import annotations
 
 from argparse import ArgumentParser
-from dataclasses import dataclass
 from pathlib import Path
-import json
 import math
 import os
-import queue
 import re
-import subprocess
-import threading
-import time
 from typing import Mapping, Sequence
 
 from .sequencer import RuntimeSequenceProgram

@@ -661,7 +661,7 @@ def estimate_resources(params: StreamerParams, *, part, target_pct: float = 90.0
     # whose engine bit drives a pin, i.e. NOT the bus-member bits (their pin is driven by
     # bus_out, their `out` bit is always 0).  At deep EVT_DEPTH this is what keeps the
     # event RAM inside the 400 Kb distributed-RAM budget (every channel would not fit).
-    evt_depth = max(1, int(getattr(params, "evt_fifo_depth", 256)))
+    evt_depth = max(1, int(getattr(params, "evt_fifo_depth", 128)))
     bus_evt_depth = max(1, int(getattr(params, "bus_evt_fifo_depth", 64)))
     # Delay-eligible channels = real TTL outputs: not bus-member bits (bus_count*bus_width,
     # pin driven by bus_out) and not the per-bus dedicated clk pins (bus_count, da_clk*).

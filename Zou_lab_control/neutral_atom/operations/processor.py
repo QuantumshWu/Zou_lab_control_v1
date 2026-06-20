@@ -87,7 +87,6 @@ class ProcessorSpec:
     ``default_value_key`` is the result key that view reads as its ``value``.  Leave
     ``default_kind`` EMPTY for a pure data-processing action -- the panel then just
     lists the published output names and the user wires them into a separate plot.
-    ``grid_shape`` lets a consumer reshape a per-site vector into a 2-D map.
     """
 
     name: str

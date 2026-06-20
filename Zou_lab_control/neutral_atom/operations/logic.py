@@ -1014,7 +1014,7 @@ class CalibrateReadoutTask(Task):
         # No schema: try the named sub-folder first (cleaner layout), else the root (legacy /
         # write_virtual_run convention -- a flat folder of img<n>.npy).
         sub = root / self.FRAMES_SUBDIR
-        if sub.is_dir() and any(sub.glob("img*.npy")) or any(sub.glob("img*.tif*")):
+        if sub.is_dir() and (any(sub.glob("img*.npy")) or any(sub.glob("img*.tif*"))):
             return index_run(sub, "img")
         return index_run(root, "img")
 

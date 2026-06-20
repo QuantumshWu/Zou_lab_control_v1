@@ -77,7 +77,6 @@ from .qt_fluent import (
     FluentSwitch,
     FluentTabWidget,
     FluentWindow,
-    add_fluent_shadow,
     ensure_qt_app,
     fluent_widget_stylesheet,
     scaled_px,

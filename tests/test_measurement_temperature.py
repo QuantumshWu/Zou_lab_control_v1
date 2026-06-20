@@ -30,6 +30,8 @@ from Zou_lab_control.neutral_atom.operations.measurement import (
     ScannedMeasurement,
 )
 from Zou_lab_control.neutral_atom.operations.temperature import (
+    K_B,
+    RB87_MASS,
     ReleaseRecapturePlan,
     SurvivalReducer,
     build_release_recapture_pulse,
@@ -118,7 +120,7 @@ def test_survival_reducer_requires_two_frames():
 @pytest.mark.parametrize("T_true", [10e-6, 30e-6, 100e-6])
 def test_fit_temperature_round_trips_known_temperature(T_true):
     rc = 1.5e-6
-    sigma_v = np.sqrt(1.380649e-23 * T_true / (86.909180527 * 1.66053906660e-27))
+    sigma_v = np.sqrt(K_B * T_true / RB87_MASS)   # derive from the source constants (single source)
     t = np.linspace(0.0, 4.0 * rc / sigma_v, 25)
     survival = release_recapture_survival(t, T_true, capture_radius=rc, baseline=0.95)
     rng = np.random.default_rng(0)

@@ -209,9 +209,10 @@ CONTINUOUSLY and CYCLICALLY (chunk `(mono%K)` into bank `mono%2`, one-ahead) -- 
 sweep wrap is just another chunk boundary, so the re-sweep is SEAMLESS for any N
 (`scan_bank_base` toggles by `K&1` so chunk 0 lands in the alternating bank).
 
-## 4. N-Slot Scan Model (current design)
+## 4. N-Slot Scan Model
 
-This replaced the old `x`/`y` affine scan. **There is no more `x`/`y` notion.**
+Scans bind named slots `s0, s1, ...` in bind order. **There is no `x`/`y` axis concept** — any
+per-field value is bound to a slot, never to a fixed `x`/`y` channel.
 
 - Any per-field value (period duration, channel delay, analog-bus DAC value) can
   be bound to a named scan **slot** `s0, s1, ...` in bind order, via the GUI

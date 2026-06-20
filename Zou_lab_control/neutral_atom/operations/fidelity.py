@@ -21,7 +21,7 @@ The per-site bimodal/Gaussian primitives come from :mod:`..core.bimodal`.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Sequence
 
 import numpy as np

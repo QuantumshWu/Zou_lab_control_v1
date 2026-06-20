@@ -2,7 +2,7 @@
 
 Sweeps the detection exposure and reduces each point to an Otsu single-shot
 fidelity.  The factory reuses ``ReadoutSubsystem.build_detection_scan`` (the SAME
-builder ``exp.readout.detection_time_scan(...)`` uses), so GUI and API agree.
+builder ``exp.readout.detection_time(...)`` uses), so GUI and API agree.
 """
 
 from __future__ import annotations

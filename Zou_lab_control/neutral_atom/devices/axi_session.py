@@ -50,12 +50,10 @@ from fpga.pulse_streamer.host.image import (
     CMD_LOAD,
     CMD_FIRE,
     CMD_SAFE,
-    CMD_RESET,
     STATUS_LOADED,
     STATUS_RUNNING,
     STATUS_DONE,
     STATUS_ERROR,
-    STATUS_UNDERFLOW,
     REGISTER_LAYOUT_ID,
 )
 

@@ -1330,7 +1330,7 @@ class _FluentTabBar(QtWidgets.QTabBar):
 class FluentTabWidget(QtWidgets.QTabWidget):
     """Pivot-underline tab widget that also supports CLOSABLE tabs.
 
-    Permanent tabs (Monitor / Control) are added with :meth:`add_permanent_tab`
+    Permanent tabs (Monitor / Logic) are added with :meth:`add_permanent_tab`
     (no close button); on-demand tabs (e.g. a per-panel Edit) are added with
     :meth:`add_closable_tab`, which shows the native close affordance and emits
     :attr:`tab_close_requested` with the page widget when its X is clicked, so a

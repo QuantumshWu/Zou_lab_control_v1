@@ -1085,7 +1085,7 @@ zf.plot(coords_xy, signal.reshape(-1, 1), kind="2d", labels=("X", "Y", "Counts")
 
 \textbf{尺寸枚举与辅助}：
 \begin{itemize}
-  \item \pyapi{zf.PANEL_SIZES = ("1x2", "2x2", "1x4", "2x4")}：含义=\tfocus{行×列的“半单元”数}。\pyapi{2x2}=标准 plot 区域(数据区 480×360)，\pyapi{1x2}=半高，\pyapi{2x4}=双宽。
+  \item \pyapi{zf.PANEL_SIZES = ("1x2", "2x2", "1x4", "2x4", "4x4")}：含义=\tfocus{行×列的“半单元”数}。\pyapi{2x2}=标准 plot 区域(数据区 480×360)，\pyapi{1x2}=半高，\pyapi{2x4}=双宽，\pyapi{4x4}=双倍。
   \item \pyapi{zf.panel_plot_spec(size="2x2") -> FigureSpec}：返回该尺寸的几何规格（所有面板类型共用边距，签名只有 \pyapi{size}）。
   \item \pyapi{zf.panel_size_cells(size) -> (rows, cols)}：解析尺寸串；非法尺寸报 \pyapi{ValueError}。
 \end{itemize}
