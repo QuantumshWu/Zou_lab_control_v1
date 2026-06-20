@@ -111,6 +111,37 @@ def test_embedded_canvas_pins_design_dpi_against_backend_inflation():
     assert abs(fig.dpi - DESIGN_DPI * real * LIVE_RENDER_SCALE) < 1e-6
 
 
+def test_embedded_canvas_first_figure_boosted_dpi_unset_original_still_design_sized():
+    """The user's "first task Monitor wrong size, second right" bug.  Under ``%matplotlib widget``
+    on a hi-DPI screen the backend BOOSTS ``figure.dpi`` by the screen ratio; on the FIRST figure of
+    a session ``figure._original_dpi`` is still UNSET (None) while ``figure.dpi`` is already boosted
+    (e.g. 750).  The axes layout sizes the figure at DESIGN_DPI (``pixels / design_dpi(fig)``), so the
+    canvas MUST also take DESIGN_DPI -- if it instead reads the boosted ``figure.dpi`` (the old
+    ``_original_dpi or figure.dpi``) it captures 750 and the first panel renders ~2.5x too big; the
+    SECOND task (``_original_dpi`` now 300) was correct.  Pin to DESIGN_DPI -> correct on the FIRST."""
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib.figure import Figure
+
+    from Zou_lab_control.frontend.qt_canvas import EmbeddedFigureCanvas
+    from Zou_lab_control.frontend.style import DESIGN_DPI, LIVE_RENDER_SCALE
+
+    if EmbeddedFigureCanvas is None:
+        pytest.skip("matplotlib Qt canvas unavailable")
+    fig = Figure(dpi=DESIGN_DPI)
+    fig.set_size_inches(2.0, 1.5)                          # design inches (authored at DESIGN_DPI)
+    # FIRST figure of a session: dpi already boosted by the backend, _original_dpi NOT yet set.
+    if hasattr(fig, "_original_dpi"):
+        del fig._original_dpi
+    fig._set_dpi(float(DESIGN_DPI) * 2.5, forward=False)   # boosted (e.g. 750), _original_dpi unset
+    cv = EmbeddedFigureCanvas(fig, display_scale=1.0, render_scale=LIVE_RENDER_SCALE)
+    # must take the canonical DESIGN dpi, NOT the boosted 750 -> size-correct on the FIRST run
+    assert cv._zlc_design_dpi == float(DESIGN_DPI)
+    # the displayed widget is inches x DESIGN_DPI x display_scale (DPR cancels): NOT 2.5x bigger
+    assert cv.width() == round(2.0 * DESIGN_DPI)
+    assert cv.height() == round(1.5 * DESIGN_DPI)
+
+
 def test_two_permanent_tabs_monitor_and_logic():
     exp = _calibrated_virtual_session()
     console = _console(exp)

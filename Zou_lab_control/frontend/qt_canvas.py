@@ -28,6 +28,8 @@ a surrounding QScrollArea, so in-plot zoom never scrolls the page.
 
 from __future__ import annotations
 
+from .style import DESIGN_DPI
+
 try:
     from PyQt5 import QtWidgets
     from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as _FigureCanvasQTAgg
@@ -58,14 +60,18 @@ else:
             # display-only panel (Monitor card, NO selectors) lets the dashboard
             # board scroll under the cursor instead of swallowing the wheel.
             self._zlc_isolate_wheel = bool(isolate_wheel)
-            # Capture the figure's DESIGN dpi NOW, before FigureCanvasQTAgg adopts it.  On a
-            # high-DPI screen under ``%matplotlib widget`` (ipympl, the notebook backend), the Qt
-            # backend's __init__ INFLATES ``figure._original_dpi`` by the screen ratio (e.g. the
-            # 300-dpi design figure becomes 750 on a 2.5x screen).  _zlc_sync would then render the
-            # figure at design_dpi x that inflation x retina -> ~2.5x too big, overflowing the panel
-            # card (title clipped, colorbar/dist off-screen).  The standalone .bat uses plain Agg, so
-            # _original_dpi stays at the design value -- this captures it so notebook == .bat.
-            self._zlc_design_dpi = float(getattr(figure, "_original_dpi", None) or figure.dpi)
+            # The figure's DESIGN dpi is the ONE canonical ``DESIGN_DPI`` -- the same dpi the layout
+            # geometry was authored against (``create_axes_fixed`` sizes the figure as
+            # ``pixels / design_dpi(fig)``, with ``design_dpi`` == DESIGN_DPI), so the displayed size
+            # ``inches x _zlc_design_dpi x display_scale`` is correct iff the two dpis MATCH.  We must
+            # NOT read it from ``figure.dpi`` / ``figure._original_dpi``: under ``%matplotlib widget``
+            # (ipympl) on a hi-DPI screen the Qt/ipympl backend BOOSTS ``figure.dpi`` by the screen
+            # ratio, and on the FIRST figure of a session ``_original_dpi`` is still unset (None) while
+            # ``figure.dpi`` is already boosted (e.g. 750) -- so the old ``_original_dpi or figure.dpi``
+            # captured 750 while the axes were laid out at 300, rendering the first task-takeover panel
+            # ~2.5x too big; the SECOND task (``_original_dpi`` now 300) was correct ("first run wrong,
+            # second right").  Pinning to the constant makes it size-correct on the FIRST run, every run.
+            self._zlc_design_dpi = float(DESIGN_DPI)
             super().__init__(figure)
             # undo any backend dpi inflation so design_dpi(fig) (and _zlc_sync) see the true design.
             figure._original_dpi = self._zlc_design_dpi
