@@ -6380,20 +6380,18 @@ def test_top_routes_all_three_edge_reads_directly_no_skew_register():
     engine DIRECTLY -- no realignment register on ANY of them.  There is NO read-latency
     skew to compensate: each port B is symmetric WITHIN ITSELF (tick 32/32, coeff/mask
     64/64), so all three read at the SAME latency.  This was MEASURED on the actual
-    synthesised blk_mem_gen IP netlists (xsim, fpga/pulse_streamer/sim/tb_bram_lat.v:
-    tick latency == mask latency == 2), and the real zlc_edge_streamer driven by those
-    real IPs plays the uploaded edge table CORRECTLY end-to-end (tb_real_engine.v: two
-    20 ms emCCD pulses).  Commits 2a2c0d1 (delay coeff/mask) and e92a78a (delay tick)
-    "fixed" a skew that does not exist -- e92a78a's register actually CREATES a tick>mask
-    skew that corrupts streamed edges in sim (tb_real_e92.v).  Both are reverted; lock the
-    direct (register-free) wiring so neither is re-introduced.  The genuine emCCD 40 ms
-    root cause was the stale-active_count FIRE seed -- see
-    test_pulse_streamer_rtl_fire_seed_uses_fresh_prog_count_not_stale_reg."""
+    synthesised blk_mem_gen IP netlists (xsim: tick latency == mask latency == 2), and the
+    real zlc_edge_streamer driven by those real IPs plays the uploaded edge table CORRECTLY
+    end-to-end (tb_real_engine.v: two 20 ms emCCD pulses).  Adding a +1 tick register to
+    "align" a skew that does not exist instead CREATES a tick>mask skew that corrupts
+    streamed edges in sim.  Lock the direct (register-free) wiring so neither register is
+    re-introduced.  The genuine emCCD 40 ms root cause was the stale-active_count FIRE seed
+    -- see test_pulse_streamer_rtl_fire_seed_uses_fresh_prog_count_not_stale_reg."""
     top = (Path(__file__).resolve().parents[1] / "fpga" / "pulse_streamer" / "zlc_pulse_streamer_top.v").read_text(encoding="utf-8")
     # NO realignment registers on any edge read
-    assert "edge_tick_rdata_q" not in top, "e92a78a tick register must be reverted (no skew exists)"
+    assert "edge_tick_rdata_q" not in top, "tick realignment register must not be re-added (no skew exists)"
     assert "edge_coeff_rdata_q" not in top and "edge_mask_rdata_q" not in top, \
-        "2a2c0d1 coeff/mask registers must be reverted"
+        "coeff/mask realignment registers must not be re-added"
     # all three reads fed to the engine DIRECTLY
     assert ".edge_tick_rdata(edge_tick_rdata)" in top
     assert ".edge_coeff_rdata(edge_coeff_rdata_w[" in top

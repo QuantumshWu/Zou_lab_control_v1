@@ -23,11 +23,6 @@ the strongest possible end-to-end proof when chasing a real-hardware discrepancy
 
 They were written to settle the "emCCD 2nd pulse = 40 ms" hardware report. The conclusions:
 
-- **`tb_bram_lat.v`** — measures the port-B read latency of the real `blk_mem_gen_edge_tick`
-  (symmetric 32/32) vs `blk_mem_gen_edge_mask` (asymmetric 32-write/64-read) IPs.
-  Result: **both = 2 cycles, ALIGNED.** Each port B is symmetric within itself, so there is
-  **no tick/mask read-latency skew.** (This disproved the 2a2c0d1/e92a78a "skew" theory.)
-
 - **`tb_real_engine.v`** — drives the real `zlc_edge_streamer` with the real tick & mask IP
   BRAMs, preloaded with the user's exact uploaded edge table, then FIREs. Result: **two clean
   20 ms emCCD pulses** — the current RTL plays the table correctly end-to-end. (The genuine

@@ -553,7 +553,7 @@ GUI 的 Start 调的就是同一个 \pyapi{build\_temperature\_scan}（spec.buil
 
 \chapter{性能结论(诚实版)}
 
-\tfocus{诚实结论先行}：多 live 同时刷新的卡顿\tfocus{瓶颈是密封 300dpi 下 matplotlib 对约 10 个子图的文字栅格化}（每帧重画，\tfocus{intrinsic}）。两条主流提速方案\tfocus{都实测否决}；合规的提速来自空白收紧；更激进的提速需要用户拍板是否接受可见行为/外观变化。源数据见 \filepath{\_redesign/03b\_perf\_conclusion.md}。
+\tfocus{诚实结论先行}：多 live 同时刷新的卡顿\tfocus{瓶颈是密封 300dpi 下 matplotlib 对约 10 个子图的文字栅格化}（每帧重画，\tfocus{intrinsic}）。两条主流提速方案\tfocus{都实测否决}；合规的提速来自空白收紧；更激进的提速需要用户拍板是否接受可见行为/外观变化。
 
 \section{量化(demo\_console=5 面板,离屏,40 tick)}
 \begin{itemize}
@@ -645,7 +645,7 @@ from Zou_lab_control.neutral_atom.operations.logic import (
 
 # 1) 先跑标定 task：产 TrapCalibration（站点中心 + 逐站阈值）
 cal = CalibrateReadoutTask(hub, exp.camera, sequencer=exp.devices.sequencer,
-                           grid_shape=(5, 7), mode="box").run_to_completion()
+                           grid_shape=(5, 7)).run_to_completion()
 # 2) 相机 measurement：只发 frame
 cam = CameraMeasurement(hub, exp.camera, sequencer=exp.devices.sequencer)
 # 3) detect processor：逐帧 frame -> occupied/counts/rate（跑真 calibration.detect）

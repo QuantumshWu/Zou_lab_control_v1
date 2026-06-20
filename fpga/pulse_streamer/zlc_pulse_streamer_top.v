@@ -315,13 +315,12 @@ module zlc_pulse_streamer_top #(
     // It is TEMPTING to think the SYMMETRIC tick (32b/32b) is faster than the ASYMMETRIC
     // coeff/mask (32b write / 64b read) and therefore needs a +1 register to "align".  It
     // does NOT: each port B is symmetric WITHIN ITSELF (tick 32/32, coeff/mask 64/64), so
-    // all three read at the SAME latency (measured = 2 cycles on this part; xsim of the
-    // ACTUAL synthesised blk_mem_gen IP netlists, fpga/pulse_streamer/sim/tb_bram_lat.v).
+    // all three read at the SAME latency (measured = 2 cycles on this part; verified in
+    // xsim against the ACTUAL synthesised blk_mem_gen IP netlists).
     // The real zlc_edge_streamer driven by these real BRAM IPs plays the uploaded edge
-    // table CORRECTLY end-to-end (tb_real_engine.v: two 20 ms emCCD pulses).  Commits
-    // 2a2c0d1 (delay coeff/mask) and e92a78a (delay tick) "fixed" a skew that does NOT
-    // exist; e92a78a's tick register CREATES a tick>mask skew that corrupts streamed
-    // edges in sim (pulse 2 collapses to a 1-tick glitch -- tb_real_e92.v).  Both reverted.
+    // table CORRECTLY end-to-end (tb_real_engine.v: two 20 ms emCCD pulses).  Adding a +1
+    // tick register to "align" a skew that does NOT exist instead CREATES a tick>mask skew
+    // that corrupts streamed edges in sim (pulse 2 collapses to a 1-tick glitch).
     // Feed the tick read straight to the engine, exactly like coeff/mask below.
 
     // --- SCAN BRAM (port A 32b write, port B 128b read; 2*BANK_SIZE deep) ------
