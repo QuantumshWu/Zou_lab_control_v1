@@ -139,6 +139,40 @@ def test_embedded_canvas_first_figure_boosted_dpi_unset_original_still_design_si
     assert cv._zlc_design_dpi == float(DESIGN_DPI)
     # the displayed widget is inches x DESIGN_DPI x display_scale (DPR cancels): NOT 2.5x bigger
     assert cv.width() == round(2.0 * DESIGN_DPI)
+
+
+def test_embedded_canvas_deferred_resync_corrects_stale_layout_size():
+    """The OTHER half of "first task wrong, second right": layout TIMING.  The construction-time sync
+    runs before the canvas is inserted into its parent layout, so the sizeHint/minimumSize it first
+    publishes can be the pre-layout values -- the FIRST task card keeps that stale size until some
+    later relayout (which the SECOND task triggers).  EmbeddedFigureCanvas schedules a next-tick
+    ``_zlc_resync`` (and re-syncs on ``showEvent``) that re-pins the geometry AND calls
+    ``updateGeometry`` so the surrounding card is re-measured on the FIRST run.  Guard: the deferred
+    resync fires without error and restores the design size after the widget was left a wrong size."""
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib.figure import Figure
+
+    from Zou_lab_control.frontend.qt_canvas import EmbeddedFigureCanvas
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.style import DESIGN_DPI, LIVE_RENDER_SCALE
+
+    if EmbeddedFigureCanvas is None:
+        pytest.skip("matplotlib Qt canvas unavailable")
+    app = ensure_qt_app()
+    fig = Figure(dpi=DESIGN_DPI)
+    fig.set_size_inches(2.0, 1.5)
+    cv = EmbeddedFigureCanvas(fig, display_scale=1.0, render_scale=LIVE_RENDER_SCALE)
+    assert hasattr(cv, "_zlc_resync")                     # the deferred-resync hook exists
+    app.processEvents()                                   # fire the queued singleShot(0, _zlc_resync)
+    # leave the widget a WRONG size (as a pre-layout/stale geometry would) and confirm the resync
+    # restores the canonical design size -- this is what fixes the first card without a second run.
+    cv.resize(9999, 9999)
+    cv._zlc_resync()
+    assert cv._zlc_design_dpi == float(DESIGN_DPI)
+    assert cv.width() == round(2.0 * DESIGN_DPI)          # design-sized again after resync
+    cv._zlc_resync()                                      # idempotent: no drift on a second call
+    assert cv.width() == round(2.0 * DESIGN_DPI)
     assert cv.height() == round(1.5 * DESIGN_DPI)
 
 

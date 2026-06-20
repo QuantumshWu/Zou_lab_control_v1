@@ -31,7 +31,7 @@ from __future__ import annotations
 from .style import DESIGN_DPI
 
 try:
-    from PyQt5 import QtWidgets
+    from PyQt5 import QtCore, QtWidgets
     from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as _FigureCanvasQTAgg
 except Exception:  # pragma: no cover - depends on the local matplotlib install
     _FigureCanvasQTAgg = None
@@ -78,6 +78,25 @@ else:
             # the backend syncs only in showEvent / on screen signals (never
             # offscreen) -- establish the invariants NOW
             self._zlc_sync()
+            # ...and AGAIN on the next event-loop tick.  The construction sync above runs before this
+            # canvas has been inserted into its parent layout, so the screen ratio it reads + the
+            # sizeHint/minimumSize it publishes can be the pre-layout values; the FIRST task-takeover
+            # panel of a just-opened console is built straight onto the board, so without this its card
+            # keeps the stale size until some later relayout (the SECOND task run) -- the "first wrong,
+            # second right" symptom.  singleShot(0) re-syncs once the widget is in its real layout.
+            QtCore.QTimer.singleShot(0, self._zlc_resync)
+
+        def _zlc_resync(self) -> None:
+            # Re-establish the size invariants once the widget is genuinely on screen / laid out, and
+            # tell the parent layout the (now-correct) sizeHint/minimumSize changed so the CARD around
+            # us is re-measured -- not just the canvas.  Guarded: the deferred call may fire after the
+            # C++ widget was torn down (panel closed) -> skip silently.
+            try:
+                self._zlc_sync()
+            except RuntimeError:
+                return
+            self.updateGeometry()
+            self.draw_idle()
 
         def showEvent(self, event):  # noqa: N802 - Qt naming
             # Re-establish the size invariants + redraw the FIRST time the canvas actually becomes
@@ -87,8 +106,7 @@ else:
             # makes that first panel render at the correct size without needing a second task run.
             # Idempotent: when the construction sync was already correct this only repaints.
             super().showEvent(event)
-            self._zlc_sync()
-            self.draw_idle()
+            self._zlc_resync()
 
         # ------------------------------------------------------------- ratio math
         def devicePixelRatioF(self):  # noqa: N802 - Qt naming
