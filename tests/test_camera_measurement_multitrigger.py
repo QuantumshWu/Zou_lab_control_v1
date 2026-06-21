@@ -117,6 +117,36 @@ def test_console_resolves_2d_frame_panel_to_judged_frame_for_shot_alignment():
     assert np.array_equal(np.asarray(ns["occupied"]), cal.detect(panel_signal, method="box").occupied)
 
 
+def test_two_occupancy_nodes_get_distinct_titles_prefixes_and_labels():
+    """#2: adding multiple occupancy judges must make them distinguishable -- distinct row
+    TITLES, distinct per-instance signal PREFIXES (so their hub signals don't collide), and
+    distinct display LABELS (so the source combobox/legend tells them apart).  Verified
+    through the REAL console helpers (_unique_logic_title + _logic_node_prefix) + the node
+    instance_label, Qt-free."""
+    from types import SimpleNamespace
+    from Zou_lab_control.frontend.task_console import TaskConsole, LogicNodeConfig
+
+    console = SimpleNamespace(logic_nodes=[], running_nodes=[])
+    # two occupancy nodes added with the SAME default title -> the console must disambiguate
+    t1 = TaskConsole._unique_logic_title(console, "Judge occupancy")
+    cfg1 = LogicNodeConfig(kind="processor", name="Judge occupancy", title=t1)
+    console.logic_nodes.append(SimpleNamespace(node=cfg1))
+    t2 = TaskConsole._unique_logic_title(console, "Judge occupancy")
+    cfg2 = LogicNodeConfig(kind="processor", name="Judge occupancy", title=t2)
+    console.logic_nodes.append(SimpleNamespace(node=cfg2))
+
+    assert t1 != t2                                      # distinct Logic-tab row titles
+    p1 = TaskConsole._logic_node_prefix(console, cfg1)
+    p2 = TaskConsole._logic_node_prefix(console, cfg2)
+    assert p1 and p2 and p1 != p2 and p1.endswith("_") and p2.endswith("_")   # distinct signal prefixes
+
+    # the built nodes then publish disjoint signal names + carry distinct labels
+    a = OccupancyProcessor(SignalHub(), calibration=None, prefix=p1); a.instance_label = t1
+    b = OccupancyProcessor(SignalHub(), calibration=None, prefix=p2); b.instance_label = t2
+    assert set(a.published_signals()).isdisjoint(b.published_signals())
+    assert a.display_label != b.display_label
+
+
 def test_frames_per_cycle_is_live_editable():
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
     cam_node = CameraMeasurement(SignalHub(), exp.camera)

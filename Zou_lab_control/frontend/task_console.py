@@ -3555,8 +3555,39 @@ class TaskConsole(QtWidgets.QWidget):
             return next((s for s in self.tasks if getattr(s, "name", None) == node.name), None)
         return None
 
+    def _unique_logic_title(self, title: str) -> str:
+        """Make a logic-node title UNIQUE among the existing Logic rows by appending
+        ``2``/``3``... -- so two same-kind nodes (two ``Judge occupancy``) are told apart in
+        the Logic rows AND get distinct per-instance signal prefixes (see _logic_node_prefix).
+        A title that is already unique is returned unchanged (so a saved layout's distinct
+        titles round-trip)."""
+        title = str(title or "node")
+        taken = {str(r.node.title) for r in self.logic_nodes}
+        if title not in taken:
+            return title
+        n = 2
+        while f"{title} {n}" in taken:
+            n += 1
+        return f"{title} {n}"
+
+    def _logic_node_prefix(self, node: LogicNodeConfig) -> str:
+        """A UNIQUE per-instance hub-signal prefix for a logic node, derived from its (already
+        unique) row title via the SAME ``measurement_slug`` measurements use -- so two
+        occupancy judges publish DISTINCT signals (``judge_occupancy_occupied`` vs
+        ``judge_occupancy_2_occupied``) instead of colliding on bare names.  A final guard
+        de-dupes against already-running prefixes (covers a manual rename to a dup)."""
+        from Zou_lab_control.neutral_atom.operations.measurement import measurement_slug
+        base = measurement_slug(node.title or node.name) or str(node.kind) or "node"
+        taken = {getattr(n, "prefix", "") for n in self.running_nodes}
+        prefix, k = base + "_", 2
+        while prefix in taken:
+            prefix = f"{base}_{k}_"
+            k += 1
+        return prefix
+
     def _attach_logic_node(self, node: LogicNodeConfig, *, focus: bool = False) -> "LogicNodeRow":
         """Add a STOPPED logic-node row to the Logic tab (no node built yet)."""
+        node.title = self._unique_logic_title(node.title)   # distinct rows + distinct signal prefixes
         row = LogicNodeRow(node)
         row.edit_requested.connect(self._edit_logic_node)
         row.remove_requested.connect(self._remove_logic_node)
@@ -3757,7 +3788,11 @@ class TaskConsole(QtWidgets.QWidget):
             # REACTIVE processor (the "func" layer): a live node consuming hub signals
             # and republishing derived ones -- e.g. judging occupancy from each frame.
             if getattr(spec, "reactive", False):
-                return spec.make_node(self.hub, **values)
+                # Per-INSTANCE prefix + label so multiple same-kind processors (two occupancy
+                # judges) publish DISTINCT signals and are told apart everywhere (#2).
+                built = spec.make_node(self.hub, prefix=self._logic_node_prefix(node), **values)
+                built.instance_label = node.title
+                return built
             # ONE-SHOT processor: runs once over saved/grabbed frames and self-stops.
             from Zou_lab_control.neutral_atom.operations.logic import ProcessorRun
             camera = next((getattr(n, "camera", None) for n in self.running_nodes

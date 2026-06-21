@@ -96,6 +96,11 @@ class LogicNode:
     def __init__(self, hub: SignalHub, *, prefix: str = ""):
         self.hub = hub
         self.prefix = str(prefix)
+        # Per-INSTANCE human name (the console sets it from the node's row title), so two
+        # nodes of the SAME kind (e.g. two occupancy judges) are told apart in the Logic
+        # rows, the source combobox and every legend.  Blank -> fall back to the LAYER
+        # node_label (camera / occupancy / ...); never the Python class name.
+        self.instance_label = ""
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self.shots = 0
@@ -119,11 +124,13 @@ class LogicNode:
 
     @property
     def display_label(self) -> str:
-        """Short human name for this logic node in the GUI -- its LAYER node name
-        (``camera`` / ``detect`` / ``calibrate`` / a measurement's curve), NEVER the
-        Python class name.  The hub prefix is a signal-namespacing detail, not part of
-        the label (the namespaced signal names shown alongside disambiguate A/B)."""
-        return str(self.node_label)
+        """Short human name for this logic node in the GUI -- a per-instance
+        ``instance_label`` (set from the node's row title) if given, else its LAYER node
+        name (``camera`` / ``occupancy`` / ``calibrate`` / a measurement's curve), NEVER the
+        Python class name.  The instance label lets two same-kind nodes (e.g. two occupancy
+        judges) be told apart; the hub prefix is a signal-namespacing detail, not the label
+        (the namespaced signal names shown alongside also disambiguate A/B)."""
+        return str(self.instance_label or self.node_label)
 
     # ------------------------------------------------------------------ loop
     def shot(self) -> dict[str, object]:  # pragma: no cover - abstract

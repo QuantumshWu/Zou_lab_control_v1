@@ -132,13 +132,18 @@ def test_judge_occupancy_node_reacts_to_frames(tmp_path):
         cam.step()                                  # first frame on the hub
         console._start_logic_node(row)
         node = console._logic_nodes[id(row)]
+        # a console-built occupancy node carries a per-INSTANCE prefix (#2: multiple occupancy
+        # judges publish DISTINCT signals), so read its published names off the node, never a
+        # hard-coded bare name.
+        assert node.prefix                          # namespaced, not the bare (colliding) form
+        occ_name, cen_name = node.prefix + "occupied", node.prefix + "centers"
         deadline = time.monotonic() + 8.0
-        while "occupied" not in hub.names() and time.monotonic() < deadline:
+        while occ_name not in hub.names() and time.monotonic() < deadline:
             cam.step()                              # keep frames coming for the reactive node
             time.sleep(0.03)
-        assert "occupied" in hub.names()
-        assert np.asarray(hub.latest("occupied")).shape == (20,)
-        assert np.asarray(hub.latest("centers")).shape == (20, 2)
+        assert occ_name in hub.names()
+        assert np.asarray(hub.latest(occ_name)).shape == (20,)
+        assert np.asarray(hub.latest(cen_name)).shape == (20, 2)
         # reactive: it keeps running (NOT a one-shot finished node)
         assert getattr(node, "finished", False) is False
         cam.stop()
