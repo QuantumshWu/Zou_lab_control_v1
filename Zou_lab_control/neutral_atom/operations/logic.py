@@ -1096,6 +1096,15 @@ class CameraMeasurement(Measurement):
     def shot(self) -> dict[str, object]:
         n = max(1, int(self.frames_per_cycle))
         frames = self.camera.acquire(n, sequencer=self.sequencer, stop=self._stop)
+        if not frames:
+            # The streamer is not firing a camera-triggering pulse (e.g. the user hit "Stop
+            # Pulse") -> no trigger -> no frame.  Publish nothing: the live view holds its last
+            # image and FREEZES, exactly as a real externally-triggered camera does.  The gate
+            # lives in the DATA SOURCE (only the lowest layer is faked): the virtual camera reads
+            # the in-process sequencer's firing state; a real qCMOS learns it directly from the
+            # absence of hardware trigger edges -- so this is correct for a real streamer driven
+            # from another process too (the camera sees the actual triggers, not a local flag).
+            return {}
         out: dict[str, object] = {f"frame_{i}": np.asarray(f, dtype=float) for i, f in enumerate(frames)}
         out["frame"] = out["frame_0"]   # back-compat + default 2D panel: first trigger
         return out

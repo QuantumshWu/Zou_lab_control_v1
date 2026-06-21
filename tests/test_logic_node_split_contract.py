@@ -21,6 +21,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if sys.path[0] != str(REPO_ROOT):
     sys.path.insert(0, str(REPO_ROOT))
 
+from conftest import fire_live_imaging   # the live "On Pulse" the trigger-driven camera needs
+
 
 def test_camera_measurement_plus_detect_processor_runs_real_pipeline():
     import Zou_lab_control.neutral_atom as na
@@ -38,6 +40,7 @@ def test_camera_measurement_plus_detect_processor_runs_real_pipeline():
     cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer)
     det = OccupancyProcessor(hub, calibration=cal, source="frame", grid_shape=(3, 4))
     try:
+        fire_live_imaging(exp)            # On Pulse: the trigger-driven camera now streams
         # the camera measurement is just that -- a camera; it does NOT detect.
         assert "frame" not in det.published_signals()
         assert "occupied" in det.published_signals()
@@ -106,6 +109,7 @@ def test_calibrate_task_produces_calibration_and_drives_detect_processor(tmp_pat
         # -- THAT (a processor) is what lands occupancy on the hub.
         cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer)
         det = OccupancyProcessor(hub, calibration=task.calibration, grid_shape=(3, 4))
+        fire_live_imaging(exp)            # On Pulse: the trigger-driven camera now streams
         cam.step()
         det.step()
         assert hub.latest("occupied").shape == (12,)
@@ -141,6 +145,7 @@ def test_user_composed_loading_readout_streams_real_detect_off_camera_frames():
         # User composition step 3: an OccupancyProcessor running the REAL contract.
         det = OccupancyProcessor(hub, calibration=task.calibration, grid_shape=(3, 4))
 
+        fire_live_imaging(exp)                        # On Pulse: the trigger-driven camera now streams
         cam.step()                                    # publishes frame
         det.step()                                    # consumes frame -> real detect
         names = set(hub.names())
@@ -182,6 +187,7 @@ def test_calibrate_task_output_stays_off_the_hub():
         # The user adds the live camera measurement separately -- it publishes ``frame``
         # on the hub; the task's buffered frame never collided with it (no ``cal_*``).
         cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer)
+        fire_live_imaging(exp)            # On Pulse: the trigger-driven camera now streams
         cam.step()
         assert "frame" in hub.names()
         assert not any(n.startswith("cal_") for n in hub.names())

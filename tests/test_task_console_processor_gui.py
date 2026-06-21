@@ -30,6 +30,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if sys.path[0] != str(REPO_ROOT):
     sys.path.insert(0, str(REPO_ROOT))
 
+from conftest import fire_live_imaging   # the live "On Pulse" the trigger-driven camera needs
+
 
 @pytest.fixture(autouse=True)
 def _offscreen(monkeypatch):
@@ -129,6 +131,7 @@ def test_judge_occupancy_node_reacts_to_frames(tmp_path):
 
         # a camera measurement publishes `frame`; the occupancy processor reacts to it
         cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer)
+        fire_live_imaging(exp)                      # On Pulse: the trigger-driven camera streams
         cam.step()                                  # first frame on the hub
         console._start_logic_node(row)
         node = console._logic_nodes[id(row)]

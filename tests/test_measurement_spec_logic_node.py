@@ -34,6 +34,8 @@ from Zou_lab_control.neutral_atom.operations.temperature import (
     fit_temperature,
 )
 
+from conftest import fire_live_imaging   # the live "On Pulse" the trigger-driven camera needs
+
 
 # ------------------------------------------------------------ descriptor unit
 
@@ -238,7 +240,8 @@ def test_virtual_camera_honors_roi_snaps_and_crops():
     assert cam.roi is None                                  # full frame by default (unchanged)
     cam.configure(roi=[10, 20, 6, 16])                      # x=10, y=6 are NOT multiples of 4
     assert cam.roi == (8, 20, 8, 16)                        # snapped to the grid, reported back
-    frame = cam.acquire(1)[-1]
+    fire_live_imaging(exp)                                  # On Pulse: the trigger-driven camera streams
+    frame = cam.acquire(1, sequencer=exp.devices.sequencer)[-1]
     assert frame.shape == (16, 20)                          # actually CROPPED to (h, w) of the ROI
 
 
@@ -356,7 +359,8 @@ def test_camera_measurement_exposes_camera_params_and_applies_them_live():
     exp = na.connect("virtual")
     cam = exp.devices.camera
     hub = SignalHub()
-    cam_node = na.CameraMeasurement(hub, cam)
+    cam_node = na.CameraMeasurement(hub, cam, sequencer=exp.devices.sequencer)
+    fire_live_imaging(exp)                                  # On Pulse: the trigger-driven camera streams
 
     # default frames_per_cycle=1 -> the first trigger as both 'frame' (back-compat /
     # default 2D panel) and 'frame_0' (the per-trigger name).

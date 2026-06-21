@@ -17,7 +17,6 @@ from ..timing import (
     DEFAULT_CAMERA_TRIGGER_CHANNELS,
     PulseSequence,
     imaging_channel_kwargs,
-    imaging_sequence,
     sequence_for_frame_count,
 )
 
@@ -312,6 +311,14 @@ class VirtualTrapArray(TrapArrayDevice):
         pass
 
 
+def _sequence_triggers_camera(sequence, trigger_channels) -> bool:
+    """True if ``sequence`` pulses a camera-trigger (emCCD) channel -- i.e. firing it would
+    actually trigger the camera and produce a frame.  A pulse with NO camera trigger leaves
+    the camera dark, exactly as on hardware (the camera only reads out on a trigger edge)."""
+    trig = {str(c) for c in (DEFAULT_CAMERA_TRIGGER_CHANNELS if trigger_channels is None else trigger_channels)}
+    return any(getattr(p, "channel", None) in trig for p in getattr(sequence, "pulses", ()))
+
+
 class VirtualCamera(CameraDevice):
     def __init__(self, trap_array: VirtualTrapArray, exposure: float = 20e-3, timeout: float = 2.0,
                  subarray_step: int = 4):
@@ -366,14 +373,23 @@ class VirtualCamera(CameraDevice):
         # SAME timing.
         channel_kwargs = imaging_channel_kwargs(sequencer)
         probe_channel = channel_kwargs.get("probe_channel", "probe")
-        # The live monitor calls acquire() with NO sequence: a real camera is always
-        # triggered by SOME pulse, so synthesize the default "cool + image" cycle and
-        # run the SAME load->image physics (a fresh ~50% loading imaged once).
-        effective_sequence = (
-            sequence if sequence is not None
-            else imaging_sequence(exposure=self.exposure, load=True, name="live",
-                                  cooling=self.trap_array.mot_load_s, **channel_kwargs)
-        )
+        # The camera is PURELY TRIGGER-DRIVEN, exactly like the real qCMOS: a frame exists
+        # only when a camera-trigger edge gates a readout.  There are two -- and only two --
+        # trigger sources, and NOTHING is ever fabricated:
+        #   * an EXPLICIT sequence (a measurement / capture() fires it and reads), or
+        #   * the streamer's CONTINUOUS firing state (the live monitor reads whatever the
+        #     FPGA is currently firing).
+        # With neither -- no streamer, or the streamer is not firing a camera-triggering pulse
+        # (the user hit "Stop Pulse" -> set_safe_state) -- there is NO trigger, so NO frame.
+        # This is what makes the live 2D image FREEZE on Stop Pulse instead of fabricating a
+        # fresh frame every tick (the bug this fixes).
+        if sequence is not None:
+            effective_sequence = sequence
+        else:
+            firing = getattr(sequencer, "firing", None)
+            if firing is None or not _sequence_triggers_camera(firing, trigger_channels):
+                return self._retain([])          # no streamer firing a camera trigger -> no frame
+            effective_sequence = firing
         # Expand to the requested frame count (one trigger -> N repeats) so the per-frame
         # analysis below sees ONE trigger window per frame -- the exact runtime sequence
         # the sequencer fires.
@@ -471,6 +487,19 @@ class VirtualSequencer(SequencerDevice):
         self.sleep_scale = nonnegative_float(sleep_scale, "sleep_scale")
         self.history: list[dict[str, object]] = []
         self._prepared: PulseSequence | None = None
+        # The program the streamer is CONTINUOUSLY firing (a repeat_forever pulse), or None
+        # when idle/safe.  A real FPGA streamer plays a repeat_forever program until it is
+        # set to a safe state; the externally-triggered camera produces frames ONLY while
+        # this is set.  This is what makes "Stop Pulse" (set_safe_state) freeze the live
+        # image: no streamer firing -> no camera trigger -> no frame (exactly like hardware).
+        self._firing: PulseSequence | None = None
+
+    @property
+    def firing(self) -> PulseSequence | None:
+        """The repeat_forever program the streamer is continuously playing, or None when
+        idle/safe.  The live (no-sequence) camera read is gated on this -- it is the
+        software model of "the FPGA is emitting camera triggers right now"."""
+        return self._firing
 
     def prepare(self, sequence: PulseSequence) -> None:
         sequence.validate(clock_hz=self.clock_hz, channels=self.channels).raise_if_failed()
@@ -483,8 +512,22 @@ class VirtualSequencer(SequencerDevice):
         if sequence is not None and sequence is not self._prepared:
             raise RuntimeError("VirtualSequencer.fire() received a sequence that was not prepared.")
         self.history.append({"action": "fire", "sequence": self._prepared.name, "duration": self._prepared.duration})
+        # A repeat_forever program keeps the streamer firing (continuous camera triggers)
+        # until set_safe_state.  A finite program plays ONCE -- a measurement's own acquire
+        # fires + reads it within that call -- so it does NOT leave the streamer continuously
+        # firing (and must not make a later live read see a stale finite shot).
+        if bool(getattr(self._prepared, "repeat_forever", False)):
+            self._firing = self._prepared
         if self.sleep_scale > 0:
             time.sleep(self._prepared.duration * self.sleep_scale)
+
+    def stop(self) -> None:
+        """Drive the streamer to a safe idle state -- it stops firing, so the camera sees no
+        more triggers.  ``abort`` / ``set_safe_state`` (base) route here, so "Stop Pulse"
+        from the GUI clears the firing state and the live image freezes."""
+        if self._firing is not None:
+            self.history.append({"action": "safe_state"})
+        self._firing = None
 
     def snapshot(self) -> dict[str, object]:
         return {
@@ -492,6 +535,7 @@ class VirtualSequencer(SequencerDevice):
             "channels": list(self.channels),
             "clock_hz": self.clock_hz,
             "runs": sum(1 for row in self.history if row["action"] == "fire"),
+            "firing": None if self._firing is None else self._firing.name,
         }
 
     def close(self) -> None:

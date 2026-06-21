@@ -120,6 +120,20 @@ res.plot       # frontend 绘图对象（只画原始像素，无任何叠加）
 虚拟相机在采\pyapi{名为 "sitemap" 的序列}时会强制"所有格点都加载"（方便标定）。真实硬件没有这个隐藏行为——做 sitemap 时你必须自己保证原子都加载好。把这条记在心里，别被虚拟后端的"理想 sitemap"误导。
 \end{notebox}
 
+\section{相机由脉冲门控：没有脉冲就没有帧}
+相机是\tfocus{外触发}器件：一帧的产生，只发生在脉冲序列器\tfocus{正在发}一条带相机触发（emCCD）的连续脉冲、给出一个触发边沿的时候。这条因果链是\tfocus{自底向上}建模的，虚拟与真实完全一致：
+
+\begin{itemize}
+  \item \tfocus{在跑脉冲（On Pulse）}：序列器持续发 \pyapi{repeat_forever} 的成像脉冲 -> 每个触发边沿采一帧 -> live 2D 图\tfocus{持续刷新}。
+  \item \tfocus{停脉冲（Stop Pulse / \pyapi{set_safe_state})}：序列器停发 -> 没有触发边沿 -> 相机\tfocus{采不到新帧}。live 2D 图\tfocus{冻结在最后一帧}，而不是凭空再造一张。
+\end{itemize}
+
+这条门控\tfocus{只}存在于最底层的数据源里（"虚拟只 fake 最底层相机帧"这条铁律）：\pyapi{VirtualCamera} 读 \pyapi{sequencer.firing}（在跑的连续脉冲，停了就是 \pyapi{None}）来决定有没有帧；真实 \pyapi{QCMOSCamera} 则是直接等硬件触发边沿——没边沿就等不到帧。两者跑的是\tfocus{同一条契约路径}（\pyapi{camera.acquire(...)}），只有"帧从哪来"不同。所以无论你从笔记本、task console 的 live 面板、还是真机看，"\tfocus{脉冲在跑才有图、停脉冲就冻结}"这一行为都成立。
+
+\begin{notebox}[别让虚拟相机凭空造图]
+虚拟后端\tfocus{绝不}在没有脉冲时也合成一张"理想成像"。那会让 live 2D 在停脉冲后仍然刷新，与真机背道而驰（真机此时相机什么也采不到）。一帧必须对应一个真实触发边沿——这正是"虚拟只 fake 最底层数据源、其余走实机同一路径"的体现：把相机的"有没有帧"也交给脉冲决定，而不是交给一个每拍都出图的假循环。
+\end{notebox}
+
 \chapter{相机读出教程：从原始图到占据}
 
 读出分三步，每步产出一个\tfocus{标定}并存进 session：\textbf{找格点（sitemap）} -> \textbf{学阈值（thresholds）} -> \textbf{单张检测（detect）}。

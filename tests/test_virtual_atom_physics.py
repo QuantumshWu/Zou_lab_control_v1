@@ -25,10 +25,19 @@ from Zou_lab_control.neutral_atom.devices.virtual import (
 )
 from Zou_lab_control.neutral_atom.timing import imaging_sequence
 
+from conftest import fire_imaging_pulse   # the live "On Pulse" the trigger-driven camera needs
+
 
 def _rig(**trap):
+    """A trap/camera/sequencer rig with the streamer already FIRING the live imaging pulse,
+    so the trigger-driven camera streams -- the exact state the live monitor runs in (the
+    user has hit "On Pulse").  ``set_safe_state()`` would stop it (the camera then sees no
+    trigger and freezes)."""
     trap_array = VirtualTrapArray(grid_shape=(4, 5), seed=11, **trap)
-    return trap_array, VirtualCamera(trap_array), VirtualSequencer()
+    cam = VirtualCamera(trap_array)
+    seqr = VirtualSequencer()
+    fire_imaging_pulse(seqr, exposure=cam.exposure, cooling=trap_array.mot_load_s)
+    return trap_array, cam, seqr
 
 
 def test_each_shot_is_a_fresh_random_loading():

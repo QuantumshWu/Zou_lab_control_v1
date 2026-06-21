@@ -6970,20 +6970,23 @@ def test_user_composed_loading_readout_publishes_standard_signals():
     The running loading rate lands near the configured probability, and a
     namespaced (prefixed) second chain coexists in the same hub for A-B expressions."""
 
+    from conftest import fire_imaging_pulse
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
-    from Zou_lab_control.neutral_atom.devices.virtual import VirtualCamera, VirtualTrapArray
+    from Zou_lab_control.neutral_atom.devices.virtual import VirtualCamera, VirtualSequencer, VirtualTrapArray
     from Zou_lab_control.neutral_atom.operations.logic import (
         CalibrateReadoutTask, CameraMeasurement, OccupancyProcessor)
 
     def _build(hub, *, prefix, seed, loading_probability):
         trap = VirtualTrapArray(grid_shape=(5, 7), loading_probability=loading_probability, seed=seed)
         camera = VirtualCamera(trap, exposure=0.02)
+        seqr = VirtualSequencer()
+        fire_imaging_pulse(seqr, exposure=0.02, cooling=trap.mot_load_s)   # On Pulse: trigger-driven camera streams
         task = CalibrateReadoutTask(hub, camera, grid_shape=trap.grid_shape,
                                     sitemap_exposure=0.05, readout_exposure=0.02,
                                     roi_radius=1, calibration_frames=4, threshold_frames=24,
                                     prefix=f"{prefix}cal_")
         task.run_to_completion()
-        cam = CameraMeasurement(hub, camera, prefix=prefix)
+        cam = CameraMeasurement(hub, camera, sequencer=seqr, prefix=prefix)
         # loading rate = cumulative running mean of occupancy (no smoothing knob)
         det = OccupancyProcessor(hub, calibration=task.calibration, source=f"{prefix}frame",
                               grid_shape=trap.grid_shape, prefix=prefix)
@@ -7219,8 +7222,10 @@ def test_psf_bimodal_readout_end_to_end_on_virtual_backend():
     assert cal.method == "psf"
     assert cal.metadata.get("threshold_method") == "bimodal"
     assert np.all(np.isfinite(cal.thresholds))
+    from conftest import fire_live_imaging
     exp.devices.trap_array.set_occupancy([0, 1, 2, 5, 9])
-    image = exp.devices.camera.acquire(1, force_all_sites=False)[-1]
+    fire_live_imaging(exp)            # On Pulse: the trigger-driven camera streams the pinned shot
+    image = exp.devices.camera.acquire(1, sequencer=exp.devices.sequencer, force_all_sites=False)[-1]
     assert cal.detect(image).occupied_indices == [0, 1, 2, 5, 9]
 
 

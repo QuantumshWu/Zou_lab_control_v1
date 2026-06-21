@@ -36,6 +36,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if sys.path[0] != str(REPO_ROOT):
     sys.path.insert(0, str(REPO_ROOT))
 
+from conftest import fire_live_imaging   # the live "On Pulse" the trigger-driven camera needs
+
 
 @pytest.fixture(autouse=True)
 def _offscreen(monkeypatch):
@@ -78,8 +80,10 @@ def test_calibrate_task_computes_every_method_processor_picks(threshold_method):
             thr = np.asarray(cal.thresholds_for(m), dtype=float).reshape(-1)
             assert thr.shape == (12,) and np.isfinite(thr).all()
         # the processor PICKS the method -> calibration.detect(method=...) routes correctly
+        fire_live_imaging(exp)                 # On Pulse: the trigger-driven camera streams
         for m in ALL_READOUT_METHODS:
-            hub = SignalHub(); cam = CameraMeasurement(hub, exp.devices.camera)
+            hub = SignalHub()
+            cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer)
             occ = OccupancyProcessor(hub, calibration=cal, source="frame", method=m)
             cam.step(); occ.step()
             assert hub.latest("occupied").shape == (12,)
@@ -349,7 +353,8 @@ def test_camera_measurement_region_is_editable_and_applies_to_virtual():
         # building with a region windows the VIRTUAL camera -> the frame is cropped
         node = exp.readout.camera_spec().build(SignalHub(), region="10, 50, 8, 40")
         assert node.camera.roi is not None
-        frame = node.camera.acquire(1, sequencer=None)[0]
+        fire_live_imaging(exp)                            # On Pulse: the trigger-driven camera streams
+        frame = node.camera.acquire(1, sequencer=node.sequencer)[0]
         assert np.asarray(frame).shape != (40, 50)        # ROI actually crops the virtual frame
         assert "region" in node.acquisition_parameters()  # round-trips (endpoints)
     finally:

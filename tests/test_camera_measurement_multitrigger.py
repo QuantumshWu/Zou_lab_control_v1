@@ -25,11 +25,14 @@ import Zou_lab_control.neutral_atom as na
 from Zou_lab_control.neutral_atom.operations.logic import CameraMeasurement, OccupancyProcessor
 from Zou_lab_control.neutral_atom.core.signals import SignalHub
 
+from conftest import fire_live_imaging   # the live "On Pulse" the trigger-driven camera needs
+
 
 def test_two_triggers_publish_frame_0_and_frame_1():
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
     hub = SignalHub()
-    cam_node = CameraMeasurement(hub, exp.camera, frames_per_cycle=2)
+    cam_node = CameraMeasurement(hub, exp.camera, sequencer=exp.devices.sequencer, frames_per_cycle=2)
+    fire_live_imaging(exp)            # On Pulse: the trigger-driven camera now streams
     cam_node.step()
 
     assert set(cam_node.published_signals()) == {"frame", "frame_0", "frame_1"}
@@ -57,8 +60,9 @@ def test_readout_image_frame_judged_is_synced_with_occupancy():
     exp.readout.thresholds(frames=20, display=False)
     cal = exp.readout.current
     hub = SignalHub()
-    cam = CameraMeasurement(hub, exp.camera)
+    cam = CameraMeasurement(hub, exp.camera, sequencer=exp.devices.sequencer)
     det = OccupancyProcessor(hub, calibration=cal, source="frame", method="box", grid_shape=(3, 4))
+    fire_live_imaging(exp)            # On Pulse: the trigger-driven camera now streams
     for _ in range(4):
         cam.step()
         det.step()
@@ -86,8 +90,9 @@ def test_console_resolves_2d_frame_panel_to_judged_frame_for_shot_alignment():
     exp.readout.thresholds(frames=20, display=False)
     cal = exp.readout.current
     hub = SignalHub()
-    cam = CameraMeasurement(hub, exp.camera)
+    cam = CameraMeasurement(hub, exp.camera, sequencer=exp.devices.sequencer)
     det = OccupancyProcessor(hub, calibration=cal, source="frame", method="box", grid_shape=(3, 4))
+    fire_live_imaging(exp)            # On Pulse: the trigger-driven camera now streams
 
     # the exact race: judge one frame, then the camera streams TWO newer frames before the
     # next occupancy tick -> latest('frame') is 2 shots ahead of the judged frame.

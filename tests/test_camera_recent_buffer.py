@@ -26,10 +26,18 @@ def _camera(grid=(2, 3), image=(20, 24), seed=1):
     return VirtualCamera(VirtualTrapArray(grid_shape=grid, image_shape=image, seed=seed), exposure=0.01)
 
 
+def _seq():
+    """The explicit fired trigger this device-level test images on.  The camera is purely
+    trigger-driven (no fabricated frames), so a standalone camera with no streamer reads via
+    ``acquire(sequence=...)`` -- it fires this imaging pulse and reads the frame(s)."""
+    from Zou_lab_control.neutral_atom.timing import imaging_sequence
+    return imaging_sequence(exposure=0.01, load=True, name="readout")
+
+
 def test_acquire_retains_and_latest_is_newest():
     cam = _camera()
     assert cam.latest() is None                      # nothing acquired yet
-    frames = cam.acquire(2)
+    frames = cam.acquire(2, sequence=_seq())
     assert len(frames) == 2
     np.testing.assert_array_equal(cam.latest(), frames[-1])
     assert len(cam.recent_frames()) == 2
@@ -38,10 +46,10 @@ def test_acquire_retains_and_latest_is_newest():
 
 def test_drain_is_lossless_across_acquires():
     cam = _camera(seed=2)
-    cam.acquire(2)
+    cam.acquire(2, sequence=_seq())
     assert len(cam.drain()) == 2                      # all frames since start
     assert cam.drain() == []                          # nothing new since last drain
-    later = cam.acquire(3)
+    later = cam.acquire(3, sequence=_seq())
     new = cam.drain()
     assert len(new) == 3                              # only the new ones
     np.testing.assert_array_equal(new[-1], later[-1])
@@ -50,7 +58,7 @@ def test_drain_is_lossless_across_acquires():
 def test_recent_capacity_bounds_retention():
     cam = _camera(grid=(2, 2), image=(16, 16), seed=3)
     cam.recent_capacity = 3                           # set before first retain (lazy init)
-    cam.acquire(5)
+    cam.acquire(5, sequence=_seq())
     assert len(cam.recent_frames()) == 3              # bounded ring
     assert len(cam.drain()) == 3                      # drain capped at what's retained
     cam.clear_recent()
