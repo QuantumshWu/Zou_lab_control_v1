@@ -16,6 +16,7 @@ from .base import CameraDevice, SequencerDevice, TrapArrayDevice, snap_subarray
 from ..timing import (
     DEFAULT_CAMERA_TRIGGER_CHANNELS,
     PulseSequence,
+    PulseTableState,
     count_trigger_pulses,
     imaging_channel_kwargs,
     sequence_for_frame_count,
@@ -564,6 +565,9 @@ class VirtualSequencer(SequencerDevice):
         self.sleep_scale = nonnegative_float(sleep_scale, "sleep_scale")
         self.history: list[dict[str, object]] = []
         self._prepared: PulseSequence | None = None
+        # The compiled program of the last prepare() (parity with RuntimeSequencer.prepare,
+        # which on_pulse / sync-to-device read for .sequence_name / .trigger_count / etc.).
+        self.last_program = None
         # The program the streamer is CONTINUOUSLY firing (a repeat_forever pulse), or None
         # when idle/safe.  A real FPGA streamer plays a repeat_forever program until it is
         # set to a safe state; the externally-triggered camera produces frames ONLY while
@@ -578,10 +582,32 @@ class VirtualSequencer(SequencerDevice):
         software model of "the FPGA is emitting camera triggers right now"."""
         return self._firing
 
-    def prepare(self, sequence: PulseSequence) -> None:
-        sequence.validate(clock_hz=self.clock_hz, channels=self.channels).raise_if_failed()
-        self._prepared = sequence
-        self.history.append({"action": "prepare", "sequence": sequence.name, "duration": sequence.duration})
+    def prepare(self, sequence: PulseSequence | PulseTableState):
+        # Accept either a PulseSequence or a GUI PulseTableState (what bind_pulse/on_pulse and a
+        # loaded pulse .json pass).  Compile a table to a PulseSequence so fire()/firing/acquire
+        # all work on ONE type, carrying repeat_forever for a continuous (On Pulse) program.
+        from .sequencer import compile_runtime_program
+        if isinstance(sequence, PulseTableState):
+            channels = list(sequence.channels)
+            program = sequence.to_sequence(clock_hz=self.clock_hz)
+            if bool(getattr(sequence, "repeat_forever", False)):
+                program = program.forever()
+        else:
+            program = sequence
+            # The program defines its OWN channels (friendly imaging names, or a saved pulse
+            # table's board chNN) -- derive them from the pulses rather than this sequencer's
+            # default list, so a virtual streamer plays whatever channel set the pulse uses.
+            channels = sorted({p.channel for p in program.base_pulses()}) or list(self.channels)
+        # Validate the TIMING against the clock grid (the channel set is intrinsic to the
+        # program), then compile to a RuntimeSequenceProgram so prepare() returns the SAME object
+        # the real RuntimeSequencer does (on_pulse / sync-to-device read it).
+        program.validate(clock_hz=self.clock_hz).raise_if_failed()
+        self._prepared = program
+        self.last_program = compile_runtime_program(
+            program, channels=channels, clock_hz=self.clock_hz,
+            trigger_channels=getattr(self, "trigger_channels", DEFAULT_CAMERA_TRIGGER_CHANNELS))
+        self.history.append({"action": "prepare", "sequence": program.name, "duration": program.duration})
+        return self.last_program
 
     def fire(self, sequence: PulseSequence | None = None) -> None:
         if self._prepared is None:
