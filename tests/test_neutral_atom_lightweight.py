@@ -971,6 +971,35 @@ def test_fpga_pulse_streamer_compiles_channel_delay_and_repeated_frames():
     assert program.loop_count == 2
 
 
+def test_pulse_table_validate_and_to_sequence_accept_clock_hz_alias():
+    """clock_hz is an ergonomic alias for time_step_ns on validate()/to_sequence(): the rest
+    of the API (compile/compile_scan/from_sequence/PulseSequence.validate) speaks clock_hz, so
+    a caller's natural ``state.validate(clock_hz=...)`` / ``state.to_sequence(clock_hz=...)``
+    must NOT raise "unexpected keyword clock_hz", and must equal passing the reciprocal step."""
+    state = na.PulseTableState(
+        channels=["trap", "probe", "emCCD"],
+        periods=[
+            na.PulsePeriod(100, (1, 0, 0), unit="ns", name="load"),
+            na.PulsePeriod(200, (1, 1, 1), unit="ns", name="image"),
+        ],
+        time_step_ns=20.0,
+    )
+    clock = 50_000_000.0
+    assert abs(1e9 / clock - 20.0) < 1e-9   # the reciprocal we compare against
+    # the user's natural calls must work (this was the reported "unexpected keyword clock_hz")
+    state.validate(clock_hz=clock)
+    by_clock = state.to_sequence(clock_hz=clock, name="x")
+    by_step = state.to_sequence(time_step_ns=1e9 / clock, name="x")
+    edges = lambda s: [(p.channel, round(p.start, 12), round(p.duration, 12)) for p in s.pulses]
+    assert edges(by_clock) == edges(by_step)   # clock_hz and its reciprocal step are identical
+    # passing BOTH is a clear error, not a silent unit mix-up
+    with pytest.raises(ValueError, match="either clock_hz or time_step_ns"):
+        state.validate(clock_hz=clock, time_step_ns=20.0)
+    # the layer split stays: clock_hz is NOT silently swallowed by **kwargs -- a real typo errors
+    with pytest.raises(TypeError):
+        state.validate(clcok_hz=clock)
+
+
 def test_pulse_table_state_compiles_repeat_visibility_and_delays(tmp_path):
     unnamed = na.PulseTableState(channels=["ch00"])
     assert re.fullmatch(r"pulse_\d{8}_\d{6}", unnamed.name)

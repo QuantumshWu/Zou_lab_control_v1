@@ -536,13 +536,26 @@ class PulseTableState:
                 return slot_var(index)
         return None
 
+    def _resolve_step_ns(self, time_step_ns: float | None, clock_hz: float | None) -> float:
+        """Resolve the tick grid (ns) from EITHER ``time_step_ns`` OR ``clock_hz`` (its
+        reciprocal).  The rest of the API speaks ``clock_hz`` (``compile`` / ``compile_scan``
+        / ``from_sequence`` / ``PulseSequence.validate`` all take it), so ``validate`` and
+        ``to_sequence`` accept it too and convert ONCE here -- a caller never has to remember
+        which of the two units a given method wants.  Defaults to the table's ``time_step_ns``."""
+        if clock_hz is not None:
+            if time_step_ns is not None:
+                raise ValueError("pass either clock_hz or time_step_ns, not both.")
+            time_step_ns = 1_000_000_000.0 / positive_float(clock_hz, "clock_hz")
+        return self.time_step_ns if time_step_ns is None else positive_time_step_ns(time_step_ns)
+
     def validate(self, *, slots: Mapping[str, float] | None = None, time_step_ns: float | None = None,
-                 validate_scan_slots: bool = True) -> "PulseTableState":
+                 clock_hz: float | None = None, validate_scan_slots: bool = True) -> "PulseTableState":
         # ``validate_scan_slots`` checks the slot bindings + the FULL N-row scan table; it is
         # SLOT-INDEPENDENT, so a per-scan-point validate (compile_scan) sets it False after
         # one full check -- otherwise validating N points each rescans the whole table, an
         # O(N^2) blow-up that dominated compile at thousands of points.
-        step_ns = self.time_step_ns if time_step_ns is None else positive_time_step_ns(time_step_ns)
+        # ``clock_hz`` is an ergonomic alias for ``time_step_ns`` (this table's tick grid).
+        step_ns = self._resolve_step_ns(time_step_ns, clock_hz)
         slots = self.reference_slots() if slots is None else dict(slots)
         if not self.channels:
             raise ValueError("pulse table must have at least one channel.")
@@ -1199,9 +1212,10 @@ class PulseTableState:
         name: str | None = None,
         slots: Mapping[str, float] | None = None,
         time_step_ns: float | None = None,
+        clock_hz: float | None = None,
         expand_repeat: bool = True,
     ) -> PulseSequence:
-        step_ns = self.time_step_ns if time_step_ns is None else positive_time_step_ns(time_step_ns)
+        step_ns = self._resolve_step_ns(time_step_ns, clock_hz)   # clock_hz = ergonomic alias for time_step_ns
         slots = self.reference_slots() if slots is None else dict(slots)
         self.validate(slots=slots, time_step_ns=step_ns)
         sequence = PulseSequence(name=name or self.name)
