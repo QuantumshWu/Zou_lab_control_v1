@@ -837,6 +837,29 @@ close()     # 关闭设备，释放句柄
 
 这样产出的图像虽是合成的，但格式与真机一致（原始像素），所以 sitemap/detect 等下游照常工作，你可以在没有原子、没有相机的桌面上完整验证读出逻辑。
 
+\subsection{仿真模型与参数（脉冲驱动，对标真实 Rb87 v16 qCMOS）}
+
+仿真不是"随机画几个点"：\tfocus{每一帧相机图就是一个实验循环}，由\tfocus{实际 fire 的 \pyapi{PulseSequence} 逐帧驱动}。一条序列里每个相机触发（如 \pyapi{emCCD}）边沿对应一帧，相邻两个触发之间的脉冲被解析成该帧的冷却时长、trap-off 间隙与曝光时长（\pyapi{cooling_durations_per_frame} / \pyapi{trap_off_durations_per_frame} / \pyapi{exposures_per_frame}）。于是装载率、温度（release-recapture）、读出保真度都从\tfocus{同一套物理}里涌现，只能通过渲染出的相机帧"测"回来——分析层从不读这些真值，与真机完全一致。下面逐个物理效应给出实现与\tfocus{当前参数值及其物理依据}：
+
+\begin{description}
+\item[装载（loading）] 每个光阱独立按伯努利装载，概率 \pyapi{p = loading_probability * (1 - exp(-t_cool / load_time_constant_s))}：冷却/MOT 时间越长越饱和。\pyapi{loading_probability=0.5}（光助碰撞单原子装载上限）、\pyapi{load_time_constant_s=0.5\,ms}、\pyapi{mot_load_s=0.30\,s}（一发虚拟 shot 代表一个真实量级的 MOT/PGC 循环）。所以\tfocus{编辑脉冲里的冷却时长会真实改变图像里的装载}。
+\item[PSF 与信号] 每个被占据站点画成各向同性高斯，\pyapi{atom_sigma_px=0.7\,px}（v16 逐站点 PSF 拟合 $\sigma_x{\sim}0.61$ / $\sigma_y{\sim}0.76$，几何均值 ${\sim}0.68$）；峰值幅度 = \pyapi{atom_rate} $\times$ 散射时间，\pyapi{atom_rate=2150\,ph/s}（调到 v16 在 3\,ms 参考读出下亮点 3$\times$3-box 35 站均值 ${\sim}18.7$ 光子）；站距 \pyapi{spacing_px=9.0\,px}（v16 ${\sim}9.2$）。
+\item[背景] 杂散光 + 散射底噪 \pyapi{background_rate=600\,ph/s/px}（v16 3\,ms 角落中值在 200-count offset 之上 ${\sim}1.8$ 光子/px），故暗站点也有真实散粒底噪而非近零；\pyapi{dark_current_e_per_s=0.006}。
+\item[相机噪声] 先对期望光电子取泊松，再 \pyapi{counts = pe / conversion_e_per_count + offset_counts + N(0, read_noise_e / conversion)}。\pyapi{conversion_e_per_count=0.107}、\pyapi{read_noise_e=0.43}、\pyapi{offset_counts=200} —— 与真实 v16 \pyapi{CameraConfig} 逐字一致。
+\item[读出损耗 / 寿命] 每个原子在 probe 下寿命 ${\sim}\mathrm{Exp}(\pyapi{detection_lifetime}=2.0\,s)$：曝光越长散射光子越多（SNR 越高）但中途丢失越多——中途丢失的原子从\tfocus{同一装载的下一帧}占据里掉出。这正是 detection-time 扫描测的 SNR-vs-存活权衡。
+\item[温度与加热] 新装载的原子起始处于 PGC 底 \pyapi{cooled_temperature_K=50\,\textmu K}；probe 以 \pyapi{probe_heating_K_per_s} 反冲加热（默认 0 = 读出对温度中性，调高即看到拟合温度升高）。
+\item[释放-再捕获] trap-off 持续 \pyapi{t_off} 后原子按当前温度弹道飞散，逐轴再捕获比例 $\mathrm{erf}\!\big(r_c/(\sqrt2\,\sigma_v\,t_\text{off})\big)$、三维取立方，$\sigma_v=\sqrt{k_B T/m}$。\pyapi{capture_radius_m=6\,\textmu m}、\pyapi{recapture_mass_kg=}\,Rb87（$1.443\times10^{-25}$\,kg）。温度越高、gap 越长，存活越低。
+\item[多帧 / 多 emCCD 触发] 一条序列含多个相机触发即渲染多帧，每帧各自按上面规则成像。
+\end{description}
+
+\begin{notebox}[单一真相源]
+以上数值的\tfocus{权威定义在 \filepath{virtual.py} 的字段注释}（本节是其镜像，改值以代码为准，不要在别处复制这些字面量）。要改仿真行为：直接改 \pyapi{virtual.py} 的字段，或在连接时覆盖 \pyapi{na.connect("virtual", sitemap=\{...\})} / 设备配置。
+\end{notebox}
+
+\begin{notebox}[已知近似：同帧内 cooling 与 trap-off 互斥]
+逐帧聚合时，若\tfocus{同一相机帧窗口内既有冷却脉冲又有 trap-off 间隙}，当前按"冷却脉冲 = 重新装载（reload 到 PGC 底）"优先，该帧的 trap-off 被忽略。标准 release-recapture 温度测量的 bracket 序列\tfocus{不含}冷却通道，故不受影响；只有刻意把冷却与释放放进同一帧窗口才会触发这个近似。
+\end{notebox}
+
 \subsection{\pyapi{force\_all\_sites}：渲染满阵列（仿真专属）}
 
 \pyapi{VirtualCamera.acquire} 接受一个 \pyapi{force_all_sites} 参数，用来\tfocus{显式}控制“是否把所有站点都视为已装载（loaded）”。这是一个仿真专属的细节：
