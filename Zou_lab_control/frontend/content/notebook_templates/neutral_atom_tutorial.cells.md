@@ -186,12 +186,13 @@ na.detect_image(exp.camera.capture(display=False).image, psf_cal, display=True).
 <!-- cell:code -->
 # 数据文件夹(真机:相机/DAQ 把 PREFIX<n> 原始帧写到这里)。改成你的实验路径即可。
 data_dir = "results/rb87_run01"
-# 【仅虚拟】把假原始帧写进该文件夹,模拟真机采集(真机:删除这一格)。
+# 【仅虚拟】用 *同一台* 虚拟相机(trap_array=exp.devices.trap_array)渲染假原始帧,
+# 这样存盘数据与 live 会话的几何/信号完全一致(真机里本就是同一台相机在写盘)。真机:删除这一格。
 # 每次装载成像 shots_per_group=4 张:short_shot=3 是短读出,ref_shots=(1,2,4) 是高 SNR 参考。
 na.write_virtual_run(
     data_dir, prefix="img", groups=150, shots_per_group=4, short_shot=3, ref_shots=(1, 2, 4),
     short_exposure=3e-3, reference_exposure=20e-3,
-    grid_shape=exp.devices.trap_array.grid_shape, seed=1,
+    trap_array=exp.devices.trap_array, seed=1,
 )
 
 <!-- cell:code -->
@@ -228,33 +229,36 @@ for row in report.ablation:
 <!-- cell:markdown -->
 ## Scan detection time and fidelity
 
-`detection_time` 不使用 virtual ground truth。它先拍 long-exposure reference images，然后对每个 detection time 的 ROI count distribution 做 threshold 和 Gaussian split fidelity 估计。接口默认 `live=True`；这里保留 live scan，cell 返回后 acquisition worker 和 frontend plot 会继续更新。等图跑完或想提前停止时，运行下一格 `scan.stop()`，再在后面的 cell 里做 decay fit。
+`detection_time` 不使用 virtual ground truth：它先拍 long-exposure reference 帧，再对每个 detection time 的 ROI 计数分布做阈值 + 双高斯保真度估计。下面用 `live=False` **一次跑完整条扫描**（确定、可复现），结果里 `scan.times` / `scan.fidelities` 是曲线，`summary()['best']` 给出保真度最高的读出时长。
+
+> 想交互观察：`detection_time(..., live=True)` 会后台采集并实时刷新前端图，`scan.stop()` 提前停止；停止后 `scan.fidelities` 里已采到的数据仍然可用。
 
 <!-- cell:code -->
 clock_hz = exp.devices.sequencer.clock_hz
-time_ticks = np.linspace(int(round(0.2e-3 * clock_hz)), int(round(10e-3 * clock_hz)), 100, dtype=int)
+time_ticks = np.linspace(int(round(0.2e-3 * clock_hz)), int(round(10e-3 * clock_hz)), 30, dtype=int)
 times = time_ticks / clock_hz
-scan = exp.readout.detection_time(times, shots=30, live=True, display=True)
+# live=False：一次跑完整条扫描，确定且可复现（live=True 则后台跑、前端实时刷新、scan.stop() 提前停）。
+scan = exp.readout.detection_time(times, shots=20, live=False, display=True)
+print("times (ms):", np.round(scan.times * 1e3, 2).tolist())
+print("fidelity  :", np.round(scan.fidelities, 3).tolist())
 
 <!-- cell:markdown -->
-## Stop the live scan
+## 读出时长的选择
 
-对 notebook 和未来 GUI 来说，外部只需要一个 stop：`scan.stop()`。它转发到 frontend `RunSession.stop()`，这个 session 会请求 acquisition worker/source 停止，并停止 attached plot refresh timer。已经采到的数据仍然留在 `scan.fidelities` 里，可以继续保存、显示 summary，或在下一格做 fit。
-
-内部仍然保留 `scan.measurement`、`scan.plot`、`scan.data_figure` 这三个部件，方便 debug 或 GUI 接管；但普通实验流程不要把 stop 拆成两套 API。
+保真度随读出时长先升后饱和：太短信噪比不够，太长则散射加热、原子丢失、占空比下降。`summary()['best']` 直接给出曲线上保真度最高的那个读出时长——这就是要选的正式成像时间。
 
 <!-- cell:code -->
-scan.stop()
-scan.summary()
+scan.summary()   # {'best': {'time': ..., 'fidelity': ...}, 'finished': True, ...}
 
 <!-- cell:markdown -->
-## Fit the stopped scan
+## 取最优读出时长
 
-拟合前要保证 live scan 已经结束或已经运行过 `scan.stop()`。decay fit 直接使用 frontend 的 `DataFigure` fitting 栈。
+`scan.summary()['best']` = `{'time': 秒, 'fidelity': 保真度}`。取拐点附近（略偏右留余量）作为正式成像时间；比它更长只是浪费占空比、徒增加热。
 
 <!-- cell:code -->
-fit_result, popt = scan.data_figure.decay()
-scan.summary(), fit_result, popt
+best = scan.summary()["best"]
+print(f"建议读出时长 = {best['time'] * 1e3:.2f} ms，保真度 ≈ {best['fidelity']:.4f}")
+best
 
 <!-- cell:markdown -->
 ## 一键测温：release-recapture（弹道重捕）
@@ -263,7 +267,7 @@ scan.summary(), fit_result, popt
 
 下面是**实机一字不变**的配方（唯一虚拟之处仍是相机）。`build_release_recapture_pulse` 建一个 6 周期双触发序列，trap-off 周期的 duration 绑到 scan slot `s0`=`t_off`（与扫描读出时长同一种可扫量）；`exp.readout.temperature` 每点采两帧、按 `calibration.detect` 算逐点存活；`fit_temperature` 是纯后处理。
 
-> **一键 GUI 路径**：同一测量在 Task 控制台里走 `zf.show_task_console(hub=..., measurements=exp.readout.measurement_specs())`——Control 标签页选 Temperature、填范围/shots/capture_radius、点 Start，Monitor 出 survival 曲线、跑完自动显示 T。GUI 的 Start 与下面这行 API 调**同一个建器**，不会漂移。
+> **一键 GUI 路径**：同一测量在 Task 控制台里走 `zf.show_task_console(hub=SignalHub(), session=exp, measurements=exp.readout.measurement_specs())`——头部 **Add Panel** 选 `Temperature`，它作为一个 Logic 节点加入，在自己的 **Edit** 页填范围/shots/capture_radius、点 **Start**，再加一个 Monitor 面板指向 survival 信号看曲线、跑完自动显示 T。GUI 的 Start 与下面这行 API 调**同一个建器**，不会漂移。完整的控制台跑实验流程见 `task_console_tutorial.ipynb`。
 
 <!-- cell:code -->
 # 6 周期双触发序列：trap_off 周期的 duration 绑到 scan slot s0(= t_off)。
@@ -295,17 +299,20 @@ task_console 的设计原则是**自由搭建**——看板开出来是空的，
 每张面板底部都列出它**读 / 发**了哪些信号（重名会标 ⚠），所以不用猜 hub 里有什么名字（hub 里只有 measurement + processor 的输出，没有 task）。要调相机/判占据的 `grid_shape` / `exposure` / `roi_radius` / `method`，在那个节点**自己**的 Edit 标签里改 + **Apply**（两帧之间应用，不中断采集）；plot 面板的 Edit 直接给产它信号的那个 measurement/processor 的参数表单。换实机只改 `na.connect("virtual"→"qcmos")`，这一节一字不变。
 
 <!-- cell:code -->
-%gui qt
-from Zou_lab_control.neutral_atom.core.signals import SignalHub
-
-hub = SignalHub()
-# session=exp 让 Add Panel 能从相机建 "Measurement: Camera (live frames)";
-# 看板开出来是空的 —— Add Panel -> Camera(发 frame) + Processor: Judge occupancy(真 detect),
-# 再 Add Panel -> Plot: Site map (value = occupied) / Plot: 2D (value = frame) 自己搭。
-console = zf.show_task_console(hub=hub, session=exp,
-                              measurements=exp.readout.measurement_specs(),
-                              processors=exp.readout.processor_specs())
-console
+# 桌面 Qt 会话里取消注释,打开 Task 控制台 GUI。注意:本 notebook 上面用 ipympl 内联图,
+# 而 Task 控制台是 Qt 实时窗口(另一套事件循环)——两者不要在同一 kernel 同时跑;要用控制台请在
+# 新 kernel 里单独跑本节(完整的从零搭建流程见 task_console_tutorial.ipynb)。
+# %gui qt
+# from Zou_lab_control.neutral_atom.core.signals import SignalHub
+#
+# hub = SignalHub()
+# # session=exp 让 Add Panel 能从相机建 "Measurement: Camera (live frames)";看板开出来是空的——
+# # Add Panel -> Camera(发 frame) + Processor: Judge occupancy(真 detect),再 Add Panel ->
+# # Plot: Site map (value = occupied) / Plot: 2D (value = frame) 自己搭。
+# console = zf.show_task_console(hub=hub, session=exp,
+#                               measurements=exp.readout.measurement_specs(),
+#                               processors=exp.readout.processor_specs())
+# console
 
 <!-- cell:markdown -->
 ## Save calibration, status, and Verilog

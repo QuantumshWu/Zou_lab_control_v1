@@ -29,6 +29,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if sys.path[0] != str(REPO_ROOT):
     sys.path.insert(0, str(REPO_ROOT))
 
+from conftest import fire_live_imaging   # the live "On Pulse" the trigger-driven camera needs
+
 
 @pytest.fixture(autouse=True)
 def _offscreen(monkeypatch):
@@ -248,6 +250,7 @@ def test_add_logic_node_is_stopped_and_publishes_nothing_until_start():
 
         # Start -> builds a CameraMeasurement, registers it, runs it (publish-only)
         console._start_logic_node(row)
+        fire_live_imaging(exp)                     # On Pulse: the trigger-driven camera streams
         node = console._logic_nodes[id(row)]
         assert isinstance(node, CameraMeasurement) and node in console.running_nodes
         deadline = time.monotonic() + 8.0
@@ -302,6 +305,7 @@ def test_remove_logic_node_stops_it_and_freezes_its_signal():
         _pick(console, ("camera", "live"))
         row = console.logic_nodes[0]
         console._start_logic_node(row)
+        fire_live_imaging(exp)                     # On Pulse: the trigger-driven camera streams
         node = console._logic_nodes[id(row)]
         deadline = time.monotonic() + 8.0
         while "frame" not in console.hub.names() and time.monotonic() < deadline:
@@ -345,6 +349,7 @@ def test_add_plot_is_blank_until_signal_set_and_node_started():
         _pick(console, ("camera", "live"))
         row = console.logic_nodes[-1]
         console._start_logic_node(row)
+        fire_live_imaging(exp)                     # On Pulse: the trigger-driven camera streams
         deadline = time.monotonic() + 8.0
         while "frame" not in console.hub.names() and time.monotonic() < deadline:
             time.sleep(0.03)
@@ -647,10 +652,18 @@ def test_plot_edit_shows_producing_processor_param_form():
         # start a camera (publishes frame) + a Judge-occupancy processor (publishes occupied)
         _pick(console, ("camera", "live"))
         console._start_logic_node(console.logic_nodes[-1])
+        fire_live_imaging(exp)                     # On Pulse: the trigger-driven camera streams
         _pick(console, ("processor", "Judge occupancy"))
-        console._start_logic_node(console.logic_nodes[-1])
+        proc_row = console.logic_nodes[-1]
+        console._start_logic_node(proc_row)
+        # the console gives each processor a per-INSTANCE prefix, so it publishes
+        # ``<prefix>occupied`` -- read its REAL name off the node (never a bare hard-coded one).
+        occ = console._logic_nodes[id(proc_row)].prefix + "occupied"
+        deadline = time.monotonic() + 8.0
+        while occ not in console.hub.names() and time.monotonic() < deadline:
+            time.sleep(0.03)
         # a Plot reading the processor's `occupied` -> its Edit shows the processor's form
-        card = PanelCard(PanelConfig(kind="sites", source="value = occupied"),
+        card = PanelCard(PanelConfig(kind="sites", source=f"value = {occ}"),
                          parent=console.board, names_provider=console.hub.names)
         console._attach_card(card)
         console._edit_card(card)

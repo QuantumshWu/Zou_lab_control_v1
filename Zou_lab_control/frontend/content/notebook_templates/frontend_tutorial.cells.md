@@ -1,8 +1,3 @@
-﻿<!-- cell:markdown -->
-# Zou_lab_control.frontend tutorial
-
-这个 notebook 展示统一的 Jupyter 画图接口。第一格直接把 `..` 加入 `sys.path` / `PYTHONPATH`，然后导入 `Zou_lab_control.frontend`，不需要先安装本仓库。
-
 <!-- cell:code -->
 {{BOOTSTRAP_CELL}}
 
@@ -274,3 +269,8 @@ for name in ["live_scan", "continuous_monitor"]:
     obj = globals().get(name)
     if obj is not None and hasattr(obj, "stop"):
         obj.stop()
+
+<!-- cell:markdown -->
+## 把这些组件接成一台实验:Task 控制台
+
+上面是 frontend 的各个**单件**(plot / pulse GUI / live scan)。把它们按 device → measurement → processor → task → plot 五层接成一台跑读出实验的 GUI,看 **`task_console_tutorial.ipynb`**——`zf.show_task_console(...)` 一行打开,Add Panel 搭出相机活图 + 校准 + 判 occupancy + site map,虚拟和真机用同一套调用。

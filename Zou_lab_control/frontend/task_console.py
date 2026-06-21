@@ -3188,9 +3188,9 @@ class TaskConsole(QtWidgets.QWidget):
 
         Covers RUNNING nodes AND the last build of every Logic-tab node (``_last_node``,
         kept past Stop): a finished scan's ``readout_fidelity`` or a stopped camera's
-        ``frame`` LINGER in the hub, and the picker must still name their producer rather
+        ``frame`` LINGER in the hub, and the picker must still name their source node rather
         than show a bare signal.  Running nodes are listed first; a name carried by more
-        than one node lists every producer (so an ambiguous pick can be flagged)."""
+        than one node lists every source node (so an ambiguous pick can be flagged)."""
         providers: dict[str, list] = {}
         seen: set[int] = set()
         for node in [*self.running_nodes, *self._last_node.values()]:
@@ -3282,7 +3282,7 @@ class TaskConsole(QtWidgets.QWidget):
 
         The occupancy is computed from each frame ~instantly, so a frame view and its
         occupancy are ONE event.  But the camera and the OccupancyProcessor are two
-        independent producer threads: the camera keeps publishing newer ``frame``s while
+        independent publishing threads: the camera keeps publishing newer ``frame``s while
         the processor judges an older one, so ``latest(frame)`` (what a 2D panel bound to
         ``frame`` would show) is a DIFFERENT shot from the occupancy a site-map shows.
 

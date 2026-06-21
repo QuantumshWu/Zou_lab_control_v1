@@ -879,7 +879,7 @@ class CalibrateReadoutTask(Task):
         # READOUT BRACKETS (the Rb87 fidelity flow): each shot images the SAME atoms
         # long-short-long, so the two long frames vote a ground-truth occupancy label for the
         # short readout (a shot where they disagree is an atom-loss event -> ambiguous).  The
-        # short readout frames also feed the box/PSF otsu thresholds (cali once, read many ways).
+        # short readout frames also drive the box/PSF otsu thresholds (cali once, read many ways).
         ref_groups, readout_by_group = self._collect_bracket_groups(
             out, progress_lo=0.35, progress_hi=0.9)
         # Optionally SAVE the acquired raw frames so a later source="saved frames" run

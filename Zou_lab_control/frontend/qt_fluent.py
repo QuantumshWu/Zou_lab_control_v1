@@ -1267,7 +1267,7 @@ class _FluentTabBar(QtWidgets.QTabBar):
     squeeze-free replacement for the old ``width//count`` layout that crammed EVERY tab
     (short ones included) to an equal sliver.  ``sizeHint`` still reports the NATURAL total
     so the QTabWidget grants the bar its full window-capped width (``tabSizeHint`` caps to
-    that ACTUAL width); reporting the capped sum instead would feed back and collapse the
+    that ACTUAL width); reporting the capped sum instead would loop back and collapse the
     bar.  No tab scrolls off, so no scroll arrows appear; the corner ``...`` overflow menu
     lists every FULL title.  Reusable, frontend-owned."""
 
