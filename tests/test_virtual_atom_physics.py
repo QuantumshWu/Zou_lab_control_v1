@@ -115,3 +115,78 @@ def test_hotter_atoms_survive_a_release_less():
         return k / n
 
     assert kept(cold) > kept(hot) + 0.1
+
+
+def test_cool_recools_existing_atoms_toward_the_floor_without_reloading():
+    """A PGC cooling phase on ALREADY-loaded atoms relaxes their temperature toward the
+    cooled floor WITHOUT replacing them -- so 'heat then re-cool' returns to the floor on
+    the SAME atom loading (what a release after re-cool then sees)."""
+    trap = VirtualTrapArray(grid_shape=(4, 4), seed=4, cooled_temperature_K=30e-6, probe_heating_K_per_s=10.0)
+    trap.reload()
+    occ_before = trap.occupancy.copy()
+    trap.heat(0.02)                                  # a 20 ms un-cooled probe -> +0.2 K
+    assert trap.temperature_K.mean() > 1e-3          # genuinely hot
+    trap.cool(5e-3)                                  # many tau of PGC -> back to the floor
+    assert abs(float(trap.temperature_K.mean()) - 30e-6) < 5e-6
+    assert np.array_equal(trap.occupancy, occ_before)   # re-cool, NOT a fresh reload
+
+
+def test_vacuum_trap_loss_decays_exponentially_with_dark_hold():
+    """A dark trap-ON hold loses atoms to background-gas collisions at exp(-t/trap_lifetime_s),
+    independent of light/temperature -- the trap-lifetime signal a hold-time scan recovers."""
+    lifetime = 10.0
+    for hold, expect in [(1.0, np.exp(-1.0 / lifetime)), (10.0, np.exp(-1.0))]:
+        kept = total = 0
+        for _ in range(25):
+            trap = VirtualTrapArray(grid_shape=(8, 8), loading_probability=1.0, seed=10, trap_lifetime_s=lifetime)
+            trap.reload(); total += int(trap.occupancy.sum())
+            trap.apply_trap_loss(hold)
+            kept += int(trap.occupancy.sum())
+        assert abs(kept / total - expect) < 0.05
+
+
+def test_probe_heating_increases_release_recapture_loss():
+    """Probe (imaging) recoil heating raises the cloud temperature, so the SAME trap-off
+    releases MORE atoms -- the bias an un-cooled readout puts on a temperature scan (and the
+    proof the heating mechanism is live, not a no-op).  Default heating is 0 (molasses)."""
+    t_off = 60e-6
+
+    def survival(heating):
+        kept = total = 0
+        for _ in range(40):
+            trap = VirtualTrapArray(grid_shape=(8, 8), loading_probability=1.0, seed=11,
+                                    cooled_temperature_K=30e-6, probe_heating_K_per_s=heating)
+            trap.reload(); trap.heat(20e-3)          # a 20 ms probe at this rate
+            total += int(trap.occupancy.sum()); trap.apply_recapture_loss(t_off)
+            kept += int(trap.occupancy.sum())
+        return kept / total
+
+    assert survival(0.0) > survival(2.0) + 0.1       # heating -> hotter -> recaptured less
+
+
+def test_acquire_applies_vacuum_loss_over_a_dark_hold_between_frames():
+    """End-to-end through ``acquire``: a two-trigger sequence with a long DARK trap-ON hold
+    between the images loses atoms to vacuum decay, while a short hold does not -- the
+    trap-lifetime physics emerges from the fired pulse (data-source side)."""
+    from Zou_lab_control.neutral_atom.timing import PulseSequence
+
+    def hold_seq(hold: float, expo: float = 20e-3, settle: float = 1e-3) -> PulseSequence:
+        total = expo + settle + hold + expo
+        s = PulseSequence(name="trap_hold").pulse("trap", 0.0, total, name="trap_on")
+        s = s.pulse("probe", 0.0, expo, name="probe1").pulse("emCCD", 0.0, 20e-6, name="trig1")
+        t2 = expo + settle + hold
+        return s.pulse("probe", t2, expo, name="probe2").pulse("emCCD", t2, 20e-6, name="trig2")
+
+    def survival(hold: float) -> float:
+        trap = VirtualTrapArray(grid_shape=(10, 10), loading_probability=1.0, seed=12, trap_lifetime_s=8.0)
+        cam, seqr = VirtualCamera(trap), VirtualSequencer()
+        kept = total = 0
+        for _ in range(8):
+            cam.acquire(2, sequence=hold_seq(hold), sequencer=seqr)  # frame0 loads, dark hold, frame1
+            # the survivors after the hold ARE the current occupancy (data-source physics test)
+            total += trap.n_sites
+            kept += int(trap.occupancy.sum())
+        return kept / total
+
+    assert survival(0.05) > 0.9                       # a 50 ms hold barely loses anything
+    assert survival(8.0) < 0.6                        # a one-lifetime dark hold loses ~1/e

@@ -16,6 +16,7 @@ from .base import CameraDevice, SequencerDevice, TrapArrayDevice, snap_subarray
 from ..timing import (
     DEFAULT_CAMERA_TRIGGER_CHANNELS,
     PulseSequence,
+    count_trigger_pulses,
     imaging_channel_kwargs,
     sequence_for_frame_count,
 )
@@ -102,6 +103,13 @@ class VirtualTrapArray(TrapArrayDevice):
     # bimodal readout, fidelity ~99%), while a detection-time scan out to ~100 ms still
     # shows a visible survival roll-off -- the real SNR-vs-loss trade-off.
     detection_lifetime: float = 2.0
+    # Vacuum-limited trap (1/e) lifetime in the DARK (s): background-gas collisions
+    # eject a trapped atom over seconds even with no probe light, so any trap-ON hold
+    # between two images loses atoms at ``exp(-t_hold / trap_lifetime_s)``.  This is the
+    # signal a TRAP-LIFETIME measurement (hold-time scan, no release) recovers, and it
+    # adds a realistic slow loss to long dark holds.  Much longer than the imaging
+    # lifetime, so a few-ms readout window loses essentially nothing to it (~0.01%).
+    trap_lifetime_s: float = 30.0
     # --- Cooling / heating model (sets the temperature release-recapture sees) -
     # A freshly loaded atom starts PGC-cooled at ``cooled_temperature_K``; the probe
     # (imaging light) recoil-heats it at ``probe_heating_K_per_s`` per second of
@@ -110,7 +118,22 @@ class VirtualTrapArray(TrapArrayDevice):
     # -- raise the heating rate and you see a hotter fitted temperature, exactly as a
     # real heating pulse would give.
     cooled_temperature_K: float = 50e-6
-    probe_heating_K_per_s: float = 0.0    # default 0 -> readout does not bias the temperature
+    # Probe recoil heating rate (K/s of probe exposure).  Default 0 models MOLASSES-COOLED
+    # fluorescence imaging: the cooling light on during the probe balances photon-recoil
+    # heating, so a standard readout is temperature-neutral (this is WHY real imaging uses
+    # molasses -- un-cooled imaging at the true recoil rate would heat Rb87 to ~mK in a few
+    # ms and eject it).  Raise it to model un-cooled / imperfect-molasses imaging: a probe
+    # phase then heats the atoms, which a following release-recapture reads as a hotter
+    # temperature (and an un-recooled readout loses them).  Fully wired -- ``render_image``
+    # heats by this rate over its exposure; see [[virtual-atom-physics-model]].
+    probe_heating_K_per_s: float = 0.0
+    # PGC re-cooling 1/e time (s): a cooling pulse applied to ALREADY-loaded atoms (a PGC
+    # phase mid-cycle, e.g. re-cool after an un-cooled probe heated them, before release)
+    # relaxes their temperature toward ``cooled_temperature_K`` as
+    # ``T -> floor + (T-floor) exp(-t_cool / pgc_cool_tau_s)`` -- WITHOUT reloading new
+    # atoms (the initial MOT load still reloads).  So "heat then re-cool then release"
+    # recovers the cooled floor, exactly as on hardware.
+    pgc_cool_tau_s: float = 0.3e-3
     # --- Release-recapture loss model (data-source side only) -----------------
     # When a fired sequence switches the trap OFF for ``t_off`` seconds between
     # two camera exposures, atoms fly ballistically and are lost unless they stay
@@ -149,8 +172,10 @@ class VirtualTrapArray(TrapArrayDevice):
         self.load_time_constant_s = positive_float(self.load_time_constant_s, "load_time_constant_s")
         self.mot_load_s = positive_float(self.mot_load_s, "mot_load_s")
         self.detection_lifetime = positive_float(self.detection_lifetime, "detection_lifetime")
+        self.trap_lifetime_s = positive_float(self.trap_lifetime_s, "trap_lifetime_s")
         self.cooled_temperature_K = positive_float(self.cooled_temperature_K, "cooled_temperature_K")
         self.probe_heating_K_per_s = nonnegative_float(self.probe_heating_K_per_s, "probe_heating_K_per_s")
+        self.pgc_cool_tau_s = positive_float(self.pgc_cool_tau_s, "pgc_cool_tau_s")
         self.capture_radius_m = positive_float(self.capture_radius_m, "capture_radius_m")
         self.recapture_mass_kg = positive_float(self.recapture_mass_kg, "recapture_mass_kg")
         self.rng = np.random.default_rng(self.seed)
@@ -223,11 +248,26 @@ class VirtualTrapArray(TrapArrayDevice):
 
     def heat(self, duration: float) -> None:
         """A probe (imaging-light) phase of ``duration`` s recoil-heats every atom
-        at ``probe_heating_K_per_s`` (0 by default -> readout is temperature-neutral)."""
+        at ``probe_heating_K_per_s`` (0 by default -> molasses-cooled readout is
+        temperature-neutral; raise it to model un-cooled imaging)."""
         dt = float(duration)
         if dt <= 0.0 or self.probe_heating_K_per_s <= 0.0:
             return
         self.temperature_K = self.temperature_K + self.probe_heating_K_per_s * dt
+
+    def cool(self, duration: float) -> None:
+        """A PGC cooling phase of ``duration`` s applied to the ALREADY-loaded atoms:
+        relax each atom's temperature toward ``cooled_temperature_K`` as
+        ``T -> floor + (T - floor) * exp(-duration / pgc_cool_tau_s)`` -- WITHOUT
+        reloading.  This is how a re-cool between an (un-cooled) probe and a release
+        brings the cloud back to the cooled floor, so "heat then re-cool then release"
+        recovers ``cooled_temperature_K`` exactly as on hardware."""
+        dt = float(duration)
+        if dt <= 0.0:
+            return
+        floor = self.cooled_temperature_K
+        decay = float(np.exp(-dt / self.pgc_cool_tau_s))
+        self.temperature_K = floor + (self.temperature_K - floor) * decay
 
     def _render(self, occupancy: np.ndarray, signal_time: np.ndarray, exposure: float) -> np.ndarray:
         """Render ONE camera frame from a site occupancy + per-site bright-scatter
@@ -295,6 +335,20 @@ class VirtualTrapArray(TrapArrayDevice):
         self.occupancy = self.occupancy & survive
         return self.occupancy.copy()
 
+    def apply_trap_loss(self, hold_duration: float) -> np.ndarray:
+        """Drop currently-occupied atoms by VACUUM-LIMITED trap loss over a dark trap-ON
+        hold of ``hold_duration`` s: each atom survives with probability
+        ``exp(-hold_duration / trap_lifetime_s)`` (background-gas collisions, independent
+        of light/temperature).  Mutates ``self.occupancy`` and returns it.  Over a few-ms
+        readout this is negligible; over a long dark hold it is the trap-lifetime signal."""
+        t = float(hold_duration)
+        if not np.isfinite(t) or t <= 0.0:
+            return self.occupancy.copy()
+        p_survive = float(np.exp(-t / self.trap_lifetime_s))
+        survive = self.rng.random(self.n_sites) < p_survive
+        self.occupancy = self.occupancy & survive
+        return self.occupancy.copy()
+
     def snapshot(self) -> dict[str, object]:
         return {
             "type": type(self).__name__,
@@ -304,6 +358,9 @@ class VirtualTrapArray(TrapArrayDevice):
             "conversion_e_per_count": self.conversion_e_per_count,
             "read_noise_e": self.read_noise_e,
             "cooled_temperature_K": self.cooled_temperature_K,
+            "probe_heating_K_per_s": self.probe_heating_K_per_s,
+            "pgc_cool_tau_s": self.pgc_cool_tau_s,
+            "trap_lifetime_s": self.trap_lifetime_s,
             "capture_radius_m": self.capture_radius_m,
         }
 
@@ -428,11 +485,22 @@ class VirtualCamera(CameraDevice):
         # genuinely changes the loading you image.
         cooling_durations = cooling_durations_per_frame(runtime_sequence, frames, trigger_channels=trigger_channels)
         trap_off_per_frame = trap_off_durations_per_frame(runtime_sequence, frames, trigger_channels=trigger_channels)
+        trap_hold_per_frame = trap_hold_durations_per_frame(runtime_sequence, frames, trigger_channels=trigger_channels)
+        # A SINGLE multi-trigger cycle (the BASE sequence already carries every trigger -- e.g. a
+        # release-recapture bracket) holds ONE atom loading across all its frames, so a cooling
+        # phase mid-cycle RE-COOLS those held atoms (no reload).  A single-trigger sequence
+        # REPEATED to reach the frame count (e.g. the threshold-calibration pass) is a fresh shot
+        # per frame, so its cooling phase RELOADS a new independent array.  Tell them apart by
+        # whether the base already has at least ``frames`` camera triggers.
+        _trig = DEFAULT_CAMERA_TRIGGER_CHANNELS if trigger_channels is None else trigger_channels
+        base_triggers = count_trigger_pulses(effective_sequence, trigger_channels=_trig) if hasattr(effective_sequence, "effective_pulses") else 0
+        single_cycle = base_triggers >= frames
         images: list[np.ndarray] = []
         for frame_index in range(frames):
             if not all_sites:
                 cool_dt = cooling_durations[frame_index]
                 trap_off = trap_off_per_frame[frame_index]
+                trap_hold = trap_hold_per_frame[frame_index]
                 if frame_index == 0:
                     # Each shot starts from a fresh loading -- UNLESS the caller pinned a
                     # specific occupancy (set_occupancy, a deterministic test/debug), which
@@ -441,15 +509,24 @@ class VirtualCamera(CameraDevice):
                     if not self.trap_array.consume_pin():
                         self.trap_array.reload(cooling_duration=(cool_dt if cool_dt > 0.0 else None))
                 elif cool_dt > 0.0:
-                    self.trap_array.reload(cooling_duration=cool_dt)  # a cooling/MOT pulse = fresh independent loading
-                # A trap-off gap RELEASES the current atoms ballistically (recapture loss vs
-                # their CURRENT temperature).  Applied AFTER any reload in the SAME frame, NOT
-                # exclusive with it -- so a frame that re-cools AND releases is faithful (cool
-                # then drop the freshly-loaded atoms), instead of silently doing only one.  The
-                # standard release-recapture bracket has no cooling channel, so this is identical
-                # to the old behaviour there (cool_dt == 0 -> reload skipped -> just the release).
+                    # Mid-cycle cooling RE-COOLS the held atoms (single multi-trigger cycle) or
+                    # RELOADS a fresh array (a repeated single-trigger imaging sequence).
+                    if single_cycle:
+                        self.trap_array.cool(cool_dt)
+                    else:
+                        self.trap_array.reload(cooling_duration=cool_dt)
+                # A trap-off gap RELEASES the current atoms ballistically (recapture loss vs their
+                # CURRENT temperature).  Applied AFTER any cooling in the SAME frame (cool THEN
+                # release), so "heat -> re-cool -> release" drops the re-cooled cloud, not silently
+                # only one effect.  The standard release-recapture bracket has no cooling channel,
+                # so there this is just the release.
                 if trap_off > 0.0:
                     self.trap_array.apply_recapture_loss(trap_off)
+                # A DARK trap-ON hold (trap on, probe off, BETWEEN images) loses atoms to vacuum
+                # collisions over its duration -- the trap-lifetime signal.  Skipped on frame 0
+                # (that window is the load, accounted for by the loading fraction, not a dark hold).
+                if trap_hold > 0.0 and frame_index >= 1:
+                    self.trap_array.apply_trap_loss(trap_hold)
             image = self.trap_array.render_image(exposure=exposures[frame_index], all_sites=all_sites)
             if self._roi is not None:
                 # crop to the applied sub-array, exactly as a real camera reads out
@@ -777,6 +854,49 @@ def trap_off_durations_per_frame(
         if window_hi > cursor:
             biggest_gap = max(biggest_gap, window_hi - cursor)
         out[k] = float(biggest_gap)
+    return out
+
+
+def trap_hold_durations_per_frame(
+    sequence: PulseSequence | None,
+    frames: int,
+    *,
+    trigger_channels: Sequence[str] | None = None,
+    trap_channels: Sequence[str] = DEFAULT_TRAP_CHANNELS,
+    probe_channels: Sequence[str] = ("probe",),
+) -> list[float]:
+    """DARK trap-ON hold (s) -- trap ON but probe OFF -- in the window preceding each frame.
+
+    Parses the SAME fired ``PulseSequence``.  For each frame's window (camera trigger
+    ``k-1`` -> ``k``) it is the trap-channel ON time minus the probe-channel ON time
+    (the probe always fires while the trap is on, so this is the dark hold: settle +
+    recapture + any explicit trap-on hold).  The virtual backend applies vacuum-limited
+    trap loss over this duration, so a TRAP-LIFETIME measurement (hold-time scan, no
+    release) shows the survival roll-off.  Data-source side only; the analysis layer never
+    reads it."""
+    out = [0.0] * int(frames)
+    if sequence is None or not hasattr(sequence, "effective_pulses"):
+        return out
+    trig_set = {str(c) for c in (DEFAULT_CAMERA_TRIGGER_CHANNELS if trigger_channels is None else trigger_channels)}
+    trap_set = {str(c) for c in trap_channels}
+    probe_set = {str(c) for c in probe_channels}
+    pulses = sequence.effective_pulses()
+    trigger_starts = sorted(p.start for p in pulses if p.value and p.channel in trig_set)
+    if not trigger_starts:
+        return out
+    trap_intervals = sorted((p.start, p.stop) for p in pulses if p.value and p.channel in trap_set)
+    probe_intervals = sorted((p.start, p.stop) for p in pulses if p.value and p.channel in probe_set)
+    duration = float(getattr(sequence, "duration", 0.0))
+    n = min(int(frames), len(trigger_starts))
+
+    def overlap(intervals, lo, hi):
+        return float(sum(max(0.0, min(stop, hi) - max(start, lo)) for start, stop in intervals if start < hi and stop > lo))
+
+    for k in range(n):
+        window_lo = 0.0 if k == 0 else trigger_starts[k - 1]
+        window_hi = trigger_starts[k] if k < len(trigger_starts) else max(duration, window_lo)
+        dark = overlap(trap_intervals, window_lo, window_hi) - overlap(probe_intervals, window_lo, window_hi)
+        out[k] = max(0.0, dark)
     return out
 
 

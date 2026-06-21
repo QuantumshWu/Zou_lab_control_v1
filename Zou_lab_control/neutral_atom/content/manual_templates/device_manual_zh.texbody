@@ -861,9 +861,13 @@ close()     # 关闭设备，释放句柄
 \item[背景] 杂散光 + 散射底噪 \pyapi{background_rate=600\,ph/s/px}（v16 3\,ms 角落中值在 200-count offset 之上 ${\sim}1.8$ 光子/px），故暗站点也有真实散粒底噪而非近零；\pyapi{dark_current_e_per_s=0.006}。
 \item[相机噪声] 先对期望光电子取泊松，再 \pyapi{counts = pe / conversion_e_per_count + offset_counts + N(0, read_noise_e / conversion)}。\pyapi{conversion_e_per_count=0.107}、\pyapi{read_noise_e=0.43}、\pyapi{offset_counts=200} —— 与真实 v16 \pyapi{CameraConfig} 逐字一致。
 \item[读出损耗 / 寿命] 每个原子在 probe 下寿命 ${\sim}\mathrm{Exp}(\pyapi{detection_lifetime}=2.0\,s)$：曝光越长散射光子越多（SNR 越高）但中途丢失越多——中途丢失的原子从\tfocus{同一装载的下一帧}占据里掉出。这正是 detection-time 扫描测的 SNR-vs-存活权衡。
-\item[温度与加热] 新装载的原子起始处于 PGC 底 \pyapi{cooled_temperature_K=50\,\textmu K}；probe 以 \pyapi{probe_heating_K_per_s} 反冲加热（默认 0 = 读出对温度中性，调高即看到拟合温度升高）。
-\item[释放-再捕获] trap-off 持续 \pyapi{t_off} 后原子按当前温度弹道飞散，逐轴再捕获比例 $\mathrm{erf}\!\big(r_c/(\sqrt2\,\sigma_v\,t_\text{off})\big)$、三维取立方，$\sigma_v=\sqrt{k_B T/m}$。\pyapi{capture_radius_m=6\,\textmu m}、\pyapi{recapture_mass_kg=}\,Rb87（$1.443\times10^{-25}$\,kg）。温度越高、gap 越长，存活越低。
-\item[每帧效应复合] 同一相机帧窗口内的冷却脉冲与 trap-off 间隙\tfocus{按顺序复合}：先按冷却脉冲 reload（回 PGC 底的一次新装载），再对这批原子按 trap-off 施加释放-再捕获损耗——不会只取其一。
+\item[温度状态] 每个原子带一个\tfocus{逐站点温度}，由脉冲逐帧演化：装载/再冷却把它压向 PGC 底，probe 把它抬高，release-recapture 按它判存活。新装载起始于 \pyapi{cooled_temperature_K=50\,\textmu K}。
+\item[冷却对温度的影响] 一发\tfocus{首帧}的冷却=新装载（温度回到 PGC 底）；\tfocus{已装载原子}上再来一段冷却脉冲（如 probe 加热后、release 前的 PGC）则\tfocus{再冷却}：$T\!\to\!\text{floor}+(T-\text{floor})\,e^{-t_\text{cool}/\pyapi{pgc_cool_tau_s}}$（\pyapi{pgc_cool_tau_s=0.3\,ms}），\tfocus{不}换原子。所以"加热$\to$再冷却$\to$释放"能回到 PGC 底。
+\item[probe 加热对温度的影响] probe 以 \pyapi{probe_heating_K_per_s} 反冲加热（$T\mathrel{+}{=}\text{rate}\times t_\text{probe}$）。默认 0 = \tfocus{molasses 冷却成像}（成像光里带冷却，反冲与冷却平衡，读出对温度中性——这正是真机为何要 molasses 成像：以真实反冲率不带冷却地成像几毫秒就会把 Rb87 加热到 ${\sim}$mK 而抛掉原子）。调高即模拟\tfocus{不冷却/molasses 不完美}的成像：probe 段抬高温度，随后的 release-recapture 会读到更高温度（不再冷却就直接丢原子）。
+\item[释放-再捕获] trap-off 持续 \pyapi{t_off} 后原子按当前温度弹道飞散，逐轴再捕获比例 $\mathrm{erf}\!\big(r_c/(\sqrt2\,\sigma_v\,t_\text{off})\big)$、三维取立方，$\sigma_v=\sqrt{k_B T/m}$。\pyapi{capture_radius_m=6\,\textmu m}、\pyapi{recapture_mass_kg=}\,Rb87（$1.443\times10^{-25}$\,kg）。温度越高、gap 越长，存活越低——这就是温度测量的信号。
+\item[真空 trap 损耗（暗保持）] 两帧之间的\tfocus{暗保持}（trap 开、probe 关）按 $e^{-t_\text{hold}/\pyapi{trap_lifetime_s}}$ 丢原子（背景气体碰撞，与光/温度无关），\pyapi{trap_lifetime_s=30\,s}。几毫秒读出窗口对它几乎无损（${\sim}0.01\%$），但一个 hold-time 扫描就能测出 trap 寿命。
+\item[每帧效应复合] 同一相机帧窗口内按时间顺序复合：冷却脉冲（首帧/重复序列 reload，单循环多触发序列则\tfocus{再冷却}）$\to$ trap-off 释放-再捕获损耗 $\to$ 暗保持真空损耗 $\to$ 成像（散射 + 读出损耗 + 反冲加热）——不会只取其一。
+\item[reload vs 再冷却的判定] 单触发成像序列\tfocus{重复}到 N 帧（如阈值标定）= 每帧一发全新装载，冷却即 reload；而\tfocus{单条多触发序列}（如 release-recapture bracket）一发原子贯穿全部帧，中途冷却即\tfocus{再冷却}不 reload。按"基序列触发数是否已 $\ge$ 帧数"区分。
 \item[多帧 / 多 emCCD 触发] 一条序列含多个相机触发即渲染多帧，每帧各自按上面规则成像。
 \end{description}
 
