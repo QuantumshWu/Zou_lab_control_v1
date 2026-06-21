@@ -849,15 +849,12 @@ close()     # 关闭设备，释放句柄
 \item[读出损耗 / 寿命] 每个原子在 probe 下寿命 ${\sim}\mathrm{Exp}(\pyapi{detection_lifetime}=2.0\,s)$：曝光越长散射光子越多（SNR 越高）但中途丢失越多——中途丢失的原子从\tfocus{同一装载的下一帧}占据里掉出。这正是 detection-time 扫描测的 SNR-vs-存活权衡。
 \item[温度与加热] 新装载的原子起始处于 PGC 底 \pyapi{cooled_temperature_K=50\,\textmu K}；probe 以 \pyapi{probe_heating_K_per_s} 反冲加热（默认 0 = 读出对温度中性，调高即看到拟合温度升高）。
 \item[释放-再捕获] trap-off 持续 \pyapi{t_off} 后原子按当前温度弹道飞散，逐轴再捕获比例 $\mathrm{erf}\!\big(r_c/(\sqrt2\,\sigma_v\,t_\text{off})\big)$、三维取立方，$\sigma_v=\sqrt{k_B T/m}$。\pyapi{capture_radius_m=6\,\textmu m}、\pyapi{recapture_mass_kg=}\,Rb87（$1.443\times10^{-25}$\,kg）。温度越高、gap 越长，存活越低。
+\item[每帧效应复合] 同一相机帧窗口内的冷却脉冲与 trap-off 间隙\tfocus{按顺序复合}：先按冷却脉冲 reload（回 PGC 底的一次新装载），再对这批原子按 trap-off 施加释放-再捕获损耗——不会只取其一。
 \item[多帧 / 多 emCCD 触发] 一条序列含多个相机触发即渲染多帧，每帧各自按上面规则成像。
 \end{description}
 
 \begin{notebox}[单一真相源]
 以上数值的\tfocus{权威定义在 \filepath{virtual.py} 的字段注释}（本节是其镜像，改值以代码为准，不要在别处复制这些字面量）。要改仿真行为：直接改 \pyapi{virtual.py} 的字段，或在连接时覆盖 \pyapi{na.connect("virtual", sitemap=\{...\})} / 设备配置。
-\end{notebox}
-
-\begin{notebox}[已知近似：同帧内 cooling 与 trap-off 互斥]
-逐帧聚合时，若\tfocus{同一相机帧窗口内既有冷却脉冲又有 trap-off 间隙}，当前按"冷却脉冲 = 重新装载（reload 到 PGC 底）"优先，该帧的 trap-off 被忽略。标准 release-recapture 温度测量的 bracket 序列\tfocus{不含}冷却通道，故不受影响；只有刻意把冷却与释放放进同一帧窗口才会触发这个近似。
 \end{notebox}
 
 \subsection{\pyapi{force\_all\_sites}：渲染满阵列（仿真专属）}

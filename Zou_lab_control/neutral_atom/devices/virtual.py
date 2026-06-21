@@ -416,6 +416,7 @@ class VirtualCamera(CameraDevice):
         for frame_index in range(frames):
             if not all_sites:
                 cool_dt = cooling_durations[frame_index]
+                trap_off = trap_off_per_frame[frame_index]
                 if frame_index == 0:
                     # Each shot starts from a fresh loading -- UNLESS the caller pinned a
                     # specific occupancy (set_occupancy, a deterministic test/debug), which
@@ -424,9 +425,15 @@ class VirtualCamera(CameraDevice):
                     if not self.trap_array.consume_pin():
                         self.trap_array.reload(cooling_duration=(cool_dt if cool_dt > 0.0 else None))
                 elif cool_dt > 0.0:
-                    self.trap_array.reload(cooling_duration=cool_dt)  # fresh independent loading (cooling-time scaled)
-                elif trap_off_per_frame[frame_index] > 0.0:
-                    self.trap_array.apply_recapture_loss(trap_off_per_frame[frame_index])  # same atoms, released
+                    self.trap_array.reload(cooling_duration=cool_dt)  # a cooling/MOT pulse = fresh independent loading
+                # A trap-off gap RELEASES the current atoms ballistically (recapture loss vs
+                # their CURRENT temperature).  Applied AFTER any reload in the SAME frame, NOT
+                # exclusive with it -- so a frame that re-cools AND releases is faithful (cool
+                # then drop the freshly-loaded atoms), instead of silently doing only one.  The
+                # standard release-recapture bracket has no cooling channel, so this is identical
+                # to the old behaviour there (cool_dt == 0 -> reload skipped -> just the release).
+                if trap_off > 0.0:
+                    self.trap_array.apply_recapture_loss(trap_off)
             image = self.trap_array.render_image(exposure=exposures[frame_index], all_sites=all_sites)
             if self._roi is not None:
                 # crop to the applied sub-array, exactly as a real camera reads out
