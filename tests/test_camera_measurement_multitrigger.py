@@ -70,6 +70,53 @@ def test_readout_image_frame_judged_is_synced_with_occupancy():
     assert np.array_equal(occupied, cal.detect(frame_judged, method="box").occupied)
 
 
+def test_console_resolves_2d_frame_panel_to_judged_frame_for_shot_alignment():
+    """#1 alignment: a 2D-image panel bound to the LIVE camera ``frame`` and a site-map bound
+    to ``occupied`` must show the SAME shot.  The camera and the occupancy processor are two
+    independent producers (the camera streams newer frames while the processor judges an older
+    one), so ``latest('frame')`` is a DIFFERENT shot than the occupancy.  The console resolves
+    a frame panel to the consuming occupancy node's ``frame_judged`` (its shot-coherent frame),
+    so 2D(frame) == site-map(occupied) == the judged shot.  Verified through the REAL resolver
+    methods (TaskConsole._coherent_frame_signal + PanelCard._with_signal_slots)."""
+    from types import SimpleNamespace
+    from Zou_lab_control.frontend.task_console import TaskConsole, PanelCard
+
+    exp = na.connect("virtual", sitemap={"grid_shape": (3, 4)})
+    exp.readout.sitemap(frames=4, display=False)
+    exp.readout.thresholds(frames=20, display=False)
+    cal = exp.readout.current
+    hub = SignalHub()
+    cam = CameraMeasurement(hub, exp.camera)
+    det = OccupancyProcessor(hub, calibration=cal, source="frame", method="box", grid_shape=(3, 4))
+
+    # the exact race: judge one frame, then the camera streams TWO newer frames before the
+    # next occupancy tick -> latest('frame') is 2 shots ahead of the judged frame.
+    cam.step(); det.step()
+    cam.step(); cam.step()
+
+    ns = hub.snapshot_latest()
+    live_frame = np.asarray(ns["frame"])
+    judged = np.asarray(ns["frame_judged"])
+    assert not np.array_equal(live_frame, judged)        # precondition: the producers HAVE diverged
+
+    # REAL console resolver: a frame consumed by a running occupancy node -> its frame_judged
+    console = SimpleNamespace(running_nodes=[det])
+    assert TaskConsole._coherent_frame_signal(console, "frame") == det.prefix + "frame_judged"
+    # with no occupancy judging it, a standalone camera view keeps the LIVE frame
+    assert TaskConsole._coherent_frame_signal(SimpleNamespace(running_nodes=[]), "frame") == "frame"
+
+    # REAL panel resolution: a 2D-image panel bound to 'frame' now reads the judged frame
+    panel = SimpleNamespace(
+        config=SimpleNamespace(inputs=["frame"]),
+        frame_coherence_provider=lambda n: TaskConsole._coherent_frame_signal(console, n))
+    panel_signal = np.asarray(PanelCard._with_signal_slots(panel, ns)["signal"])
+
+    assert np.array_equal(panel_signal, judged)          # 2D panel == site-map underlay (same shot)
+    assert not np.array_equal(panel_signal, live_frame)  # NOT the camera's newer, misaligned frame
+    # and that shot IS the one the occupancy was computed from (2D == occupied)
+    assert np.array_equal(np.asarray(ns["occupied"]), cal.detect(panel_signal, method="box").occupied)
+
+
 def test_frames_per_cycle_is_live_editable():
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
     cam_node = CameraMeasurement(SignalHub(), exp.camera)
