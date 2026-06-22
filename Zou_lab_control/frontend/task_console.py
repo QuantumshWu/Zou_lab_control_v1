@@ -281,17 +281,22 @@ def _text_to_py(text: str):
         except ValueError:
             return raw
 
-# Card geometry (raw px, matching the raw-px canvas).  The card is a TITLED frame
-# (title strip = the panel kind, top-left; Setting button top-right) whose FOOTER
-# absorbs the modulus difference: the figure margins do not halve with the data
-# area, so the canvases alone can never tile -- the frame makes the CARDS tile
-# instead.  A card spans rows x _pitch_y - gap, so a 2-row card is EXACTLY two
-# 1-row cards plus the gap, and dragged cards snap onto one shared grid.
-_CARD_PAD = 10        # horizontal padding canvas<->frame, and the drag border
-_CARD_TITLE_H = 32    # the FluentGroupBox title strip (kind title top-left + Setting top-right)
-_CARD_VPAD = 12       # vertical padding above + below the content
+# Card geometry (raw px, matching the raw-px canvas).  The card HUGS its plot: the
+# figure keeps its frontend design size (UNTOUCHED -- shape/margins/art unchanged) and
+# the card wraps it with only a thin L/R border, a tiny top inset (the kind title +
+# Setting button float over the figure's own top margin), and the footer line below.
+# So a 2x2 (or larger) panel no longer carries a big bottom gap.  Plots are AFFINE in
+# their cell count (fixed margins + per-cell data area), so cards are NOT integer
+# multiples of one another -- they tile on a FINE snap grid (each occupies
+# ceil(card / _SNAP) slots), which packs different sizes tightly (gap < one snap).
+_CARD_PAD = 10        # thin L/R border hugging the plot (also the drag grip)
+_CARD_TOP = 2         # top inset; the kind title + Setting button FLOAT over the plot's own top
+                      # margin (the figure's reserved title slot), so the card top hugs the plot
+_CARD_VPAD = 12       # vertical padding (the //2 halves are the canvas<->footer + bottom gaps)
 _FOOTER_MIN = 26      # the status + signal-legend line every card carries under its canvas
-_GRID_GAP = 8
+_GRID_GAP = 8         # gap between adjacent cards
+_SNAP = 8             # drag-snap / layout granularity: a FINE grid so cards sized to HUG their
+                      # (affine, non-grid-proportional) plot still tile tightly (gap < one snap)
 
 # The header status readout (panel/signal counts, or a node-error banner) is a borderless
 # label: grey normally, red on a node error (the colour IS the danger cue -- no box border,
@@ -301,26 +306,30 @@ _SUMMARY_STYLE_DANGER = f"color: {RED}; background: transparent; border: none;"
 
 
 def _grid_pitch() -> tuple[int, int]:
-    """(horizontal, vertical) snap pitch: one layout slot.
+    """The drag-snap / layout granularity -- a single FINE pitch on both axes.
 
-    Vertically a slot is the FULL 1-row card (canvas + title strip + pads +
-    minimum footer) plus the gap -- taller cards stretch their footer to span
-    whole slots, so mixed sizes tile exactly.  Horizontally a slot is half a
-    2-column card plus the gap; 4-column cards span four slots and centre
-    their canvas in the extra frame width."""
+    The card is sized to HUG its plot (see ``_card_size``), and a plot's size is AFFINE in its
+    cell count (fixed axis-label margins + a per-cell data area), so cards are NOT integer
+    multiples of one another and cannot tile on a coarse per-card grid without leaving big
+    padding.  A fine snap lets each card occupy ``ceil(card / snap)`` slots, so different sizes
+    pack tightly (a gap of at most one snap) while drag still snaps cleanly."""
 
-    half_w, half_h = panel_display_size("1x2")
-    pitch_x = (half_w + 2 * _CARD_PAD + _GRID_GAP) // 2
-    pitch_y = half_h + _CARD_TITLE_H + _CARD_VPAD + _FOOTER_MIN + _GRID_GAP
-    return pitch_x, pitch_y
+    return (_SNAP, _SNAP)
 
 
 def _card_size(size: str) -> tuple[int, int]:
-    """Outer card size for a panel size preset: whole slots minus the gap."""
+    """Outer card size = the plot HUGGED.  The figure keeps its frontend DESIGN size (untouched);
+    the card wraps it with only a thin border L/R, a small top inset (the kind title + Setting
+    button float over the figure's OWN top margin, so the card top sits at the plot top) and the
+    footer slot below.  No grid-multiple inflation -- the card is as small as the plot allows, so
+    a 2x2 (or larger) panel no longer carries a big bottom gap."""
 
-    rows, cols = panel_size_cells(size)
-    pitch_x, pitch_y = _grid_pitch()
-    return (cols * pitch_x - _GRID_GAP, rows * pitch_y - _GRID_GAP)
+    pw, ph = panel_display_size(size)
+    width = pw + 2 * _CARD_PAD
+    # top inset + canvas + (canvas<->footer gap) + footer + (bottom gap) -- matches the holder's
+    # contentsMargins/spacing so the layout's bottom stretch collapses to ~0 (no slack).
+    height = _CARD_TOP + ph + (_CARD_VPAD // 2) + _FOOTER_MIN + (_CARD_VPAD // 2)
+    return (width, height)
 
 
 def _slot_to_pos(row: int, col: int) -> tuple[int, int]:
@@ -434,13 +443,16 @@ class PanelConfig:
         self.params = dict(params or {})
         self.role = str(role)
 
+    # rows / cols are the card's SLOT SPAN on the fine snap grid (NOT the size preset's cell
+    # count): how many _SNAP slots the hugged card occupies, +_GRID_GAP so adjacent cards keep a
+    # gap.  The layout (overlap test / gravity compaction / board sizing) works in these slots.
     @property
     def rows(self) -> int:
-        return panel_size_cells(self.size)[0]
+        return max(1, -(-(_card_size(self.size)[1] + _GRID_GAP) // _SNAP))
 
     @property
     def cols(self) -> int:
-        return panel_size_cells(self.size)[1]
+        return max(1, -(-(_card_size(self.size)[0] + _GRID_GAP) // _SNAP))
 
     def to_dict(self) -> dict[str, object]:
         return {

@@ -1228,9 +1228,11 @@ def test_task_console_drag_snaps_to_grid(monkeypatch):
     console = dt.demo_console(shots=3)
     card = console.cards[1]                       # the 1x2 distribution panel
     pitch_x, pitch_y = _grid_pitch()
-    # simulate a drop near slot (4, 1): position the card a few px off the slot
-    target_x, target_y = _slot_to_pos(4, 1)
-    card.move(target_x + 11, target_y - 9)
+    # Drop into a clearly FREE column (past every other card's slot span -- the snap grid is
+    # fine, so a card spans many slots), a few px off the slot (< half a snap so it rounds back).
+    free_col = max((c.config.col + c.config.cols for c in console.cards if c is not card), default=0)
+    target_x, target_y = _slot_to_pos(4, free_col)
+    card.move(target_x + 3, target_y - 3)
     card._drag_offset = QtCore.QPoint(1, 1)       # as if a drag was in flight
     class _Ev:                                    # minimal release-event stand-in
         def button(self): return QtCore.Qt.LeftButton
@@ -1239,8 +1241,10 @@ def test_task_console_drag_snaps_to_grid(monkeypatch):
         card.mouseReleaseEvent(_Ev())
     except TypeError:                             # super() needs a real QEvent; snap already ran
         pass
-    assert (card.config.row, card.config.col) == (4, 1)
-    assert (card.x(), card.y()) == _slot_to_pos(4, 1)
+    # snapped to the dropped column; gravity then pulls it to the top of that empty column.
+    assert card.config.col == free_col
+    assert card.config.row == 0
+    assert (card.x(), card.y()) == _slot_to_pos(0, free_col)
     assert _pos_to_slot(*_slot_to_pos(7, 3)) == (7, 3)   # slot<->pos round-trip
     assert console.save_button.is_dirty()         # a moved panel is an unsaved edit
     console.shutdown()
@@ -1296,25 +1300,27 @@ def test_task_console_layout_is_gravity_compacted():
     b = PanelConfig(kind="2d", title="B", row=0, col=0, size="2x2")   # dropped onto A
     _compact([a, b], active=b)
     assert (b.row, b.col) == (0, 0)            # the dragged card wins its slot
-    assert a.row == 2                          # pushed down to clear (2 rows tall)
+    assert a.row == b.rows                      # pushed strictly below B (by B's full span)
     no_overlap([a, b])
 
     # (2) gravity fills vertical gaps: a lone card left floating falls to the top.
     x = PanelConfig(kind="1d", title="X", row=0, col=0, size="1x2")
     y = PanelConfig(kind="1d", title="Y", row=5, col=0, size="1x2")   # big gap below X
     assert _compact([x, y]) is True
-    assert (x.row, y.row) == (0, 1)            # Y rose to sit right under X, no gap
+    assert (x.row, y.row) == (0, x.rows)       # Y rose to sit right under X (X's span), no gap
 
-    # (3) independent columns coexist on the same rows (no false collisions).
+    # (3) independent columns coexist on the same rows (no false collisions).  A separate
+    #     column starts past the first card's full slot span (the snap grid is fine, so a
+    #     1x2 card spans many slots -- ``cols`` -- not 2).
     left = PanelConfig(kind="1d", title="L", row=4, col=0, size="1x2")
-    right = PanelConfig(kind="1d", title="R", row=9, col=2, size="1x2")
+    right = PanelConfig(kind="1d", title="R", row=9, col=PanelConfig(kind="1d", size="1x2").cols, size="1x2")
     _compact([left, right])
     assert left.row == 0 and right.row == 0    # both float up to the top, side by side
     no_overlap([left, right])
 
     # (4) already top-packed layout is a no-op (returns False, nothing moves).
     p = PanelConfig(kind="2d", title="P", row=0, col=0, size="2x2")
-    q = PanelConfig(kind="hist", title="Q", row=0, col=2, size="1x2")
+    q = PanelConfig(kind="hist", title="Q", row=0, col=p.cols, size="1x2")
     assert _compact([p, q]) is False
 
 
@@ -1342,13 +1348,19 @@ def test_task_console_cards_are_modular(monkeypatch):
     from Zou_lab_control.frontend import devtools as dt
     from Zou_lab_control.frontend.live import panel_display_size
     from Zou_lab_control.frontend.style import DESIGN_DPI
-    from Zou_lab_control.frontend.task_console import _GRID_GAP, _card_size
+    from Zou_lab_control.frontend.task_console import _CARD_PAD, _card_size
 
-    # THE tiling contract: a 2-row card is exactly two 1-row cards + gap, and a
-    # 4-column card is exactly two 2-column cards + gap (the frame's footer and
-    # side margins absorb the figure-margin slack, so cards tile on one grid).
-    assert _card_size("2x2")[1] == 2 * _card_size("1x2")[1] + _GRID_GAP
-    assert _card_size("1x4")[0] == 2 * _card_size("1x2")[0] + _GRID_GAP
+    # THE hug contract: the card wraps its plot TIGHTLY -- the outer card is the frontend
+    # panel's on-screen canvas plus only a thin border L/R + a small top inset + the footer
+    # slot below.  No grid-multiple inflation (the plot is untouched; the CARD shrinks to it),
+    # so a 2x2 card is much SHORTER than two stacked 1x2 cards -- that is what removes the
+    # bottom padding the user reported.
+    for size in ("1x2", "2x2", "1x4", "2x4", "4x4"):
+        cw, ch = _card_size(size)
+        pw, ph = panel_display_size(size)
+        assert cw == pw + 2 * _CARD_PAD          # left/right hug the plot exactly
+        assert ph < ch <= ph + 64                # only the top inset + footer below, no slack
+    assert _card_size("2x2")[1] < 2 * _card_size("1x2")[1]    # hugged, NOT a grid-multiple
 
     console = dt.demo_console(shots=3)
     for card in console.cards:
