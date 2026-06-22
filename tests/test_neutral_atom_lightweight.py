@@ -6982,7 +6982,7 @@ def test_user_composed_loading_readout_publishes_standard_signals():
         seqr = VirtualSequencer()
         fire_imaging_pulse(seqr, exposure=0.02, cooling=trap.mot_load_s)   # On Pulse: trigger-driven camera streams
         task = CalibrateReadoutTask(hub, camera, grid_shape=trap.grid_shape,
-                                    sitemap_exposure=0.05, readout_exposure=0.02,
+                                    readout_exposure=0.02,
                                     roi_radius=1, threshold_frames=24,
                                     prefix=f"{prefix}cal_")
         task.run_to_completion()

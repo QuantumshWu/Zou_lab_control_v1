@@ -68,7 +68,7 @@ def test_calibrate_writes_distribution_and_fidelity_report(tmp_path):
         task = exp.readout.calibrate_task(
             hub, source="live", threshold_method="otsu",
             threshold_frames=40,
-            sitemap_exposure=0.05, readout_exposure=0.02, folder=str(folder))
+            readout_exposure=0.02, folder=str(folder))
         task.run_to_completion()
 
         # the report lands DIRECTLY in the user's explicit `folder` -- one place, no hidden
@@ -134,7 +134,7 @@ def test_reference_bracket_gives_distinct_per_method_fidelity():
     try:
         task = exp.readout.calibrate_task(
             SignalHub(), source="live", threshold_frames=160,
-            sitemap_exposure=0.03, readout_exposure=5e-4)        # short readout -> not saturated
+            readout_exposure=5e-4)        # short readout -> not saturated
         task.run_to_completion()
         # the bracket frames were kept, grouped (n_ref long frames + one short readout each)
         assert len(task._reference_groups) == len(task._readout_by_group) > 0
@@ -175,7 +175,7 @@ def test_overlapping_readout_reports_sub_unity_fidelity_and_per_method_summary(t
     try:
         task = exp.readout.calibrate_task(
             SignalHub(), source="live", threshold_frames=200,
-            sitemap_exposure=0.03, readout_exposure=3e-4)        # very short -> populations OVERLAP
+            readout_exposure=3e-4)        # very short -> populations OVERLAP
         task.run_to_completion()
         summary = write_calibration_report(
             str(tmp_path / "report"), calibration=task.calibration,

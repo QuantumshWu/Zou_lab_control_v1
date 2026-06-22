@@ -161,6 +161,21 @@ def panel_input_slots(kind: str) -> tuple[tuple[str, str, str], ...]:
     SINGLE source of how many signals a plot consumes and what each means."""
     return PANEL_INPUT_SLOTS.get(str(kind), _DEFAULT_SLOTS)
 
+
+def _common_token_prefix(names) -> str:
+    """The longest common UNDERSCORE-token prefix of ``names`` -- e.g. both
+    ``judge_occupancy_rate`` and ``judge_occupancy_occupied`` share ``judge_occupancy_``.
+    Empty for fewer than two names or no shared leading token.  Used to strip the producer
+    prefix the hub prepends from a grouped signal picker's labels (the producer is the group
+    header, so its name need not repeat in every signal)."""
+    import os.path as _op
+    names = [str(n) for n in names]
+    if len(names) < 2:
+        return ""
+    common = _op.commonprefix(names)
+    cut = common.rfind("_")
+    return common[: cut + 1] if cut >= 0 else ""
+
 # Every Monitor-board panel is a PURE VIEW (role "plot"): it is fully decoupled
 # from acquisition -- it shows a hub signal and carries the full plotter Edit (the
 # whole DataFigure fit set + manual limits + the display knobs), but it NEVER
@@ -801,6 +816,11 @@ class PanelCard(FluentGroupBox):
         self._settings_scroll.setWidgetResizable(True)
         self._settings_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
         self._settings_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        # NEVER a horizontal scrollbar -- the popup widens to fit its content instead (the rows
+        # are narrow; only the HEIGHT is capped, below).  Vertical scroll only when the sections
+        # are taller than the panel they belong to.
+        self._settings_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self._settings_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         popup_content = QtWidgets.QWidget()
         popup_content.setStyleSheet("background: transparent;")
         self._settings_scroll.setWidget(popup_content)
@@ -1071,17 +1091,20 @@ class PanelCard(FluentGroupBox):
         anchor = self.setting_button.mapToGlobal(
             QtCore.QPoint(self.setting_button.width(), self.setting_button.height()))
         popup.adjustSize()
-        # Cap the popup to the visible screen so a tall settings list (many signals) never runs
-        # off the edge -- the FluentScrollArea scrolls the overflow instead.  Keep the card fully
-        # on screen (clamp x/y), opening it ABOVE the button when there is no room below.
+        # Cap the popup HEIGHT to THIS panel's own frame height (per-panel, so a tall panel gets a
+        # tall settings popup and a short panel a short one) -- the settings frame must not exceed
+        # the panel it belongs to; when its sections are taller the FluentScrollArea scrolls them
+        # VERTICALLY (never horizontally -- the popup keeps its natural width).  A small floor keeps
+        # a tiny panel's popup usable; a screen clamp keeps it on-screen as a backstop.
         screen = QtWidgets.QApplication.primaryScreen()
         avail = screen.availableGeometry() if screen is not None else None
         w, h = popup.width(), popup.height()
+        cap = max(scaled_px(180), self.height())          # this panel's frame height
         if avail is not None:
-            cap = int(avail.height() * 0.9)
-            popup.setMaximumHeight(cap)
-            h = min(h, cap)
-            popup.resize(w, h)
+            cap = min(cap, int(avail.height() * 0.95))     # never taller than the screen
+        popup.setMaximumHeight(cap)
+        h = min(h, cap)
+        popup.resize(w, h)
         x, y = anchor.x() - w, anchor.y() + scaled_px(2)
         if avail is not None:
             x = max(avail.left(), min(x, avail.right() - w))
@@ -1126,10 +1149,16 @@ class PanelCard(FluentGroupBox):
                 by_producer.setdefault(p, []).append(name)
         items: list[tuple[str, str | None]] = []
         for producer in sorted(by_producer, key=lambda p: (p == "(unbound)", p.lower())):
+            group = by_producer[producer]
             items.append((producer, None))            # group header (rendered disabled + bold)
-            for name in by_producer[producer]:
+            # The producer is named ONCE in the header, so its signals show SHORT under it: strip
+            # the node prefix the hub prepends (e.g. "judge_occupancy_rate" -> "rate").  The bare
+            # name (the combo's data) is unchanged, so the expression / coherence still resolve.
+            strip = _common_token_prefix(group) or (str(producer).strip("() ") + "_")
+            for name in group:
+                short = name[len(strip):] if (strip and name.startswith(strip) and len(name) > len(strip)) else name
                 fmt = formats.get(name)
-                label = f"    {name}" + (f"  [{fmt}]" if fmt else "")   # indented under its node
+                label = f"    {short}" + (f"  [{fmt}]" if fmt else "")   # indented under its node
                 items.append((label, name))
         return items
 

@@ -71,7 +71,7 @@ def test_calibrate_task_computes_every_method_processor_picks(threshold_method):
         task = exp.readout.calibrate_task(
             SignalHub(), threshold_method=threshold_method,
             threshold_frames=16,
-            sitemap_exposure=0.05, readout_exposure=0.02)
+            readout_exposure=0.02)
         task.run_to_completion()
         cal = task.calibration
         assert np.asarray(cal.centers).shape == (12, 2)
@@ -124,32 +124,32 @@ def test_calibrate_task_live_writes_canonical_calibration_json_for_the_detector(
 
 
 def test_calibrate_task_loads_a_pulse_template_and_sets_the_exposure(tmp_path):
-    """The cali LOADS a real pulse template (a PulseTableState .json with an 'image'
-    window) and SETS that window's duration to each pass's exposure -- "load a template,
-    set the duration, run" (no opaque 'built-in' sentinel).  The template path round-trips
-    in the Edit (acquisition_parameters)."""
+    """The cali LOADS a real pulse template and the template's OWN 'image'-window duration IS
+    the LONG reference exposure of the long-short-long bracket -- so editing the template's
+    image period sets the long exposure (the template genuinely drives the cali pulse; the
+    "you can't set the duration" claim is false).  The short readout is the only separate knob."""
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
-    from Zou_lab_control.neutral_atom.timing import default_imaging_template
+    from Zou_lab_control.neutral_atom.timing import PulseTableState, default_imaging_template
 
     exp = _calibrated()
     try:
         prog = tmp_path / "my_imaging.json"             # the user's own imaging program
-        default_imaging_template().save(prog)           # a real PulseTableState with an 'image' period
+        # set the template's image window to 30 ms -> THAT becomes the long reference exposure
+        st = default_imaging_template()
+        idx = st.periods.index(next(p for p in st.periods if p.name == "image"))
+        st = st.set_period_duration(idx, 0.030, unit="s")
+        st.save(prog)
 
         task = exp.readout.calibrate_task(
             SignalHub(), source="live", pulse_template=str(prog),
-            sitemap_exposure=0.06, readout_exposure=0.02,
-            threshold_frames=12)
+            readout_exposure=0.005, threshold_frames=12)
         assert task.pulse_template == str(prog)
         assert task.acquisition_parameters()["pulse_template"] == str(prog)
-        # The loaded template's 'image' window IS settable (the "you can't set the duration"
-        # claim is false): with_imaging_exposure sets it on the loaded template.
-        from Zou_lab_control.neutral_atom.timing import PulseTableState, exposure_from_sequence
-        loaded = PulseTableState.load(str(prog))
-        assert exposure_from_sequence(loaded.with_imaging_exposure(0.02).to_sequence(), default=0.05) == 0.02
-        # The cali fires the long-short-long bracket BUILT FROM the template: its load (cooling)
-        # time is the template's own load window (2 ms here) -- so the template genuinely drives
-        # the calibration pulse, not a hard-coded default.
+        # the LONG reference exposure is read from the template's image window (30 ms set above) --
+        # editing the template IS how the long exposure is set; the short readout stays separate.
+        assert task._template_image_seconds() == pytest.approx(0.030)
+        assert task.readout_exposure == pytest.approx(0.005)        # 30ms-5ms-30ms long-short-long
+        # the cooling/load time also comes from the template (2 ms load period).
         assert task._load_seconds_from_template() == pytest.approx(0.002)
         task.run_to_completion()
         assert np.asarray(task.calibration.centers).shape == (12, 2)

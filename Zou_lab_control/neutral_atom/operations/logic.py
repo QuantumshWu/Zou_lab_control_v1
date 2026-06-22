@@ -681,7 +681,7 @@ class CalibrateReadoutTask(Task):
 
     def __init__(self, hub: SignalHub, camera: CameraDevice, *, sequencer: object | None = None,
                  grid_shape: tuple[int, int] = (5, 7), roi_radius: int = 1,
-                 sitemap_exposure: float = 0.05, readout_exposure: float = 0.02,
+                 readout_exposure: float = 0.005,
                  pulse_template: str = DEFAULT_PULSE_TEMPLATE,
                  threshold_frames: int = 100,
                  threshold_method: str = "otsu",
@@ -700,12 +700,11 @@ class CalibrateReadoutTask(Task):
         self.calibration_sink = calibration_sink
         self.grid_shape = grid_shape_tuple(grid_shape)
         self.roi_radius = int(roi_radius)
-        # TWO exposures (set on the SAME loaded template per pass): the SITEMAP/reference
-        # pass uses a LONGER duration (more photons -> cleaner site centroids + PSF fit);
-        # the THRESHOLD pass uses the ACTUAL readout duration (thresholds learnt under real
-        # readout conditions).  The template is a real PulseTableState; ``with_imaging_exposure``
-        # sets its imaging window per pass -- "load a template, set the duration, run".
-        self.sitemap_exposure = float(sitemap_exposure)
+        # The long-short-long bracket's LONG reference exposure is the loaded template's OWN
+        # image-window duration (``_template_image_seconds``) -- editing the template's 'image'
+        # period IS how you set the long exposure (so the template genuinely drives the cali
+        # pulse, the "load a template, set the duration, run" workflow).  Only the SHORT middle
+        # readout -- the actual readout duration being calibrated -- is a separate knob here.
         self.readout_exposure = float(readout_exposure)
         self.pulse_template = str(pulse_template or self.DEFAULT_PULSE_TEMPLATE)
         self.threshold_frames = max(2, int(threshold_frames))
@@ -734,7 +733,6 @@ class CalibrateReadoutTask(Task):
             "save_frames": bool(self.save_frames),
             "pulse_template": str(self.pulse_template),
             "grid_shape": tuple(self.grid_shape),
-            "sitemap_exposure": float(self.sitemap_exposure),
             "readout_exposure": float(self.readout_exposure),
             "roi_radius": int(self.roi_radius),
             "threshold_frames": int(self.threshold_frames),
@@ -752,8 +750,6 @@ class CalibrateReadoutTask(Task):
             self.pulse_template = str(values["pulse_template"]) or self.DEFAULT_PULSE_TEMPLATE
         if "grid_shape" in values:
             self.grid_shape = grid_shape_tuple(values["grid_shape"])
-        if "sitemap_exposure" in values:
-            self.sitemap_exposure = float(values["sitemap_exposure"])
         if "readout_exposure" in values:
             self.readout_exposure = float(values["readout_exposure"])
         if "roi_radius" in values:
@@ -847,6 +843,27 @@ class CalibrateReadoutTask(Task):
             total_ns += float(p.duration) * UNITS_TO_NS.get(str(p.unit), 1.0)
         return (total_ns / 1e9) if total_ns > 0 else 2e-3
 
+    def _template_image_seconds(self) -> float:
+        """The loaded template's IMAGE-window duration in seconds -- the LONG reference exposure
+        of the long-short-long bracket.  Editing the template's 'image' period IS how the
+        operator sets the long exposure (the template drives the cali pulse, not a hidden param);
+        falls back to 20 ms if the template has no readable image window."""
+        from ..timing.pulse_table import UNITS_TO_NS, period_index_by_name
+        try:
+            st = self._resolve_template(self.pulse_template)
+        except Exception:
+            return 20e-3
+        idx = period_index_by_name(st, "image")
+        if idx is None:
+            idx = max(0, len(st.periods) - 1)
+        if not st.periods:
+            return 20e-3
+        dur = st.periods[idx].duration
+        if isinstance(dur, str):                # a scan-bound image period -> use the default
+            return 20e-3
+        secs = float(dur) * UNITS_TO_NS.get(str(st.periods[idx].unit), 1.0) / 1e9
+        return secs if secs > 0 else 20e-3
+
     def _run_live(self, out: "TaskOutput"):
         """Acquire the Rb87 long-short-long reference brackets NOW and run the SAME sitemap +
         per-site-threshold extraction the real readout uses.
@@ -937,7 +954,7 @@ class CalibrateReadoutTask(Task):
         # imaged long-short-long at the chosen exposures.  So the template genuinely drives the
         # calibration pulse (its load + imaging structure), not a hard-coded sequence.
         bracket = reference_bracket_sequence(
-            ref_exposure=self.sitemap_exposure, readout_exposure=self.readout_exposure,
+            ref_exposure=self._template_image_seconds(), readout_exposure=self.readout_exposure,
             n_ref=n_ref, cooling=self._load_seconds_from_template(),
             **imaging_channel_kwargs(self.sequencer))
         n_groups = max(2, int(self.threshold_frames))
