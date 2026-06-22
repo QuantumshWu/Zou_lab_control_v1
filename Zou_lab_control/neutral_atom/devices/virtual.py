@@ -413,6 +413,12 @@ class VirtualCamera(CameraDevice):
         # the ACTUALLY-applied (snapped) window, like the real camera's read-back
         return self._roi
 
+    @property
+    def sensor_shape(self) -> tuple[int, int]:
+        # the full sensor (height, width) -- the trap array's image size, known up front,
+        # so a raw-frame Edit shows the ROI as the full window even before any sub-array is set
+        return tuple(self.trap_array.image_shape)
+
     def configure(self, *, exposure: float | None = None, roi: object = None, **_) -> None:
         if exposure is not None:
             self.exposure = positive_float(exposure, "exposure")

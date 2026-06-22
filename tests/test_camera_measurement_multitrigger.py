@@ -159,3 +159,20 @@ def test_frames_per_cycle_is_live_editable():
     cam_node.set_acquisition_parameters(frames_per_cycle=3)     # the owner-thread apply path uses this
     assert cam_node.frames_per_cycle == 3
     assert {"frame_0", "frame_1", "frame_2"} <= set(cam_node.published_signals())
+
+
+def test_region_is_always_exposed_even_at_full_frame():
+    """A frame panel's Edit shows the camera's ROI (``region``) so the operator can crop it --
+    even with NO sub-array set (``roi is None``).  At full frame ``region`` is the FULL sensor
+    endpoints ``[0, W, 0, H]`` (from ``camera.sensor_shape``), so the field always exists for
+    editing AND the plot's area-select / zoom writeback has a field to fill.  (Regression: when
+    ``region`` was emitted only for a set ROI, a full-frame camera showed no ROI field at all.)"""
+    exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
+    assert exp.camera.roi is None                                  # default: full frame, no sub-array
+    assert tuple(exp.camera.sensor_shape) == (40, 50)              # (height, width)
+    cam_node = CameraMeasurement(SignalHub(), exp.camera)
+    params = cam_node.acquisition_parameters()
+    assert params["region"] == [0, 50, 0, 40]                      # full sensor endpoints [x0,x1,y0,y1]
+    # and the endpoints round-trip back to a real sub-array when applied (crop on Apply)
+    cam_node.set_acquisition_parameters(region=[10, 30, 5, 25])
+    assert exp.camera.roi is not None

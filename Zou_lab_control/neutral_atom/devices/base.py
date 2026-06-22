@@ -75,6 +75,17 @@ class CameraDevice(BaseDevice):
         has no ROI; the real qCMOS overrides this."""
         return None
 
+    @property
+    def sensor_shape(self) -> tuple[int, int] | None:
+        """The FULL sensor size ``(height, width)`` in pixels, or None if unknown.
+
+        Part of the contract so a consumer (a raw-frame Edit panel) can show the ROI as
+        the full-frame window even when no sub-array is set (``roi is None``) -- without
+        reaching into a backend's internals.  Default None (size unknown until a frame is
+        read); a backend that knows its sensor up front (the virtual renderer, the real
+        qCMOS) overrides this."""
+        return None
+
     @abstractmethod
     def configure(self, *, exposure: float | None = None, **kwargs) -> None:
         """Configure camera settings that are stable across an acquisition."""

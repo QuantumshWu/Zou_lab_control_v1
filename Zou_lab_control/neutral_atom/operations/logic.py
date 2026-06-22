@@ -1140,6 +1140,15 @@ class CameraMeasurement(Measurement):
         if roi is not None:
             x, w, y, h = (int(v) for v in roi)
             params["region"] = [x, x + w, y, y + h]   # -> endpoints (plot coords)
+        else:
+            # No sub-array set (full frame): still expose ``region`` as the FULL sensor window,
+            # so the Edit always shows an ROI field (the operator can crop by editing it or by
+            # area-selecting on the plot) and the selector writeback has a field to fill.  Falls
+            # back to omitting it only if the camera cannot report its sensor size.
+            shape = getattr(self.camera, "sensor_shape", None)
+            if shape is not None:
+                h, w = (int(v) for v in shape)
+                params["region"] = [0, w, 0, h]
         return params
 
     def set_acquisition_parameters(self, **values) -> None:
