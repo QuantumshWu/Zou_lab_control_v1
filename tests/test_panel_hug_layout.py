@@ -26,8 +26,9 @@ if sys.path[0] != str(REPO_ROOT):
     sys.path.insert(0, str(REPO_ROOT))
 
 from Zou_lab_control.frontend.live import PANEL_SIZES, panel_display_size, panel_size_cells
-from Zou_lab_control.frontend.qt_fluent import ensure_qt_app, scaled_px
-from Zou_lab_control.frontend.task_console import _CARD_PAD, _TITLE_STRIP, _card_size
+# CARD_PAD / CARD_TITLE_PX are the card's FORMAT -- owned by the component library, not task_console.
+from Zou_lab_control.frontend.qt_fluent import CARD_PAD, CARD_TITLE_PX, ensure_qt_app, scaled_px
+from Zou_lab_control.frontend.task_console import _card_size
 
 ensure_qt_app()                       # scaled_px needs the QApplication / fluent scale
 
@@ -35,13 +36,13 @@ ensure_qt_app()                       # scaled_px needs the QApplication / fluen
 def _expected_height(size: str) -> int:
     one_row_h = panel_display_size("1x2")[1]
     rows = panel_size_cells(size)[0]
-    return scaled_px(_TITLE_STRIP) + scaled_px(2) + one_row_h * rows + _CARD_PAD
+    return scaled_px(CARD_TITLE_PX) + scaled_px(2) + one_row_h * rows + CARD_PAD
 
 
 @pytest.mark.parametrize("size", PANEL_SIZES)
 def test_card_width_is_figure_plus_border(size):
     """Card width == the figure width + a thin L/R border (the plot hugs L/R)."""
-    assert _card_size(size)[0] == panel_display_size(size)[0] + 2 * _CARD_PAD
+    assert _card_size(size)[0] == panel_display_size(size)[0] + 2 * CARD_PAD
 
 
 @pytest.mark.parametrize("size", PANEL_SIZES)
@@ -57,13 +58,13 @@ def test_card_always_holds_its_canvas(size):
     clips), with the leftover as bottom padding."""
     ch = _card_size(size)[1]
     fh = panel_display_size(size)[1]
-    assert ch >= scaled_px(_TITLE_STRIP) + fh
+    assert ch >= scaled_px(CARD_TITLE_PX) + fh
 
 
 def test_plot_region_scales_linearly_with_rows():
     """The plot region (card height minus the fixed title-strip chrome) is exactly proportional
     to the rows: a 2-row card's region is 2x a 1-row card's, a 4-row card's is 4x."""
-    chrome = scaled_px(_TITLE_STRIP) + scaled_px(2) + _CARD_PAD
+    chrome = scaled_px(CARD_TITLE_PX) + scaled_px(2) + CARD_PAD
     region = {s: _card_size(s)[1] - chrome for s in ("1x2", "2x2", "4x4")}
     assert region["2x2"] == 2 * region["1x2"]
     assert region["4x4"] == 4 * region["1x2"]

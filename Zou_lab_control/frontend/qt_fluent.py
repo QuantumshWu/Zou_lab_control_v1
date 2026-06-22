@@ -53,6 +53,12 @@ ORANGE_DARK = "#8A4B1F"
 YELLOW = "#E5C85B"
 GREY = "#A2A2A2"
 RADIUS = 4
+# A "card" = FluentGroupBox: it reserves a CARD_TITLE_PX-tall strip at the top for the grey
+# QGroupBox::title chip, and insets its content by CARD_PAD on the L / R / bottom edges.  These
+# are the card's FORMAT and live HERE in the component library (the single source) -- callers
+# place content in a card and read these tokens; they never hand-pick card padding themselves.
+CARD_TITLE_PX = 32
+CARD_PAD = 10
 FONT = "Segoe UI"
 FONT_SIZE = 12
 PADDING_V = 1
@@ -636,7 +642,7 @@ class FluentGroupBox(QtWidgets.QGroupBox):
         # -- it rasterises + blurs the whole widget every frame, which makes a
         # tall, scrolled panel stutter.  When shadow is off we draw a light 1px
         # border instead so the card is still delineated, for a fraction of the
-        # paint cost.  The 32 px top padding reserves the ``QGroupBox::title`` strip.
+        # paint cost.  CARD_TITLE_PX of top padding reserves the ``QGroupBox::title`` strip.
         border = "none" if shadow else f"1px solid {DIVIDER}"
         self.setStyleSheet(
             f"""
@@ -645,7 +651,7 @@ class FluentGroupBox(QtWidgets.QGroupBox):
                 border: {border};
                 border-radius: {_radius()}px;
                 margin-top: 0px;
-                padding-top: {scaled_px(32)}px;
+                padding-top: {scaled_px(CARD_TITLE_PX)}px;
                 color: {TEXT};
                 font: {fluent_font_size()}pt "{FONT}";
             }}

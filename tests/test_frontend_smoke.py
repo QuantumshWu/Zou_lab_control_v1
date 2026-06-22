@@ -1348,11 +1348,13 @@ def test_task_console_cards_are_modular(monkeypatch):
     from Zou_lab_control.frontend import devtools as dt
     from Zou_lab_control.frontend.live import panel_display_size, panel_size_cells
     from Zou_lab_control.frontend.style import DESIGN_DPI
-    from Zou_lab_control.frontend.qt_fluent import scaled_px
-    from Zou_lab_control.frontend.task_console import _CARD_PAD, _TITLE_STRIP, _card_size
+    # CARD_PAD / CARD_TITLE_PX are the card's FORMAT -- owned by the component library (qt_fluent),
+    # not task_console; the console only lays the cards out.
+    from Zou_lab_control.frontend.qt_fluent import CARD_PAD, CARD_TITLE_PX, scaled_px
+    from Zou_lab_control.frontend.task_console import _card_size
 
     # The card keeps the FluentGroupBox chrome (rounded corners, shadow, grey title strip) and
-    # is sized in proportion: WIDTH = figure + a thin L/R border; HEIGHT = the grey title strip
+    # is sized in proportion: WIDTH = figure + the card's L/R border; HEIGHT = the grey title strip
     # + a plot region proportional to the ROW count (1-row figure height x rows) + bottom
     # border.  So the plot region scales with rows (no footer, no slot-multiple slack), and the
     # card always holds the design-size canvas below the strip.
@@ -1360,9 +1362,9 @@ def test_task_console_cards_are_modular(monkeypatch):
     for size in ("1x2", "2x2", "1x4", "2x4", "4x4"):
         cw, ch = _card_size(size)
         pw, ph = panel_display_size(size)
-        assert cw == pw + 2 * _CARD_PAD          # left/right hug the plot
-        assert ch == scaled_px(_TITLE_STRIP) + scaled_px(2) + one_row_h * panel_size_cells(size)[0] + _CARD_PAD
-        assert ch >= scaled_px(_TITLE_STRIP) + ph    # never clips the figure below the strip
+        assert cw == pw + 2 * CARD_PAD          # left/right hug the plot
+        assert ch == scaled_px(CARD_TITLE_PX) + scaled_px(2) + one_row_h * panel_size_cells(size)[0] + CARD_PAD
+        assert ch >= scaled_px(CARD_TITLE_PX) + ph    # never clips the figure below the strip
 
     console = dt.demo_console(shots=3)
     for card in console.cards:

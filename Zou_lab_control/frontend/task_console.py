@@ -55,6 +55,8 @@ from .live import (
 )
 from .qt_fluent import (
     ACCENT,
+    CARD_PAD,
+    CARD_TITLE_PX,
     GREEN,
     GREY,
     ORANGE,
@@ -281,20 +283,17 @@ def _text_to_py(text: str):
         except ValueError:
             return raw
 
-# Card geometry (raw px).  The FluentGroupBox CHROME is unchanged (rounded corners, drop
-# shadow, the grey QGroupBox title strip) -- we only size the card around the plot and lay out
-# its contents.  WIDTH = the figure width + a thin L/R border (the drag grip).  HEIGHT = the
-# grey title strip + a canvas region proportional to the preset's ROW count: the design-size
-# canvas (UNTOUCHED) pins to the top of that region and the remainder is the proportional
-# bottom padding, so a 2-/4-row card is taller in proportion to its rows (no footer, no
-# slot-multiple slack).  Cards are AFFINE in cell count (fixed figure margins), so they tile on
-# a FINE snap grid (each occupies ceil(card / _SNAP) slots) -- gap < one snap.
-_CARD_PAD = 10        # thin L/R border + bottom pad hugging the plot (also the drag grip)
-_TITLE_STRIP = 32     # the grey QGroupBox title strip height -- MUST equal FluentGroupBox's
-                      # QGroupBox ``padding-top`` (scaled_px(32)); the plot sits below this strip.
-_GRID_GAP = 8         # gap between adjacent cards
-_SNAP = 8             # drag-snap / layout granularity: a FINE grid so cards sized to HUG their
-                      # (affine, non-grid-proportional) plot still tile tightly (gap < one snap)
+# Board layout (raw px).  The CARD'S FORMAT -- rounded corners, drop shadow, the grey title
+# strip and the content padding -- belongs to the FluentGroupBox COMPONENT (qt_fluent.CARD_PAD /
+# CARD_TITLE_PX, the single source); this module only LAYS the cards out on the board.  A card's
+# WIDTH = the figure width + the card's L/R border; HEIGHT = the grey title strip + a canvas
+# region proportional to the preset's ROW count (design-size canvas pinned to the top, remainder
+# = the proportional bottom padding).
+_GRID_GAP = 8         # gap between adjacent cards on the board (board layout, not card format)
+_SNAP_X = 8           # horizontal drag-snap: cards align to an 8 px column grid
+_SNAP_Y = 1           # vertical pitch = 1 px so stacked cards sit EXACTLY _GRID_GAP apart -- a
+                      # coarse vertical snap rounded each card's span UP, adding a few px of slack
+                      # to every gap (that was the "gap too big" regression)
 
 # The header status readout (panel/signal counts, or a node-error banner) is a borderless
 # label: grey normally, red on a node error (the colour IS the danger cue -- no box border,
@@ -304,31 +303,27 @@ _SUMMARY_STYLE_DANGER = f"color: {RED}; background: transparent; border: none;"
 
 
 def _grid_pitch() -> tuple[int, int]:
-    """The drag-snap / layout granularity -- a single FINE pitch on both axes.
+    """Drag-snap / layout pitch: 8 px HORIZONTAL (cards align to a column grid) and 1 px VERTICAL
+    (so gravity packs stacked cards EXACTLY ``_GRID_GAP`` apart -- a coarse vertical snap rounded
+    each card's slot span up, which added a few px of slack to every gap)."""
 
-    The card is sized to HUG its plot (see ``_card_size``), and a plot's size is AFFINE in its
-    cell count (fixed axis-label margins + a per-cell data area), so cards are NOT integer
-    multiples of one another and cannot tile on a coarse per-card grid without leaving big
-    padding.  A fine snap lets each card occupy ``ceil(card / snap)`` slots, so different sizes
-    pack tightly (a gap of at most one snap) while drag still snaps cleanly."""
-
-    return (_SNAP, _SNAP)
+    return (_SNAP_X, _SNAP_Y)
 
 
 def _card_size(size: str) -> tuple[int, int]:
-    """Outer card size.  The FluentGroupBox chrome (rounded corners, shadow, grey title strip)
-    is UNCHANGED; we only size the card around the plot.  WIDTH = figure width + a thin L/R
-    border.  HEIGHT = the grey title strip + a canvas region proportional to the ROW count
-    (the 1-row figure height x rows): the design-size canvas pins to the top of that region
-    and the remainder is the proportional bottom padding -- so card heights follow the preset."""
+    """Outer card size.  The FluentGroupBox chrome + content padding (CARD_PAD / CARD_TITLE_PX,
+    owned by the component library) are UNCHANGED; this only sizes the card around the plot.
+    WIDTH = figure width + the card's L/R border.  HEIGHT = the grey title strip + a canvas region
+    proportional to the ROW count (1-row figure height x rows): the design-size canvas pins to the
+    top of that region and the remainder is the proportional bottom padding."""
 
     pw = panel_display_size(size)[0]
     one_row_h = panel_display_size("1x2")[1]          # the 1-row figure height (proportion unit)
     rows = panel_size_cells(size)[0]
-    width = pw + 2 * _CARD_PAD
+    width = pw + 2 * CARD_PAD
     # grey title strip + top inset + (canvas region = 1-row height x rows) + bottom border.  The
     # canvas (AlignTop) fills the top of the region; the leftover is the proportional bottom pad.
-    height = scaled_px(_TITLE_STRIP) + scaled_px(2) + one_row_h * rows + _CARD_PAD
+    height = scaled_px(CARD_TITLE_PX) + scaled_px(2) + one_row_h * rows + CARD_PAD
     return (width, height)
 
 
@@ -443,16 +438,17 @@ class PanelConfig:
         self.params = dict(params or {})
         self.role = str(role)
 
-    # rows / cols are the card's SLOT SPAN on the fine snap grid (NOT the size preset's cell
-    # count): how many _SNAP slots the hugged card occupies, +_GRID_GAP so adjacent cards keep a
-    # gap.  The layout (overlap test / gravity compaction / board sizing) works in these slots.
+    # rows / cols are the card's SLOT SPAN (card size + _GRID_GAP, in pitch units): how many
+    # vertical (1 px) / horizontal (8 px) slots it occupies.  The layout (overlap test / gravity
+    # compaction / board sizing) works in these slots; the +_GRID_GAP keeps adjacent cards apart.
+    # Vertical pitch is 1, so the span is exact and stacked cards sit EXACTLY _GRID_GAP apart.
     @property
     def rows(self) -> int:
-        return max(1, -(-(_card_size(self.size)[1] + _GRID_GAP) // _SNAP))
+        return max(1, -(-(_card_size(self.size)[1] + _GRID_GAP) // _SNAP_Y))
 
     @property
     def cols(self) -> int:
-        return max(1, -(-(_card_size(self.size)[0] + _GRID_GAP) // _SNAP))
+        return max(1, -(-(_card_size(self.size)[0] + _GRID_GAP) // _SNAP_X))
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -663,10 +659,10 @@ class PanelCard(FluentGroupBox):
         self.setCursor(QtCore.Qt.OpenHandCursor)   # the frame border drags
 
         holder = QtWidgets.QVBoxLayout(self)
-        # _CARD_PAD insets the canvas L/R (and is the drag border); the grey title strip is above
-        # (the QGroupBox padding-top), and the bottom pad makes the height proportional to the
-        # preset (see _card_size).  There is NO footer -- the signal source lives in the title.
-        holder.setContentsMargins(_CARD_PAD, scaled_px(2), _CARD_PAD, _CARD_PAD)
+        # The card's content padding is the component-library token CARD_PAD (L/R + bottom); the
+        # grey title strip is above (the FluentGroupBox padding-top), and the bottom pad makes the
+        # height proportional (see _card_size).  No footer -- the signal source lives in the title.
+        holder.setContentsMargins(CARD_PAD, scaled_px(2), CARD_PAD, CARD_PAD)
         holder.setSpacing(0)
         self.canvas_holder = holder
         # The transient status (the Setting tooltip / button colour) and the persistent SIGNAL
