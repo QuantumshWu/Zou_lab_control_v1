@@ -149,8 +149,17 @@ def test_calibrate_task_loads_a_pulse_template_and_sets_the_exposure(tmp_path):
         # editing the template IS how the long exposure is set; the short readout stays separate.
         assert task._template_image_seconds() == pytest.approx(0.030)
         assert task.readout_exposure == pytest.approx(0.005)        # 30ms-5ms-30ms long-short-long
-        # the cooling/load time also comes from the template (2 ms load period).
-        assert task._load_seconds_from_template() == pytest.approx(0.002)
+        # The bracket is BUILT BY MODIFYING THE TEMPLATE (with_imaging_bracket): ONE cooling/load
+        # cycle, then the 'image' window repeated long-short-long -> three CONSECUTIVE emCCD on the
+        # same atoms.  Verify the actual fired sequence has exactly that structure + durations.
+        bracket = st.with_imaging_bracket([0.030, 0.005, 0.030]).to_sequence(name="ref")
+        cooling = [(p.start, p.duration) for p in bracket.pulses if p.channel == "cooling" and p.value]
+        emccd = sorted(p.start for p in bracket.pulses if p.channel == "emCCD" and p.value)
+        probe = [round(p.duration, 6) for p in sorted(
+            (p for p in bracket.pulses if p.channel == "probe" and p.value), key=lambda p: p.start)]
+        assert len(cooling) == 1 and cooling[0][1] == pytest.approx(0.002)   # one cooling load
+        assert len(emccd) == 3                                               # three consecutive emCCD
+        assert probe == [pytest.approx(0.030), pytest.approx(0.005), pytest.approx(0.030)]  # 30-5-30
         task.run_to_completion()
         assert np.asarray(task.calibration.centers).shape == (12, 2)
     finally:

@@ -827,7 +827,12 @@ class PanelCard(FluentGroupBox):
         popup_outer.addWidget(self._settings_scroll)
         root = QtWidgets.QVBoxLayout(popup_content)
         pad = scaled_px(10)
-        root.setContentsMargins(pad, pad, pad, pad)
+        # RESERVE the vertical scrollbar's width on the RIGHT so the scrollbar never sits ON TOP
+        # of a control (it would otherwise occlude the combo / value boxes when content scrolls).
+        # The popup anchors its RIGHT edge at the gear, so this extra width grows the popup
+        # LEFTWARD into the empty space there -- exactly "extend the settings frame to the left".
+        scrollbar_w = self._settings_scroll.verticalScrollBar().sizeHint().width() or scaled_px(12)
+        root.setContentsMargins(pad, pad, pad + scrollbar_w + scaled_px(4), pad)
         root.setSpacing(scaled_px(10, minimum=6))
 
         # fixed left-label column, SIZED TO CONTENT so nothing truncates: the longest
@@ -4062,16 +4067,29 @@ class TaskConsole(QtWidgets.QWidget):
         return f"{title} {n}"
 
     def _logic_node_prefix(self, node: LogicNodeConfig) -> str:
-        """A UNIQUE per-instance hub-signal prefix for a logic node, derived from its (already
-        unique) row title via the SAME ``measurement_slug`` measurements use -- so two
-        occupancy judges publish DISTINCT signals (``judge_occupancy_occupied`` vs
-        ``judge_occupancy_2_occupied``) instead of colliding on bare names.  A final guard
-        de-dupes against already-running prefixes (covers a manual rename to a dup)."""
+        """The hub-signal prefix for a logic node -- EMPTY by default, so a node publishes its
+        SHORT natural signal names (``occupied`` / ``rate`` / ``frame`` ...), NOT a verbose
+        ``judge_occupancy_rate``.  The producing node is shown by the signal-flow grouping +
+        the frame-title legend, so the producer name need not be baked into every signal.
+
+        Only a SECOND node whose OWN output keys would COLLIDE with signals an already-running
+        node publishes gets a disambiguating slug prefix (``occupancy_2_occupied``), so the two
+        never overwrite each other on the hub; the common single-instance case stays short."""
+        spec = self._spec_for_logic(node)
+        keys = {str(k) for k in (getattr(spec, "result_keys", ()) or ())}
+        running: set[str] = set()
+        for n in self.running_nodes:
+            try:
+                running.update(str(s) for s in n.published_signals())
+            except Exception:
+                pass
+        if not keys or not (keys & running):
+            return ""                                # no collision -> short, unprefixed names
         from Zou_lab_control.neutral_atom.operations.measurement import measurement_slug
         base = measurement_slug(node.title or node.name) or str(node.kind) or "node"
-        taken = {getattr(n, "prefix", "") for n in self.running_nodes}
-        prefix, k = base + "_", 2
-        while prefix in taken:
+        prefix, k = f"{base}_", 2
+        while prefix in {getattr(n, "prefix", "") for n in self.running_nodes} \
+                or any((prefix + key) in running for key in keys):
             prefix = f"{base}_{k}_"
             k += 1
         return prefix

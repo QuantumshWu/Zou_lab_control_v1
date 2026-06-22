@@ -90,15 +90,23 @@ background model is PART of the readout and is carried per method in `by_method`
 
 `CalibrateReadoutTask` (`operations/logic.py`) follows the Rb87 single-atom flow:
 
-1. **Site map + PSF** from averaging many long reference frames (each images a real ~50%
-   loading; the average reveals every trap).
-2. **Reference brackets** (`_collect_bracket_groups`): each shot is ONE correlated
-   long-short-long camera sequence (`timing.reference_bracket_sequence`) imaging the SAME
-   atoms — the trap is held on and there is NO re-cooling between triggers, so a following
-   frame sees the previous frame's survivors. Comparing the two long frames tells whether
-   the atom survived; when they AGREE (strict consensus) they vote the ground-truth
-   occupancy for the short readout, and a shot where they disagree (atom loss, modelled by
-   the virtual `detection_lifetime`) is dropped as ambiguous.
+1. **Reference brackets** (`_collect_bracket_groups`): each shot is ONE correlated
+   long-short-long camera sequence imaging the SAME atoms. The bracket is built BY MODIFYING
+   THE LOADED TEMPLATE's durations — `PulseTableState.with_imaging_bracket([long, short, long])`
+   keeps ONE cooling/load cycle (the template's periods BEFORE its `image` window), then repeats
+   the template's own `image` window long-short-long with a trap-held readout gap between, so
+   the emCCD line drops and re-rises into THREE CONSECUTIVE camera triggers within that single
+   cooling cycle. The trap is held on across the bracket and there is NO re-cooling between
+   triggers, so a following frame sees the previous frame's survivors. The long exposure IS the
+   template's image-window duration (editing the template sets it); the short middle frame is
+   `readout_exposure`. Comparing the two long frames tells whether the atom survived; when they
+   AGREE (strict consensus) they vote the ground-truth occupancy for the short readout, and a
+   shot where they disagree (atom loss, modelled by the virtual `detection_lifetime`) is dropped
+   as ambiguous. (`timing.reference_bracket_sequence` builds the equivalent bracket FROM SCRATCH
+   — explicit channels, no template — for tests/notebooks without a template file.)
+2. **Site map + PSF** from averaging the bracket's LONG reference frames (each images a real
+   ~50% loading; the average reveals every trap). This is the SAME path live and from saved
+   frames — there is no separate site-map acquisition pass.
 3. **Held-out per-method fidelity** (`operations.fidelity.characterize_readout`, run per
    method in `calibration_report._held_out_by_method`): each method's per-site threshold is
    trained on a split of the labelled short readout and scored on a HELD-OUT split. Because

@@ -122,33 +122,38 @@ def test_console_resolves_2d_frame_panel_to_judged_frame_for_shot_alignment():
     assert np.array_equal(np.asarray(ns["occupied"]), cal.detect(panel_signal, method="box").occupied)
 
 
-def test_two_occupancy_nodes_get_distinct_titles_prefixes_and_labels():
-    """#2: adding multiple occupancy judges must make them distinguishable -- distinct row
-    TITLES, distinct per-instance signal PREFIXES (so their hub signals don't collide), and
-    distinct display LABELS (so the source combobox/legend tells them apart).  Verified
-    through the REAL console helpers (_unique_logic_title + _logic_node_prefix) + the node
-    instance_label, Qt-free."""
+def test_occupancy_nodes_publish_short_names_and_disambiguate_on_collision():
+    """#7/#2: a logic node publishes its SHORT natural signal names (``occupied`` / ``rate`` /
+    ... -- NOT a verbose ``judge_occupancy_rate``); the producer is shown by the signal-flow
+    grouping + frame-title legend, not baked into every name.  A SECOND node whose outputs would
+    COLLIDE with an already-running node's signals gets a disambiguating prefix so their hub
+    signals stay disjoint.  Distinct row TITLES + distinct display LABELS too.  Verified through
+    the REAL console helpers (_unique_logic_title + _logic_node_prefix), Qt-free."""
     from types import SimpleNamespace
     from Zou_lab_control.frontend.task_console import TaskConsole, LogicNodeConfig
 
-    console = SimpleNamespace(logic_nodes=[], running_nodes=[])
-    # two occupancy nodes added with the SAME default title -> the console must disambiguate
+    keys = ("occupied", "counts", "rate", "rate_sites", "rate_grid", "centers", "frame_judged")
+    spec = SimpleNamespace(result_keys=keys)
+    console = SimpleNamespace(logic_nodes=[], running_nodes=[], _spec_for_logic=lambda n: spec)
+
     t1 = TaskConsole._unique_logic_title(console, "Judge occupancy")
     cfg1 = LogicNodeConfig(kind="processor", name="Judge occupancy", title=t1)
     console.logic_nodes.append(SimpleNamespace(node=cfg1))
+    # FIRST node, nothing running yet -> NO prefix: it publishes the bare short names.
+    p1 = TaskConsole._logic_node_prefix(console, cfg1)
+    assert p1 == ""
+    a = OccupancyProcessor(SignalHub(), calibration=None, prefix=p1); a.instance_label = t1
+    assert "rate" in a.published_signals() and "occupied" in a.published_signals()   # short names
+    console.running_nodes.append(a)                       # now it's publishing the bare names
+
+    # SECOND node added while the first RUNS -> its keys collide -> disambiguating prefix.
     t2 = TaskConsole._unique_logic_title(console, "Judge occupancy")
     cfg2 = LogicNodeConfig(kind="processor", name="Judge occupancy", title=t2)
     console.logic_nodes.append(SimpleNamespace(node=cfg2))
-
-    assert t1 != t2                                      # distinct Logic-tab row titles
-    p1 = TaskConsole._logic_node_prefix(console, cfg1)
     p2 = TaskConsole._logic_node_prefix(console, cfg2)
-    assert p1 and p2 and p1 != p2 and p1.endswith("_") and p2.endswith("_")   # distinct signal prefixes
-
-    # the built nodes then publish disjoint signal names + carry distinct labels
-    a = OccupancyProcessor(SignalHub(), calibration=None, prefix=p1); a.instance_label = t1
+    assert t1 != t2 and p2 and p2.endswith("_") and p2 != p1   # distinct title + disambiguating prefix
     b = OccupancyProcessor(SignalHub(), calibration=None, prefix=p2); b.instance_label = t2
-    assert set(a.published_signals()).isdisjoint(b.published_signals())
+    assert set(a.published_signals()).isdisjoint(b.published_signals())   # disjoint hub signals
     assert a.display_label != b.display_label
 
 

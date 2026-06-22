@@ -1023,6 +1023,46 @@ class PulseTableState:
         clone.set_period_duration(idx, float(seconds), unit="s")
         return clone
 
+    def with_imaging_bracket(self, exposures, *, gap_seconds: float = 200e-6) -> "PulseTableState":
+        """Return a COPY that loads the atoms ONCE and images them ``len(exposures)`` times in a
+        row -- the Rb87 reference-bracket flow.  The periods BEFORE the ``image`` window (the
+        load / cooling cycle) run ONCE; then the ``image`` window is repeated once per entry in
+        ``exposures`` (seconds), each its OWN emCCD trigger, separated by a short readout GAP that
+        holds only the always-on channels (the trap) so the camera sees DISTINCT triggers -- back-
+        to-back image periods would keep emCCD HIGH the whole time and read as ONE trigger.
+
+        So ``exposures=[0.02, 0.005, 0.02]`` is the 20ms-5ms-20ms long-short-long bracket: one
+        cooling load, three consecutive emCCD exposures on the SAME atoms (the two long frames
+        bracket the short readout to vote ground truth).  This is how the Calibrate task turns the
+        loaded template into its bracket -- purely by setting the per-frame image durations, with
+        nothing hard-coded.  The original is unchanged."""
+        import copy
+        exposures = [float(e) for e in exposures]
+        if not exposures:
+            raise ValueError("with_imaging_bracket needs at least one exposure.")
+        idx = period_index_by_name(self, "image")
+        if idx is None:
+            if not self.periods:
+                return self
+            idx = len(self.periods) - 1
+        image = self.periods[idx]
+        pre = list(self.periods[:idx])                 # the load / cooling cycle (runs once)
+        width = len(self.channels)
+        # channels held high across the WHOLE imaging cycle (the trap) also stay on in the readout
+        # gap; the probe + camera trigger drop, so each image window is a distinct emCCD trigger.
+        held = tuple(1 if all(p.states[i] for p in [*pre, image]) else 0 for i in range(width))
+        periods = copy.deepcopy(pre)
+        single = len(exposures) == 1
+        for k, exposure in enumerate(exposures):
+            periods.append(PulsePeriod(exposure, tuple(image.states), unit="s",
+                                       name="image" if single else f"image_{k}"))
+            if k < len(exposures) - 1:
+                periods.append(PulsePeriod(float(gap_seconds), held, unit="s", name=f"readout_gap_{k}"))
+        clone = copy.deepcopy(self)
+        clone.periods = periods
+        clone.validate()
+        return clone
+
     def set_period_name(self, period_index: int, name: str) -> "PulseTableState":
         """Rename period ``period_index`` (the GUI's period-name edit)."""
         period_index = int(period_index)

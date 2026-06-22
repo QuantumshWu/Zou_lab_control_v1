@@ -822,27 +822,6 @@ class CalibrateReadoutTask(Task):
             readout_by_group=getattr(self, "_readout_by_group", None),
             timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
-    def _load_seconds_from_template(self) -> float:
-        """The total LOAD (cooling/MOT) time of the loaded template -- the seconds BEFORE its
-        imaging window -- so each reference bracket reloads the atoms for exactly as long as
-        the template prescribes (the template drives the bracket's load, not a fixed default).
-        Falls back to the bracket's own default when the template has no load period or a
-        scan-bound (non-reducible) one."""
-        from ..timing.pulse_table import UNITS_TO_NS, period_index_by_name
-        try:
-            st = self._resolve_template(self.pulse_template)
-        except Exception:
-            return 2e-3
-        idx = period_index_by_name(st, "image")
-        if idx is None:
-            idx = max(0, len(st.periods) - 1)
-        total_ns = 0.0
-        for p in st.periods[:idx]:
-            if isinstance(p.duration, str):     # a scan-expr load period can't be reduced
-                return 2e-3
-            total_ns += float(p.duration) * UNITS_TO_NS.get(str(p.unit), 1.0)
-        return (total_ns / 1e9) if total_ns > 0 else 2e-3
-
     def _template_image_seconds(self) -> float:
         """The loaded template's IMAGE-window duration in seconds -- the LONG reference exposure
         of the long-short-long bracket.  Editing the template's 'image' period IS how the
@@ -945,18 +924,18 @@ class CalibrateReadoutTask(Task):
         ``readout_per_group[g]`` is the short readout frame scored against them.  Honours the
         Stop event between brackets (interruptible).  Identical on real hardware -- only the
         camera frames' author differs (``virtual == real``)."""
-        from ..timing import imaging_channel_kwargs, reference_bracket_sequence
         n_ref = int(self.REFERENCE_FRAMES_PER_BRACKET)
         readout_index = n_ref // 2
-        # Build the bracket FROM the loaded template: it reloads for the template's load time
-        # and images on the template's channels (imaging_channel_kwargs maps the conventional
-        # roles onto whatever the sequencer exposes -- the same channels the template targets),
-        # imaged long-short-long at the chosen exposures.  So the template genuinely drives the
-        # calibration pulse (its load + imaging structure), not a hard-coded sequence.
-        bracket = reference_bracket_sequence(
-            ref_exposure=self._template_image_seconds(), readout_exposure=self.readout_exposure,
-            n_ref=n_ref, cooling=self._load_seconds_from_template(),
-            **imaging_channel_kwargs(self.sequencer))
+        # Build the bracket BY MODIFYING THE LOADED TEMPLATE's durations (with_imaging_bracket):
+        # ONE cooling/load cycle, then the template's 'image' window repeated long-short-long at
+        # the per-frame exposures -- three CONSECUTIVE emCCD triggers on the SAME atoms.  The long
+        # exposure IS the template's image-window duration (edit the template to change it); the
+        # short middle is the readout.  The template's OWN channels fire (load/cooling/probe/emCCD
+        # on virtual, the same chNN the real template names on hardware) -> virtual == real.
+        exposures = [self.readout_exposure if i == readout_index else self._template_image_seconds()
+                     for i in range(n_ref + 1)]
+        template = self._resolve_template(self.pulse_template)
+        bracket = template.with_imaging_bracket(exposures).to_sequence(name="reference_bracket")
         n_groups = max(2, int(self.threshold_frames))
         reference_groups: list = []
         readout_per_group: list = []

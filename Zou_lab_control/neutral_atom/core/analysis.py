@@ -159,10 +159,11 @@ def _regularize_grid(centers_row_major, grid_shape: Sequence[int], image_shape) 
     ``maximum_filter`` artifact and a downstream PSF box (which needs a full window around
     every site) cannot fit.  Each axis is fit GLOBALLY (robust origin + pitch via
     :func:`_robust_axis_lattice`), so even a WHOLE dark row/column is interpolated to its
-    interior node rather than anchored on a border artifact; only a center more than half a
-    cell off its node is replaced, leaving confidently-detected sites untouched.  Finally
-    every node is clamped a quarter-cell inside the frame, so no returned center can sit on
-    the border where a PSF box would not fit."""
+    interior node rather than anchored on a border artifact; EVERY site is then snapped onto
+    its fitted node (the array is regular by construction, so the per-site peak scatter is
+    measurement noise, not real displacement) -- the returned map is a clean regular grid, not
+    crooked.  Finally every node is clamped a quarter-cell inside the frame, so no returned
+    center can sit on the border where a PSF box would not fit."""
 
     ny, nx = grid_shape_tuple(grid_shape)
     g = np.asarray(centers_row_major, dtype=float).reshape(ny, nx, 2)
@@ -178,10 +179,14 @@ def _regularize_grid(centers_row_major, grid_shape: Sequence[int], image_shape) 
     pitch = float(min(pitches)) if pitches else float(min(h, w))
     lattice_x = np.broadcast_to(col_x[None, :], (ny, nx))
     lattice_y = np.broadcast_to(row_y[:, None], (ny, nx))
-    tol = 0.5 * pitch                                 # "still on its node" radius = half a cell
-    off_node = np.hypot(g[:, :, 0] - lattice_x, g[:, :, 1] - lattice_y) > tol
-    g[off_node, 0] = lattice_x[off_node]
-    g[off_node, 1] = lattice_y[off_node]
+    # The traps ARE a regular lattice (every row shares one y, every column one x), so the
+    # robustly-fitted lattice IS the true geometry; the per-site peak scatter (±1-2 px from
+    # shot noise / a dim site in a non-uniform average) is MEASUREMENT noise, not real site
+    # displacement.  Snap EVERY site onto its fitted node so the site map is a clean regular
+    # grid (no "歪歪扭扭" / crooked rings), not the jittery detected positions.  (A previous
+    # half-cell tolerance left that scatter in place, since it never exceeded half a pitch.)
+    g[:, :, 0] = lattice_x
+    g[:, :, 1] = lattice_y
     # Interior clamp: a dark-site node (or a degenerate fit) can never land on the border
     # where a PSF box cannot fit; a confidently-detected site sits well inside, so untouched.
     margin = max(1.0, 0.25 * pitch)
