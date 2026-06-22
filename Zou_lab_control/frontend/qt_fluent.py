@@ -847,6 +847,43 @@ class FluentLineEdit(QtWidgets.QLineEdit):
             self.setText(after)
 
 
+class FluentReadoutEdit(FluentLineEdit):
+    """A read-only BUT selectable / copyable text field -- the THIRD line-edit kind.
+
+    Three visually distinct text widgets, so a user tells at a glance what a field is:
+
+      * :class:`FluentLineEdit`    -- WHITE fill + accent focus ring: an EDITABLE input.
+      * :class:`FluentLabel`       -- transparent, no border: pure DISPLAY (cannot select).
+      * :class:`FluentReadoutEdit` -- light-grey fill + faint border, NO focus ring: you can
+        select + Ctrl-C the text but NOT edit it (a command result, a resolved file path, a
+        readout value).
+
+    Inherits FluentLineEdit's sizing / API (``setText`` / ``text``) so it drops into the same
+    rows; it just paints the read-only look and refuses edits."""
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(text, parent)
+        self.setReadOnly(True)
+        self.setCursor(QtCore.Qt.IBeamCursor)        # the I-beam signals "selectable text"
+
+    def _apply_style(self) -> None:
+        # grey fill (not white -> not an input) + a faint border (more than a bare label) +
+        # full-contrast text; NO accent focus border, because it cannot be edited.
+        self.setStyleSheet(
+            f"""
+            QLineEdit {{
+                background: {BG};
+                border: 1px solid {DIVIDER};
+                border-radius: {_radius()}px;
+                padding: {scaled_px(PADDING_V)}px {scaled_px(EDIT_PADDING_H)}px;
+                color: {TEXT};
+                font: {fluent_font_size()}pt "{FONT}";
+            }}
+            QLineEdit:focus {{ border: 1px solid {DIVIDER}; }}
+            """
+        )
+
+
 class FluentPathEdit(QtWidgets.QWidget):
     """A path field + a ``Browse…`` button -- the ONE reusable control for every path
     parameter (a data folder, a saved pulse-template ``.json``, a calibration file).

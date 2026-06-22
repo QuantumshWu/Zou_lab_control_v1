@@ -176,3 +176,25 @@ def test_region_is_always_exposed_even_at_full_frame():
     # and the endpoints round-trip back to a real sub-array when applied (crop on Apply)
     cam_node.set_acquisition_parameters(region=[10, 30, 5, 25])
     assert exp.camera.roi is not None
+
+
+def test_camera_exposure_setter_round_trips_on_every_backend():
+    """`cam.exposure = v` works uniformly (the one intrinsic scalar that reads naturally as `=`).
+    It is a write-through to configure() -- the single write path -- so it sets exposure and
+    nothing else.  The base CameraDevice contract carries the setter; both concrete backends
+    (VirtualCamera, QCMOSCamera) honour it.  (Guards the property/method-style alignment: the
+    setter must not silently regress to getter-only on any backend.)"""
+    from Zou_lab_control.neutral_atom.devices.base import CameraDevice
+    from Zou_lab_control.neutral_atom.devices.qcmos import QCMOSCamera
+
+    assert CameraDevice.exposure.fset is not None                  # the contract declares a setter
+
+    exp = na.connect("virtual", sitemap={"grid_shape": (3, 4)})
+    exp.camera.exposure = 5e-3                                       # virtual backend
+    assert exp.camera.exposure == 5e-3
+
+    cam = QCMOSCamera()                                             # NOT opened -> configure skips DCAM
+    roi_before = cam.roi
+    cam.exposure = 4e-3                                             # real backend, write-through configure
+    assert cam.exposure == 4e-3
+    assert cam.roi == roi_before                                   # exposure '=' touches ONLY exposure

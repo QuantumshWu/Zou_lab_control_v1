@@ -71,6 +71,7 @@ from .qt_fluent import (
     FluentLabel,
     FluentLineEdit,
     FluentPathEdit,
+    FluentReadoutEdit,
     FluentPopup,
     FluentScrollArea,
     FluentSectionLabel,
@@ -2428,10 +2429,19 @@ class PanelEditor(QtWidgets.QWidget):
             cmd_run = FluentButton("Run", color=ACCENT)
             cmd_run.clicked.connect(self._run_command)
             self.cmd_input.returnPressed.connect(self._run_command)
-            col.addWidget(FluentSettingRow("run", _inline(self.cmd_input, trailing=cmd_run), label_width=proc_lw))
-            self.cmd_result = FluentLabel("")
-            self.cmd_result.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
-            self.cmd_result.setWordWrap(True)
+            # the input FILLS the row (stretch 1) so it is not a tiny box; Run trails it.
+            run_host = QtWidgets.QWidget()
+            run_row = QtWidgets.QHBoxLayout(run_host)
+            run_row.setContentsMargins(0, 0, 0, 0)
+            run_row.setSpacing(scaled_px(6, minimum=4))
+            run_row.addWidget(self.cmd_input, 1)
+            run_row.addWidget(cmd_run, 0)
+            col.addWidget(FluentSettingRow("run", run_host, label_width=proc_lw))
+            # result: a read-only-but-COPYABLE field (FluentReadoutEdit) so you can select +
+            # Ctrl-C the value/error -- a plain label can't be copied.
+            self.cmd_result = FluentReadoutEdit("")
+            self.cmd_result.setPlaceholderText("result / error appears here (select to copy)")
+            self.cmd_result.setToolTip("The command's result or error — read-only, but select + Ctrl-C to copy.")
             col.addWidget(FluentSettingRow("result", self.cmd_result, label_width=proc_lw))
 
             # ---- Save: the ONE place to save from now (Setting no longer has Save).  The path
@@ -4327,9 +4337,10 @@ class TaskConsole(QtWidgets.QWidget):
             self.summary.setText(f"⚠ NODE ERROR ({who}, ×{n}): {node.last_error}"[:200])
         else:
             self.summary.setStyleSheet(_SUMMARY_STYLE)
+            # No single global refresh rate any more -- each panel sets its OWN update interval
+            # (see UPDATE_INTERVALS), so the header no longer claims one "every N ms".
             self.summary.setText(
-                f"{len(self.cards)} panels | {n_signals} signals | shot {self.hub.shot}"
-                f" | every {self.state.interval_ms} ms")
+                f"{len(self.cards)} panels | {n_signals} signals | shot {self.hub.shot}")
 
     # ------------------------------------------------------------------ files
     def save_to_file(self) -> None:

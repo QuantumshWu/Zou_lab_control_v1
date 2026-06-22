@@ -486,3 +486,20 @@ def test_edit_save_remembers_the_chosen_folder(tmp_path):
         assert editor2.save_dir_edit.text() == str(tmp_path)
     finally:
         console.shutdown()
+
+
+def test_edit_command_result_is_readonly_but_copyable():
+    """The Edit Command box: the `run` input fills its row, and the `result` is a
+    FluentReadoutEdit -- read-only (cannot be edited) BUT selectable/copyable (a QLineEdit, so
+    Ctrl-C works), unlike a plain label.  Running a command populates that copyable field."""
+    from Zou_lab_control.frontend.qt_fluent import FluentReadoutEdit
+    console, node, cam, card, editor = _camera_console()
+    try:
+        assert isinstance(editor.cmd_result, FluentReadoutEdit)
+        assert editor.cmd_result.isReadOnly()                       # cannot be edited
+        assert "#F3F3F3" in editor.cmd_result.styleSheet()          # distinct grey fill (not white input)
+        editor.cmd_input.setText("1 + 2")
+        editor._run_command()
+        assert editor.cmd_result.text() == "3"                      # result lands in the copyable field
+    finally:
+        console.shutdown()

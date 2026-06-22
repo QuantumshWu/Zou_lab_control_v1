@@ -65,6 +65,17 @@ class CameraDevice(BaseDevice):
     def exposure(self) -> float:
         """Current default exposure in seconds."""
 
+    @exposure.setter
+    def exposure(self, value: float) -> None:
+        """Write-through to :meth:`configure` -- so ``cam.exposure = 3e-3`` works uniformly on
+        every backend.  Exposure is the ONE intrinsic scalar where ``=`` reads naturally; it
+        routes through ``configure`` (the single hardware-write path) and never hides more than
+        setting the exposure.  Multi-field / ROI changes still go through ``configure(...)``
+        directly (an ROI snap / multi-subsystem write must not hide behind ``=``).  A backend
+        that overrides the ``exposure`` getter must re-declare this setter (it would otherwise be
+        shadowed); the concrete cameras (VirtualCamera, QCMOSCamera) do."""
+        self.configure(exposure=float(value))
+
     @property
     def roi(self) -> tuple[int, int, int, int] | None:
         """Sub-array readout window ``(x, width, y, height)``, or None for full frame.

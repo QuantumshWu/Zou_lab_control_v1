@@ -73,6 +73,12 @@ class QCMOSCamera(CameraDevice):
     def exposure(self) -> float:
         return self.config.exposure
 
+    @exposure.setter
+    def exposure(self, value: float) -> None:
+        # write-through to configure (the single DCAM-write path) -- so `cam.exposure = 3e-3`
+        # works the same as on the virtual backend; configure only touches hardware when open.
+        self.configure(exposure=float(value))
+
     @property
     def roi(self) -> tuple[int, int, int, int] | None:
         # Report what the camera is ACTUALLY reading out (post hardware snap) when
