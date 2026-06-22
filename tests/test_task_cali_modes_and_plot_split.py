@@ -417,3 +417,39 @@ def test_gui_measurement_node_is_plot_false_publishes_to_hub_only():
     finally:
         console.shutdown()
         exp.close()
+
+
+def test_with_imaging_bracket_edge_cases_three_triggers_tail_and_single_source_gap():
+    """MECHANICAL guard for the R5 self-audit fixes to PulseTableState.with_imaging_bracket:
+      * an image-FIRST template (no pre-image load period) must STILL yield N DISTINCT emCCD
+        triggers -- the readout gap must hold only the load channels, NOT probe/emCCD (holding
+        the imaging window's states collapsed the whole bracket into ONE continuous trigger);
+      * periods AFTER the image window are preserved once (not silently dropped);
+      * both bracket builders default the inter-frame gap to the ONE shared source."""
+    import inspect
+    from Zou_lab_control.neutral_atom.timing import default_imaging_template
+    from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState, PulsePeriod
+    from Zou_lab_control.neutral_atom.timing.sequence import (
+        count_trigger_pulses, reference_bracket_sequence, READOUT_GAP_SECONDS)
+
+    st = default_imaging_template()
+    chans = list(st.channels)
+    img_states = tuple(st.periods[[p.name for p in st.periods].index("image")].states)
+
+    # image-FIRST template -> three DISTINCT emCCD triggers (was 1 before the held-gap fix)
+    only_image = PulseTableState(channels=chans,
+                                 periods=[PulsePeriod(0.02, img_states, unit="s", name="image")])
+    seq = only_image.with_imaging_bracket([0.02, 0.005, 0.02]).to_sequence(name="b")
+    assert count_trigger_pulses(seq) == 3
+
+    # a period AFTER the image window survives once + still three triggers
+    tail = default_imaging_template()
+    tail.periods.append(PulsePeriod(0.001, tuple(0 for _ in chans), unit="s", name="park_after"))
+    bracketed = tail.with_imaging_bracket([0.02, 0.005, 0.02])
+    assert "park_after" in [p.name for p in bracketed.periods]
+    assert count_trigger_pulses(bracketed.to_sequence(name="b2")) == 3
+
+    # single source: both builders default the inter-frame gap to READOUT_GAP_SECONDS
+    assert inspect.signature(PulseTableState.with_imaging_bracket).parameters["gap_seconds"].default \
+        == READOUT_GAP_SECONDS
+    assert inspect.signature(reference_bracket_sequence).parameters["gap"].default == READOUT_GAP_SECONDS

@@ -293,6 +293,13 @@ class PulseReport:
             raise ValueError("Pulse sequence validation failed: " + "; ".join(self.errors))
 
 
+# The trap-held gap between consecutive emCCD frames of a long-short-long reference bracket.
+# The camera trigger drops during this gap so the next exposure registers as a DISTINCT trigger;
+# the single source both bracket builders default to (reference_bracket_sequence builds the bracket
+# from scratch, PulseTableState.with_imaging_bracket builds it by repeating a template's image window).
+READOUT_GAP_SECONDS = 100e-6
+
+
 def imaging_sequence(
     *,
     exposure: float = 20e-3,
@@ -339,7 +346,7 @@ def reference_bracket_sequence(
     n_ref: int = 2,
     trigger_width: float = 20e-6,
     pre_trigger: float = 100e-6,
-    gap: float = 100e-6,
+    gap: float = READOUT_GAP_SECONDS,
     cooling: float = 2e-3,
     name: str = "reference_bracket",
     trap_channel: str = "trap",
@@ -567,10 +574,13 @@ __all__ = [
     "PulseReport",
     "PulseSequence",
     "DEFAULT_CAMERA_TRIGGER_CHANNELS",
+    "READOUT_GAP_SECONDS",
     "count_trigger_pulses",
     "exposure_from_sequence",
+    "imaging_channel_kwargs",
     "imaging_sequence",
     "plot_sequence",
+    "reference_bracket_sequence",
     "sequence_for_frame_count",
     "snap_seconds_to_clock",
 ]

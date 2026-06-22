@@ -125,8 +125,9 @@ def find_site_centers(
     weights = smooth[candidates_yx[:, 0], candidates_yx[:, 1]]
     selected = candidates_yx[np.argsort(weights)[::-1]][:need]
     centers_xy = np.column_stack([selected[:, 1], selected[:, 0]]).astype(float)
-    # Sort into the regular array, then snap any center detection misplaced (a DARK site's
-    # border artifact) back onto its lattice node before applying the requested ordering.
+    # Sort into the regular array, then snap EVERY center onto its robustly-fitted lattice node
+    # (the trap array is regular by construction) before applying the requested ordering -- a clean
+    # regular grid, not the jittery detected positions.
     row_major = sort_centers_grid(centers_xy, (ny, nx), ordering="row-major")
     repaired = _regularize_grid(row_major, (ny, nx), img.shape)
     return sort_centers_grid(repaired, (ny, nx), ordering=ordering)
@@ -187,8 +188,8 @@ def _regularize_grid(centers_row_major, grid_shape: Sequence[int], image_shape) 
     # half-cell tolerance left that scatter in place, since it never exceeded half a pitch.)
     g[:, :, 0] = lattice_x
     g[:, :, 1] = lattice_y
-    # Interior clamp: a dark-site node (or a degenerate fit) can never land on the border
-    # where a PSF box cannot fit; a confidently-detected site sits well inside, so untouched.
+    # Interior clamp: a fitted node (e.g. from a degenerate lattice fit) can never land on the
+    # border where a PSF box cannot fit; a node already well inside is left where the fit put it.
     margin = max(1.0, 0.25 * pitch)
     g[:, :, 0] = np.clip(g[:, :, 0], margin, max(margin, w - 1 - margin))
     g[:, :, 1] = np.clip(g[:, :, 1], margin, max(margin, h - 1 - margin))

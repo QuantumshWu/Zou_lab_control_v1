@@ -695,12 +695,9 @@ Targeted improvement backlog (priority order; none blocking):
    the trap array on `detect`. (`detect` already uses the stored reducer/radius,
    so the train/infer reducer mismatch is not actually reachable via
    `TrapCalibration.detect` — only via calling `detect_atoms` directly.)
-3. **Virtual sitemap hidden behaviour.** `VirtualCamera` keys "all sites loaded"
-   off the sequence *name* `"sitemap"`. Replace with an explicit
-   `force_all_sites` parameter so virtual ≠ real behaviour is not silent.
-4. **Calibration schema version.** Add a `schema_version` to the
+3. **Calibration schema version.** Add a `schema_version` to the
    `TrapCalibration` payload so old `.npz`/`.json` can be migrated safely.
-5. **Exposure source of truth.** The sequence's probe width is the truth; assert
+4. **Exposure source of truth.** The sequence's probe width is the truth; assert
    the camera exposure matches it after `acquire` to catch silent drift.
 
 These are recorded so future work is guided; the user explicitly accepts that

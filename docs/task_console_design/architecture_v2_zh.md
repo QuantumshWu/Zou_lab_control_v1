@@ -105,11 +105,11 @@ def calibrate_readout(camera, sequencer, *, n_frames: Param(int,200),
 
 ### calibrate-readout task 的完整参数设计(`CalibrateReadoutTask` + `CALIBRATE_PARAMS`)
 所有参数声明一次(`operations/tasks/calibrate.py` 的 `CALIBRATE_PARAMS`,GUI 自动表单与 `readout.calibrate_task(**values)` 同读),逐项:
-- **source = live / folder**:`live` = 现在开相机直接采图;`folder`(+`data_dir`)= 用已存文件夹的图(`index_run` 读 `img<n>`)cali。
-- **两条 pulse(两个 readout duration)**:`sitemap` 这一遍用**较长** readout(更多光子 → site 中心 + PSF 拟合更干净),`threshold` 这一遍用**实际** readout(阈值要在真实读出条件下学)。各自:`sitemap_exposure`/`readout_exposure`(默认序列时长)或 `sitemap_pulse`/`readout_pulse`(已存 `PulseTableState .json`,经 `PulseTableState.load().to_sequence()` 当成像脉冲,空=默认序列)。`_imaging_seq(pulse, exposure, name)` 单点选择。
-- **mode = box / per-site PSF / uniform PSF**:`MODE_TO_SITEMAP_METHOD` 解析为 sitemap method `box`/`psf`/`uniform_psf`。
-- **threshold = otsu / bimodal**。
-- **save_path / load_path**:存/取标定(`TrapCalibration` = 站点中心 + 每站点阈值);给 `load_path` 直接复用已存 site+threshold、**不重新采图**。
+- **source = live / saved frames**:`live` = 现在开相机直接采图并写标定;`saved frames`(`folder`)= 用已存文件夹的原始帧(`index_run` 读 `img<n>`)cali。**没有 "saved calibration" 这个 source**:复用一份已存标定直接让 Judge-occupancy 指它的 `calibration.json`。
+- **一条 pulse + long-short-long bracket**:`pulse_template` 是要 load 的成像程序;每发**改它的 duration** 成像成 long-short-long bracket(`PulseTableState.with_imaging_bracket`)——一次 cooling cycle 里三个连续 emCCD。**长参考曝光 = 模板 `'image'` 窗口时长**(改模板即改长曝光;两长帧投真值 + 建 site map),**短读出曝光 = `readout_exposure`**(中间帧,阈值在真实读出条件下学)。site map 用 bracket 的全部长参考帧(live==saved 单一路径,不再有独立 sitemap 采集 pass)。
+- **readout method = box / per-site PSF / uniform PSF**:cali **不**选 method,它把三种全算进一份标定;OccupancyProcessor 选其一。
+- **threshold = otsu / bimodal**;`threshold_frames`(bracket 发数)/`roi_radius`。
+- **复用标定**:重跑覆盖 `folder`;复用一份已标好的标定不在 cali 里——让 Judge-occupancy load 它的 `calibration.json`。
 - 同一 `TrapCalibration` 契约(`calibrate_sitemap_from_images` / `calibrate_threshold_from_images`),虚拟与真机只差相机帧。守:`tests/test_task_cali_modes_and_plot_split.py`。
 
 ## 7. 参数注解 + 自动 UI 引擎

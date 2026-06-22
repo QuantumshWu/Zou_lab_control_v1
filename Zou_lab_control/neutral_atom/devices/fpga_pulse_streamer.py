@@ -1006,8 +1006,8 @@ def delay_eligible_channel_count(channel_count: int, bus_count: int = DEFAULT_BU
     and NOT a per-bus ``da_clk`` pin (``bus_count`` of them).  The board lays the real
     TTL outputs out FIRST, so the eligible set is the leading
     ``channel_count - bus_count*(bus_width+1)`` indices -- matching the RTL's compacted
-    (identity) event-FIFO map.  Only these get an event FIFO (deep enough at depth 256
-    only because the bus/clk channels are excluded)."""
+    (identity) event-FIFO map.  Only these get an event FIFO (``EVT_FIFO_DEPTH`` deep --
+    affordable on the LUT budget only because the bus/clk channels are excluded)."""
     return max(0, int(channel_count) - int(bus_count) * (int(bus_width) + 1))
 
 

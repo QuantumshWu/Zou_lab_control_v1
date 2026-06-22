@@ -39,7 +39,7 @@ def test_qcmos_frame_has_realistic_read_noise_offset_and_shot_noise():
     read_noise_counts = ta.read_noise_e / ta.conversion_e_per_count
     floor_e = (ta.background_rate + ta.dark_current_e_per_s) * exposure        # stray-light e-/px
     floor_counts = floor_e / ta.conversion_e_per_count                         # the floor in ADU
-    assert ta.offset_counts == pytest.approx(200.0)                            # the Rb87 qCMOS bias
+    assert ta.offset_counts > 0                                                # a real qCMOS bias (single source: VirtualTrapArray.offset_counts)
     # background sits at offset + the stray-light floor (a real, non-zero scatter level)
     assert abs(bg.mean() - (ta.offset_counts + floor_counts)) < 6.0
     assert floor_counts > 2.0 * read_noise_counts                              # a real floor, not just read noise

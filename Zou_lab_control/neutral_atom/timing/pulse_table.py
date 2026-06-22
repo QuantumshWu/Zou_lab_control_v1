@@ -28,7 +28,8 @@ from numbers import Number
 import re
 from typing import Iterable, Mapping, Sequence
 
-from .sequence import DEFAULT_CAMERA_TRIGGER_CHANNELS, PulseSequence, channel_names, positive_float
+from .sequence import (DEFAULT_CAMERA_TRIGGER_CHANNELS, READOUT_GAP_SECONDS, PulseSequence,
+                       channel_names, positive_float)
 
 
 UNITS_TO_NS = {"ns": 1.0, "us": 1_000.0, "ms": 1_000_000.0, "s": 1_000_000_000.0, "str (ns)": 1.0}
@@ -181,7 +182,7 @@ class PulsePeriod:
         # snap_scan_table; this guards the literal/period path, which validate() exercises.)
         if value < 0:
             raise ValueError(f"period duration must be >= 0 (got {value:g} {unit}).")
-        return quantized_time_steps(value * UNITS_TO_NS[unit], time_step_ns=time_step_ns, name="period duration", allow_zero=False)
+        return quantized_time_steps(value * UNITS_TO_NS[unit], time_step_ns=time_step_ns, allow_zero=False)
 
     def duration_ns(self, *, slots: Mapping[str, float] | None = None, time_step_ns: float | None = None) -> float:
         value = eval_time_expr(self.duration, slots=slots)
@@ -190,7 +191,7 @@ class PulsePeriod:
             raise ValueError(f"unsupported pulse duration unit {unit!r}.")
         out = value * UNITS_TO_NS[unit]
         if time_step_ns is not None:
-            return quantized_time_ns(out, time_step_ns=time_step_ns, name="period duration", allow_zero=False)
+            return quantized_time_ns(out, time_step_ns=time_step_ns, allow_zero=False)
         if out <= 0:
             raise ValueError("period duration must be > 0 ns.")
         return out
@@ -1023,13 +1024,15 @@ class PulseTableState:
         clone.set_period_duration(idx, float(seconds), unit="s")
         return clone
 
-    def with_imaging_bracket(self, exposures, *, gap_seconds: float = 200e-6) -> "PulseTableState":
+    def with_imaging_bracket(self, exposures, *, gap_seconds: float = READOUT_GAP_SECONDS) -> "PulseTableState":
         """Return a COPY that loads the atoms ONCE and images them ``len(exposures)`` times in a
         row -- the Rb87 reference-bracket flow.  The periods BEFORE the ``image`` window (the
         load / cooling cycle) run ONCE; then the ``image`` window is repeated once per entry in
         ``exposures`` (seconds), each its OWN emCCD trigger, separated by a short readout GAP that
-        holds only the always-on channels (the trap) so the camera sees DISTINCT triggers -- back-
-        to-back image periods would keep emCCD HIGH the whole time and read as ONE trigger.
+        holds only the channels that stay on through the WHOLE load (the trap) so the camera sees
+        DISTINCT triggers -- back-to-back image periods would keep emCCD HIGH the whole time and
+        read as ONE trigger.  Any periods AFTER the ``image`` window (e.g. a release/park step) are
+        preserved once at the end.
 
         So ``exposures=[0.02, 0.005, 0.02]`` is the 20ms-5ms-20ms long-short-long bracket: one
         cooling load, three consecutive emCCD exposures on the SAME atoms (the two long frames
@@ -1047,10 +1050,13 @@ class PulseTableState:
             idx = len(self.periods) - 1
         image = self.periods[idx]
         pre = list(self.periods[:idx])                 # the load / cooling cycle (runs once)
+        post = list(self.periods[idx + 1:])            # anything after imaging (release/park) -- kept once
         width = len(self.channels)
-        # channels held high across the WHOLE imaging cycle (the trap) also stay on in the readout
-        # gap; the probe + camera trigger drop, so each image window is a distinct emCCD trigger.
-        held = tuple(1 if all(p.states[i] for p in [*pre, image]) else 0 for i in range(width))
+        # The readout gap holds ONLY the channels on through the whole LOAD (the trap); the probe +
+        # camera trigger are off in the load so they DROP in the gap, making each image window a
+        # distinct emCCD trigger.  Intersecting over `image` too would keep probe/emCCD high when the
+        # template has no pre-image period (image-first), collapsing the bracket into ONE trigger.
+        held = tuple(1 if pre and all(p.states[i] for p in pre) else 0 for i in range(width))
         periods = copy.deepcopy(pre)
         single = len(exposures) == 1
         for k, exposure in enumerate(exposures):
@@ -1058,6 +1064,7 @@ class PulseTableState:
                                        name="image" if single else f"image_{k}"))
             if k < len(exposures) - 1:
                 periods.append(PulsePeriod(float(gap_seconds), held, unit="s", name=f"readout_gap_{k}"))
+        periods.extend(copy.deepcopy(post))
         clone = copy.deepcopy(self)
         clone.periods = periods
         clone.validate()
@@ -1222,7 +1229,6 @@ class PulseTableState:
         return quantized_time_steps(
             eval_time_expr(raw, slots=slots) * UNITS_TO_NS[unit],
             time_step_ns=step_ns,
-            name=f"delay for {channel!r}",
             allow_zero=True,
             allow_negative=True,
         )
@@ -1744,7 +1750,6 @@ def quantized_time_steps(
     value_ns: float | str,
     *,
     time_step_ns: float,
-    name: str,
     allow_zero: bool,
     allow_negative: bool = False,
 ) -> int:
@@ -1786,7 +1791,7 @@ def _snap_literal_time_value(
         number = float(value)
     factor = UNITS_TO_NS.get(str(unit), 1.0)
     snapped_ns = quantized_time_ns(
-        number * factor, time_step_ns=time_step_ns, name="time value",
+        number * factor, time_step_ns=time_step_ns,
         allow_zero=allow_zero, allow_negative=allow_negative,
     )
     out = snapped_ns / factor
@@ -1854,14 +1859,12 @@ def quantized_time_ns(
     value_ns: float | str,
     *,
     time_step_ns: float,
-    name: str,
     allow_zero: bool,
     allow_negative: bool = False,
 ) -> float:
     return quantized_time_steps(
         value_ns,
         time_step_ns=time_step_ns,
-        name=name,
         allow_zero=allow_zero,
         allow_negative=allow_negative,
     ) * positive_time_step_ns(time_step_ns)

@@ -87,13 +87,29 @@ class QCMOSCamera(CameraDevice):
             return self._applied_roi
         return self.config.roi
 
+    @property
+    def sensor_shape(self) -> tuple[int, int] | None:
+        # The FULL sensor (height, width) -- the same contract VirtualCamera exposes, so a
+        # raw-frame Edit shows the ROI as the full-frame window before any sub-array is set.
+        # Queried from DCAM's sub-array max once the camera is open; None before that (the
+        # honest "unknown until opened" the base default also returns).
+        if self._dcam is None:
+            return None
+        try:
+            _step, max_w, max_h = self._subarray_grid()
+        except Exception:
+            return None
+        return (int(max_h), int(max_w)) if max_w and max_h else None
+
     def configure(self, *, exposure: float | None = None, readout_speed: int | None = None, roi: Sequence[int] | None | object = None) -> None:
         if exposure is not None:
             self.config.exposure = positive_float(exposure, "exposure")
         if readout_speed is not None:
             self.config.readout_speed = nonnegative_int(readout_speed, "readout_speed")
         if roi is not None:
-            self.config.roi = normalize_roi(roi)
+            # honour the same clear-sentinel the VirtualCamera does: "" / "None" -> full frame
+            # (roi is None means "leave unchanged"), so configure(roi=...) is backend-agnostic.
+            self.config.roi = None if roi in ("", "None") else normalize_roi(roi)
         if self._dcam is not None:
             self._write_settings()
 
@@ -347,7 +363,7 @@ class QCMOSCamera(CameraDevice):
             "type": type(self).__name__,
             "exposure": self.config.exposure,
             "readout_speed": self.config.readout_speed,
-            "roi": self.config.roi,
+            "roi": self.roi,          # the region truly being imaged (hardware-snapped when open)
             "device_index": self.config.device_index,
             "timeout_ms": self.config.timeout_ms,
             "open": self._dcam is not None,

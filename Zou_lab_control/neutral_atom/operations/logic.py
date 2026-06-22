@@ -641,9 +641,11 @@ class CalibrateReadoutTask(Task):
     # The imaging pulse TEMPLATE the cali loads -- a REAL, inspectable program (no opaque
     # "built-in" sentinel).  A bare name resolves to the shipped configs template; an
     # absolute path to the user's own PulseTableState .json.  Each cali pass LOADS it and
-    # SETS its imaging exposure (with_imaging_exposure) -- "load a template, set the
-    # duration, on/off, run".  The cali no longer chooses a readout METHOD: it computes
-    # ALL methods (box / per-site PSF / uniform PSF) and the OccupancyProcessor picks one.
+    # images it long-short-long (with_imaging_bracket): the template's OWN 'image'-window
+    # duration is the LONG reference exposure, readout_exposure the SHORT middle frame --
+    # "load a template, set the durations, on/off, run".  The cali no longer chooses a readout
+    # METHOD: it computes ALL methods (box / per-site PSF / uniform PSF) and the
+    # OccupancyProcessor picks one.
     # The ONE canonical default imaging-template path (the cali task spec + the generic
     # Pulse-scan measurement both reference THIS, so every GUI form shows the same real,
     # project-relative ``pulses/imaging_template.json`` -- never a bare name that the path

@@ -69,6 +69,7 @@ __all__ = [
     "exposure_from_sequence",
     "generate_verilog",
     "generate_xdc",
+    "imaging_channel_kwargs",
     "imaging_sequence",
     "reference_bracket_sequence",
     "infer_bus_channels",

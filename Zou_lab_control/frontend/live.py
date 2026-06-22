@@ -862,14 +862,6 @@ class Live2DDis(BaseLivePlot):
             bad_color=self.bad_color,
         )
 
-    def set_colorbar_visible(self, visible: bool) -> None:
-        """Show / hide the colorbar axes (the ``cax`` band).  A basic display
-        toggle for the dashboard Setting popup; the figure GEOMETRY (the split
-        widths) is unchanged -- only the colorbar axis is hidden, so the main
-        image keeps its place and size."""
-        if getattr(self, "cax", None) is not None:
-            self.cax.set_visible(bool(visible))
-
 
 class LiveSiteMap(BaseLivePlot):
     """Live atom-array site map: a 2D camera frame with one hollow ring per tweezer,
@@ -905,7 +897,7 @@ class LiveSiteMap(BaseLivePlot):
             self._bg_image.set_data(arr)
             self._bg_image.set_clim(float(np.nanmin(arr)), max(float(np.nanmax(arr)), float(np.nanmin(arr)) + 1.0))
             if draw:
-                self.update_figure()
+                self.draw()
         else:
             self.background = arr               # shape changed: rebuilt by the host
 

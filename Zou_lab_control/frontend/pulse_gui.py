@@ -36,7 +36,9 @@ from .qt_fluent import (
     GREEN,
     GREY,
     ORANGE,
+    PLACEHOLDER,
     RED,
+    TEXT,
     YELLOW,
     ElidedLabel,
     FluentButton,
@@ -187,10 +189,6 @@ def _shadow_pad() -> int:
     return _px(5, minimum=4)
 
 
-def _panel_width(title: str, content_width: int) -> int:
-    return content_width
-
-
 def _period_card_width() -> int:
     return _px(PERIOD_CARD_WIDTH, minimum=112)
 
@@ -332,12 +330,6 @@ def _delay_cap_text(time_step_ns: float) -> str:
     if max_us >= 1e6:
         return f"±{format_compact_number(max_us / 1e6)} s (event-scheduled; ms-scale delays OK)"
     return f"±{format_compact_number(max_us)} us ({DELAY_MAX_TICKS} ticks)"
-
-
-def _bus_delay_cap_text(time_step_ns: float) -> str:
-    """DAC-bus delay magnitude cap -- identical to the TTL cap (both event-scheduled)."""
-
-    return _delay_cap_text(time_step_ns)
 
 
 def _bus_mode_combo_width() -> int:
@@ -1282,7 +1274,7 @@ class ChannelNamesPanel(FluentGroupBox):
         self.rows = _display_rows(state)
         label_w = _channel_label_width()
         edit_w = _channel_name_edit_width()
-        panel_w = _panel_width("Channel Names and Duration", label_w + edit_w + _px(5) + _px(20))
+        panel_w = label_w + edit_w + _px(5) + _px(20)
         self.setMinimumWidth(panel_w)
         self.setMaximumWidth(panel_w)
 
@@ -2779,8 +2771,8 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         editor_layout.setSpacing(_px(6, minimum=4))
         self.scan_code = QtWidgets.QPlainTextEdit()
         self.scan_code.setStyleSheet(
-            f'QPlainTextEdit {{ background: white; color: {ACCENT and "#323130"}; '
-            f'border: 1px solid #A19F9D; border-radius: {scaled_px(4)}px; '
+            f'QPlainTextEdit {{ background: white; color: {TEXT}; '
+            f'border: 1px solid {PLACEHOLDER}; border-radius: {scaled_px(4)}px; '
             f'font: {fluent_font_size()}pt "Consolas", "Courier New", monospace; padding: {_px(4)}px; }}'
         )
         apply_fluent_scrollbars(self.scan_code)   # match the Edit-tab Fluent scrollbar
@@ -2837,7 +2829,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         # White with a light border to match the code editor on the left -- the
         # old grey (BG) fill read as an out-of-place grey side panel.
         self.scan_table_view.setStyleSheet(
-            f'QPlainTextEdit {{ background: white; color: #323130; border: 1px solid #A19F9D; '
+            f'QPlainTextEdit {{ background: white; color: {TEXT}; border: 1px solid {PLACEHOLDER}; '
             f'border-radius: {scaled_px(4)}px; font: {fluent_font_size()}pt "Consolas", "Courier New", monospace; '
             f'padding: {_px(4)}px; }}'
         )

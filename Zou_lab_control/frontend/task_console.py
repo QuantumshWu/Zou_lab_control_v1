@@ -1995,7 +1995,7 @@ class MeasurementPanel(QtWidgets.QWidget):
         for decl in spec.params:
             kind = decl.kind
             # Show the REAL parameter name (the key threaded into the build call, e.g.
-            # ``data_dir`` / ``calibration_frames``), not a hand-written prettified label
+            # ``folder`` / ``threshold_frames``), not a hand-written prettified label
             # -- so the form is unambiguously the node's actual parameters.
             label_text = decl.key + (f" ({decl.unit})" if decl.unit else "")
             if decl.required:
@@ -2404,8 +2404,8 @@ class PanelEditor(QtWidgets.QWidget):
             hl.setSpacing(scaled_px(6, minimum=4))
             hl.addWidget(edit, 1)
             hl.addWidget(now, 0)
-            # widest node-param label is "calibration_frames" (18 chars) --
-            # 150 clipped its trailing 's'; 170 fits the longest name in full.
+            # widest node-param labels ("threshold_method" / "readout_exposure", 16 chars)
+            # need ~170 px; 150 clipped a trailing char, so 170 fits the longest name in full.
             col.addWidget(FluentSettingRow(name, holder, label_width=scaled_px(170, minimum=140)))
         if self._node_widgets:
             self.node_apply_button = FluentButton("Apply", color=ACCENT)

@@ -98,7 +98,6 @@ class ProcessorSpec:
     summary_keys: tuple[str, ...] = ()
     default_kind: str = ""
     default_value_key: str = ""
-    grid_shape: tuple[int, int] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
