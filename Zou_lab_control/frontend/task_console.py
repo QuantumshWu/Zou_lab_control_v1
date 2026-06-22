@@ -352,28 +352,34 @@ def _columns_overlap(a, b) -> bool:
 
 
 def _compact(configs: Sequence["PanelConfig"], active: "PanelConfig | None" = None) -> bool:
-    """Gravity layout: pull every card UP within its columns until it rests on
-    the card above it (or the board top).
+    """FREE-PLACEMENT grid layout: every card keeps the grid cell it sits on -- ANY
+    row/col, with empty cells ABOVE allowed -- and overlaps are the only thing
+    resolved.  Cards do NOT float up to the top: a panel dropped at row 3 with
+    nothing above it stays aligned at row 3 (that is the whole point of a grid).
 
-    This single rule is what keeps the board tidy after any drag, resize, add
-    or remove.  It does BOTH jobs at once -- a card always settles strictly
-    below every card it shares columns with (so nothing overlaps) AND it never
-    floats above free space (so there are no vertical gaps).  The result is
-    always a gap-free, top-packed grid; the previous push-DOWN-only resolver
-    cleared overlaps but left holes and let the board drift downward over
-    repeated drags.
+    Overlaps are cleared by pushing the OTHER cards straight DOWN to rest JUST below
+    whatever they collide with (minimal displacement -- no gratuitous gaps, "尽量不留空
+    挤走").  The just-dropped ``active`` card is pinned at its slot and placed FIRST,
+    so the others reflow around it (it wins) instead of being pushed itself.
 
-    Cards settle in reading order (row, then col); ``active`` (the card the user
-    just dropped) wins ties so it keeps its column/row while the others reflow
-    around it.  Returns True when any card moved."""
+    Earlier this pulled every card UP to the top (global gravity), which made a card
+    dropped below empty space snap back to row 0 -- wrong for a grid.  Returns True
+    when any card moved."""
 
     moved = False
     placed: list["PanelConfig"] = []
-    for config in sorted(configs, key=lambda c: (c.row, c.col, 0 if c is active else 1)):
-        target = 0
-        for blocker in placed:
-            if _columns_overlap(config, blocker):
-                target = max(target, blocker.row + blocker.rows)
+    # active first (pinned), then the rest in reading order so an upper card is
+    # placed before a lower one it might push.
+    for config in sorted(configs, key=lambda c: (0 if c is active else 1, c.row, c.col)):
+        target = config.row                          # keep your cell (free placement)
+        if config is not active:
+            # drop just below every already-placed card we would overlap; process
+            # blockers top-to-bottom so we settle on the lowest of an overlapping stack.
+            for blocker in sorted(placed, key=lambda b: b.row):
+                if (_columns_overlap(config, blocker)
+                        and target < blocker.row + blocker.rows
+                        and blocker.row < target + config.rows):
+                    target = blocker.row + blocker.rows
         if config.row != target:
             config.row = target
             moved = True
@@ -391,6 +397,16 @@ def _task_files_dir() -> Path:
 #: relim modes (confocal_gui combo_relim naming) -- the SINGLE source for both the Setting
 #: popup combo and the Edit-tab combo, so the two never list different options.
 _RELIM_MODES = ("tight", "normal")
+
+#: Per-panel display refresh intervals (ms) the operator can pick from.  A FIXED, harmonic set
+#: (100·{1,2,4,8}) so the SMALLEST selected interval divides every other -- the console timer
+#: runs at that base (the GCD) and each panel refreshes every ``update_ms // base`` ticks.  The
+#: payoff is PHASE ALIGNMENT: panels that share a beat fire on the SAME tick and read the SAME
+#: hub snapshot, so a 2-D frame and its site-map stay shot-coherent; a fast panel (100 ms) just
+#: refreshes more often in between (a live-1D alignment monitor).  Limiting the choices to this
+#: set is what makes the synchronisation exact -- arbitrary per-panel rates could never co-align.
+UPDATE_INTERVALS = (100, 200, 400, 800)
+DEFAULT_UPDATE_MS = 400
 
 
 def _unit_df_for(plotter):
@@ -473,6 +489,14 @@ class PanelConfig:
     @property
     def cols(self) -> int:
         return max(1, panel_size_cells(self.size)[1] // 2)
+
+    @property
+    def update_ms(self) -> int:
+        """This panel's display refresh interval (ms), one of :data:`UPDATE_INTERVALS`.
+        Stored in ``params`` (so it round-trips with the saved layout); an out-of-set value
+        falls back to :data:`DEFAULT_UPDATE_MS` so the timer base stays harmonic."""
+        ms = int(self.params.get("update_ms", DEFAULT_UPDATE_MS) or DEFAULT_UPDATE_MS)
+        return ms if ms in UPDATE_INTERVALS else DEFAULT_UPDATE_MS
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -631,6 +655,7 @@ class PanelCard(FluentGroupBox):
 
     changed = QtCore.pyqtSignal()          # any config edit (console marks dirty)
     layout_changed = QtCore.pyqtSignal()   # size/slot change (console re-arranges)
+    update_interval_changed = QtCore.pyqtSignal()  # per-panel refresh rate change (console re-bases the timer)
     remove_requested = QtCore.pyqtSignal(object)
     edit_requested = QtCore.pyqtSignal(object)   # "Edit…" -> open the panel's Edit tab
 
@@ -676,6 +701,10 @@ class PanelCard(FluentGroupBox):
         # refresh again and the panel would stay blank (white).  Re-rendering from this
         # cached namespace makes such a change take effect immediately, stopped or not.
         self._last_namespace: Mapping[str, object] | None = None
+        # The hub version at this panel's LAST render -- the per-panel multi-rate refresh
+        # (see TaskConsole._tick) skips a panel on its beat when nothing new was published
+        # since, so a slow panel does not redraw stale data and a fast one only when needed.
+        self._render_version = -1
         self._compiled_source = config.source
         # Monitor roll-gate: remembers the per-signal version of this panel's
         # source at the last roll, so an unrelated node's version bump does not
@@ -897,6 +926,21 @@ class PanelCard(FluentGroupBox):
             unit_inner_layout.addWidget(self.unit_label, 0)
             sec.addWidget(FluentSettingRow("unit", unit_inner, label_width=label_w))
 
+            # per-panel display refresh rate (this panel only).  A fixed, harmonic set so
+            # panels that share a beat stay frame-coherent (see UPDATE_INTERVALS); a fast rate
+            # suits a live-1D alignment monitor.  Changing it re-bases the console timer.
+            self.update_combo = FluentComboBox()
+            for ms in UPDATE_INTERVALS:
+                self.update_combo.addItem(f"{ms} ms", ms)
+            idx = self.update_combo.findData(self.config.update_ms)
+            self.update_combo.setCurrentIndex(idx if idx >= 0 else self.update_combo.findData(DEFAULT_UPDATE_MS))
+            self.update_combo.setToolTip(
+                "How often THIS panel redraws.  Every rate shares one base tick, so panels that\n"
+                "share a beat refresh on the SAME tick from the same data -- a 2-D frame and its\n"
+                "site-map stay shot-coherent.  A fast 100 ms suits a live-1D alignment monitor.")
+            self.update_combo.currentIndexChanged.connect(self._on_update_interval)
+            sec.addWidget(FluentSettingRow("update", self.update_combo, label_width=label_w))
+
         # ---- Panel ---------------------------------------------------------
         sec = section_box("Panel")
         self.title_edit = FluentLineEdit(self.config.title)
@@ -1100,6 +1144,17 @@ class PanelCard(FluentGroupBox):
         if self.canvas is not None:
             self.canvas.draw_idle()
         self.changed.emit()
+
+    def _on_update_interval(self, _idx: int) -> None:
+        """Persist THIS panel's display refresh interval (``config.params["update_ms"]``,
+        one of :data:`UPDATE_INTERVALS`) and ask the console to re-base its timer so the new
+        rate co-aligns with the others.  No plot rebuild -- only the refresh cadence changes."""
+        ms = int(self.update_combo.currentData() or DEFAULT_UPDATE_MS)
+        if ms == int(self.config.params.get("update_ms", DEFAULT_UPDATE_MS) or DEFAULT_UPDATE_MS):
+            return
+        self.config.params["update_ms"] = ms
+        self.update_interval_changed.emit()    # console re-bases the shared timer
+        self.changed.emit()                    # mark the layout dirty
 
     # --------------------------------------------- basic display application
     def _apply_display_params(self) -> None:
@@ -2150,6 +2205,17 @@ class PanelEditor(QtWidgets.QWidget):
         # the section gates below so the structure stays legible.
         is_plot = card.config.role == "plot"
 
+        # ---- Panel: rename this panel right here in the Edit (kept in sync with the Setting
+        # popup's title field; both go through the sealed title API).  Saves a trip back to
+        # the Setting popup just to relabel.
+        if is_plot:
+            section("Panel")
+            self.title_edit = FluentLineEdit(card.config.title)
+            self.title_edit.setPlaceholderText("panel title…")
+            self.title_edit.setToolTip("Rename this panel (also the default save name).")
+            self.title_edit.textChanged.connect(self._edit_title)
+            col.addWidget(FluentSettingRow("title", self.title_edit, label_width=scaled_px(96, minimum=72)))
+
         # ---- Acquisition: the editable parameters of the DATA SOURCE behind this
         # panel.  A panel is a VIEW; the LOGIC NODE whose published signals it reads
         # declares what its source exposes via acquisition_parameters() -- a
@@ -2347,24 +2413,63 @@ class PanelEditor(QtWidgets.QWidget):
             col.addWidget(FluentSettingRow("x range", _inline(self.xmin, self.xmax), label_width=proc_lw))
             col.addWidget(FluentSettingRow("y range", _inline(self.ymin, self.ymax, trailing=apply_btn), label_width=proc_lw))
 
-            # ---- Save: the ONE place to save from now (Setting no longer has Save).  A folder
-            # picker (the reusable FluentPathEdit, mode="dir") prefilled with the LAST folder a
-            # panel saved into -- remembered on the console for the life of the kernel -- or
-            # tasks/; Browse picks any folder.  Save writes <title>_<timestamp>.png + .npz there
-            # and remembers that folder, so reopening this (or another panel's) Edit reuses it.
+            # ---- Command: a one-line REPL on the panel's DataFigure (confocal runs the same
+            # `data_figure.<fn>(...)` form).  Type e.g. `data_figure.xlim(0, 10)`,
+            # `df.lorentzian(p0=[1,0,1,0])`, `ax.set_title('x')` -- it runs on the snapshot and
+            # the result/exception shows below.  Trusted-local-tool posture (same as the Scan
+            # tab / fit args): only run code you wrote.
+            section("Command")
+            self.cmd_input = FluentLineEdit("")
+            self.cmd_input.setPlaceholderText("data_figure.xlim(0, 10)")
+            self.cmd_input.setStyleSheet(self.cmd_input.styleSheet() + " QLineEdit { font-family: Consolas, monospace; }")
+            self.cmd_input.setToolTip(
+                "Run a line of Python on this panel's figure.  Names: data_figure / df, fig, ax,\n"
+                "plotter, np.  e.g. df.lorentzian(p0=[1,0,1,0]) ; ax.set_title('x') ; data_figure.xlim(0,10)")
+            cmd_run = FluentButton("Run", color=ACCENT)
+            cmd_run.clicked.connect(self._run_command)
+            self.cmd_input.returnPressed.connect(self._run_command)
+            col.addWidget(FluentSettingRow("run", _inline(self.cmd_input, trailing=cmd_run), label_width=proc_lw))
+            self.cmd_result = FluentLabel("")
+            self.cmd_result.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+            self.cmd_result.setWordWrap(True)
+            col.addWidget(FluentSettingRow("result", self.cmd_result, label_width=proc_lw))
+
+            # ---- Save: the ONE place to save from now (Setting no longer has Save).  The path
+            # field is FULL WIDTH (its own row) so a long path is never cut off -- the reusable
+            # FluentPathEdit (Browse picks a folder), prefilled with the LAST place a panel saved
+            # (remembered on the console for the kernel session) or tasks/.  An "auto-name" SWITCH
+            # decides the filename: ON (default) appends ``_<plot-kind>_<timestamp>`` so saves are
+            # unique; OFF writes the path VERBATIM (you control the exact name, overwrites).  A
+            # read-only preview shows the actual file that will be written -- the full name, not
+            # just the folder.
             section("Save")
             self.save_dir_edit = FluentPathEdit(
                 self.console._last_save_dir or str(_task_files_dir()),
-                mode="dir", caption="Choose a folder to save into", base_dir=str(_task_files_dir()))
+                mode="dir", caption="Choose where to save", base_dir=str(_task_files_dir()))
             self.save_dir_edit.setToolTip(
-                "Folder the figure (png) + data (npz) are saved into; remembered across saves "
-                "(this kernel session).")
+                "Where to save (folder, or a full path base).  Remembered across saves this\n"
+                "kernel session.  With auto-name OFF this is the exact output path.")
+            col.addWidget(FluentSettingRow("path", self.save_dir_edit, label_width=proc_lw))
+            # trailing spaces: FluentSwitch.sizeHint reserves the track width but paints the
+            # label past track+gap, clipping the last few px -- the pad absorbs that (scales
+            # with DPR since it is text), so the real label stays whole.
+            self.save_autoname = FluentSwitch("auto-name (type + time)   ")
+            self.save_autoname.setChecked(True)
+            self.save_autoname.setToolTip(
+                "ON: append _<plot-kind>_<timestamp> to the path (unique files).\n"
+                "OFF: write the path verbatim (you set the exact name; overwrites).")
             self.save_button = FluentButton("Save Fig", color=ACCENT)
-            self.save_button.setToolTip(
-                "Save the edited figure (png) + data (npz), timestamped, into the folder on the left.")
+            self.save_button.setToolTip("Save the edited figure (png) + matching data (npz).")
             col.addWidget(FluentSettingRow(
-                "folder", _inline(self.save_dir_edit, trailing=self.save_button), label_width=proc_lw))
+                "name", _inline(self.save_autoname, trailing=self.save_button), label_width=proc_lw))
+            self.save_preview = FluentLabel("")
+            self.save_preview.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+            self.save_preview.setWordWrap(True)
+            col.addWidget(FluentSettingRow("file", self.save_preview, label_width=proc_lw))
+            self.save_dir_edit.changed.connect(lambda *_: self._update_save_preview())
+            self.save_autoname.toggled.connect(lambda *_: self._update_save_preview())
             self.save_button.clicked.connect(self.save)
+            self._update_save_preview()
 
         self.status = FluentLabel("")
         self.status.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
@@ -2497,6 +2602,46 @@ class PanelEditor(QtWidgets.QWidget):
         if self.card is not None:
             self.card._on_unit_cycle()            # config.params["unit_index"] + live cycle
         self.rebuild()
+
+    def _edit_title(self, text: str) -> None:
+        """Rename the panel from the Edit tab: route through the card's sealed title handler
+        (config.title + live plot title via style.apply_title) and keep the Setting popup's
+        title field in sync, then re-snapshot + refresh the save preview."""
+        if self.card is None:
+            return
+        self.card._on_title(str(text))            # config.title + sealed live title
+        edit = getattr(self.card, "title_edit", None)
+        if edit is not None and edit.text() != text:
+            with _signals_blocked(edit):
+                edit.setText(str(text))
+        self._update_save_preview()               # default save name follows the title
+        self.rebuild()
+
+    def _run_command(self) -> None:
+        """A one-line REPL on this panel's DataFigure (confocal's ``data_figure.<fn>(...)``).
+        Names exposed: ``data_figure``/``df``, ``fig``, ``ax``, ``plotter``, ``np``.  An
+        expression shows its repr; a statement shows ``ok``; an error shows its message.
+        SECURITY: runs arbitrary local Python -- trusted-input tool, like the Scan tab."""
+        if self._plotter is None or not hasattr(self, "cmd_input"):
+            return
+        text = self.cmd_input.text().strip()
+        if not text:
+            return
+        try:
+            df = self._df_for()
+            ns = {"data_figure": df, "df": df, "fig": self._plotter.fig,
+                  "ax": getattr(self._plotter, "ax", None), "plotter": self._plotter, "np": np}
+            try:
+                value = eval(text, ns)            # noqa: S307 - local experiment tool, trusted input
+                msg = "ok" if value is None else repr(value)
+            except SyntaxError:
+                exec(text, ns)                    # noqa: S102 - a statement, not an expression
+                msg = "ok"
+            if self._canvas is not None:
+                self._canvas.draw_idle()
+            self.cmd_result.setText(str(msg)[:300])
+        except Exception as exc:
+            self.cmd_result.setText(f"error: {str(exc).splitlines()[0][:200]}")
 
     def _apply_snapshot_unit(self) -> None:
         """Cycle the Edit snapshot's x-axis unit ``unit_index`` times from its original,
@@ -2712,22 +2857,48 @@ class PanelEditor(QtWidgets.QWidget):
         except Exception as exc:
             self.status.setText(f"bad limits: {str(exc).splitlines()[0][:100]}")
 
+    def _save_stem(self, timestamp: str | None) -> Path:
+        """The output file stem (no extension) the Save section resolves to.
+
+        ``path`` (the picker) is the base.  With auto-name ON the file is
+        ``<base-or-base/title>_<plot-kind>_<timestamp>`` (unique); a ``timestamp`` of None
+        yields the literal ``<time>`` placeholder for the read-only preview.  With auto-name
+        OFF the base is used VERBATIM (its extension stripped), so the operator sets the exact
+        name.  ONE resolver, shared by :meth:`save` and :meth:`_update_save_preview`."""
+        title = (self.card.config.title or self.card.config.kind).strip() or "panel"
+        kind = self.card.config.kind
+        text = self.save_dir_edit.text().strip() if hasattr(self, "save_dir_edit") else ""
+        base = Path(text) if text else Path(self.console._last_save_dir or _task_files_dir())
+        # a bare folder (blank default / trailing sep / an existing dir) -> the file is
+        # <folder>/<title>; otherwise the path already names the file stem.
+        if not text or str(base).endswith(("/", "\\")) or (base.is_dir() and not base.suffix):
+            base = base / title
+        base = base.with_suffix("")               # we always append our own .png / .npz
+        if hasattr(self, "save_autoname") and self.save_autoname.isChecked():
+            return base.parent / f"{base.name}_{kind}_{timestamp or '<time>'}"   # unique
+        return base                                # verbatim (operator-set name; overwrites)
+
+    def _update_save_preview(self) -> None:
+        """Show the actual file (full path) the next Save writes -- not just the folder."""
+        if not hasattr(self, "save_preview"):
+            return
+        self.save_preview.setText(f"{display_path(str(self._save_stem(None)))}.png + .npz")
+
     def save(self) -> None:
         if self._plotter is None:
             return
         try:
             df = self._df_for()
-            stem = (self.card.config.title or self.card.config.kind).strip() or "panel"
-            # The folder the user chose (defaults to the remembered / tasks/ dir); created if
-            # needed.  Remember it on the console so the next Edit save reopens here.
-            picker = getattr(self, "save_dir_edit", None)
-            folder = Path((picker.text().strip() if picker is not None else "") or _task_files_dir())
-            folder.mkdir(parents=True, exist_ok=True)
-            out = df.save(folder / stem,
+            stem = self._save_stem(time.strftime("%Y_%m_%d_%H_%M_%S", time.localtime()))
+            stem.parent.mkdir(parents=True, exist_ok=True)
+            # a path WITH a suffix makes DataFigure.save write it VERBATIM (no extra timestamp),
+            # so this resolver is the single source of the output name.
+            out = df.save(stem.with_suffix(".png"),
                           extra_info={"source": self.card.config.source,
                                       "kind": self.card.config.kind})
-            self.console._last_save_dir = str(folder)
-            self.status.setText(f"saved {out['figure'].name} + {out['data'].name} → {folder}")
+            self.console._last_save_dir = str(stem.parent)   # remember where (kernel session)
+            self._update_save_preview()
+            self.status.setText(f"saved {out['figure'].name} + {out['data'].name} → {stem.parent}")
         except Exception as exc:
             self.status.setText(f"save failed: {str(exc).splitlines()[0][:120]}")
 
@@ -2966,7 +3137,6 @@ class TaskConsole(QtWidgets.QWidget):
         # `readout_fidelity`, a stopped camera's `frame`).  Cleared only on row removal.
         self._last_node: dict[int, object] = {}
         self._logic_editors: dict[int, "LogicNodeEditor"] = {}  # id(row) -> Edit tab
-        self._last_version = -1
         self._building = False
         self._address: str | None = None
         # The folder the LAST panel "Save Fig" wrote into -- so a panel's Edit-tab save
@@ -2993,12 +3163,18 @@ class TaskConsole(QtWidgets.QWidget):
         self._task_card_frame = None           # last mid-run frame (kept frozen after the task ends)
         self._task_locked = False              # True while a task runs -> all other actions blocked
 
+        # Multi-rate refresh: the timer ticks at the BASE interval (the smallest panel
+        # update_ms, which divides every other so the rates co-align); each panel redraws
+        # every update_ms // base ticks.  _tick_count counts base ticks since the last re-base.
+        self._tick_count = 0
+        self._base_interval_ms = int(self.state.interval_ms)
+
         self._build_ui()
         self.load_state(self.state)
 
         self._timer = QtCore.QTimer(self)
-        self._timer.setInterval(self.state.interval_ms)
         self._timer.timeout.connect(self._tick)
+        self._recompute_tick_interval()          # base = min panel update_ms (sets the interval)
         self._timer.start()
 
     # ------------------------------------------------------------------ UI
@@ -3199,7 +3375,9 @@ class TaskConsole(QtWidgets.QWidget):
             self._arrange()
         finally:
             self._building = False
-        self._last_version = -1            # force a refresh on the next tick
+        for card in self.cards:            # force every panel to redraw on its next beat
+            card._render_version = -1
+        self._recompute_tick_interval()    # the loaded panels' rates set the timer base
         self._update_summary()
 
     def _attach_card(self, card: PanelCard) -> None:
@@ -3207,9 +3385,11 @@ class TaskConsole(QtWidgets.QWidget):
         card.show()
         card.changed.connect(self._mark_dirty)
         card.layout_changed.connect(self._arrange)
+        card.update_interval_changed.connect(self._recompute_tick_interval)
         card.remove_requested.connect(self._remove_panel)
         card.edit_requested.connect(self._edit_card)
         self.cards.append(card)
+        self._recompute_tick_interval()        # a new panel's rate may change the timer base
 
     # ----------------------------------------------------------------- control
     # ---- producing-node discovery: a panel's data comes from a logic node; its Edit
@@ -3614,9 +3794,9 @@ class TaskConsole(QtWidgets.QWidget):
             widget.fill_limits()
 
     def _arrange(self) -> None:
-        # gravity: the just-dragged / resized card keeps its dropped slot (it
-        # wins ties) and every other card falls UP to fill gaps, so the board
-        # stays gap-free, top-packed and overlap-free (see _compact).
+        # free placement: the just-dragged / resized card keeps the grid cell it was
+        # dropped on (any row, empty cells above allowed); only OTHER cards it overlaps
+        # are pushed straight down, minimally (see _compact).
         active = self.sender()
         active_cfg = active.config if isinstance(active, PanelCard) and active in self.cards else None
         if _compact([c.config for c in self.cards], active_cfg):
@@ -3662,6 +3842,7 @@ class TaskConsole(QtWidgets.QWidget):
             card.setParent(None)
             card.deleteLater()
             self._arrange()
+            self._recompute_tick_interval()    # removing the fastest panel can slow the base
             self._mark_dirty()
 
     # ====================================================================== logic nodes
@@ -4072,34 +4253,63 @@ class TaskConsole(QtWidgets.QWidget):
                 frames[str(s)] = list(region)
         return frames
 
+    def _recompute_tick_interval(self) -> None:
+        """Re-base the shared timer to the SMALLEST panel ``update_ms`` (which divides every
+        other rate in :data:`UPDATE_INTERVALS`, so the rates co-align) and reset the tick
+        phase.  Called on add / remove / per-panel rate change, so the timer ticks no faster
+        than the fastest panel actually needs."""
+        base = min((c.config.update_ms for c in self.cards), default=DEFAULT_UPDATE_MS)
+        self._base_interval_ms = max(min(UPDATE_INTERVALS), int(base))
+        self._tick_count = 0                      # re-sync the phase to the new base
+        if getattr(self, "_timer", None) is not None:
+            self._timer.setInterval(self._base_interval_ms)
+
     def _tick(self) -> None:
-        # poll the logic nodes EVERY tick (even when no new signal arrived) so a
-        # one-shot node's run-complete / error transition is never missed if the
-        # node self-stops between version bumps.
+        # poll the logic nodes EVERY base tick (even when no new signal arrived) so a
+        # one-shot node's run-complete / error transition is never missed if the node
+        # self-stops between version bumps.
         self._poll_logic_nodes()
         self._refresh_signal_info()   # cheap + self-guarded: tracks source/node changes
         # A running task's mid-run output is OFF the hub (#6), so it does NOT bump the
-        # hub version -- refresh its dedicated panel here, before the version gate below.
+        # hub version -- refresh its dedicated panel here every tick.
         self._refresh_task_panel()
+        self._tick_count += 1
         version = self.hub.version
-        if version == self._last_version:
-            return
-        self._last_version = version
-        namespace = self._expression_namespace()
+        elapsed = self._tick_count * self._base_interval_ms
+        namespace = None
         for card in self.cards:
+            # this panel's beat?  update_ms is a multiple of the base, so cards that share a
+            # beat fire on the SAME tick -> they read the SAME namespace below (shot-coherent).
+            if elapsed % card.config.update_ms != 0:
+                continue
+            if version == card._render_version:
+                continue                          # nothing new published since it last drew
+            if namespace is None:                 # built ONCE per tick -> one coherent snapshot
+                namespace = self._expression_namespace()
             card.refresh(namespace)
-        # keep the visible Edit tab's 'now:' acquisition references live, so a
-        # queued parameter edit shows as applied once the loop picks it up (one
-        # general hook on the current tab -- no per-field wiring).
+            card._render_version = version
+        # keep the visible Edit tab's 'now:' acquisition references live, so a queued
+        # parameter edit shows as applied once the loop picks it up.
         editor = self.tabs.currentWidget()
         if isinstance(editor, PanelEditor):
             editor.refresh_node_now_labels()
         self._update_summary()
 
     def refresh_once(self) -> None:
-        """Synchronous refresh (tests / notebooks): one tick regardless of the timer."""
-        self._last_version = -1
-        self._tick()
+        """Synchronous FULL refresh (tests / notebooks): render every card now, regardless of
+        its per-panel beat or the version gate."""
+        self._poll_logic_nodes()
+        self._refresh_signal_info()
+        self._refresh_task_panel()
+        version = self.hub.version
+        namespace = self._expression_namespace()
+        for card in self.cards:
+            card.refresh(namespace)
+            card._render_version = version
+        editor = self.tabs.currentWidget()
+        if isinstance(editor, PanelEditor):
+            editor.refresh_node_now_labels()
+        self._update_summary()
 
     def _update_summary(self) -> None:
         try:

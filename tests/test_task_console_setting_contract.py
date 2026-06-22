@@ -376,3 +376,39 @@ def test_display_param_change_rerenders_when_source_is_stopped():
         assert card.plotter is not None, "colormap change while stopped blanked the panel (white screen)"
     finally:
         card.shutdown()
+
+
+def test_setting_has_per_panel_update_combo():
+    """Each panel's Setting carries its OWN refresh-rate combo (UPDATE_INTERVALS); picking a
+    rate persists to config.params['update_ms'] and signals the console to re-base its timer."""
+    from Zou_lab_control.frontend.task_console import UPDATE_INTERVALS, DEFAULT_UPDATE_MS
+    card = _card("1d")
+    try:
+        assert hasattr(card, "update_combo")
+        assert [card.update_combo.itemData(i) for i in range(card.update_combo.count())] == list(UPDATE_INTERVALS)
+        assert card.config.update_ms == DEFAULT_UPDATE_MS
+        fired = []
+        card.update_interval_changed.connect(lambda: fired.append(1))
+        card.update_combo.setCurrentText("100 ms")
+        assert card.config.update_ms == 100      # persisted (round-trips with the layout)
+        assert fired                              # console asked to re-base the shared timer
+    finally:
+        card.shutdown()
+
+
+def test_console_timer_base_is_the_fastest_panel():
+    """The shared timer ticks at the SMALLEST panel update_ms (the harmonic base that divides
+    every other rate, so panels stay phase-aligned); adding a fast 100 ms panel speeds it up."""
+    from Zou_lab_control.frontend.task_console import (
+        TaskConsole, default_console_state, PanelConfig, PanelCard, DEFAULT_UPDATE_MS)
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    console = TaskConsole(hub=SignalHub(), state=default_console_state())
+    console._timer.stop()
+    try:
+        assert console._base_interval_ms == DEFAULT_UPDATE_MS          # default board: 400 ms
+        card = PanelCard(PanelConfig(kind="1d", size="1x2", params={"update_ms": 100}),
+                         names_provider=console.hub.names)
+        console._attach_card(card)
+        assert console._base_interval_ms == 100 and console._timer.interval() == 100
+    finally:
+        console.shutdown()

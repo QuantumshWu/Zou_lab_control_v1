@@ -1241,10 +1241,11 @@ def test_task_console_drag_snaps_to_grid(monkeypatch):
         card.mouseReleaseEvent(_Ev())
     except TypeError:                             # super() needs a real QEvent; snap already ran
         pass
-    # snapped to the dropped column; gravity then pulls it to the top of that empty column.
+    # FREE placement: the dropped card snaps to the grid CELL it was dropped on and STAYS there
+    # (row 4) -- empty cells above are allowed; it is NOT pulled up to the top.
     assert card.config.col == free_col
-    assert card.config.row == 0
-    assert (card.x(), card.y()) == _slot_to_pos(0, free_col)
+    assert card.config.row == 4
+    assert (card.x(), card.y()) == _slot_to_pos(4, free_col)
     assert _pos_to_slot(*_slot_to_pos(7, 3)) == (7, 3)   # slot<->pos round-trip
     assert console.save_button.is_dirty()         # a moved panel is an unsaved edit
     console.shutdown()
@@ -1276,15 +1277,15 @@ def test_fluent_auto_scale_is_shared_between_guis(monkeypatch):
         set_fluent_scale(1.0)
 
 
-def test_task_console_layout_is_gravity_compacted():
-    """The board auto-layout is GRAVITY compaction (``_compact``): every card
-    falls UP within its columns until it rests on the card above or the top, so
-    the result is always overlap-free AND gap-free (top-packed).  The dragged
-    (``active``) card wins ties so it keeps the slot the user dropped it on.
+def test_task_console_layout_is_free_placement():
+    """The board auto-layout is FREE PLACEMENT (``_compact``): a card keeps the grid CELL it
+    sits on -- ANY row, with empty cells ABOVE allowed -- and the ONLY thing resolved is
+    overlaps, by pushing the OTHER cards straight DOWN to rest just below what they collide
+    with (minimal displacement).  Cards do NOT float up to the top.  The dropped (``active``)
+    card is pinned, so it wins and the others reflow around it.
 
-    Pure-function contract (PanelConfig has no Qt), so it does NOT pull in the
-    flaky demo_console GUI fixture.  Guards both jobs the single rule must do:
-    push overlapped cards out of the way, and pull cards up to fill holes."""
+    Pure-function contract (PanelConfig has no Qt), so it does NOT pull in the flaky
+    demo_console GUI fixture."""
 
     from Zou_lab_control.frontend.task_console import PanelConfig, _compact, _columns_overlap
 
@@ -1294,8 +1295,8 @@ def test_task_console_layout_is_gravity_compacted():
                 if _columns_overlap(a, b):
                     assert not (a.row < b.row + b.rows and b.row < a.row + a.rows), (a.title, b.title)
 
-    # (1) drop a card onto an occupied column: active keeps (0,0), the other is
-    #     pushed strictly below -- no overlap.
+    # (1) drop a card onto an occupied cell: active keeps its slot, the other is pushed
+    #     strictly below it -- minimal (just below the active card's full span).
     a = PanelConfig(kind="2d", title="A", row=0, col=0, size="2x2")
     b = PanelConfig(kind="2d", title="B", row=0, col=0, size="2x2")   # dropped onto A
     _compact([a, b], active=b)
@@ -1303,25 +1304,28 @@ def test_task_console_layout_is_gravity_compacted():
     assert a.row == b.rows                      # pushed strictly below B (by B's full span)
     no_overlap([a, b])
 
-    # (2) gravity fills vertical gaps: a lone card left floating falls to the top.
+    # (2) FREE placement: a card sitting below empty space STAYS there (no float-up) --
+    #     the board does not pull it to the top, and _compact reports no move.
     x = PanelConfig(kind="1d", title="X", row=0, col=0, size="1x2")
-    y = PanelConfig(kind="1d", title="Y", row=5, col=0, size="1x2")   # big gap below X
-    assert _compact([x, y]) is True
-    assert (x.row, y.row) == (0, x.rows)       # Y rose to sit right under X (X's span), no gap
+    y = PanelConfig(kind="1d", title="Y", row=5, col=0, size="1x2")   # empty cells above Y
+    assert _compact([x, y]) is False
+    assert (x.row, y.row) == (0, 5)            # Y keeps row 5 -- empty above is allowed
 
-    # (3) independent columns coexist on the same rows (no false collisions).  A separate
-    #     column starts past the first card's full slot span (the snap grid is fine, so a
-    #     1x2 card spans many slots -- ``cols`` -- not 2).
+    # (3) drop active onto a card with empty space above: active keeps its (non-zero) row,
+    #     the other is pushed JUST below it (minimal -- not to the top, no gratuitous gap).
+    occ = PanelConfig(kind="1d", title="occ", row=2, col=0, size="1x2")
+    drop = PanelConfig(kind="1d", title="drop", row=2, col=0, size="1x2")
+    assert _compact([occ, drop], active=drop) is True
+    assert drop.row == 2                        # the dropped card stays where dropped (empty above)
+    assert occ.row == drop.row + drop.rows      # displaced just below it (minimal push)
+    no_overlap([occ, drop])
+
+    # (4) independent columns keep their own rows (no false collisions, no float-up).
     left = PanelConfig(kind="1d", title="L", row=4, col=0, size="1x2")
     right = PanelConfig(kind="1d", title="R", row=9, col=PanelConfig(kind="1d", size="1x2").cols, size="1x2")
-    _compact([left, right])
-    assert left.row == 0 and right.row == 0    # both float up to the top, side by side
+    assert _compact([left, right]) is False
+    assert left.row == 4 and right.row == 9
     no_overlap([left, right])
-
-    # (4) already top-packed layout is a no-op (returns False, nothing moves).
-    p = PanelConfig(kind="2d", title="P", row=0, col=0, size="2x2")
-    q = PanelConfig(kind="hist", title="Q", row=0, col=p.cols, size="1x2")
-    assert _compact([p, q]) is False
 
 
 def test_task_console_cards_have_fluent_shadow(monkeypatch):
