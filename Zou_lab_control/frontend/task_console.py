@@ -1091,25 +1091,27 @@ class PanelCard(FluentGroupBox):
         anchor = self.setting_button.mapToGlobal(
             QtCore.QPoint(self.setting_button.width(), self.setting_button.height()))
         popup.adjustSize()
-        # Cap the popup HEIGHT to THIS panel's own frame height (per-panel, so a tall panel gets a
-        # tall settings popup and a short panel a short one) -- the settings frame must not exceed
-        # the panel it belongs to; when its sections are taller the FluentScrollArea scrolls them
-        # VERTICALLY (never horizontally -- the popup keeps its natural width).  A small floor keeps
-        # a tiny panel's popup usable; a screen clamp keeps it on-screen as a backstop.
+        # The popup opens just BELOW the gear (near the panel's TOP).  Cap its height so its BOTTOM
+        # never passes the panel's OWN bottom edge -- i.e. cap = (panel bottom) - (popup top), NOT
+        # the full panel height (capping to the height while anchored below the gear would push the
+        # popup a gear-height PAST the panel bottom, which is the overflow the user saw).  So a tall
+        # panel gets a tall popup, a short panel a short one, and either way it stays within the
+        # panel's frame; the FluentScrollArea scrolls the overflow VERTICALLY (never horizontally).
         screen = QtWidgets.QApplication.primaryScreen()
         avail = screen.availableGeometry() if screen is not None else None
-        w, h = popup.width(), popup.height()
-        cap = max(scaled_px(180), self.height())          # this panel's frame height
+        top_y = anchor.y() + scaled_px(2)
+        panel_bottom = self.mapToGlobal(QtCore.QPoint(0, self.height())).y()
+        cap = max(scaled_px(140), panel_bottom - top_y)   # fit between popup top and panel bottom
         if avail is not None:
-            cap = min(cap, int(avail.height() * 0.95))     # never taller than the screen
+            cap = min(cap, avail.bottom() - top_y)         # never run off the screen either
+        w = popup.width()
+        h = min(popup.height(), cap)
         popup.setMaximumHeight(cap)
-        h = min(h, cap)
         popup.resize(w, h)
-        x, y = anchor.x() - w, anchor.y() + scaled_px(2)
+        x = anchor.x() - w
         if avail is not None:
             x = max(avail.left(), min(x, avail.right() - w))
-            y = max(avail.top(), min(y, avail.bottom() - h))
-        popup.move(x, y)
+        popup.move(x, top_y)
         popup.show()
         popup.raise_()
 
@@ -3878,7 +3880,12 @@ class TaskConsole(QtWidgets.QWidget):
                     tag = self._node_label(src)
                     tag = f"{tag} [{layer}]" if layer and layer != "node" else tag
                     note = "  ⚠ also from another node" if len(providers.get(name, [])) > 1 else ""
-                    parts.append(f"{name} ← {tag}{note}")
+                    # The producing node is named to the RIGHT of the arrow, so the signal need
+                    # not repeat its prefix: show "rate ← occupancy", not "judge_occupancy_rate ←
+                    # occupancy" (same brevity the nested combo uses).
+                    pfx = str(getattr(src, "prefix", "") or "")
+                    short = name[len(pfx):] if (pfx and name.startswith(pfx) and len(name) > len(pfx)) else name
+                    parts.append(f"{short} ← {tag}{note}")
                 else:
                     parts.append(f"{name} ← (no running source)")
             if not reads:
