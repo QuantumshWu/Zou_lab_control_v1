@@ -327,7 +327,8 @@ def test_setting_keeps_display_params_functional_scalars_go_to_edit():
     plus ONE signal picker per :func:`panel_input_slots` slot (signal[0], signal[1], ...),
     while FUNCTIONAL scalar params (length / bins) live in the panel's Edit tab.  So a 2d
     panel's Setting shows cmap but NOT length; a monitor panel shows no param widget; and
-    the site map shows its THREE input-slot pickers (occupancy + centers + image)."""
+    the site map shows its ONE input-slot picker (the occupancy signal; its centres + frame
+    underlay auto-resolve from the producing node, not extra slots)."""
     from Zou_lab_control.frontend.task_console import PANEL_PARAMS, panel_input_slots
 
     # the ONLY display=True param is the colormap chooser; every other param is a
@@ -359,6 +360,63 @@ def test_setting_keeps_display_params_functional_scalars_go_to_edit():
         assert len(sites.slot_combos) == len(panel_input_slots("sites")) == 1
     finally:
         sites.shutdown()
+
+
+def test_multi_signal_slots_let_an_expression_index_signal_i():
+    """#6: a non-site panel can ADD signal slots so the source expression combines several
+    signals.  ONE slot -> ``signal`` is the scalar value (so ``value = signal`` plots it);
+    TWO+ slots -> ``signal`` is a list, so ``value = signal[0] - signal[1]`` reads each slot
+    by index.  Add seeds the canonical two-signal expression; remove restores ``value = signal``."""
+    import numpy as np
+    from Zou_lab_control.frontend.task_console import PanelCard
+
+    card = _card("1d", source="value = signal")
+    try:
+        assert len(card.slot_combos) == 1               # one slot by default
+        card.config.inputs = ["a"]
+        ns = {"a": np.arange(4.0), "b": np.ones(4)}
+        scalar = PanelCard._with_signal_slots(card, ns)["signal"]
+        assert np.allclose(scalar, np.arange(4.0))       # single slot -> scalar `signal`
+
+        card._add_signal_slot()                          # + signal
+        assert len(card.slot_combos) == 2
+        assert card.config.source == "value = signal[0] - signal[1]"   # seeded default
+        card.config.inputs = ["a", "b"]
+        sig = PanelCard._with_signal_slots(card, ns)["signal"]
+        assert isinstance(sig, list) and len(sig) == 2   # >1 slot -> list `signal`
+        assert np.allclose(sig[0], ns["a"]) and np.allclose(sig[1], ns["b"])
+        # the difference expression the user would type evaluates to signal[0]-signal[1]
+        assert np.allclose(np.asarray(sig[0]) - np.asarray(sig[1]), np.arange(4.0) - 1.0)
+
+        card._remove_signal_slot()                       # − signal
+        assert len(card.slot_combos) == 1
+        assert card.config.source == "value = signal"    # restored
+    finally:
+        card.shutdown()
+
+
+def test_signal_combo_groups_signals_under_their_producer():
+    """#5b: the signal picker is a TWO-LEVEL list -- a non-selectable header per producing node,
+    its signals indented beneath -- so the producer is named ONCE (the group) instead of being
+    repeated in every signal label (which made the labels too long)."""
+    from Zou_lab_control.frontend.task_console import PanelCard
+
+    card = _card("1d")
+    try:
+        # two signals from two different producers
+        card.names_provider = lambda: ["occupied", "rate"]
+        card.sources_provider = lambda: {"occupied": ["occupancy"], "rate": ["loading"]}
+        card.formats_provider = lambda: {"occupied": "(N,)", "rate": "(N,)"}
+        items = card._signal_combo_items()
+        # producer headers carry a None bare-name; signals carry their bare name and are indented
+        headers = [disp for disp, bare in items if bare is None]
+        signals = [(disp, bare) for disp, bare in items if bare is not None]
+        assert "occupancy" in headers and "loading" in headers       # grouped by producer
+        assert {bare for _disp, bare in signals} == {"occupied", "rate"}
+        # the signal labels do NOT repeat the producer name (that was the "too long" bug)
+        assert all("occupancy" not in disp and "loading" not in disp for disp, _b in signals)
+    finally:
+        card.shutdown()
 
 
 def test_display_param_change_rerenders_when_source_is_stopped():

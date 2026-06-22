@@ -543,13 +543,13 @@ def test_save_persists_edit_param_values_not_just_layout():
         row = console.logic_nodes[-1]
         editor = console._logic_editors[id(row)]
         # edit a param in the Edit form WITHOUT starting the node
-        editor.form._widgets["calibration_frames"][1].setValue(9)
+        editor.form._widgets["threshold_frames"][1].setValue(9)
         # read_state flushes the open Edit form into the node config
         state = console.read_state()
-        assert state.logic[-1].values["calibration_frames"] == 9
+        assert state.logic[-1].values["threshold_frames"] == 9
         # round-trip through JSON -> the edited value survives load
         restored = TaskConsoleState.from_dict(state.to_dict())
-        assert restored.logic[-1].values["calibration_frames"] == 9
+        assert restored.logic[-1].values["threshold_frames"] == 9
     finally:
         console.shutdown()
         exp.close()

@@ -220,9 +220,10 @@ PANEL_PARAMS: dict[str, tuple[ParamSpec, ...]] = {
     "sites": (
         # A site map is a binary occupancy OVERLAY (faint ring = empty, bold ring =
         # occupied) on the camera FRAME.  The colormap applies to that frame underlay
-        # (its counts colorbar); the rings carry no scale.  Its THREE signal inputs
-        # (occupancy / centers / image) are SLOTS (PANEL_INPUT_SLOTS), picked in the
-        # Setting's Source section as signal[0..2] -- NOT params here.
+        # (its counts colorbar); the rings carry no scale.  It takes ONE signal input --
+        # the per-site occupancy (PANEL_INPUT_SLOTS["sites"], picked in the Setting's Source
+        # section); its ring CENTRES and the frame UNDERLAY auto-resolve from that signal's
+        # producing node, so they are NOT extra slots or params here.
         ParamSpec("cmap", "colormap", "choice", "gray", choices=CMAPS,
                   tooltip="Colormap for the camera-frame underlay", display=True),
     ),
@@ -789,7 +790,22 @@ class PanelCard(FluentGroupBox):
         # Painting the card also means no border stylesheet rule can cascade
         # onto child labels/controls.
         popup = FluentPopup(self)
-        root = QtWidgets.QVBoxLayout(popup)
+        # The sections (Source / Display / Unit / Limits / Panel) can stack taller than the
+        # screen when a panel has many signals -> wrap them in a FluentScrollArea so the popup
+        # never exceeds the visible area (it scrolls instead of running off / overflowing the
+        # panel).  The scroll viewport is transparent so FluentPopup's painted rounded card
+        # still shows through; the height is capped in _open_settings.
+        popup_outer = QtWidgets.QVBoxLayout(popup)
+        popup_outer.setContentsMargins(0, 0, 0, 0)
+        self._settings_scroll = FluentScrollArea()
+        self._settings_scroll.setWidgetResizable(True)
+        self._settings_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self._settings_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        popup_content = QtWidgets.QWidget()
+        popup_content.setStyleSheet("background: transparent;")
+        self._settings_scroll.setWidget(popup_content)
+        popup_outer.addWidget(self._settings_scroll)
+        root = QtWidgets.QVBoxLayout(popup_content)
         pad = scaled_px(10)
         root.setContentsMargins(pad, pad, pad, pad)
         root.setSpacing(scaled_px(10, minimum=6))
@@ -798,9 +814,18 @@ class PanelCard(FluentGroupBox):
         # label is normally "colormap", but a multi-input plot adds slot rows like
         # "signal[0] occupancy" -- measure every label this popup will show and widen the
         # column to the widest (floored at 80 px), so all rows still align and read fully.
-        slots = panel_input_slots(self.config.kind)
-        slot_labels = [(f"signal[{i}] {sl}" if len(slots) > 1 else "signal")
-                       for i, (sl, _d, _t) in enumerate(slots)]
+        base_slots = panel_input_slots(self.config.kind)
+        # The site map has ONE fixed occupancy slot (its centres + underlay auto-resolve from
+        # the producing node, never extra slots); every other plot kind supports MULTI-INPUT --
+        # the user can ADD signal slots so an expression reads signal[0], signal[1], ...  (e.g.
+        # `value = signal[0] - signal[1]`).  The slot count = the base, grown to fit however many
+        # the user has added (config.inputs), never fewer than one.
+        self._multi_slot = self.config.kind != "sites"
+        n_slots = max(1, len(base_slots), len(self.config.inputs)) if self._multi_slot else max(1, len(base_slots))
+        slot_labels = [(f"signal[{i}]" if n_slots > 1 else "signal") for i in range(n_slots)]
+        slot_tips = [base_slots[i][2] if i < len(base_slots)
+                     else f"an added signal slot — read as signal[{i}] in the expression"
+                     for i in range(n_slots)]
         fm = self.fontMetrics()
         widest = max((fm.horizontalAdvance(t) for t in [*slot_labels, "colormap", "threshold"]), default=0)
         label_w = max(scaled_px(80, minimum=56), widest + scaled_px(10))
@@ -830,13 +855,32 @@ class PanelCard(FluentGroupBox):
         # in the expression).  A site map needs only its occupancy signal; its ring centres
         # + frame underlay are resolved from the SAME producing node, never extra slots.
         self.slot_combos: list = []
-        for i, (slabel, _default, stip) in enumerate(slots):
+        for i in range(n_slots):
             combo = FluentComboBox()
-            combo.setToolTip(stip + "\nSets the source to `value = signal`.")
+            combo.setToolTip(slot_tips[i] + (
+                "\nSets the source to `value = signal`." if n_slots == 1
+                else f"\nRead as signal[{i}] in the expression (e.g. value = signal[0] - signal[1])."))
             combo.activated.connect(lambda _ix, idx=i: self._on_slot_pick(idx))
             self.slot_combos.append(combo)
             sec.addWidget(FluentSettingRow(slot_labels[i], combo, label_width=label_w))
-        self.signal_combo = self.slot_combos[0]    # the signal picker
+        self.signal_combo = self.slot_combos[0]    # the (first) signal picker
+        # Add / remove signal slots (every kind except the site map): so a panel can combine
+        # several signals -- e.g. plot the DIFFERENCE of two occupancies with signal[0]-signal[1].
+        if self._multi_slot:
+            self.add_slot_button = FluentButton("+ signal", color=GREY)
+            self.add_slot_button.setToolTip("Add another signal slot (read as signal[i] in the expression).")
+            self.add_slot_button.clicked.connect(self._add_signal_slot)
+            self.remove_slot_button = FluentButton("− signal", color=GREY)
+            self.remove_slot_button.setToolTip("Remove the last signal slot.")
+            self.remove_slot_button.clicked.connect(self._remove_signal_slot)
+            self.remove_slot_button.setEnabled(n_slots > 1)
+            slot_btn_row = QtWidgets.QHBoxLayout()
+            slot_btn_row.setContentsMargins(0, 0, 0, 0)
+            slot_btn_row.setSpacing(scaled_px(6, minimum=4))
+            slot_btn_row.addWidget(self.add_slot_button, 0)
+            slot_btn_row.addWidget(self.remove_slot_button, 0)
+            slot_btn_row.addStretch(1)
+            sec.addLayout(slot_btn_row)
 
         self.source_edit = FluentLineEdit(self.config.source)
         self.source_edit.setMinimumWidth(scaled_px(280, minimum=220))
@@ -844,8 +888,10 @@ class PanelCard(FluentGroupBox):
             self.source_edit.styleSheet() + " QLineEdit { font-family: Consolas, monospace; }")
         self.source_edit.setToolTip(
             "Panel data source: one line of Python evaluated against the live signals.\n"
-            "Assign the result to `value`.  Namespace: every signal name (latest value),\n"
-            "history(name, n), latest(name), names(), shot, np, math.")
+            "Assign the result to `value`.  `signal` is the picked signal (one slot); with more\n"
+            "than one slot it is a list, so `value = signal[0] - signal[1]` combines them.\n"
+            "Namespace: every signal name (latest value), history(name, n), latest(name),\n"
+            "names(), shot, np, math.")
         self.apply_button = FluentButton("Apply", color=GREEN)
         self.apply_button.setFixedWidth(scaled_px(64, minimum=52))
         self.apply_button.clicked.connect(self._apply_source)
@@ -1025,14 +1071,34 @@ class PanelCard(FluentGroupBox):
         anchor = self.setting_button.mapToGlobal(
             QtCore.QPoint(self.setting_button.width(), self.setting_button.height()))
         popup.adjustSize()
-        popup.move(anchor.x() - popup.width(), anchor.y() + scaled_px(2))
+        # Cap the popup to the visible screen so a tall settings list (many signals) never runs
+        # off the edge -- the FluentScrollArea scrolls the overflow instead.  Keep the card fully
+        # on screen (clamp x/y), opening it ABOVE the button when there is no room below.
+        screen = QtWidgets.QApplication.primaryScreen()
+        avail = screen.availableGeometry() if screen is not None else None
+        w, h = popup.width(), popup.height()
+        if avail is not None:
+            cap = int(avail.height() * 0.9)
+            popup.setMaximumHeight(cap)
+            h = min(h, cap)
+            popup.resize(w, h)
+        x, y = anchor.x() - w, anchor.y() + scaled_px(2)
+        if avail is not None:
+            x = max(avail.left(), min(x, avail.right() - w))
+            y = max(avail.top(), min(y, avail.bottom() - h))
+        popup.move(x, y)
         popup.show()
         popup.raise_()
 
-    def _signal_combo_items(self) -> list[tuple[str, str]]:
-        """``[(display, bare_name)]`` for every LIVE hub signal, each labelled
-        ``name — source  [shape]`` -- the SINGLE source the panel's signal picker shares,
-        so a signal is picked the same way everywhere (by origin + shape, not typed)."""
+    def _signal_combo_items(self) -> list[tuple[str, str | None]]:
+        """``[(display, bare_name)]`` for the signal picker, GROUPED by producing node so the
+        list reads as a TWO-LEVEL picker: a non-selectable bold header per measurement /
+        processor (its ``bare_name`` is ``None``), then that node's signals indented beneath
+        it, each labelled ``name  [shape]`` -- the producer appears ONCE as the group rather
+        than repeated in every signal label (so the labels stay short).  A signal produced by
+        more than one running node is listed under each; a signal with no running producer is
+        grouped under a trailing ``(unbound)`` header.  The SINGLE source the panel's signal
+        picker shares, so a signal is picked the same way everywhere (by origin + shape)."""
         names: list[str] = []
         if callable(self.names_provider):
             try:
@@ -1051,32 +1117,44 @@ class PanelCard(FluentGroupBox):
                 formats = dict(self.formats_provider())
             except Exception:
                 formats = {}
-        items: list[tuple[str, str]] = []
+        # group bare names UNDER their producing node (a name with >1 producer is listed under
+        # each; an unbound name lands in the trailing "(unbound)" group).
+        by_producer: dict[str, list[str]] = {}
         for name in names:
-            producers = sources.get(name) or []
-            fmt = formats.get(name)
-            label = name
-            if producers:
-                label += f" — {', '.join(str(p) for p in producers)}"
-            if fmt:
-                label += f"  [{fmt}]"                 # show the signal's SHAPE too
-            items.append((label, name))
+            producers = [str(p) for p in (sources.get(name) or [])] or ["(unbound)"]
+            for p in producers:
+                by_producer.setdefault(p, []).append(name)
+        items: list[tuple[str, str | None]] = []
+        for producer in sorted(by_producer, key=lambda p: (p == "(unbound)", p.lower())):
+            items.append((producer, None))            # group header (rendered disabled + bold)
+            for name in by_producer[producer]:
+                fmt = formats.get(name)
+                label = f"    {name}" + (f"  [{fmt}]" if fmt else "")   # indented under its node
+                items.append((label, name))
         return items
 
     def _fill_slot_combo(self, combo, current: str) -> None:
-        """Populate ONE slot combobox with ``(none)`` + every live hub signal (each
-        labelled ``name — source [shape]`` via :meth:`_signal_combo_items`), keeping the
-        slot's current pick selected even when its source node is not running yet (so a
-        saved layout's ``signal[1]`` survives a restart)."""
+        """Populate ONE slot combobox with ``(none)`` + every live hub signal GROUPED by its
+        producing node (via :meth:`_signal_combo_items`): each group header is a non-selectable
+        bold row, its signals indented under it.  Keeps the slot's current pick selected even
+        when its source node is not running yet (so a saved layout's ``signal[1]`` survives a
+        restart)."""
         cur = str(current or "")
         with _signals_blocked(combo):
             combo.clear()
             combo.addItem("(none)", "")
             items = self._signal_combo_items()
-            have = {bare for _, bare in items}
+            have = {bare for _, bare in items if bare}
             for label, name in items:
-                combo.addItem(label, name)         # text shows source + shape; data is the bare name
-            if cur and cur not in have:             # preserve a not-yet-published name
+                if name is None:                      # a group header: visible, but not selectable
+                    combo.addItem(label, None)
+                    item = combo.model().item(combo.count() - 1)
+                    if item is not None:
+                        item.setEnabled(False)
+                        font = item.font(); font.setBold(True); item.setFont(font)
+                    continue
+                combo.addItem(label, name)            # indented signal; data is the bare name
+            if cur and cur not in have:               # preserve a not-yet-published name
                 combo.addItem(f"{cur}  (not yet published)", cur)
             idx = combo.findData(cur)
             combo.setCurrentIndex(idx if idx >= 0 else 0)
@@ -1099,9 +1177,46 @@ class PanelCard(FluentGroupBox):
         while len(self.config.inputs) <= idx:
             self.config.inputs.append("")
         self.config.inputs[idx] = name
-        if idx == 0:
+        # Single-slot: the picker IS the "plot this signal" control -> point the source at it
+        # (value = signal).  Multi-slot: the expression (value = signal[0] - signal[1]) is
+        # user-authored and combines the slots, so a pick just rebinds slot idx -- don't clobber it.
+        if len(self.slot_combos) <= 1 and idx == 0:
             self.source_edit.setText("value = signal" if name else _BLANK_SOURCE)
         self._apply_source()                      # picking a slot applies instantly
+
+    def _add_signal_slot(self) -> None:
+        """Add a signal slot (signal[i]) so the panel can combine more signals.  When growing
+        from one slot to two, seed the canonical two-signal expression so the panel is usable
+        at once; the user can edit it.  Rebuilds the Setting popup so the new row appears."""
+        self.config.inputs.append("")
+        if len(self.config.inputs) == 2 and self.config.source.strip() in ("value = signal", "", _BLANK_SOURCE.strip()):
+            self.config.source = "value = signal[0] - signal[1]"
+            self._compiled_source = self.config.source
+        self._rebuild_settings_popup()
+        self._apply_source()
+
+    def _remove_signal_slot(self) -> None:
+        """Remove the LAST signal slot (never below one).  Back at a single slot, restore the
+        canonical ``value = signal`` so the picker drives the plot again."""
+        if len(self.config.inputs) <= 1:
+            return
+        self.config.inputs.pop()
+        if len(self.config.inputs) == 1:
+            self.config.source = "value = signal" if self.config.inputs[0] else _BLANK_SOURCE
+            self._compiled_source = self.config.source
+        self._rebuild_settings_popup()
+        self._apply_source()
+
+    def _rebuild_settings_popup(self) -> None:
+        """Rebuild + reopen the Setting popup (the slot count is fixed at build time, so adding /
+        removing a slot rebuilds it) so the new combo row shows without the user re-clicking."""
+        old = getattr(self, "settings_popup", None)
+        if old is not None:
+            old.hide()
+            old.deleteLater()
+        self._build_settings()                    # builds a fresh self.settings_popup + combos
+        self._settings_dismissed_at = 0.0
+        self._open_settings()                     # reopen (positioned + height-capped)
 
     # ------------------------------------------------ basic display toggles
     def _current_unit_text(self) -> str:
@@ -1360,17 +1475,26 @@ class PanelCard(FluentGroupBox):
         source ``value = signal`` plots the picked signal; an expression can still read it as
         ``value = np.log(signal)`` or name a hub signal directly."""
         ns = dict(namespace)
-        primary = str(self.config.inputs[0]) if self.config.inputs else ""
-        # Shot-coherence: if a running occupancy processor is JUDGING this camera frame,
-        # read the frame it actually judged (`frame_judged`) instead of the camera's live
-        # (newer) frame -- so a 2D-image bound to `frame` and a site-map bound to `occupied`
-        # show the SAME shot.  Falls through to the live frame when nothing judges it.
-        if primary and callable(self.frame_coherence_provider):
-            try:
-                primary = str(self.frame_coherence_provider(primary)) or primary
-            except Exception:
-                pass
-        ns["signal"] = ns.get(primary) if primary else None
+
+        def _resolve(name: str):
+            # Shot-coherence: if a running occupancy processor is JUDGING this camera frame,
+            # read the frame it actually judged (`frame_judged`) instead of the camera's live
+            # (newer) frame -- so a 2D-image bound to `frame` and a site-map bound to `occupied`
+            # show the SAME shot.  Falls through to the live frame when nothing judges it.
+            if name and callable(self.frame_coherence_provider):
+                try:
+                    name = str(self.frame_coherence_provider(name)) or name
+                except Exception:
+                    pass
+            return ns.get(name) if name else None
+
+        resolved = [_resolve(str(n)) for n in self.config.inputs]
+        # ONE slot (the common case): `signal` is the scalar value, so the default
+        # `value = signal` plots the picked signal (and `value = np.log(signal)` etc. still
+        # work).  MORE than one slot (the user added signal slots): `signal` is a LIST, so an
+        # expression combines them by index -- `value = signal[0] - signal[1]` is the
+        # difference of the two picked signals.  signal[i] is the i-th slot's current value.
+        ns["signal"] = (resolved[0] if resolved else None) if len(resolved) <= 1 else resolved
         return ns
 
     def _evaluate(self, namespace: dict[str, object]):
@@ -2472,9 +2596,15 @@ class PanelEditor(QtWidgets.QWidget):
             self.save_button.setToolTip("Save the edited figure (png) + matching data (npz).")
             col.addWidget(FluentSettingRow(
                 "name", _inline(self.save_autoname, trailing=self.save_button), label_width=proc_lw))
-            self.save_preview = FluentLabel("")
-            self.save_preview.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
-            self.save_preview.setWordWrap(True)
+            # The previewed file path is a read-only-but-COPYABLE field (NOT a word-wrap label):
+            # a long absolute path has no spaces to wrap on, so a word-wrap label would force its
+            # own width to the full path and DRAG the whole Edit panel wider (the bug).  A
+            # FluentReadoutEdit is a QLineEdit -- its size hint is content-INDEPENDENT (it scrolls
+            # a long path instead of widening), so the panel width never tracks the path length,
+            # and the resolved name stays selectable + Ctrl-C-able.
+            self.save_preview = FluentReadoutEdit("")
+            self.save_preview.setToolTip("The exact file that will be written — read-only, select to copy.")
+            self.save_preview.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
             col.addWidget(FluentSettingRow("file", self.save_preview, label_width=proc_lw))
             self.save_dir_edit.changed.connect(lambda *_: self._update_save_preview())
             self.save_autoname.toggled.connect(lambda *_: self._update_save_preview())
@@ -3394,6 +3524,10 @@ class TaskConsole(QtWidgets.QWidget):
         card.setParent(self.board)
         card.show()
         card.changed.connect(self._mark_dirty)
+        # Picking a signal / editing the source expression changes which signal the panel
+        # reads -> refresh the frame-title legend NOW (it is self-guarded, so this is cheap and
+        # a no-op when nothing changed), instead of lagging a tick behind the pick.
+        card.changed.connect(self._refresh_signal_info)
         card.layout_changed.connect(self._arrange)
         card.update_interval_changed.connect(self._recompute_tick_interval)
         card.remove_requested.connect(self._remove_panel)
@@ -3798,10 +3932,14 @@ class TaskConsole(QtWidgets.QWidget):
         widget.deleteLater()
 
     def _on_tab_changed(self, _index: int) -> None:
-        # re-snapshot a PanelEditor's frozen limits when its tab is shown
+        # Opening an Edit tab must show CURRENT state, not a stale snapshot from when it was
+        # last shown / ticked: re-snapshot a PanelEditor's frozen manual-limit fields AND
+        # refresh its 'now: <value>' acquisition references to the source's current values
+        # (the params may have changed since the tab was last visible).
         widget = self.tabs.currentWidget()
         if isinstance(widget, PanelEditor):
             widget.fill_limits()
+            widget.refresh_node_now_labels()
 
     def _arrange(self) -> None:
         # free placement: the just-dragged / resized card keeps the grid cell it was

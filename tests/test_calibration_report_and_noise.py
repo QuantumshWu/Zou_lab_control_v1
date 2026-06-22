@@ -67,7 +67,7 @@ def test_calibrate_writes_distribution_and_fidelity_report(tmp_path):
         folder = tmp_path / "cal_run"
         task = exp.readout.calibrate_task(
             hub, source="live", threshold_method="otsu",
-            calibration_frames=10, threshold_frames=40,
+            threshold_frames=40,
             sitemap_exposure=0.05, readout_exposure=0.02, folder=str(folder))
         task.run_to_completion()
 
@@ -133,7 +133,7 @@ def test_reference_bracket_gives_distinct_per_method_fidelity():
     exp = na.connect("virtual", sitemap={"grid_shape": (4, 5), "image_shape": (80, 100)}, seed=5)
     try:
         task = exp.readout.calibrate_task(
-            SignalHub(), source="live", calibration_frames=6, threshold_frames=160,
+            SignalHub(), source="live", threshold_frames=160,
             sitemap_exposure=0.03, readout_exposure=5e-4)        # short readout -> not saturated
         task.run_to_completion()
         # the bracket frames were kept, grouped (n_ref long frames + one short readout each)
@@ -174,7 +174,7 @@ def test_overlapping_readout_reports_sub_unity_fidelity_and_per_method_summary(t
     exp = na.connect("virtual", sitemap={"grid_shape": (4, 5), "image_shape": (80, 100)}, seed=5)
     try:
         task = exp.readout.calibrate_task(
-            SignalHub(), source="live", calibration_frames=6, threshold_frames=200,
+            SignalHub(), source="live", threshold_frames=200,
             sitemap_exposure=0.03, readout_exposure=3e-4)        # very short -> populations OVERLAP
         task.run_to_completion()
         summary = write_calibration_report(

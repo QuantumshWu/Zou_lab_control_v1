@@ -683,7 +683,7 @@ class CalibrateReadoutTask(Task):
                  grid_shape: tuple[int, int] = (5, 7), roi_radius: int = 1,
                  sitemap_exposure: float = 0.05, readout_exposure: float = 0.02,
                  pulse_template: str = DEFAULT_PULSE_TEMPLATE,
-                 calibration_frames: int = 30, threshold_frames: int = 100,
+                 threshold_frames: int = 100,
                  threshold_method: str = "otsu",
                  source: str = "live", folder: str = "calibrations",
                  save_frames: bool = True,
@@ -708,7 +708,6 @@ class CalibrateReadoutTask(Task):
         self.sitemap_exposure = float(sitemap_exposure)
         self.readout_exposure = float(readout_exposure)
         self.pulse_template = str(pulse_template or self.DEFAULT_PULSE_TEMPLATE)
-        self.calibration_frames = max(1, int(calibration_frames))
         self.threshold_frames = max(2, int(threshold_frames))
         self.threshold_method = str(threshold_method)
         # ONE folder for input + output (no blank paths); ``source`` decides how it's used.
@@ -738,7 +737,6 @@ class CalibrateReadoutTask(Task):
             "sitemap_exposure": float(self.sitemap_exposure),
             "readout_exposure": float(self.readout_exposure),
             "roi_radius": int(self.roi_radius),
-            "calibration_frames": int(self.calibration_frames),
             "threshold_frames": int(self.threshold_frames),
             "threshold_method": str(self.threshold_method),
         }
@@ -760,8 +758,6 @@ class CalibrateReadoutTask(Task):
             self.readout_exposure = float(values["readout_exposure"])
         if "roi_radius" in values:
             self.roi_radius = int(values["roi_radius"])
-        if "calibration_frames" in values:
-            self.calibration_frames = max(1, int(values["calibration_frames"]))
         if "threshold_frames" in values:
             self.threshold_frames = max(2, int(values["threshold_frames"]))
         if "threshold_method" in values:
@@ -830,63 +826,56 @@ class CalibrateReadoutTask(Task):
             readout_by_group=getattr(self, "_readout_by_group", None),
             timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
-    def _imaging_seq(self, exposure: float, name: str):
-        """The acquisition sequence for one cali pass: LOAD the pulse template and SET its
-        imaging window to ``exposure`` -- the user's "load a template, set the duration,
-        run" workflow.  ONE template is reused for both passes (only the exposure differs).
-        Same path on real hardware (only the camera frames differ)."""
-        return self._resolve_template(self.pulse_template).with_imaging_exposure(exposure).to_sequence(name=name)
-
-    def _collect_frames(self, seq, n_frames: int, out: "TaskOutput", *, stage: str,
-                        progress_lo: float, progress_hi: float) -> list:
-        """Acquire ``n_frames`` ONE AT A TIME, streaming each to the task's mid-run
-        panel (frame + stage text + a progress fraction mapped into
-        ``[progress_lo, progress_hi]``) so the operator watches the data come in --
-        exactly the frames the extraction below runs on.  Honours the Stop event
-        between frames (a long calibration is interruptible)."""
-        frames: list = []
-        n = max(1, int(n_frames))
-        for i in range(n):
-            if self._stop.is_set():
-                break
-            batch = self.camera.acquire(1, sequence=seq, sequencer=self.sequencer, stop=self._stop)
-            frame = np.asarray(batch[-1], dtype=float)
-            frames.append(frame)
-            frac = progress_lo + (progress_hi - progress_lo) * (i + 1) / n
-            out.publish(frame=frame, progress=frac, stage=f"{stage} {i + 1}/{n}")
-        return frames
+    def _load_seconds_from_template(self) -> float:
+        """The total LOAD (cooling/MOT) time of the loaded template -- the seconds BEFORE its
+        imaging window -- so each reference bracket reloads the atoms for exactly as long as
+        the template prescribes (the template drives the bracket's load, not a fixed default).
+        Falls back to the bracket's own default when the template has no load period or a
+        scan-bound (non-reducible) one."""
+        from ..timing.pulse_table import UNITS_TO_NS, period_index_by_name
+        try:
+            st = self._resolve_template(self.pulse_template)
+        except Exception:
+            return 2e-3
+        idx = period_index_by_name(st, "image")
+        if idx is None:
+            idx = max(0, len(st.periods) - 1)
+        total_ns = 0.0
+        for p in st.periods[:idx]:
+            if isinstance(p.duration, str):     # a scan-expr load period can't be reduced
+                return 2e-3
+            total_ns += float(p.duration) * UNITS_TO_NS.get(str(p.unit), 1.0)
+        return (total_ns / 1e9) if total_ns > 0 else 2e-3
 
     def _run_live(self, out: "TaskOutput"):
-        """Acquire frames now and run the SAME sitemap + per-site-threshold extraction
-        the real readout uses -- the rb87-style flow.
+        """Acquire the Rb87 long-short-long reference brackets NOW and run the SAME sitemap +
+        per-site-threshold extraction the real readout uses.
 
-        TWO pulses: the REFERENCE pass uses the LONGER readout duration
-        (``sitemap_pulse`` / ``sitemap_exposure``) so the averaged template has high SNR
-        site centroids; the READOUT pass uses the ACTUAL (short) readout duration
-        (``readout_pulse`` / ``readout_exposure``) so per-site thresholds are learnt
-        under real readout conditions.  Both stream frame-by-frame to the mid-run panel
-        (the operator sees ~N reference then ~M readout frames accumulate), then the
-        centers come from averaging the reference frames and the thresholds from the
-        per-site count distribution of the readout frames."""
+        ONE acquisition, ONE correlated dataset -- this mirrors the saved-frames flow exactly
+        (:meth:`_run_from_folder`), so live == saved.  Every shot fires the loaded imaging
+        template imaged long-short-long (e.g. 20ms-5ms-20ms): the two LONG reference frames
+        serve DOUBLE duty -- (a) they vote, by strict consensus, the ground-truth occupancy
+        that LABELS the middle short readout (a shot where the two long frames disagree is a
+        mid-readout atom-loss event, so it is discarded -- the "data cleaning" the long frames
+        exist for), AND (b) every long frame averages into the high-SNR template the site
+        centres + PSF are fitted from.  The short readout frames drive the box/PSF otsu
+        thresholds (calibrate once, read many ways).  There is NO separate site-finding pass:
+        the site map comes from the SAME bracket frames that vote the labels.  Identical on
+        real hardware (only the camera frames' author differs: virtual == real)."""
         from .calibration import calibrate_all_methods_from_images
-        # name="reference" (NOT "sitemap"): the virtual camera images a REAL ~50% loading
-        # at the long exposure, and averaging many such frames reveals every site -- the
-        # authentic template, not a synthetic all-bright frame.
-        sitemap_seq = self._imaging_seq(self.sitemap_exposure, "reference")
-        out.publish(progress=0.0, stage="loading reference frames")
-        template = self._collect_frames(sitemap_seq, self.calibration_frames, out,
-                                        stage="reference frame", progress_lo=0.0, progress_hi=0.3)
-        # READOUT BRACKETS (the Rb87 fidelity flow): each shot images the SAME atoms
-        # long-short-long, so the two long frames vote a ground-truth occupancy label for the
-        # short readout (a shot where they disagree is an atom-loss event -> ambiguous).  The
-        # short readout frames also drive the box/PSF otsu thresholds (cali once, read many ways).
+        out.publish(progress=0.0, stage="loading reference brackets (long-short-long)")
+        # The rb87 calibration shot IS the long-short-long bracket (built from the loaded
+        # template -- its load + image structure, imaged at the long/short exposures).
         ref_groups, readout_by_group = self._collect_bracket_groups(
-            out, progress_lo=0.35, progress_hi=0.9)
+            out, progress_lo=0.0, progress_hi=0.9)
+        # The site map is built from EVERY long reference frame of the brackets (group-major) --
+        # the same frames that vote the per-site ground truth, exactly like the saved-frames flow.
+        template = [f for grp in ref_groups for f in grp]
+        samples = list(readout_by_group)
         # Optionally SAVE the acquired raw frames so a later source="saved frames" run
         # re-calibrates from them without re-acquiring (the "don't re-run every time" ask).
         if self.save_frames:
             self._save_live_frames(ref_groups, readout_by_group)
-        samples = list(readout_by_group)
         out.publish(progress=0.95, stage="finding sites + thresholds (box / PSF)")
         calibration = calibrate_all_methods_from_images(
             template, samples, grid_shape=self.grid_shape, roi_radius=self.roi_radius,
@@ -942,9 +931,15 @@ class CalibrateReadoutTask(Task):
         from ..timing import imaging_channel_kwargs, reference_bracket_sequence
         n_ref = int(self.REFERENCE_FRAMES_PER_BRACKET)
         readout_index = n_ref // 2
+        # Build the bracket FROM the loaded template: it reloads for the template's load time
+        # and images on the template's channels (imaging_channel_kwargs maps the conventional
+        # roles onto whatever the sequencer exposes -- the same channels the template targets),
+        # imaged long-short-long at the chosen exposures.  So the template genuinely drives the
+        # calibration pulse (its load + imaging structure), not a hard-coded sequence.
         bracket = reference_bracket_sequence(
             ref_exposure=self.sitemap_exposure, readout_exposure=self.readout_exposure,
-            n_ref=n_ref, **imaging_channel_kwargs(self.sequencer))
+            n_ref=n_ref, cooling=self._load_seconds_from_template(),
+            **imaging_channel_kwargs(self.sequencer))
         n_groups = max(2, int(self.threshold_frames))
         reference_groups: list = []
         readout_per_group: list = []
@@ -957,7 +952,9 @@ class CalibrateReadoutTask(Task):
             readout_per_group.append(frames[readout_index])
             reference_groups.append([f for i, f in enumerate(frames) if i != readout_index])
             frac = progress_lo + (progress_hi - progress_lo) * (g + 1) / n_groups
-            out.publish(frame=frames[readout_index], progress=frac, stage=f"readout bracket {g + 1}/{n_groups}")
+            # Stream the LONG reference frame (the high-SNR image the site map is built from)
+            # so the operator watches the site-finding data accumulate, not just the short readout.
+            out.publish(frame=frames[0], progress=frac, stage=f"reference bracket {g + 1}/{n_groups} (long-short-long)")
         return reference_groups, readout_per_group
 
     # Raw camera frames are an INPUT-format artifact (the round-trip data for a later

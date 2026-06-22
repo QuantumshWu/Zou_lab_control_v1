@@ -70,7 +70,7 @@ def test_calibrate_task_computes_every_method_processor_picks(threshold_method):
     try:
         task = exp.readout.calibrate_task(
             SignalHub(), threshold_method=threshold_method,
-            calibration_frames=3, threshold_frames=16,
+            threshold_frames=16,
             sitemap_exposure=0.05, readout_exposure=0.02)
         task.run_to_completion()
         cal = task.calibration
@@ -107,7 +107,7 @@ def test_calibrate_task_live_writes_canonical_calibration_json_for_the_detector(
         folder = tmp_path / "cal"
         made = exp.readout.calibrate_task(
             SignalHub(), source="live", folder=str(folder),
-            calibration_frames=3, threshold_frames=12)
+            threshold_frames=12)
         made.run_to_completion()
         # the canonical latest calibration the detector defaults to
         canonical = folder / "calibration.json"
@@ -139,13 +139,18 @@ def test_calibrate_task_loads_a_pulse_template_and_sets_the_exposure(tmp_path):
         task = exp.readout.calibrate_task(
             SignalHub(), source="live", pulse_template=str(prog),
             sitemap_exposure=0.06, readout_exposure=0.02,
-            calibration_frames=3, threshold_frames=12)
+            threshold_frames=12)
         assert task.pulse_template == str(prog)
         assert task.acquisition_parameters()["pulse_template"] == str(prog)
-        # the loaded template's 'image' window is set to the pass exposure (not the file's)
-        from Zou_lab_control.neutral_atom.timing import exposure_from_sequence
-        seq = task._imaging_seq(0.02, "readout")
-        assert exposure_from_sequence(seq, default=0.05) == 0.02
+        # The loaded template's 'image' window IS settable (the "you can't set the duration"
+        # claim is false): with_imaging_exposure sets it on the loaded template.
+        from Zou_lab_control.neutral_atom.timing import PulseTableState, exposure_from_sequence
+        loaded = PulseTableState.load(str(prog))
+        assert exposure_from_sequence(loaded.with_imaging_exposure(0.02).to_sequence(), default=0.05) == 0.02
+        # The cali fires the long-short-long bracket BUILT FROM the template: its load (cooling)
+        # time is the template's own load window (2 ms here) -- so the template genuinely drives
+        # the calibration pulse, not a hard-coded default.
+        assert task._load_seconds_from_template() == pytest.approx(0.002)
         task.run_to_completion()
         assert np.asarray(task.calibration.centers).shape == (12, 2)
     finally:
@@ -226,7 +231,7 @@ def test_calibrate_task_live_save_frames_round_trip(tmp_path):
         n_groups = 12
         made = exp.readout.calibrate_task(
             SignalHub(), source="live", folder=str(folder), save_frames=True,
-            calibration_frames=3, threshold_frames=n_groups)
+            threshold_frames=n_groups)
         made.run_to_completion()
         # raw frames in a CLEAN sub-folder, NOT at the root (cali folder root stays tidy)
         assert sorted(folder.glob("img*.npy")) == [], "raw frames must NOT be at the cali root"
@@ -254,7 +259,7 @@ def test_calibrate_task_live_save_frames_off_writes_no_frames(tmp_path):
         folder = tmp_path / "no_save"
         made = exp.readout.calibrate_task(
             SignalHub(), source="live", folder=str(folder), save_frames=False,
-            calibration_frames=3, threshold_frames=8)
+            threshold_frames=8)
         made.run_to_completion()
         assert (folder / "calibration.json").exists()       # the calibration is still written
         assert sorted(folder.glob("img*.npy")) == []        # no frames at root

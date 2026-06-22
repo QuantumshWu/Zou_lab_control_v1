@@ -60,22 +60,28 @@ CALIBRATE_PARAMS = (
     ParamDecl("pulse_template", "pulse template", "path", default=DEFAULT_PULSE_TEMPLATE,
               path_mode="file", file_filter="Pulse program (*.json);;All files (*)", base_dir="pulses",
               tooltip="The imaging pulse program to LOAD (a real PulseTableState .json from the pulse "
-                      "GUI); each pass sets its exposure on the 'image' window.  Defaults to the shipped "
-                      "imaging template -- Browse to load your own."),
+                      "GUI).  Every calibration shot fires THIS template -- its load + imaging "
+                      "structure, imaged long-short-long (the reference/readout exposures below set "
+                      "the image-window duration).  Defaults to the shipped imaging template -- Browse "
+                      "to load your own."),
     ParamDecl("threshold_method", "threshold", "choice", default="otsu", choices=("otsu", "bimodal"),
               tooltip="otsu = single split; bimodal = dark/bright Gaussian-core fit per site.  (The "
                       "READOUT method box / per-site PSF / uniform PSF is chosen on the OccupancyProcessor "
                       "-- the cali computes all of them.)"),
-    ParamDecl("sitemap_exposure", "sitemap exposure", "float", default=0.05, unit="s", lo=0.0, hi=10.0,
-              tooltip="LONGER imaging duration for the site-finding pass (more photons -> cleaner "
-                      "centroids/PSF); set on the template's 'image' window for this pass."),
-    ParamDecl("readout_exposure", "readout exposure", "float", default=0.02, unit="s", lo=0.0, hi=10.0,
-              tooltip="ACTUAL readout duration for the threshold pass (thresholds learnt under real "
-                      "readout conditions); set on the template's 'image' window for this pass."),
-    ParamDecl("calibration_frames", "reference frames", "int", default=30, lo=1, hi=4000,
-              tooltip="Reference (long-exposure) frames averaged into the site-finding template."),
-    ParamDecl("threshold_frames", "readout frames", "int", default=100, lo=2, hi=20000,
-              tooltip="Short-readout frames whose per-site count distribution sets the thresholds."),
+    ParamDecl("sitemap_exposure", "reference exposure (long)", "float", default=0.05, unit="s", lo=0.0, hi=10.0,
+              tooltip="The LONG reference-frame exposure in the long-short-long bracket (e.g. 20 ms).  "
+                      "TWO long frames bracket each short readout: they vote per-site ground truth (the "
+                      "atom did not loss mid-readout -- the data-cleaning step) AND average into the "
+                      "high-SNR template the site centres + PSF are fitted from.  Set on the template's "
+                      "'image' window for these frames."),
+    ParamDecl("readout_exposure", "readout exposure (short)", "float", default=0.02, unit="s", lo=0.0, hi=10.0,
+              tooltip="The SHORT readout exposure -- the MIDDLE frame of the long-short-long bracket "
+                      "(e.g. 5 ms), the ACTUAL readout duration the per-site thresholds are learnt under.  "
+                      "Set on the template's 'image' window for this frame."),
+    ParamDecl("threshold_frames", "reference brackets", "int", default=100, lo=2, hi=20000,
+              tooltip="Number of long-short-long bracket shots.  Each gives two long reference frames "
+                      "(vote ground truth + build the site map) and one short readout frame (per-site "
+                      "threshold statistics)."),
     ParamDecl("roi_radius", "ROI radius", "int", default=1, lo=1, hi=64,
               tooltip="Per-site square ROI half-width in pixels (box counting / detection geometry)."),
 )

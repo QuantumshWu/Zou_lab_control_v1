@@ -91,7 +91,7 @@ def test_calibrate_task_produces_calibration_and_drives_detect_processor(tmp_pat
     try:
         task = CalibrateReadoutTask(
             hub, exp.devices.camera, sequencer=exp.devices.sequencer, grid_shape=(3, 4),
-            calibration_frames=4, threshold_frames=20, folder=str(tmp_path / "cal"))
+            threshold_frames=20, folder=str(tmp_path / "cal"))
         task.run_to_completion()
 
         assert task.finished and task.calibration is not None
@@ -136,7 +136,7 @@ def test_user_composed_loading_readout_streams_real_detect_off_camera_frames():
         # template frames never clobber the live frame the user will stream next.)
         task = CalibrateReadoutTask(
             hub, exp.devices.camera, sequencer=exp.devices.sequencer, grid_shape=(3, 4),
-            calibration_frames=4, threshold_frames=20, prefix="cal_")
+            threshold_frames=20, prefix="cal_")
         task.run_to_completion()
         assert task.calibration is not None
 
@@ -177,7 +177,7 @@ def test_calibrate_task_output_stays_off_the_hub():
     try:
         task = CalibrateReadoutTask(
             hub, exp.devices.camera, sequencer=exp.devices.sequencer, grid_shape=(3, 4),
-            calibration_frames=4, threshold_frames=20, prefix="cal_")
+            threshold_frames=20, prefix="cal_")
         assert "frame" not in hub.names()              # nothing live yet
         task.run_to_completion()                       # runs the calibrate task
         # The task put NOTHING on the hub -- mid-run frame + progress are in its buffer.
