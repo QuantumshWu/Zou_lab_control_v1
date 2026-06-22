@@ -106,7 +106,10 @@ def test_setting_popup_has_unit_and_relim_controls():
         texts = _button_texts(img)
         assert "Apply" in texts                                # Source apply
         assert "Unit" in texts                                 # Unit cycle button
-        assert {"Remove", "Edit…", "Save Fig"} <= set(texts), texts
+        assert {"Remove", "Edit…"} <= set(texts), texts
+        # Save moved ENTIRELY to the Edit tab (it owns the folder picker + the full
+        # DataFigure controls) -- the lightweight Setting popup no longer saves.
+        assert "Save Fig" not in texts, texts
 
         item_sets = _combo_item_sets(img)
         assert any("inferno" in s for s in item_sets), item_sets  # cmap colorset
@@ -356,3 +359,20 @@ def test_setting_keeps_display_params_functional_scalars_go_to_edit():
         assert len(sites.slot_combos) == len(panel_input_slots("sites")) == 1
     finally:
         sites.shutdown()
+
+
+def test_display_param_change_rerenders_when_source_is_stopped():
+    """White-screen regression: a display-only change (e.g. the colormap) must take effect
+    IMMEDIATELY.  ``_set_param`` tears the plotter down and normally waits for the next hub
+    tick to rebuild -- but a STOPPED measurement freezes ``hub.version``, so ``_tick`` would
+    never call ``refresh`` again and the panel would stay blank (white).  Here NO tick runs
+    after the change: the plot must still be rebuilt from the last namespace, not None."""
+    card = _card("2d", source="value = frame")
+    try:
+        card.refresh({"frame": np.random.rand(8, 8), "shot": 1})   # one render -> caches the namespace
+        assert card.plotter is not None
+        card._set_param("cmap", "plasma")                           # different value; NO tick follows
+        assert card.config.params["cmap"] == "plasma"
+        assert card.plotter is not None, "colormap change while stopped blanked the panel (white screen)"
+    finally:
+        card.shutdown()

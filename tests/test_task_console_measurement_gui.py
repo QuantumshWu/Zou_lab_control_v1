@@ -443,3 +443,46 @@ def test_show_task_console_auto_starts_passed_nodes():
     finally:
         console.shutdown()
     assert not node.running
+
+
+def test_edit_tab_is_the_full_datafigure_ui():
+    """The Edit tab carries the WHOLE DataFigure control surface (the same view knobs as the
+    Setting popup, present here too): colormap (image kinds), relim (tight/normal), the unit
+    cycle button, AND the save folder picker.  Each display knob drives the LIVE card via the
+    card's own handlers (config.params is the single source), so Setting and Edit stay in sync."""
+    console, node, cam, card, editor = _camera_console()
+    try:
+        # a 2D (image) panel -> colormap control present, plus relim + unit + save picker
+        assert editor.ed_cmap is not None
+        assert editor.ed_relim is not None
+        assert editor.ed_unit_button is not None
+        assert hasattr(editor, "save_dir_edit")
+
+        # changing a display knob in Edit writes the SAME config.params key the Setting popup uses
+        editor._edit_display_cmap("cmap", "viridis")
+        assert card.config.params["cmap"] == "viridis"
+        editor.ed_relim.setCurrentText("normal")           # drive the combo (fires _edit_relim)
+        assert card.config.params["relim"] == "normal"
+    finally:
+        console.shutdown()
+
+
+def test_edit_save_remembers_the_chosen_folder(tmp_path):
+    """The Edit save picker prefills a default folder, lets the user pick any folder, writes the
+    figure there, and REMEMBERS it on the console -- so the NEXT panel's Edit opens at that same
+    folder (persisted for the kernel session, not reset each time)."""
+    console, node, cam, card, editor = _camera_console()
+    try:
+        assert editor.save_dir_edit.text()                 # prefilled (defaults to tasks/)
+        editor.save_dir_edit.setText(str(tmp_path))        # user picks a folder
+        editor.save()
+        saved = list(tmp_path.glob("*.png"))
+        assert saved, "save() wrote no figure into the chosen folder"
+        assert console._last_save_dir == str(tmp_path)     # remembered on the console
+
+        # a freshly opened Edit for another panel prefills the remembered folder
+        from Zou_lab_control.frontend.task_console import PanelEditor
+        editor2 = PanelEditor(card, console)
+        assert editor2.save_dir_edit.text() == str(tmp_path)
+    finally:
+        console.shutdown()

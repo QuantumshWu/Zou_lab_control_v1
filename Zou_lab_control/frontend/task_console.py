@@ -388,6 +388,24 @@ def _task_files_dir() -> Path:
     return path
 
 
+#: relim modes (confocal_gui combo_relim naming) -- the SINGLE source for both the Setting
+#: popup combo and the Edit-tab combo, so the two never list different options.
+_RELIM_MODES = ("tight", "normal")
+
+
+def _unit_df_for(plotter):
+    """A :class:`DataFigure` bound to ``plotter``'s figure/axes whose unit is inferred from
+    the LIVE x-axis label (NOT ``live_plot=``, which would mask a unit-bearing label like
+    'Detuning (GHz)').  ``change_unit`` operates on ``ax.lines``, so cycling rewrites that
+    figure's curve in place.  Shared by the Setting popup (the live card) and the Edit-tab
+    snapshot so the x-axis unit cycle is ONE implementation."""
+    from .data_figure import DataFigure
+    ax = getattr(plotter, "ax", None)
+    unit = DataFigure._infer_unit(ax.get_xlabel()) if ax is not None else None
+    return DataFigure(fig=plotter.fig, ax=ax, data_x=plotter.data_x, data_y=plotter.data_y,
+                      labels=getattr(plotter, "labels", None), unit=unit)
+
+
 # ====================================================================== state
 class PanelConfig:
     """One panel: kind + a size PRESET + the grid slot it is pinned to."""
@@ -651,6 +669,13 @@ class PanelCard(FluentGroupBox):
         self.plotter = None
         self.canvas = None
         self._value_shape: tuple[int, ...] | None = None
+        # The LAST namespace this panel rendered from (a reference to the hub
+        # snapshot of that tick).  A display-only change (cmap / relim / source pick)
+        # tears the plotter down and normally waits for the NEXT hub tick to rebuild --
+        # but a STOPPED measurement freezes hub.version, so _tick's gate never calls
+        # refresh again and the panel would stay blank (white).  Re-rendering from this
+        # cached namespace makes such a change take effect immediately, stopped or not.
+        self._last_namespace: Mapping[str, object] | None = None
         self._compiled_source = config.source
         # Monitor roll-gate: remembers the per-signal version of this panel's
         # source at the last roll, so an unrelated node's version bump does not
@@ -843,7 +868,7 @@ class PanelCard(FluentGroupBox):
             # is the right tool here; if you need to inspect a frozen range, use
             # zoom/pan on the canvas or Edit… into the panel's Edit tab.
             self.lim_combo = FluentComboBox()
-            self.lim_combo.addItems(["tight", "normal"])
+            self.lim_combo.addItems(list(_RELIM_MODES))
             self.lim_combo.setToolTip(
                 "Relim mode (confocal_gui combo_relim naming):\n"
                 "  tight  = autoscale hugs the data\n"
@@ -879,29 +904,23 @@ class PanelCard(FluentGroupBox):
         self.title_edit.textChanged.connect(self._on_title)
         sec.addWidget(FluentSettingRow("title", self.title_edit, label_width=label_w))
 
-        # Action row: Remove on the left (destructive, ORANGE), Edit… opens
-        # the panel's Edit tab for the heavier processing (fit / relim / per-axis
-        # detail), Save Fig is the one-click export.  The stretch between Edit…
-        # and Save Fig keeps the destructive button visually separated from the
-        # routine "open / export" actions.
+        # Action row: Remove on the left (destructive, ORANGE) + Edit… to open the
+        # panel's Edit tab.  Saving lives ONLY in the Edit tab now (it owns the folder
+        # picker + the full DataFigure controls) -- the lightweight Setting popup no
+        # longer carries a Save button, so there is one place to save from.
         remove = FluentButton("Remove", color=ORANGE)
         remove.setFixedWidth(scaled_px(72, minimum=58))
         remove.clicked.connect(lambda: self.remove_requested.emit(self))
         edit_button = FluentButton("Edit…", color=ACCENT)
         edit_button.setFixedWidth(scaled_px(64, minimum=52))
-        edit_button.setToolTip("Open this panel's Edit tab: curve fit, command-line fit, relim, Save Fig")
+        edit_button.setToolTip("Open this panel's Edit tab: colormap / unit / relim, curve fit, limits, save")
         edit_button.clicked.connect(lambda: (self.settings_popup.hide(), self.edit_requested.emit(self)))
-        save_fig = FluentButton("Save Fig", color=YELLOW)
-        save_fig.setFixedWidth(scaled_px(80, minimum=64))
-        save_fig.setToolTip("Save this panel as <title>.png + <title>.npz (timestamped) in tasks/")
-        save_fig.clicked.connect(self._save_fig)
         action_row = QtWidgets.QHBoxLayout()
         action_row.setContentsMargins(0, 0, 0, 0)
         action_row.setSpacing(scaled_px(6, minimum=4))
         action_row.addWidget(remove, 0)
         action_row.addWidget(edit_button, 0)
         action_row.addStretch(1)
-        action_row.addWidget(save_fig, 0)
         sec.addLayout(action_row)
 
         self.settings_popup = popup
@@ -1100,18 +1119,9 @@ class PanelCard(FluentGroupBox):
         self._apply_unit()
 
     def _unit_df(self):
-        """A DataFigure bound to the current plotter's figure/axes whose unit is
-        inferred from the LIVE x-axis label.  Built from fig/data (NOT live_plot)
-        on purpose: DataFigure(live_plot=...) overrides the unit with the
-        plotter's own ``unit`` (defaults to '1'), which would mask a unit-bearing
-        label like 'Detuning (GHz)'.  change_unit operates on ax.lines, so the
-        cycle still rewrites the live panel's curve in place."""
-        from .data_figure import DataFigure
-        ax = getattr(self.plotter, "ax", None)
-        unit = DataFigure._infer_unit(ax.get_xlabel()) if ax is not None else None
-        return DataFigure(fig=self.plotter.fig, ax=ax,
-                          data_x=self.plotter.data_x, data_y=self.plotter.data_y,
-                          labels=getattr(self.plotter, "labels", None), unit=unit)
+        """A DataFigure bound to the live card's figure/axes for the x-axis unit cycle
+        (shared impl: :func:`_unit_df_for`)."""
+        return _unit_df_for(self.plotter)
 
     def _unit_cycle_len(self) -> int:
         """Length of the x-axis unit cycle for the CURRENT plotter (0 if none)."""
@@ -1140,21 +1150,6 @@ class PanelCard(FluentGroupBox):
             return True
         except Exception:
             return False
-
-    def _save_fig(self) -> None:
-        """Save this panel: <title>.png + <title>.npz (timestamped) in tasks/."""
-        if self.plotter is None:
-            self.set_status("no plot to save yet", error=True)
-            return
-        try:
-            from .data_figure import DataFigure
-            df = DataFigure(self.plotter)
-            stem = (self.config.title or PANEL_KINDS[self.config.kind]).strip() or self.config.kind
-            out = df.save(_task_files_dir() / stem,
-                          extra_info={"source": self.config.source, "kind": self.config.kind})
-            self.set_status(f"saved {out['figure'].name}", error=False)
-        except Exception as exc:
-            self.set_status(f"save fig failed: {str(exc).splitlines()[0][:120]}", error=True)
 
     def _refresh_title(self) -> None:
         """Compose the grey frame TITLE: the panel KIND + WHERE its signal comes from (the
@@ -1250,14 +1245,27 @@ class PanelCard(FluentGroupBox):
             return
         self.config.params[key] = value
         self._reset_plot()
+        self._rerender_last()   # take effect NOW (e.g. colormap) even if the source is stopped
         self.changed.emit()
 
     def _apply_source(self) -> None:
         self.config.source = self.source_edit.text()
         self._compiled_source = self.config.source
         self._reset_plot()      # output shape may change with the expression
+        self._rerender_last()   # re-evaluate the new expression on the last data, stopped or not
         self.apply_button.set_dirty(False)
         self.changed.emit()
+
+    def _rerender_last(self) -> None:
+        """Re-render from the LAST namespace instead of waiting for the next hub tick.
+
+        A display-only change (colormap / relim / a new source pick) tears the plotter
+        down via :meth:`_reset_plot`; normally the next refresh rebuilds it.  But when the
+        producing measurement is STOPPED the hub version is frozen, so ``_tick`` never calls
+        ``refresh`` again -- the torn-down panel would stay blank (white).  Replaying the
+        cached namespace rebuilds the plot at once.  No-op before the first render."""
+        if self._last_namespace is not None:
+            self.refresh(self._last_namespace)
 
     # ------------------------------------------------------------- data path
     def refresh(self, namespace: dict[str, object]) -> None:
@@ -1265,6 +1273,12 @@ class PanelCard(FluentGroupBox):
         Every failure lands on the gear/status -- a bad expression in one panel
         must never break the console or its siblings."""
 
+        # Remember the namespace so a later display-only change (cmap / relim / source
+        # pick) can re-render immediately from it even when the producing measurement is
+        # stopped (the hub version is frozen, so no fresh tick will arrive) -- see
+        # _rerender_last.  It is a reference to the hub's snapshot, not a copy: callers
+        # never mutate it, and the next tick replaces it.
+        self._last_namespace = namespace
         # Inject this panel's picked input as ``signal`` -- the ONE hub signal it plots.
         # The source reads it as ``value = signal`` (a site map's centres + frame underlay
         # come from the SAME producing node, resolved separately -- never extra slots).
@@ -2210,18 +2224,58 @@ class PanelEditor(QtWidgets.QWidget):
                 widget = card._make_param_widget(s, apply=self._edit_param)
                 col.addWidget(FluentSettingRow(s.label, widget, label_width=scaled_px(96, minimum=72)))
 
-        # ---- Processing: frozen snapshot + fit + limits + save -------------
+        # ---- Display: the plot's DataFigure VIEW knobs (colormap / relim / unit) -- the
+        # SAME controls as the Setting popup, present HERE too so the Edit tab is the FULL
+        # data_figure UI (whatever DataFigure can do has a control here).  They write the
+        # SAME config.params keys and drive the SAME live card via the card's handlers
+        # (single source -- Setting and Edit never drift), then re-snapshot this Edit canvas.
+        self.ed_cmap = self.ed_relim = self.ed_unit_button = None
+        if is_plot:
+            section("Display")
+            disp_lw = scaled_px(96, minimum=72)
+            # colormap: only image kinds declare a `cmap` display spec -- reuse that spec +
+            # the card's _set_param (updates config.params + the live card), then re-snapshot.
+            cmap_spec = next((s for s in PANEL_PARAMS.get(card.config.kind, ())
+                              if s.key == "cmap" and s.display), None)
+            if cmap_spec is not None:
+                self.ed_cmap = card._make_param_widget(cmap_spec, apply=self._edit_display_cmap)
+                col.addWidget(FluentSettingRow("colormap", self.ed_cmap, label_width=disp_lw))
+            # relim (confocal tight/normal) -- reuse the card's _on_relim_mode.
+            self.ed_relim = FluentComboBox()
+            self.ed_relim.addItems(list(_RELIM_MODES))
+            self.ed_relim.setCurrentText(str(card.config.params.get("relim", "tight")))
+            self.ed_relim.setToolTip(
+                "Relim mode (confocal_gui combo_relim naming):\n"
+                "  tight  = autoscale hugs the data\n"
+                "  normal = autoscale with the matplotlib default margin")
+            self.ed_relim.currentTextChanged.connect(self._edit_relim)
+            col.addWidget(FluentSettingRow("relim", self.ed_relim, label_width=disp_lw))
+            # x-axis unit cycle -- reuse the card's _on_unit_cycle.
+            self.ed_unit_button = FluentButton("Unit", color=GREY)
+            self.ed_unit_button.setFixedWidth(scaled_px(70, minimum=56))
+            self.ed_unit_button.setToolTip(
+                "Cycle the x-axis unit (GHz/nm/MHz or ns/us/ms) where the axis label\n"
+                "carries a convertible unit; otherwise a no-op.")
+            self.ed_unit_button.clicked.connect(self._edit_unit_cycle)
+            # a fixed-width button in a FluentSettingRow's stretch cell would center; wrap it
+            # with a trailing stretch so it sits flush-left like the combos above (same idiom
+            # as the Setting popup's unit row).
+            unit_host = QtWidgets.QWidget()
+            unit_row = QtWidgets.QHBoxLayout(unit_host)
+            unit_row.setContentsMargins(0, 0, 0, 0)
+            unit_row.setSpacing(scaled_px(6, minimum=4))
+            unit_row.addWidget(self.ed_unit_button, 0)
+            unit_row.addStretch(1)
+            col.addWidget(FluentSettingRow("unit", unit_host, label_width=disp_lw))
+
+        # ---- Processing: frozen snapshot + Refresh (Save is its own row below) -------------
         section("Processing")
         head = QtWidgets.QHBoxLayout()
         head.addWidget(labeled("frozen snapshot of current data"), 1)
         self.refresh_button = FluentButton("Refresh", color=GREY)
         self.refresh_button.setToolTip("Re-snapshot the panel's current data")
         self.refresh_button.clicked.connect(self.rebuild)
-        self.save_button = FluentButton("Save Fig", color=ACCENT)
-        self.save_button.setToolTip("Save the edited figure (png) + data (npz), timestamped, into tasks/")
-        self.save_button.clicked.connect(self.save)
         head.addWidget(self.refresh_button)
-        head.addWidget(self.save_button)
         col.addLayout(head)
 
         self.canvas_holder = QtWidgets.QVBoxLayout()
@@ -2279,8 +2333,9 @@ class PanelEditor(QtWidgets.QWidget):
             self.fit_cmd.returnPressed.connect(self.do_fit)
             col.addWidget(FluentSettingRow("args", self.fit_cmd, label_width=proc_lw))
 
-            # manual x/y limits (DataFigure.xlim/ylim) -- NOT in Setting, so they
-            # live here.  Unit + relim are deliberately ABSENT (Setting owns them).
+            # manual x/y limits (DataFigure.xlim/ylim).  Together with the Display section
+            # above (colormap / relim / unit) the Edit tab now covers the whole DataFigure
+            # surface -- the same knobs as Setting plus the per-axis detail Setting omits.
             section("Limits")
             self.xmin = FluentLineEdit(""); self.xmax = FluentLineEdit("")
             self.ymin = FluentLineEdit(""); self.ymax = FluentLineEdit("")
@@ -2291,6 +2346,25 @@ class PanelEditor(QtWidgets.QWidget):
             apply_btn.clicked.connect(self.apply_limits)
             col.addWidget(FluentSettingRow("x range", _inline(self.xmin, self.xmax), label_width=proc_lw))
             col.addWidget(FluentSettingRow("y range", _inline(self.ymin, self.ymax, trailing=apply_btn), label_width=proc_lw))
+
+            # ---- Save: the ONE place to save from now (Setting no longer has Save).  A folder
+            # picker (the reusable FluentPathEdit, mode="dir") prefilled with the LAST folder a
+            # panel saved into -- remembered on the console for the life of the kernel -- or
+            # tasks/; Browse picks any folder.  Save writes <title>_<timestamp>.png + .npz there
+            # and remembers that folder, so reopening this (or another panel's) Edit reuses it.
+            section("Save")
+            self.save_dir_edit = FluentPathEdit(
+                self.console._last_save_dir or str(_task_files_dir()),
+                mode="dir", caption="Choose a folder to save into", base_dir=str(_task_files_dir()))
+            self.save_dir_edit.setToolTip(
+                "Folder the figure (png) + data (npz) are saved into; remembered across saves "
+                "(this kernel session).")
+            self.save_button = FluentButton("Save Fig", color=ACCENT)
+            self.save_button.setToolTip(
+                "Save the edited figure (png) + data (npz), timestamped, into the folder on the left.")
+            col.addWidget(FluentSettingRow(
+                "folder", _inline(self.save_dir_edit, trailing=self.save_button), label_width=proc_lw))
+            self.save_button.clicked.connect(self.save)
 
         self.status = FluentLabel("")
         self.status.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
@@ -2368,6 +2442,9 @@ class PanelEditor(QtWidgets.QWidget):
         self.canvas_holder.addWidget(self._canvas, alignment=QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop)
         self._canvas.draw_idle()
         self._df = None
+        # carry the persisted x-axis unit cycle onto the fresh snapshot (relim + cmap are
+        # already baked into panel_plot above; unit is applied post-build, like the live card).
+        self._apply_snapshot_unit()
         self.fill_limits()
         # confocal-style auto-range: interacting with this (interactive) Edit plot
         # writes the region the user marked back to the source's parameters.  The
@@ -2402,6 +2479,44 @@ class PanelEditor(QtWidgets.QWidget):
         if self.card is not None:
             self.card._set_param(key, value)
         self.rebuild()
+
+    # ---- Display knobs: apply to the LIVE card via the card's OWN handlers (so they
+    # persist in config.params + drive the live panel -- single source, identical to the
+    # Setting popup) THEN re-snapshot this Edit canvas so the change shows here too.
+    def _edit_display_cmap(self, key: str, value) -> None:
+        if self.card is not None:
+            self.card._set_param(key, value)     # config.params["cmap"] + live re-render
+        self.rebuild()
+
+    def _edit_relim(self, mode: str) -> None:
+        if self.card is not None:
+            self.card._on_relim_mode(str(mode))   # config.params["relim"] + live re-relim
+        self.rebuild()
+
+    def _edit_unit_cycle(self) -> None:
+        if self.card is not None:
+            self.card._on_unit_cycle()            # config.params["unit_index"] + live cycle
+        self.rebuild()
+
+    def _apply_snapshot_unit(self) -> None:
+        """Cycle the Edit snapshot's x-axis unit ``unit_index`` times from its original,
+        mirroring the live card's :meth:`PanelCard._apply_unit` (shared :func:`_unit_df_for`).
+        Called on every rebuild so the persisted unit survives a Refresh / re-snapshot."""
+        if self._plotter is None or self.card is None:
+            return
+        index = int(self.card.config.params.get("unit_index", 0) or 0)
+        if index <= 0:
+            return
+        try:
+            df = _unit_df_for(self._plotter)
+            if not getattr(df, "conversion_map", None):
+                return
+            for _ in range(index % max(1, len(df.conversion_map))):
+                df.change_unit()
+            if self._canvas is not None:
+                self._canvas.draw_idle()
+        except Exception:
+            pass
 
     def _selected_rect(self):
         """The area rectangle if one is drawn, ELSE the current view box (x AND y
@@ -2603,10 +2718,16 @@ class PanelEditor(QtWidgets.QWidget):
         try:
             df = self._df_for()
             stem = (self.card.config.title or self.card.config.kind).strip() or "panel"
-            out = df.save(_task_files_dir() / stem,
+            # The folder the user chose (defaults to the remembered / tasks/ dir); created if
+            # needed.  Remember it on the console so the next Edit save reopens here.
+            picker = getattr(self, "save_dir_edit", None)
+            folder = Path((picker.text().strip() if picker is not None else "") or _task_files_dir())
+            folder.mkdir(parents=True, exist_ok=True)
+            out = df.save(folder / stem,
                           extra_info={"source": self.card.config.source,
                                       "kind": self.card.config.kind})
-            self.status.setText(f"saved {out['figure'].name} + {out['data'].name}")
+            self.console._last_save_dir = str(folder)
+            self.status.setText(f"saved {out['figure'].name} + {out['data'].name} → {folder}")
         except Exception as exc:
             self.status.setText(f"save failed: {str(exc).splitlines()[0][:120]}")
 
@@ -2848,6 +2969,11 @@ class TaskConsole(QtWidgets.QWidget):
         self._last_version = -1
         self._building = False
         self._address: str | None = None
+        # The folder the LAST panel "Save Fig" wrote into -- so a panel's Edit-tab save
+        # picker reopens at the same place across panels and across reopens (remembered
+        # for the life of the process / Jupyter kernel, like the pulse GUI's save dir).
+        # None until the first save -> the picker defaults to the tasks/ folder.
+        self._last_save_dir: str | None = None
         # No-measurement / no-processor sentinels kept so older callers / tests that
         # probe "is there a global measurement launcher" still read None (there is
         # no global form -- a measurement is a Logic node now).
