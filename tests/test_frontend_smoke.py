@@ -1348,23 +1348,22 @@ def test_task_console_cards_are_modular(monkeypatch):
     from Zou_lab_control.frontend import devtools as dt
     from Zou_lab_control.frontend.live import panel_display_size, panel_size_cells
     from Zou_lab_control.frontend.style import DESIGN_DPI
-    # CARD_PAD / CARD_TITLE_PX are the card's FORMAT -- owned by the component library (qt_fluent),
-    # not task_console; the console only lays the cards out.
-    from Zou_lab_control.frontend.qt_fluent import CARD_PAD, CARD_TITLE_PX, scaled_px
-    from Zou_lab_control.frontend.task_console import _card_size
+    # The card's FORMAT (chrome + content padding) is owned by the component library (qt_fluent);
+    # the console only sizes the CELLS the cards tile.
+    from Zou_lab_control.frontend.task_console import _GRID_GAP, _card_size, _cell_size
 
-    # The card keeps the FluentGroupBox chrome (rounded corners, shadow, grey title strip) and
-    # is sized in proportion: WIDTH = figure + the card's L/R border; HEIGHT = the grey title strip
-    # + a plot region proportional to the ROW count (1-row figure height x rows) + bottom
-    # border.  So the plot region scales with rows (no footer, no slot-multiple slack), and the
-    # card always holds the design-size canvas below the strip.
-    one_row_h = panel_display_size("1x2")[1]
+    # Cards tile a CLEAN GRID whose cell is the base 1x2 panel: every card is a whole number of
+    # cells (rows tall x cols//2 wide), so same-size cards are identical, cards tile with exactly
+    # one _GRID_GAP between them, and the card always holds the design-size canvas.
+    cw_cell, ch_cell = _cell_size()
     for size in ("1x2", "2x2", "1x4", "2x4", "4x4"):
         cw, ch = _card_size(size)
         pw, ph = panel_display_size(size)
-        assert cw == pw + 2 * CARD_PAD          # left/right hug the plot
-        assert ch == scaled_px(CARD_TITLE_PX) + scaled_px(2) + one_row_h * panel_size_cells(size)[0] + CARD_PAD
-        assert ch >= scaled_px(CARD_TITLE_PX) + ph    # never clips the figure below the strip
+        rows, cols = panel_size_cells(size)
+        w_units, h_units = cols // 2, rows
+        assert cw == w_units * cw_cell + (w_units - 1) * _GRID_GAP   # whole cells wide + gaps
+        assert ch == h_units * ch_cell + (h_units - 1) * _GRID_GAP   # whole cells tall + gaps
+        assert cw >= pw and ch >= ph                                 # card always holds the plot
 
     console = dt.demo_console(shots=3)
     for card in console.cards:

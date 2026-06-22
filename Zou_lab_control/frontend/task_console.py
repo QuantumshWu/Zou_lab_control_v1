@@ -283,17 +283,16 @@ def _text_to_py(text: str):
         except ValueError:
             return raw
 
-# Board layout (raw px).  The CARD'S FORMAT -- rounded corners, drop shadow, the grey title
-# strip and the content padding -- belongs to the FluentGroupBox COMPONENT (qt_fluent.CARD_PAD /
-# CARD_TITLE_PX, the single source); this module only LAYS the cards out on the board.  A card's
-# WIDTH = the figure width + the card's L/R border; HEIGHT = the grey title strip + a canvas
-# region proportional to the preset's ROW count (design-size canvas pinned to the top, remainder
-# = the proportional bottom padding).
-_GRID_GAP = 8         # gap between adjacent cards on the board (board layout, not card format)
-_SNAP_X = 8           # horizontal drag-snap: cards align to an 8 px column grid
-_SNAP_Y = 1           # vertical pitch = 1 px so stacked cards sit EXACTLY _GRID_GAP apart -- a
-                      # coarse vertical snap rounded each card's span UP, adding a few px of slack
-                      # to every gap (that was the "gap too big" regression)
+# Board layout (raw px).  Cards tile on a CLEAN GRID whose CELL is the base 1x2 panel (1 row,
+# 2 cols).  Every preset is a whole number of cells -- 1x2 = 1x1, 2x2 = 1 wide x 2 tall,
+# 1x4 = 2 wide x 1 tall, 2x4 = 2x2, 4x4 = 2 wide x 4 tall -- so a card's size is a whole-cell
+# multiple and the ONLY drag-snap points are whole-cell positions (i x pitch_x, j x pitch_y).
+# The CARD'S FORMAT (rounded corners, shadow, grey title strip, content padding) belongs to the
+# FluentGroupBox COMPONENT (qt_fluent.CARD_PAD / CARD_TITLE_PX, the single source); this module
+# only lays cells out.  The plot keeps its design size at the top of its cell block, so a
+# multi-cell card has blank padding below / beside the plot -- the geometric price of a clean
+# grid, since the plot's fixed axis margins can't be subdivided to fill the extra cells.
+_GRID_GAP = 8         # gap between adjacent cards / cells on the board
 
 # The header status readout (panel/signal counts, or a node-error banner) is a borderless
 # label: grey normally, red on a node error (the colour IS the danger cue -- no box border,
@@ -302,29 +301,37 @@ _SUMMARY_STYLE = f"color: {GREY}; background: transparent; border: none;"
 _SUMMARY_STYLE_DANGER = f"color: {RED}; background: transparent; border: none;"
 
 
-def _grid_pitch() -> tuple[int, int]:
-    """Drag-snap / layout pitch: 8 px HORIZONTAL (cards align to a column grid) and 1 px VERTICAL
-    (so gravity packs stacked cards EXACTLY ``_GRID_GAP`` apart -- a coarse vertical snap rounded
-    each card's slot span up, which added a few px of slack to every gap)."""
+def _cell_size() -> tuple[int, int]:
+    """The base grid CELL = a 1x2 panel's card: the figure (1 row x 2 cols) plus the card chrome
+    (L/R border + grey title strip + bottom border).  Every card is a whole number of these
+    cells, so they all tile on one grid."""
 
-    return (_SNAP_X, _SNAP_Y)
+    width = panel_display_size("1x2")[0] + 2 * CARD_PAD
+    height = scaled_px(CARD_TITLE_PX) + scaled_px(2) + panel_display_size("1x2")[1] + CARD_PAD
+    return (width, height)
+
+
+def _grid_pitch() -> tuple[int, int]:
+    """The layout / drag-snap pitch = one CELL + the inter-card gap, per axis -- so the only snap
+    points are whole-cell positions and stacked cells sit exactly ``_GRID_GAP`` apart."""
+
+    cw, ch = _cell_size()
+    return (cw + _GRID_GAP, ch + _GRID_GAP)
 
 
 def _card_size(size: str) -> tuple[int, int]:
-    """Outer card size.  The FluentGroupBox chrome + content padding (CARD_PAD / CARD_TITLE_PX,
-    owned by the component library) are UNCHANGED; this only sizes the card around the plot.
-    WIDTH = figure width + the card's L/R border.  HEIGHT = the grey title strip + a canvas region
-    proportional to the ROW count (1-row figure height x rows): the design-size canvas pins to the
-    top of that region and the remainder is the proportional bottom padding."""
+    """Outer card size = a whole number of CELLS.  A preset (rows, cols-in-half-units) is
+    ``rows`` cells tall x ``cols // 2`` cells wide; the card spans those cells plus the gaps
+    between them, so cards tile the grid exactly (gap == _GRID_GAP, no slack).  The FluentGroupBox
+    chrome is unchanged; the plot keeps its design size at the top-centre of the block, and a
+    multi-cell card carries blank padding below / beside it (the plot's fixed margins cannot fill
+    the extra cells)."""
 
-    pw = panel_display_size(size)[0]
-    one_row_h = panel_display_size("1x2")[1]          # the 1-row figure height (proportion unit)
-    rows = panel_size_cells(size)[0]
-    width = pw + 2 * CARD_PAD
-    # grey title strip + top inset + (canvas region = 1-row height x rows) + bottom border.  The
-    # canvas (AlignTop) fills the top of the region; the leftover is the proportional bottom pad.
-    height = scaled_px(CARD_TITLE_PX) + scaled_px(2) + one_row_h * rows + CARD_PAD
-    return (width, height)
+    rows, cols = panel_size_cells(size)
+    w_units, h_units = max(1, cols // 2), rows
+    cw, ch = _cell_size()
+    return (w_units * cw + (w_units - 1) * _GRID_GAP,
+            h_units * ch + (h_units - 1) * _GRID_GAP)
 
 
 def _slot_to_pos(row: int, col: int) -> tuple[int, int]:
@@ -438,17 +445,16 @@ class PanelConfig:
         self.params = dict(params or {})
         self.role = str(role)
 
-    # rows / cols are the card's SLOT SPAN (card size + _GRID_GAP, in pitch units): how many
-    # vertical (1 px) / horizontal (8 px) slots it occupies.  The layout (overlap test / gravity
-    # compaction / board sizing) works in these slots; the +_GRID_GAP keeps adjacent cards apart.
-    # Vertical pitch is 1, so the span is exact and stacked cards sit EXACTLY _GRID_GAP apart.
+    # rows / cols are the card's CELL SPAN: how many whole 1x2 grid cells it occupies (rows tall,
+    # cols // 2 wide).  The layout (overlap test / gravity compaction / board sizing) works in
+    # these whole cells, so cards tile the grid exactly with a _GRID_GAP between them.
     @property
     def rows(self) -> int:
-        return max(1, -(-(_card_size(self.size)[1] + _GRID_GAP) // _SNAP_Y))
+        return max(1, panel_size_cells(self.size)[0])
 
     @property
     def cols(self) -> int:
-        return max(1, -(-(_card_size(self.size)[0] + _GRID_GAP) // _SNAP_X))
+        return max(1, panel_size_cells(self.size)[1] // 2)
 
     def to_dict(self) -> dict[str, object]:
         return {
