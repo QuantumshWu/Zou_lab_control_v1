@@ -1,13 +1,17 @@
-"""Contract: a Monitor panel CARD hugs its plot.
+"""Contract: a Monitor panel CARD keeps the FluentGroupBox chrome and is sized in proportion.
 
-The user's ask: the panel's top/left/right edges should sit right at the plot, so every panel is
-compact with little whitespace -- WITHOUT touching the plot (its shape / size / margins / art are
-unchanged).  So the card = the frontend panel's on-screen canvas (the figure, untouched) + only a
-thin border L/R + a small top inset + the footer slot below.  No grid-multiple inflation, which is
-what removes the big bottom padding a 2x2 (or larger) panel used to carry.
+The card's DISPLAY / ART is the stock FluentGroupBox (rounded corners, drop shadow, the grey
+QGroupBox title strip) -- unchanged.  Only the LAYOUT is sized here:
 
-Pure functions (no Qt window), so this runs in the normal suite -- it pins the hug so a future
-change can't silently re-inflate the card back to a slot-multiple.
+  * WIDTH  = the figure width + a thin L/R border (the drag grip).  The figure width has only a
+    few finite values (one per column count), so panel widths are in proportion.
+  * HEIGHT = the grey title strip + a plot region proportional to the preset's ROW count
+    (the 1-row figure height x rows) + the bottom border.  The design-size canvas pins to the
+    top of that region (right under the title strip) and the remainder is bottom padding, so a
+    2-/4-row card is taller in proportion to its rows (no footer, no slot-multiple slack).
+
+Pure functions (no Qt window), so this runs in the normal suite -- it pins the proportion
+mechanically.  The chrome itself is exercised by the GUI smoke tests (shadow / modular).
 """
 
 from __future__ import annotations
@@ -21,34 +25,52 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if sys.path[0] != str(REPO_ROOT):
     sys.path.insert(0, str(REPO_ROOT))
 
-from Zou_lab_control.frontend.live import PANEL_SIZES, panel_display_size
-from Zou_lab_control.frontend.task_console import _CARD_PAD, _card_size
+from Zou_lab_control.frontend.live import PANEL_SIZES, panel_display_size, panel_size_cells
+from Zou_lab_control.frontend.qt_fluent import ensure_qt_app, scaled_px
+from Zou_lab_control.frontend.task_console import _CARD_PAD, _TITLE_STRIP, _card_size
+
+ensure_qt_app()                       # scaled_px needs the QApplication / fluent scale
+
+
+def _expected_height(size: str) -> int:
+    one_row_h = panel_display_size("1x2")[1]
+    rows = panel_size_cells(size)[0]
+    return scaled_px(_TITLE_STRIP) + scaled_px(2) + one_row_h * rows + _CARD_PAD
 
 
 @pytest.mark.parametrize("size", PANEL_SIZES)
-def test_card_hugs_its_plot(size):
-    """The card is the plot canvas + a thin border L/R + top inset + footer -- nothing more."""
-    cw, ch = _card_size(size)
-    pw, ph = panel_display_size(size)
-    assert cw == pw + 2 * _CARD_PAD            # left/right edges hug the plot exactly
-    # height = top inset + plot + footer slot only; never a big bottom gap.
-    assert ph < ch <= ph + 64
+def test_card_width_is_figure_plus_border(size):
+    """Card width == the figure width + a thin L/R border (the plot hugs L/R)."""
+    assert _card_size(size)[0] == panel_display_size(size)[0] + 2 * _CARD_PAD
 
 
-def test_bigger_cards_are_not_grid_multiples():
-    """A 2x2 card is much SHORTER than two stacked 1x2 cards, and a 4-col card much NARROWER than
-    two 2-col cards -- because each card hugs its (affine, fixed-margin) plot instead of spanning
-    whole grid slots.  This is exactly the bottom/side padding the user reported, now gone."""
-    h2 = _card_size("2x2")[1]
-    h1 = _card_size("1x2")[1]
-    assert h2 < 2 * h1                          # no per-row chrome inflation -> no bottom slack
-    assert _card_size("1x4")[0] < 2 * _card_size("1x2")[0]   # no per-col inflation -> no side slack
+@pytest.mark.parametrize("size", PANEL_SIZES)
+def test_card_height_is_strip_plus_row_proportional(size):
+    """Card height == the grey title strip + (1-row figure height x rows) + bottom border, so
+    the plot region grows in proportion to the rows."""
+    assert _card_size(size)[1] == _expected_height(size)
+
+
+@pytest.mark.parametrize("size", PANEL_SIZES)
+def test_card_always_holds_its_canvas(size):
+    """The card is tall enough to hold the design-size canvas below the title strip (never
+    clips), with the leftover as bottom padding."""
+    ch = _card_size(size)[1]
+    fh = panel_display_size(size)[1]
+    assert ch >= scaled_px(_TITLE_STRIP) + fh
+
+
+def test_plot_region_scales_linearly_with_rows():
+    """The plot region (card height minus the fixed title-strip chrome) is exactly proportional
+    to the rows: a 2-row card's region is 2x a 1-row card's, a 4-row card's is 4x."""
+    chrome = scaled_px(_TITLE_STRIP) + scaled_px(2) + _CARD_PAD
+    region = {s: _card_size(s)[1] - chrome for s in ("1x2", "2x2", "4x4")}
+    assert region["2x2"] == 2 * region["1x2"]
+    assert region["4x4"] == 4 * region["1x2"]
 
 
 def test_plot_canvas_size_is_unchanged():
-    """The plot itself is UNTOUCHED: panel_display_size (the figure's on-screen size) is the stock
-    frontend geometry -- the card shrinks to it, the plot does not grow/shrink to the card."""
-    # a representative spot-check against the known design geometry (data area scales with cells,
-    # margins fixed) -- if someone makes the plot fill the card, these change and this fails.
+    """The plot itself is UNTOUCHED: panel_display_size (the figure's on-screen size) is the
+    stock frontend geometry -- the card is sized around it, the plot is not stretched."""
     assert panel_display_size("2x2")[0] == panel_display_size("1x2")[0]   # same cols => same width
     assert panel_display_size("2x2")[1] > panel_display_size("1x2")[1]    # more rows => taller plot

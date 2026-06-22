@@ -1346,21 +1346,23 @@ def test_task_console_cards_are_modular(monkeypatch):
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from Zou_lab_control.frontend import devtools as dt
-    from Zou_lab_control.frontend.live import panel_display_size
+    from Zou_lab_control.frontend.live import panel_display_size, panel_size_cells
     from Zou_lab_control.frontend.style import DESIGN_DPI
-    from Zou_lab_control.frontend.task_console import _CARD_PAD, _card_size
+    from Zou_lab_control.frontend.qt_fluent import scaled_px
+    from Zou_lab_control.frontend.task_console import _CARD_PAD, _TITLE_STRIP, _card_size
 
-    # THE hug contract: the card wraps its plot TIGHTLY -- the outer card is the frontend
-    # panel's on-screen canvas plus only a thin border L/R + a small top inset + the footer
-    # slot below.  No grid-multiple inflation (the plot is untouched; the CARD shrinks to it),
-    # so a 2x2 card is much SHORTER than two stacked 1x2 cards -- that is what removes the
-    # bottom padding the user reported.
+    # The card keeps the FluentGroupBox chrome (rounded corners, shadow, grey title strip) and
+    # is sized in proportion: WIDTH = figure + a thin L/R border; HEIGHT = the grey title strip
+    # + a plot region proportional to the ROW count (1-row figure height x rows) + bottom
+    # border.  So the plot region scales with rows (no footer, no slot-multiple slack), and the
+    # card always holds the design-size canvas below the strip.
+    one_row_h = panel_display_size("1x2")[1]
     for size in ("1x2", "2x2", "1x4", "2x4", "4x4"):
         cw, ch = _card_size(size)
         pw, ph = panel_display_size(size)
-        assert cw == pw + 2 * _CARD_PAD          # left/right hug the plot exactly
-        assert ph < ch <= ph + 64                # only the top inset + footer below, no slack
-    assert _card_size("2x2")[1] < 2 * _card_size("1x2")[1]    # hugged, NOT a grid-multiple
+        assert cw == pw + 2 * _CARD_PAD          # left/right hug the plot
+        assert ch == scaled_px(_TITLE_STRIP) + scaled_px(2) + one_row_h * panel_size_cells(size)[0] + _CARD_PAD
+        assert ch >= scaled_px(_TITLE_STRIP) + ph    # never clips the figure below the strip
 
     console = dt.demo_console(shots=3)
     for card in console.cards:

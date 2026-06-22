@@ -66,7 +66,7 @@ def _add(console, kind, source):
     return card
 
 
-def test_footer_legend_shows_reads_provides_and_duplicates():
+def test_title_legend_shows_reads_provides_and_duplicates():
     # "rate" is published by BOTH nodes -> ambiguous; "occupied" only by B.
     a = _LogicNode("", {"rate", "frame"})
     b = _LogicNode("b_", {"rate", "occupied"})
@@ -76,7 +76,7 @@ def test_footer_legend_shows_reads_provides_and_duplicates():
         occ_card = _add(console, "sites", "value = occupied")
         console._refresh_signal_info()
 
-        # Footer contract: "<signal> ← <node> [layer]", with an ambiguity flag when
+        # Legend contract: "<signal> ← <node> [layer]", with an ambiguity flag when
         # more than one running node publishes that signal.
         info = rate_card._signal_info
         assert "rate ←" in info                           # reads rate, names the node it comes from
@@ -86,7 +86,8 @@ def test_footer_legend_shows_reads_provides_and_duplicates():
         info2 = occ_card._signal_info
         assert "occupied ←" in info2
         assert "also from another node" not in info2      # occupied is unambiguous
-        # the legend reaches the visible footer text, not just the attribute
-        assert "occupied ←" in occ_card.footer.text()
+        # the legend reaches the visible FRAME TITLE (the grey strip); the signal source moved
+        # off the old footer into the QGroupBox title.
+        assert "occupied ←" in occ_card.title()
     finally:
         console.shutdown()

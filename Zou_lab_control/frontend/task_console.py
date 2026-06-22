@@ -281,19 +281,17 @@ def _text_to_py(text: str):
         except ValueError:
             return raw
 
-# Card geometry (raw px, matching the raw-px canvas).  The card HUGS its plot: the
-# figure keeps its frontend design size (UNTOUCHED -- shape/margins/art unchanged) and
-# the card wraps it with only a thin L/R border, a tiny top inset (the kind title +
-# Setting button float over the figure's own top margin), and the footer line below.
-# So a 2x2 (or larger) panel no longer carries a big bottom gap.  Plots are AFFINE in
-# their cell count (fixed margins + per-cell data area), so cards are NOT integer
-# multiples of one another -- they tile on a FINE snap grid (each occupies
-# ceil(card / _SNAP) slots), which packs different sizes tightly (gap < one snap).
-_CARD_PAD = 10        # thin L/R border hugging the plot (also the drag grip)
-_CARD_TOP = 2         # top inset; the kind title + Setting button FLOAT over the plot's own top
-                      # margin (the figure's reserved title slot), so the card top hugs the plot
-_CARD_VPAD = 12       # vertical padding (the //2 halves are the canvas<->footer + bottom gaps)
-_FOOTER_MIN = 26      # the status + signal-legend line every card carries under its canvas
+# Card geometry (raw px).  The FluentGroupBox CHROME is unchanged (rounded corners, drop
+# shadow, the grey QGroupBox title strip) -- we only size the card around the plot and lay out
+# its contents.  WIDTH = the figure width + a thin L/R border (the drag grip).  HEIGHT = the
+# grey title strip + a canvas region proportional to the preset's ROW count: the design-size
+# canvas (UNTOUCHED) pins to the top of that region and the remainder is the proportional
+# bottom padding, so a 2-/4-row card is taller in proportion to its rows (no footer, no
+# slot-multiple slack).  Cards are AFFINE in cell count (fixed figure margins), so they tile on
+# a FINE snap grid (each occupies ceil(card / _SNAP) slots) -- gap < one snap.
+_CARD_PAD = 10        # thin L/R border + bottom pad hugging the plot (also the drag grip)
+_TITLE_STRIP = 32     # the grey QGroupBox title strip height -- MUST equal FluentGroupBox's
+                      # QGroupBox ``padding-top`` (scaled_px(32)); the plot sits below this strip.
 _GRID_GAP = 8         # gap between adjacent cards
 _SNAP = 8             # drag-snap / layout granularity: a FINE grid so cards sized to HUG their
                       # (affine, non-grid-proportional) plot still tile tightly (gap < one snap)
@@ -318,17 +316,19 @@ def _grid_pitch() -> tuple[int, int]:
 
 
 def _card_size(size: str) -> tuple[int, int]:
-    """Outer card size = the plot HUGGED.  The figure keeps its frontend DESIGN size (untouched);
-    the card wraps it with only a thin border L/R, a small top inset (the kind title + Setting
-    button float over the figure's OWN top margin, so the card top sits at the plot top) and the
-    footer slot below.  No grid-multiple inflation -- the card is as small as the plot allows, so
-    a 2x2 (or larger) panel no longer carries a big bottom gap."""
+    """Outer card size.  The FluentGroupBox chrome (rounded corners, shadow, grey title strip)
+    is UNCHANGED; we only size the card around the plot.  WIDTH = figure width + a thin L/R
+    border.  HEIGHT = the grey title strip + a canvas region proportional to the ROW count
+    (the 1-row figure height x rows): the design-size canvas pins to the top of that region
+    and the remainder is the proportional bottom padding -- so card heights follow the preset."""
 
-    pw, ph = panel_display_size(size)
+    pw = panel_display_size(size)[0]
+    one_row_h = panel_display_size("1x2")[1]          # the 1-row figure height (proportion unit)
+    rows = panel_size_cells(size)[0]
     width = pw + 2 * _CARD_PAD
-    # top inset + canvas + (canvas<->footer gap) + footer + (bottom gap) -- matches the holder's
-    # contentsMargins/spacing so the layout's bottom stretch collapses to ~0 (no slack).
-    height = _CARD_TOP + ph + (_CARD_VPAD // 2) + _FOOTER_MIN + (_CARD_VPAD // 2)
+    # grey title strip + top inset + (canvas region = 1-row height x rows) + bottom border.  The
+    # canvas (AlignTop) fills the top of the region; the leftover is the proportional bottom pad.
+    height = scaled_px(_TITLE_STRIP) + scaled_px(2) + one_row_h * rows + _CARD_PAD
     return (width, height)
 
 
@@ -663,26 +663,17 @@ class PanelCard(FluentGroupBox):
         self.setCursor(QtCore.Qt.OpenHandCursor)   # the frame border drags
 
         holder = QtWidgets.QVBoxLayout(self)
-        # _CARD_PAD insets the canvas from the frame on both sides (and is the drag
-        # border); the title strip is above (padding_top), the footer below.
-        holder.setContentsMargins(_CARD_PAD, scaled_px(2), _CARD_PAD, _CARD_VPAD // 2)
-        holder.setSpacing(_CARD_VPAD // 2)
+        # _CARD_PAD insets the canvas L/R (and is the drag border); the grey title strip is above
+        # (the QGroupBox padding-top), and the bottom pad makes the height proportional to the
+        # preset (see _card_size).  There is NO footer -- the signal source lives in the title.
+        holder.setContentsMargins(_CARD_PAD, scaled_px(2), _CARD_PAD, _CARD_PAD)
+        holder.setSpacing(0)
         self.canvas_holder = holder
-        self.footer = FluentLabel("")
-        # L/R padding so the legend never hugs the frame edge; word-wrap on +
-        # newline-separated categories (see _refresh_signal_info) so a long
-        # signal list breaks to its own lines instead of jamming into one strip.
-        self.footer.setStyleSheet(
-            f"color: {GREY}; background: transparent; padding: {scaled_px(2)}px {scaled_px(8)}px;")
-        self.footer.setAlignment(QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft)
-        self.footer.setWordWrap(True)
-        # The footer carries the transient status AND a persistent SIGNAL legend
-        # (what this panel READS from the hub, what its node PROVIDES, and any
-        # name published by >1 node) so the hub namespace is never a mystery.
+        # The transient status (the Setting tooltip / button colour) and the persistent SIGNAL
+        # legend (which node each read comes from) -- the legend goes into the frame TITLE; the
+        # per-shot status no longer takes panel space.
         self._status_text = ""
         self._signal_info = ""
-        # added AFTER the canvas (in _build_plot); keep a stretch so the footer
-        # pins under the canvas and absorbs the modulus slack below
 
         self._build_settings()
 
@@ -1163,36 +1154,36 @@ class PanelCard(FluentGroupBox):
         except Exception as exc:
             self.set_status(f"save fig failed: {str(exc).splitlines()[0][:120]}", error=True)
 
-    def _compose_footer(self) -> str:
-        """status  ·  signal legend (reads / provides / duplicates), or the raw
-        source when no legend has been computed yet."""
-        info = self._signal_info or self.config.source
-        # status on its own line; the signal legend (its own lines) below it
-        return f"{self._status_text}\n{info}"[:240] if info else self._status_text[:240]
+    def _refresh_title(self) -> None:
+        """Compose the grey frame TITLE: the panel KIND + WHERE its signal comes from (the
+        legend the console computes), e.g. ``1D vector — occupied ← Judge occupancy``.  This is
+        the ordinary QGroupBox title -- the grey chip, alignment and font are the frame's own."""
+        head = PANEL_KINDS[self.config.kind]
+        info = " · ".join(p for p in self._signal_info.splitlines() if p.strip())
+        self.setTitle(f"{head} — {info}" if info else head)
 
     def set_signal_info(self, info: str) -> None:
-        """Set the persistent signal legend (computed by the console: what this
-        panel READS from the hub, what its node PROVIDES, duplicate names)."""
+        """Set the signal legend (computed by the console: which node each read comes from).
+        Shown in the frame TITLE (the grey strip), replacing the old footer legend."""
         info = str(info or "")
         if info == self._signal_info:
             return
         self._signal_info = info
-        self.footer.setText(self._compose_footer())
+        self._refresh_title()
 
     def set_status(self, text: str, *, error: bool) -> None:
-        # Text changes every tick ("shot N") -- but the COLOUR/stylesheet only
-        # changes on the ok<->error transition.  Restyle only on that transition
-        # (rebuilding the same stylesheet string every tick was pure waste);
-        # appearance-neutral because the colour is identical when error is.
+        # No per-shot status line in the panel any more (it needed a footer, which broke the
+        # height proportion).  The status lives in the Setting popup + the Setting-button
+        # tooltip; an error turns the Setting button red.  Restyle only on the ok<->error edge.
         self._status_text = str(text)
-        self.status.setText(str(text)[:200])
-        self.footer.setText(self._compose_footer())
+        if hasattr(self, "status"):
+            self.status.setText(str(text)[:200])
         self.setting_button.setToolTip(f"Panel settings — {text}" if text else "Panel settings")
         if error is not getattr(self, "_status_error", None):
             self._status_error = bool(error)
             colour = RED if error else GREY
-            self.status.setStyleSheet(f"color: {colour}; background: transparent; border: none;")
-            self.footer.setStyleSheet(f"color: {colour}; background: transparent;")
+            if hasattr(self, "status"):
+                self.status.setStyleSheet(f"color: {colour}; background: transparent; border: none;")
             self.setting_button.set_color(colour)
 
     # ------------------------------------------------------------- drag to grid
@@ -1593,20 +1584,15 @@ class PanelCard(FluentGroupBox):
         # and the wheel scrolls the board (isolate_wheel=False) instead of being
         # swallowed.  Interactive zoom / select lives in the Edit tab.
         self.canvas = panel_canvas(self.plotter.fig, isolate_wheel=False)
-        # Pin the canvas to its DESIGN size so the surrounding QVBoxLayout can never
-        # squish it below the panel region: the signal-legend footer word-wraps to
-        # several lines for a rich node chain, and without a floor it would steal
-        # the canvas's height (breaking the canvas-fits-card contract).  The card
-        # is setFixedSize to exactly hold canvas + chrome, so the footer keeps its
-        # _FOOTER_MIN slot and a long legend elides rather than shrinking the plot.
+        # Pin the canvas to its DESIGN size so the surrounding QVBoxLayout can never squish it:
+        # the card is setFixedSize to hold the canvas + the proportional bottom padding, and the
+        # canvas keeps its exact design size while the trailing stretch absorbs the padding.
         self.canvas.setMinimumSize(self.canvas.sizeHint())
+        add_stretch = self.canvas_holder.count() == 0       # first build (teardown leaves the stretch)
+        # canvas pins to the TOP of the content (right below the grey title strip); the trailing
+        # stretch is the proportional bottom padding (collapses to ~0 for a 1-row card).
         self.canvas_holder.insertWidget(0, self.canvas, alignment=QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop)
-        if self.canvas_holder.indexOf(self.footer) < 0:
-            # footer (status line) sits DIRECTLY under the canvas, then the
-            # stretch absorbs the multi-row tiling slack below it -- so the slack
-            # reads as a clean bottom margin rather than a gap floating between
-            # the plot and its status line.
-            self.canvas_holder.addWidget(self.footer)
+        if add_stretch:
             self.canvas_holder.addStretch(1)
         # re-apply persisted Setting toggles (unit + manual x/y limits) to the
         # FRESH plotter every rebuild -- the panel rebuilds whenever its data
