@@ -40,6 +40,14 @@ DEFAULT_CHANNELS = (
     "microwave",
 )
 
+# The virtual backend is a REAL-TIME hardware simulator: firing a pulse program TAKES its
+# real wall-clock duration, exactly like the FPGA + externally-triggered camera.  So a live
+# 2D monitor updates at the pulse cadence -- set the imaging period to several seconds and the
+# image visibly slows to one frame every several seconds (``sleep_scale=1.0``).  The pytest
+# suite fast-forwards this (conftest sets ``DEFAULT_SLEEP_SCALE = 0.0``) so the SAME data path
+# runs without the wall-clock waits; only the time pacing is skipped, never the physics/data.
+DEFAULT_SLEEP_SCALE = 1.0
+
 
 @dataclass
 class VirtualTrapArray(TrapArrayDevice):
@@ -496,6 +504,16 @@ class VirtualCamera(CameraDevice):
         _trig = DEFAULT_CAMERA_TRIGGER_CHANNELS if trigger_channels is None else trigger_channels
         base_triggers = count_trigger_pulses(effective_sequence, trigger_channels=_trig) if hasattr(effective_sequence, "effective_pulses") else 0
         single_cycle = base_triggers >= frames
+        # REAL-TIME live cadence: the live monitor (no explicit sequence -- it reads the
+        # streamer's continuous firing) gets ONE frame per trigger CYCLE, and that cycle takes
+        # the firing program's per-cycle wall-clock time.  So editing the imaging pulse's period
+        # to several seconds genuinely slows the displayed image to that cadence -- the camera
+        # is paced BY the pulse, not by the polling worker.  Read the scale off the sequencer
+        # (one knob; the test suite sets it to 0 to fast-forward).  The explicit-sequence path
+        # instead blocks in ``wait_done`` below, so the wall-clock is never double-counted.
+        live_path = sequence is None
+        seq_scale = float(getattr(sequencer, "sleep_scale", 0.0) or 0.0)
+        per_frame_wall = (float(getattr(runtime_sequence, "duration", 0.0)) / max(frames, 1)) * seq_scale
         images: list[np.ndarray] = []
         for frame_index in range(frames):
             if not all_sites:
@@ -535,6 +553,9 @@ class VirtualCamera(CameraDevice):
                 x, w, y, h = self._roi
                 image = image[y:y + h, x:x + w]
             images.append(image)
+            if live_path and per_frame_wall > 0:
+                # one frame per trigger cycle takes the cycle's real wall-clock time
+                time.sleep(per_frame_wall)
         if sequence is not None and sequencer is not None:
             wait_done = getattr(sequencer, "wait_done", None)
             if callable(wait_done) and not wait_done(max(self.timeout, getattr(runtime_sequence, "duration", 0.0) * 2.0 + 1.0)):
@@ -559,15 +580,24 @@ class VirtualCamera(CameraDevice):
 
 
 class VirtualSequencer(SequencerDevice):
-    def __init__(self, channels: Sequence[str] = DEFAULT_CHANNELS, clock_hz: float = 50_000_000.0, sleep_scale: float = 0.0):
+    def __init__(self, channels: Sequence[str] = DEFAULT_CHANNELS, clock_hz: float = 50_000_000.0, sleep_scale: float | None = None):
         self.channels = tuple(str(channel) for channel in channels)
         self.clock_hz = positive_float(clock_hz, "clock_hz")
+        # REAL-TIME by default (DEFAULT_SLEEP_SCALE=1.0): a fired program takes its real
+        # duration, so the live camera paces with the pulse.  ``None`` -> the module default
+        # (the pytest suite flips that default to 0 to fast-forward; see conftest).
+        if sleep_scale is None:
+            sleep_scale = DEFAULT_SLEEP_SCALE
         self.sleep_scale = nonnegative_float(sleep_scale, "sleep_scale")
         self.history: list[dict[str, object]] = []
         self._prepared: PulseSequence | None = None
         # The compiled program of the last prepare() (parity with RuntimeSequencer.prepare,
         # which on_pulse / sync-to-device read for .sequence_name / .trigger_count / etc.).
         self.last_program = None
+        # The SOURCE payload (PulseTableState/PulseSequence as a JSON string) of the last
+        # prepare -- the sync-to-device handle the pulse GUI's "Sync" pulls back, exactly like
+        # the real SequencerService records.  None until something is prepared.
+        self.last_payload_json: str | None = None
         # The program the streamer is CONTINUOUSLY firing (a repeat_forever pulse), or None
         # when idle/safe.  A real FPGA streamer plays a repeat_forever program until it is
         # set to a safe state; the externally-triggered camera produces frames ONLY while
@@ -606,6 +636,14 @@ class VirtualSequencer(SequencerDevice):
         self.last_program = compile_runtime_program(
             program, channels=channels, clock_hz=self.clock_hz,
             trigger_channels=getattr(self, "trigger_channels", DEFAULT_CAMERA_TRIGGER_CHANNELS))
+        # Record the SOURCE payload (the editable PulseTableState / PulseSequence as JSON),
+        # exactly like SequencerService.prepare -- the pulse GUI's "Sync" reads it back from
+        # snapshot()["last_payload_json"].  This is what makes Sync work on the virtual
+        # sequencer (it IS a sequencer; sync must not error / no-op).
+        import json
+        from .sequencer import timing_payload_to_dict
+        self.last_payload_json = json.dumps(
+            timing_payload_to_dict(sequence, time_step_ns=1e9 / float(self.clock_hz)))
         self.history.append({"action": "prepare", "sequence": program.name, "duration": program.duration})
         return self.last_program
 
@@ -615,14 +653,35 @@ class VirtualSequencer(SequencerDevice):
         if sequence is not None and sequence is not self._prepared:
             raise RuntimeError("VirtualSequencer.fire() received a sequence that was not prepared.")
         self.history.append({"action": "fire", "sequence": self._prepared.name, "duration": self._prepared.duration})
+        # fire() is NON-BLOCKING, exactly like the real FPGA (a quick register write that
+        # STARTS playback).  The program's real wall-clock is consumed where the hardware
+        # actually blocks: ``wait_done`` (a finite ``on_pulse(wait=True)``) or the camera's
+        # per-frame readout (the live monitor) -- never here.  So a continuous (repeat_forever)
+        # On Pulse returns at once and the live camera then paces at the firing cadence.
+        #
         # A repeat_forever program keeps the streamer firing (continuous camera triggers)
         # until set_safe_state.  A finite program plays ONCE -- a measurement's own acquire
         # fires + reads it within that call -- so it does NOT leave the streamer continuously
         # firing (and must not make a later live read see a stale finite shot).
         if bool(getattr(self._prepared, "repeat_forever", False)):
             self._firing = self._prepared
-        if self.sleep_scale > 0:
-            time.sleep(self._prepared.duration * self.sleep_scale)
+
+    def wait_done(self, timeout: float | None = None) -> bool:
+        """Block until the prepared FINITE program finishes on the wall clock
+        (``duration x sleep_scale``), mirroring :meth:`SequencerService.wait_done` -- this IS
+        the real time a measurement's ``on_pulse(wait=True)`` takes (real-time by default;
+        the test suite sets sleep_scale=0 to fast-forward).  A repeat_forever (On Pulse)
+        program never finishes, so it returns False (the caller stops it instead)."""
+        if self._prepared is None:
+            raise RuntimeError("VirtualSequencer.wait_done() called before prepare().")
+        if bool(getattr(self._prepared, "repeat_forever", False)):
+            return False
+        delay = float(self._prepared.duration) * self.sleep_scale
+        if timeout is not None and delay > float(timeout):
+            return False
+        if delay > 0:
+            time.sleep(delay)
+        return True
 
     def stop(self) -> None:
         """Drive the streamer to a safe idle state -- it stops firing, so the camera sees no
@@ -637,8 +696,12 @@ class VirtualSequencer(SequencerDevice):
             "type": type(self).__name__,
             "channels": list(self.channels),
             "clock_hz": self.clock_hz,
+            "sleep_scale": self.sleep_scale,
             "runs": sum(1 for row in self.history if row["action"] == "fire"),
             "firing": None if self._firing is None else self._firing.name,
+            # the sync-to-device handle: the GUI's "Sync" reconstructs the editor state from
+            # this (PulseTableState JSON of the last prepare), same as the real sequencer.
+            "last_payload_json": self.last_payload_json,
         }
 
     def close(self) -> None:

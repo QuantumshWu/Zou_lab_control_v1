@@ -10,6 +10,15 @@ if sys.path[0] != root_text:
     sys.path.insert(0, root_text)
 
 
+# The virtual backend is a REAL-TIME hardware simulator (sleep_scale=1.0 by default), so a
+# fired pulse program takes its real wall-clock duration and the live camera paces with the
+# pulse.  The pytest suite must NOT pay that wall-clock -- fast-forward it: flip the virtual
+# default to 0 so the SAME data/physics path runs without the timing sleeps.  Real-time itself
+# is exercised explicitly (sleep_scale=1.0) in tests/test_virtual_realtime_pacing.py.
+import Zou_lab_control.neutral_atom.devices.virtual as _virtual_backend  # noqa: E402
+_virtual_backend.DEFAULT_SLEEP_SCALE = 0.0
+
+
 @pytest.fixture(autouse=True)
 def close_matplotlib_figures():
     yield
