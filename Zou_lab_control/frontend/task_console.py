@@ -120,6 +120,25 @@ PANEL_KINDS: dict[str, str] = {
     "hist": "Distribution",
 }
 
+#: Every panel + logic-node name is "<base> #N" with N counting from 1 (G1), so two panels /
+#: nodes of the same kind are always told apart -- in the card title, the Edit tab, the frame
+#: title, and the signal-flow grouping.  ONE source of that scheme for panels and nodes alike.
+_INDEX_SUFFIX_RE = re.compile(r"^(.*?)\s*#\d+$")
+
+
+def indexed_unique_name(base: str, taken) -> str:
+    """``"<root> #N"`` with the smallest ``N >= 1`` not already in ``taken``.  Any ``#k`` already
+    on ``base`` is stripped first, so re-indexing a loaded ``"1D vector #2"`` re-derives a clean
+    number rather than nesting (idempotent for an already-clean layout)."""
+    text = str(base or "panel").strip() or "panel"
+    m = _INDEX_SUFFIX_RE.match(text)
+    root = (m.group(1).strip() if m else text) or "panel"
+    taken = set(taken)
+    n = 1
+    while f"{root} #{n}" in taken:
+        n += 1
+    return f"{root} #{n}"
+
 # What signal SHAPE each plot kind expects as its ``value`` -- shown in the panel's
 # Setting so it is clear which signals fit (e.g. a Site map wants a per-site vector,
 # a 2D image wants a frame).  Single source for the panel's input self-documentation.
@@ -4653,7 +4672,10 @@ class TaskConsole(QtWidgets.QWidget):
         # (decoupled: it shows nothing until a signal is picked in its Setting).
         kind = data or "1d"
         rows = max((c.config.row + c.config.rows for c in self.cards), default=0)
-        config = PanelConfig(kind=str(kind), row=rows, col=0, size="1x2")
+        # Every panel gets a unique "<kind> #N" title (G1) so two of the same kind never share
+        # one name in the card header / Edit tab / frame title.
+        title = indexed_unique_name(PANEL_KINDS[str(kind)], {c.config.title for c in self.cards})
+        config = PanelConfig(kind=str(kind), title=title, row=rows, col=0, size="1x2")
         card = PanelCard(config, parent=self.board, names_provider=self._signal_names,
                          sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, frame_coherence_provider=self._coherent_frame_signal)
         self._attach_card(card)
@@ -4694,19 +4716,11 @@ class TaskConsole(QtWidgets.QWidget):
         return None
 
     def _unique_logic_title(self, title: str) -> str:
-        """Make a logic-node title UNIQUE among the existing Logic rows by appending
-        ``2``/``3``... -- so two same-kind nodes (two ``Judge occupancy``) are told apart in
-        the Logic rows AND get distinct per-instance signal prefixes (see _logic_node_prefix).
-        A title that is already unique is returned unchanged (so a saved layout's distinct
-        titles round-trip)."""
-        title = str(title or "node")
-        taken = {str(r.node.title) for r in self.logic_nodes}
-        if title not in taken:
-            return title
-        n = 2
-        while f"{title} {n}" in taken:
-            n += 1
-        return f"{title} {n}"
+        """Make a logic-node title ``"<base> #N"`` and UNIQUE among the existing Logic rows
+        (G1) -- so two same-kind nodes (two ``Judge occupancy``) are told apart in the Logic
+        rows AND get distinct per-instance signal prefixes (see _logic_node_prefix).  Re-indexes
+        a loaded title's root, so an already-clean saved layout round-trips."""
+        return indexed_unique_name(title, {str(r.node.title) for r in self.logic_nodes})
 
     def _logic_node_prefix(self, node: LogicNodeConfig) -> str:
         """The hub-signal prefix for a logic node -- EMPTY by default, so a node publishes its
