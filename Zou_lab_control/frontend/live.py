@@ -225,6 +225,8 @@ class BaseLivePlot:
         update_time: float = 0.1,
         fig: plt.Figure | None = None,
         relim_mode: str = "normal",
+        fixed_lo: float | None = None,
+        fixed_hi: float | None = None,
         spec: FigureSpec | None = None,
         data_px: tuple[int, int] | None = None,
         margins_px: tuple[int, int, int, int] | None = None,
@@ -248,6 +250,11 @@ class BaseLivePlot:
         self.repeat_label = 1
         self.update_time = _positive_float(update_time, "update_time")
         self.relim_mode = relim_mode
+        # "fixed" lim mode: the y-axis (1D/monitor) / colour-limit (2D, sites) is pinned to these
+        # operator-set bounds and never autoscales (see _mode_target / relim).  Default to a unit
+        # span so a fixed panel is usable before the operator types real bounds.
+        self.fixed_lo = 0.0 if fixed_lo is None else float(fixed_lo)
+        self.fixed_hi = 1.0 if fixed_hi is None else float(fixed_hi)
         self.fig = fig
         self.ax = None
         self.axes = None
@@ -463,6 +470,8 @@ class BaseLivePlot:
         the 2D colour-limit (``Live2DDis``).  ``normal`` anchors at 0 (a counts-like
         quantity reads against zero); ``tight`` brackets the data with 10% padding.
         Negative data forces tight (anchoring at 0 would hide it)."""
+        if self.relim_mode == "fixed":
+            return self.fixed_lo, self.fixed_hi   # user-pinned bounds; ignore the data range
         rng = (max_y - min_y) or (abs(max_y) or 1.0)
         if self.relim_mode == "normal" and min_y >= 0:
             return 0.0, (max_y * 1.2 if max_y else 1.0)
@@ -476,6 +485,12 @@ class BaseLivePlot:
         # (the band assumes the mode is unchanged, so it would otherwise refuse).
         if self.relim_mode == "off":
             return False
+        if self.relim_mode == "fixed":
+            # User-pinned (lo, hi): re-apply them and never autoscale (must short-circuit BEFORE
+            # the negative-data auto-switch below, which would otherwise clobber "fixed" to tight).
+            old = (self.ylim_min, self.ylim_max)
+            self.ylim_min, self.ylim_max = self.fixed_lo, self.fixed_hi
+            return old != (self.ylim_min, self.ylim_max)
         vals = np.asarray(self.data_y[:, 0] if values is None else values, dtype=float)
         vals = vals[np.isfinite(vals)]
         if vals.size == 0:
@@ -895,7 +910,8 @@ class LiveSiteMap(BaseLivePlot):
                 and arr.shape == self.background.shape:
             self.background = arr
             self._bg_image.set_data(arr)
-            self._bg_image.set_clim(float(np.nanmin(arr)), max(float(np.nanmax(arr)), float(np.nanmin(arr)) + 1.0))
+            # The colour limit + side histogram are owned by the distribution band (per the
+            # lim-mode), not pinned to this frame's min/max here -- update_core re-clims + refreshes.
             if draw:
                 self.draw()
         else:
@@ -918,7 +934,6 @@ class LiveSiteMap(BaseLivePlot):
 
         self.ax, self.axdis, self.cax = split_axes_horizontally(self.fig, self.ax, *_IMAGE_SPLIT)
         self.axes = self.ax
-        self.axdis.set_visible(False)           # sites carry no side distribution
         centers = self.data_x[:, :2]
         if self.background is not None:
             h, w = self.background.shape
@@ -955,14 +970,93 @@ class LiveSiteMap(BaseLivePlot):
         else:
             self.cbar = None
             self.cax.set_visible(False)
+        # Side distribution of the CAMERA-FRAME intensities + draggable colour limit -- the SAME
+        # band a 2D image has (#10).  Occupancy stays a binary ring overlay; the histogram is of
+        # the underlay frame, and the drag/relim controls the frame clim (so the fixed/normal/tight
+        # lim mode applies to the site-map frame too).
+        self._init_distribution()
+
+    def _frame_values(self) -> np.ndarray:
+        if self.background is None:
+            return np.asarray([], dtype=float)
+        vals = np.asarray(self.background, dtype=float).ravel()
+        return vals[np.isfinite(vals)]
+
+    def _init_distribution(self) -> None:
+        vals = self._frame_values()
+        if self._bg_image is None or vals.size == 0:
+            self.axdis.set_visible(False)        # no frame yet -> no distribution band
+            self.poly = None
+            return
+        y_min, y_max = float(np.nanmin(vals)), float(np.nanmax(vals))
+        self.ylim_min, self.ylim_max = self._mode_target(y_min, y_max)
+        self._bg_image.set_clim(self.ylim_min, self.ylim_max)
+        self.axdis.set_ylim(self.ylim_min, self.ylim_max)
+        self.n_bins = 40
+        self.n, self.bins = np.histogram(vals, bins=self.n_bins, range=(self.ylim_min, self.ylim_max))
+        self.verts = np.empty((self.n_bins, 4, 2), dtype=float)
+        _update_verts(self.bins, self.n, self.verts, mode="horizontal")
+        self.poly = PolyCollection(self.verts, facecolors=PALETTE["hist_fill"])
+        self.axdis.add_collection(self.poly)
+        self.axdis.set_xlim(0, max(10, int(np.max(self.n) + 5)))
+        self.axdis.xaxis.set_major_locator(MaxNLocator(nbins=1, prune="lower"))
+        self.axdis.xaxis.set_major_formatter(ScalarFormatter())
+        self.axdis.tick_params(axis="x", which="both", bottom=True, top=False, labelbottom=True, labeltop=False)
+        self.axdis.tick_params(axis="y", which="both", left=True, right=False, labelleft=False, labelright=False)
+        cmap = self._bg_image.get_cmap()
+        self.line_l = self.axdis.axhline(self.ylim_min, color=cmap(0.0), linewidth=small_fontsize() / 2)
+        self.line_h = self.axdis.axhline(self.ylim_max, color=cmap(0.95), linewidth=small_fontsize() / 2)
+        self.drag = DragHLine(self.line_l, self.line_h, self.update_clim, self.axdis)
+
+    def _attach_interactions(self) -> None:
+        drag = getattr(self, "drag", None)
+        self.tools = attach_interaction(self.ax, drag=drag, axdis=self.axdis, cax=self.cax)
+        self.area, self.cross, self.zoom, self.drag = self.tools.area, self.tools.cross, self.tools.zoom, self.tools.drag
+
+    def update_clim(self) -> None:
+        if self._bg_image is not None and getattr(self, "line_l", None) is not None:
+            self._bg_image.set_clim(float(self.line_l.get_ydata()[0]), float(self.line_h.get_ydata()[0]))
+
+    def apply_relim_now(self) -> None:
+        vals = self._frame_values()
+        if self._bg_image is None or getattr(self, "poly", None) is None or not vals.size:
+            return
+        y_min, y_max = float(np.nanmin(vals)), float(np.nanmax(vals))
+        self.ylim_min, self.ylim_max = self._mode_target(y_min, y_max)
+        self._bg_image.set_clim(self.ylim_min, self.ylim_max)
+        self.axdis.set_ylim(self.ylim_min, self.ylim_max)
+        self.line_l.set_ydata([self.ylim_min, self.ylim_min])
+        self.line_h.set_ydata([self.ylim_max, self.ylim_max])
+
+    def _update_distribution(self) -> None:
+        # Recompute the frame colour-limit for the current lim-mode (normal=from 0, tight=bracket,
+        # fixed=pinned via _mode_target) + refresh the side histogram, like Live2DDis.update_core.
+        vals = self._frame_values()
+        if getattr(self, "poly", None) is None or not vals.size:
+            return
+        y_min, y_max = float(np.nanmin(vals)), float(np.nanmax(vals))
+        self.ylim_min, self.ylim_max = self._mode_target(y_min, y_max)
+        if self._bg_image is not None:
+            self._bg_image.set_clim(self.ylim_min, self.ylim_max)
+        self.axdis.set_ylim(self.ylim_min, self.ylim_max)
+        self.n, self.bins = np.histogram(vals, bins=self.n_bins, range=(self.ylim_min, self.ylim_max))
+        _update_verts(self.bins, self.n, self.verts, mode="horizontal")
+        self.poly.set_verts(self.verts)
+        self.axdis.set_xlim(0, max(10, int(np.max(self.n) + 5)))
+        # keep the draggable clim lines at the (re)computed limits unless the user dragged inside
+        if getattr(self, "line_l", None) is not None:
+            self.line_l.set_ydata([self.ylim_min, self.ylim_min])
+            self.line_h.set_ydata([self.ylim_max, self.ylim_max])
 
     def update_core(self) -> None:
         edge, widths = self._ring_styles(self.data_y[:, 0])
         self.sites.set_edgecolors(edge)
         self.sites.set_linewidths(widths)
+        self._update_distribution()              # refresh the frame-intensity histogram + clim
 
     def _install_state(self) -> None:
-        self.fig._zlc_state = PlotState(plot_type="SITES", x_array=self.data_x[:, 0], y_array=self.data_y, cax=self.cax)
+        self.fig._zlc_state = PlotState(plot_type="SITES", x_array=self.data_x[:, 0], y_array=self.data_y,
+                                        axdis=self.axdis, cax=self.cax)
 
 
 def _pulse_attr(row, name: str, default=None):
@@ -1886,14 +1980,13 @@ def _normalize_kind(kind: str | None) -> str:
         "pulse-sequence": "pulse",
         "sequence": "pulse",
         "timing": "pulse",
+        # Rolling trace is ONE kind ("monitor"); the side distribution is a show_dist toggle,
+        # NOT a separate kind, so these synonyms all collapse to "monitor".
+        "live": "monitor",
         "live-dis": "monitor",
         "live-distribution": "monitor",
         "rolling": "monitor",
-        "monitor-nodist": "monitor-nodist",
-        "monitor-no-dist": "monitor-nodist",
-        "live-nodist": "monitor-nodist",
-        "rolling-nodist": "monitor-nodist",
-        "loading-rate": "monitor-nodist",
+        "loading-rate": "monitor",
         "site-map": "sites",
         "sitemap": "sites",
         "site": "sites",
@@ -2528,13 +2621,16 @@ def plot(
                     raise ValueError("frontend.plot 2D figures are always square; call Live2DDis directly for internal non-square experiments.")
             plotter = Live2DDis(x, y, labels=labels, square=True, **kwargs).show(display=display)
         elif normalized_kind == "monitor":
-            plotter = LiveLiveDis(x, y, labels=labels, **kwargs).show(display=display)
-        elif normalized_kind == "monitor-nodist":
-            plotter = LiveLive(x, y, labels=labels, **kwargs).show(display=display)
+            # ONE rolling-trace kind; the side distribution is a show_dist toggle (default on).
+            # LiveLiveDis (with the side histogram) vs LiveLive (bare) -- both keep their own
+            # plot_type string ("live-distribution"/"live") so saved layouts still resolve.
+            show_dist = bool(kwargs.pop("show_dist", True))
+            cls = LiveLiveDis if show_dist else LiveLive
+            plotter = cls(x, y, labels=labels, **kwargs).show(display=display)
         elif normalized_kind == "sites":
             plotter = LiveSiteMap(x, y, labels=labels, **kwargs).show(display=display)
         else:
-            raise ValueError("kind must be auto, 1d, 2d, monitor, monitor_nodist, hist, sites, or pulse.")
+            raise ValueError("kind must be auto, 1d, 2d, monitor, hist, sites, or pulse.")
 
     if should_watch:
         plotter.watch(

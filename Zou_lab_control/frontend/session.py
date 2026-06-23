@@ -97,12 +97,10 @@ class RunSession:
     ):
         self.source = source
         self.kind = "hist" if kind is None and _is_integer_scalar(data_x) else (kind or "auto")
-        # Rolling kinds default to roll, fixed kinds to append.  Normalise first
-        # so BOTH live types roll: "monitor" (with side-distribution) AND
-        # "monitor-nodist" (the bare loading-rate trace) and all their aliases
-        # (loading-rate, rolling, live-distribution, ...) collapse to the two
-        # canonical kinds the factory dispatches on.
-        self.mode = mode or ("roll" if _normalize_kind(self.kind) in {"monitor", "monitor-nodist"} else "append")
+        # Rolling kinds default to roll, fixed kinds to append.  The rolling trace is ONE kind
+        # ("monitor"); the side distribution is a show_dist toggle, so every rolling alias
+        # (loading-rate, rolling, live, live-distribution, ...) collapses to "monitor".
+        self.mode = mode or ("roll" if _normalize_kind(self.kind) == "monitor" else "append")
         self.labels = labels
         self.update_time = _positive_float(update_time, "update_time")
         self.max_points = None if max_points is None else _positive_int(max_points, "max_points")
@@ -154,8 +152,8 @@ class RunSession:
             self._print_stop_hint()
 
     def _prepare_arrays(self, data_x, data_y) -> None:
-        normalized_kind = str(self.kind).lower().replace("_", "-")
-        if normalized_kind in {"hist", "histogram", "distribution"}:
+        normalized_kind = _normalize_kind(self.kind)   # collapses all aliases (hist/monitor/...)
+        if normalized_kind == "hist":
             if _is_integer_scalar(data_x) or isinstance(data_x, (bool, np.bool_)):
                 count = _positive_int(data_x, "histogram count")
                 self.data_y = np.full((count, 1), np.nan, dtype=float)
@@ -168,12 +166,12 @@ class RunSession:
             self.kind = "hist"
             return
 
-        # A ROLLING trace (monitor / monitor-nodist) is sized by its WINDOW: a notebook
-        # user passes the history length as a scalar (``run(300, source, kind="monitor")``)
-        # exactly like ``hist`` takes a count, instead of pre-building an x array.  Make a
-        # window of NaN that fills as shots arrive (the source callable yields one scalar
-        # per shot); a real x array still works (the branch below).
-        if normalized_kind in {"monitor", "monitor-nodist"} and (
+        # A ROLLING trace ("monitor") is sized by its WINDOW: a notebook user passes the
+        # history length as a scalar (``run(300, source, kind="monitor")``) exactly like
+        # ``hist`` takes a count, instead of pre-building an x array.  Make a window of NaN
+        # that fills as shots arrive (the source callable yields one scalar per shot); a
+        # real x array still works (the branch below).
+        if normalized_kind == "monitor" and (
                 _is_integer_scalar(data_x) or isinstance(data_x, (bool, np.bool_))):
             count = _positive_int(data_x, "rolling window")
             self.data_x = _as_data_x(np.arange(count))

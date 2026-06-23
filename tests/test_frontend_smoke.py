@@ -1397,11 +1397,12 @@ def test_task_console_cards_are_modular(monkeypatch):
 
 def test_task_console_panels_render_and_update(monkeypatch):
     """The demo board builds EVERY panel kind against the virtual node -- both
-    rolling-trace plot types included -- and keeps updating them on later shots.
+    rolling-trace variants included -- and keeps updating them on later shots.
 
-    ``monitor`` (with side distribution) and ``monitor_nodist`` (the bare
-    loading-rate trace) are SEPARATE plot types: ``LiveLiveDis`` extends
-    ``LiveLive`` rather than toggling a flag, so each maps to a distinct class.
+    The rolling trace is ONE kind ("monitor"); the side distribution is a
+    ``show_dist`` toggle, NOT a separate kind.  ``show_dist=True`` builds
+    ``LiveLiveDis`` (the side histogram) and ``show_dist=False`` builds the bare
+    ``LiveLive`` -- so the same kind maps to two classes via the one toggle.
     """
 
     pytest.importorskip("PyQt5")
@@ -1410,19 +1411,22 @@ def test_task_console_panels_render_and_update(monkeypatch):
 
     console = dt.demo_console(shots=25)
     kinds = {card.config.kind: card for card in console.cards}
-    assert set(kinds) == {"2d", "sites", "1d", "monitor", "monitor_nodist", "hist"}
+    assert set(kinds) == {"2d", "sites", "1d", "monitor", "hist"}
     for card in console.cards:
         assert card.plotter is not None, card.config.kind
         assert card.status.text().startswith("shot "), (card.config.kind, card.status.text())
     assert type(kinds["2d"].plotter).__name__ == "Live2DDis"
     assert type(kinds["sites"].plotter).__name__ == "LiveSiteMap"
     assert type(kinds["hist"].plotter).__name__ == "HistogramFigure"
-    assert type(kinds["monitor"].plotter).__name__ == "LiveLiveDis"
-    # the no-dist live is its OWN plot type (the bare base), not LiveLiveDis
-    assert type(kinds["monitor_nodist"].plotter).__name__ == "LiveLive"
-    assert kinds["monitor_nodist"].plotter.plot_type == "live"
-    assert kinds["monitor"].plotter.plot_type == "live-distribution"
     assert type(kinds["1d"].plotter).__name__ == "Live1D"
+    # the ONE "monitor" kind -> two classes via show_dist (the demo board has both)
+    monitors = [c for c in console.cards if c.config.kind == "monitor"]
+    by_dist = {bool(c.config.params.get("show_dist", True)): c for c in monitors}
+    assert set(by_dist) == {True, False}, "demo board should exercise both show_dist variants"
+    assert type(by_dist[True].plotter).__name__ == "LiveLiveDis"
+    assert by_dist[True].plotter.plot_type == "live-distribution"
+    assert type(by_dist[False].plotter).__name__ == "LiveLive"
+    assert by_dist[False].plotter.plot_type == "live"
 
     # more shots -> the monitor's rolling history grows; the 2d image refreshes
     before = kinds["monitor"].plotter.points_done

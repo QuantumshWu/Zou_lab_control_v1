@@ -117,7 +117,6 @@ PANEL_KINDS: dict[str, str] = {
     "sites": "Site map",
     "1d": "1D vector",
     "monitor": "Rolling trace",
-    "monitor_nodist": "Rolling trace (no dist)",
     "hist": "Distribution",
 }
 
@@ -134,7 +133,6 @@ PANEL_INPUT_FORMAT: dict[str, str] = {
              "+ frame underlay",
     "1d": "value must be a 1D vector (N,) or per-site array",
     "monitor": "value must be a scalar per shot (rolling trace)",
-    "monitor_nodist": "value must be a scalar per shot (rolling trace)",
     "hist": "value must be a 1D sample vector",
 }
 
@@ -680,10 +678,10 @@ PANEL_PARAMS: dict[str, tuple[ParamSpec, ...]] = {
     "monitor": (
         ParamSpec("length", "history", "int", 300, lo=20, hi=10_000,
                   tooltip="Rolling history length (shots kept on screen)"),
-    ),
-    "monitor_nodist": (
-        ParamSpec("length", "history", "int", 300, lo=20, hi=10_000,
-                  tooltip="Rolling history length (shots kept on screen)"),
+        # The side distribution is ONE plot kind's toggle (not a separate "no-dist" kind):
+        # ON shows the histogram band beside the trace, OFF gives the bare rolling line.
+        ParamSpec("show_dist", "side distribution", "bool", True, display=True,
+                  tooltip="Show the side distribution histogram beside the rolling trace"),
     ),
     "hist": (
         ParamSpec("bins", "bins", "int", 60, lo=5, hi=500, tooltip="Histogram bins"),
@@ -843,7 +841,9 @@ def _task_files_dir() -> Path:
 
 #: relim modes (confocal_gui combo_relim naming) -- the SINGLE source for both the Setting
 #: popup combo and the Edit-tab combo, so the two never list different options.
-_RELIM_MODES = ("tight", "normal")
+#: "fixed" (#8) pins the y-axis / colour-limit to operator-set ``fixed_lo``/``fixed_hi`` bounds
+#: (the lo/hi inputs reveal only in that mode); tight/normal autoscale as before.
+_RELIM_MODES = ("tight", "normal", "fixed")
 
 #: Per-panel display refresh intervals (ms) the operator can pick from.  A FIXED, harmonic set
 #: (100·{1,2,4,8}) so the SMALLEST selected interval divides every other -- the console timer
@@ -1410,10 +1410,28 @@ class PanelCard(FluentGroupBox):
             self.lim_combo.setToolTip(
                 "Relim mode (confocal_gui combo_relim naming):\n"
                 "  tight  = autoscale hugs the data\n"
-                "  normal = autoscale with the matplotlib default margin")
+                "  normal = autoscale with the matplotlib default margin\n"
+                "  fixed  = pin the y-axis / colour-limit to the lo/hi below")
             self.lim_combo.setCurrentText(str(self.config.params.get("relim", "tight")))
             self.lim_combo.currentTextChanged.connect(self._on_relim_mode)
             sec.addWidget(FluentSettingRow("relim", self.lim_combo, label_width=label_w))
+
+            # fixed lo/hi inputs (#8): one row [lo | hi], shown only when relim == "fixed".
+            self.fixed_lo_edit = FluentLineEdit(str(self.config.params.get("fixed_lo", 0.0)))
+            self.fixed_hi_edit = FluentLineEdit(str(self.config.params.get("fixed_hi", 1.0)))
+            for ed in (self.fixed_lo_edit, self.fixed_hi_edit):
+                ed.setMinimumWidth(scaled_px(64, minimum=52))
+                ed.editingFinished.connect(self._on_fixed_lim_edited)
+            self.fixed_lo_edit.setToolTip("Fixed lower limit (used only when relim = fixed)")
+            self.fixed_hi_edit.setToolTip("Fixed upper limit (used only when relim = fixed)")
+            fixed_inner = QtWidgets.QWidget()
+            fixed_layout = QtWidgets.QHBoxLayout(fixed_inner)
+            fixed_layout.setContentsMargins(0, 0, 0, 0)
+            fixed_layout.addWidget(self.fixed_lo_edit, 1)
+            fixed_layout.addWidget(self.fixed_hi_edit, 1)
+            self.fixed_lim_row = FluentSettingRow("lo / hi", fixed_inner, label_width=label_w)
+            self.fixed_lim_row.setVisible(str(self.config.params.get("relim", "tight")) == "fixed")
+            sec.addWidget(self.fixed_lim_row)
 
             # unit cycle: a single row [Unit button | <stretch> | current unit text]
             # under the "unit" label, so the layout rhythm stays one-control-per-row.
@@ -1510,6 +1528,12 @@ class PanelCard(FluentGroupBox):
             spin.setToolTip(spec.tooltip)
             spin.valueChanged.connect(lambda v, k=spec.key: cb(k, int(v)))
             return spin
+        if spec.kind == "bool":
+            sw = FluentSwitch("")
+            sw.setChecked(bool(current))
+            sw.setToolTip(spec.tooltip)
+            sw.toggled.connect(lambda v, k=spec.key: cb(k, bool(v)))
+            return sw
         # "text": a free-form value (blank allowed where documented)
         edit = FluentLineEdit(str(current))
         edit.setMinimumWidth(scaled_px(96, minimum=80))   # expands in its row; long signal names not cut off
@@ -1659,8 +1683,12 @@ class PanelCard(FluentGroupBox):
         Writes to the SAME ``config.params["relim"]`` key the Edit tab's
         ``ed_relim`` writes to, so the two never drift apart."""
         self.config.params["relim"] = str(mode)
+        # reveal the lo/hi inputs only in "fixed" mode (#8)
+        if hasattr(self, "fixed_lim_row"):
+            self.fixed_lim_row.setVisible(str(mode) == "fixed")
         if self.plotter is not None and hasattr(self.plotter, "relim_mode"):
             self.plotter.relim_mode = str(mode)
+            self._push_fixed_lims()   # keep plotter.fixed_lo/hi in step before re-relim
             # apply the switch NOW (2D colorbar / 1D y-axis), bypassing the relim
             # dead-band -- otherwise a 2D image's clim only changes on the next
             # frame (or never, for a static panel), so the toggle looks dead.
@@ -1668,6 +1696,31 @@ class PanelCard(FluentGroupBox):
                 self.plotter.apply_relim_now()
         if self.canvas is not None:
             self.canvas.draw_idle()
+        self.changed.emit()
+
+    def _push_fixed_lims(self) -> None:
+        """Copy ``config.params["fixed_lo"/"fixed_hi"]`` onto the live plotter (no rebuild)."""
+        if self.plotter is None or not hasattr(self.plotter, "fixed_lo"):
+            return
+        self.plotter.fixed_lo = float(self.config.params.get("fixed_lo", 0.0))
+        self.plotter.fixed_hi = float(self.config.params.get("fixed_hi", 1.0))
+
+    def _on_fixed_lim_edited(self) -> None:
+        """Persist the fixed lo/hi inputs (#8) and re-apply them to the live plotter NOW
+        (no rebuild -- just push the bounds + re-relim so the axis snaps immediately)."""
+        def _num(text: str, fallback: float) -> float:
+            try:
+                return float(str(text).strip())
+            except (TypeError, ValueError):
+                return fallback
+        self.config.params["fixed_lo"] = _num(self.fixed_lo_edit.text(), 0.0)
+        self.config.params["fixed_hi"] = _num(self.fixed_hi_edit.text(), 1.0)
+        self._push_fixed_lims()
+        if self.plotter is not None and str(self.config.params.get("relim")) == "fixed" \
+                and hasattr(self.plotter, "apply_relim_now"):
+            self.plotter.apply_relim_now()
+            if self.canvas is not None:
+                self.canvas.draw_idle()
         self.changed.emit()
 
     def _on_update_interval(self, _idx: int) -> None:
@@ -1696,6 +1749,7 @@ class PanelCard(FluentGroupBox):
             return
         if hasattr(self.plotter, "relim_mode"):
             self.plotter.relim_mode = str(self.config.params.get("relim", "tight"))
+            self._push_fixed_lims()                      # keep fixed lo/hi (#8) applied after rebuild
         self._apply_unit()
 
     def _unit_df(self):
@@ -1959,7 +2013,7 @@ class PanelCard(FluentGroupBox):
             sy = max(1, int(np.ceil(arr.shape[0] / 192)))
             sx = max(1, int(np.ceil(arr.shape[1] / 192)))
             return arr[::sy, ::sx]
-        if kind in ("monitor", "monitor_nodist"):
+        if kind == "monitor":
             flat = arr.reshape(-1)
             if flat.size != 1:
                 raise ValueError(f"rolling-trace panel needs a scalar value (got shape {arr.shape})")
@@ -2049,14 +2103,14 @@ class PanelCard(FluentGroupBox):
         if rebuild:
             self._build_plot(value, namespace)
             self._value_shape = (1,) if isinstance(value, float) else tuple(np.shape(value))
-            if kind in ("monitor", "monitor_nodist"):
+            if kind == "monitor":
                 # The build already plotted this value as the first point; record
                 # its source version so the next UNRELATED bump won't duplicate it.
                 self._last_monitor_key = self._monitor_source_key(namespace)
             return
         if kind == "2d":
             self.plotter.update(np.asarray(value).ravel(), draw=False)
-        elif kind in ("monitor", "monitor_nodist"):
+        elif kind == "monitor":
             # Roll ONE point per new sample of this monitor's own source.  With
             # several nodes, an unrelated node bumps hub.version and refreshes
             # every panel; without this gate the monitor would append a duplicate
@@ -2112,6 +2166,14 @@ class PanelCard(FluentGroupBox):
         return entry[0] if entry else None
 
     # ------------------------------------------------------------- plot lifecycle
+    def _fixed_lim_kwargs(self) -> dict:
+        """``fixed_lo``/``fixed_hi`` kwargs for the plotter, ONLY when the lim mode is
+        "fixed" (#8) -- otherwise omitted so the plotter keeps its tight/normal autoscale."""
+        if str(self.config.params.get("relim", "tight")) != "fixed":
+            return {}
+        return {"fixed_lo": float(self.config.params.get("fixed_lo", 0.0)),
+                "fixed_hi": float(self.config.params.get("fixed_hi", 1.0))}
+
     def _build_plot(self, value, namespace: Mapping[str, object] | None = None) -> None:
         if panel_canvas is None:
             raise RuntimeError("matplotlib Qt canvas is not available")
@@ -2153,14 +2215,17 @@ class PanelCard(FluentGroupBox):
                 data_x, arr.ravel(), kind="2d", size=size, interactions=False,
                 cmap=str(self.config.params.get("cmap", "inferno")),
                 relim_mode=str(self.config.params.get("relim", "tight")),
+                **self._fixed_lim_kwargs(),
                 labels=(xlabel, ylabel, ""), title=self.config.title or None)
-        elif kind in ("monitor", "monitor_nodist"):
+        elif kind == "monitor":
             length = max(20, int(self.config.params.get("length", 300)))
             history = np.full(length, np.nan)
             self.plotter = panel_plot(
-                np.arange(length, dtype=float), history, kind=kind, size=size, interactions=False,
+                np.arange(length, dtype=float), history, kind="monitor", size=size, interactions=False,
+                show_dist=bool(self.config.params.get("show_dist", True)),
                 labels=("Shots ago", self._source_axis_label() or label, "Z"),
                 relim_mode=str(self.config.params.get("relim", "tight")),
+                **self._fixed_lim_kwargs(),
                 title=self.config.title or None)
             self.plotter.roll(float(value), draw=False)
         elif kind == "hist":
@@ -2200,6 +2265,7 @@ class PanelCard(FluentGroupBox):
                 data_x, vec, kind="1d", size=size, interactions=False,
                 labels=(xlabel, ylabel, "Z"),
                 relim_mode=str(self.config.params.get("relim", "tight")),
+                **self._fixed_lim_kwargs(),
                 title=self.config.title or None)
         # Monitor cards are display-only: NO selectors (interactions=False above)
         # and the wheel scrolls the board (isolate_wheel=False) instead of being
@@ -3208,10 +3274,11 @@ class PanelEditor(QtWidgets.QWidget):
                 self._plotter = panel_plot(np.array(src.values, dtype=float), kind="hist", size=size,
                                            bins=int(card.config.params.get("bins", 60)),
                                            labels=tuple(src.labels), title=title)
-            else:  # 1d / monitor / monitor_nodist -> a line snapshot
+            else:  # 1d / monitor -> a line snapshot (monitor honours its show_dist toggle)
+                extra = {"show_dist": bool(card.config.params.get("show_dist", True))} if kind == "monitor" else {}
                 self._plotter = panel_plot(np.array(src.data_x[:, 0], dtype=float),
                                            np.array(src.data_y[:, 0], dtype=float),
-                                           kind=kind, size=size, relim_mode=relim,
+                                           kind=kind, size=size, relim_mode=relim, **extra,
                                            labels=tuple(src.labels), title=title)
         except Exception as exc:
             self.status.setText(f"could not snapshot: {str(exc).splitlines()[0][:120]}")

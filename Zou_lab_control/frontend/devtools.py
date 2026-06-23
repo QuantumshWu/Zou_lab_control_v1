@@ -187,16 +187,16 @@ def demo_editor(*, scale: float = 1.0, size=(1440, 880), bind_scans: bool = True
 
 
 def _demo_board_state():
-    """A board exercising EVERY panel kind -- both live types included.
+    """A board exercising EVERY panel kind -- both rolling-trace variants included.
 
     The bare app default (``default_console_state``) is empty; this richer board
-    is the demo/test fixture, so a screenshot or smoke test still covers all six
-    kinds and BOTH rolling-trace plot types: the bare ``monitor_nodist``
-    (-> :class:`LiveLive`) AND the side-distribution ``monitor``
-    (-> :class:`LiveLiveDis`).  Each panel is a pure VIEW wired to a hub signal
-    the demo's camera Measurement + OccupancyProcessor publish (decoupled
-    VIEW/LOGIC): the camera publishes ``frame``; the OccupancyProcessor publishes
-    ``counts`` / ``rate`` / ``rate_sites`` / ``centers``."""
+    is the demo/test fixture, so a screenshot or smoke test still covers all five
+    kinds and BOTH rolling-trace variants of the ONE ``monitor`` kind: the
+    side-distribution trace (``show_dist=True`` -> :class:`LiveLiveDis`) AND the
+    bare trace (``show_dist=False`` -> :class:`LiveLive`).  Each panel is a pure
+    VIEW wired to a hub signal the demo's camera Measurement + OccupancyProcessor
+    publish (decoupled VIEW/LOGIC): the camera publishes ``frame``; the
+    OccupancyProcessor publishes ``counts`` / ``rate`` / ``rate_sites`` / ``centers``."""
 
     from Zou_lab_control.frontend.task_console import PanelConfig, TaskConsoleState
 
@@ -213,9 +213,9 @@ def _demo_board_state():
             PanelConfig(kind="sites", title="Per-site occupancy", row=0, col=2, size="2x2",
                         source="value = occupied", inputs=["occupied"]),
             PanelConfig(kind="monitor", title="Loading rate (dist)", row=0, col=4, size="1x2",
-                        source="value = rate", params={"length": 300}),
-            PanelConfig(kind="monitor_nodist", title="Loading rate", row=1, col=4, size="1x2",
-                        source="value = rate", params={"length": 300}),
+                        source="value = rate", params={"length": 300, "show_dist": True}),
+            PanelConfig(kind="monitor", title="Loading rate", row=1, col=4, size="1x2",
+                        source="value = rate", params={"length": 300, "show_dist": False}),
             PanelConfig(kind="hist", title="Counts distribution", row=2, col=0, size="1x2",
                         source="value = counts", params={"bins": 80}),
             PanelConfig(kind="1d", title="Per-site counts", row=2, col=2, size="2x4",

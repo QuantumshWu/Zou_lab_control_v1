@@ -224,7 +224,9 @@ def test_notebook_rolling_run_accepts_a_scalar_window():
     the rolling kinds accept a scalar window (they used to raise), while a FIXED kind
     (1d) still requires a real x array (the scalar shortcut is rolling/hist only)."""
     src = lambda: 0.5                                  # a per-shot scalar source
-    for kind, window in (("monitor", 300), ("monitor-nodist", 120), ("monitor_nodist", 64)):
+    # The rolling trace is ONE kind ("monitor"); the bare-trace variant is show_dist=False,
+    # not a separate kind.  Both spellings (canonical + a rolling synonym) accept a scalar window.
+    for kind, window in (("monitor", 300), ("rolling", 120), ("loading_rate", 64)):
         sess = zf.run(window, src, kind=kind, autostart=False, display=False)
         try:
             assert sess.data_y.shape == (window, 1)    # a NaN window of the asked length
