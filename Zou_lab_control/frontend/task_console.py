@@ -66,6 +66,7 @@ from .qt_fluent import (
     FluentButton,
     FluentCodeEdit,
     FluentComboBox,
+    FluentTreeComboBox,
     FluentDoubleSpinBox,
     FluentFrame,
     FluentGroupBox,
@@ -251,6 +252,34 @@ def grouped_signal_items(names, sources, formats) -> list:
     return items
 
 
+def signal_tree_groups(names, sources, formats) -> list:
+    """``[(producer, [(leaf_label, bare_name, full_label)])]`` for the COLLAPSIBLE tree picker
+    (G2): one expandable group per producing node; each leaf's ``leaf_label`` shows the short
+    name + shape + ready/waiting state (in the tree), and its ``full_label`` is the producer-
+    qualified ``"<producer> · <short>"`` painted when the combo is COLLAPSED (frame-title aligned,
+    G3).  Built from the same producer grouping as :func:`grouped_signal_items` -- ONE source."""
+    names = sorted(str(n) for n in (names or []))
+    sources = dict(sources or {})
+    formats = dict(formats or {})
+    by_producer: dict[str, list[str]] = {}
+    for name in names:
+        for p in ([str(p) for p in (sources.get(name) or [])] or ["(unbound)"]):
+            by_producer.setdefault(p, []).append(name)
+    groups: list = []
+    for producer in sorted(by_producer, key=lambda p: (p == "(unbound)", p.lower())):
+        group = by_producer[producer]
+        strip = _common_token_prefix(group) or (str(producer).strip("() ") + "_")
+        leaves = []
+        for name in group:
+            short = name[len(strip):] if (strip and name.startswith(strip) and len(name) > len(strip)) else name
+            fmt = formats.get(name)
+            shape = f"  [{fmt}]" if fmt else ""
+            leaf_label = f"{short}{shape}  {signal_state(name, formats)}"
+            leaves.append((leaf_label, name, f"{producer} · {short}"))
+        groups.append((producer, leaves))
+    return groups
+
+
 def fill_grouped_signal_combo(combo, *, names, sources, formats, current, none_label=None) -> None:
     """Populate ``combo`` with every live hub signal GROUPED by producing node (via
     :func:`grouped_signal_items`): bold non-selectable headers, indented signals (data = the
@@ -259,6 +288,12 @@ def fill_grouped_signal_combo(combo, *, names, sources, formats, current, none_l
     visible label is indented.  Shared by the plot panel's slot picker and the logic-node
     source field, so the nested picker is identical everywhere."""
     cur = str(current or "")
+    if isinstance(combo, FluentTreeComboBox):
+        # The collapsible-tree picker (G2): one expandable producer group, leaves = signals.
+        with _signals_blocked(combo):
+            combo.set_signal_tree(signal_tree_groups(names, sources, formats),
+                                  current=cur, none_label=none_label)
+        return
     with _signals_blocked(combo):
         combo.clear()
         if none_label is not None:
@@ -292,6 +327,8 @@ def read_editable_combo(combo) -> str:
     name).  A plain ``currentData()`` would return the STALE previously-selected data after the
     user types a new name into the line edit (Qt does not move currentIndex on free text), so the
     fresh name would be silently dropped; a disabled header (data ``None``) falls through to ''."""
+    if isinstance(combo, FluentTreeComboBox):
+        return combo.current_signal()             # the tree picker stores the bare name on the leaf
     idx = combo.currentIndex()
     text = combo.currentText()
     if idx >= 0 and text == combo.itemText(idx):
@@ -549,8 +586,7 @@ class _SignalExprWidget(QtWidgets.QWidget):
                 w.setParent(None); w.deleteLater()
         n = max(1, len(self._inputs))
         for i in range(n):
-            combo = FluentComboBox()
-            combo.setEditable(True)
+            combo = FluentTreeComboBox()             # collapsible-tree signal picker (G2)
             label = f"signal[{i}]" if n > 1 else "signal"
             cur = self._inputs[i] if i < len(self._inputs) else ""
             fill_grouped_signal_combo(combo, names=self._names(), sources=self._sources(),
@@ -1343,7 +1379,7 @@ class PanelCard(FluentGroupBox):
         # + frame underlay are resolved from the SAME producing node, never extra slots.
         self.slot_combos: list = []
         for i in range(n_slots):
-            combo = FluentComboBox()
+            combo = FluentTreeComboBox()             # collapsible-tree signal picker (G2)
             combo.setToolTip(slot_tips[i] + (
                 "\nSets the source to `value = signal`." if n_slots == 1
                 else f"\nRead as signal[{i}] in the expression (e.g. value = signal[0] - signal[1])."))
@@ -2554,12 +2590,10 @@ class MeasurementPanel(QtWidgets.QWidget):
                 self.form.addRow(label_text, picker)
                 self._widgets[decl.key] = ("path", picker)
             elif kind == "signal":
-                # A hub-signal input (a processor's source) uses the SAME nested-by-producer
-                # picker the plot panels use (fill_grouped_signal_combo): bold node headers,
-                # signals indented + prefix-stripped beneath.  Editable so a not-yet-published
-                # name round-trips; the pick is read back via currentData() (the bare name).
-                combo = FluentComboBox()
-                combo.setEditable(True)
+                # A hub-signal input (a processor's source) uses the SAME collapsible-tree picker
+                # the plot panels use (G2): one expandable producer group, signals as leaves with
+                # their shape + ready/waiting state; the pick is read back via current_signal().
+                combo = FluentTreeComboBox()
                 cur = "" if decl.default is None else str(decl.default)
                 def _names():
                     try:

@@ -1221,7 +1221,7 @@ class FluentComboBox(QtWidgets.QComboBox):
         painter.setPen(QtGui.QColor(TEXT if self.isEnabled() else PLACEHOLDER))
         painter.setFont(QtGui.QFont(FONT, fluent_font_size()))
         metrics = painter.fontMetrics()
-        text = metrics.elidedText(self.currentText(), QtCore.Qt.ElideRight, text_width)
+        text = metrics.elidedText(self._display_text(), QtCore.Qt.ElideRight, text_width)
         painter.drawText(text_rect, QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, text)
 
         painter.setPen(QtCore.Qt.NoPen)
@@ -1260,12 +1260,121 @@ class FluentComboBox(QtWidgets.QComboBox):
             view.setMinimumWidth(widest + scaled_px(COMBO_WIDTH) + scaled_px(EDIT_PADDING_H) * 2)
         super().showPopup()
 
+    def _display_text(self) -> str:
+        """The text painted in the COLLAPSED combo (the seam a tree combo overrides to show a
+        fuller producer-qualified name).  Default: the current item's own text."""
+        return self.currentText()
+
     def wheelEvent(self, event):
         view = self.view()
         if view is not None and view.isVisible():
             super().wheelEvent(event)
             return
         event.ignore()
+
+
+class FluentTreeComboBox(FluentComboBox):
+    """A signal picker whose drop-down is a COLLAPSIBLE TREE (G2): one expandable parent row per
+    producing node (collapsed by default -- click to reveal its signals), each leaf a selectable
+    signal showing its shape + ready/waiting state.  Collapsed, the box paints the fuller
+    ``producer · signal`` name (frame-title aligned, G3) so you can read the source without opening
+    it.  Built on the standard QComboBox-with-QTreeView idiom (a leaf's ``currentData`` is the bare
+    signal name); the populate/read helpers live in task_console so the data shape stays there."""
+
+    #: emitted (with the bare signal name) when the user picks a leaf
+    signalPicked = QtCore.pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        tree = QtWidgets.QTreeView(self)
+        tree.setHeaderHidden(True)
+        tree.setRootIsDecorated(True)            # show the expand/collapse triangles
+        tree.setItemsExpandable(True)
+        tree.setUniformRowHeights(True)
+        tree.setExpandsOnDoubleClick(False)      # single click on the triangle expands
+        tree.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+        tree.viewport().setAutoFillBackground(False)
+        tree.viewport().setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+        pal = tree.palette()
+        pal.setColor(QtGui.QPalette.Base, QtCore.Qt.transparent)
+        pal.setColor(QtGui.QPalette.Window, QtCore.Qt.transparent)
+        tree.setPalette(pal)
+        self._model = QtGui.QStandardItemModel(self)
+        self.setModel(self._model)
+        self.setView(tree)
+        self._configure_popup_container()
+        self._display = ""                       # the producer-qualified label painted when collapsed
+        # selecting a leaf in the tree drives the combo's current item + emits signalPicked
+        tree.clicked.connect(self._on_tree_clicked)
+
+    def _display_text(self) -> str:
+        return self._display or self.currentText()
+
+    def _on_tree_clicked(self, index) -> None:
+        item = self._model.itemFromIndex(index)
+        if item is None or item.data(QtCore.Qt.UserRole) is None:
+            return                                # a parent header: let the triangle expand it
+        parent = item.parent()
+        if parent is None:
+            return
+        self.setRootModelIndex(parent.index())
+        self.setCurrentIndex(item.row())
+        self.setRootModelIndex(QtCore.QModelIndex())
+        self._display = str(item.data(QtCore.Qt.UserRole + 1) or item.text().strip())
+        self.hidePopup()
+        self.update()
+        # Emit BOTH the explicit signalPicked AND the standard ``activated`` so any existing
+        # ``combo.activated.connect(...)`` wiring fires (setCurrentIndex alone does not emit it).
+        self.activated.emit(self.currentIndex())
+        self.signalPicked.emit(self.current_signal())
+
+    def set_signal_tree(self, groups, *, current="", none_label=None) -> None:
+        """Populate the tree from ``groups`` = ``[(producer, [(leaf_label, bare_name, full_label)])]``
+        and select ``current`` (a bare signal name).  Parents are non-selectable + bold + collapsed;
+        ``none_label`` adds a leading selectable empty row."""
+        self._model.clear()
+        sel_parent_row = sel_child_row = None
+        self._display = ""
+        base = 0
+        if none_label is not None:
+            none_item = QtGui.QStandardItem(str(none_label))
+            none_item.setData("", QtCore.Qt.UserRole)
+            none_item.setData("", QtCore.Qt.UserRole + 1)
+            none_item.setEditable(False)
+            self._model.appendRow(none_item)
+            base = 1                                  # producers start one row below the none-row
+        for gi, (producer, leaves) in enumerate(groups):
+            parent = QtGui.QStandardItem(str(producer))
+            parent.setSelectable(False)
+            parent.setEditable(False)
+            font = parent.font(); font.setBold(True); parent.setFont(font)
+            for ci, (leaf_label, bare, full_label) in enumerate(leaves):
+                child = QtGui.QStandardItem(str(leaf_label))
+                child.setData(str(bare), QtCore.Qt.UserRole)
+                child.setData(str(full_label), QtCore.Qt.UserRole + 1)
+                child.setEditable(False)
+                if current and str(bare) == str(current):
+                    # the parent's FINAL model row is base+gi (parent.row() is -1 until appended)
+                    sel_parent_row, sel_child_row = base + gi, ci
+                    self._display = str(full_label)
+                parent.appendRow(child)
+            self._model.appendRow(parent)
+        view = self.view()
+        if isinstance(view, QtWidgets.QTreeView):
+            view.collapseAll()
+        if sel_parent_row is not None:
+            parent_index = self._model.index(sel_parent_row, 0)
+            self.setRootModelIndex(parent_index)
+            self.setCurrentIndex(sel_child_row)
+            self.setRootModelIndex(QtCore.QModelIndex())
+        elif none_label is not None:
+            self.setCurrentIndex(0)
+        self.update()
+
+    def current_signal(self) -> str:
+        """The selected leaf's bare signal name ('' for none / a header)."""
+        data = self.currentData(QtCore.Qt.UserRole)
+        return str(data).strip() if data else ""
 
 
 class _FluentTabCloseButton(QtWidgets.QToolButton):

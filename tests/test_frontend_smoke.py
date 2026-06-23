@@ -1487,21 +1487,42 @@ def test_task_console_signal_picker_and_declarative_params(monkeypatch):
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from Zou_lab_control.frontend import devtools as dt
 
+    from PyQt5 import QtCore
+
     console = dt.demo_console(shots=10)
     card = next(c for c in console.cards if c.config.kind == "2d")
     card._refresh_signal_combo()
-    names = [card.signal_combo.itemText(i) for i in range(card.signal_combo.count())]
-    datas = [card.signal_combo.itemData(i) for i in range(card.signal_combo.count())]
-    assert names[0] == "(none)"                            # blank = turn the slot off
-    # items are LABELLED "<name> — <source node>  [<shape>]"; the bare signal name is the
-    # item DATA (what `signal` is filled from), so check the data list.
+    combo = card.signal_combo                              # now a FluentTreeComboBox (G2)
+    model = combo._model
+    # walk the COLLAPSIBLE tree: producer parents at top level (one is the "(none)" row),
+    # signals are their leaves -- the bare signal name is each leaf's UserRole data.
+    assert model.item(0).text() == "(none)"               # blank = turn the slot off
+
+    def _leaf_datas():
+        out = []
+        for r in range(model.rowCount()):
+            parent = model.item(r)
+            for cr in range(parent.rowCount()):
+                out.append(parent.child(cr).data(QtCore.Qt.UserRole))
+        return out
+
+    def _pick(name):
+        for r in range(model.rowCount()):
+            parent = model.item(r)
+            for cr in range(parent.rowCount()):
+                child = parent.child(cr)
+                if child.data(QtCore.Qt.UserRole) == name:
+                    combo._on_tree_clicked(child.index())
+                    return True
+        return False
+
+    datas = _leaf_datas()
     assert "rate_grid" in datas and "frame" in datas
     # the demo 2d card is the synced readout image -> its input is the judged frame (#5)
-    assert card.signal_combo.currentData() == "frame_judged"
+    assert combo.current_signal() == "frame_judged"
 
-    idx = datas.index("rate_grid")
-    card.signal_combo.setCurrentIndex(idx)
-    card._on_slot_pick(0)                                   # pick the input signal
+    assert _pick("rate_grid")                              # pick the input signal in the tree
+    card._on_slot_pick(0)
     assert card.config.inputs[0] == "rate_grid"            # input now names rate_grid
     assert card.config.source == "value = signal"          # the picked signal IS `signal`
     console.refresh_once()
