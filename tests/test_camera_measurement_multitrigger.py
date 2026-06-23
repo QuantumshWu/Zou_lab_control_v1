@@ -61,7 +61,7 @@ def test_readout_image_frame_judged_is_synced_with_occupancy():
     cal = exp.readout.current
     hub = SignalHub()
     cam = CameraMeasurement(hub, exp.camera, sequencer=exp.devices.sequencer)
-    det = OccupancyProcessor(hub, calibration=cal, source="frame", method="box", grid_shape=(3, 4))
+    det = OccupancyProcessor(hub, calibration=cal, source_expr={"inputs": ["frame"], "source": "value = signal"}, method="box", grid_shape=(3, 4))
     fire_live_imaging(exp)            # On Pulse: the trigger-driven camera now streams
     for _ in range(4):
         cam.step()
@@ -91,7 +91,7 @@ def test_console_resolves_2d_frame_panel_to_judged_frame_for_shot_alignment():
     cal = exp.readout.current
     hub = SignalHub()
     cam = CameraMeasurement(hub, exp.camera, sequencer=exp.devices.sequencer)
-    det = OccupancyProcessor(hub, calibration=cal, source="frame", method="box", grid_shape=(3, 4))
+    det = OccupancyProcessor(hub, calibration=cal, source_expr={"inputs": ["frame"], "source": "value = signal"}, method="box", grid_shape=(3, 4))
     fire_live_imaging(exp)            # On Pulse: the trigger-driven camera now streams
 
     # the exact race: judge one frame, then the camera streams TWO newer frames before the
@@ -110,10 +110,16 @@ def test_console_resolves_2d_frame_panel_to_judged_frame_for_shot_alignment():
     # with no occupancy judging it, a standalone camera view keeps the LIVE frame
     assert TaskConsole._coherent_frame_signal(SimpleNamespace(running_nodes=[]), "frame") == "frame"
 
-    # REAL panel resolution: a 2D-image panel bound to 'frame' now reads the judged frame
+    # REAL panel resolution: a 2D-image panel bound to 'frame' now reads the judged frame.
+    # _with_signal_slots delegates the slot-packing + frame-coherence rewrite to the shared
+    # SignalExpr via the panel's _signal_expr()/_frame_resolve() helpers, so the stub binds
+    # those real (unbound) PanelCard methods to itself.
     panel = SimpleNamespace(
         config=SimpleNamespace(inputs=["frame"]),
+        _compiled_source="value = signal",
         frame_coherence_provider=lambda n: TaskConsole._coherent_frame_signal(console, n))
+    panel._signal_expr = PanelCard._signal_expr.__get__(panel)
+    panel._frame_resolve = PanelCard._frame_resolve.__get__(panel)
     panel_signal = np.asarray(PanelCard._with_signal_slots(panel, ns)["signal"])
 
     assert np.array_equal(panel_signal, judged)          # 2D panel == site-map underlay (same shot)

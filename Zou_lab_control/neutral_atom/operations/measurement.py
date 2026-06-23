@@ -63,6 +63,12 @@ class ParamDecl:
                       ``path_mode='dir'`` picks a folder.  Taken verbatim, never eval'd.
     ``"signal"``      the NAME of a hub signal to consume (a processor's input): a combo
                       box of the live hub signals, like a plot's input picker.
+    ``"signal_expr"`` a MULTI-slot signal picker + a ``value = ...`` expression (the same
+                      one a plot panel's source uses): pick one or more hub signals (read as
+                      ``signal`` / ``signal[i]``) and combine them.  The value is a
+                      ``{"inputs": [name, ...], "source": "value = ..."}`` dict -- so a
+                      processor/measurement "source" can subscribe to several running nodes'
+                      signals and combine them, never just one bare name.
     ``"pulse_param"`` a parameter of a pulse template to sweep: a combo box whose choices are
                       introspected from the template FILE named in the ``depends_on`` field
                       (its periods / channels / DAC buses), so picking the template repopulates
@@ -95,10 +101,10 @@ class ParamDecl:
     def __post_init__(self) -> None:
         kind = str(self.kind).lower()
         if kind not in ("float", "int", "axis_range", "bool", "choice", "text", "path",
-                        "signal", "pulse_param", "pulse_slots"):
+                        "signal", "signal_expr", "pulse_param", "pulse_slots"):
             raise ValueError(
                 "ParamDecl.kind must be one of "
-                "float/int/axis_range/bool/choice/text/path/signal/pulse_param/pulse_slots, "
+                "float/int/axis_range/bool/choice/text/path/signal/signal_expr/pulse_param/pulse_slots, "
                 f"got {self.kind!r}."
             )
         object.__setattr__(self, "kind", kind)

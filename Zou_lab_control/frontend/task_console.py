@@ -351,14 +351,191 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
         return all(w.text().strip() for w in self._scan_widgets.values())
 
 
-# The ONE description of a panel's source-expression namespace -- shown both as the inline
-# field's tooltip and as the floating editor's prompt, so the two never drift.
-SOURCE_EXPR_HELP = (
-    "Panel data source: one line of Python evaluated against the live signals.\n"
-    "Assign the result to `value`.  `signal` is the picked signal (one slot); with more\n"
-    "than one slot it is a list, so `value = signal[0] - signal[1]` combines them.\n"
-    "Namespace: every signal name (latest value), history(name, n), latest(name),\n"
-    "names(), shot, np, math.")
+# The ONE description of a source expression's namespace -- owned by operations.signal_expr
+# (the single source the analysis layer + GUI share), fetched lazily so the frontend module
+# import stays off neutral_atom's import graph (every other neutral_atom use here is lazy too).
+_SOURCE_EXPR_HELP_CACHE: str | None = None
+
+
+def SOURCE_EXPR_HELP() -> str:
+    """The expression-namespace help text (a callable so it stays a single source -- the literal
+    lives once in ``operations.signal_expr.SIGNAL_EXPR_HELP``)."""
+    global _SOURCE_EXPR_HELP_CACHE
+    if _SOURCE_EXPR_HELP_CACHE is None:
+        from ..neutral_atom.operations.signal_expr import SIGNAL_EXPR_HELP
+        _SOURCE_EXPR_HELP_CACHE = SIGNAL_EXPR_HELP
+    return _SOURCE_EXPR_HELP_CACHE
+
+class _SignalExprWidget(QtWidgets.QWidget):
+    """A multi-slot hub-signal picker + a ``value = ...`` expression -- the SAME source control a
+    plot panel uses, packaged as a measurement/processor param (ParamDecl kind ``signal_expr``).
+
+    Pick one or more live hub signals (read as ``signal`` / ``signal[i]``) and combine them in a
+    one-line expression.  So ANY "source" field -- a processor's frame, a pulse-scan's y -- can
+    subscribe to several running nodes' signals, never just one bare name.  Output schema:
+    ``{"inputs": [name, ...], "source": "value = ..."}`` (the :class:`SignalExpr` value).  Reuses
+    the SAME primitives as the panel Setting (``fill_grouped_signal_combo`` / ``read_editable_combo``
+    / the ``FluentFloatingEditor``) + the shared seed rule, so the logic is single-source."""
+
+    changed = QtCore.pyqtSignal()
+
+    def __init__(self, *, signals_provider=None, sources_provider=None, formats_provider=None, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet("background: transparent;")
+        self._signals_provider = signals_provider
+        self._sources_provider = sources_provider
+        self._formats_provider = formats_provider
+        self._inputs: list[str] = ["frame"]
+        self._editor = None
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(scaled_px(4, minimum=3))
+        self._slot_box = QtWidgets.QVBoxLayout()
+        self._slot_box.setContentsMargins(0, 0, 0, 0)
+        self._slot_box.setSpacing(scaled_px(4, minimum=3))
+        root.addLayout(self._slot_box)
+        self.slot_combos: list = []
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.setContentsMargins(0, 0, 0, 0)
+        btn_row.setSpacing(scaled_px(6, minimum=4))
+        self._add_btn = FluentButton("+ signal", color=GREY)
+        self._add_btn.setToolTip("Add another signal slot (read as signal[i] in the expression).")
+        self._add_btn.clicked.connect(self._add_slot)
+        self._rm_btn = FluentButton("− signal", color=GREY)
+        self._rm_btn.setToolTip("Remove the last signal slot.")
+        self._rm_btn.clicked.connect(self._remove_slot)
+        btn_row.addWidget(self._add_btn, 0)
+        btn_row.addWidget(self._rm_btn, 0)
+        btn_row.addStretch(1)
+        root.addLayout(btn_row)
+        self._source_edit = FluentLineEdit("value = signal")
+        self._source_edit.setMinimumWidth(scaled_px(200, minimum=160))
+        self._source_edit.setToolTip(SOURCE_EXPR_HELP())
+        self._source_edit.textChanged.connect(self.changed)
+        self._edit_btn = FluentButton("Edit…", color=GREY)
+        self._edit_btn.setFixedWidth(scaled_px(56, minimum=44))
+        self._edit_btn.setToolTip("Open a large floating editor for this expression")
+        self._edit_btn.clicked.connect(self._open_editor)
+        expr_row = QtWidgets.QHBoxLayout()
+        expr_row.setContentsMargins(0, 0, 0, 0)
+        expr_row.setSpacing(scaled_px(6, minimum=4))
+        expr_row.addWidget(self._source_edit, 1)
+        expr_row.addWidget(self._edit_btn, 0)
+        root.addLayout(expr_row)
+        self._rebuild_slots()
+
+    def _names(self) -> list:
+        try:
+            return [str(n) for n in self._signals_provider()] if callable(self._signals_provider) else []
+        except Exception:
+            return []
+
+    def _sources(self) -> dict:
+        try:
+            return self._sources_provider() if callable(self._sources_provider) else {}
+        except Exception:
+            return {}
+
+    def _formats(self) -> dict:
+        try:
+            return self._formats_provider() if callable(self._formats_provider) else {}
+        except Exception:
+            return {}
+
+    def _rebuild_slots(self) -> None:
+        for combo in self.slot_combos:
+            combo.setParent(None); combo.deleteLater()
+        self.slot_combos = []
+        while self._slot_box.count():
+            item = self._slot_box.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None); w.deleteLater()
+        n = max(1, len(self._inputs))
+        for i in range(n):
+            combo = FluentComboBox()
+            combo.setEditable(True)
+            label = f"signal[{i}]" if n > 1 else "signal"
+            cur = self._inputs[i] if i < len(self._inputs) else ""
+            fill_grouped_signal_combo(combo, names=self._names(), sources=self._sources(),
+                                      formats=self._formats(), current=cur)
+            combo.activated.connect(lambda *_a, idx=i: self._on_pick(idx))
+            self.slot_combos.append(combo)
+            self._slot_box.addWidget(FluentSettingRow(label, combo, label_width=scaled_px(64, minimum=52)))
+        self._rm_btn.setEnabled(n > 1)
+
+    def _collect_inputs(self) -> None:
+        if self.slot_combos:
+            self._inputs = [read_editable_combo(c) for c in self.slot_combos]
+
+    def _on_pick(self, idx: int) -> None:
+        self._collect_inputs()
+        # Single slot: the picker IS "read this signal" -> point the source at it (value = signal).
+        # Multi-slot: the expression is user-authored across slots, so a pick just rebinds slot idx.
+        if len(self.slot_combos) <= 1 and idx == 0:
+            self._source_edit.blockSignals(True)
+            self._source_edit.setText("value = signal")
+            self._source_edit.blockSignals(False)
+        self.changed.emit()
+
+    def _add_slot(self) -> None:
+        from ..neutral_atom.operations.signal_expr import seed_source_for_slots
+        self._collect_inputs()
+        self._inputs.append("")
+        self._source_edit.blockSignals(True)
+        self._source_edit.setText(seed_source_for_slots(len(self._inputs), self._source_edit.text()))
+        self._source_edit.blockSignals(False)
+        self._rebuild_slots()
+        self.changed.emit()
+
+    def _remove_slot(self) -> None:
+        if len(self._inputs) <= 1:
+            return
+        from ..neutral_atom.operations.signal_expr import seed_source_for_slots
+        self._collect_inputs()
+        self._inputs.pop()
+        self._source_edit.blockSignals(True)
+        self._source_edit.setText(seed_source_for_slots(len(self._inputs), self._source_edit.text()))
+        self._source_edit.blockSignals(False)
+        self._rebuild_slots()
+        self.changed.emit()
+
+    def _open_editor(self) -> None:
+        if self._editor is not None:
+            self._editor.raise_(); self._editor.activateWindow(); return
+        self._editor = FluentFloatingEditor(SOURCE_EXPR_HELP(), self._source_edit.text(),
+                                            self.window(), title="Edit signal expression")
+        self._editor.applied.connect(lambda text: self._source_edit.setText(" ".join(text.split("\n")).strip()))
+        self._editor.destroyed.connect(self._clear_editor)
+        self._editor.show()
+
+    def _clear_editor(self, *_a) -> None:
+        self._editor = None
+
+    def rebuild_combos(self) -> None:
+        """Refill every slot combo from the providers (a tab re-show: a signal published since
+        the form opened becomes pickable), keeping the current pick."""
+        for combo in self.slot_combos:
+            cur = read_editable_combo(combo)
+            fill_grouped_signal_combo(combo, names=self._names(), sources=self._sources(),
+                                      formats=self._formats(), current=cur)
+
+    def values_dict(self) -> dict:
+        """The current ``{"inputs": [...], "source": "value = ..."}`` (the signal_expr value)."""
+        self._collect_inputs()
+        inputs = [str(n) for n in self._inputs if str(n).strip()]
+        return {"inputs": inputs, "source": self._source_edit.text().strip() or "value = signal"}
+
+    def set_value(self, value) -> None:
+        """Seed from a ``{"inputs", "source"}`` dict (a default / saved value)."""
+        from ..neutral_atom.operations.signal_expr import SignalExpr
+        expr = SignalExpr.from_value(value)
+        self._inputs = list(expr.inputs) or ["frame"]
+        self._source_edit.blockSignals(True)
+        self._source_edit.setText(expr.source)
+        self._source_edit.blockSignals(False)
+        self._rebuild_slots()
+
 
 # Every Monitor-board panel is a PURE VIEW (role "plot"): it is fully decoupled
 # from acquisition -- it shows a hub signal and carries the full plotter Edit (the
@@ -1095,7 +1272,7 @@ class PanelCard(FluentGroupBox):
         self.source_edit.setMinimumWidth(scaled_px(280, minimum=220))
         self.source_edit.setStyleSheet(
             self.source_edit.styleSheet() + " QLineEdit { font-family: Consolas, monospace; }")
-        self.source_edit.setToolTip(SOURCE_EXPR_HELP)
+        self.source_edit.setToolTip(SOURCE_EXPR_HELP())
         # An inline one-liner is cramped for a real expression; "Edit…" pops a LARGE floating
         # multi-line editor (a modal card, so it does NOT reflow the panel layout) prefilled
         # with the source -- comfortable for typing math across signals -- and writes it back.
@@ -1596,7 +1773,7 @@ class PanelCard(FluentGroupBox):
         existing = getattr(self, "_expr_editor", None)
         if existing is not None:
             existing.raise_(); existing.activateWindow(); return
-        editor = FluentFloatingEditor(SOURCE_EXPR_HELP, self.source_edit.text(), self.window(),
+        editor = FluentFloatingEditor(SOURCE_EXPR_HELP(), self.source_edit.text(), self.window(),
                                       title="Edit panel source expression")
 
         def _apply(text: str) -> None:
@@ -1652,42 +1829,40 @@ class PanelCard(FluentGroupBox):
         shot = namespace.get("shot")
         self.set_status(f"shot {int(shot)}" if isinstance(shot, (int, float)) else "ok", error=False)
 
+    def _signal_expr(self):
+        """This panel's source as the ONE reusable :class:`SignalExpr` (the slot rule + the
+        ``value = ...`` contract live there, shared with processors / pulse-scan).  Lazy import
+        keeps the frontend module off neutral_atom's import graph (every neutral_atom use here
+        is lazy)."""
+        from ..neutral_atom.operations.signal_expr import SignalExpr
+        return SignalExpr(self.config.inputs, self._compiled_source)
+
+    def _frame_resolve(self, name: str) -> str:
+        """Shot-coherence rewrite: if a running occupancy processor is JUDGING this camera frame,
+        read the frame it actually judged (``frame_judged``) instead of the camera's live (newer)
+        frame -- so a 2D-image bound to ``frame`` and a site-map bound to ``occupied`` show the
+        SAME shot.  Identity when nothing judges it.  Injected into ``SignalExpr`` as ``resolve``."""
+        if name and callable(self.frame_coherence_provider):
+            try:
+                return str(self.frame_coherence_provider(name)) or name
+            except Exception:
+                return name
+        return name
+
     def _with_signal_slots(self, namespace: Mapping[str, object]) -> dict[str, object]:
-        """Return a namespace copy with ``signal`` = the value of this panel's picked input
-        (``config.inputs[0]``), or ``None`` when blank / not on the hub yet.  So the default
-        source ``value = signal`` plots the picked signal; an expression can still read it as
-        ``value = np.log(signal)`` or name a hub signal directly."""
+        """Return a namespace copy with ``signal`` = the value of this panel's picked input(s):
+        the scalar for one slot (so ``value = signal`` plots the picked signal), a list for many
+        (so ``value = signal[0] - signal[1]`` combines them).  The slot-packing rule + the
+        shot-coherence resolve hook are owned by :class:`SignalExpr`."""
         ns = dict(namespace)
-
-        def _resolve(name: str):
-            # Shot-coherence: if a running occupancy processor is JUDGING this camera frame,
-            # read the frame it actually judged (`frame_judged`) instead of the camera's live
-            # (newer) frame -- so a 2D-image bound to `frame` and a site-map bound to `occupied`
-            # show the SAME shot.  Falls through to the live frame when nothing judges it.
-            if name and callable(self.frame_coherence_provider):
-                try:
-                    name = str(self.frame_coherence_provider(name)) or name
-                except Exception:
-                    pass
-            return ns.get(name) if name else None
-
-        resolved = [_resolve(str(n)) for n in self.config.inputs]
-        # ONE slot (the common case): `signal` is the scalar value, so the default
-        # `value = signal` plots the picked signal (and `value = np.log(signal)` etc. still
-        # work).  MORE than one slot (the user added signal slots): `signal` is a LIST, so an
-        # expression combines them by index -- `value = signal[0] - signal[1]` is the
-        # difference of the two picked signals.  signal[i] is the i-th slot's current value.
-        ns["signal"] = (resolved[0] if resolved else None) if len(resolved) <= 1 else resolved
+        ns["signal"] = self._signal_expr().signal_for(ns, resolve=self._frame_resolve)
         return ns
 
     def _evaluate(self, namespace: dict[str, object]):
-        # SECURITY: runs the panel's user-entered snippet as arbitrary Python.
-        # Same trusted-local-tool posture as the pulse GUI Scan tab -- only run
-        # layouts you wrote or trust.
-        exec(self._compiled_source, namespace)  # noqa: S102 - local experiment tool, trusted input only
-        if "value" not in namespace:
-            raise ValueError("assign the panel data to a `value = ...` variable")
-        return namespace["value"]
+        # SECURITY: runs the panel's user-entered snippet as arbitrary Python.  Same
+        # trusted-local-tool posture as the pulse GUI Scan tab.  ``signal`` is already injected
+        # by _with_signal_slots; SignalExpr owns the exec + the ``value = ...`` contract.
+        return self._signal_expr().exec_in(namespace)
 
     def _coerce(self, value):
         kind = self.config.kind
@@ -1758,12 +1933,7 @@ class PanelCard(FluentGroupBox):
         key = (self._compiled_source, tuple(self.config.inputs))
         if key != self._ref_src:               # (re)derive on source OR slot change
             self._ref_src = key
-            try:
-                names = set(compile(str(self._compiled_source), "<panel-source>", "exec").co_names)
-            except Exception:
-                names = set()
-            names.update(str(n) for n in self.config.inputs if n)   # slot signal[i] -> real name
-            self._ref_names = frozenset(names)
+            self._ref_names = self._signal_expr().co_names()   # names referenced + picked slots
         return self._ref_names
 
     def _source_coord_frame(self, namespace: Mapping[str, object] | None):
@@ -2238,13 +2408,26 @@ class MeasurementPanel(QtWidgets.QWidget):
                 combo.activated.connect(lambda *_: self._refresh_start_enabled())
                 self.form.addRow(label_text, combo)
                 self._widgets[decl.key] = ("signal", combo)
+            elif kind == "signal_expr":
+                # A MULTI-slot signal picker + a ``value = ...`` expression -- the SAME source
+                # control a plot panel uses (one reusable widget).  Lets a processor/measurement
+                # "source" subscribe to several running nodes' signals and combine them, not just
+                # one bare name.  Value is {"inputs": [...], "source": "value = ..."}.
+                widget = _SignalExprWidget(signals_provider=self._signals_provider,
+                                           sources_provider=self._sources_provider,
+                                           formats_provider=self._formats_provider)
+                widget.set_value(decl.default if decl.default is not None else {})
+                widget.setToolTip(decl.tooltip)
+                widget.changed.connect(self._refresh_start_enabled)
+                self.form.addRow(label_text, widget)
+                self._widgets[decl.key] = ("signal_expr", widget)
             elif kind == "pulse_slots":
                 # An AUTO-GENERATED sub-form for the pulse template named in decl.depends_on:
                 # one numeric input per API slot (a1/a2/...) and one points-expression input per
                 # scan slot (s0/s1/...).  When the template path changes the form rebuilds; when
                 # the operator types into a sub-row the value is collected as
                 # {"api": {name: float}, "scan": {name: text-expression}} -- the same shape the
-                # PulseScanMeasurement build() consumes.  ONE source for the pulse slot form,
+                # pulse_scan build() consumes.  ONE source for the pulse slot form,
                 # so a NEW measurement that takes a pulse template gets this row for free.
                 widget = _PulseSlotsWidget()
                 widget.setToolTip(decl.tooltip)
@@ -2388,6 +2571,9 @@ class MeasurementPanel(QtWidgets.QWidget):
             elif tag == "pulse_slots":
                 # auto-form output: {"api": {a1: 1e-3, ...}, "scan": {s0: "linspace(...)", ...}}
                 values[key] = entry[1].values_dict()
+            elif tag == "signal_expr":
+                # multi-slot signal + expression: {"inputs": [...], "source": "value = ..."}
+                values[key] = entry[1].values_dict()
             else:  # float
                 values[key] = float(entry[1].value())
         return values
@@ -2416,6 +2602,8 @@ class MeasurementPanel(QtWidgets.QWidget):
                 self._repopulate_pulse_param(key)
             elif tag == "pulse_slots":
                 self._repopulate_pulse_slots(key)
+            elif tag == "signal_expr":
+                widget.rebuild_combos()      # a signal published since the form opened becomes pickable
         self._refresh_start_enabled()
 
     def set_axis_range(self, lo: float, hi: float) -> bool:
@@ -2503,6 +2691,8 @@ class MeasurementPanel(QtWidgets.QWidget):
                         entry[1].setCurrentText(cur)
                 elif tag == "pulse_param":
                     entry[1].setCurrentText("" if val is None else str(val))
+                elif tag == "signal_expr":
+                    entry[1].set_value(val)            # {"inputs": [...], "source": "..."}
                 elif tag == "float":
                     entry[1].setValue(float(val))
             except (TypeError, ValueError):
@@ -4054,19 +4244,19 @@ class TaskConsole(QtWidgets.QWidget):
         the processor judges an older one, so ``latest(frame)`` (what a 2D panel bound to
         ``frame`` would show) is a DIFFERENT shot from the occupancy a site-map shows.
 
-        When a RUNNING occupancy processor consumes this exact frame signal (its ``source``),
-        return that node's judged-frame output (``frame_judged``, namespaced by the node's
-        prefix) -- the EXACT frame its occupancy was computed from, published atomically with
-        ``occupied``.  A 2D-image(frame) then tracks the same shot as a site-map(occupied).
-        With no occupancy judging it, return the live frame unchanged (a standalone camera
-        view should show the newest frame)."""
+        When a RUNNING occupancy processor CONSUMES this exact frame signal (it is one of the
+        node's ``consumes`` inputs), return that node's judged-frame output (``frame_judged``,
+        namespaced by the node's prefix) -- the EXACT frame its occupancy was computed from,
+        published atomically with ``occupied``.  A 2D-image(frame) then tracks the same shot as
+        a site-map(occupied).  With no occupancy judging it, return the live frame unchanged (a
+        standalone camera view should show the newest frame)."""
         name = str(frame_signal or "")
         if not name:
             return name
         for node in self.running_nodes:
             image_key = getattr(node, "sitemap_image_key", "")   # the judged-frame output
-            source = getattr(node, "source", None)               # the frame it consumes
-            if image_key and source == name:
+            consumes = getattr(node, "consumes", ())             # the frame(s) it reacts to
+            if image_key and name in consumes:
                 return getattr(node, "prefix", "") + image_key
         return name
 
@@ -4591,12 +4781,20 @@ class TaskConsole(QtWidgets.QWidget):
         if spec is None:
             raise RuntimeError(f"no catalog spec named {node.name!r} for a {kind} node")
         if kind == "measurement":
-            measurement = spec.build(**values)
+            built = spec.build(**values)
+            if getattr(spec, "metadata", {}).get("node") == "pulse_scan":
+                # Pulse-scan is a DEVICE-driving node whose y is DECOUPLED (subscribed from
+                # another running node), not a frame-reducing ScannedMeasurementNode: it fires +
+                # publishes the frame, waits for the consumer to refresh, then reads the y
+                # expression.  ``build`` returned a PulseScanPlan carrier.
+                from Zou_lab_control.neutral_atom.operations.logic import PulseScanNode
+                return PulseScanNode(self.hub, built, x_key=spec.x_key, y_key=spec.y_key,
+                                     prefix=f"{spec.key}_")
             from Zou_lab_control.neutral_atom.operations.logic import ScannedMeasurementNode
             # The node publishes under the measurement's slug (spec.key), so every signal
             # is ``<slug>_<quantity>`` (e.g. temperature_t_off) -- one name, derived.
             return ScannedMeasurementNode(
-                self.hub, measurement, x_key=spec.x_key, y_key=spec.y_key, prefix=f"{spec.key}_")
+                self.hub, built, x_key=spec.x_key, y_key=spec.y_key, prefix=f"{spec.key}_")
         if kind == "processor":
             # REACTIVE processor (the "func" layer): a live node consuming hub signals
             # and republishing derived ones -- e.g. judging occupancy from each frame.

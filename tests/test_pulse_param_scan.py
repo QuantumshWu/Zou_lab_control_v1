@@ -36,6 +36,19 @@ def _template() -> PulseTableState:
     return default_imaging_template()
 
 
+def _safe_unlink(path) -> None:
+    """Best-effort delete of a gitignored temp pulse file, tolerant of a transient Windows
+    file-handle race (AV / GC) -- a lingering temp file under pulses/ is harmless."""
+    import gc
+    p = Path(path)
+    for _ in range(3):
+        try:
+            p.unlink(missing_ok=True)
+            return
+        except PermissionError:
+            gc.collect()
+
+
 # --------------------------------------------------------------------------- name/value plumbing
 def test_period_index_by_name_resolves_named_period():
     state = _template()
@@ -132,55 +145,91 @@ def _bound_probe_with_scan(exp) -> str:
     return str(out)
 
 
-def _run_pulse_scan(exp, **build_kwargs):
-    """Build the Pulse-scan measurement and drive it to completion through the SAME live node
-    the task console uses; return (x, y, measurement)."""
+def _run_pulse_scan(exp, *, y=None, **build_kwargs):
+    """Build the Pulse-scan PLAN, wire a Judge-occupancy processor as the DECOUPLED y source,
+    and drive the node to completion -- the SAME path the task console uses, but single-threaded
+    (the occupancy is settled inline per point for deterministic headless timing).  Returns
+    (x, y, node, hub)."""
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
-    from Zou_lab_control.neutral_atom.operations.logic import ScannedMeasurementNode
+    from Zou_lab_control.neutral_atom.operations.logic import OccupancyProcessor, PulseScanNode
 
     spec = {s.name: s for s in exp.readout.measurement_specs()}["Pulse scan"]
-    measurement = spec.build(**build_kwargs)
+    plan = spec.build(y=y, **build_kwargs)
     hub = SignalHub()
-    node = ScannedMeasurementNode(hub, measurement, x_key=spec.x_key, y_key=spec.y_key,
-                                  prefix=f"{spec.key}_")
+    # The y producer: a real Judge-occupancy node consuming the frame pulse-scan publishes
+    # (publishes bare 'occupied'/'rate'/... since prefix="").  Not started on its own thread;
+    # pulse-scan settles it INLINE per point (single-threaded determinism, same evaluate path).
+    occ = OccupancyProcessor(hub, calibration=exp.readout.require(thresholds=True),
+                             source_expr={"inputs": ["frame"], "source": "value = signal"},
+                             grid_shape=(3, 4))
+    plan.settle = occ.step
+    node = PulseScanNode(hub, plan, x_key=spec.x_key, y_key=spec.y_key, prefix=f"{spec.key}_")
     node.run_to_completion()
     return (np.asarray(hub.latest(f"{spec.key}_{spec.x_key}"), dtype=float),
             np.asarray(hub.latest(f"{spec.key}_{spec.y_key}"), dtype=float),
-            measurement)
+            node, hub)
 
 
-def test_pulse_scan_spec_carries_pulse_slots_form():
-    """The redesigned spec exposes ONE auto-form (pulse_slots) bound to the template field
-    -- no hard-coded scan_target/scan range any more."""
+def test_pulse_scan_spec_carries_pulse_slots_and_signal_expr_y():
+    """The decoupled spec exposes ONE pulse_slots auto-form (api + scan slots bound to the
+    template) and a signal_expr y (the subscribed source) -- no reduce/shots, and it is tagged
+    as a device-driving pulse_scan node."""
     exp = _calibrated()
     try:
         specs = {s.name: s for s in exp.readout.measurement_specs()}
         assert "Pulse scan" in specs
         spec = specs["Pulse scan"]
         assert (spec.x_key, spec.y_key) == ("param", "signal")
+        assert spec.metadata.get("node") == "pulse_scan"
         slots_decl = next(p for p in spec.params if p.kind == "pulse_slots")
         assert slots_decl.depends_on == "template"
-        # no other "scan target" param; the slots form is the only template-driver
+        # y is a multi-source signal expression (the decoupled subscription), not a reducer choice
+        y_decl = next(p for p in spec.params if p.kind == "signal_expr")
+        assert "inputs" in y_decl.default and "source" in y_decl.default
+        keys = {p.key for p in spec.params}
+        assert "reduce" not in keys and "shots" not in keys      # old reducer params are gone
+        assert "n_frames" in keys
         assert not any(p.kind == "pulse_param" for p in spec.params)
     finally:
         exp.close()
 
 
-@pytest.mark.parametrize("reduce", ["counts", "loading", "fidelity"])
-def test_pulse_scan_runs_each_reduce_mode_headless(reduce):
-    """Each reduce mode sweeps ONE bound scan slot and yields a finite curve over the SAME
-    camera/calibration contract (virtual==real; only frames are simulated)."""
+def test_pulse_scan_y_tracks_subscribed_occupancy_signal():
+    """The node sweeps ONE bound scan slot (x = the points) and y = the occupancy signal it
+    subscribes to: after each point publishes a frame + the occupancy is settled, y equals the
+    consumer's just-published value (the decoupled-source + settle contract)."""
     exp = _calibrated()
     probe = _bound_probe_with_scan(exp)
     try:
-        x, y, m = _run_pulse_scan(
+        x, y, node, hub = _run_pulse_scan(
             exp, template=probe,
             pulse_slots={"api": {}, "scan": {"s0": "linspace(10, 40, 5)"}},
-            shots=4, reduce=reduce)
+            n_frames=1, y={"inputs": ["rate"], "source": "value = signal"})
         assert x.shape == (5,) and y.shape == (5,)
         assert np.isfinite(x).all() and np.isfinite(y).all()
+        # y is the loading rate (a fraction) the occupancy node published, not a frame reduction
+        assert np.all((y >= 0.0) & (y <= 1.0))
+        # the final y point equals the occupancy 'rate' currently on the hub (read AFTER settle)
+        assert y[-1] == pytest.approx(float(hub.latest("rate")))
     finally:
-        Path(probe).unlink(missing_ok=True)
+        _safe_unlink(probe)
+        exp.close()
+
+
+def test_pulse_scan_y_expression_over_multiple_signals():
+    """The y source is a multi-slot expression: it can combine several subscribed signals
+    (e.g. mean of the per-site occupancy vector)."""
+    exp = _calibrated()
+    probe = _bound_probe_with_scan(exp)
+    try:
+        x, y, node, hub = _run_pulse_scan(
+            exp, template=probe,
+            pulse_slots={"api": {}, "scan": {"s0": "[10, 20, 30]"}},
+            n_frames=1, y={"inputs": ["occupied"], "source": "value = np.mean(signal)"})
+        assert x.shape == (3,) and y.shape == (3,)
+        assert np.isfinite(y).all() and np.all((y >= 0.0) & (y <= 1.0))
+    finally:
+        _safe_unlink(probe)
         exp.close()
 
 
@@ -197,16 +246,14 @@ def test_pulse_scan_api_value_is_applied_once_at_build():
         st.bind_api_field("delay", ch, unit="us")
         st.save(probe)
         spec = {s.name: s for s in exp.readout.measurement_specs()}["Pulse scan"]
-        m = spec.build(template=probe,
-                       pulse_slots={"api": {"a1": 1.5}, "scan": {"s0": "linspace(1, 3, 3)"}},
-                       shots=1, reduce="counts")
-        assert m.base_state.delays.get(ch) == pytest.approx(1.5)
+        plan = spec.build(template=probe,
+                          pulse_slots={"api": {"a1": 1.5}, "scan": {"s0": "linspace(1, 3, 3)"}})
+        assert plan.base_state.delays.get(ch) == pytest.approx(1.5)
         with pytest.raises(ValueError):
             spec.build(template=probe,
-                       pulse_slots={"api": {"a9": 1.0}, "scan": {"s0": "linspace(1, 3, 3)"}},
-                       shots=1, reduce="counts")
+                       pulse_slots={"api": {"a9": 1.0}, "scan": {"s0": "linspace(1, 3, 3)"}})
     finally:
-        Path(probe).unlink(missing_ok=True)
+        _safe_unlink(probe)
         exp.close()
 
 
@@ -218,10 +265,9 @@ def test_pulse_scan_missing_scan_points_raises():
     try:
         spec = {s.name: s for s in exp.readout.measurement_specs()}["Pulse scan"]
         with pytest.raises(ValueError, match="no points expression"):
-            spec.build(template=probe, pulse_slots={"api": {}, "scan": {"s0": ""}},
-                       shots=1, reduce="counts")
+            spec.build(template=probe, pulse_slots={"api": {}, "scan": {"s0": ""}})
     finally:
-        Path(probe).unlink(missing_ok=True)
+        _safe_unlink(probe)
         exp.close()
 
 
@@ -242,8 +288,7 @@ def test_pulse_scan_mismatched_lockstep_sizes_raise():
         with pytest.raises(ValueError, match=r"(?i)same number of points"):
             spec.build(template=str(probe),
                        pulse_slots={"api": {}, "scan": {"s0": "linspace(0, 5, 3)",
-                                                        "s1": "linspace(0, 5, 4)"}},
-                       shots=1, reduce="counts")
+                                                        "s1": "linspace(0, 5, 4)"}})
     finally:
-        probe.unlink(missing_ok=True)
+        _safe_unlink(probe)
         exp.close()

@@ -39,6 +39,7 @@ import numpy as np
 from ..core.analysis import grid_shape_tuple
 from ..core.signals import SignalHub
 from ..devices.base import CameraDevice
+from .signal_expr import DEFAULT_SOURCE, SignalExpr, hub_namespace
 
 
 @dataclass(frozen=True)
@@ -455,16 +456,24 @@ class OccupancyProcessor(Processor):
     sitemap_image_key = "frame_judged"
 
     def __init__(self, hub: SignalHub, *, calibration=None, calibration_source=None,
-                 source: str = "frame", grid_shape: tuple[int, int] | None = None,
+                 source_expr=None, grid_shape: tuple[int, int] | None = None,
                  method: str | None = None, prefix: str = ""):
-        super().__init__(hub, consumes=(source,), prefix=prefix)
+        # The frame this node judges is a MULTI-slot signal expression (the same one a plot
+        # panel / pulse-scan use): pick one or more hub signals and combine them.  The default
+        # is the single ``frame`` signal (``value = signal``).  ``consumes`` (what makes the
+        # node reactive) is the picked input names -- so the node re-judges when any of them
+        # advances.  An empty pick falls back to the bare ``frame`` signal.
+        expr = source_expr if isinstance(source_expr, SignalExpr) else SignalExpr.from_value(source_expr)
+        if not expr.inputs:
+            expr = SignalExpr(["frame"], DEFAULT_SOURCE)
+        super().__init__(hub, consumes=tuple(expr.inputs), prefix=prefix)
+        self.source_expr = expr
         self.calibration = calibration
         # Optional lazy source: a callable -> calibration (or None while a calibrate
         # task is still running on its own thread).  Lets the live readout stream
         # WITHOUT blocking the GUI on calibration -- the detector simply no-ops until
         # the calibration is ready, then picks it up.
         self.calibration_source = calibration_source
-        self.source = str(source)
         self.grid_shape = None if grid_shape is None else grid_shape_tuple(grid_shape)
         # The READOUT method (box / per-site PSF / ...) is chosen HERE, not at calibration
         # time: one calibration carries every method's geometry + thresholds, and the
@@ -484,7 +493,13 @@ class OccupancyProcessor(Processor):
         calibration = self._resolve_calibration()
         if calibration is None:
             return {}                                       # not calibrated yet -> no-op (non-blocking)
-        frame = np.asarray(inputs[self.source], dtype=float)
+        # The frame to judge = the source expression over the consumed signals (the picked slot
+        # is ``signal``; for the default ``value = signal`` on one input it IS that frame; an
+        # expression can average several, e.g. ``value = (signal[0] + signal[1]) / 2``).
+        try:
+            frame = np.asarray(self.source_expr.evaluate(inputs), dtype=float)
+        except Exception:
+            return {}                                       # malformed expression -> no-op (don't wedge)
         detection = calibration.detect(frame, method=self.method)   # the single readout contract
         occupied = np.asarray(detection.occupied, dtype=float).reshape(-1)
         counts = np.asarray(detection.counts, dtype=float).reshape(-1)
@@ -1361,6 +1376,169 @@ class ScannedMeasurementNode(Measurement):
         if self._per_site:
             specs.insert(2, SignalSpec(p + self.y_key + "_sites", ylabel, "", "latest scan point, per site"))
         return tuple(specs)
+
+
+class PulseScanNode(Measurement):
+    """Drive a pulse-template scan one point per ``shot()``, with a DECOUPLED y.
+
+    Unlike :class:`ScannedMeasurementNode` (which reduces its OWN frames through a calibration),
+    pulse-scan is a DEVICE driver whose y comes from ANOTHER running node: per point it resolves
+    the bound scan slots to that row (``with_slots_resolved`` -- the SAME named-slot resolver the
+    hardware scan + pulse GUI use; api slots stay FIXED on the base state), FIRES + acquires the
+    camera ``frame``(s), PUBLISHES them, lets the consumers (e.g. a Judge-occupancy processor)
+    recompute, then evaluates a SOURCE EXPRESSION over the hub for y.  So x = the scan points and
+    y = a signal published by a decoupled producer (e.g. occupancy ``rate``) combined by a
+    ``value = ...`` expression.
+
+    Because the device lockout allows only ONE device driver, pulse-scan owns the streamer +
+    camera and publishes ``frame`` itself; the reactive processors it subscribes to keep running
+    (processors are not device-driving), so the user starts the producer FIRST, then pulse-scan.
+
+    Settling y to THIS point's frame (the riskiest part) is race-free:
+      * GUI / live: the consumer runs on its OWN thread, so the node WAITS for the picked y
+        signals' per-signal version to advance past the pre-publish snapshot (it only READS the
+        hub -- never steps another node's thread -- so there is no cross-thread step() race).
+      * headless / notebook / tests: an optional ``settle`` callback steps the consumer INLINE
+        (single-threaded, deterministic) -- the consumer's thread is not running, so settle is
+        the only thing touching it.
+    Both paths read y through the SAME expression once the consumer is fresh.
+
+    It touches only ``with_slots_resolved`` + ``to_sequence`` + ``camera.acquire`` + the hub
+    (publish / signal_versions / latest), reads no simulation ground truth and imports no
+    concrete backend -- guarded by ``tests/test_virtual_equals_real_contract.py`` like the rest
+    of the analysis layer.
+    """
+
+    node_label = "pulse_scan"
+    #: How long (s) to wait for the subscribed y signals to refresh for THIS point before
+    #: reading them anyway (so a mis-wired y never wedges the scan; a real consumer ticks well
+    #: under this).
+    SETTLE_TIMEOUT_S = 5.0
+
+    def __init__(self, hub: SignalHub, plan, *, x_key: str = "param", y_key: str = "signal",
+                 prefix: str = ""):
+        super().__init__(hub, prefix=prefix)
+        self.plan = plan
+        self.base_state = plan.base_state
+        self.scan_names = list(plan.scan_names)
+        self.scan_arrays = [np.asarray(a, dtype=float).reshape(-1) for a in plan.scan_arrays]
+        self.camera = plan.camera
+        self.sequencer = plan.sequencer
+        self.n_frames = max(1, int(plan.n_frames))
+        self.y_expr = plan.y_expr if isinstance(plan.y_expr, SignalExpr) else SignalExpr.from_value(plan.y_expr)
+        # Optional inline settle (headless single-threaded determinism); None in the GUI, where
+        # the node instead waits for the consumer's own thread to republish the y signals.
+        self.settle = getattr(plan, "settle", None)
+        self.x_key = str(x_key)
+        self.y_key = str(y_key)
+        self.node_label = str(prefix).rstrip("_") or str(y_key)
+        self.x_signal = self.prefix + self.x_key
+        self.y_signal = self.prefix + self.y_key
+        # The swept x values are known up front -> a PRE-ALLOCATED NaN curve filled in place by
+        # scan index (a stable x axis from shot 1), like ScannedMeasurementNode.
+        self._values = (self.scan_arrays[0] if self.scan_arrays else np.array([0.0])).astype(float)
+        self._index = 0
+        self.data_y = np.full((self._values.size, 1), np.nan, dtype=float)
+        self._axis_label = str(plan.axis_label)
+        self._axis_unit = str(plan.axis_unit)
+
+    @property
+    def n_points(self) -> int:
+        return int(self._values.size)
+
+    @property
+    def points_done(self) -> int:
+        return int(self._index)
+
+    @property
+    def finished(self) -> bool:
+        return self._index >= self.n_points
+
+    def shot(self) -> dict[str, object]:
+        if self.finished:
+            raise StopIteration("PulseScanNode: scan already complete.")
+        index = self._index
+        # Resolve THIS point's row through the named-slot resolver (api slots stay fixed).
+        slots = {name: float(arr[index]) for name, arr in zip(self.scan_names, self.scan_arrays)}
+        resolved = self.base_state.with_slots_resolved(slots)
+        sequence = resolved.to_sequence(name="pulse_scan")
+        frames = self.camera.acquire(self.n_frames, sequence=sequence, sequencer=self.sequencer,
+                                     stop=self._stop)
+        if not frames:
+            # Streamer not firing (e.g. Stop) -> no trigger -> no frame: freeze, do not advance
+            # (the SAME data-source gate the camera measurement uses).
+            return {}
+        # 1) publish the camera frame(s) under BARE names so the reactive consumers (e.g. a
+        #    Judge-occupancy processor consuming ``frame``) pick them up -- this is the SAME
+        #    ``frame`` signal a CameraMeasurement publishes (default 2D = first trigger).
+        before = self.hub.signal_versions()
+        frame_pub = {f"frame_{k}": np.asarray(f, dtype=float) for k, f in enumerate(frames)}
+        frame_pub["frame"] = frame_pub["frame_0"]
+        self.hub.publish(frame_pub)
+        # 2) make the y signals FRESH for this frame, then 3) read y from the source expression.
+        self._await_y_inputs(before)
+        y = self._read_y()
+        self.data_y[index, 0] = y
+        self._index += 1
+        return {self.x_key: self._values.copy(),
+                self.y_key: self.data_y[:, 0].copy(),
+                "scan_done": 1.0 if self.finished else 0.0}
+
+    def _await_y_inputs(self, before: dict) -> None:
+        """Block until the picked y signals have advanced past ``before`` (a per-signal version
+        bump = the consumer republished them from the frame just published), honouring Stop.
+
+        Inline ``settle`` (headless) short-circuits this: it steps the consumer once, single-
+        threaded, so the version is fresh immediately."""
+        names = [n for n in self.y_expr.inputs if n]
+        if not names:
+            return
+        if self.settle is not None:
+            try:
+                self.settle()
+            except Exception:
+                pass
+            return
+        deadline = time.monotonic() + self.SETTLE_TIMEOUT_S
+        while not self._stop.is_set():
+            now = self.hub.signal_versions()
+            if all(now.get(n, 0) > before.get(n, 0) for n in names):
+                return
+            if time.monotonic() >= deadline:
+                return                                       # timeout: read what is there, never wedge
+            self._stop.wait(0.01)
+
+    def _read_y(self) -> float:
+        """y = the source expression over the live hub (the decoupled subscription)."""
+        try:
+            value = self.y_expr.evaluate(hub_namespace(self.hub))
+            arr = np.asarray(value, dtype=float).reshape(-1)
+            return float(arr[0]) if arr.size else float("nan")
+        except Exception:
+            return float("nan")
+
+    def step(self) -> dict[str, object]:
+        named = super().step()
+        if self.finished:
+            self._stop.set()                                 # finite scan: a background loop self-exits
+        return named
+
+    def run_to_completion(self) -> "PulseScanNode":
+        """Synchronously run + publish every remaining scan point (test/headless)."""
+        while not self.finished:
+            self.step()
+        return self
+
+    def published_signals(self) -> frozenset:
+        return frozenset(self.prefix + key for key in (self.x_key, self.y_key, "scan_done"))
+
+    def output_specs(self) -> tuple[SignalSpec, ...]:
+        p = self.prefix
+        return (
+            SignalSpec(p + self.x_key, self._axis_label, self._axis_unit, "scan x axis (the swept parameter)"),
+            SignalSpec(p + self.y_key, "signal", "", "y per point = the subscribed source expression"),
+            SignalSpec(p + "scan_done", "scan complete", "", "1 once the final point is measured"),
+        )
 
 
 class ProcessorRun(LogicNode):

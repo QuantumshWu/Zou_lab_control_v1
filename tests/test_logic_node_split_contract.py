@@ -38,7 +38,7 @@ def test_camera_measurement_plus_detect_processor_runs_real_pipeline():
 
     hub = SignalHub()
     cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer)
-    det = OccupancyProcessor(hub, calibration=cal, source="frame", grid_shape=(3, 4))
+    det = OccupancyProcessor(hub, calibration=cal, source_expr={"inputs": ["frame"], "source": "value = signal"}, grid_shape=(3, 4))
     try:
         fire_live_imaging(exp)            # On Pulse: the trigger-driven camera now streams
         # the camera measurement is just that -- a camera; it does NOT detect.

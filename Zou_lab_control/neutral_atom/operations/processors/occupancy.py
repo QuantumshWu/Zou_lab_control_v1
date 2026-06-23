@@ -51,9 +51,12 @@ def judge_occupancy(readout) -> ProcessorSpec:
                           "the Calibrate-readout task writes (calibrations/calibration.json), so "
                           "calibrate-then-judge needs no path typed; Browse to use another.  Until "
                           "this file exists the detector uses the current session calibration."),
-        ParamDecl("source", "Frame signal", "signal", default="frame",
-                  tooltip="Hub signal carrying each camera frame to judge (a processor's input, "
-                          "picked like a plot's signal)."),
+        ParamDecl("source", "Frame source", "signal_expr",
+                  default={"inputs": ["frame"], "source": "value = signal"},
+                  tooltip="The camera frame to judge: pick one or more hub signals and combine via "
+                          "value = ...  (default = the single `frame` signal; `value = (signal[0] + "
+                          "signal[1]) / 2` averages two).  A processor source can subscribe to several "
+                          "running nodes' signals, not just one."),
         ParamDecl("method", "Readout method", "choice", default="box",
                   choices=tuple(method_labels),
                   tooltip="How to turn each frame into per-site signal: box = square ROI; "
@@ -86,9 +89,11 @@ def judge_occupancy(readout) -> ProcessorSpec:
         except Exception:
             grid = None
         method = method_labels.get(str(values.get("method", "box")), "box")
+        # ``source`` is a signal_expr value ({"inputs": [...], "source": "value = ..."}); the node
+        # builds the reusable SignalExpr and consumes its picked inputs (multi-source aware).
         return OccupancyProcessor(
             hub, calibration=calibration, calibration_source=calibration_source,
-            source=str(values.get("source", "frame")),
+            source_expr=values.get("source"),
             method=method, grid_shape=grid, prefix=prefix)
 
     return ProcessorSpec(

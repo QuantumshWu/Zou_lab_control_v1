@@ -6988,7 +6988,7 @@ def test_user_composed_loading_readout_publishes_standard_signals():
         task.run_to_completion()
         cam = CameraMeasurement(hub, camera, sequencer=seqr, prefix=prefix)
         # loading rate = cumulative running mean of occupancy (no smoothing knob)
-        det = OccupancyProcessor(hub, calibration=task.calibration, source=f"{prefix}frame",
+        det = OccupancyProcessor(hub, calibration=task.calibration, source_expr={"inputs": [f"{prefix}frame"], "source": "value = signal"},
                               grid_shape=trap.grid_shape, prefix=prefix)
         return cam, det
 

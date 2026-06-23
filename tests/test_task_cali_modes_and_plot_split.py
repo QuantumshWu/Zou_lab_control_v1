@@ -84,7 +84,7 @@ def test_calibrate_task_computes_every_method_processor_picks(threshold_method):
         for m in ALL_READOUT_METHODS:
             hub = SignalHub()
             cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer)
-            occ = OccupancyProcessor(hub, calibration=cal, source="frame", method=m)
+            occ = OccupancyProcessor(hub, calibration=cal, source_expr={"inputs": ["frame"], "source": "value = signal"}, method=m)
             cam.step(); occ.step()
             assert hub.latest("occupied").shape == (12,)
             # the judged frame is published, atomically -> rings + underlay are the same shot

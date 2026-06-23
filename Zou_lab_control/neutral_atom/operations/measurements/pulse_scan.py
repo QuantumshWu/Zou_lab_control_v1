@@ -1,30 +1,26 @@
 """Generic "Pulse scan" measurement (auto-discovered).
 
-A pulse template the user loads exposes TWO kinds of named handle:
+A pulse template the user loads exposes TWO kinds of named handle, which are DIFFERENT
+mechanisms and stay separate:
 
 * **API slots** (``a1``, ``a2`` ...) — one numeric value the operator wants to FIX (not sweep)
   before the run.  Each slot is set ONCE at build time via :meth:`PulseTableState.set_api`.
-* **Scan slots** (``s0``, ``s1`` ...) — parameters the run SWEEPS.  The user gives a list /
-  ``linspace`` expression PER scan slot; the run advances every scan slot in lockstep one row
-  at a time, edits the loaded template by binding each slot to its current value, recompiles
-  ``to_sequence()`` and fires.  The axis is point index (and the FIRST scan slot's values).
+* **Scan slots** (``s0``, ``s1`` ...) — the parameters the run SWEEPS (the x axis).  The user
+  gives a list / ``linspace`` expression PER scan slot; per point the run resolves the scan
+  slots to that row via :meth:`PulseTableState.with_slots_resolved` (the SAME named-slot
+  resolver the hardware scan + pulse GUI use) and fires.  ``x`` = the scan points (1-D = the
+  one scan slot's values; 2-D = two slots advanced in lockstep against a common index).
 
-So a "Pulse scan" measurement is parameterised purely by the loaded template — the operator
-sees one numeric input per api slot and one points-expression per scan slot, with no measure-
-ment-side hard-coded slot names.  Each point reduces its frames to one ``y`` value via the
-same ``TrapCalibration`` contract the live readout uses (virtual==real; only the camera frames
-differ).  The y reduction is pluggable: ``counts`` (mean per-site readout signal), ``loading``
-(mean occupancy), or ``fidelity`` (single-shot Otsu model fidelity, reusing the detection-time
-scan's reducer).
-
-The node only needs ``measure(value, index)`` + ``axis.values`` + ``reducer`` (it is duck
-typed by :class:`~..logic.ScannedMeasurementNode`), so this reuses the whole live-scan node
-(NaN-preallocated curve, cooperative Stop, cumulative publish) without a new node class.
+The ``y`` is DECOUPLED: pulse-scan does not reduce its own frames.  It is a device-driving
+logic node that fires the pulse, publishes the camera ``frame`` it produces, and then reads
+``y`` from a **source expression** that subscribes to a signal published by ANOTHER running
+node (e.g. a Judge-occupancy processor's loading ``rate``).  So the readout pipeline lives in
+its own node (calibration, detection) and pulse-scan just sweeps + records its output -- the
+same decoupling the rest of the console uses.  The driving node is :class:`~..logic.PulseScanNode`.
 """
 
 from __future__ import annotations
 
-import warnings
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -33,57 +29,33 @@ import numpy as np
 from ...core.analysis import positive_int
 from ...timing import PulseTableState, single_imaging_template
 from ...timing.sequence import snap_seconds_to_clock
-from ..measurement import MeasurementSpec, OtsuFidelityReducer, ParamDecl
+from ..measurement import MeasurementSpec, ParamDecl
 from ..measurement_registry import measurement
+from ..signal_expr import SignalExpr
 
 # A duration scan slot's points are entered in microseconds; a DAC scan slot's points are
 # unitless signed LSB codes.  An API slot's value is entered in the slot's own unit (set
 # at bind time -- ns for time fields, signed LSB for DAC).
 _TIME_KINDS = ("duration", "delay")
 _TIME_UNIT = "us"
-_US_TO_S = 1e-6
 
 #: A pulse scan images ONCE per point, so the default pulse is the SINGLE-image probe template
 #: (one camera trigger) -- NOT the Calibrate task's long-short-long bracket.
 DEFAULT_PROBE_TEMPLATE = "pulses/probe_template.json"
 
+#: Default y source: the loading ``rate`` published by a Judge-occupancy processor (the common
+#: case -- sweep a pulse parameter, watch the loading fraction).  The operator re-picks it in
+#: the form / notebook to any running node's signal.
+DEFAULT_Y_SOURCE: Mapping[str, object] = {"inputs": ["rate"], "source": "value = signal"}
+
 
 class _Axis:
-    """The scan-axis the live node reads (``values`` + plot labels).  Just point INDEX
-    (an integer running from 0) so a sweep with more than one scan slot has one unambiguous
-    x; the first scan slot's actual swept values are published as ``<x_key>`` by the parent
-    node (this is the axis the curve is drawn against)."""
+    """The scan-axis the live node reads (``values`` + plot labels)."""
 
     def __init__(self, values, *, label: str = "x", unit: str = ""):
         self.values = np.asarray(values, dtype=float).reshape(-1)
         self.label = str(label)
         self.unit = str(unit)
-
-
-class _LoadingReducer:
-    """y = mean occupancy across sites (the loading fraction) from one readout frame."""
-
-    n_series = 1
-
-    def __init__(self, labels):
-        self.labels = labels
-
-    def reduce(self, frames, calibration):
-        occ = np.asarray(calibration.detect(frames[0]).occupied, dtype=float)
-        return float(np.nanmean(occ)) if occ.size else float("nan")
-
-
-class _CountsReducer:
-    """y = mean per-site readout signal (``detect.counts``) pooled over the point's frames."""
-
-    n_series = 1
-
-    def __init__(self, labels):
-        self.labels = labels
-
-    def reduce(self, frames, calibration):
-        counts = np.vstack([np.asarray(calibration.detect(f).counts, dtype=float) for f in frames])
-        return float(np.nanmean(counts)) if counts.size else float("nan")
 
 
 def _resolve_probe_template(template: str) -> PulseTableState:
@@ -144,68 +116,6 @@ def _scan_slot_values(state: PulseTableState, scan_spec: Mapping[str, str]) -> t
     return names, arrays
 
 
-class PulseScanMeasurement:
-    """Software per-point scan over an arbitrary pulse template.
-
-    API slots and SCAN slots are DIFFERENT mechanisms and are kept separate:
-
-    * ``api_values`` are fixed values applied ONCE to ``base_state`` (``set_api``) -- they are
-      NOT swept.
-    * the scan slots already bound on ``base_state`` (``s0``, ``s1`` ...) are the swept axes;
-      ``scan_arrays`` carries one value array per scan slot.  Per point ``i`` the measurement
-      resolves the scan slots to that row via :meth:`PulseTableState.with_slots_resolved`
-      ({s0: row0, s1: row1, ...}) -- the SAME named-slot resolver the hardware scan path and
-      the pulse GUI use -- so the slots stay slots (no clearing, no per-period hacking, no
-      collision with an api slot on the same period).
-
-    ``scan_arrays`` values are in the slot's resolved unit (ns for a duration slot, signed LSB
-    code for a DAC slot), so they go straight into ``with_slots_resolved``."""
-
-    def __init__(self, base_state: PulseTableState, scan_names: Sequence[str],
-                 scan_arrays: Sequence[np.ndarray], camera, sequencer, calibration, reducer, *,
-                 n_frames: int = 1, shots_per_point: int = 1, axis_label: str = "point",
-                 axis_unit: str = ""):
-        self.base_state = base_state
-        self.scan_names = list(scan_names)
-        self.scan_arrays = [np.asarray(a, dtype=float).reshape(-1) for a in scan_arrays]
-        # The axis the live node plots: the FIRST scan slot's values when there is one
-        # (everyone-in-lockstep means the others sweep against the same x); else the point
-        # INDEX (nothing to sweep, single shot per point).
-        if self.scan_arrays:
-            values = self.scan_arrays[0]
-        else:
-            values = np.array([0.0])
-        self.axis = _Axis(values, label=axis_label, unit=axis_unit)
-        self.camera = camera
-        self.sequencer = sequencer
-        self.calibration = calibration
-        self.reducer = reducer
-        self.n_frames = positive_int(n_frames, "n_frames")
-        self.shots_per_point = positive_int(shots_per_point, "shots_per_point")
-        # A driving node (ScannedMeasurementNode) sets this to its Stop event so a Stop
-        # interrupts a wedged trigger DURING a point (the camera honours stop=).
-        self.stop_event = None
-
-    def measure(self, value: float, index: int | None = None) -> np.ndarray:
-        # Resolve the bound scan slots to THIS point's row via the named-slot resolver
-        # ``with_slots_resolved`` -- the SAME mechanism the hardware scan + pulse GUI use.  The
-        # api slots stay fixed (already set on base_state); the scan slots are replaced by this
-        # row's values (ns for a duration slot, signed code for a DAC slot).  No clearing of
-        # slots, no per-period editing -- so an api slot on the same period is never clobbered.
-        idx = 0 if index is None else int(index)
-        slots = {name: float(arr[idx]) for name, arr in zip(self.scan_names, self.scan_arrays)}
-        resolved = self.base_state.with_slots_resolved(slots)
-        sequence = resolved.to_sequence(name="pulse_scan")
-        rows = []
-        for _ in range(self.shots_per_point):
-            frames = self.camera.acquire(self.n_frames, sequence=sequence, sequencer=self.sequencer,
-                                         stop=self.stop_event)
-            rows.append(np.atleast_1d(np.asarray(self.reducer.reduce(frames, self.calibration), dtype=float)))
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", category=RuntimeWarning)
-            return np.nanmean(np.vstack(rows), axis=0)
-
-
 def _label_for_first_scan_slot(state: PulseTableState) -> tuple[str, str]:
     """``(axis label, axis unit)`` for the first scan slot of the template (drives the live
     plot's x label).  Empty -> the axis is point INDEX."""
@@ -221,15 +131,44 @@ def _label_for_first_scan_slot(state: PulseTableState) -> tuple[str, str]:
     return (name, "")
 
 
+class PulseScanPlan:
+    """Everything :class:`~..logic.PulseScanNode` needs to drive a pulse-template scan.
+
+    API slots are already FIXED on ``base_state`` (``set_api``); ``scan_names``/``scan_arrays``
+    are the bound scan slots + their per-point sweep values (the x axis), resolved per point via
+    ``with_slots_resolved`` (no clearing, no period editing).  ``y_expr`` is the DECOUPLED y
+    source -- a :class:`~..signal_expr.SignalExpr` over signals published by other running nodes.
+    ``settle`` (optional) lets a HEADLESS caller step the consumer inline for single-threaded
+    determinism; in the GUI it is ``None`` and the node waits for the consumer's own thread to
+    republish the y signals (a per-signal version bump)."""
+
+    def __init__(self, base_state: PulseTableState, scan_names: Sequence[str],
+                 scan_arrays: Sequence[np.ndarray], camera, sequencer, *,
+                 axis_label: str = "point", axis_unit: str = "", n_frames: int = 1,
+                 y_expr=None, settle=None):
+        self.base_state = base_state
+        self.scan_names = list(scan_names)
+        self.scan_arrays = [np.asarray(a, dtype=float).reshape(-1) for a in scan_arrays]
+        self.axis = _Axis(self.scan_arrays[0] if self.scan_arrays else [0.0],
+                          label=axis_label, unit=axis_unit)
+        self.axis_label = str(axis_label)
+        self.axis_unit = str(axis_unit)
+        self.camera = camera
+        self.sequencer = sequencer
+        self.n_frames = positive_int(n_frames, "n_frames")
+        self.y_expr = y_expr if isinstance(y_expr, SignalExpr) else SignalExpr.from_value(y_expr)
+        self.settle = settle
+
+
 @measurement(order=30)
 def pulse_scan(readout) -> MeasurementSpec:
-    """Pulse-template scan: set every API slot's value, give scan-points per scan slot,
-    sweep the points in lockstep, reduce frames to y."""
+    """Pulse-template scan: set every API slot's value, give scan-points per scan slot (x),
+    sweep the points, and record y from a source signal published by another running node."""
 
     s = readout.session
 
     def build(*, template: str = DEFAULT_PROBE_TEMPLATE, pulse_slots: Mapping | None = None,
-              shots: int = 10, reduce: str = "counts", **_ignored):
+              y=None, n_frames: int = 1, **_ignored) -> PulseScanPlan:
         state = _resolve_probe_template(template)
         spec = dict(pulse_slots or {})
         api_values: Mapping[str, float] = dict(spec.get("api") or {})
@@ -243,9 +182,8 @@ def pulse_scan(readout) -> MeasurementSpec:
         # Resolve every scan slot's points expression to a 1-D array (all the same length).
         # A duration slot's unit is ALWAYS "ns" inside ``ScanSlot`` (bind_field pins it), but
         # the operator enters microseconds in the form (the natural unit for an exposure);
-        # convert us -> ns here so ``measure()`` can pass ``unit="ns"`` straight through.  Also
-        # snap each time value to the sequencer clock grid so the fired durations land on
-        # whole ticks and the plotted x is what actually ran (mirrors ScannedMeasurement).
+        # convert us -> ns here and snap each time value to the sequencer clock grid so the
+        # fired durations land on whole ticks and the plotted x is what actually ran.
         scan_names, scan_arrays = _scan_slot_values(state, scan_spec)
         clock = float(getattr(s.devices.sequencer, "clock_hz", 0.0) or 0.0)
         for k, name in enumerate(scan_names):
@@ -258,38 +196,31 @@ def pulse_scan(readout) -> MeasurementSpec:
                 scan_arrays[k] = arr_ns
 
         axis_label, axis_unit = _label_for_first_scan_slot(state)
-        mode = str(reduce).lower()
-        if mode == "loading":
-            n_frames, reducer, require_thr = 1, _LoadingReducer((axis_label, "Loading fraction", "Loading fraction")), True
-        elif mode == "fidelity":
-            reducer = OtsuFidelityReducer()
-            reducer.labels = (axis_label, "Fidelity", "Fidelity")
-            n_frames, require_thr = positive_int(shots, "shots"), False
-        else:  # "counts"
-            n_frames, reducer, require_thr = 1, _CountsReducer((axis_label, "Mean counts", "Mean counts")), False
-        shots_per_point = 1 if mode == "fidelity" else positive_int(shots, "shots")
-        calibration = s.require_calibration(require_thresholds=require_thr)
-        return PulseScanMeasurement(
-            state, scan_names, scan_arrays, s.devices.camera, s.devices.sequencer, calibration,
-            reducer, n_frames=n_frames, shots_per_point=shots_per_point,
-            axis_label=axis_label, axis_unit=axis_unit)
+        y_expr = SignalExpr.from_value(y if y is not None else DEFAULT_Y_SOURCE)
+        return PulseScanPlan(
+            state, scan_names, scan_arrays, s.devices.camera, s.devices.sequencer,
+            axis_label=axis_label, axis_unit=axis_unit, n_frames=n_frames, y_expr=y_expr)
 
     params = (
         ParamDecl("template", "Pulse template", "path", default=DEFAULT_PROBE_TEMPLATE,
                   path_mode="file", base_dir="pulses", file_filter="Pulse program (*.json);;All files (*)",
-                  tooltip="The pulse program loaded each point.  Its api / scan slots populate the "
+                  tooltip="The pulse program fired each point.  Its api / scan slots populate the "
                           "auto-form below (one numeric input per api slot, one points expression per scan slot)."),
         ParamDecl("pulse_slots", "Slots", "pulse_slots", default={}, depends_on="template",
-                  tooltip="One numeric input per API slot (the operator-set value the slot binds), one "
-                          "points expression per scan slot (the sweep -- list or linspace(...))."),
-        ParamDecl("shots", "Shots / point", "int", default=10, lo=1, hi=100_000,
-                  tooltip="Frames averaged per point (counts/loading), or pooled per point (fidelity)."),
-        ParamDecl("reduce", "Reduce", "choice", default="counts", choices=("counts", "loading", "fidelity"),
-                  tooltip="frames -> y: counts = mean per-site signal; loading = mean occupancy; "
-                          "fidelity = single-shot Otsu model fidelity.  (Recapture survival vs trap-off "
-                          "is the dedicated Temperature measurement.)"),
+                  tooltip="One numeric input per API slot (the fixed operator-set value), one "
+                          "points expression per scan slot (the sweep -- list or linspace(...); this is x)."),
+        ParamDecl("y", "Signal (y)", "signal_expr", default=dict(DEFAULT_Y_SOURCE),
+                  tooltip="The y recorded per point.  Pick a signal published by ANOTHER running node "
+                          "(e.g. a Judge-occupancy processor's loading 'rate') and combine via value = ... .  "
+                          "Start that producer FIRST; pulse-scan fires the pulse, publishes the frame it "
+                          "produces, then reads this signal back for the point's y."),
+        ParamDecl("n_frames", "Frames / point", "int", default=1, lo=1, hi=1000,
+                  tooltip="Camera triggers (frames) acquired per scan point before the y signal is read."),
     )
     return MeasurementSpec(
         name="Pulse scan", key="pulse_scan", params=params,
         result_labels=("Pulse parameter", "Signal"),
-        x_key="param", y_key="signal", build=build)
+        x_key="param", y_key="signal", build=build,
+        # The console builds a device-driving PulseScanNode (not a ScannedMeasurementNode):
+        # it fires + publishes a frame + reads y from a subscribed signal, per point.
+        metadata={"node": "pulse_scan"})
