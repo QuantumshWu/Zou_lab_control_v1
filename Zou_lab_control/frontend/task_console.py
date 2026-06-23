@@ -140,6 +140,15 @@ def indexed_unique_name(base: str, taken) -> str:
         n += 1
     return f"{root} #{n}"
 
+
+def _safe_float(text, fallback: float) -> float:
+    """Parse a numeric line-edit, falling back on blank/garbage (the ONE parser the fixed-lim
+    lo/hi inputs share between the Setting popup and the Edit tab)."""
+    try:
+        return float(str(text).strip())
+    except (TypeError, ValueError):
+        return float(fallback)
+
 # What signal SHAPE each plot kind expects as its ``value`` -- shown in the panel's
 # Setting so it is clear which signals fit (e.g. a Site map wants a per-site vector,
 # a 2D image wants a frame).  Single source for the panel's input self-documentation.
@@ -1783,13 +1792,8 @@ class PanelCard(FluentGroupBox):
     def _on_fixed_lim_edited(self) -> None:
         """Persist the fixed lo/hi inputs (#8) and re-apply them to the live plotter NOW
         (no rebuild -- just push the bounds + re-relim so the axis snaps immediately)."""
-        def _num(text: str, fallback: float) -> float:
-            try:
-                return float(str(text).strip())
-            except (TypeError, ValueError):
-                return fallback
-        self.config.params["fixed_lo"] = _num(self.fixed_lo_edit.text(), 0.0)
-        self.config.params["fixed_hi"] = _num(self.fixed_hi_edit.text(), 1.0)
+        self.config.params["fixed_lo"] = _safe_float(self.fixed_lo_edit.text(), 0.0)
+        self.config.params["fixed_hi"] = _safe_float(self.fixed_hi_edit.text(), 1.0)
         self._push_fixed_lims()
         if self.plotter is not None and str(self.config.params.get("relim")) == "fixed" \
                 and hasattr(self.plotter, "apply_relim_now"):
@@ -3097,7 +3101,7 @@ class PanelEditor(QtWidgets.QWidget):
         # data_figure UI (whatever DataFigure can do has a control here).  They write the
         # SAME config.params keys and drive the SAME live card via the card's handlers
         # (single source -- Setting and Edit never drift), then re-snapshot this Edit canvas.
-        self.ed_cmap = self.ed_relim = self.ed_unit_button = None
+        self.ed_cmap = self.ed_relim = self.ed_unit_button = self.ed_fixed_row = None
         if is_plot:
             section("Display")
             disp_lw = scaled_px(96, minimum=72)
@@ -3115,9 +3119,28 @@ class PanelEditor(QtWidgets.QWidget):
             self.ed_relim.setToolTip(
                 "Relim mode (confocal_gui combo_relim naming):\n"
                 "  tight  = autoscale hugs the data\n"
-                "  normal = autoscale with the matplotlib default margin")
+                "  normal = autoscale with the matplotlib default margin\n"
+                "  fixed  = pin the y-axis / colour-limit to the lo/hi below")
             self.ed_relim.currentTextChanged.connect(self._edit_relim)
             col.addWidget(FluentSettingRow("relim", self.ed_relim, label_width=disp_lw))
+            # fixed lo/hi inputs (#H2): the SAME control the Setting popup has, here too -- shown
+            # only when relim == "fixed", writing the SAME config.params["fixed_lo"/"fixed_hi"].
+            self.ed_fixed_lo = FluentLineEdit(str(card.config.params.get("fixed_lo", 0.0)))
+            self.ed_fixed_hi = FluentLineEdit(str(card.config.params.get("fixed_hi", 1.0)))
+            for ed in (self.ed_fixed_lo, self.ed_fixed_hi):
+                ed.setMinimumWidth(scaled_px(64, minimum=52))
+                ed.editingFinished.connect(self._edit_fixed_lim)
+            self.ed_fixed_lo.setToolTip("Fixed lower limit (used only when relim = fixed)")
+            self.ed_fixed_hi.setToolTip("Fixed upper limit (used only when relim = fixed)")
+            fixed_host = QtWidgets.QWidget()
+            fixed_row = QtWidgets.QHBoxLayout(fixed_host)
+            fixed_row.setContentsMargins(0, 0, 0, 0)
+            fixed_row.setSpacing(scaled_px(6, minimum=4))
+            fixed_row.addWidget(self.ed_fixed_lo, 1)
+            fixed_row.addWidget(self.ed_fixed_hi, 1)
+            self.ed_fixed_row = FluentSettingRow("lo / hi", fixed_host, label_width=disp_lw)
+            self.ed_fixed_row.setVisible(str(card.config.params.get("relim", "tight")) == "fixed")
+            col.addWidget(self.ed_fixed_row)
             # x-axis unit cycle -- reuse the card's _on_unit_cycle.
             self.ed_unit_button = FluentButton("Unit", color=GREY)
             self.ed_unit_button.setFixedWidth(scaled_px(70, minimum=56))
@@ -3414,6 +3437,22 @@ class PanelEditor(QtWidgets.QWidget):
     def _edit_relim(self, mode: str) -> None:
         if self.card is not None:
             self.card._on_relim_mode(str(mode))   # config.params["relim"] + live re-relim
+        if getattr(self, "ed_fixed_row", None) is not None:
+            self.ed_fixed_row.setVisible(str(mode) == "fixed")   # reveal lo/hi only in fixed (#H2)
+        self.rebuild()
+
+    def _edit_fixed_lim(self) -> None:
+        """Persist the Edit-tab fixed lo/hi (#H2) through the card's own handler (SAME
+        config.params + live re-relim as the Setting popup), then re-snapshot this canvas."""
+        if self.card is None:
+            return
+        self.card.config.params["fixed_lo"] = _safe_float(self.ed_fixed_lo.text(), 0.0)
+        self.card.config.params["fixed_hi"] = _safe_float(self.ed_fixed_hi.text(), 1.0)
+        self.card._push_fixed_lims()
+        if str(self.card.config.params.get("relim")) == "fixed" and self.card.plotter is not None \
+                and hasattr(self.card.plotter, "apply_relim_now"):
+            self.card.plotter.apply_relim_now()
+        self.card.changed.emit()
         self.rebuild()
 
     def _edit_unit_cycle(self) -> None:
