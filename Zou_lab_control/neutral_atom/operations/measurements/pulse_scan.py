@@ -24,7 +24,6 @@ typed by :class:`~..logic.ScannedMeasurementNode`), so this reuses the whole liv
 
 from __future__ import annotations
 
-import copy
 import warnings
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -148,16 +147,19 @@ def _scan_slot_values(state: PulseTableState, scan_spec: Mapping[str, str]) -> t
 class PulseScanMeasurement:
     """Software per-point scan over an arbitrary pulse template.
 
-    ``api_values`` are applied ONCE at build time (each api slot tagged in the template gets
-    its operator-chosen value via :meth:`PulseTableState.set_api`).  ``scan_arrays`` is a list,
-    one entry per scan slot in slot order; each entry is an array of length ``n_points``.  For
-    each point ``i``, the measurement edits the template by setting each scan slot's bound
-    field to ``scan_arrays[k][i]``, recompiles ``to_sequence()`` and acquires ``n_frames``.
+    API slots and SCAN slots are DIFFERENT mechanisms and are kept separate:
 
-    Mirrors :meth:`ScannedMeasurement.measure` (camera / calibration contract) but rebuilds the
-    sequence from the per-point-edited template each point instead of pushing a hardware scan
-    slot, so the SAME measurement code works against a template with multiple scan slots
-    advanced in lockstep -- no rewrite needed."""
+    * ``api_values`` are fixed values applied ONCE to ``base_state`` (``set_api``) -- they are
+      NOT swept.
+    * the scan slots already bound on ``base_state`` (``s0``, ``s1`` ...) are the swept axes;
+      ``scan_arrays`` carries one value array per scan slot.  Per point ``i`` the measurement
+      resolves the scan slots to that row via :meth:`PulseTableState.with_slots_resolved`
+      ({s0: row0, s1: row1, ...}) -- the SAME named-slot resolver the hardware scan path and
+      the pulse GUI use -- so the slots stay slots (no clearing, no per-period hacking, no
+      collision with an api slot on the same period).
+
+    ``scan_arrays`` values are in the slot's resolved unit (ns for a duration slot, signed LSB
+    code for a DAC slot), so they go straight into ``with_slots_resolved``."""
 
     def __init__(self, base_state: PulseTableState, scan_names: Sequence[str],
                  scan_arrays: Sequence[np.ndarray], camera, sequencer, calibration, reducer, *,
@@ -185,31 +187,15 @@ class PulseScanMeasurement:
         self.stop_event = None
 
     def measure(self, value: float, index: int | None = None) -> np.ndarray:
-        # Each point copies the base state (so successive points start from the SAME nominal
-        # template, not from the last point's edits), snapshots the scan-slot metadata
-        # (kind/target/unit) so we know what to bake in, DROPS the scan-slot list (so the
-        # period setters don't reject a scan-bound field), then writes each slot's current
-        # sweep value into the field directly.  The result is a fully resolved one-shot
-        # template -- to_sequence() compiles it as a fixed program.
+        # Resolve the bound scan slots to THIS point's row via the named-slot resolver
+        # ``with_slots_resolved`` -- the SAME mechanism the hardware scan + pulse GUI use.  The
+        # api slots stay fixed (already set on base_state); the scan slots are replaced by this
+        # row's values (ns for a duration slot, signed code for a DAC slot).  No clearing of
+        # slots, no per-period editing -- so an api slot on the same period is never clobbered.
         idx = 0 if index is None else int(index)
-        state = copy.deepcopy(self.base_state)
-        targets = [(state.scan_slots[int(n[1:])].kind,
-                    state.scan_slots[int(n[1:])].target,
-                    state.scan_slots[int(n[1:])].unit) for n in self.scan_names]
-        state.scan_slots = []                                      # detach so setters accept
-        for (kind, target, unit), arr in zip(targets, self.scan_arrays):
-            v = float(arr[idx])
-            if kind == "duration":
-                state.set_period_duration(int(target), v, unit=unit)
-            elif kind == "dac":
-                bus, period_index = target.split("@", 1)
-                period_index = int(period_index)
-                plan = state.analog_bus_plan(bus)
-                mode = str(plan[period_index].get("mode", "hold")).strip().lower() if period_index < len(plan) else "hold"
-                plan[period_index] = {"mode": mode if mode == "ramp" else "edge", "value": int(round(v))}
-                state.analog_bus_modes[bus] = plan
-        state.validate()
-        sequence = state.to_sequence(name="pulse_scan")
+        slots = {name: float(arr[idx]) for name, arr in zip(self.scan_names, self.scan_arrays)}
+        resolved = self.base_state.with_slots_resolved(slots)
+        sequence = resolved.to_sequence(name="pulse_scan")
         rows = []
         for _ in range(self.shots_per_point):
             frames = self.camera.acquire(self.n_frames, sequence=sequence, sequencer=self.sequencer,
