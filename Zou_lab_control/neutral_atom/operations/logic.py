@@ -934,12 +934,14 @@ class CalibrateReadoutTask(Task):
             trained[m] = thr
         return calibration.with_method_thresholds(trained, threshold_method="per_site_reference")
 
-    def _imaging_layout(self, state) -> tuple[int, int]:
-        """``(n_frames, readout_index)`` read from the loaded imaging template: the
-        camera-trigger periods IN FIRE ORDER are the frames, and the one tagged API slot
-        ``a2`` (the short readout) is the readout -- the rest are the long references that
-        vote ground truth (else the middle frame).  The cali images exactly the
-        long-short-long the FILE defines: it does not invent a bracket."""
+    def _imaging_layout(self, state) -> int:
+        """WHICH captured frame is the short readout (the ``readout_index``), read from the loaded
+        imaging template: the camera-trigger periods IN FIRE ORDER are the frames, and the one
+        tagged API slot ``a2`` (the short readout) is the readout -- the rest are the long
+        references that vote ground truth (else the middle frame).  This is the cali's own
+        INTERPRETATION of its template; it does NOT tell the camera how many frames to take (the
+        camera captures one per trigger).  The cali images exactly the long-short-long the FILE
+        defines -- it does not invent a bracket."""
         from ..timing import DEFAULT_CAMERA_TRIGGER_CHANNELS
         trig = [c for c in (getattr(self.sequencer, "trigger_channels", None) or DEFAULT_CAMERA_TRIGGER_CHANNELS)
                 if c in state.channels]
@@ -951,8 +953,7 @@ class CalibrateReadoutTask(Task):
                 "frame + 1 short readout) -- a long-short-long bracket. Open the template in the "
                 "pulse GUI and add the camera-trigger frames.")
         a2 = {int(s.target) for s in state.api_slots if s.name == "a2" and s.kind == "duration"}
-        readout_index = next((frame_periods.index(i) for i in frame_periods if i in a2), len(frame_periods) // 2)
-        return len(frame_periods), readout_index
+        return next((frame_periods.index(i) for i in frame_periods if i in a2), len(frame_periods) // 2)
 
     def _collect_bracket_groups(self, out: "TaskOutput", *, progress_lo: float, progress_hi: float):
         """Acquire ``threshold_frames`` reference BRACKETS.  Each bracket is ONE correlated
@@ -982,7 +983,7 @@ class CalibrateReadoutTask(Task):
                 f"{exc}  The Calibrate task sets the imaging template's exposures by API slot: tag "
                 "the three exposure cells as a1 (first long), a2 (short readout), a3 (second long) "
                 "in the pulse GUI (click each duration cell to its API state).") from exc
-        n_frames, readout_index = self._imaging_layout(template)
+        readout_index = self._imaging_layout(template)        # WHICH frame is the short readout (a2)
         self._readout_index = readout_index                    # shared with _save_live_frames
         bracket = template.to_sequence(name="reference_bracket")
         n_groups = max(2, int(self.threshold_frames))
@@ -991,9 +992,12 @@ class CalibrateReadoutTask(Task):
         for g in range(n_groups):
             if self._stop.is_set():
                 break
-            batch = self.camera.acquire(n_frames, sequence=bracket, sequencer=self.sequencer,
-                                        stop=self._stop)
+            # The camera captures ONE frame per camera trigger the bracket carries -- we do NOT
+            # tell it a count (decoupled: the pulse defines how many emCCD frames, not the caller).
+            batch = self.camera.acquire(sequence=bracket, sequencer=self.sequencer, stop=self._stop)
             frames = [np.asarray(f, dtype=float) for f in batch]
+            if len(frames) <= readout_index:
+                break                                          # stopped mid-bracket -> no full shot
             readout_per_group.append(frames[readout_index])
             reference_groups.append([f for i, f in enumerate(frames) if i != readout_index])
             frac = progress_lo + (progress_hi - progress_lo) * (g + 1) / n_groups

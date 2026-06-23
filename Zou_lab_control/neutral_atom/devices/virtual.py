@@ -488,14 +488,17 @@ class VirtualCamera(CameraDevice):
 
     def acquire(
         self,
-        frames: int = 1,
+        frames: int | None = None,
         *,
         sequence: PulseSequence | None = None,
         sequencer=None,
         force_all_sites: bool | None = None,
         **_,
     ) -> list[np.ndarray]:
-        frames = positive_int(frames, "frames")
+        # frames=None -> one frame per camera trigger the sequence carries (the camera is told
+        # the PULSE, never a frame count; see CameraDevice.acquire).  An explicit count is the
+        # repeat/live path.
+        frames = self._resolve_frame_count(frames, sequence, sequencer)
         trigger_channels = getattr(sequencer, "trigger_channels", None)
         # Infer the imaging channels the same single source the real adapter uses (probe
         # -> ch03 / cooling -> ch00 on a chNN sequencer), so virtual and real track the

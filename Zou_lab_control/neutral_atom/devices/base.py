@@ -102,8 +102,16 @@ class CameraDevice(BaseDevice):
         """Configure camera settings that are stable across an acquisition."""
 
     @abstractmethod
-    def acquire(self, frames: int = 1, *, sequence=None, sequencer=None, **kwargs) -> list[np.ndarray]:
-        """Acquire ``frames`` images and return one numpy array per frame.
+    def acquire(self, frames: int | None = None, *, sequence=None, sequencer=None, **kwargs) -> list[np.ndarray]:
+        """Acquire camera frames and return one numpy array per frame.
+
+        ``frames=None`` (the default) means **capture exactly one frame per camera trigger the
+        ``sequence`` carries** -- a real externally-triggered qCMOS does precisely this, so the
+        caller NEVER counts the sequence's triggers to tell the camera how many frames to take
+        (that was a coupling).  Pass an explicit ``frames`` ONLY for the repeat/live path: 1 for
+        a single live frame, or N to repeat a single-trigger pulse N times (averaging).  With no
+        sequence (live monitor) and ``frames=None`` it reads one frame off the streamer's current
+        firing.
 
         Optional ``stop`` kwarg: a ``threading.Event`` a live logic node can set to
         interrupt a blocking wait (e.g. a camera awaiting an external trigger
@@ -111,6 +119,23 @@ class CameraDevice(BaseDevice):
         waiting and raise :class:`AcquisitionCancelled` when it is set, instead
         of blocking for the full timeout; implementations that cannot interrupt
         may ignore it."""
+
+    @staticmethod
+    def _resolve_frame_count(frames, sequence, sequencer) -> int:
+        """The frame count for :meth:`acquire`.  ``frames`` given -> that count (the repeat/live
+        path).  ``frames is None`` + a sequence -> the number of camera triggers IN the sequence
+        (the camera self-determines from the pulse, never told by the caller).  No sequence -> 1."""
+        from ..core.analysis import positive_int
+        if frames is not None:
+            return positive_int(frames, "frames")
+        if sequence is not None:
+            from ..timing import DEFAULT_CAMERA_TRIGGER_CHANNELS, count_trigger_pulses
+            trig = getattr(sequencer, "trigger_channels", None) or DEFAULT_CAMERA_TRIGGER_CHANNELS
+            try:
+                return max(1, int(count_trigger_pulses(sequence, trigger_channels=trig)))
+            except Exception:
+                return 1
+        return 1
 
     # ----------------------------------------------------------- recent frames
     def _recent_state(self) -> dict:

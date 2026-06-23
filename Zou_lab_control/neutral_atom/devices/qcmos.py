@@ -129,11 +129,13 @@ class QCMOSCamera(CameraDevice):
         self._write_settings()
         return self
 
-    def acquire(self, frames: int = 1, *, sequence=None, sequencer=None, timeout_ms: int | None = None, stop=None) -> list[np.ndarray]:
-        frames = positive_int(frames, "frames")
+    def acquire(self, frames: int | None = None, *, sequence=None, sequencer=None, timeout_ms: int | None = None, stop=None) -> list[np.ndarray]:
         self.open()
         if sequencer is None and isinstance(sequence, PulseController):
             sequencer = sequence.sequencer
+        # frames=None -> one DCAM frame per camera trigger the sequence carries (the external
+        # trigger gates each readout; the caller never counts triggers for us).  Explicit = repeat.
+        frames = self._resolve_frame_count(frames, sequence, sequencer)
         runtime_sequence = self._sequence_for_frames(sequence, frames=frames, sequencer=sequencer)
         if sequence is not None:
             # Read exposure off the SAME channel the imaging sequence put the probe
