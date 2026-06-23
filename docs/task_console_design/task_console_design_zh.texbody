@@ -250,10 +250,9 @@ reshape 表达式（\pyapi{value = <y>\_sites.reshape(ny, nx)}），而 \pyapi{s
 kind & 绘图类 & 用途 \\
 \midrule
 \pyapi{2d} & \pyapi{Live2DDis} & 图像+侧分布+colorbar+可拖 clim（相机帧、网格率） \\
-\pyapi{sites} & \pyapi{LiveSiteMap} & 原子阵列站点图:每站一个实心圆按值着色+可垫相机帧 \\
+\pyapi{sites} & \pyapi{LiveSiteMap} & 原子阵列站点图:每站一个空心圆按占据着色 + 可垫相机帧 + 侧分布(帧强度直方图，像 \pyapi{2d}) \\
 \pyapi{1d} & \pyapi{Live1D} & 一维折线（逐站量、横轴站号） \\
-\pyapi{monitor} & \pyapi{LiveLiveDis} & 标量滚动轨迹+侧分布 \\
-\pyapi{monitor\_nodist} & \pyapi{LiveLive} & 滚动轨迹\tfocus{无}侧分布(独立 plot type;\pyapi{LiveLiveDis} 继承它加分布带)。装载率等侧分布无物理意义的量用它 \\
+\pyapi{monitor} & \pyapi{LiveLiveDis} / \pyapi{LiveLive} & 标量滚动轨迹。侧分布是一个 \pyapi{show\_dist} 开关(\tfocus{不是}独立 kind):开=\pyapi{LiveLiveDis}(带侧分布)，关=\pyapi{LiveLive}(裸轨迹，装载率等侧分布无意义的量用它) \\
 \pyapi{hist} & \pyapi{HistogramFigure} & 直方图+自动双高斯+可拖阈值线+保真度 \\
 \bottomrule
 \end{tabular}
@@ -323,8 +322,9 @@ Setting 弹窗按 confocal\_gui 的\tfocus{竖排范式}排布——粗体小标
       \item \pyapi{size} 尺寸预设。
       \item \pyapi{colormap}（仅 2D · Site map）——这就是\tfocus{改 colorbar 配色（colorset）}的地方；\tfocus{没有"显隐 colorbar"开关}（带 colorbar 的图恒显 colorbar）。
       \item \pyapi{colormap} 之外的功能参数（Site map 的 \pyapi{centers}/\pyapi{image}、Rolling 的历史长度、Distribution 的 bins）\tfocus{不在这里}——它们是 \pyapi{display=False} 的 \pyapi{PANEL\_PARAMS}，渲染在该面板的 \tfocus{Edit 标签} 的 Parameters 段（避免与 Setting 重复）。
+      \item Rolling 的 \pyapi{show\_dist} 开关（侧分布开/关，\pyapi{display=True} 的布尔，见 plot kinds 表）就在这一段——它选 \pyapi{LiveLiveDis}(带分布) vs \pyapi{LiveLive}(裸轨迹)。
     \end{itemize}
-  \item[relim] \pyapi{lim\_combo} 给两档 \pyapi{tight}/\pyapi{normal}（confocal\_gui \pyapi{combo\_relim} 同款命名），写 \pyapi{config.params["relim"]}（重建面板时重应用）。两档语义集中在 \pyapi{BaseLivePlot.\_mode\_target}\tfocus{单一真相源}：\pyapi{normal} 把下界钉在 0（数据非负时,读数对着零比），\pyapi{tight} 上下各留 10\% 余量裹住数据。\tfocus{对带 colorbar 的图(\pyapi{2d}\,/\,Site map),色限 clim 就是 y 轴的二维对应物},同样走 \pyapi{\_mode\_target}：\pyapi{normal} 把 colorbar 锚在 0、\pyapi{tight} 裹住帧值；切换时 \pyapi{Live2DDis.apply\_relim\_now} 即时重映射 colorbar（两个方向都重映),并同步可拖 clim 线。
+  \item[relim] \pyapi{lim\_combo} 给三档 \pyapi{tight}/\pyapi{normal}/\pyapi{fixed}（前两档 confocal\_gui \pyapi{combo\_relim} 同款命名），写 \pyapi{config.params["relim"]}（重建面板时重应用）。语义集中在 \pyapi{BaseLivePlot.\_mode\_target}\tfocus{单一真相源}：\pyapi{normal} 把下界钉在 0（数据非负时,读数对着零比），\pyapi{tight} 上下各留 10\% 余量裹住数据，\pyapi{fixed} 把轴钉死在操作者设的 \pyapi{fixed\_lo}/\pyapi{fixed\_hi}（选 \pyapi{fixed} 时才显这两个输入框，改完即时重应用、不重建）。\tfocus{对带 colorbar 的图(\pyapi{2d}\,/\,Site map),色限 clim 就是 y 轴的二维对应物},同样走 \pyapi{\_mode\_target}：\pyapi{normal} 锚 0、\pyapi{tight} 裹帧值、\pyapi{fixed} 钉死;切换时 \pyapi{apply\_relim\_now} 即时重映射 colorbar 并同步可拖 clim 线。
   \item[Unit] \pyapi{Unit} 按钮在 \pyapi{DataFigure.change\_unit} 的单位环上前进一档（GHz/nm/MHz 或 ns/us/ms 等）；右侧显示当前累计倍数（\pyapi{unit\_index}）。轴标签未带可换单位时是 no-op。
   \item[Panel（这张卡）] 面板标题（显示在图内，必须经 \pyapi{BaseLivePlot.\_apply\_title} → \pyapi{style.apply\_title} 改才有正确字号）、\pyapi{Remove}、\pyapi{Edit…}（开\tfocus{该面板专属的 Edit 标签}做参数 / 全套拟合 / 手动 lim / 详细处理）、\pyapi{Save Fig}（一键导出 png + npz 到 tasks/）。
 \end{description}
