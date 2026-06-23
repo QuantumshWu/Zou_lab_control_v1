@@ -25,8 +25,7 @@ import numpy as np
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 
-from .live import HistogramFigure, LiveSiteMap, SiteHistogramGrid, site_ring_radius
-from .style import PALETTE, axis_label_fontsize, title_fontsize
+from .live import HistogramFigure, LiveSiteMap, SiteHistogramGrid, site_psf_grid, site_ring_radius
 
 
 def _agg_figure() -> Figure:
@@ -63,29 +62,16 @@ def _site_grid(per_method_counts, thresholds, fidelity, *, title):
         fig=_agg_figure(), interactions=False).show(display=False)
 
 
-def _save_psf_grid(psf_weights, path: Path) -> str:
-    """Render the per-site PSF weight images as a grid (one small imshow per site) and save it.
-
-    This is the calibration's PSF *shape* output -- each panel is one site's empirical
-    matched-filter kernel, so the operator SEES the real (asymmetric, non-Gaussian) atom spot
-    the readout weights by.  Mirrors the rb87 readout's ``02_psf_grid.png``."""
-    weights = np.asarray(psf_weights, dtype=float)
-    n = len(weights)
-    cols = int(np.ceil(np.sqrt(n)))
-    rows = int(np.ceil(n / max(cols, 1)))
-    fig = _agg_figure()
-    fig.set_size_inches(max(4.0, cols * 0.9), max(4.0, rows * 0.9))
-    gs = fig.add_gridspec(rows, cols, wspace=0.15, hspace=0.25)
-    vmax = float(np.nanmax(weights)) if weights.size else 1.0
-    for i in range(n):
-        ax = fig.add_subplot(gs[i // cols, i % cols])
-        ax.imshow(weights[i], origin="lower", cmap=PALETTE["cmap_camera"], vmin=0.0, vmax=vmax)
-        ax.set_title(str(i), fontsize=axis_label_fontsize())
-        ax.set_xticks([]); ax.set_yticks([])
-    fig.suptitle("Per-site PSF weights (empirical matched filter -- the real asymmetric spot)",
-                 fontsize=title_fontsize())
-    fig.savefig(str(path), dpi=600)
-    return str(path)
+def _psf_grid(psf_weights, *, title):
+    """The calibration's PSF *shape* output: one ``imshow`` per site of its empirical
+    matched-filter kernel (the real asymmetric, non-Gaussian spot), on the reusable
+    per-site image grid (a :class:`GridPlot` of :class:`ImageCell`) -- NOT hand-rolled
+    matplotlib (frontend rule 7), so it gets the same selectors / focus-zoom / save
+    contract as every other report figure.  Mirrors the rb87 readout's ``02_psf_grid.png``."""
+    return site_psf_grid(
+        [np.asarray(w, dtype=float) for w in psf_weights],
+        labels=("x (px)", "y (px)"), title=title,
+        fig=_agg_figure(), interactions=False, display=False)
 
 
 def save_calibration_report(folder, *, counts, thresholds, fidelity, centers,
@@ -172,7 +158,9 @@ def save_calibration_report(folder, *, counts, thresholds, fidelity, centers,
         paths["site_map"] = _save_plot(site_map, folder / "site_map.png")
 
     if psf_weights is not None and len(np.asarray(psf_weights)):
-        paths["psf_grid"] = _save_psf_grid(psf_weights, folder / "psf_grid.png")
+        grid = _psf_grid(psf_weights,
+                         title="Per-site PSF weights (empirical matched filter -- the real asymmetric spot)")
+        paths["psf_grid"] = _save_plot(grid, folder / "psf_grid.png")
 
     return paths
 

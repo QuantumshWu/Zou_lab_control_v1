@@ -2075,6 +2075,61 @@ class HistogramCell(GridCell):
         return (vals > thr).astype(int)
 
 
+class ImageCell(GridCell):
+    """A GridPlot cell that is a 2D image -- one ``imshow`` per cell.  The readout's
+    per-site **PSF weight kernel** uses it, so the operator SEES the real (asymmetric,
+    non-Gaussian) atom spot the matched filter weights by.
+
+    ``images`` is a sequence of 2D arrays (one per cell); ALL cells share ONE colour
+    scale so the grid is comparable (the art "aligned" rule).  An image cell has no 1D
+    cut, so it contributes the zoom/pan/area/cross selectors but no draggable threshold
+    line -- exactly the ``Image2DCell`` the :class:`GridCell` docstring reserves."""
+
+    def __init__(self, images, *, labels: Sequence[str] = ("x (px)", "y (px)")):
+        self.images = [np.asarray(im, dtype=float) for im in images]
+        self.n_cells = len(self.images)
+        if self.n_cells == 0:
+            raise ValueError("images must contain at least one cell.")
+        self.labels = tuple(labels)
+        self.vmax = 1.0
+
+    def prepare(self) -> None:
+        finite = [im[np.isfinite(im)] for im in self.images if im.size]
+        pooled = np.concatenate(finite) if finite else np.array([0.0, 1.0])
+        hi = float(np.nanmax(pooled)) if pooled.size else 1.0
+        self.vmax = hi if hi > 0 else 1.0   # one shared colour scale -> cells comparable
+
+    def draw(self, ax, k: int, *, detail: bool = False):
+        ax.imshow(self.images[k], origin="lower", cmap=PALETTE["cmap_camera"],
+                  vmin=0.0, vmax=self.vmax, aspect="equal")
+        if detail:
+            # Enlarged single-cell view: a proper standalone image (axes + labels + title).
+            ax.set_xlabel(self.labels[0], fontsize=axis_label_fontsize())
+            ax.set_ylabel(self.labels[1] if len(self.labels) > 1 else "", fontsize=axis_label_fontsize())
+            ax.tick_params(labelsize=axis_label_fontsize(), length=2.5)
+            apply_title(ax, f"site {k}")
+        else:
+            # Grid cell: a corner tag, no ticks (the kernel SHAPE is the point).  The tag
+            # sits ON the image, so a plain dark label vanishes on the dark corner -- draw
+            # it light (the "label on a coloured fill" token) with a dark stroke so it reads
+            # on ANY grayscale pixel (dark corner OR a bright lobe that reaches the corner).
+            import matplotlib.patheffects as pe
+            txt = ax.text(0.06, 0.95, f"s{k}", transform=ax.transAxes, ha="left", va="top",
+                          fontsize=small_fontsize(), color=PALETTE["pulse_name"], linespacing=0.92)
+            txt.set_path_effects([pe.withStroke(linewidth=1.4, foreground=PALETTE["annotation"])])
+            ax.set_xticks([])
+            ax.set_yticks([])
+        return None
+
+    def data_figure(self, fig, ax, k: int):
+        from .data_figure import DataFigure
+        # The grid's ``.npz`` (the save contract) carries each site's PSF kernel as a
+        # 1D series (square-recoverable); the canonical 2D weights live in calibration.npz.
+        flat = self.images[k].reshape(-1)
+        return DataFigure(fig=fig, ax=ax, data_x=np.arange(flat.size, dtype=float),
+                          data_y=flat, labels=self.labels, name=f"site{k}_psf")
+
+
 class _GridData:
     """Composite ``DataFigure`` handle for a :class:`GridPlot`: one per-cell
     :class:`DataFigure` (each panel fits with the SAME stack as any plot) + a
@@ -2386,6 +2441,30 @@ def site_histogram_grid(
         site_fidelities=site_fidelities,
         labels=labels,
         title=title,
+    ).show(display=display)
+
+
+def site_psf_grid(
+    images,
+    *,
+    labels: Sequence[str] = ("x (px)", "y (px)"),
+    title: str = "",
+    display: bool = True,
+    **kwargs,
+):
+    """Plot one image per site on an aligned, non-overlapping grid (general N).
+
+    Each cell is a site's PSF weight kernel (an :class:`ImageCell`), so the operator
+    SEES the real asymmetric, non-Gaussian spot the readout weights by -- the
+    calibration's PSF *shape* output, drawn as a FIRST-CLASS plot rather than
+    hand-rolled matplotlib.  Returns a :class:`GridPlot` (of :class:`ImageCell`): it is
+    interactive (per-cell zoom + **double-click a cell to enlarge it**) and saves a png
+    + matching ``.npz`` of the kernels via the same contract as every plot.  Geometry/
+    gaps/colours/dpi/fonts are owned by the frontend (cells never overlap / cut off,
+    all cells align)."""
+
+    return GridPlot(
+        ImageCell(images, labels=labels), labels=labels, title=title, **kwargs
     ).show(display=display)
 
 

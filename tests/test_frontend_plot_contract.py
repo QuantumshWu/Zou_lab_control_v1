@@ -60,6 +60,7 @@ def _build_public_plots():
     centers = np.column_stack([(np.arange(9) % 3) * 5.0, (np.arange(9) // 3) * 5.0])
     sites = [np.concatenate([rng.normal(3, 1, 50), rng.normal(40, 3, 60)]) for _ in range(6)]
     occ = [np.array([False] * 50 + [True] * 60) for _ in range(6)]
+    psf = [rng.random((7, 7)) for _ in range(6)]            # per-site PSF kernels (image grid)
     return {
         "1d": zf.plot(x, y, kind="1d", display=False, update="once"),
         "2d": zf.plot(xy, z, kind="2d", display=False, update="once"),
@@ -68,6 +69,7 @@ def _build_public_plots():
         "sites": zf.plot(centers, rng.random(9), kind="sites", display=False, update="once"),
         "grid": zf.site_histogram_grid(sites, occupied=occ, thresholds=[20.0] * 6,
                                        site_fidelities=[0.99] * 6, display=False),
+        "psf_grid": zf.site_psf_grid(psf, display=False),
     }
 
 
