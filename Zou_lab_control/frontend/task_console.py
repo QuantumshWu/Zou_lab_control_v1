@@ -2444,7 +2444,9 @@ class MeasurementPanel(QtWidgets.QWidget):
         # auto-generated parameter form (rebuilt when the type changes)
         self.form = QtWidgets.QFormLayout()
         self.form.setContentsMargins(0, 0, 0, 0)
-        self.form.setLabelAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        # LEFT-align the label column (like the plot Edit's FluentSettingRow rows): right-aligned
+        # labels gave every row a different left edge (ragged), which read as messy (#H3).
+        self.form.setLabelAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         self.form.setHorizontalSpacing(scaled_px(8, minimum=5))
         self.form.setVerticalSpacing(scaled_px(5, minimum=3))
         # Fields fill the available width (the Edit page is wide): an expanding
@@ -2532,10 +2534,10 @@ class MeasurementPanel(QtWidgets.QWidget):
             return
         for decl in spec.params:
             kind = decl.kind
-            # Show the REAL parameter name (the key threaded into the build call, e.g.
-            # ``folder`` / ``threshold_frames``), not a hand-written prettified label
-            # -- so the form is unambiguously the node's actual parameters.
-            label_text = decl.key + (f" ({decl.unit})" if decl.unit else "")
+            # Show the READABLE label ("Pulse template" / "Signal (y)" / "Output name"), not the
+            # raw build-call key ("template" / "y" / "y_name") -- the key is unreadable in a form
+            # an experimenter actually uses (#H3); the tooltip still carries the full meaning.
+            label_text = (decl.label or decl.key) + (f" ({decl.unit})" if decl.unit else "")
             if decl.required:
                 label_text += " *"
             if kind == "axis_range":
