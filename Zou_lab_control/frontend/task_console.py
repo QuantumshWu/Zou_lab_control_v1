@@ -520,6 +520,9 @@ class _SignalExprWidget(QtWidgets.QWidget):
         self._formats_provider = formats_provider
         self._inputs: list[str] = ["frame"]
         self._editor = None
+        # ONE label-column width shared by every row (the signal slots AND the value row), so the
+        # whole widget reads as one tidy label/control grid like the plot Edit -- not ragged (#4).
+        self._label_w = scaled_px(64, minimum=52)
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(scaled_px(4, minimum=3))
@@ -528,7 +531,10 @@ class _SignalExprWidget(QtWidgets.QWidget):
         self._slot_box.setSpacing(scaled_px(4, minimum=3))
         root.addLayout(self._slot_box)
         self.slot_combos: list = []
-        btn_row = QtWidgets.QHBoxLayout()
+        # +/- buttons sit UNDER the label column (an empty label), so they line up with the
+        # control column of the rows above instead of floating full-width.
+        btn_inner = QtWidgets.QWidget()
+        btn_row = QtWidgets.QHBoxLayout(btn_inner)
         btn_row.setContentsMargins(0, 0, 0, 0)
         btn_row.setSpacing(scaled_px(6, minimum=4))
         self._add_btn = FluentButton("+ signal", color=GREY)
@@ -540,21 +546,25 @@ class _SignalExprWidget(QtWidgets.QWidget):
         btn_row.addWidget(self._add_btn, 0)
         btn_row.addWidget(self._rm_btn, 0)
         btn_row.addStretch(1)
-        root.addLayout(btn_row)
+        # +/- buttons under a blank label so they line up with the signal-slot control column
+        root.addWidget(FluentSettingRow("", btn_inner, label_width=self._label_w))
         self._source_edit = FluentLineEdit("value = signal")
-        self._source_edit.setMinimumWidth(scaled_px(200, minimum=160))
+        self._source_edit.setMinimumWidth(scaled_px(160, minimum=120))
         self._source_edit.setToolTip(SOURCE_EXPR_HELP())
         self._source_edit.textChanged.connect(self.changed)
         self._edit_btn = FluentButton("Edit…", color=GREY)
         self._edit_btn.setFixedWidth(scaled_px(56, minimum=44))
         self._edit_btn.setToolTip("Open a large floating editor for this expression")
         self._edit_btn.clicked.connect(self._open_editor)
-        expr_row = QtWidgets.QHBoxLayout()
+        expr_inner = QtWidgets.QWidget()
+        expr_row = QtWidgets.QHBoxLayout(expr_inner)
         expr_row.setContentsMargins(0, 0, 0, 0)
         expr_row.setSpacing(scaled_px(6, minimum=4))
         expr_row.addWidget(self._source_edit, 1)
         expr_row.addWidget(self._edit_btn, 0)
-        root.addLayout(expr_row)
+        # the expression on its OWN labelled "value" row, aligned to the same label column as the
+        # signal slots above -- so the whole source control reads as one tidy grid (#4)
+        root.addWidget(FluentSettingRow("value", expr_inner, label_width=self._label_w))
         self._rebuild_slots()
 
     def _names(self) -> list:
@@ -593,7 +603,7 @@ class _SignalExprWidget(QtWidgets.QWidget):
                                       formats=self._formats(), current=cur)
             combo.activated.connect(lambda *_a, idx=i: self._on_pick(idx))
             self.slot_combos.append(combo)
-            self._slot_box.addWidget(FluentSettingRow(label, combo, label_width=scaled_px(64, minimum=52)))
+            self._slot_box.addWidget(FluentSettingRow(label, combo, label_width=self._label_w))
         self._rm_btn.setEnabled(n > 1)
 
     def _collect_inputs(self) -> None:
