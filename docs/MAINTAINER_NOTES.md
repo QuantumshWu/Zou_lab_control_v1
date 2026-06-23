@@ -314,10 +314,15 @@ or replace the editor with plain tables.
   vertical scroll. Period cards may scroll horizontally; they must not have
   independent vertical scrollbars. For the same channel, raw-label, delay edit,
   and first period checkbox must share `mapTo(editor, QPoint(0,0)).y()`.
-- A scan dot next to a duration/delay/DAC field binds it: the field turns orange
-  and disabled and shows its slot number. The Scan tab lets the user write
-  Python that assigns an `N_points x N_slots` array to a `scan_table` variable
-  (namespace has `np`, `math`, `n_slots`).
+- A dot next to a per-field value cycles its binding. A **duration** or **DAC**
+  field cycles none -> scan (`sN`, orange, value HIDDEN/disabled) -> api (`aN`,
+  violet, value KEPT and still editable) -> none. A **channel delay** field is not
+  scannable, so its dot cycles none -> api (`aN`, violet) -> none only. A scan slot
+  is swept from the `scan_table`; an API slot is a named handle several fields can
+  share that `set_api(name, v)` / `state.aN = v` set BY NAME without rewriting the
+  field (e.g. both long frames of the imaging bracket share `a1`). The Scan tab
+  lets the user write Python that assigns an `N_points x N_slots` array to a
+  `scan_table` variable (namespace has `np`, `math`, `n_slots`).
 - Preview reuses `frontend.plot(..., kind="pulse")`, redraws on tab open / `Show
   off rows` toggle (no manual refresh button), plots the **unexpanded** period
   table, y-axis labels are channel display labels (no `Pulse` title), repeats

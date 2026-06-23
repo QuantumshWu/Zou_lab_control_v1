@@ -37,13 +37,13 @@ from .qt_fluent import (
     GREEN,
     GREY,
     ORANGE,
-    PLACEHOLDER,
     RED,
     TEXT,
     YELLOW,
     ElidedLabel,
     FluentButton,
     FluentCheckBox,
+    FluentCodeEdit,
     FluentComboBox,
     FluentDoubleSpinBox,
     FluentFormGrid,
@@ -60,7 +60,6 @@ from .qt_fluent import (
     FluentTabWidget,
     FluentWindow,
     Metrics,
-    apply_fluent_scrollbars,
     ensure_qt_app,
     fluent_font_size,
     fluent_scrollbar_stylesheet,
@@ -1382,6 +1381,7 @@ class ChannelPanel(FluentGroupBox):
     loadScanRequested = QtCore.pyqtSignal()
     scanSourceToggled = QtCore.pyqtSignal(bool)
     clkRequested = QtCore.pyqtSignal(str)   # toggle: wire this channel's pin to the FPGA clk
+    delayApiRequested = QtCore.pyqtSignal(str)  # cycle this channel's delay as an API slot (none->api->none)
 
     def __init__(self, state: PulseTableState, parent=None):
         super().__init__("Delay / Scan", parent)
@@ -1484,9 +1484,18 @@ class ChannelPanel(FluentGroupBox):
             else:
                 delay_value = state.delays.get(key, 0)
                 delay_unit = state.delay_units.get(key, "ns")
-            # A per-channel delay is a FIXED output delay (a delay line) and is not
-            # scannable, so the field is a plain numeric input -- no scan dot.
-            delay_edit = FluentLineEdit(str(delay_value))
+            # A per-channel delay is a FIXED output delay (a delay line) -- NOT scannable, but it
+            # CAN be an API slot the notebook/Task sets by name.  So a real (non-bus) channel's
+            # delay field carries the same inline dot, API-only: clicking it cycles none -> API
+            # (aN, violet, value kept) -> none.  A DAC-bus row stays a plain field.
+            if is_bus:
+                delay_edit = FluentLineEdit(str(delay_value))
+            else:
+                delay_edit = FluentScanLineEdit(str(delay_value))
+                delay_edit.scanClicked.connect(lambda ch=key: self.delayApiRequested.emit(ch))
+                api_name = self.state.api_slot_for("delay", key)
+                if api_name:
+                    delay_edit.set_api_bound(True, _api_number(api_name))
             if mixed_delay:
                 delay_edit.setPlaceholderText("(mixed)")
                 delay_edit.setToolTip("Members of this bus carry DIFFERENT delays (set via the "
@@ -2224,6 +2233,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self.channel_panel.loadScanRequested.connect(self._load_scan_file)
         self.channel_panel.scanSourceToggled.connect(self._on_scan_source_toggled)
         self.channel_panel.clkRequested.connect(self._toggle_clk_channel)
+        self.channel_panel.delayApiRequested.connect(self._toggle_delay_api)
         self.channel_panel_layout.addWidget(self.channel_panel)
         # Restore the active scan-table source (the panel was just recreated, so its
         # toggle + file label default back to off / empty).
@@ -2674,6 +2684,10 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                     edit.setText(str(dval))
                     if ucombo is not None:
                         ucombo.setCurrentText(dunit)
+                    # reflect the delay's API-slot marker (non-bus channels carry the dot)
+                    if hasattr(edit, "set_api_bound"):
+                        api_name = None if is_bus else state.api_slot_for("delay", key)
+                        edit.set_api_bound(bool(api_name), _api_number(api_name) if api_name else None)
             panel.state = state
             panel.set_scan_summary()
             return True
@@ -2766,6 +2780,16 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         except Exception as exc:
             self._message(str(exc))
 
+    def _toggle_delay_api(self, channel: str) -> None:
+        """A delay dot was clicked -> cycle that channel's delay as an API slot (none -> api ->
+        none).  A delay is not scannable, so ``_cycle_field_slot`` skips the scan step."""
+        try:
+            state = self.read_state()
+            self._cycle_field_slot(state, "delay", str(channel),
+                                   unit=state.delay_units.get(str(channel), "ns"))
+        except Exception as exc:
+            self._message(str(exc))
+
     def _load_scan_file(self) -> None:
         try:
             state = self.read_state()
@@ -2822,13 +2846,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         editor_layout = QtWidgets.QVBoxLayout(editor_box)
         editor_layout.setContentsMargins(_px(8), _px(28, minimum=24), _px(8), _px(8))
         editor_layout.setSpacing(_px(6, minimum=4))
-        self.scan_code = QtWidgets.QPlainTextEdit()
-        self.scan_code.setStyleSheet(
-            f'QPlainTextEdit {{ background: white; color: {TEXT}; '
-            f'border: 1px solid {PLACEHOLDER}; border-radius: {scaled_px(4)}px; '
-            f'font: {fluent_font_size()}pt "Consolas", "Courier New", monospace; padding: {_px(4)}px; }}'
-        )
-        apply_fluent_scrollbars(self.scan_code)   # match the Edit-tab Fluent scrollbar
+        self.scan_code = FluentCodeEdit()         # shared monospace code editor (Fluent chrome)
         # Top row: load a saved program (.py) or drop in a template that adapts to the
         # currently bound slot count (column_stack is the default starting point).
         template_buttons = QtWidgets.QHBoxLayout()
@@ -2877,16 +2895,8 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         preview_box = FluentGroupBox("Scan table")
         preview_layout = QtWidgets.QVBoxLayout(preview_box)
         preview_layout.setContentsMargins(_px(8), _px(28, minimum=24), _px(8), _px(8))
-        self.scan_table_view = QtWidgets.QPlainTextEdit()
-        self.scan_table_view.setReadOnly(True)
-        # White with a light border to match the code editor on the left -- the
-        # old grey (BG) fill read as an out-of-place grey side panel.
-        self.scan_table_view.setStyleSheet(
-            f'QPlainTextEdit {{ background: white; color: {TEXT}; border: 1px solid {PLACEHOLDER}; '
-            f'border-radius: {scaled_px(4)}px; font: {fluent_font_size()}pt "Consolas", "Courier New", monospace; '
-            f'padding: {_px(4)}px; }}'
-        )
-        apply_fluent_scrollbars(self.scan_table_view)   # the scan-points scroll matches Edit tab
+        # read-only twin of the code editor on the left (same Fluent chrome, no grey panel)
+        self.scan_table_view = FluentCodeEdit(read_only=True)
         preview_layout.setSpacing(_px(6, minimum=4))
         preview_layout.addWidget(self.scan_table_view, 1)
         # Mirror the left column's button-row footprint so the two boxes share an
@@ -3246,6 +3256,32 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             new_target = str(period) if slot.kind == "duration" else f"{slot.dac_bus}@{period}"
             if new_target != slot.target:
                 state.scan_slots[slot_index] = dataclasses.replace(slot, target=new_target)
+
+        # API slots target a period the SAME way (duration index / dac "bus@i"; a delay slot
+        # targets a CHANNEL, never a period -> untouched).  Shift / drop them identically so a
+        # period remove/insert never leaves an api slot pointing at a missing period -- the
+        # regression where removing a period of the long-short-long template raised in validate
+        # (an a1 slot still bound to the now-deleted image_2).
+        kept: list = []
+        for slot in state.api_slots:
+            if slot.kind == "duration":
+                period = int(slot.target) if str(slot.target).lstrip("-").isdigit() else -1
+            elif slot.kind == "dac":
+                bus, _, p = str(slot.target).partition("@")
+                period = int(p) if p.lstrip("-").isdigit() else -1
+            else:
+                kept.append(slot)            # delay slot: targets a channel, no period shift
+                continue
+            if removed is not None:
+                if period == removed:
+                    continue                 # bound to the removed period -> drop the handle
+                if period > removed:
+                    period -= 1
+            if inserted is not None and period >= inserted:
+                period += 1
+            new_target = str(period) if slot.kind == "duration" else f"{bus}@{period}"
+            kept.append(slot if new_target == slot.target else dataclasses.replace(slot, target=new_target))
+        state.api_slots = kept
 
     @staticmethod
     def _edit_analog_bus_modes(state: PulseTableState, *, inserted: int | None = None,

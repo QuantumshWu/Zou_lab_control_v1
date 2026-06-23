@@ -79,6 +79,7 @@ from .qt_fluent import (
     FluentStatusDot,
     FluentSwitch,
     FluentTabWidget,
+    FluentTextDialog,
     FluentWindow,
     ensure_qt_app,
     fluent_widget_stylesheet,
@@ -175,6 +176,90 @@ def _common_token_prefix(names) -> str:
     common = _op.commonprefix(names)
     cut = common.rfind("_")
     return common[: cut + 1] if cut >= 0 else ""
+
+
+def grouped_signal_items(names, sources, formats) -> list:
+    """``[(display, bare_name | None)]`` for a signal picker, GROUPED by producing node: a
+    non-selectable bold header per node (``bare_name`` is ``None``), then that node's signals
+    indented + prefix-stripped beneath it (``    rate  [shape]``).  The ONE source every signal
+    picker shares (plot panel AND logic-node source) so a signal is always chosen the same way."""
+    names = sorted(str(n) for n in (names or []))
+    sources = dict(sources or {})
+    formats = dict(formats or {})
+    by_producer: dict[str, list[str]] = {}
+    for name in names:
+        for p in ([str(p) for p in (sources.get(name) or [])] or ["(unbound)"]):
+            by_producer.setdefault(p, []).append(name)
+    items: list[tuple[str, str | None]] = []
+    for producer in sorted(by_producer, key=lambda p: (p == "(unbound)", p.lower())):
+        group = by_producer[producer]
+        items.append((producer, None))            # group header (rendered disabled + bold)
+        strip = _common_token_prefix(group) or (str(producer).strip("() ") + "_")
+        for name in group:
+            short = name[len(strip):] if (strip and name.startswith(strip) and len(name) > len(strip)) else name
+            fmt = formats.get(name)
+            items.append((f"    {short}" + (f"  [{fmt}]" if fmt else ""), name))
+    return items
+
+
+def fill_grouped_signal_combo(combo, *, names, sources, formats, current, none_label=None) -> None:
+    """Populate ``combo`` with every live hub signal GROUPED by producing node (via
+    :func:`grouped_signal_items`): bold non-selectable headers, indented signals (data = the
+    BARE name).  ``none_label`` adds a leading empty choice; a not-yet-published ``current``
+    is kept selectable.  Read the pick back with ``currentData()`` (the bare name) -- the
+    visible label is indented.  Shared by the plot panel's slot picker and the logic-node
+    source field, so the nested picker is identical everywhere."""
+    cur = str(current or "")
+    with _signals_blocked(combo):
+        combo.clear()
+        if none_label is not None:
+            combo.addItem(none_label, "")
+        items = grouped_signal_items(names, sources, formats)
+        have = {bare for _, bare in items if bare}
+        for label, name in items:
+            if name is None:                      # group header: visible but not selectable
+                combo.addItem(label, None)
+                item = combo.model().item(combo.count() - 1)
+                if item is not None:
+                    item.setEnabled(False)
+                    font = item.font(); font.setBold(True); item.setFont(font)
+                continue
+            combo.addItem(label, name)            # indented signal; data is the bare name
+        if cur and cur not in have:               # preserve a not-yet-published name
+            combo.addItem(f"{cur}  (not yet published)", cur)
+        idx = combo.findData(cur)
+        # No match: select the leading none-row if there is one, else leave it BLANK (index -1)
+        # -- never auto-land on a disabled group HEADER (data None), whose label would otherwise
+        # read back as if it were the chosen signal.
+        if idx < 0 and none_label is not None:
+            idx = 0
+        combo.setCurrentIndex(idx)
+
+
+def read_editable_combo(combo) -> str:
+    """Read an EDITABLE combo that pairs a display LABEL with a bare-value ``data`` (the grouped
+    signal picker, the pulse-param picker).  Returns the selected item's data when the visible
+    text still matches that item (a real pick) -- else the typed text (a not-yet-published custom
+    name).  A plain ``currentData()`` would return the STALE previously-selected data after the
+    user types a new name into the line edit (Qt does not move currentIndex on free text), so the
+    fresh name would be silently dropped; a disabled header (data ``None``) falls through to ''."""
+    idx = combo.currentIndex()
+    text = combo.currentText()
+    if idx >= 0 and text == combo.itemText(idx):
+        data = combo.itemData(idx)
+        if data is not None:
+            return str(data).strip()
+    return text.strip()
+
+
+# The ONE description of a panel's source-expression namespace -- shown both as the inline
+# field's tooltip and as the floating editor's prompt, so the two never drift.
+SOURCE_EXPR_HELP = (
+    "Panel data source: one line of Python evaluated against the live signals.\n"
+    "Assign the result to `value`.  `signal` is the picked signal (one slot); with more\n"
+    "than one slot it is a list, so `value = signal[0] - signal[1]` combines them.\n"
+    "Namespace: every signal name (latest value), history(name, n), latest(name),\n"
+    "names(), shot, np, math.")
 
 # Every Monitor-board panel is a PURE VIEW (role "plot"): it is fully decoupled
 # from acquisition -- it shows a hub signal and carries the full plotter Edit (the
@@ -911,12 +996,14 @@ class PanelCard(FluentGroupBox):
         self.source_edit.setMinimumWidth(scaled_px(280, minimum=220))
         self.source_edit.setStyleSheet(
             self.source_edit.styleSheet() + " QLineEdit { font-family: Consolas, monospace; }")
-        self.source_edit.setToolTip(
-            "Panel data source: one line of Python evaluated against the live signals.\n"
-            "Assign the result to `value`.  `signal` is the picked signal (one slot); with more\n"
-            "than one slot it is a list, so `value = signal[0] - signal[1]` combines them.\n"
-            "Namespace: every signal name (latest value), history(name, n), latest(name),\n"
-            "names(), shot, np, math.")
+        self.source_edit.setToolTip(SOURCE_EXPR_HELP)
+        # An inline one-liner is cramped for a real expression; "⤢" pops a LARGE floating
+        # multi-line editor (a modal card, so it does NOT reflow the panel layout) prefilled
+        # with the source -- comfortable for typing math across signals -- and writes it back.
+        self.expand_button = FluentButton("⤢", color=GREY)
+        self.expand_button.setFixedWidth(scaled_px(30, minimum=26))
+        self.expand_button.setToolTip("Open a large floating editor for this expression")
+        self.expand_button.clicked.connect(self._open_expr_editor)
         self.apply_button = FluentButton("Apply", color=GREEN)
         self.apply_button.setFixedWidth(scaled_px(64, minimum=52))
         self.apply_button.clicked.connect(self._apply_source)
@@ -926,6 +1013,7 @@ class PanelCard(FluentGroupBox):
         expr_row.setContentsMargins(0, 0, 0, 0)
         expr_row.setSpacing(scaled_px(6, minimum=4))
         expr_row.addWidget(self.source_edit, 1)
+        expr_row.addWidget(self.expand_button, 0)
         expr_row.addWidget(self.apply_button, 0)
         sec.addLayout(expr_row)
 
@@ -1120,80 +1208,16 @@ class PanelCard(FluentGroupBox):
         popup.show()
         popup.raise_()
 
-    def _signal_combo_items(self) -> list[tuple[str, str | None]]:
-        """``[(display, bare_name)]`` for the signal picker, GROUPED by producing node so the
-        list reads as a TWO-LEVEL picker: a non-selectable bold header per measurement /
-        processor (its ``bare_name`` is ``None``), then that node's signals indented beneath
-        it, each labelled ``name  [shape]`` -- the producer appears ONCE as the group rather
-        than repeated in every signal label (so the labels stay short).  A signal produced by
-        more than one running node is listed under each; a signal with no running producer is
-        grouped under a trailing ``(unbound)`` header.  The SINGLE source the panel's signal
-        picker shares, so a signal is picked the same way everywhere (by origin + shape)."""
-        names: list[str] = []
-        if callable(self.names_provider):
-            try:
-                names = sorted(str(n) for n in self.names_provider())
-            except Exception:
-                names = []
-        sources: dict = {}
-        if callable(self.sources_provider):
-            try:
-                sources = dict(self.sources_provider())
-            except Exception:
-                sources = {}
-        formats: dict = {}
-        if callable(self.formats_provider):
-            try:
-                formats = dict(self.formats_provider())
-            except Exception:
-                formats = {}
-        # group bare names UNDER their producing node (a name with >1 producer is listed under
-        # each; an unbound name lands in the trailing "(unbound)" group).
-        by_producer: dict[str, list[str]] = {}
-        for name in names:
-            producers = [str(p) for p in (sources.get(name) or [])] or ["(unbound)"]
-            for p in producers:
-                by_producer.setdefault(p, []).append(name)
-        items: list[tuple[str, str | None]] = []
-        for producer in sorted(by_producer, key=lambda p: (p == "(unbound)", p.lower())):
-            group = by_producer[producer]
-            items.append((producer, None))            # group header (rendered disabled + bold)
-            # The producer is named ONCE in the header, so its signals show SHORT under it: strip
-            # the node prefix the hub prepends (e.g. "judge_occupancy_rate" -> "rate").  The bare
-            # name (the combo's data) is unchanged, so the expression / coherence still resolve.
-            strip = _common_token_prefix(group) or (str(producer).strip("() ") + "_")
-            for name in group:
-                short = name[len(strip):] if (strip and name.startswith(strip) and len(name) > len(strip)) else name
-                fmt = formats.get(name)
-                label = f"    {short}" + (f"  [{fmt}]" if fmt else "")   # indented under its node
-                items.append((label, name))
-        return items
-
     def _fill_slot_combo(self, combo, current: str) -> None:
         """Populate ONE slot combobox with ``(none)`` + every live hub signal GROUPED by its
-        producing node (via :meth:`_signal_combo_items`): each group header is a non-selectable
-        bold row, its signals indented under it.  Keeps the slot's current pick selected even
-        when its source node is not running yet (so a saved layout's ``signal[1]`` survives a
-        restart)."""
-        cur = str(current or "")
-        with _signals_blocked(combo):
-            combo.clear()
-            combo.addItem("(none)", "")
-            items = self._signal_combo_items()
-            have = {bare for _, bare in items if bare}
-            for label, name in items:
-                if name is None:                      # a group header: visible, but not selectable
-                    combo.addItem(label, None)
-                    item = combo.model().item(combo.count() - 1)
-                    if item is not None:
-                        item.setEnabled(False)
-                        font = item.font(); font.setBold(True); item.setFont(font)
-                    continue
-                combo.addItem(label, name)            # indented signal; data is the bare name
-            if cur and cur not in have:               # preserve a not-yet-published name
-                combo.addItem(f"{cur}  (not yet published)", cur)
-            idx = combo.findData(cur)
-            combo.setCurrentIndex(idx if idx >= 0 else 0)
+        producing node (the shared :func:`fill_grouped_signal_combo`): bold non-selectable
+        headers, indented signals.  Keeps the slot's current pick selected even when its source
+        node is not running yet (so a saved layout's ``signal[1]`` survives a restart)."""
+        fill_grouped_signal_combo(
+            combo, names=(self.names_provider() if callable(self.names_provider) else []),
+            sources=(self.sources_provider() if callable(self.sources_provider) else {}),
+            formats=(self.formats_provider() if callable(self.formats_provider) else {}),
+            current=current, none_label="(none)")
 
     def _refresh_signal_combo(self) -> None:
         """Refresh the signal picker with the hub's current signals, each labelled with the
@@ -1462,6 +1486,17 @@ class PanelCard(FluentGroupBox):
         self._rerender_last()   # re-evaluate the new expression on the last data, stopped or not
         self.apply_button.set_dirty(False)
         self.changed.emit()
+
+    def _open_expr_editor(self) -> None:
+        """Pop a LARGE floating editor for the panel's source expression -- the shared
+        :class:`FluentTextDialog` (a modal card, so it does not reflow the panel) prefilled with
+        the current source.  OK writes it back to the inline field and applies it; Cancel
+        discards.  The source is a single Python line, so any newlines collapse to spaces."""
+        text, ok = FluentTextDialog(SOURCE_EXPR_HELP, self.source_edit.text(), self,
+                                    title="Edit panel source expression").get_text()
+        if ok:
+            self.source_edit.setText(" ".join(text.split("\n")).strip())
+            self._apply_source()
 
     def _rerender_last(self) -> None:
         """Re-render from the LAST namespace instead of waiting for the next hub tick.
@@ -1870,15 +1905,18 @@ class MeasurementPanel(QtWidgets.QWidget):
     stop_requested = QtCore.pyqtSignal()
 
     def __init__(self, measurements: Sequence[object], parent=None, *, single: bool = False,
-                 controls: bool = True, signals_provider=None):
+                 controls: bool = True, signals_provider=None, sources_provider=None, formats_provider=None):
         super().__init__(parent)
         self.setStyleSheet("background: transparent;")
         self._specs = list(measurements)
         self._single = bool(single)               # bound to ONE spec (per-panel Edit) -> hide the picker
         self._controls = bool(controls)           # False = no Start/Stop (e.g. a plot Edit's read-only-ish source form)
-        # A ``kind="signal"`` param (a processor's input) renders a combobox of the LIVE
-        # hub signals -- this callable returns their names (None -> a free text edit).
+        # A ``kind="signal"`` param (a processor's input) renders the SAME nested-by-producer
+        # signal picker the plot panels use: names_provider gives live signal names, and the
+        # sources/formats providers give the producing node + shape for the grouping.
         self._signals_provider = signals_provider
+        self._sources_provider = sources_provider
+        self._formats_provider = formats_provider
         self._widgets: dict[str, object] = {}     # param key -> widget (or tuple for axis_range)
         self._running = False
 
@@ -2066,23 +2104,23 @@ class MeasurementPanel(QtWidgets.QWidget):
                 self.form.addRow(label_text, picker)
                 self._widgets[decl.key] = ("path", picker)
             elif kind == "signal":
-                # A hub-signal input (a processor's source): a combobox of the live hub
-                # signals, like a plot's input picker -- not a hand-typed name.  The
-                # current value is kept selectable even if its producing node is not running yet.
+                # A hub-signal input (a processor's source) uses the SAME nested-by-producer
+                # picker the plot panels use (fill_grouped_signal_combo): bold node headers,
+                # signals indented + prefix-stripped beneath.  Editable so a not-yet-published
+                # name round-trips; the pick is read back via currentData() (the bare name).
                 combo = FluentComboBox()
-                combo.setEditable(True)            # allow a not-yet-published name to round-trip
-                names = []
-                if callable(self._signals_provider):
-                    try:
-                        names = [str(n) for n in self._signals_provider()]
-                    except Exception:
-                        names = []
+                combo.setEditable(True)
                 cur = "" if decl.default is None else str(decl.default)
-                for n in names:
-                    combo.addItem(n)
-                if cur and cur not in names:
-                    combo.addItem(cur)
-                combo.setCurrentText(cur)
+                def _names():
+                    try:
+                        return [str(n) for n in self._signals_provider()] if callable(self._signals_provider) else []
+                    except Exception:
+                        return []
+                fill_grouped_signal_combo(
+                    combo, names=_names(),
+                    sources=(self._sources_provider() if callable(self._sources_provider) else {}),
+                    formats=(self._formats_provider() if callable(self._formats_provider) else {}),
+                    current=cur)
                 combo.setToolTip(decl.tooltip)
                 combo.activated.connect(lambda *_: self._refresh_start_enabled())
                 self.form.addRow(label_text, combo)
@@ -2182,10 +2220,13 @@ class MeasurementPanel(QtWidgets.QWidget):
             elif tag in ("text", "path"):
                 values[key] = entry[1].text()
             elif tag == "signal":
-                values[key] = entry[1].currentText().strip()
+                # the picked signal's BARE name (combo data, indented label under its node group)
+                # -- or the typed text for a not-yet-published name; read_editable_combo keeps a
+                # freshly TYPED name instead of the stale previously-selected data.
+                values[key] = read_editable_combo(entry[1])
             elif tag == "pulse_param":
-                # the "kind:target" token (combo data); fall back to the typed text
-                values[key] = str(entry[1].currentData() or entry[1].currentText()).strip()
+                # the "kind:target" token (combo data) or the typed text, same editable-combo rule
+                values[key] = read_editable_combo(entry[1])
             else:  # float
                 values[key] = float(entry[1].value())
         return values
@@ -2217,9 +2258,7 @@ class MeasurementPanel(QtWidgets.QWidget):
                 missing.append(decl.label)
             elif entry[0] in ("int_opt", "text", "path") and not entry[1].text().strip():
                 missing.append(decl.label)
-            elif entry[0] == "signal" and not entry[1].currentText().strip():
-                missing.append(decl.label)
-            elif entry[0] == "pulse_param" and not (entry[1].currentData() or entry[1].currentText().strip()):
+            elif entry[0] in ("signal", "pulse_param") and not read_editable_combo(entry[1]):
                 missing.append(decl.label)
         return missing
 
@@ -2267,7 +2306,14 @@ class MeasurementPanel(QtWidgets.QWidget):
                 elif tag == "path":
                     entry[1].setText(display_path(val))   # absolute/project-anchored; blank stays blank
                 elif tag == "signal":
-                    entry[1].setCurrentText("" if val is None else str(val))
+                    # select the grouped item whose DATA is the bare name; fall back to the
+                    # editable text for a not-yet-published name.
+                    cur = "" if val is None else str(val)
+                    idx = entry[1].findData(cur)
+                    if idx >= 0:
+                        entry[1].setCurrentIndex(idx)
+                    else:
+                        entry[1].setCurrentText(cur)
                 elif tag == "pulse_param":
                     entry[1].setCurrentText("" if val is None else str(val))
                 elif tag == "float":
@@ -2429,7 +2475,14 @@ class PanelEditor(QtWidgets.QWidget):
                            if self._source_row is not None else None)
             if source_spec is not None:
                 section(f"Source: {source_spec.name}")
-                self.source_form = MeasurementPanel([source_spec], single=True, controls=False)
+                # pass the signal providers so a signal-kind param (e.g. the OccupancyProcessor's
+                # 'source') renders the SAME nested-by-producer picker the logic-node Edit uses --
+                # not a flat/empty combo (every signal picker is the nested form, everywhere).
+                self.source_form = MeasurementPanel(
+                    [source_spec], single=True, controls=False,
+                    signals_provider=getattr(console.hub, "names", None),
+                    sources_provider=getattr(console, "_signal_providers", None),
+                    formats_provider=getattr(console, "_signal_formats", None))
                 self.source_form.seed_values(self._source_row.node.values or {})
                 col.addWidget(self.source_form)
                 self.source_apply_button = FluentButton("Apply", color=ACCENT)
@@ -3236,7 +3289,9 @@ class LogicNodeEditor(QtWidgets.QWidget):
         # no-eval form).  A spec drives a real ParamDecl form; the camera (spec is
         # None) shows nothing here but Start/Stop still build/run the camera node.
         self.form = MeasurementPanel([spec] if spec is not None else [], single=True,
-                                     signals_provider=getattr(console.hub, "names", None))
+                                     signals_provider=getattr(console.hub, "names", None),
+                                     sources_provider=getattr(console, "_signal_providers", None),
+                                     formats_provider=getattr(console, "_signal_formats", None))
         self.form.seed_values(row.node.values or {})
         self.form.start_requested.connect(lambda *_: self.console._start_logic_node(self.row))
         self.form.stop_requested.connect(lambda: self.console._stop_logic_node(self.row))
@@ -3827,12 +3882,18 @@ class TaskConsole(QtWidgets.QWidget):
                 value = result.get(key) if isinstance(result, dict) else None
                 rows.append((f"{key} (result)", describe_shape(value), desc(key)))
             return rows
-        for full in sorted(node.published_signals()):     # already hub names (incl. prefix)
+        # published_signals() are HUB names (incl. the node's disambiguating prefix when two
+        # nodes would collide).  Show the SHORT natural name (strip the prefix) -- "rate", not
+        # "judge_occupancy_rate" -- because the Logic row is already titled by the node; the
+        # short name is also what output_specs (and so ``desc``) is keyed by.
+        pfx = str(getattr(node, "prefix", "") or "")
+        for full in sorted(node.published_signals()):
+            short = full[len(pfx):] if (pfx and full.startswith(pfx) and len(full) > len(pfx)) else full
             try:
                 shape = describe_shape(self.hub.latest(full))
             except Exception:
                 shape = "—"
-            rows.append((str(full), shape, desc(str(full))))
+            rows.append((short, shape, desc(short)))
         return rows
 
     def _update_row_publishes(self, row: "LogicNodeRow") -> None:

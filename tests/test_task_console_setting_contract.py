@@ -399,24 +399,20 @@ def test_signal_combo_groups_signals_under_their_producer():
     """#5b: the signal picker is a TWO-LEVEL list -- a non-selectable header per producing node,
     its signals indented beneath -- so the producer is named ONCE (the group) instead of being
     repeated in every signal label (which made the labels too long)."""
-    from Zou_lab_control.frontend.task_console import PanelCard
+    from Zou_lab_control.frontend.task_console import grouped_signal_items
 
-    card = _card("1d")
-    try:
-        # two signals from two different producers
-        card.names_provider = lambda: ["occupied", "rate"]
-        card.sources_provider = lambda: {"occupied": ["occupancy"], "rate": ["loading"]}
-        card.formats_provider = lambda: {"occupied": "(N,)", "rate": "(N,)"}
-        items = card._signal_combo_items()
-        # producer headers carry a None bare-name; signals carry their bare name and are indented
-        headers = [disp for disp, bare in items if bare is None]
-        signals = [(disp, bare) for disp, bare in items if bare is not None]
-        assert "occupancy" in headers and "loading" in headers       # grouped by producer
-        assert {bare for _disp, bare in signals} == {"occupied", "rate"}
-        # the signal labels do NOT repeat the producer name (that was the "too long" bug)
-        assert all("occupancy" not in disp and "loading" not in disp for disp, _b in signals)
-    finally:
-        card.shutdown()
+    # the SINGLE shared builder every signal picker uses (plot panels AND the logic-node source)
+    items = grouped_signal_items(
+        ["occupied", "rate"],
+        {"occupied": ["occupancy"], "rate": ["loading"]},
+        {"occupied": "(N,)", "rate": "(N,)"})
+    # producer headers carry a None bare-name; signals carry their bare name and are indented
+    headers = [disp for disp, bare in items if bare is None]
+    signals = [(disp, bare) for disp, bare in items if bare is not None]
+    assert "occupancy" in headers and "loading" in headers       # grouped by producer
+    assert {bare for _disp, bare in signals} == {"occupied", "rate"}
+    # the signal labels do NOT repeat the producer name (that was the "too long" bug)
+    assert all("occupancy" not in disp and "loading" not in disp for disp, _b in signals)
 
 
 def test_display_param_change_rerenders_when_source_is_stopped():

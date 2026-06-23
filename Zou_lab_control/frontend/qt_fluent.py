@@ -1746,6 +1746,65 @@ class FluentInputDialog(QtWidgets.QDialog):
         return None, False
 
 
+class FluentCodeEdit(QtWidgets.QPlainTextEdit):
+    """A monospace code/expression editor with the house Fluent chrome (white card, light
+    border, Consolas font, Fluent scrollbars).  ONE source for the look so every code editor
+    -- the pulse Scan-tab generator + table view, the panel source-expression popup -- renders
+    identically; changing the recipe here changes them all."""
+
+    def __init__(self, text: str = "", parent=None, *, read_only: bool = False):
+        super().__init__(parent)
+        if text:
+            self.setPlainText(text)
+        self.setReadOnly(read_only)
+        pad = scaled_px(4)
+        self.setStyleSheet(
+            f'QPlainTextEdit {{ background: white; color: {TEXT}; border: 1px solid {PLACEHOLDER}; '
+            f'border-radius: {scaled_px(4)}px; font: {fluent_font_size()}pt "Consolas", "Courier New", '
+            f'monospace; padding: {pad}px; }}')
+        apply_fluent_scrollbars(self)
+
+
+class FluentTextDialog(QtWidgets.QDialog):
+    """Multi-line sibling of :class:`FluentInputDialog`: a prompt label over a large
+    :class:`FluentCodeEdit`, with OK / Cancel.  The shared dialog chrome lives in ONE place,
+    so a long expression / snippet gets a comfortable floating editor without re-rolling a
+    QDialog at every call site."""
+
+    def __init__(self, prompt: str, text: str = "", parent=None, *, title: str = "",
+                 min_size: tuple[int, int] = (520, 220)):
+        super().__init__(parent, QtCore.Qt.WindowTitleHint | QtCore.Qt.WindowCloseButtonHint)
+        if title:
+            self.setWindowTitle(title)
+        self.setFont(QtGui.QFont(FONT, fluent_font_size()))
+        self.setStyleSheet("QDialog { background: white; }")
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(scaled_px(12), scaled_px(12), scaled_px(12), scaled_px(12))
+        layout.setSpacing(scaled_px(8, minimum=5))
+
+        layout.addWidget(FluentLabel(prompt, self))
+        self._edit = FluentCodeEdit(str(text), self)
+        self._edit.setMinimumSize(scaled_px(int(min_size[0]), minimum=int(min_size[0] * 0.8)),
+                                  scaled_px(int(min_size[1]), minimum=int(min_size[1] * 0.7)))
+        layout.addWidget(self._edit, 1)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addStretch()
+        ok = FluentButton("OK", self)
+        cancel = FluentButton("Cancel", self)
+        ok.clicked.connect(self.accept)
+        cancel.clicked.connect(self.reject)
+        btn_row.addWidget(ok)
+        btn_row.addWidget(cancel)
+        layout.addLayout(btn_row)
+
+    def get_text(self) -> tuple[str, bool]:
+        """Show modally; return ``(text, accepted)``."""
+        if self.exec_() == QtWidgets.QDialog.Accepted:
+            return self._edit.toPlainText(), True
+        return "", False
+
+
 class FluentDoubleSpinBox(QtWidgets.QDoubleSpinBox):
     """Confocal_GUIv2-style double spinbox with an inline step editor."""
 

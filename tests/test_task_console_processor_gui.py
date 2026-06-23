@@ -135,10 +135,11 @@ def test_judge_occupancy_node_reacts_to_frames(tmp_path):
         cam.step()                                  # first frame on the hub
         console._start_logic_node(row)
         node = console._logic_nodes[id(row)]
-        # a console-built occupancy node carries a per-INSTANCE prefix (#2: multiple occupancy
-        # judges publish DISTINCT signals), so read its published names off the node, never a
-        # hard-coded bare name.
-        assert node.prefix                          # namespaced, not the bare (colliding) form
+        # A SINGLE occupancy node publishes its SHORT, natural names (prefix "" by default -- the
+        # producing node is shown by the flow grouping/legend, not baked into every signal); only
+        # a SECOND colliding judge gets a disambiguating prefix.  Build names off node.prefix so
+        # the assertion holds either way, never a hard-coded bare name.
+        assert node.prefix == ""                    # single instance -> bare names, no prefix
         occ_name, cen_name = node.prefix + "occupied", node.prefix + "centers"
         deadline = time.monotonic() + 8.0
         while occ_name not in hub.names() and time.monotonic() < deadline:
