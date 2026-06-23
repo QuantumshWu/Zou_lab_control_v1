@@ -1441,13 +1441,16 @@ class PulseScanNode(Measurement):
         self.scan_arrays = [np.asarray(a, dtype=float).reshape(-1) for a in plan.scan_arrays]
         self.camera = plan.camera
         self.sequencer = plan.sequencer
-        self.n_frames = max(1, int(plan.n_frames))
         self.y_expr = plan.y_expr if isinstance(plan.y_expr, SignalExpr) else SignalExpr.from_value(plan.y_expr)
         # Optional inline settle (headless single-threaded determinism); None in the GUI, where
         # the node instead waits for the consumer's own thread to republish the y signals.
         self.settle = getattr(plan, "settle", None)
         self.x_key = str(x_key)
-        self.y_key = str(y_key)
+        # The OUTPUT signal name (user-set #7) comes from the plan; the constructor default is the
+        # fallback for callers that don't carry it.
+        self.y_key = str(getattr(plan, "y_key", "") or y_key)
+        # Optional grid shape for a 2-D scan: publish a reshaped <y_key>_grid map a 2D panel reads.
+        self.scan_shape = getattr(plan, "scan_shape", None)
         self.node_label = str(prefix).rstrip("_") or str(y_key)
         self.x_signal = self.prefix + self.x_key
         self.y_signal = self.prefix + self.y_key
@@ -1479,8 +1482,10 @@ class PulseScanNode(Measurement):
         slots = {name: float(arr[index]) for name, arr in zip(self.scan_names, self.scan_arrays)}
         resolved = self.base_state.with_slots_resolved(slots)
         sequence = resolved.to_sequence(name="pulse_scan")
-        frames = self.camera.acquire(self.n_frames, sequence=sequence, sequencer=self.sequencer,
-                                     stop=self._stop)
+        # ONE trigger per point: pulse-scan FIRES the pulse and reads the UPSTREAM signal (y) -- it
+        # is decoupled from the camera's exposure/averaging (no n_frames knob; temporal averaging
+        # belongs to the upstream camera/processor).
+        frames = self.camera.acquire(1, sequence=sequence, sequencer=self.sequencer, stop=self._stop)
         if not frames:
             # Streamer not firing (e.g. Stop) -> no trigger -> no frame: freeze, do not advance
             # (the SAME data-source gate the camera measurement uses).
@@ -1497,9 +1502,14 @@ class PulseScanNode(Measurement):
         y = self._read_y()
         self.data_y[index, 0] = y
         self._index += 1
-        return {self.x_key: self._values.copy(),
-                self.y_key: self.data_y[:, 0].copy(),
-                "scan_done": 1.0 if self.finished else 0.0}
+        out = {self.x_key: self._values.copy(),
+               self.y_key: self.data_y[:, 0].copy(),
+               "scan_done": 1.0 if self.finished else 0.0}
+        if self.scan_shape is not None:
+            # 2-D grid scan: also publish the per-point y reshaped into the (n0, n1) map, so a 2D
+            # image panel shows the 2D scan (unmeasured points are NaN until filled).
+            out[self.y_key + "_grid"] = self.data_y[:, 0].reshape(self.scan_shape).copy()
+        return out
 
     def _await_y_inputs(self, before: dict) -> None:
         """Block until the picked y signals have advanced past ``before`` (a per-signal version
@@ -1547,15 +1557,22 @@ class PulseScanNode(Measurement):
         return self
 
     def published_signals(self) -> frozenset:
-        return frozenset(self.prefix + key for key in (self.x_key, self.y_key, "scan_done"))
+        keys = [self.x_key, self.y_key, "scan_done"]
+        if self.scan_shape is not None:
+            keys.append(self.y_key + "_grid")
+        return frozenset(self.prefix + key for key in keys)
 
     def output_specs(self) -> tuple[SignalSpec, ...]:
         p = self.prefix
-        return (
+        specs = [
             SignalSpec(p + self.x_key, self._axis_label, self._axis_unit, "scan x axis (the swept parameter)"),
-            SignalSpec(p + self.y_key, "signal", "", "y per point = the subscribed source expression"),
+            SignalSpec(p + self.y_key, self.y_key, "", "y per point = the subscribed source expression"),
             SignalSpec(p + "scan_done", "scan complete", "", "1 once the final point is measured"),
-        )
+        ]
+        if self.scan_shape is not None:
+            specs.append(SignalSpec(p + self.y_key + "_grid", self.y_key, "",
+                                    "2-D scan map (the y reshaped to the grid; view on a 2D image)"))
+        return tuple(specs)
 
 
 class ProcessorRun(LogicNode):

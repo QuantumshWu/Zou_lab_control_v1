@@ -42,6 +42,7 @@ from .pulse_table import (
     quantized_time_ns,
     quantized_time_steps,
     scan_table_template,
+    scan_target_label,
     slot_var,
     snap_scan_table,
 )

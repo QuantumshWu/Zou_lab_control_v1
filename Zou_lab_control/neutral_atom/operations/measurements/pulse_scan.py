@@ -26,11 +26,11 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
-from ...core.analysis import positive_int
 from ...timing import (
     PulseTableState,
     evaluate_scan_table_code,
     scan_table_template,
+    scan_target_label,
     single_imaging_template,
     snap_scan_table,
 )
@@ -88,12 +88,12 @@ def _scan_table_arrays(state: PulseTableState, scan_code: str) -> tuple[list[str
         raise ValueError(
             "the pulse template has no scan slot bound -- in the pulse GUI Edit tab, click the dot "
             "next to a duration or DAC value to bind a scan slot (sN), then give a scan program.")
-    table = evaluate_scan_table_code(scan_code, len(names))            # N x n_slots, slot-native units
+    table, scan_shape = evaluate_scan_table_code(scan_code, len(names))   # N x n_slots + optional grid shape
     snapped = snap_scan_table(table, state.scan_slots, time_step_ns=state.time_step_ns,
                               dac_ranges=state.scan_slot_dac_ranges())  # hardware-legal table
     columns = list(zip(*snapped))                                      # one column per slot, length N
     arrays = [np.asarray(col, dtype=float) for col in columns]
-    return names, arrays
+    return names, arrays, scan_shape
 
 
 def _label_for_first_scan_slot(state: PulseTableState) -> tuple[str, str]:
@@ -106,7 +106,9 @@ def _label_for_first_scan_slot(state: PulseTableState) -> tuple[str, str]:
     if not state.scan_slots:
         return ("point", "")
     slot = state.scan_slots[0]
-    name = slot.label or f"{slot.kind} {slot.target}"
+    # Readable axis name: the slot's own label, else a prettified "<bus> @ <period name>" /
+    # "<period name> duration" (never the opaque "bus@<index>") via the single-source helper.
+    name = slot.label or scan_target_label(state, slot.kind, slot.target)
     if slot.kind == "dac":
         return (name, "LSB")
     if slot.kind == "duration":
@@ -127,8 +129,8 @@ class PulseScanPlan:
 
     def __init__(self, base_state: PulseTableState, scan_names: Sequence[str],
                  scan_arrays: Sequence[np.ndarray], camera, sequencer, *,
-                 axis_label: str = "point", axis_unit: str = "", n_frames: int = 1,
-                 y_expr=None, settle=None):
+                 axis_label: str = "point", axis_unit: str = "", y_key: str = "signal",
+                 y_expr=None, scan_shape: tuple[int, int] | None = None, settle=None):
         self.base_state = base_state
         self.scan_names = list(scan_names)
         self.scan_arrays = [np.asarray(a, dtype=float).reshape(-1) for a in scan_arrays]
@@ -138,7 +140,11 @@ class PulseScanPlan:
         self.axis_unit = str(axis_unit)
         self.camera = camera
         self.sequencer = sequencer
-        self.n_frames = positive_int(n_frames, "n_frames")
+        # The OUTPUT signal name (user-set #7): the node publishes y under this key.
+        self.y_key = str(y_key or "signal").strip() or "signal"
+        # Optional grid shape (n0, n1) for a 2-D scan: the node reshapes the per-point y into a
+        # 2-D map published as ``<y_key>_grid`` so a 2D image panel shows the 2D scan.  None = 1-D.
+        self.scan_shape = scan_shape
         self.y_expr = y_expr if isinstance(y_expr, SignalExpr) else SignalExpr.from_value(y_expr)
         self.settle = settle
 
@@ -151,7 +157,7 @@ def pulse_scan(readout) -> MeasurementSpec:
     s = readout.session
 
     def build(*, template: str = DEFAULT_PROBE_TEMPLATE, pulse_slots: Mapping | None = None,
-              y=None, n_frames: int = 1, **_ignored) -> PulseScanPlan:
+              y=None, y_name: str = "signal", **_ignored) -> PulseScanPlan:
         state = _resolve_probe_template(template)
         spec = dict(pulse_slots or {})
         api_values: Mapping[str, float] = dict(spec.get("api") or {})
@@ -165,15 +171,17 @@ def pulse_scan(readout) -> MeasurementSpec:
         # The scan POINTS are ONE table: the scan program builds an (N_points x n_slots) array
         # (one row per point, one column per slot) -- the slots advance in LOCKSTEP, snapped to the
         # hardware grid in each slot's NATIVE unit (ns ticks for a duration, integer code for a DAC).
+        # A 2-slot grid program also declares scan_shape (n0, n1) -> a 2-D scan map.
         # Empty program -> the column_stack default for the bound slot count.
         if not scan_code.strip():
             scan_code = scan_table_template("column_stack", len(state.scan_slots))
-        scan_names, scan_arrays = _scan_table_arrays(state, scan_code)
+        scan_names, scan_arrays, scan_shape = _scan_table_arrays(state, scan_code)
         axis_label, axis_unit = _label_for_first_scan_slot(state)
         y_expr = SignalExpr.from_value(y if y is not None else DEFAULT_Y_SOURCE)
         return PulseScanPlan(
             state, scan_names, scan_arrays, s.devices.camera, s.devices.sequencer,
-            axis_label=axis_label, axis_unit=axis_unit, n_frames=n_frames, y_expr=y_expr)
+            axis_label=axis_label, axis_unit=axis_unit, y_key=y_name, y_expr=y_expr,
+            scan_shape=scan_shape)
 
     params = (
         ParamDecl("template", "Pulse template", "path", default=DEFAULT_PROBE_TEMPLATE,
@@ -188,10 +196,11 @@ def pulse_scan(readout) -> MeasurementSpec:
         ParamDecl("y", "Signal (y)", "signal_expr", default=dict(DEFAULT_Y_SOURCE),
                   tooltip="The y recorded per point.  Pick a signal published by ANOTHER running node "
                           "(e.g. a Judge-occupancy processor's loading 'rate') and combine via value = ... .  "
-                          "Start that producer FIRST; pulse-scan fires the pulse, publishes the frame it "
-                          "produces, then reads this signal back for the point's y."),
-        ParamDecl("n_frames", "Frames / point", "int", default=1, lo=1, hi=1000,
-                  tooltip="Camera triggers (frames) acquired per scan point before the y signal is read."),
+                          "Start that producer FIRST; pulse-scan fires the pulse each point and reads this "
+                          "UPSTREAM signal back for the point's y (it does not own the camera)."),
+        ParamDecl("y_name", "Output name", "text", default="signal",
+                  tooltip="Name of the OUTPUT signal this scan publishes (the y curve), e.g. "
+                          "'loading_rate' or 'survival' -- so a plot picks a meaningful name."),
     )
     return MeasurementSpec(
         name="Pulse scan", key="pulse_scan", params=params,

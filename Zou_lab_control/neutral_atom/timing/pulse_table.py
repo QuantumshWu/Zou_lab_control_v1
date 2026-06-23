@@ -2092,7 +2092,8 @@ def scan_table_template(kind: str, n_slots: int) -> str:
         elif n == 2:
             body = ("b = np.linspace(0, 1000, 4)              # axis for s1\n"
                     "A, B = np.meshgrid(a, b, indexing=\"ij\")\n"
-                    "scan_table = np.column_stack([A.ravel(), B.ravel()])   # 5 x 4 = 20 points\n")
+                    "scan_table = np.column_stack([A.ravel(), B.ravel()])   # 5 x 4 = 20 points\n"
+                    "scan_shape = (len(a), len(b))            # 2-D grid -> a 2D scan map (view on a 2D image)\n")
         else:
             lines = ["b = np.linspace(0, 1000, 4)              # axis for s1",
                      "A, B = np.meshgrid(a, b, indexing=\"ij\")",
@@ -2100,6 +2101,7 @@ def scan_table_template(kind: str, n_slots: int) -> str:
             for j in range(2, n):
                 lines.append(f"grid.append(np.full(A.size, 0.0))      # s{j} held constant")
             lines.append("scan_table = np.column_stack(grid)")
+            lines.append("scan_shape = (len(a), len(b))            # 2-D grid map (extra slots held constant)")
             body = "\n".join(lines) + "\n"
         return head + body
     head = ("import numpy as np\n\n"
@@ -2119,9 +2121,41 @@ def scan_table_template(kind: str, n_slots: int) -> str:
     return head + body
 
 
-def evaluate_scan_table_code(code: str, n_slots: int) -> list[list[float]]:
+def _period_display(state: "PulseTableState", index) -> str:
+    """A period's human name (its name, else ``period <i>``) -- so a scan target's bare period
+    INDEX is never shown to the operator as an opaque number."""
+    try:
+        i = int(index)
+    except (TypeError, ValueError):
+        return str(index)
+    if 0 <= i < len(state.periods):
+        return str(state.periods[i].name).strip() or f"period {i}"
+    return f"period {i}"
+
+
+def scan_target_label(state: "PulseTableState", kind: str, target: str) -> str:
+    """Human label for a scannable parameter ``(kind, target)`` -- the ONE place the opaque
+    ``bus@<index>`` / bare-index forms are turned into readable text (``da[0] @ image`` /
+    ``probe duration``).  The raw ``target`` is unchanged (it is still the parse key); this is
+    display only, shared by the scan-slot axis label + the GUI scan legend."""
+    kind = str(kind)
+    target = str(target)
+    if kind == "dac" and "@" in target:
+        bus, _, idx = target.partition("@")
+        return f"{bus} @ {_period_display(state, idx)} (DAC)"
+    if kind == "duration":
+        return f"{_period_display(state, target)} duration"
+    if kind == "delay":
+        return f"{target} delay"
+    return f"{kind} {target}"
+
+
+def evaluate_scan_table_code(code: str, n_slots: int) -> tuple[list[list[float]], tuple[int, int] | None]:
     """Run a scan-table program (see :func:`scan_table_template`) in a small numpy namespace and
-    return its ``(N_points x n_slots)`` table as a list of rows.
+    return ``(rows, scan_shape)``: the ``(N_points x n_slots)`` table as a list of rows, and an
+    optional 2-D ``scan_shape`` ``(n0, n1)`` the program may assign to declare a GRID scan (so a
+    consumer can reshape the per-point result into a 2-D map for a 2D image).  ``scan_shape`` is
+    ``None`` for a plain 1-D sweep.
 
     SECURITY: execs the operator-entered snippet as arbitrary Python -- a LOCAL experiment tool;
     only run programs you wrote or trust.  Raises ``ValueError`` with a fixable message; the
@@ -2148,7 +2182,20 @@ def evaluate_scan_table_code(code: str, n_slots: int) -> list[list[float]]:
         raise ValueError(
             f"scan_table has {arr.shape[1]} column(s) but {n} scan slot(s) are bound -- give ONE column "
             "per slot (the points advance in lockstep; build correlations into the columns).")
-    return [[float(v) for v in row] for row in arr]
+    rows = [[float(v) for v in row] for row in arr]
+    shape = namespace.get("scan_shape")
+    scan_shape: tuple[int, int] | None = None
+    if shape is not None:
+        try:
+            n0, n1 = (int(shape[0]), int(shape[1]))
+        except (TypeError, ValueError, IndexError):
+            raise ValueError(f"scan_shape must be a 2-tuple (n0, n1); got {shape!r}.")
+        if n0 * n1 != arr.shape[0]:
+            raise ValueError(
+                f"scan_shape {(n0, n1)} (= {n0 * n1} points) does not match the {arr.shape[0]} scan "
+                "rows -- a grid scan needs n0*n1 == N_points.")
+        scan_shape = (n0, n1)
+    return rows, scan_shape
 
 
 def quantized_time_ns(
@@ -2391,6 +2438,7 @@ __all__ = [
     "quantized_time_ns",
     "quantized_time_steps",
     "scan_table_template",
+    "scan_target_label",
     "slot_var",
     "snap_scan_table",
 ]

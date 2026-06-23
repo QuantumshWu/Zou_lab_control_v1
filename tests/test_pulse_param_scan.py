@@ -164,8 +164,8 @@ def _run_pulse_scan(exp, *, y=None, **build_kwargs):
     plan.settle = occ.step
     node = PulseScanNode(hub, plan, x_key=spec.x_key, y_key=spec.y_key, prefix=f"{spec.key}_")
     node.run_to_completion()
-    return (np.asarray(hub.latest(f"{spec.key}_{spec.x_key}"), dtype=float),
-            np.asarray(hub.latest(f"{spec.key}_{spec.y_key}"), dtype=float),
+    return (np.asarray(hub.latest(node.x_signal), dtype=float),     # node's REAL x/y names (y_name aware)
+            np.asarray(hub.latest(node.y_signal), dtype=float),
             node, hub)
 
 
@@ -187,7 +187,8 @@ def test_pulse_scan_spec_carries_pulse_slots_and_signal_expr_y():
         assert "inputs" in y_decl.default and "source" in y_decl.default
         keys = {p.key for p in spec.params}
         assert "reduce" not in keys and "shots" not in keys      # old reducer params are gone
-        assert "n_frames" in keys
+        assert "n_frames" not in keys                            # decoupled from the camera (#6)
+        assert "y_name" in keys                                  # settable output-signal name (#7)
         assert not any(p.kind == "pulse_param" for p in spec.params)
     finally:
         exp.close()
@@ -204,7 +205,7 @@ def test_pulse_scan_y_tracks_subscribed_occupancy_signal():
             exp, template=probe,
             pulse_slots={"api": {}, "scan_code": "import numpy as np\n"
                          "scan_table = np.linspace(10000, 40000, 5).reshape(-1, 1)"},
-            n_frames=1, y={"inputs": ["rate"], "source": "value = signal"})
+            y={"inputs": ["rate"], "source": "value = signal"})
         assert x.shape == (5,) and y.shape == (5,)
         assert np.isfinite(x).all() and np.isfinite(y).all()
         # y is the loading rate (a fraction) the occupancy node published, not a frame reduction
@@ -226,9 +227,57 @@ def test_pulse_scan_y_expression_over_multiple_signals():
             exp, template=probe,
             pulse_slots={"api": {}, "scan_code": "import numpy as np\n"
                          "scan_table = np.array([10000, 20000, 30000]).reshape(-1, 1)"},
-            n_frames=1, y={"inputs": ["occupied"], "source": "value = np.mean(signal)"})
+            y={"inputs": ["occupied"], "source": "value = np.mean(signal)"})
         assert x.shape == (3,) and y.shape == (3,)
         assert np.isfinite(y).all() and np.all((y >= 0.0) & (y <= 1.0))
+    finally:
+        _safe_unlink(probe)
+        exp.close()
+
+
+def test_pulse_scan_output_signal_name_is_settable(tmp_path):
+    """#7: the y_name param renames the OUTPUT (y) signal the scan publishes, so a plot picks a
+    meaningful name (e.g. 'loading_rate') instead of a generic 'signal'."""
+    exp = _calibrated()
+    probe = _bound_probe_with_scan(exp)
+    try:
+        x, y, node, hub = _run_pulse_scan(
+            exp, template=probe, y_name="loading_rate",
+            pulse_slots={"api": {}, "scan_code": "import numpy as np\n"
+                         "scan_table = np.linspace(10000, 40000, 4).reshape(-1, 1)"},
+            y={"inputs": ["rate"], "source": "value = signal"})
+        assert node.y_signal == "pulse_scan_loading_rate"
+        assert "pulse_scan_loading_rate" in hub.names()       # published under the chosen name
+        assert y.shape == (4,)
+    finally:
+        _safe_unlink(probe)
+        exp.close()
+
+
+def test_pulse_scan_2d_grid_publishes_a_2d_map():
+    """#5b: a 2-D (grid) scan -- the program declares scan_shape (n0, n1) -- publishes the per-point
+    y reshaped into an (n0, n1) map (``<y>_grid``), so a 2D image panel shows the 2D scan."""
+    from Zou_lab_control.neutral_atom.timing import PulseTableState, single_imaging_template
+    exp = _calibrated()
+    st = single_imaging_template()
+    st.add_period(20.0, name="probe2", unit="us")
+    st.bind_field("duration", "1", unit="us")
+    st.bind_field("duration", "2", unit="us")
+    probe = Path("pulses") / "_test_probe_2d.json"
+    st.save(str(probe))
+    grid = ("import numpy as np\n"
+            "a = np.linspace(10000, 30000, 3); b = np.linspace(10000, 20000, 2)\n"
+            "A, B = np.meshgrid(a, b, indexing='ij')\n"
+            "scan_table = np.column_stack([A.ravel(), B.ravel()])\n"
+            "scan_shape = (len(a), len(b))\n")
+    try:
+        x, y, node, hub = _run_pulse_scan(
+            exp, template=str(probe), pulse_slots={"api": {}, "scan_code": grid},
+            y={"inputs": ["rate"], "source": "value = signal"})
+        assert node.scan_shape == (3, 2)
+        grid_name = node.y_signal + "_grid"
+        assert grid_name in hub.names()
+        assert np.asarray(hub.latest(grid_name)).shape == (3, 2)   # a 2-D scan map for a 2D image
     finally:
         _safe_unlink(probe)
         exp.close()
