@@ -18,6 +18,7 @@ notebook 调用侧的解耦 + Rb87 读出 + **task_console 大改(Monitor/Contro
 - 真机 qCMOS 相机后端(`devices/qcmos.py`)接 PSF/bimodal 读出,在真实数据上验证保真度;4-shot group / 参考帧定 ground-truth 标签作为可选标定流程(算法已具备,缺采集编排)。换真机时:`na.connect("qcmos", ...)` + loading 节点组合(`CameraMeasurement`+`OccupancyProcessor`+`CalibrateReadoutTask`),分析/逻辑节点代码不动;**温度/读出测量(`exp.readout.temperature`/`readout_duration_fidelity` 与 GUI 一键 Start)走同一路径**,只换 connect。
 - **性能激进档需用户拍板**:迟滞 autoscale / 错峰重绘 / 嵌入面板低 dpi 性能模式(均改可见行为或视觉,见性能结论)。
 - 其余 GUI 待决方向(见下"暂缓:GUI 相关")。
+- **Pulse-scan 解耦重设计(用户已拍板 2026-06-23,大改,下一焦点)**:pulse-scan 应是**新的 device-driving logic node**,不再是带内置 reducer 的 measurement。模型:① api slot 设固定值、scan slot 给 scan points(x;1D=一个 slot 的值,2D=两个参数)——已用 `with_slots_resolved` 解析(commit b318deb);② y **解耦** = 订阅其它正在跑节点的 hub 信号(如 occupancy 的 `rate`)+ value 表达式;③ 设备锁定只允许一个 device driver,故节点须自己 fire+采帧+publish `frame`,再**同步推进依赖该 frame 的 reactive processor**(console 注入 settle 回调),然后读 source 表达式当 y、记 (x,y);④ **凡是 source 的地方都改成多 source + 表达式**(occupancy 等所有 `kind="signal"` 字段升级成 plot 面板式多槽 signal + value 表达式,做一个可复用 `signal_expr` 控件+求值,单一真相源)。需:新节点类 + 可复用多源控件 + processor 契约改 + 三档 DPR + 测试。**注意**:别再把 api/scan 混一起(已修);别 rush——这是多文件架构改动,要独立一轮做扎实。
 
 > `references/` 是历史源码归档(`rb87_readout_v16`、confocal GUI 等),**git ignore、只在本地存在**,是借鉴/移植的来源,不是被本仓库 import 的依赖(见 README 目录树)。
 > **最小跑通入口**:`task_console.bat`(虚拟仪表盘)/ `tutorials/` 里的 notebook / `na.connect("virtual")` 起一个全虚拟 session——先在虚拟后端把调用链串通,再换真机后端。
