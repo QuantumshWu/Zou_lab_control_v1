@@ -105,10 +105,11 @@ def test_console_resolves_2d_frame_panel_to_judged_frame_for_shot_alignment():
     assert not np.array_equal(live_frame, judged)        # precondition: the producers HAVE diverged
 
     # REAL console resolver: a frame consumed by a running occupancy node -> its frame_judged
-    console = SimpleNamespace(running_nodes=[det])
+    # (only when frame_judged is actually on the hub, which it is here).
+    console = SimpleNamespace(running_nodes=[det], hub=hub)
     assert TaskConsole._coherent_frame_signal(console, "frame") == det.prefix + "frame_judged"
     # with no occupancy judging it, a standalone camera view keeps the LIVE frame
-    assert TaskConsole._coherent_frame_signal(SimpleNamespace(running_nodes=[]), "frame") == "frame"
+    assert TaskConsole._coherent_frame_signal(SimpleNamespace(running_nodes=[], hub=hub), "frame") == "frame"
 
     # REAL panel resolution: a 2D-image panel bound to 'frame' now reads the judged frame.
     # _with_signal_slots delegates the slot-packing + frame-coherence rewrite to the shared
@@ -126,6 +127,55 @@ def test_console_resolves_2d_frame_panel_to_judged_frame_for_shot_alignment():
     assert not np.array_equal(panel_signal, live_frame)  # NOT the camera's newer, misaligned frame
     # and that shot IS the one the occupancy was computed from (2D == occupied)
     assert np.array_equal(np.asarray(ns["occupied"]), cal.detect(panel_signal, method="box").occupied)
+
+
+def test_2d_frame_panel_shows_live_frame_when_no_judged_frame_yet():
+    """A 2D-image panel bound to ``frame`` must show the LIVE camera frame whenever the judging
+    occupancy node has NOT published ``frame_judged`` yet (just started, or wedged on a bad
+    calibration).  The frame-coherence resolver only redirects ``frame`` -> ``frame_judged`` when
+    that judged frame is ACTUALLY on the hub; otherwise the camera image would silently blank.
+    (Root cause of 'camera measurement can't connect to a 2D image'.)"""
+    from types import SimpleNamespace
+    from Zou_lab_control.frontend.task_console import TaskConsole
+
+    exp = na.connect("virtual", sitemap={"grid_shape": (3, 4)})
+    exp.readout.sitemap(frames=4, display=False)
+    exp.readout.thresholds(frames=20, display=False)
+    hub = SignalHub()
+    cam = CameraMeasurement(hub, exp.camera, sequencer=exp.devices.sequencer)
+    det = OccupancyProcessor(hub, calibration=exp.readout.current,
+                             source_expr={"inputs": ["frame"], "source": "value = signal"}, grid_shape=(3, 4))
+    fire_live_imaging(exp)
+    cam.step()                                            # a live 'frame' exists; det has NOT judged yet
+    console = SimpleNamespace(running_nodes=[det], hub=hub)
+    assert "frame_judged" not in hub.names()
+    assert TaskConsole._coherent_frame_signal(console, "frame") == "frame"   # -> the LIVE frame, not blank
+    det.step()                                            # now occupancy publishes frame_judged
+    assert "frame_judged" in hub.names()
+    assert TaskConsole._coherent_frame_signal(console, "frame") == det.prefix + "frame_judged"
+
+
+def test_occupancy_falls_back_to_session_calibration_on_shape_mismatch():
+    """A stale on-disk calibration (different camera ROI) must NOT wedge the readout forever.  When
+    the loaded calibration does not fit the live frame, the node falls back to the session
+    calibration (built from THIS camera, so it matches) and keeps publishing occupancy/rate."""
+    small = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
+    small.readout.sitemap(frames=4, display=False); small.readout.thresholds(frames=20, display=False)
+    stale_cal = small.readout.current                    # a (40,50) calibration
+
+    exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (48, 60)})
+    exp.readout.sitemap(frames=4, display=False); exp.readout.thresholds(frames=20, display=False)
+    session_cal = exp.readout.current                    # the matching (48,60) calibration
+    hub = SignalHub()
+    det = OccupancyProcessor(hub, calibration=stale_cal, session_calibration=lambda: session_cal,
+                             source_expr={"inputs": ["frame"], "source": "value = signal"}, grid_shape=(3, 4))
+    fire_live_imaging(exp)
+    img = exp.devices.camera.acquire(1, sequencer=exp.devices.sequencer)[0]
+    hub.publish({"frame": np.asarray(img, dtype=float)})
+    out = det.step()                                     # stale cal mismatches (48,60) -> falls back
+    assert "occupied" in out and "rate" in out           # readout keeps flowing (not wedged)
+    assert det.calibration is session_cal                # adopted the matching one for next shots
+    small.close(); exp.close()
 
 
 def test_occupancy_nodes_publish_short_names_and_disambiguate_on_collision():

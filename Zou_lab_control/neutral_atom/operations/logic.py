@@ -456,7 +456,8 @@ class OccupancyProcessor(Processor):
     sitemap_image_key = "frame_judged"
 
     def __init__(self, hub: SignalHub, *, calibration=None, calibration_source=None,
-                 source_expr=None, grid_shape: tuple[int, int] | None = None,
+                 session_calibration=None, source_expr=None,
+                 grid_shape: tuple[int, int] | None = None,
                  method: str | None = None, prefix: str = ""):
         # The frame to judge is a signal expression -- the SAME universal multi-slot signal +
         # ``value = ...`` mechanism every source field uses (default = the single ``frame``
@@ -474,6 +475,12 @@ class OccupancyProcessor(Processor):
         # WITHOUT blocking the GUI on calibration -- the detector simply no-ops until
         # the calibration is ready, then picks it up.
         self.calibration_source = calibration_source
+        # Optional getter for the LIVE session calibration (built from THIS camera's ROI, so it
+        # matches the live frame).  Used as a fallback when the loaded FILE calibration's ROI does
+        # NOT match the frame (a stale calibration.json from a different camera shape): rather than
+        # raise every shot and wedge the whole readout, the node switches to the matching session
+        # calibration so occupancy / rate keep flowing.
+        self.session_calibration = session_calibration
         self.grid_shape = None if grid_shape is None else grid_shape_tuple(grid_shape)
         # The READOUT method (box / per-site PSF / ...) is chosen HERE, not at calibration
         # time: one calibration carries every method's geometry + thresholds, and the
@@ -500,7 +507,17 @@ class OccupancyProcessor(Processor):
             frame = np.asarray(self.source_expr.evaluate(inputs), dtype=float)
         except Exception:
             return {}                                       # malformed expression -> no-op (don't wedge)
-        detection = calibration.detect(frame, method=self.method)   # the single readout contract
+        try:
+            detection = calibration.detect(frame, method=self.method)   # the single readout contract
+        except ValueError:
+            # The loaded calibration does not fit this frame (e.g. a stale calibration.json with a
+            # different camera ROI).  Fall back to the live SESSION calibration (built from this
+            # camera, so it matches) instead of raising every shot and freezing every panel.
+            fallback = self.session_calibration() if callable(self.session_calibration) else None
+            if fallback is None or fallback is calibration:
+                return {}                                   # nothing matches -> no-op (recalibrate)
+            detection = fallback.detect(frame, method=self.method)
+            self.calibration = calibration = fallback        # adopt the matching one for next shots
         occupied = np.asarray(detection.occupied, dtype=float).reshape(-1)
         counts = np.asarray(detection.counts, dtype=float).reshape(-1)
         # Cumulative loading fraction = (sum of occupancy over all shots) / (n shots); per-site

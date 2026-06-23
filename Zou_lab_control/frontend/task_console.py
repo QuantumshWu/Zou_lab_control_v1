@@ -4325,11 +4325,20 @@ class TaskConsole(QtWidgets.QWidget):
         name = str(frame_signal or "")
         if not name:
             return name
+        live = set(self.hub.names())
         for node in self.running_nodes:
             image_key = getattr(node, "sitemap_image_key", "")   # the judged-frame output
             consumes = getattr(node, "consumes", ())             # the frame(s) it reacts to
             if image_key and name in consumes:
-                return getattr(node, "prefix", "") + image_key
+                judged = getattr(node, "prefix", "") + image_key
+                # ONLY redirect to the judged frame if it is ACTUALLY on the hub.  A judging
+                # node that has not published yet (just started) or is wedged (e.g. an un-
+                # calibrated / mismatched calibration) has no ``frame_judged`` -- redirecting
+                # there would blank a 2D(frame) panel.  Falling back to the LIVE frame keeps the
+                # camera image visible; once the node publishes a judged frame, this redirects
+                # again and the 2D + site map re-sync to the same shot.
+                if judged in live:
+                    return judged
         return name
 
     def _curve_x(self, y_signal) -> str | None:

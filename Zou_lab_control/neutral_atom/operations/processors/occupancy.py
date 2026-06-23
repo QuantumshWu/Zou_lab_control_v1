@@ -90,9 +90,15 @@ def judge_occupancy(readout) -> ProcessorSpec:
         method = method_labels.get(str(values.get("method", "box")), "box")
         # ``source`` is a signal_expr value ({"inputs": [...], "source": "value = ..."}) -- the
         # same universal multi-source picker every source field uses; the node builds the shared
-        # SignalExpr and judges the resulting (H×W) frame.
+        # SignalExpr and judges the resulting (H×W) frame.  ``session_calibration`` is the live
+        # in-memory calibration (built from THIS camera's ROI, so it always matches the live
+        # frame): the node falls back to it if the loaded FILE calibration's ROI does not match
+        # the frame (a stale calibration.json from a different camera shape would otherwise wedge
+        # the whole readout) -- the operator still sees the file's name, but a mismatched file
+        # never silently freezes every panel.
         return OccupancyProcessor(
             hub, calibration=calibration, calibration_source=calibration_source,
+            session_calibration=lambda: readout.current,
             source_expr=values.get("source"),
             method=method, grid_shape=grid, prefix=prefix)
 
