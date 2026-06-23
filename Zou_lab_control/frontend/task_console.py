@@ -365,7 +365,7 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
 
     changed = QtCore.pyqtSignal()
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, title: str = ""):
         super().__init__(parent)
         self.setStyleSheet("background: transparent;")
         self._api_widgets: dict[str, QtWidgets.QWidget] = {}
@@ -373,9 +373,18 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
         self._scan_remembered: str = ""               # typed scan program, kept across reloads
         self._scan_code = None                        # the FluentCodeEdit (None until first scan slot)
         self._n_slots = 0
-        self._box = QtWidgets.QVBoxLayout(self)
-        self._box.setContentsMargins(0, 0, 0, 0)
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(scaled_px(3, minimum=2))
+        # The composite spans the FULL form width (added via addRow(widget)), so its own title sits
+        # as a header line at the top-left -- aligned with the form's other left labels -- and the
+        # api / scan sub-rows stack beneath it (not crammed into a narrow right field column, #H3b).
+        if title:
+            outer.addWidget(FluentLabel(title))
+        self._box = QtWidgets.QVBoxLayout()
+        self._box.setContentsMargins(scaled_px(10, minimum=8), 0, 0, 0)   # slight indent under the header
         self._box.setSpacing(scaled_px(6, minimum=4))
+        outer.addLayout(self._box)
 
     def _clear(self) -> None:
         """Tear down every child widget + nested layout (the form is rebuilt from scratch)."""
@@ -521,7 +530,8 @@ class _SignalExprWidget(QtWidgets.QWidget):
 
     changed = QtCore.pyqtSignal()
 
-    def __init__(self, *, signals_provider=None, sources_provider=None, formats_provider=None, parent=None):
+    def __init__(self, *, signals_provider=None, sources_provider=None, formats_provider=None,
+                 title: str = "", parent=None):
         super().__init__(parent)
         self.setStyleSheet("background: transparent;")
         self._signals_provider = signals_provider
@@ -531,10 +541,15 @@ class _SignalExprWidget(QtWidgets.QWidget):
         self._editor = None
         # ONE label-column width shared by every row (the signal slots AND the value row), so the
         # whole widget reads as one tidy label/control grid like the plot Edit -- not ragged (#4).
-        self._label_w = scaled_px(64, minimum=52)
+        # Wide enough that "signal" / "value" / "signal[0]" show in full (64px clipped them, #H3b).
+        self._label_w = scaled_px(84, minimum=70)
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(scaled_px(4, minimum=3))
+        # Spans the FULL form width (added via addRow(widget)); its title is the header line, with
+        # the signal slots + value row stacking beneath -- not crammed into a narrow field column (#H3b).
+        if title:
+            root.addWidget(FluentLabel(title))
         self._slot_box = QtWidgets.QVBoxLayout()
         self._slot_box.setContentsMargins(0, 0, 0, 0)
         self._slot_box.setSpacing(scaled_px(4, minimum=3))
@@ -2632,11 +2647,12 @@ class MeasurementPanel(QtWidgets.QWidget):
                 # one bare name.  Value is {"inputs": [...], "source": "value = ..."}.
                 widget = _SignalExprWidget(signals_provider=self._signals_provider,
                                            sources_provider=self._sources_provider,
-                                           formats_provider=self._formats_provider)
+                                           formats_provider=self._formats_provider,
+                                           title=label_text)
                 widget.set_value(decl.default if decl.default is not None else {})
                 widget.setToolTip(decl.tooltip)
                 widget.changed.connect(self._refresh_start_enabled)
-                self.form.addRow(label_text, widget)
+                self.form.addRow(widget)              # FULL-WIDTH span (label is the widget's header, #H3b)
                 self._widgets[decl.key] = ("signal_expr", widget)
             elif kind == "pulse_slots":
                 # An AUTO-GENERATED sub-form for the pulse template named in decl.depends_on:
@@ -2646,10 +2662,10 @@ class MeasurementPanel(QtWidgets.QWidget):
                 # {"api": {name: float}, "scan_code": "<python>"} -- the same shape the
                 # pulse_scan build() consumes.  ONE source for the pulse slot form,
                 # so a NEW measurement that takes a pulse template gets this row for free.
-                widget = _PulseSlotsWidget()
+                widget = _PulseSlotsWidget(title=label_text)
                 widget.setToolTip(decl.tooltip)
                 widget.changed.connect(self._refresh_start_enabled)
-                self.form.addRow(label_text, widget)
+                self.form.addRow(widget)              # FULL-WIDTH span (label is the widget's header, #H3b)
                 self._widgets[decl.key] = ("pulse_slots", widget)
                 self._pulse_slots_decls[decl.key] = decl
             elif kind == "pulse_param":
