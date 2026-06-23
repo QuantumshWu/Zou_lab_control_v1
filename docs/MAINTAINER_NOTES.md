@@ -91,15 +91,18 @@ background model is PART of the readout and is carried per method in `by_method`
 `CalibrateReadoutTask` (`operations/logic.py`) follows the Rb87 single-atom flow:
 
 1. **Reference brackets** (`_collect_bracket_groups`): each shot is ONE correlated
-   long-short-long camera sequence imaging the SAME atoms. The bracket is built BY MODIFYING
-   THE LOADED TEMPLATE's durations — `PulseTableState.with_imaging_bracket([long, short, long])`
-   keeps ONE cooling/load cycle (the template's periods BEFORE its `image` window), then repeats
-   the template's own `image` window long-short-long with a trap-held readout gap between, so
-   the emCCD line drops and re-rises into THREE CONSECUTIVE camera triggers within that single
-   cooling cycle. The trap is held on across the bracket and there is NO re-cooling between
-   triggers, so a following frame sees the previous frame's survivors. The long exposure IS the
-   template's image-window duration (editing the template sets it); the short middle frame is
-   `readout_exposure`. Comparing the two long frames tells whether the atom survived; when they
+   long-short-long camera sequence imaging the SAME atoms. The bracket is built from the TWO
+   operator-set exposures — `PulseTableState.with_imaging_bracket([reference_exposure,
+   readout_exposure, reference_exposure])` — by setting the template's `image`-window durations;
+   it keeps ONE cooling/load cycle (the template's periods BEFORE its `image` window), then repeats
+   the image window long-short-long with a readout gap that holds ONLY the persistent trap (a
+   channel on in BOTH the load AND the image) between frames. The gap deliberately drops cooling
+   (re-cooling mid-bracket would rearrange the atoms and void the labels) AND the probe + emCCD,
+   so the emCCD line drops and re-rises into THREE CONSECUTIVE camera triggers within that single
+   cooling cycle, the trap held continuously. `reference_exposure` (LONG) and `readout_exposure`
+   (SHORT) are both explicit cali params — the long exposure is NOT buried in the template (the
+   template only supplies the channels + the one cooling cycle). Comparing the two long frames
+   tells whether the atom survived; when they
    AGREE (strict consensus) they vote the ground-truth occupancy for the short readout, and a
    shot where they disagree (atom loss, modelled by the virtual `detection_lifetime`) is dropped
    as ambiguous. (`timing.reference_bracket_sequence` builds the equivalent bracket FROM SCRATCH

@@ -106,7 +106,7 @@ def calibrate_readout(camera, sequencer, *, n_frames: Param(int,200),
 ### calibrate-readout task 的完整参数设计(`CalibrateReadoutTask` + `CALIBRATE_PARAMS`)
 所有参数声明一次(`operations/tasks/calibrate.py` 的 `CALIBRATE_PARAMS`,GUI 自动表单与 `readout.calibrate_task(**values)` 同读),逐项:
 - **source = live / saved frames**:`live` = 现在开相机直接采图并写标定;`saved frames`(`folder`)= 用已存文件夹的原始帧(`index_run` 读 `img<n>`)cali。**没有 "saved calibration" 这个 source**:复用一份已存标定直接让 Judge-occupancy 指它的 `calibration.json`。
-- **一条 pulse + long-short-long bracket**:`pulse_template` 是要 load 的成像程序;每发**改它的 duration** 成像成 long-short-long bracket(`PulseTableState.with_imaging_bracket`)——一次 cooling cycle 里三个连续 emCCD。**长参考曝光 = 模板 `'image'` 窗口时长**(改模板即改长曝光;两长帧投真值 + 建 site map),**短读出曝光 = `readout_exposure`**(中间帧,阈值在真实读出条件下学)。site map 用 bracket 的全部长参考帧(live==saved 单一路径,不再有独立 sitemap 采集 pass)。
+- **两个曝光参数 + long-short-long bracket**:`pulse_template` 只提供通道 + 那**一次** cooling cycle;cali 用**两个曝光参数**把模板 image 窗口设成 `[长,短,长]`(`PulseTableState.with_imaging_bracket([reference_exposure, readout_exposure, reference_exposure])`)——同一次 cooling 里三个连续 emCCD,中间**不重做 cooling**(trap 全程 held,否则原子乱掉、标签失效)。**长参考曝光 = `reference_exposure`**(两长帧投真值 + 建 site map / PSF),**短读出曝光 = `readout_exposure`**(中间帧,阈值在真实读出条件下学)——两者都是显式 cali 参数,不埋在模板里。site map 用 bracket 的全部长参考帧(live==saved 单一路径)。
 - **readout method = box / per-site PSF / uniform PSF**:cali **不**选 method,它把三种全算进一份标定;OccupancyProcessor 选其一。
 - **threshold = otsu / bimodal**;`threshold_frames`(bracket 发数)/`roi_radius`。
 - **复用标定**:重跑覆盖 `folder`;复用一份已标好的标定不在 cali 里——让 Judge-occupancy load 它的 `calibration.json`。
