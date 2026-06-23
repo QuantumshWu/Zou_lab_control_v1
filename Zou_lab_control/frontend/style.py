@@ -250,9 +250,12 @@ PALETTE: Mapping[str, Any] = MappingProxyType(_PALETTE)
 # tweezer, faint for an EMPTY site and bold for an OCCUPIED one (the Rb87 readout
 # look).  Single source for the site-map plot -- ring colour / opacity / stroke
 # per occupancy state (rings are always unfilled so the frame shows through).
+# An EMPTY ring must read on the darkest cmap too (a faint pale ring vanishes on grey).  A
+# saturated teal at alpha ~0.7 with a real stroke gives a visible, on-brand ring without
+# competing visually with the bold occupied ring.
 SITE_OCCUPANCY_STYLE: Mapping[str, Mapping[str, Any]] = MappingProxyType({
-    "empty":    MappingProxyType({"color": "#7EA5A3", "alpha": 0.22, "linewidth": 0.35}),
-    "occupied": MappingProxyType({"color": "#D07850", "alpha": 0.95, "linewidth": 0.7}),
+    "empty":    MappingProxyType({"color": "#2E8B87", "alpha": 0.70, "linewidth": 0.55}),
+    "occupied": MappingProxyType({"color": "#D07850", "alpha": 0.95, "linewidth": 0.85}),
 })
 
 

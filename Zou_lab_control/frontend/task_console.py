@@ -252,6 +252,105 @@ def read_editable_combo(combo) -> str:
     return text.strip()
 
 
+class _PulseSlotsWidget(QtWidgets.QWidget):
+    """Auto-built sub-form for a pulse template's API + scan slots.
+
+    One numeric row per API slot (``a1``, ``a2``, ...): the operator-set value the slot binds,
+    in the slot's own unit, seeded from the template's current value.  One text row per scan
+    slot (``s0``, ``s1``, ...): a 1-D points expression (``linspace(0, 50, 11)`` / a list) the
+    measurement evaluates to a sweep array.  Rebuilds in place when the template changes; the
+    operator's typed values survive a rebuild for slots that still exist (by name).
+
+    Output schema: ``{"api": {a1: float, ...}, "scan": {s0: "expr", ...}}``.  The single
+    source for "drive a pulse measurement", so a new measurement that takes a pulse template
+    gets this row for free."""
+
+    changed = QtCore.pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet("background: transparent;")
+        self._api_widgets: dict[str, QtWidgets.QWidget] = {}
+        self._scan_widgets: dict[str, QtWidgets.QWidget] = {}
+        # remember what the operator typed across template reloads (by slot name)
+        self._api_remembered: dict[str, str] = {}
+        self._scan_remembered: dict[str, str] = {}
+        self._form = QtWidgets.QFormLayout(self)
+        self._form.setContentsMargins(0, 0, 0, 0)
+        self._form.setSpacing(scaled_px(4, minimum=3))
+        self._form.setLabelAlignment(QtCore.Qt.AlignRight)
+
+    def _clear(self) -> None:
+        for w in list(self._api_widgets.values()) + list(self._scan_widgets.values()):
+            w.setParent(None); w.deleteLater()
+        self._api_widgets.clear()
+        self._scan_widgets.clear()
+        while self._form.count():
+            item = self._form.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None); w.deleteLater()
+
+    def rebuild(self, api_rows, scan_rows) -> None:
+        """``api_rows`` = ``[(name, kind, target, unit, current_value), ...]``.
+        ``scan_rows`` = ``[(name, kind, target, unit, label), ...]``."""
+        # remember whatever the operator currently typed, then rebuild
+        for name, w in list(self._api_widgets.items()):
+            self._api_remembered[name] = w.text().strip()
+        for name, w in list(self._scan_widgets.items()):
+            self._scan_remembered[name] = w.text().strip()
+        self._clear()
+        if not api_rows and not scan_rows:
+            note = FluentLabel("(template has no API or scan slots; nothing to set here.)", self)
+            note.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+            self._form.addRow(note)
+            self.changed.emit()
+            return
+        for name, kind, target, unit, current in api_rows:
+            label = f"{name}  ({kind} @ {target})"
+            edit = FluentLineEdit(self._api_remembered.get(name) or f"{float(current):g}", self)
+            edit.setMinimumWidth(scaled_px(140, minimum=110))
+            edit.setPlaceholderText(f"{unit}")
+            edit.setToolTip(f"Numeric value for API slot {name!r} (unit: {unit}).")
+            edit.textChanged.connect(self.changed)
+            self._form.addRow(label, edit)
+            self._api_widgets[name] = edit
+        for name, kind, target, unit, slot_label in scan_rows:
+            disp = slot_label or f"{kind} @ {target}"
+            label = f"{name}  ({disp})"
+            seeded = self._scan_remembered.get(name) or "linspace(0, 50, 11)"
+            edit = FluentLineEdit(seeded, self)
+            edit.setMinimumWidth(scaled_px(200, minimum=160))
+            edit.setPlaceholderText("linspace(start, stop, N)")
+            edit.setToolTip(f"Points expression for scan slot {name!r} (a 1-D list / linspace / arange).")
+            edit.textChanged.connect(self.changed)
+            self._form.addRow(label, edit)
+            self._scan_widgets[name] = edit
+        self.changed.emit()
+
+    def values_dict(self) -> dict:
+        """The current ``{"api": {name: float}, "scan": {name: expression}}`` snapshot.  An
+        empty / blank api row is dropped (keeps the template's value); scan rows are passed
+        through as strings (the measurement evaluates them)."""
+        api: dict[str, float] = {}
+        for name, w in self._api_widgets.items():
+            text = w.text().strip()
+            if not text:
+                continue
+            try:
+                api[name] = float(text)
+            except ValueError:
+                continue
+        scan = {name: w.text().strip() for name, w in self._scan_widgets.items()}
+        return {"api": api, "scan": scan}
+
+    def has_scan_rows(self) -> bool:
+        return bool(self._scan_widgets)
+
+    def all_scan_rows_filled(self) -> bool:
+        return all(w.text().strip() for w in self._scan_widgets.values())
+
+
 # The ONE description of a panel's source-expression namespace -- shown both as the inline
 # field's tooltip and as the floating editor's prompt, so the two never drift.
 SOURCE_EXPR_HELP = (
@@ -997,11 +1096,12 @@ class PanelCard(FluentGroupBox):
         self.source_edit.setStyleSheet(
             self.source_edit.styleSheet() + " QLineEdit { font-family: Consolas, monospace; }")
         self.source_edit.setToolTip(SOURCE_EXPR_HELP)
-        # An inline one-liner is cramped for a real expression; "⤢" pops a LARGE floating
+        # An inline one-liner is cramped for a real expression; "Edit…" pops a LARGE floating
         # multi-line editor (a modal card, so it does NOT reflow the panel layout) prefilled
         # with the source -- comfortable for typing math across signals -- and writes it back.
-        self.expand_button = FluentButton("⤢", color=GREY)
-        self.expand_button.setFixedWidth(scaled_px(30, minimum=26))
+        # The "Edit…" wording matches the panel's other Fluent "Edit…" buttons (one house style).
+        self.expand_button = FluentButton("Edit…", color=GREY)
+        self.expand_button.setFixedWidth(scaled_px(56, minimum=44))
         self.expand_button.setToolTip("Open a large floating editor for this expression")
         self.expand_button.clicked.connect(self._open_expr_editor)
         self.apply_button = FluentButton("Apply", color=GREEN)
@@ -2027,6 +2127,7 @@ class MeasurementPanel(QtWidgets.QWidget):
         # OUT of self._widgets so its entries stay a uniform (tag, widget) shape -- set_running
         # iterates entry[1:] and would crash on a ParamDecl).
         self._pulse_param_decls: dict[str, object] = {}
+        self._pulse_slots_decls: dict[str, object] = {}
         spec = self.current_spec()
         if spec is None:
             return
@@ -2125,6 +2226,20 @@ class MeasurementPanel(QtWidgets.QWidget):
                 combo.activated.connect(lambda *_: self._refresh_start_enabled())
                 self.form.addRow(label_text, combo)
                 self._widgets[decl.key] = ("signal", combo)
+            elif kind == "pulse_slots":
+                # An AUTO-GENERATED sub-form for the pulse template named in decl.depends_on:
+                # one numeric input per API slot (a1/a2/...) and one points-expression input per
+                # scan slot (s0/s1/...).  When the template path changes the form rebuilds; when
+                # the operator types into a sub-row the value is collected as
+                # {"api": {name: float}, "scan": {name: text-expression}} -- the same shape the
+                # PulseScanMeasurement build() consumes.  ONE source for the pulse slot form,
+                # so a NEW measurement that takes a pulse template gets this row for free.
+                widget = _PulseSlotsWidget()
+                widget.setToolTip(decl.tooltip)
+                widget.changed.connect(self._refresh_start_enabled)
+                self.form.addRow(label_text, widget)
+                self._widgets[decl.key] = ("pulse_slots", widget)
+                self._pulse_slots_decls[decl.key] = decl
             elif kind == "pulse_param":
                 # WHICH parameter of a pulse template to sweep: a DEPENDENT combo whose
                 # choices are introspected from the template FILE named in decl.depends_on
@@ -2160,7 +2275,38 @@ class MeasurementPanel(QtWidgets.QWidget):
             if src and src[0] == "path":
                 src[1].changed.connect(lambda *_a, k=key: self._repopulate_pulse_param(k))
             self._repopulate_pulse_param(key)
+        # Wire each pulse_slots widget to its template path (same dependency pattern as
+        # pulse_param): when the template changes, rebuild the auto-form's per-slot rows.
+        for key, decl in self._pulse_slots_decls.items():
+            src = self._widgets.get(getattr(decl, "depends_on", ""))
+            if src and src[0] == "path":
+                src[1].changed.connect(lambda *_a, k=key: self._repopulate_pulse_slots(k))
+            self._repopulate_pulse_slots(key)
         self._refresh_start_enabled()
+
+    def _repopulate_pulse_slots(self, key: str) -> None:
+        """Rebuild the auto-form rows of a ``pulse_slots`` widget from the pulse template
+        named in its ``depends_on`` path field: one numeric input per API slot, one points-
+        expression input per scan slot.  Preserves any value the operator already typed (the
+        widget seeds each row from its current value when the slot survives the reload)."""
+        entry = self._widgets.get(key)
+        decl = self._pulse_slots_decls.get(key)
+        if entry is None or decl is None or entry[0] != "pulse_slots":
+            return
+        widget = entry[1]
+        src = self._widgets.get(getattr(decl, "depends_on", ""))
+        path = src[1].text() if (src and src[0] == "path") else ""
+        try:
+            from ..neutral_atom.operations.measurements.pulse_scan import _resolve_probe_template
+            state = _resolve_probe_template(path)
+        except Exception:
+            widget.rebuild([], [])
+            return
+        api_rows = [(s.name, str(s.kind), str(s.target), str(s.unit), float(state._read_api_field(s)))
+                    for s in state.api_slots]
+        scan_rows = [(f"s{i}", str(s.kind), str(s.target), str(s.unit), s.label)
+                     for i, s in enumerate(state.scan_slots)]
+        widget.rebuild(api_rows, scan_rows)
 
     def _repopulate_pulse_param(self, key: str) -> None:
         """Fill a ``pulse_param`` combo from the pulse template named in its ``depends_on``
@@ -2227,9 +2373,38 @@ class MeasurementPanel(QtWidgets.QWidget):
             elif tag == "pulse_param":
                 # the "kind:target" token (combo data) or the typed text, same editable-combo rule
                 values[key] = read_editable_combo(entry[1])
+            elif tag == "pulse_slots":
+                # auto-form output: {"api": {a1: 1e-3, ...}, "scan": {s0: "linspace(...)", ...}}
+                values[key] = entry[1].values_dict()
             else:  # float
                 values[key] = float(entry[1].value())
         return values
+
+    def refresh_on_show(self) -> None:
+        """Re-poll providers and rebuild every dynamic combo (signals + pulse_params), so
+        switching back to a tab whose providers have changed shows up-to-date choices.
+        E.g. a processor's source dropdown was empty when first opened (no signal published
+        yet); after a measurement publishes one, returning to this tab shows it -- without
+        rebuilding the form, just refilling the existing combos -- so the current selection
+        round-trips."""
+        for key, entry in list(self._widgets.items()):
+            tag, widget = entry[0], entry[1]
+            if tag == "signal":
+                current = read_editable_combo(widget)
+                names: list[str] = []
+                if callable(self._signals_provider):
+                    try: names = [str(n) for n in self._signals_provider()]
+                    except Exception: names = []
+                fill_grouped_signal_combo(
+                    widget, names=names,
+                    sources=(self._sources_provider() if callable(self._sources_provider) else {}),
+                    formats=(self._formats_provider() if callable(self._formats_provider) else {}),
+                    current=current)
+            elif tag == "pulse_param":
+                self._repopulate_pulse_param(key)
+            elif tag == "pulse_slots":
+                self._repopulate_pulse_slots(key)
+        self._refresh_start_enabled()
 
     def set_axis_range(self, lo: float, hi: float) -> bool:
         """Fill the FIRST axis_range param's Min/Max from a selected region
@@ -3062,6 +3237,18 @@ class PanelEditor(QtWidgets.QWidget):
                 self._canvas.draw_idle()
             self.status.setText("fit cleared")
 
+    def refresh_on_show(self) -> None:
+        """When this panel's Edit tab becomes visible, refresh anything that may have changed
+        since it was last shown: snap the manual-limit fields to current view, re-read the
+        producing source's 'now' acquisition values, and refresh any embedded source form's
+        dynamic combos (the ONE hook the tab-switch handler calls -- nothing special-cases
+        PanelEditor versus LogicNodeEditor)."""
+        self.fill_limits()
+        self.refresh_node_now_labels()
+        hook = getattr(getattr(self, "source_form", None), "refresh_on_show", None)
+        if callable(hook):
+            hook()
+
     def fill_limits(self) -> None:
         if self._plotter is None or self.xmin is None:
             return                          # no Limits section (a non-"plot" role)
@@ -3313,6 +3500,14 @@ class LogicNodeEditor(QtWidgets.QWidget):
         # No matplotlib resources here (a logic node never plots), so teardown is a
         # no-op -- present so the console can treat it like a PanelEditor.
         pass
+
+    def refresh_on_show(self) -> None:
+        """When switching back to this Edit tab, refresh the form's dynamic combos so a
+        signal that was not yet published when this tab was last open now shows up.
+        Delegates to the form's own ``refresh_on_show`` (the one hook every form honours)."""
+        hook = getattr(self.form, "refresh_on_show", None)
+        if callable(hook):
+            hook()
 
 
 # ====================================================================== console
@@ -4034,14 +4229,19 @@ class TaskConsole(QtWidgets.QWidget):
         widget.deleteLater()
 
     def _on_tab_changed(self, _index: int) -> None:
-        # Opening an Edit tab must show CURRENT state, not a stale snapshot from when it was
-        # last shown / ticked: re-snapshot a PanelEditor's frozen manual-limit fields AND
-        # refresh its 'now: <value>' acquisition references to the source's current values
-        # (the params may have changed since the tab was last visible).
+        # ONE rule: when a tab becomes visible, give whatever's inside a chance to refresh its
+        # dynamic content -- any widget that implements ``refresh_on_show()`` runs it.  No
+        # special-casing per tab type (PanelEditor / LogicNodeEditor / MeasurementPanel all
+        # honour the same hook), so a brand new editor automatically participates by
+        # implementing ``refresh_on_show`` -- nothing here changes.  This kills the bug where
+        # a processor's source dropdown stayed empty after switching tabs.
         widget = self.tabs.currentWidget()
-        if isinstance(widget, PanelEditor):
-            widget.fill_limits()
-            widget.refresh_node_now_labels()
+        hook = getattr(widget, "refresh_on_show", None)
+        if callable(hook):
+            try:
+                hook()
+            except Exception:
+                pass
 
     def _arrange(self) -> None:
         # free placement: the just-dragged / resized card keeps the grid cell it was

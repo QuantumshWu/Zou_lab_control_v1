@@ -1,14 +1,14 @@
-"""Contract tests for the software-scan addressing layer (timing.PulseParam et al.).
+"""Contract tests for the software-scan addressing layer + the redesigned ``Pulse scan``
+measurement.
 
-A "pulse scan" sweeps a parameter by, PER POINT, editing a loaded template and recompiling --
-the NON-slot software scan (so it can sweep a period duration, a channel delay, OR a DAC bus
-level of any program, no hardware scan slot required).  These pin the single-source addressing:
+The redesigned ``Pulse scan`` is parameterised purely by the loaded template's named slots:
+  * EVERY API slot (a1, a2, ...) gets ONE numeric value set ONCE at build time;
+  * EVERY scan slot (s0, s1, ...) gets ONE points expression (linspace / list) the run
+    evaluates to a 1-D sweep; the run advances every scan slot in lockstep, one row at a time.
 
-  * ``period_index_by_name`` resolves a named period (the single name->index source);
-  * ``PulseParam.apply`` returns a NEW state (input untouched) with the named parameter set,
-    delegating to the real setters (so it inherits their guards) -- for duration / delay / dac;
-  * ``enumerate_pulse_params`` lists exactly the addressable params (durations + delays + per-bus
-    DAC), the one source the GUI dropdown and a notebook share.
+No hardcoded slot names; no single "scan target" anymore.  The PulseParam / enumerate path
+remains for the GUI's editor introspection (it is the single source for the auto-generated
+UI's per-slot rows).
 """
 
 from __future__ import annotations
@@ -33,17 +33,16 @@ from Zou_lab_control.neutral_atom.timing import (
 
 
 def _template() -> PulseTableState:
-    # the shipped imaging template has named 'image_0/1/2' frames (case-insensitive resolve target)
     return default_imaging_template()
 
 
+# --------------------------------------------------------------------------- name/value plumbing
 def test_period_index_by_name_resolves_named_period():
     state = _template()
     idx = period_index_by_name(state, "image_0")
     assert idx is not None
     assert str(state.periods[idx].name).strip().lower() == "image_0"
     assert period_index_by_name(state, "no-such-period") is None
-    # case / whitespace insensitive
     assert period_index_by_name(state, "  IMAGE_0 ") == idx
 
 
@@ -53,9 +52,8 @@ def test_pulse_param_apply_duration_returns_new_state_and_sets_value():
     before = state.periods[idx].duration
     param = PulseParam("duration", str(idx), unit="us")
     out = param.apply(state, 12.0)
-    assert out is not state                                    # input never mutated
-    assert state.periods[idx].duration == before               # original unchanged
-    # the edited period carries the set value (12 us) via the real set_period_duration
+    assert out is not state
+    assert state.periods[idx].duration == before
     assert out.periods[idx].duration == pytest.approx(12.0)
     assert out.periods[idx].unit == "us"
 
@@ -66,19 +64,17 @@ def test_pulse_param_apply_delay_sets_channel_delay():
     param = PulseParam("delay", channel, unit="us")
     out = param.apply(state, 3.0)
     assert out is not state
-    assert out.delays.get(channel) == 3.0                      # set via set_channel_delay
-    assert channel not in state.delays                         # original untouched
+    assert out.delays.get(channel) == 3.0
+    assert channel not in state.delays
 
 
 def test_pulse_param_apply_dac_is_unitless_signed_code():
-    # build a 2-channel DAC bus template so a bus exists to address
     state = PulseTableState(channels=["da[0]", "da[1]", "trig"])
     state.add_period(50.0, name="hold", unit="us")
     bus = next(iter(state.bus_channels(min_width=1)))
-    param = PulseParam("dac", f"{bus}@0")                      # no unit -> unitless signed LSB
-    out = param.apply(state, -2.0)                             # signed code (2-bit bus range -2..1)
+    param = PulseParam("dac", f"{bus}@0")
+    out = param.apply(state, -2.0)
     assert out is not state
-    # the bus carries the SIGNED value we set (0 = 0 V on the offset-binary driver)
     assert out.analog_bus_value_at_period_start(0, bus) == -2
 
 
@@ -94,18 +90,13 @@ def test_enumerate_pulse_params_covers_durations_delays_and_dac():
     params = enumerate_pulse_params(state)
     kinds = {kind for kind, _, _ in params}
     assert {"duration", "delay", "dac"} <= kinds
-    # one duration per period
     durations = [t for k, t, _ in params if k == "duration"]
     assert durations == [str(i) for i in range(len(state.periods))]
-    # one delay per channel
     delays = [t for k, t, _ in params if k == "delay"]
     assert delays == list(state.channels)
-    # one dac entry per (bus, period)
     dac = [t for k, t, _ in params if k == "dac"]
     assert dac == [f"{bus}@{i}" for bus in state.bus_channels(min_width=1)
                    for i in range(len(state.periods))]
-    # every enumerated (kind, target) is actually applyable (or raises a CLEAR error for
-    # scan-bound durations) -- they all round-trip through the real setters
     for kind, target, _label in params:
         PulseParam(kind, target, unit="us").apply(state, 1.0)
 
@@ -120,9 +111,30 @@ def _calibrated():
     return exp
 
 
+def _bound_probe_with_scan(exp) -> str:
+    """Write a temporary probe pulse with ONE scan slot bound to its only duration, return
+    the JSON path.  Lets the scan tests exercise the slot-driven path without depending on
+    whatever the shipped probe_template carries (and without single_imaging_template's
+    pre-bound a1 on the same period -- a clash with a scan slot on that field)."""
+    from Zou_lab_control.neutral_atom.timing import PulseTableState
+    from Zou_lab_control.neutral_atom.timing.pulse_table import PulsePeriod
+
+    state = PulseTableState(channels=["trap", "cooling", "probe", "emCCD"],
+                            visible_channels=["trap", "cooling", "probe", "emCCD"])
+    states_load = (1, 1, 0, 0)
+    states_image = (1, 0, 1, 1)
+    state.periods.append(PulsePeriod(0.002, states_load, unit="s", name="load"))
+    state.periods.append(PulsePeriod(0.005, states_image, unit="s", name="image"))
+    state.bind_field("duration", "1", label="probe", unit="us")     # scan the image duration
+    state.validate()
+    out = Path("pulses") / "_test_probe_scan.json"
+    state.save(str(out))
+    return str(out)
+
+
 def _run_pulse_scan(exp, **build_kwargs):
     """Build the Pulse-scan measurement and drive it to completion through the SAME live node
-    the task console uses; return (x, y) published on the hub."""
+    the task console uses; return (x, y, measurement)."""
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
     from Zou_lab_control.neutral_atom.operations.logic import ScannedMeasurementNode
 
@@ -137,76 +149,101 @@ def _run_pulse_scan(exp, **build_kwargs):
             measurement)
 
 
-def test_pulse_scan_spec_discovered_with_unique_keys():
-    """The generic Pulse-scan measurement is auto-discovered into the Add-Panel catalog with
-    unique x/y signal keys (the registry raises on a collision with temperature/readout)."""
+def test_pulse_scan_spec_carries_pulse_slots_form():
+    """The redesigned spec exposes ONE auto-form (pulse_slots) bound to the template field
+    -- no hard-coded scan_target/scan range any more."""
     exp = _calibrated()
     try:
         specs = {s.name: s for s in exp.readout.measurement_specs()}
         assert "Pulse scan" in specs
         spec = specs["Pulse scan"]
         assert (spec.x_key, spec.y_key) == ("param", "signal")
-        # the scan-target field is the dynamic pulse_param control bound to the template field
-        target = next(p for p in spec.params if p.kind == "pulse_param")
-        assert target.depends_on == "template"
+        slots_decl = next(p for p in spec.params if p.kind == "pulse_slots")
+        assert slots_decl.depends_on == "template"
+        # no other "scan target" param; the slots form is the only template-driver
+        assert not any(p.kind == "pulse_param" for p in spec.params)
     finally:
         exp.close()
 
 
 @pytest.mark.parametrize("reduce", ["counts", "loading", "fidelity"])
 def test_pulse_scan_runs_each_reduce_mode_headless(reduce):
-    """Each reduce mode sweeps the template's first duration and yields a finite curve over the
-    SAME camera/calibration contract (virtual==real; only frames are simulated)."""
+    """Each reduce mode sweeps ONE bound scan slot and yields a finite curve over the SAME
+    camera/calibration contract (virtual==real; only frames are simulated)."""
     exp = _calibrated()
+    probe = _bound_probe_with_scan(exp)
     try:
-        x, y, m = _run_pulse_scan(exp, template="probe_template.json", scan_target="duration:0",
-                                  scan=(10.0, 40.0, 5), shots=4, reduce=reduce)
+        x, y, m = _run_pulse_scan(
+            exp, template=probe,
+            pulse_slots={"api": {}, "scan": {"s0": "linspace(10, 40, 5)"}},
+            shots=4, reduce=reduce)
         assert x.shape == (5,) and y.shape == (5,)
         assert np.isfinite(x).all() and np.isfinite(y).all()
-        assert m.reducer.labels[0].endswith("(us)")            # x-axis labelled with the param + unit
     finally:
+        Path(probe).unlink(missing_ok=True)
         exp.close()
 
 
-def test_pulse_scan_delay_is_software_non_slot():
-    """A channel DELAY scan runs -- proving the NON-slot software path (delay is NOT a hardware
-    scan slot; it is set per point by editing the template), the capability the user asked for."""
-    from Zou_lab_control.neutral_atom.operations.logic import CalibrateReadoutTask
-    from Zou_lab_control.neutral_atom.timing import enumerate_pulse_params
-
+def test_pulse_scan_api_value_is_applied_once_at_build():
+    """An api-slot value the operator sets in the form is APPLIED ONCE to the loaded template
+    (set_api on a known handle); a typo raises (template exposes no such handle)."""
     exp = _calibrated()
+    probe = _bound_probe_with_scan(exp)
     try:
-        state = CalibrateReadoutTask._resolve_template("imaging_template.json")
-        kind, target, _ = next((p for p in enumerate_pulse_params(state) if p[0] == "delay"))
-        x, y, _m = _run_pulse_scan(exp, template="probe_template.json",
-                                   scan_target=f"{kind}:{target}", scan=(0.0, 5.0, 3),
-                                   shots=3, reduce="counts")
-        assert x.shape == (3,) and np.isfinite(y).all()
+        # set the probe template's first delay channel as an api slot a1, then drive it
+        from Zou_lab_control.neutral_atom.timing import PulseTableState
+        st = PulseTableState.load(probe)
+        ch = st.channels[0]
+        st.bind_api_field("delay", ch, unit="us")
+        st.save(probe)
+        spec = {s.name: s for s in exp.readout.measurement_specs()}["Pulse scan"]
+        m = spec.build(template=probe,
+                       pulse_slots={"api": {"a1": 1.5}, "scan": {"s0": "linspace(1, 3, 3)"}},
+                       shots=1, reduce="counts")
+        assert m.base_state.delays.get(ch) == pytest.approx(1.5)
+        with pytest.raises(ValueError):
+            spec.build(template=probe,
+                       pulse_slots={"api": {"a9": 1.0}, "scan": {"s0": "linspace(1, 3, 3)"}},
+                       shots=1, reduce="counts")
     finally:
+        Path(probe).unlink(missing_ok=True)
         exp.close()
 
 
-def test_pulse_scan_missing_target_raises():
-    """An empty scan target fails LOUD (the GUI also marks it required), never silently scans
-    nothing."""
+def test_pulse_scan_missing_scan_points_raises():
+    """A scan slot WITHOUT a points expression fails LOUD: every swept slot needs a sweep
+    array (no silent freeze at nominal)."""
     exp = _calibrated()
+    probe = _bound_probe_with_scan(exp)
     try:
         spec = {s.name: s for s in exp.readout.measurement_specs()}["Pulse scan"]
-        with pytest.raises(ValueError):
-            spec.build(template="probe_template.json", scan_target="", scan=(0.0, 1.0, 3))
+        with pytest.raises(ValueError, match="no points expression"):
+            spec.build(template=probe, pulse_slots={"api": {}, "scan": {"s0": ""}},
+                       shots=1, reduce="counts")
     finally:
+        Path(probe).unlink(missing_ok=True)
         exp.close()
 
 
-def test_pulse_scan_negative_time_range_raises():
-    """A duration/delay scan range with a negative bound fails LOUD: negative/zero times snap to
-    one clock tick (snap_seconds_to_clock's floor) and would silently collapse distinct points
-    onto the same x.  (A DAC target legitimately scans negative signed-LSB codes -- the guard is
-    time-only, so a duration/delay range must be >= 0.)"""
+def test_pulse_scan_mismatched_lockstep_sizes_raise():
+    """Two scan slots advanced in lockstep must have the SAME number of points -- mismatched
+    sizes fail LOUD."""
     exp = _calibrated()
+    # build a template with TWO scan slots
+    from Zou_lab_control.neutral_atom.timing import PulseTableState, single_imaging_template
+    st = single_imaging_template()
+    st.add_period(20.0, name="probe2", unit="us")
+    st.bind_field("duration", "1", unit="us")
+    st.bind_field("duration", "2", unit="us")
+    probe = Path("pulses") / "_test_probe_2scan.json"
+    st.save(str(probe))
     try:
         spec = {s.name: s for s in exp.readout.measurement_specs()}["Pulse scan"]
-        with pytest.raises(ValueError):
-            spec.build(template="probe_template.json", scan_target="duration:0", scan=(-0.04, 0.04, 5))
+        with pytest.raises(ValueError, match=r"(?i)same number of points"):
+            spec.build(template=str(probe),
+                       pulse_slots={"api": {}, "scan": {"s0": "linspace(0, 5, 3)",
+                                                        "s1": "linspace(0, 5, 4)"}},
+                       shots=1, reduce="counts")
     finally:
+        probe.unlink(missing_ok=True)
         exp.close()

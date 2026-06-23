@@ -706,11 +706,12 @@ class CalibrateReadoutTask(Task):
         # The Rb87 reference bracket comes from the TEMPLATE (a literal long-short-long), and these
         # two operator-set exposures only set its frame DURATIONS by name (exactly as the real rb87
         # readout sets a 20 ms reference + a 5 ms readout): ``reference_exposure`` is the LONG frame
-        # (high-SNR -> votes ground truth + builds the site map / PSF; written to API slot ``a1``,
-        # which the template's long reference frame(s) carry) and ``readout_exposure`` is the SHORT
-        # readout frame (its per-site thresholds are learnt; API slot ``a2``).  ``_collect_bracket_groups``
-        # does ``set_api("a1", long)`` / ``set_api("a2", short)`` -- it changes ONLY those durations,
-        # never the structure, so what is fired == the template file.
+        # (high-SNR -> votes ground truth + builds the site map / PSF; written to API slots ``a1``
+        # and ``a3``, the two long reference exposures of the long-short-long bracket) and
+        # ``readout_exposure`` is the SHORT readout frame (its per-site thresholds are learnt; API
+        # slot ``a2``).  ``_collect_bracket_groups`` does set_api(a1, long) / set_api(a2, short) /
+        # set_api(a3, long) -- it changes ONLY those durations, never the structure, so what is
+        # fired == the template file.
         self.reference_exposure = float(reference_exposure)
         self.readout_exposure = float(readout_exposure)
         self.pulse_template = str(pulse_template or self.DEFAULT_PULSE_TEMPLATE)
@@ -938,13 +939,17 @@ class CalibrateReadoutTask(Task):
         # What is fired == the template the operator chose: file == fired.
         template = self._resolve_template(self.pulse_template)
         try:
-            template.set_api("a1", self.reference_exposure)   # long reference exposure(s)
-            template.set_api("a2", self.readout_exposure)     # short readout exposure
+            # Each exposure cell carries its OWN api handle (names are unique, like the GUI
+            # allocates a fresh a<N> per click): a1 = first long, a2 = short readout, a3 =
+            # second long.  Cali sets all three by name; structure stays as loaded.
+            template.set_api("a1", self.reference_exposure)
+            template.set_api("a2", self.readout_exposure)
+            template.set_api("a3", self.reference_exposure)
         except ValueError as exc:
             raise ValueError(
                 f"{exc}  The Calibrate task sets the imaging template's exposures by API slot: tag "
-                "the long reference-frame durations as 'a1' and the short readout as 'a2' (pulse GUI: "
-                "click a duration cell to its API state).") from exc
+                "the three exposure cells as a1 (first long), a2 (short readout), a3 (second long) "
+                "in the pulse GUI (click each duration cell to its API state).") from exc
         n_frames, readout_index = self._imaging_layout(template)
         self._readout_index = readout_index                    # shared with _save_live_frames
         bracket = template.to_sequence(name="reference_bracket")

@@ -188,10 +188,11 @@ class ApiSlot:
     :data:`API_SLOT_KINDS`; ``target`` identifies the bound field exactly like
     :class:`ScanSlot` (period index for ``duration``, channel name for ``delay``,
     ``"<bus>@<period_index>"`` for ``dac``); ``unit`` is the unit a bare
-    ``set_api(name, value)`` interprets ``value`` in.  SEVERAL slots may share one
-    ``name`` so one ``set_api`` updates several fields in lockstep (e.g. the two long
-    reference frames of a long-short-long bracket both carry ``a1``).  Unlike a scan
-    slot, the bound field keeps its concrete value -- the slot is only a label.
+    ``set_api(name, value)`` interprets ``value`` in.  Every slot's ``name`` is UNIQUE
+    within a :class:`PulseTableState` -- one handle binds exactly one field, just like
+    the GUI's per-cell dot allocates a fresh ``a<N>`` each time -- so the data layer and
+    the GUI agree on what a name can mean.  Unlike a scan slot, the bound field keeps
+    its concrete value -- the slot is only a label.
     """
 
     name: str
@@ -517,13 +518,11 @@ class PulseTableState:
     # -- API slot helpers (named handles the API/Task set by name) ----------
 
     def api_names(self) -> list[str]:
-        """Distinct API-slot handle names in slot order (``["a1", "a2", ...]``)."""
+        """API-slot handle names in slot order (``["a1", "a2", ...]``).  Names are unique
+        per :class:`PulseTableState` (a duplicate would have been rejected by ``validate``),
+        so the list is also the distinct set."""
 
-        seen: list[str] = []
-        for slot in self.api_slots:
-            if slot.name not in seen:
-                seen.append(slot.name)
-        return seen
+        return [str(slot.name) for slot in self.api_slots]
 
     def api_slot_for(self, kind: str, target: str) -> str | None:
         """The API handle bound to field ``(kind, target)``, or ``None``."""
@@ -573,20 +572,20 @@ class PulseTableState:
         return self
 
     def set_api(self, name: str, value: float, *, unit: str | None = None) -> "PulseTableState":
-        """Set EVERY field tagged with API handle ``name`` to ``value``.
+        """Set the field tagged with API handle ``name`` to ``value``.
 
         The value is interpreted in the slot's own ``unit`` unless ``unit`` overrides it.
-        Several fields may share one handle (e.g. ``a1`` on both long frames of a
-        long-short-long bracket), so one call updates them in lockstep.  Raises if no
-        field carries ``name`` (fail loud -- a silent no-op would hide a stale template)."""
+        Each name binds EXACTLY ONE field (names are unique within a state -- a duplicate
+        is rejected by ``validate()``), so the data layer agrees with the GUI's per-cell
+        dot allocator.  Raises if no field carries ``name`` (fail loud -- a silent no-op
+        would hide a stale template)."""
 
-        slots = [s for s in self.api_slots if s.name == str(name)]
-        if not slots:
+        slot = next((s for s in self.api_slots if s.name == str(name)), None)
+        if slot is None:
             raise ValueError(
                 f"no API slot named {name!r}; this pulse exposes {self.api_names() or '[]'}. "
                 "Tag a field as an API slot first (GUI: click a cell to a-state; API: bind_api_field).")
-        for slot in slots:
-            self._set_api_field(slot, value, unit if unit is not None else slot.unit)
+        self._set_api_field(slot, value, unit if unit is not None else slot.unit)
         return self
 
     def _set_api_field(self, slot: ApiSlot, value: float, unit: str) -> None:
@@ -834,6 +833,17 @@ class PulseTableState:
         return self
 
     def _validate_api_slots(self) -> None:
+        # Names are UNIQUE within a state (one handle = one field).  The GUI's per-cell dot
+        # allocates a fresh ``a<N>`` each time, so duplicates only ever arise from a hand-edited
+        # JSON or a misuse of bind_api_field -- which is precisely what this check catches.
+        seen: set[str] = set()
+        for slot in self.api_slots:
+            if slot.name in seen:
+                raise ValueError(
+                    f"api slot name {slot.name!r} appears more than once; each handle "
+                    "must bind exactly one field (GUI: every duration/delay/DAC cell gets its "
+                    "own a<N>).")
+            seen.add(slot.name)
         known_buses = self.bus_channels(min_width=1)
         for slot in self.api_slots:
             if slot.kind == "duration":
@@ -1649,11 +1659,12 @@ def default_imaging_template(
     trap (cooling/probe/trigger off) so the camera falls and re-arms between frames WITHOUT
     re-cooling (re-cooling would scramble the atoms and void the reference labels).
 
-    The two long-frame durations are the API slot ``a1`` and the short readout is ``a2``,
-    so the Calibrate task sets the exposures BY NAME (``state.set_api("a1", long)``,
-    ``state.set_api("a2", short)``) -- it only changes those durations, never the
-    structure.  What you load IS what is fired: open this template in the pulse GUI and you
-    see exactly the long-short-long the task runs."""
+    Three API handles -- ``a1`` (first long reference), ``a2`` (short readout), ``a3``
+    (second long reference) -- one per exposure cell, just like the pulse GUI allocates a
+    fresh ``a<N>`` per click.  The Calibrate task sets all three BY NAME
+    (``set_api("a1", long); set_api("a2", short); set_api("a3", long)``); it only changes
+    those durations, never the structure.  What you load IS what is fired: open this
+    template in the pulse GUI and you see exactly the long-short-long the task runs."""
 
     chans = list(channels) if channels else [trap_channel, cooling_channel, probe_channel, trigger_channel]
 
@@ -1671,11 +1682,12 @@ def default_imaging_template(
         PulsePeriod(float(reference_exposure), image, unit="s", name="image_2"),
     ]
     state = PulseTableState(channels=chans, periods=periods, name="imaging_template")
-    # API handles so the Calibrate task sets exposures by name: a1 = both long reference
-    # frames (shared), a2 = the short readout frame.
+    # One API handle per exposure cell (names are unique, like the GUI allocates):
+    # a1 = first long reference (image_0), a2 = short readout (image_1), a3 = second long
+    # reference (image_2).  The Calibrate task sets all three by name.
     state.bind_api_field("duration", "1", name="a1", unit="s")
-    state.bind_api_field("duration", "5", name="a1", unit="s")
     state.bind_api_field("duration", "3", name="a2", unit="s")
+    state.bind_api_field("duration", "5", name="a3", unit="s")
     return state
 
 

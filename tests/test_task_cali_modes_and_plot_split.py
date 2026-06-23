@@ -153,11 +153,12 @@ def test_calibrate_task_builds_long_short_long_bracket_from_two_exposures(tmp_pa
         # template "still has only one emCCD" must never recur.
         emccd_bit = st.channels.index("emCCD")
         assert sum(1 for p in st.periods if p.states[emccd_bit]) == 3
-        # The cali sets ONLY the two exposures BY NAME (a1 = long reference frames, a2 = short
-        # readout) and fires THAT template -- it does not invent or unroll a bracket.
+        # The cali sets ONLY the three exposures BY NAME (a1 = first long, a2 = short readout,
+        # a3 = second long) and fires THAT template -- it does not invent or unroll a bracket.
         fired = task._resolve_template(task.pulse_template)
         fired.set_api("a1", task.reference_exposure)
         fired.set_api("a2", task.readout_exposure)
+        fired.set_api("a3", task.reference_exposure)
         bracket = fired.to_sequence(name="ref")
         cooling = [(p.start, p.duration) for p in bracket.pulses if p.channel == "cooling" and p.value]
         trap = [p for p in bracket.pulses if p.channel == "trap" and p.value]
@@ -314,33 +315,26 @@ def test_calibrate_task_bool_param_renders_as_toggle_switch():
         exp.close()
 
 
-def test_pulse_scan_target_combo_populates_from_template_dependent_field():
-    """The Pulse-scan measurement's ``scan_target`` (kind ``pulse_param``) renders as a
-    DEPENDENT combo: its choices are introspected from the pulse template named in the sibling
-    ``template`` path field, each item's data is the ``"kind:target"`` token the build consumes,
-    and changing the template repopulates it (the form's inter-field reactivity)."""
+def test_pulse_scan_slots_form_is_template_driven():
+    """The Pulse-scan measurement carries ONE auto-form (kind ``pulse_slots``) bound to the
+    sibling ``template`` field: the form's per-slot rows (one per API slot + one per scan
+    slot) are rebuilt whenever the template path changes, and ``collect_values`` returns the
+    {'api', 'scan'} dict the build() consumes."""
     from Zou_lab_control.frontend.task_console import MeasurementPanel
 
     exp = _calibrated()
     try:
         spec = {s.name: s for s in exp.readout.measurement_specs()}["Pulse scan"]
         panel = MeasurementPanel([spec], single=True)
-        tag, combo = panel._widgets["scan_target"]
-        assert tag == "pulse_param"
-        assert combo.count() >= 2                                  # populated from the template's params
-        # items carry a "kind:target" token as data, a human label as text
-        tokens = [combo.itemData(i) for i in range(combo.count())]
-        assert any(str(t).startswith("duration:") for t in tokens)
-        assert any(str(t).startswith("delay:") for t in tokens)   # delays included (software, non-slot)
-        combo.setCurrentIndex(1)
-        token = panel.collect_values()["scan_target"]
-        assert ":" in token                                        # collected as the kind:target token
-        # the combo is DEPENDENT on the template field: repopulating (the path-change reaction)
-        # keeps it populated via the single template resolver and PRESERVES the current pick --
-        # it never silently empties to a blank mystery.
-        panel._repopulate_pulse_param("scan_target")
-        assert combo.count() >= 2
-        assert panel.collect_values()["scan_target"] == token      # selection survives a reload
+        tag, widget = panel._widgets["pulse_slots"]
+        assert tag == "pulse_slots"
+        out = panel.collect_values()["pulse_slots"]
+        assert isinstance(out, dict) and set(out) == {"api", "scan"}
+        # the imaging template carries 3 unique API handles -> 3 numeric rows after a switch
+        panel._widgets["template"][1].setText("imaging_template.json")
+        panel._repopulate_pulse_slots("pulse_slots")
+        out2 = panel.collect_values()["pulse_slots"]
+        assert set(out2["api"]) >= {"a1", "a2", "a3"}
     finally:
         if hasattr(panel, "shutdown"):
             panel.shutdown()
@@ -445,12 +439,12 @@ def test_shipped_imaging_template_is_a_continuous_three_trigger_bracket():
     trap = [p for p in st.to_sequence(name="b").pulses if p.channel == "trap" and p.value]
     assert len(cooling) == 1 and len(trap) == 1                 # one cooling load, trap held whole time
 
-    # the two exposures are API slots: a1 on BOTH long reference frames, a2 on the short readout
-    assert st.api_names() == ["a1", "a2"]
-    assert sum(1 for s in st.api_slots if s.name == "a1") == 2  # both long frames share a1
+    # three exposures, three UNIQUE API handles: a1=first long, a2=short readout, a3=second long
+    assert st.api_names() == ["a1", "a2", "a3"]
     # setting the slots by name changes ONLY those durations -> the long-short-long the cali fires
     st.set_api("a1", 0.03)
     st.set_api("a2", 0.008)
+    st.set_api("a3", 0.03)
     probe = [round(p.duration, 6) for p in sorted(
         (p for p in st.to_sequence(name="b").pulses if p.channel == "probe" and p.value), key=lambda p: p.start)]
     assert probe == [pytest.approx(0.03), pytest.approx(0.008), pytest.approx(0.03)]

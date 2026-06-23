@@ -93,6 +93,14 @@ class VirtualTrapArray(TrapArrayDevice):
     # ~18-19 detected photons at the 3 ms reference readout (35-site mean 18.7 ph), and with
     # atom_sigma_px=0.7 this rate renders an all-bright 3 ms frame at that box level.
     atom_rate: float = 2_150.0
+    # Per-site COLLECTION-efficiency variation (relative standard deviation, 1-sigma):
+    # a real Rb87 tweezer array has different effective NA / aberration / vacuum-window
+    # transmission per site, so each site's bright count rate scales by an independently
+    # drawn ``Lognormal(0, sigma)`` multiplier around 1.0.  This is what makes a per-site
+    # PSF kernel materially better than one shared box / one uniform PSF: the per-site
+    # spot brightness varies, so a fixed box averages out signal a per-site kernel can
+    # match.  Default 0.18 (=18% RSD) is a realistic spread on a moderate tweezer array.
+    site_efficiency_sigma: float = 0.18
     # Stray-light + scatter floor (detected photons/s/pixel, always present).  The real v16
     # 3 ms corner-median is ~16.5 counts/px above the 200-count offset -> ~1.8 ph/px/3 ms ->
     # ~600 ph/s/px, so dark sites carry a realistic shot-noise floor (not a near-zero one).
@@ -221,6 +229,25 @@ class VirtualTrapArray(TrapArrayDevice):
         x0, y0 = self.origin_px
         return np.asarray([[x0 + ix * self.spacing_px, y0 + iy * self.spacing_px] for iy in range(ny) for ix in range(nx)], dtype=float)
 
+    def _site_efficiency(self) -> np.ndarray:
+        """Per-site collection-efficiency multiplier (mean ~1.0).  Drawn once per session
+        from ``Lognormal(0, site_efficiency_sigma)`` so each site has a stable bright count
+        rate -- a uniform PSF kernel averages across this spread while a per-site PSF
+        kernel matches each site's own profile, which is precisely why per-site PSF beats
+        uniform PSF on a real Rb87 array.  Cached on first call (re-seeded by ``rng``)."""
+        cache = getattr(self, "_site_eff_cache", None)
+        if cache is not None and cache.size == self.n_sites:
+            return cache
+        sigma = float(getattr(self, "site_efficiency_sigma", 0.0) or 0.0)
+        if sigma <= 0.0:
+            eff = np.ones(self.n_sites, dtype=float)
+        else:
+            # Lognormal with median 1 stays strictly positive; geometric mean = 1, so the
+            # average bright count rate is preserved (only the distribution widens).
+            eff = np.exp(self.rng.normal(0.0, sigma, size=self.n_sites))
+        self._site_eff_cache = eff
+        return eff
+
     def loading_fraction(self, cooling_duration: float | None = None) -> float:
         """Single-atom loading probability per tweezer for a cooling/MOT pulse of
         ``cooling_duration`` s: it SATURATES toward the collisional ceiling
@@ -310,10 +337,14 @@ class VirtualTrapArray(TrapArrayDevice):
         sy = self.atom_sigma_px * asp
         th = radians(self.atom_psf_angle_deg)
         cos_t, sin_t = cos(th), sin(th)
-        for (cx, cy), occupied, t_sig in zip(self._site_centers(), occ, st):
+        eff = self._site_efficiency()
+        for (cx, cy), occupied, t_sig, e in zip(self._site_centers(), occ, st, eff):
             if not occupied or t_sig <= 0.0:
                 continue
-            amplitude = self.atom_rate * float(t_sig)
+            # per-site collection-efficiency multiplier: each tweezer has its OWN bright
+            # count rate (NA / window transmission / aberration vary), so a per-site PSF
+            # kernel materially beats a uniform one on a real array.
+            amplitude = self.atom_rate * float(t_sig) * float(e)
             du = (xx - cx) * cos_t + (yy - cy) * sin_t          # along the major axis
             dv = -(xx - cx) * sin_t + (yy - cy) * cos_t         # minor axis
             core = np.exp(-0.5 * ((du / sx) ** 2 + (dv / sy) ** 2))

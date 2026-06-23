@@ -18,15 +18,15 @@
       "unit": "s"
     },
     {
-      "name": "a1",
-      "kind": "duration",
-      "target": "5",
-      "unit": "s"
-    },
-    {
       "name": "a2",
       "kind": "duration",
       "target": "3",
+      "unit": "s"
+    },
+    {
+      "name": "a3",
+      "kind": "duration",
+      "target": "5",
       "unit": "s"
     }
   ],

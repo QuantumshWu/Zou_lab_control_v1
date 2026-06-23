@@ -1776,6 +1776,11 @@ class FluentTextDialog(QtWidgets.QDialog):
         super().__init__(parent, QtCore.Qt.WindowTitleHint | QtCore.Qt.WindowCloseButtonHint)
         if title:
             self.setWindowTitle(title)
+        # APPLICATION-modal: blocks the whole window (not just the parent card), so the
+        # underlying frame stays visible (no parent-vanishing surprise) but cannot be
+        # clicked while the editor is open.  The parent provides the spawn anchor only.
+        self.setModal(True)
+        self.setWindowModality(QtCore.Qt.ApplicationModal)
         self.setFont(QtGui.QFont(FONT, fluent_font_size()))
         self.setStyleSheet("QDialog { background: white; }")
         layout = QtWidgets.QVBoxLayout(self)

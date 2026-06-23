@@ -94,10 +94,12 @@ class ParamDecl:
 
     def __post_init__(self) -> None:
         kind = str(self.kind).lower()
-        if kind not in ("float", "int", "axis_range", "bool", "choice", "text", "path", "signal", "pulse_param"):
+        if kind not in ("float", "int", "axis_range", "bool", "choice", "text", "path",
+                        "signal", "pulse_param", "pulse_slots"):
             raise ValueError(
                 "ParamDecl.kind must be one of "
-                f"float/int/axis_range/bool/choice/text/path/signal/pulse_param, got {self.kind!r}."
+                "float/int/axis_range/bool/choice/text/path/signal/pulse_param/pulse_slots, "
+                f"got {self.kind!r}."
             )
         object.__setattr__(self, "kind", kind)
         object.__setattr__(self, "key", str(self.key))

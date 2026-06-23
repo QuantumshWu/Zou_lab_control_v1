@@ -44,17 +44,17 @@ def test_remove_period_with_api_slot_does_not_raise_and_remaps():
     from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
 
     state = default_imaging_template()
-    assert state.api_names() == ["a1", "a2"]
+    assert state.api_names() == ["a1", "a2", "a3"]   # one unique handle per exposure cell
     editor = PulseSequenceEditor(state=state)
     try:
-        # remove period 1 (image_0, carries one a1): a1 there is dropped, a1 on 5 -> 4, a2 on 3 -> 2
+        # remove period 1 (image_0, carries a1): a1 is dropped, a2@3 -> 2, a3@5 -> 4
         editor._selected_period = 1
         editor.remove_period()                         # must not raise
         after = editor.read_state()
         assert len(after.periods) == len(state.periods) - 1
-        a1 = sorted(int(s.target) for s in after.api_slots if s.name == "a1")
-        a2 = sorted(int(s.target) for s in after.api_slots if s.name == "a2")
-        assert a1 == [4] and a2 == [2]                 # one a1 dropped, the rest re-indexed
+        targets = {s.name: int(s.target) for s in after.api_slots}
+        assert "a1" not in targets                      # the only a1 was on removed period 1
+        assert targets["a2"] == 2 and targets["a3"] == 4   # later slots re-indexed
         after.validate()                               # the bug: this used to raise
 
         # and removing the LAST period (the other reproduction) is also clean
@@ -170,7 +170,7 @@ def test_plot_panel_has_floating_expression_editor():
 
     card = PanelCard(PanelConfig(kind="1d", title="t", row=0, col=0, size="2x2", source="value"))
     try:
-        assert hasattr(card, "expand_button") and card.expand_button.text() == "⤢"
+        assert hasattr(card, "expand_button") and card.expand_button.text() == "Edit…"
         assert callable(getattr(card, "_open_expr_editor", None))
     finally:
         card.deleteLater()
