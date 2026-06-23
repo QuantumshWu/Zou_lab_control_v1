@@ -160,8 +160,7 @@ def _run_pulse_scan(exp, *, y=None, **build_kwargs):
     # (publishes bare 'occupied'/'rate'/... since prefix="").  Not started on its own thread;
     # pulse-scan settles it INLINE per point (single-threaded determinism, same evaluate path).
     occ = OccupancyProcessor(hub, calibration=exp.readout.require(thresholds=True),
-                             source_expr={"inputs": ["frame"], "source": "value = signal"},
-                             grid_shape=(3, 4))
+                             source_expr={"inputs": ["frame"], "source": "value = signal"}, grid_shape=(3, 4))
     plan.settle = occ.step
     node = PulseScanNode(hub, plan, x_key=spec.x_key, y_key=spec.y_key, prefix=f"{spec.key}_")
     node.run_to_completion()
@@ -203,7 +202,8 @@ def test_pulse_scan_y_tracks_subscribed_occupancy_signal():
     try:
         x, y, node, hub = _run_pulse_scan(
             exp, template=probe,
-            pulse_slots={"api": {}, "scan": {"s0": "linspace(10, 40, 5)"}},
+            pulse_slots={"api": {}, "scan_code": "import numpy as np\n"
+                         "scan_table = np.linspace(10000, 40000, 5).reshape(-1, 1)"},
             n_frames=1, y={"inputs": ["rate"], "source": "value = signal"})
         assert x.shape == (5,) and y.shape == (5,)
         assert np.isfinite(x).all() and np.isfinite(y).all()
@@ -224,7 +224,8 @@ def test_pulse_scan_y_expression_over_multiple_signals():
     try:
         x, y, node, hub = _run_pulse_scan(
             exp, template=probe,
-            pulse_slots={"api": {}, "scan": {"s0": "[10, 20, 30]"}},
+            pulse_slots={"api": {}, "scan_code": "import numpy as np\n"
+                         "scan_table = np.array([10000, 20000, 30000]).reshape(-1, 1)"},
             n_frames=1, y={"inputs": ["occupied"], "source": "value = np.mean(signal)"})
         assert x.shape == (3,) and y.shape == (3,)
         assert np.isfinite(y).all() and np.all((y >= 0.0) & (y <= 1.0))
@@ -246,37 +247,39 @@ def test_pulse_scan_api_value_is_applied_once_at_build():
         st.bind_api_field("delay", ch, unit="us")
         st.save(probe)
         spec = {s.name: s for s in exp.readout.measurement_specs()}["Pulse scan"]
+        scan_code = "import numpy as np\nscan_table = np.linspace(1000, 3000, 3).reshape(-1, 1)"
         plan = spec.build(template=probe,
-                          pulse_slots={"api": {"a1": 1.5}, "scan": {"s0": "linspace(1, 3, 3)"}})
+                          pulse_slots={"api": {"a1": 1.5}, "scan_code": scan_code})
         assert plan.base_state.delays.get(ch) == pytest.approx(1.5)
         with pytest.raises(ValueError):
             spec.build(template=probe,
-                       pulse_slots={"api": {"a9": 1.0}, "scan": {"s0": "linspace(1, 3, 3)"}})
+                       pulse_slots={"api": {"a9": 1.0}, "scan_code": scan_code})
     finally:
         _safe_unlink(probe)
         exp.close()
 
 
-def test_pulse_scan_missing_scan_points_raises():
-    """A scan slot WITHOUT a points expression fails LOUD: every swept slot needs a sweep
-    array (no silent freeze at nominal)."""
+def test_pulse_scan_empty_program_uses_column_stack_default():
+    """An empty scan program is not an error -- it falls back to the column_stack template for
+    the bound slot count (the scan model is ONE table; the default is a usable starting table)."""
     exp = _calibrated()
     probe = _bound_probe_with_scan(exp)
     try:
         spec = {s.name: s for s in exp.readout.measurement_specs()}["Pulse scan"]
-        with pytest.raises(ValueError, match="no points expression"):
-            spec.build(template=probe, pulse_slots={"api": {}, "scan": {"s0": ""}})
+        plan = spec.build(template=probe, pulse_slots={"api": {}, "scan_code": ""})
+        assert plan.scan_names == ["s0"]
+        assert plan.scan_arrays[0].size >= 1            # the default column_stack sweep ran
     finally:
         _safe_unlink(probe)
         exp.close()
 
 
-def test_pulse_scan_mismatched_lockstep_sizes_raise():
-    """Two scan slots advanced in lockstep must have the SAME number of points -- mismatched
-    sizes fail LOUD."""
+def test_pulse_scan_table_column_count_must_match_slots():
+    """The scan table is ONE (N_points x n_slots) array -- the slots advance in lockstep, so the
+    program must give ONE column per bound scan slot.  A wrong column count fails LOUD (a 1-column
+    table for a TWO-slot template is rejected, not silently padded)."""
     exp = _calibrated()
-    # build a template with TWO scan slots
-    from Zou_lab_control.neutral_atom.timing import PulseTableState, single_imaging_template
+    from Zou_lab_control.neutral_atom.timing import single_imaging_template
     st = single_imaging_template()
     st.add_period(20.0, name="probe2", unit="us")
     st.bind_field("duration", "1", unit="us")
@@ -285,10 +288,10 @@ def test_pulse_scan_mismatched_lockstep_sizes_raise():
     st.save(str(probe))
     try:
         spec = {s.name: s for s in exp.readout.measurement_specs()}["Pulse scan"]
-        with pytest.raises(ValueError, match=r"(?i)same number of points"):
+        with pytest.raises(ValueError, match=r"(?i)column.*2 scan slot"):
             spec.build(template=str(probe),
-                       pulse_slots={"api": {}, "scan": {"s0": "linspace(0, 5, 3)",
-                                                        "s1": "linspace(0, 5, 4)"}})
+                       pulse_slots={"api": {}, "scan_code": "import numpy as np\n"
+                                    "scan_table = np.linspace(0, 5000, 3).reshape(-1, 1)"})  # only 1 column
     finally:
         _safe_unlink(probe)
         exp.close()

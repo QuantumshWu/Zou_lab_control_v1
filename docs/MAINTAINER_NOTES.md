@@ -1229,7 +1229,34 @@ the producer (occupancy) FIRST, then pulse-scan.
 + y `SignalExpr` + n_frames); the spec carries `metadata={"node": "pulse_scan"}` and the console
 builds a `PulseScanNode` (not a `ScannedMeasurementNode`) when it sees that tag. The reducer /
 calibration / `reduce` / `shots` params are gone; the params are now `template` + `pulse_slots`
-(api + scan auto-form) + `y` (signal_expr) + `n_frames`.
+(api + scan-table program) + `y` (signal_expr) + `n_frames`.
+
+### Scan POINTS are ONE `scan_table` program (the pulse-GUI model), not per-slot
+The scan points are a single `(N_points x n_slots)` table — one ROW per scan point, one COLUMN
+per bound scan slot, the slots advanced in LOCKSTEP — built by a small Python program assigned to
+`scan_table`, EXACTLY like the pulse GUI Scan tab. There is no separate points box per slot. The
+templates (`column_stack` default, `grid`) + the evaluator live ONCE in
+`timing/pulse_table.py::scan_table_template` / `evaluate_scan_table_code` (analysis layer, so both
+GUIs + `build()` share them; `pulse_gui._template_*` delegate to them). `build()` evaluates the
+program, then `snap_scan_table(..., time_step_ns=state.time_step_ns, dac_ranges=...)` makes each
+column hardware-legal IN ITS NATIVE UNIT (a duration column → whole clock ticks in ns, a DAC
+column → integer LSB code — the axis unit is derived per slot KIND, never assumed to be time).
+The column count MUST equal the bound slot count (lockstep contract), else `build()` raises. The
+GUI `_PulseSlotsWidget` renders one numeric row per api slot + ONE `FluentCodeEdit` for the whole
+scan table + `column_stack`/`grid` buttons + a per-`sN` column legend; its value is
+`{"api": {...}, "scan_code": "<python>"}`.
+
+### One source MECHANISM everywhere; per-kind only the slot-count + the value SIZE
+The signal-picker + `value = ...` expression box (the `SignalExpr` mechanism) is on EVERY source
+field — every plot kind (the site map included), the occupancy source, the pulse-scan y. What
+differs per plot kind is only (a) whether it can GROW slots (`+signal` / `−signal`) and (b) the
+SHAPE its `value` must be. Both are data-driven, never an inline `kind == "sites"` check:
+`panel_allows_multi_slot` / `PANEL_SINGLE_SLOT_KINDS` declare the site map single-slot (its ring
+centres + frame underlay resolve from `signal[0]`'s producing node, so a 2nd slot is meaningless)
+— it keeps the expression box but has NO `+/-`; every other kind is multi-slot. `PANEL_INPUT_FORMAT`
+declares the accepted `value` size (sites = a per-site `(N,)` vector, 2D = an `(H×W)` frame,
+monitor = a scalar), enforced in `PanelCard._coerce`. Guard: `test_task_cali_modes_and_plot_split`
+asserts sites is single-slot (no `add_slot_button`, keeps `source_edit`) while 2D is multi.
 
 ### Every `kind="signal"` source is now `signal_expr`
 The new `ParamDecl` kind `"signal_expr"` (whitelisted in `measurement.py::ParamDecl.__post_init__`

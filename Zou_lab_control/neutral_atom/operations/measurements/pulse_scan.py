@@ -27,17 +27,16 @@ from typing import Mapping, Sequence
 import numpy as np
 
 from ...core.analysis import positive_int
-from ...timing import PulseTableState, single_imaging_template
-from ...timing.sequence import snap_seconds_to_clock
+from ...timing import (
+    PulseTableState,
+    evaluate_scan_table_code,
+    scan_table_template,
+    single_imaging_template,
+    snap_scan_table,
+)
 from ..measurement import MeasurementSpec, ParamDecl
 from ..measurement_registry import measurement
 from ..signal_expr import SignalExpr
-
-# A duration scan slot's points are entered in microseconds; a DAC scan slot's points are
-# unitless signed LSB codes.  An API slot's value is entered in the slot's own unit (set
-# at bind time -- ns for time fields, signed LSB for DAC).
-_TIME_KINDS = ("duration", "delay")
-_TIME_UNIT = "us"
 
 #: A pulse scan images ONCE per point, so the default pulse is the SINGLE-image probe template
 #: (one camera trigger) -- NOT the Calibrate task's long-short-long bracket.
@@ -74,61 +73,45 @@ def _resolve_probe_template(template: str) -> PulseTableState:
     return single_imaging_template()
 
 
-def _evaluate_points_expression(expr: str) -> np.ndarray:
-    """Evaluate a 1-D points expression in a small numpy namespace and return a clean float
-    array.  Accepts ``np.linspace(0, 50, 11)`` / ``linspace(0, 50, 11)`` / ``[0, 5, 10]``
-    / ``range(0, 50, 5)``.  Raises a CLEAR error on something the user can fix."""
+def _scan_table_arrays(state: PulseTableState, scan_code: str) -> tuple[list[str], list[np.ndarray]]:
+    """Evaluate the scan PROGRAM into per-slot arrays (one array per bound scan slot, in slot
+    order).
 
-    text = str(expr or "").strip()
-    if not text:
-        raise ValueError("scan-slot points expression is empty -- give a list or linspace(...).")
-    namespace = {"np": np, "numpy": np, "linspace": np.linspace, "arange": np.arange,
-                 "logspace": np.logspace, "array": np.array, "list": list, "range": range}
-    try:
-        out = eval(text, {"__builtins__": {}}, namespace)   # noqa: S307 - local experiment tool
-    except Exception as exc:
-        raise ValueError(f"scan-slot points expression {text!r} did not evaluate: {exc}") from exc
-    arr = np.asarray(out, dtype=float).reshape(-1)
-    if arr.size == 0:
-        raise ValueError(f"scan-slot points {text!r} produced 0 points.")
-    return arr
+    The program builds ONE ``(N_points x n_slots)`` table -- the slots advance in LOCKSTEP, one
+    row per scan point -- which is then snapped to the hardware grid via the SAME ``snap_scan_table``
+    the pulse GUI + server use (durations -> whole clock ticks, DAC -> integer codes in range).
+    The points are NOT set per slot in isolation: the whole table is one object, so correlations
+    between slots are expressed by how the columns are built.  Returns ``(slot names, columns)``."""
 
-
-def _scan_slot_values(state: PulseTableState, scan_spec: Mapping[str, str]) -> tuple[list[str], list[np.ndarray]]:
-    """For each declared scan slot ``sN``, return its evaluated array, in slot order.  Every
-    scan slot in ``state`` must have an entry in ``scan_spec`` (so every swept parameter has
-    been given points -- nothing silently freezes at its nominal); each array must have the
-    SAME length (the sweep advances every slot in lockstep)."""
-
-    names = [f"s{i}" for i, _ in enumerate(state.scan_slots)]
-    arrays: list[np.ndarray] = []
-    for slot_name in names:
-        expr = str(scan_spec.get(slot_name, "")).strip()
-        if not expr:
-            raise ValueError(f"scan slot {slot_name!r} has no points expression "
-                             "(give a list or linspace(...) for every scan slot the template has).")
-        arrays.append(_evaluate_points_expression(expr))
-    if len({a.size for a in arrays}) > 1:
-        sizes = {n: a.size for n, a in zip(names, arrays)}
+    names = [f"s{i}" for i in range(len(state.scan_slots))]
+    if not names:
         raise ValueError(
-            "every scan slot needs the SAME number of points (advanced in lockstep); "
-            f"got {sizes}.  Use the SAME N in every linspace(...,N) / list of N values.")
+            "the pulse template has no scan slot bound -- in the pulse GUI Edit tab, click the dot "
+            "next to a duration or DAC value to bind a scan slot (sN), then give a scan program.")
+    table = evaluate_scan_table_code(scan_code, len(names))            # N x n_slots, slot-native units
+    snapped = snap_scan_table(table, state.scan_slots, time_step_ns=state.time_step_ns,
+                              dac_ranges=state.scan_slot_dac_ranges())  # hardware-legal table
+    columns = list(zip(*snapped))                                      # one column per slot, length N
+    arrays = [np.asarray(col, dtype=float) for col in columns]
     return names, arrays
 
 
 def _label_for_first_scan_slot(state: PulseTableState) -> tuple[str, str]:
-    """``(axis label, axis unit)`` for the first scan slot of the template (drives the live
-    plot's x label).  Empty -> the axis is point INDEX."""
+    """``(axis label, axis unit)`` for the FIRST scan slot (drives the live plot's x label).
+
+    The unit is the slot's NATIVE unit -- it is NOT assumed to be time: a duration slot's column
+    is whole clock ticks in nanoseconds, a DAC slot's column is signed integer code (LSB, 0 = 0 V).
+    Empty / no scan slot -> the axis is point INDEX."""
 
     if not state.scan_slots:
         return ("point", "")
     slot = state.scan_slots[0]
     name = slot.label or f"{slot.kind} {slot.target}"
-    if slot.kind == "duration":
-        return (f"{name}", _TIME_UNIT)
     if slot.kind == "dac":
-        return (f"{name}", "LSB")
-    return (name, "")
+        return (name, "LSB")
+    if slot.kind == "duration":
+        return (name, "ns")                       # the snapped scan-table column is in ns
+    return (name, str(getattr(slot, "unit", "") or ""))
 
 
 class PulseScanPlan:
@@ -172,29 +155,20 @@ def pulse_scan(readout) -> MeasurementSpec:
         state = _resolve_probe_template(template)
         spec = dict(pulse_slots or {})
         api_values: Mapping[str, float] = dict(spec.get("api") or {})
-        scan_spec: Mapping[str, str] = dict(spec.get("scan") or {})
+        scan_code = str(spec.get("scan_code") or "")
 
         # Apply api values ONCE; reject typos (set_api raises for unknown handle names).
         for name, value in api_values.items():
             if str(value).strip() == "":
                 continue                                       # leave the template's value
             state.set_api(name, float(value))
-        # Resolve every scan slot's points expression to a 1-D array (all the same length).
-        # A duration slot's unit is ALWAYS "ns" inside ``ScanSlot`` (bind_field pins it), but
-        # the operator enters microseconds in the form (the natural unit for an exposure);
-        # convert us -> ns here and snap each time value to the sequencer clock grid so the
-        # fired durations land on whole ticks and the plotted x is what actually ran.
-        scan_names, scan_arrays = _scan_slot_values(state, scan_spec)
-        clock = float(getattr(s.devices.sequencer, "clock_hz", 0.0) or 0.0)
-        for k, name in enumerate(scan_names):
-            slot = state.scan_slots[int(name[1:])]
-            if slot.kind == "duration":
-                arr_ns = scan_arrays[k] * 1000.0                    # us -> ns
-                if clock > 0.0:
-                    arr_ns = np.array([snap_seconds_to_clock(v * 1e-9, clock) * 1e9 for v in arr_ns],
-                                      dtype=float)
-                scan_arrays[k] = arr_ns
-
+        # The scan POINTS are ONE table: the scan program builds an (N_points x n_slots) array
+        # (one row per point, one column per slot) -- the slots advance in LOCKSTEP, snapped to the
+        # hardware grid in each slot's NATIVE unit (ns ticks for a duration, integer code for a DAC).
+        # Empty program -> the column_stack default for the bound slot count.
+        if not scan_code.strip():
+            scan_code = scan_table_template("column_stack", len(state.scan_slots))
+        scan_names, scan_arrays = _scan_table_arrays(state, scan_code)
         axis_label, axis_unit = _label_for_first_scan_slot(state)
         y_expr = SignalExpr.from_value(y if y is not None else DEFAULT_Y_SOURCE)
         return PulseScanPlan(
@@ -205,10 +179,12 @@ def pulse_scan(readout) -> MeasurementSpec:
         ParamDecl("template", "Pulse template", "path", default=DEFAULT_PROBE_TEMPLATE,
                   path_mode="file", base_dir="pulses", file_filter="Pulse program (*.json);;All files (*)",
                   tooltip="The pulse program fired each point.  Its api / scan slots populate the "
-                          "auto-form below (one numeric input per api slot, one points expression per scan slot)."),
+                          "auto-form below (one numeric input per api slot + ONE scan-table program)."),
         ParamDecl("pulse_slots", "Slots", "pulse_slots", default={}, depends_on="template",
-                  tooltip="One numeric input per API slot (the fixed operator-set value), one "
-                          "points expression per scan slot (the sweep -- list or linspace(...); this is x)."),
+                  tooltip="One numeric input per API slot (the fixed operator-set value), and ONE scan "
+                          "program that builds the (N_points x n_slots) scan table -- one row per point, "
+                          "one column per scan slot, advanced in lockstep (this is x).  Same model as the "
+                          "pulse GUI Scan tab (column_stack / grid templates)."),
         ParamDecl("y", "Signal (y)", "signal_expr", default=dict(DEFAULT_Y_SOURCE),
                   tooltip="The y recorded per point.  Pick a signal published by ANOTHER running node "
                           "(e.g. a Judge-occupancy processor's loading 'rate') and combine via value = ... .  "

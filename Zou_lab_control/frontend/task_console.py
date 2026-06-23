@@ -64,6 +64,7 @@ from .qt_fluent import (
     TEXT,
     YELLOW,
     FluentButton,
+    FluentCodeEdit,
     FluentComboBox,
     FluentDoubleSpinBox,
     FluentFrame,
@@ -123,27 +124,32 @@ PANEL_KINDS: dict[str, str] = {
 # What signal SHAPE each plot kind expects as its ``value`` -- shown in the panel's
 # Setting so it is clear which signals fit (e.g. a Site map wants a per-site vector,
 # a 2D image wants a frame).  Single source for the panel's input self-documentation.
+# The ACCEPTED ``value`` size/shape per plot kind -- the ONE per-kind contract (everything
+# else about the source, the multi-slot picker + ``value = ...`` expression, is universal and
+# kind-agnostic).  Shown in the Setting + enforced in _coerce.
 PANEL_INPUT_FORMAT: dict[str, str] = {
-    "2d": "a 2D array / camera frame (H×W)",
-    "sites": "a per-site (N,) occupancy vector (centres + frame come with it)",
-    "1d": "a 1D vector (N,) or per-site array",
-    "monitor": "a scalar per shot (rolling trace)",
-    "monitor_nodist": "a scalar per shot (rolling trace)",
-    "hist": "a 1D sample vector",
+    "2d": "value must be a 2D array / camera frame (H×W)",
+    "sites": "value must be a per-site (N,) vector -- one number per tweezer (e.g. occupancy "
+             "0/1 or loading rate); signal[0]'s producing node also supplies the ring centres "
+             "+ frame underlay",
+    "1d": "value must be a 1D vector (N,) or per-site array",
+    "monitor": "value must be a scalar per shot (rolling trace)",
+    "monitor_nodist": "value must be a scalar per shot (rolling trace)",
+    "hist": "value must be a 1D sample vector",
 }
 
-# The ONE input each plot kind takes (label, default-signal, tooltip).  A plot reads its
-# picked input as ``signal`` in the source expression (``value = signal``); the site map
-# takes only its occupancy signal and resolves the ring centres + frame underlay from the
-# SAME producing node (never extra slots).  This stays a one-tuple list so the Setting's
-# slot machinery + saved-layout ``inputs`` list keep one uniform shape.
+# The STARTING slot(s) each plot kind opens with (label, default-signal, tooltip).  Every kind
+# uses the SAME source MECHANISM (a signal picker + a ``value = ...`` expression box); whether a
+# kind can GROW extra slots (+signal / −signal) is declared by PANEL_SINGLE_SLOT_KINDS below
+# (the site map is single-slot).  A plot reads its picked input(s) as ``signal`` / ``signal[i]``.
 # Each slot = (label, default-signal-name, tooltip).
 _DEFAULT_SLOTS = (("signal", "", "the hub signal to plot"),)
-# The site map takes ONE signal -- the per-site occupancy.  Its site CENTRES and the
-# camera-frame UNDERLAY are resolved from the SAME producing node (the OccupancyProcessor
-# publishes occupied + centers + frame_judged together, declared via its spec metadata
-# centers_key / image_key), so the rings + underlay are always the same shot and the user
-# picks just the occupancy (see PanelCard._sites_aux + TaskConsole._sites_inputs).
+# The site map OPENS with one slot for its per-site occupancy.  signal[0]'s producing node also
+# supplies the ring CENTRES + camera-frame UNDERLAY (the OccupancyProcessor publishes occupied +
+# centers + frame_judged together, declared via its spec metadata centers_key / image_key), so
+# the rings + underlay are always the same shot -- the user picks just the occupancy and the rest
+# auto-resolves (see PanelCard._sites_aux + TaskConsole._sites_inputs).  The value the expression
+# produces must be a per-site (N,) vector (PANEL_INPUT_FORMAT["sites"]).
 PANEL_INPUT_SLOTS: dict[str, tuple[tuple[str, str, str], ...]] = {
     "sites": (
         # BLANK default (like every other plot) -- a fresh site-map panel must NOT auto-bind
@@ -151,16 +157,32 @@ PANEL_INPUT_SLOTS: dict[str, tuple[tuple[str, str, str], ...]] = {
         # Setting, and only THEN do the centres + frame underlay auto-resolve from that signal's
         # producing node (_sites_inputs).  A non-blank default here was the "opens already
         # connected" bug.
-        ("occupancy", "", "per-site (N,) occupancy vector -- colours the rings; its "
+        ("occupancy", "", "per-site (N,) occupancy vector (signal[0]) -- colours the rings; its "
                           "producing node also supplies the centres + frame underlay"),
     ),
 }
+
+# The per-kind declaration of which plot kinds take EXACTLY ONE signal (no +signal / −signal
+# slot-growing).  The signal-expression MECHANISM (the picker + ``value = ...`` box + evaluator)
+# is universal -- every kind has it -- but a SINGLE-slot kind cannot add more slots because its
+# auxiliary data is resolved from signal[0]: the site map pulls its ring centres + frame underlay
+# from signal[0]'s producing node, so a 2nd signal slot would be meaningless.  This is the ONE
+# declared source of "single vs multi slot"; PanelCard reads it (no inline per-kind check).
+PANEL_SINGLE_SLOT_KINDS: frozenset = frozenset({"sites"})
 
 
 def panel_input_slots(kind: str) -> tuple[tuple[str, str, str], ...]:
     """The input slots for a plot kind -- ``[(label, default_signal, tooltip)]``.  The
     SINGLE source of how many signals a plot consumes and what each means."""
     return PANEL_INPUT_SLOTS.get(str(kind), _DEFAULT_SLOTS)
+
+
+def panel_allows_multi_slot(kind: str) -> bool:
+    """Whether a plot kind can grow extra signal slots (+signal / −signal).  Data-driven from
+    ``PANEL_SINGLE_SLOT_KINDS`` -- the site map is single-slot (its centres/underlay come from
+    signal[0]); every other kind is multi-slot.  Read by PanelCard so the slot UI is declared
+    in ONE place, never an inline ``kind == 'sites'`` check scattered through the widget."""
+    return str(kind) not in PANEL_SINGLE_SLOT_KINDS
 
 
 def _common_token_prefix(names) -> str:
@@ -255,15 +277,18 @@ def read_editable_combo(combo) -> str:
 class _PulseSlotsWidget(QtWidgets.QWidget):
     """Auto-built sub-form for a pulse template's API + scan slots.
 
-    One numeric row per API slot (``a1``, ``a2``, ...): the operator-set value the slot binds,
-    in the slot's own unit, seeded from the template's current value.  One text row per scan
-    slot (``s0``, ``s1``, ...): a 1-D points expression (``linspace(0, 50, 11)`` / a list) the
-    measurement evaluates to a sweep array.  Rebuilds in place when the template changes; the
-    operator's typed values survive a rebuild for slots that still exist (by name).
+    One numeric row per API slot (``a1``, ``a2``, ...): the FIXED operator-set value, in the
+    slot's own unit, seeded from the template's current value.
 
-    Output schema: ``{"api": {a1: float, ...}, "scan": {s0: "expr", ...}}``.  The single
-    source for "drive a pulse measurement", so a new measurement that takes a pulse template
-    gets this row for free."""
+    Then ONE scan-table program for ALL scan slots TOGETHER (``s0``, ``s1``, ...): the operator
+    writes Python that builds an ``(N_points x n_slots)`` array assigned to ``scan_table`` -- one
+    ROW per scan point, one COLUMN per scan slot, advanced in LOCKSTEP.  This is the SAME scan
+    model as the pulse GUI Scan tab (``column_stack`` / ``grid`` templates), NOT a separate points
+    box per slot: the points are one table, so correlations between slots are expressed by how the
+    columns are built.  A column legend shows what each ``sN`` column means + its native unit.
+
+    Output schema: ``{"api": {a1: float, ...}, "scan_code": "<python>"}`` (the build evaluates the
+    program into the table via the shared ``evaluate_scan_table_code`` + ``snap_scan_table``)."""
 
     changed = QtCore.pyqtSignal()
 
@@ -271,67 +296,111 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
         super().__init__(parent)
         self.setStyleSheet("background: transparent;")
         self._api_widgets: dict[str, QtWidgets.QWidget] = {}
-        self._scan_widgets: dict[str, QtWidgets.QWidget] = {}
-        # remember what the operator typed across template reloads (by slot name)
-        self._api_remembered: dict[str, str] = {}
-        self._scan_remembered: dict[str, str] = {}
-        self._form = QtWidgets.QFormLayout(self)
-        self._form.setContentsMargins(0, 0, 0, 0)
-        self._form.setSpacing(scaled_px(4, minimum=3))
-        self._form.setLabelAlignment(QtCore.Qt.AlignRight)
+        self._api_remembered: dict[str, str] = {}     # typed api values, kept across reloads
+        self._scan_remembered: str = ""               # typed scan program, kept across reloads
+        self._scan_code = None                        # the FluentCodeEdit (None until first scan slot)
+        self._n_slots = 0
+        self._box = QtWidgets.QVBoxLayout(self)
+        self._box.setContentsMargins(0, 0, 0, 0)
+        self._box.setSpacing(scaled_px(6, minimum=4))
 
     def _clear(self) -> None:
-        for w in list(self._api_widgets.values()) + list(self._scan_widgets.values()):
-            w.setParent(None); w.deleteLater()
-        self._api_widgets.clear()
-        self._scan_widgets.clear()
-        while self._form.count():
-            item = self._form.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.setParent(None); w.deleteLater()
+        """Tear down every child widget + nested layout (the form is rebuilt from scratch)."""
+        def _drop(layout):
+            while layout.count():
+                item = layout.takeAt(0)
+                w = item.widget()
+                if w is not None:
+                    w.setParent(None); w.deleteLater()
+                child = item.layout()
+                if child is not None:
+                    _drop(child)
+        _drop(self._box)
+        self._api_widgets = {}
+        self._scan_code = None
 
     def rebuild(self, api_rows, scan_rows) -> None:
         """``api_rows`` = ``[(name, kind, target, unit, current_value), ...]``.
-        ``scan_rows`` = ``[(name, kind, target, unit, label), ...]``."""
+        ``scan_rows`` = ``[(name, kind, target, unit, label), ...]`` (the bound scan slots = the
+        columns of the scan table)."""
         # remember whatever the operator currently typed, then rebuild
         for name, w in list(self._api_widgets.items()):
             self._api_remembered[name] = w.text().strip()
-        for name, w in list(self._scan_widgets.items()):
-            self._scan_remembered[name] = w.text().strip()
+        if self._scan_code is not None:
+            self._scan_remembered = self._scan_code.toPlainText()
         self._clear()
-        if not api_rows and not scan_rows:
-            note = FluentLabel("(template has no API or scan slots; nothing to set here.)", self)
+        self._n_slots = len(scan_rows)
+
+        if api_rows:
+            self._box.addWidget(FluentSectionLabel("API slots (fixed values)"))
+            api_form = QtWidgets.QFormLayout()
+            api_form.setContentsMargins(0, 0, 0, 0)
+            api_form.setSpacing(scaled_px(4, minimum=3))
+            api_form.setLabelAlignment(QtCore.Qt.AlignRight)
+            for name, kind, target, unit, current in api_rows:
+                label = f"{name}  ({kind} @ {target})"
+                edit = FluentLineEdit(self._api_remembered.get(name) or f"{float(current):g}", self)
+                edit.setMinimumWidth(scaled_px(140, minimum=110))
+                edit.setPlaceholderText(f"{unit}")
+                edit.setToolTip(f"Numeric value for API slot {name!r} (unit: {unit}).")
+                edit.textChanged.connect(self.changed)
+                api_form.addRow(label, edit)
+                self._api_widgets[name] = edit
+            self._box.addLayout(api_form)
+
+        # ---- ONE scan-table program for all scan slots together ----------------------
+        self._box.addWidget(FluentSectionLabel("Scan table (one program for all scan slots)"))
+        if not scan_rows:
+            note = FluentLabel("(no scan slot bound -- in the pulse GUI Edit tab, click the dot next "
+                               "to a duration / DAC value to bind a scan slot sN, then a program appears here.)", self)
+            note.setWordWrap(True)
             note.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
-            self._form.addRow(note)
+            self._box.addWidget(note)
             self.changed.emit()
             return
-        for name, kind, target, unit, current in api_rows:
-            label = f"{name}  ({kind} @ {target})"
-            edit = FluentLineEdit(self._api_remembered.get(name) or f"{float(current):g}", self)
-            edit.setMinimumWidth(scaled_px(140, minimum=110))
-            edit.setPlaceholderText(f"{unit}")
-            edit.setToolTip(f"Numeric value for API slot {name!r} (unit: {unit}).")
-            edit.textChanged.connect(self.changed)
-            self._form.addRow(label, edit)
-            self._api_widgets[name] = edit
-        for name, kind, target, unit, slot_label in scan_rows:
+        # Column legend: what each sN column is, in its NATIVE unit (NOT assumed to be time).
+        legend = ["Columns of scan_table (one row = one scan point, slots advance in lockstep):"]
+        for i, (name, kind, target, unit, slot_label) in enumerate(scan_rows):
             disp = slot_label or f"{kind} @ {target}"
-            label = f"{name}  ({disp})"
-            seeded = self._scan_remembered.get(name) or "linspace(0, 50, 11)"
-            edit = FluentLineEdit(seeded, self)
-            edit.setMinimumWidth(scaled_px(200, minimum=160))
-            edit.setPlaceholderText("linspace(start, stop, N)")
-            edit.setToolTip(f"Points expression for scan slot {name!r} (a 1-D list / linspace / arange).")
-            edit.textChanged.connect(self.changed)
-            self._form.addRow(label, edit)
-            self._scan_widgets[name] = edit
+            u = "ns ticks" if kind == "duration" else ("integer code (LSB)" if kind == "dac" else (unit or ""))
+            legend.append(f"  s{i}: {disp}  [{u}]")
+        legend_label = FluentLabel("\n".join(legend), self)
+        legend_label.setWordWrap(True)
+        legend_label.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+        self._box.addWidget(legend_label)
+        # template buttons (adapt to the bound slot count) -- the SAME templates the pulse GUI uses
+        from ..neutral_atom.timing import scan_table_template
+        seed = self._scan_remembered.strip() or scan_table_template("column_stack", self._n_slots)
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.setContentsMargins(0, 0, 0, 0)
+        btn_row.setSpacing(scaled_px(6, minimum=4))
+        btn_row.addWidget(FluentLabel("template:", self))
+        cs = FluentButton("column_stack", color=GREY)
+        cs.setToolTip("Insert the column_stack template (one column per slot), adapted to the bound slots.")
+        cs.clicked.connect(lambda: self._insert_template("column_stack"))
+        gr = FluentButton("grid", color=GREY)
+        gr.setToolTip("Insert the grid template (every combination of the axis arrays).")
+        gr.clicked.connect(lambda: self._insert_template("grid"))
+        btn_row.addWidget(cs, 0)
+        btn_row.addWidget(gr, 0)
+        btn_row.addStretch(1)
+        self._box.addLayout(btn_row)
+        self._scan_code = FluentCodeEdit(seed)
+        self._scan_code.setMinimumHeight(scaled_px(120, minimum=90))
+        self._scan_code.setToolTip("Python that assigns an (N_points x n_slots) array to 'scan_table' "
+                                   "(one column per scan slot, in the slot's native unit).")
+        self._scan_code.textChanged.connect(self.changed)
+        self._box.addWidget(self._scan_code)
         self.changed.emit()
 
+    def _insert_template(self, kind: str) -> None:
+        from ..neutral_atom.timing import scan_table_template
+        if self._scan_code is not None:
+            self._scan_code.setPlainText(scan_table_template(kind, max(1, self._n_slots)))
+
     def values_dict(self) -> dict:
-        """The current ``{"api": {name: float}, "scan": {name: expression}}`` snapshot.  An
-        empty / blank api row is dropped (keeps the template's value); scan rows are passed
-        through as strings (the measurement evaluates them)."""
+        """The current ``{"api": {name: float}, "scan_code": "<python>"}`` snapshot.  An empty /
+        blank api row is dropped (keeps the template's value)."""
         api: dict[str, float] = {}
         for name, w in self._api_widgets.items():
             text = w.text().strip()
@@ -341,14 +410,14 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
                 api[name] = float(text)
             except ValueError:
                 continue
-        scan = {name: w.text().strip() for name, w in self._scan_widgets.items()}
-        return {"api": api, "scan": scan}
+        code = self._scan_code.toPlainText() if self._scan_code is not None else ""
+        return {"api": api, "scan_code": code}
 
     def has_scan_rows(self) -> bool:
-        return bool(self._scan_widgets)
+        return self._n_slots > 0
 
     def all_scan_rows_filled(self) -> bool:
-        return all(w.text().strip() for w in self._scan_widgets.values())
+        return self._scan_code is not None and bool(self._scan_code.toPlainText().strip())
 
 
 # The ONE description of a source expression's namespace -- owned by operations.signal_expr
@@ -1201,12 +1270,15 @@ class PanelCard(FluentGroupBox):
         # "signal[0] occupancy" -- measure every label this popup will show and widen the
         # column to the widest (floored at 80 px), so all rows still align and read fully.
         base_slots = panel_input_slots(self.config.kind)
-        # The site map has ONE fixed occupancy slot (its centres + underlay auto-resolve from
-        # the producing node, never extra slots); every other plot kind supports MULTI-INPUT --
-        # the user can ADD signal slots so an expression reads signal[0], signal[1], ...  (e.g.
-        # `value = signal[0] - signal[1]`).  The slot count = the base, grown to fit however many
-        # the user has added (config.inputs), never fewer than one.
-        self._multi_slot = self.config.kind != "sites"
+        # EVERY plot kind uses the SAME source MECHANISM: a signal picker + a ``value = ...``
+        # expression (the reusable SignalExpr).  Whether a kind can GROW extra slots
+        # (+signal / −signal) is data-driven from the per-kind declaration
+        # (``panel_allows_multi_slot`` / PANEL_SINGLE_SLOT_KINDS), NOT an inline ``kind == 'sites'``
+        # check: a site map takes EXACTLY ONE occupancy signal (its ring centres + frame underlay
+        # resolve from signal[0]'s producing node, so a 2nd slot is meaningless) -> single picker,
+        # no +/-, but it STILL has the expression box.  The per-kind value SHAPE is enforced in
+        # _coerce (PANEL_INPUT_FORMAT): sites = a per-site (N,) vector, 2D = an (H×W) frame, etc.
+        self._multi_slot = panel_allows_multi_slot(self.config.kind)
         n_slots = max(1, len(base_slots), len(self.config.inputs)) if self._multi_slot else max(1, len(base_slots))
         slot_labels = [(f"signal[{i}]" if n_slots > 1 else "signal") for i in range(n_slots)]
         slot_tips = [base_slots[i][2] if i < len(base_slots)
@@ -2426,7 +2498,7 @@ class MeasurementPanel(QtWidgets.QWidget):
                 # one numeric input per API slot (a1/a2/...) and one points-expression input per
                 # scan slot (s0/s1/...).  When the template path changes the form rebuilds; when
                 # the operator types into a sub-row the value is collected as
-                # {"api": {name: float}, "scan": {name: text-expression}} -- the same shape the
+                # {"api": {name: float}, "scan_code": "<python>"} -- the same shape the
                 # pulse_scan build() consumes.  ONE source for the pulse slot form,
                 # so a NEW measurement that takes a pulse template gets this row for free.
                 widget = _PulseSlotsWidget()
@@ -2569,7 +2641,7 @@ class MeasurementPanel(QtWidgets.QWidget):
                 # the "kind:target" token (combo data) or the typed text, same editable-combo rule
                 values[key] = read_editable_combo(entry[1])
             elif tag == "pulse_slots":
-                # auto-form output: {"api": {a1: 1e-3, ...}, "scan": {s0: "linspace(...)", ...}}
+                # auto-form output: {"api": {a1: 1e-3, ...}, "scan_code": "<python scan_table program>"}
                 values[key] = entry[1].values_dict()
             elif tag == "signal_expr":
                 # multi-slot signal + expression: {"inputs": [...], "source": "value = ..."}

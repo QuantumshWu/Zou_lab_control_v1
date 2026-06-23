@@ -458,11 +458,11 @@ class OccupancyProcessor(Processor):
     def __init__(self, hub: SignalHub, *, calibration=None, calibration_source=None,
                  source_expr=None, grid_shape: tuple[int, int] | None = None,
                  method: str | None = None, prefix: str = ""):
-        # The frame this node judges is a MULTI-slot signal expression (the same one a plot
-        # panel / pulse-scan use): pick one or more hub signals and combine them.  The default
-        # is the single ``frame`` signal (``value = signal``).  ``consumes`` (what makes the
-        # node reactive) is the picked input names -- so the node re-judges when any of them
-        # advances.  An empty pick falls back to the bare ``frame`` signal.
+        # The frame to judge is a signal expression -- the SAME universal multi-slot signal +
+        # ``value = ...`` mechanism every source field uses (default = the single ``frame``
+        # signal).  ``consumes`` (what makes the node reactive) is the picked input names, so the
+        # node re-judges when any of them advances.  Its ``value`` must evaluate to ONE (H×W)
+        # frame; an empty pick falls back to the bare ``frame`` signal.
         expr = source_expr if isinstance(source_expr, SignalExpr) else SignalExpr.from_value(source_expr)
         if not expr.inputs:
             expr = SignalExpr(["frame"], DEFAULT_SOURCE)
@@ -493,9 +493,9 @@ class OccupancyProcessor(Processor):
         calibration = self._resolve_calibration()
         if calibration is None:
             return {}                                       # not calibrated yet -> no-op (non-blocking)
-        # The frame to judge = the source expression over the consumed signals (the picked slot
-        # is ``signal``; for the default ``value = signal`` on one input it IS that frame; an
-        # expression can average several, e.g. ``value = (signal[0] + signal[1]) / 2``).
+        # The frame to judge = the source expression over the consumed signals (default
+        # ``value = signal`` on one input IS that frame; an expression may combine several,
+        # e.g. ``value = (signal[0] + signal[1]) / 2``).  The value must be ONE (H×W) frame.
         try:
             frame = np.asarray(self.source_expr.evaluate(inputs), dtype=float)
         except Exception:

@@ -2068,6 +2068,89 @@ def snap_scan_table(
     return out
 
 
+def scan_table_template(kind: str, n_slots: int) -> str:
+    """Starter Python for a scan-table program -- the ONE scan model, shared by the pulse GUI
+    Scan tab and the task-console Pulse-scan form.
+
+    The program builds an ``(N_points x n_slots)`` array and assigns it to ``scan_table``: one
+    ROW per scan point, one COLUMN per bound scan slot.  The points are NOT set per-slot in
+    isolation -- the whole table is one object, so the slots advance together (in lockstep), and
+    arbitrary correlations between slots (anti-correlated, grid, loaded array) are just different
+    ways of building that one array.  Two starting templates:
+
+    * ``column_stack`` (default): one independent column per slot.
+    * ``grid``: every combination (outer product) of per-axis arrays.
+    """
+
+    n = max(1, int(n_slots))
+    if str(kind) == "grid":
+        head = ("import numpy as np\n\n"
+                f"# Grid scan over {n} slot(s): every combination of the axis arrays.\n"
+                "a = np.linspace(1000, 5000, 5)           # axis for s0\n")
+        if n == 1:
+            body = "scan_table = a.reshape(-1, 1)\n"
+        elif n == 2:
+            body = ("b = np.linspace(0, 1000, 4)              # axis for s1\n"
+                    "A, B = np.meshgrid(a, b, indexing=\"ij\")\n"
+                    "scan_table = np.column_stack([A.ravel(), B.ravel()])   # 5 x 4 = 20 points\n")
+        else:
+            lines = ["b = np.linspace(0, 1000, 4)              # axis for s1",
+                     "A, B = np.meshgrid(a, b, indexing=\"ij\")",
+                     "grid = [A.ravel(), B.ravel()]"]
+            for j in range(2, n):
+                lines.append(f"grid.append(np.full(A.size, 0.0))      # s{j} held constant")
+            lines.append("scan_table = np.column_stack(grid)")
+            body = "\n".join(lines) + "\n"
+        return head + body
+    head = ("import numpy as np\n\n"
+            f"# {n} bound slot(s): s0..s{n - 1}.  Build an (N_points x {n}) array:\n"
+            "# one row per scan point, one column per slot (in the slot's unit:\n"
+            "# ns for a duration, integer code for a DAC).\n"
+            "points = np.arange(20, 200e3, 20)        # base sweep\n")
+    if n == 1:
+        body = "scan_table = points.reshape(-1, 1)\n"
+    elif n == 2:
+        body = ("s0 = points\n"
+                "s1 = 200e3 - s0                          # anti-correlated: s0 + s1 = 200 us (constant total)\n"
+                "scan_table = np.column_stack([s0, s1])\n")
+    else:
+        columns = ", ".join(["points"] + [f"np.zeros_like(points)  # s{j}" for j in range(1, n)])
+        body = f"scan_table = np.column_stack([{columns}])\n"
+    return head + body
+
+
+def evaluate_scan_table_code(code: str, n_slots: int) -> list[list[float]]:
+    """Run a scan-table program (see :func:`scan_table_template`) in a small numpy namespace and
+    return its ``(N_points x n_slots)`` table as a list of rows.
+
+    SECURITY: execs the operator-entered snippet as arbitrary Python -- a LOCAL experiment tool;
+    only run programs you wrote or trust.  Raises ``ValueError`` with a fixable message; the
+    number of COLUMNS must equal the bound slot count (one column per slot, advanced in lockstep)."""
+
+    import numpy as np
+
+    n = max(1, int(n_slots))
+    text = str(code or "").strip()
+    if not text:
+        raise ValueError("scan program is empty -- assign an (N_points x n_slots) array to 'scan_table'.")
+    namespace = {"np": np, "numpy": np, "math": math, "n_slots": n}
+    try:
+        exec(compile(text, "<scan-table>", "exec"), namespace)   # noqa: S102 - local experiment tool, trusted input
+    except Exception as exc:
+        raise ValueError(f"scan program did not run: {exc}") from exc
+    table = namespace.get("scan_table")
+    if table is None:
+        raise ValueError("the scan program must assign an (N_points x n_slots) array to a 'scan_table' variable.")
+    arr = np.atleast_2d(np.asarray(table, dtype=float))
+    if arr.ndim != 2 or arr.shape[0] < 1:
+        raise ValueError(f"scan_table must be a 2-D (N_points x n_slots) array; got shape {arr.shape}.")
+    if arr.shape[1] != n:
+        raise ValueError(
+            f"scan_table has {arr.shape[1]} column(s) but {n} scan slot(s) are bound -- give ONE column "
+            "per slot (the points advance in lockstep; build correlations into the columns).")
+    return [[float(v) for v in row] for row in arr]
+
+
 def quantized_time_ns(
     value_ns: float | str,
     *,
@@ -2301,11 +2384,13 @@ __all__ = [
     "default_periods",
     "default_visible_channels",
     "eval_time_expr",
+    "evaluate_scan_table_code",
     "infer_bus_channels",
     "load_scan_table",
     "positive_time_step_ns",
     "quantized_time_ns",
     "quantized_time_steps",
+    "scan_table_template",
     "slot_var",
     "snap_scan_table",
 ]

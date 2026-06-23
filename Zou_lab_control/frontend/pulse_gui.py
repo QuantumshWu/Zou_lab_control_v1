@@ -23,6 +23,7 @@ from Zou_lab_control.neutral_atom.timing.pulse_table import (
     default_pulse_name,
     is_slot_ref,
     load_scan_table,
+    scan_table_template,
     slot_ref_index,
     slot_var,
     snap_scan_table,
@@ -258,65 +259,18 @@ def _scan_slot_label(state: PulseTableState, index: int) -> str:
 
 
 def _template_column_stack(n_slots: int) -> str:
-    """``column_stack`` template: one independent column per slot (the default).
-
-    Adapts to the current slot count; a 2-slot binding shows the anti-correlated
-    "keep the total constant" example."""
-
-    n = max(1, int(n_slots))
-    head = (
-        "import numpy as np\n\n"
-        f"# {n} bound slot(s): s0..s{n - 1}.  Build an (N_points x {n}) array:\n"
-        "# one row per scan point, one column per slot (in the slot's unit:\n"
-        "# ns for a duration, integer code for a DAC).\n"
-        "points = np.arange(20, 200e3, 20)        # base sweep\n"
-    )
-    if n == 1:
-        body = "scan_table = points.reshape(-1, 1)\n"
-    elif n == 2:
-        body = (
-            "s0 = points\n"
-            "s1 = 200e3 - s0                          # anti-correlated: s0 + s1 = 200 us (constant total)\n"
-            "scan_table = np.column_stack([s0, s1])\n"
-        )
-    else:
-        columns = ", ".join(["points"] + [f"np.zeros_like(points)  # s{j}" for j in range(1, n)])
-        body = f"scan_table = np.column_stack([{columns}])\n"
-    return head + body
+    """``column_stack`` template (one column per slot) -- delegates to the ONE shared scan-table
+    template generator (the task-console Pulse-scan form uses the same source)."""
+    return scan_table_template("column_stack", n_slots)
 
 
 def _template_grid(n_slots: int) -> str:
-    """Grid (outer-product) template: every combination of two axis arrays."""
-
-    n = max(1, int(n_slots))
-    head = (
-        "import numpy as np\n\n"
-        f"# Grid scan over {n} slot(s): every combination of the axis arrays.\n"
-        "a = np.linspace(1000, 5000, 5)           # axis for s0\n"
-    )
-    if n == 1:
-        body = "scan_table = a.reshape(-1, 1)\n"
-    elif n == 2:
-        body = (
-            "b = np.linspace(0, 1000, 4)              # axis for s1\n"
-            "A, B = np.meshgrid(a, b, indexing=\"ij\")\n"
-            "scan_table = np.column_stack([A.ravel(), B.ravel()])   # 5 x 4 = 20 points\n"
-        )
-    else:
-        lines = [
-            "b = np.linspace(0, 1000, 4)              # axis for s1",
-            "A, B = np.meshgrid(a, b, indexing=\"ij\")",
-            "grid = [A.ravel(), B.ravel()]",
-        ]
-        for j in range(2, n):
-            lines.append(f"grid.append(np.full(A.size, 0.0))      # s{j} held constant")
-        lines.append("scan_table = np.column_stack(grid)")
-        body = "\n".join(lines) + "\n"
-    return head + body
+    """Grid (outer-product) template -- delegates to the ONE shared scan-table template generator."""
+    return scan_table_template("grid", n_slots)
 
 
 def _default_scan_code(n_slots: int) -> str:
-    return _template_column_stack(n_slots)
+    return scan_table_template("column_stack", n_slots)
 
 
 def _format_clock_text(time_step_ns: float) -> str:

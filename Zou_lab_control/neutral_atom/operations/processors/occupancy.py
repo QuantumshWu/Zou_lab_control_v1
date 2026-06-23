@@ -54,9 +54,8 @@ def judge_occupancy(readout) -> ProcessorSpec:
         ParamDecl("source", "Frame source", "signal_expr",
                   default={"inputs": ["frame"], "source": "value = signal"},
                   tooltip="The camera frame to judge: pick one or more hub signals and combine via "
-                          "value = ...  (default = the single `frame` signal; `value = (signal[0] + "
-                          "signal[1]) / 2` averages two).  A processor source can subscribe to several "
-                          "running nodes' signals, not just one."),
+                          "value = ... (default = the single `frame` signal; the value must be ONE "
+                          "(H×W) frame -- e.g. `value = (signal[0] + signal[1]) / 2` averages two)."),
         ParamDecl("method", "Readout method", "choice", default="box",
                   choices=tuple(method_labels),
                   tooltip="How to turn each frame into per-site signal: box = square ROI; "
@@ -89,8 +88,9 @@ def judge_occupancy(readout) -> ProcessorSpec:
         except Exception:
             grid = None
         method = method_labels.get(str(values.get("method", "box")), "box")
-        # ``source`` is a signal_expr value ({"inputs": [...], "source": "value = ..."}); the node
-        # builds the reusable SignalExpr and consumes its picked inputs (multi-source aware).
+        # ``source`` is a signal_expr value ({"inputs": [...], "source": "value = ..."}) -- the
+        # same universal multi-source picker every source field uses; the node builds the shared
+        # SignalExpr and judges the resulting (H×W) frame.
         return OccupancyProcessor(
             hub, calibration=calibration, calibration_source=calibration_source,
             source_expr=values.get("source"),

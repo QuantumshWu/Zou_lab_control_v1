@@ -315,11 +315,35 @@ def test_calibrate_task_bool_param_renders_as_toggle_switch():
         exp.close()
 
 
+def test_sitemap_is_single_slot_while_other_kinds_allow_multi_slot():
+    """E1 guard: the signal-picker + ``value = ...`` expression MECHANISM is universal (every
+    kind has the expression box), but whether a kind can GROW slots (+signal / −signal) is
+    data-driven from PANEL_SINGLE_SLOT_KINDS -- the site map takes EXACTLY ONE occupancy signal
+    (its centres + frame underlay resolve from signal[0]), so NO +/-; other kinds are multi-slot.
+    Locks the design so the slot UI can never regress to a hardcoded-per-panel +/- on the sitemap."""
+    from Zou_lab_control.frontend.task_console import (
+        PanelCard, PanelConfig, panel_allows_multi_slot)
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+
+    ensure_qt_app()
+    assert panel_allows_multi_slot("sites") is False
+    assert panel_allows_multi_slot("2d") and panel_allows_multi_slot("1d") and panel_allows_multi_slot("monitor")
+
+    sites = PanelCard(PanelConfig(kind="sites"))
+    assert sites._multi_slot is False
+    assert not hasattr(sites, "add_slot_button")     # NO +/- on the site map
+    assert hasattr(sites, "source_edit")             # but it KEEPS the universal expression box
+
+    two_d = PanelCard(PanelConfig(kind="2d"))
+    assert two_d._multi_slot is True
+    assert hasattr(two_d, "add_slot_button")         # +/- present on a multi-slot kind
+
+
 def test_pulse_scan_slots_form_is_template_driven():
     """The Pulse-scan measurement carries ONE auto-form (kind ``pulse_slots``) bound to the
-    sibling ``template`` field: the form's per-slot rows (one per API slot + one per scan
-    slot) are rebuilt whenever the template path changes, and ``collect_values`` returns the
-    {'api', 'scan'} dict the build() consumes."""
+    sibling ``template`` field: one numeric row per API slot + ONE scan-table program for all
+    scan slots together, rebuilt whenever the template path changes; ``collect_values`` returns
+    the {'api', 'scan_code'} dict the build() consumes."""
     from Zou_lab_control.frontend.task_console import MeasurementPanel
 
     exp = _calibrated()
@@ -329,7 +353,7 @@ def test_pulse_scan_slots_form_is_template_driven():
         tag, widget = panel._widgets["pulse_slots"]
         assert tag == "pulse_slots"
         out = panel.collect_values()["pulse_slots"]
-        assert isinstance(out, dict) and set(out) == {"api", "scan"}
+        assert isinstance(out, dict) and set(out) == {"api", "scan_code"}
         # the imaging template carries 3 unique API handles -> 3 numeric rows after a switch
         panel._widgets["template"][1].setText("imaging_template.json")
         panel._repopulate_pulse_slots("pulse_slots")
