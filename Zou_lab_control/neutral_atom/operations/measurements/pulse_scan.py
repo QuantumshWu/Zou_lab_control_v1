@@ -28,7 +28,6 @@ import numpy as np
 from ...core.analysis import positive_int
 from ...timing import PulseParam, enumerate_pulse_params
 from ...timing.sequence import snap_seconds_to_clock
-from ..logic import CalibrateReadoutTask          # the ONE template default + resolver (bare name -> pulses/)
 from ..measurement import MeasurementSpec, OtsuFidelityReducer, ParamDecl, axis_range_tuple
 from ..measurement_registry import measurement
 
@@ -126,16 +125,41 @@ def _label_for(state, kind: str, target: str, unit: str) -> str:
     return f"{label} ({unit})" if unit else label
 
 
+#: A pulse scan images ONCE per point, so its default pulse is the SINGLE-image probe
+#: template (one camera trigger) -- NOT the Calibrate task's long-short-long bracket (three
+#: triggers).  The user can still point ``template`` at any pulse program.
+DEFAULT_PROBE_TEMPLATE = "pulses/probe_template.json"
+
+
+def _resolve_probe_template(template: str):
+    """Load the single-image probe pulse: the given path if real, else the shipped probe
+    template of that name in ``pulses/``, else the in-memory single-image default -- never the
+    3-trigger cali bracket (a pulse scan reads ONE frame per point)."""
+    from pathlib import Path
+
+    from ...timing import PulseTableState, single_imaging_template
+    text = str(template or "").strip() or DEFAULT_PROBE_TEMPLATE
+    path = Path(text)
+    if path.is_file():
+        return PulseTableState.load(path)
+    name = path.name
+    for base in (Path("pulses"), Path(__file__).resolve().parents[4] / "pulses"):
+        shipped = base / name
+        if shipped.is_file():
+            return PulseTableState.load(shipped)
+    return single_imaging_template()
+
+
 @measurement(order=30)
 def pulse_scan(readout) -> MeasurementSpec:
     """Generic pulse-parameter scan (auto-discovered into the task console Add Panel)."""
 
     s = readout.session
 
-    def build(*, template: str = CalibrateReadoutTask.DEFAULT_PULSE_TEMPLATE, scan_target: str = "",
+    def build(*, template: str = DEFAULT_PROBE_TEMPLATE, scan_target: str = "",
               scan=(0.0, 50.0, 11), shots: int = 10, reduce: str = "counts", **_ignored):
         kind, target = _split_target(scan_target)
-        state = CalibrateReadoutTask._resolve_template(template)
+        state = _resolve_probe_template(template)
         lo, hi, points = axis_range_tuple(scan, "scan")
         is_time = kind in _TIME_KINDS
         # A duration/delay range must be >= 0: negative/zero time snaps to one clock tick
@@ -175,10 +199,10 @@ def pulse_scan(readout) -> MeasurementSpec:
                                     calibration, reducer, n_frames=n_frames, shots_per_point=shots_per_point)
 
     params = (
-        ParamDecl("template", "Pulse template", "path", default=CalibrateReadoutTask.DEFAULT_PULSE_TEMPLATE,
+        ParamDecl("template", "Pulse template", "path", default=DEFAULT_PROBE_TEMPLATE,
                   path_mode="file", base_dir="pulses", file_filter="Pulse program (*.json);;All files (*)",
-                  tooltip="The pulse program loaded each point; its periods / channels / DAC buses "
-                          "populate the Target dropdown."),
+                  tooltip="The pulse program loaded each point (a single-image probe by default); its "
+                          "periods / channels / DAC buses populate the Target dropdown."),
         ParamDecl("scan_target", "Target", "pulse_param", default="", required=True, depends_on="template",
                   tooltip="WHICH parameter of the template to sweep -- a period duration, a channel "
                           "delay, or a DAC bus level.  The choices come from the template above."),

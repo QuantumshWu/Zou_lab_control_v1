@@ -50,6 +50,11 @@ ORANGE = "#D69A6E"
 # (the inline spinbox-style button) stands out against it instead of vanishing.
 ORANGE_TINT = "#F6E3D4"
 ORANGE_DARK = "#8A4B1F"
+# API-slot (a1/a2...) marker palette -- a VIOLET distinct from the orange scan colour, so
+# the two slot kinds never read alike.  Unlike a scan slot, an API slot does NOT hide the
+# field value, so there is no tint/fill: only a violet dot + a thin violet border mark it.
+API_VIOLET = "#9B86C9"
+API_VIOLET_DARK = "#5A4A8A"
 YELLOW = "#E5C85B"
 GREY = "#A2A2A2"
 RADIUS = 4
@@ -2171,6 +2176,7 @@ class FluentScanDot(QtWidgets.QAbstractButton):
         self.setCheckable(True)
         self.setCursor(QtCore.Qt.PointingHandCursor)
         self._number: int | None = None
+        self._api = False        # api-slot state (violet); scan state is isChecked() (orange)
         diameter = Metrics.dot()
         self.setFixedSize(diameter, diameter)
         self.setToolTip(tooltip)
@@ -2178,6 +2184,19 @@ class FluentScanDot(QtWidgets.QAbstractButton):
     def set_number(self, number: int | None) -> None:
         self._number = None if number is None else int(number)
         self.update()
+
+    def set_api(self, api: bool) -> None:
+        """Mark the dot as an API slot (violet) -- distinct from a scan slot (orange,
+        ``setChecked``).  An API-slot field keeps its value, so only the dot recolours."""
+        self._api = bool(api)
+        self.update()
+
+    def nextCheckState(self) -> None:  # noqa: N802 - Qt API name
+        # The dot's checked (scan) state is DRIVEN BY THE MODEL via set_scan_bound, not by the
+        # click toggle: a click only emits ``clicked`` to drive the none->scan->api->off cycle,
+        # which then re-applies the correct visual.  Without this, the auto-toggle would leave a
+        # just-cleared dot stuck "checked" (orange) when the cycle landed on API or off.
+        pass
 
     def number(self) -> int | None:
         return self._number
@@ -2188,8 +2207,8 @@ class FluentScanDot(QtWidgets.QAbstractButton):
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
         center = QtCore.QPointF(self.width() / 2.0, self.height() / 2.0)
         radius = min(self.width(), self.height()) / 2.0 - max(1.0, scaled_px(1))
-        if self.isChecked():
-            painter.setBrush(QtGui.QColor(ORANGE))
+        if self.isChecked() or self._api:
+            painter.setBrush(QtGui.QColor(API_VIOLET if self._api else ORANGE))
             painter.setPen(QtCore.Qt.NoPen)
             painter.drawEllipse(center, radius, radius)
             if self._number is not None:
@@ -2297,6 +2316,9 @@ class FluentScanLineEdit(FluentLineEdit):
             return
         self._bound = bound
         self._scan_number = number
+        if bound:                      # scan and api are mutually exclusive on a field
+            self._api_bound = False
+        self._dot.set_api(False)
         self._dot.setChecked(self._bound)
         self._dot.set_number(number if self._bound else None)
         self.setReadOnly(self._bound)
@@ -2314,6 +2336,36 @@ class FluentScanLineEdit(FluentLineEdit):
                 """
             )
         else:
+            self.setStyleSheet(self._base_style)
+        self._reserve_right()
+        self.update()
+
+    def set_api_bound(self, bound: bool, number: int | None = None) -> None:
+        """Mark (or clear) this field as an API slot ``a{number}``.
+
+        UNLIKE :meth:`set_scan_bound`, an API slot KEEPS the field's value visible and
+        EDITABLE -- only a thin violet border + the violet dot mark it (the value is a real
+        number the API can also set by name).  Scan and API are mutually exclusive."""
+        bound = bool(bound)
+        if getattr(self, "_api_bound", False) == bound and getattr(self, "_api_number", "\x00unset") == number:
+            return
+        self._api_bound = bound
+        self._api_number = number
+        if bound:                      # leaving any scan state
+            self._bound = False
+            self._scan_number = None
+            self._dot.setChecked(False)
+            self.setReadOnly(False)
+        self._dot.set_api(bound)
+        self._dot.set_number(number if bound else None)
+        if bound:
+            self.setStyleSheet(
+                f'QLineEdit {{ border: 1px solid {API_VIOLET}; color: {API_VIOLET_DARK}; '
+                f'border-radius: {_radius()}px; '
+                f'padding: {scaled_px(PADDING_V)}px {scaled_px(EDIT_PADDING_H)}px; '
+                f'font: {fluent_font_size()}pt "{FONT}"; }}'
+            )
+        elif not getattr(self, "_bound", False):
             self.setStyleSheet(self._base_style)
         self._reserve_right()
         self.update()

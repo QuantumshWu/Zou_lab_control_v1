@@ -1,7 +1,7 @@
 {
   "schema": "Zou_lab_control.neutral_atom.PulseTableState",
   "version": 3,
-  "name": "imaging_template",
+  "name": "probe_template",
   "channels": [
     "trap",
     "cooling",
@@ -15,18 +15,6 @@
       "name": "a1",
       "kind": "duration",
       "target": "1",
-      "unit": "s"
-    },
-    {
-      "name": "a1",
-      "kind": "duration",
-      "target": "5",
-      "unit": "s"
-    },
-    {
-      "name": "a2",
-      "kind": "duration",
-      "target": "3",
       "unit": "s"
     }
   ],
@@ -44,53 +32,9 @@
       ]
     },
     {
-      "duration": 0.02,
-      "unit": "s",
-      "name": "image_0",
-      "states": [
-        1,
-        0,
-        1,
-        1
-      ]
-    },
-    {
-      "duration": 0.0001,
-      "unit": "s",
-      "name": "gap_0",
-      "states": [
-        1,
-        0,
-        0,
-        0
-      ]
-    },
-    {
       "duration": 0.005,
       "unit": "s",
-      "name": "image_1",
-      "states": [
-        1,
-        0,
-        1,
-        1
-      ]
-    },
-    {
-      "duration": 0.0001,
-      "unit": "s",
-      "name": "gap_1",
-      "states": [
-        1,
-        0,
-        0,
-        0
-      ]
-    },
-    {
-      "duration": 0.02,
-      "unit": "s",
-      "name": "image_2",
+      "name": "image",
       "states": [
         1,
         0,

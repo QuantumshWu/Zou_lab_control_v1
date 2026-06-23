@@ -15,6 +15,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 from Zou_lab_control.neutral_atom.timing.pulse_table import (
     DELAY_MAX_TICKS,
+    SCAN_SLOT_KINDS,
     UNITS_TO_NS,
     PulsePeriod,
     PulseTableState,
@@ -234,6 +235,13 @@ def _is_slot_expr(text: object) -> bool:
 
 def _slot_index_of_expr(text: object) -> int | None:
     return slot_ref_index(str(text or "").strip())
+
+
+def _api_number(name: object) -> int:
+    """The 1-based index of API handle ``name`` (``"a1"`` -> 1) for the marker dot."""
+
+    digits = "".join(ch for ch in str(name or "") if ch.isdigit())
+    return int(digits) if digits else 1
 
 
 def _scan_slot_label(state: PulseTableState, index: int) -> str:
@@ -733,7 +741,7 @@ class PeriodCard(FluentGroupBox):
         top_layout.addWidget(_set_fixed_height(duration_label))
 
         scanned = _is_slot_expr(period.duration)
-        self.duration_edit = FluentScanLineEdit(_period_duration_text(period), tooltip="Duration value; click the dot to scan it")
+        self.duration_edit = FluentScanLineEdit(_period_duration_text(period), tooltip="Duration value; click the dot to cycle scan (sN) -> API (aN) -> off")
         self.duration_edit.setFixedWidth(control_width)
         # Input restriction is applied in _handle_unit: a numeric unit (ns/us/...) only
         # accepts digits/./e; the "str (ns)" unit allows an affine slot expression.
@@ -761,6 +769,8 @@ class PeriodCard(FluentGroupBox):
         if scanned:
             self.duration_edit.set_scan_bound(True, _slot_index_of_expr(period.duration) + 1)
             self.unit_combo.setEnabled(False)
+        elif self.state_ref is not None and self.state_ref.api_slot_for("duration", str(index)):
+            self.duration_edit.set_api_bound(True, _api_number(self.state_ref.api_slot_for("duration", str(index))))
 
         row_height = _channel_row_height(len(self.rows))
         full_state = self.state_ref
@@ -808,7 +818,7 @@ class PeriodCard(FluentGroupBox):
                 combo.setToolTip(f"{bus_name}: output mode")
                 value_edit = FluentScanLineEdit(
                     value_display,
-                    tooltip=f"{bus_name}: signed integer {lo_signed}..{hi_signed} (0 = 0 V); click the dot to scan it",
+                    tooltip=f"{bus_name}: signed integer {lo_signed}..{hi_signed} (0 = 0 V); click the dot to cycle scan (sN) -> API (aN) -> off",
                 )
                 value_edit.setFixedHeight(bus_row_height)
                 # Size the value field to EXACTLY the card's remaining width (combo + gap
@@ -842,6 +852,8 @@ class PeriodCard(FluentGroupBox):
                     slot_index = full_state.slot_index_for("dac", f"{bus_name}@{index}")
                     value_edit.set_scan_bound(True, None if slot_index is None else slot_index + 1)
                     combo.setEnabled(False)
+                elif full_state.api_slot_for("dac", f"{bus_name}@{index}"):
+                    value_edit.set_api_bound(True, _api_number(full_state.api_slot_for("dac", f"{bus_name}@{index}")))
                 continue
             channel = str(row["key"])
             source_index = self.channels.index(channel) if channel in self.channels else offset
@@ -2402,6 +2414,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             for card in cards
         ]
         scan_slots = self._reconcile_scan_slots(periods)
+        api_slots = self._carry_api_slots(periods)
         n_slots = len(scan_slots)
         # Pad a short row (e.g. after binding a NEW slot) with that slot's NOMINAL (reference)
         # value, not 0 -- so a freshly-added scan dimension starts at the field's current value
@@ -2419,6 +2432,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             name=self.name_edit.text().strip() or self.state.name or _default_pulse_name(),
             scan_slots=scan_slots,
             scan_table=scan_table,
+            api_slots=api_slots,
             time_step_ns=time_step_ns,
             channel_labels=dict(self.state.channel_labels),
             analog_buses=dict(self.state.analog_buses),
@@ -2473,6 +2487,27 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 out.append(ScanSlot("dac", target, slot.label, slot.unit, slot.nominal))
             else:
                 out.append(slot)
+        return out
+
+    def _carry_api_slots(self, periods: Sequence[PulsePeriod]):
+        """Carry API slots (owned by ``self.state``, created/removed only by the dots) across
+        an edit.  An API slot does NOT rewrite the field, so -- unlike a scan slot -- there is
+        no ``aN`` marker in the cell to re-point it after a period drag; it is carried by index.
+        Slots whose target no longer exists (its period was deleted) are dropped so a stale
+        handle never trips ``validate``."""
+        n = len(periods)
+        out = []
+        for slot in self.state.api_slots:
+            if slot.kind == "duration":
+                if str(slot.target).lstrip("-").isdigit() and 0 <= int(slot.target) < n:
+                    out.append(slot)
+            elif slot.kind == "delay":
+                if slot.target in self.state.channels:
+                    out.append(slot)
+            elif slot.kind == "dac":
+                _, _, period = str(slot.target).partition("@")
+                if period.lstrip("-").isdigit() and 0 <= int(period) < n:
+                    out.append(slot)
         return out
 
     def _remember_scan_column(self, state: PulseTableState, kind: str, target: str, slot_index: int) -> None:
@@ -2568,15 +2603,19 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 period = state.periods[pidx]
                 # --- duration ---
                 scanned = _is_slot_expr(period.duration)
+                api_name = state.api_slot_for("duration", str(pidx))
                 edit, combo = card.duration_edit, card.unit_combo
                 with _signals_blocked(edit, combo):
                     edit.set_scan_bound(False)
+                    edit.set_api_bound(False)
                     edit.setText(_period_duration_text(period))
                     _set_duration_unit_combo(combo, scanned=scanned, unit=period.unit)
                     combo.setEnabled(not scanned)
                     if scanned:
                         idx = _slot_index_of_expr(period.duration)
                         edit.set_scan_bound(True, None if idx is None else idx + 1)
+                    elif api_name:   # api slot keeps the number + unit editable, violet marker
+                        edit.set_api_bound(True, _api_number(api_name))
                 # --- bus value fields ---
                 for bus, value_edit in getattr(card, "bus_value_edits", {}).items():
                     plan = state.analog_bus_plan(bus)
@@ -2594,8 +2633,10 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                     else:
                         disp = str(max(lo_signed, min(hi_signed, int(raw))))
                     mode_combo = card.bus_mode_combos[bus]
+                    api_name = state.api_slot_for("dac", f"{bus}@{pidx}")
                     with _signals_blocked(value_edit, mode_combo):
                         value_edit.set_scan_bound(False)
+                        value_edit.set_api_bound(False)
                         value_edit.setText(disp)
                         value_edit.set_editable(mode != "hold")
                         mode_combo.setCurrentText(_bus_mode_title(mode))
@@ -2603,6 +2644,8 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                         if bound:
                             si = state.slot_index_for("dac", f"{bus}@{pidx}")
                             value_edit.set_scan_bound(True, None if si is None else si + 1)
+                        elif api_name:   # api slot keeps the value editable, violet marker
+                            value_edit.set_api_bound(True, _api_number(api_name))
             # --- channel panel: delay fields (fixed per-channel value, not scannable) ---
             panel = self.channel_panel
             for key, edit in panel.delay_edits.items():
@@ -2637,16 +2680,29 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         except Exception:
             return False
 
-    def _toggle_scan_binding(self, state: PulseTableState, kind: str, target: str, *, bind, label: str = "", unit: str = "ns") -> None:
-        slot_index = state.slot_index_for(kind, target)
-        if slot_index is None:
-            self._remember_field_state(state, kind, target)  # capture BEFORE binding overwrites it
-            new_index = bind()
+    def _cycle_field_slot(self, state: PulseTableState, kind: str, target: str, *, unit: str = "ns", label: str = "") -> None:
+        """Cycle a field's slot on each dot click: none -> SCAN (sN) -> API (aN) -> none.
+
+        SCAN binds a scan slot (the value moves to the scan table, the field shows ``sN``,
+        orange).  API binds a NAMED HANDLE (``aN``) the API/Task sets by name -- the field
+        KEEPS its number, stays editable, violet marker.  A delay cell is not scannable, so
+        it cycles none -> API -> none (skips the scan step)."""
+        scannable = kind in SCAN_SLOT_KINDS
+        scan_index = state.slot_index_for(kind, target) if scannable else None
+        api_name = state.api_slot_for(kind, target)
+        if api_name is not None:
+            state.unbind_api_field(kind, target)                       # API -> none
+        elif scan_index is not None:
+            self._remember_scan_column(state, kind, target, scan_index)
+            state.unbind_slot(scan_index)
+            self._restore_field_state(state, kind, target)            # SCAN -> API: restore value...
+            state.bind_api_field(kind, target, unit=unit)             # ...then tag the handle
+        elif scannable:
+            self._remember_field_state(state, kind, target)           # none -> SCAN
+            new_index = state.bind_field(kind, target, unit=unit, label=label)
             self._restore_scan_column(state, kind, target, new_index)
         else:
-            self._remember_scan_column(state, kind, target, slot_index)
-            state.unbind_slot(slot_index)
-            self._restore_field_state(state, kind, target)  # put the field back exactly as it was
+            state.bind_api_field(kind, target, unit=unit)             # delay: none -> API
         # A dot toggle CHANGES the program that On Pulse would upload -- it must get the
         # same confocal UNSYNCED treatment as any other edit (the fast path below bypasses
         # the widget signals that normally call _mark_dirty).
@@ -2668,9 +2724,9 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             state = self.read_state()
             index = self.drag_container.pulse_cards().index(card)
             unit = card.unit_combo.currentText()
-            self._toggle_scan_binding(
+            self._cycle_field_slot(
                 state, "duration", str(index),
-                bind=lambda: state.bind_field("duration", str(index), unit="ns" if unit == "str (ns)" else unit),
+                unit="ns" if unit == "str (ns)" else unit,
             )
         except Exception as exc:
             self._message(str(exc))
@@ -2706,10 +2762,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             state = self.read_state()
             index = self.drag_container.pulse_cards().index(card)
             target = f"{bus_name}@{index}"
-            self._toggle_scan_binding(
-                state, "dac", target,
-                bind=lambda: state.bind_field("dac", target, unit="value", label=bus_name),
-            )
+            self._cycle_field_slot(state, "dac", target, unit="value", label=bus_name)
         except Exception as exc:
             self._message(str(exc))
 
@@ -2879,10 +2932,32 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 "Every point is snapped automatically before it runs (durations → whole ticks, "
                 "DAC → integer codes in range), so this table is exactly what the hardware plays."
             )
-            self.scan_slots_label.setText("\n".join(lines))
+            sections = ["\n".join(lines)]
+        else:
+            sections = []
+        # API slots are listed alongside scan slots: a named handle (a1/a2...) the notebook/API
+        # or the Calibrate task sets BY NAME (state.aN = value), with the field's value kept.
+        if state.api_names():
+            api_lines = ["API slots — set by name from a notebook/API or the Calibrate task:"]
+            for name in state.api_names():
+                where = []
+                for slot in (s for s in state.api_slots if s.name == name):
+                    if slot.kind == "duration":
+                        where.append(f"period {slot.target} duration")
+                    elif slot.kind == "delay":
+                        where.append(f"{slot.target} delay")
+                    else:
+                        bus, _, p = str(slot.target).partition("@")
+                        where.append(f"{bus} @ period {p}")
+                api_lines.append(f"  {name}: {', '.join(where)}   e.g.  pulse.{name} = <value>")
+            sections.append("\n".join(api_lines))
+        if sections:
+            self.scan_slots_label.setText("\n\n".join(sections))
         else:
             self.scan_slots_label.setText(
-                "No scan slots bound yet. In the Edit tab, click the dot next to any duration or DAC value to scan it. (A channel delay is a fixed value and cannot be scanned.)"
+                "No scan or API slots bound yet. In the Edit tab, click the dot next to any duration "
+                "or DAC value: 1st click = scan (sN, orange), 2nd = API handle (aN, violet), 3rd = off. "
+                "(A channel delay can be an API slot but is not scannable.)"
             )
         rows = state.scan_table
         if rows:

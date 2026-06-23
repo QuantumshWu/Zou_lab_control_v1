@@ -138,7 +138,7 @@ def test_reference_bracket_gives_distinct_per_method_fidelity():
         task.run_to_completion()
         # the bracket frames were kept, grouped (n_ref long frames + one short readout each)
         assert len(task._reference_groups) == len(task._readout_by_group) > 0
-        assert len(task._reference_groups[0]) == task.REFERENCE_FRAMES_PER_BRACKET
+        assert len(task._reference_groups[0]) == 2   # long-short-long -> two long reference frames
 
         by_method = _held_out_by_method(task.calibration, task._reference_groups, task._readout_by_group)
         assert set(by_method) == {"box", "psf", "uniform_psf"}

@@ -91,17 +91,20 @@ background model is PART of the readout and is carried per method in `by_method`
 `CalibrateReadoutTask` (`operations/logic.py`) follows the Rb87 single-atom flow:
 
 1. **Reference brackets** (`_collect_bracket_groups`): each shot is ONE correlated
-   long-short-long camera sequence imaging the SAME atoms. The bracket is built from the TWO
-   operator-set exposures — `PulseTableState.with_imaging_bracket([reference_exposure,
-   readout_exposure, reference_exposure])` — by setting the template's `image`-window durations;
-   it keeps ONE cooling/load cycle (the template's periods BEFORE its `image` window), then repeats
-   the image window long-short-long with a readout gap that holds ONLY the persistent trap (a
-   channel on in BOTH the load AND the image) between frames. The gap deliberately drops cooling
-   (re-cooling mid-bracket would rearrange the atoms and void the labels) AND the probe + emCCD,
-   so the emCCD line drops and re-rises into THREE CONSECUTIVE camera triggers within that single
-   cooling cycle, the trap held continuously. `reference_exposure` (LONG) and `readout_exposure`
-   (SHORT) are both explicit cali params — the long exposure is NOT buried in the template (the
-   template only supplies the channels + the one cooling cycle). Comparing the two long frames
+   long-short-long camera sequence imaging the SAME atoms. **The template FILE itself IS the
+   bracket** — `default_imaging_template()` / `pulses/imaging_template.json` is six periods
+   (`load`, `image_0`, `gap_0`, `image_1`, `gap_1`, `image_2`): one cooling/load cycle, then
+   THREE camera-trigger frames separated by trap-held gaps (the gap holds ONLY the persistent
+   trap so the emCCD line drops and re-rises into three DISTINCT triggers; cooling/probe/emCCD
+   are off in the gap, so no re-cooling rearranges the atoms mid-bracket). **`file == fired`**:
+   the cali does NOT unroll/derive a bracket (the deleted `with_imaging_bracket`) — it loads the
+   template and sets ONLY the two exposure durations BY NAME via **API slots**: `set_api("a1",
+   reference_exposure)` (the long reference frames, image_0 + image_2 share the `a1` handle) and
+   `set_api("a2", readout_exposure)` (the short readout, image_1). `_imaging_layout` reads the
+   frame count + readout index from the template (emCCD-trigger periods; the `a2`-tagged one is
+   the readout), so a user's own template with N triggers works too. `reference_exposure` (LONG)
+   and `readout_exposure` (SHORT) are both explicit cali params — open the template in the pulse
+   GUI and you SEE exactly the long-short-long the cali fires. Comparing the two long frames
    tells whether the atom survived; when they
    AGREE (strict consensus) they vote the ground-truth occupancy for the short readout, and a
    shot where they disagree (atom loss, modelled by the virtual `detection_lifetime`) is dropped
@@ -609,11 +612,24 @@ overcounts distributed RAM; the per-slot LUTRAM is ~0.7-1.0 LUT per 64x1 cell).
 `PulseController` (sequencer.py) is the notebook-facing API and shares the exact
 sequencer path with the GUI: `on_pulse()/off_pulse()`, `set_channel_delay()/
 get_channel_delay()` (delay calibration), `load_pulse()/save_pulse()`,
-`set_scan_table()`, `synced_state()`.  `SequencerService.prepare` records the SOURCE
-payload (`last_payload_json`) of every successful prepare -- from the GUI or any raw-API
-caller -- and publishes it in `snapshot()`; `RemoteSequencer` flattens it across RPyC.
-The GUI's **Sync** button and `pulse.synced_state()` both read this single source of
-truth.  GUI state semantics (confocal style -- stars + status dot, never button base
+`set_scan_table()`, `synced_state()`.  **Both `prepare` AND `fire` record the SOURCE timing
+as a syncable `PulseTableState` (always carries `periods`) in `last_payload_json`**, via the
+single `_record_source_payload` seam shared by `SequencerService` and `VirtualSequencer`: a
+GUI-authored table is recorded verbatim (names + scan/API slots preserved); a BARE
+`PulseSequence` (a Task firing `to_sequence()`) is reconstructed into a period table via
+`PulseTableState.from_sequence`.  So the GUI's **Sync** never sees a "raw payload it cannot
+sync" -- whatever ANYONE fires (GUI, notebook API, Task) reloads into the editor.
+`snapshot()` publishes it; `RemoteSequencer` flattens it across RPyC.  The GUI's **Sync**
+button and `pulse.synced_state()` both read this single source of truth.
+
+**API slots** (`pulse_table.ApiSlot`, parallel to scan slots): a NAMED handle (`a1`, `a2`...)
+on a period duration / channel delay / DAC value that the API/Task sets BY NAME --
+`state.set_api("a1", v)` or `state.a1 = v` -- WITHOUT rewriting the field (the number stays;
+several fields can share one name).  In the pulse GUI a duration/DAC cell's dot CYCLES
+none -> scan (`sN`, orange, value hidden) -> API (`aN`, violet, value kept) -> none; a delay
+cell cycles none -> API -> none (delay is not scannable).  `read_state` carries API slots by
+index (`_carry_api_slots`).  This is what lets the Calibrate task set the imaging template's
+exposures by name without parsing "which period's which signal".  GUI state semantics (confocal style -- stars + status dot, never button base
 colours): any edit while RUNNING/PREPARED adds the `*` suffix to On Pulse ("On Pulse*")
 and turns the STATUS DOT orange (UNSYNCED); the button itself stays green so it cannot
 be confused with the permanently-orange Remove/Load/Sync.  The star is present in every

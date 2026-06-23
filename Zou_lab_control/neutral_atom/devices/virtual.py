@@ -668,16 +668,26 @@ class VirtualSequencer(SequencerDevice):
         self.last_program = compile_runtime_program(
             program, channels=channels, clock_hz=self.clock_hz,
             trigger_channels=getattr(self, "trigger_channels", DEFAULT_CAMERA_TRIGGER_CHANNELS))
-        # Record the SOURCE payload (the editable PulseTableState / PulseSequence as JSON),
-        # exactly like SequencerService.prepare -- the pulse GUI's "Sync" reads it back from
-        # snapshot()["last_payload_json"].  This is what makes Sync work on the virtual
-        # sequencer (it IS a sequencer; sync must not error / no-op).
-        import json
-        from .sequencer import timing_payload_to_dict
-        self.last_payload_json = json.dumps(
-            timing_payload_to_dict(sequence, time_step_ns=1e9 / float(self.clock_hz)))
+        # Record the SOURCE timing as a syncable PulseTableState JSON (always carries
+        # ``periods``), EXACTLY like SequencerService -- the pulse GUI's "Sync" reads it back
+        # from snapshot()["last_payload_json"].  A bare PulseSequence (a Task / measurement
+        # firing a compiled bracket) is reconstructed into a period table via
+        # PulseTableState.from_sequence so it syncs too (virtual == real: no fired timing the
+        # GUI "cannot sync").
+        self._record_source_payload(sequence, channels=channels)
         self.history.append({"action": "prepare", "sequence": program.name, "duration": program.duration})
         return self.last_program
+
+    def _record_source_payload(self, payload, *, channels) -> None:
+        import json
+        from .sequencer import timing_from_payload
+        step = 1e9 / float(self.clock_hz)
+        timing = timing_from_payload(payload)
+        if isinstance(timing, PulseTableState):
+            table = timing.snapped(time_step_ns=step)
+        else:
+            table = PulseTableState.from_sequence(timing, channels=channels, clock_hz=self.clock_hz)
+        self.last_payload_json = json.dumps(table.to_dict())
 
     def fire(self, sequence: PulseSequence | None = None) -> None:
         if self._prepared is None:

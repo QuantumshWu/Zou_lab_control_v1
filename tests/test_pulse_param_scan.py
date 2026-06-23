@@ -4,7 +4,7 @@ A "pulse scan" sweeps a parameter by, PER POINT, editing a loaded template and r
 the NON-slot software scan (so it can sweep a period duration, a channel delay, OR a DAC bus
 level of any program, no hardware scan slot required).  These pin the single-source addressing:
 
-  * ``period_index_by_name`` resolves a named period (and ``with_imaging_exposure`` still uses it);
+  * ``period_index_by_name`` resolves a named period (the single name->index source);
   * ``PulseParam.apply`` returns a NEW state (input untouched) with the named parameter set,
     delegating to the real setters (so it inherits their guards) -- for duration / delay / dac;
   * ``enumerate_pulse_params`` lists exactly the addressable params (durations + delays + per-bus
@@ -33,43 +33,31 @@ from Zou_lab_control.neutral_atom.timing import (
 
 
 def _template() -> PulseTableState:
-    # the shipped imaging template has a named 'image' period (case-insensitive resolve target)
+    # the shipped imaging template has named 'image_0/1/2' frames (case-insensitive resolve target)
     return default_imaging_template()
 
 
 def test_period_index_by_name_resolves_named_period():
     state = _template()
-    idx = period_index_by_name(state, "image")
+    idx = period_index_by_name(state, "image_0")
     assert idx is not None
-    assert str(state.periods[idx].name).strip().lower() == "image"
+    assert str(state.periods[idx].name).strip().lower() == "image_0"
     assert period_index_by_name(state, "no-such-period") is None
     # case / whitespace insensitive
-    assert period_index_by_name(state, "  IMAGE ") == idx
-
-
-def test_with_imaging_exposure_still_uses_the_shared_resolver():
-    from Zou_lab_control.neutral_atom.timing import exposure_from_sequence
-
-    state = _template()
-    idx = period_index_by_name(state, "image")
-    out = state.with_imaging_exposure(0.007)
-    assert out is not state                                    # returns a copy
-    seq = out.to_sequence(name="t")
-    assert exposure_from_sequence(seq, default=0.05) == pytest.approx(0.007)
-    assert period_index_by_name(out, "image") == idx           # structure preserved
+    assert period_index_by_name(state, "  IMAGE_0 ") == idx
 
 
 def test_pulse_param_apply_duration_returns_new_state_and_sets_value():
     state = _template()
-    idx = period_index_by_name(state, "image")
+    idx = period_index_by_name(state, "image_0")
     before = state.periods[idx].duration
     param = PulseParam("duration", str(idx), unit="us")
     out = param.apply(state, 12.0)
     assert out is not state                                    # input never mutated
     assert state.periods[idx].duration == before               # original unchanged
-    # the edited period's compiled exposure is the set value (12 us)
-    from Zou_lab_control.neutral_atom.timing import exposure_from_sequence
-    assert exposure_from_sequence(out.to_sequence(name="t"), default=0.05) == pytest.approx(12e-6)
+    # the edited period carries the set value (12 us) via the real set_period_duration
+    assert out.periods[idx].duration == pytest.approx(12.0)
+    assert out.periods[idx].unit == "us"
 
 
 def test_pulse_param_apply_delay_sets_channel_delay():
@@ -171,7 +159,7 @@ def test_pulse_scan_runs_each_reduce_mode_headless(reduce):
     SAME camera/calibration contract (virtual==real; only frames are simulated)."""
     exp = _calibrated()
     try:
-        x, y, m = _run_pulse_scan(exp, template="imaging_template.json", scan_target="duration:0",
+        x, y, m = _run_pulse_scan(exp, template="probe_template.json", scan_target="duration:0",
                                   scan=(10.0, 40.0, 5), shots=4, reduce=reduce)
         assert x.shape == (5,) and y.shape == (5,)
         assert np.isfinite(x).all() and np.isfinite(y).all()
@@ -190,7 +178,7 @@ def test_pulse_scan_delay_is_software_non_slot():
     try:
         state = CalibrateReadoutTask._resolve_template("imaging_template.json")
         kind, target, _ = next((p for p in enumerate_pulse_params(state) if p[0] == "delay"))
-        x, y, _m = _run_pulse_scan(exp, template="imaging_template.json",
+        x, y, _m = _run_pulse_scan(exp, template="probe_template.json",
                                    scan_target=f"{kind}:{target}", scan=(0.0, 5.0, 3),
                                    shots=3, reduce="counts")
         assert x.shape == (3,) and np.isfinite(y).all()
@@ -205,7 +193,7 @@ def test_pulse_scan_missing_target_raises():
     try:
         spec = {s.name: s for s in exp.readout.measurement_specs()}["Pulse scan"]
         with pytest.raises(ValueError):
-            spec.build(template="imaging_template.json", scan_target="", scan=(0.0, 1.0, 3))
+            spec.build(template="probe_template.json", scan_target="", scan=(0.0, 1.0, 3))
     finally:
         exp.close()
 
@@ -219,6 +207,6 @@ def test_pulse_scan_negative_time_range_raises():
     try:
         spec = {s.name: s for s in exp.readout.measurement_specs()}["Pulse scan"]
         with pytest.raises(ValueError):
-            spec.build(template="imaging_template.json", scan_target="duration:0", scan=(-0.04, 0.04, 5))
+            spec.build(template="probe_template.json", scan_target="duration:0", scan=(-0.04, 0.04, 5))
     finally:
         exp.close()

@@ -914,19 +914,7 @@ class SequencerService:
             if self.prepare_callback is not None and not cached:
                 self.prepare_callback(program)
             self.prepared_program = program
-            # record the SOURCE payload for sync-to-device (JSON string: crosses RPyC
-            # without netrefs and is identical for str/dict payloads and state objects).
-            if isinstance(sequence_payload, (str, bytes)):
-                self.last_payload_json = (
-                    sequence_payload.decode("utf-8")
-                    if isinstance(sequence_payload, bytes) else str(sequence_payload)
-                )
-            elif isinstance(sequence_payload, Mapping):
-                self.last_payload_json = json.dumps(dict(sequence_payload))
-            else:
-                step = 1e9 / float(self.clock_hz)
-                self.last_payload_json = json.dumps(
-                    timing_payload_to_dict(sequence_payload, time_step_ns=step))
+            self._record_source_payload(sequence_payload)
             self.state = "prepared"
             self.history.append(
                 {
@@ -937,6 +925,24 @@ class SequencerService:
                 }
             )
         return program.to_dict()
+
+    def _record_source_payload(self, sequence_payload) -> None:
+        """Record the SOURCE timing as a syncable ``PulseTableState`` JSON (always carries
+        ``periods``), so the pulse GUI's Sync can ALWAYS reconstruct the editor from whatever
+        ANYONE handed the server -- GUI, API or Task -- because the server records the timing
+        it was given.  A GUI-authored ``PulseTableState`` is recorded verbatim (names + slots
+        preserved); a bare ``PulseSequence`` (compiled timing with no periods -- e.g. a Task
+        firing ``reference_bracket.to_sequence()``) is reconstructed into a period table via
+        :meth:`PulseTableState.from_sequence`, so it syncs too.  This is the single record
+        seam shared by ``prepare`` and ``fire`` -- there is no path that fires timing the GUI
+        then "cannot sync"."""
+        step = 1e9 / float(self.clock_hz)
+        timing = timing_from_payload(sequence_payload)   # parses str / dict / object
+        if isinstance(timing, PulseTableState):
+            table = timing.snapped(time_step_ns=step)
+        else:
+            table = PulseTableState.from_sequence(timing, channels=self.channels, clock_hz=self.clock_hz)
+        self.last_payload_json = json.dumps(table.to_dict())
 
     def fire(self, sequence_payload=None) -> dict[str, object]:
         with self._lock:
@@ -950,6 +956,10 @@ class SequencerService:
                 )
                 if requested.sequence_id != program.sequence_id:
                     raise RuntimeError("fire(sequence) does not match the prepared runtime program.")
+                # fire() with an explicit sequence (a Task / API caller) records it too, so a
+                # sync AFTER the task started reflects what is RUNNING (prepare alone used to be
+                # the only recorder -> a fired-but-not-prepared-here sequence left a stale table).
+                self._record_source_payload(sequence_payload)
             if self.fire_callback is not None:
                 self.fire_callback(program)
             self.state = "running"

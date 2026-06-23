@@ -73,6 +73,23 @@ DELAY_MAX_TICKS = (1 << 31) - 1
 SCAN_SLOT_KINDS = ("duration", "dac")
 SLOT_VAR_RE = re.compile(r"^s(?P<index>\d+)$")
 
+#: API-slot kinds.  An API slot is a NAMED HANDLE (``a1``, ``a2`` ...) on a field so
+#: an external caller / Task can set it BY NAME -- ``state.set_api("a1", 1e-3)`` or
+#: ``state.a1 = 1e-3`` -- without parsing "which signal of which period".  UNLIKE a
+#: scan slot it does NOT rewrite the field to a variable: the field keeps its concrete
+#: value (the slot is just a stable label pointing at it), so the GUI keeps showing the
+#: number.  Delay IS allowed (a fixed value the API may set), so all three kinds qualify.
+API_SLOT_KINDS = ("duration", "delay", "dac")
+API_VAR_RE = re.compile(r"^a(?P<index>\d+)$")
+
+
+def api_var(index: int) -> str:
+    """Return the API-slot handle name for 1-based ``index`` (``a1``, ``a2`` ...)."""
+
+    if int(index) < 1:
+        raise ValueError("api slot index must be >= 1.")
+    return f"a{int(index)}"
+
 
 def _cyclic_shift_interval(start: int, stop: int, delay: int, total: int) -> list[tuple[int, int]]:
     """Shift an ON interval ``[start, stop)`` later by ``delay`` steps, CYCLICALLY
@@ -164,6 +181,47 @@ class ScanSlot:
 
 
 @dataclass(frozen=True)
+class ApiSlot:
+    """One API-settable field handle.
+
+    ``name`` is the handle (``a1``, ``a2`` ...); ``kind`` is one of
+    :data:`API_SLOT_KINDS`; ``target`` identifies the bound field exactly like
+    :class:`ScanSlot` (period index for ``duration``, channel name for ``delay``,
+    ``"<bus>@<period_index>"`` for ``dac``); ``unit`` is the unit a bare
+    ``set_api(name, value)`` interprets ``value`` in.  SEVERAL slots may share one
+    ``name`` so one ``set_api`` updates several fields in lockstep (e.g. the two long
+    reference frames of a long-short-long bracket both carry ``a1``).  Unlike a scan
+    slot, the bound field keeps its concrete value -- the slot is only a label.
+    """
+
+    name: str
+    kind: str
+    target: str
+    unit: str = "ns"
+
+    def __post_init__(self) -> None:
+        if not API_VAR_RE.match(str(self.name)):
+            raise ValueError(f"api slot name must look like a1/a2..., got {self.name!r}.")
+        if self.kind not in API_SLOT_KINDS:
+            raise ValueError(f"api slot kind must be one of {API_SLOT_KINDS}, got {self.kind!r}.")
+        object.__setattr__(self, "name", str(self.name))
+        object.__setattr__(self, "target", str(self.target))
+        object.__setattr__(self, "unit", str(self.unit))
+
+    def to_dict(self) -> dict[str, object]:
+        return {"name": self.name, "kind": self.kind, "target": self.target, "unit": self.unit}
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "ApiSlot":
+        return cls(
+            name=str(payload.get("name", "a1")),
+            kind=str(payload.get("kind", "duration")),
+            target=str(payload.get("target", "")),
+            unit=str(payload.get("unit", "ns")),
+        )
+
+
+@dataclass(frozen=True)
 class PulsePeriod:
     """One period-card in the pulse GUI."""
 
@@ -225,6 +283,7 @@ class PulseTableState:
         name: str | None = None,
         scan_slots: Sequence[ScanSlot | Mapping[str, object]] | None = None,
         scan_table: Sequence[Sequence[float]] | None = None,
+        api_slots: Sequence[ApiSlot | Mapping[str, object]] | None = None,
         time_step_ns: float = 1.0,
         repeat_start: int | None = None,
         repeat_end: int | None = None,
@@ -244,6 +303,9 @@ class PulseTableState:
         self.time_step_ns = positive_time_step_ns(time_step_ns)
         self.scan_slots = [slot if isinstance(slot, ScanSlot) else ScanSlot.from_dict(slot) for slot in (scan_slots or [])]
         self.scan_table = _normalize_scan_table(scan_table, n_slots=len(self.scan_slots))
+        # API slots: named handles (a1/a2...) the API/Task set by name (set_api / state.aN).
+        # Set EARLY so the ``state.aN = value`` attribute sugar (__setattr__) can find them.
+        self.api_slots = [slot if isinstance(slot, ApiSlot) else ApiSlot.from_dict(slot) for slot in (api_slots or [])]
         self.periods = list(periods or default_periods(self.channels))
         self.delays = {str(k): v for k, v in dict(delays or {}).items()}
         self.delay_units = {str(k): str(v) for k, v in dict(delay_units or {}).items()}
@@ -452,6 +514,124 @@ class PulseTableState:
         for new_index, slot in enumerate(self.scan_slots):
             self._apply_slot_binding(new_index, slot)
 
+    # -- API slot helpers (named handles the API/Task set by name) ----------
+
+    def api_names(self) -> list[str]:
+        """Distinct API-slot handle names in slot order (``["a1", "a2", ...]``)."""
+
+        seen: list[str] = []
+        for slot in self.api_slots:
+            if slot.name not in seen:
+                seen.append(slot.name)
+        return seen
+
+    def api_slot_for(self, kind: str, target: str) -> str | None:
+        """The API handle bound to field ``(kind, target)``, or ``None``."""
+
+        for slot in self.api_slots:
+            if slot.kind == kind and slot.target == str(target):
+                return slot.name
+        return None
+
+    def _next_api_name(self) -> str:
+        used = {int(m.group("index")) for s in self.api_slots if (m := API_VAR_RE.match(s.name))}
+        index = 1
+        while index in used:
+            index += 1
+        return api_var(index)
+
+    def bind_api_field(self, kind: str, target: str, *, unit: str | None = None, name: str | None = None) -> str:
+        """Tag field ``(kind, target)`` as an API slot and return its handle name.
+
+        Idempotent: re-binding an already API-bound field returns its existing name.
+        Does NOT change the field's value (the number stays); the slot is only a label
+        the API sets by name.  A SCAN-bound field must be unbound first (a field is
+        scanned OR api-settable, not both) -- the GUI cycle handles that ordering.
+        """
+
+        if kind not in API_SLOT_KINDS:
+            raise ValueError(f"api slot kind must be one of {API_SLOT_KINDS}, got {kind!r}.")
+        existing = self.api_slot_for(kind, str(target))
+        if existing is not None:
+            return existing
+        if kind in SCAN_SLOT_KINDS and self.slot_index_for(kind, str(target)) is not None:
+            raise ValueError(f"{kind} {target!r} is scan-bound; unbind its scan slot before making it an API slot.")
+        name = str(name) if name else self._next_api_name()
+        if not API_VAR_RE.match(name):
+            raise ValueError(f"api slot name must look like a1/a2..., got {name!r}.")
+        if unit is None:
+            unit = "value" if kind == "dac" else (self.delay_units.get(str(target), "ns") if kind == "delay" else "ns")
+        self.api_slots.append(ApiSlot(name=name, kind=kind, target=str(target), unit=str(unit)))
+        self.validate()
+        return name
+
+    def unbind_api_field(self, kind: str, target: str) -> "PulseTableState":
+        """Remove the API slot on field ``(kind, target)`` (the value is untouched)."""
+
+        self.api_slots = [s for s in self.api_slots if not (s.kind == kind and s.target == str(target))]
+        self.validate()
+        return self
+
+    def set_api(self, name: str, value: float, *, unit: str | None = None) -> "PulseTableState":
+        """Set EVERY field tagged with API handle ``name`` to ``value``.
+
+        The value is interpreted in the slot's own ``unit`` unless ``unit`` overrides it.
+        Several fields may share one handle (e.g. ``a1`` on both long frames of a
+        long-short-long bracket), so one call updates them in lockstep.  Raises if no
+        field carries ``name`` (fail loud -- a silent no-op would hide a stale template)."""
+
+        slots = [s for s in self.api_slots if s.name == str(name)]
+        if not slots:
+            raise ValueError(
+                f"no API slot named {name!r}; this pulse exposes {self.api_names() or '[]'}. "
+                "Tag a field as an API slot first (GUI: click a cell to a-state; API: bind_api_field).")
+        for slot in slots:
+            self._set_api_field(slot, value, unit if unit is not None else slot.unit)
+        return self
+
+    def _set_api_field(self, slot: ApiSlot, value: float, unit: str) -> None:
+        if slot.kind == "duration":
+            self.set_period_duration(int(slot.target), float(value), unit=unit)
+        elif slot.kind == "delay":
+            self.delays[slot.target] = float(value)
+            self.delay_units[slot.target] = str(unit)
+            self.validate()
+        elif slot.kind == "dac":
+            bus, period_index = slot.target.split("@", 1)
+            period_index = int(period_index)
+            plan = self.analog_bus_plan(bus)
+            mode = str(plan[period_index].get("mode", "hold")).strip().lower() if period_index < len(plan) else "hold"
+            plan[period_index] = {"mode": mode if mode == "ramp" else "edge", "value": int(round(float(value)))}
+            self.analog_bus_modes[bus] = plan
+            self.validate()
+
+    def _read_api_field(self, slot: ApiSlot) -> float:
+        if slot.kind == "duration":
+            return float(self.periods[int(slot.target)].duration_ns(slots=self.reference_slots())) / UNITS_TO_NS.get(slot.unit, 1.0)
+        if slot.kind == "delay":
+            return eval_time_expr(self.delays.get(slot.target, 0.0), slots=self.reference_slots())
+        bus, period_index = slot.target.split("@", 1)
+        plan = self.analog_bus_plan(bus)
+        entry = plan[int(period_index)] if int(period_index) < len(plan) else {}
+        return float(entry.get("value") or 0.0)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        # Sugar: ``state.a1 = 1e-3`` sets the API slot named "a1" (only once the slot
+        # exists; never shadows a real attribute -- no real field is named a<int>).
+        if (API_VAR_RE.match(name) and "api_slots" in self.__dict__
+                and any(s.name == name for s in self.api_slots)):
+            self.set_api(name, value)  # type: ignore[arg-type]
+            return
+        object.__setattr__(self, name, value)
+
+    def __getattr__(self, name: str) -> float:
+        # Only invoked when normal lookup fails -> read an API slot by name.
+        if API_VAR_RE.match(name):
+            for slot in self.__dict__.get("api_slots", []):
+                if slot.name == name:
+                    return self._read_api_field(slot)
+        raise AttributeError(name)
+
     def set_scan_table(self, rows: Sequence[Sequence[float]]) -> "PulseTableState":
         self.scan_table = _normalize_scan_table(rows, n_slots=len(self.scan_slots))
         self.validate()
@@ -650,7 +830,25 @@ class PulseTableState:
             self.delay_steps(channel, slots=slots, time_step_ns=step_ns)
         if validate_scan_slots:
             self._validate_scan_slots()
+        self._validate_api_slots()
         return self
+
+    def _validate_api_slots(self) -> None:
+        known_buses = self.bus_channels(min_width=1)
+        for slot in self.api_slots:
+            if slot.kind == "duration":
+                period_index = int(slot.target) if slot.target.lstrip("-").isdigit() else -1
+                if period_index < 0 or period_index >= len(self.periods):
+                    raise ValueError(f"api slot {slot.name!r} binds duration of missing period {slot.target!r}.")
+            elif slot.kind == "delay":
+                if slot.target not in self.channels:
+                    raise ValueError(f"api slot {slot.name!r} binds delay of unknown channel {slot.target!r}.")
+            elif slot.kind == "dac":
+                bus, _, period = slot.target.partition("@")
+                if bus not in known_buses:
+                    raise ValueError(f"api slot {slot.name!r} binds unknown analog bus {bus!r}.")
+                if not period.lstrip("-").isdigit() or not (0 <= int(period) < len(self.periods)):
+                    raise ValueError(f"api slot {slot.name!r} binds dac of missing period {period!r}.")
 
     def _validate_scan_slots(self) -> None:
         for index, slot in enumerate(self.scan_slots):
@@ -1009,71 +1207,6 @@ class PulseTableState:
         self.validate()
         return self
 
-    def with_imaging_exposure(self, seconds: float) -> "PulseTableState":
-        """Return a COPY whose imaging window lasts ``seconds`` -- the "set the exposure on
-        the loaded template" step of a calibration pass.  The imaging window is the period
-        named ``image`` (case-insensitive); failing that, the last period.  The original is
-        left unchanged (callers reuse one template for several exposures)."""
-        import copy
-        idx = period_index_by_name(self, "image")
-        if idx is None:
-            if not self.periods:
-                return self
-            idx = len(self.periods) - 1
-        clone = copy.deepcopy(self)
-        clone.set_period_duration(idx, float(seconds), unit="s")
-        return clone
-
-    def with_imaging_bracket(self, exposures, *, gap_seconds: float = READOUT_GAP_SECONDS) -> "PulseTableState":
-        """Return a COPY that loads the atoms ONCE and images them ``len(exposures)`` times in a
-        row -- the Rb87 reference-bracket flow.  The periods BEFORE the ``image`` window (the
-        load / cooling cycle) run ONCE; then the ``image`` window is repeated once per entry in
-        ``exposures`` (seconds), each its OWN emCCD trigger, separated by a short readout GAP that
-        holds only the channels that stay on through the WHOLE load (the trap) so the camera sees
-        DISTINCT triggers -- back-to-back image periods would keep emCCD HIGH the whole time and
-        read as ONE trigger.  Any periods AFTER the ``image`` window (e.g. a release/park step) are
-        preserved once at the end.
-
-        So ``exposures=[0.02, 0.005, 0.02]`` is the 20ms-5ms-20ms long-short-long bracket: one
-        cooling load, three consecutive emCCD exposures on the SAME atoms (the two long frames
-        bracket the short readout to vote ground truth).  This is how the Calibrate task turns the
-        loaded template into its bracket -- purely by setting the per-frame image durations, with
-        nothing hard-coded.  The original is unchanged."""
-        import copy
-        exposures = [float(e) for e in exposures]
-        if not exposures:
-            raise ValueError("with_imaging_bracket needs at least one exposure.")
-        idx = period_index_by_name(self, "image")
-        if idx is None:
-            if not self.periods:
-                return self
-            idx = len(self.periods) - 1
-        image = self.periods[idx]
-        pre = list(self.periods[:idx])                 # the load / cooling cycle (runs once)
-        post = list(self.periods[idx + 1:])            # anything after imaging (release/park) -- kept once
-        width = len(self.channels)
-        # The readout gap holds ONLY the PERSISTENT confinement -- a channel on in BOTH the load
-        # AND the image window (the trap).  That deliberately EXCLUDES cooling (on in the load but
-        # OFF in the image): re-asserting cooling between exposures would re-cool/rearrange the
-        # atoms mid-bracket, so the two long frames would no longer label the SAME atoms and the
-        # labels become meaningless.  It also excludes the probe + camera trigger (off in the load),
-        # so they DROP in the gap and each image window is a DISTINCT emCCD trigger.  An image-first
-        # template (no pre/load period) has no trap to identify, so the gap holds nothing.
-        held = tuple(1 if (pre and image.states[i] and all(p.states[i] for p in pre)) else 0
-                     for i in range(width))
-        periods = copy.deepcopy(pre)
-        single = len(exposures) == 1
-        for k, exposure in enumerate(exposures):
-            periods.append(PulsePeriod(exposure, tuple(image.states), unit="s",
-                                       name="image" if single else f"image_{k}"))
-            if k < len(exposures) - 1:
-                periods.append(PulsePeriod(float(gap_seconds), held, unit="s", name=f"readout_gap_{k}"))
-        periods.extend(copy.deepcopy(post))
-        clone = copy.deepcopy(self)
-        clone.periods = periods
-        clone.validate()
-        return clone
-
     def set_period_name(self, period_index: int, name: str) -> "PulseTableState":
         """Rename period ``period_index`` (the GUI's period-name edit)."""
         period_index = int(period_index)
@@ -1200,6 +1333,16 @@ class PulseTableState:
                 bus, period_index = slot.target.split("@", 1)
                 payload["target"] = f"{bus}@{self._expand_bracket_index(int(period_index))}"
             scan_slots.append(payload)
+
+        api_slots: list[dict[str, object]] = []
+        for slot in self.api_slots:
+            payload = slot.to_dict()
+            if slot.kind == "duration" and str(slot.target).lstrip("-").isdigit():
+                payload["target"] = str(self._expand_bracket_index(int(slot.target)))
+            elif slot.kind == "dac":
+                bus, period_index = slot.target.split("@", 1)
+                payload["target"] = f"{bus}@{self._expand_bracket_index(int(period_index))}"
+            api_slots.append(payload)   # delay slots target a channel name -> no remap
 
         return type(self)(
             channels=list(self.channels),
@@ -1361,6 +1504,7 @@ class PulseTableState:
             "channels": list(self.channels),
             "scan_slots": [slot.to_dict() for slot in self.scan_slots],
             "scan_table": [list(row) for row in self.scan_table],
+            "api_slots": [slot.to_dict() for slot in self.api_slots],
             "time_step_ns": self.time_step_ns,
             "periods": [period.to_dict() for period in self.periods],
             "visible_channels": list(self.visible_channels),
@@ -1423,6 +1567,7 @@ class PulseTableState:
             channels=payload["channels"],
             scan_slots=payload.get("scan_slots", ()),
             scan_table=payload.get("scan_table", ()),
+            api_slots=payload.get("api_slots", ()),
             time_step_ns=float(payload.get("time_step_ns", 1.0)),
             periods=[PulsePeriod.from_dict(item) for item in payload.get("periods", [])],
             visible_channels=payload.get("visible_channels"),
@@ -1487,18 +1632,68 @@ def default_imaging_template(
     channels: Sequence[str] | None = None,
     *,
     cooling: float = 2e-3,
-    exposure: float = 20e-3,
+    reference_exposure: float = 20e-3,
+    readout_exposure: float = 5e-3,
+    gap: float = READOUT_GAP_SECONDS,
     trap_channel: str = "trap",
     cooling_channel: str = "cooling",
     probe_channel: str = "probe",
     trigger_channel: str = "emCCD",
 ) -> "PulseTableState":
-    """A clean two-period imaging program (``load`` -> ``image``) as an editable
-    :class:`PulseTableState` -- the REAL, inspectable template the Calibrate task loads
-    (no opaque "built-in" sentinel).  ``load`` cools the cloud; ``image`` turns the probe
-    on and triggers the camera for the exposure.  The Calibrate task sets the ``image``
-    period's duration per pass with :meth:`PulseTableState.with_imaging_exposure`, so the
-    workflow is literally "load a template, set the exposure, run"."""
+    """The real, inspectable imaging program the Calibrate task loads -- a literal
+    CONTINUOUS long-short-long bracket (NOT a single window the task secretly unrolls).
+
+    One ``load`` (cooling) cycle, then three back-to-back camera exposures on the SAME
+    atoms -- ``image_0`` (long reference), ``image_1`` (short readout), ``image_2`` (long
+    reference) -- each its own emCCD trigger, separated by a ``gap`` that HOLDS ONLY the
+    trap (cooling/probe/trigger off) so the camera falls and re-arms between frames WITHOUT
+    re-cooling (re-cooling would scramble the atoms and void the reference labels).
+
+    The two long-frame durations are the API slot ``a1`` and the short readout is ``a2``,
+    so the Calibrate task sets the exposures BY NAME (``state.set_api("a1", long)``,
+    ``state.set_api("a2", short)``) -- it only changes those durations, never the
+    structure.  What you load IS what is fired: open this template in the pulse GUI and you
+    see exactly the long-short-long the task runs."""
+
+    chans = list(channels) if channels else [trap_channel, cooling_channel, probe_channel, trigger_channel]
+
+    def states(active) -> tuple[int, ...]:
+        return tuple(1 if ch in active else 0 for ch in chans)
+
+    image = states({trap_channel, probe_channel, trigger_channel})
+    held = states({trap_channel})   # gap: trap held, NO cooling -> no re-cool between frames
+    periods = [
+        PulsePeriod(float(cooling), states({trap_channel, cooling_channel}), unit="s", name="load"),
+        PulsePeriod(float(reference_exposure), image, unit="s", name="image_0"),
+        PulsePeriod(float(gap), held, unit="s", name="gap_0"),
+        PulsePeriod(float(readout_exposure), image, unit="s", name="image_1"),
+        PulsePeriod(float(gap), held, unit="s", name="gap_1"),
+        PulsePeriod(float(reference_exposure), image, unit="s", name="image_2"),
+    ]
+    state = PulseTableState(channels=chans, periods=periods, name="imaging_template")
+    # API handles so the Calibrate task sets exposures by name: a1 = both long reference
+    # frames (shared), a2 = the short readout frame.
+    state.bind_api_field("duration", "1", name="a1", unit="s")
+    state.bind_api_field("duration", "5", name="a1", unit="s")
+    state.bind_api_field("duration", "3", name="a2", unit="s")
+    return state
+
+
+def single_imaging_template(
+    channels: Sequence[str] | None = None,
+    *,
+    cooling: float = 2e-3,
+    exposure: float = 5e-3,
+    trap_channel: str = "trap",
+    cooling_channel: str = "cooling",
+    probe_channel: str = "probe",
+    trigger_channel: str = "emCCD",
+) -> "PulseTableState":
+    """A SINGLE-shot imaging program (``load`` -> one ``image`` frame, ONE camera trigger) --
+    the base pulse for a generic single-image measurement (e.g. the Pulse-scan, which images
+    ONCE per scan point), as opposed to the Calibrate task's long-short-long
+    :func:`default_imaging_template` (three triggers).  The ``image`` duration is API slot
+    ``a1`` so a notebook/API can set the exposure by name."""
 
     chans = list(channels) if channels else [trap_channel, cooling_channel, probe_channel, trigger_channel]
 
@@ -1509,7 +1704,9 @@ def default_imaging_template(
         PulsePeriod(float(cooling), states({trap_channel, cooling_channel}), unit="s", name="load"),
         PulsePeriod(float(exposure), states({trap_channel, probe_channel, trigger_channel}), unit="s", name="image"),
     ]
-    return PulseTableState(channels=chans, periods=periods, name="imaging_template")
+    state = PulseTableState(channels=chans, periods=periods, name="probe_template")
+    state.bind_api_field("duration", "1", name="a1", unit="s")   # image exposure, settable by name
+    return state
 
 
 def default_visible_channels(channels: Sequence[str]) -> list[str]:
@@ -2051,7 +2248,7 @@ class PulseParam:
 def period_index_by_name(state: "PulseTableState", name: str) -> int | None:
     """Index of the first period whose name matches ``name`` (case-insensitive, stripped), or
     ``None`` if no period carries that name.  The single source for name->index resolution
-    (``with_imaging_exposure`` and the scan-target enumeration both use it)."""
+    (the scan-target enumeration + any name-based period lookup use it)."""
 
     key = str(name).strip().lower()
     return next((i for i, p in enumerate(state.periods)

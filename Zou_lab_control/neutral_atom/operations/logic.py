@@ -638,13 +638,13 @@ class CalibrateReadoutTask(Task):
     provides = ("centers", "thresholds", "n_sites")
     mid_run = ("frame", "progress", "stage")   # streamed to the dedicated mid-run panel + banner
 
-    # The imaging pulse TEMPLATE the cali loads -- a REAL, inspectable program (no opaque
-    # "built-in" sentinel).  A bare name resolves to the shipped configs template; an
-    # absolute path to the user's own PulseTableState .json.  Each cali pass LOADS it and
-    # images it long-short-long (with_imaging_bracket): the template's OWN 'image'-window
-    # duration is the LONG reference exposure, readout_exposure the SHORT middle frame --
-    # "load a template, set the durations, on/off, run".  The cali no longer chooses a readout
-    # METHOD: it computes ALL methods (box / per-site PSF / uniform PSF) and the
+    # The imaging pulse TEMPLATE the cali loads -- a REAL, inspectable program that IS the
+    # long-short-long bracket (3 emCCD frames in one cooling cycle), not a single window the
+    # task secretly unrolls.  A bare name resolves to the shipped ``pulses/`` template; an
+    # absolute path to the user's own PulseTableState .json.  Each cali pass LOADS it and sets
+    # ONLY the two exposures BY NAME -- API slot a1 = the long reference frame(s), a2 = the
+    # short readout -- so what is fired == the template file.  The cali does not choose a
+    # readout METHOD: it computes ALL methods (box / per-site PSF / uniform PSF) and the
     # OccupancyProcessor picks one.
     # The ONE canonical default imaging-template path (the cali task spec + the generic
     # Pulse-scan measurement both reference THIS, so every GUI form shows the same real,
@@ -703,13 +703,14 @@ class CalibrateReadoutTask(Task):
         self.calibration_sink = calibration_sink
         self.grid_shape = grid_shape_tuple(grid_shape)
         self.roi_radius = int(roi_radius)
-        # The Rb87 reference bracket is built from TWO operator-set exposures (exactly as the real
-        # rb87 readout sets a 20 ms reference + a 5 ms readout): ``reference_exposure`` is the LONG
-        # frame (high-SNR -> votes ground truth + builds the site map / PSF) and ``readout_exposure``
-        # is the SHORT middle frame (the actual readout duration whose per-site thresholds are
-        # learnt).  ``_collect_bracket_groups`` sets the template's image windows to
-        # [long, short, long] from these two values -- so editing them HERE drives the cali pulse;
-        # the template only supplies the channels + the ONE cooling/load cycle.
+        # The Rb87 reference bracket comes from the TEMPLATE (a literal long-short-long), and these
+        # two operator-set exposures only set its frame DURATIONS by name (exactly as the real rb87
+        # readout sets a 20 ms reference + a 5 ms readout): ``reference_exposure`` is the LONG frame
+        # (high-SNR -> votes ground truth + builds the site map / PSF; written to API slot ``a1``,
+        # which the template's long reference frame(s) carry) and ``readout_exposure`` is the SHORT
+        # readout frame (its per-site thresholds are learnt; API slot ``a2``).  ``_collect_bracket_groups``
+        # does ``set_api("a1", long)`` / ``set_api("a2", short)`` -- it changes ONLY those durations,
+        # never the structure, so what is fired == the template file.
         self.reference_exposure = float(reference_exposure)
         self.readout_exposure = float(readout_exposure)
         self.pulse_template = str(pulse_template or self.DEFAULT_PULSE_TEMPLATE)
@@ -874,10 +875,6 @@ class CalibrateReadoutTask(Task):
                                     if template else None)
         return calibration
 
-    #: The number of long reference frames bracketing each short readout (a "20-5-20" shot):
-    #: two long images, one before and one after, vote ground truth by strict consensus.
-    REFERENCE_FRAMES_PER_BRACKET = 2
-
     def _apply_reference_thresholds(self, calibration, ref_groups, readout_by_group):
         """Score each readout method's HELD-OUT fidelity against the bracket-voted ground
         truth and write the reference-trained per-site thresholds back into the calibration,
@@ -904,6 +901,26 @@ class CalibrateReadoutTask(Task):
             trained[m] = thr
         return calibration.with_method_thresholds(trained, threshold_method="per_site_reference")
 
+    def _imaging_layout(self, state) -> tuple[int, int]:
+        """``(n_frames, readout_index)`` read from the loaded imaging template: the
+        camera-trigger periods IN FIRE ORDER are the frames, and the one tagged API slot
+        ``a2`` (the short readout) is the readout -- the rest are the long references that
+        vote ground truth (else the middle frame).  The cali images exactly the
+        long-short-long the FILE defines: it does not invent a bracket."""
+        from ..timing import DEFAULT_CAMERA_TRIGGER_CHANNELS
+        trig = [c for c in (getattr(self.sequencer, "trigger_channels", None) or DEFAULT_CAMERA_TRIGGER_CHANNELS)
+                if c in state.channels]
+        bits = [state.channels.index(c) for c in trig]
+        frame_periods = [i for i, p in enumerate(state.periods) if any(p.states[b] for b in bits)]
+        if len(frame_periods) < 2:
+            raise ValueError(
+                "the imaging template must trigger the camera at least twice (>=1 long reference "
+                "frame + 1 short readout) -- a long-short-long bracket. Open the template in the "
+                "pulse GUI and add the camera-trigger frames.")
+        a2 = {int(s.target) for s in state.api_slots if s.name == "a2" and s.kind == "duration"}
+        readout_index = next((frame_periods.index(i) for i in frame_periods if i in a2), len(frame_periods) // 2)
+        return len(frame_periods), readout_index
+
     def _collect_bracket_groups(self, out: "TaskOutput", *, progress_lo: float, progress_hi: float):
         """Acquire ``threshold_frames`` reference BRACKETS.  Each bracket is ONE correlated
         shot -- a long-short-long camera sequence imaging the SAME atom loading (the trap is
@@ -913,33 +930,37 @@ class CalibrateReadoutTask(Task):
         ``readout_per_group[g]`` is the short readout frame scored against them.  Honours the
         Stop event between brackets (interruptible).  Identical on real hardware -- only the
         camera frames' author differs (``virtual == real``)."""
-        n_ref = int(self.REFERENCE_FRAMES_PER_BRACKET)
-        readout_index = n_ref // 2
-        # Build the bracket BY SETTING THE TEMPLATE's image-window durations to the operator's two
-        # exposures (with_imaging_bracket): ONE cooling/load cycle, then the image window repeated
-        # long-short-long = [reference_exposure, readout_exposure, reference_exposure] -- three
-        # CONSECUTIVE emCCD triggers on the SAME atoms within that single cooling cycle (NO
-        # re-cooling between frames, so the two long frames bracket and label the SAME atoms; this
-        # is what makes the labels physically meaningful).  The template only supplies the channels
-        # + the cooling/load cycle (load/cooling/probe/emCCD on virtual, the same chNN the real
-        # template names on hardware) -> virtual == real.
-        exposures = [self.readout_exposure if i == readout_index else self.reference_exposure
-                     for i in range(n_ref + 1)]
+        # The imaging template IS the long-short-long bracket: ONE cooling/load cycle, then the
+        # camera-trigger frames back-to-back with trap-held gaps (no re-cooling between them, so
+        # the long frames bracket and label the SAME atoms).  The cali ONLY sets the exposures
+        # BY NAME -- api slot a1 = the long reference frame(s), a2 = the short readout -- so
+        # editing reference_exposure/readout_exposure changes those durations and NOTHING else.
+        # What is fired == the template the operator chose: file == fired.
         template = self._resolve_template(self.pulse_template)
-        bracket = template.with_imaging_bracket(exposures).to_sequence(name="reference_bracket")
+        try:
+            template.set_api("a1", self.reference_exposure)   # long reference exposure(s)
+            template.set_api("a2", self.readout_exposure)     # short readout exposure
+        except ValueError as exc:
+            raise ValueError(
+                f"{exc}  The Calibrate task sets the imaging template's exposures by API slot: tag "
+                "the long reference-frame durations as 'a1' and the short readout as 'a2' (pulse GUI: "
+                "click a duration cell to its API state).") from exc
+        n_frames, readout_index = self._imaging_layout(template)
+        self._readout_index = readout_index                    # shared with _save_live_frames
+        bracket = template.to_sequence(name="reference_bracket")
         n_groups = max(2, int(self.threshold_frames))
         reference_groups: list = []
         readout_per_group: list = []
         for g in range(n_groups):
             if self._stop.is_set():
                 break
-            batch = self.camera.acquire(n_ref + 1, sequence=bracket, sequencer=self.sequencer,
+            batch = self.camera.acquire(n_frames, sequence=bracket, sequencer=self.sequencer,
                                         stop=self._stop)
             frames = [np.asarray(f, dtype=float) for f in batch]
             readout_per_group.append(frames[readout_index])
             reference_groups.append([f for i, f in enumerate(frames) if i != readout_index])
             frac = progress_lo + (progress_hi - progress_lo) * (g + 1) / n_groups
-            # Stream the LONG reference frame (the high-SNR image the site map is built from)
+            # Stream the FIRST long reference frame (the high-SNR image the site map is built from)
             # so the operator watches the site-finding data accumulate, not just the short readout.
             out.publish(frame=frames[0], progress=frac, stage=f"reference bracket {g + 1}/{n_groups} (long-short-long)")
         return reference_groups, readout_per_group
@@ -966,18 +987,22 @@ class CalibrateReadoutTask(Task):
         folder = Path(self.folder)
         frames_dir = folder / self.FRAMES_SUBDIR
         frames_dir.mkdir(parents=True, exist_ok=True)
-        n_ref = int(self.REFERENCE_FRAMES_PER_BRACKET)
-        readout_index = n_ref // 2
+        # The readout frame's position within the bracket is the template-derived layout the
+        # live acquisition used (``_collect_bracket_groups`` stored it) -- so the saved run
+        # re-reads with the SAME grouping the template defines (any frame count, not a hard 3).
+        readout_index = int(getattr(self, "_readout_index", len(ref_groups[0]) // 2 if ref_groups else 1))
         n = 0
+        shots_per_group = 1
         for refs, short in zip(ref_groups, readout_by_group):
             refs = list(refs)
             group = refs[:readout_index] + [short] + refs[readout_index:]   # trigger order
+            shots_per_group = len(group)
             for fr in group:
                 n += 1
                 save_frame(frames_dir / f"img{n}.npy", np.asarray(fr, dtype=float))
         short_shot = readout_index + 1                       # 1-based position of the short frame
-        ref_shots = [i for i in range(1, n_ref + 2) if i != short_shot]
-        schema = {"prefix": "img", "shots_per_group": n_ref + 1, "short_shot": short_shot,
+        ref_shots = [i for i in range(1, shots_per_group + 1) if i != short_shot]
+        schema = {"prefix": "img", "shots_per_group": shots_per_group, "short_shot": short_shot,
                   "ref_shots": ref_shots, "n_groups": int(len(readout_by_group)),
                   "frames_subdir": self.FRAMES_SUBDIR}
         (folder / "run_schema.json").write_text(json.dumps(schema, indent=2), encoding="utf-8")

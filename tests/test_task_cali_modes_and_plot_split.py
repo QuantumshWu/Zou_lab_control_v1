@@ -148,10 +148,17 @@ def test_calibrate_task_builds_long_short_long_bracket_from_two_exposures(tmp_pa
         assert params["reference_exposure"] == pytest.approx(0.030)   # LONG is a real param
         assert params["readout_exposure"] == pytest.approx(0.005)     # SHORT is a real param
 
-        # The bracket is built from the TWO exposures: [long, short, long] = 30-5-30, ONE cooling,
-        # the trap held continuously (no re-cool), three consecutive emCCD on the SAME atoms.
-        bracket = st.with_imaging_bracket(
-            [task.reference_exposure, task.readout_exposure, task.reference_exposure]).to_sequence(name="ref")
+        # file == fired: the TEMPLATE FILE itself is the long-short-long bracket (3 emCCD
+        # frames already in it, not derived at fire time) -- the user's complaint that the
+        # template "still has only one emCCD" must never recur.
+        emccd_bit = st.channels.index("emCCD")
+        assert sum(1 for p in st.periods if p.states[emccd_bit]) == 3
+        # The cali sets ONLY the two exposures BY NAME (a1 = long reference frames, a2 = short
+        # readout) and fires THAT template -- it does not invent or unroll a bracket.
+        fired = task._resolve_template(task.pulse_template)
+        fired.set_api("a1", task.reference_exposure)
+        fired.set_api("a2", task.readout_exposure)
+        bracket = fired.to_sequence(name="ref")
         cooling = [(p.start, p.duration) for p in bracket.pulses if p.channel == "cooling" and p.value]
         trap = [p for p in bracket.pulses if p.channel == "trap" and p.value]
         emccd = sorted(p.start for p in bracket.pulses if p.channel == "emCCD" and p.value)
@@ -420,37 +427,30 @@ def test_gui_measurement_node_is_plot_false_publishes_to_hub_only():
         exp.close()
 
 
-def test_with_imaging_bracket_edge_cases_three_triggers_tail_and_single_source_gap():
-    """MECHANICAL guard for the R5 self-audit fixes to PulseTableState.with_imaging_bracket:
-      * an image-FIRST template (no pre-image load period) must STILL yield N DISTINCT emCCD
-        triggers -- the readout gap must hold only the load channels, NOT probe/emCCD (holding
-        the imaging window's states collapsed the whole bracket into ONE continuous trigger);
-      * periods AFTER the image window are preserved once (not silently dropped);
-      * both bracket builders default the inter-frame gap to the ONE shared source."""
-    import inspect
+def test_shipped_imaging_template_is_a_continuous_three_trigger_bracket():
+    """MECHANICAL guard that the imaging template IS the long-short-long bracket -- it is NOT a
+    single window the cali secretly unrolls (the design the user demanded).  The shipped
+    ``default_imaging_template`` (== ``pulses/imaging_template.json``) must, on its own:
+      * trigger the camera THREE DISTINCT times (the trap-held gaps keep the frames separate);
+      * cool the cloud ONCE and hold the trap continuously (no re-cool between frames);
+      * expose the two exposures as API slots a1 (the long reference frames) + a2 (the short
+        readout), so the cali sets ONLY those durations BY NAME -- file == fired."""
     from Zou_lab_control.neutral_atom.timing import default_imaging_template
-    from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState, PulsePeriod
-    from Zou_lab_control.neutral_atom.timing.sequence import (
-        count_trigger_pulses, reference_bracket_sequence, READOUT_GAP_SECONDS)
+    from Zou_lab_control.neutral_atom.timing.sequence import count_trigger_pulses
 
     st = default_imaging_template()
-    chans = list(st.channels)
-    img_states = tuple(st.periods[[p.name for p in st.periods].index("image")].states)
+    # the FILE itself triggers the camera 3x (not 1) -- a continuous bracket, no unroll needed
+    assert count_trigger_pulses(st.to_sequence(name="b")) == 3
+    cooling = [p for p in st.to_sequence(name="b").pulses if p.channel == "cooling" and p.value]
+    trap = [p for p in st.to_sequence(name="b").pulses if p.channel == "trap" and p.value]
+    assert len(cooling) == 1 and len(trap) == 1                 # one cooling load, trap held whole time
 
-    # image-FIRST template -> three DISTINCT emCCD triggers (was 1 before the held-gap fix)
-    only_image = PulseTableState(channels=chans,
-                                 periods=[PulsePeriod(0.02, img_states, unit="s", name="image")])
-    seq = only_image.with_imaging_bracket([0.02, 0.005, 0.02]).to_sequence(name="b")
-    assert count_trigger_pulses(seq) == 3
-
-    # a period AFTER the image window survives once + still three triggers
-    tail = default_imaging_template()
-    tail.periods.append(PulsePeriod(0.001, tuple(0 for _ in chans), unit="s", name="park_after"))
-    bracketed = tail.with_imaging_bracket([0.02, 0.005, 0.02])
-    assert "park_after" in [p.name for p in bracketed.periods]
-    assert count_trigger_pulses(bracketed.to_sequence(name="b2")) == 3
-
-    # single source: both builders default the inter-frame gap to READOUT_GAP_SECONDS
-    assert inspect.signature(PulseTableState.with_imaging_bracket).parameters["gap_seconds"].default \
-        == READOUT_GAP_SECONDS
-    assert inspect.signature(reference_bracket_sequence).parameters["gap"].default == READOUT_GAP_SECONDS
+    # the two exposures are API slots: a1 on BOTH long reference frames, a2 on the short readout
+    assert st.api_names() == ["a1", "a2"]
+    assert sum(1 for s in st.api_slots if s.name == "a1") == 2  # both long frames share a1
+    # setting the slots by name changes ONLY those durations -> the long-short-long the cali fires
+    st.set_api("a1", 0.03)
+    st.set_api("a2", 0.008)
+    probe = [round(p.duration, 6) for p in sorted(
+        (p for p in st.to_sequence(name="b").pulses if p.channel == "probe" and p.value), key=lambda p: p.start)]
+    assert probe == [pytest.approx(0.03), pytest.approx(0.008), pytest.approx(0.03)]
