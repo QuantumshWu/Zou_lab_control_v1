@@ -1474,6 +1474,32 @@ class PulseScanNode(Measurement):
     def finished(self) -> bool:
         return self._index >= self.n_points
 
+    def published_signals(self) -> frozenset:
+        """The signals this scan publishes (behind ``prefix``): the swept x axis, the measured y
+        curve, the scan-done flag, plus the frame it fires and (for a 2-D scan) the reshaped grid.
+        Declaring them lets the console map a panel back to THIS node (so the 1-D frame-title reads
+        ``<y> ← pulse_scan`` instead of "(no running source)") and resolve the companion x."""
+        p = self.prefix
+        keys = [p + self.x_key, p + self.y_key, p + "scan_done", "frame", "frame_0"]
+        if self.scan_shape is not None:
+            keys.append(p + self.y_key + "_grid")
+        return frozenset(keys)
+
+    def output_specs(self) -> tuple[SignalSpec, ...]:
+        """LABEL / unit / meaning per published signal -- so a 1-D panel wired to the y curve reads
+        its x-axis label+unit (the swept parameter, e.g. "Probe duration (ns)") and y label from
+        THIS node, not a hard-coded string.  Mirrors :class:`ScannedMeasurementNode.output_specs`."""
+        p = self.prefix
+        specs = [
+            SignalSpec(p + self.x_key, self._axis_label, self._axis_unit, "scan x axis (the swept parameter)"),
+            SignalSpec(p + self.y_key, self.y_key, "", "measured curve vs the scan x axis"),
+            SignalSpec(p + "scan_done", "scan done", "", "1.0 when the finite scan has completed"),
+        ]
+        if self.scan_shape is not None:
+            specs.append(SignalSpec(p + self.y_key + "_grid", self.y_key, "",
+                                    "measured y reshaped into the 2-D scan map (n0 x n1)"))
+        return tuple(specs)
+
     def shot(self) -> dict[str, object]:
         if self.finished:
             raise StopIteration("PulseScanNode: scan already complete.")

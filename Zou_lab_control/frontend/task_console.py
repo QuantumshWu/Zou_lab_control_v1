@@ -217,11 +217,19 @@ def _common_token_prefix(names) -> str:
     return common[: cut + 1] if cut >= 0 else ""
 
 
+def signal_state(name, formats) -> str:
+    """A signal has exactly TWO states (G3): "ready" when it is PUBLISHED on the hub right now
+    (so it has a live shape in ``formats``), else "waiting" -- it is declared by a node that has
+    not started / not produced yet.  No more none/unbound/error/mid-run/unpublished clutter."""
+    return "ready" if formats.get(str(name)) else "waiting"
+
+
 def grouped_signal_items(names, sources, formats) -> list:
     """``[(display, bare_name | None)]`` for a signal picker, GROUPED by producing node: a
     non-selectable bold header per node (``bare_name`` is ``None``), then that node's signals
-    indented + prefix-stripped beneath it (``    rate  [shape]``).  The ONE source every signal
-    picker shares (plot panel AND logic-node source) so a signal is always chosen the same way."""
+    indented beneath it -- prefix-stripped, with the SHAPE and the two-state tag
+    (``    rate  [(35,)] ready`` / ``    survival  waiting``).  The ONE source every signal picker
+    shares (plot panel AND logic-node source) so a signal is always chosen the same way."""
     names = sorted(str(n) for n in (names or []))
     sources = dict(sources or {})
     formats = dict(formats or {})
@@ -237,7 +245,9 @@ def grouped_signal_items(names, sources, formats) -> list:
         for name in group:
             short = name[len(strip):] if (strip and name.startswith(strip) and len(name) > len(strip)) else name
             fmt = formats.get(name)
-            items.append((f"    {short}" + (f"  [{fmt}]" if fmt else ""), name))
+            state = signal_state(name, formats)
+            shape = f"  [{fmt}]" if fmt else ""
+            items.append((f"    {short}{shape}  {state}", name))
     return items
 
 
@@ -264,8 +274,8 @@ def fill_grouped_signal_combo(combo, *, names, sources, formats, current, none_l
                     font = item.font(); font.setBold(True); item.setFont(font)
                 continue
             combo.addItem(label, name)            # indented signal; data is the bare name
-        if cur and cur not in have:               # preserve a not-yet-published name
-            combo.addItem(f"{cur}  (not yet published)", cur)
+        if cur and cur not in have:               # preserve a still-waiting (not yet published) name
+            combo.addItem(f"{cur}  waiting", cur)
         idx = combo.findData(cur)
         # No match: select the leading none-row if there is one, else leave it BLANK (index -1)
         # -- never auto-land on a disabled group HEADER (data None), whose label would otherwise
