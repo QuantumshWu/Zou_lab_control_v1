@@ -1188,3 +1188,55 @@ both, the same drift class as the shared scale rule). The contract tests in
 RELATIONS (e.g. `panel_display_size == round((data+margins)*scale)`), never re-typing the
 literal — the fix for the bug where a test asserted a stale `(110,110,100,70)` long after
 the code had moved on.
+
+## 20. Decoupled pulse-scan node + the one `signal_expr` evaluator (2026-06-23)
+
+### `operations/signal_expr.py` — the single multi-slot signal + value-expression evaluator
+A "source" anywhere in the system — a plot panel's data source, a processor's input, a
+pulse-scan's y — is the SAME object: a list of picked hub-signal names (the *slots*, read as
+`signal` / `signal[i]`) plus a one-line `value = ...` expression. `SignalExpr` owns the
+slot-packing rule (scalar for one input, list for many), the `value` contract, `co_names()`
+(names referenced + picked slots, for version-gating), an optional `resolve` hook (the
+frame-coherence rewrite, injected by the frontend, never baked into the analysis layer), and
+`hub_namespace(hub)` (latest signals + history/latest/names/shot/np/math). Dependency-free, so
+the analysis layer and the GUI share ONE definition. `PanelCard._with_signal_slots` /
+`_evaluate` / `_co_names` delegate to it; `task_console.SOURCE_EXPR_HELP()` is a lazy getter of
+`signal_expr.SIGNAL_EXPR_HELP` (one help text). `tests/test_signal_expr.py` guards it.
+
+### Pulse-scan is a device-driving `PulseScanNode`, with a DECOUPLED y
+`PulseScanNode` (`operations/logic.py`) replaces the old frame-reducing measurement. **x** = the
+scan points: api slots are FIXED once on the base state, scan slots are resolved per point via
+`PulseTableState.with_slots_resolved({s0: row, ...})` — the SAME named-slot resolver the
+hardware scan + pulse GUI use (api and scan slots are different mechanisms and stay separate; no
+clearing, no per-period editing). **y** is decoupled from the readout: per point the node fires
++ acquires the camera `frame`, PUBLISHES it (bare `frame`, the same signal a `CameraMeasurement`
+publishes), lets the subscribed consumer (e.g. a Judge-occupancy processor) recompute, then
+evaluates a `signal_expr` over the hub for y. So the readout pipeline lives in its own node and
+pulse-scan just sweeps + records its output.
+
+Settling y to THIS point's frame is **race-free without any cross-thread `step()`**:
+- GUI / live: the consumer runs on its own daemon thread, so the node WAITS for the picked y
+  signals' per-signal version (`SignalHub.signal_versions()`) to advance past the pre-publish
+  snapshot — it only READS the hub.
+- headless / notebook / tests: an optional inline `settle` callback steps the consumer once,
+  single-threaded (its thread is not running), so the value is fresh immediately.
+Both read y through the same `SignalExpr.evaluate` once the consumer is fresh. A 5 s timeout
+means a mis-wired y never wedges the scan. The device lockout (`DEVICE_DRIVING_KINDS`) makes
+pulse-scan the sole device driver; processors are not device-driving, so the workflow is: start
+the producer (occupancy) FIRST, then pulse-scan.
+
+`pulse_scan.py` `build()` returns a `PulseScanPlan` (base state + scan arrays + camera/sequencer
++ y `SignalExpr` + n_frames); the spec carries `metadata={"node": "pulse_scan"}` and the console
+builds a `PulseScanNode` (not a `ScannedMeasurementNode`) when it sees that tag. The reducer /
+calibration / `reduce` / `shots` params are gone; the params are now `template` + `pulse_slots`
+(api + scan auto-form) + `y` (signal_expr) + `n_frames`.
+
+### Every `kind="signal"` source is now `signal_expr`
+The new `ParamDecl` kind `"signal_expr"` (whitelisted in `measurement.py::ParamDecl.__post_init__`
+— `processor.py` only re-exports it) renders the reusable `_SignalExprWidget` (multi-slot
+grouped signal picker + `+/- signal` + a `value = ...` editor with the floating `Edit…`). Its
+value is `{"inputs": [...], "source": "value = ..."}`. `OccupancyProcessor.source` is one such
+field: the node builds a `SignalExpr`, sets `consumes = tuple(expr.inputs)` (so it reacts to the
+picked signals), and `transform` judges `expr.evaluate(inputs)` — `value = signal` on `frame` is
+the single-frame default, `value = (signal[0] + signal[1]) / 2` averages two. The console's
+frame-coherence resolver matches on `name in node.consumes` (the canonical reactive input set).
