@@ -247,15 +247,14 @@ _PALETTE: dict[str, Any] = {
 PALETTE: Mapping[str, Any] = MappingProxyType(_PALETTE)
 
 # Occupancy overlay on a site map: a 2D camera frame with one hollow ring per
-# tweezer, faint for an EMPTY site and bold for an OCCUPIED one (the Rb87 readout
-# look).  Single source for the site-map plot -- ring colour / opacity / stroke
-# per occupancy state (rings are always unfilled so the frame shows through).
-# An EMPTY ring must read on the darkest cmap too (a faint pale ring vanishes on grey).  A
-# saturated teal at alpha ~0.7 with a real stroke gives a visible, on-brand ring without
-# competing visually with the bold occupied ring.
+# tweezer -- WHITE/grey for an EMPTY site, a bold warm ring for an OCCUPIED one (the
+# Rb87 readout look the user prefers).  Single source for the site-map plot.  An empty
+# site sits in the DARK background, so a near-opaque WHITE ring reads clearly there
+# (the earlier faint alpha=0.22 vanished on grey -- the fix is opacity + a real stroke,
+# NOT a coloured ring); the occupied ring stays warm-orange so the two never confuse.
 SITE_OCCUPANCY_STYLE: Mapping[str, Mapping[str, Any]] = MappingProxyType({
-    "empty":    MappingProxyType({"color": "#2E8B87", "alpha": 0.70, "linewidth": 0.55}),
-    "occupied": MappingProxyType({"color": "#D07850", "alpha": 0.95, "linewidth": 0.85}),
+    "empty":    MappingProxyType({"color": "#FFFFFF", "alpha": 0.85, "linewidth": 0.6}),
+    "occupied": MappingProxyType({"color": "#D07850", "alpha": 0.95, "linewidth": 0.9}),
 })
 
 

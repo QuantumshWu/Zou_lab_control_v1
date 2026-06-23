@@ -1765,22 +1765,29 @@ class FluentCodeEdit(QtWidgets.QPlainTextEdit):
         apply_fluent_scrollbars(self)
 
 
-class FluentTextDialog(QtWidgets.QDialog):
-    """Multi-line sibling of :class:`FluentInputDialog`: a prompt label over a large
-    :class:`FluentCodeEdit`, with OK / Cancel.  The shared dialog chrome lives in ONE place,
-    so a long expression / snippet gets a comfortable floating editor without re-rolling a
-    QDialog at every call site."""
+class FluentFloatingEditor(QtWidgets.QDialog):
+    """A NON-modal floating multi-line editor: a prompt label over a large
+    :class:`FluentCodeEdit`, with **Apply + Close BELOW the box**.
+
+    Non-modal on purpose: the panel/frame behind it stays VISIBLE and INTERACTIVE, and
+    Apply updates it LIVE (you watch the plot change without dismissing the editor).  It is
+    parented to the caller's TOP-LEVEL window, so it shares that window's screen + device
+    scale -- this is what prevents the "one widget scaled, the other not" DPI bug a
+    differently-parented top-level dialog hits.  ``applied`` fires with the current text on
+    every Apply; the caller writes it back and re-renders."""
+
+    applied = QtCore.pyqtSignal(str)
 
     def __init__(self, prompt: str, text: str = "", parent=None, *, title: str = "",
-                 min_size: tuple[int, int] = (520, 220)):
-        super().__init__(parent, QtCore.Qt.WindowTitleHint | QtCore.Qt.WindowCloseButtonHint)
+                 min_size: tuple[int, int] = (560, 260)):
+        # Qt.Window: a real top-level the user can move/resize, but OWNED by ``parent`` so it
+        # rides the parent's screen/scale and is destroyed when the parent closes.
+        super().__init__(parent, QtCore.Qt.Window | QtCore.Qt.WindowTitleHint
+                         | QtCore.Qt.WindowCloseButtonHint)
         if title:
             self.setWindowTitle(title)
-        # APPLICATION-modal: blocks the whole window (not just the parent card), so the
-        # underlying frame stays visible (no parent-vanishing surprise) but cannot be
-        # clicked while the editor is open.  The parent provides the spawn anchor only.
-        self.setModal(True)
-        self.setWindowModality(QtCore.Qt.ApplicationModal)
+        self.setModal(False)                      # NON-modal: frame stays usable behind it
+        self.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
         self.setFont(QtGui.QFont(FONT, fluent_font_size()))
         self.setStyleSheet("QDialog { background: white; }")
         layout = QtWidgets.QVBoxLayout(self)
@@ -1793,21 +1800,20 @@ class FluentTextDialog(QtWidgets.QDialog):
                                   scaled_px(int(min_size[1]), minimum=int(min_size[1] * 0.7)))
         layout.addWidget(self._edit, 1)
 
+        # Apply + Close UNDER the editor (Apply = write back + re-render, keep open; Close =
+        # dismiss).  Apply is the comfortable place to commit a long expression.
         btn_row = QtWidgets.QHBoxLayout()
         btn_row.addStretch()
-        ok = FluentButton("OK", self)
-        cancel = FluentButton("Cancel", self)
-        ok.clicked.connect(self.accept)
-        cancel.clicked.connect(self.reject)
-        btn_row.addWidget(ok)
-        btn_row.addWidget(cancel)
+        apply = FluentButton("Apply", self, color=GREEN)
+        close = FluentButton("Close", self, color=GREY)
+        apply.clicked.connect(lambda: self.applied.emit(self._edit.toPlainText()))
+        close.clicked.connect(self.close)
+        btn_row.addWidget(apply)
+        btn_row.addWidget(close)
         layout.addLayout(btn_row)
 
-    def get_text(self) -> tuple[str, bool]:
-        """Show modally; return ``(text, accepted)``."""
-        if self.exec_() == QtWidgets.QDialog.Accepted:
-            return self._edit.toPlainText(), True
-        return "", False
+    def text(self) -> str:
+        return self._edit.toPlainText()
 
 
 class FluentDoubleSpinBox(QtWidgets.QDoubleSpinBox):

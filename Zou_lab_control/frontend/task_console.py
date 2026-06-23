@@ -79,7 +79,7 @@ from .qt_fluent import (
     FluentStatusDot,
     FluentSwitch,
     FluentTabWidget,
-    FluentTextDialog,
+    FluentFloatingEditor,
     FluentWindow,
     ensure_qt_app,
     fluent_widget_stylesheet,
@@ -1588,15 +1588,27 @@ class PanelCard(FluentGroupBox):
         self.changed.emit()
 
     def _open_expr_editor(self) -> None:
-        """Pop a LARGE floating editor for the panel's source expression -- the shared
-        :class:`FluentTextDialog` (a modal card, so it does not reflow the panel) prefilled with
-        the current source.  OK writes it back to the inline field and applies it; Cancel
-        discards.  The source is a single Python line, so any newlines collapse to spaces."""
-        text, ok = FluentTextDialog(SOURCE_EXPR_HELP, self.source_edit.text(), self,
-                                    title="Edit panel source expression").get_text()
-        if ok:
+        """Pop a NON-modal floating editor for the panel's source expression (the shared
+        :class:`FluentFloatingEditor`): the panel behind stays VISIBLE and live, and the
+        editor's Apply (below the box) writes the text back + re-renders so you watch the plot
+        change.  Parented to this panel's TOP-LEVEL window so it shares the same screen scale
+        (no DPI-mismatch shrink).  Re-clicking just raises the existing one."""
+        existing = getattr(self, "_expr_editor", None)
+        if existing is not None:
+            existing.raise_(); existing.activateWindow(); return
+        editor = FluentFloatingEditor(SOURCE_EXPR_HELP, self.source_edit.text(), self.window(),
+                                      title="Edit panel source expression")
+
+        def _apply(text: str) -> None:
+            # the source is one Python line -> collapse any newlines to spaces, write back to
+            # the inline field, and apply live (the panel behind updates while the editor stays).
             self.source_edit.setText(" ".join(text.split("\n")).strip())
             self._apply_source()
+
+        editor.applied.connect(_apply)
+        editor.destroyed.connect(lambda *_: setattr(self, "_expr_editor", None))
+        self._expr_editor = editor
+        editor.show()
 
     def _rerender_last(self) -> None:
         """Re-render from the LAST namespace instead of waiting for the next hub tick.
@@ -2655,7 +2667,7 @@ class PanelEditor(QtWidgets.QWidget):
                 # not a flat/empty combo (every signal picker is the nested form, everywhere).
                 self.source_form = MeasurementPanel(
                     [source_spec], single=True, controls=False,
-                    signals_provider=getattr(console.hub, "names", None),
+                    signals_provider=getattr(console, "_signal_names", None),
                     sources_provider=getattr(console, "_signal_providers", None),
                     formats_provider=getattr(console, "_signal_formats", None))
                 self.source_form.seed_values(self._source_row.node.values or {})
@@ -3476,7 +3488,7 @@ class LogicNodeEditor(QtWidgets.QWidget):
         # no-eval form).  A spec drives a real ParamDecl form; the camera (spec is
         # None) shows nothing here but Start/Stop still build/run the camera node.
         self.form = MeasurementPanel([spec] if spec is not None else [], single=True,
-                                     signals_provider=getattr(console.hub, "names", None),
+                                     signals_provider=getattr(console, "_signal_names", None),
                                      sources_provider=getattr(console, "_signal_providers", None),
                                      formats_provider=getattr(console, "_signal_formats", None))
         self.form.seed_values(row.node.values or {})
@@ -3794,7 +3806,7 @@ class TaskConsole(QtWidgets.QWidget):
             self.name_edit.setText(state.name)
             for config in state.panels:
                 self._attach_card(PanelCard(config, parent=self.board,
-                                            names_provider=self.hub.names,
+                                            names_provider=self._signal_names,
                                             sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, frame_coherence_provider=self._coherent_frame_signal))
             for node in state.logic:
                 self._attach_logic_node(node)    # always STOPPED -- Start is manual
@@ -3938,7 +3950,27 @@ class TaskConsole(QtWidgets.QWidget):
                 bucket = providers.setdefault(str(name), [])
                 if label not in bucket:
                     bucket.append(label)
+        # DECLARED (not-yet-started) Logic-tab nodes: list the signals they WILL publish too,
+        # tagged by their node title, so a Monitor can be wired to a node's output BEFORE that
+        # node is started (#6: connect first, start later).  Skip rows already covered above.
+        for row in self.logic_nodes:
+            node = self._logic_nodes.get(id(row))
+            if node is not None and getattr(node, "running", False):
+                continue
+            label = str(getattr(row.node, "title", "") or getattr(row.node, "name", "") or row.node.kind)
+            for key in self._declared_signal_keys(row):
+                bucket = providers.setdefault(str(key), [])
+                if label not in bucket:
+                    bucket.append(label)
         return providers
+
+    def _signal_names(self) -> list[str]:
+        """Every signal a picker may offer: PUBLISHED hub signals UNION the DECLARED outputs
+        of stopped Logic-tab nodes (the latter not on the hub yet).  The ONE name source for
+        every signal picker, so a not-yet-started node's output is selectable (#6)."""
+        names = {str(n) for n in self.hub.names()}
+        names.update(self._signal_providers().keys())
+        return sorted(names)
 
     def _signal_formats(self) -> dict:
         """``name -> standardized array shape`` for every LIVE hub signal, read straight
@@ -4102,13 +4134,24 @@ class TaskConsole(QtWidgets.QWidget):
         if node is not None and getattr(node, "running", False):
             row.set_publishes(self._live_node_formats(node))
             return
+        row.set_publishes([(k, "—", "") for k in self._declared_signal_keys(row)])
+
+    def _declared_signal_keys(self, row: "LogicNodeRow") -> list[str]:
+        """The bare signal names a STOPPED Logic-tab node WILL publish once started -- the
+        single source for both the row's "publishes:" legend AND the signal picker's
+        declared-but-not-yet-published entries (so a Monitor can be wired to a node's output
+        before that node is started).  A processor publishes its ``result_keys``; a camera
+        publishes ``frame``; a measurement publishes its ``x_key``/``y_key`` curve; a task
+        streams a mid-run key."""
         spec = self._spec_for_logic(row.node)
         keys = list(getattr(spec, "result_keys", ()) or [])
+        if not keys and row.node.kind == "measurement":
+            keys = [k for k in (getattr(spec, "x_key", ""), getattr(spec, "y_key", "")) if k]
         if not keys and row.node.kind == "camera":
             keys = ["frame"]
         if not keys and row.node.kind == "task":          # off-hub one-shot, mid-run stream
             keys = [f"{getattr(spec, 'mid_run_key', 'frame')} (mid-run)"]
-        row.set_publishes([(k, "—", "") for k in keys])
+        return keys
 
     def _node_for_signal(self, name: str):
         """The first running node that PUBLISHES signal ``name`` (None if none does)."""
@@ -4273,7 +4316,7 @@ class TaskConsole(QtWidgets.QWidget):
         kind = data or "1d"
         rows = max((c.config.row + c.config.rows for c in self.cards), default=0)
         config = PanelConfig(kind=str(kind), row=rows, col=0, size="1x2")
-        card = PanelCard(config, parent=self.board, names_provider=self.hub.names,
+        card = PanelCard(config, parent=self.board, names_provider=self._signal_names,
                          sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, frame_coherence_provider=self._coherent_frame_signal)
         self._attach_card(card)
         self._arrange()
@@ -4466,7 +4509,7 @@ class TaskConsole(QtWidgets.QWidget):
         # from the task's output buffer (see _tick) -- never a hub signal.
         config = PanelConfig(kind=kind, title=title, size="2x2",
                              source="value = __task_frame__")
-        card = PanelCard(config, parent=self.board, names_provider=self.hub.names,
+        card = PanelCard(config, parent=self.board, names_provider=self._signal_names,
                          sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, frame_coherence_provider=self._coherent_frame_signal)
         self._attach_card(card)
         self._task_card = card
