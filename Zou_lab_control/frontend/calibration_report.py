@@ -26,6 +26,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 
 from .live import HistogramFigure, LiveSiteMap, SiteHistogramGrid, site_ring_radius
+from .style import PALETTE, axis_label_fontsize, title_fontsize
 
 
 def _agg_figure() -> Figure:
@@ -62,9 +63,35 @@ def _site_grid(per_method_counts, thresholds, fidelity, *, title):
         fig=_agg_figure(), interactions=False).show(display=False)
 
 
+def _save_psf_grid(psf_weights, path: Path) -> str:
+    """Render the per-site PSF weight images as a grid (one small imshow per site) and save it.
+
+    This is the calibration's PSF *shape* output -- each panel is one site's empirical
+    matched-filter kernel, so the operator SEES the real (asymmetric, non-Gaussian) atom spot
+    the readout weights by.  Mirrors the rb87 readout's ``02_psf_grid.png``."""
+    weights = np.asarray(psf_weights, dtype=float)
+    n = len(weights)
+    cols = int(np.ceil(np.sqrt(n)))
+    rows = int(np.ceil(n / max(cols, 1)))
+    fig = _agg_figure()
+    fig.set_size_inches(max(4.0, cols * 0.9), max(4.0, rows * 0.9))
+    gs = fig.add_gridspec(rows, cols, wspace=0.15, hspace=0.25)
+    vmax = float(np.nanmax(weights)) if weights.size else 1.0
+    for i in range(n):
+        ax = fig.add_subplot(gs[i // cols, i % cols])
+        ax.imshow(weights[i], origin="lower", cmap=PALETTE["cmap_camera"], vmin=0.0, vmax=vmax)
+        ax.set_title(str(i), fontsize=axis_label_fontsize())
+        ax.set_xticks([]); ax.set_yticks([])
+    fig.suptitle("Per-site PSF weights (empirical matched filter -- the real asymmetric spot)",
+                 fontsize=title_fontsize())
+    fig.savefig(str(path), dpi=600)
+    return str(path)
+
+
 def save_calibration_report(folder, *, counts, thresholds, fidelity, centers,
                             template=None, threshold_method: str = "otsu",
-                            timestamp: str = "", by_method=None) -> dict:
+                            timestamp: str = "", by_method=None,
+                            psf_weights=None, psf_boxes=None) -> dict:
     """Render the calibration report PNGs into ``folder`` via the frontend plot types and
     return ``{name: path}``.
 
@@ -143,6 +170,9 @@ def save_calibration_report(folder, *, counts, thresholds, fidelity, centers,
             title="Reference template + fitted sites",
             fig=_agg_figure(), interactions=False).show(display=False)
         paths["site_map"] = _save_plot(site_map, folder / "site_map.png")
+
+    if psf_weights is not None and len(np.asarray(psf_weights)):
+        paths["psf_grid"] = _save_psf_grid(psf_weights, folder / "psf_grid.png")
 
     return paths
 

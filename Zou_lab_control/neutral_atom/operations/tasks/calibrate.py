@@ -60,21 +60,28 @@ CALIBRATE_PARAMS = (
     ParamDecl("pulse_template", "pulse template", "path", default=DEFAULT_PULSE_TEMPLATE,
               path_mode="file", file_filter="Pulse program (*.json);;All files (*)", base_dir="pulses",
               tooltip="The imaging pulse program to LOAD (a real PulseTableState .json from the pulse "
-                      "GUI).  Every calibration shot fires THIS template imaged long-short-long: the "
-                      "template's OWN 'image'-window duration IS the LONG reference exposure (e.g. 20 ms) "
-                      "-- so you set the long exposure by editing the template's image period, and the "
-                      "readout exposure below is the SHORT middle frame.  Defaults to the shipped "
-                      "imaging template (20 ms image) -- Browse to load your own."),
+                      "GUI).  It supplies the CHANNELS + the ONE cooling/load cycle; every calibration "
+                      "shot then images it long-short-long with the image-window durations set to "
+                      "[reference exposure, readout exposure, reference exposure] (the two exposures "
+                      "below) -- three consecutive emCCD triggers on the SAME atoms in that one cooling "
+                      "cycle.  Defaults to the shipped imaging template -- Browse to load your own."),
     ParamDecl("threshold_method", "threshold", "choice", default="otsu", choices=("otsu", "bimodal"),
               tooltip="otsu = single split; bimodal = dark/bright Gaussian-core fit per site.  (The "
                       "READOUT method box / per-site PSF / uniform PSF is chosen on the OccupancyProcessor "
                       "-- the cali computes all of them.)"),
+    ParamDecl("reference_exposure", "reference exposure (long)", "float", default=0.020, unit="s", lo=0.0, hi=10.0,
+              tooltip="The LONG reference exposure -- the two OUTER frames of the long-short-long bracket "
+                      "(e.g. the 20 ms in 20ms-5ms-20ms).  High-SNR, so the two long frames vote the "
+                      "per-site GROUND TRUTH that LABELS the short readout AND build the site map + PSF.  "
+                      "Set it directly here (together with the readout exposure below, these two values "
+                      "ARE the bracket the cali fires)."),
     ParamDecl("readout_exposure", "readout exposure (short)", "float", default=0.005, unit="s", lo=0.0, hi=10.0,
               tooltip="The SHORT readout exposure -- the MIDDLE frame of the long-short-long bracket "
-                      "(e.g. 20ms-5ms-20ms), the ACTUAL readout duration the per-site thresholds are "
-                      "learnt under.  The two LONG frames (the template's image duration) bracket it and "
-                      "vote per-site ground truth (atom survived = no mid-readout loss), so only shots "
-                      "whose two long frames AGREE label the short readout -- the Rb87 data-cleaning step."),
+                      "(e.g. the 5 ms in 20ms-5ms-20ms), the ACTUAL readout duration the per-site "
+                      "thresholds are learnt under.  The two LONG reference frames bracket it and vote "
+                      "per-site ground truth (atom survived = no mid-readout loss) within ONE cooling "
+                      "cycle, so only shots whose two long frames AGREE label the short readout -- the "
+                      "Rb87 data-cleaning step."),
     ParamDecl("threshold_frames", "reference brackets", "int", default=100, lo=2, hi=20000,
               tooltip="Number of long-short-long bracket shots.  Each gives two long reference frames "
                       "(vote ground truth + build the site map) and one short readout frame (per-site "

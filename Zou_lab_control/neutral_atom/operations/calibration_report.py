@@ -70,7 +70,8 @@ def per_site_fidelity(counts: np.ndarray, thresholds: np.ndarray) -> np.ndarray:
 
 
 def _render_figures(folder, *, counts, thresholds, fidelity, centers, template,
-                    threshold_method, timestamp, by_method=None) -> dict:
+                    threshold_method, timestamp, by_method=None,
+                    psf_weights=None, psf_boxes=None) -> dict:
     """Draw the report PNGs through the registered FRONTEND viewer; ``{}`` when headless
     (no viewer registered) -- the data bundle below is still written either way."""
     plotter = active_plotter()
@@ -80,9 +81,59 @@ def _render_figures(folder, *, counts, thresholds, fidelity, centers, template,
         return dict(plotter.save_calibration_report(
             folder, counts=counts, thresholds=thresholds, fidelity=fidelity,
             centers=centers, template=template, by_method=by_method,
+            psf_weights=psf_weights, psf_boxes=psf_boxes,
             threshold_method=str(threshold_method), timestamp=str(timestamp)) or {})
     except Exception:
         return {}
+
+
+def _psf_weights_boxes(calibration):
+    """The per-site PSF weights ``(N,h,w)`` + boxes ``(N,4)`` the calibration carries (the
+    'psf' method's empirical kernels), or ``(None, None)`` if it has none."""
+    by_method = getattr(calibration, "by_method", None) or {}
+    entry = by_method.get("psf") if isinstance(by_method, dict) else None
+    if entry and entry.get("psf_weights") is not None and entry.get("psf_boxes") is not None:
+        return np.asarray(entry["psf_weights"], dtype=float), np.asarray(entry["psf_boxes"], dtype=int)
+    w = getattr(calibration, "psf_weights", None)
+    b = getattr(calibration, "psf_boxes", None)
+    if w is not None and b is not None:
+        return np.asarray(w, dtype=float), np.asarray(b, dtype=int)
+    return None, None
+
+
+def _write_psf_table(path, psf_weights, psf_boxes, centers) -> None:
+    """Write a per-site PSF table CSV: the fitted centre + the empirical kernel's anisotropic
+    widths (sigma_x/sigma_y from the weight's second moments -- a REAL atom PSF is asymmetric,
+    so these differ), peak weight, and effective-pixel count.  Mirrors the rb87 psf_table.csv."""
+    import csv
+    weights = np.asarray(psf_weights, dtype=float)
+    boxes = np.asarray(psf_boxes, dtype=int)
+    centres = None if centers is None else np.asarray(centers, dtype=float)
+    rows = []
+    for i in range(len(weights)):
+        wgt = np.clip(weights[i], 0, None)
+        s = float(wgt.sum())
+        bh, bw = wgt.shape
+        yy, xx = np.mgrid[0:bh, 0:bw]
+        if s > 0:
+            mx = float((xx * wgt).sum() / s); my = float((yy * wgt).sum() / s)
+            sigx = float(np.sqrt(max(((xx - mx) ** 2 * wgt).sum() / s, 0.0)))
+            sigy = float(np.sqrt(max(((yy - my) ** 2 * wgt).sum() / s, 0.0)))
+        else:
+            sigx = sigy = float("nan")
+        n_eff = float(1.0 / np.sum(wgt ** 2)) if np.sum(wgt ** 2) > 0 else float("nan")
+        cx, cy = (float(centres[i][0]), float(centres[i][1])) if centres is not None and i < len(centres) else (float("nan"), float("nan"))
+        rows.append(dict(site=i, x_px=round(cx, 3), y_px=round(cy, 3),
+                         sigma_x_px=round(sigx, 4), sigma_y_px=round(sigy, 4),
+                         peak_weight=round(float(wgt.max()), 5), n_eff_pixels=round(n_eff, 3),
+                         box_x=int(boxes[i][0]), box_y=int(boxes[i][1]),
+                         box_w=int(boxes[i][2]), box_h=int(boxes[i][3])))
+    cols = ["site", "x_px", "y_px", "sigma_x_px", "sigma_y_px", "peak_weight", "n_eff_pixels",
+            "box_x", "box_y", "box_w", "box_h"]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        wr = csv.DictWriter(f, fieldnames=cols)
+        wr.writeheader()
+        wr.writerows(rows)
 
 
 def _by_method_report(calibration, readout_frames) -> dict:
@@ -223,14 +274,23 @@ def write_calibration_report(folder, *, calibration, readout_frames, template=No
         fidelity = (per_site_fidelity(counts, thresholds) if counts.size
                     else np.full(len(centers), np.nan))
 
+    # The per-site PSF (the matched-filter spot SHAPE the readout uses) is a calibration product
+    # in its own right -- the operator wants to SEE + keep it (a real atom PSF is asymmetric, not
+    # a clean Gaussian).  Pull the empirical per-site weights + boxes the calibration carries and
+    # save them as a table + a weight-image grid (mirrors the rb87 readout's psf_table / psf_grid).
+    psf_weights, psf_boxes = _psf_weights_boxes(calibration)
+    if psf_weights is not None and psf_boxes is not None:
+        _write_psf_table(folder / "psf_table.csv", psf_weights, psf_boxes, centers)
+
     paths = _render_figures(
         folder, counts=counts, thresholds=thresholds, fidelity=fidelity, centers=centers,
         template=template, threshold_method=threshold_method, timestamp=timestamp,
-        by_method=by_method)
+        by_method=by_method, psf_weights=psf_weights, psf_boxes=psf_boxes)
 
     npz_path = folder / "calibration.npz"
+    npz_extra = {} if psf_weights is None else {"psf_weights": psf_weights, "psf_boxes": psf_boxes}
     np.savez(npz_path, centers=centers, thresholds=thresholds,
-             counts=counts, per_site_fidelity=fidelity)
+             counts=counts, per_site_fidelity=fidelity, **npz_extra)
     paths["npz"] = str(npz_path)
     # the loadable calibration artifact (so a downstream OccupancyProcessor can reuse it)
     cal_path = folder / "calibration.json"

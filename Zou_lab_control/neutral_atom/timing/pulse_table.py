@@ -1052,11 +1052,15 @@ class PulseTableState:
         pre = list(self.periods[:idx])                 # the load / cooling cycle (runs once)
         post = list(self.periods[idx + 1:])            # anything after imaging (release/park) -- kept once
         width = len(self.channels)
-        # The readout gap holds ONLY the channels on through the whole LOAD (the trap); the probe +
-        # camera trigger are off in the load so they DROP in the gap, making each image window a
-        # distinct emCCD trigger.  Intersecting over `image` too would keep probe/emCCD high when the
-        # template has no pre-image period (image-first), collapsing the bracket into ONE trigger.
-        held = tuple(1 if pre and all(p.states[i] for p in pre) else 0 for i in range(width))
+        # The readout gap holds ONLY the PERSISTENT confinement -- a channel on in BOTH the load
+        # AND the image window (the trap).  That deliberately EXCLUDES cooling (on in the load but
+        # OFF in the image): re-asserting cooling between exposures would re-cool/rearrange the
+        # atoms mid-bracket, so the two long frames would no longer label the SAME atoms and the
+        # labels become meaningless.  It also excludes the probe + camera trigger (off in the load),
+        # so they DROP in the gap and each image window is a DISTINCT emCCD trigger.  An image-first
+        # template (no pre/load period) has no trap to identify, so the gap holds nothing.
+        held = tuple(1 if (pre and image.states[i] and all(p.states[i] for p in pre)) else 0
+                     for i in range(width))
         periods = copy.deepcopy(pre)
         single = len(exposures) == 1
         for k, exposure in enumerate(exposures):

@@ -683,6 +683,7 @@ class CalibrateReadoutTask(Task):
 
     def __init__(self, hub: SignalHub, camera: CameraDevice, *, sequencer: object | None = None,
                  grid_shape: tuple[int, int] = (5, 7), roi_radius: int = 1,
+                 reference_exposure: float = 0.020,
                  readout_exposure: float = 0.005,
                  pulse_template: str = DEFAULT_PULSE_TEMPLATE,
                  threshold_frames: int = 100,
@@ -702,11 +703,14 @@ class CalibrateReadoutTask(Task):
         self.calibration_sink = calibration_sink
         self.grid_shape = grid_shape_tuple(grid_shape)
         self.roi_radius = int(roi_radius)
-        # The long-short-long bracket's LONG reference exposure is the loaded template's OWN
-        # image-window duration (``_template_image_seconds``) -- editing the template's 'image'
-        # period IS how you set the long exposure (so the template genuinely drives the cali
-        # pulse, the "load a template, set the duration, run" workflow).  Only the SHORT middle
-        # readout -- the actual readout duration being calibrated -- is a separate knob here.
+        # The Rb87 reference bracket is built from TWO operator-set exposures (exactly as the real
+        # rb87 readout sets a 20 ms reference + a 5 ms readout): ``reference_exposure`` is the LONG
+        # frame (high-SNR -> votes ground truth + builds the site map / PSF) and ``readout_exposure``
+        # is the SHORT middle frame (the actual readout duration whose per-site thresholds are
+        # learnt).  ``_collect_bracket_groups`` sets the template's image windows to
+        # [long, short, long] from these two values -- so editing them HERE drives the cali pulse;
+        # the template only supplies the channels + the ONE cooling/load cycle.
+        self.reference_exposure = float(reference_exposure)
         self.readout_exposure = float(readout_exposure)
         self.pulse_template = str(pulse_template or self.DEFAULT_PULSE_TEMPLATE)
         self.threshold_frames = max(2, int(threshold_frames))
@@ -735,6 +739,7 @@ class CalibrateReadoutTask(Task):
             "save_frames": bool(self.save_frames),
             "pulse_template": str(self.pulse_template),
             "grid_shape": tuple(self.grid_shape),
+            "reference_exposure": float(self.reference_exposure),
             "readout_exposure": float(self.readout_exposure),
             "roi_radius": int(self.roi_radius),
             "threshold_frames": int(self.threshold_frames),
@@ -752,6 +757,8 @@ class CalibrateReadoutTask(Task):
             self.pulse_template = str(values["pulse_template"]) or self.DEFAULT_PULSE_TEMPLATE
         if "grid_shape" in values:
             self.grid_shape = grid_shape_tuple(values["grid_shape"])
+        if "reference_exposure" in values:
+            self.reference_exposure = float(values["reference_exposure"])
         if "readout_exposure" in values:
             self.readout_exposure = float(values["readout_exposure"])
         if "roi_radius" in values:
@@ -824,26 +831,6 @@ class CalibrateReadoutTask(Task):
             readout_by_group=getattr(self, "_readout_by_group", None),
             timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
-    def _template_image_seconds(self) -> float:
-        """The loaded template's IMAGE-window duration in seconds -- the LONG reference exposure
-        of the long-short-long bracket.  Editing the template's 'image' period IS how the
-        operator sets the long exposure (the template drives the cali pulse, not a hidden param);
-        falls back to 20 ms if the template has no readable image window."""
-        from ..timing.pulse_table import UNITS_TO_NS, period_index_by_name
-        try:
-            st = self._resolve_template(self.pulse_template)
-        except Exception:
-            return 20e-3
-        idx = period_index_by_name(st, "image")
-        if idx is None:
-            idx = max(0, len(st.periods) - 1)
-        if not st.periods:
-            return 20e-3
-        dur = st.periods[idx].duration
-        if isinstance(dur, str):                # a scan-bound image period -> use the default
-            return 20e-3
-        secs = float(dur) * UNITS_TO_NS.get(str(st.periods[idx].unit), 1.0) / 1e9
-        return secs if secs > 0 else 20e-3
 
     def _run_live(self, out: "TaskOutput"):
         """Acquire the Rb87 long-short-long reference brackets NOW and run the SAME sitemap +
@@ -928,13 +915,15 @@ class CalibrateReadoutTask(Task):
         camera frames' author differs (``virtual == real``)."""
         n_ref = int(self.REFERENCE_FRAMES_PER_BRACKET)
         readout_index = n_ref // 2
-        # Build the bracket BY MODIFYING THE LOADED TEMPLATE's durations (with_imaging_bracket):
-        # ONE cooling/load cycle, then the template's 'image' window repeated long-short-long at
-        # the per-frame exposures -- three CONSECUTIVE emCCD triggers on the SAME atoms.  The long
-        # exposure IS the template's image-window duration (edit the template to change it); the
-        # short middle is the readout.  The template's OWN channels fire (load/cooling/probe/emCCD
-        # on virtual, the same chNN the real template names on hardware) -> virtual == real.
-        exposures = [self.readout_exposure if i == readout_index else self._template_image_seconds()
+        # Build the bracket BY SETTING THE TEMPLATE's image-window durations to the operator's two
+        # exposures (with_imaging_bracket): ONE cooling/load cycle, then the image window repeated
+        # long-short-long = [reference_exposure, readout_exposure, reference_exposure] -- three
+        # CONSECUTIVE emCCD triggers on the SAME atoms within that single cooling cycle (NO
+        # re-cooling between frames, so the two long frames bracket and label the SAME atoms; this
+        # is what makes the labels physically meaningful).  The template only supplies the channels
+        # + the cooling/load cycle (load/cooling/probe/emCCD on virtual, the same chNN the real
+        # template names on hardware) -> virtual == real.
+        exposures = [self.readout_exposure if i == readout_index else self.reference_exposure
                      for i in range(n_ref + 1)]
         template = self._resolve_template(self.pulse_template)
         bracket = template.with_imaging_bracket(exposures).to_sequence(name="reference_bracket")

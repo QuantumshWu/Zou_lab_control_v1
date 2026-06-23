@@ -123,41 +123,42 @@ def test_calibrate_task_live_writes_canonical_calibration_json_for_the_detector(
         exp.close()
 
 
-def test_calibrate_task_loads_a_pulse_template_and_sets_the_exposure(tmp_path):
-    """The cali LOADS a real pulse template and the template's OWN 'image'-window duration IS
-    the LONG reference exposure of the long-short-long bracket -- so editing the template's
-    image period sets the long exposure (the template genuinely drives the cali pulse; the
-    "you can't set the duration" claim is false).  The short readout is the only separate knob."""
+def test_calibrate_task_builds_long_short_long_bracket_from_two_exposures(tmp_path):
+    """The cali takes TWO operator-set exposures -- ``reference_exposure`` (LONG) and
+    ``readout_exposure`` (SHORT) -- and fires the long-short-long bracket built from BOTH
+    (rb87 readout flow): the loaded template supplies the channels + the ONE cooling cycle, and
+    the two exposures set the three image windows.  The bracket must be CONTINUOUS -- one cooling
+    load, the trap held the whole time, NO re-cooling between the three consecutive emCCD frames
+    (re-cooling would scramble the atoms and void the labels)."""
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
-    from Zou_lab_control.neutral_atom.timing import PulseTableState, default_imaging_template
+    from Zou_lab_control.neutral_atom.timing import default_imaging_template
 
     exp = _calibrated()
     try:
         prog = tmp_path / "my_imaging.json"             # the user's own imaging program
-        # set the template's image window to 30 ms -> THAT becomes the long reference exposure
         st = default_imaging_template()
-        idx = st.periods.index(next(p for p in st.periods if p.name == "image"))
-        st = st.set_period_duration(idx, 0.030, unit="s")
         st.save(prog)
 
+        # BOTH exposures are settable cali params -- the long is NOT buried in the template.
         task = exp.readout.calibrate_task(
             SignalHub(), source="live", pulse_template=str(prog),
-            readout_exposure=0.005, threshold_frames=12)
+            reference_exposure=0.030, readout_exposure=0.005, threshold_frames=12)
         assert task.pulse_template == str(prog)
-        assert task.acquisition_parameters()["pulse_template"] == str(prog)
-        # the LONG reference exposure is read from the template's image window (30 ms set above) --
-        # editing the template IS how the long exposure is set; the short readout stays separate.
-        assert task._template_image_seconds() == pytest.approx(0.030)
-        assert task.readout_exposure == pytest.approx(0.005)        # 30ms-5ms-30ms long-short-long
-        # The bracket is BUILT BY MODIFYING THE TEMPLATE (with_imaging_bracket): ONE cooling/load
-        # cycle, then the 'image' window repeated long-short-long -> three CONSECUTIVE emCCD on the
-        # same atoms.  Verify the actual fired sequence has exactly that structure + durations.
-        bracket = st.with_imaging_bracket([0.030, 0.005, 0.030]).to_sequence(name="ref")
+        params = task.acquisition_parameters()
+        assert params["reference_exposure"] == pytest.approx(0.030)   # LONG is a real param
+        assert params["readout_exposure"] == pytest.approx(0.005)     # SHORT is a real param
+
+        # The bracket is built from the TWO exposures: [long, short, long] = 30-5-30, ONE cooling,
+        # the trap held continuously (no re-cool), three consecutive emCCD on the SAME atoms.
+        bracket = st.with_imaging_bracket(
+            [task.reference_exposure, task.readout_exposure, task.reference_exposure]).to_sequence(name="ref")
         cooling = [(p.start, p.duration) for p in bracket.pulses if p.channel == "cooling" and p.value]
+        trap = [p for p in bracket.pulses if p.channel == "trap" and p.value]
         emccd = sorted(p.start for p in bracket.pulses if p.channel == "emCCD" and p.value)
         probe = [round(p.duration, 6) for p in sorted(
             (p for p in bracket.pulses if p.channel == "probe" and p.value), key=lambda p: p.start)]
-        assert len(cooling) == 1 and cooling[0][1] == pytest.approx(0.002)   # one cooling load
+        assert len(cooling) == 1 and cooling[0][1] == pytest.approx(0.002)   # ONE cooling load only
+        assert len(trap) == 1                                                # trap held continuously
         assert len(emccd) == 3                                               # three consecutive emCCD
         assert probe == [pytest.approx(0.030), pytest.approx(0.005), pytest.approx(0.030)]  # 30-5-30
         task.run_to_completion()

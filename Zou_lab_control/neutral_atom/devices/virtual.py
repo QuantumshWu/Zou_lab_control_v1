@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from math import erf, sqrt
+from math import cos, erf, radians, sin, sqrt
 from pathlib import Path
 from typing import Sequence
 import time
@@ -101,10 +101,20 @@ class VirtualTrapArray(TrapArrayDevice):
     offset_counts: float = 200.0          # qCMOS nominal offset (reference CameraConfig)
     conversion_e_per_count: float = 0.107  # electrons per count (reference qCMOS gain)
     read_noise_e: float = 0.43            # read noise e-rms (reference qCMOS)
-    # Imaging PSF width (Gaussian sigma, px).  The real Rb87 v16 per-site PSF fits give
-    # sigma_x ~0.61 / sigma_y ~0.76 px (geometric mean ~0.68 px, stable across the 3 ms and
-    # 5 ms runs); the isotropic 0.7 px here matches that spot size.
+    # Imaging PSF (px).  A REAL atom image is NOT a perfect symmetric Gaussian: the Rb87 v16
+    # per-site PSF fits give sigma_x ~0.61 / sigma_y ~0.76 px (anisotropic, geometric mean
+    # ~0.68 px) and the empirical spot is skewed by optical aberration (coma).  So the virtual
+    # spot is an ANISOTROPIC, ROTATED, SKEWED kernel: ``atom_sigma_px`` is the geometric-mean
+    # spot size (it ANCHORS the total brightness -- the kernel is renormalized to the same
+    # integral as an isotropic Gaussian of this sigma, so box counts are unchanged);
+    # ``atom_psf_aspect`` = sigma_y/sigma_x (=0.76/0.61), ``atom_psf_angle_deg`` tilts the
+    # ellipse, and ``atom_psf_skew`` adds the asymmetric (non-Gaussian) coma tail along the
+    # major axis.  Set ``atom_psf_skew=0``, ``atom_psf_aspect=1`` to recover the old symmetric
+    # Gaussian.
     atom_sigma_px: float = 0.7
+    atom_psf_aspect: float = 1.25         # sigma_y / sigma_x (anisotropic elliptical spot)
+    atom_psf_angle_deg: float = 18.0      # tilt of the elliptical/skewed spot (deg)
+    atom_psf_skew: float = 0.45           # asymmetry (coma tail) along the major axis; 0 = symmetric
     # Atom 1/e lifetime UNDER the probe (s): a longer readout exposure scatters MORE
     # photons (higher SNR) but also loses MORE atoms mid-readout, so the readout
     # duration sets the real SNR-vs-survival trade-off a detection-time scan measures.
@@ -178,6 +188,9 @@ class VirtualTrapArray(TrapArrayDevice):
         self.conversion_e_per_count = positive_float(self.conversion_e_per_count, "conversion_e_per_count")
         self.read_noise_e = nonnegative_float(self.read_noise_e, "read_noise_e")
         self.atom_sigma_px = positive_float(self.atom_sigma_px, "atom_sigma_px")
+        self.atom_psf_aspect = positive_float(self.atom_psf_aspect, "atom_psf_aspect")
+        self.atom_psf_angle_deg = float(self.atom_psf_angle_deg)
+        self.atom_psf_skew = nonnegative_float(self.atom_psf_skew, "atom_psf_skew")
         self.load_time_constant_s = positive_float(self.load_time_constant_s, "load_time_constant_s")
         self.mot_load_s = positive_float(self.mot_load_s, "mot_load_s")
         self.detection_lifetime = positive_float(self.detection_lifetime, "detection_lifetime")
@@ -288,11 +301,24 @@ class VirtualTrapArray(TrapArrayDevice):
         expected_e = np.full((h, w), (self.background_rate + self.dark_current_e_per_s) * exposure, dtype=float)
         occ = np.asarray(occupancy, dtype=bool).reshape(-1)
         st = np.asarray(signal_time, dtype=float).reshape(-1)
+        # ANISOTROPIC + ROTATED + SKEWED spot (a real atom image is not a perfect symmetric
+        # Gaussian).  geometric-mean sigma = atom_sigma_px is held fixed so the total photons (box
+        # counts) are unchanged: sx*sy == atom_sigma_px**2, and the linear skew term integrates to
+        # ~0 over the Gaussian, so it only ASYMMETRIZES the shape (coma tail) without adding flux.
+        asp = sqrt(max(self.atom_psf_aspect, 1e-6))
+        sx = self.atom_sigma_px / asp
+        sy = self.atom_sigma_px * asp
+        th = radians(self.atom_psf_angle_deg)
+        cos_t, sin_t = cos(th), sin(th)
         for (cx, cy), occupied, t_sig in zip(self._site_centers(), occ, st):
             if not occupied or t_sig <= 0.0:
                 continue
             amplitude = self.atom_rate * float(t_sig)
-            expected_e += amplitude * np.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2.0 * self.atom_sigma_px**2))
+            du = (xx - cx) * cos_t + (yy - cy) * sin_t          # along the major axis
+            dv = -(xx - cx) * sin_t + (yy - cy) * cos_t         # minor axis
+            core = np.exp(-0.5 * ((du / sx) ** 2 + (dv / sy) ** 2))
+            spot = np.clip(core * (1.0 + self.atom_psf_skew * (du / sx)), 0.0, None)
+            expected_e += amplitude * spot
         photoelectrons = self.rng.poisson(np.clip(expected_e, 0, None)).astype(float)
         noisy = photoelectrons / self.conversion_e_per_count + self.offset_counts
         if self.read_noise_e > 0:

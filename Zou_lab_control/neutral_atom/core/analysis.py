@@ -7,6 +7,7 @@ from typing import Sequence
 
 import numpy as np
 from scipy import ndimage
+from scipy.optimize import curve_fit
 
 from Zou_lab_control._readout_math import confidence_weighted_fidelity
 
@@ -83,6 +84,40 @@ def detect_atoms(image, centers, thresholds, *, radius: int = 1, reducer: str = 
     )
 
 
+def _gauss2d_axis(coords, offset, amp, x0, y0, sx, sy):
+    x, y = coords
+    return (offset + amp * np.exp(-0.5 * (((x - x0) / sx) ** 2 + ((y - y0) / sy) ** 2))).ravel()
+
+
+def _refine_center_subpixel(image: np.ndarray, x: float, y: float, half: int = 2) -> tuple[float, float]:
+    """Refine an integer peak ``(x, y)`` to its true SUB-PIXEL center by a local 2D-Gaussian fit
+    (intensity-weighted centroid fallback) -- the real trap center is NOT on a pixel, so returning
+    the integer argmax (or snapping to a grid) is what makes a site map look crooked.  Mirrors the
+    Rb87 readout's per-site refinement; returns the input unchanged if the box is too small."""
+    h, w = image.shape
+    xi, yi = int(round(x)), int(round(y))
+    x0, x1 = max(0, xi - half), min(w, xi + half + 1)
+    y0, y1 = max(0, yi - half), min(h, yi + half + 1)
+    cut = image[y0:y1, x0:x1]
+    if cut.size < 9 or not np.isfinite(cut).any():
+        return float(x), float(y)
+    yy, xx = np.mgrid[y0:y1, x0:x1]
+    bg = float(np.nanmedian(cut))
+    amp = float(np.nanmax(cut) - bg)
+    try:
+        p0 = [bg, max(amp, 1e-6), float(x), float(y), 0.9, 0.9]
+        lo = [np.nanmin(cut) - abs(amp) - 1, 0.0, x0 - 0.5, y0 - 0.5, 0.2, 0.2]
+        hi = [np.nanmax(cut) + abs(amp) + 1, max(amp * 5, 1.0), x1 - 0.5, y1 - 0.5, 4.0, 4.0]
+        popt, _ = curve_fit(_gauss2d_axis, (xx.ravel(), yy.ravel()), cut.ravel(), p0=p0, bounds=(lo, hi), maxfev=5000)
+        return float(popt[2]), float(popt[3])
+    except Exception:
+        vals = np.clip(cut - np.nanpercentile(cut, 20), 0, None)
+        s = float(np.sum(vals))
+        if s <= 0:
+            return float(x), float(y)
+        return float(np.sum(xx * vals) / s), float(np.sum(yy * vals) / s)
+
+
 def find_site_centers(
     image,
     grid_shape: Sequence[int],
@@ -90,8 +125,14 @@ def find_site_centers(
     min_distance: int | None = None,
     threshold_rel: float = 0.35,
     ordering: str = "row-major",
+    refine_half: int = 2,
 ) -> np.ndarray:
-    """Find bright trap centers and sort them into a stable site order."""
+    """Find bright trap centers and sort them into a stable site order.
+
+    Each detected peak is refined to its SUB-PIXEL center by a local 2D-Gaussian fit
+    (:func:`_refine_center_subpixel`) -- the true trap center is not on a pixel, so the returned
+    centers are the real continuous positions, NOT integer peaks forced onto a grid.  Only a
+    never-loaded dark site (no peak) is interpolated onto its lattice node so its PSF box fits."""
 
     img = image_array(image)
     ny, nx = grid_shape_tuple(grid_shape)
@@ -124,10 +165,13 @@ def find_site_centers(
             candidates_yx = np.column_stack(np.unravel_index(flat, smooth.shape))
     weights = smooth[candidates_yx[:, 0], candidates_yx[:, 1]]
     selected = candidates_yx[np.argsort(weights)[::-1]][:need]
-    centers_xy = np.column_stack([selected[:, 1], selected[:, 0]]).astype(float)
-    # Sort into the regular array, then snap EVERY center onto its robustly-fitted lattice node
-    # (the trap array is regular by construction) before applying the requested ordering -- a clean
-    # regular grid, not the jittery detected positions.
+    # Refine EACH detected peak from its integer argmax to its true SUB-PIXEL center (local
+    # 2D-Gaussian fit) -- the real trap center is not on a pixel, so this is what keeps the site
+    # map from looking crooked, WITHOUT forcing centers onto a grid.
+    centers_xy = np.array([_refine_center_subpixel(img, float(c), float(r), half=refine_half)
+                           for r, c in selected], dtype=float)
+    # Sort into the regular array; the lattice repair only REPLACES a never-loaded dark site's
+    # border artifact (a center far off its fitted node), leaving every detected sub-pixel center.
     row_major = sort_centers_grid(centers_xy, (ny, nx), ordering="row-major")
     repaired = _regularize_grid(row_major, (ny, nx), img.shape)
     return sort_centers_grid(repaired, (ny, nx), ordering=ordering)
@@ -151,20 +195,20 @@ def _robust_axis_lattice(anchors: np.ndarray, n: int) -> np.ndarray:
 
 
 def _regularize_grid(centers_row_major, grid_shape: Sequence[int], image_shape) -> np.ndarray:
-    """Snap centers that detection misplaced back onto the trap array's regular lattice.
+    """Replace only the centers detection MISPLACED -- keep every well-detected sub-pixel center.
 
-    The traps are an axis-aligned regular grid (real hardware and the virtual backend
-    alike), so the lattice is separable: every row shares one y, every column one x.  A
-    site that emitted no light this calibration still sits at its node -- detection cannot
-    find a peak that is not there, so without this its center lands on an image-border
-    ``maximum_filter`` artifact and a downstream PSF box (which needs a full window around
-    every site) cannot fit.  Each axis is fit GLOBALLY (robust origin + pitch via
+    The traps are an axis-aligned regular grid, so the lattice is separable: every row shares
+    one y, every column one x.  A site that emitted no light this calibration has no peak to
+    find, so its detected "center" lands on an image-border ``maximum_filter`` artifact and a
+    downstream PSF box cannot fit.  Each axis is fit GLOBALLY (robust origin + pitch via
     :func:`_robust_axis_lattice`), so even a WHOLE dark row/column is interpolated to its
-    interior node rather than anchored on a border artifact; EVERY site is then snapped onto
-    its fitted node (the array is regular by construction, so the per-site peak scatter is
-    measurement noise, not real displacement) -- the returned map is a clean regular grid, not
-    crooked.  Finally every node is clamped a quarter-cell inside the frame, so no returned
-    center can sit on the border where a PSF box would not fit."""
+    interior node.  But a DETECTED site's own SUB-PIXEL center (``find_site_centers`` refines
+    every peak with a local 2D-Gaussian fit BEFORE this) is the REAL position -- the true spot
+    center is not on a pixel and not rigidly on the grid, and forcing it onto the fitted lattice
+    is exactly what makes the site map look crooked/rigid.  So this only REPLACES a center more
+    than half a cell from its fitted node (a dark-site / border artifact) with the lattice node;
+    confidently-detected sub-pixel centers are left untouched.  Finally every node is clamped a
+    quarter-cell inside the frame, so no returned center sits on the border where a box won't fit."""
 
     ny, nx = grid_shape_tuple(grid_shape)
     g = np.asarray(centers_row_major, dtype=float).reshape(ny, nx, 2)
@@ -180,16 +224,13 @@ def _regularize_grid(centers_row_major, grid_shape: Sequence[int], image_shape) 
     pitch = float(min(pitches)) if pitches else float(min(h, w))
     lattice_x = np.broadcast_to(col_x[None, :], (ny, nx))
     lattice_y = np.broadcast_to(row_y[:, None], (ny, nx))
-    # The traps ARE a regular lattice (every row shares one y, every column one x), so the
-    # robustly-fitted lattice IS the true geometry; the per-site peak scatter (±1-2 px from
-    # shot noise / a dim site in a non-uniform average) is MEASUREMENT noise, not real site
-    # displacement.  Snap EVERY site onto its fitted node so the site map is a clean regular
-    # grid (no "歪歪扭扭" / crooked rings), not the jittery detected positions.  (A previous
-    # half-cell tolerance left that scatter in place, since it never exceeded half a pitch.)
-    g[:, :, 0] = lattice_x
-    g[:, :, 1] = lattice_y
-    # Interior clamp: a fitted node (e.g. from a degenerate lattice fit) can never land on the
-    # border where a PSF box cannot fit; a node already well inside is left where the fit put it.
+    # Keep the sub-pixel fit for every confidently-detected site; replace ONLY a center that is
+    # more than half a cell off its fitted node (a never-loaded dark site whose "peak" is a
+    # border artifact) with the interpolated lattice node so its PSF box still fits.
+    off_node = np.hypot(g[:, :, 0] - lattice_x, g[:, :, 1] - lattice_y) > 0.5 * pitch
+    g[off_node, 0] = lattice_x[off_node]
+    g[off_node, 1] = lattice_y[off_node]
+    # Interior clamp: any node within a quarter-cell of the border is pulled in so a PSF box fits.
     margin = max(1.0, 0.25 * pitch)
     g[:, :, 0] = np.clip(g[:, :, 0], margin, max(margin, w - 1 - margin))
     g[:, :, 1] = np.clip(g[:, :, 1], margin, max(margin, h - 1 - margin))
