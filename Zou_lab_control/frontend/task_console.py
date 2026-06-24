@@ -78,6 +78,7 @@ from .qt_fluent import (
     FluentScrollArea,
     FluentSectionLabel,
     FluentSettingRow,
+    setting_label_width,
     FluentStatusDot,
     FluentSwitch,
     FluentTabWidget,
@@ -376,13 +377,13 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(scaled_px(3, minimum=2))
-        # The composite spans the FULL form width (added via addRow(widget)), so its own title sits
-        # as a header line at the top-left -- aligned with the form's other left labels -- and the
-        # api / scan sub-rows stack beneath it (not crammed into a narrow right field column, #H3b).
+        # Spans the FULL form width; title is a FluentSectionLabel header (the ONE section style),
+        # with the api / scan sub-rows stacking FLUSH beneath (no indent -- section-vs-row hierarchy
+        # is weight+colour, never indentation; consistent with every other form).
         if title:
-            outer.addWidget(FluentLabel(title))
+            outer.addWidget(FluentSectionLabel(title))
         self._box = QtWidgets.QVBoxLayout()
-        self._box.setContentsMargins(scaled_px(10, minimum=8), 0, 0, 0)   # slight indent under the header
+        self._box.setContentsMargins(0, 0, 0, 0)
         self._box.setSpacing(scaled_px(6, minimum=4))
         outer.addLayout(self._box)
 
@@ -415,20 +416,17 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
 
         if api_rows:
             self._box.addWidget(FluentSectionLabel("API slots (fixed values)"))
-            api_form = QtWidgets.QFormLayout()
-            api_form.setContentsMargins(0, 0, 0, 0)
-            api_form.setSpacing(scaled_px(4, minimum=3))
-            api_form.setLabelAlignment(QtCore.Qt.AlignRight)
+            api_labels = [f"{name}  ({kind} @ {target})" for name, kind, target, _u, _c in api_rows]
+            api_lw = setting_label_width(api_labels, minimum=72)   # same row rule as every form
             for name, kind, target, unit, current in api_rows:
                 label = f"{name}  ({kind} @ {target})"
                 edit = FluentLineEdit(self._api_remembered.get(name) or f"{float(current):g}", self)
-                edit.setMinimumWidth(scaled_px(140, minimum=110))
+                edit.setMinimumWidth(scaled_px(120, minimum=96))
                 edit.setPlaceholderText(f"{unit}")
                 edit.setToolTip(f"Numeric value for API slot {name!r} (unit: {unit}).")
                 edit.textChanged.connect(self.changed)
-                api_form.addRow(label, edit)
+                self._box.addWidget(FluentSettingRow(label, edit, label_width=api_lw))
                 self._api_widgets[name] = edit
-            self._box.addLayout(api_form)
 
         # ---- ONE scan-table program for all scan slots together ----------------------
         self._box.addWidget(FluentSectionLabel("Scan table (one program for all scan slots)"))
@@ -539,17 +537,17 @@ class _SignalExprWidget(QtWidgets.QWidget):
         self._formats_provider = formats_provider
         self._inputs: list[str] = ["frame"]
         self._editor = None
-        # ONE label-column width shared by every row (the signal slots AND the value row), so the
-        # whole widget reads as one tidy label/control grid like the plot Edit -- not ragged (#4).
-        # Wide enough that "signal" / "value" / "signal[0]" show in full (64px clipped them, #H3b).
-        self._label_w = scaled_px(84, minimum=70)
+        # ONE label-column width for this widget's rows (signal / signal[i] / value), via the SAME
+        # setting_label_width rule every form uses -- so it aligns + follows the one logic.
+        self._label_w = setting_label_width(["signal[0]", "value"], minimum=64)
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(scaled_px(4, minimum=3))
-        # Spans the FULL form width (added via addRow(widget)); its title is the header line, with
-        # the signal slots + value row stacking beneath -- not crammed into a narrow field column (#H3b).
+        # Spans the FULL form width; its title is a FluentSectionLabel header (the ONE section
+        # style -- same as the Setting popup sections), with the signal slots + value rows stacking
+        # flush beneath (no indent: section-vs-row hierarchy is weight+colour, never indentation).
         if title:
-            root.addWidget(FluentLabel(title))
+            root.addWidget(FluentSectionLabel(title))
         self._slot_box = QtWidgets.QVBoxLayout()
         self._slot_box.setContentsMargins(0, 0, 0, 0)
         self._slot_box.setSpacing(scaled_px(4, minimum=3))
@@ -2456,19 +2454,15 @@ class MeasurementPanel(QtWidgets.QWidget):
             self._pick_label.hide()
             self.type_combo.hide()
 
-        # auto-generated parameter form (rebuilt when the type changes)
-        self.form = QtWidgets.QFormLayout()
+        # Auto-generated parameter form (rebuilt when the type changes).  It is a plain VBox of
+        # the SHARED row primitives -- FluentSettingRow (grey fixed-width label | control) for a
+        # scalar param, FluentSectionLabel for a composite's header -- exactly like the Setting
+        # popup + plot Edit.  NOT a QFormLayout (whose labels render dark + auto-width = a 3rd
+        # style); the whole frontend uses ONE label/row logic now.
+        self.form = QtWidgets.QVBoxLayout()
         self.form.setContentsMargins(0, 0, 0, 0)
-        # LEFT-align the label column (like the plot Edit's FluentSettingRow rows): right-aligned
-        # labels gave every row a different left edge (ragged), which read as messy (#H3).
-        self.form.setLabelAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
-        self.form.setHorizontalSpacing(scaled_px(8, minimum=5))
-        self.form.setVerticalSpacing(scaled_px(5, minimum=3))
-        # Fields fill the available width (the Edit page is wide): an expanding
-        # control -- a free-form value edit -- grows so its value is never cut off
-        # and the right-side space is used; fixed-size spins keep their natural
-        # width.  (cutoff is a core rule.)
-        self.form.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
+        self.form.setSpacing(scaled_px(5, minimum=3))
+        self._form_label_w = scaled_px(72, minimum=56)   # recomputed per spec in _rebuild_form
         root.addLayout(self.form)
 
         # Start / Stop + status
@@ -2521,6 +2515,16 @@ class MeasurementPanel(QtWidgets.QWidget):
                 widget.setParent(None)
                 widget.deleteLater()
 
+    def _add_row(self, label: str, control: QtWidgets.QWidget) -> None:
+        """ONE param row = FluentSettingRow (grey fixed-width label | control), sharing this
+        form's column width -- the SAME primitive the Setting popup + plot Edit use."""
+        self.form.addWidget(FluentSettingRow(label, control, label_width=self._form_label_w))
+
+    def _add_span(self, widget: QtWidgets.QWidget) -> None:
+        """A composite control (signal_expr / pulse_slots) that carries its OWN FluentSectionLabel
+        header spans the full width -- no outer row label (its header IS the label)."""
+        self.form.addWidget(widget)
+
     def _spin(self, decl, *, integer: bool, value=None):
         """A bounded spin box for a float/int param (range + unit from the decl)."""
         digits = max(5, len(str(int(abs(decl.hi) + 1))) + (0 if integer else 4))
@@ -2547,6 +2551,13 @@ class MeasurementPanel(QtWidgets.QWidget):
         spec = self.current_spec()
         if spec is None:
             return
+        # ONE label-column width for this form: fit the widest SCALAR-row label (composites carry
+        # their own section header, so they are not row labels).  Single rule via setting_label_width.
+        scalar_labels = [
+            (d.label or d.key) + (f" ({d.unit})" if d.unit else "") + (" *" if d.required else "")
+            for d in spec.params if d.kind not in ("signal_expr", "pulse_slots")
+        ]
+        self._form_label_w = setting_label_width(scalar_labels or [""], minimum=72)
         for decl in spec.params:
             kind = decl.kind
             # Show the READABLE label ("Pulse template" / "Signal (y)" / "Output name"), not the
@@ -2572,7 +2583,7 @@ class MeasurementPanel(QtWidgets.QWidget):
                 trow.setSpacing(scaled_px(4, minimum=3))
                 trow.addWidget(lo_spin); trow.addWidget(self._tag("to")); trow.addWidget(hi_spin)
                 trow.addWidget(self._tag("/")); trow.addWidget(pts_spin); trow.addWidget(self._tag("pts"))
-                self.form.addRow(label_text, triplet)
+                self._add_row(label_text, triplet)
                 self._widgets[decl.key] = ("axis_range", lo_spin, hi_spin, pts_spin)
             elif kind == "bool":
                 # A bool parameter renders as a sliding on/off toggle switch (not a checkbox).
@@ -2580,7 +2591,7 @@ class MeasurementPanel(QtWidgets.QWidget):
                 check.setChecked(bool(decl.default))
                 check.setToolTip(decl.tooltip)
                 check.toggled.connect(self._refresh_start_enabled)
-                self.form.addRow(label_text, check)
+                self._add_row(label_text, check)
                 self._widgets[decl.key] = ("bool", check)
             elif kind == "choice":
                 combo = FluentComboBox()
@@ -2589,7 +2600,7 @@ class MeasurementPanel(QtWidgets.QWidget):
                     combo.setCurrentText(str(decl.default))
                 combo.setToolTip(decl.tooltip)
                 combo.activated.connect(lambda *_: self._refresh_start_enabled())
-                self.form.addRow(label_text, combo)
+                self._add_row(label_text, combo)
                 self._widgets[decl.key] = ("choice", combo)
             elif kind == "int":
                 # an optional int param (default None, not required) shows blank
@@ -2601,11 +2612,11 @@ class MeasurementPanel(QtWidgets.QWidget):
                     edit.setPlaceholderText("(all)")
                     edit.setToolTip(decl.tooltip)
                     edit.textChanged.connect(self._refresh_start_enabled)
-                    self.form.addRow(label_text, edit)
+                    self._add_row(label_text, edit)
                     self._widgets[decl.key] = ("int_opt", edit)
                 else:
                     spin = self._spin(decl, integer=True)
-                    self.form.addRow(label_text, spin)
+                    self._add_row(label_text, spin)
                     self._widgets[decl.key] = ("int", spin)
             elif kind == "path":
                 # A path param: line edit + Browse button (native file/folder dialog) --
@@ -2618,7 +2629,7 @@ class MeasurementPanel(QtWidgets.QWidget):
                     base_dir=display_path(getattr(decl, "base_dir", "")))   # Browse lands in the real folder
                 picker.setToolTip(decl.tooltip)
                 picker.changed.connect(lambda *_: self._refresh_start_enabled())
-                self.form.addRow(label_text, picker)
+                self._add_row(label_text, picker)
                 self._widgets[decl.key] = ("path", picker)
             elif kind == "signal":
                 # A hub-signal input (a processor's source) uses the SAME collapsible-tree picker
@@ -2638,7 +2649,7 @@ class MeasurementPanel(QtWidgets.QWidget):
                     current=cur)
                 combo.setToolTip(decl.tooltip)
                 combo.activated.connect(lambda *_: self._refresh_start_enabled())
-                self.form.addRow(label_text, combo)
+                self._add_row(label_text, combo)
                 self._widgets[decl.key] = ("signal", combo)
             elif kind == "signal_expr":
                 # A MULTI-slot signal picker + a ``value = ...`` expression -- the SAME source
@@ -2652,7 +2663,7 @@ class MeasurementPanel(QtWidgets.QWidget):
                 widget.set_value(decl.default if decl.default is not None else {})
                 widget.setToolTip(decl.tooltip)
                 widget.changed.connect(self._refresh_start_enabled)
-                self.form.addRow(widget)              # FULL-WIDTH span (label is the widget's header, #H3b)
+                self._add_span(widget)              # FULL-WIDTH span (label is the widget's header, #H3b)
                 self._widgets[decl.key] = ("signal_expr", widget)
             elif kind == "pulse_slots":
                 # An AUTO-GENERATED sub-form for the pulse template named in decl.depends_on:
@@ -2665,7 +2676,7 @@ class MeasurementPanel(QtWidgets.QWidget):
                 widget = _PulseSlotsWidget(title=label_text)
                 widget.setToolTip(decl.tooltip)
                 widget.changed.connect(self._refresh_start_enabled)
-                self.form.addRow(widget)              # FULL-WIDTH span (label is the widget's header, #H3b)
+                self._add_span(widget)              # FULL-WIDTH span (label is the widget's header, #H3b)
                 self._widgets[decl.key] = ("pulse_slots", widget)
                 self._pulse_slots_decls[decl.key] = decl
             elif kind == "pulse_param":
@@ -2679,7 +2690,7 @@ class MeasurementPanel(QtWidgets.QWidget):
                 combo.setEditable(True)
                 combo.setToolTip(decl.tooltip)
                 combo.activated.connect(lambda *_: self._refresh_start_enabled())
-                self.form.addRow(label_text, combo)
+                self._add_row(label_text, combo)
                 self._widgets[decl.key] = ("pulse_param", combo)
                 self._pulse_param_decls[decl.key] = decl
             elif kind == "text":
@@ -2688,11 +2699,11 @@ class MeasurementPanel(QtWidgets.QWidget):
                 edit.setPlaceholderText(decl.tooltip[:48] if decl.tooltip else "")
                 edit.setToolTip(decl.tooltip)
                 edit.textChanged.connect(self._refresh_start_enabled)
-                self.form.addRow(label_text, edit)
+                self._add_row(label_text, edit)
                 self._widgets[decl.key] = ("text", edit)
             else:  # float
                 spin = self._spin(decl, integer=False)
-                self.form.addRow(label_text, spin)
+                self._add_row(label_text, spin)
                 self._widgets[decl.key] = ("float", spin)
         # Wire each pulse_param combo to its source template field (done AFTER the build loop
         # so the source field exists regardless of declaration order), then fill it once.  This
@@ -3005,9 +3016,7 @@ class PanelEditor(QtWidgets.QWidget):
         col.setSpacing(scaled_px(6, minimum=4))
 
         def section(text):
-            lab = FluentLabel(text)
-            lab.setStyleSheet(f"color: {GREY}; background: transparent; border: none; font-weight: bold;")
-            col.addWidget(lab)
+            col.addWidget(FluentSectionLabel(text))   # the ONE section style (bold dark), like everywhere
 
         def labeled(text):
             lab = FluentLabel(text)

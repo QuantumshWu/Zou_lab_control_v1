@@ -986,23 +986,46 @@ class FluentSectionLabel(QtWidgets.QLabel):
 
     def __init__(self, text: str = "", parent=None):
         super().__init__(text, parent)
+        # Bold must go in the STYLESHEET (it is what actually renders): setting a stylesheet AFTER
+        # setFont re-polishes the widget and drops a QFont-only bold, so a section ended up the same
+        # weight as a row label (the "can't tell a section from a row" bug).  Set the stylesheet
+        # (with font-weight: bold) FIRST, then setFont last so widget.font().bold() also stays True.
+        self.setStyleSheet(f"color: {TEXT}; background: transparent; border: none; font-weight: bold;")
         font = self.font()
         font.setBold(True)
         font.setPointSize(fluent_font_size())
         self.setFont(font)
-        self.setStyleSheet(f"color: {TEXT}; background: transparent; border: none;")
         self.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         self.setContentsMargins(0, scaled_px(4), 0, 0)
 
 
-class FluentSettingRow(QtWidgets.QWidget):
-    """One settings row: [fixed-width label | control flush-left, expanding].
+def setting_label_width(labels, *, minimum: int = 72) -> int:
+    """The ONE label-column width for a settings/edit/param form: wide enough that the LONGEST
+    of ``labels`` shows in full, never below ``minimum`` (scaled).  Every form computes its
+    column with THIS function, so each form's rows align and the width rule is identical across
+    the whole frontend (a form with longer labels simply gets a wider column).  This is the single
+    source of the "[label | control]" column width -- callers never hand-pick a px value."""
+    metrics = QtGui.QFontMetrics(QtGui.QFont(FONT, fluent_font_size()))
+    widest = 0
+    for text in labels:
+        try:
+            widest = max(widest, metrics.horizontalAdvance(str(text)))
+        except AttributeError:  # pragma: no cover - very old Qt
+            widest = max(widest, metrics.width(str(text)))
+    return max(scaled_px(int(minimum), minimum=48), widest + scaled_px(10))
 
-    Mirrors confocal_gui's `[QLabel(110x30, centred) | widget(100x30)]` row template
-    (`gui_individual.py`), but here the label is left-aligned (compact label-column
-    look) and the control is allowed to expand so long text fields fill the popup
-    width.  Use inside a settings popup VBox under a :class:`FluentSectionLabel`;
-    do NOT nest in a QGroupBox -- the section label is the section marker."""
+
+class FluentSettingRow(QtWidgets.QWidget):
+    """One settings row -- the ONE param-row primitive for the whole frontend:
+    ``[grey fixed-width label | control flush-left, expanding]``.
+
+    THE design system (one logic everywhere): a form is built from exactly two primitives --
+    :class:`FluentSectionLabel` (bold, dark, own-line) for a GROUP header, and this row (grey
+    label, fixed-width column) for each control.  The section/row hierarchy is shown by
+    weight+colour ONLY -- never by indentation, never by a third colour.  Share ONE column width
+    per form via :func:`setting_label_width` so the rows align.  Do NOT use a ``QFormLayout`` (its
+    labels render dark + auto-width = a different style) and do NOT use a bare ``FluentLabel`` as a
+    row/section label.  Mirrors confocal_gui's ``[QLabel | widget]`` row template."""
 
     def __init__(
         self,
@@ -1020,6 +1043,7 @@ class FluentSettingRow(QtWidgets.QWidget):
         lbl.setFixedWidth(int(label_width) if label_width is not None else scaled_px(60, minimum=48))
         lbl.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         lbl.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+        self._label = lbl                       # introspected by the layout-uniformity contract test
         h.addWidget(lbl)
         h.addWidget(control, 1)
 
