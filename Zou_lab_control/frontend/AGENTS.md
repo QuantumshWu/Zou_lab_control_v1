@@ -54,6 +54,19 @@ the rules don't get re-broken.
    `BaseLivePlot`, or an entry point whose figure has no selectors / no
    `DataFigure`, fails the build.
 
+8. **One row/label system for EVERY settings / Edit / param form.** A form is built from exactly
+   two primitives: `FluentSectionLabel` (bold, dark, own-line GROUP header) and `FluentSettingRow`
+   (grey fixed-width label | control). The section-vs-row hierarchy is shown by **weight + colour
+   only — never indentation, never a third colour**. The label-column width comes from the single
+   `setting_label_width(labels)` rule (fit the widest label, shared minimum) so a form's rows align.
+   **Do NOT** use a `QFormLayout` for a param form (its labels render dark + auto-width = a rogue
+   style), **do NOT** use a bare bold `FluentLabel` as a section (use `FluentSectionLabel`), and
+   **do NOT** indent a composite's sub-rows. Bold lives in the stylesheet (`font-weight: bold`),
+   not a QFont-only `setBold` that `setStyleSheet` re-polish would drop. **Enforced** by
+   `tests/test_frontend_layout_uniformity.py`. (Failure history: three competing label logics —
+   QFormLayout dark labels, grey-bold sections, indented sub-forms — plus section labels that were
+   never actually bold, so a section looked like a row.)
+
 ## The patterns that already seal correctly (copy these)
 
 - `panel_plot_spec` / `panel_size_cells` own panel geometry; size is the only knob.
