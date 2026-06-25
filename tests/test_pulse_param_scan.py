@@ -164,9 +164,13 @@ def _run_pulse_scan(exp, *, y=None, **build_kwargs):
     plan.settle = occ.step
     node = PulseScanNode(hub, plan, x_key=spec.x_key, y_key=spec.y_key, prefix=f"{spec.key}_")
     node.run_to_completion()
-    return (np.asarray(hub.latest(node.x_signal), dtype=float),     # node's REAL x/y names (y_name aware)
-            np.asarray(hub.latest(node.y_signal), dtype=float),
-            node, hub)
+    # The node publishes the RAW (repeat, points, 1) block; a plot REDUCES the repeat axis (the
+    # node never combines).  These tests check the displayed curve, so reduce it here the same way a
+    # panel does -- with the ONE owned helper -- to the (points,) curve (repeat=1 -> a single pass).
+    from Zou_lab_control.frontend.live import reduce_repeat
+    y = np.asarray(reduce_repeat(np.asarray(hub.latest(node.y_signal), dtype=float), "replace"),
+                   dtype=float).reshape(-1)
+    return (np.asarray(hub.latest(node.x_signal), dtype=float), y, node, hub)
 
 
 def test_pulse_scan_spec_carries_pulse_slots_and_signal_expr_y():
@@ -277,7 +281,12 @@ def test_pulse_scan_2d_grid_publishes_a_2d_map():
         assert node.scan_shape == (3, 2)
         grid_name = node.y_signal + "_grid"
         assert grid_name in hub.names()
-        assert np.asarray(hub.latest(grid_name)).shape == (3, 2)   # a 2-D scan map for a 2D image
+        # the grid is the RAW (repeat, n0, n1) block; a 2-D panel reduces the repeat axis to the
+        # (n0, n1) map (the node never combines).  repeat=1 -> a single (1, 3, 2) slice.
+        from Zou_lab_control.frontend.live import reduce_repeat
+        raw_grid = np.asarray(hub.latest(grid_name))
+        assert raw_grid.shape == (1, 3, 2)
+        assert np.asarray(reduce_repeat(raw_grid, "replace")).shape == (3, 2)   # the 2-D scan map
     finally:
         _safe_unlink(probe)
         exp.close()

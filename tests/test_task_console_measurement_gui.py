@@ -153,7 +153,10 @@ def test_node_start_builds_node_and_streams_no_auto_plot():
 
         # the console node publishes under the measurement slug: <key>_<quantity>.
         x = console.hub.latest(f"{spec.key}_{spec.x_key}")
-        y = console.hub.latest(f"{spec.key}_{spec.y_key}")
+        # y is the RAW (repeat, points, dim) block; reduce the repeat axis the way a plot does.
+        from Zou_lab_control.frontend.live import reduce_repeat
+        y = np.asarray(reduce_repeat(np.asarray(console.hub.latest(f"{spec.key}_{spec.y_key}"),
+                                                dtype=float), "replace"), dtype=float).reshape(-1)
         assert x.shape == (5,) and y.shape == (5,)
         assert np.all(np.isfinite(y)) and np.all((y >= 0) & (y <= 1))
         assert y[0] > y[-1] + 0.3
@@ -245,19 +248,22 @@ def test_1d_panel_plain_vector_still_uses_index():
         card.shutdown()
 
 
-def test_1d_panel_without_xy_marker_flattens_n_by_2():
-    """A plain 1d panel (no xy marker) that happens to produce an (N, 2) value
-    flattens to a vector vs index -- the x-y meaning is opt-in, never inferred."""
+def test_1d_panel_draws_multi_column_value_as_multiple_lines():
+    """A 1d panel given an ``(N, ncols)`` value draws each column as its OWN line -- the dimension
+    axis O2 (one line per series, or one line per repeat in ``repeat_mode='new'``), NOT flattened.
+    The x-y curve meaning (col0=x, col1=y) is the OPT-IN ``xy`` marker; without it, columns are
+    series drawn vs the point index (#3)."""
     from Zou_lab_control.frontend.task_console import PanelCard, PanelConfig
 
     card = PanelCard(PanelConfig(kind="1d", source="value = arr"))
     try:
-        arr = np.column_stack([np.array([0.0, 10.0, 20.0]),
-                               np.array([1.0, 0.8, 0.5])])
+        arr = np.column_stack([np.array([1.0, 0.8, 0.5]),
+                               np.array([0.2, 0.3, 0.4])])           # (3, 2) -> 2 series
         card.refresh({"arr": arr, "shot": 1})
         assert card.plotter is not None
-        assert np.allclose(card.plotter.data_x[:, 0], np.arange(6))
-        assert np.allclose(card.plotter.data_y[:, 0], arr.reshape(-1))
+        assert np.allclose(card.plotter.data_x[:, 0], np.arange(3))  # x = point index
+        assert card.plotter.data_y.shape == (3, 2)                   # 2 columns = 2 lines (not flattened)
+        assert np.allclose(card.plotter.data_y, arr)
     finally:
         card.shutdown()
 

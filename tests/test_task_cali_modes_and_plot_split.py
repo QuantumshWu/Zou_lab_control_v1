@@ -353,7 +353,9 @@ def test_pulse_scan_slots_form_is_template_driven():
         tag, widget = panel._widgets["pulse_slots"]
         assert tag == "pulse_slots"
         out = panel.collect_values()["pulse_slots"]
-        assert isinstance(out, dict) and set(out) == {"api", "scan_code"}
+        # the form returns the api numeric rows + the scan-table program + the software api-sweep
+        # (``api_scan``) + the inter-point ``extra_delay`` -- all the build() consumes.
+        assert isinstance(out, dict) and set(out) == {"api", "scan_code", "api_scan", "extra_delay"}
         # the imaging template carries 3 unique API handles -> 3 numeric rows after a switch
         panel._widgets["template"][1].setText("imaging_template.json")
         panel._repopulate_pulse_slots("pulse_slots")

@@ -37,6 +37,14 @@ from Zou_lab_control.neutral_atom.operations.temperature import (
 from conftest import fire_live_imaging   # the live "On Pulse" the trigger-driven camera needs
 
 
+def _curve(hub, name):
+    """The DISPLAYED curve for a scan signal: the node now publishes the RAW (repeat, points, dim)
+    block, and a plot reduces the repeat axis.  These tests check the curve, so reduce it the same
+    way a panel does (repeat=1 -> a single pass) -> (points,) / (points, dim)."""
+    from Zou_lab_control.frontend.live import reduce_repeat
+    return np.asarray(reduce_repeat(np.asarray(hub.latest(name), dtype=float), "replace"), dtype=float)
+
+
 # ------------------------------------------------------------ descriptor unit
 
 
@@ -125,7 +133,7 @@ def test_temperature_node_run_to_completion_publishes_full_decaying_curve():
 
     assert node.finished
     x = hub.latest(spec.x_key)
-    y = hub.latest(spec.y_key)
+    y = _curve(hub, spec.y_key).reshape(-1)
     # Cumulative curve has exactly ``points`` entries when complete.
     assert x.shape == (13,)
     assert y.shape == (13,)
@@ -148,9 +156,11 @@ def test_temperature_node_run_to_completion_publishes_full_decaying_curve():
     assert 25e-6 <= fit.temperature_K <= 100e-6
 
 
-def test_temperature_node_per_site_publishes_latest_site_vector_only():
-    """A per-site scan publishes ONLY the flat per-site vector (``<y>_sites``); a site-grid
-    view is a reshape EXPRESSION on it, not a separate published signal (no ``<y>_grid``)."""
+def test_temperature_node_per_site_carries_the_per_site_dimension_in_the_raw_block():
+    """A per-site scan makes the reducer's dimension O2 = n_sites, so the ONE raw ``y`` block is
+    ``(repeat, points, n_sites)`` -- the per-site vectors live in the dimension axis (a 1-D plot
+    draws one line per site; a grid view reshapes a reduced point).  There is NO separate
+    ``<y>_sites`` / ``<y>_grid`` / ``shot`` signal (the node fills only the one raw block)."""
     exp = _calibrated_virtual_session(grid=(2, 3))
     n_sites = exp.devices.trap_array.n_sites
     hub = SignalHub()
@@ -159,19 +169,20 @@ def test_temperature_node_per_site_publishes_latest_site_vector_only():
     node = ScannedMeasurementNode(hub, measurement, x_key=spec.x_key, y_key=spec.y_key)
     node.run_to_completion()
 
-    sites = hub.latest(spec.y_key + "_sites")
-    assert sites.shape == (n_sites,)
-    finite = sites[np.isfinite(sites)]
+    raw = np.asarray(hub.latest(spec.y_key))
+    assert raw.shape == (1, 4, n_sites)              # (repeat, points, dim=n_sites)
+    reduced = _curve(hub, spec.y_key)                # plot reduction -> (points, n_sites)
+    assert reduced.shape == (4, n_sites)
+    finite = reduced[np.isfinite(reduced)]
     assert np.all((finite >= 0.0) & (finite <= 1.0))
-    # No redundant signals: the grid + per-node shot counter are NOT published (the grid is
-    # a reshape expression; the panel namespace already carries a global ``shot``).
+    # No redundant signals: only x / y / scan_done -- no per-site/grid/shot extras.
     published = node.published_signals()
+    assert (spec.y_key + "_sites") not in published
     assert (spec.y_key + "_grid") not in published
     assert "shot" not in published and (spec.y_key + "_shot") not in published
-    # ... but the per-site vector reshapes cleanly to the grid via an expression, using
-    # the trap array's grid shape (the source of truth -- not a stored spec field).
+    # the latest point's per-site vector reshapes cleanly to the grid (the trap array owns the shape).
     grid = exp.devices.trap_array.grid_shape
-    assert sites.reshape(grid).shape == grid
+    assert reduced[-1].reshape(grid).shape == grid
 
 
 def test_readout_duration_node_runs_out_a_fidelity_curve():
@@ -185,7 +196,7 @@ def test_readout_duration_node_runs_out_a_fidelity_curve():
     node.run_to_completion()
 
     x = hub.latest(spec.x_key)
-    y = hub.latest(spec.y_key)
+    y = _curve(hub, spec.y_key).reshape(-1)
     assert x.shape == (4,)
     assert y.shape == (4,)
     assert np.all(np.isfinite(y))
@@ -207,7 +218,7 @@ def test_temperature_node_start_thread_auto_stops_when_scan_completes():
 
     assert node.finished
     assert node.running is False        # finite scan stopped its own daemon thread
-    y = hub.latest(spec.y_key)
+    y = _curve(hub, spec.y_key).reshape(-1)
     assert y.shape == (4,)
     assert np.all(np.isfinite(y))
 

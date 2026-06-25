@@ -44,6 +44,51 @@ DEFAULT_COLORS = list(PALETTE["series"])
 PULSE_COLORS = list(PALETTE["pulse_cycle"])
 
 
+# --- Repeat-axis reduction (the PLOT's `repeat_mode`) ---------------------------------------------
+# A scan measurement publishes a RAW 3-D block O0 x O1 x O2 = (repeat, points, dim): it just FILLS
+# each repeat (NaN = not-yet-measured), never combines.  `repeat_mode` is a PLOT parameter that
+# decides HOW to collapse the repeat axis (O0) for display -- so the SAME raw data can be shown as a
+# mean, a sum, the latest, a rolling newest, or every repeat as its own line, without re-running.
+REPEAT_MODES = ("average", "add", "replace", "roll", "new")   # "new" is 1-D only (a line per repeat)
+
+
+def reduce_repeat(raw, mode: str = "average"):
+    """Collapse a raw 3-D block over its LEADING (repeat) axis O0 for display.  Handles BOTH a 1-D
+    scan's ``(repeat, points, dim)`` and a 2-D scan's ``(repeat, n0, n1)`` -- the leading axis is the
+    repeat axis in either case (a 3-D block ALWAYS carries a repeat axis; an already-reduced array is
+    1-D/2-D and passes through untouched, so a plain image is never mistaken for a repeat stack).
+
+    * ``average`` -> ``nanmean`` over the repeats that HAVE data (the true running mean; magnitude-
+      stable regardless of how many repeats completed) -> drops the repeat axis.
+    * ``add``     -> ``nansum``  over repeats.
+    * ``replace`` / ``roll`` -> the LATEST repeat slice that holds data.
+    * ``new``     -> 1-D only: keep EVERY repeat-with-data as its own column block ``(points, n*dim)``
+      so the curve draws one line per repeat (offered only for 1-D panels)."""
+    a = np.asarray(raw, dtype=float)
+    if a.ndim != 3:                                     # already reduced (1-D/2-D) -> leave as-is
+        return a
+    has = np.isfinite(a).any(axis=tuple(range(1, a.ndim)))   # which repeat slices hold any data
+    idx = np.flatnonzero(has)
+    if mode == "add":
+        return np.nansum(a, axis=0)
+    if mode in ("replace", "roll"):
+        return a[idx[-1]] if idx.size else a[0]
+    if mode == "new":
+        cols = idx if idx.size else np.array([0])
+        return np.concatenate([a[r] for r in cols], axis=1)   # 1-D: (points, len(cols)*dim)
+    with np.errstate(invalid="ignore", divide="ignore"):       # all-NaN cell -> NaN (not-yet-measured)
+        return np.nanmean(a, axis=0)
+
+
+def repeats_with_data(raw) -> int:
+    """How many repeat slices of a raw 3-D block currently hold data (drives the plot's ``xN``
+    label).  Non-3-D (already reduced) -> 1."""
+    a = np.asarray(raw, dtype=float)
+    if a.ndim != 3:
+        return 1
+    return int(np.count_nonzero(np.isfinite(a).any(axis=tuple(range(1, a.ndim)))))
+
+
 # --- Pulse-plot display margins -------------------------------------------
 # The pulse timeline draws a viewport deliberately a little WIDER than the data
 # extent, so pulses/edges sitting on the boundary (e.g. a first edge at t=0) are
