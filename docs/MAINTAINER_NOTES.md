@@ -1225,11 +1225,12 @@ means a mis-wired y never wedges the scan. The device lockout (`DEVICE_DRIVING_K
 pulse-scan the sole device driver; processors are not device-driving, so the workflow is: start
 the producer (occupancy) FIRST, then pulse-scan.
 
-`pulse_scan.py` `build()` returns a `PulseScanPlan` (base state + scan arrays + camera/sequencer
-+ y `SignalExpr` + n_frames); the spec carries `metadata={"node": "pulse_scan"}` and the console
-builds a `PulseScanNode` (not a `ScannedMeasurementNode`) when it sees that tag. The reducer /
-calibration / `reduce` / `shots` params are gone; the params are now `template` + `pulse_slots`
-(api + scan-table program) + `y` (signal_expr) + `n_frames`.
+`pulse_scan.py` `build()` returns a `PulseScanPlan` (base state + scan/api arrays + camera/sequencer
++ y `SignalExpr` + `extra_delay_s`); the spec carries `metadata={"node": "pulse_scan"}` and the
+console builds a `PulseScanNode` (not a `ScannedMeasurementNode`) when it sees that tag. Pulse-scan
+images ONCE per point (`camera.acquire(1)`) — it is decoupled from the camera's exposure/averaging,
+so there is no frame-count knob; the params are `template` + `pulse_slots` (api fixed/sweep + scan
+program + extra settle) + `y` (signal_expr) + `y_name` (the output signal name).
 
 ### Scan POINTS are ONE `scan_table` program (the pulse-GUI model), not per-slot
 The scan points are a single `(N_points x n_slots)` table — one ROW per scan point, one COLUMN
@@ -1242,9 +1243,33 @@ program, then `snap_scan_table(..., time_step_ns=state.time_step_ns, dac_ranges=
 column hardware-legal IN ITS NATIVE UNIT (a duration column → whole clock ticks in ns, a DAC
 column → integer LSB code — the axis unit is derived per slot KIND, never assumed to be time).
 The column count MUST equal the bound slot count (lockstep contract), else `build()` raises. The
-GUI `_PulseSlotsWidget` renders one numeric row per api slot + ONE `FluentCodeEdit` for the whole
-scan table + `column_stack`/`grid` buttons + a per-`sN` column legend; its value is
-`{"api": {...}, "scan_code": "<python>"}`.
+GUI `_PulseSlotsWidget` renders TWO peer sections (hierarchy = weight+colour, never a wrapper
+header): **API slots** (always shown) + **Scan table** (always shown). Its value is
+`{"api": {...}, "scan_code": "<python>", "api_scan": "<python>", "extra_delay": <s>}`.
+
+### API slots also sweep — in SOFTWARE — the analogue of the hardware scan table
+Scan slots (`sN`) stream on the FPGA; api slots (`aN`) are fixed handles set per shot in software.
+So an api slot can be **fixed** (a numeric value, `set_api` once at build) OR **swept**: the API
+section's `api_scan` program (a `(N x n_api)` table, one column per api slot in order, the same
+`evaluate_scan_table_code` evaluator as the scan table — no hardware snap, `set_api` interprets each
+value in the slot's native unit) drives `PulseTableState.with_api_resolved({aN: row})` per point —
+the software twin of `with_slots_resolved`. A pulse with ONLY api slots is therefore fully
+sweepable (x = the swept api slot); scan + api slots may both sweep in lockstep. The per-point loop
+is **load → on_pulse → wait the pulse done (`camera.acquire`) → settle → next**, and the settle is
+owned by the DEVICE so callers don't hand-roll timing: `SequencerDevice.settle(seconds, *, stop=)`
+idles the (adjustable) `extra_delay` between points (`VirtualSequencer`/`RuntimeSequencer` scale it
+by `sleep_scale` like `wait_done`; the wait is cooperatively cancellable on Stop). Guarded by
+`test_pulse_param_scan.py` (api-only sweep drives each point; settle is called once per point).
+
+### Scan-level Repeat (the confocal model)
+A finite scan can be re-run `repeat` times, averaging each x point across the passes — `repeat=1` is
+a single pass. `ScannedMeasurementNode` and `PulseScanNode` both take `repeat=int` and accumulate a
+per-point running sum/count, publishing the running MEAN; they self-stop only after the last point of
+the LAST pass (`finished == _repeat_cur > repeat`); `points_done`/`total_points` span all passes. The
+task console's measurement Edit exposes it as an **Acquisition → Repeat** spinbox (a continuous camera
+/ reactive processor / one-shot task does not re-run a finite sweep, so the control is
+measurement-only); `_build_logic_node` pops `repeat` and hands it to the node. Guarded by
+`test_scan_repeat.py`.
 
 ### One source MECHANISM everywhere; per-kind only the slot-count + the value SIZE
 The signal-picker + `value = ...` expression box (the `SignalExpr` mechanism) is on EVERY source
