@@ -366,7 +366,7 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
 
     changed = QtCore.pyqtSignal()
 
-    def __init__(self, parent=None, *, title: str = ""):
+    def __init__(self, parent=None):
         super().__init__(parent)
         self.setStyleSheet("background: transparent;")
         self._api_widgets: dict[str, QtWidgets.QWidget] = {}
@@ -374,18 +374,12 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
         self._scan_remembered: str = ""               # typed scan program, kept across reloads
         self._scan_code = None                        # the FluentCodeEdit (None until first scan slot)
         self._n_slots = 0
-        outer = QtWidgets.QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(scaled_px(3, minimum=2))
-        # Spans the FULL form width; title is a FluentSectionLabel header (the ONE section style),
-        # with the api / scan sub-rows stacking FLUSH beneath (no indent -- section-vs-row hierarchy
-        # is weight+colour, never indentation; consistent with every other form).
-        if title:
-            outer.addWidget(FluentSectionLabel(title))
-        self._box = QtWidgets.QVBoxLayout()
+        # Spans the FULL form width and emits its OWN two PEER sections ("API slots" + "Scan table")
+        # as top-level FluentSectionLabels -- no wrapper header (that would be a redundant third
+        # same-style label above them, #H3-1).
+        self._box = QtWidgets.QVBoxLayout(self)
         self._box.setContentsMargins(0, 0, 0, 0)
         self._box.setSpacing(scaled_px(6, minimum=4))
-        outer.addLayout(self._box)
 
     def _clear(self) -> None:
         """Tear down every child widget + nested layout (the form is rebuilt from scratch)."""
@@ -414,8 +408,10 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
         self._clear()
         self._n_slots = len(scan_rows)
 
+        # ---- API slots section: ALWAYS shown (symmetric with the scan table below, #H3-2) so the
+        # two peer sections are always both present -- not "scan table always, api only sometimes".
+        self._box.addWidget(FluentSectionLabel("API slots (fixed values)"))
         if api_rows:
-            self._box.addWidget(FluentSectionLabel("API slots (fixed values)"))
             api_labels = [f"{name}  ({kind} @ {target})" for name, kind, target, _u, _c in api_rows]
             api_lw = setting_label_width(api_labels, minimum=72)   # same row rule as every form
             for name, kind, target, unit, current in api_rows:
@@ -427,6 +423,12 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
                 edit.textChanged.connect(self.changed)
                 self._box.addWidget(FluentSettingRow(label, edit, label_width=api_lw))
                 self._api_widgets[name] = edit
+        else:
+            api_note = FluentLabel("(no API slot -- in the pulse GUI Edit tab, click a duration / DAC "
+                                   "cell to its API (purple) state to fix a value by name aN.)", self)
+            api_note.setWordWrap(True)
+            api_note.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+            self._box.addWidget(api_note)
 
         # ---- ONE scan-table program for all scan slots together ----------------------
         self._box.addWidget(FluentSectionLabel("Scan table (one program for all scan slots)"))
@@ -2673,10 +2675,13 @@ class MeasurementPanel(QtWidgets.QWidget):
                 # {"api": {name: float}, "scan_code": "<python>"} -- the same shape the
                 # pulse_scan build() consumes.  ONE source for the pulse slot form,
                 # so a NEW measurement that takes a pulse template gets this row for free.
-                widget = _PulseSlotsWidget(title=label_text)
+                # No redundant "Slots" wrapper header: the widget emits its OWN two PEER sections
+                # ("API slots" + "Scan table"), so a third same-style header above them would just
+                # confuse the hierarchy (#H3-1).
+                widget = _PulseSlotsWidget()
                 widget.setToolTip(decl.tooltip)
                 widget.changed.connect(self._refresh_start_enabled)
-                self._add_span(widget)              # FULL-WIDTH span (label is the widget's header, #H3b)
+                self._add_span(widget)              # FULL-WIDTH span
                 self._widgets[decl.key] = ("pulse_slots", widget)
                 self._pulse_slots_decls[decl.key] = decl
             elif kind == "pulse_param":
