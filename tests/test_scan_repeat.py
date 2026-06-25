@@ -109,8 +109,8 @@ def test_measurement_edit_exposes_repeat_camera_does_not(monkeypatch):
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     console = dt.demo_console(shots=3)
     try:
-        # a scanned measurement node Edit HAS a Repeat spin AND a Repeat-mode combo; collect_values
-        # carries both (repeat + repeat_mode), the latter offering the confocal combine modes.
+        # a scanned measurement node Edit HAS a Repeat spin AND an Update-mode combo; collect_values
+        # carries both (repeat + update_mode), the latter offering the scan combine modes.
         row = console._add_logic_node(LogicNodeConfig(kind="measurement", name="Pulse scan"))
         console._edit_logic_node(row)
         ed = console._logic_editors[id(row)]
@@ -118,12 +118,53 @@ def test_measurement_edit_exposes_repeat_camera_does_not(monkeypatch):
         ed._repeat_spin.setValue(5)
         ed._update_mode_combo.setCurrentText("add")
         vals = ed.collect_values()
-        assert int(vals["repeat"]) == 5 and vals["repeat_mode"] == "add"
-        # a camera node Edit has NEITHER (a continuous camera does not re-run a finite sweep)
+        assert int(vals["repeat"]) == 5 and vals["update_mode"] == "add"
+        # a CAMERA is a measurement too -> it ALSO has Repeat + Update mode (repeat = average N
+        # frames; modes are the continuous set roll/average/replace, NOT the scan's add).
         crow = console._add_logic_node(LogicNodeConfig(kind="camera", name="Camera"))
         console._edit_logic_node(crow)
         ced = console._logic_editors[id(crow)]
-        assert ced._repeat_spin is None and ced._update_mode_combo is None
+        assert ced._repeat_spin is not None and ced._update_mode_combo is not None
+        cam_modes = [ced._update_mode_combo.itemText(i) for i in range(ced._update_mode_combo.count())]
+        assert "roll" in cam_modes and "add" not in cam_modes
+        # a PROCESSOR is NOT a measurement -> no repeat controls
+        prow = console._add_logic_node(LogicNodeConfig(kind="processor", name="Judge occupancy"))
+        console._edit_logic_node(prow)
+        assert console._logic_editors[id(prow)]._repeat_spin is None
+    finally:
+        console.shutdown()
+
+
+def test_repeat_cur_pushed_to_panels_plotting_the_node(monkeypatch):
+    """Decoupled `xN` feed: the console pushes a running node's `_repeat_cur` onto the plotter of
+    any panel whose source signal the node publishes (confocal's controller-push), and leaves other
+    panels alone."""
+    import types
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5 import QtWidgets
+    from Zou_lab_control.frontend import devtools as dt
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    console = dt.demo_console(shots=3)
+    try:
+        node = types.SimpleNamespace(repeat=2, _repeat_cur=2,
+                                     published_signals=lambda: frozenset({"m_y"}))
+        cards = console.cards
+        assert cards, "demo console should have at least one panel"
+        saved = [(c, c.plotter) for c in cards[:2]]      # restore real plotters before teardown
+        try:
+            cards[0].plotter = types.SimpleNamespace(repeat_cur=1)
+            cards[0].config.inputs = ["m_y"]             # this panel plots the node's signal
+            if len(cards) > 1:
+                cards[1].plotter = types.SimpleNamespace(repeat_cur=1)
+                cards[1].config.inputs = ["other"]       # unrelated panel
+            console._push_repeat_cur(node)
+            assert cards[0].plotter.repeat_cur == 2, "panel plotting the node's signal must get repeat_cur"
+            if len(cards) > 1:
+                assert cards[1].plotter.repeat_cur == 1, "an unrelated panel must be left alone"
+        finally:
+            for card, plotter in saved:
+                card.plotter = plotter
     finally:
         console.shutdown()
 

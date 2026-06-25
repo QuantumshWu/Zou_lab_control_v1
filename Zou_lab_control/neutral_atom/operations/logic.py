@@ -1153,9 +1153,15 @@ class CameraMeasurement(Measurement):
 
     node_label = "camera"
 
+    #: Repeat/update modes a continuous camera offers (the confocal per-measurement valid set):
+    #: roll = live scrolling view (default), average = running mean of the frames, replace = latest.
+    REPEAT_MODES = ("roll", "average", "replace")
+
     def __init__(self, hub: SignalHub, camera: CameraDevice, *, sequencer: object | None = None,
-                 frames_per_cycle: int = 1, prefix: str = ""):
-        super().__init__(hub, prefix=prefix)
+                 frames_per_cycle: int = 1, prefix: str = "", update_mode: str = "roll", repeat: int = 1):
+        # A camera is a Measurement too, so it shares the base repeat/update_mode (per-shot)
+        # accumulation: repeat=N + update_mode='average' averages N frames per published frame.
+        super().__init__(hub, prefix=prefix, update_mode=update_mode, repeats=repeat)
         self.camera = camera
         self.sequencer = sequencer
         self.frames_per_cycle = max(1, int(frames_per_cycle))

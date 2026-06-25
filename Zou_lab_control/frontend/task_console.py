@@ -4030,33 +4030,37 @@ class LogicNodeEditor(QtWidgets.QWidget):
         self.form.start_requested.connect(lambda *_: self.console._start_logic_node(self.row))
         self.form.stop_requested.connect(lambda: self.console._stop_logic_node(self.row))
         col.addWidget(self.form)
-        # ---- Repeat + Update mode (confocal's "Repeat:" + "Update mode:"): re-run the WHOLE finite
-        # scan N times, and combine the passes per point (average / add / replace).  Only a scanned
-        # MEASUREMENT re-runs a finite sweep -- a continuous camera / reactive processor / one-shot
-        # task does not -- so these controls are measurement-only.
+        # ---- Repeat + Update mode (confocal's "Repeat:" + "Update mode:"): repeat is a property of
+        # EVERY measurement (a scan re-runs the whole sweep; a continuous camera repeats=averages N
+        # frames), combined by the Update mode.  So these controls appear for ANY measurement-layer
+        # node (kind "measurement" OR "camera") -- NOT processors / tasks (which don't re-acquire).
+        # The valid modes come from the node type (the confocal per-measurement ``update_mode_valid``).
         self._repeat_spin = None
         self._update_mode_combo = None
-        if row.node.kind == "measurement":
-            from ..neutral_atom.operations.logic import REPEAT_COMBINE_MODES
+        if row.node.kind in ("measurement", "camera"):
+            from ..neutral_atom.operations.logic import REPEAT_COMBINE_MODES, CameraMeasurement
+            is_cam = row.node.kind == "camera"
+            modes = list(CameraMeasurement.REPEAT_MODES) if is_cam else list(REPEAT_COMBINE_MODES)
+            default_mode = modes[0] if is_cam else "average"
             col.addWidget(FluentSectionLabel("Acquisition"))
             lw = setting_label_width(["Update mode"], minimum=getattr(self.form, "_form_label_w", 72))
             spin = FluentDoubleSpinBox(length=6, allow_minus=False)
             spin.setDecimals(0)
             spin.setRange(1, 100000)
             spin.setValue(int(row.node.values.get("repeat", 1) or 1))
-            spin.setToolTip("Re-run the whole scan this many times (1 = a single pass); the passes "
-                            "are combined per point by the Update mode below.")
+            spin.setToolTip("Repeat the measurement this many times (1 = once), combined by the "
+                            "Update mode below: a scan RE-RUNS the whole sweep; a camera AVERAGES "
+                            "this many frames per published frame.")
             self._repeat_spin = spin
             col.addWidget(FluentSettingRow("Repeat", spin, label_width=lw))
             combo = FluentComboBox()
-            combo.addItems(list(REPEAT_COMBINE_MODES))
-            mode0 = str(row.node.values.get("repeat_mode", "average") or "average")
-            combo.setCurrentText(mode0 if mode0 in REPEAT_COMBINE_MODES else "average")
-            combo.setToolTip("How to combine the repeated passes at each scan point: 'average' = "
-                             "mean (noise reduction), 'add' = accumulate sum, 'replace' = keep the "
-                             "latest pass.")
+            combo.addItems(modes)
+            mode0 = str(row.node.values.get("update_mode", default_mode) or default_mode)
+            combo.setCurrentText(mode0 if mode0 in modes else default_mode)
+            combo.setToolTip("How to combine the repeats: 'average' = mean (noise reduction), 'add' "
+                             "= accumulate sum, 'replace' = keep the latest, 'roll' = live scrolling.")
             self._update_mode_combo = combo
-            col.addWidget(FluentSettingRow("Repeat mode", combo, label_width=lw))
+            col.addWidget(FluentSettingRow("Update mode", combo, label_width=lw))
         # (The node's published-signals + shapes are shown on its Logic-tab ROW card,
         # the single place for that legend -- not duplicated here.)
         col.addStretch(1)
@@ -4066,7 +4070,7 @@ class LogicNodeEditor(QtWidgets.QWidget):
         if self._repeat_spin is not None:
             vals["repeat"] = int(self._repeat_spin.value())
         if self._update_mode_combo is not None:
-            vals["repeat_mode"] = self._update_mode_combo.currentText()
+            vals["update_mode"] = self._update_mode_combo.currentText()
         return vals
 
     def set_running(self, running: bool) -> None:
@@ -5158,16 +5162,26 @@ class TaskConsole(QtWidgets.QWidget):
             if spec is None:
                 raise RuntimeError("no session camera available")
             # Same build path as the notebook: readout.camera_spec().build(hub, ...).
-            return spec.build(self.hub, **values)
+            repeat = int(values.pop("repeat", 1) or 1)
+            update_mode = str(values.pop("update_mode", "roll") or "roll")
+            cam = spec.build(self.hub, **values)
+            # A camera is a Measurement too (#H3i): repeat = average N frames per published frame.
+            # "average" routes to the base per-shot batch-mean ('repeat' mode over `repeat` frames);
+            # "roll"/"replace" pass through.  Set on the node (base reads it in _postprocess); start()
+            # resets the accumulator so this is safe to set before the first run.
+            cam.repeats = max(1, repeat)
+            cam.update_mode = cam._coerce_update_mode("repeat" if update_mode == "average" else update_mode)
+            return cam
         spec = self._spec_for_logic(node)
         if spec is None:
             raise RuntimeError(f"no catalog spec named {node.name!r} for a {kind} node")
         if kind == "measurement":
             # ``repeat`` (re-run the whole scan N times) + ``update_mode`` (how to combine the
             # passes per point: average / add / replace) are NODE knobs, not build args -- pop them
-            # before spec.build(**values) and hand them to the node.
+            # before spec.build(**values) and hand them to the node (scan's constructor calls the
+            # combine selector ``repeat_mode``).
             repeat = int(values.pop("repeat", 1) or 1)
-            repeat_mode = str(values.pop("repeat_mode", "average") or "average")
+            repeat_mode = str(values.pop("update_mode", "average") or "average")
             built = spec.build(**values)
             if getattr(spec, "metadata", {}).get("node") == "pulse_scan":
                 # Pulse-scan is a DEVICE-driving node whose y is DECOUPLED (subscribed from
@@ -5283,9 +5297,10 @@ class TaskConsole(QtWidgets.QWidget):
                 if row is self._running_task_row:
                     self._clear_task_running()
             elif running:
-                # surface scan progress when the node reports it
+                # surface scan progress when the node reports it -- ``total_points`` spans ALL
+                # repeat passes (n_points x repeat), so a repeated scan counts 52/60, not 12/20.
                 done = getattr(node, "points_done", None)
-                total = getattr(node, "n_points", None)
+                total = getattr(node, "total_points", None) or getattr(node, "n_points", None)
                 if done is not None and total:
                     row.set_state("running", status=f"running {done}/{total}")
                 else:
@@ -5294,6 +5309,29 @@ class TaskConsole(QtWidgets.QWidget):
                 # processor publishes nothing until it consumes a frame); set_publishes is
                 # self-guarded so this is a no-op once the shapes stop changing.
                 self._update_row_publishes(row)
+                # Push the node's current REPEAT pass to the panels plotting its signals, so the
+                # plot shows the confocal "xN" tag -- DECOUPLED (the panel subscribes to a signal,
+                # not the node; the console mediates, like confocal's controller pushes repeat_cur).
+                self._push_repeat_cur(node)
+
+    def _push_repeat_cur(self, node) -> None:
+        """Mirror confocal's controller: read the producing node's current repeat pass
+        (``_repeat_cur``) and push it onto every panel plotting one of its signals, so the plot's
+        y-label shows the ``xN`` pass tag.  Decoupled: the panel subscribes to a SIGNAL (not the
+        node); the console resolves which panels a node feeds via its ``published_signals``."""
+        repeat = int(getattr(node, "repeat", 1) or 1)
+        cur = getattr(node, "_repeat_cur", None)
+        if repeat <= 1 or cur is None:
+            return
+        try:
+            published = node.published_signals()
+        except Exception:
+            return
+        for card in self.cards:
+            plotter = getattr(card, "plotter", None)
+            inputs = getattr(card.config, "inputs", None) or []
+            if plotter is not None and any(str(sig) in published for sig in inputs):
+                plotter.repeat_cur = int(cur)
 
     def _mark_dirty(self, *_args) -> None:
         if self._building:
