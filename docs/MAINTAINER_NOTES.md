@@ -1051,6 +1051,31 @@ hands it to `active_plotter().run` when a viewer is registered (background worke
 UI-thread refresh, cooperative `stop()`), else runs the same callback synchronously
 and still returns a complete `ScanResult` (x + `data_y` `(n_points, n_series)`).
 
+### Repeat is a measurement param; repeat_mode is a plot param (the data model)
+
+A scan's full output is a 3-D block **O0×O1×O2 = (repeat, points, dim)**. The two scan logic nodes
+(`ScannedMeasurementNode`, `PulseScanNode`) **only FILL** that block point-by-point per pass — they
+do **not** combine the repeats. `repeat` is a **measurement** parameter (the Acquisition `Repeat`
+spin): a positive int, or `inf` (free-run = a `REPEAT_RING` (10) ring buffer, published rolled so
+the newest pass is last; `points_done`/`total_points` report `0` for inf so the progress line falls
+back to per-point). The node publishes the raw block under `<y_key>` (and a 2-D scan also publishes
+`<y_key>_grid` = the raw `(repeat, n0, n1)` block — a pure reshape, still no combine).
+
+HOW the repeats become a picture is a **plot** parameter, `repeat_mode` (each plot panel's Setting
+combo, persisted in `config.params`): `average | add | replace | roll | new` — the ONE owned reducer
+`frontend.live.reduce_repeat(raw, mode)` (single source) collapses the leading repeat axis. `average`
+= `nanmean` over the repeats that **have data** (the true running mean — magnitude-stable no matter
+how many passes finished; this is what "average" means, not a sum). `add` = `nansum`; `replace`/
+`roll` = the latest pass; `new` = every repeat as its own column (one line per repeat, **1-D only**).
+`PanelCard._with_signal_slots` runs the reduction BEFORE the source expression, so `value = signal`
+already sees the reduced `(points, dim)` (or `(points, n*dim)` for `new`); a 1-D panel keeps the 2-D
+shape so the dimension axis **O2** (and `new`) draw as **multiple lines** via Live1D's native
+multi-line + `×N` ylabel + column-grow `update(repeat_cur=)`. A 2-D panel reduces `_grid` then shows
+the `(n0,n1)` map (no `new`). The camera is the exception: it is a `Measurement` too and **does**
+average frames at the measurement (`repeat` + `update_mode` on its Edit) — that per-frame averaging
+is a device-side reduction, distinct from the plot-side repeat reduction. The panel computes the
+`×N` count itself (`repeats_with_data`) — fully decoupled, no console-pushed counter.
+
 ### Single source of truth: build_*_scan + declarative spec
 
 `ReadoutSubsystem.build_temperature_scan(...)` / `build_detection_scan(...)` are the

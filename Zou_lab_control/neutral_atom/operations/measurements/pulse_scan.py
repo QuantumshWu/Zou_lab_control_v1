@@ -187,8 +187,9 @@ class PulseScanPlan:
         self.sequencer = sequencer
         # The OUTPUT signal name (user-set #7): the node publishes y under this key.
         self.y_key = str(y_key or "signal").strip() or "signal"
-        # Optional grid shape (n0, n1) for a 2-D scan: the node reshapes the per-point y into a
-        # 2-D map published as ``<y_key>_grid`` so a 2D image panel shows the 2D scan.  None = 1-D.
+        # Optional grid shape (n0, n1) for a 2-D scan: the node publishes the raw ``<y_key>_grid``
+        # ``(repeat, n0, n1)`` block (a pure reshape of its raw y, no combine) so a 2-D image panel
+        # reduces the repeat axis then shows the (n0, n1) map.  None = 1-D.
         self.scan_shape = scan_shape
         self.y_expr = y_expr if isinstance(y_expr, SignalExpr) else SignalExpr.from_value(y_expr)
         self.settle = settle

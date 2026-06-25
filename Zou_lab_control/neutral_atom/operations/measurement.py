@@ -155,8 +155,9 @@ class MeasurementSpec:
     ``build(**param_values) -> ScannedMeasurement`` returning an UNRUN measurement
     a logic node can drive point-by-point.  ``metadata`` carries spec-specific extras
     (e.g. the capture radius the temperature fit needs) without widening the call
-    signature.  (A per-site result's 2-D map is a reshape EXPRESSION on the
-    ``<y_key>_sites`` signal, using the trap array's grid shape -- not a stored field.)
+    signature.  (A per-site result lives in the raw ``<y_key>`` block's dimension axis -- the node
+    publishes ONE raw ``(repeat, points, dim)`` signal; a per-site grid view is a PLOT-side reduce +
+    reshape on it, using the trap array's grid shape, not a separate stored field.)
     """
 
     name: str

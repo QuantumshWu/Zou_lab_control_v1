@@ -1280,14 +1280,16 @@ class ScannedMeasurementNode(Measurement):
 
     Published per shot (behind ``prefix``):
 
-    ``<x_key>``         (k,) cumulative scan x values (the points done so far)
-    ``<y_key>``         (k,) cumulative scalar curve (series 0 of the reducer)
-    ``<y_key>_sites``   (n_series,) the LATEST point's per-site vector (per-site only)
+    ``<x_key>``         (points,) the full swept x axis, stable from shot 1 (NaN-free)
+    ``<y_key>``         (repeat, points, dim) the RAW output block -- the node FILLS it point by
+                        point and does NOT combine the repeats; a PLOT reduces the repeat axis per
+                        its ``repeat_mode`` (average / add / replace / roll / new).  ``dim`` is the
+                        reducer's series count (a per-site reducer makes ``dim = n_sites``, so a
+                        1-D plot draws one line per site and a grid view reshapes a reduced point).
     ``scan_done``       0 while running, 1 once the final point has been published
 
-    Nothing DERIVABLE is published: the panel namespace already carries the global
-    ``shot`` counter, and a site-grid view of the per-site vector is a reshape EXPRESSION
-    (``value = <y_key>_sites.reshape(ny, nx)``) -- so neither is a separate signal.
+    Nothing DERIVABLE is published: the panel namespace already carries the global ``shot`` counter,
+    and any combine / per-site grid view is a PLOT-side reduction + reshape, never a separate signal.
 
     Finite-scan semantics: after the last point is published the node sets its
     own stop event, so a background ``start()`` thread exits on its own once the
