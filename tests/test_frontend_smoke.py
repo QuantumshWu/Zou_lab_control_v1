@@ -1223,15 +1223,14 @@ def test_task_console_drag_snaps_to_grid(monkeypatch):
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from PyQt5 import QtCore
     from Zou_lab_control.frontend import devtools as dt
-    from Zou_lab_control.frontend.task_console import _grid_pitch, _pos_to_slot, _slot_to_pos
+    from Zou_lab_control.frontend.task_console import _pos_to_slot, _slot_to_pos
 
     console = dt.demo_console(shots=3)
     card = console.cards[1]                       # the 1x2 distribution panel
-    pitch_x, pitch_y = _grid_pitch()
-    # Drop into a clearly FREE column (past every other card's slot span -- the snap grid is
-    # fine, so a card spans many slots), a few px off the slot (< half a snap so it rounds back).
+    # Drop into a clearly FREE column (past every other card's column span) at a pixel y of 200;
+    # x snaps to the column grid, y free-stacks (snapped to the tidy quantum).  Nudge a few px off.
     free_col = max((c.config.col + c.config.cols for c in console.cards if c is not card), default=0)
-    target_x, target_y = _slot_to_pos(4, free_col)
+    target_x, target_y = _slot_to_pos(200, free_col)
     card.move(target_x + 3, target_y - 3)
     card._drag_offset = QtCore.QPoint(1, 1)       # as if a drag was in flight
     class _Ev:                                    # minimal release-event stand-in
@@ -1241,12 +1240,12 @@ def test_task_console_drag_snaps_to_grid(monkeypatch):
         card.mouseReleaseEvent(_Ev())
     except TypeError:                             # super() needs a real QEvent; snap already ran
         pass
-    # FREE placement: the dropped card snaps to the grid CELL it was dropped on and STAYS there
-    # (row 4) -- empty cells above are allowed; it is NOT pulled up to the top.
+    # FREE placement: the dropped card snaps to its column + the nearest vertical quantum and STAYS
+    # there (empty space above is allowed); it is NOT pulled up to the top.
     assert card.config.col == free_col
-    assert card.config.row == 4
-    assert (card.x(), card.y()) == _slot_to_pos(4, free_col)
-    assert _pos_to_slot(*_slot_to_pos(7, 3)) == (7, 3)   # slot<->pos round-trip
+    assert card.config.row == 200                 # pixel y, snapped to the quantum
+    assert (card.x(), card.y()) == _slot_to_pos(200, free_col)
+    assert _pos_to_slot(*_slot_to_pos(200, 3)) == (200, 3)   # column + pixel-y round-trip
     assert console.save_button.is_dirty()         # a moved panel is an unsaved edit
     console.shutdown()
 
@@ -1287,44 +1286,50 @@ def test_task_console_layout_is_free_placement():
     Pure-function contract (PanelConfig has no Qt), so it does NOT pull in the flaky
     demo_console GUI fixture."""
 
-    from Zou_lab_control.frontend.task_console import PanelConfig, _compact, _columns_overlap
+    from Zou_lab_control.frontend.task_console import (
+        PanelConfig, _GRID_GAP, _card_size, _columns_overlap, _compact)
+
+    def _h(cfg):                                 # the card's actual pixel height (heights vary now)
+        return _card_size(cfg.size)[1]
 
     def no_overlap(cfgs):
         for i, a in enumerate(cfgs):
             for b in cfgs[i + 1:]:
                 if _columns_overlap(a, b):
-                    assert not (a.row < b.row + b.rows and b.row < a.row + a.rows), (a.title, b.title)
+                    assert not (a.row < b.row + _h(b) and b.row < a.row + _h(a)), (a.title, b.title)
 
-    # (1) drop a card onto an occupied cell: active keeps its slot, the other is pushed
-    #     strictly below it -- minimal (just below the active card's full span).
-    a = PanelConfig(kind="2d", title="A", row=0, col=0, size="2x2")
-    b = PanelConfig(kind="2d", title="B", row=0, col=0, size="2x2")   # dropped onto A
+    g = _GRID_GAP
+    # (1) drop a card onto an occupied column at the same pixel y: active keeps its y, the other is
+    #     pushed JUST below it -- by the active card's ACTUAL pixel height (+ a gap), no overlap.
+    a = PanelConfig(kind="2d", title="A", row=g, col=0, size="2x2")
+    b = PanelConfig(kind="2d", title="B", row=g, col=0, size="2x2")   # dropped onto A
     _compact([a, b], active=b)
-    assert (b.row, b.col) == (0, 0)            # the dragged card wins its slot
-    assert a.row == b.rows                      # pushed strictly below B (by B's full span)
+    assert (b.row, b.col) == (g, 0)            # the dragged card wins its position
+    assert a.row == b.row + _h(b) + g           # pushed strictly below B (by B's real height)
     no_overlap([a, b])
 
     # (2) FREE placement: a card sitting below empty space STAYS there (no float-up) --
     #     the board does not pull it to the top, and _compact reports no move.
-    x = PanelConfig(kind="1d", title="X", row=0, col=0, size="1x2")
-    y = PanelConfig(kind="1d", title="Y", row=5, col=0, size="1x2")   # empty cells above Y
+    x = PanelConfig(kind="1d", title="X", row=g, col=0, size="1x2")
+    y_top = g + _h(x) + g + 200                 # clearly below X with empty space above
+    y = PanelConfig(kind="1d", title="Y", row=y_top, col=0, size="1x2")
     assert _compact([x, y]) is False
-    assert (x.row, y.row) == (0, 5)            # Y keeps row 5 -- empty above is allowed
+    assert (x.row, y.row) == (g, y_top)        # Y keeps its y -- empty above is allowed
 
-    # (3) drop active onto a card with empty space above: active keeps its (non-zero) row,
-    #     the other is pushed JUST below it (minimal -- not to the top, no gratuitous gap).
-    occ = PanelConfig(kind="1d", title="occ", row=2, col=0, size="1x2")
-    drop = PanelConfig(kind="1d", title="drop", row=2, col=0, size="1x2")
+    # (3) drop active onto a card with empty space above: active keeps its (non-zero) y, the other
+    #     is pushed JUST below it (minimal -- not to the top, no gratuitous gap).
+    occ = PanelConfig(kind="1d", title="occ", row=300, col=0, size="1x2")
+    drop = PanelConfig(kind="1d", title="drop", row=300, col=0, size="1x2")
     assert _compact([occ, drop], active=drop) is True
-    assert drop.row == 2                        # the dropped card stays where dropped (empty above)
-    assert occ.row == drop.row + drop.rows      # displaced just below it (minimal push)
+    assert drop.row == 300                      # the dropped card stays where dropped (empty above)
+    assert occ.row == drop.row + _h(drop) + g   # displaced just below it (minimal push)
     no_overlap([occ, drop])
 
-    # (4) independent columns keep their own rows (no false collisions, no float-up).
-    left = PanelConfig(kind="1d", title="L", row=4, col=0, size="1x2")
-    right = PanelConfig(kind="1d", title="R", row=9, col=PanelConfig(kind="1d", size="1x2").cols, size="1x2")
+    # (4) independent columns keep their own y (no false collisions, no float-up).
+    left = PanelConfig(kind="1d", title="L", row=400, col=0, size="1x2")
+    right = PanelConfig(kind="1d", title="R", row=900, col=PanelConfig(kind="1d", size="1x2").cols, size="1x2")
     assert _compact([left, right]) is False
-    assert left.row == 4 and right.row == 9
+    assert left.row == 400 and right.row == 900
     no_overlap([left, right])
 
 

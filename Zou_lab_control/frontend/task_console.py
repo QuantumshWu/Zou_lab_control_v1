@@ -887,16 +887,17 @@ def _text_to_py(text: str):
         except ValueError:
             return raw
 
-# Board layout (raw px).  Cards tile on a CLEAN GRID whose CELL is the base 1x2 panel (1 row,
-# 2 cols).  Every preset is a whole number of cells -- 1x2 = 1x1, 2x2 = 1 wide x 2 tall,
-# 1x4 = 2 wide x 1 tall, 2x4 = 2x2, 4x4 = 2 wide x 4 tall -- so a card's size is a whole-cell
-# multiple and the ONLY drag-snap points are whole-cell positions (i x pitch_x, j x pitch_y).
-# The CARD'S FORMAT (rounded corners, shadow, grey title strip, content padding) belongs to the
-# FluentGroupBox COMPONENT (qt_fluent.CARD_PAD / CARD_TITLE_PX, the single source); this module
-# only lays cells out.  The plot keeps its design size at the top of its cell block, so a
-# multi-cell card has blank padding below / beside the plot -- the geometric price of a clean
-# grid, since the plot's fixed axis margins can't be subdivided to fill the extra cells.
-_GRID_GAP = 8         # gap between adjacent cards / cells on the board
+# Board layout (raw px).  WIDTH is on a clean COLUMN grid whose unit is the base 1x2 panel's
+# width (a card is ``cols // 2`` columns wide); HEIGHT HUGS the plot -- the card is exactly tall
+# enough for its figure + chrome, with NO blank padding below (every size hugs like 1x2, #H3i-3).
+# Because heights are therefore VARIABLE (a 2x2 figure is taller than a 1x2), the vertical axis is
+# NOT a fixed cell grid: ``col`` is a column index (x snaps to the column grid) but ``row`` is a
+# PIXEL y -- cards free-stack vertically and ``_compact`` pushes an overlap straight down by the
+# blocker's ACTUAL pixel height.  The CARD'S FORMAT (rounded corners, shadow, grey title strip,
+# content padding) belongs to the FluentGroupBox COMPONENT (qt_fluent.CARD_PAD / CARD_TITLE_PX,
+# the single source); this module only lays cards out.
+_GRID_GAP = 8         # gap between adjacent cards on the board
+_VSNAP = _GRID_GAP    # vertical drop-snap quantum (px) -- cards land tidily but heights are free
 
 # The header status readout (panel/signal counts, or a node-error banner) is a borderless
 # label: grey normally, red on a node error (the colour IS the danger cue -- no box border,
@@ -924,29 +925,32 @@ def _grid_pitch() -> tuple[int, int]:
 
 
 def _card_size(size: str) -> tuple[int, int]:
-    """Outer card size = a whole number of CELLS.  A preset (rows, cols-in-half-units) is
-    ``rows`` cells tall x ``cols // 2`` cells wide; the card spans those cells plus the gaps
-    between them, so cards tile the grid exactly (gap == _GRID_GAP, no slack).  The FluentGroupBox
-    chrome is unchanged; the plot keeps its design size at the top-centre of the block, and a
-    multi-cell card carries blank padding below / beside it (the plot's fixed margins cannot fill
-    the extra cells)."""
+    """Outer card size: WIDTH on the column grid (``cols // 2`` columns + the gaps between them),
+    HEIGHT HUGS the plot (title strip + the size's own figure height + bottom pad, NO blank padding
+    -- every size hugs like 1x2).  So width still scales with the size's columns, but height is
+    just tall enough for the figure -- the card's bottom edge sits right under the plot."""
 
     rows, cols = panel_size_cells(size)
-    w_units, h_units = max(1, cols // 2), rows
-    cw, ch = _cell_size()
-    return (w_units * cw + (w_units - 1) * _GRID_GAP,
-            h_units * ch + (h_units - 1) * _GRID_GAP)
+    w_units = max(1, cols // 2)
+    cw, _ch = _cell_size()
+    width = w_units * cw + (w_units - 1) * _GRID_GAP
+    # Height = the SAME chrome the cell uses, around THIS size's figure (not a cell multiple) -> hug.
+    height = scaled_px(CARD_TITLE_PX) + scaled_px(2) + panel_display_size(size)[1] + CARD_PAD
+    return (width, height)
 
 
 def _slot_to_pos(row: int, col: int) -> tuple[int, int]:
-    pitch_x, pitch_y = _grid_pitch()
-    return (_GRID_GAP + int(col) * pitch_x, _GRID_GAP + int(row) * pitch_y)
+    # col -> the clean column grid (x); row IS the pixel y of the card top (heights are variable,
+    # so there is no fixed vertical cell -- cards free-stack and _compact resolves overlaps).
+    pitch_x, _pitch_y = _grid_pitch()
+    return (_GRID_GAP + int(col) * pitch_x, max(_GRID_GAP, int(row)))
 
 
 def _pos_to_slot(x: int, y: int) -> tuple[int, int]:
-    pitch_x, pitch_y = _grid_pitch()
+    pitch_x, _pitch_y = _grid_pitch()
     col = max(0, round((int(x) - _GRID_GAP) / pitch_x))
-    row = max(0, round((int(y) - _GRID_GAP) / pitch_y))
+    # vertical: snap the dropped pixel-y to the tidy quantum (NOT a cell row -- heights vary)
+    row = max(_GRID_GAP, int(round((int(y) - _GRID_GAP) / _VSNAP)) * _VSNAP + _GRID_GAP)
     return int(row), int(col)
 
 
@@ -972,18 +976,24 @@ def _compact(configs: Sequence["PanelConfig"], active: "PanelConfig | None" = No
 
     moved = False
     placed: list["PanelConfig"] = []
+    # ``row`` is a PIXEL y and heights are VARIABLE (each card hugs its plot), so overlap + push are
+    # measured in pixels: a card drops just below (its actual height) whatever it collides with.
+    def _h(cfg) -> int:
+        return _card_size(cfg.size)[1]
     # active first (pinned), then the rest in reading order so an upper card is
     # placed before a lower one it might push.
     for config in sorted(configs, key=lambda c: (0 if c is active else 1, c.row, c.col)):
-        target = config.row                          # keep your cell (free placement)
+        target = config.row                          # keep your pixel-y (free placement)
         if config is not active:
-            # drop just below every already-placed card we would overlap; process
-            # blockers top-to-bottom so we settle on the lowest of an overlapping stack.
+            ch = _h(config)
+            # drop just below every already-placed card we would overlap; process blockers
+            # top-to-bottom so we settle on the lowest of an overlapping stack.
             for blocker in sorted(placed, key=lambda b: b.row):
+                bh = _h(blocker)
                 if (_columns_overlap(config, blocker)
-                        and target < blocker.row + blocker.rows
-                        and blocker.row < target + config.rows):
-                    target = blocker.row + blocker.rows
+                        and target < blocker.row + bh
+                        and blocker.row < target + ch):
+                    target = blocker.row + bh + _GRID_GAP
         if config.row != target:
             config.row = target
             moved = True
@@ -1085,13 +1095,9 @@ class PanelConfig:
         self.params = dict(params or {})
         self.role = str(role)
 
-    # rows / cols are the card's CELL SPAN: how many whole 1x2 grid cells it occupies (rows tall,
-    # cols // 2 wide).  The layout (overlap test / gravity compaction / board sizing) works in
-    # these whole cells, so cards tile the grid exactly with a _GRID_GAP between them.
-    @property
-    def rows(self) -> int:
-        return max(1, panel_size_cells(self.size)[0])
-
+    # ``cols`` is the card's COLUMN SPAN (how many base-width columns it occupies); x snaps to this
+    # column grid and the overlap test uses it.  There is NO ``rows`` span: card HEIGHT hugs the plot
+    # (variable pixels), so ``row`` is a pixel y and the vertical layout works in pixels via _card_size.
     @property
     def cols(self) -> int:
         return max(1, panel_size_cells(self.size)[1] // 2)
@@ -4895,11 +4901,13 @@ class TaskConsole(QtWidgets.QWidget):
         # Otherwise a PLOT kind -> a BLANK pure-view panel on the Monitor board
         # (decoupled: it shows nothing until a signal is picked in its Setting).
         kind = data or "1d"
-        rows = max((c.config.row + c.config.rows for c in self.cards), default=0)
+        # Drop the new card just BELOW the current lowest card (pixel y, since heights vary).
+        next_y = max((c.config.row + _card_size(c.config.size)[1] + _GRID_GAP for c in self.cards),
+                     default=_GRID_GAP)
         # Every panel gets a unique "<kind> #N" title (G1) so two of the same kind never share
         # one name in the card header / Edit tab / frame title.
         title = indexed_unique_name(PANEL_KINDS[str(kind)], {c.config.title for c in self.cards})
-        config = PanelConfig(kind=str(kind), title=title, row=rows, col=0, size="1x2")
+        config = PanelConfig(kind=str(kind), title=title, row=next_y, col=0, size="1x2")
         card = PanelCard(config, parent=self.board, names_provider=self._signal_names,
                          sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, frame_coherence_provider=self._coherent_frame_signal)
         self._attach_card(card)
