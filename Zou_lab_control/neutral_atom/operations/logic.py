@@ -1153,18 +1153,25 @@ class CameraMeasurement(Measurement):
 
     node_label = "camera"
 
-    #: Repeat/update modes a continuous camera offers (the confocal per-measurement valid set):
-    #: roll = live scrolling view (default), average = running mean of the frames, replace = latest.
-    REPEAT_MODES = ("roll", "average", "replace")
-
     def __init__(self, hub: SignalHub, camera: CameraDevice, *, sequencer: object | None = None,
-                 frames_per_cycle: int = 1, prefix: str = "", update_mode: str = "roll", repeat: int = 1):
-        # A camera is a Measurement too, so it shares the base repeat/update_mode (per-shot)
-        # accumulation: repeat=N + update_mode='average' averages N frames per published frame.
-        super().__init__(hub, prefix=prefix, update_mode=update_mode, repeats=repeat)
+                 frames_per_cycle: int = 1, prefix: str = "", repeat=1):
+        # A camera NEVER averages / suppresses at the measurement (that batched N frames -> the live
+        # stutter).  It publishes EVERY frame (base update_mode 'roll' = pass-through) AND keeps a
+        # rolling data array of the last ``repeat`` frames; the PLOT reduces that array's repeat axis
+        # (repeat_mode).  ``repeat`` is a MEASUREMENT param (how many frames the array holds) -- the
+        # plot can never set it.
+        super().__init__(hub, prefix=prefix, update_mode="roll", repeats=1)
         self.camera = camera
         self.sequencer = sequencer
         self.frames_per_cycle = max(1, int(frames_per_cycle))
+        self._ring: list = []                            # the last ``repeat`` frames (the data array)
+        self.set_repeat(repeat)
+
+    def set_repeat(self, repeat) -> None:
+        """The camera's data-array depth: how many recent frames to keep (``inf`` -> REPEAT_RING)."""
+        self._inf = not np.isfinite(repeat)
+        self._ring_size = REPEAT_RING if self._inf else max(1, int(repeat))
+        self._ring = self._ring[-self._ring_size:]
 
     def shot(self) -> dict[str, object]:
         n = max(1, int(self.frames_per_cycle))
@@ -1179,21 +1186,32 @@ class CameraMeasurement(Measurement):
             # from another process too (the camera sees the actual triggers, not a local flag).
             return {}
         out: dict[str, object] = {f"frame_{i}": np.asarray(f, dtype=float) for i, f in enumerate(frames)}
-        out["frame"] = out["frame_0"]   # back-compat + default 2D panel: first trigger
+        out["frame"] = out["frame_0"]   # the newest single frame: processors / default 2D panel
+        # roll the data array (the last ``repeat`` newest frames) and publish the WHOLE block every
+        # frame -- a 2-D panel bound to ``frames`` reduces its repeat axis (e.g. average) with no lag.
+        self._ring.append(out["frame_0"])
+        self._ring = self._ring[-self._ring_size:]
+        out["frames"] = np.stack(self._ring, axis=0)      # (repeat, H, W) data array
         return out
 
     def published_signals(self) -> frozenset:
         n = max(1, int(self.frames_per_cycle))
-        keys = ["frame"] + [f"frame_{i}" for i in range(n)]
+        keys = ["frame", "frames"] + [f"frame_{i}" for i in range(n)]
         return frozenset(self.prefix + key for key in keys)
 
     def output_specs(self) -> tuple[SignalSpec, ...]:
-        """Each camera output is a raw 2-D image (the newest ``frame`` + one
-        ``frame_i`` per per-cycle trigger)."""
+        """Camera outputs: the newest single ``frame`` (2-D, for processors / the default panel), the
+        rolling ``frames`` data array (3-D ``(repeat, H, W)`` -- a 2-D panel reduces its repeat axis),
+        and one ``frame_i`` per per-cycle trigger."""
         specs = []
         for name in sorted(self.published_signals()):
             bare = name[len(self.prefix):] if self.prefix and name.startswith(self.prefix) else name
-            desc = "newest camera frame" if bare == "frame" else f"camera frame {bare.split('_')[-1]} of the cycle"
+            if bare == "frames":
+                desc = "rolling data array of the last `repeat` frames (plot reduces the repeat axis)"
+            elif bare == "frame":
+                desc = "newest camera frame"
+            else:
+                desc = f"camera frame {bare.split('_')[-1]} of the cycle"
             specs.append(SignalSpec(name, "camera image", "counts", desc))
         return tuple(specs)
 

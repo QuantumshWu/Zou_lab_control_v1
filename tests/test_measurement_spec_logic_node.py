@@ -373,9 +373,10 @@ def test_camera_measurement_exposes_camera_params_and_applies_them_live():
     cam_node = na.CameraMeasurement(hub, cam, sequencer=exp.devices.sequencer)
     fire_live_imaging(exp)                                  # On Pulse: the trigger-driven camera streams
 
-    # default frames_per_cycle=1 -> the first trigger as both 'frame' (back-compat /
-    # default 2D panel) and 'frame_0' (the per-trigger name).
-    assert cam_node.published_signals() == frozenset({"frame", "frame_0"})
+    # default frames_per_cycle=1 -> the first trigger as both 'frame' (the newest single image, for
+    # processors / the default 2D panel) and 'frame_0' (the per-trigger name), plus the rolling
+    # ``frames`` data array (the last `repeat` frames -- a 2D panel reduces its repeat axis).
+    assert cam_node.published_signals() == frozenset({"frame", "frame_0", "frames"})
     params = cam_node.acquisition_parameters()
     assert "exposure" in params and params["exposure"] == float(cam.exposure)
     assert params["frames_per_cycle"] == 1

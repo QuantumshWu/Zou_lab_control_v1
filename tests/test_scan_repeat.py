@@ -143,12 +143,11 @@ def test_occupancy_advertises_rate_grid_only_with_a_grid():
     assert any(s.name == "g_rate_grid" for s in gridded.output_specs())
 
 
-def test_scan_edit_has_repeat_no_combine_camera_and_processor_have_neither(monkeypatch):
-    """A SCAN measurement's Edit shows ``Repeat`` (sweep count, with an ∞ free-run special value) and
-    NOTHING else acquisition-wise -- no ``update mode`` (that moved to the plot's ``repeat mode``,
-    #H3k).  A CAMERA has NO repeat in its Edit either: its repeat (averaging the last N frames) is the
-    PLOT's repeat ring, so the camera never combines/suppresses frames (no lag).  A processor has
-    neither."""
+def test_repeat_is_a_measurement_param_auto_injected_with_a_free_run_switch(monkeypatch):
+    """``repeat`` is a MEASUREMENT-layer param (a measurement decides how many times to acquire -- the
+    plot never can), AUTO-INJECTED into the measurement / camera auto-form as a plain integer plus a
+    BOOL ``free_run`` switch for ∞ (a number spinbox is NEVER abused with a magic special value).  A
+    processor has neither.  ``free_run`` -> the node gets ``inf``."""
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from PyQt5 import QtWidgets
@@ -158,34 +157,30 @@ def test_scan_edit_has_repeat_no_combine_camera_and_processor_have_neither(monke
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     console = dt.demo_console(shots=3)
     try:
-        row = console._add_logic_node(LogicNodeConfig(kind="measurement", name="Pulse scan"))
-        console._edit_logic_node(row)
-        ed = console._logic_editors[id(row)]
-        assert ed._repeat_spin is not None
-        assert not hasattr(ed, "_update_mode_combo")     # the combine selector is the PLOT's, not here
-        assert ed._repeat_spin.minimum() == 0            # 0 = the "∞" special value (free-run)
-        ed._repeat_spin.setValue(5)
-        assert int(ed.collect_values()["repeat"]) == 5
-        ed._repeat_spin.setValue(0)
-        assert ed.collect_values()["repeat"] == "inf"    # 0 serialises as the free-run sentinel
+        for kind, name in (("measurement", "Pulse scan"), ("camera", "Camera")):
+            row = console._add_logic_node(LogicNodeConfig(kind=kind, name=name))
+            console._edit_logic_node(row)
+            w = console._logic_editors[id(row)].form._widgets
+            assert ("repeat", "int") == (("repeat" in w and "repeat"), w.get("repeat", ["?"])[0])
+            assert w["free_run"][0] == "bool"                # ∞ is a switch, not a spinbox magic value
+            assert w["repeat"][1].specialValueText() == "" and w["repeat"][1].minimum() == 1
 
-        # a CAMERA has NO repeat in its Edit -- repeat is the plot ring, so frames never get suppressed
-        crow = console._add_logic_node(LogicNodeConfig(kind="camera", name="Camera"))
-        console._edit_logic_node(crow)
-        assert console._logic_editors[id(crow)]._repeat_spin is None
+        # the node build turns the form values into a repeat COUNT: free_run -> inf, else the integer
+        assert console._repeat_value({"repeat": 5, "free_run": False}) == 5
+        assert console._repeat_value({"repeat": 5, "free_run": True}) == float("inf")
 
         prow = console._add_logic_node(LogicNodeConfig(kind="processor", name="Judge occupancy"))
         console._edit_logic_node(prow)
-        assert console._logic_editors[id(prow)]._repeat_spin is None
+        pw = console._logic_editors[id(prow)].form._widgets
+        assert "repeat" not in pw and "free_run" not in pw   # a processor does not acquire repeats
     finally:
         console.shutdown()
 
 
-def test_plot_setting_has_auto_injected_repeat_params_decoupled_from_the_node(monkeypatch):
-    """The PLOT's repeat params (``repeat`` + ``repeat mode``) are AUTO-GENERATED from declarations
-    (the SAME _make_param_widget path as every other param -- not hand-placed), live ONLY on the plot
-    Setting (decoupled from the node), and edits route through _set_param.  ``repeat`` allows ∞; a
-    1-D panel offers ``create`` (a line per repeat), a 2-D panel does not."""
+def test_plot_setting_has_only_repeat_mode_not_repeat(monkeypatch):
+    """The PLOT Setting auto-renders ONLY ``repeat mode`` (how to DISPLAY the repeats) -- NOT a
+    ``repeat`` count, because the plot can never tell a measurement how many times to run (#H3l).  A
+    1-D panel offers ``create``; a 2-D panel does not.  Editing routes through _set_param."""
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from PyQt5 import QtWidgets
@@ -197,18 +192,13 @@ def test_plot_setting_has_auto_injected_repeat_params_decoupled_from_the_node(mo
         card.config.role = "plot"
         card.config.kind = "1d"
         card._build_settings()
-        # both repeat params were auto-rendered into param_widgets (declarative, not hand-coded).
-        assert "repeat" in card.param_widgets and "repeat_mode" in card.param_widgets
+        assert "repeat_mode" in card.param_widgets
+        assert "repeat" not in card.param_widgets            # the COUNT is the measurement's, not here
         combo = card.param_widgets["repeat_mode"]
         modes = [combo.itemText(i) for i in range(combo.count())]
         assert "average" in modes and "create" in modes        # 1-D offers 'create'
-        # repeat allows ∞ (the spin's special value at 0)
-        assert card.param_widgets["repeat"].specialValueText() == "∞"
-        # editing routes through _set_param -> persisted on the PLOT (config.params), not the node
         card._set_param("repeat_mode", "add")
-        assert card.config.params["repeat_mode"] == "add"
-        card._set_param("repeat", "inf")
-        assert card.config.params["repeat"] == "inf"
+        assert card.config.params["repeat_mode"] == "add"      # persisted on the PLOT
 
         card.config.kind = "2d"
         card._build_settings()

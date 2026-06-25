@@ -35,10 +35,12 @@ def test_two_triggers_publish_frame_0_and_frame_1():
     fire_live_imaging(exp)            # On Pulse: the trigger-driven camera now streams
     cam_node.step()
 
-    assert set(cam_node.published_signals()) == {"frame", "frame_0", "frame_1"}
+    # the single frames + the rolling data array ``frames`` (3-D, the plot reduces its repeat axis).
+    assert set(cam_node.published_signals()) == {"frame", "frame_0", "frame_1", "frames"}
     for key in ("frame", "frame_0", "frame_1"):
         assert key in hub.names()
         assert np.asarray(hub.latest(key)).ndim == 2          # a real HxW image, not a scalar
+    assert np.asarray(hub.latest("frames")).ndim == 3         # (repeat, H, W) data array
     # the default 2D panel signal aliases the FIRST trigger
     assert np.array_equal(np.asarray(hub.latest("frame")), np.asarray(hub.latest("frame_0")))
 
@@ -47,7 +49,7 @@ def test_default_is_single_trigger_back_compat():
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
     cam_node = CameraMeasurement(SignalHub(), exp.camera)        # frames_per_cycle defaults to 1
     cam_node.step()
-    assert set(cam_node.published_signals()) == {"frame", "frame_0"}
+    assert set(cam_node.published_signals()) == {"frame", "frame_0", "frames"}
 
 
 def test_readout_image_frame_judged_is_synced_with_occupancy():
@@ -111,17 +113,17 @@ def test_console_resolves_2d_frame_panel_to_judged_frame_for_shot_alignment():
     # with no occupancy judging it, a standalone camera view keeps the LIVE frame
     assert TaskConsole._coherent_frame_signal(SimpleNamespace(running_nodes=[], hub=hub), "frame") == "frame"
 
-    # REAL panel resolution: a 2D-image panel bound to 'frame' now reads the judged frame.
-    # _with_signal_slots delegates the slot-packing + frame-coherence rewrite to the shared
-    # SignalExpr via the panel's _signal_expr()/_frame_resolve() helpers, so the stub binds
-    # those real (unbound) PanelCard methods to itself.
+    # REAL panel resolution: a 2D-image panel bound to 'frame' now reads the judged frame.  The
+    # signal stage delegates the slot-packing + frame-coherence rewrite to the shared SignalExpr via
+    # the panel's _signal_expr()/_frame_resolve() helpers, so the stub binds those real (unbound)
+    # PanelCard methods to itself and resolves the picked ``signal`` the same way the pipeline does.
     panel = SimpleNamespace(
         config=SimpleNamespace(inputs=["frame"]),
         _compiled_source="value = signal",
         frame_coherence_provider=lambda n: TaskConsole._coherent_frame_signal(console, n))
     panel._signal_expr = PanelCard._signal_expr.__get__(panel)
     panel._frame_resolve = PanelCard._frame_resolve.__get__(panel)
-    panel_signal = np.asarray(PanelCard._with_signal_slots(panel, ns)["signal"])
+    panel_signal = np.asarray(panel._signal_expr().signal_for(ns, resolve=panel._frame_resolve))
 
     assert np.array_equal(panel_signal, judged)          # 2D panel == site-map underlay (same shot)
     assert not np.array_equal(panel_signal, live_frame)  # NOT the camera's newer, misaligned frame

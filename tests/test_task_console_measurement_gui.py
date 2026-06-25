@@ -110,13 +110,17 @@ def test_measurement_node_edit_generates_typed_form_with_required_param():
     try:
         spec, row, editor, form = _open_measurement_node(console, 0)
         assert form is not None
-        assert set(form._widgets) == {d.key for d in spec.params}
+        # the spec's declared params PLUS the auto-injected acquisition knobs (repeat + free_run,
+        # which every measurement-layer node owns -- #H3l).
+        assert set(form._widgets) == {d.key for d in spec.params} | {"repeat", "free_run"}
+        assert form._widgets["repeat"][0] == "int" and form._widgets["free_run"][0] == "bool"
         assert form._widgets["t_off"][0] == "axis_range"     # min/max/points triplet
         assert form._widgets["shots"][0] == "int"
         assert form._widgets["capture_radius"][0] == "float"
         assert form._widgets["per_site"][0] == "bool"
         vals = form.collect_values()
-        assert set(vals) == {d.key for d in spec.params}
+        assert set(vals) == {d.key for d in spec.params} | {"repeat", "free_run"}
+        assert vals["repeat"] == 1 and vals["free_run"] is False     # acquisition defaults
         assert isinstance(vals["t_off"], tuple) and len(vals["t_off"]) == 3
         assert vals["capture_radius"] == pytest.approx(spec.param("capture_radius").default)
         assert isinstance(vals["per_site"], bool)
