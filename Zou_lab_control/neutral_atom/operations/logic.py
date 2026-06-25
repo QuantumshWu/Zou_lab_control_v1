@@ -1249,6 +1249,13 @@ class CameraMeasurement(Measurement):
         return {"region": [int(round(x0)), int(round(x1)), int(round(y0)), int(round(y1))]}
 
 
+#: How a finite scan combines its ``repeat`` passes per point (the confocal "Update mode" set,
+#: adapted for atom readout).  "average" = mean over passes (default, noise reduction); "add" =
+#: accumulate sum (confocal's add); "replace" = the latest pass overwrites.  Both scan node kinds
+#: + the GUI's Update-mode combobox read this ONE list (single source).
+REPEAT_COMBINE_MODES = ("average", "add", "replace")
+
+
 class ScannedMeasurementNode(Measurement):
     """Drive a :class:`ScannedMeasurement` one scan point per ``shot()``, into a hub.
 
@@ -1292,13 +1299,17 @@ class ScannedMeasurementNode(Measurement):
         y_key: str = "y",
         prefix: str = "",
         repeat: int = 1,
+        repeat_mode: str = "average",
     ):
         super().__init__(hub, prefix=prefix)
         self.measurement = measurement
-        # How many times to re-run the WHOLE finite scan, accumulating each point into a running
-        # mean (the confocal "repeat" model: re-run end-to-end, average per point).  repeat=1 is a
+        # ``repeat`` re-runs the WHOLE finite scan that many times; ``repeat_mode`` (the confocal
+        # "Update mode", kept SEPARATE from the base per-shot ``update_mode`` so the two don't fight)
+        # says HOW to combine the passes per point -- ``REPEAT_COMBINE_MODES``: "average" (mean over
+        # passes, default), "add" (accumulate sum), "replace" (latest pass wins).  repeat=1 is a
         # single pass.  The node self-stops only after the LAST point of the LAST pass.
         self.repeat = max(1, int(repeat))
+        self.repeat_mode = str(repeat_mode) if str(repeat_mode) in REPEAT_COMBINE_MODES else "average"
         self._repeat_cur = 1                              # 1-based current pass
         # Share the node's stop event so a Stop interrupts a wedged trigger
         # MID-scan-point (the engine's per-point camera.acquire honours it), not
@@ -1372,7 +1383,12 @@ class ScannedMeasurementNode(Measurement):
         row = np.atleast_1d(np.asarray(self.measurement.measure(value, index), dtype=float))
         self._sum[index, :row.size] += row
         self._count[index] += 1.0
-        self.data_y[index] = self._sum[index] / self._count[index]   # running mean over passes
+        if self.repeat_mode == "replace":
+            self.data_y[index, :row.size] = row              # latest pass wins
+        elif self.repeat_mode == "add":
+            self.data_y[index] = self._sum[index]            # accumulate sum over passes
+        else:
+            self.data_y[index] = self._sum[index] / self._count[index]   # average over passes
         self._index += 1
         if self._index >= self.n_points:                 # this pass complete -> start the next one
             self._index = 0
@@ -1479,12 +1495,15 @@ class PulseScanNode(Measurement):
     SETTLE_TIMEOUT_S = 5.0
 
     def __init__(self, hub: SignalHub, plan, *, x_key: str = "param", y_key: str = "signal",
-                 prefix: str = "", repeat: int = 1):
+                 prefix: str = "", repeat: int = 1, repeat_mode: str = "average"):
         super().__init__(hub, prefix=prefix)
         self.plan = plan
-        # Re-run the WHOLE finite scan ``repeat`` times, averaging each point across passes
-        # (the confocal "repeat" model; repeat=1 = single pass).  Self-stops after the last pass.
+        # Re-run the WHOLE finite scan ``repeat`` times; ``repeat_mode`` (the confocal combine
+        # selector, REPEAT_COMBINE_MODES; SEPARATE from the base per-shot update_mode) says how to
+        # combine the passes per point: "average" (mean, default) / "add" (sum) / "replace" (latest).
+        # Self-stops after the last pass.
         self.repeat = max(1, int(repeat))
+        self.repeat_mode = str(repeat_mode) if str(repeat_mode) in REPEAT_COMBINE_MODES else "average"
         self._repeat_cur = 1
         self.base_state = plan.base_state
         self.scan_names = list(plan.scan_names)
@@ -1609,7 +1628,12 @@ class PulseScanNode(Measurement):
             self.sequencer.settle(self.extra_delay_s, stop=self._stop)
         self._sum[index, 0] += y
         self._count[index] += 1.0
-        self.data_y[index, 0] = self._sum[index, 0] / self._count[index]    # running mean over passes
+        if self.repeat_mode == "replace":
+            self.data_y[index, 0] = y                                       # latest pass wins
+        elif self.repeat_mode == "add":
+            self.data_y[index, 0] = self._sum[index, 0]                     # accumulate sum
+        else:
+            self.data_y[index, 0] = self._sum[index, 0] / self._count[index]   # average over passes
         self._index += 1
         if self._index >= self.n_points:                 # pass complete -> start the next one
             self._index = 0

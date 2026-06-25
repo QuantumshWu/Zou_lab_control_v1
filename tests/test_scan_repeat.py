@@ -86,6 +86,19 @@ def test_scan_repeat_one_is_a_single_pass():
     assert np.allclose(hub.latest("m_y"), [0.0, 1.0, 2.0])
 
 
+def test_repeat_mode_combines_passes_and_does_not_collide_with_base_update_mode():
+    """``repeat_mode`` (the confocal "Repeat mode" combine selector) must combine the passes per
+    point WITHOUT clobbering the base per-shot ``update_mode`` (they are distinct fields).  add =
+    sum over passes, replace = latest pass.  pass1 measures calls 0,1,2 ; pass2 measures 3,4,5."""
+    for mode, expect in (("add", [3.0, 5.0, 7.0]), ("replace", [3.0, 4.0, 5.0])):
+        hub = SignalHub()
+        node = ScannedMeasurementNode(hub, _CountingMeasurement(), x_key="x", y_key="y",
+                                      prefix="m_", repeat=2, repeat_mode=mode)
+        assert node.update_mode == "roll"        # base per-shot mode left at its pass-through default
+        node.run_to_completion()
+        assert np.allclose(hub.latest("m_y"), expect), mode
+
+
 def test_measurement_edit_exposes_repeat_camera_does_not(monkeypatch):
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
@@ -96,16 +109,42 @@ def test_measurement_edit_exposes_repeat_camera_does_not(monkeypatch):
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     console = dt.demo_console(shots=3)
     try:
-        # a scanned measurement node Edit HAS a Repeat spin, and collect_values carries it
+        # a scanned measurement node Edit HAS a Repeat spin AND a Repeat-mode combo; collect_values
+        # carries both (repeat + repeat_mode), the latter offering the confocal combine modes.
         row = console._add_logic_node(LogicNodeConfig(kind="measurement", name="Pulse scan"))
         console._edit_logic_node(row)
         ed = console._logic_editors[id(row)]
-        assert ed._repeat_spin is not None
+        assert ed._repeat_spin is not None and ed._update_mode_combo is not None
         ed._repeat_spin.setValue(5)
-        assert int(ed.collect_values()["repeat"]) == 5
-        # a camera node Edit does NOT (a continuous camera does not re-run a finite sweep)
+        ed._update_mode_combo.setCurrentText("add")
+        vals = ed.collect_values()
+        assert int(vals["repeat"]) == 5 and vals["repeat_mode"] == "add"
+        # a camera node Edit has NEITHER (a continuous camera does not re-run a finite sweep)
         crow = console._add_logic_node(LogicNodeConfig(kind="camera", name="Camera"))
         console._edit_logic_node(crow)
-        assert console._logic_editors[id(crow)]._repeat_spin is None
+        ced = console._logic_editors[id(crow)]
+        assert ced._repeat_spin is None and ced._update_mode_combo is None
     finally:
         console.shutdown()
+
+
+def test_api_sweep_table_has_same_form_as_scan_table(monkeypatch):
+    """The API sweep table must be the SAME FORM as the scan-slot scan table: a per-column legend +
+    column_stack/grid template buttons + a code editor (one shared renderer).  A bare editor (no
+    template buttons) would NOT be the same form."""
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5 import QtWidgets
+    from Zou_lab_control.frontend.task_console import _PulseSlotsWidget
+    from Zou_lab_control.frontend.qt_fluent import FluentButton
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    w = _PulseSlotsWidget()
+    w.rebuild(api_rows=[("a1", "duration", "1", "us", 5.0)],
+              scan_rows=[("s0", "duration", "2", "ns", "probe")])
+    # both tables render their OWN column_stack + grid template buttons -> 2 of each (api + scan)
+    btns = [b.text() for b in w.findChildren(FluentButton)]
+    assert btns.count("column_stack") == 2 and btns.count("grid") == 2, btns
+    # both tables have a code editor; the api one starts blank (blank = keep fixed)
+    assert w._api_scan_code is not None and w._scan_code is not None
+    assert not w._api_scan_code.toPlainText().strip()      # api sweep is OPTIONAL (blank by default)

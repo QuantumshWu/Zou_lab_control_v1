@@ -418,9 +418,10 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
         self._clear()
         self._n_slots = len(scan_rows)
 
-        # ---- API slots section: ALWAYS shown (symmetric with the scan table below, #H3-2) so the
-        # two peer sections are always both present -- not "scan table always, api only sometimes".
-        self._box.addWidget(FluentSectionLabel("API slots (fixed values)"))
+        # ---- API slots section: ALWAYS shown (peer with the Scan table below, #H3-2).  Each API
+        # slot can be FIXED (a value below) OR SWEPT by an API scan table that is the SAME FORM as
+        # the scan-slot scan table (legend + column_stack/grid buttons + program) -- one renderer.
+        self._box.addWidget(FluentSectionLabel("API slots"))
         if api_rows:
             api_labels = [f"{name}  ({kind} @ {target})" for name, kind, target, _u, _c in api_rows]
             api_lw = setting_label_width(api_labels, minimum=72)   # same row rule as every form
@@ -429,35 +430,26 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
                 edit = FluentLineEdit(self._api_remembered.get(name) or f"{float(current):g}", self)
                 edit.setMinimumWidth(scaled_px(120, minimum=96))
                 edit.setPlaceholderText(f"{unit}")
-                edit.setToolTip(f"Numeric value for API slot {name!r} (unit: {unit}).")
+                edit.setToolTip(f"Fixed value for API slot {name!r} (unit: {unit}) -- used unless the "
+                                "API scan table below sweeps it.")
                 edit.textChanged.connect(self.changed)
                 self._box.addWidget(FluentSettingRow(label, edit, label_width=api_lw))
                 self._api_widgets[name] = edit
-            # SOFTWARE api-sweep: the analogue of the scan table for API slots (#H3-3).  Leave it
-            # blank to keep the values above FIXED; fill it to SWEEP the api slots in software (each
-            # point: load -> on_pulse -> wait pulse done + extra settle -> next, the DEVICE owning the
-            # wait).  ONE column per API slot, in slot order -- like the scan table.
-            sweep_note = FluentLabel(
-                "Sweep these slots in software (leave blank to keep them fixed): one column per API "
-                "slot, in order, in each slot's unit.", self)
-            sweep_note.setWordWrap(True)
-            sweep_note.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
-            self._box.addWidget(sweep_note)
-            self._api_scan_code = FluentCodeEdit(self._api_scan_remembered)
-            self._api_scan_code.setMinimumHeight(scaled_px(72, minimum=54))
-            api_cols = ", ".join(name for name, *_ in api_rows)
-            self._api_scan_code.setPlaceholderText(
-                f"# blank = api slots fixed; else assign an (N x {len(api_rows)}) array to 'scan_table'\n"
-                f"# columns = [{api_cols}]\n"
-                "import numpy as np\nscan_table = np.linspace(2, 10, 5).reshape(-1, 1)")
-            self._api_scan_code.setToolTip("Python that assigns an (N_points x n_api) array to "
-                                           "'scan_table' (one column per API slot, swept in software).")
-            self._api_scan_code.textChanged.connect(self.changed)
-            self._box.addWidget(self._api_scan_code)
+            # The API scan table -- IDENTICAL form to the scan-slot table below (#H3 follow-up), just
+            # SOFTWARE-driven (load -> on_pulse -> wait pulse done + extra settle -> next).  Blank =
+            # keep the values above fixed; filled = sweep the api slots in software.
+            caption = FluentLabel("API scan table (software sweep) -- leave blank to keep the values "
+                                  "above fixed:", self)
+            caption.setWordWrap(True)
+            caption.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+            self._box.addWidget(caption)
+            api_columns = [(name, f"{kind} @ {target}", (unit or "value"))
+                           for name, kind, target, unit, _c in api_rows]
+            self._render_scan_table_body(api_columns, kind="api", optional=True)
             self._extra_delay = FluentLineEdit(self._extra_remembered, self)
             self._extra_delay.setMinimumWidth(scaled_px(120, minimum=96))
             self._extra_delay.setPlaceholderText("0")
-            self._extra_delay.setToolTip("Extra settle delay (seconds) held by the device AFTER each "
+            self._extra_delay.setToolTip("Extra settle delay (seconds) the device holds AFTER each "
                                          "point's pulse finishes, before the next is loaded (0 = none).")
             self._extra_delay.textChanged.connect(self.changed)
             self._box.addWidget(FluentSettingRow("Extra settle delay (s)", self._extra_delay,
@@ -469,7 +461,7 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
             api_note.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
             self._box.addWidget(api_note)
 
-        # ---- ONE scan-table program for all scan slots together ----------------------
+        # ---- Scan table: ONE program for all (hardware) scan slots --------------------
         self._box.addWidget(FluentSectionLabel("Scan table (one program for all scan slots)"))
         if not scan_rows:
             note = FluentLabel("(no scan slot bound -- in the pulse GUI Edit tab, click the dot next "
@@ -479,45 +471,66 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
             self._box.addWidget(note)
             self.changed.emit()
             return
-        # Column legend: what each sN column is, in its NATIVE unit (NOT assumed to be time).
-        legend = ["Columns of scan_table (one row = one scan point, slots advance in lockstep):"]
+        scan_columns = []
         for i, (name, kind, target, unit, slot_label) in enumerate(scan_rows):
             disp = slot_label or f"{kind} @ {target}"
             u = "ns ticks" if kind == "duration" else ("integer code (LSB)" if kind == "dac" else (unit or ""))
-            legend.append(f"  s{i}: {disp}  [{u}]")
+            scan_columns.append((f"s{i}", disp, u))
+        self._render_scan_table_body(scan_columns, kind="scan", optional=False)
+        self.changed.emit()
+
+    def _render_scan_table_body(self, columns, *, kind: str, optional: bool) -> None:
+        """Render the SAME scan-table form for EITHER the hardware scan slots (``kind='scan'``) or
+        the software API sweep (``kind='api'``): a per-column legend + column_stack / grid template
+        buttons + the ``FluentCodeEdit`` that assigns an (N x n_cols) ``scan_table``.  ONE renderer,
+        so the API sweep table is byte-identical in FORM to the scan-slot table.  ``optional`` (api)
+        starts BLANK -- blank means "keep the fixed values" -- while a required (scan) table seeds the
+        column_stack template; ``columns`` = ``[(col_var, display, unit), ...]``."""
+        from ..neutral_atom.timing import scan_table_template
+        n = len(columns)
+        legend = ["Columns of scan_table (one row = one point, columns advance in lockstep):"]
+        for var, disp, unit in columns:
+            legend.append(f"  {var}: {disp}  [{unit}]")
         legend_label = FluentLabel("\n".join(legend), self)
         legend_label.setWordWrap(True)
         legend_label.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
         self._box.addWidget(legend_label)
-        # template buttons (adapt to the bound slot count) -- the SAME templates the pulse GUI uses
-        from ..neutral_atom.timing import scan_table_template
-        seed = self._scan_remembered.strip() or scan_table_template("column_stack", self._n_slots)
+        remembered = (self._scan_remembered if kind == "scan" else self._api_scan_remembered).strip()
+        seed = remembered if optional else (remembered or scan_table_template("column_stack", n))
         btn_row = QtWidgets.QHBoxLayout()
         btn_row.setContentsMargins(0, 0, 0, 0)
         btn_row.setSpacing(scaled_px(6, minimum=4))
         btn_row.addWidget(FluentLabel("template:", self))
         cs = FluentButton("column_stack", color=GREY)
-        cs.setToolTip("Insert the column_stack template (one column per slot), adapted to the bound slots.")
-        cs.clicked.connect(lambda: self._insert_template("column_stack"))
+        cs.setToolTip("Insert the column_stack template (one column per slot), adapted to the columns.")
+        cs.clicked.connect(lambda *_a, k=kind, m=n: self._insert_template("column_stack", k, m))
         gr = FluentButton("grid", color=GREY)
         gr.setToolTip("Insert the grid template (every combination of the axis arrays).")
-        gr.clicked.connect(lambda: self._insert_template("grid"))
+        gr.clicked.connect(lambda *_a, k=kind, m=n: self._insert_template("grid", k, m))
         btn_row.addWidget(cs, 0)
         btn_row.addWidget(gr, 0)
         btn_row.addStretch(1)
         self._box.addLayout(btn_row)
-        self._scan_code = FluentCodeEdit(seed)
-        self._scan_code.setMinimumHeight(scaled_px(120, minimum=90))
-        self._scan_code.setToolTip("Python that assigns an (N_points x n_slots) array to 'scan_table' "
-                                   "(one column per scan slot, in the slot's native unit).")
-        self._scan_code.textChanged.connect(self.changed)
-        self._box.addWidget(self._scan_code)
-        self.changed.emit()
+        editor = FluentCodeEdit(seed)
+        editor.setMinimumHeight(scaled_px(120, minimum=90))
+        if optional and not seed:
+            editor.setPlaceholderText(f"# blank = keep the fixed values above; or click a template / "
+                                      f"assign an (N x {n}) array to 'scan_table' to sweep")
+        editor.setToolTip("Python that assigns an (N_points x n_cols) array to 'scan_table' "
+                          "(one column per slot, in the slot's native unit).")
+        editor.textChanged.connect(self.changed)
+        self._box.addWidget(editor)
+        if kind == "scan":
+            self._scan_code = editor
+        else:
+            self._api_scan_code = editor
 
-    def _insert_template(self, kind: str) -> None:
+    def _insert_template(self, template: str, kind: str = "scan", n: int | None = None) -> None:
         from ..neutral_atom.timing import scan_table_template
-        if self._scan_code is not None:
-            self._scan_code.setPlainText(scan_table_template(kind, max(1, self._n_slots)))
+        editor = self._scan_code if kind == "scan" else self._api_scan_code
+        if editor is not None:
+            cols = self._n_slots if n is None else n
+            editor.setPlainText(scan_table_template(template, max(1, cols)))
 
     def values_dict(self) -> dict:
         """The current ``{"api": {name: float}, "scan_code": "<python>", "api_scan": "<python>",
@@ -4017,21 +4030,33 @@ class LogicNodeEditor(QtWidgets.QWidget):
         self.form.start_requested.connect(lambda *_: self.console._start_logic_node(self.row))
         self.form.stop_requested.connect(lambda: self.console._stop_logic_node(self.row))
         col.addWidget(self.form)
-        # ---- Repeat: re-run the WHOLE finite scan N times, averaging each point (confocal's
-        # "Repeat").  Only a scanned MEASUREMENT re-runs a finite sweep -- a continuous camera /
-        # reactive processor / one-shot task does not -- so this control is measurement-only.
+        # ---- Repeat + Update mode (confocal's "Repeat:" + "Update mode:"): re-run the WHOLE finite
+        # scan N times, and combine the passes per point (average / add / replace).  Only a scanned
+        # MEASUREMENT re-runs a finite sweep -- a continuous camera / reactive processor / one-shot
+        # task does not -- so these controls are measurement-only.
         self._repeat_spin = None
+        self._update_mode_combo = None
         if row.node.kind == "measurement":
+            from ..neutral_atom.operations.logic import REPEAT_COMBINE_MODES
             col.addWidget(FluentSectionLabel("Acquisition"))
+            lw = setting_label_width(["Update mode"], minimum=getattr(self.form, "_form_label_w", 72))
             spin = FluentDoubleSpinBox(length=6, allow_minus=False)
             spin.setDecimals(0)
             spin.setRange(1, 100000)
             spin.setValue(int(row.node.values.get("repeat", 1) or 1))
-            spin.setToolTip("Re-run the whole scan this many times, averaging each point across the "
-                            "passes (1 = a single pass).  The curve shows the running mean.")
+            spin.setToolTip("Re-run the whole scan this many times (1 = a single pass); the passes "
+                            "are combined per point by the Update mode below.")
             self._repeat_spin = spin
-            col.addWidget(FluentSettingRow("Repeat", spin,
-                                           label_width=getattr(self.form, "_form_label_w", 72)))
+            col.addWidget(FluentSettingRow("Repeat", spin, label_width=lw))
+            combo = FluentComboBox()
+            combo.addItems(list(REPEAT_COMBINE_MODES))
+            mode0 = str(row.node.values.get("repeat_mode", "average") or "average")
+            combo.setCurrentText(mode0 if mode0 in REPEAT_COMBINE_MODES else "average")
+            combo.setToolTip("How to combine the repeated passes at each scan point: 'average' = "
+                             "mean (noise reduction), 'add' = accumulate sum, 'replace' = keep the "
+                             "latest pass.")
+            self._update_mode_combo = combo
+            col.addWidget(FluentSettingRow("Repeat mode", combo, label_width=lw))
         # (The node's published-signals + shapes are shown on its Logic-tab ROW card,
         # the single place for that legend -- not duplicated here.)
         col.addStretch(1)
@@ -4040,6 +4065,8 @@ class LogicNodeEditor(QtWidgets.QWidget):
         vals = self.form.collect_values()
         if self._repeat_spin is not None:
             vals["repeat"] = int(self._repeat_spin.value())
+        if self._update_mode_combo is not None:
+            vals["repeat_mode"] = self._update_mode_combo.currentText()
         return vals
 
     def set_running(self, running: bool) -> None:
@@ -5136,9 +5163,11 @@ class TaskConsole(QtWidgets.QWidget):
         if spec is None:
             raise RuntimeError(f"no catalog spec named {node.name!r} for a {kind} node")
         if kind == "measurement":
-            # ``repeat`` (re-run the whole scan N times, averaging each point) is a NODE knob,
-            # not a build arg -- pop it before spec.build(**values) and hand it to the node.
+            # ``repeat`` (re-run the whole scan N times) + ``update_mode`` (how to combine the
+            # passes per point: average / add / replace) are NODE knobs, not build args -- pop them
+            # before spec.build(**values) and hand them to the node.
             repeat = int(values.pop("repeat", 1) or 1)
+            repeat_mode = str(values.pop("repeat_mode", "average") or "average")
             built = spec.build(**values)
             if getattr(spec, "metadata", {}).get("node") == "pulse_scan":
                 # Pulse-scan is a DEVICE-driving node whose y is DECOUPLED (subscribed from
@@ -5147,12 +5176,13 @@ class TaskConsole(QtWidgets.QWidget):
                 # expression.  ``build`` returned a PulseScanPlan carrier.
                 from Zou_lab_control.neutral_atom.operations.logic import PulseScanNode
                 return PulseScanNode(self.hub, built, x_key=spec.x_key, y_key=spec.y_key,
-                                     prefix=f"{spec.key}_", repeat=repeat)
+                                     prefix=f"{spec.key}_", repeat=repeat, repeat_mode=repeat_mode)
             from Zou_lab_control.neutral_atom.operations.logic import ScannedMeasurementNode
             # The node publishes under the measurement's slug (spec.key), so every signal
             # is ``<slug>_<quantity>`` (e.g. temperature_t_off) -- one name, derived.
             return ScannedMeasurementNode(
-                self.hub, built, x_key=spec.x_key, y_key=spec.y_key, prefix=f"{spec.key}_", repeat=repeat)
+                self.hub, built, x_key=spec.x_key, y_key=spec.y_key, prefix=f"{spec.key}_",
+                repeat=repeat, repeat_mode=repeat_mode)
         if kind == "processor":
             # REACTIVE processor (the "func" layer): a live node consuming hub signals
             # and republishing derived ones -- e.g. judging occupancy from each frame.
