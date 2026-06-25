@@ -3968,12 +3968,30 @@ class LogicNodeEditor(QtWidgets.QWidget):
         self.form.start_requested.connect(lambda *_: self.console._start_logic_node(self.row))
         self.form.stop_requested.connect(lambda: self.console._stop_logic_node(self.row))
         col.addWidget(self.form)
+        # ---- Repeat: re-run the WHOLE finite scan N times, averaging each point (confocal's
+        # "Repeat").  Only a scanned MEASUREMENT re-runs a finite sweep -- a continuous camera /
+        # reactive processor / one-shot task does not -- so this control is measurement-only.
+        self._repeat_spin = None
+        if row.node.kind == "measurement":
+            col.addWidget(FluentSectionLabel("Acquisition"))
+            spin = FluentDoubleSpinBox(length=6, allow_minus=False)
+            spin.setDecimals(0)
+            spin.setRange(1, 100000)
+            spin.setValue(int(row.node.values.get("repeat", 1) or 1))
+            spin.setToolTip("Re-run the whole scan this many times, averaging each point across the "
+                            "passes (1 = a single pass).  The curve shows the running mean.")
+            self._repeat_spin = spin
+            col.addWidget(FluentSettingRow("Repeat", spin,
+                                           label_width=getattr(self.form, "_form_label_w", 72)))
         # (The node's published-signals + shapes are shown on its Logic-tab ROW card,
         # the single place for that legend -- not duplicated here.)
         col.addStretch(1)
 
     def collect_values(self) -> dict:
-        return self.form.collect_values()
+        vals = self.form.collect_values()
+        if self._repeat_spin is not None:
+            vals["repeat"] = int(self._repeat_spin.value())
+        return vals
 
     def set_running(self, running: bool) -> None:
         self.form.set_running(running)
@@ -5068,6 +5086,9 @@ class TaskConsole(QtWidgets.QWidget):
         if spec is None:
             raise RuntimeError(f"no catalog spec named {node.name!r} for a {kind} node")
         if kind == "measurement":
+            # ``repeat`` (re-run the whole scan N times, averaging each point) is a NODE knob,
+            # not a build arg -- pop it before spec.build(**values) and hand it to the node.
+            repeat = int(values.pop("repeat", 1) or 1)
             built = spec.build(**values)
             if getattr(spec, "metadata", {}).get("node") == "pulse_scan":
                 # Pulse-scan is a DEVICE-driving node whose y is DECOUPLED (subscribed from
@@ -5076,12 +5097,12 @@ class TaskConsole(QtWidgets.QWidget):
                 # expression.  ``build`` returned a PulseScanPlan carrier.
                 from Zou_lab_control.neutral_atom.operations.logic import PulseScanNode
                 return PulseScanNode(self.hub, built, x_key=spec.x_key, y_key=spec.y_key,
-                                     prefix=f"{spec.key}_")
+                                     prefix=f"{spec.key}_", repeat=repeat)
             from Zou_lab_control.neutral_atom.operations.logic import ScannedMeasurementNode
             # The node publishes under the measurement's slug (spec.key), so every signal
             # is ``<slug>_<quantity>`` (e.g. temperature_t_off) -- one name, derived.
             return ScannedMeasurementNode(
-                self.hub, built, x_key=spec.x_key, y_key=spec.y_key, prefix=f"{spec.key}_")
+                self.hub, built, x_key=spec.x_key, y_key=spec.y_key, prefix=f"{spec.key}_", repeat=repeat)
         if kind == "processor":
             # REACTIVE processor (the "func" layer): a live node consuming hub signals
             # and republishing derived ones -- e.g. judging occupancy from each frame.

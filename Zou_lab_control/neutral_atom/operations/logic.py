@@ -1281,9 +1281,15 @@ class ScannedMeasurementNode(Measurement):
         x_key: str = "x",
         y_key: str = "y",
         prefix: str = "",
+        repeat: int = 1,
     ):
         super().__init__(hub, prefix=prefix)
         self.measurement = measurement
+        # How many times to re-run the WHOLE finite scan, accumulating each point into a running
+        # mean (the confocal "repeat" model: re-run end-to-end, average per point).  repeat=1 is a
+        # single pass.  The node self-stops only after the LAST point of the LAST pass.
+        self.repeat = max(1, int(repeat))
+        self._repeat_cur = 1                              # 1-based current pass
         # Share the node's stop event so a Stop interrupts a wedged trigger
         # MID-scan-point (the engine's per-point camera.acquire honours it), not
         # only between points.
@@ -1308,9 +1314,13 @@ class ScannedMeasurementNode(Measurement):
         # FINAL length from the first shot (a stable x axis; unmeasured points are NaN
         # gaps that fill in), exactly like the reference measurement.
         self._values = np.asarray(measurement.axis.values, dtype=float).reshape(-1)
-        self._index = 0
+        self._index = 0                                   # within-pass point index (0..n_points-1)
         n_series = max(1, int(getattr(measurement.reducer, "n_series", 1)))
         self.data_y = np.full((self._values.size, n_series), np.nan, dtype=float)
+        # repeat>1 accumulates each point across passes into a running MEAN (data_y is what we
+        # publish).  _sum holds the per-point running sum, _count the number of passes contributing.
+        self._sum = np.zeros((self._values.size, n_series), dtype=float)
+        self._count = np.zeros(self._values.size, dtype=float)
 
     @property
     def n_points(self) -> int:
@@ -1318,13 +1328,19 @@ class ScannedMeasurementNode(Measurement):
 
     @property
     def points_done(self) -> int:
-        return int(self._index)
+        """Total points measured so far ACROSS all passes (monotonic over the whole repeat run)."""
+        return int((self._repeat_cur - 1) * self.n_points + self._index)
+
+    @property
+    def total_points(self) -> int:
+        """All points over all passes (n_points x repeat)."""
+        return int(self.n_points * self.repeat)
 
     @property
     def finished(self) -> bool:
-        """True once every scan point has been measured and published."""
+        """True once every scan point of every pass has been measured and published."""
 
-        return self._index >= self.n_points
+        return self._repeat_cur > self.repeat
 
     def shot(self) -> dict[str, object]:
         """Measure ONE scan point and FILL it into the pre-allocated curve by index.
@@ -1333,6 +1349,10 @@ class ScannedMeasurementNode(Measurement):
         measured), so the plot shows the final x range from the first point and fills
         in -- never a growing array.  Raises ``StopIteration`` if called after the sweep
         is finished (the ``start()`` loop self-stops; tests check ``finished`` first).
+
+        With ``repeat > 1`` the same x point is re-measured once per pass and the curve
+        shows the running MEAN over the passes done so far; the next pass starts only after
+        the current one's last point lands.
         """
 
         if self.finished:
@@ -1340,8 +1360,13 @@ class ScannedMeasurementNode(Measurement):
         index = self._index
         value = float(self._values[index])
         row = np.atleast_1d(np.asarray(self.measurement.measure(value, index), dtype=float))
-        self.data_y[index, :row.size] = row          # fill IN PLACE by scan index (no append)
+        self._sum[index, :row.size] += row
+        self._count[index] += 1.0
+        self.data_y[index] = self._sum[index] / self._count[index]   # running mean over passes
         self._index += 1
+        if self._index >= self.n_points:                 # this pass complete -> start the next one
+            self._index = 0
+            self._repeat_cur += 1
 
         out: dict[str, object] = {
             self.x_key: self._values.copy(),           # the FULL x axis, stable from shot 1
@@ -1444,9 +1469,13 @@ class PulseScanNode(Measurement):
     SETTLE_TIMEOUT_S = 5.0
 
     def __init__(self, hub: SignalHub, plan, *, x_key: str = "param", y_key: str = "signal",
-                 prefix: str = ""):
+                 prefix: str = "", repeat: int = 1):
         super().__init__(hub, prefix=prefix)
         self.plan = plan
+        # Re-run the WHOLE finite scan ``repeat`` times, averaging each point across passes
+        # (the confocal "repeat" model; repeat=1 = single pass).  Self-stops after the last pass.
+        self.repeat = max(1, int(repeat))
+        self._repeat_cur = 1
         self.base_state = plan.base_state
         self.scan_names = list(plan.scan_names)
         self.scan_arrays = [np.asarray(a, dtype=float).reshape(-1) for a in plan.scan_arrays]
@@ -1468,8 +1497,10 @@ class PulseScanNode(Measurement):
         # The swept x values are known up front -> a PRE-ALLOCATED NaN curve filled in place by
         # scan index (a stable x axis from shot 1), like ScannedMeasurementNode.
         self._values = (self.scan_arrays[0] if self.scan_arrays else np.array([0.0])).astype(float)
-        self._index = 0
+        self._index = 0                                   # within-pass point index
         self.data_y = np.full((self._values.size, 1), np.nan, dtype=float)
+        self._sum = np.zeros((self._values.size, 1), dtype=float)   # per-point running sum over passes
+        self._count = np.zeros(self._values.size, dtype=float)
         self._axis_label = str(plan.axis_label)
         self._axis_unit = str(plan.axis_unit)
 
@@ -1479,11 +1510,16 @@ class PulseScanNode(Measurement):
 
     @property
     def points_done(self) -> int:
-        return int(self._index)
+        """Total points measured so far across all passes (monotonic over the whole repeat run)."""
+        return int((self._repeat_cur - 1) * self.n_points + self._index)
+
+    @property
+    def total_points(self) -> int:
+        return int(self.n_points * self.repeat)
 
     @property
     def finished(self) -> bool:
-        return self._index >= self.n_points
+        return self._repeat_cur > self.repeat
 
     def published_signals(self) -> frozenset:
         """The signals this scan publishes (behind ``prefix``): the swept x axis, the measured y
@@ -1537,8 +1573,13 @@ class PulseScanNode(Measurement):
         # 2) make the y signals FRESH for this frame, then 3) read y from the source expression.
         self._await_y_inputs(before)
         y = self._read_y()
-        self.data_y[index, 0] = y
+        self._sum[index, 0] += y
+        self._count[index] += 1.0
+        self.data_y[index, 0] = self._sum[index, 0] / self._count[index]    # running mean over passes
         self._index += 1
+        if self._index >= self.n_points:                 # pass complete -> start the next one
+            self._index = 0
+            self._repeat_cur += 1
         out = {self.x_key: self._values.copy(),
                self.y_key: self.data_y[:, 0].copy(),
                "scan_done": 1.0 if self.finished else 0.0}
