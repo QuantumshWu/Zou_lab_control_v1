@@ -1297,20 +1297,40 @@ class FluentComboBox(QtWidgets.QComboBox):
         event.ignore()
 
 
+class _ExpandableTreeView(QtWidgets.QTreeView):
+    """A ``QTreeView`` whose PARENT (header) rows toggle expansion on a click ANYWHERE on the row
+    -- the text as well as the disclosure triangle -- so a signal-group header is easy to open
+    (G2 follow-up: "click the name OR the arrow"), exactly once (the click is swallowed so Qt's
+    native triangle toggle never double-fires).  LEAF rows fall through to the normal click path
+    (``clicked`` -> ``FluentTreeComboBox._on_tree_clicked`` selects them).  Reusable: the behaviour
+    lives on the widget, not in any caller."""
+
+    def mousePressEvent(self, event):  # noqa: N802 - Qt naming
+        index = self.indexAt(event.pos())
+        model = index.model() if index.isValid() else None
+        item = model.itemFromIndex(index) if isinstance(model, QtGui.QStandardItemModel) else None
+        # a producer header = has children + carries no leaf payload (UserRole) -> toggle on any click
+        if item is not None and item.hasChildren() and item.data(QtCore.Qt.UserRole) is None:
+            self.setExpanded(index, not self.isExpanded(index))
+            return                                # swallow: no native double-toggle, no header "select"
+        super().mousePressEvent(event)
+
+
 class FluentTreeComboBox(FluentComboBox):
     """A signal picker whose drop-down is a COLLAPSIBLE TREE (G2): one expandable parent row per
-    producing node (collapsed by default -- click to reveal its signals), each leaf a selectable
-    signal showing its shape + ready/waiting state.  Collapsed, the box paints the fuller
-    ``producer · signal`` name (frame-title aligned, G3) so you can read the source without opening
-    it.  Built on the standard QComboBox-with-QTreeView idiom (a leaf's ``currentData`` is the bare
-    signal name); the populate/read helpers live in task_console so the data shape stays there."""
+    producing node (collapsed by default -- click the name OR the triangle to reveal its signals),
+    each leaf a selectable signal showing its shape + ready/waiting state.  The popup GROWS to fit a
+    freshly-expanded parent's children (instead of scrolling them); collapsed, the box paints the
+    fuller ``producer · signal`` name (frame-title aligned, G3) so you can read the source without
+    opening it.  Built on the standard QComboBox-with-QTreeView idiom (a leaf's ``currentData`` is
+    the bare signal name); the populate/read helpers live in task_console so the data shape stays there."""
 
     #: emitted (with the bare signal name) when the user picks a leaf
     signalPicked = QtCore.pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        tree = QtWidgets.QTreeView(self)
+        tree = _ExpandableTreeView(self)         # parent rows toggle on a name OR triangle click
         tree.setHeaderHidden(True)
         tree.setRootIsDecorated(True)            # show the expand/collapse triangles
         tree.setItemsExpandable(True)
@@ -1330,6 +1350,63 @@ class FluentTreeComboBox(FluentComboBox):
         self._display = ""                       # the producer-qualified label painted when collapsed
         # selecting a leaf in the tree drives the combo's current item + emits signalPicked
         tree.clicked.connect(self._on_tree_clicked)
+        # When a parent expands/collapses, RE-GROW the open popup so the children are fully visible
+        # (Qt sizes the popup once at open and never re-fits a tree expand) -- the box "变长".
+        tree.expanded.connect(self._resize_popup_to_contents)
+        tree.collapsed.connect(self._resize_popup_to_contents)
+
+    def showPopup(self):  # noqa: N802 - Qt naming
+        super().showPopup()
+        self._resize_popup_to_contents()         # fit the initial (collapsed) height on open
+
+    def _popup_pad(self) -> int:
+        return 2 * self._gap                                     # the translucent card's top/bottom gap
+
+    def _desired_popup_height(self) -> int:
+        """Pixel height the popup should be to show every CURRENTLY-VISIBLE row (expanded subtrees
+        included), clamped to the screen.  Pure computation (no widget mutation) so it is unit-
+        testable: counts visible rows structurally x ``sizeHintForRow`` (the delegate's height,
+        valid the instant the expand signal fires -- ``rowHeight`` under-reports freshly-shown
+        children before they lay out)."""
+        view = self.view()
+        if not isinstance(view, QtWidgets.QTreeView):
+            return 0
+        model = self._model
+        rows = 0
+
+        def _visit(parent_index):
+            nonlocal rows
+            for r in range(model.rowCount(parent_index)):
+                rows += 1
+                idx = model.index(r, 0, parent_index)
+                if view.isExpanded(idx):
+                    _visit(idx)
+
+        _visit(QtCore.QModelIndex())
+        if rows <= 0:
+            return 0
+        row_h = view.sizeHintForRow(0)                          # uniform-row height from the delegate
+        if row_h <= 0:
+            row_h = view.fontMetrics().height() + scaled_px(8)
+        desired = rows * row_h + 2 * view.frameWidth() + self._popup_pad()
+        screen = QtWidgets.QApplication.primaryScreen()
+        if screen is not None:                                   # never taller than the screen
+            desired = min(desired, screen.availableGeometry().height() - scaled_px(16))
+        return int(desired)
+
+    def _resize_popup_to_contents(self, *_) -> None:
+        """Re-grow/shrink the OPEN popup so a freshly-expanded parent's children are fully visible
+        instead of scrolled.  Forces BOTH the view and its container height (``setFixedHeight``) so
+        the container's own layout can't keep the view short."""
+        view = self.view()
+        if not isinstance(view, QtWidgets.QTreeView) or not view.isVisible():
+            return
+        desired = self._desired_popup_height()
+        container = view.window()
+        if desired <= 0 or container is None or container is self:
+            return
+        view.setFixedHeight(max(0, desired - self._popup_pad()))   # force the view tall enough...
+        container.setFixedHeight(max(scaled_px(40), desired))      # ...and the container to match
 
     def _display_text(self) -> str:
         return self._display or self.currentText()
