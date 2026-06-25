@@ -219,7 +219,11 @@ def apply_title(target, title: str, *, pad: float | None = None):
 # The lab accent + population palette.  Colours are ART, owned here, never a
 # per-call knob (sealed-API contract).  Read-only view, like DEFAULT_STYLE.
 _PALETTE: dict[str, Any] = {
-    "series": ["grey", "skyblue", "tab:blue", "tab:orange"],     # 1D / monitor line cycle
+    # 1D / monitor multi-curve cycle: the Okabe-Ito COLOUR-BLIND-SAFE qualitative set, ordered so the
+    # common 2-5 curve case gets maximally different HUES (blue / orange / green / purple / red ...)
+    # -- never two near-identical colours (the old grey + sky-blue + tab:blue were indistinguishable).
+    # Guarded by tests/test_series_palette_distinct.py (>=8 colours, pairwise perceptually distinct).
+    "series": ["#0072B2", "#E69F00", "#009E73", "#CC79A7", "#D55E00", "#56B4E9", "#666666", "#F0E442"],
     "pulse_cycle": [
         "#5D7583", "#C37D5A", "#6F8D73", "#A66E87", "#7A6FA4", "#B5A262",
         "#5E9A9A", "#9A765E", "#7890B5", "#8B8B8B", "#B97878", "#679174",
