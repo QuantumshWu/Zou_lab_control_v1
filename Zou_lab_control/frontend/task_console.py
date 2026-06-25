@@ -1239,11 +1239,11 @@ _MONITOR_UNSET = object()   # sentinel: a monitor panel that has never rolled ye
 
 
 class PanelCard(FluentGroupBox):
-    """One dashboard panel: a TITLED frame (title strip = the panel KIND, top-left)
-    holding the frontend canvas, a status + signal-legend footer, and a text
+    """One dashboard panel: a TITLED frame (title strip = the panel KIND + the signal-source
+    legend, top-left) holding the frontend canvas, and a text
     "Setting" button on the title strip (top-right).  The frame border is the DRAG
-    HANDLE (the matplotlib canvas keeps all its own interactions); the footer
-    stretches so the card spans whole layout slots -- a 2-row card is exactly two
+    HANDLE (the matplotlib canvas keeps all its own interactions); the card
+    spans whole layout slots -- a 2-row card is exactly two
     1-row cards plus the gap."""
 
     changed = QtCore.pyqtSignal()          # any config edit (console marks dirty)
@@ -2011,6 +2011,8 @@ class PanelCard(FluentGroupBox):
         self.config.size = str(size)
         self._reset_plot()
         self._apply_fixed_size()
+        self._rerender_last()   # re-draw at the new size NOW, even if the source is stopped (else the
+                                # torn-down panel stays blank until the next hub tick -- same as _set_param)
         self.changed.emit()
         self.layout_changed.emit()
 
@@ -4708,10 +4710,11 @@ class TaskConsole(QtWidgets.QWidget):
         return None
 
     def _refresh_signal_info(self) -> None:
-        """Give every panel a legend (shown in its footer) naming, FOR EACH signal the
+        """Give every panel a legend (shown in its frame TITLE -- the grey strip, the old footer
+        was removed) naming, FOR EACH signal the
         panel actually reads, WHICH node + layer produces it -- e.g.
         ``occupied ← occupancy [processor]``.  It lists only the signals this panel
-        uses (not the producing node's whole output set), so the footer answers
+        uses (not the producing node's whole output set), so the title answers
         exactly "this plot's value comes from which measurement/processor".  A read
         published by more than one running node is flagged ambiguous.  Self-guarded:
         recomputes only when the sources / nodes / published names change."""

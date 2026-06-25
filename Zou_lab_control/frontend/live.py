@@ -2236,11 +2236,12 @@ class _GridData:
     def cell(self, k: int):
         return self.cells[k]
 
-    def save(self, path: str = "", **kwargs):
+    def save(self, path: str = "", *, extra_info=None, image_ext: str = ".png", **kwargs):
         """Save the whole grid the SAME way DataFigure saves a single plot: ONE png AND
         ONE matching ``.npz`` of the plotted data (here the per-cell raw distributions).
-        The path-stem logic mirrors :meth:`DataFigure.save` so the caller passes a path the
-        same way."""
+        The path-stem logic + the ``extra_info`` / ``image_ext`` kwargs mirror
+        :meth:`DataFigure.save` so the SAME call works on a grid or a single plot (else a
+        ``grid.save(path, extra_info=...)`` would crash by forwarding those into ``savefig``)."""
         import time
         from pathlib import Path
         current_time = time.strftime("%Y_%m_%d_%H_%M_%S", time.localtime())
@@ -2255,7 +2256,7 @@ class _GridData:
         else:
             base = Path(f"{p}_{stem}")
         base.parent.mkdir(parents=True, exist_ok=True)
-        image_path = base.with_suffix(".png")
+        image_path = base.with_suffix(image_ext if str(image_ext).startswith(".") else f".{image_ext}")
         data_path = base.with_suffix(".npz")
         self.fig.savefig(image_path, **kwargs)
         # Pack each cell's DataFigure data (data_x / data_y) into the .npz, one key per
@@ -2269,6 +2270,11 @@ class _GridData:
             except Exception:
                 continue
         bundle["n_cells"] = np.asarray(len(self.cells), dtype=int)
+        if extra_info is not None:    # mirror DataFigure.save: caller metadata travels with the data
+            try:
+                bundle["info"] = np.asarray(extra_info)
+            except Exception:
+                pass
         np.savez(data_path, **bundle)
         return {"figure": image_path, "data": data_path}
 

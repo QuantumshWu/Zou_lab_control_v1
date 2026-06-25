@@ -1061,6 +1061,11 @@ class RuntimeSequencer(SequencerDevice):
     def wait_done(self, timeout: float | None = None) -> bool:
         return self.service.wait_done(timeout)
 
+    def settle(self, seconds: float, *, stop=None) -> None:
+        # Scale the inter-shot wait by the service's sleep_scale, so it fast-forwards under the
+        # SAME knob as wait_done (else a sleep_scale=0 RuntimeSequencer would real-time-sleep here).
+        self._sleep_interruptible(float(seconds) * float(self.service.sleep_scale), stop)
+
     def abort(self) -> None:
         self.service.abort()
 

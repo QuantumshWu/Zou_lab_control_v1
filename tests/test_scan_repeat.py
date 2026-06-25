@@ -60,6 +60,22 @@ def test_scan_repeat_averages_each_point_over_passes():
     assert float(hub.latest("m_scan_done")) == 1.0
 
 
+def test_occupancy_advertises_rate_grid_only_with_a_grid():
+    """A processor must advertise ONLY what it actually publishes: rate_grid is emitted (by
+    transform) only when a grid shape is known, so published_signals/output_specs must NOT list it
+    otherwise (else a picker shows it 'waiting' forever)."""
+    from Zou_lab_control.neutral_atom.operations.logic import OccupancyProcessor
+    hub = SignalHub()
+    no_grid = OccupancyProcessor(hub, source_expr={"inputs": ["frame"], "source": "value = signal"},
+                                 grid_shape=None, prefix="o_")
+    assert "o_rate_grid" not in no_grid.published_signals()
+    assert not any(s.name == "o_rate_grid" for s in no_grid.output_specs())
+    gridded = OccupancyProcessor(hub, source_expr={"inputs": ["frame"], "source": "value = signal"},
+                                 grid_shape=(2, 3), prefix="g_")
+    assert "g_rate_grid" in gridded.published_signals()
+    assert any(s.name == "g_rate_grid" for s in gridded.output_specs())
+
+
 def test_scan_repeat_one_is_a_single_pass():
     hub = SignalHub()
     node = ScannedMeasurementNode(hub, _CountingMeasurement(), x_key="x", y_key="y",

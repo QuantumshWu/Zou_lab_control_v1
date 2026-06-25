@@ -73,7 +73,9 @@ def _resolve_probe_template(template: str) -> PulseTableState:
     return single_imaging_template()
 
 
-def _scan_table_arrays(state: PulseTableState, scan_code: str) -> tuple[list[str], list[np.ndarray]]:
+def _scan_table_arrays(
+    state: PulseTableState, scan_code: str,
+) -> tuple[list[str], list[np.ndarray], tuple[int, int] | None]:
     """Evaluate the scan PROGRAM into per-slot arrays (one array per bound scan slot, in slot
     order).
 

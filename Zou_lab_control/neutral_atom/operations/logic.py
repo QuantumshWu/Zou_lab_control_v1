@@ -552,20 +552,30 @@ class OccupancyProcessor(Processor):
             out["rate_grid"] = rate_sites.reshape(self.grid_shape).copy()
         return out
 
+    def published_signals(self) -> frozenset:
+        # ``rate_grid`` is published ONLY when a grid shape is known (transform gates it), so it must
+        # not be advertised otherwise -- else a picker/legend shows it "waiting" forever (it never
+        # arrives).  Every other ``provides`` entry is published every shot.
+        keys = [k for k in self.provides if k != "rate_grid" or self.grid_shape is not None]
+        return frozenset(self.prefix + key for key in keys)
+
     def output_specs(self) -> tuple[SignalSpec, ...]:
         """Label + meaning of each detection signal (the readout pipeline's outputs)."""
         p = self.prefix
-        return (
+        specs = [
             SignalSpec(p + "occupied", "occupancy", "", "per-site single-shot occupancy (0 / 1)"),
             SignalSpec(p + "counts", "readout counts", "", "per-site integrated readout signal"),
             SignalSpec(p + "rate", "loading rate", "", "running-mean loading rate over all sites"),
             SignalSpec(p + "rate_sites", "loading rate", "", "per-site running-mean loading rate"),
-            SignalSpec(p + "rate_grid", "loading rate", "", "per-site loading rate as a site grid"),
             SignalSpec(p + "centers", "site centre", "px", "site centres in camera pixels (N, 2)"),
             SignalSpec(p + "thresholds", "threshold", "counts", "per-site bright/dark count threshold"),
             SignalSpec(p + "frame_judged", "camera image", "counts",
                        "the exact camera frame this occupancy was judged from (site-map underlay)"),
-        )
+        ]
+        if self.grid_shape is not None:    # only declared when actually published (see transform)
+            specs.insert(4, SignalSpec(p + "rate_grid", "loading rate", "",
+                                       "per-site loading rate as a site grid"))
+        return tuple(specs)
 
 
 class TaskOutput:
@@ -1596,7 +1606,7 @@ class PulseScanNode(Measurement):
         #    -> settle (extra_delay_s) -> next.  The sequencer owns the wait (the caller just sets
         #    the adjustable extra delay); honours Stop so a long settle does not wedge teardown.
         if self.extra_delay_s > 0.0 and not self._stop.is_set():
-            self.sequencer.settle(self.extra_delay_s)
+            self.sequencer.settle(self.extra_delay_s, stop=self._stop)
         self._sum[index, 0] += y
         self._count[index] += 1.0
         self.data_y[index, 0] = self._sum[index, 0] / self._count[index]    # running mean over passes

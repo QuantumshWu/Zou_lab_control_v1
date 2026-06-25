@@ -134,7 +134,11 @@ class CameraDevice(BaseDevice):
             trig = getattr(sequencer, "trigger_channels", None) or DEFAULT_CAMERA_TRIGGER_CHANNELS
             try:
                 return max(1, int(count_trigger_pulses(sequence, trigger_channels=trig)))
-            except Exception:
+            except AttributeError:
+                # The object is not a countable PulseSequence (no base_pulses) -> a single frame.
+                # A genuine counting failure (ValueError on a malformed sequence) is NOT swallowed:
+                # silently dropping a multi-trigger reference bracket to 1 frame would corrupt the
+                # fidelity characterization with no signal to the user.
                 return 1
         return 1
 
@@ -251,18 +255,33 @@ class SequencerDevice(BaseDevice):
 
         return True
 
-    def settle(self, seconds: float) -> None:
+    def settle(self, seconds: float, *, stop: "threading.Event | None" = None) -> None:
         """Idle for ``seconds`` after a finite pulse before the next load+fire.
 
         The DEVICE owns this inter-shot wait so a software-stepped sweep (e.g. an API-slot
         pulse-scan: load -> on_pulse -> wait the pulse done -> settle -> next) does not hand-roll
         timing in the caller.  The hardware simply sits in its idle/safe state during this window;
-        the default is a plain host-side wait (a real backend is idle between fires).  A virtual
-        backend scales it by ``sleep_scale`` so tests fast-forward."""
+        the default is a plain host-side wait (a real backend is idle between fires).  ``stop``
+        (when given) makes the wait COOPERATIVELY cancellable -- it returns early once the event is
+        set, so a Stop pressed mid-settle does not block teardown for the full delay.  A virtual
+        backend scales the delay by ``sleep_scale`` so tests fast-forward."""
 
-        s = float(seconds)
-        if s > 0.0:
-            time.sleep(s)
+        self._sleep_interruptible(float(seconds), stop)
+
+    @staticmethod
+    def _sleep_interruptible(seconds: float, stop: "threading.Event | None") -> None:
+        """Sleep ``seconds`` in small slices, returning early if ``stop`` is set."""
+        if seconds <= 0.0:
+            return
+        if stop is None:
+            time.sleep(seconds)
+            return
+        deadline = time.monotonic() + seconds
+        while not stop.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return
+            stop.wait(min(0.05, remaining))
 
     def abort(self) -> None:
         """Abort the current sequence, when supported."""

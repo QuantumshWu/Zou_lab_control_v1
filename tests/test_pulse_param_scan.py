@@ -371,7 +371,7 @@ def test_pulse_scan_extra_delay_settles_via_device():
         seen: list[float] = []
         seq = exp.devices.sequencer
         orig = seq.settle
-        seq.settle = lambda s: (seen.append(float(s)), orig(s))[1]   # record + still call the real one
+        seq.settle = lambda s, **k: (seen.append(float(s)), orig(s, **k))[1]   # record + still call real
         try:
             x, y, node, hub = _run_pulse_scan(
                 exp, template=probe,
