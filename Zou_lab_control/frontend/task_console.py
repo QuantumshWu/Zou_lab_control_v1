@@ -44,7 +44,7 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
-from PyQt5 import QtCore, QtWidgets
+from PyQt5 import QtCore, QtGui, QtWidgets
 
 from .live import (
     PANEL_SIZES,
@@ -1737,11 +1737,11 @@ class PanelCard(FluentGroupBox):
         popup.raise_()
 
     def _size_settings_popup(self) -> None:
-        """Size the Setting frame to SHOW ALL its content by default; only when the content exceeds
-        the bound does the FluentScrollArea scroll it.  GROW immediately (e.g. when the panel size
-        grows) but NEVER shrink within a session -- a high-water mark, so enlarging then shrinking
-        the panel leaves the frame at its tallest (#H3i-2).  (Reset in _build_settings when the
-        popup is rebuilt with different content.)"""
+        """Size the Setting frame: EXPAND to show all its content, UNTIL it reaches the PLOT PANEL's
+        own bottom edge -- then the FluentScrollArea scrolls the overflow.  So the cap is the panel
+        boundary (`panel_bottom - top_y`), NOT the screen: a tall panel gets a tall frame, a short
+        panel scrolls, and either way the frame stays within the panel.  GROW with the panel size,
+        clamped to the live cap (so shrinking the panel re-clamps the frame to the smaller panel)."""
         popup = getattr(self, "settings_popup", None)
         if popup is None:
             return
@@ -1752,13 +1752,16 @@ class PanelCard(FluentGroupBox):
         top_y = anchor_y + scaled_px(2)
         content = self._settings_scroll.widget()
         content_h = (content.sizeHint().height() if content is not None else popup.height()) + 2 * scaled_px(10)
-        bound = (avail.height() - scaled_px(40)) if avail is not None else scaled_px(900)
-        want = min(content_h, bound)                       # default = the WHOLE content (no early scroll)
-        self._settings_h_hwm = max(int(self._settings_h_hwm), int(want))   # grow, never shrink
-        h = self._settings_h_hwm
-        if avail is not None:                              # screen physics: never run off the bottom
-            h = min(h, avail.bottom() - top_y)
-        popup.setMaximumHeight(int(bound))                 # content beyond the bound scrolls
+        # The cap is the PLOT PANEL's own bottom edge (the popup opens just below the gear near the
+        # panel top and grows DOWN); content past it scrolls.
+        panel_bottom = self.mapToGlobal(QtCore.QPoint(0, self.height())).y()
+        cap = max(scaled_px(140), panel_bottom - top_y)
+        if avail is not None:                              # last-resort: never escape the physical screen
+            cap = min(cap, avail.bottom() - top_y)
+        want = min(content_h, cap)                         # grow to the content, capped at the panel bottom
+        self._settings_h_hwm = max(int(self._settings_h_hwm), int(want))   # grow within a session...
+        h = min(self._settings_h_hwm, cap)                 # ...but always re-clamp to the LIVE panel cap
+        popup.setMaximumHeight(int(cap))                   # content beyond the panel bottom scrolls
         popup.resize(popup.width(), max(scaled_px(140), int(h)))
 
     def _fill_slot_combo(self, combo, current: str) -> None:
@@ -4210,6 +4213,7 @@ class TaskConsole(QtWidgets.QWidget):
         self._timer.timeout.connect(self._tick)
         self._recompute_tick_interval()          # base = min panel update_ms (sets the interval)
         self._timer.start()
+        self._paused = False                     # Pause button: freeze EVERY plot's display at once
 
     # ------------------------------------------------------------------ UI
     def _target_console_size(self) -> QtCore.QSize:
@@ -4287,16 +4291,24 @@ class TaskConsole(QtWidgets.QWidget):
         self.save_button.clicked.connect(self.save_to_file)
         load_button = FluentButton("Load", color=ORANGE)
         load_button.clicked.connect(self.load_from_file)
+        # Whole-monitor controls: Pause/Resume freezes/unfreezes EVERY plot at once (a display
+        # freeze -- acquisition keeps running); Save image grabs the WHOLE board region to a PNG.
+        self.pause_button = FluentButton("Pause", color=ORANGE)
+        self.pause_button.clicked.connect(self._toggle_pause)
+        self.save_image_button = FluentButton("Save image", color=ACCENT)
+        self.save_image_button.clicked.connect(self._save_board_image)
 
         for widget in (self.status_dot, self.name_edit):
             header.addWidget(widget)
         header.addWidget(self.summary, 1)
-        for widget in (self.kind_combo, add_button, self.save_button, load_button):
+        for widget in (self.kind_combo, add_button, self.pause_button, self.save_image_button,
+                       self.save_button, load_button):
             header.addWidget(widget)
         # header controls disabled while a task runs (the lockout, #5); kept as a group
-        # so ``_set_task_running`` flips them all at once.
-        self._lockable_header = (self.kind_combo, add_button, self.save_button, load_button,
-                                 self.name_edit)
+        # so ``_set_task_running`` flips them all at once.  Pause stays OUT of the lockout (you may
+        # want to freeze the display even mid-task); Save image is locked like the other mutators.
+        self._lockable_header = (self.kind_combo, add_button, self.save_image_button,
+                                 self.save_button, load_button, self.name_edit)
         root.addWidget(header_frame)
 
         # Running-task LOCKOUT banner (confocal-style): a prominent strip shown ONLY
@@ -5421,6 +5433,38 @@ class TaskConsole(QtWidgets.QWidget):
         if getattr(self, "_timer", None) is not None:
             self._timer.setInterval(self._base_interval_ms)
 
+    def _toggle_pause(self) -> None:
+        """Pause / Resume the WHOLE monitor: freeze or unfreeze every plot's live display at once.
+        This is a DISPLAY freeze -- acquisition keeps running (Stop a Logic node to halt that)."""
+        self._paused = not self._paused
+        self.pause_button.setText("Resume" if self._paused else "Pause")
+        self.pause_button.set_color(GREEN if self._paused else ORANGE)
+        if not self._paused:
+            self._tick()                          # immediate catch-up redraw of every panel
+
+    def _save_board_image(self) -> None:
+        """Save the WHOLE monitor board (every panel, composited in its laid-out position) to a PNG.
+        Unlike a per-plot save (data png+npz), this is a raster of the board region, so it is a plain
+        image.  Reuses ``_last_save_dir`` so it shares the per-panel save's remembered folder."""
+        default_dir = self._last_save_dir or str(_task_files_dir())
+        default = str(Path(default_dir) / time.strftime("monitor_%Y_%m_%d_%H_%M_%S.png", time.localtime()))
+        path, _sel = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save monitor image", default, "PNG image (*.png)")
+        if not path:
+            return
+        if not path.lower().endswith(".png"):
+            path += ".png"
+        pm = self.board.grab()                    # the board bounds every card (arrange grows its min size)
+        # _PanelBoard is transparent -> composite onto an opaque white canvas so the PNG isn't see-through.
+        canvas = QtGui.QPixmap(pm.size())
+        canvas.fill(QtGui.QColor("#FFFFFF"))
+        painter = QtGui.QPainter(canvas)
+        painter.drawPixmap(0, 0, pm)
+        painter.end()
+        canvas.save(path)
+        self._last_save_dir = str(Path(path).parent)
+        self._update_summary()
+
     def _tick(self) -> None:
         # poll the logic nodes EVERY base tick (even when no new signal arrived) so a
         # one-shot node's run-complete / error transition is never missed if the node
@@ -5430,6 +5474,12 @@ class TaskConsole(QtWidgets.QWidget):
         # A running task's mid-run output is OFF the hub (#6), so it does NOT bump the
         # hub version -- refresh its dedicated panel here every tick.
         self._refresh_task_panel()
+        # PAUSE = freeze EVERY plot's display: skip the per-card render below (so no card advances
+        # its _render_version) while keeping node polling / banners alive.  On Resume, hub.version
+        # has moved on but the cards' _render_version did not, so the version gate redraws them all.
+        if self._paused:
+            self._update_summary()
+            return
         self._tick_count += 1
         version = self.hub.version
         elapsed = self._tick_count * self._base_interval_ms
