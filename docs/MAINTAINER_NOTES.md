@@ -1271,10 +1271,42 @@ after the last point of the LAST pass (`finished == _repeat_cur > repeat`); `poi
 `total_points` span all passes. **`repeat_mode` is deliberately SEPARATE from the base
 `Measurement.update_mode`** (which `_postprocess` consumes PER SHOT, default `roll` = pass-through):
 reusing `update_mode` made the base double-average the published curve. The task console's
-measurement Edit exposes an **Acquisition** section with **Repeat** (spinbox) + **Repeat mode**
-(combobox); a continuous camera / reactive processor / one-shot task does not re-run a finite sweep,
-so the controls are measurement-only. `_build_logic_node` pops both and hands them to the node.
-Guarded by `test_scan_repeat.py`.
+measurement Edit exposes an **Acquisition** section with **Repeat** (spinbox) + **Update mode**
+(combobox).  `_build_logic_node` pops both and hands them to the node.  Guarded by `test_scan_repeat.py`.
+
+**Repeat is on EVERY measurement, not only scans (incl. the camera), and the plot shows `×N`.**
+The Acquisition section appears for any measurement-layer node — kind `measurement` (scan: re-run
+the sweep) AND `camera` (a `Measurement` too: repeat = average N frames; modes `roll/average/replace`
+from `CameraMeasurement.REPEAT_MODES`); processors/tasks (no re-acquire) get none.  For a camera,
+`_build_logic_node` maps "average" → the base per-shot `repeat` mode (`repeats=N`) and "roll"/"replace"
+1:1.  The plot's pass tag is fed DECOUPLED (confocal's controller-push): `_poll_logic_nodes` →
+`_push_repeat_cur(node)` sets `plotter.repeat_cur` on every panel plotting one of the node's
+published signals, lighting up `Live1D`'s `"<ylabel> ×N"` — the panel still subscribes to a SIGNAL,
+not the node.  The running-row counter uses `total_points` (n_points × repeat).
+
+### Panel card: width-by-columns, HEIGHT hugs the plot (variable pixel-y grid)
+A card's WIDTH is on a clean column grid (`cols // 2` base columns); its HEIGHT HUGS the plot —
+`_card_size` = chrome + the size's own figure height, **zero blank padding** below at every size
+(the figure still scales with the size, so 1x2/2x2/4x4 stay distinct).  Heights are therefore
+VARIABLE, so the vertical layout is PIXELS not cells: `PanelConfig.col` is a column index (x snaps
+to the column grid) but `.row` is a PIXEL y (`.rows` cell-span deleted).  `_slot_to_pos`/`_pos_to_slot`
+map columns cleanly + snap y to `_VSNAP`; `_compact` pushes an overlap straight down by the blocker's
+ACTUAL pixel height (+ gap) — free vertical placement, no overlap.  Guarded by `test_panel_hug_layout.py`
+(+ the two smoke layout tests).
+
+### Setting frame: show-all + grow-not-shrink (height hysteresis)
+`_size_settings_popup` sizes the Setting popup to show ALL its content by default (scroll only past
+a screen-derived bound), with a per-popup height high-water mark (`_settings_h_hwm`): it GROWS
+immediately (incl. when `_on_size` enlarges the panel) but NEVER shrinks back within a session; the
+mark resets in `_build_settings` when the popup is rebuilt with different content.  Guarded by
+`test_setting_frame_grow.py`.
+
+### FluentTreeComboBox: click the name to expand + popup grows to fit
+Both behaviours live inside the reusable widget: `_ExpandableTreeView.mousePressEvent` toggles a
+parent (header) row on a click ANYWHERE on the row (name or triangle), exactly once; `_resize_popup_to_contents`
+(on `expanded`/`collapsed` + `showPopup`) re-grows the open popup to fit every visible row
+(`n_visible × sizeHintForRow`, screen-clamped, forcing view + container `setFixedHeight`).  Guarded
+by `test_tree_combo_expand.py`.
 
 ### One source MECHANISM everywhere; per-kind only the slot-count + the value SIZE
 The signal-picker + `value = ...` expression box (the `SignalExpr` mechanism) is on EVERY source
