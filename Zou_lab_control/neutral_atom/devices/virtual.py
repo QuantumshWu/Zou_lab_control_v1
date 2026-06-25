@@ -759,6 +759,14 @@ class VirtualSequencer(SequencerDevice):
             time.sleep(delay)
         return True
 
+    def settle(self, seconds: float) -> None:
+        """Idle ``seconds`` between software-stepped fires, scaled by ``sleep_scale`` like
+        :meth:`wait_done` -- so the virtual backend takes the same proportional wall-clock as the
+        rest of its timing (and the test suite's ``sleep_scale=0`` fast-forwards it to nothing)."""
+        delay = float(seconds) * self.sleep_scale
+        if delay > 0:
+            time.sleep(delay)
+
     def stop(self) -> None:
         """Drive the streamer to a safe idle state -- it stops firing, so the camera sees no
         more triggers.  ``abort`` / ``set_safe_state`` (base) route here, so "Stop Pulse"

@@ -96,6 +96,38 @@ def _scan_table_arrays(state: PulseTableState, scan_code: str) -> tuple[list[str
     return names, arrays, scan_shape
 
 
+def _api_table_arrays(state: PulseTableState, api_code: str) -> tuple[list[str], list[np.ndarray]]:
+    """Evaluate the SOFTWARE api-sweep program into per-api-slot arrays (one column per API slot,
+    in slot order).
+
+    The api sweep is the software analogue of the hardware scan table: ONE ``(N_points x n_api)``
+    program (the api slots advance in lockstep, one row per point).  Values are in each slot's
+    NATIVE unit (``set_api`` interprets them: a duration api slot's value in its unit, a DAC api
+    slot's value in signed LSB) -- there is NO hardware snap here (set_api snaps a duration to the
+    clock grid itself).  Returns ``(api names, columns)``."""
+
+    names = [s.name for s in state.api_slots]
+    if not names:
+        raise ValueError(
+            "the pulse template has no API slot to sweep -- in the pulse GUI Edit tab, click a "
+            "duration / DAC cell to its API (purple) state to expose a named handle aN, then give "
+            "an api-sweep program here.")
+    table, _shape = evaluate_scan_table_code(api_code, len(names))   # N x n_api
+    columns = list(zip(*table))                                      # one column per api slot
+    arrays = [np.asarray(col, dtype=float) for col in columns]
+    return names, arrays
+
+
+def _label_for_first_api_slot(state: PulseTableState) -> tuple[str, str]:
+    """``(axis label, unit)`` for the FIRST API slot (drives the x label of an api-only sweep)."""
+
+    if not state.api_slots:
+        return ("point", "")
+    slot = state.api_slots[0]
+    name = slot.name + ": " + scan_target_label(state, slot.kind, slot.target)
+    return (name, str(getattr(slot, "unit", "") or ""))
+
+
 def _label_for_first_scan_slot(state: PulseTableState) -> tuple[str, str]:
     """``(axis label, axis unit)`` for the FIRST scan slot (drives the live plot's x label).
 
@@ -130,12 +162,23 @@ class PulseScanPlan:
     def __init__(self, base_state: PulseTableState, scan_names: Sequence[str],
                  scan_arrays: Sequence[np.ndarray], camera, sequencer, *,
                  axis_label: str = "point", axis_unit: str = "", y_key: str = "signal",
-                 y_expr=None, scan_shape: tuple[int, int] | None = None, settle=None):
+                 y_expr=None, scan_shape: tuple[int, int] | None = None, settle=None,
+                 api_names: Sequence[str] = (), api_arrays: Sequence[np.ndarray] = (),
+                 extra_delay_s: float = 0.0):
         self.base_state = base_state
         self.scan_names = list(scan_names)
         self.scan_arrays = [np.asarray(a, dtype=float).reshape(-1) for a in scan_arrays]
-        self.axis = _Axis(self.scan_arrays[0] if self.scan_arrays else [0.0],
-                          label=axis_label, unit=axis_unit)
+        # SOFTWARE api-slot sweep (the analogue of the hardware scan table): per point the node
+        # deep-copies the base state, calls set_api for each api column, fires, waits the pulse +
+        # extra_delay_s, then advances.  The DEVICE owns the inter-point wait (sequencer.settle).
+        self.api_names = list(api_names)
+        self.api_arrays = [np.asarray(a, dtype=float).reshape(-1) for a in api_arrays]
+        self.extra_delay_s = max(0.0, float(extra_delay_s))
+        # The x axis is the swept dimension: the hardware scan slots if any, else the software api
+        # sweep, else a single point.
+        primary = self.scan_arrays[0] if self.scan_arrays else (
+            self.api_arrays[0] if self.api_arrays else [0.0])
+        self.axis = _Axis(primary, label=axis_label, unit=axis_unit)
         self.axis_label = str(axis_label)
         self.axis_unit = str(axis_unit)
         self.camera = camera
@@ -162,26 +205,50 @@ def pulse_scan(readout) -> MeasurementSpec:
         spec = dict(pulse_slots or {})
         api_values: Mapping[str, float] = dict(spec.get("api") or {})
         scan_code = str(spec.get("scan_code") or "")
+        api_scan_code = str(spec.get("api_scan") or "")           # software api-slot sweep program
+        extra_delay_s = max(0.0, float(spec.get("extra_delay") or 0.0))
 
-        # Apply api values ONCE; reject typos (set_api raises for unknown handle names).
+        # Apply the FIXED api values ONCE; reject typos (set_api raises for unknown handle names).
+        # (An api slot named in the SWEEP program below is driven per point instead, so its fixed
+        # value here is just the resting seed.)
         for name, value in api_values.items():
             if str(value).strip() == "":
                 continue                                       # leave the template's value
             state.set_api(name, float(value))
-        # The scan POINTS are ONE table: the scan program builds an (N_points x n_slots) array
-        # (one row per point, one column per slot) -- the slots advance in LOCKSTEP, snapped to the
-        # hardware grid in each slot's NATIVE unit (ns ticks for a duration, integer code for a DAC).
-        # A 2-slot grid program also declares scan_shape (n0, n1) -> a 2-D scan map.
-        # Empty program -> the column_stack default for the bound slot count.
-        if not scan_code.strip():
-            scan_code = scan_table_template("column_stack", len(state.scan_slots))
-        scan_names, scan_arrays, scan_shape = _scan_table_arrays(state, scan_code)
-        axis_label, axis_unit = _label_for_first_scan_slot(state)
+
+        # HARDWARE scan slots (the x axis on the FPGA scan table): ONE (N_points x n_slots) program,
+        # snapped to the hardware grid, slots advancing in lockstep.  A 2-slot grid program also
+        # declares scan_shape (n0, n1) -> a 2-D scan map.  Empty program with bound slots -> the
+        # column_stack default.  No scan slot bound -> no hardware scan (an api-only sweep).
+        if state.scan_slots:
+            if not scan_code.strip():
+                scan_code = scan_table_template("column_stack", len(state.scan_slots))
+            scan_names, scan_arrays, scan_shape = _scan_table_arrays(state, scan_code)
+        else:
+            scan_names, scan_arrays, scan_shape = [], [], None
+
+        # SOFTWARE api sweep (the analogue, for api slots): present only when the operator gives a
+        # program -- otherwise the api slots stay FIXED at their values above.
+        api_names, api_arrays = [], []
+        if api_scan_code.strip():
+            api_names, api_arrays = _api_table_arrays(state, api_scan_code)
+
+        if not scan_arrays and not api_arrays:
+            raise ValueError(
+                "a pulse scan needs SOMETHING to sweep: bind a scan slot (sN) and give a scan "
+                "program, OR give an api-sweep program over an API slot (aN).")
+
+        # x axis label: the hardware scan slot if any, else the swept API slot.
+        if scan_arrays:
+            axis_label, axis_unit = _label_for_first_scan_slot(state)
+        else:
+            axis_label, axis_unit = _label_for_first_api_slot(state)
         y_expr = SignalExpr.from_value(y if y is not None else DEFAULT_Y_SOURCE)
         return PulseScanPlan(
             state, scan_names, scan_arrays, s.devices.camera, s.devices.sequencer,
             axis_label=axis_label, axis_unit=axis_unit, y_key=y_name, y_expr=y_expr,
-            scan_shape=scan_shape)
+            scan_shape=scan_shape, api_names=api_names, api_arrays=api_arrays,
+            extra_delay_s=extra_delay_s)
 
     params = (
         ParamDecl("template", "Pulse template", "path", default=DEFAULT_PROBE_TEMPLATE,

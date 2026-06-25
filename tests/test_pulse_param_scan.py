@@ -323,6 +323,70 @@ def test_pulse_scan_empty_program_uses_column_stack_default():
         exp.close()
 
 
+def _bound_probe_with_api() -> str:
+    """A probe with ONE API slot (a duration handle) and NO scan slot -- the api-only sweep case."""
+    from Zou_lab_control.neutral_atom.timing import PulseTableState
+    from Zou_lab_control.neutral_atom.timing.pulse_table import PulsePeriod
+
+    state = PulseTableState(channels=["trap", "cooling", "probe", "emCCD"],
+                            visible_channels=["trap", "cooling", "probe", "emCCD"])
+    state.periods.append(PulsePeriod(0.002, (1, 1, 0, 0), unit="s", name="load"))
+    state.periods.append(PulsePeriod(0.005, (1, 0, 1, 1), unit="s", name="image"))
+    state.bind_api_field("duration", "1", unit="us")     # a1 = the image duration (API handle)
+    state.validate()
+    out = Path("pulses") / "_test_probe_api.json"
+    state.save(str(out))
+    return str(out)
+
+
+def test_pulse_scan_api_sweep_software_drives_each_point():
+    """#H3-3: with ONLY api slots, a pulse scan supports a scan-table-like SOFTWARE sweep -- per
+    point it set_api's that row's value, fires, and reads y.  x = the api sweep points (the swept
+    API slot's value), exactly like the hardware scan table but loaded in software."""
+    exp = _calibrated()
+    probe = _bound_probe_with_api()
+    try:
+        x, y, node, hub = _run_pulse_scan(
+            exp, template=probe,
+            pulse_slots={"api": {}, "api_scan": "import numpy as np\n"
+                         "scan_table = np.linspace(2.0, 8.0, 4).reshape(-1, 1)"},
+            y={"inputs": ["rate"], "source": "value = signal"})
+        assert node.scan_names == []                       # no hardware scan slot
+        assert node.api_names == ["a1"]                    # the api slot is the swept dimension
+        assert x.shape == (4,) and y.shape == (4,)
+        assert np.allclose(x, [2.0, 4.0, 6.0, 8.0])        # x = the api sweep points
+        assert np.isfinite(y).all() and np.all((y >= 0.0) & (y <= 1.0))
+    finally:
+        _safe_unlink(probe)
+        exp.close()
+
+
+def test_pulse_scan_extra_delay_settles_via_device():
+    """#H3-3: the inter-point wait (load -> on_pulse -> wait pulse done -> settle -> next) is owned
+    by the DEVICE: the node calls sequencer.settle(extra_delay) once per point, never a hand-rolled
+    sleep in the analysis layer."""
+    exp = _calibrated()
+    probe = _bound_probe_with_api()
+    try:
+        seen: list[float] = []
+        seq = exp.devices.sequencer
+        orig = seq.settle
+        seq.settle = lambda s: (seen.append(float(s)), orig(s))[1]   # record + still call the real one
+        try:
+            x, y, node, hub = _run_pulse_scan(
+                exp, template=probe,
+                pulse_slots={"api": {}, "extra_delay": 0.05, "api_scan": "import numpy as np\n"
+                             "scan_table = np.linspace(2.0, 8.0, 3).reshape(-1, 1)"},
+                y={"inputs": ["rate"], "source": "value = signal"})
+        finally:
+            seq.settle = orig
+        assert len(seen) == 3                               # one settle per scan point
+        assert all(abs(s - 0.05) < 1e-9 for s in seen)      # the adjustable extra delay
+    finally:
+        _safe_unlink(probe)
+        exp.close()
+
+
 def test_pulse_scan_table_column_count_must_match_slots():
     """The scan table is ONE (N_points x n_slots) array -- the slots advance in lockstep, so the
     program must give ONE column per bound scan slot.  A wrong column count fails LOUD (a 1-column

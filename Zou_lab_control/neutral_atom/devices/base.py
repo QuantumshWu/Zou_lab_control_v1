@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from abc import ABC, abstractmethod
 from collections import deque
 from typing import Any
@@ -249,6 +250,19 @@ class SequencerDevice(BaseDevice):
         """Wait until the prepared finite sequence is done, when supported."""
 
         return True
+
+    def settle(self, seconds: float) -> None:
+        """Idle for ``seconds`` after a finite pulse before the next load+fire.
+
+        The DEVICE owns this inter-shot wait so a software-stepped sweep (e.g. an API-slot
+        pulse-scan: load -> on_pulse -> wait the pulse done -> settle -> next) does not hand-roll
+        timing in the caller.  The hardware simply sits in its idle/safe state during this window;
+        the default is a plain host-side wait (a real backend is idle between fires).  A virtual
+        backend scales it by ``sleep_scale`` so tests fast-forward."""
+
+        s = float(seconds)
+        if s > 0.0:
+            time.sleep(s)
 
     def abort(self) -> None:
         """Abort the current sequence, when supported."""

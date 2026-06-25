@@ -708,6 +708,20 @@ class PulseTableState:
         new.validate()
         return new
 
+    def with_api_resolved(self, values: Mapping[str, float]) -> "PulseTableState":
+        """Return a copy with the named API slots set to ``values`` (each via :meth:`set_api`).
+
+        This is the SOFTWARE analogue of :meth:`with_slots_resolved`: the hardware scan table
+        streams scan slots on the FPGA, but API slots are fixed handles set per shot in software.
+        A pulse-scan that sweeps an API slot deep-copies the base state and calls this per point,
+        so each point fires a freshly-loaded pulse (load -> on_pulse -> wait -> next).  Unknown
+        names raise (``set_api`` fails loud), exactly like the fixed-value path."""
+
+        new = PulseTableState.from_dict(self.to_dict())
+        for name, value in dict(values or {}).items():
+            new.set_api(str(name), float(value))
+        return new
+
     def primary_time_slot(self) -> str | None:
         """Return the variable name of the first duration (time) scan slot."""
 

@@ -1479,6 +1479,12 @@ class PulseScanNode(Measurement):
         self.base_state = plan.base_state
         self.scan_names = list(plan.scan_names)
         self.scan_arrays = [np.asarray(a, dtype=float).reshape(-1) for a in plan.scan_arrays]
+        # SOFTWARE api-slot sweep (the analogue of the hardware scan table): per point we set_api
+        # each api column on a deep copy, fire, then wait extra_delay_s -- the device-owned
+        # inter-point settle (load -> on_pulse -> wait pulse done -> settle -> next).
+        self.api_names = list(getattr(plan, "api_names", ()))
+        self.api_arrays = [np.asarray(a, dtype=float).reshape(-1) for a in getattr(plan, "api_arrays", ())]
+        self.extra_delay_s = max(0.0, float(getattr(plan, "extra_delay_s", 0.0)))
         self.camera = plan.camera
         self.sequencer = plan.sequencer
         self.y_expr = plan.y_expr if isinstance(plan.y_expr, SignalExpr) else SignalExpr.from_value(plan.y_expr)
@@ -1495,8 +1501,14 @@ class PulseScanNode(Measurement):
         self.x_signal = self.prefix + self.x_key
         self.y_signal = self.prefix + self.y_key
         # The swept x values are known up front -> a PRE-ALLOCATED NaN curve filled in place by
-        # scan index (a stable x axis from shot 1), like ScannedMeasurementNode.
-        self._values = (self.scan_arrays[0] if self.scan_arrays else np.array([0.0])).astype(float)
+        # scan index (a stable x axis from shot 1), like ScannedMeasurementNode.  The x dimension is
+        # the hardware scan slots if any, else the software api sweep.
+        if self.scan_arrays:
+            self._values = self.scan_arrays[0].astype(float)
+        elif self.api_arrays:
+            self._values = self.api_arrays[0].astype(float)
+        else:
+            self._values = np.array([0.0])
         self._index = 0                                   # within-pass point index
         self.data_y = np.full((self._values.size, 1), np.nan, dtype=float)
         self._sum = np.zeros((self._values.size, 1), dtype=float)   # per-point running sum over passes
@@ -1551,9 +1563,16 @@ class PulseScanNode(Measurement):
         if self.finished:
             raise StopIteration("PulseScanNode: scan already complete.")
         index = self._index
-        # Resolve THIS point's row through the named-slot resolver (api slots stay fixed).
-        slots = {name: float(arr[index]) for name, arr in zip(self.scan_names, self.scan_arrays)}
-        resolved = self.base_state.with_slots_resolved(slots)
+        # Resolve THIS point's pulse: the hardware scan slots through the named-slot resolver, AND
+        # (software) any swept API slots through set_api on the deep copy.  Either or both may be
+        # present; an api-only sweep has no scan slots.
+        resolved = self.base_state
+        if self.scan_names:
+            slots = {name: float(arr[index]) for name, arr in zip(self.scan_names, self.scan_arrays)}
+            resolved = resolved.with_slots_resolved(slots)
+        if self.api_names:
+            api_row = {name: float(arr[index]) for name, arr in zip(self.api_names, self.api_arrays)}
+            resolved = resolved.with_api_resolved(api_row)
         sequence = resolved.to_sequence(name="pulse_scan")
         # ONE trigger per point: pulse-scan FIRES the pulse and reads the UPSTREAM signal (y) -- it
         # is decoupled from the camera's exposure/averaging (no n_frames knob; temporal averaging
@@ -1573,6 +1592,11 @@ class PulseScanNode(Measurement):
         # 2) make the y signals FRESH for this frame, then 3) read y from the source expression.
         self._await_y_inputs(before)
         y = self._read_y()
+        # 4) device-owned inter-point settle: load -> on_pulse -> wait pulse done (camera.acquire)
+        #    -> settle (extra_delay_s) -> next.  The sequencer owns the wait (the caller just sets
+        #    the adjustable extra delay); honours Stop so a long settle does not wedge teardown.
+        if self.extra_delay_s > 0.0 and not self._stop.is_set():
+            self.sequencer.settle(self.extra_delay_s)
         self._sum[index, 0] += y
         self._count[index] += 1.0
         self.data_y[index, 0] = self._sum[index, 0] / self._count[index]    # running mean over passes

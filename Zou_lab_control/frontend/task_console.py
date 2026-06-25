@@ -373,6 +373,10 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
         self._api_remembered: dict[str, str] = {}     # typed api values, kept across reloads
         self._scan_remembered: str = ""               # typed scan program, kept across reloads
         self._scan_code = None                        # the FluentCodeEdit (None until first scan slot)
+        self._api_scan_remembered: str = ""           # typed SOFTWARE api-sweep program, kept across reloads
+        self._extra_remembered: str = ""              # typed extra settle delay, kept across reloads
+        self._api_scan_code = None                    # the api-sweep FluentCodeEdit (None until api slots exist)
+        self._extra_delay = None                      # the extra-settle FluentLineEdit
         self._n_slots = 0
         # Spans the FULL form width and emits its OWN two PEER sections ("API slots" + "Scan table")
         # as top-level FluentSectionLabels -- no wrapper header (that would be a redundant third
@@ -395,6 +399,8 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
         _drop(self._box)
         self._api_widgets = {}
         self._scan_code = None
+        self._api_scan_code = None
+        self._extra_delay = None
 
     def rebuild(self, api_rows, scan_rows) -> None:
         """``api_rows`` = ``[(name, kind, target, unit, current_value), ...]``.
@@ -405,6 +411,10 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
             self._api_remembered[name] = w.text().strip()
         if self._scan_code is not None:
             self._scan_remembered = self._scan_code.toPlainText()
+        if self._api_scan_code is not None:
+            self._api_scan_remembered = self._api_scan_code.toPlainText()
+        if self._extra_delay is not None:
+            self._extra_remembered = self._extra_delay.text().strip()
         self._clear()
         self._n_slots = len(scan_rows)
 
@@ -423,9 +433,38 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
                 edit.textChanged.connect(self.changed)
                 self._box.addWidget(FluentSettingRow(label, edit, label_width=api_lw))
                 self._api_widgets[name] = edit
+            # SOFTWARE api-sweep: the analogue of the scan table for API slots (#H3-3).  Leave it
+            # blank to keep the values above FIXED; fill it to SWEEP the api slots in software (each
+            # point: load -> on_pulse -> wait pulse done + extra settle -> next, the DEVICE owning the
+            # wait).  ONE column per API slot, in slot order -- like the scan table.
+            sweep_note = FluentLabel(
+                "Sweep these slots in software (leave blank to keep them fixed): one column per API "
+                "slot, in order, in each slot's unit.", self)
+            sweep_note.setWordWrap(True)
+            sweep_note.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+            self._box.addWidget(sweep_note)
+            self._api_scan_code = FluentCodeEdit(self._api_scan_remembered)
+            self._api_scan_code.setMinimumHeight(scaled_px(72, minimum=54))
+            api_cols = ", ".join(name for name, *_ in api_rows)
+            self._api_scan_code.setPlaceholderText(
+                f"# blank = api slots fixed; else assign an (N x {len(api_rows)}) array to 'scan_table'\n"
+                f"# columns = [{api_cols}]\n"
+                "import numpy as np\nscan_table = np.linspace(2, 10, 5).reshape(-1, 1)")
+            self._api_scan_code.setToolTip("Python that assigns an (N_points x n_api) array to "
+                                           "'scan_table' (one column per API slot, swept in software).")
+            self._api_scan_code.textChanged.connect(self.changed)
+            self._box.addWidget(self._api_scan_code)
+            self._extra_delay = FluentLineEdit(self._extra_remembered, self)
+            self._extra_delay.setMinimumWidth(scaled_px(120, minimum=96))
+            self._extra_delay.setPlaceholderText("0")
+            self._extra_delay.setToolTip("Extra settle delay (seconds) held by the device AFTER each "
+                                         "point's pulse finishes, before the next is loaded (0 = none).")
+            self._extra_delay.textChanged.connect(self.changed)
+            self._box.addWidget(FluentSettingRow("Extra settle delay (s)", self._extra_delay,
+                                                 label_width=setting_label_width(["Extra settle delay (s)"])))
         else:
             api_note = FluentLabel("(no API slot -- in the pulse GUI Edit tab, click a duration / DAC "
-                                   "cell to its API (purple) state to fix a value by name aN.)", self)
+                                   "cell to its API (purple) state to fix or sweep a value by name aN.)", self)
             api_note.setWordWrap(True)
             api_note.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
             self._box.addWidget(api_note)
@@ -481,8 +520,9 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
             self._scan_code.setPlainText(scan_table_template(kind, max(1, self._n_slots)))
 
     def values_dict(self) -> dict:
-        """The current ``{"api": {name: float}, "scan_code": "<python>"}`` snapshot.  An empty /
-        blank api row is dropped (keeps the template's value)."""
+        """The current ``{"api": {name: float}, "scan_code": "<python>", "api_scan": "<python>",
+        "extra_delay": float}`` snapshot.  An empty / blank api row is dropped (keeps the template's
+        value); a blank api-sweep program keeps the api slots FIXED."""
         api: dict[str, float] = {}
         for name, w in self._api_widgets.items():
             text = w.text().strip()
@@ -493,7 +533,14 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
             except ValueError:
                 continue
         code = self._scan_code.toPlainText() if self._scan_code is not None else ""
-        return {"api": api, "scan_code": code}
+        api_scan = self._api_scan_code.toPlainText() if self._api_scan_code is not None else ""
+        extra = 0.0
+        if self._extra_delay is not None:
+            try:
+                extra = float(self._extra_delay.text().strip() or 0.0)
+            except ValueError:
+                extra = 0.0
+        return {"api": api, "scan_code": code, "api_scan": api_scan, "extra_delay": extra}
 
     def has_scan_rows(self) -> bool:
         return self._n_slots > 0
