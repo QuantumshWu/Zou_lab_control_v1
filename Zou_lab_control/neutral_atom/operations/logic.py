@@ -383,6 +383,13 @@ class Measurement(LogicNode):
         self._accum_n = 0
         return mean
 
+    def start(self, *args, **kwargs):
+        # A fresh run starts accumulation fresh: a Stop mid-batch (average / repeat) must NOT leak
+        # the partial sum into the next run (it would corrupt the first batch's mean).
+        self._accum = None
+        self._accum_n = 0
+        return super().start(*args, **kwargs)
+
 
 class Processor(LogicNode):
     """A logic node that TRANSFORMS hub signals into derived signals (the "func" layer).
@@ -1585,24 +1592,6 @@ class PulseScanNode(Measurement):
         while not self.finished:
             self.step()
         return self
-
-    def published_signals(self) -> frozenset:
-        keys = [self.x_key, self.y_key, "scan_done"]
-        if self.scan_shape is not None:
-            keys.append(self.y_key + "_grid")
-        return frozenset(self.prefix + key for key in keys)
-
-    def output_specs(self) -> tuple[SignalSpec, ...]:
-        p = self.prefix
-        specs = [
-            SignalSpec(p + self.x_key, self._axis_label, self._axis_unit, "scan x axis (the swept parameter)"),
-            SignalSpec(p + self.y_key, self.y_key, "", "y per point = the subscribed source expression"),
-            SignalSpec(p + "scan_done", "scan complete", "", "1 once the final point is measured"),
-        ]
-        if self.scan_shape is not None:
-            specs.append(SignalSpec(p + self.y_key + "_grid", self.y_key, "",
-                                    "2-D scan map (the y reshaped to the grid; view on a 2D image)"))
-        return tuple(specs)
 
 
 class ProcessorRun(LogicNode):
