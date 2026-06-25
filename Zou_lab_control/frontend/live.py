@@ -42,6 +42,9 @@ from .ticks import apply_smart_ticks
 # fontsize accessors); these module names stay as convenience aliases.
 DEFAULT_COLORS = list(PALETTE["series"])
 PULSE_COLORS = list(PALETTE["pulse_cycle"])
+#: A lone 1-D curve / rolling trace (no data dimension, no create repeats) draws in this grey -- the
+#: original single-line look (matches confocal's default); dim/create multi-lines use DEFAULT_COLORS.
+LINE_SINGLE = PALETTE["line_single"]
 
 
 # --- Repeat-axis reduction (the PLOT's `repeat_mode`) ---------------------------------------------
@@ -49,7 +52,11 @@ PULSE_COLORS = list(PALETTE["pulse_cycle"])
 # each repeat (NaN = not-yet-measured), never combines.  `repeat_mode` is a PLOT parameter that
 # decides HOW to collapse the repeat axis (O0) for display -- so the SAME raw data can be shown as a
 # mean, a sum, the latest, a rolling newest, or every repeat as its own line, without re-running.
-REPEAT_MODES = ("average", "add", "replace", "roll", "new")   # "new" is 1-D only (a line per repeat)
+#: How many repeats a free-run (``inf``) ring keeps.
+REPEAT_RING = 10
+#: The PLOT's repeat-combine modes (confocal "Update mode" naming: average / add / replace / roll /
+#: create).  ``create`` is 1-D only -- it keeps every repeat as its OWN line (confocal's "create").
+REPEAT_MODES = ("average", "add", "replace", "roll", "create")
 
 
 def reduce_repeat(raw, mode: str = "average"):
@@ -62,8 +69,8 @@ def reduce_repeat(raw, mode: str = "average"):
       stable regardless of how many repeats completed) -> drops the repeat axis.
     * ``add``     -> ``nansum``  over repeats.
     * ``replace`` / ``roll`` -> the LATEST repeat slice that holds data.
-    * ``new``     -> 1-D only: keep EVERY repeat-with-data as its own column block ``(points, n*dim)``
-      so the curve draws one line per repeat (offered only for 1-D panels)."""
+    * ``create``  -> 1-D only: keep EVERY repeat-with-data as its own column block ``(points, n*dim)``
+      (repeat-major, dim-minor) so the curve draws one line per repeat (confocal's "create")."""
     a = np.asarray(raw, dtype=float)
     if a.ndim != 3:                                     # already reduced (1-D/2-D) -> leave as-is
         return a
@@ -73,7 +80,7 @@ def reduce_repeat(raw, mode: str = "average"):
         return np.nansum(a, axis=0)
     if mode in ("replace", "roll"):
         return a[idx[-1]] if idx.size else a[0]
-    if mode == "new":
+    if mode == "create":
         cols = idx if idx.size else np.array([0])
         return np.concatenate([a[r] for r in cols], axis=1)   # 1-D: (points, len(cols)*dim)
     with np.errstate(invalid="ignore", divide="ignore"):       # all-NaN cell -> NaN (not-yet-measured)
@@ -593,10 +600,40 @@ class Live1D(BaseLivePlot):
 
     plot_type = "1D"
 
+    def style_repeat(self, dim_cols: int, create_repeats: int) -> None:
+        """Tell the curve how its columns split between the DATA-DIMENSION axis (O2) and the
+        repeat-CREATE axis (#H3k), so the two kinds of multi-line read differently:
+
+        * a SINGLE line (1 column, no dim, no create) -> the original GREY (confocal's default),
+        * DATA-DIM lines (>1 dimension) -> distinct hues (different quantities),
+        * CREATE lines (each repeat of the SAME signal) -> the same hue, FADED by recency (newest
+          opaque, older lighter), so repeats never look like separate dimensions.
+
+        ``dim_cols`` = number of O2 columns per repeat; ``create_repeats`` = repeats drawn as lines
+        (1 unless repeat_mode='create')."""
+        self.dim_cols = max(1, int(dim_cols))
+        self.create_repeats = max(1, int(create_repeats))
+        if self.lines:
+            self._color_lines()
+
+    def _color_lines(self) -> None:
+        dim = max(1, int(getattr(self, "dim_cols", 1)))
+        nrep = max(1, int(getattr(self, "create_repeats", 1)))
+        ncols = self.data_y.shape[1]
+        for i, line in enumerate(self.lines):
+            d = i % dim                                    # which dimension (hue)
+            rep = i // dim                                 # which repeat (fade)
+            if ncols == 1:
+                line.set_color(LINE_SINGLE); line.set_alpha(1.0)          # grey, like before
+            elif nrep > 1:
+                hue = LINE_SINGLE if dim == 1 else DEFAULT_COLORS[d % len(DEFAULT_COLORS)]
+                line.set_color(hue); line.set_alpha(0.30 + 0.70 * (rep + 1) / nrep)  # create: fade by age
+            else:
+                line.set_color(DEFAULT_COLORS[d % len(DEFAULT_COLORS)]); line.set_alpha(1.0)  # dim: hues
+
     def init_core(self) -> None:
         self.lines = self.ax.plot(self.data_x[:, 0], self.data_y, alpha=1)
-        for i, line in enumerate(self.lines):
-            line.set_color(DEFAULT_COLORS[i % len(DEFAULT_COLORS)])
+        self._color_lines()
         self.ax.set_xlabel(self.xlabel)
         self.ax.set_ylabel(self.ylabel)
         # Only pin xlim when there are >=2 distinct x values; a single unique x
@@ -641,8 +678,7 @@ class LiveLive(Live1D):
     def init_core(self) -> None:
         self.axes = self.ax
         self.lines = self.ax.plot(self.data_x[:, 0], self.data_y, alpha=1)
-        for i, line in enumerate(self.lines):
-            line.set_color(DEFAULT_COLORS[i % len(DEFAULT_COLORS)])
+        self._color_lines()                       # single rolling trace -> grey (like before, #H3k)
         self.ax.set_xlabel(self.xlabel)
         self.ax.set_ylabel(self.ylabel)
         self.ax.set_xlim(np.nanmin(self.data_x[:, 0]), np.nanmax(self.data_x[:, 0]))

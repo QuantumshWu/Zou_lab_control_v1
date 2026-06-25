@@ -1313,9 +1313,18 @@ class PanelCard(FluentGroupBox):
         # refresh again and the panel would stay blank (white).  Re-rendering from this
         # cached namespace makes such a change take effect immediately, stopped or not.
         self._last_namespace: Mapping[str, object] | None = None
-        # How many repeats of the picked signal's raw block currently hold data (set while reducing
-        # in _reduce_repeats) -- pushed to the plotter so its ylabel shows "xN" (#3).
+        # The repeat (update-mode) stage state (#H3k): ``_repeat_cur`` = how many repeats currently
+        # have data (the plotter's "xN" ylabel); ``_repeat_ring`` = the plot-side rolling buffer of
+        # the last N streaming publishes (camera/monitor have no measurement-side repeat axis);
+        # ``_last_repeat_key`` = the source version at the last push (so the ring rolls once per real
+        # sample, not every tick).  All set in _apply_repeat -- OUTSIDE the signal stage.
         self._repeat_cur: int = 1
+        self._repeat_ring: list | None = None
+        self._last_repeat_key = None
+        # how the 1-D curve's columns split: dim_cols = data-dimension lines (distinct hues),
+        # create_repeats = repeat-create lines (same hue, faded by recency) -- see _record_split.
+        self._dim_cols: int = 1
+        self._create_repeats: int = 1
         # The hub version at this panel's LAST render -- the per-panel multi-rate refresh
         # (see TaskConsole._tick) skips a panel on its beat when nothing new was published
         # since, so a slow panel does not redraw stale data and a fast one only when needed.
@@ -1584,28 +1593,15 @@ class PanelCard(FluentGroupBox):
             self.lim_combo.currentTextChanged.connect(self._on_relim_mode)
             sec.addWidget(FluentSettingRow("relim", self.lim_combo, label_width=label_w))
 
-            # Repeat mode (#3): HOW to collapse a measurement's repeat axis for display.  This is a
-            # PLOT knob (the measurement only fills the raw (repeat, points, dim) block; the plot
-            # decides average / add / replace / roll / new).  ``new`` (one line per repeat) is 1-D
-            # only.  Persisted as ``config.params["repeat_mode"]``; only meaningful for curve/image
-            # panels, so shown for 1-D / 2-D.
-            if self.config.kind in ("1d", "2d"):
-                from .live import REPEAT_MODES
-                rep_modes = list(REPEAT_MODES) if self.config.kind == "1d" else [m for m in REPEAT_MODES if m != "new"]
-                self.repeat_mode_combo = FluentComboBox()
-                self.repeat_mode_combo.addItems(rep_modes)
-                rcur = str(self.config.params.get("repeat_mode", "average"))
-                self.repeat_mode_combo.setCurrentText(rcur if rcur in rep_modes else "average")
-                self.repeat_mode_combo.setToolTip(
-                    "How to combine a measurement's repeats for display (the raw\n"
-                    "(repeat, points, dim) block is reduced over its repeat axis):\n"
-                    "  average = mean over the repeats that have data (noise reduction)\n"
-                    "  add     = sum over repeats\n"
-                    "  replace = show the latest repeat\n"
-                    "  roll    = show the newest repeat (rolling)\n"
-                    "  new     = draw EVERY repeat as its own line (1-D only)")
-                self.repeat_mode_combo.currentTextChanged.connect(self._on_repeat_mode)
-                sec.addWidget(FluentSettingRow("repeat mode", self.repeat_mode_combo, label_width=label_w))
+            # Repeat (the update-mode stage, #H3k): a PLOT concern, fully decoupled from the signal.
+            # ``repeat`` = how many repeats to keep (a positive int, or ∞), ``repeat_mode`` = how to
+            # collapse them (average / add / replace / roll / create).  These are AUTO-GENERATED from
+            # declarations (the SAME _make_param_widget path as every other param -- no hand-placed
+            # widget) and edits route through _set_param (store -> reset -> re-render).
+            for spec in self._repeat_param_specs():
+                widget = self._make_param_widget(spec)
+                self.param_widgets[spec.key] = widget
+                sec.addWidget(FluentSettingRow(spec.label, widget, label_width=label_w))
 
             # fixed lo/hi inputs (#8): one row [lo | hi], shown only when relim == "fixed".
             self.fixed_lo_edit = FluentLineEdit(str(self.config.params.get("fixed_lo", 0.0)))
@@ -1723,6 +1719,17 @@ class PanelCard(FluentGroupBox):
             spin.setToolTip(spec.tooltip)
             spin.valueChanged.connect(lambda v, k=spec.key: cb(k, int(v)))
             return spin
+        if spec.kind == "int_inf":
+            # a positive int OR infinity: the bottom value (0) shows as "∞" and stores "inf".
+            spin = FluentDoubleSpinBox(length=max(4, len(str(int(spec.hi)))), allow_minus=False)
+            spin.setDecimals(0)
+            spin.setRange(0, spec.hi)
+            spin.setSpecialValueText("∞")
+            inf = (isinstance(current, str) and current.lower() == "inf") or current in (0, float("inf"))
+            spin.setValue(0 if inf else int(current))
+            spin.setToolTip(spec.tooltip)
+            spin.valueChanged.connect(lambda v, k=spec.key: cb(k, "inf" if int(v) == 0 else int(v)))
+            return spin
         if spec.kind == "bool":
             sw = FluentSwitch("")
             sw.setChecked(bool(current))
@@ -1735,6 +1742,26 @@ class PanelCard(FluentGroupBox):
         edit.setToolTip(spec.tooltip)
         edit.editingFinished.connect(lambda k=spec.key, w=edit: cb(k, w.text().strip()))
         return edit
+
+    def _repeat_param_specs(self) -> tuple:
+        """The PLOT's repeat (update-mode) params, DECLARED once so the Setting auto-renders them
+        through the same widget path as every other param (#H3k).  ``create`` (a line per repeat) is
+        1-D only -- other kinds get the create-less mode list."""
+        from .live import REPEAT_MODES
+        modes = list(REPEAT_MODES) if self.config.kind == "1d" else [m for m in REPEAT_MODES if m != "create"]
+        return (
+            ParamSpec("repeat", "repeat", "int_inf", 1, lo=0, hi=100000,
+                      tooltip="How many repeats to keep: a positive int, or ∞ (the bottom value, 0) "
+                              "= free-run, keep the newest 10.  A camera / monitor averages its last "
+                              "N samples every frame (no lag); a scan reduces its last N sweeps."),
+            ParamSpec("repeat_mode", "repeat mode", "choice", "average", choices=tuple(modes),
+                      tooltip="How to combine the repeats for display (decoupled from the signal):\n"
+                              "  average = mean over the repeats that have data (noise reduction)\n"
+                              "  add     = sum over repeats\n"
+                              "  replace = show the latest repeat\n"
+                              "  roll    = show the newest repeat (rolling)\n"
+                              "  create  = draw EVERY repeat as its own line (1-D only)"),
+        )
 
     def _open_settings(self) -> None:
         # Click-to-open / click-again-to-close TOGGLE.  A Qt.Popup already auto-closes
@@ -1905,16 +1932,6 @@ class PanelCard(FluentGroupBox):
                 self.plotter.apply_relim_now()
         if self.canvas is not None:
             self.canvas.draw_idle()
-        self.changed.emit()
-
-    def _on_repeat_mode(self, mode: str) -> None:
-        """Persist the plot's repeat-combine mode (#3) and re-render NOW.  Changing the mode changes
-        the reduced value's SHAPE (e.g. ``new`` adds a line per repeat), so the plot must rebuild --
-        drop the plotter and replay the cached namespace so the change is visible immediately,
-        whether the producing measurement is running or stopped."""
-        self.config.params["repeat_mode"] = str(mode)
-        self._reset_plot()
-        self._rerender_last()
         self.changed.emit()
 
     def _push_fixed_lims(self) -> None:
@@ -2168,6 +2185,13 @@ class PanelCard(FluentGroupBox):
             return
         try:
             value = self._evaluate(dict(namespace))
+            # The REPEAT (update-mode) stage runs HERE, on the expression OUTPUT -- decoupled from the
+            # signal stage.  ``changed`` = a genuinely new sample of this panel's source (so a
+            # plot-side ring pushes once per real frame, not on every unrelated tick / cache replay).
+            key = self._monitor_source_key(namespace)
+            changed = key is None or key != getattr(self, "_last_repeat_key", None)
+            self._last_repeat_key = key
+            value = self._apply_repeat(value, changed)
             self._render(value, namespace)
         except Exception as exc:
             self.set_status(str(exc).splitlines()[0][:160] or type(exc).__name__, error=True)
@@ -2196,36 +2220,95 @@ class PanelCard(FluentGroupBox):
         return name
 
     def _with_signal_slots(self, namespace: Mapping[str, object]) -> dict[str, object]:
-        """Return a namespace copy with ``signal`` = the value of this panel's picked input(s):
+        """Return a namespace copy with ``signal`` = the RAW value of this panel's picked input(s):
         the scalar for one slot (so ``value = signal`` plots the picked signal), a list for many
         (so ``value = signal[0] - signal[1]`` combines them).  The slot-packing rule + the
         shot-coherence resolve hook are owned by :class:`SignalExpr`.
 
-        A measurement's RAW signal is a 3-D ``(repeat, points, dim)`` block; the panel collapses its
-        repeat axis HERE, before the expression runs, per this panel's ``repeat_mode`` -- so the
-        node only fills the raw block and the PLOT decides average / add / replace / roll / new (#3).
-        Non-3-D signals (already-reduced curves, images, scalars) pass through untouched."""
+        DECOUPLED (#H3k): ``signal`` here is ONLY the data_points-axis value -- the repeat (update
+        mode) and data-dimension handling are SEPARATE plot stages applied AFTER the expression (see
+        :meth:`_apply_repeat`), NEVER mixed in here.  So the signal expression cannot reach the
+        repeat/dim axes, and the three concerns stay orthogonal."""
         ns = dict(namespace)
-        ns["signal"] = self._reduce_repeats(self._signal_expr().signal_for(ns, resolve=self._frame_resolve))
+        ns["signal"] = self._signal_expr().signal_for(ns, resolve=self._frame_resolve)
         return ns
-
-    def _reduce_repeats(self, sig):
-        """Collapse the repeat axis of this panel's picked signal(s) per ``repeat_mode`` and remember
-        how many repeats currently hold data (drives the plot's ``xN`` ylabel).  Delegates the actual
-        reduction to the ONE owned helper ``frontend.live.reduce_repeat`` (single source)."""
-        from .live import reduce_repeat, repeats_with_data
-        mode = str(self.config.params.get("repeat_mode", "average"))
-        if isinstance(sig, (list, tuple)):
-            self._repeat_cur = max((repeats_with_data(v) for v in sig), default=1)
-            return [reduce_repeat(v, mode) for v in sig]
-        self._repeat_cur = repeats_with_data(sig)
-        return reduce_repeat(sig, mode)
 
     def _evaluate(self, namespace: dict[str, object]):
         # SECURITY: runs the panel's user-entered snippet as arbitrary Python.  Same
         # trusted-local-tool posture as the pulse GUI Scan tab.  ``signal`` is already injected
         # by _with_signal_slots; SignalExpr owns the exec + the ``value = ...`` contract.
         return self._signal_expr().exec_in(namespace)
+
+    def _apply_repeat(self, value, changed: bool):
+        """The REPEAT (update-mode) stage -- a PLOT concern, applied to the expression OUTPUT, fully
+        decoupled from the signal stage (#H3k).  Collapses the repeat axis per ``repeat_mode``:
+
+        * a SCAN publishes a measurement-side 3-D ``(repeat, points, dim)`` block -> reduce it
+          directly (the repeat axis is already there).
+        * a STREAMING signal (camera frame / scalar monitor / a 2-D image) has NO repeat axis -> the
+          PLOT keeps a rolling ring of the last ``repeat`` DISTINCT publishes and reduces THAT, so a
+          camera averages its last N frames every frame with no lag, never blocking the live update.
+
+        ``repeat`` (ring length: a positive int, or ``inf`` -> REPEAT_RING) and ``repeat_mode``
+        (average/add/replace/roll/create) are PLOT params.  Sets ``_repeat_cur`` (the ``xN`` count)."""
+        from .live import reduce_repeat, repeats_with_data, REPEAT_RING
+        mode = str(self.config.params.get("repeat_mode", "average"))
+        n = self._repeat_len()                              # ring length (int, or REPEAT_RING for inf)
+        arr = None
+        if not isinstance(value, (list, tuple)):
+            arr = np.asarray(value, dtype=float)
+        if arr is not None and arr.ndim == 3:
+            # measurement-side repeat block (a scan): reduce the existing repeat axis directly.
+            self._repeat_ring = None
+            self._repeat_cur = repeats_with_data(arr)
+            return self._record_split(reduce_repeat(arr, mode), mode)
+        if arr is not None and n > 1 and arr.ndim in (0, 1, 2):
+            # streaming value: roll a plot-side ring of the last ``n`` DISTINCT publishes, then reduce
+            # its repeat axis.  Only push on a genuinely NEW sample (version changed) so an unrelated
+            # tick does not duplicate -- the same gate the rolling monitor uses.
+            if changed or self._repeat_ring is None:
+                ring = list(self._repeat_ring or [])
+                if ring and np.shape(ring[-1]) != arr.shape:
+                    ring = []                               # shape changed (e.g. ROI resize) -> restart
+                ring.append(arr)
+                self._repeat_ring = ring[-n:]
+            block = np.stack(self._repeat_ring, axis=0)     # (k, <value shape>)
+            self._repeat_cur = block.shape[0]
+            return self._record_split(reduce_repeat(block, mode), mode)
+        # repeat == 1, or a multi-slot list, or anything else: no repeat handling, pass through.
+        self._repeat_ring = None
+        self._repeat_cur = 1
+        self._dim_cols = 1
+        self._create_repeats = 1
+        return value
+
+    def _record_split(self, reduced, mode: str):
+        """Record how the reduced curve's columns split between the DATA-DIMENSION axis (O2) and the
+        repeat-CREATE axis, so the 1-D plot can colour them differently (dim = distinct hues; create
+        = same hue faded by recency; a lone column = grey).  Returns ``reduced`` unchanged."""
+        r = np.asarray(reduced)
+        ncols = r.shape[1] if r.ndim == 2 else 1
+        if mode == "create" and r.ndim == 2:
+            self._create_repeats = max(1, int(self._repeat_cur))
+            self._dim_cols = max(1, ncols // self._create_repeats)
+        else:
+            self._create_repeats = 1
+            self._dim_cols = max(1, ncols)
+        return reduced
+
+    def _repeat_len(self) -> int:
+        """The repeat ring length from the plot param: a positive int, or REPEAT_RING when ``inf``."""
+        from .live import REPEAT_RING
+        rv = self.config.params.get("repeat", 1)
+        if isinstance(rv, str) and rv.strip().lower() == "inf":
+            return REPEAT_RING
+        try:
+            v = float(rv)
+        except (TypeError, ValueError):
+            return 1
+        if v == 0 or not np.isfinite(v):
+            return REPEAT_RING
+        return max(1, int(v))
 
     def _coerce(self, value):
         kind = self.config.kind
@@ -2238,8 +2321,8 @@ class PanelCard(FluentGroupBox):
             if self.config.params.get("xy") and arr.ndim == 2 and arr.shape[1] == 2 and arr.shape[0] >= 1:
                 return arr
             # A reduced scan curve is ``(points, dim)`` -- KEEP the 2-D shape so the dimension axis
-            # (O2) draws as multiple lines, and so ``repeat_mode='new'`` (one column per repeat)
-            # shows one line per repeat.  Live1D draws each column of data_y as its own line (#3).
+            # (O2) draws as multiple lines, and so ``repeat_mode='create'`` (one column per repeat)
+            # shows one line per repeat.  Live1D draws each column of data_y as its own line (#H3k).
             if arr.ndim == 2 and arr.shape[0] >= 1:
                 return arr
             flat = arr.reshape(-1)
@@ -2374,8 +2457,11 @@ class PanelCard(FluentGroupBox):
             self.plotter.update(np.asarray(value)[:, 1], draw=False)
         elif kind == "1d":
             # a reduced scan curve refreshed in place: push the (points, ncols) y AND the current
-            # repeat count so the "xN" ylabel tracks how many repeats have data (#3).
+            # repeat count so the "xN" ylabel tracks how many repeats have data.
             self.plotter.update(value, repeat_cur=int(getattr(self, "_repeat_cur", 1)), draw=False)
+            if hasattr(self.plotter, "style_repeat"):       # re-colour: create-repeat count can grow
+                self.plotter.style_repeat(int(getattr(self, "_dim_cols", 1)),
+                                          int(getattr(self, "_create_repeats", 1)))
         else:  # hist / 1d-vector
             self.plotter.update(value, draw=False)
         if self.canvas is not None:
@@ -2515,10 +2601,14 @@ class PanelCard(FluentGroupBox):
                 relim_mode=str(self.config.params.get("relim", "tight")),
                 **self._fixed_lim_kwargs(),
                 title=self.config.title or None)
-            # The plot shows the repeat count as a "xN" ylabel suffix (#3: ylabel tracks the current
-            # repeat); the panel computed it while reducing the raw block in _reduce_repeats.  Apply
-            # it NOW (an in-place update with the same data) so the "xN" shows on the first build too
-            # -- not only after the next live tick (matters for a stopped / mode-switched panel).
+            # Colour the columns by their meaning (#H3k): data-dimension lines = distinct hues,
+            # create-repeat lines = same hue faded by recency, a lone line = grey (the original look).
+            if hasattr(self.plotter, "style_repeat"):
+                self.plotter.style_repeat(int(getattr(self, "_dim_cols", 1)),
+                                          int(getattr(self, "_create_repeats", 1)))
+            # The plot shows the repeat count as a "xN" ylabel suffix (the panel computed it while
+            # reducing in _apply_repeat).  Apply it NOW (an in-place update with the same data) so the
+            # "xN" shows on the first build too -- not only after the next live tick.
             rc = int(getattr(self, "_repeat_cur", 1))
             self.plotter.repeat_cur = rc
             if rc != 1:
@@ -4130,51 +4220,29 @@ class LogicNodeEditor(QtWidgets.QWidget):
         self.form.start_requested.connect(lambda *_: self.console._start_logic_node(self.row))
         self.form.stop_requested.connect(lambda: self.console._stop_logic_node(self.row))
         col.addWidget(self.form)
-        # ---- Repeat + Update mode (confocal's "Repeat:" + "Update mode:"): repeat is a property of
-        # EVERY measurement (a scan re-runs the whole sweep; a continuous camera repeats=averages N
-        # frames), combined by the Update mode.  So these controls appear for ANY measurement-layer
-        # node (kind "measurement" OR "camera") -- NOT processors / tasks (which don't re-acquire).
-        # The valid modes come from the node type (the confocal per-measurement ``update_mode_valid``).
+        # ---- Repeat (a SCAN-only acquisition knob, #H3k): how many times to re-run the whole sweep
+        # -- a positive int, or ∞ (free-run).  HOW the repeats are DISPLAYED (average / add / replace
+        # / roll / create) is the PLOT's "repeat mode" Setting, NOT here -- the measurement only FILLS
+        # the raw block.  A CAMERA has NO repeat here: its repeat (averaging the last N frames) is the
+        # PLOT's repeat ring, so a camera never combines / suppresses frames at the measurement (that
+        # was the lag) -- it just publishes every frame and the plot reduces.  There is NO "update
+        # mode" on any measurement (it moved to the plot, fully decoupled).
         self._repeat_spin = None
-        self._update_mode_combo = None
-        if row.node.kind in ("measurement", "camera"):
-            from ..neutral_atom.operations.logic import CameraMeasurement
-            is_cam = row.node.kind == "camera"
+        if row.node.kind == "measurement":
             col.addWidget(FluentSectionLabel("Acquisition"))
-            lw = setting_label_width(["Update mode"], minimum=getattr(self.form, "_form_label_w", 72))
+            lw = setting_label_width(["Repeat"], minimum=getattr(self.form, "_form_label_w", 72))
             spin = FluentDoubleSpinBox(length=6, allow_minus=False)
             spin.setDecimals(0)
-            if is_cam:
-                # A camera AVERAGES this many frames per published frame (its own Update mode).
-                spin.setRange(1, 100000)
-                spin.setValue(int(row.node.values.get("repeat", 1) or 1))
-                spin.setToolTip("Average this many camera frames per published frame, combined by the "
-                                "Update mode below.")
-            else:
-                # A scan RE-RUNS the whole sweep ``repeat`` times -- a positive int, or 0 = the special
-                # "infinity" value = free-run (keep the newest REPEAT_RING passes).  HOW the repeats
-                # are displayed (average / add / replace / roll / new) is the PLOT's Repeat-mode
-                # Setting, NOT here -- the measurement only FILLS the raw block (#3).
-                spin.setRange(0, 100000)
-                spin.setSpecialValueText("∞")            # 0 -> "inf" (free-run)
-                rv = row.node.values.get("repeat", 1)
-                inf = (isinstance(rv, str) and rv.lower() == "inf") or rv == 0 or rv == float("inf")
-                spin.setValue(0 if inf else int(rv or 1))
-                spin.setToolTip("Re-run the whole sweep this many times.  ∞ (the bottom value) = "
-                                "free-run: keep the newest 10 passes.  How the repeats are combined "
-                                "for display is the plot's 'Repeat mode' Setting.")
+            spin.setRange(0, 100000)
+            spin.setSpecialValueText("∞")                # 0 -> "inf" (free-run)
+            rv = row.node.values.get("repeat", 1)
+            inf = (isinstance(rv, str) and rv.lower() == "inf") or rv == 0 or rv == float("inf")
+            spin.setValue(0 if inf else int(rv or 1))
+            spin.setToolTip("Re-run the whole sweep this many times.  ∞ (the bottom value, 0) = "
+                            "free-run: keep the newest 10 sweeps.  How the repeats are combined for "
+                            "display is the plot panel's 'repeat mode' Setting.")
             self._repeat_spin = spin
             col.addWidget(FluentSettingRow("Repeat", spin, label_width=lw))
-            if is_cam:                                        # only the camera combines AT the measurement
-                combo = FluentComboBox()
-                combo.addItems(list(CameraMeasurement.REPEAT_MODES))
-                default_mode = CameraMeasurement.REPEAT_MODES[0]
-                mode0 = str(row.node.values.get("update_mode", default_mode) or default_mode)
-                combo.setCurrentText(mode0 if mode0 in CameraMeasurement.REPEAT_MODES else default_mode)
-                combo.setToolTip("How to combine the averaged frames: 'average' = mean (noise "
-                                 "reduction), 'replace' = keep the latest, 'roll' = live scrolling.")
-                self._update_mode_combo = combo
-                col.addWidget(FluentSettingRow("Update mode", combo, label_width=lw))
         # (The node's published-signals + shapes are shown on its Logic-tab ROW card,
         # the single place for that legend -- not duplicated here.)
         col.addStretch(1)
@@ -4183,10 +4251,7 @@ class LogicNodeEditor(QtWidgets.QWidget):
         vals = self.form.collect_values()
         if self._repeat_spin is not None:
             rv = int(self._repeat_spin.value())
-            # a scan's spin allows 0 = the "∞" special value (free-run); serialise it as "inf".
-            vals["repeat"] = "inf" if (self._repeat_spin.minimum() == 0 and rv == 0) else rv
-        if self._update_mode_combo is not None:
-            vals["update_mode"] = self._update_mode_combo.currentText()
+            vals["repeat"] = "inf" if rv == 0 else rv    # 0 = the "∞" special value (free-run)
         return vals
 
     def set_running(self, running: bool) -> None:
@@ -5300,17 +5365,14 @@ class TaskConsole(QtWidgets.QWidget):
             spec = self._spec_for_logic(node)
             if spec is None:
                 raise RuntimeError("no session camera available")
-            # Same build path as the notebook: readout.camera_spec().build(hub, ...).
-            repeat = int(values.pop("repeat", 1) or 1)
-            update_mode = str(values.pop("update_mode", "roll") or "roll")
-            cam = spec.build(self.hub, **values)
-            # A camera is a Measurement too (#H3i): repeat = average N frames per published frame.
-            # "average" routes to the base per-shot batch-mean ('repeat' mode over `repeat` frames);
-            # "roll"/"replace" pass through.  Set on the node (base reads it in _postprocess); start()
-            # resets the accumulator so this is safe to set before the first run.
-            cam.repeats = max(1, repeat)
-            cam.update_mode = cam._coerce_update_mode("repeat" if update_mode == "average" else update_mode)
-            return cam
+            # Same build path as the notebook: readout.camera_spec().build(hub, ...).  A camera does
+            # NOT average / repeat at the measurement (#H3k) -- that was the lag (it suppressed frames
+            # until N accumulated).  It publishes EVERY frame; a plot panel that wants to average the
+            # last N frames keeps its own ring (the plot's repeat / repeat_mode), so the live image
+            # never stutters.  So no repeat / update_mode is consumed here.
+            values.pop("repeat", None)
+            values.pop("update_mode", None)
+            return spec.build(self.hub, **values)
         spec = self._spec_for_logic(node)
         if spec is None:
             raise RuntimeError(f"no catalog spec named {node.name!r} for a {kind} node")

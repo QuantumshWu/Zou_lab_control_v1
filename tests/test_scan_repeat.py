@@ -93,11 +93,11 @@ def test_reduce_repeat_modes_collapse_the_repeat_axis():
     assert np.allclose(reduce_repeat(raw, "add")[:, 0], [3.0, 5.0, 7.0])
     assert np.allclose(reduce_repeat(raw, "replace")[:, 0], [3.0, 4.0, 5.0])
     assert np.allclose(reduce_repeat(raw, "roll")[:, 0], [3.0, 4.0, 5.0])
-    # 'new' keeps every repeat as its own column -> one line per repeat (1-D)
-    new = reduce_repeat(raw, "new")
-    assert new.shape == (3, 2) and np.allclose(new, [[0, 3], [1, 4], [2, 5]])
+    # 'create' keeps every repeat as its own column -> one line per repeat (1-D)
+    created = reduce_repeat(raw, "create")
+    assert created.shape == (3, 2) and np.allclose(created, [[0, 3], [1, 4], [2, 5]])
     assert repeats_with_data(raw) == 2
-    assert set(REPEAT_MODES) == {"average", "add", "replace", "roll", "new"}
+    assert set(REPEAT_MODES) == {"average", "add", "replace", "roll", "create"}
 
 
 def test_reduce_repeat_average_ignores_not_yet_measured_repeats():
@@ -143,10 +143,12 @@ def test_occupancy_advertises_rate_grid_only_with_a_grid():
     assert any(s.name == "g_rate_grid" for s in gridded.output_specs())
 
 
-def test_measurement_edit_exposes_repeat_no_combine_camera_has_both(monkeypatch):
-    """A SCAN measurement's Edit shows ``Repeat`` (with an ∞ free-run special value) but NOT a
-    combine combo -- the combine moved to the plot's ``repeat mode`` Setting (#3).  A CAMERA (also a
-    measurement) keeps Repeat + Update mode (it averages frames).  A processor has neither."""
+def test_scan_edit_has_repeat_no_combine_camera_and_processor_have_neither(monkeypatch):
+    """A SCAN measurement's Edit shows ``Repeat`` (sweep count, with an ∞ free-run special value) and
+    NOTHING else acquisition-wise -- no ``update mode`` (that moved to the plot's ``repeat mode``,
+    #H3k).  A CAMERA has NO repeat in its Edit either: its repeat (averaging the last N frames) is the
+    PLOT's repeat ring, so the camera never combines/suppresses frames (no lag).  A processor has
+    neither."""
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from PyQt5 import QtWidgets
@@ -160,19 +162,17 @@ def test_measurement_edit_exposes_repeat_no_combine_camera_has_both(monkeypatch)
         console._edit_logic_node(row)
         ed = console._logic_editors[id(row)]
         assert ed._repeat_spin is not None
-        assert ed._update_mode_combo is None             # the combine selector is the PLOT's, not here
+        assert not hasattr(ed, "_update_mode_combo")     # the combine selector is the PLOT's, not here
         assert ed._repeat_spin.minimum() == 0            # 0 = the "∞" special value (free-run)
         ed._repeat_spin.setValue(5)
         assert int(ed.collect_values()["repeat"]) == 5
         ed._repeat_spin.setValue(0)
         assert ed.collect_values()["repeat"] == "inf"    # 0 serialises as the free-run sentinel
 
+        # a CAMERA has NO repeat in its Edit -- repeat is the plot ring, so frames never get suppressed
         crow = console._add_logic_node(LogicNodeConfig(kind="camera", name="Camera"))
         console._edit_logic_node(crow)
-        ced = console._logic_editors[id(crow)]
-        assert ced._repeat_spin is not None and ced._update_mode_combo is not None
-        cam_modes = [ced._update_mode_combo.itemText(i) for i in range(ced._update_mode_combo.count())]
-        assert "roll" in cam_modes and "add" not in cam_modes
+        assert console._logic_editors[id(crow)]._repeat_spin is None
 
         prow = console._add_logic_node(LogicNodeConfig(kind="processor", name="Judge occupancy"))
         console._edit_logic_node(prow)
@@ -181,10 +181,11 @@ def test_measurement_edit_exposes_repeat_no_combine_camera_has_both(monkeypatch)
         console.shutdown()
 
 
-def test_plot_setting_has_a_repeat_mode_combo_that_reduces_the_block(monkeypatch):
-    """A plot panel's Setting offers a ``repeat mode`` combo (the PLOT owns the reduction, decoupled
-    from the node); switching it re-renders.  A 1-D panel offers all modes incl. ``new``; a 2-D panel
-    offers all but ``new``."""
+def test_plot_setting_has_auto_injected_repeat_params_decoupled_from_the_node(monkeypatch):
+    """The PLOT's repeat params (``repeat`` + ``repeat mode``) are AUTO-GENERATED from declarations
+    (the SAME _make_param_widget path as every other param -- not hand-placed), live ONLY on the plot
+    Setting (decoupled from the node), and edits route through _set_param.  ``repeat`` allows ∞; a
+    1-D panel offers ``create`` (a line per repeat), a 2-D panel does not."""
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from PyQt5 import QtWidgets
@@ -196,16 +197,24 @@ def test_plot_setting_has_a_repeat_mode_combo_that_reduces_the_block(monkeypatch
         card.config.role = "plot"
         card.config.kind = "1d"
         card._build_settings()
-        assert getattr(card, "repeat_mode_combo", None) is not None
-        modes = [card.repeat_mode_combo.itemText(i) for i in range(card.repeat_mode_combo.count())]
-        assert "average" in modes and "new" in modes          # 1-D offers 'new'
-        card._on_repeat_mode("add")
-        assert card.config.params["repeat_mode"] == "add"     # persisted on the PLOT, not the node
+        # both repeat params were auto-rendered into param_widgets (declarative, not hand-coded).
+        assert "repeat" in card.param_widgets and "repeat_mode" in card.param_widgets
+        combo = card.param_widgets["repeat_mode"]
+        modes = [combo.itemText(i) for i in range(combo.count())]
+        assert "average" in modes and "create" in modes        # 1-D offers 'create'
+        # repeat allows ∞ (the spin's special value at 0)
+        assert card.param_widgets["repeat"].specialValueText() == "∞"
+        # editing routes through _set_param -> persisted on the PLOT (config.params), not the node
+        card._set_param("repeat_mode", "add")
+        assert card.config.params["repeat_mode"] == "add"
+        card._set_param("repeat", "inf")
+        assert card.config.params["repeat"] == "inf"
 
         card.config.kind = "2d"
         card._build_settings()
-        modes2 = [card.repeat_mode_combo.itemText(i) for i in range(card.repeat_mode_combo.count())]
-        assert "average" in modes2 and "new" not in modes2    # 2-D: no per-repeat lines
+        combo2 = card.param_widgets["repeat_mode"]
+        modes2 = [combo2.itemText(i) for i in range(combo2.count())]
+        assert "average" in modes2 and "create" not in modes2  # 2-D: no per-repeat lines
     finally:
         console.shutdown()
 
