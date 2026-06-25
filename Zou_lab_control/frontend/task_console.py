@@ -1660,6 +1660,10 @@ class PanelCard(FluentGroupBox):
         sec.addLayout(action_row)
 
         self.settings_popup = popup
+        # Setting-frame height high-water mark (#H3i-2): the popup GROWS to fit its content and
+        # GROWS when the panel size grows, but NEVER shrinks back within a session.  Reset here so a
+        # REBUILT popup (its content changed, e.g. a +/- signal slot) fits fresh, then grows again.
+        self._settings_h_hwm = 0
         # A Qt.Popup auto-closes on the press that lands on the Setting button; record
         # WHEN so the button's release does not immediately re-open it (real toggle).
         self._settings_dismissed_at = 0.0
@@ -1721,30 +1725,41 @@ class PanelCard(FluentGroupBox):
         self._refresh_signal_combo()
         anchor = self.setting_button.mapToGlobal(
             QtCore.QPoint(self.setting_button.width(), self.setting_button.height()))
-        popup.adjustSize()
-        # The popup opens just BELOW the gear (near the panel's TOP).  Cap its height so its BOTTOM
-        # never passes the panel's OWN bottom edge -- i.e. cap = (panel bottom) - (popup top), NOT
-        # the full panel height (capping to the height while anchored below the gear would push the
-        # popup a gear-height PAST the panel bottom, which is the overflow the user saw).  So a tall
-        # panel gets a tall popup, a short panel a short one, and either way it stays within the
-        # panel's frame; the FluentScrollArea scrolls the overflow VERTICALLY (never horizontally).
+        self._size_settings_popup()                        # height: show-all, grow-not-shrink (#H3i-2)
         screen = QtWidgets.QApplication.primaryScreen()
         avail = screen.availableGeometry() if screen is not None else None
         top_y = anchor.y() + scaled_px(2)
-        panel_bottom = self.mapToGlobal(QtCore.QPoint(0, self.height())).y()
-        cap = max(scaled_px(140), panel_bottom - top_y)   # fit between popup top and panel bottom
+        x = anchor.x() - popup.width()
         if avail is not None:
-            cap = min(cap, avail.bottom() - top_y)         # never run off the screen either
-        w = popup.width()
-        h = min(popup.height(), cap)
-        popup.setMaximumHeight(cap)
-        popup.resize(w, h)
-        x = anchor.x() - w
-        if avail is not None:
-            x = max(avail.left(), min(x, avail.right() - w))
+            x = max(avail.left(), min(x, avail.right() - popup.width()))
         popup.move(x, top_y)
         popup.show()
         popup.raise_()
+
+    def _size_settings_popup(self) -> None:
+        """Size the Setting frame to SHOW ALL its content by default; only when the content exceeds
+        the bound does the FluentScrollArea scroll it.  GROW immediately (e.g. when the panel size
+        grows) but NEVER shrink within a session -- a high-water mark, so enlarging then shrinking
+        the panel leaves the frame at its tallest (#H3i-2).  (Reset in _build_settings when the
+        popup is rebuilt with different content.)"""
+        popup = getattr(self, "settings_popup", None)
+        if popup is None:
+            return
+        popup.adjustSize()
+        screen = QtWidgets.QApplication.primaryScreen()
+        avail = screen.availableGeometry() if screen is not None else None
+        anchor_y = self.setting_button.mapToGlobal(QtCore.QPoint(0, self.setting_button.height())).y()
+        top_y = anchor_y + scaled_px(2)
+        content = self._settings_scroll.widget()
+        content_h = (content.sizeHint().height() if content is not None else popup.height()) + 2 * scaled_px(10)
+        bound = (avail.height() - scaled_px(40)) if avail is not None else scaled_px(900)
+        want = min(content_h, bound)                       # default = the WHOLE content (no early scroll)
+        self._settings_h_hwm = max(int(self._settings_h_hwm), int(want))   # grow, never shrink
+        h = self._settings_h_hwm
+        if avail is not None:                              # screen physics: never run off the bottom
+            h = min(h, avail.bottom() - top_y)
+        popup.setMaximumHeight(int(bound))                 # content beyond the bound scrolls
+        popup.resize(popup.width(), max(scaled_px(140), int(h)))
 
     def _fill_slot_combo(self, combo, current: str) -> None:
         """Populate ONE slot combobox with ``(none)`` + every live hub signal GROUPED by its
@@ -2030,6 +2045,10 @@ class PanelCard(FluentGroupBox):
         self.config.size = str(size)
         self._reset_plot()
         self._apply_fixed_size()
+        # If the Setting frame is open, GROW it immediately to match the new (taller) panel -- but
+        # the high-water mark means a SMALLER size never snaps it shorter (#H3i-2).
+        if getattr(self, "settings_popup", None) is not None and self.settings_popup.isVisible():
+            self._size_settings_popup()
         self._rerender_last()   # re-draw at the new size NOW, even if the source is stopped (else the
                                 # torn-down panel stays blank until the next hub tick -- same as _set_param)
         self.changed.emit()
