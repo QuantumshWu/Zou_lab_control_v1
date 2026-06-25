@@ -1261,15 +1261,20 @@ idles the (adjustable) `extra_delay` between points (`VirtualSequencer`/`Runtime
 by `sleep_scale` like `wait_done`; the wait is cooperatively cancellable on Stop). Guarded by
 `test_pulse_param_scan.py` (api-only sweep drives each point; settle is called once per point).
 
-### Scan-level Repeat (the confocal model)
-A finite scan can be re-run `repeat` times, averaging each x point across the passes — `repeat=1` is
-a single pass. `ScannedMeasurementNode` and `PulseScanNode` both take `repeat=int` and accumulate a
-per-point running sum/count, publishing the running MEAN; they self-stop only after the last point of
-the LAST pass (`finished == _repeat_cur > repeat`); `points_done`/`total_points` span all passes. The
-task console's measurement Edit exposes it as an **Acquisition → Repeat** spinbox (a continuous camera
-/ reactive processor / one-shot task does not re-run a finite sweep, so the control is
-measurement-only); `_build_logic_node` pops `repeat` and hands it to the node. Guarded by
-`test_scan_repeat.py`.
+### Scan-level Repeat + Repeat mode (the confocal model)
+A finite scan can be re-run `repeat` times (`repeat=1` is a single pass), and `repeat_mode` (the
+confocal "Update mode" combine selector, `REPEAT_COMBINE_MODES = ('average','add','replace')`) says
+how to combine each x point's passes: `average` (mean, default — noise reduction) / `add` (sum) /
+`replace` (latest pass). `ScannedMeasurementNode` and `PulseScanNode` both take `repeat` +
+`repeat_mode`, keep a per-point running sum/count, and publish per the mode; they self-stop only
+after the last point of the LAST pass (`finished == _repeat_cur > repeat`); `points_done` /
+`total_points` span all passes. **`repeat_mode` is deliberately SEPARATE from the base
+`Measurement.update_mode`** (which `_postprocess` consumes PER SHOT, default `roll` = pass-through):
+reusing `update_mode` made the base double-average the published curve. The task console's
+measurement Edit exposes an **Acquisition** section with **Repeat** (spinbox) + **Repeat mode**
+(combobox); a continuous camera / reactive processor / one-shot task does not re-run a finite sweep,
+so the controls are measurement-only. `_build_logic_node` pops both and hands them to the node.
+Guarded by `test_scan_repeat.py`.
 
 ### One source MECHANISM everywhere; per-kind only the slot-count + the value SIZE
 The signal-picker + `value = ...` expression box (the `SignalExpr` mechanism) is on EVERY source
