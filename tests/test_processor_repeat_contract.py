@@ -10,9 +10,11 @@ NOT add a third.  Its relationship to the repeat axis is a STATIC class fact, ``
   * ``"preserve"`` -- maps each repeat slice 1:1 and emits a >=3-D block (axis 0 = repeat), so the SAME
     plot ``reduce_repeat`` machinery collapses it.
 
-This test mechanically forbids (a) an undeclared/invalid contract, (b) a 'reduce' processor leaking a
-repeat axis, and (c) ``repeat_contract`` ever becoming a constructor arg (which would auto-render it as
-a form field -- a user knob).  It encodes the panel's verdict that OccupancyProcessor stays per-shot.
+This test mechanically forbids (a) an undeclared/invalid contract and (b) ``repeat_contract`` ever
+becoming a constructor arg (which would auto-render it as a form field -- a user knob).  It also pins
+OccupancyProcessor as the canonical 'preserve' processor: it judges every repeat slice so the repeat
+axis flows THROUGH the node (#H3q), and ``repeat_mode=average`` over ``occupied`` is the per-site
+loading probability -- one mechanism, no in-node accumulator.
 """
 
 import inspect
@@ -65,12 +67,14 @@ def test_repeat_contract_is_never_a_constructor_arg():
             f"{cls.__name__}.__init__ must not accept repeat_contract (it would become a user knob)")
 
 
-def test_occupancy_is_reduce_and_publishes_no_repeat_axis():
-    """A 'reduce' processor fed the camera's ``(repeat,1,H,W)`` block emits ONLY signals with no
-    repeat axis (per-site vectors (N,), a single judged (H,W) frame, scalars).  This is why the
-    per-site loading PROBABILITY is the processor's cumulative ``rate_sites`` -- not a plot knob on a
-    (repeat, n_sites) block, which the plot's collapse machinery silently skips."""
-    assert OccupancyProcessor.repeat_contract == "reduce"
+def test_occupancy_is_preserve_and_the_repeat_axis_flows_through():
+    """A 'preserve' processor fed the camera's ``(repeat,1,H,W)`` block judges EVERY slice and emits
+    the per-shot signals as ``(repeat, 1, n_sites)`` blocks (#H3q): the repeat axis flows THROUGH the
+    node, so ``repeat_mode=average`` over ``occupied`` recovers every site (the per-site loading
+    PROBABILITY) -- ONE mechanism, not an in-node accumulator.  Static geometry (centers/thresholds)
+    and the scalar ``rate`` carry NO repeat axis."""
+    from Zou_lab_control.frontend.live import reduce_repeat
+    assert OccupancyProcessor.repeat_contract == "preserve"
 
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4)})
     exp.readout.sitemap(frames=4, display=False)
@@ -85,9 +89,19 @@ def test_occupancy_is_reduce_and_publishes_no_repeat_axis():
         for _ in range(6):
             cam.step()
             det.step()
-        assert np.asarray(hub.latest("frame")).ndim == 4   # the camera DOES publish a (repeat,1,H,W) block
-        for key in det.published_signals():
-            value = np.asarray(hub.latest(key))
-            assert value.ndim < 3, f"reduce processor leaked a repeat axis on {key!r}: shape {value.shape}"
+        occupied = np.asarray(hub.latest("occupied"))
+        n_sites = occupied.shape[-1]
+        # the per-shot signals carry the repeat axis (axis 0 == camera's repeat), the contract block
+        for key in ("occupied", "counts"):
+            blk = np.asarray(hub.latest(key))
+            assert blk.ndim == 3 and blk.shape == (5, 1, n_sites), f"{key} shape {blk.shape}"
+        assert np.asarray(hub.latest("frame_judged")).ndim == 4    # (repeat, 1, H, W)
+        # static / scalar outputs do NOT gain a repeat axis
+        assert np.asarray(hub.latest("centers")).ndim == 2         # (N, 2)
+        assert np.asarray(hub.latest("thresholds")).ndim == 1      # (N,)
+        assert np.ndim(hub.latest("rate")) == 0                    # scalar loading fraction
+        # repeat_mode=average collapses the block to the per-site loading probability
+        prob = np.squeeze(reduce_repeat(occupied, "average"))
+        assert prob.shape == (n_sites,) and np.all((prob >= 0) & (prob <= 1))
     finally:
         exp.close()

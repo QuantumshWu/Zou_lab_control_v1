@@ -142,8 +142,8 @@ pulse_gui.bat --no-sequencer --state .\pulses\camera_imaging_address_switch.json
 The **task console** (`task_console.bat`) is the experiment-side dashboard: a
 configurable grid of live panels (2D image with side distribution and draggable
 clim, rolling trace, bimodal-fit histogram, 1D vector), each wired to named
-experiment signals through a small Python expression (`value = rate_grid -
-b_rate_grid`).  It opens empty: from **Add Panel** you assemble the logic nodes
+experiment signals through a small Python expression (`value = occupied -
+b_occupied`).  It opens empty: from **Add Panel** you assemble the logic nodes
 (a camera Measurement publishing `frame`, a Judge-occupancy Processor turning it
 into occupancy / loading-rate signals) and plot panels reading those signals.
 A real experiment is the same graph publishing into a `SignalHub` from a real

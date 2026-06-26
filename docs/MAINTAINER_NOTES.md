@@ -1348,25 +1348,32 @@ The three axes (repeat = block axis 0 / points = middle / data = trailing) are o
 
 **A processor has NO user-facing mode.** A `Processor` is a pure typed transform; its relationship to
 the repeat axis is a STATIC class attribute `repeat_contract`, NEVER a runtime knob or form field:
-* `"reduce"` (default) — emits derived signals with NO repeat axis (a per-shot judgement, or a
-  statistic over a shot set). Nothing is left for the plot to collapse, so it can't collide with
-  `repeat_mode`. **`OccupancyProcessor` is `reduce`**: it judges the newest data-bearing slice of the
-  camera block PER-SHOT and emits 1-D per-site vectors + cumulative `rate`/`rate_sites`. It must NOT
-  be made repeat-preserving — `occupied` as `(repeat, n_sites)` is 2-D, which the plot's collapse
-  (`reduce_repeat`/`_signal_then_repeat`/`_eval_signal_per_slice`, all gate on `ndim>=3`) silently
-  skips and `_coerce` for `kind='sites'` flattens into `repeat*n_sites` bogus rings.
-* `"preserve"` — maps each repeat slice 1:1 and emits a `>=3-D` block so the SAME `reduce_repeat`
-  machinery applies (a future per-slice image filter; no console instance yet).
+* `"preserve"` — maps each repeat slice 1:1 and emits a `>=3-D` block whose axis 0 IS the repeat, so
+  the SAME plot `reduce_repeat` machinery collapses it. **`OccupancyProcessor` is `preserve`** (#H3q):
+  the repeat axis flows THROUGH it — fed the camera's `(repeat,1,H,W)` block it judges EVERY slice and
+  publishes `occupied`/`counts` as `(repeat,1,n_sites)` blocks (the uniform `(repeat,*points,*data)`
+  contract, points_shape=(1,), data_shape=(n_sites,)) and `frame_judged` as `(repeat,1,H,W)`.
+  (Earlier H3p wrongly made it `reduce` on a `(repeat,n_sites)` 2-D strawman; the contract-correct
+  shape is the 3-D `(repeat,1,n_sites)` block, which every gate accepts.)
+* `"reduce"` (the base default) — emits a result with NO repeat axis (a statistic over a shot set, e.g.
+  a `FidelityProcessor`). Nothing is left for the plot to collapse, so it can't collide with `repeat_mode`.
 
-So the everyday quantities all come out without a third knob: **S1** averaged site-map image = a
-`frame` panel with `repeat_mode='average'` (camera block mean, recovers all sites); **S2** per-site
-loading PROBABILITY = the processor's cumulative `rate_sites` (NOT a plot dropdown on occupancy);
-**S3** loading-rate-vs-time = the scalar `rate` on a rolling panel; **S4** readout fidelity = a
-`reduce` operation (`readout_fidelity` spec) over a shot set. Deleted: the dead third system
-`Measurement.UPDATE_MODES` / `_postprocess` / `update_mode` / `repeats` / `_accum` (the base
-accumulate-then-emit that violated the block contract; every concrete node already bypassed it).
-Guarded by `test_processor_repeat_contract.py` (every processor declares a valid contract, never as a
-ctor arg; a `reduce` processor never leaks a repeat axis), `test_scan_repeat.py`,
+So the everyday quantities all come out without a third knob, via ONE mechanism (plot `repeat_mode` over
+the block): **S1** averaged site-map image = a `frame` panel `repeat_mode='average'`; **S2** per-site
+loading PROBABILITY = a `sites`/`2d` panel bound to `occupied` with `repeat_mode='average'` (averaging
+the camera's `repeat` shots recovers every site — the user sets how many via `repeat`); **S3**
+loading-rate-vs-time = the processor's scalar `rate` (this block's loading fraction) on a rolling panel;
+**S4** readout fidelity = a `reduce` operation (`readout_fidelity` spec) over a shot set. `OccupancyProcessor`
+keeps ONLY the scalar `rate` (no good substitute as a pulse-scan's default y); the cumulative
+`rate_sites`/`rate_grid`/`_occ_sum` accumulators are **deleted** — they duplicated `repeat_mode=average`.
+The `counts` histogram flattens the WHOLE block (every repeat × site sample), never averaged
+(`_signal_then_repeat` skips the reduce for `kind=='hist'`); a `create`-mode sites panel collapses back
+to one value/site (`_coerce`). The site-map underlay reduces `frame_judged` (`'replace'`) to one coherent
+`(H,W)` shot (`_sites_aux`). Also deleted: the dead third system `Measurement.UPDATE_MODES` /
+`_postprocess` / `update_mode` / `repeats` / `_accum` (the base accumulate-then-emit that violated the
+block contract; every concrete node already bypassed it). Guarded by `test_processor_repeat_contract.py`
+(every processor declares a valid contract, never as a ctor arg; OccupancyProcessor is the canonical
+`preserve` and `repeat_mode=average` over `occupied` recovers the per-site probability), `test_scan_repeat.py`,
 `test_measurement_output_contract.py`, `test_panel_reshape_orthogonal.py`.
 
 **DECOUPLING (#H3o).** A panel reads EXACTLY the signal it is bound to — there is NO frame-coherence

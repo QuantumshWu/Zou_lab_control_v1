@@ -24,7 +24,7 @@ signals of a :class:`~Zou_lab_control.neutral_atom.core.signals.SignalHub`
 (the same trusted-local-code posture as the pulse GUI's Scan tab):
 
     value = frame                       # show the latest camera frame
-    value = rate_grid - b_rate_grid     # arbitrary math across signals
+    value = occupied - b_occupied       # arbitrary math across signals (two detectors)
     value = history('counts', 200).ravel()
 
 Layouts (plot panels + logic nodes + positions + sizes + expressions + params)
@@ -2199,7 +2199,9 @@ class PanelCard(FluentGroupBox):
             b = b[:, :, None]
         if had_repeat and b.ndim >= 3:                           # a repeat block (axis 0 = repeat):
             self._repeat_cur = repeats_with_data(b)               # scan (repeat,pts,dim) or camera (repeat,1,H,W)
-            return reduce_repeat(b, mode)                         # collapse the repeat axis per the mode
+            if self.config.kind == "hist":
+                return b                                          # a histogram wants ALL samples (every
+            return reduce_repeat(b, mode)                         # repeat × datum) -> _coerce flattens the block
         self._repeat_cur = 1                                      # no repeat axis -> nothing to reduce
         return b
 
@@ -2327,8 +2329,15 @@ class PanelCard(FluentGroupBox):
         flat = arr.reshape(-1)
         if flat.size < 1:
             raise ValueError("panel value is empty")
-        if kind == "sites" and flat.size > 4096:
-            raise ValueError(f"site-map panel needs one value per site (got {flat.size} values)")
+        if kind == "sites":
+            # A site map has ONE value per site.  A repeat block bound here arrives post-reduce as
+            # (1, n_sites) -> n_sites (fine), but ``create`` mode concatenates the repeats ->
+            # (repeat*n_sites,); collapse that back to one value/site (mean over repeats) using the
+            # node's declared data_shape, so a 'create' sites panel still draws exactly n_sites rings.
+            if len(ds) == 1 and int(ds[0]) > 0 and flat.size != int(ds[0]) and flat.size % int(ds[0]) == 0:
+                flat = np.nanmean(flat.reshape(-1, int(ds[0])), axis=0)
+            if flat.size > 4096:
+                raise ValueError(f"site-map panel needs one value per site (got {flat.size} values)")
         return flat
 
     def _sites_aux(self, namespace: Mapping[str, object]):
@@ -2354,7 +2363,12 @@ class PanelCard(FluentGroupBox):
         if centers.ndim != 2 or centers.shape[1] < 2:
             raise ValueError(f"centres signal must have shape (N, 2); got {centers.shape}")
         image = namespace.get(image_name) if image_name else None
-        return centers[:, :2], (None if image is None else np.asarray(image, dtype=float))
+        if image is not None:
+            image = np.asarray(image, dtype=float)
+            if image.ndim >= 3:        # a (repeat,1,H,W) frame_judged block -> ONE coherent (H,W) underlay
+                from .live import reduce_repeat
+                image = np.squeeze(reduce_repeat(image, "replace"))   # the latest filled shot (not a blur)
+        return centers[:, :2], image
 
     def _co_names(self) -> frozenset:
         """The hub-signal names this panel reads (cached) -- for the monitor roll-gate

@@ -1522,13 +1522,13 @@ def test_task_console_signal_picker_and_declarative_params(monkeypatch):
         return False
 
     datas = _leaf_datas()
-    assert "rate_grid" in datas and "frame" in datas
+    assert "counts" in datas and "frame" in datas
     # the demo 2d card is the synced readout image -> its input is the judged frame (#5)
     assert combo.current_signal() == "frame_judged"
 
-    assert _pick("rate_grid")                              # pick the input signal in the tree
+    assert _pick("counts")                                 # pick the input signal in the tree
     card._on_slot_pick(0)
-    assert card.config.inputs[0] == "rate_grid"            # input now names rate_grid
+    assert card.config.inputs[0] == "counts"               # input now names counts
     assert card.config.source == "value = signal"          # the picked signal IS `signal`
     console.refresh_once()
     assert card.status.text().startswith("shot ")           # applied instantly + healthy
@@ -1861,14 +1861,14 @@ def test_task_console_cross_signal_expression_and_error_isolation(monkeypatch):
 
     console = dt.demo_console(shots=20, dual=True)
     diff = PanelCard(
-        PanelConfig(kind="2d", title="A-B rate", row=4, col=0, size="2x2",
-                    source="value = rate_grid - b_rate_grid"))
+        PanelConfig(kind="1d", title="A-B occupancy", row=4, col=0, size="2x2",
+                    source="value = occupied - b_occupied"))
     console._attach_card(diff)
     console._arrange()
     console.refresh_once()
     assert diff.plotter is not None and diff.status.text().startswith("shot ")
-    grid_shape = console.hub.latest("rate_grid").shape
-    assert tuple(diff.plotter.data_shape) == grid_shape
+    n_sites = np.asarray(console.hub.latest("occupied")).shape[-1]
+    assert int(diff.plotter.data_y.shape[0]) == n_sites          # one A-B value per site
 
     # break ONE panel: it reports, the siblings keep updating
     victim = next(card for card in console.cards if card.config.kind == "monitor")

@@ -56,15 +56,16 @@ def test_camera_measurement_plus_detect_processor_runs_real_pipeline():
         # detect consumes the frame and produces occupancy through the REAL contract
         det.step()
         names = set(hub.names())
-        assert {"occupied", "counts", "rate", "rate_sites", "centers", "thresholds"} <= names
-        occ = hub.latest("occupied")
-        assert occ.shape == (12,)
+        assert {"occupied", "counts", "rate", "centers", "thresholds"} <= names
+        occ = np.asarray(hub.latest("occupied"))
+        assert occ.ndim == 3 and occ.shape[1] == 1 and occ.shape[2] == 12   # (repeat, 1, n_sites) block (#H3q)
         assert np.ndim(hub.latest("rate")) == 0
 
-        # virtual == real: the published occupancy IS calibration.detect on that frame
-        frame = hub.latest("frame")
-        expected = np.asarray(cal.detect(frame).occupied, dtype=float).reshape(-1)
-        np.testing.assert_array_equal(occ, expected)
+        # virtual == real: the published occupancy IS calibration.detect on that frame.  ``frame`` is
+        # now the camera's (repeat,1,H,W) block, so judge its last filled slice and compare per shot.
+        img = np.asarray(hub.latest("frame"))[-1, 0]
+        expected = np.asarray(cal.detect(img).occupied, dtype=float).reshape(-1)
+        np.testing.assert_array_equal(occ[-1, 0], expected)
 
         # reactive again: stepping detect with no new frame must not republish
         v0 = hub.signal_versions().get("occupied")
@@ -112,7 +113,8 @@ def test_calibrate_task_produces_calibration_and_drives_detect_processor(tmp_pat
         fire_live_imaging(exp)            # On Pulse: the trigger-driven camera now streams
         cam.step()
         det.step()
-        assert hub.latest("occupied").shape == (12,)
+        occ = np.asarray(hub.latest("occupied"))
+        assert occ.ndim == 3 and occ.shape[2] == 12     # (repeat, 1, n_sites) block (#H3q)
     finally:
         exp.close()
 
@@ -150,11 +152,11 @@ def test_user_composed_loading_readout_streams_real_detect_off_camera_frames():
         det.step()                                    # consumes frame -> real detect
         names = set(hub.names())
         assert "frame" in names and {"occupied", "rate", "centers"} <= names
-        occ = hub.latest("occupied")
-        assert occ.shape == (12,)
-        frame = hub.latest("frame")
-        expected = np.asarray(task.calibration.detect(frame).occupied, dtype=float).reshape(-1)
-        np.testing.assert_array_equal(occ, expected)
+        occ = np.asarray(hub.latest("occupied"))
+        assert occ.ndim == 3 and occ.shape[2] == 12     # (repeat, 1, n_sites) block (#H3q)
+        img = np.asarray(hub.latest("frame"))[-1, 0]    # judge the camera block's last filled slice
+        expected = np.asarray(task.calibration.detect(img).occupied, dtype=float).reshape(-1)
+        np.testing.assert_array_equal(occ[-1, 0], expected)
     finally:
         cam.stop()
         det.stop()

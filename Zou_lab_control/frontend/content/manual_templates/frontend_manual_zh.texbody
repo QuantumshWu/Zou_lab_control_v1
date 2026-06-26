@@ -911,10 +911,9 @@ Task 控制台（\filepath{task\_console.bat} / \pyapi{frontend.show\_task\_cons
 常用表达式示例：
 \begin{codeblock}[Python]
 value = frame                          # 最新相机帧 -> 2D
-value = occupied                       # 每站 0/1 占据 -> Site map
-value = rate_sites                     # 逐站装载率 -> Site map / 1D
+value = occupied                       # 每站 0/1 占据(Site map 设 repeat_mode=average=逐站装载概率)
 value = history('counts', 200).ravel() # 最近 200 shot 计数 -> Distribution
-value = rate_grid - b_rate_grid        # 两个实验相减 -> 2D
+value = occupied - b_occupied          # 两个实验相减 -> 1D
 \end{codeblock}
 
 \section{布局：拖动吸附的模数化卡片}
@@ -1141,7 +1140,7 @@ console = zf.show_task_console(hub=hub, session=exp,
 
 \textbf{消费侧}：\pyapi{latest(name)}（0 维->float，否则 ndarray 拷贝；不存在报 KeyError）、\pyapi{history(name, n=None) -> ndarray}（\tfocus{形状 (shots, *value\_shape)}，axis 0 是 shot；形状变过只保留最近同形状连续段）、\pyapi{names() -> list}、\pyapi{snapshot_latest() -> dict}（一致快照=表达式命名空间）、属性 \pyapi{version}/\pyapi{shot}。
 
-\textbf{约定俗成的信号名}（沿用它们->同一命名任务在虚拟/真机间零修改通用）：\pyapi{frame}（相机帧）、\pyapi{counts}、\pyapi{occupied}、\pyapi{rate}、\pyapi{rate_sites}、\pyapi{rate_grid}、\pyapi{centers}（站点中心 \pyapi{(N,2)}）、\pyapi{thresholds}、\pyapi{shot}。
+\textbf{约定俗成的信号名}（沿用它们->同一命名任务在虚拟/真机间零修改通用）：\pyapi{frame}（相机帧）、\pyapi{counts}、\pyapi{occupied}（均 \pyapi{(repeat,1,n_sites)} 块，\pyapi{repeat_mode=average} 即逐站装载概率）、\pyapi{rate}（本块装载率标量）、\pyapi{centers}（站点中心 \pyapi{(N,2)}）、\pyapi{thresholds}、\pyapi{shot}。
 
 \textbf{示例}：\pyapi{hub.publish(\{"counts": c, "rate": r, "shot": float(s)\})}，再开一个 Rolling trace 面板把 Source 指到信号名即可。
 

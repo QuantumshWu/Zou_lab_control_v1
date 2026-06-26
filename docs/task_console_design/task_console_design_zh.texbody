@@ -262,10 +262,9 @@ kind & 绘图类 & 用途 \\
 每个面板的数据来源是一行 Python，赋给 \pyapi{value}（与脉冲 GUI 的 Scan 页同一套"本地可信代码"信任模型——只跑你自己写的）：
 \begin{codeblock}[Python]
 value = frame                          # 最新相机帧 -> 2D
-value = occupied                       # 每站 0/1 占据 -> Site map
-value = rate_sites                     # 逐站装载率 -> Site map / 1D
+value = occupied                       # 每站 0/1 占据(Site map 设 repeat_mode=average=逐站装载概率)
 value = history('counts', 200).ravel() # 最近 200 shot 计数 -> Distribution
-value = rate_grid - b_rate_grid        # 两个实验相减 -> 2D
+value = occupied - b_occupied          # 两个实验相减 -> 1D
 \end{codeblock}
 命名空间 = hub 的一致快照（每个信号名直接可用）+ \pyapi{history}/\pyapi{latest}/\pyapi{names}/\pyapi{shot}/\pyapi{np}/\pyapi{math}。
 

@@ -415,26 +415,36 @@ class Processor(LogicNode):
 class OccupancyProcessor(Processor):
     """Per-frame atom detection as a live graph node -- the REAL readout pipeline.
 
-    Consumes a camera ``frame`` signal and runs the SAME ``calibration.detect``
-    contract the notebook/real readout uses, publishing per-site occupancy/counts +
-    a running loading rate.  THIS is the virtual==real split: the camera produces
-    frames (a Measurement); detection is a SEPARATE node here -- not one node
-    fabricating every signal.  The calibration (site centers + per-site thresholds)
-    comes from a prior calibrate-readout Task, exactly as on real hardware.
+    Consumes a camera ``frame`` BLOCK and runs the SAME ``calibration.detect``
+    contract the notebook/real readout uses, judging EACH repeat slice.  THIS is the
+    virtual==real split: the camera produces frames (a Measurement); detection is a
+    SEPARATE node here -- not one node fabricating every signal.  The calibration (site
+    centers + per-site thresholds) comes from a prior calibrate-readout Task, exactly
+    as on real hardware.
 
-    Published per new frame (behind ``prefix``): ``occupied`` (N,), ``counts`` (N,),
-    ``rate`` scalar loading fraction (cumulative running mean over all shots),
-    ``rate_sites`` (N,) per-site loading fraction, ``rate_grid`` grid map (when grid
-    known), ``centers`` (N,2), ``thresholds`` (N,).  The loading rate is the plain
-    occupancy fraction averaged over every shot so far -- the SAME quantity the Rb87
-    reference reports per batch, accumulated live; there is no smoothing/decay knob."""
+    ``repeat_contract == "preserve"`` (#H3q): the repeat axis flows THROUGH the
+    processor.  Fed the camera's ``(repeat, 1, H, W)`` block it judges every slice and
+    publishes ``occupied`` / ``counts`` as ``(repeat, 1, n_sites)`` blocks (the uniform
+    ``(repeat, *points_shape, *data_shape)`` contract, points_shape=(1,),
+    data_shape=(n_sites,)) and ``frame_judged`` as ``(repeat, 1, H, W)``.  So a
+    sites/2d panel with ``repeat_mode=average`` over ``occupied`` IS the per-site
+    LOADING PROBABILITY (averaging N shots recovers every ~50%-loaded site) -- ONE
+    mechanism (the plot's repeat collapse), not a private in-node accumulator.  The
+    user sets how many shots to average via the camera's ``repeat``.  ``centers``
+    (N, 2) and ``thresholds`` (N,) are static calibration geometry -- NO repeat axis."""
 
     node_label = "occupancy"
-    # ``frame_judged`` = the EXACT frame this occupancy was computed from, republished so
-    # the site map's underlay is the SAME shot as the rings (the camera keeps streaming
+    repeat_contract = "preserve"        # judges each repeat slice -> a (repeat,1,n_sites) block
+    points_shape: tuple = (1,)          # one frame per shot (the n_sites live in data_shape)
+    # ``frame_judged`` = the EXACT block this occupancy was computed from, republished so
+    # the site map's underlay is the SAME shots as the rings (the camera keeps streaming
     # newer frames on its own thread; using the live camera frame would offset the rings).
-    provides = ("occupied", "counts", "rate", "rate_sites", "rate_grid", "centers",
-                "thresholds", "frame_judged")
+    # ``rate`` (scalar) = the loading fraction of THIS block (mean occupancy over its sites x
+    # shots) -- a single number per tick, so a Rolling-trace monitor draws the loading rate vs
+    # time and a pulse scan reads it as the swept y.  Per-site loading PROBABILITY is NOT a
+    # separate signal: it is ``repeat_mode=average`` over ``occupied`` (and the 2-D site map via
+    # grid_shape) -- one mechanism, not a duplicated in-node accumulator.
+    provides = ("occupied", "counts", "rate", "centers", "thresholds", "frame_judged")
     # The site map takes ONE signal (an occupancy vector this node publishes) and resolves
     # its ring CENTRES + frame UNDERLAY from the SAME node: these name the two outputs that
     # carry them.  THIS is the single source -- the panel layer (ProcessorSpec.metadata) and
@@ -473,10 +483,9 @@ class OccupancyProcessor(Processor):
         # time: one calibration carries every method's geometry + thresholds, and the
         # processor picks which to read with (None = the calibration's default).
         self.method = None if method in (None, "") else str(method)
-        # Loading rate = cumulative running mean of occupancy over every shot (the Rb87
-        # reference's per-batch loading fraction, accumulated live -- no smoothing/decay knob).
-        self._occ_sum: np.ndarray | None = None
-        self._n_shots = 0
+        # The per-site DATA width -- set on the first judged block so structure_provider can
+        # feed the plot's reshape (the (repeat,1,n_sites) contract).  () until the first shot.
+        self.data_shape: tuple = ()
 
     def _resolve_calibration(self):
         if self.calibration is None and self.calibration_source is not None:
@@ -491,86 +500,78 @@ class OccupancyProcessor(Processor):
         # ``value = signal`` on one input IS that frame; an expression may combine several,
         # e.g. ``value = (signal[0] + signal[1]) / 2``).  The value must be ONE (H×W) frame.
         try:
-            frame = np.asarray(self.source_expr.evaluate(inputs), dtype=float)
+            value = np.asarray(self.source_expr.evaluate(inputs), dtype=float)
         except Exception:
             return {}                                       # malformed expression -> no-op (don't wedge)
-        if frame.ndim > 2:
-            # The camera publishes ``frame`` as its ``(repeat, 1, H, W)`` block; occupancy is a
-            # PER-SHOT judgement, so judge the newest single photo: take the last repeat slice that
-            # holds data, then squeeze the size-1 point axis down to the (H, W) image.
-            #
-            # This is WHY ``repeat_contract == "reduce"`` (this node judges ONE shot and emits 1-D
-            # per-site vectors, NO repeat axis).  It must NOT be made repeat-preserving: occupied
-            # as ``(repeat, n_sites)`` is 2-D, which the plot's repeat collapse SILENTLY skips
-            # (reduce_repeat / _signal_then_repeat / _eval_signal_per_slice all gate on ndim>=3),
-            # and ``_coerce`` for kind='sites' flattens it into repeat*n_sites bogus rings.  The
-            # per-site LOADING PROBABILITY is the cumulative ``rate_sites`` below (not a plot knob).
-            has = np.isfinite(frame).any(axis=tuple(range(1, frame.ndim)))
-            idx = np.flatnonzero(has)
-            frame = np.asarray(frame[idx[-1]] if idx.size else frame[-1])
-            frame = np.squeeze(frame)
-        try:
-            detection = calibration.detect(frame, method=self.method)   # the single readout contract
-        except ValueError:
-            # The loaded calibration does not fit this frame (e.g. a stale calibration.json with a
-            # different camera ROI).  Fall back to the live SESSION calibration (built from this
-            # camera, so it matches) instead of raising every shot and freezing every panel.
-            fallback = self.session_calibration() if callable(self.session_calibration) else None
-            if fallback is None or fallback is calibration:
-                return {}                                   # nothing matches -> no-op (recalibrate)
-            detection = fallback.detect(frame, method=self.method)
-            self.calibration = calibration = fallback        # adopt the matching one for next shots
-        occupied = np.asarray(detection.occupied, dtype=float).reshape(-1)
-        counts = np.asarray(detection.counts, dtype=float).reshape(-1)
-        # Cumulative loading fraction = (sum of occupancy over all shots) / (n shots); per-site
-        # and overall.  A plain running mean -- no decay -- matching the reference's batch
-        # occupancy fraction.  (Reset by re-creating the node, e.g. Stop/Start.)
-        if self._occ_sum is None or self._occ_sum.shape != occupied.shape:
-            self._occ_sum = occupied.copy()
-            self._n_shots = 1
+        # Normalize whatever the source expression yields to a (repeat, 1, H, W) BLOCK -- the camera's
+        # own ``(repeat,1,H,W)`` block, a bare ``(H,W)`` frame, or a ``(repeat,H,W)`` stack all become
+        # one uniform block.  Occupancy is then judged PER repeat slice so the repeat axis flows
+        # THROUGH the node (repeat_contract='preserve'): a sites/2d panel's repeat_mode=average over
+        # ``occupied`` IS the per-site loading probability (averaging N shots recovers every site).
+        if value.ndim == 2:
+            block = value[None, None]                       # (1, 1, H, W)
+        elif value.ndim == 3:
+            block = value[:, None]                          # (repeat, H, W) -> (repeat, 1, H, W)
+        elif value.ndim == 4:
+            block = value
         else:
-            self._occ_sum += occupied
-            self._n_shots += 1
-        rate_sites = self._occ_sum / float(self._n_shots)
-        out: dict[str, object] = {
-            "occupied": occupied,
-            "counts": counts,
-            "rate": float(rate_sites.mean()),
-            "rate_sites": rate_sites.copy(),
-            "centers": np.asarray(self.calibration.centers, dtype=float),
-            "thresholds": np.asarray(detection.thresholds, dtype=float).reshape(-1),
-            # publish the judged frame ATOMICALLY with the occupancy -> the site map's
-            # underlay + rings are always the same shot (root fix for the misalignment).
-            "frame_judged": frame,
-        }
-        if self.grid_shape is not None and occupied.size == int(np.prod(self.grid_shape)):
-            out["rate_grid"] = rate_sites.reshape(self.grid_shape).copy()
-        return out
+            return {}                                       # not an image / image block -> no-op
 
-    def published_signals(self) -> frozenset:
-        # ``rate_grid`` is published ONLY when a grid shape is known (transform gates it), so it must
-        # not be advertised otherwise -- else a picker/legend shows it "waiting" forever (it never
-        # arrives).  Every other ``provides`` entry is published every shot.
-        keys = [k for k in self.provides if k != "rate_grid" or self.grid_shape is not None]
-        return frozenset(self.prefix + key for key in keys)
+        occ_rows: list = []
+        cnt_rows: list = []
+        n_sites = None
+        thresholds = None
+        centers = None
+        for r in range(int(block.shape[0])):
+            img = np.asarray(block[r, 0], dtype=float)
+            if not np.isfinite(img).any():
+                occ_rows.append(None); cnt_rows.append(None); continue   # unfilled ring slice
+            try:
+                detection = calibration.detect(img, method=self.method)  # the single readout contract
+            except ValueError:
+                # The loaded calibration does not fit this frame (e.g. a stale calibration.json with a
+                # different camera ROI).  Fall back to the live SESSION calibration (built from this
+                # camera, so it matches) instead of raising every shot and freezing every panel.
+                fallback = self.session_calibration() if callable(self.session_calibration) else None
+                if fallback is None or fallback is calibration:
+                    occ_rows.append(None); cnt_rows.append(None); continue
+                detection = fallback.detect(img, method=self.method)
+                self.calibration = calibration = fallback     # adopt the matching one for next shots
+            occ_rows.append(np.asarray(detection.occupied, dtype=float).reshape(-1))
+            cnt_rows.append(np.asarray(detection.counts, dtype=float).reshape(-1))
+            n_sites = occ_rows[-1].size
+            thresholds = np.asarray(detection.thresholds, dtype=float).reshape(-1)
+            centers = np.asarray(calibration.centers, dtype=float)
+        if n_sites is None:
+            return {}                                       # no filled slice judged this tick -> no-op
+        nan = np.full(int(n_sites), np.nan)
+        # (repeat, 1, n_sites) blocks -- unfilled slices are NaN so the plot's nanmean ignores them.
+        occupied = np.stack([o if o is not None else nan for o in occ_rows], axis=0)[:, None, :]
+        counts = np.stack([c if c is not None else nan for c in cnt_rows], axis=0)[:, None, :]
+        self.data_shape = (int(n_sites),)                   # declare the per-site DATA width for reshape
+        return {
+            "occupied": occupied,                           # (repeat, 1, n_sites) per-shot occupancy
+            "counts": counts,                               # (repeat, 1, n_sites) per-shot readout signal
+            "rate": float(np.nanmean(occupied)),            # scalar loading fraction of this block (sites x shots)
+            "centers": centers,                             # (N, 2) static site geometry -- no repeat axis
+            "thresholds": thresholds,                       # (N,) calibration constant -- no repeat axis
+            # the judged BLOCK, published ATOMICALLY with the occupancy -> the site map's underlay +
+            # rings are always the SAME shots (the site-map path reduces it to one (H,W) underlay).
+            "frame_judged": block,                          # (repeat, 1, H, W)
+        }
 
     def output_specs(self) -> tuple[SignalSpec, ...]:
         """Label + meaning of each detection signal (the readout pipeline's outputs)."""
         p = self.prefix
-        specs = [
-            SignalSpec(p + "occupied", "occupancy", "", "per-site single-shot occupancy (0 / 1)"),
-            SignalSpec(p + "counts", "readout counts", "", "per-site integrated readout signal"),
-            SignalSpec(p + "rate", "loading rate", "", "running-mean loading rate over all sites"),
-            SignalSpec(p + "rate_sites", "loading rate", "", "per-site running-mean loading rate"),
+        return (
+            SignalSpec(p + "occupied", "occupancy", "", "per-site per-shot occupancy (0 / 1); average = loading probability"),
+            SignalSpec(p + "counts", "readout counts", "", "per-site per-shot integrated readout signal"),
+            SignalSpec(p + "rate", "loading rate", "", "loading fraction of this block (scalar) -> rolling-trace monitor / scan y"),
             SignalSpec(p + "centers", "site centre", "px", "site centres in camera pixels (N, 2)"),
             SignalSpec(p + "thresholds", "threshold", "counts", "per-site bright/dark count threshold"),
             SignalSpec(p + "frame_judged", "camera image", "counts",
-                       "the exact camera frame this occupancy was judged from (site-map underlay)"),
-        ]
-        if self.grid_shape is not None:    # only declared when actually published (see transform)
-            specs.insert(4, SignalSpec(p + "rate_grid", "loading rate", "",
-                                       "per-site loading rate as a site grid"))
-        return tuple(specs)
+                       "the exact camera frames this occupancy was judged from (site-map underlay)"),
+        )
 
 
 class TaskOutput:

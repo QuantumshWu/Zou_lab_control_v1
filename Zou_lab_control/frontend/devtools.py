@@ -196,7 +196,7 @@ def _demo_board_state():
     bare trace (``show_dist=False`` -> :class:`LiveLive`).  Each panel is a pure
     VIEW wired to a hub signal the demo's camera Measurement + OccupancyProcessor
     publish (decoupled VIEW/LOGIC): the camera publishes ``frame``; the
-    OccupancyProcessor publishes ``counts`` / ``rate`` / ``rate_sites`` / ``centers``."""
+    OccupancyProcessor publishes ``occupied`` / ``counts`` (per-shot blocks) / ``rate`` / ``centers``."""
 
     from Zou_lab_control.frontend.task_console import PanelConfig, TaskConsoleState
 
@@ -236,9 +236,9 @@ def demo_console(*, scale: float = 1.0, size=(1480, 980), grid=(5, 7), state=Non
       * a **camera** Measurement logic node (``CameraMeasurement``) publishing
         ``frame`` -- added + Started through the public-ish console API
         (``_add_logic_node`` / ``_start_logic_node``), exactly as Add-Panel does;
-      * a reactive **OccupancyProcessor** consuming ``frame`` and publishing
-        ``occupied`` / ``counts`` / ``rate`` (scalar cumulative loading fraction) / ``rate_sites`` /
-        ``rate_grid`` / ``centers`` / ``thresholds`` -- built directly (the
+      * a reactive **OccupancyProcessor** consuming ``frame`` and publishing the per-shot
+        ``occupied`` / ``counts`` ``(repeat,1,n_sites)`` blocks + the scalar ``rate`` (this
+        block's loading fraction) + ``centers`` / ``thresholds`` -- built directly (the
         Add-Panel processor flow builds a ONE-SHOT run; the live readout wires the
         reactive detector itself, as the notebook does) and registered in
         ``running_nodes`` so the console's node-discovery + tests see it.
@@ -247,7 +247,7 @@ def demo_console(*, scale: float = 1.0, size=(1480, 980), grid=(5, 7), state=Non
     default six-kind board, while STILL building + Starting the camera + detect so
     ``frame`` / ``rate`` / ... are published for whatever panels it carries.  With
     ``dual=True`` a second OccupancyProcessor (``prefix="b_"``) is started too, so the
-    ``b_rate_grid`` / ``b_counts`` / ... A/B signals exist for cross-signal panels.
+    ``b_occupied`` / ``b_counts`` / ... A/B signals exist for cross-signal panels.
 
     ``shots`` shots are stepped (camera FIRST so ``frame`` exists, then each
     OccupancyProcessor) and one ``refresh_once`` rendered, so every panel holds data
@@ -306,8 +306,8 @@ def demo_console(*, scale: float = 1.0, size=(1480, 980), grid=(5, 7), state=Non
     calibration = exp.readout.require(thresholds=True)   # the session's calibrated TrapCalibration
     detectors = [OccupancyProcessor(console.hub, calibration=calibration, grid_shape=tuple(grid))]
     if dual:
-        # A second detector behind a prefix so b_rate_grid / b_counts / ... exist
-        # for the A-B cross-signal panels.
+        # A second detector behind a prefix so b_occupied / b_counts / ... exist
+        # for the A-B cross-signal panels (e.g. value = occupied - b_occupied).
         detectors.append(OccupancyProcessor(console.hub, calibration=calibration,
                                          grid_shape=tuple(grid), prefix="b_"))
     for detector in detectors:

@@ -6987,7 +6987,7 @@ def test_user_composed_loading_readout_publishes_standard_signals():
                                     prefix=f"{prefix}cal_")
         task.run_to_completion()
         cam = CameraMeasurement(hub, camera, sequencer=seqr, prefix=prefix)
-        # loading rate = cumulative running mean of occupancy (no smoothing knob)
+        # occupancy preserves the repeat axis (#H3q); loading probability = repeat_mode=average
         det = OccupancyProcessor(hub, calibration=task.calibration, source_expr={"inputs": [f"{prefix}frame"], "source": "value = signal"},
                               grid_shape=trap.grid_shape, prefix=prefix)
         return cam, det
@@ -6995,28 +6995,29 @@ def test_user_composed_loading_readout_publishes_standard_signals():
     hub = SignalHub()
     cam, det = _build(hub, prefix="", seed=5, loading_probability=0.55)
     for _ in range(60):
-        cam.step()      # camera measurement publishes a frame
-        det.step()      # detect processor runs the REAL per-frame detect
+        cam.step()      # camera measurement publishes a frame block
+        det.step()      # detect processor runs the REAL per-frame detect on every repeat slice
     n = det.calibration.n_sites
     names = set(hub.names())
-    assert {"frame", "counts", "occupied", "rate", "rate_sites", "rate_grid",
-            "centers", "thresholds"} <= names
-    assert hub.latest("frame").shape == (96, 128)
-    assert hub.latest("centers").shape == (n, 2)   # the site-map panel's anchor
+    assert {"frame", "counts", "occupied", "rate", "centers", "thresholds"} <= names
+    assert np.squeeze(hub.latest("frame")).shape == (96, 128)
+    assert hub.latest("centers").shape == (n, 2)   # the site-map panel's anchor (static, no repeat)
     assert hub.latest("thresholds").shape == (n,)
-    assert hub.latest("counts").shape == (n,)
-    assert hub.latest("rate_grid").shape == det.grid_shape
-    assert 0.0 <= hub.latest("rate") <= 1.0
+    occ = np.asarray(hub.latest("occupied"))
+    counts = np.asarray(hub.latest("counts"))
+    assert occ.ndim == 3 and occ.shape[1] == 1 and occ.shape[2] == n   # (repeat, 1, n_sites) block
+    assert counts.shape == occ.shape
+    assert 0.0 <= float(hub.latest("rate")) <= 1.0                     # this block's loading fraction
     # the long-run occupancy mean tracks loading_probability (loose: lifetime losses)
     occupancy = hub.history("occupied", 60)
-    assert 0.30 <= float(occupancy.mean()) <= 0.80
+    assert 0.30 <= float(np.nanmean(occupancy)) <= 0.80
     # a prefixed second composition coexists in the same hub for A-B expressions
     cam_b, det_b = _build(hub, prefix="b_", seed=6, loading_probability=0.3)
     for _ in range(10):
         cam_b.step()
         det_b.step()
-    diff = hub.latest("rate_grid") - hub.latest("b_rate_grid")
-    assert diff.shape == det.grid_shape
+    diff = np.asarray(hub.latest("occupied")) - np.asarray(hub.latest("b_occupied"))
+    assert diff.shape[-1] == n
 
 
 class _FakeVivadoProc:

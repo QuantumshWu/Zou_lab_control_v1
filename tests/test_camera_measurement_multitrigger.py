@@ -74,10 +74,11 @@ def test_readout_image_frame_judged_is_synced_with_occupancy():
         det.step()
     frame_judged = np.asarray(hub.latest("frame_judged"))
     occupied = np.asarray(hub.latest("occupied"))
-    assert frame_judged.ndim == 2                                   # the readout image
-    # the readout image and the rings are the SAME shot: re-judging frame_judged reproduces
-    # exactly the published occupancy (they came from one atomic publish).
-    assert np.array_equal(occupied, cal.detect(frame_judged, method="box").occupied)
+    assert frame_judged.ndim == 4 and occupied.ndim == 3            # (repeat,1,H,W) / (repeat,1,n_sites) blocks (#H3q)
+    # the readout image and the rings are the SAME shots: re-judging each frame_judged slice
+    # reproduces exactly the published occupancy slice (they came from one atomic publish).
+    img = frame_judged[-1, 0]                                       # the last filled shot
+    assert np.array_equal(occupied[-1, 0], cal.detect(img, method="box").occupied)
 
 
 def test_2d_frame_panel_shows_camera_average_decoupled_from_judge():
@@ -154,7 +155,7 @@ def test_occupancy_nodes_publish_short_names_and_disambiguate_on_collision():
     from types import SimpleNamespace
     from Zou_lab_control.frontend.task_console import TaskConsole, LogicNodeConfig
 
-    keys = ("occupied", "counts", "rate", "rate_sites", "rate_grid", "centers", "frame_judged")
+    keys = ("occupied", "counts", "rate", "centers", "thresholds", "frame_judged")
     spec = SimpleNamespace(result_keys=keys)
     console = SimpleNamespace(logic_nodes=[], running_nodes=[], _spec_for_logic=lambda n: spec)
 

@@ -30,12 +30,15 @@ DEFAULT_CALIBRATION_FILE = "calibrations/calibration.json"
 
 @processor(order=5)   # occupancy is the primary live-readout processor
 def judge_occupancy(readout) -> ProcessorSpec:
-    """Judge per-site occupancy from each live ``frame`` using a loaded calibration.
+    """Judge per-site occupancy from each live ``frame`` BLOCK using a loaded calibration.
 
-    Publishes ``occupied`` (N,), ``counts`` (N,), ``rate`` (scalar cumulative loading
-    fraction), ``rate_sites`` (N,), ``rate_grid`` (grid map), ``centers`` (N, 2) and
-    ``thresholds`` (N,); the default view is the per-site 'sites' atom map coloured by
-    occupancy."""
+    Judges EVERY repeat slice (repeat_contract='preserve', #H3q), so it publishes
+    ``occupied`` and ``counts`` as ``(repeat, 1, n_sites)`` blocks, ``frame_judged`` as
+    ``(repeat, 1, H, W)``, the scalar ``rate`` (this block's loading fraction, for a rolling
+    monitor / scan y), and ``centers`` (N, 2) / ``thresholds`` (N,) static calibration
+    geometry.  The default view is the 'sites' atom map coloured by occupancy; set its
+    ``repeat_mode=average`` to colour by the per-site LOADING PROBABILITY (averaging the
+    camera's ``repeat`` shots recovers every site)."""
 
     # User-facing readout-method names -> the calibration's method keys.  ONE calibration
     # carries all methods (box / per-site PSF / uniform PSF); the READOUT method is chosen
@@ -107,8 +110,7 @@ def judge_occupancy(readout) -> ProcessorSpec:
         params=params,
         make_node=make_node,
         consumes=("frame",),
-        result_keys=("occupied", "counts", "rate", "rate_sites", "rate_grid", "centers",
-                     "thresholds", "frame_judged"),
+        result_keys=("occupied", "counts", "rate", "centers", "thresholds", "frame_judged"),
         default_kind="sites",            # per-site atom map (live frame underlay + circles)
         default_value_key="occupied",
         # The site map auto-resolves its centres + underlay from THIS producing node: centres =
