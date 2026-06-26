@@ -900,8 +900,19 @@ def _text_to_py(text: str):
 # blocker's ACTUAL pixel height.  The CARD'S FORMAT (rounded corners, shadow, grey title strip,
 # content padding) belongs to the FluentGroupBox COMPONENT (qt_fluent.CARD_PAD / CARD_TITLE_PX,
 # the single source); this module only lays cards out.
-_GRID_GAP = 8         # gap between adjacent cards on the board
-_VSNAP = _GRID_GAP    # vertical drop-snap quantum (px) -- cards land tidily but heights are free
+# The ONE spacing setting: columns pitch by it AND every vertical inter-card gap is snapped to an
+# integer multiple of it -- so panel-to-panel spacing is always tidy (k*GRID_UNIT), never a random
+# pixel gap left over from where a card happened to be dropped.  Change this one number to retune
+# all board spacing.
+GRID_UNIT = 8
+_GRID_GAP = GRID_UNIT   # the MINIMUM inter-card gap == one unit (name kept for the x-pitch math)
+
+
+def _snap_gap(gap: int) -> int:
+    """Round a raw vertical gap to an integer multiple of GRID_UNIT, at least one unit -- so two
+    stacked cards always sit a clean k*GRID_UNIT apart instead of an arbitrary pixel distance."""
+
+    return max(GRID_UNIT, int(round(float(gap) / GRID_UNIT)) * GRID_UNIT)
 
 # The header status readout (panel/signal counts, or a node-error banner) is a borderless
 # label: grey normally, red on a node error (the colour IS the danger cue -- no box border,
@@ -953,8 +964,10 @@ def _slot_to_pos(row: int, col: int) -> tuple[int, int]:
 def _pos_to_slot(x: int, y: int) -> tuple[int, int]:
     pitch_x, _pitch_y = _grid_pitch()
     col = max(0, round((int(x) - _GRID_GAP) / pitch_x))
-    # vertical: snap the dropped pixel-y to the tidy quantum (NOT a cell row -- heights vary)
-    row = max(_GRID_GAP, int(round((int(y) - _GRID_GAP) / _VSNAP)) * _VSNAP + _GRID_GAP)
+    # vertical: snap the dropped pixel-y to the unit grid (NOT a cell row -- heights vary).  The
+    # tidy INTER-CARD gap is enforced separately by _compact (gap quantised to GRID_UNIT), so this
+    # is just drop feedback; the final spacing is always a clean multiple regardless of where dropped.
+    row = max(GRID_UNIT, int(round((int(y) - GRID_UNIT) / GRID_UNIT)) * GRID_UNIT + GRID_UNIT)
     return int(row), int(col)
 
 
@@ -986,6 +999,9 @@ def _compact(configs: Sequence["PanelConfig"], active: "PanelConfig | None" = No
         return _card_size(cfg.size)[1]
     # active first (pinned), then the rest in reading order so an upper card is
     # placed before a lower one it might push.
+    # ONE top-to-bottom pass does BOTH overlap-clearing AND gap-snapping, so ``placed`` always holds
+    # the FINAL positions of the cards above and the snap cascades correctly: a card pushed down (a
+    # bigger gap) shifts every card below it in the same pass.
     for config in sorted(configs, key=lambda c: (0 if c is active else 1, c.row, c.col)):
         target = config.row                          # keep your pixel-y (free placement)
         if config is not active:
@@ -997,7 +1013,17 @@ def _compact(configs: Sequence["PanelConfig"], active: "PanelConfig | None" = No
                 if (_columns_overlap(config, blocker)
                         and target < blocker.row + bh
                         and blocker.row < target + ch):
-                    target = blocker.row + bh + _GRID_GAP
+                    target = blocker.row + bh        # just below; the gap is added by the snap below
+        # TIDY SPACING: snap the gap to the card directly ABOVE in this column to an integer multiple
+        # of GRID_UNIT, so inter-panel spacing is uniform (k*GRID_UNIT) instead of an arbitrary
+        # leftover-pixel gap.  After a free drop a card's pixel-y is arbitrary and heights vary, so
+        # the raw gap below a card was any value; snapping it (>= one unit) keeps cards non-overlapping
+        # AND tidy.  A card with nothing above in its column keeps its row (free placement preserved).
+        above_bottom = max(
+            (b.row + _h(b) for b in placed if _columns_overlap(config, b) and b.row + _h(b) <= target),
+            default=None)
+        if above_bottom is not None:
+            target = above_bottom + _snap_gap(target - above_bottom)
         if config.row != target:
             config.row = target
             moved = True
