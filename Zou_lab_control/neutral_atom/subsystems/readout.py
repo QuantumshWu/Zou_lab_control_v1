@@ -299,15 +299,14 @@ class ReadoutSubsystem(ExperimentSubsystem):
             raise ValueError("times must contain positive finite detection times.")
         calibration = s.require_calibration(require_thresholds=False)
         controller = self._scan_pulse(pulse, name="detect_time_scan")
-        axis = ScanAxis(slot="exposure", values=times, label="Detection time", unit="s", kind="duration")
         reducer = OtsuFidelityReducer(site=site)
         plan: Any = NFramePlan(n_frames=positive_int(shots, "shots"))
         if pulse is not None:
             # Configure the real camera exposure per point, matching the prior path.
             plan = _ExposureConfiguringPlan(plan, s.devices.camera)
-        return ScannedMeasurement(
-            controller, s.devices.camera, controller.sequencer, calibration,
-            axis, plan, reducer, shots_per_point=1,
+        return self._build_slot_scan(
+            controller, calibration, slot="exposure", values=times, label="Detection time",
+            plan=plan, reducer=reducer, shots_per_point=1,
         )
 
     def _scan_detection_time(
@@ -397,6 +396,39 @@ class ReadoutSubsystem(ExperimentSubsystem):
             return pulse
         return _SessionImagingController(self._session, name=name)
 
+    def _build_slot_scan(
+        self, controller: Any, calibration: TrapCalibration, *,
+        slot: str, values: Sequence[float], label: str,
+        plan: Any, reducer: Any, shots_per_point: int, unit: str = "s", kind: str = "duration",
+    ) -> ScannedMeasurement:
+        """Assemble a one-slot pulse-slot sweep on the shared scan engine.
+
+        This is the SPINE every coupled-reduce measurement shares -- "sweep a NAMED
+        pulse slot, reduce each point": a :class:`ScanAxis` over ``slot`` x a
+        ``ShotPlan`` x a ``PointReducer``, run by the one :class:`ScannedMeasurement`.
+        :meth:`build_temperature_scan` (slot ``s0`` trap-off -> survival) and
+        :meth:`build_detection_scan` (slot ``exposure`` -> Otsu fidelity) are the SAME
+        concept and differ ONLY in ``(slot, plan, reducer)`` -- so they call THIS instead
+        of re-spelling the engine wiring (the duplication the audit flagged).
+
+        The GUI ``pulse_scan`` measurement is the DECOUPLED sibling of this family: it
+        sweeps named pulse slots too, but instead of an inline reducer it publishes the
+        raw frames and reads y from a SEPARATE processor's signal (see the scan-taxonomy
+        note in MAINTAINER_NOTES).  Reducers stay inline here only because survival
+        (a two-frame pair) and per-frame fidelity need the multi-frame PLAN structure a
+        single-frame processor cannot see."""
+
+        s = self._session
+        axis = ScanAxis(
+            slot=slot, values=np.asarray(values, dtype=float).reshape(-1),
+            label=label, unit=unit, kind=kind,
+        )
+        sequencer = getattr(controller, "sequencer", getattr(s.devices, "sequencer", None))
+        return ScannedMeasurement(
+            controller, s.devices.camera, sequencer, calibration,
+            axis, plan, reducer, shots_per_point=positive_int(shots_per_point, "shots_per_point"),
+        )
+
     def build_temperature_scan(
         self,
         t_off_s: Sequence[float],
@@ -431,10 +463,9 @@ class ReadoutSubsystem(ExperimentSubsystem):
         reducer = SurvivalReducer(per_site=per_site)
         if per_site:
             reducer.bind_calibration(calibration)
-        axis = ScanAxis(slot="s0", values=t_off, label="Trap-off time", unit="s", kind="duration")
-        return ScannedMeasurement(
-            pulse, s.devices.camera, getattr(pulse, "sequencer", getattr(s.devices, "sequencer", None)),
-            calibration, axis, ReleaseRecapturePlan(), reducer, shots_per_point=positive_int(shots, "shots"),
+        return self._build_slot_scan(
+            pulse, calibration, slot="s0", values=t_off, label="Trap-off time",
+            plan=ReleaseRecapturePlan(), reducer=reducer, shots_per_point=positive_int(shots, "shots"),
         )
 
     def temperature(

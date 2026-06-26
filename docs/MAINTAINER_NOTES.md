@@ -1051,6 +1051,33 @@ hands it to `active_plotter().run` when a viewer is registered (background worke
 UI-thread refresh, cooperative `stop()`), else runs the same callback synchronously
 and still returns a complete `ScanResult` (x + `data_y` `(n_points, n_series)`).
 
+### Scan taxonomy: temperature, readout-duration AND pulse-scan are ONE concept (two tiers)
+
+A recurring question ("isn't Temperature just a kind of pulse-scan?") — yes. EVERY scan in the
+system is the same concept: **sweep one or more NAMED pulse slots, reduce each point to a value**.
+They split into two tiers by WHERE the per-point reduce lives, NOT by being different machines:
+
+- **Coupled tier — `ScannedMeasurement` (inline reducer).** `Temperature` (slot `s0` trap-off →
+  `SurvivalReducer`) and `Readout-duration` (slot `exposure` → `OtsuFidelityReducer`) are the SAME
+  builder differing ONLY in `(slot, plan, reducer)`, so they BOTH call the one spine
+  **`ReadoutSubsystem._build_slot_scan(controller, calibration, *, slot, values, label, plan,
+  reducer, shots_per_point)`** (the `ScanAxis` + `ScannedMeasurement` assembly lives there ONCE —
+  `build_temperature_scan` / `build_detection_scan` are 3-line callers). The reducer is inline here
+  *on purpose*: survival needs a TWO-FRAME pair from one loading and fidelity needs the per-frame
+  Otsu split — both depend on the multi-frame `ShotPlan` STRUCTURE a generic single-frame processor
+  cannot see.
+- **Decoupled tier — `PulseScanNode` (y from a separate processor's signal, §20).** The GUI
+  `pulse_scan` sweeps named pulse slots exactly the same way, but instead of an inline reducer it
+  PUBLISHES the raw frames and reads y from another running node's signal via a `signal_expr`
+  (e.g. `rate` off a Judge-occupancy processor). This is the decouplable case — y is a single-frame
+  signal expression, so the reduce can live in its own node.
+
+So "Temperature is a pulse-scan" is literally true at the model level (`ScanAxis` over a bound pulse
+slot); it sits in the coupled tier because its reduce is frame-structural. Adding a new
+single-slot coupled scan = a new `(plan, reducer)` pair + a `_build_slot_scan` call, never a new
+scan loop. Promoting one to the decoupled tier = ship its pulse as a `pulses/*.json` template + move
+its reduce into a `@processor`.
+
 ### Repeat is a measurement param; repeat_mode is a plot param (the data model)
 
 **Uniform output contract (#H3n), enforced by the base class + `tests/test_measurement_output_contract.py`:**
