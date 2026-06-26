@@ -356,6 +356,28 @@ class Measurement(LogicNode):
 
     layer = "measurement"
     node_label = "measurement"
+    # The published key that carries the (repeat,*points_shape,*data_shape) CONTRACT block.  Each
+    # concrete measurement sets it (camera -> "frame"; a scan -> its y_key) so the base can verify the
+    # block shape at publish time and the output-contract test can find it generically.
+    primary_signal: str = ""
+
+    def _assert_primary_shape(self, out: dict) -> dict:
+        """Publish-time contract guard: the primary block MUST be ``(repeat, *points_shape, *data_shape)``.
+
+        A new measurement that mis-sizes its block (forgets the repeat axis, sets only one of
+        points/data shape, publishes an un-repeated 2-D array) fails LOUD here instead of silently
+        producing a wrong plot.  Returns ``out`` so a subclass can ``return self._assert_primary_shape(out)``."""
+
+        key = self.primary_signal
+        if key and key in out and out[key] is not None:
+            block = np.asarray(out[key])
+            expected = (int(self.repeat), *tuple(self.points_shape), *tuple(self.data_shape))
+            if block.shape != expected:
+                raise ValueError(
+                    f"{type(self).__name__} primary block {key!r} has shape {block.shape}, but the "
+                    f"measurement output contract requires {expected} = (repeat, *points_shape, *data_shape); "
+                    "set points_shape/data_shape (and fill a repeat axis) to match what you publish.")
+        return out
 
 
 class Processor(LogicNode):
@@ -1184,6 +1206,7 @@ class CameraMeasurement(Measurement):
         self.sequencer = sequencer
         self.frames_per_cycle = max(1, int(frames_per_cycle))
         self.points_shape: tuple = (1,)                  # one frame = one data point (no swept param)
+        self.primary_signal = "frame"                    # the (repeat,1,H,W) contract block (#H3r-F4)
         self.data_shape: tuple = ()                      # set to (H, W) on the first frame
         self._raw = None                                 # (repeat, 1, H, W) block; None until 1st frame
         self.set_repeat(repeat, free_run)
@@ -1240,7 +1263,7 @@ class CameraMeasurement(Measurement):
         out["frame"] = self._raw.copy()
         if self.finished:                                # take exactly N photos, then stop
             self._stop.set()
-        return out
+        return self._assert_primary_shape(out)           # frame == (repeat, 1, H, W) -- contract guard
 
     def published_signals(self) -> frozenset:
         n = max(1, int(self.frames_per_cycle))
@@ -1393,6 +1416,7 @@ class ScannedMeasurementNode(Measurement):
         n_series = max(1, int(getattr(measurement.reducer, "n_series", 1)))
         self.points_shape: tuple = (int(self._values.size),)   # the swept parameter points
         self.data_shape: tuple = (n_series,)                   # the per-point data (one per series)
+        self.primary_signal = self.y_key                       # the (repeat,n_points,dim) block (#H3r-F4)
         # RAW block (repeat, *points_shape, *data_shape) = (repeat, n_points, dim), NaN = not-yet-
         # measured.  Filled in place by (pass, point); published whole -- the plot reduces axis O0.
         self._raw = np.full((self._ring, *self.points_shape, *self.data_shape), np.nan, dtype=float)
@@ -1445,11 +1469,11 @@ class ScannedMeasurementNode(Measurement):
             self._index = 0
             self._pass += 1
 
-        return {
+        return self._assert_primary_shape({
             self.x_key: self._values.copy(),             # the FULL x axis, stable from shot 1
             self.y_key: self._publish_raw(),             # RAW (repeat, points, dim) -- plot reduces it
             "scan_done": 1.0 if self.finished else 0.0,
-        }
+        })
 
     def step(self) -> dict[str, object]:
         """Run one point, publish it, and self-stop once the final point lands.
@@ -1579,6 +1603,7 @@ class PulseScanNode(Measurement):
         self._index = 0                                   # within-pass point index
         self.points_shape: tuple = (int(self._values.size),)   # swept points (2-D scan: n0*n1 flat)
         self.data_shape: tuple = (1,)                          # one scalar per point
+        self.primary_signal = self.y_key                       # the (repeat,n_points,1) block (#H3r-F4)
         # 2-D scan: the flattened points reshape to this (n0, n1) image on a 2-D panel (#H3o); the
         # data stays a scalar, so the 2-D-ness is HERE, not in data_shape.
         self.grid_shape: tuple = tuple(self.scan_shape) if self.scan_shape else ()
@@ -1699,7 +1724,7 @@ class PulseScanNode(Measurement):
                "scan_done": 1.0 if self.finished else 0.0}
         if self.scan_shape is not None:
             out[self.y_key + "_grid"] = self._publish_grid()   # RAW (repeat, n0, n1) -- plot reduces it
-        return out
+        return self._assert_primary_shape(out)
 
     def _await_y_inputs(self, before: dict) -> None:
         """Block until the picked y signals have advanced past ``before`` (a per-signal version

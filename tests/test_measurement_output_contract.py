@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -50,6 +51,7 @@ def test_camera_frame_is_repeat_x_one_point_x_image():
         block = hub.latest("frame")
         assert cam.points_shape == (1,)                         # one frame = one point
         assert len(cam.data_shape) == 2                         # the H*W image is the DATA
+        assert cam.primary_signal == "frame"                    # declares its contract block (#H3r-F4)
         assert _block_matches_contract(cam, block)              # (repeat, 1, H, W)
         # repeat is the user's number -- ``free_run`` does NOT discard it (depth = 4, not a constant)
         assert np.asarray(block).shape[0] == 4
@@ -98,4 +100,45 @@ def test_scan_block_is_repeat_x_points_x_data():
     node.run_to_completion()
     block = hub.latest("m_y")
     assert node.points_shape == (4,) and node.data_shape == (2,)
+    assert node.primary_signal == "y"                           # declares its contract block (#H3r-F4)
     assert _block_matches_contract(node, block)                 # (2, 4, 2)
+
+
+def test_base_assertion_rejects_a_wrong_shaped_primary_block():
+    """The base ``Measurement._assert_primary_shape`` is the enforcement: ANY acquiring measurement
+    (incl. a future one) that publishes its primary block with the wrong shape -- e.g. forgets the
+    repeat axis -- fails LOUD at publish time, not as a silently-wrong plot (#H3r-F4)."""
+    from Zou_lab_control.neutral_atom.operations.logic import Measurement
+
+    class _BadShape(Measurement):
+        def __init__(self, hub):
+            super().__init__(hub)
+            self.repeat = 2
+            self.points_shape = (3,)
+            self.data_shape = (1,)
+            self.primary_signal = "y"
+
+        def shot(self):
+            return self._assert_primary_shape({"y": np.zeros((3, 1))})   # (3,1) != (2,3,1): no repeat axis
+
+    node = _BadShape(SignalHub())
+    with pytest.raises(ValueError, match="output contract"):
+        node.shot()
+
+
+def test_base_assertion_passes_a_correct_block():
+    from Zou_lab_control.neutral_atom.operations.logic import Measurement
+
+    class _GoodShape(Measurement):
+        def __init__(self, hub):
+            super().__init__(hub)
+            self.repeat = 2
+            self.points_shape = (3,)
+            self.data_shape = (1,)
+            self.primary_signal = "y"
+
+        def shot(self):
+            return self._assert_primary_shape({"y": np.zeros((2, 3, 1))})
+
+    node = _GoodShape(SignalHub())
+    assert np.asarray(node.shot()["y"]).shape == (2, 3, 1)
