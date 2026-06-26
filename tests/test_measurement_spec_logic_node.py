@@ -386,7 +386,8 @@ def test_camera_measurement_exposes_camera_params_and_applies_them_live():
 
     cam_node.step()
     frame = np.asarray(hub.latest("frame"))
-    assert frame.ndim == 3                                  # the (repeat, H, W) data array
+    assert frame.ndim == 4                                  # the (repeat, 1, H, W) data block
+    assert frame.shape[1] == 1                              # one data point (a frame sweeps no param)
     assert np.ndim(hub.latest("frame_0")) == 2             # a real 2-D camera frame (per-trigger)
 
 

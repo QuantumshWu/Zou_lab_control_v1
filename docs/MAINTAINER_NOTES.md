@@ -1053,20 +1053,32 @@ and still returns a complete `ScanResult` (x + `data_y` `(n_points, n_series)`).
 
 ### Repeat is a measurement param; repeat_mode is a plot param (the data model)
 
-A measurement's full output is a block whose **LEADING axis is the repeat** (a scan's
-`(repeat, points, dim)`, a camera's `(repeat, H, W)`). The measurement **FILLS** that block — it
-never combines the repeats. `repeat` is a **measurement** parameter (the Acquisition `Repeat` int +
-`Free-run (∞)` bool switch — never a magic value in a spinbox); both are declared ONCE as
-`ParamDecl`s in `_acquisition_param_decls(free_run_default)` and **auto-injected** into the same form
-path as every measurement param (`MeasurementPanel(acquisition_params=...)`), so a scan and a camera
-get them through the SAME `_rebuild_form`, never a hand-placed widget. `_repeat_value(values)` maps
-Free-run→`float('inf')` else the int. A scan re-runs the whole sweep `repeat` times; a **camera takes
-exactly `repeat` photos then FINISHES** (`finished`/`points_done`/`total_points`) — `repeat=N` ⇒ N
-photos, not forever. Free-run (∞) keeps only the newest `REPEAT_RING` (10) in a rolling buffer.
-**A camera defaults to Free-run** (a live monitor streams continuously); turn it OFF + set Repeat for
-a finite N-photo exposure. The camera publishes `frame` = the `(repeat, H, W)` data array itself
-(`frame_i` stay the single per-trigger images for processors / per-trigger panels; `OccupancyProcessor`
-reduces a 3-D `frame` to its newest filled slice for the per-shot judgement).
+**Uniform output contract (#H3n), enforced by the base class + `tests/test_measurement_output_contract.py`:**
+EVERY acquiring measurement publishes its primary block with shape **`(repeat, *points_shape, *data_shape)`**
+— `repeat` = the repeat-axis depth, `points_shape` = the swept parameter space, `data_shape` = the
+per-point data. `LogicNode` declares `points_shape`/`data_shape` (default `()`); the nodes set them:
+
+| node | `points_shape` | `data_shape` | block |
+|------|------|------|------|
+| camera | `(1,)` (a frame sweeps no input param) | `(H, W)` (the image IS the data) | `(repeat, 1, H, W)` |
+| 1-D scan | `(n_points,)` | `(dim,)` | `(repeat, n_points, dim)` |
+| 2-D scan | `(n0*n1,)` (param1×param2) | `(1,)` | `(repeat, n0*n1, 1)` (+ `_grid` reshape) |
+
+`repeat` is a **measurement** param: the Acquisition `Repeat` int + `Free-run` bool switch, declared
+ONCE in `_acquisition_param_decls(free_run_default)` and **auto-injected** through the SAME
+`_rebuild_form` as every param (never a hand-placed widget, never a magic spinbox value).
+`_repeat_value(values)` → **`(repeat:int, free_run:bool)`**: `repeat` is ALWAYS the user's integer =
+the ring DEPTH (how many passes/photos are kept and **averaged**); `free_run` ONLY toggles
+STOP-after-`repeat` (False) vs keep ROLLING that `repeat`-deep ring forever (True) — it NEVER discards
+the user's number (so `repeat=20` averages 20 whether or not it free-runs; the old `inf→REPEAT_RING=10`
+that silently ignored the user's count is gone). A scan re-runs the whole sweep `repeat` times; a
+**camera takes exactly `repeat` photos then FINISHES** when not free-running. **A camera defaults to
+Free-run** (a live monitor streams continuously); turn it OFF + set Repeat for a finite N-photo
+exposure. `frame` = the `(repeat, 1, H, W)` block itself; `frame_i` stay the single per-trigger images
+(`OccupancyProcessor` reduces a >2-D `frame` to its newest filled (H,W) slice for the per-shot judge).
+**Two-cameras fix:** the built node's `instance_label` is set to its row TITLE, so its provider label
+matches the declared row (the empty-prefix camera no longer shows `frame` under both "camera" and
+"Camera (live frames)").
 
 HOW the repeats become a picture is a **plot** parameter, `repeat_mode` (each plot panel's Setting
 combo, persisted in `config.params`): `average | add | replace | roll | create`. The pipeline
@@ -1085,6 +1097,15 @@ solid, `alpha=1`, the global `lines.linewidth=1`, colours CYCLE `LINE_CYCLE` (gr
 skyblue, …) by column index — a lone line is grey (identical to confocal's `repeat=1`), no per-repeat
 fade. There is **no** measurement-side averaging anywhere (that was the camera live-stutter); the
 plot owns every reduction.
+
+**Auto-reshape (#H3n) — `PanelCard._coerce` makes ANY measurement's data fit ANY panel kind**, so a
+camera frame and a 2-D scan both "just show" as an image and a frame fed to a 1-D vector "just shows"
+flattened. After the repeat reduce the value is the `(*points, *data)` core; the panel reshapes by
+SQUEEZE + kind: a **2-D** panel squeezes size-1 axes (a camera's `(1,H,W)→(H,W)`, a 2-D scan grid's
+`(n0,n1,1)→(n0,n1)`) and imshows; a **1-D** panel keeps a small trailing `dim` (≤`_DIM_MULTILINE_MAX`)
+as multiple lines (or `create`'s one-line-per-repeat), else UNROLLS an image core to a single 1-D
+trace; **dist** flattens to a histogram. `reduce_repeat`/`repeats_with_data` accept any `(repeat, *rest)`
+(the camera's 4-D block included), reducing axis 0 only.
 
 ### Single source of truth: build_*_scan + declarative spec
 

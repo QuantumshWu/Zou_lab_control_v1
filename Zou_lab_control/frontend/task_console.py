@@ -114,6 +114,11 @@ TASK_FILES_ENV = "ZLC_TASK_DIR"
 # hub signals -- it touches no device, so it is NOT in this set and keeps running.
 DEVICE_DRIVING_KINDS: frozenset = frozenset({"camera", "measurement", "task"})
 
+# A 1-D panel keeps a reduced ``(points, dim)`` value 2-D (one line per data dimension) only while
+# ``dim`` is small -- a scan has a handful of series.  A wider trailing axis (a camera frame's image
+# width) is DATA to unroll into a single 1-D trace, not dozens of lines (#H3n auto-reshape).
+_DIM_MULTILINE_MAX = 16
+
 PANEL_KINDS: dict[str, str] = {
     "2d": "2D image",
     "sites": "Site map",
@@ -2210,8 +2215,8 @@ class PanelCard(FluentGroupBox):
         b = np.asarray(block, dtype=float)
         if had_repeat and self.config.kind == "1d" and b.ndim == 2:   # (repeat, points) -> add dim axis
             b = b[:, :, None]
-        if b.ndim == 3:                                           # ANY 3-D value IS a repeat block
-            self._repeat_cur = repeats_with_data(b)               # (camera (repeat,H,W) or scan (repeat,pts,dim))
+        if had_repeat and b.ndim >= 3:                           # a repeat block (axis 0 = repeat):
+            self._repeat_cur = repeats_with_data(b)               # scan (repeat,pts,dim) or camera (repeat,1,H,W)
             return reduce_repeat(b, mode)                         # collapse the repeat axis per the mode
         self._repeat_cur = 1                                      # no repeat axis -> nothing to reduce
         return b
@@ -2261,22 +2266,33 @@ class PanelCard(FluentGroupBox):
             # x-y curve (col0 = x, col1 = y).
             if self.config.params.get("xy") and arr.ndim == 2 and arr.shape[1] == 2 and arr.shape[0] >= 1:
                 return arr
-            # A reduced scan curve is ``(points, dim)`` -- KEEP the 2-D shape so the dimension axis
-            # (O2) draws as multiple lines, and so ``repeat_mode='create'`` (one column per repeat)
-            # shows one line per repeat.  Live1D draws each column of data_y as its own line (#H3k).
-            if arr.ndim == 2 and arr.shape[0] >= 1:
-                return arr
-            flat = arr.reshape(-1)
+            # Auto-reshape (#H3n): the value (after the repeat reduce) is the (*points, *data) core.
+            # A scan curve ``(points, dim)`` (small dim) stays 2-D so each data dimension draws as its
+            # own line; ``repeat_mode='create'`` keeps 2-D too (one line per repeat, any count).  An
+            # IMAGE-like core (a camera frame's (H, W), large axes) UNROLLS to a single 1-D vector --
+            # so a camera frame fed to a 1-D vector panel "just shows" as one flattened trace.
+            a = np.squeeze(arr)
+            mode = str(self.config.params.get("repeat_mode", ""))
+            if a.ndim == 2 and (mode == "create" or a.shape[1] <= _DIM_MULTILINE_MAX):
+                return a
+            flat = a.reshape(-1)
             if flat.size < 1:
                 raise ValueError("panel value is empty")
             return flat
         if kind == "2d":
-            if arr.ndim != 2 or min(arr.shape) < 2:
-                raise ValueError(f"2D panel needs a 2D array value (got shape {arr.shape})")
+            # Auto-reshape to an image (#H3n): SQUEEZE the size-1 axes so BOTH a camera frame's
+            # ``(1, H, W)`` (one point x the H*W data) AND a 2-D scan's ``(n0, n1, 1)`` (the param
+            # grid x a scalar) collapse to the 2-D map to imshow -- the plot reshapes, the panel
+            # "just shows".  An extra trailing data dimension shows its first plane.
+            img = np.squeeze(arr)
+            if img.ndim > 2:
+                img = img.reshape(img.shape[0], img.shape[1], -1)[:, :, 0]
+            if img.ndim != 2 or min(img.shape) < 2:
+                raise ValueError(f"2D panel needs a 2D array / image value (got shape {arr.shape})")
             # bound the point table so the grid scatter stays cheap per tick
-            sy = max(1, int(np.ceil(arr.shape[0] / 192)))
-            sx = max(1, int(np.ceil(arr.shape[1] / 192)))
-            return arr[::sy, ::sx]
+            sy = max(1, int(np.ceil(img.shape[0] / 192)))
+            sx = max(1, int(np.ceil(img.shape[1] / 192)))
+            return img[::sy, ::sx]
         if kind == "monitor":
             flat = arr.reshape(-1)
             if flat.size != 1:
@@ -2590,24 +2606,26 @@ class PanelCard(FluentGroupBox):
 
 
 def _acquisition_param_decls(free_run_default: bool = False) -> tuple:
-    """The acquisition knobs EVERY measurement-layer node owns, declared ONCE (#H3l): ``repeat`` =
-    how many repeats to FILL into the data array (a measurement decides this -- the plot never can);
-    ``free_run`` = a BOOL switch for ∞ (keep only the newest REPEAT_RING).  ``free_run_default`` is
-    True for a CAMERA (a live monitor streams continuously by default -- set Repeat + turn Free-run
-    OFF to take exactly N photos) and False for a scan (run the sweep once).  Returned as real
-    ``ParamDecl``s so they auto-render through the SAME form path as every measurement param (no
-    hand-placed widget, no magic value abused into a number spinbox)."""
+    """The acquisition knobs EVERY measurement-layer node owns, declared ONCE (#H3n): ``repeat`` = the
+    DEPTH of the repeat axis = how many passes/photos the data block keeps and AVERAGES (a measurement
+    decides this -- the plot never can); ``free_run`` = a BOOL switch that only decides STOP-after-N vs
+    keep ROLLING that ``repeat``-deep ring forever -- it NEVER discards the user's Repeat number.
+    ``free_run_default`` is True for a CAMERA (a live monitor streams continuously by default -- set
+    Repeat + turn Free-run OFF to take exactly N photos) and False for a scan (run the sweep once).
+    Returned as real ``ParamDecl``s so they auto-render through the SAME form path as every measurement
+    param (no hand-placed widget, no magic value abused into a number spinbox)."""
     from ..neutral_atom.operations.measurement import ParamDecl
     return (
         ParamDecl(key="repeat", label="Repeat", kind="int", default=1, lo=1, hi=100000,
-                  tooltip="How many repeats to acquire into the data array (a scan re-runs the whole "
-                          "sweep this many times; a camera takes this many photos).  How the repeats "
-                          "are DISPLAYED is the plot panel's 'repeat mode' Setting (average = a long "
-                          "exposure, add = a running sum, create = one line per repeat)."),
+                  tooltip="How many passes/photos to keep & AVERAGE (a scan re-runs the whole sweep "
+                          "this many times; a camera takes this many photos -- averaging them is a "
+                          "long exposure that recovers the full site map).  How the repeats are "
+                          "DISPLAYED is the plot panel's 'repeat mode' Setting (average / add / "
+                          "replace / roll / create = one line per repeat)."),
         ParamDecl(key="free_run", label="Free-run (∞)", kind="bool", default=bool(free_run_default),
-                  tooltip="Run forever, keeping only the newest 10 repeats (overrides Repeat).  Turn "
+                  tooltip="Keep rolling the newest 'Repeat' passes forever (a live monitor).  Turn "
                           "this OFF and set Repeat to take exactly N (a camera: N photos, then stop). "
-                          "∞ is a switch -- the Repeat number stays a plain integer, never a magic value."),
+                          "It only toggles stop-vs-roll -- the Repeat number is always the ring depth."),
     )
 
 
@@ -5189,6 +5207,11 @@ class TaskConsole(QtWidgets.QWidget):
                 editor.set_status(f"build failed: {str(exc).splitlines()[0][:140]}", error=True)
             return
         row.node.values = dict(values)            # remember for the next Edit reopen + save
+        # Label the built node with its ROW TITLE so its provider label MATCHES the declared row's
+        # (the camera has prefix="" -> display_label would otherwise fall back to node_label="camera",
+        # which differs from the row title "Camera (live frames)", listing `frame` under TWO sources
+        # = the "two cameras" bug).  One label per node => one entry in the signal picker (#H3n).
+        node.instance_label = str(getattr(row.node, "title", "") or getattr(node, "instance_label", ""))
         self._logic_nodes[id(row)] = node
         self._last_node[id(row)] = node           # survives Stop, for signal-source labelling
         if node not in self.running_nodes:
@@ -5292,17 +5315,19 @@ class TaskConsole(QtWidgets.QWidget):
 
     @staticmethod
     def _repeat_value(values: dict):
-        """The acquisition repeat count from the form (#H3l): ``free_run`` (a BOOL) -> ``float('inf')``
-        (keep the newest REPEAT_RING); otherwise the ``repeat`` integer (>= 1).  Pops both keys so
-        they never leak into the measurement's build kwargs."""
+        """The acquisition knobs from the form -> ``(repeat:int, free_run:bool)`` (#H3n).  ``repeat``
+        is ALWAYS the user's integer = the depth of the measurement's repeat axis (how many passes /
+        frames the block holds, hence how many are averaged); ``free_run`` only decides whether the
+        node STOPS after filling ``repeat`` (False) or keeps ROLLING that ``repeat``-deep ring forever
+        (True).  So ``repeat=20`` averages 20 frames whether or not it free-runs -- ∞ never discards
+        the user's number.  Pops both keys so they never leak into the build kwargs."""
         free_run = bool(values.pop("free_run", False))
         rv = values.pop("repeat", 1)
-        if free_run:
-            return float("inf")
         try:
-            return max(1, int(float(rv)))
+            repeat = max(1, int(float(rv)))
         except (TypeError, ValueError):
-            return 1
+            repeat = 1
+        return repeat, free_run
 
     def _build_logic_node(self, node: LogicNodeConfig, values: dict):
         """Build the node for a logic node, DISPLAY SUPPRESSED (publish-only).
@@ -5325,7 +5350,8 @@ class TaskConsole(QtWidgets.QWidget):
             # block via repeat_mode.  So we consume ``repeat`` here, and there is NO update mode.
             cam = spec.build(self.hub, **{k: v for k, v in values.items()
                                           if k not in ("repeat", "free_run")})
-            cam.set_repeat(self._repeat_value(values))
+            repeat, free_run = self._repeat_value(values)
+            cam.set_repeat(repeat, free_run)
             return cam
         spec = self._spec_for_logic(node)
         if spec is None:
@@ -5335,7 +5361,7 @@ class TaskConsole(QtWidgets.QWidget):
             # pop them and hand the count to the node.  The node only FILLS its raw
             # ``(repeat, points, dim)`` block; HOW the repeats are displayed is the PLOT's
             # ``repeat_mode``, so no combine selector is passed here (#H3l).
-            repeat = self._repeat_value(values)
+            repeat, free_run = self._repeat_value(values)
             built = spec.build(**values)
             if getattr(spec, "metadata", {}).get("node") == "pulse_scan":
                 # Pulse-scan is a DEVICE-driving node whose y is DECOUPLED (subscribed from
@@ -5344,13 +5370,13 @@ class TaskConsole(QtWidgets.QWidget):
                 # expression.  ``build`` returned a PulseScanPlan carrier.
                 from Zou_lab_control.neutral_atom.operations.logic import PulseScanNode
                 return PulseScanNode(self.hub, built, x_key=spec.x_key, y_key=spec.y_key,
-                                     prefix=f"{spec.key}_", repeat=repeat)
+                                     prefix=f"{spec.key}_", repeat=repeat, free_run=free_run)
             from Zou_lab_control.neutral_atom.operations.logic import ScannedMeasurementNode
             # The node publishes under the measurement's slug (spec.key), so every signal
             # is ``<slug>_<quantity>`` (e.g. temperature_t_off) -- one name, derived.
             return ScannedMeasurementNode(
                 self.hub, built, x_key=spec.x_key, y_key=spec.y_key, prefix=f"{spec.key}_",
-                repeat=repeat)
+                repeat=repeat, free_run=free_run)
         if kind == "processor":
             # REACTIVE processor (the "func" layer): a live node consuming hub signals
             # and republishing derived ones -- e.g. judging occupancy from each frame.

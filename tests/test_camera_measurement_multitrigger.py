@@ -42,10 +42,10 @@ def test_two_triggers_publish_frame_0_and_frame_1():
         assert key in hub.names()
         assert np.asarray(hub.latest(key)).ndim == 2          # a real HxW image, not a scalar
     block = np.asarray(hub.latest("frame"))
-    assert block.ndim == 3                                     # (repeat, H, W) data array
+    assert block.ndim == 4 and block.shape[1] == 1            # (repeat, 1, H, W): repeat x one point x image
     # the newest data-array slice is the FIRST trigger's frame (the default 2D panel reduces -> trigger 0)
-    has = np.isfinite(block).any(axis=(1, 2))
-    newest = block[np.flatnonzero(has)[-1]]
+    has = np.isfinite(block).any(axis=(1, 2, 3))
+    newest = block[np.flatnonzero(has)[-1], 0]
     assert np.array_equal(newest, np.asarray(hub.latest("frame_0")))
 
 

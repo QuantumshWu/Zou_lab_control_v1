@@ -51,31 +51,32 @@ LINE_CYCLE = [LINE_SINGLE, PALETTE.get("bright", "skyblue")] + list(PALETTE["ser
 
 
 # --- Repeat-axis reduction (the PLOT's `repeat_mode`) ---------------------------------------------
-# A scan measurement publishes a RAW 3-D block O0 x O1 x O2 = (repeat, points, dim): it just FILLS
-# each repeat (NaN = not-yet-measured), never combines.  `repeat_mode` is a PLOT parameter that
-# decides HOW to collapse the repeat axis (O0) for display -- so the SAME raw data can be shown as a
-# mean, a sum, the latest, a rolling newest, or every repeat as its own line, without re-running.
-#: How many repeats a free-run (``inf``) ring keeps.
-REPEAT_RING = 10
+# Every measurement publishes a RAW block whose LEADING axis is the repeat: ``(repeat, *points_shape,
+# *data_shape)`` -- a 1-D scan's ``(repeat, points, dim)``, a 2-D scan's ``(repeat, n0*n1, dim)``, a
+# camera's ``(repeat, 1, H, W)``.  It just FILLS each repeat (NaN = not-yet-measured), never combines.
+# `repeat_mode` is a PLOT parameter that decides HOW to collapse the repeat axis O0 for display -- so
+# the SAME raw data can be shown as a mean, a sum, the latest, a rolling newest, or (1-D) every repeat
+# as its own line, without re-running.
 #: The PLOT's repeat-combine modes (confocal "Update mode" naming: average / add / replace / roll /
 #: create).  ``create`` is 1-D only -- it keeps every repeat as its OWN line (confocal's "create").
 REPEAT_MODES = ("average", "add", "replace", "roll", "create")
 
 
 def reduce_repeat(raw, mode: str = "average"):
-    """Collapse a raw 3-D block over its LEADING (repeat) axis O0 for display.  Handles BOTH a 1-D
-    scan's ``(repeat, points, dim)`` and a 2-D scan's ``(repeat, n0, n1)`` -- the leading axis is the
-    repeat axis in either case (a 3-D block ALWAYS carries a repeat axis; an already-reduced array is
-    1-D/2-D and passes through untouched, so a plain image is never mistaken for a repeat stack).
+    """Collapse a raw block over its LEADING (repeat) axis O0 for display.  Works for ANY trailing
+    shape -- a 1-D scan's ``(repeat, points, dim)``, a 2-D scan's ``(repeat, n0*n1, dim)``, a camera's
+    ``(repeat, 1, H, W)`` -- because the repeat axis is always axis 0 (a block is >=3-D; an already-
+    reduced array is <3-D and passes through untouched, so a plain image is never mistaken for a stack).
 
     * ``average`` -> ``nanmean`` over the repeats that HAVE data (the true running mean; magnitude-
-      stable regardless of how many repeats completed) -> drops the repeat axis.
-    * ``add``     -> ``nansum``  over repeats.
+      stable regardless of how many repeats completed = a long exposure for a camera) -> drops O0.
+    * ``add``     -> ``nansum``  over repeats (accumulating exposure).
     * ``replace`` / ``roll`` -> the LATEST repeat slice that holds data.
-    * ``create``  -> 1-D only: keep EVERY repeat-with-data as its own column block ``(points, n*dim)``
-      (repeat-major, dim-minor) so the curve draws one line per repeat (confocal's "create")."""
+    * ``create``  -> 1-D blocks only: keep EVERY repeat-with-data as its own column block
+      ``(points, n*dim)`` so the curve draws one line per repeat (confocal's "create"); for a 3-D+
+      data block (an image) ``create`` has no meaning and falls back to the mean."""
     a = np.asarray(raw, dtype=float)
-    if a.ndim != 3:                                     # already reduced (1-D/2-D) -> leave as-is
+    if a.ndim < 3:                                      # already reduced -> leave as-is
         return a
     has = np.isfinite(a).any(axis=tuple(range(1, a.ndim)))   # which repeat slices hold any data
     idx = np.flatnonzero(has)
@@ -83,7 +84,7 @@ def reduce_repeat(raw, mode: str = "average"):
         return np.nansum(a, axis=0)
     if mode in ("replace", "roll"):
         return a[idx[-1]] if idx.size else a[0]
-    if mode == "create":
+    if mode == "create" and a.ndim == 3:
         cols = idx if idx.size else np.array([0])
         return np.concatenate([a[r] for r in cols], axis=1)   # 1-D: (points, len(cols)*dim)
     with np.errstate(invalid="ignore", divide="ignore"):       # all-NaN cell -> NaN (not-yet-measured)
@@ -91,10 +92,10 @@ def reduce_repeat(raw, mode: str = "average"):
 
 
 def repeats_with_data(raw) -> int:
-    """How many repeat slices of a raw 3-D block currently hold data (drives the plot's ``xN``
-    label).  Non-3-D (already reduced) -> 1."""
+    """How many repeat slices of a raw block currently hold data (drives the plot's ``xN`` label).
+    An already-reduced (<3-D) array -> 1."""
     a = np.asarray(raw, dtype=float)
-    if a.ndim != 3:
+    if a.ndim < 3:
         return 1
     return int(np.count_nonzero(np.isfinite(a).any(axis=tuple(range(1, a.ndim)))))
 

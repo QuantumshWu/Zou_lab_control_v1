@@ -48,7 +48,7 @@ def test_live_camera_streams_only_while_the_pulse_is_firing():
         first = np.asarray(hub.latest("frame")).copy()
         cam.step()
         second = np.asarray(hub.latest("frame")).copy()
-        assert first.ndim == 3                                # the (repeat, H, W) data array
+        assert first.ndim == 4                                # the (repeat, 1, H, W) data block
         assert not np.array_equal(first, second)              # live updating while firing
 
         # 3) "Stop Pulse" (set_safe_state): no more triggers -> the live view FREEZES.
