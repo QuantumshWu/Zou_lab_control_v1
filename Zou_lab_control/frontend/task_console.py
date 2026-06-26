@@ -844,6 +844,10 @@ PANEL_PARAMS: dict[str, tuple[ParamSpec, ...]] = {
     ),
     "hist": (
         ParamSpec("bins", "bins", "int", 60, lo=5, hi=500, tooltip="Histogram bins"),
+        # A log count axis makes a SPARSE bright tail (rare high occupancy) visible -- on a linear
+        # axis a handful of bright shots vanish under the dark peak.  Default OFF (linear).
+        ParamSpec("ylog", "log count axis", "bool", False, display=True,
+                  tooltip="Log-scale the count (y) axis -- reveals a sparse bright tail"),
     ),
 }
 
@@ -2556,7 +2560,7 @@ class PanelCard(FluentGroupBox):
         elif kind == "hist":
             self.plotter = panel_plot(
                 np.asarray(value, dtype=float), kind="hist", size=size, interactions=False,
-                bins=int(self.config.params.get("bins", 60)),
+                bins=int(self.config.params.get("bins", 60)), ylog=bool(self.config.params.get("ylog", False)),
                 labels=("Value", "Shots", "Population"), title=self.config.title or None)
         else:  # 1d
             arr = np.asarray(value, dtype=float)

@@ -86,8 +86,9 @@ def test_calibrate_task_computes_every_method_processor_picks(threshold_method):
             cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer)
             occ = OccupancyProcessor(hub, calibration=cal, source_expr={"inputs": ["frame"], "source": "value = signal"}, method=m)
             cam.step(); occ.step()
-            assert hub.latest("occupied").shape == (12,)
-            # the judged frame is published, atomically -> rings + underlay are the same shot
+            occupied = np.asarray(hub.latest("occupied"))
+            assert occupied.ndim == 3 and occupied.shape[2] == 12      # (repeat, 1, n_sites) block (#H3q)
+            # the judged frame block is published, atomically -> rings + underlay are the same shots
             assert np.array_equal(hub.latest("frame_judged"), hub.latest("frame"))
     finally:
         exp.close()

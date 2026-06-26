@@ -1835,10 +1835,12 @@ class HistogramFigure(BaseLivePlot):
         bins: int | Sequence[float] = 50,
         thresholds: Sequence[float] | None = None,
         labels: Sequence[str] = ("Counts", "Shots", "Population"),
+        ylog: bool = False,
         **kwargs,
     ):
         self.values = np.asarray(values, dtype=float).reshape(-1)
         self.bins_arg = bins
+        self.ylog = bool(ylog)          # log-scale the COUNT axis (reveals a sparse bright tail)
         self.thresholds = list(thresholds or [])
         super().__init__(np.arange(len(self.values)), self.values, labels=labels, relim_mode="tight", **kwargs)
 
@@ -1878,7 +1880,7 @@ class HistogramFigure(BaseLivePlot):
             fontsize=small_fontsize(),
         )
         self.ax.set_xlim(self.bins[0], self.bins[-1])
-        self.ax.set_ylim(0, max(1, float(np.max(self.n) * 1.2)))
+        self._apply_count_yscale()
         self._update_hist_stats()
 
     def update(self, values=None, *, data_y=None, points_done: int | None = None, repeat_cur: int | None = None, draw: bool = True):
@@ -1901,7 +1903,7 @@ class HistogramFigure(BaseLivePlot):
         _update_verts(self.bins, self.n, self.verts, mode="vertical")
         self.poly.set_verts(self.verts)
         self.ax.set_xlim(self.bins[0], self.bins[-1])
-        self.ax.set_ylim(0, max(1, float(np.max(self.n) * 1.2)))
+        self._apply_count_yscale()
         self._fit_bimodal()
         while len(self.threshold_lines) < len(self.thresholds):
             line = self.ax.axvline(self.thresholds[len(self.threshold_lines)], **threshold_line_kwargs())
@@ -1927,47 +1929,91 @@ class HistogramFigure(BaseLivePlot):
             return {}
         return {int(state): float(np.mean(states == state)) for state in np.unique(states)}
 
-    def _fit_bimodal(self) -> None:
-        vals = self.values[np.isfinite(self.values)]
-        if vals.size < 6 or np.ptp(vals) == 0:
-            self.bimodal_popt = None
-            self.fit_threshold = None
-            return
+    def _apply_count_yscale(self) -> None:
+        """Set the count (y) axis scale + limits.  Log mode floors at 0.5 so 0-count bars sit BELOW
+        the axis (no 0 -> -inf on the filled poly) and a sparse bright tail becomes visible."""
+        top = max(1.0, float(np.max(self.n)) * (3.0 if self.ylog else 1.2))
+        if self.ylog:
+            self.ax.set_yscale("log")
+            self.ax.set_ylim(0.5, top)
+        else:
+            self.ax.set_yscale("linear")
+            self.ax.set_ylim(0, top)
 
+    def _fit_bimodal(self) -> None:
+        # A robust two-Gaussian fit with a UNIMODAL FALLBACK.  The old median split sat INSIDE the
+        # dark blob whenever the bright mode was sparse (rare high occupancy), seeding both Gaussians
+        # on dark so curve_fit collapsed to one blob and reported a MISLEADING fidelity.  Fix: split by
+        # between-class variance (Otsu) over the samples, seed each side's amplitude from its own bin
+        # counts, and -- when the bright mode is too sparse or unseparated -- fit ONE Gaussian and
+        # report fit F = N/A (honest), never a fake number.
+        vals = self.values[np.isfinite(self.values)]
+        self.bimodal_popt = None
+        self.fit_threshold = None
+        for ln in (self.fit_line_left, self.fit_line_right, self.fit_line_total):
+            ln.set_data([], [])
+        if vals.size < 6 or np.ptp(vals) == 0:
+            return
         centers = (self.bins[:-1] + self.bins[1:]) / 2
         counts = self.n.astype(float)
-        split = np.nanmedian(vals)
-        left_vals = vals[vals <= split]
-        right_vals = vals[vals > split]
-        if left_vals.size < 2 or right_vals.size < 2:
-            left_vals = vals[: vals.size // 2]
-            right_vals = vals[vals.size // 2 :]
+        span = float(np.ptp(vals)) or 1.0
+        x_fit = np.linspace(self.bins[0], self.bins[-1], 400)
 
-        mu0 = float(np.nanmean(left_vals))
-        mu1 = float(np.nanmean(right_vals))
+        # Otsu split on the sorted samples (between-class variance), NOT the median.
+        xs = np.sort(vals)
+        csum = np.cumsum(xs)
+        k = np.arange(1, xs.size, dtype=float)
+        score = k * (xs.size - k) * ((csum[-1] - csum[:-1]) / (xs.size - k) - csum[:-1] / k) ** 2
+        si = int(np.argmax(score))
+        split = float(0.5 * (xs[si] + xs[si + 1]))
+        left, right = vals[vals <= split], vals[vals > split]
+        if left.size < 2 or right.size < 2:
+            left, right = vals[: vals.size // 2], vals[vals.size // 2:]
+        mu0, mu1 = float(np.mean(left)), float(np.mean(right))
         if mu0 > mu1:
             mu0, mu1 = mu1, mu0
-        span = float(np.ptp(vals)) or 1.0
-        sigma0 = max(float(np.nanstd(left_vals)), span / 20, 1e-9)
-        sigma1 = max(float(np.nanstd(right_vals)), span / 20, 1e-9)
-        amp = max(float(np.nanmax(counts)), 1.0)
-        p0 = [amp, mu0, sigma0, amp, mu1, sigma1]
+        s0 = max(float(np.std(left)), span / 40, 1e-9)
+        s1 = max(float(np.std(right)), span / 40, 1e-9)
+
+        def _amp_near(mu):
+            return max(float(counts[int(np.clip(np.searchsorted(centers, mu), 0, len(counts) - 1))]), 1.0)
+
+        def _draw_unimodal():
+            try:
+                p0 = [max(float(np.max(counts)), 1.0), float(np.mean(vals)), max(float(np.std(vals)), span / 40, 1e-9)]
+                popt, _ = curve_fit(gaussian, centers, counts, p0=p0, maxfev=20000)
+                self.fit_line_total.set_data(x_fit, gaussian(x_fit, *popt))   # one curve, fit F = N/A
+            except Exception:
+                pass
+
+        # Too few bright samples to even attempt a second peak -> fit ONE Gaussian (fit F = N/A).
+        if right.size < max(4, int(0.01 * vals.size)):
+            _draw_unimodal()
+            return
+
+        p0 = [_amp_near(mu0), mu0, s0, _amp_near(mu1), mu1, s1]
         bounds = (
-            [0, float(np.nanmin(vals)), span / 200, 0, float(np.nanmin(vals)), span / 200],
-            [max(amp * 5, 1), float(np.nanmax(vals)), span * 2, max(amp * 5, 1), float(np.nanmax(vals)), span * 2],
+            [0, float(np.min(vals)), span / 200, 0, float(np.min(vals)), span / 200],
+            [max(_amp_near(mu0) * 5, 1), float(np.max(vals)), span * 2,
+             max(_amp_near(mu1) * 5, 1), float(np.max(vals)), span * 2],
         )
         try:
             popt, _ = curve_fit(bimodal_model, centers, counts, p0=p0, bounds=bounds,
                                  jac=bimodal_jacobian, maxfev=20000)
         except Exception:
-            self.bimodal_popt = None
-            self.fit_threshold = None
+            _draw_unimodal()
             return
-
         if popt[1] > popt[4]:
             popt = np.array([popt[3], popt[4], popt[5], popt[0], popt[1], popt[2]], dtype=float)
+        # Gate the fidelity on the FITTED separation (clean -- unlike a raw-bin dip test, which Poisson
+        # bin noise on a finely-binned UNIMODAL histogram fakes).  A real readout bimodal separates the
+        # fitted means by >~2 summed widths; an over-fitted single blob lands ~1.  Below 1.5 there is no
+        # meaningful threshold -> draw the blended curve but report fit F = N/A (never a fake number).
+        fitted_sep = abs(popt[4] - popt[1]) / (abs(popt[2]) + abs(popt[5]) + 1e-12)
+        if fitted_sep < 1.5:
+            self.fit_line_total.set_data(x_fit, bimodal_model(x_fit, *popt))
+            return
         self.bimodal_popt = popt
-        x_fit = np.linspace(self.bins[0], self.bins[-1], 400)
         y0 = gaussian(x_fit, *popt[:3])
         y1 = gaussian(x_fit, *popt[3:])
         self.fit_line_left.set_data(x_fit, y0)
