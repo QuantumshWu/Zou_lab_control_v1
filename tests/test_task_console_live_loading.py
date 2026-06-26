@@ -543,7 +543,7 @@ def test_save_persists_edit_param_values_not_just_layout():
         row = console.logic_nodes[-1]
         editor = console._logic_editors[id(row)]
         # edit a param in the Edit form WITHOUT starting the node
-        editor.form._widgets["threshold_frames"][1].setValue(9)
+        editor.form._widgets["threshold_frames"].setValue(9)
         # read_state flushes the open Edit form into the node config
         state = console.read_state()
         assert state.logic[-1].values["threshold_frames"] == 9

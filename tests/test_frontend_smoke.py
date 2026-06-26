@@ -1814,7 +1814,7 @@ def test_edit_area_select_fills_measurement_scan_range(monkeypatch):
         # its param form -- the form that carries the scan x-range.
         editor = next(iter(console._logic_editors.values()))
         form = editor.form
-        _, lo, hi, pts = form._widgets["t_off"]
+        ax = form._widgets["t_off"]; lo, hi, pts = ax.min_spin, ax.max_spin, ax.pts_spin
         lo.setValue(0.0); hi.setValue(120.0); pts.setValue(5)
         # a marked region [18, 91] (what a real drag-select on a plot of this
         # signal yields) becomes the next scan's x-range via set_axis_range.

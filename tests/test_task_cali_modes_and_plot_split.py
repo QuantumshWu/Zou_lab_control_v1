@@ -308,9 +308,9 @@ def test_calibrate_task_bool_param_renders_as_toggle_switch():
         row = console.logic_nodes[-1]
         console._edit_logic_node(row)
         editor = console._logic_editors[id(row)]
-        entry = editor.form._widgets["save_frames"]
-        assert entry[0] == "bool"
-        assert isinstance(entry[1], FluentSwitch)
+        widget = editor.form._widgets["save_frames"]
+        assert editor.form._decls["save_frames"].kind == "bool"
+        assert isinstance(widget, FluentSwitch)
     finally:
         console.shutdown()
         exp.close()
@@ -351,14 +351,14 @@ def test_pulse_scan_slots_form_is_template_driven():
     try:
         spec = {s.name: s for s in exp.readout.measurement_specs()}["Pulse scan"]
         panel = MeasurementPanel([spec], single=True)
-        tag, widget = panel._widgets["pulse_slots"]
-        assert tag == "pulse_slots"
+        widget = panel._widgets["pulse_slots"]
+        assert panel._decls["pulse_slots"].kind == "pulse_slots"
         out = panel.collect_values()["pulse_slots"]
         # the form returns the api numeric rows + the scan-table program + the software api-sweep
         # (``api_scan``) + the inter-point ``extra_delay`` -- all the build() consumes.
         assert isinstance(out, dict) and set(out) == {"api", "scan_code", "api_scan", "extra_delay"}
         # the imaging template carries 3 unique API handles -> 3 numeric rows after a switch
-        panel._widgets["template"][1].setText("imaging_template.json")
+        panel._widgets["template"].setText("imaging_template.json")
         panel._repopulate_pulse_slots("pulse_slots")
         out2 = panel.collect_values()["pulse_slots"]
         assert set(out2["api"]) >= {"a1", "a2", "a3"}

@@ -104,6 +104,17 @@ except Exception:  # pragma: no cover - depends on the local matplotlib install
 # layer uses to resolve paths, so the field shows exactly the file/folder that is used.
 from Zou_lab_control._paths import display_path
 
+# The ONE param-kind -> widget registry every form in this module dispatches through: a
+# ParamDecl of kind K is built / read / seeded / validated / refreshed by PARAM_WIDGETS[K].
+# Adding a kind is one handler there + one whitelist entry on ParamDecl, not 5-7 ladders here.
+from .param_widgets import PARAM_WIDGETS, SPAN_KINDS, ParamWidgetContext, RefreshProviders
+
+# ParamDecl is the ONE declarative param record both the measurement form and the plot
+# panels use (PANEL_PARAMS).  Importing it here (frontend -> operations is allowed; the
+# reverse is not) lets the panel params be real ParamDecls validated by the kind whitelist,
+# instead of a parallel ParamSpec class with its own smaller ladder.
+from Zou_lab_control.neutral_atom.operations.measurement import ParamDecl
+
 
 TASK_FILES_ENV = "ZLC_TASK_DIR"
 
@@ -789,35 +800,18 @@ CMAPS = ("inferno", "viridis", "magma", "plasma", "gray", "coolwarm")
 _BLANK_SOURCE = ""
 
 
-class ParamSpec:
-    """One declarative panel parameter: the Setting popup generates its widget
-    from this spec (confocal style -- adding a parameter is ONE line here, the
-    GUI, the JSON params and the plot rebuild all follow)."""
-
-    def __init__(self, key: str, label: str, kind: str, default, *,
-                 choices: Sequence[str] = (), lo: float = 0, hi: float = 1e9, tooltip: str = "",
-                 display: bool = False):
-        self.key = str(key)
-        self.label = str(label)
-        self.kind = str(kind)              # "choice" | "int" | "text"
-        self.default = default
-        self.choices = tuple(choices)
-        self.lo, self.hi = lo, hi
-        self.tooltip = str(tooltip)
-        # display=True  -> a BASIC display knob, rendered in the Setting popup
-        #                  (e.g. the colormap / colorset chooser).
-        # display=False -> a FUNCTIONAL plot-API parameter, rendered as a GUI
-        #                  control in the panel's Edit tab (length / bins /
-        #                  centers / image), so Setting and Edit never duplicate.
-        self.display = bool(display)
-
-    def get(self, params: Mapping[str, object]):
-        return params.get(self.key, self.default)
-
-
-PANEL_PARAMS: dict[str, tuple[ParamSpec, ...]] = {
+# A plot panel's per-kind params are REAL ``ParamDecl``s -- the SAME declarative record the
+# measurement form uses -- so they render through the SAME PARAM_WIDGETS registry and are
+# validated by the SAME kind whitelist (a typo'd kind raises at construction, instead of a
+# parallel ParamSpec silently degrading to a text box).  ``display`` (a ParamDecl DATA flag,
+# not an art knob) places the param: True = a basic display knob in the Setting popup (the
+# colormap chooser); False = a functional plot-API param in the panel's Edit tab -- so the two
+# surfaces never duplicate.  Adding a panel param is ONE ParamDecl here; adding a KIND is one
+# handler in param_widgets + one whitelist entry on ParamDecl.
+PANEL_PARAMS: dict[str, tuple[ParamDecl, ...]] = {
     "2d": (
-        ParamSpec("cmap", "colormap", "choice", "inferno", choices=CMAPS, tooltip="Image colormap", display=True),
+        ParamDecl(key="cmap", label="colormap", kind="choice", default="inferno", choices=CMAPS,
+                  tooltip="Image colormap", display=True),
     ),
     "sites": (
         # A site map is a binary occupancy OVERLAY (faint ring = empty, bold ring =
@@ -826,7 +820,7 @@ PANEL_PARAMS: dict[str, tuple[ParamSpec, ...]] = {
         # the per-site occupancy (PANEL_INPUT_SLOTS["sites"], picked in the Setting's Source
         # section); its ring CENTRES and the frame UNDERLAY auto-resolve from that signal's
         # producing node, so they are NOT extra slots or params here.
-        ParamSpec("cmap", "colormap", "choice", "gray", choices=CMAPS,
+        ParamDecl(key="cmap", label="colormap", kind="choice", default="gray", choices=CMAPS,
                   tooltip="Colormap for the camera-frame underlay", display=True),
     ),
     # The colormap / colorset chooser is the only per-kind knob that stays in the
@@ -835,18 +829,19 @@ PANEL_PARAMS: dict[str, tuple[ParamSpec, ...]] = {
     # surfaces never duplicate.
     "1d": (),
     "monitor": (
-        ParamSpec("length", "history", "int", 300, lo=20, hi=10_000,
-                  tooltip="Rolling history length (shots kept on screen)"),
+        ParamDecl(key="length", label="history", kind="int", default=300, lo=20, hi=10_000,
+                  display=False, tooltip="Rolling history length (shots kept on screen)"),
         # The side distribution is ONE plot kind's toggle (not a separate "no-dist" kind):
         # ON shows the histogram band beside the trace, OFF gives the bare rolling line.
-        ParamSpec("show_dist", "side distribution", "bool", True, display=True,
+        ParamDecl(key="show_dist", label="side distribution", kind="bool", default=True, display=True,
                   tooltip="Show the side distribution histogram beside the rolling trace"),
     ),
     "hist": (
-        ParamSpec("bins", "bins", "int", 60, lo=5, hi=500, tooltip="Histogram bins"),
+        ParamDecl(key="bins", label="bins", kind="int", default=60, lo=5, hi=500, display=False,
+                  tooltip="Histogram bins"),
         # A log count axis makes a SPARSE bright tail (rare high occupancy) visible -- on a linear
         # axis a handful of bright shots vanish under the dark peak.  Default OFF (linear).
-        ParamSpec("ylog", "log count axis", "bool", False, display=True,
+        ParamDecl(key="ylog", label="log count axis", kind="bool", default=False, display=True,
                   tooltip="Log-scale the count (y) axis -- reveals a sparse bright tail"),
     ),
 }
@@ -1577,7 +1572,7 @@ class PanelCard(FluentGroupBox):
         self.size_combo.currentTextChanged.connect(self._on_size)
         sec.addWidget(FluentSettingRow("size", self.size_combo, label_width=label_w))
 
-        # one ParamSpec widget per row -- this is where the kind's `cmap`
+        # one ParamDecl widget per row -- this is where the kind's `cmap`
         # colormap lives (the colorbar COLORSET chooser; there is no separate
         # cbar show/hide toggle).
         self.param_widgets: dict[str, QtWidgets.QWidget] = {}
@@ -1714,43 +1709,19 @@ class PanelCard(FluentGroupBox):
     def _note_settings_dismissed(self) -> None:
         self._settings_dismissed_at = time.monotonic()
 
-    def _make_param_widget(self, spec: ParamSpec, *, apply=None) -> QtWidgets.QWidget:
-        """One widget per declarative ParamSpec; edits apply INSTANTLY.
+    def _make_param_widget(self, spec: ParamDecl, *, apply=None) -> QtWidgets.QWidget:
+        """One widget per declarative ParamDecl; edits apply INSTANTLY.
 
         ``apply`` overrides where the edit goes (default ``self._set_param``); the
         Edit tab passes its own callback so a functional-param edit re-renders the
-        live panel AND its snapshot.  Same builder for both surfaces (DRY)."""
+        live panel AND its snapshot.  Dispatches through the SAME PARAM_WIDGETS
+        registry the measurement form uses (one handler per kind), with the edit
+        wired as the ``instant_apply`` path so a plot param applies on each edit."""
 
         cb = apply if apply is not None else self._set_param
         current = self.config.params.get(spec.key, spec.default)
-        if spec.kind == "choice":
-            combo = FluentComboBox()
-            combo.addItems(list(spec.choices))
-            if str(current) in spec.choices:
-                combo.setCurrentText(str(current))
-            combo.setToolTip(spec.tooltip)
-            combo.currentTextChanged.connect(lambda text, k=spec.key: cb(k, str(text)))
-            return combo
-        if spec.kind == "int":
-            spin = FluentDoubleSpinBox(length=max(4, len(str(int(spec.hi)))), allow_minus=False)
-            spin.setDecimals(0)
-            spin.setRange(spec.lo, spec.hi)
-            spin.setValue(int(current))
-            spin.setToolTip(spec.tooltip)
-            spin.valueChanged.connect(lambda v, k=spec.key: cb(k, int(v)))
-            return spin
-        if spec.kind == "bool":
-            sw = FluentSwitch("")
-            sw.setChecked(bool(current))
-            sw.setToolTip(spec.tooltip)
-            sw.toggled.connect(lambda v, k=spec.key: cb(k, bool(v)))
-            return sw
-        # "text": a free-form value (blank allowed where documented)
-        edit = FluentLineEdit(str(current))
-        edit.setMinimumWidth(scaled_px(96, minimum=80))   # expands in its row; long signal names not cut off
-        edit.setToolTip(spec.tooltip)
-        edit.editingFinished.connect(lambda k=spec.key, w=edit: cb(k, w.text().strip()))
-        return edit
+        ctx = ParamWidgetContext(instant_apply=cb)
+        return PARAM_WIDGETS[spec.kind].build(spec, current, ctx)
 
     def _repeat_param_specs(self) -> tuple:
         """The PLOT's repeat-DISPLAY param (``repeat_mode``), DECLARED so the Setting auto-renders it
@@ -1761,7 +1732,8 @@ class PanelCard(FluentGroupBox):
         from .live import REPEAT_MODES
         modes = list(REPEAT_MODES) if self.config.kind == "1d" else [m for m in REPEAT_MODES if m != "create"]
         return (
-            ParamSpec("repeat_mode", "repeat mode", "choice", "average", choices=tuple(modes),
+            ParamDecl(key="repeat_mode", label="repeat mode", kind="choice", default="average",
+                      choices=tuple(modes),
                       tooltip="How to combine the measurement's repeats for display (decoupled from\n"
                               "the signal):\n"
                               "  average = mean over the repeats that have data (noise reduction)\n"
@@ -2812,7 +2784,9 @@ class MeasurementPanel(QtWidgets.QWidget):
 
     # ------------------------------------------------------------- form build
     def _clear_form(self) -> None:
-        self._widgets = {}
+        self._widgets = {}       # param key -> widget
+        self._handlers = {}      # param key -> ParamWidgetHandler (kept in lockstep with _widgets)
+        self._decls = {}         # param key -> ParamDecl
         while self.form.count():
             item = self.form.takeAt(0)
             widget = item.widget()
@@ -2845,14 +2819,40 @@ class MeasurementPanel(QtWidgets.QWidget):
         spin.valueChanged.connect(self._refresh_start_enabled)
         return spin
 
+    def _param_context(self) -> ParamWidgetContext:
+        """The bundle every PARAM_WIDGETS handler builds against: re-validation on edit
+        + the signal providers + factories for the two composite widgets that live in
+        this module.  ``instant_apply`` stays None -- the measurement form reads back on
+        Start (``collect_values``), it does NOT push each edit into a live config."""
+        return ParamWidgetContext(
+            on_change=self._refresh_start_enabled,
+            signals_provider=self._signals_provider,
+            sources_provider=self._sources_provider,
+            formats_provider=self._formats_provider,
+            signal_expr_factory=lambda title: _SignalExprWidget(
+                signals_provider=self._signals_provider,
+                sources_provider=self._sources_provider,
+                formats_provider=self._formats_provider,
+                title=title),
+            pulse_slots_factory=lambda: _PulseSlotsWidget(),
+        )
+
     def _rebuild_form(self) -> None:
-        """Rebuild the parameter form for the currently selected measurement."""
+        """Rebuild the parameter form for the currently selected measurement.
+
+        ONE thin loop: each ParamDecl's widget is built by its registry handler
+        (``PARAM_WIDGETS[kind].build``) and stored by key alongside its HANDLER -- so the
+        collect / seed / required / refresh / set_running loops dispatch through the
+        handler, never index a positional tuple.  The only form-owned logic left is the
+        layout (row vs full-width span) and the dependent-combo wiring (a sibling-field
+        lookup the form must own)."""
         self._clear_form()
-        # decls for the dependent ``pulse_param`` combos, keyed by their field key (kept
-        # OUT of self._widgets so its entries stay a uniform (tag, widget) shape -- set_running
-        # iterates entry[1:] and would crash on a ParamDecl).
+        # decl + widget kept per key so the dependent-combo wiring (pulse_param / pulse_slots)
+        # can find its sibling ``path`` field and repopulate from the template it names.
         self._pulse_param_decls: dict[str, object] = {}
         self._pulse_slots_decls: dict[str, object] = {}
+        self._handlers: dict[str, object] = {}    # param key -> ParamWidgetHandler
+        self._decls: dict[str, object] = {}        # param key -> ParamDecl
         spec = self.current_spec()
         if spec is None:
             return
@@ -2863,9 +2863,10 @@ class MeasurementPanel(QtWidgets.QWidget):
         # their own section header, so they are not row labels).  Single rule via setting_label_width.
         scalar_labels = [
             (d.label or d.key) + (f" ({d.unit})" if d.unit else "") + (" *" if d.required else "")
-            for d in decls if d.kind not in ("signal_expr", "pulse_slots")
+            for d in decls if d.kind not in SPAN_KINDS
         ]
         self._form_label_w = setting_label_width(scalar_labels or [""], minimum=72)
+        ctx = self._param_context()
         for decl in decls:
             kind = decl.kind
             # Show the READABLE label ("Pulse template" / "Signal (y)" / "Output name"), not the
@@ -2874,178 +2875,58 @@ class MeasurementPanel(QtWidgets.QWidget):
             label_text = (decl.label or decl.key) + (f" ({decl.unit})" if decl.unit else "")
             if decl.required:
                 label_text += " *"
-            if kind == "axis_range":
-                lo, hi, points = decl.default if decl.default is not None else (0.0, 1.0, 2)
-                lo_spin = self._spin(decl, integer=False, value=lo)
-                hi_spin = self._spin(decl, integer=False, value=hi)
-                pts_spin = FluentDoubleSpinBox(length=5, allow_minus=False)
-                pts_spin.setDecimals(0)
-                pts_spin.setRange(2, 100000)
-                pts_spin.setValue(int(points))
-                pts_spin.setToolTip("Number of scan points (>= 2).")
-                pts_spin.valueChanged.connect(self._refresh_start_enabled)
-                triplet = QtWidgets.QWidget()
-                triplet.setStyleSheet("background: transparent;")
-                trow = QtWidgets.QHBoxLayout(triplet)
-                trow.setContentsMargins(0, 0, 0, 0)
-                trow.setSpacing(scaled_px(4, minimum=3))
-                trow.addWidget(lo_spin); trow.addWidget(self._tag("to")); trow.addWidget(hi_spin)
-                trow.addWidget(self._tag("/")); trow.addWidget(pts_spin); trow.addWidget(self._tag("pts"))
-                self._add_row(label_text, triplet)
-                self._widgets[decl.key] = ("axis_range", lo_spin, hi_spin, pts_spin)
-            elif kind == "bool":
-                # A bool parameter renders as a sliding on/off toggle switch (not a checkbox).
-                check = FluentSwitch("")
-                check.setChecked(bool(decl.default))
-                check.setToolTip(decl.tooltip)
-                check.toggled.connect(self._refresh_start_enabled)
-                self._add_row(label_text, check)
-                self._widgets[decl.key] = ("bool", check)
-            elif kind == "choice":
-                combo = FluentComboBox()
-                combo.addItems([str(c) for c in decl.choices])
-                if decl.default is not None and str(decl.default) in [str(c) for c in decl.choices]:
-                    combo.setCurrentText(str(decl.default))
-                combo.setToolTip(decl.tooltip)
-                combo.activated.connect(lambda *_: self._refresh_start_enabled())
-                self._add_row(label_text, combo)
-                self._widgets[decl.key] = ("choice", combo)
-            elif kind == "int":
-                # an optional int param (default None, not required) shows blank
-                # via a line edit so "leave blank" stays expressible; bounded ints
-                # with a default use a spin box.
-                if decl.default is None and not decl.required:
-                    edit = FluentLineEdit("")
-                    edit.setMinimumWidth(scaled_px(96, minimum=80))   # grows with the form field; no cutoff
-                    edit.setPlaceholderText("(all)")
-                    edit.setToolTip(decl.tooltip)
-                    edit.textChanged.connect(self._refresh_start_enabled)
-                    self._add_row(label_text, edit)
-                    self._widgets[decl.key] = ("int_opt", edit)
-                else:
-                    spin = self._spin(decl, integer=True)
-                    self._add_row(label_text, spin)
-                    self._widgets[decl.key] = ("int", spin)
-            elif kind == "path":
-                # A path param: line edit + Browse button (native file/folder dialog) --
-                # the ONE reusable picker, never a bare hand-typed path.
-                picker = FluentPathEdit(
-                    display_path(decl.default),                 # absolute, project-anchored (never bare)
-                    mode=getattr(decl, "path_mode", "file"),
-                    caption=f"Choose {decl.key}",
-                    file_filter=getattr(decl, "file_filter", "All files (*)"),
-                    base_dir=display_path(getattr(decl, "base_dir", "")))   # Browse lands in the real folder
-                picker.setToolTip(decl.tooltip)
-                picker.changed.connect(lambda *_: self._refresh_start_enabled())
-                self._add_row(label_text, picker)
-                self._widgets[decl.key] = ("path", picker)
-            elif kind == "signal":
-                # A hub-signal input (a processor's source) uses the SAME collapsible-tree picker
-                # the plot panels use (G2): one expandable producer group, signals as leaves with
-                # their shape + ready/waiting state; the pick is read back via current_signal().
-                combo = FluentTreeComboBox()
-                cur = "" if decl.default is None else str(decl.default)
-                def _names():
-                    try:
-                        return [str(n) for n in self._signals_provider()] if callable(self._signals_provider) else []
-                    except Exception:
-                        return []
-                fill_grouped_signal_combo(
-                    combo, names=_names(),
-                    sources=(self._sources_provider() if callable(self._sources_provider) else {}),
-                    formats=(self._formats_provider() if callable(self._formats_provider) else {}),
-                    current=cur)
-                combo.setToolTip(decl.tooltip)
-                combo.activated.connect(lambda *_: self._refresh_start_enabled())
-                self._add_row(label_text, combo)
-                self._widgets[decl.key] = ("signal", combo)
-            elif kind == "signal_expr":
-                # A MULTI-slot signal picker + a ``value = ...`` expression -- the SAME source
-                # control a plot panel uses (one reusable widget).  Lets a processor/measurement
-                # "source" subscribe to several running nodes' signals and combine them, not just
-                # one bare name.  Value is {"inputs": [...], "source": "value = ..."}.
-                widget = _SignalExprWidget(signals_provider=self._signals_provider,
-                                           sources_provider=self._sources_provider,
-                                           formats_provider=self._formats_provider,
-                                           title=label_text)
-                widget.set_value(decl.default if decl.default is not None else {})
-                widget.setToolTip(decl.tooltip)
-                widget.changed.connect(self._refresh_start_enabled)
+            handler = PARAM_WIDGETS[kind]
+            # build the widget seeded from the decl's default (a saved value is applied later by
+            # seed_values); the handler wires ctx.on_change (re-validate) onto its change signals.
+            widget = handler.build(decl, decl.default, ctx)
+            if kind in SPAN_KINDS:
                 self._add_span(widget)              # FULL-WIDTH span (label is the widget's header, #H3b)
-                self._widgets[decl.key] = ("signal_expr", widget)
-            elif kind == "pulse_slots":
-                # An AUTO-GENERATED sub-form for the pulse template named in decl.depends_on:
-                # one numeric input per API slot (a1/a2/...) and one points-expression input per
-                # scan slot (s0/s1/...).  When the template path changes the form rebuilds; when
-                # the operator types into a sub-row the value is collected as
-                # {"api": {name: float}, "scan_code": "<python>"} -- the same shape the
-                # pulse_scan build() consumes.  ONE source for the pulse slot form,
-                # so a NEW measurement that takes a pulse template gets this row for free.
-                # No redundant "Slots" wrapper header: the widget emits its OWN two PEER sections
-                # ("API slots" + "Scan table"), so a third same-style header above them would just
-                # confuse the hierarchy (#H3-1).
-                widget = _PulseSlotsWidget()
-                widget.setToolTip(decl.tooltip)
-                widget.changed.connect(self._refresh_start_enabled)
-                self._add_span(widget)              # FULL-WIDTH span
-                self._widgets[decl.key] = ("pulse_slots", widget)
-                self._pulse_slots_decls[decl.key] = decl
-            elif kind == "pulse_param":
-                # WHICH parameter of a pulse template to sweep: a DEPENDENT combo whose
-                # choices are introspected from the template FILE named in decl.depends_on
-                # (its periods / channels / DAC buses), repopulated whenever that path changes.
-                # Each item shows the human label; its data is the "kind:target" token the
-                # measurement build() consumes.  Editable so a saved target round-trips even
-                # before the template loads.
-                combo = FluentComboBox()
-                combo.setEditable(True)
-                combo.setToolTip(decl.tooltip)
-                combo.activated.connect(lambda *_: self._refresh_start_enabled())
-                self._add_row(label_text, combo)
-                self._widgets[decl.key] = ("pulse_param", combo)
+            else:
+                self._add_row(label_text, widget)
+            self._widgets[decl.key] = widget
+            self._handlers[decl.key] = handler
+            self._decls[decl.key] = decl
+            if kind == "pulse_param":
                 self._pulse_param_decls[decl.key] = decl
-            elif kind == "text":
-                edit = FluentLineEdit("" if decl.default is None else str(decl.default))
-                edit.setMinimumWidth(scaled_px(160, minimum=120))   # grows with the field; no cutoff
-                edit.setPlaceholderText(decl.tooltip[:48] if decl.tooltip else "")
-                edit.setToolTip(decl.tooltip)
-                edit.textChanged.connect(self._refresh_start_enabled)
-                self._add_row(label_text, edit)
-                self._widgets[decl.key] = ("text", edit)
-            else:  # float
-                spin = self._spin(decl, integer=False)
-                self._add_row(label_text, spin)
-                self._widgets[decl.key] = ("float", spin)
+            elif kind == "pulse_slots":
+                self._pulse_slots_decls[decl.key] = decl
         # Wire each pulse_param combo to its source template field (done AFTER the build loop
         # so the source field exists regardless of declaration order), then fill it once.  This
         # is the form's only inter-field reactivity: changing the template repopulates the
         # scan-target choices.
         for key, decl in self._pulse_param_decls.items():
-            src = self._widgets.get(getattr(decl, "depends_on", ""))
-            if src and src[0] == "path":
-                src[1].changed.connect(lambda *_a, k=key: self._repopulate_pulse_param(k))
+            src = self._sibling_path_widget(decl)
+            if src is not None:
+                src.changed.connect(lambda *_a, k=key: self._repopulate_pulse_param(k))
             self._repopulate_pulse_param(key)
         # Wire each pulse_slots widget to its template path (same dependency pattern as
         # pulse_param): when the template changes, rebuild the auto-form's per-slot rows.
         for key, decl in self._pulse_slots_decls.items():
-            src = self._widgets.get(getattr(decl, "depends_on", ""))
-            if src and src[0] == "path":
-                src[1].changed.connect(lambda *_a, k=key: self._repopulate_pulse_slots(k))
+            src = self._sibling_path_widget(decl)
+            if src is not None:
+                src.changed.connect(lambda *_a, k=key: self._repopulate_pulse_slots(k))
             self._repopulate_pulse_slots(key)
         self._refresh_start_enabled()
+
+    def _sibling_path_widget(self, decl):
+        """The ``path`` widget named in ``decl.depends_on`` (the template a dependent
+        pulse_param / pulse_slots field introspects), or None."""
+        dep = getattr(decl, "depends_on", "")
+        if dep and self._decls.get(dep) is not None and self._decls[dep].kind == "path":
+            return self._widgets.get(dep)
+        return None
 
     def _repopulate_pulse_slots(self, key: str) -> None:
         """Rebuild the auto-form rows of a ``pulse_slots`` widget from the pulse template
         named in its ``depends_on`` path field: one numeric input per API slot, one points-
         expression input per scan slot.  Preserves any value the operator already typed (the
         widget seeds each row from its current value when the slot survives the reload)."""
-        entry = self._widgets.get(key)
+        widget = self._widgets.get(key)
         decl = self._pulse_slots_decls.get(key)
-        if entry is None or decl is None or entry[0] != "pulse_slots":
+        if widget is None or decl is None:
             return
-        widget = entry[1]
-        src = self._widgets.get(getattr(decl, "depends_on", ""))
-        path = src[1].text() if (src and src[0] == "path") else ""
+        src = self._sibling_path_widget(decl)
+        path = src.text() if src is not None else ""
         try:
             from ..neutral_atom.operations.measurements.pulse_scan import _resolve_probe_template
             state = _resolve_probe_template(path)
@@ -3064,13 +2945,12 @@ class MeasurementPanel(QtWidgets.QWidget):
         the measurement consumes.  Preserves the current selection across a reload (the editable
         combo lets an unknown saved target round-trip).  A bad/empty path -> empty combo (Start
         stays disabled via ``required``)."""
-        entry = self._widgets.get(key)
+        combo = self._widgets.get(key)
         decl = self._pulse_param_decls.get(key)
-        if entry is None or decl is None or entry[0] != "pulse_param":
+        if combo is None or decl is None:
             return
-        combo = entry[1]
-        src = self._widgets.get(getattr(decl, "depends_on", ""))
-        path = src[1].text() if (src and src[0] == "path") else ""
+        src = self._sibling_path_widget(decl)
+        path = src.text() if src is not None else ""
         keep = combo.currentData() or combo.currentText()
         items: list[tuple[str, str]] = []   # (label, "kind:target")
         try:
@@ -3097,41 +2977,10 @@ class MeasurementPanel(QtWidgets.QWidget):
 
     # ------------------------------------------------------------- value read
     def collect_values(self) -> dict[str, object]:
-        """Read every parameter back BY KIND (no eval) into a build kwargs dict."""
-        values: dict[str, object] = {}
-        for key, entry in self._widgets.items():
-            tag = entry[0]
-            if tag == "axis_range":
-                _, lo_spin, hi_spin, pts_spin = entry
-                values[key] = (float(lo_spin.value()), float(hi_spin.value()), int(pts_spin.value()))
-            elif tag == "bool":
-                values[key] = bool(entry[1].isChecked())
-            elif tag == "choice":
-                values[key] = entry[1].currentText()
-            elif tag == "int":
-                values[key] = int(entry[1].value())
-            elif tag == "int_opt":
-                text = entry[1].text().strip()
-                values[key] = int(text) if text else None
-            elif tag in ("text", "path"):
-                values[key] = entry[1].text()
-            elif tag == "signal":
-                # the picked signal's BARE name (combo data, indented label under its node group)
-                # -- or the typed text for a not-yet-published name; read_editable_combo keeps a
-                # freshly TYPED name instead of the stale previously-selected data.
-                values[key] = read_editable_combo(entry[1])
-            elif tag == "pulse_param":
-                # the "kind:target" token (combo data) or the typed text, same editable-combo rule
-                values[key] = read_editable_combo(entry[1])
-            elif tag == "pulse_slots":
-                # auto-form output: {"api": {a1: 1e-3, ...}, "scan_code": "<python scan_table program>"}
-                values[key] = entry[1].values_dict()
-            elif tag == "signal_expr":
-                # multi-slot signal + expression: {"inputs": [...], "source": "value = ..."}
-                values[key] = entry[1].values_dict()
-            else:  # float
-                values[key] = float(entry[1].value())
-        return values
+        """Read every parameter back BY KIND (no eval) into a build kwargs dict --
+        each value is its handler's ``read`` of the widget (the coercion lives in
+        PARAM_WIDGETS, one rule per kind)."""
+        return {key: self._handlers[key].read(widget) for key, widget in self._widgets.items()}
 
     def refresh_on_show(self) -> None:
         """Re-poll providers and rebuild every dynamic combo (signals + pulse_params), so
@@ -3140,42 +2989,42 @@ class MeasurementPanel(QtWidgets.QWidget):
         yet); after a measurement publishes one, returning to this tab shows it -- without
         rebuilding the form, just refilling the existing combos -- so the current selection
         round-trips."""
-        for key, entry in list(self._widgets.items()):
-            tag, widget = entry[0], entry[1]
-            if tag == "signal":
-                current = read_editable_combo(widget)
-                names: list[str] = []
-                if callable(self._signals_provider):
-                    try: names = [str(n) for n in self._signals_provider()]
-                    except Exception: names = []
-                fill_grouped_signal_combo(
-                    widget, names=names,
-                    sources=(self._sources_provider() if callable(self._sources_provider) else {}),
-                    formats=(self._formats_provider() if callable(self._formats_provider) else {}),
-                    current=current)
-            elif tag == "pulse_param":
-                self._repopulate_pulse_param(key)
-            elif tag == "pulse_slots":
-                self._repopulate_pulse_slots(key)
-            elif tag == "signal_expr":
-                widget.rebuild_combos()      # a signal published since the form opened becomes pickable
+        names: list[str] = []
+        if callable(self._signals_provider):
+            try: names = [str(n) for n in self._signals_provider()]
+            except Exception: names = []
+        sources = self._sources_provider() if callable(self._sources_provider) else {}
+        formats = self._formats_provider() if callable(self._formats_provider) else {}
+        for key, widget in list(self._widgets.items()):
+            kind = self._decls[key].kind
+            # a DEPENDENT combo (pulse_param / pulse_slots) repopulates via the form's per-key
+            # hook (it reads the sibling template); a signal picker refills from live providers.
+            if kind == "pulse_param":
+                repopulate = lambda _w, k=key: self._repopulate_pulse_param(k)
+            elif kind == "pulse_slots":
+                repopulate = lambda _w, k=key: self._repopulate_pulse_slots(k)
+            else:
+                repopulate = None
+            providers = RefreshProviders(signals=names, sources=sources, formats=formats,
+                                         repopulate=repopulate)
+            self._handlers[key].refresh(widget, providers)
         self._refresh_start_enabled()
 
     def set_axis_range(self, lo: float, hi: float) -> bool:
         """Fill the FIRST axis_range param's Min/Max from a selected region
         (confocal _read_range: a plot selection becomes the next scan's range).
         Returns True if an axis_range param was found and set."""
-        for entry in self._widgets.values():
-            if entry[0] == "axis_range":
-                _, lo_spin, hi_spin, _pts = entry
-                lo_spin.setValue(float(min(lo, hi)))
-                hi_spin.setValue(float(max(lo, hi)))
+        for key, widget in self._widgets.items():
+            if self._decls[key].kind == "axis_range":
+                widget.min_spin.setValue(float(min(lo, hi)))
+                widget.max_spin.setValue(float(max(lo, hi)))
                 return True
         return False
 
     def _missing_required(self) -> list[str]:
-        """Required params whose value is empty (only the optional-int line edit
-        can be blank; spin boxes always hold a number)."""
+        """Required params whose value is empty -- delegated to each kind's handler
+        (``is_empty``): only a blank line-edit / unpicked combo is "missing"; a spin
+        box / switch always holds a value."""
         spec = self.current_spec()
         if spec is None:
             return []
@@ -3183,12 +3032,8 @@ class MeasurementPanel(QtWidgets.QWidget):
         for decl in spec.params:
             if not decl.required:
                 continue
-            entry = self._widgets.get(decl.key)
-            if entry is None:
-                missing.append(decl.label)
-            elif entry[0] in ("int_opt", "text", "path") and not entry[1].text().strip():
-                missing.append(decl.label)
-            elif entry[0] in ("signal", "pulse_param") and not read_editable_combo(entry[1]):
+            widget = self._widgets.get(decl.key)
+            if widget is None or self._handlers[decl.key].is_empty(widget):
                 missing.append(decl.label)
         return missing
 
@@ -3214,42 +3059,12 @@ class MeasurementPanel(QtWidgets.QWidget):
         params the panel last ran with), so a per-panel Edit reopens on the
         last-used values rather than the declared defaults.  Unknown keys and
         shape mismatches are ignored -- the declared form is the source of truth."""
-        for key, entry in self._widgets.items():
+        for key, widget in self._widgets.items():
             if key not in values:
                 continue
-            val = values[key]
-            tag = entry[0]
+            # each kind's handler seeds its own widget (ignoring a shape mismatch / bad value)
             try:
-                if tag == "axis_range" and isinstance(val, (tuple, list)) and len(val) == 3:
-                    entry[1].setValue(float(val[0])); entry[2].setValue(float(val[1]))
-                    entry[3].setValue(int(val[2]))
-                elif tag == "bool":
-                    entry[1].setChecked(bool(val))
-                elif tag == "choice":
-                    entry[1].setCurrentText(str(val))
-                elif tag == "int":
-                    entry[1].setValue(int(val))
-                elif tag == "int_opt":
-                    entry[1].setText("" if val is None else str(int(val)))
-                elif tag == "text":
-                    entry[1].setText("" if val is None else str(val))
-                elif tag == "path":
-                    entry[1].setText(display_path(val))   # absolute/project-anchored; blank stays blank
-                elif tag == "signal":
-                    # select the grouped item whose DATA is the bare name; fall back to the
-                    # editable text for a not-yet-published name.
-                    cur = "" if val is None else str(val)
-                    idx = entry[1].findData(cur)
-                    if idx >= 0:
-                        entry[1].setCurrentIndex(idx)
-                    else:
-                        entry[1].setCurrentText(cur)
-                elif tag == "pulse_param":
-                    entry[1].setCurrentText("" if val is None else str(val))
-                elif tag == "signal_expr":
-                    entry[1].set_value(val)            # {"inputs": [...], "source": "..."}
-                elif tag == "float":
-                    entry[1].setValue(float(val))
+                self._handlers[key].write(widget, values[key])
             except (TypeError, ValueError):
                 continue
         # A pulse_param combo's choices come from its (also-seeded) template field, so
@@ -3264,9 +3079,10 @@ class MeasurementPanel(QtWidgets.QWidget):
         self.start_button.setEnabled(not running and not self._missing_required())
         self.stop_button.setEnabled(bool(running))
         self.type_combo.setEnabled(not running)
-        for entry in self._widgets.values():
-            for widget in entry[1:]:
-                widget.setEnabled(not running)
+        # _widgets[key] is now the widget itself (a handler-owned control), not a positional
+        # tuple -- disable each one directly.
+        for widget in self._widgets.values():
+            widget.setEnabled(not running)
 
     def set_status(self, text: str, *, error: bool) -> None:
         self.status.setText(str(text)[:200])

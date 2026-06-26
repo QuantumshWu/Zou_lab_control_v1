@@ -78,8 +78,12 @@ class ParamDecl:
 
     ``required`` marks a parameter a GUI must highlight when missing.  ``depends_on`` (kind
     ``pulse_param``) names the sibling ``path`` field whose pulse template is introspected to
-    populate this control.  No value here is ever ``eval``'d -- the spec consumer validates /
-    coerces by ``kind``.
+    populate this control.  ``display`` is a pure DATA placement flag (not an art/geometry knob):
+    a plot-panel param with ``display=True`` is a BASIC display knob rendered in the lightweight
+    Setting popup (e.g. the colormap chooser); ``display=False`` is a FUNCTIONAL plot-API param
+    rendered in the panel's Edit tab instead, so Setting and Edit never duplicate.  A measurement
+    param ignores it (defaults True).  No value here is ever ``eval``'d -- the spec consumer
+    validates / coerces by ``kind``.
     """
 
     key: str
@@ -99,6 +103,9 @@ class ParamDecl:
                                      # for a pulse template, "calibrations" for a data folder)
     depends_on: str = ""             # kind="pulse_param": the sibling kind="path" field whose
                                      # pulse template is introspected to populate this combo
+    display: bool = True             # plot-panel placement flag (DATA, not art): True = a basic
+                                     # display knob in the Setting popup; False = a functional
+                                     # plot-API param in the Edit tab.  Ignored by measurements.
 
     def __post_init__(self) -> None:
         kind = str(self.kind).lower()

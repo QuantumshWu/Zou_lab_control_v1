@@ -113,10 +113,11 @@ def test_measurement_node_edit_generates_typed_form_with_required_param():
         # the spec's declared params PLUS the auto-injected acquisition knobs (repeat + free_run,
         # which every measurement-layer node owns -- #H3l).
         assert set(form._widgets) == {d.key for d in spec.params} | {"repeat", "free_run"}
-        assert form._widgets["repeat"][0] == "int" and form._widgets["free_run"][0] == "bool"
-        assert form._widgets["t_off"][0] == "axis_range"     # min/max/points triplet
-        assert form._widgets["shots"][0] == "int"
-        assert form._widgets["per_site"][0] == "bool"
+        # the form stores the widget by key + its kind in _decls (no positional tuple now)
+        assert form._decls["repeat"].kind == "int" and form._decls["free_run"].kind == "bool"
+        assert form._decls["t_off"].kind == "axis_range"     # min/max/points triplet
+        assert form._decls["shots"].kind == "int"
+        assert form._decls["per_site"].kind == "bool"
         # capture_radius is an ANALYSIS/fit input, NOT an acquisition param -> it is NOT in the form (#H3q)
         assert "capture_radius" not in form._widgets
         vals = form.collect_values()
@@ -141,9 +142,9 @@ def test_node_start_builds_node_and_streams_no_auto_plot():
         from Zou_lab_control.neutral_atom.operations.logic import ScannedMeasurementNode
 
         spec, row, editor, form = _open_measurement_node(console, 0)
-        _, lo, hi, pts = form._widgets["t_off"]
+        ax = form._widgets["t_off"]; lo, hi, pts = ax.min_spin, ax.max_spin, ax.pts_spin
         lo.setValue(0.0); hi.setValue(120.0); pts.setValue(5)
-        form._widgets["shots"][1].setValue(8)
+        form._widgets["shots"].setValue(8)
 
         console._start_logic_node(row)
         node = console._logic_nodes[id(row)]
@@ -175,9 +176,9 @@ def test_node_start_then_stop_releases_controls_and_stops_node():
     console = _console(specs, session=exp)
     try:
         spec, row, editor, form = _open_measurement_node(console, 0)
-        _, lo, hi, pts = form._widgets["t_off"]
+        ax = form._widgets["t_off"]; lo, hi, pts = ax.min_spin, ax.max_spin, ax.pts_spin
         lo.setValue(0.0); hi.setValue(60.0); pts.setValue(3)
-        form._widgets["shots"][1].setValue(2)
+        form._widgets["shots"].setValue(2)
 
         console._start_logic_node(row)
         node = console._logic_nodes[id(row)]
@@ -201,9 +202,9 @@ def test_stopped_node_signals_still_name_their_producer_in_picker():
     console = _console(specs, session=exp)
     try:
         spec, row, editor, form = _open_measurement_node(console, 0)
-        _, lo, hi, pts = form._widgets["t_off"]
+        ax = form._widgets["t_off"]; lo, hi, pts = ax.min_spin, ax.max_spin, ax.pts_spin
         lo.setValue(0.0); hi.setValue(60.0); pts.setValue(3)
-        form._widgets["shots"][1].setValue(2)
+        form._widgets["shots"].setValue(2)
 
         console._start_logic_node(row)
         node = console._logic_nodes[id(row)]

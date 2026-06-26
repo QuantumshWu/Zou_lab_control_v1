@@ -102,8 +102,8 @@ def test_logic_node_source_picker_is_grouped_and_read_by_data():
         sources_provider=lambda: {"frame": ["live_image"], "occupied": ["occupancy"], "rate": ["occupancy"]},
         formats_provider=lambda: {"frame": "(48, 60)", "occupied": "(N,)", "rate": "scalar"})
     try:
-        tag, combo = panel._widgets["source"]
-        assert tag == "signal"
+        combo = panel._widgets["source"]
+        assert panel._decls["source"].kind == "signal"
         # grouped: at least one disabled (non-selectable) header row, signals carry the bare name
         from PyQt5.QtCore import Qt
         model = combo.model()
@@ -137,7 +137,7 @@ def test_signal_picker_keeps_a_freshly_typed_not_yet_published_name():
         sources_provider=lambda: {"frame": ["camera"], "rate": ["occupancy"]},
         formats_provider=lambda: {})
     try:
-        combo = panel._widgets["source"][1]
+        combo = panel._widgets["source"]
         idx = next(i for i in range(combo.count()) if combo.itemData(i) == "rate")
         combo.setCurrentIndex(idx)                 # a real selection
         combo.setEditText("future_signal")         # then the user types a new name

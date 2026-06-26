@@ -83,8 +83,8 @@ def test_calibrate_task_path_fields_show_absolute_project_paths():
     try:
         spec = exp.readout.task_specs()[0]
         editor = _open_editor(console, ("task", spec.name))
-        folder = editor.form._widgets["folder"][1].text()
-        template = editor.form._widgets["pulse_template"][1].text()
+        folder = editor.form._widgets["folder"].text()
+        template = editor.form._widgets["pulse_template"].text()
         assert Path(folder).is_absolute() and Path(folder) == PROJECT_ROOT / "calibrations"
         assert folder != "calibrations"                       # never the bare ambiguous name
         assert Path(template).is_absolute()
@@ -106,7 +106,7 @@ def test_occupancy_calibration_field_names_the_canonical_file_not_blank():
     try:
         spec = next(s for s in exp.readout.processor_specs() if "occup" in s.name.lower())
         editor = _open_editor(console, ("processor", spec.name))
-        text = editor.form._widgets["calibration"][1].text()
+        text = editor.form._widgets["calibration"].text()
         assert text != ""                                          # NOT blank
         p = Path(text)
         assert p.is_absolute() and p == PROJECT_ROOT / "calibrations" / "calibration.json"

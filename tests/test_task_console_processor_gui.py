@@ -71,12 +71,12 @@ def test_processor_node_runs_and_publishes(tmp_path):
         assert row.node.kind == "processor"
         # the Edit form opened, auto-generated incl. the 'text' folder-path field
         assert editor.form is not None
-        assert editor.form._widgets["data_dir"][0] == "text"
+        assert editor.form._decls["data_dir"].kind == "text"
         # default STOPPED: no node built, nothing on the hub
         assert console._logic_nodes[id(row)] is None
 
         # fill the folder + Start: the action runs ONCE on its own thread, publishes
-        editor.form._widgets["data_dir"][1].setText(str(data_dir))
+        editor.form._widgets["data_dir"].setText(str(data_dir))
         console._start_logic_node(row)
         node = console._logic_nodes[id(row)]
         deadline = time.monotonic() + 8.0
@@ -127,7 +127,7 @@ def test_judge_occupancy_node_reacts_to_frames(tmp_path):
         # model) -- the canonical default path may not exist in a fresh checkout.
         cal_file = tmp_path / "cal.json"
         exp.readout.save(str(cal_file))
-        editor.form._widgets["calibration"][1].setText(str(cal_file))
+        editor.form._widgets["calibration"].setText(str(cal_file))
 
         # a camera measurement publishes `frame`; the occupancy processor reacts to it
         cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer)

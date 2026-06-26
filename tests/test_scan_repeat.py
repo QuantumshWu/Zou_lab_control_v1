@@ -147,10 +147,11 @@ def test_repeat_is_a_measurement_param_auto_injected_with_a_free_run_switch(monk
         for kind, name in (("measurement", "Pulse scan"), ("camera", "Camera")):
             row = console._add_logic_node(LogicNodeConfig(kind=kind, name=name))
             console._edit_logic_node(row)
-            w = console._logic_editors[id(row)].form._widgets
-            assert ("repeat", "int") == (("repeat" in w and "repeat"), w.get("repeat", ["?"])[0])
-            assert w["free_run"][0] == "bool"                # ∞ is a switch, not a spinbox magic value
-            assert w["repeat"][1].specialValueText() == "" and w["repeat"][1].minimum() == 1
+            form = console._logic_editors[id(row)].form
+            w, d = form._widgets, form._decls
+            assert "repeat" in w and d["repeat"].kind == "int"
+            assert d["free_run"].kind == "bool"              # ∞ is a switch, not a spinbox magic value
+            assert w["repeat"].specialValueText() == "" and w["repeat"].minimum() == 1
 
         # the node build turns the form values into (repeat:int, free_run:bool): the int is ALWAYS the
         # user's number (the depth) -- free_run NEVER discards it (it only toggles stop vs roll).
