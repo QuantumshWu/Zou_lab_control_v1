@@ -404,12 +404,32 @@ class Processor(LogicNode):
     def transform(self, inputs: dict[str, object]) -> dict[str, object]:  # pragma: no cover - abstract
         raise NotImplementedError
 
+    def output_keys(self) -> tuple[str, ...]:
+        """The bare signal names this processor publishes -- the SINGLE source.
+
+        ``provides`` (a class fact) IS this declaration; ``published_signals`` (the
+        prefixed hub names) and the spec's ``result_keys`` both derive from it, so the
+        output names are typed ONCE.  A subclass with dynamic outputs overrides this."""
+
+        return tuple(self.provides)
+
     def shot(self) -> dict[str, object]:
         inputs = self.new_inputs()
-        return {} if inputs is None else self.transform(inputs)
+        if inputs is None:
+            return {}
+        out = self.transform(inputs)
+        # Publish-time conformance: a processor may ONLY publish signals it declared in
+        # output_keys() -- an undeclared key would become a silent, unlegended hub signal
+        # the flow graph never shows.  Fail loud at the boundary instead.
+        extra = set(out) - set(self.output_keys())
+        if extra:
+            raise ValueError(
+                f"{type(self).__name__} published undeclared signal(s) {sorted(extra)}; "
+                "declare them in `provides` (the single output-key source).")
+        return out
 
     def published_signals(self) -> frozenset:
-        return frozenset(self.prefix + key for key in self.provides)
+        return frozenset(self.prefix + key for key in self.output_keys())
 
 
 class OccupancyProcessor(Processor):

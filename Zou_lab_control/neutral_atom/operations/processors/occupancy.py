@@ -110,7 +110,10 @@ def judge_occupancy(readout) -> ProcessorSpec:
         params=params,
         make_node=make_node,
         consumes=("frame",),
-        result_keys=("occupied", "counts", "rate", "centers", "thresholds", "frame_judged"),
+        # SINGLE SOURCE: the published key names live ONCE on the node class (its `provides`),
+        # the spec derives them -- so the spec's result_keys and the node's published_signals
+        # can never drift (#H3r-F3).
+        result_keys=OccupancyProcessor.provides,
         default_kind="sites",            # per-site atom map (live frame underlay + circles)
         default_value_key="occupied",
         # The site map auto-resolves its centres + underlay from THIS producing node: centres =
