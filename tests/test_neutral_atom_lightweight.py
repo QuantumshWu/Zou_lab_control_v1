@@ -7230,6 +7230,26 @@ def test_psf_bimodal_readout_end_to_end_on_virtual_backend():
     assert cal.detect(image).occupied_indices == [0, 1, 2, 5, 9]
 
 
+def test_sequence_name_does_not_switch_the_virtual_camera_to_all_bright():
+    """Decoupling (#H3q): the virtual camera must NOT render an idealized all-loaded frame just
+    because the ANALYSIS layer named its sequence 'sitemap'.  All-sites is ONLY the explicit device
+    kwarg ``force_all_sites``; otherwise a sitemap calibration sees realistic ~50% loading and finds
+    the sites by AVERAGING many frames -- the SAME path real hardware takes (virtual==real)."""
+    exp = na.connect("virtual", sitemap={"grid_shape": (5, 7)}, seed=3)
+    try:
+        exp.readout.sitemap(frames=8, display=False)
+        exp.readout.thresholds(frames=60, display=False)
+        cal = exp.readout.current
+        from conftest import fire_live_imaging
+        fire_live_imaging(exp)
+        seq = exp.readout._session._imaging_sequence(load=True, name="sitemap")   # the MAGIC name
+        img = exp.devices.camera.acquire(1, sequence=seq, sequencer=exp.devices.sequencer)[-1]
+        loaded = int(np.sum(np.asarray(cal.detect(img).occupied)))
+        assert 0 < loaded < cal.n_sites      # realistic partial loading -- the name does NOT force all-bright
+    finally:
+        exp.close()
+
+
 def test_psf_calibration_serialization_round_trip(tmp_path):
     exp = na.connect("virtual", loss_rate=0.001, seed=5)
     exp.readout.sitemap(method="psf", frames=4, display=False)

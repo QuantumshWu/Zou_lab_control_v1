@@ -537,12 +537,13 @@ class VirtualCamera(CameraDevice):
         probe_set = [probe_channel] + (["ch02"] if probe_channel == "probe" else [])
         exposures = exposures_per_frame(runtime_sequence, frames, default=self.exposure,
                                         trigger_channels=trigger_channels, probe_channels=probe_set)
-        # "All sites loaded" (the sitemap template) is requested explicitly via
-        # ``force_all_sites``; the legacy fallback keys off the sequence name.
-        all_sites = (
-            bool(force_all_sites) if force_all_sites is not None
-            else (sequence is not None and sequence.name == "sitemap")
-        )
+        # "All sites loaded" is an EXPLICIT device-boundary request (``force_all_sites``), NEVER
+        # inferred from the sequence NAME.  The old ``sequence.name == "sitemap"`` fallback let the
+        # ANALYSIS layer (it chooses that name) secretly switch the sim to an idealized all-bright
+        # frame -- a virtual!=real divergence: a real sitemap calibration sees ~50% loading and finds
+        # the sites by AVERAGING many frames (calibrate_sitemap_from_images, reducer='mean'), the SAME
+        # path virtual now takes.  So no analysis-set name controls what the camera renders.
+        all_sites = bool(force_all_sites)
         # ---- PULSE-DRIVEN ATOM PHYSICS (data-source side only) ----------------
         # Each camera frame is bounded by a camera-trigger rise.  In the window BEFORE
         # a frame the fired pulse decides what happens to the atoms:
