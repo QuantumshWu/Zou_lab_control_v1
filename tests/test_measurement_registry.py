@@ -107,7 +107,7 @@ def test_dropping_a_module_in_the_package_is_autodiscovered(exp):
         # and RESTARTS task_console (a fresh process), so production never needs it.
         import importlib
         importlib.invalidate_caches()
-        mr._DISCOVERED = False
+        mr._REGISTRY.reset_discovery()
         names = [s.name for s in exp.readout.measurement_specs()]
         assert "Dropped-in scan" in names
         import importlib
@@ -117,6 +117,6 @@ def test_dropping_a_module_in_the_package_is_autodiscovered(exp):
             mr.unregister_measurement(dropped_factory)
         sys.modules.pop(mod_name, None)
         new_file.unlink(missing_ok=True)
-        mr._DISCOVERED = False  # re-import only the surviving (real) modules next call
+        mr._REGISTRY.reset_discovery()  # re-import only the surviving (real) modules next call
 
     assert "Dropped-in scan" not in [s.name for s in exp.readout.measurement_specs()]
