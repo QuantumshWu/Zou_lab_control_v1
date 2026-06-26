@@ -33,12 +33,13 @@ virtual run exercises the identical path a real run does
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Callable
+from dataclasses import dataclass
+from typing import Any, Callable, ClassVar
 
 # Reuse the ONE declarative parameter type: same kind->widget mapping and the same
 # no-eval coercion the measurement form already uses (single source of truth).
 from .measurement import ParamDecl
+from ._spec import CatalogSpec
 
 
 @dataclass(frozen=True)
@@ -62,8 +63,8 @@ class ProcessorContext:
     stop: Any = None
 
 
-@dataclass(frozen=True)
-class ProcessorSpec:
+@dataclass(frozen=True, kw_only=True)
+class ProcessorSpec(CatalogSpec):
     """A named processing action + its declared parameters + ONE builder.
 
     Set EXACTLY ONE of:
@@ -89,8 +90,6 @@ class ProcessorSpec:
     lists the published output names and the user wires them into a separate plot.
     """
 
-    name: str
-    params: tuple[ParamDecl, ...]
     result_keys: tuple[str, ...]
     run: Callable[["ProcessorContext"], dict] | None = None
     make_node: Callable[..., Any] | None = None
@@ -98,9 +97,12 @@ class ProcessorSpec:
     summary_keys: tuple[str, ...] = ()
     default_kind: str = ""
     default_value_key: str = ""
-    metadata: dict[str, Any] = field(default_factory=dict)
+
+    collision_advice: ClassVar[str] = (
+        "give each processor unique result_keys (e.g. a per-processor prefix).")
 
     def __post_init__(self) -> None:
+        super().__post_init__()
         # Exactly one execution style -- a processor is reactive OR one-shot, never
         # both/neither (clean dispatch in the console; no ambiguous half-built spec).
         if (self.run is None) == (self.make_node is None):
@@ -114,18 +116,9 @@ class ProcessorSpec:
 
         return self.make_node is not None
 
-    def param(self, key: str) -> ParamDecl:
-        """Return the declaration for ``key`` (raises ``KeyError`` if absent)."""
-
-        for decl in self.params:
-            if decl.key == key:
-                return decl
-        raise KeyError(key)
-
-    def defaults(self) -> dict[str, Any]:
-        """The declared default value for every parameter, keyed by ``key``."""
-
-        return {decl.key: decl.default for decl in self.params}
+    def collision_key(self) -> tuple:
+        # Two processors publishing the same result key would clobber on the hub.
+        return tuple(self.result_keys)
 
 
 __all__ = ["ProcessorContext", "ProcessorSpec", "ParamDecl"]

@@ -29,12 +29,7 @@ from __future__ import annotations
 
 from ._open_registry import DEFAULT_ORDER, OpenRegistry
 
-_REGISTRY = OpenRegistry(
-    noun="measurement",
-    package=f"{__package__}.measurements",
-    collision_keys=lambda spec: (getattr(spec, "x_key", None), getattr(spec, "y_key", None)),
-    collision_advice="give each measurement a unique x_key/y_key (e.g. a per-measurement prefix).",
-)
+_REGISTRY = OpenRegistry(noun="measurement", package=f"{__package__}.measurements")
 
 register_measurement = _REGISTRY.register
 measurement = _REGISTRY.decorator

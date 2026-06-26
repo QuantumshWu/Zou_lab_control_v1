@@ -26,12 +26,7 @@ from __future__ import annotations
 
 from ._open_registry import DEFAULT_ORDER, OpenRegistry
 
-_REGISTRY = OpenRegistry(
-    noun="processor",
-    package=f"{__package__}.processors",
-    collision_keys=lambda spec: getattr(spec, "result_keys", ()),
-    collision_advice="give each processor unique result_keys (e.g. a per-processor prefix).",
-)
+_REGISTRY = OpenRegistry(noun="processor", package=f"{__package__}.processors")
 
 register_processor = _REGISTRY.register
 processor = _REGISTRY.decorator

@@ -23,7 +23,7 @@ from __future__ import annotations
 import importlib
 import pkgutil
 import warnings
-from typing import Callable, Iterable
+from typing import Callable
 
 # Default order for user/ad-hoc factories; built-ins pass a smaller order so they
 # list first.  Plenty of headroom on either side.
@@ -33,20 +33,16 @@ DEFAULT_ORDER = 100
 class OpenRegistry:
     """One auto-discovered catalog: register factories, build their specs in order.
 
-    ``noun`` names the kind for messages ("measurement"), ``package`` is the dotted
-    path of the built-ins package scanned on first use, and ``collision_keys(spec)``
-    returns the hub keys two specs must not share (e.g. a measurement's
-    ``x_key``/``y_key``) -- a collision is raised loud at discovery with
-    ``collision_advice`` appended."""
+    ``noun`` names the kind for messages ("measurement") and ``package`` is the dotted
+    path of the built-ins package scanned on first use.  The de-dup rule lives on the
+    SPEC, not here: discovery calls ``spec.collision_key()`` (the hub keys two specs
+    must not share) and raises loud with the spec's ``collision_advice`` appended -- so
+    every catalog's collision check has a single source (the :class:`CatalogSpec`
+    subclass), not a per-registry lambda."""
 
-    def __init__(
-        self, *, noun: str, package: str,
-        collision_keys: Callable[[object], Iterable[str | None]], collision_advice: str,
-    ) -> None:
+    def __init__(self, *, noun: str, package: str) -> None:
         self._noun = noun
         self._package = package
-        self._collision_keys = collision_keys
-        self._collision_advice = collision_advice
         # Each entry is (order, sequence, factory).  ``sequence`` is a monotonic
         # tie-break so equal-order factories keep registration order; a list (not a
         # dict) keeps duplicates out via identity while preserving order.
@@ -140,13 +136,13 @@ class OpenRegistry:
         # contributor must pick a unique key.
         seen: dict[str, str] = {}
         for spec in out:
-            for key in self._collision_keys(spec):
+            for key in spec.collision_key():
                 if not key:
                     continue
                 if key in seen and seen[key] != spec.name:
                     raise ValueError(
                         f"{self._noun}s {seen[key]!r} and {spec.name!r} both publish signal {key!r}; "
-                        + self._collision_advice)
+                        + type(spec).collision_advice)
                 seen[key] = spec.name
         return out
 

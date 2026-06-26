@@ -22,11 +22,13 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Protocol, runtime_checkable
+from typing import Any, Callable, ClassVar, Protocol, runtime_checkable
 
 import numpy as np
 
 from Zou_lab_control._viewer_registry import active_plotter
+
+from ._spec import CatalogSpec
 
 from ..core.analysis import estimate_threshold_fidelity, otsu_threshold, positive_int
 from ..core.calibration import TrapCalibration
@@ -145,28 +147,26 @@ def axis_range_tuple(value, name: str) -> tuple[float, float, int]:
     return lo, hi, points
 
 
-@dataclass(frozen=True)
-class MeasurementSpec:
+@dataclass(frozen=True, kw_only=True)
+class MeasurementSpec(CatalogSpec):
     """A named measurement + its declared parameters + a build closure.
 
     A spec is the dependency-free contract between a measurement and a GUI/API:
-    it lists the parameters ONCE (``params``), names the live curve's axes
-    (``result_labels`` + ``x_key``/``y_key`` published-signal keys), and exposes
-    ``build(**param_values) -> ScannedMeasurement`` returning an UNRUN measurement
-    a logic node can drive point-by-point.  ``metadata`` carries spec-specific extras
-    (e.g. the capture radius the temperature fit needs) without widening the call
-    signature.  (A per-site result lives in the raw ``<y_key>`` block's dimension axis -- the node
-    publishes ONE raw ``(repeat, points, dim)`` signal; a per-site grid view is a PLOT-side reduce +
-    reshape on it, using the trap array's grid shape, not a separate stored field.)
+    it lists the parameters ONCE (``params``, from :class:`CatalogSpec`), names the
+    live curve's axes (``result_labels`` + ``x_key``/``y_key`` published-signal keys),
+    and exposes ``build(**param_values) -> ScannedMeasurement`` returning an UNRUN
+    measurement a logic node can drive point-by-point.  ``metadata`` carries
+    spec-specific extras (e.g. the capture radius the temperature fit needs) without
+    widening the call signature.  (A per-site result lives in the raw ``<y_key>`` block's
+    dimension axis -- the node publishes ONE raw ``(repeat, points, dim)`` signal; a per-site
+    grid view is a PLOT-side reduce + reshape on it, using the trap array's grid shape, not a
+    separate stored field.)
     """
 
-    name: str
-    params: tuple[ParamDecl, ...]
     result_labels: tuple[str, str]
     x_key: str
     y_key: str
     build: Callable[..., "ScannedMeasurement"]
-    metadata: dict[str, Any] = field(default_factory=dict)
     # Canonical machine slug (the node prefix + signal names derive from it).  Defaults
     # to ``measurement_slug(name)`` so a measurement is named ONCE; ``x_key``/``y_key``
     # are the BARE quantity tokens (``t_off``/``survival``) -- the full hub signal is
@@ -174,22 +174,17 @@ class MeasurementSpec:
     # display name automatically instead of a hand-typed abbreviation.
     key: str = ""
 
+    collision_advice: ClassVar[str] = (
+        "give each measurement a unique x_key/y_key (e.g. a per-measurement prefix).")
+
     def __post_init__(self) -> None:
+        super().__post_init__()
         if not self.key:
             object.__setattr__(self, "key", measurement_slug(self.name))
 
-    def param(self, key: str) -> ParamDecl:
-        """Return the declaration for ``key`` (raises ``KeyError`` if absent)."""
-
-        for decl in self.params:
-            if decl.key == key:
-                return decl
-        raise KeyError(key)
-
-    def defaults(self) -> dict[str, Any]:
-        """The declared default value for every parameter, keyed by ``key``."""
-
-        return {decl.key: decl.default for decl in self.params}
+    def collision_key(self) -> tuple:
+        # Two measurements publishing the same bare x_key/y_key would clobber on the hub.
+        return (self.x_key, self.y_key)
 
 
 @dataclass(frozen=True)

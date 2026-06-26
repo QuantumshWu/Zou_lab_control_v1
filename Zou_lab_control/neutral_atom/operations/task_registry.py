@@ -25,12 +25,7 @@ from __future__ import annotations
 
 from ._open_registry import DEFAULT_ORDER, OpenRegistry
 
-_REGISTRY = OpenRegistry(
-    noun="task",
-    package=f"{__package__}.tasks",
-    collision_keys=lambda spec: (getattr(spec, "prefix", ""),),
-    collision_advice="give each task a unique prefix so their signals do not collide.",
-)
+_REGISTRY = OpenRegistry(noun="task", package=f"{__package__}.tasks")
 
 register_task = _REGISTRY.register
 task = _REGISTRY.decorator
