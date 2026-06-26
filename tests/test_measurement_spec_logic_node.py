@@ -97,10 +97,11 @@ def test_builtin_specs_build_unrun_scanned_measurements():
     assert temp.key == "temperature"
     assert temp.x_key == "t_off" and temp.y_key == "survival"
     assert temp.result_labels == ("Trap-off time", "Survival")
-    # capture_radius -> metres conversion for fit_temperature is carried in metadata.
-    assert temp.metadata["fit"] == "fit_temperature"
-    assert temp.metadata["fit_param"] == "capture_radius"
-    assert temp.metadata["fit_param_scale"] == pytest.approx(1e-6)
+    # capture_radius is an ANALYSIS/fit input (na.fit_temperature), NOT an acquisition param (#H3q):
+    # the measurement acquires survival-vs-t_off; the metadata only points at the fit.
+    assert "capture_radius" not in {d.key for d in temp.params}
+    assert "fit_param" not in temp.metadata and "fit" not in temp.metadata
+    assert "analysis_fit" in temp.metadata
     assert dur.key == "readout"
     assert dur.x_key == "detection_time" and dur.y_key == "fidelity"
     assert dur.result_labels == ("Detection time", "Fidelity")
@@ -118,7 +119,7 @@ def test_builtin_specs_build_unrun_scanned_measurements():
 
 def _temperature_node(exp, hub, *, points, shots, t_max_us=300.0):
     spec = exp.readout.measurement_specs()[0]
-    measurement = spec.build(t_off=(0.0, t_max_us, points), shots=shots, capture_radius=6.0)
+    measurement = spec.build(t_off=(0.0, t_max_us, points), shots=shots)
     return ScannedMeasurementNode(
         hub, measurement, x_key=spec.x_key, y_key=spec.y_key,
     ), spec
@@ -148,10 +149,9 @@ def test_temperature_node_run_to_completion_publishes_full_decaying_curve():
     # scan_done flips to 1 on the final publish.
     assert float(hub.latest("scan_done")) == pytest.approx(1.0)
 
-    # The fit recovers a temperature in the model's ballpark (50 uK truth), using the
-    # capture-radius conversion the spec metadata declares (um -> m).
-    scale = spec.metadata["fit_param_scale"]
-    fit = fit_temperature(x, y, capture_radius=6.0 * scale)
+    # The fit recovers a temperature in the model's ballpark (50 uK truth).  capture_radius is an
+    # ANALYSIS input supplied AT FIT TIME in metres (the trap geometry), not an acquisition param.
+    fit = fit_temperature(x, y, capture_radius=6.0e-6)
     assert fit.success
     assert 25e-6 <= fit.temperature_K <= 100e-6
 
@@ -165,7 +165,7 @@ def test_temperature_node_per_site_carries_the_per_site_dimension_in_the_raw_blo
     n_sites = exp.devices.trap_array.n_sites
     hub = SignalHub()
     spec = exp.readout.measurement_specs()[0]
-    measurement = spec.build(t_off=(0.0, 80.0, 4), shots=2, capture_radius=6.0, per_site=True)
+    measurement = spec.build(t_off=(0.0, 80.0, 4), shots=2, per_site=True)
     node = ScannedMeasurementNode(hub, measurement, x_key=spec.x_key, y_key=spec.y_key)
     node.run_to_completion()
 

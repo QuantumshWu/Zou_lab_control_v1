@@ -22,7 +22,7 @@ from ..temperature import build_release_recapture_pulse
 def temperature_release_recapture(readout) -> MeasurementSpec:
     s = readout.session
 
-    def build(*, t_off=(0.0, 300.0, 13), shots=16, capture_radius=6.0, per_site=False, **_ignored):
+    def build(*, t_off=(0.0, 300.0, 13), shots=16, per_site=False, **_ignored):
         t_min_us, t_max_us, points = axis_range_tuple(t_off, "t_off")
         t_off_s = np.linspace(float(t_min_us) * 1e-6, float(t_max_us) * 1e-6, int(points))
         # Target the channels the bound sequencer actually exposes (real configs
@@ -45,8 +45,6 @@ def temperature_release_recapture(readout) -> MeasurementSpec:
                   lo=0.0, hi=1e4, tooltip="Trap-off sweep min/max (us) and number of points."),
         ParamDecl("shots", "Shots / point", "int", default=16, lo=1, hi=100_000,
                   tooltip="Loadings averaged at each t_off (more = lower survival noise)."),
-        ParamDecl("capture_radius", "Capture radius", "float", default=6.0, unit="um", required=True,
-                  lo=1e-3, hi=1e3, tooltip="Trap capture radius (um); fixes the temperature scale for the fit."),
         ParamDecl("per_site", "Per-site survival", "bool", default=False,
                   tooltip="Report one survival column per site (else the array mean)."),
     )
@@ -58,7 +56,10 @@ def temperature_release_recapture(readout) -> MeasurementSpec:
         x_key="t_off",
         y_key="survival",
         build=build,
-        # The fit needs the capture radius in METRES; the GUI param is um, so
-        # record the converter the consumer applies before calling fit_temperature.
-        metadata={"fit": "fit_temperature", "fit_param": "capture_radius", "fit_param_scale": 1e-6},
+        # The measurement ACQUIRES survival vs t_off; turning that curve into a TEMPERATURE is a
+        # post-hoc ANALYSIS that needs the trap capture radius (a known geometry, NOT an acquisition
+        # knob, NOT a sim parameter): ``na.fit_temperature(scan.x, scan.y, capture_radius=<metres>)``.
+        # So ``capture_radius`` lives with the FIT, never as an acquisition ParamDecl (it changes
+        # nothing about what is fired/read).
+        metadata={"analysis_fit": "operations.temperature.fit_temperature(capture_radius=...)"},
     )
