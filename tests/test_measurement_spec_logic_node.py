@@ -373,10 +373,9 @@ def test_camera_measurement_exposes_camera_params_and_applies_them_live():
     cam_node = na.CameraMeasurement(hub, cam, sequencer=exp.devices.sequencer)
     fire_live_imaging(exp)                                  # On Pulse: the trigger-driven camera streams
 
-    # default frames_per_cycle=1 -> the first trigger as both 'frame' (the newest single image, for
-    # processors / the default 2D panel) and 'frame_0' (the per-trigger name), plus the rolling
-    # ``frames`` data array (the last `repeat` frames -- a 2D panel reduces its repeat axis).
-    assert cam_node.published_signals() == frozenset({"frame", "frame_0", "frames"})
+    # default frames_per_cycle=1 -> 'frame' = the (repeat, H, W) data array (a 2D panel reduces its
+    # repeat axis) and 'frame_0' = the single per-trigger image (for processors / per-trigger panels).
+    assert cam_node.published_signals() == frozenset({"frame", "frame_0"})
     params = cam_node.acquisition_parameters()
     assert "exposure" in params and params["exposure"] == float(cam.exposure)
     assert params["frames_per_cycle"] == 1
@@ -386,8 +385,9 @@ def test_camera_measurement_exposes_camera_params_and_applies_them_live():
     assert cam_node.acquisition_parameters()["exposure"] == 0.05
 
     cam_node.step()
-    frame = hub.latest("frame")
-    assert np.ndim(frame) == 2                              # a real 2-D camera frame
+    frame = np.asarray(hub.latest("frame"))
+    assert frame.ndim == 3                                  # the (repeat, H, W) data array
+    assert np.ndim(hub.latest("frame_0")) == 2             # a real 2-D camera frame (per-trigger)
 
 
 def test_running_node_applies_params_in_owner_thread_no_concurrent_acquire():

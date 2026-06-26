@@ -42,9 +42,12 @@ from .ticks import apply_smart_ticks
 # fontsize accessors); these module names stay as convenience aliases.
 DEFAULT_COLORS = list(PALETTE["series"])
 PULSE_COLORS = list(PALETTE["pulse_cycle"])
-#: A lone 1-D curve / rolling trace (no data dimension, no create repeats) draws in this grey -- the
-#: original single-line look (matches confocal's default); dim/create multi-lines use DEFAULT_COLORS.
+#: A lone 1-D curve / rolling trace draws in this grey -- EXACTLY confocal's repeat=1 line (matplotlib
+#: 'grey' #808080, alpha 1, the global lines.linewidth=1); the colour CYCLES for multi-line plots.
 LINE_SINGLE = PALETTE["line_single"]
+#: The per-line colour cycle, confocal's ['grey', 'skyblue', ...]: a lone line is the first (grey),
+#: extra lines (data dimensions OR ``create`` repeats) take the next colours.
+LINE_CYCLE = [LINE_SINGLE, PALETTE.get("bright", "skyblue")] + list(PALETTE["series"])
 
 
 # --- Repeat-axis reduction (the PLOT's `repeat_mode`) ---------------------------------------------
@@ -600,36 +603,16 @@ class Live1D(BaseLivePlot):
 
     plot_type = "1D"
 
-    def style_repeat(self, dim_cols: int, create_repeats: int) -> None:
-        """Tell the curve how its columns split between the DATA-DIMENSION axis (O2) and the
-        repeat-CREATE axis (#H3k), so the two kinds of multi-line read differently:
-
-        * a SINGLE line (1 column, no dim, no create) -> the original GREY (confocal's default),
-        * DATA-DIM lines (>1 dimension) -> distinct hues (different quantities),
-        * CREATE lines (each repeat of the SAME signal) -> the same hue, FADED by recency (newest
-          opaque, older lighter), so repeats never look like separate dimensions.
-
-        ``dim_cols`` = number of O2 columns per repeat; ``create_repeats`` = repeats drawn as lines
-        (1 unless repeat_mode='create')."""
-        self.dim_cols = max(1, int(dim_cols))
-        self.create_repeats = max(1, int(create_repeats))
-        if self.lines:
-            self._color_lines()
-
     def _color_lines(self) -> None:
-        dim = max(1, int(getattr(self, "dim_cols", 1)))
-        nrep = max(1, int(getattr(self, "create_repeats", 1)))
-        ncols = self.data_y.shape[1]
+        """Colour the curve(s) EXACTLY like Confocal-GUIv2: every line solid, ``alpha=1``,
+        ``linewidth=1``; the COLOUR cycles (grey, skyblue, ...) by column index.  A lone line is
+        grey.  There is NO per-repeat fade and NO dim-vs-create distinction -- the data-dimension
+        lines and the ``create`` repeat-lines are styled identically (one line per column), so this
+        matches the reference and the single-line look is unchanged."""
         for i, line in enumerate(self.lines):
-            d = i % dim                                    # which dimension (hue)
-            rep = i // dim                                 # which repeat (fade)
-            if ncols == 1:
-                line.set_color(LINE_SINGLE); line.set_alpha(1.0)          # grey, like before
-            elif nrep > 1:
-                hue = LINE_SINGLE if dim == 1 else DEFAULT_COLORS[d % len(DEFAULT_COLORS)]
-                line.set_color(hue); line.set_alpha(0.30 + 0.70 * (rep + 1) / nrep)  # create: fade by age
-            else:
-                line.set_color(DEFAULT_COLORS[d % len(DEFAULT_COLORS)]); line.set_alpha(1.0)  # dim: hues
+            line.set_color(LINE_CYCLE[i % len(LINE_CYCLE)])
+            line.set_alpha(1.0)
+            line.set_linewidth(1.0)
 
     def init_core(self) -> None:
         self.lines = self.ax.plot(self.data_x[:, 0], self.data_y, alpha=1)

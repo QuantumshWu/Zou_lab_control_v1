@@ -1316,10 +1316,6 @@ class PanelCard(FluentGroupBox):
         # ``_repeat_cur`` = how many repeats of the measurement's block currently have data (drives
         # the plotter's "xN" ylabel); set by _signal_then_repeat when it reduces the repeat axis.
         self._repeat_cur: int = 1
-        # how the 1-D curve's columns split: dim_cols = data-dimension lines (distinct hues),
-        # create_repeats = repeat-create lines (same hue, faded by recency) -- see _record_split.
-        self._dim_cols: int = 1
-        self._create_repeats: int = 1
         # The hub version at this panel's LAST render -- the per-panel multi-rate refresh
         # (see TaskConsole._tick) skips a panel on its beat when nothing new was published
         # since, so a slow panel does not redraw stale data and a fast one only when needed.
@@ -2195,85 +2191,65 @@ class PanelCard(FluentGroupBox):
         return name
 
     def _signal_then_repeat(self, namespace: Mapping[str, object]):
-        """The decoupled three-stage plot pipeline (#H3l).  The measurement owns the repeat axis: a
-        node publishes a RAW ``(repeat, points, dim)`` block (a 1-D scan), a ``(repeat, H, W)`` block
-        (a camera / 2-D image), or a plain value (repeat==1).  The PLOT processes it in three
-        ORTHOGONAL stages, none of which the others can reach into:
+        """The decoupled plot pipeline.  The MEASUREMENT owns the repeat axis: it publishes a RAW
+        block whose LEADING axis is the repeat (a 1-D scan's ``(repeat, points, dim)``, a camera's
+        ``(repeat, H, W)``); a node with no repeat publishes a plain value (a curve / image / scalar).
 
-        1. **signal** (the ``value = ...`` expression) -- runs PER data_points slice with ``signal``
-           presented as the points core only (a ``(points,)`` vector for 1-D, the image for 2-D), so
-           it CANNOT touch the repeat or dimension axes.
-        2. **repeat** (the plot's ``repeat_mode``) -- reduces the leading repeat axis O0.
-        3. **dim** (data-dimension) -- O2 becomes the multi-line split (recorded for colouring).
-
-        Returns the value to coerce+render."""
+        The plot runs the ``value = ...`` expression PER REPEAT (``signal`` = that repeat's whole
+        core -- the (H, W) frame, or the (points, dim) curve -- so the user can write ``value =
+        signal[0]`` etc.); ONLY the repeat axis is looped, so it stays decoupled.  Then ``repeat_mode``
+        reduces the repeat axis (average = the long-exposure mean over the repeats that have data, add
+        = sum, create = one line per repeat, ...).  ``_repeat_cur`` (how many repeats hold data) drives
+        the plotter's "xN" ylabel."""
         from .live import reduce_repeat, repeats_with_data
         mode = str(self.config.params.get("repeat_mode", "average"))
-        block = self._eval_signal_per_slice(namespace)            # stage 1 (signal = points only)
+        block, had_repeat = self._eval_signal_per_slice(namespace)
         if isinstance(block, (list, tuple)):                      # a free expression returned a list
             self._repeat_cur = 1
-            return self._record_split(np.asarray(block, dtype=float), "average")
+            return np.asarray(block, dtype=float)
         b = np.asarray(block, dtype=float)
-        if b.ndim == 3:                                           # the measurement's repeat block
-            self._repeat_cur = repeats_with_data(b)
-            reduced = reduce_repeat(b, mode)                      # stage 2: reduce O0
-            return self._record_split(reduced, mode)             # stage 3: dim split
+        if had_repeat and self.config.kind == "1d" and b.ndim == 2:   # (repeat, points) -> add dim axis
+            b = b[:, :, None]
+        if b.ndim == 3:                                           # ANY 3-D value IS a repeat block
+            self._repeat_cur = repeats_with_data(b)               # (camera (repeat,H,W) or scan (repeat,pts,dim))
+            return reduce_repeat(b, mode)                         # collapse the repeat axis per the mode
         self._repeat_cur = 1                                      # no repeat axis -> nothing to reduce
-        return self._record_split(b, "average")
+        return b
 
     def _eval_signal_per_slice(self, namespace: Mapping[str, object]):
-        """Stage 1 -- evaluate the ``value`` expression with ``signal`` = ONE data_points slice, so a
-        custom expression only ever sees the points core (never repeat/dim).  Applied across the
-        leading repeat axis (and, for a 1-D curve, the trailing dimension axis); the slices are
-        reassembled into the same ``(repeat, ...)`` block.  The default ``value = signal`` short-
-        circuits (identity) so the common path stays a single array op, not a Python loop."""
+        """Run the ``value`` expression once PER REPEAT and re-stack -> ``(repeat, *result), True``.
+        Every signal the expression reads that carries a repeat axis (the bound ``signal`` AND any
+        raw hub signal the source names directly, e.g. ``value = frame``) is presented as that
+        repeat's whole core -- the (H, W) frame / the (points, dim) curve -- so the user can process
+        it (``signal[0]``, ``frame.mean()``, ...) while the repeat axis stays OUTSIDE the expression.
+        When nothing read has a repeat axis (a single frame / curve / scalar) the expression runs
+        once -> ``value, False``.  The default ``value = signal`` on one bound block short-circuits."""
         from ..neutral_atom.operations.signal_expr import DEFAULT_SOURCE
         expr = self._signal_expr()
         sig = expr.signal_for(namespace, resolve=self._frame_resolve)
         slots = sig if isinstance(sig, list) else [sig]
-        if any(s is None for s in slots) or not slots:
-            ns = dict(namespace); ns["signal"] = sig              # let the expression raise/handle it
-            return expr.exec_in(ns)
-        arrs = [np.asarray(s, dtype=float) for s in slots]
-        lead = arrs[0]
-        # The default identity expression needs no per-slice work -- the picked block IS the value.
-        if str(self._compiled_source).strip() == DEFAULT_SOURCE and len(arrs) == 1:
-            return lead
-        if lead.ndim < 3:                                         # no repeat axis -> evaluate once
+        # raw hub signals the source NAMES directly (not via ``signal``) that carry a repeat axis
+        raw_names = [n for n in expr.co_names()
+                     if n != "signal" and np.ndim(namespace.get(n)) >= 3]
+        sig_rep = bool(slots) and all(s is not None and np.ndim(s) >= 3 for s in slots)
+        if not sig_rep and not raw_names:                         # no repeat axis -> evaluate once
             ns = dict(namespace); ns["signal"] = sig
-            return expr.exec_in(ns)
+            return expr.exec_in(ns), False
+        if sig_rep and not raw_names and len(slots) == 1 \
+                and str(self._compiled_source).strip() == DEFAULT_SOURCE:
+            return np.asarray(slots[0], dtype=float), True        # identity: the block IS the value
+        raw = {n: np.asarray(namespace[n], dtype=float) for n in raw_names}
+        sl = [np.asarray(s, dtype=float) for s in slots] if sig_rep else None
+        R = int((sl[0] if sig_rep else raw[raw_names[0]]).shape[0])
 
-        def _run(sl_signal):
+        def _run(r):
             ns = dict(namespace)
-            ns["signal"] = sl_signal
+            for n, a in raw.items():
+                ns[n] = a[r]                                       # slice each named block to this repeat
+            ns["signal"] = (sl[0][r] if len(sl) == 1 else [a[r] for a in sl]) if sl is not None else sig
             return np.asarray(expr.exec_in(ns), dtype=float)
 
-        R = lead.shape[0]
-        if self.config.kind == "1d":
-            D = lead.shape[2]
-            out = np.empty_like(lead)
-            for r in range(R):
-                for d in range(D):
-                    sl = arrs[0][r, :, d] if len(arrs) == 1 else [a[r, :, d] for a in arrs]
-                    out[r, :, d] = _run(sl).reshape(-1)
-            return out
-        # 2-D / image: signal = the (H, W) / grid slice per repeat
-        return np.stack([_run(arrs[0][r] if len(arrs) == 1 else [a[r] for a in arrs])
-                         for r in range(R)], axis=0)
-
-    def _record_split(self, reduced, mode: str):
-        """Record how the reduced curve's columns split between the DATA-DIMENSION axis (O2) and the
-        repeat-CREATE axis, so the 1-D plot can colour them differently (dim = distinct hues; create
-        = same hue faded by recency; a lone column = grey).  Returns ``reduced`` unchanged."""
-        r = np.asarray(reduced)
-        ncols = r.shape[1] if r.ndim == 2 else 1
-        if mode == "create" and r.ndim == 2:
-            self._create_repeats = max(1, int(self._repeat_cur))
-            self._dim_cols = max(1, ncols // self._create_repeats)
-        else:
-            self._create_repeats = 1
-            self._dim_cols = max(1, ncols)
-        return reduced
+        return np.stack([_run(r) for r in range(R)], axis=0), True
 
     def _coerce(self, value):
         kind = self.config.kind
@@ -2422,11 +2398,9 @@ class PanelCard(FluentGroupBox):
             self.plotter.update(np.asarray(value)[:, 1], draw=False)
         elif kind == "1d":
             # a reduced scan curve refreshed in place: push the (points, ncols) y AND the current
-            # repeat count so the "xN" ylabel tracks how many repeats have data.
+            # repeat count so the "xN" ylabel tracks how many repeats have data.  Colours cycle by
+            # column index inside Live1D (confocal-exact), so the panel no longer styles per-line.
             self.plotter.update(value, repeat_cur=int(getattr(self, "_repeat_cur", 1)), draw=False)
-            if hasattr(self.plotter, "style_repeat"):       # re-colour: create-repeat count can grow
-                self.plotter.style_repeat(int(getattr(self, "_dim_cols", 1)),
-                                          int(getattr(self, "_create_repeats", 1)))
         else:  # hist / 1d-vector
             self.plotter.update(value, draw=False)
         if self.canvas is not None:
@@ -2566,11 +2540,8 @@ class PanelCard(FluentGroupBox):
                 relim_mode=str(self.config.params.get("relim", "tight")),
                 **self._fixed_lim_kwargs(),
                 title=self.config.title or None)
-            # Colour the columns by their meaning (#H3k): data-dimension lines = distinct hues,
-            # create-repeat lines = same hue faded by recency, a lone line = grey (the original look).
-            if hasattr(self.plotter, "style_repeat"):
-                self.plotter.style_repeat(int(getattr(self, "_dim_cols", 1)),
-                                          int(getattr(self, "_create_repeats", 1)))
+            # Colours cycle by column index inside Live1D (confocal-exact: grey, skyblue, ...; a lone
+            # line is grey, every line alpha=1 / linewidth=1) -- no per-line styling needed here.
             # The plot shows the repeat count as a "xN" ylabel suffix (the panel computed it while
             # reducing the measurement's repeat axis).  Apply it NOW (an in-place update with the same
             # data) so the "xN" shows on the first build too -- not only after the next live tick.
@@ -2618,21 +2589,25 @@ class PanelCard(FluentGroupBox):
         self._teardown_plot()
 
 
-def _acquisition_param_decls() -> tuple:
+def _acquisition_param_decls(free_run_default: bool = False) -> tuple:
     """The acquisition knobs EVERY measurement-layer node owns, declared ONCE (#H3l): ``repeat`` =
     how many repeats to FILL into the data array (a measurement decides this -- the plot never can);
-    ``free_run`` = a BOOL switch for ∞ (keep only the newest REPEAT_RING).  Returned as real
+    ``free_run`` = a BOOL switch for ∞ (keep only the newest REPEAT_RING).  ``free_run_default`` is
+    True for a CAMERA (a live monitor streams continuously by default -- set Repeat + turn Free-run
+    OFF to take exactly N photos) and False for a scan (run the sweep once).  Returned as real
     ``ParamDecl``s so they auto-render through the SAME form path as every measurement param (no
     hand-placed widget, no magic value abused into a number spinbox)."""
     from ..neutral_atom.operations.measurement import ParamDecl
     return (
         ParamDecl(key="repeat", label="Repeat", kind="int", default=1, lo=1, hi=100000,
                   tooltip="How many repeats to acquire into the data array (a scan re-runs the whole "
-                          "sweep this many times; a camera keeps this many recent frames).  How the "
-                          "repeats are DISPLAYED is the plot panel's 'repeat mode' Setting."),
-        ParamDecl(key="free_run", label="Free-run (∞)", kind="bool", default=False,
-                  tooltip="Run forever, keeping only the newest 10 repeats (overrides Repeat).  ∞ is "
-                          "a switch -- the Repeat number is a plain integer, never a magic value."),
+                          "sweep this many times; a camera takes this many photos).  How the repeats "
+                          "are DISPLAYED is the plot panel's 'repeat mode' Setting (average = a long "
+                          "exposure, add = a running sum, create = one line per repeat)."),
+        ParamDecl(key="free_run", label="Free-run (∞)", kind="bool", default=bool(free_run_default),
+                  tooltip="Run forever, keeping only the newest 10 repeats (overrides Repeat).  Turn "
+                          "this OFF and set Repeat to take exactly N (a camera: N photos, then stop). "
+                          "∞ is a switch -- the Repeat number stays a plain integer, never a magic value."),
     )
 
 
@@ -4210,7 +4185,10 @@ class LogicNodeEditor(QtWidgets.QWidget):
         # BOOL switch -- a number spinbox is never abused with a magic value).  An acquisition node
         # (measurement / camera) gets them; a processor / task does not.  How the repeats are
         # DISPLAYED is the PLOT's "repeat mode" Setting -- there is NO "update mode" on a measurement.
-        acquisition = _acquisition_param_decls() if row.node.kind in ("measurement", "camera") else ()
+        # A camera defaults to Free-run (a live monitor streams continuously); the user turns it OFF
+        # and sets Repeat to take exactly N photos.  A scan defaults to a single finite sweep.
+        acquisition = (_acquisition_param_decls(free_run_default=(row.node.kind == "camera"))
+                       if row.node.kind in ("measurement", "camera") else ())
         self.form = MeasurementPanel([spec] if spec is not None else [], single=True,
                                      signals_provider=getattr(console, "_signal_names", None),
                                      sources_provider=getattr(console, "_signal_providers", None),

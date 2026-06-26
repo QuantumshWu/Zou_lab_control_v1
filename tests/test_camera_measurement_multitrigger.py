@@ -35,21 +35,25 @@ def test_two_triggers_publish_frame_0_and_frame_1():
     fire_live_imaging(exp)            # On Pulse: the trigger-driven camera now streams
     cam_node.step()
 
-    # the single frames + the rolling data array ``frames`` (3-D, the plot reduces its repeat axis).
-    assert set(cam_node.published_signals()) == {"frame", "frame_0", "frame_1", "frames"}
-    for key in ("frame", "frame_0", "frame_1"):
+    # ``frame`` IS the (repeat, H, W) data array (the plot reduces its repeat axis); ``frame_i`` are
+    # the single per-trigger images.
+    assert set(cam_node.published_signals()) == {"frame", "frame_0", "frame_1"}
+    for key in ("frame_0", "frame_1"):
         assert key in hub.names()
         assert np.asarray(hub.latest(key)).ndim == 2          # a real HxW image, not a scalar
-    assert np.asarray(hub.latest("frames")).ndim == 3         # (repeat, H, W) data array
-    # the default 2D panel signal aliases the FIRST trigger
-    assert np.array_equal(np.asarray(hub.latest("frame")), np.asarray(hub.latest("frame_0")))
+    block = np.asarray(hub.latest("frame"))
+    assert block.ndim == 3                                     # (repeat, H, W) data array
+    # the newest data-array slice is the FIRST trigger's frame (the default 2D panel reduces -> trigger 0)
+    has = np.isfinite(block).any(axis=(1, 2))
+    newest = block[np.flatnonzero(has)[-1]]
+    assert np.array_equal(newest, np.asarray(hub.latest("frame_0")))
 
 
 def test_default_is_single_trigger_back_compat():
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
     cam_node = CameraMeasurement(SignalHub(), exp.camera)        # frames_per_cycle defaults to 1
     cam_node.step()
-    assert set(cam_node.published_signals()) == {"frame", "frame_0", "frames"}
+    assert set(cam_node.published_signals()) == {"frame", "frame_0"}
 
 
 def test_readout_image_frame_judged_is_synced_with_occupancy():

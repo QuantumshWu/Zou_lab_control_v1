@@ -1053,28 +1053,38 @@ and still returns a complete `ScanResult` (x + `data_y` `(n_points, n_series)`).
 
 ### Repeat is a measurement param; repeat_mode is a plot param (the data model)
 
-A scan's full output is a 3-D block **O0×O1×O2 = (repeat, points, dim)**. The two scan logic nodes
-(`ScannedMeasurementNode`, `PulseScanNode`) **only FILL** that block point-by-point per pass — they
-do **not** combine the repeats. `repeat` is a **measurement** parameter (the Acquisition `Repeat`
-spin): a positive int, or `inf` (free-run = a `REPEAT_RING` (10) ring buffer, published rolled so
-the newest pass is last; `points_done`/`total_points` report `0` for inf so the progress line falls
-back to per-point). The node publishes the raw block under `<y_key>` (and a 2-D scan also publishes
-`<y_key>_grid` = the raw `(repeat, n0, n1)` block — a pure reshape, still no combine).
+A measurement's full output is a block whose **LEADING axis is the repeat** (a scan's
+`(repeat, points, dim)`, a camera's `(repeat, H, W)`). The measurement **FILLS** that block — it
+never combines the repeats. `repeat` is a **measurement** parameter (the Acquisition `Repeat` int +
+`Free-run (∞)` bool switch — never a magic value in a spinbox); both are declared ONCE as
+`ParamDecl`s in `_acquisition_param_decls(free_run_default)` and **auto-injected** into the same form
+path as every measurement param (`MeasurementPanel(acquisition_params=...)`), so a scan and a camera
+get them through the SAME `_rebuild_form`, never a hand-placed widget. `_repeat_value(values)` maps
+Free-run→`float('inf')` else the int. A scan re-runs the whole sweep `repeat` times; a **camera takes
+exactly `repeat` photos then FINISHES** (`finished`/`points_done`/`total_points`) — `repeat=N` ⇒ N
+photos, not forever. Free-run (∞) keeps only the newest `REPEAT_RING` (10) in a rolling buffer.
+**A camera defaults to Free-run** (a live monitor streams continuously); turn it OFF + set Repeat for
+a finite N-photo exposure. The camera publishes `frame` = the `(repeat, H, W)` data array itself
+(`frame_i` stay the single per-trigger images for processors / per-trigger panels; `OccupancyProcessor`
+reduces a 3-D `frame` to its newest filled slice for the per-shot judgement).
 
 HOW the repeats become a picture is a **plot** parameter, `repeat_mode` (each plot panel's Setting
-combo, persisted in `config.params`): `average | add | replace | roll | new` — the ONE owned reducer
-`frontend.live.reduce_repeat(raw, mode)` (single source) collapses the leading repeat axis. `average`
-= `nanmean` over the repeats that **have data** (the true running mean — magnitude-stable no matter
-how many passes finished; this is what "average" means, not a sum). `add` = `nansum`; `replace`/
-`roll` = the latest pass; `new` = every repeat as its own column (one line per repeat, **1-D only**).
-`PanelCard._with_signal_slots` runs the reduction BEFORE the source expression, so `value = signal`
-already sees the reduced `(points, dim)` (or `(points, n*dim)` for `new`); a 1-D panel keeps the 2-D
-shape so the dimension axis **O2** (and `new`) draw as **multiple lines** via Live1D's native
-multi-line + `×N` ylabel + column-grow `update(repeat_cur=)`. A 2-D panel reduces `_grid` then shows
-the `(n0,n1)` map (no `new`). The camera is the exception: it is a `Measurement` too and **does**
-average frames at the measurement (`repeat` + `update_mode` on its Edit) — that per-frame averaging
-is a device-side reduction, distinct from the plot-side repeat reduction. The panel computes the
-`×N` count itself (`repeats_with_data`) — fully decoupled, no console-pushed counter.
+combo, persisted in `config.params`): `average | add | replace | roll | create`. The pipeline
+(`PanelCard._signal_then_repeat` → `_eval_signal_per_slice`) runs the `value = ...` expression **once
+per repeat**, presenting every repeat-carrying signal it reads (the bound `signal` AND any raw hub
+signal it names directly, e.g. `value = frame[0]`) as that repeat's whole core — so the repeat axis
+stays OUTSIDE the expression and `signal` only ever sees one frame / curve. The re-stacked block (any
+3-D value, regardless of how it was named) is then collapsed by the ONE owned reducer
+`frontend.live.reduce_repeat(raw, mode)`: `average` = `nanmean` over the repeats that **have data**
+(the true running mean = a long exposure for a camera, magnitude-stable; this is what "average" means,
+not a sum), `add` = `nansum`, `replace`/`roll` = the latest, `create` = every repeat as its own column
+(one line per repeat, **1-D only**). A 1-D panel keeps the reduced 2-D shape so the dimension axis
+**and** `create` draw as **multiple lines** via Live1D's native multi-line + `×N` ylabel
+(`repeats_with_data` drives `update(repeat_cur=)`). Line style is **confocal-exact**: every line
+solid, `alpha=1`, the global `lines.linewidth=1`, colours CYCLE `LINE_CYCLE` (grey `#808080`,
+skyblue, …) by column index — a lone line is grey (identical to confocal's `repeat=1`), no per-repeat
+fade. There is **no** measurement-side averaging anywhere (that was the camera live-stutter); the
+plot owns every reduction.
 
 ### Single source of truth: build_*_scan + declarative spec
 

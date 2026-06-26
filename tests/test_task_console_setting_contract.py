@@ -375,14 +375,14 @@ def test_multi_signal_slots_let_an_expression_index_signal_i():
         assert len(card.slot_combos) == 1               # one slot by default
         card.config.inputs = ["a"]
         ns = {"a": np.arange(4.0), "b": np.ones(4)}
-        scalar = PanelCard._with_signal_slots(card, ns)["signal"]
+        scalar = card._signal_expr().signal_for(ns, resolve=card._frame_resolve)
         assert np.allclose(scalar, np.arange(4.0))       # single slot -> scalar `signal`
 
         card._add_signal_slot()                          # + signal
         assert len(card.slot_combos) == 2
         assert card.config.source == "value = signal[0] - signal[1]"   # seeded default
         card.config.inputs = ["a", "b"]
-        sig = PanelCard._with_signal_slots(card, ns)["signal"]
+        sig = card._signal_expr().signal_for(ns, resolve=card._frame_resolve)
         assert isinstance(sig, list) and len(sig) == 2   # >1 slot -> list `signal`
         assert np.allclose(sig[0], ns["a"]) and np.allclose(sig[1], ns["b"])
         # the difference expression the user would type evaluates to signal[0]-signal[1]

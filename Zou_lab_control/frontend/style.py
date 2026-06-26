@@ -224,7 +224,7 @@ _PALETTE: dict[str, Any] = {
     # -- never two near-identical colours (the old grey + sky-blue + tab:blue were indistinguishable).
     # Guarded by tests/test_series_palette_distinct.py (>=8 colours, pairwise perceptually distinct).
     "series": ["#0072B2", "#E69F00", "#009E73", "#CC79A7", "#D55E00", "#56B4E9", "#666666", "#F0E442"],
-    "line_single": "#666666",  # a lone curve / rolling trace (no extra dimension, no create repeats) -- grey
+    "line_single": "#808080",  # a lone 1-D curve / rolling trace -- matplotlib 'grey', EXACTLY confocal's repeat=1 line
     "pulse_cycle": [
         "#5D7583", "#C37D5A", "#6F8D73", "#A66E87", "#7A6FA4", "#B5A262",
         "#5E9A9A", "#9A765E", "#7890B5", "#8B8B8B", "#B97878", "#679174",

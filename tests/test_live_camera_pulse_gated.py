@@ -48,7 +48,7 @@ def test_live_camera_streams_only_while_the_pulse_is_firing():
         first = np.asarray(hub.latest("frame")).copy()
         cam.step()
         second = np.asarray(hub.latest("frame")).copy()
-        assert first.ndim == 2
+        assert first.ndim == 3                                # the (repeat, H, W) data array
         assert not np.array_equal(first, second)              # live updating while firing
 
         # 3) "Stop Pulse" (set_safe_state): no more triggers -> the live view FREEZES.
@@ -57,12 +57,13 @@ def test_live_camera_streams_only_while_the_pulse_is_firing():
         frozen = np.asarray(hub.latest("frame")).copy()
         for _ in range(6):
             assert cam.step() == {}                           # no publish: the view holds
-        assert np.array_equal(np.asarray(hub.latest("frame")), frozen)
+        # the (repeat, H, W) data array is frozen (equal_nan: the not-yet-filled ring rows are NaN)
+        assert np.array_equal(np.asarray(hub.latest("frame")), frozen, equal_nan=True)
 
         # 4) Re-fire -> the live view resumes.
         fire_live_imaging(exp)
         cam.step()
-        assert not np.array_equal(np.asarray(hub.latest("frame")), frozen)
+        assert not np.array_equal(np.asarray(hub.latest("frame")), frozen, equal_nan=True)
     finally:
         cam.stop()
         exp.close()
