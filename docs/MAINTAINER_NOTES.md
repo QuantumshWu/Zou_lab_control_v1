@@ -1457,3 +1457,51 @@ field: the node builds a `SignalExpr`, sets `consumes = tuple(expr.inputs)` (so 
 picked signals), and `transform` judges `expr.evaluate(inputs)` — `value = signal` on `frame` is
 the single-frame default, `value = (signal[0] + signal[1]) / 2` averages two. The console's
 frame-coherence resolver matches on `name in node.consumes` (the canonical reactive input set).
+
+## 21. The catalog / node / UI / layout base-class framework (#H3r, 2026-06-26)
+
+The five layers (device / measurement / processor / task / plot) are pinned down by base classes that
+OWN and ENFORCE the shared contract, so adding a new one is "declare your specifics" and a wrong
+addition fails LOUD (at import or at the publish boundary), not silently. Each rule is a pytest
+contract test — the single mechanical guard. Change the framework = change the base.
+
+- **Catalog specs** — `operations/_spec.py::CatalogSpec` (frozen, kw_only, dependency-free) is the
+  base of `MeasurementSpec` / `ProcessorSpec` / `TaskSpec`. It owns `name`/`params`/`metadata` +
+  `param()`/`defaults()` and ENFORCES (`__post_init__`) a non-empty name + a tuple of ParamDecl
+  params + UNIQUE param keys; `collision_key()` is ABSTRACT and `__init_subclass__` raises at import
+  if a new spec forgets it (the OpenRegistry de-dup rule lives ON the spec, not per-registry).
+  Subclass adds only its fields + `collision_key`. Guard: `tests/test_spec_base.py`.
+- **Open registries** — `operations/_open_registry.py::OpenRegistry` is the ONE auto-discovery +
+  ordered-registration + dedup-by-name + collision machinery; `measurement_registry` /
+  `processor_registry` / `task_registry` are thin shells binding the public names
+  (`register_*`/`<noun>`/`unregister_*`/`registered_*`) and re-exported symmetrically from
+  `operations` AND `neutral_atom`. Guard: `tests/test_registry_public_api_symmetry.py`.
+- **Reactive processor node** — `operations/logic.py::Processor`: `provides` (a class fact) is the
+  SINGLE output-key source; `output_keys()`/`published_signals()` and the spec's `result_keys`
+  derive from it. `shot()` ENFORCES publish-time conformance — a processor may only emit keys it
+  declared (an undeclared signal raises, never leaks). `repeat_contract` (reduce|preserve) is a
+  static class attr, never a user knob. Guards: `tests/test_processor_output_contract.py`,
+  `test_processor_repeat_contract.py`.
+- **Acquiring measurement node** — `operations/logic.py::Measurement`: declares `primary_signal`
+  (the key carrying the `(repeat,*points_shape,*data_shape)` contract block) and
+  `_assert_primary_shape(out)`. Camera / Scanned / PulseScan all `return self._assert_primary_shape(out)`
+  from `shot()`, so ANY measurement (incl. a future one) that mis-shapes its block (forgets the
+  repeat axis, sets only one of points/data shape) fails LOUD at publish, not as a wrong plot.
+  Guard: `tests/test_measurement_output_contract.py`. (The full ring/pass de-dup across the three
+  acquiring nodes is intentionally NOT done — the per-pass NaN-clear + free-run roll are
+  data-correctness logic that must be reproduced on real frames, not refactored blind.)
+- **UI param injection** — `frontend/param_widgets.py::ParamWidgetHandler` (ABC, 5 abstractmethods:
+  build/read/write/is_empty/refresh) + `PARAM_WIDGETS[kind]`. The measurement form, plot Setting,
+  Edit tab, and `_make_param_widget` ALL dispatch through it; `ParamSpec` is deleted (plot params are
+  `ParamDecl` with a `display` data flag), so a ParamDecl kind is rendered/read/seeded/validated in
+  ONE place. Adding a kind = one whitelist entry + one handler. Guard:
+  `tests/test_param_widget_registry.py`.
+- **Plot kinds** — `frontend/live.py::PLOT_KINDS` (tuple of `PlotKind`: key/cls/label/render_family/
+  panel/input_format/input_slots/single_slot) is the single source; `live.plot()` looks the class up
+  and task_console's `PANEL_KINDS`/`PANEL_INPUT_FORMAT`/`PANEL_INPUT_SLOTS`/`PANEL_SINGLE_SLOT_KINDS`
+  are DERIVED from it (byte-identical to the old literals); `data_figure` reads the declared
+  `render_family` (`"auto"` sentinel keeps the site map's conditional 1D/2D). Guard:
+  `tests/test_plot_kind_table.py`.
+- **Panel layout** — `frontend/task_console.py::GRID_UNIT` is the ONE spacing setting; `_compact`
+  snaps every vertical inter-card gap to an integer multiple of it (`_snap_gap`), so panel spacing is
+  always tidy `k*GRID_UNIT`, never a leftover-pixel gap. Guard: `tests/test_panel_grid_spacing.py`.
