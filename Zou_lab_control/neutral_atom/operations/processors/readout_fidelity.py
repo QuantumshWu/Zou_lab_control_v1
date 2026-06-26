@@ -30,7 +30,7 @@ def readout_fidelity(readout) -> ProcessorSpec:
     calibration when ``store_thresholds`` is set."""
 
     params = (
-        ParamDecl("data_dir", "Frames folder", "text", default="",
+        ParamDecl("data_dir", "Frames folder", "path", default="", path_mode="dir",
                   required=True, tooltip="Folder of saved frames (na.write_virtual_run output, or a real run)."),
         ParamDecl("prefix", "Frame prefix", "text", default="img"),
         ParamDecl("shots_per_group", "Shots/group", "int", default=4, lo=2, hi=64),

@@ -666,7 +666,7 @@ class LiveLive(Live1D):
     def init_core(self) -> None:
         self.axes = self.ax
         self.lines = self.ax.plot(self.data_x[:, 0], self.data_y, alpha=1)
-        self._color_lines()                       # single rolling trace -> grey (like before, #H3k)
+        self._color_lines()                       # a lone rolling trace -> grey (confocal style)
         self.ax.set_xlabel(self.xlabel)
         self.ax.set_ylabel(self.ylabel)
         self.ax.set_xlim(np.nanmin(self.data_x[:, 0]), np.nanmax(self.data_x[:, 0]))

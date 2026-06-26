@@ -130,7 +130,7 @@ def discovered_specs(readout):
             pos[name] = len(out)
             out.append(spec)
     # Two specs publishing the same x_key/y_key would overwrite each other on the
-    # shared SignalHub (and their _sites/_grid derivatives) -- a silent data mix-up.
+    # shared SignalHub -- a silent data mix-up.
     # Fail loud at discovery so a new measurement must pick a unique signal key.
     seen: dict[str, str] = {}
     for spec in out:

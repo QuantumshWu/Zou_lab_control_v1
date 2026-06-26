@@ -1587,11 +1587,11 @@ class PanelCard(FluentGroupBox):
             self.lim_combo.currentTextChanged.connect(self._on_relim_mode)
             sec.addWidget(FluentSettingRow("relim", self.lim_combo, label_width=label_w))
 
-            # Repeat (the update-mode stage, #H3k): a PLOT concern, fully decoupled from the signal.
-            # ``repeat`` = how many repeats to keep (a positive int, or ∞), ``repeat_mode`` = how to
-            # collapse them (average / add / replace / roll / create).  These are AUTO-GENERATED from
-            # declarations (the SAME _make_param_widget path as every other param -- no hand-placed
-            # widget) and edits route through _set_param (store -> reset -> re-render).
+            # ``repeat_mode`` (the DISPLAY collapse) is the ONLY repeat knob the plot owns: how to
+            # collapse a measurement's repeat axis for display (average / add / replace / roll / create).
+            # How MANY repeats lives on the MEASUREMENT (``repeat``/``free_run``, auto-injected by
+            # _acquisition_param_decls -- #H3l), NOT here.  Rendered through the SAME _make_param_widget
+            # path as every other param (no hand-placed widget); edits route through _set_param.
             for spec in self._repeat_param_specs():
                 widget = self._make_param_widget(spec)
                 self.param_widgets[spec.key] = widget
@@ -2573,7 +2573,7 @@ class PanelCard(FluentGroupBox):
                 ylabel = str(self.config.params.get("ylabel", "")) or label
             else:
                 # A reduced scan curve is ``(points, ncols)`` -- KEEP it 2-D so each column draws as
-                # its own line (the dimension axis O2, or one line per repeat in ``new`` mode); a
+                # its own line (the dimension axis O2, or one line per repeat in ``create`` mode); a
                 # plain vector stays 1-D (one line).  npts = the point count either way.
                 vec = arr if arr.ndim == 2 else arr.reshape(-1)
                 npts = arr.shape[0] if arr.ndim == 2 else vec.size
