@@ -65,20 +65,33 @@ class SignalSpec:
         return f"{self.label} ({self.unit})" if self.unit else self.label
 
 
-def describe_shape(value) -> str:
+def describe_shape(value, *, points_shape=None, data_shape=None, grid_shape=None) -> str:
     """A standardized shape string read straight from a published VALUE -- the SINGLE
     way the GUI says what a signal looks like, AUTO-EXTRACTED from real data rather
     than a hand-typed name->format map (which silently drifts from what a node really
-    emits).  ``scalar`` for a 0-d / Python number, else the numpy shape tuple verbatim
-    (``(35,)`` / ``(35, 2)`` / ``(96, 128)``).  ``None`` -> ``"—"`` (no value yet)."""
+    emits).  ``scalar`` for a 0-d / Python number; ``None`` -> ``"—"`` (no value yet).
+
+    When the value IS a measurement's primary block (its shape matches the node's declared
+    ``(repeat, *points_shape, *data_shape)`` contract, #H3o) it is shown in CONTRACT form
+    ``repeat × points × (data)`` -- the DATA grouped in parens (a camera frame ``5 × 1 ×
+    (96×128)``; a 1-D scan ``5 × 8 × (3)``; a 2-D scan ``5 × (4×5) × (1)`` via ``grid_shape``) --
+    so the GUI shows the repeat/points/data structure, not a flat tuple.  Otherwise the raw
+    numpy shape (``(35,)`` / ``(96, 128)``)."""
     if value is None:
         return "—"
-    shape = np.shape(value)
+    shape = tuple(int(n) for n in np.shape(value))
     if shape == ():
         return "scalar"
+    ps = tuple(int(n) for n in (points_shape or ()))
+    dsh = tuple(int(n) for n in (data_shape or ()))
+    if (ps or dsh) and len(shape) >= 1 and tuple(shape[1:]) == ps + dsh:
+        gs = tuple(int(n) for n in (grid_shape or ()))
+        pstr = "×".join(str(n) for n in (gs or ps)) or "1"
+        dstr = "×".join(str(n) for n in dsh) or "1"
+        return f"{shape[0]} × {pstr} × ({dstr})"          # repeat × points × (data)
     if len(shape) == 1:                  # numpy 1-D repr keeps the trailing comma: (35,)
-        return f"({int(shape[0])},)"
-    return "(" + ", ".join(str(int(n)) for n in shape) + ")"
+        return f"({shape[0]},)"
+    return "(" + ", ".join(str(n) for n in shape) + ")"
 
 
 class LogicNode:

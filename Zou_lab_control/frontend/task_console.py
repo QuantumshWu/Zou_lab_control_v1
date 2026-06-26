@@ -4752,7 +4752,9 @@ class TaskConsole(QtWidgets.QWidget):
         out: dict[str, str] = {}
         for name in self.hub.names():
             try:
-                out[str(name)] = describe_shape(self.hub.latest(name))
+                st = self._signal_structure(name) or {}
+                out[str(name)] = describe_shape(self.hub.latest(name), points_shape=st.get("points_shape"),
+                                                data_shape=st.get("data_shape"), grid_shape=st.get("grid_shape"))
             except Exception:
                 continue
         return out
@@ -4896,7 +4898,11 @@ class TaskConsole(QtWidgets.QWidget):
         for full in sorted(node.published_signals()):
             short = full[len(pfx):] if (pfx and full.startswith(pfx) and len(full) > len(pfx)) else full
             try:
-                shape = describe_shape(self.hub.latest(full))
+                # the node's PRIMARY block shows in contract form (repeat × points × (data)); its aux
+                # signals (a single frame_i etc.) don't match the block shape -> raw shape (#H3o).
+                shape = describe_shape(self.hub.latest(full), points_shape=getattr(node, "points_shape", ()),
+                                       data_shape=getattr(node, "data_shape", ()),
+                                       grid_shape=getattr(node, "grid_shape", ()))
             except Exception:
                 shape = "—"
             rows.append((short, shape, desc(short)))
