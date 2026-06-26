@@ -48,6 +48,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 from .live import (
     PANEL_SIZES,
+    PLOT_KINDS,
     panel_display_size,
     panel_plot,
     panel_size_cells,
@@ -125,13 +126,15 @@ TASK_FILES_ENV = "ZLC_TASK_DIR"
 # hub signals -- it touches no device, so it is NOT in this set and keeps running.
 DEVICE_DRIVING_KINDS: frozenset = frozenset({"camera", "measurement", "task"})
 
-PANEL_KINDS: dict[str, str] = {
-    "2d": "2D image",
-    "sites": "Site map",
-    "1d": "1D vector",
-    "monitor": "Rolling trace",
-    "hist": "Distribution",
-}
+# The Add-Panel plot kinds.  DERIVED from the ONE plot-kind table ``live.PLOT_KINDS``
+# (the kinds flagged ``panel=True``), NOT a hand-maintained parallel literal -- adding a
+# plot kind to that table (its key/class/label/input-format/slots) updates PANEL_KINDS,
+# PANEL_INPUT_FORMAT, PANEL_INPUT_SLOTS and PANEL_SINGLE_SLOT_KINDS together.  Insertion
+# order is preserved, so it is also the Add-Panel menu order.
+_PANEL_KINDS: tuple = tuple(pk for pk in PLOT_KINDS if pk.panel)
+
+#: ``key -> label`` for the Add-Panel menu + every panel/card/frame title.
+PANEL_KINDS: dict[str, str] = {pk.key: pk.label for pk in _PANEL_KINDS}
 
 #: Every panel + logic-node name is "<base> #N" with N counting from 1 (G1), so two panels /
 #: nodes of the same kind are always told apart -- in the card title, the Edit tab, the frame
@@ -161,53 +164,32 @@ def _safe_float(text, fallback: float) -> float:
     except (TypeError, ValueError):
         return float(fallback)
 
-# What signal SHAPE each plot kind expects as its ``value`` -- shown in the panel's
-# Setting so it is clear which signals fit (e.g. a Site map wants a per-site vector,
-# a 2D image wants a frame).  Single source for the panel's input self-documentation.
-# The ACCEPTED ``value`` size/shape per plot kind -- the ONE per-kind contract (everything
-# else about the source, the multi-slot picker + ``value = ...`` expression, is universal and
-# kind-agnostic).  Shown in the Setting + enforced in _coerce.
-PANEL_INPUT_FORMAT: dict[str, str] = {
-    "2d": "value must be a 2D array / camera frame (H×W)",
-    "sites": "value must be a per-site (N,) vector -- one number per tweezer (e.g. occupancy "
-             "0/1 or loading rate); signal[0]'s producing node also supplies the ring centres "
-             "+ frame underlay",
-    "1d": "value must be a 1D vector (N,) or per-site array",
-    "monitor": "value must be a scalar per shot (rolling trace)",
-    "hist": "value must be a 1D sample vector",
-}
+# What signal SHAPE each plot kind expects as its ``value`` -- shown in the panel's Setting so
+# it is clear which signals fit (e.g. a Site map wants a per-site vector, a 2D image wants a
+# frame).  DERIVED from each ``PlotKind.input_format`` in the ONE table; the per-kind contract
+# is declared THERE (everything else about the source -- the multi-slot picker + ``value = ...``
+# expression -- is universal and kind-agnostic).  Shown in the Setting + enforced in _coerce.
+PANEL_INPUT_FORMAT: dict[str, str] = {pk.key: pk.input_format for pk in _PANEL_KINDS}
 
 # The STARTING slot(s) each plot kind opens with (label, default-signal, tooltip).  Every kind
 # uses the SAME source MECHANISM (a signal picker + a ``value = ...`` expression box); whether a
 # kind can GROW extra slots (+signal / −signal) is declared by PANEL_SINGLE_SLOT_KINDS below
 # (the site map is single-slot).  A plot reads its picked input(s) as ``signal`` / ``signal[i]``.
-# Each slot = (label, default-signal-name, tooltip).
+# Each slot = (label, default-signal-name, tooltip).  The DEFAULT (a single blank ``signal``
+# slot) lives here; the per-kind overrides (e.g. the site map's "occupancy" slot) come from each
+# ``PlotKind.input_slots`` in the ONE table, so PANEL_INPUT_SLOTS is derived, not hand-listed.
 _DEFAULT_SLOTS = (("signal", "", "the hub signal to plot"),)
-# The site map OPENS with one slot for its per-site occupancy.  signal[0]'s producing node also
-# supplies the ring CENTRES + camera-frame UNDERLAY (the OccupancyProcessor publishes occupied +
-# centers + frame_judged together, declared via its spec metadata centers_key / image_key), so
-# the rings + underlay are always the same shot -- the user picks just the occupancy and the rest
-# auto-resolves (see PanelCard._sites_aux + TaskConsole._sites_inputs).  The value the expression
-# produces must be a per-site (N,) vector (PANEL_INPUT_FORMAT["sites"]).
 PANEL_INPUT_SLOTS: dict[str, tuple[tuple[str, str, str], ...]] = {
-    "sites": (
-        # BLANK default (like every other plot) -- a fresh site-map panel must NOT auto-bind
-        # to a running "occupied" signal on open; the user picks the occupancy signal in the
-        # Setting, and only THEN do the centres + frame underlay auto-resolve from that signal's
-        # producing node (_sites_inputs).  A non-blank default here was the "opens already
-        # connected" bug.
-        ("occupancy", "", "per-site (N,) occupancy vector (signal[0]) -- colours the rings; its "
-                          "producing node also supplies the centres + frame underlay"),
-    ),
+    pk.key: pk.input_slots for pk in _PANEL_KINDS if pk.input_slots
 }
 
 # The per-kind declaration of which plot kinds take EXACTLY ONE signal (no +signal / −signal
 # slot-growing).  The signal-expression MECHANISM (the picker + ``value = ...`` box + evaluator)
 # is universal -- every kind has it -- but a SINGLE-slot kind cannot add more slots because its
 # auxiliary data is resolved from signal[0]: the site map pulls its ring centres + frame underlay
-# from signal[0]'s producing node, so a 2nd signal slot would be meaningless.  This is the ONE
-# declared source of "single vs multi slot"; PanelCard reads it (no inline per-kind check).
-PANEL_SINGLE_SLOT_KINDS: frozenset = frozenset({"sites"})
+# from signal[0]'s producing node, so a 2nd signal slot would be meaningless.  DERIVED from each
+# ``PlotKind.single_slot`` flag in the ONE table; PanelCard reads it (no inline per-kind check).
+PANEL_SINGLE_SLOT_KINDS: frozenset = frozenset(pk.key for pk in _PANEL_KINDS if pk.single_slot)
 
 
 def panel_input_slots(kind: str) -> tuple[tuple[str, str, str], ...]:

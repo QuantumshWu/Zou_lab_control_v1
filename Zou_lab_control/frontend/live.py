@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from math import ceil
 from typing import Any, Mapping, Sequence
 
@@ -275,6 +276,11 @@ class BaseLivePlot:
     """
 
     plot_type = "base"
+    #: The DataFigure fitting FAMILY -- "1D" (line/hist fits) or "2D" (image
+    #: clim/centroid).  Declared ONCE per plot class (the single-source plot-kind
+    #: table ``PLOT_KINDS`` mirrors it) so ``DataFigure`` reads it instead of
+    #: re-deriving the family from matplotlib artists.  Default "1D".
+    render_family = "1D"
 
     def __init__(
         self,
@@ -607,6 +613,7 @@ class Live1D(BaseLivePlot):
     """Live 1D line plot with fixed-size notebook layout."""
 
     plot_type = "1D"
+    render_family = "1D"
 
     def _color_lines(self) -> None:
         """Colour the curve(s) EXACTLY like Confocal-GUIv2: every line solid, ``alpha=1``,
@@ -695,8 +702,9 @@ class LiveLive(Live1D):
             else:
                 self.text.set_text(label)
 
-    def _install_state(self) -> None:
-        self.fig._zlc_state = PlotState(plot_type="1D", x_array=self.data_x[:, 0], y_array=self.data_y)
+    # _install_state is byte-identical to the inherited Live1D._install_state
+    # (same "1D" PlotState with the same x/y arrays), so it is NOT overridden
+    # here -- the inherited one is reused (one fewer copy of the same code).
 
 
 class LiveLiveDis(LiveLive):
@@ -795,6 +803,7 @@ class Live2DDis(BaseLivePlot):
     """Live 2D image with side distribution, colorbar, and draggable clim."""
 
     plot_type = "2D"
+    render_family = "2D"
 
     def __init__(self, *args, cmap: str = PALETTE["cmap_scan"], bad_color: str = PALETTE["bad"], square: bool = True, **kwargs):
         super().__init__(*args, **kwargs)
@@ -961,6 +970,12 @@ class LiveSiteMap(BaseLivePlot):
     line up with the 2D panels (the side-distribution band stays empty)."""
 
     plot_type = "SITES"
+    # "auto" = let DataFigure resolve the fitting family from the artists PER FIGURE, not a
+    # fixed "1D"/"2D".  A site map's primary axes only carries an image when a background frame
+    # is supplied (``image=``); with only occupancy rings + no frame there is no imshow, so the
+    # legacy fitting family was "1D".  A static declared family would change that conditional
+    # behaviour, so the site map opts OUT of the declared override (behaviour-preserving).
+    render_family = "auto"
 
     def __init__(self, *args, image=None, roi_radius: float = 3.0, cmap: str = PALETTE["cmap_camera"], **kwargs):
         super().__init__(*args, **kwargs)
@@ -2080,6 +2095,93 @@ def _is_watch_update(update) -> bool:
     return bool(update)
 
 
+@dataclass(frozen=True)
+class PlotKind:
+    """ONE declarative record per plot kind -- the single source both ``live.plot()``
+    and the task_console Add-Panel / PANEL_* lookups READ.
+
+    Adding a plot kind means adding ONE ``PlotKind`` to :data:`PLOT_KINDS`; the
+    ``plot()`` dispatch, the kind->class lookup, the panel label, the accepted
+    ``value`` format, the starting signal slots and the single-vs-multi-slot rule
+    all derive from it -- no parallel dicts to keep in sync.
+
+    Fields
+    ------
+    key            the canonical kind string (``"1d"``, ``"2d"``, ...).
+    cls            the :class:`BaseLivePlot` subclass ``plot()`` instantiates.
+    label          the human Add-Panel / panel-title label.
+    render_family  the DataFigure fitting family ("1D" / "2D"), mirroring
+                   ``cls.render_family``.  The sentinel ``"auto"`` means "resolve
+                   per-figure from the artists" (the site map: image-family only
+                   when a background frame is supplied) -- DataFigure then keeps
+                   its legacy artist heuristic for that kind.
+    panel          True if this kind is offered as a console Add-Panel plot
+                   (every kind except the notebook-only ``pulse`` diagram).
+    input_format   one-line description of the accepted ``value`` shape (shown in
+                   the Setting; ``""`` for a non-panel kind).
+    input_slots    the STARTING signal slot(s) a fresh panel opens with --
+                   ``((label, default_signal, tooltip), ...)``; empty = the
+                   universal single ``signal`` slot.
+    single_slot    True if the kind takes EXACTLY ONE signal (no +/- slot growing).
+    """
+
+    key: str
+    cls: type
+    label: str
+    render_family: str = "1D"
+    panel: bool = True
+    input_format: str = ""
+    input_slots: tuple[tuple[str, str, str], ...] = ()
+    single_slot: bool = False
+
+
+# The ONE plot-kind table.  ``plot()`` looks the class up here (no if/elif ladder)
+# and the task_console derives PANEL_KINDS / PANEL_INPUT_FORMAT / PANEL_INPUT_SLOTS /
+# PANEL_SINGLE_SLOT_KINDS from it (no parallel literals).  Order is the Add-Panel
+# menu order.  ``monitor`` lists its DEFAULT class (LiveLiveDis, show_dist=True); the
+# bare LiveLive variant is the show_dist=False toggle, still inside plot().
+PLOT_KINDS: tuple[PlotKind, ...] = (
+    PlotKind(
+        key="2d", cls=Live2DDis, label="2D image", render_family="2D",
+        input_format="value must be a 2D array / camera frame (H×W)",
+    ),
+    PlotKind(
+        key="sites", cls=LiveSiteMap, label="Site map", render_family="auto",
+        single_slot=True,
+        input_format=(
+            "value must be a per-site (N,) vector -- one number per tweezer (e.g. occupancy "
+            "0/1 or loading rate); signal[0]'s producing node also supplies the ring centres "
+            "+ frame underlay"),
+        input_slots=(
+            # BLANK default (like every other plot) -- a fresh site-map panel must NOT auto-bind
+            # to a running "occupied" signal on open; the user picks the occupancy signal in the
+            # Setting, and only THEN do the centres + frame underlay auto-resolve from that signal's
+            # producing node (_sites_inputs).  A non-blank default here was the "opens already
+            # connected" bug.
+            ("occupancy", "", "per-site (N,) occupancy vector (signal[0]) -- colours the rings; its "
+                              "producing node also supplies the centres + frame underlay"),
+        ),
+    ),
+    PlotKind(
+        key="1d", cls=Live1D, label="1D vector", render_family="1D",
+        input_format="value must be a 1D vector (N,) or per-site array",
+    ),
+    PlotKind(
+        key="monitor", cls=LiveLiveDis, label="Rolling trace", render_family="1D",
+        input_format="value must be a scalar per shot (rolling trace)",
+    ),
+    PlotKind(
+        key="hist", cls=HistogramFigure, label="Distribution", render_family="1D",
+        input_format="value must be a 1D sample vector",
+    ),
+    # Notebook-only static timing diagram -- NOT a console Add-Panel kind.
+    PlotKind(key="pulse", cls=PulseSequenceFigure, label="Pulse sequence", render_family="1D", panel=False),
+)
+
+#: ``key -> PlotKind`` for O(1) dispatch.
+PLOT_KIND_BY_KEY: dict[str, PlotKind] = {pk.key: pk for pk in PLOT_KINDS}
+
+
 def _normalize_kind(kind: str | None) -> str:
     if kind is None:
         return "auto"
@@ -2718,40 +2820,44 @@ def plot(
     normalized_kind = _normalize_kind(kind)
     should_watch = _is_watch_update(update)
 
+    # The kind -> class dispatch is a SINGLE lookup in the PLOT_KINDS table (no if/elif
+    # ladder).  The handful of kinds with a per-kind input convention keep their tiny
+    # special-case (hist reads data_x as the values array; pulse is data_x-only + rejects
+    # watch; 2d validates the sealed `square`; monitor's show_dist toggle picks the bare
+    # vs side-distribution sibling) -- everything else is ``cls(x, y, labels=..).show()``.
     if normalized_kind == "hist":
         values = data_x if data_y is None else data_y
         labels = tuple(labels or ("Counts", "Shots", "Population"))
-        plotter = HistogramFigure(values, labels=labels, **kwargs).show(display=display)
+        plotter = PLOT_KIND_BY_KEY["hist"].cls(values, labels=labels, **kwargs).show(display=display)
     elif normalized_kind == "pulse":
         if should_watch:
             raise ValueError("pulse plots are static timing diagrams; update='watch' is not supported.")
         labels = tuple(labels or ("Time (s)", "", "State"))
-        plotter = PulseSequenceFigure(data_x, labels=labels, **kwargs).show(display=display)
+        plotter = PLOT_KIND_BY_KEY["pulse"].cls(data_x, labels=labels, **kwargs).show(display=display)
     else:
         x = _as_data_x(data_x)
         y = _as_data_y(data_y, len(x))
         if normalized_kind == "auto":
             normalized_kind = "2d" if x.shape[1] == 2 else "1d"
         labels = tuple(labels or ("X", "Y", "Z"))
-        if normalized_kind == "1d":
-            plotter = Live1D(x, y, labels=labels, **kwargs).show(display=display)
-        elif normalized_kind == "2d":
+        spec = PLOT_KIND_BY_KEY.get(normalized_kind)
+        if spec is None or spec.key in ("hist", "pulse"):
+            raise ValueError("kind must be auto, 1d, 2d, monitor, hist, sites, or pulse.")
+        cls = spec.cls
+        if normalized_kind == "2d":
             if "square" in kwargs:
                 square = kwargs.pop("square")
                 if square is not True:
                     raise ValueError("frontend.plot 2D figures are always square; call Live2DDis directly for internal non-square experiments.")
-            plotter = Live2DDis(x, y, labels=labels, square=True, **kwargs).show(display=display)
+            kwargs = {**kwargs, "square": True}
         elif normalized_kind == "monitor":
             # ONE rolling-trace kind; the side distribution is a show_dist toggle (default on).
-            # LiveLiveDis (with the side histogram) vs LiveLive (bare) -- both keep their own
-            # plot_type string ("live-distribution"/"live") so saved layouts still resolve.
+            # LiveLiveDis (with the side histogram, the table's default class) vs LiveLive (bare)
+            # -- both keep their own plot_type string ("live-distribution"/"live") so saved
+            # layouts still resolve.
             show_dist = bool(kwargs.pop("show_dist", True))
-            cls = LiveLiveDis if show_dist else LiveLive
-            plotter = cls(x, y, labels=labels, **kwargs).show(display=display)
-        elif normalized_kind == "sites":
-            plotter = LiveSiteMap(x, y, labels=labels, **kwargs).show(display=display)
-        else:
-            raise ValueError("kind must be auto, 1d, 2d, monitor, hist, sites, or pulse.")
+            cls = spec.cls if show_dist else LiveLive
+        plotter = cls(x, y, labels=labels, **kwargs).show(display=display)
 
     if should_watch:
         plotter.watch(
@@ -2803,6 +2909,9 @@ def load(path, *, kind: str | None = "auto", display: bool = True):
 
 __all__ = [
     "BaseLivePlot",
+    "PlotKind",
+    "PLOT_KINDS",
+    "PLOT_KIND_BY_KEY",
     "HistogramFigure",
     "Live1D",
     "Live2DDis",

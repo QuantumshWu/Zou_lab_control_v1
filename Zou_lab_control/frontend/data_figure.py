@@ -100,7 +100,16 @@ class DataFigure:
             self.cross = getattr(live_plot, "cross", self.cross)
 
         first_ax = self._ax
-        self.plot_type = "2D" if first_ax.images else "1D"
+        # The fitting FAMILY ("1D" / "2D") comes from the plot's DECLARED
+        # ``render_family`` (the single-source PLOT_KINDS table in live.py), not
+        # re-derived from matplotlib artists.  Fall back to the legacy artist
+        # heuristic (an image axes => 2D) when there is nothing to ask -- no
+        # live_plot (a GridPlot per-cell DataFigure built with ``fig=``/``ax=``, or
+        # a bare externally-constructed DataFigure) OR a plot that declares the
+        # ``"auto"`` sentinel (the site map, whose family is image-only when a
+        # background frame is supplied, so it stays artist-derived per figure).
+        declared = getattr(live_plot, "render_family", None) if live_plot is not None else None
+        self.plot_type = declared if declared in ("1D", "2D") else ("2D" if first_ax.images else "1D")
         self.ylabel_original = self.labels[1] if len(self.labels) > 1 else first_ax.get_ylabel()
         self.unit = unit or self._infer_unit(first_ax.get_xlabel())
         self.unit_original = self.info.get("unit", self.unit)

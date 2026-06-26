@@ -49,6 +49,18 @@ def test_no_plot_class_bypasses_base_live_plot():
     )
 
 
+def test_plot_kind_table_classes_are_all_base_live_plot():
+    """The ONE plot-kind table (``live.PLOT_KINDS`` -- the single source both ``plot()`` and the
+    task_console PANEL_* lookups read) may only point at BaseLivePlot subclasses, so a kind added
+    to the table cannot smuggle in a hand-rolled figure that loses the reusable layer.  (The
+    richer no-drift / render-family checks live in ``tests/test_plot_kind_table.py``.)"""
+    from Zou_lab_control.frontend.live import PLOT_KINDS
+
+    bad = [pk.key for pk in PLOT_KINDS
+           if not (inspect.isclass(pk.cls) and issubclass(pk.cls, BaseLivePlot))]
+    assert bad == [], f"PLOT_KINDS entries whose cls is not a BaseLivePlot subclass: {bad}"
+
+
 def _build_public_plots():
     """One instance of every public, data-easy plot entry point (display off)."""
     rng = np.random.default_rng(0)
