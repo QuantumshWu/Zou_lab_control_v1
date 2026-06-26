@@ -101,6 +101,11 @@ class LogicNode:
     # and ``tests/test_measurement_output_contract.py`` MECHANICALLY enforces the published shape.
     points_shape: tuple = ()
     data_shape: tuple = ()
+    # The INTENDED 2-D display geometry of the points axis when it is a flattened grid -- a 2-D scan
+    # declares ``grid_shape=(n0, n1)`` (prod == points_shape[0]) so a 2-D panel can reshape the
+    # flattened points back into an image, since ``data_shape`` stays ``(1,)`` for a scan (#H3o).
+    # Empty for a camera (its image is in ``data_shape``) and a 1-D scan.
+    grid_shape: tuple = ()
 
     def __init__(self, hub: SignalHub, *, prefix: str = ""):
         self.hub = hub
@@ -1579,6 +1584,9 @@ class PulseScanNode(Measurement):
         self._index = 0                                   # within-pass point index
         self.points_shape: tuple = (int(self._values.size),)   # swept points (2-D scan: n0*n1 flat)
         self.data_shape: tuple = (1,)                          # one scalar per point
+        # 2-D scan: the flattened points reshape to this (n0, n1) image on a 2-D panel (#H3o); the
+        # data stays a scalar, so the 2-D-ness is HERE, not in data_shape.
+        self.grid_shape: tuple = tuple(self.scan_shape) if self.scan_shape else ()
         # RAW block (repeat, *points_shape, *data_shape) = (repeat, n_points, 1), NaN = not-yet-
         # measured.  A 2-D scan has n_points = n0*n1; the 2-D panel reshapes by scan_shape to an image.
         self._raw = np.full((self._ring, *self.points_shape, *self.data_shape), np.nan, dtype=float)

@@ -114,11 +114,6 @@ TASK_FILES_ENV = "ZLC_TASK_DIR"
 # hub signals -- it touches no device, so it is NOT in this set and keeps running.
 DEVICE_DRIVING_KINDS: frozenset = frozenset({"camera", "measurement", "task"})
 
-# A 1-D panel keeps a reduced ``(points, dim)`` value 2-D (one line per data dimension) only while
-# ``dim`` is small -- a scan has a handful of series.  A wider trailing axis (a camera frame's image
-# width) is DATA to unroll into a single 1-D trace, not dozens of lines (#H3n auto-reshape).
-_DIM_MULTILINE_MAX = 16
-
 PANEL_KINDS: dict[str, str] = {
     "2d": "2D image",
     "sites": "Site map",
@@ -1278,7 +1273,8 @@ class PanelCard(FluentGroupBox):
 
     def __init__(self, config: PanelConfig, parent=None, *, names_provider=None,
                  sources_provider=None, formats_provider=None, axes_provider=None,
-                 sites_inputs_provider=None, curve_x_provider=None, frame_coherence_provider=None):
+                 sites_inputs_provider=None, curve_x_provider=None, frame_coherence_provider=None,
+                 structure_provider=None):
         # Titled frame: the title strip carries the panel KIND (top-left) and the
         # Setting button (top-right), so the card is delineated like the rest.
         super().__init__(PANEL_KINDS[config.kind], parent, shadow=True)
@@ -1308,6 +1304,10 @@ class PanelCard(FluentGroupBox):
         # always show the SAME shot -- the occupancy is ~instant, so frame and occupied are one
         # event.  No occupancy running -> the live frame is shown unchanged.
         self.frame_coherence_provider = frame_coherence_provider
+        # callable(signal) -> (points_shape, data_shape) from the producing node's output contract,
+        # so the plot auto-reshapes by the DATA dimensionality (1-D data -> multiple lines; 2-D data
+        # -> reshape/imshow) instead of guessing from sizes (#H3o).
+        self.structure_provider = structure_provider
         self.plotter = None
         self.canvas = None
         self._value_shape: tuple[int, ...] | None = None
@@ -2256,9 +2256,32 @@ class PanelCard(FluentGroupBox):
 
         return np.stack([_run(r) for r in range(R)], axis=0), True
 
+    def _bound_structure(self):
+        """The producing node's ``{points_shape, data_shape, grid_shape}`` for this panel's bound
+        signal -- authoritative ONLY for the DEFAULT identity source (``value = signal``), because a
+        custom expression rewrites the core's shape so the node's declared structure no longer
+        describes it (#H3o).  ``None`` -> the reshape falls back to shape inference."""
+        from ..neutral_atom.operations.signal_expr import DEFAULT_SOURCE
+        if str(self._compiled_source).strip() != DEFAULT_SOURCE:
+            return None
+        if not (self.config.inputs and callable(self.structure_provider)):
+            return None
+        try:
+            return self.structure_provider(self.config.inputs[0])
+        except Exception:
+            return None
+
     def _coerce(self, value):
         kind = self.config.kind
         arr = np.asarray(value, dtype=float)
+        # The producing node's structure (#H3o): reshape is decided by the DATA dimensionality (NOT a
+        # size threshold).  ``data_shape`` 1-D -> the data is multiple series -> LINES (data does not
+        # reshape); ``data_shape`` 2-D -> the data is an image -> it reshapes (image / flat trace).
+        # ``grid_shape`` un-flattens a 2-D scan's points to a map.  Empty (a custom expression / a raw
+        # array) -> fall back to shape inference, never assume.
+        st = self._bound_structure()
+        ds = tuple(st["data_shape"]) if st else ()
+        gs = tuple(st["grid_shape"]) if st else ()
         if kind == "1d":
             # 1D panels are y-vs-index by default.  Only a panel EXPLICITLY
             # flagged xy=True (e.g. a curve view whose source is
@@ -2266,29 +2289,46 @@ class PanelCard(FluentGroupBox):
             # x-y curve (col0 = x, col1 = y).
             if self.config.params.get("xy") and arr.ndim == 2 and arr.shape[1] == 2 and arr.shape[0] >= 1:
                 return arr
-            # Auto-reshape (#H3n): the value (after the repeat reduce) is the (*points, *data) core.
-            # A scan curve ``(points, dim)`` (small dim) stays 2-D so each data dimension draws as its
-            # own line; ``repeat_mode='create'`` keeps 2-D too (one line per repeat, any count).  An
-            # IMAGE-like core (a camera frame's (H, W), large axes) UNROLLS to a single 1-D vector --
-            # so a camera frame fed to a 1-D vector panel "just shows" as one flattened trace.
             a = np.squeeze(arr)
             mode = str(self.config.params.get("repeat_mode", ""))
-            if a.ndim == 2 and (mode == "create" or a.shape[1] <= _DIM_MULTILINE_MAX):
+            if len(ds) == 2:
+                # the DATA is a 2-D image -> it does NOT make per-data lines.  ``create`` already
+                # arrived as ``(pixels, repeat)`` from reduce_repeat, so one line per repeat; otherwise
+                # UNROLL the image to a single 1-D trace (a camera frame "just shows" flattened).
+                if mode == "create" and a.ndim == 2:
+                    return a
+                flat = a.reshape(-1)
+                if flat.size < 1:
+                    raise ValueError("panel value is empty")
+                return flat
+            # 1-D DATA (a scan's series) OR unknown: a 2-D ``(points, lines)`` stays 2-D so each data
+            # series (and each ``create`` repeat) draws as its own line; a 1-D value is a single line.
+            if a.ndim == 2:
                 return a
             flat = a.reshape(-1)
             if flat.size < 1:
                 raise ValueError("panel value is empty")
             return flat
         if kind == "2d":
-            # Auto-reshape to an image (#H3n): SQUEEZE the size-1 axes so BOTH a camera frame's
-            # ``(1, H, W)`` (one point x the H*W data) AND a 2-D scan's ``(n0, n1, 1)`` (the param
-            # grid x a scalar) collapse to the 2-D map to imshow -- the plot reshapes, the panel
-            # "just shows".  An extra trailing data dimension shows its first plane.
-            img = np.squeeze(arr)
-            if img.ndim > 2:
-                img = img.reshape(img.shape[0], img.shape[1], -1)[:, :, 0]
+            # Reshape to an image by the structure (#H3o): a 2-D DATA core (a camera frame's (H, W))
+            # IS the image; else a 2-D scan's flattened points reshape to ``grid_shape``; else a value
+            # that is already a 2-D map (a derived expression) is shown as-is.  A 1-D-data / 1-D-points
+            # value has no map and raises (no silently-wrong image).
+            a = np.asarray(arr, dtype=float)
+            if len(ds) == 2:                                  # camera: the image lives in the data axis
+                img = np.squeeze(a)
+                if img.ndim > 2:
+                    img = img.reshape(img.shape[0], img.shape[1], -1)[:, :, 0]
+            elif gs and int(np.prod(gs)) == int(a.size):      # 2-D scan: un-flatten points to the grid
+                img = a.reshape(tuple(int(n) for n in gs))
+            elif st is None and np.squeeze(a).ndim == 2:      # a derived 2-D map (unknown structure)
+                img = np.squeeze(a)
+            else:
+                raise ValueError(
+                    f"2D panel needs an image (a 2-D data_shape or a grid_shape); got value shape "
+                    f"{arr.shape}, data_shape={ds}, grid_shape={gs}")
             if img.ndim != 2 or min(img.shape) < 2:
-                raise ValueError(f"2D panel needs a 2D array / image value (got shape {arr.shape})")
+                raise ValueError(f"2D panel needs a 2D image value (got shape {arr.shape})")
             # bound the point table so the grid scatter stays cheap per tick
             sy = max(1, int(np.ceil(img.shape[0] / 192)))
             sx = max(1, int(np.ceil(img.shape[1] / 192)))
@@ -4537,7 +4577,7 @@ class TaskConsole(QtWidgets.QWidget):
             for config in state.panels:
                 self._attach_card(PanelCard(config, parent=self.board,
                                             names_provider=self._signal_names,
-                                            sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, frame_coherence_provider=self._coherent_frame_signal))
+                                            sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, frame_coherence_provider=self._coherent_frame_signal, structure_provider=self._signal_structure))
             for node in state.logic:
                 self._attach_logic_node(node)    # always STOPPED -- Start is manual
             self._arrange()
@@ -4893,11 +4933,30 @@ class TaskConsole(QtWidgets.QWidget):
         return keys
 
     def _node_for_signal(self, name: str):
-        """The first running node that PUBLISHES signal ``name`` (None if none does)."""
-        for node in self.running_nodes:
-            if hasattr(node, "published_signals") and name in node.published_signals():
-                return node
+        """The producing node for signal ``name``: a RUNNING node first, else the last build of a
+        Logic-tab node (``_last_node``, kept past Stop) so a stopped node's lingering signal still
+        resolves.  None if none publishes it."""
+        for node in [*self.running_nodes, *self._last_node.values()]:
+            if node is not None and hasattr(node, "published_signals"):
+                try:
+                    if name in node.published_signals():
+                        return node
+                except Exception:
+                    continue
         return None
+
+    def _signal_structure(self, name: str):
+        """The output-contract structure for signal ``name`` from its producing node (#H3o):
+        ``{"points_shape", "data_shape", "grid_shape"}`` -- so a plot knows whether the DATA is 1-D
+        (multiple series -> lines) or 2-D (an image -> reshape/imshow), what the swept points are,
+        and the 2-D ``grid_shape`` for reshaping a flattened scan grid to a map.  ``None`` when no
+        producing node declares it (a derived expression / a raw array): fall back to shape heuristics."""
+        node = self._node_for_signal(str(name or ""))
+        if node is None:
+            return None
+        return {"points_shape": tuple(getattr(node, "points_shape", ()) or ()),
+                "data_shape": tuple(getattr(node, "data_shape", ()) or ()),
+                "grid_shape": tuple(getattr(node, "grid_shape", ()) or ())}
 
     def _refresh_signal_info(self) -> None:
         """Give every panel a legend (shown in its frame TITLE -- the grey strip, the old footer
@@ -5062,7 +5121,7 @@ class TaskConsole(QtWidgets.QWidget):
         title = indexed_unique_name(PANEL_KINDS[str(kind)], {c.config.title for c in self.cards})
         config = PanelConfig(kind=str(kind), title=title, row=next_y, col=0, size="1x2")
         card = PanelCard(config, parent=self.board, names_provider=self._signal_names,
-                         sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, frame_coherence_provider=self._coherent_frame_signal)
+                         sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, frame_coherence_provider=self._coherent_frame_signal, structure_provider=self._signal_structure)
         self._attach_card(card)
         self._arrange()
         self._mark_dirty()
@@ -5252,7 +5311,7 @@ class TaskConsole(QtWidgets.QWidget):
         config = PanelConfig(kind=kind, title=title, size="2x2",
                              source="value = __task_frame__")
         card = PanelCard(config, parent=self.board, names_provider=self._signal_names,
-                         sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, frame_coherence_provider=self._coherent_frame_signal)
+                         sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, frame_coherence_provider=self._coherent_frame_signal, structure_provider=self._signal_structure)
         self._attach_card(card)
         self._task_card = card
         self._running_task_row = row

@@ -1098,14 +1098,26 @@ skyblue, …) by column index — a lone line is grey (identical to confocal's `
 fade. There is **no** measurement-side averaging anywhere (that was the camera live-stutter); the
 plot owns every reduction.
 
-**Auto-reshape (#H3n) — `PanelCard._coerce` makes ANY measurement's data fit ANY panel kind**, so a
-camera frame and a 2-D scan both "just show" as an image and a frame fed to a 1-D vector "just shows"
-flattened. After the repeat reduce the value is the `(*points, *data)` core; the panel reshapes by
-SQUEEZE + kind: a **2-D** panel squeezes size-1 axes (a camera's `(1,H,W)→(H,W)`, a 2-D scan grid's
-`(n0,n1,1)→(n0,n1)`) and imshows; a **1-D** panel keeps a small trailing `dim` (≤`_DIM_MULTILINE_MAX`)
-as multiple lines (or `create`'s one-line-per-repeat), else UNROLLS an image core to a single 1-D
-trace; **dist** flattens to a histogram. `reduce_repeat`/`repeats_with_data` accept any `(repeat, *rest)`
-(the camera's 4-D block included), reducing axis 0 only.
+**Auto-reshape (#H3o) — STRUCTURE-DRIVEN, decided by the DATA dimensionality, not a size threshold.**
+The three axes (repeat / points / data) are ORTHOGONAL. A node declares `points_shape` / `data_shape`
+/ `grid_shape` (base-class fields); the console threads them to `PanelCard` via `structure_provider`
+(`_signal_structure` → `_node_for_signal`). `PanelCard._bound_structure()` returns them ONLY for the
+default `value = signal` source — a custom expression rewrites the core, so structure is then advisory
+and the code degrades to shape inference. `_coerce` reshapes by `len(data_shape)`:
+- **`data_shape` 1-D** (a scan's `(dim,)` series): each data series is its OWN line; a 1-D `(points,
+  dim)` value stays 2-D (multi-line); it never reshapes to an image.
+- **`data_shape` 2-D** (a camera frame `(H,W)`): the data is an image → a **2-D** panel imshows it; a
+  **1-D** panel UNROLLS it to ONE trace.
+- **`grid_shape`** un-flattens a 2-D scan's `(n0*n1,)` points to an `(n0,n1)` map on a 2-D panel (a
+  scan's `data_shape` stays `(1,)`, so the 2-D-ness is in the POINTS, recovered via `grid_shape`).
+- a 1-D-data / 1-D-points value on a **2-D** panel RAISES (never a silently-wrong image); **dist**
+  flattens to a histogram (structure not consulted).
+
+`repeat_mode` stays orthogonal: `reduce_repeat`/`repeats_with_data` accept any `(repeat, *rest)`
+(camera 4-D block included), reducing axis 0 only; **`create` is orthogonal to the data axes** —
+a 3-D scan block → `(points, R*dim)` (confocal columns), a ≥4-D image block → `(prod(core), R)` so a
+camera frame + create draws **R repeat-traces, NOT H image-rows** (the bug #H3o fixed). `_DIM_MULTILINE_MAX`
+is deleted; `tests/test_panel_reshape_orthogonal.py` encodes the full corner-case matrix as the guard.
 
 ### Single source of truth: build_*_scan + declarative spec
 

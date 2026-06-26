@@ -84,9 +84,13 @@ def reduce_repeat(raw, mode: str = "average"):
         return np.nansum(a, axis=0)
     if mode in ("replace", "roll"):
         return a[idx[-1]] if idx.size else a[0]
-    if mode == "create" and a.ndim == 3:
+    if mode == "create":
         cols = idx if idx.size else np.array([0])
-        return np.concatenate([a[r] for r in cols], axis=1)   # 1-D: (points, len(cols)*dim)
+        if a.ndim == 3:                                       # (R, points, dim) scan -> (points, R*dim)
+            return np.concatenate([a[r] for r in cols], axis=1)   #   confocal: repeat-major dim-minor columns
+        # ndim >= 4: an image block (a camera's (R, 1, H, W)) -- create is ORTHOGONAL to the data axes:
+        # flatten each repeat's core to a column so there is ONE trace per repeat (NOT per image row).
+        return a[cols].reshape(len(cols), -1).T               # (prod(core), R) = x=pixel index, R lines
     with np.errstate(invalid="ignore", divide="ignore"):       # all-NaN cell -> NaN (not-yet-measured)
         return np.nanmean(a, axis=0)
 
