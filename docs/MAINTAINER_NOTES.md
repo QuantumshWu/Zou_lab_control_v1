@@ -1329,28 +1329,54 @@ idles the (adjustable) `extra_delay` between points (`VirtualSequencer`/`Runtime
 by `sleep_scale` like `wait_done`; the wait is cooperatively cancellable on Stop). Guarded by
 `test_pulse_param_scan.py` (api-only sweep drives each point; settle is called once per point).
 
-### Scan-level Repeat + Repeat mode (the confocal model)
-A finite scan can be re-run `repeat` times (`repeat=1` is a single pass), and `repeat_mode` (the
-confocal "Update mode" combine selector, `REPEAT_COMBINE_MODES = ('average','add','replace')`) says
-how to combine each x point's passes: `average` (mean, default — noise reduction) / `add` (sum) /
-`replace` (latest pass). `ScannedMeasurementNode` and `PulseScanNode` both take `repeat` +
-`repeat_mode`, keep a per-point running sum/count, and publish per the mode; they self-stop only
-after the last point of the LAST pass (`finished == _repeat_cur > repeat`); `points_done` /
-`total_points` span all passes. **`repeat_mode` is deliberately SEPARATE from the base
-`Measurement.update_mode`** (which `_postprocess` consumes PER SHOT, default `roll` = pass-through):
-reusing `update_mode` made the base double-average the published curve. The task console's
-measurement Edit exposes an **Acquisition** section with **Repeat** (spinbox) + **Update mode**
-(combobox).  `_build_logic_node` pops both and hands them to the node.  Guarded by `test_scan_repeat.py`.
+### Repeat: TWO systems, three orthogonal axes, processors are typed transforms (#H3o)
+There are EXACTLY TWO repeat knobs in the whole pipeline — never three. The design panel
+(workflow `processor-update-mode-design`) verified this against the code and rejected every attempt
+to add a processor-side mode.
 
-**Repeat is on EVERY measurement, not only scans (incl. the camera), and the plot shows `×N`.**
-The Acquisition section appears for any measurement-layer node — kind `measurement` (scan: re-run
-the sweep) AND `camera` (a `Measurement` too: repeat = average N frames; modes `roll/average/replace`
-from `CameraMeasurement.REPEAT_MODES`); processors/tasks (no re-acquire) get none.  For a camera,
-`_build_logic_node` maps "average" → the base per-shot `repeat` mode (`repeats=N`) and "roll"/"replace"
-1:1.  The plot's pass tag is fed DECOUPLED (confocal's controller-push): `_poll_logic_nodes` →
-`_push_repeat_cur(node)` sets `plotter.repeat_cur` on every panel plotting one of the node's
-published signals, lighting up `Live1D`'s `"<ylabel> ×N"` — the panel still subscribes to a SIGNAL,
-not the node.  The running-row counter uses `total_points` (n_points × repeat).
+1. **ACQUIRE-FILL (measurement layer).** Every acquiring `Measurement` OWNS the repeat axis and
+   FILLS a `(repeat, *points_shape, *data_shape)` BLOCK in `shot()` (the camera ring; a scan's raw
+   block). Driven by two user fields, auto-injected as acquisition ParamDecls: `repeat:int` (ring
+   depth = how many shots to keep & average) and `free_run:bool` (roll-forever vs stop-after-N). The
+   measurement NEVER collapses the repeat axis.
+2. **DISPLAY-COLLAPSE (plot layer).** The plot collapses the repeat axis FOR DISPLAY ONLY via
+   `repeat_mode` (`live.reduce_repeat`, modes `average/add/replace/roll/create`). Stored data is
+   never mutated; this is the SINGLE place a repeat axis is collapsed.
+
+The three axes (repeat = block axis 0 / points = middle / data = trailing) are orthogonal (#H3n/#H3o):
+`reduce_repeat` collapses axis 0 (only on a `ndim>=3` block), `_coerce` reshapes points/data.
+
+**A processor has NO user-facing mode.** A `Processor` is a pure typed transform; its relationship to
+the repeat axis is a STATIC class attribute `repeat_contract`, NEVER a runtime knob or form field:
+* `"reduce"` (default) — emits derived signals with NO repeat axis (a per-shot judgement, or a
+  statistic over a shot set). Nothing is left for the plot to collapse, so it can't collide with
+  `repeat_mode`. **`OccupancyProcessor` is `reduce`**: it judges the newest data-bearing slice of the
+  camera block PER-SHOT and emits 1-D per-site vectors + cumulative `rate`/`rate_sites`. It must NOT
+  be made repeat-preserving — `occupied` as `(repeat, n_sites)` is 2-D, which the plot's collapse
+  (`reduce_repeat`/`_signal_then_repeat`/`_eval_signal_per_slice`, all gate on `ndim>=3`) silently
+  skips and `_coerce` for `kind='sites'` flattens into `repeat*n_sites` bogus rings.
+* `"preserve"` — maps each repeat slice 1:1 and emits a `>=3-D` block so the SAME `reduce_repeat`
+  machinery applies (a future per-slice image filter; no console instance yet).
+
+So the everyday quantities all come out without a third knob: **S1** averaged site-map image = a
+`frame` panel with `repeat_mode='average'` (camera block mean, recovers all sites); **S2** per-site
+loading PROBABILITY = the processor's cumulative `rate_sites` (NOT a plot dropdown on occupancy);
+**S3** loading-rate-vs-time = the scalar `rate` on a rolling panel; **S4** readout fidelity = a
+`reduce` operation (`readout_fidelity` spec) over a shot set. Deleted: the dead third system
+`Measurement.UPDATE_MODES` / `_postprocess` / `update_mode` / `repeats` / `_accum` (the base
+accumulate-then-emit that violated the block contract; every concrete node already bypassed it).
+Guarded by `test_processor_repeat_contract.py` (every processor declares a valid contract, never as a
+ctor arg; a `reduce` processor never leaks a repeat axis), `test_scan_repeat.py`,
+`test_measurement_output_contract.py`, `test_panel_reshape_orthogonal.py`.
+
+**DECOUPLING (#H3o).** A panel reads EXACTLY the signal it is bound to — there is NO frame-coherence
+rewrite. A `frame` panel shows the camera's own block (averaged per `repeat_mode`), INDEPENDENT of any
+running Judge; a Judge publishes its OWN keys (`occupied`, `frame_judged`) and never touches `frame`.
+The site-map underlay still tracks the rings' shot because `frame_judged` is published ATOMICALLY with
+`occupied` (one transform dict) and the map resolves both from the SAME producing node via
+`_sites_aux` — a separate path, not a binding rewrite. (Per-shot semantics: the site-map underlay is
+the single judged shot, not the 30-shot mean — that is correct for occupancy.) Guarded by
+`test_camera_measurement_multitrigger.py::test_2d_frame_panel_shows_camera_average_decoupled_from_judge`.
 
 ### Panel card: width-by-columns, HEIGHT hugs the plot (variable pixel-y grid)
 A card's WIDTH is on a clean column grid (`cols // 2` base columns); its HEIGHT HUGS the plot —

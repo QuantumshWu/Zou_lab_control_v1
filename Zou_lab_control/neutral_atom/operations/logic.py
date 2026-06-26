@@ -174,18 +174,10 @@ class LogicNode:
         values = self.shot()
         if not values:
             return {}
-        values = self._postprocess(values)
-        if not values:
-            return {}   # a logic node (e.g. a repeat-averaging measurement) may suppress this tick
         named = {self.prefix + key: value for key, value in values.items()}
         self.hub.publish(named)
         self.shots += 1
         return named
-
-    def _postprocess(self, values: dict[str, object]) -> dict[str, object]:
-        """Hook to transform a shot's raw values before publish.  Identity in the
-        base; :class:`Measurement` applies its ``update_mode`` accumulation here."""
-        return values
 
     def start(self, *, rate_hz: float = 5.0) -> "LogicNode":
         """Publish shots from a daemon thread at ``rate_hz`` until ``stop()``."""
@@ -347,74 +339,23 @@ class LogicNode:
 # The three concrete logic node KINDS that compose a task console.  All share the
 # LogicNode worker-loop/publish/param-queue/cancel infrastructure above; they differ
 # only in WHERE their per-shot values come from:
-#   Measurement -- ACQUIRES from devices (camera/sequencer), update_mode-driven.
+#   Measurement -- ACQUIRES from devices (camera/sequencer); OWNS the repeat axis (fills a block).
 #   Processor   -- TRANSFORMS hub signals into derived signals (no acquisition).
 #   Task        -- ORCHESTRATES the others over a multi-step flow, with mid-run output.
 class Measurement(LogicNode):
     """A logic node that ACQUIRES data from devices and publishes named signals.
 
-    Continuous vs swept is just ``update_mode`` (how successive shots accumulate),
-    not a separate class.  Concrete measurements implement ``shot()``."""
+    A Measurement OWNS the repeat axis: each concrete measurement FILLS a
+    ``(repeat, *points_shape, *data_shape)`` BLOCK every shot (the camera's depth-``repeat``
+    ring, a scan's raw block) and publishes it whole.  It does NOT collapse the repeat axis --
+    HOW the repeats are combined for viewing (average / add / roll / create) is the PLOT's
+    ``repeat_mode`` (display-only), the SINGLE place a repeat axis is collapsed.  So there are
+    exactly two repeat knobs in the whole pipeline: ``repeat``/``free_run`` here (how many shots
+    to keep) and the plot's ``repeat_mode`` (how to show them).  Concrete measurements implement
+    ``shot()``; ``repeat``/``free_run`` are auto-injected acquisition params by the console."""
 
     layer = "measurement"
     node_label = "measurement"
-    UPDATE_MODES = ("single", "replace", "roll", "average", "repeat")
-
-    def __init__(self, hub: SignalHub, *, prefix: str = "", update_mode: str = "roll", repeats: int = 1):
-        super().__init__(hub, prefix=prefix)
-        self.update_mode = self._coerce_update_mode(update_mode)
-        self.repeats = max(1, int(repeats))
-        self._accum: dict[str, np.ndarray] | None = None   # running sum per numeric key
-        self._accum_n = 0
-
-    @classmethod
-    def _coerce_update_mode(cls, mode: str) -> str:
-        mode = str(mode)
-        if mode not in cls.UPDATE_MODES:
-            raise ValueError(f"update_mode {mode!r} must be one of {cls.UPDATE_MODES}.")
-        return mode
-
-    @staticmethod
-    def _is_numeric(value) -> bool:
-        return not isinstance(value, str) and isinstance(value, (int, float, np.number, np.ndarray))
-
-    def _postprocess(self, values: dict[str, object]) -> dict[str, object]:
-        """Apply ``update_mode`` to a raw shot before publish.
-
-        ``roll`` / ``replace`` pass through (per-shot publish; the rolling-vs-overwrite
-        VIEW is the plot's relim, not the node's job).  ``single`` publishes once
-        then self-stops.  ``average`` publishes the cumulative running mean of every
-        numeric signal.  ``repeat`` accumulates ``repeats`` shots and publishes only
-        their mean (suppressing the in-between ticks)."""
-        mode = self.update_mode
-        if mode in ("roll", "replace"):
-            return values
-        if mode == "single":
-            self._stop.set()
-            return values
-        numeric = {k: np.asarray(v, dtype=float) for k, v in values.items() if self._is_numeric(v)}
-        if self._accum is None or set(self._accum) != set(numeric):
-            self._accum = {k: np.zeros_like(val) for k, val in numeric.items()}
-            self._accum_n = 0
-        for key, val in numeric.items():
-            self._accum[key] = self._accum[key] + val
-        self._accum_n += 1
-        if mode == "average":
-            return {**values, **{k: s / self._accum_n for k, s in self._accum.items()}}
-        # repeat: hold until `repeats` accumulated, then emit the mean and reset
-        if self._accum_n < self.repeats:
-            return {}
-        mean = {**values, **{k: s / self._accum_n for k, s in self._accum.items()}}
-        self._accum = None
-        self._accum_n = 0
-        return mean
-
-    def start(self, *args, **kwargs):
-        # A fresh run starts accumulation fresh: a Stop mid-batch (average / repeat) must NOT leak
-        # the partial sum into the next run (it would corrupt the first batch's mean).
-        self._accum = None
-        self._accum_n = 0
-        return super().start(*args, **kwargs)
 
 
 class Processor(LogicNode):
@@ -424,11 +365,24 @@ class Processor(LogicNode):
     acquisition of its own.  REACTIVE: it only emits when a consumed signal advanced
     since the last tick (tracked via the hub's per-signal version), so it runs as a
     live graph node beside the measurement that produces its input, at its own poll
-    rate, and no-ops (``shot`` returns ``{}``) when there is nothing new."""
+    rate, and no-ops (``shot`` returns ``{}``) when there is nothing new.
+
+    A processor is a PURE TYPED TRANSFORM with NO user-facing mode (that would be a third
+    repeat knob on top of the measurement's ``repeat``/``free_run`` and the plot's
+    ``repeat_mode`` -- the tangle we deliberately do not have).  Its relationship to the repeat
+    axis is a STATIC class fact, ``repeat_contract``, NOT a runtime knob and NEVER shown in a form:
+      * ``"reduce"`` (default, the common case): emits derived signals that carry NO repeat axis
+        (a per-shot judgement / a statistic over a shot set).  There is nothing left for the plot
+        to collapse, so it never collides with ``repeat_mode``.
+      * ``"preserve"``: maps each repeat slice 1:1 and emits a >=3-D block whose axis 0 IS the
+        repeat, so the SAME plot ``reduce_repeat`` machinery collapses it (a future per-slice
+        image filter -- no console instance yet).
+    Enforced by ``tests/test_processor_repeat_contract.py``."""
 
     layer = "processor"
     node_label = "processor"
     provides: tuple[str, ...] = ()
+    repeat_contract = "reduce"   # see class docstring; static, never a user knob
 
     def __init__(self, hub: SignalHub, *, consumes, prefix: str = ""):
         super().__init__(hub, prefix=prefix)
@@ -544,6 +498,13 @@ class OccupancyProcessor(Processor):
             # The camera publishes ``frame`` as its ``(repeat, 1, H, W)`` block; occupancy is a
             # PER-SHOT judgement, so judge the newest single photo: take the last repeat slice that
             # holds data, then squeeze the size-1 point axis down to the (H, W) image.
+            #
+            # This is WHY ``repeat_contract == "reduce"`` (this node judges ONE shot and emits 1-D
+            # per-site vectors, NO repeat axis).  It must NOT be made repeat-preserving: occupied
+            # as ``(repeat, n_sites)`` is 2-D, which the plot's repeat collapse SILENTLY skips
+            # (reduce_repeat / _signal_then_repeat / _eval_signal_per_slice all gate on ndim>=3),
+            # and ``_coerce`` for kind='sites' flattens it into repeat*n_sites bogus rings.  The
+            # per-site LOADING PROBABILITY is the cumulative ``rate_sites`` below (not a plot knob).
             has = np.isfinite(frame).any(axis=tuple(range(1, frame.ndim)))
             idx = np.flatnonzero(has)
             frame = np.asarray(frame[idx[-1]] if idx.size else frame[-1])
@@ -1197,7 +1158,7 @@ class CameraMeasurement(Measurement):
         # ``repeat``-deep ring forever (True, the live monitor).  The camera never averages at the
         # measurement (that was the live stutter) -- it FILLS and publishes the WHOLE block; the PLOT
         # reduces the repeat axis (repeat_mode: average = the long-exposure mean over the kept frames).
-        super().__init__(hub, prefix=prefix, update_mode="roll", repeats=1)
+        super().__init__(hub, prefix=prefix)
         self.camera = camera
         self.sequencer = sequencer
         self.frames_per_cycle = max(1, int(frames_per_cycle))

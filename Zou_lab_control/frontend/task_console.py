@@ -1273,7 +1273,7 @@ class PanelCard(FluentGroupBox):
 
     def __init__(self, config: PanelConfig, parent=None, *, names_provider=None,
                  sources_provider=None, formats_provider=None, axes_provider=None,
-                 sites_inputs_provider=None, curve_x_provider=None, frame_coherence_provider=None,
+                 sites_inputs_provider=None, curve_x_provider=None,
                  structure_provider=None):
         # Titled frame: the title strip carries the panel KIND (top-left) and the
         # Setting button (top-right), so the card is delineated like the rest.
@@ -1298,12 +1298,6 @@ class PanelCard(FluentGroupBox):
         # callable(y_signal) -> companion x_signal: a 1d plot wired to a scan's y curve
         # draws it vs the swept x from the SAME producing node (one signal pick, #3).
         self.curve_x_provider = curve_x_provider
-        # callable(frame_signal) -> shot-coherent frame signal: when a running occupancy
-        # processor JUDGES this camera frame, a panel bound to the live `frame` instead reads
-        # that node's judged frame (`frame_judged`), so a 2D-image(frame) and a site-map(occupied)
-        # always show the SAME shot -- the occupancy is ~instant, so frame and occupied are one
-        # event.  No occupancy running -> the live frame is shown unchanged.
-        self.frame_coherence_provider = frame_coherence_provider
         # callable(signal) -> (points_shape, data_shape) from the producing node's output contract,
         # so the plot auto-reshapes by the DATA dimensionality (1-D data -> multiple lines; 2-D data
         # -> reshape/imshow) instead of guessing from sizes (#H3o).
@@ -2183,18 +2177,6 @@ class PanelCard(FluentGroupBox):
         from ..neutral_atom.operations.signal_expr import SignalExpr
         return SignalExpr(self.config.inputs, self._compiled_source)
 
-    def _frame_resolve(self, name: str) -> str:
-        """Shot-coherence rewrite: if a running occupancy processor is JUDGING this camera frame,
-        read the frame it actually judged (``frame_judged``) instead of the camera's live (newer)
-        frame -- so a 2D-image bound to ``frame`` and a site-map bound to ``occupied`` show the
-        SAME shot.  Identity when nothing judges it.  Injected into ``SignalExpr`` as ``resolve``."""
-        if name and callable(self.frame_coherence_provider):
-            try:
-                return str(self.frame_coherence_provider(name)) or name
-            except Exception:
-                return name
-        return name
-
     def _signal_then_repeat(self, namespace: Mapping[str, object]):
         """The decoupled plot pipeline.  The MEASUREMENT owns the repeat axis: it publishes a RAW
         block whose LEADING axis is the repeat (a 1-D scan's ``(repeat, points, dim)``, a camera's
@@ -2231,7 +2213,11 @@ class PanelCard(FluentGroupBox):
         once -> ``value, False``.  The default ``value = signal`` on one bound block short-circuits."""
         from ..neutral_atom.operations.signal_expr import DEFAULT_SOURCE
         expr = self._signal_expr()
-        sig = expr.signal_for(namespace, resolve=self._frame_resolve)
+        # A panel reads EXACTLY the signal it is bound to -- no rewrite.  A camera's `frame` shows the
+        # camera's own (repeat, 1, H, W) block (so average/create work), INDEPENDENT of any Judge
+        # processor (a Judge is a separate reactive node; its `frame_judged` is its OWN output, bound
+        # explicitly when wanted).  The site-map underlay coherence is handled separately (#_sites_aux).
+        sig = expr.signal_for(namespace)
         slots = sig if isinstance(sig, list) else [sig]
         # raw hub signals the source NAMES directly (not via ``signal``) that carry a repeat axis
         raw_names = [n for n in expr.co_names()
@@ -4577,7 +4563,7 @@ class TaskConsole(QtWidgets.QWidget):
             for config in state.panels:
                 self._attach_card(PanelCard(config, parent=self.board,
                                             names_provider=self._signal_names,
-                                            sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, frame_coherence_provider=self._coherent_frame_signal, structure_provider=self._signal_structure))
+                                            sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, structure_provider=self._signal_structure))
             for node in state.logic:
                 self._attach_logic_node(node)    # always STOPPED -- Start is manual
             self._arrange()
@@ -4816,40 +4802,6 @@ class TaskConsole(QtWidgets.QWidget):
                 ck, ik = meta.get("centers_key"), meta.get("image_key")
                 return ((prefix + ck) if ck else None, (prefix + ik) if ik else None)
         return (None, None)
-
-    def _coherent_frame_signal(self, frame_signal) -> str:
-        """Resolve a camera ``frame`` signal to the SHOT-COHERENT frame to display.
-
-        The occupancy is computed from each frame ~instantly, so a frame view and its
-        occupancy are ONE event.  But the camera and the OccupancyProcessor are two
-        independent publishing threads: the camera keeps publishing newer ``frame``s while
-        the processor judges an older one, so ``latest(frame)`` (what a 2D panel bound to
-        ``frame`` would show) is a DIFFERENT shot from the occupancy a site-map shows.
-
-        When a RUNNING occupancy processor CONSUMES this exact frame signal (it is one of the
-        node's ``consumes`` inputs), return that node's judged-frame output (``frame_judged``,
-        namespaced by the node's prefix) -- the EXACT frame its occupancy was computed from,
-        published atomically with ``occupied``.  A 2D-image(frame) then tracks the same shot as
-        a site-map(occupied).  With no occupancy judging it, return the live frame unchanged (a
-        standalone camera view should show the newest frame)."""
-        name = str(frame_signal or "")
-        if not name:
-            return name
-        live = set(self.hub.names())
-        for node in self.running_nodes:
-            image_key = getattr(node, "sitemap_image_key", "")   # the judged-frame output
-            consumes = getattr(node, "consumes", ())             # the frame(s) it reacts to
-            if image_key and name in consumes:
-                judged = getattr(node, "prefix", "") + image_key
-                # ONLY redirect to the judged frame if it is ACTUALLY on the hub.  A judging
-                # node that has not published yet (just started) or is wedged (e.g. an un-
-                # calibrated / mismatched calibration) has no ``frame_judged`` -- redirecting
-                # there would blank a 2D(frame) panel.  Falling back to the LIVE frame keeps the
-                # camera image visible; once the node publishes a judged frame, this redirects
-                # again and the 2D + site map re-sync to the same shot.
-                if judged in live:
-                    return judged
-        return name
 
     def _curve_x(self, y_signal) -> str | None:
         """For a 1d plot wired to a scan's y CURVE, the companion x-axis signal resolved
@@ -5127,7 +5079,7 @@ class TaskConsole(QtWidgets.QWidget):
         title = indexed_unique_name(PANEL_KINDS[str(kind)], {c.config.title for c in self.cards})
         config = PanelConfig(kind=str(kind), title=title, row=next_y, col=0, size="1x2")
         card = PanelCard(config, parent=self.board, names_provider=self._signal_names,
-                         sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, frame_coherence_provider=self._coherent_frame_signal, structure_provider=self._signal_structure)
+                         sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, structure_provider=self._signal_structure)
         self._attach_card(card)
         self._arrange()
         self._mark_dirty()
@@ -5317,7 +5269,7 @@ class TaskConsole(QtWidgets.QWidget):
         config = PanelConfig(kind=kind, title=title, size="2x2",
                              source="value = __task_frame__")
         card = PanelCard(config, parent=self.board, names_provider=self._signal_names,
-                         sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, frame_coherence_provider=self._coherent_frame_signal, structure_provider=self._signal_structure)
+                         sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, structure_provider=self._signal_structure)
         self._attach_card(card)
         self._task_card = card
         self._running_task_row = row

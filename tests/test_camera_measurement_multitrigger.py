@@ -80,85 +80,45 @@ def test_readout_image_frame_judged_is_synced_with_occupancy():
     assert np.array_equal(occupied, cal.detect(frame_judged, method="box").occupied)
 
 
-def test_console_resolves_2d_frame_panel_to_judged_frame_for_shot_alignment():
-    """#1 alignment: a 2D-image panel bound to the LIVE camera ``frame`` and a site-map bound
-    to ``occupied`` must show the SAME shot.  The camera and the occupancy processor are two
-    independent producers (the camera streams newer frames while the processor judges an older
-    one), so ``latest('frame')`` is a DIFFERENT shot than the occupancy.  The console resolves
-    a frame panel to the consuming occupancy node's ``frame_judged`` (its shot-coherent frame),
-    so 2D(frame) == site-map(occupied) == the judged shot.  Verified through the REAL resolver
-    methods (TaskConsole._coherent_frame_signal + PanelCard._with_signal_slots)."""
-    from types import SimpleNamespace
-    from Zou_lab_control.frontend.task_console import TaskConsole, PanelCard
+def test_2d_frame_panel_shows_camera_average_decoupled_from_judge():
+    """#H3o DECOUPLING: a 2D-image panel bound to the camera ``frame`` shows the CAMERA's OWN
+    ``(repeat,1,H,W)`` block reduced by the plot's ``repeat_mode`` (average = the long-exposure mean
+    that recovers all sites), INDEPENDENT of any running Judge.  A Judge (OccupancyProcessor) is a
+    SEPARATE reactive node: it publishes its OWN keys (``occupied`` / ``frame_judged``) and NEVER
+    rewrites ``frame``, so it cannot change what a ``frame`` panel displays.  This pins the bug where,
+    with a Judge running, a 2D(frame) panel collapsed to the judged single frame and LOST the average
+    -- there is no frame-coherence rewrite; a panel reads exactly the signal it is bound to."""
+    from PyQt5 import QtWidgets
+    from Zou_lab_control.frontend.task_console import PanelCard, PanelConfig
+    _app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4)})
     exp.readout.sitemap(frames=4, display=False)
     exp.readout.thresholds(frames=20, display=False)
-    cal = exp.readout.current
     hub = SignalHub()
-    cam = CameraMeasurement(hub, exp.camera, sequencer=exp.devices.sequencer)
-    det = OccupancyProcessor(hub, calibration=cal, source_expr={"inputs": ["frame"], "source": "value = signal"}, method="box", grid_shape=(3, 4))
-    fire_live_imaging(exp)            # On Pulse: the trigger-driven camera now streams
-
-    # the exact race: judge one frame, then the camera streams TWO newer frames before the
-    # next occupancy tick -> latest('frame') is 2 shots ahead of the judged frame.
-    cam.step(); det.step()
-    cam.step(); cam.step()
+    cam = CameraMeasurement(hub, exp.camera, sequencer=exp.devices.sequencer, repeat=5, free_run=True)
+    det = OccupancyProcessor(hub, calibration=exp.readout.current,
+                             source_expr={"inputs": ["frame"], "source": "value = signal"}, method="box", grid_shape=(3, 4))
+    fire_live_imaging(exp)
+    for _ in range(6):
+        cam.step(); det.step()           # the camera fills its repeat ring WHILE the Judge runs
 
     ns = hub.snapshot_latest()
-    live_frame = np.asarray(ns["frame"])
-    judged = np.asarray(ns["frame_judged"])
-    assert not np.array_equal(live_frame, judged)        # precondition: the producers HAVE diverged
+    block = np.asarray(ns["frame"])                       # (repeat, 1, H, W) camera block
+    assert block.ndim == 4 and "frame_judged" in ns       # precondition: a Judge IS running + published
 
-    # REAL console resolver: a frame consumed by a running occupancy node -> its frame_judged
-    # (only when frame_judged is actually on the hub, which it is here).
-    console = SimpleNamespace(running_nodes=[det], hub=hub)
-    assert TaskConsole._coherent_frame_signal(console, "frame") == det.prefix + "frame_judged"
-    # with no occupancy judging it, a standalone camera view keeps the LIVE frame
-    assert TaskConsole._coherent_frame_signal(SimpleNamespace(running_nodes=[], hub=hub), "frame") == "frame"
-
-    # REAL panel resolution: a 2D-image panel bound to 'frame' now reads the judged frame.  The
-    # signal stage delegates the slot-packing + frame-coherence rewrite to the shared SignalExpr via
-    # the panel's _signal_expr()/_frame_resolve() helpers, so the stub binds those real (unbound)
-    # PanelCard methods to itself and resolves the picked ``signal`` the same way the pipeline does.
-    panel = SimpleNamespace(
-        config=SimpleNamespace(inputs=["frame"]),
-        _compiled_source="value = signal",
-        frame_coherence_provider=lambda n: TaskConsole._coherent_frame_signal(console, n))
-    panel._signal_expr = PanelCard._signal_expr.__get__(panel)
-    panel._frame_resolve = PanelCard._frame_resolve.__get__(panel)
-    panel_signal = np.asarray(panel._signal_expr().signal_for(ns, resolve=panel._frame_resolve))
-
-    assert np.array_equal(panel_signal, judged)          # 2D panel == site-map underlay (same shot)
-    assert not np.array_equal(panel_signal, live_frame)  # NOT the camera's newer, misaligned frame
-    # and that shot IS the one the occupancy was computed from (2D == occupied)
-    assert np.array_equal(np.asarray(ns["occupied"]), cal.detect(panel_signal, method="box").occupied)
-
-
-def test_2d_frame_panel_shows_live_frame_when_no_judged_frame_yet():
-    """A 2D-image panel bound to ``frame`` must show the LIVE camera frame whenever the judging
-    occupancy node has NOT published ``frame_judged`` yet (just started, or wedged on a bad
-    calibration).  The frame-coherence resolver only redirects ``frame`` -> ``frame_judged`` when
-    that judged frame is ACTUALLY on the hub; otherwise the camera image would silently blank.
-    (Root cause of 'camera measurement can't connect to a 2D image'.)"""
-    from types import SimpleNamespace
-    from Zou_lab_control.frontend.task_console import TaskConsole
-
-    exp = na.connect("virtual", sitemap={"grid_shape": (3, 4)})
-    exp.readout.sitemap(frames=4, display=False)
-    exp.readout.thresholds(frames=20, display=False)
-    hub = SignalHub()
-    cam = CameraMeasurement(hub, exp.camera, sequencer=exp.devices.sequencer)
-    det = OccupancyProcessor(hub, calibration=exp.readout.current,
-                             source_expr={"inputs": ["frame"], "source": "value = signal"}, grid_shape=(3, 4))
-    fire_live_imaging(exp)
-    cam.step()                                            # a live 'frame' exists; det has NOT judged yet
-    console = SimpleNamespace(running_nodes=[det], hub=hub)
-    assert "frame_judged" not in hub.names()
-    assert TaskConsole._coherent_frame_signal(console, "frame") == "frame"   # -> the LIVE frame, not blank
-    det.step()                                            # now occupancy publishes frame_judged
-    assert "frame_judged" in hub.names()
-    assert TaskConsole._coherent_frame_signal(console, "frame") == det.prefix + "frame_judged"
+    st = {"points_shape": (1,), "data_shape": tuple(block.shape[2:]), "grid_shape": ()}
+    card = PanelCard(PanelConfig(kind="2d", role="plot", source="value = signal", inputs=["frame"],
+                                 params={"repeat_mode": "average", "cmap": "viridis"}),
+                     structure_provider=lambda name: st)
+    try:
+        rendered = np.asarray(card._coerce(card._signal_then_repeat(ns)))
+        expected = np.nanmean(block.reshape(block.shape[0], *block.shape[2:]), axis=0)  # camera block average
+        assert rendered.shape == tuple(block.shape[2:])                    # an (H, W) image
+        assert np.allclose(rendered, expected, equal_nan=True)             # == the camera average
+        assert not np.allclose(rendered, np.asarray(ns["frame_judged"]))   # NOT the Judge's single frame
+    finally:
+        card.shutdown()
 
 
 def test_occupancy_falls_back_to_session_calibration_on_shape_mismatch():

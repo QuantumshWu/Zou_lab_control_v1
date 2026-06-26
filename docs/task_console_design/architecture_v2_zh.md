@@ -16,17 +16,17 @@ task_console 及其上游分为清晰五层,解决以下结构性约束:
 ## 1. 五层总览 + 数据流
 
 ```
- device ──(camera.acquire / sequencer.fire)──► Measurement(worker线程, update_mode)
-                                                  │ publish 命名信号
+ device ──(camera.acquire / sequencer.fire)──► Measurement(worker线程, 拥有 repeat 轴 = 填块)
+                                                  │ publish (repeat,*points,*data) 块
                                                   ▼
                                               SignalHub(命名信号 + 版本 + 节点登记)
                                                   ▲                         │
-                            Processor(纯变换/逐帧)─┘                         ▼
-                              frame→occupied/rate (读 cali)            Plot(纯消费, 订阅信号名, 不绑 measurement)
+                            Processor(纯类型化变换)─┘                        ▼
+                              frame→occupied/rate (读 cali)            Plot(纯消费, repeat_mode 合并显示, 订阅信号名)
  Task: 编排 device+measurement+processor+plot, 文件夹流程, 产标定 npz, 中途输出占专用 panel
 ```
 
-**核心决策**:保留 confocal 的 Measurement(worker 线程 + update_mode + 签名即参数 + 默认 plotter),但把"controller 直连一个 plot"换成"publish 到已有 `SignalHub`、plot 只订阅信号名"。⇒ 一个 measurement 输出可被多图同时连;SignalHub 天然记录"谁产谁消费"喂流向图;前端保持解耦。
+**核心决策**:保留 confocal 的 Measurement(worker 线程 + 签名即参数 + 默认 plotter),但把"controller 直连一个 plot"换成"publish 到已有 `SignalHub`、plot 只订阅信号名"。⇒ 一个 measurement 输出可被多图同时连;SignalHub 天然记录"谁产谁消费"喂流向图;前端保持解耦。**repeat 模型(#H3o)**:全管线只有两个 repeat 旋钮——measurement 的 `repeat`/`free_run`(拍几次、填 `(repeat,*points,*data)` 块)与 plot 的 `repeat_mode`(怎么合并显示)。Processor 是**纯类型化变换、无用户 mode**(静态类属性 `repeat_contract=reduce|preserve`,不进表单);旧的基类 `update_mode`/`_postprocess`/`repeats` 累积是死的第三套,已删。详见 `MAINTAINER_NOTES.md` 的「Repeat: TWO systems」节。
 
 ## 2. 模块布局
 
@@ -61,15 +61,14 @@ class CameraDevice(BaseDevice):
 
 ```python
 @measurement(produces=('frame',), default_plot={'frame': '2d'},
-             update_modes=('roll','replace'), devices=('camera','sequencer'))
-def live_image(camera, sequencer, *, exposure: Param(float, 0.1, unit='s'),
-               update_mode: Choice(('roll','replace'), 'roll')):
+             devices=('camera','sequencer'))
+def live_image(camera, sequencer, *, exposure: Param(float, 0.1, unit='s')):
     frame = camera.acquire(1, sequence=...)[-1]   # 只产相机帧;不在这里 detect
     return {'frame': frame}
 ```
 - **参数 = build 函数签名 + 类型注解**(`params_from_signature`)。API 直接调;GUI 自动出表单(§7)。无手列 spec。
 - **worker 线程**:`Measurement.start()` 后台跑,每点 publish 一次并推进版本;不直接刷 plot。
-- **update_mode**:`single/replace/roll/average/repeat`(注册表,可扩展);声明 `update_modes` 限定可选。
+- **repeat 轴 = measurement 拥有**:`repeat:int`(环深/拍几次)+ `free_run:bool`(滚动 vs 拍满 N 停)两个参数(控制台自动注入 ParamDecl);measurement 填 `(repeat,*points,*data)` 块**整块** publish,**从不**自己合并 repeat 轴。怎么合并显示是 plot 的 `repeat_mode`(§见 plot 层 / MAINTAINER_NOTES「Repeat: TWO systems」)。
 - **publish**:返回 `{name: value}` → Hub publish(命名空间见 §8)。
 - **pulse 绑定**:扫描类用 `PulseScan('pulse_name','target')` 注解,运行时写 `PulseTableState` scan 表(已硬件化)。
 - **plot=True / plot=False 分流**:notebook 里直接 API 调一个 measurement(如 `readout.temperature(...)`)默认 `display=True` → 自动出适配的默认图(`ScannedMeasurement.run(display=True)`)。但在 task console / GUI 里,measurement 作为 logic 节点由 `ScannedMeasurementNode.step()` 逐点驱动、**只 publish 到 hub、从不调 `.run()`** ⇒ 等价 plot=False:不自动出图,用户自己加 Plot 面板按 signal 配。
@@ -159,7 +158,7 @@ panel 空白处的"读/发信号"图例:加**左右 padding**,过长**按需分�
 ## 12. 阶段计划(每阶段独立可验, virtual==real, 删旧 clean-delete)
 
 - **P1 Device**:`snapshot()` 统一 + CameraDevice ring-buffer(arm/latest/drain)+ virtual 出帧。验:snapshot 往返、drain 无损、虚拟帧契约。
-- **P2 Measurement 基类**:worker 线程+update_mode+签名参数+publish;`live_image` 产 frame、`ScannedMeasurementNode` 走扫描 measurement。验:契约测试、虚拟==实机。
+- **P2 Measurement 基类**:worker 线程+签名参数+publish;measurement 拥有 repeat 轴(填 `(repeat,*points,*data)` 块,`repeat`/`free_run` 两参);`live_image` 产 frame、`ScannedMeasurementNode` 走扫描 measurement。验:契约测试、虚拟==实机。
 - **P3 Processor**:`detect_occupancy` 等逐帧节点 + 合并现 @processor;cali 文件契约。验:frame→occupied 走真 detect;processor 读 npz。
 - **P4 Task**:`calibrate_readout` 文件夹流程 + 中途输出通道 + 产物指纹。验:task 产 npz、中途 panel 收到进度。
 - **P5 自动 UI**:`params_from_signature` + `auto_form` + 三种 Edit + panel Setting 清理。验:N 参数→N 控件、selector 写回、Edit 分工正确。
@@ -168,17 +167,17 @@ panel 空白处的"读/发信号"图例:加**左右 padding**,过长**按需分�
 
 ## 13. 决策(§13 答案,已定)
 
-① 总称 `Measurement`(update_mode 分连续/扫描);② func=`Processor` 合并;③ update_mode=`single/replace/roll/average/repeat`(注册表);④ 参数=签名+注解(单一真相源);⑤ 信号节点命名空间+可别名,Hub 记产出/消费节点;⑥ task 产物=带指纹 npz/run 文件夹;⑦ Processor 进 live 图逐帧;⑧ pulse 绑定注解 `PulseScan`;⑨ 含基础 load-device+snapshot。
+① 总称 `Measurement`(连续/扫描都是它,拥有 repeat 轴 = 填块);② func=`Processor` 合并(纯类型化变换,无用户 mode,静态 `repeat_contract`);③ repeat 全管线只两旋钮:measurement `repeat`/`free_run` + plot `repeat_mode`(`average/add/replace/roll/create`),旧基类 `update_mode` 累积已删(#H3o);④ 参数=签名+注解(单一真相源);⑤ 信号节点命名空间+可别名,Hub 记产出/消费节点;⑥ task 产物=带指纹 npz/run 文件夹;⑦ Processor 进 live 图逐帧;⑧ pulse 绑定注解 `PulseScan`;⑨ 含基础 load-device+snapshot。
 
 ## 14. 关键实现事实
 
 - **相机最近帧 ring**:`CameraDevice` 提供 `recent_capacity`/`latest`/`drain`/`recent_frames`/`clear_recent`,`acquire` 末尾经 `_retain(images)` 入 ring(virtual 与 qcmos 共用,qcmos 不 override ⇒ virtual==real);snapshot 含 roi 对齐。
-- **节点基类与 KIND**(`operations/logic.py`):所有逻辑节点继承 `LogicNode`。`Measurement` 类节点带 `UPDATE_MODES`+`update_mode`;`CameraMeasurement` 与 `ScannedMeasurementNode` 都是其子类。`Processor` 为 reactive:`new_inputs()` 按 hub 每信号版本只在输入前进时发,`step()` 返回空 dict = no-op(skip-on-empty)。`OccupancyProcessor(Processor)` 逐帧跑 `calibration.detect(frame)` → `occupied/counts/rate/rate_sites/rate_grid/centers/thresholds`,是**真 detect 流程**:相机 measurement 只发 `frame`,OccupancyProcessor 单独跑 detect,`occupied == cal.detect(frame).occupied`。
+- **节点基类与 KIND**(`operations/logic.py`):所有逻辑节点继承 `LogicNode`。`Measurement` 类节点拥有 repeat 轴(`repeat`/`free_run`,填 `(repeat,*points,*data)` 块);`CameraMeasurement` 与 `ScannedMeasurementNode` 都是其子类。`Processor` 为 reactive:`new_inputs()` 按 hub 每信号版本只在输入前进时发,`step()` 返回空 dict = no-op(skip-on-empty);静态 `repeat_contract`(`reduce`/`preserve`)声明它对 repeat 轴的关系,**不是用户 mode**。`OccupancyProcessor(Processor)` 是 `reduce`:逐帧(取相机块最新切片)跑 `calibration.detect(frame)` → `occupied/counts/rate/rate_sites/rate_grid/centers/thresholds`(均无 repeat 轴),是**真 detect 流程**:相机 measurement 只发 `frame`,OccupancyProcessor 单独跑 detect,`occupied == cal.detect(frame).occupied`。
 - **Task 层**:`Task` 基类是 one-shot——`run(out)` 跑完把结果存上 `self.result` 后自停,`Task.shot()` 向 hub **发 0 信号**、`Task.published_signals()` 为空(#6:task 不进 hub)。`TaskOutput`(`node.output`)是 task 自有缓冲(非 hub),`run` 把中途数值信号(`frame`/`progress`)写进它供固定面板(`__task_frame__`)显示。`CalibrateReadoutTask` 跑真 sitemap+threshold → `self.calibration`,存 npz 产物并中途出帧。完整 loading 读出 = device + task + processor 组合(无单体节点),全程 virtual==real。
-- **update_mode 行为**:`LogicNode.step` 经 `_postprocess` 钩子分派;`Measurement._postprocess` 实现 roll/replace 透传、`single` 发一次自停、`average` 累计均值、`repeat=N` 攒 N 发均值(中途 tick suppress 返回 `{}`)。
+- **repeat 行为(#H3o)**:measurement 每 `shot()` 填整块 `(repeat,*points,*data)` 并整块 publish(`LogicNode.step` 不再有合并钩子);怎么把 repeat 轴合并成画面全部交给 plot 的 `repeat_mode`(`live.reduce_repeat`,只对 `ndim>=3` 块生效)。processor 不参与合并——`reduce` 型出无 repeat 轴结果、`preserve` 型出 `>=3-D` 块复用同一 `reduce_repeat`。旧 `Measurement.UPDATE_MODES/_postprocess/update_mode/repeats/_accum` 已删(死的第三套)。
 - **参数引擎**(`operations/params.py`):注解 spec(`Param/Choice/ScanArray/SignalRef/PulseScan`)+ `ParamField` 记录 + `params_from_signature(fn)`(用 `inspect.signature(eval_str=True)` 解 PEP 563 字符串注解,跳过 `INJECTED`=hub/camera/sequencer/out/calibration/prefix,保序)。前端 auto_form 鸭子类型读 `ParamField` 属性(不 import,保持解耦)。
 - **`auto_form`**(`frontend/auto_form.py`):`AutoForm(fields, current=, signal_names=)` 把 ParamField list 渲染成 fluent 行(float/int/str→LineEdit、bool→CheckBox、choice→Combo、signal→可编辑 Combo、array/pulse_scan→`start:stop:step`/逗号 LineEdit),`values()`/`set_values()` 往返;鸭子类型读 ParamField(不 import operations,保解耦);密封。`parse_scan_text` 解析扫描数组。
-- **节点基类复用线程/取消/参数队列**:`LogicNode` 是 worker-loop 生产者 + owner-thread 参数队列(`apply_acquisition_parameters`/`_apply_pending_params`/`acquisition_epoch`)+ 协作取消(`stop` event)+ 错误 banner(`node_error`)。`update_mode` 注册表 + 从 build 函数签名派生参数取代手列 `acquisition_parameters`。loading 读出拆成三节点(§4–§6 代码块里的 `live_image`/`detect_occupancy`/`calibrate_readout` 是示意签名,真实节点类如下):标定(find_site_centers+estimate_thresholds)→ `CalibrateReadoutTask`(task);逐帧 detect(roi_counts>thresholds)→ `OccupancyProcessor`(processor);采帧 → `CameraMeasurement`(measurement,只发 `frame`,多触发用 `drain()`)。`ScannedMeasurementNode` 为扫描型(update_mode='replace')。
+- **节点基类复用线程/取消/参数队列**:`LogicNode` 是 worker-loop 生产者 + owner-thread 参数队列(`apply_acquisition_parameters`/`_apply_pending_params`/`acquisition_epoch`)+ 协作取消(`stop` event)+ 错误 banner(`node_error`)。从 build 函数签名派生参数取代手列 `acquisition_parameters`(measurement 再自动注入 `repeat`/`free_run`)。loading 读出拆成三节点(§4–§6 代码块里的 `live_image`/`detect_occupancy`/`calibrate_readout` 是示意签名,真实节点类如下):标定(find_site_centers+estimate_thresholds)→ `CalibrateReadoutTask`(task);逐帧 detect(roi_counts>thresholds)→ `OccupancyProcessor`(processor);采帧 → `CameraMeasurement`(measurement,只发 `frame`,多触发用 `drain()`)。`ScannedMeasurementNode` 为扫描型(填 `(repeat,N,dim)` 块)。
 - **loading 读出 = 用户用三类节点自己拼**(无 `build_loading_readout` 组合入口、无自造 "Readout: Loading" 复合体):在 Logic tab 加一个 `Measurement: Camera (live frames)`(`readout.camera_measurement`→`CameraMeasurement`,发 `frame`)+ 一个 `Processor`(逐帧 `OccupancyProcessor` 跑真 `calibration.detect`)+ 一个 `Task: Calibrate readout`(先跑、写回标定 / 产 npz),各自 Start,再在 Monitor 加 Plot 面板按 signal 连。launcher(`task_console.py`)`na.connect` 后只 `sitemap`/`thresholds` 自标定让 catalog 能跑,console 开 **空 hub、全停**,不自动建/启任何读出。
 - **task 输出不进 hub**(#6):`Task` 自带 `TaskOutput` 缓冲(`node.output`,非 hub),`run(out)` 把中途帧/进度写进它;`Task.shot()` 向 hub 发 **0** 信号、`Task.published_signals()` 为空,结果/标定留在 `node.result`/`node.calibration`。**hub 只承载 measurement + processor 输出**——一次性 task 的瞬态帧永不混进 live 信号或被误当读出。console 起 task 时把 `node.output` 绑到 Monitor 一张**固定**面板(保留键 `__task_frame__`,见 §10),`TaskSpec.mid_run_key` 选缓冲键(如 `frame`)。
 - **panel 永远是 plot 视图 + 两类 Edit 各属一套类**(`frontend/task_console.py`):`PanelConfig.role` ∈ `PANEL_ROLES=("plot",)`——board 上的 panel **只有 plot 一种角色**(纯视图),不再有 measurement/task 角色面板。两类 Edit 分属两套类:`PanelEditor`(plot 面板的 Edit,`is_plot` 恒真)= Acquisition(它所读信号的**产出 logic 节点**自报的源参数 + Apply 原地下发)+ Parameters(plot 自己的 API 参数)+ Processing(快照 + 全 fit 栈 + manual limits + Save);`LogicNodeEditor`(Logic tab 上 measurement/processor/task/camera 节点的 Edit)= 该节点 ParamDecl 自动表单 + Start/Stop,**无 fit / 无 limits**(拟合是 plotter 的事,去 Plot 面板做)。`do_fit`/`fill_limits`/`apply_limits` 经 guard(`fit_combo`/`xmin` 预置 None);fit 由 **role(恒 plot)** 门、绝不由 plot kind 门。
