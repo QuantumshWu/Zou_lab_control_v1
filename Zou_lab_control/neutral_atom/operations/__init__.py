@@ -43,6 +43,22 @@ from .measurement_registry import (
     registered_measurements,
     unregister_measurement,
 )
+from .processor import ProcessorSpec
+from .processor_registry import (
+    discovered_processor_specs,
+    processor,
+    register_processor,
+    registered_processors,
+    unregister_processor,
+)
+from .task import TaskSpec
+from .task_registry import (
+    discovered_task_specs,
+    register_task,
+    registered_tasks,
+    task,
+    unregister_task,
+)
 from .temperature import (
     ReleaseRecapturePlan,
     SurvivalReducer,
@@ -68,6 +84,18 @@ __all__ = [
     "register_measurement",
     "registered_measurements",
     "unregister_measurement",
+    "discovered_processor_specs",
+    "processor",
+    "register_processor",
+    "registered_processors",
+    "unregister_processor",
+    "ProcessorSpec",
+    "discovered_task_specs",
+    "task",
+    "register_task",
+    "registered_tasks",
+    "unregister_task",
+    "TaskSpec",
     "frame_files",
     "index_run",
     "load_frame",
