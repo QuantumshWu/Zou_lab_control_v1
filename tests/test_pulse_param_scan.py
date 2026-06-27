@@ -400,16 +400,17 @@ def test_pulse_scan_finite_repeats_stops_after_k_whole_sweeps():
         exp.close()
 
 
-def test_pulse_scan_repeats_is_orthogonal_to_camera_free_run():
-    """#3: scan_repeats is a SEPARATE axis from the camera-frame repeat/free_run.  A finite
-    scan_repeats=K halts even a free_run node (the user asked for K sweeps), while scan_repeats=0
-    leaves the free_run behaviour untouched (never finishes)."""
+def test_pulse_scan_repeats_is_the_authoritative_pass_count():
+    """#3: pulse-scan fires once per point per pass, so a pass IS a whole sweep -- scan_repeats and
+    the camera-frame repeat/free_run are the SAME axis here.  A finite scan_repeats=K is authoritative:
+    it folds repeat/free_run into a finite K-pass run (so it halts even a free_run-requested node),
+    while scan_repeats=0 leaves the camera-frame behaviour untouched (never finishes)."""
     exp = _calibrated()
     node = probe = node0 = probe0 = None
     try:
-        # free_run camera ring + finite scan_repeats -> the scan still STOPS after K whole sweeps.
+        # free_run + repeat=2 requested, but scan_repeats=1 is authoritative -> 1 finite sweep.
         node, probe = _scan_node(exp, scan_repeats=1, repeat=2, free_run=True, tag="orth1")
-        assert node.total_points == 3                        # 3 points x 1 sweep (scan_repeats wins)
+        assert node.total_points == 3 and node.repeat == 1 and node.free_run is False  # scan_repeats folds them
         node.run_to_completion()
         assert node.finished and node.points_done == 3
 
@@ -423,6 +424,28 @@ def test_pulse_scan_repeats_is_orthogonal_to_camera_free_run():
         for p in (probe, probe0):
             if p:
                 _safe_unlink(p)
+        exp.close()
+
+
+def test_pulse_scan_repeats_keeps_all_k_sweeps_for_averaging():
+    """#3 REGRESSION (review): scan_repeats=K must KEEP all K sweeps in the published block (the
+    repeat-axis depth == K), so the plot's repeat_mode=average actually averages K sweeps.  The bug:
+    the ring used the camera-frame repeat (default 1), so all K sweeps overwrote ONE slot and every
+    sweep but the LAST was silently dropped -- the user's K-sweep noise reduction was a no-op."""
+    import numpy as np
+    exp = _calibrated()
+    node = probe = None
+    try:
+        node, probe = _scan_node(exp, scan_repeats=3, repeat=1, tag="depth")   # default camera repeat=1
+        assert node._ring == 3                               # ring holds all K sweeps, not the camera 1
+        node.run_to_completion()
+        block = np.asarray(node._publish_raw())
+        assert block.shape[0] == 3, f"published depth must be K=3 (all sweeps kept), got {block.shape}"
+        # no sweep slot was left unwritten (i.e. none was overwritten/dropped)
+        assert not np.isnan(block).all(axis=tuple(range(1, block.ndim))).any()
+    finally:
+        if probe:
+            _safe_unlink(probe)
         exp.close()
 
 
