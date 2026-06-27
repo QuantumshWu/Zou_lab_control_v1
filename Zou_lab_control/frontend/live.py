@@ -1872,11 +1872,17 @@ class HistogramFigure(BaseLivePlot):
         thresholds: Sequence[float] | None = None,
         labels: Sequence[str] = ("Counts", "Shots", "Population"),
         ylog: bool = False,
+        bimodal: bool = True,
         **kwargs,
     ):
         self.values = np.asarray(values, dtype=float).reshape(-1)
         self.bins_arg = bins
         self.ylog = bool(ylog)          # log-scale the COUNT axis (reveals a sparse bright tail)
+        # The readout histogram is a dark/bright DISTRIBUTION, so the default IS the two-Gaussian
+        # (bimodal) decomposition -- consistently, for EVERY signal -- not auto-chosen per data (which
+        # made it flip single/double between signals).  Turn it OFF for a plain single-Gaussian view.
+        self._bimodal = bool(bimodal)
+        self._fit_separated = False     # whether the bimodal fit cleanly separated (gates the fidelity stat)
         self.thresholds = list(thresholds or [])
         super().__init__(np.arange(len(self.values)), self.values, labels=labels, relim_mode="tight", **kwargs)
 
@@ -2022,9 +2028,19 @@ class HistogramFigure(BaseLivePlot):
             except Exception:
                 pass
 
-        # Too few bright samples to even attempt a second peak -> fit ONE Gaussian (fit F = N/A).
+        # SINGLE-Gaussian mode (the toggle is OFF): one curve, no dark/bright split, fit F = N/A.
+        if not self._bimodal:
+            _draw_unimodal()
+            self.fit_threshold = float(np.nanmedian(vals))
+            return
+
+        # BIMODAL mode (the DEFAULT): always draw the two-Gaussian dark/bright decomposition, so the
+        # readout histogram reads consistently for EVERY signal -- never auto-collapsed to one peak by
+        # the data.  Only a genuine numerical inability to seed two peaks (a handful of bright samples,
+        # or curve_fit failure) falls back to one Gaussian.
         if right.size < max(4, int(0.01 * vals.size)):
             _draw_unimodal()
+            self.fit_threshold = float(np.nanmedian(vals))
             return
 
         p0 = [_amp_near(mu0), mu0, s0, _amp_near(mu1), mu1, s1]
@@ -2038,18 +2054,17 @@ class HistogramFigure(BaseLivePlot):
                                  jac=bimodal_jacobian, maxfev=20000)
         except Exception:
             _draw_unimodal()
+            self.fit_threshold = float(np.nanmedian(vals))
             return
         if popt[1] > popt[4]:
             popt = np.array([popt[3], popt[4], popt[5], popt[0], popt[1], popt[2]], dtype=float)
-        # Gate the fidelity on the FITTED separation (clean -- unlike a raw-bin dip test, which Poisson
-        # bin noise on a finely-binned UNIMODAL histogram fakes).  A real readout bimodal separates the
-        # fitted means by >~2 summed widths; an over-fitted single blob lands ~1.  Below 1.5 there is no
-        # meaningful threshold -> draw the blended curve but report fit F = N/A (never a fake number).
-        fitted_sep = abs(popt[4] - popt[1]) / (abs(popt[2]) + abs(popt[5]) + 1e-12)
-        if fitted_sep < 1.5:
-            self.fit_line_total.set_data(x_fit, bimodal_model(x_fit, *popt))
-            return
+        # DRAW both peaks always (bimodal mode).  The FIDELITY stat stays honest: it is reported only
+        # when the fitted means separate by >~1.5 summed widths (a real readout bimodal); below that the
+        # two peaks still draw but ``_fit_fidelity`` returns N/A (never a fake number) -- the same
+        # FITTED-separation gate as before, now driving only the stat, not the visual.
         self.bimodal_popt = popt
+        fitted_sep = abs(popt[4] - popt[1]) / (abs(popt[2]) + abs(popt[5]) + 1e-12)
+        self._fit_separated = fitted_sep >= 1.5
         y0 = gaussian(x_fit, *popt[:3])
         y1 = gaussian(x_fit, *popt[3:])
         self.fit_line_left.set_data(x_fit, y0)
@@ -2058,10 +2073,13 @@ class HistogramFigure(BaseLivePlot):
         lo, hi = float(popt[1]), float(popt[4])
         x_mid = np.linspace(lo, hi, 400)
         diff = np.abs(gaussian(x_mid, *popt[:3]) - gaussian(x_mid, *popt[3:]))
-        self.fit_threshold = float(x_mid[int(np.nanargmin(diff))])
+        self.fit_threshold = float(x_mid[int(np.nanargmin(diff))]) if hi > lo else float(np.nanmedian(vals))
 
     def _fit_fidelity(self, threshold: float) -> float | None:
-        if self.bimodal_popt is None:
+        # Honest fidelity only when the two-Gaussian fit cleanly SEPARATED (>=1.5 summed widths); the
+        # decomposition may be DRAWN for an unseparated distribution (bimodal mode) but its fidelity is
+        # meaningless, so report N/A rather than a fake number.
+        if self.bimodal_popt is None or not self._fit_separated:
             return None
         amp0, mu0, sigma0, amp1, mu1, sigma1 = self.bimodal_popt
         w0 = abs(amp0 * sigma0)

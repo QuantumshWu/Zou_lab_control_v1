@@ -966,6 +966,13 @@ PANEL_PARAMS: dict[str, tuple[ParamDecl, ...]] = {
     "hist": (
         ParamDecl(key="bins", label="bins", kind="int", default=60, lo=5, hi=500, display=False,
                   tooltip="Histogram bins"),
+        # The readout histogram is a dark/bright DISTRIBUTION -> default to the two-Gaussian (bimodal)
+        # decomposition, CONSISTENTLY for every signal (not auto-chosen per data).  Turn OFF for a plain
+        # single-Gaussian view.
+        ParamDecl(key="bimodal", label="bimodal fit", kind="bool", default=True, display=True,
+                  tooltip="Fit the dark/bright two-Gaussian readout distribution (default).  Off = a "
+                          "single Gaussian.  The fidelity stat is reported only when the two peaks "
+                          "cleanly separate (else 'fit F=N/A')."),
         # A log count axis makes a SPARSE bright tail (rare high occupancy) visible -- on a linear
         # axis a handful of bright shots vanish under the dark peak.  Default OFF (linear).
         ParamDecl(key="ylog", label="log count axis", kind="bool", default=False, display=True,
@@ -2816,6 +2823,7 @@ class PanelCard(FluentGroupBox):
             self.plotter = panel_plot(
                 np.asarray(value, dtype=float), kind="hist", size=size, interactions=False,
                 bins=int(self.config.params.get("bins", 60)), ylog=bool(self.config.params.get("ylog", False)),
+                bimodal=bool(self.config.params.get("bimodal", True)),
                 labels=("Value", "Shots", "Population"), title=self.config.title or None)
         else:  # 1d
             arr = np.asarray(value, dtype=float)
@@ -3759,6 +3767,7 @@ class PanelEditor(QtWidgets.QWidget):
             elif kind == "hist":
                 self._plotter = panel_plot(np.array(src.values, dtype=float), kind="hist", size=size,
                                            bins=int(card.config.params.get("bins", 60)),
+                                           bimodal=bool(card.config.params.get("bimodal", True)),
                                            labels=tuple(src.labels), title=title)
             else:  # 1d / monitor -> a line snapshot (monitor honours its show_dist toggle)
                 extra = {"show_dist": bool(card.config.params.get("show_dist", True))} if kind == "monitor" else {}
