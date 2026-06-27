@@ -129,11 +129,12 @@ def test_describe_shape_renders_per_signal_structure():
         H, W = np.asarray(frame_judged).shape[1:]
         assert describe_shape(occupied, points_shape=occ_spec.points_shape,
                               data_shape=occ_spec.data_shape) == f"{REPEAT} × ({N_SITES})"
-        # #H3u-3: WITH the site grid, occupied reads "5 × (5×7)" (a site map) -- NEVER the meaningless
-        # "5 × 5×7 × (35)" that double-counted the sites (the 5×7 grid IS the 35 data).
+        # #H3v-3: a no-points signal shows the FLAT site count, NEVER a grid -- even if a grid_shape is
+        # passed it is ignored (the 35 sites are not "5×7"; that layout is the sitemap's display
+        # concern, not the dim).  grid_shape only reshapes a 2-D SCAN's points.
         assert describe_shape(occupied, points_shape=occ_spec.points_shape,
                               data_shape=occ_spec.data_shape,
-                              grid_shape=GRID) == f"{REPEAT} × ({GRID[0]}×{GRID[1]})"
+                              grid_shape=GRID) == f"{REPEAT} × ({N_SITES})"
         assert describe_shape(frame_judged, points_shape=frame_spec.points_shape,
                               data_shape=frame_spec.data_shape) == f"{REPEAT} × ({H}×{W})"
         # centers declares NO structure -> raw shape, no repeat axis

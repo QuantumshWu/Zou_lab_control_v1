@@ -101,12 +101,13 @@ def describe_shape(value, *, points_shape=None, data_shape=None, grid_shape=None
     When the value IS a measurement/processor's contract block (its shape matches the declared
     ``(repeat, *points_shape, *data_shape)``, #H3o) it is shown in CONTRACT form
     ``repeat × points × (data)`` -- the DATA grouped in parens (a 1-D scan ``5 × 8 × (3)``; a
-    2-D scan ``5 × (4×5) × (1)`` via ``grid_shape`` reshaping the SWEPT POINTS).  A signal with NO
-    swept points (points empty) NEVER shows a phantom points axis: its ``grid_shape`` describes how
-    the DATA lays out (a site grid), so per-site occupancy ``(10, 35)`` with a 5×7 site grid reads
-    ``10 × (5×7)`` (10 repeats of a 5×7 site map), NOT the meaningless ``10 × 5×7 × (35)`` (#H3u-3);
-    with no grid it is ``5 × (35)`` and a judged camera frame ``5 × (96×128)``.  Otherwise the raw
-    numpy shape (``(35,)`` / ``(96, 128)``) -- e.g. static ``centers`` (35, 2) carries no repeat axis."""
+    2-D scan ``5 × (4×5) × (1)`` via ``grid_shape`` reshaping the SWEPT POINTS).  ``grid_shape`` is
+    ONLY a 2-D SCAN's points reshape -- it is NEVER applied to the DATA: per-site occupancy
+    ``(10, 35)`` reads ``10 × (35)`` (10 repeats × 35 sites), the flat site count, because the sites
+    are not necessarily a regular grid (the sitemap's 2-D layout is a display concern, not the
+    signal's dimension, #H3v-3).  A signal with NO swept points drops the meaningless ``× 1 ×`` and
+    reads ``repeat × (data)``; a judged camera frame is ``5 × (96×128)``.  Otherwise the raw numpy
+    shape (``(35,)`` / ``(96, 128)``) -- e.g. static ``centers`` (35, 2) carries no repeat axis."""
     if value is None:
         return "—"
     shape = tuple(int(n) for n in np.shape(value))
@@ -119,11 +120,9 @@ def describe_shape(value, *, points_shape=None, data_shape=None, grid_shape=None
         gs = tuple(int(n) for n in (grid_shape or ()))
         dstr = "×".join(str(n) for n in dsh) or "1"
         if not ps:
-            # NO swept points: the grid (if any) reshapes the DATA into a site map, so it goes INSIDE
-            # the data parens -- never as a phantom points axis (that double-counted the sites: the
-            # 5×7 grid IS the 35 data, so "10 × 5×7 × (35)" said the same number twice, #H3u-3).
-            if gs and int(np.prod(gs)) == int(np.prod(dsh) or 1):
-                return f"{shape[0]} × ({'×'.join(str(n) for n in gs)})"   # repeat × (site grid)
+            # NO swept points: show the FLAT data count, never a grid -- the grid_shape only
+            # reshapes a 2-D SCAN's points (below), it is NOT a property of the data (#H3v-3: the
+            # 35 sites are not "5×7"; that layout is the sitemap's display concern, not the dim).
             return f"{shape[0]} × ({dstr})"               # repeat × (flat data)
         pstr = "×".join(str(n) for n in (gs or ps))
         return f"{shape[0]} × {pstr} × ({dstr})"          # repeat × points × (data)
