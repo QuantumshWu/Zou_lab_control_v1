@@ -1,15 +1,23 @@
 """Generic "Pulse scan" measurement (auto-discovered).
 
-A pulse template the user loads exposes TWO kinds of named handle, which are DIFFERENT
-mechanisms and stay separate:
+A pulse template the user loads exposes TWO kinds of named handle:
 
-* **API slots** (``a1``, ``a2`` ...) — one numeric value the operator wants to FIX (not sweep)
-  before the run.  Each slot is set ONCE at build time via :meth:`PulseTableState.set_api`.
-* **Scan slots** (``s0``, ``s1`` ...) — the parameters the run SWEEPS (the x axis).  The user
-  gives a list / ``linspace`` expression PER scan slot; per point the run resolves the scan
-  slots to that row via :meth:`PulseTableState.with_slots_resolved` (the SAME named-slot
-  resolver the hardware scan + pulse GUI use) and fires.  ``x`` = the scan points (1-D = the
-  one scan slot's values; 2-D = two slots advanced in lockstep against a common index).
+* **API slots** (``a1``, ``a2`` ...) — one numeric value the operator wants to FIX before the
+  run.  Each slot is set ONCE at build time via :meth:`PulseTableState.set_api`.
+* **Scan slots** (``s0``, ``s1`` ...) — handles bound to a HARDWARE scan column (the FPGA scan
+  table), resolved per point via :meth:`PulseTableState.with_slots_resolved` (the SAME named-slot
+  resolver the hardware scan + pulse GUI use).
+
+A pulse scan runs in ONE of three :data:`SCAN_MODES` -- a single ``scan_mode`` in the spec picks
+WHAT a single shared scan table sweeps and HOW the device runs it:
+
+* ``"scan"`` — sweep the bound hardware scan slots (one ``(N x n_slots)`` table snapped to the
+  FPGA grid, slots advancing in lockstep).  ``x`` = the scan points (1-D = one slot; 2-D = a grid).
+* ``"api"`` — SOFTWARE sweep of the API slots (the analogue table, native units, no snap): per
+  point the node ``set_api``'s that row, fires, waits the pulse + an extra settle, then advances.
+* ``"none"`` — no sweep: fire ONE point at the fixed api values (a single-point measurement).
+
+The fixed api values are ALWAYS applied first; the mode only decides whether (and how) to sweep.
 
 The ``y`` is DECOUPLED: pulse-scan does not reduce its own frames.  It is a device-driving
 logic node that fires the pulse, publishes the camera ``frame`` it produces, and then reads
@@ -37,6 +45,16 @@ from ...timing import (
 from ..measurement import MeasurementSpec, ParamDecl
 from ..measurement_registry import measurement
 from ..signal_expr import SignalExpr
+
+#: The THREE pulse-scan modes -- the SINGLE source for the name strings the widget toggle, the
+#: build() dispatch, and the tests all share (so "none"/"api"/"scan" is typed in exactly one place):
+#:   * ``"none"`` -- no sweep; fire ONE point at the fixed api values (a single-point measurement).
+#:   * ``"api"``  -- SOFTWARE sweep of the API slots (load -> on_pulse -> settle -> next), no snap.
+#:   * ``"scan"`` -- HARDWARE sweep of the bound scan slots (the FPGA scan table), snapped to the grid.
+SCAN_MODE_NONE = "none"
+SCAN_MODE_API = "api"
+SCAN_MODE_SCAN = "scan"
+SCAN_MODES: tuple[str, str, str] = (SCAN_MODE_NONE, SCAN_MODE_API, SCAN_MODE_SCAN)
 
 #: A pulse scan images ONCE per point, so the default pulse is the SINGLE-image probe template
 #: (one camera trigger) -- NOT the Calibrate task's long-short-long bracket.
@@ -118,6 +136,36 @@ def _api_table_arrays(state: PulseTableState, api_code: str) -> tuple[list[str],
     columns = list(zip(*table))                                      # one column per api slot
     arrays = [np.asarray(col, dtype=float) for col in columns]
     return names, arrays
+
+
+def _resolve_scan_mode(spec: Mapping, state: PulseTableState) -> str:
+    """The pulse-scan mode ("none" | "api" | "scan") -- ONE place that picks WHAT is swept.
+
+    A form built on the new schema sets ``scan_mode`` explicitly.  A LEGACY saved task (pre-toggle)
+    has no ``scan_mode`` key but may carry the old separate programs (``scan_code`` for the hardware
+    scan + ``api_scan`` for the software api sweep).  Infer it ONCE here (no dual runtime path):
+      * a hardware ``scan_code`` + bound scan slots -> "scan" (the old default when slots existed);
+      * else an old ``api_scan`` program -> "api";
+      * else "none" (nothing to sweep -> a single fixed point)."""
+
+    mode = str(spec.get("scan_mode") or "").strip().lower()
+    if mode in SCAN_MODES:
+        return mode
+    # ---- legacy inference (no scan_mode key) -- map the OLD two-table schema onto a single mode.
+    legacy_scan = str(spec.get("scan_code") or "").strip()
+    legacy_api = str(spec.get("api_scan") or "").strip()
+    if state.scan_slots and legacy_scan:
+        return SCAN_MODE_SCAN
+    if legacy_api:
+        return SCAN_MODE_API
+    # An old task that bound scan slots but left the program blank still meant a hardware scan
+    # (the build seeded the column_stack default), so honour that too.
+    if state.scan_slots:
+        return SCAN_MODE_SCAN
+    if state.api_slots and legacy_scan:
+        # the only program present is under scan_code but there are no scan slots -> it was an api one
+        return SCAN_MODE_API
+    return SCAN_MODE_NONE
 
 
 def _label_for_first_api_slot(state: PulseTableState) -> tuple[str, str]:
@@ -208,40 +256,42 @@ def pulse_scan(readout) -> MeasurementSpec:
         spec = dict(pulse_slots or {})
         api_values: Mapping[str, float] = dict(spec.get("api") or {})
         scan_code = str(spec.get("scan_code") or "")
-        api_scan_code = str(spec.get("api_scan") or "")           # software api-slot sweep program
         extra_delay_s = max(0.0, float(spec.get("extra_delay") or 0.0))
+        # The mode is the SINGLE place that picks WHAT is swept: "scan" (hardware scan slots, snap),
+        # "api" (software api sweep, no snap), "none" (one fixed point).  ONE scan_code (the active
+        # mode's program); the form never emits two simultaneous tables.
+        scan_mode = _resolve_scan_mode(spec, state)
 
         # Apply the FIXED api values ONCE; reject typos (set_api raises for unknown handle names).
-        # (An api slot named in the SWEEP program below is driven per point instead, so its fixed
-        # value here is just the resting seed.)
+        # (An api slot named in the api SWEEP below is driven per point instead, so its fixed value
+        # here is just the resting seed.)
         for name, value in api_values.items():
             if str(value).strip() == "":
                 continue                                       # leave the template's value
             state.set_api(name, float(value))
 
-        # HARDWARE scan slots (the x axis on the FPGA scan table): ONE (N_points x n_slots) program,
-        # snapped to the hardware grid, slots advancing in lockstep.  A 2-slot grid program also
-        # declares scan_shape (n0, n1) -> a 2-D scan map.  Empty program with bound slots -> the
-        # column_stack default.  No scan slot bound -> no hardware scan (an api-only sweep).
-        if state.scan_slots:
+        scan_names, scan_arrays, scan_shape = [], [], None
+        api_names, api_arrays = [], []
+        if scan_mode == SCAN_MODE_SCAN:
+            # HARDWARE scan slots (x on the FPGA scan table): ONE (N_points x n_slots) program,
+            # snapped to the hardware grid, slots advancing in lockstep.  A 2-slot grid program
+            # also declares scan_shape (n0, n1) -> a 2-D scan map.  Empty program with bound slots
+            # -> the column_stack default.
             if not scan_code.strip():
                 scan_code = scan_table_template("column_stack", len(state.scan_slots))
             scan_names, scan_arrays, scan_shape = _scan_table_arrays(state, scan_code)
-        else:
-            scan_names, scan_arrays, scan_shape = [], [], None
+        elif scan_mode == SCAN_MODE_API:
+            # SOFTWARE api sweep (the analogue, for api slots): the SAME single scan_code, read as
+            # an (N_points x n_api) table in native units (no hardware snap; set_api snaps a duration
+            # itself).  Empty program -> the column_stack default for the api columns.
+            if not scan_code.strip():
+                scan_code = scan_table_template("column_stack", len(state.api_slots))
+            api_names, api_arrays = _api_table_arrays(state, scan_code)
+        # scan_mode == "none": no sweep -> a single point at the fixed api values (scan/api arrays
+        # stay empty; PulseScanPlan's primary axis is then the lone [0.0] point).
 
-        # SOFTWARE api sweep (the analogue, for api slots): present only when the operator gives a
-        # program -- otherwise the api slots stay FIXED at their values above.
-        api_names, api_arrays = [], []
-        if api_scan_code.strip():
-            api_names, api_arrays = _api_table_arrays(state, api_scan_code)
-
-        if not scan_arrays and not api_arrays:
-            raise ValueError(
-                "a pulse scan needs SOMETHING to sweep: bind a scan slot (sN) and give a scan "
-                "program, OR give an api-sweep program over an API slot (aN).")
-
-        # x axis label: the hardware scan slot if any, else the swept API slot.
+        # x axis label: the hardware scan slot if scanning, the swept API slot if api-sweeping, else
+        # (none) the fixed point's first api slot (a meaningful single-point label).
         if scan_arrays:
             axis_label, axis_unit = _label_for_first_scan_slot(state)
         else:
@@ -259,10 +309,13 @@ def pulse_scan(readout) -> MeasurementSpec:
                   tooltip="The pulse program fired each point.  Its api / scan slots populate the "
                           "auto-form below (one numeric input per api slot + ONE scan-table program)."),
         ParamDecl("pulse_slots", "Slots", "pulse_slots", default={}, depends_on="template",
-                  tooltip="One numeric input per API slot (the fixed operator-set value), and ONE scan "
-                          "program that builds the (N_points x n_slots) scan table -- one row per point, "
-                          "one column per scan slot, advanced in lockstep (this is x).  Same model as the "
-                          "pulse GUI Scan tab (column_stack / grid templates)."),
+                  tooltip="One numeric input per API slot (the fixed operator-set value), then a "
+                          "Scan: [None | API | Scan] mode toggle that picks WHAT one shared scan "
+                          "table sweeps: API sweeps the api slots in software (native units, no "
+                          "snap); Scan sweeps the bound hardware scan slots (snapped to the FPGA "
+                          "grid); None fires a single fixed point.  Same table model as the pulse "
+                          "GUI Scan tab (column_stack / grid templates) -- one row per point, one "
+                          "column per slot, advanced in lockstep (this is x)."),
         ParamDecl("y", "Signal (y)", "signal_expr", default=dict(DEFAULT_Y_SOURCE),
                   tooltip="The y recorded per point.  Pick a signal published by ANOTHER running node "
                           "(e.g. a Judge-occupancy processor's loading 'rate') and combine via value = ... .  "

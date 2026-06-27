@@ -342,21 +342,47 @@ def read_editable_combo(combo) -> str:
     return text.strip()
 
 
+def _scan_modes() -> tuple[str, str, str]:
+    """The ("none", "api", "scan") tuple -- fetched lazily from the ONE backend source
+    (``operations.measurements.pulse_scan.SCAN_MODES``) so the name strings are typed once and the
+    frontend module import stays off neutral_atom's import-time graph (every other na use is lazy)."""
+    from ..neutral_atom.operations.measurements.pulse_scan import SCAN_MODES
+    return SCAN_MODES
+
+
+def _is_number(v) -> bool:
+    """True when ``v`` can be read as a finite float (a saved numeric param), else False."""
+    try:
+        float(v)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
 class _PulseSlotsWidget(QtWidgets.QWidget):
     """Auto-built sub-form for a pulse template's API + scan slots.
 
-    One numeric row per API slot (``a1``, ``a2``, ...): the FIXED operator-set value, in the
-    slot's own unit, seeded from the template's current value.
+    One numeric row per API slot (``a1``, ``a2``, ...): the FIXED operator-set value, in the slot's
+    own unit, seeded from the template's current value (these are ALWAYS shown and ALWAYS applied).
 
-    Then ONE scan-table program for ALL scan slots TOGETHER (``s0``, ``s1``, ...): the operator
-    writes Python that builds an ``(N_points x n_slots)`` array assigned to ``scan_table`` -- one
-    ROW per scan point, one COLUMN per scan slot, advanced in LOCKSTEP.  This is the SAME scan
-    model as the pulse GUI Scan tab (``column_stack`` / ``grid`` templates), NOT a separate points
-    box per slot: the points are one table, so correlations between slots are expressed by how the
-    columns are built.  A column legend shows what each ``sN`` column means + its native unit.
+    Then ONE ``Scan:`` mode toggle -- ``[None | API | Scan]`` -- and ONE shared scan-table editor
+    whose columns / legend / templates ADAPT to the selected mode:
 
-    Output schema: ``{"api": {a1: float, ...}, "scan_code": "<python>"}`` (the build evaluates the
-    program into the table via the shared ``evaluate_scan_table_code`` + ``snap_scan_table``)."""
+    * **Scan** sweeps the bound HARDWARE scan slots (``s0``, ``s1``, ...) -- the columns are the
+      hardware slots in ns ticks / LSB, snapped to the FPGA grid by the build.
+    * **API** sweeps the API slots in SOFTWARE (``a1``, ``a2``, ...) -- the columns are the api
+      slots in their native units (no snap); the ``Extra settle delay`` row is shown only here.
+    * **None** fires a single fixed point at the api values -- the table is hidden.
+
+    Each program is the SAME table model as the pulse GUI Scan tab (``column_stack`` / ``grid``
+    templates): one ROW per point, one COLUMN per slot, advanced in LOCKSTEP.  A mode whose kind is
+    ABSENT (no api slots -> API; no scan slots -> Scan) is disabled.  TWO remembered buffers (one
+    per mode) so switching API<->Scan keeps each mode's last program -- the column MEANING differs,
+    so they are never collapsed into one string.
+
+    Output schema: ``{"api": {a1: float, ...}, "scan_mode": "none"|"api"|"scan",
+    "scan_code": "<the active mode's program>", "extra_delay": float}`` (ONE ``scan_code`` = the
+    active table; the build dispatches on ``scan_mode``)."""
 
     changed = QtCore.pyqtSignal()
 
@@ -365,171 +391,256 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
         self.setStyleSheet("background: transparent;")
         self._api_widgets: dict[str, QtWidgets.QWidget] = {}
         self._api_remembered: dict[str, str] = {}     # typed api values, kept across reloads
-        self._scan_remembered: str = ""               # typed scan program, kept across reloads
-        self._scan_code = None                        # the FluentCodeEdit (None until first scan slot)
-        self._api_scan_remembered: str = ""           # typed SOFTWARE api-sweep program, kept across reloads
+        # TWO remembered buffers -- one per sweep mode -- because the columns mean DIFFERENT things
+        # (api native units vs hardware ns/LSB); switching API<->Scan must restore each mode's own
+        # program.  Keyed by the SINGLE-source mode names (api, scan); None has no table.
+        _none, _api, _scan = _scan_modes()
+        self._scan_buffers: dict[str, str] = {_api: "", _scan: ""}
         self._extra_remembered: str = ""              # typed extra settle delay, kept across reloads
-        self._api_scan_code = None                    # the api-sweep FluentCodeEdit (None until api slots exist)
-        self._extra_delay = None                      # the extra-settle FluentLineEdit
-        self._n_slots = 0
-        # Spans the FULL form width and emits its OWN two PEER sections ("API slots" + "Scan table")
-        # as top-level FluentSectionLabels -- no wrapper header (that would be a redundant third
-        # same-style label above them, #H3-1).
+        self._scan_code = None                        # the ONE active-mode FluentCodeEdit (None in None mode)
+        self._extra_delay = None                      # the extra-settle FluentLineEdit (API mode only)
+        self._mode_combo = None                       # the Scan:[None|API|Scan] toggle
+        self._mode = "none"                           # the currently selected mode
+        # A pending SAVED state to restore on the next rebuild (a load / round-trip).  Kept apart
+        # from the live-typed _api_remembered so rebuild's own stash-of-current-text never clobbers
+        # it; consumed (cleared) once applied.
+        self._pending_mode = None
+        self._pending_api: dict[str, str] = {}
+        self._api_columns: list[tuple[str, str, str]] = []   # the api-mode table columns
+        self._scan_columns: list[tuple[str, str, str]] = []  # the scan-mode table columns
+        self._have_api = False
+        self._have_scan = False
+        self._n_slots = 0                             # bound hardware scan slot count
+        # Spans the FULL form width.  An always-on "API slots" header + the per-slot value rows live
+        # in _api_box; the mode toggle + the single adaptive table live in _table_box (rebuilt on a
+        # mode switch WITHOUT tearing down the api rows, so the value edits survive a toggle).
         self._box = QtWidgets.QVBoxLayout(self)
         self._box.setContentsMargins(0, 0, 0, 0)
         self._box.setSpacing(scaled_px(6, minimum=4))
+        self._api_box = QtWidgets.QVBoxLayout()
+        self._api_box.setContentsMargins(0, 0, 0, 0)
+        self._api_box.setSpacing(scaled_px(6, minimum=4))
+        self._box.addLayout(self._api_box)
+        self._table_box = QtWidgets.QVBoxLayout()
+        self._table_box.setContentsMargins(0, 0, 0, 0)
+        self._table_box.setSpacing(scaled_px(6, minimum=4))
+        self._box.addLayout(self._table_box)
 
-    def _clear(self) -> None:
-        """Tear down every child widget + nested layout (the form is rebuilt from scratch)."""
-        def _drop(layout):
-            while layout.count():
-                item = layout.takeAt(0)
-                w = item.widget()
-                if w is not None:
-                    w.setParent(None); w.deleteLater()
-                child = item.layout()
-                if child is not None:
-                    _drop(child)
-        _drop(self._box)
-        self._api_widgets = {}
-        self._scan_code = None
-        self._api_scan_code = None
-        self._extra_delay = None
+    @staticmethod
+    def _drop_layout(layout) -> None:
+        """Tear down every child widget + nested layout under ``layout`` (rebuilt from scratch)."""
+        while layout.count():
+            item = layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None); w.deleteLater()
+            child = item.layout()
+            if child is not None:
+                _PulseSlotsWidget._drop_layout(child)
 
     def rebuild(self, api_rows, scan_rows) -> None:
         """``api_rows`` = ``[(name, kind, target, unit, current_value), ...]``.
         ``scan_rows`` = ``[(name, kind, target, unit, label), ...]`` (the bound scan slots = the
         columns of the scan table)."""
-        # remember whatever the operator currently typed, then rebuild
-        for name, w in list(self._api_widgets.items()):
-            self._api_remembered[name] = w.text().strip()
-        if self._scan_code is not None:
-            self._scan_remembered = self._scan_code.toPlainText()
-        if self._api_scan_code is not None:
-            self._api_scan_remembered = self._api_scan_code.toPlainText()
-        if self._extra_delay is not None:
-            self._extra_remembered = self._extra_delay.text().strip()
-        self._clear()
+        # Remember whatever the operator currently typed (api values + the active mode's program),
+        # then rebuild both the api rows and the toggle + table.  A queued SAVED load (seed_value set
+        # _pending_*) must NOT be clobbered by stashing the current (default) editor text, so skip the
+        # stash in that case -- the pending buffers / values are the source of truth for this rebuild.
+        pending_load = bool(self._pending_mode) or bool(self._pending_api)
+        if not pending_load:
+            for name, w in list(self._api_widgets.items()):
+                self._api_remembered[name] = w.text().strip()
+            self._stash_active_buffer()
+            if self._extra_delay is not None:
+                self._extra_remembered = self._extra_delay.text().strip()
+        self._drop_layout(self._api_box)
+        self._drop_layout(self._table_box)
+        self._api_widgets = {}
+        self._scan_code = None
+        self._extra_delay = None
+        self._mode_combo = None
         self._n_slots = len(scan_rows)
+        self._have_api = bool(api_rows)
+        self._have_scan = bool(scan_rows)
 
-        # ---- API slots section: ALWAYS shown (peer with the Scan table below, #H3-2).  Each API
-        # slot can be FIXED (a value below) OR SWEPT by an API scan table that is the SAME FORM as
-        # the scan-slot scan table (legend + column_stack/grid buttons + program) -- one renderer.
-        self._box.addWidget(FluentSectionLabel("API slots"))
+        # ---- API slots section: ALWAYS shown.  One FIXED value row per api slot (used in every
+        # mode; in API mode a row may ALSO be the swept dimension, with this value as the seed).
+        self._api_box.addWidget(FluentSectionLabel("API slots"))
         if api_rows:
             api_labels = [f"{name}  {slot_label(kind, target)}" for name, kind, target, _u, _c in api_rows]
             api_lw = setting_label_width(api_labels, minimum=72)   # same row rule as every form
             for name, kind, target, unit, current in api_rows:
                 label = f"{name}  {slot_label(kind, target)}"
-                edit = FluentLineEdit(self._api_remembered.get(name) or f"{float(current):g}", self)
+                # a saved value (a load) wins over the live-typed buffer wins over the template seed
+                seed_text = (self._pending_api.get(name) or self._api_remembered.get(name)
+                             or f"{float(current):g}")
+                edit = FluentLineEdit(seed_text, self)
                 edit.setMinimumWidth(scaled_px(120, minimum=96))
                 edit.setPlaceholderText(f"{unit}")
-                edit.setToolTip(f"Fixed value for API slot {name!r} (unit: {unit}) -- used unless the "
-                                "API scan table below sweeps it.")
+                edit.setToolTip(f"Fixed value for API slot {name!r} (unit: {unit}) -- used in every "
+                                "mode (in API mode it is the resting seed unless that slot is swept).")
                 edit.textChanged.connect(self.changed)
-                self._box.addWidget(FluentSettingRow(label, edit, label_width=api_lw))
+                self._api_box.addWidget(FluentSettingRow(label, edit, label_width=api_lw))
                 self._api_widgets[name] = edit
-            # The API scan table -- IDENTICAL form to the scan-slot table below (#H3 follow-up), just
-            # SOFTWARE-driven (load -> on_pulse -> wait pulse done + extra settle -> next).  Blank =
-            # keep the values above fixed; filled = sweep the api slots in software.
-            caption = FluentLabel("API scan table (software sweep) -- leave blank to keep the values "
-                                  "above fixed:", self)
-            caption.setWordWrap(True)
-            caption.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
-            self._box.addWidget(caption)
-            api_columns = [(name, slot_label(kind, target), (unit or "value"))
-                           for name, kind, target, unit, _c in api_rows]
-            self._render_scan_table_body(api_columns, kind="api", optional=True)
+        else:
+            api_note = FluentLabel("(no API slot -- in the pulse GUI Edit tab, click a duration / DAC "
+                                   "cell to its API (purple) state to fix or sweep a value by name aN.)", self)
+            api_note.setWordWrap(True)
+            api_note.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+            self._api_box.addWidget(api_note)
+
+        # the per-mode table columns (api native units; hardware scan ns/LSB)
+        self._api_columns = [(name, slot_label(kind, target), (unit or "value"))
+                             for name, kind, target, unit, _c in api_rows]
+        self._scan_columns = []
+        for i, (name, kind, target, unit, stored_label) in enumerate(scan_rows):
+            disp = stored_label or slot_label(kind, target)
+            u = "ns ticks" if kind == "duration" else ("integer code (LSB)" if kind == "dac" else (unit or ""))
+            self._scan_columns.append((f"s{i}", disp, u))
+
+        # Default mode: Scan if scan slots exist, else API if api slots exist, else None.  A SAVED
+        # mode (set by seed_value on a load) wins -- but only if that kind is still available for the
+        # loaded template (a saved "scan" with no scan slots falls back to the default).
+        none, api, scan = _scan_modes()
+        default_mode = scan if self._have_scan else (api if self._have_api else none)
+        available = {none: True, api: self._have_api, scan: self._have_scan}
+        self._mode = (self._pending_mode if self._pending_mode and available.get(self._pending_mode)
+                      else default_mode)
+        self._pending_mode = None
+        self._pending_api = {}                         # consumed: a later template-driven rebuild is fresh
+        self._build_mode_toggle()
+        self._render_active_table()
+        self.changed.emit()
+
+    def _build_mode_toggle(self) -> None:
+        """The ONE ``Scan:`` mode toggle -- a FluentComboBox of [None | API | Scan].  A mode whose
+        kind is absent is added but disabled (so the toggle is the single place that picks the swept
+        kind, and an impossible mode reads as unavailable rather than silently missing)."""
+        none, api, scan = _scan_modes()
+        labels = {none: "None", api: "API", scan: "Scan"}
+        enabled = {none: True, api: self._have_api, scan: self._have_scan}
+        combo = FluentComboBox()
+        combo.setMinimumWidth(scaled_px(120, minimum=96))
+        for mode in (none, api, scan):
+            combo.addItem(labels[mode], mode)
+            item = combo.model().item(combo.count() - 1)
+            if item is not None and not enabled[mode]:
+                item.setEnabled(False)
+        idx = combo.findData(self._mode)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.currentIndexChanged.connect(self._on_mode_changed)
+        combo.setToolTip("What to sweep: None = one fixed point; API = sweep the api slots in "
+                         "software; Scan = sweep the bound hardware scan slots.  A mode is disabled "
+                         "when the template has no slot of that kind.")
+        self._mode_combo = combo
+        self._table_box.addWidget(FluentSettingRow("Scan", combo,
+                                                   label_width=setting_label_width(["Scan"], minimum=72)))
+
+    def _on_mode_changed(self, *_a) -> None:
+        if self._mode_combo is None:
+            return
+        new_mode = str(self._mode_combo.currentData() or "none")
+        if new_mode == self._mode:
+            return
+        self._stash_active_buffer()                   # keep the program the operator just typed
+        self._mode = new_mode
+        self._render_active_table()
+        self.changed.emit()
+
+    def _stash_active_buffer(self) -> None:
+        """Save the active code editor's text into its mode's buffer (so a switch preserves it)."""
+        if self._scan_code is not None and self._mode in self._scan_buffers:
+            self._scan_buffers[self._mode] = self._scan_code.toPlainText()
+        if self._extra_delay is not None:
+            self._extra_remembered = self._extra_delay.text().strip()
+
+    def _render_active_table(self) -> None:
+        """(Re)build the single adaptive table area below the toggle for the current mode: nothing
+        for None; the api columns + extra-settle row for API; the hardware scan columns for Scan."""
+        # Drop everything in the table box EXCEPT the first item (the mode toggle row).
+        while self._table_box.count() > 1:
+            item = self._table_box.takeAt(self._table_box.count() - 1)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None); w.deleteLater()
+            child = item.layout()
+            if child is not None:
+                self._drop_layout(child)
+        self._scan_code = None
+        self._extra_delay = None
+        none, api, scan = _scan_modes()
+        if self._mode == none:
+            note = FluentLabel("(None -- no sweep: the pulse fires ONCE at the fixed api values above.)",
+                               self)
+            note.setWordWrap(True)
+            note.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+            self._table_box.addWidget(note)
+            return
+        columns = self._api_columns if self._mode == api else self._scan_columns
+        self._render_scan_table_body(columns, mode=self._mode)
+        if self._mode == api:
+            # The inter-point software settle is meaningful only for the API sweep (the device
+            # streams hardware scans itself), so its row appears ONLY here.
             self._extra_delay = FluentLineEdit(self._extra_remembered, self)
             self._extra_delay.setMinimumWidth(scaled_px(120, minimum=96))
             self._extra_delay.setPlaceholderText("0")
             self._extra_delay.setToolTip("Extra settle delay (seconds) the device holds AFTER each "
                                          "point's pulse finishes, before the next is loaded (0 = none).")
             self._extra_delay.textChanged.connect(self.changed)
-            self._box.addWidget(FluentSettingRow("Extra settle delay (s)", self._extra_delay,
-                                                 label_width=setting_label_width(["Extra settle delay (s)"])))
-        else:
-            api_note = FluentLabel("(no API slot -- in the pulse GUI Edit tab, click a duration / DAC "
-                                   "cell to its API (purple) state to fix or sweep a value by name aN.)", self)
-            api_note.setWordWrap(True)
-            api_note.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
-            self._box.addWidget(api_note)
+            self._table_box.addWidget(FluentSettingRow("Extra settle delay (s)", self._extra_delay,
+                                                       label_width=setting_label_width(["Extra settle delay (s)"])))
 
-        # ---- Scan table: ONE program for all (hardware) scan slots --------------------
-        self._box.addWidget(FluentSectionLabel("Scan table (one program for all scan slots)"))
-        if not scan_rows:
-            note = FluentLabel("(no scan slot bound -- in the pulse GUI Edit tab, click the dot next "
-                               "to a duration / DAC value to bind a scan slot sN, then a program appears here.)", self)
-            note.setWordWrap(True)
-            note.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
-            self._box.addWidget(note)
-            self.changed.emit()
-            return
-        scan_columns = []
-        for i, (name, kind, target, unit, stored_label) in enumerate(scan_rows):
-            disp = stored_label or slot_label(kind, target)
-            u = "ns ticks" if kind == "duration" else ("integer code (LSB)" if kind == "dac" else (unit or ""))
-            scan_columns.append((f"s{i}", disp, u))
-        self._render_scan_table_body(scan_columns, kind="scan", optional=False)
-        self.changed.emit()
-
-    def _render_scan_table_body(self, columns, *, kind: str, optional: bool) -> None:
-        """Render the SAME scan-table form for EITHER the hardware scan slots (``kind='scan'``) or
-        the software API sweep (``kind='api'``): a per-column legend + column_stack / grid template
-        buttons + the ``FluentCodeEdit`` that assigns an (N x n_cols) ``scan_table``.  ONE renderer,
-        so the API sweep table is byte-identical in FORM to the scan-slot table.  ``optional`` (api)
-        starts BLANK -- blank means "keep the fixed values" -- while a required (scan) table seeds the
-        column_stack template; ``columns`` = ``[(col_var, display, unit), ...]``."""
+    def _render_scan_table_body(self, columns, *, mode: str) -> None:
+        """Render the shared scan-table form for the active ``mode``: a per-column legend +
+        column_stack / grid template buttons + the ``FluentCodeEdit`` that assigns an (N x n_cols)
+        ``scan_table``.  ONE renderer, so the API and Scan tables are byte-identical in FORM; only
+        the columns / legend / remembered buffer differ.  ``columns`` = ``[(col_var, display, unit),
+        ...]``.  The editor seeds from this mode's remembered buffer, or the column_stack template."""
         from ..neutral_atom.timing import scan_table_template
-        n = len(columns)
+        n = max(1, len(columns))
         legend = ["Columns of scan_table (one row = one point, columns advance in lockstep):"]
         for var, disp, unit in columns:
             legend.append(f"  {var}: {disp}  [{unit}]")
         legend_label = FluentLabel("\n".join(legend), self)
         legend_label.setWordWrap(True)
         legend_label.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
-        self._box.addWidget(legend_label)
-        remembered = (self._scan_remembered if kind == "scan" else self._api_scan_remembered).strip()
-        seed = remembered if optional else (remembered or scan_table_template("column_stack", n))
+        self._table_box.addWidget(legend_label)
+        remembered = self._scan_buffers.get(mode, "").strip()
+        seed = remembered or scan_table_template("column_stack", n)
         btn_row = QtWidgets.QHBoxLayout()
         btn_row.setContentsMargins(0, 0, 0, 0)
         btn_row.setSpacing(scaled_px(6, minimum=4))
         btn_row.addWidget(FluentLabel("template:", self))
         cs = FluentButton("column_stack", color=GREY)
         cs.setToolTip("Insert the column_stack template (one column per slot), adapted to the columns.")
-        cs.clicked.connect(lambda *_a, k=kind, m=n: self._insert_template("column_stack", k, m))
+        cs.clicked.connect(lambda *_a, m=n: self._insert_template("column_stack", m))
         gr = FluentButton("grid", color=GREY)
         gr.setToolTip("Insert the grid template (every combination of the axis arrays).")
-        gr.clicked.connect(lambda *_a, k=kind, m=n: self._insert_template("grid", k, m))
+        gr.clicked.connect(lambda *_a, m=n: self._insert_template("grid", m))
         btn_row.addWidget(cs, 0)
         btn_row.addWidget(gr, 0)
         btn_row.addStretch(1)
-        self._box.addLayout(btn_row)
+        self._table_box.addLayout(btn_row)
         editor = FluentCodeEdit(seed)
         editor.setMinimumHeight(scaled_px(120, minimum=90))
-        if optional and not seed:
-            editor.setPlaceholderText(f"# blank = keep the fixed values above; or click a template / "
-                                      f"assign an (N x {n}) array to 'scan_table' to sweep")
         editor.setToolTip("Python that assigns an (N_points x n_cols) array to 'scan_table' "
                           "(one column per slot, in the slot's native unit).")
         editor.textChanged.connect(self.changed)
-        self._box.addWidget(editor)
-        if kind == "scan":
-            self._scan_code = editor
-        else:
-            self._api_scan_code = editor
+        self._table_box.addWidget(editor)
+        self._scan_code = editor
 
-    def _insert_template(self, template: str, kind: str = "scan", n: int | None = None) -> None:
+    def _insert_template(self, template: str, n: int | None = None) -> None:
         from ..neutral_atom.timing import scan_table_template
-        editor = self._scan_code if kind == "scan" else self._api_scan_code
-        if editor is not None:
-            cols = self._n_slots if n is None else n
-            editor.setPlainText(scan_table_template(template, max(1, cols)))
+        if self._scan_code is not None:
+            _none, _api, scan = _scan_modes()
+            cols = (self._n_slots if self._mode == scan else len(self._api_columns)) if n is None else n
+            self._scan_code.setPlainText(scan_table_template(template, max(1, cols)))
 
     def values_dict(self) -> dict:
-        """The current ``{"api": {name: float}, "scan_code": "<python>", "api_scan": "<python>",
-        "extra_delay": float}`` snapshot.  An empty / blank api row is dropped (keeps the template's
-        value); a blank api-sweep program keeps the api slots FIXED."""
+        """The current ``{"api": {name: float}, "scan_mode": "none"|"api"|"scan",
+        "scan_code": "<python>", "extra_delay": float}`` snapshot.  ONE ``scan_code`` = the ACTIVE
+        mode's program (the build dispatches on ``scan_mode``); an empty / blank api row is dropped
+        (keeps the template's value)."""
         api: dict[str, float] = {}
         for name, w in self._api_widgets.items():
             text = w.text().strip()
@@ -540,19 +651,48 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
             except ValueError:
                 continue
         code = self._scan_code.toPlainText() if self._scan_code is not None else ""
-        api_scan = self._api_scan_code.toPlainText() if self._api_scan_code is not None else ""
         extra = 0.0
         if self._extra_delay is not None:
             try:
                 extra = float(self._extra_delay.text().strip() or 0.0)
             except ValueError:
                 extra = 0.0
-        return {"api": api, "scan_code": code, "api_scan": api_scan, "extra_delay": extra}
+        return {"api": api, "scan_mode": self._mode, "scan_code": code, "extra_delay": extra}
+
+    def seed_value(self, value) -> None:
+        """Seed from a SAVED ``{"api", "scan_mode", "scan_code", "extra_delay"}`` blob (a load /
+        round-trip).  The auto-form is rebuilt from the template path (the slots themselves come
+        from the template, not the blob), so we stash the saved api values + mode + active program
+        into the per-mode buffers here; the next :meth:`rebuild` (triggered by the template field's
+        repopulation) restores them.  ``_pending_mode`` is honoured by ``rebuild`` over the default
+        when the saved mode is still available for the loaded template."""
+        if not isinstance(value, Mapping):
+            return
+        for name, v in dict(value.get("api") or {}).items():
+            self._pending_api[str(name)] = f"{float(v):g}" if _is_number(v) else str(v)
+        mode = str(value.get("scan_mode") or "").strip().lower()
+        code = str(value.get("scan_code") or "")
+        none, api, scan = _scan_modes()
+        if mode in self._scan_buffers and code.strip():
+            self._scan_buffers[mode] = code
+        elif not mode and code.strip():
+            # a legacy blob (no scan_mode) carried only scan_code -- keep it for both buffers so
+            # whichever mode the rebuild defaults to picks it up.
+            self._scan_buffers[scan] = self._scan_buffers[api] = code
+        self._pending_mode = mode if mode in (none, api, scan) else None
+        self._extra_remembered = (f"{float(value['extra_delay']):g}"
+                                  if _is_number(value.get("extra_delay")) else self._extra_remembered)
 
     def has_scan_rows(self) -> bool:
         return self._n_slots > 0
 
     def all_scan_rows_filled(self) -> bool:
+        """The form has SOMETHING to run: a fixed point (None mode) is always runnable; a sweep mode
+        needs its program filled (or the column_stack default the build supplies, which a blank
+        editor seeds, so a non-None mode is considered ready)."""
+        none, _api, _scan = _scan_modes()
+        if self._mode == none:
+            return True
         return self._scan_code is not None and bool(self._scan_code.toPlainText().strip())
 
 
@@ -3124,6 +3264,11 @@ class MeasurementPanel(QtWidgets.QWidget):
         # (the editable combo round-trips it even if the template changed).
         for key in getattr(self, "_pulse_param_decls", {}):
             self._repopulate_pulse_param(key)
+        # A pulse_slots auto-form rebuilds from its template field too: repopulate AFTER seeding so
+        # the rebuild runs with the stash write() left (saved api values + scan_mode + program) and
+        # the round-trip restores them, regardless of seed order.
+        for key in getattr(self, "_pulse_slots_decls", {}):
+            self._repopulate_pulse_slots(key)
         self._refresh_start_enabled()
 
     def set_running(self, running: bool) -> None:

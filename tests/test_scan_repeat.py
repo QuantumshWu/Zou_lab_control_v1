@@ -198,21 +198,29 @@ def test_plot_setting_has_only_repeat_mode_not_repeat(monkeypatch):
         console.shutdown()
 
 
-def test_api_sweep_table_has_same_form_as_scan_table(monkeypatch):
-    """The API sweep table must be the SAME FORM as the scan-slot scan table: a per-column legend +
-    column_stack/grid template buttons + a code editor (one shared renderer).  A bare editor (no
-    template buttons) would NOT be the same form."""
+def test_api_and_scan_modes_share_one_table_form(monkeypatch):
+    """#H3s-F7: there is ONE scan table whose form (per-column legend + column_stack/grid template
+    buttons + a code editor) is identical in API mode and Scan mode -- the SAME shared renderer.  At
+    any time exactly ONE table is shown (one set of template buttons), not two simultaneous tables."""
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from PyQt5 import QtWidgets
-    from Zou_lab_control.frontend.task_console import _PulseSlotsWidget
+    from Zou_lab_control.frontend.task_console import _PulseSlotsWidget, _scan_modes
     from Zou_lab_control.frontend.qt_fluent import FluentButton
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    none, api, scan = _scan_modes()
     w = _PulseSlotsWidget()
     w.rebuild(api_rows=[("a1", "duration", "1", "us", 5.0)],
               scan_rows=[("s0", "duration", "2", "ns", "probe")])
+    # both kinds present -> defaults to Scan; ONE table (one pair of template buttons), one editor
+    assert w.values_dict()["scan_mode"] == scan
     btns = [b.text() for b in w.findChildren(FluentButton)]
-    assert btns.count("column_stack") == 2 and btns.count("grid") == 2, btns
-    assert w._api_scan_code is not None and w._scan_code is not None
-    assert not w._api_scan_code.toPlainText().strip()
+    assert btns.count("column_stack") == 1 and btns.count("grid") == 1, btns
+    assert w._scan_code is not None
+    # flip to API -> still ONE table with the SAME form (one pair of template buttons + an editor)
+    w._mode_combo.setCurrentIndex(w._mode_combo.findData(api))
+    assert w.values_dict()["scan_mode"] == api
+    btns = [b.text() for b in w.findChildren(FluentButton)]
+    assert btns.count("column_stack") == 1 and btns.count("grid") == 1, btns
+    assert w._scan_code is not None

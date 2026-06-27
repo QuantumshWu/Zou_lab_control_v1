@@ -354,15 +354,16 @@ def _bound_probe_with_api() -> str:
 
 
 def test_pulse_scan_api_sweep_software_drives_each_point():
-    """#H3-3: with ONLY api slots, a pulse scan supports a scan-table-like SOFTWARE sweep -- per
-    point it set_api's that row's value, fires, and reads y.  x = the api sweep points (the swept
-    API slot's value), exactly like the hardware scan table but loaded in software."""
+    """#H3s-F7: in API mode, a pulse scan sweeps the api slots in SOFTWARE -- per point it set_api's
+    that row's value, fires, and reads y.  x = the api sweep points (the swept API slot's value),
+    exactly like the hardware scan table but loaded in software (the SAME single scan_code program,
+    selected by scan_mode='api')."""
     exp = _calibrated()
     probe = _bound_probe_with_api()
     try:
         x, y, node, hub = _run_pulse_scan(
             exp, template=probe,
-            pulse_slots={"api": {}, "api_scan": "import numpy as np\n"
+            pulse_slots={"api": {}, "scan_mode": "api", "scan_code": "import numpy as np\n"
                          "scan_table = np.linspace(2.0, 8.0, 4).reshape(-1, 1)"},
             y={"inputs": ["rate"], "source": "value = signal"})
         assert node.scan_names == []                       # no hardware scan slot
@@ -389,7 +390,8 @@ def test_pulse_scan_extra_delay_settles_via_device():
         try:
             x, y, node, hub = _run_pulse_scan(
                 exp, template=probe,
-                pulse_slots={"api": {}, "extra_delay": 0.05, "api_scan": "import numpy as np\n"
+                pulse_slots={"api": {}, "scan_mode": "api", "extra_delay": 0.05,
+                             "scan_code": "import numpy as np\n"
                              "scan_table = np.linspace(2.0, 8.0, 3).reshape(-1, 1)"},
                 y={"inputs": ["rate"], "source": "value = signal"})
         finally:

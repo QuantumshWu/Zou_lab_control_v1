@@ -504,7 +504,9 @@ class SignalExprHandler(ParamWidgetHandler):
 class PulseSlotsHandler(ParamWidgetHandler):
     """An auto-generated per-slot sub-form for a pulse template (the COMPOSITE
     ``_PulseSlotsWidget``), repopulated from a sibling ``path`` field.  Value is
-    ``{"api": {...}, "scan_code": "...", ...}``."""
+    ``{"api": {...}, "scan_mode": "none"|"api"|"scan", "scan_code": "...", "extra_delay": ...}``
+    -- the api fixed values plus a single Scan-mode toggle that picks what one shared scan table
+    sweeps (the build dispatches on ``scan_mode``)."""
 
     def build(self, decl, value, ctx):
         if ctx.pulse_slots_factory is None:
@@ -518,9 +520,12 @@ class PulseSlotsHandler(ParamWidgetHandler):
         return widget.values_dict()
 
     def write(self, widget, value):
-        # the auto-form rebuilds from the template path; the per-row values are seeded
-        # by that repopulation, not a flat value blob, so there is nothing to write here.
-        return None
+        # The auto-form rebuilds from the template path, so the SLOT ROWS come from the template,
+        # not the blob -- but the saved api VALUES + scan_mode + active program DO round-trip: stash
+        # them on the widget so the next repopulation (driven by the seeded template field) restores
+        # them.  The form calls refresh()/repopulate AFTER seeding so this stash is consumed.
+        if hasattr(widget, "seed_value"):
+            widget.seed_value(value)
 
     def is_empty(self, widget) -> bool:
         return False

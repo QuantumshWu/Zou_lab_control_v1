@@ -343,9 +343,9 @@ def test_sitemap_is_single_slot_while_other_kinds_allow_multi_slot():
 
 def test_pulse_scan_slots_form_is_template_driven():
     """The Pulse-scan measurement carries ONE auto-form (kind ``pulse_slots``) bound to the
-    sibling ``template`` field: one numeric row per API slot + ONE scan-table program for all
-    scan slots together, rebuilt whenever the template path changes; ``collect_values`` returns
-    the {'api', 'scan_code'} dict the build() consumes."""
+    sibling ``template`` field: one numeric row per API slot + a Scan-mode toggle over ONE shared
+    scan-table program, rebuilt whenever the template path changes; ``collect_values`` returns the
+    {'api', 'scan_mode', 'scan_code', 'extra_delay'} dict the build() consumes (#H3s-F7)."""
     from Zou_lab_control.frontend.task_console import MeasurementPanel
 
     exp = _calibrated()
@@ -355,9 +355,10 @@ def test_pulse_scan_slots_form_is_template_driven():
         widget = panel._widgets["pulse_slots"]
         assert panel._decls["pulse_slots"].kind == "pulse_slots"
         out = panel.collect_values()["pulse_slots"]
-        # the form returns the api numeric rows + the scan-table program + the software api-sweep
-        # (``api_scan``) + the inter-point ``extra_delay`` -- all the build() consumes.
-        assert isinstance(out, dict) and set(out) == {"api", "scan_code", "api_scan", "extra_delay"}
+        # the form returns the api numeric rows + the single Scan-mode + the active scan_code program
+        # + the inter-point extra_delay -- ONE scan_code (no separate api_scan key anymore).
+        assert isinstance(out, dict) and set(out) == {"api", "scan_mode", "scan_code", "extra_delay"}
+        assert out["scan_mode"] in {"none", "api", "scan"}
         # the imaging template carries 3 unique API handles -> 3 numeric rows after a switch
         panel._widgets["template"].setText("imaging_template.json")
         panel._repopulate_pulse_slots("pulse_slots")
