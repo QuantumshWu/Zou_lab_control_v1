@@ -24,6 +24,8 @@ from Zou_lab_control.neutral_atom.devices.virtual import VirtualSequencer  # noq
 from Zou_lab_control.neutral_atom.operations.rearrangement import (  # noqa: E402
     Move, target_sites, plan_rearrangement)
 
+GRID = (5, 7)
+
 
 def test_virtual_config_provides_an_aod_bound_to_the_imaged_array():
     dev = load_devices("virtual", open_devices=True)
