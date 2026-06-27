@@ -2332,7 +2332,11 @@ class PanelCard(FluentGroupBox):
         self.config.source = self.source_edit.text()
         self._compiled_source = self.config.source
         self._reset_plot()      # output shape may change with the expression
-        self._rerender_last()   # re-evaluate the new expression on the last data, stopped or not
+        # Force the console's NEXT tick to re-render this panel against a FRESH hub namespace (the
+        # version gate honours -1), so re-picking a signal recovers a panel that previously errored
+        # on a now-available signal -- never "remove the panel to recover" (#H3w-2).
+        self._render_version = -1
+        self._rerender_last()   # also re-evaluate on the last GOOD data at once (stopped node)
         self.apply_button.set_dirty(False)
         self.changed.emit()
 
@@ -2376,12 +2380,6 @@ class PanelCard(FluentGroupBox):
         Every failure lands on the gear/status -- a bad expression in one panel
         must never break the console or its siblings."""
 
-        # Remember the namespace so a later display-only change (cmap / relim / source
-        # pick) can re-render immediately from it even when the producing measurement is
-        # stopped (the hub version is frozen, so no fresh tick will arrive) -- see
-        # _rerender_last.  It is a reference to the hub's snapshot, not a copy: callers
-        # never mutate it, and the next tick replaces it.
-        self._last_namespace = namespace
         # A BLANK panel (a freshly added pure view, source not yet wired) sits
         # quietly with a hint -- it is decoupled, so it shows nothing until the
         # user picks a signal in its Setting.  Not an error.
@@ -2395,8 +2393,18 @@ class PanelCard(FluentGroupBox):
             value = self._signal_then_repeat(namespace)
             self._render(value, namespace)
         except Exception as exc:
+            # A failed eval (e.g. the bound signal is not in this namespace yet -- a still-WAITING
+            # producer) must NOT latch the panel: keep the LAST GOOD namespace (set only on success
+            # below), so re-picking a signal / a display change replays valid data, and a fresh hub
+            # tick re-renders the moment the signal arrives -- never "remove the panel to recover"
+            # (#H3w-2).
             self.set_status(str(exc).splitlines()[0][:160] or type(exc).__name__, error=True)
             return
+        # Remember the LAST SUCCESSFULLY-rendered namespace so a later display-only change (cmap /
+        # relim / a source re-pick) can re-render immediately from it even when the producing
+        # measurement is stopped (hub version frozen, no fresh tick) -- see _rerender_last.  Set ONLY
+        # on success, so an error never overwrites it with a namespace that re-errors on replay.
+        self._last_namespace = namespace
         shot = namespace.get("shot")
         self.set_status(f"shot {int(shot)}" if isinstance(shot, (int, float)) else "ok", error=False)
 
