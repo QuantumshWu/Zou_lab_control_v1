@@ -1,0 +1,108 @@
+{
+  "schema": "Zou_lab_control.neutral_atom.PulseTableState",
+  "version": 3,
+  "name": "release_recapture",
+  "channels": [
+    "trap",
+    "cooling",
+    "probe",
+    "emCCD"
+  ],
+  "scan_slots": [
+    {
+      "kind": "duration",
+      "target": "2",
+      "label": "t_off",
+      "unit": "ns",
+      "nominal": 20000.0
+    }
+  ],
+  "scan_table": [],
+  "api_slots": [],
+  "time_step_ns": 20.0,
+  "periods": [
+    {
+      "duration": 20000000.0,
+      "unit": "ns",
+      "name": "image1_expose",
+      "states": [
+        1,
+        0,
+        1,
+        1
+      ]
+    },
+    {
+      "duration": 1000000.0,
+      "unit": "ns",
+      "name": "image1_settle",
+      "states": [
+        1,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "duration": "s0",
+      "unit": "str (ns)",
+      "name": "trap_off",
+      "states": [
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "duration": 1000000.0,
+      "unit": "ns",
+      "name": "trap_recapture",
+      "states": [
+        1,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "duration": 20000000.0,
+      "unit": "ns",
+      "name": "image2_expose",
+      "states": [
+        1,
+        0,
+        1,
+        1
+      ]
+    },
+    {
+      "duration": 1000000.0,
+      "unit": "ns",
+      "name": "image2_settle",
+      "states": [
+        1,
+        0,
+        0,
+        0
+      ]
+    }
+  ],
+  "visible_channels": [
+    "trap",
+    "cooling",
+    "probe",
+    "emCCD"
+  ],
+  "channel_labels": {},
+  "analog_buses": {},
+  "analog_bus_modes": {},
+  "delays": {},
+  "delay_units": {},
+  "repeat_start": null,
+  "repeat_end": null,
+  "repeat_count": 1,
+  "repeat_forever": false,
+  "scan_repeats": 0,
+  "clk_channels": []
+}

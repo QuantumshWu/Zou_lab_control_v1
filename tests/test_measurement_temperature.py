@@ -159,6 +159,41 @@ def test_release_recapture_plan_rejects_non_two_frames():
         ReleaseRecapturePlan(n_frames=3)
 
 
+def test_temperature_spec_is_a_selectable_pulse_scan_special_case():
+    """#H3u-4: the Temperature SPEC exposes a SELECTABLE pulse ``template`` (the release-recapture
+    program, shipped as pulses/release_recapture.json) -- the pulse-selection step that makes it visibly
+    a pulse-scan whose swept axis is the template's trap-off duration slot -- while STAYING the coupled
+    tier (``scan_tier='coupled'``, NOT routed through the decoupled PulseScanNode)."""
+    exp = _calibrated_virtual_session(grid=(2, 3))
+    try:
+        spec = {s.name: s for s in exp.readout.measurement_specs()}["Temperature"]
+        decls = {p.key: p for p in spec.params}
+        assert "template" in decls and decls["template"].kind == "path"           # a SELECTABLE pulse
+        assert decls["template"].default == "pulses/release_recapture.json"        # the shipped default
+        # the COUPLED tier marker (single source for docs / boundary test) -- NOT the decoupled node
+        assert spec.metadata.get("scan_tier") == "coupled"
+        assert spec.metadata.get("node") != "pulse_scan"
+        # building from the DEFAULT (selectable) template runs the coupled survival scan end-to-end
+        scan = spec.build(template="pulses/release_recapture.json",
+                          t_off=(0.0, 40.0, 4), shots=2).run(live=False, display=False)
+        assert scan.data_y.shape == (4, 1)
+        assert np.all((scan.y >= 0.0) & (scan.y <= 1.0))
+    finally:
+        exp.close()
+
+
+def test_temperature_template_rejects_a_missing_file():
+    """A bogus template path fails LOUD (the operator picked a file that is not there), never silently
+    falling back -- the pulse-selection step is real."""
+    exp = _calibrated_virtual_session(grid=(2, 3))
+    try:
+        spec = {s.name: s for s in exp.readout.measurement_specs()}["Temperature"]
+        with pytest.raises(FileNotFoundError):
+            spec.build(template="pulses/does_not_exist_rr.json", t_off=(0.0, 40.0, 3), shots=2)
+    finally:
+        exp.close()
+
+
 def test_virtual_parses_trap_off_from_release_recapture_sequence():
     """The virtual data source recovers ``t_off`` from the SAME fired sequence the
     analysis layer built: it is the trap-channel OFF gap between the two camera
