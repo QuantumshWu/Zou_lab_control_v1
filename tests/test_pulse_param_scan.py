@@ -105,8 +105,13 @@ def test_enumerate_pulse_params_covers_durations_delays_and_dac():
     assert {"duration", "delay", "dac"} <= kinds
     durations = [t for k, t, _ in params if k == "duration"]
     assert durations == [str(i) for i in range(len(state.periods))]
+    # A DAC bus OWNS its delay (it fans out to its members), so the bus name -- NOT each
+    # member channel (da[0]/da[1]) -- is the delay target; plain channels list themselves.
     delays = [t for k, t, _ in params if k == "delay"]
-    assert delays == list(state.channels)
+    buses = list(state.bus_channels(min_width=1))
+    bus_members = {ch for members in state.bus_channels(min_width=1).values() for ch in members}
+    expected_delays = buses + [c for c in state.channels if c not in bus_members]
+    assert delays == expected_delays
     dac = [t for k, t, _ in params if k == "dac"]
     assert dac == [f"{bus}@{i}" for bus in state.bus_channels(min_width=1)
                    for i in range(len(state.periods))]

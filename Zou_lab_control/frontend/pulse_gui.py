@@ -1445,6 +1445,10 @@ class ChannelPanel(FluentGroupBox):
             label.setFixedSize(label_w, row_height)
             self.channel_labels[key] = label
 
+            # A delay is the API target itself for a plain channel (key == channel), and the
+            # BARE BUS NAME for a bus row (row_info["name"], matching analog_buses) -- the data
+            # layer fans a bus-delay slot out to its members.  ONE target token, ONE code path.
+            api_target = str(row_info["name"]) if is_bus else key
             mixed_delay = False
             if is_bus:
                 member_values = [state.delays.get(channel, 0) for channel in members]
@@ -1461,18 +1465,16 @@ class ChannelPanel(FluentGroupBox):
             else:
                 delay_value = state.delays.get(key, 0)
                 delay_unit = state.delay_units.get(key, "ns")
-            # A per-channel delay is a FIXED output delay (a delay line) -- NOT scannable, but it
-            # CAN be an API slot the notebook/Task sets by name.  So a real (non-bus) channel's
-            # delay field carries the same inline dot, API-only: clicking it cycles none -> API
-            # (aN, violet, value kept) -> none.  A DAC-bus row stays a plain field.
-            if is_bus:
-                delay_edit = FluentLineEdit(str(delay_value))
-            else:
-                delay_edit = FluentScanLineEdit(str(delay_value))
-                delay_edit.scanClicked.connect(lambda ch=key: self.delayApiRequested.emit(ch))
-                api_name = self.state.api_slot_for("delay", key)
-                if api_name:
-                    delay_edit.set_api_bound(True, _api_number(api_name))
+            # A delay is a FIXED output delay (a delay line) -- NOT scannable, but it CAN be an
+            # API slot the notebook/Task sets by name.  EVERY delay field (plain channel AND DAC
+            # bus) carries the same inline dot, API-only: clicking it cycles none -> API (aN,
+            # violet, value kept) -> none.  A bus's handle fans out to its members; there is no
+            # asymmetry between a TTL channel's delay and the bus's.
+            delay_edit = FluentScanLineEdit(str(delay_value))
+            delay_edit.scanClicked.connect(lambda t=api_target: self.delayApiRequested.emit(t))
+            api_name = self.state.api_slot_for("delay", api_target)
+            if api_name:
+                delay_edit.set_api_bound(True, _api_number(api_name))
             if mixed_delay:
                 delay_edit.setPlaceholderText("(mixed)")
                 delay_edit.setToolTip("Members of this bus carry DIFFERENT delays (set via the "
@@ -2633,22 +2635,30 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                             value_edit.set_scan_bound(True, None if si is None else si + 1)
                         elif api_name:   # api slot keeps the value editable, violet marker
                             value_edit.set_api_bound(True, _api_number(api_name))
-            # --- channel panel: delay fields (fixed per-channel value, not scannable) ---
+            # --- channel panel: delay fields (fixed per-channel/bus value, not scannable) ---
             panel = self.channel_panel
             for key, edit in panel.delay_edits.items():
                 is_bus = str(key).startswith("bus:")
+                # The API delay target is the channel itself, or the BARE bus name (the data
+                # layer fans a bus slot out to its members) -- the same token the build path
+                # and enumerate_pulse_params use, so the dot reflects symmetrically.
+                api_target = str(key).split(":", 1)[1] if is_bus else key
+                api_name = state.api_slot_for("delay", api_target)
                 if is_bus:
-                    members = buses.get(str(key).split(":", 1)[1], [])
+                    members = buses.get(api_target, [])
                     vals = [state.delays.get(c, 0) for c in members]
                     units = [state.delay_units.get(c, "ns") for c in members]
                     uniform = vals and all(v == vals[0] for v in vals) and all(u == units[0] for u in units)
                     if vals and not uniform:
                         # per-member delays differ (API-set): show "(mixed)" and protect
-                        # them from being flattened by the next read_values
+                        # them from being flattened by the next read_values -- but STILL
+                        # reflect the bus's API dot (the slot is independent of uniformity).
                         with _signals_blocked(edit):
                             edit.setText("")
                             edit.setPlaceholderText("(mixed)")
                             edit._zlc_mixed = True
+                            if hasattr(edit, "set_api_bound"):
+                                edit.set_api_bound(bool(api_name), _api_number(api_name) if api_name else None)
                         continue
                     edit._zlc_mixed = False
                     dval = vals[0] if vals else 0
@@ -2661,9 +2671,8 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                     edit.setText(str(dval))
                     if ucombo is not None:
                         ucombo.setCurrentText(dunit)
-                    # reflect the delay's API-slot marker (non-bus channels carry the dot)
+                    # reflect the delay's API-slot marker (EVERY delay field carries the dot)
                     if hasattr(edit, "set_api_bound"):
-                        api_name = None if is_bus else state.api_slot_for("delay", key)
                         edit.set_api_bound(bool(api_name), _api_number(api_name) if api_name else None)
             panel.state = state
             panel.set_scan_summary()
@@ -2757,13 +2766,17 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         except Exception as exc:
             self._message(str(exc))
 
-    def _toggle_delay_api(self, channel: str) -> None:
-        """A delay dot was clicked -> cycle that channel's delay as an API slot (none -> api ->
-        none).  A delay is not scannable, so ``_cycle_field_slot`` skips the scan step."""
+    def _toggle_delay_api(self, target: str) -> None:
+        """A delay dot was clicked -> cycle that delay as an API slot (none -> api -> none).
+        ``target`` is a channel name OR a bare DAC-bus name (both are valid delay targets --
+        a bus fans out to its members).  A delay is not scannable, so ``_cycle_field_slot``
+        skips the scan step; the unit is the field's own (a bus reads its first member's)."""
         try:
             state = self.read_state()
-            self._cycle_field_slot(state, "delay", str(channel),
-                                   unit=state.delay_units.get(str(channel), "ns"))
+            members = state.bus_channels(min_width=1).get(str(target))
+            source = members[0] if members else str(target)   # bus -> first member's unit
+            self._cycle_field_slot(state, "delay", str(target),
+                                   unit=state.delay_units.get(source, "ns"))
         except Exception as exc:
             self._message(str(exc))
 

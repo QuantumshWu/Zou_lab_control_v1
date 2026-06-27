@@ -577,7 +577,16 @@ class PulseTableState:
         if not API_VAR_RE.match(name):
             raise ValueError(f"api slot name must look like a1/a2..., got {name!r}.")
         if unit is None:
-            unit = "value" if kind == "dac" else (self.delay_units.get(str(target), "ns") if kind == "delay" else "ns")
+            if kind == "dac":
+                unit = "value"
+            elif kind == "delay":
+                # A bus target carries no entry in delay_units (that maps member
+                # CHANNELS); read the first member's unit so a bus-delay slot gets a
+                # sane unit instead of a bare "ns" that would mis-scale ms/s delays.
+                source = self._delay_targets(str(target))[0]
+                unit = self.delay_units.get(source, "ns")
+            else:
+                unit = "ns"
         self.api_slots.append(ApiSlot(name=name, kind=kind, target=str(target), unit=str(unit)))
         self.validate()
         return name
@@ -610,8 +619,15 @@ class PulseTableState:
         if slot.kind == "duration":
             self.set_period_duration(int(slot.target), float(value), unit=unit)
         elif slot.kind == "delay":
-            self.delays[slot.target] = float(value)
-            self.delay_units[slot.target] = str(unit)
+            # A delay target is either a single channel OR a DAC bus.  A bus's
+            # delay field IS the shared per-member delay (the bus's bits ride one
+            # delay line), so an API slot on it FANS OUT to every member channel --
+            # the handle (a notebook's ``state.a1 = ...``) sets them uniformly,
+            # exactly the symmetry a per-channel delay slot already has.
+            targets = self._delay_targets(slot.target)
+            for channel in targets:
+                self.delays[channel] = float(value)
+                self.delay_units[channel] = str(unit)
             self.validate()
         elif slot.kind == "dac":
             bus, period_index = slot.target.split("@", 1)
@@ -622,11 +638,25 @@ class PulseTableState:
             self.analog_bus_modes[bus] = plan
             self.validate()
 
+    def _delay_targets(self, target: str) -> list[str]:
+        """The channel(s) a delay slot's ``target`` writes/reads.  A plain channel is
+        itself; a DAC-bus name fans out to its member channels (a bus's bits share one
+        delay line).  Falls back to the literal target so a stale name never silently
+        no-ops."""
+
+        members = self.bus_channels(min_width=1).get(str(target))
+        if members:
+            return [str(channel) for channel in members]
+        return [str(target)]
+
     def _read_api_field(self, slot: ApiSlot) -> float:
         if slot.kind == "duration":
             return float(self.periods[int(slot.target)].duration_ns(slots=self.reference_slots())) / UNITS_TO_NS.get(slot.unit, 1.0)
         if slot.kind == "delay":
-            return eval_time_expr(self.delays.get(slot.target, 0.0), slots=self.reference_slots())
+            # For a bus the members are uniform after any set (an API slot IMPLIES
+            # uniformity), so the first member's delay is the shared value.
+            source = self._delay_targets(slot.target)[0]
+            return eval_time_expr(self.delays.get(source, 0.0), slots=self.reference_slots())
         bus, period_index = slot.target.split("@", 1)
         plan = self.analog_bus_plan(bus)
         entry = plan[int(period_index)] if int(period_index) < len(plan) else {}
@@ -883,8 +913,11 @@ class PulseTableState:
                 if period_index < 0 or period_index >= len(self.periods):
                     raise ValueError(f"api slot {slot.name!r} binds duration of missing period {slot.target!r}.")
             elif slot.kind == "delay":
-                if slot.target not in self.channels:
-                    raise ValueError(f"api slot {slot.name!r} binds delay of unknown channel {slot.target!r}.")
+                # A delay target is a single channel OR a DAC bus (a bus owns a delay that
+                # fans out to its members) -- both are valid, exactly the symmetry the user
+                # asked for; anything else is a typo / stale config and fails loud.
+                if slot.target not in self.channels and slot.target not in known_buses:
+                    raise ValueError(f"api slot {slot.name!r} binds delay of unknown channel/bus {slot.target!r}.")
             elif slot.kind == "dac":
                 bus, _, period = slot.target.partition("@")
                 if bus not in known_buses:
@@ -1261,13 +1294,17 @@ class PulseTableState:
         return self
 
     def set_channel_delay(self, channel: str, delay: float | str, *, unit: str = "ns") -> "PulseTableState":
-        """Set ``channel``'s output delay (ns by default, or a scan-expr str) -- the
-        programmatic form of the GUI's per-channel delay edit."""
+        """Set the output delay (ns by default, or a scan-expr str) of ``channel`` OR a DAC
+        BUS -- the programmatic form of the GUI's per-row delay edit.  A bus fans out to its
+        member channels (the bus's bits share one delay line), exactly like the bus-delay API
+        handle; a plain channel writes only itself."""
         channel = str(channel)
-        if channel not in self._channel_index:
-            raise ValueError(f"unknown channel {channel!r}.")
-        self.delays[channel] = delay
-        self.delay_units[channel] = str(unit)
+        targets = self._delay_targets(channel)
+        if channel not in self._channel_index and channel not in self.bus_channels(min_width=1):
+            raise ValueError(f"unknown channel/bus {channel!r}.")
+        for ch in targets:
+            self.delays[ch] = delay
+            self.delay_units[ch] = str(unit)
         self.validate()
         return self
 
@@ -2440,9 +2477,18 @@ def enumerate_pulse_params(state: "PulseTableState") -> list[tuple[str, str, str
         pname = str(period.name).strip() or f"period {i}"
         bound = state.slot_index_for("duration", str(i)) is not None
         out.append(("duration", str(i), f"{pname} duration" + (" (scan-bound)" if bound else "")))
+    # Delays are API-settable (never scannable); a DAC BUS owns a delay just like a
+    # plain channel (it fans out to its members), so both are listed -- buses first so
+    # the bus-delay slot is as discoverable as a TTL channel's.
+    bus_channels = state.bus_channels(min_width=1)
+    bus_members = {channel for members in bus_channels.values() for channel in members}
+    for bus in bus_channels:
+        out.append(("delay", str(bus), f"{bus} delay"))
     for channel in state.channels:
+        if channel in bus_members:
+            continue   # its delay is exposed via the owning bus's slot, not per-member
         out.append(("delay", str(channel), f"{state.label_for(channel)} delay"))
-    for bus in state.bus_channels(min_width=1):
+    for bus in bus_channels:
         for i, period in enumerate(state.periods):
             pname = str(period.name).strip() or f"period {i}"
             out.append(("dac", f"{bus}@{i}", f"{bus} @ {pname} (DAC, signed LSB)"))
