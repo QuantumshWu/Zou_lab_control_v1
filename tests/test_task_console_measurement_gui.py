@@ -110,19 +110,19 @@ def test_measurement_node_edit_generates_typed_form_with_required_param():
     try:
         spec, row, editor, form = _open_measurement_node(console, 0)
         assert form is not None
-        # the spec's declared params PLUS the auto-injected acquisition knobs (repeat + free_run,
-        # which every measurement-layer node owns -- #H3l).
-        assert set(form._widgets) == {d.key for d in spec.params} | {"repeat", "free_run"}
+        # the spec's declared params PLUS the auto-injected acquisition knob (the ONE `repeat`, 0 = ∞,
+        # which every measurement-layer node owns -- #H3l/#H3u-2; the old separate free_run toggle is gone).
+        assert set(form._widgets) == {d.key for d in spec.params} | {"repeat"}
         # the form stores the widget by key + its kind in _decls (no positional tuple now)
-        assert form._decls["repeat"].kind == "int" and form._decls["free_run"].kind == "bool"
+        assert form._decls["repeat"].kind == "int"
         assert form._decls["t_off"].kind == "axis_range"     # min/max/points triplet
         assert form._decls["shots"].kind == "int"
         assert form._decls["per_site"].kind == "bool"
         # capture_radius is an ANALYSIS/fit input, NOT an acquisition param -> it is NOT in the form (#H3q)
         assert "capture_radius" not in form._widgets
         vals = form.collect_values()
-        assert set(vals) == {d.key for d in spec.params} | {"repeat", "free_run"}
-        assert vals["repeat"] == 1 and vals["free_run"] is False     # acquisition defaults
+        assert set(vals) == {d.key for d in spec.params} | {"repeat"}
+        assert vals["repeat"] == 1                           # acquisition default (0 = ∞)
         assert isinstance(vals["t_off"], tuple) and len(vals["t_off"]) == 3
         assert isinstance(vals["per_site"], bool)
     finally:

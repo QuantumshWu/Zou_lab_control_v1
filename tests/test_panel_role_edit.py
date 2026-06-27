@@ -143,7 +143,9 @@ def test_measurement_logic_node_edit_has_form_start_stop_no_fit():
         editor = console._logic_editors[id(row)]
         # the measurement's OWN param form is present, with Start / Stop ...
         assert editor.form is not None
-        assert set(editor.form._widgets) == {d.key for d in spec.params}
+        # the spec's declared params PLUS the ONE auto-injected acquisition knob `repeat` (0 = ∞,
+        # which every measurement-layer node owns -- #H3l/#H3u-2).
+        assert set(editor.form._widgets) == {d.key for d in spec.params} | {"repeat"}
         assert editor.form.start_button is not None and editor.form.stop_button is not None
         # ... but a logic node carries NO curve fit, NO manual limits
         assert not hasattr(editor, "fit_combo")
@@ -194,7 +196,11 @@ def test_camera_and_task_are_addable_logic_layers_with_clean_labels():
         console._start_logic_node(cam_row)
         cam = console._logic_nodes[id(cam_row)]
         assert isinstance(cam, CameraMeasurement)
-        assert console._node_label(cam) == "camera"          # layer name, not "CameraMeasurement"
+        # the dashboard label is the node's DISPLAY name (the unique "<base> #N", #G306), NEVER the
+        # Python class name -- no class name leaks into the UI.
+        assert console._node_label(cam) == cam.display_label
+        assert "CameraMeasurement" not in console._node_label(cam)
+        assert console._node_label(cam).startswith("Camera")
 
         # calibrate task: its own node, STOPPED, with a param Edit (no fit)
         _open_via_add_panel(console, ("task", "Calibrate readout"))
@@ -203,7 +209,8 @@ def test_camera_and_task_are_addable_logic_layers_with_clean_labels():
         console._start_logic_node(task_row)
         task = console._logic_nodes[id(task_row)]
         assert isinstance(task, CalibrateReadoutTask)
-        assert console._node_label(task) == "calibrate"
+        assert console._node_label(task) == task.display_label
+        assert "CalibrateReadoutTask" not in console._node_label(task)
     finally:
         console.shutdown()
         exp.close()
