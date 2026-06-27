@@ -336,7 +336,7 @@ Setting 弹窗按 confocal\_gui 的\tfocus{竖排范式}排布——粗体小标
 Setting 改的每一项——\pyapi{size}、\pyapi{colormap}、声明式参数（bins / 历史长度 / centers / image / cmap）、\tfocus{relim 模式（与 Edit 标签同 key）}、\tfocus{Unit 的 \pyapi{unit\_index}}——\tfocus{都写进 \pyapi{PanelConfig.params}}（连同标题、源、网格槽），随布局 JSON 一起保存。面板因尺寸 / 表达式变化而\tfocus{重建}时，\pyapi{\_apply\_display\_params} 在 \pyapi{\_build\_plot} 收尾时调一次，把 \pyapi{relim\_mode} 与 \pyapi{unit\_index} 重新应用到新建的 plotter 上（\pyapi{cmap} / bins 等声明式参数则直接进 \pyapi{panel\_plot(...)} 的 kwargs）。所以"我把这张卡换了配色、调了 bins、切到 normal + us 单位"在保存/载入/重建后都保持。每面板 Edit 标签的 Processing 段做的是另一份\tfocus{冻结快照}（照搬该卡 size）上的细看，包括手动钉 x/y lim 的功能；它不写回 Monitor live 卡的 config，二者不冲突。
 
 \section{声明式参数:加一个旋钮=一行}
-\pyapi{ParamSpec(key, label, kind, default, choices=, lo=, hi=, tooltip=)}，\pyapi{kind} 取 \pyapi{choice}/\pyapi{int}/\pyapi{signal}。Setting 控件、JSON 持久化、改动后重建全部自动跟上；\pyapi{\_set\_param} 是唯一写入口。要给某类面板加一个可配置项，就在 \pyapi{PANEL\_PARAMS[kind]} 加一行——不用写 bespoke 控件。
+面板参数用与 measurement 同一个声明类型 \pyapi{ParamDecl(key, label, kind, default=, choices=, lo=, hi=, tooltip=, display=)} 声明（\pyapi{display=True} 进 Setting 弹窗的基础旋钮、\pyapi{False} 进面板 Edit 标签的功能参数）；\pyapi{kind} 取 \pyapi{choice}/\pyapi{int}/\pyapi{bool}/\pyapi{float}/\pyapi{path}/\pyapi{signal} 等白名单值。每个 kind 对应 \pyapi{frontend/param\_widgets.py} 里一个 \pyapi{ParamWidgetHandler}（\pyapi{build}/\pyapi{read}/\pyapi{write}/\pyapi{is\_empty}/\pyapi{refresh} 五个 op），注册进 \pyapi{PARAM\_WIDGETS[kind]} 字典——measurement 表单、Setting、Edit \tfocus{共用同一套 handler}（\#H3r-F5）。Setting 控件、JSON 持久化、改动后重建全部自动跟上。要给某类面板加一个可配置项，就在该 kind 的 \pyapi{PANEL\_PARAMS} 加一行 \pyapi{ParamDecl}——它的 kind 必须在 \pyapi{PARAM\_WIDGETS} 里有 handler（契约测试 \pyapi{test\_param\_widget\_registry} 守这条），不用写 bespoke 控件。
 
 
 \chapter{两个常驻标签 + 每面板/每节点 Edit 架构}
@@ -706,7 +706,7 @@ per-site 信号 (photons) & \pyapi{counts} → Distribution(双高斯+阈值) \\
 \end{description}
 
 \section{task\_console.py 内部要点}
-\pyapi{PANEL\_KINDS}/\pyapi{PANEL\_PARAMS}/\pyapi{ParamSpec}/\pyapi{FIT\_MODELS}/\pyapi{COLORBAR\_KINDS};\pyapi{resolve\_task\_state}/\pyapi{default\_console\_state};几何 \pyapi{\_grid\_pitch}/\pyapi{\_card\_size}/\pyapi{\_pos\_to\_slot}/\pyapi{\_resolve\_collisions};\pyapi{PanelCard}(\pyapi{\_build\_settings}/\pyapi{\_make\_param\_widget}/\pyapi{\_render}/\pyapi{\_build\_plot}/\pyapi{\_apply\_display\_params}/\pyapi{\_save\_fig});\pyapi{LogicNodeRow}(\pyapi{STATE\_COLORS})/\pyapi{LogicNodeEditor}/\pyapi{PanelEditor};\pyapi{TaskConsole}(\pyapi{\_build\_ui}/\pyapi{\_add\_logic\_node}/\pyapi{\_build\_logic\_node}/\pyapi{\_producing\_node}/\pyapi{\_poll\_logic\_nodes}/\pyapi{\_refresh\_task\_panel}/\pyapi{\_apply\_task\_lock}/\pyapi{\_edit\_card})。
+\pyapi{PLOT\_KINDS}（单源表，\pyapi{PANEL\_KINDS}/\pyapi{PANEL\_PARAMS} 等从它派生，\#H3r-F7）/\pyapi{ParamDecl}+\pyapi{PARAM\_WIDGETS}（kind→\pyapi{ParamWidgetHandler}，\#H3r-F5）/\pyapi{FIT\_MODELS}/\pyapi{COLORBAR\_KINDS};\pyapi{resolve\_task\_state}/\pyapi{default\_console\_state};几何 \pyapi{GRID\_UNIT}+\pyapi{\_snap\_gap}（间距=单元整数倍，\#H3r-F6）/\pyapi{\_grid\_pitch}/\pyapi{\_card\_size}/\pyapi{\_pos\_to\_slot}/\pyapi{\_compact};\pyapi{PanelCard}(\pyapi{\_build\_settings}/\pyapi{\_make\_param\_widget}/\pyapi{\_render}/\pyapi{\_build\_plot}/\pyapi{\_apply\_display\_params}/\pyapi{\_save\_fig});\pyapi{LogicNodeRow}(\pyapi{STATE\_COLORS})/\pyapi{LogicNodeEditor}/\pyapi{PanelEditor};\pyapi{TaskConsole}(\pyapi{\_build\_ui}/\pyapi{\_add\_logic\_node}/\pyapi{\_build\_logic\_node}/\pyapi{\_producing\_node}/\pyapi{\_poll\_logic\_nodes}/\pyapi{\_refresh\_task\_panel}/\pyapi{\_apply\_task\_lock}/\pyapi{\_edit\_card})。
 
 
 \chapter{已知限制与待决方向}

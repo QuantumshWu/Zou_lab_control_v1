@@ -34,7 +34,7 @@ notebook-first;子模块只经接口互联(解耦);无后向兼容;前端密封;
 >
 > (来源 `references/.../Confocal_GUIv2_refactored_v6`,git-ignore 历史归档。)
 
-1. **声明式实验/测量元数据**:一个测量类用装饰器(confocal 的 `@measurement_gui_meta`)或 `caller()` 签名**自带它的参数与分类**(context / 要保存的 config / 设备槽 device-overrides / 额外参数),单位和默认值就在签名里。借鉴:让每个"实验任务"自带参数接口,notebook/GUI 从签名/schema 生成交互面板,不手写。(我们的 frontend `ParamSpec` 是这个思想在面板层的局部实现,可向实验层推广。)
+1. **声明式实验/测量元数据**:一个测量类用装饰器(confocal 的 `@measurement_gui_meta`)或 `caller()` 签名**自带它的参数与分类**(context / 要保存的 config / 设备槽 device-overrides / 额外参数),单位和默认值就在签名里。借鉴:让每个"实验任务"自带参数接口,notebook/GUI 从签名/schema 生成交互面板,不手写。(我们的 frontend `ParamDecl` 声明 + `ParamWidgetHandler` 注入注册表[#H3r-F5,`frontend/param_widgets.py`]是这个思想在面板层的局部实现:每 kind 一个 handler,measurement 表单/Setting/Edit 共用,可向实验层推广。)
 2. **设备契约 + 注册表**:设备通过抽象基类定义契约(`BaseCounter`/`BaseLaser`…),上层不绑死硬件;按名字注册/取设备(device manager)。我们已有 `devices/base.py` 三契约 + registry,继续沿用并补齐。
 3. **虚拟设备信号注册表 + 物理 dataclass**:`@VirtualCounter.register_signal('ple')` 按测量名查表产期望计数;物理常数集中在 dataclass(峰位/宽/衰减/漂移)。借鉴:为 Rb87 建 `@dataclass VirtualAtom`(能级/亮暗率/loss/drift),按实验名注册信号模型——**加新实验不用改相机/虚拟设备代码**。我们的 loading 读出节点组合(`CameraMeasurement`+`OccupancyProcessor`,虚拟相机驱动)是雏形,可泛化成注册表。
 4. **measurement 生命周期 + 线程分工**:worker daemon 线程跑 `_loop()` 只产数据,前端定时器/notebook 轮询只读;matplotlib artist 由一处统一管;update 策略用**显式 dispatch 字典**(add/replace/create/roll)而非动态 getattr。我们的 LogicNode/SignalHub 已是这套(生产者线程 + hub 拷贝 + GUI 读副本),继续保持。
