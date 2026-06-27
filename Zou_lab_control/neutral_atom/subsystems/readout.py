@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence
 
@@ -109,15 +108,12 @@ class ReadoutSubsystem(ExperimentSubsystem):
         images = s.devices.camera.acquire(
             positive_int(frames, "frames"), sequence=sequence, sequencer=getattr(s.devices, "sequencer", None)
         )
-        result = calibrate_threshold_from_images(images, calibration, site=site, method=method, display=display)
-        # Record the exposure the thresholds were learnt at: a threshold is exposure-specific (bright
-        # counts scale with the imaging time), so any later readout (e.g. release-recapture survival)
-        # MUST image at this SAME exposure or empty sites cross the too-low threshold = a false-positive
-        # floor that stops survival reaching 0 (#H3v-2).  Stamp it on the calibration metadata so the
-        # readout can self-match.
-        cal = result.calibration
-        cal = replace(cal, metadata={**dict(cal.metadata), "threshold_exposure": float(expo)})
-        s._calibration = cal
+        # The exposure these thresholds are learnt at is stamped INSIDE calibrate_threshold_from_images
+        # (the single source every threshold path routes through, #H3w-3) so a later readout -- e.g. the
+        # release-recapture survival frames -- self-matches it and never floors/sticks (#H3v-2).
+        result = calibrate_threshold_from_images(
+            images, calibration, site=site, method=method, exposure=expo, display=display)
+        s._calibration = result.calibration
         s.history.append(result)
         return result
 

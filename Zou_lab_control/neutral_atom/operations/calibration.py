@@ -105,12 +105,20 @@ def calibrate_threshold_from_images(
     *,
     site: int = 0,
     method: str = "otsu",
+    exposure: float | None = None,
     display: bool = True,
 ) -> ThresholdResult:
     """Calibrate per-site thresholds from images and an existing sitemap.
 
     Signals are extracted with ``calibration.signals`` (box or PSF, matching the
     sitemap), so thresholds apply to the same quantity ``detect`` will use.
+
+    This is the ONE place thresholds are learned (every calibration path -- the
+    ``ReadoutSubsystem.thresholds`` API AND the ``CalibrateReadoutTask`` GUI flow -- routes
+    through it), so it is the single source that stamps ``threshold_exposure`` (the camera
+    gate time the bright counts were learnt at, passed by the caller).  A threshold is
+    exposure-specific, so any later readout (e.g. the temperature survival frames) must image
+    at this SAME exposure; recording it here lets that match happen automatically (#H3w-3).
     """
 
     stack = [np.asarray(image, dtype=float) for image in images]
@@ -136,6 +144,8 @@ def calibrate_threshold_from_images(
         thresholds = np.asarray([otsu_threshold(counts[:, i]) for i in range(counts.shape[1])], dtype=float)
         extra = {"threshold_method": "otsu"}
 
+    if exposure is not None:
+        extra["threshold_exposure"] = float(exposure)   # the gate time these thresholds are valid at
     updated = calibration.with_thresholds(thresholds, stage="threshold", thresholds_calibrated=True, **extra)
     site = site_index(site, counts.shape[1])
     fidelity = estimate_threshold_fidelity(counts[:, site], thresholds[site])
@@ -166,6 +176,7 @@ def calibrate_all_methods_from_images(
     threshold_method: str = "otsu",
     psf_half_width: int = 3,
     background: str = "annulus",
+    exposure: float | None = None,
 ) -> TrapCalibration:
     """Calibrate ONCE into a single calibration that can be read with EVERY method.
 
@@ -183,7 +194,7 @@ def calibrate_all_methods_from_images(
             reducer=reducer, method=method, psf_half_width=psf_half_width,
             background=background, display=False)
         result = calibrate_threshold_from_images(
-            readout_images, sitemap.calibration, method=threshold_method, display=False)
+            readout_images, sitemap.calibration, method=threshold_method, exposure=exposure, display=False)
         cals[method] = result.calibration
     box = cals["box"]
     by_method = {

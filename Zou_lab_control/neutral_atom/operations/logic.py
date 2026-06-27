@@ -1019,7 +1019,7 @@ class CalibrateReadoutTask(Task):
         out.publish(progress=0.95, stage="finding sites + thresholds (box / PSF)")
         calibration = calibrate_all_methods_from_images(
             template, samples, grid_shape=self.grid_shape, roi_radius=self.roi_radius,
-            threshold_method=self.threshold_method)
+            threshold_method=self.threshold_method, exposure=self.readout_exposure)
         # Use the bracket-voted ground truth to train + write back each method's per-site
         # boundary (so detect reads on it), and stash the groups for the held-out report.
         calibration = self._apply_reference_thresholds(calibration, ref_groups, readout_by_group)
@@ -1224,7 +1224,7 @@ class CalibrateReadoutTask(Task):
             out.publish(frame=samples[-1], progress=0.85)
         calibration = calibrate_all_methods_from_images(
             reference_flat, samples, grid_shape=self.grid_shape, roi_radius=self.roi_radius,
-            threshold_method=self.threshold_method)
+            threshold_method=self.threshold_method, exposure=self.readout_exposure)
         n_groups = run.n_groups
         ref_groups = ([reference_flat[g * n_ref:(g + 1) * n_ref] for g in range(n_groups)]
                       if n_ref and len(reference_flat) >= n_groups * n_ref
