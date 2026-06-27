@@ -38,7 +38,8 @@ import numpy as np
 
 from ..core.analysis import grid_shape_tuple
 from ..core.signals import SignalHub
-from ..devices.base import CameraDevice
+from ..devices.base import AODDevice, CameraDevice
+from .rearrangement import plan_rearrangement, target_sites
 from .signal_expr import DEFAULT_SOURCE, SignalExpr, hub_namespace
 
 
@@ -1234,6 +1235,127 @@ class CalibrateReadoutTask(Task):
         self._reference_template = (np.mean(np.asarray(reference_flat, dtype=float), axis=0)
                                     if reference_flat else None)
         return calibration
+
+
+class RearrangeTask(Task):
+    """Assemble a defect-free atom array via the AOD, as a first-class one-shot Task.
+
+    The standard neutral-atom rearrangement loop: IMAGE the stochastic loading -> DETECT per-site
+    occupancy (through the session calibration) -> PLAN the moves that fill a target defect-free set with
+    minimum displacement (:mod:`operations.rearrangement`) -> drive the AOD to EXECUTE them
+    (``aod.apply_moves``) -> RE-IMAGE and report the fill fraction.  Mid-run it streams the before/after
+    camera frames + before/after per-site occupancy + a progress fraction to a dedicated panel; the result
+    (fill fraction, counts, the move list) lives on ``self.result``.
+
+    Decoupled from the session: it takes the camera + AOD devices and two closures the subsystem wires --
+    ``frame_provider(exposure) -> one frame`` (the SAME imaging path the readout uses) and
+    ``calibration_provider() -> TrapCalibration`` (the session's thresholded calibration).  Identical on
+    real hardware -- only the camera frames + the AOD (virtual occupancy vs real RF chirp) differ."""
+
+    node_label = "rearrange"
+    provides = ("fill_fraction", "n_filled", "n_target", "n_loaded", "n_moves")
+    # streamed to the dedicated mid-run panel + banner (before/after frames + occupancy + progress)
+    mid_run = ("frame_before", "frame_after", "occupancy_before", "occupancy_after", "progress", "stage")
+
+    def output_specs(self) -> tuple[SignalSpec, ...]:
+        return (
+            SignalSpec("frame_before", "before frame", "counts", "camera frame of the initial loading"),
+            SignalSpec("frame_after", "after frame", "counts", "camera frame of the assembled array"),
+            SignalSpec("occupancy_before", "before occupancy", "", "per-site 0/1 before rearrange (N,)"),
+            SignalSpec("occupancy_after", "after occupancy", "", "per-site 0/1 after rearrange (N,)"),
+            SignalSpec("fill_fraction", "fill fraction", "", "fraction of target sites filled after"),
+            SignalSpec("n_filled", "filled", "", "number of target sites filled after"),
+            SignalSpec("n_target", "target sites", "", "size of the defect-free target set"),
+            SignalSpec("n_loaded", "loaded", "", "atoms detected in the initial loading"),
+            SignalSpec("n_moves", "moves", "", "single-atom moves the plan executed"),
+        )
+
+    def __init__(self, hub: SignalHub, camera: CameraDevice, aod: AODDevice, *,
+                 sequencer: object | None = None, grid_shape: tuple[int, int] = (5, 7),
+                 readout_exposure: float = 0.020, target_count: int = 0, target_layout: str = "center",
+                 move_survival: float | None = None,
+                 frame_provider=None, calibration_provider=None, prefix: str = ""):
+        super().__init__(hub, prefix=prefix)
+        self.camera = camera
+        self.aod = aod
+        self.sequencer = sequencer
+        self.grid_shape = grid_shape_tuple(grid_shape)
+        self.readout_exposure = float(readout_exposure)
+        # 0 = half the array (the rearrangement planner's default); >0 = that many central sites.
+        self.target_count = int(target_count)
+        self.target_layout = str(target_layout)
+        # None = use the AOD device's own per-move survival default; a value overrides it.
+        self.move_survival = None if move_survival is None else float(move_survival)
+        # Wired by the subsystem (captures the session): image one frame through the readout's imaging
+        # path, and read the session's thresholded calibration -- so the task stays backend-free.
+        self._frame_provider = frame_provider
+        self._calibration_provider = calibration_provider
+
+    def acquisition_parameters(self) -> dict[str, object]:
+        return {
+            "grid_shape": tuple(self.grid_shape),
+            "target_count": int(self.target_count),
+            "target_layout": str(self.target_layout),
+            "readout_exposure": float(self.readout_exposure),
+            "move_survival": -1.0 if self.move_survival is None else float(self.move_survival),
+        }
+
+    def set_acquisition_parameters(self, **values) -> None:
+        if "grid_shape" in values:
+            self.grid_shape = grid_shape_tuple(values["grid_shape"])
+        if "target_count" in values:
+            self.target_count = int(values["target_count"])
+        if "target_layout" in values:
+            self.target_layout = str(values["target_layout"])
+        if "readout_exposure" in values:
+            self.readout_exposure = float(values["readout_exposure"])
+        if "move_survival" in values:
+            sv = float(values["move_survival"])
+            self.move_survival = None if sv < 0 else sv      # -1 (or any <0) = use the device default
+
+    def _image_occupancy(self, calibration):
+        """Image one frame through the readout path + classify per-site occupancy via the calibration
+        (the SAME ``TrapCalibration.detect`` contract the live OccupancyProcessor uses)."""
+        if self._frame_provider is None:
+            raise RuntimeError("RearrangeTask has no frame_provider; build it via exp.rearrange.task(...).")
+        frame = self._frame_provider(self.readout_exposure)
+        occupied = np.asarray(calibration.detect(frame).occupied, dtype=bool).reshape(-1)
+        return frame, occupied
+
+    def run(self, out: "TaskOutput") -> dict:
+        if self._calibration_provider is None:
+            raise RuntimeError("RearrangeTask has no calibration_provider; build it via exp.rearrange.task(...).")
+        calibration = self._calibration_provider()        # thresholded calibration (raises if missing)
+
+        out.publish(progress=0.05, stage="imaging initial loading")
+        frame0, occ0 = self._image_occupancy(calibration)
+        out.publish(frame_before=frame0, occupancy_before=occ0.astype(float),
+                    progress=0.25, stage=f"{int(occ0.sum())} atoms loaded")
+
+        targets = target_sites(self.grid_shape, n_target=(self.target_count or None), layout=self.target_layout)
+        plan = plan_rearrangement(occ0, self.grid_shape, targets)
+        short = "" if plan.feasible else f" (short {plan.shortfall})"
+        out.publish(progress=0.4, stage=f"planned {len(plan.moves)} moves -> {len(targets)} targets{short}")
+
+        if self.move_survival is None:
+            self.aod.apply_moves(plan.moves)              # device default per-move survival
+        else:
+            self.aod.apply_moves(plan.moves, survival=self.move_survival)
+
+        out.publish(progress=0.7, stage="imaging rearranged array")
+        frame1, occ1 = self._image_occupancy(calibration)
+        filled = int(sum(1 for t in targets if occ1[t]))
+        fill = filled / max(1, len(targets))
+        out.publish(frame_after=frame1, occupancy_after=occ1.astype(float),
+                    progress=1.0, stage=f"filled {filled}/{len(targets)} = {fill:.0%}")
+
+        return {
+            "fill_fraction": float(fill), "n_filled": float(filled), "n_target": float(len(targets)),
+            "n_loaded": float(plan.n_loaded), "n_moves": float(len(plan.moves)),
+            "targets": np.asarray(targets, dtype=int),
+            "occupancy_before": occ0, "occupancy_after": occ1,
+            "moves": [(int(m.src), int(m.dst)) for m in plan.moves],
+        }
 
 
 class CameraMeasurement(Measurement):

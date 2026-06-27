@@ -30,7 +30,7 @@ from .devices import CameraDevice, DeviceSet, SequencerDevice, load_devices, res
 from .operations import calibrate_sitemap_from_images, calibrate_threshold_from_images, detect_image
 from .timing import PulseSequence, imaging_channel_kwargs, imaging_sequence
 from .timing.verilog import generate_verilog, write_verilog_bundle
-from .subsystems import ExperimentSubsystem, ReadoutSubsystem, TimingSubsystem
+from .subsystems import ExperimentSubsystem, ReadoutSubsystem, RearrangeSubsystem, TimingSubsystem
 
 
 class NeutralAtomSession:
@@ -52,6 +52,7 @@ class NeutralAtomSession:
         self.devices.camera.bind_experiment(self)
         self._readout_subsystem = ReadoutSubsystem(self)
         self._timing_subsystem = TimingSubsystem(self)
+        self._rearrange_subsystem = RearrangeSubsystem(self)
 
     @property
     def camera(self) -> CameraDevice:
@@ -76,6 +77,14 @@ class NeutralAtomSession:
         if not hasattr(self, "_timing_subsystem"):
             self._timing_subsystem = TimingSubsystem(self)
         return self._timing_subsystem
+
+    @property
+    def rearrange(self) -> RearrangeSubsystem:
+        """AOD atom rearrangement -- assemble a defect-free array (``exp.rearrange.execute()`` /
+        ``.task(hub)``).  Needs a thresholded calibration + an ``aod`` device on the connection."""
+        if not hasattr(self, "_rearrange_subsystem"):
+            self._rearrange_subsystem = RearrangeSubsystem(self)
+        return self._rearrange_subsystem
 
     # ---- GUI launchers (confocal-style ``exp.task_console()`` / ``exp.pulse_gui()``) --------
     # The windows live in the frontend; these are thin sugar reached LAZILY through the

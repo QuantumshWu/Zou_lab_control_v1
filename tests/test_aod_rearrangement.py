@@ -83,3 +83,34 @@ def test_ramp_aod_apply_moves_fires_one_program_per_move():
     ramp.apply_moves([Move(0, 17), Move(6, 18), Move(34, 24)])
     fires = sum(1 for row in seq.history if row["action"] == "fire")
     assert fires == 3, "one ramp program fired per move (sequential single-tweezer)"
+
+
+# -- end-to-end (the user's "virtual must SEE the defect-free array") --------------------
+def _calibrated_virtual_session():
+    import Zou_lab_control.neutral_atom as na
+    exp = na.connect("virtual")
+    exp.readout.sitemap(frames=12, display=False)
+    exp.readout.thresholds(frames=80, display=False)
+    return exp
+
+
+def test_rearrange_task_is_auto_discovered():
+    exp = _calibrated_virtual_session()
+    names = [spec.name for spec in exp.readout.task_specs()]
+    assert "Rearrange array" in names, "the rearrange task must appear in the Add-Panel Task group"
+
+
+def test_end_to_end_virtual_rearrange_assembles_defect_free_array():
+    """The whole flow on the virtual backend: calibrate -> load sparsely -> exp.rearrange.execute() ->
+    the re-image SEES a filled defect-free target (fill fraction == 1 at perfect transfer)."""
+    exp = _calibrated_virtual_session()
+    trap = exp.devices.trap_array
+    occ = np.zeros(trap.n_sites, dtype=bool)
+    occ[[0, 6, 28, 34, 3, 21, 13]] = True                  # 7 scattered atoms
+    trap.set_occupancy(occ)
+    res = exp.rearrange.execute(target_count=6, move_survival=1.0)
+    assert res["n_loaded"] >= 6 and res["fill_fraction"] >= 0.99, res
+    assert res["n_filled"] == res["n_target"] == 6
+    # occupancy_after must actually show atoms ON the target sites (the camera re-image sees it)
+    occ_after = np.asarray(res["occupancy_after"], dtype=bool)
+    assert int(occ_after.sum()) >= 6
