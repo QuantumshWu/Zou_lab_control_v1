@@ -1057,24 +1057,40 @@ A recurring question ("isn't Temperature just a kind of pulse-scan?") — yes. E
 system is the same concept: **sweep one or more NAMED pulse slots, reduce each point to a value**.
 They split into two tiers by WHERE the per-point reduce lives, NOT by being different machines:
 
-- **Coupled tier — `ScannedMeasurement` (inline reducer).** `Temperature` (slot `s0` trap-off →
-  `SurvivalReducer`) and `Readout-duration` (slot `exposure` → `OtsuFidelityReducer`) are the SAME
+- **Coupled tier — `ScannedMeasurement` (inline reducer).** `Temperature` (trap-off → `SurvivalReducer`)
+  and `Readout-duration`/`Fidelity vs duration` (readout window → `OtsuFidelityReducer`) are the SAME
   builder differing ONLY in `(slot, plan, reducer)`, so they BOTH call the one spine
   **`ReadoutSubsystem._build_slot_scan(controller, calibration, *, slot, values, label, plan,
   reducer, shots_per_point)`** (the `ScanAxis` + `ScannedMeasurement` assembly lives there ONCE —
   `build_temperature_scan` / `build_detection_scan` are 3-line callers). The reducer is inline here
   *on purpose*: survival needs a TWO-FRAME pair from one loading and fidelity needs the per-frame
   Otsu split — both depend on the multi-frame `ShotPlan` STRUCTURE a generic single-frame processor
-  cannot see. **The pulse is SELECTABLE** (#H3u-4): `Temperature` exposes a `template` ParamDecl
-  defaulting to the shipped `pulses/release_recapture.json` (editable in the pulse GUI), whose trap-off
-  duration slot `s0` is the swept axis — the same "pick a pulse" entry the generic `pulse_scan` has, so
-  temperature is *visibly* a pulse-scan; only its reduce stays coupled. `temperature.py`
-  `_resolve_release_recapture_template` maps the template's role channels onto the session sequencer
-  (virtual roles / real `ch00..`) via `imaging_channel_kwargs`. The spec carries
-  `metadata["scan_tier"]="coupled"` (the single source the boundary test + docs read) and NO
-  `"node":"pulse_scan"` key, so the console builds it as a plain `ScannedMeasurementNode`.
-  `Readout-duration` sweeps the CAMERA exposure (a camera setting, not a pulse-duration slot), so it
-  has no pulse-template step — its coupling is the per-point Otsu frame SET.
+  cannot see. **Both pulses are SELECTABLE templates** (#H3u-4, #H3v-1): each exposes a `template`
+  ParamDecl editable in the pulse GUI, whose ONE swept DURATION slot is the scan axis — the same
+  "pick a pulse" entry the generic `pulse_scan` has, so both are *visibly* pulse-scans; only the reduce
+  stays coupled. `Temperature` defaults to `pulses/release_recapture.json`, sweeping the trap-off slot
+  `s0` (`temperature.py::_resolve_release_recapture_template`). `Fidelity vs duration` defaults to the
+  single-image `pulses/probe_template.json`, sweeping the imaging template's **image-period readout
+  window** (`readout_duration.py::_resolve_imaging_template` binds a `duration` scan slot on the `image`
+  period; `build_detection_scan`'s `_ExposureConfiguringPlan` matches the camera gate per point, so the
+  imaging light-on time AND the camera exposure follow the sweep together — virtual==real). Both
+  resolvers map role channels onto the session sequencer (virtual roles / real `ch00..`) via
+  `imaging_channel_kwargs`. Each spec carries `metadata["scan_tier"]="coupled"` (the single source the
+  boundary test + docs read) and NO `"node":"pulse_scan"` key, so the console builds it as a plain
+  `ScannedMeasurementNode`. **The ONE honest physical difference**: temperature's swept duration is a
+  STREAMER trap-pulse channel; fidelity's is the readout window (the imaging light-on time, whose camera
+  gate the plan matches) — both are "a duration of the loaded readout template", realised on different
+  hardware.
+
+  **Why these are MEASUREMENTS, not Tasks** (#H3v-1): a recurring question is "isn't Temperature a
+  Task?". No. A `Task` (e.g. `CalibrateReadoutTask`) publishes NOTHING to the SignalHub, yields an
+  off-hub artifact on `self.result`, and renders a SINGLE mid-run frame in a fixed Monitor panel — the
+  shape for a WORKFLOW that produces an artifact (centres/thresholds → a folder). Temperature/fidelity
+  instead produce a live, hub-published, **fittable x-y curve** (`survival` vs `t_off`,
+  `fidelity` vs `detection_time`) that the operator plots in ANY panel and fits (`na.fit_temperature`,
+  `operations.fidelity.characterize_readout`). The three properties they share with a task —
+  template + UI-params→auto-generated scan table + internal (camera/occupancy-derived) signal — are NOT
+  task-defining; they are exactly how a COUPLED pulse-scan MEASUREMENT works. So they stay measurements.
 - **Decoupled tier — `PulseScanNode` (y from a separate processor's signal, §20).** The GUI
   `pulse_scan` sweeps named pulse slots exactly the same way, but instead of an inline reducer it
   PUBLISHES the raw frames and reads y from another running node's signal via a `signal_expr`
