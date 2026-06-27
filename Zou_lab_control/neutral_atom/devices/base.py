@@ -318,10 +318,28 @@ class TrapArrayDevice(BaseDevice):
         """Number of trap sites."""
 
 
+class AODDevice(BaseDevice):
+    """Required contract for the actuator that EXECUTES an atom-rearrangement plan -- the crossed-AOD
+    deflector that drags atoms between tweezer sites.
+
+    The host computes the plan (``operations.rearrangement.plan_rearrangement`` -> ordered single-atom
+    moves); the AOD device performs it.  On REAL hardware ``apply_moves`` chirps the X/Y RF tones (a DAC
+    voltage ramp -> VCO -> deflection angle) to walk each atom from its source tweezer to its target; on
+    the VIRTUAL backend it mutates the simulated atom occupancy.  Same plan, device-swapped -- this is the
+    seam that keeps rearrangement virtual==real (the orchestration never branches on backend)."""
+
+    @abstractmethod
+    def apply_moves(self, moves: Any, *, survival: float | None = None) -> None:
+        """Execute ``moves`` (a sequence of ``rearrangement.Move`` with flat ``.src`` / ``.dst`` site
+        indices), dragging each atom from its source site to its destination.  ``survival`` optionally
+        overrides the per-move transit-survival probability (else the device default)."""
+
+
 ROLE_BASES = {
     "camera": CameraDevice,
     "sequencer": SequencerDevice,
     "trap_array": TrapArrayDevice,
+    "aod": AODDevice,
 }
 
 
@@ -370,6 +388,7 @@ def snap_subarray(roi, *, step: int, max_w: int, max_h: int):
 
 
 __all__ = [
+    "AODDevice",
     "BaseDevice",
     "CameraDevice",
     "SequencerDevice",

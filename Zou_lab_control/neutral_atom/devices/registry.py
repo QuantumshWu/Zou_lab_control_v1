@@ -10,15 +10,17 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .virtual import virtual_config, virtual_config_with_overrides
-from .base import CameraDevice, SequencerDevice, TrapArrayDevice, validate_device_contract
+from .base import AODDevice, CameraDevice, SequencerDevice, TrapArrayDevice, validate_device_contract
 
 
 BUILTIN_DEVICE_CLASS_PATHS = {
     "QCMOSCamera": "Zou_lab_control.neutral_atom.devices.qcmos.QCMOSCamera",
     "ManualSequencer": "Zou_lab_control.neutral_atom.devices.sequencer.ManualSequencer",
+    "RampAOD": "Zou_lab_control.neutral_atom.devices.aod.RampAOD",
     "RemoteSequencer": "Zou_lab_control.neutral_atom.devices.sequencer.RemoteSequencer",
     "RuntimeSequencer": "Zou_lab_control.neutral_atom.devices.sequencer.RuntimeSequencer",
     "VerilogSequencer": "Zou_lab_control.neutral_atom.devices.sequencer.VerilogSequencer",
+    "VirtualAOD": "Zou_lab_control.neutral_atom.devices.virtual.VirtualAOD",
     "VirtualCamera": "Zou_lab_control.neutral_atom.devices.virtual.VirtualCamera",
     "VirtualSequencer": "Zou_lab_control.neutral_atom.devices.virtual.VirtualSequencer",
     "VirtualTrapArray": "Zou_lab_control.neutral_atom.devices.virtual.VirtualTrapArray",
@@ -44,6 +46,12 @@ class DeviceSet:
     @property
     def trap_array(self) -> TrapArrayDevice:
         return self.require("trap_array", TrapArrayDevice)
+
+    @property
+    def aod(self) -> AODDevice:
+        """The crossed-AOD rearrangement actuator (raises if the config has no ``aod`` device --
+        rearrangement is opt-in; a config without an AOD simply has no ``exp.devices.aod``)."""
+        return self.require("aod", AODDevice)
 
     def __getattr__(self, name: str):
         try:
