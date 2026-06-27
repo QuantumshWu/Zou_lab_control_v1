@@ -2151,43 +2151,46 @@ def scan_table_template(kind: str, n_slots: int) -> str:
     * ``grid``: every combination (outer product) of per-axis arrays.
     """
 
+    # Emitted UNIFORMLY for ANY slot count n (s0..s{n-1}): ONE editable line per slot, comments on
+    # their OWN line (never an inline `#` inside a single-line list -- that swallowed the rest of the
+    # list and made the 3+-slot template a SyntaxError).  So a 3 / 4 / ... -slot pulse gets a real
+    # per-slot template, not the old 2-slot-only special case.
     n = max(1, int(n_slots))
     if str(kind) == "grid":
-        head = ("import numpy as np\n\n"
-                f"# Grid scan over {n} slot(s): every combination of the axis arrays.\n"
-                "a = np.linspace(1000, 5000, 5)           # axis for s0\n")
-        if n == 1:
-            body = "scan_table = a.reshape(-1, 1)\n"
-        elif n == 2:
-            body = ("b = np.linspace(0, 1000, 4)              # axis for s1\n"
-                    "A, B = np.meshgrid(a, b, indexing=\"ij\")\n"
-                    "scan_table = np.column_stack([A.ravel(), B.ravel()])   # 5 x 4 = 20 points\n"
-                    "scan_shape = (len(a), len(b))            # 2-D grid -> a 2D scan map (view on a 2D image)\n")
+        # A real N-D grid: ONE axis per slot, every combination (outer product).  Each slot is an
+        # independent axis -- edit the linspaces; scan_shape lets the grid show as a scan map.  Modest
+        # default per-axis sizes keep the point count sane (the operator edits them).
+        sizes = [5, 4, 3] + [2] * max(0, n - 3)
+        lines = ["import numpy as np", "",
+                 f"# Grid scan over {n} slot(s) s0..s{n - 1}: every combination of the per-slot axes."]
+        for j in range(n):
+            lines.append(f"a{j} = np.linspace(1000, 5000, {sizes[j]})        # axis for s{j}")
+        mesh = ", ".join(f"A{j}" for j in range(n))
+        axes = ", ".join(f"a{j}" for j in range(n))
+        cols = ", ".join(f"A{j}.ravel()" for j in range(n))
+        shape = ", ".join(f"len(a{j})" for j in range(n))
+        shape_expr = f"({shape},)" if n == 1 else f"({shape})"   # always a tuple, even for n == 1
+        # trailing comma makes the target a tuple even for n == 1 (meshgrid returns a 1-element list)
+        lines.append(f"{mesh}, = np.meshgrid({axes}, indexing=\"ij\")")
+        lines.append(f"scan_table = np.column_stack([{cols}])")
+        lines.append(f"scan_shape = {shape_expr}        # {n}-D grid -> a scan map")
+        return "\n".join(lines) + "\n"
+    # column_stack: one independent column per slot, the columns advancing together (lockstep).
+    lines = ["import numpy as np", "",
+             f"# {n} bound slot(s) s0..s{n - 1}: build an (N_points x {n}) array -- one row per scan",
+             "# point, one column per slot (the slot's unit: ns for a duration, integer code for a DAC).",
+             "# Edit each slot's column below; the columns advance together (lockstep).",
+             "points = np.arange(20, 200e3, 20)        # base sweep"]
+    for j in range(n):
+        if j == 0:
+            lines.append("s0 = points")
+        elif j == 1 and n == 2:
+            lines.append("s1 = 200e3 - s0                          # e.g. anti-correlated (s0 + s1 const) -- edit freely")
         else:
-            lines = ["b = np.linspace(0, 1000, 4)              # axis for s1",
-                     "A, B = np.meshgrid(a, b, indexing=\"ij\")",
-                     "grid = [A.ravel(), B.ravel()]"]
-            for j in range(2, n):
-                lines.append(f"grid.append(np.full(A.size, 0.0))      # s{j} held constant")
-            lines.append("scan_table = np.column_stack(grid)")
-            lines.append("scan_shape = (len(a), len(b))            # 2-D grid map (extra slots held constant)")
-            body = "\n".join(lines) + "\n"
-        return head + body
-    head = ("import numpy as np\n\n"
-            f"# {n} bound slot(s): s0..s{n - 1}.  Build an (N_points x {n}) array:\n"
-            "# one row per scan point, one column per slot (in the slot's unit:\n"
-            "# ns for a duration, integer code for a DAC).\n"
-            "points = np.arange(20, 200e3, 20)        # base sweep\n")
-    if n == 1:
-        body = "scan_table = points.reshape(-1, 1)\n"
-    elif n == 2:
-        body = ("s0 = points\n"
-                "s1 = 200e3 - s0                          # anti-correlated: s0 + s1 = 200 us (constant total)\n"
-                "scan_table = np.column_stack([s0, s1])\n")
-    else:
-        columns = ", ".join(["points"] + [f"np.zeros_like(points)  # s{j}" for j in range(1, n)])
-        body = f"scan_table = np.column_stack([{columns}])\n"
-    return head + body
+            lines.append(f"s{j} = points                            # edit s{j}'s column")
+    slots = ", ".join(f"s{j}" for j in range(n))
+    lines.append(f"scan_table = np.column_stack([{slots}])")
+    return "\n".join(lines) + "\n"
 
 
 def _period_display(state: "PulseTableState", index) -> str:
