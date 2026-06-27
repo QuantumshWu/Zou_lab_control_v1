@@ -1435,7 +1435,7 @@ class PanelCard(FluentGroupBox):
     def __init__(self, config: PanelConfig, parent=None, *, names_provider=None,
                  sources_provider=None, formats_provider=None, axes_provider=None,
                  sites_inputs_provider=None, curve_x_provider=None,
-                 structure_provider=None):
+                 structure_provider=None, calibration_provider=None):
         # Titled frame: the title strip carries the panel KIND (top-left) and the
         # Setting button (top-right), so the card is delineated like the rest.
         super().__init__(PANEL_KINDS[config.kind], parent, shadow=True)
@@ -1463,6 +1463,10 @@ class PanelCard(FluentGroupBox):
         # so the plot auto-reshapes by the DATA dimensionality (1-D data -> multiple lines; 2-D data
         # -> reshape/imshow) instead of guessing from sizes (#H3o).
         self.structure_provider = structure_provider
+        # callable() -> a running TrapCalibration (or None): a histogram (dis) bound to a raw camera
+        # FRAME reduces each frame to its per-site COUNTS via this calibration (the dark/bright bimodal
+        # readout), instead of histogramming raw pixels (a single background blob) (#H3v-4a).
+        self.calibration_provider = calibration_provider
         self.plotter = None
         self.canvas = None
         self._value_shape: tuple[int, ...] | None = None
@@ -2609,6 +2613,32 @@ class PanelCard(FluentGroupBox):
             return None
         return tuple(sorted((n, versions[n]) for n in refs))
 
+    def _hist_samples(self, value):
+        """The samples a histogram (``dis`` plot) bins.  When the bound value is one or more camera
+        FRAMES (a 2D+ image big enough to hold a running calibration's site centres) it reduces each
+        frame to its per-site COUNTS via ``calibration.signals`` and returns ALL of them -- so a ``dis``
+        bound to a raw camera frame shows the dark/bright BIMODAL readout, NOT the single background
+        blob the raw pixels make (a frame's pixels are not bimodal; the readout bimodal lives in the
+        box-summed per-site counts, #H3v-4a).  Otherwise (already per-site counts, no calibration, or
+        the trailing dims too small to be the camera image) the value passes through unchanged."""
+        if not callable(self.calibration_provider):
+            return value
+        arr = np.asarray(value, dtype=float)
+        if arr.ndim < 2:
+            return value                       # already a 1-D distribution (e.g. per-site counts)
+        cal = self.calibration_provider()
+        centers = np.asarray(getattr(cal, "centers", ()), dtype=float) if cal is not None else np.empty((0, 2))
+        if centers.size == 0:
+            return value
+        h, w = int(arr.shape[-2]), int(arr.shape[-1])
+        if w <= int(np.max(centers[:, 0])) or h <= int(np.max(centers[:, 1])):
+            return value                       # trailing dims too small to be the camera image (counts/scan)
+        try:
+            frames = arr.reshape(-1, h, w)
+            return np.concatenate([np.asarray(cal.signals(f), dtype=float).reshape(-1) for f in frames])
+        except Exception:
+            return value
+
     def _render(self, value, namespace: Mapping[str, object] | None = None) -> None:
         # PERFORMANCE: push data with draw=False and queue ONE draw_idle per
         # panel -- rendering happens in Qt's paint pass (coalesced per frame),
@@ -2617,6 +2647,8 @@ class PanelCard(FluentGroupBox):
         # must NOT rebuild the whole plot every shot.
         value = self._coerce(value)
         kind = self.config.kind
+        if kind == "hist":
+            value = self._hist_samples(value)
         rebuild = self.plotter is None
         if not rebuild and kind in ("2d", "1d", "sites"):
             rebuild = tuple(np.shape(value)) != self._value_shape
@@ -4633,7 +4665,7 @@ class TaskConsole(QtWidgets.QWidget):
             for config in state.panels:
                 self._attach_card(PanelCard(config, parent=self.board,
                                             names_provider=self._signal_names,
-                                            sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, structure_provider=self._signal_structure))
+                                            sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, structure_provider=self._signal_structure, calibration_provider=self._running_calibration))
             for node in state.logic:
                 self._attach_logic_node(node)    # always STOPPED -- Start is manual
             self._arrange()
@@ -4872,6 +4904,18 @@ class TaskConsole(QtWidgets.QWidget):
                 ck, ik = meta.get("centers_key"), meta.get("image_key")
                 return ((prefix + ck) if ck else None, (prefix + ik) if ik else None)
         return (None, None)
+
+    def _running_calibration(self):
+        """The :class:`TrapCalibration` of a running Judge-occupancy processor (or ``None``).  A
+        histogram (``dis`` plot) bound to a raw camera FRAME uses it to extract the per-site COUNTS
+        (the dark/bright bimodal readout) via ``calibration.signals`` instead of histogramming the raw
+        pixels -- a frame's pixels are a single background blob (NOT bimodal), the readout bimodal lives
+        in the box-summed per-site counts (#H3v-4a)."""
+        for node in self.running_nodes:
+            cal = getattr(node, "calibration", None)
+            if cal is not None and callable(getattr(cal, "signals", None)):
+                return cal
+        return None
 
     def _curve_x(self, y_signal) -> str | None:
         """For a 1d plot wired to a scan's y CURVE, the companion x-axis signal resolved
@@ -5199,7 +5243,7 @@ class TaskConsole(QtWidgets.QWidget):
         title = indexed_unique_name(PANEL_KINDS[str(kind)], {c.config.title for c in self.cards})
         config = PanelConfig(kind=str(kind), title=title, row=next_y, col=0, size="1x2")
         card = PanelCard(config, parent=self.board, names_provider=self._signal_names,
-                         sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, structure_provider=self._signal_structure)
+                         sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, structure_provider=self._signal_structure, calibration_provider=self._running_calibration)
         self._attach_card(card)
         self._arrange()
         self._mark_dirty()
@@ -5389,7 +5433,7 @@ class TaskConsole(QtWidgets.QWidget):
         config = PanelConfig(kind=kind, title=title, size="2x2",
                              source="value = __task_frame__")
         card = PanelCard(config, parent=self.board, names_provider=self._signal_names,
-                         sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, structure_provider=self._signal_structure)
+                         sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, structure_provider=self._signal_structure, calibration_provider=self._running_calibration)
         self._attach_card(card)
         self._task_card = card
         self._running_task_row = row
