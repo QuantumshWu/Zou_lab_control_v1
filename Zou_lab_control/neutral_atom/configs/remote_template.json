@@ -91,5 +91,20 @@
       ],
       "connect_on_init": false
     }
+  },
+  "aod": {
+    "type": "RampAOD",
+    "params": {
+      "sequencer": "$device:sequencer",
+      "grid_shape": [5, 7],
+      "x_bus": "aod_x",
+      "y_bus": "aod_y",
+      "x_channels": ["ch20", "ch21", "ch22", "ch23", "ch24", "ch25", "ch26", "ch27", "ch28", "ch29"],
+      "y_channels": ["ch30", "ch31", "ch32", "ch33", "ch34", "ch35", "ch36", "ch37", "ch38", "ch39"],
+      "x_code_step": 40.0,
+      "y_code_step": 40.0,
+      "move_duration_s": 1e-4,
+      "settle_s": 2e-5
+    }
   }
 }

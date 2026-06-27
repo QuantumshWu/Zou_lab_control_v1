@@ -45,7 +45,10 @@ class RampAOD(AODDevice):
 
     ``sequencer``     the pulse streamer that fires the ramp programs.
     ``grid_shape``    ``(rows, cols)`` of the tweezer array (matches the readout grid).
-    ``x_bus``/``y_bus`` analog-bus names for the X / Y deflection DACs.
+    ``x_bus``/``y_bus`` analog-bus LABELS for the X / Y deflection DACs.
+    ``x_channels``/``y_channels`` the BOARD channels (LSB-first) wired to the X / Y DAC -- the real
+                      hardware wiring (e.g. ``["ch20".."ch29"]``); default = ``bus_width`` synthetic
+                      ``aod_x0..`` names (for the virtual / compile path).
     ``x_codes``/``y_codes`` explicit per-column / per-row signed DAC codes (length cols / rows); if None,
                       built linearly from ``{x,y}_code_base`` + ``{x,y}_code_step``.
     ``move_duration_s``/``settle_s`` ramp window and post-ramp settle per move.
@@ -59,6 +62,8 @@ class RampAOD(AODDevice):
         grid_shape: Sequence[int] = (5, 7),
         x_bus: str = "aod_x",
         y_bus: str = "aod_y",
+        x_channels: Sequence[str] | None = None,
+        y_channels: Sequence[str] | None = None,
         x_codes: Sequence[int] | None = None,
         y_codes: Sequence[int] | None = None,
         x_code_base: float = 0.0,
@@ -75,6 +80,10 @@ class RampAOD(AODDevice):
         self.x_bus = str(x_bus)
         self.y_bus = str(y_bus)
         self.bus_width = int(bus_width)
+        self.x_channels = ([str(c) for c in x_channels] if x_channels is not None
+                           else [f"{self.x_bus}{bit}" for bit in range(self.bus_width)])
+        self.y_channels = ([str(c) for c in y_channels] if y_channels is not None
+                           else [f"{self.y_bus}{bit}" for bit in range(self.bus_width)])
         ny, nx = self.grid_shape
         self.x_codes = list(x_codes) if x_codes is not None else _linear_codes(nx, x_code_base, x_code_step)
         self.y_codes = list(y_codes) if y_codes is not None else _linear_codes(ny, y_code_base, y_code_step)
@@ -85,9 +94,6 @@ class RampAOD(AODDevice):
         self.move_survival = float(move_survival)
 
     # -- bus / site geometry -------------------------------------------------
-    def _members(self, prefix: str) -> list[str]:
-        return [f"{prefix}{bit}" for bit in range(self.bus_width)]
-
     def _codes_for(self, site: int) -> tuple[int, int]:
         ny, nx = self.grid_shape
         row, col = int(site) // nx, int(site) % nx
@@ -101,7 +107,7 @@ class RampAOD(AODDevice):
         hold for ``settle_s``.  Returned (not fired) so it can be inspected / unit-tested."""
         sx, sy = self._codes_for(src)
         dx, dy = self._codes_for(dst)
-        members_x, members_y = self._members(self.x_bus), self._members(self.y_bus)
+        members_x, members_y = self.x_channels, self.y_channels
         channels = members_x + members_y
         zero = tuple(0 for _ in channels)
         table = PulseTableState(
