@@ -229,15 +229,32 @@ def signal_state(name, formats) -> str:
     return "ready" if formats.get(str(name)) else "waiting"
 
 
-def grouped_signal_items(names, sources, formats) -> list:
+def _signal_short_label(name, group, labels) -> str:
+    """The human-facing leaf label for ``name`` in a producer ``group`` (#H3w-4): the producing
+    node's declared SignalSpec label (e.g. ``Survival``) when known -- NEVER the raw ``temperature_
+    survival`` key -- else the shared-token prefix stripped (``judge_occupancy_rate`` -> ``rate``);
+    a single-signal group with no human label keeps the bare name (no fake ``producer_`` strip that
+    only ever failed to match a display-name producer)."""
+    human = (labels or {}).get(str(name))
+    if human:
+        return str(human)
+    strip = _common_token_prefix(group)
+    if strip and name.startswith(strip) and len(name) > len(strip):
+        return name[len(strip):]
+    return str(name)
+
+
+def grouped_signal_items(names, sources, formats, labels=None) -> list:
     """``[(display, bare_name | None)]`` for a signal picker, GROUPED by producing node: a
     non-selectable bold header per node (``bare_name`` is ``None``), then that node's signals
-    indented beneath it -- prefix-stripped, with the SHAPE and the two-state tag
-    (``    rate  [(35,)] ready`` / ``    survival  waiting``).  The ONE source every signal picker
-    shares (plot panel AND logic-node source) so a signal is always chosen the same way."""
+    indented beneath it -- shown by their HUMAN label (the SignalSpec the producing node declares),
+    with the SHAPE and the two-state tag (``    Loading rate  [(35,)] ready`` / ``    Survival
+    waiting``).  ``data`` stays the BARE signal name (the binding key); only the DISPLAY is humanised.
+    The ONE source every signal picker shares (plot panel AND logic-node source)."""
     names = sorted(str(n) for n in (names or []))
     sources = dict(sources or {})
     formats = dict(formats or {})
+    labels = dict(labels or {})
     by_producer: dict[str, list[str]] = {}
     for name in names:
         for p in ([str(p) for p in (sources.get(name) or [])] or ["(unbound)"]):
@@ -246,9 +263,8 @@ def grouped_signal_items(names, sources, formats) -> list:
     for producer in sorted(by_producer, key=lambda p: (p == "(unbound)", p.lower())):
         group = by_producer[producer]
         items.append((producer, None))            # group header (rendered disabled + bold)
-        strip = _common_token_prefix(group) or (str(producer).strip("() ") + "_")
         for name in group:
-            short = name[len(strip):] if (strip and name.startswith(strip) and len(name) > len(strip)) else name
+            short = _signal_short_label(name, group, labels)
             fmt = formats.get(name)
             state = signal_state(name, formats)
             shape = f"  [{fmt}]" if fmt else ""
@@ -256,15 +272,17 @@ def grouped_signal_items(names, sources, formats) -> list:
     return items
 
 
-def signal_tree_groups(names, sources, formats) -> list:
+def signal_tree_groups(names, sources, formats, labels=None) -> list:
     """``[(producer, [(leaf_label, bare_name, full_label)])]`` for the COLLAPSIBLE tree picker
-    (G2): one expandable group per producing node; each leaf's ``leaf_label`` shows the short
-    name + shape + ready/waiting state (in the tree), and its ``full_label`` is the producer-
-    qualified ``"<producer> · <short>"`` painted when the combo is COLLAPSED (frame-title aligned,
-    G3).  Built from the same producer grouping as :func:`grouped_signal_items` -- ONE source."""
+    (G2): one expandable group per producing node; each leaf's ``leaf_label`` shows the HUMAN signal
+    label + shape + ready/waiting state (in the tree), and its ``full_label`` is the producer-
+    qualified ``"<producer> · <label>"`` painted when the combo is COLLAPSED (frame-title aligned,
+    G3).  Built from the same producer grouping + ``_signal_short_label`` as
+    :func:`grouped_signal_items` -- ONE source, so neither ever shows a raw ``temperature_survival``."""
     names = sorted(str(n) for n in (names or []))
     sources = dict(sources or {})
     formats = dict(formats or {})
+    labels = dict(labels or {})
     by_producer: dict[str, list[str]] = {}
     for name in names:
         for p in ([str(p) for p in (sources.get(name) or [])] or ["(unbound)"]):
@@ -272,10 +290,9 @@ def signal_tree_groups(names, sources, formats) -> list:
     groups: list = []
     for producer in sorted(by_producer, key=lambda p: (p == "(unbound)", p.lower())):
         group = by_producer[producer]
-        strip = _common_token_prefix(group) or (str(producer).strip("() ") + "_")
         leaves = []
         for name in group:
-            short = name[len(strip):] if (strip and name.startswith(strip) and len(name) > len(strip)) else name
+            short = _signal_short_label(name, group, labels)
             fmt = formats.get(name)
             shape = f"  [{fmt}]" if fmt else ""
             leaf_label = f"{short}{shape}  {signal_state(name, formats)}"
@@ -284,7 +301,7 @@ def signal_tree_groups(names, sources, formats) -> list:
     return groups
 
 
-def fill_grouped_signal_combo(combo, *, names, sources, formats, current, none_label=None) -> None:
+def fill_grouped_signal_combo(combo, *, names, sources, formats, current, none_label=None, labels=None) -> None:
     """Populate ``combo`` with every live hub signal GROUPED by producing node (via
     :func:`grouped_signal_items`): bold non-selectable headers, indented signals (data = the
     BARE name).  ``none_label`` adds a leading empty choice; a not-yet-published ``current``
@@ -295,14 +312,14 @@ def fill_grouped_signal_combo(combo, *, names, sources, formats, current, none_l
     if isinstance(combo, FluentTreeComboBox):
         # The collapsible-tree picker (G2): one expandable producer group, leaves = signals.
         with _signals_blocked(combo):
-            combo.set_signal_tree(signal_tree_groups(names, sources, formats),
+            combo.set_signal_tree(signal_tree_groups(names, sources, formats, labels),
                                   current=cur, none_label=none_label)
         return
     with _signals_blocked(combo):
         combo.clear()
         if none_label is not None:
             combo.addItem(none_label, "")
-        items = grouped_signal_items(names, sources, formats)
+        items = grouped_signal_items(names, sources, formats, labels)
         have = {bare for _, bare in items if bare}
         for label, name in items:
             if name is None:                      # group header: visible but not selectable
@@ -2009,7 +2026,18 @@ class PanelCard(FluentGroupBox):
             combo, names=(self.names_provider() if callable(self.names_provider) else []),
             sources=(self.sources_provider() if callable(self.sources_provider) else {}),
             formats=(self.formats_provider() if callable(self.formats_provider) else {}),
+            labels=self._signal_human_labels(),
             current=current, none_label="(none)")
+
+    def _signal_human_labels(self) -> dict:
+        """``{signal name: human label}`` from the producing node's SignalSpec (the ``axes_provider``'s
+        axis_label), so the picker shows ``Survival`` not the raw ``temperature_survival`` key (#H3w-4)."""
+        if not callable(self.axes_provider):
+            return {}
+        try:
+            return {str(n): str(lbl) for n, (lbl, _unit) in dict(self.axes_provider()).items() if lbl}
+        except Exception:
+            return {}
 
     def _refresh_signal_combo(self) -> None:
         """Refresh the signal picker with the hub's current signals, each labelled with the

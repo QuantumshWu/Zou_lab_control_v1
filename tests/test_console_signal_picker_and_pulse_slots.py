@@ -87,63 +87,54 @@ def test_delay_field_can_become_an_api_slot_via_gui():
 
 
 # --------------------------------------------------------------------------- #3 grouped picker
-def test_logic_node_source_picker_is_grouped_and_read_by_data():
-    """A signal-kind param renders the SAME nested picker the plot panels use: a disabled bold
-    producer header + the bare signal indented under it, the pick read via ``currentData()``."""
-    from Zou_lab_control.frontend.task_console import MeasurementPanel
+def test_logic_node_source_picker_groups_by_producer_with_human_labels_and_bare_data():
+    """A signal-kind param renders the SAME nested collapsible-tree picker the plot panels use (G2):
+    one producer GROUP, each leaf shown by its HUMAN label (never the raw ``judge_occupancy_rate`` key,
+    #H3w-4) but carrying the BARE signal name as its bind data.  Asserted on the single-source grouping
+    (`signal_tree_groups`) the widget is built from, + that the panel reads a pick back by bare name."""
+    from Zou_lab_control.frontend.task_console import (MeasurementPanel, signal_tree_groups, read_editable_combo)
     from Zou_lab_control.neutral_atom.operations.measurement import ParamDecl
+    from Zou_lab_control.frontend.qt_fluent import FluentTreeComboBox
 
-    spec = SimpleNamespace(
-        name="judge_occupancy",
-        params=(ParamDecl("source", "Frame signal", "signal", default="frame"),))
-    panel = MeasurementPanel(
-        [spec], single=True, controls=False,
-        signals_provider=lambda: ["frame", "occupied", "rate"],
-        sources_provider=lambda: {"frame": ["live_image"], "occupied": ["occupancy"], "rate": ["occupancy"]},
-        formats_provider=lambda: {"frame": "(48, 60)", "occupied": "(N,)", "rate": "scalar"})
-    try:
-        combo = panel._widgets["source"]
-        assert panel._decls["source"].kind == "signal"
-        # grouped: at least one disabled (non-selectable) header row, signals carry the bare name
-        from PyQt5.QtCore import Qt
-        model = combo.model()
-        headers = [i for i in range(combo.count())
-                   if not (model.item(i).flags() & Qt.ItemIsEnabled)]
-        datas = [combo.itemData(i) for i in range(combo.count())]
-        assert headers, "expected at least one disabled producer header"
-        assert "occupancy" in [combo.itemText(i).strip() for i in headers]
-        assert {"frame", "occupied", "rate"} <= {d for d in datas if d}
-        # picking an indented signal reads back its BARE name (label is indented; data is clean)
-        idx = next(i for i in range(combo.count()) if combo.itemData(i) == "rate")
-        combo.setCurrentIndex(idx)
-        assert panel.collect_values()["source"] == "rate"
-    finally:
-        panel.deleteLater()
+    names = ["occupancy_occupied", "occupancy_rate"]
+    sources = {"occupancy_occupied": ["Judge occupancy #1"], "occupancy_rate": ["Judge occupancy #1"]}
+    formats = {"occupancy_occupied": "(35,)", "occupancy_rate": "scalar"}
+    labels = {"occupancy_occupied": "Occupied", "occupancy_rate": "Loading rate"}
+    groups = signal_tree_groups(names, sources, formats, labels)
+    assert [g[0] for g in groups] == ["Judge occupancy #1"]              # one producer group
+    leaves = groups[0][1]
+    leaf_labels = [lbl for lbl, _bare, _full in leaves]
+    bare = [bare for _lbl, bare, _full in leaves]
+    assert any(l.startswith("Occupied") for l in leaf_labels) and any(l.startswith("Loading rate") for l in leaf_labels)
+    assert not any("occupancy_" in l for l in leaf_labels)               # NO raw key leaks into the label
+    assert set(bare) == set(names)                                       # bind data stays the bare name
+
+    # and the widget reads a pick back by its BARE name (the bind key), not the human label shown
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    ensure_qt_app()
+    combo = FluentTreeComboBox()
+    combo.set_signal_tree(groups, current="occupancy_rate", none_label="(none)")
+    assert read_editable_combo(combo) == "occupancy_rate"
+    combo.deleteLater()
 
 
-# ---------------------------------------------------- #3 editable-combo read robustness (review)
-def test_signal_picker_keeps_a_freshly_typed_not_yet_published_name():
-    """Selecting a published signal then TYPING a new (not-yet-published) name must read back the
-    TYPED name -- not the stale previously-selected item's data.  (Qt does not move currentIndex on
-    free text, so a plain currentData() would silently drop the new name.)"""
-    from Zou_lab_control.frontend.task_console import MeasurementPanel
-    from Zou_lab_control.neutral_atom.operations.measurement import ParamDecl
-
-    spec = SimpleNamespace(name="judge_occupancy",
-                           params=(ParamDecl("source", "Frame signal", "signal", default="frame"),))
-    panel = MeasurementPanel(
-        [spec], single=True, controls=False,
-        signals_provider=lambda: ["frame", "rate"],
-        sources_provider=lambda: {"frame": ["camera"], "rate": ["occupancy"]},
-        formats_provider=lambda: {})
-    try:
-        combo = panel._widgets["source"]
-        idx = next(i for i in range(combo.count()) if combo.itemData(i) == "rate")
-        combo.setCurrentIndex(idx)                 # a real selection
-        combo.setEditText("future_signal")         # then the user types a new name
-        assert panel.collect_values()["source"] == "future_signal"
-    finally:
-        panel.deleteLater()
+# ---------------------------------------------------- #3 a WAITING (declared, not-yet-published) signal
+def test_signal_picker_can_select_a_declared_not_yet_published_signal():
+    """A signal a node DECLARES but has not published yet (waiting) is still listed in the tree -- via
+    the providers -- and reads back by its bare name, so you can wire a panel to a node before it runs
+    (no 'must publish first' dead-end).  Read via ``read_editable_combo`` (the tree's documented path)."""
+    from Zou_lab_control.frontend.task_console import signal_tree_groups, read_editable_combo
+    from Zou_lab_control.frontend.qt_fluent import FluentTreeComboBox, ensure_qt_app
+    ensure_qt_app()
+    # 'rate' is declared (in names) but waiting (no live format) -- it must still be pickable
+    groups = signal_tree_groups(["frame", "rate"],
+                                {"frame": ["camera"], "rate": ["Judge occupancy #1"]},
+                                {"frame": "(48, 60)"},               # 'rate' has no format -> waiting
+                                {"rate": "Loading rate"})
+    combo = FluentTreeComboBox()
+    combo.set_signal_tree(groups, current="rate", none_label="(none)")
+    assert read_editable_combo(combo) == "rate"                       # the waiting signal is bound
+    combo.deleteLater()
 
 
 def test_empty_signal_pick_never_reads_back_a_group_header():

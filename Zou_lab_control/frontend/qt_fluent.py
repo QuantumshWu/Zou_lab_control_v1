@@ -1098,6 +1098,11 @@ class _RoundedPopupCard(QtCore.QObject):
         return False
 
 
+#: Max rows a Fluent drop-down shows before it SCROLLS (the shared fluent scrollbar) -- one source for
+#: both the flat combo and the collapsible tree picker, so a long signal list never overflows the screen.
+_COMBO_MAX_VISIBLE_ITEMS = 12
+
+
 class FluentComboBox(QtWidgets.QComboBox):
     """A non-editable Fluent combo that paints its own current text.
 
@@ -1111,6 +1116,10 @@ class FluentComboBox(QtWidgets.QComboBox):
         super().__init__(parent)
         self.setMinimumHeight(scaled_px(30, minimum=22))
         self.setEditable(False)
+        # Cap the drop-down at a sensible number of visible rows so a long signal list SCROLLS (via the
+        # shared fluent scrollbar already styled below) instead of growing unbounded / overflowing the
+        # screen.  Qt shows its vertical scrollbar once the item count exceeds this (#H3w-4).
+        self.setMaxVisibleItems(_COMBO_MAX_VISIBLE_ITEMS)
         self._popup_styled = False
         # The drop-down list is a top-level popup.  It must look EXACTLY like the
         # FluentPopup card (the Setting popup): one antialiased rounded rect with a
