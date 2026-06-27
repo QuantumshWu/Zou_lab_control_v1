@@ -678,6 +678,10 @@ class VirtualSequencer(SequencerDevice):
         # streamer.  None when no scan is firing.
         self._scan_info: dict[str, float] | None = None
         self._scan_fire_time: float = 0.0
+        # Latched once a finite scan has played its K sweeps: scan_progress() then keeps returning the
+        # SATURATED done reading (not idle) until the next prepare/stop -- matching the real streamer's
+        # _scan_finished latch, so virtual == real at the scan's terminal reading too.
+        self._scan_done: bool = False
 
     @property
     def firing(self) -> PulseSequence | None:
@@ -720,6 +724,7 @@ class VirtualSequencer(SequencerDevice):
         # Capture scan-progress info from the SOURCE table (the compiled PulseSequence drops the
         # scan_table): N points + the requested sweep count, plus a per-point wall-clock estimate
         # (the program's one-frame duration) so scan_progress() can report "point K / N · sweep r".
+        self._scan_done = False          # a fresh prepare clears any prior finite-scan done latch
         rows = list(getattr(sequence, "scan_table", None) or []) if isinstance(sequence, PulseTableState) else []
         if rows:
             self._scan_info = {
@@ -771,17 +776,22 @@ class VirtualSequencer(SequencerDevice):
         (scan_repeats>0) that has played its K sweeps stops firing here, exactly like the host
         issues the engine stop on the real backend."""
         from .sequencer import SCAN_PROGRESS_IDLE, scan_progress_fields
-        if self._firing is None or self._scan_info is None:
+        if self._scan_info is None:
             return dict(SCAN_PROGRESS_IDLE)
         n = int(self._scan_info["n_points"])
         k = int(self._scan_info["scan_repeats"])
+        if self._scan_done:              # finite scan finished -> latch the SATURATED done reading (== real)
+            return scan_progress_fields(max(1, k) * n, n, k)
+        if self._firing is None:
+            return dict(SCAN_PROGRESS_IDLE)
         dt = float(self._scan_info["base_dt"]) * self.sleep_scale
         if dt <= 0:                      # fast-forward: a finite scan is instantly done, an infinite one sits at point 0
             total = k * n if k > 0 else 0
         else:
             total = int((time.monotonic() - self._scan_fire_time) / dt)
         fields = scan_progress_fields(total, n, k)
-        if not fields["scanning"]:       # finite scan reached K sweeps -> the streamer halts
+        if not fields["scanning"]:       # finite scan reached K sweeps -> the streamer halts (camera stops),
+            self._scan_done = True       # but the reading stays latched at done until the next prepare/stop
             self._firing = None
         return fields
 
@@ -804,6 +814,7 @@ class VirtualSequencer(SequencerDevice):
                     return False
                 if delay > 0:
                     time.sleep(delay)
+                self._scan_done = True       # latch the saturated done reading (matches the real backend)
                 self._firing = None
                 return True
             return False
@@ -829,6 +840,7 @@ class VirtualSequencer(SequencerDevice):
             self.history.append({"action": "safe_state"})
         self._firing = None
         self._scan_info = None
+        self._scan_done = False
 
     def snapshot(self) -> dict[str, object]:
         return {

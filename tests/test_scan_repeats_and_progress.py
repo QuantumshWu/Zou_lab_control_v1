@@ -98,3 +98,47 @@ def test_virtual_idle_when_not_scanning():
 def test_both_backends_expose_scan_progress():
     for cls in (VirtualSequencer, VivadoAxiStreamerSession):
         assert hasattr(cls, "scan_progress"), f"{cls.__name__} must expose scan_progress()"
+
+
+# ---- review fixes: finite scan requires >=2 points + implies streaming + can be waited on ----
+def _one_point_scan_state() -> PulseTableState:
+    st = PulseTableState(channels=["probe", "trig"])
+    st.bind_field("duration", "0", unit="us")
+    st.set_scan_table([[10.0]])      # a single scan point
+    return st
+
+
+def test_finite_one_point_scan_is_rejected():
+    # A single point never produces a cursor wrap, so the host could never count sweeps -> it would
+    # hang forever on real hardware.  The shared fire seam rejects it (so virtual == real refuse it).
+    ctrl = PulseController(VirtualSequencer(channels=["probe", "trig"]), _one_point_scan_state())
+    with pytest.raises(ValueError, match="at least 2 scan points"):
+        ctrl.payload(scan_repeats=2)
+
+
+def test_finite_scan_repeats_implies_repeat_forever():
+    # scan_repeats>0 is a streamed-then-stopped scan; a bare repeat_forever=False must NOT silently
+    # demote it to a single sweep -- the finite count forces streaming.
+    payload = PulseController(VirtualSequencer(channels=["probe", "trig"]), _scan_state()).payload(
+        repeat_forever=False, scan_repeats=2)
+    assert payload.repeat_forever is True and payload.scan_repeats == 2
+
+
+def test_finite_scan_can_be_waited_without_timeout():
+    # A finite scan DOES finish, so on_pulse(wait=True) must not raise the "cannot wait for a
+    # repeat_forever pulse" guard (it would for an infinite scan).
+    seq = VirtualSequencer(channels=["probe", "trig"], sleep_scale=0.0)
+    PulseController(seq, _scan_state()).on_pulse(wait=True, scan_repeats=2)   # must not raise
+    with pytest.raises(RuntimeError, match="cannot wait"):
+        PulseController(VirtualSequencer(channels=["probe", "trig"], sleep_scale=0.0),
+                        _scan_state()).on_pulse(wait=True, scan_repeats=0)     # infinite -> still guarded
+
+
+def test_virtual_terminal_reading_latches_like_real():
+    # After a finite scan finishes, scan_progress() keeps returning the SATURATED done reading
+    # (not idle) until the next prepare/stop -- matching the real streamer's latch (virtual==real).
+    seq = VirtualSequencer(channels=["probe", "trig"], sleep_scale=0.0)
+    PulseController(seq, _scan_state()).on_pulse(repeat_forever=True, scan_repeats=2)
+    first = seq.scan_progress()
+    second = seq.scan_progress()
+    assert first == second == {"scanning": False, "point": 2, "n_points": 3, "sweep": 1, "n_repeats": 2}

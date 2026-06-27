@@ -1402,14 +1402,27 @@ class PulseController:
                 payload = self.pulse.with_slots_resolved(merged)
             else:
                 payload = self.pulse
-            # repeat_forever / scan_repeats overrides go through the dict (the same seam the GUI
-            # / save bundle use); scan_repeats=K>0 means "K whole sweeps then stop" (0 = forever).
-            if repeat_forever is not None or scan_repeats is not None:
+            # repeat_forever / scan_repeats overrides go through the dict (the same seam the GUI /
+            # save bundle use).  scan_repeats=K>0 means "play K whole sweeps then stop" -- which IS a
+            # STREAMED scan the host halts after K sweeps, so it IMPLIES repeat_forever (a bare
+            # repeat_forever=False + scan_repeats>0 would otherwise silently play just once).  And the
+            # host counts sweeps from the streamed cursor's WRAP, which a SINGLE scan point never
+            # produces, so a finite K-sweep scan needs >= 2 points -- else it would never stop on real
+            # hardware; we reject here (the shared fire seam) so virtual == real (both refuse it).
+            eff_repeats = max(0, int(scan_repeats)) if scan_repeats is not None else int(getattr(payload, "scan_repeats", 0))
+            if repeat_forever is not None or scan_repeats is not None or eff_repeats > 0:
                 data = payload.to_dict()
-                if repeat_forever is not None:
+                if eff_repeats > 0:
+                    if len(payload.scan_table) == 1:
+                        raise ValueError(
+                            "a finite scan-repeat (scan_repeats > 0) needs at least 2 scan points: the host "
+                            "counts whole sweeps from the streamed cursor's wrap, which a single point never "
+                            "produces (it would never stop). Add scan points, or use repeat_forever=False for "
+                            "a single finite shot.")
+                    data["repeat_forever"] = True          # a finite K-sweep scan must stream to be stopped
+                elif repeat_forever is not None:
                     data["repeat_forever"] = bool(repeat_forever)
-                if scan_repeats is not None:
-                    data["scan_repeats"] = max(0, int(scan_repeats))
+                data["scan_repeats"] = eff_repeats
                 payload = PulseTableState.from_dict(data)
             return payload
         if repeat_forever is not None:
@@ -1463,11 +1476,16 @@ class PulseController:
         scan_repeats: int | None = None,
     ) -> RuntimeSequenceProgram:
         payload = self.payload(scan_table=scan_table, repeat_forever=repeat_forever, scan_repeats=scan_repeats)
-        if wait and timeout is None and bool(getattr(payload, "repeat_forever", False)):
+        # A FINITE scan-repeat (scan_repeats>0) streams (repeat_forever) but DOES finish after K
+        # sweeps, so it is exempt from the "cannot wait for a repeat_forever pulse" guard -- only a
+        # truly endless repeat_forever (scan_repeats==0) needs a timeout to wait on.
+        endless = bool(getattr(payload, "repeat_forever", False)) and int(getattr(payload, "scan_repeats", 0)) == 0
+        if wait and timeout is None and endless:
             raise RuntimeError(
                 "pulse.on_pulse(wait=True) cannot wait for a repeat_forever pulse without a timeout. "
                 "Use pulse.on_pulse(wait=False, repeat_forever=True) for continuous scope output, "
-                "or pulse.on_pulse(wait=True, repeat_forever=False) for a finite shot."
+                "or pulse.on_pulse(wait=True, repeat_forever=False) for a finite shot, "
+                "or pulse.on_pulse(wait=True, scan_repeats=K) for a finite K-sweep scan."
             )
         self.last_program = self.sequencer.prepare(payload)
         program = self.last_program
