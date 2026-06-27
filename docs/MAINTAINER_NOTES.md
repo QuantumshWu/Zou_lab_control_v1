@@ -1375,13 +1375,19 @@ The three axes (repeat = block axis 0 / points = middle / data = trailing) are o
 
 **A processor has NO user-facing mode.** A `Processor` is a pure typed transform; its relationship to
 the repeat axis is a STATIC class attribute `repeat_contract`, NEVER a runtime knob or form field:
-* `"preserve"` — maps each repeat slice 1:1 and emits a `>=3-D` block whose axis 0 IS the repeat, so
-  the SAME plot `reduce_repeat` machinery collapses it. **`OccupancyProcessor` is `preserve`** (#H3q):
-  the repeat axis flows THROUGH it — fed the camera's `(repeat,1,H,W)` block it judges EVERY slice and
-  publishes `occupied`/`counts` as `(repeat,1,n_sites)` blocks (the uniform `(repeat,*points,*data)`
-  contract, points_shape=(1,), data_shape=(n_sites,)) and `frame_judged` as `(repeat,1,H,W)`.
-  (Earlier H3p wrongly made it `reduce` on a `(repeat,n_sites)` 2-D strawman; the contract-correct
-  shape is the 3-D `(repeat,1,n_sites)` block, which every gate accepts.)
+* `"preserve"` — maps each repeat slice 1:1 and emits a block whose LEADING axis 0 IS the repeat, so
+  the SAME plot `reduce_repeat` machinery collapses it. **`OccupancyProcessor` is `preserve`** (#H3q,
+  #H3s-F3): the repeat axis flows THROUGH it — fed the camera's `(repeat,1,H,W)` block it judges EVERY
+  slice and publishes `occupied`/`counts` as CLEAN `(repeat, n_sites)` blocks (a leading repeat axis,
+  NO vestigial middle 1) and `frame_judged` as `(repeat, H, W)`. Repeat-collapse is **structure-driven,
+  not an ndim guess**: each signal's `SignalSpec` declares its OWN `points_shape`/`data_shape`, so
+  `core_ndim = len(points)+len(data)` (occupancy: points=(), data=(n_sites,) → core_ndim 1) tells
+  `reduce_repeat(block, mode, core_ndim=core_ndim)` that axis 0 is the repeat exactly when
+  `block.ndim == 1 + core_ndim`. `reduce_repeat`'s legacy ndim≥3 fallback is kept verbatim for callers
+  that pass no `core_ndim` (camera `(repeat,1,H,W)` / scan `(repeat,pts,dim)` blocks), so those paths
+  are byte-identical. Static geometry — `centers` (N,2) / `thresholds` (N,) — declares NO contract
+  slot (its SignalSpec leaves points/data `None`), so it prints its raw shape and carries no repeat
+  axis a consumer could mistake for one.
 * `"reduce"` (the base default) — emits a result with NO repeat axis (a statistic over a shot set, e.g.
   a `FidelityProcessor`). Nothing is left for the plot to collapse, so it can't collide with `repeat_mode`.
 

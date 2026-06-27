@@ -63,11 +63,30 @@ LINE_CYCLE = [LINE_SINGLE, PALETTE.get("bright", "skyblue")] + list(PALETTE["ser
 REPEAT_MODES = ("average", "add", "replace", "roll", "create")
 
 
-def reduce_repeat(raw, mode: str = "average"):
+def _has_repeat_axis(a, core_ndim) -> bool:
+    """Whether array ``a``'s LEADING axis is the repeat to collapse.
+
+    STRUCTURE-driven when the producing signal declares its ``core_ndim`` (= len(points_shape) +
+    len(data_shape), #H3s-F3): a block carries the repeat axis exactly when ``a.ndim == 1 + core_ndim``
+    (and an already-reduced ``a.ndim == core_ndim`` value passes through).  This is the clean fix for
+    the muddle a bare ndim heuristic caused -- a clean ``(repeat, n_sites)`` (ndim 2, core_ndim 1) is a
+    repeat block, while a static ``(n_sites,)`` value is not.  When ``core_ndim is None`` (an
+    undeclared/legacy caller -- a camera/scan signal that does not pass it), fall back to the EXACT
+    ndim>=3 rule so those paths behave byte-identically."""
+    if core_ndim is not None:
+        return a.ndim == 1 + int(core_ndim)
+    return a.ndim >= 3
+
+
+def reduce_repeat(raw, mode: str = "average", *, core_ndim=None):
     """Collapse a raw block over its LEADING (repeat) axis O0 for display.  Works for ANY trailing
     shape -- a 1-D scan's ``(repeat, points, dim)``, a 2-D scan's ``(repeat, n0*n1, dim)``, a camera's
-    ``(repeat, 1, H, W)`` -- because the repeat axis is always axis 0 (a block is >=3-D; an already-
-    reduced array is <3-D and passes through untouched, so a plain image is never mistaken for a stack).
+    ``(repeat, 1, H, W)``, a clean occupancy ``(repeat, n_sites)`` -- because the repeat axis is always
+    axis 0.  WHETHER axis 0 IS the repeat is decided by the producing signal's declared structure when
+    given (``core_ndim``, #H3s-F3): collapse when ``raw.ndim == 1 + core_ndim``, pass through an
+    already-reduced ``raw.ndim == core_ndim`` value.  When ``core_ndim is None`` the EXISTING ndim>=3
+    fallback is kept EXACTLY (an already-reduced <3-D array passes through, so a plain image is never
+    mistaken for a stack) -- so undeclared camera/scan callers are unaffected.
 
     * ``average`` -> ``nanmean`` over the repeats that HAVE data (the true running mean; magnitude-
       stable regardless of how many repeats completed = a long exposure for a camera) -> drops O0.
@@ -77,7 +96,7 @@ def reduce_repeat(raw, mode: str = "average"):
       ``(points, n*dim)`` so the curve draws one line per repeat (confocal's "create"); for a 3-D+
       data block (an image) ``create`` has no meaning and falls back to the mean."""
     a = np.asarray(raw, dtype=float)
-    if a.ndim < 3:                                      # already reduced -> leave as-is
+    if not _has_repeat_axis(a, core_ndim):              # not a repeat block -> leave as-is
         return a
     has = np.isfinite(a).any(axis=tuple(range(1, a.ndim)))   # which repeat slices hold any data
     idx = np.flatnonzero(has)
@@ -87,6 +106,8 @@ def reduce_repeat(raw, mode: str = "average"):
         return a[idx[-1]] if idx.size else a[0]
     if mode == "create":
         cols = idx if idx.size else np.array([0])
+        if a.ndim == 2:                                       # (R, points) reduced scan -> (points, R) lines
+            return a[cols].T
         if a.ndim == 3:                                       # (R, points, dim) scan -> (points, R*dim)
             return np.concatenate([a[r] for r in cols], axis=1)   #   confocal: repeat-major dim-minor columns
         # ndim >= 4: an image block (a camera's (R, 1, H, W)) -- create is ORTHOGONAL to the data axes:
@@ -96,11 +117,11 @@ def reduce_repeat(raw, mode: str = "average"):
         return np.nanmean(a, axis=0)
 
 
-def repeats_with_data(raw) -> int:
+def repeats_with_data(raw, *, core_ndim=None) -> int:
     """How many repeat slices of a raw block currently hold data (drives the plot's ``xN`` label).
-    An already-reduced (<3-D) array -> 1."""
+    A non-repeat-block (structure-driven when ``core_ndim`` is given, else the ndim>=3 fallback) -> 1."""
     a = np.asarray(raw, dtype=float)
-    if a.ndim < 3:
+    if not _has_repeat_axis(a, core_ndim):
         return 1
     return int(np.count_nonzero(np.isfinite(a).any(axis=tuple(range(1, a.ndim)))))
 

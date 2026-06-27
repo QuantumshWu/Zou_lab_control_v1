@@ -291,7 +291,7 @@ temp_fit.summary()   # {'temperature_uK': ~44..50, 'capture_radius_m': 6e-06, 's
 task_console 的设计原则是**自由搭建**——看板开出来是空的，你从 **Add Panel** 一路自己搭。把 `session=exp` 传进去（让看板能用相机建连续生产者）+ `measurements` / `processors`，Add Panel 就分成清晰的几类：
 
 - **Measurement: Camera (live frames)**：连续出帧的相机测量，只发一个信号 `frame`。这是整条 loading 读出链的源头——相机出帧、真流程检测，再没有别的隐藏环节。
-- **Processor: Judge occupancy**（判占据，reactive）：消费 `frame`、跑**真** `calibration.detect`，逐 repeat 切片判，流式发布 `occupied` / `counts`（`(repeat,1,n_sites)` 块，`repeat_mode=average` 即逐站装载概率）/ `rate`（本块装载率标量）/ `centers` / `thresholds` / `frame_judged`。参数是**从哪载入标定**（`calibration`：site/PSF/阈值，默认就是 Calibrate 任务写的 `calibrations/calibration.json`，该文件出现前回退到 `session` 当前标定）+ `source`（要判的 `frame` 信号）+ `method`（box / per-site PSF / uniform PSF）。
+- **Processor: Judge occupancy**（判占据，reactive）：消费 `frame`、跑**真** `calibration.detect`，逐 repeat 切片判，流式发布 `occupied` / `counts`（`(repeat, n_sites)` 块，`repeat_mode=average` 即逐站装载概率）/ `rate`（本块装载率标量）/ `centers` / `thresholds` / `frame_judged`。参数是**从哪载入标定**（`calibration`：site/PSF/阈值，默认就是 Calibrate 任务写的 `calibrations/calibration.json`，该文件出现前回退到 `session` 当前标定）+ `source`（要判的 `frame` 信号）+ `method`（box / per-site PSF / uniform PSF）。
 - **Task: Calibrate readout**（一次性工作流）：在**自己的线程**里跑标定、不卡界面；它**不往 hub 发任何信号**——结果落在 `task.result`，中途帧/进度写进它自己的 `TaskOutput` 缓冲。运行时它占一张**固定 Monitor 面板**看中途模板帧、并锁定其它操作只留 **Stop task**（confocal task 式）。
 - 然后**自由加视图**读 measurement / processor 发的信号：Add Panel → `Plot: Site map`，在 Setting 里把 source 写 `value = occupied`（占据图：圈画在相机帧上，centers 自动取 `centers` 信号）；`Plot: 2D` + `value = frame`（原始图）；`Plot: Site map` + `value = occupied` 设 `repeat_mode=average`（逐站点装载概率）。
 - **Measurement: …**（扫描）：温度 / 读出时长，默认绑曲线图。

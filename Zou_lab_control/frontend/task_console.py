@@ -1717,14 +1717,44 @@ class PanelCard(FluentGroupBox):
         return (
             ParamDecl(key="repeat_mode", label="repeat mode", kind="choice", default="average",
                       choices=tuple(modes),
-                      tooltip="How to combine the measurement's repeats for display (decoupled from\n"
-                              "the signal):\n"
-                              "  average = mean over the repeats that have data (noise reduction)\n"
-                              "  add     = sum over repeats\n"
-                              "  replace = show the latest repeat\n"
-                              "  roll    = show the newest repeat (rolling)\n"
-                              "  create  = draw EVERY repeat as its own line (1-D only)"),
+                      tooltip=self._repeat_mode_tooltip()),
         )
+
+    def _bound_is_occupancy(self) -> bool:
+        """Whether this panel's bound signal is an OCCUPANCY vector (a Judge-occupancy output) --
+        driven off the signal's ROLE, not a hardcoded panel-kind string: its producing node resolves
+        a site-map centres/underlay for it (only a Judge-occupancy processor does), via the same
+        ``sites_inputs_provider`` the site map already uses (#H3s-F5).  So the occupancy meaning shows
+        for an occupancy signal on ANY plot kind, and stays generic for everything else."""
+        occ = self.config.inputs[0] if self.config.inputs else ""
+        if not occ or not callable(self.sites_inputs_provider):
+            return False
+        try:
+            centers_name, _ = self.sites_inputs_provider(occ)
+        except Exception:
+            return False
+        return bool(centers_name)
+
+    def _repeat_mode_tooltip(self) -> str:
+        """The repeat-mode tooltip, SPECIALISED for an occupancy signal (#H3s-F5): when the bound
+        signal is per-site occupancy, ``average`` is the per-site LOADING PROBABILITY (mean of the N
+        shots' 0/1), ``add`` the total loads, ``replace`` the latest shot, ``roll`` the last N --
+        the experiment meaning, not a generic array verb.  Generic otherwise, driven off the signal's
+        role rather than the panel kind."""
+        if self._bound_is_occupancy():
+            return ("How to combine the N shots of per-site occupancy for display:\n"
+                    "  average = per-site LOADING PROBABILITY = mean of the N shots' 0/1\n"
+                    "  add     = total loads per site over the N shots\n"
+                    "  replace = the latest shot's 0/1\n"
+                    "  roll    = the last N shots (rolling)\n"
+                    "  create  = draw EVERY shot as its own line (1-D only)")
+        return ("How to combine the measurement's repeats for display (decoupled from\n"
+                "the signal):\n"
+                "  average = mean over the repeats that have data (noise reduction)\n"
+                "  add     = sum over repeats\n"
+                "  replace = show the latest repeat\n"
+                "  roll    = show the newest repeat (rolling)\n"
+                "  create  = draw EVERY repeat as its own line (1-D only)")
 
     def _open_settings(self) -> None:
         # Click-to-open / click-again-to-close TOGGLE.  A Qt.Popup already auto-closes
@@ -2175,30 +2205,45 @@ class PanelCard(FluentGroupBox):
         the plotter's "xN" ylabel."""
         from .live import reduce_repeat, repeats_with_data
         mode = str(self.config.params.get("repeat_mode", "average"))
-        block, had_repeat = self._eval_signal_per_slice(namespace)
+        # core_ndim of the bound signal (a Judge-occupancy output declares its OWN per-signal structure,
+        # so its clean ``(repeat, n_sites)`` block is collapsed by STRUCTURE, not an ndim guess; camera /
+        # scan stay on the legacy ndim>=3 path with core_ndim=None) -- #H3s-F3.
+        core_ndim = self._bound_core_ndim()
+        block, had_repeat = self._eval_signal_per_slice(namespace, core_ndim=core_ndim)
         if isinstance(block, (list, tuple)):                      # a free expression returned a list
             self._repeat_cur = 1
             return np.asarray(block, dtype=float)
         b = np.asarray(block, dtype=float)
-        if had_repeat and self.config.kind == "1d" and b.ndim == 2:   # (repeat, points) -> add dim axis
-            b = b[:, :, None]
-        if had_repeat and b.ndim >= 3:                           # a repeat block (axis 0 = repeat):
-            self._repeat_cur = repeats_with_data(b)               # scan (repeat,pts,dim) or camera (repeat,1,H,W)
+        if had_repeat and self.config.kind == "1d" and core_ndim is None and b.ndim == 2:
+            b = b[:, :, None]                                     # legacy (repeat, points) -> add dim axis
+        # a repeat block (axis 0 = repeat) -- structure-driven when core_ndim is declared, else ndim>=3
+        if had_repeat and (b.ndim == 1 + core_ndim if core_ndim is not None else b.ndim >= 3):
+            self._repeat_cur = repeats_with_data(b, core_ndim=core_ndim)   # scan / camera / occupancy block
             if self.config.kind == "hist":
                 return b                                          # a histogram wants ALL samples (every
-            return reduce_repeat(b, mode)                         # repeat × datum) -> _coerce flattens the block
+            return reduce_repeat(b, mode, core_ndim=core_ndim)    # repeat × datum) -> _coerce flattens the block
         self._repeat_cur = 1                                      # no repeat axis -> nothing to reduce
         return b
 
-    def _eval_signal_per_slice(self, namespace: Mapping[str, object]):
+    def _eval_signal_per_slice(self, namespace: Mapping[str, object], *, core_ndim=None):
         """Run the ``value`` expression once PER REPEAT and re-stack -> ``(repeat, *result), True``.
         Every signal the expression reads that carries a repeat axis (the bound ``signal`` AND any
         raw hub signal the source names directly, e.g. ``value = frame``) is presented as that
         repeat's whole core -- the (H, W) frame / the (points, dim) curve -- so the user can process
         it (``signal[0]``, ``frame.mean()``, ...) while the repeat axis stays OUTSIDE the expression.
         When nothing read has a repeat axis (a single frame / curve / scalar) the expression runs
-        once -> ``value, False``.  The default ``value = signal`` on one bound block short-circuits."""
+        once -> ``value, False``.  The default ``value = signal`` on one bound block short-circuits.
+
+        WHETHER the bound ``signal`` carries a repeat axis is STRUCTURE-driven when its producing signal
+        declares ``core_ndim`` (a clean occupancy ``(repeat, n_sites)`` is ndim ``1 + 1``, #H3s-F3);
+        camera / scan slots (core_ndim None) keep the ndim>=3 rule."""
         from ..neutral_atom.operations.signal_expr import DEFAULT_SOURCE
+
+        def _slot_has_repeat(s) -> bool:
+            if s is None:
+                return False
+            return np.ndim(s) == 1 + int(core_ndim) if core_ndim is not None else np.ndim(s) >= 3
+
         expr = self._signal_expr()
         # A panel reads EXACTLY the signal it is bound to -- no rewrite.  A camera's `frame` shows the
         # camera's own (repeat, 1, H, W) block (so average/create work), INDEPENDENT of any Judge
@@ -2206,10 +2251,11 @@ class PanelCard(FluentGroupBox):
         # explicitly when wanted).  The site-map underlay coherence is handled separately (#_sites_aux).
         sig = expr.signal_for(namespace)
         slots = sig if isinstance(sig, list) else [sig]
-        # raw hub signals the source NAMES directly (not via ``signal``) that carry a repeat axis
+        # raw hub signals the source NAMES directly (not via ``signal``) that carry a repeat axis -- these
+        # are NOT the bound signal, so they keep the ndim>=3 rule (no per-signal core_ndim for them).
         raw_names = [n for n in expr.co_names()
                      if n != "signal" and np.ndim(namespace.get(n)) >= 3]
-        sig_rep = bool(slots) and all(s is not None and np.ndim(s) >= 3 for s in slots)
+        sig_rep = bool(slots) and all(_slot_has_repeat(s) for s in slots)
         if not sig_rep and not raw_names:                         # no repeat axis -> evaluate once
             ns = dict(namespace); ns["signal"] = sig
             return expr.exec_in(ns), False
@@ -2243,6 +2289,19 @@ class PanelCard(FluentGroupBox):
             return self.structure_provider(self.config.inputs[0])
         except Exception:
             return None
+
+    def _bound_core_ndim(self):
+        """``core_ndim`` (= len(points)+len(data)) for the bound signal, fed to ``reduce_repeat`` /
+        ``repeats_with_data`` so the LEADING repeat axis is collapsed by STRUCTURE (#H3s-F3) -- a clean
+        occupancy ``(repeat, n_sites)`` (ndim 2, core_ndim 1) IS a repeat block where a bare ndim guess
+        would miss it.  Returned ONLY when the bound signal declares its OWN per-signal structure (a
+        Judge-occupancy output): for camera / scan signals (node-level structure, ``per_signal`` False)
+        this returns ``None`` so ``reduce_repeat`` keeps the legacy ndim>=3 rule byte-identically.
+        ``None`` too for a custom expression (``_bound_structure`` already gates on identity source)."""
+        st = self._bound_structure()
+        if st is None or not st.get("per_signal"):
+            return None
+        return int(st.get("core_ndim", 0))
 
     def _coerce(self, value):
         kind = self.config.kind
@@ -2350,7 +2409,7 @@ class PanelCard(FluentGroupBox):
         image = namespace.get(image_name) if image_name else None
         if image is not None:
             image = np.asarray(image, dtype=float)
-            if image.ndim >= 3:        # a (repeat,1,H,W) frame_judged block -> ONE coherent (H,W) underlay
+            if image.ndim >= 3:        # a (repeat, H, W) frame_judged block -> ONE coherent (H,W) underlay
                 from .live import reduce_repeat
                 image = np.squeeze(reduce_repeat(image, "replace"))   # the latest filled shot (not a blur)
         return centers[:, :2], image
@@ -4693,11 +4752,21 @@ class TaskConsole(QtWidgets.QWidget):
         for full in sorted(node.published_signals()):
             short = full[len(pfx):] if (pfx and full.startswith(pfx) and len(full) > len(pfx)) else full
             try:
-                # the node's PRIMARY block shows in contract form (repeat × points × (data)); its aux
-                # signals (a single frame_i etc.) don't match the block shape -> raw shape (#H3o).
-                shape = describe_shape(self.hub.latest(full), points_shape=getattr(node, "points_shape", ()),
-                                       data_shape=getattr(node, "data_shape", ()),
-                                       grid_shape=getattr(node, "grid_shape", ()))
+                # PER-SIGNAL structure (#H3s-F3): a signal whose own SignalSpec declares a points/data
+                # slot (occupied -> 5 × (35); frame_judged -> 5 × (96×128)) shows in CONTRACT form off
+                # ITS structure.  Else the node's PRIMARY block (camera frame, scan y) shows in contract
+                # form off the node-level triple; any other AUX signal (a static centers (35, 2) /
+                # thresholds (35,), a per-trigger frame_i) shows its RAW numpy shape.
+                spec = specs.get(full)
+                primary = full == pfx + str(getattr(node, "primary_signal", "") or "")
+                if spec is not None and getattr(spec, "has_structure", False):
+                    ps, ds, gs = spec.points_shape, spec.data_shape, getattr(node, "grid_shape", ())
+                elif primary:                               # node-level primary block (camera / scan)
+                    ps = getattr(node, "points_shape", ()); ds = getattr(node, "data_shape", ())
+                    gs = getattr(node, "grid_shape", ())
+                else:                                       # an aux signal with no contract slot -> raw shape
+                    ps, ds, gs = None, None, ()
+                shape = describe_shape(self.hub.latest(full), points_shape=ps, data_shape=ds, grid_shape=gs)
             except Exception:
                 shape = "—"
             rows.append((short, shape, desc(short)))
@@ -4747,17 +4816,41 @@ class TaskConsole(QtWidgets.QWidget):
         return None
 
     def _signal_structure(self, name: str):
-        """The output-contract structure for signal ``name`` from its producing node (#H3o):
-        ``{"points_shape", "data_shape", "grid_shape"}`` -- so a plot knows whether the DATA is 1-D
-        (multiple series -> lines) or 2-D (an image -> reshape/imshow), what the swept points are,
-        and the 2-D ``grid_shape`` for reshaping a flattened scan grid to a map.  ``None`` when no
-        producing node declares it (a derived expression / a raw array): fall back to shape heuristics."""
+        """The output-contract structure for ONE signal ``name`` from its producing node (#H3o, #H3s-F3):
+        ``{"points_shape", "data_shape", "grid_shape", "core_ndim"}`` -- so a plot knows whether the DATA
+        is 1-D (multiple series -> lines) or 2-D (an image -> reshape/imshow), what the swept points are,
+        the 2-D ``grid_shape`` for reshaping a flattened scan grid, and ``core_ndim`` (= len(points) +
+        len(data)) so ``reduce_repeat`` collapses the LEADING repeat axis by STRUCTURE, never an ndim
+        guess.  PER-SIGNAL first: a node may publish signals of different structure (occupancy's
+        ``(repeat, n_sites)`` vs its static ``centers`` (N, 2)), so when the signal's own
+        :class:`SignalSpec` declares a points/data slot it wins; only when it declares none does this
+        fall back to the node-level triple (so other nodes are unaffected).  ``None`` when no producing
+        node is found (a derived expression / a raw array): the consumer then uses shape heuristics."""
         node = self._node_for_signal(str(name or ""))
         if node is None:
             return None
-        return {"points_shape": tuple(getattr(node, "points_shape", ()) or ()),
-                "data_shape": tuple(getattr(node, "data_shape", ()) or ()),
-                "grid_shape": tuple(getattr(node, "grid_shape", ()) or ())}
+        # PER-SIGNAL: the producing signal's own SignalSpec (occupied declares points=(), data=(n_sites,);
+        # centers declares neither -> None) takes precedence over the node-level triple.
+        spec = None
+        if hasattr(node, "signal_spec"):
+            try:
+                spec = node.signal_spec(str(name))
+            except Exception:
+                spec = None
+        if spec is not None and getattr(spec, "has_structure", False):
+            ps = tuple(spec.points_shape or ())
+            ds = tuple(spec.data_shape or ())
+            return {"points_shape": ps, "data_shape": ds,
+                    "grid_shape": tuple(getattr(node, "grid_shape", ()) or ()),
+                    "core_ndim": len(ps) + len(ds), "per_signal": True}
+        # fall back to the node-level contract triple (camera / scan / a node with no per-signal spec).
+        # ``per_signal`` False -> a consumer keeps the legacy ndim>=3 repeat detection (core_ndim NOT
+        # fed to reduce_repeat) so camera / scan paths stay byte-identical.
+        ps = tuple(getattr(node, "points_shape", ()) or ())
+        ds = tuple(getattr(node, "data_shape", ()) or ())
+        return {"points_shape": ps, "data_shape": ds,
+                "grid_shape": tuple(getattr(node, "grid_shape", ()) or ()),
+                "core_ndim": len(ps) + len(ds), "per_signal": False}
 
     def _refresh_signal_info(self) -> None:
         """Give every panel a legend (shown in its frame TITLE -- the grey strip, the old footer

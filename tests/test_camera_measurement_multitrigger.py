@@ -74,11 +74,11 @@ def test_readout_image_frame_judged_is_synced_with_occupancy():
         det.step()
     frame_judged = np.asarray(hub.latest("frame_judged"))
     occupied = np.asarray(hub.latest("occupied"))
-    assert frame_judged.ndim == 4 and occupied.ndim == 3            # (repeat,1,H,W) / (repeat,1,n_sites) blocks (#H3q)
+    assert frame_judged.ndim == 3 and occupied.ndim == 2           # clean (repeat,H,W) / (repeat,n_sites) blocks (#H3s-F3)
     # the readout image and the rings are the SAME shots: re-judging each frame_judged slice
     # reproduces exactly the published occupancy slice (they came from one atomic publish).
-    img = frame_judged[-1, 0]                                       # the last filled shot
-    assert np.array_equal(occupied[-1, 0], cal.detect(img, method="box").occupied)
+    img = frame_judged[-1]                                          # the last filled shot
+    assert np.array_equal(occupied[-1], cal.detect(img, method="box").occupied)
 
 
 def test_2d_frame_panel_shows_camera_average_decoupled_from_judge():

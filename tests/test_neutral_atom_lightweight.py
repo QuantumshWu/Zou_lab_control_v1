@@ -7005,7 +7005,7 @@ def test_user_composed_loading_readout_publishes_standard_signals():
     assert hub.latest("thresholds").shape == (n,)
     occ = np.asarray(hub.latest("occupied"))
     counts = np.asarray(hub.latest("counts"))
-    assert occ.ndim == 3 and occ.shape[1] == 1 and occ.shape[2] == n   # (repeat, 1, n_sites) block
+    assert occ.ndim == 2 and occ.shape[1] == n   # clean (repeat, n_sites) block (#H3s-F3)
     assert counts.shape == occ.shape
     assert 0.0 <= float(hub.latest("rate")) <= 1.0                     # this block's loading fraction
     # the long-run occupancy mean tracks loading_probability (loose: lifetime losses)
