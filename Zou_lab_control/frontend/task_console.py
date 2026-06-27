@@ -425,6 +425,24 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
         self._table_box.setContentsMargins(0, 0, 0, 0)
         self._table_box.setSpacing(scaled_px(6, minimum=4))
         self._box.addLayout(self._table_box)
+        # Whole-sweep count (#3): how many times to repeat the ENTIRE point-by-point sweep before
+        # stopping (0 = sweep forever, the default; K = K whole sweeps then stop).  PERSISTENT -- it
+        # lives directly on _box (not _api_box / _table_box), so it survives a mode switch + an
+        # api-row rebuild (neither _drop_layout target touches it).  ORTHOGONAL to the camera-frame
+        # ``repeat`` / ``free_run`` (a different axis injected by the console): this counts SWEEPS of
+        # the whole scan; those count frames kept/averaged per point.  Carried in
+        # values_dict["scan_repeats"]; consumed by the pulse-scan measurement (PulseScanNode).
+        self._scan_repeats_spin = FluentDoubleSpinBox(length=5, allow_minus=False)
+        self._scan_repeats_spin.setDecimals(0)
+        self._scan_repeats_spin.setRange(0, 999)
+        self._scan_repeats_spin.setValue(0)
+        self._scan_repeats_spin.setToolTip(
+            "How many WHOLE scan sweeps to play before stopping.  0 = sweep forever (the default); "
+            "K ≥ 1 = K full sweeps then stop.  Orthogonal to the camera-frame Repeat (which counts "
+            "frames kept per point) -- this counts sweeps of the whole scan.")
+        self._scan_repeats_spin.valueChanged.connect(self.changed)
+        self._box.addWidget(FluentSettingRow("Scan repeats (0 = ∞)", self._scan_repeats_spin,
+                                             label_width=setting_label_width(["Scan repeats (0 = ∞)"])))
 
     @staticmethod
     def _drop_layout(layout) -> None:
@@ -638,9 +656,11 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
 
     def values_dict(self) -> dict:
         """The current ``{"api": {name: float}, "scan_mode": "none"|"api"|"scan",
-        "scan_code": "<python>", "extra_delay": float}`` snapshot.  ONE ``scan_code`` = the ACTIVE
-        mode's program (the build dispatches on ``scan_mode``); an empty / blank api row is dropped
-        (keeps the template's value)."""
+        "scan_code": "<python>", "extra_delay": float, "scan_repeats": int}`` snapshot.  ONE
+        ``scan_code`` = the ACTIVE mode's program (the build dispatches on ``scan_mode``); an empty /
+        blank api row is dropped (keeps the template's value).  ``scan_repeats`` (#3) = how many WHOLE
+        sweeps to run (0 = forever); the pulse-scan measurement consumes it, ORTHOGONAL to the
+        camera-frame ``repeat`` / ``free_run`` axis the console injects separately."""
         api: dict[str, float] = {}
         for name, w in self._api_widgets.items():
             text = w.text().strip()
@@ -657,7 +677,8 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
                 extra = float(self._extra_delay.text().strip() or 0.0)
             except ValueError:
                 extra = 0.0
-        return {"api": api, "scan_mode": self._mode, "scan_code": code, "extra_delay": extra}
+        return {"api": api, "scan_mode": self._mode, "scan_code": code, "extra_delay": extra,
+                "scan_repeats": int(self._scan_repeats_spin.value())}
 
     def seed_value(self, value) -> None:
         """Seed from a SAVED ``{"api", "scan_mode", "scan_code", "extra_delay"}`` blob (a load /
@@ -682,6 +703,11 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
         self._pending_mode = mode if mode in (none, api, scan) else None
         self._extra_remembered = (f"{float(value['extra_delay']):g}"
                                   if _is_number(value.get("extra_delay")) else self._extra_remembered)
+        # The repeats spin is PERSISTENT (not rebuilt), so restore the saved whole-sweep count
+        # directly here (signal blocked so a load is not read as a user edit).  Missing key -> 0 (∞).
+        if _is_number(value.get("scan_repeats")):
+            with _signals_blocked(self._scan_repeats_spin):
+                self._scan_repeats_spin.setValue(int(float(value["scan_repeats"])))
 
     def has_scan_rows(self) -> bool:
         return self._n_slots > 0

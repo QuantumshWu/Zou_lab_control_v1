@@ -337,6 +337,95 @@ def test_pulse_scan_empty_program_uses_column_stack_default():
         exp.close()
 
 
+def _scan_node(exp, *, scan_repeats=0, repeat=1, free_run=False, tag="a"):
+    """Build a PulseScanNode over a 3-point software sweep with the given whole-sweep count +
+    camera-frame repeat/free_run, settled INLINE per point (deterministic headless run).  ``tag``
+    keeps each probe file UNIQUE (a shared path races a still-open Windows handle)."""
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.neutral_atom.operations.logic import OccupancyProcessor, PulseScanNode
+    from Zou_lab_control.neutral_atom.timing import PulseTableState
+    from Zou_lab_control.neutral_atom.timing.pulse_table import PulsePeriod
+
+    state = PulseTableState(channels=["trap", "cooling", "probe", "emCCD"],
+                            visible_channels=["trap", "cooling", "probe", "emCCD"])
+    state.periods.append(PulsePeriod(0.002, (1, 1, 0, 0), unit="s", name="load"))
+    state.periods.append(PulsePeriod(0.005, (1, 0, 1, 1), unit="s", name="image"))
+    state.bind_field("duration", "1", label="probe", unit="us")
+    state.validate()
+    probe = str(Path("pulses") / f"_test_probe_repeats_{tag}.json")
+    state.save(probe)
+    spec = {s.name: s for s in exp.readout.measurement_specs()}["Pulse scan"]
+    plan = spec.build(
+        template=probe,
+        pulse_slots={"api": {}, "scan_code": "import numpy as np\n"
+                     "scan_table = np.linspace(10000, 30000, 3).reshape(-1, 1)",
+                     "scan_repeats": scan_repeats},
+        y={"inputs": ["rate"], "source": "value = signal"})
+    hub = SignalHub()
+    occ = OccupancyProcessor(hub, calibration=exp.readout.require(thresholds=True),
+                             source_expr={"inputs": ["frame"], "source": "value = signal"}, grid_shape=(3, 4))
+    plan.settle = occ.step
+    node = PulseScanNode(hub, plan, x_key=spec.x_key, y_key=spec.y_key, prefix=f"{spec.key}_",
+                         repeat=repeat, free_run=free_run)
+    return node, probe
+
+
+def test_pulse_scan_repeats_threads_from_form_to_plan_and_node():
+    """#3: the form's scan_repeats reaches the plan + the node (the GUI->measurement seam)."""
+    exp = _calibrated()
+    node = probe = None
+    try:
+        node, probe = _scan_node(exp, scan_repeats=2, tag="thread")
+        assert node.plan.scan_repeats == 2
+        assert node.scan_repeats == 2
+    finally:
+        if probe:
+            _safe_unlink(probe)
+        exp.close()
+
+
+def test_pulse_scan_finite_repeats_stops_after_k_whole_sweeps():
+    """#3: scan_repeats=K runs K WHOLE point-by-point sweeps then stops (a finite software sweep)."""
+    exp = _calibrated()
+    node = probe = None
+    try:
+        node, probe = _scan_node(exp, scan_repeats=2, tag="finite")   # 3 points x 2 sweeps = 6 points
+        assert node.total_points == 6
+        node.run_to_completion()
+        assert node.finished
+        assert node.points_done == 6
+    finally:
+        if probe:
+            _safe_unlink(probe)
+        exp.close()
+
+
+def test_pulse_scan_repeats_is_orthogonal_to_camera_free_run():
+    """#3: scan_repeats is a SEPARATE axis from the camera-frame repeat/free_run.  A finite
+    scan_repeats=K halts even a free_run node (the user asked for K sweeps), while scan_repeats=0
+    leaves the free_run behaviour untouched (never finishes)."""
+    exp = _calibrated()
+    node = probe = node0 = probe0 = None
+    try:
+        # free_run camera ring + finite scan_repeats -> the scan still STOPS after K whole sweeps.
+        node, probe = _scan_node(exp, scan_repeats=1, repeat=2, free_run=True, tag="orth1")
+        assert node.total_points == 3                        # 3 points x 1 sweep (scan_repeats wins)
+        node.run_to_completion()
+        assert node.finished and node.points_done == 3
+
+        # scan_repeats=0 + free_run -> unchanged: never finishes (the camera axis rolls forever).
+        node0, probe0 = _scan_node(exp, scan_repeats=0, repeat=2, free_run=True, tag="orth0")
+        assert node0.total_points == 0                       # unbounded
+        assert not node0.finished
+        node0.step(); node0.step(); node0.step(); node0.step()   # past one whole sweep
+        assert not node0.finished                            # free_run with no sweep bound rolls on
+    finally:
+        for p in (probe, probe0):
+            if p:
+                _safe_unlink(p)
+        exp.close()
+
+
 def _bound_probe_with_api() -> str:
     """A probe with ONE API slot (a duration handle) and NO scan slot -- the api-only sweep case."""
     from Zou_lab_control.neutral_atom.timing import PulseTableState

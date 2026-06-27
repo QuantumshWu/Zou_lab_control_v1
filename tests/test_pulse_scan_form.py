@@ -72,13 +72,14 @@ def _legend_text(w) -> str:
 
 
 def test_values_dict_schema_per_mode(_app):
-    """``values_dict`` emits exactly ``{api, scan_mode, scan_code, extra_delay}`` -- ONE scan_code
-    (the active mode's program), and no separate api_scan key."""
+    """``values_dict`` emits exactly ``{api, scan_mode, scan_code, extra_delay, scan_repeats}`` --
+    ONE scan_code (the active mode's program), the whole-sweep count (#3), and no separate api_scan
+    key."""
     from Zou_lab_control.frontend.task_console import _scan_modes
     none, api, scan = _scan_modes()
     w = _widget_both()
     v = w.values_dict()
-    assert set(v.keys()) == {"api", "scan_mode", "scan_code", "extra_delay"}
+    assert set(v.keys()) == {"api", "scan_mode", "scan_code", "extra_delay", "scan_repeats"}
     assert "api_scan" not in v                          # the old second program key is gone
     assert v["scan_mode"] == scan
     _set_mode(w, none)

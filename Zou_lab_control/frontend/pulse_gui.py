@@ -281,6 +281,37 @@ def _scan_slot_label(state: PulseTableState, index: int) -> str:
     return slot_label(slot.kind, slot.target)
 
 
+def _format_scan_progress(progress: Mapping[str, object] | None) -> str:
+    """SINGLE source for the live scan-progress label text (Task #4).
+
+    ``progress`` is the dict every ``sequencer.scan_progress()`` returns (the shape declared by
+    ``sequencer.SCAN_PROGRESS_IDLE``): ``{scanning, point, n_points, sweep, n_repeats}`` with
+    ``point``/``sweep`` 0-based and ``n_repeats=0`` meaning ∞.  Returns:
+
+    * ``""`` when idle (not scanning, no points, or ``progress is None``) -- the label blanks.
+    * ``"Scan: point K / N · sweep r"`` for an INFINITE scan (``n_repeats=0``; no ``/ R``).
+    * ``"Scan: point K / N · sweep r / R"`` for a FINITE scan (``n_repeats=R>0``).
+
+    Points/sweeps are shown 1-based (operator-facing) though the dict is 0-based."""
+
+    if not progress:
+        return ""
+    try:
+        scanning = bool(progress.get("scanning"))
+        n_points = int(progress.get("n_points", 0))
+        point = int(progress.get("point", 0))
+        sweep = int(progress.get("sweep", 0))
+        n_repeats = int(progress.get("n_repeats", 0))
+    except (TypeError, ValueError):
+        return ""
+    if not scanning or n_points <= 0:
+        return ""
+    text = f"Scan: point {point + 1} / {n_points} · sweep {sweep + 1}"
+    if n_repeats > 0:                      # finite K sweeps -> show "/ R"; ∞ (0) shows just "sweep r"
+        text += f" / {n_repeats}"
+    return text
+
+
 def _template_column_stack(n_slots: int) -> str:
     """``column_stack`` template (one column per slot) -- delegates to the ONE shared scan-table
     template generator (the task-console Pulse-scan form uses the same source)."""
@@ -2121,6 +2152,11 @@ class PulseSequenceEditor(QtWidgets.QWidget):
     def load_state(self, state: PulseTableState) -> None:
         self._building = True
         self.state = state
+        # Sync the Scan-tab repeats spin to the LOADED whole-sweep count (#3) so a Save round-trips
+        # it; signals blocked so this device/file load does not read as a user edit (dirty hint).
+        if getattr(self, "scan_repeats_spin", None) is not None:
+            with _signals_blocked(self.scan_repeats_spin):
+                self.scan_repeats_spin.setValue(int(getattr(state, "scan_repeats", 0)))
         # Suspend painting while we tear down and rebuild every channel panel and
         # period card (up to 5 periods x 62 channels = hundreds of widgets).  Each
         # addWidget on a *visible* tree would otherwise trigger an immediate
@@ -2429,6 +2465,13 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             delays=dict(self.state.delays),
             delay_units=dict(self.state.delay_units),
             repeat_forever=bool(self.state.repeat_forever),
+            # Whole-sweep count (#3): 0 = sweep forever (default), K = K sweeps then stop.  Carried
+            # on the state so Save round-trips it and prepare(state) hands it to the device (which
+            # does the finite stop).  Falls back to the current state's value if the Scan tab's spin
+            # was never built (e.g. a headless read_state before _build_scan_tab).
+            scan_repeats=(int(self.scan_repeats_spin.value())
+                          if getattr(self, "scan_repeats_spin", None) is not None
+                          else int(getattr(self.state, "scan_repeats", 0))),
             clk_channels=list(self.state.clk_channels),
         )
         self.names_panel.read_values(state)
@@ -2827,7 +2870,41 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self.scan_slots_label = FluentLabel("")
         self.scan_slots_label.setWordWrap(True)
         info_layout.addWidget(self.scan_slots_label)
+        # Run controls row: how many whole sweeps to play (#3) + a live "where is the scan" readout
+        # (#4).  ``scan_repeats`` (0 = sweep forever, the default) writes ``state.scan_repeats`` in
+        # read_state, so it round-trips through Save and reaches the device via prepare(state) -- the
+        # DEVICE does the finite stop (no GUI counting loop).  Reuses the in-file numeric idiom
+        # (FluentDoubleSpinBox(length=5, allow_minus=False), as the bracket "Repeat" spin), with 0
+        # decimals so it reads as an integer count.
+        run_row = QtWidgets.QHBoxLayout()
+        run_row.setContentsMargins(0, 0, 0, 0)
+        run_row.setSpacing(_px(6, minimum=4))
+        run_row.addWidget(FluentLabel("Scan repeats (0 = ∞)"))
+        self.scan_repeats_spin = FluentDoubleSpinBox(length=5, allow_minus=False)
+        self.scan_repeats_spin.setDecimals(0)
+        self.scan_repeats_spin.setRange(0, 999)
+        self.scan_repeats_spin.setValue(int(getattr(self.state, "scan_repeats", 0)))
+        self.scan_repeats_spin.setFixedHeight(_row_height())
+        self.scan_repeats_spin.setToolTip(
+            "How many WHOLE scan sweeps to play before stopping.  0 = sweep forever (the default); "
+            "K ≥ 1 = K full sweeps then stop.  The device performs the finite stop.")
+        # A repeats edit is a STATE change (it rides on read_state -> prepare(state)); mark the
+        # editor unsynced, the same dirty path the scan-code editor uses.
+        self.scan_repeats_spin.valueChanged.connect(self._mark_dirty)
+        run_row.addWidget(self.scan_repeats_spin)
+        # Live scan-position readout (#4): a QTimer polls the connected sequencer's scan_progress()
+        # while a scan runs and writes this label (single-source text via _format_scan_progress);
+        # blank when idle / no sequencer.
+        self.scan_progress_label = FluentLabel("")
+        run_row.addWidget(self.scan_progress_label, 1)
+        info_layout.addLayout(run_row)
         layout.addWidget(info)
+        # Poll the device for the live scan position; defensive (no sequencer / no scan_progress
+        # method -> silently blank, never throws).  Started here, ticking for the tab's lifetime.
+        self._scan_progress_timer = QtCore.QTimer(self)
+        self._scan_progress_timer.setInterval(200)
+        self._scan_progress_timer.timeout.connect(self._poll_scan_progress)
+        self._scan_progress_timer.start()
 
         body = QtWidgets.QHBoxLayout()
         body.setSpacing(_px(8, minimum=5))
@@ -2905,6 +2982,26 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         # default is regenerated to match the current slot count.
         self._scan_auto_code = ""
         return tab
+
+    def _poll_scan_progress(self) -> None:
+        """Update the live scan-position label from the connected sequencer (#4).
+
+        Defensive by contract: no sequencer attached, or a sequencer without a ``scan_progress``
+        method, or any error reading it -> the label blanks and the poll never throws (a transient
+        device/network blip must not crash the GUI timer).  ``_format_scan_progress`` is the SINGLE
+        source of the text (blank when idle)."""
+        label = getattr(self, "scan_progress_label", None)
+        if label is None:
+            return
+        sequencer = getattr(self, "sequencer", None)
+        progress = None
+        reader = getattr(sequencer, "scan_progress", None)
+        if callable(reader):
+            try:
+                progress = reader()
+            except Exception:
+                progress = None
+        label.setText(_format_scan_progress(progress))
 
     def _refresh_scan_tab(self) -> None:
         if not hasattr(self, "scan_slots_label"):

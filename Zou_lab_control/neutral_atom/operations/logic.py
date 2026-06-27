@@ -1631,6 +1631,14 @@ class PulseScanNode(Measurement):
         self.api_names = list(getattr(plan, "api_names", ()))
         self.api_arrays = [np.asarray(a, dtype=float).reshape(-1) for a in getattr(plan, "api_arrays", ())]
         self.extra_delay_s = max(0.0, float(getattr(plan, "extra_delay_s", 0.0)))
+        # Whole-sweep count (#3): K>0 = stop after K complete point-by-point passes; 0 = no sweep
+        # bound (the historical default -- the scan stops only per ``repeat``/``free_run``).  This is
+        # ORTHOGONAL to the camera-frame ``repeat``/``free_run`` axis above: ``repeat`` is the depth
+        # of the kept/averaged frame ring PER POINT; ``scan_repeats`` caps how many whole SWEEPS run.
+        # pulse-scan is a per-point SOFTWARE loop (it fires once per point in shot(), for both the
+        # hardware-scan and api-sweep modes -- it never streams a device scan table), so the count is
+        # enforced here by bounding ``_pass`` (the whole-sweep counter).
+        self.scan_repeats = max(0, int(getattr(plan, "scan_repeats", 0)))
         self.camera = plan.camera
         self.sequencer = plan.sequencer
         self.y_expr = plan.y_expr if isinstance(plan.y_expr, SignalExpr) else SignalExpr.from_value(plan.y_expr)
@@ -1680,10 +1688,22 @@ class PulseScanNode(Measurement):
 
     @property
     def total_points(self) -> int:
+        # The whole-sweep count (#3) is the SOLE stop criterion when set: K sweeps x N points,
+        # regardless of the camera-frame axis (it counts SWEEPS, orthogonal to repeat = frames per
+        # point / free_run = roll-vs-stop).  With scan_repeats=0 the camera-frame axis decides as
+        # before (free_run = unbounded; else repeat x N).
+        if self.scan_repeats > 0:
+            return int(self.n_points * self.scan_repeats)
         return 0 if self.free_run else int(self.n_points * int(self.repeat))
 
     @property
     def finished(self) -> bool:
+        # scan_repeats>0 is the SOLE stop criterion: stop after K WHOLE sweeps, whatever the
+        # camera-frame repeat/free_run is (they are a different axis -- frames kept per point, not
+        # sweeps of the scan; #3).  scan_repeats=0 = the historical behaviour: free_run rolls
+        # forever, else stop after ``repeat`` passes.
+        if self.scan_repeats > 0:
+            return self._pass >= self.scan_repeats
         return False if self.free_run else (self._pass >= int(self.repeat))
 
     def _publish_raw(self) -> np.ndarray:
