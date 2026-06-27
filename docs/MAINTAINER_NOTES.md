@@ -1418,15 +1418,24 @@ The site-map underlay still tracks the rings' shot because `frame_judged` is pub
 the single judged shot, not the 30-shot mean — that is correct for occupancy.) Guarded by
 `test_camera_measurement_multitrigger.py::test_2d_frame_panel_shows_camera_average_decoupled_from_judge`.
 
-### Panel card: width-by-columns, HEIGHT hugs the plot (variable pixel-y grid)
-A card's WIDTH is on a clean column grid (`cols // 2` base columns); its HEIGHT HUGS the plot —
-`_card_size` = chrome + the size's own figure height, **zero blank padding** below at every size
-(the figure still scales with the size, so 1x2/2x2/4x4 stay distinct).  Heights are therefore
-VARIABLE, so the vertical layout is PIXELS not cells: `PanelConfig.col` is a column index (x snaps
-to the column grid) but `.row` is a PIXEL y (`.rows` cell-span deleted).  `_slot_to_pos`/`_pos_to_slot`
-map columns cleanly + snap y to `_VSNAP`; `_compact` pushes an overlap straight down by the blocker's
-ACTUAL pixel height (+ gap) — free vertical placement, no overlap.  Guarded by `test_panel_hug_layout.py`
-(+ the two smoke layout tests).
+### Panel board: TOP-LEFT GRAVITY packing over pixel AABBs (#H3s-F8)
+There is **no column grid**: the board is a pure pixel plane and `PanelConfig.col`/`.row` ARE the
+card's pixel top-left (the `.cols` column-span + `.rows` cell-span are deleted).  A card's WIDTH still
+scales with the size (`cols // 2` base widths joined by one `GAP`, so 1x4 is wider than 1x2); its
+HEIGHT HUGS the plot — `_card_size` = chrome + the size's own figure height, **zero blank padding**
+below at every size.  `_compact(configs, active=None, board_w=None)` is a TOP-LEFT GRAVITY packer:
+every card floats UP then LEFT (`_gravity_slot` = top-most then left-most feasible candidate point)
+until blocked by another card or the board edge, with a **uniform `GAP` on all four sides** (and as
+the margin from the (0,0) origin).  `GAP` = `GRID_UNIT` (the single spacing constant) = the horizontal
+inter-card gap the user liked; reuse it, never add a new art/geom knob.  Cards pack in READING ORDER
+of their current `(row, col)`, the `active` (just-dropped) card winning a tie — so a card dropped
+low-right snaps up-left, dropping it back where it was reproduces the layout (stable + deterministic:
+a settled board is a fixed point), and cards sit side by side until the board (`board_w` = the live
+scroll-viewport width; a two-wide fallback headless) is full, then wrap.  `_arrange` passes the
+viewport width; the drop-release records the raw drop pixel as the seed and lets `_compact` re-pack.
+Saved layouts round-trip the reading ORDER (exact pixels are recomputed on load).  Guarded by
+`test_board_gravity.py`, `test_panel_grid_spacing.py`, `test_panel_hug_layout.py` (+ the smoke layout
+test).
 
 ### Setting frame: show-all + grow-not-shrink (height hysteresis)
 `_size_settings_popup` sizes the Setting popup to show ALL its content by default (scroll only past
@@ -1508,6 +1517,7 @@ contract test — the single mechanical guard. Change the framework = change the
   are DERIVED from it (byte-identical to the old literals); `data_figure` reads the declared
   `render_family` (`"auto"` sentinel keeps the site map's conditional 1D/2D). Guard:
   `tests/test_plot_kind_table.py`.
-- **Panel layout** — `frontend/task_console.py::GRID_UNIT` is the ONE spacing setting; `_compact`
-  snaps every vertical inter-card gap to an integer multiple of it (`_snap_gap`), so panel spacing is
-  always tidy `k*GRID_UNIT`, never a leftover-pixel gap. Guard: `tests/test_panel_grid_spacing.py`.
+- **Panel layout** — `frontend/task_console.py::GAP` (= `GRID_UNIT`) is the ONE spacing setting;
+  `_compact` is a top-left gravity packer (see the board section above) that leaves exactly `GAP` on
+  all four sides of every card and as the origin margin, so spacing is uniform, never a leftover-pixel
+  gap. Guard: `tests/test_panel_grid_spacing.py`, `tests/test_board_gravity.py`.

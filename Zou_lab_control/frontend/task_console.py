@@ -869,28 +869,23 @@ def _text_to_py(text: str):
         except ValueError:
             return raw
 
-# Board layout (raw px).  WIDTH is on a clean COLUMN grid whose unit is the base 1x2 panel's
-# width (a card is ``cols // 2`` columns wide); HEIGHT HUGS the plot -- the card is exactly tall
-# enough for its figure + chrome, with NO blank padding below (every size hugs like 1x2, #H3i-3).
-# Because heights are therefore VARIABLE (a 2x2 figure is taller than a 1x2), the vertical axis is
-# NOT a fixed cell grid: ``col`` is a column index (x snaps to the column grid) but ``row`` is a
-# PIXEL y -- cards free-stack vertically and ``_compact`` pushes an overlap straight down by the
-# blocker's ACTUAL pixel height.  The CARD'S FORMAT (rounded corners, shadow, grey title strip,
+# Board layout (raw px).  The board is a pure PIXEL plane of card AABBs -- there is NO column
+# grid.  WIDTH still scales with the size (``cols // 2`` base-widths so 1x4 is wider than 1x2);
+# HEIGHT HUGS the plot -- the card is exactly tall enough for its figure + chrome, with NO blank
+# padding below (every size hugs like 1x2, #H3i-3).  ``PanelConfig.col`` is the card's pixel X and
+# ``row`` is the card's pixel Y; ``_compact`` is a TOP-LEFT GRAVITY packer that floats every card
+# UP then LEFT until blocked.  The CARD'S FORMAT (rounded corners, shadow, grey title strip,
 # content padding) belongs to the FluentGroupBox COMPONENT (qt_fluent.CARD_PAD / CARD_TITLE_PX,
 # the single source); this module only lays cards out.
-# The ONE spacing setting: columns pitch by it AND every vertical inter-card gap is snapped to an
-# integer multiple of it -- so panel-to-panel spacing is always tidy (k*GRID_UNIT), never a random
-# pixel gap left over from where a card happened to be dropped.  Change this one number to retune
-# all board spacing.
 GRID_UNIT = 8
-_GRID_GAP = GRID_UNIT   # the MINIMUM inter-card gap == one unit (name kept for the x-pitch math)
-
-
-def _snap_gap(gap: int) -> int:
-    """Round a raw vertical gap to an integer multiple of GRID_UNIT, at least one unit -- so two
-    stacked cards always sit a clean k*GRID_UNIT apart instead of an arbitrary pixel distance."""
-
-    return max(GRID_UNIT, int(round(float(gap) / GRID_UNIT)) * GRID_UNIT)
+# The ONE spacing setting (#H3s-F8).  GAP is the UNIFORM clear distance between any two cards on
+# every side -- top, bottom, left, right -- AND the board margin from the (0, 0) origin.  It equals
+# the HORIZONTAL inter-card gap the user likes: two cards on adjacent base-columns pitched by
+# ``_cell_size()[0] + GAP`` sit exactly GAP px apart (and a multi-column card's internal columns are
+# joined by the SAME GAP, see ``_card_size``).  Reusing this one existing spacing constant (no new
+# public art/geom knob, per frontend/AGENTS.md F2/F3); change this one number to retune all board
+# spacing.
+GAP = GRID_UNIT
 
 # The header status readout (panel/signal counts, or a node-error banner) is a borderless
 # label: grey normally, red on a node error (the colour IS the danger cue -- no box border,
@@ -900,25 +895,17 @@ _SUMMARY_STYLE_DANGER = f"color: {RED}; background: transparent; border: none;"
 
 
 def _cell_size() -> tuple[int, int]:
-    """The base grid CELL = a 1x2 panel's card: the figure (1 row x 2 cols) plus the card chrome
-    (L/R border + grey title strip + bottom border).  Every card is a whole number of these
-    cells, so they all tile on one grid."""
+    """The base CARD WIDTH unit = a 1x2 panel's card: the figure (1 row x 2 cols) plus the card
+    chrome (L/R border + grey title strip + bottom border).  Every card width is a whole number of
+    these base widths joined by ``GAP``, so widths stay on one rhythm (height hugs the plot)."""
 
     width = panel_display_size("1x2")[0] + 2 * CARD_PAD
     height = scaled_px(CARD_TITLE_PX) + scaled_px(2) + panel_display_size("1x2")[1] + CARD_PAD
     return (width, height)
 
 
-def _grid_pitch() -> tuple[int, int]:
-    """The layout / drag-snap pitch = one CELL + the inter-card gap, per axis -- so the only snap
-    points are whole-cell positions and stacked cells sit exactly ``_GRID_GAP`` apart."""
-
-    cw, ch = _cell_size()
-    return (cw + _GRID_GAP, ch + _GRID_GAP)
-
-
 def _card_size(size: str) -> tuple[int, int]:
-    """Outer card size: WIDTH on the column grid (``cols // 2`` columns + the gaps between them),
+    """Outer card size: WIDTH = ``cols // 2`` base widths joined by ``GAP`` (1x4 is wider than 1x2),
     HEIGHT HUGS the plot (title strip + the size's own figure height + bottom pad, NO blank padding
     -- every size hugs like 1x2).  So width still scales with the size's columns, but height is
     just tall enough for the figure -- the card's bottom edge sits right under the plot."""
@@ -926,84 +913,108 @@ def _card_size(size: str) -> tuple[int, int]:
     rows, cols = panel_size_cells(size)
     w_units = max(1, cols // 2)
     cw, _ch = _cell_size()
-    width = w_units * cw + (w_units - 1) * _GRID_GAP
+    width = w_units * cw + (w_units - 1) * GAP
     # Height = the SAME chrome the cell uses, around THIS size's figure (not a cell multiple) -> hug.
     height = scaled_px(CARD_TITLE_PX) + scaled_px(2) + panel_display_size(size)[1] + CARD_PAD
     return (width, height)
 
 
-def _slot_to_pos(row: int, col: int) -> tuple[int, int]:
-    # col -> the clean column grid (x); row IS the pixel y of the card top (heights are variable,
-    # so there is no fixed vertical cell -- cards free-stack and _compact resolves overlaps).
-    pitch_x, _pitch_y = _grid_pitch()
-    return (_GRID_GAP + int(col) * pitch_x, max(_GRID_GAP, int(row)))
+def _aabb(cfg) -> tuple[int, int, int, int]:
+    """The card's pixel AABB ``(x0, y0, x1, y1)`` -- top-left ``(col, row)`` plus its size."""
+    w, h = _card_size(cfg.size)
+    return (cfg.col, cfg.row, cfg.col + w, cfg.row + h)
 
 
-def _pos_to_slot(x: int, y: int) -> tuple[int, int]:
-    pitch_x, _pitch_y = _grid_pitch()
-    col = max(0, round((int(x) - _GRID_GAP) / pitch_x))
-    # vertical: snap the dropped pixel-y to the unit grid (NOT a cell row -- heights vary).  The
-    # tidy INTER-CARD gap is enforced separately by _compact (gap quantised to GRID_UNIT), so this
-    # is just drop feedback; the final spacing is always a clean multiple regardless of where dropped.
-    row = max(GRID_UNIT, int(round((int(y) - GRID_UNIT) / GRID_UNIT)) * GRID_UNIT + GRID_UNIT)
-    return int(row), int(col)
+def _overlaps_with_gap(box: tuple[int, int, int, int], placed) -> bool:
+    """True when ``box`` (an ``(x0, y0, x1, y1)`` AABB), EXPANDED by ``GAP`` on all sides, intersects
+    any already-placed card.  Equivalently: the clear distance between ``box`` and a placed card is
+    < GAP on the axis where they overlap, so leaving a card exactly GAP away counts as clear."""
+    x0, y0, x1, y1 = box
+    for p in placed:
+        px0, py0, px1, py1 = _aabb(p)
+        if x0 < px1 + GAP and px0 < x1 + GAP and y0 < py1 + GAP and py0 < y1 + GAP:
+            return True
+    return False
 
 
-def _columns_overlap(a, b) -> bool:
-    """True when two cards share at least one column (overlap horizontally)."""
-    return a.col < b.col + b.cols and b.col < a.col + a.cols
+def _gravity_slot(cfg, placed, board_w: int) -> tuple[int, int]:
+    """The TOP-MOST then LEFT-MOST pixel ``(col, row)`` where ``cfg``'s AABB sits clear of every
+    already-placed card (each separated by ``GAP``), inside the board margins and width.
+
+    Candidate points are GAP (the top-left origin) plus, for each placed card, the x just past its
+    right edge (``x1 + GAP``) and the y just past its bottom edge (``y1 + GAP``) -- the only places a
+    card can newly butt up against something -- and the placed cards' own left/top edges (so a card
+    can tuck under a wider one).  We sweep candidates by (y, then x) so gravity minimises y first
+    (rise to the top), then x (slide to the left), and take the first feasible one; a card-width
+    clamp keeps it inside ``board_w`` (or pins it at the left margin if it cannot fit)."""
+    w, _h = _card_size(cfg.size)
+    xs = {GAP}
+    ys = {GAP}
+    for p in placed:
+        px0, py0, px1, py1 = _aabb(p)
+        xs.add(px1 + GAP)
+        ys.add(py1 + GAP)
+        xs.add(px0)            # also align left edges, so a card can tuck under a wider one
+        ys.add(py0)
+    max_x = max(GAP, board_w - GAP - w)
+    cand_x = sorted(x for x in xs if GAP <= x <= max_x) or [GAP]
+    for y in sorted(ys):
+        for x in cand_x:
+            if not _overlaps_with_gap((x, y, x + w, y + _h), placed):
+                return (x, y)
+    # Defensive: no candidate fit (should not happen -- placing past the lowest card always clears).
+    bottom = max((py1 for *_rest, py1 in (_aabb(p) for p in placed)), default=0)
+    return (GAP, bottom + GAP if placed else GAP)
 
 
-def _compact(configs: Sequence["PanelConfig"], active: "PanelConfig | None" = None) -> bool:
-    """FREE-PLACEMENT grid layout: every card keeps the grid cell it sits on -- ANY
-    row/col, with empty cells ABOVE allowed -- and overlaps are the only thing
-    resolved.  Cards do NOT float up to the top: a panel dropped at row 3 with
-    nothing above it stays aligned at row 3 (that is the whole point of a grid).
+def _min_board_width(configs: Sequence["PanelConfig"]) -> int:
+    """The NARROWEST a board may pack to: one WIDEST card plus both GAP margins, and never narrower
+    than the cards' current right-extent.  A viewport thinner than this still has to fit the widest
+    card, so we clamp up to it (otherwise a card would have nowhere to go)."""
+    widest = max((_card_size(c.size)[0] for c in configs), default=_card_size("1x2")[0])
+    extent = max((_aabb(c)[2] for c in configs), default=0)
+    return max(widest + 2 * GAP, extent + GAP)
 
-    Overlaps are cleared by pushing the OTHER cards straight DOWN to rest JUST below
-    whatever they collide with (minimal displacement -- no gratuitous gaps, "尽量不留空
-    挤走").  The just-dropped ``active`` card is pinned at its slot and placed FIRST,
-    so the others reflow around it (it wins) instead of being pushed itself.
 
-    Earlier this pulled every card UP to the top (global gravity), which made a card
-    dropped below empty space snap back to row 0 -- wrong for a grid.  Returns True
-    when any card moved."""
+def _board_width(configs: Sequence["PanelConfig"]) -> int:
+    """A fallback packing width for callers without a live viewport (the pure-function tests): two
+    of the WIDEST card side by side plus the GAP margins, so cards CAN pack side by side.  The real
+    GUI passes the scroll viewport width to ``_compact`` instead, so the board wraps at the edge."""
+    widest = max((_card_size(c.size)[0] for c in configs), default=_card_size("1x2")[0])
+    return max(2 * widest + 3 * GAP, _min_board_width(configs))
+
+
+def _compact(configs: Sequence["PanelConfig"], active: "PanelConfig | None" = None,
+             board_w: int | None = None) -> bool:
+    """TOP-LEFT GRAVITY packer over pixel AABBs (#H3s-F8).  Every card floats UP then LEFT until it
+    is blocked by another card or the board edge; the clear distance to every neighbour and to the
+    top-left origin is a UNIFORM ``GAP`` on all four sides (there is NO column grid -- ``col`` is a
+    pixel x, ``row`` a pixel y).  So a card dropped low-right snaps up-left into the first free slot,
+    and cards pack side by side until the board (``board_w``, the live scroll-viewport width) is full.
+
+    Cards are placed in READING ORDER of their CURRENT positions -- ``(row, col)``, top-to-bottom
+    then left-to-right -- with the just-moved ``active`` card winning any TIE (it sorts first when it
+    shares a row/col with another, so it claims the contested slot and the others reflow around it).
+    Placing in reading order is what makes the layout STABLE and DETERMINISTIC: the drop point only
+    sets a card's reading-order rank, so dropping a card back where it was reproduces the previous
+    packing exactly, and a settled board is a fixed point (a second pass moves nothing -> False).
+
+    For each card we take the TOP-MOST then LEFT-MOST feasible slot (see ``_gravity_slot``): a card
+    with nothing above or left of it lands at exactly ``(GAP, GAP)``.  ``board_w`` defaults to a
+    two-wide fallback for headless callers.  Returns True if any card's ``(col, row)`` changed."""
 
     moved = False
     placed: list["PanelConfig"] = []
-    # ``row`` is a PIXEL y and heights are VARIABLE (each card hugs its plot), so overlap + push are
-    # measured in pixels: a card drops just below (its actual height) whatever it collides with.
-    def _h(cfg) -> int:
-        return _card_size(cfg.size)[1]
-    # active first (pinned), then the rest in reading order so an upper card is
-    # placed before a lower one it might push.
-    # ONE top-to-bottom pass does BOTH overlap-clearing AND gap-snapping, so ``placed`` always holds
-    # the FINAL positions of the cards above and the snap cascades correctly: a card pushed down (a
-    # bigger gap) shifts every card below it in the same pass.
-    for config in sorted(configs, key=lambda c: (0 if c is active else 1, c.row, c.col)):
-        target = config.row                          # keep your pixel-y (free placement)
-        if config is not active:
-            ch = _h(config)
-            # drop just below every already-placed card we would overlap; process blockers
-            # top-to-bottom so we settle on the lowest of an overlapping stack.
-            for blocker in sorted(placed, key=lambda b: b.row):
-                bh = _h(blocker)
-                if (_columns_overlap(config, blocker)
-                        and target < blocker.row + bh
-                        and blocker.row < target + ch):
-                    target = blocker.row + bh        # just below; the gap is added by the snap below
-        # TIDY SPACING: snap the gap to the card directly ABOVE in this column to an integer multiple
-        # of GRID_UNIT, so inter-panel spacing is uniform (k*GRID_UNIT) instead of an arbitrary
-        # leftover-pixel gap.  After a free drop a card's pixel-y is arbitrary and heights vary, so
-        # the raw gap below a card was any value; snapping it (>= one unit) keeps cards non-overlapping
-        # AND tidy.  A card with nothing above in its column keeps its row (free placement preserved).
-        above_bottom = max(
-            (b.row + _h(b) for b in placed if _columns_overlap(config, b) and b.row + _h(b) <= target),
-            default=None)
-        if above_bottom is not None:
-            target = above_bottom + _snap_gap(target - above_bottom)
-        if config.row != target:
-            config.row = target
+    # No live viewport -> a two-wide fallback so cards CAN pack side by side; a given viewport width
+    # is honoured but never below one-card-wide (a too-narrow viewport must still fit the widest card).
+    board_w = _board_width(configs) if board_w is None else max(board_w, _min_board_width(configs))
+    # Reading order (row, then col); the active card wins a tie so a card dropped ONTO another's slot
+    # claims it (the other reflows) instead of yielding -- a 0 sort key only on an exact coincidence.
+    order = sorted(configs, key=lambda c: (c.row, c.col, 0 if c is active else 1))
+    for config in order:
+        col, row = _gravity_slot(config, placed, board_w)
+        if (config.col, config.row) != (col, row):
+            config.col, config.row = col, row
             moved = True
         placed.append(config)
     return moved
@@ -1048,7 +1059,8 @@ def _unit_df_for(plotter):
 
 # ====================================================================== state
 class PanelConfig:
-    """One panel: kind + a size PRESET + the grid slot it is pinned to."""
+    """One panel: kind + a size PRESET + its pixel top-left on the board (``col`` = pixel x,
+    ``row`` = pixel y).  ``_compact`` re-packs these top-left under gravity (no column grid)."""
 
     def __init__(
         self,
@@ -1070,8 +1082,8 @@ class PanelConfig:
         panel_size_cells(size)              # validate against the limited preset list
         self.kind = str(kind)
         self.title = str(title)
-        self.row = max(0, int(row))
-        self.col = max(0, int(col))
+        self.row = max(0, int(row))    # pixel y of the card top-left (no column grid)
+        self.col = max(0, int(col))    # pixel x of the card top-left (no column grid)
         self.size = str(size)
         # The per-slot signal names (signal[0], signal[1], ...): one hub signal per input
         # slot of this plot kind.  Defaults to each slot's default signal so a freshly
@@ -1103,13 +1115,6 @@ class PanelConfig:
         self.params = dict(params or {})
         self.role = str(role)
 
-    # ``cols`` is the card's COLUMN SPAN (how many base-width columns it occupies); x snaps to this
-    # column grid and the overlap test uses it.  There is NO ``rows`` span: card HEIGHT hugs the plot
-    # (variable pixels), so ``row`` is a pixel y and the vertical layout works in pixels via _card_size.
-    @property
-    def cols(self) -> int:
-        return max(1, panel_size_cells(self.size)[1] // 2)
-
     @property
     def update_ms(self) -> int:
         """This panel's display refresh interval (ms), one of :data:`UPDATE_INTERVALS`.
@@ -1119,6 +1124,9 @@ class PanelConfig:
         return ms if ms in UPDATE_INTERVALS else DEFAULT_UPDATE_MS
 
     def to_dict(self) -> dict[str, object]:
+        # ``row``/``col`` are the card's pixel top-left (no column grid).  They are only a SEED for
+        # the gravity packer, which re-packs the whole board on load, so a layout's reading order
+        # (top-to-bottom, left-to-right) is what round-trips -- exact pixels are recomputed.
         return {
             "kind": self.kind,
             "title": self.title,
@@ -2060,11 +2068,13 @@ class PanelCard(FluentGroupBox):
         if self._drag_offset is not None:
             self._drag_offset = None
             self.setCursor(QtCore.Qt.OpenHandCursor)
-            row, col = _pos_to_slot(self.x(), self.y())
-            if (row, col) != (self.config.row, self.config.col):
-                self.config.row, self.config.col = row, col
+            # Record the raw drop pixel as this card's (col, row) seed; _compact then gravity-packs
+            # it top-left (it is the ``active`` card so it wins the spot nearest the drop point).
+            col, row = max(0, self.x()), max(0, self.y())
+            if (col, row) != (self.config.col, self.config.row):
+                self.config.col, self.config.row = col, row
                 self.changed.emit()
-            self.layout_changed.emit()      # snap (even back to the same slot)
+            self.layout_changed.emit()      # re-pack (even when dropped back near the same spot)
         super().mouseReleaseEvent(event)
 
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt naming
@@ -3976,13 +3986,15 @@ class _PanelBoard(QtWidgets.QWidget):
         self.setStyleSheet("background: transparent;")
 
     def arrange(self, cards: Sequence[PanelCard]) -> None:
+        # ``col``/``row`` ARE the card's pixel top-left (gravity-packed by _compact); place verbatim
+        # and reserve a GAP margin past the lowest-right card so the board scrolls cleanly.
         max_x = max_y = 0
         for card in cards:
-            x, y = _slot_to_pos(card.config.row, card.config.col)
+            x, y = card.config.col, card.config.row
             card.move(x, y)
             max_x = max(max_x, x + card.width())
             max_y = max(max_y, y + card.height())
-        self.setMinimumSize(max_x + _GRID_GAP, max_y + _GRID_GAP)
+        self.setMinimumSize(max_x + GAP, max_y + GAP)
 
 
 # ====================================================================== logic tab
@@ -4980,12 +4992,15 @@ class TaskConsole(QtWidgets.QWidget):
                 pass
 
     def _arrange(self) -> None:
-        # free placement: the just-dragged / resized card keeps the grid cell it was
-        # dropped on (any row, empty cells above allowed); only OTHER cards it overlaps
-        # are pushed straight down, minimally (see _compact).
+        # Top-left gravity pack (see _compact): every card floats UP then LEFT until blocked, with a
+        # uniform GAP on all four sides, wrapping at the live scroll-viewport width.  The just-dragged
+        # / resized card is the ``active`` one, so it wins a contested slot and the others reflow.
         active = self.sender()
         active_cfg = active.config if isinstance(active, PanelCard) and active in self.cards else None
-        if _compact([c.config for c in self.cards], active_cfg):
+        # The board fills the scroll viewport (setWidgetResizable), so the viewport width is how wide
+        # cards may pack before wrapping to the next row.
+        board_w = self.scroll.viewport().width() if hasattr(self, "scroll") else self.board.width()
+        if _compact([c.config for c in self.cards], active_cfg, board_w=board_w):
             self._mark_dirty()
         self.board.arrange(self.cards)
         self._update_summary()
@@ -5007,9 +5022,10 @@ class TaskConsole(QtWidgets.QWidget):
         # Otherwise a PLOT kind -> a BLANK pure-view panel on the Monitor board
         # (decoupled: it shows nothing until a signal is picked in its Setting).
         kind = data or "1d"
-        # Drop the new card just BELOW the current lowest card (pixel y, since heights vary).
-        next_y = max((c.config.row + _card_size(c.config.size)[1] + _GRID_GAP for c in self.cards),
-                     default=_GRID_GAP)
+        # Seed the new card just BELOW the current lowest card so it sorts LAST in reading order;
+        # _compact then gravity-packs it into the first free top-left slot (so it rises/slides in).
+        next_y = max((c.config.row + _card_size(c.config.size)[1] + GAP for c in self.cards),
+                     default=GAP)
         # Every panel gets a unique "<kind> #N" title (G1) so two of the same kind never share
         # one name in the card header / Edit tab / frame title.
         title = indexed_unique_name(PANEL_KINDS[str(kind)], {c.config.title for c in self.cards})

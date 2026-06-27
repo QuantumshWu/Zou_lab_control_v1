@@ -1,10 +1,10 @@
-"""Contract (#H3r-F6): inter-panel vertical spacing is always an integer multiple of GRID_UNIT.
+"""Contract (#H3s-F8): inter-panel spacing is a UNIFORM ``GAP`` on all four sides.
 
-The user disliked the old "random" spacing: a card's pixel-y was snapped, but card heights vary, so
-the GAP below a card was any leftover pixel value.  `_compact` now snaps every vertical inter-card
-gap (the distance from one card's bottom to the next card's top, in the same column) to a clean
-multiple of the single `GRID_UNIT` setting.  This guard fails if any placement path leaves a ragged
-gap, or if the spacing stops scaling with GRID_UNIT.
+The user dropped the column grid (#H3r had a column grid + a vertical-gap snap).  The board is now a
+pure pixel plane: ``_compact`` gravity-packs cards top-left and the clear distance between any two
+neighbours -- and the margin from the top-left origin -- is exactly the single ``GAP`` constant
+(which equals the horizontal inter-card gap the user liked).  This guard fails if any placement path
+leaves a ragged gap, or if the spacing stops scaling with the one ``GAP`` knob.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import Zou_lab_control.frontend.task_console as tc
 from Zou_lab_control.frontend.task_console import (
-    PANEL_KINDS, PanelConfig, _card_size, _columns_overlap, _compact, GRID_UNIT,
+    GAP, PANEL_KINDS, PanelConfig, _aabb, _card_size, _compact,
 )
 
 _KIND = sorted(PANEL_KINDS)[0]
@@ -25,46 +25,58 @@ def _stack(rows, col=0, size="2x2"):
     return [PanelConfig(kind=_KIND, row=r, col=col, size=size) for r in rows]
 
 
-def _in_column_gaps(cfgs):
+def _one_col(size="2x2"):
+    """A board width that fits exactly ONE card of ``size`` (+ both GAP margins), forcing a stack."""
+    return _card_size(size)[0] + 2 * GAP
+
+
+def _stacked_gaps(cfgs):
+    """Vertical gaps between cards that end up stacked in the same x-column after packing."""
     cfgs = sorted(cfgs, key=lambda c: c.row)
     gaps = []
     for a, b in zip(cfgs, cfgs[1:]):
-        if _columns_overlap(a, b):
-            gaps.append(b.row - (a.row + _card_size(a.size)[1]))
+        ax0, _ay0, ax1, ay1 = _aabb(a)
+        bx0, by0, bx1, _by1 = _aabb(b)
+        if ax0 < bx1 and bx0 < ax1:                 # share an x-column -> stacked
+            gaps.append(by0 - ay1)
     return gaps
 
 
-def test_vertical_gaps_are_multiples_of_grid_unit():
-    cfgs = _stack([5, 137, 281, 410])      # arbitrary pixel rows in one column
-    _compact(cfgs)
-    gaps = _in_column_gaps(cfgs)
-    assert gaps, "expected stacked cards to share a column"
+def test_stacked_gaps_are_exactly_one_gap():
+    """Several cards on a one-card-wide board stack one ``GAP`` apart (uniform, never ragged)."""
+    cfgs = _stack([5, 137, 281, 410])               # arbitrary pixel rows in one column
+    _compact(cfgs, board_w=_one_col())              # board fits one column -> they stack
+    gaps = _stacked_gaps(cfgs)
+    assert gaps, "expected the cards to stack in one column"
     for gap in gaps:
-        assert gap >= 0, "cards must not overlap"
-        assert gap % GRID_UNIT == 0, f"inter-panel gap {gap} is not a multiple of GRID_UNIT={GRID_UNIT}"
+        assert gap == GAP, f"stacked gap {gap} != the uniform GAP {GAP}"
 
 
-def test_two_columns_are_independent_but_each_tidy():
-    cfgs = _stack([10, 200], col=0) + _stack([55, 333], col=2)
+def test_top_left_margin_is_one_gap():
+    """The top-most/left-most card sits exactly ``GAP`` from the (0, 0) origin on both axes."""
+    cfgs = _stack([5, 137, 281])
     _compact(cfgs)
-    for gap in _in_column_gaps(cfgs):
-        assert gap % GRID_UNIT == 0
+    top_left = min(cfgs, key=lambda c: (c.row, c.col))
+    assert (top_left.col, top_left.row) == (GAP, GAP)
 
 
-def test_changing_grid_unit_rescales_spacing(monkeypatch):
-    # GRID_UNIT is the ONE knob: snap to it and every gap becomes a multiple of the new value.
-    monkeypatch.setattr(tc, "GRID_UNIT", 25)
+def test_changing_gap_rescales_spacing(monkeypatch):
+    """GAP is the ONE knob: retune it and every margin + inter-card gap follows."""
+    monkeypatch.setattr(tc, "GAP", 25)
     cfgs = _stack([7, 190, 360])
+    _compact(cfgs, board_w=_one_col())              # one column -> stacked, gaps follow the new GAP
+    top_left = min(cfgs, key=lambda c: (c.row, c.col))
+    assert (top_left.col, top_left.row) == (25, 25)            # margin = retuned GAP
+    for gap in _stacked_gaps(cfgs):
+        assert gap == 25, f"stacked gap {gap} != the retuned GAP 25"
+
+
+def test_side_by_side_cards_one_gap_apart():
+    """Two narrow cards that DO fit side by side end up one ``GAP`` apart horizontally (the user's
+    'horizontal minimal gap'), both at the top margin."""
+    cfgs = _stack([5, 9], size="1x2")               # 1x2 is the base width -> two fit on one row
     _compact(cfgs)
-    cfgs.sort(key=lambda c: c.row)
-    for a, b in zip(cfgs, cfgs[1:]):
-        if _columns_overlap(a, b):
-            gap = b.row - (a.row + _card_size(a.size)[1])
-            assert gap % 25 == 0, f"gap {gap} not a multiple of the retuned unit 25"
-
-
-def test_snap_gap_rounds_to_unit_and_floors_at_one_unit():
-    assert tc._snap_gap(0) == GRID_UNIT
-    assert tc._snap_gap(GRID_UNIT * 3) == GRID_UNIT * 3
-    assert tc._snap_gap(GRID_UNIT * 2 + 1) == GRID_UNIT * 2     # rounds down
-    assert tc._snap_gap(-5) == GRID_UNIT                        # never negative/zero
+    cfgs.sort(key=lambda c: c.col)
+    left, right = cfgs
+    assert left.row == right.row == GAP
+    assert right.col - (left.col + _card_size(left.size)[0]) == GAP

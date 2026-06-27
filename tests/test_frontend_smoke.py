@@ -1215,37 +1215,34 @@ def test_embedded_canvas_invariants_across_screen_scales(scale_factor):
     assert "DPR-INVARIANTS-OK" in result.stdout, result.stdout + result.stderr
 
 
-def test_task_console_drag_snaps_to_grid(monkeypatch):
-    """Dropping a card snaps it to the half-card pitch grid and records the slot
-    in the config (so the layout JSON round-trips drag positions)."""
+def test_task_console_drag_records_drop_then_gravity_packs(monkeypatch):
+    """Dropping a card records its raw pixel drop point into the config and ``_compact`` gravity-packs
+    it top-left (no column grid).  Dropping it low-right snaps it back UP-LEFT into a clean slot, and
+    a moved panel is an unsaved edit (so the layout JSON round-trips the resulting placement)."""
 
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from PyQt5 import QtCore
     from Zou_lab_control.frontend import devtools as dt
-    from Zou_lab_control.frontend.task_console import _pos_to_slot, _slot_to_pos
+    from Zou_lab_control.frontend.task_console import GAP
 
     console = dt.demo_console(shots=3)
     card = console.cards[1]                       # the 1x2 distribution panel
-    # Drop into a clearly FREE column (past every other card's column span) at a pixel y of 200;
-    # x snaps to the column grid, y free-stacks (snapped to the tidy quantum).  Nudge a few px off.
-    free_col = max((c.config.col + c.config.cols for c in console.cards if c is not card), default=0)
-    target_x, target_y = _slot_to_pos(200, free_col)
-    card.move(target_x + 3, target_y - 3)
+    # Drag it far to the LOW-RIGHT; on release the board gravity-packs every card up + left.
+    card.move(900, 700)
     card._drag_offset = QtCore.QPoint(1, 1)       # as if a drag was in flight
     class _Ev:                                    # minimal release-event stand-in
         def button(self): return QtCore.Qt.LeftButton
         def pos(self): return QtCore.QPoint(1, 1)
     try:
         card.mouseReleaseEvent(_Ev())
-    except TypeError:                             # super() needs a real QEvent; snap already ran
+    except TypeError:                             # super() needs a real QEvent; the re-pack already ran
         pass
-    # FREE placement: the dropped card snaps to its column + the nearest vertical quantum and STAYS
-    # there (empty space above is allowed); it is NOT pulled up to the top.
-    assert card.config.col == free_col
-    assert card.config.row == 200                 # pixel y, snapped to the quantum
-    assert (card.x(), card.y()) == _slot_to_pos(200, free_col)
-    assert _pos_to_slot(*_slot_to_pos(200, 3)) == (200, 3)   # column + pixel-y round-trip
+    # GRAVITY: every card sits at >= GAP from the origin and the board packed top-left (no card is
+    # left stranded at the low-right drop point).
+    for c in console.cards:
+        assert c.config.col >= GAP and c.config.row >= GAP
+    assert min(c.config.row for c in console.cards) == GAP        # something rose to the top margin
     assert console.save_button.is_dirty()         # a moved panel is an unsaved edit
     console.shutdown()
 
@@ -1276,60 +1273,53 @@ def test_fluent_auto_scale_is_shared_between_guis(monkeypatch):
         set_fluent_scale(1.0)
 
 
-def test_task_console_layout_is_free_placement():
-    """The board auto-layout is FREE PLACEMENT (``_compact``): a card keeps the grid CELL it
-    sits on -- ANY row, with empty cells ABOVE allowed -- and the ONLY thing resolved is
-    overlaps, by pushing the OTHER cards straight DOWN to rest just below what they collide
-    with (minimal displacement).  Cards do NOT float up to the top.  The dropped (``active``)
-    card is pinned, so it wins and the others reflow around it.
+def test_task_console_layout_is_top_left_gravity():
+    """The board auto-layout is TOP-LEFT GRAVITY (``_compact``, #H3s-F8): every card floats UP then
+    LEFT until blocked, separated from neighbours and the origin by a uniform ``GAP`` on all four
+    sides.  A card dropped low-right snaps up-left; the dropped (``active``) card wins a contested
+    slot and the others reflow; a settled board is a fixed point.
 
     Pure-function contract (PanelConfig has no Qt), so it does NOT pull in the flaky
     demo_console GUI fixture."""
 
-    from Zou_lab_control.frontend.task_console import (
-        PanelConfig, _GRID_GAP, _card_size, _columns_overlap, _compact)
-
-    def _h(cfg):                                 # the card's actual pixel height (heights vary now)
-        return _card_size(cfg.size)[1]
+    from Zou_lab_control.frontend.task_console import GAP, PanelConfig, _aabb, _card_size, _compact
 
     def no_overlap(cfgs):
         for i, a in enumerate(cfgs):
             for b in cfgs[i + 1:]:
-                if _columns_overlap(a, b):
-                    assert not (a.row < b.row + _h(b) and b.row < a.row + _h(a)), (a.title, b.title)
+                ax0, ay0, ax1, ay1 = _aabb(a)
+                bx0, by0, bx1, by1 = _aabb(b)
+                assert not (ax0 < bx1 and bx0 < ax1 and ay0 < by1 and by0 < ay1), (a.title, b.title)
 
-    g = _GRID_GAP
-    # (1) drop a card onto an occupied column at the same pixel y: active keeps its y, the other is
-    #     pushed JUST below it -- by the active card's ACTUAL pixel height (+ a gap), no overlap.
-    a = PanelConfig(kind="2d", title="A", row=g, col=0, size="2x2")
-    b = PanelConfig(kind="2d", title="B", row=g, col=0, size="2x2")   # dropped onto A
+    g = GAP
+    # (1) a card dropped LOW-RIGHT snaps UP-LEFT to the origin (gravity); on an empty board -> (g, g).
+    a = PanelConfig(kind="2d", title="A", row=700, col=900, size="2x2")
+    assert _compact([a], active=a) is True
+    assert (a.col, a.row) == (g, g)
+
+    # (2) drop a second card ONTO the first's slot: the active card WINS it, the other reflows below
+    #     by exactly one GAP past the active card's ACTUAL height; no overlap.
+    a = PanelConfig(kind="2d", title="A", row=g, col=g, size="2x2")
+    b = PanelConfig(kind="2d", title="B", row=g, col=g, size="2x2")   # dropped onto A
     _compact([a, b], active=b)
-    assert (b.row, b.col) == (g, 0)            # the dragged card wins its position
-    assert a.row == b.row + _h(b) + g           # pushed strictly below B (by B's real height)
+    assert (b.col, b.row) == (g, g)             # the dragged card wins the contested slot
+    assert a.row == b.row + _card_size(b.size)[1] + g   # other pushed one GAP below B's real height
     no_overlap([a, b])
 
-    # (2) FREE placement: a card sitting below empty space STAYS there (no float-up) --
-    #     the board does not pull it to the top, and _compact reports no move.
-    x = PanelConfig(kind="1d", title="X", row=g, col=0, size="1x2")
-    y_top = g + _h(x) + g + 200                 # clearly below X with empty space above
-    y = PanelConfig(kind="1d", title="Y", row=y_top, col=0, size="1x2")
-    assert _compact([x, y]) is False
-    assert (x.row, y.row) == (g, y_top)        # Y keeps its y -- empty above is allowed
+    # (3) a settled board is a FIXED POINT: re-packing moves nothing.
+    cfgs = [PanelConfig(kind="1d", title=t, row=r, col=c, size="2x2")
+            for t, r, c in (("P", 5, 300), ("Q", 260, 20), ("R", 88, 640), ("S", 500, 120))]
+    _compact(cfgs)
+    no_overlap(cfgs)
+    assert _compact(cfgs) is False
 
-    # (3) drop active onto a card with empty space above: active keeps its (non-zero) y, the other
-    #     is pushed JUST below it (minimal -- not to the top, no gratuitous gap).
-    occ = PanelConfig(kind="1d", title="occ", row=300, col=0, size="1x2")
-    drop = PanelConfig(kind="1d", title="drop", row=300, col=0, size="1x2")
-    assert _compact([occ, drop], active=drop) is True
-    assert drop.row == 300                      # the dropped card stays where dropped (empty above)
-    assert occ.row == drop.row + _h(drop) + g   # displaced just below it (minimal push)
-    no_overlap([occ, drop])
-
-    # (4) independent columns keep their own y (no false collisions, no float-up).
-    left = PanelConfig(kind="1d", title="L", row=400, col=0, size="1x2")
-    right = PanelConfig(kind="1d", title="R", row=900, col=PanelConfig(kind="1d", size="1x2").cols, size="1x2")
-    assert _compact([left, right]) is False
-    assert left.row == 400 and right.row == 900
+    # (4) two narrow cards pack SIDE BY SIDE one GAP apart on the top row (the user's horizontal gap).
+    left = PanelConfig(kind="1d", title="L", row=5, col=0, size="1x2")
+    right = PanelConfig(kind="1d", title="R", row=9, col=0, size="1x2")
+    _compact([left, right])
+    left, right = sorted([left, right], key=lambda c: c.col)
+    assert left.row == right.row == g
+    assert right.col - (left.col + _card_size(left.size)[0]) == g
     no_overlap([left, right])
 
 
@@ -1358,21 +1348,20 @@ def test_task_console_cards_are_modular(monkeypatch):
     from Zou_lab_control.frontend.live import panel_display_size, panel_size_cells
     from Zou_lab_control.frontend.style import DESIGN_DPI
     # The card's FORMAT (chrome + content padding) is owned by the component library (qt_fluent);
-    # the console only sizes the CELLS the cards tile.
-    from Zou_lab_control.frontend.task_console import _GRID_GAP, _card_size, _cell_size
+    # the console only sizes the cards.
+    from Zou_lab_control.frontend.task_console import GAP, _card_size, _cell_size
 
-    # Cards tile a CLEAN GRID whose cell is the base 1x2 panel: every card is a whole number of
-    # cells (rows tall x cols//2 wide), so same-size cards are identical, cards tile with exactly
-    # one _GRID_GAP between them, and the card always holds the design-size canvas.
-    cw_cell, ch_cell = _cell_size()
+    # Card WIDTH tiles on the base 1x2 width (cols//2 base widths joined by one GAP), so same-size
+    # cards are identical and the card always holds the design-size canvas.  HEIGHT HUGS the plot
+    # (no cell-multiple), so it is just tall enough for the figure + chrome (no blank padding).
+    cw_cell, _ch_cell = _cell_size()
     for size in ("1x2", "2x2", "1x4", "2x4", "4x4"):
         cw, ch = _card_size(size)
         pw, ph = panel_display_size(size)
-        rows, cols = panel_size_cells(size)
-        w_units, h_units = cols // 2, rows
-        assert cw == w_units * cw_cell + (w_units - 1) * _GRID_GAP   # whole cells wide + gaps
-        assert ch == h_units * ch_cell + (h_units - 1) * _GRID_GAP   # whole cells tall + gaps
-        assert cw >= pw and ch >= ph                                 # card always holds the plot
+        cols = panel_size_cells(size)[1]
+        w_units = max(1, cols // 2)
+        assert cw == w_units * cw_cell + (w_units - 1) * GAP        # whole base widths + gaps
+        assert cw >= pw and ch >= ph                                # card always holds the plot
 
     console = dt.demo_console(shots=3)
     for card in console.cards:
