@@ -2989,10 +2989,14 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         Defensive by contract: no sequencer attached, or a sequencer without a ``scan_progress``
         method, or any error reading it -> the label blanks and the poll never throws (a transient
         device/network blip must not crash the GUI timer).  ``_format_scan_progress`` is the SINGLE
-        source of the text (blank when idle)."""
+        source of the text (blank when idle).  Only POLLS when the Scan tab is the current view: the
+        label lives there, and ``scan_progress`` is a real RPC round-trip on a remote sequencer, so a
+        background tab (Edit/Preview) must not keep hitting the network 5x/s for an unseen label."""
         label = getattr(self, "scan_progress_label", None)
         if label is None:
             return
+        if getattr(self, "tabs", None) is not None and self.tabs.currentWidget() is not getattr(self, "scan_tab", None):
+            return                                       # Scan tab not visible -> skip the RPC poll
         sequencer = getattr(self, "sequencer", None)
         progress = None
         reader = getattr(sequencer, "scan_progress", None)

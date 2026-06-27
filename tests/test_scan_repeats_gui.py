@@ -133,6 +133,7 @@ def test_scan_repeats_default_is_zero_forever(_app):
 # ---- the live progress poll is defensive (no sequencer / no method -> blank, never raises) ------
 def test_poll_scan_progress_blank_without_sequencer(_app):
     ed = _pulse_editor()
+    ed.tabs.setCurrentWidget(ed.scan_tab)             # Scan tab visible -> the poll actually runs
     ed.sequencer = None
     ed._poll_scan_progress()                          # must not raise
     assert ed.scan_progress_label.text() == ""
@@ -141,6 +142,7 @@ def test_poll_scan_progress_blank_without_sequencer(_app):
 def test_poll_scan_progress_reads_connected_sequencer(_app):
     """With a sequencer reporting a mid-sweep scan, the poll writes the real progress text."""
     ed = _pulse_editor()
+    ed.tabs.setCurrentWidget(ed.scan_tab)             # Scan tab visible -> the poll actually runs
 
     class _FakeSeq:
         def scan_progress(self):
@@ -151,10 +153,28 @@ def test_poll_scan_progress_reads_connected_sequencer(_app):
     assert ed.scan_progress_label.text() == "Scan: point 2 / 3 · sweep 1 / 2"
 
 
+def test_poll_scan_progress_skips_rpc_when_scan_tab_hidden(_app):
+    """The poll must NOT call scan_progress() (a remote-sequencer RPC) when the Scan tab is not the
+    current view -- the label lives there, so a background tab must not keep hitting the network."""
+    ed = _pulse_editor()
+    ed.tabs.setCurrentWidget(ed.edit_tab)             # NOT the Scan tab
+
+    class _CountingSeq:
+        calls = 0
+        def scan_progress(self):
+            type(self).calls += 1
+            return {"scanning": True, "point": 0, "n_points": 3, "sweep": 0, "n_repeats": 0}
+
+    ed.sequencer = _CountingSeq()
+    ed._poll_scan_progress()
+    assert _CountingSeq.calls == 0                    # gated: no RPC while the Scan tab is hidden
+
+
 def test_poll_scan_progress_swallows_reader_errors(_app):
     """A sequencer whose scan_progress() raises (a device/network blip) must not crash the timer;
     the label just blanks."""
     ed = _pulse_editor()
+    ed.tabs.setCurrentWidget(ed.scan_tab)             # Scan tab visible -> the poll actually calls in
 
     class _BoomSeq:
         def scan_progress(self):

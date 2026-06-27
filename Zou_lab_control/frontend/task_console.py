@@ -1134,12 +1134,13 @@ def _gravity_slot(cfg, placed, board_w: int) -> tuple[int, int]:
 
 
 def _min_board_width(configs: Sequence["PanelConfig"]) -> int:
-    """The NARROWEST a board may pack to: one WIDEST card plus both GAP margins, and never narrower
-    than the cards' current right-extent.  A viewport thinner than this still has to fit the widest
-    card, so we clamp up to it (otherwise a card would have nowhere to go)."""
+    """The NARROWEST a board may pack to: one WIDEST card plus both GAP margins.  A viewport thinner
+    than this still has to fit the widest card, so we clamp up to it -- but NOT to the cards' current
+    right-extent: clamping to the extent would RATCHET (once cards spread wide the board could never
+    pack narrower), so narrowing the window would never reflow into a single column.  At one-card
+    width the gravity packer simply stacks every card in one column, which is the correct reflow."""
     widest = max((_card_size(c.size)[0] for c in configs), default=_card_size("1x2")[0])
-    extent = max((_aabb(c)[2] for c in configs), default=0)
-    return max(widest + 2 * GAP, extent + GAP)
+    return widest + 2 * GAP
 
 
 def _board_width(configs: Sequence["PanelConfig"]) -> int:
@@ -4581,6 +4582,12 @@ class TaskConsole(QtWidgets.QWidget):
         self.board = _PanelBoard()
         self.scroll.setWidget(self.board)
         dash_layout.addWidget(self.scroll, 1)
+        # Re-pack the gravity board when the viewport WIDTH changes (window resized): cards wrap at
+        # the live viewport width, so narrowing the window must reflow them into fewer columns (else
+        # they would just clip behind a horizontal scrollbar).  Watch the viewport's resize via an
+        # event filter and re-arrange only on an actual width change (no-op recursion guard).
+        self._board_view_w = 0
+        self.scroll.viewport().installEventFilter(self)
         self.tabs.add_permanent_tab(dash_tab, "Monitor")
 
         # Logic tab: a scrolled top-packed column of LogicNodeRow cards.
@@ -5161,6 +5168,18 @@ class TaskConsole(QtWidgets.QWidget):
                 hook()
             except Exception:
                 pass
+
+    def eventFilter(self, obj, event):  # noqa: N802 - Qt naming
+        # Re-pack the gravity board when its scroll viewport WIDTH changes (window resized): cards
+        # wrap at the viewport width, so narrowing must reflow them into fewer columns rather than
+        # clip behind a horizontal scrollbar.  Guard on an actual width change (no redundant packs).
+        if (getattr(self, "scroll", None) is not None and obj is self.scroll.viewport()
+                and event.type() == QtCore.QEvent.Resize):
+            w = self.scroll.viewport().width()
+            if w != getattr(self, "_board_view_w", 0) and getattr(self, "cards", None):
+                self._board_view_w = w
+                self._arrange()
+        return super().eventFilter(obj, event)
 
     def _arrange(self) -> None:
         # Top-left gravity pack (see _compact): every card floats UP then LEFT until blocked, with a

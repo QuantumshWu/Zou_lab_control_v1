@@ -24,8 +24,20 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
 from Zou_lab_control.frontend.task_console import (
-    GAP, PanelConfig, _aabb, _card_size, _compact,
+    GAP, PanelConfig, _aabb, _card_size, _compact, _min_board_width,
 )
+
+
+def test_narrow_viewport_reflows_to_single_column():
+    """A narrowed viewport must reflow a side-by-side layout into a single column (the board-width
+    must NOT ratchet to the cards' current right-extent, else narrowing could never re-pack)."""
+    cfgs = [PanelConfig(kind="1d", col=0, row=0, size="1x2"),
+            PanelConfig(kind="1d", col=0, row=0, size="1x2")]
+    _compact(cfgs, board_w=4000)                          # wide: pack side by side
+    assert len({c.col for c in cfgs}) == 2, "wide board should place the two cards in two columns"
+    _compact(cfgs, board_w=_min_board_width(cfgs))        # narrow to one-card width
+    assert len({c.col for c in cfgs}) == 1, "narrow board must reflow both cards to a single column"
+    assert len({c.row for c in cfgs}) == 2, "and stack them vertically"
 
 ensure_qt_app()                       # _card_size reads scaled_px (needs the QApplication)
 
