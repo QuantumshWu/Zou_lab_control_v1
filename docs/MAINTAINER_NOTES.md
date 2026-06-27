@@ -1065,7 +1065,16 @@ They split into two tiers by WHERE the per-point reduce lives, NOT by being diff
   `build_temperature_scan` / `build_detection_scan` are 3-line callers). The reducer is inline here
   *on purpose*: survival needs a TWO-FRAME pair from one loading and fidelity needs the per-frame
   Otsu split — both depend on the multi-frame `ShotPlan` STRUCTURE a generic single-frame processor
-  cannot see.
+  cannot see. **The pulse is SELECTABLE** (#H3u-4): `Temperature` exposes a `template` ParamDecl
+  defaulting to the shipped `pulses/release_recapture.json` (editable in the pulse GUI), whose trap-off
+  duration slot `s0` is the swept axis — the same "pick a pulse" entry the generic `pulse_scan` has, so
+  temperature is *visibly* a pulse-scan; only its reduce stays coupled. `temperature.py`
+  `_resolve_release_recapture_template` maps the template's role channels onto the session sequencer
+  (virtual roles / real `ch00..`) via `imaging_channel_kwargs`. The spec carries
+  `metadata["scan_tier"]="coupled"` (the single source the boundary test + docs read) and NO
+  `"node":"pulse_scan"` key, so the console builds it as a plain `ScannedMeasurementNode`.
+  `Readout-duration` sweeps the CAMERA exposure (a camera setting, not a pulse-duration slot), so it
+  has no pulse-template step — its coupling is the per-point Otsu frame SET.
 - **Decoupled tier — `PulseScanNode` (y from a separate processor's signal, §20).** The GUI
   `pulse_scan` sweeps named pulse slots exactly the same way, but instead of an inline reducer it
   PUBLISHES the raw frames and reads y from another running node's signal via a `signal_expr`
@@ -1125,17 +1134,17 @@ per-point data. `LogicNode` declares `points_shape`/`data_shape` (default `()`);
 | 1-D scan | `(n_points,)` | `(dim,)` | `(repeat, n_points, dim)` |
 | 2-D scan | `(n0*n1,)` (param1×param2) | `(1,)` | `(repeat, n0*n1, 1)` (+ `_grid` reshape) |
 
-`repeat` is a **measurement** param: the Acquisition `Repeat` int + `Free-run` bool switch, declared
-ONCE in `_acquisition_param_decls(free_run_default)` and **auto-injected** through the SAME
-`_rebuild_form` as every param (never a hand-placed widget, never a magic spinbox value).
-`_repeat_value(values)` → **`(repeat:int, free_run:bool)`**: `repeat` is ALWAYS the user's integer =
-the ring DEPTH (how many passes/photos are kept and **averaged**); `free_run` ONLY toggles
-STOP-after-`repeat` (False) vs keep ROLLING that `repeat`-deep ring forever (True) — it NEVER discards
-the user's number (so `repeat=20` averages 20 whether or not it free-runs; the old `inf→REPEAT_RING=10`
-that silently ignored the user's count is gone). A scan re-runs the whole sweep `repeat` times; a
-**camera takes exactly `repeat` photos then FINISHES** when not free-running. **A camera defaults to
-Free-run** (a live monitor streams continuously); turn it OFF + set Repeat for a finite N-photo
-exposure. `frame` = the `(repeat, 1, H, W)` block itself; `frame_i` stay the single per-trigger images
+`repeat` is the **ONE measurement** param, **0 = ∞** (#H3u-2): the Acquisition `Repeat (0 = ∞)` int,
+declared ONCE in `_acquisition_param_decls(repeat_default)` and **auto-injected** through the SAME
+`_rebuild_form` as every param (never a hand-placed widget). There is **NO separate Free-run toggle** —
+0 IS infinite, the same semantics everywhere (and the same as the scan-repeat count). `_repeat_value(values)`
+→ **`int`**: `repeat=K>0` keeps a K-deep block (K passes/photos **averaged**) then **STOPS**; `repeat=0`
+rolls a **1-deep ring forever** (a live monitor showing the latest). The kept block depth is
+`_ring = max(1, repeat)` (K for finite, 1 for ∞). A scan re-runs the whole sweep `repeat` times; a
+**camera takes exactly `repeat` photos then FINISHES** (or rolls forever at 0). **Per-type default:** a
+camera defaults to `0` (∞, a live monitor); a scan defaults to `1` (one finite sweep) — the node ctor
+defaults mirror the GUI form defaults so a headless `run_to_completion()` terminates. `frame` = the
+`(repeat, 1, H, W)` block itself (`repeat`=`_ring`); `frame_i` stay the single per-trigger images
 (`OccupancyProcessor` reduces a >2-D `frame` to its newest filled (H,W) slice for the per-shot judge).
 **Two-cameras fix:** the built node's `instance_label` is set to its row TITLE, so its provider label
 matches the declared row (the empty-prefix camera no longer shows `frame` under both "camera" and
@@ -1396,10 +1405,10 @@ There are EXACTLY TWO repeat knobs in the whole pipeline — never three. The de
 to add a processor-side mode.
 
 1. **ACQUIRE-FILL (measurement layer).** Every acquiring `Measurement` OWNS the repeat axis and
-   FILLS a `(repeat, *points_shape, *data_shape)` BLOCK in `shot()` (the camera ring; a scan's raw
-   block). Driven by two user fields, auto-injected as acquisition ParamDecls: `repeat:int` (ring
-   depth = how many shots to keep & average) and `free_run:bool` (roll-forever vs stop-after-N). The
-   measurement NEVER collapses the repeat axis.
+   FILLS a `(ring, *points_shape, *data_shape)` BLOCK in `shot()` (the camera ring; a scan's raw
+   block) where `ring = max(1, repeat)`. Driven by ONE user field, auto-injected as an acquisition
+   ParamDecl: `repeat:int`, **0 = ∞** (#H3u-2) — `K>0` keeps K shots & averages then stops; `0` rolls
+   a 1-deep ring forever. No separate free-run toggle. The measurement NEVER collapses the repeat axis.
 2. **DISPLAY-COLLAPSE (plot layer).** The plot collapses the repeat axis FOR DISPLAY ONLY via
    `repeat_mode` (`live.reduce_repeat`, modes `average/add/replace/roll/create`). Stored data is
    never mutated; this is the SINGLE place a repeat axis is collapsed.
@@ -1537,7 +1546,7 @@ contract test — the single mechanical guard. Change the framework = change the
   from `shot()`, so ANY measurement (incl. a future one) that mis-shapes its block (forgets the
   repeat axis, sets only one of points/data shape) fails LOUD at publish, not as a wrong plot.
   Guard: `tests/test_measurement_output_contract.py`. (The full ring/pass de-dup across the three
-  acquiring nodes is intentionally NOT done — the per-pass NaN-clear + free-run roll are
+  acquiring nodes is intentionally NOT done — the per-pass NaN-clear + the `repeat=0`=∞ roll are
   data-correctness logic that must be reproduced on real frames, not refactored blind.)
 - **UI param injection** — `frontend/param_widgets.py::ParamWidgetHandler` (ABC, 5 abstractmethods:
   build/read/write/is_empty/refresh) + `PARAM_WIDGETS[kind]`. The measurement form, plot Setting,
