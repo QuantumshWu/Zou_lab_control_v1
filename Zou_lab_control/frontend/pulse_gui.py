@@ -2537,7 +2537,11 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 if str(slot.target).lstrip("-").isdigit() and 0 <= int(slot.target) < n:
                     out.append(slot)
             elif slot.kind == "delay":
-                if slot.target in self.state.channels:
+                # A delay target is a channel OR a DAC bus (a bus owns one delay fanned out to its
+                # members) -- the SAME rule the validator uses.  Checking only ``channels`` dropped
+                # every bus-delay api slot on each read_state rebuild, so the dot could never toggle
+                # OFF (each click saw "no slot" -> re-bound) and only one bus could ever hold a slot.
+                if self.state.is_delay_target(slot.target):
                     out.append(slot)
             elif slot.kind == "dac":
                 _, _, period = str(slot.target).partition("@")

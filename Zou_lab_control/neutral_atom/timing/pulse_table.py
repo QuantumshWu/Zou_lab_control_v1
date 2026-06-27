@@ -900,6 +900,14 @@ class PulseTableState:
         self._validate_api_slots()
         return self
 
+    def is_delay_target(self, target: str) -> bool:
+        """True if ``target`` names a valid DELAY field: a single channel OR a DAC bus (a bus owns
+        ONE delay that fans out to its members).  The ONE source both the validator AND the GUI's
+        api-slot carry use -- so a bus-delay api slot is never wrongly dropped on a state rebuild
+        (dropping it made the dot impossible to toggle OFF and let only one bus ever hold a slot)."""
+        t = str(target)
+        return t in self.channels or t in self.bus_channels(min_width=1)
+
     def _validate_api_slots(self) -> None:
         # Names are UNIQUE within a state (one handle = one field).  The GUI's per-cell dot
         # allocates a fresh ``a<N>`` each time, so duplicates only ever arise from a hand-edited
@@ -922,7 +930,7 @@ class PulseTableState:
                 # A delay target is a single channel OR a DAC bus (a bus owns a delay that
                 # fans out to its members) -- both are valid, exactly the symmetry the user
                 # asked for; anything else is a typo / stale config and fails loud.
-                if slot.target not in self.channels and slot.target not in known_buses:
+                if not self.is_delay_target(slot.target):
                     raise ValueError(f"api slot {slot.name!r} binds delay of unknown channel/bus {slot.target!r}.")
             elif slot.kind == "dac":
                 bus, _, period = slot.target.partition("@")
