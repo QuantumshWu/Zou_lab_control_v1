@@ -425,24 +425,9 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
         self._table_box.setContentsMargins(0, 0, 0, 0)
         self._table_box.setSpacing(scaled_px(6, minimum=4))
         self._box.addLayout(self._table_box)
-        # Whole-sweep count (#3): how many times to repeat the ENTIRE point-by-point sweep before
-        # stopping (0 = sweep forever, the default; K = K whole sweeps then stop).  PERSISTENT -- it
-        # lives directly on _box (not _api_box / _table_box), so it survives a mode switch + an
-        # api-row rebuild (neither _drop_layout target touches it).  ORTHOGONAL to the camera-frame
-        # ``repeat`` / ``free_run`` (a different axis injected by the console): this counts SWEEPS of
-        # the whole scan; those count frames kept/averaged per point.  Carried in
-        # values_dict["scan_repeats"]; consumed by the pulse-scan measurement (PulseScanNode).
-        self._scan_repeats_spin = FluentDoubleSpinBox(length=5, allow_minus=False)
-        self._scan_repeats_spin.setDecimals(0)
-        self._scan_repeats_spin.setRange(0, 999)
-        self._scan_repeats_spin.setValue(0)
-        self._scan_repeats_spin.setToolTip(
-            "How many WHOLE scan sweeps to play before stopping.  0 = sweep forever (the default); "
-            "K ≥ 1 = K full sweeps then stop.  Orthogonal to the camera-frame Repeat (which counts "
-            "frames kept per point) -- this counts sweeps of the whole scan.")
-        self._scan_repeats_spin.valueChanged.connect(self.changed)
-        self._box.addWidget(FluentSettingRow("Scan repeats (0 = ∞)", self._scan_repeats_spin,
-                                             label_width=setting_label_width(["Scan repeats (0 = ∞)"])))
+        # The whole-sweep count is the measurement's auto-injected ``Repeat (0 = ∞)`` knob -- a
+        # pulse-scan pass IS a whole sweep, so the ONE repeat axis already counts sweeps (0 = sweep
+        # forever).  There is NO separate "scan repeats" field here (it would double the same number).
 
     @staticmethod
     def _drop_layout(layout) -> None:
@@ -656,11 +641,10 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
 
     def values_dict(self) -> dict:
         """The current ``{"api": {name: float}, "scan_mode": "none"|"api"|"scan",
-        "scan_code": "<python>", "extra_delay": float, "scan_repeats": int}`` snapshot.  ONE
-        ``scan_code`` = the ACTIVE mode's program (the build dispatches on ``scan_mode``); an empty /
-        blank api row is dropped (keeps the template's value).  ``scan_repeats`` (#3) = how many WHOLE
-        sweeps to run (0 = forever); the pulse-scan measurement consumes it, ORTHOGONAL to the
-        camera-frame ``repeat`` / ``free_run`` axis the console injects separately."""
+        "scan_code": "<python>", "extra_delay": float}`` snapshot.  ONE ``scan_code`` = the ACTIVE
+        mode's program (the build dispatches on ``scan_mode``); an empty / blank api row is dropped
+        (keeps the template's value).  The whole-sweep count is the measurement's auto-injected
+        ``Repeat (0 = ∞)`` knob (a pulse-scan pass IS a sweep) -- not a field here."""
         api: dict[str, float] = {}
         for name, w in self._api_widgets.items():
             text = w.text().strip()
@@ -677,8 +661,7 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
                 extra = float(self._extra_delay.text().strip() or 0.0)
             except ValueError:
                 extra = 0.0
-        return {"api": api, "scan_mode": self._mode, "scan_code": code, "extra_delay": extra,
-                "scan_repeats": int(self._scan_repeats_spin.value())}
+        return {"api": api, "scan_mode": self._mode, "scan_code": code, "extra_delay": extra}
 
     def seed_value(self, value) -> None:
         """Seed from a SAVED ``{"api", "scan_mode", "scan_code", "extra_delay"}`` blob (a load /
@@ -703,11 +686,6 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
         self._pending_mode = mode if mode in (none, api, scan) else None
         self._extra_remembered = (f"{float(value['extra_delay']):g}"
                                   if _is_number(value.get("extra_delay")) else self._extra_remembered)
-        # The repeats spin is PERSISTENT (not rebuilt), so restore the saved whole-sweep count
-        # directly here (signal blocked so a load is not read as a user edit).  Missing key -> 0 (∞).
-        if _is_number(value.get("scan_repeats")):
-            with _signals_blocked(self._scan_repeats_spin):
-                self._scan_repeats_spin.setValue(int(float(value["scan_repeats"])))
 
     def has_scan_rows(self) -> bool:
         return self._n_slots > 0
@@ -1768,7 +1746,7 @@ class PanelCard(FluentGroupBox):
 
             # ``repeat_mode`` (the DISPLAY collapse) is the ONLY repeat knob the plot owns: how to
             # collapse a measurement's repeat axis for display (average / add / replace / roll / create).
-            # How MANY repeats lives on the MEASUREMENT (``repeat``/``free_run``, auto-injected by
+            # How MANY repeats lives on the MEASUREMENT (``repeat``, 0 = ∞, auto-injected by
             # _acquisition_param_decls -- #H3l), NOT here.  Rendered through the SAME _make_param_widget
             # path as every other param (no hand-placed widget); edits route through _set_param.
             for spec in self._repeat_param_specs():
@@ -2866,27 +2844,23 @@ class PanelCard(FluentGroupBox):
         self._teardown_plot()
 
 
-def _acquisition_param_decls(free_run_default: bool = False) -> tuple:
-    """The acquisition knobs EVERY measurement-layer node owns, declared ONCE (#H3n): ``repeat`` = the
-    DEPTH of the repeat axis = how many passes/photos the data block keeps and AVERAGES (a measurement
-    decides this -- the plot never can); ``free_run`` = a BOOL switch that only decides STOP-after-N vs
-    keep ROLLING that ``repeat``-deep ring forever -- it NEVER discards the user's Repeat number.
-    ``free_run_default`` is True for a CAMERA (a live monitor streams continuously by default -- set
-    Repeat + turn Free-run OFF to take exactly N photos) and False for a scan (run the sweep once).
-    Returned as real ``ParamDecl``s so they auto-render through the SAME form path as every measurement
-    param (no hand-placed widget, no magic value abused into a number spinbox)."""
+def _acquisition_param_decls(repeat_default: int = 0) -> tuple:
+    """The ONE acquisition knob EVERY measurement-layer node owns, declared ONCE (#H3n): ``Repeat`` =
+    the depth of the repeat axis = how many passes/photos the data block keeps and AVERAGES, then STOPS
+    -- with ``0`` = ∞ (roll forever, a live monitor showing the latest).  ONE number, 0 = infinite (the
+    SAME semantics as the scan-repeat count) -- there is NO separate Free-run toggle.  ``repeat_default``
+    is 0 for a CAMERA (a live monitor streams forever by default -- set Repeat=N to take exactly N
+    photos) and 1 for a scan (run the sweep once; set 0 to keep re-running it live).  A real ``ParamDecl``
+    so it auto-renders through the SAME form path as every measurement param."""
     from ..neutral_atom.operations.measurement import ParamDecl
     return (
-        ParamDecl(key="repeat", label="Repeat", kind="int", default=1, lo=1, hi=100000,
-                  tooltip="How many passes/photos to keep & AVERAGE (a scan re-runs the whole sweep "
-                          "this many times; a camera takes this many photos -- averaging them is a "
-                          "long exposure that recovers the full site map).  How the repeats are "
-                          "DISPLAYED is the plot panel's 'repeat mode' Setting (average / add / "
-                          "replace / roll / create = one line per repeat)."),
-        ParamDecl(key="free_run", label="Free-run (∞)", kind="bool", default=bool(free_run_default),
-                  tooltip="Keep rolling the newest 'Repeat' passes forever (a live monitor).  Turn "
-                          "this OFF and set Repeat to take exactly N (a camera: N photos, then stop). "
-                          "It only toggles stop-vs-roll -- the Repeat number is always the ring depth."),
+        ParamDecl(key="repeat", label="Repeat (0 = ∞)", kind="int", default=max(0, int(repeat_default)),
+                  lo=0, hi=100000,
+                  tooltip="How many passes/photos to keep & AVERAGE then STOP, or 0 = ∞ (roll forever, "
+                          "a live monitor showing the latest).  A scan re-runs the whole sweep this many "
+                          "times; a camera takes this many photos -- averaging them is a long exposure "
+                          "that recovers the full site map.  How the repeats are DISPLAYED is the plot "
+                          "panel's 'repeat mode' Setting (average / add / replace / roll / create)."),
     )
 
 
@@ -2913,9 +2887,9 @@ class MeasurementPanel(QtWidgets.QWidget):
         super().__init__(parent)
         self.setStyleSheet("background: transparent;")
         self._specs = list(measurements)
-        # Extra ParamDecls APPENDED to every spec's auto-form (the acquisition knobs an acquisition
-        # node owns -- ``repeat`` + ``free_run`` -- declared ONCE and auto-rendered through the SAME
-        # ParamDecl path as every measurement param, so they are never hand-placed widgets, #H3l).
+        # Extra ParamDecls APPENDED to every spec's auto-form (the ONE acquisition knob an acquisition
+        # node owns -- ``repeat`` (0 = ∞) -- declared ONCE and auto-rendered through the SAME
+        # ParamDecl path as every measurement param, so it is never a hand-placed widget, #H3l).
         self._acquisition_params = tuple(acquisition_params)
         self._single = bool(single)               # bound to ONE spec (per-panel Edit) -> hide the picker
         self._controls = bool(controls)           # False = no Start/Stop (e.g. a plot Edit's read-only-ish source form)
@@ -3075,7 +3049,7 @@ class MeasurementPanel(QtWidgets.QWidget):
         spec = self.current_spec()
         if spec is None:
             return
-        # the spec's declared params PLUS the auto-injected acquisition knobs (repeat / free_run) --
+        # the spec's declared params PLUS the auto-injected acquisition knob (repeat, 0 = ∞) --
         # ONE list so both the label-width and the widget loop see the same declarations.
         decls = list(spec.params) + list(self._acquisition_params)
         # ONE label-column width for this form: fit the widest SCALAR-row label (composites carry
@@ -4308,16 +4282,14 @@ class LogicNodeEditor(QtWidgets.QWidget):
         # which already carries start_requested(self) / stop_requested + the typed,
         # no-eval form).  A spec drives a real ParamDecl form; the camera (spec is
         # None) shows nothing here but Start/Stop still build/run the camera node.
-        # ``repeat`` (how many repeats to FILL into the data array) + ``free_run`` (∞ = keep only the
-        # newest 10) are MEASUREMENT-layer acquisition knobs -- the plot can NEVER tell a measurement
-        # how many times to run (#H3l).  They are DECLARED ParamDecls auto-injected into the SAME
-        # auto-form as every other param (so they are never hand-placed widgets, and ∞ is a proper
-        # BOOL switch -- a number spinbox is never abused with a magic value).  An acquisition node
-        # (measurement / camera) gets them; a processor / task does not.  How the repeats are
-        # DISPLAYED is the PLOT's "repeat mode" Setting -- there is NO "update mode" on a measurement.
-        # A camera defaults to Free-run (a live monitor streams continuously); the user turns it OFF
-        # and sets Repeat to take exactly N photos.  A scan defaults to a single finite sweep.
-        acquisition = (_acquisition_param_decls(free_run_default=(row.node.kind == "camera"))
+        # ``repeat`` (0 = ∞) is the ONE MEASUREMENT-layer acquisition knob -- the plot can NEVER tell a
+        # measurement how many times to run (#H3l).  It is a DECLARED ParamDecl auto-injected into the
+        # SAME auto-form as every other param (never a hand-placed widget; 0 is the ∞ sentinel, the same
+        # semantics as the scan-repeat count -- no separate Free-run toggle).  An acquisition node
+        # (measurement / camera) gets it; a processor / task does not.  How the repeats are DISPLAYED is
+        # the PLOT's "repeat mode" Setting.  A camera defaults to ∞ (repeat=0, a live monitor); a scan
+        # defaults to a single finite sweep (repeat=1).
+        acquisition = (_acquisition_param_decls(repeat_default=(0 if row.node.kind == "camera" else 1))
                        if row.node.kind in ("measurement", "camera") else ())
         self.form = MeasurementPanel([spec] if spec is not None else [], single=True,
                                      signals_provider=getattr(console, "_signal_names", None),
@@ -4333,7 +4305,7 @@ class LogicNodeEditor(QtWidgets.QWidget):
         col.addStretch(1)
 
     def collect_values(self) -> dict:
-        return self.form.collect_values()                # repeat + free_run come back like any param
+        return self.form.collect_values()                # repeat (0 = ∞) comes back like any param
 
     def set_running(self, running: bool) -> None:
         self.form.set_running(running)
@@ -5474,19 +5446,16 @@ class TaskConsole(QtWidgets.QWidget):
 
     @staticmethod
     def _repeat_value(values: dict):
-        """The acquisition knobs from the form -> ``(repeat:int, free_run:bool)`` (#H3n).  ``repeat``
-        is ALWAYS the user's integer = the depth of the measurement's repeat axis (how many passes /
-        frames the block holds, hence how many are averaged); ``free_run`` only decides whether the
-        node STOPS after filling ``repeat`` (False) or keeps ROLLING that ``repeat``-deep ring forever
-        (True).  So ``repeat=20`` averages 20 frames whether or not it free-runs -- ∞ never discards
-        the user's number.  Pops both keys so they never leak into the build kwargs."""
-        free_run = bool(values.pop("free_run", False))
-        rv = values.pop("repeat", 1)
+        """The acquisition knob from the form -> ``repeat:int`` (#H3n, ONE knob with 0 = ∞).  ``repeat``
+        is the depth of the measurement's repeat axis: ``K`` keeps a K-deep block (K passes/frames
+        averaged) then STOPS; ``0`` rolls a 1-deep ring forever (a live monitor).  There is NO separate
+        free-run toggle -- 0 IS infinite, the SAME semantics as the pulse-scan / scan-repeat count, so
+        every measurement reads one number.  Pops the key so it never leaks into the build kwargs."""
+        rv = values.pop("repeat", 0)
         try:
-            repeat = max(1, int(float(rv)))
+            return max(0, int(float(rv)))
         except (TypeError, ValueError):
-            repeat = 1
-        return repeat, free_run
+            return 0
 
     def _build_logic_node(self, node: LogicNodeConfig, values: dict):
         """Build the node for a logic node, DISPLAY SUPPRESSED (publish-only).
@@ -5503,39 +5472,38 @@ class TaskConsole(QtWidgets.QWidget):
             if spec is None:
                 raise RuntimeError("no session camera available")
             # Same build path as the notebook: readout.camera_spec().build(hub, ...).  ``repeat`` =
-            # how many recent frames the camera keeps in its data array (∞ -> the newest 10).  The
-            # camera FILLS that ring and publishes the WHOLE block EVERY frame -- it never averages /
-            # suppresses frames at the measurement (that was the lag, #H3l); the PLOT reduces the
-            # block via repeat_mode.  So we consume ``repeat`` here, and there is NO update mode.
-            cam = spec.build(self.hub, **{k: v for k, v in values.items()
-                                          if k not in ("repeat", "free_run")})
-            repeat, free_run = self._repeat_value(values)
-            cam.set_repeat(repeat, free_run)
+            # how many recent frames the camera keeps & AVERAGES then STOPS, or 0 = ∞ (roll the latest
+            # frame forever).  The camera FILLS that ring and publishes the WHOLE block EVERY frame --
+            # it never averages / suppresses frames at the measurement (that was the lag, #H3l); the
+            # PLOT reduces the block via repeat_mode.  So we consume ``repeat`` here, no update mode.
+            cam = spec.build(self.hub, **{k: v for k, v in values.items() if k != "repeat"})
+            cam.set_repeat(self._repeat_value(values))
             return cam
         spec = self._spec_for_logic(node)
         if spec is None:
             raise RuntimeError(f"no catalog spec named {node.name!r} for a {kind} node")
         if kind == "measurement":
-            # ``repeat`` (re-run the whole scan N times) + ``free_run`` (∞) are MEASUREMENT knobs --
-            # pop them and hand the count to the node.  The node only FILLS its raw
-            # ``(repeat, points, dim)`` block; HOW the repeats are displayed is the PLOT's
-            # ``repeat_mode``, so no combine selector is passed here (#H3l).
-            repeat, free_run = self._repeat_value(values)
+            # ``repeat`` (re-run the whole scan N times, 0 = ∞) is the MEASUREMENT knob -- pop it and
+            # hand the count to the node.  The node only FILLS its raw ``(ring, points, dim)`` block;
+            # HOW the repeats are displayed is the PLOT's ``repeat_mode``, so no combine selector is
+            # passed here (#H3l).
+            repeat = self._repeat_value(values)
             built = spec.build(**values)
             if getattr(spec, "metadata", {}).get("node") == "pulse_scan":
                 # Pulse-scan is a DEVICE-driving node whose y is DECOUPLED (subscribed from
                 # another running node), not a frame-reducing ScannedMeasurementNode: it fires +
                 # publishes the frame, waits for the consumer to refresh, then reads the y
-                # expression.  ``build`` returned a PulseScanPlan carrier.
+                # expression.  ``build`` returned a PulseScanPlan carrier.  ``repeat`` (0 = ∞) is the
+                # whole-sweep count -- a pulse-scan pass IS a sweep, so it is the ONE repeat axis.
                 from Zou_lab_control.neutral_atom.operations.logic import PulseScanNode
                 return PulseScanNode(self.hub, built, x_key=spec.x_key, y_key=spec.y_key,
-                                     prefix=f"{spec.key}_", repeat=repeat, free_run=free_run)
+                                     prefix=f"{spec.key}_", repeat=repeat)
             from Zou_lab_control.neutral_atom.operations.logic import ScannedMeasurementNode
             # The node publishes under the measurement's slug (spec.key), so every signal
             # is ``<slug>_<quantity>`` (e.g. temperature_t_off) -- one name, derived.
             return ScannedMeasurementNode(
                 self.hub, built, x_key=spec.x_key, y_key=spec.y_key, prefix=f"{spec.key}_",
-                repeat=repeat, free_run=free_run)
+                repeat=repeat)
         if kind == "processor":
             # REACTIVE processor (the "func" layer): a live node consuming hub signals
             # and republishing derived ones -- e.g. judging occupancy from each frame.

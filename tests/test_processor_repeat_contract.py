@@ -1,7 +1,7 @@
 """Contract (#H3o, design panel): a Processor is a PURE TYPED TRANSFORM with NO user-facing mode.
 
-The repeat axis has exactly TWO knobs in the whole pipeline -- the measurement's ``repeat``/``free_run``
-(how many shots) and the plot's ``repeat_mode`` (how to collapse them for display).  A processor must
+The repeat axis has exactly TWO knobs in the whole pipeline -- the measurement's ``repeat`` (how many
+shots to keep, 0 = ∞) and the plot's ``repeat_mode`` (how to collapse them for display).  A processor must
 NOT add a third.  Its relationship to the repeat axis is a STATIC class fact, ``repeat_contract``:
 
   * ``"reduce"``  -- emits derived signals carrying NO repeat axis (a per-shot judgement / a statistic
@@ -81,7 +81,7 @@ def test_occupancy_is_preserve_and_the_repeat_axis_flows_through():
     exp.readout.sitemap(frames=4, display=False)
     exp.readout.thresholds(frames=20, display=False)
     hub = SignalHub()
-    cam = CameraMeasurement(hub, exp.camera, sequencer=exp.devices.sequencer, repeat=5, free_run=True)
+    cam = CameraMeasurement(hub, exp.camera, sequencer=exp.devices.sequencer, repeat=5)  # 0=∞; 5 = 5-deep block
     det = OccupancyProcessor(hub, calibration=exp.readout.current,
                              source_expr={"inputs": ["frame"], "source": "value = signal"},
                              method="box", grid_shape=(3, 4))

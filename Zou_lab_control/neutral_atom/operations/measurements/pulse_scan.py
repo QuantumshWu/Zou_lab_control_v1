@@ -214,7 +214,7 @@ class PulseScanPlan:
                  axis_label: str = "point", axis_unit: str = "", y_key: str = "signal",
                  y_expr=None, scan_shape: tuple[int, int] | None = None, settle=None,
                  api_names: Sequence[str] = (), api_arrays: Sequence[np.ndarray] = (),
-                 extra_delay_s: float = 0.0, scan_repeats: int = 0):
+                 extra_delay_s: float = 0.0):
         self.base_state = base_state
         self.scan_names = list(scan_names)
         self.scan_arrays = [np.asarray(a, dtype=float).reshape(-1) for a in scan_arrays]
@@ -224,15 +224,9 @@ class PulseScanPlan:
         self.api_names = list(api_names)
         self.api_arrays = [np.asarray(a, dtype=float).reshape(-1) for a in api_arrays]
         self.extra_delay_s = max(0.0, float(extra_delay_s))
-        # Whole-sweep count (#3): repeat the ENTIRE point-by-point sweep this many times then stop
-        # (0 = sweep forever -- the historical default).  This is the SOFTWARE analogue of the
-        # device's finite scan_repeats: pulse-scan is a per-point software loop (it resolves each row
-        # in Python and fires once per point for BOTH the hardware-scan and api-sweep modes -- it
-        # never streams a hardware scan table through the controller), so the count is enforced in
-        # PulseScanNode by bounding the number of whole passes.  ORTHOGONAL to the camera-frame
-        # ``repeat`` / ``free_run`` axis (how many frames are kept/averaged PER POINT): that counts
-        # frames, this counts whole sweeps.
-        self.scan_repeats = max(0, int(scan_repeats))
+        # The whole-sweep count is NOT carried on the plan: a pulse-scan pass IS a whole sweep, so the
+        # measurement's ONE ``repeat`` knob (0 = ∞), injected by the console into PulseScanNode, is the
+        # sweep count.  PulseScanNode bounds the number of point-by-point passes by that ``repeat``.
         # The x axis is the swept dimension: the hardware scan slots if any, else the software api
         # sweep, else a single point.
         primary = self.scan_arrays[0] if self.scan_arrays else (
@@ -266,10 +260,6 @@ def pulse_scan(readout) -> MeasurementSpec:
         api_values: Mapping[str, float] = dict(spec.get("api") or {})
         scan_code = str(spec.get("scan_code") or "")
         extra_delay_s = max(0.0, float(spec.get("extra_delay") or 0.0))
-        # Whole-sweep count (#3): 0 = sweep forever (default); K = K whole sweeps then stop.  Bounds
-        # the number of point-by-point passes in PulseScanNode -- ORTHOGONAL to the camera-frame
-        # repeat/free_run axis the console injects separately (frames per point vs sweeps of the scan).
-        scan_repeats = max(0, int(float(spec.get("scan_repeats") or 0)))
         # The mode is the SINGLE place that picks WHAT is swept: "scan" (hardware scan slots, snap),
         # "api" (software api sweep, no snap), "none" (one fixed point).  ONE scan_code (the active
         # mode's program); the form never emits two simultaneous tables.
@@ -314,7 +304,7 @@ def pulse_scan(readout) -> MeasurementSpec:
             state, scan_names, scan_arrays, s.devices.camera, s.devices.sequencer,
             axis_label=axis_label, axis_unit=axis_unit, y_key=y_name, y_expr=y_expr,
             scan_shape=scan_shape, api_names=api_names, api_arrays=api_arrays,
-            extra_delay_s=extra_delay_s, scan_repeats=scan_repeats)
+            extra_delay_s=extra_delay_s)
 
     params = (
         ParamDecl("template", "Pulse template", "path", default=DEFAULT_PROBE_TEMPLATE,

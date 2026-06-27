@@ -47,7 +47,7 @@ def _calibrated_occupancy(hub):
     exp.readout.sitemap(frames=4, display=False)
     exp.readout.thresholds(frames=20, display=False)
     cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer,
-                            repeat=REPEAT, free_run=True)
+                            repeat=REPEAT)                       # 0=∞; REPEAT = a REPEAT-deep block
     det = OccupancyProcessor(hub, calibration=exp.readout.current,
                              source_expr={"inputs": ["frame"], "source": "value = signal"},
                              method="box", grid_shape=GRID)

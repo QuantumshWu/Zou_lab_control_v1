@@ -337,10 +337,11 @@ def test_pulse_scan_empty_program_uses_column_stack_default():
         exp.close()
 
 
-def _scan_node(exp, *, scan_repeats=0, repeat=1, free_run=False, tag="a"):
-    """Build a PulseScanNode over a 3-point software sweep with the given whole-sweep count +
-    camera-frame repeat/free_run, settled INLINE per point (deterministic headless run).  ``tag``
-    keeps each probe file UNIQUE (a shared path races a still-open Windows handle)."""
+def _scan_node(exp, *, repeat=1, tag="a"):
+    """Build a PulseScanNode over a 3-point software sweep with the given ``repeat`` (0 = ∞, the ONE
+    knob -- a pulse-scan pass IS a whole sweep, so ``repeat`` IS the whole-sweep count), settled INLINE
+    per point (deterministic headless run).  ``tag`` keeps each probe file UNIQUE (a shared path races a
+    still-open Windows handle)."""
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
     from Zou_lab_control.neutral_atom.operations.logic import OccupancyProcessor, PulseScanNode
     from Zou_lab_control.neutral_atom.timing import PulseTableState
@@ -358,26 +359,29 @@ def _scan_node(exp, *, scan_repeats=0, repeat=1, free_run=False, tag="a"):
     plan = spec.build(
         template=probe,
         pulse_slots={"api": {}, "scan_code": "import numpy as np\n"
-                     "scan_table = np.linspace(10000, 30000, 3).reshape(-1, 1)",
-                     "scan_repeats": scan_repeats},
+                     "scan_table = np.linspace(10000, 30000, 3).reshape(-1, 1)"},
         y={"inputs": ["rate"], "source": "value = signal"})
     hub = SignalHub()
     occ = OccupancyProcessor(hub, calibration=exp.readout.require(thresholds=True),
                              source_expr={"inputs": ["frame"], "source": "value = signal"}, grid_shape=(3, 4))
     plan.settle = occ.step
     node = PulseScanNode(hub, plan, x_key=spec.x_key, y_key=spec.y_key, prefix=f"{spec.key}_",
-                         repeat=repeat, free_run=free_run)
+                         repeat=repeat)
     return node, probe
 
 
-def test_pulse_scan_repeats_threads_from_form_to_plan_and_node():
-    """#3: the form's scan_repeats reaches the plan + the node (the GUI->measurement seam)."""
+def test_pulse_scan_repeat_is_the_whole_sweep_count():
+    """#H3u-2: ``repeat`` (the ONE knob the console injects) IS the whole-sweep count for a pulse-scan
+    (a pass IS a sweep).  ``repeat=K`` reaches ``node.repeat`` and means K whole sweeps."""
     exp = _calibrated()
     node = probe = None
     try:
-        node, probe = _scan_node(exp, scan_repeats=2, tag="thread")
-        assert node.plan.scan_repeats == 2
-        assert node.scan_repeats == 2
+        node, probe = _scan_node(exp, repeat=2, tag="thread")
+        assert node.repeat == 2
+        assert node.total_points == 6                        # 3 points x 2 whole sweeps
+        # The plan no longer carries a separate sweep count (#H3u-2: subsumed by ``repeat``).
+        assert not hasattr(node.plan, "scan_repeats")
+        assert not hasattr(node, "free_run")
     finally:
         if probe:
             _safe_unlink(probe)
@@ -385,11 +389,11 @@ def test_pulse_scan_repeats_threads_from_form_to_plan_and_node():
 
 
 def test_pulse_scan_finite_repeats_stops_after_k_whole_sweeps():
-    """#3: scan_repeats=K runs K WHOLE point-by-point sweeps then stops (a finite software sweep)."""
+    """#H3u-2: repeat=K runs K WHOLE point-by-point sweeps then stops (a finite software sweep)."""
     exp = _calibrated()
     node = probe = None
     try:
-        node, probe = _scan_node(exp, scan_repeats=2, tag="finite")   # 3 points x 2 sweeps = 6 points
+        node, probe = _scan_node(exp, repeat=2, tag="finite")        # 3 points x 2 sweeps = 6 points
         assert node.total_points == 6
         node.run_to_completion()
         assert node.finished
@@ -400,44 +404,33 @@ def test_pulse_scan_finite_repeats_stops_after_k_whole_sweeps():
         exp.close()
 
 
-def test_pulse_scan_repeats_is_the_authoritative_pass_count():
-    """#3: pulse-scan fires once per point per pass, so a pass IS a whole sweep -- scan_repeats and
-    the camera-frame repeat/free_run are the SAME axis here.  A finite scan_repeats=K is authoritative:
-    it folds repeat/free_run into a finite K-pass run (so it halts even a free_run-requested node),
-    while scan_repeats=0 leaves the camera-frame behaviour untouched (never finishes)."""
+def test_pulse_scan_repeat_zero_is_infinite():
+    """#H3u-2: repeat=0 = ∞ (the ONLY infinite knob, no free-run toggle) -- the sweep rolls forever."""
     exp = _calibrated()
-    node = probe = node0 = probe0 = None
+    node0 = probe0 = None
     try:
-        # free_run + repeat=2 requested, but scan_repeats=1 is authoritative -> 1 finite sweep.
-        node, probe = _scan_node(exp, scan_repeats=1, repeat=2, free_run=True, tag="orth1")
-        assert node.total_points == 3 and node.repeat == 1 and node.free_run is False  # scan_repeats folds them
-        node.run_to_completion()
-        assert node.finished and node.points_done == 3
-
-        # scan_repeats=0 + free_run -> unchanged: never finishes (the camera axis rolls forever).
-        node0, probe0 = _scan_node(exp, scan_repeats=0, repeat=2, free_run=True, tag="orth0")
+        node0, probe0 = _scan_node(exp, repeat=0, tag="inf")
         assert node0.total_points == 0                       # unbounded
         assert not node0.finished
-        node0.step(); node0.step(); node0.step(); node0.step()   # past one whole sweep
-        assert not node0.finished                            # free_run with no sweep bound rolls on
+        node0.step(); node0.step(); node0.step(); node0.step()   # past one whole sweep (3 points)
+        assert not node0.finished                            # repeat=0 rolls on
     finally:
-        for p in (probe, probe0):
-            if p:
-                _safe_unlink(p)
+        if probe0:
+            _safe_unlink(probe0)
         exp.close()
 
 
 def test_pulse_scan_repeats_keeps_all_k_sweeps_for_averaging():
-    """#3 REGRESSION (review): scan_repeats=K must KEEP all K sweeps in the published block (the
-    repeat-axis depth == K), so the plot's repeat_mode=average actually averages K sweeps.  The bug:
-    the ring used the camera-frame repeat (default 1), so all K sweeps overwrote ONE slot and every
-    sweep but the LAST was silently dropped -- the user's K-sweep noise reduction was a no-op."""
+    """#H3u-2 REGRESSION: repeat=K must KEEP all K sweeps in the published block (the repeat-axis depth
+    == K), so the plot's repeat_mode=average actually averages K sweeps.  The historical bug (#H3t): the
+    ring used a separate camera-frame repeat (default 1), so all K sweeps overwrote ONE slot and every
+    sweep but the LAST was silently dropped.  Unifying to the ONE ``repeat`` knob makes the ring = K."""
     import numpy as np
     exp = _calibrated()
     node = probe = None
     try:
-        node, probe = _scan_node(exp, scan_repeats=3, repeat=1, tag="depth")   # default camera repeat=1
-        assert node._ring == 3                               # ring holds all K sweeps, not the camera 1
+        node, probe = _scan_node(exp, repeat=3, tag="depth")
+        assert node._ring == 3                               # ring holds all K sweeps
         node.run_to_completion()
         block = np.asarray(node._publish_raw())
         assert block.shape[0] == 3, f"published depth must be K=3 (all sweeps kept), got {block.shape}"

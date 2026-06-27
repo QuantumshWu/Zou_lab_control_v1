@@ -25,9 +25,11 @@ from conftest import fire_live_imaging
 
 
 def _block_matches_contract(node, block) -> bool:
-    """The published block's shape is EXACTLY ``(repeat, *points_shape, *data_shape)``."""
+    """The published block's shape is EXACTLY ``(ring, *points_shape, *data_shape)`` where the ring
+    depth = ``max(1, repeat)`` (finite K keeps K slices; ``repeat=0`` = ∞ keeps a 1-deep rolling ring)."""
     block = np.asarray(block)
-    expected = (int(node.repeat), *tuple(node.points_shape), *tuple(node.data_shape))
+    ring = int(getattr(node, "_ring", max(1, int(node.repeat))))
+    expected = (ring, *tuple(node.points_shape), *tuple(node.data_shape))
     return block.shape == expected
 
 
@@ -43,8 +45,7 @@ def test_camera_frame_is_repeat_x_one_point_x_image():
     exp = na.connect("virtual")
     try:
         hub = SignalHub()
-        cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer,
-                                repeat=4, free_run=True)
+        cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer, repeat=4)
         fire_live_imaging(exp)
         for _ in range(6):
             cam.step()
@@ -53,24 +54,41 @@ def test_camera_frame_is_repeat_x_one_point_x_image():
         assert len(cam.data_shape) == 2                         # the H*W image is the DATA
         assert cam.primary_signal == "frame"                    # declares its contract block (#H3r-F4)
         assert _block_matches_contract(cam, block)              # (repeat, 1, H, W)
-        # repeat is the user's number -- ``free_run`` does NOT discard it (depth = 4, not a constant)
+        # repeat is the user's number -- the kept block depth IS repeat (4, not a constant)
         assert np.asarray(block).shape[0] == 4
     finally:
         exp.close()
 
 
-def test_camera_repeat_is_finite_when_not_free_running():
-    """``repeat=N`` + ``free_run=False`` takes EXACTLY N photos then finishes (not forever)."""
+def test_camera_repeat_K_takes_exactly_K_photos_then_finishes():
+    """``repeat=N`` (N>0) takes EXACTLY N photos then finishes (not forever)."""
     exp = na.connect("virtual")
     try:
         hub = SignalHub()
-        cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer,
-                                repeat=3, free_run=False)
+        cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer, repeat=3)
         fire_live_imaging(exp)
         for _ in range(8):
             cam.step()
         assert cam.points_done == 3 and cam.finished            # N photos then stop
         assert np.asarray(hub.latest("frame")).shape[0] == 3
+    finally:
+        exp.close()
+
+
+def test_camera_repeat_zero_is_infinite_rolling_1_deep():
+    """``repeat=0`` = ∞ (the ONLY infinite knob, no free-run toggle): a 1-deep rolling ring that
+    never finishes -- the live monitor showing the latest frame."""
+    exp = na.connect("virtual")
+    try:
+        hub = SignalHub()
+        cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer, repeat=0)
+        fire_live_imaging(exp)
+        for _ in range(6):
+            cam.step()
+        block = np.asarray(hub.latest("frame"))
+        assert not cam.finished and cam.total_points == 0       # rolls forever
+        assert _block_matches_contract(cam, block)              # (1, 1, H, W)
+        assert block.shape[0] == 1                              # a 1-deep rolling ring (the latest frame)
     finally:
         exp.close()
 

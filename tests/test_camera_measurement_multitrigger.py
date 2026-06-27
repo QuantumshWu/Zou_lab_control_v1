@@ -97,7 +97,7 @@ def test_2d_frame_panel_shows_camera_average_decoupled_from_judge():
     exp.readout.sitemap(frames=4, display=False)
     exp.readout.thresholds(frames=20, display=False)
     hub = SignalHub()
-    cam = CameraMeasurement(hub, exp.camera, sequencer=exp.devices.sequencer, repeat=5, free_run=True)
+    cam = CameraMeasurement(hub, exp.camera, sequencer=exp.devices.sequencer, repeat=5)  # 0=∞; 5 = a 5-deep block
     det = OccupancyProcessor(hub, calibration=exp.readout.current,
                              source_expr={"inputs": ["frame"], "source": "value = signal"}, method="box", grid_shape=(3, 4))
     fire_live_imaging(exp)

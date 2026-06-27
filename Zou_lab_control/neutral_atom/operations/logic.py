@@ -101,11 +101,12 @@ def describe_shape(value, *, points_shape=None, data_shape=None, grid_shape=None
     When the value IS a measurement/processor's contract block (its shape matches the declared
     ``(repeat, *points_shape, *data_shape)``, #H3o) it is shown in CONTRACT form
     ``repeat × points × (data)`` -- the DATA grouped in parens (a 1-D scan ``5 × 8 × (3)``; a
-    2-D scan ``5 × (4×5) × (1)`` via ``grid_shape``).  A signal with NO swept points (points
-    empty) drops the meaningless ``× 1 ×`` and reads ``repeat × (data)`` -- so per-site
-    occupancy is ``5 × (35)`` and a judged camera frame is ``5 × (96×128)``, the node row's
-    "publishes" table reading "5 repeats, 35 sites" coherently.  Otherwise the raw numpy shape
-    (``(35,)`` / ``(96, 128)``) -- e.g. static ``centers`` (35, 2) carries no repeat axis."""
+    2-D scan ``5 × (4×5) × (1)`` via ``grid_shape`` reshaping the SWEPT POINTS).  A signal with NO
+    swept points (points empty) NEVER shows a phantom points axis: its ``grid_shape`` describes how
+    the DATA lays out (a site grid), so per-site occupancy ``(10, 35)`` with a 5×7 site grid reads
+    ``10 × (5×7)`` (10 repeats of a 5×7 site map), NOT the meaningless ``10 × 5×7 × (35)`` (#H3u-3);
+    with no grid it is ``5 × (35)`` and a judged camera frame ``5 × (96×128)``.  Otherwise the raw
+    numpy shape (``(35,)`` / ``(96, 128)``) -- e.g. static ``centers`` (35, 2) carries no repeat axis."""
     if value is None:
         return "—"
     shape = tuple(int(n) for n in np.shape(value))
@@ -117,8 +118,13 @@ def describe_shape(value, *, points_shape=None, data_shape=None, grid_shape=None
             and tuple(shape[1:]) == ps + dsh:
         gs = tuple(int(n) for n in (grid_shape or ()))
         dstr = "×".join(str(n) for n in dsh) or "1"
-        if not ps and not gs:
-            return f"{shape[0]} × ({dstr})"               # no swept points -> repeat × (data)
+        if not ps:
+            # NO swept points: the grid (if any) reshapes the DATA into a site map, so it goes INSIDE
+            # the data parens -- never as a phantom points axis (that double-counted the sites: the
+            # 5×7 grid IS the 35 data, so "10 × 5×7 × (35)" said the same number twice, #H3u-3).
+            if gs and int(np.prod(gs)) == int(np.prod(dsh) or 1):
+                return f"{shape[0]} × ({'×'.join(str(n) for n in gs)})"   # repeat × (site grid)
+            return f"{shape[0]} × ({dstr})"               # repeat × (flat data)
         pstr = "×".join(str(n) for n in (gs or ps))
         return f"{shape[0]} × {pstr} × ({dstr})"          # repeat × points × (data)
     if len(shape) == 1:                  # numpy 1-D repr keeps the trailing comma: (35,)
@@ -382,9 +388,9 @@ class Measurement(LogicNode):
     ring, a scan's raw block) and publishes it whole.  It does NOT collapse the repeat axis --
     HOW the repeats are combined for viewing (average / add / roll / create) is the PLOT's
     ``repeat_mode`` (display-only), the SINGLE place a repeat axis is collapsed.  So there are
-    exactly two repeat knobs in the whole pipeline: ``repeat``/``free_run`` here (how many shots
-    to keep) and the plot's ``repeat_mode`` (how to show them).  Concrete measurements implement
-    ``shot()``; ``repeat``/``free_run`` are auto-injected acquisition params by the console."""
+    exactly two repeat knobs in the whole pipeline: ``repeat`` here (how many shots to keep, 0 = ∞
+    rolls forever) and the plot's ``repeat_mode`` (how to show them).  Concrete measurements
+    implement ``shot()``; ``repeat`` is the ONE acquisition param auto-injected by the console."""
 
     layer = "measurement"
     node_label = "measurement"
@@ -403,12 +409,17 @@ class Measurement(LogicNode):
         key = self.primary_signal
         if key and key in out and out[key] is not None:
             block = np.asarray(out[key])
-            expected = (int(self.repeat), *tuple(self.points_shape), *tuple(self.data_shape))
+            # The block's first axis is the RING DEPTH actually published = ``max(1, repeat)`` (a
+            # finite run keeps ``repeat`` slices; ``repeat=0`` = ∞ keeps a 1-deep rolling ring), NOT
+            # the raw ``repeat`` -- so 0 = ∞ does not false-trip this contract guard.
+            ring = int(getattr(self, "_ring", max(1, int(self.repeat))))
+            expected = (ring, *tuple(self.points_shape), *tuple(self.data_shape))
             if block.shape != expected:
                 raise ValueError(
                     f"{type(self).__name__} primary block {key!r} has shape {block.shape}, but the "
-                    f"measurement output contract requires {expected} = (repeat, *points_shape, *data_shape); "
-                    "set points_shape/data_shape (and fill a repeat axis) to match what you publish.")
+                    f"measurement output contract requires {expected} = (ring, *points_shape, *data_shape) "
+                    "with ring = max(1, repeat); set points_shape/data_shape (and fill the ring axis) to "
+                    "match what you publish.")
         return out
 
 
@@ -422,7 +433,7 @@ class Processor(LogicNode):
     rate, and no-ops (``shot`` returns ``{}``) when there is nothing new.
 
     A processor is a PURE TYPED TRANSFORM with NO user-facing mode (that would be a third
-    repeat knob on top of the measurement's ``repeat``/``free_run`` and the plot's
+    repeat knob on top of the measurement's ``repeat`` (0 = ∞) and the plot's
     ``repeat_mode`` -- the tangle we deliberately do not have).  Its relationship to the repeat
     axis is a STATIC class fact, ``repeat_contract``, NOT a runtime knob and NEVER shown in a form:
       * ``"reduce"`` (default, the common case): emits derived signals that carry NO repeat axis
@@ -1248,15 +1259,14 @@ class CameraMeasurement(Measurement):
     node_label = "camera"
 
     def __init__(self, hub: SignalHub, camera: CameraDevice, *, sequencer: object | None = None,
-                 frames_per_cycle: int = 1, prefix: str = "", repeat: int = 1, free_run: bool = True):
+                 frames_per_cycle: int = 1, prefix: str = "", repeat: int = 0):
         # The camera obeys the UNIFORM measurement output contract (#H3n): its ``frame`` block is
-        # ``(repeat, *points_shape, *data_shape)`` = ``(repeat, 1, H, W)`` -- ONE data point (a frame
-        # does not sweep an input parameter), whose DATA is the H×W image.  ``repeat`` is the depth
-        # of that block = how many photos are kept/averaged (always the user's integer); ``free_run``
-        # only decides whether it STOPS after filling ``repeat`` (False) or keeps ROLLING that
-        # ``repeat``-deep ring forever (True, the live monitor).  The camera never averages at the
-        # measurement (that was the live stutter) -- it FILLS and publishes the WHOLE block; the PLOT
-        # reduces the repeat axis (repeat_mode: average = the long-exposure mean over the kept frames).
+        # ``(ring, *points_shape, *data_shape)`` = ``(ring, 1, H, W)`` -- ONE data point (a frame does
+        # not sweep an input parameter), whose DATA is the H×W image.  ONE knob ``repeat``, 0 = ∞ (no
+        # free-run toggle): repeat=K keeps a K-deep block (K photos averaged) then STOPS; repeat=0
+        # rolls a 1-deep ring forever (the live monitor showing the latest frame).  The camera never
+        # averages at the measurement (that was the live stutter) -- it FILLS and publishes the WHOLE
+        # block; the PLOT reduces the repeat axis (repeat_mode: average = the long-exposure mean).
         super().__init__(hub, prefix=prefix)
         self.camera = camera
         self.sequencer = sequencer
@@ -1264,21 +1274,22 @@ class CameraMeasurement(Measurement):
         self.points_shape: tuple = (1,)                  # one frame = one data point (no swept param)
         self.primary_signal = "frame"                    # the (repeat,1,H,W) contract block (#H3r-F4)
         self.data_shape: tuple = ()                      # set to (H, W) on the first frame
-        self._raw = None                                 # (repeat, 1, H, W) block; None until 1st frame
-        self.set_repeat(repeat, free_run)
+        self._raw = None                                 # (ring, 1, H, W) block; None until 1st frame
+        self.set_repeat(repeat)
 
-    def set_repeat(self, repeat: int = 1, free_run: bool = True) -> None:
-        """Depth of the repeat axis = how many photos to keep/average (``repeat``, the user's int),
-        and whether to keep ROLLING that ring forever (``free_run``) or STOP after filling it.  Resets
+    def set_repeat(self, repeat: int = 0) -> None:
+        """How many photos to KEEP & AVERAGE then STOP, or ``0`` = ∞ (roll forever, a live monitor
+        showing the latest frame).  ONE knob, 0 = infinite -- there is NO separate free-run toggle:
+        repeat=K fills a K-deep block once and stops; repeat=0 rolls a 1-deep ring forever.  Resets
         the (partly filled) block."""
-        self.free_run = bool(free_run)
-        self.repeat = max(1, int(repeat))
+        self.repeat = max(0, int(repeat))
+        self._ring = max(1, self.repeat)                 # block depth: K for finite, 1 for the rolling live view
         self._raw = None
         self._filled = 0
 
     @property
     def total_points(self) -> int:
-        return 0 if self.free_run else int(self.repeat)
+        return 0 if self.repeat <= 0 else int(self.repeat)
 
     @property
     def points_done(self) -> int:
@@ -1286,7 +1297,7 @@ class CameraMeasurement(Measurement):
 
     @property
     def finished(self) -> bool:
-        return (not self.free_run) and self._filled >= self.repeat
+        return self.repeat > 0 and self._filled >= self.repeat
 
     def shot(self) -> dict[str, object]:
         n = max(1, int(self.frames_per_cycle))
@@ -1304,14 +1315,14 @@ class CameraMeasurement(Measurement):
         f0 = out["frame_0"]                              # the newest single frame of this shot
         if self._raw is None or self.data_shape != f0.shape:
             self.data_shape = tuple(f0.shape)            # (H, W) -- the per-point DATA shape
-            self._raw = np.full((self.repeat, 1, *self.data_shape), np.nan, dtype=float)
+            self._raw = np.full((self._ring, 1, *self.data_shape), np.nan, dtype=float)
             self._filled = 0
-        if self.free_run:                                # free-run: roll the newest in at the end
+        if self.repeat <= 0:                             # ∞: roll the newest in at the end (live monitor)
             self._raw = np.roll(self._raw, -1, axis=0)
             self._raw[-1, 0] = f0
-            self._filled = min(self._filled + 1, self.repeat)
-        else:                                            # finite: FILL the next slot of the N-frame block
-            self._raw[min(self._filled, self.repeat - 1), 0] = f0
+            self._filled += 1
+        else:                                            # finite: FILL the next slot of the K-frame block
+            self._raw[min(self._filled, self._ring - 1), 0] = f0
             self._filled = min(self._filled + 1, self.repeat)
         # ``frame`` IS the (repeat, 1, H, W) data array (NaN = not-yet-taken) -- a panel reduces its
         # repeat axis (average -> long exposure).  ``frame_i`` stay the newest single per-trigger
@@ -1443,18 +1454,16 @@ class ScannedMeasurementNode(Measurement):
         y_key: str = "y",
         prefix: str = "",
         repeat: int = 1,
-        free_run: bool = False,
     ):
         super().__init__(hub, prefix=prefix)
         self.measurement = measurement
         # UNIFORM contract (#H3n): the block is ``(repeat, *points_shape, *data_shape)`` = a 1-D scan's
-        # ``(repeat, n_points, dim)``.  ``repeat`` (the user's int) = the depth of the repeat axis = how
-        # many passes are kept/averaged; ``free_run`` only decides STOP-after-``repeat`` (False) vs keep
-        # ROLLING that ``repeat``-deep ring forever (True).  The node only FILLS the block point-by-
-        # point; HOW the repeats are combined for display is the PLOT's ``repeat_mode``.
-        self.free_run = bool(free_run)
-        self.repeat = max(1, int(repeat))
-        self._ring = int(self.repeat)                      # O0 = repeat axis depth = the user's number
+        # ``(ring, n_points, dim)``.  ONE knob ``repeat``, 0 = ∞ (no free-run toggle): repeat=K keeps a
+        # K-deep block (K passes averaged) then STOPS; repeat=0 rolls a 1-deep ring forever (a live scan
+        # showing the latest sweep).  The node only FILLS point-by-point; HOW the repeats are combined
+        # for display is the PLOT's ``repeat_mode``.
+        self.repeat = max(0, int(repeat))
+        self._ring = max(1, self.repeat)                   # block depth: K passes for finite, 1 (rolling) for ∞
         self._index = 0                                   # within-pass point index (0..n_points-1)
         self._pass = 0                                    # 0-based pass currently being filled
         # Share the node's stop event so a Stop interrupts a wedged trigger MID-scan-point.
@@ -1488,19 +1497,19 @@ class ScannedMeasurementNode(Measurement):
 
     @property
     def total_points(self) -> int:
-        """All points over all passes (n_points x repeat); 0 (open-ended) while free-running."""
-        return 0 if self.free_run else int(self.n_points * int(self.repeat))
+        """All points over all passes (n_points x repeat); 0 (open-ended) while ∞ (repeat=0)."""
+        return 0 if self.repeat <= 0 else int(self.n_points * int(self.repeat))
 
     @property
     def finished(self) -> bool:
-        """True once every point of every pass has been measured (never, while free-running)."""
-        return False if self.free_run else (self._pass >= int(self.repeat))
+        """True once every point of every pass has been measured (never, while ∞ / repeat=0)."""
+        return self.repeat > 0 and (self._pass >= int(self.repeat))
 
     def _publish_raw(self) -> np.ndarray:
         """The raw ``(repeat, points, dim)`` block to publish.  Finite: as-is (slot == pass, already
-        chronological).  free-run ring: rolled so the most-recently-written slice is LAST
+        chronological).  ∞ rolling ring: rolled so the most-recently-written slice is LAST
         (oldest->newest), so the plot's replace/roll/create read the newest correctly."""
-        if not self.free_run:
+        if self.repeat > 0:
             return self._raw.copy()
         last = (self._pass if self._index > 0 else self._pass - 1) % self._ring
         return np.roll(self._raw, self._ring - 1 - last, axis=0).copy()
@@ -1609,28 +1618,18 @@ class PulseScanNode(Measurement):
     SETTLE_TIMEOUT_S = 5.0
 
     def __init__(self, hub: SignalHub, plan, *, x_key: str = "param", y_key: str = "signal",
-                 prefix: str = "", repeat: int = 1, free_run: bool = False):
+                 prefix: str = "", repeat: int = 1):
         super().__init__(hub, prefix=prefix)
         self.plan = plan
         # UNIFORM contract (#H3n): the block is ``(repeat, n_points, 1)`` = ``(repeat, *points_shape,
         # *data_shape)`` with ``points_shape=(n_points,)`` (a 2-D scan's n0*n1 param grid flattened)
-        # and ``data_shape=(1,)``.  ``repeat`` (the user's int) = the repeat-axis depth (passes kept/
-        # averaged); ``free_run`` only decides STOP-after-``repeat`` vs keep ROLLING forever.  The node
-        # only FILLS the block; the PLOT combines the repeats (``repeat_mode``) and, for a 2-D scan,
-        # reshapes the points by ``scan_shape`` to an image.
-        self.free_run = bool(free_run)
-        self.repeat = max(1, int(repeat))
-        # Whole-sweep count (#3): pulse-scan fires ONCE per point per pass, so a "pass" IS a whole
-        # re-sweep -- ``scan_repeats`` and the camera-frame ``repeat`` are the SAME axis here (NOT
-        # orthogonal).  So scan_repeats=K>0 is the authoritative kept/averaged pass count: it sets a
-        # FINITE K-pass run whose K sweeps are all kept (ring depth K) so the plot's repeat_mode can
-        # average them.  scan_repeats=0 keeps the historical camera-frame repeat/free_run behaviour
-        # (free_run default = roll forever = the "repeat ∞" 0 stands for).
-        self.scan_repeats = max(0, int(getattr(plan, "scan_repeats", 0)))
-        if self.scan_repeats > 0:
-            self.repeat = self.scan_repeats
-            self.free_run = False
-        self._ring = int(self.repeat)
+        # and ``data_shape=(1,)``.  ONE knob ``repeat``, 0 = ∞ (no free-run toggle): pulse-scan fires
+        # ONCE per point per pass, so a "pass" IS a whole re-sweep -- repeat=K keeps K whole sweeps
+        # (averageable) then STOPS, repeat=0 rolls a 1-deep ring forever (a live scan showing the
+        # latest sweep).  The node only FILLS; the PLOT combines the repeats (``repeat_mode``) and,
+        # for a 2-D scan, reshapes the points by ``scan_shape`` to an image.
+        self.repeat = max(0, int(repeat))
+        self._ring = max(1, self.repeat)                  # block depth: K sweeps for finite, 1 (rolling) for ∞
         self._pass = 0                                    # 0-based pass currently being filled
         self.base_state = plan.base_state
         self.scan_names = list(plan.scan_names)
@@ -1690,21 +1689,18 @@ class PulseScanNode(Measurement):
 
     @property
     def total_points(self) -> int:
-        # ``repeat`` already absorbed scan_repeats in __init__ (a finite K-sweep run sets
-        # repeat=K, free_run=False), so the pass count is ONE axis: K sweeps x N points, or 0
-        # (unbounded) when free_run.
-        return 0 if self.free_run else int(self.n_points * int(self.repeat))
+        # ONE pass axis, 0 = ∞: repeat=K means K whole sweeps x N points; repeat=0 is unbounded.
+        return 0 if self.repeat <= 0 else int(self.n_points * int(self.repeat))
 
     @property
     def finished(self) -> bool:
-        # ONE pass axis (scan_repeats folded into repeat): free_run rolls forever, else stop after
-        # ``repeat`` whole sweeps.
-        return False if self.free_run else (self._pass >= int(self.repeat))
+        # repeat=0 = ∞ (roll forever); else stop after ``repeat`` whole sweeps.
+        return self.repeat > 0 and (self._pass >= int(self.repeat))
 
     def _publish_raw(self) -> np.ndarray:
-        """The raw ``(repeat, points, 1)`` block to publish (finite: as-is; free-run ring: rolled so
-        the most-recently-written slice is LAST).  Mirrors :meth:`ScannedMeasurementNode._publish_raw`."""
-        if not self.free_run:
+        """The raw ``(repeat, points, 1)`` block to publish (finite: as-is; ∞ ring: rolled so the
+        most-recently-written slice is LAST).  Mirrors :meth:`ScannedMeasurementNode._publish_raw`."""
+        if self.repeat > 0:
             return self._raw.copy()
         last = (self._pass if self._index > 0 else self._pass - 1) % self._ring
         return np.roll(self._raw, self._ring - 1 - last, axis=0).copy()

@@ -3,11 +3,11 @@
 are displayed (average / add / replace / roll / new) is the PLOT's ``repeat_mode`` (#3), which
 reduces the repeat axis via the single owned helper ``frontend.live.reduce_repeat``.
 
-``repeat`` is a MEASUREMENT parameter = the DEPTH of the repeat axis (always the user's integer = how
-many passes are kept/averaged).  ``free_run`` (a BOOL) only decides whether the node STOPS after
-filling ``repeat`` or keeps ROLLING that ``repeat``-deep ring forever (#H3n).  The task console's
-measurement Edit exposes ``Repeat`` (a plain integer) + a ``free_run`` switch, but NOT the combine
-selector -- that moved to each plot panel's Setting.
+``repeat`` is the ONE MEASUREMENT parameter, 0 = ∞ (#H3u-2): ``K`` keeps a K-deep block (K passes
+averaged) then STOPS; ``0`` rolls a 1-deep ring forever (the live monitor).  There is NO separate
+free-run toggle -- 0 IS infinite, the same semantics everywhere.  The task console's measurement Edit
+exposes that ONE ``Repeat (0 = ∞)`` integer, but NOT the combine selector -- that moved to each plot
+panel's Setting.
 """
 
 import numpy as np
@@ -71,20 +71,20 @@ def test_repeat_one_is_a_single_pass_block():
     assert np.allclose(raw[0, :, 0], [0.0, 1.0, 2.0])
 
 
-def test_free_run_keeps_a_repeat_deep_ring_forever():
-    """``free_run=True`` never finishes and keeps the most recent ``repeat`` passes (the user's number
-    = the ring depth, NOT a hardcoded constant); the raw block's repeat axis is that depth, rolled so
-    the newest pass is LAST."""
+def test_repeat_zero_is_infinite_rolling_one_deep():
+    """``repeat=0`` = ∞ (the ONE infinite knob, no free-run toggle, #H3u-2): never finishes, a 1-deep
+    rolling ring showing the LATEST pass (the live monitor)."""
     hub = SignalHub()
     node = ScannedMeasurementNode(hub, _CountingMeasurement(), x_key="x", y_key="y",
-                                  prefix="m_", repeat=2, free_run=True)
-    assert node.total_points == 0              # open-ended (free-run)
+                                  prefix="m_", repeat=0)
+    assert node.total_points == 0              # open-ended (∞)
+    assert node._ring == 1                     # ∞ rolls a 1-deep ring (not an old repeat-deep ring)
     for _ in range(node.n_points * 3):         # run 3 whole passes worth of points
         node.step()
-        assert not node.finished               # free-run -> never self-stops
+        assert not node.finished               # ∞ -> never self-stops
     raw = np.asarray(hub.latest("m_y"))
-    assert raw.shape == (2, 3, 1)              # ring depth = the user's repeat (2), not a constant
-    # the most recent pass measured calls 6,7,8 and is the LAST filled slice (rolled to the end).
+    assert raw.shape == (1, 3, 1)              # 1-deep rolling ring = the latest pass
+    # the most recent pass measured calls 6,7,8 and is the (only) filled slice.
     assert np.allclose(raw[-1, :, 0], [6.0, 7.0, 8.0])
 
 
@@ -130,11 +130,10 @@ def test_reduce_repeat_passes_through_already_reduced_arrays():
     assert repeats_with_data(img) == 1
 
 
-def test_repeat_is_a_measurement_param_auto_injected_with_a_free_run_switch(monkeypatch):
+def test_repeat_is_a_measurement_param_auto_injected_as_one_knob(monkeypatch):
     """``repeat`` is a MEASUREMENT-layer param (a measurement decides how many times to acquire -- the
-    plot never can), AUTO-INJECTED into the measurement / camera auto-form as a plain integer plus a
-    BOOL ``free_run`` switch (a number spinbox is NEVER abused with a magic special value).  A
-    processor has neither.  ``_repeat_value`` -> ``(repeat:int, free_run:bool)``."""
+    plot never can), AUTO-INJECTED into the measurement / camera auto-form as the ONE integer knob with
+    0 = ∞ (no separate free-run toggle, #H3u-2).  A processor has neither.  ``_repeat_value`` -> int."""
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from PyQt5 import QtWidgets
@@ -150,13 +149,13 @@ def test_repeat_is_a_measurement_param_auto_injected_with_a_free_run_switch(monk
             form = console._logic_editors[id(row)].form
             w, d = form._widgets, form._decls
             assert "repeat" in w and d["repeat"].kind == "int"
-            assert d["free_run"].kind == "bool"              # ∞ is a switch, not a spinbox magic value
-            assert w["repeat"].specialValueText() == "" and w["repeat"].minimum() == 1
+            assert "free_run" not in d and "free_run" not in w   # 0 = ∞, NO separate toggle
+            assert w["repeat"].minimum() == 0                    # 0 is the ∞ sentinel
 
-        # the node build turns the form values into (repeat:int, free_run:bool): the int is ALWAYS the
-        # user's number (the depth) -- free_run NEVER discards it (it only toggles stop vs roll).
-        assert console._repeat_value({"repeat": 5, "free_run": False}) == (5, False)
-        assert console._repeat_value({"repeat": 5, "free_run": True}) == (5, True)
+        # the node build turns the form value into ONE int (0 = ∞); no tuple, no free_run.
+        assert console._repeat_value({"repeat": 5}) == 5
+        assert console._repeat_value({"repeat": 0}) == 0
+        assert console._repeat_value({}) == 0                    # missing -> ∞ default
 
         prow = console._add_logic_node(LogicNodeConfig(kind="processor", name="Judge occupancy"))
         console._edit_logic_node(prow)
