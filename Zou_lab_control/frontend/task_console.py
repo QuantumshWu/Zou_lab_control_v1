@@ -1178,6 +1178,17 @@ def _task_files_dir() -> Path:
 #: (the lo/hi inputs reveal only in that mode); tight/normal autoscale as before.
 _RELIM_MODES = ("tight", "normal", "fixed")
 
+#: The relim mode as a declarative ``ParamDecl`` -- so a "plot"-role panel's relim chooser renders
+#: through the SAME _make_param_widget / PARAM_WIDGETS path every other plot param uses (one source,
+#: auto-injected into BOTH the Setting popup and the Edit tab, #H3v-4b).  Edits route through
+#: ``_set_param`` (which pushes the mode onto the live plotter + reveals the fixed lo/hi row).
+_RELIM_PARAM = ParamDecl(
+    key="relim", label="relim", kind="choice", default="tight", choices=_RELIM_MODES, display=True,
+    tooltip="Relim mode (confocal_gui combo_relim naming):\n"
+            "  tight  = autoscale hugs the data\n"
+            "  normal = autoscale with the matplotlib default margin\n"
+            "  fixed  = pin the y-axis / colour-limit to the lo/hi below")
+
 #: Per-panel display refresh intervals (ms) the operator can pick from.  A FIXED, harmonic set
 #: (100·{1,2,4,8}) so the SMALLEST selected interval divides every other -- the console timer
 #: runs at that base (the GCD) and each panel refreshes every ``update_ms // base`` ticks.  The
@@ -1712,42 +1723,21 @@ class PanelCard(FluentGroupBox):
         self.size_combo.currentTextChanged.connect(self._on_size)
         sec.addWidget(FluentSettingRow("size", self.size_combo, label_width=label_w))
 
-        # one ParamDecl widget per row -- this is where the kind's `cmap`
-        # colormap lives (the colorbar COLORSET chooser; there is no separate
-        # cbar show/hide toggle).
+        # The plot's DISPLAY knobs are DECLARATIVE ParamDecls rendered through the SAME _make_param_widget
+        # / PARAM_WIDGETS path everywhere (#H3v-4b): the per-kind colormap / toggles (display=True) for
+        # EVERY role, plus -- on a "plot"-role panel -- the relim chooser.  Adding a plot display
+        # ParamDecl here makes it appear in the Edit tab too with NO hand-wiring (both call
+        # _emit_param_rows).  (size + colormap stay for every role; relim/repeat/unit/update are
+        # plotter-only conveniences, "plot" role only -- restyle a measurement by Adding a Plot panel.)
         self.param_widgets: dict[str, QtWidgets.QWidget] = {}
-        for spec in PANEL_PARAMS.get(self.config.kind, ()):
-            if not spec.display:
-                continue            # FUNCTIONAL params live in the Edit tab, not here
-            widget = self._make_param_widget(spec)
-            self.param_widgets[spec.key] = widget
-            sec.addWidget(FluentSettingRow(spec.label, widget, label_width=label_w))
-
-        # relim mode + unit cycle are PURE plot-display knobs (axis autoscale style
-        # + x-axis unit conversion).  They are "things only a plotter finds useful"
-        # (#3), so they appear ONLY on a "plot"-role panel.  A measurement / task
-        # panel's Setting keeps just source / size / colormap / title / actions --
-        # if you want to restyle a measurement's curve, Add a Plot panel for it.
-        # (size + colormap stay for every role: resizing a grid slot and choosing
-        # an image colorset are not plotter-only conveniences.)
+        display_specs = [s for s in PANEL_PARAMS.get(self.config.kind, ()) if s.display]
         if self.config.role == "plot":
-            # relim mode (confocal_gui's combo_relim semantics EXACTLY: ``tight`` /
-            # ``normal``).  Persisted as ``config.params["relim"]`` -- the SAME key
-            # the Edit tab's ed_relim writes to, so Setting and Edit never
-            # drift apart.  No "manual" mode, no x/y typed limits: live autoscale
-            # is the right tool here; if you need to inspect a frozen range, use
-            # zoom/pan on the canvas or Edit… into the panel's Edit tab.
-            self.lim_combo = FluentComboBox()
-            self.lim_combo.addItems(list(_RELIM_MODES))
-            self.lim_combo.setToolTip(
-                "Relim mode (confocal_gui combo_relim naming):\n"
-                "  tight  = autoscale hugs the data\n"
-                "  normal = autoscale with the matplotlib default margin\n"
-                "  fixed  = pin the y-axis / colour-limit to the lo/hi below")
-            self.lim_combo.setCurrentText(str(self.config.params.get("relim", "tight")))
-            self.lim_combo.currentTextChanged.connect(self._on_relim_mode)
-            sec.addWidget(FluentSettingRow("relim", self.lim_combo, label_width=label_w))
+            display_specs = display_specs + [_RELIM_PARAM]
+        self.param_widgets.update(
+            self._emit_param_rows(display_specs, sec.addWidget, self._set_param, label_w))
+        self.lim_combo = self.param_widgets.get("relim")     # named back-ref (relim is now declarative)
 
+        if self.config.role == "plot":
             # ``repeat_mode`` (the DISPLAY collapse) is the ONLY repeat knob the plot owns: how to
             # collapse a measurement's repeat axis for display (average / add / replace / roll / create).
             # How MANY repeats lives on the MEASUREMENT (``repeat``, 0 = ∞, auto-injected by
@@ -1758,21 +1748,10 @@ class PanelCard(FluentGroupBox):
                 self.param_widgets[spec.key] = widget
                 sec.addWidget(FluentSettingRow(spec.label, widget, label_width=label_w))
 
-            # fixed lo/hi inputs (#8): one row [lo | hi], shown only when relim == "fixed".
-            self.fixed_lo_edit = FluentLineEdit(str(self.config.params.get("fixed_lo", 0.0)))
-            self.fixed_hi_edit = FluentLineEdit(str(self.config.params.get("fixed_hi", 1.0)))
-            for ed in (self.fixed_lo_edit, self.fixed_hi_edit):
-                ed.setMinimumWidth(scaled_px(64, minimum=52))
-                ed.editingFinished.connect(self._on_fixed_lim_edited)
-            self.fixed_lo_edit.setToolTip("Fixed lower limit (used only when relim = fixed)")
-            self.fixed_hi_edit.setToolTip("Fixed upper limit (used only when relim = fixed)")
-            fixed_inner = QtWidgets.QWidget()
-            fixed_layout = QtWidgets.QHBoxLayout(fixed_inner)
-            fixed_layout.setContentsMargins(0, 0, 0, 0)
-            fixed_layout.addWidget(self.fixed_lo_edit, 1)
-            fixed_layout.addWidget(self.fixed_hi_edit, 1)
-            self.fixed_lim_row = FluentSettingRow("lo / hi", fixed_inner, label_width=label_w)
-            self.fixed_lim_row.setVisible(str(self.config.params.get("relim", "tight")) == "fixed")
+            # fixed lo/hi inputs (#8): ONE bespoke [lo | hi] row (the single special-cased control,
+            # shown only when relim == "fixed") -- built by the shared helper the Edit tab also uses.
+            self.fixed_lim_row, self.fixed_lo_edit, self.fixed_hi_edit = \
+                self._make_fixed_lim_row(self._on_fixed_lim_edited, label_w)
             sec.addWidget(self.fixed_lim_row)
 
             # unit cycle: a single row [Unit button | <stretch> | current unit text]
@@ -1862,6 +1841,53 @@ class PanelCard(FluentGroupBox):
         current = self.config.params.get(spec.key, spec.default)
         ctx = ParamWidgetContext(instant_apply=cb)
         return PARAM_WIDGETS[spec.kind].build(spec, current, ctx)
+
+    def _emit_param_rows(self, specs, add, apply, label_w) -> dict:
+        """Render each declarative ParamDecl in ``specs`` as a ``[label | control]`` row through the
+        SAME _make_param_widget / PARAM_WIDGETS path the measurement form uses, appending it via the
+        ``add`` callback.  Returns ``{key: widget}`` so a caller can keep a named back-reference.  BOTH
+        the Setting popup AND the Edit tab call this for a plot's display knobs, so adding a plot
+        ParamDecl shows up in both surfaces with NO hand-wiring (#H3v-4b)."""
+        out = {}
+        for spec in specs:
+            widget = self._make_param_widget(spec, apply=apply)
+            out[spec.key] = widget
+            add(FluentSettingRow(spec.label, widget, label_width=label_w))
+        return out
+
+    def _make_fixed_lim_row(self, apply_cb, label_w):
+        """The fixed lo/hi inputs as ONE bespoke ``[lo | hi]`` row (the single display knob kept
+        special-cased rather than declarative -- a 2-box combined control PARAM_WIDGETS has no kind for),
+        shown only when relim == "fixed".  Built by this ONE helper so the Setting popup and the Edit tab
+        get the IDENTICAL row instead of two hand-copied blocks (#H3v-4b).  Returns ``(row, lo, hi)``."""
+        lo = FluentLineEdit(str(self.config.params.get("fixed_lo", 0.0)))
+        hi = FluentLineEdit(str(self.config.params.get("fixed_hi", 1.0)))
+        for ed in (lo, hi):
+            ed.setMinimumWidth(scaled_px(64, minimum=52))
+            ed.editingFinished.connect(apply_cb)
+        lo.setToolTip("Fixed lower limit (used only when relim = fixed)")
+        hi.setToolTip("Fixed upper limit (used only when relim = fixed)")
+        host = QtWidgets.QWidget()
+        lay = QtWidgets.QHBoxLayout(host)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(scaled_px(6, minimum=4))
+        lay.addWidget(lo, 1)
+        lay.addWidget(hi, 1)
+        row = FluentSettingRow("lo / hi", host, label_width=label_w)
+        row.setVisible(str(self.config.params.get("relim", "tight")) == "fixed")
+        return row, lo, hi
+
+    def _apply_lim_to_plotter(self) -> None:
+        """Push the relim mode + fixed lo/hi onto the LIVE plotter and apply NOW (2D colour-limit / 1D
+        y-axis), bypassing the relim dead-band so a toggle takes effect immediately even on a static
+        panel.  Shared by the declarative relim edit (_set_param) and the rebuild-time re-apply."""
+        if self.plotter is not None and hasattr(self.plotter, "relim_mode"):
+            self.plotter.relim_mode = str(self.config.params.get("relim", "tight"))
+            self._push_fixed_lims()                 # keep plotter.fixed_lo/hi in step before re-relim
+            if hasattr(self.plotter, "apply_relim_now"):
+                self.plotter.apply_relim_now()
+        if self.canvas is not None:
+            self.canvas.draw_idle()
 
     def _repeat_param_specs(self) -> tuple:
         """The PLOT's repeat-DISPLAY param (``repeat_mode``), DECLARED so the Setting auto-renders it
@@ -2063,26 +2089,10 @@ class PanelCard(FluentGroupBox):
             self.canvas.draw_idle()
 
     def _on_relim_mode(self, mode: str) -> None:
-        """Persist + apply the relim mode (confocal_gui naming: ``tight`` /
-        ``normal``).
-
-        Writes to the SAME ``config.params["relim"]`` key the Edit tab's
-        ``ed_relim`` writes to, so the two never drift apart."""
-        self.config.params["relim"] = str(mode)
-        # reveal the lo/hi inputs only in "fixed" mode (#8)
-        if hasattr(self, "fixed_lim_row"):
-            self.fixed_lim_row.setVisible(str(mode) == "fixed")
-        if self.plotter is not None and hasattr(self.plotter, "relim_mode"):
-            self.plotter.relim_mode = str(mode)
-            self._push_fixed_lims()   # keep plotter.fixed_lo/hi in step before re-relim
-            # apply the switch NOW (2D colorbar / 1D y-axis), bypassing the relim
-            # dead-band -- otherwise a 2D image's clim only changes on the next
-            # frame (or never, for a static panel), so the toggle looks dead.
-            if hasattr(self.plotter, "apply_relim_now"):
-                self.plotter.apply_relim_now()
-        if self.canvas is not None:
-            self.canvas.draw_idle()
-        self.changed.emit()
+        """Back-compat shim: drive a relim change through the declarative ``_set_param`` path (the relim
+        chooser is now a ParamDecl, #H3v-4b).  Kept so callers that set relim by name -- notebook code,
+        tests -- still work; ``_set_param`` does the persist + plotter push + fixed-row reveal."""
+        self._set_param("relim", str(mode))
 
     def _push_fixed_lims(self) -> None:
         """Copy ``config.params["fixed_lo"/"fixed_hi"]`` onto the live plotter (no rebuild)."""
@@ -2263,10 +2273,22 @@ class PanelCard(FluentGroupBox):
         self.layout_changed.emit()
 
     def _set_param(self, key: str, value) -> None:
-        """A declarative parameter edit: store, rebuild the plot, mark dirty."""
+        """A declarative parameter edit: store, apply, mark dirty.
+
+        Most params (colormap / bins / toggles …) change the plot's STRUCTURE, so they tear the plotter
+        down + re-render.  ``relim`` is the exception: it is a LIVE axis adjustment (the dead-band-aware
+        autoscale mode), so it pushes onto the existing plotter WITHOUT a teardown and reveals the fixed
+        lo/hi row only in ``fixed`` mode -- the SAME effect the old hand-wired ``_on_relim_mode`` had,
+        now reached through this one declarative path (#H3v-4b)."""
         if self.config.params.get(key) == value:
             return
         self.config.params[key] = value
+        if key == "relim":
+            if getattr(self, "fixed_lim_row", None) is not None:        # the Setting popup's lo/hi row
+                self.fixed_lim_row.setVisible(str(value) == "fixed")    # (the Edit tab toggles its own)
+            self._apply_lim_to_plotter()
+            self.changed.emit()
+            return
         self._reset_plot()
         self._rerender_last()   # take effect NOW (e.g. colormap) even if the source is stopped
         self.changed.emit()
@@ -3492,44 +3514,22 @@ class PanelEditor(QtWidgets.QWidget):
         # SAME config.params keys and drive the SAME live card via the card's handlers
         # (single source -- Setting and Edit never drift), then re-snapshot this Edit canvas.
         self.ed_cmap = self.ed_relim = self.ed_unit_button = self.ed_fixed_row = None
+        self.ed_params: dict[str, QtWidgets.QWidget] = {}
         if is_plot:
             section("Display")
             disp_lw = scaled_px(96, minimum=72)
-            # colormap: only image kinds declare a `cmap` display spec -- reuse that spec +
-            # the card's _set_param (updates config.params + the live card), then re-snapshot.
-            cmap_spec = next((s for s in PANEL_PARAMS.get(card.config.kind, ())
-                              if s.key == "cmap" and s.display), None)
-            if cmap_spec is not None:
-                self.ed_cmap = card._make_param_widget(cmap_spec, apply=self._edit_display_cmap)
-                col.addWidget(FluentSettingRow("colormap", self.ed_cmap, label_width=disp_lw))
-            # relim (confocal tight/normal) -- reuse the card's _on_relim_mode.
-            self.ed_relim = FluentComboBox()
-            self.ed_relim.addItems(list(_RELIM_MODES))
-            self.ed_relim.setCurrentText(str(card.config.params.get("relim", "tight")))
-            self.ed_relim.setToolTip(
-                "Relim mode (confocal_gui combo_relim naming):\n"
-                "  tight  = autoscale hugs the data\n"
-                "  normal = autoscale with the matplotlib default margin\n"
-                "  fixed  = pin the y-axis / colour-limit to the lo/hi below")
-            self.ed_relim.currentTextChanged.connect(self._edit_relim)
-            col.addWidget(FluentSettingRow("relim", self.ed_relim, label_width=disp_lw))
-            # fixed lo/hi inputs (#H2): the SAME control the Setting popup has, here too -- shown
-            # only when relim == "fixed", writing the SAME config.params["fixed_lo"/"fixed_hi"].
-            self.ed_fixed_lo = FluentLineEdit(str(card.config.params.get("fixed_lo", 0.0)))
-            self.ed_fixed_hi = FluentLineEdit(str(card.config.params.get("fixed_hi", 1.0)))
-            for ed in (self.ed_fixed_lo, self.ed_fixed_hi):
-                ed.setMinimumWidth(scaled_px(64, minimum=52))
-                ed.editingFinished.connect(self._edit_fixed_lim)
-            self.ed_fixed_lo.setToolTip("Fixed lower limit (used only when relim = fixed)")
-            self.ed_fixed_hi.setToolTip("Fixed upper limit (used only when relim = fixed)")
-            fixed_host = QtWidgets.QWidget()
-            fixed_row = QtWidgets.QHBoxLayout(fixed_host)
-            fixed_row.setContentsMargins(0, 0, 0, 0)
-            fixed_row.setSpacing(scaled_px(6, minimum=4))
-            fixed_row.addWidget(self.ed_fixed_lo, 1)
-            fixed_row.addWidget(self.ed_fixed_hi, 1)
-            self.ed_fixed_row = FluentSettingRow("lo / hi", fixed_host, label_width=disp_lw)
-            self.ed_fixed_row.setVisible(str(card.config.params.get("relim", "tight")) == "fixed")
+            # The SAME declarative display knobs as the Setting popup -- the per-kind colormap / toggles
+            # PLUS the relim chooser -- rendered through the card's SHARED _emit_param_rows, so the Edit
+            # tab auto-exposes EVERY plot display ParamDecl with no hand-wiring (#H3v-4b).  Each edit
+            # routes via _edit_param -> the live card (config.params + re-render) THEN re-snapshots here.
+            display_specs = [s for s in PANEL_PARAMS.get(card.config.kind, ()) if s.display] + [_RELIM_PARAM]
+            self.ed_params = card._emit_param_rows(display_specs, col.addWidget, self._edit_param, disp_lw)
+            self.ed_cmap = self.ed_params.get("cmap")        # named back-refs (kept for tests / clarity)
+            self.ed_relim = self.ed_params.get("relim")
+            # fixed lo/hi: the IDENTICAL bespoke [lo | hi] row the Setting popup builds (shared helper),
+            # shown only when relim == "fixed"; _edit_param toggles it when relim changes.
+            self.ed_fixed_row, self.ed_fixed_lo, self.ed_fixed_hi = \
+                card._make_fixed_lim_row(self._edit_fixed_lim, disp_lw)
             col.addWidget(self.ed_fixed_row)
             # x-axis unit cycle -- reuse the card's _on_unit_cycle.
             self.ed_unit_button = FluentButton("Unit", color=GREY)
@@ -3810,25 +3810,14 @@ class PanelEditor(QtWidgets.QWidget):
                             "snapshot of current data — Save Fig is frozen here")
 
     def _edit_param(self, key: str, value) -> None:
-        """A plot-param edit from the Edit tab: apply to the LIVE panel (re-renders
-        it) and re-snapshot here, so the change shows in both surfaces."""
+        """A plot-param edit from the Edit tab (declarative display knob OR functional param): apply to
+        the LIVE panel via the card's ONE _set_param (config.params + live re-render -- single source,
+        identical to the Setting popup), reveal the Edit tab's OWN fixed lo/hi row when relim flips to
+        ``fixed``, then re-snapshot this canvas so the change shows in both surfaces (#H3v-4b)."""
         if self.card is not None:
             self.card._set_param(key, value)
-        self.rebuild()
-
-    # ---- Display knobs: apply to the LIVE card via the card's OWN handlers (so they
-    # persist in config.params + drive the live panel -- single source, identical to the
-    # Setting popup) THEN re-snapshot this Edit canvas so the change shows here too.
-    def _edit_display_cmap(self, key: str, value) -> None:
-        if self.card is not None:
-            self.card._set_param(key, value)     # config.params["cmap"] + live re-render
-        self.rebuild()
-
-    def _edit_relim(self, mode: str) -> None:
-        if self.card is not None:
-            self.card._on_relim_mode(str(mode))   # config.params["relim"] + live re-relim
-        if getattr(self, "ed_fixed_row", None) is not None:
-            self.ed_fixed_row.setVisible(str(mode) == "fixed")   # reveal lo/hi only in fixed (#H2)
+        if key == "relim" and getattr(self, "ed_fixed_row", None) is not None:
+            self.ed_fixed_row.setVisible(str(value) == "fixed")   # reveal lo/hi only in fixed (#H2)
         self.rebuild()
 
     def _edit_fixed_lim(self) -> None:

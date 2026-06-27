@@ -469,11 +469,14 @@ def test_edit_tab_is_the_full_datafigure_ui():
         assert editor.ed_unit_button is not None
         assert hasattr(editor, "save_dir_edit")
 
-        # changing a display knob in Edit writes the SAME config.params key the Setting popup uses
-        editor._edit_display_cmap("cmap", "viridis")
+        # changing a display knob in Edit writes the SAME config.params key the Setting popup uses;
+        # every display knob (colormap / relim) now routes through the ONE declarative _edit_param
+        # path (#H3v-4b: cmap/relim are ParamDecls rendered by the shared _emit_param_rows).
+        editor._edit_param("cmap", "viridis")
         assert card.config.params["cmap"] == "viridis"
-        editor.ed_relim.setCurrentText("normal")           # drive the combo (fires _edit_relim)
+        editor._edit_param("relim", "normal")
         assert card.config.params["relim"] == "normal"
+        assert card.plotter is None or card.plotter.relim_mode == "normal"
     finally:
         console.shutdown()
 
