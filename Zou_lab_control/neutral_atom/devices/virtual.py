@@ -671,6 +671,13 @@ class VirtualSequencer(SequencerDevice):
         # this is set.  This is what makes "Stop Pulse" (set_safe_state) freeze the live
         # image: no streamer firing -> no camera trigger -> no frame (exactly like hardware).
         self._firing: PulseSequence | None = None
+        # Scan-progress mirror of the real streamer: when a streamed scan is firing, this holds
+        # {"n_points": N, "scan_repeats": K, "base_dt": per-point seconds}; scan_progress() derives
+        # the current (point, sweep) from the wall-clock elapsed since fire, and a finite scan (K>0)
+        # stops itself once K sweeps are played -- exactly like the host issues CMD_SAFE on the real
+        # streamer.  None when no scan is firing.
+        self._scan_info: dict[str, float] | None = None
+        self._scan_fire_time: float = 0.0
 
     @property
     def firing(self) -> PulseSequence | None:
@@ -710,6 +717,18 @@ class VirtualSequencer(SequencerDevice):
         # PulseTableState.from_sequence so it syncs too (virtual == real: no fired timing the
         # GUI "cannot sync").
         self._record_source_payload(sequence, channels=channels)
+        # Capture scan-progress info from the SOURCE table (the compiled PulseSequence drops the
+        # scan_table): N points + the requested sweep count, plus a per-point wall-clock estimate
+        # (the program's one-frame duration) so scan_progress() can report "point K / N · sweep r".
+        rows = list(getattr(sequence, "scan_table", None) or []) if isinstance(sequence, PulseTableState) else []
+        if rows:
+            self._scan_info = {
+                "n_points": float(len(rows)),
+                "scan_repeats": float(max(0, int(getattr(sequence, "scan_repeats", 0)))),
+                "base_dt": float(max(program.duration, 1e-9)),
+            }
+        else:
+            self._scan_info = None
         self.history.append({"action": "prepare", "sequence": program.name, "duration": program.duration})
         return self.last_program
 
@@ -742,6 +761,29 @@ class VirtualSequencer(SequencerDevice):
         # firing (and must not make a later live read see a stale finite shot).
         if bool(getattr(self._prepared, "repeat_forever", False)):
             self._firing = self._prepared
+            self._scan_fire_time = time.monotonic()
+
+    def scan_progress(self) -> dict:
+        """Where the streamed scan is now -- mirrors the real streamer (virtual==real).  The
+        current monotonic played-point count is the wall-clock elapsed since fire divided by the
+        per-point estimate (scaled by ``sleep_scale`` like every other virtual time, so the test
+        suite's ``sleep_scale=0`` fast-forwards a finite scan straight to done).  A finite scan
+        (scan_repeats>0) that has played its K sweeps stops firing here, exactly like the host
+        issues the engine stop on the real backend."""
+        from .sequencer import SCAN_PROGRESS_IDLE, scan_progress_fields
+        if self._firing is None or self._scan_info is None:
+            return dict(SCAN_PROGRESS_IDLE)
+        n = int(self._scan_info["n_points"])
+        k = int(self._scan_info["scan_repeats"])
+        dt = float(self._scan_info["base_dt"]) * self.sleep_scale
+        if dt <= 0:                      # fast-forward: a finite scan is instantly done, an infinite one sits at point 0
+            total = k * n if k > 0 else 0
+        else:
+            total = int((time.monotonic() - self._scan_fire_time) / dt)
+        fields = scan_progress_fields(total, n, k)
+        if not fields["scanning"]:       # finite scan reached K sweeps -> the streamer halts
+            self._firing = None
+        return fields
 
     def wait_done(self, timeout: float | None = None) -> bool:
         """Block until the prepared FINITE program finishes on the wall clock
@@ -752,6 +794,18 @@ class VirtualSequencer(SequencerDevice):
         if self._prepared is None:
             raise RuntimeError("VirtualSequencer.wait_done() called before prepare().")
         if bool(getattr(self._prepared, "repeat_forever", False)):
+            # A FINITE scan (scan_repeats=K>0) DOES finish -- after K whole sweeps the streamer
+            # halts (the host stops it on the real backend).  Block the K-sweep wall-clock, then
+            # report done.  An infinite scan / continuous On Pulse never finishes -> False.
+            info = self._scan_info
+            if info is not None and int(info["scan_repeats"]) > 0:
+                delay = int(info["scan_repeats"]) * int(info["n_points"]) * float(info["base_dt"]) * self.sleep_scale
+                if timeout is not None and delay > float(timeout):
+                    return False
+                if delay > 0:
+                    time.sleep(delay)
+                self._firing = None
+                return True
             return False
         delay = float(self._prepared.duration) * self.sleep_scale
         if timeout is not None and delay > float(timeout):
@@ -774,6 +828,7 @@ class VirtualSequencer(SequencerDevice):
         if self._firing is not None:
             self.history.append({"action": "safe_state"})
         self._firing = None
+        self._scan_info = None
 
     def snapshot(self) -> dict[str, object]:
         return {

@@ -3838,6 +3838,10 @@ def test_sequencer_server_jtag_axi_backend_warm_starts_axi_session(tmp_path, mon
         def safe_state(self):
             events.append("safe")
 
+        def scan_progress(self):     # the session interface the server wires for the GUI's scan poll
+            from Zou_lab_control.neutral_atom.devices.sequencer import SCAN_PROGRESS_IDLE
+            return dict(SCAN_PROGRESS_IDLE)
+
     def fake_serve(service, *, host, port, start):
         events.append(f"serve:{host}:{port}")
         return object()

@@ -159,6 +159,10 @@ class VivadoAxiStreamerSession:
         self._program = None          # last prepared program (for streaming refills)
         self._total_points = 0
         self._total_chunks = 1
+        self._scan_repeats = 0        # 0 = sweep forever; K>=1 = stop after K whole sweeps
+        self._scan_point = 0          # current scan point within the sweep (mirror for scan_progress)
+        self._scan_sweep = 0          # current 0-based sweep index
+        self._scan_finished = False   # latched once a finite scan has played its K sweeps
         self._next_chunk = 2          # finite-streaming cursor (instance state -> re-entrant)
         self._bank_ready = 0b11
         # RLock (not Lock): a transaction runs under this lock, and if the persistent
@@ -463,6 +467,14 @@ class VivadoAxiStreamerSession:
         self._total_points = len(points)
         self._total_chunks = max(1, math.ceil(self._total_points / p.bank_size)) if self._total_points else 1
         self._repeat_forever = bool(getattr(program, "repeat_forever", False))
+        # Finite scan-repeat (0 = sweep forever): the streaming refill thread counts CURSOR wraps
+        # and stops the engine after K whole sweeps.  _scan_point / _scan_sweep mirror where the
+        # engine is for scan_progress(); _scan_finished latches the finite stop so a blocking
+        # wait_done returns done.
+        self._scan_repeats = max(0, int(getattr(program, "scan_repeats", 0)))
+        self._scan_point = 0
+        self._scan_sweep = 0
+        self._scan_finished = False
         # Independently validate before upload (defence in depth -- a non-monotonic
         # effective-tick program would silently drop edges on hardware).  Allow the
         # full scan-point count (streaming is unbounded) by raising the cap to N.
@@ -700,6 +712,11 @@ class VivadoAxiStreamerSession:
         total_chunks = self._total_chunks
 
         while True:
+            # A FINITE scan-repeat (scan_repeats=K>0) is driven by the streaming thread, which
+            # halts the engine after K whole sweeps and latches _scan_finished; a blocking
+            # wait_done returns the instant that happens (DONE is not asserted by CMD_SAFE).
+            if self._scan_finished:
+                return True
             status = self._read_word(CtrlWords.STATUS)
             if status & STATUS_DONE:
                 # DONE means the UNDELAYED stream ended; delayed signals keep emitting
@@ -759,6 +776,7 @@ class VivadoAxiStreamerSession:
         sweeps = 0
         prev_cursor = 0
         stop = self._stream_stop
+        needs_refill = self._total_chunks > 2   # <=2 chunks are fully preloaded; just monitor wraps
         try:
             while not stop.is_set():
                 cursor = self._read_word(CtrlWords.CURSOR, stop=stop)
@@ -767,22 +785,53 @@ class VivadoAxiStreamerSession:
                 if cursor < prev_cursor:
                     sweeps += 1
                 prev_cursor = cursor
-                eng_mono = sweeps * K + (min(cursor, N - 1) // bank_size)
-                # one-ahead: load the next monotonic chunk as soon as the engine has
-                # freed its bank (eng_mono >= next_mono - 1).  Unbounded: next_mono just
-                # keeps counting; _load_chunk maps it to (data=next_mono%K, bank=next_mono%2).
-                if eng_mono >= next_mono - 1:
-                    bank_ready = self._load_chunk(next_mono, bank_ready, stop=stop)
-                    next_mono += 1
-                    continue
+                # progress mirror for scan_progress(): where the engine is right now.
+                self._scan_point = min(cursor, N - 1) if N > 0 else 0
+                self._scan_sweep = sweeps
+                # FINITE scan: once K whole sweeps have wrapped, halt the engine (REUSE the safe
+                # state command -- the same primitive Stop/off_pulse uses) and latch done so a
+                # blocking wait_done returns.  (At most one extra point of sweep K+1 may emit before
+                # CMD_SAFE lands; the scan stopped at the K-th sweep boundary.)
+                if self._scan_repeats > 0 and sweeps >= self._scan_repeats:
+                    self._command(CMD_SAFE)
+                    self._scan_point = (N - 1) if N > 0 else 0
+                    self._scan_sweep = self._scan_repeats - 1
+                    self._scan_finished = True
+                    return
+                if needs_refill:
+                    eng_mono = sweeps * K + (min(cursor, N - 1) // bank_size)
+                    # one-ahead: load the next monotonic chunk as soon as the engine has
+                    # freed its bank (eng_mono >= next_mono - 1).  Unbounded: next_mono just
+                    # keeps counting; _load_chunk maps it to (data=next_mono%K, bank=next_mono%2).
+                    if eng_mono >= next_mono - 1:
+                        bank_ready = self._load_chunk(next_mono, bank_ready, stop=stop)
+                        next_mono += 1
+                        continue
                 time.sleep(self.stream_poll_interval)
         except _AxiAborted:             # Off/prepare tore us down mid-read: clean exit
             pass
         except Exception as exc:        # never let the daemon die silently
             self._write_action_log("stream_refill", f"streaming refill thread stopped: {exc!r}")
 
+    def scan_progress(self) -> dict:
+        """Where the streamed scan is now -- mirrors the virtual backend (virtual==real).  The
+        refill thread updates ``_scan_point`` (CURSOR) and ``_scan_sweep`` (wrap count) as it runs;
+        this turns the monotonic played-point count into the shared {scanning, point, n_points,
+        sweep, n_repeats} reading.  Idle when no scan is loaded / running."""
+        from .sequencer import SCAN_PROGRESS_IDLE, scan_progress_fields
+        n = int(self._total_points)
+        if n <= 0 or not self._repeat_forever:
+            return dict(SCAN_PROGRESS_IDLE)
+        if self._scan_finished:
+            return scan_progress_fields(max(1, self._scan_repeats) * n, n, self._scan_repeats)
+        point_total = int(self._scan_sweep) * n + int(self._scan_point)
+        return scan_progress_fields(point_total, n, self._scan_repeats)
+
     def _start_stream_thread(self) -> None:
-        if self._repeat_forever and self._total_points > 2 * self.params.bank_size:
+        # Start the background monitor for a streamed scan: a long scan (>2 banks) needs continuous
+        # refill, AND any FINITE scan (scan_repeats>0) needs a monitor to count sweeps + stop -- even
+        # a short, fully-preloaded one (the refill is skipped inside the loop when not needed).
+        if self._repeat_forever and (self._total_points > 2 * self.params.bank_size or self._scan_repeats > 0):
             self._stop_stream_thread()
             self._stream_stop = threading.Event()
             self._stream_thread = threading.Thread(

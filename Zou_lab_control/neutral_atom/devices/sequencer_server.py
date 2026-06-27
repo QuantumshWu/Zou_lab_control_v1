@@ -172,6 +172,7 @@ def run_server(
         fire_callback = hardware_backend.fire
         wait_done_callback = hardware_backend.wait_done
         safe_state_callback = hardware_backend.safe_state
+        scan_progress_callback = hardware_backend.scan_progress   # live scan cursor for the GUI poll
     elif backend_name == "command":
         hardware_backend = CommandSequencerBackend(
             Path(state_dir),
@@ -185,6 +186,7 @@ def run_server(
         fire_callback = hardware_backend.fire
         wait_done_callback = hardware_backend.wait_done
         safe_state_callback = hardware_backend.safe_state
+        scan_progress_callback = None        # the command backend has no live scan cursor
     else:
         raise ValueError("backend must be 'jtag-axi' or 'command'.")
     cache_prepared = _env_bool("ZLC_SEQUENCER_CACHE_PREPARED", False)
@@ -196,6 +198,7 @@ def run_server(
         fire_callback=fire_callback,
         wait_done_callback=wait_done_callback,
         safe_state_callback=safe_state_callback,
+        scan_progress_callback=scan_progress_callback,
         cache_prepared=cache_prepared,
     )
     print("Zou_lab_control sequencer service")

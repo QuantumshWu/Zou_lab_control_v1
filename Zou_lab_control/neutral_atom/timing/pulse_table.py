@@ -308,6 +308,7 @@ class PulseTableState:
         repeat_end: int | None = None,
         repeat_count: int = 1,
         repeat_forever: bool = True,
+        scan_repeats: int = 0,
         visible_channels: Sequence[str] | None = None,
         channel_labels: Mapping[str, str] | None = None,
         analog_buses: Mapping[str, Sequence[str]] | None = None,
@@ -332,6 +333,11 @@ class PulseTableState:
         self.repeat_end = None if repeat_end is None else int(repeat_end)
         self.repeat_count = int(repeat_count)
         self.repeat_forever = bool(repeat_forever)
+        # Number of FULL scan sweeps before the scan stops: 0 = sweep forever (the default,
+        # matching the seamless cyclic streaming), K>=1 = play every scan point K times then
+        # halt.  ORTHOGONAL to the measurement-layer camera ``repeat`` (frames per point); this
+        # counts whole-table sweeps of the scan_table / api sweep.
+        self.scan_repeats = max(0, int(scan_repeats))
         self.visible_channels = list(channel_names(visible_channels, "visible_channels", allow_empty=True)) if visible_channels is not None else default_visible_channels(self.channels)
         self.channel_labels = {str(k): str(v) for k, v in dict(channel_labels or {}).items()}
         self.analog_buses = {
@@ -1599,6 +1605,7 @@ class PulseTableState:
             "repeat_end": self.repeat_end,
             "repeat_count": self.repeat_count,
             "repeat_forever": self.repeat_forever,
+            "scan_repeats": int(self.scan_repeats),
             "clk_channels": list(self.clk_channels),
         }
 
@@ -1659,6 +1666,7 @@ class PulseTableState:
             repeat_end=payload.get("repeat_end"),
             repeat_count=int(payload.get("repeat_count", 1)),
             repeat_forever=bool(payload.get("repeat_forever", True)),
+            scan_repeats=int(payload.get("scan_repeats", 0)),
             clk_channels=payload.get("clk_channels"),
         )
 

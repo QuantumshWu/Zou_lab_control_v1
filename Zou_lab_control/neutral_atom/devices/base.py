@@ -255,6 +255,15 @@ class SequencerDevice(BaseDevice):
 
         return True
 
+    def scan_progress(self) -> dict:
+        """Where the running scan is now: the SINGLE-source dict {scanning, point, n_points,
+        sweep, n_repeats} (see ``sequencer.scan_progress_fields``).  A backend with no live
+        scan -- or one that does not track progress -- reports idle.  The GUI polls this to show
+        "point K / N · sweep r / R"; virtual and real backends return the same shape."""
+
+        from .sequencer import SCAN_PROGRESS_IDLE
+        return dict(SCAN_PROGRESS_IDLE)
+
     def settle(self, seconds: float, *, stop: "threading.Event | None" = None) -> None:
         """Idle for ``seconds`` after a finite pulse before the next load+fire.
 

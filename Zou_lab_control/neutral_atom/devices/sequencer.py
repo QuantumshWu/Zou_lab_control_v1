@@ -192,6 +192,11 @@ class RuntimeSequenceProgram:
     scan_points: list[list[int]] | None = None
     scan_point_durations: list[float] | None = None
     scan_coeff_frac_bits: int = 8
+    # Number of FULL scan sweeps before the scan stops: 0 = sweep forever (seamless cyclic
+    # streaming, the default), K>=1 = play every scan point K times then halt (the host counts
+    # sweeps from the CURSOR wrap and issues the engine stop -- no RTL change).  Inert unless
+    # ``scan_points`` is set.
+    scan_repeats: int = 0
     bus_names: list[str] | None = None
     bus_segments: list[RuntimeBusSegment] | None = None
     # PHYSICAL DAC-BUS DELAY: per-bus delay in ticks, realised by the per-signal EVENT SCHEDULER
@@ -234,6 +239,7 @@ class RuntimeSequenceProgram:
             "scan_points": [list(point) for point in (self.scan_points or [])],
             "scan_point_durations": list(self.scan_point_durations or []),
             "scan_coeff_frac_bits": int(self.scan_coeff_frac_bits),
+            "scan_repeats": int(self.scan_repeats),
             "bus_names": list(self.bus_names or []),
             "bus_segments": [segment.to_dict() for segment in (self.bus_segments or [])],
             "bus_delays": [bd.to_dict() for bd in (self.bus_delays or [])],
@@ -277,6 +283,7 @@ class RuntimeSequenceProgram:
             scan_points=[[int(v) for v in item] for item in payload.get("scan_points", [])] or None,
             scan_point_durations=[float(v) for v in payload.get("scan_point_durations", [])] or None,
             scan_coeff_frac_bits=int(payload.get("scan_coeff_frac_bits", 8)),
+            scan_repeats=int(payload.get("scan_repeats", 0)),
             bus_names=[str(item) for item in payload.get("bus_names", [])] or None,
             bus_segments=[RuntimeBusSegment.from_dict(item) for item in payload.get("bus_segments", [])] or None,
             bus_delays=[RuntimeBusDelay.from_dict(item) for item in payload.get("bus_delays", [])] or None,
@@ -287,6 +294,35 @@ class RuntimeSequenceProgram:
     @property
     def scan_enabled(self) -> bool:
         return bool(self.scan_points)
+
+
+#: The idle scan-progress reading -- no scan running.  SINGLE SOURCE for the dict shape every
+#: SequencerDevice.scan_progress() returns, so the GUI poll + the virtual/real backends agree.
+SCAN_PROGRESS_IDLE: dict[str, object] = {
+    "scanning": False, "point": 0, "n_points": 0, "sweep": 0, "n_repeats": 0,
+}
+
+
+def scan_progress_fields(point_total: int, n_points: int, scan_repeats: int) -> dict[str, object]:
+    """Turn a MONOTONIC played-point count into the scan-progress reading.
+
+    ``point_total`` = how many scan points have been played since the scan started (it keeps
+    counting across sweep wraps: sweep s, point p -> s*N + p).  Returns the SINGLE-source dict
+    {scanning, point (0-based in the current sweep), n_points N, sweep (0-based), n_repeats K}.
+    For a finite scan (K>=1) the reading saturates at the last point of sweep K-1 and reports
+    ``scanning=False`` once K full sweeps are done; an infinite scan (K=0) never stops.  Shared
+    by the virtual sequencer (point_total from wall-clock) and the real streamer (point_total =
+    CURSOR + wraps), so both report progress identically (virtual==real)."""
+
+    n = int(n_points)
+    k = max(0, int(scan_repeats))
+    if n <= 0:
+        return dict(SCAN_PROGRESS_IDLE)
+    total = max(0, int(point_total))
+    if k > 0 and total >= k * n:
+        # K full sweeps done: saturate at the last point and stop.
+        return {"scanning": False, "point": n - 1, "n_points": n, "sweep": k - 1, "n_repeats": k}
+    return {"scanning": True, "point": total % n, "n_points": n, "sweep": total // n, "n_repeats": k}
 
 
 def compile_runtime_program(
@@ -748,6 +784,7 @@ def compile_pulse_table_scan_runtime_program(
         scan_points=points_ticks,
         scan_point_durations=point_durations,
         scan_coeff_frac_bits=coeff_frac_bits,
+        scan_repeats=max(0, int(getattr(state, "scan_repeats", 0))),
         bus_names=bus_names or None,
         bus_segments=bus_segments or None,
         bus_delays=bus_delays or None,
@@ -839,6 +876,7 @@ class SequencerService:
         fire_callback: Callable[[RuntimeSequenceProgram], None] | None = None,
         wait_done_callback: Callable[[RuntimeSequenceProgram, float | None], bool] | None = None,
         safe_state_callback: Callable[[], None] | None = None,
+        scan_progress_callback: Callable[[], dict] | None = None,
         sleep_scale: float = 0.0,
         cache_prepared: bool = True,
     ):
@@ -849,6 +887,7 @@ class SequencerService:
         self.fire_callback = fire_callback
         self.wait_done_callback = wait_done_callback
         self.safe_state_callback = safe_state_callback
+        self.scan_progress_callback = scan_progress_callback
         self.sleep_scale = nonnegative_float(sleep_scale, "sleep_scale")
         self.cache_prepared = bool(cache_prepared)
         self._lock = threading.RLock()
@@ -1004,6 +1043,13 @@ class SequencerService:
         if self.safe_state_callback is not None:
             self.safe_state_callback()
 
+    def scan_progress(self) -> dict:
+        """Where the running scan is now -- delegates to the hardware backend's reading when one is
+        wired (the real streamer), else idle (a pure-software service has no live scan cursor)."""
+        if self.scan_progress_callback is not None:
+            return dict(self.scan_progress_callback())
+        return dict(SCAN_PROGRESS_IDLE)
+
     def snapshot(self) -> dict[str, object]:
         with self._lock:
             return {
@@ -1060,6 +1106,9 @@ class RuntimeSequencer(SequencerDevice):
 
     def wait_done(self, timeout: float | None = None) -> bool:
         return self.service.wait_done(timeout)
+
+    def scan_progress(self) -> dict:
+        return self.service.scan_progress()
 
     def settle(self, seconds: float, *, stop=None) -> None:
         # Scale the inter-shot wait by the service's sleep_scale, so it fast-forwards under the
@@ -1222,6 +1271,16 @@ class RemoteSequencer(SequencerDevice):
         self.open()
         return bool(self._conn.root.wait_done(timeout))
 
+    def scan_progress(self) -> dict:
+        # Lightweight poll for the GUI's live scan progress -- reconnect like every other call so a
+        # server blip never wedges the poller; fall back to idle if the server lacks the method.
+        from .base import SequencerDevice
+        self.open()
+        try:
+            return dict(self._conn.root.scan_progress())
+        except AttributeError:
+            return SequencerDevice.scan_progress(self)
+
     def abort(self) -> None:
         # Reconnect first, exactly like fire/wait_done/set_safe_state.  abort runs
         # on the error / safing path -- precisely when a server restart or network
@@ -1329,6 +1388,7 @@ class PulseController:
         slots: Mapping[str, float] | None = None,
         scan_table: Sequence[Sequence[float]] | None = None,
         repeat_forever: bool | None = None,
+        scan_repeats: int | None = None,
     ) -> PulseSequence | PulseTableState:
         if isinstance(self.pulse, PulseTableState):
             table = self.scan_table if scan_table is None else scan_table
@@ -1342,9 +1402,14 @@ class PulseController:
                 payload = self.pulse.with_slots_resolved(merged)
             else:
                 payload = self.pulse
-            if repeat_forever is not None:
+            # repeat_forever / scan_repeats overrides go through the dict (the same seam the GUI
+            # / save bundle use); scan_repeats=K>0 means "K whole sweeps then stop" (0 = forever).
+            if repeat_forever is not None or scan_repeats is not None:
                 data = payload.to_dict()
-                data["repeat_forever"] = bool(repeat_forever)
+                if repeat_forever is not None:
+                    data["repeat_forever"] = bool(repeat_forever)
+                if scan_repeats is not None:
+                    data["scan_repeats"] = max(0, int(scan_repeats))
                 payload = PulseTableState.from_dict(data)
             return payload
         if repeat_forever is not None:
@@ -1382,8 +1447,10 @@ class PulseController:
         *,
         scan_table: Sequence[Sequence[float]] | None = None,
         repeat_forever: bool | None = None,
+        scan_repeats: int | None = None,
     ) -> RuntimeSequenceProgram:
-        self.last_program = self.sequencer.prepare(self.payload(scan_table=scan_table, repeat_forever=repeat_forever))
+        self.last_program = self.sequencer.prepare(
+            self.payload(scan_table=scan_table, repeat_forever=repeat_forever, scan_repeats=scan_repeats))
         return self.last_program
 
     def on_pulse(
@@ -1393,8 +1460,9 @@ class PulseController:
         timeout: float | None = None,
         scan_table: Sequence[Sequence[float]] | None = None,
         repeat_forever: bool | None = None,
+        scan_repeats: int | None = None,
     ) -> RuntimeSequenceProgram:
-        payload = self.payload(scan_table=scan_table, repeat_forever=repeat_forever)
+        payload = self.payload(scan_table=scan_table, repeat_forever=repeat_forever, scan_repeats=scan_repeats)
         if wait and timeout is None and bool(getattr(payload, "repeat_forever", False)):
             raise RuntimeError(
                 "pulse.on_pulse(wait=True) cannot wait for a repeat_forever pulse without a timeout. "
@@ -2495,6 +2563,9 @@ def serve_runtime_sequencer(
 
         def exposed_set_safe_state(self):
             return service.set_safe_state()
+
+        def exposed_scan_progress(self):
+            return service.scan_progress()
 
         def exposed_snapshot(self):
             return service.snapshot()
