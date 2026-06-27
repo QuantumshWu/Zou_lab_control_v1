@@ -68,18 +68,36 @@ def bus_signed_range(n_bits: int) -> tuple[int, int]:
 #: event-FIFO depth), which the compiler checks and reports.
 DELAY_MAX_TICKS = (1 << 31) - 1
 
-#: Scan-slot kinds.  ``duration`` binds a period duration, ``delay`` binds a
-#: channel delay, ``dac`` binds one analog-bus value in one period.
-SCAN_SLOT_KINDS = ("duration", "dac")
-SLOT_VAR_RE = re.compile(r"^s(?P<index>\d+)$")
+@dataclass(frozen=True)
+class FieldKind:
+    """What ONE bindable pulse FIELD kind supports.
 
-#: API-slot kinds.  An API slot is a NAMED HANDLE (``a1``, ``a2`` ...) on a field so
-#: an external caller / Task can set it BY NAME -- ``state.set_api("a1", 1e-3)`` or
-#: ``state.a1 = 1e-3`` -- without parsing "which signal of which period".  UNLIKE a
-#: scan slot it does NOT rewrite the field to a variable: the field keeps its concrete
-#: value (the slot is just a stable label pointing at it), so the GUI keeps showing the
-#: number.  Delay IS allowed (a fixed value the API may set), so all three kinds qualify.
-API_SLOT_KINDS = ("duration", "delay", "dac")
+    A field can carry a SCAN slot (rewrite to a streamed variable ``sN``, values from
+    the scan table) and/or an API slot (a NAMED HANDLE ``aN`` that KEEPS the field's
+    concrete value -- a stable label an external caller / Task sets by name via
+    ``state.set_api("a1", v)`` / ``state.a1 = v``, without parsing "which signal of which
+    period").  ``target`` describes the field's target-token shape.  ONE row per kind --
+    the single source the scan/API rules derive from, so delay's "API yes, SCAN no"
+    (a per-channel/bus delay is a FIXED output delay line, not a sweepable value) is ONE
+    fact here, not three docstrings + two ``__post_init__`` rejections + a bind guard."""
+
+    api: bool
+    scan: bool
+    target: str   # the target-token shape: period | bus@period | channel
+
+#: The SINGLE SOURCE OF TRUTH for bindable field kinds.  Order matters only for the
+#: derived tuples below; membership is what the rest of the module checks.
+FIELD_KINDS = {
+    "duration": FieldKind(api=True, scan=True, target="period"),
+    "delay":    FieldKind(api=True, scan=False, target="channel"),   # delay can API, never SCAN
+    "dac":      FieldKind(api=True, scan=True, target="bus@period"),
+}
+
+#: Derived from FIELD_KINDS -- NEVER hand-maintained.  A scan slot may bind a kind whose
+#: ``scan`` is True; an API slot any kind whose ``api`` is True (delay qualifies for API only).
+SCAN_SLOT_KINDS = tuple(k for k, v in FIELD_KINDS.items() if v.scan)
+API_SLOT_KINDS = tuple(k for k, v in FIELD_KINDS.items() if v.api)
+SLOT_VAR_RE = re.compile(r"^s(?P<index>\d+)$")
 API_VAR_RE = re.compile(r"^a(?P<index>\d+)$")
 
 
