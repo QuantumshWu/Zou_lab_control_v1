@@ -194,6 +194,34 @@ def test_temperature_template_rejects_a_missing_file():
         exp.close()
 
 
+def test_temperature_survival_reaches_zero_at_large_trap_off():
+    """#H3v-2: survival DROPS TO ~0 at large trap-off (the atoms physically fly away) -- the model is
+    REAL ballistic loss, NOT a faked saturating curve.  The floor the user saw came from imaging the
+    survival frames at a different exposure than the thresholds were calibrated at: a threshold is
+    exposure-specific, so empty sites crossed a mismatched threshold = a readout false-positive floor
+    that never reached 0.  The Temperature SPEC build now images at the SAME exposure the thresholds were
+    learnt at (recorded on the calibration metadata), so the readout self-matches and survival -> 0."""
+    exp = _calibrated_virtual_session(grid=(5, 7), readout_exposure=20e-3)
+    try:
+        # the calibration records the exposure its thresholds were learnt at (so the readout self-matches)
+        assert exp.readout.current.metadata.get("threshold_exposure") == pytest.approx(20e-3)
+        spec = {s.name: s for s in exp.readout.measurement_specs()}["Temperature"]
+        scan = spec.build(template="pulses/release_recapture.json",
+                          t_off=(0.0, 2000.0, 6), shots=40).run(live=False, display=False)
+        y = np.asarray(scan.y)
+        assert y[0] >= 0.9                          # nearly all atoms recaptured at t_off = 0
+        assert y[-1] <= 0.02                        # survival reaches ~0 at large trap-off (atoms gone)
+        assert y[0] - y[-1] >= 0.85                 # a full ballistic fall-off, not a high floor
+
+        # the PHYSICAL model itself drops to 0 occupancy (proves real dynamics, not a faked floor): at a
+        # large trap-off EVERY atom ballistically escapes the capture radius before the recapture.
+        ta = exp.devices.trap_array
+        ta.occupancy = np.ones(ta.n_sites, dtype=bool)
+        assert int(ta.apply_recapture_loss(5e-3).sum()) == 0
+    finally:
+        exp.close()
+
+
 def test_virtual_parses_trap_off_from_release_recapture_sequence():
     """The virtual data source recovers ``t_off`` from the SAME fired sequence the
     analysis layer built: it is the trap-channel OFF gap between the two camera

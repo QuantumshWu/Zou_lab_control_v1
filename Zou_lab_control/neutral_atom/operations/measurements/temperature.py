@@ -27,6 +27,18 @@ from ..temperature import build_release_recapture_pulse
 DEFAULT_RR_TEMPLATE = "pulses/release_recapture.json"
 
 
+def _match_imaging_exposure(state: PulseTableState, exposure_s: float) -> None:
+    """Set every image-EXPOSE period of the release-recapture template to ``exposure_s`` so the survival
+    frames are imaged at the SAME exposure the readout thresholds were calibrated at.  A threshold is
+    exposure-specific (bright counts scale with the imaging time), so a mismatch leaves empty sites above
+    a too-low threshold = a false-positive floor that stops survival reaching 0 even when all atoms are
+    physically gone (#H3v-2).  The trap-off scan slot + settle/recapture periods are left untouched."""
+    ns = float(exposure_s) * 1e9
+    for i, period in enumerate(state.periods):
+        if "expose" in str(period.name):
+            state.set_period_duration(i, ns, unit="ns")
+
+
 def _resolve_release_recapture_template(template: str, sequencer) -> PulseTableState:
     """Load the release-recapture pulse the operator SELECTED and map its role channels onto whatever
     THIS sequencer exposes.  When the template's channels are already all on the sequencer (the virtual
@@ -61,6 +73,14 @@ def temperature_release_recapture(readout) -> MeasurementSpec:
         # The SELECTED release-recapture pulse, channel-mapped to this sequencer (real ch00.. vs
         # virtual roles).  Its trap-off duration slot s0 is the t_off scan axis.
         state = _resolve_release_recapture_template(template, s.devices.sequencer)
+        # Image the survival frames at the SAME exposure the thresholds were calibrated at (recorded on
+        # the calibration metadata): a threshold is exposure-specific, so a mismatch floors the survival
+        # at the readout false-positive rate and it never reaches 0 (#H3v-2).  A high-SNR calibration
+        # exposure then yields a clean survival -> 0 at large t_off (the real ballistic loss).
+        cal = s.require_calibration(require_thresholds=True)
+        expo = (cal.metadata or {}).get("threshold_exposure") if isinstance(getattr(cal, "metadata", None), dict) else None
+        if expo:
+            _match_imaging_exposure(state, float(expo))
         from ...devices import bind_pulse  # lazy: keep operations->devices off import-time graph
 
         pulse = bind_pulse(s.devices.sequencer, state)
