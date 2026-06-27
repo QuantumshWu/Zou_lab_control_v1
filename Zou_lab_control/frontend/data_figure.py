@@ -417,6 +417,12 @@ class DataFigure:
         return FitResult(self.popt_str, popt, pcov, self.fit_func), popt
 
     def gaussian(self, p0=None, is_display: bool = True, is_fit: bool = True, **kwargs):
+        # NOTE (DRY boundary, #H3w-5): this is the INTERACTIVE CURVE-FIT model for a 1-D plot -- a peak
+        # on a BACKGROUND, so it carries an ``offset`` (B) term and amplitude may be negative (a dip).
+        # It is deliberately DISTINCT from ``_readout_math.gaussian`` (a normalised, offset-free PEAK
+        # used by the per-site readout fidelity math).  Different models for different jobs -- do NOT
+        # "unify" them; the offset here would corrupt the readout overlap integral, and removing it
+        # would break fitting a peak that sits on a pedestal.
         if self.plot_type == "2D":
             return FitResult(["A", "B", "sigma", "x_0"], None, None, "gaussian"), None
         self.data_x_p, self.data_y_p = self._select_fit(min_num=4)
