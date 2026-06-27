@@ -27,11 +27,14 @@ class RearrangeSubsystem(ExperimentSubsystem):
 
     def _frame_provider(self):
         """A closure that images ONE frame through the readout's imaging path (the SAME sequence the
-        sitemap / detect calls fire) -- so the rearrange task images identically to the rest of readout."""
+        sitemap / detect calls fire) -- so the rearrange task images identically to the rest of readout.
+        ``load`` fires the cooling/MOT load first: True for the initial image (a fresh array), False for
+        the post-rearrange image (image the assembled atoms WITHOUT reloading -- on real hardware a
+        reload would cool a new random array on top of the rearranged one)."""
         s = self._session
 
-        def image_once(exposure: float):
-            sequence = s._imaging_sequence(exposure=float(exposure), load=True, name="rearrange")
+        def image_once(exposure: float, load: bool = True):
+            sequence = s._imaging_sequence(exposure=float(exposure), load=bool(load), name="rearrange")
             frames = s.devices.camera.acquire(1, sequence=sequence, sequencer=getattr(s.devices, "sequencer", None))
             return frames[-1]
 

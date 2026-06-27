@@ -100,6 +100,36 @@ def test_rearrange_task_is_auto_discovered():
     assert "Rearrange array" in names, "the rearrange task must appear in the Add-Panel Task group"
 
 
+def test_post_rearrange_image_does_not_reload(monkeypatch):
+    """Real-correctness invariant: the INITIAL image loads a fresh array (load=True) but the
+    post-rearrange image must NOT re-cool a new array on top of the assembled atoms (load=False).
+    On the virtual camera the pin masks this; on real hardware a reload would destroy the array."""
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.neutral_atom.operations.logic import RearrangeTask
+
+    loads = []
+
+    class _Det:
+        occupied = np.zeros(GRID[0] * GRID[1], dtype=bool)
+
+    class _Cal:
+        def detect(self, frame):
+            return _Det()
+
+    class _AOD:
+        def apply_moves(self, moves, *, survival=None):
+            pass
+
+    def frame_provider(exposure, load):
+        loads.append(load)
+        return np.zeros((8, 8), dtype=float)
+
+    task = RearrangeTask(SignalHub(), camera=None, aod=_AOD(), grid_shape=GRID,
+                         frame_provider=frame_provider, calibration_provider=_Cal)
+    task.run_to_completion()
+    assert loads == [True, False], f"expected [load, no-reload], got {loads}"
+
+
 def test_end_to_end_virtual_rearrange_assembles_defect_free_array():
     """The whole flow on the virtual backend: calibrate -> load sparsely -> exp.rearrange.execute() ->
     the re-image SEES a filled defect-free target (fill fraction == 1 at perfect transfer)."""

@@ -1313,12 +1313,16 @@ class RearrangeTask(Task):
             sv = float(values["move_survival"])
             self.move_survival = None if sv < 0 else sv      # -1 (or any <0) = use the device default
 
-    def _image_occupancy(self, calibration):
+    def _image_occupancy(self, calibration, *, load: bool):
         """Image one frame through the readout path + classify per-site occupancy via the calibration
-        (the SAME ``TrapCalibration.detect`` contract the live OccupancyProcessor uses)."""
+        (the SAME ``TrapCalibration.detect`` contract the live OccupancyProcessor uses).  ``load`` fires
+        the cooling/MOT load first (a FRESH array) -- True for the INITIAL image, but the post-rearrange
+        image MUST use ``load=False`` so the cooling light does not reload a new random array on top of
+        the atoms the AOD just assembled (on the virtual camera the pin masks this; on real hardware a
+        reload would destroy the rearranged array)."""
         if self._frame_provider is None:
             raise RuntimeError("RearrangeTask has no frame_provider; build it via exp.rearrange.task(...).")
-        frame = self._frame_provider(self.readout_exposure)
+        frame = self._frame_provider(self.readout_exposure, load)
         occupied = np.asarray(calibration.detect(frame).occupied, dtype=bool).reshape(-1)
         return frame, occupied
 
@@ -1328,7 +1332,7 @@ class RearrangeTask(Task):
         calibration = self._calibration_provider()        # thresholded calibration (raises if missing)
 
         out.publish(progress=0.05, stage="imaging initial loading")
-        frame0, occ0 = self._image_occupancy(calibration)
+        frame0, occ0 = self._image_occupancy(calibration, load=True)   # fresh stochastic load + image
         out.publish(frame_before=frame0, occupancy_before=occ0.astype(float),
                     progress=0.25, stage=f"{int(occ0.sum())} atoms loaded")
 
@@ -1343,7 +1347,8 @@ class RearrangeTask(Task):
             self.aod.apply_moves(plan.moves, survival=self.move_survival)
 
         out.publish(progress=0.7, stage="imaging rearranged array")
-        frame1, occ1 = self._image_occupancy(calibration)
+        # load=False: image the atoms the AOD just assembled WITHOUT re-cooling a fresh array on top
+        frame1, occ1 = self._image_occupancy(calibration, load=False)
         filled = int(sum(1 for t in targets if occ1[t]))
         fill = filled / max(1, len(targets))
         out.publish(frame_after=frame1, occupancy_after=occ1.astype(float),
