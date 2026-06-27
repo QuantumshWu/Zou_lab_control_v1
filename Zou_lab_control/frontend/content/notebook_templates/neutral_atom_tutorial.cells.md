@@ -121,6 +121,20 @@ occupancy_grid = shot.occupied.reshape(exp.devices.trap_array.grid_shape)
 occupancy_grid
 
 <!-- cell:markdown -->
+## AOD 重排:拼一个无缺陷阵列
+
+随机装载只填 ~50% 的位点。**重排**用 AOD(交叉声光偏转器)把已装载的原子一个个拖到一块连续的目标区,拼出无缺陷阵列:成像 → 判占据 → 解一个最小位移的指派(匈牙利算法,`operations.rearrangement`)→ 驱动 AOD 执行(真机是 RF 频率啁啾 = DAC 电压 ramp;虚拟是直接改占据态)→ 再成像报填充率。一行就能跑(需要先标定阈值 + 连接里有 `aod` 设备,虚拟默认就有):
+
+<!-- cell:code -->
+result = exp.rearrange.execute(target_count=6)   # 把最中心的 6 个位点拼满
+print(f"装载 {int(result['n_loaded'])} 原子 → {int(result['n_moves'])} 次移动 → "
+      f"填充 {int(result['n_filled'])}/{int(result['n_target'])} = {result['fill_fraction']:.0%}")
+result["occupancy_after"].reshape(exp.devices.trap_array.grid_shape)
+
+<!-- cell:markdown -->
+GUI 里同一个流程在 Task 控制台 **Add Panel → Task → "Rearrange array"**:跑起来后专属面板实时显示重排后的相机帧(`frame_after`),`occupancy_after` 还能接一个 2D site-map 面板看前后对比。换真机只改 `connect()`(真机配置里 `aod` = `RampAOD`,把 X/Y DAC ramp 打到 AOD 通道),分析与编排代码一字不改。
+
+<!-- cell:markdown -->
 ## Standalone array analysis
 
 有些算法不应该绑死在 session 上。只给 images 和 calibration，也可以重算 sitemap、threshold 或 detect。
