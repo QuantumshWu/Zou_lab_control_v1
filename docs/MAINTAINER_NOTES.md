@@ -1075,8 +1075,42 @@ They split into two tiers by WHERE the per-point reduce lives, NOT by being diff
 So "Temperature is a pulse-scan" is literally true at the model level (`ScanAxis` over a bound pulse
 slot); it sits in the coupled tier because its reduce is frame-structural. Adding a new
 single-slot coupled scan = a new `(plan, reducer)` pair + a `_build_slot_scan` call, never a new
-scan loop. Promoting one to the decoupled tier = ship its pulse as a `pulses/*.json` template + move
-its reduce into a `@processor`.
+scan loop.
+
+### The tier boundary is a HARD contract (do not try to merge the engines)
+
+The recurring temptation is to "finish" the unification by routing temperature / detection-time through
+the decoupled `PulseScanNode`. That is IMPOSSIBLE without breaking physics, and the boundary is enforced
+mechanically — pinned by `tests/test_scan_tier_boundary.py`:
+
+- **Decoupled per-point acquisition = `acquire(1)`: ONE camera trigger, ONE frame** (`logic.py`
+  `PulseScanNode.shot` → `camera.acquire(1, sequence=...)`). Its y is then a SINGLE-FRAME
+  `signal_expr` over the published `frame` (read off another node, e.g. `rate`).
+- **The coupled reducers need a multi-frame structure a single published frame cannot carry:**
+  - `SurvivalReducer` needs EXACTLY 2 frames from ONE atom loading (`temperature.py`: raises unless
+    `len(frames)==2`), produced by `ReleaseRecapturePlan` (`n_frames` fixed at 2 — the two camera
+    triggers of ONE release-recapture sequence, trap-off between them). "Survival" is per-atom only
+    because both reads share the loading; two independent loadings make it meaningless.
+  - `OtsuFidelityReducer` needs the per-point frame SET to pool counts and Otsu-split — a statistic
+    over the point's frames, not a single value.
+- **The device boundary refuses the merge by construction:** `sequence_for_frame_count`
+  (`timing/sequence.py`) raises when a sequence's camera-trigger count ≠ the requested frame count
+  (except the 1→N repeat = independent reloads). So feeding the 2-trigger release-recapture pulse to
+  the decoupled node's `acquire(1)` is a hard `ValueError`, and `acquire(2)` against a 1-trigger
+  imaging pulse reloads between frames — the wrong physics for survival.
+
+Therefore: **a measurement whose y needs ≥2 frames from one loading (survival) or a per-point frame-set
+statistic (Otsu fidelity) is IRREDUCIBLY coupled.** The promotion path (ship the pulse as `pulses/*.json`
++ move the reduce into a `@processor`) applies ONLY to single-frame reduces, NOT to survival/fidelity.
+Do NOT ship a `pulses/release_recapture.json`: the pulse is built programmatically by
+`build_release_recapture_pulse` from the live sequencer's channel roles, so a static JSON would hard-code
+`trap`/`probe`/`emCCD` names and drift on real `chNN` configs — the programmatic builder is the single source.
+
+Naming note (two different "fidelity" things): **"Fidelity vs duration"** = `readout_duration.py`
+(the detection-time scan, key `readout`) IS a coupled pulse-scan (covered above). The module
+`operations/fidelity.py` (`characterize_readout`, held-out train/test threshold fitting over labelled
+image GROUPS) is NOT a scan at all — no swept axis, no per-point acquire loop — so it is not a pulse-scan
+special case; it is the rigorous offline counterpart to the live `OtsuFidelityReducer` quick-look.
 
 ### Repeat is a measurement param; repeat_mode is a plot param (the data model)
 
