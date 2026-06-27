@@ -306,7 +306,10 @@ def _format_scan_progress(progress: Mapping[str, object] | None) -> str:
         return ""
     if not scanning or n_points <= 0:
         return ""
-    text = f"Scan: point {point + 1} / {n_points} · sweep {sweep + 1}"
+    # 1-based display; clamp the point to [1, N] so a malformed/boundary reading can never show
+    # "point N+1 / N" (scan_progress_fields keeps point in [0, N-1], so this is belt-and-suspenders).
+    point_1 = min(max(point + 1, 1), n_points)
+    text = f"Scan: point {point_1} / {n_points} · sweep {sweep + 1}"
     if n_repeats > 0:                      # finite K sweeps -> show "/ R"; ∞ (0) shows just "sweep r"
         text += f" / {n_repeats}"
     return text
