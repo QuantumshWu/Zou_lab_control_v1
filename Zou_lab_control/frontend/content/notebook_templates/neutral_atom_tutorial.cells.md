@@ -299,20 +299,25 @@ task_console 的设计原则是**自由搭建**——看板开出来是空的，
 每张面板底部都列出它**读 / 发**了哪些信号（重名会标 ⚠），所以不用猜 hub 里有什么名字（hub 里只有 measurement + processor 的输出，没有 task）。要调相机/判占据的 `grid_shape` / `exposure` / `roi_radius` / `method`，在那个节点**自己**的 Edit 标签里改 + **Apply**（两帧之间应用，不中断采集）；plot 面板的 Edit 直接给产它信号的那个 measurement/processor 的参数表单。换实机只改 `na.connect("virtual"→"qcmos")`，这一节一字不变。
 
 <!-- cell:code -->
-# 桌面 Qt 会话里取消注释,打开 Task 控制台 GUI。注意:本 notebook 上面用 ipympl 内联图,
-# 而 Task 控制台是 Qt 实时窗口(另一套事件循环)——两者不要在同一 kernel 同时跑;要用控制台请在
-# 新 kernel 里单独跑本节(完整的从零搭建流程见 task_console_tutorial.ipynb)。
-# %gui qt
-# from Zou_lab_control.neutral_atom.core.signals import SignalHub
-#
-# hub = SignalHub()
-# # session=exp 让 Add Panel 能从相机建 "Measurement: Camera (live frames)";看板开出来是空的——
-# # Add Panel -> Camera(发 frame) + Processor: Judge occupancy(真 detect),再 Add Panel ->
-# # Plot: Site map (value = occupied) / Plot: 2D (value = frame) 自己搭。
-# console = zf.show_task_console(hub=hub, session=exp,
-#                               measurements=exp.readout.measurement_specs(),
-#                               processors=exp.readout.processor_specs())
-# console
+# 一键打开 Task 控制台:`exp.task_console()` 自动把本 session 的 hub + 自动发现的
+# measurement / processor / task 目录都接好(等价于手写 zf.show_task_console(hub=..., session=exp,
+# measurements=..., processors=...),但一行搞定)。看板开出来是空的,从 Add Panel 自己搭
+# Camera(发 frame) -> Processor: Judge occupancy(真 detect) -> Plot: Site map (value = occupied) /
+# Plot: 2D (value = frame)。`exp.task_console(task="<名字>")` 还能直接载入 tasks/<名字>.json 的存盘布局。
+# 注意:Qt 实时窗口与本 notebook 上面的 ipympl 内联图是两套事件循环——建议重启 kernel 后,只跑
+# 上面那格 `exp = na.connect("virtual", ...)` + 本格(完整的从零搭建流程见 task_console_tutorial.ipynb)。
+console = exp.task_console()
+console
+
+<!-- cell:markdown -->
+## 一键打开 pulse GUI(编辑 / 扫描脉冲)
+
+`exp.pulse_gui()` 打开绑定到本 session 的脉冲编辑器(等价于不带 session 的 `zf.show_pulse_gui()`,但绑了 session 后测量端能读回编辑后的程序)。在 period 卡里改 duration / DAC / delay;给任意 duration / DAC / delay 字段点那个圆点,绑成 **API slot**(`aN`,紫色,按名设值——普通通道 delay 和 **DAC-bus delay 一样能绑**)或 **scan slot**(`sN`,可流式扫描);**Scan** 页给所有 scan slot 写一张 `N×n_slots` 的 `scan_table`(delay 只有 API slot、没有 scan slot)。换实机只改 `na.connect`,这一格不变。
+
+<!-- cell:code -->
+# 一键打开脉冲编辑器(绑定本 session,所以 exp.readout.* 测量能读回编辑后的时序):
+pulse_win = exp.pulse_gui()
+pulse_win
 
 <!-- cell:markdown -->
 ## Save calibration, status, and Verilog
