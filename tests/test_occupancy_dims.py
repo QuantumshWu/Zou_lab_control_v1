@@ -129,6 +129,11 @@ def test_describe_shape_renders_per_signal_structure():
         H, W = np.asarray(frame_judged).shape[1:]
         assert describe_shape(occupied, points_shape=occ_spec.points_shape,
                               data_shape=occ_spec.data_shape) == f"{REPEAT} × ({N_SITES})"
+        # #H3u-3: WITH the site grid, occupied reads "5 × (5×7)" (a site map) -- NEVER the meaningless
+        # "5 × 5×7 × (35)" that double-counted the sites (the 5×7 grid IS the 35 data).
+        assert describe_shape(occupied, points_shape=occ_spec.points_shape,
+                              data_shape=occ_spec.data_shape,
+                              grid_shape=GRID) == f"{REPEAT} × ({GRID[0]}×{GRID[1]})"
         assert describe_shape(frame_judged, points_shape=frame_spec.points_shape,
                               data_shape=frame_spec.data_shape) == f"{REPEAT} × ({H}×{W})"
         # centers declares NO structure -> raw shape, no repeat axis
@@ -185,4 +190,76 @@ def test_sites_panel_renders_the_averaged_per_site_map_from_occupancy():
     finally:
         if hasattr(card, "shutdown"):
             card.shutdown()
+        exp.close()
+
+
+def test_centers_align_with_the_judged_frame():
+    """#H3u-3 GUARD: the published `centers` (x, y) land on the BRIGHT atoms of `frame_judged` -- the
+    mean intensity AT the centers is much higher than the whole-frame mean, so the site-map rings sit ON
+    the atoms (not offset/swapped).  The wrong (row, col) order would NOT beat the control."""
+    from Zou_lab_control.frontend.live import reduce_repeat
+    hub = SignalHub()
+    exp, _, _ = _calibrated_occupancy(hub)
+    try:
+        centers = np.asarray(hub.latest("centers"), dtype=float)
+        fj = np.squeeze(reduce_repeat(np.asarray(hub.latest("frame_judged"), dtype=float), "average"))
+        h_img, w_img = fj.shape
+
+        def at(xy):
+            cx, cy = int(round(xy[0])), int(round(xy[1]))
+            return float(fj[cy, cx]) if (0 <= cy < h_img and 0 <= cx < w_img) else np.nan
+
+        i_xy = np.nanmean([at(c) for c in centers])                 # (x=col, y=row) -- the contract
+        i_swap = np.nanmean([at((c[1], c[0])) for c in centers])    # the wrong (row, col) order
+        control = float(np.nanmean(fj))
+        assert i_xy > control * 1.2, f"centers must sit on the bright atoms: {i_xy} vs control {control}"
+        assert i_xy > i_swap, "the (x, y) order beats the swapped (row, col) order -> not a coordinate swap"
+    finally:
+        exp.close()
+
+
+def test_sites_underlay_obeys_the_panel_repeat_mode():
+    """#H3u-3 GUARD: the site-map underlay (frame_judged) obeys the SAME `repeat_mode` Setting as the
+    rings -- 'average' = the long-exposure mean over the kept frames, 'replace' = the latest frame -- so
+    they differ (the hardcoded-'replace' bug had made repeat_mode a no-op for the underlay)."""
+    pytest.importorskip("PyQt5")
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.task_console import PanelCard, PanelConfig
+    from Zou_lab_control.frontend.live import reduce_repeat
+    ensure_qt_app()
+
+    hub = SignalHub()
+    exp, _, _ = _calibrated_occupancy(hub)
+    try:
+        def structure_provider(name):
+            if name == "occupied":
+                return {"points_shape": (), "data_shape": (N_SITES,), "grid_shape": GRID,
+                        "core_ndim": 1, "per_signal": True}
+            return None
+
+        def sites_inputs_provider(occ):
+            return ("centers", "frame_judged") if occ == "occupied" else (None, None)
+
+        ns = dict(hub.snapshot_latest())
+        raw = np.asarray(hub.latest("frame_judged"), dtype=float)
+
+        def underlay(mode):
+            card = PanelCard(PanelConfig(kind="sites", inputs=["occupied"], source="value = signal",
+                                         params={"repeat_mode": mode}),
+                             structure_provider=structure_provider,
+                             sites_inputs_provider=sites_inputs_provider)
+            try:
+                _, image = card._sites_aux(ns)
+            finally:
+                if hasattr(card, "shutdown"):
+                    card.shutdown()
+            return np.asarray(image, dtype=float)
+
+        avg, rep = underlay("average"), underlay("replace")
+        np.testing.assert_allclose(avg, np.squeeze(reduce_repeat(raw, "average")))   # long-exposure mean
+        np.testing.assert_allclose(rep, np.squeeze(reduce_repeat(raw, "replace")))   # the latest frame
+        assert not np.allclose(avg, rep)            # repeat_mode is NOT a no-op for the underlay
+    finally:
         exp.close()

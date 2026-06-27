@@ -2566,7 +2566,13 @@ class PanelCard(FluentGroupBox):
             image = np.asarray(image, dtype=float)
             if image.ndim >= 3:        # a (repeat, H, W) frame_judged block -> ONE coherent (H,W) underlay
                 from .live import reduce_repeat
-                image = np.squeeze(reduce_repeat(image, "replace"))   # the latest filled shot (not a blur)
+                # The underlay obeys the SAME ``repeat_mode`` Setting as the occupancy rings (#H3u-3):
+                # average = a long-exposure mean over the kept frames (coherent with the averaged
+                # occupancy), replace/roll = the latest frame, add = the summed frame.  A 2-D image
+                # cannot be per-repeat lines, so 'create' falls back to the latest (exactly as a 2-D
+                # panel offers no 'create') -- the rings and the frame are always the same reduction.
+                mode = str(self.config.params.get("repeat_mode", "average"))
+                image = np.squeeze(reduce_repeat(image, "replace" if mode == "create" else mode))
         return centers[:, :2], image
 
     def _co_names(self) -> frozenset:
