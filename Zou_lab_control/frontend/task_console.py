@@ -54,6 +54,7 @@ from .live import (
     panel_size_cells,
     site_ring_radius,
 )
+from .pulse_gui import slot_label   # the ONE human slot-label formatter (period/channel, #H3s-F2)
 from .qt_fluent import (
     ACCENT,
     CARD_PAD,
@@ -416,10 +417,10 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
         # the scan-slot scan table (legend + column_stack/grid buttons + program) -- one renderer.
         self._box.addWidget(FluentSectionLabel("API slots"))
         if api_rows:
-            api_labels = [f"{name}  ({kind} @ {target})" for name, kind, target, _u, _c in api_rows]
+            api_labels = [f"{name}  {slot_label(kind, target)}" for name, kind, target, _u, _c in api_rows]
             api_lw = setting_label_width(api_labels, minimum=72)   # same row rule as every form
             for name, kind, target, unit, current in api_rows:
-                label = f"{name}  ({kind} @ {target})"
+                label = f"{name}  {slot_label(kind, target)}"
                 edit = FluentLineEdit(self._api_remembered.get(name) or f"{float(current):g}", self)
                 edit.setMinimumWidth(scaled_px(120, minimum=96))
                 edit.setPlaceholderText(f"{unit}")
@@ -436,7 +437,7 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
             caption.setWordWrap(True)
             caption.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
             self._box.addWidget(caption)
-            api_columns = [(name, f"{kind} @ {target}", (unit or "value"))
+            api_columns = [(name, slot_label(kind, target), (unit or "value"))
                            for name, kind, target, unit, _c in api_rows]
             self._render_scan_table_body(api_columns, kind="api", optional=True)
             self._extra_delay = FluentLineEdit(self._extra_remembered, self)
@@ -465,8 +466,8 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
             self.changed.emit()
             return
         scan_columns = []
-        for i, (name, kind, target, unit, slot_label) in enumerate(scan_rows):
-            disp = slot_label or f"{kind} @ {target}"
+        for i, (name, kind, target, unit, stored_label) in enumerate(scan_rows):
+            disp = stored_label or slot_label(kind, target)
             u = "ns ticks" if kind == "duration" else ("integer code (LSB)" if kind == "dac" else (unit or ""))
             scan_columns.append((f"s{i}", disp, u))
         self._render_scan_table_body(scan_columns, kind="scan", optional=False)

@@ -244,18 +244,41 @@ def _api_number(name: object) -> int:
     return int(digits) if digits else 1
 
 
+def slot_label(kind: str, target: str, *, base_1: bool = True) -> str:
+    """Human label for a bound pulse field (a scan slot OR an api slot) from (kind, target) ALONE.
+
+    The raw ``target`` is an INTERNAL handle -- a 0-based period index (``duration``),
+    ``"<bus>@<period_index>"`` (``dac``), or a channel/bus name (``delay``) -- meaningless to
+    show verbatim (the user's "a1  duration @ 1" complaint: "what is 1?").  This names the PERIOD
+    (1-based, matching the 'Period N/M' on the card) / channel / bus, so the label carries real
+    information.  Needs NO ``PulseTableState`` -- pure (kind, target), so the pulse editor AND the
+    task console's pulse-scan form share ONE formatter instead of each dumping the raw target."""
+
+    target = str(target)
+    off = 1 if base_1 else 0
+    if kind == "duration":
+        try:
+            return f"Period {int(target) + off} duration"
+        except ValueError:
+            return f"Period {target} duration"
+    if kind == "dac":
+        bus, sep, period = target.partition("@")
+        if sep:
+            try:
+                return f"{bus} (Period {int(period) + off})"
+            except ValueError:
+                return f"{bus} (Period {period})"
+        return f"{bus} DAC"
+    if kind == "delay":
+        return f"{target} delay"            # the channel / bus name is the information
+    return target
+
+
 def _scan_slot_label(state: PulseTableState, index: int) -> str:
-    """Human description of scan slot ``index`` for GUI lists/tooltips."""
+    """Human description of scan slot ``index`` for GUI lists/tooltips (single source: slot_label)."""
 
     slot = state.scan_slots[index]
-    if slot.kind == "duration":
-        try:
-            return f"Period {int(slot.target) + 1} duration"
-        except ValueError:
-            return f"Period {slot.target} duration"
-    if slot.kind == "dac":
-        return f"{slot.dac_bus} (period {slot.dac_period + 1})"
-    return slot.target
+    return slot_label(slot.kind, slot.target)
 
 
 def _template_column_stack(n_slots: int) -> str:
