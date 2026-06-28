@@ -127,11 +127,21 @@ class ReadoutSubsystem(ExperimentSubsystem):
 
     # ------------------------------------------------------------- detection
     def detect(self, *, exposure: float | None = None, display: bool = True, what: str = "occupancy") -> DetectionResult:
-        """Acquire one shot and classify occupancy/counts against the calibration."""
+        """Acquire one shot and classify occupancy/counts against the calibration.
+
+        The default readout exposure is the calibration's ``threshold_exposure`` -- the gate time the
+        thresholds were LEARNT at -- NOT the camera's current exposure.  The per-site thresholds (bright
+        counts) are only valid at the exposure they were measured at: imaging at a different exposure
+        (e.g. a 2 ms frame against 20 ms thresholds) classifies every atom dark -> ~50 % occupancy while
+        the calibration still claims 99 %.  Single source: this exposure, the calibration, and a re-image
+        always agree (#issue-2)."""
 
         s = self._session
         calibration = s.require_calibration(require_thresholds=True)
-        sequence = s._imaging_sequence(exposure=s._camera_exposure() if exposure is None else exposure, load=True, name="detect")
+        if exposure is None:
+            md = getattr(calibration, "metadata", {}) or {}
+            exposure = md.get("threshold_exposure") or s._camera_exposure()
+        sequence = s._imaging_sequence(exposure=float(exposure), load=True, name="detect")
         images = s.devices.camera.acquire(1, sequence=sequence, sequencer=getattr(s.devices, "sequencer", None))
         result = detect_image(images[-1], calibration, sequence=sequence, display=display, what=what)
         s.history.append(result)
