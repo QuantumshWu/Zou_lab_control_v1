@@ -95,6 +95,42 @@ def test_calibrate_task_computes_every_method_processor_picks(threshold_method):
         exp.close()
 
 
+def test_calibrate_task_pins_live_camera_exposure_to_the_readout_gate():
+    """#issue-2 (live sitemap path): after a live calibration the session camera exposure is PINNED to
+    the gate the thresholds were learnt at (``threshold_exposure``), so the live OccupancyProcessor --
+    which judges the RUNNING pulse's frames at the camera exposure -- self-matches the calibration
+    instead of imaging at a stale default (which would classify every atom dark while the report says
+    99 %).  Calibrate at a SHORT 4 ms readout while the camera default is 20 ms, then verify the live
+    judge is accurate (not chance)."""
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.neutral_atom.operations.logic import CameraMeasurement, OccupancyProcessor
+
+    exp = _calibrated()
+    try:
+        exp.devices.camera.exposure = 0.020                  # stale default -- DIFFERENT from the readout gate
+        task = exp.readout.calibrate_task(
+            SignalHub(), threshold_method="otsu", threshold_frames=24, readout_exposure=0.004)
+        task.run_to_completion()
+        # the live readout exposure is now the calibrated gate, not the stale 20 ms default
+        assert exp.devices.camera.exposure == pytest.approx(0.004), exp.devices.camera.exposure
+        assert (task.calibration.metadata or {}).get("threshold_exposure") == pytest.approx(0.004)
+        # and the live judge (camera frame at the pinned exposure) is accurate, not ~0.5 chance
+        fire_live_imaging(exp)
+        accs = []
+        for _ in range(8):
+            hub = SignalHub()
+            cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer)
+            occ = OccupancyProcessor(hub, calibration=task.calibration,
+                                     source_expr={"inputs": ["frame"], "source": "value = signal"}, method="box")
+            cam.step(); occ.step()
+            pred = np.asarray(hub.latest("occupied"), dtype=bool).reshape(-1)
+            truth = np.asarray(exp.devices.trap_array.occupancy, dtype=bool).reshape(-1)
+            accs.append(float((pred == truth).mean()))
+        assert np.mean(accs) >= 0.75, f"live occupancy must match at the pinned exposure, got {np.mean(accs):.3f}"
+    finally:
+        exp.close()
+
+
 def test_calibrate_task_live_writes_canonical_calibration_json_for_the_detector(tmp_path):
     """A live calibration writes the CANONICAL ``folder/calibration.json`` -- the stable,
     named file the Judge-occupancy detector loads -- plus the report artifacts, ALL directly

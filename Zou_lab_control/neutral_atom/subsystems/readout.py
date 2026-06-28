@@ -675,6 +675,19 @@ class ReadoutSubsystem(ExperimentSubsystem):
             # so a decoupled live OccupancyProcessor begins judging sites the moment this
             # task completes -- no path to type, the cali->occupancy connection.
             s._calibration = calibration
+            # Pin the LIVE readout exposure to the gate the thresholds were learnt at
+            # (``threshold_exposure``): the live OccupancyProcessor judges the RUNNING pulse's frames,
+            # and a per-site threshold is exposure-specific -- calibrating at the short readout gate but
+            # imaging live at the camera default classifies every atom dark (~50 % occupancy while the
+            # report says 99 %).  Setting the camera exposure to the calibrated gate makes the default
+            # live readout self-match (#issue-2 live path); a frame still imaged at a different gate is
+            # the operator's explicit choice.  threshold_exposure is stamped by calibrate_threshold_from_images.
+            expo = (getattr(calibration, "metadata", {}) or {}).get("threshold_exposure")
+            if expo:
+                try:
+                    s.devices.camera.exposure = float(expo)
+                except Exception:
+                    pass
 
         return CalibrateReadoutTask(hub, s.devices.camera,
                                     sequencer=getattr(s.devices, "sequencer", None),
