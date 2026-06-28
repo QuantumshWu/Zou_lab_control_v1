@@ -73,6 +73,32 @@ def test_logic_node_prefix_disambiguates_against_a_lingering_hub_signal():
         exp.close()
 
 
+def test_restart_reclaims_its_own_lingering_prefix_not_a_new_one():
+    """#issue-1: restarting the SAME node must REUSE its (empty) prefix -- reclaiming its OWN lingering
+    signals -- not take a fresh 'judge_occupancy_2_' prefix.  Otherwise after Stop->Start its signals are
+    renamed and every panel bound to 'occupied' / the sitemap goes UNBOUND.  A DIFFERENT same-kind node
+    still disambiguates (the H3y behaviour is preserved)."""
+    from types import SimpleNamespace
+    from Zou_lab_control.frontend.task_console import LogicNodeConfig
+    exp, console = _console()
+    try:
+        cfg = LogicNodeConfig(kind="processor", name="Judge occupancy", title="Judge occupancy")
+        assert console._logic_node_prefix(cfg) == ""                 # first start: no collision, short names
+        # it ran then STOPPED: its 'occupied' lingers AND its built node survives in _last_node (tagged
+        # with instance_label == the node title, as _start_logic_node does).
+        console.hub.publish({"occupied": np.zeros(6), "rate": 0.4})
+        console._last_node[id(cfg)] = SimpleNamespace(
+            instance_label="Judge occupancy", published_signals=lambda: ["occupied", "rate"])
+        # RESTART the SAME node -> must reclaim "" (its own lingering signals are not a collision)
+        assert console._logic_node_prefix(cfg) == "", "restart must reuse its prefix, not rename -> unbound"
+        # a DIFFERENT same-kind node STILL disambiguates against the lingering 'occupied'
+        other = LogicNodeConfig(kind="processor", name="Judge occupancy", title="Judge occupancy #2")
+        assert console._logic_node_prefix(other) != ""
+    finally:
+        console.shutdown()
+        exp.close()
+
+
 def _add_node(console, match):
     kc = console.kind_combo
     for i in range(kc.count()):

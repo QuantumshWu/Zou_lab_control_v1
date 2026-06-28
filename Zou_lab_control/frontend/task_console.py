@@ -5400,8 +5400,18 @@ class TaskConsole(QtWidgets.QWidget):
                 running.update(str(s) for s in n.published_signals())  # just-started, maybe not in hub yet
             except Exception:
                 pass
+        # A RESTART reclaims its OWN lingering signals -- they are not a collision (#issue-1): without
+        # this, restarting the only occupancy node sees its own STOPPED 'occupied' still in the hub, takes
+        # a fresh 'judge_occupancy_2_' prefix, and every panel bound to 'occupied' goes UNBOUND.  Its
+        # prior built node survives Stop in _last_node tagged with instance_label == this node's title.
+        for prev in (getattr(self, "_last_node", {}) or {}).values():
+            if prev is not None and str(getattr(prev, "instance_label", "")) == str(node.title):
+                try:
+                    running.difference_update(str(s) for s in prev.published_signals())
+                except Exception:
+                    pass
         if not keys or not (keys & running):
-            return ""                                # no collision -> short, unprefixed names
+            return ""                                # no collision (incl. own restart) -> short names
         from Zou_lab_control.neutral_atom.operations.measurement import measurement_slug
         base = measurement_slug(node.title or node.name) or str(node.kind) or "node"
         prefix, k = f"{base}_", 2
