@@ -63,6 +63,26 @@ class SignalHub:
             self._version += 1
             self._shot = 0
 
+    def remove_signals(self, names) -> list[str]:
+        """Drop the named signals (history + version counter) and return the ones actually removed.
+
+        The TARGETED opposite of :meth:`clear`: when a logic node is REMOVED from the console, its
+        published signals are stale and must leave the hub so they stop cluttering every picker
+        ("多余 signal" that accumulate run after run).  STOPPING a node does NOT call this -- a stopped
+        node's signals deliberately linger (so a finished scan stays plottable and a panel can be wired
+        before the next run); only REMOVING the node purges them.  A no-op for names that are not present
+        (idempotent); bumps the global version once if anything was removed so consumers refresh."""
+        removed: list[str] = []
+        with self._lock:
+            for name in (str(n) for n in (names or [])):
+                if name in self._signals:
+                    del self._signals[name]
+                    self._sig_version.pop(name, None)
+                    removed.append(name)
+            if removed:
+                self._version += 1
+        return removed
+
     def signal_versions(self) -> dict[str, int]:
         """``{name: publish_count}`` snapshot -- one counter per signal, bumped
         each time that name is published.  A consumer compares a name's counter

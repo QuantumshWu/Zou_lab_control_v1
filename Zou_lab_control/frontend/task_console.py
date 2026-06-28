@@ -5366,10 +5366,14 @@ class TaskConsole(QtWidgets.QWidget):
         never overwrite each other on the hub; the common single-instance case stays short."""
         spec = self._spec_for_logic(node)
         keys = {str(k) for k in (getattr(spec, "result_keys", ()) or ())}
-        running: set[str] = set()
+        # Collision is checked against EVERY signal live in the hub -- running nodes AND a STOPPED
+        # node's lingering signals -- not just running_nodes (#2): otherwise a new same-kind node added
+        # after an earlier one STOPPED (its signals deliberately linger) would see no running collision,
+        # take the empty prefix, and CLOBBER the stopped node's lingering data on the hub.
+        running: set[str] = set(self.hub.signal_versions())
         for n in self.running_nodes:
             try:
-                running.update(str(s) for s in n.published_signals())
+                running.update(str(s) for s in n.published_signals())  # just-started, maybe not in hub yet
             except Exception:
                 pass
         if not keys or not (keys & running):
@@ -5672,6 +5676,17 @@ class TaskConsole(QtWidgets.QWidget):
         # passes _rebuild=False and is never reached while locked.
         if self._task_locked and _rebuild:
             return
+        # Capture this node's published signals BEFORE stop (which nulls the ref) so REMOVE can PURGE
+        # them from the hub -- a removed node's signals are stale and must leave, else they pile up
+        # run-after-run as "多余 signal" in every picker (#2).  STOPPING keeps them (a finished scan
+        # stays plottable / a panel can be wired before the next run); only REMOVING purges.
+        gone = self._logic_nodes.get(id(row))
+        gone_sigs: set[str] = set()
+        if gone is not None and hasattr(gone, "published_signals"):
+            try:
+                gone_sigs = {str(s) for s in gone.published_signals()}
+            except Exception:
+                gone_sigs = set()
         self._stop_logic_node(row, _silent=True)
         editor = self._logic_editors.pop(id(row), None)
         if editor is not None:
@@ -5690,6 +5705,19 @@ class TaskConsole(QtWidgets.QWidget):
         row.deleteLater()
         if not self.logic_nodes:
             self.logic_hint.show()
+        # PURGE the removed node's signals that NO OTHER live node still owns (a shared/prefixed name
+        # another running node also publishes is kept), so the hub sheds the stale names instead of
+        # accumulating them across runs.
+        if gone_sigs:
+            keep: set[str] = set()
+            for other in self.running_nodes:
+                try:
+                    keep.update(str(s) for s in other.published_signals())
+                except Exception:
+                    pass
+            purge = gone_sigs - keep
+            if purge:
+                self.hub.remove_signals(purge)
         if _rebuild:
             self._mark_dirty()
 
