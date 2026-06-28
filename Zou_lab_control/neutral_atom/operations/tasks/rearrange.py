@@ -18,21 +18,24 @@ from ..task_registry import task
 
 
 # The rearrangement task's tunable parameters, declared ONCE (single source for the GUI form + the build
-# closure).  EVERY one has a real default (no blank fields): how many central sites to assemble, the
-# defect-free layout, the readout exposure each image is taken at, and the per-move transit survival
-# (-1 = use the AOD device's own default).
+# closure).  ``targets`` lets the user name the EXACT tweezer sites to assemble; left blank it falls back
+# to the ``target_count`` most-central sites of the chosen layout.  ``move_survival`` is an OPTIONAL float
+# (blank = the AOD device's own default) -- a proper optional, NOT an in-band -1 sentinel.
 REARRANGE_PARAMS = (
-    ParamDecl("target_count", "target sites", "int", default=0, lo=0, hi=100000,
-              tooltip="How many of the most-central tweezer sites to assemble into the defect-free "
-                      "block.  0 = half the array (what a ~50 %-loaded array can typically fill)."),
+    ParamDecl("targets", "target sites", "text", default="",
+              tooltip="Explicit tweezer site indices to assemble, comma/space-separated (e.g. '0 1 2 7 8 9'). "
+                      "Blank = use the target count + layout below."),
+    ParamDecl("target_count", "target count", "int", default=0, lo=0, hi=100000,
+              tooltip="When 'target sites' is blank: how many of the most-central tweezer sites to assemble "
+                      "into the defect-free block.  0 = half the array (what a ~50 %-loaded array can fill)."),
     ParamDecl("target_layout", "layout", "choice", default="center", choices=("center", "all"),
-              tooltip="center = the target_count sites closest to the array centre (a filled central "
-                      "block); all = every site (only feasible at high loading)."),
+              tooltip="When 'target sites' is blank: center = the target_count sites closest to the array "
+                      "centre (a filled central block); all = every site (only feasible at high loading)."),
     ParamDecl("readout_exposure", "readout exposure", "float", default=0.020, unit="s", lo=0.0, hi=10.0,
               tooltip="Camera exposure for the before / after images that detect occupancy (through the "
                       "current calibration's thresholds)."),
-    ParamDecl("move_survival", "move survival (-1=device)", "float", default=-1.0, lo=-1.0, hi=1.0,
-              tooltip="Per-move atom transit survival probability used by the actuator.  -1 = use the "
+    ParamDecl("move_survival", "move survival", "float", default=None, required=False, lo=0.0, hi=1.0,
+              tooltip="Per-move atom transit survival probability used by the actuator.  Blank = use the "
                       "AOD device's own default (≈0.98 on the virtual AOD; the real loss is physical)."),
 )
 

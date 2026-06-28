@@ -91,14 +91,29 @@ def test_ramp_aod_validates_dac_codes_at_construction():
         RampAOD(VirtualSequencer(), grid_shape=(1, 14), x_code_step=40.0)  # col 13 -> 520 > 511
 
 
-def test_rearrange_task_default_move_survival_sentinel_uses_device_default():
-    """The GUI ParamDecl default move_survival=-1 (sentinel) must map to None in the ctor (use the AOD
-    device default), NOT reach aod.apply_moves(survival=-1) which would raise out-of-range."""
+def test_rearrange_task_move_survival_is_optional_not_a_sentinel():
+    """move_survival is a clean Optional[float] (NO -1 in-band sentinel): None = use the AOD device's own
+    default (apply_moves with no survival kwarg); a value in [0,1] overrides it; out-of-range raises."""
+    import pytest
     from Zou_lab_control.neutral_atom.core.signals import SignalHub
     from Zou_lab_control.neutral_atom.operations.logic import RearrangeTask
-    task = RearrangeTask(SignalHub(), camera=None, aod=None, move_survival=-1.0)
-    assert task.move_survival is None
+    assert RearrangeTask(SignalHub(), camera=None, aod=None, move_survival=None).move_survival is None
+    assert RearrangeTask(SignalHub(), camera=None, aod=None).move_survival is None      # default = device default
     assert RearrangeTask(SignalHub(), camera=None, aod=None, move_survival=0.9).move_survival == 0.9
+    with pytest.raises(ValueError, match="must be in"):
+        RearrangeTask(SignalHub(), camera=None, aod=None, move_survival=-1.0)            # no sentinel: -1 is illegal
+    # acquisition_parameters round-trips None as None (NOT -1.0)
+    assert RearrangeTask(SignalHub(), camera=None, aod=None).acquisition_parameters()["move_survival"] is None
+
+
+def test_rearrange_task_explicit_targets_override_count_and_layout():
+    """An explicit ``targets`` site list (GUI text field / list) assembles exactly those sites and is
+    parsed from a comma/space string; blank falls back to target_count + layout."""
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.neutral_atom.operations.logic import RearrangeTask
+    assert RearrangeTask(SignalHub(), camera=None, aod=None, targets="0 1 2, 7 8").targets == (0, 1, 2, 7, 8)
+    assert RearrangeTask(SignalHub(), camera=None, aod=None, targets=[3, 4]).targets == (3, 4)
+    assert RearrangeTask(SignalHub(), camera=None, aod=None).targets == ()              # blank = central-block default
 
 
 def test_ramp_aod_apply_moves_fires_one_program_per_move():

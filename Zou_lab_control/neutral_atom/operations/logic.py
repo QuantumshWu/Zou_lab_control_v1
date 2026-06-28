@@ -1241,6 +1241,28 @@ class CalibrateReadoutTask(Task):
         return calibration
 
 
+def _parse_site_list(value) -> tuple[int, ...]:
+    """Coerce an explicit target-site spec to a tuple of int site indices.  Accepts a sequence of ints
+    or a comma/space-separated string (the GUI ``text`` field, e.g. ``"0 1 2, 7 8"``); blank / None -> ()
+    (fall back to the central-block default).  Kept dependency-free so the GUI form and the notebook
+    share ONE interpreter of a site list."""
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        parts = [p for p in value.replace(",", " ").split() if p]
+        return tuple(int(p) for p in parts)
+    return tuple(int(v) for v in value)
+
+
+def _unit_interval(value: float, name: str) -> float:
+    """Validate a probability in [0, 1] (the analysis layer's own check -- it must not import the
+    backend's ``probability`` helper, V1/N1 contract)."""
+    out = float(value)
+    if not (0.0 <= out <= 1.0):
+        raise ValueError(f"{name} must be in [0, 1], got {value!r}.")
+    return out
+
+
 class RearrangeTask(Task):
     """Assemble a defect-free atom array via the AOD, as a first-class one-shot Task.
 
@@ -1277,7 +1299,7 @@ class RearrangeTask(Task):
     def __init__(self, hub: SignalHub, camera: CameraDevice, aod: AODDevice, *,
                  sequencer: object | None = None, grid_shape: tuple[int, int] = (5, 7),
                  readout_exposure: float = 0.020, target_count: int = 0, target_layout: str = "center",
-                 move_survival: float | None = None,
+                 targets: object = None, move_survival: float | None = None,
                  frame_provider=None, calibration_provider=None, prefix: str = ""):
         super().__init__(hub, prefix=prefix)
         self.camera = camera
@@ -1288,11 +1310,12 @@ class RearrangeTask(Task):
         # 0 = half the array (the rearrangement planner's default); >0 = that many central sites.
         self.target_count = int(target_count)
         self.target_layout = str(target_layout)
-        # None / any value < 0 = use the AOD device's own per-move survival default (the GUI ParamDecl
-        # default is the -1 sentinel, fed straight into this ctor on Run -- it MUST map to None, else
-        # apply_moves(survival=-1) raises probability out-of-range); a value in [0,1] overrides it.
-        sv = None if move_survival is None else float(move_survival)
-        self.move_survival = None if (sv is None or sv < 0) else sv
+        # EXPLICIT target site set: when given (a list / "0 1 2" text), assemble exactly those sites
+        # and ignore target_count/layout; blank/None falls back to the central-block default below.
+        self.targets = _parse_site_list(targets)
+        # OPTIONAL per-move transit survival: None = use the AOD device's own default (apply_moves with
+        # no survival kwarg).  A clean Optional[float] -- no in-band sentinel; the GUI blank maps to None.
+        self.move_survival = None if move_survival is None else _unit_interval(move_survival, "move_survival")
         # Wired by the subsystem (captures the session): image one frame through the readout's imaging
         # path, and read the session's thresholded calibration -- so the task stays backend-free.
         self._frame_provider = frame_provider
@@ -1301,15 +1324,18 @@ class RearrangeTask(Task):
     def acquisition_parameters(self) -> dict[str, object]:
         return {
             "grid_shape": tuple(self.grid_shape),
+            "targets": " ".join(str(t) for t in self.targets) if self.targets else "",
             "target_count": int(self.target_count),
             "target_layout": str(self.target_layout),
             "readout_exposure": float(self.readout_exposure),
-            "move_survival": -1.0 if self.move_survival is None else float(self.move_survival),
+            "move_survival": self.move_survival,          # Optional[float]: None = the AOD device default
         }
 
     def set_acquisition_parameters(self, **values) -> None:
         if "grid_shape" in values:
             self.grid_shape = grid_shape_tuple(values["grid_shape"])
+        if "targets" in values:
+            self.targets = _parse_site_list(values["targets"])
         if "target_count" in values:
             self.target_count = int(values["target_count"])
         if "target_layout" in values:
@@ -1317,8 +1343,8 @@ class RearrangeTask(Task):
         if "readout_exposure" in values:
             self.readout_exposure = float(values["readout_exposure"])
         if "move_survival" in values:
-            sv = float(values["move_survival"])
-            self.move_survival = None if sv < 0 else sv      # -1 (or any <0) = use the device default
+            sv = values["move_survival"]
+            self.move_survival = None if sv is None else _unit_interval(sv, "move_survival")
 
     def _image_occupancy(self, calibration, *, load: bool):
         """Image one frame through the readout path + classify per-site occupancy via the calibration
@@ -1343,7 +1369,13 @@ class RearrangeTask(Task):
         out.publish(frame_before=frame0, occupancy_before=occ0.astype(float),
                     progress=0.25, stage=f"{int(occ0.sum())} atoms loaded")
 
-        targets = target_sites(self.grid_shape, n_target=(self.target_count or None), layout=self.target_layout)
+        if self.targets:                                   # explicit user-named sites win over count/layout
+            n_sites = int(np.prod(self.grid_shape))
+            targets = tuple(t for t in self.targets if 0 <= t < n_sites)
+            if not targets:
+                raise ValueError(f"targets {self.targets} has no site in range for grid {self.grid_shape}.")
+        else:
+            targets = target_sites(self.grid_shape, n_target=(self.target_count or None), layout=self.target_layout)
         plan = plan_rearrangement(occ0, self.grid_shape, targets)
         short = "" if plan.feasible else f" (short {plan.shortfall})"
         out.publish(progress=0.4, stage=f"planned {len(plan.moves)} moves -> {len(targets)} targets{short}")

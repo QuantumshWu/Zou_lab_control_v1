@@ -198,16 +198,47 @@ def _make_spin(decl, *, integer: bool, value=None) -> FluentDoubleSpinBox:
 
 
 class FloatHandler(_StaticMixin, ParamWidgetHandler):
+    """A bounded float.  An OPTIONAL float (``default is None and not required``) renders as a
+    line edit so "leave blank = use the library / device default" stays expressible (mirrors
+    :class:`IntHandler`); a defaulted / required float uses a spin box.  ``read`` / ``write`` /
+    ``is_empty`` branch on which one was built (the line edit can be blank -> ``None``)."""
+
+    @staticmethod
+    def _is_optional(decl) -> bool:
+        return decl.default is None and not decl.required
+
     def build(self, decl, value, ctx):
+        if self._is_optional(decl):
+            edit = FluentLineEdit("" if value is None else f"{float(value):g}")
+            edit.setMinimumWidth(scaled_px(96, minimum=80))
+            edit.setPlaceholderText("(default)")
+            edit.setToolTip(decl.tooltip)
+
+            def _read_opt():
+                text = edit.text().strip()
+                return float(text) if text else None
+
+            _wire(edit.textChanged, ctx, decl, _read_opt)
+            return edit
         spin = _make_spin(decl, integer=False, value=value)
         _wire(spin.valueChanged, ctx, decl, lambda: float(spin.value()))
         return spin
 
     def read(self, widget):
+        if isinstance(widget, FluentLineEdit):
+            text = widget.text().strip()
+            return float(text) if text else None
         return float(widget.value())
 
     def write(self, widget, value):
-        widget.setValue(float(value))
+        if isinstance(widget, FluentLineEdit):
+            widget.setText("" if value is None else f"{float(value):g}")
+        else:
+            widget.setValue(float(value))
+
+    def is_empty(self, widget) -> bool:
+        # only the optional-float line edit can be blank; a spin box always has a number
+        return isinstance(widget, FluentLineEdit) and not widget.text().strip()
 
 
 class IntHandler(_StaticMixin, ParamWidgetHandler):
