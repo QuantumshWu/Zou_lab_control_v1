@@ -101,6 +101,17 @@ class VirtualTrapArray(TrapArrayDevice):
     # spot brightness varies, so a fixed box averages out signal a per-site kernel can
     # match.  Default 0.18 (=18% RSD) is a realistic spread on a moderate tweezer array.
     site_efficiency_sigma: float = 0.18
+    # SHOT-TO-SHOT atom-brightness jitter (1-sigma of a per-shot, per-atom lognormal multiplier,
+    # mean-preserving).  A real trapped atom does NOT scatter the same number of photons every shot:
+    # its position in the tweezer, light-assisted collision history and hopping vary the collected
+    # count shot to shot, so the BRIGHT distribution is much WIDER than pure Poisson.  The Rb87 v16
+    # data shows a within-site bright CV ~0.58 (psf) at ~9 photons where Poisson alone is only ~0.33
+    # -> ~0.45 excess shot-to-shot jitter.  Without it the virtual bright peak is unrealistically
+    # narrow, so every site reads a flat ~100 % fidelity with no per-site spread (the regression the
+    # user hit); with it the per-site fidelity lands in the realistic 0.8-0.99 band WITH a spread, and
+    # a longer readout only gradually approaches (never trivially saturates) 1.0 -- the honest
+    # SNR-vs-readout-duration behaviour.  0 = the old pure-Poisson (too-clean) bright peak.
+    shot_brightness_jitter: float = 0.15
     # Stray-light + scatter floor (detected photons/s/pixel, always present).  The real v16
     # 3 ms corner-median is ~16.5 counts/px above the 200-count offset -> ~1.8 ph/px/3 ms ->
     # ~600 ph/s/px, so dark sites carry a realistic shot-noise floor (not a near-zero one).
@@ -123,6 +134,14 @@ class VirtualTrapArray(TrapArrayDevice):
     atom_psf_aspect: float = 1.25         # sigma_y / sigma_x (anisotropic elliptical spot)
     atom_psf_angle_deg: float = 18.0      # tilt of the elliptical/skewed spot (deg)
     atom_psf_skew: float = 0.45           # asymmetry (coma tail) along the major axis; 0 = symmetric
+    # PER-SITE PSF SHAPE scatter (fractional RSD).  On a real array EACH tweezer has its OWN spot
+    # shape (the Rb87 v16 per-site fits give sigma_x / sigma_y ~10 % RSD across the 35 sites), because
+    # field-dependent aberration varies the kernel site to site.  Each site's sigma_x / sigma_y is
+    # drawn ONCE per session (cached, like site_efficiency) as ``base * Lognormal(0, sigma)``, and the
+    # spot is renormalized to keep that site's total flux (so box counts still track site_efficiency).
+    # This per-site SHAPE diversity -- not just amplitude -- is exactly what lets a per-site PSF matched
+    # filter beat a single uniform PSF / a box on a real array (set 0 to recover one shared shape).
+    site_shape_sigma: float = 0.10
     # Atom 1/e lifetime UNDER the probe (s): a longer readout exposure scatters MORE
     # photons (higher SNR) but also loses MORE atoms mid-readout, so the readout
     # duration sets the real SNR-vs-survival trade-off a detection-time scan measures.
@@ -202,6 +221,8 @@ class VirtualTrapArray(TrapArrayDevice):
         self.atom_psf_aspect = positive_float(self.atom_psf_aspect, "atom_psf_aspect")
         self.atom_psf_angle_deg = float(self.atom_psf_angle_deg)
         self.atom_psf_skew = nonnegative_float(self.atom_psf_skew, "atom_psf_skew")
+        self.site_shape_sigma = nonnegative_float(self.site_shape_sigma, "site_shape_sigma")
+        self.shot_brightness_jitter = nonnegative_float(self.shot_brightness_jitter, "shot_brightness_jitter")
         self.load_time_constant_s = positive_float(self.load_time_constant_s, "load_time_constant_s")
         self.mot_load_s = positive_float(self.mot_load_s, "mot_load_s")
         self.detection_lifetime = positive_float(self.detection_lifetime, "detection_lifetime")
@@ -250,6 +271,29 @@ class VirtualTrapArray(TrapArrayDevice):
             eff = np.exp(self.rng.normal(0.0, sigma, size=self.n_sites))
         self._site_eff_cache = eff
         return eff
+
+    def _site_shapes(self) -> tuple[np.ndarray, np.ndarray]:
+        """Per-site PSF (sigma_x, sigma_y) in px -- each tweezer's OWN spot shape, drawn ONCE per session
+        (cached) as the global ``atom_sigma_px`` / aspect scaled by independent ``Lognormal(0,
+        site_shape_sigma)`` factors (geometric mean 1, so the array-average spot size is unchanged).  This
+        gives each site a distinct kernel like the real Rb87 v16 per-site fits (~10 % RSD), which is what
+        lets a per-site PSF matched filter beat one shared (uniform) PSF.  ``site_shape_sigma=0`` -> every
+        site shares the global shape."""
+        cache = getattr(self, "_site_shape_cache", None)
+        if cache is not None and cache[0].size == self.n_sites:
+            return cache
+        asp = sqrt(max(self.atom_psf_aspect, 1e-6))
+        base_sx = self.atom_sigma_px / asp
+        base_sy = self.atom_sigma_px * asp
+        sigma = float(getattr(self, "site_shape_sigma", 0.0) or 0.0)
+        if sigma <= 0.0:
+            sx = np.full(self.n_sites, base_sx, dtype=float)
+            sy = np.full(self.n_sites, base_sy, dtype=float)
+        else:
+            sx = base_sx * np.exp(self.rng.normal(0.0, sigma, size=self.n_sites))
+            sy = base_sy * np.exp(self.rng.normal(0.0, sigma, size=self.n_sites))
+        self._site_shape_cache = (sx, sy)
+        return self._site_shape_cache
 
     def loading_fraction(self, cooling_duration: float | None = None) -> float:
         """Single-atom loading probability per tweezer for a cooling/MOT pulse of
@@ -364,23 +408,34 @@ class VirtualTrapArray(TrapArrayDevice):
         # counts) are unchanged: sx*sy == atom_sigma_px**2, and the linear skew term integrates to
         # ~0 over the Gaussian, so it only ASYMMETRIZES the shape (coma tail) without adding flux.
         asp = sqrt(max(self.atom_psf_aspect, 1e-6))
-        sx = self.atom_sigma_px / asp
-        sy = self.atom_sigma_px * asp
+        base_sx = self.atom_sigma_px / asp                     # array-average (nominal) spot size
+        base_sy = self.atom_sigma_px * asp
         th = radians(self.atom_psf_angle_deg)
         cos_t, sin_t = cos(th), sin(th)
         eff = self._site_efficiency()
-        for (cx, cy), occupied, t_sig, e in zip(self._site_centers(), occ, st, eff):
+        site_sx, site_sy = self._site_shapes()                 # per-site spot shape (cached, ~10 % RSD)
+        # SHOT-TO-SHOT brightness jitter: a fresh per-atom mean-1 lognormal EACH frame (not cached) so
+        # the same atom scatters a different photon count shot to shot -- this is what gives the bright
+        # distribution its realistic (super-Poisson) width and a non-saturating per-site fidelity.
+        js = float(self.shot_brightness_jitter)
+        jit = (np.exp(self.rng.normal(-0.5 * js * js, js, size=self.n_sites)) if js > 0.0
+               else np.ones(self.n_sites, dtype=float))
+        for (cx, cy), occupied, t_sig, e, sx, sy, j in zip(self._site_centers(), occ, st, eff, site_sx, site_sy, jit):
             if not occupied or t_sig <= 0.0:
                 continue
-            # per-site collection-efficiency multiplier: each tweezer has its OWN bright
-            # count rate (NA / window transmission / aberration vary), so a per-site PSF
-            # kernel materially beats a uniform one on a real array.
-            amplitude = self.atom_rate * float(t_sig) * float(e)
+            # Each tweezer has its OWN bright count rate (collection efficiency: NA / window / aberration)
+            # AND its OWN spot SHAPE.  ``amplitude`` is the array-nominal PEAK; ``norm`` rescales the
+            # per-site spot so its INTEGRAL (total photons) is unchanged by the shape draw -- a real atom
+            # scatters a fixed photon count set by eff, just spread over its own kernel.  So box counts
+            # track ``eff`` (amplitude) while the per-site SHAPE differs, which is precisely why a per-site
+            # PSF matched filter beats one uniform PSF / a box on a real array.
+            amplitude = self.atom_rate * float(t_sig) * float(e) * float(j)
+            norm = (base_sx * base_sy) / (float(sx) * float(sy))
             du = (xx - cx) * cos_t + (yy - cy) * sin_t          # along the major axis
             dv = -(xx - cx) * sin_t + (yy - cy) * cos_t         # minor axis
             core = np.exp(-0.5 * ((du / sx) ** 2 + (dv / sy) ** 2))
             spot = np.clip(core * (1.0 + self.atom_psf_skew * (du / sx)), 0.0, None)
-            expected_e += amplitude * spot
+            expected_e += amplitude * norm * spot
         photoelectrons = self.rng.poisson(np.clip(expected_e, 0, None)).astype(float)
         noisy = photoelectrons / self.conversion_e_per_count + self.offset_counts
         if self.read_noise_e > 0:

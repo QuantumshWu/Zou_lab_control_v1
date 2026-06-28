@@ -171,9 +171,15 @@ def test_post_rearrange_image_does_not_reload(monkeypatch):
 
 def test_end_to_end_virtual_rearrange_assembles_defect_free_array():
     """The whole flow on the virtual backend: calibrate -> load sparsely -> exp.rearrange.execute() ->
-    the re-image SEES a filled defect-free target (fill fraction == 1 at perfect transfer)."""
+    the re-image SEES a filled defect-free target (fill fraction == 1 at perfect transfer).
+
+    This checks the ASSEMBLY LOGIC, so it runs with the shot-to-shot brightness jitter OFF -> a clean,
+    deterministic readout -> detection is perfect and the only thing under test is the plan+move+re-image
+    chain.  The realistic (noisy) readout is exercised separately by
+    ``test_virtual_readout_has_realistic_per_site_spread_and_psf_beats_box``."""
     exp = _calibrated_virtual_session()
     trap = exp.devices.trap_array
+    trap.shot_brightness_jitter = 0.0                      # clean readout: isolate the assembly logic
     occ = np.zeros(trap.n_sites, dtype=bool)
     occ[[0, 6, 28, 34, 3, 21, 13]] = True                  # 7 scattered atoms
     trap.set_occupancy(occ)
@@ -183,3 +189,43 @@ def test_end_to_end_virtual_rearrange_assembles_defect_free_array():
     # occupancy_after must actually show atoms ON the target sites (the camera re-image sees it)
     occ_after = np.asarray(res["occupancy_after"], dtype=bool)
     assert int(occ_after.sum()) >= 6
+
+
+def test_virtual_readout_has_realistic_per_site_spread_and_psf_beats_box():
+    """#3: the virtual readout reproduces the REAL Rb87 per-site behaviour (no fake): each site has its
+    OWN brightness + spot shape, so (a) the per-site BRIGHT signal is NON-uniform (a real spread, not a
+    flat level), and (b) a per-site PSF matched filter beats a box -- exactly what was lost when the
+    per-site spread "disappeared".  Reproduced through the SAME calibration+readout path real data uses."""
+    import numpy as np
+    from Zou_lab_control.neutral_atom.devices.virtual import VirtualTrapArray
+    from Zou_lab_control.neutral_atom.operations.calibration import calibrate_all_methods_from_images
+    from Zou_lab_control.neutral_atom.core.bimodal import fit_bimodal
+    trap = VirtualTrapArray(grid_shape=GRID)
+    expo = 3e-3
+    R = lambda o: trap._render(o, np.where(o, expo, 0.0), expo).astype(float)
+    ref = [R(np.ones(trap.n_sites, bool)) for _ in range(16)]
+    readout = [R(trap.rng.random(trap.n_sites) < 0.5) for _ in range(120)]
+    cal = calibrate_all_methods_from_images(ref, readout, grid_shape=GRID, exposure=expo)
+
+    def per_site(method):
+        sig, lab = [], []
+        for _ in range(120):
+            o = trap.rng.random(trap.n_sites) < 0.5
+            sig.append(cal.signals(R(o), method=method)); lab.append(o)
+        sig = np.array(sig); lab = np.array(lab)
+        fids = np.array([fit_bimodal(sig[:, i]).fidelity for i in range(trap.n_sites)])
+        # per-site NET bright signal = mean(bright shots) - mean(dark shots): the real per-site
+        # brightness with the constant offset/background removed (the quantity a per-site PSF / the
+        # background-subtracted readout actually shows -- NOT the raw box value, which the offset floods).
+        net = np.array([sig[lab[:, i], i].mean() - sig[~lab[:, i], i].mean() for i in range(trap.n_sites)])
+        return fids[np.isfinite(fids)], net
+
+    fid_box, net_box = per_site("box")
+    fid_psf, _ = per_site("psf")
+    # (a) per-site NET bright signal is genuinely non-uniform (NOT a flat level): each tweezer has its own
+    #     brightness + shape -- this is the "counts per site 不均匀" the user said had disappeared.
+    assert (net_box.max() - net_box.min()) / net_box.mean() > 0.20, "per-site bright signal must vary (non-flat)"
+    # (b) per-site fidelity is a SPREAD, not a flat value, and lands in the realistic Rb87 band
+    assert fid_box.std() > 0.01 and 0.80 < fid_box.mean() < 0.999, (fid_box.mean(), fid_box.std())
+    # (c) a per-site PSF matched filter beats a box (the per-site-PSF advantage the regression killed)
+    assert fid_psf.mean() >= fid_box.mean(), (fid_psf.mean(), fid_box.mean())

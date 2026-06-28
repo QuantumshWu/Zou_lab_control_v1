@@ -157,7 +157,9 @@ def test_occupancy_nodes_publish_short_names_and_disambiguate_on_collision():
 
     keys = ("occupied", "counts", "rate", "centers", "thresholds", "frame_judged")
     spec = SimpleNamespace(result_keys=keys)
-    console = SimpleNamespace(logic_nodes=[], running_nodes=[], _spec_for_logic=lambda n: spec)
+    # _logic_node_prefix checks collisions against EVERY live hub signal (#2) -> the mock console needs a
+    # hub; an empty one suffices here (the running node `a` below is detected via running_nodes).
+    console = SimpleNamespace(logic_nodes=[], running_nodes=[], hub=SignalHub(), _spec_for_logic=lambda n: spec)
 
     t1 = TaskConsole._unique_logic_title(console, "Judge occupancy")
     cfg1 = LogicNodeConfig(kind="processor", name="Judge occupancy", title=t1)
