@@ -71,3 +71,46 @@ def test_logic_node_prefix_disambiguates_against_a_lingering_hub_signal():
     finally:
         console.shutdown()
         exp.close()
+
+
+def _add_node(console, match):
+    kc = console.kind_combo
+    for i in range(kc.count()):
+        data = kc.itemData(i)
+        if match(data):
+            kc.setCurrentIndex(i); console._add_panel()
+            return console.logic_nodes[-1]
+    raise AssertionError(f"no kind matched in {[kc.itemData(i) for i in range(kc.count())]}")
+
+
+def test_stop_then_remove_purges_a_lingering_nodes_signals():
+    """The exact bug the human-flow run caught: STOP a node (its signals linger -> kept), then REMOVE it.
+    Remove must purge those lingering signals even though the live node ref was already None'd at stop
+    (the fix uses ``_last_node``, retained through stop, not ``_logic_nodes`` which is None'd)."""
+    import time
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.timing import imaging_sequence
+    exp, console = _console()
+    try:
+        # imaging pulse on -> the trigger-driven camera streams frames
+        exp.devices.sequencer.prepare(imaging_sequence(exposure=exp.devices.camera.exposure, load=True).forever())
+        exp.devices.sequencer.fire()
+        cam = _add_node(console, lambda d: isinstance(d, tuple) and d and d[0] == "camera")
+        console._start_logic_node(cam)
+        for _ in range(8):
+            console.refresh_once(); time.sleep(0.005)
+        occ = _add_node(console, lambda d: isinstance(d, tuple) and d and "occupanc" in str(d[1]).lower())
+        console._start_logic_node(occ)
+        for _ in range(3):
+            console.refresh_once(); time.sleep(0.005)
+        node = console._logic_nodes.get(id(occ)) or console._last_node.get(id(occ))
+        occ_sigs = {s for s in node.published_signals()} & set(console.hub.signal_versions())
+        assert occ_sigs, "occupancy node published nothing to the hub"
+        console._stop_logic_node(occ)                                  # STOP -> signals LINGER
+        assert occ_sigs <= set(console.hub.signal_versions()), "STOP must keep the node's signals"
+        console._remove_logic_node(occ)                               # REMOVE -> signals PURGED
+        left = occ_sigs & set(console.hub.signal_versions())
+        assert not left, f"REMOVE after STOP must purge the lingering signals, still present: {sorted(left)}"
+    finally:
+        console.shutdown()
+        exp.close()

@@ -5676,11 +5676,14 @@ class TaskConsole(QtWidgets.QWidget):
         # passes _rebuild=False and is never reached while locked.
         if self._task_locked and _rebuild:
             return
-        # Capture this node's published signals BEFORE stop (which nulls the ref) so REMOVE can PURGE
-        # them from the hub -- a removed node's signals are stale and must leave, else they pile up
-        # run-after-run as "多余 signal" in every picker (#2).  STOPPING keeps them (a finished scan
-        # stays plottable / a panel can be wired before the next run); only REMOVING purges.
-        gone = self._logic_nodes.get(id(row))
+        # Capture this node's published signals so REMOVE can PURGE them from the hub -- a removed
+        # node's signals are stale and must leave, else they pile up run-after-run as "多余 signal" in
+        # every picker (#2).  STOPPING keeps them (a finished scan stays plottable / a panel can be
+        # wired before the next run); only REMOVING purges.  Use ``_last_node`` (the last built node,
+        # retained THROUGH stop) not ``_logic_nodes`` (None'd on stop): the common flow is STOP-then-
+        # REMOVE, where the live ref is already gone but the lingering hub signals are precisely the
+        # ones to purge.
+        gone = self._logic_nodes.get(id(row)) or self._last_node.get(id(row))
         gone_sigs: set[str] = set()
         if gone is not None and hasattr(gone, "published_signals"):
             try:
