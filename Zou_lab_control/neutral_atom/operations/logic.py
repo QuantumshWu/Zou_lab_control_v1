@@ -1335,11 +1335,16 @@ class RearrangeTask(Task):
 
     node_label = "rearrange"
     provides = ("fill_fraction", "n_filled", "n_target", "n_loaded", "n_moves")
-    # streamed to the dedicated mid-run panel + banner (before/after frames + occupancy + progress)
-    mid_run = ("frame_before", "frame_after", "occupancy_before", "occupancy_after", "progress", "stage")
+    # streamed to the dedicated mid-run panel + banner (before/after frames + occupancy + progress).
+    # ``summary`` (before | after side by side) is the DEFAULT mid-run/result image so the panel shows at a
+    # glance WHAT rearrangement did -- scattered loading on the left, the assembled block on the right.
+    mid_run = ("summary", "frame_before", "frame_after", "occupancy_before", "occupancy_after",
+               "progress", "stage")
 
     def output_specs(self) -> tuple[SignalSpec, ...]:
         return (
+            SignalSpec("summary", "before | after", "counts",
+                       "before (left) and after (right) frames side by side -- the at-a-glance result"),
             SignalSpec("frame_before", "before frame", "counts", "camera frame of the initial loading"),
             SignalSpec("frame_after", "after frame", "counts", "camera frame of the assembled array"),
             SignalSpec("occupancy_before", "before occupancy", "", "per-site 0/1 before rearrange (N,)"),
@@ -1414,6 +1419,18 @@ class RearrangeTask(Task):
         occupied = np.asarray(calibration.detect(frame).occupied, dtype=bool).reshape(-1)
         return frame, occupied
 
+    @staticmethod
+    def _summary_image(before, after):
+        """Before | after camera frames side by side for the result panel: the initial scattered loading
+        on the LEFT, the assembled defect-free block on the RIGHT, with a thin NaN divider between them.
+        ``after`` is None mid-run (only the before frame is imaged yet) -> the right half is blank, so the
+        panel shows the before frame immediately and fills in the after when the move completes."""
+        before = np.asarray(before, dtype=float)
+        h, w = before.shape
+        gap = np.full((h, max(1, w // 40)), np.nan)                     # blank divider so before/after read apart
+        right = np.asarray(after, dtype=float) if after is not None else np.full_like(before, np.nan)
+        return np.hstack([before, gap, right])
+
     def run(self, out: "TaskOutput") -> dict:
         if self._calibration_provider is None:
             raise RuntimeError("RearrangeTask has no calibration_provider; build it via exp.rearrange.task(...).")
@@ -1422,6 +1439,7 @@ class RearrangeTask(Task):
         out.publish(progress=0.05, stage="imaging initial loading")
         frame0, occ0 = self._image_occupancy(calibration, load=True)   # fresh stochastic load + image
         out.publish(frame_before=frame0, occupancy_before=occ0.astype(float),
+                    summary=self._summary_image(frame0, None),         # before frame on the left, after blank
                     progress=0.25, stage=f"{int(occ0.sum())} atoms loaded")
 
         if self.targets:                                   # explicit user-named sites win over count/layout
@@ -1446,6 +1464,7 @@ class RearrangeTask(Task):
         filled = int(sum(1 for t in targets if occ1[t]))
         fill = filled / max(1, len(targets))
         out.publish(frame_after=frame1, occupancy_after=occ1.astype(float),
+                    summary=self._summary_image(frame0, frame1),       # before | after, side by side
                     progress=1.0, stage=f"filled {filled}/{len(targets)} = {fill:.0%}")
 
         return {

@@ -45,12 +45,13 @@ def rearrange_array(readout) -> TaskSpec:
     """The AOD rearrangement task (image -> plan -> move -> re-image -> fill fraction).
 
     Its tunable parameters (:data:`REARRANGE_PARAMS`) are threaded into the built
-    :class:`~..logic.RearrangeTask`; mid-run it streams the before/after frames to its dedicated panel
-    under the ``rearrange_`` namespace.  Requires a thresholded calibration (run Calibrate readout first)
-    + an ``aod`` device on the connection."""
+    :class:`~..logic.RearrangeTask`; mid-run it streams a ``summary`` image -- the before loading on the
+    LEFT and the assembled block on the RIGHT, side by side -- to its dedicated panel under the
+    ``rearrange_`` namespace, so the panel shows at a glance what rearrangement did.  Requires a
+    thresholded calibration (run Calibrate readout first) + an ``aod`` device on the connection."""
 
     def build(hub, *, prefix: str = "rearrange_", **param_values):
         return readout.session.rearrange.task(hub, prefix=prefix, **param_values)
 
     return TaskSpec(name="Rearrange array", build=build, params=REARRANGE_PARAMS,
-                    mid_run_key="frame_after", default_kind="2d", prefix="rearrange_")
+                    mid_run_key="summary", default_kind="2d", prefix="rearrange_")
