@@ -1250,7 +1250,7 @@ class _ShotClock:
     it elapses (e.g. a stopped/errored processor will never catch up) advance anyway, so the display never
     wedges.  ``cache_time_s == 0`` advances on the next tick (no hold).  Pause freezes ``target_shot``."""
 
-    def __init__(self, *, cache_time_s: float = 0.1):
+    def __init__(self, *, cache_time_s: float = 0.0):
         from ..neutral_atom.core.signals import NO_LINEAGE   # single source of the sentinel
         self._no_lineage = NO_LINEAGE
         self.cache_time_s = max(0.0, float(cache_time_s))
@@ -1271,6 +1271,17 @@ class _ShotClock:
         back to match the slower).  A signal that has not advanced for ``cache_time_s`` is dropped from that
         ``min`` (treated as stalled) so a stopped producer cannot freeze the rest.  Never runs backwards."""
         if self.paused and not immediate:
+            return self.target_shot
+        # Hold == 0 (DEFAULT): NO coherence hold -- every signal shows its OWN latest, so a live camera /
+        # rolling monitor stays fully live and repeat / repeat_mode behave exactly as before the shot clock
+        # existed.  display = the newest lineage shot, so snapshot_at(newest) resolves each signal to its
+        # latest.  Hold > 0 OPTS IN to locking the WHOLE board to one common shot (the min-rule below).
+        # (Cross-producer readout coherence -- sitemap underlay vs a frame_judged 2D -- does NOT need the
+        # hold: frame_judged is atomically co-published with occupied carrying the same source-shot id.)
+        if self.cache_time_s <= 0.0:
+            lineage = [s for s in prov_map.values() if s != self._no_lineage]
+            newest = max(lineage) if lineage else self.target_shot
+            self.target_shot = max(self.target_shot, newest)
             return self.target_shot
         live = {n: prov_map.get(n, self._no_lineage) for n in bound_names}
         live = {n: p for n, p in live.items() if p != self._no_lineage}      # bound lineage signals only
@@ -1450,16 +1461,18 @@ class TaskConsoleState:
         *,
         name: str = "task",
         interval_ms: int = 400,
-        cache_time_s: float = 0.1,
+        cache_time_s: float = 0.0,
         panels: Sequence[PanelConfig | Mapping[str, object]] | None = None,
         logic: Sequence[LogicNodeConfig | Mapping[str, object]] | None = None,
     ):
         self.name = str(name)
         self.interval_ms = max(50, int(interval_ms))
-        # The shot-clock "Hold" window (seconds): how long the live display waits for a lagging derived
-        # signal (e.g. occupancy's frame_judged) to catch up to the newest frame before advancing the
-        # coherent display shot anyway.  Small because processors are light (no heavy compute); 0 = never
-        # hold, advance next tick.  Bounds latency, never wedges on a stopped producer (#shot-clock).
+        # The shot-clock "Hold" window (seconds).  DEFAULT 0 = LIVE: every panel shows its own latest, so a
+        # live camera / rolling monitor and repeat / repeat_mode behave exactly as before the shot clock --
+        # the readout (sitemap underlay + a frame_judged 2D) is still coherent because frame_judged is
+        # atomically co-published with occupied (same source-shot id), no hold needed.  Hold > 0 OPTS IN to
+        # locking the WHOLE board (incl. the live camera) to one common shot, waiting up to this long for a
+        # lagging producer before advancing (never wedges on a stopped one).  (#shot-clock: default-live.)
         self.cache_time_s = max(0.0, min(5.0, float(cache_time_s)))
         self.panels = [
             panel if isinstance(panel, PanelConfig) else PanelConfig.from_dict(panel)
@@ -1489,7 +1502,7 @@ class TaskConsoleState:
         return cls(
             name=str(payload.get("name", "task")),
             interval_ms=int(payload.get("interval_ms", 400)),
-            cache_time_s=float(payload.get("cache_time_s", 0.1)),   # get-default: old layouts load cleanly
+            cache_time_s=float(payload.get("cache_time_s", 0.0)),   # get-default: old layouts load cleanly (0 = live)
             panels=payload.get("panels") or [],
             logic=payload.get("logic") or [],
         )
