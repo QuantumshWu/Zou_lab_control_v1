@@ -1284,8 +1284,11 @@ class RearrangeTask(Task):
         # 0 = half the array (the rearrangement planner's default); >0 = that many central sites.
         self.target_count = int(target_count)
         self.target_layout = str(target_layout)
-        # None = use the AOD device's own per-move survival default; a value overrides it.
-        self.move_survival = None if move_survival is None else float(move_survival)
+        # None / any value < 0 = use the AOD device's own per-move survival default (the GUI ParamDecl
+        # default is the -1 sentinel, fed straight into this ctor on Run -- it MUST map to None, else
+        # apply_moves(survival=-1) raises probability out-of-range); a value in [0,1] overrides it.
+        sv = None if move_survival is None else float(move_survival)
+        self.move_survival = None if (sv is None or sv < 0) else sv
         # Wired by the subsystem (captures the session): image one frame through the readout's imaging
         # path, and read the session's thresholded calibration -- so the task stays backend-free.
         self._frame_provider = frame_provider

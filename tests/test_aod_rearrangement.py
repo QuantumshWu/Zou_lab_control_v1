@@ -68,15 +68,37 @@ def test_virtual_aod_per_move_loss_can_drop_atoms():
         dev.close()
 
 
-def test_ramp_aod_move_program_ramps_src_to_dst_and_compiles():
+def test_ramp_aod_move_program_ramps_FROM_src_to_dst_and_compiles():
+    """THREE periods: park at the SOURCE codes (so the ramp's carry-in is the source, not 0 V), ramp to
+    the destination, settle holding the destination.  Regression: a 2-period (ramp, settle) program
+    ramped from 0 V and dropped the atom on every move."""
     ramp = RampAOD(VirtualSequencer(), grid_shape=(5, 7))
-    prog = ramp.move_program(0, 17)                             # corner (col0,row0) -> centre (col3,row2)
-    prog.to_sequence(clock_hz=50e6)                             # compiles -> hardware won't error
+    prog = ramp.move_program(6, 17)                            # site6 (col6,row0) -> site17 (col3,row2)
+    prog.to_sequence(clock_hz=50e6)                            # compiles -> hardware won't error
     px = prog.analog_bus_plan("aod_x")
     py = prog.analog_bus_plan("aod_y")
-    assert px[0]["mode"] == "ramp" and px[0]["value"] == ramp.x_codes[3]   # ramp X to dst column code
-    assert py[0]["mode"] == "ramp" and py[0]["value"] == ramp.y_codes[2]   # ramp Y to dst row code
-    assert px[1]["value"] == ramp.x_codes[3] and py[1]["value"] == ramp.y_codes[2]  # settle HOLDS dst
+    assert px[0]["mode"] == "edge" and px[0]["value"] == ramp.x_codes[6]   # PARK at source column code
+    assert px[1]["mode"] == "ramp" and px[1]["value"] == ramp.x_codes[3]   # RAMP from src -> dst column
+    assert px[2]["value"] == ramp.x_codes[3]                               # SETTLE holds dst
+    assert py[0]["value"] == ramp.y_codes[0] and py[1]["mode"] == "ramp" and py[1]["value"] == ramp.y_codes[2]
+
+
+def test_ramp_aod_validates_dac_codes_at_construction():
+    """A site->code map exceeding the signed DAC range fails at CONSTRUCTION (config/connect time),
+    not lazily on the first move that touches the out-of-range edge site mid-experiment."""
+    import pytest
+    with pytest.raises(ValueError, match="outside the signed"):
+        RampAOD(VirtualSequencer(), grid_shape=(1, 14), x_code_step=40.0)  # col 13 -> 520 > 511
+
+
+def test_rearrange_task_default_move_survival_sentinel_uses_device_default():
+    """The GUI ParamDecl default move_survival=-1 (sentinel) must map to None in the ctor (use the AOD
+    device default), NOT reach aod.apply_moves(survival=-1) which would raise out-of-range."""
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.neutral_atom.operations.logic import RearrangeTask
+    task = RearrangeTask(SignalHub(), camera=None, aod=None, move_survival=-1.0)
+    assert task.move_survival is None
+    assert RearrangeTask(SignalHub(), camera=None, aod=None, move_survival=0.9).move_survival == 0.9
 
 
 def test_ramp_aod_apply_moves_fires_one_program_per_move():

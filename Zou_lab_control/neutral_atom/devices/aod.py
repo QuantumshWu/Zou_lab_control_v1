@@ -84,11 +84,23 @@ class RampAOD(AODDevice):
                            else [f"{self.x_bus}{bit}" for bit in range(self.bus_width)])
         self.y_channels = ([str(c) for c in y_channels] if y_channels is not None
                            else [f"{self.y_bus}{bit}" for bit in range(self.bus_width)])
+        if len(self.x_channels) != self.bus_width or len(self.y_channels) != self.bus_width:
+            raise ValueError(f"x_channels/y_channels must each list {self.bus_width} board channels "
+                             f"(the DAC bus width), got {len(self.x_channels)}/{len(self.y_channels)}.")
         ny, nx = self.grid_shape
         self.x_codes = list(x_codes) if x_codes is not None else _linear_codes(nx, x_code_base, x_code_step)
         self.y_codes = list(y_codes) if y_codes is not None else _linear_codes(ny, y_code_base, y_code_step)
         if len(self.x_codes) != nx or len(self.y_codes) != ny:
             raise ValueError(f"x_codes/y_codes must have length {nx}/{ny} for grid {self.grid_shape}.")
+        # Validate every site code against the bus's SIGNED range NOW (at config/connect time), not
+        # lazily on the first move that touches an out-of-range edge site deep into a run: a too-wide
+        # array / too-large step would otherwise pass connect and raise mid-experiment.
+        lo, hi = -(1 << (self.bus_width - 1)), (1 << (self.bus_width - 1)) - 1
+        for axis, codes in (("x", self.x_codes), ("y", self.y_codes)):
+            for code in codes:
+                if not (lo <= int(code) <= hi):
+                    raise ValueError(f"AOD {axis} site code {code} is outside the signed {self.bus_width}-bit "
+                                     f"DAC range [{lo}, {hi}] -- recalibrate the site->code map or bus_width.")
         self.move_duration_s = _positive(move_duration_s, "move_duration_s")
         self.settle_s = _positive(settle_s, "settle_s")
         self.move_survival = float(move_survival)
@@ -102,9 +114,13 @@ class RampAOD(AODDevice):
         return self.x_codes[col], self.y_codes[row]
 
     def move_program(self, src: int, dst: int) -> PulseTableState:
-        """Build the ramp program that drags an atom from site ``src`` to site ``dst``: park the X / Y
-        buses at the source codes, then ramp them to the destination codes over ``move_duration_s`` and
-        hold for ``settle_s``.  Returned (not fired) so it can be inspected / unit-tested."""
+        """Build the ramp program that drags an atom from site ``src`` to site ``dst`` -- THREE periods:
+        (0) PARK the X / Y buses at the SOURCE codes (an edge, so the ramp's carry-in is the source),
+        (1) RAMP from the source codes to the destination codes over ``move_duration_s`` (the chirp that
+        drags the atom), (2) SETTLE holding the destination codes.  The park period is essential: a ramp
+        carries in the PREVIOUS period's end value, so without a source-park first the ramp would start
+        from 0 V (array centre) and the tweezer would not be over the atom -- it would be dropped on every
+        move.  Returned (not fired) so it can be inspected / unit-tested."""
         sx, sy = self._codes_for(src)
         dx, dy = self._codes_for(dst)
         members_x, members_y = self.x_channels, self.y_channels
@@ -114,18 +130,19 @@ class RampAOD(AODDevice):
             channels=channels,
             analog_buses={self.x_bus: members_x, self.y_bus: members_y},
             periods=[
+                PulsePeriod(self.settle_s * 1e9, zero, unit="ns", name="park"),
                 PulsePeriod(self.move_duration_s * 1e9, zero, unit="ns", name="ramp"),
                 PulsePeriod(self.settle_s * 1e9, zero, unit="ns", name="settle"),
             ],
             repeat_forever=False,
             name=f"aod_move_{src}_{dst}",
         )
-        table.set_bus_value(0, self.x_bus, int(sx))           # park at the source codes (carry-in)
+        table.set_bus_value(0, self.x_bus, int(sx))           # PARK at the source codes (the ramp carry-in)
         table.set_bus_value(0, self.y_bus, int(sy))
-        table.set_bus_value(1, self.x_bus, int(dx))           # settle HOLDS at the destination codes
-        table.set_bus_value(1, self.y_bus, int(dy))
-        table.set_analog_bus_mode(0, self.x_bus, "ramp", value=int(dx))   # period 0 ramps src -> dst
-        table.set_analog_bus_mode(0, self.y_bus, "ramp", value=int(dy))
+        table.set_bus_value(2, self.x_bus, int(dx))           # SETTLE holds at the destination codes
+        table.set_bus_value(2, self.y_bus, int(dy))
+        table.set_analog_bus_mode(1, self.x_bus, "ramp", value=int(dx))   # period 1 ramps src -> dst
+        table.set_analog_bus_mode(1, self.y_bus, "ramp", value=int(dy))
         return table
 
     # -- AODDevice contract --------------------------------------------------
