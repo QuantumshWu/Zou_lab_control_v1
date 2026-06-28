@@ -374,8 +374,8 @@ def test_camera_measurement_exposes_camera_params_and_applies_them_live():
     fire_live_imaging(exp)                                  # On Pulse: the trigger-driven camera streams
 
     # default frames_per_cycle=1 -> 'frame' = the (repeat, H, W) data array (a 2D panel reduces its
-    # repeat axis) and 'frame_0' = the single per-trigger image (for processors / per-trigger panels).
-    assert cam_node.published_signals() == frozenset({"frame", "frame_0"})
+    # event 0's repeat block).  ONE signal per emCCD event of the cycle; frames_per_cycle=1 -> just frame_0.
+    assert cam_node.published_signals() == frozenset({"frame_0"})
     params = cam_node.acquisition_parameters()
     assert "exposure" in params and params["exposure"] == float(cam.exposure)
     assert params["frames_per_cycle"] == 1
@@ -385,10 +385,9 @@ def test_camera_measurement_exposes_camera_params_and_applies_them_live():
     assert cam_node.acquisition_parameters()["exposure"] == 0.05
 
     cam_node.step()
-    frame = np.asarray(hub.latest("frame"))
+    frame = np.asarray(hub.latest("frame_0"))              # frame_0 IS event 0's (repeat,1,H,W) block
     assert frame.ndim == 4                                  # the (repeat, 1, H, W) data block
     assert frame.shape[1] == 1                              # one data point (a frame sweeps no param)
-    assert np.ndim(hub.latest("frame_0")) == 2             # a real 2-D camera frame (per-trigger)
 
 
 def test_camera_build_applies_repeat_through_every_entry_point():

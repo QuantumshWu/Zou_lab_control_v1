@@ -23,7 +23,7 @@ A plot panel's data source is a one-line expression evaluated against the named
 signals of a :class:`~Zou_lab_control.neutral_atom.core.signals.SignalHub`
 (the same trusted-local-code posture as the pulse GUI's Scan tab):
 
-    value = frame                       # show the latest camera frame
+    value = frame_0                     # show emCCD event 0 of the camera cycle
     value = occupied - b_occupied       # arbitrary math across signals (two detectors)
     value = history('counts', 200).ravel()
 
@@ -764,7 +764,7 @@ class _SignalExprWidget(QtWidgets.QWidget):
         self._signals_provider = signals_provider
         self._sources_provider = sources_provider
         self._formats_provider = formats_provider
-        self._inputs: list[str] = ["frame"]
+        self._inputs: list[str] = ["frame_0"]
         self._editor = None
         # ONE label-column width for this widget's rows (signal / signal[i] / value), via the SAME
         # setting_label_width rule every form uses -- so it aligns + follows the one logic.
@@ -923,7 +923,7 @@ class _SignalExprWidget(QtWidgets.QWidget):
         """Seed from a ``{"inputs", "source"}`` dict (a default / saved value)."""
         from ..neutral_atom.operations.signal_expr import SignalExpr
         expr = SignalExpr.from_value(value)
-        self._inputs = list(expr.inputs) or ["frame"]
+        self._inputs = list(expr.inputs) or ["frame_0"]
         self._source_edit.blockSignals(True)
         self._source_edit.setText(expr.source)
         self._source_edit.blockSignals(False)

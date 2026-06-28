@@ -602,13 +602,13 @@ class OccupancyProcessor(Processor):
                  grid_shape: tuple[int, int] | None = None,
                  method: str | None = None, prefix: str = ""):
         # The frame to judge is a signal expression -- the SAME universal multi-slot signal +
-        # ``value = ...`` mechanism every source field uses (default = the single ``frame``
-        # signal).  ``consumes`` (what makes the node reactive) is the picked input names, so the
-        # node re-judges when any of them advances.  Its ``value`` must evaluate to ONE (H×W)
-        # frame; an empty pick falls back to the bare ``frame`` signal.
+        # ``value = ...`` mechanism every source field uses (default = the camera's first emCCD
+        # event, ``frame_0``).  ``consumes`` (what makes the node reactive) is the picked input
+        # names, so the node re-judges when any of them advances.  Its ``value`` must evaluate to
+        # ONE (H×W) frame; an empty pick falls back to ``frame_0``.
         expr = source_expr if isinstance(source_expr, SignalExpr) else SignalExpr.from_value(source_expr)
         if not expr.inputs:
-            expr = SignalExpr(["frame"], DEFAULT_SOURCE)
+            expr = SignalExpr(["frame_0"], DEFAULT_SOURCE)
         super().__init__(hub, consumes=tuple(expr.inputs), prefix=prefix)
         self.source_expr = expr
         self.calibration = calibration
@@ -676,13 +676,19 @@ class OccupancyProcessor(Processor):
                 occ_rows.append(None); cnt_rows.append(None); continue   # unfilled ring slice
             try:
                 detection = calibration.detect(img, method=self.method)  # the single readout contract
-            except ValueError:
-                # The loaded calibration does not fit this frame (e.g. a stale calibration.json with a
-                # different camera ROI).  Fall back to the live SESSION calibration (built from this
-                # camera, so it matches) instead of raising every shot and freezing every panel.
+            except ValueError as exc:
+                # The loaded calibration does not fit this frame (e.g. a calibration.json from a
+                # different camera ROI/shape, or one that lacks the chosen readout method).  Try the
+                # live SESSION calibration (built from THIS camera, so it matches); if there is none
+                # that fits, RAISE a clear text error -- the node surfaces it like a signal-size
+                # mismatch (red node-error banner) instead of silently producing no data forever.
                 fallback = self.session_calibration() if callable(self.session_calibration) else None
                 if fallback is None or fallback is calibration:
-                    occ_rows.append(None); cnt_rows.append(None); continue
+                    raise ValueError(
+                        f"Judge occupancy: the loaded calibration does not fit this frame "
+                        f"(frame {img.shape}, method {self.method or 'default'}): {exc}.  It is likely "
+                        f"a calibration for a different camera ROI/shape or missing this method -- "
+                        f"recalibrate for THIS camera, or pick the matching calibration file.") from exc
                 detection = fallback.detect(img, method=self.method)
                 self.calibration = calibration = fallback     # adopt the matching one for next shots
             occ_rows.append(np.asarray(detection.occupied, dtype=float).reshape(-1))
@@ -1318,21 +1324,24 @@ class CameraMeasurement(Measurement):
 
     def __init__(self, hub: SignalHub, camera: CameraDevice, *, sequencer: object | None = None,
                  frames_per_cycle: int = 1, prefix: str = "", repeat: int = 0):
-        # The camera obeys the UNIFORM measurement output contract (#H3n): its ``frame`` block is
-        # ``(ring, *points_shape, *data_shape)`` = ``(ring, 1, H, W)`` -- ONE data point (a frame does
-        # not sweep an input parameter), whose DATA is the H×W image.  ONE knob ``repeat``, 0 = ∞ (no
-        # free-run toggle): repeat=K keeps a K-deep block (K photos averaged) then STOPS; repeat=0
-        # rolls a 1-deep ring forever (the live monitor showing the latest frame).  The camera never
-        # averages at the measurement (that was the live stutter) -- it FILLS and publishes the WHOLE
-        # block; the PLOT reduces the repeat axis (repeat_mode: average = the long-exposure mean).
+        # A cycle fires ``frames_per_cycle`` emCCD events (triggers); the camera publishes ONE signal
+        # PER event -- ``frame_0, frame_1, … frame_{N-1}`` -- and NOTHING else (no lumped ``frame``).
+        # Each ``frame_i`` is that event's OWN repeat block obeying the UNIFORM contract (#H3n)
+        # ``(ring, *points_shape, *data_shape)`` = ``(ring, 1, H, W)``: the i-th emCCD image STACKED
+        # across the cycle's repeats.  So a panel bound to ``frame_i`` reduces ITS repeat axis
+        # (repeat_mode: average = the long-exposure mean of THAT specific emCCD event) -- the only way
+        # a 3-event cycle can show the repeat_mode effect for a chosen event.  ONE knob ``repeat``,
+        # 0 = ∞ (no free-run toggle): repeat=K keeps each event's K-deep block then STOPS; repeat=0
+        # rolls a 1-deep ring forever (live monitor).  The camera never averages at the measurement
+        # (that was the live stutter) -- it FILLS and publishes the WHOLE per-event block every cycle.
         super().__init__(hub, prefix=prefix)
         self.camera = camera
         self.sequencer = sequencer
         self.frames_per_cycle = max(1, int(frames_per_cycle))
         self.points_shape: tuple = (1,)                  # one frame = one data point (no swept param)
-        self.primary_signal = "frame"                    # the (repeat,1,H,W) contract block (#H3r-F4)
+        self.primary_signal = "frame_0"                  # event 0's (repeat,1,H,W) block (#H3r-F4)
         self.data_shape: tuple = ()                      # set to (H, W) on the first frame
-        self._raw = None                                 # (ring, 1, H, W) block; None until 1st frame
+        self._rings = None                               # list of N (ring,1,H,W) blocks; None until 1st frame
         self.set_repeat(repeat)
 
     def set_repeat(self, repeat: int = 0) -> None:
@@ -1342,7 +1351,7 @@ class CameraMeasurement(Measurement):
         the (partly filled) block."""
         self.repeat = max(0, int(repeat))
         self._ring = max(1, self.repeat)                 # block depth: K for finite, 1 for the rolling live view
-        self._raw = None
+        self._rings = None
         self._filled = 0
 
     @property
@@ -1369,49 +1378,48 @@ class CameraMeasurement(Measurement):
             # absence of hardware trigger edges -- so this is correct for a real streamer driven
             # from another process too (the camera sees the actual triggers, not a local flag).
             return {}
-        # A real frame WAS acquired -> mint this shot's SOURCE-shot id; every signal published this shot
-        # (frame, frame_i) carries it, and the OccupancyProcessor consuming `frame` inherits it, so the
+        # A real cycle WAS acquired -> mint this shot's SOURCE-shot id; every ``frame_i`` published this
+        # cycle carries it, and the OccupancyProcessor consuming a chosen ``frame_i`` inherits it, so the
         # judged image / occupancy group with the exact frame they came from (#shot-clock).
         self._current_source_shot = self.hub.next_source_shot()
-        out: dict[str, object] = {f"frame_{i}": np.asarray(f, dtype=float) for i, f in enumerate(frames)}
-        f0 = out["frame_0"]                              # the newest single frame of this shot
-        if self._raw is None or self.data_shape != f0.shape:
+        frames = [np.asarray(f, dtype=float) for f in frames]
+        n = len(frames)
+        f0 = frames[0]
+        if self._rings is None or len(self._rings) != n or self.data_shape != f0.shape:
             self.data_shape = tuple(f0.shape)            # (H, W) -- the per-point DATA shape
-            self._raw = np.full((self._ring, 1, *self.data_shape), np.nan, dtype=float)
+            self._rings = [np.full((self._ring, 1, *self.data_shape), np.nan, dtype=float)
+                           for _ in range(n)]            # ONE repeat block per emCCD event of the cycle
             self._filled = 0
-        if self.repeat <= 0:                             # ∞: roll the newest in at the end (live monitor)
-            self._raw = np.roll(self._raw, -1, axis=0)
-            self._raw[-1, 0] = f0
-            self._filled += 1
-        else:                                            # finite: FILL the next slot of the K-frame block
-            self._raw[min(self._filled, self._ring - 1), 0] = f0
-            self._filled = min(self._filled + 1, self.repeat)
-        # ``frame`` IS the (repeat, 1, H, W) data array (NaN = not-yet-taken) -- a panel reduces its
-        # repeat axis (average -> long exposure).  ``frame_i`` stay the newest single per-trigger
-        # images (for processors + per-trigger panels).
-        out["frame"] = self._raw.copy()
-        if self.finished:                                # take exactly N photos, then stop
+        out: dict[str, object] = {}
+        for i, fi in enumerate(frames):                  # fill EACH event's own ring, publish its block
+            if self.repeat <= 0:                         # ∞: roll the newest in at the end (live monitor)
+                self._rings[i] = np.roll(self._rings[i], -1, axis=0)
+                self._rings[i][-1, 0] = fi
+            else:                                        # finite: FILL the next slot of the K-deep block
+                self._rings[i][min(self._filled, self._ring - 1), 0] = fi
+            # ``frame_i`` IS event i's (repeat, 1, H, W) block (NaN = not-yet-taken) -- a panel reduces
+            # its repeat axis (average = long exposure of THAT emCCD event).  No lumped ``frame``.
+            out[f"frame_{i}"] = self._rings[i].copy()
+        self._filled = (self._filled + 1) if self.repeat <= 0 else min(self._filled + 1, self.repeat)
+        if self.finished:                                # take exactly K cycles, then stop
             self._stop.set()
-        return self._assert_primary_shape(out)           # frame == (repeat, 1, H, W) -- contract guard
+        return self._assert_primary_shape(out)           # frame_0 == (repeat, 1, H, W) -- contract guard
 
     def published_signals(self) -> frozenset:
         n = max(1, int(self.frames_per_cycle))
-        keys = ["frame"] + [f"frame_{i}" for i in range(n)]
-        return frozenset(self.prefix + key for key in keys)
+        return frozenset(self.prefix + f"frame_{i}" for i in range(n))   # ONE block per emCCD event; no lumped `frame`
 
     def output_specs(self) -> tuple[SignalSpec, ...]:
-        """Camera outputs: ``frame`` = the ``(repeat, 1, H, W)`` block (repeat × ONE point × the H×W
-        image data -- a panel reduces its repeat axis, e.g. average = a long exposure); ``frame_i`` =
-        the newest single image of per-cycle trigger ``i`` (for processors + per-trigger panels)."""
+        """Camera outputs: ONE ``frame_i`` per emCCD event of the cycle, each a ``(repeat, 1, H, W)``
+        block (repeat × ONE point × the H×W image) -- a panel reduces ITS repeat axis (repeat_mode:
+        average = the long exposure of THAT specific emCCD event).  There is NO lumped ``frame``."""
         specs = []
         for name in sorted(self.published_signals()):
             bare = name[len(self.prefix):] if self.prefix and name.startswith(self.prefix) else name
-            if bare == "frame":
-                desc = ("(repeat, 1, H, W) block: repeat x one point x the H*W image -- plot reduces repeats.  "
-                        "LIVE camera, advances independently of the readout: for a 2D image shot-locked to the "
-                        "site map, bind the Judge-occupancy node's `frame_judged` instead.")
-            else:
-                desc = f"newest single image of camera trigger {bare.split('_')[-1]} of the cycle"
+            i = bare.split("_")[-1]
+            desc = (f"emCCD event {i} of the cycle: (repeat, 1, H, W) block -- plot reduces repeats "
+                    f"(average = long exposure of event {i}).  LIVE camera, advances independently of the "
+                    "readout: for a 2D image shot-locked to the site map, bind Judge-occupancy `frame_judged`.")
             specs.append(SignalSpec(name, "camera image", "counts", desc))
         return tuple(specs)
 

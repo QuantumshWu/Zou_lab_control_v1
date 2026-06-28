@@ -1,10 +1,10 @@
-"""Contract: CameraMeasurement reads ONE frame per camera trigger (frames_per_cycle).
+"""Contract: CameraMeasurement publishes ONE signal per emCCD event of the cycle.
 
-A pulse that triggers the camera twice per cycle (e.g. a release-recapture / two-
-readout "T" sequence) needs frames_per_cycle=2; the measurement then publishes
-frame_0 + frame_1 (one per emCCD trigger), so two panels can show the two triggers.
-The default frames_per_cycle=1 preserves the old single-frame behaviour (only frame +
-frame_0). This pins the fix for "qCMOS live always shows the first emCCD".
+A cycle with ``frames_per_cycle`` camera triggers publishes ``frame_0 … frame_{N-1}``,
+and NOTHING else (no lumped ``frame``).  Each ``frame_i`` is THAT event's own
+``(repeat, 1, H, W)`` repeat block -- so a panel bound to ``frame_i`` reduces its repeat
+axis (repeat_mode: average = the long-exposure mean of THAT emCCD event), the only way a
+multi-event cycle can show the repeat_mode effect for a chosen event.
 
 Virtual == real: only the camera differs; the measurement reads frames through the
 same acquire(n) contract.
@@ -31,29 +31,27 @@ from conftest import fire_live_imaging   # the live "On Pulse" the trigger-drive
 def test_two_triggers_publish_frame_0_and_frame_1():
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
     hub = SignalHub()
-    cam_node = CameraMeasurement(hub, exp.camera, sequencer=exp.devices.sequencer, frames_per_cycle=2)
+    cam_node = CameraMeasurement(hub, exp.camera, sequencer=exp.devices.sequencer,
+                                 frames_per_cycle=2, repeat=4)
     fire_live_imaging(exp)            # On Pulse: the trigger-driven camera now streams
-    cam_node.step()
+    for _ in range(2):
+        cam_node.step()
 
-    # ``frame`` IS the (repeat, H, W) data array (the plot reduces its repeat axis); ``frame_i`` are
-    # the single per-trigger images.
-    assert set(cam_node.published_signals()) == {"frame", "frame_0", "frame_1"}
-    for key in ("frame_0", "frame_1"):
-        assert key in hub.names()
-        assert np.asarray(hub.latest(key)).ndim == 2          # a real HxW image, not a scalar
-    block = np.asarray(hub.latest("frame"))
-    assert block.ndim == 4 and block.shape[1] == 1            # (repeat, 1, H, W): repeat x one point x image
-    # the newest data-array slice is the FIRST trigger's frame (the default 2D panel reduces -> trigger 0)
-    has = np.isfinite(block).any(axis=(1, 2, 3))
-    newest = block[np.flatnonzero(has)[-1], 0]
-    assert np.array_equal(newest, np.asarray(hub.latest("frame_0")))
+    # ONE signal per emCCD event, each its OWN (repeat, 1, H, W) block; NO lumped ``frame``.
+    assert set(cam_node.published_signals()) == {"frame_0", "frame_1"}
+    b0 = np.asarray(hub.latest("frame_0"))
+    b1 = np.asarray(hub.latest("frame_1"))
+    for b in (b0, b1):
+        assert b.shape == (4, 1, 40, 50)                       # (repeat, 1, H, W) block per event
+    # the two emCCD events are DISTINCT images, each stacked across repeats in its own ring
+    assert not np.array_equal(np.nan_to_num(b0), np.nan_to_num(b1))
 
 
-def test_default_is_single_trigger_back_compat():
+def test_default_is_single_event_frame_0_only():
     exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
     cam_node = CameraMeasurement(SignalHub(), exp.camera)        # frames_per_cycle defaults to 1
     cam_node.step()
-    assert set(cam_node.published_signals()) == {"frame", "frame_0"}
+    assert set(cam_node.published_signals()) == {"frame_0"}      # one event -> just frame_0; no lumped frame
 
 
 def test_readout_image_frame_judged_is_synced_with_occupancy():
@@ -67,7 +65,7 @@ def test_readout_image_frame_judged_is_synced_with_occupancy():
     cal = exp.readout.current
     hub = SignalHub()
     cam = CameraMeasurement(hub, exp.camera, sequencer=exp.devices.sequencer)
-    det = OccupancyProcessor(hub, calibration=cal, source_expr={"inputs": ["frame"], "source": "value = signal"}, method="box", grid_shape=(3, 4))
+    det = OccupancyProcessor(hub, calibration=cal, source_expr={"inputs": ["frame_0"], "source": "value = signal"}, method="box", grid_shape=(3, 4))
     fire_live_imaging(exp)            # On Pulse: the trigger-driven camera now streams
     for _ in range(4):
         cam.step()
@@ -99,17 +97,17 @@ def test_2d_frame_panel_shows_camera_average_decoupled_from_judge():
     hub = SignalHub()
     cam = CameraMeasurement(hub, exp.camera, sequencer=exp.devices.sequencer, repeat=5)  # 0=∞; 5 = a 5-deep block
     det = OccupancyProcessor(hub, calibration=exp.readout.current,
-                             source_expr={"inputs": ["frame"], "source": "value = signal"}, method="box", grid_shape=(3, 4))
+                             source_expr={"inputs": ["frame_0"], "source": "value = signal"}, method="box", grid_shape=(3, 4))
     fire_live_imaging(exp)
     for _ in range(6):
         cam.step(); det.step()           # the camera fills its repeat ring WHILE the Judge runs
 
     ns = hub.snapshot_latest()
-    block = np.asarray(ns["frame"])                       # (repeat, 1, H, W) camera block
+    block = np.asarray(ns["frame_0"])                     # (repeat, 1, H, W) camera block
     assert block.ndim == 4 and "frame_judged" in ns       # precondition: a Judge IS running + published
 
     st = {"points_shape": (1,), "data_shape": tuple(block.shape[2:]), "grid_shape": ()}
-    card = PanelCard(PanelConfig(kind="2d", role="plot", source="value = signal", inputs=["frame"],
+    card = PanelCard(PanelConfig(kind="2d", role="plot", source="value = signal", inputs=["frame_0"],
                                  params={"repeat_mode": "average", "cmap": "viridis"}),
                      structure_provider=lambda name: st)
     try:
@@ -135,10 +133,10 @@ def test_occupancy_falls_back_to_session_calibration_on_shape_mismatch():
     session_cal = exp.readout.current                    # the matching (48,60) calibration
     hub = SignalHub()
     det = OccupancyProcessor(hub, calibration=stale_cal, session_calibration=lambda: session_cal,
-                             source_expr={"inputs": ["frame"], "source": "value = signal"}, grid_shape=(3, 4))
+                             source_expr={"inputs": ["frame_0"], "source": "value = signal"}, grid_shape=(3, 4))
     fire_live_imaging(exp)
     img = exp.devices.camera.acquire(1, sequencer=exp.devices.sequencer)[0]
-    hub.publish({"frame": np.asarray(img, dtype=float)})
+    hub.publish({"frame_0": np.asarray(img, dtype=float)})
     out = det.step()                                     # stale cal mismatches (48,60) -> falls back
     assert "occupied" in out and "rate" in out           # readout keeps flowing (not wedged)
     assert det.calibration is session_cal                # adopted the matching one for next shots

@@ -38,19 +38,19 @@ def test_camera_measurement_plus_detect_processor_runs_real_pipeline():
 
     hub = SignalHub()
     cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer)
-    det = OccupancyProcessor(hub, calibration=cal, source_expr={"inputs": ["frame"], "source": "value = signal"}, grid_shape=(3, 4))
+    det = OccupancyProcessor(hub, calibration=cal, source_expr={"inputs": ["frame_0"], "source": "value = signal"}, grid_shape=(3, 4))
     try:
         fire_live_imaging(exp)            # On Pulse: the trigger-driven camera now streams
         # the camera measurement is just that -- a camera; it does NOT detect.
-        assert "frame" not in det.published_signals()
+        assert "frame_0" not in det.published_signals()
         assert "occupied" in det.published_signals()
 
         # reactive: with no frame yet, the processor no-ops (publishes nothing)
         assert det.step() == {}
 
-        # camera publishes ONLY a frame (the monolith published 9 signals here)
+        # camera publishes ONE block per emCCD event (frames_per_cycle=1 -> just frame_0)
         named = cam.step()
-        assert set(k for k in named) == {"frame", "frame_0"}
+        assert set(k for k in named) == {"frame_0"}
         assert "occupied" not in hub.names()
 
         # detect consumes the frame and produces occupancy through the REAL contract
@@ -63,7 +63,7 @@ def test_camera_measurement_plus_detect_processor_runs_real_pipeline():
 
         # virtual == real: the published occupancy IS calibration.detect on that frame.  ``frame`` is
         # the camera's (repeat,1,H,W) block, so judge its last filled slice and compare per shot.
-        img = np.asarray(hub.latest("frame"))[-1, 0]
+        img = np.asarray(hub.latest("frame_0"))[-1, 0]
         expected = np.asarray(cal.detect(img).occupied, dtype=float).reshape(-1)
         np.testing.assert_array_equal(occ[-1], expected)
 
@@ -151,10 +151,10 @@ def test_user_composed_loading_readout_streams_real_detect_off_camera_frames():
         cam.step()                                    # publishes frame
         det.step()                                    # consumes frame -> real detect
         names = set(hub.names())
-        assert "frame" in names and {"occupied", "rate", "centers"} <= names
+        assert "frame_0" in names and {"occupied", "rate", "centers"} <= names
         occ = np.asarray(hub.latest("occupied"))
         assert occ.ndim == 2 and occ.shape[1] == 12     # clean (repeat, n_sites) block (#H3s-F3)
-        img = np.asarray(hub.latest("frame"))[-1, 0]    # judge the camera block's last filled slice
+        img = np.asarray(hub.latest("frame_0"))[-1, 0]    # judge the camera block's last filled slice
         expected = np.asarray(task.calibration.detect(img).occupied, dtype=float).reshape(-1)
         np.testing.assert_array_equal(occ[-1], expected)
     finally:
@@ -180,7 +180,7 @@ def test_calibrate_task_output_stays_off_the_hub():
         task = CalibrateReadoutTask(
             hub, exp.devices.camera, sequencer=exp.devices.sequencer, grid_shape=(3, 4),
             threshold_frames=20, prefix="cal_")
-        assert "frame" not in hub.names()              # nothing live yet
+        assert "frame_0" not in hub.names()              # nothing live yet
         task.run_to_completion()                       # runs the calibrate task
         # The task put NOTHING on the hub -- mid-run frame + progress are in its buffer.
         assert hub.names() == []
@@ -191,7 +191,7 @@ def test_calibrate_task_output_stays_off_the_hub():
         cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer)
         fire_live_imaging(exp)            # On Pulse: the trigger-driven camera now streams
         cam.step()
-        assert "frame" in hub.names()
+        assert "frame_0" in hub.names()
         assert not any(n.startswith("cal_") for n in hub.names())
     finally:
         exp.close()

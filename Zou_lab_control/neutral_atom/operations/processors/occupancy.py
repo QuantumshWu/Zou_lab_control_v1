@@ -57,10 +57,11 @@ def judge_occupancy(readout) -> ProcessorSpec:
                           "calibrate-then-judge needs no path typed; Browse to use another.  Until "
                           "this file exists the detector uses the current session calibration."),
         ParamDecl("source", "Frame source", "signal_expr",
-                  default={"inputs": ["frame"], "source": "value = signal"},
-                  tooltip="The camera frame to judge: pick one or more hub signals and combine via "
-                          "value = ... (default = the single `frame` signal; the value must be ONE "
-                          "(H×W) frame -- e.g. `value = (signal[0] + signal[1]) / 2` averages two)."),
+                  default={"inputs": ["frame_0"], "source": "value = signal"},
+                  tooltip="The camera frame to judge: pick one emCCD event's signal (`frame_0`, "
+                          "`frame_1`, … one per trigger of the cycle) and optionally combine via "
+                          "value = ... (default = `frame_0`, the cycle's first emCCD event; the value "
+                          "must be ONE (H×W) frame -- e.g. `value = (signal[0]+signal[1])/2` averages two)."),
         ParamDecl("method", "Readout method", "choice", default="box",
                   choices=tuple(method_labels),
                   tooltip="How to turn each frame into per-site signal: box = square ROI; "
@@ -83,7 +84,13 @@ def judge_occupancy(readout) -> ProcessorSpec:
 
         def _load_calibration():
             if cal_path.is_file():
-                return TrapCalibration.load(cal_path)
+                try:
+                    return TrapCalibration.load(cal_path)
+                except Exception as exc:                       # corrupt / wrong-format file -> clear text error
+                    raise ValueError(
+                        f"Judge occupancy: cannot load calibration file {cal_path.name}: {exc}. "
+                        "The file is missing required fields or is not a valid calibration "
+                        "(.json/.npz) -- re-run Calibrate readout, or pick a valid file.") from exc
             return readout.current        # graceful fallback until the named file exists
 
         calibration = _load_calibration()
@@ -111,7 +118,7 @@ def judge_occupancy(readout) -> ProcessorSpec:
         name="Judge occupancy",
         params=params,
         make_node=make_node,
-        consumes=("frame",),
+        consumes=("frame_0",),
         # SINGLE SOURCE: the published key names live ONCE on the node class (its `provides`),
         # the spec derives them -- so the spec's result_keys and the node's published_signals
         # can never drift (#H3r-F3).

@@ -647,7 +647,9 @@ class ReadoutSubsystem(ExperimentSubsystem):
             params=(
                 ParamDecl(key="frames_per_cycle", label="frames / cycle", kind="int",
                           default=1, lo=1, hi=10000,
-                          tooltip="Camera frames acquired per publish cycle."),
+                          tooltip="emCCD events (camera triggers) per cycle.  Each event i publishes its "
+                                  "OWN signal frame_i = a (repeat,1,H,W) block, so you can apply repeat_mode "
+                                  "to a chosen event (e.g. average just frame_1 of a 3-event cycle)."),
                 ParamDecl(key="exposure", label="exposure", kind="float",
                           default=exposure, unit="s", lo=0.0, hi=100.0,
                           tooltip="Camera exposure time (applied live to the camera)."),
@@ -656,8 +658,8 @@ class ReadoutSubsystem(ExperimentSubsystem):
                                   "sensor).  Or drag a box on a frame plot to set it -- both go to "
                                   "camera.configure(roi=), identical for virtual / real."),
             ),
-            result_labels=("shot", "frame"),
-            x_key="frame", y_key="frame",
+            result_labels=("shot", "frame_0"),
+            x_key="frame_0", y_key="frame_0",
             build=_build,
         )
 
