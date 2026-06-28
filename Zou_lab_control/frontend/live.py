@@ -92,6 +92,9 @@ def reduce_repeat(raw, mode: str = "average", *, core_ndim=None):
       stable regardless of how many repeats completed = a long exposure for a camera) -> drops O0.
     * ``add``     -> ``nansum``  over repeats (accumulating exposure).
     * ``replace`` / ``roll`` -> the LATEST repeat slice that holds data.
+    * ``pool``    -> a DISTRIBUTION mode: do NOT reduce the repeat axis -- flatten EVERY repeat-with-data's
+      samples into one 1-D set so a histogram bins all shots together.  This is the ONLY repeat mode a
+      histogram offers, so the panel needs no per-kind special case: it just calls ``reduce_repeat(mode)``.
     * ``create``  -> 1-D blocks only: keep EVERY repeat-with-data as its own column block
       ``(points, n*dim)`` so the curve draws one line per repeat (confocal's "create"); for a 3-D+
       data block (an image) ``create`` has no meaning and falls back to the mean."""
@@ -104,6 +107,8 @@ def reduce_repeat(raw, mode: str = "average", *, core_ndim=None):
         return np.nansum(a, axis=0)
     if mode in ("replace", "roll"):
         return a[idx[-1]] if idx.size else a[0]
+    if mode == "pool":                                    # histogram: flatten ALL repeats' samples (no reduce)
+        return (a[idx] if idx.size else a[:1]).reshape(-1)
     if mode == "create":
         cols = idx if idx.size else np.array([0])
         if a.ndim == 2:                                       # (R, points) reduced scan -> (points, R) lines
@@ -2243,7 +2248,7 @@ class PlotKind:
 # trace verb (roll/replace) is never offered on (or silently ignored by) a histogram (#issue-1).
 TRACE_REPEAT_MODES: tuple[str, ...] = REPEAT_MODES                                     # full set (create = 1-D)
 IMAGE_REPEAT_MODES: tuple[str, ...] = ("average", "add", "replace")                    # a frame: mean/sum/latest
-HIST_REPEAT_MODES: tuple[str, ...] = ("pool", "latest")                                # all repeats / newest only
+HIST_REPEAT_MODES: tuple[str, ...] = ("pool",)              # distribution: bin ALL repeats' samples together
 
 PLOT_KINDS: tuple[PlotKind, ...] = (
     PlotKind(
