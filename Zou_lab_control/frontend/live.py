@@ -2162,6 +2162,14 @@ class PlotKind:
                    ``((label, default_signal, tooltip), ...)``; empty = the
                    universal single ``signal`` slot.
     single_slot    True if the kind takes EXACTLY ONE signal (no +/- slot growing).
+    repeat_modes   the repeat-DISPLAY modes that are MEANINGFUL for this kind, in menu order
+                   (the first is the default).  A TRACE/IMAGE reduces its repeats
+                   (``average``/``add``/``replace``/``roll``, plus ``create`` = one line per repeat
+                   for 1-D); a DISTRIBUTION instead chooses how to BIN the repeats' samples
+                   (``pool`` = all repeats in one histogram, ``latest`` = only the newest repeat).
+                   Empty = a non-repeat kind (no repeat_mode control).  This is what stops a
+                   trace verb like ``roll`` being offered on a histogram (where it is meaningless)
+                   and stops a histogram silently ignoring the control (#issue-1).
     """
 
     key: str
@@ -2172,6 +2180,7 @@ class PlotKind:
     input_format: str = ""
     input_slots: tuple[tuple[str, str, str], ...] = ()
     single_slot: bool = False
+    repeat_modes: tuple[str, ...] = ()
 
 
 # The ONE plot-kind table.  ``plot()`` looks the class up here (no if/elif ladder)
@@ -2179,14 +2188,22 @@ class PlotKind:
 # PANEL_SINGLE_SLOT_KINDS from it (no parallel literals).  Order is the Add-Panel
 # menu order.  ``monitor`` lists its DEFAULT class (LiveLiveDis, show_dist=True); the
 # bare LiveLive variant is the show_dist=False toggle, still inside plot().
+# Repeat-display vocabularies (single source).  TRACE/IMAGE modes REDUCE the repeat axis;
+# the DISTRIBUTION instead BINS the repeats' samples -- a separate, dedicated vocabulary so a
+# trace verb (roll/replace) is never offered on (or silently ignored by) a histogram (#issue-1).
+TRACE_REPEAT_MODES: tuple[str, ...] = REPEAT_MODES                                     # full set (create = 1-D)
+IMAGE_REPEAT_MODES: tuple[str, ...] = ("average", "add", "replace")                    # a frame: mean/sum/latest
+HIST_REPEAT_MODES: tuple[str, ...] = ("pool", "latest")                                # all repeats / newest only
+
 PLOT_KINDS: tuple[PlotKind, ...] = (
     PlotKind(
         key="2d", cls=Live2DDis, label="2D image", render_family="2D",
         input_format="value must be a 2D array / camera frame (H×W)",
+        repeat_modes=IMAGE_REPEAT_MODES,
     ),
     PlotKind(
         key="sites", cls=LiveSiteMap, label="Site map", render_family="auto",
-        single_slot=True,
+        single_slot=True, repeat_modes=IMAGE_REPEAT_MODES,
         input_format=(
             "value must be a per-site (N,) vector -- one number per tweezer (e.g. occupancy "
             "0/1 or loading rate); signal[0]'s producing node also supplies the ring centres "
@@ -2204,14 +2221,17 @@ PLOT_KINDS: tuple[PlotKind, ...] = (
     PlotKind(
         key="1d", cls=Live1D, label="1D vector", render_family="1D",
         input_format="value must be a 1D vector (N,) or per-site array",
+        repeat_modes=TRACE_REPEAT_MODES,
     ),
     PlotKind(
         key="monitor", cls=LiveLiveDis, label="Rolling trace", render_family="1D",
         input_format="value must be a scalar per shot (rolling trace)",
+        repeat_modes=TRACE_REPEAT_MODES,
     ),
     PlotKind(
         key="hist", cls=HistogramFigure, label="Distribution", render_family="1D",
         input_format="value must be a 1D sample vector",
+        repeat_modes=HIST_REPEAT_MODES,
     ),
     # Notebook-only static timing diagram -- NOT a console Add-Panel kind.
     PlotKind(key="pulse", cls=PulseSequenceFigure, label="Pulse sequence", render_family="1D", panel=False),

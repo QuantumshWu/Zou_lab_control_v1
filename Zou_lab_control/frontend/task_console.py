@@ -1934,14 +1934,28 @@ class PanelCard(FluentGroupBox):
         through the same widget path as every other param.  This is the ONLY repeat knob on the plot:
         the COUNT (``repeat``) belongs to the MEASUREMENT (the plot cannot tell a measurement how many
         times to run) -- the plot just chooses how to DISPLAY the repeats the measurement produced.
-        ``create`` (a line per repeat) is 1-D only -- other kinds get the create-less mode list."""
-        from .live import REPEAT_MODES
-        modes = list(REPEAT_MODES) if self.config.kind == "1d" else [m for m in REPEAT_MODES if m != "create"]
+        Each plot KIND exposes only the repeat modes meaningful for it (#issue-1), read from the one
+        ``PLOT_KINDS`` table: a trace/image reduces its repeats (average/add/replace/roll/+create for
+        1-D), a DISTRIBUTION instead bins them (pool / latest).  So a histogram never offers a trace
+        verb like ``roll`` (and never silently ignores the control), and the default is the kind's first
+        (canonical) mode."""
+        from .live import PLOT_KIND_BY_KEY, IMAGE_REPEAT_MODES
+        pk = PLOT_KIND_BY_KEY.get(self.config.kind)
+        modes = list(pk.repeat_modes) if (pk and pk.repeat_modes) else list(IMAGE_REPEAT_MODES)
         return (
-            ParamDecl(key="repeat_mode", label="repeat mode", kind="choice", default="average",
+            ParamDecl(key="repeat_mode", label="repeat mode", kind="choice", default=modes[0],
                       choices=tuple(modes),
                       tooltip=self._repeat_mode_tooltip()),
         )
+
+    def _repeat_mode_value(self) -> str:
+        """The stored repeat_mode, CLAMPED to this kind's valid modes (migrates an old saved layout
+        whose mode -- e.g. a histogram saved with 'average' before #issue-1 -- is no longer offered)."""
+        from .live import PLOT_KIND_BY_KEY, IMAGE_REPEAT_MODES
+        pk = PLOT_KIND_BY_KEY.get(self.config.kind)
+        modes = list(pk.repeat_modes) if (pk and pk.repeat_modes) else list(IMAGE_REPEAT_MODES)
+        cur = str(self.config.params.get("repeat_mode", modes[0]))
+        return cur if cur in modes else modes[0]
 
     def _bound_is_occupancy(self) -> bool:
         """Whether this panel's bound signal is an OCCUPANCY vector (a Judge-occupancy output) --
@@ -1964,6 +1978,10 @@ class PanelCard(FluentGroupBox):
         shots' 0/1), ``add`` the total loads, ``replace`` the latest shot, ``roll`` the last N --
         the experiment meaning, not a generic array verb.  Generic otherwise, driven off the signal's
         role rather than the panel kind."""
+        if self.config.kind == "hist":
+            return ("How to BIN the measurement's repeats into the distribution:\n"
+                    "  pool   = bin EVERY repeat's samples into one histogram (all repeats together)\n"
+                    "  latest = bin only the newest repeat's samples")
         if self._bound_is_occupancy():
             return ("How to combine the N shots of per-site occupancy for display:\n"
                     "  average = per-site LOADING PROBABILITY = mean of the N shots' 0/1\n"
@@ -2446,7 +2464,7 @@ class PanelCard(FluentGroupBox):
         = sum, create = one line per repeat, ...).  ``_repeat_cur`` (how many repeats hold data) drives
         the plotter's "xN" ylabel."""
         from .live import reduce_repeat, repeats_with_data
-        mode = str(self.config.params.get("repeat_mode", "average"))
+        mode = self._repeat_mode_value()                          # clamped to this kind's valid modes (#issue-1)
         # core_ndim of the bound signal (a Judge-occupancy output declares its OWN per-signal structure,
         # so its clean ``(repeat, n_sites)`` block is collapsed by STRUCTURE, not an ndim guess; camera /
         # scan stay on the legacy ndim>=3 path with core_ndim=None) -- #H3s-F3.
@@ -2462,8 +2480,14 @@ class PanelCard(FluentGroupBox):
         if had_repeat and (b.ndim == 1 + core_ndim if core_ndim is not None else b.ndim >= 3):
             self._repeat_cur = repeats_with_data(b, core_ndim=core_ndim)   # scan / camera / occupancy block
             if self.config.kind == "hist":
-                return b                                          # a histogram wants ALL samples (every
-            return reduce_repeat(b, mode, core_ndim=core_ndim)    # repeat × datum) -> _coerce flattens the block
+                # A DISTRIBUTION bins the repeats, it does NOT reduce them (#issue-1): 'pool' = bin EVERY
+                # repeat's samples into one histogram (the default, all repeats together); 'latest' = bin
+                # only the newest repeat's samples (parallels a trace's 'replace').  This is the dist-OWN
+                # repeat handling -- a trace verb (average/roll/...) is never reached here.
+                if mode == "latest":
+                    return reduce_repeat(b, "replace", core_ndim=core_ndim)
+                return b                                          # 'pool' -> ALL samples -> _coerce flattens
+            return reduce_repeat(b, mode, core_ndim=core_ndim)    # trace/image: reduce the repeat axis
         self._repeat_cur = 1                                      # no repeat axis -> nothing to reduce
         return b
 

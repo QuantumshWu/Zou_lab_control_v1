@@ -193,6 +193,15 @@ def test_plot_setting_has_only_repeat_mode_not_repeat(monkeypatch):
         combo2 = card.param_widgets["repeat_mode"]
         modes2 = [combo2.itemText(i) for i in range(combo2.count())]
         assert "average" in modes2 and "create" not in modes2  # 2-D: no per-repeat lines
+
+        # A DISTRIBUTION offers its OWN dedicated modes (pool/latest), NOT trace verbs (#issue-1): it must
+        # never show 'roll'/'average'/'create' (a histogram can't "roll") and must not silently no-op.
+        card.config.kind = "hist"
+        card._build_settings()
+        combo3 = card.param_widgets["repeat_mode"]
+        modes3 = [combo3.itemText(i) for i in range(combo3.count())]
+        assert "pool" in modes3 and "latest" in modes3
+        assert not ({"average", "add", "replace", "roll", "create"} & set(modes3))  # no trace verbs on a dist
     finally:
         console.shutdown()
 
