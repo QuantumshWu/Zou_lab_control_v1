@@ -88,11 +88,15 @@ class VirtualTrapArray(TrapArrayDevice):
     # still loads fewer atoms (loading_fraction), but a full MOT load saturates the
     # ~loading_probability ceiling.
     mot_load_s: float = 0.30
-    # Bright-atom photoelectron rate (peak amplitude/s) during the probe.  Tuned to the REAL
-    # Rb87 qCMOS dataset (references/.../rb87_readout_v16): a bright site's 3x3-box signal is
-    # ~18-19 detected photons at the 3 ms reference readout (35-site mean 18.7 ph), and with
-    # atom_sigma_px=0.7 this rate renders an all-bright 3 ms frame at that box level.
-    atom_rate: float = 2_150.0
+    # Bright-atom photoelectron rate (peak amplitude/s) during the probe.  ALIGNED to the REAL Rb87
+    # qCMOS dataset's DETECTED PHOTON RATE (references/.../rb87_readout_v16): the v16 bright atom
+    # delivers ~9.3 box / ~7.9 psf detected photons in a 2 ms readout (= ~4.6 / 4.0 kph/s), so this
+    # rate makes the virtual per-atom photon count match v16 at the SAME exposure -- NOT higher (a
+    # too-high rate gave an unrealistically clean, over-separated histogram: the readout looked far
+    # easier than real Rb87).  With the photon count aligned, the bright distribution width is pure
+    # Poisson(signal+background) -- it sharpens with exposure, so single-shot fidelity RISES from the
+    # hard short-readout regime (~0.8-0.9) to ~0.99 at a long readout, exactly like the real data.
+    atom_rate: float = 1_450.0
     # Per-site COLLECTION-efficiency variation (relative standard deviation, 1-sigma):
     # a real Rb87 tweezer array has different effective NA / aberration / vacuum-window
     # transmission per site, so each site's bright count rate scales by an independently
@@ -101,21 +105,22 @@ class VirtualTrapArray(TrapArrayDevice):
     # spot brightness varies, so a fixed box averages out signal a per-site kernel can
     # match.  Default 0.18 (=18% RSD) is a realistic spread on a moderate tweezer array.
     site_efficiency_sigma: float = 0.18
-    # SHOT-TO-SHOT atom-brightness jitter (1-sigma of a per-shot, per-atom lognormal multiplier,
-    # mean-preserving).  A real trapped atom does NOT scatter the same number of photons every shot:
-    # its position in the tweezer, light-assisted collision history and hopping vary the collected
-    # count shot to shot, so the BRIGHT distribution is much WIDER than pure Poisson.  The Rb87 v16
-    # data shows a within-site bright CV ~0.58 (psf) at ~9 photons where Poisson alone is only ~0.33
-    # -> ~0.45 excess shot-to-shot jitter.  Without it the virtual bright peak is unrealistically
-    # narrow, so every site reads a flat ~100 % fidelity with no per-site spread (the regression the
-    # user hit); with it the per-site fidelity lands in the realistic 0.8-0.99 band WITH a spread, and
-    # a longer readout only gradually approaches (never trivially saturates) 1.0 -- the honest
-    # SNR-vs-readout-duration behaviour.  0 = the old pure-Poisson (too-clean) bright peak.
-    shot_brightness_jitter: float = 0.15
-    # Stray-light + scatter floor (detected photons/s/pixel, always present).  The real v16
-    # 3 ms corner-median is ~16.5 counts/px above the 200-count offset -> ~1.8 ph/px/3 ms ->
-    # ~600 ph/s/px, so dark sites carry a realistic shot-noise floor (not a near-zero one).
-    background_rate: float = 600.0
+    # OPTIONAL extra super-Poisson shot-to-shot brightness jitter (1-sigma of a per-shot, per-atom
+    # mean-preserving lognormal).  DEFAULT 0: the v16 bright-distribution width is fully explained by
+    # Poisson(signal + background) once the photon RATE and background are aligned (a 2 ms bright box
+    # ~9 ph over ~29 ph background -> Poisson sigma ~5.8 ph, the measured width) -- there is NO unexplained
+    # excess, and a FIXED multiplicative jitter is WRONG anyway because it would cap the fidelity (it does
+    # not sharpen with exposure, so single-shot fidelity could never rise to ~0.99 at a long readout the
+    # way the real data does).  Left as a knob only to model a genuinely un-cooled / hopping atom; keep 0
+    # for the v16-faithful pure-Poisson readout.
+    shot_brightness_jitter: float = 0.0
+    # Stray-light + scatter floor (detected photons/s/pixel, always present).  ALIGNED to the v16
+    # background: its 2 ms box carries ~29 detected photons over a 49 px (7x7) box -> ~0.6 ph/px/2 ms
+    # -> ~300 ph/s/px.  This sets the dark-site Poisson floor that the bright signal competes with;
+    # a too-high floor (the old 600) added background noise that CAPPED the achievable fidelity (it
+    # could not reach ~0.99 even at a long readout), so aligning it to v16 is what lets the readout
+    # recover the real ~0.99 at the reference exposure.
+    background_rate: float = 300.0
     dark_current_e_per_s: float = 0.006
     offset_counts: float = 200.0          # qCMOS nominal offset (reference CameraConfig)
     conversion_e_per_count: float = 0.107  # electrons per count (reference qCMOS gain)
