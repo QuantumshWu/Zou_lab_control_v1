@@ -18,6 +18,15 @@ from Zou_lab_control.frontend.task_console import _ShotClock
 from Zou_lab_control.neutral_atom.core.signals import NO_LINEAGE
 
 
+def test_default_hold_is_zero_live_camera_not_held_by_a_lagging_occupancy():
+    # DEFAULT (Hold=0) = LIVE: a live camera bound alongside a slower occupancy must NOT be held back to
+    # occupancy's pace -- display = newest, so snapshot_at gives each its own latest (repeat/repeat_mode
+    # work exactly as before the shot clock).  This is the regression the global min-hold caused.
+    c = _ShotClock()                                  # default
+    assert c.cache_time_s == 0.0
+    assert c.advance({"frame": 7, "occupied": 3}, ["frame", "occupied"], now=1.0) == 7   # live, not held to 3
+
+
 def test_all_bound_at_same_shot_advances_to_it():
     c = _ShotClock(cache_time_s=0.1)
     assert c.advance({"frame": 5, "occupied": 5}, ["frame", "occupied"], now=1.0) == 5
