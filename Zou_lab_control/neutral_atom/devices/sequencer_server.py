@@ -89,7 +89,10 @@ class CommandSequencerBackend:
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            timeout=self.timeout,
+            # Honour the PER-CALL timeout (e.g. a long wait_done) for the actual process kill, not just
+            # the ZLC_TIMEOUT env var -- else a slow command is killed at the instance default while the
+            # env says otherwise.  Falls back to the instance timeout when the caller gives none.
+            timeout=timeout if timeout is not None else self.timeout,
         )
         log_path = self.state_dir / f"{action}.log"
         log_path.write_text(result.stdout, encoding="utf-8", errors="replace")

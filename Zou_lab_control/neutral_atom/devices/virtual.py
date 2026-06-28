@@ -194,6 +194,9 @@ class VirtualTrapArray(TrapArrayDevice):
         self.dark_current_e_per_s = nonnegative_float(self.dark_current_e_per_s, "dark_current_e_per_s")
         self.offset_counts = nonnegative_float(self.offset_counts, "offset_counts")
         self.conversion_e_per_count = positive_float(self.conversion_e_per_count, "conversion_e_per_count")
+        # Validate like every sibling tunable (it feeds a lognormal sigma; a bad value otherwise
+        # only blows up deep in _site_efficiency on the first render, not at construction).
+        self.site_efficiency_sigma = nonnegative_float(self.site_efficiency_sigma, "site_efficiency_sigma")
         self.read_noise_e = nonnegative_float(self.read_noise_e, "read_noise_e")
         self.atom_sigma_px = positive_float(self.atom_sigma_px, "atom_sigma_px")
         self.atom_psf_aspect = positive_float(self.atom_psf_aspect, "atom_psf_aspect")

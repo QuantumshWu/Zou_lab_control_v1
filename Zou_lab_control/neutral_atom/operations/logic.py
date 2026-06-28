@@ -412,7 +412,10 @@ class Measurement(LogicNode):
             # The block's first axis is the RING DEPTH actually published = ``max(1, repeat)`` (a
             # finite run keeps ``repeat`` slices; ``repeat=0`` = ∞ keeps a 1-deep rolling ring), NOT
             # the raw ``repeat`` -- so 0 = ∞ does not false-trip this contract guard.
-            ring = int(getattr(self, "_ring", max(1, int(self.repeat))))
+            # Resolve the ring depth defensively: a new measurement subclass that sets primary_signal
+            # but forgot _ring/repeat should still get this guard's CLEAR shape message, not a cryptic
+            # AttributeError from an eagerly-evaluated default (getattr's default arg always evaluates).
+            ring = int(getattr(self, "_ring", 0)) or max(1, int(getattr(self, "repeat", 1)))
             expected = (ring, *tuple(self.points_shape), *tuple(self.data_shape))
             if block.shape != expected:
                 raise ValueError(

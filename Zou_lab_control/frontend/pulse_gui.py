@@ -2173,7 +2173,10 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             chan_key = (
                 tuple(state.channels), tuple(state.visible_channels),
                 tuple(sorted((str(k), str(v)) for k, v in (getattr(state, "labels", None) or {}).items())),
-                tuple(sorted((str(k), float(v)) for k, v in (state.delays or {}).items())),
+                # str(v) not float(v): a delay value is legitimately a string EXPRESSION ("s0", "20+s1")
+                # per PulseTableState.delays (float | str); float() would crash load_state on a valid saved
+                # pulse.  This key only detects change, so string identity is sufficient and correct.
+                tuple(sorted((str(k), str(v)) for k, v in (state.delays or {}).items())),
                 tuple(sorted((str(k), str(v)) for k, v in (state.delay_units or {}).items())),
                 tuple(getattr(state, "clk_channels", []) or []),
                 len(state.scan_slots), float(state.time_step_ns),
@@ -3002,6 +3005,8 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         label = getattr(self, "scan_progress_label", None)
         if label is None:
             return
+        if not self.isVisible():
+            return                                       # hidden (e.g. hide_on_close): no RPC for an unseen window
         if getattr(self, "tabs", None) is not None and self.tabs.currentWidget() is not getattr(self, "scan_tab", None):
             return                                       # Scan tab not visible -> skip the RPC poll
         sequencer = getattr(self, "sequencer", None)
@@ -3468,19 +3473,6 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self.bracket_button.setText("Del Bracket")
         self._sync_dataset_geometry()
         self._mark_dirty()
-
-    def hide_channel(self, channel: str) -> None:
-        try:
-            state = self.read_state()
-            if self._channel_has_period_on(state, channel):
-                self._message(f"Channel {channel!r} has an on period. Clear its pulses before hiding it.")
-                return
-            state.visible_channels = [item for item in state.visible_channels if item != channel]
-            state.validate()
-        except Exception as exc:
-            self._message(str(exc))
-            return
-        self.load_state(state)
 
     def clear_channel(self, channel: str) -> None:
         try:

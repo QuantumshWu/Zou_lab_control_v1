@@ -149,3 +149,16 @@ def test_find_site_centers_1d_array_with_dark_sites_stays_in_bounds():
     h, w = image_shape
     assert np.all(centers[:, 0] >= half) and np.all(centers[:, 0] <= w - 1 - half)
     assert np.all(centers[:, 1] >= half) and np.all(centers[:, 1] <= h - 1 - half)
+
+
+def test_find_site_centers_peak_poor_image_raises_not_corrupts():
+    """A near-noiseless / degenerate reference with FAR fewer local maxima than sites must FAIL LOUD,
+    not silently fall back to brightest-PIXEL picks (which collapse many centers onto one blob and
+    return a corrupt grid).  A real averaged qCMOS frame always carries read noise -> many peaks ->
+    never hits this; this pins that a genuinely peak-poor image errors instead of corrupting."""
+    import pytest
+    yy, xx = np.mgrid[0:96, 0:128].astype(float)
+    img = 0.01 * yy + 0.013 * xx                                  # gentle unique-valued slope (no flat ties)
+    img += 500.0 * np.exp(-((yy - 48) ** 2 + (xx - 64) ** 2) / (2 * 8.0 ** 2))   # ONE broad blob
+    with pytest.raises(ValueError, match="local maxima"):
+        find_site_centers(img, (5, 7))                            # 1-2 maxima for a 35-site grid -> raise

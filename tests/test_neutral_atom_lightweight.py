@@ -857,8 +857,11 @@ def test_repo_tree_has_no_generated_fpga_or_latex_work_products():
 def test_repo_bat_entrypoints_are_minimal_and_grouped_by_submodule():
     root = Path(__file__).resolve().parents[1]
     # "build" excludes the git-ignored Vivado project output (fpga/build/r/...),
-    # which contains IP-generated runme.bat files that are not entrypoints.
-    ignored_roots = {".git", "references", "reference", "build"}
+    # which contains IP-generated runme.bat files that are not entrypoints.  ".claude" excludes the
+    # harness's transient tooling state (skills/hooks + agent worktree copies of the whole repo) -- it
+    # is gitignored, not part of the project entrypoints, and a leftover agent worktree would otherwise
+    # smuggle a duplicate copy of every .bat into this audit.
+    ignored_roots = {".git", ".claude", "references", "reference", "build"}
     bat_files = sorted(path.relative_to(root).as_posix() for path in root.rglob("*.bat") if not (set(path.relative_to(root).parts) & ignored_roots))
 
     assert bat_files == [

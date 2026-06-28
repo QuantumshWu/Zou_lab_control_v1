@@ -160,9 +160,17 @@ def find_site_centers(
         if len(peaks_yx) >= need:
             peak_weights = smooth[peaks_yx[:, 0], peaks_yx[:, 1]]
             candidates_yx = peaks_yx[np.argsort(peak_weights)[::-1][:need]]
-        else:                       # genuinely peak-poor image: last-resort brightest pixels
-            flat = np.argsort(smooth.ravel())[::-1][:need]
-            candidates_yx = np.column_stack(np.unravel_index(flat, smooth.shape))
+        else:
+            # Fewer LOCAL MAXIMA than traps -- only possible on a near-noiseless / degenerate
+            # reference (a real averaged qCMOS frame always carries read noise, so it has far more
+            # peaks than sites and never lands here).  The old brightest-PIXEL fallback would
+            # collapse several centers onto one blob and silently return a corrupt grid (exactly
+            # what the comment above warns against).  Fail LOUD instead of corrupting the calibration.
+            raise ValueError(
+                f"find_site_centers: only {len(peaks_yx)} distinct local maxima for a "
+                f"{ny}x{nx}={need}-site grid -- the reference is too peak-poor (over-blurred, "
+                "near-zero contrast, or far fewer traps loaded than grid_shape). Check the exposure / "
+                "threshold_rel / grid_shape rather than detecting on this frame.")
     weights = smooth[candidates_yx[:, 0], candidates_yx[:, 1]]
     selected = candidates_yx[np.argsort(weights)[::-1]][:need]
     # Refine EACH detected peak from its integer argmax to its true SUB-PIXEL center (local

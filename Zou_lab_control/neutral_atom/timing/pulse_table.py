@@ -432,8 +432,8 @@ class PulseTableState:
                         return float(slots.get(str(value).strip(), 0.0))
                     return float(value)
                 return float(self.analog_bus_value_at_period_start(int(period_index), bus))
-        except Exception:
-            pass
+        except (ValueError, KeyError, IndexError, TypeError):
+            pass   # malformed/out-of-range field -> fall back to the kind default (don't hide a real bug)
         return (1000.0 / scale) if kind == "duration" else 0.0
 
     def bind_field(self, kind: str, target: str, *, label: str = "", unit: str = "ns", nominal: float | None = None) -> int:
