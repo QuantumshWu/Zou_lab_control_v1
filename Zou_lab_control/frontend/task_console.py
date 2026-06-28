@@ -4336,7 +4336,10 @@ class LogicNodeRow(FluentFrame):
         # Monospace so the name/shape columns ALIGN down the rows (a readable table, not a
         # run-on line).
         self.publishes_label = FluentLabel("")
-        self.publishes_label.setWordWrap(False)
+        # WRAP, never extend the row horizontally: a logic-node card lives in a vertical list with NO
+        # horizontal scroll (#2).  The publishes legend is name + shape only (short, fits) -- the longer
+        # per-signal meaning lives in the tooltip, so nothing forces the card wider than the column.
+        self.publishes_label.setWordWrap(True)
         self.publishes_label.setStyleSheet(
             f"color: {GREY}; background: transparent; border: none; "
             "font-family: Consolas, 'DejaVu Sans Mono', monospace;")
@@ -4353,31 +4356,28 @@ class LogicNodeRow(FluentFrame):
         self.stop_button.setEnabled(running)
 
     def set_publishes(self, rows) -> None:
-        """Show the node's outputs as a readable TABLE -- ONE signal per line, the
-        ``name`` / ``shape`` columns aligned, then the human meaning::
+        """Show the node's outputs as a SHORT table -- ONE signal per line, ``name`` + ``shape`` only::
 
             publishes:
-              occupied    (35,)     per-site single-shot occupancy (0 / 1)
-              rate        scalar    running-mean loading rate over all sites
+              occupied   (35,)
+              rate       scalar
 
-        ``rows`` is ``[(name, shape, description)]`` from the console (shapes
-        AUTO-EXTRACTED from the real values via ``logic.describe_shape``; meanings from
-        the node's ``output_specs``).  A pending shape (``—``) just means no value yet."""
+        The per-signal MEANING goes in the label's tooltip (hover), NOT inline -- so the card never
+        grows wider than its column and the Logic list needs no horizontal scroll (#2).  ``rows`` is
+        ``[(name, shape, description)]`` (shapes AUTO-EXTRACTED via ``logic.describe_shape``; meanings
+        from the node's ``output_specs``); a pending shape (``—``) just means no value yet."""
         rows = list(rows)
         if rows:
             name_w = max(len(str(n)) for n, _, _ in rows)
             shape_w = max(len(str(s)) for _, s, _ in rows)
-            lines = ["publishes:"]
-            for name, shape, description in rows:
-                line = f"  {str(name):<{name_w}}  {str(shape):<{shape_w}}"
-                if description:
-                    line += f"  {description}"
-                lines.append(line.rstrip())
-            text = "\n".join(lines)
+            lines = [f"  {str(n):<{name_w}}  {str(s):<{shape_w}}".rstrip() for n, s, _ in rows]
+            text = "publishes:\n" + "\n".join(lines)
+            tip = "\n".join(f"{n} {s} — {d}" for n, s, d in rows if d)   # meanings on hover, off the card
         else:
-            text = "publishes: (nothing on the hub)"
+            text, tip = "publishes: (nothing on the hub)", ""
         if text != self.publishes_label.text():       # skip churn: shapes refresh each tick
             self.publishes_label.setText(text)
+            self.publishes_label.setToolTip(tip)
 
 
 class LogicNodeEditor(QtWidgets.QWidget):
@@ -4707,6 +4707,8 @@ class TaskConsole(QtWidgets.QWidget):
         logic_outer.setContentsMargins(0, 0, 0, 0)
         self.logic_scroll = FluentScrollArea()
         self.logic_scroll.setWidgetResizable(True)
+        self.logic_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)   # #2: never scroll sideways
+        self.logic_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         logic_body = QtWidgets.QWidget()
         logic_body.setStyleSheet("background: transparent;")
         self.logic_layout = QtWidgets.QVBoxLayout(logic_body)
