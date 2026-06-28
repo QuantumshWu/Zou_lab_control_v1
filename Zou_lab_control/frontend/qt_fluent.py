@@ -1090,10 +1090,16 @@ class _RoundedPopupCard(QtCore.QObject):
             # gap the Setting FluentPopup uses below its button.  Self-converging: once
             # at target the guard no-ops, so the corrective move does not loop.
             below = self._combo.mapToGlobal(QtCore.QPoint(0, self._combo.height())).y()
-            target = below + self._gap
+            above = self._combo.mapToGlobal(QtCore.QPoint(0, 0)).y()
             geo = obj.geometry()
-            if geo.top() >= below - 2 and abs(geo.top() - target) > 1:   # opened downward, not yet offset
-                obj.move(geo.left(), target)
+            if geo.top() >= below - 2:                                   # opened DOWNWARD -> gap below the box
+                target = below + self._gap
+                if abs(geo.top() - target) > 1:
+                    obj.move(geo.left(), target)
+            elif geo.bottom() <= above + 2:                             # FLIPPED above -> SAME gap above the box
+                target_top = above - self._gap - geo.height()
+                if abs(geo.top() - target_top) > 1:
+                    obj.move(geo.left(), target_top)
             return False
         return False
 
@@ -1398,10 +1404,27 @@ class FluentTreeComboBox(FluentComboBox):
         if row_h <= 0:
             row_h = view.fontMetrics().height() + scaled_px(8)
         desired = rows * row_h + 2 * view.frameWidth() + self._popup_pad()
-        screen = QtWidgets.QApplication.primaryScreen()
-        if screen is not None:                                   # never taller than the screen
-            desired = min(desired, screen.availableGeometry().height() - scaled_px(16))
+        # Clamp to the space ACTUALLY available at the anchor (the larger of below-the-box / above-the-box,
+        # whichever side the popup opens), NOT the whole screen -- otherwise a popup anchored low overruns
+        # the screen bottom.  When the content exceeds that space the popup stays at the boundary and the
+        # tree SCROLLS (the shared fluent scrollbar), exactly like the Setting popup (#issue-4).
+        avail = self._anchor_available_height()
+        if avail > 0:
+            desired = min(desired, avail)
         return int(desired)
+
+    def _anchor_available_height(self) -> int:
+        """Pixels available for the popup at the combo anchor = the larger of the gap-inset space below
+        the box and above it, clamped to the screen.  Shared boundary rule (mirrors the Setting popup)."""
+        screen = self.screen() if hasattr(self, "screen") else QtWidgets.QApplication.primaryScreen()
+        if screen is None:
+            return 0
+        avail = screen.availableGeometry()
+        top_g = self.mapToGlobal(QtCore.QPoint(0, 0)).y()
+        bottom_g = top_g + self.height()
+        space_below = avail.bottom() - (bottom_g + self._gap)
+        space_above = (top_g - self._gap) - avail.top()
+        return int(max(space_below, space_above))
 
     def _resize_popup_to_contents(self, *_) -> None:
         """Re-grow/shrink the OPEN popup so a freshly-expanded parent's children are fully visible

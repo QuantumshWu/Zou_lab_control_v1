@@ -38,11 +38,11 @@ def test_parent_name_click_toggles_expansion(monkeypatch):
     c.hidePopup()
 
 
-def test_popup_height_grows_when_a_parent_expands(monkeypatch):
-    """The popup's DESIRED height (what `_resize_popup_to_contents` applies when the popup is
-    visible) must increase when a parent expands -- i.e. the box grows to fit the children rather
-    than keeping them scrolled.  We assert the pure computation `_desired_popup_height` (the visible
-    `setFixedHeight` itself needs a real display the headless grab can't map)."""
+def test_popup_height_grows_to_fit_then_clamps_and_scrolls(monkeypatch):
+    """The popup's DESIRED height grows to fit a freshly-expanded parent's children -- BUT is clamped
+    to the space available at the anchor (never overruns the screen): once content exceeds that space the
+    height stays at the boundary (and the tree then SCROLLS), exactly the Setting-popup rule (#issue-4).
+    We assert the pure computation `_desired_popup_height` (the visible `setFixedHeight` needs a display)."""
     pytest.importorskip("PyQt5")
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from PyQt5 import QtWidgets
@@ -50,12 +50,19 @@ def test_popup_height_grows_when_a_parent_expands(monkeypatch):
     c = _combo()
     c.showPopup()
     tree = c.view()
+    avail = c._anchor_available_height()
     collapsed = c._desired_popup_height()
     tree.setExpanded(c._model.index(1, 0), True)
     expanded_one = c._desired_popup_height()
     tree.setExpanded(c._model.index(2, 0), True)
     expanded_two = c._desired_popup_height()
     assert collapsed > 0
-    assert expanded_one > collapsed, "expanding a parent must make the popup taller"
-    assert expanded_two > expanded_one, "expanding a second parent must make it taller still"
+    # monotonic non-decreasing as more rows show...
+    assert expanded_one >= collapsed and expanded_two >= expanded_one
+    # ...and NEVER taller than the space available at the anchor (the clamp = the overrun fix).
+    assert avail > 0 and expanded_two <= avail
+    # when the fully-expanded content would exceed the available space, the height clamps to it (-> scroll)
+    tree.setExpanded(c._model.index(1, 0), True)
+    tree.setExpanded(c._model.index(2, 0), True)
+    assert c._desired_popup_height() <= avail
     c.hidePopup()
