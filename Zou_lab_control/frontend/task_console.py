@@ -5132,6 +5132,20 @@ class TaskConsole(QtWidgets.QWidget):
         node = self._node_for_signal(str(name or ""))
         if node is None:
             return None
+        node_grid = tuple(int(n) for n in (getattr(node, "grid_shape", ()) or ()))
+
+        def _grid_for(points) -> tuple:
+            # ``grid_shape`` un-flattens a 2-D scan's SWEPT POINTS into a map; it applies ONLY when the
+            # signal HAS swept points the grid divides (prod(grid) == prod(points)).  A per-site DATA
+            # signal (occupancy: points=(), data=(n_sites,)) must get () -- otherwise _coerce's 2-D
+            # branch reshapes the (n_sites,) occupancy into a (5x7) heatmap and Live2DDis imshows it,
+            # which is NOT a site map (the trap layout is a scatter of camera-pixel centres, not a pixel
+            # grid).  The site map renders frame + rings; occupancy never becomes a grid imshow.
+            pts = tuple(int(n) for n in (points or ()))
+            if pts and node_grid and int(np.prod(node_grid)) == int(np.prod(pts)):
+                return node_grid
+            return ()
+
         # PER-SIGNAL: the producing signal's own SignalSpec (occupied declares points=(), data=(n_sites,);
         # centers declares neither -> None) takes precedence over the node-level triple.
         spec = None
@@ -5144,7 +5158,7 @@ class TaskConsole(QtWidgets.QWidget):
             ps = tuple(spec.points_shape or ())
             ds = tuple(spec.data_shape or ())
             return {"points_shape": ps, "data_shape": ds,
-                    "grid_shape": tuple(getattr(node, "grid_shape", ()) or ()),
+                    "grid_shape": _grid_for(ps),
                     "core_ndim": len(ps) + len(ds), "per_signal": True}
         # fall back to the node-level contract triple (camera / scan / a node with no per-signal spec).
         # ``per_signal`` False -> a consumer keeps the legacy ndim>=3 repeat detection (core_ndim NOT
@@ -5152,7 +5166,7 @@ class TaskConsole(QtWidgets.QWidget):
         ps = tuple(getattr(node, "points_shape", ()) or ())
         ds = tuple(getattr(node, "data_shape", ()) or ())
         return {"points_shape": ps, "data_shape": ds,
-                "grid_shape": tuple(getattr(node, "grid_shape", ()) or ()),
+                "grid_shape": _grid_for(ps),
                 "core_ndim": len(ps) + len(ds), "per_signal": False}
 
     def _refresh_signal_info(self) -> None:
