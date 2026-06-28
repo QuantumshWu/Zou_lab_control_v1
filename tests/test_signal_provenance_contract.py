@@ -21,21 +21,21 @@ def test_hub_provenance_primitives_and_coherent_read():
     assert h.latest_provenance("missing") == NO_LINEAGE          # soft-fail, never raises
     s1, s2 = h.next_source_shot(), h.next_source_shot()
     assert (s1, s2) == (1, 2)                                     # strictly monotonic, distinct
-    h.publish({"frame": np.full((2, 2), 1.0)}, provenance=s1)
+    h.publish({"frame_0": np.full((2, 2), 1.0)}, provenance=s1)
     h.publish({"derived": np.array([1.0])}, provenance=s1)        # a consumer inheriting s1
     h.publish({"rate": 7.0})                                      # free-running scalar -> NO_LINEAGE
-    h.publish({"frame": np.full((2, 2), 2.0)}, provenance=s2)     # frame advances; derived lags at s1
-    assert h.latest_provenance("frame") == s2
+    h.publish({"frame_0": np.full((2, 2), 2.0)}, provenance=s2)     # frame advances; derived lags at s1
+    assert h.latest_provenance("frame_0") == s2
     assert h.latest_provenance("derived") == s1
     assert h.latest_provenance("rate") == NO_LINEAGE
-    assert h.provenance_map() == {"frame": s2, "derived": s1, "rate": NO_LINEAGE}
+    assert h.provenance_map() == {"frame_0": s2, "derived": s1, "rate": NO_LINEAGE}
     # coherent read at s1: the ahead frame is held back to s1, the scalar shows latest
     snap = h.snapshot_at(s1)
-    assert snap["frame"][0, 0] == 1.0 and snap["derived"][0] == 1.0 and snap["rate"] == 7.0
-    assert h.snapshot_at(None)["frame"][0, 0] == 2.0             # None == latest of each
+    assert snap["frame_0"][0, 0] == 1.0 and snap["derived"][0] == 1.0 and snap["rate"] == 7.0
+    assert h.snapshot_at(None)["frame_0"][0, 0] == 2.0             # None == latest of each
     # clear() / remove_signals() drop the parallel provenance store in lockstep
-    h.remove_signals(["frame"])
-    assert "frame" not in h.provenance_map()
+    h.remove_signals(["frame_0"])
+    assert "frame_0" not in h.provenance_map()
     h.clear()
     assert h.provenance_map() == {}
 
@@ -53,25 +53,25 @@ def test_camera_mints_and_occupancy_inherits():
         cam = exp.readout.camera_measurement(hub, prefix="")
         occ = OccupancyProcessor(hub, calibration=exp.readout.current,
                                  session_calibration=lambda: exp.readout.current,
-                                 source_expr={"inputs": ["frame"], "source": "value = signal"},
+                                 source_expr={"inputs": ["frame_0"], "source": "value = signal"},
                                  method="box", grid_shape=(5, 7), prefix="")
         # two camera shots mint DISTINCT ids
         fire_live_imaging(exp, exposure=exp.devices.camera.exposure); cam.step()
-        first = hub.latest_provenance("frame")
+        first = hub.latest_provenance("frame_0")
         fire_live_imaging(exp, exposure=exp.devices.camera.exposure); cam.step()
-        second = hub.latest_provenance("frame")
+        second = hub.latest_provenance("frame_0")
         assert second > first > 0
         # the occupancy DERIVED signals inherit the SAME id as the frame they were judged from
         occ.step()
-        fid = hub.latest_provenance("frame")
+        fid = hub.latest_provenance("frame_0")
         assert hub.latest_provenance("occupied") == fid
         assert hub.latest_provenance("frame_judged") == fid
         # camera ahead -> the coherent read at the occupancy's shot holds the ahead frame back
         fire_live_imaging(exp, exposure=exp.devices.camera.exposure); cam.step()
         t = hub.latest_provenance("occupied")
-        assert hub.latest_provenance("frame") > t                # camera is ahead
-        held = np.squeeze(np.asarray(hub.snapshot_at(t)["frame"]))
-        latest = np.squeeze(np.asarray(hub.snapshot_at(None)["frame"]))
+        assert hub.latest_provenance("frame_0") > t                # camera is ahead
+        held = np.squeeze(np.asarray(hub.snapshot_at(t)["frame_0"]))
+        latest = np.squeeze(np.asarray(hub.snapshot_at(None)["frame_0"]))
         assert not np.array_equal(held, latest)                  # ahead frame held back at the coherent shot
     finally:
         exp.close()

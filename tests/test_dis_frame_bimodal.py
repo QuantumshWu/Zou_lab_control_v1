@@ -66,7 +66,7 @@ def _hist_card_with_calibration():
     exp.readout.sitemap(method="box", frames=6, display=False)
     exp.readout.thresholds(frames=40, display=False)
     cal = exp.readout.current
-    card = PanelCard(PanelConfig(kind="hist", inputs=["frame"], source="value = signal"),
+    card = PanelCard(PanelConfig(kind="hist", inputs=["frame_0"], source="value = signal"),
                      calibration_provider=lambda: cal)
     return exp, cal, card
 
@@ -82,7 +82,7 @@ def test_dis_on_a_camera_frame_yields_the_per_site_bimodal_not_pixels():
         fire_live_imaging(exp)
         for _ in range(8):
             cam.step()
-        frame_block = np.asarray(hub.latest("frame"))             # (repeat, 1, H, W)
+        frame_block = np.asarray(hub.latest("frame_0"))             # (repeat, 1, H, W)
 
         # a raw camera frame -> dis reduces it to per-site COUNTS (repeat x n_sites of them), CLEANLY
         # bimodal (dark vs bright sites), NOT the single-blob raw-pixel histogram.
@@ -108,7 +108,7 @@ def test_dis_without_calibration_keeps_raw_pixels():
     from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
     from Zou_lab_control.frontend.task_console import PanelCard, PanelConfig
     ensure_qt_app()
-    card = PanelCard(PanelConfig(kind="hist", inputs=["frame"], source="value = signal"),
+    card = PanelCard(PanelConfig(kind="hist", inputs=["frame_0"], source="value = signal"),
                      calibration_provider=lambda: None)
     try:
         frame = np.random.default_rng(0).normal(300, 30, size=(64, 80))

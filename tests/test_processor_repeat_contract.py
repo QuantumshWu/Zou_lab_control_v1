@@ -83,7 +83,7 @@ def test_occupancy_is_preserve_and_the_repeat_axis_flows_through():
     hub = SignalHub()
     cam = CameraMeasurement(hub, exp.camera, sequencer=exp.devices.sequencer, repeat=5)  # 0=∞; 5 = 5-deep block
     det = OccupancyProcessor(hub, calibration=exp.readout.current,
-                             source_expr={"inputs": ["frame"], "source": "value = signal"},
+                             source_expr={"inputs": ["frame_0"], "source": "value = signal"},
                              method="box", grid_shape=(3, 4))
     fire_live_imaging(exp)
     try:
