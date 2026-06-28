@@ -114,8 +114,8 @@ def test_setting_popup_has_unit_and_relim_controls():
         item_sets = _combo_item_sets(img)
         assert any("inferno" in s for s in item_sets), item_sets  # cmap colorset
         assert any("2x2" in s for s in item_sets), item_sets      # size combo
-        # relim mode combo uses confocal_gui's NAMING (tight/normal)
-        assert ("tight", "normal") in item_sets, item_sets
+        # relim mode combo uses confocal_gui's NAMING (tight/normal) + the explicit fixed(lo,hi) mode
+        assert ("tight", "normal", "fixed") in item_sets, item_sets
         # the popup must NOT carry any auto/manual lim mode
         assert ("auto", "manual") not in item_sets, item_sets
 
@@ -146,8 +146,8 @@ def test_setting_popup_has_unit_and_relim_controls():
     try:
         texts = _button_texts(line)
         assert "Unit" in texts
-        # SAME confocal relim naming on a line kind (tight / normal)
-        assert ("tight", "normal") in _combo_item_sets(line)
+        # SAME confocal relim naming on a line kind (tight / normal / fixed)
+        assert ("tight", "normal", "fixed") in _combo_item_sets(line)
         assert ("auto", "manual") not in _combo_item_sets(line)
         from PyQt5.QtWidgets import QCheckBox
         assert line.settings_popup.findChildren(QCheckBox) == []
@@ -331,23 +331,30 @@ def test_setting_keeps_display_params_functional_scalars_go_to_edit():
     underlay auto-resolve from the producing node, not extra slots)."""
     from Zou_lab_control.frontend.task_console import PANEL_PARAMS, panel_input_slots
 
-    # the ONLY display=True param is the colormap chooser; every other param is a
-    # FUNCTIONAL scalar that stays in the Edit tab (signal inputs are slots, not params).
+    # APPEARANCE toggles auto-inject into the Setting popup (display=True): the colormap chooser, the
+    # rolling-trace side-distribution toggle, the histogram bimodal / ylog toggles (#H3v-4b / #H3w-1).
+    # FUNCTIONAL scalars (rolling length, hist bins) stay in the Edit tab (display=False); signal inputs
+    # are SLOTS, not params.
+    _FUNCTIONAL_SCALARS = {"length", "bins"}
     for kind, specs in PANEL_PARAMS.items():
         for spec in specs:
-            assert spec.display is (spec.key == "cmap"), (kind, spec.key)
+            assert spec.display is (spec.key not in _FUNCTIONAL_SCALARS), (kind, spec.key)
 
     # a 2d card's Setting popup renders the colormap chooser (display) + its ONE signal
     # slot; a monitor card renders no param widget and one slot.
+    # Every Setting popup carries the universal plot controls (relim + repeat_mode) PLUS the kind's
+    # appearance params; the FUNCTIONAL scalars (length / bins) are NOT here -- they live in Edit.
     img = _card("2d")
     try:
-        assert set(img.param_widgets) == {"cmap"}
+        assert "cmap" in img.param_widgets                       # appearance param in Setting
+        assert not ({"length", "bins"} & set(img.param_widgets)) # functional scalars stay in Edit
         assert len(img.slot_combos) == len(panel_input_slots("2d")) == 1
     finally:
         img.shutdown()
     mon = _card("monitor")
     try:
-        assert mon.param_widgets == {}      # 'length' moved to the Edit tab
+        assert "show_dist" in mon.param_widgets                  # the rolling-trace appearance toggle
+        assert "length" not in mon.param_widgets                 # the FUNCTIONAL scalar moved to Edit
         assert len(mon.slot_combos) == 1
     finally:
         mon.shutdown()
@@ -356,7 +363,7 @@ def test_setting_keeps_display_params_functional_scalars_go_to_edit():
     # so the user picks just the one signal (centers/image are NOT slots or display params).
     sites = _card("sites")
     try:
-        assert set(sites.param_widgets) == {"cmap"}
+        assert "cmap" in sites.param_widgets                     # appearance param in Setting
         assert len(sites.slot_combos) == len(panel_input_slots("sites")) == 1
     finally:
         sites.shutdown()
