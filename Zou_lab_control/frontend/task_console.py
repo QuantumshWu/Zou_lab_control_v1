@@ -1628,7 +1628,7 @@ class PanelCard(FluentGroupBox):
         # repaints even on a tick with no fresh publish.  -1 = never rendered.
         self._render_shot = -1
         # True ONLY for a finished-task RESULT panel: the console stops repainting it (_tick skips it) so
-        # its final image (e.g. the rearranged array) persists instead of vanishing when the task ends.
+        # its final image persists instead of vanishing when the task ends.
         self._frozen = False
         self._compiled_source = config.source
         # Monitor roll-gate: remembers the per-signal version of this panel's
@@ -5721,8 +5721,8 @@ class TaskConsole(QtWidgets.QWidget):
         """Leave task-run mode (task finished or stopped): drop the lock + banner.
 
         ``keep_result`` (a task that FINISHED on its own) FREEZES the mid-run panel into a persistent
-        result panel instead of removing it -- an instant task (e.g. Rearrange completes in <1 tick on the
-        virtual backend) would otherwise have its panel vanish before the operator ever sees the outcome.
+        result panel instead of removing it -- an instant task that completes in <1 tick on the virtual
+        backend would otherwise have its panel vanish before the operator ever sees the outcome.
         A stopped / removed task drops the panel as before (its job was only to show work in progress)."""
         row = self._running_task_row
         node = self._logic_nodes.get(id(row)) if row is not None else None

@@ -203,7 +203,7 @@ threshold.summary()
 <!-- cell:markdown -->
 ## Detect one shot
 
-`DetectionResult.occupied` 是后续 rearrangement/statistics 可以直接使用的
+`DetectionResult.occupied` 是后续 statistics 可以直接使用的
 boolean array。
 
 <!-- cell:code -->

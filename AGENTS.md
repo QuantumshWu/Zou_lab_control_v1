@@ -29,6 +29,10 @@
   - **用户指了参考实现(如 `references/rb87_readout_v16`)就通读当权威 spec**,按它的流程形态实现;**不许自作主张只挑算法移植、跳过文件 IO/编排**(正是这个自作主张害我返工)。
   - **已经猜错 ≥2 次、或要做"和 X 一模一样"的大改**:动手前先用 AskUserQuestion 确认验收场景(目标流程形态 / 文件格式 / "selector"具体指什么),**别再盲猜第三次**——确认一次比错三次省用户时间。
   - 收尾**不说"做完了"**;说"对照标准 Y 验证了 X;Z 还没对你的真实用法验过"。详见 [[verify-against-user-acceptance]]。
+- **从根源原理解决,绝不头疼医头 / 绝不绕过遮盖**(用户核心铁律,2026-06 当场被识破才补记)。用户每提一个问题,先**理解它背后的机制根源**——问"为什么会这样、是哪个抽象/契约没设计对"——再动手,把修复落在根上:
+  - **绝不用「关掉/绕过引入问题的那个开关」让表象通过**。反面案例:repeat 被 shot-clock 的全局 min-hold 拽回慢信号节拍后,我把 Hold 默认设 0 走 fast-path 跳过 clock,真窗口「看起来好了」就交差——用户一眼看穿"把 hold 设 0 看起来通过验收,敷衍"。真根是「一个全局 display_shot 经 `snapshot_at` 套到所有信号,把**单信号自身的 repeat 累积(intra-signal,必须始终 live)**和**跨信号对齐(inter-signal coherence)**混为一谈」。
+  - **绝不靠加特殊 case 打补丁**:若需要 `if kind=='hist'` 这种特殊处理才能跑通,往往说明**别处的抽象/契约没设计好**——要把它消成统一声明式契约(让数据契约由 plot kind 声明,而不是在渲染主干里塞分支),而不是再加一个 if。
+  - **修一个问题不许破坏既有效果**:加 Hold 不能毁掉 camera repeat=50 + average 的 live 逐帧累积(site 逐渐填满);任何"协调/缓存"机制默认必须保留 live 实时性,牺牲实时性的同步只能 opt-in。动 `_tick`/namespace/repeat 这类**所有面板共用的渲染主干**前,先列出受影响功能逐个真入口回归(见 §5 #17/#18)。
 
 ---
 
@@ -101,6 +105,9 @@
 15. **跨模块复制同一映射 → 两处悄悄漂移(单一真相源破裂)**:成像探测通道在 `imaging_channel_kwargs` 映射成 `ch03`,而 `exposure_from_sequence` 仍按 `probe`/`ch02` 找脉冲——真机上相机曝光**永远读不到序列里的曝光值、静默回退默认**(探测时间/读出保真扫描变平直线),且**虚拟与真机同样瞎所以仿真测不出来**。**根因**:同一"哪个通道是 probe"的知识抄在两处。→ 让消费方(相机适配器)从**同一来源** `imaging_channel_kwargs(sequencer)` 取通道再传给 `exposure_from_sequence(channel=...)`;并写一条"用 chNN 映射建序列→曝光能被取回、用占位名取不回"的契约测试钉死(`tests/test_audit_hardening.py`)。**复发警告(同坑下一轮又踩)**:`build_release_recapture_pulse`(温度测量)还留着 `trap/probe/emCCD` 占位角色默认,真机 chNN 上构造即 `ValueError`、温度测量完全不可用——只修了成像那一处、没扫所有 builder。→ **任何"角色名→物理通道"的映射都必须走 `imaging_channel_kwargs` 单一来源;改一处时 grep 所有 pulse builder(`imaging_sequence`/`build_release_recapture_pulse`/未来新增的)逐个核**,每个都配 chNN 构造契约测试。
 16. **验收时单独构造界面/直 poke 内部当 test,而非走用户真正打开的入口流程(反复栽,用户多次发火)**:验证 task_console 行为时写 `/tmp/*.py` 里 `TaskConsole(...)` 直构 + `card.config.inputs=[...]`/`camN.step()`/`con._tick()` 戳内部,或拿 `QT_QPA_PLATFORM=offscreen` 离屏 grab、demo fixture、纯数据断言当"验收"。**这些都不是用户看到/操作的东西**——用户开的是 `exp.task_console()`(`show_task_console`)真窗口,手点 **Add Panel → 在 Setting 弹窗里选信号 → Start → 看面板**。我离屏渲染/直构出来的画面与用户真实窗口"完全不一致、一团混乱",却拿来当通过。**根因**:把"我能造出一个绿的检查"当成"用户那条路真的对",违反 §1 代理指标 + §3 真入口截图。→ **铁律:任何 task_console / pulse_gui 的验收必须驱动真实入口窗口(`exp.task_console()` / `show_task_console`),按用户手势一步步操作(点真实 Add Panel 按钮、在真实 Setting 弹窗选信号、点 Start),再对真实窗口截图肉眼看**;就像 virtual==real——**验收流程必须 == 用户操作流程**,绝不许单独搭一个测试界面或 poke `config`/内部对象代替。能机械守的逻辑仍写 pytest,但**"看起来对没对"只认真实入口截图**。配套 §3。
 17. **改 A 顺手碰坏不相关的 B,且没走真入口验收所以没发现(repeat/repeat_mode 被 shot-clock 殃及)**:做同钟 shot-clock 时改了 `_tick`/namespace,把相机 repeat 累积 / repeat_mode 的实际效果在真实操作下搞坏(或被 clock hold 住),自己只在离屏脚本里测"数据层 average 对"就过了。**根因**:① 改动边界没界定清楚就动公共渲染路径;② 验收没走用户真流程(见 #16)所以坏了也看不见。→ 动 `_tick`/namespace/repeat 这类**所有面板共用的渲染主干**前,先列出会受影响的现有功能(repeat、repeat_mode、rolling、sitemap…)逐个在**真入口**回归;改完对每个受影响功能走一遍用户流程截图。
+
+18. **用「绕过/关掉引入问题的开关」冒充根因修复(敷衍,被当场识破)**:repeat 被全局 shot-clock 的 min-hold 拽回慢信号节拍后,我把 Hold 默认改 0 让 fast-path 跳过 clock、真窗口「看起来好了」就交差。用户:"把 hold 设 0 看起来通过验收,敷衍我";且 hold>0 时 repeat 仍坏。**根因**:没追到真根——「一个全局 `display_shot` 经 `snapshot_at` 套到所有信号,把单信号自身 repeat 累积(intra,必须 live)与跨信号对齐(inter,coherence)混为一谈」——而是关掉开关遮盖。**真修方向**:repeat 累积始终读信号自己的最新块(live,任意 Hold 都对),clock 只协调跨信号对齐;dis 删掉 `if kind=='hist'` 特殊 case,把"repeat 轴该 reduce 还是该摊平成样本"提升为 plot kind 的声明式数据契约(无特殊处理 = §2「复用/单源」+ §1「不靠特殊 case 打补丁」)。见 §1「从根源解决」。
+19. **dis 的 repeat mode 命名/特殊处理**:dis 特有的 repeat mode **只有 `pool` 一个**(摊平所有 repeat 样本进一个直方图),不存在 `latest`;且它**不该**在 `_signal_then_repeat` 里被 `if kind=='hist'` 特殊处理——特殊处理本身=别处抽象没做好的信号(见 #18 真修方向)。
 
 ### 如何持续记录(防上下文压缩遗忘)
 - 每当我造成一个**自造的或重复的 bug**,立刻在上面加一条(一句话:现象 → 根因 → 规则)。这是标准收尾动作,和"跑测试/截图验收"同级。

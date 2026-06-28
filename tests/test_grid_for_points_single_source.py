@@ -3,7 +3,7 @@ a 2-D map".  Every consumer -- ``describe_shape`` (the legend), the console's ``
 panel may reshape) and ``_coerce`` (the reshape itself) -- must share it, so the rule cannot drift.
 
 Root cause this guards (a7c031c -> made systematic): a node may carry a ``grid_shape`` that is NOT a
-swept-points grid -- an OccupancyProcessor/rearrange task stores ``grid_shape=(5,7)`` as the physical TRAP
+swept-points grid -- an OccupancyProcessor stores ``grid_shape=(5,7)`` as the physical TRAP
 LAYOUT.  Reshape eligibility is the dimensional FACT ``points non-empty and prod(grid)==prod(points)``, so
 that trap grid is never smeared onto the per-site ``occupied`` (points=()) and imshow'd as a (5x7) heatmap
 -- and the SAME fact, not a per-node special case, decides it in the legend and the reshape too.

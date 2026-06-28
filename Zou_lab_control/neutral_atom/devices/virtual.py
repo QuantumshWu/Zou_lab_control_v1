@@ -12,7 +12,7 @@ import numpy as np
 
 from ..core.analysis import finite_float, grid_shape_tuple, positive_int
 from ..core.utils import site_index
-from .base import AODDevice, CameraDevice, SequencerDevice, TrapArrayDevice, snap_subarray
+from .base import CameraDevice, SequencerDevice, TrapArrayDevice, snap_subarray
 from ..timing import (
     DEFAULT_CAMERA_TRIGGER_CHANNELS,
     PulseSequence,
@@ -346,34 +346,6 @@ class VirtualTrapArray(TrapArrayDevice):
         pinned = bool(getattr(self, "_pinned", False))
         self._pinned = False
         return pinned
-
-    def apply_moves(self, moves, *, survival: float = 0.98) -> np.ndarray:
-        """Execute an AOD rearrangement PLAN on the atom array -- the lowest-layer physics fake for
-        ``exp.devices.aod.apply_moves`` (the real AOD instead chirps its RF / DAC ramps to drag the atoms;
-        SAME plan, device-swapped, so virtual==real).  Each move drags its atom from ``src`` to ``dst``
-        (flat row-major site indices); the atom carries its temperature with it and is lost in transit
-        with probability ``1 - survival`` (≈1-5 % per move on a real array).  Pins the result so the NEXT
-        image shows the rearranged array (like :meth:`set_occupancy`).  The occupancy remap matches the
-        host planner's ``apply_moves_to_occupancy`` oracle, so the predicted defect-free array agrees.
-
-        ``moves`` is a sequence of ``rearrangement.Move`` (or any object with ``.src`` / ``.dst``)."""
-        survival = probability(survival, "survival")
-        occ = self.occupancy.copy()
-        temp = self.temperature_K.copy()
-        for m in moves:
-            src, dst = int(m.src), int(m.dst)
-            if not (0 <= src < self.n_sites and 0 <= dst < self.n_sites):
-                raise ValueError(f"move site out of range for {self.n_sites}-site array: {src}->{dst}")
-            if not occ[src]:
-                continue                                       # nothing to drag (lost on an earlier move)
-            occ[src] = False
-            if self.rng.random() < survival:
-                occ[dst] = True
-                temp[dst] = temp[src]                          # the atom keeps its temperature
-        self.occupancy = occ
-        self.temperature_K = temp
-        self._pinned = True                                    # image THIS rearranged array next shot
-        return self.occupancy.copy()
 
     def heat(self, duration: float) -> None:
         """A probe (imaging-light) phase of ``duration`` s recoil-heats every atom
@@ -950,32 +922,6 @@ class VirtualSequencer(SequencerDevice):
         pass
 
 
-class VirtualAOD(AODDevice):
-    """Virtual crossed-AOD rearrangement actuator -- the lowest-layer fake for ``exp.devices.aod``.
-
-    On real hardware the AOD drags atoms by chirping its X/Y RF tones; here it simply applies the move
-    plan to the shared :class:`VirtualTrapArray` occupancy (``trap_array.apply_moves``), so the next
-    camera image of that array shows the rearranged, defect-free pattern.  The rearrangement task /
-    subsystem call ``aod.apply_moves(plan.moves)`` identically against this or a real AOD -- the only
-    backend-specific thing is that the real AOD fires a waveform while this mutates the simulated atoms
-    (virtual==real, branch at the device).  ``trap_array`` is wired by the config (``$device:trap_array``,
-    the SAME array the camera images)."""
-
-    def __init__(self, trap_array: VirtualTrapArray, move_survival: float = 0.98):
-        self.trap_array = trap_array
-        self.move_survival = probability(move_survival, "move_survival")
-
-    def apply_moves(self, moves, *, survival: float | None = None) -> None:
-        self.trap_array.apply_moves(moves, survival=self.move_survival if survival is None else survival)
-
-    def snapshot(self) -> dict[str, object]:
-        return {"type": type(self).__name__, "move_survival": self.move_survival,
-                "n_sites": self.trap_array.n_sites}
-
-    def close(self) -> None:
-        pass
-
-
 def write_virtual_run(
     data_dir: str | Path,
     prefix: str = "img",
@@ -1034,8 +980,6 @@ def virtual_config() -> dict[str, object]:
         "trap_array": {"type": "VirtualTrapArray"},
         "camera": {"type": "VirtualCamera", "params": {"trap_array": "$device:trap_array"}},
         "sequencer": {"type": "VirtualSequencer"},
-        # the AOD rearrangement actuator drags atoms in the SAME array the camera images
-        "aod": {"type": "VirtualAOD", "params": {"trap_array": "$device:trap_array"}},
     }
 
 
@@ -1061,7 +1005,6 @@ def virtual_config_with_overrides(
     sitemap_params = dict(sitemap or {})
     camera_params = dict(camera or {})
     sequencer_params = dict(sequencer or {})
-    aod_params: dict[str, object] = {}
     defaults: dict[str, object] = {}
     trap_fields = set(VirtualTrapArray.__dataclass_fields__)
     aliases = {
@@ -1090,8 +1033,6 @@ def virtual_config_with_overrides(
             if not np.isfinite(loss_rate) or loss_rate <= 0:
                 raise ValueError("loss_rate must be positive and finite.")
             trap_params["detection_lifetime"] = 1.0 / loss_rate
-        elif key == "move_survival":
-            aod_params["move_survival"] = float(value)        # per-move AOD transit survival
         elif key in {"sitemap_exposure", "detection_times", "roi_radius"}:
             defaults[key] = value
         else:
@@ -1107,7 +1048,6 @@ def virtual_config_with_overrides(
     cfg["trap_array"].setdefault("params", {}).update(trap_params)
     cfg["camera"].setdefault("params", {}).update(camera_params)
     cfg["sequencer"].setdefault("params", {}).update(sequencer_params)
-    cfg["aod"].setdefault("params", {}).update(aod_params)
     return cfg, defaults
 
 
