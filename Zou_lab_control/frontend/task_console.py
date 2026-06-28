@@ -5516,6 +5516,16 @@ class TaskConsole(QtWidgets.QWidget):
             values = editor.collect_values() if editor is not None else dict(row.node.values)
         except Exception:
             values = dict(row.node.values)
+        # Capture THIS row's PREVIOUS published signals so a source/param change that drops some of
+        # them (fewer emCCD events -> fewer frame_i, a different processor source, ...) UNLINKS the now
+        # orphan signals from the hub instead of leaving them as stale "(unbound)" picker entries (#5).
+        _prev = self._logic_nodes.get(id(row)) or self._last_node.get(id(row))
+        old_sigs = set()
+        if _prev is not None and hasattr(_prev, "published_signals"):
+            try:
+                old_sigs = {str(s) for s in _prev.published_signals()}
+            except Exception:
+                old_sigs = set()
         # stop a previous run of THIS node so running nodes don't pile up
         self._stop_logic_node(row, _silent=True)
         # Starting ANY device-driving node (camera / measurement / task) first STOPS every
@@ -5545,6 +5555,22 @@ class TaskConsole(QtWidgets.QWidget):
         self._last_node[id(row)] = node           # survives Stop, for signal-source labelling
         if node not in self.running_nodes:
             self.running_nodes.append(node)
+        # #5: unlink any signal the PREVIOUS build published that this new build no longer does AND no
+        # other running node owns -> a switched/rebuilt node leaves NO orphan "(unbound)" signal behind.
+        try:
+            keep = {str(s) for s in node.published_signals()}
+        except Exception:
+            keep = set()
+        for other in self.running_nodes:
+            if other is node:
+                continue
+            try:
+                keep.update(str(s) for s in other.published_signals())
+            except Exception:
+                pass
+        orphan = old_sigs - keep
+        if orphan:
+            self.hub.remove_signals(orphan)
         if not self._timer.isActive():
             self._timer.start()
         try:
