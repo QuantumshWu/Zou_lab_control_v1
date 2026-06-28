@@ -1118,33 +1118,39 @@ def _overlaps_with_gap(box: tuple[int, int, int, int], placed) -> bool:
 
 
 def _gravity_slot(cfg, placed, board_w: int) -> tuple[int, int]:
-    """The TOP-MOST then LEFT-MOST pixel ``(col, row)`` where ``cfg``'s AABB sits clear of every
-    already-placed card (each separated by ``GAP``), inside the board margins and width.
+    """LOCAL up-left gravity ANCHORED at the card's CURRENT ``(col, row)``: from where it is, the card
+    rises straight up until a card above blocks it, then slides straight left until a card to its left
+    blocks it -- alternating to a fixed point.  It only ever moves UP and LEFT (toward the top-left
+    origin), settling against its OWN neighbours, so it is NEVER flung to a far free slot: a south-west
+    card is pulled toward the north-WEST, never the north-EAST (#1).  (That fling came from the OLD
+    packer assigning fresh reading-order slots and filling row 0 left-to-right, so a late SW card landed
+    in the row-0 gap at the far right.)  ``placed`` = the already-settled cards; x is clamped inside
+    ``board_w`` so a card stays on the board, otherwise it is left where the user put it.
 
-    Candidate points are GAP (the top-left origin) plus, for each placed card, the x just past its
-    right edge (``x1 + GAP``) and the y just past its bottom edge (``y1 + GAP``) -- the only places a
-    card can newly butt up against something -- and the placed cards' own left/top edges (so a card
-    can tuck under a wider one).  We sweep candidates by (y, then x) so gravity minimises y first
-    (rise to the top), then x (slide to the left), and take the first feasible one; a card-width
-    clamp keeps it inside ``board_w`` (or pins it at the left margin if it cannot fit)."""
-    w, _h = _card_size(cfg.size)
-    xs = {GAP}
-    ys = {GAP}
-    for p in placed:
-        px0, py0, px1, py1 = _aabb(p)
-        xs.add(px1 + GAP)
-        ys.add(py1 + GAP)
-        xs.add(px0)            # also align left edges, so a card can tuck under a wider one
-        ys.add(py0)
+    Rest-up = just below the lowest placed card whose x-span overlaps this card's column (else the top
+    margin); rest-left = just right of the right-most placed card whose y-span overlaps this card's row
+    (else the left margin).  Sliding left changes which cards share the row and rising changes the
+    column band, so we alternate until neither moves."""
+    w, h = _card_size(cfg.size)
     max_x = max(GAP, board_w - GAP - w)
-    cand_x = sorted(x for x in xs if GAP <= x <= max_x) or [GAP]
-    for y in sorted(ys):
-        for x in cand_x:
-            if not _overlaps_with_gap((x, y, x + w, y + _h), placed):
-                return (x, y)
-    # Defensive: no candidate fit (should not happen -- placing past the lowest card always clears).
-    bottom = max((py1 for *_rest, py1 in (_aabb(p) for p in placed)), default=0)
-    return (GAP, bottom + GAP if placed else GAP)
+    x = min(max(GAP, int(round(cfg.col))), max_x)        # start from the card's CURRENT spot (clamped on-board)
+    y = max(GAP, int(round(cfg.row)))
+    for _ in range(8):                                    # alternate rise / slide-left to a fixed point
+        ny = GAP                                          # rise: rest just under any column-overlapping card
+        for p in placed:
+            px0, py0, px1, py1 = _aabb(p)
+            if x < px1 + GAP and px0 < x + w + GAP:       # x-spans overlap (within GAP) -> "above" in-column
+                ny = max(ny, py1 + GAP)
+        nx = GAP                                          # slide left: rest just right of any row-overlapping card
+        for p in placed:
+            px0, py0, px1, py1 = _aabb(p)
+            if ny < py1 + GAP and py0 < ny + h + GAP:     # y-spans overlap at the risen y -> "left" in-row
+                nx = max(nx, px1 + GAP)
+        nx = min(nx, max_x)
+        if (nx, ny) == (x, y):
+            break
+        x, y = nx, ny
+    return (x, y)
 
 
 def _min_board_width(configs: Sequence["PanelConfig"]) -> int:
