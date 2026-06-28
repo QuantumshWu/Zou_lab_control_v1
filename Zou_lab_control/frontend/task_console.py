@@ -229,15 +229,27 @@ def signal_state(name, formats) -> str:
     return "ready" if formats.get(str(name)) else "waiting"
 
 
+def strip_node_prefix(full: str, prefix: str) -> str:
+    """The SHORT signal name = the hub name minus its producing node's disambiguating prefix
+    (``judge_occupancy_rate`` -> ``rate``, ``temperature_survival`` -> ``survival``, ``frame`` ->
+    ``frame``).  The ONE rule the Logic tab AND the signal picker share, so the nest leaf is ALWAYS the
+    short name -- never the full prefixed key, never the verbose axis label."""
+    full = str(full)
+    prefix = str(prefix or "")
+    return full[len(prefix):] if (prefix and full.startswith(prefix) and len(full) > len(prefix)) else full
+
+
 def _signal_short_label(name, group, labels) -> str:
-    """The human-facing leaf label for ``name`` in a producer ``group`` (#H3w-4): the producing
-    node's declared SignalSpec label (e.g. ``Survival``) when known -- NEVER the raw ``temperature_
-    survival`` key -- else the shared-token prefix stripped (``judge_occupancy_rate`` -> ``rate``);
-    a single-signal group with no human label keeps the bare name (no fake ``producer_`` strip that
-    only ever failed to match a display-name producer)."""
-    human = (labels or {}).get(str(name))
-    if human:
-        return str(human)
+    """The leaf label for ``name`` under its producer node in the picker nest: the SHORT signal name --
+    the producing node's prefix stripped (``temperature_survival`` -> ``survival``, ``frame`` ->
+    ``frame``), passed in via ``labels`` (the ``short_names_provider`` map, built from each running
+    node's prefix; #design: the nest already names the producer, so the leaf is the short NAME, NOT the
+    verbose SignalSpec axis label like ``camera image``).  For a signal with no mapped short name (a
+    declared-but-not-running node), fall back to the shared-token prefix stripped from the group, else
+    the bare name."""
+    short = (labels or {}).get(str(name))
+    if short:
+        return str(short)
     strip = _common_token_prefix(group)
     if strip and name.startswith(strip) and len(name) > len(strip):
         return name[len(strip):]
@@ -1470,7 +1482,7 @@ class PanelCard(FluentGroupBox):
     def __init__(self, config: PanelConfig, parent=None, *, names_provider=None,
                  sources_provider=None, formats_provider=None, axes_provider=None,
                  sites_inputs_provider=None, curve_x_provider=None,
-                 structure_provider=None, calibration_provider=None):
+                 structure_provider=None, calibration_provider=None, short_names_provider=None):
         # Titled frame: the title strip carries the panel KIND (top-left) and the
         # Setting button (top-right), so the card is delineated like the rest.
         super().__init__(PANEL_KINDS[config.kind], parent, shadow=True)
@@ -1487,6 +1499,10 @@ class PanelCard(FluentGroupBox):
         # makes the signal (confocal: the measurement owns its labels), not a per-kind
         # hard-coded string.
         self.axes_provider = axes_provider
+        # callable -> {full hub signal: SHORT name} (the producing node's prefix stripped), so the
+        # picker NEST shows the short name (frame / survival / rate) -- never the full prefixed key
+        # nor the verbose SignalSpec axis label.  ONE rule, shared with the Logic tab.
+        self.short_names_provider = short_names_provider
         # callable(occupancy_signal) -> (centres_signal, image_signal): the site map takes
         # ONE signal (occupancy) and resolves its centres + frame underlay from the SAME
         # producing node (via that node's spec metadata), so rings + underlay are one shot.
@@ -2026,16 +2042,18 @@ class PanelCard(FluentGroupBox):
             combo, names=(self.names_provider() if callable(self.names_provider) else []),
             sources=(self.sources_provider() if callable(self.sources_provider) else {}),
             formats=(self.formats_provider() if callable(self.formats_provider) else {}),
-            labels=self._signal_human_labels(),
+            labels=self._signal_short_names_map(),
             current=current, none_label="(none)")
 
-    def _signal_human_labels(self) -> dict:
-        """``{signal name: human label}`` from the producing node's SignalSpec (the ``axes_provider``'s
-        axis_label), so the picker shows ``Survival`` not the raw ``temperature_survival`` key (#H3w-4)."""
-        if not callable(self.axes_provider):
+    def _signal_short_names_map(self) -> dict:
+        """``{full hub signal: SHORT name}`` (the producing node's prefix stripped) from the
+        ``short_names_provider``, so the picker nest leaf is the short name (``frame`` / ``survival`` /
+        ``rate``) -- NOT the full prefixed key and NOT the verbose SignalSpec axis label (``camera
+        image``).  The picker nest already names the producer node, so the leaf is the short NAME."""
+        if not callable(self.short_names_provider):
             return {}
         try:
-            return {str(n): str(lbl) for n, (lbl, _unit) in dict(self.axes_provider()).items() if lbl}
+            return {str(n): str(s) for n, s in dict(self.short_names_provider()).items() if s}
         except Exception:
             return {}
 
@@ -4699,7 +4717,7 @@ class TaskConsole(QtWidgets.QWidget):
             for config in state.panels:
                 self._attach_card(PanelCard(config, parent=self.board,
                                             names_provider=self._signal_names,
-                                            sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, structure_provider=self._signal_structure, calibration_provider=self._running_calibration))
+                                            sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, structure_provider=self._signal_structure, calibration_provider=self._running_calibration, short_names_provider=self._signal_short_names))
             for node in state.logic:
                 self._attach_logic_node(node)    # always STOPPED -- Start is manual
             self._arrange()
@@ -4896,6 +4914,21 @@ class TaskConsole(QtWidgets.QWidget):
                 continue
         return out
 
+    def _signal_short_names(self) -> dict:
+        """``{full hub signal: SHORT name}`` = each RUNNING node's published signals with that node's
+        prefix stripped (``temperature_survival`` -> ``survival``, ``frame`` -> ``frame``).  The picker
+        nest binds this so the leaf shows the short name -- the SAME rule the Logic tab uses
+        (``strip_node_prefix``), never the verbose SignalSpec axis label."""
+        out: dict[str, str] = {}
+        for node in self.running_nodes:
+            pfx = str(getattr(node, "prefix", "") or "")
+            try:
+                for full in node.published_signals():
+                    out[str(full)] = strip_node_prefix(str(full), pfx)
+            except Exception:
+                continue
+        return out
+
     def _sites_inputs(self, occ_signal) -> tuple[str | None, str | None]:
         """For a site-map panel's ONE occupancy signal, return ``(centres_signal,
         image_signal)`` resolved from the SAME producing node -- so the site map pulls its
@@ -4996,7 +5029,7 @@ class TaskConsole(QtWidgets.QWidget):
         # short name is also what output_specs (and so ``desc``) is keyed by.
         pfx = str(getattr(node, "prefix", "") or "")
         for full in sorted(node.published_signals()):
-            short = full[len(pfx):] if (pfx and full.startswith(pfx) and len(full) > len(pfx)) else full
+            short = strip_node_prefix(full, pfx)             # ONE rule, shared with the picker nest
             try:
                 # PER-SIGNAL structure (#H3s-F3): a signal whose own SignalSpec declares a points/data
                 # slot (occupied -> 5 × (35); frame_judged -> 5 × (96×128)) shows in CONTRACT form off
@@ -5277,7 +5310,7 @@ class TaskConsole(QtWidgets.QWidget):
         title = indexed_unique_name(PANEL_KINDS[str(kind)], {c.config.title for c in self.cards})
         config = PanelConfig(kind=str(kind), title=title, row=next_y, col=0, size="1x2")
         card = PanelCard(config, parent=self.board, names_provider=self._signal_names,
-                         sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, structure_provider=self._signal_structure, calibration_provider=self._running_calibration)
+                         sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, structure_provider=self._signal_structure, calibration_provider=self._running_calibration, short_names_provider=self._signal_short_names)
         self._attach_card(card)
         self._arrange()
         self._mark_dirty()
@@ -5467,7 +5500,7 @@ class TaskConsole(QtWidgets.QWidget):
         config = PanelConfig(kind=kind, title=title, size="2x2",
                              source="value = __task_frame__")
         card = PanelCard(config, parent=self.board, names_provider=self._signal_names,
-                         sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, structure_provider=self._signal_structure, calibration_provider=self._running_calibration)
+                         sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, structure_provider=self._signal_structure, calibration_provider=self._running_calibration, short_names_provider=self._signal_short_names)
         self._attach_card(card)
         self._task_card = card
         self._running_task_row = row
