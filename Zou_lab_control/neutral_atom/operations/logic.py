@@ -38,7 +38,7 @@ import numpy as np
 
 from Zou_lab_control._paths import CALIBRATION_DIR
 from ..core.analysis import grid_shape_tuple
-from ..core.signals import SignalHub
+from ..core.signals import NO_LINEAGE, SignalHub
 from ..devices.base import AODDevice, CameraDevice
 from .rearrangement import plan_rearrangement, target_sites
 from .signal_expr import DEFAULT_SOURCE, SignalExpr, hub_namespace
@@ -210,6 +210,11 @@ class LogicNode:
         # published (see acquisition_epoch): the GUI polls this to re-snapshot the
         # Edit panel on the FIRST post-edit frame instead of the stale pre-edit one.
         self._apply_epoch = 0
+        # The SOURCE-shot id the NEXT publish belongs to (set within shot(): an acquiring node mints a fresh
+        # one after it acquires; a reactive Processor inherits its consumed input's).  step() reads it, tags
+        # the publish, then clears it -- so a no-op / frozen shot publishes nothing with a stale id.  Set and
+        # read on the node's OWN thread only (shot()->step() are same-thread), so no extra lock (#shot-clock).
+        self._current_source_shot: int | None = None
 
     @property
     def display_label(self) -> str:
@@ -237,7 +242,12 @@ class LogicNode:
         if not values:
             return {}
         named = {self.prefix + key: value for key, value in values.items()}
-        self.hub.publish(named)
+        # Tag every signal of this shot with the SOURCE-shot id shot() set (mint for an acquiring node,
+        # inherited for a reactive processor; None -> NO_LINEAGE for a free-running publish), so a derived
+        # signal and the frame it came from share ONE id and the console can show them as one shot.  Clear
+        # after, so a later no-op/frozen shot never re-uses a stale id (#shot-clock).
+        self.hub.publish(named, provenance=self._current_source_shot)
+        self._current_source_shot = None
         self.shots += 1
         return named
 
@@ -475,6 +485,11 @@ class Processor(LogicNode):
     node_label = "processor"
     provides: tuple[str, ...] = ()
     repeat_contract = "reduce"   # see class docstring; static, never a user knob
+    # Provenance inheritance (#shot-clock): a single-input processor inherits its input's source-shot id so
+    # its derived signals group with that frame.  With MULTIPLE inputs, by default the processor no-ops until
+    # they share one id (they are not one coherent shot); set True to instead fuse them at max(ids) -- only
+    # for a processor that deliberately combines several acquisitions into one derived result.
+    fuse_across_shots = False
 
     def __init__(self, hub: SignalHub, *, consumes, prefix: str = ""):
         super().__init__(hub, prefix=prefix)
@@ -489,9 +504,24 @@ class Processor(LogicNode):
             return None
         self._seen_version = {n: versions.get(n, 0) for n in self.consumes}
         try:
-            return {n: self.hub.latest(n) for n in self.consumes}
+            inputs = {n: self.hub.latest(n) for n in self.consumes}
         except KeyError:
             return None
+        # INHERIT the consumed input's source-shot id so the derived signals (occupied / frame_judged)
+        # carry the SAME id as the frame they were computed from -> the console groups them into one
+        # display shot (#shot-clock).  Single input -> that id.  Multiple inputs from DIFFERENT shots are
+        # not one coherent acquisition -> no-op until they line up (or max-fuse if fuse_across_shots).
+        ids = {self.hub.latest_provenance(n) for n in self.consumes}
+        ids.discard(NO_LINEAGE)
+        if len(ids) == 1:
+            self._current_source_shot = next(iter(ids))
+        elif not ids:
+            self._current_source_shot = None                  # inputs carry no lineage -> derived is NO_LINEAGE too
+        elif self.fuse_across_shots:
+            self._current_source_shot = max(ids)
+        else:
+            return None                                       # different acquisitions -> wait for one coherent shot
+        return inputs
 
     def transform(self, inputs: dict[str, object]) -> dict[str, object]:  # pragma: no cover - abstract
         raise NotImplementedError
@@ -1501,6 +1531,10 @@ class CameraMeasurement(Measurement):
             # absence of hardware trigger edges -- so this is correct for a real streamer driven
             # from another process too (the camera sees the actual triggers, not a local flag).
             return {}
+        # A real frame WAS acquired -> mint this shot's SOURCE-shot id; every signal published this shot
+        # (frame, frame_i) carries it, and the OccupancyProcessor consuming `frame` inherits it, so the
+        # judged image / occupancy group with the exact frame they came from (#shot-clock).
+        self._current_source_shot = self.hub.next_source_shot()
         out: dict[str, object] = {f"frame_{i}": np.asarray(f, dtype=float) for i, f in enumerate(frames)}
         f0 = out["frame_0"]                              # the newest single frame of this shot
         if self._raw is None or self.data_shape != f0.shape:
@@ -1726,6 +1760,7 @@ class ScannedMeasurementNode(Measurement):
             self._index = 0
             self._pass += 1
 
+        self._current_source_shot = self.hub.next_source_shot()   # one SOURCE-shot per scan point (#shot-clock)
         return self._assert_primary_shape({
             self.x_key: self._values.copy(),             # the FULL x axis, stable from shot 1
             self.y_key: self._publish_raw(),             # RAW (repeat, points, dim) -- plot reduces it
@@ -1959,9 +1994,16 @@ class PulseScanNode(Measurement):
         #    Judge-occupancy processor consuming ``frame``) pick them up -- this is the SAME
         #    ``frame`` signal a CameraMeasurement publishes (default 2D = first trigger).
         before = self.hub.signal_versions()
+        # Mint ONE source-shot id for this scan point: the camera frame, any consumer that inherits it
+        # (a Judge-occupancy processor on `frame`), AND the scan y-block (published via step()) all share
+        # it, so this point's frame + derived occupancy + y are one coherent shot.  Order matters: the
+        # frame publish (with sid) must precede the consumer recompute (_await_y_inputs) so it inherits sid
+        # before _read_y -- a reorder would break lineage coherence (#shot-clock).
+        sid = self.hub.next_source_shot()
         frame_pub = {f"frame_{k}": np.asarray(f, dtype=float) for k, f in enumerate(frames)}
         frame_pub["frame"] = frame_pub["frame_0"]
-        self.hub.publish(frame_pub)
+        self.hub.publish(frame_pub, provenance=sid)
+        self._current_source_shot = sid                  # the y-block (base step()) carries the same id
         # 2) make the y signals FRESH for this frame, then 3) read y from the source expression.
         self._await_y_inputs(before)
         y = self._read_y()
@@ -2071,6 +2113,7 @@ class ProcessorRun(LogicNode):
         self.finished = True
         out = dict(self.result)
         out["processor_done"] = 1.0
+        self._current_source_shot = self.hub.next_source_shot()   # one SOURCE-shot for this discrete result (#shot-clock)
         return out
 
     def run_to_completion(self) -> "ProcessorRun":

@@ -1236,6 +1236,66 @@ UPDATE_INTERVALS = (100, 200, 400, 800)
 DEFAULT_UPDATE_MS = 400
 
 
+class _ShotClock:
+    """Picks ONE coherent display shot ``target_shot`` for the whole console each render beat, so every
+    panel draws the SAME physical shot (the sitemap underlay, the 2D image and the occupancy overlay can
+    never disagree).  A pure, NON-BLOCKING state machine (#shot-clock): it never spins the GUI thread --
+    it advances at most once per tick and holds candidate state across ticks.
+
+    The rule, given the hub's ``{name: latest source-shot id}`` map and the names every panel is bound to:
+    advance to the newest source shot ANY producer reached, but only once every BOUND lineage signal has
+    caught up to it (so a derived ``frame_judged`` is shown together with its ``frame``).  While a bound
+    derived signal lags, HOLD the previous coherent shot -- the faster producer's newer frame is buffered
+    in the hub and shown later via :meth:`SignalHub.snapshot_at`.  ``cache_time_s`` bounds the wait: once
+    it elapses (e.g. a stopped/errored processor will never catch up) advance anyway, so the display never
+    wedges.  ``cache_time_s == 0`` advances on the next tick (no hold).  Pause freezes ``target_shot``."""
+
+    def __init__(self, *, cache_time_s: float = 0.1):
+        from ..neutral_atom.core.signals import NO_LINEAGE   # single source of the sentinel
+        self._no_lineage = NO_LINEAGE
+        self.cache_time_s = max(0.0, float(cache_time_s))
+        self.target_shot = 0
+        self.paused = False
+        # Per-signal stall timer: {name: (last source-shot id seen, monotonic time it was first seen at)} --
+        # so a bound signal that stops advancing for longer than cache_time_s is treated as STALLED and no
+        # longer holds the display back (a stopped/errored producer must never freeze the live view).
+        self._seen: dict[str, tuple] = {}
+
+    def advance(self, prov_map: Mapping[str, int], bound_names, now: float, *, immediate: bool = False) -> int:
+        """Return the coherent display shot for this tick.  ``prov_map`` = hub.provenance_map(); ``bound_names``
+        = every signal any panel reads; ``now`` = a monotonic clock; ``immediate`` (a synchronous refresh)
+        ignores the stall grace so it reflects the exact newest coherent shot.
+
+        The display shot is the NEWEST source shot every BOUND lineage signal has reached -- ``min`` of their
+        latest ids -- so ``frame`` and its derived ``frame_judged`` are shown together (the faster one is held
+        back to match the slower).  A signal that has not advanced for ``cache_time_s`` is dropped from that
+        ``min`` (treated as stalled) so a stopped producer cannot freeze the rest.  Never runs backwards."""
+        if self.paused and not immediate:
+            return self.target_shot
+        live = {n: prov_map.get(n, self._no_lineage) for n in bound_names}
+        live = {n: p for n, p in live.items() if p != self._no_lineage}      # bound lineage signals only
+        if not live:
+            # no bound lineage signal (a scalar-only dashboard) -> just follow the newest lineage shot.
+            allp = [s for s in prov_map.values() if s != self._no_lineage]
+            newest = max(allp) if allp else self.target_shot
+            self.target_shot = max(self.target_shot, newest)
+            return self.target_shot
+        newest = max(live.values())
+        for name, p in live.items():                       # refresh per-signal stall timers
+            prev = self._seen.get(name)
+            if prev is None or prev[0] != p:
+                self._seen[name] = (p, now)
+        hold = self.cache_time_s
+        def _stalled(name: str, p: int) -> bool:
+            # a LAGGING signal (behind newest) that has not advanced for the hold window -> stalled
+            seen_t = self._seen.get(name, (p, now))[1]
+            return (not immediate) and hold > 0.0 and p < newest and (now - seen_t) >= hold
+        considered = [p for name, p in live.items() if not _stalled(name, p)]
+        coherent = min(considered) if considered else newest
+        self.target_shot = max(self.target_shot, coherent)   # monotonic: never show an older shot
+        return self.target_shot
+
+
 def _unit_df_for(plotter):
     """A :class:`DataFigure` bound to ``plotter``'s figure/axes whose unit is inferred from
     the LIVE x-axis label (NOT ``live_plot=``, which would mask a unit-bearing label like
@@ -1390,11 +1450,17 @@ class TaskConsoleState:
         *,
         name: str = "task",
         interval_ms: int = 400,
+        cache_time_s: float = 0.1,
         panels: Sequence[PanelConfig | Mapping[str, object]] | None = None,
         logic: Sequence[LogicNodeConfig | Mapping[str, object]] | None = None,
     ):
         self.name = str(name)
         self.interval_ms = max(50, int(interval_ms))
+        # The shot-clock "Hold" window (seconds): how long the live display waits for a lagging derived
+        # signal (e.g. occupancy's frame_judged) to catch up to the newest frame before advancing the
+        # coherent display shot anyway.  Small because processors are light (no heavy compute); 0 = never
+        # hold, advance next tick.  Bounds latency, never wedges on a stopped producer (#shot-clock).
+        self.cache_time_s = max(0.0, min(5.0, float(cache_time_s)))
         self.panels = [
             panel if isinstance(panel, PanelConfig) else PanelConfig.from_dict(panel)
             for panel in (panels or [])
@@ -1413,6 +1479,7 @@ class TaskConsoleState:
             "version": self.version,
             "name": self.name,
             "interval_ms": self.interval_ms,
+            "cache_time_s": self.cache_time_s,
             "panels": [panel.to_dict() for panel in self.panels],
             "logic": [node.to_dict() for node in self.logic],
         }
@@ -1422,6 +1489,7 @@ class TaskConsoleState:
         return cls(
             name=str(payload.get("name", "task")),
             interval_ms=int(payload.get("interval_ms", 400)),
+            cache_time_s=float(payload.get("cache_time_s", 0.1)),   # get-default: old layouts load cleanly
             panels=payload.get("panels") or [],
             logic=payload.get("logic") or [],
         )
@@ -1542,6 +1610,10 @@ class PanelCard(FluentGroupBox):
         # (see TaskConsole._tick) skips a panel on its beat when nothing new was published
         # since, so a slow panel does not redraw stale data and a fast one only when needed.
         self._render_version = -1
+        # The coherent DISPLAY shot at this panel's last render (#shot-clock): the console re-renders the
+        # card when either the hub version OR the display shot advances, so a held-then-released shot still
+        # repaints even on a tick with no fresh publish.  -1 = never rendered.
+        self._render_shot = -1
         self._compiled_source = config.source
         # Monitor roll-gate: remembers the per-signal version of this panel's
         # source at the last roll, so an unrelated node's version bump does not
@@ -4547,6 +4619,11 @@ class TaskConsole(QtWidgets.QWidget):
         # every update_ms // base ticks.  _tick_count counts base ticks since the last re-base.
         self._tick_count = 0
         self._base_interval_ms = int(self.state.interval_ms)
+        # The cross-producer shot clock: each tick it picks ONE coherent display shot so every panel draws
+        # the SAME physical shot (sitemap underlay == 2D image == occupancy).  ``_display_shot`` is the shot
+        # the namespace is currently built at; ``_shot_clock`` owns the advance/hold/cache logic (#shot-clock).
+        self._shot_clock = _ShotClock(cache_time_s=self.state.cache_time_s)
+        self._display_shot = self.hub.shot
 
         self._build_ui()
         self.load_state(self.state)
@@ -4637,14 +4714,30 @@ class TaskConsole(QtWidgets.QWidget):
         # freeze -- acquisition keeps running); Save image grabs the WHOLE board region to a PNG.
         self.pause_button = FluentButton("Pause", color=ORANGE)
         self.pause_button.clicked.connect(self._toggle_pause)
+        # "Hold" = the shot-clock cache window (seconds): how long the live display waits for a lagging
+        # derived signal (e.g. occupancy's frame_judged) to catch up to the newest frame before advancing
+        # the coherent display shot -- so the site map and the 2D image always show the SAME shot.  A live
+        # tuning knob (safe to change mid-task), so it stays OUT of the lockout group (#shot-clock).
+        self.cache_label = FluentLabel("Hold")
+        self.cache_spin = FluentDoubleSpinBox()
+        self.cache_spin.setDecimals(2)
+        self.cache_spin.setRange(0.0, 5.0)
+        self.cache_spin.setSingleStep(0.05)
+        self.cache_spin.setSuffix(" s")
+        self.cache_spin.setValue(self.state.cache_time_s)
+        self.cache_spin.setFixedWidth(scaled_px(74, minimum=60))
+        self.cache_spin.setToolTip(
+            "Coherent-shot hold: wait up to this long for a derived signal (e.g. occupancy) to catch up "
+            "to the newest frame so the site map and the 2D image show the SAME shot. 0 = no hold.")
+        self.cache_spin.valueChanged.connect(self._on_cache_time_changed)
         self.save_image_button = FluentButton("Save image", color=ACCENT)
         self.save_image_button.clicked.connect(self._save_board_image)
 
         for widget in (self.status_dot, self.name_edit):
             header.addWidget(widget)
         header.addWidget(self.summary, 1)
-        for widget in (self.kind_combo, add_button, self.pause_button, self.save_image_button,
-                       self.save_button, load_button):
+        for widget in (self.kind_combo, add_button, self.cache_label, self.cache_spin,
+                       self.pause_button, self.save_image_button, self.save_button, load_button):
             header.addWidget(widget)
         # header controls disabled while a task runs (the lockout, #5); kept as a group
         # so ``_set_task_running`` flips them all at once.  Pause stays OUT of the lockout (you may
@@ -4760,6 +4853,8 @@ class TaskConsole(QtWidgets.QWidget):
             for row in list(self.logic_nodes):
                 self._remove_logic_node(row, _rebuild=False)
             self.name_edit.setText(state.name)
+            self.cache_spin.setValue(state.cache_time_s)        # reflect the loaded "Hold" window
+            self._shot_clock.cache_time_s = state.cache_time_s
             for config in state.panels:
                 self._attach_card(PanelCard(config, parent=self.board,
                                             names_provider=self._signal_names,
@@ -4771,6 +4866,7 @@ class TaskConsole(QtWidgets.QWidget):
             self._building = False
         for card in self.cards:            # force every panel to redraw on its next beat
             card._render_version = -1
+            card._render_shot = -1
         self._recompute_tick_interval()    # the loaded panels' rates set the timer base
         self._update_summary()
 
@@ -5844,11 +5940,16 @@ class TaskConsole(QtWidgets.QWidget):
     # ------------------------------------------------------------------ refresh
     def _expression_namespace(self) -> dict[str, object]:
         namespace: dict[str, object] = {"np": np, "numpy": np, "math": _math}
-        namespace.update(self.hub.snapshot_latest())
+        # COHERENT snapshot at the shot clock's current display shot (#shot-clock): every signal resolves
+        # to its value AT this shot, so a 2D image, the sitemap underlay and the occupancy overlay are the
+        # SAME physical shot.  A signal with no sample at this shot (a free-running scalar, or a producer
+        # that has not reached it) falls back to its latest value -- never blanks a panel.  (Task mid-run
+        # output is intentionally absent: it is off-hub via __task_frame__ below.)
+        namespace.update(self.hub.snapshot_at(self._display_shot))
         namespace["history"] = self.hub.history
         namespace["latest"] = self.hub.latest
         namespace["names"] = self.hub.names
-        namespace["shot"] = self.hub.shot
+        namespace["shot"] = self._display_shot           # the coherent DISPLAY shot, not hub.shot (raw activity)
         # Per-signal publish counters (reserved key) so a rolling monitor can tell
         # a new sample of its own source from an unrelated node's version bump.
         namespace["__sig_versions__"] = self.hub.signal_versions()
@@ -5902,8 +6003,19 @@ class TaskConsole(QtWidgets.QWidget):
         self._paused = not self._paused
         self.pause_button.setText("Resume" if self._paused else "Pause")
         self.pause_button.set_color(GREEN if self._paused else ORANGE)
+        # Freeze the shot clock on the SAME clock the panels render from: a paused display holds its
+        # current coherent shot (sitemap + 2D stay locked together), and Resume lets it advance again
+        # to the newest coherent shot via the immediate _tick below (#shot-clock).
+        self._shot_clock.paused = self._paused
         if not self._paused:
             self._tick()                          # immediate catch-up redraw of every panel
+
+    def _on_cache_time_changed(self, value) -> None:
+        """Live 'Hold' edit: update the shot clock's cache window now (no restart) and remember it in the
+        saved state.  Safe mid-task -- it only tunes how long the display waits for coherence."""
+        self.state.cache_time_s = max(0.0, min(5.0, float(value)))
+        self._shot_clock.cache_time_s = self.state.cache_time_s
+        self._mark_dirty()
 
     def _save_board_image(self) -> None:
         """Save the WHOLE monitor board (every panel, composited in its laid-out position) to a PNG.
@@ -5945,6 +6057,11 @@ class TaskConsole(QtWidgets.QWidget):
             return
         self._tick_count += 1
         version = self.hub.version
+        # Advance the cross-producer shot clock ONCE per tick (a single id-only hub read), so the namespace
+        # below is built coherently at one display shot for ALL cards -- the sitemap underlay, the 2D image
+        # and the occupancy overlay are guaranteed to be the SAME shot (#shot-clock).
+        bound = {n for card in self.cards for n in (card.config.inputs or ()) if n}
+        self._display_shot = self._shot_clock.advance(self.hub.provenance_map(), bound, time.monotonic())
         elapsed = self._tick_count * self._base_interval_ms
         namespace = None
         for card in self.cards:
@@ -5952,12 +6069,16 @@ class TaskConsole(QtWidgets.QWidget):
             # beat fire on the SAME tick -> they read the SAME namespace below (shot-coherent).
             if elapsed % card.config.update_ms != 0:
                 continue
-            if version == card._render_version:
-                continue                          # nothing new published since it last drew
+            # Redraw when a new sample arrived (version) OR the coherent display shot advanced -- the latter
+            # catches a HOLD that the cache window released on a tick with no fresh publish (a scalar-only
+            # card still updates via the version gate; a lineage card tracks the display shot).
+            if version == card._render_version and self._display_shot == card._render_shot:
+                continue
             if namespace is None:                 # built ONCE per tick -> one coherent snapshot
                 namespace = self._expression_namespace()
             card.refresh(namespace)
             card._render_version = version
+            card._render_shot = self._display_shot
         # keep the visible Edit tab's 'now:' acquisition references live, so a queued
         # parameter edit shows as applied once the loop picks it up.
         editor = self.tabs.currentWidget()
@@ -5972,10 +6093,16 @@ class TaskConsole(QtWidgets.QWidget):
         self._refresh_signal_info()
         self._refresh_task_panel()
         version = self.hub.version
+        # immediate=True: a synchronous refresh jumps straight to the newest coherent shot (no hold), so a
+        # headless render / test sees the freshest shot-aligned snapshot deterministically.
+        bound = {n for card in self.cards for n in (card.config.inputs or ()) if n}
+        self._display_shot = self._shot_clock.advance(
+            self.hub.provenance_map(), bound, time.monotonic(), immediate=True)
         namespace = self._expression_namespace()
         for card in self.cards:
             card.refresh(namespace)
             card._render_version = version
+            card._render_shot = self._display_shot
         editor = self.tabs.currentWidget()
         if isinstance(editor, PanelEditor):
             editor.refresh_node_now_labels()
