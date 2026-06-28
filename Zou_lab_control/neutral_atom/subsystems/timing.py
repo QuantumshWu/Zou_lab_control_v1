@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from Zou_lab_control._paths import GENERATED_SEQUENCES_DIR
 from ..core.results import PreflightReport
 from ..timing import PulseSequence, PulseTableState
 from .base import ExperimentSubsystem
@@ -41,7 +42,7 @@ class TimingSubsystem(ExperimentSubsystem):
             raise RuntimeError("This session has no sequencer device to bind a pulse to.")
         return bind_pulse(sequencer, self._load_pulse_payload(pulse))
 
-    def write_verilog(self, output_dir: str | Path = "generated_sequences", **kwargs) -> Path:
+    def write_verilog(self, output_dir: str | Path = GENERATED_SEQUENCES_DIR, **kwargs) -> Path:
         return self._session._write_verilog(output_dir, **kwargs)
 
     def _load_pulse_payload(self, pulse: PulseSequence | PulseTableState | str | Path | None) -> PulseSequence | PulseTableState:

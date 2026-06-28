@@ -21,6 +21,18 @@ from pathlib import Path
 # ``Zou_lab_control/_paths.py``, so two parents up is that root.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+# ALL regenerable run output (calibration data + reports, generated Verilog, saved run results) lives
+# under ONE gitignored root instead of scattering loose ``calibrations/`` ``results/``
+# ``generated_sequences/`` folders across the repo root (系统整理 -- one place to find or wipe run
+# output).  These are the SINGLE SOURCE for every default output path: the calibrate task writes its
+# data folder here and the judge processor reads ``DEFAULT_CALIBRATION_FILE`` from the SAME place, so
+# the calibrate-then-judge default wiring stays coupled by construction.
+OUTPUT_ROOT = "_output"
+CALIBRATION_DIR = f"{OUTPUT_ROOT}/calibrations"
+GENERATED_SEQUENCES_DIR = f"{OUTPUT_ROOT}/generated_sequences"
+RESULTS_DIR = f"{OUTPUT_ROOT}/results"
+DEFAULT_CALIBRATION_FILE = f"{CALIBRATION_DIR}/calibration.json"
+
 
 def project_path(*parts: str) -> Path:
     """Absolute path under the project root for ``parts`` -- e.g.

@@ -672,7 +672,10 @@ def test_plot_edit_shows_producing_processor_param_form():
         vals = editor.source_form.collect_values()
         assert {"calibration", "source"} <= set(vals)                  # the processor's params
         assert "ema" not in vals                                        # no invented smoothing knob
-        assert vals["source"] == "frame"                               # prefilled default (#3)
+        # source is a signal_expr; its prefilled default EXPRESSION is ``value = signal`` over the
+        # frame signal (#3) -- assert the expression, robust to the widget leaving inputs empty.
+        from Zou_lab_control.neutral_atom.operations.signal_expr import SignalExpr
+        assert SignalExpr.from_value(vals["source"]).source == "value = signal"
         # calibration prefilled with the canonical file path -- never a blank mystery
         assert vals["calibration"].replace("\\", "/").endswith("calibrations/calibration.json")
     finally:

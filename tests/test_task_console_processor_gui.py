@@ -69,9 +69,10 @@ def test_processor_node_runs_and_publishes(tmp_path):
     try:
         row, editor = _add_processor_node(console, "Readout fidelity")
         assert row.node.kind == "processor"
-        # the Edit form opened, auto-generated incl. the 'text' folder-path field
+        # the Edit form opened, auto-generated incl. the folder field -- a PATH picker (path_mode="dir",
+        # Browse to a frames folder), as the fidelity processor declares it
         assert editor.form is not None
-        assert editor.form._decls["data_dir"].kind == "text"
+        assert editor.form._decls["data_dir"].kind == "path"
         # default STOPPED: no node built, nothing on the hub
         assert console._logic_nodes[id(row)] is None
 
@@ -120,7 +121,11 @@ def test_judge_occupancy_node_reacts_to_frames(tmp_path):
         assert console._logic_nodes[id(row)] is None
         vals = editor.collect_values()
         assert vals["calibration"].replace("\\", "/").endswith("calibrations/calibration.json")
-        assert vals["source"] == "frame"
+        # source is a signal_expr (the universal multi-slot picker): its declared default expression
+        # is ``value = signal`` over the ``frame`` signal -- assert the EXPRESSION, robust to the
+        # widget leaving ``inputs`` empty until that signal exists (an empty pick falls back to frame).
+        from Zou_lab_control.neutral_atom.operations.signal_expr import SignalExpr
+        assert SignalExpr.from_value(vals["source"]).source == "value = signal"
         assert "ema" not in vals
 
         # point the detector at a REAL saved calibration file (the reference's explicit-file
@@ -146,8 +151,10 @@ def test_judge_occupancy_node_reacts_to_frames(tmp_path):
             cam.step()                              # keep frames coming for the reactive node
             time.sleep(0.03)
         assert occ_name in hub.names()
-        assert np.asarray(hub.latest(occ_name)).shape == (20,)
-        assert np.asarray(hub.latest(cen_name)).shape == (20, 2)
+        cen = np.asarray(hub.latest(cen_name))
+        assert cen.shape == (20, 2)                                     # static (N, 2) centres
+        # occupancy is the CLEAN (repeat, n_sites) block the processor preserves (#H3q), not flat
+        assert np.asarray(hub.latest(occ_name)).shape == (1, cen.shape[0])
         # reactive: it keeps running (NOT a one-shot finished node)
         assert getattr(node, "finished", False) is False
         cam.stop()

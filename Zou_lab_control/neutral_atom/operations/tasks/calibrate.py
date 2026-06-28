@@ -13,6 +13,7 @@ ground truth -- a virtual run traverses the identical contract path a real run d
 
 from __future__ import annotations
 
+from Zou_lab_control._paths import CALIBRATION_DIR
 from ..logic import CalibrateReadoutTask
 from ..measurement import ParamDecl
 from ..task import TaskSpec
@@ -28,7 +29,7 @@ from ..task_registry import task
 # OccupancyProcessor picks one.  EVERY parameter carries a REAL default (no blank fields):
 # ``folder`` (a real data dir) + ``pulse_template`` (the shipped imaging program) are both
 # Browse-able paths the experimenter sees up front.
-DEFAULT_DATA_DIR = "calibrations"          # the one data + report folder (re-running overwrites it)
+DEFAULT_DATA_DIR = CALIBRATION_DIR         # the one data + report folder (under _output/, re-run overwrites)
 # The shipped imaging program, from the ONE canonical source (CalibrateReadoutTask): a real,
 # project-relative ``pulses/imaging_template.json`` the GUI field shows in full -- not a bare
 # name the path widget would anchor to the project root and display as a non-existent file.

@@ -18,14 +18,16 @@ only the camera frames differ; no simulation ground truth is read).
 
 from __future__ import annotations
 
+from Zou_lab_control._paths import CALIBRATION_DIR, DEFAULT_CALIBRATION_FILE
 from ..logic import OccupancyProcessor
 from ..processor import ParamDecl, ProcessorSpec
 from ..processor_registry import processor
 
-# The canonical calibration file the Calibrate-readout task writes (its latest result), and
-# the detector's default input -- so calibrate-then-judge wires up with no path typed, while
-# the file in use is always explicitly named (never a blank "current" mystery).
-DEFAULT_CALIBRATION_FILE = "calibrations/calibration.json"
+# The canonical calibration file the Calibrate-readout task writes (its latest result), and the
+# detector's default input -- so calibrate-then-judge wires up with no path typed, while the file in
+# use is always explicitly named (never a blank "current" mystery).  Single-sourced in _paths
+# (DEFAULT_CALIBRATION_FILE under _output/calibrations/) so the WRITE side (calibrate task) and this
+# READ side cannot drift.
 
 
 @processor(order=5)   # occupancy is the primary live-readout processor
@@ -48,7 +50,7 @@ def judge_occupancy(readout) -> ProcessorSpec:
     params = (
         ParamDecl("calibration", "Calibration file", "path", default=DEFAULT_CALIBRATION_FILE,
                   path_mode="file", file_filter="Calibration (*.json *.npz);;All files (*)",
-                  base_dir="calibrations", required=True,
+                  base_dir=CALIBRATION_DIR, required=True,
                   tooltip="The calibration file the detector LOADS (.json/.npz: site centers + "
                           "per-site thresholds [+ PSF kernels]).  Defaults to the canonical file "
                           "the Calibrate-readout task writes (calibrations/calibration.json), so "

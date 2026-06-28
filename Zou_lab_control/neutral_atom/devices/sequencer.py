@@ -12,6 +12,7 @@ import threading
 import time
 from typing import Any, Callable, Mapping, Sequence
 
+from Zou_lab_control._paths import GENERATED_SEQUENCES_DIR
 from ..core.analysis import positive_int
 from .base import SequencerDevice
 from ..timing import (
@@ -1622,7 +1623,7 @@ class VerilogSequencer(SequencerDevice):
         *,
         channels: Sequence[str],
         clock_hz: float = DEFAULT_RUNTIME_CLOCK_HZ,
-        output_dir: str | Path = "generated_sequences",
+        output_dir: str | Path = GENERATED_SEQUENCES_DIR,
         module_name: str = "zlc_sequence",
         pin_map: Mapping[str, str] | None = None,
         fire_callback: Callable[[VerilogBuild], None] | None = None,

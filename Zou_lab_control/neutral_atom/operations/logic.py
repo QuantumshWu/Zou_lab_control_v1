@@ -36,6 +36,7 @@ from pathlib import Path
 
 import numpy as np
 
+from Zou_lab_control._paths import CALIBRATION_DIR
 from ..core.analysis import grid_shape_tuple
 from ..core.signals import SignalHub
 from ..devices.base import AODDevice, CameraDevice
@@ -845,7 +846,7 @@ class CalibrateReadoutTask(Task):
                  pulse_template: str = DEFAULT_PULSE_TEMPLATE,
                  threshold_frames: int = 100,
                  threshold_method: str = "otsu",
-                 source: str = "live", folder: str = "calibrations",
+                 source: str = "live", folder: str = CALIBRATION_DIR,
                  save_frames: bool = True,
                  calibration_sink=None, prefix: str = ""):
         super().__init__(hub, prefix=prefix)

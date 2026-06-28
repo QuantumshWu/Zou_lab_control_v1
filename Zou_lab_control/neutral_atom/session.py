@@ -13,6 +13,7 @@ import json
 
 import numpy as np
 
+from Zou_lab_control._paths import GENERATED_SEQUENCES_DIR
 from .core.analysis import grid_shape_tuple
 from .core.calibration import TrapCalibration
 from .core.results import (
@@ -153,7 +154,7 @@ class NeutralAtomSession:
             verilog=build,
         )
 
-    def _write_verilog(self, output_dir: str | Path = "generated_sequences", *, sequence: PulseSequence | None = None) -> Path:
+    def _write_verilog(self, output_dir: str | Path = GENERATED_SEQUENCES_DIR, *, sequence: PulseSequence | None = None) -> Path:
         sequence = sequence or self.sequence
         sequencer = getattr(self.devices, "sequencer", None)
         channels = getattr(sequencer, "channels", sequence.channels)

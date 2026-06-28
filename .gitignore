@@ -33,7 +33,11 @@ ENV/
 tutorials/_executed_check/
 **/_executed_check/
 
-# Generated local outputs
+# Generated local outputs -- ALL run output now lives under ONE root (_output/: calibrations data +
+# reports, generated Verilog, saved results), single-sourced in Zou_lab_control/_paths.py so it never
+# scatters loose folders across the repo root.  Legacy top-level names kept ignored for any explicit override.
+/_output/
+**/_output/
 /generated_sequences/
 /results/
 **/generated_sequences/

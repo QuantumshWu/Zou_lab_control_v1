@@ -77,7 +77,7 @@ def test_calibrate_task_path_fields_show_absolute_project_paths():
     """The Calibrate-readout task's ``folder`` + ``pulse template`` fields open prefilled
     with the FULL project path (so the operator sees exactly which folder/json), not a bare
     name resolved against whatever CWD Python was launched from."""
-    from Zou_lab_control._paths import PROJECT_ROOT
+    from Zou_lab_control._paths import PROJECT_ROOT, CALIBRATION_DIR, resolve_under_project
 
     exp, console = _console()
     try:
@@ -85,8 +85,9 @@ def test_calibrate_task_path_fields_show_absolute_project_paths():
         editor = _open_editor(console, ("task", spec.name))
         folder = editor.form._widgets["folder"].text()
         template = editor.form._widgets["pulse_template"].text()
-        assert Path(folder).is_absolute() and Path(folder) == PROJECT_ROOT / "calibrations"
-        assert folder != "calibrations"                       # never the bare ambiguous name
+        # the default data folder = the single-source CALIBRATION_DIR (under _output/), shown absolute
+        assert Path(folder).is_absolute() and Path(folder) == resolve_under_project(CALIBRATION_DIR)
+        assert folder != "calibrations" and folder != CALIBRATION_DIR  # never a bare ambiguous name
         assert Path(template).is_absolute()
         assert Path(template) == PROJECT_ROOT / "pulses" / "imaging_template.json"
         assert "pulses" in template.replace("\\", "/")        # points at the real shipped file
@@ -100,7 +101,7 @@ def test_occupancy_calibration_field_names_the_canonical_file_not_blank():
     opens prefilled with the canonical ``calibrations/calibration.json`` (absolute, project-
     anchored) the Calibrate task writes -- so the operator always sees which json is loaded,
     matching the Rb87 reference's explicit-file model (no implicit 'current' calibration)."""
-    from Zou_lab_control._paths import PROJECT_ROOT
+    from Zou_lab_control._paths import DEFAULT_CALIBRATION_FILE, resolve_under_project
 
     exp, console = _console()
     try:
@@ -109,7 +110,8 @@ def test_occupancy_calibration_field_names_the_canonical_file_not_blank():
         text = editor.form._widgets["calibration"].text()
         assert text != ""                                          # NOT blank
         p = Path(text)
-        assert p.is_absolute() and p == PROJECT_ROOT / "calibrations" / "calibration.json"
+        # the single-source canonical file the Calibrate task writes (under _output/calibrations/)
+        assert p.is_absolute() and p == resolve_under_project(DEFAULT_CALIBRATION_FILE)
         # there is no invented `ema` smoothing param on this processor
         assert "ema" not in editor.form._widgets
     finally:
