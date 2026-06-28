@@ -1627,6 +1627,9 @@ class PanelCard(FluentGroupBox):
         # card when either the hub version OR the display shot advances, so a held-then-released shot still
         # repaints even on a tick with no fresh publish.  -1 = never rendered.
         self._render_shot = -1
+        # True ONLY for a finished-task RESULT panel: the console stops repainting it (_tick skips it) so
+        # its final image (e.g. the rearranged array) persists instead of vanishing when the task ends.
+        self._frozen = False
         self._compiled_source = config.source
         # Monitor roll-gate: remembers the per-signal version of this panel's
         # source at the last roll, so an unrelated node's version bump does not
@@ -5714,14 +5717,35 @@ class TaskConsole(QtWidgets.QWidget):
         if row is not None:
             self._stop_logic_node(row)
 
-    def _clear_task_running(self) -> None:
-        """Leave task-run mode (task finished or stopped): drop the lock + banner and
-        the transient mid-run panel (its job was to show the work in progress)."""
+    def _clear_task_running(self, *, keep_result: bool = False) -> None:
+        """Leave task-run mode (task finished or stopped): drop the lock + banner.
+
+        ``keep_result`` (a task that FINISHED on its own) FREEZES the mid-run panel into a persistent
+        result panel instead of removing it -- an instant task (e.g. Rearrange completes in <1 tick on the
+        virtual backend) would otherwise have its panel vanish before the operator ever sees the outcome.
+        A stopped / removed task drops the panel as before (its job was only to show work in progress)."""
+        row = self._running_task_row
+        node = self._logic_nodes.get(id(row)) if row is not None else None
         self._running_task_row = None
         card, self._task_card = self._task_card, None
         self._apply_task_lock(False)
-        if card is not None and card in self.cards:
-            self._remove_panel(card)
+        if card is None or card not in self.cards:
+            return
+        if keep_result and node is not None:
+            # FINAL pump (the finish is detected in _poll_logic_nodes BEFORE _refresh_task_panel runs, so
+            # the panel has not drawn the last frame yet): show the task's final output, then freeze it so
+            # _tick stops repainting it and a later task run cannot overwrite the result the user is reading.
+            try:
+                frame = node.output.latest(self._task_mid_key)
+                if frame is not None:
+                    self._task_card_frame = frame
+                card.config.title = f"{card.config.title} (result)"
+                card.refresh(self._expression_namespace())   # draw the final frame once
+                card._frozen = True                           # _tick skips frozen cards -> the image persists
+                return
+            except Exception:
+                pass
+        self._remove_panel(card)
 
     def _refresh_task_panel(self) -> None:
         """Pump the running task's mid-run output (from its OWN buffer) into the
@@ -5926,7 +5950,7 @@ class TaskConsole(QtWidgets.QWidget):
                 # that completes normally leaves the dashboard locked forever (only a
                 # manual Stop reaches _clear_task_running).
                 if row is self._running_task_row:
-                    self._clear_task_running()
+                    self._clear_task_running(keep_result=True)   # a finished task leaves a persistent result panel
             elif running:
                 # surface scan progress when the node reports it -- ``total_points`` spans ALL
                 # repeat passes (n_points x repeat), so a repeated scan counts 52/60, not 12/20.
@@ -6078,6 +6102,8 @@ class TaskConsole(QtWidgets.QWidget):
         elapsed = self._tick_count * self._base_interval_ms
         namespace = None
         for card in self.cards:
+            if getattr(card, "_frozen", False):
+                continue                          # a finished-task RESULT panel: keep its last image, never repaint
             # this panel's beat?  update_ms is a multiple of the base, so cards that share a
             # beat fire on the SAME tick -> they read the SAME namespace below (shot-coherent).
             if elapsed % card.config.update_ms != 0:
