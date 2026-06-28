@@ -94,6 +94,29 @@ class SignalSpec:
         return len(self.points_shape or ()) + len(self.data_shape or ())
 
 
+def grid_for_points(grid, points) -> tuple:
+    """The SINGLE validity precondition for un-flattening a flat swept-points axis into a 2-D map.
+
+    A 2-D scan publishes its swept points FLAT (``points_shape=(P,)``) and declares ``grid_shape=(n0,n1)``
+    so a 2-D panel can reshape them back into an image.  That reshape is valid IFF the points exist AND the
+    grid divides them exactly -- ``points`` non-empty and ``prod(grid) == prod(points)``.  Returns ``grid``
+    when valid, else ``()``.
+
+    This is the ONE rule EVERY consumer shares -- :func:`describe_shape` (the legend), the console's
+    ``_signal_structure`` (what a panel reshapes) and ``_coerce`` (the actual reshape) -- so the rule can
+    never drift between them.  Crucially, a node may carry a ``grid_shape`` that is NOT a swept-points grid:
+    an :class:`OccupancyProcessor` / rearrange task stores ``grid_shape=(5,7)`` as the physical TRAP LAYOUT,
+    which has nothing to do with reshaping points.  Because reshape eligibility is a dimensional FACT about
+    the signal (``prod(grid)==prod(points)``), such a trap grid is never smeared onto a per-site signal
+    (occupancy ``points=()`` -> ``prod=1`` != ``35``) and imshow'd as a (5x7) heatmap -- no per-node
+    special-casing, the same fact decides it everywhere."""
+    pts = tuple(int(n) for n in (points or ()))
+    g = tuple(int(n) for n in (grid or ()))
+    if pts and g and int(np.prod(g)) == int(np.prod(pts)):
+        return g
+    return ()
+
+
 def describe_shape(value, *, points_shape=None, data_shape=None, grid_shape=None) -> str:
     """A standardized shape string read straight from a published VALUE -- the SINGLE
     way the GUI says what a signal looks like, AUTO-EXTRACTED from real data rather
@@ -119,7 +142,7 @@ def describe_shape(value, *, points_shape=None, data_shape=None, grid_shape=None
     dsh = tuple(int(n) for n in (data_shape or ()))
     if (points_shape is not None or data_shape is not None) and len(shape) >= 1 \
             and tuple(shape[1:]) == ps + dsh:
-        gs = tuple(int(n) for n in (grid_shape or ()))
+        gs = grid_for_points(grid_shape, ps)   # ONE rule: a grid shows only when it divides the points
         dstr = "×".join(str(n) for n in dsh) or "1"
         if not ps:
             # NO swept points: show the FLAT data count, never a grid -- the grid_shape only
@@ -2064,6 +2087,7 @@ class ProcessorRun(LogicNode):
 
 __all__ = [
     "describe_shape",
+    "grid_for_points",
     "SignalSpec",
     "CalibrateReadoutTask",
     "CameraMeasurement",

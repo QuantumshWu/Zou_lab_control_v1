@@ -5155,18 +5155,15 @@ class TaskConsole(QtWidgets.QWidget):
         if node is None:
             return None
         node_grid = tuple(int(n) for n in (getattr(node, "grid_shape", ()) or ()))
+        # ``grid_shape`` un-flattens a 2-D scan's SWEPT POINTS into a map; whether it applies to THIS
+        # signal is the ONE shared rule grid_for_points (operations layer) -- prod(grid)==prod(points) and
+        # points non-empty -- the SAME fact describe_shape and _coerce use, so it can never drift.  A
+        # per-site DATA signal (occupancy points=()) gets () and so can never be imshow'd as a (5x7)
+        # heatmap; the site map stays frame + rings (the trap layout is camera-pixel centres, not a grid).
+        from Zou_lab_control.neutral_atom.operations.logic import grid_for_points
 
         def _grid_for(points) -> tuple:
-            # ``grid_shape`` un-flattens a 2-D scan's SWEPT POINTS into a map; it applies ONLY when the
-            # signal HAS swept points the grid divides (prod(grid) == prod(points)).  A per-site DATA
-            # signal (occupancy: points=(), data=(n_sites,)) must get () -- otherwise _coerce's 2-D
-            # branch reshapes the (n_sites,) occupancy into a (5x7) heatmap and Live2DDis imshows it,
-            # which is NOT a site map (the trap layout is a scatter of camera-pixel centres, not a pixel
-            # grid).  The site map renders frame + rings; occupancy never becomes a grid imshow.
-            pts = tuple(int(n) for n in (points or ()))
-            if pts and node_grid and int(np.prod(node_grid)) == int(np.prod(pts)):
-                return node_grid
-            return ()
+            return grid_for_points(node_grid, points)
 
         # PER-SIGNAL: the producing signal's own SignalSpec (occupied declares points=(), data=(n_sites,);
         # centers declares neither -> None) takes precedence over the node-level triple.
