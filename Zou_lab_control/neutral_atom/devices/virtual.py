@@ -96,7 +96,7 @@ class VirtualTrapArray(TrapArrayDevice):
     # easier than real Rb87).  With the photon count aligned, the bright distribution width is pure
     # Poisson(signal+background) -- it sharpens with exposure, so single-shot fidelity RISES from the
     # hard short-readout regime (~0.8-0.9) to ~0.99 at a long readout, exactly like the real data.
-    atom_rate: float = 1_450.0
+    atom_rate: float = 1_100.0
     # Per-site COLLECTION-efficiency variation (relative standard deviation, 1-sigma):
     # a real Rb87 tweezer array has different effective NA / aberration / vacuum-window
     # transmission per site, so each site's bright count rate scales by an independently

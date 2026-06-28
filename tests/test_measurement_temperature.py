@@ -304,11 +304,14 @@ def test_temperature_scan_virtual_survival_decays_with_t_off():
     data-source physics matches the analysis-layer model without the analysis layer
     knowing the truth."""
 
-    exp = _calibrated_virtual_session(grid=(5, 7), readout_exposure=3e-3)
+    # Read SURVIVAL at a high-fidelity exposure (20 ms) so y reflects the ATOM survival physics, not the
+    # readout error: with the v16-aligned photon budget a 3 ms readout is genuinely ~0.85 fidelity, which
+    # would floor y[0] below the true 1.0 (a real lab reads survival at high fidelity for the same reason).
+    exp = _calibrated_virtual_session(grid=(5, 7), readout_exposure=20e-3)
     # The default loss model (50 uK, 6 um capture radius) has its half-survival near
     # ~75 us, so sweep 0..300 us to see the full fall-off.
     state = build_release_recapture_pulse(
-        channels=list(exp.devices.sequencer.channels), exposure=3e-3, settle=2e-4, recapture=2e-4
+        channels=list(exp.devices.sequencer.channels), exposure=20e-3, settle=2e-4, recapture=2e-4
     )
     pulse = na.bind_pulse(exp.devices.sequencer, state)
 
