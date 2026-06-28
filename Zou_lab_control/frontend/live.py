@@ -1883,6 +1883,12 @@ class HistogramFigure(BaseLivePlot):
         # made it flip single/double between signals).  Turn it OFF for a plain single-Gaussian view.
         self._bimodal = bool(bimodal)
         self._fit_separated = False     # whether the bimodal fit cleanly separated (gates the fidelity stat)
+        # A threshold (cut line) is only MEANINGFUL when there are two populations to separate (#issue-2):
+        # shown when the bimodal fit separated OR a threshold was supplied explicitly (a calibration's
+        # per-site cut).  A pure single-Gaussian fit shows the FIT params + out-of-fit fraction instead.
+        self._explicit_thr = bool(thresholds)
+        self._has_threshold = self._explicit_thr
+        self.single_popt = None         # (amp, mu, sigma) of the single-Gaussian fit, for the no-threshold stat
         self.thresholds = list(thresholds or [])
         super().__init__(np.arange(len(self.values)), self.values, labels=labels, relim_mode="tight", **kwargs)
 
@@ -1909,6 +1915,7 @@ class HistogramFigure(BaseLivePlot):
         self.threshold_draggers = []
         for threshold in self.thresholds:
             line = self.ax.axvline(threshold, **threshold_line_kwargs())
+            line.set_visible(self._has_threshold)        # hidden on a single-Gaussian (no meaningful cut)
             self.threshold_lines.append(line)
             self.threshold_draggers.append(DragVLine(line, self._on_threshold_drag, self.ax))
         self.stats_text = self.ax.text(
@@ -1953,10 +1960,12 @@ class HistogramFigure(BaseLivePlot):
             self.threshold_draggers.append(DragVLine(line, self._on_threshold_drag, self.ax))
         for line, threshold in zip(self.threshold_lines, self.thresholds):
             line.set_xdata([threshold, threshold])
+            line.set_visible(self._has_threshold)        # show/hide live as the data separates / merges
         self._update_hist_stats()
 
     def set_thresholds(self, thresholds: Sequence[float]):
         self.thresholds = list(thresholds)
+        self._explicit_thr = bool(thresholds)            # an explicit cut shows even on a single Gaussian
         self.update_core()
         self.draw()
         return self
@@ -1992,6 +2001,9 @@ class HistogramFigure(BaseLivePlot):
         vals = self.values[np.isfinite(self.values)]
         self.bimodal_popt = None
         self.fit_threshold = None
+        self.single_popt = None
+        self._fit_separated = False
+        self._has_threshold = self._explicit_thr        # no fit yet -> only an explicit cut shows
         for ln in (self.fit_line_left, self.fit_line_right, self.fit_line_total):
             ln.set_data([], [])
         if vals.size < 6 or np.ptp(vals) == 0:
@@ -2025,13 +2037,20 @@ class HistogramFigure(BaseLivePlot):
                 p0 = [max(float(np.max(counts)), 1.0), float(np.mean(vals)), max(float(np.std(vals)), span / 40, 1e-9)]
                 popt, _ = curve_fit(gaussian, centers, counts, p0=p0, maxfev=20000)
                 self.fit_line_total.set_data(x_fit, gaussian(x_fit, *popt))   # one curve, fit F = N/A
+                self.single_popt = (float(popt[0]), float(popt[1]), float(popt[2]))   # for the no-threshold stat
             except Exception:
                 pass
 
+        # A SINGLE-Gaussian outcome -> NO threshold (a cut between two populations is meaningless when
+        # there is one): only show a cut if it was supplied EXPLICITLY (a calibration's per-site cut).
+        def _single_gaussian():
+            _draw_unimodal()
+            self.fit_threshold = None
+            self._has_threshold = self._explicit_thr
+
         # SINGLE-Gaussian mode (the toggle is OFF): one curve, no dark/bright split, fit F = N/A.
         if not self._bimodal:
-            _draw_unimodal()
-            self.fit_threshold = float(np.nanmedian(vals))
+            _single_gaussian()
             return
 
         # BIMODAL mode (the DEFAULT): always draw the two-Gaussian dark/bright decomposition, so the
@@ -2039,8 +2058,7 @@ class HistogramFigure(BaseLivePlot):
         # the data.  Only a genuine numerical inability to seed two peaks (a handful of bright samples,
         # or curve_fit failure) falls back to one Gaussian.
         if right.size < max(4, int(0.01 * vals.size)):
-            _draw_unimodal()
-            self.fit_threshold = float(np.nanmedian(vals))
+            _single_gaussian()
             return
 
         p0 = [_amp_near(mu0), mu0, s0, _amp_near(mu1), mu1, s1]
@@ -2053,8 +2071,7 @@ class HistogramFigure(BaseLivePlot):
             popt, _ = curve_fit(bimodal_model, centers, counts, p0=p0, bounds=bounds,
                                  jac=bimodal_jacobian, maxfev=20000)
         except Exception:
-            _draw_unimodal()
-            self.fit_threshold = float(np.nanmedian(vals))
+            _single_gaussian()
             return
         if popt[1] > popt[4]:
             popt = np.array([popt[3], popt[4], popt[5], popt[0], popt[1], popt[2]], dtype=float)
@@ -2070,10 +2087,17 @@ class HistogramFigure(BaseLivePlot):
         self.fit_line_left.set_data(x_fit, y0)
         self.fit_line_right.set_data(x_fit, y1)
         self.fit_line_total.set_data(x_fit, y0 + y1)
+        # A threshold is only meaningful when the two peaks actually SEPARATED.  Separated -> the cut at
+        # the cross-over; not separated (one effective population) -> NO auto cut (#issue-2): show the fit
+        # + out-of-fit fraction instead.  An explicitly-supplied cut (calibration) still shows either way.
+        self._has_threshold = self._fit_separated or self._explicit_thr
         lo, hi = float(popt[1]), float(popt[4])
-        x_mid = np.linspace(lo, hi, 400)
-        diff = np.abs(gaussian(x_mid, *popt[:3]) - gaussian(x_mid, *popt[3:]))
-        self.fit_threshold = float(x_mid[int(np.nanargmin(diff))]) if hi > lo else float(np.nanmedian(vals))
+        if self._fit_separated and hi > lo:
+            x_mid = np.linspace(lo, hi, 400)
+            diff = np.abs(gaussian(x_mid, *popt[:3]) - gaussian(x_mid, *popt[3:]))
+            self.fit_threshold = float(x_mid[int(np.nanargmin(diff))])
+        else:
+            self.fit_threshold = None
 
     def _fit_fidelity(self, threshold: float) -> float | None:
         # Honest fidelity only when the two-Gaussian fit cleanly SEPARATED (>=1.5 summed widths); the
@@ -2098,31 +2122,57 @@ class HistogramFigure(BaseLivePlot):
         return float(raw)
 
     def _on_threshold_drag(self, x: float) -> None:
+        if not self._has_threshold:
+            return                                       # a hidden (single-Gaussian) cut can't be dragged
         if not self.thresholds:
             self.thresholds = [float(x)]
         else:
             self.thresholds[0] = float(x)
         self._update_hist_stats()
 
+    def _out_of_fit_fraction(self) -> float | None:
+        """Fraction of the histogram mass NOT explained by the fitted curve (the overlap-coefficient
+        complement: ``1 - sum(min(counts, fitted)) / sum(counts)``).  Uses the single-Gaussian fit when
+        there is one, else the two-Gaussian sum; the gaussian math is the single-source _readout_math."""
+        n = getattr(self, "n", None)
+        if n is None or float(np.sum(n)) <= 0 or getattr(self, "bins", None) is None:
+            return None
+        centers = (self.bins[:-1] + self.bins[1:]) / 2
+        if self.single_popt is not None:
+            fitted = gaussian(centers, *self.single_popt)
+        elif self.bimodal_popt is not None:
+            fitted = bimodal_model(centers, *self.bimodal_popt)
+        else:
+            return None
+        overlap = float(np.sum(np.minimum(n.astype(float), np.clip(fitted, 0.0, None))))
+        return float(max(0.0, 1.0 - overlap / float(np.sum(n))))
+
     def _update_hist_stats(self) -> None:
-        if not self.thresholds:
+        # WITH a meaningful cut (separated fit or an explicit calibration cut): the threshold readout.
+        if self._has_threshold and self.thresholds:
+            threshold = float(self.thresholds[0])
+            vals = self.values[np.isfinite(self.values)]
+            if vals.size:
+                left = float(np.mean(vals <= threshold))
+                right = 1.0 - left
+            else:
+                left = right = 0.0
+            fidelity = self._fit_fidelity(threshold)
+            fidelity_text = "fit F=N/A" if fidelity is None else f"fit F={100 * fidelity:.1f}%"
+            fit_threshold = "" if self.fit_threshold is None else f"\nfit cut={self.fit_threshold:.4g}"
+            self.stats_text.set_text(
+                f"th={threshold:.4g}\n{fidelity_text}\nL/R={100 * left:.1f}%/{100 * right:.1f}%{fit_threshold}"
+            )
             return
-        threshold = float(self.thresholds[0])
-        vals = self.values[np.isfinite(self.values)]
-        if vals.size:
-            left = float(np.mean(vals <= threshold))
-            right = 1.0 - left
+        # SINGLE-Gaussian (no meaningful cut, #issue-2): show the FIT params + the out-of-fit fraction
+        # (how much of the data the single Gaussian does NOT explain), NOT a meaningless threshold.
+        out = self._out_of_fit_fraction()
+        out_text = "" if out is None else f"\nout-of-fit={100 * out:.1f}%"
+        if self.single_popt is not None:
+            _amp, mu, sigma = self.single_popt          # ASCII labels: the figure font lacks Greek glyphs
+            self.stats_text.set_text(f"gauss mean={mu:.4g}\nsd={abs(sigma):.3g}{out_text}")
         else:
-            left = right = 0.0
-        fidelity = self._fit_fidelity(threshold)
-        if fidelity is None:
-            fidelity_text = "fit F=N/A"
-        else:
-            fidelity_text = f"fit F={100 * fidelity:.1f}%"
-        fit_threshold = "" if self.fit_threshold is None else f"\nfit cut={self.fit_threshold:.4g}"
-        self.stats_text.set_text(
-            f"th={threshold:.4g}\n{fidelity_text}\nL/R={100 * left:.1f}%/{100 * right:.1f}%{fit_threshold}"
-        )
+            self.stats_text.set_text(f"single peak (no split){out_text}")
 
     def _install_state(self) -> None:
         self.fig._zlc_state = PlotState(plot_type="hist", x_array=self.bins, y_array=self.n)
