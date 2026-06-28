@@ -391,6 +391,24 @@ def test_camera_measurement_exposes_camera_params_and_applies_them_live():
     assert np.ndim(hub.latest("frame_0")) == 2             # a real 2-D camera frame (per-trigger)
 
 
+def test_camera_build_applies_repeat_through_every_entry_point():
+    """The camera's ``repeat`` (0 = ∞; K = keep & average a K-deep frame block then STOP) is the
+    acquisition knob the plot's repeat_mode then collapses (average / add / ...).  It MUST be applied
+    identically by EVERY build entry point -- the notebook ``camera_spec().build(hub, repeat=K)``, the
+    ``camera_measurement(hub, repeat=K)`` helper, and (via that helper) the console -- never silently
+    dropped on one path (that left a notebook camera stuck at repeat=0 = a 1-deep ring = no repeat_mode
+    effect, while the GUI worked).  ``set_repeat`` is the single source; every path routes K to it."""
+    exp = na.connect("virtual")
+    hub = SignalHub()
+    spec = exp.readout.camera_spec()
+    for K in (0, 1, 50):
+        # notebook spec path (build kwargs) and the bare helper must agree, ring depth = max(1, K)
+        node_spec = spec.build(hub, repeat=K)
+        node_help = exp.readout.camera_measurement(hub, repeat=K)
+        assert node_spec.repeat == K and node_help.repeat == K
+        assert node_spec._ring == max(1, K) and node_help._ring == max(1, K)
+
+
 def test_running_node_applies_params_in_owner_thread_no_concurrent_acquire():
     """ARCHITECTURE invariant: while a node's acquisition loop runs, it is the SOLE
     owner of the source.  An edit from another thread goes through

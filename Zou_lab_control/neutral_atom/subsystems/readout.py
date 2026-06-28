@@ -571,7 +571,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
 
         return discovered_task_specs(self)
 
-    def camera_measurement(self, hub, *, prefix: str = "", frames_per_cycle: int = 1):
+    def camera_measurement(self, hub, *, prefix: str = "", frames_per_cycle: int = 1, repeat: int = 0):
         """Build a CONTINUOUS camera Measurement over the session camera (a
         :class:`~..operations.logic.CameraMeasurement` publishing raw ``frame``s).
 
@@ -580,13 +580,20 @@ class ReadoutSubsystem(ExperimentSubsystem):
         it alongside a :class:`~..operations.logic.OccupancyProcessor` and a
         :class:`~..operations.logic.CalibrateReadoutTask`.  Its editable
         parameters ARE the camera's (exposure / region), applied live; only the
-        camera differs on real hardware (virtual == real)."""
+        camera differs on real hardware (virtual == real).
+
+        ``repeat`` is the acquisition knob (0 = ∞, the live monitor; K = keep & average a K-deep frame
+        block then STOP) -- a FIRST-CLASS build parameter so EVERY entry point (notebook + GUI) applies
+        it the SAME way (a plot then collapses the repeat axis via repeat_mode = average / add / ...).
+        It is passed straight to :class:`CameraMeasurement` (whose ``set_repeat`` is the single source);
+        a notebook calling ``readout.camera_spec().build(hub, repeat=50)`` gets a 50-deep ring exactly
+        like the console's Repeat=50 form does -- they must never diverge (virtual == real == notebook)."""
 
         from ..operations.logic import CameraMeasurement
 
         s = self._session
         return CameraMeasurement(hub, s.devices.camera, sequencer=getattr(s.devices, "sequencer", None),
-                                 frames_per_cycle=frames_per_cycle, prefix=prefix)
+                                 frames_per_cycle=frames_per_cycle, prefix=prefix, repeat=repeat)
 
     def camera_spec(self) -> MeasurementSpec:
         """The camera live stream as a DECLARATIVE spec, so a GUI auto-form renders
@@ -620,8 +627,9 @@ class ReadoutSubsystem(ExperimentSubsystem):
             return [float(p) for p in parts]
 
         def _build(hub, *, frames_per_cycle: int = 1, exposure: float = exposure,
-                   region: str = "", **_ignored):
-            node = self.camera_measurement(hub, frames_per_cycle=int(frames_per_cycle))
+                   region: str = "", repeat: int = 0, **_ignored):
+            node = self.camera_measurement(hub, frames_per_cycle=int(frames_per_cycle),
+                                           repeat=max(0, int(repeat)))
             apply: dict[str, object] = {}
             if exposure is not None:
                 apply["exposure"] = float(exposure)
