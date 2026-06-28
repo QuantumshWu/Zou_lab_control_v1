@@ -1511,7 +1511,7 @@ def test_task_console_signal_picker_and_declarative_params(monkeypatch):
         return False
 
     datas = _leaf_datas()
-    assert "counts" in datas and "frame" in datas
+    assert "counts" in datas and "frame_0" in datas
     # the demo 2d card is the synced readout image -> its input is the judged frame (#5)
     assert combo.current_signal() == "frame_judged"
 
@@ -1759,7 +1759,7 @@ def test_edit_exposes_producing_node_acquisition_params(monkeypatch):
 
     # a 2-D raw-frame view (reads `frame`) -- built inline (there are no presets)
     state = TaskConsoleState(name="raw_image",
-                             panels=[PanelConfig(kind="2d", title="Loading image", source="value = frame")])
+                             panels=[PanelConfig(kind="2d", title="Loading image", source="value = frame_0")])
     console = dt.demo_console(shots=20, state=state)
     try:
         img = next(c for c in console.cards if c.config.kind == "2d")   # "Loading image"
@@ -1829,10 +1829,10 @@ def test_task_console_sites_panel_bad_centers_isolated(monkeypatch):
     sites = next(c for c in console.cards if c.config.kind == "sites")
     # point the site map at a signal whose producing node publishes NO centres (the camera's
     # raw ``frame``) -> the panel cannot resolve centres/underlay from that node + errors.
-    sites.config.inputs[0] = "frame"
+    sites.config.inputs[0] = "frame_0"
     sites.config.source = "value = signal"
     console.refresh_once()
-    assert "frame" in sites.status.text()
+    assert "frame_0" in sites.status.text()
     healthy = [c for c in console.cards if c is not sites]
     assert all(c.status.text().startswith("shot ") for c in healthy)
     console.shutdown()

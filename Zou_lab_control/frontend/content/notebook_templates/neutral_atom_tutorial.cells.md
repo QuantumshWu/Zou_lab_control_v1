@@ -293,7 +293,7 @@ task_console 的设计原则是**自由搭建**——看板开出来是空的，
 - **Measurement: Camera (live frames)**：连续出帧的相机测量，只发一个信号 `frame`。这是整条 loading 读出链的源头——相机出帧、真流程检测，再没有别的隐藏环节。
 - **Processor: Judge occupancy**（判占据，reactive）：消费 `frame`、跑**真** `calibration.detect`，逐 repeat 切片判，流式发布 `occupied` / `counts`（`(repeat, n_sites)` 块，`repeat_mode=average` 即逐站装载概率）/ `rate`（本块装载率标量）/ `centers` / `thresholds` / `frame_judged`。参数是**从哪载入标定**（`calibration`：site/PSF/阈值，默认就是 Calibrate 任务写的 `calibrations/calibration.json`，该文件出现前回退到 `session` 当前标定）+ `source`（要判的 `frame` 信号）+ `method`（box / per-site PSF / uniform PSF）。
 - **Task: Calibrate readout**（一次性工作流）：在**自己的线程**里跑标定、不卡界面；它**不往 hub 发任何信号**——结果落在 `task.result`，中途帧/进度写进它自己的 `TaskOutput` 缓冲。运行时它占一张**固定 Monitor 面板**看中途模板帧、并锁定其它操作只留 **Stop task**（confocal task 式）。
-- 然后**自由加视图**读 measurement / processor 发的信号：Add Panel → `Plot: Site map`，在 Setting 里把 source 写 `value = occupied`（占据图：圈画在相机帧上，centers 自动取 `centers` 信号）；`Plot: 2D` + `value = frame`（原始图）；`Plot: Site map` + `value = occupied` 设 `repeat_mode=average`（逐站点装载概率）。
+- 然后**自由加视图**读 measurement / processor 发的信号：Add Panel → `Plot: Site map`，在 Setting 里把 source 写 `value = occupied`（占据图：圈画在相机帧上，centers 自动取 `centers` 信号）；`Plot: 2D` + `value = frame_0`（原始图）；`Plot: Site map` + `value = occupied` 设 `repeat_mode=average`（逐站点装载概率）。
 - **Measurement: …**（扫描）：温度 / 读出时长，默认绑曲线图。
 
 每张面板底部都列出它**读 / 发**了哪些信号（重名会标 ⚠），所以不用猜 hub 里有什么名字（hub 里只有 measurement + processor 的输出，没有 task）。要调相机/判占据的 `grid_shape` / `exposure` / `roi_radius` / `method`，在那个节点**自己**的 Edit 标签里改 + **Apply**（两帧之间应用，不中断采集）；plot 面板的 Edit 直接给产它信号的那个 measurement/processor 的参数表单。换实机只改 `na.connect("virtual"→"qcmos")`，这一节一字不变。
@@ -303,7 +303,7 @@ task_console 的设计原则是**自由搭建**——看板开出来是空的，
 # measurement / processor / task 目录都接好(等价于手写 zf.show_task_console(hub=..., session=exp,
 # measurements=..., processors=...),但一行搞定)。看板开出来是空的,从 Add Panel 自己搭
 # Camera(发 frame) -> Processor: Judge occupancy(真 detect) -> Plot: Site map (value = occupied) /
-# Plot: 2D (value = frame)。`exp.task_console(task="<名字>")` 还能直接载入 tasks/<名字>.json 的存盘布局。
+# Plot: 2D (value = frame_0)。`exp.task_console(task="<名字>")` 还能直接载入 tasks/<名字>.json 的存盘布局。
 # 注意:Qt 实时窗口与本 notebook 上面的 ipympl 内联图是两套事件循环——建议重启 kernel 后,只跑
 # 上面那格 `exp = na.connect("virtual", ...)` + 本格(完整的从零搭建流程见 task_console_tutorial.ipynb)。
 console = exp.task_console()

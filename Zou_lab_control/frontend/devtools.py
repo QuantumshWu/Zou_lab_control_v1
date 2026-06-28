@@ -206,7 +206,7 @@ def _demo_board_state():
             # Readout image SYNCED with the site map: both read the occupancy processor's
             # ``frame_judged`` (the exact frame it judged, co-published atomically with
             # ``occupied``) -> the 2D image and the rings are always the SAME shot.  (A raw
-            # live-camera view would be ``value = frame``, but that runs one cycle AHEAD of
+            # live-camera view would be ``value = frame_0``, but that runs one cycle AHEAD of
             # the judged frame, so it would not line up with the rings.)
             PanelConfig(kind="2d", title="Readout image", row=0, col=0, size="2x2",
                         source="value = frame_judged", inputs=["frame_judged"]),

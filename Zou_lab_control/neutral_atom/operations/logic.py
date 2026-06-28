@@ -428,7 +428,7 @@ class Measurement(LogicNode):
     layer = "measurement"
     node_label = "measurement"
     # The published key that carries the (repeat,*points_shape,*data_shape) CONTRACT block.  Each
-    # concrete measurement sets it (camera -> "frame"; a scan -> its y_key) so the base can verify the
+    # concrete measurement sets it (camera -> "frame_0"; a scan -> its y_key) so the base can verify the
     # block shape at publish time and the output-contract test can find it generically.
     primary_signal: str = ""
 

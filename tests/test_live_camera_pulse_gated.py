@@ -39,31 +39,31 @@ def test_live_camera_streams_only_while_the_pulse_is_firing():
     try:
         # 1) Nothing fired yet -> the streamer emits no camera trigger -> NO live frame.
         cam.step()
-        assert "frame" not in hub.names()
+        assert "frame_0" not in hub.names()
 
         # 2) "On Pulse": fire the continuous imaging pulse -> the camera streams and every
         #    shot is a NEW frame (the live 2D actually updates).
         fire_live_imaging(exp)
         cam.step()
-        first = np.asarray(hub.latest("frame")).copy()
+        first = np.asarray(hub.latest("frame_0")).copy()
         cam.step()
-        second = np.asarray(hub.latest("frame")).copy()
+        second = np.asarray(hub.latest("frame_0")).copy()
         assert first.ndim == 4                                # the (repeat, 1, H, W) data block
         assert not np.array_equal(first, second)              # live updating while firing
 
         # 3) "Stop Pulse" (set_safe_state): no more triggers -> the live view FREEZES.
         #    Stepping the camera many more times never changes the last frame (NOT fabricated).
         exp.devices.sequencer.set_safe_state()
-        frozen = np.asarray(hub.latest("frame")).copy()
+        frozen = np.asarray(hub.latest("frame_0")).copy()
         for _ in range(6):
             assert cam.step() == {}                           # no publish: the view holds
         # the (repeat, H, W) data array is frozen (equal_nan: the not-yet-filled ring rows are NaN)
-        assert np.array_equal(np.asarray(hub.latest("frame")), frozen, equal_nan=True)
+        assert np.array_equal(np.asarray(hub.latest("frame_0")), frozen, equal_nan=True)
 
         # 4) Re-fire -> the live view resumes.
         fire_live_imaging(exp)
         cam.step()
-        assert not np.array_equal(np.asarray(hub.latest("frame")), frozen, equal_nan=True)
+        assert not np.array_equal(np.asarray(hub.latest("frame_0")), frozen, equal_nan=True)
     finally:
         cam.stop()
         exp.close()

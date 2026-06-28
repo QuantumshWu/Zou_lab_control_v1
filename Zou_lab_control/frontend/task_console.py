@@ -2514,7 +2514,7 @@ class PanelCard(FluentGroupBox):
     def _eval_signal_per_slice(self, namespace: Mapping[str, object], *, core_ndim=None):
         """Run the ``value`` expression once PER REPEAT and re-stack -> ``(repeat, *result), True``.
         Every signal the expression reads that carries a repeat axis (the bound ``signal`` AND any
-        raw hub signal the source names directly, e.g. ``value = frame``) is presented as that
+        raw hub signal the source names directly, e.g. ``value = frame_0``) is presented as that
         repeat's whole core -- the (H, W) frame / the (points, dim) curve -- so the user can process
         it (``signal[0]``, ``frame.mean()``, ...) while the repeat axis stays OUTSIDE the expression.
         When nothing read has a repeat axis (a single frame / curve / scalar) the expression runs
