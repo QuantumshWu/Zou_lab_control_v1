@@ -123,3 +123,5 @@ pulses/
 xsim.dir/
 *.pb
 calibrations/
+
+.claude/worktrees/
