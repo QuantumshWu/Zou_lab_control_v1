@@ -682,7 +682,9 @@ class OccupancyProcessor(Processor):
             SignalSpec(p + "centers", "site centre", "px", "site centres in camera pixels (N, 2)"),
             SignalSpec(p + "thresholds", "threshold", "counts", "per-site bright/dark count threshold"),
             SignalSpec(p + "frame_judged", "camera image", "counts",
-                       "the exact camera frames this occupancy was judged from (site-map underlay)",
+                       "the EXACT frame this occupancy was judged from -- shot-locked to occupied/centers "
+                       "(one atomic publish).  Use THIS for a 2D readout image that matches the site map "
+                       "(same shot); the camera's live `frame` advances independently and is NOT shot-locked.",
                        points_shape=(), data_shape=frame),
         )
 
@@ -1510,7 +1512,9 @@ class CameraMeasurement(Measurement):
         for name in sorted(self.published_signals()):
             bare = name[len(self.prefix):] if self.prefix and name.startswith(self.prefix) else name
             if bare == "frame":
-                desc = "(repeat, 1, H, W) block: repeat x one point x the H*W image -- plot reduces repeats"
+                desc = ("(repeat, 1, H, W) block: repeat x one point x the H*W image -- plot reduces repeats.  "
+                        "LIVE camera, advances independently of the readout: for a 2D image shot-locked to the "
+                        "site map, bind the Judge-occupancy node's `frame_judged` instead.")
             else:
                 desc = f"newest single image of camera trigger {bare.split('_')[-1]} of the cycle"
             specs.append(SignalSpec(name, "camera image", "counts", desc))

@@ -1482,7 +1482,8 @@ class PanelCard(FluentGroupBox):
     def __init__(self, config: PanelConfig, parent=None, *, names_provider=None,
                  sources_provider=None, formats_provider=None, axes_provider=None,
                  sites_inputs_provider=None, curve_x_provider=None,
-                 structure_provider=None, calibration_provider=None, short_names_provider=None):
+                 structure_provider=None, calibration_provider=None, short_names_provider=None,
+                 live_namespace_provider=None):
         # Titled frame: the title strip carries the panel KIND (top-left) and the
         # Setting button (top-right), so the card is delineated like the rest.
         super().__init__(PANEL_KINDS[config.kind], parent, shadow=True)
@@ -1518,6 +1519,12 @@ class PanelCard(FluentGroupBox):
         # FRAME reduces each frame to its per-site COUNTS via this calibration (the dark/bright bimodal
         # readout), instead of histogramming raw pixels (a single background blob) (#H3v-4a).
         self.calibration_provider = calibration_provider
+        # callable() -> the console's CURRENT shared per-tick namespace (a fresh hub snapshot).  An
+        # IMMEDIATE re-render (signal switch / colormap / resize) must draw from THIS -- the SAME shot
+        # every other panel is on this tick -- NOT the panel's own stale ``_last_namespace`` (a PAST
+        # tick).  Otherwise after switching a panel's source it shows an OLDER shot than its siblings,
+        # so e.g. a 2D image and the sitemap display different shots (#shot-coherence-on-switch).
+        self.live_namespace_provider = live_namespace_provider
         self.plotter = None
         self.canvas = None
         self._value_shape: tuple[int, ...] | None = None
@@ -2406,8 +2413,23 @@ class PanelCard(FluentGroupBox):
         down via :meth:`_reset_plot`; normally the next refresh rebuilds it.  But when the
         producing measurement is STOPPED the hub version is frozen, so ``_tick`` never calls
         ``refresh`` again -- the torn-down panel would stay blank (white).  Replaying the
-        cached namespace rebuilds the plot at once.  No-op before the first render."""
-        if self._last_namespace is not None:
+        cached namespace rebuilds the plot at once.  No-op before the first render.
+
+        Prefer the console's CURRENT shared namespace (a fresh hub snapshot = the SAME shot every
+        other panel is on this tick) over this panel's own ``_last_namespace`` (a PAST tick): after a
+        SIGNAL SWITCH or Stop/Start, replaying the stale cache would draw an OLDER shot than the
+        siblings, so a 2D image and the sitemap would show different shots (#shot-coherence-on-switch).
+        Fall back to the cached namespace only when no live one is available (or it lacks the new
+        source -- e.g. a stopped producer whose frozen value lives only in the cache)."""
+        live = None
+        if callable(self.live_namespace_provider):
+            try:
+                live = self.live_namespace_provider()
+            except Exception:
+                live = None
+        if live is not None and all(name in live for name in (self.config.inputs or ()) if name):
+            self.refresh(live)
+        elif self._last_namespace is not None:
             self.refresh(self._last_namespace)
 
     # ------------------------------------------------------------- data path
@@ -4741,7 +4763,7 @@ class TaskConsole(QtWidgets.QWidget):
             for config in state.panels:
                 self._attach_card(PanelCard(config, parent=self.board,
                                             names_provider=self._signal_names,
-                                            sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, structure_provider=self._signal_structure, calibration_provider=self._running_calibration, short_names_provider=self._signal_short_names))
+                                            sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, structure_provider=self._signal_structure, calibration_provider=self._running_calibration, short_names_provider=self._signal_short_names, live_namespace_provider=self._expression_namespace))
             for node in state.logic:
                 self._attach_logic_node(node)    # always STOPPED -- Start is manual
             self._arrange()
@@ -5348,7 +5370,7 @@ class TaskConsole(QtWidgets.QWidget):
         title = indexed_unique_name(PANEL_KINDS[str(kind)], {c.config.title for c in self.cards})
         config = PanelConfig(kind=str(kind), title=title, row=next_y, col=0, size="1x2")
         card = PanelCard(config, parent=self.board, names_provider=self._signal_names,
-                         sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, structure_provider=self._signal_structure, calibration_provider=self._running_calibration, short_names_provider=self._signal_short_names)
+                         sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, structure_provider=self._signal_structure, calibration_provider=self._running_calibration, short_names_provider=self._signal_short_names, live_namespace_provider=self._expression_namespace)
         self._attach_card(card)
         self._arrange()
         self._mark_dirty()
@@ -5552,7 +5574,7 @@ class TaskConsole(QtWidgets.QWidget):
         config = PanelConfig(kind=kind, title=title, size="2x2",
                              source="value = __task_frame__")
         card = PanelCard(config, parent=self.board, names_provider=self._signal_names,
-                         sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, structure_provider=self._signal_structure, calibration_provider=self._running_calibration, short_names_provider=self._signal_short_names)
+                         sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, structure_provider=self._signal_structure, calibration_provider=self._running_calibration, short_names_provider=self._signal_short_names, live_namespace_provider=self._expression_namespace)
         self._attach_card(card)
         self._task_card = card
         self._running_task_row = row
