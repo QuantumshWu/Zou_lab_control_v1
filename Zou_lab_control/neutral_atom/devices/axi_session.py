@@ -246,7 +246,13 @@ class VivadoAxiStreamerSession:
             return
         try:
             if process.stdin is not None:
-                process.stdin.write("exit\n")
+                # Release the JTAG / dbg_hub lock on the hw_server BEFORE the Tcl process exits.
+                # Vivado's hw_server keeps the target OPEN when the client merely exits, so a REOPEN
+                # ("close the pulse GUI, open it again") then finds the target still held and
+                # get_hw_axis comes back empty -> "No JTAG-to-AXI (hw_axi) core found" until the whole
+                # server is rebooted.  A clean close_hw_target + disconnect_hw_server hands the lock
+                # back deterministically; both are catch-wrapped so a wedged session still exits (#5b-B).
+                process.stdin.write("catch {close_hw_target}\ncatch {disconnect_hw_server}\nexit\n")
                 process.stdin.flush()
         except (BrokenPipeError, OSError):
             pass
@@ -254,6 +260,10 @@ class VivadoAxiStreamerSession:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
             process.terminate()
+            try:
+                process.wait(timeout=3)        # let SIGTERM/teardown land...
+            except subprocess.TimeoutExpired:
+                process.kill()                 # ...else force-reap so it can't linger holding the lock
         self._process = None
 
     def _ensure_process(self) -> None:

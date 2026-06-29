@@ -1890,6 +1890,37 @@ def test_final_status_bits_match_host():
         assert v != im.STATUS_ERROR, "a STATUS bit collides with host STATUS_ERROR (bit 3)"
 
 
+def test_close_releases_the_jtag_lock_then_force_reaps_a_hung_process():
+    """#5b-B (debug-core-on-reopen): close() must hand the JTAG / dbg_hub lock back to the hw_server
+    (close_hw_target + disconnect_hw_server) BEFORE the Tcl process exits -- otherwise a REOPEN finds
+    the target still held and get_hw_axis comes back empty ("No JTAG-to-AXI core found").  And a
+    process that ignores `exit` must be force-reaped (terminate -> kill), never left lingering on the
+    lock.  Both invariants are deterministic and host-testable with a fake process."""
+    import io
+    import subprocess as _sp
+    from types import SimpleNamespace
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+    session = VivadoAxiStreamerSession.__new__(VivadoAxiStreamerSession)
+    session._closed = False
+    session._external_executor = None
+    session._stop_stream_thread = lambda join_timeout=2.0: None
+    captured = io.StringIO()
+    calls = {"terminate": 0, "kill": 0}
+    def _wait(timeout=None):
+        raise _sp.TimeoutExpired(cmd="vivado", timeout=timeout)         # a hung process: never exits on its own
+    session._process = SimpleNamespace(
+        stdin=SimpleNamespace(write=captured.write, flush=lambda: None),
+        wait=_wait,
+        terminate=lambda: calls.__setitem__("terminate", calls["terminate"] + 1),
+        kill=lambda: calls.__setitem__("kill", calls["kill"] + 1))
+    session.close()
+    tcl = captured.getvalue()
+    assert "close_hw_target" in tcl and "disconnect_hw_server" in tcl   # lock handed back...
+    assert tcl.rstrip().endswith("exit")                               # ...before exit
+    assert calls["terminate"] == 1 and calls["kill"] == 1              # hung process force-reaped, not left
+    assert session._process is None
+
+
 def test_vivado_axi_session_tolerates_transient_underflow(tmp_path):
     """STATUS_UNDERFLOW (bit 4) is a transient streaming stall, a DISTINCT bit from
     the fatal STATUS_ERROR (bit 3).  wait_done must keep polling and complete on the
