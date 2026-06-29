@@ -668,7 +668,11 @@ def compile_pulse_table_scan_runtime_program(
             coeff_frac_bits=coeff_frac_bits,
             loops=bool(repeat_forever),     # steady-state ramp baseline when the scan frame loops (#ramp-loop)
         )
-        bus_members = [channel for members in state.bus_channels().values() for channel in members]
+        # Exclude from the TTL edge table ONLY the members of ANALOG buses (those bus-engine driven).
+        # A channel in a bus group that is NOT an analog bus is a plain TTL bit and must STAY in the
+        # edge table -- not silently dropped from both TTL and DAC (#phantom-bus).
+        bus_members = [channel for bus, members in state.bus_channels().items()
+                       if bus in state.analog_bus_modes for channel in members]
 
     # PHYSICAL CHANNEL DELAY: a delay is NOT scanned and NOT baked into the edges -- it is a
     # CONSTANT per-channel OUTPUT delay (a delay line; see engine_model.delay_line_reference).
@@ -2120,6 +2124,9 @@ def _pulse_table_edge_table(
         base_intervals[channel] = ivals
     if fold_analog_buses:
         for bus_name, members in bus_groups.items():
+            if bus_name not in state.analog_bus_modes:
+                continue   # only ANALOG buses fold into the masks; a non-analog group's members are
+                           # plain TTL and were already processed above (#phantom-bus)
             bus_delay = _pulse_table_bus_delay_steps(state, members, slots=slots, time_step_ns=time_step_ns)
             plan = state.analog_bus_plan(bus_name)
             # An UNTOUCHED bus (all-hold plan, resting at 0 V) folds NOTHING -- the
@@ -2314,8 +2321,8 @@ def _pulse_table_bus_segments(
     for bus_index, bus_name in enumerate(bus_names):
         members = bus_groups[bus_name]
         plan = state.analog_bus_plan(bus_name)
-        if bus_name not in state.analog_bus_modes and all(state.bus_value(index, bus_name) == 0 for index in range(len(state.periods))):
-            continue
+        if bus_name not in state.analog_bus_modes:
+            continue   # a group not explicitly an analog bus is plain TTL -- never a (phantom) DAC bus (#phantom-bus)
         # A bus delay is NOT baked into the segment ticks (that capped it at one frame).
         # Segments are emitted at their NOMINAL (undelayed) phase; the per-bus delay is
         # returned separately and realised by the engine's per-signal EVENT SCHEDULER (each DA
@@ -2435,12 +2442,11 @@ def _pulse_table_bus_segments(
 
 
 def _pulse_table_has_analog_activity(state: PulseTableState) -> bool:
-    for bus_name in state.bus_channels():
-        if bus_name in state.analog_bus_modes:
-            return True
-        if any(state.bus_value(index, bus_name) != 0 for index in range(len(state.periods))):
-            return True
-    return False
+    # A group is an analog DAC bus IFF it is explicitly in ``analog_bus_modes`` -- the ONE source of
+    # truth.  A nonzero level on a bus-MEMBER channel that the user toggled as a plain TTL bit (its
+    # group never made an analog bus) is NOT analog activity; treating it as such synthesized a
+    # PHANTOM bus that even inherited a scan coefficient and corrupted other channels (#phantom-bus).
+    return any(bus_name in state.analog_bus_modes for bus_name in state.bus_channels())
 
 
 def _pulse_table_has_any_delay(state: PulseTableState) -> bool:

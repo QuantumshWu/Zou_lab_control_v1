@@ -1294,6 +1294,29 @@ def test_looping_ramp_to_a_held_value_compiles_flat_not_a_per_loop_sawtooth():
     assert any(512 < w < 712 for w in single) and max(single) >= 711    # ... and genuinely RAMPS up to +200
 
 
+def test_ttl_toggle_on_a_dac_bus_member_channel_stays_ttl_not_a_phantom_bus():
+    """#phantom-bus: toggling a channel that happens to be a MEMBER of a DAC bus group, while that
+    group was NEVER made an analog bus (no set_analog_bus_mode), must drive it as a plain TTL bit --
+    not synthesize a phantom analog bus from the raw level (which, under a scan, even inherited a scan
+    coefficient and perturbed other channels' timing).  A group is an analog bus IFF it is in
+    analog_bus_modes -- the ONE source of truth."""
+    from Zou_lab_control.neutral_atom.devices.sequencer import (
+        _pulse_table_bus_segments, _pulse_table_has_analog_activity)
+    ch = [f"da[{i}]" for i in range(10)] + ["t"]
+    mask_on = tuple(1 if i == 9 else 0 for i in range(11))             # da[9] ON: a plain TTL toggle
+    state = na.PulseTableState(
+        channels=ch, visible_channels=ch,
+        periods=[na.PulsePeriod(1000, mask_on, unit="ns"), na.PulsePeriod(1000, tuple([0] * 11), unit="ns")],
+        channel_labels={f"da[{i}]": f"da[{i}]" for i in range(10)},
+        time_step_ns=20.0, name="phantom_bus")
+    # NO set_analog_bus_mode -> the "da" group is NOT an analog bus.
+    assert _pulse_table_has_analog_activity(state) is False            # a raw TTL toggle is not analog activity
+    _, segs, _ = _pulse_table_bus_segments(state, time_step_ns=20.0)
+    assert segs == [], "a non-analog group must NOT synthesize (phantom) DAC bus segments"
+    # da[9] is still DRIVEN -- as a TTL channel in the compiled program (not dropped from both TTL and DAC)
+    assert "da[9]" in state.compile(clock_hz=50_000_000).channels
+
+
 def test_clk_channel_excluded_from_engine_and_carried_as_mask(tmp_path):
     """A channel marked clk is wired to the FPGA clk by the top: it is removed from the
     edge masks, ships as a clk_enable bitmask, survives save/load, and round-trips through
