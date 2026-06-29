@@ -41,7 +41,9 @@ def _render_threshold_hist(path: Path) -> Path:
 
         from Zou_lab_control import neutral_atom as na
 
-        exp = na.connect("virtual")
+        # Fixed seed so the manual's figure is REPRODUCIBLE -- a doc rebuild must not churn the
+        # committed PNG with a fresh random load pattern (the figure is illustrative, not a result).
+        exp = na.connect("virtual", seed=0)
         exp.readout.sitemap(frames=6, display=False)
         threshold_result = exp.readout.thresholds(frames=120, site=0, display=False)
         plot = threshold_result.plot_site(0, display=False)
