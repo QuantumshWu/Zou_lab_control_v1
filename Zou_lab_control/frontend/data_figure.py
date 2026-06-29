@@ -39,6 +39,25 @@ def _as_2d_y(data_y) -> np.ndarray:
     return y
 
 
+def resolve_save_base(path, stem: str) -> Path:
+    """Turn a save ``path`` + ``stem`` into the extension-less base path, and mkdir its parent --
+    the ONE place a figure+npz pair's location is resolved (DataFigure.save and the grid save both
+    call it).  Empty / ``"."`` -> the bare ``stem``; a directory or trailing-separator path -> the
+    stem inside it; a path that already has a suffix -> that path sans suffix; anything else ->
+    ``<path>_<stem>`` (#C4)."""
+    p = Path(path)
+    if str(p) in ("", "."):
+        base = Path(stem)
+    elif str(p).endswith(("/", "\\")) or p.is_dir():
+        base = p / stem
+    elif p.suffix:
+        base = p.with_suffix("")
+    else:
+        base = Path(f"{p}_{stem}")
+    base.parent.mkdir(parents=True, exist_ok=True)
+    return base
+
+
 class DataFigure:
     """Data and post-processing handle for a front-end figure.
 
@@ -166,17 +185,7 @@ class DataFigure:
         """Save the figure image and a matching ``.npz`` payload."""
         current_time = time.strftime("%Y_%m_%d_%H_%M_%S", time.localtime())
         stem = "_".join(p for p in (self.name, current_time) if p)
-        path = Path(path)
-        if str(path) in ("", "."):
-            base = Path(stem)
-        elif str(path).endswith(("/", "\\")) or path.is_dir():
-            base = path / stem
-        elif path.suffix:
-            base = path.with_suffix("")
-        else:
-            base = Path(f"{path}_{stem}")
-        base.parent.mkdir(parents=True, exist_ok=True)
-
+        base = resolve_save_base(path, stem)
         image_path = base.with_suffix(f".{image_ext}")
         data_path = base.with_suffix(".npz")
         info = {

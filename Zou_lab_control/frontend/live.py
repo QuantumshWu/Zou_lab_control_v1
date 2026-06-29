@@ -2227,7 +2227,7 @@ class PlotKind:
                    (the first is the default).  A TRACE/IMAGE reduces its repeats
                    (``average``/``add``/``replace``/``roll``, plus ``create`` = one line per repeat
                    for 1-D); a DISTRIBUTION instead chooses how to BIN the repeats' samples
-                   (``pool`` = all repeats in one histogram, ``latest`` = only the newest repeat).
+                   (``pool`` = all repeats in one histogram -- the only distribution mode).
                    Empty = a non-repeat kind (no repeat_mode control).  This is what stops a
                    trace verb like ``roll`` being offered on a histogram (where it is meaningless)
                    and stops a histogram silently ignoring the control (#issue-1).
@@ -2580,19 +2580,8 @@ class _GridData:
         :meth:`DataFigure.save` so the SAME call works on a grid or a single plot (else a
         ``grid.save(path, extra_info=...)`` would crash by forwarding those into ``savefig``)."""
         import time
-        from pathlib import Path
-        current_time = time.strftime("%Y_%m_%d_%H_%M_%S", time.localtime())
-        stem = current_time
-        p = Path(path)
-        if str(p) in ("", "."):
-            base = Path(stem)
-        elif p.is_dir() or str(p).endswith(("/", "\\")):
-            base = p / stem
-        elif p.suffix:
-            base = p.with_suffix("")
-        else:
-            base = Path(f"{p}_{stem}")
-        base.parent.mkdir(parents=True, exist_ok=True)
+        from .data_figure import resolve_save_base
+        base = resolve_save_base(path, time.strftime("%Y_%m_%d_%H_%M_%S", time.localtime()))   # shared path stem (#C4)
         image_path = base.with_suffix(image_ext if str(image_ext).startswith(".") else f".{image_ext}")
         data_path = base.with_suffix(".npz")
         self.fig.savefig(image_path, **kwargs)

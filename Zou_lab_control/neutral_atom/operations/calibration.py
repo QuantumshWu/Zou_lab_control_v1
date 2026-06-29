@@ -32,6 +32,12 @@ from ..views.plots import plot_image, plot_threshold_hist
 
 SUPPORTED_THRESHOLD_METHODS = ("otsu", "bimodal")
 
+#: The readout methods a one-shot calibration computes so the OccupancyProcessor can pick any
+#: later (box square-ROI, per-site PSF, one-shared-kernel PSF).  Single source -- the cali, the
+#: calibration's ``by_method`` and the processor choice derive from this, never a retyped literal.
+#: Defined ABOVE the first function so the sitemap builder validates ``method`` against it (#F5).
+ALL_READOUT_METHODS = ("box", "psf", "uniform_psf")
+
 
 def calibrate_sitemap_from_images(
     images,
@@ -54,7 +60,7 @@ def calibrate_sitemap_from_images(
         raise ValueError("all sitemap frames must have the same shape.")
     grid_shape = grid_shape_tuple(grid_shape)
     method = str(method).lower()
-    if method not in ("box", "psf", "uniform_psf"):
+    if method not in ALL_READOUT_METHODS:
         raise ValueError("method must be 'box', 'psf' (per-site) or 'uniform_psf' (one shared kernel).")
     average = np.mean(np.stack(stack, axis=0), axis=0)
     centers = find_site_centers(average, grid_shape, ordering=ordering)
@@ -157,12 +163,6 @@ def calibrate_threshold_from_images(
     )
     return ThresholdResult(updated, counts, thresholds, site, plot=plot, fidelity=fidelity)
 
-
-#: The readout methods a one-shot calibration computes so the OccupancyProcessor can
-#: pick any of them later (box square-ROI, per-site PSF, one-shared-kernel PSF).  Single
-#: source -- the cali, the calibration's ``by_method`` and the processor choice derive
-#: from this, never a retyped literal.
-ALL_READOUT_METHODS = ("box", "psf", "uniform_psf")
 
 
 def calibrate_all_methods_from_images(

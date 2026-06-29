@@ -153,8 +153,8 @@ def _by_method_report(calibration, readout_frames) -> dict:
         try:
             counts = per_site_counts(calibration, readout_frames, method=m)
             thr = np.asarray(calibration.thresholds_for(m), dtype=float).reshape(-1)
-        except Exception:
-            continue
+        except ValueError:           # a method this cali can't extract -> skip it; a real
+            continue                 # contract drift (AttributeError/KeyError) now surfaces (#F4)
         fid = (per_site_fidelity(counts, thr) if counts.size
                else np.full(len(np.asarray(calibration.centers)), np.nan))
         out[str(m)] = {"counts": counts, "thresholds": thr, "fidelity": fid}
@@ -210,8 +210,8 @@ def _held_out_by_method(calibration, reference_groups, readout_by_group) -> dict
                                       dtype=float).reshape(-1) for f in readout_by_group])
         try:
             report = characterize_readout(short, reference)
-        except Exception:
-            continue
+        except ValueError:           # this method's held-out characterization can't be scored ->
+            continue                 # skip; a real contract drift surfaces instead of vanishing (#F4)
         # The HEADLINE per-site fidelity is the trained two-Gaussian MODEL fidelity (the smooth
         # overlap integral of the dark/bright populations about the trained threshold) -- it
         # matches the plotted count distribution: overlapping populations give < 1, well-
@@ -297,8 +297,8 @@ def write_calibration_report(folder, *, calibration, readout_frames, template=No
     try:
         calibration.save(cal_path)
         paths["calibration"] = str(cal_path)
-    except Exception:
-        pass
+    except OSError:                   # disk/permission only -> report still returns; a save-API
+        pass                          # contract drift (Attribute/Type/Value) surfaces (#F4)
 
     # PER-METHOD fidelity in the summary (box / per-site PSF / uniform PSF), so the experimenter
     # can compare the readout models offline -- not just the single box aggregate.  The headline

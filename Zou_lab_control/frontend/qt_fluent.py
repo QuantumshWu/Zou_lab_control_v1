@@ -2552,24 +2552,29 @@ class FluentScanDot(QtWidgets.QAbstractButton):
         painter.end()
 
 
+def _bound_field_style(*, selector: str, text: str, border: str, fill: str | None = None) -> str:
+    """The ONE stylesheet recipe for a scan/api BOUND field: a coloured border + text (+ optional
+    background ``fill``) with the shared radius / padding / font.  ``selector`` differs (a scan mark
+    also covers combos, an api mark only the line edit); ``fill`` is ``None`` for the api border-only
+    look.  Qt ignores CSS whitespace, so this single canonical form renders identically to the
+    previously hand-written orange (multi-line) / api (inline) stylesheets (#D1)."""
+    bg = f"background: {fill}; " if fill else ""
+    return (
+        f"{selector} {{ {bg}color: {text}; border: 1px solid {border}; "
+        f"border-radius: {_radius()}px; "
+        f"padding: {scaled_px(PADDING_V)}px {scaled_px(EDIT_PADDING_H)}px; "
+        f'font: {fluent_font_size()}pt "{FONT}"; }}'
+    )
+
+
 def mark_scan_field(widget: QtWidgets.QWidget, *, bound: bool) -> None:
     """Apply (or clear) the orange disabled look on a field bound to a scan slot."""
 
     widget.setProperty("zlcScanBound", bool(bound))
     widget.setEnabled(not bound)
     if bound:
-        widget.setStyleSheet(
-            f"""
-            QLineEdit, QComboBox {{
-                background: {ORANGE_TINT};
-                color: {ORANGE_DARK};
-                border: 1px solid {ORANGE};
-                border-radius: {_radius()}px;
-                padding: {scaled_px(PADDING_V)}px {scaled_px(EDIT_PADDING_H)}px;
-                font: {fluent_font_size()}pt "{FONT}";
-            }}
-            """
-        )
+        widget.setStyleSheet(_bound_field_style(
+            selector="QLineEdit, QComboBox", text=ORANGE_DARK, border=ORANGE, fill=ORANGE_TINT))
     else:
         widget.setStyleSheet("")
 
@@ -2648,18 +2653,8 @@ class FluentScanLineEdit(FluentLineEdit):
         self._dot.set_number(number if self._bound else None)
         self.setReadOnly(self._bound)
         if self._bound:
-            self.setStyleSheet(
-                f"""
-                QLineEdit {{
-                    background: {ORANGE_TINT};
-                    color: {ORANGE_DARK};
-                    border: 1px solid {ORANGE};
-                    border-radius: {_radius()}px;
-                    padding: {scaled_px(PADDING_V)}px {scaled_px(EDIT_PADDING_H)}px;
-                    font: {fluent_font_size()}pt "{FONT}";
-                }}
-                """
-            )
+            self.setStyleSheet(_bound_field_style(
+                selector="QLineEdit", text=ORANGE_DARK, border=ORANGE, fill=ORANGE_TINT))
         else:
             self.setStyleSheet(self._base_style)
         self._reserve_right()
@@ -2684,12 +2679,8 @@ class FluentScanLineEdit(FluentLineEdit):
         self._dot.set_api(bound)
         self._dot.set_number(number if bound else None)
         if bound:
-            self.setStyleSheet(
-                f'QLineEdit {{ border: 1px solid {API_VIOLET}; color: {API_VIOLET_DARK}; '
-                f'border-radius: {_radius()}px; '
-                f'padding: {scaled_px(PADDING_V)}px {scaled_px(EDIT_PADDING_H)}px; '
-                f'font: {fluent_font_size()}pt "{FONT}"; }}'
-            )
+            self.setStyleSheet(_bound_field_style(
+                selector="QLineEdit", text=API_VIOLET_DARK, border=API_VIOLET, fill=None))
         elif not getattr(self, "_bound", False):
             self.setStyleSheet(self._base_style)
         self._reserve_right()
