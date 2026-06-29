@@ -233,7 +233,7 @@ def test_two_permanent_tabs_monitor_and_logic():
 def test_add_logic_node_is_stopped_and_publishes_nothing_until_start():
     """Adding a camera Measurement creates a STOPPED Logic node -- no node is
     built, nothing is on the hub.  Start builds + runs it (display suppressed: it
-    only publishes ``frame``, it never opens a plot)."""
+    only publishes ``frame_0``, it never opens a plot)."""
     exp = _calibrated_virtual_session()
     console = _console(exp)
     try:
@@ -245,7 +245,7 @@ def test_add_logic_node_is_stopped_and_publishes_nothing_until_start():
         row = console.logic_nodes[0]
         assert console._logic_nodes[id(row)] is None
         assert not console.running_nodes          # no node running yet
-        assert "frame" not in console.hub.names()
+        assert "frame_0" not in console.hub.names()
         assert row.node.kind == "camera"
 
         # Start -> builds a CameraMeasurement, registers it, runs it (publish-only)
@@ -254,9 +254,9 @@ def test_add_logic_node_is_stopped_and_publishes_nothing_until_start():
         node = console._logic_nodes[id(row)]
         assert isinstance(node, CameraMeasurement) and node in console.running_nodes
         deadline = time.monotonic() + 8.0
-        while "frame" not in console.hub.names() and time.monotonic() < deadline:
+        while "frame_0" not in console.hub.names() and time.monotonic() < deadline:
             time.sleep(0.03)
-        assert "frame" in console.hub.names()     # it publishes to the hub
+        assert "frame_0" in console.hub.names()     # it publishes to the hub
         # display suppressed: starting a measurement created NO plot panel
         assert console.cards == []
 
@@ -308,13 +308,13 @@ def test_remove_logic_node_stops_it_and_freezes_its_signal():
         fire_live_imaging(exp)                     # On Pulse: the trigger-driven camera streams
         node = console._logic_nodes[id(row)]
         deadline = time.monotonic() + 8.0
-        while "frame" not in console.hub.names() and time.monotonic() < deadline:
+        while "frame_0" not in console.hub.names() and time.monotonic() < deadline:
             time.sleep(0.03)
-        assert "frame" in console.hub.names()
+        assert "frame_0" in console.hub.names()
         # it IS advancing while running
-        v0 = console.hub.signal_versions().get("frame", 0)
+        v0 = console.hub.signal_versions().get("frame_0", 0)
         time.sleep(0.4)
-        assert console.hub.signal_versions().get("frame", 0) > v0
+        assert console.hub.signal_versions().get("frame_0", 0) > v0
 
         # Remove the node's row -> stop + drop everywhere
         console._remove_logic_node(row)
@@ -324,9 +324,9 @@ def test_remove_logic_node_stops_it_and_freezes_its_signal():
         assert id(row) not in console._logic_nodes
 
         # and its signal no longer advances (nothing is publishing it anymore)
-        v1 = console.hub.signal_versions().get("frame", 0)
+        v1 = console.hub.signal_versions().get("frame_0", 0)
         time.sleep(0.4)
-        assert console.hub.signal_versions().get("frame", 0) == v1
+        assert console.hub.signal_versions().get("frame_0", 0) == v1
     finally:
         console.shutdown()
         exp.close()
@@ -345,18 +345,18 @@ def test_add_plot_is_blank_until_signal_set_and_node_started():
         console.refresh_once()
         assert card.plotter is None               # blank: shows nothing
 
-        # start a camera logic node so `frame` becomes available
+        # start a camera logic node so `frame_0` becomes available
         _pick(console, ("camera", "live"))
         row = console.logic_nodes[-1]
         console._start_logic_node(row)
         fire_live_imaging(exp)                     # On Pulse: the trigger-driven camera streams
         deadline = time.monotonic() + 8.0
-        while "frame" not in console.hub.names() and time.monotonic() < deadline:
+        while "frame_0" not in console.hub.names() and time.monotonic() < deadline:
             time.sleep(0.03)
 
         # now wire the plot to that signal -> it shows data
-        card.config.source = "value = frame"
-        card._compiled_source = "value = frame"
+        card.config.source = "value = frame_0"
+        card._compiled_source = "value = frame_0"
         console.refresh_once()
         assert card.plotter is not None
         assert np.asarray(card.plotter.data_y).size > 0
