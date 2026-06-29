@@ -200,6 +200,19 @@ class RuntimeSequenceProgram:
     # onto their pins via this mask.  0 = no clk channels.
     clk_enable: int = 0
 
+    def __post_init__(self) -> None:
+        # A finite K-sweep streamed scan (scan_repeats>0) needs >= 2 scan points: the host counts whole
+        # sweeps from the streamed cursor's WRAP, which a single point never produces -- it would never
+        # stop on real hardware.  Enforced HERE, on the COMPILED program, because EVERY fire path (real
+        # and virtual both compile to a RuntimeSequenceProgram) passes through it and it is NEVER built
+        # during GUI mid-edit (the editor holds a PulseTableState, not this) -- so the rule cannot be
+        # bypassed and virtual == real, without a transient 1-row edit ever raising (#G3).
+        if int(self.scan_repeats) > 0 and self.scan_points is not None and len(self.scan_points) < 2:
+            raise ValueError(
+                "a finite scan-repeat (scan_repeats > 0) needs at least 2 scan points: the host counts "
+                "whole sweeps from the streamed cursor's wrap, which a single point never produces (it "
+                "would never stop). Add scan points, or use scan_repeats=0 for a seamless cyclic scan.")
+
     def to_dict(self) -> dict[str, object]:
         payload = {
             "schema": "Zou_lab_control.neutral_atom.RuntimeSequenceProgram",

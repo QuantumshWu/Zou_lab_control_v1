@@ -605,3 +605,23 @@ def test_swept_block_ring_contract_is_one_base_class():
                  "finished", "n_points", "step", "run_to_completion"):
         assert name not in ScannedMeasurementNode.__dict__, f"{name} re-typed in ScannedMeasurementNode"
         assert name not in PulseScanNode.__dict__, f"{name} re-typed in PulseScanNode"
+
+
+def test_finite_scan_repeat_needs_two_points_on_the_compiled_program():
+    """review-G3: the 'scan_repeats>0 needs >=2 scan points' invariant is enforced on the COMPILED
+    RuntimeSequenceProgram -- the SINGLE chokepoint EVERY fire path passes through (real AND virtual
+    both compile a PulseTableState to a RuntimeSequenceProgram), so neither backend can stream a
+    finite K-sweep with a single point (the host counts sweeps from the cursor wrap, which one point
+    never produces -> it would never stop).  Deliberately NOT on PulseTableState.validate (eager: it
+    runs on every mutation, so it would raise on a legitimate GUI mid-edit that sets scan_repeats
+    before the operator has added the scan points) -- the compiled program is only built at fire
+    time, never during editing."""
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
+    base = dict(sequence_id="s", sequence_name="n", clock_hz=5e7, channels=["a"], ticks=[0],
+                masks=[1], duration=1e-6, trigger_count=1)
+    with pytest.raises(ValueError, match="at least 2 scan points"):
+        RuntimeSequenceProgram(**base, scan_points=[[0]], scan_repeats=3)   # 1-point finite K-sweep
+    # the legitimate shapes the guard must NOT reject:
+    RuntimeSequenceProgram(**base, scan_points=[[0], [1]], scan_repeats=3)  # 2-point finite K-sweep
+    RuntimeSequenceProgram(**base, scan_points=[[0]], scan_repeats=0)       # 1-point seamless (cyclic)
+    RuntimeSequenceProgram(**base)                                          # a plain non-scan program
