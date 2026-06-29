@@ -54,6 +54,20 @@ def test_default_is_single_event_frame_0_only():
     assert set(cam_node.published_signals()) == {"frame_0"}      # one event -> just frame_0; no lumped frame
 
 
+def test_camera_frame_keys_is_the_single_source_for_published_and_declared_names():
+    """The console's declared-signal picker (a not-yet-started camera row) and the running camera's
+    ``published_signals`` must offer the EXACT same ``frame_i`` set -- so a 'waiting' name in the picker
+    is always a name the camera will really emit (the #2 phantom 'frame' bug was a second, drifted
+    source).  Both go through ``camera_frame_keys``; pin that they agree for every frames_per_cycle."""
+    from Zou_lab_control.neutral_atom.operations.logic import camera_frame_keys
+    exp = na.connect("virtual", sitemap={"grid_shape": (3, 4), "image_shape": (40, 50)})
+    for n in (1, 2, 3):
+        cam = CameraMeasurement(SignalHub(), exp.camera, frames_per_cycle=n)
+        assert set(camera_frame_keys(n)) == set(cam.published_signals())     # helper == live publish
+        assert "frame" not in camera_frame_keys(n)                            # never the lumped residue
+        assert camera_frame_keys(n) == [f"frame_{i}" for i in range(n)]       # ordered, frame_0..frame_{n-1}
+
+
 def test_readout_image_frame_judged_is_synced_with_occupancy():
     """#5: a 2D 'readout image' reads the occupancy processor's ``frame_judged``, which is
     co-published ATOMICALLY with ``occupied`` (one transform dict) -- so the image and the

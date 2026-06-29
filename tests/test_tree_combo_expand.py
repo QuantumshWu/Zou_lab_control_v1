@@ -68,20 +68,20 @@ def test_popup_height_grows_to_fit_then_clamps_and_scrolls(monkeypatch):
     c.hidePopup()
 
 
-def test_pick_updates_the_collapsed_display_immediately():
-    """#1: clicking a leaf must update the box's COLLAPSED display text RIGHT AWAY (the producer-
-    qualified label), not only after the Setting popup is closed and reopened.  Guards the widget
-    contract behind the repaint() fix -- _on_tree_clicked sets _display, and _display_text() (what the
-    collapsed box paints) returns it immediately."""
+def test_pick_updates_the_collapsed_display_immediately_and_on_switch():
+    """#1: picking a leaf updates the box's COLLAPSED text RIGHT AWAY to the producer-qualified label
+    (not the raw verbose leaf text), AND switching to ANOTHER leaf updates it LIVE -- no close+reopen.
+    Guards the live-derive design: _display_text() reads the CURRENT selection's full label from the
+    populate-time map (no cached _display that goes stale)."""
     from PyQt5 import QtCore, QtWidgets
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    c = _combo()                                       # groups: producers with leaves (see _combo helper)
-    before = c._display_text()
-    # click the FIRST leaf of the SECOND producer group (index depends on the helper's groups)
-    parent = c._model.item(c._model.rowCount() - 1)    # last producer group
-    leaf = parent.child(0)
-    c._on_tree_clicked(leaf.index())
-    picked_full = str(leaf.data(QtCore.Qt.UserRole + 1))
-    assert c._display_text() == picked_full            # collapsed box shows the pick NOW
-    assert c._display_text() != before
-    assert c.current_signal() == str(leaf.data(QtCore.Qt.UserRole))   # and the bound value matches
+    c = _combo()                                       # producers: occupancy{rate,occupied}, temperature{t_off}
+    occ = c._model.item(1)                             # row 0 = (none); row 1 = occupancy group
+    rate, occupied = occ.child(0), occ.child(1)
+    c._on_tree_clicked(rate.index())
+    assert c._display_text() == "occupancy · rate"     # producer-qualified, NOT "rate  (35,)" raw text
+    assert c.current_signal() == "rate"
+    # SWITCH to a different leaf -> the collapsed text tracks it LIVE (the bug: stuck on the first pick)
+    c._on_tree_clicked(occupied.index())
+    assert c._display_text() == "occupancy · occupied"
+    assert c.current_signal() == "occupied"

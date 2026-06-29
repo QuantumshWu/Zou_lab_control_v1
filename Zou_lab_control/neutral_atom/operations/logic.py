@@ -4,18 +4,18 @@ A logic node is the upstream half of the task-console contract (the console is t
 consumer).  There are three KINDs, all sharing the :class:`LogicNode` loop:
 
 * :class:`Measurement` -- drives a device acquisition loop and publishes named
-  signals (e.g. a camera :class:`CameraMeasurement` publishing ``frame``, or a swept
-  :class:`ScannedMeasurementNode`);
+  signals (e.g. a camera :class:`CameraMeasurement` publishing one ``frame_i`` per
+  emCCD event, or a swept :class:`ScannedMeasurementNode`);
 * :class:`Processor` -- a reactive TRANSFORM node with no acquisition of its own
   (the "func" layer): it consumes hub signals and republishes derived ones, e.g.
   :class:`OccupancyProcessor` running the SAME ``calibration.detect`` contract the
-  real readout uses, frame -> occupancy/counts/rate;
+  real readout uses, frame_0 -> occupancy/counts/rate;
 * :class:`Task` -- a one-shot orchestration (e.g. :class:`CalibrateReadoutTask`,
   which produces a ``TrapCalibration`` + an npz artifact and streams its template
   frames to a mid-run output panel).
 
 The loading readout is COMPOSED by the user from these primitives -- a camera
-Measurement publishing ``frame`` + an OccupancyProcessor turning ``frame`` into
+Measurement publishing ``frame_0`` + an OccupancyProcessor turning ``frame_0`` into
 occupancy/counts/rate, with calibration produced by a CalibrateReadoutTask.  No
 monolithic node fabricates every signal: each layer is independent and explicitly
 wired by the notebook or task console.  Every logic node touches only the camera
@@ -1301,6 +1301,15 @@ class CalibrateReadoutTask(Task):
         return calibration
 
 
+def camera_frame_keys(frames_per_cycle, prefix=""):
+    """The SINGLE source of a camera's published signal names: ONE ``frame_i`` per emCCD event,
+    ``frame_0 .. frame_{N-1}`` (NO lumped ``frame``).  Used by BOTH ``CameraMeasurement.published_signals``
+    (live, with the node prefix) and the console's declared-signal picker (bare, before the node starts) so
+    the two can never drift -- a declared 'waiting' name always equals what the running camera will emit."""
+    n = max(1, int(frames_per_cycle or 1))
+    return [f"{prefix}frame_{i}" for i in range(n)]
+
+
 class CameraMeasurement(Measurement):
     """Stream RAW camera frames into the hub, no site analysis.  The data SOURCE is
     the camera itself, so the editable acquisition parameters ARE the camera's own
@@ -1309,8 +1318,8 @@ class CameraMeasurement(Measurement):
 
     MULTI-TRIGGER per cycle (``frames_per_cycle``).  One ``shot()`` reads
     ``frames_per_cycle`` frames -- ONE per camera (emCCD) trigger in the running
-    pulse -- and publishes each as its own signal ``frame_0``, ``frame_1``, ... (the
-    first is also published as ``frame`` for back-compat / the default 2D panel).  A
+    pulse -- and publishes each as its own signal ``frame_0``, ``frame_1``, ... and
+    NOTHING else (no lumped ``frame``; the default 2D panel binds ``frame_0``).  A
     pulse that triggers the camera TWICE (e.g. a release-recapture / two-readout "T"
     sequence) must set ``frames_per_cycle=2``; otherwise ``acquire(1)`` reads only
     the FIRST trigger's frame each cycle and the second is dropped -- which is why a
@@ -1406,8 +1415,8 @@ class CameraMeasurement(Measurement):
         return self._assert_primary_shape(out)           # frame_0 == (repeat, 1, H, W) -- contract guard
 
     def published_signals(self) -> frozenset:
-        n = max(1, int(self.frames_per_cycle))
-        return frozenset(self.prefix + f"frame_{i}" for i in range(n))   # ONE block per emCCD event; no lumped `frame`
+        # ONE block per emCCD event; no lumped `frame`.  Same source as the console's declared picker.
+        return frozenset(camera_frame_keys(self.frames_per_cycle, self.prefix))
 
     def output_specs(self) -> tuple[SignalSpec, ...]:
         """Camera outputs: ONE ``frame_i`` per emCCD event of the cycle, each a ``(repeat, 1, H, W)``
@@ -1666,7 +1675,7 @@ class PulseScanNode(Measurement):
     ``value = ...`` expression.
 
     Because the device lockout allows only ONE device driver, pulse-scan owns the streamer +
-    camera and publishes ``frame`` itself; the reactive processors it subscribes to keep running
+    camera and publishes the per-event ``frame_i`` itself; the reactive processors it subscribes to keep running
     (processors are not device-driving), so the user starts the producer FIRST, then pulse-scan.
 
     Settling y to THIS point's frame (the riskiest part) is race-free:

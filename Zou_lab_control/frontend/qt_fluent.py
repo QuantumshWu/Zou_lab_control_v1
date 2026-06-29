@@ -1362,7 +1362,11 @@ class FluentTreeComboBox(FluentComboBox):
         self.setModel(self._model)
         self.setView(tree)
         self._configure_popup_container()
-        self._display = ""                       # the producer-qualified label painted when collapsed
+        # {bare signal name -> producer-qualified label}, built when the tree is populated.  The collapsed
+        # box derives its text LIVE from this + the CURRENT selection (see _display_text) -- there is NO
+        # cached "_display" to go stale: a pick via the native view click, _on_tree_clicked, OR a
+        # programmatic set_signal_tree all change currentData, so the box always tracks the real pick (#1).
+        self._full_by_bare: dict[str, str] = {}
         # selecting a leaf in the tree drives the combo's current item + emits signalPicked
         tree.clicked.connect(self._on_tree_clicked)
         # When a parent expands/collapses, RE-GROW the open popup so the children are fully visible
@@ -1451,7 +1455,12 @@ class FluentTreeComboBox(FluentComboBox):
         container.setFixedHeight(max(scaled_px(40), desired))      # ...and the container to match
 
     def _display_text(self) -> str:
-        return self._display or self.currentText()
+        """The collapsed text = the producer-qualified label of the CURRENT pick, derived LIVE from the
+        selection (no cached field): look the current bare signal up in the populate-time map.  So the
+        box tracks EVERY selection change -- native view click, _on_tree_clicked, or set_signal_tree --
+        and never shows the raw verbose leaf text (#1)."""
+        full = self._full_by_bare.get(self.current_signal(), "")
+        return full or self.currentText()
 
     def _on_tree_clicked(self, index) -> None:
         item = self._model.itemFromIndex(index)
@@ -1463,12 +1472,11 @@ class FluentTreeComboBox(FluentComboBox):
         self.setRootModelIndex(parent.index())
         self.setCurrentIndex(item.row())
         self.setRootModelIndex(QtCore.QModelIndex())
-        self._display = str(item.data(QtCore.Qt.UserRole + 1) or item.text().strip())
         self.hidePopup()
         # repaint() NOT update(): the box lives inside the Setting Qt.Popup, and closing the tree's own
         # child popup (hidePopup) leaves the SCHEDULED async repaint of update() unprocessed -- so the box
         # showed the STALE pick until the whole Setting was closed + reopened (#1).  repaint() forces the
-        # new ``_display`` to paint NOW.
+        # (live-derived) producer-qualified label to paint NOW.
         self.repaint()
         # Emit BOTH the explicit signalPicked AND the standard ``activated`` so any existing
         # ``combo.activated.connect(...)`` wiring fires (setCurrentIndex alone does not emit it).
@@ -1481,7 +1489,7 @@ class FluentTreeComboBox(FluentComboBox):
         ``none_label`` adds a leading selectable empty row."""
         self._model.clear()
         sel_parent_row = sel_child_row = None
-        self._display = ""
+        self._full_by_bare = {}                  # {bare -> producer-qualified label} for live _display_text
         base = 0
         if none_label is not None:
             none_item = QtGui.QStandardItem(str(none_label))
@@ -1500,10 +1508,10 @@ class FluentTreeComboBox(FluentComboBox):
                 child.setData(str(bare), QtCore.Qt.UserRole)
                 child.setData(str(full_label), QtCore.Qt.UserRole + 1)
                 child.setEditable(False)
+                self._full_by_bare[str(bare)] = str(full_label)   # for the live collapsed-box label
                 if current and str(bare) == str(current):
                     # the parent's FINAL model row is base+gi (parent.row() is -1 until appended)
                     sel_parent_row, sel_child_row = base + gi, ci
-                    self._display = str(full_label)
                 parent.appendRow(child)
             self._model.appendRow(parent)
         view = self.view()
@@ -1517,8 +1525,8 @@ class FluentTreeComboBox(FluentComboBox):
         elif none_label is not None:
             self.setCurrentIndex(0)
         # repaint() not update(): a rebuild while the Setting is open (a refresh after a pick) must show
-        # the producer-qualified ``_display`` IMMEDIATELY, not on a deferred async paint that the Qt.Popup
-        # may not flush until it is closed + reopened (#1).  (A no-op on a not-yet-shown combo.)
+        # the producer-qualified label IMMEDIATELY, not on a deferred async paint that the Qt.Popup may
+        # not flush until it is closed + reopened (#1).  (A no-op on a not-yet-shown combo.)
         self.repaint()
 
     def current_signal(self) -> str:

@@ -5170,14 +5170,18 @@ class TaskConsole(QtWidgets.QWidget):
         single source for both the row's "publishes:" legend AND the signal picker's
         declared-but-not-yet-published entries (so a Monitor can be wired to a node's output
         before that node is started).  A processor publishes its ``result_keys``; a camera
-        publishes ``frame``; a measurement publishes its ``x_key``/``y_key`` curve; a task
-        streams a mid-run key."""
+        publishes one ``frame_i`` PER emCCD event (``frames_per_cycle``); a measurement publishes its
+        ``x_key``/``y_key`` curve; a task streams a mid-run key."""
         spec = self._spec_for_logic(row.node)
         keys = list(getattr(spec, "result_keys", ()) or [])
         if not keys and row.node.kind == "measurement":
             keys = [k for k in (getattr(spec, "x_key", ""), getattr(spec, "y_key", "")) if k]
         if not keys and row.node.kind == "camera":
-            keys = ["frame"]
+            # ONE frame_i per emCCD event -- the SAME names CameraMeasurement.published_signals() will
+            # publish once started (shared helper so they can NEVER drift; NOT the lumped "frame" the old
+            # design had, which left a phantom "frame waiting" while the camera emits frame_0/1/2, #residue).
+            from Zou_lab_control.neutral_atom.operations.logic import camera_frame_keys
+            keys = camera_frame_keys(row.node.values.get("frames_per_cycle", 1))
         if not keys and row.node.kind == "task":          # off-hub one-shot, mid-run stream
             keys = [f"{getattr(spec, 'mid_run_key', 'frame')} (mid-run)"]
         return keys
@@ -5254,7 +5258,7 @@ class TaskConsole(QtWidgets.QWidget):
         recomputes only when the sources / nodes / published names change."""
         providers = self._signal_providers()
         sig = (tuple(sorted((k, len(v)) for k, v in providers.items())),
-               tuple((id(c), c.config.source) for c in self.cards))
+               tuple((id(c), c.config.source, tuple(c.config.inputs or ())) for c in self.cards))
         if sig == getattr(self, "_signal_info_sig", None):
             return
         self._signal_info_sig = sig

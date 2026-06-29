@@ -222,3 +222,54 @@ def test_logic_tab_shows_short_signal_names():
     assert names == ["occupied", "rate"]                       # short + sorted, no prefix
     assert all("judge_occupancy_" not in n for n in names)
     assert dict((r[0], r[2]) for r in rows)["rate"] == "cumulative loading"   # desc still resolves
+
+
+def _live_console():
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    exp = na.connect("virtual", sitemap={"grid_shape": (3, 4)})
+    exp.readout.sitemap(method="box", frames=4, display=False); exp.readout.thresholds(frames=20, display=False)
+    con = TaskConsole(hub=SignalHub(), state=default_console_state(), session=exp,
+                      measurements=exp.readout.measurement_specs(), processors=exp.readout.processor_specs(),
+                      tasks=exp.readout.task_specs(), window_px=(1100, 700))
+    con._timer.stop()
+    return exp, con
+
+
+def test_declared_camera_offers_frame_i_not_a_phantom_bare_frame():
+    """#2 residue: a DECLARED (not-started) camera row offers ``frame_0`` -- the SAME per-emCCD-event
+    name it will publish -- NOT the old lumped ``frame``, which left a phantom 'frame waiting' in every
+    signal picker while the running camera actually publishes frame_0/1/2."""
+    exp, con = _live_console()
+    try:
+        kc = con.kind_combo
+        i = next(j for j in range(kc.count()) if isinstance(kc.itemData(j), tuple) and kc.itemData(j)[0] == "camera")
+        kc.setCurrentIndex(i); con._add_panel()
+        names = con._signal_names()
+        assert "frame" not in names                    # the phantom is gone
+        assert "frame_0" in names                       # the real per-event name is declared instead
+    finally:
+        con.shutdown(); exp.close()
+
+
+def test_frame_title_updates_live_when_the_picked_signal_changes():
+    """#3: the panel's frame-title legend ("<signal> <- <node>") must refresh when the picked signal
+    changes -- the refresh guard keys on config.inputs, not only config.source (which stays
+    'value = signal').  Before the fix, picking a signal never re-ran the legend."""
+    exp, con = _live_console()
+    try:
+        kc = con.kind_combo
+        i = next(j for j in range(kc.count()) if kc.itemData(j) == "2d")
+        kc.setCurrentIndex(i); con._add_panel()
+        card = con.cards[-1]
+        titles = []
+        card.set_signal_info = lambda t, _o=card.set_signal_info: (_o(t), titles.append(t))[0]
+        card.config.source = "value = signal"; card.config.inputs = ["occupied"]
+        con._refresh_signal_info(); first = titles[-1]
+        card.config.inputs = ["rate"]                   # the user re-picks a different signal
+        con._refresh_signal_info()
+        assert titles[-1] != first                      # the title RE-RAN (was stuck before -- guard keyed on source only)
+        assert "rate" in titles[-1]
+    finally:
+        con.shutdown(); exp.close()
