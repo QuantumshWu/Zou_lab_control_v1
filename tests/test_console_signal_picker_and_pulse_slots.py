@@ -118,6 +118,42 @@ def test_logic_node_source_picker_groups_by_producer_with_human_labels_and_bare_
     combo.deleteLater()
 
 
+def test_logic_source_picker_uses_short_name_labels_like_the_plot_picker():
+    """#combo-parity: the occupancy / logic-node SOURCE picker must render IDENTICALLY to the plot
+    Setting picker -- a camera leaf reads "frame_0", NOT the prefix-stripped "0" the
+    _common_token_prefix fallback yields when NO short-name labels are threaded.  Guards the
+    labels_provider wiring (MeasurementPanel.short_names_provider -> signal_expr_factory ->
+    _SignalExprWidget._labels); without it the two pickers diverged ("camera 0/1/2" vs "camera
+    frame_0")."""
+    from PyQt5 import QtCore
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.task_console import _SignalExprWidget
+    ensure_qt_app()
+    names = ["frame_0", "frame_1", "frame_2"]
+    sources = {n: ["camera"] for n in names}
+    formats = {n: "(1,1,40,50)" for n in names}
+    short = {n: n for n in names}                          # camera prefix "" -> short name == name
+
+    def leaves(w):
+        m = w.slot_combos[0]._model
+        out = []
+        for r in range(m.rowCount()):
+            it = m.item(r)
+            for c in range(it.rowCount()):
+                ch = it.child(c)
+                if ch.data(QtCore.Qt.UserRole):
+                    out.append(ch.text().strip().split("  ")[0])
+        return out
+
+    with_labels = _SignalExprWidget(signals_provider=lambda: names, sources_provider=lambda: sources,
+                                    formats_provider=lambda: formats, labels_provider=lambda: short)
+    assert leaves(with_labels) == ["frame_0", "frame_1", "frame_2"]   # short NAME, like the plot picker
+    without = _SignalExprWidget(signals_provider=lambda: names, sources_provider=lambda: sources,
+                                formats_provider=lambda: formats)
+    assert leaves(without) == ["0", "1", "2"]                         # the OLD bug (no labels -> stripped)
+    with_labels.deleteLater(); without.deleteLater()
+
+
 # ---------------------------------------------------- #3 a WAITING (declared, not-yet-published) signal
 def test_signal_picker_can_select_a_declared_not_yet_published_signal():
     """A signal a node DECLARES but has not published yet (waiting) is still listed in the tree -- via

@@ -1516,7 +1516,10 @@ class FluentTreeComboBox(FluentComboBox):
             self.setRootModelIndex(QtCore.QModelIndex())
         elif none_label is not None:
             self.setCurrentIndex(0)
-        self.update()
+        # repaint() not update(): a rebuild while the Setting is open (a refresh after a pick) must show
+        # the producer-qualified ``_display`` IMMEDIATELY, not on a deferred async paint that the Qt.Popup
+        # may not flush until it is closed + reopened (#1).  (A no-op on a not-yet-shown combo.)
+        self.repaint()
 
     def current_signal(self) -> str:
         """The selected leaf's bare signal name ('' for none / a header)."""

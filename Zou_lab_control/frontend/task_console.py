@@ -758,12 +758,17 @@ class _SignalExprWidget(QtWidgets.QWidget):
     changed = QtCore.pyqtSignal()
 
     def __init__(self, *, signals_provider=None, sources_provider=None, formats_provider=None,
-                 title: str = "", parent=None):
+                 labels_provider=None, title: str = "", parent=None):
         super().__init__(parent)
         self.setStyleSheet("background: transparent;")
         self._signals_provider = signals_provider
         self._sources_provider = sources_provider
         self._formats_provider = formats_provider
+        # The SHORT-name map (``short_names_provider``: {full hub name -> short name}), passed as the
+        # picker's ``labels`` so a leaf shows "frame_0" -- NOT the prefix-stripped "0/1/2" the
+        # _common_token_prefix fallback yields without it.  This is what makes THIS source picker render
+        # IDENTICALLY to the plot-panel Setting picker (same fill_grouped_signal_combo + same labels).
+        self._labels_provider = labels_provider
         self._inputs: list[str] = ["frame_0"]
         self._editor = None
         # ONE label-column width for this widget's rows (signal / signal[i] / value), via the SAME
@@ -836,6 +841,13 @@ class _SignalExprWidget(QtWidgets.QWidget):
         except Exception:
             return {}
 
+    def _labels(self) -> dict:
+        try:
+            return {str(n): str(s) for n, s in dict(self._labels_provider()).items() if s} \
+                if callable(self._labels_provider) else {}
+        except Exception:
+            return {}
+
     def _rebuild_slots(self) -> None:
         for combo in self.slot_combos:
             combo.setParent(None); combo.deleteLater()
@@ -851,7 +863,7 @@ class _SignalExprWidget(QtWidgets.QWidget):
             label = f"signal[{i}]" if n > 1 else "signal"
             cur = self._inputs[i] if i < len(self._inputs) else ""
             fill_grouped_signal_combo(combo, names=self._names(), sources=self._sources(),
-                                      formats=self._formats(), current=cur)
+                                      formats=self._formats(), labels=self._labels(), current=cur)
             combo.activated.connect(lambda *_a, idx=i: self._on_pick(idx))
             self.slot_combos.append(combo)
             self._slot_box.addWidget(FluentSettingRow(label, combo, label_width=self._label_w))
@@ -911,7 +923,7 @@ class _SignalExprWidget(QtWidgets.QWidget):
         for combo in self.slot_combos:
             cur = read_editable_combo(combo)
             fill_grouped_signal_combo(combo, names=self._names(), sources=self._sources(),
-                                      formats=self._formats(), current=cur)
+                                      formats=self._formats(), labels=self._labels(), current=cur)
 
     def values_dict(self) -> dict:
         """The current ``{"inputs": [...], "source": "value = ..."}`` (the signal_expr value)."""
@@ -3079,7 +3091,7 @@ class MeasurementPanel(QtWidgets.QWidget):
 
     def __init__(self, measurements: Sequence[object], parent=None, *, single: bool = False,
                  controls: bool = True, signals_provider=None, sources_provider=None, formats_provider=None,
-                 acquisition_params: Sequence[object] = ()):
+                 short_names_provider=None, acquisition_params: Sequence[object] = ()):
         super().__init__(parent)
         self.setStyleSheet("background: transparent;")
         self._specs = list(measurements)
@@ -3095,6 +3107,10 @@ class MeasurementPanel(QtWidgets.QWidget):
         self._signals_provider = signals_provider
         self._sources_provider = sources_provider
         self._formats_provider = formats_provider
+        # The short-name map (full hub name -> short name) the signal picker uses as its ``labels`` so a
+        # leaf reads "frame_0" not the prefix-stripped "0" -- threaded into the signal_expr widget so THIS
+        # form's source picker renders IDENTICALLY to the plot Setting picker (#combo-parity).
+        self._short_names_provider = short_names_provider
         self._widgets: dict[str, object] = {}     # param key -> widget (or tuple for axis_range)
         self._running = False
 
@@ -3222,6 +3238,7 @@ class MeasurementPanel(QtWidgets.QWidget):
                 signals_provider=self._signals_provider,
                 sources_provider=self._sources_provider,
                 formats_provider=self._formats_provider,
+                labels_provider=self._short_names_provider,
                 title=title),
             pulse_slots_factory=lambda: _PulseSlotsWidget(),
         )
@@ -3384,6 +3401,8 @@ class MeasurementPanel(QtWidgets.QWidget):
             except Exception: names = []
         sources = self._sources_provider() if callable(self._sources_provider) else {}
         formats = self._formats_provider() if callable(self._formats_provider) else {}
+        labels = ({str(n): str(s) for n, s in dict(self._short_names_provider()).items() if s}
+                  if callable(self._short_names_provider) else {})
         for key, widget in list(self._widgets.items()):
             kind = self._decls[key].kind
             # a DEPENDENT combo (pulse_param / pulse_slots) repopulates via the form's per-key
@@ -3395,7 +3414,7 @@ class MeasurementPanel(QtWidgets.QWidget):
             else:
                 repopulate = None
             providers = RefreshProviders(signals=names, sources=sources, formats=formats,
-                                         repopulate=repopulate)
+                                         labels=labels, repopulate=repopulate)
             self._handlers[key].refresh(widget, providers)
         self._refresh_start_enabled()
 
@@ -3622,7 +3641,8 @@ class PanelEditor(QtWidgets.QWidget):
                     [source_spec], single=True, controls=False,
                     signals_provider=getattr(console, "_signal_names", None),
                     sources_provider=getattr(console, "_signal_providers", None),
-                    formats_provider=getattr(console, "_signal_formats", None))
+                    formats_provider=getattr(console, "_signal_formats", None),
+                    short_names_provider=getattr(console, "_signal_short_names", None))
                 self.source_form.seed_values(self._source_row.node.values or {})
                 col.addWidget(self.source_form)
                 self.source_apply_button = FluentButton("Apply", color=ACCENT)
@@ -4459,6 +4479,7 @@ class LogicNodeEditor(QtWidgets.QWidget):
                                      signals_provider=getattr(console, "_signal_names", None),
                                      sources_provider=getattr(console, "_signal_providers", None),
                                      formats_provider=getattr(console, "_signal_formats", None),
+                                     short_names_provider=getattr(console, "_signal_short_names", None),
                                      acquisition_params=acquisition)
         self.form.seed_values(row.node.values or {})
         self.form.start_requested.connect(lambda *_: self.console._start_logic_node(self.row))

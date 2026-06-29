@@ -38,7 +38,7 @@ GUI-side consumer that interprets a declaration, exactly as the docstring of
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from PyQt5 import QtWidgets
@@ -93,6 +93,7 @@ class ParamWidgetContext:
     signals_provider: Optional[Callable[[], Any]] = None
     sources_provider: Optional[Callable[[], Any]] = None
     formats_provider: Optional[Callable[[], Any]] = None
+    labels_provider: Optional[Callable[[], Any]] = None
     signal_expr_factory: Optional[Callable[[str], QtWidgets.QWidget]] = None
     pulse_slots_factory: Optional[Callable[[], QtWidgets.QWidget]] = None
 
@@ -110,6 +111,16 @@ class ParamWidgetContext:
     def formats(self) -> dict:
         return self.formats_provider() if callable(self.formats_provider) else {}
 
+    def labels(self) -> dict:
+        """The SHORT-name map ({full hub name -> short name}) the grouped picker uses as ``labels`` so a
+        leaf reads "frame_0", NOT the prefix-stripped "0" -- so a ``signal``-kind picker renders the SAME
+        as the plot Setting / signal_expr pickers (#combo-parity)."""
+        try:
+            return {str(n): str(s) for n, s in dict(self.labels_provider()).items() if s} \
+                if callable(self.labels_provider) else {}
+        except Exception:
+            return {}
+
 
 @dataclass
 class RefreshProviders:
@@ -125,6 +136,7 @@ class RefreshProviders:
     signals: list[str]
     sources: dict
     formats: dict
+    labels: dict = field(default_factory=dict)   # short-name map -> picker leaf "frame_0" not "0"
     repopulate: Optional[Callable[[QtWidgets.QWidget], None]] = None
 
 
@@ -432,9 +444,10 @@ def _grey_label(text: str) -> FluentLabel:
 # These three helpers come from task_console; importing them at module scope would be a
 # cycle (task_console imports THIS module).  They are tiny and stable, so we import them
 # lazily inside the handlers -- the SAME single-source helpers every picker uses.
-def _grouped_fill(combo, *, names, sources, formats, current):
+def _grouped_fill(combo, *, names, sources, formats, current, labels=None):
     from .task_console import fill_grouped_signal_combo
-    fill_grouped_signal_combo(combo, names=names, sources=sources, formats=formats, current=current)
+    fill_grouped_signal_combo(combo, names=names, sources=sources, formats=formats,
+                              labels=labels or {}, current=current)
 
 
 def _read_editable(combo) -> str:
@@ -448,7 +461,8 @@ class SignalHandler(ParamWidgetHandler):
     def build(self, decl, value, ctx):
         combo = FluentTreeComboBox()
         cur = "" if (value is None and decl.default is None) else str(value if value is not None else decl.default)
-        _grouped_fill(combo, names=ctx.names(), sources=ctx.sources(), formats=ctx.formats(), current=cur)
+        _grouped_fill(combo, names=ctx.names(), sources=ctx.sources(), formats=ctx.formats(),
+                      labels=ctx.labels(), current=cur)
         combo.setToolTip(decl.tooltip)
         _wire(combo.activated, ctx, decl, lambda: _read_editable(combo))
         return combo
@@ -470,7 +484,7 @@ class SignalHandler(ParamWidgetHandler):
     def refresh(self, widget, providers: RefreshProviders) -> None:
         current = _read_editable(widget)
         _grouped_fill(widget, names=providers.signals, sources=providers.sources,
-                      formats=providers.formats, current=current)
+                      formats=providers.formats, labels=providers.labels, current=current)
 
 
 class PulseParamHandler(ParamWidgetHandler):
