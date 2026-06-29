@@ -652,7 +652,12 @@ class BaseLivePlot:
         1D/monitor: rescale the y-axis.  Live2DDis overrides for the colour limit."""
         self.relim(force=True)
         if self.ax is not None:
-            self.ax.set_ylim(self.ylim_min, self.ylim_max)
+            lo, hi = self.ylim_min, self.ylim_max
+            if self.ax.get_yscale() == "log" and lo <= 0:
+                # a log axis rejects a non-positive lower limit -- floor it the way
+                # HistogramFigure._apply_count_yscale already does (#log-ylim).
+                lo = 0.5 if hi > 0.5 else hi * 0.1
+            self.ax.set_ylim(lo, hi)
 
     def after_plot(self):
         """Create and attach a DataFigure handle."""
@@ -1929,7 +1934,8 @@ class HistogramFigure(BaseLivePlot):
             line = self.ax.axvline(threshold, **threshold_line_kwargs())
             line.set_visible(self._has_threshold)        # hidden on a single-Gaussian (no meaningful cut)
             self.threshold_lines.append(line)
-            self.threshold_draggers.append(DragVLine(line, self._on_threshold_drag, self.ax))
+            if self.interactions:                        # DRAGGABLE only on the Edit/notebook surface; a
+                self.threshold_draggers.append(DragVLine(line, self._on_threshold_drag, self.ax))  # read-only Monitor card (interactions=False) keeps the line but no grab
         self.stats_text = self.ax.text(
             0.975,
             0.975,
@@ -1969,7 +1975,8 @@ class HistogramFigure(BaseLivePlot):
         while len(self.threshold_lines) < len(self.thresholds):
             line = self.ax.axvline(self.thresholds[len(self.threshold_lines)], **threshold_line_kwargs())
             self.threshold_lines.append(line)
-            self.threshold_draggers.append(DragVLine(line, self._on_threshold_drag, self.ax))
+            if self.interactions:                        # gate the grab, not the line (#dis-threshold-disable)
+                self.threshold_draggers.append(DragVLine(line, self._on_threshold_drag, self.ax))
         for line, threshold in zip(self.threshold_lines, self.thresholds):
             line.set_xdata([threshold, threshold])
             line.set_visible(self._has_threshold)        # show/hide live as the data separates / merges

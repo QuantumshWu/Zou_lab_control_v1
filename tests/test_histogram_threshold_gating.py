@@ -60,3 +60,39 @@ def test_explicit_threshold_shows_even_on_single_gaussian():
         assert "th=" in _stats(h)
     finally:
         import matplotlib.pyplot as plt; plt.close(h.fig)
+
+
+def test_threshold_line_is_draggable_only_when_interactions_on():
+    """#dis-threshold-disable: the threshold cut LINE always draws, but its DRAG interactor obeys the
+    same per-tab rule as every other selector -- present on the Edit/notebook surface (interactions=True),
+    GONE on a read-only Monitor card (interactions=False), so a running panel can't be dragged."""
+    rng = np.random.default_rng(3)
+    vals = np.concatenate([rng.normal(20.0, 3.0, 2000), rng.normal(80.0, 4.0, 2000)])
+    import matplotlib.pyplot as plt
+    monitor = HistogramFigure(vals, bimodal=True, interactions=False).show()
+    edit = HistogramFigure(vals, bimodal=True, interactions=True).show()
+    try:
+        assert monitor.threshold_lines and not monitor.threshold_draggers, "monitor card: line kept, no grab"
+        assert edit.threshold_lines and edit.threshold_draggers, "edit surface: line + draggable grab"
+    finally:
+        plt.close(monitor.fig); plt.close(edit.fig)
+
+
+def test_log_count_axis_relim_never_sets_nonpositive_ylim():
+    """#log-ylim: a log-scaled count axis rejects a <=0 lower limit (matplotlib warns + ignores).
+    apply_relim_now (fired by the lim-mode combo) must floor the lower bound to a positive value
+    in every relim mode instead of emitting 'Attempt to set non-positive ylim on a log-scaled axis'."""
+    import warnings
+    import matplotlib.pyplot as plt
+    rng = np.random.default_rng(4)
+    vals = np.concatenate([rng.normal(20.0, 3.0, 1500), rng.normal(80.0, 4.0, 1500), np.zeros(5)])
+    h = HistogramFigure(vals, ylog=True).show()
+    try:
+        for mode in ("tight", "normal", "fixed"):
+            h.relim_mode = mode
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", UserWarning)
+                h.apply_relim_now()
+            assert h.ax.get_ylim()[0] > 0, (mode, h.ax.get_ylim())
+    finally:
+        plt.close(h.fig)
