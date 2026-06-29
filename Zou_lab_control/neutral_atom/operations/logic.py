@@ -904,21 +904,13 @@ class CalibrateReadoutTask(Task):
 
     @classmethod
     def _resolve_template(cls, pulse_template):
-        """Load the imaging template: the given path if it is a real file, else the shipped
-        template of that name in the repo ``pulses/`` folder (where the pulse GUI saves and
-        the Browse dialog opens -- so the default ``pulses/imaging_template.json`` is a REAL,
-        inspectable file the experimenter can find), else the in-memory default."""
-        from ..timing import PulseTableState, default_imaging_template
-        text = str(pulse_template or "").strip() or cls.DEFAULT_PULSE_TEMPLATE
-        path = Path(text)
-        if path.is_file():
-            return PulseTableState.load(path)
-        name = path.name
-        for base in (Path("pulses"), Path(__file__).resolve().parents[3] / "pulses"):
-            shipped = base / name
-            if shipped.is_file():
-                return PulseTableState.load(shipped)
-        return default_imaging_template()
+        """Load the imaging template via the ONE shared resolver (the given path if real, else the
+        same-named file shipped under the project ``pulses/`` folder -- where the pulse GUI saves and
+        the Browse dialog opens, so the default ``pulses/imaging_template.json`` is a REAL inspectable
+        file -- else the in-memory long-short-long default)."""
+        from ..timing import default_imaging_template, resolve_pulse_template
+        return resolve_pulse_template(pulse_template, default_name=cls.DEFAULT_PULSE_TEMPLATE,
+                                      default_factory=default_imaging_template)
 
     def output_specs(self) -> tuple[SignalSpec, ...]:
         """What the calibration PRODUCES (off the hub) + streams mid-run -- keyed by the

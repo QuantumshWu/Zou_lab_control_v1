@@ -245,14 +245,17 @@ def _api_number(name: object) -> int:
 
 
 def slot_label(kind: str, target: str, *, base_1: bool = True) -> str:
-    """Human label for a bound pulse field (a scan slot OR an api slot) from (kind, target) ALONE.
+    """The STATE-FREE, INDEX-based label for a bound pulse field from (kind, target) ALONE.
 
     The raw ``target`` is an INTERNAL handle -- a 0-based period index (``duration``),
     ``"<bus>@<period_index>"`` (``dac``), or a channel/bus name (``delay``) -- meaningless to
     show verbatim (the user's "a1  duration @ 1" complaint: "what is 1?").  This names the PERIOD
-    (1-based, matching the 'Period N/M' on the card) / channel / bus, so the label carries real
-    information.  Needs NO ``PulseTableState`` -- pure (kind, target), so the pulse editor AND the
-    task console's pulse-scan form share ONE formatter instead of each dumping the raw target."""
+    by its 1-based INDEX (``Period 3``, matching the 'Period N/M' on the card) / channel / bus
+    WITHOUT a ``PulseTableState``, so it works on the flat row tuples the pulse editor + the
+    task-console pulse-scan form carry where no state object is in hand.  The COMPLEMENT is
+    ``timing.pulse_table.scan_target_label`` -- the STATE-FUL, NAME-based label (``probe duration``)
+    for callers that DO hold a state.  The two are NOT duplicates: same question, different input
+    (index vs name)."""
 
     target = str(target)
     off = 1 if base_1 else 0

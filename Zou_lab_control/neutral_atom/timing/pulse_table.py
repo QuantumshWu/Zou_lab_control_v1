@@ -490,6 +490,19 @@ class PulseTableState:
                 return index
         return None
 
+    def _set_bus_target(self, bus: str, period_index: int, value) -> None:
+        """Write ``value`` into the DAC ``bus`` at ``period_index``, PRESERVING a ramp waveform but
+        forcing any other mode to an ``edge`` -- the ONE place that 'keep ramp, else edge' rule + the
+        ``analog_bus_modes`` plan writeback lives (scan-slot binding, api-field set, slot resolution),
+        so the three callers can never drift apart (#B2).  ``value`` rides the plan entry verbatim: a
+        str slot-var (a scan binding) or an int DAC code (resolved / api set) both work unchanged.
+        The out-of-range fallback is unreachable (``validate`` rejects out-of-range periods)."""
+        plan = self.analog_bus_plan(bus)
+        cur = plan[period_index].get("mode", "hold") if period_index < len(plan) else "hold"
+        mode = str(cur).strip().lower()
+        plan[period_index] = {"mode": mode if mode == "ramp" else "edge", "value": value}
+        self.analog_bus_modes[bus] = plan
+
     def _apply_slot_binding(self, index: int, slot: ScanSlot) -> None:
         var = slot_var(index)
         if slot.kind == "duration":
@@ -497,18 +510,11 @@ class PulseTableState:
             period = self.periods[period_index]
             self.periods[period_index] = PulsePeriod(var, period.states, unit="str (ns)", name=period.name)
         elif slot.kind == "dac":
-            bus, period_index = slot.dac_bus, slot.dac_period
-            plan = self.analog_bus_plan(bus)
-            # PRESERVE the period's waveform mode: a scanned EDGE steps to the scanned
-            # value, a scanned RAMP ramps (from the carried-in value) TO the scanned value
-            # -- both are hardware-seamless (the segment's stop endpoint reads the scan
-            # slot at runtime via stop_value_select; see _pulse_table_bus_segments and the
-            # RTL's dual start/stop selects).  Only a HOLD (no value of its own) becomes
-            # an edge when bound.  This used to force "edge" and silently destroyed a
-            # ramp the moment its dot was clicked.
-            mode = str(plan[period_index].get("mode", "hold")).strip().lower() if period_index < len(plan) else "hold"
-            plan[period_index] = {"mode": mode if mode == "ramp" else "edge", "value": var}
-            self.analog_bus_modes[bus] = plan
+            # PRESERVE the period's waveform mode (via _set_bus_target): a scanned EDGE steps to the
+            # scanned value, a scanned RAMP ramps (from the carried-in value) TO the scanned value --
+            # both hardware-seamless (the segment's stop endpoint reads the scan slot at runtime via
+            # stop_value_select).  Only a HOLD becomes an edge when bound.  ``var`` is the str slot-var.
+            self._set_bus_target(slot.dac_bus, slot.dac_period, var)
 
     def _clear_slot_binding(self, index: int, restore: float | str | None) -> None:
         slot = self.scan_slots[index]
@@ -637,11 +643,7 @@ class PulseTableState:
             self.validate()
         elif slot.kind == "dac":
             bus, period_index = slot.target.split("@", 1)
-            period_index = int(period_index)
-            plan = self.analog_bus_plan(bus)
-            mode = str(plan[period_index].get("mode", "hold")).strip().lower() if period_index < len(plan) else "hold"
-            plan[period_index] = {"mode": mode if mode == "ramp" else "edge", "value": int(round(float(value)))}
-            self.analog_bus_modes[bus] = plan
+            self._set_bus_target(bus, int(period_index), int(round(float(value))))   # keep ramp, else edge (#B2)
             self.validate()
 
     def _delay_targets(self, target: str) -> list[str]:
@@ -746,16 +748,10 @@ class PulseTableState:
                 period = new.periods[period_index]
                 new.periods[period_index] = PulsePeriod(value, period.states, unit="ns", name=period.name)
             elif slot.kind == "dac":
-                # PRESERVE the period's waveform mode (same rule as _apply_slot_binding):
-                # resolving a RAMP-bound slot keeps it a ramp to the resolved value -- it
-                # used to force "edge", so a single-point notebook run of a ramp-bound
-                # pulse played a step instead of the ramp.
-                plan = new.analog_bus_plan(slot.dac_bus)
-                entry = plan[slot.dac_period] if slot.dac_period < len(plan) else {}
-                mode = str(entry.get("mode", "edge")).strip().lower()
-                plan[slot.dac_period] = {"mode": mode if mode == "ramp" else "edge",
-                                         "value": int(round(value))}
-                new.analog_bus_modes[slot.dac_bus] = plan
+                # PRESERVE the period's waveform mode (same rule as _apply_slot_binding, via the ONE
+                # _set_bus_target): resolving a RAMP-bound slot keeps it a ramp to the resolved value --
+                # forcing "edge" made a single-point notebook run of a ramp-bound pulse play a step.
+                new._set_bus_target(slot.dac_bus, slot.dac_period, int(round(value)))
         new.scan_slots = []
         new.scan_table = []
         new.apply_analog_bus_modes_to_period_states()
@@ -1806,6 +1802,25 @@ def single_imaging_template(
     return state
 
 
+def resolve_pulse_template(template, *, default_name: str, default_factory) -> "PulseTableState":
+    """The SINGLE resolver every form that takes a pulse-template path goes through (the Calibrate
+    task + the Pulse-scan measurement).  Load order: the given path if it is a real file; else the
+    same-named file shipped under the project ``pulses/`` folder -- anchored to the PROJECT ROOT via
+    ``project_path`` (NOT a fragile ``parents[N]`` count that breaks when a caller moves); else the
+    in-memory ``default_factory()`` (e.g. the long-short-long or single-image default)."""
+    from Zou_lab_control._paths import project_path        # absolute import: the dependency-free path seam
+    text = str(template or "").strip() or default_name
+    path = Path(text)
+    if path.is_file():
+        return PulseTableState.load(path)
+    name = path.name
+    for base in (Path("pulses"), project_path("pulses")):     # CWD-relative, then project-anchored
+        shipped = base / name
+        if shipped.is_file():
+            return PulseTableState.load(shipped)
+    return default_factory()
+
+
 def default_visible_channels(channels: Sequence[str]) -> list[str]:
     channels = list(channel_names(channels, "channels"))
     preferred = [channel for channel in ("trap", "cooling", "probe", "emCCD") if channel in channels]
@@ -2222,19 +2237,26 @@ def _period_display(state: "PulseTableState", index) -> str:
 
 
 def scan_target_label(state: "PulseTableState", kind: str, target: str) -> str:
-    """Human label for a scannable parameter ``(kind, target)`` -- the ONE place the opaque
-    ``bus@<index>`` / bare-index forms are turned into readable text (``da[0] @ image`` /
-    ``probe duration``).  The raw ``target`` is unchanged (it is still the parse key); this is
-    display only, shared by the scan-slot axis label + the GUI scan legend."""
+    """The STATE-FUL, NAME-based label for a scannable parameter ``(kind, target)`` -- the ONE
+    formatter for callers that HOLD a ``PulseTableState``, turning the opaque ``bus@<index>`` /
+    bare-index forms into NAME-based text (``probe duration`` / ``da @ image (DAC, signed LSB)``).
+    Shared by the scan-slot axis label, the GUI scan legend, AND ``enumerate_pulse_params`` (so the
+    dropdown + the axis read identically).  The COMPLEMENT is the frontend's
+    ``pulse_gui.slot_label`` -- the STATE-FREE, INDEX-based label (``Period 3 duration``) for the
+    flat row tuples that carry no state.  The raw ``target`` is unchanged (still the parse key);
+    this is display only."""
     kind = str(kind)
     target = str(target)
     if kind == "dac" and "@" in target:
         bus, _, idx = target.partition("@")
-        return f"{bus} @ {_period_display(state, idx)} (DAC)"
+        return f"{bus} @ {_period_display(state, idx)} (DAC, signed LSB)"
     if kind == "duration":
         return f"{_period_display(state, target)} duration"
     if kind == "delay":
-        return f"{target} delay"
+        # A plain CHANNEL delay shows the channel's friendly label; a DAC BUS delay (the bus name
+        # is not an individual channel) shows the raw bus name -- matching enumerate_pulse_params.
+        name = state.label_for(target) if target in state.channels else target
+        return f"{name} delay"
     return f"{kind} {target}"
 
 
@@ -2491,26 +2513,27 @@ def enumerate_pulse_params(state: "PulseTableState") -> list[tuple[str, str, str
     DURATION, every channel DELAY, and every DAC bus level per period; a duration already bound
     to a scan slot is flagged in its label (setting it raises until the slot is unbound)."""
 
+    # Labels come from the ONE formatter (scan_target_label); enumerate only adds the
+    # ' (scan-bound)' flag (the duration-already-bound hint), AROUND the call (#B3).
     out: list[tuple[str, str, str]] = []
-    for i, period in enumerate(state.periods):
-        pname = str(period.name).strip() or f"period {i}"
+    for i, _period in enumerate(state.periods):
         bound = state.slot_index_for("duration", str(i)) is not None
-        out.append(("duration", str(i), f"{pname} duration" + (" (scan-bound)" if bound else "")))
+        out.append(("duration", str(i),
+                    scan_target_label(state, "duration", str(i)) + (" (scan-bound)" if bound else "")))
     # Delays are API-settable (never scannable); a DAC BUS owns a delay just like a
     # plain channel (it fans out to its members), so both are listed -- buses first so
     # the bus-delay slot is as discoverable as a TTL channel's.
     bus_channels = state.bus_channels(min_width=1)
     bus_members = {channel for members in bus_channels.values() for channel in members}
     for bus in bus_channels:
-        out.append(("delay", str(bus), f"{bus} delay"))
+        out.append(("delay", str(bus), scan_target_label(state, "delay", str(bus))))
     for channel in state.channels:
         if channel in bus_members:
             continue   # its delay is exposed via the owning bus's slot, not per-member
-        out.append(("delay", str(channel), f"{state.label_for(channel)} delay"))
+        out.append(("delay", str(channel), scan_target_label(state, "delay", str(channel))))
     for bus in bus_channels:
-        for i, period in enumerate(state.periods):
-            pname = str(period.name).strip() or f"period {i}"
-            out.append(("dac", f"{bus}@{i}", f"{bus} @ {pname} (DAC, signed LSB)"))
+        for i, _period in enumerate(state.periods):
+            out.append(("dac", f"{bus}@{i}", scan_target_label(state, "dac", f"{bus}@{i}")))
     return out
 
 

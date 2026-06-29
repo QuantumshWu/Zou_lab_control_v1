@@ -29,7 +29,6 @@ same decoupling the rest of the console uses.  The driving node is :class:`~..lo
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Mapping, Sequence
 
 import numpy as np
@@ -37,6 +36,7 @@ import numpy as np
 from ...timing import (
     PulseTableState,
     evaluate_scan_table_code,
+    resolve_pulse_template,
     scan_table_template,
     scan_target_label,
     single_imaging_template,
@@ -76,19 +76,12 @@ class _Axis:
 
 
 def _resolve_probe_template(template: str) -> PulseTableState:
-    """Load the pulse template the operator picked: the given path if real, else the shipped
-    template of that name in ``pulses/``, else the in-memory single-image default."""
+    """Load the pulse template the operator picked via the ONE shared resolver: the given path if
+    real, else the same-named file shipped under the project ``pulses/`` folder, else the in-memory
+    single-image default."""
 
-    text = str(template or "").strip() or DEFAULT_PROBE_TEMPLATE
-    path = Path(text)
-    if path.is_file():
-        return PulseTableState.load(path)
-    name = path.name
-    for base in (Path("pulses"), Path(__file__).resolve().parents[4] / "pulses"):
-        shipped = base / name
-        if shipped.is_file():
-            return PulseTableState.load(shipped)
-    return single_imaging_template()
+    return resolve_pulse_template(template, default_name=DEFAULT_PROBE_TEMPLATE,
+                                  default_factory=single_imaging_template)
 
 
 def _scan_table_arrays(
