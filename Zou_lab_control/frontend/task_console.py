@@ -1988,7 +1988,7 @@ class PanelCard(FluentGroupBox):
         lay.addWidget(lo, 1)
         lay.addWidget(hi, 1)
         row = FluentSettingRow("lo / hi", host, label_width=label_w)
-        row.setVisible(str(self.config.params.get("relim", "tight")) == "fixed")
+        row.setVisible(self._relim() == "fixed")
         return row, lo, hi
 
     def _apply_lim_to_plotter(self) -> None:
@@ -1996,12 +1996,24 @@ class PanelCard(FluentGroupBox):
         y-axis), bypassing the relim dead-band so a toggle takes effect immediately even on a static
         panel.  Shared by the declarative relim edit (_set_param) and the rebuild-time re-apply."""
         if self.plotter is not None and hasattr(self.plotter, "relim_mode"):
-            self.plotter.relim_mode = str(self.config.params.get("relim", "tight"))
+            self.plotter.relim_mode = self._relim()
             self._push_fixed_lims()                 # keep plotter.fixed_lo/hi in step before re-relim
             if hasattr(self.plotter, "apply_relim_now"):
                 self.plotter.apply_relim_now()
         if self.canvas is not None:
             self.canvas.draw_idle()
+
+    def _kind_repeat_modes(self) -> list:
+        """The repeat modes THIS plot kind offers (its ``PLOT_KINDS`` entry, else the image
+        default) -- the ONE lookup shared by the param spec + the value clamp (#A3)."""
+        from .live import PLOT_KIND_BY_KEY, IMAGE_REPEAT_MODES
+        pk = PLOT_KIND_BY_KEY.get(self.config.kind)
+        return list(pk.repeat_modes) if (pk and pk.repeat_modes) else list(IMAGE_REPEAT_MODES)
+
+    def _relim(self) -> str:
+        """The panel's relim mode, defaulting to ``_RELIM_PARAM.default`` -- the ONE place that
+        default lives, so every reader agrees instead of re-typing the 'tight' literal (#A3)."""
+        return str(self.config.params.get("relim", _RELIM_PARAM.default))
 
     def _repeat_param_specs(self) -> tuple:
         """The PLOT's repeat-DISPLAY param (``repeat_mode``), DECLARED so the Setting auto-renders it
@@ -2013,9 +2025,7 @@ class PanelCard(FluentGroupBox):
         1-D), a DISTRIBUTION instead bins them (pool / latest).  So a histogram never offers a trace
         verb like ``roll`` (and never silently ignores the control), and the default is the kind's first
         (canonical) mode."""
-        from .live import PLOT_KIND_BY_KEY, IMAGE_REPEAT_MODES
-        pk = PLOT_KIND_BY_KEY.get(self.config.kind)
-        modes = list(pk.repeat_modes) if (pk and pk.repeat_modes) else list(IMAGE_REPEAT_MODES)
+        modes = self._kind_repeat_modes()
         return (
             ParamDecl(key="repeat_mode", label="repeat mode", kind="choice", default=modes[0],
                       choices=tuple(modes),
@@ -2025,9 +2035,7 @@ class PanelCard(FluentGroupBox):
     def _repeat_mode_value(self) -> str:
         """The stored repeat_mode, CLAMPED to this kind's valid modes (migrates an old saved layout
         whose mode -- e.g. a histogram saved with 'average' before #issue-1 -- is no longer offered)."""
-        from .live import PLOT_KIND_BY_KEY, IMAGE_REPEAT_MODES
-        pk = PLOT_KIND_BY_KEY.get(self.config.kind)
-        modes = list(pk.repeat_modes) if (pk and pk.repeat_modes) else list(IMAGE_REPEAT_MODES)
+        modes = self._kind_repeat_modes()
         cur = str(self.config.params.get("repeat_mode", modes[0]))
         return cur if cur in modes else modes[0]
 
@@ -2252,7 +2260,7 @@ class PanelCard(FluentGroupBox):
         self.config.params["fixed_lo"] = _safe_float(self.fixed_lo_edit.text(), 0.0)
         self.config.params["fixed_hi"] = _safe_float(self.fixed_hi_edit.text(), 1.0)
         self._push_fixed_lims()
-        if self.plotter is not None and str(self.config.params.get("relim")) == "fixed" \
+        if self.plotter is not None and self._relim() == "fixed" \
                 and hasattr(self.plotter, "apply_relim_now"):
             self.plotter.apply_relim_now()
             if self.canvas is not None:
@@ -2284,7 +2292,7 @@ class PanelCard(FluentGroupBox):
         if self.plotter is None:
             return
         if hasattr(self.plotter, "relim_mode"):
-            self.plotter.relim_mode = str(self.config.params.get("relim", "tight"))
+            self.plotter.relim_mode = self._relim()
             self._push_fixed_lims()                      # keep fixed lo/hi (#8) applied after rebuild
         self._apply_unit()
 
@@ -2672,7 +2680,7 @@ class PanelCard(FluentGroupBox):
             if self.config.params.get("xy") and arr.ndim == 2 and arr.shape[1] == 2 and arr.shape[0] >= 1:
                 return arr
             a = np.squeeze(arr)
-            mode = str(self.config.params.get("repeat_mode", ""))
+            mode = self._repeat_mode_value()      # the ONE clamped reader (#A2)
             if len(ds) == 2:
                 # the DATA is a 2-D image -> it does NOT make per-data lines.  ``create`` already
                 # arrived as ``(pixels, repeat)`` from reduce_repeat, so one line per repeat; otherwise
@@ -2766,7 +2774,7 @@ class PanelCard(FluentGroupBox):
                 # occupancy), replace/roll = the latest frame, add = the summed frame.  A 2-D image
                 # cannot be per-repeat lines, so 'create' falls back to the latest (exactly as a 2-D
                 # panel offers no 'create') -- the rings and the frame are always the same reduction.
-                mode = str(self.config.params.get("repeat_mode", "average"))
+                mode = self._repeat_mode_value()      # the ONE clamped reader (#A2)
                 image = np.squeeze(reduce_repeat(image, "replace" if mode == "create" else mode))
         return centers[:, :2], image
 
@@ -2922,7 +2930,7 @@ class PanelCard(FluentGroupBox):
     def _fixed_lim_kwargs(self) -> dict:
         """``fixed_lo``/``fixed_hi`` kwargs for the plotter, ONLY when the lim mode is
         "fixed" (#8) -- otherwise omitted so the plotter keeps its tight/normal autoscale."""
-        if str(self.config.params.get("relim", "tight")) != "fixed":
+        if self._relim() != "fixed":
             return {}
         return {"fixed_lo": float(self.config.params.get("fixed_lo", 0.0)),
                 "fixed_hi": float(self.config.params.get("fixed_hi", 1.0))}
@@ -2967,7 +2975,7 @@ class PanelCard(FluentGroupBox):
             self.plotter = panel_plot(
                 data_x, arr.ravel(), kind="2d", size=size, interactions=False,
                 cmap=str(self.config.params.get("cmap", "inferno")),
-                relim_mode=str(self.config.params.get("relim", "tight")),
+                relim_mode=self._relim(),
                 **self._fixed_lim_kwargs(),
                 labels=(xlabel, ylabel, ""), title=self.config.title or None)
         elif kind == "monitor":
@@ -2977,7 +2985,7 @@ class PanelCard(FluentGroupBox):
                 np.arange(length, dtype=float), history, kind="monitor", size=size, interactions=False,
                 show_dist=bool(self.config.params.get("show_dist", True)),
                 labels=("Shots ago", self._source_axis_label() or label, "Z"),
-                relim_mode=str(self.config.params.get("relim", "tight")),
+                relim_mode=self._relim(),
                 **self._fixed_lim_kwargs(),
                 title=self.config.title or None)
             self.plotter.roll(float(value), draw=False)
@@ -3022,7 +3030,7 @@ class PanelCard(FluentGroupBox):
             self.plotter = panel_plot(
                 data_x, vec, kind="1d", size=size, interactions=False,
                 labels=(xlabel, ylabel, "Z"),
-                relim_mode=str(self.config.params.get("relim", "tight")),
+                relim_mode=self._relim(),
                 **self._fixed_lim_kwargs(),
                 title=self.config.title or None)
             # Colours cycle by column index inside Live1D (confocal-exact: grey, skyblue, ...; a lone
@@ -3920,7 +3928,7 @@ class PanelEditor(QtWidgets.QWidget):
         kind = card.config.kind
         size = card.config.size          # mirror the Monitor frame, never force 2x4
         title = card.config.title or PANEL_KINDS[kind]
-        relim = str(card.config.params.get("relim", "tight"))
+        relim = card._relim()
         cmap = str(card.config.params.get("cmap", "gray" if kind == "sites" else "inferno"))
         try:
             if kind == "2d":
@@ -4007,7 +4015,7 @@ class PanelEditor(QtWidgets.QWidget):
         self.card.config.params["fixed_lo"] = _safe_float(self.ed_fixed_lo.text(), 0.0)
         self.card.config.params["fixed_hi"] = _safe_float(self.ed_fixed_hi.text(), 1.0)
         self.card._push_fixed_lims()
-        if str(self.card.config.params.get("relim")) == "fixed" and self.card.plotter is not None \
+        if self.card._relim() == "fixed" and self.card.plotter is not None \
                 and hasattr(self.card.plotter, "apply_relim_now"):
             self.card.plotter.apply_relim_now()
         self.card.changed.emit()
@@ -4838,9 +4846,7 @@ class TaskConsole(QtWidgets.QWidget):
                 self._remove_logic_node(row, _rebuild=False)
             self.name_edit.setText(state.name)
             for config in state.panels:
-                self._attach_card(PanelCard(config, parent=self.board,
-                                            names_provider=self._signal_names,
-                                            sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, structure_provider=self._signal_structure, calibration_provider=self._running_calibration, short_names_provider=self._signal_short_names, live_namespace_provider=self._expression_namespace))
+                self._attach_card(self._new_panel_card(config))
             for node in state.logic:
                 self._attach_logic_node(node)    # always STOPPED -- Start is manual
             self._arrange()
@@ -4850,6 +4856,18 @@ class TaskConsole(QtWidgets.QWidget):
             card._render_version = -1
         self._recompute_tick_interval()    # the loaded panels' rates set the timer base
         self._update_summary()
+
+    def _new_panel_card(self, config: PanelConfig) -> PanelCard:
+        """Build a PanelCard wired to the console's signal providers -- the ONE place the
+        provider block lives, so adding/renaming a provider is a single edit here instead of three
+        parallel edits at every PanelCard construction site (load_state / _add_panel / a task run) (#A1)."""
+        return PanelCard(
+            config, parent=self.board,
+            names_provider=self._signal_names, sources_provider=self._signal_providers,
+            formats_provider=self._signal_formats, axes_provider=self._signal_axes,
+            sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x,
+            structure_provider=self._signal_structure, calibration_provider=self._running_calibration,
+            short_names_provider=self._signal_short_names, live_namespace_provider=self._expression_namespace)
 
     def _attach_card(self, card: PanelCard) -> None:
         card.setParent(self.board)
@@ -5465,8 +5483,7 @@ class TaskConsole(QtWidgets.QWidget):
         vw = self.scroll.viewport().width() if hasattr(self, "scroll") else 0
         board_w = max(vw, _min_board_width(cfgs + [config])) if vw else _board_width(cfgs + [config])
         config.col, config.row = _first_free_slot(config, cfgs, board_w)
-        card = PanelCard(config, parent=self.board, names_provider=self._signal_names,
-                         sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, structure_provider=self._signal_structure, calibration_provider=self._running_calibration, short_names_provider=self._signal_short_names, live_namespace_provider=self._expression_namespace)
+        card = self._new_panel_card(config)
         self._attach_card(card)
         self._arrange()
         self._mark_dirty()
@@ -5695,8 +5712,7 @@ class TaskConsole(QtWidgets.QWidget):
         # from the task's output buffer (see _tick) -- never a hub signal.
         config = PanelConfig(kind=kind, title=title, size="2x2",
                              source="value = __task_frame__")
-        card = PanelCard(config, parent=self.board, names_provider=self._signal_names,
-                         sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, structure_provider=self._signal_structure, calibration_provider=self._running_calibration, short_names_provider=self._signal_short_names, live_namespace_provider=self._expression_namespace)
+        card = self._new_panel_card(config)
         self._attach_card(card)
         self._task_card = card
         self._running_task_row = row
