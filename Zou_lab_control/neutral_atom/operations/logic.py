@@ -653,7 +653,7 @@ class OccupancyProcessor(Processor):
         # processor picks which to read with (None = the calibration's default).
         self.method = None if method in (None, "") else str(method)
         # The per-site DATA width -- set on the first judged block so structure_provider can
-        # feed the plot's reshape (the (repeat, n_sites) contract).  () until the first shot.
+        # drive the plot's reshape (the (repeat, n_sites) contract).  () until the first shot.
         self.data_shape: tuple = ()
         # The judged frame's (H, W) -- the data_shape of the ``frame_judged`` signal's per-signal
         # structure, set on the first judged block (() until then).
@@ -1226,18 +1226,29 @@ class CalibrateReadoutTask(Task):
     FRAMES_SUBDIR = "frames"
 
     def _save_live_frames(self, ref_groups, readout_by_group) -> None:
-        """Write the live brackets to ``<folder>/frames/`` as a contiguous ``img<n>.npy`` run
-        plus a ``run_schema.json`` at the cali folder root describing the grouping (and the
-        frames sub-folder), so a later source="saved frames" run re-indexes them with
-        ``index_run`` and re-calibrates WITHOUT re-acquiring.  Each group is written in trigger
-        order (the short readout in the middle of its reference frames); the schema records
-        ``shots_per_group`` / ``short_shot`` / ``ref_shots`` / ``frames_subdir`` so the reader
-        reconstructs the exact bracket -- no frame duplication, no hard-coded layout."""
+        """Write the live brackets to ``<folder>/frames/`` as a contiguous ``img<n>.npy`` run --
+        the round-trip DATA -- each paired with an ``img<n>.png`` 2D-image render of the SAME frame,
+        plus a ``run_schema.json`` at the cali folder root describing the grouping (and the frames
+        sub-folder), so a later source="saved frames" run re-indexes them with ``index_run`` and
+        re-calibrates WITHOUT re-acquiring.  Each group is written in trigger order (the short
+        readout in the middle of its reference frames); the schema records ``shots_per_group`` /
+        ``short_shot`` / ``ref_shots`` / ``frames_subdir`` so the reader reconstructs the exact
+        bracket -- no frame duplication, no hard-coded layout.
+
+        The ``.png`` is the operator's eyeball companion to the emCCD bracket frames the cali
+        ACTUALLY used: it is rendered through the frontend viewer seam (the same 2D-image imshow the
+        live console uses), so na never imports the frontend.  Headless (no viewer registered) ->
+        the ``.npy`` data is written exactly the same and the png is simply skipped; a render hiccup
+        never costs the saved ``.npy``."""
         import json
+        from Zou_lab_control._viewer_registry import active_plotter
         from .imageio import save_frame
         folder = Path(self.folder)
         frames_dir = folder / self.FRAMES_SUBDIR
         frames_dir.mkdir(parents=True, exist_ok=True)
+        # png companion: rendered by the frontend's ``save_frame_image`` when a viewer is registered.
+        _plotter = active_plotter()
+        _render_png = getattr(_plotter, "save_frame_image", None) if _plotter is not None else None
         # The readout frame's position within the bracket is the template-derived layout the
         # live acquisition used (``_collect_bracket_groups`` stored it) -- so the saved run
         # re-reads with the SAME grouping the template defines (any frame count, not a hard 3).
@@ -1250,7 +1261,13 @@ class CalibrateReadoutTask(Task):
             shots_per_group = len(group)
             for fr in group:
                 n += 1
-                save_frame(frames_dir / f"img{n}.npy", np.asarray(fr, dtype=float))
+                arr = np.asarray(fr, dtype=float)
+                save_frame(frames_dir / f"img{n}.npy", arr)
+                if _render_png is not None:
+                    try:
+                        _render_png(frames_dir / f"img{n}.png", arr)   # 2D image of this exact frame
+                    except Exception:
+                        pass   # a viewer render hiccup must NEVER lose the round-trip .npy
         short_shot = readout_index + 1                       # 1-based position of the short frame
         ref_shots = [i for i in range(1, shots_per_group + 1) if i != short_shot]
         schema = {"prefix": "img", "shots_per_group": shots_per_group, "short_shot": short_shot,

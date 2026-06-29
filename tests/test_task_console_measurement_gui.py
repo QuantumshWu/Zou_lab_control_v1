@@ -373,7 +373,7 @@ def _camera_console(roi=(1648, 64, 1144, 64)):
     cam = _RoiCamera(roi)
     node = CameraMeasurement(hub, cam)
     state = zf.TaskConsoleState(name="t", panels=[
-        zf.PanelConfig(kind="2d", title="cam", size="2x2", source="value = frame")])
+        zf.PanelConfig(kind="2d", title="cam", size="2x2", source="value = frame_0")])
     console = TaskConsole(hub=hub, state=state, running_nodes=[node])
     console._timer.stop()
     node.step()

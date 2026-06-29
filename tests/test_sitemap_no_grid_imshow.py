@@ -58,7 +58,7 @@ def test_occupied_structure_has_no_grid_shape_so_a_2d_panel_cannot_heatmap_it():
         # panel could reshape (n_sites,) -> (5,7) and imshow a heatmap.
         st = con._signal_structure("occupied")
         assert st is not None, "occupied must resolve a producing-node structure"
-        assert tuple(st["points_shape"]) == (), st                 # no swept points
+        assert tuple(st["points_shape"]) == (1,), st               # no scan -> exactly one data-point (H4c iron law)
         data = tuple(st["data_shape"])
         assert len(data) == 1 and data[0] >= 2, st                 # per-site (n_sites,) DATA
         assert tuple(st["grid_shape"]) == (), (

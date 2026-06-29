@@ -97,9 +97,13 @@ def test_virtual_jupyter_session_runs_end_to_end(tmp_path):
     assert detection.plot is not None
     assert detection.data_figure is detection.plot.data_figure
     assert not hasattr(detection, "truth")
+    from matplotlib.collections import EllipseCollection
     sitemap_radius = next(patch.radius for patch in sitemap.plot.ax.patches if isinstance(patch, Circle))
-    detect_radii = [patch.radius for patch in detection.plot.ax.patches if isinstance(patch, Circle)]
-    assert sitemap_radius in detect_radii
+    # The detection plot is the frontend LiveSiteMap: it draws the site rings as ONE vectorised
+    # EllipseCollection (widths = 2*roi_radius), NOT per-site Circle patches -- so its radius is
+    # roi_radius, and it shares the same _site_radius source as the sitemap's Circle rings.
+    assert any(isinstance(c, EllipseCollection) for c in detection.plot.ax.collections)
+    assert detection.plot.roi_radius == sitemap_radius
     assert sitemap_radius >= 4.5
     assert scan.summary()["finished"] is True
     assert np.all(np.isfinite(scan.fidelities))

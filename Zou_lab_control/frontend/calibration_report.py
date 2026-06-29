@@ -165,4 +165,32 @@ def save_calibration_report(folder, *, counts, thresholds, fidelity, centers,
     return paths
 
 
-__all__ = ["save_calibration_report"]
+def save_frame_image(path, frame, *, title: str | None = None) -> str:
+    """Render ONE raw camera frame as a 2D IMAGE (``imshow`` with the camera colormap + a styled
+    title) and save just the PNG -- the visual companion to that frame's ``.npy`` in the calibration
+    ``frames/`` folder, so the operator can eyeball the emCCD bracket frames the calibration actually
+    used.  NO ``.npz``: the ``.npy`` beside it IS the data.  This images one array exactly the way
+    :class:`live.ImageCell` does (a raw-frame SAVE artifact, not an interactive plot), so it stays off
+    the BaseLivePlot path on purpose.  Drawn on an explicit Agg canvas, so the calibrate task's worker
+    thread can render it without touching pyplot / Qt."""
+    from pathlib import Path as _P
+
+    from .style import DEFAULT_STYLE, PALETTE, apply_title, axis_label_fontsize
+
+    arr = np.asarray(frame, dtype=float)
+    fig = _agg_figure()
+    ax = fig.add_subplot(111)
+    im = ax.imshow(arr, origin="lower", cmap=PALETTE["cmap_camera"], interpolation="none")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fs = axis_label_fontsize()
+    ax.set_xlabel("Camera x (px)", fontsize=fs)
+    ax.set_ylabel("Camera y (px)", fontsize=fs)
+    apply_title(ax, title or _P(path).stem)
+    out = _P(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(str(out), dpi=DEFAULT_STYLE["savefig.dpi"])   # unified high save dpi (same as plot.save)
+    return str(out)
+
+
+__all__ = ["save_calibration_report", "save_frame_image"]

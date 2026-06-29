@@ -265,7 +265,7 @@ best
 
 测温与上面的读出时长扫描**是同一台通用扫描引擎**的另一个实例——只换扫描轴 / 每点采帧方式 / 约简器：两次成像之间把 trap 关掉 `t_off`，原子按热速度自由飞，再开 trap，看还有多少能被重捕。越热飞得越远，存活随 `t_off` 衰减越快——**survival-vs-`t_off` 曲线编码了温度**。曲线只定 `r_c/sqrt(T)`，所以**必须**从阱几何给出捕获半径 `capture_radius`（米）才能定出 T。
 
-下面是**实机一字不变**的配方（唯一虚拟之处仍是相机）。`build_release_recapture_pulse` 建一个 6 周期双触发序列，trap-off 周期的 duration 绑到 scan slot `s0`=`t_off`（与扫描读出时长同一种可扫量）；`exp.readout.temperature` 每点采两帧、按 `calibration.detect` 算逐点存活；`fit_temperature` 是纯后处理。
+下面的配方在实机上**基本一字不变**（唯一虚拟之处仍是相机）——只是 `build_release_recapture_pulse` 默认按 `trap`/`probe`/`emCCD` 三个**角色通道名**建序列;实机通道名不同就把角色名作参数传进去（`build_release_recapture_pulse(channels=..., trap_channel="chNN", probe_channel=..., trigger_channel=...)`）。它建一个 6 周期双触发序列，trap-off 周期的 duration 绑到 scan slot `s0`=`t_off`（与扫描读出时长同一种可扫量）；`exp.readout.temperature` 每点采两帧、按 `calibration.detect` 算逐点存活；`fit_temperature` 是纯后处理。
 
 > **一键 GUI 路径**：同一测量在 Task 控制台里走 `zf.show_task_console(hub=SignalHub(), session=exp, measurements=exp.readout.measurement_specs())`——头部 **Add Panel** 选 `Temperature`，它作为一个 Logic 节点加入，在自己的 **Edit** 页填范围 `t_off`/`shots`/`per_site`、点 **Start**，再加一个 Monitor 面板指向 survival 信号看曲线。`capture_radius` **不在采集表单里**——它是把 survival 曲线变成温度的**后处理 fit 入参**（一个已知的阱几何，不改变发什么/读什么），所以拿到 survival 后用下面的 `fit_temperature(..., capture_radius=...)` 定 T。GUI 的 Start 与下面这行 API 调**同一个建器**，不会漂移。完整的控制台跑实验流程见 `task_console_tutorial.ipynb`。
 

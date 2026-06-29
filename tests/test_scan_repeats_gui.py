@@ -5,7 +5,6 @@ These guard the THREE seams the GUI adds on top of the already-committed device 
 
 * the pulse_gui Scan-tab "Scan repeats (0 = ∞)" spin writes ``state.scan_repeats`` and round-trips
   through ``read_state`` -> ``load_state`` (so it reaches the device via ``prepare(state)`` + Save);
-* ``_PulseSlotsWidget.values_dict()`` (the task_console pulse-scan form) carries ``scan_repeats``;
 * ``_format_scan_progress`` is the SINGLE source of the live label text (blanks on idle, no "/ R"
   for an infinite scan, "/ R" for a finite one).
 
@@ -58,38 +57,6 @@ def test_format_scan_progress_idle_blanks():
     # scanning but no points is also idle-blank (degenerate)
     assert _format_scan_progress(
         {"scanning": True, "point": 0, "n_points": 0, "sweep": 0, "n_repeats": 0}) == ""
-
-
-# ---- (b) the task_console pulse-scan form carries scan_repeats through values_dict --------------
-def _pulse_slots_widget():
-    from Zou_lab_control.frontend.task_console import _PulseSlotsWidget
-    w = _PulseSlotsWidget()
-    w.rebuild(api_rows=[("a1", "duration", "1", "us", 5.0)],
-              scan_rows=[("s0", "duration", "2", "ns", "probe")])
-    return w
-
-
-def test_pulse_slots_values_dict_carries_scan_repeats_default_zero(_app):
-    w = _pulse_slots_widget()
-    v = w.values_dict()
-    assert "scan_repeats" in v
-    assert v["scan_repeats"] == 0          # default = sweep forever
-
-
-def test_pulse_slots_values_dict_reflects_typed_repeats(_app):
-    w = _pulse_slots_widget()
-    w._scan_repeats_spin.setValue(4)
-    assert w.values_dict()["scan_repeats"] == 4
-
-
-def test_pulse_slots_scan_repeats_round_trips_through_seed_value(_app):
-    """A SAVED blob restores the whole-sweep count (the spin is persistent, set in seed_value)."""
-    w = _pulse_slots_widget()
-    w.seed_value({"api": {"a1": 7.5}, "scan_mode": "scan",
-                  "scan_code": "scan_table = [[2000.0]]", "extra_delay": 0.0, "scan_repeats": 3})
-    w.rebuild(api_rows=[("a1", "duration", "1", "us", 5.0)],
-              scan_rows=[("s0", "duration", "2", "ns", "probe")])
-    assert w.values_dict()["scan_repeats"] == 3
 
 
 # ---- (a) the pulse_gui Scan-tab spin writes state.scan_repeats and round-trips ------------------

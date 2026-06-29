@@ -126,7 +126,7 @@ class ParamWidgetContext:
 class RefreshProviders:
     """What :meth:`ParamWidgetHandler.refresh` needs to repopulate a dynamic control.
 
-    ``signals`` / ``sources`` / ``formats`` feed the grouped signal pickers.
+    ``signals`` / ``sources`` / ``formats`` populate the grouped signal pickers.
     ``repopulate`` is a per-widget hook the form supplies for a DEPENDENT combo
     (``pulse_param`` / ``pulse_slots``) whose choices come from a SIBLING template
     field -- the inter-field reactivity stays owned by the form (it knows the sibling

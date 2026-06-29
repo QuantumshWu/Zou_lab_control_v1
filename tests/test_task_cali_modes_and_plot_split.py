@@ -305,6 +305,65 @@ def test_calibrate_task_live_save_frames_round_trip(tmp_path):
         exp.close()
 
 
+def test_calibrate_task_live_save_frames_writes_a_png_companion_per_npy(tmp_path):
+    """#5: every saved emCCD bracket frame (``img<n>.npy``, the round-trip DATA) gets a paired
+    ``img<n>.png`` 2D-IMAGE companion so the operator can eyeball the frames the cali actually
+    used.  The png is rendered through the viewer SEAM (``active_plotter().save_frame_image``) --
+    na never imports the frontend -- so this pins the wiring: ONE png call per saved npy, same
+    stem, in the frames sub-folder.  (Headless with NO viewer -> npy only; covered by the
+    round-trip test above, which registers no plotter and asserts only the npy.)"""
+    import Zou_lab_control.frontend  # noqa: F401 -- ensure the real viewer is registered
+    from Zou_lab_control._viewer_registry import active_plotter, register_plotter
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+
+    orig = active_plotter()
+    assert orig is not None, "the frontend viewer must be registered for this end-to-end seam test"
+
+    class _RecordingPlotter:                                  # wraps the REAL viewer, records the frame-png call
+        def __init__(self, inner):
+            self._inner = inner
+            self.calls = []
+        def save_frame_image(self, path, frame, *, title=None):
+            self.calls.append((Path(path).name, tuple(np.asarray(frame).shape)))
+            return self._inner.save_frame_image(path, frame, title=title)   # render the REAL png
+        def __getattr__(self, name):                         # everything else (plot/display/...) -> the real viewer
+            return getattr(self._inner, name)
+
+    exp = _calibrated()
+    rec = _RecordingPlotter(orig)
+    register_plotter(rec)
+    try:
+        folder = tmp_path / "live_saved_png"
+        n_groups = 2
+        made = exp.readout.calibrate_task(
+            SignalHub(), source="live", folder=str(folder), save_frames=True,
+            threshold_frames=n_groups)
+        made.run_to_completion()
+        frames_dir = folder / "frames"
+        npys = sorted(frames_dir.glob("img*.npy"))
+        pngs = sorted(frames_dir.glob("img*.png"))
+        assert len(npys) == n_groups * 3                     # 3 frames/group (ref-short-ref)
+        # one png companion per npy, SAME stem (img1.npy <-> img1.png)
+        assert [p.stem for p in pngs] == [p.stem for p in npys]
+        assert len(rec.calls) == len(npys)                   # the seam was called once per saved frame
+        assert all(name.endswith(".png") and len(shape) == 2 for name, shape in rec.calls)
+    finally:
+        register_plotter(orig)                               # never leak the recording plotter into other tests
+        exp.close()
+
+
+def test_frontend_save_frame_image_renders_a_real_png_only(tmp_path):
+    """#5 render side: the frontend ``save_frame_image`` images ONE raw frame (2D imshow, camera
+    cmap + styled title) and writes a real, non-empty PNG -- and ONLY the png (NO ``.npz``: the
+    ``.npy`` beside it in the frames folder IS the data, unlike a plot.save which pairs png+npz)."""
+    from Zou_lab_control.frontend.calibration_report import save_frame_image
+
+    frame = np.random.default_rng(0).normal(600.0, 30.0, size=(40, 50))
+    out = Path(save_frame_image(tmp_path / "img1.png", frame))
+    assert out.exists() and out.suffix == ".png" and out.stat().st_size > 0
+    assert not (tmp_path / "img1.npz").exists()              # png only -- the data lives in the .npy companion
+
+
 def test_calibrate_task_live_save_frames_off_writes_no_frames(tmp_path):
     """save_frames=False writes ONLY the calibration + report -- no raw frames, no schema,
     no frames sub-folder."""

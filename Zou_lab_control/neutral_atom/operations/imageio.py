@@ -84,7 +84,14 @@ def _frame_number(path: Path, prefix: str) -> int | None:
 
 
 def frame_files(folder: str | Path, prefix: str) -> dict[int, Path]:
-    """Map ``{frame_number: path}`` for every ``PREFIX<number>`` raw frame in ``folder``."""
+    """Map ``{frame_number: path}`` for every ``PREFIX<number>`` raw frame in ``folder``.
+
+    A frame's DATA is its ``.npy``; a same-numbered ``.png``/``.tif`` beside it is a VISUAL
+    companion (the cali save path writes ``img<n>.npy`` data + an ``img<n>.png`` picture so the
+    operator can eyeball it).  When both exist for one number, the ``.npy`` WINS -- the picture
+    companion must never shadow the round-trip data (re-reading the png as a frame would fail: it
+    is RGBA, not a 2D count map).  A run with only image-suffix frames (a real qCMOS that wrote
+    ``.tif``, no companion) still reads those -- the rule only disambiguates a genuine collision."""
 
     folder = Path(folder).expanduser()
     if not folder.exists():
@@ -92,8 +99,12 @@ def frame_files(folder: str | Path, prefix: str) -> dict[int, Path]:
     out: dict[int, Path] = {}
     for p in sorted(folder.iterdir()):
         n = _frame_number(p, prefix) if p.is_file() else None
-        if n is not None:
-            out[n] = p
+        if n is None:
+            continue
+        prev = out.get(n)
+        if prev is not None and prev.suffix.lower() == ".npy" and p.suffix.lower() != ".npy":
+            continue                                   # keep the .npy data, skip its picture companion
+        out[n] = p
     return out
 
 
