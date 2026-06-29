@@ -626,8 +626,8 @@ def _scan_ramb(bank_size: int, p: StreamerParams) -> int:
 
 
 def estimate_resources(params: StreamerParams, *, part, target_pct: float = 90.0,
-                       slot_mul_width: int = 25, engine_logic_luts: int = 14405,
-                       engine_ff: int = 9000, engine_dsp: int | None = None) -> dict:
+                       slot_mul_width: int = 25, engine_logic_luts: int = 12843,
+                       engine_ff: int = 11502, engine_dsp: int | None = None) -> dict:
     """Resource usage of a CONCRETE ``StreamerParams`` vs a part, per axis.
 
     This is the single accounting model shared by :func:`solve_capacity` (which
@@ -635,17 +635,17 @@ def estimate_resources(params: StreamerParams, *, part, target_pct: float = 90.0
     (which reports whether the configured geometry fits as-is).  Returns
     ``{"ramb36"|"lut"|"ff"|"dsp": {"used","budget","total","pct","ok"}}``.
 
-    LUT is CALIBRATED to a REAL Vivado 2019.1 SYNTH+PLACE of the current 35T build
-    (2026-06-11): the placer needed 21933 slice LUTs at evt_fifo_depth=256 /
-    bus_evt_fifo_depth=64 (the build that OVERFLOWED 20800).  ``engine_logic_luts``
-    (=14405) is the fixed, non-depth-scaled remainder (control logic + edge/scan/DSP
-    glue) once the bus-segment LUTRAM and the two event-FIFO terms (ttl_sched + dac_evt,
-    which DO scale with evt_fifo_depth / bus_evt_fifo_depth) are subtracted -- so the
-    model now reproduces 21933 at (256/64) and predicts other depths honestly (the old
-    8000 base under-read the real placement by ~40%).  The 40 DA bits cost ~2.2x per
-    depth-tick vs the 18 TTL channels, so DEEPENING DA is far pricier than deepening TTL.
-    FF/DSP/RAMB36 are estimates; edge fields are parallel BRAMs and the event FIFOs are
-    distributed RAM (LUTs in SLICEM, no RAMB36)."""
+    LUT is CALIBRATED to a REAL Vivado 2019.1 SYNTH+PLACE+ROUTE of the current 35T build
+    (2026-06-29, zlc_pulse_streamer_top_utilization_routed.rpt): 18607 of 20800 slice LUTs
+    (89.5%, FITS) at evt_fifo_depth=128 / bus_evt_fifo_depth=64.  ``engine_logic_luts``
+    (=12843) is the fixed, non-depth-scaled remainder (logic LUTs + the LUTRAM the geometry
+    terms below do not capture) once the bus-segment LUTRAM and the two event-FIFO terms
+    (ttl_sched + dac_evt, which DO scale with evt_fifo_depth / bus_evt_fifo_depth) are
+    subtracted -- so the model reproduces the real 18607 at (128/64) and predicts other
+    depths honestly.  The 40 DA bits cost ~2.2x per depth-tick vs the 18 TTL channels, so
+    DEEPENING DA is far pricier than deepening TTL.  FF (real 11502), DSP (real 52, exact)
+    and RAMB36 (real 40) are calibrated to the same routed build; edge fields are parallel
+    BRAMs and the event FIFOs are distributed RAM (LUTs in SLICEM, no RAMB36)."""
     prof = part_profile(part)
     pct = max(1.0, min(100.0, float(target_pct)))
     ramb36_used = (_edge_ramb(params.max_edges, params) + _scan_ramb(params.bank_size, params)
@@ -706,14 +706,15 @@ def solve_capacity(part, *, channel_count: int = 62, num_slots: int = 4, coeff_w
                    slot_mul_width: int = 25,
                    target_pct: float = 90.0, bank_size: int = 2048,
                    max_edges_cap: int = 16384,
-                   engine_logic_luts: int = 14405, engine_ff: int = 9000, engine_dsp: int | None = None) -> SolvedCapacity:
+                   engine_logic_luts: int = 12843, engine_ff: int = 11502, engine_dsp: int | None = None) -> SolvedCapacity:
     """Maximise max_edges under <=target_pct of the part's RAMB36 (edges are the
     bounded resource; scan points are UNBOUNDED via streaming, so only the 2-bank
     window costs BRAM).  Edge fields are parallel BRAMs (no width padding).
 
-    LUT/FF/DSP estimates are CALIBRATED to a real Vivado 2019.1 place+route of the
-    35T build (zlc_pulse_streamer_top): 7376 slice LUTs (35%), 8059 FF (19%), 52
-    DSP (58%), 40 RAMB36 (80%).  The defaults below sit just above those with margin
+    LUT/FF/DSP/RAMB36 estimates are CALIBRATED to a real Vivado 2019.1 place+ROUTE of the
+    35T build (zlc_pulse_streamer_top, 2026-06-29 routed): 18607 slice LUTs (89%), 11502 FF
+    (28%), 52 DSP (58%), 40 RAMB36 (80%) at evt_fifo_depth=128 / bus_evt_fifo_depth=64.  The
+    LUT/FF defaults reproduce those at this geometry and scale the depth-driven LUTRAM terms,
     so the contract test catches a regression that would push any axis past 90%."""
     prof = part_profile(part)
     pct = max(1.0, min(100.0, float(target_pct)))

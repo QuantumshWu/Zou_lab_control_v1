@@ -1628,9 +1628,9 @@ def test_final_image_solver_90pct_and_packs_round_trip():
     assert s.params.max_edges >= 4096
     assert s.params.bank_size >= 512
     # RAMB36 is the solver's BINDING axis (edges are BRAM-bound) and stays <=90% of the part.
-    # LUT is the TIGHT axis now (~97% at the accepted TTL=128 / DA=64 event-FIFO depths -- the
-    # estimate is calibrated to a real 35T placement, see image.estimate_resources), so every
-    # axis is checked against the DEVICE (<=100%), not the 90% soft target.
+    # LUT now FITS the 90% target too (~89% at the accepted TTL=128 / DA=64 event-FIFO depths --
+    # the estimate is calibrated to the real 2026-06-29 35T ROUTED build, see
+    # image.estimate_resources), so every axis is comfortably under the device.
     assert s.resource_report["ramb36"]["pct"] <= 90.0
     assert all(r["pct"] <= 100.0 for r in s.resource_report.values())
     # DSP = the affine-MAC eval sites (bus start/stop + the 5 main sites); must match the engine.
@@ -6280,9 +6280,9 @@ def test_streamer_config_is_single_source_for_host_geometry():
 def test_estimate_resources_matches_solve_capacity_and_reports_pass_fail():
     """solve_capacity now delegates its accounting to estimate_resources (one model), and
     check_config_capacity (the estimate_resources.bat backend) reports per-axis fit.  The
-    configured 35T design FITS THE DEVICE on every axis, but LUT runs over the 90% soft
-    target (~97% at the accepted TTL=128 / DA=64 event-FIFO depths -- calibrated to a real
-    placement), so the overall 'ok' is False while ff/dsp/ramb36 individually stay in budget."""
+    configured 35T design FITS THE DEVICE and stays under the 90% soft target on EVERY axis
+    -- the estimate is calibrated to the REAL 2026-06-29 routed build (LUT 18607/20800 = 89%
+    at the accepted TTL=128 / DA=64 event-FIFO depths), so the overall 'ok' is True."""
 
     from fpga.pulse_streamer.host import image as im
 
@@ -6290,12 +6290,11 @@ def test_estimate_resources_matches_solve_capacity_and_reports_pass_fail():
     assert im.estimate_resources(s.params, part="xc7a35t", target_pct=90.0) == s.resource_report
 
     result = im.check_config_capacity()
-    assert result["report"]["lut"]["pct"] <= 100.0                 # LUT fits the device...
-    assert not result["report"]["lut"]["ok"]                       # ...but is over the 90% target
-    assert all(result["report"][axis]["ok"] for axis in ("ff", "dsp", "ramb36"))
+    assert result["report"]["lut"]["pct"] <= 90.0                  # LUT now fits UNDER the 90% target...
+    assert all(result["report"][axis]["ok"] for axis in ("lut", "ff", "dsp", "ramb36"))  # ...and every axis is in budget
     text = im.format_capacity_report(result)
-    # honest verdict: LUT is over the 90% target at the accepted TTL=128/DA=64 depths.
-    assert "INSUFFICIENT" in text and "LUT" in text and "RAMB36" in text
+    # honest verdict: the 35T HAS enough resources at the accepted TTL=128/DA=64 depths.
+    assert "HAS enough resources" in text and "INSUFFICIENT" not in text
 
 
 # --------------------------------------------------------------------------- #
