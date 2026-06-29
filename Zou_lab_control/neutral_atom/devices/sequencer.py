@@ -440,6 +440,7 @@ def compile_pulse_table_runtime_program(
         state,
         slots=slot_values,
         time_step_ns=clock_step_ns,
+        loops=bool(repeat_forever),     # steady-state ramp baseline only when the frame loops (#ramp-loop)
     )
     # When buses are emitted as SEGMENTS, their (now nominal-phase) delay is realised by the
     # LITERAL per-bus delay line; pass the raw bus delays so they share the SAME global shift G
@@ -665,6 +666,7 @@ def compile_pulse_table_scan_runtime_program(
             time_step_ns=clock_step_ns,
             slot_vars=slot_vars,
             coeff_frac_bits=coeff_frac_bits,
+            loops=bool(repeat_forever),     # steady-state ramp baseline when the scan frame loops (#ramp-loop)
         )
         bus_members = [channel for members in state.bus_channels().values() for channel in members]
 
@@ -2274,6 +2276,7 @@ def _pulse_table_bus_segments(
     time_step_ns: float,
     slot_vars: Sequence[str] | None = None,
     coeff_frac_bits: int = 8,
+    loops: bool = False,
 ) -> tuple[list[str], list[RuntimeBusSegment], dict[int, int]]:
     """Compile logical analog buses into hardware bus segments.
 
@@ -2348,58 +2351,86 @@ def _pulse_table_bus_segments(
         # offset-binary CODE = signed + zero_code.  The hardware idles at zero_code
         # (BUS_SAFE_VALUE), so carried starts there -- an edge to signed 0 is a no-op.
         zero_code = 1 << (len(members) - 1)
-        carried_value = zero_code
-        carried_select = 0
-        for period_index in range(len(state.periods)):
-            entry = plan[period_index] if period_index < len(plan) else {"mode": "hold", "value": None}
-            mode = str(entry.get("mode", "hold")).strip().lower()
-            value = entry.get("value")
-            if mode not in {"edge", "ramp"} or value is None:
-                continue  # hold -> carried value persists in the engine
-            ref_index = _slot_ref_index(value, slot_vars)
-            if ref_index is not None:
-                value_select = ref_index + 1
-                value_int = 0  # placeholder; the FPGA reads the (code) slot at runtime
-            else:
-                value_select = 0
-                # On the STATIC path (slot_vars empty -- e.g. the payload dispatcher degrades a
-                # bound-but-unfilled DAC scan to a static program), a value may still be a slot
-                # ref like "s0".  Resolve it from the provided slots (reference values) instead
-                # of int("s0")-crashing.
-                slot_idx = _parse_slot_ref_index(value)
-                if slot_idx is not None:
-                    key = str(value).strip()
-                    if slots is None or key not in slots:
-                        raise ValueError(
-                            f"analog bus {bus_name!r} references unresolved scan slot {key!r}; "
-                            "provide its value or a scan table.")
-                    value = slots[key]
-                # signed user value -> offset-binary wire code
-                value_int = max(0, min(max_value, int(round(float(value))) + zero_code))
-            start_ref, start_base, start_coeffs = _boundary(period_index)
-            if start_ref < 0 or start_ref > table_end:
-                raise ValueError(f"analog bus {bus_name!r} produced segment tick {start_ref} outside the uploaded table.")
-            if mode == "edge":
-                # Emit only when the level actually changes -- an edge to the value the
-                # engine already holds (e.g. edge 0 at the start, when the bus is 0) is a
-                # no-op, so skipping it keeps the segment table minimal.
-                if not (value_int == carried_value and value_select == carried_select):
-                    segments.append(RuntimeBusSegment(
-                        bus_index, start_base, start_base, value_int, value_int, "edge", bus_name,
-                        value_select, _coeffs(start_coeffs), _coeffs(start_coeffs),
-                        stop_value_select=value_select,
-                    ))
-            else:  # ramp within THIS period: carried-in value -> value, over [start_i, start_{i+1})
-                end_ref, end_base, end_coeffs = _boundary(period_index + 1)
-                if end_ref < start_ref:
-                    raise ValueError(f"analog bus {bus_name!r} ramp end precedes its start.")
-                segments.append(RuntimeBusSegment(
-                    bus_index, start_base, end_base, carried_value, value_int, "ramp", bus_name,
-                    carried_select, _coeffs(start_coeffs), _coeffs(end_coeffs),
-                    stop_value_select=value_select,
-                ))
-            carried_value = value_int
-            carried_select = value_select
+
+        def _emit(ramp_seed_value: int, ramp_seed_select: int, *, emit: bool = True):
+            """Walk this bus's periods, returning (segments, final_value, final_select).
+
+            TWO carried-in trackers, because a looping program's loop-entry value (the END-of-frame
+            value the bus holds across the wrap) is NOT the idle 0 V of the very first fire (#ramp-loop):
+              * ``carried`` is the RAMP-START baseline -- seeded with ``ramp_seed`` (the loop-entry value
+                for a looping program), so a "ramp to V" entered with V already held compiles FLAT, not
+                a 0->V ramp re-run every loop.
+              * ``held`` is what the engine holds on the FIRST PLAY (always idle 0 V = zero_code).  The
+                edge no-op skip compares against THIS, so a period-0 edge is still emitted (it must set
+                the bus from idle on the first play) -- never dropped just because the looped-in baseline
+                already equals it.  Both update to the period's value after each period."""
+            bus_segs: list[RuntimeBusSegment] = []
+            carried_value, carried_select = ramp_seed_value, ramp_seed_select
+            held_value, held_select = zero_code, 0
+            for period_index in range(len(state.periods)):
+                entry = plan[period_index] if period_index < len(plan) else {"mode": "hold", "value": None}
+                mode = str(entry.get("mode", "hold")).strip().lower()
+                value = entry.get("value")
+                if mode not in {"edge", "ramp"} or value is None:
+                    continue  # hold -> carried value persists in the engine
+                ref_index = _slot_ref_index(value, slot_vars)
+                if ref_index is not None:
+                    value_select = ref_index + 1
+                    value_int = 0  # placeholder; the FPGA reads the (code) slot at runtime
+                else:
+                    value_select = 0
+                    # On the STATIC path (slot_vars empty -- e.g. the payload dispatcher degrades a
+                    # bound-but-unfilled DAC scan to a static program), a value may still be a slot
+                    # ref like "s0".  Resolve it from the provided slots (reference values) instead
+                    # of int("s0")-crashing.
+                    slot_idx = _parse_slot_ref_index(value)
+                    if slot_idx is not None:
+                        key = str(value).strip()
+                        if slots is None or key not in slots:
+                            raise ValueError(
+                                f"analog bus {bus_name!r} references unresolved scan slot {key!r}; "
+                                "provide its value or a scan table.")
+                        value = slots[key]
+                    # signed user value -> offset-binary wire code
+                    value_int = max(0, min(max_value, int(round(float(value))) + zero_code))
+                start_ref, start_base, start_coeffs = _boundary(period_index)
+                if start_ref < 0 or start_ref > table_end:
+                    raise ValueError(f"analog bus {bus_name!r} produced segment tick {start_ref} outside the uploaded table.")
+                if mode == "edge":
+                    # Emit only when the level actually changes vs the FIRST-PLAY held value (idle 0 at
+                    # the start) -- an edge to the value the engine already holds is a no-op, so skipping
+                    # it keeps the segment table minimal; comparing against ``held`` (not the looped-in
+                    # ramp baseline) keeps a period-0 edge that sets the bus from idle (#ramp-loop).
+                    if emit and not (value_int == held_value and value_select == held_select):
+                        bus_segs.append(RuntimeBusSegment(
+                            bus_index, start_base, start_base, value_int, value_int, "edge", bus_name,
+                            value_select, _coeffs(start_coeffs), _coeffs(start_coeffs),
+                            stop_value_select=value_select,
+                        ))
+                else:  # ramp within THIS period: carried-in value -> value, over [start_i, start_{i+1})
+                    end_ref, end_base, end_coeffs = _boundary(period_index + 1)
+                    if end_ref < start_ref:
+                        raise ValueError(f"analog bus {bus_name!r} ramp end precedes its start.")
+                    if emit:
+                        bus_segs.append(RuntimeBusSegment(
+                            bus_index, start_base, end_base, carried_value, value_int, "ramp", bus_name,
+                            carried_select, _coeffs(start_coeffs), _coeffs(end_coeffs),
+                            stop_value_select=value_select,
+                        ))
+                carried_value, carried_select = value_int, value_select
+                held_value, held_select = value_int, value_select
+            return bus_segs, carried_value, carried_select
+
+        # The RAMP-START baseline entering period 0: idle 0 V for a single-shot fire, but for a LOOPING
+        # program (repeat_forever) the END-of-frame value the bus holds across the wrap -- so a ramp to a
+        # value the previous frame already holds is FLAT, not a 0->V ramp re-run every loop (#ramp-loop;
+        # e.g. [ramp 500, hold 500] looping holds 500, not a sawtooth from 0).  The final carried is
+        # seed-independent, so one no-emit walk from idle finds the loop-entry value.
+        ramp_seed_value, ramp_seed_select = zero_code, 0
+        if loops:
+            _, ramp_seed_value, ramp_seed_select = _emit(zero_code, 0, emit=False)
+        bus_segs, _, _ = _emit(ramp_seed_value, ramp_seed_select)
+        segments.extend(bus_segs)
     return bus_names, segments, bus_delays
 
 

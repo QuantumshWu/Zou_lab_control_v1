@@ -1273,6 +1273,27 @@ def test_dac_ramp_spans_current_period_with_hold_carry_and_edge_step():
     assert wave[160] == 512 and wave[199] == 512
 
 
+def test_looping_ramp_to_a_held_value_compiles_flat_not_a_per_loop_sawtooth():
+    """#ramp-loop: a [ramp V, hold V] DAC bus on a REPEAT_FOREVER program must hold FLAT at V.  The bus
+    steady-states at the END-of-frame value across the loop wrap, so period 0's ramp starts from the
+    looped-in V (flat), NOT from 0 V every iteration (the reported sawtooth bug: it compiled a 0->V ramp
+    re-run each loop).  A genuinely SINGLE-SHOT fire still ramps from the real idle 0 V."""
+    from fpga.pulse_streamer.host.engine_model import bus_play
+    ch = [f"da[{i}]" for i in range(10)] + ["t"]
+    state = na.PulseTableState(
+        channels=ch, visible_channels=ch,
+        periods=[na.PulsePeriod(1000, tuple([0] * 11), unit="ns") for _ in range(2)],
+        channel_labels={f"da[{i}]": f"da[{i}]" for i in range(10)},
+        time_step_ns=20.0, name="ramp_loop")
+    state.set_analog_bus_mode(0, "da", "ramp", value=200)   # ramp to +200 (code 712)
+    state.set_analog_bus_mode(1, "da", "hold")              # then hold it, looping
+    looped = bus_play(state.compile(clock_hz=50_000_000), 0, 100)        # repeat_forever=True (default)
+    assert all(w == 712 for w in looped), looped[:8]                     # FLAT at +200 every tick, no 0->V ramp
+    single = bus_play(state.compile(clock_hz=50_000_000, repeat_forever=False), 0, 100)
+    assert single[0] == 512                                             # single-shot starts at idle 0 V (code 512)
+    assert any(512 < w < 712 for w in single) and max(single) >= 711    # ... and genuinely RAMPS up to +200
+
+
 def test_clk_channel_excluded_from_engine_and_carried_as_mask(tmp_path):
     """A channel marked clk is wired to the FPGA clk by the top: it is removed from the
     edge masks, ships as a clk_enable bitmask, survives save/load, and round-trips through
