@@ -6041,7 +6041,19 @@ class TaskConsole(QtWidgets.QWidget):
             return
         if not path.lower().endswith(".png"):
             path += ".png"
-        pm = self.board.grab()                    # the board bounds every card (arrange grows its min size)
+        # Grab ONLY the MINIMAL rectangle that bounds the laid-out cards (union of their geometries +
+        # one GAP margin), NOT the whole board widget -- the board is sized to fill the scroll viewport
+        # (setWidgetResizable), so grabbing it would bake in a big empty plot area below/right of the
+        # panels.  Clamp to the board so the sub-rect is valid; empty board -> the whole (tiny) board.
+        cards = list(self.cards)
+        if cards:
+            rect = cards[0].geometry()
+            for card in cards[1:]:
+                rect = rect.united(card.geometry())
+            rect = rect.adjusted(-GAP, -GAP, GAP, GAP).intersected(self.board.rect())
+            pm = self.board.grab(rect)
+        else:
+            pm = self.board.grab()
         # _PanelBoard is transparent -> composite onto an opaque white canvas so the PNG isn't see-through.
         canvas = QtGui.QPixmap(pm.size())
         canvas.fill(QtGui.QColor("#FFFFFF"))
