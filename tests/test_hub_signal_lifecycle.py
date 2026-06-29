@@ -99,6 +99,34 @@ def test_restart_reclaims_its_own_lingering_prefix_not_a_new_one():
         exp.close()
 
 
+def test_declared_signal_name_equals_the_name_the_node_publishes():
+    """#prebind: a Plot wired to a measurement's 'survival' BEFORE it starts must keep working once the
+    node publishes. That holds iff the DECLARED picker name == the PUBLISHED hub name. A measurement
+    node publishes under 'f{spec.key}_' (temperature_survival), so the declared key the picker offers
+    (and a binding / a saved layout stores) must be that SAME prefixed name -- never the bare
+    'survival', which never re-resolves once the producer starts under its real name."""
+    from types import SimpleNamespace
+    from Zou_lab_control.frontend.task_console import LogicNodeConfig, strip_node_prefix
+    exp, console = _console()
+    try:
+        spec = next(s for s in exp.readout.measurement_specs() if getattr(s, "key", "") == "temperature")
+        row = SimpleNamespace(node=LogicNodeConfig(kind="measurement", name=spec.name, title=spec.name))
+        declared = console._declared_signal_keys(row)
+        pfx = console._declared_node_prefix(row)
+        # declared == the FULL names a ScannedMeasurementNode(prefix=f"{spec.key}_") publishes
+        assert pfx == f"{spec.key}_"
+        assert set(declared) == {f"{spec.key}_{spec.x_key}", f"{spec.key}_{spec.y_key}"}
+        assert "temperature_survival" in declared, declared
+        # the Logic-row legend still shows the SHORT name (prefix stripped), like the running path
+        assert [strip_node_prefix(k, pfx) for k in declared] == [spec.x_key, spec.y_key]
+        # a processor keeps its empty-default prefix (so existing bare 'occupied' bindings are unchanged)
+        proc = SimpleNamespace(node=LogicNodeConfig(kind="processor", name="Judge occupancy", title="Judge occupancy"))
+        assert console._declared_node_prefix(proc) == ""
+    finally:
+        console.shutdown()
+        exp.close()
+
+
 def _add_node(console, match):
     kc = console.kind_combo
     for i in range(kc.count()):

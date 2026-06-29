@@ -5203,15 +5203,33 @@ class TaskConsole(QtWidgets.QWidget):
         if node is not None and getattr(node, "running", False):
             row.set_publishes(self._live_node_formats(node))
             return
-        row.set_publishes([(k, "—", "") for k in self._declared_signal_keys(row)])
+        # The legend shows the SHORT name (strip the node prefix), exactly like the running path
+        # (_live_node_formats); _declared_signal_keys now returns the FULL published names (#prebind).
+        pfx = self._declared_node_prefix(row)
+        row.set_publishes([(strip_node_prefix(k, pfx), "—", "") for k in self._declared_signal_keys(row)])
+
+    def _declared_node_prefix(self, row: "LogicNodeRow") -> str:
+        """The hub-signal PREFIX the row's node will publish under once started -- the SAME prefix the
+        build path uses, so a declared name == the published name (a binding made before Start, or
+        restored from a saved layout, re-attaches the instant the producer starts, #prebind).
+        Measurement: the slug ``f"{spec.key}_"`` (what ScannedMeasurementNode/PulseScanNode get at
+        build); processor: the per-instance ``_logic_node_prefix``; camera/task: ``""`` (a camera
+        publishes ``frame_i`` bare, a task's mid-run entry is a synthetic display tag, not a hub name)."""
+        node = row.node
+        if node.kind == "measurement":
+            return f"{self._spec_for_logic(node).key}_"
+        if node.kind == "processor":
+            return self._logic_node_prefix(node)
+        return ""
 
     def _declared_signal_keys(self, row: "LogicNodeRow") -> list[str]:
-        """The bare signal names a STOPPED Logic-tab node WILL publish once started -- the
-        single source for both the row's "publishes:" legend AND the signal picker's
-        declared-but-not-yet-published entries (so a Monitor can be wired to a node's output
-        before that node is started).  A processor publishes its ``result_keys``; a camera
-        publishes one ``frame_i`` PER emCCD event (``frames_per_cycle``); a measurement publishes its
-        ``x_key``/``y_key`` curve; a task streams a mid-run key."""
+        """The FULL hub names a STOPPED Logic-tab node WILL publish once started -- IDENTICAL to the
+        running node's ``published_signals()`` (same node prefix, #prebind), so the picker offers, and
+        a Monitor binding stores, the SAME name the node later emits.  That makes a "connect first,
+        start later" binding (and a save->load of one) re-attach automatically when the producer
+        publishes that exact name.  A processor publishes its ``result_keys``; a camera one ``frame_i``
+        PER emCCD event (``frames_per_cycle``); a measurement its ``x_key``/``y_key`` curve; a task
+        streams a (synthetic, off-hub) mid-run key."""
         spec = self._spec_for_logic(row.node)
         keys = list(getattr(spec, "result_keys", ()) or [])
         if not keys and row.node.kind == "measurement":
@@ -5222,9 +5240,10 @@ class TaskConsole(QtWidgets.QWidget):
             # design had, which left a phantom "frame waiting" while the camera emits frame_0/1/2, #residue).
             from Zou_lab_control.neutral_atom.operations.logic import camera_frame_keys
             keys = camera_frame_keys(row.node.values.get("frames_per_cycle", 1))
-        if not keys and row.node.kind == "task":          # off-hub one-shot, mid-run stream
-            keys = [f"{getattr(spec, 'mid_run_key', 'frame')} (mid-run)"]
-        return keys
+        if not keys and row.node.kind == "task":          # off-hub one-shot, SYNTHETIC mid-run tag (never a hub signal)
+            return [f"{getattr(spec, 'mid_run_key', 'frame')} (mid-run)"]
+        pfx = self._declared_node_prefix(row)              # prepend the node prefix -> == published_signals()
+        return [f"{pfx}{k}" for k in keys]
 
     def _node_for_signal(self, name: str):
         """The producing node for signal ``name``: a RUNNING node first, else the last build of a
