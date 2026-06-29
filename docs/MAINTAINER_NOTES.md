@@ -1574,3 +1574,58 @@ contract test — the single mechanical guard. Change the framework = change the
   `_compact` is a top-left gravity packer (see the board section above) that leaves exactly `GAP` on
   all four sides of every card and as the origin margin, so spacing is uniform, never a leftover-pixel
   gap. Guard: `tests/test_panel_grid_spacing.py`, `tests/test_board_gravity.py`.
+
+
+## 22. Systematic single-source review — where each "one fact" now lives (2026-06-29)
+
+A 7-wave DRY/decoupling pass turned "the same fact copied in N places, kept in sync by hand"
+into ONE structurally-enforced source (a helper / constant / `__post_init__` / contract test).
+Behaviour-neutral throughout. The single sources added/relocated, by layer:
+
+**timing**
+- `timing.pulse_table.resolve_pulse_template(template, *, default_name, default_factory)` — the ONE
+  pulse-template path resolver (the Calibrate task + the Pulse-scan measurement delegate). Anchors
+  the `pulses/` lookup to the project root via `_paths.project_path`, NOT a per-caller `parents[N]`
+  count.
+- `PulseTableState._set_bus_target(bus, period_index, value)` — the ONE "keep a ramp, else force an
+  edge" rule + `analog_bus_modes` plan writeback (scan-slot bind / api-field set / slot resolve).
+- `timing.pulse_table.scan_target_label` — the ONE STATE-FUL name label for a `(kind, target)`;
+  `enumerate_pulse_params` routes every label through it (the GUI dropdown + the scan axis read
+  identically). Its complement is the frontend's STATE-FREE index label `pulse_gui.slot_label`.
+
+**devices**
+- `RuntimeSequenceProgram.__post_init__` — the ONE enforcement of "a finite K-sweep
+  (`scan_repeats>0`) needs >= 2 scan points": on the COMPILED program (the single chokepoint the
+  real + virtual backends both build), never the eager `PulseTableState.validate` (which would
+  raise on a legitimate GUI mid-edit). Guard: `tests/test_audit_hardening.py`.
+
+**analysis (core / operations / subsystems)**
+- `core.analysis.fit_gaussian_spot_2d(data, yy, xx, *, x0, y0, offset0, amp)` — the ONE 2D-gaussian
+  spot fit (`_gauss2d` model + bounds + centroid fallback); `psf.fit_site_psfs` + the sub-pixel
+  `analysis._refine_center_subpixel` both call it.
+- `operations.measurement.otsu_fidelity_from_frames(frames, calibration, site)` — the ONE
+  signals -> `(counts, threshold, FidelityEstimate)` pipeline; the live `OtsuFidelityReducer` and the
+  held-out reference path in `subsystems/readout.py::_scan_detection_time` both delegate.
+- `core.calibration.TrapCalibration.with_thresholds` / `with_method_thresholds` use
+  `dataclasses.replace` (re-runs `__post_init__`) instead of re-spelling every field; `to_dict`/
+  `from_dict` stay explicit per-field. Guard: the `set(to_dict()) == {fields}` parity assertion in
+  `test_neutral_atom_lightweight::test_psf_calibration_serialization_round_trip`.
+- `operations.calibration.ALL_READOUT_METHODS` — the ONE readout-method allowlist (defined above the
+  first function so `calibrate_sitemap_from_images` validates `method` against it).
+
+**frontend (art-internal; na never imports frontend)**
+- `BaseLivePlot._build_distribution_band(image_artist, values, *, n_bins, guide_minmax)` — the ONE
+  side clim-distribution band (`Live2DDis` + `LiveSiteMap`): histogram poly + draggable clim lines +
+  DragHLine, guide lines drawn (same artist order) only when `guide_minmax` is given. Strictly
+  appearance-neutral (rendered-PNG pixel-diff identical).
+- `frontend.site_map(centers, occupied, *, image, roi_radius, labels)` — the sealed site-map view
+  (a `LiveSiteMap`), registered on the viewer namespace. `views/plots.py::plot_detection_image`
+  routes through it, so the occupancy ring art comes only from `style.SITE_OCCUPANCY_STYLE` and na
+  hard-codes no ring colours.
+- `frontend.data_figure.resolve_save_base(path, stem)` — the ONE figure+npz save-path resolver
+  (`DataFigure.save` + the grid `_GridData.save`).
+- `frontend.qt_fluent._bound_field_style(*, selector, text, border, fill)` — the ONE scan/api
+  bound-field stylesheet recipe (`mark_scan_field` / `set_scan_bound` orange + `set_api_bound`
+  violet).
+- `task_console`: `_new_panel_card` (the ONE PanelCard provider block), `_repeat_mode_value` (the ONE
+  clamped repeat-mode reader), `_kind_repeat_modes`, `_relim` (the ONE `relim` default reader).
