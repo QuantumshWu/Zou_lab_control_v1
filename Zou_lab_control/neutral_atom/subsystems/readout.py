@@ -14,7 +14,7 @@ from ..core.results import DetectionResult, DetectionTimeScanResult, SitemapResu
 from ..core.utils import json_ready, site_index
 from ..operations import calibrate_sitemap_from_images, calibrate_threshold_from_images, detect_image
 from ..operations.fidelity import FidelityReport, characterize_readout
-from ..operations.imageio import index_run
+from ..operations.imageio import DEFAULT_REF_SHOTS, DEFAULT_SHORT_SHOT, DEFAULT_SHOTS_PER_GROUP, index_run
 from ..operations.measurement import (
     MeasurementSpec,
     NFramePlan,
@@ -160,9 +160,9 @@ class ReadoutSubsystem(ExperimentSubsystem):
         data_dir: str | Path,
         prefix: str = "img",
         *,
-        shots_per_group: int = 4,
-        short_shot: int = 3,
-        ref_shots: Sequence[int] = (1, 2, 4),
+        shots_per_group: int = DEFAULT_SHOTS_PER_GROUP,
+        short_shot: int = DEFAULT_SHORT_SHOT,
+        ref_shots: Sequence[int] = DEFAULT_REF_SHOTS,
         max_groups: int | None = None,
         grid_shape: Sequence[int] | None = None,
         ordering: str = "row-major",
@@ -197,9 +197,9 @@ class ReadoutSubsystem(ExperimentSubsystem):
         data_dir: str | Path,
         prefix: str = "img",
         *,
-        shots_per_group: int = 4,
-        short_shot: int = 3,
-        ref_shots: Sequence[int] = (1, 2, 4),
+        shots_per_group: int = DEFAULT_SHOTS_PER_GROUP,
+        short_shot: int = DEFAULT_SHORT_SHOT,
+        ref_shots: Sequence[int] = DEFAULT_REF_SHOTS,
         max_groups: int | None = None,
         train_fraction: float = 0.9,
         seed: int = 0,

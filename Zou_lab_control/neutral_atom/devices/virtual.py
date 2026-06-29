@@ -10,7 +10,8 @@ import time
 
 import numpy as np
 
-from ..core.analysis import finite_float, grid_shape_tuple, positive_int
+from ..core.analysis import (
+    finite_float, grid_shape_tuple, nonnegative_float, point_tuple, positive_float, positive_int, probability)
 from ..core.utils import site_index
 from .base import CameraDevice, SequencerDevice, TrapArrayDevice, snap_subarray
 from ..timing import (
@@ -19,6 +20,7 @@ from ..timing import (
     PulseTableState,
     count_trigger_pulses,
     imaging_channel_kwargs,
+    probe_channel_set,
     sequence_for_frame_count,
 )
 
@@ -597,7 +599,7 @@ class VirtualCamera(CameraDevice):
         # frame for the window ITS trigger gates, so a heterogeneous bracket (long-short-long
         # reference) images successive frames for different durations.  For a uniform repeated
         # sequence every entry equals the one exposure (the legacy single-exposure behaviour).
-        probe_set = [probe_channel] + (["ch02"] if probe_channel == "probe" else [])
+        probe_set = probe_channel_set(probe_channel)
         exposures = exposures_per_frame(runtime_sequence, frames, default=self.exposure,
                                         trigger_channels=trigger_channels, probe_channels=probe_set)
         # "All sites loaded" is an EXPLICIT device-boundary request (``force_all_sites``), NEVER
@@ -1239,37 +1241,6 @@ def exposures_per_frame(
         total = sum(max(0.0, min(e, hi) - max(s, lo)) for s, e in probe_intervals if s < hi and e > lo)
         if total > 0.0:
             out[k] = float(total)
-    return out
-
-
-def point_tuple(value, name: str) -> tuple[float, float]:
-    try:
-        raw = tuple(value)
-    except TypeError as exc:
-        raise ValueError(f"{name} must contain two finite numbers.") from exc
-    if len(raw) != 2:
-        raise ValueError(f"{name} must contain two finite numbers.")
-    return finite_float(raw[0], f"{name}[0]"), finite_float(raw[1], f"{name}[1]")
-
-
-def positive_float(value, name: str) -> float:
-    out = finite_float(value, name)
-    if out <= 0:
-        raise ValueError(f"{name} must be > 0.")
-    return out
-
-
-def nonnegative_float(value, name: str) -> float:
-    out = finite_float(value, name)
-    if out < 0:
-        raise ValueError(f"{name} must be >= 0.")
-    return out
-
-
-def probability(value, name: str) -> float:
-    out = finite_float(value, name)
-    if out < 0 or out > 1:
-        raise ValueError(f"{name} must be in [0, 1].")
     return out
 
 

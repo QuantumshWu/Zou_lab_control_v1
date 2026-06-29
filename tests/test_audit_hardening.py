@@ -516,3 +516,64 @@ def test_qcmos_exposure_fallback_uses_longest_probe_for_a_heterogeneous_bracket(
         exposure_from_sequence(bracket, default=1e-3, channel="probe")
     durations = [p.duration for p in bracket.base_pulses() if p.value and p.channel == "probe"]
     assert max(durations) == pytest.approx(20e-3)                 # the adapter's longest-probe fallback
+
+
+def test_probe_channel_alias_is_single_source():
+    """#5.15 / review-T1: the probe->channel alias (placeholder 'probe' also matches the legacy
+    'ch02') lives in exactly ONE helper -- ``timing.sequence.probe_channel_set`` -- so the camera
+    backends + exposure inference can never drift it (the trap the project has already been burned by).
+    A resolved chNN matches only itself; only the placeholder fans out to the legacy alias."""
+    from pathlib import Path
+    from Zou_lab_control.neutral_atom.timing import probe_channel_set
+    import Zou_lab_control.neutral_atom.devices.qcmos as qcmos_mod
+    import Zou_lab_control.neutral_atom.devices.virtual as virtual_mod
+    import Zou_lab_control.neutral_atom.timing.sequence as sequence_mod
+
+    assert probe_channel_set("probe") == ["probe", "ch02"]      # placeholder fans out to the legacy alias
+    assert probe_channel_set("ch03") == ["ch03"]                # a resolved chNN matches only itself
+    # The 'ch02' alias literal exists ONLY in the helper's module; a re-copy into a backend fails here.
+    assert '"ch02"' not in Path(qcmos_mod.__file__).read_text()
+    assert '"ch02"' not in Path(virtual_mod.__file__).read_text()
+    assert Path(sequence_mod.__file__).read_text().count('"ch02"') == 1
+
+
+def test_scalar_validators_are_single_source():
+    """review-T2/H2: the pure scalar validators have ONE home (core.analysis); every other module
+    IMPORTS them (identity holds), so a re-typed copy that drifts in behaviour cannot exist."""
+    from Zou_lab_control.neutral_atom.core import analysis
+    import Zou_lab_control.neutral_atom.devices.qcmos as qcmos_mod
+    import Zou_lab_control.neutral_atom.devices.virtual as virtual_mod
+    import Zou_lab_control.neutral_atom.devices.sequencer as sequencer_mod
+    import Zou_lab_control.neutral_atom.timing.sequence as sequence_mod
+    import Zou_lab_control.neutral_atom.views.plots as plots_mod
+
+    assert qcmos_mod.positive_float is analysis.positive_float
+    assert qcmos_mod.nonnegative_int is analysis.nonnegative_int
+    assert virtual_mod.positive_float is analysis.positive_float
+    assert virtual_mod.nonnegative_float is analysis.nonnegative_float
+    assert virtual_mod.probability is analysis.probability
+    assert virtual_mod.point_tuple is analysis.point_tuple
+    assert sequencer_mod.nonnegative_float is analysis.nonnegative_float
+    assert sequence_mod.positive_float is analysis.positive_float
+    assert plots_mod.positive_int is analysis.positive_int
+
+
+def test_reference_bracket_defaults_are_single_source():
+    """review-T2/F3: the Rb87 4-shot bracket layout (shots_per_group / short_shot / ref_shots) has ONE
+    default block in operations.imageio; the analysis-layer entry points DERIVE from it (no re-typed 4/3/
+    (1,2,4) literals that can drift)."""
+    import inspect
+    from Zou_lab_control.neutral_atom.operations import imageio
+    from Zou_lab_control.neutral_atom.subsystems.readout import ReadoutSubsystem
+
+    assert (imageio.DEFAULT_SHOTS_PER_GROUP, imageio.DEFAULT_SHORT_SHOT, imageio.DEFAULT_REF_SHOTS) == (4, 3, (1, 2, 4))
+    # RunIndex dataclass field defaults + index_run kwargs both reference the constants.
+    ri_fields = {f.name: f.default for f in __import__("dataclasses").fields(imageio.RunIndex)}
+    assert ri_fields["shots_per_group"] is imageio.DEFAULT_SHOTS_PER_GROUP
+    assert ri_fields["ref_shots"] is imageio.DEFAULT_REF_SHOTS
+    sig = inspect.signature(imageio.index_run)
+    assert sig.parameters["short_shot"].default is imageio.DEFAULT_SHORT_SHOT
+    # The subsystem's *_from_dir defaults derive from the same constants.
+    rsig = inspect.signature(ReadoutSubsystem.sitemap_from_dir)
+    assert rsig.parameters["shots_per_group"].default is imageio.DEFAULT_SHOTS_PER_GROUP
+    assert rsig.parameters["ref_shots"].default is imageio.DEFAULT_REF_SHOTS

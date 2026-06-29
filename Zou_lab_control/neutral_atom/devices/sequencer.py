@@ -13,7 +13,7 @@ import time
 from typing import Any, Callable, Mapping, Sequence
 
 from Zou_lab_control._paths import GENERATED_SEQUENCES_DIR
-from ..core.analysis import positive_int
+from ..core.analysis import nonnegative_float, positive_int
 from .base import SequencerDevice
 from ..timing import (
     DEFAULT_CAMERA_TRIGGER_CHANNELS,
@@ -2533,13 +2533,6 @@ def _plain_rpc_payload(value):
     except TypeError:
         return value
     return [_plain_rpc_payload(item) for item in iterator]
-
-
-def nonnegative_float(value, name: str) -> float:
-    out = float(value)
-    if out < 0:
-        raise ValueError(f"{name} must be >= 0.")
-    return out
 
 
 def serve_runtime_sequencer(

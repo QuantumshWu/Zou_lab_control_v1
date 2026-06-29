@@ -407,6 +407,37 @@ def positive_int(value, name: str) -> int:
     return out
 
 
+def positive_float(value, name: str) -> float:
+    out = finite_float(value, name)
+    if out <= 0:
+        raise ValueError(f"{name} must be > 0.")
+    return out
+
+
+def nonnegative_float(value, name: str) -> float:
+    out = finite_float(value, name)
+    if out < 0:
+        raise ValueError(f"{name} must be >= 0.")
+    return out
+
+
+def probability(value, name: str) -> float:
+    out = finite_float(value, name)
+    if out < 0 or out > 1:
+        raise ValueError(f"{name} must be in [0, 1].")
+    return out
+
+
+def point_tuple(value, name: str) -> tuple[float, float]:
+    try:
+        raw = tuple(value)
+    except TypeError as exc:
+        raise ValueError(f"{name} must contain two finite numbers.") from exc
+    if len(raw) != 2:
+        raise ValueError(f"{name} must contain two finite numbers.")
+    return finite_float(raw[0], f"{name}[0]"), finite_float(raw[1], f"{name}[1]")
+
+
 def reject_bool_values(values, name: str) -> None:
     arr = np.asarray(values, dtype=object)
     if any(isinstance(value, (bool, np.bool_)) for value in arr.reshape(-1)):

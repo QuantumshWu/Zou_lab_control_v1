@@ -9,8 +9,8 @@ from typing import Any, Sequence
 
 import numpy as np
 
-from ..core.analysis import finite_float, positive_int
-from ..timing import DEFAULT_CAMERA_TRIGGER_CHANNELS, exposure_from_sequence, imaging_channel_kwargs
+from ..core.analysis import nonnegative_int, positive_float, positive_int
+from ..timing import DEFAULT_CAMERA_TRIGGER_CHANNELS, exposure_from_sequence, imaging_channel_kwargs, probe_channel_set
 from .base import AcquisitionCancelled, CameraDevice, snap_subarray
 from .sequencer import PulseController, finite_frame_sequence
 
@@ -151,7 +151,7 @@ class QCMOSCamera(CameraDevice):
                 # frame and the atoms scatter only during their OWN probe pulse, so set the
                 # global DCAM exposure to the LONGEST probe (it covers every frame; a frame's
                 # signal is bounded by its shorter probe).  Matches the virtual per-frame model.
-                probe_set = {probe_channel} | ({"ch02"} if probe_channel == "probe" else set())
+                probe_set = set(probe_channel_set(probe_channel))
                 durations = [p.duration for p in runtime_sequence.base_pulses()
                              if p.value and p.channel in probe_set]
                 sequence_exposure = max(durations) if durations else self.config.exposure
@@ -382,20 +382,6 @@ def normalize_roi(roi: Sequence[int]) -> tuple[int, int, int, int]:
     out = tuple(nonnegative_int(v, f"roi[{i}]") for i, v in enumerate(raw))
     if out[1] <= 0 or out[3] <= 0:
         raise ValueError("roi width and height must be positive.")
-    return out
-
-
-def nonnegative_int(value, name: str) -> int:
-    out = finite_float(value, name)
-    if int(out) != out or out < 0:
-        raise ValueError(f"{name} must be a non-negative integer.")
-    return int(out)
-
-
-def positive_float(value, name: str) -> float:
-    out = finite_float(value, name)
-    if out <= 0:
-        raise ValueError(f"{name} must be > 0.")
     return out
 
 

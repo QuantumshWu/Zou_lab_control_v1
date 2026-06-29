@@ -10,7 +10,7 @@ import math
 
 import numpy as np
 
-from ..core.analysis import finite_float, positive_int
+from ..core.analysis import finite_float, positive_float, positive_int
 
 
 CLOCK_GRID_RTOL = 1e-12
@@ -462,6 +462,18 @@ def sequence_for_frame_count(
     )
 
 
+def probe_channel_set(channel: str) -> list[str]:
+    """The set of pulse-channel names that count as the probe for ``channel`` -- the SINGLE
+    source of the probe->channel alias.  When the caller hands the placeholder name ``probe``
+    (no chNN config resolved it yet) we ALSO match the legacy ``ch02`` it historically mapped to,
+    so an exposure inferred from a placeholder-named sequence still finds its probe pulses.  A
+    resolved chNN (e.g. ``ch03``) matches only itself.  Every site that expands a probe channel
+    (exposure inference, the qCMOS + virtual camera bracket exposure) routes through HERE so the
+    alias is defined once and cannot drift (#5.15)."""
+    channel = channel_name(channel)
+    return [channel, "ch02"] if channel == "probe" else [channel]
+
+
 def exposure_from_sequence(sequence: PulseSequence | None, *, default: float, channel: str = "probe") -> float:
     """Infer camera exposure from uniform probe pulses in a sequence.
 
@@ -476,9 +488,7 @@ def exposure_from_sequence(sequence: PulseSequence | None, *, default: float, ch
     if not hasattr(sequence, "base_pulses"):
         return default
     channel = channel_name(channel)
-    probe_candidates = [channel]
-    if channel == "probe":
-        probe_candidates.append("ch02")
+    probe_candidates = probe_channel_set(channel)
     durations = [
         int(round(pulse.duration * 1e15))
         for pulse in sequence.base_pulses()
@@ -542,13 +552,6 @@ def digital_value(value) -> int:
     return int(out)
 
 
-def positive_float(value, name: str) -> float:
-    out = finite_float(value, name)
-    if out <= 0:
-        raise ValueError(f"{name} must be > 0.")
-    return out
-
-
 def _time_to_clock_tick(time_s: float, clock_hz: float) -> int | None:
     raw_tick = time_s * clock_hz
     tick = int(round(raw_tick))
@@ -581,6 +584,7 @@ __all__ = [
     "imaging_channel_kwargs",
     "imaging_sequence",
     "plot_sequence",
+    "probe_channel_set",
     "reference_bracket_sequence",
     "sequence_for_frame_count",
     "snap_seconds_to_clock",

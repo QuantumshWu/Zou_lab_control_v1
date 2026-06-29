@@ -97,6 +97,15 @@ def frame_files(folder: str | Path, prefix: str) -> dict[int, Path]:
     return out
 
 
+# The Rb87 4-shot reference-bracket layout -- ONE source for every reader/writer of a calibration
+# run (this file's RunIndex + index_run, and the readout/fidelity entry points that default to it):
+# ``shots_per_group`` frames per atom loading; the ``short_shot`` frame is the short readout under
+# test; ``ref_shots`` are the high-SNR frames that vote the ground-truth label (#F3, single-source).
+DEFAULT_SHOTS_PER_GROUP = 4
+DEFAULT_SHORT_SHOT = 3
+DEFAULT_REF_SHOTS = (1, 2, 4)
+
+
 @dataclass
 class RunIndex:
     """Lazy index of grouped raw frames in a folder (no full stack in memory).
@@ -109,9 +118,9 @@ class RunIndex:
     prefix: str
     group_paths: list[list[Path]]
     image_shape: tuple[int, int]
-    shots_per_group: int = 4
-    short_shot: int = 3
-    ref_shots: tuple[int, ...] = (1, 2, 4)
+    shots_per_group: int = DEFAULT_SHOTS_PER_GROUP
+    short_shot: int = DEFAULT_SHORT_SHOT
+    ref_shots: tuple[int, ...] = DEFAULT_REF_SHOTS
 
     @property
     def n_groups(self) -> int:
@@ -143,9 +152,9 @@ def index_run(
     folder: str | Path,
     prefix: str,
     *,
-    shots_per_group: int = 4,
-    short_shot: int = 3,
-    ref_shots=(1, 2, 4),
+    shots_per_group: int = DEFAULT_SHOTS_PER_GROUP,
+    short_shot: int = DEFAULT_SHORT_SHOT,
+    ref_shots=DEFAULT_REF_SHOTS,
     max_groups: int | None = None,
 ) -> RunIndex:
     """Index ``PREFIX<number>`` raw frames in ``folder`` into ``shots_per_group`` groups.

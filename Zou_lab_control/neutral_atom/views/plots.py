@@ -17,6 +17,7 @@ from matplotlib.patches import Circle
 import numpy as np
 
 from Zou_lab_control._viewer_registry import active_plotter
+from ..core.analysis import positive_int
 
 
 def image_to_points(image, *, max_points: int | None = 120_000):
@@ -145,15 +146,6 @@ def plot_detection_scan(times, fidelities, *, labels=("Detection time (s)", "Fid
     if plotter is None:
         return None
     return plotter.plot(np.asarray(times, dtype=float).reshape(-1, 1), np.asarray(fidelities, dtype=float).reshape(-1, 1), labels=labels, display=display, **kwargs)
-
-
-def positive_int(value, name: str) -> int:
-    if isinstance(value, (bool, np.bool_)):
-        raise ValueError(f"{name} must be a positive integer.")
-    numeric = float(value)
-    if not np.isfinite(numeric) or int(numeric) != numeric or numeric <= 0:
-        raise ValueError(f"{name} must be a positive integer.")
-    return int(numeric)
 
 
 __all__ = ["image_to_points", "plot_detection_image", "plot_detection_scan", "plot_image", "plot_site_values", "plot_threshold_hist"]
