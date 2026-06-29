@@ -42,3 +42,20 @@ def test_switch_with_a_label_stays_clickable_across_its_label():
     track_w = scaled_px(60, minimum=48)
     assert sw.hitButton(QtCore.QPoint(track_w // 2, mid_y)) is True      # the track
     assert sw.hitButton(QtCore.QPoint(track_w + scaled_px(8) + 2, mid_y)) is True   # onto the label text
+
+
+def test_a_real_click_on_the_dead_padding_does_not_flip_the_switch():
+    """The end-to-end behaviour the user reported: deliver an actual left-button click (press+release)
+    to the widget.  A click on the dead padding (where the form row's control cell extends past the
+    track) must leave isChecked() unchanged; a click on the track must toggle it."""
+    from PyQt5.QtTest import QTest
+    ensure_qt_app()
+    sw = FluentSwitch("")
+    sw.resize(sw.sizeHint())
+    sw.setChecked(False)
+    track_w = scaled_px(60, minimum=48)
+    mid_y = sw.height() // 2
+    QTest.mouseClick(sw, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, QtCore.QPoint(sw.width() - 2, mid_y))
+    assert sw.isChecked() is False, "a click on the dead padding must NOT toggle the switch"
+    QTest.mouseClick(sw, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, QtCore.QPoint(track_w // 2, mid_y))
+    assert sw.isChecked() is True, "a click on the track must toggle the switch"

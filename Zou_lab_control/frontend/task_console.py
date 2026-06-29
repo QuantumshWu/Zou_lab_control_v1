@@ -3964,11 +3964,13 @@ class PanelEditor(QtWidgets.QWidget):
             self.status.setText(f"could not snapshot: {str(exc).splitlines()[0][:120]}")
             return
         self._canvas = panel_canvas(self._plotter.fig)
-        # The Edit page lives in a scroll area; without a floor its QVBoxLayout
-        # SQUISHES the canvas below the figure's design height (clipping the plot
-        # and the y-axis label -- the snapshot then looks empty/broken).  Pin the
-        # minimum to the figure's own size so the page SCROLLS instead of squishing.
-        self._canvas.setMinimumSize(self._canvas.sizeHint())
+        # The Edit page lives in a SCROLL AREA.  A bare minimum size lets the scroll-area layout
+        # STRETCH the canvas taller than the figure (and a hi-DPI re-sync round can then keep growing
+        # it across rebuilds -- the "scroll bins a few times and the image balloons / cuts off" bug).
+        # Pin it to a FIXED size = the figure's own design size (the same non-growable contract the
+        # Monitor card uses): the page SCROLLS when the figure is taller than the viewport, but the
+        # snapshot can never squish (clip) NOR grow.  Idempotent across rebuilds (#4 edit-resize).
+        self._canvas.setFixedSize(self._canvas.sizeHint())
         self.canvas_holder.addWidget(self._canvas, alignment=QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop)
         self._canvas.draw_idle()
         self._df = None
