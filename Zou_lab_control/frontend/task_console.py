@@ -5877,15 +5877,51 @@ class TaskConsole(QtWidgets.QWidget):
         self._update_summary()
 
     # ------------------------------------------------------------------ refresh
+    def _display_shot(self) -> int | None:
+        """The ONE coherent display shot for the WHOLE board this tick (the global shot clock): the newest
+        source-shot that EVERY displayed, still-running-producer signal has reached -- the ``min`` of their
+        latest provenance ids.  :meth:`_expression_namespace` reads :meth:`SignalHub.snapshot_at` at this
+        shot, so every panel draws ONE physical shot and they can never stagger: two 2-D images on ``frame_0``
+        / ``frame_2`` and a sitemap fed by ``frame_1``->occupancy all show the same clock cycle; a fast camera
+        frame is held back to match the slower reactive occupancy (the user's hard requirement -- coherence
+        over freshness, "同一个clock周期，不要错位").
+
+        Crucially this holds back ONLY relative to OTHER co-displayed producers: a LONE camera-repeat panel's
+        bound set is just ``frame_0``, so its ``min`` is its OWN latest -> it stays fully live (repeat /
+        repeat_mode never stutter).  The hold appears exactly when a slower producer is shown ALONGSIDE it.
+
+        Scope = signals that are BOTH bound by a live panel AND published by a node STILL RUNNING: a lingering
+        signal of a STOPPED node is excluded (it would freeze the clock at its last shot), and a free-running
+        :data:`NO_LINEAGE` scalar (a loading rate) never constrains.  ``None`` (-> latest of each, i.e.
+        :meth:`snapshot_latest`) when nothing displayed carries a lineage yet."""
+        from ..neutral_atom.core.signals import NO_LINEAGE     # single source of the sentinel (lazy: off na import graph)
+        live: set[str] = set()
+        for node in self.running_nodes:
+            try:
+                live |= {str(s) for s in node.published_signals()}
+            except Exception:
+                continue
+        if not live:
+            return None
+        shots: list[int] = []
+        for card in self.cards:
+            for name in self._card_reads(card):
+                if name in live:
+                    p = self.hub.latest_provenance(name)
+                    if p != NO_LINEAGE:
+                        shots.append(int(p))
+        return min(shots) if shots else None
+
     def _expression_namespace(self) -> dict[str, object]:
         namespace: dict[str, object] = {"np": np, "numpy": np, "math": _math}
-        # Each signal at ITS OWN LATEST value.  This keeps every live panel fully live -- a camera repeat
-        # block shows its newest, fullest ring so repeat / repeat_mode (average filling a site) is never
-        # held back by a slower co-running producer.  Cross-signal coherence is FREE where it matters: a
-        # readout processor co-publishes occupied + centres + frame_judged in ONE publish, so reading each
-        # at its latest puts them on the SAME physical shot (sitemap rings == its frame_judged underlay ==
-        # a frame_judged 2D, all from that one publish).  (Task mid-run output is off-hub via __task_frame__.)
-        namespace.update(self.hub.snapshot_latest())
+        # Shot-COHERENT read at the board's global display shot (#shot-clock): every signal resolves to its
+        # value AT that shot, so a frame_0 2-D, a frame_2 2-D and a frame_1->occupancy sitemap can never show
+        # different shots -- the faster camera is held back to the slower co-displayed producer.  A signal
+        # with no sample at that shot (a free-running scalar, or a producer not yet there) falls back to its
+        # latest, never blanking a panel.  display_shot None -> latest of each (snapshot_latest).  A LONE
+        # fast panel is NOT held back: its own signal is the min (see _display_shot).  (Task mid-run output
+        # is intentionally absent here: it is off-hub via __task_frame__.)
+        namespace.update(self.hub.snapshot_at(self._display_shot()))
         namespace["history"] = self.hub.history
         namespace["latest"] = self.hub.latest
         namespace["names"] = self.hub.names
