@@ -49,27 +49,6 @@ def _channel_delays_list(channel_delays: Mapping[int, int] | None, n_channels: i
     return [int(cd.get(bit, 0)) for bit in range(n_channels)]
 
 
-def _with_effective_delays(program: "RuntimeSequenceProgram") -> "RuntimeSequenceProgram":
-    """Enforce the 32-bit delay-field cap on the PHYSICAL channel delays.
-
-    The delay is a TRUE physical delay -- ``out[t] = in[t-d]``, the channel
-    silent for the first ``d`` ticks -- with NO modulo-by-period reduction (a
-    reduction would make the first sweeps play early; the first frame must be
-    correct).  The only host-side bound is the 32-bit delay field; whether the
-    in-flight edge count fits the event FIFO is checked separately by
-    ``validate_pulse_streamer_program`` (which rejects, with the max delay, if
-    the delay is too long for that channel's toggle rate)."""
-    if not program.channel_delays:
-        return program
-    from .fpga_pulse_streamer import TTL_DELAY_MAX_TICKS
-    for b, d in enumerate(program.channel_delays):
-        if int(d) > TTL_DELAY_MAX_TICKS:
-            raise ValueError(
-                f"channel-delay output bit {b}: delay {int(d)} ticks is outside "
-                f"[0, {TTL_DELAY_MAX_TICKS}] (~{TTL_DELAY_MAX_TICKS * 20e-9:.1f} s at 20 ns/tick).")
-    return program
-
-
 def _clk_enable_mask_for_channels(channels: Sequence[str], clk_channels: Sequence[str]) -> int:
     """clk-enable bitmask in the COMPILED hardware channel order (bit n = ``channels[n]``).
 
@@ -167,6 +146,11 @@ class RuntimeBusSegment:
         )
 
 
+# Serialized RuntimeSequenceProgram schema version -- ONE source, written by to_dict AND checked by
+# from_dict (#G4) so a future schema bump fails fast with a rebuild message instead of mis-decoding.
+_RUNTIME_PROGRAM_VERSION = 2
+
+
 @dataclass(frozen=True)
 class RuntimeSequenceProgram:
     """Runtime edge-table program uploaded to a pulse-streamer-like FPGA."""
@@ -219,7 +203,7 @@ class RuntimeSequenceProgram:
     def to_dict(self) -> dict[str, object]:
         payload = {
             "schema": "Zou_lab_control.neutral_atom.RuntimeSequenceProgram",
-            "version": 2,
+            "version": _RUNTIME_PROGRAM_VERSION,
             "sequence_id": self.sequence_id,
             "sequence_name": self.sequence_name,
             "clock_hz": self.clock_hz,
@@ -257,6 +241,13 @@ class RuntimeSequenceProgram:
     def from_dict(cls, payload: Mapping[str, object]) -> "RuntimeSequenceProgram":
         if payload.get("schema") != "Zou_lab_control.neutral_atom.RuntimeSequenceProgram":
             raise ValueError("unsupported runtime sequence program schema.")
+        # ``version`` is load-bearing, not a written-but-unread field (#G4): a future schema bump
+        # fails fast here with a clear rebuild message instead of silently mis-decoding an old payload.
+        version = int(payload.get("version", 0))
+        if version != _RUNTIME_PROGRAM_VERSION:
+            raise ValueError(
+                f"unsupported runtime sequence program version {version} "
+                f"(this host reads/writes version {_RUNTIME_PROGRAM_VERSION}); rebuild the program.")
         slot_count = int(payload.get("slot_count", 0))
         tick_slot_coeffs = [[int(v) for v in row] for row in payload.get("tick_slot_coeffs", [])]
         if tick_slot_coeffs and not any(any(row) for row in tick_slot_coeffs):
@@ -375,6 +366,17 @@ def compile_runtime_program(
     )
 
 
+def _resolve_hardware_channels(state: "PulseTableState", channels) -> list[str]:
+    """The hardware channel list a pulse-table program compiles against -- the explicit ``channels``
+    or the state's own -- validated so every channel the table USES is a real hardware channel (#G5).
+    ONE source for both compile paths (1-D + scan), so the unknown-channel guard can't drift."""
+    resolved = list(channel_names(state.channels if channels is None else channels, "channels"))
+    unknown = [channel for channel in state.channels if channel not in resolved]
+    if unknown:
+        raise ValueError(f"pulse table channels are not in hardware channels: {unknown}.")
+    return resolved
+
+
 def compile_pulse_table_runtime_program(
     state: PulseTableState,
     *,
@@ -394,10 +396,7 @@ def compile_pulse_table_runtime_program(
     scan point), so this path emits a single static program.
     """
 
-    channels = list(channel_names(state.channels if channels is None else channels, "channels"))
-    unknown_channels = [channel for channel in state.channels if channel not in channels]
-    if unknown_channels:
-        raise ValueError(f"pulse table channels are not in hardware channels: {unknown_channels}.")
+    channels = _resolve_hardware_channels(state, channels)
     clock_hz = positive_float(clock_hz, "clock_hz")
     clock_step_ns = 1e9 / clock_hz
     slot_values = state.reference_slots() if slots is None else dict(slots)
@@ -495,7 +494,10 @@ def compile_pulse_table_runtime_program(
     }
     channel_delays_list = _channel_delays_list(channel_delays, len(channels)) if channel_delays else None
     sequence_id = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
-    return _with_effective_delays(RuntimeSequenceProgram(
+    # The physical channel-delay bound (and the full edge/FIFO/monotonic capacity contract) is
+    # enforced once by validate_pulse_streamer_program -- the authoritative gate every program
+    # passes through at host prepare / AXI upload (#G1, single source for the bound).
+    return RuntimeSequenceProgram(
         sequence_id=sequence_id,
         sequence_name=state.name,
         clock_hz=clock_hz,
@@ -516,7 +518,7 @@ def compile_pulse_table_runtime_program(
         bus_delays=bus_delays or None,
         channel_delays=channel_delays_list,
         clk_enable=int(clk_enable),
-    ))
+    )
 
 
 def compile_pulse_table_scan_runtime_program(
@@ -539,10 +541,7 @@ def compile_pulse_table_scan_runtime_program(
     parameter table are uploaded.
     """
 
-    channels = list(channel_names(state.channels if channels is None else channels, "channels"))
-    unknown_channels = [channel for channel in state.channels if channel not in channels]
-    if unknown_channels:
-        raise ValueError(f"pulse table channels are not in hardware channels: {unknown_channels}.")
+    channels = _resolve_hardware_channels(state, channels)
     clock_hz = positive_float(clock_hz, "clock_hz")
     clock_step_ns = 1e9 / clock_hz
     if not state.scan_slots:
@@ -763,7 +762,10 @@ def compile_pulse_table_scan_runtime_program(
     }
     channel_delays_list = _channel_delays_list(channel_delays, len(channels)) if channel_delays else None
     sequence_id = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
-    return _with_effective_delays(RuntimeSequenceProgram(
+    # The physical channel-delay bound (and the full edge/FIFO/monotonic capacity contract) is
+    # enforced once by validate_pulse_streamer_program -- the authoritative gate every program
+    # passes through at host prepare / AXI upload (#G1, single source for the bound).
+    return RuntimeSequenceProgram(
         sequence_id=sequence_id,
         sequence_name=state.name,
         clock_hz=clock_hz,
@@ -791,7 +793,7 @@ def compile_pulse_table_scan_runtime_program(
         bus_delays=bus_delays or None,
         channel_delays=channel_delays_list,
         clk_enable=int(clk_enable),
-    ))
+    )
 
 
 def compile_runtime_program_for_payload(
