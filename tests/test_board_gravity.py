@@ -29,18 +29,15 @@ from Zou_lab_control.frontend.task_console import (
 
 
 def test_narrow_viewport_reflows_to_single_column():
-    """A narrowed viewport collapses a two-column layout into a single column: each card keeps its
-    column under gravity, but the board-width clamp pulls every card's x back inside the board, so at
-    one-card width both land in the one column and stack (the clamp must NOT ratchet to the cards'
-    current right-extent, else narrowing could never re-pack)."""
-    w = _card_size("1x2")[0]
-    cfgs = [PanelConfig(kind="1d", col=GAP, row=GAP, size="1x2"),
-            PanelConfig(kind="1d", col=GAP + w + GAP, row=GAP, size="1x2")]   # two adjacent columns
-    _compact(cfgs, board_w=4000)                          # wide: the two distinct columns stay put
-    assert len({c.col for c in cfgs}) == 2, "wide board keeps the two columns the user placed"
+    """A narrowed viewport must reflow a side-by-side layout into a single column (the board-width
+    must NOT ratchet to the cards' current right-extent, else narrowing could never re-pack)."""
+    cfgs = [PanelConfig(kind="1d", col=0, row=0, size="1x2"),
+            PanelConfig(kind="1d", col=0, row=0, size="1x2")]
+    _compact(cfgs, board_w=4000)                          # wide: pack side by side
+    assert len({c.col for c in cfgs}) == 2, "wide board should place the two cards in two columns"
     _compact(cfgs, board_w=_min_board_width(cfgs))        # narrow to one-card width
-    assert len({c.col for c in cfgs}) == 1, "narrow board clamps both cards into a single column"
-    assert len({c.row for c in cfgs}) == 2, "and they stack vertically"
+    assert len({c.col for c in cfgs}) == 1, "narrow board must reflow both cards to a single column"
+    assert len({c.row for c in cfgs}) == 2, "and stack them vertically"
 
 ensure_qt_app()                       # _card_size reads scaled_px (needs the QApplication)
 

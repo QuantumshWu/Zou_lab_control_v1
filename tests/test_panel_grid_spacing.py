@@ -72,12 +72,9 @@ def test_changing_gap_rescales_spacing(monkeypatch):
 
 
 def test_side_by_side_cards_one_gap_apart():
-    """Two cards the user PLACED in adjacent columns stay side by side, one ``GAP`` apart, both risen
-    to the top margin.  Gravity pulls each UP/LEFT from where it is -- it does NOT auto-stack two
-    distinct columns into one, nor fling either across the board (#1: no auto-relocation)."""
-    w = _card_size("1x2")[0]
-    cfgs = [PanelConfig(kind=_KIND, row=5 * GAP, col=GAP, size="1x2"),
-            PanelConfig(kind=_KIND, row=9 * GAP, col=GAP + w + GAP, size="1x2")]   # adjacent columns
+    """Two narrow cards that DO fit side by side end up one ``GAP`` apart horizontally (the user's
+    'horizontal minimal gap'), both at the top margin."""
+    cfgs = _stack([5, 9], size="1x2")               # 1x2 is the base width -> two fit on one row
     _compact(cfgs)
     cfgs.sort(key=lambda c: c.col)
     left, right = cfgs
