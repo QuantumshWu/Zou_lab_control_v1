@@ -1118,21 +1118,48 @@ def _overlaps_with_gap(box: tuple[int, int, int, int], placed) -> bool:
 
 
 def _gravity_slot(cfg, placed, board_w: int) -> tuple[int, int]:
-    """The TOP-MOST then LEFT-MOST pixel ``(col, row)`` where ``cfg``'s AABB sits clear of every
-    already-placed card (each separated by ``GAP``), inside the board margins and width.
+    """NORTH-WEST (top-left) gravity ANCHORED at the card's CURRENT ``(col, row)``: from where it is, the
+    card falls toward the top-left corner -- it rises straight UP until a card above blocks it, then slides
+    straight LEFT until a card to its left (or the boundary) blocks it -- alternating to a fixed point.  It
+    only ever moves UP and LEFT and is BLOCKED by neighbours, so it NEVER teleports over an obstacle to a
+    far free slot: a card dragged to the bottom-left, blocked above by a panel and on the left by the
+    boundary, STAYS bottom-left -- it is NOT flung to a top-right gap (#2).  ``placed`` = the already-
+    settled cards; x is clamped inside ``board_w`` so a card stays on the board.
 
-    Gravity is toward the top-left origin: we minimise y FIRST (rise to the top), then x (slide to the
-    left), and take the FIRST free slot -- so cards TILE the board (fill the top row left-to-right, then
-    the next row), each separated from its neighbours and the origin by exactly ``GAP``.  A card with
-    nothing above or left of it lands at ``(GAP, GAP)``.  This is what fills the board WIDTH: a new card
-    (``_add_panel`` seeds it at ``col=0`` below the lowest card, so it sorts LAST in reading order) drops
-    into the first free top-left slot -- which is the gap at the end of the top row, NOT a fresh column.
+    Rest-up = just below the lowest placed card whose x-span overlaps this card's column (else the top
+    margin); rest-left = just right of the right-most placed card whose y-span overlaps this card's row
+    (else the left margin).  Sliding left changes which cards share the row and rising changes the column
+    band, so we alternate until neither moves.  (A FRESH card spawns at :func:`_first_free_slot` so an Add
+    tiles into the board; thereafter this local gravity keeps it -- and a drag -- where the user put it.)"""
+    w, h = _card_size(cfg.size)
+    max_x = max(GAP, board_w - GAP - w)
+    x = min(max(GAP, int(round(cfg.col))), max_x)        # start from the card's CURRENT spot (clamped on-board)
+    y = max(GAP, int(round(cfg.row)))
+    for _ in range(8):                                    # alternate rise / slide-left to a fixed point
+        ny = GAP                                          # rise: rest just under any column-overlapping card
+        for p in placed:
+            px0, py0, px1, py1 = _aabb(p)
+            if x < px1 + GAP and px0 < x + w + GAP:       # x-spans overlap (within GAP) -> "above" in-column
+                ny = max(ny, py1 + GAP)
+        nx = GAP                                          # slide left: rest just right of any row-overlapping card
+        for p in placed:
+            px0, py0, px1, py1 = _aabb(p)
+            if ny < py1 + GAP and py0 < ny + h + GAP:     # y-spans overlap at the risen y -> "left" in-row
+                nx = max(nx, px1 + GAP)
+        nx = min(nx, max_x)
+        if (nx, ny) == (x, y):
+            break
+        x, y = nx, ny
+    return (x, y)
 
-    Candidate points are GAP (the origin) plus, for each placed card, the x just past its right edge
-    (``x1 + GAP``) and the y just past its bottom edge (``y1 + GAP``) -- the only places a card can newly
-    butt up against something -- and the placed cards' own left/top edges (so a card can tuck under a
-    wider one).  A card-width clamp keeps it inside ``board_w`` (or pins it at the left margin if it
-    cannot fit)."""
+
+def _first_free_slot(cfg, placed, board_w: int) -> tuple[int, int]:
+    """The TOP-MOST then LEFT-MOST free ``(col, row)`` where ``cfg`` fits clear of every placed card (GAP
+    apart, inside ``board_w``).  Used ONLY to SEED where a freshly-Added panel spawns, so an Add TILES into
+    the board (fills the top row left-to-right, then wraps to the next row) instead of starting a fresh
+    column.  (Compaction + drag use :func:`_gravity_slot`'s local NW gravity, which then KEEPS a card here.)
+    Candidate points are GAP (origin) + each placed card's right/bottom edge (``+GAP``) and its left/top
+    edge (so a card can tuck under a wider one); swept by y then x, first feasible wins."""
     w, _h = _card_size(cfg.size)
     xs = {GAP}
     ys = {GAP}
@@ -1148,7 +1175,7 @@ def _gravity_slot(cfg, placed, board_w: int) -> tuple[int, int]:
         for x in cand_x:
             if not _overlaps_with_gap((x, y, x + w, y + _h), placed):
                 return (x, y)
-    # Defensive: no candidate fit (should not happen -- placing past the lowest card always clears).
+    # No candidate fit (should not happen -- placing past the lowest card always clears).
     bottom = max((py1 for *_rest, py1 in (_aabb(p) for p in placed)), default=0)
     return (GAP, bottom + GAP if placed else GAP)
 
@@ -5380,14 +5407,17 @@ class TaskConsole(QtWidgets.QWidget):
         # Otherwise a PLOT kind -> a BLANK pure-view panel on the Monitor board
         # (decoupled: it shows nothing until a signal is picked in its Setting).
         kind = data or "1d"
-        # Seed the new card just BELOW the current lowest card so it sorts LAST in reading order;
-        # _compact then gravity-packs it into the first free top-left slot (so it rises/slides in).
-        next_y = max((c.config.row + _card_size(c.config.size)[1] + GAP for c in self.cards),
-                     default=GAP)
         # Every panel gets a unique "<kind> #N" title (G1) so two of the same kind never share
         # one name in the card header / Edit tab / frame title.
         title = indexed_unique_name(PANEL_KINDS[str(kind)], {c.config.title for c in self.cards})
-        config = PanelConfig(kind=str(kind), title=title, row=next_y, col=0, size="1x2")
+        config = PanelConfig(kind=str(kind), title=title, row=GAP, col=GAP, size="1x2")
+        # SPAWN the new card at the first free TOP-LEFT slot (tile into the board: fill the top row
+        # then wrap), NOT a fresh column -- the local NW gravity in _compact then keeps it there.  Seed
+        # against the live viewport width so it wraps at the real board edge (fallback width when unshown).
+        cfgs = [c.config for c in self.cards]
+        vw = self.scroll.viewport().width() if hasattr(self, "scroll") else 0
+        board_w = max(vw, _min_board_width(cfgs + [config])) if vw else _board_width(cfgs + [config])
+        config.col, config.row = _first_free_slot(config, cfgs, board_w)
         card = PanelCard(config, parent=self.board, names_provider=self._signal_names,
                          sources_provider=self._signal_providers, formats_provider=self._signal_formats, axes_provider=self._signal_axes, sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x, structure_provider=self._signal_structure, calibration_provider=self._running_calibration, short_names_provider=self._signal_short_names, live_namespace_provider=self._expression_namespace)
         self._attach_card(card)

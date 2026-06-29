@@ -29,15 +29,18 @@ from Zou_lab_control.frontend.task_console import (
 
 
 def test_narrow_viewport_reflows_to_single_column():
-    """A narrowed viewport must reflow a side-by-side layout into a single column (the board-width
-    must NOT ratchet to the cards' current right-extent, else narrowing could never re-pack)."""
-    cfgs = [PanelConfig(kind="1d", col=0, row=0, size="1x2"),
-            PanelConfig(kind="1d", col=0, row=0, size="1x2")]
-    _compact(cfgs, board_w=4000)                          # wide: pack side by side
-    assert len({c.col for c in cfgs}) == 2, "wide board should place the two cards in two columns"
+    """A narrowed viewport collapses a two-column layout into a single column: each card keeps its
+    column under gravity, but the board-width clamp pulls every card's x back inside the board, so at
+    one-card width both land in the one column and stack (the clamp must NOT ratchet to the cards'
+    current right-extent, else narrowing could never re-pack)."""
+    w = _card_size("1x2")[0]
+    cfgs = [PanelConfig(kind="1d", col=GAP, row=GAP, size="1x2"),
+            PanelConfig(kind="1d", col=GAP + w + GAP, row=GAP, size="1x2")]   # two adjacent columns
+    _compact(cfgs, board_w=4000)                          # wide: the two distinct columns stay put
+    assert len({c.col for c in cfgs}) == 2, "wide board keeps the two columns the user placed"
     _compact(cfgs, board_w=_min_board_width(cfgs))        # narrow to one-card width
-    assert len({c.col for c in cfgs}) == 1, "narrow board must reflow both cards to a single column"
-    assert len({c.row for c in cfgs}) == 2, "and stack them vertically"
+    assert len({c.col for c in cfgs}) == 1, "narrow board clamps both cards into a single column"
+    assert len({c.row for c in cfgs}) == 2, "and they stack vertically"
 
 ensure_qt_app()                       # _card_size reads scaled_px (needs the QApplication)
 
@@ -177,3 +180,38 @@ def test_dragged_card_snaps_up_left():
     a = _cfg(700, 600, "2x2")
     _compact([a], active=a)
     assert (a.col, a.row) == (GAP, GAP)
+
+
+# ------------------------------------------------------- (#2) NW gravity is BLOCKED, never teleports
+def test_drag_to_bottom_left_stays_below_the_top_left_card():
+    """#2: a card dropped at the BOTTOM-LEFT, with a panel directly ABOVE it and the LEFT BOUNDARY on
+    its left, STAYS bottom-left -- the NW gravity is blocked by the panel above and the boundary, so it
+    must NOT be flung up-and-over to the empty TOP-RIGHT slot.  (The candidate-sweep packer wrongly
+    teleported it to the first free top-most slot = top-right; anchored local gravity keeps it put.)"""
+    w, h = _card_size("1x2")
+    board_w = 2 * w + 3 * GAP                          # room for TWO columns (so a top-right gap exists)
+    top = _cfg(GAP, GAP, "1x2")
+    drop = _cfg(GAP, GAP + h + 50, "1x2")              # the user drops it just below the top-left card
+    _compact([top, drop], active=drop, board_w=board_w)
+    assert (drop.col, drop.row) == (GAP, GAP + h + GAP)   # stays bottom-left, one GAP under the top card
+    assert drop.row > GAP                                 # NOT risen to the top row
+    assert drop.col == GAP                                # NOT slid right to the top-right gap
+
+
+def test_first_free_slot_tiles_the_top_row_then_wraps():
+    """A freshly-Added panel SPAWNS at the first free top-left slot (``_first_free_slot``) so an Add
+    TILES the board -- fills the top row left-to-right, then wraps -- instead of starting a fresh column.
+    (Local NW gravity then keeps it there; this is the seed that makes Add fill the width.)"""
+    from Zou_lab_control.frontend.task_console import _first_free_slot
+    w, h = _card_size("1x2")
+    board_w = 2 * w + 3 * GAP                          # exactly two columns fit
+    placed = []
+    spots = []
+    for _ in range(4):                                 # add four 1x2 panels one at a time
+        cfg = _cfg(GAP, GAP, "1x2")
+        cfg.col, cfg.row = _first_free_slot(cfg, placed, board_w)
+        spots.append((cfg.col, cfg.row)); placed.append(cfg)
+    assert spots[0] == (GAP, GAP)                       # first -> origin
+    assert spots[1] == (GAP + w + GAP, GAP)             # second -> top row, second column (TILES, not stacks)
+    assert spots[2] == (GAP, GAP + h + GAP)             # third -> wraps to row 2, column 1
+    assert spots[3] == (GAP + w + GAP, GAP + h + GAP)   # fourth -> row 2, column 2
