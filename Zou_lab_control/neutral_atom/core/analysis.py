@@ -70,9 +70,36 @@ def roi_counts(image, centers, *, radius: int = 1, reducer: str = "mean") -> np.
     return np.asarray(out, dtype=float)
 
 
-def _gauss2d_axis(coords, offset, amp, x0, y0, sx, sy):
+def _gauss2d(coords, offset, amp, x0, y0, sx, sy):
     x, y = coords
     return (offset + amp * np.exp(-0.5 * (((x - x0) / sx) ** 2 + ((y - y0) / sy) ** 2))).ravel()
+
+
+def fit_gaussian_spot_2d(data, yy, xx, *, x0, y0, offset0, amp, sigma0: float = 0.9):
+    """Fit a 2D gaussian spot to ``data`` over the integer-pixel meshgrid ``(yy, xx)`` -- the ONE
+    2D-gaussian fit (the :func:`_gauss2d` model + parameter bounds + intensity-weighted centroid
+    fallback) shared by sub-pixel centre refinement and PSF extraction, so the two never drift (#C4).
+    The centre is seeded at ``(x0, y0)`` and bounded to the box (``xx``/``yy`` extents); ``offset0``
+    seeds the background level (0 for already-bg-subtracted data).  Returns
+    ``(xf, yf, sx, sy, fit_ok)``; on a failed fit the intensity-weighted centroid of ``data`` floored
+    at its 20th percentile (or the seed centre + ``sigma0`` when even that carries no signal)."""
+    amp = float(amp)
+    try:
+        p0 = [float(offset0), max(amp, 1e-6), float(x0), float(y0), sigma0, sigma0]
+        lo = [float(np.nanmin(data)) - abs(amp) - 1, 0.0,
+              float(xx.min()) - 0.5, float(yy.min()) - 0.5, 0.2, 0.2]
+        hi = [float(np.nanmax(data)) + abs(amp) + 1, max(amp * 5, 1.0),
+              float(xx.max()) + 0.5, float(yy.max()) + 0.5, 4.0, 4.0]
+        popt, _ = curve_fit(_gauss2d, (xx.ravel(), yy.ravel()), data.ravel(),
+                            p0=p0, bounds=(lo, hi), maxfev=5000)
+        _, _, xf, yf, sx, sy = popt
+        return float(xf), float(yf), float(abs(sx)), float(abs(sy)), True
+    except Exception:
+        vals = np.clip(data - np.nanpercentile(data, 20), 0, None)
+        s = float(np.sum(vals))
+        if s <= 0:
+            return float(x0), float(y0), float(sigma0), float(sigma0), False
+        return float(np.sum(xx * vals) / s), float(np.sum(yy * vals) / s), float(sigma0), float(sigma0), False
 
 
 def _refine_center_subpixel(image: np.ndarray, x: float, y: float, half: int = 2) -> tuple[float, float]:
@@ -90,18 +117,8 @@ def _refine_center_subpixel(image: np.ndarray, x: float, y: float, half: int = 2
     yy, xx = np.mgrid[y0:y1, x0:x1]
     bg = float(np.nanmedian(cut))
     amp = float(np.nanmax(cut) - bg)
-    try:
-        p0 = [bg, max(amp, 1e-6), float(x), float(y), 0.9, 0.9]
-        lo = [np.nanmin(cut) - abs(amp) - 1, 0.0, x0 - 0.5, y0 - 0.5, 0.2, 0.2]
-        hi = [np.nanmax(cut) + abs(amp) + 1, max(amp * 5, 1.0), x1 - 0.5, y1 - 0.5, 4.0, 4.0]
-        popt, _ = curve_fit(_gauss2d_axis, (xx.ravel(), yy.ravel()), cut.ravel(), p0=p0, bounds=(lo, hi), maxfev=5000)
-        return float(popt[2]), float(popt[3])
-    except Exception:
-        vals = np.clip(cut - np.nanpercentile(cut, 20), 0, None)
-        s = float(np.sum(vals))
-        if s <= 0:
-            return float(x), float(y)
-        return float(np.sum(xx * vals) / s), float(np.sum(yy * vals) / s)
+    xf, yf, _sx, _sy, _ok = fit_gaussian_spot_2d(cut, yy, xx, x0=float(x), y0=float(y), offset0=bg, amp=amp)
+    return xf, yf
 
 
 def find_site_centers(

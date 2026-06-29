@@ -8,10 +8,10 @@ from typing import TYPE_CHECKING, Any, Sequence
 
 import numpy as np
 
-from ..core.analysis import estimate_threshold_fidelity, otsu_threshold, positive_int
+from ..core.analysis import positive_int
 from ..core.calibration import TrapCalibration
 from ..core.results import DetectionResult, DetectionTimeScanResult, SitemapResult, ThresholdResult
-from ..core.utils import json_ready, site_index
+from ..core.utils import json_ready
 from ..operations import calibrate_sitemap_from_images, calibrate_threshold_from_images, detect_image
 from ..operations.fidelity import FidelityReport, characterize_readout
 from ..operations.imageio import DEFAULT_REF_SHOTS, DEFAULT_SHORT_SHOT, DEFAULT_SHOTS_PER_GROUP, index_run
@@ -23,6 +23,7 @@ from ..operations.measurement import (
     ScanAxis,
     ScanResult,
     ScannedMeasurement,
+    otsu_fidelity_from_frames,
 )
 from ..operations.temperature import ReleaseRecapturePlan, SurvivalReducer
 from ..timing import PulseTableState
@@ -361,17 +362,11 @@ class ReadoutSubsystem(ExperimentSubsystem):
         reference_images = s.devices.camera.acquire(
             reference_shots, sequence=reference_sequence, sequencer=reference_controller.sequencer,
         )
-        # Extract through the calibration's own method (box or PSF), so a
-        # detection-time scan on a PSF calibration uses PSF signals -- the same
-        # quantity detect() compares.
-        reference_counts = np.vstack([calibration.signals(image) for image in reference_images])
-        if site is None:
-            reference_values = reference_counts.reshape(-1)
-        else:
-            site_idx_ref = site_index(site, reference_counts.shape[1])
-            reference_values = reference_counts[:, site_idx_ref]
-        reference_threshold = otsu_threshold(reference_values)
-        reference_fidelity = estimate_threshold_fidelity(reference_values, reference_threshold)
+        # Extract through the calibration's own method (box or PSF) and Otsu-split + score via the
+        # ONE shared pipeline -- so the held-out reference uses the SAME signals/threshold/fidelity
+        # the live OtsuFidelityReducer does, the same quantity detect() compares (#C3).
+        reference_counts, reference_threshold, reference_fidelity = otsu_fidelity_from_frames(
+            reference_images, calibration, site)
 
         scan = self.build_detection_scan(times, shots=shots, site=site, pulse=pulse)
         reducer = scan.reducer

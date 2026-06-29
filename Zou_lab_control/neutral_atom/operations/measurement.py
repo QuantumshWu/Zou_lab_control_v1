@@ -284,6 +284,19 @@ class PointReducer(Protocol):
         ...
 
 
+def otsu_fidelity_from_frames(frames, calibration: TrapCalibration, site: int | None):
+    """Stack per-frame site signals, select ``site`` (or pool ALL when ``None``), Otsu-split the
+    distribution and score the two-Gaussian threshold fidelity -- the ONE
+    ``signals -> (counts, threshold, FidelityEstimate)`` pipeline, shared by the live
+    :class:`OtsuFidelityReducer` and the held-out reference path in the readout subsystem so the
+    detection-time scan's y and its reference fidelity are computed identically (#C3).  Returns the
+    stacked per-site ``counts`` too (the reference path records them)."""
+    counts = np.vstack([calibration.signals(image) for image in frames])
+    values = counts.reshape(-1) if site is None else counts[:, site_index(site, counts.shape[1])]
+    threshold = otsu_threshold(values)
+    return counts, threshold, estimate_threshold_fidelity(values, threshold)
+
+
 @dataclass
 class OtsuFidelityReducer:
     """Per-point single-shot readout fidelity (the detection-time scan's y).
@@ -311,13 +324,7 @@ class OtsuFidelityReducer:
     fidelities: list[float] = field(default_factory=list)
 
     def reduce(self, frames, calibration: TrapCalibration) -> float:
-        counts = np.vstack([calibration.signals(image) for image in frames])
-        if self.site is None:
-            values = counts.reshape(-1)
-        else:
-            values = counts[:, site_index(self.site, counts.shape[1])]
-        threshold = otsu_threshold(values)
-        model = estimate_threshold_fidelity(values, threshold)
+        _counts, threshold, model = otsu_fidelity_from_frames(frames, calibration, self.site)
         fidelity = float(model.fidelity)
         if not np.isfinite(fidelity):
             fidelity = 0.5

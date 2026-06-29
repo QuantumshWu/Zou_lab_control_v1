@@ -11,7 +11,7 @@ operations, the readout subsystem) is unchanged across methods.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 from pathlib import Path
 from typing import Any, Sequence
@@ -176,19 +176,9 @@ class TrapCalibration:
         )
 
     def with_thresholds(self, thresholds, **metadata) -> "TrapCalibration":
-        return TrapCalibration(
-            self.centers,
-            thresholds,
-            grid_shape=self.grid_shape,
-            roi_radius=self.roi_radius,
-            reducer=self.reducer,
-            method=self.method,
-            psf_weights=self.psf_weights,
-            psf_boxes=self.psf_boxes,
-            background=self.background,
-            by_method=self.by_method,
-            metadata={**self.metadata, **metadata},
-        )
+        # dataclasses.replace re-runs __post_init__ (re-normalizes thresholds/by_method), so it is
+        # the ONE faithful "copy with one field changed" -- no hand-re-spelling every field (#C2).
+        return replace(self, thresholds=thresholds, metadata={**self.metadata, **metadata})
 
     def with_method_thresholds(self, per_method, **metadata) -> "TrapCalibration":
         """A copy with per-METHOD thresholds replaced.  ``per_method`` maps a method name to
@@ -206,11 +196,9 @@ class TrapCalibration:
             if name in per_method:
                 updated["thresholds"] = per_method[name]
             by_method[name] = updated
-        return TrapCalibration(
-            self.centers, top, grid_shape=self.grid_shape, roi_radius=self.roi_radius,
-            reducer=self.reducer, method=self.method, psf_weights=self.psf_weights,
-            psf_boxes=self.psf_boxes, background=self.background,
-            by_method=by_method or None, metadata={**self.metadata, **metadata})
+        # the by_method rebuild above is the real work; replace() carries every OTHER field faithfully (#C2).
+        return replace(self, thresholds=top, by_method=by_method or None,
+                       metadata={**self.metadata, **metadata})
 
     @staticmethod
     def _by_method_to_json(by_method) -> dict | None:

@@ -7262,6 +7262,14 @@ def test_psf_calibration_serialization_round_trip(tmp_path):
     exp.readout.sitemap(method="psf", frames=4, display=False)
     exp.readout.thresholds(method="bimodal", frames=80, display=False)
     cal = exp.readout.current
+    # to_dict must serialize EVERY dataclass field -- so a newly-added field can NOT silently drop
+    # out of the on-disk record (this parity is why to_dict/from_dict stay explicit per-field, not
+    # a generic fields() loop that would emit raw numpy) (#C2).
+    from dataclasses import fields as _dc_fields, replace as _dc_replace
+    assert set(cal.to_dict()) == {f.name for f in _dc_fields(na.TrapCalibration)}
+    # Inject a per-method entry so the round trip also exercises to_dict's by_method encoder
+    # + from_dict's by_method parse (a multi-method calibration carries these).
+    cal = _dc_replace(cal, by_method={"box": {"thresholds": cal.thresholds, "psf_weights": None, "psf_boxes": None}})
     for suffix in (".json", ".npz"):
         path = tmp_path / f"cal{suffix}"
         cal.save(path)
@@ -7270,6 +7278,8 @@ def test_psf_calibration_serialization_round_trip(tmp_path):
         assert np.allclose(loaded.psf_weights, cal.psf_weights)
         assert np.array_equal(loaded.psf_boxes, cal.psf_boxes)
         assert np.allclose(loaded.thresholds, cal.thresholds)
+        assert set(loaded.by_method or {}) == {"box"}   # by_method survives the round trip
+        assert np.allclose(loaded.by_method["box"]["thresholds"], cal.thresholds)
 
 
 def test_box_otsu_readout_is_still_the_default():

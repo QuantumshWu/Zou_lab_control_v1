@@ -25,9 +25,8 @@ from dataclasses import dataclass
 from typing import Sequence
 
 import numpy as np
-from scipy.optimize import curve_fit
 
-from .analysis import centers_array, image_array, nonnegative_int
+from .analysis import centers_array, fit_gaussian_spot_2d, image_array, nonnegative_int
 
 
 @dataclass(frozen=True)
@@ -84,11 +83,6 @@ def gaussian_psf(shape: tuple[int, int], x0: float, y0: float, sx: float, sy: fl
     return g / total if total > 0 else np.ones(shape, dtype=float) / float(np.prod(shape))
 
 
-def _gauss2d(coords: tuple[np.ndarray, np.ndarray], offset: float, amp: float, x0: float, y0: float, sx: float, sy: float) -> np.ndarray:
-    x, y = coords
-    return (offset + amp * np.exp(-0.5 * (((x - x0) / sx) ** 2 + ((y - y0) / sy) ** 2))).ravel()
-
-
 def fit_site_psfs(
     template,
     centers,
@@ -130,19 +124,8 @@ def fit_site_psfs(
         sub = cut - bg
         yy, xx = np.mgrid[by:by + bh, bx:bx + bw]
         amp = float(np.nanmax(sub)) if np.isfinite(sub).any() else 0.0
-        xf, yf, sx, sy, fit_ok = float(x), float(y), 0.9, 0.9, False
-        try:
-            p0 = [0.0, max(amp, 1e-6), float(x), float(y), 0.9, 0.9]
-            lo = [float(np.nanmin(sub)) - abs(amp) - 1, 0.0, bx - 0.5, by - 0.5, 0.2, 0.2]
-            hi = [float(np.nanmax(sub)) + abs(amp) + 1, max(amp * 5, 1.0), bx + bw - 0.5, by + bh - 0.5, 4.0, 4.0]
-            popt, _ = curve_fit(_gauss2d, (xx.ravel(), yy.ravel()), sub.ravel(), p0=p0, bounds=(lo, hi), maxfev=5000)
-            _, _, xf, yf, sx, sy = popt
-            sx, sy, fit_ok = float(abs(sx)), float(abs(sy)), True
-        except Exception:
-            vals = np.clip(sub - np.nanpercentile(sub, 20), 0, None)
-            if np.sum(vals) > 0:
-                xf = float(np.sum(xx * vals) / np.sum(vals))
-                yf = float(np.sum(yy * vals) / np.sum(vals))
+        # the bg-subtracted box -> offset seed 0; the ONE shared 2D-gaussian fit (#C4).
+        xf, yf, sx, sy, fit_ok = fit_gaussian_spot_2d(sub, yy, xx, x0=float(x), y0=float(y), offset0=0.0, amp=amp)
 
         if weight_source == "gaussian":
             weight = gaussian_psf((bh, bw), xf - bx, yf - by, sx, sy)
