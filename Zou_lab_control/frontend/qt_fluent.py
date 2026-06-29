@@ -1863,6 +1863,17 @@ class FluentSwitch(QtWidgets.QAbstractButton):
         text_w = fluent_text_width(QtGui.QFontMetrics(self.font()), self.text())
         return QtCore.QSize(max(self.minimumWidth(), scaled_px(60) + text_w), self.minimumHeight())
 
+    def hitButton(self, pos) -> bool:
+        # Only the visible switch TRACK (and its label, if any) toggles.  The widget reserves a wider
+        # minimum width for column alignment, so without this the dead padding to the right of the
+        # 60 px track -- which fills the form row's control cell -- would flip the switch on a click
+        # that never landed on it (a click anywhere "on the row" toggling is the reported bug).
+        track_w = scaled_px(60, minimum=48)
+        hit_w = track_w
+        if self.text():
+            hit_w = track_w + scaled_px(8) + fluent_text_width(QtGui.QFontMetrics(self.font()), self.text())
+        return 0 <= int(pos.x()) <= int(hit_w) and 0 <= int(pos.y()) <= self.height()
+
     def paintEvent(self, event) -> None:
         del event
         painter = QtGui.QPainter(self)
