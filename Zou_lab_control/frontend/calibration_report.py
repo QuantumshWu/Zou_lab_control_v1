@@ -166,30 +166,33 @@ def save_calibration_report(folder, *, counts, thresholds, fidelity, centers,
 
 
 def save_frame_image(path, frame, *, title: str | None = None) -> str:
-    """Render ONE raw camera frame as a 2D IMAGE (``imshow`` with the camera colormap + a styled
-    title) and save just the PNG -- the visual companion to that frame's ``.npy`` in the calibration
-    ``frames/`` folder, so the operator can eyeball the emCCD bracket frames the calibration actually
-    used.  NO ``.npz``: the ``.npy`` beside it IS the data.  This images one array exactly the way
-    :class:`live.ImageCell` does (a raw-frame SAVE artifact, not an interactive plot), so it stays off
-    the BaseLivePlot path on purpose.  Drawn on an explicit Agg canvas, so the calibrate task's worker
-    thread can render it without touching pyplot / Qt."""
+    """Render ONE raw camera frame through the SAME "2D image" plot TYPE the live console uses for a
+    camera 2d panel (:class:`live.Live2DDis`, ``kind="2d"``) -- REUSE, not a hand-rolled imshow -- and
+    save just the PNG.  The frame (H x W counts) is raveled into the plot's ``(N, 2)`` coords +
+    ``(N,)`` values exactly as :meth:`PanelCard._build_plot` does for a live 2d panel, so the saved
+    picture is identical to the console's 2D camera image (same colormap + side distribution +
+    colorbar + clim).  PNG only: the ``.npy`` beside it in the ``frames/`` folder IS the data (no
+    redundant ``.npz``).  Drawn on an explicit Agg canvas (``fig=``), so the calibrate task's worker
+    thread can render it without touching pyplot / Qt -- the same off-thread contract the report uses."""
     from pathlib import Path as _P
 
-    from .style import DEFAULT_STYLE, PALETTE, apply_title, axis_label_fontsize
+    from .live import Live2DDis
+    from .style import DEFAULT_STYLE
 
     arr = np.asarray(frame, dtype=float)
-    fig = _agg_figure()
-    ax = fig.add_subplot(111)
-    im = ax.imshow(arr, origin="lower", cmap=PALETTE["cmap_camera"], interpolation="none")
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    fs = axis_label_fontsize()
-    ax.set_xlabel("Camera x (px)", fontsize=fs)
-    ax.set_ylabel("Camera y (px)", fontsize=fs)
-    apply_title(ax, title or _P(path).stem)
+    ny, nx = arr.shape
+    # ravel the image into the 2d plot's scatter form (meshgrid pixel coords + counts); Live2DDis
+    # grids it straight back to the H x W image -- the identical path the live 2d camera panel takes.
+    xx, yy = np.meshgrid(np.arange(nx, dtype=float), np.arange(ny, dtype=float))
+    data_x = np.column_stack([xx.ravel(), yy.ravel()])
+    plot = Live2DDis(
+        data_x, arr.ravel(),
+        labels=("Camera x (px)", "Camera y (px)", "Counts"),
+        title=title or _P(path).stem,
+        fig=_agg_figure(), interactions=False).show(display=False)
     out = _P(path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
-    fig.savefig(str(out), dpi=DEFAULT_STYLE["savefig.dpi"])   # unified high save dpi (same as plot.save)
+    plot.fig.savefig(str(out), dpi=DEFAULT_STYLE["savefig.dpi"])   # png only -- unified save dpi, .npy holds the data
     return str(out)
 
 

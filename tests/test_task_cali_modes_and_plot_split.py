@@ -352,14 +352,22 @@ def test_calibrate_task_live_save_frames_writes_a_png_companion_per_npy(tmp_path
         exp.close()
 
 
-def test_frontend_save_frame_image_renders_a_real_png_only(tmp_path):
-    """#5 render side: the frontend ``save_frame_image`` images ONE raw frame (2D imshow, camera
-    cmap + styled title) and writes a real, non-empty PNG -- and ONLY the png (NO ``.npz``: the
-    ``.npy`` beside it in the frames folder IS the data, unlike a plot.save which pairs png+npz)."""
+def test_frontend_save_frame_image_reuses_the_2d_image_plot_type(tmp_path, monkeypatch):
+    """#5 render side: ``save_frame_image`` must render the frame through the SAME "2D image" plot TYPE
+    the live console uses (:class:`Live2DDis`, kind="2d") -- REUSE, not a hand-rolled imshow -- so the
+    saved picture looks identical to the console's 2D camera image (same cmap + side distribution +
+    colorbar).  It writes a real, non-empty PNG and ONLY the png (NO ``.npz``: the ``.npy`` beside it
+    in the frames folder IS the data)."""
+    import Zou_lab_control.frontend.live as live
     from Zou_lab_control.frontend.calibration_report import save_frame_image
+
+    used = {}
+    real = live.Live2DDis
+    monkeypatch.setattr(live, "Live2DDis", lambda *a, **k: used.setdefault("via", real(*a, **k)))
 
     frame = np.random.default_rng(0).normal(600.0, 30.0, size=(40, 50))
     out = Path(save_frame_image(tmp_path / "img1.png", frame))
+    assert "via" in used, "the frame png must be rendered via the Live2DDis 2D-image plot type (reuse)"
     assert out.exists() and out.suffix == ".png" and out.stat().st_size > 0
     assert not (tmp_path / "img1.npz").exists()              # png only -- the data lives in the .npy companion
 
