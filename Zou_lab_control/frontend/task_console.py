@@ -435,8 +435,10 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
         # it; consumed (cleared) once applied.
         self._pending_mode = None
         self._pending_api: dict[str, str] = {}
-        self._api_columns: list[tuple[str, str, str]] = []   # the api-mode table columns
-        self._scan_columns: list[tuple[str, str, str]] = []  # the scan-mode table columns
+        self._api_columns: list[tuple[str, str, str]] = []   # the api-mode table columns (legend)
+        self._scan_columns: list[tuple[str, str, str]] = []  # the scan-mode table columns (legend)
+        self._api_specs: list = []                           # per-kind template column specs (api)
+        self._scan_specs: list = []                          # per-kind template column specs (scan)
         self._have_api = False
         self._have_scan = False
         self._n_slots = 0                             # bound hardware scan slot count
@@ -521,14 +523,20 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
             api_note.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
             self._api_box.addWidget(api_note)
 
-        # the per-mode table columns (api native units; hardware scan ns/LSB)
+        # the per-mode table columns (api native units; hardware scan ns/LSB) + the per-kind template
+        # column specs (so a DAC column is seeded with its signed code range, not a duration's ns range).
+        from ..neutral_atom.timing import scan_column_spec
         self._api_columns = [(name, slot_label(kind, target), (unit or "value"))
                              for name, kind, target, unit, _c in api_rows]
+        self._api_specs = [scan_column_spec(name, ("dac" if kind == "dac" else "duration"), unit=(unit or "ns"))
+                           for name, kind, target, unit, _c in api_rows]
         self._scan_columns = []
+        self._scan_specs = []
         for i, (name, kind, target, unit, stored_label) in enumerate(scan_rows):
             disp = stored_label or slot_label(kind, target)
             u = "ns ticks" if kind == "duration" else ("integer code (LSB)" if kind == "dac" else (unit or ""))
             self._scan_columns.append((f"s{i}", disp, u))
+            self._scan_specs.append(scan_column_spec(f"s{i}", kind, unit=(unit or "ns")))
 
         # Default mode: Scan if scan slots exist, else API if api slots exist, else None.  A SAVED
         # mode (set by seed_value on a load) wins -- but only if that kind is still available for the
@@ -629,7 +637,8 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
         the columns / legend / remembered buffer differ.  ``columns`` = ``[(col_var, display, unit),
         ...]``.  The editor seeds from this mode's remembered buffer, or the column_stack template."""
         from ..neutral_atom.timing import scan_table_template
-        n = max(1, len(columns))
+        _none, api_mode, _scan = _scan_modes()
+        specs = self._api_specs if mode == api_mode else self._scan_specs
         legend = ["Columns of scan_table (one row = one point, columns advance in lockstep):"]
         for var, disp, unit in columns:
             legend.append(f"  {var}: {disp}  [{unit}]")
@@ -638,17 +647,17 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
         legend_label.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
         self._table_box.addWidget(legend_label)
         remembered = self._scan_buffers.get(mode, "").strip()
-        seed = remembered or scan_table_template("column_stack", n)
+        seed = remembered or scan_table_template("column_stack", specs)
         btn_row = QtWidgets.QHBoxLayout()
         btn_row.setContentsMargins(0, 0, 0, 0)
         btn_row.setSpacing(scaled_px(6, minimum=4))
         btn_row.addWidget(FluentLabel("template:", self))
         cs = FluentButton("column_stack", color=GREY)
         cs.setToolTip("Insert the column_stack template (one column per slot), adapted to the columns.")
-        cs.clicked.connect(lambda *_a, m=n: self._insert_template("column_stack", m))
+        cs.clicked.connect(lambda *_a: self._insert_template("column_stack"))
         gr = FluentButton("grid", color=GREY)
         gr.setToolTip("Insert the grid template (every combination of the axis arrays).")
-        gr.clicked.connect(lambda *_a, m=n: self._insert_template("grid", m))
+        gr.clicked.connect(lambda *_a: self._insert_template("grid"))
         btn_row.addWidget(cs, 0)
         btn_row.addWidget(gr, 0)
         btn_row.addStretch(1)
@@ -661,12 +670,12 @@ class _PulseSlotsWidget(QtWidgets.QWidget):
         self._table_box.addWidget(editor)
         self._scan_code = editor
 
-    def _insert_template(self, template: str, n: int | None = None) -> None:
+    def _insert_template(self, template: str) -> None:
         from ..neutral_atom.timing import scan_table_template
         if self._scan_code is not None:
-            _none, _api, scan = _scan_modes()
-            cols = (self._n_slots if self._mode == scan else len(self._api_columns)) if n is None else n
-            self._scan_code.setPlainText(scan_table_template(template, max(1, cols)))
+            _none, api_mode, _scan = _scan_modes()
+            specs = self._api_specs if self._mode == api_mode else self._scan_specs
+            self._scan_code.setPlainText(scan_table_template(template, specs))
 
     def values_dict(self) -> dict:
         """The current ``{"api": {name: float}, "scan_mode": "none"|"api"|"scan",

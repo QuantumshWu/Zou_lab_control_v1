@@ -727,6 +727,32 @@ class PulseTableState:
                 out.append(None)
         return out
 
+    def scan_column_specs(self) -> list["ScanColumnSpec"]:
+        """Per scan-slot starter-sweep spec for the template (#scan-template): a DAC slot over its
+        bus's SIGNED code range, a duration slot over a ns range bracketing the nominal (>= 1 tick).
+        ONE source so the pulse GUI and the task-console pulse-scan form seed identical, per-kind
+        columns -- a DAC column is never given a duration's ns sweep."""
+        ranges = self.scan_slot_dac_ranges()
+        step = positive_time_step_ns(self.time_step_ns)
+        return [scan_column_spec(slot_var(index), slot.kind, nominal=slot.nominal, unit=slot.unit,
+                                 signed_range=ranges[index], time_step_ns=step)
+                for index, slot in enumerate(self.scan_slots)]
+
+    def api_column_specs(self) -> list["ScanColumnSpec"]:
+        """Per api-slot starter-sweep spec for the api-sweep template -- a DAC api slot over its bus's
+        signed code range, a duration/delay api slot over a ns range (the SAME per-kind rule as the
+        hardware scan, so neither template ever mixes a DAC's range with a duration's)."""
+        buses = self.bus_channels(min_width=1)
+        step = positive_time_step_ns(self.time_step_ns)
+        specs: list[ScanColumnSpec] = []
+        for slot in self.api_slots:
+            rng = None
+            if slot.kind == "dac":
+                rng = bus_signed_range(max(1, len(buses.get(slot.target.split("@", 1)[0], []))))
+            specs.append(scan_column_spec(slot.name, ("dac" if slot.kind == "dac" else "duration"),
+                                          unit=slot.unit, signed_range=rng, time_step_ns=step))
+        return specs
+
     def with_slots_resolved(self, slots: Mapping[str, float]) -> "PulseTableState":
         """Return a non-scan copy with each slot replaced by a constant value.
 
@@ -1286,11 +1312,30 @@ class PulseTableState:
                 f"period {period_index} duration is scan-bound; unbind its scan slot "
                 "(unbind_slot) before setting a fixed duration.")
         period = self.periods[period_index]
+        new_unit = str(unit) if unit is not None else period.unit
+        # A LITERAL duration is floored to >= 1 whole tick HERE so a 0 / sub-tick value can never
+        # reach the compiler/driver as a degenerate zero-length period (the user's "unexpected
+        # error").  This is the SINGLE structural guard for "you cannot set a duration to 0": the
+        # api-sweep path (_api_table_arrays) sets durations point-by-point with NO table-level snap,
+        # so the floor must live at the set site.  A negative literal is left for validate() to
+        # reject loudly (duration_steps); a scan EXPRESSION is left for the per-point scan snap.
+        duration = self._floor_literal_duration(duration, new_unit)
         self.periods[period_index] = PulsePeriod(
-            duration, tuple(period.states),
-            unit=str(unit) if unit is not None else period.unit, name=period.name)
+            duration, tuple(period.states), unit=new_unit, name=period.name)
         self.validate()
         return self
+
+    def _floor_literal_duration(self, duration: float | str, unit: str) -> float | str:
+        """A literal duration in ``[0, 1 tick)`` is bumped UP to exactly one tick (the hardware
+        minimum); a negative literal or a slot expression (needs ``sN``) is returned unchanged."""
+        try:
+            ns = float(eval_time_expr(duration)) * UNITS_TO_NS[str(unit)]
+        except Exception:
+            return duration                                  # an expression needing slots -- leave it
+        step = positive_time_step_ns(self.time_step_ns)
+        if 0.0 <= ns < step:                                 # 0 or sub-tick -> exactly 1 tick
+            return step / UNITS_TO_NS.get(str(unit), 1.0)
+        return duration
 
     def set_period_name(self, period_index: int, name: str) -> "PulseTableState":
         """Rename period ``period_index`` (the GUI's period-name edit)."""
@@ -2180,58 +2225,91 @@ def snap_scan_table(
     return out
 
 
-def scan_table_template(kind: str, n_slots: int) -> str:
+@dataclass(frozen=True)
+class ScanColumnSpec:
+    """One column of a starter scan/api template: the column variable name + a KIND-APPROPRIATE
+    default sweep range.  A ``dac`` column sweeps INTEGER codes over the bus's signed range
+    (``0`` = 0 V); a time column sweeps its unit (ns by default), ``>= 1`` tick.  This is why a
+    DAC slot no longer inherits a duration's ns range -- the bug the operator hit, where a +-512
+    DAC column was seeded with a ``20 .. 200000`` ns sweep (every point then clamped to +511)."""
+
+    name: str
+    lo: float
+    hi: float
+    is_dac: bool = False
+    unit: str = "ns"
+
+
+def scan_column_spec(name: str, kind: str, *, nominal: float = 0.0, unit: str = "ns",
+                     signed_range: tuple[int, int] | None = None, time_step_ns: float = 20.0) -> ScanColumnSpec:
+    """Build a :class:`ScanColumnSpec` with a sensible per-kind default sweep.
+
+    ``dac`` -> the bus's SIGNED code range (``signed_range``, else the default 10-bit ``+-512``).
+    ``duration`` / time -> a ns range bracketing ``nominal`` (a few x), floored at one tick so the
+    column is never seeded with a 0 / sub-tick duration (the driver rejects a zero-length period)."""
+    if str(kind) == "dac":
+        lo, hi = signed_range if signed_range is not None else bus_signed_range(DEFAULT_DAC_BITS)
+        return ScanColumnSpec(name, float(lo), float(hi), is_dac=True, unit=str(unit or "code"))
+    u = UNITS_TO_NS.get(str(unit or "ns"), 1.0)
+    step_in_unit = positive_time_step_ns(time_step_ns) / u           # one clock tick, in the slot's unit
+    nom = max(0.0, float(nominal))
+    lo = step_in_unit                                                # 1 tick minimum -- never 0
+    hi = max(nom * 2.0, 100.0 * step_in_unit)                        # bracket the nominal, >= ~100 ticks
+    return ScanColumnSpec(name, float(lo), float(hi), is_dac=False, unit=str(unit or "ns"))
+
+
+def scan_table_template(kind: str, columns: Sequence[ScanColumnSpec]) -> str:
     """Starter Python for a scan-table program -- the ONE scan model, shared by the pulse GUI
     Scan tab and the task-console Pulse-scan form.
 
-    The program builds an ``(N_points x n_slots)`` array and assigns it to ``scan_table``: one
-    ROW per scan point, one COLUMN per bound scan slot.  The points are NOT set per-slot in
-    isolation -- the whole table is one object, so the slots advance together (in lockstep), and
-    arbitrary correlations between slots (anti-correlated, grid, loaded array) are just different
-    ways of building that one array.  Two starting templates:
+    The program builds an ``(N_points x n_cols)`` array and assigns it to ``scan_table``: one ROW
+    per scan point, one COLUMN per bound slot.  The whole table is one object, so the slots advance
+    together (lockstep); correlations (anti-correlated, grid, loaded array) are just different ways
+    of building that one array.  Each column is seeded by its slot's KIND (``columns`` carries the
+    per-slot range): a DAC column sweeps integer codes over its signed range, a duration column
+    sweeps ns ticks bracketing the nominal -- so a DAC slot is NOT given a duration's ns range.
 
     * ``column_stack`` (default): one independent column per slot.
     * ``grid``: every combination (outer product) of per-axis arrays.
     """
 
-    # Emitted UNIFORMLY for ANY slot count n (s0..s{n-1}): ONE editable line per slot, comments on
-    # their OWN line (never an inline `#` inside a single-line list -- that swallowed the rest of the
-    # list and made the 3+-slot template a SyntaxError).  So a 3 / 4 / ... -slot pulse gets a real
-    # per-slot template, not the old 2-slot-only special case.
-    n = max(1, int(n_slots))
+    cols = list(columns) or [ScanColumnSpec("s0", 20.0, 200_000.0, is_dac=False, unit="ns")]
+    n = len(cols)
+
+    def sweep(spec: ScanColumnSpec, size) -> str:
+        base = f"np.linspace({spec.lo:g}, {spec.hi:g}, {size})"
+        return f"{base}.round().astype(int)" if spec.is_dac else base
+
+    def note(spec: ScanColumnSpec) -> str:
+        return (f"{spec.name}: DAC code [{spec.lo:g}..{spec.hi:g}], 0 = 0 V"
+                if spec.is_dac else f"{spec.name}: duration [{spec.unit}], >= 1 tick")
+
     if str(kind) == "grid":
-        # A real N-D grid: ONE axis per slot, every combination (outer product).  Each slot is an
-        # independent axis -- edit the linspaces; scan_shape lets the grid show as a scan map.  Modest
-        # default per-axis sizes keep the point count sane (the operator edits them).
+        # A real N-D grid: ONE axis per slot, every combination (outer product).  Each axis is seeded
+        # in its own unit/range; scan_shape lets the grid show as a scan map.  Modest default sizes.
         sizes = [5, 4, 3] + [2] * max(0, n - 3)
         lines = ["import numpy as np", "",
-                 f"# Grid scan over {n} slot(s) s0..s{n - 1}: every combination of the per-slot axes."]
-        for j in range(n):
-            lines.append(f"a{j} = np.linspace(1000, 5000, {sizes[j]})        # axis for s{j}")
+                 f"# Grid scan over {n} slot(s) {cols[0].name}..{cols[-1].name}: every combination of the per-slot axes."]
+        for j, spec in enumerate(cols):
+            lines.append(f"a{j} = {sweep(spec, sizes[j])}        # axis for {note(spec)}")
         mesh = ", ".join(f"A{j}" for j in range(n))
         axes = ", ".join(f"a{j}" for j in range(n))
-        cols = ", ".join(f"A{j}.ravel()" for j in range(n))
+        ravel = ", ".join(f"A{j}.ravel()" for j in range(n))
         shape = ", ".join(f"len(a{j})" for j in range(n))
         shape_expr = f"({shape},)" if n == 1 else f"({shape})"   # always a tuple, even for n == 1
-        # trailing comma makes the target a tuple even for n == 1 (meshgrid returns a 1-element list)
         lines.append(f"{mesh}, = np.meshgrid({axes}, indexing=\"ij\")")
-        lines.append(f"scan_table = np.column_stack([{cols}])")
+        lines.append(f"scan_table = np.column_stack([{ravel}])")
         lines.append(f"scan_shape = {shape_expr}        # {n}-D grid -> a scan map")
         return "\n".join(lines) + "\n"
     # column_stack: one independent column per slot, the columns advancing together (lockstep).
     lines = ["import numpy as np", "",
-             f"# {n} bound slot(s) s0..s{n - 1}: build an (N_points x {n}) array -- one row per scan",
-             "# point, one column per slot (the slot's unit: ns for a duration, integer code for a DAC).",
-             "# Edit each slot's column below; the columns advance together (lockstep).",
-             "points = np.arange(20, 200e3, 20)        # base sweep"]
-    for j in range(n):
-        if j == 0:
-            lines.append("s0 = points")
-        elif j == 1 and n == 2:
-            lines.append("s1 = 200e3 - s0                          # e.g. anti-correlated (s0 + s1 const) -- edit freely")
-        else:
-            lines.append(f"s{j} = points                            # edit s{j}'s column")
-    slots = ", ".join(f"s{j}" for j in range(n))
+             f"# {n} bound slot(s) {cols[0].name}..{cols[-1].name}: build an (N_points x {n}) array -- one row",
+             "# per scan point, one column per slot (each in its OWN unit: ns for a duration, integer",
+             "# code for a DAC).  Edit each column; the columns advance together (lockstep).",
+             "N = 21        # number of scan points"]
+    for spec in cols:
+        lines.append(f"{spec.name} = {sweep(spec, 'N')}        # {note(spec)}")
+    slots = ", ".join(spec.name for spec in cols)
     lines.append(f"scan_table = np.column_stack([{slots}])")
     return "\n".join(lines) + "\n"
 

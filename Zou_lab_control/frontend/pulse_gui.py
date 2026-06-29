@@ -318,19 +318,21 @@ def _format_scan_progress(progress: Mapping[str, object] | None) -> str:
     return text
 
 
-def _template_column_stack(n_slots: int) -> str:
+def _template_column_stack(state) -> str:
     """``column_stack`` template (one column per slot) -- delegates to the ONE shared scan-table
-    template generator (the task-console Pulse-scan form uses the same source)."""
-    return scan_table_template("column_stack", n_slots)
+    template generator with the state's PER-KIND column specs (DAC slots get their signed code
+    range, not a duration's ns range).  The task-console Pulse-scan form uses the same source."""
+    return scan_table_template("column_stack", state.scan_column_specs())
 
 
-def _template_grid(n_slots: int) -> str:
-    """Grid (outer-product) template -- delegates to the ONE shared scan-table template generator."""
-    return scan_table_template("grid", n_slots)
+def _template_grid(state) -> str:
+    """Grid (outer-product) template -- delegates to the ONE shared scan-table template generator
+    with the state's per-kind column specs."""
+    return scan_table_template("grid", state.scan_column_specs())
 
 
-def _default_scan_code(n_slots: int) -> str:
-    return scan_table_template("column_stack", n_slots)
+def _default_scan_code(state) -> str:
+    return scan_table_template("column_stack", state.scan_column_specs())
 
 
 def _format_clock_text(time_step_ns: float) -> str:
@@ -3177,7 +3179,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         # long as the user has not edited it / loaded a program / picked the grid template.
         current = self.scan_code.toPlainText()
         if not current.strip() or current == getattr(self, "_scan_auto_code", ""):
-            fresh = _default_scan_code(max(1, len(state.scan_slots)))
+            fresh = _default_scan_code(state)
             was_dirty = self.scan_run_button.is_dirty()
             self.scan_code.setPlainText(fresh)
             self._scan_auto_code = fresh
@@ -3336,8 +3338,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             state = self.read_state()
         except Exception:
             state = self.state
-        n = max(1, len(state.scan_slots))
-        code = _template_grid(n) if kind == "grid" else _template_column_stack(n)
+        code = _template_grid(state) if kind == "grid" else _template_column_stack(state)
         self.scan_code.setPlainText(code)
         self._scan_code_initialized = True
 

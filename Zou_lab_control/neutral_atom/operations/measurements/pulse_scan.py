@@ -274,14 +274,14 @@ def pulse_scan(readout) -> MeasurementSpec:
             # also declares scan_shape (n0, n1) -> a 2-D scan map.  Empty program with bound slots
             # -> the column_stack default.
             if not scan_code.strip():
-                scan_code = scan_table_template("column_stack", len(state.scan_slots))
+                scan_code = scan_table_template("column_stack", state.scan_column_specs())
             scan_names, scan_arrays, scan_shape = _scan_table_arrays(state, scan_code)
         elif scan_mode == SCAN_MODE_API:
             # SOFTWARE api sweep (the analogue, for api slots): the SAME single scan_code, read as
             # an (N_points x n_api) table in native units (no hardware snap; set_api snaps a duration
             # itself).  Empty program -> the column_stack default for the api columns.
             if not scan_code.strip():
-                scan_code = scan_table_template("column_stack", len(state.api_slots))
+                scan_code = scan_table_template("column_stack", state.api_column_specs())
             api_names, api_arrays = _api_table_arrays(state, scan_code)
         # scan_mode == "none": no sweep -> a single point at the fixed api values (scan/api arrays
         # stay empty; PulseScanPlan's primary axis is then the lone [0.0] point).
