@@ -69,8 +69,9 @@ def test_repeat_contract_is_never_a_constructor_arg():
 
 def test_occupancy_is_preserve_and_the_repeat_axis_flows_through():
     """A 'preserve' processor fed the camera's ``(repeat,1,H,W)`` block judges EVERY slice and emits
-    the per-shot signals as CLEAN ``(repeat, n_sites)`` blocks (#H3s-F3): a LEADING repeat axis, NO
-    vestigial middle 1.  The repeat axis flows THROUGH the node, so ``repeat_mode=average`` over
+    the per-shot signals as ``(repeat, 1, n_sites)`` blocks: the UNIFORM (repeat, data_points, *data_dim)
+    contract with data_points=1 PRESENT (a frame stays one shape raw or judged).  The repeat axis flows
+    THROUGH the node, so ``repeat_mode=average`` over
     ``occupied`` (collapsed by the signal's declared ``core_ndim``) recovers every site (the per-site
     loading PROBABILITY) -- ONE mechanism, not an in-node accumulator.  Static geometry
     (centers/thresholds) and the scalar ``rate`` carry NO repeat axis."""
@@ -92,18 +93,20 @@ def test_occupancy_is_preserve_and_the_repeat_axis_flows_through():
             det.step()
         occupied = np.asarray(hub.latest("occupied"))
         n_sites = occupied.shape[-1]
-        # the per-shot signals carry a LEADING repeat axis (axis 0 == camera's repeat) and NO middle 1:
-        # the CLEAN (repeat, n_sites) contract block (#H3s-F3).
+        # the per-shot signals are the UNIFORM (repeat, data_points, *data_dim) block: occupancy judges
+        # ONE readout per shot, so data_points = 1 (PRESENT, never dropped) -- (repeat, 1, n_sites).
         for key in ("occupied", "counts"):
             blk = np.asarray(hub.latest(key))
-            assert blk.ndim == 2 and blk.shape == (5, n_sites), f"{key} shape {blk.shape}"
-        assert np.asarray(hub.latest("frame_judged")).ndim == 3    # clean (repeat, H, W) -- no middle 1
+            assert blk.ndim == 3 and blk.shape == (5, 1, n_sites), f"{key} shape {blk.shape}"
+        fj = np.asarray(hub.latest("frame_judged"))
+        assert fj.ndim == 4 and fj.shape[1] == 1                   # (repeat, 1, H, W) -- same as the camera frame
         # static / scalar outputs do NOT gain a repeat axis
         assert np.asarray(hub.latest("centers")).ndim == 2         # (N, 2)
         assert np.asarray(hub.latest("thresholds")).ndim == 1      # (N,)
         assert np.ndim(hub.latest("rate")) == 0                    # scalar loading fraction
-        # repeat_mode=average over the (repeat, n_sites) block (core_ndim=1) -> per-site loading probability
-        prob = reduce_repeat(occupied, "average", core_ndim=1)
+        # repeat_mode=average over (repeat, 1, n_sites) (core_ndim=2) collapses ONLY repeat -> (1, n_sites);
+        # the display squeezes the size-1 data_points axis to the per-site loading probability
+        prob = np.squeeze(reduce_repeat(occupied, "average", core_ndim=2))
         assert prob.shape == (n_sites,) and np.all((prob >= 0) & (prob <= 1))
     finally:
         exp.close()

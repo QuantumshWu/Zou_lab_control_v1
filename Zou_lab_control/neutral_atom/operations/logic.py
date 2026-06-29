@@ -69,8 +69,22 @@ class SignalSpec:
     label: str              # axis / legend label, e.g. "loading rate"
     unit: str = ""          # physical unit, e.g. "s" / "K" (blank = dimensionless)
     description: str = ""    # one-line human meaning for the publishes legend
-    points_shape: tuple | None = None   # this signal's swept-parameter axes (None = no contract slot)
+    points_shape: tuple | None = None   # this signal's swept-parameter (data_points) axes (None = no contract slot)
     data_shape: tuple | None = None     # this signal's per-point data axes (None = no contract slot)
+
+    def __post_init__(self):
+        # IRON-LAW guard: a signal that follows the repeat contract is ALWAYS (repeat, data_points, *data_dim)
+        # with the data_points axis PRESENT (a no-scan acquisition = exactly ONE point -> points_shape=(1,)).
+        # The empty tuple () means "repeat-carrying but ZERO points" -- a contradiction that historically
+        # crept in (dropping the middle 1) and broke the uniform shape.  points_shape is therefore EITHER
+        # None (no repeat contract: a static constant / a derived scalar) OR a NON-EMPTY tuple.  data_shape
+        # follows the same rule so a declared contract slot is never half-specified.
+        if self.points_shape == () or self.data_shape == ():
+            raise ValueError(
+                f"SignalSpec({self.name!r}): points_shape/data_shape must be None (no repeat contract) or a "
+                f"NON-EMPTY tuple -- got points_shape={self.points_shape!r}, data_shape={self.data_shape!r}.  "
+                "A no-scan, single-point signal is (repeat, 1, *data) with points_shape=(1,); the empty () "
+                "drops the mandatory data_points axis (#iron-law).")
 
     @property
     def axis_label(self) -> str:
@@ -124,14 +138,13 @@ def describe_shape(value, *, points_shape=None, data_shape=None, grid_shape=None
 
     When the value IS a measurement/processor's contract block (its shape matches the declared
     ``(repeat, *points_shape, *data_shape)``, #H3o) it is shown in CONTRACT form
-    ``repeat × points × (data)`` -- the DATA grouped in parens (a 1-D scan ``5 × 8 × (3)``; a
-    2-D scan ``5 × (4×5) × (1)`` via ``grid_shape`` reshaping the SWEPT POINTS).  ``grid_shape`` is
-    ONLY a 2-D SCAN's points reshape -- it is NEVER applied to the DATA: per-site occupancy
-    ``(10, 35)`` reads ``10 × (35)`` (10 repeats × 35 sites), the flat site count, because the sites
-    are not necessarily a regular grid (the sitemap's 2-D layout is a display concern, not the
-    signal's dimension, #H3v-3).  A signal with NO swept points drops the meaningless ``× 1 ×`` and
-    reads ``repeat × (data)``; a judged camera frame is ``5 × (96×128)``.  Otherwise the raw numpy
-    shape (``(35,)`` / ``(96, 128)``) -- e.g. static ``centers`` (35, 2) carries no repeat axis."""
+    ``repeat × points × (data)`` -- ALWAYS all three groups (the data_points axis is mandatory, never
+    dropped): a 1-D scan ``5 × 8 × (3)``; a 2-D scan ``5 × (4×5) × (1)`` via ``grid_shape`` reshaping the
+    SWEPT POINTS; a no-scan single-point signal is ``5 × 1 × (...)`` -- a camera/judged frame
+    ``5 × 1 × (96×128)``, per-site occupancy ``5 × 1 × (35)``.  ``grid_shape`` is ONLY a 2-D SCAN's
+    points reshape -- it is NEVER applied to the DATA (the 35 sites read ``(35)``, not ``5×7``: that
+    layout is the sitemap's display concern, #H3v-3).  Otherwise the raw numpy shape (``(35,)`` /
+    ``(96, 128)``) -- e.g. static ``centers`` (35, 2) carries no repeat axis."""
     if value is None:
         return "—"
     shape = tuple(int(n) for n in np.shape(value))
@@ -143,13 +156,8 @@ def describe_shape(value, *, points_shape=None, data_shape=None, grid_shape=None
             and tuple(shape[1:]) == ps + dsh:
         gs = grid_for_points(grid_shape, ps)   # ONE rule: a grid shows only when it divides the points
         dstr = "×".join(str(n) for n in dsh) or "1"
-        if not ps:
-            # NO swept points: show the FLAT data count, never a grid -- the grid_shape only
-            # reshapes a 2-D SCAN's points (below), it is NOT a property of the data (#H3v-3: the
-            # 35 sites are not "5×7"; that layout is the sitemap's display concern, not the dim).
-            return f"{shape[0]} × ({dstr})"               # repeat × (flat data)
-        pstr = "×".join(str(n) for n in (gs or ps))
-        return f"{shape[0]} × {pstr} × ({dstr})"          # repeat × points × (data)
+        pstr = "×".join(str(n) for n in (gs or ps)) or "1"   # data_points ALWAYS shown (no-scan = 1)
+        return f"{shape[0]} × {pstr} × ({dstr})"              # repeat × data_points × (data)
     if len(shape) == 1:                  # numpy 1-D repr keeps the trailing comma: (35,)
         return f"({shape[0]},)"
     return "(" + ", ".join(str(n) for n in shape) + ")"
@@ -442,6 +450,15 @@ class Measurement(LogicNode):
         key = self.primary_signal
         if key and key in out and out[key] is not None:
             block = np.asarray(out[key])
+            # IRON-LAW guard: a measurement that publishes a primary block ALWAYS has the data_points
+            # axis -- a no-scan acquisition is exactly ONE point (points_shape=(1,)), never the empty ()
+            # that drops the axis.  Catch the omission LOUD here so a new measurement cannot silently
+            # publish a (repeat, *data) block missing data_points (the drift the iron law forbids).
+            if not tuple(self.points_shape):
+                raise ValueError(
+                    f"{type(self).__name__} publishes primary block {key!r} but points_shape is empty: every "
+                    "measurement block is (repeat, data_points, *data_dim) with the data_points axis PRESENT "
+                    "-- set points_shape=(1,) for a no-scan acquisition, or (n_points,) for a scan (#iron-law).")
             # The block's first axis is the RING DEPTH actually published = ``max(1, repeat)`` (a
             # finite run keeps ``repeat`` slices; ``repeat=0`` = ∞ keeps a 1-deep rolling ring), NOT
             # the raw ``repeat`` -- so 0 = ∞ does not false-trip this contract guard.
@@ -563,16 +580,18 @@ class OccupancyProcessor(Processor):
     centers + per-site thresholds) comes from a prior calibrate-readout Task, exactly
     as on real hardware.
 
-    ``repeat_contract == "preserve"`` (#H3q): the repeat axis flows THROUGH the
-    processor with a LEADING repeat axis and NO vestigial middle 1 (#H3s-F3).  Fed the
-    camera's ``(repeat, 1, H, W)`` block it judges every slice and publishes ``occupied`` /
-    ``counts`` as CLEAN ``(repeat, n_sites)`` blocks (points_shape=(), data_shape=(n_sites,))
-    and ``frame_judged`` as ``(repeat, H, W)``.  Each repeat-collapse is STRUCTURE-driven, not
-    an ndim guess: the signal's declared ``core_ndim = len(points)+len(data)`` tells the plot
-    that axis 0 is the repeat (``ndim == 1 + core_ndim``), so a sites/2d panel with
-    ``repeat_mode=average`` over ``occupied`` averages ``(repeat, n_sites) -> (n_sites,)`` =
-    the per-site LOADING PROBABILITY (averaging N shots recovers every ~50%-loaded site) -- ONE
-    mechanism (the plot's repeat collapse), not a private in-node accumulator.  The user sets
+    ``repeat_contract == "preserve"`` (#H3q): the repeat axis flows THROUGH the processor, and so
+    does the UNIFORM ``(repeat, data_points, *data_dim)`` shape -- occupancy judges ONE readout per
+    shot (no parameter sweep), so data_points = 1, the SAME single-point axis the camera frame carries.
+    Fed the camera's ``(repeat, 1, H, W)`` block it judges every slice and publishes ``occupied`` /
+    ``counts`` as ``(repeat, 1, n_sites)`` (points_shape=(1,), data_shape=(n_sites,)) and
+    ``frame_judged`` as the SAME ``(repeat, 1, H, W)`` it was fed (a frame keeps ONE shape raw or
+    judged).  Each repeat-collapse is STRUCTURE-driven, not an ndim guess: the signal's declared
+    ``core_ndim = len(points)+len(data)`` tells the plot that axis 0 is the repeat
+    (``ndim == 1 + core_ndim``), so a sites/2d panel with ``repeat_mode=average`` over ``occupied``
+    averages ``(repeat, 1, n_sites) -> (1, n_sites) -> (n_sites,)`` = the per-site LOADING PROBABILITY
+    (averaging N shots recovers every ~50%-loaded site) -- ONE mechanism (the plot's repeat collapse),
+    not a private in-node accumulator.  The user sets
     how many shots to average via the camera's ``repeat``.  ``centers`` (N, 2) and
     ``thresholds`` (N,) are STATIC calibration geometry -- they declare NO contract slot (their
     SignalSpec leaves points/data ``None``), so they print their raw shape and carry no repeat
@@ -699,22 +718,25 @@ class OccupancyProcessor(Processor):
         if n_sites is None:
             return {}                                       # no filled slice judged this tick -> no-op
         nan = np.full(int(n_sites), np.nan)
-        # CLEAN (repeat, n_sites) blocks (#H3s-F3) -- a LEADING repeat axis, NO vestigial middle 1;
-        # unfilled slices are NaN so the plot's nanmean ignores them.  The block (repeat, H, W) keeps
-        # the same leading repeat axis.
-        occupied = np.stack([o if o is not None else nan for o in occ_rows], axis=0)
-        counts = np.stack([c if c is not None else nan for c in cnt_rows], axis=0)
-        self.data_shape = (int(n_sites),)                   # declare the per-site DATA width for reshape
+        # Every per-shot BLOCK obeys the UNIFORM contract (repeat, data_points, *data_dim): occupancy
+        # judges ONE readout per shot (no parameter sweep), so data_points = 1 -- the SAME single-point
+        # axis the camera frame carries.  occupied/counts are (repeat, 1, n_sites); frame_judged is the
+        # camera block (repeat, 1, H, W) unchanged.  This middle 1 is NEVER dropped: a frame keeps one
+        # shape raw or judged, and occupancy/sites/scan/camera all read as (repeat, points, data).
+        # unfilled slices are NaN so the plot's nanmean ignores them.
+        occupied = np.stack([o if o is not None else nan for o in occ_rows], axis=0)[:, None, :]
+        counts = np.stack([c if c is not None else nan for c in cnt_rows], axis=0)[:, None, :]
+        self.data_shape = (int(n_sites),)                   # the per-site DATA width (points axis is the (1,))
         self.frame_shape = (int(block.shape[2]), int(block.shape[3]))   # (H, W) of frame_judged
         return {
-            "occupied": occupied,                           # (repeat, n_sites) per-shot occupancy
-            "counts": counts,                               # (repeat, n_sites) per-shot readout signal
-            "rate": float(np.nanmean(occupied)),            # scalar loading fraction of this block (sites x shots)
+            "occupied": occupied,                           # (repeat, 1, n_sites) per-shot occupancy
+            "counts": counts,                               # (repeat, 1, n_sites) per-shot readout signal
+            "rate": float(np.nanmean(occupied)),            # per-cycle loading fraction (derived scalar, no repeat)
             "centers": centers,                             # (N, 2) static site geometry -- no repeat axis
             "thresholds": thresholds,                       # (N,) calibration constant -- no repeat axis
             # the judged BLOCK, published ATOMICALLY with the occupancy -> the site map's underlay +
             # rings are always the SAME shots (the site-map path reduces it to one (H,W) underlay).
-            "frame_judged": block[:, 0],                    # (repeat, H, W) -- drop the middle 1
+            "frame_judged": block,                          # (repeat, 1, H, W) -- the SAME single-point frame
         }
 
     def output_specs(self) -> tuple[SignalSpec, ...]:
@@ -722,28 +744,33 @@ class OccupancyProcessor(Processor):
         OWN repeat-contract structure (#H3s-F3) -- so a consumer reads each signal's points/data slot,
         not one node-level triple that can only be right for one of them:
 
-          * ``occupied`` / ``counts`` -- ``(repeat, n_sites)``: points=(), data=(n_sites,) (core_ndim 1).
-          * ``frame_judged`` -- ``(repeat, H, W)``: points=(), data=(H, W) (core_ndim 2).
-          * ``rate`` -- a scalar per tick: points=(), data=() (core_ndim 0).
+          * ``occupied`` / ``counts`` -- ``(repeat, 1, n_sites)``: points=(1,), data=(n_sites,) (core_ndim 2)
+            -- one judged readout per shot (data_points=1, never dropped), n_sites per point.
+          * ``frame_judged`` -- ``(repeat, 1, H, W)``: points=(1,), data=(H, W) (core_ndim 3) -- the SAME
+            shape the camera frame carries (a frame keeps ONE shape raw or judged).
+          * ``rate`` -- a per-cycle loading fraction, a DERIVED SCALAR (already reduced over the block),
+            NOT a per-shot block: points/data ``None`` (no repeat contract), consumed by a rolling monitor.
           * ``centers`` / ``thresholds`` -- STATIC geometry with NO repeat axis: they leave points/data
             ``None`` (no contract slot), so a consumer prints their raw shape ``(N, 2)`` / ``(N,)``."""
         p = self.prefix
-        sites = tuple(self.data_shape) if self.data_shape else ()      # (n_sites,) once judged, else ()
-        frame = tuple(self.frame_shape) if self.frame_shape else ()    # (H, W) once judged, else ()
+        # (n_sites,) / (H, W) once judged, else None -- BEFORE the first judge the data width is unknown,
+        # so the signal declares NO contract slot yet (None, not the illegal empty ()); once judged it is
+        # the uniform (repeat, 1, *data) block.  points_shape pairs with data_shape: both known or both None.
+        sites = tuple(self.data_shape) if self.data_shape else None
+        frame = tuple(self.frame_shape) if self.frame_shape else None
         return (
             SignalSpec(p + "occupied", "occupancy", "", "per-site per-shot occupancy (0 / 1); average = loading probability",
-                       points_shape=(), data_shape=sites),
+                       points_shape=((1,) if sites else None), data_shape=sites),
             SignalSpec(p + "counts", "readout counts", "", "per-site per-shot integrated readout signal",
-                       points_shape=(), data_shape=sites),
-            SignalSpec(p + "rate", "loading rate", "", "loading fraction of this block (scalar) -> rolling-trace monitor / scan y",
-                       points_shape=(), data_shape=()),
+                       points_shape=((1,) if sites else None), data_shape=sites),
+            SignalSpec(p + "rate", "loading rate", "", "loading fraction of this block (scalar) -> rolling-trace monitor / scan y"),
             SignalSpec(p + "centers", "site centre", "px", "site centres in camera pixels (N, 2)"),
             SignalSpec(p + "thresholds", "threshold", "counts", "per-site bright/dark count threshold"),
             SignalSpec(p + "frame_judged", "camera image", "counts",
                        "the EXACT frame this occupancy was judged from -- shot-locked to occupied/centers "
                        "(one atomic publish).  Use THIS for a 2D readout image that matches the site map "
                        "(same shot); the camera's live `frame` advances independently and is NOT shot-locked.",
-                       points_shape=(), data_shape=frame),
+                       points_shape=((1,) if frame else None), data_shape=frame),
         )
 
 

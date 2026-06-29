@@ -34,9 +34,10 @@ from ..processor_registry import processor
 def judge_occupancy(readout) -> ProcessorSpec:
     """Judge per-site occupancy from each live ``frame`` BLOCK using a loaded calibration.
 
-    Judges EVERY repeat slice (repeat_contract='preserve', #H3q), so it publishes
-    ``occupied`` and ``counts`` as CLEAN ``(repeat, n_sites)`` blocks (a leading repeat axis,
-    no vestigial middle 1, #H3s-F3), ``frame_judged`` as ``(repeat, H, W)``, the scalar
+    Judges EVERY repeat slice (repeat_contract='preserve', #H3q) and PRESERVES the uniform
+    ``(repeat, data_points, *data_dim)`` shape: occupancy judges ONE readout per shot, so data_points=1.
+    It publishes ``occupied`` and ``counts`` as ``(repeat, 1, n_sites)`` blocks, ``frame_judged`` as the
+    SAME ``(repeat, 1, H, W)`` the camera frame carries, the scalar
     ``rate`` (this block's loading fraction, for a rolling monitor / scan y), and ``centers``
     (N, 2) / ``thresholds`` (N,) static calibration geometry.  The default view is the 'sites'
     atom map coloured by occupancy; set its ``repeat_mode=average`` to colour by the per-site

@@ -153,8 +153,9 @@ def test_judge_occupancy_node_reacts_to_frames(tmp_path):
         assert occ_name in hub.names()
         cen = np.asarray(hub.latest(cen_name))
         assert cen.shape == (20, 2)                                     # static (N, 2) centres
-        # occupancy is the CLEAN (repeat, n_sites) block the processor preserves (#H3q), not flat
-        assert np.asarray(hub.latest(occ_name)).shape == (1, cen.shape[0])
+        # occupancy is the UNIFORM (repeat, data_points, n_sites) block the processor preserves (#H3q):
+        # one shot judged, one readout point -> (1, 1, n_sites), the data_points axis kept
+        assert np.asarray(hub.latest(occ_name)).shape == (1, 1, cen.shape[0])
         # reactive: it keeps running (NOT a one-shot finished node)
         assert getattr(node, "finished", False) is False
         cam.stop()

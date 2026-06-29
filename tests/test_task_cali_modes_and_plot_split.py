@@ -84,13 +84,13 @@ def test_calibrate_task_computes_every_method_processor_picks(threshold_method):
         for m in ALL_READOUT_METHODS:
             hub = SignalHub()
             cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer)
-            occ = OccupancyProcessor(hub, calibration=cal, source_expr={"inputs": ["frame"], "source": "value = signal"}, method=m)
+            occ = OccupancyProcessor(hub, calibration=cal, source_expr={"inputs": ["frame_0"], "source": "value = signal"}, method=m)
             cam.step(); occ.step()
             occupied = np.asarray(hub.latest("occupied"))
-            assert occupied.ndim == 2 and occupied.shape[1] == 12      # CLEAN (repeat, n_sites) block (#H3s-F3)
-            # the judged frame block is published, atomically -> rings + underlay are the same shots; the
-            # clean frame_judged (repeat, H, W) is the camera's (repeat, 1, H, W) frame with the middle 1 dropped
-            assert np.array_equal(hub.latest("frame_judged"), np.asarray(hub.latest("frame"))[:, 0])
+            assert occupied.ndim == 3 and occupied.shape[1:] == (1, 12)   # (repeat, 1, n_sites) -- data_points kept
+            # the judged frame block is published atomically -> rings + underlay are the same shots; the
+            # frame_judged (repeat, 1, H, W) is the camera's frame UNCHANGED (a frame keeps one shape raw or judged)
+            assert np.array_equal(hub.latest("frame_judged"), np.asarray(hub.latest("frame_0")))
     finally:
         exp.close()
 
@@ -121,7 +121,7 @@ def test_calibrate_task_pins_live_camera_exposure_to_the_readout_gate():
             hub = SignalHub()
             cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer)
             occ = OccupancyProcessor(hub, calibration=task.calibration,
-                                     source_expr={"inputs": ["frame"], "source": "value = signal"}, method="box")
+                                     source_expr={"inputs": ["frame_0"], "source": "value = signal"}, method="box")
             cam.step(); occ.step()
             pred = np.asarray(hub.latest("occupied"), dtype=bool).reshape(-1)
             truth = np.asarray(exp.devices.trap_array.occupancy, dtype=bool).reshape(-1)

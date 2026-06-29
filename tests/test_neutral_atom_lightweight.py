@@ -6995,7 +6995,7 @@ def test_user_composed_loading_readout_publishes_standard_signals():
         task.run_to_completion()
         cam = CameraMeasurement(hub, camera, sequencer=seqr, prefix=prefix)
         # occupancy preserves the repeat axis (#H3q); loading probability = repeat_mode=average
-        det = OccupancyProcessor(hub, calibration=task.calibration, source_expr={"inputs": [f"{prefix}frame"], "source": "value = signal"},
+        det = OccupancyProcessor(hub, calibration=task.calibration, source_expr={"inputs": [f"{prefix}frame_0"], "source": "value = signal"},
                               grid_shape=trap.grid_shape, prefix=prefix)
         return cam, det
 
@@ -7006,13 +7006,13 @@ def test_user_composed_loading_readout_publishes_standard_signals():
         det.step()      # detect processor runs the REAL per-frame detect on every repeat slice
     n = det.calibration.n_sites
     names = set(hub.names())
-    assert {"frame", "counts", "occupied", "rate", "centers", "thresholds"} <= names
-    assert np.squeeze(hub.latest("frame")).shape == (96, 128)
+    assert {"frame_0", "counts", "occupied", "rate", "centers", "thresholds"} <= names
+    assert np.squeeze(hub.latest("frame_0")).shape == (96, 128)
     assert hub.latest("centers").shape == (n, 2)   # the site-map panel's anchor (static, no repeat)
     assert hub.latest("thresholds").shape == (n,)
     occ = np.asarray(hub.latest("occupied"))
     counts = np.asarray(hub.latest("counts"))
-    assert occ.ndim == 2 and occ.shape[1] == n   # clean (repeat, n_sites) block (#H3s-F3)
+    assert occ.ndim == 3 and occ.shape[1:] == (1, n)   # (repeat, 1, n_sites) -- data_points axis kept
     assert counts.shape == occ.shape
     assert 0.0 <= float(hub.latest("rate")) <= 1.0                     # this block's loading fraction
     # the long-run occupancy mean tracks loading_probability (loose: lifetime losses)

@@ -32,8 +32,9 @@ def test_grid_for_points_is_the_reshape_validity_precondition():
 
 def test_describe_shape_shares_the_same_rule_no_drift():
     # describe_shape must apply the IDENTICAL rule, not a weaker copy that trusts grid_shape blindly.
-    # occupancy (repeat, n_sites) with points=() -> flat site count, NEVER a 5x7 grid string
-    assert describe_shape(np.zeros((10, 35)), points_shape=(), data_shape=(35,), grid_shape=(5, 7)) == "10 × (35)"
+    # occupancy (repeat, 1, n_sites): the single data_points axis is NEVER a 5x7 grid (the grid does not
+    # divide 1 point) -> flat site count, the literal "1" data_points kept (#iron-law, #H3v-3)
+    assert describe_shape(np.zeros((10, 1, 35)), points_shape=(1,), data_shape=(35,), grid_shape=(5, 7)) == "10 × 1 × (35)"
     # a real 2-D scan whose grid divides the points -> the grid IS shown
     assert describe_shape(np.zeros((4, 35, 1)), points_shape=(35,), data_shape=(1,), grid_shape=(5, 7)) == "4 × 5×7 × (1)"
     # a grid that does NOT divide the points must fall back to the flat points -- the weaker pre-fix copy
