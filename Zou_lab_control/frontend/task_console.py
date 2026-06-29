@@ -5210,6 +5210,20 @@ class TaskConsole(QtWidgets.QWidget):
         if sig == getattr(self, "_signal_info_sig", None):
             return
         self._signal_info_sig = sig
+        # GC the hub of ORPHANED signals (#5 unbound): the AUTHORITATIVE invariant -- a hub signal that NO
+        # live producer still publishes is stale and must leave, else it piles up as an "(unbound)" picker
+        # entry run-after-run.  ``providers`` is the single source of "who publishes what" (running nodes +
+        # stopped-but-kept rows via _last_node + declared rows); a hub name absent from it has no owner ->
+        # purge.  A STOPPED node's signals are KEPT (its row is still a provider via _last_node -- a finished
+        # scan stays plottable).  The reserved per-node health channel (``*node_error``, read by the banner,
+        # not a declared output) is never an orphan.  This runs only when the provider map / card sources
+        # CHANGED (the guard above), which a SWITCH does even with no rebuild: a live ``frames_per_cycle``
+        # 3->1 shrinks a running camera's published set {frame_0,1,2}->{frame_0}, dropping frame_1/frame_2
+        # from ``providers`` -> they are caught here (the eager purges in _start/_remove_logic_node cover the
+        # rebuild / remove paths synchronously; THIS catches every remaining path, switches included).
+        orphans = [n for n in self.hub.names() if n not in providers and not n.endswith("node_error")]
+        if orphans:
+            self.hub.remove_signals(orphans)
         for card in self.cards:
             reads = sorted(self._card_reads(card))
             parts: list[str] = []

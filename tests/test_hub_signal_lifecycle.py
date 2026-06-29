@@ -109,6 +109,55 @@ def _add_node(console, match):
     raise AssertionError(f"no kind matched in {[kc.itemData(i) for i in range(kc.count())]}")
 
 
+def test_live_switch_that_drops_outputs_purges_orphans_without_a_rebuild():
+    """The gap the eager purges miss (#5 unbound): a LIVE acquisition edit that SHRINKS a running node's
+    output set -- ``frames_per_cycle`` 3 -> 1 on the camera -- happens with NO rebuild and NO remove, so
+    neither _start_logic_node nor _remove_logic_node runs.  The systematic GC in _refresh_signal_info
+    catches it: frame_1/frame_2 lose their producer (the camera now publishes only frame_0) -> they are
+    purged from the hub so they never linger as '(unbound)' picker entries."""
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.operations.logic import CameraMeasurement
+    from Zou_lab_control.neutral_atom.timing import imaging_sequence
+    exp, console = _console()
+    try:
+        hub = console.hub
+        cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer,
+                                frames_per_cycle=3, repeat=0)
+        console.running_nodes = [cam]
+        exp.devices.sequencer.prepare(
+            imaging_sequence(exposure=exp.devices.camera.exposure, load=True).forever())
+        exp.devices.sequencer.fire()
+        cam.step()                                              # frame_0/1/2 published
+        assert {"frame_0", "frame_1", "frame_2"} <= set(hub.names())
+        console._refresh_signal_info()                          # cache the fpc=3 provider signature
+
+        cam.set_acquisition_parameters(frames_per_cycle=1)      # LIVE switch: now publishes only frame_0
+        assert set(cam.published_signals()) == {"frame_0"}
+        console._refresh_signal_info()                          # provider map shrank -> GC fires
+        assert "frame_0" in hub.names()                         # the kept output stays
+        assert "frame_1" not in hub.names() and "frame_2" not in hub.names()   # orphans purged
+    finally:
+        console.shutdown()
+        exp.close()
+
+
+def test_node_error_health_signal_is_not_purged_as_an_orphan():
+    """The reserved per-node ``*node_error`` health channel (published by the node loop, read by the
+    console banner -- NOT a declared output) must survive the orphan GC even though no provider lists
+    it, else a wedged node's banner signal would be churned away every tick."""
+    import numpy as np
+    exp, console = _console()
+    try:
+        console.hub.publish({"node_error": 2.0})               # a health counter, no producer in providers
+        console.running_nodes = []
+        console._signal_info_sig = None                        # force the GC to run this call
+        console._refresh_signal_info()
+        assert "node_error" in console.hub.names()             # reserved channel kept (not an orphan)
+    finally:
+        console.shutdown()
+        exp.close()
+
+
 def test_stop_then_remove_purges_a_lingering_nodes_signals():
     """The exact bug the human-flow run caught: STOP a node (its signals linger -> kept), then REMOVE it.
     Remove must purge those lingering signals even though the live node ref was already None'd at stop
