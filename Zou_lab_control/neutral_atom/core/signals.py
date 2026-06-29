@@ -220,13 +220,18 @@ class SignalHub:
                     continue
                 value = ring[-1]                      # default: latest (NO_LINEAGE / not-present-at-target)
                 src = self._src.get(name)
-                if target is not None and src is not None:
-                    # src is non-decreasing over the ring (ids only grow); scan from the right and stop
-                    # early once a real id drops below target (it cannot reappear earlier).
-                    for i in range(len(src) - 1, -1, -1):
-                        s = src[i]
+                # Only a LINEAGE signal can resolve to a specific shot.  A free-running NO_LINEAGE signal
+                # (loading rate / node_error / a static aux) belongs to NO shot, so it always stays at its
+                # latest -- skip the scan entirely.  (Its whole ring is NO_LINEAGE, so the early-break below
+                # would never fire and the loop would walk the FULL ring EVERY tick; combined with deque
+                # indexing -- O(n) per element -- that was an O(n^2) per-signal freeze of the GUI thread.)
+                if target is not None and src and src[-1] != NO_LINEAGE:
+                    # ids only grow over the ring; walk from the NEWEST via reversed() iterators (O(1) per
+                    # step on a deque -- NOT src[i] / ring[i] indexing, which is O(n) per access) and stop
+                    # once a real id drops below target (it cannot reappear earlier in the ring).
+                    for v, s in zip(reversed(ring), reversed(src)):
                         if s == target:
-                            value = ring[i]
+                            value = v
                             break
                         if s != NO_LINEAGE and s < target:
                             break

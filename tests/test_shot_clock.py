@@ -92,6 +92,27 @@ def test_snapshot_at_aligns_raw_frames_with_lagging_occupancy():
         exp.close()
 
 
+def test_snapshot_at_is_cheap_with_deep_no_lineage_rings():
+    """Perf guard (#shot-clock froze the GUI): snapshot_at runs EVERY display tick, so it must be cheap
+    even with full (2048-deep) rings.  The freeze was an O(n^2) scan -- a free-running NO_LINEAGE signal
+    never early-broke, walking its whole ring via deque INDEXING (O(n) per element).  With several such
+    signals at 10 Hz that wedged PyQt.  The fix skips NO_LINEAGE signals and walks via reversed iterators
+    (O(1)/step).  A generous bound (the regressed cost is ~1000x over it) keeps this non-flaky."""
+    import time
+    hub = SignalHub()
+    for _ in range(2100):                              # overflow the 2048 history -> full rings
+        sid = hub.next_source_shot()
+        hub.publish({"frame_0": np.zeros((1, 1, 8, 8))}, provenance=sid)
+        hub.publish({"rate": 0.5, "counts": np.zeros(12), "centers": np.zeros((12, 2)),
+                     "thresholds": np.zeros(12)}, provenance=None)   # 4 NO_LINEAGE deep rings
+    target = hub.latest_provenance("frame_0") - 1      # an OLD shot: the held-back-camera worst case
+    t = time.perf_counter()
+    for _ in range(50):
+        hub.snapshot_at(target)
+    per_call_ms = (time.perf_counter() - t) / 50 * 1000
+    assert per_call_ms < 20.0, f"snapshot_at too slow ({per_call_ms:.2f} ms) -- the O(n^2) ring scan regressed"
+
+
 # ----------------------------------------------------------------------------- console helpers
 @pytest.fixture(autouse=True)
 def _offscreen(monkeypatch):
