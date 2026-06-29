@@ -55,7 +55,7 @@ def test_camera_nest_leaf_is_short_name_not_axis_label():
             console.refresh_once(); time.sleep(0.01)
 
         short = console._signal_short_names()
-        assert short.get("frame") == "frame" and short.get("frame_0") == "frame_0"
+        assert short.get("frame_0") == "frame_0"     # camera publishes per-event frame_i (no lumped "frame")
         groups = signal_tree_groups(sorted(short), console._signal_providers(),
                                     console._signal_formats(), short)
         leaves = [lbl for _prod, lvs in groups for (lbl, _bare, _full) in lvs]

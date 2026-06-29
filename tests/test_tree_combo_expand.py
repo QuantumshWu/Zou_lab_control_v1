@@ -66,3 +66,22 @@ def test_popup_height_grows_to_fit_then_clamps_and_scrolls(monkeypatch):
     tree.setExpanded(c._model.index(2, 0), True)
     assert c._desired_popup_height() <= avail
     c.hidePopup()
+
+
+def test_pick_updates_the_collapsed_display_immediately():
+    """#1: clicking a leaf must update the box's COLLAPSED display text RIGHT AWAY (the producer-
+    qualified label), not only after the Setting popup is closed and reopened.  Guards the widget
+    contract behind the repaint() fix -- _on_tree_clicked sets _display, and _display_text() (what the
+    collapsed box paints) returns it immediately."""
+    from PyQt5 import QtCore, QtWidgets
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    c = _combo()                                       # groups: producers with leaves (see _combo helper)
+    before = c._display_text()
+    # click the FIRST leaf of the SECOND producer group (index depends on the helper's groups)
+    parent = c._model.item(c._model.rowCount() - 1)    # last producer group
+    leaf = parent.child(0)
+    c._on_tree_clicked(leaf.index())
+    picked_full = str(leaf.data(QtCore.Qt.UserRole + 1))
+    assert c._display_text() == picked_full            # collapsed box shows the pick NOW
+    assert c._display_text() != before
+    assert c.current_signal() == str(leaf.data(QtCore.Qt.UserRole))   # and the bound value matches

@@ -1414,17 +1414,27 @@ class FluentTreeComboBox(FluentComboBox):
         return int(desired)
 
     def _anchor_available_height(self) -> int:
-        """Pixels available for the popup at the combo anchor = the larger of the gap-inset space below
-        the box and above it, clamped to the screen.  Shared boundary rule (mirrors the Setting popup)."""
+        """Pixels available for the popup at the combo anchor, on the side it ACTUALLY opens.
+
+        The grow-vs-scroll rule: the popup grows to fit its visible rows up to THIS height, then scrolls.
+        It must measure the side Qt actually placed the popup on -- not ``max(below, above)``, which would
+        clamp a downward-opening popup to the (larger) UPWARD space and overrun the screen bottom (#3).
+        When the popup is already shown we read its container's top to tell the side; before it shows we
+        assume DOWN (Qt's default when the collapsed box fits below)."""
         screen = self.screen() if hasattr(self, "screen") else QtWidgets.QApplication.primaryScreen()
         if screen is None:
             return 0
         avail = screen.availableGeometry()
-        top_g = self.mapToGlobal(QtCore.QPoint(0, 0)).y()
-        bottom_g = top_g + self.height()
-        space_below = avail.bottom() - (bottom_g + self._gap)
-        space_above = (top_g - self._gap) - avail.top()
-        return int(max(space_below, space_above))
+        combo_top = self.mapToGlobal(QtCore.QPoint(0, 0)).y()
+        view = self.view()
+        container = view.window() if isinstance(view, QtWidgets.QTreeView) else None
+        if container is not None and container is not self and container.isVisible():
+            ctop = container.mapToGlobal(QtCore.QPoint(0, 0)).y()
+            if ctop < combo_top:                                  # opened ABOVE the box
+                return int(max(0, (combo_top - self._gap) - avail.top()))
+            return int(max(0, avail.bottom() - (ctop + self._gap)))   # opened BELOW -> from its own top down
+        bottom_g = combo_top + self.height()                      # not shown yet -> assume it opens below
+        return int(max(0, avail.bottom() - (bottom_g + self._gap)))
 
     def _resize_popup_to_contents(self, *_) -> None:
         """Re-grow/shrink the OPEN popup so a freshly-expanded parent's children are fully visible
@@ -1455,7 +1465,11 @@ class FluentTreeComboBox(FluentComboBox):
         self.setRootModelIndex(QtCore.QModelIndex())
         self._display = str(item.data(QtCore.Qt.UserRole + 1) or item.text().strip())
         self.hidePopup()
-        self.update()
+        # repaint() NOT update(): the box lives inside the Setting Qt.Popup, and closing the tree's own
+        # child popup (hidePopup) leaves the SCHEDULED async repaint of update() unprocessed -- so the box
+        # showed the STALE pick until the whole Setting was closed + reopened (#1).  repaint() forces the
+        # new ``_display`` to paint NOW.
+        self.repaint()
         # Emit BOTH the explicit signalPicked AND the standard ``activated`` so any existing
         # ``combo.activated.connect(...)`` wiring fires (setCurrentIndex alone does not emit it).
         self.activated.emit(self.currentIndex())
