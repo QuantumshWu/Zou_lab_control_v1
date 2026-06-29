@@ -7,6 +7,7 @@ if /I not "%~1"=="--inner" (
   if /I "%~1"=="--diagnose" set "ZLC_ACTION=hardware diagnose"
   if /I "%~1"=="--build-only" set "ZLC_ACTION=build"
   if /I "%~1"=="--program-only" set "ZLC_ACTION=program"
+  if /I "%~1"=="--flash" set "ZLC_ACTION=program SPI flash (persists across power cycle)"
   call "%~f0" --inner %*
   set "ZLC_STATUS=!ERRORLEVEL!"
   if "!ZLC_STATUS!"=="0" (
@@ -41,6 +42,7 @@ if /I "%~1"=="--check" set "MODE=check"
 if /I "%~1"=="--diagnose" set "MODE=diagnose"
 if /I "%~1"=="--build-only" set "MODE=build"
 if /I "%~1"=="--program-only" set "MODE=program"
+if /I "%~1"=="--flash" set "MODE=flash"
 rem --force-build / --rebuild: rebuild even if the sources are unchanged (default mode otherwise
 rem skips the build and programs the existing bitstream when nothing changed).
 if /I "%~1"=="--force-build" set "ZLC_FORCE_BUILD=1"
@@ -62,6 +64,15 @@ call :zlc_print_capacity_estimate
 
 if /I "%MODE%"=="diagnose" (
   call :zlc_run_tcl "diagnose_hw_target.tcl"
+  exit /b !ERRORLEVEL!
+)
+
+rem --flash: write the EXISTING bitstream into the board's SPI configuration flash so the FPGA
+rem auto-boots from flash and the program SURVIVES a power cycle (program_fpga.tcl only loads the
+rem volatile config SRAM).  Needs a built .bit + the MODE jumper set to SPI/QSPI boot.
+if /I "%MODE%"=="flash" (
+  echo ZLC FPGA pulse streamer: program SPI flash ^(persists across power cycle^)
+  call :zlc_run_tcl "program_flash.tcl"
   exit /b !ERRORLEVEL!
 )
 
@@ -100,9 +111,16 @@ echo Usage:
 echo   fpga\build_and_program.bat              Build (only if sources changed) and program
 echo   fpga\build_and_program.bat --force-build Rebuild even if the sources are unchanged
 echo   fpga\build_and_program.bat --build-only Build only
-echo   fpga\build_and_program.bat --program-only Program existing bitstream
+echo   fpga\build_and_program.bat --program-only Program existing bitstream (VOLATILE: lost on power-off)
+echo   fpga\build_and_program.bat --flash      Program the SPI flash so the program SURVIVES a power cycle
 echo   fpga\build_and_program.bat --check      Build only (alias of --build-only)
 echo   fpga\build_and_program.bat --diagnose   List Vivado hw targets/devices
+echo.
+echo --program-only loads the VOLATILE FPGA config (lost when the board powers off).  --flash writes
+echo the bitstream into the board's SPI configuration flash so the FPGA AUTO-BOOTS from it on every
+echo power-up -- run it ONCE and the program persists across reboots (no rebuild needed).  Requires the
+echo board MODE jumper on SPI/QSPI boot; set ZLC_PS_CFGMEM_PART if your flash differs from the default
+echo (run 'get_cfgmem_parts' in Vivado to list valid names).
 echo.
 echo The default mode SKIPS the (slow) synth+impl when a bitstream already exists and none of
 echo the sources that go into it (engine/top HDL, create/program tcl, board XDC, streamer_config,
