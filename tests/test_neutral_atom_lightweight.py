@@ -1293,31 +1293,51 @@ def test_dac_ramp_spans_current_period_with_hold_carry_and_edge_step():
     assert wave[160] == 512 and wave[199] == 512
 
 
-def test_looping_ramp_to_a_held_value_carries_from_the_register_and_converges_flat():
-    """#ramp-carry: a ramp ALWAYS ramps from the engine's CURRENT value register, carried across the
-    frame/loop wrap (NOT a baked start).  For a looping [ramp V, hold V] this means the FIRST loop
-    ramps up from idle 0 V (a ramp IS a ramp -- the user's point), then the wrap carries V in, so every
-    later loop ramps V->V == FLAT V.  The bus thus CONVERGES to the held value rather than re-running a
-    0->V sawtooth each loop OR being statically flattened (which would break scan+ramp).  A single-shot
-    fire ramps from idle exactly like the first loop."""
+def test_every_ramp_ramps_from_the_previous_end_and_forevers_first_period_ramps_from_idle():
+    """#ramp-carry -- the user's THREE requirements, all asserted here:
+      1. every ramp ramps from the PREVIOUS command's ending value (the live register), NOT a baked
+         start: a [edge -200, ramp 300] climbs from -200 (the edge's end), not from 0;
+      2. the FIRST period of a forever loop RAMPS (idle 0 V -> V), it does NOT hold;
+      3. the rejected 5a "bake the steady value" design is GONE: the compiled ramp segment's start is 0
+         (the engine reads its register), not the flattened steady code.
+    The looping [ramp V, hold V] is FLAT only in STEADY STATE (loop 2+), as the math consequence of
+    ramping V->V once the wrap has carried V in -- the display choice the user confirmed (option 1).
+    scan+ramp (the other thing the user worried about) staircases from the prior point -- proven by
+    test_dac_ramp_endpoint_scan_compiles_and_tracks_every_point."""
     from fpga.pulse_streamer.host.engine_model import bus_play
     ch = [f"da[{i}]" for i in range(10)] + ["t"]
-    state = na.PulseTableState(
-        channels=ch, visible_channels=ch,
-        periods=[na.PulsePeriod(1000, tuple([0] * 11), unit="ns") for _ in range(2)],
-        channel_labels={f"da[{i}]": f"da[{i}]" for i in range(10)},
-        time_step_ns=20.0, name="ramp_loop")
+    lab = {f"da[{i}]": f"da[{i}]" for i in range(10)}
+
+    # (1) + (3): [ramp 200, hold 200] -- the compiled ramp does NOT bake the steady 712; start_value is 0.
+    state = na.PulseTableState(channels=ch, visible_channels=ch, channel_labels=lab, time_step_ns=20.0,
+                               name="ramp_loop", periods=[na.PulsePeriod(1000, tuple([0] * 11), unit="ns") for _ in range(2)])
     state.set_analog_bus_mode(0, "da", "ramp", value=200)   # ramp to +200 (code 712)
     state.set_analog_bus_mode(1, "da", "hold")              # then hold it, looping
     prog = state.compile(clock_hz=50_000_000)               # repeat_forever=True (default)
-    first = bus_play(prog, 0, 100)                          # FIRST loop: ramps up from idle 0 V
+    assert [(s.mode, s.start_value) for s in prog.bus_segments] == [("ramp", 0)]   # (3) start NOT baked -> 0
+
+    # (2): forever's FIRST period genuinely RAMPS up from idle 0 V (it is NOT a hold)
+    first = bus_play(prog, 0, 100)
     assert first[0] == 512                                  # enters at idle 0 V (code 512)
-    assert any(512 < w < 712 for w in first) and first[-1] == 712   # genuinely RAMPS up to +200
-    steady = bus_play(prog, 0, 100, seed_value=first[-1])   # next loop carries +200 IN across the wrap
-    assert all(w == 712 for w in steady)                    # ramp 200->200 == FLAT at +200 (converged)
-    # the single-shot fire ramps from idle just like the first loop
+    assert any(512 < w < 712 for w in first) and first[-1] == 712   # RAMPS up to +200 -- a ramp, not a hold
+    # FLAT only after the wrap carries +200 in (steady state, loop 2+) -- the option-1 display the user chose
+    assert all(w == 712 for w in bus_play(prog, 0, 100, seed_value=first[-1]))
+    # a genuine single-shot fire ramps from idle just like the first loop
     single = bus_play(state.compile(clock_hz=50_000_000, repeat_forever=False), 0, 100)
     assert single[0] == 512 and single[-1] == 712
+
+    # (1): a ramp ramps from the PREVIOUS command's end -- [edge -200, ramp 300, hold] climbs from -200,
+    # not 0.  The ramp reaches its target at the period BOUNDARY, so a trailing hold period parks at it.
+    s2 = na.PulseTableState(channels=ch, visible_channels=ch, channel_labels=lab, time_step_ns=20.0,
+                            name="edge_then_ramp", periods=[na.PulsePeriod(1000, tuple([0] * 11), unit="ns") for _ in range(3)])
+    s2.set_analog_bus_mode(0, "da", "edge", value=-200)     # edge to -200 (code 312)
+    s2.set_analog_bus_mode(1, "da", "ramp", value=300)      # then ramp to +300 (code 812)
+    s2.set_analog_bus_mode(2, "da", "hold")                 # then hold, so the ramp's endpoint is observable
+    w = bus_play(s2.compile(clock_hz=50_000_000, repeat_forever=False), 0, 150)
+    assert w[0] == 312                                      # period 0 edge -> -200 (code 312)
+    assert w[25] == 312                                     # still at the edge end (NOT ramping from 0)
+    assert 312 < w[75] < 812                                # period 1 ramp climbs FROM 312 (the edge's end) toward 812
+    assert w[-1] == 812                                     # ... reaching +300 and holding it
 
 
 def test_preview_is_loop_aware_so_a_looping_ramp_to_a_held_value_shows_flat():
