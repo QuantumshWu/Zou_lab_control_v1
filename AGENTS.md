@@ -54,7 +54,7 @@
 - **单一真相源**:同一事实只有一个权威定义处。例:板级/容量配置只在 `fpga/board_config/streamer_config.json`;前端排版只有一套 300dpi 体系;memory 对原则只放指针,权威定义在仓库 AGENTS。
 - **能机械强制的设计准则,必须写成测试,不能只留在文档里**(架构契约测试 / fitness function)。只写在 `.md` 里的准则会被(包括我自己,尤其长会话里局部模式匹配时)悄悄违背且无人报错——这正是整理这些 `.md` 却仍被违背的根因。所以:每立一条"所有 X 都必须 Y"的结构性准则(例:**所有 plot 都必须继承 `BaseLivePlot`** 才能复用 selectors/data_figure),就同时写一个会在违背时**失败**的测试(例:`tests/test_frontend_plot_contract.py`),并在准则旁注明强制它的测试。文档讲"为什么",测试保证"不退化"。
 - **借鉴参考实现:取原则,不照搬具体设计**。`references/` 里的实现(confocal GUI、rb87 readout 等)是灵感来源,要遵守的是上面这些**设计原则**,不是它们的具体形态/代码结构;有更干净的思路就用自己的,别为"照着参考写"而牺牲解耦或引入残留。
-- **前端密封 API**:几何/dpi/字号/配色/阴影/缩放**由 frontend 拥有**,外部只传数据。完整六规则见 `frontend/AGENTS.md`——加任何前端公共参数前先读它,并把参数分类为 DATA(允许)还是 ART/几何(禁止)。
+- **前端密封 API**:几何/dpi/字号/配色/阴影/缩放**由 frontend 拥有**,外部只传数据。完整规则见 `frontend/AGENTS.md`(单一权威)——加任何前端公共参数前先读它,并把参数分类为 DATA(允许)还是 ART/几何(禁止)。
 - **改寄存器映射必带版本握手**:改 host↔RTL 的寄存器布局必须 bump 两边的 LAYOUT_ID 并在 prepare 时校验,不匹配明确报"重建+重启"(否则新主机配旧 bitstream 会踩进死字)。
 
 ---
@@ -126,7 +126,7 @@
 | `docs/task_console_design/*.pdf` | 你/维护者 | Task 控制台**设计审查**专档(单一主题深档) |
 | `docs/MAINTAINER_NOTES.md` | 维护者 | FPGA/host **子系统深档**(§编号:为什么这么写、握手、容量、性能…) |
 | `AGENTS.md`(本页) | agent/维护者 | **工作守则**:流程/设计/测试/文档原则 + 常犯错误目录 + 文档地图 |
-| `frontend/AGENTS.md` | agent/维护者 | 前端**密封 API 契约**六规则 + 事故史 |
+| `frontend/AGENTS.md` | agent/维护者 | 前端**密封 API 契约**规则(单一权威)+ 事故史 |
 | `tests/README.md` | agent/维护者 | **测试怎么跑**(targeted matrix / Vivado / 截图) |
 | `docs/ROADMAP.md` | 你/维护者 | **当前焦点、需求、待决方向、暂缓项** |
 | `memory/`(在 `.claude/`,不入库) | 我(跨会话) | 一行索引 + 根因记录;对原则只放指针指向上面这些权威源 |

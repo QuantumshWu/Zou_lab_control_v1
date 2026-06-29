@@ -189,7 +189,7 @@ det.detection.counts            # (35,) 该张图每格点的计数
 det.plot                        # 原始图 + 被占据格点亮圈
 \end{codeblock}
 
-\textbf{原理}（\pyapi{detect_atoms}）：取单张图每格点的 ROI 计数，逐元素 \pyapi{counts > thresholds} 得布尔占据数组。这是\tfocus{基于阈值的二元分类}，每张图独立判断，没有多帧贝叶斯/卡尔曼。
+\textbf{原理}（\pyapi{TrapCalibration.detect}）：取单张图每格点的读出信号（box 为 ROI 计数），逐元素 \pyapi{counts > thresholds} 得布尔占据数组。这是\tfocus{基于阈值的二元分类}，每张图独立判断，没有多帧贝叶斯/卡尔曼。
 
 \section{检测时间扫描（保真度 vs 曝光）}
 \begin{codeblock}[Python]
@@ -1163,9 +1163,9 @@ print(res.detection.occupied_indices)  # 占据位点的下标列表
 \item[\pyapi{res.plot}] 当 \pyapi{display=True} 时，在图上给\tfocus{占据}的阱套亮环——一眼看出这一发装了几个、装在哪。
 \end{description}
 
-\subsection{原理：detect\_atoms 是纯阈值二分类}
+\subsection{原理：TrapCalibration.detect 是纯阈值二分类}
 
-底层是 \pyapi{detect_atoms(image, centers, thresholds, radius, reducer)}：
+底层是 \pyapi{TrapCalibration.detect(image)}（box 法用标定里存的 centers / thresholds / radius / reducer）：
 
 \begin{enumerate}
 \item 用 \pyapi{roi_counts} 在每个中心算出 \pyapi{counts}（形状 \pyapi{(N,)}），用法和标定时完全一样。
@@ -1272,7 +1272,7 @@ print("占据数：", int(det.detection.occupied.sum()))
 
 \item[保真度偏低（明显小于 0.99）] 暗亮高斯重叠大。看 \pyapi{FidelityEstimate} 里的 \pyapi{separation}：偏小说明两峰太近，需要更长成像时间或更低背景。也注意 \pyapi{left_fraction/right_fraction} 是否严重失衡（某一类样本太少），这会触发置信度修正把保真度往 0.5 拉，提示"数据本身不足以下结论"。
 
-\item[detect 结果系统性偏多/偏少占据] 几乎一定是\tfocus{阈值整体偏了}或\tfocus{reducer/radius 不一致}。本系统通过把 reducer/radius 存进 \pyapi{TrapCalibration} 并在 \pyapi{TrapCalibration.detect} 里自动复用，杜绝了不一致这条路；若你自己直接调底层 \pyapi{detect_atoms}，务必手动传与训练时相同的 \pyapi{radius}/\pyapi{reducer}。阈值偏了则回到 \pyapi{thresholds} 重标（成像条件变了就必须重标）。
+\item[detect 结果系统性偏多/偏少占据] 几乎一定是\tfocus{阈值整体偏了}或\tfocus{reducer/radius 不一致}。本系统通过把 reducer/radius 存进 \pyapi{TrapCalibration} 并在 \pyapi{TrapCalibration.detect} 里自动复用，从设计上杜绝了不一致这条路。阈值偏了则回到 \pyapi{thresholds} 重标（成像条件变了就必须重标）。
 
 \item[detect 报"center 越界"或"ROI 无有限像素"] \pyapi{roi_counts} 会校验中心在图像范围内、ROI 里有有限像素。报错通常意味着加载的旧标定与当前相机视场不匹配（视场/裁剪变了），或图像里有 NaN/Inf。对策：确认相机 ROI/分辨率与标定时一致；必要时 \pyapi{clear()} 后重新 site-map。
 

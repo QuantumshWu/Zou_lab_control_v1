@@ -70,7 +70,7 @@ PADDING_V = 1
 PADDING_H = 1
 EDIT_PADDING_H = 4
 # Left column of the window body content (the standard 14 px content margin).
-# FluentWindow pins the title bar's title to THIS column (see _align_title_bar),
+# FluentWindow pins the title bar's title to THIS column (see _position_window_title),
 # so the title text shares one left edge with the body cards/tabs.
 TITLE_LEFT_INSET = 14
 COMBO_WIDTH = 16
@@ -817,7 +817,7 @@ class FluentLineEdit(QtWidgets.QLineEdit):
         top: float | None = None,
         decimals: int = 12,
     ) -> None:
-        """Restrict typed input to a number (like the Confocal GUI's FloatLineEdit).
+        """Restrict typed input to a number (a numeric validator on the line edit).
 
         ``kind="float"`` accepts only digits, a decimal point, ``e``/``E`` and a sign
         (scientific notation); ``kind="int"`` accepts only an integer.  Optional
@@ -1046,10 +1046,6 @@ class FluentSettingRow(QtWidgets.QWidget):
         self._label = lbl                       # introspected by the layout-uniformity contract test
         h.addWidget(lbl)
         h.addWidget(control, 1)
-
-
-class FloatLineEdit(FluentLineEdit):
-    pass
 
 
 class _RoundedPopupCard(QtCore.QObject):
@@ -2087,14 +2083,6 @@ class FluentDoubleSpinBox(QtWidgets.QDoubleSpinBox):
     """Confocal_GUIv2-style double spinbox with an inline step editor."""
 
     def __init__(self, length=5, allow_minus: bool = False, parent=None):
-        if isinstance(length, QtWidgets.QWidget) and parent is None:
-            parent = length
-            length = 5
-        base_class = type(self).mro()[1]
-        if "Confocal_GUIv2" in getattr(base_class, "__module__", ""):
-            super().__init__(length=length, allow_minus=allow_minus, parent=parent)
-            self.setMinimumHeight(scaled_px(30, minimum=22))
-            return
         super().__init__(parent)
         self.setButtonSymbols(QtWidgets.QAbstractSpinBox.PlusMinus)
         self.setMinimumHeight(scaled_px(30, minimum=22))
@@ -2809,7 +2797,6 @@ __all__ = [
     "FluentSpinBox",
     "FluentSwitch",
     "FluentTabWidget",
-    "FloatLineEdit",
     "FluentScrollArea",
     "FluentStatusDot",
     "FluentWindow",

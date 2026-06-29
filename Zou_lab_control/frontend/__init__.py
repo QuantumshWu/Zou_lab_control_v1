@@ -5,34 +5,15 @@ hardware-decoupled API for notebook plotting, live updates, selectors, fitting,
 unit conversion, and neutral-atom histogram/readout views.
 
 ============================================================================
-SEALED-API DESIGN CONTRACT (authoritative; mirrored in frontend/AGENTS.md and
-docs/MAINTAINER_NOTES.md).  The frontend exposes a SMALL public surface so an
+SEALED-API DESIGN CONTRACT.  The frontend exposes a SMALL public surface so an
 external caller (notebook / lab) gets correct art, geometry, dpi and typography
-WITHOUT being able to break the visual design.  Six rules:
+WITHOUT being able to break the visual design: geometry/dpi/typography/scale and
+the art-bearing fluent widgets are OWNED here, never passed in or re-exported;
+every public parameter is classified DATA (allowed) vs ART/geometry (internal).
 
-1. Geometry is OWNED, never passed in.  No public callable accepts ``data_px``,
-   ``margins_px``, ``spec`` or ``dpi``.  Sizes come only from ``FigureSpec``
-   defaults, ``panel_plot_spec``, ``pulse_plot_spec`` and ``create_axes_fixed``.
-   ``plot()``/``panel_plot()`` REJECT those keys (``_SEALED_PLOT_KWARGS``); the
-   internal geometry channel is the private ``plot(_spec=...)`` argument.
-2. Sizes/colormaps are curated, validated on entry.  Panel size is one of
-   ``PANEL_SIZES`` (``panel_size_cells`` raises otherwise); an invalid cmap
-   raises rather than silently falling back.
-3. ONE typography system, one dpi.  ``style.DEFAULT_STYLE`` (300 dpi, fixed font
-   sizes) is the only typography source and is exported READ-ONLY
-   (MappingProxyType); there is no public font-size/colour/dpi override.
-4. ONE display-scale rule.  On-screen scale comes only from
-   ``qt_fluent.resolve_fluent_auto_scale`` (GUI controls) and
-   ``qt_canvas.panel_canvas`` / ``PANEL_DISPLAY_SCALE`` (embedded figures).
-   Public ``show_*`` entry points default to ``scale=None`` (auto).
-5. Art-bearing fluent widgets stay INTERNAL.  ``qt_fluent.*`` / ``qt_canvas.*``
-   (incl. ``FluentGroupBox(shadow=)``, ``add_fluent_shadow``,
-   ``EmbeddedFigureCanvas``) are NOT re-exported here.  Shadows / borders /
-   corner radii are construction details, never public knobs.
-6. Adding a public parameter requires classifying it.  DATA (labels, title,
-   bins, thresholds, relim_mode, cmap-from-a-list, channels) is allowed on the
-   public surface; ART / GEOMETRY / TYPOGRAPHY (margins, dpi, colours, sizes,
-   shadow, fonts) lives on INTERNAL classes only.
+The authoritative, numbered statement of those rules -- plus the failure history
+that motivates each -- lives in ``frontend/AGENTS.md`` (single source; do not
+re-list the rule text here, it drifts).  This module is their implementation.
 ============================================================================
 """
 
@@ -144,8 +125,11 @@ def _register_neutral_atom_viewer() -> None:
 
         register_plotter(SimpleNamespace(plot=plot, display_figure=display_figure, run=run,
                                          save_calibration_report=save_calibration_report))
-    except Exception:  # pragma: no cover - plotting registration must never block import
+    except (ImportError, ModuleNotFoundError):  # pragma: no cover - optional deps absent: never block import
         pass
+    except Exception as exc:  # a REAL registration break must SURFACE (warn), not silently vanish
+        import warnings
+        warnings.warn(f"neutral-atom viewer registration failed: {exc!r}", RuntimeWarning, stacklevel=2)
 
 
 _register_neutral_atom_viewer()

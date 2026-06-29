@@ -664,20 +664,14 @@ path. See §18.
 ## §18. frontend public-API seal (the visual-design contract)
 
 The frontend exposes a **small, sealed** surface: callers pass DATA, the frontend
-owns ART/GEOMETRY/dpi/typography. The authoritative statement is the
-`frontend/__init__.py` module docstring; the rationale + failure history is in
-`Zou_lab_control/frontend/AGENTS.md`. Six rules, enforced in code:
-1. `plot()`/`panel_plot()` reject `data_px`/`margins_px`/`spec`/`dpi`/`bad_color`/
-   `colors` (`live._SEALED_PLOT_KWARGS`); internal geometry rides the private
-   `plot(_spec=...)` channel.
-2. Panel size validated against `PANEL_SIZES`; pulse geometry constants are
-   `_`-private (`live._PULSE_*`, `_PULSE_MARGINS_PX`, `_PULSE_DPI`).
-3. `style.DEFAULT_STYLE` is a read-only `MappingProxyType` over `_DEFAULT_STYLE`.
-4. One scale rule: `qt_fluent.resolve_fluent_auto_scale` + `qt_canvas.panel_canvas`.
-5. `qt_fluent.*` / `qt_canvas.*` (shadows, canvases) are NOT re-exported.
-6. New public params must be DATA, not ART. Contract tests live in
-   `tests/test_frontend_smoke.py` (sealed-kwargs rejection, DEFAULT_STYLE
-   read-only, scale parity).
+owns ART/GEOMETRY/dpi/typography. The **single authoritative, numbered statement
+of the rules — plus the failure history that motivates each — is
+`Zou_lab_control/frontend/AGENTS.md`** (do not re-list the rule text here; it
+drifts). `frontend/__init__.py`'s module docstring is the in-code pointer to it.
+Mechanically enforced by `tests/test_frontend_plot_contract.py` (every plot is a
+`BaseLivePlot`), `tests/test_frontend_layout_uniformity.py` (one form system) and
+`tests/test_frontend_smoke.py` (sealed-kwargs rejection, `DEFAULT_STYLE`
+read-only, scale parity).
 
 ## 11. Verification
 
@@ -717,8 +711,8 @@ Targeted improvement backlog (priority order; none blocking):
    the camera; swapping cameras can leave a stale calibration. Low-risk guard:
    record `grid_shape`/`reducer`/`ordering` in `metadata` and validate against
    the trap array on `detect`. (`detect` already uses the stored reducer/radius,
-   so the train/infer reducer mismatch is not actually reachable via
-   `TrapCalibration.detect` — only via calling `detect_atoms` directly.)
+   so the train/infer reducer mismatch is not reachable: `TrapCalibration.detect`
+   is the single readout path.)
 3. **Calibration schema version.** Add a `schema_version` to the
    `TrapCalibration` payload so old `.npz`/`.json` can be migrated safely.
 4. **Exposure source of truth.** The sequence's probe width is the truth; assert

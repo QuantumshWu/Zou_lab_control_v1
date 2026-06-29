@@ -70,20 +70,6 @@ def roi_counts(image, centers, *, radius: int = 1, reducer: str = "mean") -> np.
     return np.asarray(out, dtype=float)
 
 
-def detect_atoms(image, centers, thresholds, *, radius: int = 1, reducer: str = "mean") -> AtomDetection:
-    """Classify atoms by comparing ROI counts to scalar or per-site thresholds."""
-
-    counts = roi_counts(image, centers, radius=radius, reducer=reducer)
-    thresholds = threshold_array(thresholds, len(counts))
-    occupied = counts > thresholds
-    return AtomDetection(
-        counts=counts,
-        occupied=occupied,
-        occupied_indices=np.flatnonzero(occupied).astype(int).tolist(),
-        thresholds=thresholds,
-    )
-
-
 def _gauss2d_axis(coords, offset, amp, x0, y0, sx, sy):
     x, y = coords
     return (offset + amp * np.exp(-0.5 * (((x - x0) / sx) ** 2 + ((y - y0) / sy) ** 2))).ravel()
@@ -272,20 +258,6 @@ def sort_centers_grid(centers, grid_shape: Sequence[int], *, ordering: str = "ro
     return np.vstack(cols)
 
 
-def estimate_thresholds(images, centers, *, radius: int = 1, reducer: str = "mean", bins: int = 96) -> np.ndarray:
-    """Estimate one threshold per site from a stack of calibration images."""
-
-    centers = centers_array(centers)
-    bins = positive_int(bins, "bins")
-    stack = [image_array(image) for image in images]
-    if not stack:
-        raise ValueError("images must contain at least one frame.")
-    if any(frame.shape != stack[0].shape for frame in stack):
-        raise ValueError("all calibration images must have the same shape.")
-    counts = np.vstack([roi_counts(frame, centers, radius=radius, reducer=reducer) for frame in stack])
-    return np.asarray([otsu_threshold(counts[:, i], bins=bins) for i in range(counts.shape[1])], dtype=float)
-
-
 def otsu_threshold(values, *, bins: int = 96) -> float:
     """One-dimensional Otsu threshold with finite-value filtering."""
 
@@ -449,9 +421,7 @@ __all__ = [
     "SUPPORTED_ORDERINGS",
     "SUPPORTED_REDUCERS",
     "centers_array",
-    "detect_atoms",
     "estimate_threshold_fidelity",
-    "estimate_thresholds",
     "find_site_centers",
     "grid_shape_tuple",
     "image_array",

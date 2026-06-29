@@ -165,7 +165,7 @@ def _run_pulse_scan(exp, *, y=None, **build_kwargs):
     # (publishes bare 'occupied'/'rate'/... since prefix="").  Not started on its own thread;
     # pulse-scan settles it INLINE per point (single-threaded determinism, same evaluate path).
     occ = OccupancyProcessor(hub, calibration=exp.readout.require(thresholds=True),
-                             source_expr={"inputs": ["frame"], "source": "value = signal"}, grid_shape=(3, 4))
+                             source_expr={"inputs": ["frame_0"], "source": "value = signal"}, grid_shape=(3, 4))
     plan.settle = occ.step
     node = PulseScanNode(hub, plan, x_key=spec.x_key, y_key=spec.y_key, prefix=f"{spec.key}_")
     node.run_to_completion()
@@ -363,7 +363,7 @@ def _scan_node(exp, *, repeat=1, tag="a"):
         y={"inputs": ["rate"], "source": "value = signal"})
     hub = SignalHub()
     occ = OccupancyProcessor(hub, calibration=exp.readout.require(thresholds=True),
-                             source_expr={"inputs": ["frame"], "source": "value = signal"}, grid_shape=(3, 4))
+                             source_expr={"inputs": ["frame_0"], "source": "value = signal"}, grid_shape=(3, 4))
     plan.settle = occ.step
     node = PulseScanNode(hub, plan, x_key=spec.x_key, y_key=spec.y_key, prefix=f"{spec.key}_",
                          repeat=repeat)

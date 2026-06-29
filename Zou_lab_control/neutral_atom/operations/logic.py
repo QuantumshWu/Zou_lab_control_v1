@@ -1828,7 +1828,9 @@ class PulseScanNode(Measurement):
         ``<y> <- pulse_scan``) and resolve x.  Both y signals are RAW (repeat-axis kept) -- the PLOT
         reduces them; the node never combines repeats."""
         p = self.prefix
-        keys = [p + self.x_key, p + self.y_key, p + "scan_done", "frame", "frame_0"]
+        # ONE source of the camera-frame names (no lumped ``frame``): pulse-scan fires ONE trigger per
+        # point, so it publishes the same ``frame_0`` a single-cycle CameraMeasurement does (#E1).
+        keys = [p + self.x_key, p + self.y_key, p + "scan_done", *camera_frame_keys(1)]
         if self.scan_shape is not None:
             keys.append(p + self.y_key + "_grid")
         return frozenset(keys)
@@ -1873,8 +1875,8 @@ class PulseScanNode(Measurement):
             # (the SAME data-source gate the camera measurement uses).
             return {}
         # 1) publish the camera frame(s) under BARE names so the reactive consumers (e.g. a
-        #    Judge-occupancy processor consuming ``frame``) pick them up -- this is the SAME
-        #    ``frame`` signal a CameraMeasurement publishes (default 2D = first trigger).
+        #    Judge-occupancy processor consuming ``frame_0``) pick them up -- this is the SAME
+        #    ``frame_0`` signal a single-cycle CameraMeasurement publishes (default 2D = frame_0).
         before = self.hub.signal_versions()
         # Mint ONE source-shot id for this scan point: the camera frame, any consumer that inherits it
         # (a Judge-occupancy processor on `frame`), AND the scan y-block (published via step()) all share
@@ -1883,7 +1885,6 @@ class PulseScanNode(Measurement):
         # before _read_y -- a reorder would break lineage coherence (#shot-clock).
         sid = self.hub.next_source_shot()
         frame_pub = {f"frame_{k}": np.asarray(f, dtype=float) for k, f in enumerate(frames)}
-        frame_pub["frame"] = frame_pub["frame_0"]
         self.hub.publish(frame_pub, provenance=sid)
         self._current_source_shot = sid                  # the y-block (base step()) carries the same id
         # 2) make the y signals FRESH for this frame, then 3) read y from the source expression.

@@ -31,7 +31,6 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from ..core.analysis import positive_int
 from ..core.calibration import TrapCalibration
 
 if TYPE_CHECKING:  # pragma: no cover
