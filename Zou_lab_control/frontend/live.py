@@ -314,6 +314,33 @@ class BaseLivePlot:
     #: re-deriving the family from matplotlib artists.  Default "1D".
     render_family = "1D"
 
+    def _build_distribution_band(self, image_artist, values, *, n_bins, guide_minmax=None):
+        """Build the side clim-distribution band on ``self.axdis`` (which assumes ``self.ylim_min`` /
+        ``self.ylim_max`` and the image clim are already set): the intensity histogram PolyCollection,
+        the x-axis ticks, the two draggable clim lines (coloured by the image cmap ends) + their
+        DragHLine, and -- only when ``guide_minmax=(y_min, y_max)`` is given -- the faint guide lines
+        at the data min/max drawn BEFORE the clim lines.  The ONE place Live2DDis + LiveSiteMap build
+        the band, in the SAME artist order, so the poly / guide / clim-line wiring cannot drift (#C1)."""
+        self.n_bins = int(n_bins)
+        self.n, self.bins = np.histogram(values, bins=self.n_bins, range=(self.ylim_min, self.ylim_max))
+        self.verts = np.empty((self.n_bins, 4, 2), dtype=float)
+        _update_verts(self.bins, self.n, self.verts, mode="horizontal")
+        self.poly = PolyCollection(self.verts, facecolors=PALETTE["hist_fill"])
+        self.axdis.add_collection(self.poly)
+        self.axdis.set_xlim(0, max(10, int(np.max(self.n) + 5)))
+        self.axdis.xaxis.set_major_locator(MaxNLocator(nbins=1, prune="lower"))
+        self.axdis.xaxis.set_major_formatter(ScalarFormatter())
+        self.axdis.tick_params(axis="x", which="both", bottom=True, top=False, labelbottom=True, labeltop=False)
+        self.axdis.tick_params(axis="y", which="both", left=True, right=False, labelleft=False, labelright=False)
+        if guide_minmax is not None:
+            y_min, y_max = guide_minmax
+            self.line_min = self.axdis.axhline(y_min, color=PALETTE["guide"], linewidth=small_fontsize() / 2, alpha=0.3)
+            self.line_max = self.axdis.axhline(y_max, color=PALETTE["guide"], linewidth=small_fontsize() / 2, alpha=0.3)
+        cmap = image_artist.get_cmap()
+        self.line_l = self.axdis.axhline(self.ylim_min, color=cmap(0.0), linewidth=small_fontsize() / 2)
+        self.line_h = self.axdis.axhline(self.ylim_max, color=cmap(0.95), linewidth=small_fontsize() / 2)
+        self.drag = DragHLine(self.line_l, self.line_h, self.update_clim, self.axdis)
+
     def __init__(
         self,
         data_x=np.arange(100),
@@ -912,24 +939,11 @@ class Live2DDis(BaseLivePlot):
         self.ylim_min, self.ylim_max = self._mode_target(y_min, y_max)
         self.image.set_clim(self.ylim_min, self.ylim_max)
         self.axdis.set_ylim(self.ylim_min, self.ylim_max)
-        self.n_bins = int(max(8, min(max(self.points_total, 1) // 4, 50)))
-        self.n, self.bins = np.histogram(vals if vals.size else [0], bins=self.n_bins, range=(self.ylim_min, self.ylim_max))
-        self.verts = np.empty((self.n_bins, 4, 2), dtype=float)
-        _update_verts(self.bins, self.n, self.verts, mode="horizontal")
-        self.poly = PolyCollection(self.verts, facecolors=PALETTE["hist_fill"])
-        self.axdis.add_collection(self.poly)
-        self.axdis.set_xlim(0, max(10, int(np.max(self.n) + 5)))
-        self.axdis.xaxis.set_major_locator(MaxNLocator(nbins=1, prune="lower"))
-        self.axdis.xaxis.set_major_formatter(ScalarFormatter())
-        self.axdis.tick_params(axis="x", which="both", bottom=True, top=False, labelbottom=True, labeltop=False)
-        self.axdis.tick_params(axis="y", which="both", left=True, right=False, labelleft=False, labelright=False)
-        self.line_min = self.axdis.axhline(y_min, color=PALETTE["guide"], linewidth=small_fontsize() / 2, alpha=0.3)
-        self.line_max = self.axdis.axhline(y_max, color=PALETTE["guide"], linewidth=small_fontsize() / 2, alpha=0.3)
-        cmap = self.image.get_cmap()
-        self.line_l = self.axdis.axhline(self.ylim_min, color=cmap(0.0), linewidth=small_fontsize() / 2)
-        self.line_h = self.axdis.axhline(self.ylim_max, color=cmap(0.95), linewidth=small_fontsize() / 2)
-        # colorbar end ticks are set by update_core (cax.set_yticks/labels)
-        self.drag = DragHLine(self.line_l, self.line_h, self.update_clim, self.axdis)
+        # shared band (#C1): histogram + faint guide lines (this kind has them) + draggable clim
+        # lines; the colorbar end ticks are set by update_core (cax.set_yticks/labels).
+        self._build_distribution_band(self.image, vals if vals.size else [0],
+                                      n_bins=int(max(8, min(max(self.points_total, 1) // 4, 50))),
+                                      guide_minmax=(y_min, y_max))
 
     def _attach_interactions(self) -> None:
         self.tools = attach_interaction(self.ax, drag=self.drag, axdis=self.axdis, cax=self.cax)
@@ -1108,21 +1122,8 @@ class LiveSiteMap(BaseLivePlot):
         self.ylim_min, self.ylim_max = self._mode_target(y_min, y_max)
         self._bg_image.set_clim(self.ylim_min, self.ylim_max)
         self.axdis.set_ylim(self.ylim_min, self.ylim_max)
-        self.n_bins = 40
-        self.n, self.bins = np.histogram(vals, bins=self.n_bins, range=(self.ylim_min, self.ylim_max))
-        self.verts = np.empty((self.n_bins, 4, 2), dtype=float)
-        _update_verts(self.bins, self.n, self.verts, mode="horizontal")
-        self.poly = PolyCollection(self.verts, facecolors=PALETTE["hist_fill"])
-        self.axdis.add_collection(self.poly)
-        self.axdis.set_xlim(0, max(10, int(np.max(self.n) + 5)))
-        self.axdis.xaxis.set_major_locator(MaxNLocator(nbins=1, prune="lower"))
-        self.axdis.xaxis.set_major_formatter(ScalarFormatter())
-        self.axdis.tick_params(axis="x", which="both", bottom=True, top=False, labelbottom=True, labeltop=False)
-        self.axdis.tick_params(axis="y", which="both", left=True, right=False, labelleft=False, labelright=False)
-        cmap = self._bg_image.get_cmap()
-        self.line_l = self.axdis.axhline(self.ylim_min, color=cmap(0.0), linewidth=small_fontsize() / 2)
-        self.line_h = self.axdis.axhline(self.ylim_max, color=cmap(0.95), linewidth=small_fontsize() / 2)
-        self.drag = DragHLine(self.line_l, self.line_h, self.update_clim, self.axdis)
+        # shared band (#C1): the sitemap's frame-intensity band has NO guide lines (guide_minmax=None).
+        self._build_distribution_band(self._bg_image, vals, n_bins=40, guide_minmax=None)
 
     def _attach_interactions(self) -> None:
         drag = getattr(self, "drag", None)
