@@ -198,6 +198,51 @@ def test_drag_to_bottom_left_stays_below_the_top_left_card():
     assert drop.col == GAP                                # NOT slid right to the top-right gap
 
 
+def test_save_composite_fills_a_hidpi_grab_with_no_white_margin():
+    """#H4c save: the monitor 'Save image' composites the grabbed board onto an opaque white canvas.  On
+    a SCALED display the grab is a HiDPI pixmap (physical = logical × dpr); the canvas MUST carry that
+    dpr or the pixmap paints at its smaller LOGICAL size into the top-left and leaves a giant blank
+    margin (the bug).  Build a fully-RED dpr=2 pixmap, composite, and assert the BOTTOM-RIGHT pixel is
+    red -- i.e. the content fills the whole image, no margin."""
+    from PyQt5 import QtGui, QtWidgets
+    from Zou_lab_control.frontend.task_console import _opaque_white_composite
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    pm = QtGui.QPixmap(40, 20)                  # physical 40x20 ...
+    pm.setDevicePixelRatio(2.0)                 # ... = logical 20x10 at dpr 2 (a scaled-display grab)
+    pm.fill(QtGui.QColor("#FF0000"))
+    out = _opaque_white_composite(pm)
+    assert out.size() == pm.size()                          # same physical pixels
+    assert out.devicePixelRatio() == pm.devicePixelRatio()  # dpr carried -> logical sizes match
+    img = out.toImage()
+    br = QtGui.QColor(img.pixel(img.width() - 1, img.height() - 1)).getRgb()[:3]
+    assert br == (255, 0, 0), f"bottom-right is {br}, not red -> the HiDPI composite left a blank margin"
+
+
+def test_resizing_one_card_does_not_disturb_non_overlapping_cards():
+    """#H4c: resizing ONE card must NOT scramble the others.  Three 1x2 cards -- top-left,
+    bottom-left (stacked in the left column), top-right -- then the user grows the TOP-RIGHT card to
+    2x2 (which is TALLER, same width).  The two LEFT-column cards must stay EXACTLY put and the grown
+    card stays in its column: a card to the RIGHT that merely grows into the same row band must never
+    shove a left-column card left/down (the gravity slide-left only yields to cards actually to the
+    left).  Before the fix, growing the top-right card flung the bottom-left card down."""
+    w1, h1 = _card_size("1x2")
+    w2, _h2 = _card_size("2x2")
+    board_w = GAP + w2 + GAP + w2 + GAP                 # wide enough for two 2x2 columns
+    TL = _cfg(GAP, GAP, "1x2")
+    TR = _cfg(GAP + w1 + GAP, GAP, "1x2")
+    BL = _cfg(GAP, GAP + h1 + GAP, "1x2")
+    cfgs = [TL, TR, BL]
+    _compact(cfgs, board_w=board_w)
+    tl0, bl0 = (TL.col, TL.row), (BL.col, BL.row)
+    TR.size = "2x2"                                      # user enlarges the top-right card
+    moved = _compact(cfgs, TR, board_w=board_w)
+    assert (TL.col, TL.row) == tl0                       # top-left UNMOVED
+    assert (BL.col, BL.row) == bl0                       # bottom-left UNMOVED (the bug flung it down)
+    assert (TR.col, TR.row) == (GAP + w1 + GAP, GAP)     # the grown card stays in its own column/top
+    assert moved is False                                # nothing in the settled board needed to move
+    _assert_no_overlap(cfgs)
+
+
 def test_first_free_slot_tiles_the_top_row_then_wraps():
     """A freshly-Added panel SPAWNS at the first free top-left slot (``_first_free_slot``) so an Add
     TILES the board -- fills the top row left-to-right, then wraps -- instead of starting a fresh column.

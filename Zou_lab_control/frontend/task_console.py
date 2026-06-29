@@ -1111,6 +1111,24 @@ def _card_size(size: str) -> tuple[int, int]:
     return (width, height)
 
 
+def _opaque_white_composite(pm):
+    """Composite a (possibly transparent, possibly HiDPI) grabbed pixmap onto an opaque WHITE canvas of
+    the SAME size AND devicePixelRatio, so the saved PNG is not see-through AND has no blank margin.
+
+    The dpr match is the crux: on a HiDPI screen ``QWidget.grab`` returns a pixmap whose PHYSICAL size is
+    ``logical × dpr`` but whose LOGICAL size is ``logical``.  A plain ``QPixmap(pm.size())`` is dpr=1, so
+    ``drawPixmap`` paints the pixmap at its smaller LOGICAL size into the top-left and leaves the rest
+    blank -- the giant white margin around the panels the user saw on a scaled display.  Carrying the
+    pixmap's dpr makes the canvas's logical size equal the pixmap's, so the composite fills it exactly."""
+    canvas = QtGui.QPixmap(pm.size())
+    canvas.setDevicePixelRatio(pm.devicePixelRatio())
+    canvas.fill(QtGui.QColor("#FFFFFF"))
+    painter = QtGui.QPainter(canvas)
+    painter.drawPixmap(0, 0, pm)
+    painter.end()
+    return canvas
+
+
 def _aabb(cfg) -> tuple[int, int, int, int]:
     """The card's pixel AABB ``(x0, y0, x1, y1)`` -- top-left ``(col, row)`` plus its size."""
     w, h = _card_size(cfg.size)
@@ -1153,10 +1171,14 @@ def _gravity_slot(cfg, placed, board_w: int) -> tuple[int, int]:
             px0, py0, px1, py1 = _aabb(p)
             if x < px1 + GAP and px0 < x + w + GAP:       # x-spans overlap (within GAP) -> "above" in-column
                 ny = max(ny, py1 + GAP)
-        nx = GAP                                          # slide left: rest just right of any row-overlapping card
+        nx = GAP                                          # slide left: rest just right of any LEFT card in the row
         for p in placed:
             px0, py0, px1, py1 = _aabb(p)
-            if ny < py1 + GAP and py0 < ny + h + GAP:     # y-spans overlap at the risen y -> "left" in-row
+            # y-spans overlap at the risen y AND p is actually to the LEFT (px0 < x).  Only a card to the
+            # left blocks LEFTWARD travel: a card to the RIGHT that merely shares the row band (e.g. a
+            # right-column card grown TALLER on resize) must NOT shove this card right past it -- that was
+            # the resize bug that flung every left-column card down/across when one card was enlarged.
+            if ny < py1 + GAP and py0 < ny + h + GAP and px0 < x:
                 nx = max(nx, px1 + GAP)
         nx = min(nx, max_x)
         if (nx, ny) == (x, y):
@@ -6080,12 +6102,7 @@ class TaskConsole(QtWidgets.QWidget):
         else:
             pm = self.board.grab()
         # _PanelBoard is transparent -> composite onto an opaque white canvas so the PNG isn't see-through.
-        canvas = QtGui.QPixmap(pm.size())
-        canvas.fill(QtGui.QColor("#FFFFFF"))
-        painter = QtGui.QPainter(canvas)
-        painter.drawPixmap(0, 0, pm)
-        painter.end()
-        canvas.save(path)
+        _opaque_white_composite(pm).save(path)
         self._last_save_dir = str(Path(path).parent)
         self._update_summary()
 
