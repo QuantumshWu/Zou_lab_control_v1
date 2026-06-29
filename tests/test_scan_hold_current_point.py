@@ -42,6 +42,17 @@ def test_freeze_bakes_the_held_point_into_a_static_pulse():
     assert state.scan_table == [[200.0], [400.0], [600.0]]
 
 
+def test_held_point_text_shows_slot_vars_s0_s1_not_period_dac_names():
+    """#2: the held/current scan-point display reads 's0 = .., s1 = ..' (the slot_var single source),
+    NOT the long 'Period N duration / da[k] level' labels -- and carries no '[..]' wrapper.  The text
+    is a pure function of the row + slot_var (no self.state dependency)."""
+    ed = PulseSequenceEditor.__new__(PulseSequenceEditor)
+    text = ed._scan_point_values_text([200.0, -100.0])
+    assert text == "s0 = 200, s1 = -100", text
+    assert "Period" not in text and "da[" not in text and "[" not in text
+    assert ed._held_scan_point_text((0, [200.0, -100.0], 3)) == "held at point 1/3: s0 = 200, s1 = -100"
+
+
 def test_freeze_clamps_an_out_of_range_index_to_the_last_point():
     state = _scan_state()
     assert float(PulseSequenceEditor._freeze_state_to_scan_point(state, 99).periods[0].duration) == 600.0

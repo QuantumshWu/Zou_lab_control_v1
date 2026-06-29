@@ -3060,9 +3060,10 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         return frozen
 
     def _scan_point_values_text(self, row) -> str:
-        labels = [_scan_slot_label(self.state, i) for i in range(len(getattr(self.state, "scan_slots", None) or []))]
-        parts = [f"{(labels[i] if i < len(labels) else f'slot{i}')}={float(v):g}" for i, v in enumerate(row)]
-        return ("[" + ", ".join(parts) + "]") if parts else ""
+        # Show the scan-point as the SLOT identifiers + values: "s0 = .., s1 = ..".  slot_var is the
+        # single source of the s0/s1/.. convention (pulse_table.slot_var), the same labels the Scan
+        # tab and the bind-expression namespace use -- NOT the long "Period N duration / da[k] level".
+        return ", ".join(f"{slot_var(i)} = {float(v):g}" for i, v in enumerate(row))
 
     def _current_scan_point_text(self, progress) -> str:
         """The CURRENT scan point's VALUES (#1) at the live position -- looked up in the streaming table."""
@@ -3105,7 +3106,8 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             self.sequencer.fire()
             self.stateui_manager.runstate = PulseStateUIManager.RunState.RUNNING
             self._held_scan_point = (k, frozen_row, len(table))
-            self._message(f"Scan held at point {k + 1}/{len(table)}: {self._scan_point_values_text(frozen_row)}")
+            # No success popup: the held point is shown persistently in the scan-progress label
+            # (_held_scan_point_text), so a modal dialog here is just noise the user has to dismiss.
         except Exception as exc:
             self.stateui_manager.runstate = PulseStateUIManager.RunState.ERROR
             self._message(str(exc))
@@ -3128,7 +3130,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 else:
                     allowed = f"snapped to a whole {format_compact_number(step)} ns tick (≥ 1 tick)"
                 lines.append(
-                    f"  s{index}: {_scan_slot_label(state, index)}  [{slot.unit}]  "
+                    f"  {slot_var(index)}: {_scan_slot_label(state, index)}  [{slot.unit}]  "
                     f"(nominal {format_compact_number(slot.nominal)}) → {allowed}"
                 )
             lines.append("")
