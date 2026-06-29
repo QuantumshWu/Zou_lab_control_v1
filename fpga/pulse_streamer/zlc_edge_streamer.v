@@ -629,8 +629,11 @@ module zlc_edge_streamer #(
             // segment has start_sel == stop_sel so vstart == vstop.
             start_sel = bus_value_select_mem[addr];
             stop_sel  = bus_stop_value_select_mem[addr];
+            // The ramp START is the engine's LIVE value register (carried in from the previous period /
+            // frame / scan-point), NOT a baked endpoint -- unless an explicit SCANNED start (start_sel)
+            // overrides it.  This is the one model correct for fire-once, loop AND scan (#ramp-carry).
             vstart = (start_sel != {BUS_SEL_WIDTH{1'b0}})
-                     ? slot_vec[(start_sel - 1'b1)*TICK_WIDTH +: BUS_WIDTH] : bus_start_value_mem[addr];
+                     ? slot_vec[(start_sel - 1'b1)*TICK_WIDTH +: BUS_WIDTH] : bus_value_active[i];
             vstop  = (stop_sel  != {BUS_SEL_WIDTH{1'b0}})
                      ? slot_vec[(stop_sel  - 1'b1)*TICK_WIDTH +: BUS_WIDTH] : bus_stop_value_mem[addr];
             if (bus_mode_mem[addr] == BUS_MODE_RAMP && tkstop > tkstart) begin
@@ -679,7 +682,12 @@ module zlc_edge_streamer #(
                 if (reinit) begin
                     count = zlc_bus_count_at(i);
                     bus_count_active[i] <= count; bus_index_active[i] <= {(BUS_SEG_ADDR_WIDTH+1){1'b0}};
-                    bus_value_active[i] <= BUS_SAFE_VALUE[BUS_WIDTH-1:0]; bus_ramp_active[i] <= 1'b0; bus_ramp_dir_up[i] <= 1'b0;
+                    // bus_value_active is NOT reset here: it CARRIES across the gapless wrap (loop / scan
+                    // point), so a ramp at the next frame's start ramps from the value held at the END of
+                    // the previous frame -- the staircase a scanned ramp needs, and the steady-state a loop
+                    // converges to (#ramp-carry).  The idle 0 V start for the very FIRST fire comes from the
+                    // arm/reset path (which sets BUS_SAFE_VALUE), not this per-frame reinit.
+                    bus_ramp_active[i] <= 1'b0; bus_ramp_dir_up[i] <= 1'b0;
                     bus_ramp_start_tick[i] <= {TICK_WIDTH{1'b0}}; bus_ramp_stop_tick[i] <= {TICK_WIDTH{1'b0}};
                     bus_ramp_target[i] <= {BUS_WIDTH{1'b0}}; bus_ramp_step[i] <= {(BUS_WIDTH+1){1'b0}}; bus_ramp_rem[i] <= {(BUS_WIDTH+1){1'b0}}; bus_ramp_steep[i] <= 1'b0;
                     bus_ramp_denom[i] <= {TICK_WIDTH{1'b0}}; bus_ramp_accum[i] <= {(TICK_WIDTH+BUS_WIDTH+1){1'b0}};
