@@ -577,3 +577,31 @@ def test_reference_bracket_defaults_are_single_source():
     rsig = inspect.signature(ReadoutSubsystem.sitemap_from_dir)
     assert rsig.parameters["shots_per_group"].default is imageio.DEFAULT_SHOTS_PER_GROUP
     assert rsig.parameters["ref_shots"].default is imageio.DEFAULT_REF_SHOTS
+
+
+def test_publish_conformance_guard_is_one_base_method():
+    """#E2: the 'a node may publish only the signals it declared' guard lives ONCE on
+    LogicNode._assert_declared and is reused by BOTH Processor.shot and ProcessorRun.shot -- so the
+    sibling that historically lacked it can no longer silently drop the contract."""
+    from Zou_lab_control.neutral_atom.operations.logic import LogicNode, Processor, ProcessorRun
+    assert Processor._assert_declared is LogicNode._assert_declared       # single source ...
+    assert ProcessorRun._assert_declared is LogicNode._assert_declared    # ... shared by both twins
+    node = LogicNode.__new__(LogicNode)
+    with pytest.raises(ValueError, match="undeclared"):
+        node._assert_declared({"occupied": 1, "rogue": 2}, ["occupied"])
+    assert node._assert_declared({"occupied": 1}, ["occupied", "rate"]) == {"occupied": 1}
+
+
+def test_swept_block_ring_contract_is_one_base_class():
+    """#E4: the swept-block ring contract (depth/index/pass, RAW buffer, points_done/total_points/
+    finished, _publish_raw, _fill_point, finite-scan stop) lives ONCE on _SweptBlockMeasurement; both
+    scan nodes inherit it rather than re-typing it, so neither can drift the contract."""
+    from Zou_lab_control.neutral_atom.operations.logic import (
+        _SweptBlockMeasurement, ScannedMeasurementNode, PulseScanNode)
+    assert issubclass(ScannedMeasurementNode, _SweptBlockMeasurement)
+    assert issubclass(PulseScanNode, _SweptBlockMeasurement)
+    # the ring machinery is defined on the base, NOT overridden in either subclass (one source).
+    for name in ("_init_swept_block", "_publish_raw", "_fill_point", "points_done", "total_points",
+                 "finished", "n_points", "step", "run_to_completion"):
+        assert name not in ScannedMeasurementNode.__dict__, f"{name} re-typed in ScannedMeasurementNode"
+        assert name not in PulseScanNode.__dict__, f"{name} re-typed in PulseScanNode"

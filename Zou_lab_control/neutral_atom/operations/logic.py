@@ -238,6 +238,19 @@ class LogicNode:
         """Produce one shot's worth of {name: value} signals."""
         raise NotImplementedError
 
+    def _assert_declared(self, out: dict, declared) -> dict:
+        """Publish-time conformance, enforced for EVERY ``shot()``-publisher on the common
+        ancestor (#E2): a node may publish ONLY signals it declared (its bare output / result
+        keys, before ``step`` prefixes them).  An undeclared key would become a silent,
+        unlegended hub signal the flow graph never shows, so fail loud at the boundary instead
+        of letting one node type carry the guard while a sibling silently drops it."""
+        extra = set(out) - set(declared)
+        if extra:
+            raise ValueError(
+                f"{type(self).__name__} published undeclared signal(s) {sorted(extra)}; "
+                "declare them in the node's output keys (the single output-key source).")
+        return out
+
     def step(self) -> dict[str, object]:
         """Run ONE shot synchronously and publish it (test/notebook friendly).
 
@@ -556,15 +569,7 @@ class Processor(LogicNode):
         if inputs is None:
             return {}
         out = self.transform(inputs)
-        # Publish-time conformance: a processor may ONLY publish signals it declared in
-        # output_keys() -- an undeclared key would become a silent, unlegended hub signal
-        # the flow graph never shows.  Fail loud at the boundary instead.
-        extra = set(out) - set(self.output_keys())
-        if extra:
-            raise ValueError(
-                f"{type(self).__name__} published undeclared signal(s) {sorted(extra)}; "
-                "declare them in `provides` (the single output-key source).")
-        return out
+        return self._assert_declared(out, self.output_keys())
 
     def published_signals(self) -> frozenset:
         return frozenset(self.prefix + key for key in self.output_keys())
@@ -1517,7 +1522,92 @@ class CameraMeasurement(Measurement):
         return {"region": [int(round(x0)), int(round(x1)), int(round(y0)), int(round(y1))]}
 
 
-class ScannedMeasurementNode(Measurement):
+class _SweptBlockMeasurement(Measurement):
+    """Shared swept-block ring contract for EVERY scan node (#E4).
+
+    A scan node fills a RAW ``(repeat, *points_shape, *data_shape)`` block point-by-point and
+    publishes it WHOLE -- the node never combines the repeats; the PLOT reduces the repeat axis per
+    its ``repeat_mode``.  ONE knob ``repeat``: 0 = ∞ (roll a 1-deep ring forever, a live scan showing
+    the latest sweep); K = keep K whole passes (averageable) then STOP.  A subclass sets the swept x
+    values + per-point data width once via :meth:`_init_swept_block`, implements only its per-point
+    body (calling :meth:`_fill_point`), and reuses the ring state / progress properties / publish /
+    finite-scan stop here -- so neither twin (a :class:`ScannedMeasurement` driver or a
+    :class:`PulseScanNode`) can drift the contract: the law lives on the common ancestor, not retyped
+    per node."""
+
+    def _init_swept_block(self, *, values, data_shape: tuple, repeat: int) -> None:
+        """Set up the swept x values + the pre-allocated RAW block.  ``repeat`` (0 = ∞) fixes the ring
+        depth; ``data_shape`` is the per-point data (``(n_series,)`` for a reducer curve, ``(1,)`` for
+        a scalar)."""
+        self.repeat = max(0, int(repeat))
+        self._ring = max(1, self.repeat)              # block depth: K passes for finite, 1 (rolling) for ∞
+        self._index = 0                               # within-pass point index (0..n_points-1)
+        self._pass = 0                                # 0-based pass currently being filled
+        self._values = np.asarray(values, dtype=float).reshape(-1)
+        self.points_shape: tuple = (int(self._values.size),)   # the swept parameter points
+        self.data_shape: tuple = tuple(data_shape)             # per-point data
+        # RAW (repeat, *points_shape, *data_shape), NaN = not-yet-measured; filled in place by
+        # (pass, point) and published whole (the plot reduces the leading repeat axis).
+        self._raw = np.full((self._ring, *self.points_shape, *self.data_shape), np.nan, dtype=float)
+
+    @property
+    def n_points(self) -> int:
+        return int(self._values.size)
+
+    @property
+    def points_done(self) -> int:
+        """Total points measured so far ACROSS all passes (monotonic over the whole repeat run)."""
+        return int(self._pass * self.n_points + self._index)
+
+    @property
+    def total_points(self) -> int:
+        """All points over all passes (n_points x repeat); 0 (open-ended) while ∞ (repeat=0)."""
+        return 0 if self.repeat <= 0 else int(self.n_points * int(self.repeat))
+
+    @property
+    def finished(self) -> bool:
+        """True once every point of every pass has been measured (never, while ∞ / repeat=0)."""
+        return self.repeat > 0 and (self._pass >= int(self.repeat))
+
+    def _publish_raw(self) -> np.ndarray:
+        """The raw block to publish.  Finite: as-is (slot == pass, already chronological).  ∞ rolling
+        ring: rolled so the most-recently-written slice is LAST (oldest->newest), so the plot's
+        replace/roll/create read the newest correctly."""
+        if self.repeat > 0:
+            return self._raw.copy()
+        last = (self._pass if self._index > 0 else self._pass - 1) % self._ring
+        return np.roll(self._raw, self._ring - 1 - last, axis=0).copy()
+
+    def _fill_point(self, index: int, row) -> None:
+        """Fill measured ``row`` into the raw block at the current ``(pass, point)`` and advance the
+        within-pass index / pass counter.  Clears a reused ring slot on a pass's first point so two
+        passes never mix.  The node only FILLS; HOW the repeats combine for display is the plot's job."""
+        row = np.atleast_1d(np.asarray(row, dtype=float))
+        slot = self._pass % self._ring
+        if index == 0:                               # first point of a pass -> clear its slice
+            self._raw[slot] = np.nan                 # (so a reused ring slot never mixes 2 passes)
+        self._raw[slot, index, :row.size] = row
+        self._index += 1
+        if self._index >= self.n_points:             # this pass complete -> start the next one
+            self._index = 0
+            self._pass += 1
+
+    def step(self) -> dict[str, object]:
+        """Run one point, publish it, and self-stop once the final point lands (so a background
+        ``start()`` thread's loop exits cleanly on a finite scan)."""
+        named = super().step()
+        if self.finished:
+            self._stop.set()
+        return named
+
+    def run_to_completion(self):
+        """Synchronously run + publish every remaining scan point (test/headless)."""
+        while not self.finished:
+            self.step()
+        return self
+
+
+class ScannedMeasurementNode(_SweptBlockMeasurement):
     """Drive a :class:`ScannedMeasurement` one scan point per ``shot()``, into a hub.
 
     Wraps a swept measurement as a console logic node (``start``/``stop``/``running``)
@@ -1570,10 +1660,6 @@ class ScannedMeasurementNode(Measurement):
         # K-deep block (K passes averaged) then STOPS; repeat=0 rolls a 1-deep ring forever (a live scan
         # showing the latest sweep).  The node only FILLS point-by-point; HOW the repeats are combined
         # for display is the PLOT's ``repeat_mode``.
-        self.repeat = max(0, int(repeat))
-        self._ring = max(1, self.repeat)                   # block depth: K passes for finite, 1 (rolling) for ∞
-        self._index = 0                                   # within-pass point index (0..n_points-1)
-        self._pass = 0                                    # 0-based pass currently being filled
         # Share the node's stop event so a Stop interrupts a wedged trigger MID-scan-point.
         try:
             self.measurement.stop_event = self._stop
@@ -1584,43 +1670,13 @@ class ScannedMeasurementNode(Measurement):
         self.node_label = str(prefix).rstrip("_") or str(y_key)
         self.x_signal = self.prefix + self.x_key
         self.y_signal = self.prefix + self.y_key
-        # The measurement owns the swept values (single source of truth) = the x AXIS, known up front.
-        self._values = np.asarray(measurement.axis.values, dtype=float).reshape(-1)
+        # The swept-block contract (ring depth, RAW (repeat, n_points, dim) buffer, progress
+        # properties, finite-scan stop) is owned by _SweptBlockMeasurement; we supply the swept x
+        # values (the measurement's axis = the single source of truth) and the per-point data width
+        # (the reducer's series count, so a per-site reducer makes dim = n_sites).
         n_series = max(1, int(getattr(measurement.reducer, "n_series", 1)))
-        self.points_shape: tuple = (int(self._values.size),)   # the swept parameter points
-        self.data_shape: tuple = (n_series,)                   # the per-point data (one per series)
+        self._init_swept_block(values=measurement.axis.values, data_shape=(n_series,), repeat=repeat)
         self.primary_signal = self.y_key                       # the (repeat,n_points,dim) block (#H3r-F4)
-        # RAW block (repeat, *points_shape, *data_shape) = (repeat, n_points, dim), NaN = not-yet-
-        # measured.  Filled in place by (pass, point); published whole -- the plot reduces axis O0.
-        self._raw = np.full((self._ring, *self.points_shape, *self.data_shape), np.nan, dtype=float)
-
-    @property
-    def n_points(self) -> int:
-        return int(self._values.size)
-
-    @property
-    def points_done(self) -> int:
-        """Total points measured so far ACROSS all passes (monotonic over the whole repeat run)."""
-        return int(self._pass * self.n_points + self._index)
-
-    @property
-    def total_points(self) -> int:
-        """All points over all passes (n_points x repeat); 0 (open-ended) while ∞ (repeat=0)."""
-        return 0 if self.repeat <= 0 else int(self.n_points * int(self.repeat))
-
-    @property
-    def finished(self) -> bool:
-        """True once every point of every pass has been measured (never, while ∞ / repeat=0)."""
-        return self.repeat > 0 and (self._pass >= int(self.repeat))
-
-    def _publish_raw(self) -> np.ndarray:
-        """The raw ``(repeat, points, dim)`` block to publish.  Finite: as-is (slot == pass, already
-        chronological).  ∞ rolling ring: rolled so the most-recently-written slice is LAST
-        (oldest->newest), so the plot's replace/roll/create read the newest correctly."""
-        if self.repeat > 0:
-            return self._raw.copy()
-        last = (self._pass if self._index > 0 else self._pass - 1) % self._ring
-        return np.roll(self._raw, self._ring - 1 - last, axis=0).copy()
 
     def shot(self) -> dict[str, object]:
         """Measure ONE scan point and FILL it into the raw ``(repeat, points, dim)`` block at
@@ -1632,15 +1688,8 @@ class ScannedMeasurementNode(Measurement):
             raise StopIteration("ScannedMeasurementNode: scan already complete.")
         index = self._index
         value = float(self._values[index])
-        row = np.atleast_1d(np.asarray(self.measurement.measure(value, index), dtype=float))
-        slot = self._pass % self._ring
-        if index == 0:                                   # first point of a pass -> clear its slice
-            self._raw[slot] = np.nan                     # (so a reused ring slot never mixes 2 passes)
-        self._raw[slot, index, :row.size] = row
-        self._index += 1
-        if self._index >= self.n_points:                 # this pass complete -> start the next one
-            self._index = 0
-            self._pass += 1
+        row = self.measurement.measure(value, index)
+        self._fill_point(index, row)                      # base owns slot/pass-clear/advance (#E4)
 
         self._current_source_shot = self.hub.next_source_shot()   # one SOURCE-shot per scan point (#shot-clock)
         return self._assert_primary_shape({
@@ -1648,26 +1697,6 @@ class ScannedMeasurementNode(Measurement):
             self.y_key: self._publish_raw(),             # RAW (repeat, points, dim) -- plot reduces it
             "scan_done": 1.0 if self.finished else 0.0,
         })
-
-    def step(self) -> dict[str, object]:
-        """Run one point, publish it, and self-stop once the final point lands.
-
-        Reuses the base publish path; the only addition is the finite-scan stop:
-        after the last point's signals are on the hub, the stop event is set so a
-        background ``start()`` thread's loop exits cleanly.
-        """
-
-        named = super().step()
-        if self.finished:
-            self._stop.set()
-        return named
-
-    def run_to_completion(self) -> "ScannedMeasurementNode":
-        """Synchronously run + publish every remaining scan point (test/headless)."""
-
-        while not self.finished:
-            self.step()
-        return self
 
     def published_signals(self) -> frozenset:
         return frozenset(self.prefix + key for key in (self.x_key, self.y_key, "scan_done"))
@@ -1689,7 +1718,7 @@ class ScannedMeasurementNode(Measurement):
         )
 
 
-class PulseScanNode(Measurement):
+class PulseScanNode(_SweptBlockMeasurement):
     """Drive a pulse-template scan one point per ``shot()``, with a DECOUPLED y.
 
     Unlike :class:`ScannedMeasurementNode` (which reduces its OWN frames through a calibration),
@@ -1730,16 +1759,12 @@ class PulseScanNode(Measurement):
                  prefix: str = "", repeat: int = 1):
         super().__init__(hub, prefix=prefix)
         self.plan = plan
-        # UNIFORM contract (#H3n): the block is ``(repeat, n_points, 1)`` = ``(repeat, *points_shape,
-        # *data_shape)`` with ``points_shape=(n_points,)`` (a 2-D scan's n0*n1 param grid flattened)
-        # and ``data_shape=(1,)``.  ONE knob ``repeat``, 0 = ∞ (no free-run toggle): pulse-scan fires
-        # ONCE per point per pass, so a "pass" IS a whole re-sweep -- repeat=K keeps K whole sweeps
-        # (averageable) then STOPS, repeat=0 rolls a 1-deep ring forever (a live scan showing the
-        # latest sweep).  The node only FILLS; the PLOT combines the repeats (``repeat_mode``) and,
-        # for a 2-D scan, reshapes the points by ``scan_shape`` to an image.
-        self.repeat = max(0, int(repeat))
-        self._ring = max(1, self.repeat)                  # block depth: K sweeps for finite, 1 (rolling) for ∞
-        self._pass = 0                                    # 0-based pass currently being filled
+        # The swept-block ring contract -- ``(repeat, n_points, 1)`` buffer, ring depth, progress
+        # properties, finite-scan stop -- is owned by _SweptBlockMeasurement (#E4); set up below via
+        # _init_swept_block once the swept x values are known.  Pulse-scan fires ONCE per point per
+        # pass, so a "pass" IS a whole re-sweep (repeat=K keeps K averageable sweeps then STOPS;
+        # repeat=0 rolls a 1-deep ring forever); the PLOT combines the repeats + (2-D) reshapes by
+        # ``scan_shape``.
         self.base_state = plan.base_state
         self.scan_names = list(plan.scan_names)
         self.scan_arrays = [np.asarray(a, dtype=float).reshape(-1) for a in plan.scan_arrays]
@@ -1765,54 +1790,23 @@ class PulseScanNode(Measurement):
         self.node_label = str(prefix).rstrip("_") or str(y_key)
         self.x_signal = self.prefix + self.x_key
         self.y_signal = self.prefix + self.y_key
-        # The swept x values are known up front -> a PRE-ALLOCATED NaN curve filled in place by
-        # scan index (a stable x axis from shot 1), like ScannedMeasurementNode.  The x dimension is
-        # the hardware scan slots if any, else the software api sweep.
+        # The x dimension is the hardware scan slots if any, else the software api sweep; the base
+        # pre-allocates the RAW (repeat, n_points, 1) NaN block + ring/progress state from it (a stable
+        # x axis from shot 1).  One scalar per point (data_shape=(1,)); a 2-D scan flattens its n0*n1
+        # grid into n_points here and the 2-D panel reshapes by scan_shape.
         if self.scan_arrays:
-            self._values = self.scan_arrays[0].astype(float)
+            swept_values = self.scan_arrays[0].astype(float)
         elif self.api_arrays:
-            self._values = self.api_arrays[0].astype(float)
+            swept_values = self.api_arrays[0].astype(float)
         else:
-            self._values = np.array([0.0])
-        self._index = 0                                   # within-pass point index
-        self.points_shape: tuple = (int(self._values.size),)   # swept points (2-D scan: n0*n1 flat)
-        self.data_shape: tuple = (1,)                          # one scalar per point
+            swept_values = np.array([0.0])
+        self._init_swept_block(values=swept_values, data_shape=(1,), repeat=repeat)
         self.primary_signal = self.y_key                       # the (repeat,n_points,1) block (#H3r-F4)
         # 2-D scan: the flattened points reshape to this (n0, n1) image on a 2-D panel (#H3o); the
         # data stays a scalar, so the 2-D-ness is HERE, not in data_shape.
         self.grid_shape: tuple = tuple(self.scan_shape) if self.scan_shape else ()
-        # RAW block (repeat, *points_shape, *data_shape) = (repeat, n_points, 1), NaN = not-yet-
-        # measured.  A 2-D scan has n_points = n0*n1; the 2-D panel reshapes by scan_shape to an image.
-        self._raw = np.full((self._ring, *self.points_shape, *self.data_shape), np.nan, dtype=float)
         self._axis_label = str(plan.axis_label)
         self._axis_unit = str(plan.axis_unit)
-
-    @property
-    def n_points(self) -> int:
-        return int(self._values.size)
-
-    @property
-    def points_done(self) -> int:
-        """Total points measured so far across all passes (monotonic over the whole repeat run)."""
-        return int(self._pass * self.n_points + self._index)
-
-    @property
-    def total_points(self) -> int:
-        # ONE pass axis, 0 = ∞: repeat=K means K whole sweeps x N points; repeat=0 is unbounded.
-        return 0 if self.repeat <= 0 else int(self.n_points * int(self.repeat))
-
-    @property
-    def finished(self) -> bool:
-        # repeat=0 = ∞ (roll forever); else stop after ``repeat`` whole sweeps.
-        return self.repeat > 0 and (self._pass >= int(self.repeat))
-
-    def _publish_raw(self) -> np.ndarray:
-        """The raw ``(repeat, points, 1)`` block to publish (finite: as-is; ∞ ring: rolled so the
-        most-recently-written slice is LAST).  Mirrors :meth:`ScannedMeasurementNode._publish_raw`."""
-        if self.repeat > 0:
-            return self._raw.copy()
-        last = (self._pass if self._index > 0 else self._pass - 1) % self._ring
-        return np.roll(self._raw, self._ring - 1 - last, axis=0).copy()
 
     def _publish_grid(self) -> np.ndarray:
         """For a 2-D scan: the SAME raw block reshaped to ``(repeat, n0, n1)`` -- a pure reshape of
@@ -1895,14 +1889,7 @@ class PulseScanNode(Measurement):
         #    the adjustable extra delay); honours Stop so a long settle does not wedge teardown.
         if self.extra_delay_s > 0.0 and not self._stop.is_set():
             self.sequencer.settle(self.extra_delay_s, stop=self._stop)
-        slot = self._pass % self._ring
-        if index == 0:                                   # first point of a pass -> clear its slice
-            self._raw[slot] = np.nan                     # (so a reused ring slot never mixes 2 passes)
-        self._raw[slot, index, 0] = y                    # FILL only -- the plot reduces the repeats
-        self._index += 1
-        if self._index >= self.n_points:                 # pass complete -> start the next one
-            self._index = 0
-            self._pass += 1
+        self._fill_point(index, y)                        # base owns slot/pass-clear/advance (#E4)
         out = {self.x_key: self._values.copy(),
                self.y_key: self._publish_raw(),          # RAW (repeat, points, 1) -- plot reduces it
                "scan_done": 1.0 if self.finished else 0.0}
@@ -1942,18 +1929,6 @@ class PulseScanNode(Measurement):
             return float(arr[0]) if arr.size else float("nan")
         except Exception:
             return float("nan")
-
-    def step(self) -> dict[str, object]:
-        named = super().step()
-        if self.finished:
-            self._stop.set()                                 # finite scan: a background loop self-exits
-        return named
-
-    def run_to_completion(self) -> "PulseScanNode":
-        """Synchronously run + publish every remaining scan point (test/headless)."""
-        while not self.finished:
-            self.step()
-        return self
 
 
 class ProcessorRun(LogicNode):
@@ -1997,7 +1972,7 @@ class ProcessorRun(LogicNode):
         out = dict(self.result)
         out["processor_done"] = 1.0
         self._current_source_shot = self.hub.next_source_shot()   # one SOURCE-shot for this discrete result (#shot-clock)
-        return out
+        return self._assert_declared(out, tuple(self.spec.result_keys) + ("processor_done",))
 
     def run_to_completion(self) -> "ProcessorRun":
         """Run the action once synchronously and publish its result (test/headless)."""
