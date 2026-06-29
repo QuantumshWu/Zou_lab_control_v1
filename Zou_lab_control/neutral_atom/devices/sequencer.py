@@ -307,6 +307,13 @@ SCAN_PROGRESS_IDLE: dict[str, object] = {
     "scanning": False, "point": 0, "n_points": 0, "sweep": 0, "n_repeats": 0,
 }
 
+#: Per-scan-point WALL-CLOCK pacing of the PURE-SOFTWARE scan-progress readout.  The real backend
+#: wires ``scan_progress_callback`` (the FPGA scan cursor) and ignores this; a pure-software
+#: SequencerService (the standalone pulse GUI's RuntimeSequencer) has NO cursor, so it derives the
+#: played-point count from ``elapsed_since_fire / this`` -- so the GUI shows "point K / N" advancing
+#: for a virtual streamed scan too (virtual == real for the readout; the rate is a display choice).
+SCAN_PROGRESS_DISPLAY_DT: float = 0.05
+
 
 def scan_progress_fields(point_total: int, n_points: int, scan_repeats: int) -> dict[str, object]:
     """Turn a MONOTONIC played-point count into the scan-progress reading.
@@ -919,6 +926,10 @@ class SequencerService:
         self.last_payload_json: str | None = None
         self.state = "idle"
         self.history: list[dict[str, object]] = []
+        # Pure-software scan-progress derivation (no FPGA cursor): the wall-clock fire instant of the
+        # running STREAMED scan + a done latch for a finite K-sweep scan (see scan_progress).
+        self._scan_fire_time: float = 0.0
+        self._scan_done: bool = False
 
     def prepare(self, sequence_payload) -> dict[str, object]:
         timing_payload = timing_from_payload(sequence_payload)
@@ -1022,6 +1033,11 @@ class SequencerService:
             if self.fire_callback is not None:
                 self.fire_callback(program)
             self.state = "running"
+            # Stamp the fire instant for a STREAMED scan so scan_progress() can derive the played-point
+            # count from the wall clock when no hardware cursor callback is wired (pure software).
+            if getattr(program, "repeat_forever", False) and getattr(program, "scan_points", None):
+                self._scan_fire_time = time.monotonic()
+                self._scan_done = False
             self.history.append({"action": "fire", "sequence_id": program.sequence_id})
             return program.to_dict()
 
@@ -1064,11 +1080,28 @@ class SequencerService:
             self.safe_state_callback()
 
     def scan_progress(self) -> dict:
-        """Where the running scan is now -- delegates to the hardware backend's reading when one is
-        wired (the real streamer), else idle (a pure-software service has no live scan cursor)."""
+        """Where the running scan is now.  Delegates to the hardware backend's reading when one is
+        wired (the real FPGA scan cursor).  WITHOUT a hardware callback (the pure-software
+        ``RuntimeSequencer`` the standalone pulse GUI uses by default), DERIVE the played-point count
+        from the wall-clock elapsed since ``fire()`` -- exactly how the real cursor advances -- so the
+        Scan tab shows "point K / N" for a VIRTUAL streamed scan too (virtual == real for the readout;
+        the old behaviour returned idle here, so a virtual scan showed no position at all)."""
         if self.scan_progress_callback is not None:
             return dict(self.scan_progress_callback())
-        return dict(SCAN_PROGRESS_IDLE)
+        program = self.prepared_program
+        if (self.state != "running" or program is None
+                or not getattr(program, "repeat_forever", False)
+                or not getattr(program, "scan_points", None)):
+            return dict(SCAN_PROGRESS_IDLE)              # nothing streaming -> no scan position
+        n = len(program.scan_points)
+        k = max(0, int(getattr(program, "scan_repeats", 0)))
+        if self._scan_done:                              # finite scan already played its K sweeps -> latched done
+            return scan_progress_fields(max(1, k) * n, n, k)
+        total = int(max(0.0, time.monotonic() - self._scan_fire_time) / SCAN_PROGRESS_DISPLAY_DT)
+        fields = scan_progress_fields(total, n, k)
+        if not fields["scanning"]:                       # a finite K-sweep scan reached its end -> latch
+            self._scan_done = True
+        return fields
 
     def snapshot(self) -> dict[str, object]:
         with self._lock:
