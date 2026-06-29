@@ -1167,28 +1167,48 @@ def test_pulse_table_analog_bus_modes_compile_to_runtime_bus_segments(tmp_path):
     assert program.ticks == [0, 5, 10, 15]
     assert program.masks == [0, 0, 0, 0]
     assert program.bus_names == ["da_test"]
-    # The edge to signed 0 (= the idle mid code 4) is a no-op so it emits nothing; the
-    # ramp spans period 2 [10,15) from the carried-in code 4 (0 V) to code 7 (+3 LSB).
+    # period 0's explicit edge to signed 0 (= idle mid code 4) is ALWAYS emitted now: under a loop it
+    # re-zeroes the bus each frame, so dropping it would let the previous frame's value carry in.  The
+    # ramp spans period 2 [10,15) and carries IN from the LIVE register, so its start endpoint is NOT
+    # baked (start_value 0) -- the ramp engine reads its current value at runtime (#ramp-carry).
     assert [segment.to_dict() for segment in (program.bus_segments or [])] == [
+        {
+            "bus_index": 0,
+            "bus_name": "da_test",
+            "start_tick": 0,
+            "stop_tick": 0,
+            "start_value": 4,
+            "stop_value": 4,
+            "mode": "edge",
+            "value_select": 0,
+            "stop_value_select": 0,
+            "start_tick_coeffs": [],
+            "stop_tick_coeffs": [],
+        },
         {
             "bus_index": 0,
             "bus_name": "da_test",
             "start_tick": 10,
             "stop_tick": 15,
-            "start_value": 4,
+            "start_value": 0,
             "stop_value": 7,
             "mode": "ramp",
             "value_select": 0,
             "stop_value_select": 0,
             "start_tick_coeffs": [],
             "stop_tick_coeffs": [],
-        }
+        },
     ]
     roundtrip = na.RuntimeSequenceProgram.from_dict(program.to_dict())
     assert [segment.to_dict() for segment in (roundtrip.bus_segments or [])] == [
         segment.to_dict() for segment in (program.bus_segments or [])
     ]
     na.validate_pulse_streamer_program(program, max_edges=16, max_bus_segments=4, tick_width=32, channel_count=4)
+    # The WAVEFORM proves the ramp carries from the live register (code 4 = 0 V), not the baked 0:
+    from fpga.pulse_streamer.host.engine_model import bus_play
+    wave = bus_play(program, 0, 18, bus_width=3)
+    assert wave[0] == 4 and wave[10] == 4          # idle, then the carried 0 V entering the ramp
+    assert wave[12] < 7 and max(wave) == 7 and wave[17] == 7   # ramps up from the carried 4, lands +3 LSB, holds
 
 
 def _neg_delay_bus_state():
@@ -1273,11 +1293,13 @@ def test_dac_ramp_spans_current_period_with_hold_carry_and_edge_step():
     assert wave[160] == 512 and wave[199] == 512
 
 
-def test_looping_ramp_to_a_held_value_compiles_flat_not_a_per_loop_sawtooth():
-    """#ramp-loop: a [ramp V, hold V] DAC bus on a REPEAT_FOREVER program must hold FLAT at V.  The bus
-    steady-states at the END-of-frame value across the loop wrap, so period 0's ramp starts from the
-    looped-in V (flat), NOT from 0 V every iteration (the reported sawtooth bug: it compiled a 0->V ramp
-    re-run each loop).  A genuinely SINGLE-SHOT fire still ramps from the real idle 0 V."""
+def test_looping_ramp_to_a_held_value_carries_from_the_register_and_converges_flat():
+    """#ramp-carry: a ramp ALWAYS ramps from the engine's CURRENT value register, carried across the
+    frame/loop wrap (NOT a baked start).  For a looping [ramp V, hold V] this means the FIRST loop
+    ramps up from idle 0 V (a ramp IS a ramp -- the user's point), then the wrap carries V in, so every
+    later loop ramps V->V == FLAT V.  The bus thus CONVERGES to the held value rather than re-running a
+    0->V sawtooth each loop OR being statically flattened (which would break scan+ramp).  A single-shot
+    fire ramps from idle exactly like the first loop."""
     from fpga.pulse_streamer.host.engine_model import bus_play
     ch = [f"da[{i}]" for i in range(10)] + ["t"]
     state = na.PulseTableState(
@@ -1287,11 +1309,15 @@ def test_looping_ramp_to_a_held_value_compiles_flat_not_a_per_loop_sawtooth():
         time_step_ns=20.0, name="ramp_loop")
     state.set_analog_bus_mode(0, "da", "ramp", value=200)   # ramp to +200 (code 712)
     state.set_analog_bus_mode(1, "da", "hold")              # then hold it, looping
-    looped = bus_play(state.compile(clock_hz=50_000_000), 0, 100)        # repeat_forever=True (default)
-    assert all(w == 712 for w in looped), looped[:8]                     # FLAT at +200 every tick, no 0->V ramp
+    prog = state.compile(clock_hz=50_000_000)               # repeat_forever=True (default)
+    first = bus_play(prog, 0, 100)                          # FIRST loop: ramps up from idle 0 V
+    assert first[0] == 512                                  # enters at idle 0 V (code 512)
+    assert any(512 < w < 712 for w in first) and first[-1] == 712   # genuinely RAMPS up to +200
+    steady = bus_play(prog, 0, 100, seed_value=first[-1])   # next loop carries +200 IN across the wrap
+    assert all(w == 712 for w in steady)                    # ramp 200->200 == FLAT at +200 (converged)
+    # the single-shot fire ramps from idle just like the first loop
     single = bus_play(state.compile(clock_hz=50_000_000, repeat_forever=False), 0, 100)
-    assert single[0] == 512                                             # single-shot starts at idle 0 V (code 512)
-    assert any(512 < w < 712 for w in single) and max(single) >= 711    # ... and genuinely RAMPS up to +200
+    assert single[0] == 512 and single[-1] == 712
 
 
 def test_ttl_toggle_on_a_dac_bus_member_channel_stays_ttl_not_a_phantom_bus():
@@ -1508,9 +1534,9 @@ def test_pulse_table_scan_allows_analog_bus_ramp_with_timing_scan():
     ramps = [s for s in (program.bus_segments or []) if s.mode == "ramp"]
     assert ramps, "expected a ramp segment"
     r = ramps[0]
-    # fixed value endpoints (no scanned-endpoint value_select); wire codes on the
-    # 2-bit bus: carried-in 0 V = mid code 2, signed +1 -> code 3 ...
-    assert r.start_value == 2 and r.stop_value == 3 and r.value_select == 0
+    # the ramp START is the LIVE register (carry), so it is NOT baked (start_value 0, value_select 0);
+    # only the fixed STOP endpoint is set -- signed +1 -> code 3 on the 2-bit bus (#ramp-carry).
+    assert r.start_value == 0 and r.stop_value == 3 and r.value_select == 0
     # ... but affine ticks: the scanned-duration slot moves a ramp endpoint tick so
     # the ramp stretches in lockstep with the scan.
     assert any(c != 0 for c in (list(r.start_tick_coeffs or []) + list(r.stop_tick_coeffs or []))), \
@@ -2279,9 +2305,12 @@ def _rtl_bus_held_value(program, bus_index, tick, scan_point, *, bus_width=10):
         e_eff = eff(seg.stop_tick, getattr(seg, "stop_tick_coeffs", None))
         vstart, vstop = endpoint(seg, stop=False), endpoint(seg, stop=True)
         if str(seg.mode).lower() == "ramp" and e_eff > s_eff and tick < e_eff:
-            span, delta, k = e_eff - s_eff, abs(vstop - vstart), tick - s_eff
+            # ramp START = the CARRIED (current held) value, unless a SCANNED start endpoint overrides
+            # it; the ramp engine reads its live register, not a baked start (#ramp-carry).
+            rstart = vstart if int(getattr(seg, "value_select", 0) or 0) else value
+            span, delta, k = e_eff - s_eff, abs(vstop - rstart), tick - s_eff
             moves = min(delta, (k * delta) // span)
-            value = vstart + (moves if vstop >= vstart else -moves)
+            value = rstart + (moves if vstop >= rstart else -moves)
         else:
             value = vstop
     return value
@@ -2397,7 +2426,9 @@ def test_dac_ramp_endpoint_scan_compiles_and_tracks_every_point():
     assert len(ramps) == 1
     seg = ramps[0]
     zero = 1 << (2 - 1)                                # 2-bit bus: signed 0 -> code 2
-    assert int(seg.value_select) == 0 and int(seg.start_value) == 1 + zero  # carried edge 1
+    # the ramp START is the LIVE register (carry), so it is NOT baked (start_value 0); the engine
+    # carries in period 0's edge level (code 3) at runtime -- proven by the waveform below (#ramp-carry).
+    assert int(seg.value_select) == 0 and int(seg.start_value) == 0
     assert int(seg.stop_value_select) == 1             # stop endpoint reads scan slot 0
     s_tick, e_tick = int(seg.start_tick), int(seg.stop_tick)
     assert (s_tick, e_tick) == (10, 30)                # period-1 window in ticks
@@ -2416,10 +2447,12 @@ def test_dac_ramp_endpoint_scan_compiles_and_tracks_every_point():
             assert _rtl_bus_held_value(program, bus, s_tick + k, point_index, bus_width=2) == expect
 
 
-def test_dac_ramp_from_scanned_edge_carries_start_select():
-    """The OTHER direction: an edge bound to a slot followed by a literal-target ramp.
-    The ramp must START from the scanned level at runtime -- its value_select (start
-    endpoint) carries the slot, while the stop endpoint stays literal."""
+def test_dac_ramp_from_a_scanned_edge_carries_the_scanned_level_via_the_register():
+    """An edge bound to a scan slot followed by a literal-target ramp: the ramp must START from the
+    scanned edge level at runtime.  It does so via the CARRY -- the edge sets the engine register to the
+    scanned code and the ramp reads its current value (value_select 0, no baked start), NOT a baked
+    scanned start endpoint.  The WAVEFORM proves it: just before the ramp the bus holds that point's
+    scanned code at every scan point (#ramp-carry)."""
 
     state = na.PulseTableState(
         name="carry", channels=["b0", "b1", "t"],
@@ -2437,9 +2470,9 @@ def test_dac_ramp_from_scanned_edge_carries_start_select():
     assert len(ramps) == 1
     seg = ramps[0]
     zero = 1 << (2 - 1)
-    assert int(seg.value_select) == 1, "ramp start endpoint must carry the scanned slot"
+    assert int(seg.value_select) == 0, "the ramp carries from the register, not a baked scanned start"
     assert int(seg.stop_value_select) == 0 and int(seg.stop_value) == 1 + zero
-    # model: at each point the ramp starts FROM that point's scanned code
+    # model: at each point the ramp starts FROM that point's scanned edge code (carried in the register)
     for point_index, signed in enumerate([-2.0, 1.0]):
         code = int(signed) + zero
         assert _rtl_bus_held_value(program, int(seg.bus_index), int(seg.start_tick) - 1,
@@ -6739,7 +6772,11 @@ def test_steep_ramp_tracks_ideal_line_with_multi_lsb_bresenham_steps():
         sequence_id="ramp", sequence_name="ramp", clock_hz=50e6,
         channels=["a"], ticks=[0, 2000], masks=[1, 0],
         duration=2000 * 20e-9, trigger_count=0, repeat_forever=False,
-        bus_names=["da"], bus_segments=[RuntimeBusSegment(0, 0, 10, 0, 1023, "ramp", "da")],
+        bus_names=["da"],
+        # a ramp carries from the live register, so seed it at code 0 with an edge first, then the
+        # steep ramp sweeps 0 -> 1023 over 10 ticks (#ramp-carry).
+        bus_segments=[RuntimeBusSegment(0, 0, 0, 0, 0, "edge", "da"),
+                      RuntimeBusSegment(0, 0, 10, 0, 1023, "ramp", "da")],
     )
     na.validate_pulse_streamer_program(steep, channel_count=1)   # accepted, no raise
 
@@ -6829,7 +6866,9 @@ def test_signed_dac_user_layer_to_wire_codes_end_to_end():
     st.set_analog_bus_mode(1, "da", "ramp", value=300)
     prog = na.compile_runtime_program_for_payload(st, channels=ch, clock_hz=50e6)
     segs = [(s.mode, s.start_value, s.stop_value) for s in prog.bus_segments]
-    assert segs == [("edge", 312, 312), ("ramp", 312, 812)]   # codes = signed + 512
+    # codes = signed + 512: edge -200 -> 312, ramp TO 300 -> 812.  The ramp START is the live
+    # register (carries the edge 312 at runtime), so it is NOT baked -- start_value 0 (#ramp-carry).
+    assert segs == [("edge", 312, 312), ("ramp", 0, 812)]
     # user-facing views stay signed
     assert st.analog_bus_value_at_period_start(0, "da") == -200
     # an out-of-range signed value is rejected with the signed bounds in the message

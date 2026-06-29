@@ -440,7 +440,6 @@ def compile_pulse_table_runtime_program(
         state,
         slots=slot_values,
         time_step_ns=clock_step_ns,
-        loops=bool(repeat_forever),     # steady-state ramp baseline only when the frame loops (#ramp-loop)
     )
     # When buses are emitted as SEGMENTS, their (now nominal-phase) delay is realised by the
     # LITERAL per-bus delay line; pass the raw bus delays so they share the SAME global shift G
@@ -666,7 +665,6 @@ def compile_pulse_table_scan_runtime_program(
             time_step_ns=clock_step_ns,
             slot_vars=slot_vars,
             coeff_frac_bits=coeff_frac_bits,
-            loops=bool(repeat_forever),     # steady-state ramp baseline when the scan frame loops (#ramp-loop)
         )
         # Exclude from the TTL edge table ONLY the members of ANALOG buses (those bus-engine driven).
         # A channel in a bus group that is NOT an analog bus is a plain TTL bit and must STAY in the
@@ -2283,7 +2281,6 @@ def _pulse_table_bus_segments(
     time_step_ns: float,
     slot_vars: Sequence[str] | None = None,
     coeff_frac_bits: int = 8,
-    loops: bool = False,
 ) -> tuple[list[str], list[RuntimeBusSegment], dict[int, int]]:
     """Compile logical analog buses into hardware bus segments.
 
@@ -2352,28 +2349,27 @@ def _pulse_table_bus_segments(
         #             period END (a [start_i, start_{i+1}) segment); the RTL/engine
         #             interpolate within that window and hold v afterwards;
         #   hold   -> emit NO segment (the engine keeps the carried value).
-        # carried_value/carried_select describe the value entering the period; the ramp's
-        # START endpoint reads carried_select so a scanned hold/edge still scans the start.
-        # WIRE CONVERSION: plan values are SIGNED (0 = true 0 V); segments carry the
-        # offset-binary CODE = signed + zero_code.  The hardware idles at zero_code
-        # (BUS_SAFE_VALUE), so carried starts there -- an edge to signed 0 is a no-op.
+        # The value entering each period is the engine's LIVE register (carried across periods and
+        # across the frame/loop/scan wrap), so a ramp's START is NOT computed here -- the ramp engine
+        # reads its current value at runtime (#ramp-carry).  This is the one model correct for
+        # fire-once (ramp from idle), loop (converge to flat) AND scan (staircase from the prior point).
+        # WIRE CONVERSION: plan values are SIGNED (0 = true 0 V); segments carry the offset-binary
+        # CODE = signed + zero_code.  The hardware idles at zero_code (BUS_SAFE_VALUE).
         zero_code = 1 << (len(members) - 1)
 
-        def _emit(ramp_seed_value: int, ramp_seed_select: int, *, emit: bool = True):
-            """Walk this bus's periods, returning (segments, final_value, final_select).
+        def _emit():
+            """Walk this bus's periods, emitting one segment per edge/ramp period (hold emits none).
 
-            TWO carried-in trackers, because a looping program's loop-entry value (the END-of-frame
-            value the bus holds across the wrap) is NOT the idle 0 V of the very first fire (#ramp-loop):
-              * ``carried`` is the RAMP-START baseline -- seeded with ``ramp_seed`` (the loop-entry value
-                for a looping program), so a "ramp to V" entered with V already held compiles FLAT, not
-                a 0->V ramp re-run every loop.
-              * ``held`` is what the engine holds on the FIRST PLAY (always idle 0 V = zero_code).  The
-                edge no-op skip compares against THIS, so a period-0 edge is still emitted (it must set
-                the bus from idle on the first play) -- never dropped just because the looped-in baseline
-                already equals it.  Both update to the period's value after each period."""
+            The DAC value is CARRIED by the engine/hardware value register across periods AND across the
+            frame / loop / scan-point boundary (#ramp-carry).  A ramp therefore ALWAYS ramps from the
+            CURRENT register value -- the end of the previous period within a frame, or the previous
+            frame / scan-point across a wrap -- to its target, so the segment bakes NO start endpoint
+            (start_value / start_value_select = 0, ignored by the RTL ramp engine and the host mirror
+            alike).  An edge sets the register to its value; a hold persists it.  The compiler thus
+            never has to GUESS the carry: the first fire ramps from idle 0 V, a looping [ramp V, hold V]
+            converges to FLAT V (the wrap carries V in), and a SCANNED ramp staircases from the previous
+            scan point's value -- the one model that is correct for fire-once, loop AND scan."""
             bus_segs: list[RuntimeBusSegment] = []
-            carried_value, carried_select = ramp_seed_value, ramp_seed_select
-            held_value, held_select = zero_code, 0
             for period_index in range(len(state.periods)):
                 entry = plan[period_index] if period_index < len(plan) else {"mode": "hold", "value": None}
                 mode = str(entry.get("mode", "hold")).strip().lower()
@@ -2404,40 +2400,30 @@ def _pulse_table_bus_segments(
                 if start_ref < 0 or start_ref > table_end:
                     raise ValueError(f"analog bus {bus_name!r} produced segment tick {start_ref} outside the uploaded table.")
                 if mode == "edge":
-                    # Emit only when the level actually changes vs the FIRST-PLAY held value (idle 0 at
-                    # the start) -- an edge to the value the engine already holds is a no-op, so skipping
-                    # it keeps the segment table minimal; comparing against ``held`` (not the looped-in
-                    # ramp baseline) keeps a period-0 edge that sets the bus from idle (#ramp-loop).
-                    if emit and not (value_int == held_value and value_select == held_select):
-                        bus_segs.append(RuntimeBusSegment(
-                            bus_index, start_base, start_base, value_int, value_int, "edge", bus_name,
-                            value_select, _coeffs(start_coeffs), _coeffs(start_coeffs),
-                            stop_value_select=value_select,
-                        ))
-                else:  # ramp within THIS period: carried-in value -> value, over [start_i, start_{i+1})
+                    # Edge: step to value at the period start and HOLD it.  Always emitted -- with the
+                    # carried register an edge to the currently-held value is harmlessly redundant, but
+                    # under a loop / scan the held value differs per frame / point, so an edge must NOT
+                    # be STATICALLY dropped (e.g. a period-0 edge-to-0 that re-zeroes the bus each loop
+                    # is exactly what stops the previous frame's value carrying in) (#ramp-carry).
+                    bus_segs.append(RuntimeBusSegment(
+                        bus_index, start_base, start_base, value_int, value_int, "edge", bus_name,
+                        value_select, _coeffs(start_coeffs), _coeffs(start_coeffs),
+                        stop_value_select=value_select,
+                    ))
+                else:  # ramp from the CURRENT register value -> value, over [start_i, start_{i+1})
                     end_ref, end_base, end_coeffs = _boundary(period_index + 1)
                     if end_ref < start_ref:
                         raise ValueError(f"analog bus {bus_name!r} ramp end precedes its start.")
-                    if emit:
-                        bus_segs.append(RuntimeBusSegment(
-                            bus_index, start_base, end_base, carried_value, value_int, "ramp", bus_name,
-                            carried_select, _coeffs(start_coeffs), _coeffs(end_coeffs),
-                            stop_value_select=value_select,
-                        ))
-                carried_value, carried_select = value_int, value_select
-                held_value, held_select = value_int, value_select
-            return bus_segs, carried_value, carried_select
+                    # The ramp START is the LIVE register (carry) -- NOT baked: start_value=0,
+                    # start_value_select=0, ignored by the ramp engine, which reads its current value.
+                    bus_segs.append(RuntimeBusSegment(
+                        bus_index, start_base, end_base, 0, value_int, "ramp", bus_name,
+                        0, _coeffs(start_coeffs), _coeffs(end_coeffs),
+                        stop_value_select=value_select,
+                    ))
+            return bus_segs
 
-        # The RAMP-START baseline entering period 0: idle 0 V for a single-shot fire, but for a LOOPING
-        # program (repeat_forever) the END-of-frame value the bus holds across the wrap -- so a ramp to a
-        # value the previous frame already holds is FLAT, not a 0->V ramp re-run every loop (#ramp-loop;
-        # e.g. [ramp 500, hold 500] looping holds 500, not a sawtooth from 0).  The final carried is
-        # seed-independent, so one no-emit walk from idle finds the loop-entry value.
-        ramp_seed_value, ramp_seed_select = zero_code, 0
-        if loops:
-            _, ramp_seed_value, ramp_seed_select = _emit(zero_code, 0, emit=False)
-        bus_segs, _, _ = _emit(ramp_seed_value, ramp_seed_select)
-        segments.extend(bus_segs)
+        segments.extend(_emit())
     return bus_names, segments, bus_delays
 
 

@@ -854,12 +854,18 @@ def rtl_mirror_play_stale_seed(program, n_ticks: int, prior_count: int, *,
 
 
 def bus_play(program, bus_index: int, n_ticks: int, scan_point: int = 0, *,
-             bus_width: int = 10, frac_bits: int | None = None) -> list[int]:
+             bus_width: int = 10, frac_bits: int | None = None,
+             seed_value: int | None = None) -> list[int]:
     """Cycle-accurate mirror of zlc_edge_streamer.v's per-bus DAC engine
     (zlc_bus_start_table + zlc_bus_step + zlc_bus_apply_segment): the interpolating
-    ramp, the DUAL start/stop value_select (a ramp can scan BOTH endpoints), and the
-    affine segment ticks.  Returns bus_out at each tick for one scan point -- the
-    bus-path counterpart of reference_play (which covers only the digital edges)."""
+    ramp and the affine segment ticks.  Returns bus_out at each tick for one scan point
+    -- the bus-path counterpart of reference_play (which covers only the digital edges).
+
+    A ramp ALWAYS ramps from the engine's CURRENT value register (#ramp-carry), carried in
+    from the previous period.  The frame enters at idle 0 V on the FIRST fire, or at
+    ``seed_value`` -- the value held at the end of the previous frame / scan-point -- when the
+    caller chains frames to model the cross-wrap carry (a looping [ramp V, hold V] then
+    converges to FLAT V; a scanned ramp staircases from the prior scan point)."""
 
     frac = int(getattr(program, "scan_coeff_frac_bits", 8)) if frac_bits is None else frac_bits
     pts = list(getattr(program, "scan_points", None) or [])
@@ -879,29 +885,33 @@ def bus_play(program, bus_index: int, n_ticks: int, scan_point: int = 0, *,
         ve = (point[sss - 1] & mask) if sss else (int(s.stop_value) & mask)
         return vs, ve
 
-    # The bus rests at the SAFE mid-scale code (BUS_SAFE_VALUE in the RTL): the DAC
-    # driver is offset-binary, so mid-code = true 0 V.  An unwritten bus therefore
-    # idles at 0 V, and a tick-0 ramp carries IN from 0 V, exactly like the hardware.
+    # The bus rests at the SAFE mid-scale code (BUS_SAFE_VALUE in the RTL): the DAC driver is
+    # offset-binary, so mid-code = true 0 V.  The frame enters at idle 0 V on the first fire, or
+    # at ``seed_value`` (the previous frame / scan-point's end value) when chaining the carry.
     safe = 1 << (bus_width - 1)
-    st = {"idx": 0, "value": safe, "ramp": False, "rstart": 0, "rstop": 0,
+    st = {"idx": 0, "value": safe if seed_value is None else (int(seed_value) & mask),
+          "ramp": False, "rstart": 0, "rstop": 0,
           "target": 0, "denom": 0, "accum": 0, "up": True, "step": 0, "rem": 0}
 
     def apply(s):
-        vs, ve = endpoints(s)
+        vs, ve = endpoints(s)         # vs = scanned/baked START endpoint; ve = TARGET (stop) value
         ts = eff(s.start_tick, s.start_tick_coeffs)
         te = eff(s.stop_tick, s.stop_tick_coeffs)
         if str(s.mode).lower() == "ramp" and te > ts:
             # Bresenham split (mirrors zlc_bus_apply_segment): per-tick base step =
             # delta//span with the remainder feeding the carry accumulator, so a STEEP
             # ramp moves multiple LSBs per tick and tracks floor(k*delta/span) exactly.
+            # The ramp START: a SCANNED-start ramp (value_select set) reads its slot; otherwise the
+            # ramp carries from the engine's CURRENT register value -- the default (#ramp-carry).
+            vstart = vs if int(getattr(s, "value_select", 0)) else st["value"]
             span = te - ts
-            delta = (ve - vs) if ve >= vs else (vs - ve)
+            delta = (ve - vstart) if ve >= vstart else (vstart - ve)
             if span < delta:
                 step, rem = divmod(delta, span)
             else:
                 step, rem = 0, delta
-            st.update(value=vs, ramp=True, rstart=ts, rstop=te, target=ve, denom=span,
-                      accum=0, up=ve >= vs, step=step, rem=rem)
+            st.update(value=vstart, ramp=True, rstart=ts, rstop=te, target=ve, denom=span,
+                      accum=0, up=ve >= vstart, step=step, rem=rem)
         else:
             st.update(value=ve, ramp=False, accum=0)
 
@@ -972,20 +982,28 @@ def bus_value_at(program, bus_index: int, phase: int, scan_point: int = 0, *,
     def endval(sel, lit):
         return (int(point[sel - 1]) & mask) if sel else (int(lit) & mask)
 
+    safe = 1 << (bus_width - 1)
+    def seg_stop(s):
+        return endval(int(getattr(s, "stop_value_select", getattr(s, "value_select", 0))), s.stop_value)
+    # Track the value CARRIED INTO the chosen segment: idle (mid code) at the frame start, else the
+    # previous (superseded) segment's stop.  A ramp starts from THIS, not a baked endpoint (#ramp-carry).
     chosen = None
+    vstart = safe
     for s in sorted(segs, key=lambda s: eff(s.start_tick, s.start_tick_coeffs)):
         ts = eff(s.start_tick, s.start_tick_coeffs)
         if ts < phase or ts == 0:        # registered apply (ts shows at ts+1); seg@0 pre-applied
+            if chosen is not None:
+                vstart = seg_stop(chosen)
             chosen = s
         else:
             break
     if chosen is None:
-        return 1 << (bus_width - 1)   # rest = BUS_SAFE_VALUE (mid code = true 0 V)
+        return safe                   # rest = BUS_SAFE_VALUE (mid code = true 0 V)
     ts = eff(chosen.start_tick, chosen.start_tick_coeffs)
     te = eff(chosen.stop_tick, chosen.stop_tick_coeffs)
-    vstart = endval(int(getattr(chosen, "value_select", 0)), chosen.start_value)
-    stop_sel = int(getattr(chosen, "stop_value_select", getattr(chosen, "value_select", 0)))
-    vstop = endval(stop_sel, chosen.stop_value)
+    vstop = seg_stop(chosen)
+    if int(getattr(chosen, "value_select", 0)):        # a SCANNED-start ramp overrides the carry
+        vstart = endval(int(chosen.value_select), chosen.start_value)
     if str(chosen.mode).lower() == "ramp" and te > ts:
         if phase <= ts:
             return vstart
