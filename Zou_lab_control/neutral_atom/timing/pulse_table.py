@@ -1861,12 +1861,15 @@ def infer_bus_channels(
 
 
 def bus_period_levels(
-    plan: Sequence[Mapping[str, object]], starts: Sequence[int]
+    plan: Sequence[Mapping[str, object]], starts: Sequence[int], *, looping: bool = False
 ) -> list[tuple[int, int, int, int, str]]:
     """Per-period DAC levels with the WITHIN-PERIOD waveform semantics.
 
-    Walks the periods front-to-back carrying the current DAC value (it starts at 0
-    before the first period).  For each period returns
+    Walks the periods front-to-back carrying the current DAC value.  ``looping`` chooses the value
+    entering period 0: a single fire enters at idle 0 V (the default); a LOOPING program enters at the
+    steady-state the loop converges to -- the level of the last edge/ramp the frame leaves -- so a
+    looping ``[ramp V, hold V]`` shows FLAT V (the hardware carries V across the wrap), not the one-time
+    idle->V first frame (#ramp-carry).  For each period returns
     ``(start_tick, stop_tick, in_value, out_value, mode)`` where ``in_value`` is the
     value entering the period and:
 
@@ -1884,6 +1887,14 @@ def bus_period_levels(
     count = min(len(plan), max(0, len(starts) - 1))
     levels: list[tuple[int, int, int, int, str]] = []
     carried = 0
+    if looping:
+        # seed period 0 with the steady-state the loop converges to = the level of the LAST edge/ramp
+        # the frame leaves (edge/ramp set an absolute level; a trailing hold keeps it carried) (#ramp-carry).
+        for entry in plan[:count]:
+            mode = str(entry.get("mode", "hold")).strip().lower()
+            value = entry.get("value")
+            if value is not None and mode in {"edge", "ramp"}:
+                carried = int(value)
     for index in range(count):
         entry = plan[index]
         mode = str(entry.get("mode", "hold")).strip().lower()
@@ -1901,9 +1912,10 @@ def bus_period_levels(
     return levels
 
 
-def _analog_bus_value_at_tick(plan: Sequence[Mapping[str, object]], starts: Sequence[int], tick: int) -> int:
+def _analog_bus_value_at_tick(plan: Sequence[Mapping[str, object]], starts: Sequence[int], tick: int,
+                              *, looping: bool = False) -> int:
     tick = int(tick)
-    levels = bus_period_levels(plan, starts)
+    levels = bus_period_levels(plan, starts, looping=looping)
     if not levels:
         return 0
     for start_tick, stop_tick, in_value, out_value, mode in levels:

@@ -1320,6 +1320,23 @@ def test_looping_ramp_to_a_held_value_carries_from_the_register_and_converges_fl
     assert single[0] == 512 and single[-1] == 712
 
 
+def test_preview_is_loop_aware_so_a_looping_ramp_to_a_held_value_shows_flat():
+    """#ramp-carry preview: the GUI runs pulses forever, so bus_period_levels(looping=True) seeds period
+    0 with the loop's steady-state (the last edge/ramp the frame leaves).  A looping [ramp V, hold V]
+    then PREVIEWS flat V -- matching the bench -- while a single fire (looping=False) still shows the
+    one-time idle->V rise.  The within-frame carry is unchanged; only the period-0 entry value differs."""
+    from Zou_lab_control.neutral_atom.timing.pulse_table import bus_period_levels, _analog_bus_value_at_tick
+    plan = [{"mode": "ramp", "value": 500}, {"mode": "hold", "value": None}]
+    starts = [0, 10, 20]
+    once = bus_period_levels(plan, starts, looping=False)
+    assert (once[0][2], once[0][3], once[0][4]) == (0, 500, "ramp")          # single fire: in=idle 0 -> out=500
+    assert _analog_bus_value_at_tick(plan, starts, 0, looping=False) == 0    # enters at idle
+    loop = bus_period_levels(plan, starts, looping=True)
+    assert (loop[0][2], loop[0][3]) == (500, 500)                            # looping: in=carried 500 -> out=500 == flat
+    assert _analog_bus_value_at_tick(plan, starts, 5, looping=True) == 500   # flat across the (now no-op) ramp
+    assert _analog_bus_value_at_tick(plan, starts, 15, looping=True) == 500  # and the hold
+
+
 def test_ttl_toggle_on_a_dac_bus_member_channel_stays_ttl_not_a_phantom_bus():
     """#phantom-bus: toggling a channel that happens to be a MEMBER of a DAC bus group, while that
     group was NEVER made an analog bus (no set_analog_bus_mode), must drive it as a plain TTL bit --

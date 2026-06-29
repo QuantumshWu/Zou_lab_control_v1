@@ -521,8 +521,11 @@ def _analog_bus_traces(state: PulseTableState, *, include_always_off: bool = Tru
                 "min": lo_signed,
                 "max": hi_signed,
                 "starts": [tick * state.time_step_ns * 1e-9 for tick in bus_ticks],
+                # looping=True: the GUI runs the pulse forever (on_pulse), so the preview shows the
+                # STEADY STATE the loop converges to -- a looping [ramp V, hold V] reads FLAT V, matching
+                # what the bench actually outputs, not the one-time idle->V first frame (#ramp-carry).
                 "values": [
-                    _analog_bus_value_at_tick(plan, starts_steps, tick)
+                    _analog_bus_value_at_tick(plan, starts_steps, tick, looping=True)
                     for tick in bus_ticks[:-1]
                 ],
             }
