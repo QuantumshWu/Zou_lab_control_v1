@@ -156,7 +156,38 @@ proc zlc_force_latency2 {ip} {
     puts "ZLC LATENCY-CHECK OK: $ip port-B output registers (primitives+core) = true (RD_LAT=2)"
 }
 
-if {[file exists $project_dir]} { file delete -force $project_dir }
+if {[file exists $project_dir]} {
+    # The old project dir must go before we recreate it.  Inside a CLOUD-SYNC folder
+    # (Dropbox / OneDrive / Google Drive) the sync client holds open handles on Vivado's
+    # generated IP/output files, so a single `file delete -force` fails with "permission
+    # denied" -- with NO Vivado process running.  Retry a couple of times (the client may
+    # release mid-flush), then fail LOUDLY with the actual fix instead of a cryptic Tcl error.
+    set zlc_deleted 0
+    for {set zlc_i 0} {$zlc_i < 3 && !$zlc_deleted} {incr zlc_i} {
+        if {![catch {file delete -force $project_dir} zlc_del_err]} {
+            set zlc_deleted 1
+        } elseif {$zlc_i < 2} {
+            puts "ZLC WARN: cannot delete old project dir (attempt [expr {$zlc_i+1}]/3): $zlc_del_err"
+            puts "ZLC WARN: a cloud-sync client may be holding it open -- waiting 3 s, then retrying..."
+            after 3000
+        }
+    }
+    if {!$zlc_deleted} {
+        puts "ZLC ERROR: cannot delete the old Vivado project dir:"
+        puts "ZLC ERROR:   $project_dir"
+        puts "ZLC ERROR:   ($zlc_del_err)"
+        puts "ZLC ERROR: This is almost always a CLOUD-SYNC client (Dropbox / OneDrive / Google Drive)"
+        puts "ZLC ERROR: holding open handles on Vivado's generated files -- the build dir is inside a"
+        puts "ZLC ERROR: synced folder.  No Vivado process needs to be running for the lock to exist."
+        puts "ZLC ERROR: Fix it ONE of these ways, then rebuild:"
+        puts "ZLC ERROR:   1. Exclude fpga\\build from sync (recommended; keeps the in-repo build):"
+        puts "ZLC ERROR:        Dropbox -> mark fpga\\build 'ignored'; OneDrive -> 'Always keep off this device'."
+        puts "ZLC ERROR:   2. Build outside the synced folder for one run:"
+        puts "ZLC ERROR:        set ZLC_PS_BUILD_ROOT=C:\\zlc_build   (then run build_and_program.bat)"
+        puts "ZLC ERROR:   3. Pause the sync client, delete the dir by hand, then rebuild."
+        error "ZLC build aborted: old project dir is locked (see the ZLC ERROR lines above)."
+    }
+}
 file mkdir [file dirname $project_dir]
 create_project $project_name $project_dir -part $part -force
 set_property target_language Verilog [current_project]
