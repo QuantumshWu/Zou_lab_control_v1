@@ -60,6 +60,11 @@ else:
             # display-only panel (Monitor card, NO selectors) lets the dashboard
             # board scroll under the cursor instead of swallowing the wheel.
             self._zlc_isolate_wheel = bool(isolate_wheel)
+            # Pinned (the Edit snapshot): once ``pin_size()`` is called, every resync re-applies
+            # ``setFixedSize`` (min==max) instead of ``setMinimumSize``, so a deferred resync can never
+            # raise the floor past the fixed ceiling and balloon the figure (#4 edit-resize).  Default
+            # unpinned: a live card is held by its OWN ``setFixedSize`` wrapper, so it only needs a floor.
+            self._zlc_pinned = False
             # The figure's DESIGN dpi is the ONE canonical ``DESIGN_DPI`` -- the same dpi the layout
             # geometry was authored against (``create_axes_fixed`` sizes the figure as
             # ``pixels / design_dpi(fig)``, with ``design_dpi`` == DESIGN_DPI), so the displayed size
@@ -99,11 +104,25 @@ else:
             # ``setMinimumSize(sizeHint())`` at BUILD time; if that build ran before the layout settled
             # the floor is stale-too-big and would pin the canvas at the wrong size -- the exact "first
             # wrong, second right" trap (a resize cannot go below a stale minimum).  Re-assert it from
-            # the SAME source (sizeHint) to clear any stale floor...
-            self.setMinimumSize(self.sizeHint())
+            # the SAME source (sizeHint) to clear any stale floor...  When PINNED (Edit snapshot) min and
+            # max move TOGETHER to the settled sizeHint -- so resync corrects the size but can never let
+            # the floor exceed the ceiling and balloon the figure (#4 "改参数图变大小").
+            if self._zlc_pinned:
+                self.setFixedSize(self.sizeHint())
+            else:
+                self.setMinimumSize(self.sizeHint())
             self._zlc_sync()                           # 3) ...then resize again, now free of that floor
             self.updateGeometry()                      # 4) let the parent CARD re-measure us
             self.draw_idle()
+
+        def pin_size(self) -> None:
+            """Lock this canvas to a FIXED size (min==max) == its design ``sizeHint``, and KEEP it
+            locked across every later resync / showEvent.  The Edit snapshot uses this so a param edit
+            (which rebuilds the snapshot) can never let a deferred ``_zlc_resync`` raise the minimum
+            past the fixed maximum and balloon the figure -- min and max always move together to the
+            settled design size.  Idempotent; replaces a bare ``setFixedSize`` that resync would undo."""
+            self._zlc_pinned = True
+            self.setFixedSize(self.sizeHint())
 
         def showEvent(self, event):  # noqa: N802 - Qt naming
             # Re-establish the size invariants + redraw the FIRST time the canvas actually becomes

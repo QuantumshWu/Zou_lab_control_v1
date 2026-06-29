@@ -2950,10 +2950,19 @@ class PanelCard(FluentGroupBox):
         return {"fixed_lo": float(self.config.params.get("fixed_lo", 0.0)),
                 "fixed_hi": float(self.config.params.get("fixed_hi", 1.0))}
 
+    def _view_kwargs(self, kind: str) -> dict:
+        """The relim / limit view kwargs EVERY relim-capable kind passes to its plotter -- the ONE
+        source for BOTH the live build (``_build_plot``) and the Edit snapshot (``PanelEditor.rebuild``),
+        so no kind can silently omit relim/fixed.  This is exactly what regressed: the ``sites`` panel
+        omitted these in both builders, so a Site map's lim mode / fixed lo-hi never re-rendered (#4).
+        ``hist`` owns its own y-axis -> no relim."""
+        if kind == "hist":
+            return {}
+        return {"relim_mode": self._relim(), **self._fixed_lim_kwargs()}
+
     def _build_plot(self, value, namespace: Mapping[str, object] | None = None) -> None:
         if panel_canvas is None:
             raise RuntimeError("matplotlib Qt canvas is not available")
-        self._teardown_plot()
         kind = self.config.kind
         size = self.config.size
         label = self.config.title or PANEL_KINDS[kind]
@@ -2963,10 +2972,11 @@ class PanelCard(FluentGroupBox):
             if len(vec) != len(centers):
                 raise ValueError(
                     f"site-map value has {len(vec)} entries but the centers signal has {len(centers)} sites")
-            self.plotter = panel_plot(
+            plotter = panel_plot(
                 centers, vec, kind="sites", size=size, interactions=False,
                 image=image, roi_radius=site_ring_radius(centers),
                 cmap=str(self.config.params.get("cmap", "gray")),
+                **self._view_kwargs("sites"),
                 labels=("Camera x (px)", "Camera y (px)", label),
                 title=self.config.title or None)
         elif kind == "2d":
@@ -2987,25 +2997,23 @@ class PanelCard(FluentGroupBox):
                 xlabel, ylabel = "X (px)", "Y (px)"
             xx, yy = np.meshgrid(x0 + np.arange(nx, dtype=float), y0 + np.arange(ny, dtype=float))
             data_x = np.column_stack([xx.ravel(), yy.ravel()])
-            self.plotter = panel_plot(
+            plotter = panel_plot(
                 data_x, arr.ravel(), kind="2d", size=size, interactions=False,
                 cmap=str(self.config.params.get("cmap", "inferno")),
-                relim_mode=self._relim(),
-                **self._fixed_lim_kwargs(),
+                **self._view_kwargs("2d"),
                 labels=(xlabel, ylabel, ""), title=self.config.title or None)
         elif kind == "monitor":
             length = max(20, int(self.config.params.get("length", 300)))
             history = np.full(length, np.nan)
-            self.plotter = panel_plot(
+            plotter = panel_plot(
                 np.arange(length, dtype=float), history, kind="monitor", size=size, interactions=False,
                 show_dist=bool(self.config.params.get("show_dist", True)),
                 labels=("Shots ago", self._source_axis_label() or label, "Z"),
-                relim_mode=self._relim(),
-                **self._fixed_lim_kwargs(),
+                **self._view_kwargs("monitor"),
                 title=self.config.title or None)
-            self.plotter.roll(float(value), draw=False)
+            plotter.roll(float(value), draw=False)
         elif kind == "hist":
-            self.plotter = panel_plot(
+            plotter = panel_plot(
                 np.asarray(value, dtype=float), kind="hist", size=size, interactions=False,
                 bins=int(self.config.params.get("bins", 60)), ylog=bool(self.config.params.get("ylog", False)),
                 bimodal=bool(self.config.params.get("bimodal", True)),
@@ -3042,11 +3050,10 @@ class PanelCard(FluentGroupBox):
                     data_x, xlabel = x_arr, (self._axis_label_for(x_name) or "X")
                 else:
                     data_x, xlabel = np.arange(npts, dtype=float), "Site"
-            self.plotter = panel_plot(
+            plotter = panel_plot(
                 data_x, vec, kind="1d", size=size, interactions=False,
                 labels=(xlabel, ylabel, "Z"),
-                relim_mode=self._relim(),
-                **self._fixed_lim_kwargs(),
+                **self._view_kwargs("1d"),
                 title=self.config.title or None)
             # Colours cycle by column index inside Live1D (confocal-exact: grey, skyblue, ...; a lone
             # line is grey, every line alpha=1 / linewidth=1) -- no per-line styling needed here.
@@ -3054,9 +3061,14 @@ class PanelCard(FluentGroupBox):
             # reducing the measurement's repeat axis).  Apply it NOW (an in-place update with the same
             # data) so the "xN" shows on the first build too -- not only after the next live tick.
             rc = int(getattr(self, "_repeat_cur", 1))
-            self.plotter.repeat_cur = rc
+            plotter.repeat_cur = rc
             if rc != 1:
-                self.plotter.update(self.plotter.data_y, repeat_cur=rc, draw=False)
+                plotter.update(plotter.data_y, repeat_cur=rc, draw=False)
+        # Build-then-swap: only NOW that the new plotter is fully built do we tear down the OLD one
+        # and install the new -- a build error above (e.g. the sites length check) leaves the previous
+        # figure on the card, never a blank panel (#4 "图有时消失").
+        self._teardown_plot()
+        self.plotter = plotter
         # Monitor cards are display-only: NO selectors (interactions=False above)
         # and the wheel scrolls the board (isolate_wheel=False) instead of being
         # swallowed.  Interactive zoom / select lives in the Edit tab.
@@ -3938,48 +3950,53 @@ class PanelEditor(QtWidgets.QWidget):
         if card.plotter is None:
             self.status.setText("open the panel with data first")
             return
-        self.teardown()
         src = card.plotter
         kind = card.config.kind
         size = card.config.size          # mirror the Monitor frame, never force 2x4
         title = card.config.title or PANEL_KINDS[kind]
-        relim = card._relim()
+        view = card._view_kwargs(kind)   # ONE source: relim mode + fixed lo/hi -- for sites too (#4)
         cmap = str(card.config.params.get("cmap", "gray" if kind == "sites" else "inferno"))
         try:
             if kind == "2d":
-                self._plotter = panel_plot(np.array(src.data_x, dtype=float),
-                                           np.array(src.data_y[:, 0], dtype=float), kind="2d",
-                                           size=size, cmap=cmap, relim_mode=relim,
-                                           labels=tuple(src.labels), title=title)
+                new_plotter = panel_plot(np.array(src.data_x, dtype=float),
+                                         np.array(src.data_y[:, 0], dtype=float), kind="2d",
+                                         size=size, cmap=cmap, **view,
+                                         labels=tuple(src.labels), title=title)
             elif kind == "sites":
-                self._plotter = panel_plot(np.array(src.data_x[:, :2], dtype=float),
-                                           np.array(src.data_y[:, 0], dtype=float), kind="sites",
-                                           size=size, image=getattr(src, "background", None),
-                                           roi_radius=getattr(src, "roi_radius", 3.0), cmap=cmap,
-                                           labels=tuple(src.labels), title=title)
+                new_plotter = panel_plot(np.array(src.data_x[:, :2], dtype=float),
+                                         np.array(src.data_y[:, 0], dtype=float), kind="sites",
+                                         size=size, image=getattr(src, "background", None),
+                                         roi_radius=getattr(src, "roi_radius", 3.0), cmap=cmap, **view,
+                                         labels=tuple(src.labels), title=title)
             elif kind == "hist":
-                self._plotter = panel_plot(np.array(src.values, dtype=float), kind="hist", size=size,
-                                           bins=int(card.config.params.get("bins", 60)),
-                                           bimodal=bool(card.config.params.get("bimodal", True)),
-                                           ylog=bool(card.config.params.get("ylog", False)),
-                                           labels=tuple(src.labels), title=title)
+                new_plotter = panel_plot(np.array(src.values, dtype=float), kind="hist", size=size,
+                                         bins=int(card.config.params.get("bins", 60)),
+                                         bimodal=bool(card.config.params.get("bimodal", True)),
+                                         ylog=bool(card.config.params.get("ylog", False)),
+                                         labels=tuple(src.labels), title=title)
             else:  # 1d / monitor -> a line snapshot (monitor honours its show_dist toggle)
                 extra = {"show_dist": bool(card.config.params.get("show_dist", True))} if kind == "monitor" else {}
-                self._plotter = panel_plot(np.array(src.data_x[:, 0], dtype=float),
-                                           np.array(src.data_y[:, 0], dtype=float),
-                                           kind=kind, size=size, relim_mode=relim, **extra,
-                                           labels=tuple(src.labels), title=title)
+                new_plotter = panel_plot(np.array(src.data_x[:, 0], dtype=float),
+                                         np.array(src.data_y[:, 0], dtype=float),
+                                         kind=kind, size=size, **view, **extra,
+                                         labels=tuple(src.labels), title=title)
         except Exception as exc:
             self.status.setText(f"could not snapshot: {str(exc).splitlines()[0][:120]}")
-            return
+            return                       # build failed -> keep the LAST good snapshot, never blank (#4 "图有时消失")
+        # Build-then-swap: the new plotter built cleanly, so ONLY NOW tear down the old snapshot and
+        # install the new -- a failed rebuild above left the previous figure intact.
+        self.teardown()
+        self._plotter = new_plotter
         self._canvas = panel_canvas(self._plotter.fig)
         # The Edit page lives in a SCROLL AREA.  A bare minimum size lets the scroll-area layout
         # STRETCH the canvas taller than the figure (and a hi-DPI re-sync round can then keep growing
         # it across rebuilds -- the "scroll bins a few times and the image balloons / cuts off" bug).
         # Pin it to a FIXED size = the figure's own design size (the same non-growable contract the
         # Monitor card uses): the page SCROLLS when the figure is taller than the viewport, but the
-        # snapshot can never squish (clip) NOR grow.  Idempotent across rebuilds (#4 edit-resize).
-        self._canvas.setFixedSize(self._canvas.sizeHint())
+        # snapshot can never squish (clip) NOR grow.  pin_size() also KEEPS it fixed across the canvas's
+        # own deferred _zlc_resync / showEvent (a bare setFixedSize was re-opened by resync's
+        # setMinimumSize, ballooning the figure across param edits -- #4 edit-resize).
+        self._canvas.pin_size()
         self.canvas_holder.addWidget(self._canvas, alignment=QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop)
         self._canvas.draw_idle()
         self._df = None

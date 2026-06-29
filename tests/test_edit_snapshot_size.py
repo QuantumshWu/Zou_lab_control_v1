@@ -1,7 +1,15 @@
-"""#4 edit-resize: the per-panel Edit tab's snapshot canvas must be a FIXED size = the figure's design
-size, so repeated rebuilds (e.g. scrolling the bins param, which is a structure knob that re-snapshots)
-keep it identical -- it can neither be stretched taller by the scroll-area layout (the reported "image
-balloons / cuts off after a few bin turns") nor squished below the figure."""
+"""#4 Edit-snapshot ROBUSTNESS guards (the per-panel Edit tab's interactive snapshot):
+
+1. FIXED size = the figure's design size, so repeated rebuilds (e.g. scrolling the bins param, a
+   structure knob that re-snapshots) keep it identical -- it can neither be stretched taller by the
+   scroll-area layout (the reported "image balloons / cuts off after a few bin turns") nor squished.
+2. the pin SURVIVES the canvas's own deferred ``_zlc_resync`` (what a showEvent fires): resync
+   re-applies setFixedSize (min==max) when pinned, so it can never raise the floor past the ceiling
+   and balloon the figure (symptom "改参数图变大小").
+3. a Site map snapshot honours its lim mode (tight/normal) AND fixed lo/hi -- the ``sites`` branch
+   used to OMIT relim/fixed in the snapshot builder, so a sitemap's lim never re-rendered (symptom 3).
+4. a rebuild that RAISES mid-build keeps the LAST good snapshot, never a blank holder -- build-then-swap
+   tears the old figure down only after the new one built cleanly (symptom "图有时消失")."""
 
 from __future__ import annotations
 
@@ -63,6 +71,108 @@ def test_edit_snapshot_canvas_is_fixed_size_and_idempotent_across_bin_rebuilds()
         cv = editor._canvas
         assert (cv.width(), cv.height()) == size0, "Edit snapshot canvas changed size across bin rebuilds"
         assert cv.minimumSize() == cv.maximumSize(), "snapshot canvas must stay FIXED, not growable"
+    finally:
+        console.shutdown()
+        exp.close()
+
+
+def _console():
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
+    exp = na.connect("virtual", sitemap={"grid_shape": (2, 3)})
+    console = TaskConsole(hub=SignalHub(), state=default_console_state(), session=exp,
+                          measurements=exp.readout.measurement_specs(),
+                          processors=exp.readout.processor_specs(), window_px=(900, 600))
+    console._timer.stop()
+    console.refresh_once = lambda: None        # the editor's pre-snapshot refresh must not clear the plotter
+    return exp, console
+
+
+def _hist_card(console):
+    from Zou_lab_control.frontend import panel_plot
+    from Zou_lab_control.frontend.task_console import PanelConfig, GAP
+    vals = np.concatenate([np.random.default_rng(0).normal(300.0, 20.0, 400),
+                           np.random.default_rng(1).normal(460.0, 20.0, 300)])
+    card = console._new_panel_card(PanelConfig(kind="hist", title="dis", source="counts",
+                                               row=GAP, col=GAP, size="2x4"))
+    console._attach_card(card)
+    card.plotter = panel_plot(vals, kind="hist", size="2x4", bins=60, title="dis")
+    return card
+
+
+def test_edit_snapshot_canvas_stays_fixed_after_a_resync():
+    """#4 symptom 1: the snapshot canvas's own deferred ``_zlc_resync`` (what a showEvent fires) must
+    KEEP it pinned.  When pinned it re-applies setFixedSize (min==max); the old code re-published
+    setMinimumSize(sizeHint()), which could raise the floor past the fixed ceiling and balloon the
+    figure across param edits."""
+    ensure_qt_app()
+    from Zou_lab_control.frontend.task_console import PanelEditor
+    exp, console = _console()
+    try:
+        editor = PanelEditor(_hist_card(console), console)
+        editor.rebuild()
+        cv = editor._canvas
+        assert cv is not None and cv.minimumSize() == cv.maximumSize()      # pinned at build
+        before = (cv.minimumSize().width(), cv.minimumSize().height())
+        cv._zlc_resync()                                                    # the deferred resync a showEvent fires
+        assert cv.minimumSize() == cv.maximumSize(), "resync must keep the pinned snapshot FIXED (no balloon)"
+        assert (cv.minimumSize().width(), cv.minimumSize().height()) == before
+    finally:
+        console.shutdown()
+        exp.close()
+
+
+def test_edit_sites_snapshot_honours_relim_and_fixed_lim():
+    """#4 symptom 3: the Edit snapshot of a Site map must re-render when its lim mode (tight/normal) OR
+    fixed lo/hi changes.  The ``sites`` branch used to OMIT relim/fixed in the snapshot builder, so a
+    sitemap's lim never updated (other kinds did).  ``_view_kwargs`` now carries them for EVERY kind."""
+    ensure_qt_app()
+    from Zou_lab_control.frontend import panel_plot
+    from Zou_lab_control.frontend.task_console import PanelConfig, GAP, PanelEditor
+    exp, console = _console()
+    try:
+        centers = np.column_stack([(np.arange(6) % 3) * 5.0, (np.arange(6) // 3) * 5.0])
+        occ = np.random.default_rng(0).random(6)
+        img = np.random.default_rng(1).normal(300.0, 20.0, (24, 30))
+        card = console._new_panel_card(PanelConfig(kind="sites", title="map", source="occupied",
+                                                   row=GAP, col=GAP, size="2x4"))
+        console._attach_card(card)
+        card.plotter = panel_plot(centers, occ, kind="sites", size="2x4", image=img,
+                                  roi_radius=4.0, labels=("x", "y", "occ"), title="map")
+        editor = PanelEditor(card, console)
+        editor.rebuild()
+        # relim mode reaches the SITES snapshot (was ignored): a real Edit-param edit re-snapshots.
+        editor._edit_param("relim", "tight")
+        assert editor._plotter.relim_mode == "tight"
+        editor._edit_param("relim", "normal")
+        assert editor._plotter.relim_mode == "normal"
+        # fixed lo/hi reaches the sites snapshot too (the snapshot omitted fixed for ALL kinds).
+        card.config.params.update({"relim": "fixed", "fixed_lo": 120.0, "fixed_hi": 480.0})
+        editor.rebuild()
+        assert editor._plotter.relim_mode == "fixed"
+        assert float(editor._plotter.fixed_lo) == 120.0 and float(editor._plotter.fixed_hi) == 480.0
+    finally:
+        console.shutdown()
+        exp.close()
+
+
+def test_edit_rebuild_keeps_last_good_snapshot_on_build_error(monkeypatch):
+    """#4 symptom 2: a rebuild that RAISES mid-build must leave the PREVIOUS snapshot installed, never a
+    blank holder -- build-then-swap tears the old figure down only after the new one built cleanly."""
+    ensure_qt_app()
+    import Zou_lab_control.frontend.task_console as tc
+    exp, console = _console()
+    try:
+        editor = tc.PanelEditor(_hist_card(console), console)
+        editor.rebuild()
+        good_canvas = editor._canvas
+        assert good_canvas is not None
+        monkeypatch.setattr(tc, "panel_plot", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("forced build error")))
+        editor.rebuild()                                                    # build raises mid-rebuild
+        assert editor._canvas is good_canvas, "a failed rebuild must keep the last good snapshot, not blank it"
+        assert editor._plotter is not None
+        assert "could not snapshot" in editor.status.text().lower()
     finally:
         console.shutdown()
         exp.close()
