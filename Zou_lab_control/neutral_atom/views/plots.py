@@ -82,7 +82,11 @@ def plot_detection_image(
     display: bool = True,
     **kwargs,
 ):
-    """Plot raw camera data with faint sitemap rings and occupied-site rings."""
+    """Plot the camera frame with faint (empty) / bold (occupied) site rings.
+
+    The ring art is NOT hard-coded here: this routes through the frontend's sealed ``site_map``
+    view, whose rings come from the single ``SITE_OCCUPANCY_STYLE`` source (a ``LiveSiteMap``).
+    ``None`` when headless / the registered plotter has no ``site_map``."""
 
     centers = np.asarray(centers, dtype=float)
     occupied = np.asarray(occupied, dtype=bool).reshape(-1)
@@ -92,26 +96,11 @@ def plot_detection_image(
         raise ValueError("occupied must have one value per site center.")
 
     plotter = active_plotter()
-    if plotter is None:
+    site_map = getattr(plotter, "site_map", None)
+    if site_map is None:
         return None
-
-    plot = plot_image(image, labels=labels, display=False, **kwargs)
-    if plot is None:
-        return None
-    radius = _site_radius(roi_radius)
-    for x, y in centers[:, :2]:
-        plot.ax.add_patch(
-            Circle((x, y), radius, facecolor="none", edgecolor="#7EA5A3", linewidth=0.45, alpha=0.24, zorder=4)
-        )
-    for x, y in centers[occupied, :2]:
-        plot.ax.add_patch(
-            Circle((x, y), radius, facecolor="none", edgecolor="#D07850", linewidth=0.85, alpha=0.94, zorder=5)
-        )
-    if display:
-        plotter.display_figure(plot.fig)
-    else:
-        _draw_now(plot.fig)
-    return plot
+    return site_map(centers[:, :2], occupied, image=image, roi_radius=_site_radius(roi_radius),
+                    labels=labels, display=display, **kwargs)
 
 
 def plot_site_values(centers, values, *, labels=("Camera x (px)", "Camera y (px)", "Value"), display: bool = True, **kwargs):

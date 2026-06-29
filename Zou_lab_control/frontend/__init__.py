@@ -108,6 +108,19 @@ def __getattr__(name: str):
     raise AttributeError(name)
 
 
+def site_map(centers, occupied, *, image=None, roi_radius=3.0,
+             labels=("Camera x (px)", "Camera y (px)", "Counts"), display=True, **kwargs):
+    """The sealed site-map view: a camera frame (``image=``) with one hollow ring per tweezer, FAINT
+    when empty / BOLD when occupied -- the rings come from the single ``SITE_OCCUPANCY_STYLE`` source
+    (a :class:`~.live.LiveSiteMap`, via the ``"sites"`` plot kind).  The experiment layer's
+    ``views.plots`` routes its detection-image overlay through THIS so it never hard-codes ring art
+    itself; ``roi_radius`` is the ring radius in camera pixels (#C2)."""
+    import numpy as _np
+    occ = _np.asarray(occupied, dtype=float).reshape(-1, 1)
+    return plot(centers, occ, kind="sites", image=image, roi_radius=roi_radius,
+                labels=labels, display=display, **kwargs)
+
+
 def _register_neutral_atom_viewer() -> None:
     """Register this frontend as the experiment layer's viewer.
 
@@ -124,7 +137,7 @@ def _register_neutral_atom_viewer() -> None:
         from .calibration_report import save_calibration_report
 
         register_plotter(SimpleNamespace(plot=plot, display_figure=display_figure, run=run,
-                                         save_calibration_report=save_calibration_report))
+                                         site_map=site_map, save_calibration_report=save_calibration_report))
     except (ImportError, ModuleNotFoundError):  # pragma: no cover - optional deps absent: never block import
         pass
     except Exception as exc:  # a REAL registration break must SURFACE (warn), not silently vanish
