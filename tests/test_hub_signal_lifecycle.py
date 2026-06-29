@@ -141,18 +141,18 @@ def test_live_switch_that_drops_outputs_purges_orphans_without_a_rebuild():
         exp.close()
 
 
-def test_node_error_health_signal_is_not_purged_as_an_orphan():
-    """The reserved per-node ``*node_error`` health channel (published by the node loop, read by the
-    console banner -- NOT a declared output) must survive the orphan GC even though no provider lists
-    it, else a wedged node's banner signal would be churned away every tick."""
+def test_orphan_gc_purges_every_unowned_signal_with_no_exception():
+    """The orphan GC removes EVERY hub signal no live producer publishes -- with no special-case
+    exemption.  (A node error is surfaced via instance attrs + the banner, never as a hub signal, so
+    there is no reserved 'node_error' channel to keep; this pins that the GC has no carve-out left.)"""
     import numpy as np
     exp, console = _console()
     try:
-        console.hub.publish({"node_error": 2.0})               # a health counter, no producer in providers
+        console.hub.publish({"stray": 2.0, "occupied": np.zeros(6)})   # neither has a live producer
         console.running_nodes = []
         console._signal_info_sig = None                        # force the GC to run this call
         console._refresh_signal_info()
-        assert "node_error" in console.hub.names()             # reserved channel kept (not an orphan)
+        assert console.hub.names() == []                       # both orphans purged, no exception
     finally:
         console.shutdown()
         exp.close()

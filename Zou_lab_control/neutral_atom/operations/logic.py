@@ -271,20 +271,20 @@ class LogicNode:
                 except Exception as exc:
                     if self._stop.is_set():
                         return  # asked to stop mid-shot -- a clean exit, not a fault
-                    # A wedged source must not kill the daemon silently mid-run, but
-                    # it must NOT fail silently either: record the error + a running
-                    # count and publish the count so the console raises a banner
-                    # (the operator otherwise just sees frozen, stale data).
+                    # A wedged source must not kill the daemon silently mid-run, but it must NOT fail
+                    # silently either: record the error + a running count ON THE INSTANCE.  The console's
+                    # _update_summary reads these (last_error / consecutive_errors) EVERY tick (timer-driven,
+                    # not version-gated) and raises the banner -- so the error is surfaced WITHOUT putting a
+                    # synthetic "node_error" value on the hub (which had no reader, yet showed up as an
+                    # "(unbound)" signal in every picker, #5).
                     self.last_error = f"{type(exc).__name__}: {exc}"
                     self.consecutive_errors += 1
-                    self.hub.publish({self.prefix + "node_error": float(self.consecutive_errors)})
                     self._stop.wait(period)
                     continue
                 if self.consecutive_errors:
                     # Recovered: clear the banner so a transient hiccup doesn't stick.
                     self.last_error = None
                     self.consecutive_errors = 0
-                    self.hub.publish({self.prefix + "node_error": 0.0})
                 remaining = period - (time.monotonic() - started)
                 if remaining > 0:
                     self._stop.wait(remaining)

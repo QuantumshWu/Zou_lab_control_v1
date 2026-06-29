@@ -18,9 +18,9 @@ import numpy as np
 
 DEFAULT_HISTORY = 2048
 
-#: A sample that belongs to NO acquisition shot -- a free-running scalar (loading rate), a health
-#: counter (node_error), a static aux (centers / thresholds).  It never groups into a coherent display
-#: shot, so a panel bound to it is shown best-effort (latest) and never blocks the shot clock (#shot-clock).
+#: A sample that belongs to NO acquisition shot -- a free-running scalar (loading rate) or a static aux
+#: (centers / thresholds).  It never groups into a coherent display shot, so a panel bound to it is shown
+#: best-effort (latest) and never blocks the shot clock (#shot-clock).
 NO_LINEAGE = -1
 
 
@@ -221,7 +221,7 @@ class SignalHub:
                 value = ring[-1]                      # default: latest (NO_LINEAGE / not-present-at-target)
                 src = self._src.get(name)
                 # Only a LINEAGE signal can resolve to a specific shot.  A free-running NO_LINEAGE signal
-                # (loading rate / node_error / a static aux) belongs to NO shot, so it always stays at its
+                # (loading rate / a static aux) belongs to NO shot, so it always stays at its
                 # latest -- skip the scan entirely.  (Its whole ring is NO_LINEAGE, so the early-break below
                 # would never fire and the loop would walk the FULL ring EVERY tick; combined with deque
                 # indexing -- O(n) per element -- that was an O(n^2) per-signal freeze of the GUI thread.)

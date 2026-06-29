@@ -5215,13 +5215,14 @@ class TaskConsole(QtWidgets.QWidget):
         # entry run-after-run.  ``providers`` is the single source of "who publishes what" (running nodes +
         # stopped-but-kept rows via _last_node + declared rows); a hub name absent from it has no owner ->
         # purge.  A STOPPED node's signals are KEPT (its row is still a provider via _last_node -- a finished
-        # scan stays plottable).  The reserved per-node health channel (``*node_error``, read by the banner,
-        # not a declared output) is never an orphan.  This runs only when the provider map / card sources
-        # CHANGED (the guard above), which a SWITCH does even with no rebuild: a live ``frames_per_cycle``
-        # 3->1 shrinks a running camera's published set {frame_0,1,2}->{frame_0}, dropping frame_1/frame_2
-        # from ``providers`` -> they are caught here (the eager purges in _start/_remove_logic_node cover the
-        # rebuild / remove paths synchronously; THIS catches every remaining path, switches included).
-        orphans = [n for n in self.hub.names() if n not in providers and not n.endswith("node_error")]
+        # scan stays plottable).  (A node error is surfaced via instance attrs + the banner, never as a hub
+        # signal, so there is no reserved health channel to exempt here.)  This runs only when the provider
+        # map / card sources CHANGED (the guard above), which a SWITCH does even with no rebuild: a live
+        # ``frames_per_cycle`` 3->1 shrinks a running camera's published set {frame_0,1,2}->{frame_0},
+        # dropping frame_1/frame_2 from ``providers`` -> they are caught here (the eager purges in
+        # _start/_remove_logic_node cover the rebuild / remove paths synchronously; THIS catches every
+        # remaining path, switches included).
+        orphans = [n for n in self.hub.names() if n not in providers]
         if orphans:
             self.hub.remove_signals(orphans)
         for card in self.cards:

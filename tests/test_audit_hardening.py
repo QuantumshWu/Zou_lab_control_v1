@@ -45,8 +45,10 @@ def test_hub_tracks_per_signal_version():
 
 # --------------------------------------------------------------------------- M7
 def test_wedged_node_surfaces_error_not_silent():
-    """A node whose source raises must record the error + publish a health signal,
-    never freeze silently."""
+    """A node whose source raises must record the error ON THE INSTANCE (last_error +
+    consecutive_errors), never freeze silently -- the console's _update_summary reads these every tick
+    and raises the banner.  It must NOT put a synthetic 'node_error' value on the hub: that had no
+    reader and only showed up as an '(unbound)' signal in every picker (#5)."""
     hub = SignalHub()
 
     class BoomNode(LogicNode):
@@ -60,7 +62,7 @@ def test_wedged_node_surfaces_error_not_silent():
             time.sleep(0.01)
         assert node.last_error is not None and "trigger never arrived" in node.last_error
         assert node.consecutive_errors >= 1
-        assert "node_error" in hub.names()
+        assert hub.names() == []                 # the error stays OFF the hub -- no "(unbound)" pollution
     finally:
         node.stop()
 
