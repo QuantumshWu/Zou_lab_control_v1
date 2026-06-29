@@ -2908,9 +2908,19 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         # editor unsynced, the same dirty path the scan-code editor uses.
         self.scan_repeats_spin.valueChanged.connect(self._mark_dirty)
         run_row.addWidget(self.scan_repeats_spin)
+        # Stop the running scan and HOLD the current point (#1): reload a single-point program built from
+        # exactly the scan point the device is on RIGHT NOW and loop it forever (NOT seamless -- a fresh
+        # load of that one point), so the experiment parks on the current setpoint.  Re-Run to resume.
+        self.scan_hold_button = FluentButton("Stop ▸ hold point", color=RED)
+        self.scan_hold_button.setFixedHeight(_row_height())
+        self.scan_hold_button.setToolTip(
+            "Stop the running scan and HOLD the CURRENT scan point: reloads a single-point pulse built "
+            "from that point's values and loops it forever.  Re-run the Scan to resume sweeping.")
+        self.scan_hold_button.clicked.connect(self._stop_scan_to_current_point)
+        run_row.addWidget(self.scan_hold_button)
         # Live scan-position readout (#4): a QTimer polls the connected sequencer's scan_progress()
-        # while a scan runs and writes this label (single-source text via _format_scan_progress);
-        # blank when idle / no sequencer.
+        # while a scan runs and writes this label (single-source text via _format_scan_progress) PLUS the
+        # current point's VALUES (#1 "show the current scan points"); blank when idle / no sequencer.
         self.scan_progress_label = FluentLabel("")
         run_row.addWidget(self.scan_progress_label, 1)
         info_layout.addLayout(run_row)
@@ -3023,7 +3033,82 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 progress = reader()
             except Exception:
                 progress = None
-        label.setText(_format_scan_progress(progress))
+        # When HELD (Stop ▸ hold point), show the frozen point; otherwise the live position PLUS the
+        # current point's VALUES so the running scan point is visible, not just its index (#1).
+        held = getattr(self, "_held_scan_point", None)
+        if held is not None:
+            label.setText(self._held_scan_point_text(held))
+        else:
+            label.setText(_format_scan_progress(progress) + self._current_scan_point_text(progress))
+
+    @staticmethod
+    def _freeze_state_to_scan_point(state, point_index: int):
+        """Return a STATIC copy of ``state`` holding exactly scan point ``point_index`` -- the program the
+        Stop button reloads to HOLD the current point's pulse, looped forever.  BAKES that point's slot
+        values into their targets (period duration / DAC level, waveform mode preserved) and CLEARS the
+        scan via ``with_slots_resolved`` (a 1-row scan_table would degrade to the slots' NOMINALS, not
+        the held values).  ``slot_point_ns`` is the same per-point resolve ``reference_slots`` uses.
+        Testable without the GUI."""
+        table = list(getattr(state, "scan_table", None) or [])
+        if not table:
+            frozen = state.__class__.from_dict(state.to_dict())
+            frozen.scan_repeats = 0
+            return frozen
+        k = max(0, min(int(point_index), len(table) - 1))
+        frozen = state.with_slots_resolved(state.slot_point_ns(k))
+        frozen.scan_repeats = 0
+        return frozen
+
+    def _scan_point_values_text(self, row) -> str:
+        labels = [_scan_slot_label(self.state, i) for i in range(len(getattr(self.state, "scan_slots", None) or []))]
+        parts = [f"{(labels[i] if i < len(labels) else f'slot{i}')}={float(v):g}" for i, v in enumerate(row)]
+        return ("[" + ", ".join(parts) + "]") if parts else ""
+
+    def _current_scan_point_text(self, progress) -> str:
+        """The CURRENT scan point's VALUES (#1) at the live position -- looked up in the streaming table."""
+        table = list(getattr(self.state, "scan_table", None) or [])
+        if not progress or not table:
+            return ""
+        try:
+            k = int(progress.get("point", 0) or 0)
+        except Exception:
+            return ""
+        return ("  " + self._scan_point_values_text(table[k])) if 0 <= k < len(table) else ""
+
+    def _held_scan_point_text(self, held) -> str:
+        k, row, total = held
+        return f"held at point {int(k) + 1}/{int(total)}: {self._scan_point_values_text(row)}"
+
+    def _stop_scan_to_current_point(self) -> None:
+        """#1: stop the running scan and HOLD the current scan point -- reload a single-point program
+        built from exactly that point's values and loop it forever (not seamless).  Re-Run to resume."""
+        if self.sequencer is None:
+            self._message("No sequencer attached.")
+            return
+        try:
+            progress = self.sequencer.scan_progress() if hasattr(self.sequencer, "scan_progress") else {}
+        except Exception:
+            progress = {}
+        state = self.read_state()
+        table = list(getattr(state, "scan_table", None) or [])
+        if not table:
+            self._message("No scan table to hold -- run a scan first.")
+            return
+        try:
+            k = max(0, min(int((progress or {}).get("point", 0) or 0), len(table) - 1))
+        except Exception:
+            k = 0
+        frozen_row = list(table[k])              # the raw row (for the readout); device gets the baked state
+        frozen = self._freeze_state_to_scan_point(state, k)
+        try:
+            self.sequencer.prepare(frozen)
+            self.sequencer.fire()
+            self.stateui_manager.runstate = PulseStateUIManager.RunState.RUNNING
+            self._held_scan_point = (k, frozen_row, len(table))
+            self._message(f"Scan held at point {k + 1}/{len(table)}: {self._scan_point_values_text(frozen_row)}")
+        except Exception as exc:
+            self.stateui_manager.runstate = PulseStateUIManager.RunState.ERROR
+            self._message(str(exc))
 
     def _refresh_scan_tab(self) -> None:
         if not hasattr(self, "scan_slots_label"):
@@ -3630,6 +3715,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
 
     def fire(self) -> None:
         RunState = PulseStateUIManager.RunState
+        self._held_scan_point = None          # a fresh Run resumes the full sweep -> no longer HELD (#1)
         try:
             self.last_program = self._prepare_to_device()
             if self.sequencer is None:
