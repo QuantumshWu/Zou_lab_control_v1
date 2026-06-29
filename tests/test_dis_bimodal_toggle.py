@@ -65,3 +65,24 @@ def test_separated_readout_reports_a_fidelity():
     assert _two_peaks_drawn(fig) and fig._fit_separated
     fidelity = fig._fit_fidelity(fig.fit_threshold or 380.0)
     assert fidelity is not None and 0.5 <= fidelity <= 1.0
+
+
+def test_log_and_bimodal_toggle_in_place_without_rebuilding_the_figure():
+    """#dis-resize: toggling the log y-scale or the bimodal fit is DISPLAY-ONLY -- apply_param updates
+    the EXISTING axes (update_core + draw), it must NEVER rebuild the figure/axes (a rebuild reflows
+    the Qt holder so the plot visibly resizes/flashes).  Assert the SAME fig/ax objects survive each
+    toggle and only the scale / fit curves change; a STRUCTURE knob (bins) is NOT handled in place."""
+    ensure_qt_app()
+    rng = np.random.default_rng(3)
+    vals = np.concatenate([rng.normal(20.0, 3.0, 800), rng.normal(80.0, 4.0, 800)])
+    fig = plot(vals, kind="hist", bimodal=True)
+    fig_id, ax_id = id(fig.fig), id(fig.ax)
+    assert fig.ax.get_yscale() == "linear"
+    assert fig.apply_param("ylog", True) is True
+    assert fig.ax.get_yscale() == "log"
+    assert id(fig.fig) == fig_id and id(fig.ax) == ax_id, "log toggle must NOT rebuild the figure/axes"
+    assert _two_peaks_drawn(fig)
+    assert fig.apply_param("bimodal", False) is True
+    assert _only_single_drawn(fig)
+    assert id(fig.fig) == fig_id and id(fig.ax) == ax_id, "bimodal toggle must NOT rebuild the figure/axes"
+    assert fig.apply_param("bins", 80) is False           # a STRUCTURE knob falls back to the rebuild path

@@ -659,6 +659,14 @@ class BaseLivePlot:
                 lo = 0.5 if hi > 0.5 else hi * 0.1
             self.ax.set_ylim(lo, hi)
 
+    def apply_param(self, key: str, value) -> bool:
+        """Apply a DISPLAY-ONLY plot knob IN PLACE on the existing axes (no figure/canvas rebuild) and
+        return True if handled.  The default handles nothing, so the caller falls back to a teardown +
+        re-render.  A subclass overrides this for knobs that change only the curve/scale -- NOT the
+        layout -- so toggling them never reflows the Qt holder and visibly resizes the plot
+        (#dis-resize).  This is the in-place path ``relim`` already uses, generalized."""
+        return False
+
     def after_plot(self):
         """Create and attach a DataFigure handle."""
         return self.to_data_figure()
@@ -1988,6 +1996,21 @@ class HistogramFigure(BaseLivePlot):
         self.update_core()
         self.draw()
         return self
+
+    def apply_param(self, key: str, value) -> bool:
+        """Log count-axis + bimodal-fit toggles are DISPLAY-ONLY: flip the flag then re-fit + redraw
+        on the EXISTING axes (``update_core`` + ``draw``, exactly like :meth:`set_thresholds`), with no
+        figure/canvas rebuild -- so the dis plot never flashes/resizes when the Setting or Edit form
+        toggles them (#dis-resize).  Returns True if handled."""
+        if key == "ylog":
+            self.ylog = bool(value)
+        elif key == "bimodal":
+            self._bimodal = bool(value)
+        else:
+            return False
+        self.update_core()
+        self.draw()
+        return True
 
     def classify(self, values=None) -> np.ndarray:
         vals = self.values if values is None else np.asarray(values, dtype=float)

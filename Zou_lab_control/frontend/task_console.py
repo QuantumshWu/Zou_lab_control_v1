@@ -2442,6 +2442,12 @@ class PanelCard(FluentGroupBox):
             self._apply_lim_to_plotter()
             self.changed.emit()
             return
+        # Display-only knobs the plotter applies IN PLACE (e.g. log y-scale / bimodal-fit toggle): like
+        # ``relim``, NO teardown -- a teardown + rebuild reflows the Qt holder so the plot visibly
+        # resizes/flashes (#dis-resize).  Fall back to the rebuild path only for knobs it doesn't handle.
+        if self.plotter is not None and self.plotter.apply_param(key, value):
+            self.changed.emit()
+            return
         self._reset_plot()
         self._rerender_last()   # take effect NOW (e.g. colormap) even if the source is stopped
         self.changed.emit()
@@ -3946,6 +3952,7 @@ class PanelEditor(QtWidgets.QWidget):
                 self._plotter = panel_plot(np.array(src.values, dtype=float), kind="hist", size=size,
                                            bins=int(card.config.params.get("bins", 60)),
                                            bimodal=bool(card.config.params.get("bimodal", True)),
+                                           ylog=bool(card.config.params.get("ylog", False)),
                                            labels=tuple(src.labels), title=title)
             else:  # 1d / monitor -> a line snapshot (monitor honours its show_dist toggle)
                 extra = {"show_dist": bool(card.config.params.get("show_dist", True))} if kind == "monitor" else {}
@@ -4005,6 +4012,13 @@ class PanelEditor(QtWidgets.QWidget):
             self.card._set_param(key, value)
         if key == "relim" and getattr(self, "ed_fixed_row", None) is not None:
             self.ed_fixed_row.setVisible(str(value) == "fixed")   # reveal lo/hi only in fixed (#H2)
+        # A display-only knob the snapshot can apply IN PLACE updates here too without a re-snapshot:
+        # rebuild() tears down + recreates this canvas, which flashes/resizes it (#dis-resize).
+        snap = getattr(self, "_plotter", None)
+        if key != "relim" and snap is not None and snap.apply_param(key, value):
+            if getattr(self, "_canvas", None) is not None:
+                self._canvas.draw_idle()
+            return
         self.rebuild()
 
     def _edit_fixed_lim(self) -> None:
