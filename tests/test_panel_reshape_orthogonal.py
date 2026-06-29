@@ -101,3 +101,19 @@ def test_custom_expression_falls_back_to_shape_inference():
         assert c._bound_structure() is None      # custom expr -> structure NOT trusted
     finally:
         c.shutdown()
+
+
+def test_average_reduce_of_partial_scan_emits_no_runtime_warning():
+    """A LIVE scan publishes a (repeat, points, dim) block that is only partially filled -- the
+    not-yet-measured point columns are all-NaN.  Averaging the repeat axis of an all-NaN column is
+    NaN BY INTENT (a gap in the curve), so reduce_repeat('average') must NOT leak numpy's spurious
+    'Mean of empty slice' RuntimeWarning (the temperature live-scan noise).  Result still correct."""
+    import warnings
+    block = np.full((3, 4, 1), np.nan)            # 3 repeats x 4 points x 1 series, nothing measured...
+    block[:, 0, 0] = [1.0, 2.0, 3.0]              # ...except point 0 -> points 1..3 are all-NaN columns
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)   # any leaked RuntimeWarning -> test failure
+        out = np.asarray(reduce_repeat(block, "average", core_ndim=2))
+    assert out.shape == (4, 1)
+    assert abs(float(out[0, 0]) - 2.0) < 1e-9          # measured point = mean over repeats
+    assert np.isnan(out[1:, 0]).all()                  # unmeasured points stay NaN gaps

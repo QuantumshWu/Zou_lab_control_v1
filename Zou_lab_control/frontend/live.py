@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from math import ceil
 from typing import Any, Mapping, Sequence
@@ -118,7 +119,12 @@ def reduce_repeat(raw, mode: str = "average", *, core_ndim=None):
         # ndim >= 4: an image block (a camera's (R, 1, H, W)) -- create is ORTHOGONAL to the data axes:
         # flatten each repeat's core to a column so there is ONE trace per repeat (NOT per image row).
         return a[cols].reshape(len(cols), -1).T               # (prod(core), R) = x=pixel index, R lines
-    with np.errstate(invalid="ignore", divide="ignore"):       # all-NaN cell -> NaN (not-yet-measured)
+    # An all-NaN cell (a not-yet-measured scan point during a LIVE sweep) averages to NaN -- a gap in
+    # the curve, BY INTENT.  numpy reports that via two channels: errstate covers the 0/0 it computes,
+    # and a separate ``warnings`` message ("Mean of empty slice") that errstate does NOT catch -- so
+    # silence exactly that benign message here (the result is already the intended NaN).
+    with warnings.catch_warnings(), np.errstate(invalid="ignore", divide="ignore"):
+        warnings.filterwarnings("ignore", message="Mean of empty slice", category=RuntimeWarning)
         return np.nanmean(a, axis=0)
 
 
