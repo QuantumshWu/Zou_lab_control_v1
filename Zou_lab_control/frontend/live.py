@@ -1885,7 +1885,16 @@ class PulseSequenceFigure(BaseLivePlot):
 
 
 class HistogramFigure(BaseLivePlot):
-    """Neutral-atom-friendly histogram with threshold classification tools."""
+    """Neutral-atom-friendly histogram with threshold classification tools.
+
+    Fidelity note (#1b): when fed the live ``counts`` signal this POOLS every site's readout into ONE
+    histogram and reports the two-Gaussian fidelity about ONE global cut.  That number is EXPECTED to
+    read a few tenths of a percent BELOW the readout calibration's reported fidelity -- not a bug, and
+    the overlap math is single-sourced (``_readout_math``).  The calibration scores each site against
+    its OWN threshold and averages (per-site-centred, ``operations/calibration_report``), so each
+    per-site distribution is tight; pooling N sites that each have a different dark/bright mean widens
+    both peaks, so a single global cut overlaps more.  The pooled number is the honest "all sites, one
+    cut" figure; the calibration's is the per-site-cut figure -- two different (both correct) questions."""
 
     plot_type = "hist"
 
