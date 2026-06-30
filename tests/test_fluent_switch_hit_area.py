@@ -17,8 +17,13 @@ import pytest  # noqa: E402
 
 pytest.importorskip("PyQt5")
 
-from PyQt5 import QtCore  # noqa: E402
-from Zou_lab_control.frontend.qt_fluent import ensure_qt_app, FluentSwitch, scaled_px  # noqa: E402
+from PyQt5 import QtCore, QtGui, QtWidgets  # noqa: E402
+from Zou_lab_control.frontend.qt_fluent import (  # noqa: E402
+    ensure_qt_app,
+    FluentSwitch,
+    FluentTriStateToggle,
+    scaled_px,
+)
 
 
 def test_switch_toggles_on_its_track_but_not_on_the_dead_padding():
@@ -59,3 +64,53 @@ def test_a_real_click_on_the_dead_padding_does_not_flip_the_switch():
     assert sw.isChecked() is False, "a click on the dead padding must NOT toggle the switch"
     QTest.mouseClick(sw, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier, QtCore.QPoint(track_w // 2, mid_y))
     assert sw.isChecked() is True, "a click on the track must toggle the switch"
+
+
+# --- FluentTriStateToggle: segment width tracks the labels, click selects that segment ---
+
+def test_tristate_size_hint_widens_with_the_longest_label():
+    """The capsule sizes each segment to the widest label, so a toggle of long labels is wider
+    than one of short labels -- never a fixed width that clips text or wastes space."""
+    ensure_qt_app()
+    short = FluentTriStateToggle(["a", "b", "c"])
+    long = FluentTriStateToggle(["Replace", "Block", "Parallel"])
+    assert long.sizeHint().width() > short.sizeHint().width()
+    # the hint is derived from the real font metrics of the widest label (+ uniform padding),
+    # so it is at least three times that label's text width
+    fm = QtGui.QFontMetrics(long.font())
+    widest = max(fm.horizontalAdvance(o) for o in ["Replace", "Block", "Parallel"])
+    assert long.sizeHint().width() >= 3 * widest
+
+
+def test_tristate_horizontal_size_policy_is_fixed():
+    """A settings row adds the control with stretch=1; only a FIXED horizontal policy keeps the
+    row from ballooning the capsule past its sizeHint."""
+    ensure_qt_app()
+    toggle = FluentTriStateToggle(["Replace", "Block", "Parallel"])
+    assert toggle.sizePolicy().horizontalPolicy() == QtWidgets.QSizePolicy.Fixed
+
+
+def test_tristate_click_selects_the_clicked_segment_not_the_next():
+    """Click-to-segment: pressing inside segment i makes state == i (not (state+1)%n)."""
+    ensure_qt_app()
+    toggle = FluentTriStateToggle(["Replace", "Block", "Parallel"])
+    toggle.resize(toggle.sizeHint())
+    seg = toggle.width() / 3
+    mid_y = toggle.height() // 2
+
+    fired: list[int] = []
+    toggle.activated.connect(fired.append)
+
+    for target in (2, 0, 1):
+        x = int(seg * target + seg / 2)
+        ev = QtGui.QMouseEvent(
+            QtCore.QEvent.MouseButtonPress,
+            QtCore.QPointF(x, mid_y),
+            QtCore.Qt.LeftButton,
+            QtCore.Qt.LeftButton,
+            QtCore.Qt.NoModifier,
+        )
+        toggle.mousePressEvent(ev)
+        assert toggle.state() == target, f"click in segment {target} must select it"
+
+    assert fired == [2, 0, 1], "each distinct pick emits activated(index)"

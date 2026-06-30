@@ -782,7 +782,12 @@ class FluentTriStateToggle(QtWidgets.QAbstractButton):
         self._anim = QtCore.QPropertyAnimation(self, b"offset", self)
         self._anim.setDuration(150)
         self._anim.stateChanged.connect(self._on_anim_state_changed)
-        self.clicked.connect(self._cycle_state)
+        # A FIXED size policy pins the capsule to its sizeHint (= widest label per
+        # segment): a settings row adds the control with ``addWidget(control, 1)`` so a
+        # default (Minimum) horizontal policy lets the row stretch the toggle to fill the
+        # whole row -- the segments would balloon far past their text.  Fixed both ways
+        # keeps each segment exactly as wide as its label needs.
+        self.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
         self.setMinimumSize(self.sizeHint())
 
     def _seg_width(self) -> float:
@@ -816,11 +821,22 @@ class FluentTriStateToggle(QtWidgets.QAbstractButton):
             painter.drawText(QtCore.QRectF(i * seg, 0, seg, h), QtCore.Qt.AlignCenter, label)
         painter.end()
 
-    def _cycle_state(self) -> None:
-        prev = self._state
-        self._state = (self._state + 1) % len(self._options)
-        self._animate(prev, self._state)
-        self.activated.emit(self._state)
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        # Click-to-segment: the active state is the segment the user actually clicked,
+        # not the "next" one (cycling forces a user to walk past intermediate states to
+        # reach the one they want).  Map the press x to a segment index, clamped in range.
+        if event.button() != QtCore.Qt.LeftButton:
+            super().mousePressEvent(event)
+            return
+        seg = self._seg_width()
+        idx = int(event.x() // seg) if seg > 0 else 0
+        idx = max(0, min(idx, len(self._options) - 1))
+        if idx != self._state:
+            prev = self._state
+            self._state = idx
+            self._animate(prev, idx)
+            self.activated.emit(self._state)
+        event.accept()
 
     def _animate(self, prev_idx: int, new_idx: int) -> None:
         seg = self._seg_width()
