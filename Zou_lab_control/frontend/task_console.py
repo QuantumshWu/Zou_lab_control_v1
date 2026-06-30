@@ -2468,8 +2468,8 @@ class PanelCard(FluentGroupBox):
         if self.plotter is not None and self.plotter.apply_param(key, value):
             self.changed.emit()
             return
-        # A STRUCTURE knob the plotter can't apply in place (bins / colormap / fit mode ...): force a
-        # REBUILD on the next render, but do NOT tear the old plotter down first.  _build_plot
+        # A STRUCTURE knob the plotter can't apply in place (e.g. a 2D colormap): force a REBUILD on
+        # the next render, but do NOT tear the old plotter down first.  _build_plot
         # build-then-swaps, so if the rebuild raises (a transient namespace) the OLD figure stays and
         # the card never blanks -- the root fix for the scroll-bins-vanishes race.
         self._force_rebuild = True

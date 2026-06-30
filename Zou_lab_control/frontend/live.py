@@ -2022,21 +2022,18 @@ class HistogramFigure(BaseLivePlot):
         return self
 
     def _apply_value_xlim(self) -> None:
-        """The VALUE (x) axis range: in ``fixed`` relim mode pin it to the operator's lo/hi; otherwise
-        track the data's bin span.  The count (y) axis is owned by ``_apply_count_yscale`` -- so a
-        fixed value range is NOT re-pinned-away every frame (the #3 'fixed lo/hi does nothing on a dis'
-        fix: a histogram's relim/fixed means the VALUE axis, not the count axis)."""
-        if getattr(self, "relim_mode", "tight") == "fixed":
-            lo, hi = float(getattr(self, "fixed_lo", 0.0)), float(getattr(self, "fixed_hi", 1.0))
-            if hi > lo:
-                self.ax.set_xlim(lo, hi)
-                return
+        """The VALUE (x) axis = the binning COORDINATE: always the natural bin span.  A histogram's
+        relim/fixed acts on the COUNT (y) axis -- the measured quantity -- exactly as a 1D plot's
+        relim acts on its SIGNAL (dependent) axis, not on its independent scan coordinate.  So the
+        value axis simply frames the data's bins; tight/normal/fixed live on the count axis
+        (:meth:`_apply_count_yscale`)."""
         self.ax.set_xlim(self.bins[0], self.bins[-1])
 
     def apply_relim_now(self) -> None:
-        """A histogram's relim controls the VALUE (x) axis (NOT the count axis): re-apply the lo/hi
-        range NOW (the Setting/Edit 'fixed' toggle), bypassing any dead-band."""
-        self._apply_value_xlim()
+        """A histogram's relim controls the COUNT (y) axis -- the measured quantity, like a 1D plot's
+        signal axis, NOT the value/binning axis: re-apply the tight/normal/fixed count range NOW (the
+        Setting/Edit relim toggle), bypassing any dead-band."""
+        self._apply_count_yscale()
         self.draw()
 
     def apply_param(self, key: str, value) -> bool:
@@ -2048,8 +2045,10 @@ class HistogramFigure(BaseLivePlot):
             self.ylog = bool(value)
         elif key == "fit":
             self._fit = str(value)
-        else:
-            return False
+        elif key == "bins":
+            self.bins_arg = int(value)               # re-bin in place: update_core refills the SAME
+        else:                                        # PolyCollection (set_verts) -- no figure rebuild,
+            return False                             # so changing bins never flashes/resizes the dis
         self.update_core()
         self.draw()
         return True
@@ -2065,19 +2064,30 @@ class HistogramFigure(BaseLivePlot):
         return {int(state): float(np.mean(states == state)) for state in np.unique(states)}
 
     def _apply_count_yscale(self) -> None:
-        """Set the count (y) axis scale + limits.  Log mode floors at 0.5 so 0-count bars sit BELOW
-        the axis (no 0 -> -inf on the filled poly) and a sparse bright tail becomes visible."""
+        """Set the count (y) axis scale + limits -- the MEASURED axis a histogram's relim acts on
+        (the dependent quantity, like a 1D plot's signal axis).  ``fixed`` pins the operator's lo/hi;
+        ``normal``/``tight`` both anchor at 0 (counts are non-negative) and differ only in headroom
+        above the peak -- the single-source normal-vs-tight rule (:meth:`_mode_target`), clamped to 0
+        for the count axis.  Log mode floors at 0.5 so 0-count bars sit BELOW the axis (no
+        0 -> -inf on the filled poly) and a sparse bright tail becomes visible."""
         peak = float(np.max(self.n))
         for counts in self._overlay_counts:           # include the 'create' overlay histograms' peak
             if len(counts):
                 peak = max(peak, float(np.max(counts)))
-        top = max(1.0, peak * (3.0 if self.ylog else 1.2))
+        if getattr(self, "relim_mode", "normal") == "fixed":
+            lo, hi = float(getattr(self, "fixed_lo", 0.0)), float(getattr(self, "fixed_hi", 1.0))
+            if not hi > lo:                            # invalid pin -> fall back to auto headroom
+                lo, hi = 0.0, max(1.0, peak * 1.2)
+        else:
+            lo, hi = self._mode_target(0.0, max(peak, 1.0))   # ONE tight/normal rule, shared with 1D/2D
+            lo = max(0.0, lo)                          # counts never read below 0 (tight's -10% -> 0)
+        hi = max(hi, lo + 1.0)
         if self.ylog:
             self.ax.set_yscale("log")
-            self.ax.set_ylim(0.5, top)
+            self.ax.set_ylim(max(0.5, lo), max(hi, peak * 3.0 if peak else 1.0))
         else:
             self.ax.set_yscale("linear")
-            self.ax.set_ylim(0, top)
+            self.ax.set_ylim(lo, hi)
 
     def _fit_bimodal(self) -> None:
         # A robust two-Gaussian fit with a UNIMODAL FALLBACK.  The old median split sat INSIDE the

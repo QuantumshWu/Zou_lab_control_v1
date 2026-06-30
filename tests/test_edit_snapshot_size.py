@@ -157,25 +157,27 @@ def test_edit_sites_snapshot_honours_relim_and_fixed_lim():
         exp.close()
 
 
-def test_dis_fixed_lim_pins_the_value_axis_not_the_count_axis():
-    """#3B: a Distribution's relim/fixed lo-hi must pin the VALUE (x) axis (the count y-axis is always
-    auto).  The bug: ``_view_kwargs`` returned {} for hist, so a dis NEVER received relim/fixed and the
-    fixed lo/hi did nothing.  Now the kwargs reach HistogramFigure and apply_relim_now pins x."""
+def test_dis_fixed_lim_pins_the_count_axis_not_the_value_axis():
+    """A Distribution's relim/fixed lo-hi pins the COUNT (y) axis -- the measured quantity, exactly
+    as a 1D plot's relim pins its SIGNAL axis (the dependent axis), not the value/binning (x) axis.
+    The value axis always frames the natural bin span; only the count headroom is operator-pinned."""
     ensure_qt_app()
     from Zou_lab_control.frontend.task_console import PanelEditor
     exp, console = _console()
     try:
         card = _hist_card(console)
         editor = PanelEditor(card, console)
-        editor.rebuild()                                                    # tight: x tracks the data span
-        tight_lo, tight_hi = editor._plotter.ax.get_xlim()
-        assert tight_lo < 300.0 and tight_hi > 460.0
-        # fixed lo/hi pins the VALUE (x) axis to the operator bounds
-        card.config.params.update({"relim": "fixed", "fixed_lo": 270.0, "fixed_hi": 500.0})
+        editor.rebuild()                                                    # auto: count fits, value frames bins
+        value_lo, value_hi = editor._plotter.ax.get_xlim()                  # value (x) axis = bin span
+        assert value_lo < 300.0 and value_hi > 460.0
+        auto_top = float(editor._plotter.ax.get_ylim()[1])                  # count (y) auto headroom
+        # fixed lo/hi pins the COUNT (y) axis; the value (x) axis must NOT move
+        card.config.params.update({"relim": "fixed", "fixed_lo": 0.0, "fixed_hi": auto_top + 500.0})
         editor.rebuild()
         assert editor._plotter.relim_mode == "fixed"
-        lo, hi = editor._plotter.ax.get_xlim()
-        assert abs(lo - 270.0) < 1e-6 and abs(hi - 500.0) < 1e-6, "fixed lo/hi must pin the dis VALUE axis"
+        ylo, yhi = editor._plotter.ax.get_ylim()
+        assert abs(ylo - 0.0) < 1e-6 and abs(yhi - (auto_top + 500.0)) < 1e-6, "fixed must pin the dis COUNT axis"
+        assert editor._plotter.ax.get_xlim() == (value_lo, value_hi), "value (x) axis must not be pinned by fixed"
     finally:
         console.shutdown()
         exp.close()

@@ -126,4 +126,6 @@ def test_log_and_fit_toggle_in_place_without_rebuilding_the_figure():
     assert fig.apply_param("fit", "single") is True
     assert _only_single_drawn(fig)
     assert id(fig.fig) == fig_id and id(fig.ax) == ax_id, "fit toggle must NOT rebuild the figure/axes"
-    assert fig.apply_param("bins", 80) is False           # a STRUCTURE knob falls back to the rebuild path
+    assert fig.apply_param("bins", 80) is True            # bins re-bins IN PLACE (no figure rebuild)
+    assert len(fig.n) == 80
+    assert id(fig.fig) == fig_id and id(fig.ax) == ax_id, "bins change must NOT rebuild the figure/axes"
