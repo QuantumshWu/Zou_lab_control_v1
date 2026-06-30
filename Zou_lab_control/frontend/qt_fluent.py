@@ -370,20 +370,70 @@ def _baked_silhouette_shadow(key: tuple, path: QtGui.QPainterPath, width: int, h
     return pixmap
 
 
-def _tab_widget_silhouette(widget: QtWidgets.QTabWidget):
-    """Silhouette of a FluentTabWidget: ONE rounded-rect card.
+def _baked_shadow_from_silhouette_pixmap(key: tuple, silhouette: QtGui.QPixmap,
+                                         blur: int, alpha: int, offset: int, dpr: float) -> QtGui.QPixmap:
+    """Shadow baked from a WHITE-filled silhouette PIXMAP (the source's own alpha), cached by ``key``.
 
-    The widget paints as a single white rounded card: the tab strip and the pane
-    share the card, and the area to the RIGHT of the tabs is the card (white), not
-    the window background.  Earlier this region was left transparent so the window
-    grey showed through -- which read as an ugly grey sliver beside the right-most
-    selected (white) tab.  As one opaque rounded card the shadow is clean and that
-    grey edge is gone."""
+    Unlike the path bake, the silhouette keeps the source's antialiased alpha edge, so the cast
+    shadow matches the stock ``QGraphicsDropShadowEffect`` exactly for ANY widget shape -- the
+    baked white body sits precisely where the source is opaque (so the live source covers it and
+    NOTHING bleeds through the transparent regions).  ``silhouette`` is a dpr-tagged device pixmap
+    the same padded size as the source; the returned pixmap is the same size, blitted 1:1."""
+    cached = _SHADOW_PIXMAP_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if len(_SHADOW_PIXMAP_CACHE) > 256:
+        _SHADOW_PIXMAP_CACHE.clear()
+    scene = QtWidgets.QGraphicsScene()
+    item = scene.addPixmap(silhouette)
+    effect = QtWidgets.QGraphicsDropShadowEffect()
+    effect.setBlurRadius(blur)
+    effect.setColor(QtGui.QColor(0, 0, 0, alpha))
+    effect.setOffset(0, offset)
+    item.setGraphicsEffect(effect)
+    out = QtGui.QPixmap(silhouette.width(), silhouette.height())
+    out.setDevicePixelRatio(dpr)
+    out.fill(QtCore.Qt.transparent)
+    painter = QtGui.QPainter(out)
+    painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+    log_w, log_h = silhouette.width() / dpr, silhouette.height() / dpr
+    scene.render(painter, QtCore.QRectF(0, 0, log_w, log_h), QtCore.QRectF(0, 0, log_w, log_h))
+    painter.end()
+    _SHADOW_PIXMAP_CACHE[key] = out
+    return out
+
+
+def _tab_widget_silhouette(widget: QtWidgets.QTabWidget):
+    """Silhouette of a FluentTabWidget: the SELECTED tab + the pane.
+
+    The widget is NOT an opaque rounded rect.  Only two things paint opaque white:
+    the pane below the tabs, and the CURRENTLY-SELECTED tab -- the UNSELECTED tabs
+    have a transparent background (the FluentTabWidget stylesheet sets
+    ``::tab background:transparent``), so the window grey shows through them.  A
+    silhouette spanning the whole tab strip would bake a white band over those
+    transparent unselected tabs and cast shadow where the stock effect casts none.
+    Bake only the opaque outline = the selected tab UNIONed with the pane, so the
+    cached shadow matches the stock ``QGraphicsDropShadowEffect`` exactly.  The key
+    includes the selected tab's rect, so switching tabs re-bakes the new outline."""
+    bar = widget.tabBar()
+    geo = bar.geometry()
+    cur = bar.currentIndex()
+    sel = bar.tabRect(cur) if cur >= 0 else QtCore.QRect(0, 0, 0, 0)
     w, h, r = widget.width(), widget.height(), _radius()
-    key = ("tabcard", w, h, r)
-    path = QtGui.QPainterPath()
-    path.addRoundedRect(0.0, 0.0, float(w), float(h), float(r), float(r))
-    return key, path
+    pane_top = geo.height()
+    key = ("tabs", w, h, pane_top, geo.x(), geo.y(), sel.x(), sel.y(), sel.width(), sel.height(), r)
+    pane = QtGui.QPainterPath()
+    # WindingFill: the selected-tab subpath overlaps the pane top; the default
+    # odd-even rule would XOR the overlap into a hole, so force a UNION.
+    pane.setFillRule(QtCore.Qt.WindingFill)
+    pane.addRoundedRect(0.0, float(pane_top), float(w), float(h - pane_top), float(r), float(r))
+    if sel.width() > 0 and sel.height() > 0:
+        tab = QtGui.QPainterPath()
+        # the selected tab, extended down by r so its bottom merges flush into the pane top
+        tab.addRoundedRect(float(geo.x() + sel.x()), float(geo.y() + sel.y()),
+                           float(sel.width()), float(sel.height() + r), float(r), float(r))
+        return key, pane.united(tab).simplified()
+    return key, pane.simplified()
 
 
 class CachedDropShadow(QtWidgets.QGraphicsEffect):
@@ -464,15 +514,27 @@ class CachedDropShadow(QtWidgets.QGraphicsEffect):
         # mirrors that: device-resolution pixels, logical geometry.
         dpr = float(src.devicePixelRatioF() or 1.0)
         margin = self._blur + abs(self._offset)
-        widget = self.parent()
-        if self._silhouette is not None and widget is not None:
-            sil_key, path = self._silhouette(widget)
-        else:
-            sil_key, path = self._default_silhouette(
-                src.width() / dpr - 2.0 * margin, src.height() / dpr - 2.0 * margin)
-        key = sil_key + (self._blur, self._alpha, self._offset, round(dpr, 2))
-        shadow = _baked_silhouette_shadow(key, path, src.width(), src.height(),
-                                          margin, self._blur, self._alpha, self._offset, dpr)
+        # The silhouette is the source's OWN opaque alpha -- whatever shape the widget really
+        # paints (a rounded card, or the tab strip whose UNSELECTED tabs are transparent, ...).
+        # White-fill the live source (keeping its antialiased alpha) and bake the shadow from THAT,
+        # so the baked white body sits exactly where the source is opaque (nothing bleeds through
+        # transparent regions) and the shadow matches the stock effect for ANY shape -- no hand-built
+        # per-widget silhouette to drift as the UI evolves.
+        silhouette = QtGui.QPixmap(src.size())
+        silhouette.setDevicePixelRatio(dpr)
+        silhouette.fill(QtCore.Qt.transparent)
+        sp = QtGui.QPainter(silhouette)
+        sp.drawPixmap(0, 0, src)
+        sp.setCompositionMode(QtGui.QPainter.CompositionMode_SourceIn)   # keep src's alpha, force RGB white
+        sp.fillRect(silhouette.rect(), QtCore.Qt.white)
+        sp.end()
+        # cache by size + a cheap opaque-region signature (bbox + rect count) so two same-size
+        # widgets of DIFFERENT shape don't collide, while a repaint of the same shape hits the cache.
+        rb = QtGui.QRegion(src.mask()).boundingRect()
+        key = ("alpha", src.width(), src.height(), rb.x(), rb.y(), rb.width(), rb.height(),
+               self._blur, self._alpha, self._offset, round(dpr, 2))
+        shadow = _baked_shadow_from_silhouette_pixmap(key, silhouette, self._blur, self._alpha,
+                                                      self._offset, dpr)
         restore = painter.worldTransform()
         painter.setWorldTransform(QtGui.QTransform())
         painter.drawPixmap(off, shadow)

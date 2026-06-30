@@ -3022,10 +3022,16 @@ def test_pulse_gui_shadows_pixel_match_stock_effect(monkeypatch):
     stock = grab_editor()
 
     diff = np.abs(stock - cached).max(axis=2)
-    # measured: 3 px differ by <= 12 (a sub-pixel at the tab widget's square NW
-    # corner); shadows missing or a white band would differ by thousands of px.
-    assert int((diff > 4).sum()) < 200, (int(diff.max()), int((diff > 4).sum()))
-    assert int(diff.max()) <= 40
+    # CachedDropShadow bakes the shadow from the source's OWN alpha (white-filled), so it matches
+    # the stock effect for ANY widget shape -- including the tab widget whose UNSELECTED tabs are
+    # transparent (a hand-built silhouette baked a white BAND over them: ~50 000 px, max ~30).  The
+    # residual here is sub-perceptible penumbra antialiasing between a CACHED blur (baked once into a
+    # pixmap) and the stock DIRECT blur -- a few hundred px that differ by AT MOST a handful of grey
+    # levels (measured ~250 px, max ~8, across the tab widget + every nested card shadow).  The two
+    # real regressions this guards still fail by orders of magnitude: a white band / missing shadow
+    # is tens of thousands of px (count guard), and any VISIBLE mismatch blows the max-diff guard.
+    assert int((diff > 4).sum()) < 400, (int(diff.max()), int((diff > 4).sum()))
+    assert int(diff.max()) <= 16   # tightened from 40: the alpha-mask floor is max ~8; a band was ~30
 
     # ... and the shadows must actually exist (compare against no effect at all):
     monkeypatch.setattr(qf, "add_fluent_shadow", lambda widget, **kw: None)
