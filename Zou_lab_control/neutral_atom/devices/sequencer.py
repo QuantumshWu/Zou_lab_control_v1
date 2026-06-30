@@ -13,6 +13,7 @@ import time
 from typing import Any, Callable, Mapping, Sequence
 
 from Zou_lab_control._paths import GENERATED_SEQUENCES_DIR
+from Zou_lab_control._clock import default_clock_hz as _default_clock_hz
 from ..core.analysis import nonnegative_float, positive_int
 from .base import SequencerDevice
 from ..timing import (
@@ -33,7 +34,7 @@ from ..timing.pulse_table import (
 from ..timing.verilog import VerilogBuild, VerilogFiles, generate_verilog, write_verilog_bundle
 
 
-DEFAULT_RUNTIME_CLOCK_HZ = 50_000_000.0
+DEFAULT_RUNTIME_CLOCK_HZ = _default_clock_hz()
 DEFAULT_RUNTIME_BUS_NAMES = ("da_dipole", "da_bias_y", "da_bias_x", "da_bias_z")
 
 

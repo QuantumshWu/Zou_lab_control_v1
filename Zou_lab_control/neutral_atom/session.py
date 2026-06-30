@@ -14,6 +14,7 @@ import json
 import numpy as np
 
 from Zou_lab_control._paths import GENERATED_SEQUENCES_DIR
+from Zou_lab_control._clock import DEFAULT_CLOCK_HZ
 from .core.analysis import grid_shape_tuple
 from .core.calibration import TrapCalibration
 from .core.results import (
@@ -128,7 +129,7 @@ class NeutralAtomSession:
         errors: list[str] = []
         warnings: list[str] = []
         sequencer = getattr(self.devices, "sequencer", None)
-        clock = getattr(sequencer, "clock_hz", 50_000_000.0)
+        clock = getattr(sequencer, "clock_hz", DEFAULT_CLOCK_HZ)
         channels = getattr(sequencer, "channels", None)
         pulse_report = sequence.validate(clock_hz=clock, channels=channels)
         errors.extend(pulse_report.errors)
@@ -152,7 +153,7 @@ class NeutralAtomSession:
         sequence = sequence or self.sequence
         sequencer = getattr(self.devices, "sequencer", None)
         channels = getattr(sequencer, "channels", sequence.channels)
-        clock = getattr(sequencer, "clock_hz", 50_000_000.0)
+        clock = getattr(sequencer, "clock_hz", DEFAULT_CLOCK_HZ)
         pin_map = getattr(sequencer, "pin_map", None)
         build = generate_verilog(sequence, channels=channels, clock_hz=clock, module_name="neutral_atom_sequence")
         files = write_verilog_bundle(build, output_dir, pin_map=pin_map)

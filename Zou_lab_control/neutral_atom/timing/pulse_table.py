@@ -29,7 +29,8 @@ import re
 from typing import Iterable, Mapping, Sequence
 
 from .sequence import (CLOCK_GRID_ATOL_TICKS as GRID_ATOL_STEPS,
-                       CLOCK_GRID_RTOL as GRID_RTOL, READOUT_GAP_SECONDS,
+                       CLOCK_GRID_RTOL as GRID_RTOL, DEFAULT_CLOCK_HZ,
+                       READOUT_GAP_SECONDS,
                        PulseSequence, channel_names, positive_float)
 
 
@@ -1730,7 +1731,7 @@ class PulseTableState:
         return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
 
     @classmethod
-    def from_sequence(cls, sequence: PulseSequence, *, channels: Sequence[str], clock_hz: float = 50_000_000.0) -> "PulseTableState":
+    def from_sequence(cls, sequence: PulseSequence, *, channels: Sequence[str], clock_hz: float = DEFAULT_CLOCK_HZ) -> "PulseTableState":
         ticks, masks, channels = sequence.edges(clock_hz=clock_hz, channels=channels)
         periods: list[PulsePeriod] = []
         if not ticks:

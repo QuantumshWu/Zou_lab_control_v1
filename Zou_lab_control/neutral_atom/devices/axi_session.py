@@ -46,7 +46,6 @@ from fpga.pulse_streamer.host.image import (
     scan_bank_words,
     region_bases,
     default_params as _default_streamer_params,
-    default_clock_hz as _default_streamer_clock_hz,
     CMD_LOAD,
     CMD_FIRE,
     CMD_SAFE,
@@ -58,8 +57,12 @@ from fpga.pulse_streamer.host.image import (
 )
 
 # Runtime clock + geometry default come from the single config file
-# (fpga/board_config/streamer_config.json via host.image).
-DEFAULT_RUNTIME_CLOCK_HZ = _default_streamer_clock_hz()
+# (fpga/board_config/streamer_config.json via host.image).  The clock default has
+# ONE definition (sequencer.DEFAULT_RUNTIME_CLOCK_HZ, itself derived from that
+# config); we import it so the compile clock and this AXI runtime clock can never
+# diverge.  Importing it module-level is cycle-free: sequencer never imports this
+# module (its one back-reference at scan_progress_fields is a lazy in-function import).
+from .sequencer import DEFAULT_RUNTIME_CLOCK_HZ
 
 
 class _AxiAborted(Exception):

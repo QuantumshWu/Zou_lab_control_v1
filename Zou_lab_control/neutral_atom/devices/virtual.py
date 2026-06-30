@@ -12,6 +12,7 @@ import numpy as np
 
 from ..core.analysis import (
     finite_float, grid_shape_tuple, nonnegative_float, point_tuple, positive_float, positive_int, probability)
+from Zou_lab_control._clock import DEFAULT_CLOCK_HZ
 from ..core.utils import site_index
 from .base import CameraDevice, SequencerDevice, TrapArrayDevice, snap_subarray
 from .camera_trigger import DEFAULT_CAMERA_TRIGGER_CHANNELS, count_trigger_pulses
@@ -707,7 +708,7 @@ class VirtualCamera(CameraDevice):
 
 
 class VirtualSequencer(SequencerDevice):
-    def __init__(self, channels: Sequence[str] = DEFAULT_CHANNELS, clock_hz: float = 50_000_000.0, sleep_scale: float | None = None):
+    def __init__(self, channels: Sequence[str] = DEFAULT_CHANNELS, clock_hz: float = DEFAULT_CLOCK_HZ, sleep_scale: float | None = None):
         self.channels = tuple(str(channel) for channel in channels)
         self.clock_hz = positive_float(clock_hz, "clock_hz")
         # REAL-TIME by default (DEFAULT_SLEEP_SCALE=1.0): a fired program takes its real

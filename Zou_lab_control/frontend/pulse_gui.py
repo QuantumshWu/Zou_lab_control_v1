@@ -13,6 +13,7 @@ import os
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
+from Zou_lab_control._clock import default_clock_hz as _default_hardware_clock_hz
 from Zou_lab_control.neutral_atom.timing.pulse_table import (
     DELAY_MAX_TICKS,
     SCAN_SLOT_KINDS,
@@ -137,7 +138,7 @@ PANEL_TOP_HEIGHT = 178   # name row + Duration label + value + unit (all four pa
 CHANNEL_ROW_SPACING = 4
 PERIOD_CARD_WIDTH = 158
 DEFAULT_WINDOW_RATIO = WINDOW_SCREEN_FRACTION   # the ONE shared screen-fraction (qt_fluent), == task console
-DEFAULT_HARDWARE_CLOCK_HZ = 50_000_000.0
+DEFAULT_HARDWARE_CLOCK_HZ = _default_hardware_clock_hz()  # single source: streamer_config.json (via the dependency-free _clock seam)
 DEFAULT_TIME_STEP_NS = 1_000_000_000.0 / DEFAULT_HARDWARE_CLOCK_HZ
 SUMMARY_DEBOUNCE_MS = 90
 PREVIEW_DEBOUNCE_MS = 160

@@ -10,6 +10,7 @@ import math
 
 import numpy as np
 
+from Zou_lab_control._clock import DEFAULT_CLOCK_HZ  # absolute: dependency-free clock seam (config single source)
 from ..core.analysis import finite_float, positive_float, positive_int
 
 
@@ -219,7 +220,7 @@ class PulseSequence:
                     active_index = index
         return PulseReport(not errors, self.name, len(self.pulses), clock, tuple(errors), tuple(warnings))
 
-    def edges(self, *, clock_hz: float = 50_000_000.0, channels: Sequence[str] | None = None) -> tuple[list[int], list[int], list[str]]:
+    def edges(self, *, clock_hz: float = DEFAULT_CLOCK_HZ, channels: Sequence[str] | None = None) -> tuple[list[int], list[int], list[str]]:
         channels = list(self.channels if channels is None else channel_names(channels, "channels", allow_empty=True))
         if not channels:
             raise ValueError("channels must contain at least one channel.")
@@ -466,7 +467,7 @@ def exposure_from_sequence(sequence: PulseSequence | None, *, default: float, ch
     return positive_float(unique[0] / 1e15, f"{channel} exposure")
 
 
-def plot_sequence(sequence: PulseSequence, *, clock_hz: float = 50_000_000.0, display: bool = True):
+def plot_sequence(sequence: PulseSequence, *, clock_hz: float = DEFAULT_CLOCK_HZ, display: bool = True):
     """Plot a pulse timeline through the registered viewer (``None`` if headless)."""
 
     from Zou_lab_control._viewer_registry import active_plotter
