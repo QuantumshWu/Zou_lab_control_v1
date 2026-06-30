@@ -1202,22 +1202,19 @@ class _RoundedPopupCard(QtCore.QObject):
             painter.end()
             return True
         if et == QtCore.QEvent.Move and self._combo is not None and isinstance(obj, QtWidgets.QWidget):
-            # OUTER gap: Qt drops the popup flush against the combo (in a deferred
-            # step a showPopup-time move() can't beat); re-apply the offset every time
-            # it is repositioned so the dropdown sits a few px OFF the box -- the same
-            # gap the Setting FluentPopup uses below its button.  Self-converging: once
-            # at target the guard no-ops, so the corrective move does not loop.
+            # ALWAYS BELOW: the dropdown must open downward off the box, never flip above it.
+            # Qt drops the popup flush against the combo (and near the screen bottom would flip it
+            # UPWARD) in a deferred step a showPopup-time move() can't beat; re-apply the downward
+            # offset every time it is repositioned so the dropdown sits a few px BELOW the box -- the
+            # same gap the Setting FluentPopup uses below its button.  Self-converging: once at target
+            # the guard no-ops, so the corrective move does not loop.  (Overrun past the screen bottom
+            # is handled by clamping the popup HEIGHT to the below-the-box space so it scrolls -- see
+            # FluentComboBox.showPopup / _anchor_available_height -- not by flipping it up.)
             below = self._combo.mapToGlobal(QtCore.QPoint(0, self._combo.height())).y()
-            above = self._combo.mapToGlobal(QtCore.QPoint(0, 0)).y()
             geo = obj.geometry()
-            if geo.top() >= below - 2:                                   # opened DOWNWARD -> gap below the box
-                target = below + self._gap
-                if abs(geo.top() - target) > 1:
-                    obj.move(geo.left(), target)
-            elif geo.bottom() <= above + 2:                             # FLIPPED above -> SAME gap above the box
-                target_top = above - self._gap - geo.height()
-                if abs(geo.top() - target_top) > 1:
-                    obj.move(geo.left(), target_top)
+            target = below + self._gap
+            if abs(geo.top() - target) > 1:
+                obj.move(geo.left(), target)
             return False
         return False
 
@@ -1397,9 +1394,9 @@ class FluentComboBox(QtWidgets.QComboBox):
     def showPopup(self):  # noqa: N802 - Qt naming
         # Reconfigure the popup container (translucent + rounded-card event filter)
         # in case Qt rebuilt it since __init__.  The OUTER gap (dropdown sits a few
-        # px off the box) is enforced by the container's Move event filter
-        # (_RoundedPopupCard), which beats Qt's deferred flush-positioning that a
-        # showPopup-time move() cannot.
+        # px off the box) AND the ALWAYS-DOWNWARD placement are enforced by the
+        # container's Move event filter (_RoundedPopupCard), which beats Qt's
+        # deferred flush-positioning that a showPopup-time move() cannot.
         self._configure_popup_container()
         # Size the dropdown to its widest item so options like "Edge"/"Ramp"/
         # "Hold" or "ns"/"us"/"ms" are never clipped when the combo itself is
@@ -1416,6 +1413,28 @@ class FluentComboBox(QtWidgets.QComboBox):
                 widest = max(widest, advance)
             view.setMinimumWidth(widest + scaled_px(COMBO_WIDTH) + scaled_px(EDIT_PADDING_H) * 2)
         super().showPopup()
+        self._place_popup_below()
+
+    def _place_popup_below(self) -> None:
+        """Force the open drop-down to sit BELOW the box (never flipped above it).
+
+        Qt positions the popup container in a deferred flush AFTER ``super().showPopup()`` and, near the
+        screen bottom, would flip it UPWARD.  We move the container to the combo's bottom-left + the outer
+        gap right away (and ``_RoundedPopupCard``'s Move filter re-applies the same downward target on
+        Qt's later flush, so the box can never end up above).  The x is clamped into the screen so a combo
+        at the right edge does not push the popup off-screen horizontally; the height is clamped to the
+        below-the-box space elsewhere so an overrun SCROLLS rather than flipping up."""
+        view = self.view()
+        container = view.window() if view is not None else None
+        if container is None or container is self:
+            return
+        below = self.mapToGlobal(QtCore.QPoint(0, self.height() + self._gap))
+        x = below.x()
+        screen = self.screen() if hasattr(self, "screen") else QtWidgets.QApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            x = max(avail.left(), min(x, avail.right() - container.width()))
+        container.move(x, below.y())
 
     def _display_text(self) -> str:
         """The text painted in the COLLAPSED combo (the seam a tree combo overrides to show a
@@ -1536,26 +1555,17 @@ class FluentTreeComboBox(FluentComboBox):
         return int(desired)
 
     def _anchor_available_height(self) -> int:
-        """Pixels available for the popup at the combo anchor, on the side it ACTUALLY opens.
+        """Pixels available for the popup BELOW the combo box, down to the screen bottom.
 
-        The grow-vs-scroll rule: the popup grows to fit its visible rows up to THIS height, then scrolls.
-        It must measure the side Qt actually placed the popup on -- not ``max(below, above)``, which would
-        clamp a downward-opening popup to the (larger) UPWARD space and overrun the screen bottom (#3).
-        When the popup is already shown we read its container's top to tell the side; before it shows we
-        assume DOWN (Qt's default when the collapsed box fits below)."""
+        The popup ALWAYS opens downward (``_place_popup_below`` forces it; the dropdown never flips above
+        the box).  So the grow-vs-scroll cap is always the space from the box's bottom edge (+ the outer
+        gap) to the screen bottom: the popup grows to fit its visible rows up to THIS height, then SCROLLS
+        the overflow (the shared fluent scrollbar) -- it never overruns the screen and never flips up."""
         screen = self.screen() if hasattr(self, "screen") else QtWidgets.QApplication.primaryScreen()
         if screen is None:
             return 0
         avail = screen.availableGeometry()
-        combo_top = self.mapToGlobal(QtCore.QPoint(0, 0)).y()
-        view = self.view()
-        container = view.window() if isinstance(view, QtWidgets.QTreeView) else None
-        if container is not None and container is not self and container.isVisible():
-            ctop = container.mapToGlobal(QtCore.QPoint(0, 0)).y()
-            if ctop < combo_top:                                  # opened ABOVE the box
-                return int(max(0, (combo_top - self._gap) - avail.top()))
-            return int(max(0, avail.bottom() - (ctop + self._gap)))   # opened BELOW -> from its own top down
-        bottom_g = combo_top + self.height()                      # not shown yet -> assume it opens below
+        bottom_g = self.mapToGlobal(QtCore.QPoint(0, self.height())).y()   # the box's bottom edge, global
         return int(max(0, avail.bottom() - (bottom_g + self._gap)))
 
     def _resize_popup_to_contents(self, *_) -> None:

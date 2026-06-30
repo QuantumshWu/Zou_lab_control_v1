@@ -112,3 +112,61 @@ def test_pick_updates_the_collapsed_display_immediately_and_on_switch():
     c._on_tree_clicked(occupied.index())
     assert c._display_text() == "occupancy · occupied"
     assert c.current_signal() == "occupied"
+
+
+def test_flat_combo_popup_always_opens_below_even_near_the_screen_bottom(monkeypatch):
+    """The drop-down must ALWAYS sit BELOW the box, never flip ABOVE it -- even when the box is near the
+    screen bottom (where stock Qt flips the popup upward).  ``_place_popup_below`` forces the container to
+    the box's bottom edge + the outer gap; the height clamps to the below-the-box space so an overrun
+    SCROLLS rather than flipping up.  Guards the rule on the BASE FluentComboBox so every combo inherits
+    it."""
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5 import QtWidgets, QtCore
+    from Zou_lab_control.frontend.qt_fluent import FluentComboBox
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    scr = app.primaryScreen().availableGeometry()
+    c = FluentComboBox()
+    c.addItems([f"item {i}" for i in range(30)])           # many items so it would prefer to flip up if it could
+    c.resize(160, 30)
+    c.move(scr.left() + 40, scr.bottom() - 50)             # bottom of the box ~50 px from the screen bottom
+    c.show()
+    c.showPopup()
+    container = c.view().window()
+    combo_bottom = c.mapToGlobal(QtCore.QPoint(0, c.height())).y()
+    container_top = container.mapToGlobal(QtCore.QPoint(0, 0)).y()
+    assert container_top >= combo_bottom - 1, \
+        "the drop-down must open BELOW the box (its top at/under the box bottom), never flipped above"
+    c.hidePopup()
+
+
+def test_tree_combo_popup_always_below_and_clamps_to_below_space_then_scrolls(monkeypatch):
+    """The collapsible tree picker obeys the SAME always-below rule, and its grow cap is the below-the-box
+    space: anchored near the screen bottom, the popup opens BELOW and ``_anchor_available_height`` /
+    ``_desired_popup_height`` clamp to the (small) below space so the tree SCROLLS instead of flipping up
+    or overrunning the screen.  ``_anchor_available_height`` measures from the box BOTTOM down only -- it
+    has no 'opened above' branch anymore."""
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5 import QtWidgets, QtCore
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    scr = app.primaryScreen().availableGeometry()
+    c = _combo()
+    c.resize(180, 30)
+    c.move(scr.left() + 40, scr.bottom() - 50)             # near the bottom
+    c.show()
+    c.showPopup()
+    tree = c.view()
+    tree.setExpanded(c._model.index(1, 0), True)
+    tree.setExpanded(c._model.index(2, 0), True)
+    c._resize_popup_to_contents()
+    container = tree.window()
+    combo_bottom = c.mapToGlobal(QtCore.QPoint(0, c.height())).y()
+    container_top = container.mapToGlobal(QtCore.QPoint(0, 0)).y()
+    assert container_top >= combo_bottom - 1, "the tree popup must open BELOW the box, never flipped above"
+    # the available height is measured from the box BOTTOM down (no 'above' side); near the bottom it is small
+    avail = c._anchor_available_height()
+    full = c._desired_popup_height()
+    assert 0 < avail < 100, "near the screen bottom the below-the-box space is small (-> the popup scrolls)"
+    assert full <= avail, "the desired height clamps to the below-the-box space (scroll, never flip up)"
+    c.hidePopup()
