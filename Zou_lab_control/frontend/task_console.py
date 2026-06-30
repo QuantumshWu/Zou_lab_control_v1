@@ -4921,7 +4921,7 @@ class TaskConsole(QtWidgets.QWidget):
             names_provider=self._signal_names, sources_provider=self._signal_providers,
             formats_provider=self._signal_formats, axes_provider=self._signal_axes,
             sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x,
-            structure_provider=self._signal_structure, calibration_provider=self._running_calibration,
+            structure_provider=self._signal_structure, calibration_provider=self._active_calibration,
             short_names_provider=self._signal_short_names, live_namespace_provider=self._expression_namespace)
 
     def _attach_card(self, card: PanelCard) -> None:
@@ -5168,16 +5168,24 @@ class TaskConsole(QtWidgets.QWidget):
                 return ((prefix + ck) if ck else None, (prefix + ik) if ik else None)
         return (None, None)
 
-    def _running_calibration(self):
-        """The :class:`TrapCalibration` of a running Judge-occupancy processor (or ``None``).  A
-        histogram (``dis`` plot) bound to a raw camera FRAME uses it to extract the per-site COUNTS
-        (the dark/bright bimodal readout) via ``calibration.signals`` instead of histogramming the raw
-        pixels -- a frame's pixels are a single background blob (NOT bimodal), the readout bimodal lives
-        in the box-summed per-site counts (#H3v-4a)."""
+    def _active_calibration(self):
+        """The :class:`TrapCalibration` a histogram (``dis`` plot) bound to a raw camera FRAME uses to
+        extract the per-site COUNTS (the dark/bright bimodal readout) via ``calibration.signals`` --
+        instead of histogramming the raw pixels (a single background blob, NOT bimodal: the readout
+        bimodal lives in the box-summed per-site counts, #H3v-4a).
+
+        Prefer a RUNNING Judge-occupancy node's own calibration (freshest -- the one actively
+        detecting); otherwise fall back to the SESSION's current calibration (the last sitemap /
+        thresholds the operator ran).  So a frame-bound dis is bimodal even with NO Judge node running
+        -- the #3A root cause: it required a running node, so a plain ``frame`` -> dis defaulted to the
+        single-blob raw pixels (which fit as ONE gaussian)."""
         for node in self.running_nodes:
             cal = getattr(node, "calibration", None)
             if cal is not None and callable(getattr(cal, "signals", None)):
                 return cal
+        cal = getattr(getattr(getattr(self, "session", None), "readout", None), "current", None)
+        if cal is not None and callable(getattr(cal, "signals", None)):
+            return cal                          # the session's loaded calibration (no Judge node needed)
         return None
 
     def _curve_x(self, y_signal) -> str | None:

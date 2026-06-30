@@ -58,7 +58,7 @@ def _fitted_sep(vals: np.ndarray) -> float:
 
 def _hist_card_with_calibration():
     """A `dis` PanelCard whose calibration_provider returns a REAL virtual calibration -- exactly the
-    wiring the console gives every panel (its `_running_calibration`)."""
+    wiring the console gives every panel (its `_active_calibration`)."""
     from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
     from Zou_lab_control.frontend.task_console import PanelCard, PanelConfig
     ensure_qt_app()
@@ -117,3 +117,30 @@ def test_dis_without_calibration_keeps_raw_pixels():
     finally:
         if hasattr(card, "shutdown"):
             card.shutdown()
+
+
+def test_active_calibration_falls_back_to_session_with_no_running_node():
+    """#3A root fix: a frame -> dis must be bimodal even with NO Judge node running.  The console's
+    ``_active_calibration`` prefers a running node's calibration but falls back to the SESSION's current
+    calibration (the last sitemap/thresholds the operator ran) -- so the per-site reduction (and thus the
+    bimodal dis) happens without requiring a running processor.  Before, it required a running node, so a
+    plain frame -> dis defaulted to the single-blob raw pixels (fit as ONE gaussian)."""
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.task_console import TaskConsole, default_console_state
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    ensure_qt_app()
+    exp = na.connect("virtual", sitemap={"grid_shape": GRID, "image_shape": (64, 80)})
+    exp.readout.sitemap(method="box", frames=6, display=False)
+    exp.readout.thresholds(frames=40, display=False)
+    console = TaskConsole(hub=SignalHub(), state=default_console_state(), session=exp,
+                          measurements=exp.readout.measurement_specs(),
+                          processors=exp.readout.processor_specs(), window_px=(900, 600))
+    console._timer.stop()
+    try:
+        assert not console.running_nodes                       # NO Judge node running ...
+        cal = console._active_calibration()                    # ... yet a calibration is available
+        assert cal is not None and callable(getattr(cal, "signals", None))
+        assert cal is exp.readout.current                      # it's the SESSION's loaded calibration
+    finally:
+        console.shutdown()
+        exp.close()
