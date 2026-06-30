@@ -60,6 +60,38 @@ def test_scan_compile_carries_scan_repeats_to_program():
     assert RuntimeSequenceProgram.from_dict(program.to_dict()).scan_repeats == 3
 
 
+def test_streamed_scan_compiles_repeat_forever_even_without_the_flag():
+    # The pulse GUI's On Pulse sets only scan_repeats and prepares the STATE directly (it never sets
+    # repeat_forever, and bypasses PulseController).  A streamed scan must still STREAM: the compiled
+    # program forces repeat_forever=True whenever scan_points is set (the single-source __post_init__
+    # invariant), so K=0 sweeps forever and K>0 stops after K -- GUI, notebook and real alike.  This
+    # is the "finite scan plays only one sweep / infinite scan never starts" bug, fixed at the gate.
+    finite = _scan_state(); finite.scan_repeats = 3           # finite, repeat_forever NOT set
+    assert finite.compile_scan(clock_hz=50_000_000.0).repeat_forever is True
+    assert _scan_state().compile_scan(clock_hz=50_000_000.0).repeat_forever is True   # K=0 too
+
+
+def test_gui_path_scan_streams_without_explicit_repeat_forever():
+    # Reproduce the GUI On Pulse end to end on the virtual backend: prepare the scan STATE directly
+    # (no PulseController, no repeat_forever flag) and fire -- it must actually STREAM (firing set,
+    # scan_progress scanning), instead of a single-sweep one-shot.  virtual == real.
+    seq = VirtualSequencer(channels=["probe", "trig"], sleep_scale=0.0)
+    seq.prepare(_scan_state())                               # K=0 infinite scan; flag NOT set
+    seq.fire()
+    assert seq.firing is not None
+    assert seq.scan_progress()["scanning"] is True
+
+
+def test_gui_path_finite_scan_reaches_done_without_the_flag():
+    # The finite case of the same GUI path: K=2 whole sweeps then stop (the saturated done reading),
+    # with no explicit repeat_forever flag -- the exact user report "scan repeats > 0 plays only once".
+    seq = VirtualSequencer(channels=["probe", "trig"], sleep_scale=0.0)
+    st = _scan_state(); st.scan_repeats = 2                  # finite, flag NOT set
+    seq.prepare(st)
+    seq.fire()
+    assert seq.scan_progress() == {"scanning": False, "point": 2, "n_points": 3, "sweep": 1, "n_repeats": 2}
+
+
 def test_controller_payload_threads_scan_repeats_into_state():
     # The on_pulse/prepare API writes scan_repeats into the fired pulse state (the seam the scan
     # compiler then reads), so a notebook `pulse.on_pulse(scan_repeats=K)` sets it by value.
@@ -133,18 +165,22 @@ def _one_point_scan_state() -> PulseTableState:
 
 def test_finite_one_point_scan_is_rejected():
     # A single point never produces a cursor wrap, so the host could never count sweeps -> it would
-    # hang forever on real hardware.  The shared fire seam rejects it (so virtual == real refuse it).
-    ctrl = PulseController(VirtualSequencer(channels=["probe", "trig"]), _one_point_scan_state())
+    # hang forever on real hardware.  The rejection lives on the COMPILED program (__post_init__),
+    # the one gate EVERY fire path passes -- so GUI, notebook and real all refuse it identically.
+    one_point = _one_point_scan_state()
+    one_point.scan_repeats = 2
     with pytest.raises(ValueError, match="at least 2 scan points"):
-        ctrl.payload(scan_repeats=2)
+        one_point.compile_scan(clock_hz=50_000_000.0)
 
 
 def test_finite_scan_repeats_implies_repeat_forever():
-    # scan_repeats>0 is a streamed-then-stopped scan; a bare repeat_forever=False must NOT silently
-    # demote it to a single sweep -- the finite count forces streaming.
+    # scan_repeats>0 is a streamed-then-stopped scan; a bare repeat_forever=False must NOT demote it
+    # to a single sweep.  The streaming invariant lives on the COMPILED program (every fire path
+    # passes __post_init__), so the payload carries the count and the compile forces streaming.
     payload = PulseController(VirtualSequencer(channels=["probe", "trig"]), _scan_state()).payload(
         repeat_forever=False, scan_repeats=2)
-    assert payload.repeat_forever is True and payload.scan_repeats == 2
+    assert payload.scan_repeats == 2
+    assert payload.compile_scan(clock_hz=50_000_000.0).repeat_forever is True
 
 
 def test_infinite_scan_streams_without_explicit_repeat_forever():

@@ -198,6 +198,16 @@ class RuntimeSequenceProgram:
     clk_enable: int = 0
 
     def __post_init__(self) -> None:
+        # A streamed scan (ANY scan_points) is played by the engine's CONTINUOUS scan-point streamer,
+        # so the program MUST run repeat_forever: scan_repeats=0 is a seamless cyclic scan; scan_repeats=K
+        # plays K whole sweeps and the HOST then stops the engine.  This is the program's single source
+        # of truth for the invariant, enforced HERE on the COMPILED program because EVERY fire path (real
+        # AND virtual both compile to a RuntimeSequenceProgram) passes through it.  So a caller that
+        # compiles a scan WITHOUT setting repeat_forever -- e.g. the pulse GUI's On Pulse, which only
+        # sets scan_repeats and never touched PulseController where this used to live -- still streams,
+        # instead of producing a contradictory (scan_points yet repeat_forever=False) one-shot program.
+        if self.scan_enabled and not self.repeat_forever:
+            object.__setattr__(self, "repeat_forever", True)
         # A finite K-sweep streamed scan (scan_repeats>0) needs >= 2 scan points: the host counts whole
         # sweeps from the streamed cursor's WRAP, which a single point never produces -- it would never
         # stop on real hardware.  Enforced HERE, on the COMPILED program, because EVERY fire path (real
@@ -1442,31 +1452,19 @@ class PulseController:
                 payload = self.pulse.with_slots_resolved(merged)
             else:
                 payload = self.pulse
-            # repeat_forever / scan_repeats overrides go through the dict (the same seam the GUI /
-            # save bundle use).  A STREAMED scan (bound slots + a scan table) ALWAYS streams its
-            # scan-point bank cyclically: ``scan_repeats`` alone controls the host-side STOP -- 0 =
-            # sweep forever (the default), K>=1 = halt after K whole sweeps.  So such a payload is
-            # repeat_forever REGARDLESS of the whole-table flag (a bare repeat_forever=False would
-            # otherwise compile as a play-once program: On Pulse fires the scan once and nothing keeps
-            # running -- exactly the "scan_repeats=0 does nothing" bug).  The host counts sweeps from
-            # the streamed cursor's WRAP, which a SINGLE scan point never produces, so a finite K-sweep
-            # scan needs >= 2 points -- else it would never stop on real hardware; we reject here (the
-            # shared fire seam) so virtual == real (both refuse it).
-            eff_repeats = max(0, int(scan_repeats)) if scan_repeats is not None else int(getattr(payload, "scan_repeats", 0))
-            is_streamed_scan = bool(getattr(payload, "scan_slots", None)) and len(getattr(payload, "scan_table", None) or ()) > 0
-            if repeat_forever is not None or scan_repeats is not None or eff_repeats > 0 or is_streamed_scan:
+            # repeat_forever / scan_repeats overrides flow through the dict (the same seam the GUI /
+            # save bundle use).  The streamed-scan invariants -- "ANY scan_points => repeat_forever"
+            # (0 = sweep forever, K = stop after K whole sweeps) and "a finite K-sweep needs >= 2
+            # points" -- are enforced ONCE on the COMPILED program (RuntimeSequenceProgram.__post_init__),
+            # which EVERY fire path passes through, INCLUDING the pulse GUI's On Pulse that bypasses
+            # this method.  So we only carry the explicit overrides here and never re-derive streaming
+            # (no second copy to drift; the GUI gets the same enforcement it used to miss).
+            if repeat_forever is not None or scan_repeats is not None:
                 data = payload.to_dict()
-                if is_streamed_scan:
-                    if eff_repeats > 0 and len(payload.scan_table) == 1:
-                        raise ValueError(
-                            "a finite scan-repeat (scan_repeats > 0) needs at least 2 scan points: the host "
-                            "counts whole sweeps from the streamed cursor's wrap, which a single point never "
-                            "produces (it would never stop). Add scan points, or use repeat_forever=False for "
-                            "a single finite shot.")
-                    data["repeat_forever"] = True          # a streamed scan must stream (0=forever, K=stop after K)
-                elif repeat_forever is not None:
+                if repeat_forever is not None:
                     data["repeat_forever"] = bool(repeat_forever)
-                data["scan_repeats"] = eff_repeats
+                if scan_repeats is not None:
+                    data["scan_repeats"] = max(0, int(scan_repeats))
                 payload = PulseTableState.from_dict(data)
             return payload
         if repeat_forever is not None:
