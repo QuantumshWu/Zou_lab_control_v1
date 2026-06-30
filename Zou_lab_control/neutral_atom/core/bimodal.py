@@ -1,8 +1,7 @@
 """Bimodal (dark/bright) threshold fitting for single-site readout.
 
-``exact_otsu_threshold`` here is the single source of the between-class-variance
-split point (``analysis.otsu_threshold`` delegates to it); the Gaussian split in
-``estimate_threshold_fidelity`` then characterizes the two sides.  For
+``otsu_threshold`` in :mod:`.analysis` picks a single split point; the Gaussian
+split in ``estimate_threshold_fidelity`` then characterizes the two sides.  For
 low-photon qCMOS readout the Rb87 pipeline does better: it fits robust dark and
 bright peak *cores* (one-sided widths, so a partial-loss bridge between the peaks
 does not inflate the bright width), then places the threshold at the point of

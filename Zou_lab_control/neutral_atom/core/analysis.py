@@ -11,8 +11,6 @@ from scipy.optimize import curve_fit
 
 from Zou_lab_control._readout_math import confidence_weighted_fidelity
 
-from .bimodal import exact_otsu_threshold
-
 
 SUPPORTED_REDUCERS = ("mean", "sum", "median", "max")
 SUPPORTED_ORDERINGS = ("row-major", "serpentine", "column-major", "column-serpentine")
@@ -277,29 +275,8 @@ def sort_centers_grid(centers, grid_shape: Sequence[int], *, ordering: str = "ro
     return np.vstack(cols)
 
 
-def otsu_threshold(values, *, mode: str = "exact", bins: int = 96) -> float:
-    """One-dimensional Otsu (between-class-variance) threshold.
-
-    Single source of the maximum-between-class-variance split, used for the
-    single-threshold readout (``measurement.py``, ``calibration.py``) and as the
-    empirical pre-split inside the bimodal fit.
-
-    ``mode="exact"`` (default) delegates to
-    :func:`.bimodal.exact_otsu_threshold`, which maximizes the between-class
-    variance over the *sorted samples* and places the split at the midpoint of
-    the chosen adjacent pair.  For a well-separated bimodal that midpoint lands
-    in the empty gap between the peaks (the between-class variance peaks at the
-    centre of the gap, not on a plateau), so the robust "gap-centre" split is
-    intrinsic -- no plateau-averaging heuristic is needed.
-
-    ``mode="binned"`` is the histogram fast path for very large samples: it
-    maximizes the same criterion over ``bins`` histogram bins.  Because binning
-    flattens the across-gap score into a plateau, it explicitly returns the
-    *centre* of the optimal plateau to reproduce the same gap-centre split.
-    """
-
-    if mode not in ("exact", "binned"):
-        raise ValueError("otsu_threshold mode must be 'exact' or 'binned'.")
+def otsu_threshold(values, *, bins: int = 96) -> float:
+    """One-dimensional Otsu threshold with finite-value filtering."""
 
     vals = np.asarray(values, dtype=float).reshape(-1)
     vals = vals[np.isfinite(vals)]
@@ -307,10 +284,6 @@ def otsu_threshold(values, *, mode: str = "exact", bins: int = 96) -> float:
         raise ValueError("threshold values contain no finite entries.")
     if float(np.min(vals)) == float(np.max(vals)):
         return float(vals[0])
-
-    if mode == "exact":
-        return exact_otsu_threshold(vals)
-
     hist, edges = np.histogram(vals, bins=positive_int(bins, "bins"))
     centers = (edges[:-1] + edges[1:]) / 2
     weights = hist.astype(float)
@@ -325,11 +298,10 @@ def otsu_threshold(values, *, mode: str = "exact", bins: int = 96) -> float:
     valid = denom > 0
     score[valid] = (mu[-1] * omega[valid] - mu[valid]) ** 2 / denom[valid]
     # A well-separated bimodal has an EMPTY gap between the peaks: across the gap no
-    # probability mass moves, so the binned Otsu score is FLAT (a plateau).  ``argmax``
-    # would return the LEFTMOST plateau bin -- the threshold then sits at the top of the
-    # dark peak, where a dark tail misclassifies.  Return the CENTRE of the optimal
-    # plateau instead (the middle of the gap), the robust split a balanced threshold
-    # wants.  ``mode="exact"`` gets this gap-centre for free from the sorted samples.
+    # probability mass moves, so the Otsu score is FLAT (a plateau).  ``argmax`` would
+    # return the LEFTMOST plateau bin -- the threshold then sits at the top of the dark
+    # peak, where a dark tail misclassifies.  Return the CENTRE of the optimal plateau
+    # instead (the middle of the gap), the robust split a balanced threshold wants.
     best = float(np.max(score[valid]))
     plateau = np.flatnonzero(valid & (score >= best - 1e-9 * (abs(best) + 1.0)))
     return float(np.mean(centers[plateau]))
