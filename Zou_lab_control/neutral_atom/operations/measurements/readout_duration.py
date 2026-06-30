@@ -21,13 +21,15 @@ The factory reuses ``ReadoutSubsystem.build_detection_scan`` -- the SAME builder
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import numpy as np
 
-from Zou_lab_control._paths import resolve_under_project
 from ...core.analysis import positive_int
-from ...timing import PulseTableState, imaging_channel_kwargs, single_imaging_template
+from ...timing import (
+    PulseTableState,
+    imaging_channel_kwargs,
+    resolve_pulse_template,
+    single_imaging_template,
+)
 from ..measurement import MeasurementSpec, ParamDecl, axis_range_tuple
 from ..measurement_registry import measurement
 
@@ -45,17 +47,11 @@ def _resolve_imaging_template(template: str, sequencer, *, trigger_channel: str 
     map the camera trigger onto a real channel.  Either way the result is a one-trigger load->image
     program whose ``image`` duration is the readout window."""
     chans = list(getattr(sequencer, "channels", ()) or ())
-    text = str(template or "").strip()
-    state = None
-    if text:
-        path = Path(text)
-        if not path.is_file():
-            path = resolve_under_project(text)
-        if path.is_file():
-            loaded = PulseTableState.load(path)
-            if chans and all(c in chans for c in loaded.channels):
-                state = loaded                       # channels already match -> honour the template
-    if state is None:
+    loaded = resolve_pulse_template(template, default_name=DEFAULT_IMAGING_TEMPLATE,
+                                    default_factory=single_imaging_template)
+    if chans and all(c in chans for c in loaded.channels):
+        state = loaded                               # channels already match -> honour the template
+    else:
         kw = imaging_channel_kwargs(sequencer, trigger_channel=trigger_channel)
         role_kwargs = {k: kw[k] for k in
                        ("trap_channel", "cooling_channel", "probe_channel", "trigger_channel") if k in kw}

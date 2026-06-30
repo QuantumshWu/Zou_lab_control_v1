@@ -13,13 +13,10 @@ the SAME builder the notebook one-liner (``exp.readout.temperature(...)``) uses 
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import numpy as np
 
-from Zou_lab_control._paths import resolve_under_project
 from ...core.analysis import positive_int
-from ...timing import PulseTableState, imaging_channel_kwargs
+from ...timing import PulseTableState, imaging_channel_kwargs, resolve_pulse_template
 from ..measurement import MeasurementSpec, ParamDecl, axis_range_tuple
 from ..measurement_registry import measurement
 from ..temperature import build_release_recapture_pulse
@@ -48,14 +45,20 @@ def _resolve_release_recapture_template(template: str, sequencer, *, trigger_cha
     role->channel single source as the imaging path -- so a role-named template still fires on real
     hardware.  ``trigger_channel`` is the CAMERA's ``capture_trigger_channels[0]`` (the sequencer no
     longer owns it): a real chNN streamer needs it to map the camera trigger onto a real channel.  Either
-    way the result keeps the trap-off duration scan slot ``build_temperature_scan`` requires."""
-    text = str(template or "").strip() or DEFAULT_RR_TEMPLATE
-    path = Path(text)
-    if not path.is_file():
-        path = resolve_under_project(text)
-    if not path.is_file():
-        raise FileNotFoundError(f"release-recapture pulse template not found: {text}")
-    loaded = PulseTableState.load(path)
+    way the result keeps the trap-off duration scan slot ``build_temperature_scan`` requires.  A template
+    the operator NAMED but that resolves to no file fails LOUD (the selection step is real, never a silent
+    fall-back) -- the ``default_factory`` reached only when the named file is absent raises rather than
+    fabricating a default."""
+    named = bool(str(template or "").strip())
+
+    def _missing() -> PulseTableState:
+        raise FileNotFoundError(
+            f"release-recapture pulse template not found: {str(template).strip()}")
+
+    loaded = resolve_pulse_template(
+        template, default_name=DEFAULT_RR_TEMPLATE,
+        default_factory=(_missing if named else build_release_recapture_pulse),
+    )
     chans = list(getattr(sequencer, "channels", ()) or ())
     if chans and all(c in chans for c in loaded.channels):
         return loaded                                # channels already match -> honour the template
