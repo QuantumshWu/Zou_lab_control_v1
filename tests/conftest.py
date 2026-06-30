@@ -1,7 +1,23 @@
+import os
 from pathlib import Path
 import sys
 
 import pytest
+
+# Pin the non-interactive Agg backend for the WHOLE test session, in ONE place (this conftest
+# loads before any test module).  Otherwise matplotlib lazily resolves to the GUI 'qtagg' backend
+# the first time a test creates a figure under PyQt5, and every plt.figure() then spawns a real Qt
+# FigureManager.  The suite USED to set Agg only in scattered per-file `matplotlib.use("Agg")`
+# calls, so any test that ran before the first such call (alphabetically earlier) created live Qt
+# managers; those are destroyed at interpreter shutdown racing with the QApplication teardown -> an
+# INTERMITTENT process-exit segfault (exit 139) even though every test passed.  Pinning Agg here is
+# the single source that makes the backend deterministic and kills that flaky teardown crash.  The
+# GUI panel canvas (EmbeddedFigureCanvas, an explicit FigureCanvasQTAgg) is unaffected: it imports
+# the Qt backend directly, independent of this default.
+os.environ.setdefault("MPLBACKEND", "Agg")
+import matplotlib  # noqa: E402
+
+matplotlib.use("Agg")
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
