@@ -34,7 +34,7 @@ pytest.importorskip("matplotlib")
 
 from Zou_lab_control.frontend.qt_fluent import ensure_qt_app  # noqa: E402
 from Zou_lab_control.frontend import plot as _plot  # noqa: E402
-from Zou_lab_control.frontend.qt_canvas import panel_canvas, EmbeddedFigureCanvas  # noqa: E402
+from Zou_lab_control.frontend.qt_canvas import panel_canvas  # noqa: E402
 from Zou_lab_control.frontend.style import DESIGN_DPI  # noqa: E402
 from Zou_lab_control.frontend.live import PANEL_DISPLAY_SCALE  # noqa: E402
 
@@ -72,25 +72,21 @@ def test_resync_re_asserts_the_same_fixed_size():
     assert (c.width(), c.height()) == size0
 
 
-def test_canvas_size_is_invariant_under_a_screen_ratio_change():
-    # The core bug: a screen-ratio change must move ONLY the render buffer dpi, never the widget size.
+def test_widget_size_does_not_follow_the_render_buffer_resolution():
+    # The core bug: the widget size was figure.bbox / device_pixel_ratio (sizeHint), so anything that
+    # inflated the render buffer dpi (a hi-DPI screen, a render-scale change) grew the widget.  The fix
+    # sizes the widget from the DPR-free _zlc_design_size, so the buffer dpi can change freely while the
+    # widget size stays put.  (Varying _zlc_render_scale -- an instance attr -- safely models a buffer
+    # resolution change, without monkeypatching the C++ devicePixelRatioF, which corrupts the sip type.)
     ensure_qt_app()
     c = _hist_canvas()
     size0 = (c.width(), c.height())
     dpi0 = float(c.figure.dpi)
-    base = EmbeddedFigureCanvas.__mro__[1]                 # the matplotlib FigureCanvasQTAgg base
-    had_own = "devicePixelRatioF" in base.__dict__
-    saved = base.__dict__.get("devicePixelRatioF")
-    base.devicePixelRatioF = lambda self: 1.5             # pretend we moved onto a 150% hi-DPI screen
-    try:
-        c._zlc_resync()                                   # the deferred resync reads the new ratio
-        assert (c.width(), c.height()) == size0, "a DPR change must NOT resize the widget (only the buffer)"
-        assert c.figure.dpi > dpi0, "the render buffer dpi SHOULD track the higher screen ratio (crisp)"
-    finally:
-        if had_own:
-            base.devicePixelRatioF = saved
-        else:
-            del base.devicePixelRatioF                    # was inherited: remove the patch, restore it
+    c._zlc_render_scale = c._zlc_render_scale * 2.0        # a higher-resolution render buffer
+    c._zlc_sync()                                          # re-derive figure dpi + widget size
+    assert c.figure.dpi != dpi0, "the render BUFFER dpi must follow the resolution change"
+    assert (c.width(), c.height()) == size0, "the WIDGET size must NOT follow the buffer dpi (DPR-free)"
+    assert (c.width(), c.height()) == (c._zlc_design_size().width(), c._zlc_design_size().height())
 
 
 def test_buffer_is_rendered_synchronously_never_blank():
