@@ -104,7 +104,6 @@ state = na.PulseTableState.load("pulses/camera_imaging_address_switch.json")
 
 program = state.compile(
     clock_hz=exp.devices.sequencer.clock_hz,        # 默认 50 MHz
-    trigger_channels=exp.devices.sequencer.trigger_channels,
     repeat_forever=False,
 )
 print(program.ticks)   # 例如 [0, 100000, 105000, 106000, 1105000, 1106000]
@@ -159,7 +158,6 @@ masks: 513, 512, 2568, 520, 512, 0
 state = na.PulseTableState.load("pulses/camera_imaging_address_switch.json")
 program = state.compile(
     clock_hz=exp.devices.sequencer.clock_hz,
-    trigger_channels=exp.devices.sequencer.trigger_channels,
     repeat_forever=False,
 )
 exp.devices.sequencer.prepare(program)
@@ -690,7 +688,7 @@ masks = [513,    512,    2568,   ...]
 
 \section{从 PulseSequence 到边沿表：compile\_runtime\_program}
 
-把一个 PulseSequence 变成可上传程序的函数是 \pyapi{compile_runtime_program(sequence, *, channels, clock_hz, trigger_channels)}，定义在 \filepath{Zou\_lab\_control/neutral\_atom/devices/sequencer.py}。它返回一个 \tfocus{RuntimeSequenceProgram}。
+把一个 PulseSequence 变成可上传程序的函数是 \pyapi{compile_runtime_program(sequence, *, channels, clock_hz)}，定义在 \filepath{Zou\_lab\_control/neutral\_atom/devices/sequencer.py}。它返回一个 \tfocus{RuntimeSequenceProgram}。
 
 它内部做的事，按顺序：
 \begin{enumerate}
@@ -699,7 +697,7 @@ masks = [513,    512,    2568,   ...]
 \item 计算 loop\_end\_tick：如果序列设了重复周期 repeat\_period，就用它换算成 tick；否则用最后一条边沿的 tick。这决定了硬件循环回绕的位置。
 \item 用 \pyapi{_ensure_final_off_edge(...)} 在循环末尾补一条"全关"边沿，保证回绕前输出干净。
 \item 把 sequence、clock\_hz、channels、ticks、masks 等打包，算一个 sha256 截断作为 \pyapi{sequence_id}（用于去重/缓存）。
-\item 组装并返回 RuntimeSequenceProgram，里面带上 ticks/masks、duration、trigger\_count（用 trigger\_channels 数触发脉冲个数）、repeat\_forever、loop\_start\_index、loop\_end\_tick、loop\_count 等元数据。
+\item 组装并返回 RuntimeSequenceProgram，里面带上 ticks/masks、duration、repeat\_forever、loop\_start\_index、loop\_end\_tick、loop\_count 等元数据。序列器是\tfocus{纯脉冲流送器}：它只编译并流送边沿表，不知道哪条通道是相机触发，也不在程序里数触发次数。\tfocus{要数一段序列里相机被触发几次}（每次触发出一帧），用相机层的 \pyapi{count_trigger_pulses(sequence, trigger_channels=...)}（定义在 \filepath{Zou\_lab\_control/neutral\_atom/devices/camera\_trigger.py}），并传入\tfocus{相机自己的} \pyapi{capture_trigger_channels}——这条 TTL 线接哪是相机的属性。
 \end{enumerate}
 
 \tfocus{关键点}：边沿表本身\tfocus{不把重复展开}。一个会重复 1000 次的成像循环，边沿表只存一份，配上 loop\_end\_tick 和 loop\_count，让硬件自己回绕。这就是为什么内部先 \pyapi{without_repeat()} 拿基础边沿，再单独带上循环元数据。
@@ -723,12 +721,15 @@ prog = compile_runtime_program(
     seq,
     channels=[f"ch{n:02d}" for n in range(62)],   # bit0=ch00, bit1=ch01, ...
     clock_hz=50e6,                                  # 20ns/tick
-    trigger_channels=["ch11"],                      # 数相机触发个数
 )
 
 print(prog.ticks)          # 绝对 tick 列表
 print(prog.masks)          # 与 ticks 对齐的全量掩码列表
-print(prog.trigger_count)  # = 1（emCCD 触发了一次）
+
+# 数相机触发个数（每次触发出一帧）是相机层的事：用 count_trigger_pulses，
+# 传相机自己的 capture_trigger_channels（这里 emCCD 接在 ch11）。
+from Zou_lab_control.neutral_atom.devices.camera_trigger import count_trigger_pulses
+print(count_trigger_pulses(seq, trigger_channels=["ch11"]))  # = 1（emCCD 触发了一次）
 \end{codeblock}
 
 这里 \pyapi{channels} 的\tfocus{顺序就是位序}：channels[0]→bit0。如果你把通道列表换个顺序，同样的脉冲会编出不同的掩码整数——但物理上等价。
@@ -755,8 +756,8 @@ PulseTableState 是 GUI 那张表的内存模型。它拥有的状态（谁拥�
 \item[\pyapi{with_slots_resolved(slots)}] 返回一个\tfocus{非扫描}的副本，把每个槽替换成常量值（时间槽吃 ns、dac 槽吃整数 DAC 码）。用于"每发设一个值"的简洁 Notebook 单点扫描。
 \item[\pyapi{analog_bus_plan(name)} / \pyapi{set_analog_bus_mode(...)} / \pyapi{set_bus_value(period, bus, value)}] 读/写某条模拟总线的逐周期方案（edge/hold + 值）。
 \item[\pyapi{to_sequence(...)}] 把这张表下沉成一个 PulseSequence（遍历周期，把每段连续为高的区间变成 \pyapi{seq.pulse(...)}，再对每通道套上延迟）。这是 PulseTableState → PulseSequence 的桥。
-\item[\pyapi{compile(*, clock_hz, trigger_channels, slots, repeat_forever)}] 把表（解析掉扫描槽后的单点）编译成一个静态运行时程序。内部转去 \pyapi{compile_pulse_table_runtime_program}。
-\item[\pyapi{compile_scan(*, clock_hz, scan_table, trigger_channels, repeat_forever)}] 把表连同扫描表一起编译成一个\tfocus{带扫描}的运行时程序（硬件逐点扫）。内部转去 \pyapi{compile_pulse_table_scan_runtime_program}。
+\item[\pyapi{compile(*, clock_hz, slots, repeat_forever)}] 把表（解析掉扫描槽后的单点）编译成一个静态运行时程序。内部转去 \pyapi{compile_pulse_table_runtime_program}。
+\item[\pyapi{compile_scan(*, clock_hz, scan_table, repeat_forever)}] 把表连同扫描表一起编译成一个\tfocus{带扫描}的运行时程序（硬件逐点扫）。内部转去 \pyapi{compile_pulse_table_scan_runtime_program}。
 \end{description}
 
 \begin{notebox}[槽号是位置而非名字]
@@ -896,7 +897,7 @@ seq = RemoteSequencer(
     clock_hz=50e6,          # 20 ns / tick
 )
 program = seq.prepare(pulse_table_state)   # 上传边沿表, 但不发射
-print(program.sequence_id, "triggers:", program.trigger_count)
+print(program.sequence_id)                 # 程序内容哈希 (用于去重 / 缓存)
 # 此刻 FPGA 装好弹、保险在, 输出仍是安全电平
 \end{codeblock}
 

@@ -81,13 +81,16 @@ XDC = PROJECT_ROOT / "references" / "source_archives" / "address_switch" / "addr
 CHANNELS = na.infer_xdc_channels(XDC)
 CHANNEL_LABELS = na.infer_xdc_channel_labels(XDC)
 CHANNEL_PINS = na.infer_xdc_channel_pins(XDC)
-TRIGGER_CHANNELS = na.infer_xdc_trigger_channels(XDC)
-if not TRIGGER_CHANNELS:
+# 相机触发线（emCCD）只是给控制机的相机配 capture_trigger_channels 用的提示：
+# 序列器是纯脉冲流送器，不感知谁被它触发，所以下面 server / RemoteSequencer 都不接它。
+CAMERA_TRIGGER_CHANNELS = na.infer_xdc_trigger_channels(XDC)
+if not CAMERA_TRIGGER_CHANNELS:
     raise RuntimeError("The selected XDC must label the camera trigger output as emCCD.")
 CLOCK_HZ = 50_000_000.0
 
 print("channel count:", len(CHANNELS))
-print("trigger:", TRIGGER_CHANNELS, {ch: CHANNEL_LABELS.get(ch) for ch in TRIGGER_CHANNELS})
+print("camera trigger line:", CAMERA_TRIGGER_CHANNELS,
+      {ch: CHANNEL_LABELS.get(ch) for ch in CAMERA_TRIGGER_CHANNELS})
 print("camera subset:", {ch: (CHANNEL_LABELS.get(ch), CHANNEL_PINS.get(ch)) for ch in ("ch09", "ch00", "ch03", "ch11")})
 print("trig output still exists:", "ch06", CHANNEL_LABELS.get("ch06"), CHANNEL_PINS.get("ch06"))
 print("clock:", CLOCK_HZ, "Hz; step:", 1e9 / CLOCK_HZ, "ns")
@@ -147,7 +150,8 @@ os.environ["ZLC_PS_XDC"] = str(XDC)
 
 for key in ("ZLC_PS_VIVADO_BIN", "ZLC_PS_VIVADO_BIT", "ZLC_PS_VIVADO_LTX", "ZLC_PS_XDC"):
     print(key, Path(os.environ[key]).exists(), os.environ[key])
-print("server config", {"channels": len(CHANNELS), "trigger_channels": TRIGGER_CHANNELS, "clock_hz": CLOCK_HZ})
+print("server config", {"channels": len(CHANNELS), "clock_hz": CLOCK_HZ})
+print("camera trigger line (configure on the CONTROL computer's camera):", CAMERA_TRIGGER_CHANNELS)
 
 <!-- cell:markdown -->
 ## 3. PowerShell command equivalent
@@ -181,7 +185,6 @@ python -m Zou_lab_control.neutral_atom.devices.sequencer_server `
   --host {HOST} `
   --port {PORT} `
   --channels {" ".join(CHANNELS)} `
-  --trigger-channels {" ".join(TRIGGER_CHANNELS)} `
   --clock-hz {CLOCK_HZ:g} `
   --state-dir "{STATE_DIR}"
 """)
@@ -195,7 +198,6 @@ python -m Zou_lab_control.neutral_atom.devices.sequencer_server `
 <!-- cell:code -->
 na.run_sequencer_server(
     channels=CHANNELS,
-    trigger_channels=TRIGGER_CHANNELS,
     host=HOST,
     port=PORT,
     clock_hz=CLOCK_HZ,
@@ -253,7 +255,6 @@ connected to the running server rather than offline mode.
 #     port=PORT,
 #     channels=CHANNELS,
 #     clock_hz=CLOCK_HZ,
-#     trigger_channels=TRIGGER_CHANNELS,
 # )
 # pulse_gui = zf.show_pulse_gui(
 #     state=na.PulseTableState.load(PROJECT_ROOT / "pulses" / "camera_imaging_address_switch.json"),

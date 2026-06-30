@@ -50,7 +50,7 @@ class BaseDevice:
     def close(self): ...
     def snapshot(self) -> dict: ...          # 单一公共方法:记录可复现状态(存数据时聚合)
 class CameraDevice(BaseDevice):
-    def acquire(self, frames, *, sequence=None, sequencer=None) -> np.ndarray: ...  # 既有契约,不变
+    def acquire(self, frames, *, sequence=None, on_armed=None) -> list: ...  # 纯 grabber:arm 后回调 on_armed 让测量层 fire FPGA,自己不驱动序列器
     def arm(self, n_buffer=64): ...          # 起采集线程 + ring(deque maxlen=N),每 trigger 入一帧
     def latest(self): ...                    # live 取最新一帧
     def drain(self): ...                     # 取"上次以来全部新帧"(无损);measurement 用它

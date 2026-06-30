@@ -144,14 +144,14 @@ scan_state = na.PulseTableState(
 scan_state.bind_field("duration", "1", label="image width")   # period 1 duration -> s0
 scan_state = scan_state.set_scan_table([[240], [500], [1000], [2000]])  # N_points x N_slots, ns
 
-scan_program = scan_state.compile_scan(clock_hz=50_000_000, trigger_channels=["ch11"])
+scan_program = scan_state.compile_scan(clock_hz=50_000_000)
 scan_program.scan_points, scan_program.ticks  # 一个 program 携带全部扫描点(tick 单位)
 
 <!-- cell:code -->
 # 单点检查：with_slots_resolved 把 s0 换成一个具体值(其余 slot 保持 nominal)，
 # 得到一张普通的静态表；compile(slots=...) 等价。
 single = scan_state.with_slots_resolved({"s0": 500})
-single_program = single.compile(clock_hz=50_000_000, trigger_channels=["ch11"])
+single_program = single.compile(clock_hz=50_000_000)
 [(width, scan_state.total_duration_steps(slots={"s0": width}, time_step_ns=20))
  for width in [240, 500, 1000, 2000]], single_program.ticks
 
@@ -165,8 +165,9 @@ sequencer = na.RemoteSequencer(
     port=18861,
     channels=[f"ch{i:02d}" for i in range(62)],
     clock_hz=50_000_000,
-    trigger_channels=["ch11"],  # emCCD/M13 in the checked-in address-switch XDC
 )
+# 哪条线触发相机（emCCD/M13）是相机的属性（camera.capture_trigger_channels），
+# 不是序列器的——序列器是纯脉冲流送器，不感知谁被它触发。
 gui = zf.show_pulse_gui(
     state=na.PulseTableState.load("pulses/camera_imaging_address_switch.json"),
     sequencer=sequencer,
@@ -177,7 +178,7 @@ The API equivalent of pressing `On Pulse` is:
 
 ```python
 state = na.PulseTableState.load("pulses/camera_imaging_address_switch.json")
-program = state.compile(clock_hz=50_000_000, trigger_channels=["ch11"])
+program = state.compile(clock_hz=50_000_000)
 sequencer.prepare(program)
 sequencer.fire()
 ```

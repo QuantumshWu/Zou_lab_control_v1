@@ -147,13 +147,16 @@ GUI 不是单独硬件层；下面的 API 和 GUI `On Pulse` 调的是同一个 
 state = na.PulseTableState.load("pulses/camera_imaging_address_switch.json")
 program = state.compile(
     clock_hz=exp.devices.sequencer.clock_hz,
-    trigger_channels=exp.devices.sequencer.trigger_channels,
     repeat_forever=False,
 )
+# 数相机被触发几次（每次出一帧）是相机层的事：用 count_trigger_pulses，传相机
+# 自己持有的 capture_trigger_channels（哪条 TTL 线触发相机是相机的属性，序列器不感知）。
+imaging_seq = state.to_sequence()
 {
     "ticks": program.ticks[:8],
     "masks": program.masks[:8],
-    "trigger_count": program.trigger_count,
+    "trigger_count": na.count_trigger_pulses(
+        imaging_seq, trigger_channels=exp.camera.capture_trigger_channels),
     "repeat_forever": program.repeat_forever,
 }
 
