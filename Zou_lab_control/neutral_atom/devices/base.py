@@ -115,7 +115,28 @@ class CameraDevice(BaseDevice):
 
     @abstractmethod
     def configure(self, *, exposure: float | None = None, **kwargs) -> None:
-        """Configure camera settings that are stable across an acquisition."""
+        """Configure camera settings that are stable across an acquisition.
+
+        Backends declare the keyword arguments they accept and reject any unknown
+        key via :meth:`_reject_unknown_configure_keys` -- so a mistyped or
+        backend-specific option fails LOUDLY and identically on every backend
+        (virtual == real), never silently ignored on one and a ``TypeError`` on
+        another."""
+
+    @staticmethod
+    def _reject_unknown_configure_keys(allowed: set[str], got) -> None:
+        """Raise ``ValueError`` listing the configurable options if ``got`` carries an
+        unknown key.
+
+        Shared so ``configure`` enforces the SAME contract on every backend: an
+        option a backend does not recognise is an explicit error (naming the keys it
+        DOES accept), not a silent no-op on one camera and a ``TypeError`` on the
+        next.  ``allowed`` is the backend's own configurable set (always includes
+        ``exposure``); ``got`` is its ``**kwargs`` of leftover keys."""
+        unknown = sorted(set(got) - allowed)
+        if unknown:
+            raise ValueError(
+                f"unknown configure option(s) {unknown}; configurable: {sorted(allowed)}")
 
     @abstractmethod
     def acquire(self, frames: int = 1, *, sequence=None, on_armed=None, stop=None, **kwargs) -> list[np.ndarray]:

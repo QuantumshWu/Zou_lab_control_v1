@@ -633,7 +633,8 @@ class VirtualCamera(CameraDevice):
         # so a raw-frame Edit shows the ROI as the full window even before any sub-array is set
         return tuple(self.trap_array.image_shape)
 
-    def configure(self, *, exposure: float | None = None, roi: object = None, **_) -> None:
+    def configure(self, *, exposure: float | None = None, roi: object = None, **kwargs) -> None:
+        self._reject_unknown_configure_keys({"exposure", "roi"}, kwargs)
         if exposure is not None:
             self.exposure = positive_float(exposure, "exposure")
         if roi is not None:

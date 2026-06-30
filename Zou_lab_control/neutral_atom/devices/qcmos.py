@@ -109,7 +109,8 @@ class QCMOSCamera(CameraDevice):
             return None
         return (int(max_h), int(max_w)) if max_w and max_h else None
 
-    def configure(self, *, exposure: float | None = None, readout_speed: int | None = None, roi: Sequence[int] | None | object = None) -> None:
+    def configure(self, *, exposure: float | None = None, readout_speed: int | None = None, roi: Sequence[int] | None | object = None, **kwargs) -> None:
+        self._reject_unknown_configure_keys({"exposure", "readout_speed", "roi"}, kwargs)
         if exposure is not None:
             self.config.exposure = positive_float(exposure, "exposure")
         if readout_speed is not None:

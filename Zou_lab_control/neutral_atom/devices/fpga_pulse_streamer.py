@@ -20,7 +20,7 @@ from typing import Mapping, Sequence
 
 from .sequencer import RuntimeSequenceProgram
 from ..timing import channel_names
-from ..timing.verilog import CONTROL_PORTS, safe_identifier
+from ..timing.verilog import CONTROL_PORTS
 
 
 # The reconfigurable, compile-affecting specifics (channel/edge/scan/bus/delay geometry,
@@ -969,16 +969,6 @@ def _check_delay_event_capacity(program, *, evt_depth: int, frac_bits: int,
                 f"larger evt_fifo_depth.")
 
 
-def _safe_channel_identifiers(channels: Sequence[str], *, reserved: set[str]) -> list[str]:
-    safe_channels = [safe_identifier(channel) for channel in channels]
-    if len(set(safe_channels)) != len(safe_channels):
-        raise ValueError("channel names collide after Verilog identifier sanitization.")
-    collisions = sorted(set(safe_channels) & set(reserved))
-    if collisions:
-        raise ValueError(f"channel names collide with pulse-streamer top-level names: {collisions}")
-    return safe_channels
-
-
 def _label_from_xdc_comment(comment: str, channel: str) -> str:
     text = str(comment or "").strip()
     if not text:
@@ -1016,14 +1006,6 @@ def _positive_int(value, name: str) -> int:
     if out <= 0:
         raise ValueError(f"{name} must be positive.")
     return out
-
-
-def _env_first(*names: str) -> str | None:
-    for name in names:
-        value = os.environ.get(name)
-        if value:
-            return value
-    return None
 
 
 def _resolve_xdc_path(xdc_path: str | Path | None) -> Path | None:
