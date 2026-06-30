@@ -745,9 +745,9 @@ class VirtualSequencer(SequencerDevice):
 
     @property
     def firing(self) -> PulseSequence | None:
-        """The repeat_forever program the streamer is continuously playing, or None when
-        idle/safe.  The live (no-sequence) camera read is gated on this -- it is the
-        software model of "the FPGA is emitting camera triggers right now"."""
+        """The repeat_forever program this in-process streamer is continuously playing, or None
+        when idle/safe -- the override of :attr:`SequencerDevice.firing` (which defaults None for a
+        real/remote streamer with no host-side firing flag)."""
         return self._firing
 
     def prepare(self, sequence: PulseSequence | PulseTableState):

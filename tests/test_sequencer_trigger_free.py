@@ -40,6 +40,35 @@ def test_camera_owns_the_capture_trigger_channel_not_the_sequencer():
         exp.close()
 
 
+def test_firing_is_a_sequencer_contract_with_real_default_none():
+    """``firing`` (the live "is the streamer continuously playing a program" handle the camera read
+    is gated on) is declared on the SequencerDevice base, NOT a duck-typed attribute only on the
+    virtual backend.  A real/remote streamer keeps no host-side firing flag -- the camera learns it
+    from the presence/absence of hardware trigger edges -- so the contract default is None.  This
+    pins that the abstraction owns the notion (callers read ``seqr.firing`` directly, no getattr)."""
+    from Zou_lab_control.neutral_atom.devices.base import SequencerDevice
+
+    assert "firing" in vars(SequencerDevice)               # declared on the abstract contract
+    seq = na.RuntimeSequencer(channels=["ch00", "ch11"], clock_hz=50e6)
+    assert isinstance(seq, SequencerDevice)
+    assert seq.firing is None                              # real backend default = correct semantics
+
+
+def test_virtual_sequencer_overrides_firing_with_its_played_program():
+    """The in-process VirtualSequencer overrides ``firing`` to expose the repeat_forever program it
+    is simulating: None when idle, the program once fired forever, None again after safe-state."""
+    from Zou_lab_control.neutral_atom.devices.virtual import VirtualSequencer
+
+    seqr = VirtualSequencer()
+    assert seqr.firing is None                             # idle
+    seq = na.imaging_sequence(exposure=1e-3, load=True, name="live").forever()
+    seqr.prepare(seq)
+    seqr.fire(seq)
+    assert seqr.firing is not None                         # streaming a continuous program
+    seqr.set_safe_state()
+    assert seqr.firing is None                             # Stop Pulse -> cleared
+
+
 def test_count_trigger_pulses_lives_in_the_camera_seam():
     # The trigger-counting util moved out of timing into the camera layer; na re-exports it.
     from Zou_lab_control.neutral_atom.devices.camera_trigger import (

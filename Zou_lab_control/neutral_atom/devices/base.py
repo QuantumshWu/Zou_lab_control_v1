@@ -254,6 +254,21 @@ class SequencerDevice(BaseDevice):
     def fire(self, sequence=None) -> None:
         """Start a previously prepared sequence."""
 
+    @property
+    def firing(self) -> "Any | None":
+        """The ``repeat_forever`` program the streamer is continuously playing, or None when
+        idle/safe.  The live (no-sequence) camera read is gated on this -- it is the software
+        model of "the FPGA is emitting camera triggers right now".
+
+        Part of the contract (like :meth:`scan_progress`) so the camera/measurement layer reads
+        the live firing state through the abstraction, not via a duck-typed ``getattr`` on a
+        concrete backend.  Default None: a real/remote streamer keeps no local firing flag -- the
+        camera learns "is it triggering" from the PRESENCE/ABSENCE of hardware trigger edges, not
+        from a host-side handle -- so None is the correct real-hardware semantics.  The in-process
+        VirtualSequencer overrides this to expose the program it is simulating."""
+
+        return None
+
     def wait_done(self, timeout: float | None = None) -> bool:
         """Wait until the prepared finite sequence is done, when supported."""
 
