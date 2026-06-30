@@ -16,6 +16,11 @@ from ..core.analysis import finite_float, positive_float, positive_int
 CLOCK_GRID_RTOL = 1e-12
 CLOCK_GRID_ATOL_TICKS = 1e-9
 
+# Floating-point slack when comparing a repeat period against the base sequence
+# duration: period >= base_duration is the physical requirement, but a period set
+# exactly equal to base_duration can land a few ULP below it after arithmetic.
+_PERIOD_DURATION_SLACK = 1e-15
+
 
 @dataclass(frozen=True)
 class Pulse:
@@ -112,20 +117,12 @@ class PulseSequence:
     def repeated(self, repeats: int, *, period: float | None = None) -> "PulseSequence":
         repeats = positive_int(repeats, "repeats")
         period = self.base_duration if period is None else finite_float(period, "period")
-        if period <= 0:
-            raise ValueError("period must be > 0.")
-        if period + 1e-15 < self.base_duration:
-            raise ValueError("period must be at least the base sequence duration.")
         out = PulseSequence(self.pulses, name=self.name, delays=self.delays, repeat_count=repeats, repeat_period=period)
         out.validate().raise_if_failed()
         return out
 
     def forever(self, *, period: float | None = None) -> "PulseSequence":
         period = self.base_duration if period is None else finite_float(period, "period")
-        if period <= 0:
-            raise ValueError("period must be > 0.")
-        if period + 1e-15 < self.base_duration:
-            raise ValueError("period must be at least the base sequence duration.")
         out = PulseSequence(self.pulses, name=self.name, delays=self.delays, repeat_count=1, repeat_period=period, repeat_forever=True)
         out.validate().raise_if_failed()
         return out
@@ -185,7 +182,7 @@ class PulseSequence:
             period = self.repeat_period or base_duration
             if period <= 0:
                 errors.append("repeat period must be > 0.")
-            elif period + 1e-15 < base_duration:
+            elif period + _PERIOD_DURATION_SLACK < base_duration:
                 errors.append("repeat period must be at least the base sequence duration.")
             if clock is not None and period > 0 and _time_to_clock_tick(period, clock) is None:
                 errors.append(f"repeat period={period:g} s is not on the {clock:g} Hz clock grid.")

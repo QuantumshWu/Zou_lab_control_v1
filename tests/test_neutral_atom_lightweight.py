@@ -979,6 +979,26 @@ def test_fpga_pulse_streamer_compiles_channel_delay_and_repeated_frames():
     assert program.loop_count == 2
 
 
+def test_repeated_period_equal_to_base_duration_is_accepted_but_shorter_rejected():
+    """``repeated``/``forever`` resolve the default period then defer all legality to
+    ``validate()`` (no duplicated if-raise). The boundary is period >= base_duration with a
+    tiny floating-point slack: a period set exactly equal to base_duration must be accepted,
+    while one meaningfully below it must be rejected by the single validate() check."""
+    seq = na.PulseSequence(name="period_boundary").pulse("trap", 0.0, 2e-8)
+    base = seq.base_duration
+    assert base == pytest.approx(2e-8)
+
+    # period == base_duration: accepted by both entry points (no raise).
+    assert seq.repeated(2, period=base).repeat_period == pytest.approx(base)
+    assert seq.forever(period=base).repeat_period == pytest.approx(base)
+
+    # period below base_duration (well beyond the float slack): rejected via validate().
+    with pytest.raises(ValueError):
+        seq.repeated(2, period=base * 0.5)
+    with pytest.raises(ValueError):
+        seq.forever(period=base * 0.5)
+
+
 def test_pulse_table_validate_and_to_sequence_accept_clock_hz_alias():
     """clock_hz is an ergonomic alias for time_step_ns on validate()/to_sequence(): the rest
     of the API (compile/compile_scan/from_sequence/PulseSequence.validate) speaks clock_hz, so
