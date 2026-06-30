@@ -2507,12 +2507,7 @@ def run_fluent_window(
         hide_on_close=not in_GUI,
     )
 
-    screen = app.primaryScreen()
-    if screen is not None:
-        screen_geo = screen.availableGeometry()
-        frame = window.frameGeometry()
-        frame.moveCenter(screen_geo.center())
-        window.move(frame.topLeft())
+    center_window_on_primary_screen(window, app)
     window.show()
 
     if in_GUI:
