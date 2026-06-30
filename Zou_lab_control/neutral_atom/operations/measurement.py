@@ -197,6 +197,34 @@ class MeasurementSpec(CatalogSpec):
         # Two measurements publishing the same bare x_key/y_key would clobber on the hub.
         return (self.x_key, self.y_key)
 
+    def make_node(self, hub, *, prefix: str = "", repeat: int = 1, **values):
+        """Build the LIVE logic node this measurement drives -- the ``ProcessorSpec.make_node``
+        counterpart, so a decoupled console (or the notebook) asks the SPEC for its node instead of
+        knowing which concrete node class a measurement uses.
+
+        ``build(**values)`` returns the per-point ENGINE (a :class:`ScannedMeasurement`, or -- for the
+        generic pulse scan -- a :class:`PulseScanPlan` carrier); this wraps it in the matching swept
+        node behind ``prefix`` with the acquisition ``repeat`` knob (0 = ∞).  WHICH node is the scan
+        TIER, declared ONCE on the spec (``metadata['node']``): ``"pulse_scan"`` is the DECOUPLED tier
+        (a device driver whose y is a ``signal_expr`` off another node -> :class:`PulseScanNode`);
+        anything else (incl. the COUPLED temperature/fidelity tier, whose y is reduced inline over a
+        loading's frames) is a frame-reducing :class:`ScannedMeasurementNode`.  The tier's physics
+        (acquire(1) vs the 2-trigger single loading) is pinned by ``tests/test_scan_tier_boundary.py``;
+        this method only routes to the node that tier implies, it does NOT change what is fired/read.
+
+        The concrete node classes are imported HERE (lazily) so the GUI never imports
+        ``operations.logic`` to pick a node by a metadata string -- the spec owns the assembly."""
+        from .logic import PulseScanNode, ScannedMeasurementNode
+
+        built = self.build(**values)
+        prefix = str(prefix)
+        repeat = max(0, int(repeat))
+        if self.metadata.get("node") == "pulse_scan":
+            return PulseScanNode(hub, built, x_key=self.x_key, y_key=self.y_key,
+                                 prefix=prefix, repeat=repeat)
+        return ScannedMeasurementNode(hub, built, x_key=self.x_key, y_key=self.y_key,
+                                      prefix=prefix, repeat=repeat)
+
 
 @dataclass(frozen=True)
 class ScanAxis:

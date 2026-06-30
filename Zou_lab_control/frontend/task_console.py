@@ -5843,10 +5843,13 @@ class TaskConsole(QtWidgets.QWidget):
     def _build_logic_node(self, node: LogicNodeConfig, values: dict):
         """Build the node for a logic node, DISPLAY SUPPRESSED (publish-only).
 
-        Reuses the SAME build paths as the real readout / notebook:
-          * camera      -> readout.camera_measurement(hub)
-          * measurement -> spec.build(**values) wrapped in a ScannedMeasurementNode
-          * processor   -> a ProcessorRun driving the spec once
+        Reuses the SAME build paths as the real readout / notebook, and asks each SPEC to
+        assemble its own live node (so the console never imports a concrete na node class to
+        pick one by a metadata string):
+          * camera      -> readout.camera_spec().build(hub, ...)
+          * measurement -> spec.make_node(hub, prefix=, repeat=, **values)  (the spec's scan tier
+                           picks PulseScanNode vs ScannedMeasurementNode)
+          * processor   -> spec.make_node(...) (reactive) or a ProcessorRun (one-shot)
           * task        -> spec.build(hub, **values)
         None of these ever opens a matplotlib plot -- they only publish to the hub."""
         kind = node.kind
@@ -5866,27 +5869,15 @@ class TaskConsole(QtWidgets.QWidget):
         if spec is None:
             raise RuntimeError(f"no catalog spec named {node.name!r} for a {kind} node")
         if kind == "measurement":
-            # ``repeat`` (re-run the whole scan N times, 0 = ∞) is the MEASUREMENT knob -- pop it and
-            # hand the count to the node.  The node only FILLS its raw ``(ring, points, dim)`` block;
-            # HOW the repeats are displayed is the PLOT's ``repeat_mode``, so no combine selector is
-            # passed here (#H3l).
+            # The SPEC owns the assembly (its ProcessorSpec.make_node counterpart): ask it for the live
+            # node.  ``repeat`` (re-run the whole scan N times, 0 = ∞) is the MEASUREMENT knob -- pop it
+            # and hand the count to make_node; the node only FILLS its raw ``(ring, points, dim)`` block,
+            # HOW the repeats are displayed is the PLOT's ``repeat_mode`` (#H3l).  WHICH concrete node
+            # (decoupled PulseScanNode vs frame-reducing ScannedMeasurementNode) is the spec's scan TIER,
+            # not a string the GUI parses; the node publishes under the measurement's slug (spec.key) so
+            # every signal is ``<slug>_<quantity>`` (e.g. temperature_t_off) -- one name, derived.
             repeat = self._repeat_value(values)
-            built = spec.build(**values)
-            if getattr(spec, "metadata", {}).get("node") == "pulse_scan":
-                # Pulse-scan is a DEVICE-driving node whose y is DECOUPLED (subscribed from
-                # another running node), not a frame-reducing ScannedMeasurementNode: it fires +
-                # publishes the frame, waits for the consumer to refresh, then reads the y
-                # expression.  ``build`` returned a PulseScanPlan carrier.  ``repeat`` (0 = ∞) is the
-                # whole-sweep count -- a pulse-scan pass IS a sweep, so it is the ONE repeat axis.
-                from Zou_lab_control.neutral_atom.operations.logic import PulseScanNode
-                return PulseScanNode(self.hub, built, x_key=spec.x_key, y_key=spec.y_key,
-                                     prefix=f"{spec.key}_", repeat=repeat)
-            from Zou_lab_control.neutral_atom.operations.logic import ScannedMeasurementNode
-            # The node publishes under the measurement's slug (spec.key), so every signal
-            # is ``<slug>_<quantity>`` (e.g. temperature_t_off) -- one name, derived.
-            return ScannedMeasurementNode(
-                self.hub, built, x_key=spec.x_key, y_key=spec.y_key, prefix=f"{spec.key}_",
-                repeat=repeat)
+            return spec.make_node(self.hub, prefix=f"{spec.key}_", repeat=repeat, **values)
         if kind == "processor":
             # REACTIVE processor (the "func" layer): a live node consuming hub signals
             # and republishing derived ones -- e.g. judging occupancy from each frame.

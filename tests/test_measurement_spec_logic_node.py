@@ -114,6 +114,74 @@ def test_builtin_specs_build_unrun_scanned_measurements():
     assert m_dur.axis.values.size == 11
 
 
+# --------------------------------------------- spec.make_node (spec owns assembly)
+
+
+def test_measurement_spec_make_node_builds_a_live_node_matching_its_declared_signals():
+    """The ``ProcessorSpec.make_node`` counterpart: EVERY discovered measurement spec assembles its OWN
+    live logic node via ``spec.make_node(hub, prefix=, repeat=)`` -- the console no longer imports a
+    concrete na node class to pick one by a metadata string.  The node it returns is a real LogicNode
+    that publishes EXACTLY the signals the spec implies behind the prefix (``<slug>_<x>``/``<slug>_<y>``),
+    so the GUI's `_build_logic_node` reduces to one `make_node` call with no node-class knowledge."""
+    from Zou_lab_control.neutral_atom.operations.logic import LogicNode
+
+    exp = _calibrated_virtual_session(grid=(2, 3))
+    try:
+        hub = SignalHub()
+        for spec in exp.readout.measurement_specs():
+            node = spec.make_node(hub, prefix=f"{spec.key}_", repeat=1, **spec.defaults())
+            assert isinstance(node, LogicNode)
+            published = node.published_signals()
+            # both axes are published behind the slug prefix (the single source the GUI / picker read)
+            assert f"{spec.key}_{spec.x_key}" in published
+            assert f"{spec.key}_{spec.y_key}" in published
+    finally:
+        exp.close()
+
+
+def test_make_node_routes_each_scan_tier_to_its_node_class():
+    """make_node routes by the spec's scan TIER (its single source ``metadata['node']``), NOT by the
+    caller knowing a class: the DECOUPLED ``"pulse_scan"`` tier -> a PulseScanNode (device driver whose
+    y is a signal_expr off another node); the COUPLED temperature tier (no ``"pulse_scan"`` key) ->
+    a frame-reducing ScannedMeasurementNode.  The tier's physics is pinned by
+    test_scan_tier_boundary; here we pin that make_node honours it."""
+    from Zou_lab_control.neutral_atom.operations.logic import PulseScanNode, ScannedMeasurementNode
+
+    exp = _calibrated_virtual_session(grid=(2, 3))
+    try:
+        hub = SignalHub()
+        by_name = {s.name: s for s in exp.readout.measurement_specs()}
+        pscan = by_name["Pulse scan"]
+        temp = by_name["Temperature"]
+        assert pscan.metadata.get("node") == "pulse_scan"
+        assert temp.metadata.get("node") != "pulse_scan"
+        assert isinstance(pscan.make_node(hub, prefix="pulse_scan_", **pscan.defaults()), PulseScanNode)
+        assert isinstance(temp.make_node(hub, prefix="temperature_", **temp.defaults()),
+                          ScannedMeasurementNode)
+    finally:
+        exp.close()
+
+
+def test_task_console_does_not_import_concrete_scan_node_classes_to_assemble_measurements():
+    """DECOUPLING guard (#finding-14): the console's measurement-assembly path goes through
+    ``spec.make_node``, so ``task_console.py`` must NOT import the concrete scan node classes
+    (``PulseScanNode`` / ``ScannedMeasurementNode``) to pick one by ``metadata['node']``.  A regression
+    that re-couples the GUI to a concrete na node class re-adds such an import and trips this."""
+    from Zou_lab_control.frontend import task_console as tc_mod
+
+    src = Path(tc_mod.__file__).read_text(encoding="utf-8")
+    for cls in ("PulseScanNode", "ScannedMeasurementNode"):
+        # the names may still appear in PROSE (docstrings/comments) but never in an import statement
+        assert f"import {cls}" not in src and f"import ... {cls}" not in src
+    import re
+    for line in src.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("from ") and "operations.logic" in stripped and " import " in stripped:
+            imported = stripped.split(" import ", 1)[1]
+            assert "PulseScanNode" not in imported and "ScannedMeasurementNode" not in imported, (
+                f"task_console must not import a concrete scan node class: {stripped!r}")
+
+
 # ------------------------------------------------- ScannedMeasurementNode (sync)
 
 

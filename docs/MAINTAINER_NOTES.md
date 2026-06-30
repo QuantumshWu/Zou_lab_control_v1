@@ -1380,8 +1380,13 @@ pulse-scan the sole device driver; processors are not device-driving, so the wor
 the producer (occupancy) FIRST, then pulse-scan.
 
 `pulse_scan.py` `build()` returns a `PulseScanPlan` (base state + scan/api arrays + camera/sequencer
-+ y `SignalExpr` + `extra_delay_s`); the spec carries `metadata={"node": "pulse_scan"}` and the
-console builds a `PulseScanNode` (not a `ScannedMeasurementNode`) when it sees that tag. Pulse-scan
++ y `SignalExpr` + `extra_delay_s`); the spec carries `metadata={"node": "pulse_scan"}` to mark its
+scan TIER. `MeasurementSpec.make_node(hub, prefix=, repeat=)` (the `ProcessorSpec.make_node`
+counterpart) owns the spec→live-node assembly: it reads that tier tag and returns a `PulseScanNode`
+for the decoupled `"pulse_scan"` tier, else a `ScannedMeasurementNode` (the coupled
+temperature/fidelity tier reduces inline over a loading's frames). The console's `_build_logic_node`
+just calls `spec.make_node(...)` — it never imports a concrete na node class to pick one by the
+metadata string. Pulse-scan
 images ONCE per point (`camera.acquire(1)`) — it is decoupled from the camera's exposure/averaging,
 so there is no frame-count knob; the params are `template` + `pulse_slots` (api fixed/sweep + scan
 program + extra settle) + `y` (signal_expr) + `y_name` (the output signal name).
