@@ -72,6 +72,39 @@ def test_fit_toggle_changes_the_fit_on_any_data_no_silent_fallback():
     assert p.single_popt is None and p.bimodal_popt is None
 
 
+def test_create_through_real_console_path_draws_filled_overlays():
+    """END-TO-END (virtual==real): a dis bound to a per-site COUNTS signal in 'create' mode, fed the
+    iron-law (repeat, 1, n_sites) block through the SAME console chain hardware uses -- _signal_then_repeat
+    (reduce_repeat hist=create) -> _coerce -> _build_plot -- draws one FILLED histogram per repeat (first
+    with the fit), and switching the live card to 'pool' collapses to a single histogram with no overlays."""
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.task_console import PanelCard, PanelConfig
+    ensure_qt_app()
+    R, n_sites = 5, 35
+    rng = np.random.default_rng(7)
+    block = np.stack([np.concatenate([rng.normal(300, 16, 17), rng.normal(470, 16, 18)])
+                      for _ in range(R)])[:, None, :]                 # (R, 1, n_sites)
+    cfg = PanelConfig(kind="hist", inputs=["counts"], source="value = signal",
+                      params={"repeat_mode": "create", "bins": 18, "fit": "double"})
+    card = PanelCard(cfg, structure_provider=lambda name: (
+        {"points_shape": (1,), "data_shape": (n_sites,), "grid_shape": ()} if name == "counts" else None))
+    try:
+        ns = {"counts": block}
+        reduced = card._signal_then_repeat(ns)                       # real reduce_repeat(hist=True, create)
+        assert reduced.shape == (n_sites, R)                         # one column per repeat
+        card._render(reduced, ns)                                    # coerce -> build the real HistogramFigure
+        assert len(card.plotter._overlay_polys) == R - 1            # R-1 FILLED overlays (not outlines)
+        assert all(len(p.get_paths()) > 0 for p in card.plotter._overlay_polys)
+        assert card.plotter.bimodal_popt is not None                # first repeat keeps the fit
+        card.config.params["repeat_mode"] = "pool"                  # switch the LIVE card -> one histogram
+        card._force_rebuild = True
+        card._render(card._signal_then_repeat(ns), ns)
+        assert len(card.plotter._overlay_polys) == 0
+    finally:
+        if hasattr(card, "shutdown"):
+            card.shutdown()
+
+
 def test_dis_bins_per_site_counts_unchanged_when_bound_to_counts():
     """Bound to a 1-D per-site COUNTS array (what a processor publishes), the dis bins those values
     unchanged -- the bimodal readout comes from the DATA the source provides, not from the plot reaching
