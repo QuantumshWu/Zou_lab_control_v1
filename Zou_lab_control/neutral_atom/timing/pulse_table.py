@@ -1204,7 +1204,7 @@ class PulseTableState:
         """
 
         slots = self.reference_slots()
-        starts = self._period_start_steps(slots=slots, time_step_ns=self.time_step_ns)
+        starts = self.period_start_steps(slots=slots, time_step_ns=self.time_step_ns)
         groups = self.bus_channels(min_width=1)
         for bus_name, members in groups.items():
             zero_code = bus_zero_code(len(members))
@@ -1240,7 +1240,7 @@ class PulseTableState:
 
     def analog_bus_value_at_period_start(self, period_index: int, bus_name: str) -> int:
         slots = self.reference_slots()
-        starts = self._period_start_steps(slots=slots, time_step_ns=self.time_step_ns)
+        starts = self.period_start_steps(slots=slots, time_step_ns=self.time_step_ns)
         return _analog_bus_value_at_tick(self._resolved_bus_plan(bus_name, slots), starts, starts[int(period_index)])
 
     def show_channel(self, channel: str, *, index: int | None = None) -> "PulseTableState":
@@ -1526,7 +1526,12 @@ class PulseTableState:
         step_ns = self.time_step_ns if time_step_ns is None else positive_time_step_ns(time_step_ns)
         return self.total_duration_steps(slots=slots, time_step_ns=step_ns) * step_ns
 
-    def _period_start_steps(self, *, slots: Mapping[str, float] | None = None, time_step_ns: float) -> list[int]:
+    def period_start_steps(self, *, slots: Mapping[str, float] | None = None, time_step_ns: float) -> list[int]:
+        """Prefix sum of period durations: ``starts[i]`` is the tick at which period ``i`` begins
+        (``starts[-1]`` == total frame duration).  ``time_step_ns`` is REQUIRED (never falls back to
+        ``self.time_step_ns``) so the same source serves both the preview (``self.time_step_ns``) and
+        the hardware compiler (``clock_step_ns = 1e9 / clock_hz``).  The affine compiler
+        (``_pulse_table_affine_period_starts``) is the affine form of this same prefix sum."""
         starts = [0]
         for period in self.periods:
             starts.append(starts[-1] + period.duration_steps(slots=slots, time_step_ns=time_step_ns))

@@ -432,7 +432,7 @@ def compile_pulse_table_runtime_program(
 
     state.validate(slots=slot_values, time_step_ns=clock_step_ns)
     sequence = state.to_sequence(slots=slot_values, time_step_ns=clock_step_ns, expand_repeat=False)
-    period_starts = _pulse_table_period_starts_ticks(state, slots=slot_values, time_step_ns=clock_step_ns)
+    period_starts = state.period_start_steps(slots=slot_values, time_step_ns=clock_step_ns)
     bus_names, bus_segments, raw_bus_delays = _pulse_table_bus_segments(
         state,
         slots=slot_values,
@@ -1793,18 +1793,6 @@ def _insert_mask_edge_at_tick(ticks: Sequence[int], masks: Sequence[int], tick: 
     return out_ticks, out_masks, len(out_ticks) - 1
 
 
-def _pulse_table_period_starts_ticks(
-    state: PulseTableState,
-    *,
-    slots: Mapping[str, float] | None = None,
-    time_step_ns: float,
-) -> list[int]:
-    starts = [0]
-    for period in state.periods:
-        starts.append(starts[-1] + period.duration_steps(slots=slots, time_step_ns=time_step_ns))
-    return starts
-
-
 def _affine_expr(
     value: float | str,
     unit: str,
@@ -1823,6 +1811,10 @@ def _pulse_table_affine_period_starts(
     time_step_ns: float,
     coeff_frac_bits: int,
 ) -> list[tuple[int, tuple[int, ...]]]:
+    """Affine form of ``PulseTableState.period_start_steps`` (the same period-start prefix
+    sum): each entry is ``(base_tick, slot_coeffs)`` rather than a scalar tick, so the period
+    boundaries scan affinely in the bound slots.  Iterates ``state.periods`` in the same order;
+    a scalar evaluation of these coeffs at any slot point equals ``period_start_steps`` there."""
     starts = [(0, tuple(0 for _ in slot_vars))]
     for period in state.periods:
         starts.append(_affine_add(starts[-1], _affine_expr(period.duration, period.unit, slot_vars, time_step_ns, coeff_frac_bits)))
@@ -2050,7 +2042,7 @@ def _pulse_table_effective_duration_ticks(
     slots: Mapping[str, float] | None = None,
     time_step_ns: float,
 ) -> int:
-    starts = _pulse_table_period_starts_ticks(state, slots=slots, time_step_ns=time_step_ns)
+    starts = state.period_start_steps(slots=slots, time_step_ns=time_step_ns)
     if state.repeat_start is None or state.repeat_end is None or state.repeat_count <= 1:
         return starts[-1]
     loop_ticks = starts[int(state.repeat_end) + 1] - starts[int(state.repeat_start)]
@@ -2086,7 +2078,7 @@ def _pulse_table_edge_table(
     negative bus delay also lands >= 0) and are returned shifted as ``bus_delays``
     (bus_index -> delay) for the LITERAL per-bus delay line."""
     hardware_channels = list(channel_names(channels, "channels"))
-    starts = _pulse_table_period_starts_ticks(state, slots=slots, time_step_ns=time_step_ns)
+    starts = state.period_start_steps(slots=slots, time_step_ns=time_step_ns)
     table_end = int(starts[-1])
     channel_bits = {channel: index for index, channel in enumerate(hardware_channels)}
     bus_groups = state.bus_channels()
@@ -2299,7 +2291,7 @@ def _pulse_table_bus_segments(
     slot_vars = list(slot_vars or [])
     affine = bool(slot_vars)
     zero_coeffs = tuple(0 for _ in slot_vars)
-    starts = _pulse_table_period_starts_ticks(state, slots=slots, time_step_ns=time_step_ns)
+    starts = state.period_start_steps(slots=slots, time_step_ns=time_step_ns)
     table_end = int(starts[-1])
     affine_starts = (
         _pulse_table_affine_period_starts(state, slot_vars=slot_vars, time_step_ns=time_step_ns, coeff_frac_bits=coeff_frac_bits)
