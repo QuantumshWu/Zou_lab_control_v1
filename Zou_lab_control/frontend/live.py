@@ -785,43 +785,6 @@ class LiveLive(Live1D):
             else:
                 self.text.set_text(label)
 
-    def resize_history(self, new_len: int) -> None:
-        """Change the rolling history length IN PLACE -- resize the data buffers + x-axis on the
-        EXISTING axes, never a new figure/canvas.
-
-        A rolling trace keeps a fixed-length ``(length, ncols)`` buffer (newest at row 0).  Changing
-        ``length`` used to force a full plotter teardown + rebuild on every scroll tick; a fast scroll
-        fired those faster than the Qt holder could reflow, so the figure flickered / "grew" / vanished
-        (a build-then-swap race).  Resizing in place removes the race at the root: the figure geometry
-        never moves (no "grew"), nothing is torn down (no "vanished").  Keep the newest ``min(old, new)``
-        samples, drop or NaN-pad the rest, and re-pin the x-axis to ``0..new_len-1``."""
-        new_len = max(2, int(new_len))
-        ncols = self.data_y.shape[1]
-        keep = min(self.points_total, new_len)
-        buf = np.full((new_len, ncols), np.nan)
-        buf[:keep, :] = self.data_y[:keep, :]                  # newest-first -> the first rows are newest
-        self.data_y = buf
-        self.data_x = _as_data_x(np.arange(new_len, dtype=float))
-        self.points_total = new_len
-        self.points_done = min(self.points_done, new_len)
-        for i, line in enumerate(self.lines):
-            if i < ncols:
-                line.set_data(self.data_x[:, 0], self.data_y[:, i])
-        if self.ax is not None:
-            self.ax.set_xlim(0, new_len - 1)
-            self.relim(force=True)
-            self.ax.set_ylim(self.ylim_min, self.ylim_max)
-
-    def apply_param(self, key: str, value) -> bool:
-        """``length`` (history) is a DISPLAY-ONLY knob applied IN PLACE via :meth:`resize_history` -- no
-        figure rebuild -- so scrolling it never tears the plot down (the #5 scroll-race fix).  Anything
-        else falls back to the rebuild path."""
-        if key == "length":
-            self.resize_history(value)
-            self.draw()
-            return True
-        return False
-
     # _install_state is byte-identical to the inherited Live1D._install_state
     # (same "1D" PlotState with the same x/y arrays), so it is NOT overridden
     # here -- the inherited one is reused (one fewer copy of the same code).
@@ -914,17 +877,6 @@ class LiveLiveDis(LiveLive):
         counts_max = max(10, int(max(peak + 5, peak * 1.5)))
         self.axdis.set_xlim(0, counts_max)
         self._update_gauss_fit()
-
-    def resize_history(self, new_len: int) -> None:
-        """Resize the rolling buffer in place (the base does the trace + x-axis), then re-derive the
-        side-distribution's bin count from the new length and refill its bars on the EXISTING dist axes
-        -- still no figure rebuild, so a fast history scroll never tears the dis variant down either."""
-        super().resize_history(new_len)
-        self.n_bins = int(max(3, min(self.points_total // 4, 50)))
-        self.n, self.bins = self._hist()
-        self.verts = np.empty((self.n_bins, 4, 2), dtype=float)
-        _update_verts(self.bins, self.n, self.verts, mode="horizontal")
-        self.poly.set_verts(self.verts)
 
     def _install_state(self) -> None:
         self.fig._zlc_state = PlotState(plot_type="1D", x_array=self.data_x[:, 0], y_array=self.data_y, axdis=self.axdis)

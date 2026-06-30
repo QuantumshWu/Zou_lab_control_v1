@@ -1317,6 +1317,13 @@ _RELIM_PARAM = ParamDecl(
 UPDATE_INTERVALS = (100, 200, 400, 800)
 DEFAULT_UPDATE_MS = 400
 
+#: Debounce window (ms) for coalescing a burst of STRUCTURE-knob edits into ONE plotter rebuild.  A
+#: fast scroll on a rebuild-class param (history length, colormap, ...) fires many _set_param calls; each
+#: restarts this timer, so the (heavy) teardown+rebuild runs ONCE after the burst settles, on the latest
+#: values -- removing the per-tick rebuild race.  Short enough that a single deliberate edit still feels
+#: instant; long enough that a wheel spin coalesces.
+REBUILD_DEBOUNCE_MS = 90
+
 
 def _unit_df_for(plotter):
     """A :class:`DataFigure` bound to ``plotter``'s figure/axes whose unit is inferred from
@@ -1611,6 +1618,17 @@ class PanelCard(FluentGroupBox):
         # keeps the OLD figure (the card never goes blank) -- the root fix for the "scroll bins and the
         # figure occasionally vanishes" race, where a pre-null teardown could latch plotter=None.
         self._force_rebuild = False
+        # ANTI-RACING rebuild debounce: a STRUCTURE-knob edit that needs a rebuild schedules it on this
+        # single-shot timer instead of rebuilding inline.  A fast burst of edits (scrolling the history
+        # spin / a colormap combo) RESTARTS the timer, so only ONE rebuild runs after the burst settles
+        # -- the latest config.params values.  This is GENERAL (every rebuild-class param, not history
+        # only): coalescing the rebuilds removes the race where per-tick teardown+rebuild outran the Qt
+        # holder reflow (the figure flickered / grew / vanished).  _build_plot itself is atomic
+        # build-then-swap at a fixed canvas size, so even a rebuild that DOES run never blanks the card.
+        self._rebuild_timer = QtCore.QTimer(self)
+        self._rebuild_timer.setSingleShot(True)
+        self._rebuild_timer.setInterval(REBUILD_DEBOUNCE_MS)
+        self._rebuild_timer.timeout.connect(self._run_pending_rebuild)
         # The LAST namespace this panel rendered from (a reference to the hub
         # snapshot of that tick).  A display-only change (cmap / relim / source pick)
         # tears the plotter down and normally waits for the NEXT hub tick to rebuild --
@@ -2492,13 +2510,22 @@ class PanelCard(FluentGroupBox):
         if self.plotter is not None and self.plotter.apply_param(key, value):
             self.changed.emit()
             return
-        # A STRUCTURE knob the plotter can't apply in place (e.g. a 2D colormap): force a REBUILD on
-        # the next render, but do NOT tear the old plotter down first.  _build_plot
-        # build-then-swaps, so if the rebuild raises (a transient namespace) the OLD figure stays and
-        # the card never blanks -- the root fix for the scroll-bins-vanishes race.
+        # A STRUCTURE knob the plotter can't apply in place (e.g. a 2D colormap, a new history length):
+        # mark a rebuild and schedule it on the DEBOUNCE timer rather than rebuilding inline.  A fast
+        # burst of edits (scroll) restarts the timer, so the heavy teardown+rebuild runs ONCE after the
+        # burst on the latest config.params -- not once per tick (the race source).  _build_plot itself
+        # build-then-swaps at a fixed canvas size, so even the single rebuild never blanks the card.
         self._force_rebuild = True
-        self._rerender_last()   # take effect NOW (e.g. colormap) even if the source is stopped
+        self._rebuild_timer.start()   # coalesce; _run_pending_rebuild fires after the burst settles
         self.changed.emit()
+
+    def _run_pending_rebuild(self) -> None:
+        """The debounce timer fired: perform the ONE coalesced rebuild for the latest config.params.
+        Re-renders from the live/last namespace (so a stopped producer still rebuilds) -- _build_plot
+        build-then-swaps atomically, so the card never blanks even if this rebuild raises."""
+        if not self._force_rebuild:
+            return
+        self._rerender_last()
 
     def _apply_source(self) -> None:
         self.config.source = self.source_edit.text()
@@ -3091,10 +3118,12 @@ class PanelCard(FluentGroupBox):
             plotter.repeat_cur = rc
             if rc != 1:
                 plotter.update(plotter.data_y, repeat_cur=rc, draw=False)
-        # Build-then-swap: only NOW that the new plotter is fully built do we tear down the OLD one
-        # and install the new -- a build error above (e.g. the sites length check) leaves the previous
-        # figure on the card, never a blank panel (#4 "图有时消失").
-        self._teardown_plot()
+        # ATOMIC build-then-swap: the new plotter is now fully built.  Capture the OLD canvas/figure,
+        # INSERT the new canvas FIRST, then remove the old -- so the holder is NEVER empty during the
+        # swap (no one-frame blank).  A build error above (e.g. the sites length check) returns before
+        # here, leaving the previous figure untouched (#4 "图有时消失").  The card is setFixedSize, so the
+        # swap cannot reflow its geometry -- the plot never visibly resizes/jumps either (#5 "图变大").
+        old_canvas, old_plotter = self.canvas, self.plotter
         self.plotter = plotter
         # Monitor cards are display-only: NO selectors (interactions=False above)
         # and the wheel scrolls the board (isolate_wheel=False) instead of being
@@ -3104,12 +3133,20 @@ class PanelCard(FluentGroupBox):
         # the card is setFixedSize to hold the canvas + the proportional bottom padding, and the
         # canvas keeps its exact design size while the trailing stretch absorbs the padding.
         self.canvas.setMinimumSize(self.canvas.sizeHint())
-        add_stretch = self.canvas_holder.count() == 0       # first build (teardown leaves the stretch)
+        add_stretch = self.canvas_holder.count() == 0       # first build (no canvas, no stretch yet)
         # canvas pins to the TOP of the content (right below the grey title strip); the trailing
         # stretch is the proportional bottom padding (collapses to ~0 for a 1-row card).
         self.canvas_holder.insertWidget(0, self.canvas, alignment=QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop)
         if add_stretch:
             self.canvas_holder.addStretch(1)
+        # NOW retire the old canvas/figure -- the new one is already in the holder, so there is no blank
+        # window between remove and insert (the swap is atomic from the user's view).
+        if old_canvas is not None:
+            self.canvas_holder.removeWidget(old_canvas)
+            old_canvas.setParent(None)
+            old_canvas.deleteLater()
+        if old_plotter is not None and plt is not None and old_plotter.fig is not None:
+            plt.close(old_plotter.fig)
         # re-apply persisted Setting toggles (unit + manual x/y limits) to the
         # FRESH plotter every rebuild -- the panel rebuilds whenever its data
         # shape changes, so without this the toggle would silently revert.
@@ -3133,6 +3170,8 @@ class PanelCard(FluentGroupBox):
             plt.close(plotter.fig)
 
     def shutdown(self) -> None:
+        self._rebuild_timer.stop()          # never fire a coalesced rebuild into a torn-down card
+        self._force_rebuild = False
         self._teardown_plot()
 
 
