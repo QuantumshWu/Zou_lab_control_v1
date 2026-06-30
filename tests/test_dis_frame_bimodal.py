@@ -50,6 +50,24 @@ def test_dis_bins_its_raw_input_no_calibration_reach():
             card.shutdown()
 
 
+def test_fit_toggle_changes_the_fit_on_any_data_no_silent_fallback():
+    """The single<->double fit toggle drives the DISPLAY directly: selecting double must visibly attempt a
+    two-Gaussian fit even on near-UNIMODAL data (the reported "toggle does nothing / button is broken"
+    case).  The bug was a hidden pre-gate in _fit_bimodal that quietly reverted to a single Gaussian when
+    the bright mode was sparse -- so the display was decided by the data's shape, not by the toggle.  No
+    hardcoding: the fit follows the toggle."""
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend import panel_plot
+    ensure_qt_app()
+    uni = np.random.default_rng(0).normal(300.0, 25.0, 1500)   # unimodal -- the "broken button" case
+    p = panel_plot(uni, kind="hist", size="2x4", bins=60, bimodal=True, title="dis")
+    assert p.bimodal_popt is not None                          # double attempts TWO gaussians on unimodal data
+    p.apply_param("bimodal", False)                            # -> single
+    assert p.single_popt is not None and p.bimodal_popt is None
+    p.apply_param("bimodal", True)                             # -> double again (visibly different state)
+    assert p.bimodal_popt is not None
+
+
 def test_dis_bins_per_site_counts_unchanged_when_bound_to_counts():
     """Bound to a 1-D per-site COUNTS array (what a processor publishes), the dis bins those values
     unchanged -- the bimodal readout comes from the DATA the source provides, not from the plot reaching

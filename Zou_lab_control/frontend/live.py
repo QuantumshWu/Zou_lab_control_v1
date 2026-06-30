@@ -2125,14 +2125,12 @@ class HistogramFigure(BaseLivePlot):
             _single_gaussian()
             return
 
-        # BIMODAL mode (the DEFAULT): always draw the two-Gaussian dark/bright decomposition, so the
-        # readout histogram reads consistently for EVERY signal -- never auto-collapsed to one peak by
-        # the data.  Only a genuine numerical inability to seed two peaks (a handful of bright samples,
-        # or curve_fit failure) falls back to one Gaussian.
-        if right.size < max(4, int(0.01 * vals.size)):
-            _single_gaussian()
-            return
-
+        # BIMODAL mode: ALWAYS attempt the two-Gaussian dark/bright decomposition -- the toggle drives the
+        # display DIRECTLY, never a hidden auto-collapse-to-one-peak based on how the data happens to look.
+        # If the bright mode is sparse the two peaks may overlap, but selecting double MUST visibly fit two
+        # Gaussians, not silently fall back to one (the "toggle does nothing / button is broken" bug: the
+        # old `right.size` pre-gate quietly reverted to single on near-unimodal data).  Only a genuine
+        # curve_fit FAILURE (caught below) falls back to a single Gaussian.
         p0 = [_amp_near(mu0), mu0, s0, _amp_near(mu1), mu1, s1]
         bounds = (
             [0, float(np.min(vals)), span / 200, 0, float(np.min(vals)), span / 200],
