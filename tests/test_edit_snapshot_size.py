@@ -157,6 +157,30 @@ def test_edit_sites_snapshot_honours_relim_and_fixed_lim():
         exp.close()
 
 
+def test_dis_fixed_lim_pins_the_value_axis_not_the_count_axis():
+    """#3B: a Distribution's relim/fixed lo-hi must pin the VALUE (x) axis (the count y-axis is always
+    auto).  The bug: ``_view_kwargs`` returned {} for hist, so a dis NEVER received relim/fixed and the
+    fixed lo/hi did nothing.  Now the kwargs reach HistogramFigure and apply_relim_now pins x."""
+    ensure_qt_app()
+    from Zou_lab_control.frontend.task_console import PanelEditor
+    exp, console = _console()
+    try:
+        card = _hist_card(console)
+        editor = PanelEditor(card, console)
+        editor.rebuild()                                                    # tight: x tracks the data span
+        tight_lo, tight_hi = editor._plotter.ax.get_xlim()
+        assert tight_lo < 300.0 and tight_hi > 460.0
+        # fixed lo/hi pins the VALUE (x) axis to the operator bounds
+        card.config.params.update({"relim": "fixed", "fixed_lo": 270.0, "fixed_hi": 500.0})
+        editor.rebuild()
+        assert editor._plotter.relim_mode == "fixed"
+        lo, hi = editor._plotter.ax.get_xlim()
+        assert abs(lo - 270.0) < 1e-6 and abs(hi - 500.0) < 1e-6, "fixed lo/hi must pin the dis VALUE axis"
+    finally:
+        console.shutdown()
+        exp.close()
+
+
 def test_edit_rebuild_keeps_last_good_snapshot_on_build_error(monkeypatch):
     """#4 symptom 2: a rebuild that RAISES mid-build must leave the PREVIOUS snapshot installed, never a
     blank holder -- build-then-swap tears the old figure down only after the new one built cleanly."""

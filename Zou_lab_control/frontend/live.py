@@ -1924,7 +1924,10 @@ class HistogramFigure(BaseLivePlot):
         self._has_threshold = self._explicit_thr
         self.single_popt = None         # (amp, mu, sigma) of the single-Gaussian fit, for the no-threshold stat
         self.thresholds = list(thresholds or [])
-        super().__init__(np.arange(len(self.values)), self.values, labels=labels, relim_mode="tight", **kwargs)
+        # relim/fixed pins the VALUE (x) axis for a histogram (the count y-axis is always auto, #3);
+        # default to "tight" but HONOR a relim_mode the panel passes (Setting/Edit "fixed" + lo/hi).
+        kwargs.setdefault("relim_mode", "tight")
+        super().__init__(np.arange(len(self.values)), self.values, labels=labels, **kwargs)
 
     def init_core(self) -> None:
         self.ax.set_xlabel(self.xlabel)
@@ -1963,7 +1966,7 @@ class HistogramFigure(BaseLivePlot):
             color=PALETTE["annotation"],
             fontsize=small_fontsize(),
         )
-        self.ax.set_xlim(self.bins[0], self.bins[-1])
+        self._apply_value_xlim()
         self._apply_count_yscale()
         self._update_hist_stats()
 
@@ -1986,7 +1989,7 @@ class HistogramFigure(BaseLivePlot):
             self.verts = np.empty((len(self.n), 4, 2), dtype=float)
         _update_verts(self.bins, self.n, self.verts, mode="vertical")
         self.poly.set_verts(self.verts)
-        self.ax.set_xlim(self.bins[0], self.bins[-1])
+        self._apply_value_xlim()
         self._apply_count_yscale()
         self._fit_bimodal()
         while len(self.threshold_lines) < len(self.thresholds):
@@ -2005,6 +2008,24 @@ class HistogramFigure(BaseLivePlot):
         self.update_core()
         self.draw()
         return self
+
+    def _apply_value_xlim(self) -> None:
+        """The VALUE (x) axis range: in ``fixed`` relim mode pin it to the operator's lo/hi; otherwise
+        track the data's bin span.  The count (y) axis is owned by ``_apply_count_yscale`` -- so a
+        fixed value range is NOT re-pinned-away every frame (the #3 'fixed lo/hi does nothing on a dis'
+        fix: a histogram's relim/fixed means the VALUE axis, not the count axis)."""
+        if getattr(self, "relim_mode", "tight") == "fixed":
+            lo, hi = float(getattr(self, "fixed_lo", 0.0)), float(getattr(self, "fixed_hi", 1.0))
+            if hi > lo:
+                self.ax.set_xlim(lo, hi)
+                return
+        self.ax.set_xlim(self.bins[0], self.bins[-1])
+
+    def apply_relim_now(self) -> None:
+        """A histogram's relim controls the VALUE (x) axis (NOT the count axis): re-apply the lo/hi
+        range NOW (the Setting/Edit 'fixed' toggle), bypassing any dead-band."""
+        self._apply_value_xlim()
+        self.draw()
 
     def apply_param(self, key: str, value) -> bool:
         """Log count-axis + bimodal-fit toggles are DISPLAY-ONLY: flip the flag then re-fit + redraw

@@ -2968,9 +2968,8 @@ class PanelCard(FluentGroupBox):
         source for BOTH the live build (``_build_plot``) and the Edit snapshot (``PanelEditor.rebuild``),
         so no kind can silently omit relim/fixed.  This is exactly what regressed: the ``sites`` panel
         omitted these in both builders, so a Site map's lim mode / fixed lo-hi never re-rendered (#4).
-        ``hist`` owns its own y-axis -> no relim."""
-        if kind == "hist":
-            return {}
+        For a histogram the relim/fixed pins the VALUE (x) axis (the count y-axis is always auto, #3);
+        every other kind pins its value axis (1D y-axis / 2D·sites clim)."""
         return {"relim_mode": self._relim(), **self._fixed_lim_kwargs()}
 
     def _build_plot(self, value, namespace: Mapping[str, object] | None = None) -> None:
@@ -3030,6 +3029,7 @@ class PanelCard(FluentGroupBox):
                 np.asarray(value, dtype=float), kind="hist", size=size, interactions=False,
                 bins=int(self.config.params.get("bins", 60)), ylog=bool(self.config.params.get("ylog", False)),
                 bimodal=bool(self.config.params.get("bimodal", True)),
+                **self._view_kwargs("hist"),                # relim/fixed pins the VALUE (x) axis (#3)
                 labels=("Value", "Shots", "Population"), title=self.config.title or None)
         else:  # 1d
             arr = np.asarray(value, dtype=float)
@@ -3985,7 +3985,7 @@ class PanelEditor(QtWidgets.QWidget):
                 new_plotter = panel_plot(np.array(src.values, dtype=float), kind="hist", size=size,
                                          bins=int(card.config.params.get("bins", 60)),
                                          bimodal=bool(card.config.params.get("bimodal", True)),
-                                         ylog=bool(card.config.params.get("ylog", False)),
+                                         ylog=bool(card.config.params.get("ylog", False)), **view,
                                          labels=tuple(src.labels), title=title)
             else:  # 1d / monitor -> a line snapshot (monitor honours its show_dist toggle)
                 extra = {"show_dist": bool(card.config.params.get("show_dist", True))} if kind == "monitor" else {}
