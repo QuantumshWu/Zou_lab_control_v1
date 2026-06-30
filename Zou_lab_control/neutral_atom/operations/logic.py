@@ -1433,7 +1433,10 @@ class CameraMeasurement(Measurement):
         n = max(1, int(self.frames_per_cycle))
         # Live monitor: the streamer is already firing continuously; the camera images whatever it is
         # firing now (we hand it that pulse).  None / not firing a camera trigger -> no frame (freeze).
-        frames = self.camera.acquire(n, sequence=self.sequencer.firing, stop=self._stop)
+        # No sequencer at all is the same idle state -- ``firing`` is a guaranteed SequencerDevice
+        # contract, but the device itself may be absent (a camera node wired without a streamer).
+        firing = None if self.sequencer is None else self.sequencer.firing
+        frames = self.camera.acquire(n, sequence=firing, stop=self._stop)
         if not frames:
             # The streamer is not firing a camera-triggering pulse (e.g. the user hit "Stop
             # Pulse") -> no trigger -> no frame.  Publish nothing: the live view holds its last
