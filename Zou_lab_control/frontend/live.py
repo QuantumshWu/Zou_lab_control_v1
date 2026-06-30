@@ -1920,9 +1920,10 @@ class HistogramFigure(BaseLivePlot):
         **kwargs,
     ):
         # 'create' repeat mode delivers (n_samples, R): column 0 is the FIRST repeat (the FULL
-        # treatment -- fill + fit + threshold + stats), columns 1.. draw an OUTLINE only (LINE_CYCLE).
-        # Any other input is one flat sample set (a single histogram).
-        self._overlay_lines: list = []
+        # treatment -- fill + fit + threshold + stats), columns 1.. draw the SAME FILLED histogram as a
+        # no-repeat dis, just a different LINE_CYCLE colour + alpha so overlaps stay legible (NOT outlines
+        # -- a repeat reads like an ordinary distribution, only the fit/threshold/text are the first's).
+        self._overlay_polys: list = []
         self._overlay_counts: list = []
         self.values = self._split_columns(values)
         self.bins_arg = bins
@@ -1956,26 +1957,29 @@ class HistogramFigure(BaseLivePlot):
         return arr.reshape(-1)
 
     def _ensure_overlays(self, n_extra: int) -> None:
-        """Keep exactly ``n_extra`` outline Line2D artists (one per non-first 'create' repeat),
-        coloured by the shared LINE_CYCLE so they match the 1-D trace colours."""
-        while len(self._overlay_lines) < n_extra:
-            j = len(self._overlay_lines)
-            (ln,) = self.ax.plot([], [], drawstyle="steps-mid",
-                                 color=LINE_CYCLE[(j + 1) % len(LINE_CYCLE)], linewidth=1.0, alpha=0.7)
-            self._overlay_lines.append(ln)
-        while len(self._overlay_lines) > n_extra:
-            self._overlay_lines.pop().remove()
+        """Keep exactly ``n_extra`` FILLED overlay histograms (one per non-first 'create' repeat) -- the
+        SAME bar fill a no-repeat dis uses (PolyCollection), only a different LINE_CYCLE colour + alpha so
+        the overlapping repeats stay legible.  A repeat reads like an ordinary distribution, not an outline."""
+        while len(self._overlay_polys) < n_extra:
+            j = len(self._overlay_polys)
+            poly = PolyCollection(np.empty((0, 4, 2)),
+                                  facecolors=LINE_CYCLE[(j + 1) % len(LINE_CYCLE)], alpha=0.4)
+            self.ax.add_collection(poly)
+            self._overlay_polys.append(poly)
+        while len(self._overlay_polys) > n_extra:
+            self._overlay_polys.pop().remove()
 
     def _refresh_overlays(self) -> None:
-        """Re-bin each extra 'create' repeat on the CURRENT bins and update its outline; cache the counts
-        so the count-axis can include the overlays' peak (else a taller repeat would clip)."""
+        """Re-bin each extra 'create' repeat on the CURRENT bins and refill its bars; cache the counts so
+        the count-axis can include the overlays' peak (else a taller repeat would clip)."""
         self._ensure_overlays(len(self._extra_cols))
-        centers = (self.bins[:-1] + self.bins[1:]) / 2
         self._overlay_counts = []
-        for ln, col in zip(self._overlay_lines, self._extra_cols):
+        for poly, col in zip(self._overlay_polys, self._extra_cols):
             c = col if col.size else np.array([0.0])
             counts, _ = np.histogram(c, bins=self.bins)
-            ln.set_data(centers, counts)
+            verts = np.empty((len(counts), 4, 2), dtype=float)
+            _update_verts(self.bins, counts, verts, mode="vertical")     # SAME bar geometry as the primary
+            poly.set_verts(verts)
             self._overlay_counts.append(counts)
 
     def init_core(self) -> None:

@@ -2081,7 +2081,8 @@ class PanelCard(FluentGroupBox):
                     "  average = bin the per-point MEAN over the repeats (one histogram)\n"
                     "  add     = bin the per-point SUM over the repeats\n"
                     "  replace = bin only the newest repeat's samples\n"
-                    "  create  = ONE histogram per repeat overlaid (first repeat full, the rest outlined)")
+                    "  create  = ONE filled histogram per repeat overlaid (each a different colour; the "
+                    "first repeat also draws the fit/threshold/stats)")
         if self._bound_is_occupancy():
             return ("How to combine the N shots of per-site occupancy for display:\n"
                     "  average = per-site LOADING PROBABILITY = mean of the N shots' 0/1\n"
