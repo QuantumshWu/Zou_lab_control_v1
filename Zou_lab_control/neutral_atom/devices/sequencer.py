@@ -940,6 +940,8 @@ class SequencerService:
                 {
                     "action": "prepare",
                     "sequence_id": program.sequence_id,
+                    "sequence": program.sequence_name,
+                    "duration": program.duration,
                     "cached": cached,
                 }
             )
@@ -986,7 +988,7 @@ class SequencerService:
             if getattr(program, "repeat_forever", False) and getattr(program, "scan_points", None):
                 self._scan_fire_time = time.monotonic()
                 self._scan_done = False
-            self.history.append({"action": "fire", "sequence_id": program.sequence_id})
+            self.history.append({"action": "fire", "sequence_id": program.sequence_id, "sequence": program.sequence_name})
             return program.to_dict()
 
     def wait_done(self, timeout: float | None = None) -> bool:

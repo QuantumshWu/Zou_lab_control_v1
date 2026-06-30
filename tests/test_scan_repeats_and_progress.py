@@ -100,6 +100,29 @@ def test_both_backends_expose_scan_progress():
         assert hasattr(cls, "scan_progress"), f"{cls.__name__} must expose scan_progress()"
 
 
+# ---- VirtualSequencer COMPOSES the single SequencerService state machine (no second copy) ----
+def test_virtual_sequencer_composes_one_service_state_machine():
+    """The virtual backend must DELEGATE prepare/fire/source-recording to a composed
+    SequencerService -- the one shared state machine -- not keep a second copy that can drift
+    (finding #4: the duplicated prepare/_record_source_payload/scan_progress had already diverged).
+    Pin the structure so a future hand-rolled copy fails here."""
+    from Zou_lab_control.neutral_atom.devices.sequencer import SequencerService
+    seq = VirtualSequencer(channels=["probe", "trig"], sleep_scale=0.0)
+    # composition, not a hand-rolled copy
+    assert isinstance(seq.service, SequencerService)
+    # the source-payload recorder lives ONLY on the service now (no virtual override to drift)
+    assert "_record_source_payload" not in vars(type(seq))
+    # the sync handle + history are the service's, read through, not a second store
+    assert seq.last_payload_json is seq.service.last_payload_json
+    assert seq.history is seq.service.history
+    # prepare/fire route through the service: its state machine advances + records the source
+    PulseController(seq, _scan_state()).on_pulse(repeat_forever=True, scan_repeats=0)
+    assert seq.service.state == "running"
+    assert seq.service.last_payload_json and '"periods"' in seq.service.last_payload_json
+    # the live scan reading is the service's seam (it invokes the virtual real-time callback)
+    assert seq.scan_progress()["scanning"] is True
+
+
 # ---- review fixes: finite scan requires >=2 points + implies streaming + can be waited on ----
 def _one_point_scan_state() -> PulseTableState:
     st = PulseTableState(channels=["probe", "trig"])

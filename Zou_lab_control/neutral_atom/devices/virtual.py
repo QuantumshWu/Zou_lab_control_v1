@@ -708,7 +708,26 @@ class VirtualCamera(CameraDevice):
 
 
 class VirtualSequencer(SequencerDevice):
+    """In-process streamer = a :class:`SequencerService` software state machine + the virtual
+    camera's ``firing`` handle.
+
+    The service IS the single state machine (the one shared by the real ``SequencerService`` on
+    the FPGA computer): ``VirtualSequencer`` COMPOSES one and delegates prepare/fire/state +
+    source-payload recording to it, so there is no second copy of that protocol to drift.  The
+    only state this class adds on top is the REAL-TIME pacing the bare service cannot express:
+
+    * ``firing`` -- the ``repeat_forever`` :class:`PulseSequence` the streamer is playing right
+      now (or None when idle/safe).  The externally-triggered virtual camera images ONLY while
+      this is set, so "Stop Pulse" freezes the live image exactly like hardware.  A real/remote
+      streamer keeps no host-side firing flag (it learns it from trigger edges), hence the base
+      default is None and this in-process backend overrides it.
+    * the per-point wall-clock scan pacing (``base_dt = program.duration * sleep_scale``) the
+      scan-progress reading + the finite-scan ``wait_done`` use, so lengthening the pulse really
+      slows the live image and the pytest suite's ``sleep_scale=0`` fast-forwards.
+    """
+
     def __init__(self, channels: Sequence[str] = DEFAULT_CHANNELS, clock_hz: float = DEFAULT_CLOCK_HZ, sleep_scale: float | None = None):
+        from .sequencer import SequencerService
         self.channels = tuple(str(channel) for channel in channels)
         self.clock_hz = positive_float(clock_hz, "clock_hz")
         # REAL-TIME by default (DEFAULT_SLEEP_SCALE=1.0): a fired program takes its real
@@ -717,32 +736,48 @@ class VirtualSequencer(SequencerDevice):
         if sleep_scale is None:
             sleep_scale = DEFAULT_SLEEP_SCALE
         self.sleep_scale = nonnegative_float(sleep_scale, "sleep_scale")
-        self.history: list[dict[str, object]] = []
+        # The shared software state machine: prepare (with the FPGA-geometry backstop), fire,
+        # source-payload recording and last_payload_json all live HERE, one copy.  Its built-in
+        # pure-software wall-clock scan-progress is BYPASSED by wiring our real-time-paced
+        # ``_scan_progress`` as the scan_progress_callback (the same callback seam the real AXI
+        # backend uses for its hardware cursor) -- so the live-scan reading is single-sourced too.
+        self.service = SequencerService(
+            channels=self.channels,
+            clock_hz=self.clock_hz,
+            sleep_scale=self.sleep_scale,
+            scan_progress_callback=self._scan_progress,
+        )
+        # The compiled program of the last prepare() the camera reads as ``firing`` -- a
+        # PulseSequence (not the service's compiled RuntimeSequenceProgram), because the camera
+        # needs its ``base_pulses()`` to detect the capture-trigger channel + its physics.
         self._prepared: PulseSequence | None = None
-        # The compiled program of the last prepare() (parity with RuntimeSequencer.prepare,
-        # which on_pulse / sync-to-device read for .sequence_name / .duration / etc.).
+        # The compiled RuntimeSequenceProgram of the last prepare() (parity with
+        # RuntimeSequencer.prepare, which on_pulse / sync-to-device read for .sequence_name etc.).
         self.last_program = None
-        # The SOURCE payload (PulseTableState/PulseSequence as a JSON string) of the last
-        # prepare -- the sync-to-device handle the pulse GUI's "Sync" pulls back, exactly like
-        # the real SequencerService records.  None until something is prepared.
-        self.last_payload_json: str | None = None
-        # The program the streamer is CONTINUOUSLY firing (a repeat_forever pulse), or None
-        # when idle/safe.  A real FPGA streamer plays a repeat_forever program until it is
-        # set to a safe state; the externally-triggered camera produces frames ONLY while
-        # this is set.  This is what makes "Stop Pulse" (set_safe_state) freeze the live
-        # image: no streamer firing -> no camera trigger -> no frame (exactly like hardware).
+        # The program the streamer is CONTINUOUSLY firing (a repeat_forever pulse), or None when
+        # idle/safe -- the virtual camera's gate; see the class docstring.
         self._firing: PulseSequence | None = None
-        # Scan-progress mirror of the real streamer: when a streamed scan is firing, this holds
-        # {"n_points": N, "scan_repeats": K, "base_dt": per-point seconds}; scan_progress() derives
-        # the current (point, sweep) from the wall-clock elapsed since fire, and a finite scan (K>0)
-        # stops itself once K sweeps are played -- exactly like the host issues CMD_SAFE on the real
-        # streamer.  None when no scan is firing.
+        # Per-point wall-clock pacing of the firing streamed scan (None when no scan is firing):
+        # {"n_points": N, "scan_repeats": K, "base_dt": per-point seconds}.  ``_scan_progress``
+        # derives the current (point, sweep) from the wall clock; a finite scan (K>0) stops once
+        # K sweeps are played, exactly like the host issues the engine stop on the real backend.
         self._scan_info: dict[str, float] | None = None
         self._scan_fire_time: float = 0.0
-        # Latched once a finite scan has played its K sweeps: scan_progress() then keeps returning the
-        # SATURATED done reading (not idle) until the next prepare/stop -- matching the real streamer's
-        # _scan_finished latch, so virtual == real at the scan's terminal reading too.
+        # Latched once a finite scan has played its K sweeps: the scan reading then keeps returning
+        # the SATURATED done value (not idle) until the next prepare/stop -- == the real backend.
         self._scan_done: bool = False
+
+    @property
+    def history(self) -> list[dict[str, object]]:
+        """The service's action log (prepare/fire/wait_done/safe...), so tests + snapshot read the
+        single state machine's history rather than a second copy kept here."""
+        return self.service.history
+
+    @property
+    def last_payload_json(self) -> str | None:
+        """The sync-to-device handle the service recorded on the last prepare/fire (PulseTableState
+        JSON with ``periods``) -- delegated, so there is ONE record seam (no virtual copy to drift)."""
+        return self.service.last_payload_json
 
     @property
     def firing(self) -> PulseSequence | None:
@@ -755,7 +790,6 @@ class VirtualSequencer(SequencerDevice):
         # Accept either a PulseSequence or a GUI PulseTableState (what bind_pulse/on_pulse and a
         # loaded pulse .json pass).  Compile a table to a PulseSequence so fire()/firing/acquire
         # all work on ONE type, carrying repeat_forever for a continuous (On Pulse) program.
-        from .sequencer import compile_runtime_program
         if isinstance(sequence, PulseTableState):
             channels = list(sequence.channels)
             program = sequence.to_sequence(clock_hz=self.clock_hz)
@@ -767,23 +801,20 @@ class VirtualSequencer(SequencerDevice):
             # table's board chNN) -- derive them from the pulses rather than this sequencer's
             # default list, so a virtual streamer plays whatever channel set the pulse uses.
             channels = sorted({p.channel for p in program.base_pulses()}) or list(self.channels)
-        # Validate the TIMING against the clock grid (the channel set is intrinsic to the
-        # program), then compile to a RuntimeSequenceProgram so prepare() returns the SAME object
-        # the real RuntimeSequencer does (on_pulse / sync-to-device read it).
+        # Validate the TIMING against the clock grid (the channel set is intrinsic to the program).
         program.validate(clock_hz=self.clock_hz).raise_if_failed()
         self._prepared = program
-        self.last_program = compile_runtime_program(
-            program, channels=channels, clock_hz=self.clock_hz)
-        # Record the SOURCE timing as a syncable PulseTableState JSON (always carries
-        # ``periods``), EXACTLY like SequencerService -- the pulse GUI's "Sync" reads it back
-        # from snapshot()["last_payload_json"].  A bare PulseSequence (a Task / measurement
-        # firing a compiled bracket) is reconstructed into a period table via
-        # PulseTableState.from_sequence so it syncs too (virtual == real: no fired timing the
-        # GUI "cannot sync").
-        self._record_source_payload(sequence, channels=channels)
-        # Capture scan-progress info from the SOURCE table (the compiled PulseSequence drops the
+        # Delegate the state machine to the service on the per-prepare channel set: it compiles
+        # the RuntimeSequenceProgram, runs the FPGA-geometry backstop, records the SOURCE timing as
+        # syncable last_payload_json, and advances to "prepared" -- exactly the seam the GUI's Sync
+        # and the real SequencerService share, with no virtual copy.  The channel set is intrinsic
+        # to the program (a saved table's chNN, the imaging names), so point the service at it.
+        from .sequencer import RuntimeSequenceProgram
+        self.service.channels = list(channels)
+        self.last_program = RuntimeSequenceProgram.from_dict(self.service.prepare(sequence))
+        # Capture scan-progress pacing from the SOURCE table (the compiled program drops the
         # scan_table): N points + the requested sweep count, plus a per-point wall-clock estimate
-        # (the program's one-frame duration) so scan_progress() can report "point K / N · sweep r".
+        # (the program's one-frame duration) so the scan reading reports "point K / N · sweep r".
         self._scan_done = False          # a fresh prepare clears any prior finite-scan done latch
         rows = list(getattr(sequence, "scan_table", None) or []) if isinstance(sequence, PulseTableState) else []
         if rows:
@@ -794,47 +825,37 @@ class VirtualSequencer(SequencerDevice):
             }
         else:
             self._scan_info = None
-        self.history.append({"action": "prepare", "sequence": program.name, "duration": program.duration})
         return self.last_program
-
-    def _record_source_payload(self, payload, *, channels) -> None:
-        import json
-        from .sequencer import timing_from_payload
-        step = 1e9 / float(self.clock_hz)
-        timing = timing_from_payload(payload)
-        if isinstance(timing, PulseTableState):
-            table = timing.snapped(time_step_ns=step)
-        else:
-            table = PulseTableState.from_sequence(timing, channels=channels, clock_hz=self.clock_hz)
-        self.last_payload_json = json.dumps(table.to_dict())
 
     def fire(self, sequence: PulseSequence | None = None) -> None:
         if self._prepared is None:
             raise RuntimeError("VirtualSequencer.fire() called before prepare().")
         if sequence is not None and sequence is not self._prepared:
             raise RuntimeError("VirtualSequencer.fire() received a sequence that was not prepared.")
-        self.history.append({"action": "fire", "sequence": self._prepared.name, "duration": self._prepared.duration})
-        # fire() is NON-BLOCKING, exactly like the real FPGA (a quick register write that
-        # STARTS playback).  The program's real wall-clock is consumed where the hardware
-        # actually blocks: ``wait_done`` (a finite ``on_pulse(wait=True)``) or the camera's
-        # per-frame readout (the live monitor) -- never here.  So a continuous (repeat_forever)
-        # On Pulse returns at once and the live camera then paces at the firing cadence.
-        #
-        # A repeat_forever program keeps the streamer firing (continuous camera triggers)
-        # until set_safe_state.  A finite program plays ONCE -- a measurement's own acquire
-        # fires + reads it within that call -- so it does NOT leave the streamer continuously
-        # firing (and must not make a later live read see a stale finite shot).
+        # Delegate the state transition (idle->running + history) to the shared service.  fire() is
+        # NON-BLOCKING, exactly like the real FPGA (a quick register write that STARTS playback): the
+        # program's real wall-clock is consumed where the hardware actually blocks -- ``wait_done``
+        # (a finite ``on_pulse(wait=True)``) or the camera's per-frame readout (the live monitor) --
+        # never here.  So a continuous (repeat_forever) On Pulse returns at once and the live camera
+        # then paces at the firing cadence.
+        self.service.fire()
+        # A repeat_forever program keeps the streamer firing (continuous camera triggers) until
+        # set_safe_state.  A finite program plays ONCE -- a measurement's own acquire fires + reads
+        # it within that call -- so it does NOT leave the streamer continuously firing (and must not
+        # make a later live read see a stale finite shot).
         if bool(getattr(self._prepared, "repeat_forever", False)):
             self._firing = self._prepared
             self._scan_fire_time = time.monotonic()
 
-    def scan_progress(self) -> dict:
-        """Where the streamed scan is now -- mirrors the real streamer (virtual==real).  The
-        current monotonic played-point count is the wall-clock elapsed since fire divided by the
-        per-point estimate (scaled by ``sleep_scale`` like every other virtual time, so the test
-        suite's ``sleep_scale=0`` fast-forwards a finite scan straight to done).  A finite scan
-        (scan_repeats>0) that has played its K sweeps stops firing here, exactly like the host
-        issues the engine stop on the real backend."""
+    def _scan_progress(self) -> dict:
+        """Where the streamed scan is now -- the real-time-paced reading wired into the service as
+        its scan_progress_callback (mirrors the real streamer; virtual==real).  The monotonic
+        played-point count is the wall-clock elapsed since fire divided by the per-point estimate
+        (scaled by ``sleep_scale`` like every other virtual time, so ``sleep_scale=0`` fast-forwards
+        a finite scan straight to done).  The point/sweep math + idle/done shape are single-sourced
+        in ``scan_progress_fields``; only the per-point ``base_dt`` pacing is virtual-specific.  A
+        finite scan (scan_repeats>0) that has played its K sweeps stops firing here, exactly like the
+        host issues the engine stop on the real backend."""
         from .sequencer import SCAN_PROGRESS_IDLE, scan_progress_fields
         if self._scan_info is None:
             return dict(SCAN_PROGRESS_IDLE)
@@ -855,12 +876,21 @@ class VirtualSequencer(SequencerDevice):
             self._firing = None
         return fields
 
+    def scan_progress(self) -> dict:
+        """The live scan reading -- delegated to the service (which calls our real-time-paced
+        ``_scan_progress`` callback), so virtual and real expose the one ``scan_progress`` seam."""
+        return self.service.scan_progress()
+
     def wait_done(self, timeout: float | None = None) -> bool:
         """Block until the prepared FINITE program finishes on the wall clock
-        (``duration x sleep_scale``), mirroring :meth:`SequencerService.wait_done` -- this IS
-        the real time a measurement's ``on_pulse(wait=True)`` takes (real-time by default;
-        the test suite sets sleep_scale=0 to fast-forward).  A repeat_forever (On Pulse)
-        program never finishes, so it returns False (the caller stops it instead)."""
+        (``duration x sleep_scale``) -- this IS the real time a measurement's ``on_pulse(wait=True)``
+        takes (real-time by default; the test suite sets sleep_scale=0 to fast-forward).
+
+        Kept on the virtual backend rather than delegated because a finite STREAMED scan
+        (``repeat_forever`` + ``scan_repeats=K>0``) DOES finish after K sweeps, yet the bare
+        ``SequencerService.wait_done`` -- having no hardware wait_done_callback -- reports any
+        repeat_forever program as never-done and even refuses to wait without a timeout.  This
+        override is the real-time pacing the service cannot express on its own."""
         if self._prepared is None:
             raise RuntimeError("VirtualSequencer.wait_done() called before prepare().")
         if bool(getattr(self._prepared, "repeat_forever", False)):
@@ -876,13 +906,17 @@ class VirtualSequencer(SequencerDevice):
                     time.sleep(delay)
                 self._scan_done = True       # latch the saturated done reading (matches the real backend)
                 self._firing = None
+                self.service.history.append({"action": "wait_done", "ok": True})
                 return True
+            self.service.history.append({"action": "wait_done", "ok": False})
             return False
         delay = float(self._prepared.duration) * self.sleep_scale
         if timeout is not None and delay > float(timeout):
+            self.service.history.append({"action": "wait_done", "ok": False})
             return False
         if delay > 0:
             time.sleep(delay)
+        self.service.history.append({"action": "wait_done", "ok": True})
         return True
 
     def settle(self, seconds: float, *, stop=None) -> None:
@@ -897,7 +931,7 @@ class VirtualSequencer(SequencerDevice):
         more triggers.  ``abort`` / ``set_safe_state`` (base) route here, so "Stop Pulse"
         from the GUI clears the firing state and the live image freezes."""
         if self._firing is not None:
-            self.history.append({"action": "safe_state"})
+            self.service.set_safe_state()
         self._firing = None
         self._scan_info = None
         self._scan_done = False
