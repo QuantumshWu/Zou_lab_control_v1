@@ -2295,8 +2295,9 @@ class PlotKind:
 # 1-D families incl. the distribution, but NOT 2d/sites (an image has no per-repeat-line meaning);
 # ``pool`` (bin EVERY repeat's samples into ONE histogram) is the distribution's own extra mode.
 _BASE_REPEAT_MODES: tuple[str, ...] = ("average", "add", "replace")
-TRACE_REPEAT_MODES: tuple[str, ...] = REPEAT_MODES                                     # base + roll + create
-IMAGE_REPEAT_MODES: tuple[str, ...] = _BASE_REPEAT_MODES                               # a frame: mean/sum/latest, no create
+TRACE_REPEAT_MODES: tuple[str, ...] = _BASE_REPEAT_MODES + ("create",)                 # 1-D vector: base + per-repeat lines (NO roll)
+ROLLING_REPEAT_MODES: tuple[str, ...] = _BASE_REPEAT_MODES + ("roll", "create")        # rolling trace ONLY adds 'roll' (a rolling buffer)
+IMAGE_REPEAT_MODES: tuple[str, ...] = _BASE_REPEAT_MODES                               # a frame: mean/sum/latest, no create/roll
 HIST_REPEAT_MODES: tuple[str, ...] = ("pool",) + _BASE_REPEAT_MODES                    # pool (default) + base; create (multi-hist) added with its artist
 
 PLOT_KINDS: tuple[PlotKind, ...] = (
@@ -2330,7 +2331,7 @@ PLOT_KINDS: tuple[PlotKind, ...] = (
     PlotKind(
         key="monitor", cls=LiveLiveDis, label="Rolling trace", render_family="1D",
         input_format="value must be a scalar per shot (rolling trace)",
-        repeat_modes=TRACE_REPEAT_MODES,
+        repeat_modes=ROLLING_REPEAT_MODES,                  # rolling trace is the ONLY kind with 'roll'
     ),
     PlotKind(
         key="hist", cls=HistogramFigure, label="Distribution", render_family="1D",
