@@ -177,3 +177,48 @@ def test_poll_scan_progress_swallows_reader_errors(_app):
     ed.sequencer = _BoomSeq()
     ed._poll_scan_progress()                          # must not raise
     assert ed.scan_progress_label.text() == ""
+
+
+# ---- (4) On Pulse routes through the SAME PulseController seam as notebook + real, and is CYCLIC ----
+class _RecordingSeq:
+    """Records the payload prepared + whether fire() ran -- the device seam On Pulse must drive."""
+    clock_hz = 50_000_000.0
+
+    def __init__(self):
+        self.prepared = []
+        self.fired = 0
+
+    def prepare(self, payload):
+        self.prepared.append(payload)
+        return payload
+
+    def fire(self):
+        self.fired += 1
+
+
+def test_on_pulse_routes_through_pulse_controller_and_is_cyclic(_app):
+    """The GUI On Pulse must go through bind_pulse(...).on_pulse (GUI == notebook == real one seam) and
+    always ask for repeat_forever=True (On Pulse = continuous until Stop).  Even a state whose own
+    repeat_forever is False fires a CYCLIC program -- so a scan with scan_repeats=0 sweeps forever and
+    K>0 stops after K, exactly the user's intent (no reliance on any global data-carrier invariant)."""
+    ed = _pulse_editor()
+    ed.state.repeat_forever = False                   # a loaded single-shot state -- On Pulse overrides
+    seq = _RecordingSeq()
+    ed.sequencer = seq
+    ed.fire()                                         # the real On Pulse handler
+    assert seq.fired == 1                             # it prepared AND fired through the controller seam
+    payload = seq.prepared[-1]
+    assert bool(payload.repeat_forever) is True       # On Pulse is cyclic regardless of the state flag
+    assert int(payload.scan_repeats) == 0             # scan_repeats (0=∞) is what stops a scan, not this
+
+
+def test_prepare_button_also_routes_cyclic_through_controller(_app):
+    """The Prepare button shares the seam: it prepares (no fire) a cyclic program through the controller
+    -- so a subsequent run streams, and Prepare never leaves a contradictory one-shot scan program."""
+    ed = _pulse_editor()
+    ed.state.repeat_forever = False
+    seq = _RecordingSeq()
+    ed.sequencer = seq
+    ed.prepare()                                      # the real Prepare handler
+    assert seq.fired == 0                             # Prepare does NOT fire
+    assert len(seq.prepared) == 1 and bool(seq.prepared[-1].repeat_forever) is True

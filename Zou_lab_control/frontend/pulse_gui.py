@@ -3116,8 +3116,12 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         frozen_row = list(table[k])              # the raw row (for the readout); device gets the baked state
         frozen = self._freeze_state_to_scan_point(state, k)
         try:
-            self.sequencer.prepare(frozen)
-            self.sequencer.fire()
+            # Hold = loop the frozen single point FOREVER, through the SAME PulseController seam as On
+            # Pulse (prepare + fire in one call, repeat_forever=True); the frozen state has no scan_table,
+            # so this is a continuous static pulse of exactly that point.
+            from Zou_lab_control.neutral_atom.devices.sequencer import bind_pulse
+
+            bind_pulse(self.sequencer, frozen).on_pulse(repeat_forever=True, wait=False)
             self.stateui_manager.runstate = PulseStateUIManager.RunState.RUNNING
             self._held_scan_point = (k, frozen_row, len(table))
             # No success popup: the held point is shown persistently in the scan-progress label
@@ -3694,7 +3698,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
 
         return json.dumps(state.to_dict(), sort_keys=True, separators=(",", ":"))
 
-    def _prepare_to_device(self):
+    def _prepare_to_device(self, *, fire: bool = False):
         state = self.read_state()
         clock_step_ns = self._clock_step_ns(self.sequencer)
         if self.sequencer is None:
@@ -3704,7 +3708,20 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 state.to_sequence()
             self._applied_state_key = self._state_key(state)
             return None
-        program = self.sequencer.prepare(state)
+        # Route On Pulse / Prepare through the SAME PulseController seam the notebook and real hardware
+        # use (bind_pulse(...).on_pulse / .prepare), so GUI == notebook == real one interface -- the
+        # controller is the single owner of repeat_forever/scan_repeats/payload construction.  On Pulse
+        # means "run continuously until Stop", so it always asks for repeat_forever=True: a static pulse
+        # plays forever; a scan is cyclic, with scan_repeats (carried on the state) doing the stopping
+        # (0=sweep forever / K=stop after K).  That is the single source of the GUI scan's cyclic intent
+        # -- it does not depend on any global invariant in the data carrier.
+        from Zou_lab_control.neutral_atom.devices.sequencer import bind_pulse
+
+        controller = bind_pulse(self.sequencer, state)
+        if fire:
+            program = controller.on_pulse(repeat_forever=True, wait=False)
+        else:
+            program = controller.prepare(repeat_forever=True)
         # record what is now APPLIED on the device (the UNSYNCED baseline)
         self._applied_state_key = self._state_key(state)
         return program
@@ -3732,12 +3749,13 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         RunState = PulseStateUIManager.RunState
         self._held_scan_point = None          # a fresh Run resumes the full sweep -> no longer HELD (#1)
         try:
-            self.last_program = self._prepare_to_device()
+            # On Pulse = prepare + fire through the PulseController seam in ONE call (controller.on_pulse
+            # prepares then fires); no second self.sequencer.fire() here.
+            self.last_program = self._prepare_to_device(fire=True)
             if self.sequencer is None:
                 self._message("No sequencer attached. Sequence validated only.")
                 self.stateui_manager.runstate = RunState.PREPARED
                 return
-            self.sequencer.fire()
             self.stateui_manager.runstate = RunState.RUNNING
         except Exception as exc:
             self.stateui_manager.runstate = RunState.ERROR
