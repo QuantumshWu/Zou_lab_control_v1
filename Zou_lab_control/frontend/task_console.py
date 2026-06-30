@@ -2501,6 +2501,14 @@ class PanelCard(FluentGroupBox):
         if key == "relim":
             if getattr(self, "fixed_lim_row", None) is not None:        # the Setting popup's lo/hi row
                 self.fixed_lim_row.setVisible(str(value) == "fixed")    # (the Edit tab toggles its own)
+                # Revealing/hiding the lo/hi row CHANGES the popup's content height.  The Setting popup
+                # is a free-floating top-level Qt.Popup whose window size is fixed at open time, so a bare
+                # setVisible reflows the rows INSIDE that fixed window -> the layout "jumps".  Re-run the
+                # ONE sizing rule (_size_settings_popup: top-left anchored, grow-down, never re-position,
+                # high-water so it never snaps shorter) so the window grows DOWNWARD to fit the new row --
+                # smooth single-direction expand, not a jump (#fixed-lim-row-jump).
+                if getattr(self, "settings_popup", None) is not None and self.settings_popup.isVisible():
+                    self._size_settings_popup()
             self._apply_lim_to_plotter()
             self.changed.emit()
             return

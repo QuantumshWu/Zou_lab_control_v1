@@ -266,3 +266,49 @@ def test_edit_status_line_never_widens_the_page():
     finally:
         console.shutdown()
         exp.close()
+
+
+def test_setting_popup_relim_fixed_grows_down_from_a_fixed_top_left():
+    """Toggling relim -> ``fixed`` reveals the lo/hi row, which makes the Setting popup TALLER.  The
+    popup is a free-floating top-level Qt.Popup whose window size is fixed at open time, so a bare
+    ``setVisible`` reflows the rows inside that fixed window -> the layout "jumps".  The fix re-runs the
+    one sizing rule (``_size_settings_popup``: top-left anchored, grow-down, high-water) so the window
+    GROWS DOWNWARD: its top-left ``pos`` must NOT move (no re-center/teleport) and its height must only
+    grow -- a smooth single-direction expand.  Uses a LARGE window so the popup is not already capped at
+    the panel bottom (which would scroll instead of grow), isolating the row-toggle growth."""
+    ensure_qt_app()
+    import Zou_lab_control.neutral_atom as na
+    from Zou_lab_control.neutral_atom.core.signals import SignalHub
+    from Zou_lab_control.frontend.task_console import (
+        TaskConsole, default_console_state, PanelConfig, GAP)
+
+    exp = na.connect("virtual", sitemap={"grid_shape": (2, 3)})
+    console = TaskConsole(hub=SignalHub(), state=default_console_state(), session=exp,
+                          measurements=exp.readout.measurement_specs(),
+                          processors=exp.readout.processor_specs(), window_px=(1600, 1100))
+    console._timer.stop()
+    try:
+        card = console._new_panel_card(PanelConfig(kind="1d", title="t", source="value",
+                                                   row=GAP, col=GAP, size="4x4"))
+        console._attach_card(card)
+        card._open_settings()
+        popup = card.settings_popup
+        assert popup.isVisible()
+        assert not card.fixed_lim_row.isVisible()                       # auto: lo/hi row hidden
+        pos0 = (popup.x(), popup.y())
+        h0 = popup.height()
+
+        card._set_param("relim", "fixed")                              # reveal the lo/hi row
+        assert card.fixed_lim_row.isVisible()
+        assert (popup.x(), popup.y()) == pos0, \
+            "the Setting popup must stay top-left ANCHORED when a row appears (no re-center/jump)"
+        assert popup.height() > h0, "the popup must GROW DOWNWARD to fit the revealed lo/hi row"
+        grown_h = popup.height()
+
+        # Toggling back never moves the top-left, and the high-water mark keeps it tall (no shrink-jump).
+        card._set_param("relim", "normal")
+        assert (popup.x(), popup.y()) == pos0, "toggling back must not move the popup either"
+        assert popup.height() == grown_h, "high-water: the popup never snaps shorter within a session"
+    finally:
+        console.shutdown()
+        exp.close()
