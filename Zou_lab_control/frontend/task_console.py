@@ -5964,14 +5964,15 @@ class TaskConsole(QtWidgets.QWidget):
             spec = self._spec_for_logic(node)
             if spec is None:
                 raise RuntimeError("no session camera available")
-            # Same build path as the notebook: readout.camera_spec().build(hub, ...).  ``repeat`` =
-            # how many recent frames the camera keeps & AVERAGES then STOPS, or 0 = ∞ (roll the latest
-            # frame forever).  The camera FILLS that ring and publishes the WHOLE block EVERY frame --
-            # it never averages / suppresses frames at the measurement (that was the lag, #H3l); the
-            # PLOT reduces the block via repeat_mode.  So we consume ``repeat`` here, no update mode.
-            cam = spec.build(self.hub, **{k: v for k, v in values.items() if k != "repeat"})
-            cam.set_repeat(self._repeat_value(values))
-            return cam
+            # Same build path as the notebook: readout.camera_spec().build(hub, repeat=, ...).  ``repeat``
+            # = how many recent frames the camera keeps & AVERAGES then STOPS, or 0 = ∞ (roll the latest
+            # frame forever).  The camera FILLS that ring and publishes the WHOLE block EVERY frame -- it
+            # never averages / suppresses frames at the measurement (that was the lag, #H3l); the PLOT
+            # reduces the block via repeat_mode.  Pass ``repeat`` straight INTO build (its ``_build``
+            # forwards it to CameraMeasurement, whose ctor set_repeat is the single source) -- the same
+            # ONE path the notebook takes, instead of building then re-setting it from a second code path.
+            repeat = self._repeat_value(values)                     # pops "repeat" off ``values``
+            return spec.build(self.hub, repeat=repeat, **values)
         spec = self._spec_for_logic(node)
         if spec is None:
             raise RuntimeError(f"no catalog spec named {node.name!r} for a {kind} node")
