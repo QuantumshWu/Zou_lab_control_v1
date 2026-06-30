@@ -3983,6 +3983,11 @@ class PanelEditor(QtWidgets.QWidget):
 
         self.status = FluentLabel("")
         self.status.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+        # A status line must NEVER drive the page WIDTH: a QLabel's sizeHint width tracks its text, so a
+        # long message (e.g. "saved … → C:\very\long\path") would balloon the Edit column into a
+        # horizontal scroll.  Ignored horizontal policy makes the label take the available width and CLIP
+        # instead -- the layout width is owned by the canvas/rows, never by a log string (#layout-fixed).
+        self.status.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
         col.addWidget(self.status)
         col.addStretch(1)
 
@@ -4462,7 +4467,11 @@ class PanelEditor(QtWidgets.QWidget):
                                       "kind": self.card.config.kind})
             self.console._last_save_dir = str(stem.parent)   # remember where (kernel session)
             self._update_save_preview()
-            self.status.setText(f"saved {out['figure'].name} + {out['data'].name} → {stem.parent}")
+            # Show the LEAF folder, not the full absolute path (the full path is one click away in the
+            # tooltip + the save-preview field) -- a short message that fits, with the width-safe status
+            # policy as the backstop so even a long folder name can never widen the page.
+            self.status.setText(f"saved {out['figure'].name} + {out['data'].name} → …/{stem.parent.name}")
+            self.status.setToolTip(str(stem.parent))
         except Exception as exc:
             self.status.setText(f"save failed: {str(exc).splitlines()[0][:120]}")
 

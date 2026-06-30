@@ -244,3 +244,25 @@ def test_both_gui_windows_share_one_editable_screen_fraction():
     assert pulse_gui.DEFAULT_WINDOW_RATIO == frac                       # pulse editor reads the constant
     assert inspect.signature(TaskConsole.__init__).parameters["window_ratio"].default == frac
     assert inspect.signature(show_task_console).parameters["window_ratio"].default == frac
+
+
+def test_edit_status_line_never_widens_the_page():
+    """A long save log (the saved absolute path) must NOT balloon the Edit page into a horizontal
+    scroll: the status label's horizontal policy is Ignored, so it takes the available width and clips
+    -- the page width is owned by the canvas/rows, never by a log string (#layout-fixed)."""
+    ensure_qt_app()
+    from PyQt5 import QtWidgets
+    from Zou_lab_control.frontend.task_console import PanelEditor
+    exp, console = _console()
+    try:
+        editor = PanelEditor(_hist_card(console), console)
+        editor.rebuild()
+        assert editor.status.sizePolicy().horizontalPolicy() == QtWidgets.QSizePolicy.Ignored
+        w0 = editor.sizeHint().width()
+        editor.status.setText("saved fig.png + fig.npy -> " + "C:/" + "averylongfoldername/" * 40)
+        editor.status.adjustSize()
+        assert editor.sizeHint().width() <= w0 + 4, \
+            "a long status string must not grow the Edit page width (it must clip, not balloon)"
+    finally:
+        console.shutdown()
+        exp.close()
