@@ -12,6 +12,15 @@ from matplotlib.widgets import RectangleSelector
 import numpy as np
 
 
+# Selector artists (zoom rectangle, area box + handles, crosshair, coordinate text)
+# are TRANSIENT interaction overlays and must sit ABOVE every data-layer overlay so the
+# user can always see what they are selecting.  The plot data overlays (site rings,
+# threshold cut lines, pulse brackets) live at zorder 1-12; this single constant pins
+# every selector artist well clear of them, in ONE place so the contract can't drift.
+# (Internal art knob -- never a public parameter, per the sealed-API contract rule 6.)
+SELECTOR_ZORDER = 50
+
+
 @dataclass
 class PlotState:
     """Small metadata object shared by plots, selectors, and DataFigure."""
@@ -72,15 +81,25 @@ class AreaSelector:
             interactive=True,
             useblit=True,
             button=[1],
-            props=dict(alpha=0.8, fill=False, linestyle="-", color=self.color),
+            props=dict(alpha=0.8, fill=False, linestyle="-", color=self.color,
+                       zorder=SELECTOR_ZORDER),
             handle_props=dict(
                 marker="s",
                 markersize=matplotlib.rcParams["legend.fontsize"] / 2,
                 markeredgecolor=self.color,
                 markerfacecolor="white",
                 markeredgewidth=matplotlib.rcParams["lines.linewidth"] / 2,
+                zorder=SELECTOR_ZORDER,
             ),
         )
+        # Belt-and-braces: pin every artist the selector created (box + handles) above
+        # the data overlays, independent of which matplotlib version honoured the zorder
+        # in props / handle_props.
+        for artist in getattr(self.selector, "artists", ()):  # pragma: no branch
+            try:
+                artist.set_zorder(SELECTOR_ZORDER)
+            except Exception:
+                pass
 
     def _call(self) -> None:
         if self.callback is not None:
@@ -116,6 +135,7 @@ class AreaSelector:
                 ha="left",
                 va="top",
                 fontsize=matplotlib.rcParams["legend.fontsize"],
+                zorder=SELECTOR_ZORDER + 1,
             )
         else:
             self.text.set_text(label)
@@ -216,8 +236,10 @@ class CrossSelector:
         self.xy = [x, y]
 
         if self.point is None:
-            self.vline = self.ax.axvline(x, color=self.color, linestyle="-", alpha=0.8)
-            self.hline = self.ax.axhline(y, color=self.color, linestyle="-", alpha=0.8)
+            self.vline = self.ax.axvline(x, color=self.color, linestyle="-", alpha=0.8,
+                                         zorder=SELECTOR_ZORDER)
+            self.hline = self.ax.axhline(y, color=self.color, linestyle="-", alpha=0.8,
+                                         zorder=SELECTOR_ZORDER)
             self.text = self.ax.text(
                 0.975,
                 0.975,
@@ -227,8 +249,10 @@ class CrossSelector:
                 ha="right",
                 va="top",
                 fontsize=matplotlib.rcParams["legend.fontsize"],
+                zorder=SELECTOR_ZORDER + 1,
             )
-            (self.point,) = self.ax.plot(x, y, "o", alpha=0.8, color=self.color)
+            (self.point,) = self.ax.plot(x, y, "o", alpha=0.8, color=self.color,
+                                         zorder=SELECTOR_ZORDER)
         else:
             self.vline.set_xdata([x, x])
             self.hline.set_ydata([y, y])
@@ -245,6 +269,7 @@ class CrossSelector:
                     color=self.color_dis,
                     linewidth=matplotlib.rcParams["legend.fontsize"] / 4,
                     alpha=0.3,
+                    zorder=SELECTOR_ZORDER,
                 )
             else:
                 self._dis_line.set_ydata([zval, zval])
