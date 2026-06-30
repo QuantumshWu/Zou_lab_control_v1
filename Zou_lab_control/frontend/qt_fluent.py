@@ -2122,9 +2122,29 @@ def fluent_spinbox_stylesheet(selector: str) -> str:
     """
 
 
-class FluentSpinBox(QtWidgets.QSpinBox):
+class _WheelFocusGuardMixin:
+    """Scroll-over protection for numeric spin controls: the wheel only changes the value
+    AFTER the widget has been clicked into (has keyboard focus).  Without focus the wheel
+    event is ignored and bubbles up to the parent scroll area, so scrolling a Setting / Edit
+    page that happens to pass over a spinbox scrolls the PAGE instead of silently nudging the
+    number -- the误触 the user hit.  Mirrors ``FluentComboBox.wheelEvent`` (ignore -> bubble)
+    so every numeric control behaves the same way.  ``StrongFocus`` is what makes a left click
+    grab focus (Tab too); the real gate is the ``hasFocus`` check below, not the policy."""
+
+    def _install_wheel_focus_guard(self) -> None:
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
+
+    def wheelEvent(self, event):
+        if not self.hasFocus():
+            event.ignore()         # not focused -> let the parent scroll area scroll the page
+            return
+        super().wheelEvent(event)  # focused (clicked into) -> normal value step
+
+
+class FluentSpinBox(_WheelFocusGuardMixin, QtWidgets.QSpinBox):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._install_wheel_focus_guard()
         self.setButtonSymbols(QtWidgets.QAbstractSpinBox.PlusMinus)
         self.setMinimumHeight(scaled_px(30, minimum=22))
         # Left-align with zero internal text margins so the text's left inset is
@@ -2240,11 +2260,12 @@ class FluentFloatingEditor(QtWidgets.QDialog):
         return self._edit.toPlainText()
 
 
-class FluentDoubleSpinBox(QtWidgets.QDoubleSpinBox):
+class FluentDoubleSpinBox(_WheelFocusGuardMixin, QtWidgets.QDoubleSpinBox):
     """Confocal_GUIv2-style double spinbox with an inline step editor."""
 
     def __init__(self, length=5, allow_minus: bool = False, parent=None):
         super().__init__(parent)
+        self._install_wheel_focus_guard()
         self.setButtonSymbols(QtWidgets.QAbstractSpinBox.PlusMinus)
         self.setMinimumHeight(scaled_px(30, minimum=22))
         # See FluentSpinBox: left-align + zero text margins for left-padding
