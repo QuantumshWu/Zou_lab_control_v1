@@ -79,10 +79,10 @@ def _has_repeat_axis(a, core_ndim) -> bool:
     return a.ndim >= 3
 
 
-def reduce_repeat(raw, mode: str = "average", *, core_ndim=None):
+def reduce_repeat(raw, mode: str = "average", *, core_ndim=None, hist=False):
     """Collapse a raw block over its LEADING (repeat) axis O0 for display.  Works for ANY trailing
     shape -- a 1-D scan's ``(repeat, points, dim)``, a 2-D scan's ``(repeat, n0*n1, dim)``, a camera's
-    ``(repeat, 1, H, W)``, a clean occupancy ``(repeat, n_sites)`` -- because the repeat axis is always
+    ``(repeat, 1, H, W)``, a clean occupancy ``(repeat, 1, n_sites)`` -- because the repeat axis is always
     axis 0.  WHETHER axis 0 IS the repeat is decided by the producing signal's declared structure when
     given (``core_ndim``, #H3s-F3): collapse when ``raw.ndim == 1 + core_ndim``, pass through an
     already-reduced ``raw.ndim == core_ndim`` value.  When ``core_ndim is None`` the EXISTING ndim>=3
@@ -94,24 +94,25 @@ def reduce_repeat(raw, mode: str = "average", *, core_ndim=None):
     * ``add``     -> ``nansum``  over repeats (accumulating exposure).
     * ``replace`` / ``roll`` -> the LATEST repeat slice that holds data.
     * ``pool``    -> a DISTRIBUTION mode: do NOT reduce the repeat axis -- flatten EVERY repeat-with-data's
-      samples into one 1-D set so a histogram bins all shots together.  This is the ONLY repeat mode a
-      histogram offers, so the panel needs no per-kind special case: it just calls ``reduce_repeat(mode)``.
-    * ``create``  -> 1-D blocks only: keep EVERY repeat-with-data as its own column block
-      ``(points, n*dim)`` so the curve draws one line per repeat (confocal's "create"); for a 3-D+
-      data block (an image) ``create`` has no meaning and falls back to the mean."""
+      samples into one 1-D set so a histogram bins all shots together.
+    * ``create``  -> keep EVERY repeat-with-data as its own column.  For a TRACE the core's leading axis
+      is the x-points, so ``(R, points, dim) -> (points, R*dim)`` draws one line per repeat (confocal's
+      "create"); for an image ``(R, 1, H, W)`` each repeat's whole core flattens to a column.
+
+    ``hist=True`` reduces for a DISTRIBUTION (the kind decides this, #iron-law): a histogram's core is
+    ALL samples -- it has NO x-axis -- so EVERY non-pool reduction is flattened to one 1-D sample set
+    (the dis bins all of it), and ``create`` keeps each repeat's WHOLE flattened core as its own column
+    ``(n_samples, R)`` = one histogram per repeat.  This is why a trace and a histogram, whose blocks can
+    be the SAME ndim (``(R, points, dim)`` vs ``(R, 1, n_sites)``), need the kind to pick the layout."""
     a = np.asarray(raw, dtype=float)
-    if not _has_repeat_axis(a, core_ndim):              # not a repeat block -> leave as-is
-        return a
+    if not _has_repeat_axis(a, core_ndim):              # not a repeat block -> leave as-is (a hist with no
+        return a.reshape(-1) if hist else a             # repeat axis is just ONE sample set -> flatten)
     has = np.isfinite(a).any(axis=tuple(range(1, a.ndim)))   # which repeat slices hold any data
     idx = np.flatnonzero(has)
-    if mode == "add":
-        return np.nansum(a, axis=0)
-    if mode in ("replace", "roll"):
-        return a[idx[-1]] if idx.size else a[0]
-    if mode == "pool":                                    # histogram: flatten ALL repeats' samples (no reduce)
-        return (a[idx] if idx.size else a[:1]).reshape(-1)
     if mode == "create":
         cols = idx if idx.size else np.array([0])
+        if hist:                                              # a histogram's core is ALL samples (no x-axis):
+            return a[cols].reshape(len(cols), -1).T           #   each repeat's whole core -> a column (n_samples, R)
         if a.ndim == 2:                                       # (R, points) reduced scan -> (points, R) lines
             return a[cols].T
         if a.ndim == 3:                                       # (R, points, dim) scan -> (points, R*dim)
@@ -119,13 +120,22 @@ def reduce_repeat(raw, mode: str = "average", *, core_ndim=None):
         # ndim >= 4: an image block (a camera's (R, 1, H, W)) -- create is ORTHOGONAL to the data axes:
         # flatten each repeat's core to a column so there is ONE trace per repeat (NOT per image row).
         return a[cols].reshape(len(cols), -1).T               # (prod(core), R) = x=pixel index, R lines
+    if mode == "pool":                                    # histogram: flatten ALL repeats' samples (no reduce)
+        return (a[idx] if idx.size else a[:1]).reshape(-1)
+    if mode == "add":
+        out = np.nansum(a, axis=0)
+        return out.reshape(-1) if hist else out
+    if mode in ("replace", "roll"):
+        out = a[idx[-1]] if idx.size else a[0]
+        return out.reshape(-1) if hist else out
     # An all-NaN cell (a not-yet-measured scan point during a LIVE sweep) averages to NaN -- a gap in
     # the curve, BY INTENT.  numpy reports that via two channels: errstate covers the 0/0 it computes,
     # and a separate ``warnings`` message ("Mean of empty slice") that errstate does NOT catch -- so
     # silence exactly that benign message here (the result is already the intended NaN).
     with warnings.catch_warnings(), np.errstate(invalid="ignore", divide="ignore"):
         warnings.filterwarnings("ignore", message="Mean of empty slice", category=RuntimeWarning)
-        return np.nanmean(a, axis=0)
+        out = np.nanmean(a, axis=0)
+    return out.reshape(-1) if hist else out
 
 
 def repeats_with_data(raw, *, core_ndim=None) -> int:
@@ -1909,7 +1919,12 @@ class HistogramFigure(BaseLivePlot):
         fit: str = "double",            # fit chooser: "none" | "single" | "double" (dark/bright readout)
         **kwargs,
     ):
-        self.values = np.asarray(values, dtype=float).reshape(-1)
+        # 'create' repeat mode delivers (n_samples, R): column 0 is the FIRST repeat (the FULL
+        # treatment -- fill + fit + threshold + stats), columns 1.. draw an OUTLINE only (LINE_CYCLE).
+        # Any other input is one flat sample set (a single histogram).
+        self._overlay_lines: list = []
+        self._overlay_counts: list = []
+        self.values = self._split_columns(values)
         self.bins_arg = bins
         self.ylog = bool(ylog)          # log-scale the COUNT axis (reveals a sparse bright tail)
         # The fit is a DISPLAY chooser (none / single / double) driven by the toggle -- never an
@@ -1928,6 +1943,40 @@ class HistogramFigure(BaseLivePlot):
         # default to "tight" but HONOR a relim_mode the panel passes (Setting/Edit "fixed" + lo/hi).
         kwargs.setdefault("relim_mode", "tight")
         super().__init__(np.arange(len(self.values)), self.values, labels=labels, **kwargs)
+
+    def _split_columns(self, values):
+        """Parse the bound value into (first-repeat samples, extra per-repeat columns).  A 2-D
+        ``(n_samples, R>1)`` block ('create' mode) keeps each column as its own repeat -- column 0 is the
+        primary histogram, columns 1.. become outline overlays.  Anything else is one flat sample set."""
+        arr = np.asarray(values, dtype=float)
+        if arr.ndim == 2 and arr.shape[1] > 1:
+            self._extra_cols = [arr[:, j][np.isfinite(arr[:, j])] for j in range(1, arr.shape[1])]
+            return np.asarray(arr[:, 0], dtype=float).reshape(-1)
+        self._extra_cols = []
+        return arr.reshape(-1)
+
+    def _ensure_overlays(self, n_extra: int) -> None:
+        """Keep exactly ``n_extra`` outline Line2D artists (one per non-first 'create' repeat),
+        coloured by the shared LINE_CYCLE so they match the 1-D trace colours."""
+        while len(self._overlay_lines) < n_extra:
+            j = len(self._overlay_lines)
+            (ln,) = self.ax.plot([], [], drawstyle="steps-mid",
+                                 color=LINE_CYCLE[(j + 1) % len(LINE_CYCLE)], linewidth=1.0, alpha=0.7)
+            self._overlay_lines.append(ln)
+        while len(self._overlay_lines) > n_extra:
+            self._overlay_lines.pop().remove()
+
+    def _refresh_overlays(self) -> None:
+        """Re-bin each extra 'create' repeat on the CURRENT bins and update its outline; cache the counts
+        so the count-axis can include the overlays' peak (else a taller repeat would clip)."""
+        self._ensure_overlays(len(self._extra_cols))
+        centers = (self.bins[:-1] + self.bins[1:]) / 2
+        self._overlay_counts = []
+        for ln, col in zip(self._overlay_lines, self._extra_cols):
+            c = col if col.size else np.array([0.0])
+            counts, _ = np.histogram(c, bins=self.bins)
+            ln.set_data(centers, counts)
+            self._overlay_counts.append(counts)
 
     def init_core(self) -> None:
         self.ax.set_xlabel(self.xlabel)
@@ -1966,6 +2015,7 @@ class HistogramFigure(BaseLivePlot):
             color=PALETTE["annotation"],
             fontsize=small_fontsize(),
         )
+        self._refresh_overlays()         # 'create' overlay histograms (empty unless in create mode)
         self._apply_value_xlim()
         self._apply_count_yscale()
         self._update_hist_stats()
@@ -1974,7 +2024,7 @@ class HistogramFigure(BaseLivePlot):
         if values is None and data_y is not None:
             values = data_y
         if values is not None:
-            self.values = np.asarray(values, dtype=float).reshape(-1)
+            self.values = self._split_columns(values)
             self.data_x = _as_data_x(np.arange(len(self.values)))
             self.data_y = _as_data_y(self.values, len(self.values))
             self.points_total = len(self.values)
@@ -1989,6 +2039,7 @@ class HistogramFigure(BaseLivePlot):
             self.verts = np.empty((len(self.n), 4, 2), dtype=float)
         _update_verts(self.bins, self.n, self.verts, mode="vertical")
         self.poly.set_verts(self.verts)
+        self._refresh_overlays()
         self._apply_value_xlim()
         self._apply_count_yscale()
         self._fit_bimodal()
@@ -2055,7 +2106,11 @@ class HistogramFigure(BaseLivePlot):
     def _apply_count_yscale(self) -> None:
         """Set the count (y) axis scale + limits.  Log mode floors at 0.5 so 0-count bars sit BELOW
         the axis (no 0 -> -inf on the filled poly) and a sparse bright tail becomes visible."""
-        top = max(1.0, float(np.max(self.n)) * (3.0 if self.ylog else 1.2))
+        peak = float(np.max(self.n))
+        for counts in self._overlay_counts:           # include the 'create' overlay histograms' peak
+            if len(counts):
+                peak = max(peak, float(np.max(counts)))
+        top = max(1.0, peak * (3.0 if self.ylog else 1.2))
         if self.ylog:
             self.ax.set_yscale("log")
             self.ax.set_ylim(0.5, top)
@@ -2320,7 +2375,7 @@ _BASE_REPEAT_MODES: tuple[str, ...] = ("average", "add", "replace")
 TRACE_REPEAT_MODES: tuple[str, ...] = _BASE_REPEAT_MODES + ("create",)                 # 1-D vector: base + per-repeat lines (NO roll)
 ROLLING_REPEAT_MODES: tuple[str, ...] = _BASE_REPEAT_MODES + ("roll", "create")        # rolling trace ONLY adds 'roll' (a rolling buffer)
 IMAGE_REPEAT_MODES: tuple[str, ...] = _BASE_REPEAT_MODES                               # a frame: mean/sum/latest, no create/roll
-HIST_REPEAT_MODES: tuple[str, ...] = ("pool",) + _BASE_REPEAT_MODES                    # pool (default) + base; create (multi-hist) added with its artist
+HIST_REPEAT_MODES: tuple[str, ...] = ("pool",) + _BASE_REPEAT_MODES + ("create",)      # pool (default) + base + create (one overlaid histogram per repeat)
 
 PLOT_KINDS: tuple[PlotKind, ...] = (
     PlotKind(

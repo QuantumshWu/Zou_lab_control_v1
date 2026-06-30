@@ -203,6 +203,7 @@ def test_plot_setting_has_only_repeat_mode_not_repeat(monkeypatch):
         modes3 = [combo3.itemText(i) for i in range(combo3.count())]
         assert modes3[0] == "pool"                                 # pool is the dist's canonical default (first)
         assert {"average", "add", "replace"} <= set(modes3)        # the base verbs are generic across kinds
+        assert "create" in modes3                                  # a dist CAN create: one overlaid histogram per repeat
         assert "roll" not in modes3                                # 'roll' is a trace-only verb (no rolling histogram)
     finally:
         console.shutdown()

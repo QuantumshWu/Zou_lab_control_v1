@@ -2080,7 +2080,8 @@ class PanelCard(FluentGroupBox):
                     "  pool    = bin EVERY repeat's samples into ONE histogram (all repeats together)\n"
                     "  average = bin the per-point MEAN over the repeats (one histogram)\n"
                     "  add     = bin the per-point SUM over the repeats\n"
-                    "  replace = bin only the newest repeat's samples")
+                    "  replace = bin only the newest repeat's samples\n"
+                    "  create  = ONE histogram per repeat overlaid (first repeat full, the rest outlined)")
         if self._bound_is_occupancy():
             return ("How to combine the N shots of per-site occupancy for display:\n"
                     "  average = per-site LOADING PROBABILITY = mean of the N shots' 0/1\n"
@@ -2603,10 +2604,12 @@ class PanelCard(FluentGroupBox):
         # a repeat block (axis 0 = repeat) -- structure-driven when core_ndim is declared, else ndim>=3
         if had_repeat and (b.ndim == 1 + core_ndim if core_ndim is not None else b.ndim >= 3):
             self._repeat_cur = repeats_with_data(b, core_ndim=core_ndim)   # scan / camera / occupancy block
-            # ONE reducer for EVERY kind -- no per-kind branch: average/add/replace/roll/create collapse the
-            # repeat axis; a histogram's 'pool' flattens it into one sample set.  The plot kind only decides
-            # WHICH modes are offered (PLOT_KINDS repeat_modes); reduce_repeat dispatches on the chosen mode.
-            return reduce_repeat(b, mode, core_ndim=core_ndim)
+            # ONE reducer dispatches on the chosen mode; the only kind input is hist=, because a histogram
+            # has NO x-axis in its core (#iron-law): every non-pool reduction flattens to one sample set,
+            # and 'create' keeps each repeat's whole core as a column (n_samples, R) -- a trace's create
+            # instead keeps the points axis.  A trace/image block and a hist block can be the SAME ndim
+            # ((R, points, dim) vs (R, 1, n_sites)), so the kind, not the shape, picks the layout.
+            return reduce_repeat(b, mode, core_ndim=core_ndim, hist=(self.config.kind == "hist"))
         self._repeat_cur = 1                                      # no repeat axis -> nothing to reduce
         return b
 
@@ -2750,6 +2753,13 @@ class PanelCard(FluentGroupBox):
             sy = max(1, int(np.ceil(img.shape[0] / 192)))
             sx = max(1, int(np.ceil(img.shape[1] / 192)))
             return img[::sy, ::sx]
+        if kind == "hist":
+            # A histogram bins SAMPLES.  ``reduce_repeat(hist=True)`` already flattened every non-'create'
+            # mode to a 1-D sample set, so the ONLY 2-D a dis receives is 'create' per-repeat COLUMNS
+            # (n_samples, R) -> keep them (HistogramFigure draws one histogram per repeat: first full, the
+            # rest outlined).  Anything else flattens to ONE histogram -- the dis bins EXACTLY what the
+            # source gives it (no reach into any calibration, no shape guessing).
+            return arr if (arr.ndim == 2 and arr.shape[1] > 1) else arr.reshape(-1)
         if kind == "monitor":
             flat = arr.reshape(-1)
             if flat.size != 1:

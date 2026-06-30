@@ -69,6 +69,32 @@ def test_none_draws_no_fit():
     assert _no_fit_drawn(fig), 'fit="none" must draw NO fit curve at all'
 
 
+def test_create_draws_one_outlined_histogram_per_repeat():
+    """'create' for a DISTRIBUTION: reduce_repeat(hist=True) collapses each repeat's WHOLE core to a
+    column -> (n_samples, R) for the iron-law (repeat, data_points=1, n_sites) block; the dis draws ONE
+    histogram per repeat -- column 0 the FULL treatment (filled poly + fit), columns 1.. an OUTLINE only
+    (LINE_CYCLE).  Non-create modes stay 1-D (the hist bins everything); a plain 1-D value (pool / single
+    repeat) is a single histogram with no overlays."""
+    ensure_qt_app()
+    from Zou_lab_control.frontend.live import reduce_repeat
+    rng = np.random.default_rng(0)
+    R, n_sites = 4, 35
+    # iron-law per-site readout block: (repeat, data_points=1, n_sites), core_ndim=2 -- the REAL shape
+    block = np.stack([np.concatenate([rng.normal(300, 16, n_sites // 2),
+                                      rng.normal(470, 16, n_sites - n_sites // 2)])
+                      for _ in range(R)])[:, None, :]            # (R, 1, n_sites)
+    created = reduce_repeat(block, "create", core_ndim=2, hist=True)
+    assert created.shape == (n_sites, R)                         # one COLUMN (n_sites samples) per repeat
+    assert reduce_repeat(block, "average", core_ndim=2, hist=True).ndim == 1   # non-create -> ONE 1-D set
+    fig = plot(created, kind="hist", bins=20, fit="double")
+    assert _two_peaks_drawn(fig)                                 # the FIRST repeat keeps the full fit
+    assert len(fig._overlay_lines) == R - 1                      # one OUTLINE per non-first repeat
+    assert all(len(ln.get_xdata()) > 0 for ln in fig._overlay_lines)
+    # a 1-D value -> ONE histogram, no overlays
+    fig2 = plot(rng.normal(300.0, 20.0, 400), kind="hist", bins=30)
+    assert len(fig2._overlay_lines) == 0
+
+
 def test_separated_readout_reports_a_fidelity():
     """A genuinely bimodal readout (dark + bright) draws two peaks AND reports a finite fidelity (the
     separation gate is met)."""

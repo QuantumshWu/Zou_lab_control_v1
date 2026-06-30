@@ -30,12 +30,14 @@ def _hist_card():
 
 
 def test_dis_bins_its_raw_input_no_calibration_reach():
-    """A 2D camera FRAME bound to a dis histograms ALL its pixels (size H*W) -- it is NOT secretly
-    reduced to per-site counts.  And the panel carries no calibration hook at all (structural decoupling:
-    the dis cannot reach into a processor/session for 'extra data')."""
+    """A camera FRAME bound to a dis histograms ALL its pixels -- it is NOT secretly reduced to per-site
+    counts.  Under the iron law (repeat, data_points, *data_dim) a frame reaches the dis as a reduced
+    single block (data_points=1, H, W) [average] or 1-D [pool]; the dis flattens it and bins every pixel.
+    The panel carries no calibration hook at all (structural decoupling: it cannot reach into a
+    processor/session for 'extra data')."""
     card = _hist_card()
     try:
-        frame = np.random.default_rng(0).normal(300.0, 30.0, size=(24, 30))
+        frame = np.random.default_rng(0).normal(300.0, 30.0, size=(1, 24, 30))   # (data_points=1, H, W)
         card._render(frame)
         assert card.plotter is not None
         binned = np.asarray(card.plotter.values, dtype=float).reshape(-1)
