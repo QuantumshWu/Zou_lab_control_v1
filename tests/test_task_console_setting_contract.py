@@ -321,43 +321,43 @@ def test_no_control_tab_monitor_only():
         console.shutdown()
 
 
-def test_setting_keeps_display_params_functional_scalars_go_to_edit():
-    """Setting/Edit never DUPLICATE a parameter, and a plot's signal INPUTS are SLOTS,
-    not params: the Setting popup renders the colormap chooser (the only display param)
-    plus ONE signal picker per :func:`panel_input_slots` slot (signal[0], signal[1], ...),
-    while FUNCTIONAL scalar params (length / bins) live in the panel's Edit tab.  So a 2d
-    panel's Setting shows cmap but NOT length; a monitor panel shows no param widget; and
-    the site map shows its ONE input-slot picker (the occupancy signal; its centres + frame
-    underlay auto-resolve from the producing node, not extra slots)."""
+def test_setting_keeps_display_params_acquisition_goes_to_edit():
+    """Setting/Edit never DUPLICATE a parameter via display=False, and a plot's signal INPUTS are SLOTS,
+    not params.  A pure DISPLAY knob -- how the SAME data is drawn: colormap, the rolling side-dist
+    toggle, the histogram bins / fit / log axis, and the rolling history length -- lives in the
+    lightweight Setting popup (display=True).  Only an ACQUISITION / measurement-API param would be
+    display=False and live in the Edit tab; these display-only kinds declare none.  So a 2d panel's
+    Setting shows cmap; a monitor panel shows history + the side-dist toggle; a hist panel shows bins;
+    and the site map shows its ONE input-slot picker (centres + frame underlay auto-resolve)."""
     from Zou_lab_control.frontend.task_console import PANEL_PARAMS, panel_input_slots
 
-    # APPEARANCE toggles auto-inject into the Setting popup (display=True): the colormap chooser, the
-    # rolling-trace side-distribution toggle, the histogram bimodal / ylog toggles (#H3v-4b / #H3w-1).
-    # FUNCTIONAL scalars (rolling length, hist bins) stay in the Edit tab (display=False); signal inputs
-    # are SLOTS, not params.
-    _FUNCTIONAL_SCALARS = {"length", "bins"}
+    # Every declared plot-panel param on these display-only kinds is a pure DISPLAY knob -> Setting
+    # (display=True).  None is an acquisition param, so display=False must not appear here.
     for kind, specs in PANEL_PARAMS.items():
         for spec in specs:
-            assert spec.display is (spec.key not in _FUNCTIONAL_SCALARS), (kind, spec.key)
+            assert spec.display is True, (kind, spec.key, "all params on a display-only kind are display knobs")
 
     # a 2d card's Setting popup renders the colormap chooser (display) + its ONE signal
-    # slot; a monitor card renders no param widget and one slot.
-    # Every Setting popup carries the universal plot controls (relim + repeat_mode) PLUS the kind's
-    # appearance params; the FUNCTIONAL scalars (length / bins) are NOT here -- they live in Edit.
+    # slot.  Every Setting popup carries the universal plot controls (relim + repeat_mode) PLUS the
+    # kind's display knobs; a display-only kind has NO Edit-tab acquisition params.
     img = _card("2d")
     try:
         assert "cmap" in img.param_widgets                       # appearance param in Setting
-        assert not ({"length", "bins"} & set(img.param_widgets)) # functional scalars stay in Edit
         assert len(img.slot_combos) == len(panel_input_slots("2d")) == 1
     finally:
         img.shutdown()
     mon = _card("monitor")
     try:
         assert "show_dist" in mon.param_widgets                  # the rolling-trace appearance toggle
-        assert "length" not in mon.param_widgets                 # the FUNCTIONAL scalar moved to Edit
+        assert "length" in mon.param_widgets                     # the history length is a Setting display knob
         assert len(mon.slot_combos) == 1
     finally:
         mon.shutdown()
+    dis = _card("hist")
+    try:
+        assert "bins" in dis.param_widgets                       # bins is a Setting display knob
+    finally:
+        dis.shutdown()
     # the site map's Setting: cmap (display param) + ONE input-slot picker (the occupancy
     # signal); its centres + frame underlay are auto-resolved from the SAME producing node,
     # so the user picks just the one signal (centers/image are NOT slots or display params).

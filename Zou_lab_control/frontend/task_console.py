@@ -1860,6 +1860,9 @@ class PanelCard(FluentGroupBox):
         # _emit_param_rows).  (size + colormap stay for every role; relim/repeat/unit/update are
         # plotter-only conveniences, "plot" role only -- restyle a measurement by Adding a Plot panel.)
         self.param_widgets: dict[str, QtWidgets.QWidget] = {}
+        # {key: kind} for every declarative Setting control, so refresh_on_show can re-seed each widget
+        # from config.params through its kind's PARAM_WIDGETS.write (one source -- no per-key handwiring).
+        self._param_kinds: dict[str, str] = {}
         display_specs = [s for s in PANEL_PARAMS.get(self.config.kind, ()) if s.display]
         if self.config.role == "plot":
             display_specs = display_specs + [_RELIM_PARAM]
@@ -1876,6 +1879,7 @@ class PanelCard(FluentGroupBox):
             for spec in self._repeat_param_specs():
                 widget = self._make_param_widget(spec)
                 self.param_widgets[spec.key] = widget
+                self._param_kinds[spec.key] = spec.kind    # remember for refresh_on_show re-seed
                 sec.addWidget(FluentSettingRow(spec.label, widget, label_width=label_w))
 
             # fixed lo/hi inputs (#8): ONE bespoke [lo | hi] row (the single special-cased control,
@@ -1982,6 +1986,7 @@ class PanelCard(FluentGroupBox):
         for spec in specs:
             widget = self._make_param_widget(spec, apply=apply)
             out[spec.key] = widget
+            self._param_kinds[spec.key] = spec.kind        # remember the kind for refresh_on_show re-seed
             add(FluentSettingRow(spec.label, widget, label_width=label_w))
         return out
 
@@ -2099,6 +2104,24 @@ class PanelCard(FluentGroupBox):
                 "  roll    = show the newest repeat (rolling)\n"
                 "  create  = draw EVERY repeat as its own line (1-D only)")
 
+    def refresh_on_show(self) -> None:
+        """Re-seed every Setting control from ``config.params`` -- the SINGLE source of truth for a
+        panel's params -- so the Setting popup shows the CURRENT values whenever it opens, even if they
+        were changed elsewhere (the Edit tab writes the same config.params).  Each widget is re-seeded
+        through its kind's ``PARAM_WIDGETS.write`` (one entry point, no per-key handwiring), with its
+        change signals blocked so re-seeding does not re-fire ``_set_param`` (which would needlessly
+        rebuild).  This is the #6 fix: a control is a VIEW of config.params, refreshed on show, never a
+        private copy that drifts from the other surface."""
+        for key, widget in self.param_widgets.items():
+            kind = self._param_kinds.get(key)
+            if kind is None or key not in self.config.params:
+                continue
+            with _signals_blocked(widget):
+                try:
+                    PARAM_WIDGETS[kind].write(widget, self.config.params[key])
+                except (TypeError, ValueError):
+                    continue
+
     def _open_settings(self) -> None:
         # Click-to-open / click-again-to-close TOGGLE.  A Qt.Popup already auto-closes
         # on the mouse PRESS that lands on this button, so by the time the button's
@@ -2111,6 +2134,7 @@ class PanelCard(FluentGroupBox):
             return
         if time.monotonic() - self._settings_dismissed_at < 0.25:
             return
+        self.refresh_on_show()          # Setting controls are a VIEW of config.params -- refresh on open (#6)
         self._refresh_signal_combo()
         anchor = self.setting_button.mapToGlobal(
             QtCore.QPoint(self.setting_button.width(), self.setting_button.height()))
@@ -4303,15 +4327,38 @@ class PanelEditor(QtWidgets.QWidget):
 
     def refresh_on_show(self) -> None:
         """When this panel's Edit tab becomes visible, refresh anything that may have changed
-        since it was last shown: snap the manual-limit fields to current view, re-read the
-        producing source's 'now' acquisition values, and refresh any embedded source form's
-        dynamic combos (the ONE hook the tab-switch handler calls -- nothing special-cases
-        PanelEditor versus LogicNodeEditor)."""
+        since it was last shown: re-seed the display knobs from config.params, snap the manual-limit
+        fields to current view, re-read the producing source's 'now' acquisition values, and refresh
+        any embedded source form's dynamic combos (the ONE hook the tab-switch handler calls -- nothing
+        special-cases PanelEditor versus LogicNodeEditor)."""
+        self._refresh_display_params()
         self.fill_limits()
         self.refresh_node_now_labels()
         hook = getattr(getattr(self, "source_form", None), "refresh_on_show", None)
         if callable(hook):
             hook()
+
+    def _refresh_display_params(self) -> None:
+        """Re-seed the Edit tab's display-knob controls (``ed_params``) from the live card's
+        ``config.params`` -- the SINGLE source of truth -- so switching back to this tab shows the
+        CURRENT values even when they were changed in the Setting popup (which writes the same
+        config.params).  Each control is re-seeded through its kind's ``PARAM_WIDGETS.write`` (the card
+        records the kinds while building both surfaces' rows), signals blocked so re-seeding does not
+        re-fire ``_edit_param``.  The #6 mirror of ``PanelCard.refresh_on_show`` -- both surfaces are a
+        VIEW of config.params, refreshed on show, never private copies that drift."""
+        if self.card is None:
+            return
+        kinds = getattr(self.card, "_param_kinds", {})
+        params = self.card.config.params
+        for key, widget in self.ed_params.items():
+            kind = kinds.get(key)
+            if kind is None or key not in params:
+                continue
+            with _signals_blocked(widget):
+                try:
+                    PARAM_WIDGETS[kind].write(widget, params[key])
+                except (TypeError, ValueError):
+                    continue
 
     def fill_limits(self) -> None:
         if self._plotter is None or self.xmin is None:
