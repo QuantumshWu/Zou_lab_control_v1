@@ -83,6 +83,37 @@ class RuntimeBusDelay:
         return cls(bus_index=int(payload.get("bus_index", 0)), delay=int(payload.get("delay", 0)))
 
 
+def _fold_global_delay_shift(
+    channel_raw: Mapping[Any, int],
+    bus_raw: Mapping[int, int],
+) -> tuple[dict[Any, int], dict[int, int], int]:
+    """Fold the negative-delay global shift ``G`` into TTL channels and DAC buses.
+
+    A causal delay line cannot LEAD, so a negative delay re-translates the WHOLE
+    frame: shift every channel and bus by ``G = max(0, -min(all raw delays))`` so
+    every realised delay lands ``>= 0`` while relative timing is preserved (the
+    "-2 s emCCD shows DA_bias_y first" bug needs G to reach the buses too).  ``G``
+    is computed over the TTL ``channel_raw`` and DAC ``bus_raw`` delays TOGETHER --
+    they are one physical schedule.  A folded delay equal to 0 is dropped from both
+    maps (an undelayed signal carries no delay word).  This is the SINGLE source for
+    both the scanned and non-scanned pulse-table compilers; the keys of ``channel_raw``
+    (channel name vs hardware-bit index) are opaque and round-trip unchanged."""
+
+    all_raw = list(channel_raw.values()) + list(bus_raw.values())
+    global_shift = max(0, -min(all_raw)) if all_raw else 0
+    channel_delays = {
+        ch: channel_raw[ch] + global_shift
+        for ch in channel_raw
+        if (channel_raw[ch] + global_shift) != 0
+    }
+    bus_delays = {
+        bus: bus_raw[bus] + global_shift
+        for bus in bus_raw
+        if (bus_raw[bus] + global_shift) != 0
+    }
+    return channel_delays, bus_delays, global_shift
+
+
 @dataclass(frozen=True)
 class RuntimeBusSegment:
     """One runtime analog-bus segment uploaded beside the digital edge table."""
@@ -711,20 +742,17 @@ def compile_pulse_table_scan_runtime_program(
         if not any(int(period.states[ch_index]) for period in state.periods):
             continue
         raw_delay[ch] = state.delay_steps(ch, slots=state.reference_slots(), time_step_ns=clock_step_ns)
-    all_raw = list(raw_delay.values()) + list(raw_bus_delays.values())
-    global_shift = max(0, -min(all_raw)) if all_raw else 0
-    channel_delays = {
-        hardware_bits[ch]: raw_delay[ch] + global_shift
-        for ch in raw_delay if (raw_delay[ch] + global_shift) != 0
-    }
-    # EVERY DRIVEN bus (emits >= 1 segment) inherits the global shift G, even with no explicit
-    # delay of its own -- so a negative TTL delay shifts the DAC buses in lockstep with the TTLs
-    # instead of letting them lead (the "-2 s emCCD shows DA_bias_y first" bug).
+    # EVERY DRIVEN bus (emits >= 1 segment) must inherit the global shift G, even with no
+    # explicit delay of its own -- so a negative TTL delay shifts the DAC buses in lockstep
+    # with the TTLs instead of letting them lead (the "-2 s emCCD shows DA_bias_y first" bug).
+    # Seed those buses at raw 0 so they fold like an explicitly-zero delay.
     driven_bus_indices = sorted({seg.bus_index for seg in bus_segments})
+    bus_raw = {b: raw_bus_delays.get(b, 0) for b in driven_bus_indices}
+    channel_delays_by_name, bus_delays_by_index, _global_shift = _fold_global_delay_shift(
+        raw_delay, bus_raw)
+    channel_delays = {hardware_bits[ch]: d for ch, d in channel_delays_by_name.items()}
     bus_delays = [
-        RuntimeBusDelay(bus_index=b, delay=raw_bus_delays.get(b, 0) + global_shift)
-        for b in driven_bus_indices
-        if (raw_bus_delays.get(b, 0) + global_shift) != 0
+        RuntimeBusDelay(bus_index=b, delay=d) for b, d in sorted(bus_delays_by_index.items())
     ]
 
     rows = _pulse_table_affine_rows(
@@ -2152,14 +2180,8 @@ def _pulse_table_edge_table(
     # delay -- a causal delay line cannot lead, so shifting everyone by G makes all delays
     # >= 0 while preserving relative timing (the old in-edge G, now an output delay).
     extra_raw_delays = dict(extra_raw_delays or {})
-    all_raw = list(raw_delay.values()) + list(extra_raw_delays.values())
-    global_shift = max(0, -min(all_raw)) if all_raw else 0
-    channel_delays = {channel: raw_delay[channel] + global_shift for channel in raw_delay}
-    bus_delays_shifted = {
-        bus_index: extra_raw_delays[bus_index] + global_shift
-        for bus_index in extra_raw_delays
-        if (extra_raw_delays[bus_index] + global_shift) != 0
-    }
+    channel_delays, bus_delays_shifted, _global_shift = _fold_global_delay_shift(
+        raw_delay, extra_raw_delays)
 
     # --- emit UNDELAYED ON/OFF events (channel=None entries are period-boundary anchors) ---
     events: list[tuple[int, str | None, int | None]] = []
@@ -2478,41 +2500,6 @@ def _check_unrolled_edge_budget(
             "OUTER loop, fewer inner iterations, or remove the channel delay so the bracket can "
             "stay a compact hardware loop instead of being unrolled."
         )
-
-
-def _pulse_table_channel_rises(state: PulseTableState, channel: str) -> int:
-    index = state.channel_index(channel)
-    states = [int(period.states[index]) for period in state.periods]
-    if state.repeat_start is None or state.repeat_end is None or state.repeat_count <= 1:
-        count, _last = _count_rises(states, initial=0)
-        return count
-
-    repeat_start = int(state.repeat_start)
-    repeat_end = int(state.repeat_end)
-    repeat_count = int(state.repeat_count)
-    pre = states[:repeat_start]
-    loop = states[repeat_start : repeat_end + 1]
-    post = states[repeat_end + 1 :]
-
-    count, last = _count_rises(pre, initial=0)
-    first_count, last_after_loop = _count_rises(loop, initial=last)
-    count += first_count
-    if repeat_count > 1:
-        loop_again_count, last_after_loop = _count_rises(loop, initial=last_after_loop)
-        count += (repeat_count - 1) * loop_again_count
-    post_count, _last = _count_rises(post, initial=last_after_loop)
-    return count + post_count
-
-
-def _count_rises(states: Sequence[int], *, initial: int) -> tuple[int, int]:
-    last = 1 if int(initial) else 0
-    count = 0
-    for state in states:
-        state = 1 if int(state) else 0
-        if state and not last:
-            count += 1
-        last = state
-    return count, last
 
 
 def _pulse_table_has_delays(

@@ -1270,6 +1270,41 @@ def test_negative_delay_global_shift_also_shifts_undelayed_dac_bus_nonscan():
         f"got {program.bus_delays!r}")
 
 
+def test_negative_delay_global_shift_identical_scan_vs_nonscan():
+    """SINGLE-SOURCE GUARD (#G-fold): the negative-delay global shift G is folded by ONE
+    pure helper (_fold_global_delay_shift), so the SCAN and NON-SCAN compilers must emit
+    BYTE-IDENTICAL channel_delays + bus_delays for the same program.  The two paths share
+    a virtual mirror, so a phase drift between them would NOT surface as a wrong waveform in
+    sim -- only a real machine would show it.  Hence we assert the two compiled delay sets
+    are equal directly: any future edit that re-inlines G in one path and not the other (the
+    exact DRY trap this collapses) fails here, not silently on hardware."""
+    # NON-SCAN: the same driven-bus + negative-delay state as the regression above.
+    nonscan = _neg_delay_bus_state().compile(clock_hz=50_000_000, repeat_forever=True)
+
+    # SCAN: the same program, made scan-legal by binding period 0's duration to a slot set to
+    # its OWN nominal value -- the frame is unchanged, so the only thing that can differ is how
+    # each path folds G.  A delay is a fixed per-channel value (never scanned), so this isolates
+    # the shared G fold.
+    scan_state = _neg_delay_bus_state()
+    nominal = float(scan_state.periods[0].duration)   # read BEFORE bind rewrites it to 's0'
+    scan_state.bind_field("duration", "0", unit="ns")
+    scan = scan_state.compile_scan(
+        clock_hz=50_000_000, scan_table=[[nominal]], repeat_forever=True)
+
+    assert list(scan.channels) == list(nonscan.channels)
+    assert (scan.channel_delays or []) == (nonscan.channel_delays or []), (
+        "scan vs non-scan channel_delays drifted -- G must be folded by the single shared "
+        f"helper; scan={scan.channel_delays!r} non-scan={nonscan.channel_delays!r}")
+    scan_bus = {bd.bus_index: bd.delay for bd in (scan.bus_delays or [])}
+    nonscan_bus = {bd.bus_index: bd.delay for bd in (nonscan.bus_delays or [])}
+    assert scan_bus == nonscan_bus, (
+        "scan vs non-scan bus_delays drifted -- the driven DAC bus must inherit the SAME G "
+        f"on both paths; scan={scan_bus!r} non-scan={nonscan_bus!r}")
+    # And the G actually fired (regression value): the negative -50 forced G=50.
+    assert nonscan_bus.get(0) == 50 and (nonscan.channel_delays or [])[
+        list(nonscan.channels).index("ch04")] == 50
+
+
 def test_dac_ramp_spans_current_period_with_hold_carry_and_edge_step():
     """The within-period DAC semantics (the user's ramp/edge/hold fix), proven end-to-end
     through the compiler + the cycle-accurate engine model:
@@ -6430,6 +6465,76 @@ def test_unrolled_bracket_preserves_clk_channels():
     assert unrolled.clk_channels == ["D1"]
     assert unrolled.clk_enable_mask() == (1 << 1)
     assert len(unrolled.periods) == 4   # bracket [P0,P1] x2 unrolled
+
+
+def test_remapped_target_single_source_for_bracket_index():
+    """``unrolled_bracket`` remaps a slot ``target``'s PERIOD index through the unroll.  That one
+    rule lives in a single helper ``_remapped_target`` shared by the scan-slot AND api-slot loops
+    (it used to be copy-pasted verbatim, so the two could drift).  Pin the helper to the three
+    branches: numeric ``duration`` index expands, ``dac`` ``bus@index`` expands its index, and a
+    ``delay`` channel name / non-numeric ``duration`` expression carries through unchanged."""
+
+    state = na.PulseTableState(
+        channels=["D0", "D1", "D2", "D3"],
+        periods=[na.PulsePeriod(10, (1, 0, 0, 0), unit="ns") for _ in range(6)],
+        analog_buses={"busA": ["D0", "D1"]},
+        repeat_start=1, repeat_end=3, repeat_count=3, time_step_ns=20,
+    )
+    # bracket [1..3] x3 -> period 5 shifts to 5 + (3-1)*3 = 11; an in-bracket index maps to its
+    # first copy (unchanged), a before-bracket index is unchanged.
+    assert state._remapped_target("duration", "0") == "0"          # before bracket
+    assert state._remapped_target("duration", "5") == "11"         # after bracket
+    assert state._remapped_target("dac", "busA@4") == "busA@10"    # after-bracket dac index
+    assert state._remapped_target("dac", "busA@2") == "busA@2"     # in-bracket dac index
+    assert state._remapped_target("delay", "D1") == "D1"           # channel name -> unchanged
+    assert state._remapped_target("duration", "s0") == "s0"        # non-numeric expr -> unchanged
+
+    # The scan-slot and api-slot loops must produce identical target remapping for the same
+    # (kind, target) -- proving they share the one helper rather than two drifting copies.
+    unrolled = na.PulseTableState(
+        channels=["D0", "D1", "D2", "D3"],
+        periods=[na.PulsePeriod(10, (1, 0, 0, 0), unit="ns") for _ in range(6)],
+        analog_buses={"busA": ["D0", "D1"]},
+        scan_slots=[
+            {"kind": "duration", "target": "5", "label": "L"},
+            {"kind": "dac", "target": "busA@4"},
+        ],
+        api_slots=[
+            {"name": "a1", "kind": "duration", "target": "5"},
+            {"name": "a2", "kind": "dac", "target": "busA@4"},
+            {"name": "a3", "kind": "delay", "target": "D2"},
+        ],
+        repeat_start=1, repeat_end=3, repeat_count=3, time_step_ns=20,
+    ).unrolled_bracket()
+    assert [s.target for s in unrolled.scan_slots] == ["11", "busA@10"]
+
+
+def test_duration_steps_and_ns_share_eval_unit_prefix():
+    """``duration_steps`` / ``duration_ns`` share only the eval+unit-check prefix via
+    ``_duration_ns_unquantized`` (single source for the unsupported-unit message); each keeps its
+    OWN boundary policy.  Pin: prefix returns ``(value, unit, ns)`` with ns = value * scale, the
+    bad-unit literal is one string, and the per-method boundaries (steps rejects negative, ns
+    rejects non-positive only when unquantized) are unchanged."""
+
+    p = na.PulsePeriod("2*s0", (1,), unit="us")
+    value, unit, ns = p._duration_ns_unquantized(slots={"s0": 3.0})
+    assert (value, unit) == (6.0, "us")
+    assert ns == 6000.0  # 6 us in ns -- value * UNITS_TO_NS[unit]
+
+    # Single source for the bad-unit message: both public methods raise the SAME literal.
+    bad = na.PulsePeriod(10, (1,), unit="bogus")
+    with pytest.raises(ValueError, match=r"unsupported pulse duration unit 'bogus'\."):
+        bad.duration_steps()
+    with pytest.raises(ValueError, match=r"unsupported pulse duration unit 'bogus'\."):
+        bad.duration_ns()
+
+    # Each method keeps its own boundary policy (not merged into the shared prefix).
+    with pytest.raises(ValueError, match="must be >= 0"):
+        na.PulsePeriod(-5, (1,), unit="ns").duration_steps()           # steps rejects negative
+    with pytest.raises(ValueError, match="must be > 0 ns"):
+        na.PulsePeriod(0, (1,), unit="ns").duration_ns()               # ns (unquantized) rejects 0
+    # quantized path keeps its own policy: snaps 0 ns UP to one tick instead of raising
+    assert na.PulsePeriod(0, (1,), unit="ns").duration_ns(time_step_ns=10) == 10.0
 
 
 def test_clk_channel_unknown_raises_not_silently_dropped():
