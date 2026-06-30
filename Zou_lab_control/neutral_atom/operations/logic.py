@@ -847,17 +847,22 @@ class Task(LogicNode):
         raise NotImplementedError
 
     def shot(self) -> dict[str, object]:
-        # One-shot: stop the loop AFTER this run (a run() that raises is reported via
-        # node_error and NOT retried), exactly like a finite scan / processor.  The stop
-        # event is set in a ``finally`` -- AFTER ``run`` -- so that DURING the run it
-        # stays clear and means "cancel": ``run`` can poll ``self._stop`` (and pass it to
-        # ``camera.acquire``) to interrupt a long acquisition the moment Stop is pressed.
+        # One-shot: stop the loop AFTER this run (a run() that raises is NOT retried),
+        # exactly like a finite scan / processor.  ``finished`` means "this one-shot has
+        # RUN ONCE and will not retry" -- success OR failure terminates it -- so BOTH it
+        # and the stop event are set in ``finally``.  Keeping them together is what lets
+        # the console release its lock on either outcome (a run() that raises otherwise
+        # leaves finished=False forever -> dashboard locked, finding 7).  During the run
+        # the stop event stays clear and means "cancel": ``run`` can poll ``self._stop``
+        # (and pass it to ``camera.acquire``) to interrupt a long acquisition the moment
+        # Stop is pressed.  The exception still propagates (finally does not swallow), so a
+        # headless step() caller sees it; failure is expressed by ``result`` staying empty.
         # The result + mid-run output stay on the INSTANCE (self.result / self.output); a
         # task publishes NOTHING to the hub -- the hub is measurements + processors only.
         try:
             self.result = {str(key): value for key, value in dict(self.run(self.output)).items()}
-            self.finished = True
         finally:
+            self.finished = True
             self._stop.set()
         return {}
 
@@ -1981,15 +1986,20 @@ class ProcessorRun(LogicNode):
         from .processor import ProcessorContext
 
         # One-shot: stop the loop after THIS publish no matter what.  Setting the
-        # stop up front means a run() that raises (reported by the loop as
-        # node_error) is NOT retried -- a deterministic processing action runs once.
+        # stop up front means a run() that raises is NOT retried -- a deterministic
+        # processing action runs once.  ``finished`` means "this one-shot has RUN ONCE"
+        # (success OR failure), so it is set in ``finally`` alongside the stop event --
+        # otherwise a spec.run() that raises leaves finished=False forever (mirrors the
+        # Task fix, finding 7).  The publish below runs only on success (after run returns).
         self._stop.set()
         ctx = ProcessorContext(
             readout=self._readout, params=self._params,
             camera=self._camera, sequencer=self._sequencer, stop=self._stop)
-        result = self.spec.run(ctx)
+        try:
+            result = self.spec.run(ctx)
+        finally:
+            self.finished = True
         self.result = {str(key): value for key, value in dict(result).items()}
-        self.finished = True
         out = dict(self.result)
         out["processor_done"] = 1.0
         self._current_source_shot = self.hub.next_source_shot()   # one SOURCE-shot for this discrete result (#shot-clock)

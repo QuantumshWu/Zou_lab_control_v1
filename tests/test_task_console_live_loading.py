@@ -544,6 +544,47 @@ def test_self_finished_task_releases_lock_in_poll():
         exp.close()
 
 
+def test_failing_task_releases_lock_in_poll(monkeypatch):
+    """A one-shot task whose ``run`` RAISES must ALSO release the console lockout (finding
+    7): the failed run sets ``finished=True`` in a ``finally`` and the loop self-stops, so
+    a lifecycle poll detects the terminated node and unlocks -- exactly like a normal
+    finish or a manual Stop.  Without this the dashboard stays locked FOREVER (the lock
+    was only released on the finished+running-false branch, and a failed task otherwise
+    never reaches it).  The unlock must work even though no banner/error text surfaces."""
+    from Zou_lab_control.neutral_atom.operations.logic import CalibrateReadoutTask
+
+    exp = _calibrated_virtual_session()
+    console = _console(exp)
+    try:
+        # make the task's run() raise -- the same class Start instantiates, so the real
+        # _start_logic_node path builds a node whose shot() will fail.
+        def _boom(self, out):
+            raise RuntimeError("calibration boom")
+        monkeypatch.setattr(CalibrateReadoutTask, "run", _boom)
+
+        _pick(console, ("task", "Calibrate readout"))
+        row = console.logic_nodes[-1]
+        console._start_logic_node(row)
+        assert console._task_locked is True            # lock engaged at start
+        node = console._logic_nodes[id(row)]
+        # the worker thread runs shot() once, which raises -> finally sets finished + stop,
+        # then the loop exits (the stop event is set, so the except returns cleanly).
+        deadline = time.monotonic() + 8.0
+        while node.running and time.monotonic() < deadline:
+            time.sleep(0.03)
+        assert not node.running                        # thread ended despite the failure
+        assert node.finished is True                   # terminated (ran once, no retry)
+
+        # the lifecycle poll detects the terminated node and RELEASES the lock.
+        console._poll_logic_nodes()
+        assert console._task_locked is False
+        assert console._running_task_row is None
+        assert console.kind_combo.isEnabled() is True
+    finally:
+        console.shutdown()
+        exp.close()
+
+
 def test_save_persists_edit_param_values_not_just_layout():
     """#4: saving captures the CURRENT Edit-form parameter values (even for a node that
     was never Started), not just the panel geometry; a JSON round-trip restores them."""

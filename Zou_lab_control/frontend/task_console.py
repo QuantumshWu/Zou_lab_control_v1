@@ -5997,6 +5997,12 @@ class TaskConsole(QtWidgets.QWidget):
             error = getattr(node, "last_error", None)
             running = bool(getattr(node, "running", False))
             finished = bool(getattr(node, "finished", False))
+            # A one-shot node is TERMINATED once its loop has stopped AND it has either
+            # finished (ran once) or errored -- both outcomes end the node, so both must
+            # release the console lock.  A run() that raises sets finished=True in a
+            # ``finally`` (logic.py), so a failed Task lands here too; binding the unlock
+            # to error as well covers any node that surfaces an error WITHOUT finishing.
+            terminated = (not running) and (finished or bool(error))
             if error:
                 row.set_state("error", status=f"error: {str(error)[:60]}")
                 if editor is not None:
@@ -6007,12 +6013,6 @@ class TaskConsole(QtWidgets.QWidget):
                 if editor is not None:
                     editor.set_running(False)
                     editor.set_status("done", error=False)
-                # A one-shot TASK that finishes ON ITS OWN (not via the Stop button)
-                # must ALSO release the console lockout here -- otherwise a calibration
-                # that completes normally leaves the dashboard locked forever (only a
-                # manual Stop reaches _clear_task_running).
-                if row is self._running_task_row:
-                    self._clear_task_running()                    # finish == Stop: release lock + remove the task panel (#C)
             elif running:
                 # surface scan progress when the node reports it -- ``total_points`` spans ALL
                 # repeat passes (n_points x repeat), so a repeated scan counts 52/60, not 12/20.
@@ -6029,6 +6029,13 @@ class TaskConsole(QtWidgets.QWidget):
                 # (The "xN" repeat tag is computed by each plot panel itself while it reduces the raw
                 # (repeat, points, dim) block per its repeat_mode -- the console no longer pushes a
                 # repeat counter onto plotters, since the panel is decoupled and owns the reduction.)
+            # A one-shot TASK that ENDS on its own -- finishing normally OR raising (which
+            # sets finished=True in a finally) -- must release the console lockout here, the
+            # SAME path the Stop button takes.  Finish == error == Stop: otherwise a task that
+            # completes (or fails) leaves the dashboard locked forever (only a manual Stop
+            # would reach _clear_task_running).
+            if terminated and row is self._running_task_row:
+                self._clear_task_running()                        # release lock + remove the task panel (#C)
 
     def _mark_dirty(self, *_args) -> None:
         if self._building:
