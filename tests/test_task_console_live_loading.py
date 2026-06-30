@@ -378,6 +378,11 @@ def test_task_logic_node_produces_calibration_off_the_hub_when_started():
         row = console.logic_nodes[-1]
         assert console._logic_nodes[id(row)] is None      # stopped
 
+        # Off-the-hub / lifecycle behaviour is independent of the per-frame PNG dump the task
+        # otherwise does for every reference frame; turn ``save_frames`` off (via the node's Edit
+        # form, the same path Start reads) so the calibration finishes inside the test deadline.
+        console._logic_editors[id(row)].form._widgets["save_frames"].setChecked(False)
+
         console._start_logic_node(row)
         node = console._logic_nodes[id(row)]
         assert isinstance(node, CalibrateReadoutTask)
@@ -470,6 +475,10 @@ def test_running_task_takes_a_fixed_panel_and_locks_the_console():
         n_before = len(console.cards)
         _pick(console, ("task", "Calibrate readout"))
         row = console.logic_nodes[-1]
+        # The console lock + transient-panel lifecycle is independent of the per-frame PNG dump the
+        # task otherwise does for every reference frame; turn ``save_frames`` off (via the node's Edit
+        # form, the same path Start reads) so the calibration finishes inside the test deadline.
+        console._logic_editors[id(row)].form._widgets["save_frames"].setChecked(False)
         console._start_logic_node(row)
 
         # LOCK engaged: dedicated task panel on the board + banner up + header disabled.
@@ -514,6 +523,10 @@ def test_self_finished_task_releases_lock_in_poll():
     try:
         _pick(console, ("task", "Calibrate readout"))
         row = console.logic_nodes[-1]
+        # Lock release on self-finish is independent of the per-frame PNG dump the task otherwise does
+        # for every reference frame; turn ``save_frames`` off (via the node's Edit form, the same path
+        # Start reads) so the calibration finishes inside the test deadline.
+        console._logic_editors[id(row)].form._widgets["save_frames"].setChecked(False)
         console._start_logic_node(row)
         assert console._task_locked is True
         node = console._logic_nodes[id(row)]

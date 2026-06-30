@@ -1048,10 +1048,11 @@ def test_pulse_gui_scan_dot_retoggle_preserves_values(monkeypatch):
     editor.load_state(editor.state)
     assert editor.state.scan_table == [[100.0], [200.0], [300.0]]
 
-    editor._toggle_duration_scan(editor.drag_container.pulse_cards()[1])  # unbind
+    editor._toggle_duration_scan(editor.drag_container.pulse_cards()[1])  # SCAN -> API (no scan slot bound)
     assert len(editor.state.scan_slots) == 0
 
-    editor._toggle_duration_scan(editor.drag_container.pulse_cards()[1])  # rebind -> values restored, not reset to nominal
+    editor._toggle_duration_scan(editor.drag_container.pulse_cards()[1])  # API -> none (column cleared)
+    editor._toggle_duration_scan(editor.drag_container.pulse_cards()[1])  # none -> SCAN: values restored, not reset to nominal
     assert editor.state.scan_table == [[100.0], [200.0], [300.0]]
 
 
@@ -1282,7 +1283,8 @@ def test_task_console_layout_is_top_left_gravity():
     Pure-function contract (PanelConfig has no Qt), so it does NOT pull in the flaky
     demo_console GUI fixture."""
 
-    from Zou_lab_control.frontend.task_console import GAP, PanelConfig, _aabb, _card_size, _compact
+    from Zou_lab_control.frontend.task_console import (
+        GAP, PanelConfig, _aabb, _board_width, _card_size, _compact, _first_free_slot)
 
     def no_overlap(cfgs):
         for i, a in enumerate(cfgs):
@@ -1313,10 +1315,17 @@ def test_task_console_layout_is_top_left_gravity():
     no_overlap(cfgs)
     assert _compact(cfgs) is False
 
-    # (4) two narrow cards pack SIDE BY SIDE one GAP apart on the top row (the user's horizontal gap).
-    left = PanelConfig(kind="1d", title="L", row=5, col=0, size="1x2")
-    right = PanelConfig(kind="1d", title="R", row=9, col=0, size="1x2")
-    _compact([left, right])
+    # (4) two narrow cards freshly ADDED tile SIDE BY SIDE one GAP apart on the top row (the user's
+    #     horizontal gap).  A fresh Add seeds its position with `_first_free_slot` (NW tiling: fill the
+    #     top row left-to-right), NOT `_compact`'s anchored gravity (which only floats a card up/left
+    #     from where it already is and never teleports it to an empty slot on the right).
+    left = PanelConfig(kind="1d", title="L", size="1x2")
+    right = PanelConfig(kind="1d", title="R", size="1x2")
+    board_w = _board_width([left, right])
+    placed = []
+    for cfg in (left, right):
+        cfg.col, cfg.row = _first_free_slot(cfg, placed, board_w)
+        placed.append(cfg)
     left, right = sorted([left, right], key=lambda c: c.col)
     assert left.row == right.row == g
     assert right.col - (left.col + _card_size(left.size)[0]) == g
@@ -1515,9 +1524,9 @@ def test_task_console_signal_picker_and_declarative_params(monkeypatch):
     # the demo 2d card is the synced readout image -> its input is the judged frame (#5)
     assert combo.current_signal() == "frame_judged"
 
-    assert _pick("counts")                                 # pick the input signal in the tree
+    assert _pick("frame_0")                                # pick a 2-D signal valid for a 2d panel
     card._on_slot_pick(0)
-    assert card.config.inputs[0] == "counts"               # input now names counts
+    assert card.config.inputs[0] == "frame_0"              # input now names frame_0
     assert card.config.source == "value = signal"          # the picked signal IS `signal`
     console.refresh_once()
     assert card.status.text().startswith("shot ")           # applied instantly + healthy
