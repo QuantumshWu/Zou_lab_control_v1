@@ -79,12 +79,15 @@ class ParamDecl:
 
     ``required`` marks a parameter a GUI must highlight when missing.  ``depends_on`` (kind
     ``pulse_param``) names the sibling ``path`` field whose pulse template is introspected to
-    populate this control.  ``display`` is a pure DATA placement flag (not an art/geometry knob):
-    a plot-panel param with ``display=True`` is a BASIC display knob rendered in the lightweight
-    Setting popup (e.g. the colormap chooser); ``display=False`` is a FUNCTIONAL plot-API param
-    rendered in the panel's Edit tab instead, so Setting and Edit never duplicate.  A measurement
-    param ignores it (defaults True).  No value here is ever ``eval``'d -- the spec consumer
-    validates / coerces by ``kind``.
+    populate this control.  ``display`` is a pure DATA placement flag (not an art/geometry knob)
+    that splits a plot panel's params between its two surfaces:
+      * ``display=True``  -- a pure DISPLAY knob (how the SAME data is drawn): bins, history length,
+                             fit chooser, log axis, colormap, relim.  Rendered in the lightweight
+                             Setting popup, alongside size / relim, where an operator reaches for them.
+      * ``display=False`` -- an ACQUISITION / measurement-API param (what data is taken).  Rendered in
+                             the panel's Edit tab instead, so Setting and Edit never duplicate.
+    A measurement param ignores it (defaults True).  No value here is ever ``eval``'d -- the spec
+    consumer validates / coerces by ``kind``.
     """
 
     key: str
@@ -104,9 +107,10 @@ class ParamDecl:
                                      # for a pulse template, "calibrations" for a data folder)
     depends_on: str = ""             # kind="pulse_param": the sibling kind="path" field whose
                                      # pulse template is introspected to populate this combo
-    display: bool = True             # plot-panel placement flag (DATA, not art): True = a basic
-                                     # display knob in the Setting popup; False = a functional
-                                     # plot-API param in the Edit tab.  Ignored by measurements.
+    display: bool = True             # plot-panel placement flag (DATA, not art): True = a pure DISPLAY
+                                     # knob (bins / history / fit / colormap …) in the Setting popup;
+                                     # False = an acquisition / measurement-API param in the Edit tab.
+                                     # Ignored by measurements.
     segmented: bool = False          # kind="choice" RENDER hint (DATA, not art): True = a capsule
                                      # tri/multi-state toggle (confocal TriStateToggleSwitch) instead of
                                      # a combo box; same value semantics (one of ``choices``).

@@ -1002,21 +1002,21 @@ PANEL_PARAMS: dict[str, tuple[ParamDecl, ...]] = {
         ParamDecl(key="cmap", label="colormap", kind="choice", default="gray", choices=CMAPS,
                   tooltip="Colormap for the camera-frame underlay", display=True),
     ),
-    # The colormap / colorset chooser is the only per-kind knob that stays in the
-    # Setting popup (display=True); the FUNCTIONAL params below (length / bins /
-    # centers / image) are rendered in each panel's Edit tab instead, so the two
-    # surfaces never duplicate.
+    # Pure DISPLAY knobs (history / bins / fit / log axis / colormap) live in the lightweight
+    # Setting popup (display=True): they only change how the SAME data is drawn, so they belong with
+    # size / relim where an operator reaches for them.  Only acquisition / measurement-API params
+    # (none on these display-only kinds) would be display=False and live in the Edit tab.
     "1d": (),
     "monitor": (
         ParamDecl(key="length", label="history", kind="int", default=300, lo=20, hi=10_000,
-                  display=False, tooltip="Rolling history length (shots kept on screen)"),
+                  display=True, tooltip="Rolling history length (shots kept on screen)"),
         # The side distribution is ONE plot kind's toggle (not a separate "no-dist" kind):
         # ON shows the histogram band beside the trace, OFF gives the bare rolling line.
         ParamDecl(key="show_dist", label="side distribution", kind="bool", default=True, display=True,
                   tooltip="Show the side distribution histogram beside the rolling trace"),
     ),
     "hist": (
-        ParamDecl(key="bins", label="bins", kind="int", default=60, lo=5, hi=500, display=False,
+        ParamDecl(key="bins", label="bins", kind="int", default=60, lo=5, hi=500, display=True,
                   tooltip="Histogram bins"),
         # The fit is a confocal-style capsule tri-toggle (none / single / double), NOT a forced default:
         # the operator picks which fit to draw on whatever data the source provides.  "double" is the
