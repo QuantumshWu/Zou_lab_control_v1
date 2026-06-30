@@ -249,24 +249,34 @@ class PulsePeriod:
     unit: str = "ns"
     name: str = ""
 
-    def duration_steps(self, *, slots: Mapping[str, float] | None = None, time_step_ns: float = 1.0) -> int:
+    def _duration_ns_unquantized(self, *, slots: Mapping[str, float] | None = None) -> tuple[float, str, float]:
+        """Shared front half of :meth:`duration_steps` / :meth:`duration_ns`: evaluate the
+        duration expression, validate the unit, and return ``(value, unit, ns)`` where ``value``
+        is the raw quantity in ``unit`` and ``ns`` is it scaled to nanoseconds.
+
+        ONLY the eval + unit-check is shared (single source for the ``unsupported pulse
+        duration unit`` literal); each caller keeps its OWN boundary policy (negative/zero
+        rejection, quantization) -- those are deliberate per-method differences, not duplication.
+        ``value``/``unit`` are returned alongside ``ns`` so a caller can phrase an error in the
+        source unit.
+        """
         value = eval_time_expr(self.duration, slots=slots)
         unit = str(self.unit or "ns")
         if unit not in UNITS_TO_NS:
             raise ValueError(f"unsupported pulse duration unit {unit!r}.")
+        return value, unit, value * UNITS_TO_NS[unit]
+
+    def duration_steps(self, *, slots: Mapping[str, float] | None = None, time_step_ns: float = 1.0) -> int:
+        value, unit, out = self._duration_ns_unquantized(slots=slots)
         # A NEGATIVE literal period duration is almost always an input error; raise instead of
         # silently snapping it up to one tick.  (Scan-table durations are clamped UI-side by
         # snap_scan_table; this guards the literal/period path, which validate() exercises.)
         if value < 0:
             raise ValueError(f"period duration must be >= 0 (got {value:g} {unit}).")
-        return quantized_time_steps(value * UNITS_TO_NS[unit], time_step_ns=time_step_ns, allow_zero=False)
+        return quantized_time_steps(out, time_step_ns=time_step_ns, allow_zero=False)
 
     def duration_ns(self, *, slots: Mapping[str, float] | None = None, time_step_ns: float | None = None) -> float:
-        value = eval_time_expr(self.duration, slots=slots)
-        unit = str(self.unit or "ns")
-        if unit not in UNITS_TO_NS:
-            raise ValueError(f"unsupported pulse duration unit {unit!r}.")
-        out = value * UNITS_TO_NS[unit]
+        _value, _unit, out = self._duration_ns_unquantized(slots=slots)
         if time_step_ns is not None:
             return quantized_time_ns(out, time_step_ns=time_step_ns, allow_zero=False)
         if out <= 0:
@@ -1433,6 +1443,24 @@ class PulseTableState:
         loop_len = re - rs + 1
         return period_index + (rc - 1) * loop_len     # after the bracket
 
+    def _remapped_target(self, kind: str, target: str) -> str:
+        """Remap a slot ``target``'s PERIOD index through the bracket unroll (see
+        :meth:`unrolled_bracket` / :meth:`_expand_bracket_index`).
+
+        ``duration`` slots target a bare period index; ``dac`` slots target
+        ``"<bus>@<period_index>"`` -- both have their period index expanded.  A ``delay``
+        slot targets a CHANNEL name (and a ``duration`` target that is not numeric, e.g. an
+        expression) carries no period index, so it returns unchanged.  This is the single
+        source for that one index-remap rule, shared by the scan-slot and api-slot loops;
+        each loop keeps its own (different) serialization.
+        """
+        if kind == "duration" and str(target).lstrip("-").isdigit():
+            return str(self._expand_bracket_index(int(target)))
+        if kind == "dac":
+            bus, period_index = target.split("@", 1)
+            return f"{bus}@{self._expand_bracket_index(int(period_index))}"
+        return target
+
     def unrolled_bracket(self) -> "PulseTableState":
         """Return a NEW state with the inner finite repeat bracket fully UNROLLED into a
         flat period list (``repeat_count`` becomes 1, the bracket is cleared).
@@ -1461,22 +1489,14 @@ class PulseTableState:
         scan_slots: list[dict[str, object]] = []
         for slot in self.scan_slots:
             payload = slot.to_dict()
-            if slot.kind == "duration" and str(slot.target).lstrip("-").isdigit():
-                payload["target"] = str(self._expand_bracket_index(int(slot.target)))
-            elif slot.kind == "dac":
-                bus, period_index = slot.target.split("@", 1)
-                payload["target"] = f"{bus}@{self._expand_bracket_index(int(period_index))}"
+            payload["target"] = self._remapped_target(slot.kind, slot.target)
             scan_slots.append(payload)
 
         api_slots: list[dict[str, object]] = []
         for slot in self.api_slots:
             payload = slot.to_dict()
-            if slot.kind == "duration" and str(slot.target).lstrip("-").isdigit():
-                payload["target"] = str(self._expand_bracket_index(int(slot.target)))
-            elif slot.kind == "dac":
-                bus, period_index = slot.target.split("@", 1)
-                payload["target"] = f"{bus}@{self._expand_bracket_index(int(period_index))}"
-            api_slots.append(payload)   # delay slots target a channel name -> no remap
+            payload["target"] = self._remapped_target(slot.kind, slot.target)   # delay -> channel name, unchanged
+            api_slots.append(payload)
 
         return type(self)(
             channels=list(self.channels),
