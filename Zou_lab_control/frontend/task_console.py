@@ -3129,10 +3129,11 @@ class PanelCard(FluentGroupBox):
         # and the wheel scrolls the board (isolate_wheel=False) instead of being
         # swallowed.  Interactive zoom / select lives in the Edit tab.
         self.canvas = panel_canvas(self.plotter.fig, isolate_wheel=False)
-        # Pin the canvas to its DESIGN size so the surrounding QVBoxLayout can never squish it:
-        # the card is setFixedSize to hold the canvas + the proportional bottom padding, and the
-        # canvas keeps its exact design size while the trailing stretch absorbs the padding.
-        self.canvas.setMinimumSize(self.canvas.sizeHint())
+        # The canvas OWNS its size: EmbeddedFigureCanvas setFixedSize's itself to its DPR-invariant
+        # design size at construction (and renders its buffer synchronously), so the host no longer pins
+        # setMinimumSize(sizeHint()) on top -- that two-pin + DPR-derived-sizeHint race is what ballooned
+        # the figure.  The card is setFixedSize to hold the canvas + the proportional bottom padding the
+        # trailing stretch absorbs.
         add_stretch = self.canvas_holder.count() == 0       # first build (no canvas, no stretch yet)
         # canvas pins to the TOP of the content (right below the grey title strip); the trailing
         # stretch is the proportional bottom padding (collapses to ~0 for a 1-row card).
@@ -3151,7 +3152,7 @@ class PanelCard(FluentGroupBox):
         # FRESH plotter every rebuild -- the panel rebuilds whenever its data
         # shape changes, so without this the toggle would silently revert.
         self._apply_display_params()
-        self.canvas.draw_idle()
+        self.canvas.draw()          # SYNCHRONOUS: the swapped-in canvas shows its FINAL frame at once
         self._place_setting_button()
 
     def _reset_plot(self) -> None:
@@ -4054,17 +4055,14 @@ class PanelEditor(QtWidgets.QWidget):
         self.teardown()
         self._plotter = new_plotter
         self._canvas = panel_canvas(self._plotter.fig)
-        # The Edit page lives in a SCROLL AREA.  A bare minimum size lets the scroll-area layout
-        # STRETCH the canvas taller than the figure (and a hi-DPI re-sync round can then keep growing
-        # it across rebuilds -- the "scroll bins a few times and the image balloons / cuts off" bug).
-        # Pin it to a FIXED size = the figure's own design size (the same non-growable contract the
-        # Monitor card uses): the page SCROLLS when the figure is taller than the viewport, but the
-        # snapshot can never squish (clip) NOR grow.  pin_size() also KEEPS it fixed across the canvas's
-        # own deferred _zlc_resync / showEvent (a bare setFixedSize was re-opened by resync's
-        # setMinimumSize, ballooning the figure across param edits -- #4 edit-resize).
+        # The Edit page lives in a SCROLL AREA: the page SCROLLS when the figure is taller than the
+        # viewport, and the snapshot must never squish (clip) NOR grow.  The canvas already setFixedSize's
+        # itself to its DPR-invariant design size at construction (and re-asserts it on every resync), so
+        # pin_size() is now idempotent -- the deferred _zlc_resync / showEvent can no longer re-open the
+        # size and balloon the figure across param edits (that was the setMinimumSize(sizeHint()) race).
         self._canvas.pin_size()
         self.canvas_holder.addWidget(self._canvas, alignment=QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop)
-        self._canvas.draw_idle()
+        self._canvas.draw()      # SYNCHRONOUS: the snapshot shows its frame at once (never a blank)
         self._df = None
         # carry the persisted x-axis unit cycle onto the fresh snapshot (relim + cmap are
         # already baked into panel_plot above; unit is applied post-build, like the live card).

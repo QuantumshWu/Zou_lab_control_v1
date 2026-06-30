@@ -60,11 +60,6 @@ else:
             # display-only panel (Monitor card, NO selectors) lets the dashboard
             # board scroll under the cursor instead of swallowing the wheel.
             self._zlc_isolate_wheel = bool(isolate_wheel)
-            # Pinned (the Edit snapshot): once ``pin_size()`` is called, every resync re-applies
-            # ``setFixedSize`` (min==max) instead of ``setMinimumSize``, so a deferred resync can never
-            # raise the floor past the fixed ceiling and balloon the figure (#4 edit-resize).  Default
-            # unpinned: a live card is held by its OWN ``setFixedSize`` wrapper, so it only needs a floor.
-            self._zlc_pinned = False
             # The figure's DESIGN dpi is the ONE canonical ``DESIGN_DPI`` -- the same dpi the layout
             # geometry was authored against (``create_axes_fixed`` sizes the figure as
             # ``pixels / design_dpi(fig)``, with ``design_dpi`` == DESIGN_DPI), so the displayed size
@@ -83,46 +78,55 @@ else:
             # the backend syncs only in showEvent / on screen signals (never
             # offscreen) -- establish the invariants NOW
             self._zlc_sync()
+            # Fix the widget to its DPR-INVARIANT design size ONCE (min==max).  Neither a deferred
+            # resync, a screen-ratio change, nor the host can re-pin it from the racy DPR-derived
+            # sizeHint and balloon/shrink the figure (#5 "图偶尔变大") -- DPR only scales the render
+            # BUFFER, never this logical size.  This is the SINGLE owner of the canvas size; the host
+            # PanelCard no longer pins setMinimumSize(sizeHint()) on top (the two-pin race is gone).
+            self.setFixedSize(self._zlc_design_size())
+            # Render the Agg buffer NOW (synchronously): the canvas is never blank in the window between
+            # insertion and a deferred first paint (draw_idle leaves the buffer unrendered -- #5 "图偶尔
+            # 消失").  A freshly-built canvas swapped into the holder already carries a painted frame.
+            self.draw()
             # ...and AGAIN on the next event-loop tick.  The construction sync above runs before this
-            # canvas has been inserted into its parent layout, so the screen ratio it reads + the
-            # sizeHint/minimumSize it publishes can be the pre-layout values; the FIRST task-takeover
-            # panel of a just-opened console is built straight onto the board, so without this its card
-            # keeps the stale size until some later relayout (the SECOND task run) -- the "first wrong,
-            # second right" symptom.  singleShot(0) re-syncs once the widget is in its real layout.
+            # canvas has been inserted into its parent layout, so the screen ratio it reads can be the
+            # pre-layout value; the FIRST task-takeover panel of a just-opened console is built straight
+            # onto the board, so without this its figure dpi (render buffer) stays pre-screen until some
+            # later relayout.  singleShot(0) re-syncs the BUFFER (not the size) once genuinely laid out.
             QtCore.QTimer.singleShot(0, self._zlc_resync)
 
+        def _zlc_design_size(self) -> "QtCore.QSize":
+            """The widget's LOGICAL size = design_inches x design_dpi x display_scale -- a CONSTANT that
+            does NOT read the screen device-pixel-ratio.  The stock ``sizeHint`` is
+            ``figure.bbox / device_pixel_ratio``; the DPR cancels in that ratio ONLY when figure.dpi and
+            device_pixel_ratio are read at the SAME instant -- mid screen-ratio-change (a rebuild burst,
+            a monitor move) they desync and sizeHint balloons.  This product is invariant, so pinning the
+            canvas min==max to it is race-free.  (DPR still scales the render BUFFER via figure.dpi.)"""
+            w_in, h_in = self._zlc_inches
+            scale = 1.0 / self._zlc_ratio                      # display_scale (render_scale cancels out)
+            return QtCore.QSize(max(1, round(w_in * self._zlc_design_dpi * scale)),
+                                max(1, round(h_in * self._zlc_design_dpi * scale)))
+
         def _zlc_resync(self) -> None:
-            # Re-establish the size invariants once the widget is genuinely on screen / laid out, and
-            # tell the parent layout the (now-correct) sizeHint/minimumSize changed so the CARD around
-            # us is re-measured -- not just the canvas.  Guarded: the deferred call may fire after the
-            # C++ widget was torn down (panel closed) -> skip silently.
+            # Re-establish the figure dpi (render buffer) once the widget is genuinely on screen -- the
+            # construction sync ran before the widget knew its real screen ratio.  The widget SIZE is the
+            # DPR-invariant design constant, fixed min==max at construction, so a resync corrects the
+            # buffer for the real screen but can NEVER re-pin a wrong size and balloon/shrink the figure
+            # ("first wrong, second right" is gone).  Guarded: the deferred call may fire after the C++
+            # widget was torn down (panel closed) -> skip silently.
             try:
-                self._zlc_sync()                       # 1) set the figure to the correct design dpi
+                self._zlc_sync()                       # figure dpi -> the REAL screen ratio (crisp buffer)
             except RuntimeError:
                 return
-            # 2) Re-PUBLISH the size floor from the now-settled sizeHint.  The host (PanelCard) pins
-            # ``setMinimumSize(sizeHint())`` at BUILD time; if that build ran before the layout settled
-            # the floor is stale-too-big and would pin the canvas at the wrong size -- the exact "first
-            # wrong, second right" trap (a resize cannot go below a stale minimum).  Re-assert it from
-            # the SAME source (sizeHint) to clear any stale floor...  When PINNED (Edit snapshot) min and
-            # max move TOGETHER to the settled sizeHint -- so resync corrects the size but can never let
-            # the floor exceed the ceiling and balloon the figure (#4 "改参数图变大小").
-            if self._zlc_pinned:
-                self.setFixedSize(self.sizeHint())
-            else:
-                self.setMinimumSize(self.sizeHint())
-            self._zlc_sync()                           # 3) ...then resize again, now free of that floor
-            self.updateGeometry()                      # 4) let the parent CARD re-measure us
-            self.draw_idle()
+            self.setFixedSize(self._zlc_design_size())  # idempotent (a monitor move only shifts display_scale)
+            self.updateGeometry()                       # let the parent CARD re-measure us
+            self.draw()                                 # SYNCHRONOUS: a resync never leaves a blank frame
 
         def pin_size(self) -> None:
-            """Lock this canvas to a FIXED size (min==max) == its design ``sizeHint``, and KEEP it
-            locked across every later resync / showEvent.  The Edit snapshot uses this so a param edit
-            (which rebuilds the snapshot) can never let a deferred ``_zlc_resync`` raise the minimum
-            past the fixed maximum and balloon the figure -- min and max always move together to the
-            settled design size.  Idempotent; replaces a bare ``setFixedSize`` that resync would undo."""
-            self._zlc_pinned = True
-            self.setFixedSize(self.sizeHint())
+            """Lock the canvas to its design size.  Now equivalent to the default -- the canvas is already
+            setFixedSize to the DPR-invariant :meth:`_zlc_design_size` at construction and re-asserts it
+            on every resync -- so this is idempotent.  Kept for the Edit-snapshot caller's intent."""
+            self.setFixedSize(self._zlc_design_size())
 
         def showEvent(self, event):  # noqa: N802 - Qt naming
             # Re-establish the size invariants + redraw the FIRST time the canvas actually becomes
@@ -162,10 +166,11 @@ else:
             # render_scale (rs<1 -> smaller/cheaper buffer; rs cancels in the widget size).
             figure._set_dpi(self._zlc_design_dpi * real * rs, forward=False)
             self._device_pixel_ratio = real * self._zlc_ratio * rs
-            # invariant 3: logical widget size = design px x display_scale
-            width_px, height_px = map(float, figure.bbox.max)
-            self.resize(round(width_px / self._device_pixel_ratio),
-                        round(height_px / self._device_pixel_ratio))
+            # invariant 3: logical widget size = design px x display_scale -- the DPR-FREE constant
+            # (NOT figure.bbox / device_pixel_ratio, which desyncs when the screen ratio changes
+            # mid-sync and balloons the size).  After construction the canvas is setFixedSize to this
+            # same value, so this resize() is the pre-fix construction sizing and a no-op thereafter.
+            self.resize(self._zlc_design_size())
 
         def resizeEvent(self, event):  # noqa: N802 - Qt naming
             # spec-owned figure: NEVER re-derive the figure geometry from the
