@@ -793,6 +793,13 @@ class VirtualSequencer(SequencerDevice):
         if isinstance(sequence, PulseTableState):
             channels = list(sequence.channels)
             program = sequence.to_sequence(clock_hz=self.clock_hz)
+            # Carry the SOURCE state's cyclic intent onto the camera's firing handle: an On Pulse
+            # (continuous until Stop) or a GUI/notebook scan arrives as repeat_forever=True on the
+            # PulseTableState, so the in-process streamer keeps firing.  Derived from the state the
+            # caller handed in (the fire seam owns the cyclic intent), NOT re-derived from the compiled
+            # flag -- the same source the real backend reads.
+            if bool(getattr(sequence, "repeat_forever", False)):
+                program = program.forever()
         else:
             program = sequence
             # The program defines its OWN channels (friendly imaging names, or a saved pulse
@@ -809,14 +816,6 @@ class VirtualSequencer(SequencerDevice):
         from .sequencer import RuntimeSequenceProgram
         self.service.channels = list(channels)
         self.last_program = RuntimeSequenceProgram.from_dict(self.service.prepare(sequence))
-        # The camera's firing handle (a PulseSequence) must carry the SAME repeat_forever the
-        # COMPILED program does -- the single-source invariant that a streamed scan ALWAYS streams
-        # (RuntimeSequenceProgram.__post_init__) and that the On Pulse "repeat forever" flag sets.
-        # Deriving it from the compiled flag (not the raw state) is what makes the pulse GUI's On
-        # Pulse -- which sets only scan_repeats, never the flag -- stream on the virtual backend
-        # exactly as on real hardware (virtual == real), instead of firing a single-sweep one-shot.
-        if self.last_program.repeat_forever and not bool(getattr(program, "repeat_forever", False)):
-            program = program.forever()
         self._prepared = program
         # Capture scan-progress pacing from the SOURCE table (the compiled program drops the
         # scan_table): N points + the requested sweep count, plus a per-point wall-clock estimate

@@ -198,16 +198,15 @@ class RuntimeSequenceProgram:
     clk_enable: int = 0
 
     def __post_init__(self) -> None:
-        # A streamed scan (ANY scan_points) is played by the engine's CONTINUOUS scan-point streamer,
-        # so the program MUST run repeat_forever: scan_repeats=0 is a seamless cyclic scan; scan_repeats=K
-        # plays K whole sweeps and the HOST then stops the engine.  This is the program's single source
-        # of truth for the invariant, enforced HERE on the COMPILED program because EVERY fire path (real
-        # AND virtual both compile to a RuntimeSequenceProgram) passes through it.  So a caller that
-        # compiles a scan WITHOUT setting repeat_forever -- e.g. the pulse GUI's On Pulse, which only
-        # sets scan_repeats and never touched PulseController where this used to live -- still streams,
-        # instead of producing a contradictory (scan_points yet repeat_forever=False) one-shot program.
-        if self.scan_enabled and not self.repeat_forever:
-            object.__setattr__(self, "repeat_forever", True)
+        # repeat_forever and scan_points are ORTHOGONAL here, and this pure data contract does NOT
+        # decide one from the other.  ``repeat_forever`` is the host-side CYCLIC intent: 0-repeat
+        # seamless forever / K whole sweeps then stop.  ``scan_points`` is the STREAMING fact: any
+        # bound scan still streams its points.  A program can legitimately be a FINITE single-pass
+        # streamed scan (repeat_forever=False + scan_points: play N points once to STATUS_DONE -- the
+        # axi_session wait_done streaming-refill path), so this carrier must never force one value
+        # from the other.  The CYCLIC intent for a GUI/notebook scan is owned by the fire seam
+        # (PulseController.on_pulse passes repeat_forever for On Pulse "continuous until Stop"); the
+        # streaming/progress gate downstream keys off scan_points, not this flag.
         # A finite K-sweep streamed scan (scan_repeats>0) needs >= 2 scan points: the host counts whole
         # sweeps from the streamed cursor's WRAP, which a single point never produces -- it would never
         # stop on real hardware.  Enforced HERE, on the COMPILED program, because EVERY fire path (real
@@ -994,8 +993,10 @@ class SequencerService:
                 self.fire_callback(program)
             self.state = "running"
             # Stamp the fire instant for a STREAMED scan so scan_progress() can derive the played-point
-            # count from the wall clock when no hardware cursor callback is wired (pure software).
-            if getattr(program, "repeat_forever", False) and getattr(program, "scan_points", None):
+            # count from the wall clock when no hardware cursor callback is wired (pure software).  The
+            # gate is "this is a streamed scan" = scan_points present, NOT repeat_forever -- a finite
+            # single-pass scan (repeat_forever=False) streams its points too and must show progress.
+            if getattr(program, "scan_points", None):
                 self._scan_fire_time = time.monotonic()
                 self._scan_done = False
             self.history.append({"action": "fire", "sequence_id": program.sequence_id, "sequence": program.sequence_name})
@@ -1049,8 +1050,10 @@ class SequencerService:
         if self.scan_progress_callback is not None:
             return dict(self.scan_progress_callback())
         program = self.prepared_program
+        # A streamed scan reports progress whether it is CYCLIC (repeat_forever) or a FINITE single-pass
+        # one (repeat_forever=False) -- both stream their scan_points -- so the gate is scan_points, NOT
+        # the cyclic flag (which is what wrongly idled a single-pass scan's readout before).
         if (self.state != "running" or program is None
-                or not getattr(program, "repeat_forever", False)
                 or not getattr(program, "scan_points", None)):
             return dict(SCAN_PROGRESS_IDLE)              # nothing streaming -> no scan position
         n = len(program.scan_points)

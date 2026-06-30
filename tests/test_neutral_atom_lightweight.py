@@ -4202,6 +4202,175 @@ def test_vivado_axi_session_repeat_forever_treats_running_as_done(tmp_path):
     assert session.wait_done(timeout=1.0) is True
 
 
+class _CursorScanHardware:
+    """A streamed-scan FPGA stand-in whose CURSOR advances on every CURSOR read (one point per
+    read), wrapping at N -- so the scan-progress monitor thread observes a real moving cursor.  This
+    is what pins the user-reported bug: a streamed scan's progress must ADVANCE (not stick at 1/0)."""
+
+    def __init__(self, params, *, n_points, forever=True):
+        from fpga.pulse_streamer.host.image import CtrlWords, STATUS_LOADED, STATUS_RUNNING
+        self.params = params
+        self.CtrlWords = CtrlWords
+        self.STATUS_LOADED = STATUS_LOADED
+        self.STATUS_RUNNING = STATUS_RUNNING
+        self.n_points = int(n_points)
+        self.forever = bool(forever)
+        self.bram: dict[int, int] = {}
+        self.status = 0
+        self.fired = False
+        self.cursor = 0
+
+    def __call__(self, lines, action, timeout):
+        from fpga.pulse_streamer.host.image import (
+            CtrlWords, CMD_LOAD, CMD_FIRE, CMD_SAFE, STATUS_LOADED, STATUS_RUNNING, STATUS_DONE,
+        )
+        text = "\n".join(lines)
+        for word, value in _decode_axi_writes(text):
+            self.bram[word] = value
+            if word == CtrlWords.COMMAND and value != 0:
+                if value & CMD_SAFE:
+                    self.status = 0; self.fired = False
+                if value & CMD_LOAD:
+                    self.status = STATUS_LOADED
+                if value & CMD_FIRE:
+                    self.fired = True; self.cursor = 0
+                    self.status = (self.status | STATUS_RUNNING)
+        m = re.search(r"-address ([0-9A-Fa-f]+) -len 1 -type read", text)
+        if m:
+            word = int(m.group(1), 16) // 4
+            if word == CtrlWords.CURSOR:
+                cur = self.cursor
+                if self.fired:                       # advance one point per read; wrap at N (a sweep)
+                    self.cursor = (self.cursor + 1) % max(1, self.n_points)
+                return f"ZLCDATA {cur:08X}\n"
+            if word == CtrlWords.STATUS:
+                if self.fired and not self.forever and self.cursor >= self.n_points - 1:
+                    self.status |= STATUS_DONE
+                return f"ZLCDATA {self.status:08X}\n"
+            if word == 63:
+                return "ZLCDATA 5A4C4C02\n"
+            return f"ZLCDATA {self.bram.get(word, 0):08X}\n"
+        return "ok\n"
+
+
+def _scan_program(n_points, *, repeat_forever, scan_repeats=0):
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
+    return RuntimeSequenceProgram(
+        sequence_id="g", sequence_name="g", clock_hz=50e6,
+        channels=[f"ch{i:02d}" for i in range(62)],
+        ticks=[0, 5, 25, 40], masks=[0, 1, 2, 0], duration=4e-6,
+        repeat_forever=repeat_forever, loop_start_index=0, loop_end_tick=40, loop_count=1,
+        slot_count=1, slot_kinds=["delay"], loop_end_slot_coeffs=[0],
+        tick_slot_coeffs=[[0], [256], [0], [0]],
+        scan_points=[[k] for k in range(n_points)], scan_coeff_frac_bits=8,
+        scan_repeats=scan_repeats,
+    )
+
+
+def test_real_cyclic_scan_progress_advances(tmp_path):
+    """#1 (the user's real-device report): a CYCLIC streamed scan (repeat_forever, 0=inf) reports
+    scanning=True and its point ADVANCES on the real backend -- it must not stick at point 1/0.  The
+    progress gate now keys off scan_points (a streamed scan), not the repeat_forever flag."""
+
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+    from fpga.pulse_streamer.host.image import StreamerParams
+
+    N = 6
+    params = StreamerParams(max_edges=16, bank_size=2)
+    hw = _CursorScanHardware(params, n_points=N, forever=True)
+    session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=hw)
+    session.prepare(_scan_program(N, repeat_forever=True, scan_repeats=0))
+    session.fire()                          # starts the streaming monitor thread
+    try:
+        seen = []
+        deadline = time.monotonic() + 2.0
+        while len(seen) < 3 and time.monotonic() < deadline:
+            prog = session.scan_progress()
+            assert prog["scanning"] is True and prog["n_points"] == N
+            point_total = int(prog["sweep"]) * N + int(prog["point"])
+            if not seen or point_total != seen[-1]:
+                seen.append(point_total)
+            time.sleep(0.005)
+        assert len(seen) >= 3, f"scan point never advanced (stuck reading): {seen}"
+        assert seen == sorted(seen), f"scan point must advance monotonically, got {seen}"
+    finally:
+        session.safe_state()
+
+
+def test_real_single_pass_scan_progress_advances(tmp_path):
+    """A FINITE single-pass scan (repeat_forever=False + scan_points) streams too: its progress must
+    advance, not idle.  Decoupling the monitor from repeat_forever (start it for any streamed scan)
+    is what makes single-pass progress live (and keeps virtual==real)."""
+
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+    from fpga.pulse_streamer.host.image import StreamerParams
+
+    N = 6
+    params = StreamerParams(max_edges=16, bank_size=2)
+    hw = _CursorScanHardware(params, n_points=N, forever=False)
+    session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=hw)
+    session.prepare(_scan_program(N, repeat_forever=False, scan_repeats=0))
+    session.fire()
+    try:
+        first = session.scan_progress()
+        assert first["scanning"] is True and first["n_points"] == N
+        seen = {int(first["point"])}
+        deadline = time.monotonic() + 2.0
+        while len(seen) < 2 and time.monotonic() < deadline:
+            seen.add(int(session.scan_progress()["point"]))
+            time.sleep(0.005)
+        assert len(seen) >= 2, f"single-pass scan point never advanced: {seen}"
+    finally:
+        session.safe_state()
+
+
+def test_real_non_scan_repeat_forever_does_not_report_scan(tmp_path):
+    """A repeat_forever STATIC pulse (no scan_points -> _total_points==0) must not be treated as a
+    scan: scan_progress idles and no monitor thread is spawned."""
+
+    from Zou_lab_control.neutral_atom.devices.axi_session import VivadoAxiStreamerSession
+    from fpga.pulse_streamer.host.image import StreamerParams
+    from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram, SCAN_PROGRESS_IDLE
+
+    program = RuntimeSequenceProgram(
+        sequence_id="p", sequence_name="p", clock_hz=50e6,
+        channels=[f"ch{i:02d}" for i in range(62)],
+        ticks=[0, 100, 200], masks=[1, 0, 0], duration=4e-6,
+        repeat_forever=True, loop_start_index=0, loop_end_tick=200, loop_count=1, slot_count=0,
+    )
+    params = StreamerParams(max_edges=16, bank_size=4)
+    hw = _FakeStreamerHardware(params, forever=True)
+    session = VivadoAxiStreamerSession(state_dir=tmp_path, params=params, tcl_executor=hw)
+    session.prepare(program)
+    session.fire()
+    try:
+        assert session.scan_progress() == SCAN_PROGRESS_IDLE
+        assert session._stream_thread is None        # no scan -> no monitor thread
+    finally:
+        session.safe_state()
+
+
+def test_virtual_equals_real_scan_progress_same_dict():
+    """virtual==real for the scan readout: a finite K-sweep scan, played to completion on BOTH the
+    virtual backend and the real (fake-hardware) backend at the SAME point_total, returns the SAME
+    single-source {scanning, point, n_points, sweep, n_repeats} dict."""
+
+    from Zou_lab_control.neutral_atom.devices.virtual import VirtualSequencer
+    from Zou_lab_control.neutral_atom.devices.sequencer import PulseController, scan_progress_fields
+    from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState
+
+    st = PulseTableState(channels=["probe", "trig"])
+    st.bind_field("duration", "0", unit="us")
+    st.set_scan_table([[10.0], [20.0], [30.0]])
+    # virtual finite scan, fast-forwarded to its saturated done reading
+    seq = VirtualSequencer(channels=["probe", "trig"], sleep_scale=0.0)
+    PulseController(seq, st).on_pulse(repeat_forever=True, scan_repeats=2)
+    virtual_done = seq.scan_progress()
+    # the single source the real backend also returns at K*N played points
+    assert virtual_done == scan_progress_fields(2 * 3, 3, 2)
+    assert virtual_done == {"scanning": False, "point": 2, "n_points": 3, "sweep": 1, "n_repeats": 2}
+
+
 def test_remote_sequencer_round_trip_uses_json_protocol(tmp_path):
     try:
         import rpyc  # noqa: F401

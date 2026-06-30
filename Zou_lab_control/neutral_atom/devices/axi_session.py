@@ -789,7 +789,13 @@ class VivadoAxiStreamerSession:
         sweeps = 0
         prev_cursor = 0
         stop = self._stream_stop
-        needs_refill = self._total_chunks > 2   # <=2 chunks are fully preloaded; just monitor wraps
+        # A FINITE single-pass scan (repeat_forever=False) is refilled SYNCHRONOUSLY by wait_done's
+        # finite-streaming-refill path and stops itself at STATUS_DONE -- this thread then only MONITORS
+        # the cursor to advance the scan_progress() mirror (no chunk refill, no sweep stop) so it can
+        # never collide with wait_done's refills.  A CYCLIC scan (repeat_forever=True) owns the refill +
+        # the K-sweep stop here, because wait_done returns the instant RUNNING is seen for it.
+        monitor_only = not self._repeat_forever
+        needs_refill = (not monitor_only) and self._total_chunks > 2   # <=2 chunks preloaded; just monitor wraps
         try:
             while not stop.is_set():
                 cursor = self._read_word(CtrlWords.CURSOR, stop=stop)
@@ -833,7 +839,11 @@ class VivadoAxiStreamerSession:
         sweep, n_repeats} reading.  Idle when no scan is loaded / running."""
         from .sequencer import SCAN_PROGRESS_IDLE, scan_progress_fields
         n = int(self._total_points)
-        if n <= 0 or not self._repeat_forever:
+        # ANY streamed scan reports progress -- a FINITE single-pass scan (repeat_forever=False) and a
+        # CYCLIC one (repeat_forever=True, 0=inf / K-sweep) both stream points, so the gate is "is this
+        # a streamed scan" = scan_points present, NOT the cyclic flag.  (Keying off _repeat_forever was
+        # the real != virtual bug: a single-pass scan showed point 1/0 forever even while it streamed.)
+        if n <= 0:
             return dict(SCAN_PROGRESS_IDLE)
         if self._scan_finished:
             return scan_progress_fields(max(1, self._scan_repeats) * n, n, self._scan_repeats)
@@ -841,10 +851,14 @@ class VivadoAxiStreamerSession:
         return scan_progress_fields(point_total, n, self._scan_repeats)
 
     def _start_stream_thread(self) -> None:
-        # Start the background monitor for a streamed scan: a long scan (>2 banks) needs continuous
-        # refill, AND any FINITE scan (scan_repeats>0) needs a monitor to count sweeps + stop -- even
-        # a short, fully-preloaded one (the refill is skipped inside the loop when not needed).
-        if self._repeat_forever and (self._total_points > 2 * self.params.bank_size or self._scan_repeats > 0):
+        # Start the background monitor for ANY streamed scan (scan_points present).  Its job depends on
+        # the cyclic flag (see _stream_refill_loop): a CYCLIC scan (repeat_forever) needs continuous
+        # refill + the K-sweep stop; a FINITE single-pass scan needs only the cursor-mirror so
+        # scan_progress() advances while wait_done refills it synchronously.  Either way the gate is
+        # "this is a streamed scan", NOT the cyclic flag -- that is what fixes a single-pass / real scan
+        # showing point 1/0 forever (the mirror never advanced because no thread ran).  A non-scan
+        # repeat_forever pulse (_total_points==0) never starts a thread.
+        if self._total_points > 0:
             self._stop_stream_thread()
             self._stream_stop = threading.Event()
             self._stream_thread = threading.Thread(
