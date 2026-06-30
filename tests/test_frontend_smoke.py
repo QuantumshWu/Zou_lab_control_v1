@@ -401,7 +401,6 @@ def test_frontend_title_pulse_and_public_2d_square_guard():
     assert all_rows.spec.data_px[1] >= 4 * 360
     assert zf.pulse_repeat_notation() == "repeat ∞"
     assert zf.pulse_repeat_notation(0, 2, 4) == "repeat P1-P3 x4"
-    assert zf.pulse_repeat_marker(total_duration_s=3e-6) == (0.0, 3e-6, "×∞")
     repeat_state = na.PulseTableState(
         channels=["ch00", "ch01"],
         periods=[

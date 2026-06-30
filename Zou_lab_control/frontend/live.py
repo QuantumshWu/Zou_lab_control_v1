@@ -1462,49 +1462,6 @@ def _pulse_period_starts_ns(periods, *, slots=None, time_step_ns: float | None =
     return starts_ns
 
 
-def pulse_repeat_marker(
-    state_or_periods=None,
-    *,
-    repeat_start: int | None = None,
-    repeat_end: int | None = None,
-    repeat_count: int | None = None,
-    slots=None,
-    time_step_ns: float | None = None,
-    total_duration_s: float | None = None,
-    default_forever: bool = True,
-) -> tuple[float, float, str] | None:
-    """Return ``(start_s, stop_s, label)`` for a pulse-plot repeat bracket."""
-
-    periods = None
-    if hasattr(state_or_periods, "periods"):
-        periods = list(getattr(state_or_periods, "periods"))
-        repeat_start = getattr(state_or_periods, "repeat_start", repeat_start)
-        repeat_end = getattr(state_or_periods, "repeat_end", repeat_end)
-        repeat_count = getattr(state_or_periods, "repeat_count", repeat_count)
-        default_forever = bool(getattr(state_or_periods, "repeat_forever", default_forever))
-        slots = state_or_periods.reference_slots() if hasattr(state_or_periods, "reference_slots") else slots
-        time_step_ns = getattr(state_or_periods, "time_step_ns", time_step_ns)
-    elif state_or_periods is not None:
-        periods = list(state_or_periods)
-
-    if periods is None:
-        if total_duration_s is None or not default_forever:
-            return None
-        return (0.0, float(total_duration_s), "×∞")
-
-    starts_ns = _pulse_period_starts_ns(periods, slots=slots, time_step_ns=time_step_ns)
-    if repeat_start is None or repeat_end is None:
-        if not default_forever:
-            return None
-        return (0.0, starts_ns[-1] * 1e-9, "×∞")
-    repeat_start = int(repeat_start)
-    repeat_end = int(repeat_end)
-    if repeat_start < 0 or repeat_end < repeat_start or repeat_end + 1 >= len(starts_ns):
-        return None
-    repeat_count = 1 if repeat_count is None else int(repeat_count)
-    return (starts_ns[repeat_start] * 1e-9, starts_ns[repeat_end + 1] * 1e-9, f"×{repeat_count}")
-
-
 def pulse_repeat_markers(
     state_or_periods=None,
     *,
@@ -3168,7 +3125,6 @@ __all__ = [
     "site_ring_radius",
     "pulse_plot_channels",
     "pulse_plot_spec",
-    "pulse_repeat_marker",
     "pulse_repeat_markers",
     "pulse_repeat_notation",
 ]

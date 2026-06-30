@@ -70,7 +70,6 @@ from .live import (
     site_psf_grid,
     pulse_plot_channels,
     pulse_plot_spec,
-    pulse_repeat_marker,
     pulse_repeat_markers,
     pulse_repeat_notation,
 )
@@ -210,7 +209,6 @@ __all__ = [
     "site_histogram_grid",
     "pulse_plot_channels",
     "pulse_plot_spec",
-    "pulse_repeat_marker",
     "pulse_repeat_markers",
     "pulse_repeat_notation",
     "require_attrs",
