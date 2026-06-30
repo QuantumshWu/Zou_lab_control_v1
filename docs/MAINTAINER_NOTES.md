@@ -1640,3 +1640,88 @@ Behaviour-neutral throughout. The single sources added/relocated, by layer:
   violet).
 - `task_console`: `_new_panel_card` (the ONE PanelCard provider block), `_repeat_mode_value` (the ONE
   clamped repeat-mode reader), `_kind_repeat_modes`, `_relim` (the ONE `relim` default reader).
+
+### More single sources (the same "one fact, one home" pass, continued)
+
+**timing**
+- `PulseTableState._duration_ns_unquantized(*, slots)` (`timing/pulse_table.py`) — the ONE
+  evaluate-and-validate prefix every period-duration read shares: `eval_time_expr` + the unit-set
+  check + the `"unsupported pulse duration unit"` error literal. `duration_steps` and `duration_ns`
+  each call it and then keep their OWN boundary policy (negative-raise / zero-raise / quantize-or-not);
+  the shared part is the prefix only — the boundary strategies are a deliberate per-method difference,
+  NOT something to merge.
+- `PulseTableState._remapped_target(kind, target)` (`timing/pulse_table.py`) — the ONE bracket
+  index-remap rule (`duration` numeric target and `dac` `bus@period` target run through
+  `_expand_bracket_index`; a `delay` channel-name target passes through). `unrolled_bracket`'s
+  scan-slot and api-slot loops both call it, so a finite-bracket compile remaps both identically.
+  Serialization stays each slot type's own (`ScanSlot`/`ApiSlot` carry different fields) — only the
+  target rule is shared.
+- `unrolled_bracket` carries `api_slots` through the rebuilt state, symmetric with `scan_slots`, so
+  every API binding (a duration/delay/DAC handle) survives a finite-bracket compile — the bound names
+  reach `api_names` / `validate` / server-sync, not only the value baked into the period.
+
+**devices**
+- `devices.sequencer._fold_global_delay_shift(channel_raw, bus_raw) -> (ch, bus, G)` — the ONE
+  negative-delay global-shift fold: `G = max(0, -min(all raw))`, add `G` to every channel + bus raw
+  delay, drop the now-zero entries. The scan and non-scan compilers BOTH call it, so a negative TTL/bus
+  delay produces the SAME phase on real hardware whichever path compiled it (the two paths used to
+  inline the same algorithm and could drift; virtual mirrors both, so a drift is only catchable by the
+  cross-path assert this single source enables).
+- `CameraDevice._reject_unknown_configure_keys(allowed, got)` (`devices/base.py`) — the ONE
+  unknown-`configure`-key contract: an unrecognised keyword raises a clear `ValueError` listing the
+  backend's configurable keys, on BOTH backends (`VirtualCamera` allows `{exposure, roi}`,
+  `QCMOSCamera` allows `{exposure, readout_speed, roi}`). A mistyped key fails the same loud way on
+  virtual and real instead of one silently swallowing it and the other raising `TypeError`. Guard:
+  `tests/test_camera_configure_contract.py`.
+
+**analysis (core / operations / subsystems)**
+- `core.calibration.TrapCalibration.readout_exposure(fallback)` — the ONE reader of the
+  exposure-self-match invariant (`metadata["threshold_exposure"]`, the gate time the thresholds were
+  learnt at). Every readout that must image at the calibration's exposure — `detect`, the live
+  calibrate-task adoption, the temperature survival frames — goes through HERE with its own `fallback`,
+  instead of each reaching into `metadata` with its own defensive spelling. A threshold is
+  exposure-specific, so a missed/mistyped lookup re-floors occupancy / sticks survival at the
+  false-positive rate (#issue-2 / #H3v-2); one accessor removes that whole class of drift.
+- `core.calibration.READOUT_KINDS` (+ `readout_kind(method)`) — the ONE method->kind table
+  (`box`->`box`, `psf`/`uniform_psf`->`kernel`) that `signals()` dispatches on. The readout KIND is
+  declared, NOT inferred from a `"psf" in m` substring on the method NAME (a future `matched_filter`
+  would miss the substring and be read as box, every count silently wrong). core owns it and never
+  imports operations; `operations.calibration.ALL_READOUT_METHODS` validates every offered method is
+  registered here.
+- `TrapCalibration.roi_radius` / `reducer` are the BOX readout's extraction geometry only — a PSF
+  (kernel) calibration sets both to `None` in `__post_init__` (it reads through `psf_weights`/
+  `psf_boxes`), so no dead box-only state rides on a PSF calibration. `core.results` rings fall back to
+  the box default when a calibration carries no `roi_radius`.
+- `operations.measurements._coupled_template.resolve_coupled_template(...)` — the ONE coupled-tier
+  template resolver (load-or-default -> compare channels -> rebuild via `imaging_channel_kwargs` ->
+  optionally bind a duration scan slot). `temperature` and `readout_duration` both delegate, differing
+  only in `default_name` / `default_factory` / `role_keys` / bind target and — made EXPLICIT, since it
+  had silently drifted — the `missing_policy`: temperature passes `"raise"` (an operator-named but
+  absent file fails LOUD), readout_duration passes `"fabricate"` (a missing/unnamed template falls back
+  to its default).
+- `operations.fidelity.FidelityReport.SUMMARY_KEYS` — the ONE list of scalar summary keys; `summary()`
+  self-asserts its returned dict equals `SUMMARY_KEYS`, and the `readout_fidelity` processor declares
+  `summary_keys = FidelityReport.SUMMARY_KEYS` instead of hand-copying the tuple, so a processor's
+  declared scalars can never drift from what the report publishes (a drift would trip the
+  publish-boundary `_assert_declared`).
+- `ProcessorSpec` no longer carries a `consumes` field — the canonical reactive input set is
+  `node.consumes` (derived from the node's `source_expr`, see §20), the ONE source the frame-coherence
+  resolver matches on; a spec-level copy could only drift from it.
+
+**frontend (art-internal; na never imports frontend)**
+- `frontend/_validate.py` — the dependency-free seam (same pattern as `_paths` / `_readout_math` /
+  `_viewer_registry`) holding `_strict_bool` / `_positive_float` / `_positive_int` / `_non_negative_int`,
+  the ONE place the notebook-facing scalars (a refresh interval, a flag, a count) are rejected the same
+  way across `plot()` / `ArrayWatcher` / the acquisition `Session`. The analysis layer keeps its OWN
+  validators in `core/analysis.py`; this seam never crosses the sealed boundary.
+- `task_console.coerce_short_labels(provider)` — the ONE `{full -> short}` label-map normaliser
+  (callable-guard, `str()` both ends, drop empties, swallow provider errors to `{}`) every grouped
+  signal picker feeds `fill_grouped_signal_combo`, so the signal_expr / plot-Setting-slot / form
+  pickers render identically.
+- `task_console._make_unit_cycle_row(on_click, label_w, *, with_label)` — the ONE x-axis unit-cycle
+  row, so the Setting popup and the Edit tab get the identical button width / flush-left idiom / single
+  tooltip (`with_label=True` also builds the live current-unit label).
+- `live._dist_count_xlim(n)` — the ONE side distribution-band count-axis upper limit (small headroom:
+  `peak*1.5`, floored to `peak+5`, never below 10) shared by every band (`Live2DDis` / `LiveSiteMap` /
+  `LiveLiveDis`, init and update alike), so the bar column never touches the right edge and the five
+  call sites cannot drift into two headroom rules. Appearance-neutral.

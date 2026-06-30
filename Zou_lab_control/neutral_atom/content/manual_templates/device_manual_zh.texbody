@@ -1126,23 +1126,26 @@ th = exp.readout.thresholds(method="bimodal", frames=120)
 这套实现移植自 \filepath{references/.../rb87\_readout\_v16} 的\tfocus{算法}（PSF 拟合、双高斯定阈、匹配滤波提取），但参考归档里那套面向离线批处理的文件 IO / 流式缓存 / 输出目录命名 / 重复别名\tfocus{没有}带进来——在线控制库只要算法，按本仓库的分层（原语在 \filepath{core/}，标定在 \filepath{operations/}，编排在 \pyapi{ReadoutSubsystem}）重写。
 \end{notebox}
 
-\subsection{用实验数据逐站点定阈值 + 保真度：characterize}
+\subsection{用实验数据逐站点定阈值 + 保真度：characterize\_from\_dir}
 
-前两步给的是"一条分布定一条阈值"。Rb87 真正的做法是用\tfocus{参考帧给出的 ground-truth 标签}来逐站点训练并\tfocus{诚实评估}阈值。\pyapi{exp.readout.characterize(...)} 完整复刻这套流程：
+前两步给的是"一条分布定一条阈值"。Rb87 真正的做法是用\tfocus{参考帧给出的 ground-truth 标签}来逐站点训练并\tfocus{诚实评估}阈值。这一步\tfocus{走文件夹}：实验把相机原始帧逐张存进\tfocus{一个数据文件夹}、命名 \pyapi{PREFIX<n>}；\pyapi{exp.readout.characterize_from_dir(data_dir, prefix)} \tfocus{指向那个文件夹}跑完整流程，和真机一字不差（唯一差别是帧由真相机还是 \pyapi{na.write_virtual_run} 写的）。
 
 \begin{codeblock}[Python]
-report = exp.readout.characterize(
-    groups=150, reference_shots=3,
-    short_exposure=3e-3,        # 待表征的读出曝光
-    reference_exposure=20e-3,   # 高 SNR 参考曝光（给真值标签）
-    train_fraction=0.9, seed=1,
+report = exp.readout.characterize_from_dir(
+    data_dir, prefix="img",     # 文件夹里已有 img0, img1, ... 原始帧
+    train_fraction=0.9, seed=1, # 随机划分逐站点训练 / held-out 评估
+    # 下列默认对齐 Rb87 v16，按需覆盖：
+    # shots_per_group=4, short_shot=3, ref_shots=(1, 2, 4),
+    # max_groups=None, store_thresholds=True, results_dir=None, save=True,
 )
 report.summary()                # aggregate/global/min 保真度、ambiguous 比例
 \end{codeblock}
 
-每个 group 在 short 曝光下成像一次、在 reference 长曝光下成像 \pyapi{reference_shots} 次（\tfocus{同一批原子}）。流程：参考帧逐站点双高斯拟合 → 严格共识（一组的所有参考帧同亮/同暗才算定，否则 ambiguous）给出 \pyapi{(group, site)} 真值标签 → 在随机 \pyapi{train} 划分上为\tfocus{每个站点单独}训练阈值 → 在 held-out \pyapi{test} 上算保真度 → 另给一个全局单阈值对比 + drop-worst-site 消融。\pyapi{store_thresholds=True}（默认）把训练出的逐站点阈值写回标定（\pyapi{metadata["threshold_method"]="per_site_reference"}）。提取走\tfocus{当前标定的方法}（box 或 PSF），所以阈值定在 detect 实际用的信号上。
+\pyapi{index_run} 把文件夹里的 \pyapi{PREFIX<n>} 帧按 \pyapi{shots_per_group} 一组索引（同一批原子的一次装载）：\pyapi{short_shot} 是\tfocus{待表征的短读出帧}，\pyapi{ref_shots} 是\tfocus{高 SNR 参考帧}（投票出真值标签）。流程：参考帧逐站点双高斯拟合 → 严格共识（一组的所有参考帧同亮/同暗才算定，否则 ambiguous）给出 \pyapi{(group, site)} 真值标签 → 在随机 \pyapi{train} 划分上为\tfocus{每个站点单独}训练阈值 → 在 held-out \pyapi{test} 上算保真度 → 另给一个全局单阈值对比 + drop-worst-site 消融。提取走\tfocus{当前标定的方法}（\pyapi{calibration.signals}，box 或 PSF），所以阈值定在 detect 实际用的信号上；因此先跑 \pyapi{exp.readout.sitemap_from_dir(data_dir, prefix, method=...)} 从同一文件夹建好站点图 / PSF。
 
-返回 \pyapi{FidelityReport}：\pyapi{per_site}（逐站 \pyapi{SiteFidelity}）、\pyapi{thresholds (N,)}、\pyapi{aggregate_fidelity}（逐站阈值 held-out）、\pyapi{global_fidelity}（单阈值 held-out）、\pyapi{ablation}（drop-worst-k 行）、\pyapi{labels}/\pyapi{split}，以及 \pyapi{per_site_arrays()} 给绘图用的逐站 \pyapi{(values, occupied)}。
+\pyapi{store_thresholds=True}（默认）把训练出的逐站点阈值写回标定（\pyapi{metadata["threshold_method"]="per_site_reference"}）。\pyapi{save=True}（默认）把信号、阈值、逐站保真度与 \pyapi{summary()} 元数据写进 \pyapi{results_dir}（缺省 \pyapi{<data_dir>_results}）。
+
+返回 \pyapi{FidelityReport}：\pyapi{per_site}（逐站 \pyapi{SiteFidelity}）、\pyapi{thresholds (N,)}、\pyapi{site_fidelities (N,)}、\pyapi{aggregate_fidelity}（逐站阈值 held-out）、\pyapi{global_fidelity}（单阈值 held-out）、\pyapi{ablation}（drop-worst-k 行）、\pyapi{labels}/\pyapi{split}，以及 \pyapi{per_site_arrays()} 给绘图用的逐站 \pyapi{(values, occupied)}。
 
 \subsection{逐站点直方图网格：site\_histogram\_grid}
 
