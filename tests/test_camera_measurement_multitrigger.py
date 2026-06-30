@@ -221,6 +221,47 @@ def test_region_is_always_exposed_even_at_full_frame():
     assert exp.camera.roi is not None
 
 
+def test_arm_then_fire_is_the_single_on_armed_factory():
+    """``arm_then_fire`` is the ONE arm-before-fire ``on_armed`` factory every readout/scan/capture
+    path uses (no hand-copied ``lambda: (seq.prepare(s), seq.fire(s))`` per call site).  Pin its two
+    behaviours: None sequencer -> None callback (a notebook readout that leans on the virtual atom
+    array fires nothing); a real sequencer -> a callable that prepares THEN fires the SAME sequence."""
+    from Zou_lab_control.neutral_atom.devices.base import arm_then_fire
+
+    assert arm_then_fire(None, object()) is None          # no bound sequencer -> nothing to fire
+
+    calls: list[tuple[str, object]] = []
+
+    class _Spy:
+        def prepare(self, s): calls.append(("prepare", s))
+        def fire(self, s=None): calls.append(("fire", s))
+
+    seq = object()
+    cb = arm_then_fire(_Spy(), seq)
+    assert callable(cb)
+    cb()
+    assert calls == [("prepare", seq), ("fire", seq)]      # prepare THEN fire, both on this sequence
+
+
+def test_no_call_site_hand_copies_the_arm_then_fire_lambda():
+    """Mechanical single-source guard: the arm-before-fire idiom must route through
+    ``devices.base.arm_then_fire`` -- not be re-typed as an inline ``prepare(...)...fire(...)`` lambda.
+    Scans the analysis/subsystem/device modules that orchestrate shots; the ONLY allowed occurrence
+    of a ``prepare(...).fire(...)`` pair is the helper's own one-line body."""
+    import re
+    na_root = REPO_ROOT / "Zou_lab_control" / "neutral_atom"
+    pattern = re.compile(r"\.prepare\([^\n]*\)[^\n]*\.fire\(")
+    offenders: list[str] = []
+    for py in na_root.rglob("*.py"):
+        for i, line in enumerate(py.read_text(encoding="utf-8").splitlines(), 1):
+            if pattern.search(line):
+                # the helper body in devices/base.py is the single legitimate occurrence
+                if py.name == "base.py" and "return lambda:" in line:
+                    continue
+                offenders.append(f"{py.relative_to(REPO_ROOT)}:{i}: {line.strip()}")
+    assert not offenders, "hand-copied arm-then-fire lambda; use arm_then_fire():\n" + "\n".join(offenders)
+
+
 def test_camera_exposure_setter_round_trips_on_every_backend():
     """`cam.exposure = v` works uniformly (the one intrinsic scalar that reads naturally as `=`).
     It is a write-through to configure() -- the single write path -- so it sets exposure and

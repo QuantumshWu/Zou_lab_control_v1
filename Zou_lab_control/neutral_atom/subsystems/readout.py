@@ -27,6 +27,7 @@ from ..operations.measurement import (
 )
 from ..operations.temperature import ReleaseRecapturePlan, SurvivalReducer
 from ..timing import PulseTableState
+from ..devices.base import arm_then_fire
 from .base import ExperimentSubsystem
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -80,7 +81,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
         seq_dev = getattr(s.devices, "sequencer", None)
         images = s.devices.camera.acquire(
             positive_int(frames, "frames"), sequence=sequence,
-            on_armed=(lambda q=sequence: (seq_dev.prepare(q), seq_dev.fire(q))) if seq_dev is not None else None,
+            on_armed=arm_then_fire(seq_dev, sequence),
         )
         result = calibrate_sitemap_from_images(
             images, grid_shape=grid_shape, ordering=ordering, roi_radius=roi_radius, reducer=reducer,
@@ -111,7 +112,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
         seq_dev = getattr(s.devices, "sequencer", None)
         images = s.devices.camera.acquire(
             positive_int(frames, "frames"), sequence=sequence,
-            on_armed=(lambda q=sequence: (seq_dev.prepare(q), seq_dev.fire(q))) if seq_dev is not None else None,
+            on_armed=arm_then_fire(seq_dev, sequence),
         )
         # The exposure these thresholds are learnt at is stamped INSIDE calibrate_threshold_from_images
         # (the single source every threshold path routes through, #H3w-3) so a later readout -- e.g. the
@@ -149,8 +150,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
         sequence = s._imaging_sequence(exposure=float(exposure), load=True, name="detect")
         seq_dev = getattr(s.devices, "sequencer", None)
         images = s.devices.camera.acquire(
-            1, sequence=sequence,
-            on_armed=(lambda q=sequence: (seq_dev.prepare(q), seq_dev.fire(q))) if seq_dev is not None else None)
+            1, sequence=sequence, on_armed=arm_then_fire(seq_dev, sequence))
         result = detect_image(images[-1], calibration, sequence=sequence, display=display, what=what)
         s.history.append(result)
         return result
@@ -369,7 +369,7 @@ class ReadoutSubsystem(ExperimentSubsystem):
         ref_seqr = reference_controller.sequencer
         reference_images = s.devices.camera.acquire(
             reference_shots, sequence=reference_sequence,
-            on_armed=(lambda q=reference_sequence: (ref_seqr.prepare(q), ref_seqr.fire(q))) if ref_seqr is not None else None,
+            on_armed=arm_then_fire(ref_seqr, reference_sequence),
         )
         # Extract through the calibration's own method (box or PSF) and Otsu-split + score via the
         # ONE shared pipeline -- so the held-out reference uses the SAME signals/threshold/fidelity

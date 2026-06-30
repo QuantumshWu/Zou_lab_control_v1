@@ -39,7 +39,7 @@ import numpy as np
 from Zou_lab_control._paths import CALIBRATION_DIR
 from ..core.analysis import grid_shape_tuple
 from ..core.signals import NO_LINEAGE, SignalHub
-from ..devices.base import CameraDevice
+from ..devices.base import CameraDevice, arm_then_fire
 from .signal_expr import DEFAULT_SOURCE, SignalExpr, hub_namespace
 
 
@@ -1211,10 +1211,8 @@ class CalibrateReadoutTask(Task):
             # so the virtual camera can simulate; a real qCMOS reads the frames its trigger gates.
             # Without a bound sequencer (a notebook-composed readout that leans on the virtual atom
             # array) there is nothing to fire -- the camera still simulates from the bracket sequence.
-            on_armed = ((lambda b=bracket: (self.sequencer.prepare(b), self.sequencer.fire(b)))
-                        if self.sequencer is not None else None)
             batch = self.camera.acquire(
-                n_frames, sequence=bracket, on_armed=on_armed, stop=self._stop)
+                n_frames, sequence=bracket, on_armed=arm_then_fire(self.sequencer, bracket), stop=self._stop)
             frames = [np.asarray(f, dtype=float) for f in batch]
             if len(frames) <= readout_index:
                 break                                          # stopped mid-bracket -> no full shot
@@ -1885,9 +1883,8 @@ class PulseScanNode(_SweptBlockMeasurement):
         # is decoupled from the camera's exposure/averaging (no n_frames knob; temporal averaging
         # belongs to the upstream camera/processor).  The camera never drives the sequencer; WE fire
         # it from on_armed.  No bound sequencer -> nothing to fire (the virtual camera still simulates).
-        on_armed = ((lambda s=sequence: (self.sequencer.prepare(s), self.sequencer.fire(s)))
-                    if self.sequencer is not None else None)
-        frames = self.camera.acquire(1, sequence=sequence, on_armed=on_armed, stop=self._stop)
+        frames = self.camera.acquire(
+            1, sequence=sequence, on_armed=arm_then_fire(self.sequencer, sequence), stop=self._stop)
         if not frames:
             # Streamer not firing (e.g. Stop) -> no trigger -> no frame: freeze, do not advance
             # (the SAME data-source gate the camera measurement uses).

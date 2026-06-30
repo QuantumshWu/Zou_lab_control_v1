@@ -31,6 +31,7 @@ from Zou_lab_control._viewer_registry import active_plotter
 from ._spec import REQUIRED, CatalogSpec
 
 from ..core.analysis import estimate_threshold_fidelity, otsu_threshold, positive_int
+from ..devices.base import arm_then_fire
 from ..core.calibration import TrapCalibration
 from ..core.results import MeasurementTaskResult
 from ..core.utils import site_index
@@ -449,7 +450,7 @@ class ScannedMeasurement:
         for _ in range(self.shots_per_point):
             frames = self.camera.acquire(
                 self.plan.n_frames, sequence=sequence,
-                on_armed=(lambda q=sequence: (sequencer.prepare(q), sequencer.fire(q))) if sequencer is not None else None,
+                on_armed=arm_then_fire(sequencer, sequence),
                 stop=self.stop_event)
             rows.append(np.atleast_1d(np.asarray(self.reducer.reduce(frames, self.calibration), dtype=float)))
         # nanmean, not mean: a per-site reducer returns NaN for a site that was

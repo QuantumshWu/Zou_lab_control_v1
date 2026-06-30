@@ -227,11 +227,7 @@ class CameraDevice(BaseDevice):
         # Orchestrate the shot the decoupled way: the camera arms, then (on_armed) we fire the
         # sequencer -- the camera never drives it.  ``sequence`` is handed in only so the virtual
         # camera can simulate; a real camera reads the frames its hardware trigger gates.
-        on_armed = None
-        if sequencer is not None and sequence is not None:
-            def on_armed(_seq=sequence, _dev=sequencer):
-                _dev.prepare(_seq)
-                _dev.fire(_seq)
+        on_armed = arm_then_fire(sequencer if sequence is not None else None, sequence)
         images = self.acquire(frames, sequence=sequence, on_armed=on_armed, **kwargs)
         plot = plot_image(images[-1], display=display)
         result = CaptureResult(images=images, sequence=sequence, plot=plot)
@@ -322,6 +318,27 @@ class SequencerDevice(BaseDevice):
         self.stop()
 
 
+def arm_then_fire(sequencer, sequence):
+    """The single ``on_armed`` callback factory for the arm-before-fire shot.
+
+    A camera is a pure grabber: a consumer arms it (:meth:`CameraDevice.acquire`),
+    and the camera invokes ``on_armed`` AFTER it is armed and BEFORE it waits, so
+    the measurement fires the sequencer at exactly the moment the camera is ready
+    for triggers -- the camera never drives the sequencer.  Every readout / scan /
+    capture path needs the same callback ("prepare then fire this sequence on this
+    sequencer"), so it lives here next to the :class:`SequencerDevice` contract
+    rather than being hand-copied as an inline lambda at each call site.
+
+    Returns ``None`` when there is no bound sequencer (a notebook-composed readout
+    that leans on the virtual atom array -- nothing to fire), otherwise a no-arg
+    callable that prepares then fires ``sequence``.  The returned closure captures
+    ``sequencer``/``sequence`` directly (they are this call's arguments, so there is
+    no late-binding loop-variable hazard)."""
+    if sequencer is None:
+        return None
+    return lambda: (sequencer.prepare(sequence), sequencer.fire(sequence))
+
+
 class TrapArrayDevice(BaseDevice):
     """Required contract for a trap-array state source.
 
@@ -393,6 +410,7 @@ __all__ = [
     "CameraDevice",
     "SequencerDevice",
     "TrapArrayDevice",
+    "arm_then_fire",
     "snap_subarray",
     "validate_device_contract",
 ]
