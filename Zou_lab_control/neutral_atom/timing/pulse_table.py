@@ -28,13 +28,12 @@ from numbers import Number
 import re
 from typing import Iterable, Mapping, Sequence
 
-from .sequence import (READOUT_GAP_SECONDS, PulseSequence,
-                       channel_names, positive_float)
+from .sequence import (CLOCK_GRID_ATOL_TICKS as GRID_ATOL_STEPS,
+                       CLOCK_GRID_RTOL as GRID_RTOL, READOUT_GAP_SECONDS,
+                       PulseSequence, channel_names, positive_float)
 
 
 UNITS_TO_NS = {"ns": 1.0, "us": 1_000.0, "ms": 1_000_000.0, "s": 1_000_000_000.0, "str (ns)": 1.0}
-GRID_RTOL = 1e-12
-GRID_ATOL_STEPS = 1e-9
 BUS_LABEL_RE = re.compile(r"^(?P<base>.+)\[(?P<bit>\d+)\]$")
 ANALOG_BUS_MODES = ("hold", "edge", "ramp")
 

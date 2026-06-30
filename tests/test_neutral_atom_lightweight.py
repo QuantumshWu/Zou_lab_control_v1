@@ -7468,3 +7468,15 @@ def test_readout_characterize_from_dir_on_virtual_backend(tmp_path):
     assert (results / "characterize_signals.npz").exists()
     values, occupied = report.per_site_arrays()
     assert len(values) == report.n_sites
+
+
+def test_clock_grid_tolerance_single_source():
+    """pulse_table reuses the clock-grid tolerances defined in sequence (no copy).
+
+    Both compilers snap to the FPGA tick grid with the same rel/abs tolerance;
+    the constants live once in ``timing.sequence`` and ``timing.pulse_table``
+    only re-exports them under its historical names. Re-typing the literals in
+    two places would silently drift, so this pins the identity."""
+    from Zou_lab_control.neutral_atom.timing import sequence, pulse_table
+    assert pulse_table.GRID_RTOL is sequence.CLOCK_GRID_RTOL
+    assert pulse_table.GRID_ATOL_STEPS is sequence.CLOCK_GRID_ATOL_TICKS
