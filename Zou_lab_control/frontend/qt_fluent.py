@@ -1829,6 +1829,24 @@ class FluentTabWidget(QtWidgets.QTabWidget):
         self._overflow_btn.hide()
         self.currentChanged.connect(lambda _i: self._update_overflow())
 
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        # The white card is the WIDGET's own paint, not a by-product of the shadow.
+        # The ``::pane`` stylesheet fills only the page below the tab bar white, and
+        # ``QTabBar { background: transparent }`` leaves the strip see-through -- so the
+        # whole widget reads as one rounded white card ONLY if it paints that card itself
+        # (same principle as FluentFrame / FluentPopup, which paint their own white body).
+        # Painting it here also gives the baked shadow (`CachedDropShadow.draw`, which bakes
+        # from the source's own alpha) an opaque body across the FULL rect -- so the strip
+        # is backed and the shadow hugs the whole card, with no transparent strip-band.
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.setBrush(QtGui.QColor("white"))
+        radius = _radius()
+        painter.drawRoundedRect(QtCore.QRectF(self.rect()), radius, radius)
+        painter.end()
+        super().paintEvent(event)
+
     def _build_overflow_button(self) -> QtWidgets.QToolButton:
         """The Fluent overflow affordance: a subtle ``...`` button (top-right corner) that
         replaces the native scroll arrows.  Shown only when the tabs overflow the bar;
