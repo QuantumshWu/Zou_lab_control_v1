@@ -78,9 +78,11 @@ class ProcessorSpec(CatalogSpec):
       numpy arrays / scalars (NOT a domain object); the host publishes them under
       ``result_keys``.
 
-    ``consumes`` names the hub signals a reactive processor reads (drives the signal
-    flow graph / legend); empty for a one-shot.  ``summary_keys`` names the SCALAR
-    results worth showing in a panel's numeric pane (the rest are per-site arrays).
+    A reactive processor's input set is canonical on its NODE (``node.consumes``,
+    derived from the picked source expression) -- the console's frame-coherence
+    resolver matches on that, never on a spec-level copy.  ``summary_keys`` names the
+    SCALAR results worth showing in a panel's numeric pane (the rest are per-site
+    arrays).
 
     The OPTIONAL default-view binding mirrors a measurement's (and confocal's
     ``plotter`` class attribute): ``default_kind`` is the plot kind the console
@@ -93,7 +95,6 @@ class ProcessorSpec(CatalogSpec):
     result_keys: tuple[str, ...] = REQUIRED
     run: Callable[["ProcessorContext"], dict] | None = None
     make_node: Callable[..., Any] | None = None
-    consumes: tuple[str, ...] = ()
     summary_keys: tuple[str, ...] = ()
     default_kind: str = ""
     default_value_key: str = ""

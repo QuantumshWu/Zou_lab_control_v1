@@ -22,7 +22,7 @@ The per-site bimodal/Gaussian primitives come from :mod:`..core.bimodal`.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, ClassVar, Sequence
 
 import numpy as np
 
@@ -245,6 +245,15 @@ def _fit_site_threshold(dark_train, bright_train, edges):
 class FidelityReport:
     """Held-out per-site and aggregate readout fidelity with a drop-worst ablation."""
 
+    # SINGLE SOURCE for the scalar keys ``summary()`` publishes: any consumer that
+    # declares the report's scalar outputs (e.g. the ``readout_fidelity`` processor's
+    # ``summary_keys`` / ``result_keys``) reads THIS tuple instead of re-typing it, so
+    # the declaration can never drift from what ``summary()`` actually returns.
+    SUMMARY_KEYS: ClassVar[tuple[str, ...]] = (
+        "n_sites", "n_groups", "aggregate_fidelity", "global_fidelity",
+        "mean_site_fidelity", "min_site_fidelity", "ambiguous_fraction",
+    )
+
     per_site: list[SiteFidelity]
     thresholds: np.ndarray         # (n_sites,) trained per-site thresholds
     pred: np.ndarray               # (n_groups, n_sites) bool, per-site predictions
@@ -282,7 +291,7 @@ class FidelityReport:
 
     def summary(self) -> dict[str, Any]:
         fids = self.site_fidelities
-        return {
+        out = {
             "n_sites": self.n_sites,
             "n_groups": self.labels.n_groups,
             "aggregate_fidelity": float(self.aggregate_fidelity),
@@ -291,6 +300,10 @@ class FidelityReport:
             "min_site_fidelity": float(np.nanmin(fids)) if fids.size else float("nan"),
             "ambiguous_fraction": float(np.mean(self.labels.ambiguous)),
         }
+        # Self-guard the single source: the keys here MUST equal SUMMARY_KEYS so any
+        # consumer declaring SUMMARY_KEYS publishes exactly what this returns.
+        assert set(out) == set(self.SUMMARY_KEYS)
+        return out
 
 
 def _drop_worst(per_site, pred, labels, split, max_drop) -> list[dict[str, Any]]:

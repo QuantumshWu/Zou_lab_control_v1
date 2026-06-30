@@ -349,7 +349,7 @@ class OtsuFidelityReducer:
     labels), which is the right cheap signal to optimize a detection time on a
     rolling curve.  For a rigorous HELD-OUT, per-site empirical fidelity (truth
     from reference shots, threshold trained on a split, fidelity scored on the
-    held-out split), run ``exp.readout.characterize(...)`` -- a separate
+    held-out split), run ``exp.readout.characterize_from_dir(...)`` -- a separate
     characterization that acquires the reference frames the live scan does not.
     """
 

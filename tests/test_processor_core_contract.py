@@ -90,6 +90,31 @@ def test_processor_run_once_and_publishes_to_hub(tmp_path):
     assert exp.readout.current.metadata.get("threshold_method") == "per_site_reference"
 
 
+def test_readout_fidelity_summary_keys_are_single_sourced():
+    """SINGLE SOURCE: ``FidelityReport.summary()`` and its declared ``SUMMARY_KEYS`` must agree, and
+    the ``readout_fidelity`` processor declares its scalar keys STRAIGHT from that tuple (no hand-typed
+    copy that could drift -- a drift would make the processor publish a key it never declared and crash
+    at ``_assert_declared`` in the console).  Pin both edges of the single source here."""
+    from Zou_lab_control.neutral_atom.operations.fidelity import FidelityReport, characterize_readout
+    from Zou_lab_control.neutral_atom.operations.processors.readout_fidelity import readout_fidelity
+
+    # A real FidelityReport via the pure characterization path (cleanly separable bright/dark, no IO):
+    rng = np.random.default_rng(0)
+    n_groups, n_sites, n_ref = 40, 3, 3
+    occupied = rng.integers(0, 2, size=(n_groups, n_sites)).astype(bool)
+    short = np.where(occupied, 100.0, 10.0) + rng.normal(0, 1.0, size=(n_groups, n_sites))
+    ref = (np.where(occupied[:, None, :], 100.0, 10.0)
+           + rng.normal(0, 1.0, size=(n_groups, n_ref, n_sites)))
+    report = characterize_readout(short, ref, seed=0)
+
+    # 1) the report's own summary() returns EXACTLY the keys it advertises in SUMMARY_KEYS
+    assert set(report.summary()) == set(FidelityReport.SUMMARY_KEYS)
+    # 2) the processor's declared summary_keys ARE that tuple (read straight from the report, not retyped)
+    spec = readout_fidelity(readout=None)
+    assert spec.summary_keys == FidelityReport.SUMMARY_KEYS
+    assert set(FidelityReport.SUMMARY_KEYS) <= set(spec.result_keys)
+
+
 def test_processor_registry_rejects_duplicate_result_keys():
     a = lambda readout: ProcessorSpec(name="A", params=(), run=lambda c: {}, result_keys=("dup",))
     b = lambda readout: ProcessorSpec(name="B", params=(), run=lambda c: {}, result_keys=("dup",))

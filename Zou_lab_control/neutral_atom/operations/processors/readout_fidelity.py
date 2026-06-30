@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from ..fidelity import FidelityReport
 from ..imageio import DEFAULT_SHORT_SHOT, DEFAULT_SHOTS_PER_GROUP
 from ..processor import ParamDecl, ProcessorContext, ProcessorSpec
 from ..processor_registry import processor
@@ -73,10 +74,10 @@ def readout_fidelity(readout) -> ProcessorSpec:
         out.update({str(k): float(v) for k, v in report.summary().items()})
         return out
 
-    summary_keys = (
-        "n_sites", "n_groups", "aggregate_fidelity", "global_fidelity",
-        "mean_site_fidelity", "min_site_fidelity", "ambiguous_fraction",
-    )
+    # SINGLE SOURCE: the report owns its scalar key names; declare them straight from
+    # FidelityReport.SUMMARY_KEYS so the spec's declaration can never drift from what
+    # report.summary() actually publishes (run() above republishes summary() verbatim).
+    summary_keys = FidelityReport.SUMMARY_KEYS
     return ProcessorSpec(
         name="Readout fidelity",
         params=params,

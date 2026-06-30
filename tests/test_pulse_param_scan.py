@@ -370,6 +370,27 @@ def _scan_node(exp, *, repeat=1, tag="a"):
     return node, probe
 
 
+def test_pulse_scan_settle_no_sequencer_is_a_noop_not_a_wedge():
+    """A None sequencer is a LEGAL config (a notebook-composed readout on the virtual atom array --
+    ``arm_then_fire`` returns None, nothing to fire).  The device-owned inter-point settle must be the
+    SAME None-tolerant no-op as fire: with ``sequencer is None`` and ``extra_delay_s > 0`` the scan
+    must advance to ``finished`` instead of wedging on ``None.settle`` (AttributeError) at the first
+    point.  Guard the whole finite scan completes."""
+    exp = _calibrated()
+    node = probe = None
+    try:
+        node, probe = _scan_node(exp, repeat=1, tag="nosettle")
+        node.sequencer = None                 # no bound streamer (virtual atom array readout)
+        node.extra_delay_s = 1e-4             # a positive inter-point settle -> would hit None.settle
+        node.run_to_completion()              # must NOT raise AttributeError on None.settle
+        assert node.finished
+        assert node.points_done == 3          # the 3-point sweep advanced past point 0
+    finally:
+        if probe:
+            _safe_unlink(probe)
+        exp.close()
+
+
 def test_pulse_scan_repeat_is_the_whole_sweep_count():
     """#H3u-2: ``repeat`` (the ONE knob the console injects) IS the whole-sweep count for a pulse-scan
     (a pass IS a sweep).  ``repeat=K`` reaches ``node.repeat`` and means K whole sweeps."""

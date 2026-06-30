@@ -1916,7 +1916,12 @@ class PulseScanNode(_SweptBlockMeasurement):
         # 4) device-owned inter-point settle: load -> on_pulse -> wait pulse done (camera.acquire)
         #    -> settle (extra_delay_s) -> next.  The sequencer owns the wait (the caller just sets
         #    the adjustable extra delay); honours Stop so a long settle does not wedge teardown.
-        if self.extra_delay_s > 0.0 and not self._stop.is_set():
+        #    No bound sequencer -> nothing to settle, exactly like ``arm_then_fire`` returns None
+        #    when there is no streamer (a notebook-composed readout on the virtual atom array): the
+        #    sequencer-owned actions (fire AND settle) are all no-ops when ``self.sequencer is None``,
+        #    so an api-only / virtual scan with extra_delay_s>0 advances instead of wedging on
+        #    ``None.settle``.
+        if self.extra_delay_s > 0.0 and self.sequencer is not None and not self._stop.is_set():
             self.sequencer.settle(self.extra_delay_s, stop=self._stop)
         self._fill_point(index, y)                        # base owns slot/pass-clear/advance (#E4)
         out = {self.x_key: self._values.copy(),

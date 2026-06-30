@@ -119,7 +119,6 @@ def judge_occupancy(readout) -> ProcessorSpec:
         name="Judge occupancy",
         params=params,
         make_node=make_node,
-        consumes=("frame_0",),
         # SINGLE SOURCE: the published key names live ONCE on the node class (its `provides`),
         # the spec derives them -- so the spec's result_keys and the node's published_signals
         # can never drift (#H3r-F3).
