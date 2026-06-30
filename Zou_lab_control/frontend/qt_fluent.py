@@ -189,6 +189,23 @@ def screen_fit_window_size(window_ratio: float) -> QtCore.QSize:
     return QtCore.QSize(max(min_w, desired_w), max(min_h, desired_h))
 
 
+def center_window_on_primary_screen(window: QtWidgets.QWidget, app: QtWidgets.QApplication | None = None) -> None:
+    """Centre a top-level GUI window on the primary screen's available area.
+
+    The pulse editor and the task console share this ONE rule -- it used to live only in the
+    pulse launcher, so the console opened wherever the window manager dropped it and the two
+    GUIs looked inconsistent.  Single-sourced here next to ``screen_fit_window_size`` (which
+    sizes the same windows) so the open POSITION cannot silently diverge from the open SIZE."""
+    app = app or QtWidgets.QApplication.instance()
+    screen = app.primaryScreen() if app is not None else None
+    if screen is None:
+        return
+    available = screen.availableGeometry()
+    frame = window.frameGeometry()
+    frame.moveCenter(available.center())
+    window.move(frame.topLeft())
+
+
 def fluent_font_size() -> int:
     return max(8, int(round(FONT_SIZE * _FLUENT_SCALE)))
 
@@ -1553,11 +1570,22 @@ class FluentTreeComboBox(FluentComboBox):
         instead of scrolled.  Forces BOTH the view and its container height (``setFixedHeight``) so
         the container's own layout can't keep the view short."""
         view = self.view()
-        if not isinstance(view, QtWidgets.QTreeView) or not view.isVisible():
+        if not isinstance(view, QtWidgets.QTreeView):
+            return
+        container = view.window()
+        # NOT gated on ``view.isVisible()``: during the FIRST showPopup (and its first parent-expand)
+        # the popup's visibility has not propagated yet -- ``view.isVisible()`` is transiently False
+        # even though super().showPopup() already POSITIONED the container and ``_desired_popup_height``
+        # computes the right (full) height.  Gating on it dropped the very first open's/expand's grow,
+        # so the picker opened CLIPPED until the SECOND open.  The container guard (a real top-level
+        # popup window the combo owns, never ``self``) is the correct gate -- it holds whether or not
+        # the transient visible flag has caught up.  ``_resize_popup_to_contents`` is only ever reached
+        # during the open lifecycle (showPopup + the tree expand/collapse signals), so resizing a
+        # not-yet-flagged-visible-but-positioned container is safe.
+        if container is None or container is self:
             return
         desired = self._desired_popup_height()
-        container = view.window()
-        if desired <= 0 or container is None or container is self:
+        if desired <= 0:
             return
         view.setFixedHeight(max(0, desired - self._popup_pad()))   # force the view tall enough...
         container.setFixedHeight(max(scaled_px(40), desired))      # ...and the container to match

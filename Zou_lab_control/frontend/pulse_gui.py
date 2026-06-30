@@ -62,6 +62,7 @@ from .qt_fluent import (
     FluentTabWidget,
     FluentWindow,
     Metrics,
+    center_window_on_primary_screen,
     ensure_qt_app,
     fluent_font_size,
     fluent_scrollbar_stylesheet,
@@ -4479,23 +4480,13 @@ def show_pulse_gui(
     editor._set_gui_title(editor.windowTitle())
     window.adjustSize()
     window.setFixedSize(window.size())
-    _center_window_on_primary_screen(window, app)
+    center_window_on_primary_screen(window, app)   # shared with show_task_console (qt_fluent single source)
     window.show()
     editor._zlc_window = window
     if not hasattr(app, "_zlc_pulse_windows"):
         app._zlc_pulse_windows = []
     app._zlc_pulse_windows.extend([window, editor])
     return editor
-
-
-def _center_window_on_primary_screen(window: QtWidgets.QWidget, app: QtWidgets.QApplication) -> None:
-    screen = app.primaryScreen()
-    if screen is None:
-        return
-    available = screen.availableGeometry()
-    frame = window.frameGeometry()
-    frame.moveCenter(available.center())
-    window.move(frame.topLeft())
 
 
 __all__ = ["PulseSequenceEditor", "show_pulse_gui", "ensure_qt_app"]

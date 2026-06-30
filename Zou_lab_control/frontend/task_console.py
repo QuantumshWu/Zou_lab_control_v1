@@ -87,6 +87,7 @@ from .qt_fluent import (
     FluentTabWidget,
     FluentFloatingEditor,
     FluentWindow,
+    center_window_on_primary_screen,
     ensure_qt_app,
     fluent_widget_stylesheet,
     scaled_px,
@@ -6418,6 +6419,7 @@ def show_task_console(
         window.closed.connect(console.shutdown)
     window.adjustSize()
     window.setFixedSize(window.size())
+    center_window_on_primary_screen(window, app)   # open centred, exactly like show_pulse_gui (consistency)
     window.show()
     if not hasattr(app, "_zlc_task_windows"):
         app._zlc_task_windows = []

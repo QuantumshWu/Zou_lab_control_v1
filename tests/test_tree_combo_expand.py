@@ -68,6 +68,33 @@ def test_popup_height_grows_to_fit_then_clamps_and_scrolls(monkeypatch):
     c.hidePopup()
 
 
+def test_first_open_resize_applies_despite_lagging_visible_flag(monkeypatch):
+    """The popup must GROW to fit its content on the FIRST open/expand -- even though, on a real screen,
+    super().showPopup() positions the container a beat BEFORE the view's ``isVisible()`` flag propagates
+    (transiently False on the very first open).  ``_resize_popup_to_contents`` must apply the (already
+    correct) ``_desired_popup_height`` regardless of that lagging flag; a ``not view.isVisible()`` guard
+    used to DROP the first open's/expand's resize, so the picker opened CLIPPED until the SECOND open
+    (offscreen sets the flag immediately, so this forces the real-window transient explicitly)."""
+    pytest.importorskip("PyQt5")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5 import QtWidgets
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    c = _combo()
+    c.showPopup()
+    tree = c.view()
+    tree.setExpanded(c._model.index(1, 0), True)        # expand both parents -> the full content height
+    tree.setExpanded(c._model.index(2, 0), True)
+    container = tree.window()
+    desired = c._desired_popup_height()                 # computed while the flag is still good
+    assert desired > c._popup_pad() + 30                # there IS content to grow into
+    container.setFixedHeight(c._popup_pad() + 1)         # start in the clipped-on-first-open state
+    monkeypatch.setattr(tree, "isVisible", lambda: False)   # the first-open transient: flag not yet set
+    c._resize_popup_to_contents()                       # must STILL grow the container (the fix)
+    assert container.height() == pytest.approx(max(40, desired), abs=6), \
+        "first-open resize must apply despite the lagging visible flag (else the picker opens clipped)"
+    c.hidePopup()
+
+
 def test_pick_updates_the_collapsed_display_immediately_and_on_switch():
     """#1: picking a leaf updates the box's COLLAPSED text RIGHT AWAY to the producer-qualified label
     (not the raw verbose leaf text), AND switching to ANOTHER leaf updates it LIVE -- no close+reopen.
