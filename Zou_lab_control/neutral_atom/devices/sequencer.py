@@ -1563,7 +1563,7 @@ class PulseController:
         if not isinstance(self.pulse, PulseTableState):
             raise TypeError("get_channel_delay needs a PulseTableState pulse.")
         unit = str(self.pulse.delay_units.get(str(channel), "ns"))
-        factor = {"ns": 1.0, "us": 1e3, "ms": 1e6, "s": 1e9}.get(unit, 1.0)
+        factor = UNITS_TO_NS.get(unit, 1.0)
         return float(self.pulse.delays.get(str(channel), 0.0)) * factor
 
     def load_pulse(self, path: str | Path) -> "PulseController":

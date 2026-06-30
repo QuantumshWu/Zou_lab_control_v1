@@ -539,7 +539,15 @@ def _analog_bus_traces(state: PulseTableState, *, include_always_off: bool = Tru
 
 def _summary_time_text(value_ns: float) -> str:
     value_ns = float(value_ns)
-    units = (("s", 1_000_000_000.0), ("ms", 1_000_000.0), ("us", 1_000.0), ("ns", 1.0))
+    # Largest-unit-first table derived from the single source UNITS_TO_NS, skipping the
+    # internal "str (ns)" scan-expression alias (it duplicates ns and is never displayed).
+    units = tuple(
+        (unit, factor)
+        for unit, factor in sorted(
+            UNITS_TO_NS.items(), key=lambda kv: kv[1], reverse=True
+        )
+        if unit in DURATION_UNITS
+    )
     for unit, factor in units:
         if abs(value_ns) >= factor or unit == "ns":
             return f"{format_compact_number(value_ns / factor, digits=6)} {unit}"
