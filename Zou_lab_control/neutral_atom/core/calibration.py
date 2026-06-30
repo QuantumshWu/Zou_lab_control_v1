@@ -103,7 +103,17 @@ class TrapCalibration:
         return (self.method, *(m for m in extra if m != self.method))
 
     def _resolve_method(self, method) -> str:
-        return str(self.method if method in (None, "") else method).lower()
+        m = str(self.method if method in (None, "") else method).lower()
+        # Whitelist against the methods this calibration can actually read with
+        # (methods(), the single source) -- a misspelled method must fail loud
+        # (like analysis.normalize_reducer / operations ALL_READOUT_METHODS),
+        # not silently fall back to box because ``"psf" in m`` happened to miss.
+        valid = self.methods()
+        if m not in valid:
+            raise ValueError(
+                f"method {m!r} is not one of {', '.join(valid)} -- "
+                "recalibrate including it or pick an available method.")
+        return m
 
     def _kernels_for(self, method: str):
         """PSF (weights, boxes) for a psf-type ``method`` -- the top-level fields when it

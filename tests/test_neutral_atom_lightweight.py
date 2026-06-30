@@ -7333,6 +7333,35 @@ def test_psf_bimodal_readout_end_to_end_on_virtual_backend():
     assert cal.detect(image).occupied_indices == [0, 1, 2, 5, 9]
 
 
+def test_misspelled_readout_method_raises_instead_of_silently_falling_back():
+    """A misspelled method must fail loud (like analysis.normalize_reducer /
+    operations ALL_READOUT_METHODS), NOT silently get read as box because the old
+    ``"psf" in m`` substring test happened to miss.  ``_resolve_method`` whitelists
+    against ``methods()`` (the single source of what this calibration can read),
+    and the message lists the legal set."""
+    cal = na.TrapCalibration(
+        centers=[(2, 2), (2, 6)],
+        thresholds=[5.0, 5.0],
+        grid_shape=(1, 2),
+        method="box",
+    )
+    image = np.zeros((8, 8), dtype=float)
+    # A valid method (its own) reads fine.
+    assert cal.signals(image, method="box").shape == (2,)
+    # Misspellings raise, and the error names the available set -- not a silent box read.
+    for bad in ("pfs", "psff", "uniform-psf", "nonsense"):
+        with pytest.raises(ValueError, match="not one of"):
+            cal.signals(image, method=bad)
+        with pytest.raises(ValueError, match="not one of"):
+            cal.detect(image, method=bad)
+        with pytest.raises(ValueError, match="not one of"):
+            cal.thresholds_for(bad)
+    # A method this box calibration does NOT carry also fails loud (it is not in methods()).
+    assert "psf" not in cal.methods()
+    with pytest.raises(ValueError, match="not one of"):
+        cal.signals(image, method="psf")
+
+
 def test_sequence_name_does_not_switch_the_virtual_camera_to_all_bright():
     """Decoupling (#H3q): the virtual camera must NOT render an idealized all-loaded frame just
     because the ANALYSIS layer named its sequence 'sitemap'.  All-sites is ONLY the explicit device
