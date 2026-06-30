@@ -12,7 +12,10 @@
           64
         ],
         "device_index": 0,
-        "timeout_ms": 10000
+        "timeout_ms": 10000,
+        "capture_trigger_channels": [
+          "ch11"
+        ]
       }
     }
   },
@@ -84,9 +87,6 @@
         "ch61"
       ],
       "clock_hz": 50000000.0,
-      "trigger_channels": [
-        "ch11"
-      ],
       "message": "qCMOS is armed. Start the FPGA emCCD trigger sequence now."
     }
   }

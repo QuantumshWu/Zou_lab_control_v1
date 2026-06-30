@@ -976,8 +976,10 @@ exp = na.connect("virtual")            # 真实实验换成对应 config
 centers = exp.readout.sitemap(frames=12, display=False).calibration.centers
 rate = None
 for shot in range(1000):
-    frame = exp.camera.acquire(1, sequence=exp.sequence,
-                               sequencer=exp.devices.sequencer)[0]
+    frame = exp.camera.acquire(
+        1, sequence=exp.sequence,
+        on_armed=lambda: (exp.devices.sequencer.prepare(exp.sequence),
+                          exp.devices.sequencer.fire(exp.sequence)))[0]
     det = exp.readout.from_image(frame, display=False)
     occ = det.occupied.astype(float)
     rate = occ.mean() if rate is None else 0.95 * rate + 0.05 * occ.mean()

@@ -78,9 +78,9 @@ def build_release_recapture_pulse(
     scan can stream a whole ``t_off`` table.
 
     This must be a SINGLE sequence with two triggers, NOT a repeated single-frame
-    sequence: ``finite_frame_sequence`` reloads atoms between frames, so the two
-    images would be different loadings with no trap-off between them.  Release-
-    recapture survival requires the SAME atoms imaged before and after one
+    sequence: repeating a one-trigger imaging pulse reloads atoms between frames,
+    so the two images would be different loadings with no trap-off between them.
+    Release-recapture survival requires the SAME atoms imaged before and after one
     trap-off, which only the explicit trap-off period provides.
     """
 

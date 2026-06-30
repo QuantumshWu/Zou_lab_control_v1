@@ -110,7 +110,7 @@ def test_add_period_keeps_analog_bus_modes_in_step():
     modes = st.analog_bus_modes["da_test"]
     assert len(modes) == n0 + 1
     assert modes[-1] == {"mode": "hold", "value": None}
-    st.compile(clock_hz=50_000_000, trigger_channels=["ch03"], repeat_forever=False)
+    st.compile(clock_hz=50_000_000, repeat_forever=False)
     st2 = PulseTableState.from_dict(json.loads(json.dumps(st.to_dict())))
     assert len(st2.analog_bus_modes["da_test"]) == n0 + 1
 

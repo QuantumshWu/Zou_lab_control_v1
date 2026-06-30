@@ -1,12 +1,10 @@
 """Pulse-sequence and Verilog timing layer."""
 
 from .sequence import (
-    DEFAULT_CAMERA_TRIGGER_CHANNELS,
     Pulse,
     PulseReport,
     PulseSequence,
     channel_names,
-    count_trigger_pulses,
     exposure_from_sequence,
     imaging_channel_kwargs,
     imaging_sequence,
@@ -14,7 +12,6 @@ from .sequence import (
     probe_channel_set,
     reference_bracket_sequence,
     positive_float,
-    sequence_for_frame_count,
 )
 from .pulse_table import (
     ANALOG_BUS_MODES,
@@ -61,7 +58,6 @@ __all__ = [
     "ApiSlot",
     "api_var",
     "single_imaging_template",
-    "DEFAULT_CAMERA_TRIGGER_CHANNELS",
     "Pulse",
     "PulseParam",
     "PulsePeriod",
@@ -75,7 +71,6 @@ __all__ = [
     "VerilogFiles",
     "affine_coeffs",
     "channel_names",
-    "count_trigger_pulses",
     "default_imaging_template",
     "default_pulse_name",
     "default_periods",
@@ -100,7 +95,6 @@ __all__ = [
     "ScanColumnSpec",
     "scan_column_spec",
     "scan_table_template",
-    "sequence_for_frame_count",
     "slot_var",
     "snap_scan_table",
     "write_verilog_bundle",

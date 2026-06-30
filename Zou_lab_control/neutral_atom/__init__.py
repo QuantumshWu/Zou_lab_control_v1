@@ -43,7 +43,6 @@ from .devices import (
     compile_runtime_program_for_payload,
     device_class_registry,
     device_config_dir,
-    finite_frame_sequence,
     infer_xdc_channel_pins,
     infer_xdc_trigger_channels,
     load_devices,
@@ -55,12 +54,10 @@ from .views import image_to_points, plot_detection_image, plot_detection_scan, p
 from .devices import VerilogSequencer
 from .timing import (
     ANALOG_BUS_MODES,
-    DEFAULT_CAMERA_TRIGGER_CHANNELS,
     Pulse,
     PulsePeriod,
     PulseSequence,
     PulseTableState,
-    count_trigger_pulses,
     default_pulse_name,
     exposure_from_sequence,
     imaging_sequence,
@@ -69,8 +66,10 @@ from .timing import (
     positive_time_step_ns,
     quantized_time_ns,
     quantized_time_steps,
-    sequence_for_frame_count,
 )
+# The camera capture-trigger helpers live in the CAMERA layer now (the sequencer/timing know
+# nothing about which channel gates a camera); re-exported here so notebooks keep `na.*` access.
+from .devices.camera_trigger import DEFAULT_CAMERA_TRIGGER_CHANNELS, count_trigger_pulses
 from .timing.verilog import VerilogBuild, VerilogFiles, generate_verilog, write_verilog_bundle
 from .devices import DEFAULT_CHANNELS, VirtualCamera, VirtualSequencer, VirtualTrapArray, virtual_config, write_virtual_run
 from .operations import (
@@ -246,7 +245,6 @@ __all__ = [
     "estimate_threshold_fidelity",
     "exposure_from_sequence",
     "find_site_centers",
-    "finite_frame_sequence",
     "fit_bimodal",
     "fit_bimodal_per_site",
     "fit_site_psfs",
@@ -275,7 +273,6 @@ __all__ = [
     "register_device_class",
     "run_sequencer_server",
     "serve_runtime_sequencer",
-    "sequence_for_frame_count",
     "sort_centers_grid",
     "virtual_config",
     "write_virtual_run",

@@ -71,13 +71,17 @@ def test_wedged_node_surfaces_error_not_silent():
 def test_loading_node_channel_mapping_follows_sequencer():
     """imaging_channel_kwargs maps the conventional roles onto whatever channels
     the bound sequencer exposes -- a real chNN streamer must NOT get the
-    trap/cooling/probe/emCCD placeholders."""
-    ch_seq = types.SimpleNamespace(channels=["ch00", "ch03", "ch09", "ch11"], trigger_channels=["ch11"])
-    assert imaging_channel_kwargs(ch_seq) == {
+    trap/cooling/probe/emCCD placeholders.  The CAMERA owns the capture-trigger
+    line now (the sequencer is a pure streamer), so the trigger channel is passed
+    in explicitly (the camera's capture_trigger_channels[0]), not read off the
+    sequencer."""
+    ch_seq = types.SimpleNamespace(channels=["ch00", "ch03", "ch09", "ch11"])
+    assert imaging_channel_kwargs(ch_seq, trigger_channel="ch11") == {
         "trap_channel": "ch09", "cooling_channel": "ch00",
         "probe_channel": "ch03", "trigger_channel": "ch11",
     }
-    named = types.SimpleNamespace(channels=["trap", "cooling", "probe", "emCCD"], trigger_channels=["emCCD"])
+    # The placeholder (virtual) convention names the trigger emCCD directly -- no explicit arg needed.
+    named = types.SimpleNamespace(channels=["trap", "cooling", "probe", "emCCD"])
     assert imaging_channel_kwargs(named)["trigger_channel"] == "emCCD"
     # virtual / unbound: fall back to imaging_sequence's own placeholder defaults
     assert imaging_channel_kwargs(None) == {}
@@ -119,7 +123,7 @@ class _FakePulse:
 class _CountCamera:
     last_stop = None
 
-    def acquire(self, frames=1, *, sequence=None, sequencer=None, stop=None, **kw):
+    def acquire(self, frames=1, *, sequence=None, on_armed=None, stop=None, **kw):
         self.last_stop = stop
         return [np.zeros((2, 2))]
 
@@ -331,8 +335,8 @@ def test_exposure_inference_follows_probe_channel_mapping():
     This was virtual-invisible, so it is pinned here."""
     from Zou_lab_control.neutral_atom.timing import exposure_from_sequence, imaging_sequence
 
-    ch_seq = types.SimpleNamespace(channels=["ch00", "ch03", "ch09", "ch11"], trigger_channels=["ch11"])
-    kw = imaging_channel_kwargs(ch_seq)
+    ch_seq = types.SimpleNamespace(channels=["ch00", "ch03", "ch09", "ch11"])
+    kw = imaging_channel_kwargs(ch_seq, trigger_channel="ch11")
     seq = imaging_sequence(exposure=0.037, load=True, name="readout", **kw)
     # inferring with the mapped probe channel (ch03) recovers the real exposure
     assert exposure_from_sequence(seq, default=0.02, channel=kw["probe_channel"]) == pytest.approx(0.037)
@@ -367,8 +371,8 @@ def test_release_recapture_builds_on_chNN_channels():
     the builder raises -- so the spec must remap via imaging_channel_kwargs."""
     from Zou_lab_control.neutral_atom.operations.temperature import build_release_recapture_pulse
 
-    ch_seq = types.SimpleNamespace(channels=["ch00", "ch03", "ch09", "ch11"], trigger_channels=["ch11"])
-    kw = imaging_channel_kwargs(ch_seq)
+    ch_seq = types.SimpleNamespace(channels=["ch00", "ch03", "ch09", "ch11"])
+    kw = imaging_channel_kwargs(ch_seq, trigger_channel="ch11")
     roles = {k: kw[k] for k in ("trap_channel", "probe_channel", "trigger_channel")}
     state = build_release_recapture_pulse(channels=ch_seq.channels, **roles)   # mapped roles -> builds
     assert state is not None
@@ -491,10 +495,11 @@ def test_exposures_per_frame_handles_uniform_and_heterogeneous_brackets():
     regression vs the old single-exposure path); a long-short-long reference bracket gives
     the real per-frame durations -- the whole point of supporting a 20-5-20 shot."""
     from Zou_lab_control.neutral_atom.devices.virtual import exposures_per_frame
-    from Zou_lab_control.neutral_atom.timing import (
-        imaging_sequence, reference_bracket_sequence, sequence_for_frame_count)
+    from Zou_lab_control.neutral_atom.timing import imaging_sequence, reference_bracket_sequence
 
-    uniform = sequence_for_frame_count(imaging_sequence(exposure=8e-3, load=True), 3)
+    # A single-trigger imaging pulse read for 3 frames = the pulse repeated 3x (3 capture edges),
+    # the per-frame-exposure analogue of the camera reading N frames off a one-trigger pulse.
+    uniform = imaging_sequence(exposure=8e-3, load=True).repeated(3)
     exps = exposures_per_frame(uniform, 3, default=20e-3, probe_channels=["probe"])
     assert all(abs(e - 8e-3) < 1e-9 for e in exps), exps          # every frame == the one exposure
 
@@ -618,7 +623,7 @@ def test_finite_scan_repeat_needs_two_points_on_the_compiled_program():
     time, never during editing."""
     from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
     base = dict(sequence_id="s", sequence_name="n", clock_hz=5e7, channels=["a"], ticks=[0],
-                masks=[1], duration=1e-6, trigger_count=1)
+                masks=[1], duration=1e-6)
     with pytest.raises(ValueError, match="at least 2 scan points"):
         RuntimeSequenceProgram(**base, scan_points=[[0]], scan_repeats=3)   # 1-point finite K-sweep
     # the legitimate shapes the guard must NOT reject:

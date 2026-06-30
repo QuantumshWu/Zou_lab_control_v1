@@ -46,7 +46,7 @@ def test_each_shot_is_a_fresh_random_loading():
     trap, cam, seqr = _rig(loading_probability=0.5)
     fractions, patterns = [], set()
     for _ in range(40):
-        cam.acquire(1, sequencer=seqr)          # the live-monitor path (no explicit sequence)
+        cam.acquire(1, sequence=getattr(seqr, "firing", None))          # the live-monitor path (no explicit sequence)
         fractions.append(float(trap.occupancy.mean()))
         patterns.add(trap.occupancy.tobytes())
     assert 0.4 <= np.mean(fractions) <= 0.6      # ~50% loading on average
@@ -57,9 +57,9 @@ def test_set_occupancy_is_a_one_shot_pin():
     """set_occupancy images THAT loading on the next shot, then resumes reloading."""
     trap, cam, seqr = _rig()
     trap.set_occupancy([0, 1, 4, 9])
-    cam.acquire(1, sequencer=seqr)
+    cam.acquire(1, sequence=getattr(seqr, "firing", None))
     assert list(np.flatnonzero(trap.occupancy)) == [0, 1, 4, 9]   # pinned loading imaged
-    cam.acquire(1, sequencer=seqr)
+    cam.acquire(1, sequence=getattr(seqr, "firing", None))
     # the shot after the pin is a fresh stochastic loading again (extremely unlikely
     # to reproduce the exact 4-site pattern by chance)
     assert list(np.flatnonzero(trap.occupancy)) != [0, 1, 4, 9]
@@ -71,7 +71,7 @@ def test_threshold_frames_are_independent_loadings():
     when empty) -- the spread an otsu threshold needs."""
     trap, cam, seqr = _rig(loading_probability=0.5)
     seq = imaging_sequence(exposure=20e-3, load=True, name="readout")
-    frames = cam.acquire(40, sequence=seq, sequencer=seqr)
+    frames = cam.acquire(40, sequence=seq, on_armed=lambda: (seqr.prepare(seq), seqr.fire(seq)))
     # central pixel of site 0 over the 40 independent shots: a clear bright/dark split
     cy, cx = (int(round(c)) for c in trap._site_centers()[0][::-1])
     centre = np.array([float(f[cy, cx]) for f in frames])
@@ -182,7 +182,8 @@ def test_acquire_applies_vacuum_loss_over_a_dark_hold_between_frames():
         cam, seqr = VirtualCamera(trap), VirtualSequencer()
         kept = total = 0
         for _ in range(8):
-            cam.acquire(2, sequence=hold_seq(hold), sequencer=seqr)  # frame0 loads, dark hold, frame1
+            _s = hold_seq(hold)
+            cam.acquire(2, sequence=_s, on_armed=lambda s=_s: (seqr.prepare(s), seqr.fire(s)))  # frame0 loads, dark hold, frame1
             # the survivors after the hold ARE the current occupancy (data-source physics test)
             total += trap.n_sites
             kept += int(trap.occupancy.sum())

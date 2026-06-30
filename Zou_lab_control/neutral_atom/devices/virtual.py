@@ -14,14 +14,11 @@ from ..core.analysis import (
     finite_float, grid_shape_tuple, nonnegative_float, point_tuple, positive_float, positive_int, probability)
 from ..core.utils import site_index
 from .base import CameraDevice, SequencerDevice, TrapArrayDevice, snap_subarray
+from .camera_trigger import DEFAULT_CAMERA_TRIGGER_CHANNELS, count_trigger_pulses
 from ..timing import (
-    DEFAULT_CAMERA_TRIGGER_CHANNELS,
     PulseSequence,
     PulseTableState,
-    count_trigger_pulses,
-    imaging_channel_kwargs,
     probe_channel_set,
-    sequence_for_frame_count,
 )
 
 
@@ -480,6 +477,81 @@ class VirtualTrapArray(TrapArrayDevice):
         self.occupancy = self.occupancy & survive
         return self.occupancy.copy()
 
+    def image_frames(self, sequence, frames: int, *, capture_trigger_channels, exposure: float,
+                     all_sites: bool = False) -> list[np.ndarray]:
+        """The virtual 'physical world': evolve THIS atom array under the fired ``sequence`` and
+        render the ``frames`` camera images its capture triggers gate.
+
+        This is the ATOM device's job (mirroring real hardware, where the FPGA outputs drive the
+        atoms and the camera merely images them): each camera-trigger window the pulse carries
+        (re)LOADS / re-COOLS / RELEASES / dark-holds the atoms before its frame, then the survivors
+        are imaged (probe scatter + readout loss + recoil).  The CAMERA passes its OWN
+        ``capture_trigger_channels`` (it owns 'which line triggers me') + its exposure; it does not
+        parse the pulse itself.  A pulse carrying NO camera trigger leaves the array dark -> no
+        frame (the live image freezes), exactly like an externally-triggered sensor.  The analysis
+        layer never sees any of this -- it only receives the rendered frames."""
+        frames = positive_int(frames, "frames")
+        trig = capture_trigger_channels or DEFAULT_CAMERA_TRIGGER_CHANNELS
+        if sequence is None:
+            return []
+        # The camera-trigger gate is a LIVE-monitor concept: a CONTINUOUS (``repeat_forever``)
+        # firing renders only while it pulses a camera-trigger line, and FREEZES the moment it
+        # does not (Stop Pulse -> a non-imaging safe state), exactly like a real externally-
+        # triggered sensor.  A FINITE measurement sequence (sitemap / threshold / detect /
+        # detection-time scan / reference bracket) is one the measurement deliberately fired to
+        # read ``frames`` windows, so it is rendered UNCONDITIONALLY -- its per-frame physics
+        # (cooling/trap-off/trap-hold) is parsed against the camera's trigger line, defaulting
+        # to independent re-loads when the bound pulse carries no trigger of its own.
+        if getattr(sequence, "repeat_forever", False) and not _sequence_triggers_camera(sequence, trig):
+            return []
+        probe_set = probe_channel_set("probe")
+        exposures = exposures_per_frame(sequence, frames, default=exposure,
+                                        trigger_channels=trig, probe_channels=probe_set)
+        cooling_durations = cooling_durations_per_frame(sequence, frames, trigger_channels=trig)
+        trap_off_per_frame = trap_off_durations_per_frame(sequence, frames, trigger_channels=trig)
+        trap_hold_per_frame = trap_hold_durations_per_frame(sequence, frames, trigger_channels=trig)
+        # A SINGLE multi-trigger cycle (the base sequence already carries every trigger -- e.g. a
+        # release-recapture bracket) holds ONE loading across all its frames, so a mid-cycle cooling
+        # phase RE-COOLS the held atoms.  A single-trigger sequence the measurement reads N times is
+        # a fresh shot per frame, so its cooling phase RELOADS.  Tell them apart by the base trigger
+        # count vs the requested frame count.
+        base_triggers = count_trigger_pulses(sequence, trigger_channels=trig) if hasattr(sequence, "effective_pulses") else 0
+        single_cycle = base_triggers >= frames
+        # A repeated SINGLE-trigger sequence (the measurement reads ``frames`` windows from a pulse that
+        # carries ONE camera trigger -- sitemap / threshold / detect / detection-time scan) is a fresh,
+        # independent shot per frame, so EVERY frame reloads.  The pulse defines only ONE cooling window
+        # (count_trigger_pulses == 1 < frames), so ``cooling_durations`` is non-zero only on frame 0;
+        # the reload duration each repeated shot uses is that base cooling (None when the pulse has no
+        # cooling phase -> saturated load).  A multi-trigger cycle (base_triggers >= frames, e.g. a
+        # release-recapture bracket) instead HOLDS one loading and a mid-cycle cooling RE-cools it.
+        repeated_shot_cooling = cooling_durations[0] if cooling_durations else 0.0
+        images: list[np.ndarray] = []
+        for frame_index in range(frames):
+            if not all_sites:
+                cool_dt = cooling_durations[frame_index]
+                trap_off = trap_off_per_frame[frame_index]
+                trap_hold = trap_hold_per_frame[frame_index]
+                if frame_index == 0:
+                    # Each shot starts from a fresh loading -- unless a deterministic test pinned a
+                    # specific occupancy (consume_pin), which this one shot images instead.
+                    if not self.consume_pin():
+                        self.reload(cooling_duration=(cool_dt if cool_dt > 0.0 else None))
+                elif not single_cycle:
+                    # A repeated single-trigger shot: a fresh independent loading every frame (the same
+                    # base cooling each time), so threshold/scan frames are independent shots -- NOT one
+                    # decaying loading imaged N times.
+                    self.reload(cooling_duration=(repeated_shot_cooling if repeated_shot_cooling > 0.0 else None))
+                elif cool_dt > 0.0:
+                    self.cool(cool_dt)       # mid-cycle cooling re-cools the held single-cycle atoms
+                # Cool THEN release (so heat -> re-cool -> release drops the re-cooled cloud).
+                if trap_off > 0.0:
+                    self.apply_recapture_loss(trap_off)
+                # Dark trap-ON hold loses atoms to vacuum collisions; skipped on frame 0 (the load).
+                if trap_hold > 0.0 and frame_index >= 1:
+                    self.apply_trap_loss(trap_hold)
+            images.append(self.render_image(exposure=exposures[frame_index], all_sites=all_sites))
+        return images
+
     def snapshot(self) -> dict[str, object]:
         return {
             "type": type(self).__name__,
@@ -509,10 +581,20 @@ def _sequence_triggers_camera(sequence, trigger_channels) -> bool:
 
 class VirtualCamera(CameraDevice):
     def __init__(self, trap_array: VirtualTrapArray, exposure: float = 20e-3, timeout: float = 2.0,
-                 subarray_step: int = 4):
+                 subarray_step: int = 4, capture_trigger_channels: Sequence[str] = DEFAULT_CAMERA_TRIGGER_CHANNELS,
+                 sleep_scale: float | None = None):
         self.trap_array = trap_array
         self._exposure = positive_float(exposure, "exposure")
         self.timeout = positive_float(timeout, "timeout")
+        # Which line the camera's trigger is wired to -- a PASSIVE device property the camera owns
+        # and exposes; it images the atoms the FPGA drives, never touching the sequencer (virtual==real).
+        self.capture_trigger_channels = tuple(str(c) for c in capture_trigger_channels)
+        # A real externally-triggered qCMOS BLOCKS in wait_capevent until the FPGA trigger arrives, so
+        # acquire() takes the inter-trigger wall-clock -- editing the imaging period to several seconds
+        # genuinely slows the live image.  The virtual camera mirrors that block (NOT pacing the
+        # experiment -- it is WAITING FOR ITS TRIGGER, intrinsic to a triggered sensor); ``sleep_scale``
+        # is the virtual time scale (the pytest suite flips DEFAULT_SLEEP_SCALE to 0 to fast-forward).
+        self.sleep_scale = nonnegative_float(DEFAULT_SLEEP_SCALE if sleep_scale is None else sleep_scale, "sleep_scale")
         self.last_sequence: str | None = None
         # Mirror the real qCMOS sub-array: a ROI is snapped to a hardware grid
         # (the Hamamatsu step is 4) and the rendered frame is CROPPED to it, so the
@@ -553,147 +635,51 @@ class VirtualCamera(CameraDevice):
 
     def acquire(
         self,
-        frames: int | None = None,
+        frames: int = 1,
         *,
         sequence: PulseSequence | None = None,
-        sequencer=None,
+        on_armed=None,
         force_all_sites: bool | None = None,
+        stop=None,
         **_,
     ) -> list[np.ndarray]:
-        # frames=None -> one frame per camera trigger the sequence carries (the camera is told
-        # the PULSE, never a frame count; see CameraDevice.acquire).  An explicit count is the
-        # repeat/live path.
-        frames = self._resolve_frame_count(frames, sequence, sequencer)
-        trigger_channels = getattr(sequencer, "trigger_channels", None)
-        # Infer the imaging channels the same single source the real adapter uses (probe
-        # -> ch03 / cooling -> ch00 on a chNN sequencer), so virtual and real track the
-        # SAME timing.
-        channel_kwargs = imaging_channel_kwargs(sequencer)
-        probe_channel = channel_kwargs.get("probe_channel", "probe")
-        # The camera is PURELY TRIGGER-DRIVEN, exactly like the real qCMOS: a frame exists
-        # only when a camera-trigger edge gates a readout.  There are two -- and only two --
-        # trigger sources, and NOTHING is ever fabricated:
-        #   * an EXPLICIT sequence (a measurement / capture() fires it and reads), or
-        #   * the streamer's CONTINUOUS firing state (the live monitor reads whatever the
-        #     FPGA is currently firing).
-        # With neither -- no streamer, or the streamer is not firing a camera-triggering pulse
-        # (the user hit "Stop Pulse" -> set_safe_state) -- there is NO trigger, so NO frame.
-        # This is what makes the live 2D image FREEZE on Stop Pulse instead of fabricating a
-        # fresh frame every tick (the bug this fixes).
-        if sequence is not None:
-            effective_sequence = sequence
-        else:
-            firing = getattr(sequencer, "firing", None)
-            if firing is None or not _sequence_triggers_camera(firing, trigger_channels):
-                return self._retain([])          # no streamer firing a camera trigger -> no frame
-            effective_sequence = firing
-        # Expand to the requested frame count (one trigger -> N repeats) so the per-frame
-        # analysis below sees ONE trigger window per frame -- the exact runtime sequence
-        # the sequencer fires.
-        kw = {"trigger_channels": trigger_channels} if trigger_channels is not None else {}
-        runtime_sequence = sequence_for_frame_count(effective_sequence, frames, **kw)
-        if sequence is not None and sequencer is not None:
-            sequencer.prepare(runtime_sequence)
-            sequencer.fire(runtime_sequence)
-        # Per-frame integration time: a real externally-triggered camera integrates each
-        # frame for the window ITS trigger gates, so a heterogeneous bracket (long-short-long
-        # reference) images successive frames for different durations.  For a uniform repeated
-        # sequence every entry equals the one exposure (the legacy single-exposure behaviour).
-        probe_set = probe_channel_set(probe_channel)
-        exposures = exposures_per_frame(runtime_sequence, frames, default=self.exposure,
-                                        trigger_channels=trigger_channels, probe_channels=probe_set)
-        # "All sites loaded" is an EXPLICIT device-boundary request (``force_all_sites``), NEVER
-        # inferred from the sequence NAME.  The old ``sequence.name == "sitemap"`` fallback let the
-        # ANALYSIS layer (it chooses that name) secretly switch the sim to an idealized all-bright
-        # frame -- a virtual!=real divergence: a real sitemap calibration sees ~50% loading and finds
-        # the sites by AVERAGING many frames (calibrate_sitemap_from_images, reducer='mean'), the SAME
-        # path virtual now takes.  So no analysis-set name controls what the camera renders.
-        all_sites = bool(force_all_sites)
-        # ---- PULSE-DRIVEN ATOM PHYSICS (data-source side only) ----------------
-        # Each camera frame is bounded by a camera-trigger rise.  In the window BEFORE
-        # a frame the fired pulse decides what happens to the atoms:
-        #   * a cooling/MOT pulse (re)LOADS a fresh ~50% array, PGC-cooled to the cooled
-        #     floor -- so an imaging shot, and each repeat of a threshold-calibration
-        #     sequence, is an INDEPENDENT loading;
-        #   * a trap-off gap RELEASES the current atoms ballistically (release-recapture
-        #     loss against their CURRENT temperature) -- the SAME loading imaged again,
-        #     as a temperature scan needs;
-        #   * the FIRST frame always starts from a fresh shot loading.
-        # render_image then images the survivors (probe scatter + readout loss + recoil
-        # heating).  No analysis code learns of this -- it only receives the frames.
-        # Cooling DURATION per frame (not just presence): a longer cooling/MOT pulse
-        # loads more atoms (loading_fraction), so editing the pulse's cooling time
-        # genuinely changes the loading you image.
-        cooling_durations = cooling_durations_per_frame(runtime_sequence, frames, trigger_channels=trigger_channels)
-        trap_off_per_frame = trap_off_durations_per_frame(runtime_sequence, frames, trigger_channels=trigger_channels)
-        trap_hold_per_frame = trap_hold_durations_per_frame(runtime_sequence, frames, trigger_channels=trigger_channels)
-        # A SINGLE multi-trigger cycle (the BASE sequence already carries every trigger -- e.g. a
-        # release-recapture bracket) holds ONE atom loading across all its frames, so a cooling
-        # phase mid-cycle RE-COOLS those held atoms (no reload).  A single-trigger sequence
-        # REPEATED to reach the frame count (e.g. the threshold-calibration pass) is a fresh shot
-        # per frame, so its cooling phase RELOADS a new independent array.  Tell them apart by
-        # whether the base already has at least ``frames`` camera triggers.
-        _trig = DEFAULT_CAMERA_TRIGGER_CHANNELS if trigger_channels is None else trigger_channels
-        base_triggers = count_trigger_pulses(effective_sequence, trigger_channels=_trig) if hasattr(effective_sequence, "effective_pulses") else 0
-        single_cycle = base_triggers >= frames
-        # REAL-TIME live cadence: the live monitor (no explicit sequence -- it reads the
-        # streamer's continuous firing) gets ONE frame per trigger CYCLE, and that cycle takes
-        # the firing program's per-cycle wall-clock time.  So editing the imaging pulse's period
-        # to several seconds genuinely slows the displayed image to that cadence -- the camera
-        # is paced BY the pulse, not by the polling worker.  Read the scale off the sequencer
-        # (one knob; the test suite sets it to 0 to fast-forward).  The explicit-sequence path
-        # instead blocks in ``wait_done`` below, so the wall-clock is never double-counted.
-        live_path = sequence is None
-        seq_scale = float(getattr(sequencer, "sleep_scale", 0.0) or 0.0)
-        per_frame_wall = (float(getattr(runtime_sequence, "duration", 0.0)) / max(frames, 1)) * seq_scale
-        images: list[np.ndarray] = []
-        for frame_index in range(frames):
-            if not all_sites:
-                cool_dt = cooling_durations[frame_index]
-                trap_off = trap_off_per_frame[frame_index]
-                trap_hold = trap_hold_per_frame[frame_index]
-                if frame_index == 0:
-                    # Each shot starts from a fresh loading -- UNLESS the caller pinned a
-                    # specific occupancy (set_occupancy, a deterministic test/debug), which
-                    # this one shot images instead of reloading.  The loading scales with the
-                    # shot's cooling time (None -> saturated when the pulse has no cooling phase).
-                    if not self.trap_array.consume_pin():
-                        self.trap_array.reload(cooling_duration=(cool_dt if cool_dt > 0.0 else None))
-                elif cool_dt > 0.0:
-                    # Mid-cycle cooling RE-COOLS the held atoms (single multi-trigger cycle) or
-                    # RELOADS a fresh array (a repeated single-trigger imaging sequence).
-                    if single_cycle:
-                        self.trap_array.cool(cool_dt)
-                    else:
-                        self.trap_array.reload(cooling_duration=cool_dt)
-                # A trap-off gap RELEASES the current atoms ballistically (recapture loss vs their
-                # CURRENT temperature).  Applied AFTER any cooling in the SAME frame (cool THEN
-                # release), so "heat -> re-cool -> release" drops the re-cooled cloud, not silently
-                # only one effect.  The standard release-recapture bracket has no cooling channel,
-                # so there this is just the release.
-                if trap_off > 0.0:
-                    self.trap_array.apply_recapture_loss(trap_off)
-                # A DARK trap-ON hold (trap on, probe off, BETWEEN images) loses atoms to vacuum
-                # collisions over its duration -- the trap-lifetime signal.  Skipped on frame 0
-                # (that window is the load, accounted for by the loading fraction, not a dark hold).
-                if trap_hold > 0.0 and frame_index >= 1:
-                    self.trap_array.apply_trap_loss(trap_hold)
-            image = self.trap_array.render_image(exposure=exposures[frame_index], all_sites=all_sites)
+        # A pure grabber, exactly like the real qCMOS: the camera is armed; now (on_armed) the
+        # measurement fires the FPGA -- the camera invokes the hook but never knows it drives a
+        # sequencer (arm-before-fire; virtual == real).
+        if on_armed is not None:
+            on_armed()
+        frames = positive_int(frames, "frames")
+        # Image what the atoms (the VirtualTrapArray) are doing under the fired pulse.  The
+        # pulse-driven physics lives in the ATOM device -- mirroring real hardware where the FPGA
+        # outputs drive the atoms and the camera merely images them; the camera owns ONLY its
+        # capture-trigger channel + imaging (exposure / ROI).  ``sequence`` is the fired pulse the
+        # MEASUREMENT hands in (the live monitor passes the streamer's current firing; a calibration
+        # passes its bracket); ``None`` / no camera trigger -> no frame, so the live image FREEZES,
+        # exactly as a real externally-triggered camera produces nothing without a trigger edge.
+        images = self.trap_array.image_frames(
+            sequence, frames,
+            capture_trigger_channels=self.capture_trigger_channels,
+            exposure=self.exposure,
+            all_sites=bool(force_all_sites),
+        )
+        out: list[np.ndarray] = []
+        for image in images:
             if self._roi is not None:
-                # crop to the applied sub-array, exactly as a real camera reads out
-                # only its ROI -- so the displayed frame IS the ROI region (x, w, y, h)
+                # crop to the applied sub-array, exactly as a real camera reads out only its ROI
                 x, w, y, h = self._roi
                 image = image[y:y + h, x:x + w]
-            images.append(image)
-            if live_path and per_frame_wall > 0:
-                # one frame per trigger cycle takes the cycle's real wall-clock time
-                time.sleep(per_frame_wall)
-        if sequence is not None and sequencer is not None:
-            wait_done = getattr(sequencer, "wait_done", None)
-            if callable(wait_done) and not wait_done(max(self.timeout, getattr(runtime_sequence, "duration", 0.0) * 2.0 + 1.0)):
-                raise TimeoutError("virtual sequencer did not report done.")
-        self.last_sequence = None if sequence is None else sequence.name
-        return self._retain(images)
+            out.append(image)
+        # Block for the trigger cycle's wall-clock when imaging a CONTINUOUS (live) firing, exactly as a
+        # real qCMOS's wait_capevent blocks until the next trigger -- so lengthening the imaging period
+        # genuinely slows the live image.  Only for a continuous (repeat_forever) program; a finite shot's
+        # timing is the measurement's wait_done, not a per-cycle camera block.  Interruptible by ``stop`` so
+        # Stop Pulse / teardown never blocks a full cycle.  No frame (Stop) -> no wait (the image freezes).
+        if out and self.sleep_scale > 0.0 and bool(getattr(sequence, "repeat_forever", False)):
+            wall = float(getattr(sequence, "duration", 0.0)) * self.sleep_scale
+            if wall > 0.0:
+                stop.wait(wall) if stop is not None else time.sleep(wall)
+        self.last_sequence = None if sequence is None else getattr(sequence, "name", None)
+        return self._retain(out)
 
     def snapshot(self) -> dict[str, object]:
         return {
@@ -724,7 +710,7 @@ class VirtualSequencer(SequencerDevice):
         self.history: list[dict[str, object]] = []
         self._prepared: PulseSequence | None = None
         # The compiled program of the last prepare() (parity with RuntimeSequencer.prepare,
-        # which on_pulse / sync-to-device read for .sequence_name / .trigger_count / etc.).
+        # which on_pulse / sync-to-device read for .sequence_name / .duration / etc.).
         self.last_program = None
         # The SOURCE payload (PulseTableState/PulseSequence as a JSON string) of the last
         # prepare -- the sync-to-device handle the pulse GUI's "Sync" pulls back, exactly like
@@ -777,8 +763,7 @@ class VirtualSequencer(SequencerDevice):
         program.validate(clock_hz=self.clock_hz).raise_if_failed()
         self._prepared = program
         self.last_program = compile_runtime_program(
-            program, channels=channels, clock_hz=self.clock_hz,
-            trigger_channels=getattr(self, "trigger_channels", DEFAULT_CAMERA_TRIGGER_CHANNELS))
+            program, channels=channels, clock_hz=self.clock_hz)
         # Record the SOURCE timing as a syncable PulseTableState JSON (always carries
         # ``periods``), EXACTLY like SequencerService -- the pulse GUI's "Sync" reads it back
         # from snapshot()["last_payload_json"].  A bare PulseSequence (a Task / measurement
@@ -1045,6 +1030,10 @@ def virtual_config_with_overrides(
                 camera_params[key] = value
             elif key in {"clock_hz", "sleep_scale", "channels"}:
                 sequencer_params[key] = value
+                # The camera's wait-for-trigger block uses the SAME virtual time scale as the
+                # sequencer (real qCMOS wait_capevent blocks in lockstep with the FPGA cadence).
+                if key == "sleep_scale":
+                    camera_params["sleep_scale"] = value
             else:
                 raise TypeError(f"unknown virtual configuration parameter {key!r}.")
     cfg["trap_array"].setdefault("params", {}).update(trap_params)

@@ -10,9 +10,8 @@ from typing import Any, Sequence
 import numpy as np
 
 from ..core.analysis import nonnegative_int, positive_float, positive_int
-from ..timing import DEFAULT_CAMERA_TRIGGER_CHANNELS, exposure_from_sequence, imaging_channel_kwargs, probe_channel_set
 from .base import AcquisitionCancelled, CameraDevice, snap_subarray
-from .sequencer import PulseController, finite_frame_sequence
+from .camera_trigger import DEFAULT_CAMERA_TRIGGER_CHANNELS
 
 
 @dataclass
@@ -31,8 +30,14 @@ class QCMOSConfig:
     # config to pin it; they are written + read back only when not None.
     sensor_mode: int | None = None
     trigger_global_exposure: int | None = None
+    # Which sequencer line the camera's external-trigger input is physically wired to.  The real
+    # hardware gates on that edge via ``TRIGGERSOURCE.EXTERNAL`` regardless, so for the real camera
+    # this is METADATA the upper layers (measurement / cali) read to build the right imaging pulse --
+    # the camera never uses it to drive the sequencer.
+    capture_trigger_channels: tuple[str, ...] = DEFAULT_CAMERA_TRIGGER_CHANNELS
 
     def __post_init__(self) -> None:
+        self.capture_trigger_channels = tuple(str(c) for c in self.capture_trigger_channels)
         self.exposure = positive_float(self.exposure, "exposure")
         self.readout_speed = nonnegative_int(self.readout_speed, "readout_speed")
         self.device_index = nonnegative_int(self.device_index, "device_index")
@@ -58,6 +63,9 @@ class QCMOSCamera(CameraDevice):
 
     def __init__(self, config: QCMOSConfig | dict[str, Any] | None = None, *, dcam_module: str = DEFAULT_DCAM_MODULE):
         self.config = config if isinstance(config, QCMOSConfig) else QCMOSConfig(**dict(config or {}))
+        # Passive wiring fact exposed upward (which sequencer line gates this camera); the camera
+        # never uses it to drive the sequencer -- a real qCMOS is gated by the hardware edge.
+        self.capture_trigger_channels = tuple(self.config.capture_trigger_channels)
         self.dcam_module_name = str(dcam_module)
         self._module = None
         self._api = None
@@ -129,52 +137,26 @@ class QCMOSCamera(CameraDevice):
         self._write_settings()
         return self
 
-    def acquire(self, frames: int | None = None, *, sequence=None, sequencer=None, timeout_ms: int | None = None, stop=None) -> list[np.ndarray]:
+    def acquire(self, frames: int = 1, *, sequence=None, on_armed=None, timeout_ms: int | None = None, stop=None) -> list[np.ndarray]:
+        """Arm for ``frames`` frames, let the measurement fire (``on_armed``), read N back.
+
+        Pure grabber: no sequencer, no trigger counting, no exposure inference.  Exposure/ROI are
+        the camera's own config (``configure``); the FPGA's external trigger gates each readout.
+        ``sequence`` is ignored here (a real sensor needs no pulse to image); it exists in the
+        contract only so the VIRTUAL camera can simulate."""
         self.open()
-        if sequencer is None and isinstance(sequence, PulseController):
-            sequencer = sequence.sequencer
-        # frames=None -> one DCAM frame per camera trigger the sequence carries (the external
-        # trigger gates each readout; the caller never counts triggers for us).  Explicit = repeat.
-        frames = self._resolve_frame_count(frames, sequence, sequencer)
-        runtime_sequence = self._sequence_for_frames(sequence, frames=frames, sequencer=sequencer)
-        if sequence is not None:
-            # Read exposure off the SAME channel the imaging sequence put the probe
-            # pulse on: imaging_channel_kwargs maps probe -> ch03 on a real chNN
-            # streamer, so inferring from the placeholder "probe" name would miss
-            # it and silently pin the camera at config exposure (a flat scan).
-            probe_channel = imaging_channel_kwargs(sequencer).get("probe_channel", "probe")
-            try:
-                sequence_exposure = exposure_from_sequence(runtime_sequence, default=self.config.exposure, channel=probe_channel)
-            except ValueError:
-                # A heterogeneous bracket (e.g. the long-short-long reference-fidelity shot)
-                # has NON-uniform probe durations: the external camera trigger gates each
-                # frame and the atoms scatter only during their OWN probe pulse, so set the
-                # global DCAM exposure to the LONGEST probe (it covers every frame; a frame's
-                # signal is bounded by its shorter probe).  Matches the virtual per-frame model.
-                probe_set = set(probe_channel_set(probe_channel))
-                durations = [p.duration for p in runtime_sequence.base_pulses()
-                             if p.value and p.channel in probe_set]
-                sequence_exposure = max(durations) if durations else self.config.exposure
-            if sequence_exposure != self.config.exposure:
-                self.config.exposure = sequence_exposure
-                self._write_settings()
-        if sequencer is not None and sequence is not None:
-            prepare = getattr(sequencer, "prepare", None)
-            if callable(prepare):
-                prepare(runtime_sequence)
+        frames = positive_int(frames, "frames")
         dcam = self._dcam
         if dcam.buf_alloc(frames) is False:
             raise RuntimeError(f"qCMOS buf_alloc({frames}) failed: {dcam.lasterr()}")
         images: list[np.ndarray] = []
-        acquisition_error = False
         try:
             if dcam.cap_start(bSequence=True) is False:
                 raise RuntimeError(f"qCMOS cap_start failed: {dcam.lasterr()}")
-            if sequencer is not None and sequence is not None:
-                fire = getattr(sequencer, "fire", None)
-                if not callable(fire):
-                    raise RuntimeError("sequencer must expose fire(sequence) for real qCMOS acquire.")
-                fire(runtime_sequence)
+            # The camera is armed and waiting for hardware triggers; NOW the measurement fires the
+            # FPGA (arm-before-fire).  The camera invokes the hook but knows nothing about it.
+            if on_armed is not None:
+                on_armed()
             timeout = self.config.timeout_ms if timeout_ms is None else positive_int(timeout_ms, "timeout_ms")
             # When a live logic node passes a stop event, wait in short slices and check
             # it between slices so Stop interrupts a wedged trigger within ~one
@@ -203,24 +185,8 @@ class QCMOSCamera(CameraDevice):
                         raise RuntimeError(f"qCMOS buf_getframedata({next_frame}) failed: {dcam.lasterr()}")
                     images.append(np.asarray(data[1]).copy())
                     next_frame += 1
-            if sequencer is not None and sequence is not None:
-                wait_done = getattr(sequencer, "wait_done", None)
-                if callable(wait_done):
-                    wait_timeout = max(timeout / 1000.0, getattr(runtime_sequence, "duration", 0.0) * 2.0 + 1.0)
-                    if not wait_done(wait_timeout):
-                        raise TimeoutError("sequencer did not report done after qCMOS acquisition.")
             return self._retain(images)
-        except Exception:
-            acquisition_error = True
-            raise
         finally:
-            if acquisition_error and sequencer is not None:
-                abort = getattr(sequencer, "abort", None)
-                if callable(abort):
-                    try:
-                        abort()
-                    except Exception:
-                        pass
             try:
                 dcam.cap_stop()
             finally:
@@ -228,18 +194,6 @@ class QCMOSCamera(CameraDevice):
                     dcam.buf_release()
                 except Exception:
                     pass
-
-    def _sequence_for_frames(self, sequence, *, frames: int, sequencer=None):
-        if sequence is None:
-            return None
-        if isinstance(sequence, PulseController):
-            return sequence.frame_sequence(frames)
-        trigger_channels = getattr(sequencer, "trigger_channels", None)
-        return finite_frame_sequence(
-            sequence,
-            frames,
-            trigger_channels=trigger_channels if trigger_channels is not None else DEFAULT_CAMERA_TRIGGER_CHANNELS,
-        )
 
     def _set_prop(self, idprop, value, name: str, *, verify: bool = False) -> None:
         """Write a DCAM property and FAIL LOUDLY if the camera rejects it.

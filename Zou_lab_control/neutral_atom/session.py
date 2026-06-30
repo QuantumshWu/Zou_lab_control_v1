@@ -118,7 +118,10 @@ class NeutralAtomSession:
     def _imaging_channel_kwargs(self) -> dict[str, str]:
         # Single source of truth lives in timing.imaging_channel_kwargs so the
         # session and the loading readout map channels identically (see M4 / logic nodes).
-        return imaging_channel_kwargs(getattr(self.devices, "sequencer", None))
+        # The CAMERA owns which line gates a frame, so the imaging pulse triggers THAT channel.
+        cam_trig = getattr(getattr(self.devices, "camera", None), "capture_trigger_channels", None)
+        return imaging_channel_kwargs(getattr(self.devices, "sequencer", None),
+                                      trigger_channel=(cam_trig[0] if cam_trig else None))
 
     def _preflight(self, *, sequence: PulseSequence | None = None, verilog: bool = True) -> PreflightReport:
         sequence = sequence or self.sequence

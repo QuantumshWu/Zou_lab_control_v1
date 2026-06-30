@@ -124,6 +124,24 @@ def test_finite_scan_repeats_implies_repeat_forever():
     assert payload.repeat_forever is True and payload.scan_repeats == 2
 
 
+def test_infinite_scan_streams_without_explicit_repeat_forever():
+    # scan_repeats=0 (the inf default) IS a streamed scan too: it must compile as repeat_forever so
+    # On Pulse keeps sweeping FOREVER.  The pulse GUI fires a scan WITHOUT toggling the whole-table
+    # flag, so a bare scan_repeats=0 (repeat_forever unset) must NOT demote to a play-once program --
+    # that was the "scan repeats = 0 / inf, On Pulse does nothing" bug.
+    payload = PulseController(VirtualSequencer(channels=["probe", "trig"]), _scan_state()).payload(scan_repeats=0)
+    assert payload.repeat_forever is True and payload.scan_repeats == 0
+
+
+def test_infinite_scan_actually_runs_on_pulse_without_flag():
+    # End-to-end mirror of the GUI On Pulse: firing an inf scan with NO whole-table flag must leave
+    # the streamer continuously firing and the scan progressing (not fire-once-and-stop).
+    seq = VirtualSequencer(channels=["probe", "trig"], sleep_scale=0.0)
+    PulseController(seq, _scan_state()).on_pulse(scan_repeats=0)
+    assert seq.firing is not None                          # the streamer keeps firing (it streams)
+    assert seq.scan_progress()["scanning"] is True
+
+
 def test_finite_scan_can_be_waited_without_timeout():
     # A finite scan DOES finish, so on_pulse(wait=True) must not raise the "cannot wait for a
     # repeat_forever pulse" guard (it would for an infinite scan).

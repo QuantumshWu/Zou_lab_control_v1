@@ -74,21 +74,11 @@ if "%ZLC_PS_CHANNELS%"=="" (
 if "%ZLC_PS_CHANNELS%"=="" (
   for /f "delims=" %%I in ('%ZLC_PY_CMD% -c "print(' '.join(f'ch{i:02d}' for i in range(62)))" 2^>nul') do if "!ZLC_PS_CHANNELS!"=="" set "ZLC_PS_CHANNELS=%%I"
 )
-rem Which channels are camera (emCCD) triggers is OPTIONAL METADATA the MEASUREMENT layer
-rem reads to count frames-per-cycle -- the sequencer just STREAMS pulses on its named
-rem channels and NEVER needs a trigger channel to run.  So inference is best-effort and
-rem NEVER fatal: if the XDC names no trigger channel, the server still starts -- we simply
-rem omit the arg and it falls back to its own default (DEFAULT_CAMERA_TRIGGER_CHANNELS).
-rem A consumer that needs a specific trigger channel sets ZLC_PS_TRIGGER_CHANNELS (or owns
-rem the notion at its own layer).
-if "%ZLC_PS_TRIGGER_CHANNELS%"=="" (
-  for /f "delims=" %%I in ('%ZLC_PY_CMD% -m Zou_lab_control.neutral_atom.devices.fpga_pulse_streamer infer_trigger_channels --xdc "%ZLC_PS_XDC%" --default-count %ZLC_PS_CHANNEL_COUNT% %ZLC_PS_MAX_CHANNEL_COUNT_ARG% 2^>nul') do if "!ZLC_PS_TRIGGER_CHANNELS!"=="" set "ZLC_PS_TRIGGER_CHANNELS=%%I"
-)
-if "%ZLC_PS_TRIGGER_CHANNELS%"=="" (
-  set "ZLC_PS_TRIGGER_CHANNELS_ARG="
-) else (
-  set "ZLC_PS_TRIGGER_CHANNELS_ARG=--trigger-channels %ZLC_PS_TRIGGER_CHANNELS%"
-)
+rem The sequencer is a PURE streamer: it streams pulses on its named channels and NEVER
+rem needs to know which line gates a camera.  Which channel is a camera capture trigger is
+rem the CAMERA device's property (its config's capture_trigger_channels), read by the
+rem control-computer measurement layer -- not the server.  So the server infers no camera
+rem trigger here and its launch line below passes only channels, never a trigger flag.
 
 rem Default the bitstream + JTAG-to-AXI probes from the in-repo build (build\ps).
 if not "%ZLC_PS_PROJECT_DIR%"=="" (
@@ -137,7 +127,6 @@ if "%ZLC_RUN_SERVER_CHECK%"=="1" (
   --host %ZLC_PS_HOST% ^
   --port %ZLC_PS_PORT% ^
   --channels %ZLC_PS_CHANNELS% ^
-  %ZLC_PS_TRIGGER_CHANNELS_ARG% ^
   --clock-hz %ZLC_PS_CLOCK_HZ% ^
   --state-dir "%ZLC_PS_STATE_DIR%"
 set "ZLC_STATUS=%ERRORLEVEL%"

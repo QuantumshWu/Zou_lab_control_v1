@@ -910,10 +910,13 @@ all_frames = result.images   # list[np.ndarray]，全部原始帧（uint16）
 last_frame = result.image    # 最后一帧 == images[-1]
 result.plot()                # 只画原始像素，绝不叠加圆圈/阈值
 
-# 4) 若需要底层、带时序器的采集（readout 流水线内部用法）：
-#    acquire 会把序列扩展到正好 3 个触发，然后
-#    sequencer.prepare(seq) -> fire(seq) -> 相机外触发采 3 帧 -> wait_done()
-raw = camera.acquire(frames=3, sequence=imaging_seq, sequencer=sequencer)
+# 4) 若需要底层、解耦式的采集（readout 流水线内部用法）：
+#    相机是纯取帧器，绝不碰时序器；它先 arm，再回调 on_armed 让上层 fire FPGA
+#    （arm-before-fire），自己只按外触发取帧。所以是测量层编排 prepare/fire：
+raw = camera.acquire(
+    frames=3, sequence=imaging_seq,
+    on_armed=lambda: (sequencer.prepare(imaging_seq), sequencer.fire(imaging_seq)),
+)
 # raw 是 list[np.ndarray]，每个元素是一帧 uint16 原始像素
 \end{codeblock}
 
@@ -923,7 +926,7 @@ raw = camera.acquire(frames=3, sequence=imaging_seq, sequencer=sequencer)
 \item 想改曝光却去调 \pyapi{camera.configure(exposure=...)}？——在外触发实验里请改序列：\pyapi{exp.timing.configure_imaging(exposure=...)}。
 \item 真机采集报句柄无效？——检查是否漏了 \pyapi{open()}（此时 \pyapi{_dcam is None}），顺序应为 open→configure→acquire→close。
 \item 仿真想要满阵列图？——优先用显式 \pyapi{force_all_sites=True}（比按序列名 \pyapi{"sitemap"} 的约定更清晰）；真机则必须真正装载原子。
-\item 帧数与触发数对不上？——别在 acquire 之外手动驱动时序器，让 \pyapi{acquire(...)} 把序列扩展到恰好 \pyapi{frames} 个触发。
+\item 相机没出帧 / 帧数对不上？——相机是纯取帧器，绝不自己驱动时序器：由测量层经 \pyapi{acquire(..., on_armed=...)} 钩子在相机 arm 后 fire FPGA。别让相机层去 prepare/fire，也别指望它把单触发序列改写成 \pyapi{frames} 个触发——它就按外触发逐帧取。
 \end{itemize}
 \end{notebox}
 

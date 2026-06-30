@@ -252,7 +252,7 @@ def test_virtual_camera_honors_roi_snaps_and_crops():
     cam.configure(roi=[10, 20, 6, 16])                      # x=10, y=6 are NOT multiples of 4
     assert cam.roi == (8, 20, 8, 16)                        # snapped to the grid, reported back
     fire_live_imaging(exp)                                  # On Pulse: the trigger-driven camera streams
-    frame = cam.acquire(1, sequencer=exp.devices.sequencer)[-1]
+    frame = cam.acquire(1, sequence=getattr(exp.devices.sequencer, "firing", None))[-1]
     assert frame.shape == (16, 20)                          # actually CROPPED to (h, w) of the ROI
 
 
@@ -444,7 +444,7 @@ def test_running_node_applies_params_in_owner_thread_no_concurrent_acquire():
             if kw.get("roi") is not None:
                 self._roi = tuple(int(v) for v in kw["roi"])
 
-        def acquire(self, frames=1, *, sequence=None, sequencer=None, stop=None, **kw):
+        def acquire(self, frames=1, *, sequence=None, on_armed=None, stop=None, **kw):
             with self._lock:
                 self._depth += 1
                 self.max_depth = max(self.max_depth, self._depth)

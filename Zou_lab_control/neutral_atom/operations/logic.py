@@ -1152,8 +1152,9 @@ class CalibrateReadoutTask(Task):
         INTERPRETATION of its template; it does NOT tell the camera how many frames to take (the
         camera captures one per trigger).  The cali images exactly the long-short-long the FILE
         defines -- it does not invent a bracket."""
-        from ..timing import DEFAULT_CAMERA_TRIGGER_CHANNELS
-        trig = [c for c in (getattr(self.sequencer, "trigger_channels", None) or DEFAULT_CAMERA_TRIGGER_CHANNELS)
+        from ..devices.camera_trigger import DEFAULT_CAMERA_TRIGGER_CHANNELS
+        # WHICH line gates a frame is the CAMERA's knowledge (it is wired to it), not the sequencer's.
+        trig = [c for c in (getattr(self.camera, "capture_trigger_channels", None) or DEFAULT_CAMERA_TRIGGER_CHANNELS)
                 if c in state.channels]
         bits = [state.channels.index(c) for c in trig]
         frame_periods = [i for i, p in enumerate(state.periods) if any(p.states[b] for b in bits)]
@@ -1196,15 +1197,24 @@ class CalibrateReadoutTask(Task):
         readout_index = self._imaging_layout(template)        # WHICH frame is the short readout (a2)
         self._readout_index = readout_index                    # shared with _save_live_frames
         bracket = template.to_sequence(name="reference_bracket")
+        from ..devices.camera_trigger import count_trigger_pulses
+        cam_trig = getattr(self.camera, "capture_trigger_channels", None)
+        n_frames = max(1, count_trigger_pulses(bracket, **({"trigger_channels": cam_trig} if cam_trig else {})))
         n_groups = max(2, int(self.threshold_frames))
         reference_groups: list = []
         readout_per_group: list = []
         for g in range(n_groups):
             if self._stop.is_set():
                 break
-            # The camera captures ONE frame per camera trigger the bracket carries -- we do NOT
-            # tell it a count (decoupled: the pulse defines how many emCCD frames, not the caller).
-            batch = self.camera.acquire(sequence=bracket, sequencer=self.sequencer, stop=self._stop)
+            # Decoupled shot: the camera arms for the bracket's N frames, then (on_armed) WE fire the
+            # sequencer -- the camera never drives it.  The bracket (the fired pulse) is handed in only
+            # so the virtual camera can simulate; a real qCMOS reads the frames its trigger gates.
+            # Without a bound sequencer (a notebook-composed readout that leans on the virtual atom
+            # array) there is nothing to fire -- the camera still simulates from the bracket sequence.
+            on_armed = ((lambda b=bracket: (self.sequencer.prepare(b), self.sequencer.fire(b)))
+                        if self.sequencer is not None else None)
+            batch = self.camera.acquire(
+                n_frames, sequence=bracket, on_armed=on_armed, stop=self._stop)
             frames = [np.asarray(f, dtype=float) for f in batch]
             if len(frames) <= readout_index:
                 break                                          # stopped mid-bracket -> no full shot
@@ -1418,7 +1428,9 @@ class CameraMeasurement(Measurement):
 
     def shot(self) -> dict[str, object]:
         n = max(1, int(self.frames_per_cycle))
-        frames = self.camera.acquire(n, sequencer=self.sequencer, stop=self._stop)
+        # Live monitor: the streamer is already firing continuously; the camera images whatever it is
+        # firing now (we hand it that pulse).  None / not firing a camera trigger -> no frame (freeze).
+        frames = self.camera.acquire(n, sequence=getattr(self.sequencer, "firing", None), stop=self._stop)
         if not frames:
             # The streamer is not firing a camera-triggering pulse (e.g. the user hit "Stop
             # Pulse") -> no trigger -> no frame.  Publish nothing: the live view holds its last
@@ -1871,8 +1883,11 @@ class PulseScanNode(_SweptBlockMeasurement):
         sequence = resolved.to_sequence(name="pulse_scan")
         # ONE trigger per point: pulse-scan FIRES the pulse and reads the UPSTREAM signal (y) -- it
         # is decoupled from the camera's exposure/averaging (no n_frames knob; temporal averaging
-        # belongs to the upstream camera/processor).
-        frames = self.camera.acquire(1, sequence=sequence, sequencer=self.sequencer, stop=self._stop)
+        # belongs to the upstream camera/processor).  The camera never drives the sequencer; WE fire
+        # it from on_armed.  No bound sequencer -> nothing to fire (the virtual camera still simulates).
+        on_armed = ((lambda s=sequence: (self.sequencer.prepare(s), self.sequencer.fire(s)))
+                    if self.sequencer is not None else None)
+        frames = self.camera.acquire(1, sequence=sequence, on_armed=on_armed, stop=self._stop)
         if not frames:
             # Streamer not firing (e.g. Stop) -> no trigger -> no frame: freeze, do not advance
             # (the SAME data-source gate the camera measurement uses).

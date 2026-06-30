@@ -1749,9 +1749,10 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         # Connection seeds for the runtime Connection control: a virtual or remote
         # sequencer built later (the user picks the backend AFTER opening, instead
         # of fixing it at launch) reuses the SAME channels the editor shows, so a
-        # transport swap never churns the channel layout.
+        # transport swap never churns the channel layout.  The sequencer is a pure
+        # streamer now -- which line gates a camera is the CAMERA's property, not the
+        # sequencer's, so the editor never seeds a trigger channel.
         self._clock_hz = float(getattr(self.sequencer, "clock_hz", None) or (1e9 / self.state.time_step_ns))
-        self._trigger_channels = list(getattr(self.sequencer, "trigger_channels", []) or [])
         self._connection_label = ""
         self.last_program = None
         self.bracket_exists = False
@@ -3820,8 +3821,6 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         from Zou_lab_control.neutral_atom.devices.sequencer import RemoteSequencer, RuntimeSequencer
 
         kwargs = {"channels": list(self.state.channels), "clock_hz": self._clock_hz}
-        if self._trigger_channels:
-            kwargs["trigger_channels"] = list(self._trigger_channels)
         try:
             if target == "virtual":
                 self._set_sequencer(RuntimeSequencer(**kwargs), label="Virtual (sim)")
@@ -3848,9 +3847,6 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self.sequencer = sequencer
         if sequencer is not None:
             self._clock_hz = float(getattr(sequencer, "clock_hz", self._clock_hz))
-            triggers = list(getattr(sequencer, "trigger_channels", []) or [])
-            if triggers:
-                self._trigger_channels = triggers
         self._connection_label = label
         self._refresh_connection_label()
         # a fresh connection has nothing of ours applied yet -> the editor's pulse

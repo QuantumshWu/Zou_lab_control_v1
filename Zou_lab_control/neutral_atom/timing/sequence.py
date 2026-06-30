@@ -393,7 +393,7 @@ def reference_bracket_sequence(
     return seq
 
 
-def imaging_channel_kwargs(sequencer: object) -> dict[str, str]:
+def imaging_channel_kwargs(sequencer: object, *, trigger_channel: str | None = None) -> dict[str, str]:
     """Channel kwargs for :func:`imaging_sequence`, derived from a bound sequencer.
 
     Single source of truth shared by the session and the loading readout: a real
@@ -402,16 +402,22 @@ def imaging_channel_kwargs(sequencer: object) -> dict[str, str]:
     names, or every pulse references a channel the device does not have).  Maps
     the conventional roles onto whatever the sequencer actually exposes; returns
     ``{}`` when neither convention is present so the caller falls back to
-    :func:`imaging_sequence`'s own placeholder defaults (virtual / notebook use)."""
+    :func:`imaging_sequence`'s own placeholder defaults (virtual / notebook use).
+
+    ``trigger_channel`` is the CAMERA's capture-trigger channel: the camera device owns
+    "which line triggers me" (the sequencer does NOT), so a caller building an imaging
+    pulse for a real chNN streamer passes its camera's ``capture_trigger_channels[0]`` --
+    that selects which chNN the imaging pulse pulses to trigger the camera.  The placeholder
+    (virtual) convention names the trigger ``emCCD`` directly, so the virtual path needs no
+    explicit trigger channel."""
 
     channels = list(getattr(sequencer, "channels", ()) or ())
-    trigger_channels = list(getattr(sequencer, "trigger_channels", ()) or ())
-    if all(ch in channels for ch in ("ch00", "ch03", "ch09")) and trigger_channels and trigger_channels[0] in channels:
+    if all(ch in channels for ch in ("ch00", "ch03", "ch09")) and trigger_channel and trigger_channel in channels:
         return {
             "trap_channel": "ch09",
             "cooling_channel": "ch00",
             "probe_channel": "ch03",
-            "trigger_channel": trigger_channels[0],
+            "trigger_channel": trigger_channel,
         }
     if all(ch in channels for ch in ("trap", "cooling", "probe", "emCCD")):
         return {
@@ -421,45 +427,6 @@ def imaging_channel_kwargs(sequencer: object) -> dict[str, str]:
             "trigger_channel": "emCCD",
         }
     return {}
-
-
-DEFAULT_CAMERA_TRIGGER_CHANNELS = ("emCCD",)
-
-
-def count_trigger_pulses(sequence: PulseSequence, *, trigger_channels: Sequence[str] = DEFAULT_CAMERA_TRIGGER_CHANNELS) -> int:
-    """Count rising camera-trigger pulses in a sequence."""
-
-    channels = set(channel_names(trigger_channels, "trigger_channels"))
-    base_count = sum(1 for pulse in sequence.base_pulses() if pulse.value and pulse.channel in channels)
-    if sequence.repeat_forever:
-        return base_count
-    return base_count * int(sequence.repeat_count)
-
-
-def sequence_for_frame_count(
-    sequence: PulseSequence,
-    frames: int,
-    *,
-    trigger_channels: Sequence[str] = DEFAULT_CAMERA_TRIGGER_CHANNELS,
-) -> PulseSequence:
-    """Return a sequence whose camera-trigger count matches ``frames``.
-
-    Single-shot imaging sequences are common in notebooks.  Real qCMOS
-    multi-frame acquisitions still need one hardware trigger per frame, so a
-    one-trigger sequence is repeated automatically.  Ambiguous sequences fail
-    early instead of timing out after the camera is armed.
-    """
-
-    frames = positive_int(frames, "frames")
-    triggers = count_trigger_pulses(sequence, trigger_channels=trigger_channels)
-    if triggers == frames:
-        return sequence
-    if triggers == 1 and frames > 1:
-        return sequence.repeated(frames)
-    raise ValueError(
-        f"sequence {sequence.name!r} has {triggers} camera trigger pulses, "
-        f"but acquisition requested {frames} frame(s)."
-    )
 
 
 def probe_channel_set(channel: str) -> list[str]:
@@ -577,15 +544,12 @@ __all__ = [
     "Pulse",
     "PulseReport",
     "PulseSequence",
-    "DEFAULT_CAMERA_TRIGGER_CHANNELS",
     "READOUT_GAP_SECONDS",
-    "count_trigger_pulses",
     "exposure_from_sequence",
     "imaging_channel_kwargs",
     "imaging_sequence",
     "plot_sequence",
     "probe_channel_set",
     "reference_bracket_sequence",
-    "sequence_for_frame_count",
     "snap_seconds_to_clock",
 ]

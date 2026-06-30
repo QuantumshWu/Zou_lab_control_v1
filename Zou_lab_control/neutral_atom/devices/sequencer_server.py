@@ -11,7 +11,7 @@ import socket
 import subprocess
 from typing import Sequence
 
-from .sequencer import DEFAULT_CAMERA_TRIGGER_CHANNELS, DEFAULT_RUNTIME_CLOCK_HZ, RuntimeSequenceProgram, SequencerService, serve_runtime_sequencer
+from .sequencer import DEFAULT_RUNTIME_CLOCK_HZ, RuntimeSequenceProgram, SequencerService, serve_runtime_sequencer
 
 
 @dataclass
@@ -80,7 +80,6 @@ class CommandSequencerBackend:
             env["ZLC_SEQUENCE_NAME"] = program.sequence_name
             env["ZLC_CLOCK_HZ"] = str(program.clock_hz)
             env["ZLC_DURATION"] = str(program.duration)
-            env["ZLC_TRIGGER_COUNT"] = str(program.trigger_count)
         result = subprocess.run(
             command,
             shell=True,
@@ -124,7 +123,6 @@ def run_server(
     host: str = "0.0.0.0",
     port: int = 18861,
     clock_hz: float = DEFAULT_RUNTIME_CLOCK_HZ,
-    trigger_channels: Sequence[str] = DEFAULT_CAMERA_TRIGGER_CHANNELS,
     state_dir: str | Path = "zlc_sequencer_state",
     prepare_command: str | None = None,
     fire_command: str | None = None,
@@ -196,7 +194,6 @@ def run_server(
     service = SequencerService(
         channels=channels,
         clock_hz=clock_hz,
-        trigger_channels=trigger_channels,
         prepare_callback=prepare_callback,
         fire_callback=fire_callback,
         wait_done_callback=wait_done_callback,
@@ -286,7 +283,6 @@ def build_arg_parser() -> ArgumentParser:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=18861)
     parser.add_argument("--channels", nargs="+", required=True, help="Sequencer channels, e.g. ch00 ch01 ... inferred from the selected XDC.")
-    parser.add_argument("--trigger-channels", nargs="+", default=list(DEFAULT_CAMERA_TRIGGER_CHANNELS))
     parser.add_argument("--clock-hz", type=float, default=DEFAULT_RUNTIME_CLOCK_HZ)
     parser.add_argument("--state-dir", default="zlc_sequencer_state")
     parser.add_argument("--prepare-command", default=None)
@@ -313,7 +309,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     run_server(
         channels=_split_channels(args.channels),
-        trigger_channels=_split_channels(args.trigger_channels),
         host=args.host,
         port=args.port,
         clock_hz=args.clock_hz,

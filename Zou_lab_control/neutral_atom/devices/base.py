@@ -10,6 +10,8 @@ from typing import Any
 
 import numpy as np
 
+from .camera_trigger import DEFAULT_CAMERA_TRIGGER_CHANNELS
+
 
 class AcquisitionCancelled(Exception):
     """Raised by ``acquire`` when its optional ``stop`` event fires mid-wait.
@@ -51,9 +53,22 @@ class CameraDevice(BaseDevice):
     never misses the extra ones and :meth:`latest` always holds the newest.  This
     lives on the base class, so the virtual and real cameras retain identically
     (virtual == real); subclasses only call :meth:`_retain` at the end of acquire.
+
+    A camera is a PURE frame-grabber: it arms for N frames and reads N externally
+    triggered frames (a real qCMOS: ``buf_alloc(N)`` -> ``cap_start`` -> wait for the
+    FPGA's hardware trigger edges -> ``buf_getframedata``).  It NEVER drives a sequencer,
+    NEVER counts triggers in a pulse, NEVER infers exposure -- the MEASUREMENT orchestrates
+    the shot (fire the sequencer, then read the camera).  The one thing a camera owns about
+    the wider system is ``capture_trigger_channels`` -- which sequencer line its hardware
+    trigger input is wired to -- a PASSIVE fact it exposes upward (so a measurement / the
+    virtual atom simulation can read the fired pulse), never used to control the sequencer.
     """
 
     recent_capacity: int = 16
+    #: Which sequencer channel(s) the camera's external-trigger input is wired to.  A passive
+    #: device property (the camera is the source of this wiring fact), default the conventional
+    #: ``emCCD`` line; a real camera is configured with its actual chNN at construction.
+    capture_trigger_channels: tuple[str, ...] = DEFAULT_CAMERA_TRIGGER_CHANNELS
 
     def bind_experiment(self, session) -> "CameraDevice":
         """Attach experiment defaults used by convenience methods like capture."""
@@ -103,44 +118,25 @@ class CameraDevice(BaseDevice):
         """Configure camera settings that are stable across an acquisition."""
 
     @abstractmethod
-    def acquire(self, frames: int | None = None, *, sequence=None, sequencer=None, **kwargs) -> list[np.ndarray]:
-        """Acquire camera frames and return one numpy array per frame.
+    def acquire(self, frames: int = 1, *, sequence=None, on_armed=None, stop=None, **kwargs) -> list[np.ndarray]:
+        """Arm for ``frames`` frames and return one numpy array per externally-triggered frame.
 
-        ``frames=None`` (the default) means **capture exactly one frame per camera trigger the
-        ``sequence`` carries** -- a real externally-triggered qCMOS does precisely this, so the
-        caller NEVER counts the sequence's triggers to tell the camera how many frames to take
-        (that was a coupling).  Pass an explicit ``frames`` ONLY for the repeat/live path: 1 for
-        a single live frame, or N to repeat a single-trigger pulse N times (averaging).  With no
-        sequence (live monitor) and ``frames=None`` it reads one frame off the streamer's current
-        firing.
+        The camera is a PURE grabber: ``frames`` is the count the MEASUREMENT wants (it knows
+        how many camera triggers its pulse carries -- e.g. ``frames_per_cycle`` for a live cycle,
+        or the bracket length for a calibration shot).  The camera does NOT count the sequence's
+        triggers, does NOT prepare/fire any sequencer, does NOT infer exposure.
 
-        Optional ``stop`` kwarg: a ``threading.Event`` a live logic node can set to
-        interrupt a blocking wait (e.g. a camera awaiting an external trigger
-        that never comes).  Implementations that honour it poll the event while
-        waiting and raise :class:`AcquisitionCancelled` when it is set, instead
-        of blocking for the full timeout; implementations that cannot interrupt
-        may ignore it."""
+        ``on_armed`` (optional) is a callback the camera invokes AFTER it has armed (a real
+        ``cap_start``) and BEFORE it waits -- so the measurement can fire the FPGA exactly when
+        the camera is ready for triggers (arm-before-fire), without the camera knowing anything
+        about the sequencer.  ``sequence`` (optional) is the fired pulse, passed purely so the
+        VIRTUAL camera can SIMULATE the frames it would have captured (a real camera ignores it --
+        its frames come from the sensor); ``None`` with no firing pulse -> no frame (the live image
+        freezes, exactly as a real externally-triggered camera produces nothing without triggers).
 
-    @staticmethod
-    def _resolve_frame_count(frames, sequence, sequencer) -> int:
-        """The frame count for :meth:`acquire`.  ``frames`` given -> that count (the repeat/live
-        path).  ``frames is None`` + a sequence -> the number of camera triggers IN the sequence
-        (the camera self-determines from the pulse, never told by the caller).  No sequence -> 1."""
-        from ..core.analysis import positive_int
-        if frames is not None:
-            return positive_int(frames, "frames")
-        if sequence is not None:
-            from ..timing import DEFAULT_CAMERA_TRIGGER_CHANNELS, count_trigger_pulses
-            trig = getattr(sequencer, "trigger_channels", None) or DEFAULT_CAMERA_TRIGGER_CHANNELS
-            try:
-                return max(1, int(count_trigger_pulses(sequence, trigger_channels=trig)))
-            except AttributeError:
-                # The object is not a countable PulseSequence (no base_pulses) -> a single frame.
-                # A genuine counting failure (ValueError on a malformed sequence) is NOT swallowed:
-                # silently dropping a multi-trigger reference bracket to 1 frame would corrupt the
-                # fidelity characterization with no signal to the user.
-                return 1
-        return 1
+        Optional ``stop``: a ``threading.Event`` a live logic node can set to interrupt a blocking
+        wait (a camera awaiting an external trigger that never comes).  Implementations that honour
+        it poll the event and raise :class:`AcquisitionCancelled` when set; others may ignore it."""
 
     # ----------------------------------------------------------- recent frames
     def _recent_state(self) -> dict:
@@ -228,7 +224,15 @@ class CameraDevice(BaseDevice):
             sequence = sequence or imaging_sequence(exposure=self.exposure, load=True)
             sequencer = explicit_sequencer
 
-        images = self.acquire(frames, sequence=sequence, sequencer=sequencer, **kwargs)
+        # Orchestrate the shot the decoupled way: the camera arms, then (on_armed) we fire the
+        # sequencer -- the camera never drives it.  ``sequence`` is handed in only so the virtual
+        # camera can simulate; a real camera reads the frames its hardware trigger gates.
+        on_armed = None
+        if sequencer is not None and sequence is not None:
+            def on_armed(_seq=sequence, _dev=sequencer):
+                _dev.prepare(_seq)
+                _dev.fire(_seq)
+        images = self.acquire(frames, sequence=sequence, on_armed=on_armed, **kwargs)
         plot = plot_image(images[-1], display=display)
         result = CaptureResult(images=images, sequence=sequence, plot=plot)
         if session is not None:

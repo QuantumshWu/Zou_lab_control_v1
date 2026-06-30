@@ -20,11 +20,8 @@ The reducer/plan unit facts (2 triggers, reducer needs 2 frames, plan rejects n!
 
 import inspect
 
-import pytest
-
 import Zou_lab_control.neutral_atom as na
 from Zou_lab_control.neutral_atom.operations.temperature import build_release_recapture_pulse
-from Zou_lab_control.neutral_atom.timing.sequence import sequence_for_frame_count
 
 
 def _release_recapture_sequence():
@@ -36,32 +33,22 @@ def _release_recapture_sequence():
                              time_step_ns=state.time_step_ns, expand_repeat=False)
 
 
-def test_release_recapture_is_two_trigger_single_loading_not_acquire_one():
-    """The coupled physics: the release-recapture pulse carries 2 camera triggers from ONE loading.
-    The device boundary REFUSES to acquire it as the decoupled tier's one-frame-per-point: a 2-trigger
-    sequence asked for 1 frame is a hard error.  Acquired as 2 frames it is returned UNCHANGED (the
-    single loading, both reads sharing it) -- never repeated into two independent reloads."""
+def test_release_recapture_is_two_trigger_single_loading():
+    """The coupled physics: the release-recapture pulse carries 2 camera triggers from ONE loading --
+    the pulse itself carries BOTH frames (trap-off between the triggers), so the coupled measurement
+    reads two frames of the SAME loading.  This is why survival cannot be the decoupled tier's
+    one-frame-per-point: the boundary is the 2-trigger single-loading sequence, pinned here."""
     seq = _release_recapture_sequence()
     assert na.count_trigger_pulses(seq, trigger_channels=["emCCD"]) == 2
 
-    # The decoupled node's per-point contract is acquire(1); feeding it this pulse is impossible.
-    with pytest.raises(ValueError):
-        sequence_for_frame_count(seq, 1, trigger_channels=["emCCD"])
 
-    # The coupled path acquires both triggers from the SAME sequence (one loading) -- unchanged.
-    assert sequence_for_frame_count(seq, 2, trigger_channels=["emCCD"]) is seq
-
-
-def test_one_trigger_imaging_acquired_as_two_is_independent_reloads():
-    """The contrast that makes survival irreducible to the decoupled tier: a 1-trigger imaging pulse
-    asked for 2 frames is REPEATED -> two independent loadings (a fresh reload between frames).  That
-    is fine for averaging an image, but it is the WRONG physics for survival (no shared loading), which
-    is exactly why release-recapture must stay a 2-trigger single sequence, not 2x acquire(1)."""
+def test_one_trigger_imaging_is_a_single_capture_edge():
+    """The contrast that makes survival irreducible to the decoupled tier: a single-image readout pulse
+    carries exactly ONE camera trigger.  Reading it for an N-frame average reloads atoms per frame (the
+    measurement reads N independent loadings) -- the WRONG physics for survival (no shared loading),
+    which is exactly why release-recapture must stay a 2-trigger single sequence."""
     img = na.imaging_sequence(exposure=2e-3, load=True)
     assert na.count_trigger_pulses(img) == 1
-    repeated = sequence_for_frame_count(img, 2)
-    assert repeated is not img                              # had to be expanded (reloaded), not shared
-    assert na.count_trigger_pulses(repeated) == 2
 
 
 def test_decoupled_pulse_scan_per_point_acquisition_is_acquire_one():
@@ -72,8 +59,10 @@ def test_decoupled_pulse_scan_per_point_acquisition_is_acquire_one():
     encroachment on the coupled physics -- changes this line and must reckon with the boundary here."""
     from Zou_lab_control.neutral_atom.operations import logic as logic_mod
 
-    node_src = inspect.getsource(logic_mod.PulseScanNode)
-    assert "acquire(1" in node_src, (
+    # Normalise whitespace so the contract holds regardless of how the acquire() call is wrapped
+    # across lines (the camera contract is acquire(frames, ...) -- frames=1 is the first positional).
+    node_src = " ".join(inspect.getsource(logic_mod.PulseScanNode).split())
+    assert "camera.acquire( 1," in node_src or "camera.acquire(1," in node_src, (
         "decoupled PulseScanNode must acquire exactly ONE frame per scan point; a multi-frame "
         "acquisition would encroach on the coupled survival/fidelity tier (see MAINTAINER_NOTES §19).")
 

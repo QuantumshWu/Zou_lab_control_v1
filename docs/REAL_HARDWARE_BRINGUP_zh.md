@@ -27,11 +27,14 @@
 
 ### 配置文件
 - [ ] `Zou_lab_control/neutral_atom/configs/remote_template.json` 按实际改:
-      `camera`(QCMOSCamera:exposure / roi / device_index / timeout_ms)、
-      `sequencer`(RemoteSequencer:**host / port** = FPGA 端 IP:端口、`channels`、`trigger_channels`)。
-- [ ] `channels` / `trigger_channels` 与板子 XDC 一致;成像默认用 `ch09=trap / ch00=cooling / ch03=probe`
-      + `trigger_channels[0]`(模板里是 `ch11`)。这套映射在 `session.py:_imaging_channel_kwargs` 里,
-      若通道名变了要同步。
+      `camera`(QCMOSCamera:exposure / roi / device_index / timeout_ms、`capture_trigger_channels`)、
+      `sequencer`(RemoteSequencer:**host / port** = FPGA 端 IP:端口、`channels`)。
+      序列器是纯脉冲流送器,不再有 `trigger_channels`:相机被哪条线触发是**相机**的属性
+      (`camera.config.capture_trigger_channels`),由相机持有、向上暴露,序列器不感知。
+- [ ] `channels` 与板子 XDC 一致;`capture_trigger_channels` 是相机外部触发接的那条线(模板里是 `ch11`)。
+      成像默认用 `ch09=trap / ch00=cooling / ch03=probe` + 相机的 `capture_trigger_channels[0]`。
+      这套映射在 `session.py:_imaging_channel_kwargs` 里(它从 `camera.capture_trigger_channels[0]`
+      取触发通道喂给 `imaging_channel_kwargs`),若通道名变了要同步。
 
 ---
 
@@ -107,7 +110,7 @@ python task_console.py --config remote_template.json --grid 5x7
 | `ConnectionRefused` / `socket.timeout` | server 没起 / IP 端口错 / 防火墙 | 先起 `run_server.bat`;核对 `remote_template.json` 的 host:port;放行端口 |
 | 首次 `prepare()` 报 `register-layout mismatch` | bitstream 旧,LAYOUT_ID 与 host 不符 | 重 build + 重烧 bitstream + 重启 server(这是保护,别绕过) |
 | server 起不来 / JTAG 报错 | hw_server 没起 / JTAG 接触 / 板掉电 | 查电源、JTAG 线;Vivado 硬件管理器单独验证 |
-| `qCMOS timed out` 等不到帧 | 相机收不到触发(通道/触发名不匹配) | 核对 XDC 与 config 的 `channels`/`trigger_channels`;示波器看触发线 |
+| `qCMOS timed out` 等不到帧 | 相机收不到触发(通道/触发名不匹配) | 核对 XDC 的 `channels` 与相机 config 的 `capture_trigger_channels`;示波器看触发线 |
 
 > 真机出问题先翻 memory 根因记录(`register-layout-handshake` / `stale-bus-delay` / `prefetch-pipeline-depth`
 > / `fire-seed-stale-count` 等)与 `docs/MAINTAINER_NOTES.md`,多数历史坑已在那里定位过。

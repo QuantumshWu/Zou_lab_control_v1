@@ -16,14 +16,11 @@ from Zou_lab_control._paths import GENERATED_SEQUENCES_DIR
 from ..core.analysis import nonnegative_float, positive_int
 from .base import SequencerDevice
 from ..timing import (
-    DEFAULT_CAMERA_TRIGGER_CHANNELS,
     PulseSequence,
     PulseTableState,
     affine_coeffs,
     channel_names,
-    count_trigger_pulses,
     positive_float,
-    sequence_for_frame_count,
     slot_var,
 )
 from ..timing.pulse_table import (
@@ -148,7 +145,7 @@ class RuntimeBusSegment:
 
 # Serialized RuntimeSequenceProgram schema version -- ONE source, written by to_dict AND checked by
 # from_dict (#G4) so a future schema bump fails fast with a rebuild message instead of mis-decoding.
-_RUNTIME_PROGRAM_VERSION = 2
+_RUNTIME_PROGRAM_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -162,7 +159,6 @@ class RuntimeSequenceProgram:
     ticks: list[int]
     masks: list[int]
     duration: float
-    trigger_count: int
     source_sequence: dict[str, Any] | None = None
     source_table: dict[str, Any] | None = None
     repeat_forever: bool = False
@@ -224,7 +220,6 @@ class RuntimeSequenceProgram:
             "ticks": list(self.ticks),
             "masks": list(self.masks),
             "duration": self.duration,
-            "trigger_count": self.trigger_count,
             "repeat_forever": bool(self.repeat_forever),
             "loop_start_index": int(self.loop_start_index),
             "loop_end_tick": int(self.loop_end_tick),
@@ -273,7 +268,6 @@ class RuntimeSequenceProgram:
             ticks=[int(v) for v in payload["ticks"]],
             masks=[int(v) for v in payload["masks"]],
             duration=float(payload["duration"]),
-            trigger_count=int(payload["trigger_count"]),
             source_sequence=None if payload.get("source_sequence") is None else dict(payload["source_sequence"]),
             source_table=None if payload.get("source_table") is None else dict(payload["source_table"]),
             repeat_forever=bool(payload.get("repeat_forever", False)),
@@ -342,7 +336,6 @@ def compile_runtime_program(
     *,
     channels: Sequence[str],
     clock_hz: float = DEFAULT_RUNTIME_CLOCK_HZ,
-    trigger_channels: Sequence[str] = DEFAULT_CAMERA_TRIGGER_CHANNELS,
 ) -> RuntimeSequenceProgram:
     """Compile a ``PulseSequence`` into an uploadable edge table."""
 
@@ -377,7 +370,6 @@ def compile_runtime_program(
         ticks=list(ticks),
         masks=list(masks),
         duration=sequence.duration,
-        trigger_count=count_trigger_pulses(sequence, trigger_channels=trigger_channels),
         source_sequence=sequence.to_dict(),
         repeat_forever=bool(sequence.repeat_forever),
         loop_start_index=0,
@@ -402,7 +394,6 @@ def compile_pulse_table_runtime_program(
     *,
     channels: Sequence[str] | None = None,
     clock_hz: float = DEFAULT_RUNTIME_CLOCK_HZ,
-    trigger_channels: Sequence[str] = DEFAULT_CAMERA_TRIGGER_CHANNELS,
     slots: Mapping[str, float] | None = None,
     repeat_forever: bool = True,
 ) -> RuntimeSequenceProgram:
@@ -435,7 +426,6 @@ def compile_pulse_table_runtime_program(
             unrolled,
             channels=channels,
             clock_hz=clock_hz,
-            trigger_channels=trigger_channels,
             slots=slots,
             repeat_forever=repeat_forever,
         )
@@ -525,7 +515,6 @@ def compile_pulse_table_runtime_program(
         ticks=list(ticks),
         masks=list(masks),
         duration=effective_duration_ticks / clock_hz,
-        trigger_count=_pulse_table_trigger_count(state, trigger_channels=trigger_channels),
         source_sequence=sequence.to_dict(),
         source_table=state.to_dict(),
         repeat_forever=bool(repeat_forever),
@@ -547,7 +536,6 @@ def compile_pulse_table_scan_runtime_program(
     scan_table: Sequence[Sequence[float]] | None = None,
     channels: Sequence[str] | None = None,
     clock_hz: float = DEFAULT_RUNTIME_CLOCK_HZ,
-    trigger_channels: Sequence[str] = DEFAULT_CAMERA_TRIGGER_CHANNELS,
     repeat_forever: bool = False,
     coeff_frac_bits: int = 8,
 ) -> RuntimeSequenceProgram:
@@ -582,7 +570,6 @@ def compile_pulse_table_scan_runtime_program(
             scan_table=scan_table,
             channels=channels,
             clock_hz=clock_hz,
-            trigger_channels=trigger_channels,
             repeat_forever=repeat_forever,
             coeff_frac_bits=coeff_frac_bits,
         )
@@ -759,7 +746,6 @@ def compile_pulse_table_scan_runtime_program(
         for point in points_ticks
     ]
     sequence = state.to_sequence(slots=point_slots_ns(table[0]), time_step_ns=clock_step_ns, expand_repeat=False)
-    trigger_count = _pulse_table_trigger_count(state, trigger_channels=trigger_channels) * len(points_ticks)
     slot_kinds = [slot.kind for slot in state.scan_slots]
     source_table = state.to_dict()
     source_table["scan_table"] = [list(row) for row in table]
@@ -797,7 +783,6 @@ def compile_pulse_table_scan_runtime_program(
         ticks=ticks,
         masks=masks,
         duration=sum(point_durations),
-        trigger_count=trigger_count,
         source_sequence=sequence.to_dict(),
         source_table=source_table,
         repeat_forever=bool(repeat_forever),
@@ -825,7 +810,6 @@ def compile_runtime_program_for_payload(
     *,
     channels: Sequence[str],
     clock_hz: float = DEFAULT_RUNTIME_CLOCK_HZ,
-    trigger_channels: Sequence[str] = DEFAULT_CAMERA_TRIGGER_CHANNELS,
 ) -> RuntimeSequenceProgram:
     """Compile either finite sequence data or GUI pulse-table data."""
 
@@ -841,7 +825,6 @@ def compile_runtime_program_for_payload(
                 payload,
                 channels=channels,
                 clock_hz=clock_hz,
-                trigger_channels=trigger_channels,
                 scan_table=payload.scan_table,
                 repeat_forever=payload.repeat_forever,
             )
@@ -849,40 +832,9 @@ def compile_runtime_program_for_payload(
             payload,
             channels=channels,
             clock_hz=clock_hz,
-            trigger_channels=trigger_channels,
             repeat_forever=payload.repeat_forever,
         )
-    return compile_runtime_program(payload, channels=channels, clock_hz=clock_hz, trigger_channels=trigger_channels)
-
-
-def finite_frame_sequence(
-    payload: PulseSequence | PulseTableState,
-    frames: int,
-    *,
-    trigger_channels: Sequence[str] = DEFAULT_CAMERA_TRIGGER_CHANNELS,
-) -> PulseSequence:
-    """Return a finite ``PulseSequence`` with exactly ``frames`` trigger rises."""
-
-    frames = positive_int(frames, "frames")
-    trigger_channels = tuple(channel_names(trigger_channels, "trigger_channels"))
-    if isinstance(payload, PulseTableState):
-        slots = payload.reference_slots()
-        sequence = payload.to_sequence(slots=slots, time_step_ns=payload.time_step_ns, expand_repeat=False)
-        base_period_s = sum(
-            period.duration_steps(slots=slots, time_step_ns=payload.time_step_ns) for period in payload.periods
-        ) * payload.time_step_ns * 1e-9
-        triggers = count_trigger_pulses(sequence, trigger_channels=trigger_channels)
-        if triggers == frames:
-            return sequence
-        if triggers == 1 and frames > 1:
-            return sequence.repeated(frames, period=base_period_s)
-        raise ValueError(
-            f"sequence {sequence.name!r} has {triggers} camera trigger pulses, "
-            f"but acquisition requested {frames} frame(s)."
-        )
-    if isinstance(payload, PulseSequence):
-        return sequence_for_frame_count(payload, frames, trigger_channels=trigger_channels)
-    raise TypeError("frame acquisition sequence must be a PulseSequence or PulseTableState.")
+    return compile_runtime_program(payload, channels=channels, clock_hz=clock_hz)
 
 
 class SequencerService:
@@ -898,7 +850,6 @@ class SequencerService:
         *,
         channels: Sequence[str],
         clock_hz: float = DEFAULT_RUNTIME_CLOCK_HZ,
-        trigger_channels: Sequence[str] = DEFAULT_CAMERA_TRIGGER_CHANNELS,
         prepare_callback: Callable[[RuntimeSequenceProgram], None] | None = None,
         fire_callback: Callable[[RuntimeSequenceProgram], None] | None = None,
         wait_done_callback: Callable[[RuntimeSequenceProgram, float | None], bool] | None = None,
@@ -909,7 +860,6 @@ class SequencerService:
     ):
         self.channels = list(channel_names(channels, "channels"))
         self.clock_hz = positive_float(clock_hz, "clock_hz")
-        self.trigger_channels = tuple(channel_names(trigger_channels, "trigger_channels"))
         self.prepare_callback = prepare_callback
         self.fire_callback = fire_callback
         self.wait_done_callback = wait_done_callback
@@ -938,7 +888,6 @@ class SequencerService:
                 timing_payload,
                 channels=self.channels,
                 clock_hz=self.clock_hz,
-                trigger_channels=self.trigger_channels,
             )
             # Backstop: validate the compiled program against the FPGA geometry / delay-line
             # depth REGARDLESS of which backend's prepare_callback runs.  An AXI backend
@@ -990,7 +939,6 @@ class SequencerService:
                 {
                     "action": "prepare",
                     "sequence_id": program.sequence_id,
-                    "triggers": program.trigger_count,
                     "cached": cached,
                 }
             )
@@ -1022,7 +970,6 @@ class SequencerService:
                     timing_from_payload(sequence_payload),
                     channels=self.channels,
                     clock_hz=self.clock_hz,
-                    trigger_channels=self.trigger_channels,
                 )
                 if requested.sequence_id != program.sequence_id:
                     raise RuntimeError("fire(sequence) does not match the prepared runtime program.")
@@ -1109,7 +1056,6 @@ class SequencerService:
                 "type": type(self).__name__,
                 "channels": list(self.channels),
                 "clock_hz": self.clock_hz,
-                "trigger_channels": list(self.trigger_channels),
                 "state": self.state,
                 "cache_prepared": self.cache_prepared,
                 "prepared_program": None if self.prepared_program is None else self.prepared_program.to_dict(),
@@ -1134,18 +1080,15 @@ class RuntimeSequencer(SequencerDevice):
         *,
         channels: Sequence[str],
         clock_hz: float = DEFAULT_RUNTIME_CLOCK_HZ,
-        trigger_channels: Sequence[str] = DEFAULT_CAMERA_TRIGGER_CHANNELS,
         sleep_scale: float = 0.0,
     ):
         self.service = SequencerService(
             channels=channels,
             clock_hz=clock_hz,
-            trigger_channels=trigger_channels,
             sleep_scale=sleep_scale,
         )
         self.channels = self.service.channels
         self.clock_hz = self.service.clock_hz
-        self.trigger_channels = self.service.trigger_channels
         self.last_program: RuntimeSequenceProgram | None = None
 
     def prepare(self, sequence: PulseSequence | PulseTableState) -> RuntimeSequenceProgram:
@@ -1193,12 +1136,10 @@ class ManualSequencer(SequencerDevice):
         *,
         channels: Sequence[str],
         clock_hz: float = DEFAULT_RUNTIME_CLOCK_HZ,
-        trigger_channels: Sequence[str] = DEFAULT_CAMERA_TRIGGER_CHANNELS,
         message: str | None = None,
     ):
         self.channels = list(channel_names(channels, "channels"))
         self.clock_hz = positive_float(clock_hz, "clock_hz")
-        self.trigger_channels = tuple(channel_names(trigger_channels, "trigger_channels"))
         self.message = message or "Camera is armed. Start the FPGA/manual trigger sequence now."
         self.prepared_sequence: PulseSequence | None = None
         self.state = "idle"
@@ -1210,11 +1151,10 @@ class ManualSequencer(SequencerDevice):
             sequence,
             channels=self.channels,
             clock_hz=self.clock_hz,
-            trigger_channels=self.trigger_channels,
         )
         self.prepared_sequence = sequence
         self.state = "prepared"
-        self.history.append({"action": "prepare", "sequence_id": program.sequence_id, "triggers": program.trigger_count})
+        self.history.append({"action": "prepare", "sequence_id": program.sequence_id})
         return program
 
     def fire(self, sequence: PulseSequence | None = None) -> None:
@@ -1244,7 +1184,6 @@ class ManualSequencer(SequencerDevice):
             "type": type(self).__name__,
             "channels": list(self.channels),
             "clock_hz": self.clock_hz,
-            "trigger_channels": list(self.trigger_channels),
             "state": self.state,
             "prepared": self.prepared_sequence is not None,
             "history_length": len(self.history),
@@ -1261,7 +1200,6 @@ class RemoteSequencer(SequencerDevice):
         port: int,
         channels: Sequence[str],
         clock_hz: float = DEFAULT_RUNTIME_CLOCK_HZ,
-        trigger_channels: Sequence[str] = DEFAULT_CAMERA_TRIGGER_CHANNELS,
         ssl: bool = False,
         ca_certs: str | None = None,
         connect_on_init: bool = False,
@@ -1272,7 +1210,6 @@ class RemoteSequencer(SequencerDevice):
         self.port = int(port)
         self.channels = list(channel_names(channels, "channels"))
         self.clock_hz = positive_float(clock_hz, "clock_hz")
-        self.trigger_channels = tuple(channel_names(trigger_channels, "trigger_channels"))
         self.ssl = bool(ssl)
         self.ca_certs = ca_certs
         self._conn = None
@@ -1304,7 +1241,6 @@ class RemoteSequencer(SequencerDevice):
         snap = self._conn.root.snapshot()
         self.channels = list(snap.get("channels", self.channels))
         self.clock_hz = float(snap.get("clock_hz", self.clock_hz))
-        self.trigger_channels = tuple(channel_names(snap.get("trigger_channels", self.trigger_channels), "trigger_channels"))
         return self
 
     def prepare(self, sequence: PulseSequence | PulseTableState) -> RuntimeSequenceProgram:
@@ -1353,7 +1289,6 @@ class RemoteSequencer(SequencerDevice):
             "port": self.port,
             "channels": list(self.channels),
             "clock_hz": self.clock_hz,
-            "trigger_channels": list(self.trigger_channels),
             "connected": self._conn is not None,
             "last_program": None if self._last_program is None else self._last_program.to_dict(),
         }
@@ -1435,6 +1370,55 @@ class PulseController:
         self.scan_table = [[float(v) for v in row] for row in array]
         return self
 
+    def frame_sequence(
+        self,
+        frames: int,
+        *,
+        time_ns: float | None = None,
+        slots: Mapping[str, float] | None = None,
+        trigger_channels: Sequence[str] | None = None,
+    ) -> PulseSequence:
+        """Resolve the bound pulse at the requested ``time_ns``/``slots`` and return it as a finite
+        ``PulseSequence`` for one scan point.
+
+        The pulse carries its OWN camera triggers (a single-image readout pulse has one; a
+        release-recapture bracket has two with the trap-off period between them), so this NEVER
+        expands a one-trigger pulse into N copies -- the measurement reads ``frames`` capture windows
+        from the sequence the pulse already defines (a multi-trigger bracket is ONE loading read
+        twice; a one-trigger pulse read N times is N independent reloads, decided per frame by the
+        atom device).  ``frames``/``trigger_channels`` are accepted for the scan-engine + session
+        adapter contract but no longer drive any 1->N rewrite -- which channel gates a frame is the
+        CAMERA's property, parsed downstream from its ``capture_trigger_channels``."""
+
+        positive_int(frames, "frames")
+        merged = dict(slots or {})
+        if time_ns is not None:
+            name = self.pulse.primary_time_slot() if isinstance(self.pulse, PulseTableState) else None
+            if name is None:
+                raise TypeError("pulse has no duration/delay scan slot to set from time_ns.")
+            merged[name] = float(time_ns)
+        payload = self.payload(slots=merged, scan_table=[], repeat_forever=False)
+        if isinstance(payload, PulseTableState):
+            ref_slots = payload.reference_slots()
+            sequence = payload.to_sequence(
+                slots=ref_slots, time_step_ns=payload.time_step_ns, expand_repeat=False)
+            # ``to_sequence`` returns only the pulse EDGES, so a trailing all-low period (a gap the
+            # table defines AFTER the last edge) is invisible in the edge list -- its duration would
+            # be dropped, shortening the fired program by that tail.  The program must run the WHOLE
+            # cycle the table defines (the edges PLUS any trailing gap), so pin the sequence period to
+            # the table's ONE-CYCLE duration.  Sum the RAW periods (NOT expanded_periods): an inner
+            # finite-repeat bracket is the streamer's OWN affine loop, not a frame the camera reads,
+            # so unrolling it here would inflate the cycle; ``to_sequence(expand_repeat=False)`` keeps
+            # the same single-cycle view.  With no trailing gap this is the no-op identity.
+            step_ns = payload.time_step_ns
+            cycle_steps = sum(period.duration_steps(slots=ref_slots, time_step_ns=step_ns)
+                              for period in payload.periods)
+            cycle_s = cycle_steps * step_ns * 1e-9
+            if cycle_s > sequence.base_duration + 1e-15:
+                sequence = sequence.repeated(1, period=cycle_s)
+            return sequence
+        return payload
+
     def payload(
         self,
         *,
@@ -1456,23 +1440,27 @@ class PulseController:
             else:
                 payload = self.pulse
             # repeat_forever / scan_repeats overrides go through the dict (the same seam the GUI /
-            # save bundle use).  scan_repeats=K>0 means "play K whole sweeps then stop" -- which IS a
-            # STREAMED scan the host halts after K sweeps, so it IMPLIES repeat_forever (a bare
-            # repeat_forever=False + scan_repeats>0 would otherwise silently play just once).  And the
-            # host counts sweeps from the streamed cursor's WRAP, which a SINGLE scan point never
-            # produces, so a finite K-sweep scan needs >= 2 points -- else it would never stop on real
-            # hardware; we reject here (the shared fire seam) so virtual == real (both refuse it).
+            # save bundle use).  A STREAMED scan (bound slots + a scan table) ALWAYS streams its
+            # scan-point bank cyclically: ``scan_repeats`` alone controls the host-side STOP -- 0 =
+            # sweep forever (the default), K>=1 = halt after K whole sweeps.  So such a payload is
+            # repeat_forever REGARDLESS of the whole-table flag (a bare repeat_forever=False would
+            # otherwise compile as a play-once program: On Pulse fires the scan once and nothing keeps
+            # running -- exactly the "scan_repeats=0 does nothing" bug).  The host counts sweeps from
+            # the streamed cursor's WRAP, which a SINGLE scan point never produces, so a finite K-sweep
+            # scan needs >= 2 points -- else it would never stop on real hardware; we reject here (the
+            # shared fire seam) so virtual == real (both refuse it).
             eff_repeats = max(0, int(scan_repeats)) if scan_repeats is not None else int(getattr(payload, "scan_repeats", 0))
-            if repeat_forever is not None or scan_repeats is not None or eff_repeats > 0:
+            is_streamed_scan = bool(getattr(payload, "scan_slots", None)) and len(getattr(payload, "scan_table", None) or ()) > 0
+            if repeat_forever is not None or scan_repeats is not None or eff_repeats > 0 or is_streamed_scan:
                 data = payload.to_dict()
-                if eff_repeats > 0:
-                    if len(payload.scan_table) == 1:
+                if is_streamed_scan:
+                    if eff_repeats > 0 and len(payload.scan_table) == 1:
                         raise ValueError(
                             "a finite scan-repeat (scan_repeats > 0) needs at least 2 scan points: the host "
                             "counts whole sweeps from the streamed cursor's wrap, which a single point never "
                             "produces (it would never stop). Add scan points, or use repeat_forever=False for "
                             "a single finite shot.")
-                    data["repeat_forever"] = True          # a finite K-sweep scan must stream to be stopped
+                    data["repeat_forever"] = True          # a streamed scan must stream (0=forever, K=stop after K)
                 elif repeat_forever is not None:
                     data["repeat_forever"] = bool(repeat_forever)
                 data["scan_repeats"] = eff_repeats
@@ -1483,30 +1471,6 @@ class PulseController:
             data["repeat_forever"] = bool(repeat_forever)
             return PulseSequence.from_dict(data)
         return self.pulse
-
-    def frame_sequence(
-        self,
-        frames: int,
-        *,
-        time_ns: float | None = None,
-        slots: Mapping[str, float] | None = None,
-        trigger_channels: Sequence[str] | None = None,
-    ) -> PulseSequence:
-        """Return a finite ``PulseSequence`` with exactly ``frames`` triggers."""
-
-        frames = positive_int(frames, "frames")
-        trigger_channels = tuple(channel_names(
-            getattr(self.sequencer, "trigger_channels", DEFAULT_CAMERA_TRIGGER_CHANNELS) if trigger_channels is None else trigger_channels,
-            "trigger_channels",
-        ))
-        merged = dict(slots or {})
-        if time_ns is not None:
-            name = self.pulse.primary_time_slot() if isinstance(self.pulse, PulseTableState) else None
-            if name is None:
-                raise TypeError("pulse has no duration/delay scan slot to set from time_ns.")
-            merged[name] = float(time_ns)
-        payload = self.payload(slots=merged, scan_table=[], repeat_forever=False)
-        return finite_frame_sequence(payload, frames, trigger_channels=trigger_channels)
 
     def prepare(
         self,
@@ -1643,7 +1607,6 @@ class PulseController:
                 "sequence_name": self.last_program.sequence_name,
                 "channels": list(self.last_program.channels),
                 "edge_count": len(self.last_program.ticks),
-                "trigger_count": int(self.last_program.trigger_count),
                 "duration": float(self.last_program.duration),
                 "repeat_forever": bool(self.last_program.repeat_forever),
                 "loop_count": int(self.last_program.loop_count),
@@ -1656,7 +1619,6 @@ class PulseController:
             "sequencer_type": type(self.sequencer).__name__,
             "sequencer_channels": list(getattr(self.sequencer, "channels", [])),
             "clock_hz": float(getattr(self.sequencer, "clock_hz", 0.0)),
-            "trigger_channels": list(getattr(self.sequencer, "trigger_channels", [])),
             "last_program": last,
         }
 
@@ -2520,30 +2482,6 @@ def _check_unrolled_edge_budget(
             "OUTER loop, fewer inner iterations, or remove the channel delay so the bracket can "
             "stay a compact hardware loop instead of being unrolled."
         )
-
-
-def _pulse_table_trigger_count(
-    state: PulseTableState,
-    *,
-    trigger_channels: Sequence[str],
-) -> int:
-    trigger_channels = list(channel_names(trigger_channels, "trigger_channels", allow_empty=True))
-    total = 0
-    counted: set[str] = set()
-    for trigger in trigger_channels:
-        candidates = [trigger] if trigger in state.channels else []
-        trigger_label = str(trigger).strip().lower()
-        candidates.extend(
-            channel
-            for channel, label in state.channel_labels.items()
-            if channel in state.channels and str(label).strip().lower() == trigger_label
-        )
-        for channel in candidates:
-            if channel in counted:
-                continue
-            counted.add(channel)
-            total += _pulse_table_channel_rises(state, channel)
-    return total
 
 
 def _pulse_table_channel_rises(state: PulseTableState, channel: str) -> int:

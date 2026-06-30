@@ -14,7 +14,7 @@ import argparse
 import os
 from pathlib import Path
 import sys
-from typing import Mapping, Sequence
+from typing import Sequence
 
 
 DEFAULT_PULSE_GUI_FALLBACK_CHANNELS = 62
@@ -27,18 +27,6 @@ def _default_channels(count: int) -> list[str]:
     if count <= 0:
         raise argparse.ArgumentTypeError("channel count must be positive.")
     return [f"ch{i:02d}" for i in range(count)]
-
-
-def _resolve_trigger_channels(args, channels: Sequence[str], channel_labels: Mapping[str, str] | None = None) -> list[str]:
-    if args.trigger_channels:
-        return [str(channel) for channel in args.trigger_channels]
-    labels = {str(channel): str(label).strip().lower() for channel, label in dict(channel_labels or {}).items()}
-    for channel in channels:
-        if labels.get(str(channel)) == "emccd":
-            return [str(channel)]
-    if "emCCD" in channels:
-        return ["emCCD"]
-    raise ValueError("No default emCCD trigger channel was found. Provide --trigger-channels explicitly after confirming the camera trigger output.")
 
 
 def _positive_float(text: str) -> float:
@@ -87,7 +75,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Maximum channel count accepted from --xdc. Omit for no GUI-side limit.",
     )
     parser.add_argument("--clock-hz", type=_positive_float, default=50_000_000.0, help="Sequencer clock in Hz.")
-    parser.add_argument("--trigger-channels", nargs="+", help="Hardware channel names counted as camera triggers.")
     parser.add_argument(
         "--scale",
         type=_positive_float,
@@ -176,15 +163,12 @@ def _resolve_channel_pins(args, channels: Sequence[str]) -> dict[str, str]:
 
 def _connect_remote_or_offline(args, state, na, *, explicit_remote: bool):
     seed_channels = _resolve_channels(args, state)
-    seed_labels = _resolve_channel_labels(args, seed_channels, state)
-    seed_trigger_channels = _resolve_trigger_channels(args, seed_channels, seed_labels)
     try:
         sequencer = na.RemoteSequencer(
             host=args.remote_host,
             port=args.remote_port,
             channels=seed_channels,
             clock_hz=args.clock_hz,
-            trigger_channels=seed_trigger_channels,
             connect_on_init=True,
         )
     except Exception as exc:
@@ -198,8 +182,8 @@ def _connect_remote_or_offline(args, state, na, *, explicit_remote: bool):
         # No server listening is the normal offline case -- print a clean one-liner, not
         # the raw ConnectionRefusedError traceback (it reads as a scary error otherwise).
         print(f"ZLC pulse GUI: {notice}")
-        return None, seed_channels, seed_trigger_channels, notice
-    return sequencer, list(sequencer.channels), list(sequencer.trigger_channels), None
+        return None, seed_channels, notice
+    return sequencer, list(sequencer.channels), None
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -221,7 +205,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     startup_notice = None
     if not args.no_sequencer:
         if explicit_remote:
-            sequencer, channels, trigger_channels, startup_notice = _connect_remote_or_offline(
+            sequencer, channels, startup_notice = _connect_remote_or_offline(
                 args,
                 state,
                 na,
@@ -232,19 +216,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             # Connection control lets you switch to a remote FPGA server
             # (host:port) or offline AFTER opening -- the backend is no longer
             # fixed on the command line.  An explicit --remote-host still
-            # auto-connects at launch for scripted/headless use.
+            # auto-connects at launch for scripted/headless use.  The sequencer is
+            # a pure streamer; which line gates a camera is the CAMERA's property,
+            # so the pulse editor never seeds a trigger channel.
             channels = _resolve_channels(args, state)
             channel_labels = _resolve_channel_labels(args, channels, state)
-            trigger_channels = _resolve_trigger_channels(args, channels, channel_labels)
             sequencer = na.RuntimeSequencer(
                 channels=channels,
                 clock_hz=args.clock_hz,
-                trigger_channels=trigger_channels,
             )
     else:
         channels = _resolve_channels(args, state)
         channel_labels = _resolve_channel_labels(args, channels, state)
-        trigger_channels = _resolve_trigger_channels(args, channels, channel_labels)
 
     if state is not None and list(state.channels) != list(channels):
         if all(channel in channels for channel in state.channels):

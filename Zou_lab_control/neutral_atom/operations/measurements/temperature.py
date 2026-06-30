@@ -39,15 +39,16 @@ def _match_imaging_exposure(state: PulseTableState, exposure_s: float) -> None:
             state.set_period_duration(i, ns, unit="ns")
 
 
-def _resolve_release_recapture_template(template: str, sequencer) -> PulseTableState:
+def _resolve_release_recapture_template(template: str, sequencer, *, trigger_channel: str | None = None) -> PulseTableState:
     """Load the release-recapture pulse the operator SELECTED and map its role channels onto whatever
     THIS sequencer exposes.  When the template's channels are already all on the sequencer (the virtual
     roles, or a real-channel template the operator shipped) it is used AS-IS, so its tuned durations are
     honoured.  When they are NOT (a role-named template on a real ``ch00..`` streamer) the standard
     release-recapture is rebuilt with the session channels via ``imaging_channel_kwargs`` -- the SAME
     role->channel single source as the imaging path -- so a role-named template still fires on real
-    hardware.  Either way the result keeps the trap-off duration scan slot ``build_temperature_scan``
-    requires."""
+    hardware.  ``trigger_channel`` is the CAMERA's ``capture_trigger_channels[0]`` (the sequencer no
+    longer owns it): a real chNN streamer needs it to map the camera trigger onto a real channel.  Either
+    way the result keeps the trap-off duration scan slot ``build_temperature_scan`` requires."""
     text = str(template or "").strip() or DEFAULT_RR_TEMPLATE
     path = Path(text)
     if not path.is_file():
@@ -58,7 +59,7 @@ def _resolve_release_recapture_template(template: str, sequencer) -> PulseTableS
     chans = list(getattr(sequencer, "channels", ()) or ())
     if chans and all(c in chans for c in loaded.channels):
         return loaded                                # channels already match -> honour the template
-    kw = imaging_channel_kwargs(sequencer)
+    kw = imaging_channel_kwargs(sequencer, trigger_channel=trigger_channel)
     role_kwargs = {k: kw[k] for k in ("trap_channel", "probe_channel", "trigger_channel") if k in kw}
     return build_release_recapture_pulse(channels=chans or list(loaded.channels), **role_kwargs)
 
@@ -71,8 +72,13 @@ def temperature_release_recapture(readout) -> MeasurementSpec:
         t_min_us, t_max_us, points = axis_range_tuple(t_off, "t_off")
         t_off_s = np.linspace(float(t_min_us) * 1e-6, float(t_max_us) * 1e-6, int(points))
         # The SELECTED release-recapture pulse, channel-mapped to this sequencer (real ch00.. vs
-        # virtual roles).  Its trap-off duration slot s0 is the t_off scan axis.
-        state = _resolve_release_recapture_template(template, s.devices.sequencer)
+        # virtual roles).  Its trap-off duration slot s0 is the t_off scan axis.  The CAMERA owns
+        # the capture-trigger line now, so its channel is threaded in for a real chNN streamer.
+        cam = getattr(s.devices, "camera", None)
+        cam_trig = getattr(cam, "capture_trigger_channels", None)
+        state = _resolve_release_recapture_template(
+            template, s.devices.sequencer, trigger_channel=(cam_trig[0] if cam_trig else None),
+        )
         # Image the survival frames at the SAME exposure the thresholds were calibrated at (recorded on
         # the calibration metadata): a threshold is exposure-specific, so a mismatch floors the survival
         # at the readout false-positive rate and it never reaches 0 (#H3v-2).  A high-SNR calibration

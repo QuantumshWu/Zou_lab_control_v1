@@ -265,19 +265,18 @@ def test_timing_and_verilog_boundaries(tmp_path):
     assert files.manifest_path.exists()
 
 
-def test_multiframe_acquisition_repeats_camera_trigger_sequence():
+def test_multiframe_acquisition_reads_n_frames_from_one_trigger_pulse():
+    """The camera reads N frames off a pulse it is handed -- a single-trigger imaging pulse read for
+    3 frames is 3 independent shots (the atom device reloads per armed frame), NOT a sequence
+    rewritten to carry 3 triggers.  The pulse carries its OWN triggers; there is no 1->N expansion."""
     exp = na.connect("virtual")
     seq = na.imaging_sequence(exposure=1e-3, load=True, name="multi_frame")
-    expanded = na.sequence_for_frame_count(seq, 3)
-    images = exp.camera.acquire(3, sequence=seq, sequencer=exp.devices.sequencer)
+    images = exp.camera.acquire(
+        3, sequence=seq,
+        on_armed=lambda: (exp.devices.sequencer.prepare(seq), exp.devices.sequencer.fire(seq)))
 
     assert len(images) == 3
-    assert na.count_trigger_pulses(seq) == 1
-    assert na.count_trigger_pulses(expanded) == 3
-    prepares = [row for row in exp.devices.sequencer.history if row["action"] == "prepare"]
-    fires = [row for row in exp.devices.sequencer.history if row["action"] == "fire"]
-    assert prepares[-1]["duration"] == expanded.duration
-    assert fires[-1]["duration"] == expanded.duration
+    assert na.count_trigger_pulses(seq) == 1                 # the pulse itself is unchanged (1 trigger)
 
 
 def test_pulse_sequence_repeat_metadata_does_not_expand_for_runtime_counts():
@@ -302,28 +301,28 @@ def test_detection_time_scan_sends_probe_duration_per_point():
 
     prepares = [row for row in exp.devices.sequencer.history if row["action"] == "prepare"]
     scan_prepares = [row for row in prepares if row["sequence"] == "detect_time_scan"]
+    # Each point fires the single-trigger imaging pulse at that exposure; the camera reads the
+    # shots off it (no 1->N expansion), so the fired duration is the one imaging sequence's duration.
     expected = [
-        na.sequence_for_frame_count(na.imaging_sequence(exposure=float(t), load=True, name="detect_time_scan"), 4).duration
+        na.imaging_sequence(exposure=float(t), load=True, name="detect_time_scan").duration
         for t in times
     ]
     assert [row["duration"] for row in scan_prepares] == expected
 
 
 def test_runtime_sequencer_service_contract():
-    seq = na.sequence_for_frame_count(na.imaging_sequence(exposure=1e-4, load=True), 2)
+    seq = na.imaging_sequence(exposure=1e-4, load=True).repeated(2)
     sequencer = na.RuntimeSequencer(channels=["trap", "cooling", "probe", "emCCD"], sleep_scale=0.0)
     program = sequencer.prepare(seq)
     sequencer.fire(seq)
 
-    assert program.trigger_count == 2
     assert sequencer.wait_done(timeout=1.0)
     snapshot = sequencer.snapshot()
     assert snapshot["state"] == "done"
-    assert snapshot["prepared_program"]["trigger_count"] == 2
 
 
 def test_fpga_pulse_streamer_rejects_program_that_does_not_fit():
-    seq = na.sequence_for_frame_count(na.imaging_sequence(exposure=4e-6, load=True), 2)
+    seq = na.imaging_sequence(exposure=4e-6, load=True).repeated(2)
     program = na.compile_runtime_program(seq, channels=["trap", "cooling", "probe", "emCCD"], clock_hz=50_000_000)
 
     try:
@@ -343,7 +342,6 @@ def test_fpga_pulse_streamer_rejects_runtime_edge_table_hazards():
         ticks=[0, 10, 10],
         masks=[1, 2, 0],
         duration=1e-7,
-        trigger_count=1,
     )
     bad_final_mask = na.RuntimeSequenceProgram(
         sequence_id="bad",
@@ -353,7 +351,6 @@ def test_fpga_pulse_streamer_rejects_runtime_edge_table_hazards():
         ticks=[0, 10],
         masks=[1, 1],
         duration=1e-7,
-        trigger_count=1,
     )
     bad_duplicate_channel = na.RuntimeSequenceProgram(
         sequence_id="bad",
@@ -363,7 +360,6 @@ def test_fpga_pulse_streamer_rejects_runtime_edge_table_hazards():
         ticks=[0, 10],
         masks=[1, 0],
         duration=1e-7,
-        trigger_count=0,
     )
 
     for program, expected in (
@@ -392,7 +388,6 @@ def test_pulse_gui_launcher_aligns_subset_state_to_full_hardware_channels(monkey
         channel_count=None,
         xdc=root / "fpga" / "board_config" / "board.xdc",
         max_channel_count=62,
-        trigger_channels=None,
     )
     subset_state = na.PulseTableState(
         channels=["ch00", "ch03"],
@@ -409,7 +404,7 @@ def test_pulse_gui_launcher_aligns_subset_state_to_full_hardware_channels(monkey
 
     channels = pulse_gui_launcher._resolve_channels(args, subset_state)
     aligned = subset_state.aligned_to_channels(channels)
-    program = aligned.compile(clock_hz=50_000_000, trigger_channels=["ch11"])
+    program = aligned.compile(clock_hz=50_000_000)
 
     assert channels == [f"ch{i:02d}" for i in range(62)]
     assert aligned.channels == channels
@@ -418,7 +413,11 @@ def test_pulse_gui_launcher_aligns_subset_state_to_full_hardware_channels(monkey
     assert max(program.masks) < (1 << 62)
     labels = pulse_gui_launcher._resolve_channel_labels(args, channels, subset_state)
     pins = pulse_gui_launcher._resolve_channel_pins(args, channels)
-    assert pulse_gui_launcher._resolve_trigger_channels(args, channels, labels) == ["ch11"]
+    # The standalone pulse editor no longer resolves a trigger channel (the sequencer is a pure
+    # streamer; the camera owns the capture-trigger line), but the emCCD line is still discoverable
+    # from the XDC labels for a real camera's capture_trigger_channels.
+    assert not hasattr(pulse_gui_launcher, "_resolve_trigger_channels")
+    assert labels["ch11"] == "emCCD"
     assert labels["ch00"] == "trap"
     assert labels["ch03"] == "probe"
     assert labels["ch06"] == "trig"
@@ -445,7 +444,7 @@ def test_pulse_gui_launcher_aligns_subset_state_to_full_hardware_channels(monkey
             def __init__(self, **_kwargs):
                 raise ConnectionRefusedError("server is not running")
 
-    sequencer, fallback_channels, fallback_triggers, notice = pulse_gui_launcher._connect_remote_or_offline(
+    sequencer, fallback_channels, notice = pulse_gui_launcher._connect_remote_or_offline(
         remote_args,
         subset_state,
         FailingRemoteNa,
@@ -453,7 +452,6 @@ def test_pulse_gui_launcher_aligns_subset_state_to_full_hardware_channels(monkey
     )
     assert sequencer is None
     assert fallback_channels == channels
-    assert fallback_triggers == ["ch11"]
     assert "opened offline editor" in notice
     assert pulse_gui_launcher._remote_host_was_requested([]) is False
     assert pulse_gui_launcher._remote_host_was_requested(["--remote-host", "192.168.0.20"]) is True
@@ -652,11 +650,15 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     assert "ZLC_PS_VARIANT" not in server_bat
     assert "fpga\\build\\address_switch" not in server_bat
     assert "echo Trigger:" not in server_bat
-    assert "--trigger-channels ch03" not in server_bat
+    # The sequencer is a pure streamer: which line gates a camera is the CAMERA's property
+    # (its config's capture_trigger_channels), not a server arg.  So run_server.bat no longer
+    # infers a trigger channel or passes --trigger-channels.
+    assert "--trigger-channels" not in server_bat
+    assert "infer_trigger_channels" not in server_bat
+    assert "ZLC_PS_TRIGGER_CHANNELS" not in server_bat
 
     assert "DEFAULT_PULSE_GUI_FALLBACK_CHANNELS = 62" in launcher
     assert "infer_xdc_channel_count" in launcher
-    assert "infer_trigger_channels" in server_bat
     assert preset.exists()
 
     for text in (
@@ -971,7 +973,6 @@ def test_fpga_pulse_streamer_compiles_channel_delay_and_repeated_frames():
     assert program.ticks == [0, 1, 2, 5]
     assert program.masks == [0b0001, 0b1001, 0b0000, 0b0000]
     assert program.masks[-1] == 0
-    assert program.trigger_count == 2
     assert program.repeat_forever is False
     assert program.loop_start_index == 0
     assert program.loop_end_tick == 5
@@ -1029,7 +1030,7 @@ def test_pulse_table_state_compiles_repeat_visibility_and_delays(tmp_path):
     )
 
     sequence = state.to_sequence()
-    program = state.compile(clock_hz=100e6, trigger_channels=["trig"])
+    program = state.compile(clock_hz=100e6)
     saved = state.save(tmp_path / "pulse.json")
     loaded = na.PulseTableState.load(saved)
 
@@ -1050,7 +1051,6 @@ def test_pulse_table_state_compiles_repeat_visibility_and_delays(tmp_path):
     assert resolved.scan_slots == []
     assert resolved.scan_table == []
     assert na.count_trigger_pulses(sequence, trigger_channels=["trig"]) == 3
-    assert program.trigger_count == 3
     assert program.repeat_forever is True
     # A channel delay (trig: s0/2) WITH an inner repeat bracket is now supported: the
     # bracket is UNROLLED into a flat period list, so the delayed edge has no inner-loop
@@ -1075,8 +1075,7 @@ def test_pulse_table_state_compiles_repeat_visibility_and_delays(tmp_path):
     r = em.reference_play(ep, 600)
     assert r == truth
     assert em.prefetch_play(ep, 600) == r and em.rtl_mirror_play(ep, 600) == r
-    program_x = state.compile(clock_hz=100e6, trigger_channels=["trig"], slots=s0_200)
-    assert program_x.trigger_count == 3
+    program_x = state.compile(clock_hz=100e6, slots=s0_200)
     assert program_x.repeat_forever is True
     # s0=200 -> each image is 400 ns = 40 ticks; undelayed flat frame = 10 + 3*(40+10) = 160
     # ticks (trig delay now 10 ticks on channel_delays, not in the frame).
@@ -1116,7 +1115,6 @@ def test_pulse_table_state_compiles_hardware_repeat_without_expanding_edges():
         state,
         channels=hardware_channels,
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
     )
     aligned = state.aligned_to_channels(hardware_channels)
 
@@ -1129,7 +1127,6 @@ def test_pulse_table_state_compiles_hardware_repeat_without_expanding_edges():
     assert program.loop_start_index == 1
     assert program.loop_end_tick == 3
     assert program.loop_count == 500
-    assert program.trigger_count == 1
     assert len(program.ticks) == len(state.periods) + 1
     assert len(program.ticks) < state.repeat_count
     assert aligned.channels == hardware_channels
@@ -1157,7 +1154,7 @@ def test_pulse_table_analog_bus_modes_compile_to_runtime_bus_segments(tmp_path):
     state.apply_analog_bus_modes_to_period_states()
     saved = state.save(tmp_path / "analog_bus.json")
     loaded = na.PulseTableState.load(saved)
-    program = loaded.compile(clock_hz=50_000_000, trigger_channels=["ch03"], repeat_forever=False)
+    program = loaded.compile(clock_hz=50_000_000, repeat_forever=False)
 
     assert loaded.bus_channels()["da_test"] == ["ch00", "ch01", "ch02"]
     assert loaded.analog_bus_modes["da_test"] == [
@@ -1471,7 +1468,7 @@ def test_analog_ramp_can_scan_both_value_endpoints_round_trip():
     prog = RuntimeSequenceProgram(
         sequence_id="r", sequence_name="r", clock_hz=50e6,
         channels=[f"ch{i:02d}" for i in range(62)],
-        ticks=[0, 50, 200], masks=[0, 1, 0], duration=4e-6, trigger_count=0,
+        ticks=[0, 50, 200], masks=[0, 1, 0], duration=4e-6,
         repeat_forever=False, loop_start_index=0, loop_end_tick=200, loop_count=1,
         slot_count=2, slot_kinds=["dac", "dac"], loop_end_slot_coeffs=[0, 0],
         tick_slot_coeffs=[[0, 0], [0, 0], [0, 0]],
@@ -1507,7 +1504,7 @@ def test_bus_play_models_dual_endpoint_ramp_and_held_value():
         return RuntimeSequenceProgram(
             sequence_id="b", sequence_name="b", clock_hz=50e6,
             channels=[f"ch{i:02d}" for i in range(62)],
-            ticks=[0, 5, 200], masks=[0, 1, 0], duration=4e-6, trigger_count=0,
+            ticks=[0, 5, 200], masks=[0, 1, 0], duration=4e-6,
             repeat_forever=False, loop_start_index=0, loop_end_tick=200, loop_count=1,
             slot_count=2, slot_kinds=["dac", "dac"], loop_end_slot_coeffs=[0, 0],
             tick_slot_coeffs=[[0, 0], [0, 0], [0, 0]], scan_points=points, scan_coeff_frac_bits=8,
@@ -1647,7 +1644,7 @@ def test_final_image_solver_90pct_and_packs_round_trip():
         sequence_id="a", sequence_name="t", clock_hz=50e6,
         channels=[f"ch{i:02d}" for i in range(62)],
         ticks=[0, 5, 25, 400], masks=[0, (1 << 0) | (1 << 5), (1 << 61), 0],
-        duration=8e-6, trigger_count=0, repeat_forever=True, loop_start_index=1,
+        duration=8e-6, repeat_forever=True, loop_start_index=1,
         loop_end_tick=400, loop_count=3, slot_count=2, slot_kinds=["delay", "dac"],
         loop_end_slot_coeffs=[256, 0], tick_slot_coeffs=[[0, 0], [256, 0], [256, 0], [256, 0]],
         scan_points=[[k, k * 2] for k in range(5)], scan_coeff_frac_bits=8, bus_names=["da0"],
@@ -1935,7 +1932,7 @@ def _minimal_runtime_program():
     from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequenceProgram
     return RuntimeSequenceProgram(
         sequence_id=1, sequence_name="t", clock_hz=50e6, channels=["a"],
-        ticks=[0, 10], masks=[1, 0], duration=200.0, trigger_count=0)
+        ticks=[0, 10], masks=[1, 0], duration=200.0)
 
 
 def test_final_status_bits_match_host():
@@ -2004,7 +2001,7 @@ def test_vivado_axi_session_tolerates_transient_underflow(tmp_path):
     program = RuntimeSequenceProgram(
         sequence_id="u", sequence_name="u", clock_hz=50e6,
         channels=[f"ch{i:02d}" for i in range(62)],
-        ticks=[0, 100, 200], masks=[1, 0, 0], duration=4e-6, trigger_count=0,
+        ticks=[0, 100, 200], masks=[1, 0, 0], duration=4e-6,
         repeat_forever=False, loop_start_index=0, loop_end_tick=200, loop_count=1, slot_count=0,
     )
 
@@ -2071,7 +2068,7 @@ def test_vivado_axi_session_rejects_dac_value_over_bus_width(tmp_path):
     program = RuntimeSequenceProgram(
         sequence_id="dh", sequence_name="dh", clock_hz=50e6,
         channels=[f"ch{i:02d}" for i in range(62)],
-        ticks=[0, 50, 200], masks=[0, 1, 0], duration=4e-6, trigger_count=0,
+        ticks=[0, 50, 200], masks=[0, 1, 0], duration=4e-6,
         repeat_forever=False, loop_start_index=0, loop_end_tick=200, loop_count=1,
         slot_count=1, slot_kinds=["dac"], loop_end_slot_coeffs=[0],
         tick_slot_coeffs=[[0], [0], [0]], scan_points=[[100], [2000]], scan_coeff_frac_bits=8,  # 2000 > 1023
@@ -2098,7 +2095,7 @@ def test_vivado_axi_session_wait_done_is_reentrant(tmp_path):
     program = RuntimeSequenceProgram(
         sequence_id="re", sequence_name="re", clock_hz=50e6,
         channels=[f"ch{i:02d}" for i in range(62)],
-        ticks=[0, 5, 40], masks=[0, 1, 0], duration=4e-6, trigger_count=0,
+        ticks=[0, 5, 40], masks=[0, 1, 0], duration=4e-6,
         repeat_forever=False, loop_start_index=0, loop_end_tick=40, loop_count=1,
         slot_count=1, slot_kinds=["delay"], loop_end_slot_coeffs=[0],
         tick_slot_coeffs=[[0], [256], [0]], scan_points=[[k] for k in range(N)], scan_coeff_frac_bits=8,
@@ -2162,7 +2159,7 @@ def test_vivado_axi_session_rejects_nonmonotonic_program(tmp_path):
     program = RuntimeSequenceProgram(
         sequence_id="bad", sequence_name="bad", clock_hz=50e6,
         channels=[f"ch{i:02d}" for i in range(62)],
-        ticks=[0, 100, 200], masks=[0, 1, 0], duration=4e-6, trigger_count=0,
+        ticks=[0, 100, 200], masks=[0, 1, 0], duration=4e-6,
         repeat_forever=False, loop_start_index=0, loop_end_tick=200, loop_count=1,
         slot_count=1, slot_kinds=["delay"], loop_end_slot_coeffs=[0],
         tick_slot_coeffs=[[0], [256], [0]], scan_points=[[0], [1000]], scan_coeff_frac_bits=8,
@@ -2192,7 +2189,7 @@ def test_vivado_axi_session_repeat_streaming_refills_cyclically(tmp_path):
     program = RuntimeSequenceProgram(
         sequence_id="rs", sequence_name="rs", clock_hz=50e6,
         channels=[f"ch{i:02d}" for i in range(62)],
-        ticks=[0, 5, 40], masks=[0, 1, 0], duration=4e-6, trigger_count=0,
+        ticks=[0, 5, 40], masks=[0, 1, 0], duration=4e-6,
         repeat_forever=True, loop_start_index=0, loop_end_tick=40, loop_count=1,
         slot_count=1, slot_kinds=["delay"], loop_end_slot_coeffs=[0],
         tick_slot_coeffs=[[0], [256], [0]], scan_points=[[k] for k in range(N)], scan_coeff_frac_bits=8,
@@ -2270,7 +2267,6 @@ def test_pulse_table_state_compiles_pair_array_scan_to_full_40ch_template():
         state,
         channels=hardware_channels,
         clock_hz=50_000_000,
-        trigger_channels=["ch03"],
     )
 
     assert program.channels == hardware_channels
@@ -2281,7 +2277,6 @@ def test_pulse_table_state_compiles_pair_array_scan_to_full_40ch_template():
     assert program.ticks == [0, 1, 1, 2]
     assert program.masks == [1, 1 << 3, 0, 0]
     assert program.tick_slot_coeffs == [[0, 0], [0, 0], [256, 0], [256, 256]]
-    assert program.trigger_count == 2
     assert len(program.ticks) == 4
     assert len(program.ticks) < len(program.scan_points) * len(state.periods)
     assert len(program.channels) == 40
@@ -2535,7 +2530,7 @@ def test_delayed_scanned_ramp_capacity_is_enforced():
         ticks = [0, span_ticks + 100]
         return na.RuntimeSequenceProgram(
             sequence_id=1, sequence_name="r", clock_hz=50e6, channels=["a"],
-            ticks=ticks, masks=[1, 0], duration=(span_ticks + 100) * 20.0, trigger_count=0,
+            ticks=ticks, masks=[1, 0], duration=(span_ticks + 100) * 20.0,
             slot_count=1, slot_kinds=["dac"],
             tick_slot_coeffs=[[0], [0]], loop_end_slot_coeffs=[0],
             scan_points=[[100], [900]],
@@ -2672,7 +2667,6 @@ def test_sequencer_service_pads_gui_subset_state_to_full_40ch_hardware():
     service = na.SequencerService(
         channels=hardware_channels,
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
         prepare_callback=prepared_programs.append,
     )
     state = na.PulseTableState(
@@ -2695,7 +2689,6 @@ def test_sequencer_service_pads_gui_subset_state_to_full_40ch_hardware():
     assert program.channels == hardware_channels
     assert program.masks == [1 << 0, (1 << 0) | (1 << 3), 0, 0]
     assert all(mask >> 4 == 0 for mask in program.masks)
-    assert program.trigger_count == 1
     assert prepared_programs == [program]
     na.validate_pulse_streamer_program(program, max_edges=1024, tick_width=32, channel_count=40)
 
@@ -2719,7 +2712,6 @@ def test_fpga_loop_repeat_keeps_post_loop_idle_before_repeat_forever():
         state,
         channels=[f"ch{i:02d}" for i in range(40)],
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
     )
     history = _simulate_pulse_streamer_program_steps(program, steps=8)
 
@@ -2752,7 +2744,6 @@ def test_pulse_table_reports_repeat_forever_table_boundary_high_channels():
         state,
         channels=[f"ch{i:02d}" for i in range(40)],
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
     )
     history = _simulate_pulse_streamer_program_steps(program, steps=7)
     boundary_tick = round(program.duration * program.clock_hz)
@@ -2788,7 +2779,7 @@ def test_pulse_table_no_boundary_warning_when_repeat_bracket_covers_whole_table(
 def test_partial_hardware_channels_default_missing_outputs_off():
     hardware_channels = [f"ch{i:02d}" for i in range(40)]
     seq = na.PulseSequence(name="partial_hardware").pulse("ch00", 0.0, 10e-9).pulse("ch03", 10e-9, 10e-9).forever(period=30e-9)
-    sequence_program = na.compile_runtime_program(seq, channels=hardware_channels, clock_hz=100_000_000, trigger_channels=["ch03"])
+    sequence_program = na.compile_runtime_program(seq, channels=hardware_channels, clock_hz=100_000_000)
 
     state = na.PulseTableState(
         channels=["ch00", "ch03"],
@@ -2804,7 +2795,6 @@ def test_partial_hardware_channels_default_missing_outputs_off():
         state,
         channels=hardware_channels,
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
     )
 
     assert sequence_program.channels == hardware_channels
@@ -2814,7 +2804,6 @@ def test_partial_hardware_channels_default_missing_outputs_off():
     assert table_program.channels == hardware_channels
     assert table_program.masks == [1 << 0, 1 << 3, 0, 0]
     assert table_program.repeat_forever is True
-    assert table_program.trigger_count == 1
     assert all(mask & ~((1 << 0) | (1 << 3)) == 0 for mask in table_program.masks)
     assert all(mask >> 4 == 0 for mask in table_program.masks)
 
@@ -2837,7 +2826,6 @@ def test_40ch_gui_visible_subset_compiles_as_full_width_fpga_program():
         state,
         channels=hardware_channels,
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
     )
 
     assert state.visible_channels == hardware_channels[:4]
@@ -2845,7 +2833,6 @@ def test_40ch_gui_visible_subset_compiles_as_full_width_fpga_program():
     assert len(program.channels) == 40
     assert program.masks == [0b0011, 0b1101, 0, 0]
     assert all(mask >> 4 == 0 for mask in program.masks)
-    assert program.trigger_count == 1
     assert program.repeat_forever is True
     na.validate_pulse_streamer_program(program, max_edges=1024, tick_width=32, channel_count=40)
 
@@ -2868,7 +2855,7 @@ def test_pulse_table_unknown_channel_is_not_silently_ignored():
 def test_checked_in_camera_imaging_pulse_compiles_for_address_switch_fpga():
     path = Path(__file__).resolve().parents[1] / "pulses" / "camera_imaging_address_switch.json"
     state = na.PulseTableState.load(path)
-    program = state.compile(clock_hz=50_000_000, trigger_channels=["ch11"])
+    program = state.compile(clock_hz=50_000_000)
 
     assert state.channels == [f"ch{i:02d}" for i in range(62)]
     assert state.visible_channels == ["ch09", "ch00", "ch03", "ch11"]
@@ -2901,26 +2888,23 @@ def test_checked_in_camera_imaging_pulse_compiles_for_address_switch_fpga():
     assert program.channels == state.channels
     assert program.ticks == [0, 100_000, 105_000, 106_000, 1_105_000, 1_106_000]
     assert program.masks == [513, 512, 2568, 520, 512, 0]
-    assert program.trigger_count == 1
     assert program.repeat_forever is True
     assert program.loop_start_index == 0
     assert program.loop_end_tick == 1_106_000
     assert program.loop_count == 1
     na.validate_pulse_streamer_program(program, max_edges=1024, tick_width=32, channel_count=62)
 
-    shorter = state.compile(clock_hz=50_000_000, trigger_channels=["ch11"], slots={"s0": 2_000_000})
+    shorter = state.compile(clock_hz=50_000_000, slots={"s0": 2_000_000})
     assert shorter.ticks == [0, 100_000, 105_000, 106_000, 206_000, 207_000]
     assert shorter.masks == program.masks
-    assert shorter.trigger_count == 1
-    finite = na.finite_frame_sequence(state.with_slots_resolved({"s0": 2_000_000}), 3, trigger_channels=["ch11"])
+    finite = state.with_slots_resolved({"s0": 2_000_000}).to_sequence(expand_repeat=False).repeated(3)
+    assert na.count_trigger_pulses(finite, trigger_channels=["ch11"]) == 3
     finite_program = na.compile_runtime_program(
         finite,
         channels=state.channels,
         clock_hz=50_000_000,
-        trigger_channels=["ch11"],
     )
     assert finite_program.repeat_forever is False
-    assert finite_program.trigger_count == 3
 
 
 def test_pulse_table_repeat_forever_can_be_disabled_for_single_shot():
@@ -2939,14 +2923,12 @@ def test_pulse_table_repeat_forever_can_be_disabled_for_single_shot():
         state,
         channels=["ch00", "ch01", "ch02", "ch03"],
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
         repeat_forever=state.repeat_forever,
     )
     service_program = na.compile_runtime_program_for_payload(
         state,
         channels=["ch00", "ch01", "ch02", "ch03"],
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
     )
     restored = na.PulseTableState.from_dict(state.to_dict())
 
@@ -2960,7 +2942,6 @@ def test_bind_pulse_controller_updates_slot_and_fires_runtime_sequencer():
     sequencer = na.RuntimeSequencer(
         channels=["ch00", "ch03"],
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
         sleep_scale=0.0,
     )
     state = na.PulseTableState(
@@ -2988,14 +2969,12 @@ def test_bind_pulse_controller_updates_slot_and_fires_runtime_sequencer():
     snapshot = pulse.snapshot()
     assert snapshot["slots"] == {"s0": 200.0}
     assert snapshot["last_program"]["edge_count"] == len(program.ticks)
-    assert snapshot["last_program"]["trigger_count"] == program.trigger_count
 
 
 def test_bind_pulse_controller_can_override_repeat_forever_for_scope_debug():
     sequencer = na.RuntimeSequencer(
         channels=["ch00", "ch03"],
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
         sleep_scale=0.0,
     )
     state = na.PulseTableState(
@@ -3021,7 +3000,6 @@ def test_bind_pulse_controller_rejects_waiting_indefinitely_for_repeat_forever()
     sequencer = na.RuntimeSequencer(
         channels=["ch00", "ch03"],
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
         sleep_scale=0.0,
     )
     state = na.PulseTableState(
@@ -3052,7 +3030,6 @@ def test_runtime_sequencer_repeat_forever_wait_done_times_out():
     sequencer = na.RuntimeSequencer(
         channels=["ch00", "ch03"],
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
         sleep_scale=0.0,
     )
     state = na.PulseTableState(
@@ -3084,7 +3061,6 @@ def test_bind_pulse_controller_repeat_forever_wait_timeout_raises():
     sequencer = na.RuntimeSequencer(
         channels=["ch00", "ch03"],
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
         sleep_scale=0.0,
     )
     state = na.PulseTableState(
@@ -3115,7 +3091,6 @@ def test_bind_pulse_controller_can_override_sequence_repeat_forever():
     sequencer = na.RuntimeSequencer(
         channels=["ch00", "ch03"],
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
         sleep_scale=0.0,
     )
     sequence = (
@@ -3150,7 +3125,7 @@ def test_detection_time_scan_uses_bound_40ch_pulse_controller():
             self.prepared_programs.append(program)
             return program
 
-    sequencer = RecordingRuntimeSequencer(channels=hardware_channels, clock_hz=100_000_000, trigger_channels=["ch03"], sleep_scale=0.0)
+    sequencer = RecordingRuntimeSequencer(channels=hardware_channels, clock_hz=100_000_000, sleep_scale=0.0)
     state = na.PulseTableState(
         channels=["ch00", "ch02", "ch03"],
         periods=[
@@ -3175,14 +3150,17 @@ def test_detection_time_scan_uses_bound_40ch_pulse_controller():
     )
 
     assert scan.summary()["finished"] is True
-    # The bound exposure slot is driven per scan point via frame_sequence(time_ns=...):
+    # The bound exposure slot is driven per scan point via frame_sequence(time_ns=...): the program
+    # runs the WHOLE period the table defines (the edges PLUS the trailing 100 ns all-low gap), so
     # reference 8 us -> 820, then 2 us -> 220 and 4 us -> 420 loop end ticks.
     assert [program.loop_end_tick for program in sequencer.prepared_programs] == [820, 220, 420]
-    assert [program.trigger_count for program in sequencer.prepared_programs] == [2, 2, 2]
-    assert [program.source_sequence["repeat_count"] for program in sequencer.prepared_programs] == [2, 2, 2]
+    # The streamer is a PURE pulse streamer: each scan point FIRES the bound pulse ONCE (repeat_count
+    # = 1) and the camera grabs ``shots`` frames from that single firing -- ``frame_sequence`` never
+    # rewrites the pulse's own trigger count into N copies (see
+    # test_bound_pulse_frame_sequence_keeps_pulse_own_trigger_count_regardless_of_frames).
+    assert [program.source_sequence["repeat_count"] for program in sequencer.prepared_programs] == [1, 1, 1]
     assert sequencer.last_program is not None
     assert sequencer.last_program.channels == hardware_channels
-    assert sequencer.last_program.trigger_count == 2
     assert sequencer.last_program.repeat_forever is False
     assert all(mask < (1 << 4) for mask in sequencer.last_program.masks)
 
@@ -3202,7 +3180,7 @@ def test_timing_subsystem_bind_pulse_loads_json_for_40ch_remote_style_scan(tmp_p
             self.prepared_programs.append(program)
             return program
 
-    sequencer = RecordingRuntimeSequencer(channels=hardware_channels, clock_hz=100_000_000, trigger_channels=["ch03"], sleep_scale=0.0)
+    sequencer = RecordingRuntimeSequencer(channels=hardware_channels, clock_hz=100_000_000, sleep_scale=0.0)
     exp.devices.devices["sequencer"] = sequencer
     state = na.PulseTableState(
         channels=["ch00", "ch02", "ch03"],
@@ -3241,15 +3219,17 @@ def test_timing_subsystem_bind_pulse_loads_json_for_40ch_remote_style_scan(tmp_p
     assert scan.summary()["finished"] is True
     assert [program.loop_end_tick for program in sequencer.prepared_programs[-3:]] == [820, 220, 420]
     assert sequencer.prepared_programs[-1].channels == hardware_channels
-    assert sequencer.prepared_programs[-1].trigger_count == 2
     assert sequencer.prepared_programs[-1].repeat_forever is False
 
 
-def test_bound_pulse_frame_sequence_uses_requested_frames_not_gui_repeat_count():
+def test_bound_pulse_frame_sequence_keeps_pulse_own_trigger_count_regardless_of_frames():
+    """frame_sequence no longer expands a 1-trigger pulse into N copies (the streamer is a pure
+    pulse streamer now): the resolved sequence carries the pulse's OWN triggers, and ``frames``
+    does NOT change the sequence's trigger count.  Here the pulse has a single ch03 trigger, so
+    frames=1/2/3 all yield exactly one trigger and the same finite, non-forever program."""
     sequencer = na.RuntimeSequencer(
         channels=["ch00", "ch03"],
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
         sleep_scale=0.0,
     )
     state = na.PulseTableState(
@@ -3267,16 +3247,22 @@ def test_bound_pulse_frame_sequence_uses_requested_frames_not_gui_repeat_count()
     )
     pulse = na.bind_pulse(sequencer, state)
 
-    sequence = pulse.frame_sequence(2)
-    program = sequencer.prepare(sequence)
+    for frames in (1, 2, 3):
+        sequence = pulse.frame_sequence(frames)
+        program = sequencer.prepare(sequence)
 
-    assert na.count_trigger_pulses(sequence, trigger_channels=["ch03"]) == 2
-    assert program.trigger_count == 2
-    assert program.repeat_forever is False
-    assert program.loop_count == 2
-    assert program.loop_end_tick == 14
-    assert program.ticks == [0, 10, 12, 14]
-    assert program.duration == 28 / 100_000_000
+        # The pulse's own ch03 trigger count is 1 -- ``frames`` never rewrites it.
+        assert na.count_trigger_pulses(sequence, trigger_channels=["ch03"]) == 1
+        assert program.repeat_forever is False
+        assert program.loop_count == 1
+        # The fired cycle is the WHOLE period the table defines: the 100 ns load + the 20 ns trigger
+        # window + the trailing 20 ns all-low gap = 140 ns (14 ticks).  The period end (14) closes the
+        # loop, so it is the loop-end tick AND the last entry in ``ticks``; the edges proper are the
+        # ch00/ch03 rise (0/10) and their fall (12).  ``duration`` is the edge span (last falling edge
+        # at 12 ticks); the trailing gap to the period end is loop-end time, not edge time.
+        assert program.loop_end_tick == 14
+        assert program.ticks == [0, 10, 12, 14]
+        assert program.duration == pytest.approx(12 / 100_000_000)
 
 
 def test_bind_field_time_slot_always_normalized_to_ns():
@@ -3718,7 +3704,6 @@ def test_command_sequencer_backend_writes_program_and_runs_fire_command(tmp_path
 
     assert marker.read_text(encoding="utf-8") == program.sequence_id
     payload = json.loads((tmp_path / "prepared_program.json").read_text(encoding="utf-8"))
-    assert payload["trigger_count"] == 1
     assert payload["source_sequence"]["name"] == seq.name
 
 
@@ -3750,7 +3735,6 @@ def test_sequencer_service_skips_duplicate_prepare_uploads():
     service = na.SequencerService(
         channels=["ch00", "ch03"],
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
         prepare_callback=prepare_callback,
     )
     state = na.PulseTableState(
@@ -3785,7 +3769,6 @@ def test_sequencer_service_safe_state_invalidates_prepare_cache():
     service = na.SequencerService(
         channels=["ch00", "ch03"],
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
         prepare_callback=prepare_callback,
         safe_state_callback=lambda: safe_calls.append(True),
     )
@@ -3837,7 +3820,7 @@ def test_rejected_streamed_prepare_safes_backend_then_recovers(monkeypatch):
     service.prepared_program = RuntimeSequenceProgram(
         sequence_id="prior", sequence_name="prior", clock_hz=100e6,
         channels=["ch00", "ch03"], ticks=[0, 10], masks=[1, 0], duration=1e-6,
-        trigger_count=0, loop_end_tick=10, loop_count=1, slot_count=1,
+        loop_end_tick=10, loop_count=1, slot_count=1,
         repeat_forever=True, scan_points=[[0], [1]])
 
     state = na.PulseTableState(
@@ -4003,7 +3986,6 @@ def test_sequencer_server_jtag_axi_backend_warm_starts_axi_session(tmp_path, mon
 
     service = sequencer_server.run_server(
         channels=[f"ch{i:02d}" for i in range(62)],
-        trigger_channels=["ch03"],
         host="127.0.0.1",
         port=18861,
         clock_hz=50_000_000,
@@ -4100,7 +4082,7 @@ def test_vivado_axi_session_loads_and_fires_edge_table_program(tmp_path):
         sequence_id="abc", sequence_name="t", clock_hz=50e6,
         channels=[f"ch{i:02d}" for i in range(62)],
         ticks=[0, 50, 120, 400], masks=[0, (1 << 0) | (1 << 5), (1 << 61), 0],
-        duration=8e-6, trigger_count=0,
+        duration=8e-6,
         repeat_forever=False, loop_start_index=0, loop_end_tick=400, loop_count=1,
         slot_count=2, slot_kinds=["delay", "dac"], loop_end_slot_coeffs=[0, 0],
         tick_slot_coeffs=[[0, 0], [256, 0], [256, 0], [256, 0]],
@@ -4144,7 +4126,7 @@ def test_vivado_axi_session_streams_unbounded_scan(tmp_path):
     program = RuntimeSequenceProgram(
         sequence_id="s", sequence_name="s", clock_hz=50e6,
         channels=[f"ch{i:02d}" for i in range(62)],
-        ticks=[0, 5, 25, 40], masks=[0, 1, 2, 0], duration=4e-6, trigger_count=0,
+        ticks=[0, 5, 25, 40], masks=[0, 1, 2, 0], duration=4e-6,
         repeat_forever=False, loop_start_index=0, loop_end_tick=40, loop_count=1,
         slot_count=1, slot_kinds=["delay"], loop_end_slot_coeffs=[0],
         tick_slot_coeffs=[[0], [256], [0], [0]],
@@ -4187,7 +4169,7 @@ def test_vivado_axi_session_repeat_forever_treats_running_as_done(tmp_path):
         sequence_id="p", sequence_name="p", clock_hz=50e6,
         channels=[f"ch{i:02d}" for i in range(62)],
         ticks=[0, 100, 200], masks=[1, 0, 0],
-        duration=4e-6, trigger_count=0,
+        duration=4e-6,
         repeat_forever=True, loop_start_index=0, loop_end_tick=200, loop_count=1,
         slot_count=0,
     )
@@ -4210,7 +4192,6 @@ def test_remote_sequencer_round_trip_uses_json_protocol(tmp_path):
     service = na.SequencerService(
         channels=["trap", "cooling", "probe", "emCCD"],
         clock_hz=50_000_000,
-        trigger_channels=["emCCD"],
         prepare_callback=backend.prepare,
         fire_callback=backend.fire,
         wait_done_callback=backend.wait_done,
@@ -4224,7 +4205,8 @@ def test_remote_sequencer_round_trip_uses_json_protocol(tmp_path):
     thread.start()
     time.sleep(0.2)
     remote = na.RemoteSequencer(host="127.0.0.1", port=port, channels=["trap", "cooling", "probe", "emCCD"], clock_hz=50_000_000)
-    seq = na.sequence_for_frame_count(na.imaging_sequence(exposure=12e-6, load=True), 4)
+    seq = na.imaging_sequence(exposure=12e-6, load=True).repeated(4)
+    assert na.count_trigger_pulses(seq) == 4
     try:
         program = remote.prepare(seq)
         remote.fire(seq)
@@ -4234,8 +4216,6 @@ def test_remote_sequencer_round_trip_uses_json_protocol(tmp_path):
         server.close()
 
     payload = json.loads((tmp_path / "prepared_program.json").read_text(encoding="utf-8"))
-    assert program.trigger_count == 4
-    assert payload["trigger_count"] == 4
     assert payload["source_sequence"]["name"] == seq.name
 
 
@@ -4258,7 +4238,6 @@ def test_remote_pulse_controller_sends_pulse_table_x_over_json_protocol(tmp_path
     service = na.SequencerService(
         channels=hardware_channels,
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
         prepare_callback=prepare_callback,
         fire_callback=fire_callback,
     )
@@ -4276,7 +4255,6 @@ def test_remote_pulse_controller_sends_pulse_table_x_over_json_protocol(tmp_path
         port=port,
         channels=["ch00", "ch03"],
         clock_hz=1.0,
-        trigger_channels=["ch03"],
     )
     state = na.PulseTableState(
         channels=["ch00", "ch03"],
@@ -4306,7 +4284,6 @@ def test_remote_pulse_controller_sends_pulse_table_x_over_json_protocol(tmp_path
     assert program.ticks == [0, 10, 210, 220]
     assert program.masks == [1 << 0, (1 << 0) | (1 << 3), 0, 0]
     assert program.repeat_forever is False
-    assert program.trigger_count == 1
     assert all(mask >> 4 == 0 for mask in program.masks)
     assert [p.sequence_id for p in prepared_programs] == [program.sequence_id]
     assert [p.sequence_id for p in fired_programs] == [program.sequence_id]
@@ -4326,7 +4303,6 @@ def test_remote_detection_time_scan_uses_bound_pulse_controller_over_json_protoc
     service = na.SequencerService(
         channels=hardware_channels,
         clock_hz=100_000_000,
-        trigger_channels=["ch03"],
         prepare_callback=lambda program: prepared_programs.append(program),
         fire_callback=lambda program: fired_programs.append(program),
     )
@@ -4346,7 +4322,6 @@ def test_remote_detection_time_scan_uses_bound_pulse_controller_over_json_protoc
         port=port,
         channels=["ch00", "ch03"],
         clock_hz=1.0,
-        trigger_channels=["ch03"],
     )
     state = na.PulseTableState(
         channels=["ch00", "ch02", "ch03"],
@@ -4379,7 +4354,6 @@ def test_remote_detection_time_scan_uses_bound_pulse_controller_over_json_protoc
     assert remote.channels == hardware_channels
     assert remote.clock_hz == 100_000_000
     assert [program.channels for program in prepared_programs] == [hardware_channels] * 3
-    assert [program.trigger_count for program in prepared_programs] == [2, 2, 2]
     assert [program.loop_end_tick for program in prepared_programs] == [820, 220, 420]
     assert all(not program.repeat_forever for program in prepared_programs)
     assert [program.sequence_id for program in fired_programs] == [program.sequence_id for program in prepared_programs]
@@ -4424,7 +4398,6 @@ def test_real_device_templates_load_without_hardware_connection():
     assert isinstance(manual.sequencer, na.ManualSequencer)
     assert manual.sequencer.channels == hardware_channels
     assert manual.sequencer.clock_hz == 50_000_000
-    assert manual.sequencer.trigger_channels == ("ch11",)
     assert isinstance(remote.camera, na.QCMOSCamera)
     assert remote.camera.dcam_module_name == na.DEFAULT_DCAM_MODULE
     assert isinstance(remote.sequencer, na.RemoteSequencer)
@@ -4432,7 +4405,6 @@ def test_real_device_templates_load_without_hardware_connection():
     assert remote.sequencer.port == 18862
     assert remote.sequencer.channels == hardware_channels
     assert remote.sequencer.clock_hz == 50_000_000
-    assert remote.sequencer.trigger_channels == ("ch11",)
     assert remote.sequencer.snapshot()["connected"] is False
 
     exp = na.connect("remote_template", sequencer={"host": "192.168.0.22"})
@@ -4468,7 +4440,7 @@ def test_load_devices_can_open_device_graph(monkeypatch):
         def configure(self, *, exposure=None, **kwargs):
             pass
 
-        def acquire(self, frames=1, *, sequence=None, sequencer=None, **kwargs):
+        def acquire(self, frames=1, *, sequence=None, on_armed=None, **kwargs):
             return [np.zeros((2, 2))]
 
         def open(self):
@@ -4527,7 +4499,7 @@ def test_sequencer_server_reports_client_endpoints(monkeypatch, capsys):
     assert 'sequencer={"host": "192.168.0.20", "port": 18861}' in output
 
 
-def test_qcmos_camera_acquire_uses_dcam_and_expanded_sequencer(monkeypatch):
+def test_qcmos_camera_acquire_reads_n_frames(monkeypatch):
     class FakeApi:
         initialized = False
 
@@ -4627,80 +4599,30 @@ def test_qcmos_camera_acquire_uses_dcam_and_expanded_sequencer(monkeypatch):
     )
     monkeypatch.setitem(sys.modules, "fake_dcam_for_qcmos_test", fake_module)
 
-    class FakeSequencer:
-        channels = ["trap", "cooling", "probe", "emCCD"]
-        clock_hz = 50_000_000
-        trigger_channels = ("emCCD",)
-
-        def __init__(self):
-            self.prepared = None
-            self.fired = None
-            self.done_wait = None
-
-        def prepare(self, sequence):
-            self.prepared = sequence
-
-        def fire(self, sequence):
-            self.fired = sequence
-
-        def wait_done(self, timeout):
-            self.done_wait = timeout
-            return True
-
+    # Pure grabber: the camera arms N frames and calls ``on_armed`` (the fire hook);
+    # it does NOT touch the sequencer or expand any pulse.  The DCAM mock must see N
+    # buffer allocations / read N frames back.
     camera = na.QCMOSCamera({"exposure": 2e-3, "roi": [1, 4, 2, 3], "timeout_ms": 100}, dcam_module="fake_dcam_for_qcmos_test")
-    sequencer = FakeSequencer()
-    sequence = na.imaging_sequence(exposure=1e-3, load=True)
-    images = camera.acquire(2, sequence=sequence, sequencer=sequencer)
+    armed = []
+    images = camera.acquire(2, on_armed=lambda: armed.append(True))
 
     assert len(images) == 2
+    assert FakeDcam.instance.frames == 2          # N frames allocated/read via the dcam mock
+    assert armed == [True]                          # the fire hook ran after the camera armed
     assert FakeApi.initialized is True
     assert FakeDcam.instance.released is True
-    exposure_writes = [value for prop, value in FakeDcam.instance.props if prop == "EXPOSURETIME"]
-    assert exposure_writes[-1] == 1e-3
     assert ("TRIGGERSOURCE", "EXTERNAL") in FakeDcam.instance.props
     assert ("TRIGGERACTIVE", "EDGE") in FakeDcam.instance.props
-    assert na.count_trigger_pulses(sequencer.prepared) == 2
-    assert sequencer.fired is sequencer.prepared
-    assert sequencer.done_wait is not None
     camera.close()
     assert FakeApi.initialized is False
 
     camera = na.QCMOSCamera({"exposure": 2e-3, "timeout_ms": 100}, dcam_module="fake_dcam_for_qcmos_test")
-    sequencer = FakeSequencer()
-    sequencer.channels = ["ch00", "ch03"]
-    sequencer.trigger_channels = ("ch03",)
-    pulse_state = na.PulseTableState(
-        channels=["ch00", "ch03"],
-        periods=[
-            na.PulsePeriod(100, (1, 0), unit="ns"),
-            na.PulsePeriod(20, (1, 1), unit="ns"),
-            na.PulsePeriod(100, (0, 0), unit="ns"),
-        ],
-        time_step_ns=10,
-        repeat_forever=True,
-    )
-    images = camera.acquire(3, sequence=pulse_state, sequencer=sequencer)
+    armed = []
+    images = camera.acquire(3, on_armed=lambda: armed.append(True))
 
     assert len(images) == 3
-    assert isinstance(sequencer.prepared, na.PulseSequence)
-    assert sequencer.prepared.repeat_forever is False
-    assert na.count_trigger_pulses(sequencer.prepared, trigger_channels=["ch03"]) == 3
-    assert sequencer.fired is sequencer.prepared
-    assert sequencer.done_wait is not None
-    camera.close()
-    assert FakeApi.initialized is False
-
-    camera = na.QCMOSCamera({"exposure": 2e-3, "timeout_ms": 100}, dcam_module="fake_dcam_for_qcmos_test")
-    sequencer = FakeSequencer()
-    sequencer.channels = ["ch00", "ch03"]
-    sequencer.trigger_channels = ("ch03",)
-    pulse = na.bind_pulse(sequencer, pulse_state)
-    images = camera.acquire(2, sequence=pulse)
-
-    assert len(images) == 2
-    assert isinstance(sequencer.prepared, na.PulseSequence)
-    assert na.count_trigger_pulses(sequencer.prepared, trigger_channels=["ch03"]) == 2
-    assert sequencer.fired is sequencer.prepared
+    assert FakeDcam.instance.frames == 3
+    assert armed == [True]
     camera.close()
     assert FakeApi.initialized is False
 
@@ -5175,7 +5097,7 @@ def _rand_bus_program(rng, *, n_seg, T, n_points, with_ramps=True):
     return RuntimeSequenceProgram(
         sequence_id="b", sequence_name="b", clock_hz=50e6,
         channels=[f"ch{i:02d}" for i in range(62)],
-        ticks=[0, 1, T], masks=[0, 1, 0], duration=1e-6, trigger_count=0,
+        ticks=[0, 1, T], masks=[0, 1, 0], duration=1e-6,
         repeat_forever=True, loop_start_index=0, loop_end_tick=T, loop_count=1,
         slot_count=2, slot_kinds=["dac", "dac"], loop_end_slot_coeffs=[0, 0],
         tick_slot_coeffs=[[0, 0], [0, 0], [0, 0]], scan_points=points, scan_coeff_frac_bits=8,
@@ -5435,7 +5357,7 @@ def test_delay_line_bounded_cap_rejected_clearly():
     def prog(cd=None, bus_delays=None, ticks=(0, 10), masks=(0, 0)):
         return RuntimeSequenceProgram(
             sequence_id="o", sequence_name="o", clock_hz=50e6, channels=chans,
-            ticks=list(ticks), masks=list(masks), duration=1e-6, trigger_count=0,
+            ticks=list(ticks), masks=list(masks), duration=1e-6,
             loop_end_tick=int(ticks[-1]), loop_count=1, slot_count=0,
             channel_delays=cd, bus_delays=bus_delays)
 
@@ -5489,7 +5411,7 @@ def test_delay_event_capacity_counts_full_schedule():
     def prog(ticks, masks, cd, **kw):
         defaults = dict(
             sequence_id="o", sequence_name="o", clock_hz=50e6, channels=chans,
-            ticks=list(ticks), masks=list(masks), duration=1e-6, trigger_count=0,
+            ticks=list(ticks), masks=list(masks), duration=1e-6,
             loop_end_tick=int(ticks[-1]), loop_count=1, slot_count=0,
             channel_delays=cd)
         defaults.update(kw)
@@ -5599,7 +5521,7 @@ def test_delay_eligibility_enforced_in_api():
     assert delay_eligible_channel_count(8, 0, 0) == 8         # no buses -> all eligible
 
     seq = na.RuntimeSequencer(channels=[f"ch{i:02d}" for i in range(62)],
-                              clock_hz=50e6, trigger_channels=["ch11"])
+                              clock_hz=50e6)
     st = na.PulseTableState(channels=[f"ch{i:02d}" for i in range(62)],
                             periods=[na.PulsePeriod(1000, (0,) * 62, unit="ns")], time_step_ns=20)
     ctl = na.bind_pulse(seq, st)
@@ -6449,7 +6371,7 @@ def test_negative_literal_duration_rejected():
 
 def test_pulse_controller_set_scan_table_accepts_numpy():
     # BUG: set_scan_table/payload used `rows or []` / `if table:`, raising on a NumPy array.
-    seq = na.RuntimeSequencer(channels=["a", "trig"], clock_hz=50e6, trigger_channels=["trig"])
+    seq = na.RuntimeSequencer(channels=["a", "trig"], clock_hz=50e6)
     st = na.PulseTableState(
         channels=["a", "trig"], periods=[na.PulsePeriod("s0", (1, 0), unit="str (ns)")],
         scan_slots=[{"kind": "duration", "target": "0", "unit": "ns", "nominal": 100.0}],
@@ -6474,7 +6396,7 @@ def test_sequencer_prepare_backstops_invalid_program_geometry():
     # BUG: SequencerService.prepare cached the program before any geometry check; a mock
     # backend would accept channel_delays beyond the 32-bit cap. A backstop validate rejects it.
     import pytest
-    seq = na.RuntimeSequencer(channels=["a", "b"], clock_hz=50e6, trigger_channels=["a"])
+    seq = na.RuntimeSequencer(channels=["a", "b"], clock_hz=50e6)
     # a delay beyond the 32-bit TTL field (~42.9 s) must still be rejected by the backstop
     huge_ns = ((1 << 31) + 10) * 20.0
     st = na.PulseTableState(channels=["a", "b"], periods=[na.PulsePeriod(100, (1, 1), unit="ns")],
@@ -6487,7 +6409,7 @@ def test_sequencer_prepare_accepts_streamed_scan_beyond_resident_window():
     # REGRESSION: the prepare() backstop used the DEFAULT max_scan_points (the 2-bank
     # resident window, 4096) and rejected larger STREAMED scans (e.g. 9999 points),
     # which the architecture explicitly supports (points stream through the window).
-    seq = na.RuntimeSequencer(channels=["a", "b"], clock_hz=50e6, trigger_channels=["a"])
+    seq = na.RuntimeSequencer(channels=["a", "b"], clock_hz=50e6)
     st = na.PulseTableState(channels=["a", "b"], periods=[na.PulsePeriod(100, (1, 1), unit="ns")],
                             time_step_ns=20)
     st.bind_field("duration", "0")
@@ -6512,7 +6434,7 @@ def test_counter_width_guards_reject_silent_wrap():
         base = dict(
             sequence_id="cw", sequence_name="cw", clock_hz=50e6,
             channels=[f"ch{i:02d}" for i in range(62)],
-            ticks=[0, 100], masks=[1, 0], duration=4e-6, trigger_count=0,
+            ticks=[0, 100], masks=[1, 0], duration=4e-6,
             repeat_forever=False, loop_start_index=0, loop_end_tick=100, loop_count=1,
         )
         base.update(kw)
@@ -6541,7 +6463,7 @@ def test_scan_frame_shorter_than_read_latency_is_rejected():
     # one slot scales the single period's duration; scan a 1-tick frame -> reject
     bad = RuntimeSequenceProgram(
         sequence_id="s", sequence_name="s", clock_hz=50e6, channels=["a", "b"],
-        ticks=[0, 1], masks=[1, 0], duration=1*20e-9, trigger_count=0, repeat_forever=False,
+        ticks=[0, 1], masks=[1, 0], duration=1*20e-9, repeat_forever=False,
         slot_count=1, slot_kinds=["dac"], tick_slot_coeffs=[[0], [0]],
         loop_end_tick=1, loop_end_slot_coeffs=[0], loop_count=1,
         scan_points=[[0], [1]],   # frame = 1 tick (< SCAN_READ_LATENCY=2): too short
@@ -6551,7 +6473,7 @@ def test_scan_frame_shorter_than_read_latency_is_rejected():
     # a normal scanned frame (>= SCAN_READ_LATENCY ticks) is accepted
     ok = RuntimeSequenceProgram(
         sequence_id="s2", sequence_name="s2", clock_hz=50e6, channels=["a", "b"],
-        ticks=[0, 100], masks=[1, 0], duration=100*20e-9, trigger_count=0, repeat_forever=False,
+        ticks=[0, 100], masks=[1, 0], duration=100*20e-9, repeat_forever=False,
         slot_count=1, slot_kinds=["duration"], tick_slot_coeffs=[[0], [256]],
         loop_end_tick=100, loop_end_slot_coeffs=[256], loop_count=1,
         scan_points=[[100], [200]],
@@ -6788,7 +6710,7 @@ def test_delay_tail_emits_after_done_contract():
     prog = na.RuntimeSequenceProgram(
         sequence_id="tail", sequence_name="tail", clock_hz=50e6,
         channels=["a"], ticks=[0, 10], masks=[1, 0],
-        duration=10 * 20e-9, trigger_count=0, repeat_forever=False,
+        duration=10 * 20e-9, repeat_forever=False,
         channel_delays=[5],
     )
     out = em.rtl_mirror_play(prog, 40)
@@ -6811,7 +6733,7 @@ def test_steep_ramp_tracks_ideal_line_with_multi_lsb_bresenham_steps():
     steep = na.RuntimeSequenceProgram(
         sequence_id="ramp", sequence_name="ramp", clock_hz=50e6,
         channels=["a"], ticks=[0, 2000], masks=[1, 0],
-        duration=2000 * 20e-9, trigger_count=0, repeat_forever=False,
+        duration=2000 * 20e-9, repeat_forever=False,
         bus_names=["da"],
         # a ramp carries from the live register, so seed it at code 0 with an edge first, then the
         # steep ramp sweeps 0 -> 1023 over 10 ticks (#ramp-carry).
@@ -7004,7 +6926,7 @@ def test_wait_done_drains_the_delayed_tail_and_prepare_does_not_chop_it(tmp_path
     session = VivadoAxiStreamerSession(state_dir=tmp_path, tcl_executor=Hw())
     prog = na.RuntimeSequenceProgram(
         sequence_id=1, sequence_name="d", clock_hz=50e6, channels=["a"],
-        ticks=[0, 10], masks=[1, 0], duration=200.0, trigger_count=0,
+        ticks=[0, 10], masks=[1, 0], duration=200.0,
         channel_delays=[2_500_000],                      # 50 ms tail
         bus_delays=[RuntimeBusDelay(0, 1_000_000)])
     session.prepare(prog)
@@ -7066,7 +6988,7 @@ def test_drain_tail_short_budget_keeps_guard_and_running_prepare_aborts_instantl
     session = VivadoAxiStreamerSession(state_dir=tmp_path / "done", tcl_executor=Hw(0b101))
     prog = na.RuntimeSequenceProgram(
         sequence_id=1, sequence_name="d", clock_hz=50e6, channels=["a"],
-        ticks=[0, 10], masks=[1, 0], duration=200.0, trigger_count=0,
+        ticks=[0, 10], masks=[1, 0], duration=200.0,
         channel_delays=[5_000_000])                      # 100 ms tail
     session.prepare(prog)
     session.fire()
@@ -7080,7 +7002,7 @@ def test_drain_tail_short_budget_keeps_guard_and_running_prepare_aborts_instantl
     session2 = VivadoAxiStreamerSession(state_dir=tmp_path / "run", tcl_executor=Hw(0b011))
     prog2 = na.RuntimeSequenceProgram(
         sequence_id=2, sequence_name="r", clock_hz=50e6, channels=["a"],
-        ticks=[0, 10], masks=[1, 0], duration=200.0, trigger_count=0,
+        ticks=[0, 10], masks=[1, 0], duration=200.0,
         channel_delays=[10_000_000])                     # 200 ms tail
     session2.prepare(prog2)
     session2.fire()
@@ -7387,7 +7309,7 @@ def test_psf_bimodal_readout_end_to_end_on_virtual_backend():
     from conftest import fire_live_imaging
     exp.devices.trap_array.set_occupancy([0, 1, 2, 5, 9])
     fire_live_imaging(exp)            # On Pulse: the trigger-driven camera streams the pinned shot
-    image = exp.devices.camera.acquire(1, sequencer=exp.devices.sequencer, force_all_sites=False)[-1]
+    image = exp.devices.camera.acquire(1, sequence=getattr(exp.devices.sequencer, "firing", None), force_all_sites=False)[-1]
     assert cal.detect(image).occupied_indices == [0, 1, 2, 5, 9]
 
 
@@ -7404,7 +7326,7 @@ def test_sequence_name_does_not_switch_the_virtual_camera_to_all_bright():
         from conftest import fire_live_imaging
         fire_live_imaging(exp)
         seq = exp.readout._session._imaging_sequence(load=True, name="sitemap")   # the MAGIC name
-        img = exp.devices.camera.acquire(1, sequence=seq, sequencer=exp.devices.sequencer)[-1]
+        img = exp.devices.camera.acquire(1, sequence=seq)[-1]
         loaded = int(np.sum(np.asarray(cal.detect(img).occupied)))
         assert 0 < loaded < cal.n_sites      # realistic partial loading -- the name does NOT force all-bright
     finally:

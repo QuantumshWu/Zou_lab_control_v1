@@ -502,7 +502,7 @@ def test_camera_measurement_region_is_editable_and_applies_to_virtual():
         node = exp.readout.camera_spec().build(SignalHub(), region="10, 50, 8, 40")
         assert node.camera.roi is not None
         fire_live_imaging(exp)                            # On Pulse: the trigger-driven camera streams
-        frame = node.camera.acquire(1, sequencer=node.sequencer)[0]
+        frame = node.camera.acquire(1, sequence=getattr(node.sequencer, "firing", None))[0]
         assert np.asarray(frame).shape != (40, 50)        # ROI actually crops the virtual frame
         assert "region" in node.acquisition_parameters()  # round-trips (endpoints)
     finally:
@@ -562,7 +562,7 @@ def test_shipped_imaging_template_is_a_continuous_three_trigger_bracket():
       * expose the two exposures as API slots a1 (the long reference frames) + a2 (the short
         readout), so the cali sets ONLY those durations BY NAME -- file == fired."""
     from Zou_lab_control.neutral_atom.timing import default_imaging_template
-    from Zou_lab_control.neutral_atom.timing.sequence import count_trigger_pulses
+    from Zou_lab_control.neutral_atom.devices.camera_trigger import count_trigger_pulses
 
     st = default_imaging_template()
     # the FILE itself triggers the camera 3x (not 1) -- a continuous bracket, no unroll needed

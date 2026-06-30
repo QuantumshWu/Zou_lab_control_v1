@@ -77,15 +77,15 @@ def test_virtual_camera_device_does_not_fabricate_a_frame_when_idle():
     cam, seqr = exp.devices.camera, exp.devices.sequencer
     try:
         assert seqr.firing is None
-        assert len(cam.acquire(1, sequencer=seqr)) == 0          # idle -> no fabricated frame
+        assert len(cam.acquire(1, sequence=getattr(seqr, "firing", None))) == 0          # idle -> no fabricated frame
 
         fire_live_imaging(exp)
         assert seqr.firing is not None
-        frames = cam.acquire(1, sequencer=seqr)
+        frames = cam.acquire(1, sequence=getattr(seqr, "firing", None))
         assert len(frames) == 1 and np.asarray(frames[0]).ndim == 2
 
         seqr.set_safe_state()
         assert seqr.firing is None
-        assert len(cam.acquire(1, sequencer=seqr)) == 0          # Stop Pulse -> no frame again
+        assert len(cam.acquire(1, sequence=getattr(seqr, "firing", None))) == 0          # Stop Pulse -> no frame again
     finally:
         exp.close()

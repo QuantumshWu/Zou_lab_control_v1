@@ -15,7 +15,6 @@ from .sequencer import (
     compile_pulse_table_scan_runtime_program,
     compile_runtime_program,
     compile_runtime_program_for_payload,
-    finite_frame_sequence,
     serve_runtime_sequencer,
 )
 from .virtual import DEFAULT_CHANNELS, VirtualCamera, VirtualSequencer, VirtualTrapArray, virtual_config, write_virtual_run
@@ -121,6 +120,5 @@ __all__ = [
     "compile_pulse_table_runtime_program",
     "compile_pulse_table_scan_runtime_program",
     "compile_runtime_program_for_payload",
-    "finite_frame_sequence",
     "serve_runtime_sequencer",
 ]

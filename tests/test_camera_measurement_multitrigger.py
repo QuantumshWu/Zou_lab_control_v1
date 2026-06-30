@@ -150,7 +150,7 @@ def test_occupancy_falls_back_to_session_calibration_on_shape_mismatch():
     det = OccupancyProcessor(hub, calibration=stale_cal, session_calibration=lambda: session_cal,
                              source_expr={"inputs": ["frame_0"], "source": "value = signal"}, grid_shape=(3, 4))
     fire_live_imaging(exp)
-    img = exp.devices.camera.acquire(1, sequencer=exp.devices.sequencer)[0]
+    img = exp.devices.camera.acquire(1, sequence=getattr(exp.devices.sequencer, "firing", None))[0]
     hub.publish({"frame_0": np.asarray(img, dtype=float)})
     out = det.step()                                     # stale cal mismatches (48,60) -> falls back
     assert "occupied" in out and "rate" in out           # readout keeps flowing (not wedged)

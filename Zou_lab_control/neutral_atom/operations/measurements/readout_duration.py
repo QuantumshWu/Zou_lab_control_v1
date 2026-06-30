@@ -34,14 +34,16 @@ from ..measurement_registry import measurement
 DEFAULT_IMAGING_TEMPLATE = "pulses/probe_template.json"
 
 
-def _resolve_imaging_template(template: str, sequencer) -> PulseTableState:
+def _resolve_imaging_template(template: str, sequencer, *, trigger_channel: str | None = None) -> PulseTableState:
     """Load the SINGLE-image readout pulse the operator selected and map its role channels onto whatever
     THIS sequencer exposes -- the SAME pattern ``temperature`` uses for the release-recapture pulse.  A
     file whose channels are already all on the sequencer is honoured as-is (its tuned durations kept);
     otherwise (a role-named template on a real ``ch00..`` streamer, or no file) the standard
     single-image template is rebuilt on this sequencer's channels via ``imaging_channel_kwargs`` -- the
-    SAME role->channel single source the imaging path uses.  Either way the result is a one-trigger
-    load->image program whose ``image`` duration is the readout window."""
+    SAME role->channel single source the imaging path uses.  ``trigger_channel`` is the CAMERA's
+    ``capture_trigger_channels[0]`` (the sequencer no longer owns it): a real chNN streamer needs it to
+    map the camera trigger onto a real channel.  Either way the result is a one-trigger load->image
+    program whose ``image`` duration is the readout window."""
     chans = list(getattr(sequencer, "channels", ()) or ())
     text = str(template or "").strip()
     state = None
@@ -54,7 +56,7 @@ def _resolve_imaging_template(template: str, sequencer) -> PulseTableState:
             if chans and all(c in chans for c in loaded.channels):
                 state = loaded                       # channels already match -> honour the template
     if state is None:
-        kw = imaging_channel_kwargs(sequencer)
+        kw = imaging_channel_kwargs(sequencer, trigger_channel=trigger_channel)
         role_kwargs = {k: kw[k] for k in
                        ("trap_channel", "cooling_channel", "probe_channel", "trigger_channel") if k in kw}
         state = single_imaging_template(channels=chans or None, **role_kwargs)
@@ -80,7 +82,12 @@ def readout_duration_fidelity(readout) -> MeasurementSpec:
         # virtual roles): the imaging-light pulse + camera trigger fired each scan point.  The readout
         # DURATION (the camera gate-open window) is the swept axis -- build_detection_scan configures it
         # per point through this bound pulse (the coupled OtsuFidelityReducer reduces each point inline).
-        state = _resolve_imaging_template(template, s.devices.sequencer)
+        # The CAMERA owns the capture-trigger line now, so its channel is threaded in for a real streamer.
+        cam = getattr(s.devices, "camera", None)
+        cam_trig = getattr(cam, "capture_trigger_channels", None)
+        state = _resolve_imaging_template(
+            template, s.devices.sequencer, trigger_channel=(cam_trig[0] if cam_trig else None),
+        )
         from ...devices import bind_pulse  # lazy: keep operations->devices off the import-time graph
 
         pulse = bind_pulse(s.devices.sequencer, state)

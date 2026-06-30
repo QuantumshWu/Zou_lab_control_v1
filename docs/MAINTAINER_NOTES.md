@@ -1112,11 +1112,15 @@ mechanically — pinned by `tests/test_scan_tier_boundary.py`:
     because both reads share the loading; two independent loadings make it meaningless.
   - `OtsuFidelityReducer` needs the per-point frame SET to pool counts and Otsu-split — a statistic
     over the point's frames, not a single value.
-- **The device boundary refuses the merge by construction:** `sequence_for_frame_count`
-  (`timing/sequence.py`) raises when a sequence's camera-trigger count ≠ the requested frame count
-  (except the 1→N repeat = independent reloads). So feeding the 2-trigger release-recapture pulse to
-  the decoupled node's `acquire(1)` is a hard `ValueError`, and `acquire(2)` against a 1-trigger
-  imaging pulse reloads between frames — the wrong physics for survival.
+- **The pulse carries its own triggers (no 1→N expansion):** each pulse defines its OWN camera
+  capture edges — a single-image readout pulse has one, a release-recapture bracket has two (trap-off
+  between them). The camera reads N frames off whatever sequence it is handed; a 2-trigger release-
+  recapture pulse is ONE loading read twice, while a 1-trigger imaging pulse read N times reloads
+  between frames (independent shots, decided per-frame by the atom device). So the coupled tier's
+  release-recapture pulse INTRINSICALLY produces 2 frames of one loading — the decoupled node's
+  per-point `acquire(1)` would only image once, never the two-read survival. The trigger-counting util
+  `count_trigger_pulses` lives in the camera seam (`devices/camera_trigger.py`), not the sequencer:
+  the streamer is a pure pulse streamer and never inspects which channel gates a camera.
 
 Therefore: **a measurement whose y needs ≥2 frames from one loading (survival) or a per-point frame-set
 statistic (Otsu fidelity) is IRREDUCIBLY coupled.** The promotion path (ship the pulse as `pulses/*.json`
@@ -1273,9 +1277,11 @@ al., PRA 78, 033425 (2008).
   trap_recapture, image2_expose, image2_settle — two emCCD triggers, one trap-off
   between. Bound via `bind_field("duration","2")` — the SAME slot mechanism a scanned
   readout duration uses, so hardware can stream a whole t_off table. Must be a SINGLE
-  two-trigger sequence, NOT a repeated single-frame sequence: `finite_frame_sequence`
-  reloads atoms between frames, so the two images would be different loadings with no
-  trap-off between — survival needs the SAME atoms imaged before/after one trap-off.
+  two-trigger sequence the camera reads as TWO frames of ONE atom loading, NOT a repeated
+  single-trigger sequence: a single-trigger pulse the camera reads twice is a fresh shot per
+  frame (the virtual atom device reloads when the base sequence carries fewer triggers than
+  the frame count), so the two images would be different loadings with no trap-off between —
+  survival needs the SAME atoms imaged before/after one trap-off.
 - **`fit_temperature` is pure post-processing** on a finished `ScanResult` — it never
   runs inside the acquire loop, keeping the live engine free of physics models.
 

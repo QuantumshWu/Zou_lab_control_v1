@@ -28,7 +28,7 @@ from numbers import Number
 import re
 from typing import Iterable, Mapping, Sequence
 
-from .sequence import (DEFAULT_CAMERA_TRIGGER_CHANNELS, READOUT_GAP_SECONDS, PulseSequence,
+from .sequence import (READOUT_GAP_SECONDS, PulseSequence,
                        channel_names, positive_float)
 
 
@@ -1585,7 +1585,6 @@ class PulseTableState:
         self,
         *,
         clock_hz: float,
-        trigger_channels: Sequence[str] = DEFAULT_CAMERA_TRIGGER_CHANNELS,
         slots: Mapping[str, float] | None = None,
         repeat_forever: bool | None = None,
     ):
@@ -1596,7 +1595,6 @@ class PulseTableState:
             self,
             channels=self.channels,
             clock_hz=clock_hz,
-            trigger_channels=trigger_channels,
             slots=slots,
             repeat_forever=self.repeat_forever if repeat_forever is None else bool(repeat_forever),
         )
@@ -1606,7 +1604,6 @@ class PulseTableState:
         *,
         clock_hz: float,
         scan_table: Sequence[Sequence[float]] | None = None,
-        trigger_channels: Sequence[str] = DEFAULT_CAMERA_TRIGGER_CHANNELS,
         repeat_forever: bool | None = None,
     ):
         from ..devices.sequencer import compile_pulse_table_scan_runtime_program
@@ -1625,7 +1622,6 @@ class PulseTableState:
             snapped,
             channels=snapped.channels,
             clock_hz=clock_hz,
-            trigger_channels=trigger_channels,
             scan_table=snapped.scan_table,
             repeat_forever=snapped.repeat_forever if repeat_forever is None else bool(repeat_forever),
         )

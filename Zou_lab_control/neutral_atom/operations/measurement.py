@@ -447,8 +447,10 @@ class ScannedMeasurement:
         sequencer = self._sequencer()
         rows = []
         for _ in range(self.shots_per_point):
-            frames = self.camera.acquire(self.plan.n_frames, sequence=sequence, sequencer=sequencer,
-                                         stop=self.stop_event)
+            frames = self.camera.acquire(
+                self.plan.n_frames, sequence=sequence,
+                on_armed=(lambda q=sequence: (sequencer.prepare(q), sequencer.fire(q))) if sequencer is not None else None,
+                stop=self.stop_event)
             rows.append(np.atleast_1d(np.asarray(self.reducer.reduce(frames, self.calibration), dtype=float)))
         # nanmean, not mean: a per-site reducer returns NaN for a site that was
         # empty on a given shot (no atom -> survival undefined).  Plain mean would

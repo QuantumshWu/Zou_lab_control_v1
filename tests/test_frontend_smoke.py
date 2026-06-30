@@ -2732,10 +2732,10 @@ def test_standalone_pulse_gui_defaults_use_hardware_channel_names():
     channels = launcher._default_channels(5)
     assert channels == ["ch00", "ch01", "ch02", "ch03", "ch04"]
     assert not hasattr(launcher, "DEFAULT_CHANNEL_LABELS")
-    args = SimpleNamespace(trigger_channels=None)
-    with pytest.raises(ValueError, match="emCCD"):
-        launcher._resolve_trigger_channels(args, [f"ch{i:02d}" for i in range(62)])
-    assert launcher._resolve_trigger_channels(args, [f"ch{i:02d}" for i in range(62)], {"ch11": "emCCD"}) == ["ch11"]
+    # The sequencer is a pure streamer: which line gates a camera is the CAMERA's property, so the
+    # standalone pulse editor no longer resolves a trigger channel or accepts --trigger-channels.
+    assert not hasattr(launcher, "_resolve_trigger_channels")
+    assert "--trigger-channels" not in launcher._build_parser().format_help()
     assert launcher._build_parser().parse_args([]).clock_hz == 50_000_000
 
 
@@ -2750,7 +2750,6 @@ def test_pulse_gui_controls_call_attached_address_switch_sequencer(monkeypatch):
 
     class RecordingSequencer:
         clock_hz = 50e6
-        trigger_channels = ["ch11"]
 
         def __init__(self):
             self.channels = channels
@@ -2760,7 +2759,7 @@ def test_pulse_gui_controls_call_attached_address_switch_sequencer(monkeypatch):
         def prepare(self, sequence):
             self.prepared = sequence
             self.events.append(("prepare", sequence.name, list(sequence.channels)))
-            return na.compile_runtime_program_for_payload(sequence, channels=self.channels, clock_hz=self.clock_hz, trigger_channels=self.trigger_channels)
+            return na.compile_runtime_program_for_payload(sequence, channels=self.channels, clock_hz=self.clock_hz)
 
         def fire(self):
             self.events.append(("fire",))
@@ -2798,7 +2797,6 @@ def test_pulse_gui_controls_call_attached_address_switch_sequencer(monkeypatch):
         assert sequencer.events[0][0] == "prepare"
         assert [event[0] for event in sequencer.events] == ["prepare", "fire", "safe"]
         assert editor.last_program.channels == channels
-        assert editor.last_program.trigger_count == 1
         assert isinstance(sequencer.prepared, na.PulseTableState)
         assert sequencer.prepared.to_sequence(expand_repeat=False).validate(clock_hz=50e6, channels=channels).ok
         assert editor.last_program.repeat_forever is True
@@ -2819,7 +2817,7 @@ def test_pulse_gui_runtime_connection_control(monkeypatch):
 
     ensure_qt_app()
     channels = [f"ch{i:02d}" for i in range(12)]
-    seq = RuntimeSequencer(channels=channels, trigger_channels=["ch11"])
+    seq = RuntimeSequencer(channels=channels)
     editor = PulseSequenceEditor(channels=channels, sequencer=seq)
     try:
         # opens reflecting the launch (virtual) sequencer; host:port disabled
@@ -3160,7 +3158,7 @@ def test_pulse_gui_scan_array_toggle_validates_and_marks_symbolic_regions(monkey
         editor.load_state(editor.state)
         app.processEvents()
         assert editor.channel_panel.scan_summary.text() == "1 slot · 2 pts"
-        scan_program = editor.read_state().compile_scan(clock_hz=50_000_000, trigger_channels=["ch03"])
+        scan_program = editor.read_state().compile_scan(clock_hz=50_000_000)
         assert scan_program.scan_enabled is True
         assert scan_program.slot_count == 1
         assert scan_program.scan_points == [[1], [2]]
