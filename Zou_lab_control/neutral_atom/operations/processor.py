@@ -39,7 +39,7 @@ from typing import Any, Callable, ClassVar
 # Reuse the ONE declarative parameter type: same kind->widget mapping and the same
 # no-eval coercion the measurement form already uses (single source of truth).
 from .measurement import ParamDecl
-from ._spec import CatalogSpec
+from ._spec import REQUIRED, CatalogSpec
 
 
 @dataclass(frozen=True)
@@ -63,7 +63,7 @@ class ProcessorContext:
     stop: Any = None
 
 
-@dataclass(frozen=True, kw_only=True)
+@dataclass(frozen=True)
 class ProcessorSpec(CatalogSpec):
     """A named processing action + its declared parameters + ONE builder.
 
@@ -90,7 +90,7 @@ class ProcessorSpec(CatalogSpec):
     lists the published output names and the user wires them into a separate plot.
     """
 
-    result_keys: tuple[str, ...]
+    result_keys: tuple[str, ...] = REQUIRED
     run: Callable[["ProcessorContext"], dict] | None = None
     make_node: Callable[..., Any] | None = None
     consumes: tuple[str, ...] = ()

@@ -40,6 +40,35 @@ def _task(**kw):
     return na.TaskSpec(**base)
 
 
+def test_catalog_specs_have_no_kw_only_so_the_server_runs_on_old_python():
+    """The FPGA sequencer SERVER (``python -m ...devices.sequencer_server``) imports the whole
+    ``neutral_atom`` package, which pulls in these catalog specs.  ``@dataclass(kw_only=True)`` needs
+    Python >= 3.10 -- on the lab server's older Python the import CRASHED with 'dataclass() got an
+    unexpected keyword argument kw_only'.  Required fields now default to the ``REQUIRED`` sentinel and
+    are enforced in ``__post_init__`` instead, so NO catalog spec may use ``kw_only`` again."""
+    import inspect
+
+    from Zou_lab_control.neutral_atom.operations import _spec, measurement, processor, task
+    for mod in (_spec, measurement, processor, task):
+        for line in inspect.getsource(mod).splitlines():
+            if line.lstrip().startswith("@dataclass"):
+                assert "kw_only" not in line, (
+                    f"{mod.__name__}: '{line.strip()}' must not use kw_only (breaks Python < 3.10).")
+
+
+@pytest.mark.parametrize("make,missing", [
+    (lambda: na.TaskSpec(name="t"), "build"),
+    (lambda: na.MeasurementSpec(name="m", params=()), "result_labels"),
+    (lambda: na.ProcessorSpec(name="p", params=(), run=lambda c: {}), "result_keys"),
+])
+def test_omitting_a_required_field_raises(make, missing):
+    """The ``REQUIRED`` sentinel replaces ``kw_only``'s "must pass the kwarg": omitting a required field
+    raises TypeError naming it, exactly as a no-default keyword argument would."""
+    with pytest.raises(TypeError) as exc:
+        make()
+    assert missing in str(exc.value)
+
+
 @pytest.mark.parametrize("spec_cls", SPECS)
 def test_every_spec_subclasses_the_base(spec_cls):
     assert issubclass(spec_cls, CatalogSpec)

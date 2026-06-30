@@ -28,14 +28,24 @@ Kept dependency-free on purpose (no import of `ParamDecl` or any operations modu
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields as _dc_fields
 from typing import Any, ClassVar
 
+#: Sentinel default for a REQUIRED field on a catalog spec.  ``@dataclass(kw_only=True)`` made
+#: these dataclasses keyword-only so a subclass could add required fields AFTER the base's
+#: defaulted ``params``/``metadata`` -- but ``kw_only`` needs Python >= 3.10, and the FPGA server
+#: runs on an older Python.  Instead every "required" field defaults to ``REQUIRED`` (so field
+#: ordering is always valid -- 3.9-compatible) and :meth:`CatalogSpec.__post_init__` raises if one
+#: was left unset -- the SAME "you must pass it" contract, no version dependency.
+REQUIRED: Any = object()
 
-@dataclass(frozen=True, kw_only=True)
+
+@dataclass(frozen=True)
 class CatalogSpec:
     """Shared base for the three catalog specs.  Subclasses add their own fields and
-    MUST override :meth:`collision_key`.  All construction is keyword-only."""
+    MUST override :meth:`collision_key`.  Required subclass fields default to :data:`REQUIRED`
+    and are enforced in :meth:`__post_init__` (keeps construction keyword-required without the
+    Python-3.10-only ``kw_only``)."""
 
     name: str
     params: tuple = ()
@@ -54,6 +64,13 @@ class CatalogSpec:
                 "(the hub keys two specs must not share).")
 
     def __post_init__(self) -> None:
+        # A field left at the REQUIRED sentinel was not passed -> raise, exactly like a no-default
+        # keyword argument would (the kw_only replacement; runs before any subclass __post_init__).
+        missing = [f.name for f in _dc_fields(self) if getattr(self, f.name, None) is REQUIRED]
+        if missing:
+            raise TypeError(
+                f"{type(self).__name__} missing required argument(s): {', '.join(missing)} "
+                "(pass them by keyword).")
         if not self.name or not isinstance(self.name, str):
             raise ValueError(f"{type(self).__name__} must have a non-empty string name.")
         if not isinstance(self.params, tuple):
@@ -89,4 +106,4 @@ class CatalogSpec:
         return {decl.key: decl.default for decl in self.params}
 
 
-__all__ = ["CatalogSpec"]
+__all__ = ["CatalogSpec", "REQUIRED"]

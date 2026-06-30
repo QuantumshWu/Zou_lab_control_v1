@@ -27,10 +27,10 @@ from typing import Any, Callable, ClassVar
 # parameters as ParamDecls so the GUI auto-generates the SAME form, and build()
 # receives the validated values.
 from .measurement import ParamDecl
-from ._spec import CatalogSpec
+from ._spec import REQUIRED, CatalogSpec
 
 
-@dataclass(frozen=True, kw_only=True)
+@dataclass(frozen=True)
 class TaskSpec(CatalogSpec):
     """A named orchestration task + its declared parameters + how to build it.
 
@@ -47,8 +47,8 @@ class TaskSpec(CatalogSpec):
     no hub signal.  ``prefix`` is REQUIRED (no default) so a new task cannot silently
     inherit another task's namespace and collide at discovery."""
 
-    build: Callable[..., Any]          # build(hub, *, prefix=..., **param_values) -> Task
-    prefix: str
+    build: Callable[..., Any] = REQUIRED   # build(hub, *, prefix=..., **param_values) -> Task
+    prefix: str = REQUIRED
     mid_run_key: str = "frame"
     default_kind: str = "2d"
 

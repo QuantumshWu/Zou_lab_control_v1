@@ -28,7 +28,7 @@ import numpy as np
 
 from Zou_lab_control._viewer_registry import active_plotter
 
-from ._spec import CatalogSpec
+from ._spec import REQUIRED, CatalogSpec
 
 from ..core.analysis import estimate_threshold_fidelity, otsu_threshold, positive_int
 from ..core.calibration import TrapCalibration
@@ -157,7 +157,7 @@ def axis_range_tuple(value, name: str) -> tuple[float, float, int]:
     return lo, hi, points
 
 
-@dataclass(frozen=True, kw_only=True)
+@dataclass(frozen=True)
 class MeasurementSpec(CatalogSpec):
     """A named measurement + its declared parameters + a build closure.
 
@@ -173,10 +173,10 @@ class MeasurementSpec(CatalogSpec):
     separate stored field.)
     """
 
-    result_labels: tuple[str, str]
-    x_key: str
-    y_key: str
-    build: Callable[..., "ScannedMeasurement"]
+    result_labels: tuple[str, str] = REQUIRED
+    x_key: str = REQUIRED
+    y_key: str = REQUIRED
+    build: Callable[..., "ScannedMeasurement"] = REQUIRED
     # Canonical machine slug (the node prefix + signal names derive from it).  Defaults
     # to ``measurement_slug(name)`` so a measurement is named ONCE; ``x_key``/``y_key``
     # are the BARE quantity tokens (``t_off``/``survival``) -- the full hub signal is
