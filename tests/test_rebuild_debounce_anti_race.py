@@ -102,7 +102,7 @@ def test_rebuild_keeps_the_card_fixed_size_and_never_null_plotter():
             card._run_pending_rebuild()                 # fire each coalesced rebuild
             assert card.plotter is not None
             assert (card.width(), card.height()) == size_before, "a rebuild must not resize the card"
-        # the live data feed still works after rebuilds (the monitor rolls into the fresh plotter)
+        # the live data stream still works after rebuilds (the monitor rolls into the fresh plotter)
         card.refresh({"rate": 9.0, "shot": 2})
         assert card.plotter is not None
     finally:
