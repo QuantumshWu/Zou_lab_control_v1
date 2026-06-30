@@ -26,6 +26,7 @@ from Zou_lab_control._readout_math import (
 )
 from .style import (
     DESIGN_DPI,
+    HIST_FILL_ALPHA,
     PALETTE,
     SITE_OCCUPANCY_STYLE,
     STOCK_MARGINS_PX,
@@ -1920,7 +1921,7 @@ class HistogramFigure(BaseLivePlot):
         while len(self._overlay_polys) < n_extra:
             j = len(self._overlay_polys)
             poly = PolyCollection(np.empty((0, 4, 2)),
-                                  facecolors=LINE_CYCLE[(j + 1) % len(LINE_CYCLE)], alpha=0.4)
+                                  facecolors=LINE_CYCLE[(j + 1) % len(LINE_CYCLE)], alpha=HIST_FILL_ALPHA)
             self.ax.add_collection(poly)
             self._overlay_polys.append(poly)
         while len(self._overlay_polys) > n_extra:
@@ -1948,7 +1949,10 @@ class HistogramFigure(BaseLivePlot):
         self.n, self.bins = np.histogram(vals, bins=self.bins_arg)
         self.verts = np.empty((len(self.n), 4, 2), dtype=float)
         _update_verts(self.bins, self.n, self.verts, mode="vertical")
-        self.poly = PolyCollection(self.verts, facecolors=PALETTE["hist_fill"])
+        # The PRIMARY (repeat=1) histogram is drawn with the SAME owned bar opacity as the 'create'
+        # overlays (style.HIST_FILL_ALPHA) -- a lone dis reads identically to one with overlays, and the
+        # threshold/fit lines read through the bars -- never an opaque block beside translucent ones.
+        self.poly = PolyCollection(self.verts, facecolors=PALETTE["hist_fill"], alpha=HIST_FILL_ALPHA)
         self.ax.add_collection(self.poly)
         (self.fit_line_left,) = self.ax.plot([], [], color=PALETTE["fit_left"], linewidth=1, alpha=0.8)
         (self.fit_line_right,) = self.ax.plot([], [], color=PALETTE["fit_right"], linewidth=1, alpha=0.8)

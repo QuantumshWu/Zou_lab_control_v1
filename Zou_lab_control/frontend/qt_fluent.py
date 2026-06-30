@@ -1156,7 +1156,18 @@ class FluentSettingRow(QtWidgets.QWidget):
         lbl.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
         self._label = lbl                       # introspected by the layout-uniformity contract test
         h.addWidget(lbl)
-        h.addWidget(control, 1)
+        # A control that FILLS the cell (a combo / line-edit / spin / switch -- Expanding/Preferred
+        # horizontal policy) is stretched so its left edge sits flush against the label column.  A
+        # control pinned to its sizeHint (FIXED horizontal policy -- the FluentTriStateToggle capsule,
+        # a FluentButton) must NOT be stretched: a stretch cell CENTRES a non-filling widget, so the
+        # toggle would float in the middle of the row instead of left-aligning under its label.  Add it
+        # left-aligned with a trailing stretch instead (confocal's TriStateToggleSwitch row idiom), so
+        # EVERY control -- filling or fixed -- starts at the SAME left edge.
+        if control.sizePolicy().horizontalPolicy() == QtWidgets.QSizePolicy.Fixed:
+            h.addWidget(control, 0, QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+            h.addStretch(1)
+        else:
+            h.addWidget(control, 1)
 
 
 class _RoundedPopupCard(QtCore.QObject):

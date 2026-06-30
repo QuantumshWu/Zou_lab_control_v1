@@ -270,9 +270,18 @@ def threshold_line_kwargs(linewidth: float = 1.9) -> dict[str, Any]:
     return {"color": _PALETTE["threshold"], "linewidth": float(linewidth), "alpha": 0.95, "zorder": 5}
 
 
+# The ONE histogram bar-fill opacity.  A dis bin is drawn SLIGHTLY translucent so an overlapped
+# distribution (a 'create' repeat overlay) stays legible and the threshold/fit lines read THROUGH
+# the bars -- and so the lone (repeat=1) histogram reads the SAME as an overlay, never an opaque
+# block beside translucent ones.  Owned here (ART), read by every histogram poly (primary + overlay)
+# so the two can never drift to different opacities.
+HIST_FILL_ALPHA = 0.4
+
+
 __all__ = [
     "DEFAULT_STYLE",
     "DESIGN_DPI",
+    "HIST_FILL_ALPHA",
     "LIVE_RENDER_SCALE",
     "FONT_PATH",
     "NEW_BLACK",

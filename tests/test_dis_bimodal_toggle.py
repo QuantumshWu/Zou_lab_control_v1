@@ -96,6 +96,29 @@ def test_create_draws_one_outlined_histogram_per_repeat():
     assert len(fig2._overlay_polys) == 0
 
 
+def test_primary_and_overlay_bins_share_the_one_owned_fill_alpha():
+    """#2: EVERY dis bin is translucent -- the lone (repeat=1) PRIMARY histogram reads the SAME as a
+    'create' overlay, never an opaque block beside translucent ones.  Both the primary PolyCollection and
+    each overlay use the ONE owned opacity (style.HIST_FILL_ALPHA), so they can never drift apart and the
+    threshold/fit lines read through the bars."""
+    ensure_qt_app()
+    from Zou_lab_control.frontend.style import HIST_FILL_ALPHA
+    rng = np.random.default_rng(5)
+    # a lone 1-D dis: the PRIMARY poly must carry the owned alpha (not opaque)
+    fig = plot(rng.normal(300.0, 20.0, 400), kind="hist")
+    assert fig.poly.get_alpha() == HIST_FILL_ALPHA, \
+        "the primary (repeat=1) histogram must use style.HIST_FILL_ALPHA, not be opaque"
+    # a 'create' block: every overlay shares the SAME owned alpha as the primary
+    R, n_sites = 3, 30
+    block = np.stack([rng.normal(300, 16, n_sites) for _ in range(R)])[:, None, :]   # (R,1,n_sites)
+    from Zou_lab_control.frontend.live import reduce_repeat
+    created = reduce_repeat(block, "create", core_ndim=2, hist=True)
+    fig2 = plot(created, kind="hist", bins=20)
+    assert fig2.poly.get_alpha() == HIST_FILL_ALPHA
+    for ov in fig2._overlay_polys:
+        assert ov.get_alpha() == HIST_FILL_ALPHA, "an overlay bin must share the primary's owned alpha"
+
+
 def test_separated_readout_reports_a_fidelity():
     """A genuinely bimodal readout (dark + bright) draws two peaks AND reports a finite fidelity (the
     separation gate is met)."""
