@@ -1505,6 +1505,12 @@ class PulseTableState:
             delay_units=dict(self.delay_units),
             name=self.name,
             scan_slots=scan_slots,
+            # api_slots carry through the unroll just like scan_slots (built above with the same
+            # target remap): a bracketed period's api-bound duration is duplicated to every copy
+            # (each carries the same api expression, so they resolve in lockstep), and the binding
+            # points at the first copy.  Omitting this dropped the api-slot bindings on any
+            # finite-bracket compile -- the same built-but-not-passed bug class as clk_channels below.
+            api_slots=api_slots,
             scan_table=[list(row) for row in self.scan_table],
             time_step_ns=self.time_step_ns,
             repeat_start=None,

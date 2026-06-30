@@ -32,6 +32,32 @@ from Zou_lab_control.neutral_atom.timing import (
 from Zou_lab_control.neutral_atom.timing.pulse_table import PulsePeriod
 
 
+def test_unrolled_bracket_preserves_api_slots_with_remapped_targets():
+    """A finite-bracket compile unrolls the table first; api-slot bindings must carry through that
+    unroll (with their period targets remapped), exactly like scan_slots and clk_channels.  The
+    rebuild used to BUILD the remapped api_slots and then omit ``api_slots=`` from the new state,
+    silently dropping every API binding on any finite-bracket compile -- the same built-but-not-
+    passed bug class the adjacent clk_channels comment documents."""
+    st = PulseTableState(
+        channels=["ch0"],
+        periods=[PulsePeriod(1.0, [1], unit="us"),
+                 PulsePeriod(2.0, [0], unit="us"),
+                 PulsePeriod(3.0, [1], unit="us")],
+        repeat_start=0, repeat_end=0, repeat_count=3,        # bracket the FIRST period x3
+    )
+    st.bind_api_field("duration", 2)                          # a duration handle on period AFTER the bracket
+    st.bind_api_field("delay", "ch0", unit="us")              # a delay handle on a channel (target = name)
+    assert len(st.api_slots) == 2
+
+    u = st.unrolled_bracket()
+    assert len(u.api_slots) == 2, "unrolled_bracket dropped the api-slot bindings"
+    by_kind = {s.kind: s.target for s in u.api_slots}
+    # period 2, after a (start=end=0, count=3) bracket, shifts to 2 + (3-1)*1 = 4
+    assert by_kind["duration"] == "4", "the duration handle's period target must be remapped through the unroll"
+    assert by_kind["delay"] == "ch0", "a delay handle targets a channel name -> unchanged by the unroll"
+    u.validate()                                              # the carried bindings are still self-consistent
+
+
 def test_api_slot_names_are_unique_each_binds_one_field():
     """Each API handle binds EXACTLY ONE field (names are unique, like the GUI allocates a
     fresh ``a<N>`` per click) -- ``validate`` rejects a duplicate; ``set_api`` writes only its
