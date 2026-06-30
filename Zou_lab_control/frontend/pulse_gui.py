@@ -40,6 +40,7 @@ from .qt_fluent import (
     ORANGE,
     RED,
     TEXT,
+    WINDOW_SCREEN_FRACTION,
     YELLOW,
     ElidedLabel,
     FluentButton,
@@ -134,7 +135,7 @@ HIDE_BUTTON_WIDTH = 26
 PANEL_TOP_HEIGHT = 178   # name row + Duration label + value + unit (all four panels share it)
 CHANNEL_ROW_SPACING = 4
 PERIOD_CARD_WIDTH = 158
-DEFAULT_WINDOW_RATIO = 0.90
+DEFAULT_WINDOW_RATIO = WINDOW_SCREEN_FRACTION   # the ONE shared screen-fraction (qt_fluent), == task console
 DEFAULT_HARDWARE_CLOCK_HZ = 50_000_000.0
 DEFAULT_TIME_STEP_NS = 1_000_000_000.0 / DEFAULT_HARDWARE_CLOCK_HZ
 SUMMARY_DEBOUNCE_MS = 90

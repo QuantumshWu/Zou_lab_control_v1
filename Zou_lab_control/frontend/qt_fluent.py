@@ -116,6 +116,12 @@ _WINDOW_TITLEBAR_PX = 36                # title-bar height allowance
 _WINDOW_TITLEBAR_FLOOR_PX = 28          # scaled_px floor for the title bar
 _WINDOW_MAX_FLOOR_PX = (360, 320)       # absolute (w, h) floor for the screen-fit max
 
+#: The fraction of the primary screen each top-level GUI (task console + pulse editor) opens at.
+#: ONE editable knob both windows read through ``screen_fit_window_size``, so they open the SAME
+#: size on the same screen (it used to be 0.90 in the pulse editor but a stray 0.84 in the console).
+#: User-tunable, like the other uppercase constants in this module.
+WINDOW_SCREEN_FRACTION = 0.90
+
 
 def resolve_fluent_auto_scale(app: QtWidgets.QApplication | None = None) -> float:
     """The shared automatic fluent scale for the current primary screen."""

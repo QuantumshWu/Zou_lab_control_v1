@@ -176,3 +176,45 @@ def test_edit_rebuild_keeps_last_good_snapshot_on_build_error(monkeypatch):
     finally:
         console.shutdown()
         exp.close()
+
+
+def test_force_rebuild_keeps_card_plotter_on_failed_build(monkeypatch):
+    """#4 root fix for the scroll-bins-vanishes race: a STRUCTURE knob (bins/colormap/fit) forces a
+    rebuild via the ``_force_rebuild`` flag -- it does NOT pre-tear the plotter down.  So if the rebuild
+    raises (a transient namespace), ``_build_plot``'s build-then-swap leaves the OLD plotter in place
+    and the live card never blanks; the flag stays set so the next tick retries.  (Before, ``_set_param``
+    called ``_reset_plot()`` which nulled ``card.plotter`` up-front, latching a permanent blank that the
+    Edit ``rebuild`` then propagated via its ``card.plotter is None`` guard.)"""
+    ensure_qt_app()
+    import Zou_lab_control.frontend.task_console as tc
+    exp, console = _console()
+    try:
+        card = _hist_card(console)
+        good = card.plotter
+        assert good is not None
+        monkeypatch.setattr(tc, "panel_plot", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+        card._force_rebuild = True
+        try:
+            card._render(np.array([300.0, 320.0, 1400.0, 1420.0]))   # forced rebuild -> _build_plot raises
+        except RuntimeError:
+            pass
+        assert card.plotter is good, "a failed forced rebuild must KEEP the old plotter (no blank)"
+        assert card._force_rebuild is True, "flag stays set so the next tick retries the rebuild"
+    finally:
+        console.shutdown()
+        exp.close()
+
+
+def test_both_gui_windows_share_one_editable_screen_fraction():
+    """#5: the task console and the pulse editor open at the SAME fraction of the screen, read from ONE
+    user-editable constant ``qt_fluent.WINDOW_SCREEN_FRACTION`` -- not two divergent literals (the pulse
+    editor's 0.90 vs the console's stray 0.84)."""
+    import inspect
+
+    from Zou_lab_control.frontend import pulse_gui, qt_fluent
+    from Zou_lab_control.frontend.task_console import TaskConsole, show_task_console
+
+    frac = qt_fluent.WINDOW_SCREEN_FRACTION
+    assert pulse_gui.DEFAULT_WINDOW_RATIO == frac                       # pulse editor reads the constant
+    assert inspect.signature(TaskConsole.__init__).parameters["window_ratio"].default == frac
+    assert inspect.signature(show_task_console).parameters["window_ratio"].default == frac

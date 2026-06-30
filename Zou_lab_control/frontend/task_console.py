@@ -64,6 +64,7 @@ from .qt_fluent import (
     ORANGE,
     RED,
     TEXT,
+    WINDOW_SCREEN_FRACTION,
     YELLOW,
     FluentButton,
     FluentCodeEdit,
@@ -1604,6 +1605,11 @@ class PanelCard(FluentGroupBox):
         self.plotter = None
         self.canvas = None
         self._value_shape: tuple[int, ...] | None = None
+        # A STRUCTURE knob (bins / colormap / fit ...) sets this to force the NEXT _render to REBUILD
+        # the plotter -- WITHOUT pre-tearing it down.  _build_plot build-then-swaps, so a failed rebuild
+        # keeps the OLD figure (the card never goes blank) -- the root fix for the "scroll bins and the
+        # figure occasionally vanishes" race, where a pre-null teardown could latch plotter=None.
+        self._force_rebuild = False
         # The LAST namespace this panel rendered from (a reference to the hub
         # snapshot of that tick).  A display-only change (cmap / relim / source pick)
         # tears the plotter down and normally waits for the NEXT hub tick to rebuild --
@@ -2457,7 +2463,11 @@ class PanelCard(FluentGroupBox):
         if self.plotter is not None and self.plotter.apply_param(key, value):
             self.changed.emit()
             return
-        self._reset_plot()
+        # A STRUCTURE knob the plotter can't apply in place (bins / colormap / fit mode ...): force a
+        # REBUILD on the next render, but do NOT tear the old plotter down first.  _build_plot
+        # build-then-swaps, so if the rebuild raises (a transient namespace) the OLD figure stays and
+        # the card never blanks -- the root fix for the scroll-bins-vanishes race.
+        self._force_rebuild = True
         self._rerender_last()   # take effect NOW (e.g. colormap) even if the source is stopped
         self.changed.emit()
 
@@ -2863,7 +2873,7 @@ class PanelCard(FluentGroupBox):
         kind = self.config.kind
         if kind == "hist":
             value = self._hist_samples(value)
-        rebuild = self.plotter is None
+        rebuild = self.plotter is None or self._force_rebuild
         if not rebuild and kind in ("2d", "1d", "sites"):
             rebuild = tuple(np.shape(value)) != self._value_shape
         if not rebuild and kind == "2d":
@@ -2872,7 +2882,8 @@ class PanelCard(FluentGroupBox):
             roi = self._source_coord_frame(namespace)
             rebuild = (list(roi) if roi else None) != getattr(self, "_roi_built", None)
         if rebuild:
-            self._build_plot(value, namespace)
+            self._build_plot(value, namespace)             # build-then-swap: a failed build keeps the old figure
+            self._force_rebuild = False                    # cleared ONLY after a clean build (else retry next tick)
             self._value_shape = (1,) if isinstance(value, float) else tuple(np.shape(value))
             if kind == "monitor":
                 # The build already plotted this value as the first point; record
@@ -4599,7 +4610,7 @@ class TaskConsole(QtWidgets.QWidget):
         tasks: Sequence[object] = (),
         session: object | None = None,
         scale: float | None = None,
-        window_ratio: float = 0.84,
+        window_ratio: float = WINDOW_SCREEN_FRACTION,
         window_px: tuple[int, int] | None = None,
     ):
         ensure_qt_app()
@@ -6371,7 +6382,7 @@ def show_task_console(
     tasks: Sequence[object] = (),
     session: object | None = None,
     scale: float | None = None,
-    window_ratio: float = 0.84,
+    window_ratio: float = WINDOW_SCREEN_FRACTION,
     title: str = "TaskConsole@Zou lab",
     on_close=None,
     hide_on_close: bool = False,
