@@ -2035,11 +2035,11 @@ class PanelCard(FluentGroupBox):
         through the same widget path as every other param.  This is the ONLY repeat knob on the plot:
         the COUNT (``repeat``) belongs to the MEASUREMENT (the plot cannot tell a measurement how many
         times to run) -- the plot just chooses how to DISPLAY the repeats the measurement produced.
-        Each plot KIND exposes only the repeat modes meaningful for it (#issue-1), read from the one
-        ``PLOT_KINDS`` table: a trace/image reduces its repeats (average/add/replace/roll/+create for
-        1-D), a DISTRIBUTION instead bins them (pool / latest).  So a histogram never offers a trace
-        verb like ``roll`` (and never silently ignores the control), and the default is the kind's first
-        (canonical) mode."""
+        Each plot KIND exposes the repeat modes meaningful for it (#issue-1), read from the one
+        ``PLOT_KINDS`` table: the BASE verbs (average/add/replace) are GENERIC across EVERY kind (one
+        ``reduce_repeat`` collapses the axis the same way); a trace adds ``roll``; a DISTRIBUTION adds
+        ``pool`` (bin every repeat together) and defaults to it.  2d/sites omit per-repeat ``create``.
+        No kind offers a mode it would silently ignore; the default is the kind's first (canonical) mode."""
         modes = self._kind_repeat_modes()
         return (
             ParamDecl(key="repeat_mode", label="repeat mode", kind="choice", default=modes[0],
@@ -2076,9 +2076,11 @@ class PanelCard(FluentGroupBox):
         the experiment meaning, not a generic array verb.  Generic otherwise, driven off the signal's
         role rather than the panel kind."""
         if self.config.kind == "hist":
-            return ("How to BIN the measurement's repeats into the distribution:\n"
-                    "  pool   = bin EVERY repeat's samples into one histogram (all repeats together)\n"
-                    "  latest = bin only the newest repeat's samples")
+            return ("How to combine the measurement's repeats into the distribution:\n"
+                    "  pool    = bin EVERY repeat's samples into ONE histogram (all repeats together)\n"
+                    "  average = bin the per-point MEAN over the repeats (one histogram)\n"
+                    "  add     = bin the per-point SUM over the repeats\n"
+                    "  replace = bin only the newest repeat's samples")
         if self._bound_is_occupancy():
             return ("How to combine the N shots of per-site occupancy for display:\n"
                     "  average = per-site LOADING PROBABILITY = mean of the N shots' 0/1\n"

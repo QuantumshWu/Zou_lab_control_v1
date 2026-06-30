@@ -2289,12 +2289,15 @@ class PlotKind:
 # PANEL_SINGLE_SLOT_KINDS from it (no parallel literals).  Order is the Add-Panel
 # menu order.  ``monitor`` lists its DEFAULT class (LiveLiveDis, show_dist=True); the
 # bare LiveLive variant is the show_dist=False toggle, still inside plot().
-# Repeat-display vocabularies (single source).  TRACE/IMAGE modes REDUCE the repeat axis;
-# the DISTRIBUTION instead BINS the repeats' samples -- a separate, dedicated vocabulary so a
-# trace verb (roll/replace) is never offered on (or silently ignored by) a histogram (#issue-1).
-TRACE_REPEAT_MODES: tuple[str, ...] = REPEAT_MODES                                     # full set (create = 1-D)
-IMAGE_REPEAT_MODES: tuple[str, ...] = ("average", "add", "replace")                    # a frame: mean/sum/latest
-HIST_REPEAT_MODES: tuple[str, ...] = ("pool",)              # distribution: bin ALL repeats' samples together
+# Repeat-display vocabularies (single source).  The BASE verbs (average/add/replace) are GENERIC --
+# ``reduce_repeat`` collapses the repeat axis the same way for ANY plot kind -- so every kind offers
+# them.  Only two specialisations: ``create`` (one line / one sub-distribution per repeat) is for the
+# 1-D families incl. the distribution, but NOT 2d/sites (an image has no per-repeat-line meaning);
+# ``pool`` (bin EVERY repeat's samples into ONE histogram) is the distribution's own extra mode.
+_BASE_REPEAT_MODES: tuple[str, ...] = ("average", "add", "replace")
+TRACE_REPEAT_MODES: tuple[str, ...] = REPEAT_MODES                                     # base + roll + create
+IMAGE_REPEAT_MODES: tuple[str, ...] = _BASE_REPEAT_MODES                               # a frame: mean/sum/latest, no create
+HIST_REPEAT_MODES: tuple[str, ...] = ("pool",) + _BASE_REPEAT_MODES                    # pool (default) + base; create (multi-hist) added with its artist
 
 PLOT_KINDS: tuple[PlotKind, ...] = (
     PlotKind(

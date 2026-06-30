@@ -194,14 +194,16 @@ def test_plot_setting_has_only_repeat_mode_not_repeat(monkeypatch):
         modes2 = [combo2.itemText(i) for i in range(combo2.count())]
         assert "average" in modes2 and "create" not in modes2  # 2-D: no per-repeat lines
 
-        # A DISTRIBUTION has ONE dedicated repeat mode -- 'pool' (bin ALL repeats' samples together) -- NOT
-        # trace verbs (#issue-1, #H4b): it must never show 'roll'/'average'/'create' (a histogram can't "roll").
+        # A DISTRIBUTION DEFAULTS to 'pool' (bin ALL repeats together) and now ALSO offers the GENERIC
+        # base verbs (average/add/replace) -- ONE reduce_repeat collapses the repeat axis the same way
+        # for any kind (#issue-1).  It does NOT offer the trace-only 'roll'.
         card.config.kind = "hist"
         card._build_settings()
         combo3 = card.param_widgets["repeat_mode"]
         modes3 = [combo3.itemText(i) for i in range(combo3.count())]
-        assert modes3 == ["pool"]                                  # the ONLY dist repeat mode (no 'latest')
-        assert not ({"average", "add", "replace", "roll", "create"} & set(modes3))  # no trace verbs on a dist
+        assert modes3[0] == "pool"                                 # pool is the dist's canonical default (first)
+        assert {"average", "add", "replace"} <= set(modes3)        # the base verbs are generic across kinds
+        assert "roll" not in modes3                                # 'roll' is a trace-only verb (no rolling histogram)
     finally:
         console.shutdown()
 
