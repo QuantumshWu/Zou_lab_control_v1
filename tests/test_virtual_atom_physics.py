@@ -80,6 +80,23 @@ def test_threshold_frames_are_independent_loadings():
     assert centre.max() - centre.min() > 50.0    # a real bimodal gap, not just noise
 
 
+def test_repeated_single_trigger_frames_all_use_the_window_exposure():
+    """Every frame of a repeated single-trigger acquisition is imaged through the SAME one trigger
+    window, so ALL frames share that window's (short) exposure -- NOT a mix where frame 0 uses the
+    2 ms window and the repeats fall back to the camera-default (20 ms) exposure.  A mixed-brightness
+    set teaches a per-site threshold ABOVE the true short-exposure readout brightness, so a freshly
+    loaded atom reads as EMPTY and release-recapture survival / readout fidelity collapse to 0 -- the
+    regression this guards (the threshold floated 209 -> 286 above the ~210 atom signal at 2 ms)."""
+    trap, cam, seqr = _rig(loading_probability=1.0)            # every site loaded -> brightness == exposure
+    seq = imaging_sequence(exposure=2e-3, load=True, name="readout")   # a SHORT 2 ms readout window
+    frames = cam.acquire(8, sequence=seq, on_armed=lambda: (seqr.prepare(seq), seqr.fire(seq)))
+    over_bg = np.array([float(np.asarray(f).max()) - 200.0 for f in frames])   # peak atom signal per frame
+    assert over_bg.min() > 0                                   # every frame imaged a real atom
+    # all frames at the SAME short-exposure brightness; the bug made the repeats ~6x brighter
+    # (camera-default 20 ms) than the 2 ms window-0 frame, blowing this ratio far past 2.
+    assert over_bg.max() <= 2.0 * over_bg.min()
+
+
 def test_release_recapture_survival_decays_with_trap_off_temperature():
     """Survival after a trap-off gap falls from ~1 (no time to escape) toward 0 as the
     gap grows, at a rate set by the COOLED temperature -- the temperature-scan signal."""

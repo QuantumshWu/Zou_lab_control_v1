@@ -525,8 +525,17 @@ class VirtualTrapArray(TrapArrayDevice):
         # cooling phase -> saturated load).  A multi-trigger cycle (base_triggers >= frames, e.g. a
         # release-recapture bracket) instead HOLDS one loading and a mid-cycle cooling RE-cools it.
         repeated_shot_cooling = cooling_durations[0] if cooling_durations else 0.0
+        # A repeated single-trigger shot images EVERY frame through the SAME one trigger window, so
+        # every frame uses THAT window's exposure -- not the camera-default `exposures_per_frame`
+        # falls back to for frames past the (single) trigger.  Mixing a short window-0 with
+        # default-length repeats skews a per-site threshold learnt across the frames ABOVE the real
+        # readout brightness, so a freshly loaded atom at the readout exposure reads as EMPTY
+        # (release-recapture survival / readout fidelity collapse to 0).  Mirrors repeated_shot_cooling.
+        repeated_shot_exposure = exposures[0] if exposures else float(exposure)
         images: list[np.ndarray] = []
         for frame_index in range(frames):
+            frame_exposure = (
+                repeated_shot_exposure if (not single_cycle and frame_index >= 1) else exposures[frame_index])
             if not all_sites:
                 cool_dt = cooling_durations[frame_index]
                 trap_off = trap_off_per_frame[frame_index]
@@ -549,7 +558,7 @@ class VirtualTrapArray(TrapArrayDevice):
                 # Dark trap-ON hold loses atoms to vacuum collisions; skipped on frame 0 (the load).
                 if trap_hold > 0.0 and frame_index >= 1:
                     self.apply_trap_loss(trap_hold)
-            images.append(self.render_image(exposure=exposures[frame_index], all_sites=all_sites))
+            images.append(self.render_image(exposure=frame_exposure, all_sites=all_sites))
         return images
 
     def snapshot(self) -> dict[str, object]:
