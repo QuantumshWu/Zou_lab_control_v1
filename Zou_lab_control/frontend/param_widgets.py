@@ -116,11 +116,8 @@ class ParamWidgetContext:
         """The SHORT-name map ({full hub name -> short name}) the grouped picker uses as ``labels`` so a
         leaf reads "frame_0", NOT the prefix-stripped "0" -- so a ``signal``-kind picker renders the SAME
         as the plot Setting / signal_expr pickers (#combo-parity)."""
-        try:
-            return {str(n): str(s) for n, s in dict(self.labels_provider()).items() if s} \
-                if callable(self.labels_provider) else {}
-        except Exception:
-            return {}
+        from .task_console import coerce_short_labels   # lazy: task_console imports THIS module (cycle)
+        return coerce_short_labels(self.labels_provider)
 
 
 @dataclass

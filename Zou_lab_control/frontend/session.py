@@ -10,37 +10,12 @@ from typing import Any, Callable, Sequence
 
 import numpy as np
 
+from ._validate import _positive_float, _positive_int, _strict_bool
 from .live import _as_data_x, _as_data_y, _normalize_kind, plot
 
 
 def _is_integer_scalar(value) -> bool:
     return isinstance(value, (int, np.integer)) and not isinstance(value, (bool, np.bool_))
-
-
-def _strict_bool(value, name: str) -> bool:
-    if isinstance(value, (bool, np.bool_)):
-        return bool(value)
-    raise TypeError(f"{name} must be a boolean.")
-
-
-def _positive_float(value, name: str) -> float:
-    if isinstance(value, (bool, np.bool_)):
-        raise TypeError(f"{name} must be finite, not a boolean.")
-    result = float(value)
-    if not np.isfinite(result) or result <= 0:
-        raise ValueError(f"{name} must be finite and > 0.")
-    return result
-
-
-def _positive_int(value, name: str) -> int:
-    if isinstance(value, (bool, np.bool_)):
-        raise TypeError(f"{name} must be a positive integer, not a boolean.")
-    if not isinstance(value, (int, np.integer)):
-        raise TypeError(f"{name} must be a positive integer.")
-    result = int(value)
-    if result <= 0:
-        raise ValueError(f"{name} must be a positive integer.")
-    return result
 
 
 def _call_accepts(func: Callable, args: tuple[Any, ...]) -> bool:

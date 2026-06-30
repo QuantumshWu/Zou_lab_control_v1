@@ -15,6 +15,7 @@ from matplotlib.ticker import Formatter, FuncFormatter, MaxNLocator, ScalarForma
 import numpy as np
 from scipy.optimize import curve_fit
 
+from ._validate import _positive_float
 from .canvas import FigureSpec, configure_canvas, create_axes_fixed, create_axes_grid, display_figure, grid_shape_for, new_figure, split_axes_horizontally
 from .selectors import AreaSelector, CrossSelector, DragHLine, DragVLine, InteractionBundle, PlotState, ZoomPan, attach_interaction
 from Zou_lab_control._readout_math import (
@@ -272,15 +273,6 @@ def _float2str_eng(x: float, length: int = 5) -> str:
     return f"{mant}e{int(exp)}"
 
 
-def _positive_float(value, name: str) -> float:
-    if isinstance(value, (bool, np.bool_)):
-        raise TypeError(f"{name} must be finite, not a boolean.")
-    result = float(value)
-    if not np.isfinite(result) or result <= 0:
-        raise ValueError(f"{name} must be finite and > 0.")
-    return result
-
-
 def _with_title_margin(spec: FigureSpec, title: str, margins_supplied: bool) -> FigureSpec:
     if not title or margins_supplied:
         return spec
@@ -311,6 +303,19 @@ def _update_verts(bins, counts, verts, mode: str = "horizontal") -> None:
         verts[:, 3, 1] = 0
 
 
+def _dist_count_xlim(n) -> int:
+    """The side distribution-band count(x)-axis upper limit, from the per-bin counts ``n`` -- the ONE
+    rule every band shares (Live2DDis / LiveSiteMap / LiveLiveDis, INIT and UPDATE alike) so the bar
+    column never touches the right edge and the five call sites cannot drift into two headroom rules.
+
+    Small headroom (``peak * 1.5``, floored to ``peak + 5`` for tiny peaks, never below 10) keeps the
+    tallest bar clear of the axis edge per the no-cutoff/no-overlap layout rule -- an appearance-neutral
+    single source, NOT the old no-headroom ``peak + 5`` that left the top bar flush against the frame."""
+    arr = np.asarray(n, dtype=float)
+    peak = float(np.nanmax(arr)) if arr.size and np.isfinite(arr).any() else 0.0
+    return max(10, int(max(peak + 5, peak * 1.5)))
+
+
 class BaseLivePlot:
     """Base class shared by notebook live plotters.
 
@@ -338,7 +343,7 @@ class BaseLivePlot:
         _update_verts(self.bins, self.n, self.verts, mode="horizontal")
         self.poly = PolyCollection(self.verts, facecolors=PALETTE["hist_fill"])
         self.axdis.add_collection(self.poly)
-        self.axdis.set_xlim(0, max(10, int(np.max(self.n) + 5)))
+        self.axdis.set_xlim(0, _dist_count_xlim(self.n))
         self.axdis.xaxis.set_major_locator(MaxNLocator(nbins=1, prune="lower"))
         self.axdis.xaxis.set_major_formatter(ScalarFormatter())
         self.axdis.tick_params(axis="x", which="both", bottom=True, top=False, labelbottom=True, labeltop=False)
@@ -728,6 +733,14 @@ class Live1D(BaseLivePlot):
             self.ylabel = f"{self.labels[1]} x{self.repeat_cur}" if self.repeat_cur != 1 else self.labels[1]
             self.repeat_label = self.repeat_cur
             self.ax.set_ylabel(self.ylabel)
+        # Grow a Line2D per data column that appeared AFTER init (notebook update_point(mode='create')
+        # pads data_y with a new column per repeat).  self.lines is frozen at show() time, so without this
+        # the new columns would never be drawn -- the SAME on-demand artist pattern HistogramFigure uses
+        # (_ensure_overlays).  When no column was added the while-loop is a no-op (byte-identical old path).
+        while len(self.lines) < self.data_y.shape[1]:
+            (ln,) = self.ax.plot([], [])
+            self.lines.append(ln)
+        self._color_lines()
         self.relim()
         self.ax.set_ylim(self.ylim_min, self.ylim_max)
         for i, line in enumerate(self.lines):
@@ -817,8 +830,7 @@ class LiveLiveDis(LiveLive):
         _update_verts(self.bins, self.n, self.verts, mode="horizontal")
         self.poly = PolyCollection(self.verts, facecolors=PALETTE["hist_fill"])
         self.axdis.add_collection(self.poly)
-        self.counts_max = max(10, int(np.nanmax(self.n) + 5 if self.n.size else 10))
-        self.axdis.set_xlim(0, self.counts_max)
+        self.axdis.set_xlim(0, _dist_count_xlim(self.n))
         (self.gauss_line,) = self.axdis.plot([], [], color=PALETTE["fit_right"], alpha=1)
 
     def _hist(self):
@@ -873,9 +885,7 @@ class LiveLiveDis(LiveLive):
         self.n, self.bins = self._hist()
         _update_verts(self.bins, self.n, self.verts, mode="horizontal")
         self.poly.set_verts(self.verts)
-        peak = np.nanmax(self.n)
-        counts_max = max(10, int(max(peak + 5, peak * 1.5)))
-        self.axdis.set_xlim(0, counts_max)
+        self.axdis.set_xlim(0, _dist_count_xlim(self.n))
         self._update_gauss_fit()
 
     def _install_state(self) -> None:
@@ -1003,7 +1013,7 @@ class Live2DDis(BaseLivePlot):
             self.n, self.bins = np.histogram(vals, bins=self.n_bins, range=(self.ylim_min, self.ylim_max))
             _update_verts(self.bins, self.n, self.verts, mode="horizontal")
             self.poly.set_verts(self.verts)
-            self.axdis.set_xlim(0, max(10, int(max(np.max(self.n) + 5, np.max(self.n) * 1.5))))
+            self.axdis.set_xlim(0, _dist_count_xlim(self.n))
             self.line_min.set_ydata([y_min, y_min])
             self.line_max.set_ydata([y_max, y_max])
             if float(self.line_l.get_ydata()[0]) > y_min or float(self.line_h.get_ydata()[0]) < y_max:
@@ -1183,7 +1193,7 @@ class LiveSiteMap(BaseLivePlot):
         self.n, self.bins = np.histogram(vals, bins=self.n_bins, range=(self.ylim_min, self.ylim_max))
         _update_verts(self.bins, self.n, self.verts, mode="horizontal")
         self.poly.set_verts(self.verts)
-        self.axdis.set_xlim(0, max(10, int(np.max(self.n) + 5)))
+        self.axdis.set_xlim(0, _dist_count_xlim(self.n))
         # keep the draggable clim lines at the (re)computed limits unless the user dragged inside
         if getattr(self, "line_l", None) is not None:
             self.line_l.set_ydata([self.ylim_min, self.ylim_min])

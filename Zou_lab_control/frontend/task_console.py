@@ -373,6 +373,20 @@ def read_editable_combo(combo) -> str:
     return text.strip()
 
 
+def coerce_short_labels(provider) -> dict:
+    """Normalise a ``{full hub name -> short name}`` callback into the ``labels`` map every grouped
+    signal picker feeds ``fill_grouped_signal_combo``: callable-guard, ``str()`` both ends, drop empty
+    short names, swallow any provider exception to ``{}``.  The ONE source the signal_expr / plot
+    Setting slot / form signal pickers share so they render IDENTICALLY (#combo-parity) instead of four
+    hand-copied dict comprehensions (the 4th of which had already dropped the try/except)."""
+    if not callable(provider):
+        return {}
+    try:
+        return {str(n): str(s) for n, s in dict(provider()).items() if s}
+    except Exception:
+        return {}
+
+
 def _scan_modes() -> tuple[str, str, str]:
     """The ("none", "api", "scan") tuple -- fetched lazily from the ONE backend source
     (``operations.measurements.pulse_scan.SCAN_MODES``) so the name strings are typed once and the
@@ -853,11 +867,7 @@ class _SignalExprWidget(QtWidgets.QWidget):
             return {}
 
     def _labels(self) -> dict:
-        try:
-            return {str(n): str(s) for n, s in dict(self._labels_provider()).items() if s} \
-                if callable(self._labels_provider) else {}
-        except Exception:
-            return {}
+        return coerce_short_labels(self._labels_provider)
 
     def _rebuild_slots(self) -> None:
         for combo in self.slot_combos:
@@ -1906,25 +1916,11 @@ class PanelCard(FluentGroupBox):
                 self._make_fixed_lim_row(self._on_fixed_lim_edited, label_w)
             sec.addWidget(self.fixed_lim_row)
 
-            # unit cycle: a single row [Unit button | <stretch> | current unit text]
-            # under the "unit" label, so the layout rhythm stays one-control-per-row.
-            self.unit_button = FluentButton("Unit", color=GREY)
-            self.unit_button.setFixedWidth(scaled_px(70, minimum=56))
-            self.unit_button.setToolTip(
-                "Cycle the x-axis unit (GHz/nm/MHz or ns/us/ms) where the axis label\n"
-                "declares one; persisted and re-applied to the live panel")
-            self.unit_button.clicked.connect(self._on_unit_cycle)
-            self.unit_label = FluentLabel(self._current_unit_text())
-            self.unit_label.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
-            self.unit_label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-            unit_inner = QtWidgets.QWidget()
-            unit_inner_layout = QtWidgets.QHBoxLayout(unit_inner)
-            unit_inner_layout.setContentsMargins(0, 0, 0, 0)
-            unit_inner_layout.setSpacing(scaled_px(6, minimum=4))
-            unit_inner_layout.addWidget(self.unit_button, 0)
-            unit_inner_layout.addStretch(1)
-            unit_inner_layout.addWidget(self.unit_label, 0)
-            sec.addWidget(FluentSettingRow("unit", unit_inner, label_width=label_w))
+            # unit cycle: a single row [Unit button | <stretch> | current unit text] under the "unit"
+            # label (one-control-per-row rhythm) -- the IDENTICAL row the Edit tab builds via the helper.
+            unit_row, self.unit_button, self.unit_label = \
+                self._make_unit_cycle_row(self._on_unit_cycle, label_w, with_label=True)
+            sec.addWidget(unit_row)
 
             # per-panel display refresh rate (this panel only).  A fixed, harmonic set so
             # panels that share a beat stay frame-coherent (see UPDATE_INTERVALS); a fast rate
@@ -2029,6 +2025,34 @@ class PanelCard(FluentGroupBox):
         row = FluentSettingRow("lo / hi", host, label_width=label_w)
         row.setVisible(self._relim() == "fixed")
         return row, lo, hi
+
+    def _make_unit_cycle_row(self, on_click, label_w, *, with_label: bool):
+        """The x-axis unit-cycle row as ONE bespoke ``[Unit button | <stretch> [| current-unit text]]``
+        row.  Built by this ONE helper (like ``_make_fixed_lim_row``) so the Setting popup and the Edit
+        tab get the IDENTICAL row -- same button width, same flush-left idiom, same SINGLE tooltip --
+        instead of two hand-copied blocks whose tooltips had already drifted apart.  ``with_label=True``
+        (Setting) also builds the live current-unit ``self.unit_label`` (refreshed by ``_on_unit_cycle``);
+        Edit passes ``with_label=False``.  Returns ``(row, button, label_or_None)``."""
+        button = FluentButton("Unit", color=GREY)
+        button.setFixedWidth(scaled_px(70, minimum=56))
+        button.setToolTip(
+            "Cycle the x-axis unit (GHz/nm/MHz or ns/us/ms) where the axis label\n"
+            "declares a convertible unit; otherwise a no-op")
+        button.clicked.connect(on_click)
+        host = QtWidgets.QWidget()
+        lay = QtWidgets.QHBoxLayout(host)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(scaled_px(6, minimum=4))
+        lay.addWidget(button, 0)
+        lay.addStretch(1)
+        label = None
+        if with_label:
+            label = FluentLabel(self._current_unit_text())
+            label.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+            label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            lay.addWidget(label, 0)
+        row = FluentSettingRow("unit", host, label_width=label_w)
+        return row, button, label
 
     def _apply_lim_to_plotter(self) -> None:
         """Push the relim mode + fixed lo/hi onto the LIVE plotter and apply NOW (2D colour-limit / 1D
@@ -2212,12 +2236,7 @@ class PanelCard(FluentGroupBox):
         ``short_names_provider``, so the picker nest leaf is the short name (``frame`` / ``survival`` /
         ``rate``) -- NOT the full prefixed key and NOT the verbose SignalSpec axis label (``camera
         image``).  The picker nest already names the producer node, so the leaf is the short NAME."""
-        if not callable(self.short_names_provider):
-            return {}
-        try:
-            return {str(n): str(s) for n, s in dict(self.short_names_provider()).items() if s}
-        except Exception:
-            return {}
+        return coerce_short_labels(self.short_names_provider)
 
     def _refresh_signal_combo(self) -> None:
         """Refresh the signal picker with the hub's current signals, each labelled with the
@@ -3533,8 +3552,7 @@ class MeasurementPanel(QtWidgets.QWidget):
             except Exception: names = []
         sources = self._sources_provider() if callable(self._sources_provider) else {}
         formats = self._formats_provider() if callable(self._formats_provider) else {}
-        labels = ({str(n): str(s) for n, s in dict(self._short_names_provider()).items() if s}
-                  if callable(self._short_names_provider) else {})
+        labels = coerce_short_labels(self._short_names_provider)
         for key, widget in list(self._widgets.items()):
             kind = self._decls[key].kind
             # a DEPENDENT combo (pulse_param / pulse_slots) repopulates via the form's per-key
@@ -3819,23 +3837,11 @@ class PanelEditor(QtWidgets.QWidget):
             self.ed_fixed_row, self.ed_fixed_lo, self.ed_fixed_hi = \
                 card._make_fixed_lim_row(self._edit_fixed_lim, disp_lw)
             col.addWidget(self.ed_fixed_row)
-            # x-axis unit cycle -- reuse the card's _on_unit_cycle.
-            self.ed_unit_button = FluentButton("Unit", color=GREY)
-            self.ed_unit_button.setFixedWidth(scaled_px(70, minimum=56))
-            self.ed_unit_button.setToolTip(
-                "Cycle the x-axis unit (GHz/nm/MHz or ns/us/ms) where the axis label\n"
-                "carries a convertible unit; otherwise a no-op.")
-            self.ed_unit_button.clicked.connect(self._edit_unit_cycle)
-            # a fixed-width button in a FluentSettingRow's stretch cell would center; wrap it
-            # with a trailing stretch so it sits flush-left like the combos above (same idiom
-            # as the Setting popup's unit row).
-            unit_host = QtWidgets.QWidget()
-            unit_row = QtWidgets.QHBoxLayout(unit_host)
-            unit_row.setContentsMargins(0, 0, 0, 0)
-            unit_row.setSpacing(scaled_px(6, minimum=4))
-            unit_row.addWidget(self.ed_unit_button, 0)
-            unit_row.addStretch(1)
-            col.addWidget(FluentSettingRow("unit", unit_host, label_width=disp_lw))
+            # x-axis unit cycle -- the IDENTICAL row the Setting popup builds (shared helper), minus the
+            # Setting-only current-unit label; the callback re-routes through the card's _on_unit_cycle.
+            ed_unit_row, self.ed_unit_button, _ = \
+                card._make_unit_cycle_row(self._edit_unit_cycle, disp_lw, with_label=False)
+            col.addWidget(ed_unit_row)
 
         # ---- Processing: frozen snapshot + Refresh (Save is its own row below) -------------
         section("Processing")

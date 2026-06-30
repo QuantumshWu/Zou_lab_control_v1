@@ -173,10 +173,6 @@ def _channel_name_edit_width() -> int:
     return _px(108, minimum=88)
 
 
-def _delay_edit_width() -> int:
-    return _px(76, minimum=62)
-
-
 def _time_unit_width() -> int:
     return _px(TIME_UNIT_WIDTH, minimum=62)
 
@@ -195,10 +191,6 @@ def _shadow_pad() -> int:
 
 def _period_card_width() -> int:
     return _px(PERIOD_CARD_WIDTH, minimum=112)
-
-
-def _period_top_label_width() -> int:
-    return _px(56, minimum=46)
 
 
 def _default_pulse_name() -> str:
@@ -584,16 +576,6 @@ def _form_control_cell(widget: QtWidgets.QWidget) -> QtWidgets.QWidget:
 
 def _channel_row_height(channel_count: int) -> int:
     return _px(26 if channel_count > 16 else ROW_HEIGHT, minimum=22)
-
-
-def _bar_title(text: str) -> FluentLabel:
-    """Small bold section header used inside the compact bottom control bar."""
-
-    label = FluentLabel(text)
-    label.setStyleSheet(
-        f'QLabel {{ color: {GREY}; font: 600 {max(8, fluent_font_size() - 2)}pt "{FONT}"; background: transparent; }}'
-    )
-    return label
 
 
 def _elide_text(text: object, width: int) -> str:
