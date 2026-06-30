@@ -24,46 +24,35 @@ from __future__ import annotations
 import numpy as np
 
 from ...core.analysis import positive_int
-from ...timing import (
-    PulseTableState,
-    imaging_channel_kwargs,
-    resolve_pulse_template,
-    single_imaging_template,
-)
+from ...timing import PulseTableState, single_imaging_template
 from ..measurement import MeasurementSpec, ParamDecl, axis_range_tuple
 from ..measurement_registry import measurement
+from ._coupled_template import resolve_coupled_template
 
 DEFAULT_IMAGING_TEMPLATE = "pulses/probe_template.json"
 
 
 def _resolve_imaging_template(template: str, sequencer, *, trigger_channel: str | None = None) -> PulseTableState:
     """Load the SINGLE-image readout pulse the operator selected and map its role channels onto whatever
-    THIS sequencer exposes -- the SAME pattern ``temperature`` uses for the release-recapture pulse.  A
-    file whose channels are already all on the sequencer is honoured as-is (its tuned durations kept);
-    otherwise (a role-named template on a real ``ch00..`` streamer, or no file) the standard
-    single-image template is rebuilt on this sequencer's channels via ``imaging_channel_kwargs`` -- the
-    SAME role->channel single source the imaging path uses.  ``trigger_channel`` is the CAMERA's
-    ``capture_trigger_channels[0]`` (the sequencer no longer owns it): a real chNN streamer needs it to
-    map the camera trigger onto a real channel.  Either way the result is a one-trigger load->image
-    program whose ``image`` duration is the readout window."""
-    chans = list(getattr(sequencer, "channels", ()) or ())
-    loaded = resolve_pulse_template(template, default_name=DEFAULT_IMAGING_TEMPLATE,
-                                    default_factory=single_imaging_template)
-    if chans and all(c in chans for c in loaded.channels):
-        state = loaded                               # channels already match -> honour the template
-    else:
-        kw = imaging_channel_kwargs(sequencer, trigger_channel=trigger_channel)
-        role_kwargs = {k: kw[k] for k in
-                       ("trap_channel", "cooling_channel", "probe_channel", "trigger_channel") if k in kw}
-        state = single_imaging_template(channels=chans or None, **role_kwargs)
-    # Bind a duration SCAN slot on the IMAGE period -- the readout window the scan sweeps (the imaging
-    # light-on time on the streamer; the camera gate is matched per point by build_detection_scan).  This
-    # is the fidelity analogue of temperature's trap-off slot ``s0``; bind_field is idempotent, so a
-    # template that already ships the slot is honoured unchanged.
-    img_idx = next((i for i, p in enumerate(state.periods) if "image" in str(p.name)),
-                   len(state.periods) - 1)
-    state.bind_field("duration", str(img_idx), label="Detection time", unit="s")
-    return state
+    THIS sequencer exposes -- the SAME shared coupled-template resolver ``temperature`` uses.  A file
+    whose channels already match the sequencer is honoured as-is (tuned durations kept); otherwise (a
+    role-named template on a real ``ch00..`` streamer, or no file) the standard single-image template is
+    rebuilt on this sequencer's channels via ``imaging_channel_kwargs``.  ``trigger_channel`` is the
+    CAMERA's ``capture_trigger_channels[0]``.  ``missing_policy="fabricate"``: a missing/unnamed template
+    falls back to the standard single-image program.  The resolver binds a duration SCAN slot on the IMAGE
+    period -- the readout window the scan sweeps (the fidelity analogue of temperature's trap-off slot
+    ``s0``)."""
+    return resolve_coupled_template(
+        template, sequencer,
+        default_name=DEFAULT_IMAGING_TEMPLATE,
+        default_factory=single_imaging_template,
+        role_keys=("trap_channel", "cooling_channel", "probe_channel", "trigger_channel"),
+        trigger_channel=trigger_channel,
+        missing_policy="fabricate",                  # a missing/unnamed template fabricates the default
+        fallback_to_loaded_channels=False,           # single_imaging_template uses its own role defaults
+        bind_period=lambda name: "image" in name,    # bind the IMAGE-period readout window as the scan slot
+        bind_label="Detection time", bind_unit="s",
+    )
 
 
 @measurement(order=20)

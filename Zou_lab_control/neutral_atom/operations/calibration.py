@@ -24,7 +24,7 @@ from ..core.analysis import (
     otsu_threshold,
 )
 from ..core.bimodal import fit_bimodal_per_site
-from ..core.calibration import TrapCalibration
+from ..core.calibration import READOUT_KINDS, TrapCalibration
 from ..core.psf import fit_site_psfs, fit_uniform_psf, psf_boxes_array, psf_weights_array
 from ..core.results import SitemapResult, ThresholdResult
 from ..core.utils import site_index
@@ -37,6 +37,17 @@ SUPPORTED_THRESHOLD_METHODS = ("otsu", "bimodal")
 #: calibration's ``by_method`` and the processor choice derive from this, never a retyped literal.
 #: Defined ABOVE the first function so the sitemap builder validates ``method`` against it (#F5).
 ALL_READOUT_METHODS = ("box", "psf", "uniform_psf")
+
+# Every offered method MUST declare its readout KIND in the core dispatch table, so
+# ``calibration.signals`` routes it by explicit kind (box ROI vs kernel matched-filter)
+# rather than a ``"psf" in name`` substring.  This guard catches a new method added here
+# but not registered in READOUT_KINDS at import time (it would otherwise dispatch wrong).
+_unregistered = tuple(m for m in ALL_READOUT_METHODS if m not in READOUT_KINDS)
+if _unregistered:
+    raise RuntimeError(
+        f"readout methods {_unregistered} are not in core.calibration.READOUT_KINDS -- "
+        "register each method's readout kind there so signals() dispatches it explicitly.")
+del _unregistered
 
 
 def calibrate_sitemap_from_images(
@@ -77,12 +88,13 @@ def calibrate_sitemap_from_images(
         # path) -- the psf_mode metadata records which kernel model produced it.
         uniform = method == "uniform_psf"
         psfs = (fit_uniform_psf if uniform else fit_site_psfs)(average, centers, half_width=psf_half_width)
+        # roi_radius / reducer are the BOX extraction geometry; a PSF readout reads through its
+        # kernels and ignores them (TrapCalibration drops them to None for a non-box method), so
+        # they are NOT passed here -- a PSF calibration carries no dead box-only state.
         calibration = TrapCalibration(
             centers,
             thresholds,
             grid_shape=grid_shape,
-            roi_radius=roi_radius,
-            reducer=reducer,
             method="psf",
             psf_weights=psf_weights_array(psfs),
             psf_boxes=psf_boxes_array(psfs),

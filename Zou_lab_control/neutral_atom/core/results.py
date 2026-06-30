@@ -130,7 +130,8 @@ class SitemapResult(ResultObject):
         return {
             "n_sites": self.calibration.n_sites,
             "grid_shape": None if self.calibration.grid_shape is None else list(self.calibration.grid_shape),
-            "roi_radius": self.calibration.roi_radius,
+            # roi_radius is box-only (None on a PSF calibration); report the box default for the ring size.
+            "roi_radius": self.calibration.roi_radius if self.calibration.roi_radius is not None else 1,
         }
 
     def _repr_html_(self) -> str:
@@ -214,7 +215,8 @@ class DetectionResult(ResultObject):
             self.image,
             self.calibration.centers,
             self.occupied,
-            roi_radius=self.calibration.roi_radius,
+            # roi_radius is box-only (None on a PSF calibration); fall back to the box default ring size.
+            roi_radius=self.calibration.roi_radius if self.calibration.roi_radius is not None else 1,
             labels=("Camera x (px)", "Camera y (px)", "Counts"),
             display=display,
         )

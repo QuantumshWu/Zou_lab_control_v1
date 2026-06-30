@@ -16,10 +16,11 @@ from __future__ import annotations
 import numpy as np
 
 from ...core.analysis import positive_int
-from ...timing import PulseTableState, imaging_channel_kwargs, resolve_pulse_template
+from ...timing import PulseTableState
 from ..measurement import MeasurementSpec, ParamDecl, axis_range_tuple
 from ..measurement_registry import measurement
 from ..temperature import build_release_recapture_pulse
+from ._coupled_template import resolve_coupled_template
 
 DEFAULT_RR_TEMPLATE = "pulses/release_recapture.json"
 
@@ -38,33 +39,23 @@ def _match_imaging_exposure(state: PulseTableState, exposure_s: float) -> None:
 
 def _resolve_release_recapture_template(template: str, sequencer, *, trigger_channel: str | None = None) -> PulseTableState:
     """Load the release-recapture pulse the operator SELECTED and map its role channels onto whatever
-    THIS sequencer exposes.  When the template's channels are already all on the sequencer (the virtual
-    roles, or a real-channel template the operator shipped) it is used AS-IS, so its tuned durations are
-    honoured.  When they are NOT (a role-named template on a real ``ch00..`` streamer) the standard
-    release-recapture is rebuilt with the session channels via ``imaging_channel_kwargs`` -- the SAME
-    role->channel single source as the imaging path -- so a role-named template still fires on real
-    hardware.  ``trigger_channel`` is the CAMERA's ``capture_trigger_channels[0]`` (the sequencer no
-    longer owns it): a real chNN streamer needs it to map the camera trigger onto a real channel.  Either
-    way the result keeps the trap-off duration scan slot ``build_temperature_scan`` requires.  A template
-    the operator NAMED but that resolves to no file fails LOUD (the selection step is real, never a silent
-    fall-back) -- the ``default_factory`` reached only when the named file is absent raises rather than
-    fabricating a default."""
-    named = bool(str(template or "").strip())
-
-    def _missing() -> PulseTableState:
-        raise FileNotFoundError(
-            f"release-recapture pulse template not found: {str(template).strip()}")
-
-    loaded = resolve_pulse_template(
-        template, default_name=DEFAULT_RR_TEMPLATE,
-        default_factory=(_missing if named else build_release_recapture_pulse),
+    THIS sequencer exposes (the shared coupled-template resolver).  A template whose channels already
+    match the sequencer is honoured AS-IS (tuned durations kept); otherwise (a role-named template on a
+    real ``ch00..`` streamer) the standard release-recapture is rebuilt on the session channels via
+    ``imaging_channel_kwargs``.  ``trigger_channel`` is the CAMERA's ``capture_trigger_channels[0]``.  The
+    result keeps the trap-off duration scan slot ``build_temperature_scan`` requires.  ``missing_policy=
+    "raise"``: a template the operator NAMED but that resolves to no file fails LOUD (the selection step
+    is real, never a silent fall-back)."""
+    return resolve_coupled_template(
+        template, sequencer,
+        default_name=DEFAULT_RR_TEMPLATE,
+        default_factory=build_release_recapture_pulse,
+        role_keys=("trap_channel", "probe_channel", "trigger_channel"),
+        trigger_channel=trigger_channel,
+        missing_policy="raise",                      # a NAMED-but-absent template fails LOUD
+        fallback_to_loaded_channels=True,            # the factory has no usable channels=None default
+        bind_period=None,                            # the trap-off scan slot already ships in the template
     )
-    chans = list(getattr(sequencer, "channels", ()) or ())
-    if chans and all(c in chans for c in loaded.channels):
-        return loaded                                # channels already match -> honour the template
-    kw = imaging_channel_kwargs(sequencer, trigger_channel=trigger_channel)
-    role_kwargs = {k: kw[k] for k in ("trap_channel", "probe_channel", "trigger_channel") if k in kw}
-    return build_release_recapture_pulse(channels=chans or list(loaded.channels), **role_kwargs)
 
 
 @measurement(order=10)
@@ -87,7 +78,9 @@ def temperature_release_recapture(readout) -> MeasurementSpec:
         # at the readout false-positive rate and it never reaches 0 (#H3v-2).  A high-SNR calibration
         # exposure then yields a clean survival -> 0 at large t_off (the real ballistic loss).
         cal = s.require_calibration(require_thresholds=True)
-        expo = (cal.metadata or {}).get("threshold_exposure") if isinstance(getattr(cal, "metadata", None), dict) else None
+        # The authoritative reader of the calibration's threshold_exposure; fallback=None means
+        # an UNstamped calibration does not force an exposure match (leave the template windows as-is).
+        expo = cal.readout_exposure(fallback=None)
         if expo:
             _match_imaging_exposure(state, float(expo))
         from ...devices import bind_pulse  # lazy: keep operations->devices off import-time graph

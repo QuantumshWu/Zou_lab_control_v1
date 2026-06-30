@@ -145,8 +145,9 @@ class ReadoutSubsystem(ExperimentSubsystem):
         s = self._session
         calibration = s.require_calibration(require_thresholds=True)
         if exposure is None:
-            md = getattr(calibration, "metadata", {}) or {}
-            exposure = md.get("threshold_exposure") or s._camera_exposure()
+            # The authoritative reader of the calibration's threshold_exposure (the gate the
+            # thresholds were learnt at); fall back to the camera's current exposure when unstamped.
+            exposure = calibration.readout_exposure(fallback=s._camera_exposure())
         sequence = s._imaging_sequence(exposure=float(exposure), load=True, name="detect")
         seq_dev = getattr(s.devices, "sequencer", None)
         images = s.devices.camera.acquire(
@@ -696,7 +697,8 @@ class ReadoutSubsystem(ExperimentSubsystem):
             # report says 99 %).  Setting the camera exposure to the calibrated gate makes the default
             # live readout self-match (#issue-2 live path); a frame still imaged at a different gate is
             # the operator's explicit choice.  threshold_exposure is stamped by calibrate_threshold_from_images.
-            expo = (getattr(calibration, "metadata", {}) or {}).get("threshold_exposure")
+            # fallback=None: an UNstamped calibration does not force a re-pin (leave the camera as-is).
+            expo = calibration.readout_exposure(fallback=None)
             if expo:
                 try:
                     s.devices.camera.exposure = float(expo)

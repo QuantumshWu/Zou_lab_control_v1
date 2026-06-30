@@ -23,14 +23,40 @@ from .psf import psf_signals
 
 SUPPORTED_METHODS = ("box", "psf")
 
+#: Readout-KIND for every readout method, the EXPLICIT dispatch table that decides how
+#: ``signals()`` extracts a method's per-site scalar.  ``"box"`` reduces a square ROI;
+#: ``"kernel"`` does matched-filter (PSF) extraction.  This is the single source for the
+#: method->kind relation, so dispatch is by declared kind -- NOT by a fragile ``"psf" in m``
+#: substring on the method NAME (a future ``matched_filter`` would miss the substring and be
+#: read as box, every count silently wrong).  ``operations.ALL_READOUT_METHODS`` validates that
+#: every offered method is registered here.  core owns this (it owns ``signals()`` dispatch) and
+#: never imports operations, keeping the analysis->backend decoupling direction (AGENTS §2).
+READOUT_KINDS = {"box": "box", "psf": "kernel", "uniform_psf": "kernel"}
+
+
+def readout_kind(method: str) -> str:
+    """The readout KIND (``"box"`` square-ROI or ``"kernel"`` matched-filter) for ``method`` --
+    the explicit dispatch the readout uses instead of inferring it from the method NAME."""
+    m = str(method).lower()
+    try:
+        return READOUT_KINDS[m]
+    except KeyError:
+        raise ValueError(
+            f"readout method {m!r} has no registered readout kind -- add it to "
+            "core.calibration.READOUT_KINDS.") from None
+
 
 @dataclass(frozen=True)
 class TrapCalibration:
     centers: np.ndarray
     thresholds: np.ndarray | float
     grid_shape: tuple[int, int] | None = None
-    roi_radius: int = 1
-    reducer: str = "mean"
+    # roi_radius / reducer are the BOX readout's extraction geometry (square ROI half-width +
+    # how it reduces).  They are meaningful ONLY for method='box'; a PSF (kernel) calibration
+    # reads through psf_weights/psf_boxes and ignores them entirely, so __post_init__ sets both
+    # to None there (no dead box-only state carried on a PSF calibration).
+    roi_radius: int | None = 1
+    reducer: str | None = "mean"
     method: str = "box"
     psf_weights: np.ndarray | None = None   # (N, h, w) normalized, method='psf'
     psf_boxes: np.ndarray | None = None      # (N, 4) int (x0, y0, w, h), method='psf'
@@ -52,12 +78,19 @@ class TrapCalibration:
             if int(np.prod(shape)) != len(centers):
                 raise ValueError("grid_shape product must match number of centers.")
             object.__setattr__(self, "grid_shape", shape)
-        object.__setattr__(self, "roi_radius", nonnegative_int(self.roi_radius, "roi_radius"))
-        object.__setattr__(self, "reducer", str(self.reducer))
         method = str(self.method).lower()
         if method not in SUPPORTED_METHODS:
             raise ValueError(f"method must be one of {SUPPORTED_METHODS}.")
         object.__setattr__(self, "method", method)
+        # roi_radius / reducer are box-only extraction geometry: validate + keep them for a box
+        # calibration, but a PSF (kernel) calibration reads through the kernels and ignores them,
+        # so drop both to None there rather than carry meaningless box state (#historical-residue).
+        if method == "box":
+            object.__setattr__(self, "roi_radius", nonnegative_int(self.roi_radius, "roi_radius"))
+            object.__setattr__(self, "reducer", str(self.reducer))
+        else:
+            object.__setattr__(self, "roi_radius", None)
+            object.__setattr__(self, "reducer", None)
         object.__setattr__(self, "background", str(self.background).lower())
         if method == "psf":
             if self.psf_weights is None or self.psf_boxes is None:
@@ -136,6 +169,18 @@ class TrapCalibration:
         entry = (self.by_method or {}).get(method) or {}
         return entry.get("background") if entry.get("background") is not None else self.background
 
+    def readout_exposure(self, fallback: float | None = None) -> float | None:
+        """The camera gate time these thresholds were LEARNT at (``threshold_exposure`` on the
+        metadata), or ``fallback`` when none was recorded.  This is the ONE authoritative reader
+        of that exposure-self-match invariant: every readout that must image at the calibration's
+        exposure (``detect``, the live calibrate-task adoption, the temperature survival frames)
+        goes through HERE instead of each reaching into ``metadata`` with its own defensive spelling
+        -- a threshold is exposure-specific, so a missed/mistyped lookup re-floors occupancy /
+        sticks survival at the readout false-positive rate (#issue-2 / #H3v-2).  Callers pass their
+        OWN fallback (the camera exposure, or None to mean 'do not force a match')."""
+        value = self.metadata.get("threshold_exposure")
+        return float(value) if value else fallback
+
     def thresholds_for(self, method=None) -> np.ndarray:
         """Per-site thresholds for ``method`` (this calibration's own, or a ``by_method``
         entry); falls back to the top-level thresholds when the method has no own set."""
@@ -165,7 +210,7 @@ class TrapCalibration:
                     f"image shape {got} does not match the calibration's {tuple(expected)} "
                     "(camera ROI changed since calibration?) -- recalibrate before reading out.")
         m = self._resolve_method(method)
-        if "psf" in m:
+        if readout_kind(m) == "kernel":
             weights, boxes = self._kernels_for(m)
             return psf_signals(image, weights, boxes, background=self._background_for(m) or "annulus")
         return roi_counts(image, self.centers, radius=self.roi_radius, reducer=self.reducer)
@@ -263,8 +308,10 @@ class TrapCalibration:
                 centers=self.centers,
                 thresholds=self.thresholds,
                 grid_shape=np.asarray([] if self.grid_shape is None else self.grid_shape),
-                roi_radius=np.asarray(self.roi_radius),
-                reducer=np.asarray(self.reducer),
+                # roi_radius / reducer are box-only (None on a PSF calibration); store a sentinel
+                # (-1 / "") that load() reads back as None so the npz stays allow_pickle=False.
+                roi_radius=np.asarray(-1 if self.roi_radius is None else self.roi_radius),
+                reducer=np.asarray("" if self.reducer is None else self.reducer),
                 method=np.asarray(self.method),
                 background=np.asarray(self.background),
                 psf_weights=np.asarray([] if self.psf_weights is None else self.psf_weights),
@@ -286,12 +333,16 @@ class TrapCalibration:
             by_method = json.loads(str(data["by_method_json"].item())) if "by_method_json" in data.files else None
             psf_weights = data["psf_weights"] if "psf_weights" in data.files else None
             psf_boxes = data["psf_boxes"] if "psf_boxes" in data.files else None
+            # roi_radius / reducer sentinels (-1 / "") restore to None (a PSF calibration carried
+            # no box geometry); __post_init__ also drops them for any non-box method either way.
+            roi_radius_raw = int(data["roi_radius"].item())
+            reducer_raw = str(data["reducer"].item())
             return cls(
                 data["centers"],
                 data["thresholds"],
                 grid_shape=None if grid.size == 0 else tuple(int(v) for v in grid),
-                roi_radius=int(data["roi_radius"].item()),
-                reducer=str(data["reducer"].item()),
+                roi_radius=None if roi_radius_raw < 0 else roi_radius_raw,
+                reducer=None if reducer_raw == "" else reducer_raw,
                 method=str(data["method"].item()) if "method" in data.files else "box",
                 psf_weights=None if psf_weights is None or psf_weights.size == 0 else psf_weights,
                 psf_boxes=None if psf_boxes is None or psf_boxes.size == 0 else psf_boxes,
