@@ -28,7 +28,7 @@ def _visible_threshold(h) -> bool:
 def test_single_gaussian_has_no_threshold_shows_fit_and_out_of_fit():
     rng = np.random.default_rng(0)
     vals = rng.normal(100.0, 8.0, size=4000)          # ONE population -> no separable cut
-    h = HistogramFigure(vals, bimodal=False).show()
+    h = HistogramFigure(vals, fit="single").show()
     try:
         assert h._has_threshold is False
         assert not _visible_threshold(h), "single-Gaussian must NOT show a threshold line"
@@ -42,7 +42,7 @@ def test_single_gaussian_has_no_threshold_shows_fit_and_out_of_fit():
 def test_separated_bimodal_keeps_threshold_and_fidelity():
     rng = np.random.default_rng(1)
     vals = np.concatenate([rng.normal(20.0, 3.0, 2000), rng.normal(80.0, 4.0, 2000)])   # two clear peaks
-    h = HistogramFigure(vals, bimodal=True).show()
+    h = HistogramFigure(vals, fit="double").show()
     try:
         assert h._fit_separated and h._has_threshold
         assert _visible_threshold(h), "a separated bimodal must show its threshold line"
@@ -54,7 +54,7 @@ def test_separated_bimodal_keeps_threshold_and_fidelity():
 def test_explicit_threshold_shows_even_on_single_gaussian():
     rng = np.random.default_rng(2)
     vals = rng.normal(50.0, 6.0, size=3000)           # single population, but an explicit cut is given
-    h = HistogramFigure(vals, bimodal=False, thresholds=[55.0]).show()
+    h = HistogramFigure(vals, fit="single", thresholds=[55.0]).show()
     try:
         assert h._has_threshold and _visible_threshold(h)
         assert "th=" in _stats(h)
@@ -69,8 +69,8 @@ def test_threshold_line_is_draggable_only_when_interactions_on():
     rng = np.random.default_rng(3)
     vals = np.concatenate([rng.normal(20.0, 3.0, 2000), rng.normal(80.0, 4.0, 2000)])
     import matplotlib.pyplot as plt
-    monitor = HistogramFigure(vals, bimodal=True, interactions=False).show()
-    edit = HistogramFigure(vals, bimodal=True, interactions=True).show()
+    monitor = HistogramFigure(vals, fit="double", interactions=False).show()
+    edit = HistogramFigure(vals, fit="double", interactions=True).show()
     try:
         assert monitor.threshold_lines and not monitor.threshold_draggers, "monitor card: line kept, no grab"
         assert edit.threshold_lines and edit.threshold_draggers, "edit surface: line + draggable grab"

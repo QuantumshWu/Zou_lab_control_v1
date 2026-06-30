@@ -1017,13 +1017,17 @@ PANEL_PARAMS: dict[str, tuple[ParamDecl, ...]] = {
     "hist": (
         ParamDecl(key="bins", label="bins", kind="int", default=60, lo=5, hi=500, display=False,
                   tooltip="Histogram bins"),
-        # The readout histogram is a dark/bright DISTRIBUTION -> default to the two-Gaussian (bimodal)
-        # decomposition, CONSISTENTLY for every signal (not auto-chosen per data).  Turn OFF for a plain
-        # single-Gaussian view.
-        ParamDecl(key="bimodal", label="bimodal fit", kind="bool", default=True, display=True,
-                  tooltip="Fit the dark/bright two-Gaussian readout distribution (default).  Off = a "
-                          "single Gaussian.  The fidelity stat is reported only when the two peaks "
-                          "cleanly separate (else 'fit F=N/A')."),
+        # The fit is a confocal-style capsule tri-toggle (none / single / double), NOT a forced default:
+        # the operator picks which fit to draw on whatever data the source provides.  "double" is the
+        # dark/bright readout convention.  ``segmented=True`` renders it as the TriStateToggleSwitch
+        # capsule (sliding thumb) instead of a combo box.
+        ParamDecl(key="fit", label="fit", kind="choice", choices=("none", "single", "double"),
+                  default="double", segmented=True, display=True,
+                  tooltip="Distribution fit (drives the display directly -- no auto-decision):\n"
+                          "  none   = no fit curve\n"
+                          "  single = one Gaussian\n"
+                          "  double = the dark/bright two-Gaussian readout (fidelity stat shown only "
+                          "when the two peaks cleanly separate, else 'fit F=N/A')"),
         # A log count axis makes a SPARSE bright tail (rare high occupancy) visible -- on a linear
         # axis a handful of bright shots vanish under the dark peak.  Default OFF (linear).
         ParamDecl(key="ylog", label="log count axis", kind="bool", default=False, display=True,
@@ -3002,7 +3006,7 @@ class PanelCard(FluentGroupBox):
             plotter = panel_plot(
                 np.asarray(value, dtype=float), kind="hist", size=size, interactions=False,
                 bins=int(self.config.params.get("bins", 60)), ylog=bool(self.config.params.get("ylog", False)),
-                bimodal=bool(self.config.params.get("bimodal", True)),
+                fit=str(self.config.params.get("fit", "double")),
                 **self._view_kwargs("hist"),                # relim/fixed pins the VALUE (x) axis (#3)
                 labels=("Value", "Shots", "Population"), title=self.config.title or None)
         else:  # 1d
@@ -3958,7 +3962,7 @@ class PanelEditor(QtWidgets.QWidget):
             elif kind == "hist":
                 new_plotter = panel_plot(np.array(src.values, dtype=float), kind="hist", size=size,
                                          bins=int(card.config.params.get("bins", 60)),
-                                         bimodal=bool(card.config.params.get("bimodal", True)),
+                                         fit=str(card.config.params.get("fit", "double")),
                                          ylog=bool(card.config.params.get("ylog", False)), **view,
                                          labels=tuple(src.labels), title=title)
             else:  # 1d / monitor -> a line snapshot (monitor honours its show_dist toggle)

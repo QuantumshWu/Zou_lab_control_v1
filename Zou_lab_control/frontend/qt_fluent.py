@@ -775,6 +775,112 @@ class FluentButton(QtWidgets.QPushButton):
         return self._dirty
 
 
+class FluentTriStateToggle(QtWidgets.QAbstractButton):
+    """Capsule-style MUTUALLY-EXCLUSIVE multi-state toggle -- a faithful port of the Confocal-GUIv2
+    ``TriStateToggleSwitch`` (the "on start: single / replace / parallel" capsule).  ALL option labels
+    stay visible and a white thumb slides to overlay the active one; clicking cycles to the next state.
+    The track is the placeholder grey, the thumb white, the labels the standard text colour (sizes /
+    colours read from this module's tokens + ``scaled_px``, so it scales with DPI).
+
+    It exposes the SAME ``currentText`` / ``setCurrentText`` / ``activated(int)`` surface as
+    :class:`FluentComboBox`, so a param form's choice handler swaps a toggle for a combo with no other
+    change (it only decides which to BUILD; read / write / wiring are identical)."""
+
+    activated = QtCore.pyqtSignal(int)          # mirrors QComboBox.activated(int): a USER pick (a cycle)
+
+    def __init__(self, options, parent=None):
+        super().__init__(parent)
+        self._options = [str(o) for o in options] or [""]
+        self._state = 0
+        self._offset = 0.0
+        self._animating = False
+        self.setCursor(QtCore.Qt.PointingHandCursor)
+        self.setFont(QtGui.QFont(FONT, fluent_font_size()))
+        self._anim = QtCore.QPropertyAnimation(self, b"offset", self)
+        self._anim.setDuration(150)
+        self._anim.stateChanged.connect(self._on_anim_state_changed)
+        self.clicked.connect(self._cycle_state)
+        self.setMinimumSize(self.sizeHint())
+
+    def _seg_width(self) -> float:
+        return self.width() / max(1, len(self._options))
+
+    def sizeHint(self) -> QtCore.QSize:
+        fm = QtGui.QFontMetrics(self.font())
+        pad = scaled_px(18, minimum=12)
+        seg = max((fluent_text_width(fm, o) for o in self._options), default=0) + pad
+        return QtCore.QSize(int(seg * len(self._options)), scaled_px(30, minimum=24))
+
+    def paintEvent(self, event) -> None:
+        del event
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        seg = self._seg_width()
+        margin = scaled_px(3, minimum=2)
+        # 1) capsule track (placeholder grey; muted when disabled)
+        painter.setBrush(QtGui.QBrush(QtGui.QColor(PLACEHOLDER if self.isEnabled() else BG)))
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.drawRoundedRect(0, 0, w, h, h / 2, h / 2)
+        # 2) white thumb overlaying the active segment (animated x while sliding)
+        x = self._offset if self._animating else self._state * seg
+        th = max(1, h - 2 * margin)
+        painter.setBrush(QtGui.QBrush(QtGui.QColor("#FFFFFF")))
+        painter.drawRoundedRect(int(x + margin), int(margin), int(seg - 2 * margin), int(th), th / 2, th / 2)
+        # 3) labels on top, centred per segment
+        painter.setPen(QtGui.QColor(TEXT if self.isEnabled() else PLACEHOLDER))
+        for i, label in enumerate(self._options):
+            painter.drawText(QtCore.QRectF(i * seg, 0, seg, h), QtCore.Qt.AlignCenter, label)
+        painter.end()
+
+    def _cycle_state(self) -> None:
+        prev = self._state
+        self._state = (self._state + 1) % len(self._options)
+        self._animate(prev, self._state)
+        self.activated.emit(self._state)
+
+    def _animate(self, prev_idx: int, new_idx: int) -> None:
+        seg = self._seg_width()
+        if not self.isEnabled() or self.width() <= 0:
+            self._offset = new_idx * seg
+            self.update()
+            return
+        self._anim.stop()
+        self._anim.setStartValue(prev_idx * seg)
+        self._anim.setEndValue(new_idx * seg)
+        self._anim.start()
+
+    def _on_anim_state_changed(self, new_state, _old) -> None:
+        self._animating = new_state == QtCore.QAbstractAnimation.Running
+        if not self._animating:
+            self._offset = self._state * self._seg_width()
+            self.update()
+
+    def getOffset(self) -> float:
+        return float(self._offset)
+
+    def setOffset(self, value: float) -> None:
+        self._offset = float(value)
+        self.update()
+
+    offset = QtCore.pyqtProperty(float, fget=getOffset, fset=setOffset)
+
+    # ---- QComboBox-compatible surface (so a choice handler is widget-agnostic) ----
+    def currentText(self) -> str:
+        return self._options[self._state] if self._options else ""
+
+    def setCurrentText(self, text: str) -> None:
+        for i, opt in enumerate(self._options):
+            if opt == str(text):
+                self._state = i
+                self._offset = i * self._seg_width()
+                self.update()
+                return
+
+    def state(self) -> int:                       # confocal parity: the active index
+        return self._state
+
+
 class FluentLineEdit(QtWidgets.QLineEdit):
     def __init__(self, text: str = "", parent=None):
         super().__init__(text, parent)

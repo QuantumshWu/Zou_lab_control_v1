@@ -60,12 +60,14 @@ def test_fit_toggle_changes_the_fit_on_any_data_no_silent_fallback():
     from Zou_lab_control.frontend import panel_plot
     ensure_qt_app()
     uni = np.random.default_rng(0).normal(300.0, 25.0, 1500)   # unimodal -- the "broken button" case
-    p = panel_plot(uni, kind="hist", size="2x4", bins=60, bimodal=True, title="dis")
+    p = panel_plot(uni, kind="hist", size="2x4", bins=60, fit="double", title="dis")
     assert p.bimodal_popt is not None                          # double attempts TWO gaussians on unimodal data
-    p.apply_param("bimodal", False)                            # -> single
+    p.apply_param("fit", "single")                            # -> single
     assert p.single_popt is not None and p.bimodal_popt is None
-    p.apply_param("bimodal", True)                             # -> double again (visibly different state)
+    p.apply_param("fit", "double")                            # -> double again (visibly different state)
     assert p.bimodal_popt is not None
+    p.apply_param("fit", "none")                              # -> no fit at all
+    assert p.single_popt is None and p.bimodal_popt is None
 
 
 def test_dis_bins_per_site_counts_unchanged_when_bound_to_counts():

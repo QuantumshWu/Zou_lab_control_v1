@@ -1906,16 +1906,16 @@ class HistogramFigure(BaseLivePlot):
         thresholds: Sequence[float] | None = None,
         labels: Sequence[str] = ("Counts", "Shots", "Population"),
         ylog: bool = False,
-        bimodal: bool = True,
+        fit: str = "double",            # fit chooser: "none" | "single" | "double" (dark/bright readout)
         **kwargs,
     ):
         self.values = np.asarray(values, dtype=float).reshape(-1)
         self.bins_arg = bins
         self.ylog = bool(ylog)          # log-scale the COUNT axis (reveals a sparse bright tail)
-        # The readout histogram is a dark/bright DISTRIBUTION, so the default IS the two-Gaussian
-        # (bimodal) decomposition -- consistently, for EVERY signal -- not auto-chosen per data (which
-        # made it flip single/double between signals).  Turn it OFF for a plain single-Gaussian view.
-        self._bimodal = bool(bimodal)
+        # The fit is a DISPLAY chooser (none / single / double) driven by the toggle -- never an
+        # auto-decision based on how the data happens to look.  It defaults to the two-Gaussian dark/
+        # bright decomposition (the readout convention); "single" gives one Gaussian, "none" no fit.
+        self._fit = str(fit)
         self._fit_separated = False     # whether the bimodal fit cleanly separated (gates the fidelity stat)
         # A threshold (cut line) is only MEANINGFUL when there are two populations to separate (#issue-2):
         # shown when the bimodal fit separated OR a threshold was supplied explicitly (a calibration's
@@ -2034,8 +2034,8 @@ class HistogramFigure(BaseLivePlot):
         toggles them (#dis-resize).  Returns True if handled."""
         if key == "ylog":
             self.ylog = bool(value)
-        elif key == "bimodal":
-            self._bimodal = bool(value)
+        elif key == "fit":
+            self._fit = str(value)
         else:
             return False
         self.update_core()
@@ -2120,12 +2120,15 @@ class HistogramFigure(BaseLivePlot):
             self.fit_threshold = None
             self._has_threshold = self._explicit_thr
 
-        # SINGLE-Gaussian mode (the toggle is OFF): one curve, no dark/bright split, fit F = N/A.
-        if not self._bimodal:
-            _single_gaussian()
+        # The FIT chooser drives the display directly (none / single / double) -- no hardcoding, no
+        # data-driven auto-decision.
+        if self._fit == "none":
+            return                       # no fit lines at all (the lines cleared above stay empty)
+        if self._fit != "double":
+            _single_gaussian()           # "single": one Gaussian, no dark/bright split, fit F = N/A
             return
 
-        # BIMODAL mode: ALWAYS attempt the two-Gaussian dark/bright decomposition -- the toggle drives the
+        # DOUBLE mode: ALWAYS attempt the two-Gaussian dark/bright decomposition -- the toggle drives the
         # display DIRECTLY, never a hidden auto-collapse-to-one-peak based on how the data happens to look.
         # If the bright mode is sparse the two peaks may overlap, but selecting double MUST visibly fit two
         # Gaussians, not silently fall back to one (the "toggle does nothing / button is broken" bug: the

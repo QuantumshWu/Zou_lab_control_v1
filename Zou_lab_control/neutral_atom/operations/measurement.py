@@ -106,6 +106,9 @@ class ParamDecl:
     display: bool = True             # plot-panel placement flag (DATA, not art): True = a basic
                                      # display knob in the Setting popup; False = a functional
                                      # plot-API param in the Edit tab.  Ignored by measurements.
+    segmented: bool = False          # kind="choice" RENDER hint (DATA, not art): True = a capsule
+                                     # tri/multi-state toggle (confocal TriStateToggleSwitch) instead of
+                                     # a combo box; same value semantics (one of ``choices``).
 
     def __post_init__(self) -> None:
         kind = str(self.kind).lower()

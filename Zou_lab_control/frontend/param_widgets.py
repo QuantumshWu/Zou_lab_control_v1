@@ -54,6 +54,7 @@ from .qt_fluent import (
     FluentPathEdit,
     FluentSwitch,
     FluentTreeComboBox,
+    FluentTriStateToggle,
     scaled_px,
 )
 
@@ -313,16 +314,23 @@ class BoolHandler(_StaticMixin, ParamWidgetHandler):
 
 
 class ChoiceHandler(_StaticMixin, ParamWidgetHandler):
+    """One of ``decl.choices``.  ``decl.segmented`` renders a confocal-style capsule multi-state toggle
+    (:class:`FluentTriStateToggle`) instead of a combo box -- both expose ``currentText`` /
+    ``setCurrentText`` / ``activated``, so ``read`` / ``write`` / wiring stay widget-agnostic (only
+    ``build`` decides which control to construct)."""
+
     def build(self, decl, value, ctx):
-        combo = FluentComboBox()
         choices = [str(c) for c in decl.choices]
-        combo.addItems(choices)
+        segmented = bool(getattr(decl, "segmented", False))
+        widget = FluentTriStateToggle(choices) if segmented else FluentComboBox()
+        if not segmented:
+            widget.addItems(choices)
         cur = decl.default if value is None else value
         if cur is not None and str(cur) in choices:
-            combo.setCurrentText(str(cur))
-        combo.setToolTip(decl.tooltip)
-        _wire(combo.activated, ctx, decl, lambda: combo.currentText())
-        return combo
+            widget.setCurrentText(str(cur))
+        widget.setToolTip(decl.tooltip)
+        _wire(widget.activated, ctx, decl, lambda: widget.currentText())
+        return widget
 
     def read(self, widget):
         return widget.currentText()
