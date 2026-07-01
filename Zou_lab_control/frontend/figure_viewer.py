@@ -405,6 +405,11 @@ class FigureViewer(QtWidgets.QWidget):
         # --- Info tabs: Plot | Measurement | Device | Raw -----------------------------------
         # The facts the npz stored, grouped so a column is not one long crushed list: Plot (how it draws),
         # Measurement (its data shapes / source), Device (the run's provenance), Raw (the whole dict).
+        # A clear gap ABOVE the tab card: the FluentTabWidget carries its own soft drop shadow whose
+        # blur bleeds a few px past its top edge, so without headroom the shadow overlaps the File row
+        # and the tab bar's top reads as CUT OFF.  Give it a full section-gap so the tab strip is
+        # completely clear of the row above it.
+        lay.addSpacing(scaled_px(10, minimum=7))
         self.info_tabs = FluentTabWidget()
         self.info_tabs.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         self.plot_layout = self._add_rows_tab("Plot")
@@ -678,6 +683,11 @@ def show_figure_viewer(path: str | Path | None = None, *, scale: float | None = 
     window.setFixedSize(window.size())
     center_window_on_primary_screen(window, app)
     window.show()
+    # The embedded console's scroll viewport only has its REAL width AFTER the window is shown (0 during
+    # construction).  Re-pack its board now so it lays out against the true pane width immediately,
+    # rather than waiting for the first resize event.
+    if viewer.console is not None:
+        viewer.console._arrange_if_cards()
     viewer._zlc_window = window
     if not hasattr(app, "_zlc_figure_windows"):
         app._zlc_figure_windows = []

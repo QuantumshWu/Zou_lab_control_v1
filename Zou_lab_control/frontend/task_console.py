@@ -4072,8 +4072,12 @@ class PanelEditor(QtWidgets.QWidget):
                                          labels=tuple(src.labels), title=title)
             else:  # 1d / monitor -> a line snapshot (monitor honours its show_dist toggle)
                 extra = {"show_dist": bool(card.config.params.get("show_dist", True))} if kind == "monitor" else {}
+                # Pass the live plotter's FULL data_y (all columns), not just column 0: a 1d ``create``
+                # repeat_mode collapses to a ``(points, R)`` array = one line per repeat, and the snapshot
+                # must draw EVERY column exactly like the live card (Live1D plots one line per column) --
+                # else the Edit-tab preview would ignore repeat_mode and always show a single line.
                 new_plotter = panel_plot(np.array(src.data_x[:, 0], dtype=float),
-                                         np.array(src.data_y[:, 0], dtype=float),
+                                         np.array(src.data_y, dtype=float),
                                          kind=kind, size=size, **view, **extra,
                                          labels=tuple(src.labels), title=title)
         except Exception as exc:
@@ -5004,7 +5008,12 @@ class TaskConsole(QtWidgets.QWidget):
             self.setFixedSize(self._target_console_size())
         root = QtWidgets.QVBoxLayout(self)
         margin = scaled_px(14)
-        root.setContentsMargins(margin, scaled_px(8), margin, scaled_px(8))
+        # EMBEDDED: no top/bottom inset -- the host (the figure viewer) already frames the console with
+        # its own root margin, so the console's FIRST card (the header) sits flush at the pane top and its
+        # visible top/bottom edges line up with the Info card beside it.  Standalone keeps the 8 px inset
+        # off the window chrome.
+        v_margin = 0 if self.embedded else scaled_px(8)
+        root.setContentsMargins(margin, v_margin, margin, v_margin)
         # A clear GAP separates the three rows -- the header card, the (hidden) task banner and
         # the tab card -- so they read as DISTINCT rounded cards on the grey window background.
         # The header is flat (no drop shadow) and the tab bar draws no top base line, so this
@@ -5144,6 +5153,10 @@ class TaskConsole(QtWidgets.QWidget):
         self._board_view_w = 0
         self.scroll.viewport().installEventFilter(self)
         self.tabs.add_permanent_tab(dash_tab, "Monitor")
+        # A one-shot re-arrange AFTER the first show, when the scroll viewport finally has its real
+        # width (0 during construction): so an EMBEDDED console (hosted in the figure viewer) packs
+        # its board against the true pane width immediately, not a stale 0.
+        QtCore.QTimer.singleShot(0, self._arrange_if_cards)
 
         # Logic tab: a scrolled top-packed column of LogicNodeRow cards.  OMITTED when embedded (the
         # figure viewer hosts pure VIEWS of a loaded static figure -- no acquisition logic to run), so
@@ -5807,10 +5820,18 @@ class TaskConsole(QtWidgets.QWidget):
             except Exception:
                 pass
 
+    def _arrange_if_cards(self) -> None:
+        """Re-pack the board (deferred one-shot on show) ONLY when it holds cards -- a no-op on an
+        empty board, so an embedded console with nothing loaded yet does not thrash."""
+        if getattr(self, "cards", None):
+            self._arrange()
+
     def eventFilter(self, obj, event):  # noqa: N802 - Qt naming
-        # Re-pack the gravity board when its scroll viewport WIDTH changes (window resized): cards
-        # wrap at the viewport width, so narrowing must reflow them into fewer columns rather than
-        # clip behind a horizontal scrollbar.  Guard on an actual width change (no redundant packs).
+        # Re-pack the gravity board when its scroll viewport WIDTH changes (window resized): the pack
+        # width is demand-driven (``_pack_width`` = the viewport width grown to the furthest card's
+        # reach), so WIDENING lets more columns fit and NARROWING re-flows cards that now fit while any
+        # card the user parked past the edge keeps the board wide + a horizontal scrollbar.  Guard on an
+        # actual width change (no redundant packs).
         if (getattr(self, "scroll", None) is not None and obj is self.scroll.viewport()
                 and event.type() == QtCore.QEvent.Resize):
             w = self.scroll.viewport().width()
@@ -5821,17 +5842,32 @@ class TaskConsole(QtWidgets.QWidget):
 
     def _arrange(self) -> None:
         # Top-left gravity pack (see _compact): every card floats UP then LEFT until blocked, with a
-        # uniform GAP on all four sides, wrapping at the live scroll-viewport width.  The just-dragged
-        # / resized card is the ``active`` one, so it wins a contested slot and the others reflow.
+        # uniform GAP on all four sides.  The just-dragged / resized card is the ``active`` one, so it
+        # wins a contested slot and the others reflow.
         active = self.sender()
         active_cfg = active.config if isinstance(active, PanelCard) and active in self.cards else None
-        # The board fills the scroll viewport (setWidgetResizable), so the viewport width is how wide
-        # cards may pack before wrapping to the next row.
-        board_w = self.scroll.viewport().width() if hasattr(self, "scroll") else self.board.width()
+        # DEMAND-driven pack width: the viewport width, GROWN only far enough to hold the card that
+        # currently reaches furthest right (its just-dropped column pixel + width).  So a board whose
+        # cards all fit the viewport packs at the viewport width (one column when narrow, no sideways
+        # scroll); the moment a card is dragged into a column past the viewport, the board grows to fit
+        # it -- gravity then keeps it there (it no longer wraps back) and the scroll area shows a
+        # horizontal scrollbar.  Move that card back and the reach shrinks, so the board returns to the
+        # viewport width and the scrollbar disappears.
+        board_w = self._pack_width([c.config for c in self.cards])
         if _compact([c.config for c in self.cards], active_cfg, board_w=board_w):
             self._mark_dirty()
         self.board.arrange(self.cards)
         self._update_summary()
+
+    def _pack_width(self, configs: Sequence["PanelConfig"]) -> int:
+        """The width the gravity packer wraps at: the live scroll-viewport width GROWN to the furthest
+        right edge any card currently reaches (``col + width + GAP``).  Cards that all fit the viewport
+        pack at the viewport width (no sideways scroll); a card dropped into a column past the viewport
+        grows the board to hold it (so column 2 stays reachable + a horizontal scrollbar appears), and
+        removing/moving it back shrinks the board to the viewport again -- expansion strictly on demand."""
+        vw = self.scroll.viewport().width() if hasattr(self, "scroll") else 0
+        reach = max((c.col + _card_size(c.size)[0] + GAP for c in configs), default=0)
+        return max(vw, reach)
 
     # ------------------------------------------------------------------ actions
     def _add_panel(self) -> None:
@@ -5856,7 +5892,9 @@ class TaskConsole(QtWidgets.QWidget):
         config = PanelConfig(kind=str(kind), title=title, row=GAP, col=GAP, size="1x2")
         # SPAWN the new card at the first free TOP-LEFT slot (tile into the board: fill the top row
         # then wrap), NOT a fresh column -- the local NW gravity in _compact then keeps it there.  Seed
-        # against the live viewport width so it wraps at the real board edge (fallback width when unshown).
+        # against the live VIEWPORT width so Add only ever tiles WITHIN the visible pane (it never
+        # force-grows the board into an off-screen column -- that expansion is on-demand via a DRAG, see
+        # _pack_width); a fallback width covers the pre-show case where the viewport is still 0.
         cfgs = [c.config for c in self.cards]
         vw = self.scroll.viewport().width() if hasattr(self, "scroll") else 0
         board_w = max(vw, _min_board_width(cfgs + [config])) if vw else _board_width(cfgs + [config])

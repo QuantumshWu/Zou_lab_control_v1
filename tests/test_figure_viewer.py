@@ -264,6 +264,83 @@ def test_info_tabs_group_facts_and_browse_auto_loads(tmp_path):
         plt.close("all")
 
 
+def _saved_1d_with_repeat_npz(tmp_path) -> Path:
+    """A 1-D save whose stored ``info['signals']`` value block carries a REAL repeat axis ``(R, P, 1)``
+    (R distinct traces) -- so a panel's ``repeat_mode`` = ``create`` draws one line per repeat and
+    ``average`` draws a single mean line.  Written as a hand-built payload (no hardware)."""
+    R, P = 3, 25
+    x = np.linspace(0.0, 6.0, P)
+    block = np.stack([np.sin(x) + 0.15 * r for r in range(R)], axis=0).reshape(R, P, 1)
+
+    def sig(b, ps, ds, label, unit, role):
+        return {"block": np.asarray(b), "points_shape": ps, "data_shape": ds,
+                "label": label, "unit": unit, "role": role}
+
+    info = {"name": "survival", "kind": "1d", "source": "value = survival",
+            "labels": ["t (s)", "survival", "Z"], "unit": "",
+            "view": {"relim": "tight", "repeat_mode": "create"},
+            "signals": {"survival": sig(block, None, None, "survival", "", "value"),
+                        "t": sig(x, None, None, "t (s)", "", "x")}}
+    path = tmp_path / "survival_repeat.npz"
+    np.savez(path, data_x=x.reshape(P, 1), data_y=block.mean(0).reshape(P, 1), info=info)
+    return path
+
+
+def _line_count(plotter) -> int:
+    """Data-carrying Line2D artists on the plotter's main axes (a create trace draws one per repeat)."""
+    return len([ln for ln in plotter.ax.get_lines() if len(ln.get_xdata()) > 0])
+
+
+def test_edit_tab_repeat_mode_create_redraws_snapshot_per_repeat(tmp_path):
+    """Regression (#3): changing ``repeat_mode`` in a panel's Edit tab must REDRAW the Edit-tab
+    snapshot, not just the live card.  The snapshot previously rebuilt from only column 0 of the live
+    plotter's data, so a 1d ``create`` (one line per repeat) always showed a single line -- the reported
+    'selecting create has no effect'.  A save with a real ``(R, P, 1)`` repeat axis, opened in the
+    viewer: the Edit-tab snapshot must show MORE lines under ``create`` (one per repeat) than under
+    ``average`` (a single mean line)."""
+    from Zou_lab_control.frontend.task_console import PanelEditor
+    npz = _saved_1d_with_repeat_npz(tmp_path)
+    v = show_figure_viewer(npz)
+    try:
+        con = v.console
+        card = con.cards[0]
+        con._tick()
+        assert card.config.kind == "1d"
+        # open the panel's real Edit tab (the closable PanelEditor) exactly as the Edit… button does
+        con._edit_card(card)
+        editor = next(con.tabs.widget(i) for i in range(con.tabs.count())
+                      if isinstance(con.tabs.widget(i), PanelEditor) and con.tabs.widget(i).card is card)
+        assert editor._plotter is not None, "the Edit tab builds its snapshot"
+
+        # create: the live card draws one line per repeat, and the snapshot must MIRROR that
+        card._set_param("repeat_mode", "create"); card._run_pending_rebuild(); con._tick()
+        editor.rebuild()
+        create_live = _line_count(card.plotter)
+        create_snap = _line_count(editor._plotter)
+        assert create_live == 3, "the live 1d panel draws one line per repeat in create mode"
+
+        # average: a single mean line, on BOTH the live card AND the snapshot
+        card._set_param("repeat_mode", "average"); card._run_pending_rebuild(); con._tick()
+        editor.rebuild()
+        average_live = _line_count(card.plotter)
+        average_snap = _line_count(editor._plotter)
+        assert average_live == 1, "average reduces the repeats to one line on the live card"
+
+        # THE FIX: the Edit-tab snapshot RESPONDS to repeat_mode -- create shows the extra per-repeat
+        # lines that average collapses.  The delta equals the live delta (the extra repeats), so the
+        # snapshot is no longer frozen to a single column.
+        assert create_snap > average_snap, \
+            "the Edit-tab snapshot redraws per repeat_mode (create shows more lines than average)"
+        assert create_snap - average_snap == create_live - average_live, \
+            "the snapshot's create/average line delta matches the live panel's (all repeats drawn)"
+    finally:
+        win = v.window()
+        if win is not None:
+            win.close(); win.deleteLater()
+        v.teardown()
+        plt.close("all")
+
+
 def test_one_d_save_reproduces_with_saved_x_axis(tmp_path):
     """A 1-D save publishes a companion fig_x so the seeded 1d panel draws vs the saved x with the
     saved x-axis label (faithful reproduction of the x axis, not a bare index)."""
