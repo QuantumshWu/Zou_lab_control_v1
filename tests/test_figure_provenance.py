@@ -2,21 +2,31 @@
 doing when this data was taken" -- and the FigureViewer shows it.
 
 The data flow (all through public paths):
-  * an acquiring logic NODE (camera measurement / scan) refreshes ``provenance_snapshot()`` each shot:
-    its held devices' PUBLIC ``.snapshot()`` (the backend-neutral contract) + acquisition params +
-    calibration fingerprint + node/layer identity + a timestamp -- reading NO simulation ground truth,
-    so it is the SAME record a real qCMOS run keeps (guarded by test_virtual_equals_real_contract);
+  * an acquiring logic NODE (camera measurement / scan) captures its ``provenance_snapshot()`` ONCE per
+    run (at ``start()``, or lazily on the first read of a notebook ``step()`` loop): its held devices'
+    PUBLIC ``.snapshot()`` (the backend-neutral contract) + acquisition params + calibration fingerprint
+    + node/layer identity + a timestamp -- the device BASE-STATE of the run, held CONSTANT across its
+    shots (a scanned parameter's change IS the scan, already in the data), reading NO simulation ground
+    truth, so it is the SAME record a real qCMOS run keeps (guarded by test_virtual_equals_real_contract);
   * the console's Save resolves the producing node of the panel's signal
     (``PanelEditor._provenance_for_save`` -> ``node.provenance_snapshot()``) and folds it into
-    ``extra_info['provenance']``, which ``DataFigure.save`` stores under the npz's top-level ``info``;
+    ``extra_info['provenance']``, which ``DataFigure.save`` stores under the npz's top-level ``info``.
+    When that node is a DERIVED processor (no device, a ``consumes`` list) the save walks UPSTREAM to
+    the measurement that produced each consumed signal and folds those device snapshots under
+    ``provenance['upstream']`` -- so a PROCESSED figure still records the source apparatus state;
   * ``load_figure`` reads ``info['provenance']`` back; the FigureViewer expands it readably.
 
 These pin:
 1. ``LogicNode.provenance_snapshot()`` unit behaviour: a node HOLDING a camera includes the camera's
    snapshot + acquisition params; a bare node (no device) returns no ``devices`` and never crashes;
+1b. ONCE-per-run: a running node captures provenance at ``start()`` and it stays IDENTICAL across many
+   shots (not re-snapshotted per shot);
+1c. a PROCESSOR's provenance carries its ``consumes`` list + empty devices, and never crashes;
 2. end-to-end through the CONSOLE Save path: connect virtual -> a camera measurement publishes
    ``frame_0`` -> save its panel -> ``load_figure`` back -> ``info['provenance']`` carries the camera
    device snapshot + key acquisition params;
+2b. CHAINED: saving a processor-output panel records the upstream measurement's device snapshot under
+   ``provenance['upstream']``;
 3. the fallback: no producing node but a session attached -> the whole-session device snapshot;
 4. backward compatibility: an OLD npz with no ``provenance`` loads + the viewer expands nothing (no crash).
 
@@ -84,13 +94,39 @@ def test_provenance_snapshot_includes_held_camera_and_params():
 
 def test_provenance_snapshot_of_a_bare_node_has_no_devices_and_never_crashes():
     """A node holding NO acquisition device (a pure processor) yields a provenance dict with identity +
-    timestamp but no ``devices`` section -- and never raises (the generic device probe finds nothing)."""
+    timestamp but no ``devices`` section -- and never raises (the generic device probe finds nothing).
+    Its ``consumes`` (the upstream signals it transforms) IS its provenance substance."""
     hub = SignalHub()
     proc = OccupancyProcessor(hub)               # a processor holds no camera / sequencer
     prov = proc.provenance_snapshot()
     assert isinstance(prov, dict)
     assert prov["layer"] == "processor"
     assert "devices" not in prov, "a node with no held device declares no devices section"
+    # a processor's provenance carries the signals it CONSUMES (default OccupancyProcessor -> frame_0)
+    assert prov.get("consumes") == list(proc.consumes) and "frame_0" in prov["consumes"]
+
+
+def test_provenance_is_captured_once_per_run_not_per_shot():
+    """A RUNNING node captures its provenance ONCE at ``start()`` and holds it CONSTANT across shots --
+    the device BASE-STATE of the run, NOT re-snapshotted every shot (a scanned param's change is the
+    scan, already in the data).  We drive several shots synchronously and assert the snapshot's content
+    (incl. ``captured_at``) never changes between them."""
+    exp = na.connect("virtual")
+    try:
+        hub = SignalHub()
+        cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer, repeat=2)
+        fire_live_imaging(exp)
+        cam.refresh_provenance()                 # what start() does -- capture the run's base state ONCE
+        first = cam.provenance_snapshot()
+        assert "camera" in first["devices"] and isinstance(first.get("captured_at"), str)
+        # many shots later the snapshot is IDENTICAL -- byte for byte, including the timestamp -- because
+        # it was captured once for the run and is not refreshed per shot.
+        for _ in range(6):
+            cam.step()
+            assert cam.provenance_snapshot() == first, \
+                "provenance must be captured ONCE per run, not re-snapshotted every shot"
+    finally:
+        exp.close()
 
 
 # ------------------------------------------------------------------ end-to-end through the console save
@@ -151,6 +187,60 @@ def test_console_save_writes_producing_node_provenance(tmp_path):
         assert stored["devices"]["camera"]["type"] == type(exp.devices.camera).__name__
         assert "exposure" in stored["devices"]["camera"]
         assert "acquisition_parameters" in stored and "exposure" in stored["acquisition_parameters"]
+    finally:
+        if console is not None:
+            console.shutdown()
+        exp.close()
+        plt.close("all")
+
+
+def test_console_save_chains_upstream_measurement_provenance():
+    """Saving a panel wired to a PROCESSOR's output records the UPSTREAM measurement's device state.
+
+    A camera measurement publishes ``cam_frame_0``; an OccupancyProcessor consumes it and publishes
+    ``occ_occupied``.  A panel bound to ``occ_occupied`` resolves the processor (no device of its own)
+    as its producing node; ``_provenance_for_save`` then walks the processor's ``consumes`` to the
+    camera node and folds THAT node's camera snapshot under ``provenance['upstream']`` -- so a processed
+    figure still carries the source apparatus state."""
+    ensure_qt_app()
+    from Zou_lab_control.frontend.task_console import (
+        TaskConsole, default_console_state, PanelConfig, PanelEditor, GAP)
+    from Zou_lab_control.frontend import panel_plot
+    from Zou_lab_control.neutral_atom.operations.signal_expr import SignalExpr, DEFAULT_SOURCE
+
+    exp = na.connect("virtual")
+    console = None
+    try:
+        hub = SignalHub()
+        cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer,
+                                prefix="cam_", repeat=2)
+        # the processor CONSUMES cam_frame_0 (its provenance says so) but holds NO device
+        proc = OccupancyProcessor(hub, source_expr=SignalExpr(["cam_frame_0"], DEFAULT_SOURCE),
+                                  prefix="occ_")
+        assert "cam_frame_0" in proc.consumes and "occ_occupied" in proc.published_signals()
+        fire_live_imaging(exp)
+        cam.refresh_provenance()                 # the camera run's base state, captured once
+        console = TaskConsole(hub=hub, state=default_console_state(), session=exp,
+                              running_nodes=[cam, proc], window_px=(900, 600))
+        console._timer.stop()
+        console.refresh_once = lambda: None
+        # a panel bound to the PROCESSOR's output -> its producing node is the processor
+        card = console._new_panel_card(PanelConfig(kind="hist", title="occ", source="value = occ_occupied",
+                                                   inputs=["occ_occupied"], row=GAP, col=GAP, size="2x4"))
+        console._attach_card(card)
+        card.plotter = panel_plot(np.random.default_rng(0).normal(0.5, 0.1, 200),
+                                  kind="hist", size="2x4", bins=20, title="occ")
+        editor = PanelEditor(card, console)
+        editor.rebuild()
+        prov = editor._provenance_for_save()
+        # the processor's own provenance: no device, its consumed input recorded
+        assert prov["layer"] == "processor" and "cam_frame_0" in prov.get("consumes", [])
+        # chained upstream: the camera measurement's device snapshot travelled along
+        upstream = prov.get("upstream")
+        assert isinstance(upstream, dict) and "cam_frame_0" in upstream, \
+            "a processed panel records the upstream measurement under provenance['upstream']"
+        cam_prov = upstream["cam_frame_0"]
+        assert cam_prov["devices"]["camera"]["type"] == type(exp.devices.camera).__name__
     finally:
         if console is not None:
             console.shutdown()

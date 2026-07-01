@@ -222,11 +222,12 @@ class LogicNode:
         # the publish, then clears it -- so a no-op / frozen shot publishes nothing with a stale id.  Set and
         # read on the node's OWN thread only (shot()->step() are same-thread), so no extra lock (#shot-clock).
         self._current_source_shot: int | None = None
-        # ACQUISITION-TIME provenance: the device state + acquisition params captured the moment this node
-        # last produced data, so a saved figure records "what the apparatus was doing when this data was
-        # taken".  Refreshed by an acquiring node via ``refresh_provenance()`` after a real acquisition;
-        # ``provenance_snapshot()`` returns this cached dict (or computes it on demand when never set).  Set
-        # and read on the node's OWN thread (shot() is same-thread), so no extra lock.
+        # PER-RUN provenance: the device BASE-STATE + acquisition params captured ONCE at the start of a
+        # measurement run, so a saved figure records "what the apparatus was doing when this data was
+        # taken".  Captured in ``start()`` (a fresh run = a fresh base state) and held CONSTANT for the
+        # whole run -- NOT re-snapshotted per shot (a scanned parameter's point-to-point change IS the
+        # scan, already in the data).  ``provenance_snapshot()`` returns this cached dict, computing +
+        # caching it once on first read for a notebook ``step()`` loop that never called ``start()``.
         self._provenance: dict[str, object] | None = None
 
     @property
@@ -275,12 +276,11 @@ class LogicNode:
         self.hub.publish(named, provenance=self._current_source_shot)
         self._current_source_shot = None
         self.shots += 1
-        # Capture provenance the moment this node produced data, but ONLY for a node that actually
-        # HOLDS an acquisition device (a camera / sequencer) -- so the snapshot reflects the device
-        # state that took THIS shot.  A pure processor / task holds neither, so this is a cheap no-op
-        # for them (single source: the generic device check drives it, not a per-node-type flag).
-        if getattr(self, "camera", None) is not None or getattr(self, "sequencer", None) is not None:
-            self.refresh_provenance()
+        # Provenance is the device BASE-STATE of ONE measurement run -- captured ONCE at ``start()``,
+        # NOT re-snapshotted every shot: within a run the apparatus base state is constant, and what
+        # DOES change point-to-point (a scanned parameter) is the scan itself, already in the data.  A
+        # notebook ``step()`` loop with no ``start()`` still gets provenance via the lazy fallback in
+        # ``provenance_snapshot()`` (captured on first read, then cached), so this hot path stays clean.
         return named
 
     def start(self, *, rate_hz: float = 5.0) -> "LogicNode":
@@ -288,6 +288,11 @@ class LogicNode:
         if self._thread is not None and self._thread.is_alive():
             return self
         self.rate_hz = float(rate_hz)   # remembered so a paused node can resume at the same rate
+        # Capture the run's provenance ONCE, at the moment this run begins -- the device base-state a
+        # saved figure records.  Re-captured on every ``start()`` (a fresh run = a fresh base state),
+        # then held CONSTANT for the whole run (start -> stop), so every figure saved during the run
+        # carries the same "what the apparatus was doing" record, and a stopped run keeps its last one.
+        self.refresh_provenance()
         self._stop.clear()
         period = 1.0 / max(0.1, float(rate_hz))
 
@@ -439,20 +444,25 @@ class LogicNode:
         return {}
 
     # ----------------------------------------------------- acquisition provenance
-    # "What was the apparatus doing when this data was taken" -- collected the moment a node
-    # produces data so a SAVED figure can record it (frontend reads it off the producing node).
-    # It reads ONLY each device's PUBLIC ``.snapshot()`` (the backend-neutral contract on
-    # devices/base.py) plus the node's own acquisition params + calibration fingerprint -- never a
-    # simulation ground-truth, never a concrete backend -- so it is the SAME provenance a real qCMOS
-    # run records (virtual == real, guarded by test_virtual_equals_real_contract).
+    # "What was the apparatus doing when this data was taken" -- the device BASE-STATE of ONE run,
+    # captured ONCE at ``start()`` so a SAVED figure can record it (frontend reads it off the producing
+    # node).  It reads ONLY each device's PUBLIC ``.snapshot()`` (the backend-neutral contract on
+    # devices/base.py) plus the node's own acquisition params + calibration fingerprint + (for a
+    # derived node with no device) the signals it CONSUMES -- never a simulation ground-truth, never a
+    # concrete backend -- so it is the SAME provenance a real qCMOS run records (virtual == real,
+    # guarded by test_virtual_equals_real_contract).  Every layer's node is handled GENERICALLY (probe
+    # for held devices / a ``consumes`` list / a ``session`` -- no per-node-type if/else): a measurement
+    # yields device snapshots, a processor yields its consumed inputs, a task yields whatever it holds.
     def _snapshot_devices(self) -> dict[str, object]:
         """The public ``.snapshot()`` of every device this node HOLDS, keyed by role.
 
-        GENERIC (no per-node-type ``if``): it looks for the two device attributes a producing node
-        may own -- ``camera`` and ``sequencer`` -- and includes each one that is present AND exposes
-        the ``.snapshot()`` device contract.  A processor / task that holds neither simply yields an
-        empty dict.  A device whose snapshot raises is skipped (its role maps to the error text)
-        rather than wedging a save."""
+        GENERIC (no per-node-type ``if``): it probes the device attributes a producing node MAY own --
+        a directly-held ``camera`` / ``sequencer`` (a measurement / camera task) and a held
+        ``devices`` bundle (a task that carries the whole session) -- and includes each one that is
+        present AND exposes the ``.snapshot()`` device contract.  A pure processor holds none of these
+        so it yields an empty dict.  A snapshot that raises maps its role to the error text rather than
+        wedging a save; a ``devices`` bundle's snapshot (already a role-keyed dict) is merged flat so a
+        task and a measurement record the SAME per-role device keys."""
         out: dict[str, object] = {}
         for role in ("camera", "sequencer"):
             device = getattr(self, role, None)
@@ -463,6 +473,19 @@ class LogicNode:
                 out[role] = snap()
             except Exception as exc:                     # a device must never break a figure save
                 out[role] = f"<snapshot failed: {type(exc).__name__}: {exc}>"
+        # A node that instead carries the whole session's device BUNDLE (``self.devices`` with its own
+        # ``.snapshot()`` returning a role-keyed dict, e.g. a session-holding task) contributes every
+        # role it does not already have directly -- so a task records the same per-role device state a
+        # measurement does, still generically (probe the attribute, no node-type branch).
+        bundle_snap = getattr(getattr(self, "devices", None), "snapshot", None)
+        if callable(bundle_snap):
+            try:
+                bundle = bundle_snap()
+            except Exception:
+                bundle = None
+            if isinstance(bundle, dict):
+                for role, snap in bundle.items():
+                    out.setdefault(str(role), snap)
         return out
 
     def _calibration_fingerprint(self) -> dict[str, object] | None:
@@ -490,13 +513,18 @@ class LogicNode:
         return fp or None
 
     def refresh_provenance(self) -> None:
-        """Capture and cache this node's provenance NOW (call from an acquiring node right after a
-        real acquisition, so the snapshot reflects the device state that produced THIS data)."""
+        """Re-capture this run's provenance NOW and cache it.  Called once by :meth:`start` at the
+        beginning of a run (a fresh run = a fresh device base-state); a node with no ``start()`` gets
+        the same one-shot capture lazily via :meth:`provenance_snapshot`."""
         self._provenance = self._collect_provenance()
 
     def _collect_provenance(self) -> dict[str, object]:
-        """Assemble the provenance dict: the held devices' snapshots + this node's acquisition
-        params + calibration fingerprint + node/layer identity + a wall-clock timestamp."""
+        """Assemble the provenance dict GENERICALLY for any layer's node: the held devices' snapshots
+        (measurement / camera task) + the consumed input signals (a derived processor with no device)
+        + this node's acquisition params + calibration fingerprint + node/layer identity + a
+        wall-clock timestamp.  Every section is included only when the generic probe finds it, so a
+        measurement, a processor and a task each record what they actually have -- no node-type
+        branch."""
         prov: dict[str, object] = {
             "node": self.display_label,
             "layer": self.layer,
@@ -505,6 +533,14 @@ class LogicNode:
         devices = self._snapshot_devices()
         if devices:
             prov["devices"] = devices
+        # A DERIVED node (a processor) holds no device, so its provenance is otherwise empty and
+        # meaningless.  Give it substance GENERICALLY: if the node declares the signals it CONSUMES
+        # (the ``consumes`` attribute every Processor carries), record them -- so a processor's
+        # provenance says WHICH upstream signals it transformed, and the console can walk them to the
+        # producing measurement's device state (upstream chaining).  Probed by attribute, not by type.
+        consumes = getattr(self, "consumes", None)
+        if consumes:
+            prov["consumes"] = [str(c) for c in consumes]
         try:
             params = self.acquisition_parameters()
         except Exception:
@@ -517,16 +553,18 @@ class LogicNode:
         return prov
 
     def provenance_snapshot(self) -> dict[str, object]:
-        """The device state + acquisition context of the data this node produced -- the record a
-        saved figure keeps so a reader sees "what the apparatus was doing when this was taken".
+        """The device base-state + acquisition context of the run that produced this node's data --
+        the record a saved figure keeps so a reader sees "what the apparatus was doing when this was
+        taken".
 
-        Returns the snapshot cached by :meth:`refresh_provenance` (captured at the last acquisition);
-        when a node never refreshed one (e.g. a static node, or read before its first shot) it is
-        computed on demand from the current device state.  Always a plain dict of picklable values
-        (device ``.snapshot()`` dicts + scalars), so it round-trips through the saved-figure npz."""
-        if self._provenance is not None:
-            return dict(self._provenance)
-        return self._collect_provenance()
+        Returns the per-run snapshot captured ONCE at :meth:`start` (constant for the whole run, kept
+        after stop).  A notebook ``step()`` loop that never called ``start()`` has no cached snapshot
+        yet, so the FIRST read computes it and caches it -- from then on it is constant too (never
+        re-snapshotted per shot).  Always a plain dict of picklable values (device ``.snapshot()``
+        dicts + scalars), so it round-trips through the saved-figure npz."""
+        if self._provenance is None:
+            self._provenance = self._collect_provenance()
+        return dict(self._provenance)
 
 
 # ===================================================================== logic node kinds

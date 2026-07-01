@@ -4515,17 +4515,28 @@ class PanelEditor(QtWidgets.QWidget):
 
         Resolved from the producing logic NODE of the panel's first input signal
         (``console._node_for_signal(...)`` -> ``node.provenance_snapshot()``): its held devices'
-        public ``.snapshot()`` + acquisition params + calibration fingerprint.  When no node produces
-        the signal (a derived expression, a loaded static figure) it falls back to the whole-session
-        device snapshot (``session.devices.snapshot()``) if a session is attached, else ``None``
-        (nothing to record) -- so a save NEVER fails for lack of provenance."""
+        public ``.snapshot()`` + acquisition params + calibration fingerprint.  When the producing
+        node is DERIVED (a processor: no device of its own, but a ``consumes`` list), its own
+        provenance is thin, so this walks UPSTREAM -- each consumed signal -> its producing node ->
+        that node's ``provenance_snapshot()`` -- and folds them under ``provenance['upstream']``
+        (keyed by the consumed signal), so a PROCESSED figure still carries the source measurement's
+        device state.  The walk is transitive (a processor of a processor chains up), visited-guarded
+        (no cycle / no duplicate).  When no node produces the signal (a derived expression, a loaded
+        static figure) it falls back to the whole-session device snapshot
+        (``session.devices.snapshot()``) if a session is attached, else ``None`` (nothing to record)
+        -- so a save NEVER fails for lack of provenance."""
         inputs = self.card.config.inputs or []
         node = self.console._node_for_signal(inputs[0]) if inputs else None
         if node is not None:
             try:
-                return node.provenance_snapshot()
+                prov = dict(node.provenance_snapshot())
             except Exception:
-                pass
+                prov = None
+            if prov is not None:
+                upstream = self._upstream_provenance(node, visited={id(node)})
+                if upstream:
+                    prov["upstream"] = upstream
+                return prov
         devices = getattr(getattr(self.console, "session", None), "devices", None)
         snap = getattr(devices, "snapshot", None)
         if callable(snap):
@@ -4534,6 +4545,34 @@ class PanelEditor(QtWidgets.QWidget):
             except Exception:
                 return None
         return None
+
+    def _upstream_provenance(self, node, *, visited):
+        """Walk a DERIVED node's consumed inputs to the measurements that produced them, returning
+        ``{consumed_signal: upstream_node_provenance}`` (each also carrying ITS own upstream, so the
+        chain is transitive).  Only a node that consumes signals yet holds NO device of its own (a
+        processor) is a pass-through worth chaining -- a measurement's own ``provenance_snapshot`` is
+        already the source record, so it is a leaf here.  ``visited`` (a set of ``id(node)``) breaks
+        cycles and avoids recording the same node twice."""
+        prov = node.provenance_snapshot() if hasattr(node, "provenance_snapshot") else {}
+        # A node with its OWN device state is a source leaf: nothing further upstream to record for it.
+        if prov.get("devices"):
+            return {}
+        consumes = list(getattr(node, "consumes", ()) or [])
+        upstream: dict[str, object] = {}
+        for sig in consumes:
+            src = self.console._node_for_signal(sig)
+            if src is None or id(src) in visited:
+                continue
+            visited.add(id(src))
+            try:
+                src_prov = dict(src.provenance_snapshot())
+            except Exception:
+                continue
+            deeper = self._upstream_provenance(src, visited=visited)
+            if deeper:
+                src_prov["upstream"] = deeper
+            upstream[str(sig)] = src_prov
+        return upstream
 
     def save(self) -> None:
         if self._plotter is None:
