@@ -473,3 +473,57 @@ def test_console_timer_base_is_the_fastest_panel():
         assert console._base_interval_ms == 100 and console._timer.interval() == 100
     finally:
         console.shutdown()
+
+
+# ------------------------------------------------- Edit-tab Save image format
+def test_edit_save_image_format_writes_chosen_container(tmp_path):
+    """The Edit tab's Save offers an image FORMAT picker (png / pdf / jpg) that drives BOTH the output
+    file suffix and ``DataFigure.save(image_ext=...)`` -- the ONE ``_save_image_ext`` reader keeps the
+    two in lockstep.  The matching ``.npz`` data file is format-INDEPENDENT: identical ``info`` for every
+    choice (only the image container changes).  A DATA-layer choice, not an art knob, so the figure's
+    geometry / dpi are untouched.  (Confocal names this the ``save_type`` = jpg / png convention.)"""
+    import numpy as np
+    from Zou_lab_control.frontend import devtools as dt
+    from Zou_lab_control.frontend.task_console import SAVE_IMAGE_FORMATS
+
+    # png is the default (first) offering, and the picker exposes exactly these lowercase containers.
+    assert SAVE_IMAGE_FORMATS[0] == "png"
+    assert set(SAVE_IMAGE_FORMATS) == {"png", "pdf", "jpg"}
+    # each format's magic bytes so we prove a REAL container was written, not just a renamed file.
+    magic = {"png": b"\x89PNG", "pdf": b"%PDF", "jpg": b"\xff\xd8\xff"}
+
+    console = dt.demo_console(shots=4)
+    try:
+        card = console.cards[0]                      # the 2d "Readout image" panel (holds data)
+        assert card.plotter is not None
+        console._edit_card(card)
+        editor = console._panel_editors[id(card)]
+        editor.rebuild()                             # snapshot -> _plotter is live, save() can run
+        assert editor._plotter is not None
+        assert editor.save_format_combo.currentText() == "png"   # defaults to png
+        editor.save_autoname.setChecked(False)       # verbatim name -> deterministic per-format path
+
+        infos: dict[str, dict] = {}
+        for fmt in SAVE_IMAGE_FORMATS:
+            editor.save_dir_edit.setText(str(tmp_path / f"panel_{fmt}"))
+            editor.save_format_combo.setCurrentText(fmt)
+            assert editor._save_image_ext() == fmt
+            # the read-only preview shows the actual suffix the next Save writes
+            editor._update_save_preview()
+            assert editor.save_preview.text().endswith(f".{fmt} + .npz")
+
+            editor.save()
+            img = tmp_path / f"panel_{fmt}.{fmt}"
+            npz = tmp_path / f"panel_{fmt}.npz"
+            assert img.exists() and img.stat().st_size > 0, fmt
+            assert img.read_bytes()[: len(magic[fmt])] == magic[fmt], (fmt, "not a real container")
+            assert npz.exists(), fmt
+            info = np.load(npz, allow_pickle=True)["info"].item()
+            infos[fmt] = {k: info.get(k) for k in ("kind", "source", "size", "name", "labels")}
+
+        # the .npz payload is the SAME data regardless of the image container chosen
+        ref = infos[SAVE_IMAGE_FORMATS[0]]
+        for fmt in SAVE_IMAGE_FORMATS[1:]:
+            assert infos[fmt] == ref, (fmt, infos[fmt], ref)
+    finally:
+        console.shutdown()

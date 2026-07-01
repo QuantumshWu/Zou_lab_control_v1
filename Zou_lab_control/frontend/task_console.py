@@ -1374,6 +1374,13 @@ _RELIM_PARAM = ParamDecl(
 UPDATE_INTERVALS = (100, 200, 400, 800)
 DEFAULT_UPDATE_MS = 400
 
+#: Image containers the Edit-tab Save offers, in menu order (first = default).  A DATA-layer choice of
+#: the output FILE FORMAT (not an art knob): the figure's geometry / dpi / typography are unchanged; only
+#: the container the ``DataFigure.save(image_ext=...)`` writes changes.  Lowercase to match matplotlib's
+#: ``savefig`` extensions and confocal's ``save_type`` naming (jpg / png).  The matching ``.npz`` data
+#: file is format-independent -- identical arrays + ``info`` for every choice.
+SAVE_IMAGE_FORMATS: tuple[str, ...] = ("png", "pdf", "jpg")
+
 #: Debounce window (ms) for coalescing a burst of STRUCTURE-knob edits into ONE plotter rebuild.  A
 #: fast scroll on a rebuild-class param (history length, colormap, ...) fires many _set_param calls; each
 #: restarts this timer, so the (heavy) teardown+rebuild runs ONCE after the burst settles, on the latest
@@ -4033,10 +4040,23 @@ class PanelEditor(QtWidgets.QWidget):
             self.save_autoname.setToolTip(
                 "ON: append _<plot-kind>_<timestamp> to the path (unique files).\n"
                 "OFF: write the path verbatim (you set the exact name; overwrites).")
+            # image FORMAT: a DATA-layer choice of the output CONTAINER (png / pdf / jpg), NOT an art
+            # knob -- the figure's geometry/dpi/typography are unchanged, only the file it lands in.
+            # It drives ``DataFigure.save(image_ext=...)`` (the ONE save path) and the file suffix;
+            # the .npz payload is format-independent (same data + info for every choice).  Lowercase
+            # extensions match confocal's ``save_type`` convention (jpg/png).
+            self.save_format_combo = FluentComboBox()
+            self.save_format_combo.addItems(list(SAVE_IMAGE_FORMATS))
+            self.save_format_combo.setCurrentText(SAVE_IMAGE_FORMATS[0])
+            self.save_format_combo.setFixedWidth(scaled_px(72, minimum=56))
+            self.save_format_combo.setToolTip(
+                "Image container for the saved figure (png / pdf / jpg).\n"
+                "The matching .npz data file is the same for every format.")
             self.save_button = FluentButton("Save Fig", color=ACCENT)
-            self.save_button.setToolTip("Save the edited figure (png) + matching data (npz).")
+            self.save_button.setToolTip("Save the edited figure (png / pdf / jpg) + matching data (npz).")
             col.addWidget(FluentSettingRow(
-                "name", _inline(self.save_autoname, trailing=self.save_button), label_width=proc_lw))
+                "name", _inline(self.save_autoname, self.save_format_combo, trailing=self.save_button),
+                label_width=proc_lw))
             # The previewed file path is a read-only-but-COPYABLE field (NOT a word-wrap label):
             # a long absolute path has no spaces to wrap on, so a word-wrap label would force its
             # own width to the full path and DRAG the whole Edit panel wider (the bug).  A
@@ -4049,6 +4069,7 @@ class PanelEditor(QtWidgets.QWidget):
             col.addWidget(FluentSettingRow("file", self.save_preview, label_width=proc_lw))
             self.save_dir_edit.changed.connect(lambda *_: self._update_save_preview())
             self.save_autoname.toggled.connect(lambda *_: self._update_save_preview())
+            self.save_format_combo.currentTextChanged.connect(lambda *_: self._update_save_preview())
             self.save_button.clicked.connect(self.save)
             self._update_save_preview()
 
@@ -4538,11 +4559,22 @@ class PanelEditor(QtWidgets.QWidget):
             return base.parent / f"{base.name}_{kind}_{timestamp or '<time>'}"   # unique
         return base                                # verbatim (operator-set name; overwrites)
 
+    def _save_image_ext(self) -> str:
+        """The image container the next Save writes (``png`` / ``pdf`` / ``jpg``).
+
+        ONE reader of the format picker, shared by :meth:`save` and :meth:`_update_save_preview`, so the
+        previewed suffix and the file actually written never disagree.  Falls back to the first
+        :data:`SAVE_IMAGE_FORMATS` entry when the picker is absent (e.g. a non-plot editor) or empty."""
+        combo = getattr(self, "save_format_combo", None)
+        ext = combo.currentText().strip().lower() if combo is not None else ""
+        return ext or SAVE_IMAGE_FORMATS[0]
+
     def _update_save_preview(self) -> None:
         """Show the actual file (full path) the next Save writes -- not just the folder."""
         if not hasattr(self, "save_preview"):
             return
-        self.save_preview.setText(f"{display_path(str(self._save_stem(None)))}.png + .npz")
+        self.save_preview.setText(
+            f"{display_path(str(self._save_stem(None)))}.{self._save_image_ext()} + .npz")
 
     def _save_view_state(self) -> dict[str, object]:
         """The panel's DISPLAY knobs, read from ``config.params`` (the one source), folded into the
@@ -4583,9 +4615,12 @@ class PanelEditor(QtWidgets.QWidget):
                            resolve_node=self.console._node_for_signal, session=self.console.session)
             stem = self._save_stem(time.strftime("%Y_%m_%d_%H_%M_%S", time.localtime()))
             stem.parent.mkdir(parents=True, exist_ok=True)
+            # the operator-chosen container (png / pdf / jpg) drives BOTH the file suffix and
+            # ``DataFigure.save(image_ext=...)`` -- the ONE format reader keeps them in lockstep.
+            ext = self._save_image_ext()
             # a path WITH a suffix makes DataFigure.save write it VERBATIM (no extra timestamp),
             # so this resolver is the single source of the output name.
-            out = df.save(stem.with_suffix(".png"),
+            out = df.save(stem.with_suffix(f".{ext}"), image_ext=ext,
                           extra_info={"source": self.card.config.source,
                                       "kind": self.card.config.kind,
                                       "size": self.card.config.size,
