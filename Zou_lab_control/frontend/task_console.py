@@ -89,6 +89,7 @@ from .qt_fluent import (
     FluentWindow,
     center_window_on_primary_screen,
     ensure_qt_app,
+    fluent_text_width,
     fluent_widget_stylesheet,
     scaled_px,
     screen_fit_window_size,
@@ -1840,7 +1841,7 @@ class PanelCard(FluentGroupBox):
                      else f"an added signal slot — read as signal[{i}] in the expression"
                      for i in range(n_slots)]
         fm = self.fontMetrics()
-        widest = max((fm.horizontalAdvance(t) for t in [*slot_labels, "colormap", "threshold"]), default=0)
+        widest = max((fluent_text_width(fm, t) for t in [*slot_labels, "colormap", "threshold"]), default=0)
         label_w = max(scaled_px(80, minimum=56), widest + scaled_px(10))
 
         def section_box(title: str) -> QtWidgets.QVBoxLayout:

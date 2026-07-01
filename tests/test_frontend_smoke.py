@@ -862,9 +862,10 @@ def test_pulse_gui_layout_geometry_contract(monkeypatch):
         editor.bracket_button, editor.collapse_button, editor.save_button, editor.load_button,
         editor.add_channel_button, editor.hide_off_button, editor.show_all_button,
     ]
+    from Zou_lab_control.frontend.qt_fluent import fluent_text_width
     for b in buttons:
         metrics = QtGui.QFontMetrics(b.font())
-        text_w = metrics.horizontalAdvance(b.text().replace("\n", " "))
+        text_w = fluent_text_width(metrics, b.text().replace("\n", " "))
         assert text_w <= b.width() - 8, (b.text(), text_w, b.width())
 
 
@@ -880,7 +881,7 @@ def test_pulse_gui_preview_robust_across_states(monkeypatch):
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from Zou_lab_control.frontend import devtools as dt
     from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
-    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.qt_fluent import fluent_text_width, ensure_qt_app
 
     ensure_qt_app()
 
@@ -3586,8 +3587,9 @@ def test_bus_mode_combo_fits_ramp(monkeypatch):
     ed = dt.demo_editor(size=(1480, 900))
     dt.settle(ed, 120)
     combo = next(iter(ed.drag_container.pulse_cards()[0].bus_mode_combos.values()))
+    from Zou_lab_control.frontend.qt_fluent import fluent_text_width
     metrics = QtGui.QFontMetrics(QtGui.QFont(combo.font()))
-    ramp_w = metrics.horizontalAdvance("Ramp")
+    ramp_w = fluent_text_width(metrics, "Ramp")
     # paintEvent reserves drop arrow + insets (~drop + 2*pad + 2); the combo must leave at
     # least the "Ramp" text width after that reserve.
     reserve = scaled_px(COMBO_WIDTH) + scaled_px(EDIT_PADDING_H) * 2 + scaled_px(2)

@@ -19,6 +19,7 @@ pytest.importorskip("PyQt5")
 
 from PyQt5 import QtCore, QtGui, QtWidgets  # noqa: E402
 from Zou_lab_control.frontend.qt_fluent import (  # noqa: E402
+    fluent_text_width,
     ensure_qt_app,
     FluentSwitch,
     FluentTriStateToggle,
@@ -78,7 +79,7 @@ def test_tristate_size_hint_widens_with_the_longest_label():
     # the hint is derived from the real font metrics of the widest label (+ uniform padding),
     # so it is at least three times that label's text width
     fm = QtGui.QFontMetrics(long.font())
-    widest = max(fm.horizontalAdvance(o) for o in ["Replace", "Block", "Parallel"])
+    widest = max(fluent_text_width(fm, o) for o in ["Replace", "Block", "Parallel"])
     assert long.sizeHint().width() >= 3 * widest
 
 

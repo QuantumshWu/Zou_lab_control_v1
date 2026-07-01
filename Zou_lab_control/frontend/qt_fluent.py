@@ -1056,7 +1056,7 @@ class FluentPathEdit(QtWidgets.QWidget):
         # size the button to its OWN label (+ padding) at the live DPR so "Browse…"
         # is never clipped (a fixed 80px clipped it to "owse" at some scales).
         self.browse.setFixedWidth(
-            self.browse.fontMetrics().horizontalAdvance("Browse…") + scaled_px(22, minimum=16))
+            fluent_text_width(self.browse.fontMetrics(), "Browse…") + scaled_px(22, minimum=16))
         self.browse.clicked.connect(self._browse)
         row.addWidget(self.edit, 1)
         row.addWidget(self.browse, 0)
