@@ -245,6 +245,16 @@ class FlowGraphView(QtWidgets.QWidget):
 
         self._content = QtCore.QSize(max(scaled_px(320, minimum=200), int(content_w)),
                                      max(scaled_px(120, minimum=90), int(content_h)))
+
+        # The globally non-overlapping labels may slide OUT of the node bounding box (they spread right /
+        # down to escape a crowd -- see ``_place_labels``); grow the recorded content so the widest / lowest
+        # plate is never clipped by the canvas edge (the #5b "no cutoff" half of the guarantee).
+        plates = [item["plate"] for item in self._place_labels(self._edge_endpoints())]
+        if plates:
+            label_right = max(p.right() for p in plates) + m
+            label_bottom = max(p.bottom() for p in plates) + m
+            self._content = QtCore.QSize(max(self._content.width(), int(label_right)),
+                                         max(self._content.height(), int(label_bottom)))
         self.setMinimumSize(self._content)
 
     def sizeHint(self) -> QtCore.QSize:  # noqa: N802 - Qt API name
@@ -318,69 +328,123 @@ class FlowGraphView(QtWidgets.QWidget):
         return path
 
     def _place_labels(self, endpoints: list) -> list[dict]:
-        """GLOBALLY non-overlapping label plates.  Each edge's label starts at the curve midpoint; the
-        plates are then placed one by one and each is nudged along the edge NORMAL (perpendicular, so it
-        slides sideways off the line) in growing steps until its bounding box clears every plate ALREADY
-        placed AND every node box -- so any two signal names in the whole graph are mutually exclusive
-        (crossing lines or not) and a name never sits on top of a node.  Returns a list of
-        ``{plate, label, anchor}`` (``anchor`` = the on-curve point, for a leader line when the plate had to
-        move).  Longest labels are placed FIRST (hardest to fit -> best pick of free space)."""
+        """GLOBALLY non-overlapping label plates.  Every label starts at its edge's curve midpoint, then
+        two passes make the whole set mutually disjoint -- independent of edge order / geometry:
+
+        * an ITERATIVE ALL-PAIRS push-apart relaxation (not the old greedy one-at-a-time-vs-already-placed
+          pass): each sweep resolves EVERY O(n²) plate pair together by the minimum-translation vector that
+          just separates it, split equally, so a plate that moved to dodge A cannot silently land on C
+          without C pushing back -- this spreads the dense clusters apart cheaply and symmetrically;
+        * a DETERMINISTIC guarantee pass that then walks every label (widest first, hardest to fit) and, for
+          any label still touching another plate OR a node box, slides it along its edge NORMAL in growing
+          +/- steps into the FIRST position clear of EVERY other plate and EVERY node -- searched in an
+          UNBOUNDED strip (no upper clamp; ``_relayout`` grows the content to enclose whatever slid out), so
+          a clear spot ALWAYS exists and the pass cannot fall back onto an overlap.
+
+        Together they guarantee the #5b contract: ANY two signal names in the graph are mutually disjoint
+        and no name sits on a node.  Returns ``{plate, label, anchor}`` (``anchor`` = the on-curve midpoint,
+        for a leader line when the plate had to slide away)."""
         import math
         fm = QtGui.QFontMetrics(self._small_font())
         pad_w = scaled_px(8, minimum=6)
         pad_h = scaled_px(2, minimum=2)
-        step = scaled_px(6, minimum=4)                       # normal-offset increment per collision retry
-        gap = scaled_px(2, minimum=1)                        # min clear gap between two plates
-        # Node boxes are OBSTACLES too (a name must not sit on a node); grow them by the gap so a plate rests
-        # just clear of a box edge.
+        gap = scaled_px(2, minimum=1)                        # min clear gap kept between two plates / a node
+        step = scaled_px(6, minimum=4)                       # normal-slide increment in the guarantee pass
+        margin = self._margin()
+
+        # Node boxes are OBSTACLES (a name must not sit on a node); grown by the gap so a plate rests just
+        # clear of a box edge.
         node_obstacles = [b.adjusted(-gap, -gap, gap, gap) for b in self._boxes.values()]
 
-        cand: list[dict] = []
+        # Seed every label at its ideal position (the curve midpoint), keeping the on-curve anchor (for the
+        # leader line) and the edge NORMAL (the sideways slide axis for the guarantee pass).
+        items: list[dict] = []
         for e, p1, p2 in endpoints:
             label = self._edge_label(e)
             if not label:
                 continue
-            path = self._edge_path(p1, p2)
-            anchor = path.pointAtPercent(0.5)
-            tw = fm.horizontalAdvance(label) + pad_w
-            th = fm.height() + pad_h
-            # Edge unit normal (perpendicular to the p1->p2 chord) -- the direction a plate slides to escape.
+            anchor = self._edge_path(p1, p2).pointAtPercent(0.5)
             dx, dy = (p2.x() - p1.x()), (p2.y() - p1.y())
             length = math.hypot(dx, dy) or 1.0
-            nx, ny = (-dy / length, dx / length)
-            cand.append({"label": label, "anchor": anchor, "tw": tw, "th": th, "nx": nx, "ny": ny})
+            items.append({"label": label, "anchor": anchor,
+                          "cx": anchor.x(), "cy": anchor.y(),
+                          "tw": fm.horizontalAdvance(label) + pad_w, "th": fm.height() + pad_h,
+                          "nx": -dy / length, "ny": dx / length})
 
-        cand.sort(key=lambda c: c["tw"], reverse=True)       # hardest (widest) first
+        def _plate(it: dict) -> QtCore.QRectF:
+            return QtCore.QRectF(it["cx"] - it["tw"] / 2.0, it["cy"] - it["th"] / 2.0, it["tw"], it["th"])
+
+        def _clamp_min(it: dict) -> None:
+            # Only a LOWER bound (never off the top/left edge); NO upper clamp, so the placement can spread
+            # right / down freely -- an upper clamp would jam plates back together and dead-lock separation.
+            it["cx"] = max(it["cx"], margin + it["tw"] / 2.0)
+            it["cy"] = max(it["cy"], margin + it["th"] / 2.0)
+
+        # The signed minimum-translation to move a box centred (ax, ay) size (aw, ah) just clear of one at
+        # (bx, by) size (bw, bh) along the axis of SMALLEST penetration (keeping ``clear`` between them);
+        # (0, 0) when they already do not touch.
+        def _mtv(ax, ay, aw, ah, bx, by, bw, bh, clear):
+            ox = (aw + bw) / 2.0 + clear - abs(ax - bx)
+            oy = (ah + bh) / 2.0 + clear - abs(ay - by)
+            if ox <= 0 or oy <= 0:
+                return 0.0, 0.0
+            if oy <= ox:                                     # shorter push is vertical -> separate in y
+                return 0.0, oy if ay >= by else -oy
+            return ox if ax >= bx else -ox, 0.0
+
+        # ---- pass 1: iterative all-pairs push-apart relaxation ------------------------------------------
+        n = len(items)
+        for _ in range(120):
+            moved = False
+            for i in range(n):
+                for j in range(i + 1, n):
+                    a, b = items[i], items[j]
+                    mx, my = _mtv(a["cx"], a["cy"], a["tw"], a["th"],
+                                  b["cx"], b["cy"], b["tw"], b["th"], gap)
+                    if mx or my:
+                        moved = True
+                        a["cx"] += mx / 2.0; a["cy"] += my / 2.0
+                        b["cx"] -= mx / 2.0; b["cy"] -= my / 2.0
+            for it in items:
+                for nb in node_obstacles:
+                    mx, my = _mtv(it["cx"], it["cy"], it["tw"], it["th"],
+                                  nb.center().x(), nb.center().y(), nb.width(), nb.height(), 0.0)
+                    if mx or my:
+                        moved = True
+                        it["cx"] += mx; it["cy"] += my
+            for it in items:
+                _clamp_min(it)
+            if not moved:
+                break
+
+        # ---- pass 2: deterministic guarantee -- normal-slide each still-colliding plate to a clear spot --
+        def _collides(it: dict, others: list[dict]) -> bool:
+            r = _plate(it).adjusted(-gap, -gap, gap, gap)
+            if any(r.intersects(_plate(o)) for o in others):
+                return True
+            plain = _plate(it)
+            return any(plain.intersects(nb) for nb in node_obstacles)
+
         placed: list[dict] = []
-        margin = self._margin()
-        max_w = float(self._content.width())
-        for c in cand:
-            tw, th = c["tw"], c["th"]
-            ax, ay = c["anchor"].x(), c["anchor"].y()
-            nx, ny = c["nx"], c["ny"]
-            chosen = None
-            # Try the on-curve midpoint, then step alternately to +/- normal offsets until the plate is clear
-            # of every already-placed plate AND every node box (and inside the canvas width).
-            for i in range(0, 120):
-                off = 0 if i == 0 else (((i + 1) // 2) * step) * (1 if i % 2 else -1)
-                cx = ax + nx * off
-                cy = ay + ny * off
-                plate = QtCore.QRectF(cx - tw / 2.0, cy - th / 2.0, tw, th)
-                if plate.left() < margin:
-                    plate.moveLeft(margin)
-                if plate.right() > max_w - margin:
-                    plate.moveRight(max_w - margin)
-                grown = plate.adjusted(-gap, -gap, gap, gap)
-                clear_labels = not any(grown.intersects(p["plate"]) for p in placed)
-                clear_nodes = not any(plate.intersects(nb) for nb in node_obstacles)
-                if clear_labels and clear_nodes:
-                    chosen = plate
+        for it in sorted(items, key=lambda c: c["tw"], reverse=True):   # widest (hardest) first
+            ax, ay = it["anchor"].x(), it["anchor"].y()
+            nx, ny = it["nx"], it["ny"]
+            best = None
+            for k in range(0, 400):
+                off = 0 if k == 0 else (((k + 1) // 2) * step) * (1 if k % 2 else -1)
+                it["cx"], it["cy"] = ax + nx * off, ay + ny * off
+                _clamp_min(it)
+                if not _collides(it, placed):
+                    best = (it["cx"], it["cy"])
                     break
-            if chosen is None:                               # never fully clear -> take the last try anyway
-                chosen = QtCore.QRectF(ax - tw / 2.0, ay - th / 2.0, tw, th)
-            placed.append({"plate": chosen, "label": c["label"],
-                           "anchor": QtCore.QPointF(ax, ay)})
-        return placed
+            if best is None:                                  # unreachable in an unbounded strip, but be safe
+                best = (it["cx"], it["cy"])
+            it["cx"], it["cy"] = best
+            placed.append(it)
+
+        return [{"plate": _plate(it), "label": it["label"],
+                 "anchor": QtCore.QPointF(it["anchor"].x(), it["anchor"].y())}
+                for it in items]
 
     def _paint_edges(self, painter: QtGui.QPainter) -> None:
         painter.setFont(self._small_font())

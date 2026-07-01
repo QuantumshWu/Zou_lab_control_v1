@@ -279,44 +279,71 @@ def test_flow_view_places_device_leaves_in_the_top_layer():
 
 
 def test_flow_view_labels_are_globally_non_overlapping():
-    """#5b: on a busy multi-input graph the ``FlowGraphView`` places its edge labels by a GLOBAL collision
-    pass -- ANY two signal-name plates in the whole graph are mutually non-overlapping (crossing lines or
-    not), which the old per-target-group stagger did NOT guarantee across groups."""
+    """#5b: on a BUSY multi-input graph (two device-expanded cameras -> two processors -> one plot, and
+    several named signals fanning into that SAME plot) the ``FlowGraphView`` places its edge labels by an
+    ITERATIVE ALL-PAIRS push-apart -- so ACROSS THE WHOLE GRAPH, checked by a full O(n²) sweep, (1) any two
+    signal-name plates are mutually non-overlapping and (2) no plate sits on any node box.  The old greedy
+    one-at-a-time-vs-already-placed pass did NOT guarantee this: a plate that dodged A could land where C
+    then had to sit (a plate B avoided ending up under C), so ~13 labels near mid-height overlapped."""
     from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
     from Zou_lab_control.frontend.flow_graph_view import FlowGraphView
 
     ensure_qt_app()
-    # a graph that fuses several sources into one plot AND one processor -> many edges crossing near mid-height
+    # Two cameras, each expanded to its own camera + sequencer device leaves, feed two processors; both
+    # processors AND a measurement then fan several named signals into the one plot -> ~13 labelled edges
+    # crowd the layer gaps, exactly the case the greedy pass left overlapping.
     graph = {
         "nodes": [
             {"id": "cam0", "name": "camera", "role": "device"},
             {"id": "seq0", "name": "sequencer", "role": "device"},
-            {"id": "mA", "name": "camera A", "role": "measurement", "has_devices": True,
+            {"id": "cam1", "name": "camera", "role": "device"},
+            {"id": "seq1", "name": "sequencer", "role": "device"},
+            {"id": "mA", "name": "bright A", "role": "measurement", "has_devices": True,
              "devices": ["camera", "sequencer"]},
-            {"id": "mB", "name": "camera B", "role": "measurement"},
-            {"id": "p", "name": "occupancy", "role": "processor"},
+            {"id": "mB", "name": "bright B", "role": "measurement", "has_devices": True,
+             "devices": ["camera", "sequencer"]},
+            {"id": "occ", "name": "occupancy", "role": "processor"},
+            {"id": "cal", "name": "calibrate", "role": "processor"},
             {"id": "__plot__", "name": "figure", "role": "plot"},
         ],
         "edges": [
             {"from": "cam0", "to": "mA", "signal": "camera", "role": "device"},
             {"from": "seq0", "to": "mA", "signal": "sequencer", "role": "device"},
-            {"from": "mA", "to": "p", "signal": "frame_alpha", "shape": [1, 1, 96, 128]},
-            {"from": "mB", "to": "p", "signal": "frame_beta", "shape": [1, 1, 96, 128]},
-            {"from": "mA", "to": "__plot__", "signal": "centers_map", "shape": [35, 2], "role": "centers"},
-            {"from": "mB", "to": "__plot__", "signal": "underlay_frame", "shape": [1, 1, 96, 128],
+            {"from": "cam1", "to": "mB", "signal": "camera", "role": "device"},
+            {"from": "seq1", "to": "mB", "signal": "sequencer", "role": "device"},
+            {"from": "mA", "to": "occ", "signal": "frame_0", "shape": [1, 1, 96, 128]},
+            {"from": "mB", "to": "occ", "signal": "frame_1", "shape": [1, 1, 96, 128]},
+            {"from": "mA", "to": "cal", "signal": "frame_0", "shape": [1, 1, 96, 128]},
+            {"from": "mB", "to": "cal", "signal": "frame_1", "shape": [1, 1, 96, 128]},
+            {"from": "occ", "to": "__plot__", "signal": "occupied_sites", "shape": [1, 1, 35], "role": "value"},
+            {"from": "occ", "to": "__plot__", "signal": "survival_prob", "shape": [1, 1, 35], "role": "value"},
+            {"from": "cal", "to": "__plot__", "signal": "centers_map", "shape": [35, 2], "role": "centers"},
+            {"from": "cal", "to": "__plot__", "signal": "thresholds_map", "shape": [1, 1, 35], "role": "value"},
+            {"from": "mA", "to": "__plot__", "signal": "underlay_frame", "shape": [1, 1, 96, 128],
              "role": "frame"},
-            {"from": "p", "to": "__plot__", "signal": "occupied_sites", "shape": [1, 1, 35], "role": "value"},
         ],
     }
     view = FlowGraphView()
     view.set_graph(graph)
     rects = view.label_rects()
-    assert len(rects) >= 6, f"one plate per labelled edge (got {len(rects)})"
-    # every pair of label plates is disjoint (no overlap) -- the core #5b guarantee
+    assert len(rects) >= 13, f"one plate per labelled edge (got {len(rects)})"
+    # (1) every PAIR of label plates is disjoint -- the core #5b guarantee, over the FULL O(n²) sweep.
     for i in range(len(rects)):
         for j in range(i + 1, len(rects)):
             assert not rects[i].intersects(rects[j]), \
                 f"label plates {i} and {j} overlap: {rects[i]} vs {rects[j]}"
+    # (2) NO plate sits on ANY node box -- a signal name never lands on a device / measurement / processor /
+    # plot box, checked against every laid-out node.
+    boxes = list(view._boxes.values())
+    assert len(boxes) == 9, f"every node laid out (got {len(boxes)})"
+    for k, r in enumerate(rects):
+        for nid, b in view._boxes.items():
+            assert not r.intersects(b), f"label plate {k} sits on node {nid}: {r} vs {b}"
+    # (3) nothing is clipped: every plate lies inside the reported content canvas (no-cutoff half of #5b).
+    cw, ch = float(view.sizeHint().width()), float(view.sizeHint().height())
+    for k, r in enumerate(rects):
+        assert r.left() >= -0.5 and r.top() >= -0.5 and r.right() <= cw + 0.5 and r.bottom() <= ch + 0.5, \
+            f"label plate {k} is clipped by the {cw:.0f}x{ch:.0f} canvas: {r}"
 
 
 # --------------------------------------------------------------------------- end-to-end save/load
