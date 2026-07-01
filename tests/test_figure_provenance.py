@@ -12,8 +12,10 @@ The data flow (all through public paths):
     (``PanelEditor._provenance_for_save`` -> ``node.provenance_snapshot()``) and folds it into
     ``extra_info['provenance']``, which ``DataFigure.save`` stores under the npz's top-level ``info``.
     When that node is a DERIVED processor (no device, a ``consumes`` list) the save walks UPSTREAM to
-    the measurement that produced each consumed signal and folds those device snapshots under
-    ``provenance['upstream']`` -- so a PROCESSED figure still records the source apparatus state;
+    the measurement that produced each consumed signal and HOISTS its device snapshot to the TOP LEVEL
+    (``provenance['devices']``) -- a FLAT record identical in shape to a direct measurement panel's, so
+    a processed figure records the source apparatus state in the same place, nothing hidden in a nested
+    sub-dict;
   * ``load_figure`` reads ``info['provenance']`` back; the FigureViewer expands it readably.
 
 These pin:
@@ -25,8 +27,8 @@ These pin:
 2. end-to-end through the CONSOLE Save path: connect virtual -> a camera measurement publishes
    ``frame_0`` -> save its panel -> ``load_figure`` back -> ``info['provenance']`` carries the camera
    device snapshot + key acquisition params;
-2b. CHAINED: saving a processor-output panel records the upstream measurement's device snapshot under
-   ``provenance['upstream']``;
+2b. CHAINED: saving a processor-output panel HOISTS the upstream measurement's device snapshot to the
+   top level ``provenance['devices']`` (a flat record, no nested ``upstream``);
 3. the fallback: no producing node but a session attached -> the whole-session device snapshot;
 4. backward compatibility: an OLD npz with no ``provenance`` loads + the viewer expands nothing (no crash).
 
@@ -195,13 +197,16 @@ def test_console_save_writes_producing_node_provenance(tmp_path):
 
 
 def test_console_save_chains_upstream_measurement_provenance():
-    """Saving a panel wired to a PROCESSOR's output records the UPSTREAM measurement's device state.
+    """Saving a panel wired to a PROCESSOR's output records the UPSTREAM measurement's device state,
+    HOISTED to the top level (a FLAT record, identical in shape to a direct camera panel's).
 
     A camera measurement publishes ``cam_frame_0``; an OccupancyProcessor consumes it and publishes
     ``occ_occupied``.  A panel bound to ``occ_occupied`` resolves the processor (no device of its own)
     as its producing node; ``_provenance_for_save`` then walks the processor's ``consumes`` to the
-    camera node and folds THAT node's camera snapshot under ``provenance['upstream']`` -- so a processed
-    figure still carries the source apparatus state."""
+    camera node and HOISTS that node's ``devices`` + ``acquisition_parameters`` to the TOP LEVEL of the
+    saved provenance -- so a processed figure carries the source apparatus state at ``prov['devices']``
+    exactly where a direct camera panel carries it (no nested ``upstream`` sub-dict).  The processor's
+    own identity keys (``layer`` / ``consumes`` / ``calibration_fingerprint``) stay top-level too."""
     ensure_qt_app()
     from Zou_lab_control.frontend.task_console import (
         TaskConsole, default_console_state, PanelConfig, PanelEditor, GAP)
@@ -233,14 +238,72 @@ def test_console_save_chains_upstream_measurement_provenance():
         editor = PanelEditor(card, console)
         editor.rebuild()
         prov = editor._provenance_for_save()
-        # the processor's own provenance: no device, its consumed input recorded
+        # the processor's own identity stays: its layer + the consumed input it transformed
         assert prov["layer"] == "processor" and "cam_frame_0" in prov.get("consumes", [])
-        # chained upstream: the camera measurement's device snapshot travelled along
-        upstream = prov.get("upstream")
-        assert isinstance(upstream, dict) and "cam_frame_0" in upstream, \
-            "a processed panel records the upstream measurement under provenance['upstream']"
-        cam_prov = upstream["cam_frame_0"]
-        assert cam_prov["devices"]["camera"]["type"] == type(exp.devices.camera).__name__
+        # NO nested upstream sub-dict -- the record is flat
+        assert "upstream" not in prov, "the flat provenance never nests an 'upstream' sub-dict"
+        # the upstream camera measurement's device snapshot was HOISTED to the TOP LEVEL: a processed
+        # panel's provenance carries devices in EXACTLY the same place a direct camera panel does
+        assert isinstance(prov.get("devices"), dict) and "camera" in prov["devices"], \
+            "a processed panel hoists the upstream camera's devices to the top level"
+        assert prov["devices"]["camera"]["type"] == type(exp.devices.camera).__name__
+        assert "sequencer" in prov["devices"], "both held devices travel up (camera + sequencer)"
+        # the upstream node's acquisition params were hoisted too
+        assert "acquisition_parameters" in prov and "exposure" in prov["acquisition_parameters"]
+    finally:
+        if console is not None:
+            console.shutdown()
+        exp.close()
+        plt.close("all")
+
+
+def test_measurement_and_processor_panels_record_the_same_flat_devices_shape():
+    """The CORE flat-provenance invariant: a 2-D panel wired STRAIGHT to a camera measurement and a
+    site-map panel wired to a PROCESSOR of that same camera record provenance with the SAME top-level
+    shape -- both carry ``prov['devices']`` holding camera + sequencer.  The reported inconsistency
+    (the direct panel had a top-level sequencer, the processed panel hid it in a nested sub-dict) is
+    gone: whatever the panel is wired to, the devices that produced the data are at the top level."""
+    ensure_qt_app()
+    from Zou_lab_control.frontend.task_console import (
+        TaskConsole, default_console_state, PanelConfig, PanelEditor, GAP)
+    from Zou_lab_control.frontend import panel_plot
+    from Zou_lab_control.neutral_atom.operations.signal_expr import SignalExpr, DEFAULT_SOURCE
+
+    exp = na.connect("virtual")
+    console = None
+    try:
+        hub = SignalHub()
+        cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer,
+                                prefix="cam_", repeat=2)
+        proc = OccupancyProcessor(hub, source_expr=SignalExpr(["cam_frame_0"], DEFAULT_SOURCE),
+                                  prefix="occ_")
+        fire_live_imaging(exp)
+        cam.refresh_provenance()
+        console = TaskConsole(hub=hub, state=default_console_state(), session=exp,
+                              running_nodes=[cam, proc], window_px=(900, 600))
+        console._timer.stop()
+        console.refresh_once = lambda: None
+
+        def prov_for(kind, source, inputs):
+            card = console._new_panel_card(PanelConfig(kind=kind, title=kind, source=source,
+                                                       inputs=inputs, row=GAP, col=GAP, size="2x4"))
+            console._attach_card(card)
+            card.plotter = panel_plot(np.random.default_rng(0).normal(0.5, 0.1, 200),
+                                      kind="hist", size="2x4", bins=20, title=kind)
+            editor = PanelEditor(card, console)
+            editor.rebuild()
+            return editor._provenance_for_save()
+
+        direct = prov_for("2d", "value = cam_frame_0", ["cam_frame_0"])          # measurement panel
+        processed = prov_for("sites", "value = occ_occupied", ["occ_occupied"])   # processor panel
+
+        for label, prov in (("direct/measurement", direct), ("processed/processor", processed)):
+            assert isinstance(prov.get("devices"), dict), f"{label}: devices at the top level"
+            assert "camera" in prov["devices"], f"{label}: camera at the top level"
+            assert "sequencer" in prov["devices"], f"{label}: SEQUENCER at the top level (the reported gap)"
+            assert "upstream" not in prov, f"{label}: no nested upstream sub-dict (flat)"
+        # identical shape: both device sets carry the same roles
+        assert set(direct["devices"]) == set(processed["devices"]) == {"camera", "sequencer"}
     finally:
         if console is not None:
             console.shutdown()

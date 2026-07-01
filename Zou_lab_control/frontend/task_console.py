@@ -1046,6 +1046,29 @@ PANEL_PARAMS: dict[str, tuple[ParamDecl, ...]] = {
     ),
 }
 
+
+def _panel_param_default(kind: str, key: str) -> object:
+    """The declared default of a panel kind's param, from the ONE ``PANEL_PARAMS`` catalog -- so a
+    kind's colormap default (``2d`` -> ``inferno``, ``sites`` -> ``gray``) has a SINGLE source and is
+    never hand-typed at a consume site.  Returns ``None`` for a kind/key with no declared param."""
+    for decl in PANEL_PARAMS.get(str(kind), ()):  # noqa: SIM110 - explicit loop is clearer than any()
+        if decl.key == key:
+            return decl.default
+    return None
+
+
+def _resolved_cmap(kind: str, params: Mapping[str, object]) -> str:
+    """The colormap a panel of ``kind`` actually draws with: the operator's picked ``params['cmap']``
+    if set, else the kind's declared default from ``PANEL_PARAMS`` (``_panel_param_default``).  Returns
+    an empty string for a kind that declares no cmap param (1-D / hist / monitor draw no image), so a
+    caller can store ``''`` for "no colormap" and a colormap-drawing kind always resolves a real name.
+    This is the SINGLE resolver for both the plot-build sites and the save's recorded view state."""
+    picked = str((params or {}).get("cmap") or "").strip()
+    if picked:
+        return picked
+    default = _panel_param_default(kind, "cmap")
+    return str(default) if default else ""
+
 # Curve fits a panel's Edit tab can run on its frozen snapshot -- the FULL
 # DataFigure model set (confocal's combo_fit plus gaussian), available for EVERY
 # plot kind (DataFigure picks the 1D or 2D path from the snapshot, so a 2D image
@@ -1172,6 +1195,19 @@ def _overlaps_with_gap(box: tuple[int, int, int, int], placed) -> bool:
     return False
 
 
+def _spans_mostly_overlap(lo_a: float, hi_a: float, lo_b: float, hi_b: float) -> bool:
+    """True when two 1-D spans ``[lo_a, hi_a]`` and ``[lo_b, hi_b]`` overlap by MORE THAN HALF of the
+    NARROWER span -- a "majority overlap", not a mere touch.  This is the robust "in the same band"
+    test the gravity packer uses: two cards count as sharing a column (or a row) only when one sits
+    mostly in front of the other, so a card dragged to sit BESIDE another with a slight edge overlap is
+    NOT judged to be stacked with it.  Adjacent (GAP-apart, zero intersection) spans return False."""
+    inter = min(hi_a, hi_b) - max(lo_a, lo_b)            # signed intersection length (negative = a gap)
+    if inter <= 0:
+        return False
+    narrower = min(hi_a - lo_a, hi_b - lo_b)
+    return inter * 2 > narrower                          # more than half the narrower span is covered
+
+
 def _gravity_slot(cfg, placed, board_w: int) -> tuple[int, int]:
     """NORTH-WEST (top-left) gravity ANCHORED at the card's CURRENT ``(col, row)``: from where it is, the
     card falls toward the top-left corner -- it rises straight UP until a card above blocks it, then slides
@@ -1181,11 +1217,18 @@ def _gravity_slot(cfg, placed, board_w: int) -> tuple[int, int]:
     boundary, STAYS bottom-left -- it is NOT flung to a top-right gap (#2).  ``placed`` = the already-
     settled cards; x is clamped inside ``board_w`` so a card stays on the board.
 
-    Rest-up = just below the lowest placed card whose x-span overlaps this card's column (else the top
-    margin); rest-left = just right of the right-most placed card whose y-span overlaps this card's row
-    (else the left margin).  Sliding left changes which cards share the row and rising changes the column
-    band, so we alternate until neither moves.  (A FRESH card spawns at :func:`_first_free_slot` so an Add
-    tiles into the board; thereafter this local gravity keeps it -- and a drag -- where the user put it.)"""
+    "In my column" / "in my row" use a MAJORITY-overlap test (:func:`_spans_mostly_overlap`), not any
+    touch: a placed card blocks my RISE only when its x-span covers MORE THAN HALF of the narrower of
+    our two widths, and blocks my SLIDE-LEFT only when its y-span covers more than half the narrower
+    height.  So a card dragged to sit BESIDE another with a slight edge overlap rests at the other's
+    right edge instead of sinking beneath it (the reported "drop B to A's right -> B falls under A"
+    bug): only a card the dragged one MOSTLY covers counts as sharing its band.
+
+    Rest-up = just below the lowest placed card whose x-span mostly overlaps this card's column (else the
+    top margin); rest-left = just right of the right-most placed card whose y-span mostly overlaps this
+    card's row (else the left margin).  Sliding left changes which cards share the row and rising changes
+    the column band, so we alternate until neither moves.  (A FRESH card spawns at :func:`_first_free_slot`
+    so an Add tiles into the board; thereafter this local gravity keeps it -- and a drag -- where put.)"""
     w, h = _card_size(cfg.size)
     max_x = max(GAP, board_w - GAP - w)
     x = min(max(GAP, int(round(cfg.col))), max_x)        # start from the card's CURRENT spot (clamped on-board)
@@ -1194,16 +1237,20 @@ def _gravity_slot(cfg, placed, board_w: int) -> tuple[int, int]:
         ny = GAP                                          # rise: rest just under any column-overlapping card
         for p in placed:
             px0, py0, px1, py1 = _aabb(p)
-            if x < px1 + GAP and px0 < x + w + GAP:       # x-spans overlap (within GAP) -> "above" in-column
+            # p is "above me in my column" only if its width MOSTLY covers mine -- a slight edge overlap
+            # (a card sitting mostly beside me) must NOT make me sink under it.
+            if _spans_mostly_overlap(x, x + w, px0, px1):
                 ny = max(ny, py1 + GAP)
         nx = GAP                                          # slide left: rest just right of any LEFT card in the row
         for p in placed:
             px0, py0, px1, py1 = _aabb(p)
-            # y-spans overlap at the risen y AND p is actually to the LEFT (px0 < x).  Only a card to the
-            # left blocks LEFTWARD travel: a card to the RIGHT that merely shares the row band (e.g. a
-            # right-column card grown TALLER on resize) must NOT shove this card right past it -- that was
-            # the resize bug that flung every left-column card down/across when one card was enlarged.
-            if ny < py1 + GAP and py0 < ny + h + GAP and px0 < x:
+            # p is "to my left in my row" only if its height MOSTLY covers mine (majority overlap at the
+            # risen y) AND it is actually to the LEFT (px0 < x).  Only a card to the left blocks LEFTWARD
+            # travel: a card to the RIGHT that merely shares the row band (e.g. a right-column card grown
+            # TALLER on resize) must NOT shove this card right past it (the resize bug that flung every
+            # left-column card down/across when one card was enlarged); a mere slight vertical sliver of
+            # overlap must not block the slide either.
+            if px0 < x and _spans_mostly_overlap(ny, ny + h, py0, py1):
                 nx = max(nx, px1 + GAP)
         nx = min(nx, max_x)
         if (nx, ny) == (x, y):
@@ -3055,7 +3102,7 @@ class PanelCard(FluentGroupBox):
             plotter = panel_plot(
                 centers, vec, kind="sites", size=size, interactions=False,
                 image=image, roi_radius=site_ring_radius(centers),
-                cmap=str(self.config.params.get("cmap") or "gray"),   # '' (a saved "default") -> the plot default
+                cmap=_resolved_cmap("sites", self.config.params),   # operator pick, else the kind default (ONE resolver)
                 **self._view_kwargs("sites"),
                 labels=("Camera x (px)", "Camera y (px)", label),
                 title=self.config.title or None)
@@ -3079,7 +3126,7 @@ class PanelCard(FluentGroupBox):
             data_x = np.column_stack([xx.ravel(), yy.ravel()])
             plotter = panel_plot(
                 data_x, arr.ravel(), kind="2d", size=size, interactions=False,
-                cmap=str(self.config.params.get("cmap") or "inferno"),   # '' (a saved "default") -> the plot default
+                cmap=_resolved_cmap("2d", self.config.params),   # operator pick, else the kind default (ONE resolver)
                 **self._view_kwargs("2d"),
                 labels=(xlabel, ylabel, ""), title=self.config.title or None)
         elif kind == "monitor":
@@ -4051,7 +4098,7 @@ class PanelEditor(QtWidgets.QWidget):
         size = card.config.size          # mirror the Monitor frame, never force 2x4
         title = card.config.title or PANEL_KINDS[kind]
         view = card._view_kwargs(kind)   # ONE source: relim mode + fixed lo/hi -- for sites too (#4)
-        cmap = str(card.config.params.get("cmap") or ("gray" if kind == "sites" else "inferno"))  # '' saved -> default
+        cmap = _resolved_cmap(kind, card.config.params)   # operator pick, else the kind default (ONE resolver)
         try:
             if kind == "2d":
                 new_plotter = panel_plot(np.array(src.data_x, dtype=float),
@@ -4501,14 +4548,21 @@ class PanelEditor(QtWidgets.QWidget):
         """The panel's DISPLAY knobs, read from ``config.params`` (the one source), folded into the
         saved ``info['view']`` so ``load_figure(...).plot()`` reopens the figure AS SEEN: relim mode
         + fixed lo/hi (``card._relim`` / the fixed bounds), unit index, colormap and repeat mode.
-        Everything defaults, so a panel saved before a knob was touched still round-trips cleanly."""
+        Everything defaults, so a panel saved before a knob was touched still round-trips cleanly.
+
+        ``cmap`` stores the RESOLVED colormap name -- the actual colormap the panel drew with -- via the
+        ONE ``_resolved_cmap`` resolver (operator's pick, else the kind's declared ``PANEL_PARAMS``
+        default: ``gray`` for a site map, ``inferno`` for a 2-D image).  So the npz records a REAL name an
+        image/site-map save drew with, never an empty ``''`` a consumer would have to second-guess; kinds
+        with no colormap param (1-D / hist / monitor) resolve to ``''`` -- they never feed it to
+        matplotlib."""
         params = self.card.config.params
         return {
             "relim": self.card._relim(),
             "fixed_lo": _safe_float(str(params.get("fixed_lo", 0.0)), 0.0),
             "fixed_hi": _safe_float(str(params.get("fixed_hi", 1.0)), 1.0),
             "unit_index": int(params.get("unit_index", 0) or 0),
-            "cmap": str(params.get("cmap", "")),
+            "cmap": _resolved_cmap(str(self.card.config.kind or ""), params),
             "repeat_mode": self.card._repeat_mode_value(),
         }
 
@@ -4517,18 +4571,25 @@ class PanelEditor(QtWidgets.QWidget):
         saved ``info['provenance']`` so a reopened figure shows "what the apparatus was doing when
         this data was taken".
 
-        Resolved from the producing logic NODE of the panel's first input signal
-        (``console._node_for_signal(...)`` -> ``node.provenance_snapshot()``): its held devices'
-        public ``.snapshot()`` + acquisition params + calibration fingerprint.  When the producing
-        node is DERIVED (a processor: no device of its own, but a ``consumes`` list), its own
-        provenance is thin, so this walks UPSTREAM -- each consumed signal -> its producing node ->
-        that node's ``provenance_snapshot()`` -- and folds them under ``provenance['upstream']``
-        (keyed by the consumed signal), so a PROCESSED figure still carries the source measurement's
-        device state.  The walk is transitive (a processor of a processor chains up), visited-guarded
-        (no cycle / no duplicate).  When no node produces the signal (a derived expression, a loaded
-        static figure) it falls back to the whole-session device snapshot
-        (``session.devices.snapshot()``) if a session is attached, else ``None`` (nothing to record)
-        -- so a save NEVER fails for lack of provenance."""
+        The record is FLAT and UNIFORM regardless of what kind of node the panel is wired to: the
+        ``devices`` that produced the plotted data (``camera`` + ``sequencer`` snapshots) and their
+        ``acquisition_parameters`` are ALWAYS at the top level.  Resolved from the producing logic NODE
+        of the panel's first input (``console._node_for_signal(...)`` -> ``node.provenance_snapshot()``):
+
+        * a MEASUREMENT node holds its own devices -> they are already top-level;
+        * a DERIVED node (a processor: no device of its own, only a ``consumes`` list) is walked UPSTREAM
+          -- each consumed signal -> its producing node -> ... transitively -- to the nearest node that
+          DOES hold devices, and THAT node's ``devices`` + ``acquisition_parameters`` are HOISTED to the
+          top level.  So a site-map panel wired to ``Judge occupancy`` and a 2-D panel wired straight to
+          the camera both end up with ``provenance['devices']`` carrying camera + sequencer -- the two
+          kinds record the SAME shape, nothing hidden in a nested ``upstream`` sub-dict.
+
+        The processor's OWN identity keys (``node`` / ``layer`` / ``consumes`` /
+        ``calibration_fingerprint``) stay at the top level too, so a processed figure still says which
+        upstream signals it transformed and under which calibration.  When no node produces the signal
+        (a derived expression, a loaded static figure) it falls back to the whole-session device snapshot
+        (``session.devices.snapshot()``) if a session is attached, else ``None`` -- so a save NEVER
+        fails for lack of provenance.  The walk is transitive and visited-guarded (no cycle / duplicate)."""
         inputs = self.card.config.inputs or []
         node = self.console._node_for_signal(inputs[0]) if inputs else None
         if node is not None:
@@ -4537,9 +4598,13 @@ class PanelEditor(QtWidgets.QWidget):
             except Exception:
                 prov = None
             if prov is not None:
-                upstream = self._upstream_provenance(node, visited={id(node)})
-                if upstream:
-                    prov["upstream"] = upstream
+                # If this node holds no devices of its own (a processor), hoist the nearest
+                # device-holding upstream node's devices + acquisition params to the top level, so the
+                # record is flat and identical to a measurement's -- no nested ``upstream`` structure.
+                if not prov.get("devices"):
+                    hoisted = self._hoist_upstream_devices(node, visited={id(node)})
+                    if hoisted:
+                        prov.update(hoisted)          # top-level devices + acquisition_parameters
                 return prov
         devices = getattr(getattr(self.console, "session", None), "devices", None)
         snap = getattr(devices, "snapshot", None)
@@ -4550,19 +4615,15 @@ class PanelEditor(QtWidgets.QWidget):
                 return None
         return None
 
-    def _upstream_provenance(self, node, *, visited):
-        """Walk a DERIVED node's consumed inputs to the measurements that produced them, returning
-        ``{consumed_signal: upstream_node_provenance}`` (each also carrying ITS own upstream, so the
-        chain is transitive).  Only a node that consumes signals yet holds NO device of its own (a
-        processor) is a pass-through worth chaining -- a measurement's own ``provenance_snapshot`` is
-        already the source record, so it is a leaf here.  ``visited`` (a set of ``id(node)``) breaks
-        cycles and avoids recording the same node twice."""
-        prov = node.provenance_snapshot() if hasattr(node, "provenance_snapshot") else {}
-        # A node with its OWN device state is a source leaf: nothing further upstream to record for it.
-        if prov.get("devices"):
-            return {}
+    def _hoist_upstream_devices(self, node, *, visited) -> dict:
+        """Walk a DERIVED node's consumed inputs to the nearest node that HOLDS devices and return that
+        node's ``{devices, acquisition_parameters}`` (only the keys it has) to hoist to the top level --
+        so a processed panel's flat provenance carries the source apparatus state directly, not buried in
+        a per-signal ``upstream`` sub-dict.  The walk is transitive (a processor of a processor chains up
+        to the measurement) and visited-guarded (a set of ``id(node)`` -- no cycle / no double-visit); the
+        FIRST device-holding node found wins (breadth-first over each level's consumed signals)."""
         consumes = list(getattr(node, "consumes", ()) or [])
-        upstream: dict[str, object] = {}
+        deferred: list = []
         for sig in consumes:
             src = self.console._node_for_signal(sig)
             if src is None or id(src) in visited:
@@ -4572,11 +4633,18 @@ class PanelEditor(QtWidgets.QWidget):
                 src_prov = dict(src.provenance_snapshot())
             except Exception:
                 continue
-            deeper = self._upstream_provenance(src, visited=visited)
+            if src_prov.get("devices"):
+                # This upstream node HOLDS the devices: hoist its device state + acquisition params.
+                hoist = {"devices": src_prov["devices"]}
+                if src_prov.get("acquisition_parameters"):
+                    hoist["acquisition_parameters"] = src_prov["acquisition_parameters"]
+                return hoist
+            deferred.append(src)                       # a processor-of-a-processor: chase it next level
+        for src in deferred:                           # transitive: recurse into the deeper processors
+            deeper = self._hoist_upstream_devices(src, visited=visited)
             if deeper:
-                src_prov["upstream"] = deeper
-            upstream[str(sig)] = src_prov
-        return upstream
+                return deeper
+        return {}
 
     def _signals_for_save(self) -> dict[str, dict]:
         """The RAW native hub blocks this panel actually consumes, keyed by bare name, folded into the

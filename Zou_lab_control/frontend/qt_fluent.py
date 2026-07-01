@@ -454,6 +454,25 @@ def add_fluent_shadow(widget: QtWidgets.QWidget, *, blur: int = 20, alpha: int =
     widget.setGraphicsEffect(shadow)
 
 
+# The FluentTabWidget drop-shadow parameters -- ONE source, so both the shadow itself and any layout
+# that must leave clearance for it (a tab card placed under another row) read the SAME numbers.  A soft
+# blur with a small downward offset; the shadow bleeds ``blur + offset`` (scaled) past every edge,
+# INCLUDING the top, so a host that stacks a tab card below another widget must reserve that much
+# headroom above it or the top shadow reads as clipped.
+_TAB_SHADOW_BLUR = 10
+_TAB_SHADOW_ALPHA = 50
+_TAB_SHADOW_OFFSET = 2
+
+
+def fluent_tab_shadow_margin() -> int:
+    """The pixel headroom a :class:`FluentTabWidget`'s drop shadow bleeds past its TOP edge -- the
+    ``blur + offset`` extent of :data:`_TAB_SHADOW_*`, at the current display scale.  A layout that
+    stacks a tab card under another row must add EXACTLY this much spacing above the card so the soft
+    top shadow is fully visible (never clipped by the row above).  ONE source with the shadow itself,
+    so the two can never drift out of step."""
+    return scaled_px(_TAB_SHADOW_BLUR) + scaled_px(_TAB_SHADOW_OFFSET, minimum=0)
+
+
 @contextlib.contextmanager
 def signals_blocked(*widgets: QtWidgets.QWidget | None):
     """Temporarily block Qt signals on each (non-None) widget, restoring after.
@@ -1860,7 +1879,7 @@ class FluentTabWidget(QtWidgets.QTabWidget):
             }}
             """
         )
-        add_fluent_shadow(self, blur=10, alpha=50, offset=2)
+        add_fluent_shadow(self, blur=_TAB_SHADOW_BLUR, alpha=_TAB_SHADOW_ALPHA, offset=_TAB_SHADOW_OFFSET)
         self._overflow_btn = self._build_overflow_button()
         self.setCornerWidget(self._overflow_btn, QtCore.Qt.TopRightCorner)
         self._overflow_btn.hide()

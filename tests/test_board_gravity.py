@@ -198,6 +198,38 @@ def test_drag_to_bottom_left_stays_below_the_top_left_card():
     assert drop.col == GAP                                # NOT slid right to the top-right gap
 
 
+def test_drop_beside_a_card_lands_at_its_right_edge_not_under_it():
+    """ROBUST drag (majority-overlap gravity): dropping card B to the RIGHT of card A with only a
+    SLIGHT horizontal overlap must land B at A's RIGHT EDGE (one GAP over), leaving A EXACTLY where it
+    was -- NOT sink B under A.  The old "any x-overlap = same column" rule made B fall beneath A the
+    moment their edges touched; the majority-overlap rule counts B as sharing A's column only when B
+    mostly covers A, so a card dragged to sit beside another rests beside it."""
+    w, h = _card_size("2x2")
+    board_w = GAP + 2 * w + 2 * GAP                    # room for two side-by-side columns
+    A = _cfg(GAP, GAP, "2x2")
+    B = _cfg(GAP + w - 30, GAP, "2x2")                 # dragged to A's right, only 30px of overlap
+    _compact([A, B], active=B, board_w=board_w)
+    ax0, ay0, ax1, ay1 = _aabb(A)
+    assert (A.col, A.row) == (GAP, GAP), "A stays put -- the dropped card does not shove it"
+    assert (B.col, B.row) == (ax1 + GAP, GAP), "B lands one GAP to the RIGHT of A, not beneath it"
+    _assert_no_overlap([A, B])
+
+
+def test_drop_mostly_onto_a_card_sinks_below_it():
+    """The other side of the majority rule: dropping B so it MOSTLY covers A (>half A's width) DOES
+    count as sharing A's column, so B sinks to just below A (one GAP under) -- the operator clearly
+    meant to stack, not to sit beside.  This is the boundary that keeps the packer's no-overlap
+    guarantee: a card that is mostly on top of another is placed under it, never left overlapping."""
+    w, h = _card_size("2x2")
+    board_w = GAP + 2 * w + 2 * GAP
+    A = _cfg(GAP, GAP, "2x2")
+    B = _cfg(GAP + w - int(w * 0.9), GAP, "2x2")       # dragged mostly ON TOP of A (90% overlap)
+    _compact([A, B], active=B, board_w=board_w)
+    assert (A.col, A.row) == (GAP, GAP), "A stays put"
+    assert B.col == GAP and B.row == GAP + h + GAP, "B sinks to one GAP below A (it mostly covered A)"
+    _assert_no_overlap([A, B])
+
+
 def test_save_composite_fills_a_hidpi_grab_with_no_white_margin():
     """#H4c save: the monitor 'Save image' composites the grabbed board onto an opaque white canvas.  On
     a SCALED display the grab is a HiDPI pixmap (physical = logical × dpr); the canvas MUST carry that

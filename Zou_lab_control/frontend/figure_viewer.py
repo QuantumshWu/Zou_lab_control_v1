@@ -64,6 +64,7 @@ from .qt_fluent import (
     WINDOW_SCREEN_FRACTION,
     center_window_on_primary_screen,
     ensure_qt_app,
+    fluent_tab_shadow_margin,
     scaled_px,
     screen_fit_window_size,
     set_fluent_scale,
@@ -405,11 +406,13 @@ class FigureViewer(QtWidgets.QWidget):
         # --- Info tabs: Plot | Measurement | Device | Raw -----------------------------------
         # The facts the npz stored, grouped so a column is not one long crushed list: Plot (how it draws),
         # Measurement (its data shapes / source), Device (the run's provenance), Raw (the whole dict).
-        # A clear gap ABOVE the tab card: the FluentTabWidget carries its own soft drop shadow whose
-        # blur bleeds a few px past its top edge, so without headroom the shadow overlaps the File row
-        # and the tab bar's top reads as CUT OFF.  Give it a full section-gap so the tab strip is
-        # completely clear of the row above it.
-        lay.addSpacing(scaled_px(10, minimum=7))
+        # A clear gap ABOVE the tab card equal to EXACTLY the tab shadow's top bleed
+        # (``fluent_tab_shadow_margin``, the ONE source shared with the shadow itself): the
+        # FluentTabWidget carries a soft drop shadow whose blur+offset bleeds past its top edge, so
+        # without at least that much headroom the shadow overlaps the File row and the tab bar's top
+        # reads as CUT OFF.  Reserving the shadow's own margin makes the whole top shadow visible at
+        # every display scale (the shadow grows with scale, and so does this gap).
+        lay.addSpacing(fluent_tab_shadow_margin())
         self.info_tabs = FluentTabWidget()
         self.info_tabs.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         self.plot_layout = self._add_rows_tab("Plot")
