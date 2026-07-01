@@ -499,44 +499,48 @@ class FigureViewer(QtWidgets.QWidget):
 
     # ------------------------------------------------------------------ layout
     def _build_info_column(self) -> QtWidgets.QWidget:
-        # The Info column is a fluent CARD (like PanelCard / a Setting card), so its rounded corners,
-        # 1 px edge and soft shadow are OWNED by FluentFrame -- never hand-drawn borders here (rule 5/8).
-        # An inner card padding floats the content off the card edge so nothing hugs the rounded corner.
-        col = FluentFrame()
+        # The Info column MIRRORS the console beside it: a FLAT header card (the path picker) ABOVE a
+        # SHADOWED tab card -- TWO separate fluent cards, NOT a tab card nested inside an outer frame.
+        # The old nesting (an outer FluentFrame wrapping the tab widget, which carries its OWN drop
+        # shadow) let the outer card clip the inner tab's upward shadow bleed, so the tab bar's top read
+        # as CUT OFF.  Two sibling cards each keep their own elevation and nothing clips.  The column's
+        # margins / header height / header<->tab gap match the console's (scaled_px 14 / 48 / 10) so the
+        # two header cards and the two tab cards line up row-for-row across the divider.
+        col = QtWidgets.QWidget()
+        col.setStyleSheet("background: transparent;")
         col.setFixedWidth(self._info_col_w)
-        pad = scaled_px(12, minimum=8)
         lay = QtWidgets.QVBoxLayout(col)
-        lay.setContentsMargins(pad, pad, pad, pad)
-        lay.setSpacing(scaled_px(6, minimum=4))
+        lay.setContentsMargins(scaled_px(14), 0, scaled_px(14), 0)   # == console root margins -> aligned
+        lay.setSpacing(scaled_px(10, minimum=7))                     # == console header<->tab gap
 
-        # --- File: path field -- Browse (or typing a valid .npz) AUTO-LOADS ----------------
-        # No separate Load button: FluentPathEdit.changed(str) fires when Browse picks a file (or the
-        # user finishes typing one) and _on_path_changed loads it if it is an existing .npz -- one action.
-        lay.addWidget(FluentSectionLabel("File"))
-        # Browse shows the saved-figure IMAGES (png / jpg) too, not just the .npz -- so the operator can
-        # eye-ball the thumbnail to find the right run (the native Windows dialog draws image previews),
-        # then picking the image loads its SIBLING .npz data (the save writes ``<name>_<time>.png`` +
-        # ``<name>_<time>.npz`` as a pair, so the data is ``<image>.with_suffix('.npz')``).  Picking a
-        # .npz directly still works.
+        # --- File header card: FLAT (like the console header), a single bar "File" + path picker --------
+        # Browse (or typing a valid .npz) AUTO-LOADS -- no separate Load button: FluentPathEdit.changed
+        # fires when Browse picks a file (or the user finishes typing one) and _on_path_changed loads it.
+        # Browse lists the saved-figure IMAGES (png / jpg) too, so the operator can eye-ball a thumbnail;
+        # picking the image loads its SIBLING ``<image>.with_suffix('.npz')`` data (the save writes the
+        # pair).  A FLAT header (no shadow) mirrors the console header, which is flat so its shadow's soft
+        # bottom edge never draws a thin line into the gap above the tab strip.
+        header_frame = FluentFrame(shadow=False)
+        header_frame.setFixedHeight(scaled_px(48, minimum=38))
+        header = QtWidgets.QHBoxLayout(header_frame)
+        header.setContentsMargins(scaled_px(12), scaled_px(6), scaled_px(12), scaled_px(6))
+        header.setSpacing(scaled_px(8, minimum=5))
+        header.addWidget(FluentSectionLabel("File"))
         self.path_edit = FluentPathEdit(
             "", mode="file", caption="Open a saved figure (image or .npz)",
             file_filter="Saved figures (*.png *.jpg *.jpeg *.npz);;All files (*)")
         self.path_edit.setToolTip("A saved figure -- Browse (or type a full path).  Pick the image "
                                   "(.png / .jpg) or the .npz and it loads onto the board automatically.")
         self.path_edit.changed.connect(self._on_path_changed)
-        lay.addWidget(FluentSettingRow("path", self.path_edit, label_width=self._label_w))
+        header.addWidget(self.path_edit, 1)
+        lay.addWidget(header_frame)
 
-        # --- Info tabs: Plot | Measurement | Device | Flow | Raw ------------------------------
-        # The facts the npz stored, grouped so a column is not one long crushed list: Plot (how it draws),
-        # Measurement (its data shapes / source), Device (the run's provenance), Flow (the upstream DAG of
-        # how the data was produced), Raw (the whole dict).
-        # A clear gap ABOVE the tab card equal to EXACTLY the tab shadow's top bleed
-        # (``fluent_tab_shadow_margin``, the ONE source shared with the shadow itself): the
-        # FluentTabWidget carries a soft drop shadow whose blur+offset bleeds past its top edge, so
-        # without at least that much headroom the shadow overlaps the File row and the tab bar's top
-        # reads as CUT OFF.  Reserving the shadow's own margin makes the whole top shadow visible at
-        # every display scale (the shadow grows with scale, and so does this gap).
-        lay.addSpacing(fluent_tab_shadow_margin())
+        # --- Info tabs card: its OWN shadowed card (no outer frame to clip its top shadow) ---------------
+        # Plot (how it draws) | Measurement (data shapes / source) | Device (run provenance) | Flow (the
+        # upstream DAG of how the data was produced) | Raw (the whole dict).  Reserve the tab shadow's top
+        # bleed above the card EXACTLY like the console does (gap = spacing + this = fluent_tab_shadow_margin)
+        # so the strip's top shadow is fully visible at every scale.
+        lay.addSpacing(max(0, fluent_tab_shadow_margin() - lay.spacing()))
         self.info_tabs = FluentTabWidget()
         self.info_tabs.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         self.plot_layout = self._add_rows_tab("Plot")
