@@ -294,17 +294,17 @@ def test_pulse_recipe_prefers_provenance_sequencer_payload(tmp_path):
         plt.close("all")
 
 
-def test_pulse_recipe_reopens_on_the_same_console_board(tmp_path):
-    """A pulse recipe npz reopens in ``show_figure_viewer`` on the SAME real console board -- it does NOT
-    replace the console.  A pulse figure is ``panel=False`` (not array-fed, so not a signal-driven panel),
-    so it lands on the board as a ``StaticFigureCard`` BESIDE the panels, and the Monitor tab + Add Panel
-    stay intact.  The pins guard the reported bug 'loading a pulse figure wiped the console / Monitor tab':
-    (1) the console is a real ``TaskConsole`` (never None); (2) the Monitor tab is present; (3) the pulse
-    reproduction is a single static card on the board (NOT a seeded signal panel); (4) the reproduced
-    figure is faithful (a ``PulseSequenceFigure`` -- many channels + an analog bus, not a 1-D line); and
-    (5) the board is still live -- a further Add Panel adds an ordinary panel."""
-    from Zou_lab_control.frontend.figure_viewer import show_figure_viewer
-    from Zou_lab_control.frontend.task_console import StaticFigureCard, TaskConsole
+def test_pulse_reopens_as_a_normal_panelcard_on_the_same_board(tmp_path):
+    """A pulse figure reopens through the EXACT SAME load path as every other kind: ``LoadedFigureNode``
+    publishes ``fig_value`` and ``_seed_state`` seeds a ``kind="pulse"`` panel bound to it -- so the
+    loaded pulse card is a NORMAL :class:`PanelCard` (not a bespoke class), rendered by PanelCard's
+    ``pulse`` branch.  Pins: (1) the console is a real ``TaskConsole`` (never replaced); (2) the Monitor
+    tab survives; (3) the seeded card is a plain ``PanelCard`` with ``kind == "pulse"`` wired to
+    ``fig_value`` -- SAME seed path as a hist; (4) it renders a faithful ``PulseSequenceFigure`` (channels
+    + analog bus, not a 1-D line) through the console tick; (5) Add Panel still works; (6) ``pulse`` is
+    NOT offered in the live Add-Panel dropdown (seedable, not live-addable)."""
+    from Zou_lab_control.frontend.figure_viewer import show_figure_viewer, FIG_PREFIX, FIG_VALUE_KEY
+    from Zou_lab_control.frontend.task_console import PanelCard, TaskConsole
 
     ed, state = _pulse_editor()
     df = ed._preview_data_figure(state, include_always_off=True)
@@ -315,26 +315,32 @@ def test_pulse_recipe_reopens_on_the_same_console_board(tmp_path):
     try:
         assert viewer.saved is not None and viewer.saved.kind == "pulse"
         con = viewer.console
-        # (1) the pulse figure opens on a real console board -- the console is NEVER replaced
+        # (1) real console, never replaced; (2) Monitor tab survives
         assert isinstance(con, TaskConsole), "a pulse figure opens on the SAME console (not a replacement)"
-        # (2) the Monitor tab survives (the reported bug wiped it)
         tab_titles = {con.tabs.tabText(i) for i in range(con.tabs.count())}
         assert "Monitor" in tab_titles, "the Monitor tab must survive a pulse load"
-        # (3) the reproduced pulse figure is ONE static card on the board -- no seeded signal panel
-        statics = [c for c in con.cards if isinstance(c, StaticFigureCard)]
-        assert len(statics) == 1, "the reproduced pulse figure is one static card on the board"
-        assert len(con.cards) == 1, "a pulse recipe seeds NO signal panel (it is not array-fed)"
-        assert viewer.node is None, "a pulse recipe publishes no fig_value signal (nothing array-fed)"
-        # (4) the reproduction is FAITHFUL: a PulseSequenceFigure with many channels + an analog bus
-        plotter = viewer.saved.plot().live_plot
-        assert type(plotter).__name__ == "PulseSequenceFigure", "the reproduction is a faithful pulse figure"
+        # (3) the seeded card is a NORMAL PanelCard of kind=pulse wired to fig_value -- SAME seed path
+        assert len(con.cards) == 1
+        card = con.cards[0]
+        assert type(card) is PanelCard, "the loaded pulse card is a normal PanelCard (not a bespoke class)"
+        assert card.config.kind == "pulse"
+        assert card.config.inputs[0] == FIG_PREFIX + FIG_VALUE_KEY
+        assert card.config.source == f"value = {FIG_PREFIX}{FIG_VALUE_KEY}"
+        assert (FIG_PREFIX + FIG_VALUE_KEY) in set(viewer.hub.names()), "fig_value published like every kind"
+        # (4) it BUILDS a faithful PulseSequenceFigure through the console tick (the pulse render branch)
+        con._tick()
+        plotter = card.plotter
+        assert type(plotter).__name__ == "PulseSequenceFigure", "PanelCard renders pulse faithfully"
         assert len(plotter.channels) > 1 and len(plotter.analog_traces) >= 1 and len(plotter.pulses) > 1
-        # the Info column still carries the recipe
         assert "figure_recipe" in viewer.raw_info.toPlainText()
-        # (5) the board is a real live console: Add Panel adds an ordinary panel beside the pulse card
-        con.kind_combo.setCurrentIndex(0)          # a "Plot: ..." kind
+        # (5) Add Panel still works beside the pulse panel
+        con.kind_combo.setCurrentIndex(0)          # a live-addable "Plot: ..." kind
         con._add_panel()
-        assert len(con.cards) == 2, "Add Panel still works with a static pulse card on the board"
+        assert len(con.cards) == 2, "Add Panel still works with a pulse panel on the board"
+        # (6) pulse is a SEEDABLE kind but NOT live-addable -> absent from the Add-Panel dropdown
+        combo_kinds = {con.kind_combo.itemData(i) for i in range(con.kind_combo.count())}
+        assert "pulse" not in {k for k in combo_kinds if isinstance(k, str)}, \
+            "pulse is not offered in the live Add-Panel dropdown (seedable, not live-addable)"
     finally:
         win = viewer.window()
         if win is not None:

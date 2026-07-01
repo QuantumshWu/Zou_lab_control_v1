@@ -458,14 +458,15 @@ def _saved_pulse_recipe_npz(tmp_path) -> Path:
     return path
 
 
-def test_pulse_recipe_lands_as_static_card_and_keeps_the_console(tmp_path):
+def test_pulse_seeds_a_normal_panelcard_via_the_same_load_path(tmp_path):
     """The reported bug: loading a PULSE figure wiped the console / Monitor tab (an old special-case
-    replaced the whole board with a bare recipe canvas).  A pulse figure is ``panel=False`` (not
-    array-fed), so it is NOT a signal panel -- but it must still open on the SAME console board as a
-    ``StaticFigureCard`` (a card beside the panels), with the Monitor tab + Add Panel intact.  Pins: the
-    console is a real board (never None), the Monitor tab is present, the reproduced pulse is exactly one
-    static card (no seeded signal panel, no fig_value node), and it is a faithful ``PulseSequenceFigure``."""
-    from Zou_lab_control.frontend.task_console import StaticFigureCard
+    replaced the whole board).  A pulse figure now takes the EXACT SAME load path as every other kind:
+    ``LoadedFigureNode`` publishes ``fig_value``, ``_seed_state`` seeds a ``kind="pulse"`` panel bound to
+    it, and the SAME :class:`PanelCard` renders it via its ``pulse`` branch.  Pins: a real console (never
+    replaced), the Monitor tab present, the seeded card is a NORMAL PanelCard of kind=pulse wired to
+    ``fig_value`` (fig_value IS on the hub -- as a numeric placeholder; the PulseTableState is resolved
+    off the producing node), and it renders a faithful ``PulseSequenceFigure`` through the tick."""
+    from Zou_lab_control.frontend.task_console import PanelCard
     npz = _saved_pulse_recipe_npz(tmp_path)
     v = show_figure_viewer(npz)
     try:
@@ -474,13 +475,16 @@ def test_pulse_recipe_lands_as_static_card_and_keeps_the_console(tmp_path):
         assert v.saved.kind == "pulse"
         tab_titles = {con.tabs.tabText(i) for i in range(con.tabs.count())}
         assert "Monitor" in tab_titles, "the Monitor tab survives a pulse load"
-        statics = [c for c in con.cards if isinstance(c, StaticFigureCard)]
-        assert len(statics) == 1 and len(con.cards) == 1, "one static pulse card, no seeded signal panel"
-        assert v.node is None, "a pulse recipe publishes no fig_value signal"
-        assert FIG_SIGNAL not in set(v.hub.names()), "no fig_value on the hub for a recipe figure"
-        # faithful reproduction: a PulseSequenceFigure with many channels + an analog bus
-        plotter = v.saved.plot().live_plot
-        assert type(plotter).__name__ == "PulseSequenceFigure"
+        assert len(con.cards) == 1
+        card = con.cards[0]
+        assert type(card) is PanelCard, "the loaded pulse card is a normal PanelCard (same seed path)"
+        assert card.config.kind == "pulse" and card.config.inputs[0] == FIG_SIGNAL
+        assert FIG_SIGNAL in set(v.hub.names()), "fig_value is published like every other kind"
+        # the producing node carries the reproduction state (the hub is float-only)
+        assert v.node is not None and v.node.pulse_state is not None
+        con._tick()
+        plotter = card.plotter
+        assert type(plotter).__name__ == "PulseSequenceFigure", "PanelCard renders pulse faithfully"
         assert len(plotter.channels) > 1 and len(plotter.analog_traces) >= 1
     finally:
         win = v.window()

@@ -248,3 +248,42 @@ def test_notebook_rolling_run_accepts_a_scalar_window():
     # a fixed (append) kind has no window meaning -> a scalar is still rejected
     with pytest.raises((ValueError, TypeError)):
         zf.run(50, src, kind="1d", autostart=False, display=False)
+
+
+# ---- pulse is a real plot kind: its RENDER lives in the plot layer (live.py), not the GUI app --------
+# A plot kind's rendering belongs to the plot layer next to every other kind's render class -- so the
+# pulse "state -> figure" render is in live.py, and pulse_gui / task_console / data_figure CONSUME it.
+# The dependency must point that way (consumers import FROM live), never the reverse (the plot layer
+# importing a renderer from the pulse_gui editor app).  These pins encode that so it cannot regress.
+def test_pulse_render_lives_in_the_plot_layer():
+    """The pulse render entry points are DEFINED in ``live.py`` (the plot layer that owns every kind's
+    render), not in the ``pulse_gui`` editor app."""
+    from Zou_lab_control.frontend import live as live_mod
+    for name in ("build_pulse_preview_plot", "annotate_pulse_variable_regions", "analog_bus_traces"):
+        obj = getattr(live_mod, name, None)
+        assert obj is not None, f"live.py must define the pulse-render entry point {name!r}"
+        assert obj.__module__ == live_mod.__name__, \
+            f"{name} must be DEFINED in live.py (the plot layer), got {obj.__module__}"
+
+
+def test_consumers_do_not_import_pulse_render_from_the_gui_app():
+    """``task_console`` and ``data_figure`` (and the plot layer itself) must NOT import any pulse RENDER
+    symbol from ``pulse_gui`` -- the pulse render's single source is the plot layer.  (Importing a plain
+    GUI utility like ``slot_label`` is fine; a pulse RENDERER is not.)"""
+    import ast
+    from pathlib import Path
+
+    render_names = {"build_pulse_preview_plot", "analog_bus_traces", "annotate_pulse_variable_regions",
+                    "_analog_bus_traces", "_annotate_variable_regions"}
+    frontend = Path(live_mod.__file__).parent
+    offenders = []
+    for mod in ("task_console.py", "data_figure.py", "live.py"):
+        tree = ast.parse((frontend / mod).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module and node.module.endswith("pulse_gui"):
+                for alias in node.names:
+                    if alias.name in render_names:
+                        offenders.append(f"{mod}: from ...pulse_gui import {alias.name}")
+    assert offenders == [], (
+        "a consumer imports a pulse RENDER symbol from the pulse_gui app -- the render's single source is "
+        f"the plot layer (live.py); import it from there instead: {offenders}")

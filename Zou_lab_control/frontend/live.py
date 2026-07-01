@@ -40,6 +40,11 @@ from .style import (
     tick_fontsize,
 )
 from .ticks import apply_smart_ticks
+# The pulse RENDER lives here (the plot layer owns every plot kind's rendering): building the timeline
+# figure from a PulseTableState, folding the analog DAC buses into their own rows and shading the scanned
+# regions.  ORANGE / fluent_font_size are the two GUI tokens the scan-region highlight reuses (imported
+# here, not re-declared -- single source); qt_fluent does not import live, so there is no cycle.
+from .qt_fluent import ORANGE, fluent_font_size
 
 
 # Colours/sizes come from the one owned source in style.py (style.PALETTE / the
@@ -1548,6 +1553,255 @@ def pulse_repeat_markers(
     return [(0.0, total, "×∞"), inner] if default_forever else [inner]
 
 
+# ============================================================ pulse render (state -> figure)
+# The pulse plot kind, like every other kind, has its RENDER here in the plot layer -- building the
+# timeline FIGURE from a PulseTableState (digital channels + analog DAC-bus rows + repeat brackets +
+# scanned-region shading).  ``pulse_gui`` (the editor app) and ``task_console`` / ``data_figure`` all
+# CONSUME this; none of them owns the render.  A contract test (test_pulse_render_single_source) pins
+# that these live here and that the consumers do not re-implement or import a pulse renderer from the GUI.
+
+
+def bus_signed_bounds(max_value: int) -> "tuple[int, int]":
+    """SIGNED user range of a bus whose full-scale code is ``max_value`` (2^B - 1):
+    (-2^(B-1), +2^(B-1)-1).  0 = true 0 V on the offset-binary DAC driver.  Shared by the pulse render
+    (bus-row min/max) and the editor's value validation -- one source."""
+    half = (int(max_value) + 1) >> 1
+    return (-half, half - 1)
+
+
+def bus_display_label(name: str) -> str:
+    """Human label for a DAC bus name (underscores -> spaces).  Shared by the render + the editor."""
+    return str(name).replace("_", " ")
+
+
+# In-module aliases so the render code below reads the same names it used in the editor module.
+_bus_signed_bounds = bus_signed_bounds
+_bus_display_label = bus_display_label
+
+
+def _bus_has_signal(state, bus_name: str) -> bool:
+    """True if a DAC bus carries a real signal: any edge/ramp entry (even to 0 V -- the user explicitly
+    drives it), OR a scanned (slot-referenced) value.  An untouched / all-hold bus rests at 0 V and is
+    treated as "off" (hidden when "show off rows" is off)."""
+    for slot in state.scan_slots:
+        if getattr(slot, "kind", "") == "dac" and slot.dac_bus == bus_name:
+            return True
+    for entry in state.analog_bus_modes.get(bus_name, []):
+        if str(entry.get("mode", "hold")).lower() != "hold":
+            return True
+    if bus_name not in state.analog_bus_modes:
+        for index in range(len(state.periods)):
+            try:
+                if state.bus_value(index, bus_name) != 0:
+                    return True
+            except Exception:
+                pass
+    return False
+
+
+def analog_bus_traces(state, *, include_always_off: bool = True) -> "tuple[list[dict[str, object]], set[str]]":
+    """Fold each DAC bus into ONE signed analog trace row (starts + step values), and return
+    ``(traces, folded_members)`` -- the member bit-channels that must NOT leak into the digital plot as
+    their own rows.  A pure function of the ``PulseTableState`` (the render layer owns this)."""
+    from ..neutral_atom.timing.pulse_table import analog_bus_ticks, _analog_bus_value_at_tick
+
+    buses = state.bus_channels()
+    if not buses:
+        return [], set()
+    starts_steps = [0]
+    slots = state.reference_slots()
+    for period in state.periods:
+        starts_steps.append(starts_steps[-1] + period.duration_steps(slots=slots, time_step_ns=state.time_step_ns))
+    traces: list[dict[str, object]] = []
+    folded_members: set[str] = set()
+    for bus_name, members in buses.items():
+        # A recognized DAC bus is ALWAYS folded -- its bit channels must never leak into the digital plot
+        # as individual rows (the bug where DA appeared as 10 separate channels).
+        folded_members.update(members)
+        # "Show off rows" off -> hide idle (all-zero / hold) DAC buses, like an always-off TTL channel.
+        if not include_always_off and not _bus_has_signal(state, bus_name):
+            continue
+        # Resolve scanned (slot-referenced) DAC values to their reference value so the preview shows a
+        # concrete trace instead of crashing on int("s2").
+        plan = state._resolved_bus_plan(bus_name, slots)
+        bus_ticks = analog_bus_ticks(plan, starts_steps)
+        lo_signed, hi_signed = _bus_signed_bounds((1 << len(members)) - 1)
+        traces.append(
+            {
+                "name": bus_name,
+                "label": _bus_display_label(bus_name),
+                "members": list(members),
+                # values are SIGNED (0 = true 0 V); min/max bound the signed range so the plotter can
+                # place the 0 V baseline mid-row and show negatives.
+                "min": lo_signed,
+                "max": hi_signed,
+                "starts": [tick * state.time_step_ns * 1e-9 for tick in bus_ticks],
+                # looping=True: the GUI runs the pulse forever, so the preview shows the STEADY STATE the
+                # loop converges to (a looping [ramp V, hold V] reads FLAT V, matching the bench output).
+                "values": [
+                    _analog_bus_value_at_tick(plan, starts_steps, tick, looping=True)
+                    for tick in bus_ticks[:-1]
+                ],
+            }
+        )
+    return traces, folded_members
+
+
+def build_pulse_preview_plot(state, *, include_always_off: bool):
+    """Render the pretty pulse timeline for ``state`` -- the SINGLE source of the pulse preview figure.
+
+    A pure function of the ``PulseTableState`` (no editor widgets): it builds the sequence, folds the
+    analog DAC buses into their own rows, draws the digital channels + analog traces + repeat brackets,
+    and shades the scanned regions.  Returns ``(plotter, channels, repeat_notation)``.
+
+    This is the ONE renderer the plot layer owns and every consumer shares: (a) the editor's live preview
+    / Save-Figure image (``pulse_gui``), (b) a reopened ``figure_recipe`` (``data_figure.SavedFigure``),
+    and (c) a seeded ``kind="pulse"`` console panel (``task_console.PanelCard``) -- so all three draw the
+    identical faithful figure (same channels / analog traces / brackets), never a flattened 1-D trace."""
+    sequence = state.to_sequence(expand_repeat=False)
+    repeat = pulse_repeat_notation(state)
+    repeat_brackets = pulse_repeat_markers(state)
+    # Channel delays can push edges past the period-table end; the repeat markers are computed from period
+    # starts only, so without this the delayed tail renders OUTSIDE the ×∞ loop bracket (reads as
+    # unphysical).  Extend the infinite-loop bracket to enclose the whole drawn sequence.
+    seq_end = float(getattr(sequence, "duration", 0.0) or 0.0)
+    if seq_end > 0.0:
+        repeat_brackets = [
+            (start, max(stop, seq_end), label) if "∞" in str(label) else (start, stop, label)
+            for (start, stop, label) in repeat_brackets
+        ]
+    analog_traces, folded_members = analog_bus_traces(state, include_always_off=include_always_off)
+    clk_set = set(getattr(state, "clk_channels", []))
+    digital_channel_universe = [
+        channel for channel in state.channels
+        if channel not in folded_members and channel not in clk_set   # clk channels aren't engine-driven
+    ]
+    channels = pulse_plot_channels(
+        sequence,
+        channels=digital_channel_universe,
+        include_always_off=include_always_off,
+    )
+    # Defensive: a folded DAC bit must never appear as its own digital row.
+    channels = [channel for channel in channels if channel not in folded_members]
+    plotter = plot(
+        sequence,
+        kind="pulse",
+        channels=channels,
+        include_always_off=True,
+        repeat_notation=repeat,
+        repeat_brackets=repeat_brackets,
+        channel_labels={channel: state.label_for(channel) for channel in channels},
+        analog_traces=analog_traces,
+        title=state.name,
+        show_names=True,
+        display=False,
+        data_figure=False,
+        # x auto-extend: one width block per PULSE_X_PERIODS_PER_BLOCK periods (capped at
+        # PULSE_X_MAX_WIDTH_FACTOR x) -- mirrors the y row blocks.
+        period_count=len(state.periods),
+    )
+    bus_rows = [str(trace.get("name")) for trace in analog_traces]
+    annotate_pulse_variable_regions(plotter, state, channels, bus_rows=bus_rows)
+    return plotter, channels, repeat
+
+
+def annotate_pulse_variable_regions(plotter, state, channels=None, *, bus_rows=None) -> None:
+    """Shade the time spans affected by each scan slot in transparent orange.
+
+    Only ``duration`` and ``dac`` are scannable (a channel delay is a fixed value):
+    - a scanned *duration* spans its whole period across all channels;
+    - a scanned *DAC* value spans its period on its own analog-bus row.
+
+    Each slot carries its 1-based number exactly once, placed on the row it affects (the DAC's bus row),
+    so several scanned DAC buses get distinct, non-overlapping labels instead of piling up."""
+    if not hasattr(plotter, "ax"):
+        return
+    slots = state.reference_slots()
+    starts_ns = [0.0]
+    for period in state.periods:
+        starts_ns.append(starts_ns[-1] + period.duration_ns(slots=slots, time_step_ns=state.time_step_ns))
+    # Use the plotter's ACTUAL row geometry (data coordinates) so highlights land exactly on the channels
+    # they belong to -- guessing y from a row count drifts and puts delay bands on the wrong channel.
+    ax = plotter.ax
+    base_y = dict(getattr(plotter, "_pulse_baseline_y", {}) or {})
+    analog_y = dict(getattr(plotter, "_analog_baseline_y", {}) or {})
+    row_h = float(getattr(plotter, "_pulse_row_height", 0.64) or 0.64)
+    if not base_y and not analog_y:
+        return
+    all_baselines = list(base_y.values()) + list(analog_y.values())
+    area_bottom = min(all_baselines)
+    area_top = max(all_baselines) + row_h          # top edge of the top channel
+    ylim_top = float(ax.get_ylim()[1])
+    x_lo, x_hi = ax.get_xlim()
+    min_width = max((x_hi - x_lo) * 0.004, 1e-12)
+
+    plotter.variable_region_artists = []
+    plotter.variable_region_labels = []
+
+    def add_band(x0: float, x1: float, y0: float, y1: float, alpha: float) -> None:
+        if x1 < x0:
+            x0, x1 = x1, x0
+        if x1 - x0 < min_width:
+            x1 = x0 + min_width
+        patch = Rectangle((x0, y0), x1 - x0, y1 - y0, facecolor=ORANGE, edgecolor="none",
+                          alpha=alpha, linewidth=0.0, zorder=6, transform=ax.transData)
+        ax.add_patch(patch)
+        plotter.variable_region_artists.append(patch)
+
+    def add_number(xc: float, yc: float, tag: str, va: str = "center") -> None:
+        if not tag:
+            return
+        # Mimic the bound scan-dot badge: a filled orange circle with a white digit (same look as
+        # FluentScanDot), keeping the small font size.
+        text = ax.text(xc, yc, tag, transform=ax.transData, ha="center", va=va,
+                       color="white", fontsize=max(2.6, float(fluent_font_size()) * 0.28),
+                       fontweight="bold", clip_on=False, zorder=12,
+                       bbox=dict(boxstyle="circle,pad=0.3", facecolor=ORANGE, edgecolor="none"))
+        plotter.variable_region_labels.append(text)
+
+    # Unified tint; the value highlight (DAC) is a touch stronger but same hue.
+    BAND_ALPHA = 0.18
+    bus_groups = state.bus_channels()
+    for slot_index, slot in enumerate(state.scan_slots):
+        tag = str(slot_index + 1)
+        if slot.kind == "duration":
+            pidx = int(slot.target) if slot.target.lstrip("-").isdigit() else -1
+            if not (0 <= pidx < len(state.periods)):
+                continue
+            x0 = starts_ns[pidx] * 1e-9
+            x1 = starts_ns[pidx + 1] * 1e-9
+            # Band covers exactly the channel rows (top = top channel's top, never above it).  Number
+            # sits in the headroom just above the top channel but below the title/bracket.
+            add_band(x0, x1, area_bottom, area_top, BAND_ALPHA)
+            label_y = min(area_top + row_h * 0.5, ylim_top - row_h * 0.2)
+            add_number((x0 + x1) / 2, label_y, tag, va="center")
+        elif slot.kind == "dac":
+            bus = slot.dac_bus
+            pidx = slot.dac_period
+            if bus not in analog_y or not (0 <= pidx < len(state.periods)):
+                continue
+            x0 = starts_ns[pidx] * 1e-9
+            x1 = starts_ns[pidx + 1] * 1e-9
+            members = bus_groups.get(bus, [])
+            lo_v, hi_v = _bus_signed_bounds((1 << max(1, len(members))) - 1)
+            span_v = max(1, hi_v - lo_v)
+            try:
+                value = float(state.analog_bus_value_at_period_start(pidx, bus))
+            except Exception:
+                value = 0.0
+            # Follow the DA LINE: highlight the trace segment at the SIGNED value's height over the
+            # scanned period (0 V = mid-row, negatives below).
+            vy = analog_y[bus] + row_h * min(1.0, max(0.0, (value - lo_v) / span_v))
+            if x1 - x0 < min_width:
+                x1 = x0 + min_width
+            seg = ax.plot([x0, x1], [vy, vy], color=ORANGE, linewidth=3.0, alpha=0.9,
+                          solid_capstyle="butt", zorder=8)[0]
+            plotter.variable_region_artists.append(seg)
+            # Number centred vertically in the bus row (only *duration* labels sit above the band;
+            # delay and DAC labels live inside their row).
+            add_number((x0 + x1) / 2, analog_y[bus] + row_h * 0.5, tag, va="center")
+
+
 class PulseSequenceFigure(BaseLivePlot):
     """Filled-rectangle pulse timeline for sequencer/verilog inspection."""
 
@@ -2346,8 +2600,13 @@ class PlotKind:
                    per-figure from the artists" (the site map: image-family only
                    when a background frame is supplied) -- DataFigure then keeps
                    its legacy artist heuristic for that kind.
-    panel          True if this kind is offered as a console Add-Panel plot
-                   (every kind except the notebook-only ``pulse`` diagram).
+    panel          True if this kind is offered in the live console ADD-PANEL
+                   dropdown (you add a blank panel of it and wire it to a signal).
+                   ``pulse`` is ``panel=False`` -- you do not add a blank pulse
+                   panel live -- but it is STILL a full panel kind: a saved pulse
+                   figure SEEDS a ``kind="pulse"`` PanelCard (the seed path does not
+                   gate on this flag), rendered by PanelCard's ``pulse`` branch.
+                   So the flag means "addable live", NOT "can be a panel".
     input_format   one-line description of the accepted ``value`` shape (shown in
                    the Setting; ``""`` for a non-panel kind).
     input_slots    the STARTING signal slot(s) a fresh panel opens with --
@@ -3180,4 +3439,9 @@ __all__ = [
     "pulse_plot_spec",
     "pulse_repeat_markers",
     "pulse_repeat_notation",
+    "build_pulse_preview_plot",
+    "analog_bus_traces",
+    "annotate_pulse_variable_regions",
+    "bus_signed_bounds",
+    "bus_display_label",
 ]

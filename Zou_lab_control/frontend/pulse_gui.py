@@ -31,7 +31,21 @@ from Zou_lab_control.neutral_atom.timing.pulse_table import (
     _analog_bus_value_at_tick,
     analog_bus_ticks as _analog_bus_ticks,
 )
-from .live import plot as frontend_plot, pulse_plot_channels, pulse_repeat_markers, pulse_repeat_notation
+# The pulse RENDER (state -> figure) lives in the plot layer (live.py); the editor CONSUMES it -- it does
+# not own the render.  ``bus_signed_bounds`` / ``bus_display_label`` are shared render+editor helpers that
+# also live there now (single source; the editor's ``_bus_signed_bounds`` / ``_bus_display_label`` names
+# alias them below so the many editor call sites are unchanged).
+from .live import (
+    plot as frontend_plot,
+    pulse_plot_channels,
+    pulse_repeat_markers,
+    pulse_repeat_notation,
+    build_pulse_preview_plot,
+    analog_bus_traces as _analog_bus_traces,
+    annotate_pulse_variable_regions,
+    bus_signed_bounds as _bus_signed_bounds,
+    bus_display_label as _bus_display_label,
+)
 from .qt_fluent import (
     ACCENT,
     BG,
@@ -375,13 +389,6 @@ def _set_duration_unit_combo(combo, *, scanned: bool, unit: str) -> None:
     combo.setCurrentText("str (ns)" if scanned else (unit if unit in DURATION_UNITS else "ns"))
 
 
-def _bus_signed_bounds(max_value: int) -> tuple[int, int]:
-    """SIGNED user range of a bus whose full-scale code is ``max_value`` (2^B - 1):
-    (-2^(B-1), +2^(B-1)-1).  0 = true 0 V on the offset-binary DAC driver."""
-    half = (int(max_value) + 1) >> 1
-    return (-half, half - 1)
-
-
 def _normalize_bus_value_text(text: str, *, max_value: int) -> str:
     lo, hi = _bus_signed_bounds(max_value)
     try:
@@ -397,10 +404,6 @@ def _unit_resolution(step_ns: float, unit: str) -> float:
     if factor <= 0:
         return float(step_ns)
     return float(step_ns) / factor
-
-
-def _bus_display_label(name: str) -> str:
-    return str(name).replace("_", " ")
 
 
 def _bus_key(name: str) -> str:
@@ -459,137 +462,6 @@ def _display_row_label(row: Mapping[str, object], labels: Mapping[str, str] | No
         return str((labels or {}).get(str(row["key"])) or row.get("label") or row.get("name"))
     key = str(row["key"])
     return str((labels or {}).get(key) or row.get("label") or key)
-
-
-def _bus_has_signal(state: PulseTableState, bus_name: str) -> bool:
-    """True if a DAC bus carries a real signal: any edge/ramp entry (even to 0 V --
-    the user explicitly drives it), OR a scanned (slot-referenced) value.  An
-    untouched / all-hold bus rests at 0 V and is treated as "off"."""
-
-    for slot in state.scan_slots:
-        if getattr(slot, "kind", "") == "dac" and slot.dac_bus == bus_name:
-            return True
-    for entry in state.analog_bus_modes.get(bus_name, []):
-        if str(entry.get("mode", "hold")).lower() != "hold":
-            return True
-    # No explicit plan: nonzero member bits mean a direct bit-level (code) drive.
-    if bus_name not in state.analog_bus_modes:
-        for index in range(len(state.periods)):
-            try:
-                if state.bus_value(index, bus_name) != 0:
-                    return True
-            except Exception:
-                pass
-    return False
-
-
-def _analog_bus_traces(state: PulseTableState, *, include_always_off: bool = True) -> tuple[list[dict[str, object]], set[str]]:
-    buses = state.bus_channels()
-    if not buses:
-        return [], set()
-    starts_steps = [0]
-    slots = state.reference_slots()
-    for period in state.periods:
-        starts_steps.append(starts_steps[-1] + period.duration_steps(slots=slots, time_step_ns=state.time_step_ns))
-    traces: list[dict[str, object]] = []
-    folded_members: set[str] = set()
-    for bus_name, members in buses.items():
-        # A recognized DAC bus is ALWAYS folded -- its bit channels must never leak
-        # into the digital plot as individual rows (that was the bug where DA appeared
-        # as 10 separate channels).  So fold every member here regardless of whether
-        # its analog row is drawn.
-        folded_members.update(members)
-        # "Show off rows" off -> hide idle (all-zero / hold) DAC buses, exactly like an
-        # always-off TTL channel.  Show off rows on -> show ALL DAC buses.
-        if not include_always_off and not _bus_has_signal(state, bus_name):
-            continue
-        # Resolve scanned (slot-referenced) DAC values to their reference value so
-        # the preview shows a concrete trace instead of crashing on int("s2").
-        plan = state._resolved_bus_plan(bus_name, slots)
-        bus_ticks = _analog_bus_ticks(plan, starts_steps)
-        lo_signed, hi_signed = _bus_signed_bounds((1 << len(members)) - 1)
-        traces.append(
-            {
-                "name": bus_name,
-                "label": _bus_display_label(bus_name),
-                "members": list(members),
-                # values are SIGNED (0 = true 0 V); min/max bound the signed range so
-                # the plotter can place the 0 V baseline mid-row and show negatives.
-                "min": lo_signed,
-                "max": hi_signed,
-                "starts": [tick * state.time_step_ns * 1e-9 for tick in bus_ticks],
-                # looping=True: the GUI runs the pulse forever (on_pulse), so the preview shows the
-                # STEADY STATE the loop converges to -- a looping [ramp V, hold V] reads FLAT V, matching
-                # what the bench actually outputs, not the one-time idle->V first frame (#ramp-carry).
-                "values": [
-                    _analog_bus_value_at_tick(plan, starts_steps, tick, looping=True)
-                    for tick in bus_ticks[:-1]
-                ],
-            }
-        )
-    return traces, folded_members
-
-
-def build_pulse_preview_plot(state: PulseTableState, *, include_always_off: bool):
-    """Render the pretty pulse timeline for ``state`` -- the SINGLE source of the pulse preview figure.
-
-    A pure function of the :class:`PulseTableState` (no editor widgets): it builds the sequence, folds
-    the analog DAC buses into their own rows, draws the digital channels + analog traces + repeat
-    brackets, and shades the scanned regions.  Returns ``(plotter, channels, repeat_notation)`` exactly
-    as the old in-editor builder did.
-
-    It is the ONE renderer shared by (a) the editor's live preview / Save-Figure image and (b) a
-    reopened ``figure_recipe`` -- :meth:`~.data_figure.SavedFigure.plot` for a ``kind="pulse"`` save
-    rebuilds the ``PulseTableState`` from the recipe and calls THIS, so a reloaded pulse figure is a
-    faithful reproduction (same channels / analog traces / brackets) of the one that was saved, not a
-    flattened 1-D trace.
-    """
-    sequence = state.to_sequence(expand_repeat=False)
-    repeat = pulse_repeat_notation(state)
-    repeat_brackets = pulse_repeat_markers(state)
-    # Channel delays can push edges past the period-table end; the repeat
-    # markers are computed from period starts only, so without this the
-    # delayed tail renders OUTSIDE the ×∞ loop bracket (reads as unphysical).
-    # Extend the infinite-loop bracket to enclose the whole drawn sequence.
-    seq_end = float(getattr(sequence, "duration", 0.0) or 0.0)
-    if seq_end > 0.0:
-        repeat_brackets = [
-            (start, max(stop, seq_end), label) if "∞" in str(label) else (start, stop, label)
-            for (start, stop, label) in repeat_brackets
-        ]
-    analog_traces, folded_members = _analog_bus_traces(state, include_always_off=include_always_off)
-    clk_set = set(getattr(state, "clk_channels", []))
-    digital_channel_universe = [
-        channel for channel in state.channels
-        if channel not in folded_members and channel not in clk_set   # clk channels aren't engine-driven
-    ]
-    channels = pulse_plot_channels(
-        sequence,
-        channels=digital_channel_universe,
-        include_always_off=include_always_off,
-    )
-    # Defensive: a folded DAC bit must never appear as its own digital row.
-    channels = [channel for channel in channels if channel not in folded_members]
-    plotter = frontend_plot(
-        sequence,
-        kind="pulse",
-        channels=channels,
-        include_always_off=True,
-        repeat_notation=repeat,
-        repeat_brackets=repeat_brackets,
-        channel_labels={channel: state.label_for(channel) for channel in channels},
-        analog_traces=analog_traces,
-        title=state.name,
-        show_names=True,
-        display=False,
-        data_figure=False,
-        # x auto-extend: one width block per PULSE_X_PERIODS_PER_BLOCK periods
-        # (capped at PULSE_X_MAX_WIDTH_FACTOR x) -- mirrors the y row blocks.
-        period_count=len(state.periods),
-    )
-    bus_rows = [str(trace.get("name")) for trace in analog_traces]
-    PulseSequenceEditor._annotate_variable_regions(plotter, state, channels, bus_rows=bus_rows)
-    return plotter, channels, repeat
 
 
 def _summary_time_text(value_ns: float) -> str:
@@ -4235,120 +4107,11 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         return directory / f"{_safe_file_stem(state.name)}.png"
 
     def _create_preview_plot(self, state: PulseTableState, *, include_always_off: bool):
-        # The pretty pulse render is a PURE function of the state (no editor widgets), so it lives at
-        # module level -- the ONE source both the GUI preview AND a reopened ``figure_recipe`` rebuild
-        # (``SavedFigure.plot()`` for a ``kind="pulse"`` save) call, so a reloaded pulse figure is
-        # byte-for-byte the figure that was saved.
+        # The pulse render is a PURE function of the state that lives in the PLOT LAYER (live.py, next to
+        # every other kind's render) -- this editor merely CONSUMES it, as do the reopened-recipe replay
+        # (``SavedFigure.plot()``) and a seeded console pulse panel, so all three draw byte-for-byte the
+        # same figure.  (Enforced by test_pulse_render_single_source: the render is not defined here.)
         return build_pulse_preview_plot(state, include_always_off=include_always_off)
-
-    @staticmethod
-    def _annotate_variable_regions(
-        plotter,
-        state: PulseTableState,
-        channels: Sequence[str] | None = None,
-        *,
-        bus_rows: Sequence[str] | None = None,
-    ) -> None:
-        """Shade the time spans affected by each scan slot in transparent orange.
-
-        Only ``duration`` and ``dac`` are scannable (a channel delay is a fixed value):
-        - a scanned *duration* spans its whole period across all channels;
-        - a scanned *DAC* value spans its period on its own analog-bus row.
-
-        Each slot carries its 1-based number exactly once, placed on the row it
-        affects (the DAC's bus row), so several scanned DAC buses get distinct,
-        non-overlapping labels instead of piling up.
-        """
-
-        if not hasattr(plotter, "ax"):
-            return
-        slots = state.reference_slots()
-        starts_ns = [0.0]
-        for period in state.periods:
-            starts_ns.append(starts_ns[-1] + period.duration_ns(slots=slots, time_step_ns=state.time_step_ns))
-        # Use the plotter's ACTUAL row geometry (data coordinates) so highlights
-        # land exactly on the channels they belong to -- guessing y from a row
-        # count drifts and put delay bands on the wrong channel.
-        ax = plotter.ax
-        base_y = dict(getattr(plotter, "_pulse_baseline_y", {}) or {})
-        analog_y = dict(getattr(plotter, "_analog_baseline_y", {}) or {})
-        row_h = float(getattr(plotter, "_pulse_row_height", 0.64) or 0.64)
-        if not base_y and not analog_y:
-            return
-        all_baselines = list(base_y.values()) + list(analog_y.values())
-        area_bottom = min(all_baselines)
-        area_top = max(all_baselines) + row_h          # top edge of the top channel
-        ylim_top = float(ax.get_ylim()[1])
-        x_lo, x_hi = ax.get_xlim()
-        min_width = max((x_hi - x_lo) * 0.004, 1e-12)
-
-        from matplotlib.patches import Rectangle
-        plotter.variable_region_artists = []
-        plotter.variable_region_labels = []
-
-        def add_band(x0: float, x1: float, y0: float, y1: float, alpha: float) -> None:
-            if x1 < x0:
-                x0, x1 = x1, x0
-            if x1 - x0 < min_width:
-                x1 = x0 + min_width
-            patch = Rectangle((x0, y0), x1 - x0, y1 - y0, facecolor=ORANGE, edgecolor="none",
-                              alpha=alpha, linewidth=0.0, zorder=6, transform=ax.transData)
-            ax.add_patch(patch)
-            plotter.variable_region_artists.append(patch)
-
-        def add_number(xc: float, yc: float, tag: str, va: str = "center") -> None:
-            if not tag:
-                return
-            # Mimic the bound scan-dot badge: a filled orange circle with a white
-            # digit (same look as FluentScanDot), keeping the small font size.
-            text = ax.text(xc, yc, tag, transform=ax.transData, ha="center", va=va,
-                           color="white", fontsize=max(2.6, float(fluent_font_size()) * 0.28),
-                           fontweight="bold", clip_on=False, zorder=12,
-                           bbox=dict(boxstyle="circle,pad=0.3", facecolor=ORANGE, edgecolor="none"))
-            plotter.variable_region_labels.append(text)
-
-        # Unified tint; the value highlight (DAC) is a touch stronger but same hue.
-        BAND_ALPHA = 0.18
-        bus_groups = state.bus_channels()
-        for slot_index, slot in enumerate(state.scan_slots):
-            tag = str(slot_index + 1)
-            if slot.kind == "duration":
-                pidx = int(slot.target) if slot.target.lstrip("-").isdigit() else -1
-                if not (0 <= pidx < len(state.periods)):
-                    continue
-                x0 = starts_ns[pidx] * 1e-9
-                x1 = starts_ns[pidx + 1] * 1e-9
-                # Band covers exactly the channel rows (top = top channel's top,
-                # never above it).  Number sits in the headroom just above the top
-                # channel but below the title/bracket.
-                add_band(x0, x1, area_bottom, area_top, BAND_ALPHA)
-                label_y = min(area_top + row_h * 0.5, ylim_top - row_h * 0.2)
-                add_number((x0 + x1) / 2, label_y, tag, va="center")
-            elif slot.kind == "dac":
-                bus = slot.dac_bus
-                pidx = slot.dac_period
-                if bus not in analog_y or not (0 <= pidx < len(state.periods)):
-                    continue
-                x0 = starts_ns[pidx] * 1e-9
-                x1 = starts_ns[pidx + 1] * 1e-9
-                members = bus_groups.get(bus, [])
-                lo_v, hi_v = _bus_signed_bounds((1 << max(1, len(members))) - 1)
-                span_v = max(1, hi_v - lo_v)
-                try:
-                    value = float(state.analog_bus_value_at_period_start(pidx, bus))
-                except Exception:
-                    value = 0.0
-                # Follow the DA LINE: highlight the trace segment at the SIGNED value's
-                # height over the scanned period (0 V = mid-row, negatives below).
-                vy = analog_y[bus] + row_h * min(1.0, max(0.0, (value - lo_v) / span_v))
-                if x1 - x0 < min_width:
-                    x1 = x0 + min_width
-                seg = ax.plot([x0, x1], [vy, vy], color=ORANGE, linewidth=3.0, alpha=0.9,
-                              solid_capstyle="butt", zorder=8)[0]
-                plotter.variable_region_artists.append(seg)
-                # Number centred vertically in the bus row (only *duration* labels
-                # sit above the band; delay and DAC labels live inside their row).
-                add_number((x0 + x1) / 2, analog_y[bus] + row_h * 0.5, tag, va="center")
 
     def save_figure(self) -> None:
         try:

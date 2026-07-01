@@ -987,7 +987,7 @@ class SavedFigure:
         unknown recipe kind falls back to the ordinary array ``plot`` so nothing crashes.
 
         ``pulse`` -> rebuild the ``PulseTableState`` and re-draw the pulse figure through the SAME
-        :func:`~.pulse_gui.build_pulse_preview_plot` the editor uses, so every digital channel / analog
+        :func:`~.live.build_pulse_preview_plot` the plot layer owns, so every digital channel / analog
         bus trace / repeat bracket comes back exactly as saved.  The rebuild imports ``pulse_gui`` LAZILY
         (only when a pulse recipe is actually reopened) so the ordinary array-figure reload path stays
         free of the pulse-editor / PyQt import."""
@@ -1022,16 +1022,27 @@ class SavedFigure:
                 pass
         return dict(recipe.get("pulse_state") or {})         # preview fallback (editor state, never fired)
 
-    def _replay_pulse(self, recipe: Mapping[str, Any]) -> "DataFigure":
-        """Rebuild the pulse figure: ``PulseTableState.from_dict`` (provenance-preferred source) ->
-        :func:`~.pulse_gui.build_pulse_preview_plot` -> its :class:`DataFigure`.  Both source paths feed
-        the ONE renderer, so a fired pulse (rebuilt from its provenance) and a pure preview (rebuilt from
-        the recipe) draw through identical code."""
+    def pulse_state(self):
+        """The reproduced pulse ``(PulseTableState, include_always_off)`` for a ``kind="pulse"`` save --
+        the single object the WHOLE reproduction uses: the notebook ``.plot()`` builds its figure from it,
+        AND the Task console seeds a pulse PANEL bound to it (published as ``fig_value``), so both draw the
+        SAME faithful timeline through the ONE renderer.  Provenance (a fired pulse) is preferred over the
+        recipe's own copy (see :meth:`_pulse_state_dict`).  ``None`` when this is not a pulse figure."""
+        recipe = self.figure_recipe
+        if recipe is None or str(recipe.get("kind") or "") != "pulse":
+            return None
         from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState
 
         state = PulseTableState.from_dict(self._pulse_state_dict(recipe))
-        include_always_off = bool(recipe.get("include_always_off", True))
-        from .pulse_gui import build_pulse_preview_plot
+        return state, bool(recipe.get("include_always_off", True))
+
+    def _replay_pulse(self, recipe: Mapping[str, Any]) -> "DataFigure":
+        """Rebuild the pulse figure: :meth:`pulse_state` (provenance-preferred source) ->
+        :func:`~.live.build_pulse_preview_plot` -> its :class:`DataFigure`.  The pulse RENDER lives in the
+        PLOT LAYER (live.py), never the pulse_gui app -- so notebook replay, the editor preview and a
+        seeded console panel all draw through the ONE renderer, identical code."""
+        state, include_always_off = self.pulse_state()
+        from .live import build_pulse_preview_plot
 
         plotter, _channels, _repeat = build_pulse_preview_plot(
             state, include_always_off=include_always_off)

@@ -58,20 +58,32 @@ def test_table_is_the_single_source_every_kind_has_a_baseliveplot_class():
 
 def test_panel_dicts_are_derived_from_the_table_no_drift():
     """The task_console PANEL_* lookups must EQUAL exactly what the table derives -- they are
-    derived, not hand-maintained, so any drift (a stale literal) fails here."""
+    derived, not hand-maintained, so any drift (a stale literal) fails here.
+
+    EVERY plot kind is a console PANEL kind (it renders through the SAME PanelCard, so a saved figure of
+    any kind -- incl. ``pulse`` -- seeds a normal panel): ``PANEL_KINDS`` / ``PANEL_INPUT_FORMAT`` /
+    ``PANEL_INPUT_SLOTS`` / ``PANEL_SINGLE_SLOT_KINDS`` derive from the WHOLE table.  The ``panel`` flag
+    ONLY gates the live Add-Panel dropdown, so ``ADDABLE_PANEL_KINDS`` is the ``panel=True`` subset."""
     from Zou_lab_control.frontend import task_console as tc
 
-    panel_kinds = [pk for pk in PLOT_KINDS if pk.panel]
+    all_kinds = list(PLOT_KINDS)
+    addable_kinds = [pk for pk in PLOT_KINDS if pk.panel]
 
-    # order is preserved (it is also the Add-Panel menu order)
-    assert list(tc.PANEL_KINDS) == [pk.key for pk in panel_kinds]
-    assert tc.PANEL_KINDS == {pk.key: pk.label for pk in panel_kinds}
-    assert tc.PANEL_INPUT_FORMAT == {pk.key: pk.input_format for pk in panel_kinds}
-    assert tc.PANEL_INPUT_SLOTS == {pk.key: pk.input_slots for pk in panel_kinds if pk.input_slots}
-    assert tc.PANEL_SINGLE_SLOT_KINDS == frozenset(pk.key for pk in panel_kinds if pk.single_slot)
+    # PANEL_KINDS (label + PanelConfig validation) covers EVERY kind, in table order
+    assert list(tc.PANEL_KINDS) == [pk.key for pk in all_kinds]
+    assert tc.PANEL_KINDS == {pk.key: pk.label for pk in all_kinds}
+    assert tc.PANEL_INPUT_FORMAT == {pk.key: pk.input_format for pk in all_kinds}
+    assert tc.PANEL_INPUT_SLOTS == {pk.key: pk.input_slots for pk in all_kinds if pk.input_slots}
+    assert tc.PANEL_SINGLE_SLOT_KINDS == frozenset(pk.key for pk in all_kinds if pk.single_slot)
 
-    # the helper accessors agree with the table too
-    for pk in panel_kinds:
+    # ADDABLE_PANEL_KINDS (the live Add-Panel dropdown) is the panel=True subset, in menu order
+    assert list(tc.ADDABLE_PANEL_KINDS) == [pk.key for pk in addable_kinds]
+    assert tc.ADDABLE_PANEL_KINDS == {pk.key: pk.label for pk in addable_kinds}
+    assert "pulse" in tc.PANEL_KINDS, "pulse is a real panel kind (seedable)"
+    assert "pulse" not in tc.ADDABLE_PANEL_KINDS, "pulse is NOT offered in the live Add-Panel dropdown"
+
+    # the helper accessors agree with the table too (every kind)
+    for pk in all_kinds:
         assert tc.panel_allows_multi_slot(pk.key) is (not pk.single_slot)
         expected_slots = pk.input_slots if pk.input_slots else (("signal", "", "the hub signal to plot"),)
         assert tc.panel_input_slots(pk.key) == expected_slots

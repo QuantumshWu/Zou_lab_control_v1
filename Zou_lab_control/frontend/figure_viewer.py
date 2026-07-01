@@ -19,15 +19,16 @@ viewer, the loaded figure becomes ONE hub SIGNAL and the whole reuse is the Task
   the signal picker, re-wiring and the light processing for free -- add MORE panels reading the same
   ``fig_value`` under a different kind, or fit / relim / re-save through the panel's own Edit tab.
 
-A STRUCTURED figure (one whose save carries an ``info['figure_recipe']`` -- e.g. a pulse timeline, which
-is rendered from a period table + analog buses and so cannot be expressed as ``data_x`` / ``data_y``) is
-``panel=False`` (not an array-fed console-panel kind), so it is not a SIGNAL-driven panel.  It still
-opens on the SAME console board: ``SavedFigure.plot()`` rebuilds it FAITHFULLY from the recipe (the pulse
-figure redrawn through the SAME renderer the editor used -- every channel / analog trace / bracket back),
-and that reproduced figure is dropped onto the board as a :class:`~.task_console.StaticFigureCard` -- a
-card BESIDE the panels, never a replacement for the console.  So the right pane ALWAYS holds a live
-console board with its Monitor tab + Add Panel: an array figure seeds a signal panel on it, a structured
-figure lands its reproduction as a static card, and the Info column shows the recipe alongside the rest.
+A PULSE figure (one whose save carries an ``info['figure_recipe']`` of kind ``pulse`` -- a timeline
+rendered from a period table + analog buses, which cannot be expressed as ``data_x`` / ``data_y``) takes
+the EXACT SAME path as every other kind, no special case: ``LoadedFigureNode`` publishes its reproduction
+OBJECT (a ``PulseTableState``, resolved via :meth:`~.data_figure.SavedFigure.pulse_state`) as ``fig_value``
+-- a hub value may be any object, not just an array -- and :func:`_seed_state` seeds a ``kind="pulse"``
+panel bound to it, so the SAME :class:`~.task_console.PanelCard` reproduces the full timeline through its
+``pulse`` branch (every digital channel / analog trace / bracket).  ``pulse`` is ``panel=False`` ONLY in
+the sense that it is not offered in the live Add-Panel dropdown (you do not add a blank pulse panel and
+wire it) -- it is a full panel kind on this SEED path.  So the loaded pulse card is a normal PanelCard on
+the same board, and the Monitor tab / Add Panel / re-wire reuse is identical to a hist or a site map.
 
 A read-only **Info** column on the left lists EVERY key the npz stored, grouped into tabs -- **Plot**
 (name / kind / labels / unit / saved / the view sub-dict / any fit), **Measurement** (source / data_x /
@@ -192,12 +193,23 @@ class LoadedFigureNode(LogicNode):
         self._blocks: dict[str, np.ndarray] = {}
         self._specs: dict[str, SignalSpec] = {}
         self._role_key: dict[str, str] = {}
+        # A pulse figure carries its reproduction OBJECT here (the hub is float-only); the console's
+        # pulse_state_provider reads it off this node.  None for every non-pulse figure.
+        self.pulse_state = None
+        self.pulse_include_always_off = True
 
-        stored = saved.info.get("signals")
-        if isinstance(stored, Mapping) and stored:
-            self._build_from_signals(stored)
+        # A STRUCTURED figure (a pulse timeline) publishes its reproduction OBJECT (a PulseTableState)
+        # as ``fig_value`` -- a hub value may be any object, not just an array -- so the seeded ``pulse``
+        # panel binds to it exactly like a hist panel binds to its sample vector, and PanelCard's ``pulse``
+        # branch renders the full timeline from it.  This is the SAME load path every kind uses.
+        if kind == "pulse":
+            self._build_pulse(saved)
         else:
-            self._build_from_arrays(kind, data_x, data_y)
+            stored = saved.info.get("signals")
+            if isinstance(stored, Mapping) and stored:
+                self._build_from_signals(stored)
+            else:
+                self._build_from_arrays(kind, data_x, data_y)
 
     # ------------------------------------------------------- faithful (info['signals'])
     def _build_from_signals(self, stored: Mapping) -> None:
@@ -256,6 +268,24 @@ class LoadedFigureNode(LogicNode):
                 "the saved figure's primary data (data_y)", "value")
             add(FIG_X_KEY, self._first_column(data_x), self._xlabel, "",
                 "the saved figure's x axis (data_x)", "x")
+
+    # ------------------------------------------------------- structured (pulse)
+    def _build_pulse(self, saved: SavedFigure) -> None:
+        """A pulse figure's reproduction source is a ``PulseTableState`` (an OBJECT, not an array).  The
+        hub carries only float arrays, so it cannot hold the state -- instead the node CARRIES the state
+        as an attribute (``pulse_state`` / ``pulse_include_always_off``) and the seeded pulse panel reads
+        it off THIS producing node via the console's ``pulse_state_provider``, exactly as a site-map panel
+        reads its centres/frame off ITS producing node (auxiliary data resolved from the node, not the
+        bare hub value).  The hub ``fig_value`` is a numeric PLACEHOLDER (the period count) so the shot
+        clock / version gate still tick; the pulse panel renders from the resolved state, not this value."""
+        resolved = saved.pulse_state()
+        self.pulse_state, self.pulse_include_always_off = (resolved if resolved is not None else (None, True))
+        n_periods = float(len(self.pulse_state.periods)) if self.pulse_state is not None else 0.0
+        self._blocks[FIG_VALUE_KEY] = np.array([n_periods], dtype=float)   # numeric placeholder for the hub
+        self._specs[FIG_VALUE_KEY] = SignalSpec(
+            self.prefix + FIG_VALUE_KEY, str(saved.name or "pulse"), "",
+            "the saved pulse figure (its PulseTableState is carried on the node, read via the provider)")
+        self._role_key["value"] = FIG_VALUE_KEY
 
     # ---------------------------------------------------------------- shaping
     @staticmethod
@@ -318,30 +348,75 @@ class LoadedFigureNode(LogicNode):
 
     def shot(self) -> dict[str, object]:
         # Publish each stored block VERBATIM (the faithful path relies on the panel's identity
-        # short-circuit reading the declared points_shape/data_shape, not a reshape here).
+        # short-circuit reading the declared points_shape/data_shape, not a reshape here).  Every block is
+        # a float array (a pulse figure's block is the numeric placeholder; its PulseTableState is carried
+        # on the node and read via the provider, not published to the float-only hub).
         return {bare: np.array(block) for bare, block in self._blocks.items()}
 
 
 def _seed_state(saved: SavedFigure) -> TaskConsoleState:
     """The console layout that REPRODUCES the saved figure: ONE panel of the saved ``kind`` wired to
     ``fig_value`` (``value = fig_value``) with the saved ``info['view']`` restored as its params, so it
-    opens exactly as saved.  A save with no recorded kind falls back to shape inference; an unknown/
-    non-panel kind falls back to a 1-D vector panel so the window still opens with a reproduction."""
+    opens exactly as saved.  EVERY kind takes this ONE path -- a pulse figure seeds a ``kind="pulse"``
+    panel exactly as a hist figure seeds a ``kind="hist"`` panel (``PanelCard`` then renders each by its
+    kind).  ``pulse`` is ``panel=False`` (not offered in the live Add-Panel dropdown) but it IS a real
+    panel kind on this SEED path, so it is NOT downgraded.  Only a genuinely UNKNOWN kind (not in the
+    plot-kind table) falls back to shape inference so the window still opens with a reproduction."""
     from .live import PLOT_KIND_BY_KEY
 
     kind = str(saved.kind or "")
     pk = PLOT_KIND_BY_KEY.get(kind)
-    if pk is None or not pk.panel:
+    if pk is None:                              # unknown kind only -- a real panel kind (incl. pulse) stays
         kind = "2d" if (np.asarray(saved.data_x).ndim == 2 and np.asarray(saved.data_x).shape[1] >= 2) else "1d"
+        pk = PLOT_KIND_BY_KEY.get(kind)
     view = dict(saved.view or {})
+    # A pulse panel carries its ``include_always_off`` (how the reproduction was drawn) as a param, and
+    # opens at a size that fits the timeline (a wider preset), so the reproduced figure is not clipped.
+    size = "2x2"
+    if kind == "pulse":
+        resolved = saved.pulse_state()
+        if resolved is not None:
+            view.setdefault("include_always_off", bool(resolved[1]))
+        size = _pulse_panel_size(saved)
     panel = PanelConfig(
         kind=kind,
         title=str(saved.name or "figure"),
+        size=size,
         source=f"value = {FIG_PREFIX}{FIG_VALUE_KEY}",
         inputs=[FIG_PREFIX + FIG_VALUE_KEY],
         params=view,
     )
     return TaskConsoleState(name=str(saved.name or "figure"), panels=[panel])
+
+
+def _pulse_panel_size(saved: SavedFigure) -> str:
+    """The smallest ``PANEL_SIZES`` preset whose card content holds the reproduced pulse timeline (so it
+    is not clipped), else the largest.  The pulse figure's own spec-owned geometry (fixed inches, channel-
+    driven height) is measured once and matched to a preset -- the panel then sizes to that preset like
+    every other kind, and its card holds the figure at its natural size."""
+    from .live import PANEL_SIZES, panel_display_size
+
+    resolved = saved.pulse_state()
+    if resolved is None:
+        return "2x2"
+    try:
+        from .live import build_pulse_preview_plot
+        import matplotlib.pyplot as _plt
+        plotter, _c, _r = build_pulse_preview_plot(resolved[0], include_always_off=bool(resolved[1]))
+        w_in, h_in = (float(v) for v in plotter.fig.get_size_inches())
+        _plt.close(plotter.fig)
+    except Exception:
+        return "2x2"
+    from .live import DESIGN_DPI, PANEL_DISPLAY_SCALE
+    need_w = w_in * DESIGN_DPI * PANEL_DISPLAY_SCALE
+    need_h = h_in * DESIGN_DPI * PANEL_DISPLAY_SCALE
+    best = PANEL_SIZES[0]
+    for size in PANEL_SIZES:
+        avail_w, avail_h = panel_display_size(size)     # the on-screen canvas area a preset reserves
+        if avail_w >= need_w and avail_h >= need_h:
+            return size
+        best = size                                     # largest tried (fallback if nothing fits)
+    return best
 
 
 class FigureViewer(QtWidgets.QWidget):
@@ -371,10 +446,9 @@ class FigureViewer(QtWidgets.QWidget):
         self.hub = SignalHub()
         self.node: LoadedFigureNode | None = None
         self.console: TaskConsole | None = None
-        # The right pane ALWAYS holds a real console board.  An ARRAY figure seeds a signal panel on it;
-        # a STRUCTURED figure (a ``figure_recipe`` -- a pulse timeline, ``panel=False`` because it is not
-        # array-fed) is reproduced faithfully and dropped onto the SAME board as a static card (see
-        # ``TaskConsole.add_static_figure_card``), so the console / Monitor tab are never replaced.
+        # The right pane ALWAYS holds a real console board.  EVERY figure -- array OR pulse -- seeds a
+        # normal PanelCard of its saved kind on it (a pulse figure seeds a ``kind="pulse"`` panel exactly
+        # as a hist seeds ``kind="hist"``); the console / Monitor tab are never replaced.
         self._current_path: Path | None = None
 
         self._label_w = setting_label_width(
@@ -548,21 +622,13 @@ class FigureViewer(QtWidgets.QWidget):
         with _signals_blocked(self.path_edit.edit):
             self.path_edit.setText(str(path))
         self._fill_info(saved)
-        # EVERY figure -- array OR structured -- opens on the SAME real Task console board (Monitor tab,
-        # Add Panel, the signal picker), so the console is never replaced.  An ARRAY figure (scan / hist /
-        # site map) becomes the ``fig_value`` hub signal + a seeded panel reproducing it.  A STRUCTURED
-        # figure (a ``figure_recipe`` -- a pulse timeline, ``panel=False`` because it is not array-fed) is
-        # reproduced FAITHFULLY from its recipe and dropped onto the SAME board as a StaticFigureCard --
-        # a card BESIDE the panels, not a replacement for the console.
+        # EVERY figure -- array OR pulse -- takes the SAME path: publish as ``fig_value``, seed ONE panel
+        # of the saved kind that reproduces it.  A pulse figure seeds a ``kind="pulse"`` panel exactly as
+        # a hist seeds a ``kind="hist"`` panel; the console / Monitor tab are never replaced.
         self._build_console(saved)
-        if saved.figure_recipe is not None:
-            self.status.setText(
-                f"loaded {display_path(str(path))} -> reproduced the {saved.kind or 'structured'} figure "
-                "faithfully from its saved recipe, on the board (Add Panel to view its data too).")
-        else:
-            self.status.setText(
-                f"loaded {display_path(str(path))} -> fig_value signal; the seeded {saved.kind or 'figure'} "
-                "panel reproduces it -- Add Panel to view it another way.")
+        self.status.setText(
+            f"loaded {display_path(str(path))} -> fig_value signal; the seeded {saved.kind or 'figure'} "
+            "panel reproduces it -- Add Panel to view it another way.")
 
     def _clear_layout(self, layout: QtWidgets.QVBoxLayout) -> None:
         while layout.count():
@@ -679,28 +745,22 @@ class FigureViewer(QtWidgets.QWidget):
         """(Re)build the embedded TaskConsole filling the right column -- the right pane ALWAYS holds a
         real console board (Monitor tab, Add Panel), never a replacement.
 
-        * an ARRAY figure (``saved`` with no ``figure_recipe``) publishes its data as the ``fig_value``
-          hub signal and seeds a panel reproducing it;
-        * a STRUCTURED figure (a ``figure_recipe`` -- a pulse timeline, ``panel=False`` because it is not
-          array-fed) reproduces FAITHFULLY from its recipe and lands on the SAME board as a
-          :class:`~.task_console.StaticFigureCard` (a card beside the panels), so the console / Monitor
-          tab stay intact;
-        * ``None`` (nothing loaded yet) is an EMPTY board -- so the window ALWAYS shows a real console
-          beside the Info column (never a bare, crammed strip), and Browse + Load simply reseeds it."""
+        EVERY figure takes the SAME path: :class:`LoadedFigureNode` publishes its data as the ``fig_value``
+        hub signal and :func:`_seed_state` seeds ONE panel of the saved ``kind`` bound to it, so
+        ``PanelCard`` reproduces it by its kind (a 2-D image, a site map, a histogram, a 1-D curve, a PULSE
+        timeline -- the pulse panel's value is a ``PulseTableState`` object, published + rendered by the
+        same node / seed / PanelCard machinery).  ``None`` (nothing loaded yet) is an EMPTY board, so the
+        window ALWAYS shows a real console beside the Info column and Browse simply reseeds it."""
         self._teardown_console()
         self.hub = SignalHub()
-        recipe = saved.figure_recipe if saved is not None else None
-        if saved is not None and recipe is None:
+        if saved is not None:
             self.node = LoadedFigureNode(self.hub, saved)
             self.node.step()                   # publish once so the signal is on the hub immediately
             state = _seed_state(saved)
             running = [self.node]
         else:
-            # A recipe figure has NO hub-signal panel (it is not array-fed); it goes on as a static card
-            # below.  An empty load has nothing at all -- an empty board either way.
             self.node = None
-            state = TaskConsoleState(name=str(saved.name or "figure") if saved is not None else "figure",
-                                     panels=[])
+            state = TaskConsoleState(name="figure", panels=[])
             running = []
         # EMBEDDED console: it is size-Expanding, so the stretching holder makes it FILL the right pane
         # and its gravity board reads the real viewport width -> reflows into 2+ columns.  ``window_px``
@@ -716,17 +776,6 @@ class FigureViewer(QtWidgets.QWidget):
                                    session=None, scale=self._scale,
                                    window_px=(console_w, console_h), embedded=True)
         self._console_holder.addWidget(self.console)
-        # A STRUCTURED figure: reproduce it faithfully from its recipe and drop it onto the board as a
-        # static card (the pulse figure redrawn through the SAME renderer the editor used -- every
-        # channel / analog trace / bracket).  A rebuild that fails leaves the board empty + an error in
-        # the status rather than crashing the window.
-        if recipe is not None:
-            try:
-                df = saved.plot()              # recipe reproduction -> a DataFigure holding the figure
-            except Exception as exc:
-                self.status.setText(f"could not reproduce: {str(exc).splitlines()[0][:160]}")
-                return
-            self.console.add_static_figure_card(df.fig, title=str(saved.name or saved.kind or "figure"))
 
     def _teardown_console(self) -> None:
         if self.console is not None:
