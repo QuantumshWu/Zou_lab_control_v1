@@ -165,6 +165,12 @@ def __getattr__(name: str):
         from ._gui import load_figure
 
         return load_figure
+    if name == "figure_viewer":
+        # Open the saved-figure viewer window (``na.figure_viewer('scan.npz')``) -- reached LAZILY
+        # through the GUI-action module so the frontend stays off the analysis import path.
+        from ._gui import open_figure_viewer
+
+        return open_figure_viewer
     if name in _PULSE_STREAMER_EXPORTS:
         from .devices import fpga_pulse_streamer
 
@@ -250,6 +256,7 @@ __all__ = [
     "device_config_dir",
     "estimate_threshold_fidelity",
     "exposure_from_sequence",
+    "figure_viewer",
     "find_site_centers",
     "fit_bimodal",
     "fit_bimodal_per_site",

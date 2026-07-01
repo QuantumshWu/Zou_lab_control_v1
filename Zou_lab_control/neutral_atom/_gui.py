@@ -102,6 +102,31 @@ def open_pulse_gui(session: Any = None, *, state=None, **kwargs):
     return editor
 
 
+def open_figure_viewer(session: Any = None, *, path=None, **kwargs):
+    """Open the saved-figure viewer window (``exp.figure_viewer()``).
+
+    A PURE VIEWER: it reopens a saved ``.npz`` (or a folder of them) with no hardware / acquisition,
+    so it works with or WITHOUT a session.  With a ``session`` it is a ONE-per-session singleton (a
+    later ``exp.figure_viewer()`` reshows the SAME window instead of a new one; closing it just hides
+    it); with ``session=None`` each call is its own window.  ``path`` opens a file/folder on launch."""
+
+    from Zou_lab_control.frontend.figure_viewer import show_figure_viewer
+
+    if session is None:
+        return show_figure_viewer(path=path, **kwargs)
+
+    existing = getattr(session, "_zlc_figure_viewer", None)
+    if existing is not None and _alive(existing):
+        _reshow(getattr(existing, "_zlc_window", None) or existing.window())
+        if path is not None:
+            existing.open_path(path)
+        return existing
+
+    viewer = show_figure_viewer(path=path, hide_on_close=True, **kwargs)
+    session._zlc_figure_viewer = viewer
+    return viewer
+
+
 def load_figure(path):
     """Reopen a ``.npz`` saved by a panel's / notebook figure's Save as a hardware-free
     ``SavedFigure`` -- ``na.load_figure('scan.npz').info_summary()`` tells what it holds and
@@ -113,4 +138,4 @@ def load_figure(path):
     return _load_figure(path)
 
 
-__all__ = ["open_task_console", "open_pulse_gui", "load_figure"]
+__all__ = ["open_task_console", "open_pulse_gui", "open_figure_viewer", "load_figure"]

@@ -95,6 +95,7 @@ LiveHistogram = HistogramFigure
 _PULSE_GUI_EXPORTS = {"PulseSequenceEditor", "show_pulse_gui"}
 _TASK_CONSOLE_EXPORTS = {"TaskConsole", "TaskConsoleState", "PanelConfig", "LogicNodeConfig",
                          "default_console_state", "show_task_console"}
+_FIGURE_VIEWER_EXPORTS = {"FigureViewer", "show_figure_viewer"}
 
 
 def __getattr__(name: str):
@@ -104,6 +105,9 @@ def __getattr__(name: str):
     if name in _TASK_CONSOLE_EXPORTS:
         task_console = import_module(".task_console", __name__)
         return getattr(task_console, name)
+    if name in _FIGURE_VIEWER_EXPORTS:
+        figure_viewer = import_module(".figure_viewer", __name__)
+        return getattr(figure_viewer, name)
     raise AttributeError(name)
 
 
@@ -159,6 +163,7 @@ __all__ = [
     "DragVLine",
     "FONT_PATH",
     "FigureSpec",
+    "FigureViewer",
     "FitResult",
     "HistogramFigure",
     "InteractionBundle",
@@ -218,6 +223,7 @@ __all__ = [
     "render_tex_pdf",
     "run",
     "save_figure_data",
+    "show_figure_viewer",
     "show_pulse_gui",
     "show_task_console",
     "split_axes_horizontally",

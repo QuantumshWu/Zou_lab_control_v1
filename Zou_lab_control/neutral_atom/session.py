@@ -102,6 +102,16 @@ class NeutralAtomSession:
         from ._gui import open_pulse_gui
         return open_pulse_gui(self, state=state, **kwargs)
 
+    def figure_viewer(self, path=None, **kwargs):
+        """Open the saved-figure viewer GUI (reopen a ``.npz`` written by a panel / notebook Save).
+
+        A PURE VIEWER -- no hardware, no acquisition: pick a saved figure (or a folder of them, e.g. a
+        calibration run) and re-view / relim / fit / re-save it through the same DataFigure stack.  A
+        ONE-per-session singleton (a later call reshows the same window).  To open a viewer WITHOUT a
+        session call ``Zou_lab_control.frontend.show_figure_viewer()`` directly."""
+        from ._gui import open_figure_viewer
+        return open_figure_viewer(self, path=path, **kwargs)
+
     def _configure_imaging(self, *, exposure: float | None = None, load: bool = True, trigger_width: float = 20e-6, pre_trigger: float = 100e-6) -> PulseSequence:
         if exposure is not None and hasattr(self.devices.camera, "configure"):
             self.devices.camera.configure(exposure=exposure)
