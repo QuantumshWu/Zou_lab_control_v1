@@ -95,7 +95,7 @@ LiveHistogram = HistogramFigure
 _PULSE_GUI_EXPORTS = {"PulseSequenceEditor", "show_pulse_gui"}
 _TASK_CONSOLE_EXPORTS = {"TaskConsole", "TaskConsoleState", "PanelConfig", "LogicNodeConfig",
                          "default_console_state", "show_task_console"}
-_FIGURE_VIEWER_EXPORTS = {"FigureViewer", "show_figure_viewer"}
+_FIGURE_VIEWER_EXPORTS = {"FigureViewer", "LoadedFigureNode", "show_figure_viewer"}
 
 
 def __getattr__(name: str):
@@ -174,6 +174,7 @@ __all__ = [
     "LiveLive",
     "LiveLiveDis",
     "LiveSiteMap",
+    "LoadedFigureNode",
     "GridPlot",
     "GridCell",
     "HistogramCell",

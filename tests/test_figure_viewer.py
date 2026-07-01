@@ -1,24 +1,22 @@
 """Contract for the ``FigureViewer`` window (``exp.figure_viewer()`` / ``show_figure_viewer``).
 
-The viewer is a PURE reopen-and-re-view GUI over a saved figure ``.npz``: no hardware, no session.
-It loads through the SAME :class:`~Zou_lab_control.frontend.data_figure.SavedFigure` / ``DataFigure``
-stack the notebook ``na.load_figure(...)`` uses, so these pins are all about the WINDOW wiring, not
-the data layer (that is ``test_saved_figure_load.py``):
+The viewer reopens a saved figure ``.npz`` INTO the Task console: the loaded figure becomes ONE hub
+SIGNAL (published by a :class:`~Zou_lab_control.frontend.figure_viewer.LoadedFigureNode`) and a panel of
+the SAVED kind is seeded on a real :class:`~Zou_lab_control.frontend.task_console.TaskConsole`, so the
+whole board / Add-Panel / signal-picker / re-wire / processing reuse comes for free.  These pins are
+about that WIRING (the data layer round-trip is ``test_saved_figure_load.py``):
 
-1. opening a ``.npz`` fills the Info panel (a non-empty set of rows + the raw-info dict) and builds
-   the centre canvas + a live ``DataFigure``;
-2. the plot-kind combo lists ``compatible_kinds`` (saved kind first) and switching kind rebuilds the
-   canvas WITHOUT raising;
-3. the fixed lo/hi row is ALWAYS in the layout (constant footprint -> no jitter) and only its inputs
-   enable in ``relim == "fixed"``;
-4. Save writes a fresh png + npz.
+1. loading a save publishes its data as ``fig_value`` on the console's hub, and the seeded panel is
+   wired to it with kind == the SAVED kind (a faithful reproduction);
+2. the Info column exposes EVERY key the npz stored (name / kind / labels / view / the raw info dict);
+3. the console is a real board: a second panel can be added reading the SAME ``fig_value`` signal;
+4. the seeded panel's plotter builds (through the console tick) as the saved kind's plot class.
 
 Runs headless (``QT_QPA_PLATFORM=offscreen``); the window is built + torn down in-process.
 """
 
 from __future__ import annotations
 
-import glob
 import os
 import sys
 from pathlib import Path
@@ -35,11 +33,19 @@ import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 
 from Zou_lab_control.frontend import plot, show_figure_viewer  # noqa: E402
-from Zou_lab_control.frontend.data_figure import DataFigure  # noqa: E402
-from Zou_lab_control.frontend.figure_viewer import FigureViewer  # noqa: E402
+from Zou_lab_control.frontend.figure_viewer import (  # noqa: E402
+    FIG_PREFIX,
+    FIG_VALUE_KEY,
+    FigureViewer,
+    LoadedFigureNode,
+)
+from Zou_lab_control.frontend.task_console import PanelConfig, TaskConsole  # noqa: E402
 
 
-def _saved_hist_npz(tmp_path) -> Path:
+FIG_SIGNAL = FIG_PREFIX + FIG_VALUE_KEY   # the hub name the loaded figure's primary data lands on
+
+
+def _saved_hist_npz(tmp_path, *, name="readout") -> Path:
     """Save a bimodal-readout hist figure with a stored view state, and return its ``.npz`` path."""
     rng = np.random.default_rng(0)
     vals = np.concatenate([rng.normal(300.0, 20.0, 400), rng.normal(460.0, 20.0, 300)])
@@ -48,7 +54,20 @@ def _saved_hist_npz(tmp_path) -> Path:
     info = {"source": "counts", "kind": "hist",
             "view": {"relim": "fixed", "fixed_lo": 0.0, "fixed_hi": 200.0,
                      "unit_index": 0, "cmap": "", "repeat_mode": "pool"}}
-    out = df.save(str(tmp_path / "readout"), extra_info=info)
+    out = df.save(str(tmp_path / name), extra_info=info)
+    plt.close(p.fig)
+    return Path(out["data"])
+
+
+def _saved_1d_npz(tmp_path) -> Path:
+    """Save a 1-D vector figure with a real x-axis label, and return its ``.npz`` path."""
+    x = np.linspace(0.0, 10.0, 40)
+    y = np.sin(x)
+    p = plot(x.reshape(-1, 1), y.reshape(-1, 1), kind="1d", display=False, update="once",
+             data_figure=True, labels=("Trap-off time (s)", "survival", "Z"))
+    df = p.to_data_figure()
+    out = df.save(str(tmp_path / "scan1d"), extra_info={"source": "temperature", "kind": "1d",
+                                                        "view": {"relim": "tight"}})
     plt.close(p.fig)
     return Path(out["data"])
 
@@ -69,65 +88,80 @@ def viewer(tmp_path):
         plt.close("all")
 
 
-def test_open_fills_info_and_builds_canvas(viewer):
+def test_load_publishes_signal_and_seeds_reproduction_panel(viewer):
     v, _ = viewer
-    # (1) the Info panel has content (one row per fact) + the raw-info dict is populated
-    assert v.info_layout.count() > 0, "the Info panel must list what the file holds"
-    assert v.raw_info.text(), "the raw-info field must show the full stored info dict"
-    assert "source" in v.raw_info.text(), "raw info exposes EVERY stored key (e.g. 'source')"
-    # (2) the centre canvas + its DataFigure were built
-    assert v._canvas is not None, "the centre canvas must be built from the reopened figure"
-    assert isinstance(v._df, DataFigure) and v._df.fig is not None
+    con = v.console
+    assert isinstance(con, TaskConsole), "the loaded figure opens on a real Task console board"
+    # (1) the seeded panel reproduces: kind == the SAVED kind, wired to the fig_value signal
+    assert len(con.cards) == 1, "one panel is seeded per loaded figure"
+    card = con.cards[0]
+    assert card.config.kind == v.saved.kind == "hist", "the seeded panel kind == the saved kind"
+    assert card.config.inputs[0] == FIG_SIGNAL, "the seeded panel is wired to the fig_value signal"
+    assert card.config.source == f"value = {FIG_SIGNAL}"
+    # (2) that signal is actually PUBLISHED on the console's hub (the node ran a shot)
+    assert FIG_SIGNAL in set(v.hub.names()), "the loaded figure's data is published as fig_value"
+    assert isinstance(v.node, LoadedFigureNode)
+    assert FIG_SIGNAL in set(v.node.published_signals())
 
 
-def test_kind_combo_lists_compatible_kinds_and_switch_rebuilds(viewer):
+def test_seeded_panel_restores_the_saved_view(viewer):
     v, _ = viewer
-    # the combo carries the saved kind FIRST, then the other compatible kinds (data by key)
-    keys = [v.kind_combo.itemData(i) for i in range(v.kind_combo.count())]
-    assert keys[0] == v._saved.kind == "hist"
-    assert set(keys) == set(v._saved.compatible_kinds())
-    others = [i for i in range(v.kind_combo.count()) if v.kind_combo.itemData(i) != v._saved.kind]
-    assert others, "a 1-D save must offer more than one compatible kind"
-    before = v._canvas
-    v.kind_combo.setCurrentIndex(others[0])       # switch plotter -> rebuild, must not raise
-    assert v._canvas is not None and v._canvas is not before, "switching kind rebuilds the canvas"
+    card = v.console.cards[0]
+    # the saved info['view'] was passed verbatim as the panel params -> the panel restores relim=fixed
+    assert card.config.params.get("relim") == "fixed"
+    assert float(card.config.params.get("fixed_lo")) == 0.0
+    assert float(card.config.params.get("fixed_hi")) == 200.0
+    assert card._relim() == "fixed", "the panel resolves the saved relim mode from its params"
 
 
-def test_fixed_lim_row_is_permanent_and_only_enables_in_fixed(viewer):
+def test_info_panel_exposes_every_stored_key(viewer):
+    v, npz = viewer
+    # (2) the Info column lists the facts (one row per fact) ...
+    assert v.info_layout.count() > 0, "the Info panel lists what the file holds"
+    # ... and the raw-info field exposes EVERY key the npz stored, verbatim
+    raw = v.raw_info.text()
+    assert raw, "the raw-info field shows the full stored info dict"
+    for key in ("source", "kind", "labels", "view"):
+        assert key in raw, f"raw info exposes the stored '{key}' key"
+
+
+def test_seeded_panel_plotter_builds_as_saved_kind(viewer):
     v, _ = viewer
-    # the saved view was relim=fixed, so the row is visible + inputs enabled
-    assert v.relim_combo.currentText() == "fixed"
-    assert v.fixed_row.isVisible() and v.fixed_lo.isEnabled() and v.fixed_hi.isEnabled()
-    # switching to tight must NOT hide the row (no setVisible jitter) -- only DISABLE the inputs
-    v.relim_combo.setCurrentText("tight")
-    assert v.fixed_row.isVisible(), "the lo/hi row stays in the layout (constant footprint, no jump)"
-    assert not v.fixed_lo.isEnabled() and not v.fixed_hi.isEnabled()
-    # back to fixed re-enables them, still same permanent row
-    v.relim_combo.setCurrentText("fixed")
-    assert v.fixed_row.isVisible() and v.fixed_lo.isEnabled()
+    card = v.console.cards[0]
+    v.console._tick()                      # drive one refresh, exactly like the live timer does
+    assert card.plotter is not None, "the seeded panel builds its plotter (reproduces the figure)"
+    assert type(card.plotter).__name__ == "HistogramFigure", "a hist save reproduces as HistogramFigure"
 
 
-def test_save_writes_png_and_npz(viewer, tmp_path):
+def test_board_reuse_add_second_panel_reads_same_signal(viewer):
     v, _ = viewer
-    out_dir = tmp_path / "resaved"
-    out_dir.mkdir()
-    v.save_dir_edit.setText(str(out_dir))
-    v.save()
-    pngs = glob.glob(str(out_dir / "*.png"))
-    npzs = glob.glob(str(out_dir / "*.npz"))
-    assert len(pngs) == 1 and len(npzs) == 1, "Save writes exactly one png + one matching npz"
-    assert "saved" in v.status.text()
+    con = v.console
+    # (4) the board is real: add a SECOND panel reading the SAME fig_value signal, another kind
+    con.state.panels.append(PanelConfig(kind="monitor", title="again",
+                                        source=f"value = {FIG_SIGNAL}", inputs=[FIG_SIGNAL]))
+    con.load_state(con.state)
+    con._tick()
+    assert len(con.cards) == 2, "a second panel was added to the same board"
+    assert all(c.config.inputs[0] == FIG_SIGNAL for c in con.cards), \
+        "both panels read the one loaded-figure signal (board reuse)"
+    kinds = {c.config.kind for c in con.cards}
+    assert kinds == {"hist", "monitor"}, "the same signal is viewed as two different kinds"
 
 
-def test_folder_open_fills_gallery(tmp_path):
-    """Opening a FOLDER lists every .npz as a gallery row (a calibration run drops one per site)."""
-    for i in range(3):
-        _saved_hist_npz(tmp_path)               # three npz in one folder (names differ by timestamp/seq)
-    npz_count = len(glob.glob(str(tmp_path / "*.npz")))
-    v = show_figure_viewer(str(tmp_path))
+def test_one_d_save_reproduces_with_saved_x_axis(tmp_path):
+    """A 1-D save publishes a companion fig_x so the seeded 1d panel draws vs the saved x with the
+    saved x-axis label (faithful reproduction of the x axis, not a bare index)."""
+    npz = _saved_1d_npz(tmp_path)
+    v = show_figure_viewer(npz)
     try:
-        assert len(v._gallery_buttons) == npz_count, "every .npz in the folder is a gallery row"
-        assert v._canvas is not None, "opening a folder selects + renders its first figure"
+        con = v.console
+        card = con.cards[0]
+        assert card.config.kind == "1d"
+        assert (FIG_PREFIX + "x") in set(v.hub.names()), "a 1-D save also publishes its companion x"
+        con._tick()
+        assert card.plotter is not None
+        assert card.plotter.ax.get_xlabel() == "Trap-off time (s)", \
+            "the 1d panel draws vs the saved x with the saved x-axis label"
     finally:
         win = v.window()
         if win is not None:
