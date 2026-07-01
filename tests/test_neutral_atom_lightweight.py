@@ -487,7 +487,7 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
     hardware_notebook_text = "\n".join(cell["source"] for cell in neutral_atom_hardware_tutorial_cells())
 
     for name in ("install_requirements.bat", "pulse_gui.bat", "task_console.bat",
-                 "start_tutorials_jupyter_lab.bat", "estimate_resources.bat"):
+                 "figure_viewer.bat", "start_tutorials_jupyter_lab.bat", "estimate_resources.bat"):
         assert (root / name).exists(), name
     assert not (root / "build_and_program.bat").exists()
     assert not (root / "run_server.bat").exists()
@@ -496,6 +496,8 @@ def test_fpga_pulse_streamer_repo_vivado_entrypoint_contract():
         "pulse_gui.bat",
         # live experiment dashboard (virtual node by default)
         "task_console.bat",
+        # double-click viewer that re-opens a saved figure .npz (exp.figure_viewer)
+        "figure_viewer.bat",
         "start_tutorials_jupyter_lab.bat",
         # double-click capacity check against fpga/board_config/streamer_config.json
         "estimate_resources.bat",
@@ -872,6 +874,7 @@ def test_repo_bat_entrypoints_are_minimal_and_grouped_by_submodule():
 
     assert bat_files == [
         "estimate_resources.bat",
+        "figure_viewer.bat",
         "fpga/build_and_program.bat",
         "fpga/run_server.bat",
         "install_requirements.bat",
