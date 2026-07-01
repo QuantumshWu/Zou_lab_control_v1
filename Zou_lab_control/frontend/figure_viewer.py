@@ -68,12 +68,13 @@ from .task_console import (
 )
 
 from .qt_fluent import (
+    CARD_PAD,
     GREY,
     FluentCodeEdit,
     FluentFrame,
     FluentLabel,
     FluentPathEdit,
-    FluentReadoutEdit,
+    FluentReadoutMultiline,
     FluentScrollArea,
     FluentSectionLabel,
     FluentSettingRow,
@@ -578,8 +579,12 @@ class FigureViewer(QtWidgets.QWidget):
         body = QtWidgets.QWidget()
         body.setStyleSheet("background: transparent;")
         vbox = QtWidgets.QVBoxLayout(body)
-        vbox.setContentsMargins(scaled_px(6, minimum=4), scaled_px(6, minimum=4),
-                                scaled_px(6, minimum=4), scaled_px(6, minimum=4))
+        # Body inset == the component-library card padding (CARD_PAD), so the Info tab card's content
+        # sits off its edge by the SAME margin as the console's own tab bodies (the Logic / Edit tabs use
+        # scaled_px(CARD_PAD, minimum=6)) -- the left and right tab cards read identically, not with the
+        # Info column crammed tighter against its edge.
+        m = scaled_px(CARD_PAD, minimum=6)
+        vbox.setContentsMargins(m, m, m, m)
         vbox.setSpacing(scaled_px(3, minimum=2))
         vbox.setAlignment(QtCore.Qt.AlignTop)
         scroll.setWidget(body)
@@ -747,15 +752,23 @@ class FigureViewer(QtWidgets.QWidget):
         for key, value in rows:
             if value is None:
                 continue
-            field = FluentReadoutEdit(str(value))
-            field.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
-            layout.addWidget(FluentSettingRow(key, field, label_width=self._label_w))
+            layout.addWidget(FluentSettingRow(key, self._readout_field(value),
+                                              label_width=self._label_w))
 
     def _add_info_row(self, key: str, value: object) -> None:
         """One read-only ``key | value`` row in the DEVICE tab (the shared row primitive)."""
-        field = FluentReadoutEdit(str(value))
+        self.info_layout.addWidget(FluentSettingRow(key, self._readout_field(value),
+                                                    label_width=self._label_w))
+
+    @staticmethod
+    def _readout_field(value: object) -> FluentReadoutMultiline:
+        """The ONE read-only value control for an Info row: a :class:`FluentReadoutMultiline` that SOFT-
+        WRAPS a long value (a resolved path, a device-metadata blob, a data shape) over as many lines as
+        it needs instead of a single-line edit clipping it.  Ignored horizontal policy so the row/column
+        drives the width; the field auto-sizes its OWN height to the wrapped content (up to its cap)."""
+        field = FluentReadoutMultiline(str(value))
         field.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
-        self.info_layout.addWidget(FluentSettingRow(key, field, label_width=self._label_w))
+        return field
 
     def _fill_provenance(self, provenance: object) -> None:
         """Expand the saved ``info['provenance']`` (the producing node's device snapshot) into the

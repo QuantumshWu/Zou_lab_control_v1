@@ -686,3 +686,93 @@ def test_pulse_seeds_a_normal_panelcard_via_the_same_load_path(tmp_path):
             win.close(); win.deleteLater()
         v.teardown()
         plt.close("all")
+
+
+# --------------------------------------------------------------------------- #
+# Visual-consistency contracts (#1 tab card parity + #6 multi-line Info values).
+# These guard the mechanical facts: the Info value control WRAPS a long value
+# (never truncates), the Info tab card body uses the SAME card padding as the
+# console's own tabs, and the tab overflow popup is rounded the shared way (not a
+# bare square QMenu).
+# --------------------------------------------------------------------------- #
+
+def test_readout_multiline_wraps_long_value_taller_and_untruncated():
+    """#6: a long Info value goes into a :class:`FluentReadoutMultiline` that SOFT-WRAPS it over
+    several lines (taller than a one-line field) and keeps the WHOLE text (``toPlainText`` complete),
+    where the old single-line ``FluentReadoutEdit`` would clip it to one row."""
+    from PyQt5 import QtWidgets
+    from Zou_lab_control.frontend.qt_fluent import FluentReadoutMultiline, ensure_qt_app
+
+    ensure_qt_app()
+    # A realistic long value (a resolved data path) that cannot fit one narrow column line.
+    long_value = ("C:/Users/lab/Dropbox/experiments/rb87/2026-07-01/"
+                  "overnight_survival_scan_run17_readout_calibration_final.npz")
+    host = QtWidgets.QWidget()
+    host.resize(240, 400)                                  # a narrow Info-column-like width -> forces wrap
+    lay = QtWidgets.QVBoxLayout(host)
+
+    short = FluentReadoutMultiline("42")
+    long = FluentReadoutMultiline(long_value)
+    lay.addWidget(short)
+    lay.addWidget(long)
+    host.show()                                           # realise geometry so wrapping + _adjust_height run
+    try:
+        QtWidgets.QApplication.processEvents()
+        # the whole value is preserved (no truncation, unlike a clipped single-line edit)
+        assert long.toPlainText() == long_value, "the multi-line readout keeps the full value verbatim"
+        assert long.text() == long_value, "its line-edit-style .text() also returns the full value"
+        # and it grew TALLER than the one-line field (it wrapped onto multiple visual lines)
+        assert long.height() > short.height(), \
+            "a long value wraps onto several lines -> taller than a single-line value"
+    finally:
+        host.close()
+        host.deleteLater()
+
+
+def test_info_rows_tab_body_uses_card_padding(viewer):
+    """#1(b): the Info tab card body is inset by the component-library card padding (``CARD_PAD``),
+    so it matches the console's own tab bodies (Logic / Edit use ``scaled_px(CARD_PAD, minimum=6)``)
+    instead of the tighter ``scaled_px(6)`` that read as crammed next to the right column."""
+    from Zou_lab_control.frontend.qt_fluent import CARD_PAD, scaled_px
+
+    v, _ = viewer
+    expected = scaled_px(CARD_PAD, minimum=6)
+    margins = v.plot_layout.contentsMargins()
+    assert (margins.left(), margins.top(), margins.right(), margins.bottom()) == \
+        (expected, expected, expected, expected), \
+        "the Info rows-tab body uses CARD_PAD on every edge (matches the console tab bodies)"
+
+
+def test_tab_overflow_popup_uses_rounded_card_single_source():
+    """#1(a): the tab overflow ``...`` popup is rounded the SAME way every other Fluent popup is --
+    a translucent, frameless :class:`_FluentRoundedMenu` that PAINTS the antialiased rounded card --
+    NOT a bare opaque square ``QMenu`` relying on a stylesheet border-radius (which shows a corner nub
+    and reads inconsistent beside the combo drop-down / Setting card)."""
+    from PyQt5 import QtCore, QtWidgets
+    from Zou_lab_control.frontend.qt_fluent import (
+        FluentTabWidget, _FluentRoundedMenu, ensure_qt_app)
+
+    ensure_qt_app()
+    tabs = FluentTabWidget()
+    for name in ("Monitor", "Logic", "Edit alpha", "Edit beta", "Edit gamma"):
+        tabs.add_permanent_tab(QtWidgets.QWidget(), name)
+    try:
+        menu = tabs._overflow_menu()
+        # the shared rounded-card menu subclass, not a plain QMenu
+        assert isinstance(menu, _FluentRoundedMenu), \
+            "the overflow popup is a _FluentRoundedMenu (the shared rounded-card single source)"
+        assert type(menu) is not QtWidgets.QMenu, "it is NOT a bare square QMenu"
+        # translucent + frameless so nothing opaque/square sits behind the painted arc
+        assert menu.testAttribute(QtCore.Qt.WA_TranslucentBackground), \
+            "the popup window is translucent (no opaque square behind the rounded arc)"
+        assert bool(menu.windowFlags() & QtCore.Qt.FramelessWindowHint), "and frameless"
+        # it paints the card itself (overrides paintEvent) -- the same drawRoundedRect recipe
+        assert type(menu).paintEvent is not QtWidgets.QMenu.paintEvent, \
+            "the menu paints its own rounded card (not the default square QMenu paint)"
+        # one action per tab, and it selects the picked tab (behaviour unchanged by the chrome)
+        assert len(menu.actions()) == tabs.count()
+        menu.actions()[3].trigger()
+        assert tabs.currentIndex() == 3, "picking a tab in the overflow menu selects it"
+        menu.deleteLater()
+    finally:
+        tabs.deleteLater()

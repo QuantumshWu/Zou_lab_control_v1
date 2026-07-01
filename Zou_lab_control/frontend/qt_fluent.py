@@ -1019,6 +1019,102 @@ class FluentReadoutEdit(FluentLineEdit):
         )
 
 
+class FluentReadoutMultiline(QtWidgets.QPlainTextEdit):
+    """A MULTI-LINE :class:`FluentReadoutEdit` -- the read-only-but-selectable text field for a
+    value TOO LONG for one line (a resolved file path, a device-metadata blob, a data shape).
+
+    Same look/role as :class:`FluentReadoutEdit` (grey fill + faint border + full-contrast text, NO
+    accent focus ring: you can select + Ctrl-C but not edit), but it SOFT-WRAPS a long value at the
+    field width (``WrapAtWordBoundaryOrAnywhere``) and AUTO-SIZES its height to the wrapped content --
+    so nothing is ever truncated the way a single-line edit clips it.  Height grows with the text up
+    to ``max_lines`` visible rows, after which it stops growing and the (shared fluent) vertical
+    scrollbar takes over.  Mirrors confocal_gui's ``DynamicPlainTextEdit._adjust_height`` (count the
+    VISUAL wrapped lines, size to fit), on the house Fluent readout chrome.  All colours / radius /
+    font come from the style tokens (one source), never re-picked."""
+
+    def __init__(self, text: str = "", parent=None, *, max_lines: int = 6):
+        super().__init__(parent)
+        self._max_lines = max(1, int(max_lines))
+        self.setReadOnly(True)
+        self.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse
+                                     | QtCore.Qt.TextSelectableByKeyboard)
+        self.setCursor(QtCore.Qt.IBeamCursor)          # the I-beam signals "selectable text"
+        # Soft-wrap a long value at the field width (break inside a long token like a path too), so it
+        # wraps to as many lines as it needs instead of overflowing / clipping (confocal idiom).
+        self.setLineWrapMode(QtWidgets.QPlainTextEdit.WidgetWidth)
+        self.setWordWrapMode(QtGui.QTextOption.WrapAtWordBoundaryOrAnywhere)
+        self.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)  # width-wrapped -> never sideways
+        # Vertical scrollbar only appears once the text exceeds ``max_lines`` (the height is capped there).
+        self.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        apply_fluent_scrollbars(self)
+        self._apply_style()
+        if text:
+            self.setPlainText(str(text))
+        self._doc_margin = self.document().documentMargin()
+        # Recompute height when the text changes AND when the wrapped layout size changes (a resize
+        # re-wraps the same text into a different line count) -- the two triggers confocal uses.
+        self.textChanged.connect(self._adjust_height)
+        self.document().documentLayout().documentSizeChanged.connect(lambda *_: self._adjust_height())
+        self._adjust_height()
+
+    def _apply_style(self) -> None:
+        # The SAME readout chrome as FluentReadoutEdit: grey fill (not white -> not an input) + a faint
+        # border + full-contrast text; NO accent focus border, because it cannot be edited.
+        self.setStyleSheet(
+            f"""
+            QPlainTextEdit {{
+                background: {BG};
+                border: 1px solid {DIVIDER};
+                border-radius: {_radius()}px;
+                padding: {scaled_px(PADDING_V)}px {scaled_px(EDIT_PADDING_H)}px;
+                color: {TEXT};
+                font: {fluent_font_size()}pt "{FONT}";
+            }}
+            QPlainTextEdit:focus {{ border: 1px solid {DIVIDER}; }}
+            """
+        )
+
+    def setText(self, text: str) -> None:  # noqa: N802 - match FluentReadoutEdit's line-edit API
+        """Quack like a line edit (``setText`` / ``text``) so it drops into the same rows/fillers."""
+        self.setPlainText(str(text))
+
+    def text(self) -> str:
+        return self.toPlainText()
+
+    def resizeEvent(self, event):  # noqa: N802 - Qt naming
+        # Wrapping depends on the viewport width, so a width change re-wraps -> re-measure the height.
+        super().resizeEvent(event)
+        self._adjust_height()
+
+    def _visual_line_count(self) -> int:
+        """The number of VISUAL lines the text occupies once wrapped at the current width (a wrapped
+        long line counts as several) -- confocal's DynamicPlainTextEdit line-count walk."""
+        doc = self.document()
+        doc.setTextWidth(self.viewport().width())     # wrap at the live viewport width
+        doc.adjustSize()                              # force relayout so line counts are current
+        layout = doc.documentLayout()
+        count = 0
+        block = doc.begin()
+        while block.isValid():
+            if layout is not None:
+                layout.blockBoundingRect(block)       # ensure the block's layout exists
+            block_layout = block.layout()
+            count += block_layout.lineCount() if block_layout is not None else 1
+            block = block.next()
+        return max(1, count)
+
+    def _adjust_height(self) -> None:
+        """Size the field to fit its wrapped content, up to ``max_lines`` rows (then it scrolls) --
+        confocal's height formula (visual lines x line height + frame + doc margin)."""
+        lines = min(self._visual_line_count(), self._max_lines)
+        line_height = self.fontMetrics().lineSpacing()
+        frame = self.frameWidth() * 2
+        margin = int(self._doc_margin) * 2
+        total = int(math.ceil(lines * line_height + frame + margin) + 1)
+        self.setFixedHeight(total)
+        self.updateGeometry()
+
+
 class FluentPathEdit(QtWidgets.QWidget):
     """A path field + a ``Browse…`` button -- the ONE reusable control for every path
     parameter (a data folder, a saved pulse-template ``.json``, a calibration file).
@@ -1236,6 +1332,56 @@ class _RoundedPopupCard(QtCore.QObject):
                 obj.move(geo.left(), target)
             return False
         return False
+
+
+class _FluentRoundedMenu(QtWidgets.QMenu):
+    """A ``QMenu`` with the SAME antialiased rounded-card chrome as every other Fluent popup
+    (the FluentPopup Setting card, the FluentComboBox drop-down), reusable frontend-owned.
+
+    A stylesheet ``border-radius`` alone is NOT enough on a menu: its window stays opaque + SQUARE
+    behind the arc, so the corners outside the radius show a white nub (and the platform adds a native
+    shadow) -- reading as a hard-cornered popup beside the antialiased round ones.  So the window is
+    made TRANSLUCENT + frameless and this PAINTS the card itself (fill + 1 px border) via the same
+    ``drawRoundedRect`` single source, BEFORE the items -- unlike :class:`_RoundedPopupCard` (which
+    filters a container that owns no items and so can suppress its paint), a menu draws its own items,
+    so the card is composited UNDER them (super paints the labels on top) rather than replacing them."""
+
+    def __init__(self, parent=None, *, radius: float | None = None,
+                 border: str = DIVIDER, fill: str = "white"):
+        super().__init__(parent)
+        self._radius = float(_radius() if radius is None else radius)
+        self._border = QtGui.QColor(border)
+        self._fill = QtGui.QColor(fill)
+        # Translucent frameless window so nothing opaque/square sits behind the painted arc.
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+        self.setWindowFlags(self.windowFlags() | QtCore.Qt.FramelessWindowHint
+                            | QtCore.Qt.NoDropShadowWindowHint)
+        # Transparent menu body (the card is painted, not a stylesheet background) + a rounded ACCENT
+        # pill on the selected/hover row -- the same item chrome the combo drop-down uses.
+        self.setStyleSheet(
+            f"""
+            QMenu {{ background: transparent; border: none;
+                     padding: {scaled_px(4, minimum=3)}px;
+                     font: {fluent_font_size()}pt "{FONT}"; color: {TEXT}; }}
+            QMenu::item {{ padding: {scaled_px(5, minimum=4)}px {scaled_px(14, minimum=10)}px;
+                          border-radius: {_radius()}px; }}
+            QMenu::item:selected {{ background: {ACCENT}; color: white; }}
+            """
+        )
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        # Paint the rounded card FIRST (fill + 1 px antialiased border), then let QMenu draw its items
+        # on top -- same drawRoundedRect recipe as FluentPopup / _RoundedPopupCard (one visual source).
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        pen = QtGui.QPen(self._border)
+        pen.setWidthF(1.0)
+        painter.setPen(pen)
+        painter.setBrush(self._fill)
+        rect = QtCore.QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        painter.drawRoundedRect(rect, self._radius, self._radius)
+        painter.end()
+        super().paintEvent(event)
 
 
 #: Max rows a Fluent drop-down shows before it SCROLLS (the shared fluent scrollbar) -- one source for
@@ -1956,18 +2102,16 @@ class FluentTabWidget(QtWidgets.QTabWidget):
     def _overflow_menu(self) -> QtWidgets.QMenu:
         """Build (but do not show) the Fluent overflow menu: one checkable action per tab
         that selects it on trigger (Qt scrolls it into view).  Split out from the popup so
-        the click->select wiring is testable without a blocking ``exec_``."""
-        menu = QtWidgets.QMenu(self)
-        menu.setStyleSheet(
-            f"""
-            QMenu {{ background: white; border: 1px solid {PLACEHOLDER};
-                     border-radius: {_radius()}px; padding: {scaled_px(4, minimum=3)}px;
-                     font: {fluent_font_size()}pt "{FONT}"; color: {TEXT}; }}
-            QMenu::item {{ padding: {scaled_px(5, minimum=4)}px {scaled_px(14, minimum=10)}px;
-                          border-radius: {_radius()}px; }}
-            QMenu::item:selected {{ background: {ACCENT}; color: white; }}
-            """
-        )
+        the click->select wiring is testable without a blocking ``exec_``.
+
+        The card is rounded the SAME way every other Fluent popup is (the FluentPopup Setting card,
+        the FluentComboBox drop-down): a stylesheet ``border-radius`` alone leaves the menu's opaque
+        SQUARE window behind the arc, so the corners outside the radius show a square white nub (and
+        Windows adds a native shadow) -- reading as a hard-cornered popup next to the antialiased
+        round ones.  So this uses :class:`_FluentRoundedMenu`, which is TRANSLUCENT + frameless and
+        PAINTS one antialiased rounded rect (white fill + 1 px border) behind its items -- the shared
+        rounded-card single source, composited so the labels still draw on top."""
+        menu = _FluentRoundedMenu(self)
         current = self.currentIndex()
         for i in range(self.count()):
             act = menu.addAction(self.tabText(i))
