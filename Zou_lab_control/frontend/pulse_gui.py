@@ -2000,7 +2000,7 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         # a wider substitute font (offscreen screenshots), so it never clips.
         self.preview_include_off.setFixedSize(_px(198, minimum=178), preview_control_h)
         self.preview_include_off.setToolTip("Show channels that are always off in the preview.")
-        self.preview_include_off.toggled.connect(self._request_preview_refresh)
+        self.preview_include_off.toggled.connect(self._on_include_off_toggled)
         # Preview SIZE: one of PANEL_SIZES (the same size presets the console panels use), so the pulse
         # figure's data region scales like every other kind.  The default is optimal_pulse_size for the
         # current channel / period counts (the ONE default source, shared with the loaded panel); once the
@@ -4312,9 +4312,21 @@ class PulseSequenceEditor(QtWidgets.QWidget):
     def _on_tab_changed(self, _index: int) -> None:
         current = self.tabs.currentWidget()
         if current is self.preview_tab:
+            # ENTERING Preview from another tab is a big context switch: drop any temporary size PIN so the
+            # plot re-derives the optimal size for the CURRENT channel / period counts (the pin is only a
+            # transient pick that lives WHILE staying on Preview, not across leaving-and-returning).
+            self._preview_size_pinned = False
             self.refresh_preview()
         elif current is getattr(self, "scan_tab", None):
             self._refresh_scan_tab()
+
+    def _on_include_off_toggled(self, *_args) -> None:
+        """Toggling "show all / off channels" changes how many rows the render draws, so the OPTIMAL size
+        changes too.  Drop any temporary size PIN first so the plot re-derives the best size for the new
+        visible-channel count, then refresh (the pin is a transient in-Preview pick, not something a
+        show-all toggle should keep honouring)."""
+        self._preview_size_pinned = False
+        self._request_preview_refresh()
 
     def _request_preview_refresh(self, *_args) -> None:
         self._preview_dirty = True

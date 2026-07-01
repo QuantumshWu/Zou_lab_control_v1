@@ -57,6 +57,19 @@ def _busy_state() -> PulseTableState:
     return PulseTableState(channels=ch, periods=periods, name="busy")
 
 
+def _mostly_off_state() -> PulseTableState:
+    """A pulse with a FEW active channels and MANY always-off channels, chosen so ``include_always_off``
+    flips the drawn-row count across a size threshold: hiding the off rows defaults to the smallest preset,
+    showing them defaults to the largest.  Lets a show-all toggle observably re-derive the optimal size."""
+    active = [f"a{i}" for i in range(2)]
+    off = [f"off{i}" for i in range(20)]
+    ch = active + off
+    periods = [PulsePeriod(duration=5 + p, unit="us", name=f"P{p}",
+                           states=tuple((1 if (c in active and (p + ai) % 2 == 0) else 0)
+                                        for ai, c in enumerate(ch))) for p in range(3)]
+    return PulseTableState(channels=ch, periods=periods, name="mostly_off")
+
+
 def _grid_recipe(n=6):
     rng = np.random.default_rng(0)
     per = [np.concatenate([rng.normal(200, 25, 40), rng.normal(1200, 70, 40)]) for _ in range(n)]
@@ -183,6 +196,55 @@ def test_preview_default_size_uses_optimal():
         gui._on_preview_size_picked()
         assert gui._preview_size_pinned is True
         assert gui._preview_size_for(st, include_always_off=True) == "4x4"
+    finally:
+        gui.deleteLater()
+        plt.close("all")
+
+
+# ------------------------------------- 4b. entering Preview / show-all toggle re-derive the optimal size
+def test_preview_size_pin_is_transient_and_auto_recomputes():
+    """The size PIN is a TRANSIENT in-Preview pick -- it is NOT kept across the two big context switches
+    that change the natural size:
+
+    (1) SWITCHING BACK to the Preview tab drops the pin and re-derives ``default_pulse_size`` for the
+        current channel / period counts;
+    (2) TOGGLING "show all / off channels" drops the pin and re-derives the optimal size for the NEW
+        visible-channel count (asserted to actually CHANGE the size here);
+
+    but a plain refresh WHILE staying on Preview keeps a pin (so a manual pick is sticky in-place)."""
+    from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
+    st = _mostly_off_state()
+    gui = PulseSequenceEditor(state=st, channels=list(st.channels))
+    try:
+        # (i) entering the Preview tab: pin is reset and the effective size is the shared optimal default.
+        gui._preview_size_pinned = True                       # pretend a pin lingered from a prior visit
+        preview_index = gui.tabs.indexOf(gui.preview_tab)
+        gui.tabs.setCurrentWidget(gui.preview_tab)             # currentWidget() is preview_tab for the handler
+        gui._on_tab_changed(preview_index)
+        assert gui._preview_size_pinned is False, "entering Preview must drop a lingering size pin"
+        assert gui._preview_size_for(st, include_always_off=False) \
+            == default_pulse_size(st, include_always_off=False)
+
+        # (ii) a manual pick PINS the size (unchanged behaviour) ...
+        gui.preview_size_combo.setCurrentText("4x4")
+        gui._on_preview_size_picked()
+        assert gui._preview_size_pinned is True
+
+        # ... and a plain refresh WHILE on Preview keeps that pin (a manual pick is sticky in-place).
+        gui.refresh_preview()
+        assert gui._preview_size_pinned is True, "a plain in-Preview refresh must NOT clear a manual pin"
+
+        # (iii) toggling show-all drops the pin and re-derives the size for the NEW visible-channel count.
+        # off channels hidden -> smallest preset; shown -> largest preset (the two defaults differ), so the
+        # recompute is observable, not a no-op.
+        default_hidden = default_pulse_size(st, include_always_off=False)
+        default_shown = default_pulse_size(st, include_always_off=True)
+        assert default_hidden != default_shown, "fixture must make show-all change the optimal size"
+        gui.preview_include_off.setChecked(True)              # now showing the off rows
+        gui._on_include_off_toggled()
+        assert gui._preview_size_pinned is False, "a show-all toggle must drop the size pin"
+        assert gui._preview_size_for(st, include_always_off=True) == default_shown, \
+            "after show-all, the size must re-derive to the new (larger) optimal default"
     finally:
         gui.deleteLater()
         plt.close("all")
