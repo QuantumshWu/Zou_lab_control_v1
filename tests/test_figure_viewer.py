@@ -148,6 +148,45 @@ def test_board_reuse_add_second_panel_reads_same_signal(viewer):
     assert kinds == {"hist", "monitor"}, "the same signal is viewed as two different kinds"
 
 
+def test_window_opens_at_screen_fit_not_content_width(tmp_path):
+    """The viewer opens at the shared screen-fraction size (the task console / pulse editor both return
+    ``screen_fit_window_size`` verbatim from ``sizeHint``), NEVER collapsed to the bare Info-column
+    content width -- and at that SAME size whether or not a figure is loaded, because an empty console
+    board always fills the right column.  This is the guard for 'the window opened crammed': a
+    content-driven ``sizeHint`` (or building no console when nothing is loaded) would shrink the empty
+    window to the narrow Info strip and this test would fail."""
+    from Zou_lab_control.frontend.qt_fluent import (
+        WINDOW_SCREEN_FRACTION, ensure_qt_app, screen_fit_window_size)
+    ensure_qt_app()
+    fit = screen_fit_window_size(WINDOW_SCREEN_FRACTION)
+
+    empty = FigureViewer(path=None)                       # the double-click default: nothing loaded
+    try:
+        assert empty.console is not None, \
+            "an empty viewer still builds a real console board (never a bare Info strip)"
+        assert empty.sizeHint().width() == fit.width(), \
+            "the window opens at the screen-fit WIDTH, not the content/Info-column width"
+        assert empty.sizeHint().height() == fit.height(), "and at the screen-fit height"
+        assert empty.sizeHint().width() > empty._info_col_w * 2, \
+            "far wider than the Info column alone -- not crammed"
+        empty_hint = empty.sizeHint()
+    finally:
+        empty.teardown()
+
+    npz = _saved_1d_npz(tmp_path)
+    loaded = show_figure_viewer(npz)                      # loaded opens at the SAME size (content-independent)
+    try:
+        assert loaded.sizeHint().width() == empty_hint.width() == fit.width(), \
+            "a loaded viewer opens at the same screen-fit width as the empty one"
+        assert loaded.sizeHint().height() == empty_hint.height()
+    finally:
+        win = loaded.window()
+        if win is not None:
+            win.close(); win.deleteLater()
+        loaded.teardown()
+        plt.close("all")
+
+
 def test_one_d_save_reproduces_with_saved_x_axis(tmp_path):
     """A 1-D save publishes a companion fig_x so the seeded 1d panel draws vs the saved x with the
     saved x-axis label (faithful reproduction of the x axis, not a bare index)."""

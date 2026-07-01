@@ -282,6 +282,10 @@ class FigureViewer(QtWidgets.QWidget):
         holder_host.setLayout(self._console_holder)
         root.addWidget(holder_host, 1)
 
+        # The right column ALWAYS holds a real console board -- empty until a figure is loaded -- so the
+        # window opens at its full screen-fit size beside the Info column (never a bare, crammed strip).
+        # A given ``path`` then reseeds it; a bad path leaves the empty board + an error in the status.
+        self._build_console(None)
         if path is not None:
             self.open_path(path)
 
@@ -462,24 +466,33 @@ class FigureViewer(QtWidgets.QWidget):
                 self._add_info_row(str(role), snap)
 
     # -------------------------------------------------------------- console
-    def _build_console(self, saved: SavedFigure) -> None:
-        """Publish the loaded figure as a hub signal + seed a fresh TaskConsole reproducing it, and
-        swap it into the right column (a re-Load rebuilds everything on a fresh hub)."""
+    def _build_console(self, saved: SavedFigure | None = None) -> None:
+        """(Re)build the embedded TaskConsole filling the right column.  With a ``saved`` figure it
+        publishes it as the ``fig_value`` hub signal and seeds a panel reproducing it; with ``None``
+        (nothing loaded yet) it is an EMPTY board -- so the window ALWAYS shows a real console beside
+        the Info column (never a bare, crammed strip), and Browse + Load simply reseeds it."""
         self._teardown_console()
         self.hub = SignalHub()
-        self.node = LoadedFigureNode(self.hub, saved)
-        self.node.step()                       # publish once so the signal is on the hub immediately
-        state = _seed_state(saved)
-        # Size the console to fill the screen budget BESIDE the Info column, so the whole window stays
-        # within the shared screen-fraction rule (the console alone would demand the full screen width,
-        # pushing the Info column off-screen / clipping the board).  ``window_px`` overrides the console's
-        # own screen-fit; the height matches the fit so the board never clips vertically either.
+        if saved is not None:
+            self.node = LoadedFigureNode(self.hub, saved)
+            self.node.step()                   # publish once so the signal is on the hub immediately
+            state = _seed_state(saved)
+            running = [self.node]
+        else:
+            self.node = None
+            state = TaskConsoleState(name="figure", panels=[])
+            running = []
+        # Size the console to fill the screen budget BESIDE the Info column (the SAME shared
+        # screen-fraction rule the window opens at), so info + console + chrome == the window and the
+        # board never clips: WIDTH = window minus the fixed Info column and the 3 horizontal gaps (2 root
+        # margins + 1 spacing); HEIGHT = window minus the 2 vertical root margins.
         fit = screen_fit_window_size(self.window_ratio)
-        console_w = max(scaled_px(520, minimum=380),
-                        fit.width() - self._info_col_w - 3 * self._root_margin)
-        self.console = TaskConsole(hub=self.hub, state=state, running_nodes=[self.node],
+        m = self._root_margin
+        console_w = max(scaled_px(520, minimum=380), fit.width() - self._info_col_w - 3 * m)
+        console_h = max(scaled_px(360, minimum=280), fit.height() - 2 * m)
+        self.console = TaskConsole(hub=self.hub, state=state, running_nodes=running,
                                    session=None, scale=self._scale,
-                                   window_px=(console_w, fit.height()))
+                                   window_px=(console_w, console_h))
         self._console_holder.addWidget(self.console)
 
     def _teardown_console(self) -> None:
@@ -503,15 +516,14 @@ class FigureViewer(QtWidgets.QWidget):
 
     # ---------------------------------------------------------------- sizing
     def sizeHint(self) -> QtCore.QSize:  # noqa: N802 - Qt API name
-        # The window fits its content: WIDTH is the natural layout size (the fixed Info column + the
-        # TaskConsole's own fixed size) so nothing clips; HEIGHT is clamped to the primary screen (the
-        # shared qt_fluent rule).  A Python exception from this Qt-virtual would crash the C++
-        # adjustSize, so keep it total (self-swallow).
+        # The window opens at the SAME screen fraction as the other two top-level GUIs -- the task
+        # console (``TaskConsole.sizeHint``) and the pulse editor both return ``screen_fit_window_size``
+        # VERBATIM from their ``sizeHint``.  The size is the screen BUDGET, never the content: the inner
+        # layout (fixed Info column + a console board sized to fill the rest) fits inside it, so the
+        # window can't collapse to a bare Info strip whether or not a figure is loaded.  A Python
+        # exception from this Qt-virtual would crash the C++ adjustSize, so self-swallow.
         try:
-            natural = super().sizeHint()
-            fit = screen_fit_window_size(self.window_ratio)
-            h = min(natural.height(), fit.height()) if fit.height() > 0 else natural.height()
-            return QtCore.QSize(natural.width(), max(h, 1))
+            return screen_fit_window_size(self.window_ratio)
         except Exception:
             return super().sizeHint()
 
