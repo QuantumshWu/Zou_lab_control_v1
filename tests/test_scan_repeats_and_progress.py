@@ -236,3 +236,82 @@ def test_virtual_terminal_reading_latches_like_real():
     first = seq.scan_progress()
     second = seq.scan_progress()
     assert first == second == {"scanning": False, "point": 2, "n_points": 3, "sweep": 1, "n_repeats": 2}
+
+
+# ---- scan progress is DEVICE TRUTH, never a GUI-local wall clock -----------------------------
+# The user-reported "progress climbs but the device is idle": the standalone pulse GUI's real
+# hardware runs behind the COMMAND backend, which is a fire-and-forget lab command with NO scan
+# cursor (scan_progress_callback=None).  The bare SequencerService used to DERIVE a climbing
+# played-point count from the wall clock elapsed since fire() -- so the Scan tab counted up even
+# though nothing was confirmed streaming.  Progress must instead come ONLY from a real playback
+# source; without one it reports the honest static reading and never advances.
+import time as _time
+
+from Zou_lab_control.neutral_atom.devices.sequencer import RuntimeSequencer, SequencerService
+
+
+def _command_backed_service():
+    """A SequencerService wired like the real command backend: fire/prepare succeed as a state
+    transition but there is NO scan-progress source (the lab command has no readable cursor)."""
+    return SequencerService(
+        channels=["probe", "trig"],
+        prepare_callback=lambda program: None,   # a lab command that "uploads" (opaque)
+        fire_callback=lambda program: None,      # a lab command that "fires" (opaque)
+        safe_state_callback=lambda: None,
+        scan_progress_callback=None,             # no cursor -> the service cannot read a position
+        cache_prepared=False,
+    )
+
+
+def test_command_backend_progress_never_fabricates_advance():
+    svc = _command_backed_service()
+    PulseController(svc, _scan_state()).on_pulse(repeat_forever=True)
+    first = svc.scan_progress()
+    assert first == {"scanning": True, "point": 0, "n_points": 3, "sweep": 0, "n_repeats": 0}
+    _time.sleep(0.12)                            # >> 2 * SCAN_PROGRESS_DISPLAY_DT
+    later = svc.scan_progress()
+    # The wall clock advanced but the reading did NOT: no cursor => no fabricated points.  This is
+    # the guard against "progress climbs while the device is idle".
+    assert later == first
+    assert later["point"] == 0
+
+
+def test_command_backend_progress_idle_when_not_running():
+    svc = _command_backed_service()
+    # Nothing fired yet -> idle (no scan position at all).
+    assert svc.scan_progress() == SCAN_PROGRESS_IDLE
+    PulseController(svc, _scan_state()).on_pulse(repeat_forever=True)
+    svc.set_safe_state()                         # Stop -> device idle again
+    assert svc.scan_progress() == SCAN_PROGRESS_IDLE
+
+
+def test_simulate_flag_is_the_single_opt_in_for_wall_clock_progress():
+    # The wall-clock SIMULATION lives in exactly one place and is reachable ONLY via the explicit
+    # opt-in: a service with simulate_scan_progress=True paces the played-point count off the clock;
+    # the default (a real, un-readable device) does not.  Same service, same NoOp backend, opposite
+    # behaviour -- so a real command-backed device can never inherit the simulator's fabrication.
+    def make(simulate):
+        return SequencerService(
+            channels=["probe", "trig"],
+            prepare_callback=lambda p: None, fire_callback=lambda p: None,
+            safe_state_callback=lambda: None, scan_progress_callback=None,
+            cache_prepared=False, simulate_scan_progress=simulate,
+        )
+    sim = make(True)
+    PulseController(sim, _scan_state()).on_pulse(repeat_forever=True)
+    p0 = sim.scan_progress()["point"]
+    _time.sleep(0.12)
+    assert sim.scan_progress()["point"] >= p0 and sim.scan_progress() != {
+        "scanning": True, "point": 0, "n_points": 3, "sweep": 0, "n_repeats": 0}
+
+    real = make(False)
+    PulseController(real, _scan_state()).on_pulse(repeat_forever=True)
+    _time.sleep(0.12)
+    assert real.scan_progress()["point"] == 0    # a real device never fabricates
+
+
+def test_runtime_sequencer_opts_into_the_simulator_but_command_backend_does_not():
+    # Pin the wiring so the opt-in cannot silently flip: the in-process "Virtual (sim)"
+    # RuntimeSequencer IS a simulator (may pace off the clock); a command-backed service is NOT.
+    assert RuntimeSequencer(channels=["probe", "trig"]).service.simulate_scan_progress is True
+    assert _command_backed_service().simulate_scan_progress is False

@@ -895,6 +895,7 @@ class SequencerService:
         scan_progress_callback: Callable[[], dict] | None = None,
         sleep_scale: float = 0.0,
         cache_prepared: bool = True,
+        simulate_scan_progress: bool = False,
     ):
         self.channels = list(channel_names(channels, "channels"))
         self.clock_hz = positive_float(clock_hz, "clock_hz")
@@ -903,6 +904,18 @@ class SequencerService:
         self.wait_done_callback = wait_done_callback
         self.safe_state_callback = safe_state_callback
         self.scan_progress_callback = scan_progress_callback
+        # SCAN PROGRESS IS A DEVICE-TRUTH READING, never a GUI-local timer.  A backend with a real
+        # scan-point source wires ``scan_progress_callback`` -- the FPGA cursor (AXI) or the virtual
+        # backend's real-time simulator -- and the reading always comes from there.  WITHOUT such a
+        # source (the command backend on real hardware, whose fire is a fire-and-forget lab command
+        # with no cursor to read) the service does NOT know where the engine's scan is, so it reports
+        # the HONEST reading: point 0 while a scan is loaded and running, NEVER an advancing count.
+        # ``simulate_scan_progress`` is the SINGLE opt-in for the ONE case where fabricating a moving
+        # position is legitimate -- the in-process ``RuntimeSequencer`` "Virtual (sim)", which has no
+        # real device to contradict it.  Keying the wall-clock derivation off this flag (not off "no
+        # callback") is what stops a real command-backed device from showing "progress advancing" while
+        # nothing is physically streaming -- the user-reported "progress climbs but the device is idle".
+        self.simulate_scan_progress = bool(simulate_scan_progress)
         self.sleep_scale = nonnegative_float(sleep_scale, "sleep_scale")
         self.cache_prepared = bool(cache_prepared)
         self._lock = threading.RLock()
@@ -1069,12 +1082,21 @@ class SequencerService:
             self.safe_state_callback()
 
     def scan_progress(self) -> dict:
-        """Where the running scan is now.  Delegates to the hardware backend's reading when one is
-        wired (the real FPGA scan cursor).  WITHOUT a hardware callback (the pure-software
-        ``RuntimeSequencer`` the standalone pulse GUI uses by default), DERIVE the played-point count
-        from the wall-clock elapsed since ``fire()`` -- exactly how the real cursor advances -- so the
-        Scan tab shows "point K / N" for a VIRTUAL streamed scan too (virtual == real for the readout;
-        the old behaviour returned idle here, so a virtual scan showed no position at all)."""
+        """Where the running scan is now -- a DEVICE-TRUTH reading, never a GUI-local timer.
+
+        A backend that can report its real scan position wires ``scan_progress_callback`` (the FPGA
+        cursor on the AXI backend, the real-time simulator on the virtual backend); the reading then
+        comes ENTIRELY from there, so it advances if and only if the device actually plays points.
+
+        WITHOUT such a source (the command backend on real hardware -- a fire-and-forget lab command
+        with no cursor) the service CANNOT know the engine's scan position, so it reports the honest
+        reading: a loaded, running scan sits at ``point 0`` and does NOT advance.  It NEVER derives a
+        climbing count from the wall clock -- that would claim the device is sweeping when nothing may
+        be streaming (the reported "progress climbs but the device is idle").
+
+        The one exception is ``simulate_scan_progress`` (the in-process ``RuntimeSequencer`` "Virtual
+        (sim)"): a genuine software simulator with no real device to contradict it, so it MAY pace the
+        played-point count off the wall clock -- the single, opt-in home of that simulation."""
         if self.scan_progress_callback is not None:
             return dict(self.scan_progress_callback())
         program = self.prepared_program
@@ -1088,6 +1110,11 @@ class SequencerService:
         k = max(0, int(getattr(program, "scan_repeats", 0)))
         if self._scan_done:                              # finite scan already played its K sweeps -> latched done
             return scan_progress_fields(max(1, k) * n, n, k)
+        if not self.simulate_scan_progress:
+            # No real cursor and NOT a simulator: report the honest static reading (running at the
+            # start of the scan), so a real device with an un-readable position never fabricates a
+            # climbing count while nothing is confirmed streaming.
+            return scan_progress_fields(0, n, k)
         total = int(max(0.0, time.monotonic() - self._scan_fire_time) / SCAN_PROGRESS_DISPLAY_DT)
         fields = scan_progress_fields(total, n, k)
         if not fields["scanning"]:                       # a finite K-sweep scan reached its end -> latch
@@ -1126,10 +1153,14 @@ class RuntimeSequencer(SequencerDevice):
         clock_hz: float = DEFAULT_RUNTIME_CLOCK_HZ,
         sleep_scale: float = 0.0,
     ):
+        # The in-process "Virtual (sim)" backend has NO real device, so it is the one place a
+        # wall-clock-paced scan position is an honest SIMULATION (nothing to contradict it) rather
+        # than a fabrication over a real, un-readable device -- opt into it explicitly.
         self.service = SequencerService(
             channels=channels,
             clock_hz=clock_hz,
             sleep_scale=sleep_scale,
+            simulate_scan_progress=True,
         )
         self.channels = self.service.channels
         self.clock_hz = self.service.clock_hz
@@ -1536,6 +1567,14 @@ class PulseController:
                 "or pulse.on_pulse(wait=True, repeat_forever=False) for a finite shot, "
                 "or pulse.on_pulse(wait=True, scan_repeats=K) for a finite K-sweep scan."
             )
+        # On Pulse ALWAYS = off_pulse -> prepare -> fire, unconditionally: a fresh run stops whatever
+        # is currently playing, then uploads THIS payload and starts.  This is what makes On Pulse
+        # order-independent -- switching a running scan (new slot / new points / new binding) is just
+        # another On Pulse, never a "already running, reuse the old scan" short-circuit.  The stop also
+        # clears any cached prepared program (set_safe_state drops prepared_program), so the next
+        # prepare is guaranteed to re-upload rather than hit the cache.  Notebook, GUI and real all go
+        # through this one seam, so the API and the GUI cannot drift into different run semantics.
+        self.stop()
         self.last_program = self.sequencer.prepare(payload)
         program = self.last_program
         self.sequencer.fire()

@@ -3249,34 +3249,63 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             # Run every time the tab was opened -- restore the pre-refresh state.
             self.scan_run_button.set_dirty(was_dirty)
 
+    def _generate_scan_rows(self, state: PulseTableState) -> list[list[float]]:
+        """Execute the current scan CODE against ``state``'s slots and return the snapped rows.
+
+        The ONE source of the generated scan table: it runs the editor's scan snippet with
+        ``n_slots`` = the state's CURRENT scan-slot count, so the table is always shaped for the
+        slots as they are right now.  Pure (no widget mutation)."""
+        import numpy as np
+        import math as _math
+
+        namespace = {"np": np, "numpy": np, "math": _math, "n_slots": len(state.scan_slots)}
+        # SECURITY: this runs the user-entered scan snippet as arbitrary Python. It is a
+        # LOCAL experiment tool -- only run code you wrote or trust (a loaded scan .py can do
+        # anything Python can). Do not paste/load untrusted scan programs.
+        exec(self.scan_code.toPlainText(), namespace)  # noqa: S102 - local experiment tool, trusted input only
+        table = namespace.get("scan_table")
+        if table is None:
+            raise ValueError("Assign an N_points x N_slots array to a 'scan_table' variable.")
+        array = np.atleast_2d(np.asarray(table, dtype=float))
+        # Snap behind the scenes so what runs is always hardware-legal: durations
+        # -> whole ticks (>= 1), DAC -> integer codes clamped to each bus width.
+        return snap_scan_table(
+            [[float(value) for value in row] for row in array],
+            state.scan_slots,
+            time_step_ns=state.time_step_ns,
+            dac_ranges=state.scan_slot_dac_ranges(),
+        )
+
+    def _current_scan_table(self, state: PulseTableState) -> list[list[float]]:
+        """The scan table the CURRENT UI defines for ``state``, reconciled to its slots as they are NOW.
+
+        On Pulse must upload the table for the current binding, never a table corrupted by an
+        intermediate edit.  The AUTHORITATIVE values live in the active SOURCE cache -- the last
+        generated code output (``_scan_tables['generated']``) or the loaded array -- not in
+        ``state.scan_table``, which a mid-edit (e.g. a slot briefly unbound to zero columns during a
+        move) can pad down to the new slot's nominal and so LOSE the user's values.  Re-snap the
+        source rows to the current slots and reconcile each row to the slot count (short rows padded
+        with the slot nominal, extra columns dropped) -- the exact rule ``_apply_scan_source`` uses,
+        so On Pulse and the Scan-tab preview always agree.  Falls back to whatever ``state`` already
+        carries if the source cache is empty (a directly-loaded pulse's embedded table)."""
+        n = len(state.scan_slots)
+        source = self._scan_tables.get("loaded" if self._scan_use_loaded else "generated") or []
+        rows = source if source else [list(row) for row in state.scan_table]
+        if rows:
+            rows = snap_scan_table(
+                rows, state.scan_slots,
+                time_step_ns=state.time_step_ns, dac_ranges=state.scan_slot_dac_ranges(),
+            )
+        slot_defaults = [float(slot.nominal) for slot in state.scan_slots]
+        return [list(row)[:n] + slot_defaults[len(row):n] for row in rows]
+
     def _run_scan_code(self) -> None:
         try:
             state = self.read_state()
             if not state.scan_slots:
                 self._message("Bind at least one field to a scan slot first (click a dot in the Edit tab).")
                 return
-            import numpy as np
-            import math as _math
-
-            namespace = {"np": np, "numpy": np, "math": _math, "n_slots": len(state.scan_slots)}
-            # SECURITY: this runs the user-entered scan snippet as arbitrary Python. It is a
-            # LOCAL experiment tool -- only run code you wrote or trust (a loaded scan .py can do
-            # anything Python can). Do not paste/load untrusted scan programs.
-            exec(self.scan_code.toPlainText(), namespace)  # noqa: S102 - local experiment tool, trusted input only
-            table = namespace.get("scan_table")
-            if table is None:
-                self._message("Assign an N_points x N_slots array to a 'scan_table' variable.")
-                return
-            array = np.atleast_2d(np.asarray(table, dtype=float))
-            # Snap behind the scenes so what runs is always hardware-legal: durations
-            # -> whole ticks (>= 1), DAC -> integer codes clamped to each bus width.
-            rows = snap_scan_table(
-                [[float(value) for value in row] for row in array],
-                state.scan_slots,
-                time_step_ns=state.time_step_ns,
-                dac_ranges=state.scan_slot_dac_ranges(),
-            )
-            self._scan_tables["generated"] = rows
+            self._scan_tables["generated"] = self._generate_scan_rows(state)
             self._scan_use_loaded = False
             self._apply_scan_source()
             self._open_scan_tab()
@@ -3744,6 +3773,13 @@ class PulseSequenceEditor(QtWidgets.QWidget):
 
     def _prepare_to_device(self, *, fire: bool = False):
         state = self.read_state()
+        # RE-DERIVE the scan table for the CURRENT slots before every upload, from the active SOURCE
+        # (the generated-code output cache / the loaded array) rather than the table read_state carried
+        # forward -- which a mid-edit slot move can have padded down to the new slot's nominal.  This is
+        # what makes On Pulse order-independent: move a scan slot then On Pulse and the uploaded table
+        # still matches the moved slot with the real values, no manual "re-run scan points" step.
+        if state.scan_slots:
+            state.set_scan_table(self._current_scan_table(state))
         clock_step_ns = self._clock_step_ns(self.sequencer)
         if self.sequencer is None:
             if clock_step_ns is not None:

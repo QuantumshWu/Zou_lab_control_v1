@@ -181,12 +181,14 @@ def test_poll_scan_progress_swallows_reader_errors(_app):
 
 # ---- (4) On Pulse routes through the SAME PulseController seam as notebook + real, and is CYCLIC ----
 class _RecordingSeq:
-    """Records the payload prepared + whether fire() ran -- the device seam On Pulse must drive."""
+    """Records the payload prepared + whether fire()/set_safe_state() ran -- the device seam On Pulse
+    must drive (On Pulse = stop -> prepare -> fire)."""
     clock_hz = 50_000_000.0
 
     def __init__(self):
         self.prepared = []
         self.fired = 0
+        self.stopped = 0
 
     def prepare(self, payload):
         self.prepared.append(payload)
@@ -194,6 +196,9 @@ class _RecordingSeq:
 
     def fire(self):
         self.fired += 1
+
+    def set_safe_state(self):
+        self.stopped += 1
 
 
 def test_on_pulse_routes_through_pulse_controller_and_is_cyclic(_app):
@@ -222,3 +227,51 @@ def test_prepare_button_also_routes_cyclic_through_controller(_app):
     ed.prepare()                                      # the real Prepare handler
     assert seq.fired == 0                             # Prepare does NOT fire
     assert len(seq.prepared) == 1 and bool(seq.prepared[-1].repeat_forever) is True
+
+
+# ---- On Pulse is ORDER-INDEPENDENT: stop -> re-read current UI -> re-upload -> fire ----------------
+# The user report: change a scan slot's binding, press On Pulse -- no effect unless you first Stop and
+# re-run the scan points in a specific order.  On Pulse must instead ALWAYS stop, re-derive the scan
+# table for the slots as they are NOW, upload it, and fire -- so a slot move then On Pulse just works.
+def _three_period_scan_editor(seq):
+    from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
+    from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState, PulsePeriod
+    st = PulseTableState(channels=["probe", "trig"])
+    st.periods.append(PulsePeriod(1000, tuple(0 for _ in st.channels), unit="ns"))
+    st.periods.append(PulsePeriod(1000, tuple(0 for _ in st.channels), unit="ns"))
+    st.bind_field("duration", "0", unit="us")
+    st.set_scan_table([[10.0], [20.0], [30.0]])
+    ed = PulseSequenceEditor(st, sequencer=seq)
+    ed._scan_tables["generated"] = [[10.0], [20.0], [30.0]]   # the active generated source
+    return ed
+
+
+def test_on_pulse_stops_before_it_fires(_app):
+    """On Pulse = off_pulse -> prepare -> fire: it drives the stop seam FIRST every time, so switching
+    a running scan is just another On Pulse (no reliance on the user having stopped first)."""
+    seq = _RecordingSeq()
+    ed = _three_period_scan_editor(seq)
+    ed.fire()
+    assert seq.stopped == 1 and seq.fired == 1        # stopped THEN fired (one On Pulse)
+    ed.fire()
+    assert seq.stopped == 2 and seq.fired == 2        # a second On Pulse stops again first
+
+
+def test_on_pulse_after_moving_a_scan_slot_uploads_the_current_ui_table(_app):
+    """Move the scan slot to a different period, then On Pulse directly (no manual Stop, no re-run of
+    the scan points): the uploaded program must target the MOVED slot and carry the real, DISTINCT
+    scan points -- not a stale/degenerate table left from the old binding."""
+    seq = _RecordingSeq()
+    ed = _three_period_scan_editor(seq)
+
+    # move the slot: unbind period-0's duration, bind period-2's -- the exact "change the scan slot's
+    # position" the user does in the Edit tab (here via the state the read_state/load_state cycle uses).
+    st = ed.read_state(); st.unbind_slot(0); ed.state = st; ed.load_state(st)
+    st2 = ed.read_state(); st2.bind_field("duration", "2", unit="us"); ed.state = st2; ed.load_state(st2)
+
+    ed.fire()                                         # On Pulse directly, no manual re-run
+    payload = seq.prepared[-1]
+    assert [(s.kind, s.target) for s in payload.scan_slots] == [("duration", "2")]   # the MOVED slot
+    # the real distinct sweep survived the move (not [[nominal],[nominal],[nominal]])
+    assert len({tuple(row) for row in payload.scan_table}) > 1
+    assert seq.stopped >= 1                           # it stopped before re-uploading + firing
