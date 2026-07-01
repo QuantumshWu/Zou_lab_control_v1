@@ -4574,6 +4574,77 @@ class PanelEditor(QtWidgets.QWidget):
             upstream[str(sig)] = src_prov
         return upstream
 
+    def _signals_for_save(self) -> dict[str, dict]:
+        """The RAW native hub blocks this panel actually consumes, keyed by bare name, folded into the
+        saved ``info['signals']`` so ``load_figure(...)`` can REBUILD every panel kind losslessly -- most
+        importantly a site map, whose 2-D underlay FRAME (`frame_judged`) and per-site `centers` are NOT
+        recoverable from the flat ``data_x``/``data_y`` a scatter plot saves (that dropped the frame, so a
+        reloaded site map could not be redrawn).
+
+        Roles resolved off the ONE producing node of the panel's first input (same node the site-map
+        wiring / provenance already use -- ``console._node_for_signal(inputs[0])``):
+          * ``value``   = the panel's own signal (``inputs[0]``);
+          * ``x``       = its companion x-axis signal for a 1-D curve (``node.x_signal``);
+          * ``centers`` = the node's site-centre output (``prefix + sitemap_centers_key``);
+          * ``frame``   = the node's underlay-image output (``prefix + sitemap_image_key``).
+        Each role stores the CURRENT native block (``hub.latest`` -- a copy of the raw, un-reshaped array)
+        plus the ``SignalSpec``'s ``points_shape``/``data_shape``/``label``/``unit`` (via
+        ``node.signal_spec``), so the reloader has the same contract metadata the live panel had.  A missing
+        role (no such signal / not on the hub / no producing node) is simply SKIPPED -- a save never fails
+        for a role it cannot resolve, and only the ``signals`` key is added (data_x/data_y unchanged =
+        backward compatible)."""
+        inputs = list(self.card.config.inputs or [])
+        if not inputs or not inputs[0]:
+            return {}
+        node = self.console._node_for_signal(inputs[0])
+        if node is None:
+            return {}
+        prefix = str(getattr(node, "prefix", "") or "")
+        centers_key = str(getattr(node, "sitemap_centers_key", "") or "")
+        image_key = str(getattr(node, "sitemap_image_key", "") or "")
+        # (role, full hub name) -- only the roles that resolve to a name; the rest never enter the loop.
+        roles: list[tuple[str, str]] = [("value", str(inputs[0]))]
+        x_full = str(getattr(node, "x_signal", "") or "")
+        if x_full:
+            roles.append(("x", x_full))
+        if centers_key:
+            roles.append(("centers", prefix + centers_key))
+        if image_key:
+            roles.append(("frame", prefix + image_key))
+
+        signals: dict[str, dict] = {}
+        for role, full in roles:
+            if not full:
+                continue
+            try:
+                block = self.console.hub.latest(full)          # raw native block (a copy), un-reshaped
+            except Exception:
+                continue                                       # signal not on the hub right now -> skip role
+            bare = full[len(prefix):] if prefix and full.startswith(prefix) else full
+            # One SIGNAL can fill two roles (a 2-D camera panel whose ``value`` IS the underlay
+            # ``frame``: inputs[0] == sitemap_image_key).  ``roles`` lists ``value`` FIRST, so the
+            # first writer wins -- keep ``value`` (the panel's own data, what the reloaded plot draws)
+            # and skip the later same-signal ``frame`` rather than clobbering it to role="frame"
+            # (which dropped fig_value and left the reloaded 2-D panel with nothing to plot).
+            if bare in signals:
+                continue
+            spec = None
+            try:
+                spec = node.signal_spec(full)
+            except Exception:
+                spec = None
+            ps = tuple(spec.points_shape) if (spec is not None and spec.points_shape is not None) else None
+            ds = tuple(spec.data_shape) if (spec is not None and spec.data_shape is not None) else None
+            signals[bare] = {
+                "block": np.asarray(block),
+                "points_shape": ps,
+                "data_shape": ds,
+                "label": str(getattr(spec, "label", "") or "") if spec is not None else "",
+                "unit": str(getattr(spec, "unit", "") or "") if spec is not None else "",
+                "role": role,
+            }
+        return signals
+
     def save(self) -> None:
         if self._plotter is None:
             return
@@ -4588,7 +4659,8 @@ class PanelEditor(QtWidgets.QWidget):
                                       "kind": self.card.config.kind,
                                       "size": self.card.config.size,
                                       "view": self._save_view_state(),
-                                      "provenance": self._provenance_for_save()})
+                                      "provenance": self._provenance_for_save(),
+                                      "signals": self._signals_for_save()})
             self.console._last_save_dir = str(stem.parent)   # remember where (kernel session)
             self._update_save_preview()
             # Show the LEAF folder, not the full absolute path (the full path is one click away in the
@@ -4821,11 +4893,19 @@ class TaskConsole(QtWidgets.QWidget):
         scale: float | None = None,
         window_ratio: float = WINDOW_SCREEN_FRACTION,
         window_px: tuple[int, int] | None = None,
+        embedded: bool = False,
     ):
         ensure_qt_app()
         set_fluent_scale(scale)
         super().__init__()
         self.hub = hub
+        # EMBEDDED mode (the figure viewer hosts a whole TaskConsole in one pane): a stripped,
+        # RESIZABLE console -- no Logic tab, no whole-board Pause/Save image/Save/Load buttons (a
+        # loaded static figure has nothing to acquire, freeze, or persist as a layout) -- and, crucially,
+        # NOT size-frozen: the parent layout stretches it so the gravity board reads the REAL viewport
+        # width and reflows into 2+ columns.  Standalone (embedded=False) behaviour is byte-for-byte
+        # unchanged.  The four omitted buttons are set to None so every reference guards on existence.
+        self.embedded = bool(embedded)
         # Nodes that are CURRENTLY running (their owner thread is publishing to
         # the hub).  Populated on Start (``_start_logic_node``) and drained on Stop;
         # an externally-supplied, already-running node may be adopted here too.
@@ -4913,7 +4993,15 @@ class TaskConsole(QtWidgets.QWidget):
     def _build_ui(self) -> None:
         self.setWindowTitle("TaskConsole@Zou lab")
         self.setStyleSheet(fluent_widget_stylesheet())
-        self.setFixedSize(self._target_console_size())
+        # Standalone: a fixed window (the shared GUI sizing rule).  EMBEDDED: the parent (the figure
+        # viewer's right pane) owns the size, so we set only a MINIMUM and expand into whatever the
+        # layout gives -- that lets the gravity board read the live viewport width and reflow into
+        # multiple columns instead of being pinned to a frozen width that stacks every card in one column.
+        if self.embedded:
+            self.setMinimumSize(self._target_console_size())
+            self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        else:
+            self.setFixedSize(self._target_console_size())
         root = QtWidgets.QVBoxLayout(self)
         margin = scaled_px(14)
         root.setContentsMargins(margin, scaled_px(8), margin, scaled_px(8))
@@ -4974,28 +5062,42 @@ class TaskConsole(QtWidgets.QWidget):
         self.kind_combo.setFixedWidth(scaled_px(170, minimum=130))
         add_button = FluentButton("Add Panel", color=ACCENT)
         add_button.clicked.connect(self._add_panel)
-        self.save_button = FluentButton("Save", color=ACCENT)
-        self.save_button.clicked.connect(self.save_to_file)
-        load_button = FluentButton("Load", color=ORANGE)
-        load_button.clicked.connect(self.load_from_file)
-        # Whole-monitor controls: Pause/Resume freezes/unfreezes EVERY plot at once (a display
-        # freeze -- acquisition keeps running); Save image grabs the WHOLE board region to a PNG.
-        self.pause_button = FluentButton("Pause", color=ORANGE)
-        self.pause_button.clicked.connect(self._toggle_pause)
-        self.save_image_button = FluentButton("Save image", color=ACCENT)
-        self.save_image_button.clicked.connect(self._save_board_image)
+        # Whole-console layout + monitor controls: Save/Load persist the LAYOUT (json); Pause/Resume
+        # freezes every plot at once (a display freeze -- acquisition keeps running); Save image grabs
+        # the WHOLE board region to a PNG.  EMBEDDED (figure-viewer host) has nothing to acquire, freeze
+        # or persist as a standalone layout, so all four are OMITTED -- set to None so every reference
+        # (``_lockable_header``, ``_mark_dirty``, ``_toggle_pause`` ...) guards on existence.
+        if self.embedded:
+            self.save_button = None
+            load_button = None
+            self.pause_button = None
+            self.save_image_button = None
+        else:
+            self.save_button = FluentButton("Save", color=ACCENT)
+            self.save_button.clicked.connect(self.save_to_file)
+            load_button = FluentButton("Load", color=ORANGE)
+            load_button.clicked.connect(self.load_from_file)
+            self.pause_button = FluentButton("Pause", color=ORANGE)
+            self.pause_button.clicked.connect(self._toggle_pause)
+            self.save_image_button = FluentButton("Save image", color=ACCENT)
+            self.save_image_button.clicked.connect(self._save_board_image)
 
         for widget in (self.status_dot, self.name_edit):
             header.addWidget(widget)
         header.addWidget(self.summary, 1)
-        for widget in (self.kind_combo, add_button,
-                       self.pause_button, self.save_image_button, self.save_button, load_button):
-            header.addWidget(widget)
+        # Add Panel stays even when embedded (a loaded figure is re-wired + extra panels added), the
+        # four whole-console buttons only when they exist.
+        for widget in (self.kind_combo, add_button, self.pause_button,
+                       self.save_image_button, self.save_button, load_button):
+            if widget is not None:
+                header.addWidget(widget)
         # header controls disabled while a task runs (the lockout, #5); kept as a group
         # so ``_set_task_running`` flips them all at once.  Pause stays OUT of the lockout (you may
         # want to freeze the display even mid-task); Save image is locked like the other mutators.
-        self._lockable_header = (self.kind_combo, add_button, self.save_image_button,
-                                 self.save_button, load_button, self.name_edit)
+        # None entries (embedded: the button was never made) are dropped so the lockout loop is safe.
+        self._lockable_header = tuple(w for w in (self.kind_combo, add_button, self.save_image_button,
+                                                  self.save_button, load_button, self.name_edit)
+                                      if w is not None)
         root.addWidget(header_frame)
 
         # Running-task LOCKOUT banner (confocal-style): a prominent strip shown ONLY
@@ -5043,31 +5145,38 @@ class TaskConsole(QtWidgets.QWidget):
         self.scroll.viewport().installEventFilter(self)
         self.tabs.add_permanent_tab(dash_tab, "Monitor")
 
-        # Logic tab: a scrolled top-packed column of LogicNodeRow cards.
-        logic_tab = QtWidgets.QWidget()
-        logic_tab.setStyleSheet("background: transparent;")
-        logic_outer = QtWidgets.QVBoxLayout(logic_tab)
-        logic_outer.setContentsMargins(0, 0, 0, 0)
-        self.logic_scroll = FluentScrollArea()
-        self.logic_scroll.setWidgetResizable(True)
-        self.logic_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)   # #2: never scroll sideways
-        self.logic_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
-        logic_body = QtWidgets.QWidget()
-        logic_body.setStyleSheet("background: transparent;")
-        self.logic_layout = QtWidgets.QVBoxLayout(logic_body)
-        lm = scaled_px(10, minimum=6)
-        self.logic_layout.setContentsMargins(lm, lm, lm, lm)
-        self.logic_layout.setSpacing(scaled_px(8, minimum=5))
-        self.logic_hint = FluentLabel(
-            "No logic nodes yet.  Add a Measurement / Processor / Task from the header "
-            "(it starts STOPPED); open its Edit to set parameters and Start it.")
-        self.logic_hint.setWordWrap(True)
-        self.logic_hint.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
-        self.logic_layout.addWidget(self.logic_hint)
-        self.logic_layout.addStretch(1)
-        self.logic_scroll.setWidget(logic_body)
-        logic_outer.addWidget(self.logic_scroll, 1)
-        self.tabs.add_permanent_tab(logic_tab, "Logic")
+        # Logic tab: a scrolled top-packed column of LogicNodeRow cards.  OMITTED when embedded (the
+        # figure viewer hosts pure VIEWS of a loaded static figure -- no acquisition logic to run), so
+        # ``logic_scroll`` / ``logic_layout`` / ``logic_hint`` stay None and their few users guard.
+        if self.embedded:
+            self.logic_scroll = None
+            self.logic_layout = None
+            self.logic_hint = None
+        else:
+            logic_tab = QtWidgets.QWidget()
+            logic_tab.setStyleSheet("background: transparent;")
+            logic_outer = QtWidgets.QVBoxLayout(logic_tab)
+            logic_outer.setContentsMargins(0, 0, 0, 0)
+            self.logic_scroll = FluentScrollArea()
+            self.logic_scroll.setWidgetResizable(True)
+            self.logic_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)   # #2: never scroll sideways
+            self.logic_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+            logic_body = QtWidgets.QWidget()
+            logic_body.setStyleSheet("background: transparent;")
+            self.logic_layout = QtWidgets.QVBoxLayout(logic_body)
+            lm = scaled_px(10, minimum=6)
+            self.logic_layout.setContentsMargins(lm, lm, lm, lm)
+            self.logic_layout.setSpacing(scaled_px(8, minimum=5))
+            self.logic_hint = FluentLabel(
+                "No logic nodes yet.  Add a Measurement / Processor / Task from the header "
+                "(it starts STOPPED); open its Edit to set parameters and Start it.")
+            self.logic_hint.setWordWrap(True)
+            self.logic_hint.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
+            self.logic_layout.addWidget(self.logic_hint)
+            self.logic_layout.addStretch(1)
+            self.logic_scroll.setWidget(logic_body)
+            logic_outer.addWidget(self.logic_scroll, 1)
+            self.tabs.add_permanent_tab(logic_tab, "Logic")
 
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.tabs.tab_close_requested.connect(self._on_editor_tab_closed)
@@ -5839,8 +5948,12 @@ class TaskConsole(QtWidgets.QWidget):
             k += 1
         return prefix
 
-    def _attach_logic_node(self, node: LogicNodeConfig, *, focus: bool = False) -> "LogicNodeRow":
-        """Add a STOPPED logic-node row to the Logic tab (no node built yet)."""
+    def _attach_logic_node(self, node: LogicNodeConfig, *, focus: bool = False) -> "LogicNodeRow | None":
+        """Add a STOPPED logic-node row to the Logic tab (no node built yet).  A NO-OP when embedded:
+        the figure viewer has no Logic tab (``logic_layout`` is None), so there is nowhere to host the
+        row -- the console is a pure view host, its acquisition is whatever produced the loaded figure."""
+        if self.logic_layout is None:                        # embedded: no Logic tab to attach to
+            return None
         node.title = self._unique_logic_title(node.title)   # distinct rows + distinct signal prefixes
         row = LogicNodeRow(node)
         row.edit_requested.connect(self._edit_logic_node)
@@ -6249,7 +6362,8 @@ class TaskConsole(QtWidgets.QWidget):
     def _mark_dirty(self, *_args) -> None:
         if self._building:
             return
-        self.save_button.set_dirty(True, dirty_color=YELLOW)
+        if self.save_button is not None:            # embedded: no layout Save button to flag dirty
+            self.save_button.set_dirty(True, dirty_color=YELLOW)
         self._update_summary()
 
     # ------------------------------------------------------------------ refresh
@@ -6477,7 +6591,8 @@ class TaskConsole(QtWidgets.QWidget):
                 return
             state.save(path)
             self._address = path
-            self.save_button.set_dirty(False)
+            if self.save_button is not None:
+                self.save_button.set_dirty(False)
             self._message(f"Saved: {path}")
         except Exception as exc:
             self._message(f"Save failed: {exc}")
@@ -6493,7 +6608,8 @@ class TaskConsole(QtWidgets.QWidget):
             state = TaskConsoleState.load(path)
             self._address = path
             self.load_state(state)
-            self.save_button.set_dirty(False)
+            if self.save_button is not None:
+                self.save_button.set_dirty(False)
         except Exception as exc:
             self._message(f"Load failed: {exc}")
 

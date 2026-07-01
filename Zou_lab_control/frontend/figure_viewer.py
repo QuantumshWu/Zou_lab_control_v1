@@ -5,19 +5,26 @@ next to its ``.png`` (see :meth:`~.data_figure.DataFigure.save`).  This window i
 counterpart of the notebook one-liner ``na.load_figure('scan.npz')`` -- but instead of a bespoke
 viewer, the loaded figure becomes ONE hub SIGNAL and the whole reuse is the Task console board:
 
-* a :class:`LoadedFigureNode` publishes the saved arrays as a static hub signal (``fig_value`` plus,
-  for a 1-D save, its companion ``fig_x``; for a site map, its ``fig_centers``), declaring the SAME
-  ``output_specs`` / ``published_signals`` / ``x_signal`` / ``sitemap_*`` a live producer does -- so a
-  panel wired to it reads the right axis label, unit and x-coordinates;
+* a :class:`LoadedFigureNode` publishes the saved data as static hub signals (``fig_value`` plus, for a
+  1-D save its companion ``fig_x``; for a site map its ``fig_centers`` and ``fig_frame`` underlay),
+  declaring the SAME ``output_specs`` / ``published_signals`` / ``x_signal`` / ``sitemap_*`` a live
+  producer does -- so a panel wired to it reads the right axis label, unit, x-coordinates AND the
+  site-map background frame.  A new save records the full producer blocks under ``info['signals']`` (each
+  a native ``(repeat, *points, *data)`` array + ``points_shape`` / ``data_shape`` + a ``role``), which
+  the node re-publishes VERBATIM (a faithful round-trip); an old npz with no ``info['signals']`` falls
+  back to inferring the blocks from ``data_x`` / ``data_y`` (a site map then has rings but no frame);
 * the window SEEDS one panel with the SAVED ``kind`` + ``view`` (``PanelConfig(kind=sf.kind,
   source="value = fig_value", params=sf.info["view"])``) so it opens reproducing the original figure;
 * the panel lives on a real :class:`~.task_console.TaskConsole`, so the user gets the board, Add Panel,
   the signal picker, re-wiring and the light processing for free -- add MORE panels reading the same
   ``fig_value`` under a different kind, or fit / relim / re-save through the panel's own Edit tab.
 
-A read-only **Info** column on the left lists EVERY key the npz stored (name / source / kind / labels /
-unit / shapes / points / saved / the view sub-dict / any fit) plus the raw ``info`` dict verbatim, so
-"what is in this file" is always fully visible next to the board.
+A read-only **Info** column on the left lists EVERY key the npz stored, grouped into tabs -- **Plot**
+(name / kind / labels / unit / saved / the view sub-dict / any fit), **Measurement** (source / data_x /
+data_y shapes / points / repeat / the stored signal blocks), **Device** (the run's provenance expanded
+per device) and **Raw** (the whole ``info`` dict verbatim, multi-line + scrollable) -- so "what is in
+this file" is always fully visible next to the board.  Browse (or typing a valid ``.npz`` path) loads it
+automatically -- there is no separate Load button.
 
 It is session-INDEPENDENT: it only reads a file, no hardware, no acquisition -- the ``LoadedFigureNode``
 re-publishes the same stored arrays every shot.  The window chrome (Fluent frameless shell, one shared
@@ -44,7 +51,7 @@ from .task_console import (
 )
 from .qt_fluent import (
     GREY,
-    FluentButton,
+    FluentCodeEdit,
     FluentFrame,
     FluentLabel,
     FluentPathEdit,
@@ -52,6 +59,7 @@ from .qt_fluent import (
     FluentScrollArea,
     FluentSectionLabel,
     FluentSettingRow,
+    FluentTabWidget,
     FluentWindow,
     WINDOW_SCREEN_FRACTION,
     center_window_on_primary_screen,
@@ -73,10 +81,25 @@ FIG_X_KEY = "x"
 #: The per-tweezer centres signal (site-map saves) -- a site-map panel resolves its ring centres from
 #: this node via ``sitemap_centers_key``.
 FIG_CENTERS_KEY = "centers"
+#: The camera-frame underlay signal (site-map / 2-D saves that stored the judged frame) -- a site-map
+#: panel resolves its BACKGROUND image from this node via ``sitemap_image_key``, exactly as it pulls the
+#: underlay off a live occupancy processor's ``frame_judged``.
+FIG_FRAME_KEY = "frame"
 
-#: The node prefix -- so the published hub names are ``fig_value`` / ``fig_x`` / ``fig_centers`` and the
-#: seeded panel's ``inputs`` name ``fig_value``.
+#: The node prefix -- so the published hub names are ``fig_value`` / ``fig_x`` / ``fig_centers`` /
+#: ``fig_frame`` and the seeded panel's ``inputs`` name ``fig_value``.
 FIG_PREFIX = "fig_"
+
+
+def _as_tuple_or_none(shape) -> tuple | None:
+    """A stored ``points_shape`` / ``data_shape`` (a list from the npz, ``None``, or the illegal empty
+    ``()``) coerced to the ``SignalSpec`` contract: ``None`` (no repeat slot) or a NON-EMPTY tuple.  The
+    empty ``()`` is treated as ``None`` (the iron-law guard rejects it), so a malformed slot degrades to
+    'no contract' rather than raising on load."""
+    if shape is None:
+        return None
+    t = tuple(int(n) for n in shape)
+    return t or None
 
 
 def _kind_label(key: str | None) -> str:
@@ -94,18 +117,25 @@ class LoadedFigureNode(LogicNode):
 
     It is a SOURCE like any live producer -- so a Task-console panel binds to it exactly as it binds
     to a camera / measurement -- except its ``shot()`` returns the SAME saved data every time (a file,
-    not hardware).  The shape it publishes is chosen so the saved ``kind`` REPRODUCES faithfully on a
-    panel wired to ``value``:
+    not hardware).
 
-    * 1-D families (line / rolling trace / distribution): ``value`` = the 1-D ``data_y`` column, plus a
-      companion ``x`` = the 1-D ``data_x`` column, with ``x_signal`` / ``y_signal`` / ``output_specs``
-      set so a 1-D panel draws the curve vs the saved x with the saved x-axis label + unit;
-    * 2-D image: ``value`` = the ``(H, W)`` frame reshaped from ``data_y`` over the ``(N, 2)`` scan grid;
-    * site map: ``value`` = the per-site ``data_y`` vector and ``centers`` = the ``(N, 2)`` ``data_x``
-      centres, with ``sitemap_centers_key`` so the panel resolves the rings from this node.
+    **Faithful path (new npz that stored ``info['signals']``).**  A save now records the FULL producer
+    blocks it plotted: for each named signal a ``block`` (its native ``(repeat, *points, *data)`` array),
+    its ``points_shape`` / ``data_shape`` and a ``role`` (``value`` / ``x`` / ``centers`` / ``frame``).
+    This node re-publishes each block **verbatim** under its own bare name and declares the SAME
+    ``SignalSpec`` (with the stored contract), then wires by role exactly as a live producer:
 
-    Every output carries ``points_shape``/``data_shape`` = ``None`` (no repeat contract): the saved
-    figure is a single static block, so a panel plots it verbatim (no repeat-axis reduction)."""
+    * ``value`` -> the primary signal (published under ``value`` so a panel seeded ``value = fig_value``
+      binds to it) + ``y_signal`` -- because the block declares its structure, the panel's identity
+      short-circuit reduces the repeat axis correctly (no bespoke reshape here);
+    * ``x`` -> the companion 1-D curve x (``x_signal``);
+    * ``centers`` -> ``sitemap_centers_key`` (the rings);
+    * ``frame`` -> ``sitemap_image_key`` -- so a site-map save gets its BACKGROUND camera frame back
+      (the underlay the live occupancy panel had), not a bare ring plot.
+
+    **Fallback path (old npz with no ``info['signals']``).**  Only ``data_x`` / ``data_y`` were stored,
+    so the node infers a static single-block ``value`` (+ ``x`` for 1-D, ``centers`` for a site map) from
+    the arrays; a site map then shows rings + occupancy with NO background image (nothing was stored)."""
 
     layer = "figure"
 
@@ -125,18 +155,76 @@ class LoadedFigureNode(LogicNode):
         self._xlabel = str(labels[0]) if len(labels) > 0 else "X"
         self._ylabel = str(labels[1]) if len(labels) > 1 else "Y"
 
-        # Resolve the arrays each kind's panel consumes.
-        self._value: np.ndarray
-        self._x: np.ndarray | None = None
-        self._centers: np.ndarray | None = None
+        # bare key -> (block, SignalSpec) for every signal this node publishes, in publish order.  The
+        # faithful path fills it from the stored ``info['signals']``; the fallback synthesises value/x/
+        # centres from data_x/data_y.  ``_role_key`` maps each role to the bare key it landed on.
+        self._blocks: dict[str, np.ndarray] = {}
+        self._specs: dict[str, SignalSpec] = {}
+        self._role_key: dict[str, str] = {}
+
+        stored = saved.info.get("signals")
+        if isinstance(stored, Mapping) and stored:
+            self._build_from_signals(stored)
+        else:
+            self._build_from_arrays(kind, data_x, data_y)
+
+    # ------------------------------------------------------- faithful (info['signals'])
+    def _build_from_signals(self, stored: Mapping) -> None:
+        """Re-publish each stored signal's ``block`` VERBATIM under a role-fixed bare key
+        (``value`` / ``x`` / ``centers`` / ``frame``) with its stored ``points_shape`` / ``data_shape``.
+
+        The role -> bare-key mapping is fixed (``value`` -> ``value`` so a panel seeded ``value =
+        fig_value`` binds regardless of the original signal's name), so the seeded panel + the sitemap /
+        curve wiring resolve off THIS node exactly as they do off the live producer that made the save."""
+        role_to_key = {"value": FIG_VALUE_KEY, "x": FIG_X_KEY,
+                       "centers": FIG_CENTERS_KEY, "frame": FIG_FRAME_KEY}
+        for name, entry in stored.items():
+            if not isinstance(entry, Mapping):
+                continue
+            role = str(entry.get("role") or ("value" if "value" not in self._role_key else ""))
+            bare = role_to_key.get(role)
+            if bare is None or bare in self._blocks:
+                continue
+            block = np.asarray(entry.get("block"))
+            label = str(entry.get("label") or (self._ylabel if role == "value" else name))
+            unit = str(entry.get("unit") or "")
+            ps = _as_tuple_or_none(entry.get("points_shape"))
+            ds = _as_tuple_or_none(entry.get("data_shape"))
+            self._blocks[bare] = block
+            self._specs[bare] = SignalSpec(self.prefix + bare, label, unit,
+                                           f"the saved figure's {role} block ({name})",
+                                           points_shape=ps, data_shape=ds)
+            self._role_key[role] = bare
+        # A save must carry a value block; if none was tagged, promote the first stored entry so the
+        # window still opens with a reproduction rather than an empty board.
+        if FIG_VALUE_KEY not in self._blocks and self._blocks:
+            first = next(iter(self._blocks))
+            self._role_key["value"] = first
+
+    # ------------------------------------------------------- fallback (data_x / data_y only)
+    def _build_from_arrays(self, kind: str, data_x: np.ndarray, data_y: np.ndarray) -> None:
+        """Old-npz path: infer a static single-block ``value`` (+ ``x`` / ``centers``) from the raw
+        arrays, each with ``points_shape`` / ``data_shape`` = ``None`` (no repeat contract) so a panel
+        plots it verbatim.  A site map here has NO frame (none was stored) -- rings + occupancy only."""
+        def add(bare: str, block: np.ndarray, label: str, unit: str, desc: str, role: str) -> None:
+            self._blocks[bare] = np.asarray(block, dtype=float)
+            self._specs[bare] = SignalSpec(self.prefix + bare, label, unit, desc)
+            self._role_key[role] = bare
+
         if kind in ("2d",):
-            self._value = self._as_image(data_x, data_y)
+            add(FIG_VALUE_KEY, self._as_image(data_x, data_y), self._ylabel, "",
+                "the saved figure's primary data (data_y)", "value")
         elif kind in ("sites",):
-            self._value = self._first_column(data_y)
-            self._centers = data_x[:, :2] if (data_x.ndim == 2 and data_x.shape[1] >= 2) else None
+            add(FIG_VALUE_KEY, self._first_column(data_y), self._ylabel, "",
+                "the saved figure's primary data (data_y)", "value")
+            if data_x.ndim == 2 and data_x.shape[1] >= 2:
+                add(FIG_CENTERS_KEY, data_x[:, :2], "site centres", "px",
+                    "per-tweezer (N, 2) camera-pixel centres (data_x)", "centers")
         else:  # 1d / monitor / hist and any 1-D family
-            self._value = self._first_column(data_y)
-            self._x = self._first_column(data_x)
+            add(FIG_VALUE_KEY, self._first_column(data_y), self._ylabel, "",
+                "the saved figure's primary data (data_y)", "value")
+            add(FIG_X_KEY, self._first_column(data_x), self._xlabel, "",
+                "the saved figure's x axis (data_x)", "x")
 
     # ---------------------------------------------------------------- shaping
     @staticmethod
@@ -166,12 +254,16 @@ class LoadedFigureNode(LogicNode):
     def sitemap_centers_key(self) -> str:
         """The BARE centres key a site-map panel resolves from this node (the console prepends the
         node prefix, exactly as it does for a Judge-occupancy processor's ``"centers"``) -- present
-        only for a site-map save, else blank so the console skips this node for a site-map underlay."""
-        return FIG_CENTERS_KEY if self._centers is not None else ""
+        only when a centres block was stored, else blank so the console skips this node for rings."""
+        return self._role_key.get("centers", "")
 
-    #: A saved figure carries no camera frame underlay (the npz stores only data_x/data_y), so the
-    #: site map shows rings + occupancy with no background image.
-    sitemap_image_key = ""
+    @property
+    def sitemap_image_key(self) -> str:
+        """The BARE camera-frame key a site-map panel resolves its BACKGROUND underlay from (the console
+        prepends the prefix, exactly as it does for a live occupancy processor's ``frame_judged``) --
+        present only when a frame block was stored (new npz), else blank so an OLD site-map save shows
+        rings + occupancy with no background image (nothing was stored to draw)."""
+        return self._role_key.get("frame", "")
 
     # --------------------------------------------------------- scan-curve wiring
     @property
@@ -179,41 +271,24 @@ class LoadedFigureNode(LogicNode):
         """The companion x-axis signal a 1-D panel draws its curve against (the console's
         ``curve_x_provider`` matches ``y_signal`` -> ``x_signal``).  Blank when there is no x
         (a 2-D / site-map save)."""
-        return (self.prefix + FIG_X_KEY) if self._x is not None else ""
+        xk = self._role_key.get("x")
+        return (self.prefix + xk) if xk else ""
 
     @property
     def y_signal(self) -> str:
-        return self.prefix + FIG_VALUE_KEY
+        return self.prefix + self._role_key.get("value", FIG_VALUE_KEY)
 
     # ------------------------------------------------------------- hub contract
     def published_signals(self) -> frozenset:
-        keys = [self.prefix + FIG_VALUE_KEY]
-        if self._x is not None:
-            keys.append(self.prefix + FIG_X_KEY)
-        if self._centers is not None:
-            keys.append(self.prefix + FIG_CENTERS_KEY)
-        return frozenset(keys)
+        return frozenset(self.prefix + bare for bare in self._blocks)
 
     def output_specs(self) -> tuple[SignalSpec, ...]:
-        # points_shape/data_shape=None: a static, single-block figure carries NO repeat axis, so a
-        # panel plots ``value`` verbatim (the identity ``value = signal`` short-circuit).
-        specs = [SignalSpec(self.prefix + FIG_VALUE_KEY, self._ylabel, "",
-                            "the saved figure's primary data (data_y)")]
-        if self._x is not None:
-            specs.append(SignalSpec(self.prefix + FIG_X_KEY, self._xlabel, "",
-                                    "the saved figure's x axis (data_x)"))
-        if self._centers is not None:
-            specs.append(SignalSpec(self.prefix + FIG_CENTERS_KEY, "site centres", "px",
-                                    "per-tweezer (N, 2) camera-pixel centres (data_x)"))
-        return tuple(specs)
+        return tuple(self._specs[bare] for bare in self._blocks)
 
     def shot(self) -> dict[str, object]:
-        out: dict[str, object] = {FIG_VALUE_KEY: np.array(self._value, dtype=float)}
-        if self._x is not None:
-            out[FIG_X_KEY] = np.array(self._x, dtype=float)
-        if self._centers is not None:
-            out[FIG_CENTERS_KEY] = np.array(self._centers, dtype=float)
-        return out
+        # Publish each stored block VERBATIM (the faithful path relies on the panel's identity
+        # short-circuit reading the declared points_shape/data_shape, not a reshape here).
+        return {bare: np.array(block) for bare, block in self._blocks.items()}
 
 
 def _seed_state(saved: SavedFigure) -> TaskConsoleState:
@@ -241,10 +316,15 @@ def _seed_state(saved: SavedFigure) -> TaskConsoleState:
 class FigureViewer(QtWidgets.QWidget):
     """The reopen-into-the-console body (wrapped in a :class:`FluentWindow` by :func:`show_figure_viewer`).
 
-    Left:  a read-only **Info** column -- a path field + Load, then one row per stored fact and the raw
-           ``info`` dict, so the whole npz is visible next to the board.
-    Right: a live :class:`~.task_console.TaskConsole` whose seeded panel reproduces the saved figure and
-           on which the user can Add more panels / re-wire / process the loaded ``fig_value`` signal.
+    Left:  a read-only **Info** column -- a path field (Browse auto-loads a picked ``.npz``, no Load
+           button) over a TAB set that groups the stored facts: **Plot** (how it draws) / **Measurement**
+           (its data shapes / source / stored signal blocks) / **Device** (the run's provenance) / **Raw**
+           (the whole ``info`` dict, multi-line + scrollable), so the entire npz is visible next to the
+           board without one crushed column.
+    Right: a live embedded :class:`~.task_console.TaskConsole` (size-Expanding, so it FILLS the pane and
+           reflows into 2+ columns) whose seeded panel reproduces the saved figure and on which the user
+           can Add more panels / re-wire / process the loaded ``fig_value`` signal.  The Info card and the
+           console share one root layout with equal margins + spacing, so their outer edges line up.
     """
 
     def __init__(self, path: str | Path | None = None, *, scale: float | None = None,
@@ -264,21 +344,30 @@ class FigureViewer(QtWidgets.QWidget):
 
         self._label_w = setting_label_width(
             ["name", "source", "kind", "labels", "unit", "data_x", "data_y",
-             "points", "repeat", "saved", "view", "fit", "path"])
+             "points", "repeat", "saved", "view", "fit", "path", "signals"])
         # The fixed Info-column width; the console is sized to fill the REST of the screen budget beside
-        # it (so the whole window stays within the shared screen-fraction rule, no board clipping).
-        self._info_col_w = self._label_w + scaled_px(230, minimum=170)
+        # it (so the whole window stays within the shared screen-fraction rule, no board clipping).  The
+        # column is WIDER than a single-row form (the tabbed facts + multi-line raw dict need room to
+        # breathe) so a long label/value is not crushed into an ellipsis.
+        self._info_col_w = self._label_w + scaled_px(320, minimum=240)
         self._root_margin = scaled_px(10, minimum=6)
 
+        # ONE root QHBoxLayout holding the Info card and the console holder with the SAME contents
+        # margins + spacing, so the two frames' outer edges (top / bottom / sides) line up exactly --
+        # the core alignment rule (no per-frame margin fudging).
         root = QtWidgets.QHBoxLayout(self)
         m = self._root_margin
         root.setContentsMargins(m, m, m, m)
         root.setSpacing(self._root_margin)
         root.addWidget(self._build_info_column(), 0)
+        # The console holder STRETCHES (stretch = 1): the embedded TaskConsole is size-Expanding, so it
+        # fills the whole right pane and its gravity board reads the real viewport width -> reflows into
+        # 2+ columns (vs a frozen-width console that stacks every card in one column).
         self._console_holder = QtWidgets.QVBoxLayout()
         self._console_holder.setContentsMargins(0, 0, 0, 0)
         holder_host = QtWidgets.QWidget()
         holder_host.setStyleSheet("background: transparent;")
+        holder_host.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         holder_host.setLayout(self._console_holder)
         root.addWidget(holder_host, 1)
 
@@ -301,41 +390,30 @@ class FigureViewer(QtWidgets.QWidget):
         lay.setContentsMargins(pad, pad, pad, pad)
         lay.setSpacing(scaled_px(6, minimum=4))
 
-        # --- File: path field + Load ------------------------------------------
+        # --- File: path field -- Browse (or typing a valid .npz) AUTO-LOADS ----------------
+        # No separate Load button: FluentPathEdit.changed(str) fires when Browse picks a file (or the
+        # user finishes typing one) and _on_path_changed loads it if it is an existing .npz -- one action.
         lay.addWidget(FluentSectionLabel("File"))
         self.path_edit = FluentPathEdit(
             "", mode="file", caption="Open a saved figure (.npz)",
             file_filter="Saved figures (*.npz);;All files (*)")
-        self.path_edit.setToolTip("A saved figure .npz -- type a path or Browse, then Load.")
+        self.path_edit.setToolTip("A saved figure .npz -- Browse (or type a full path) and it loads onto "
+                                  "the board automatically.")
+        self.path_edit.changed.connect(self._on_path_changed)
         lay.addWidget(FluentSettingRow("path", self.path_edit, label_width=self._label_w))
-        self.load_button = FluentButton("Load", color=GREY)
-        self.load_button.setToolTip("Load the .npz into the console (its data becomes the fig_value signal).")
-        self.load_button.clicked.connect(self._on_load_clicked)
-        load_row = QtWidgets.QHBoxLayout()
-        load_row.setContentsMargins(0, 0, 0, 0)
-        load_row.addWidget(self.load_button, 0)
-        load_row.addStretch(1)
-        lay.addLayout(load_row)
 
-        # --- Info: one row per stored fact ------------------------------------
-        lay.addWidget(FluentSectionLabel("Info"))
-        info_scroll = FluentScrollArea()
-        info_scroll.setWidgetResizable(True)
-        info_body = QtWidgets.QWidget()
-        info_body.setStyleSheet("background: transparent;")
-        self.info_layout = QtWidgets.QVBoxLayout(info_body)
-        self.info_layout.setContentsMargins(0, 0, 0, 0)
-        self.info_layout.setSpacing(scaled_px(3, minimum=2))
-        self.info_layout.setAlignment(QtCore.Qt.AlignTop)
-        info_scroll.setWidget(info_body)
-        lay.addWidget(info_scroll, 1)
-
-        # Raw info: EVERY key the npz stored, verbatim.
-        lay.addWidget(FluentSectionLabel("Raw info"))
-        self.raw_info = FluentReadoutEdit("")
-        self.raw_info.setToolTip("The full info dict stored in the npz -- read-only, select to copy.")
-        self.raw_info.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
-        lay.addWidget(self.raw_info)
+        # --- Info tabs: Plot | Measurement | Device | Raw -----------------------------------
+        # The facts the npz stored, grouped so a column is not one long crushed list: Plot (how it draws),
+        # Measurement (its data shapes / source), Device (the run's provenance), Raw (the whole dict).
+        self.info_tabs = FluentTabWidget()
+        self.info_tabs.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        self.plot_layout = self._add_rows_tab("Plot")
+        self.meas_layout = self._add_rows_tab("Measurement")
+        # ``info_layout`` is the DEVICE tab body -- the provenance expansion lands here (kept under this
+        # name so _fill_provenance / _add_info_row + the provenance tests read one Info container).
+        self.info_layout = self._add_rows_tab("Device")
+        self.raw_info = self._add_raw_tab("Raw")
+        lay.addWidget(self.info_tabs, 1)
 
         self.status = FluentLabel("Load a saved figure (.npz) to view it on the board.")
         self.status.setStyleSheet(f"color: {GREY}; background: transparent; border: none;")
@@ -343,6 +421,30 @@ class FigureViewer(QtWidgets.QWidget):
         self.status.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
         lay.addWidget(self.status)
         return col
+
+    def _add_rows_tab(self, title: str) -> QtWidgets.QVBoxLayout:
+        """A permanent tab whose body is a top-aligned rows column inside a vertical FluentScrollArea (so
+        a long list of facts scrolls) -- returns the body layout for the filler to add rows to."""
+        scroll = FluentScrollArea()
+        scroll.setWidgetResizable(True)
+        body = QtWidgets.QWidget()
+        body.setStyleSheet("background: transparent;")
+        vbox = QtWidgets.QVBoxLayout(body)
+        vbox.setContentsMargins(scaled_px(6, minimum=4), scaled_px(6, minimum=4),
+                                scaled_px(6, minimum=4), scaled_px(6, minimum=4))
+        vbox.setSpacing(scaled_px(3, minimum=2))
+        vbox.setAlignment(QtCore.Qt.AlignTop)
+        scroll.setWidget(body)
+        self.info_tabs.add_permanent_tab(scroll, title)
+        return vbox
+
+    def _add_raw_tab(self, title: str) -> FluentCodeEdit:
+        """A permanent tab holding a read-only multi-line code editor (its own scrollbars) that shows the
+        WHOLE stored info dict verbatim -- so a long / nested value is fully readable, never truncated."""
+        raw = FluentCodeEdit("", read_only=True)
+        raw.setToolTip("The full info dict stored in the npz -- read-only, select to copy.")
+        self.info_tabs.add_permanent_tab(raw, title)
+        return raw
 
     # -------------------------------------------------------------- public API
     def window(self):
@@ -356,12 +458,16 @@ class FigureViewer(QtWidgets.QWidget):
         self._load_npz(p)
 
     # ------------------------------------------------------------- file / load
-    def _on_load_clicked(self) -> None:
-        text = self.path_edit.text().strip()
-        if not text:
-            self.status.setText("choose a .npz file first")
+    def _on_path_changed(self, text: str) -> None:
+        """Browse (or typed) path -> AUTO-LOAD when it is an existing ``.npz``.  ``changed`` fires on
+        every keystroke too, so we load only a real ``.npz`` file (mid-type garbage / a folder is
+        ignored, no error spam) -- Browse always yields a real file, so picking one loads immediately."""
+        p = Path(str(text).strip())
+        if str(p) in ("", ".") or p.suffix.lower() != ".npz" or not p.is_file():
             return
-        self.open_path(text)
+        if self._current_path is not None and p == self._current_path:
+            return                                       # already loaded (the setText echo below re-fires)
+        self._load_npz(p)
 
     def _load_npz(self, path: Path) -> None:
         path = Path(path)
@@ -380,55 +486,80 @@ class FigureViewer(QtWidgets.QWidget):
             f"loaded {display_path(str(path))} -> fig_value signal; the seeded {saved.kind or 'figure'} "
             "panel reproduces it -- Add Panel to view it another way.")
 
-    def _fill_info(self, saved: SavedFigure) -> None:
-        while self.info_layout.count():
-            item = self.info_layout.takeAt(0)
+    def _clear_layout(self, layout: QtWidgets.QVBoxLayout) -> None:
+        while layout.count():
+            item = layout.takeAt(0)
             w = item.widget()
             if w is not None:
                 w.deleteLater()
+
+    def _fill_info(self, saved: SavedFigure) -> None:
+        for layout in (self.plot_layout, self.meas_layout, self.info_layout):
+            self._clear_layout(layout)
         data_x = np.asarray(saved.data_x)
         data_y = np.asarray(saved.data_y)
-        rows: list[tuple[str, object]] = [
+
+        # --- Plot tab: how the figure DRAWS (kind / labels / unit / view / fit / when saved) ---
+        plot_rows: list[tuple[str, object]] = [
             ("name", saved.name),
-            ("source", saved.info.get("source")),
             ("kind", _kind_label(saved.kind) or saved.kind),
             ("labels", saved.labels),
             ("unit", saved.unit),
-            ("data_x", tuple(data_x.shape)),
-            ("data_y", tuple(data_y.shape)),
-            ("points", saved.info.get("points_done")),
-            ("repeat", saved.info.get("repeat_cur")),
             ("saved", saved.saved_at),
         ]
-        if saved.info.get("size"):
-            rows.append(("size", saved.info.get("size")))
         if saved.view:
             view_bits = ", ".join(f"{k}={v}" for k, v in saved.view.items() if v is not None)
-            rows.append(("view", view_bits or "(defaults)"))
+            plot_rows.append(("view", view_bits or "(defaults)"))
         fit = saved.info.get("fit")
         if isinstance(fit, Mapping) and fit.get("func"):
             pairs = ", ".join(f"{n}={float(v):.5g}"
                               for n, v in zip(fit.get("names", []), fit.get("popt", [])))
-            rows.append(("fit", f"{fit['func']}: {pairs}" if pairs else str(fit["func"])))
+            plot_rows.append(("fit", f"{fit['func']}: {pairs}" if pairs else str(fit["func"])))
+        self._fill_rows(self.plot_layout, plot_rows)
+
+        # --- Measurement tab: the DATA (source / shapes / points / repeat / stored signal blocks) ---
+        meas_rows: list[tuple[str, object]] = [
+            ("source", saved.info.get("source")),
+            ("data_x", tuple(data_x.shape)),
+            ("data_y", tuple(data_y.shape)),
+            ("points", saved.info.get("points_done")),
+            ("repeat", saved.info.get("repeat_cur")),
+        ]
+        if saved.info.get("size"):
+            meas_rows.append(("size", saved.info.get("size")))
+        signals = saved.info.get("signals")
+        if isinstance(signals, Mapping) and signals:
+            bits = ", ".join(
+                f"{name}[{entry.get('role', '?')}]"
+                for name, entry in signals.items() if isinstance(entry, Mapping))
+            meas_rows.append(("signals", bits or str(list(signals))))
         if self._current_path is not None:
-            rows.append(("path", display_path(str(self._current_path))))
+            meas_rows.append(("path", display_path(str(self._current_path))))
+        self._fill_rows(self.meas_layout, meas_rows)
+
+        # --- Device tab: provenance ("what the apparatus was doing"), expanded READABLY --
+        # each held device gets its own small section (its snapshot keys, one row each), so the
+        # operator sees the device state at a glance instead of one crushed line.  Absent / old npz:
+        # a single placeholder line (no Provenance section), so the tab is never blank.
+        self._fill_provenance(saved.info.get("provenance"))
+        if self.info_layout.count() == 0:
+            self._add_info_row("provenance", "(none recorded)")
+
+        # --- Raw tab: the WHOLE dict verbatim (every key the npz stored), multi-line + scrollable ---
+        text = repr(dict(saved.info))
+        self.raw_info.setPlainText(text)
+        self.raw_info.setToolTip("The full info dict stored in the npz -- read-only, select to copy.")
+
+    def _fill_rows(self, layout: QtWidgets.QVBoxLayout, rows: list[tuple[str, object]]) -> None:
         for key, value in rows:
             if value is None:
                 continue
             field = FluentReadoutEdit(str(value))
             field.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
-            self.info_layout.addWidget(FluentSettingRow(key, field, label_width=self._label_w))
-        # Provenance: "what the apparatus was doing when this data was taken", expanded READABLY --
-        # each held device gets its own small section (its snapshot keys, one row each), so the
-        # operator sees the device state at a glance instead of one crushed line.  Absent / old npz:
-        # skipped silently (backward compatible).
-        self._fill_provenance(saved.info.get("provenance"))
-        # Raw info: the WHOLE dict verbatim (every key the npz stored).
-        self.raw_info.setText(repr(dict(saved.info)))
-        self.raw_info.setToolTip(repr(dict(saved.info)))
+            layout.addWidget(FluentSettingRow(key, field, label_width=self._label_w))
 
     def _add_info_row(self, key: str, value: object) -> None:
-        """One read-only ``key | value`` row in the Info column (the shared row primitive)."""
+        """One read-only ``key | value`` row in the DEVICE tab (the shared row primitive)."""
         field = FluentReadoutEdit(str(value))
         field.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
         self.info_layout.addWidget(FluentSettingRow(key, field, label_width=self._label_w))
@@ -482,17 +613,19 @@ class FigureViewer(QtWidgets.QWidget):
             self.node = None
             state = TaskConsoleState(name="figure", panels=[])
             running = []
-        # Size the console to fill the screen budget BESIDE the Info column (the SAME shared
-        # screen-fraction rule the window opens at), so info + console + chrome == the window and the
-        # board never clips: WIDTH = window minus the fixed Info column and the 3 horizontal gaps (2 root
-        # margins + 1 spacing); HEIGHT = window minus the 2 vertical root margins.
+        # EMBEDDED console: it is size-Expanding, so the stretching holder makes it FILL the right pane
+        # and its gravity board reads the real viewport width -> reflows into 2+ columns.  ``window_px``
+        # is only its MINIMUM (embedded mode setMinimumSize's it): the budget BESIDE the Info column
+        # (window minus the fixed Info column and the 3 horizontal gaps = 2 root margins + 1 spacing;
+        # height = window minus the 2 vertical root margins), so it never starts smaller than that but
+        # grows with the window.
         fit = screen_fit_window_size(self.window_ratio)
         m = self._root_margin
         console_w = max(scaled_px(520, minimum=380), fit.width() - self._info_col_w - 3 * m)
         console_h = max(scaled_px(360, minimum=280), fit.height() - 2 * m)
         self.console = TaskConsole(hub=self.hub, state=state, running_nodes=running,
                                    session=None, scale=self._scale,
-                                   window_px=(console_w, console_h))
+                                   window_px=(console_w, console_h), embedded=True)
         self._console_holder.addWidget(self.console)
 
     def _teardown_console(self) -> None:

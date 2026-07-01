@@ -304,8 +304,9 @@ def test_viewer_expands_provenance_and_tolerates_its_absence(tmp_path):
 
     v = show_figure_viewer(Path(out["data"]))
     try:
-        # the raw-info field shows the whole dict, including the nested provenance
-        assert "provenance" in v.raw_info.text() and "VirtualCamera" in v.raw_info.text()
+        # the raw-info field (the Raw tab's multi-line code editor) shows the whole dict, including the
+        # nested provenance
+        assert "provenance" in v.raw_info.toPlainText() and "VirtualCamera" in v.raw_info.toPlainText()
         # the Info column expanded it into rows/sections (more rows than the flat facts alone)
         assert v.info_layout.count() > 0
         texts = _info_column_texts(v)

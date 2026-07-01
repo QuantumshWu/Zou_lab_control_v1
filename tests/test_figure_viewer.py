@@ -118,8 +118,9 @@ def test_info_panel_exposes_every_stored_key(viewer):
     v, npz = viewer
     # (2) the Info column lists the facts (one row per fact) ...
     assert v.info_layout.count() > 0, "the Info panel lists what the file holds"
-    # ... and the raw-info field exposes EVERY key the npz stored, verbatim
-    raw = v.raw_info.text()
+    # ... and the raw-info field (the Raw tab's multi-line code editor) exposes EVERY key the npz
+    # stored, verbatim
+    raw = v.raw_info.toPlainText()
     assert raw, "the raw-info field shows the full stored info dict"
     for key in ("source", "kind", "labels", "view"):
         assert key in raw, f"raw info exposes the stored '{key}' key"
@@ -184,6 +185,82 @@ def test_window_opens_at_screen_fit_not_content_width(tmp_path):
         if win is not None:
             win.close(); win.deleteLater()
         loaded.teardown()
+        plt.close("all")
+
+
+def _saved_sites_with_signals_npz(tmp_path) -> Path:
+    """Write a SITE-MAP npz that stored ``info['signals']`` (the faithful save side): a value occupancy
+    block ``(r, 1, N)``, its ``(N, 2)`` centres and -- crucially -- the judged camera FRAME block
+    ``(r, 1, H, W)``.  Return the ``.npz`` path (no live plot -- a hand-built payload, no hardware)."""
+    R, N, H, W = 3, 12, 40, 50
+    rng = np.random.default_rng(1)
+    centers = np.stack([5.0 * (np.arange(N) % 4) + 6, 5.0 * (np.arange(N) // 4) + 6], axis=1)
+    occ = (rng.random((R, 1, N)) > 0.4).astype(float)
+    frame = rng.normal(600.0, 40.0, (R, 1, H, W))
+
+    def sig(block, ps, ds, label, unit, role):
+        return {"block": np.asarray(block), "points_shape": ps, "data_shape": ds,
+                "label": label, "unit": unit, "role": role}
+
+    info = {"name": "occupancy", "kind": "sites", "source": "value = occupied",
+            "labels": ["site", "occupancy", "Z"], "unit": "", "view": {"relim": "tight"},
+            "signals": {
+                "occupied": sig(occ, [1], [N], "occupancy", "", "value"),
+                "centers": sig(centers, None, None, "site centre", "px", "centers"),
+                "frame_judged": sig(frame, [1], [H, W], "camera image", "counts", "frame"),
+            }}
+    path = tmp_path / "occ_sites.npz"
+    np.savez(path, data_x=centers, data_y=occ.mean(0).reshape(N, 1), info=info)
+    return path
+
+
+def test_sitemap_signals_save_reproduces_rings_and_background_frame(tmp_path):
+    """A site-map save that stored ``info['signals']`` reopens FAITHFULLY: the ``LoadedFigureNode``
+    re-publishes the occupancy value + the ``(N, 2)`` centres + the judged FRAME block, and wires
+    ``sitemap_centers_key`` / ``sitemap_image_key`` so the seeded sites panel builds WITH its background
+    camera frame (an imshow underlay) -- the bug where a sitemap save built an empty board is gone."""
+    npz = _saved_sites_with_signals_npz(tmp_path)
+    v = show_figure_viewer(npz)
+    try:
+        node = v.node
+        assert isinstance(node, LoadedFigureNode)
+        # the frame block was re-published and wired as the sitemap underlay (bare "frame")
+        assert node.sitemap_centers_key == "centers"
+        assert node.sitemap_image_key == "frame", "the stored frame block is wired as the sitemap underlay"
+        assert (FIG_PREFIX + "frame") in set(v.hub.names())
+        # the seeded sites panel BUILDS (the reported bug: it did not) and carries a background image
+        card = v.console.cards[0]
+        assert card.config.kind == "sites"
+        v.console._tick()
+        assert card.plotter is not None, "the seeded sites panel builds its plotter"
+        assert len(card.plotter.ax.get_images()) >= 1, \
+            "the sitemap shows its stored background camera frame (an imshow underlay), not bare rings"
+    finally:
+        win = v.window()
+        if win is not None:
+            win.close(); win.deleteLater()
+        v.teardown()
+        plt.close("all")
+
+
+def test_info_tabs_group_facts_and_browse_auto_loads(tmp_path):
+    """The Info column is TABBED (Plot / Measurement / Device / Raw) and Browse (a valid .npz path on the
+    path field) AUTO-LOADS with no separate Load button.  Pins: the four tabs exist; the Raw tab's editor
+    holds the whole info dict; setting a real .npz on the path field loads it onto the board."""
+    v = FigureViewer(path=None)                       # open empty, then drive Browse == a path change
+    try:
+        titles = {v.info_tabs.tabText(i) for i in range(v.info_tabs.count())}
+        assert {"Plot", "Measurement", "Device", "Raw"} <= titles, "the Info column groups facts into tabs"
+        assert not hasattr(v, "load_button"), "Browse auto-loads -- there is no separate Load button"
+
+        npz = _saved_1d_npz(tmp_path)
+        v.path_edit.setText(str(npz))                 # Browse sets the field -> changed(str) -> auto-load
+        assert v.saved is not None and v.saved.kind == "1d", "picking a valid .npz loads it automatically"
+        assert v.console is not None and len(v.console.cards) == 1
+        # the Raw tab shows the whole stored info dict verbatim (multi-line, not one crushed line)
+        assert "labels" in v.raw_info.toPlainText() and "kind" in v.raw_info.toPlainText()
+    finally:
+        v.teardown()
         plt.close("all")
 
 
