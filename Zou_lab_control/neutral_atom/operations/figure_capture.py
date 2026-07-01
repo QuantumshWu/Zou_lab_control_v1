@@ -155,6 +155,10 @@ _PLOT_ID = "__plot__"
 #: The synthetic id/role of a RAW-DATA leaf -- a figure whose data was handed in directly (a bare array,
 #: no ``bind_source``), so there is no producing node and the flow degrades to ``raw data -> plot``.
 _RAW_ID = "__raw__"
+#: Prefix for a synthetic DEVICE leaf id (``<prefix><source_id>::<device>``) -- the apparatus a
+#: device-holding source expands up into.  Scoped by the source id so two measurements each holding a
+#: ``camera`` get DISTINCT camera leaves (no cross-source collision).
+_DEVICE_ID_PREFIX = "__dev__"
 
 
 def _node_id(node) -> str:
@@ -251,15 +255,16 @@ def capture_flow_graph(hub, node, inputs, *, resolve_node: ResolveNode | None = 
         re-stored here).
 
     Roles come from each node's architecture ``layer`` (``measurement`` / ``processor`` / ``task``) plus the
-    synthetic ``plot`` terminal and, when there is no producing node at all (a bare-array figure), a single
-    ``raw data`` leaf -> ``plot``.  Returns ``None`` only when there is no plot to describe (no inputs and no
-    node); otherwise ALWAYS a graph (at minimum ``raw data -> plot``), so the Flow tab always has something
-    to draw.  ``resolve_node`` is the upstream resolver (``console._node_for_signal`` / a notebook resolver);
-    without it the graph still captures the DIRECT plot inputs, just not the deeper chain."""
+    synthetic ``plot`` terminal, the ``device`` LEAVES a device-holding source expands into (one per held
+    device -- ``camera`` / ``sequencer`` -- as the MOST-upstream nodes: an edge ``device -> source`` so the
+    flow is traced all the way UP to the apparatus that produced the raw frames, and the existing
+    longest-path layering drops them naturally in the TOP layer), and, when there is no producing node at
+    all (a bare-array figure), a single ``raw data`` leaf -> ``plot``.  ALWAYS returns a graph (at minimum
+    ``raw data -> plot`` -- even a plain ``plot(arr).save()`` with no inputs and no node), so the Flow tab
+    always has something to draw.  ``resolve_node`` is the upstream resolver (``console._node_for_signal`` /
+    a notebook resolver); without it the graph still captures the DIRECT plot inputs, just not the deeper
+    chain."""
     wired = [str(s) for s in (inputs or []) if s]
-    # Nothing to describe at all -- no wired inputs and no producing node.
-    if not wired and node is None:
-        return None
 
     nodes: dict[str, dict] = {}
     edges: list[dict] = []
@@ -279,7 +284,21 @@ def capture_flow_graph(hub, node, inputs, *, resolve_node: ResolveNode | None = 
                 entry["has_devices"] = True
                 entry["devices"] = sorted(str(k) for k in prov["devices"])
             nodes[nid] = entry
+            _expand_devices(nid, entry)                       # trace up to the apparatus (device leaves)
         return nid
+
+    def _expand_devices(source_id: str, entry: dict) -> None:
+        """Trace a device-holding SOURCE up to the apparatus: expand each held device (``camera`` /
+        ``sequencer``) into its OWN most-upstream leaf node (``role="device"``) and add an edge
+        ``device -> source``.  The device is the true origin of the raw frames the source published, so the
+        edge points DOWN into the source and the existing longest-path layering places the device in the TOP
+        layer -- one level (no TTL/DAC sub-tree).  The device's snapshot itself stays flat in
+        ``provenance['devices']`` (not re-stored here); this only adds the structural leaf."""
+        for dev in entry.get("devices", []):
+            dev_id = f"{_DEVICE_ID_PREFIX}{source_id}::{dev}"
+            if dev_id not in nodes:
+                nodes[dev_id] = {"id": dev_id, "name": str(dev), "role": "device"}
+            _add_edge(dev_id, source_id, signal=str(dev), role="device")
 
     def _add_edge(frm: str, to: str, *, signal: str = "", shape=None, role: str = "") -> None:
         edge: dict = {"from": frm, "to": to}

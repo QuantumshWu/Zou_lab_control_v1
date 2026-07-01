@@ -191,12 +191,12 @@ class DataFigure:
     def _rich_capture(self) -> dict[str, Any]:
         """The ``signals`` + ``provenance`` blocks a RICH save folds into ``info``, captured through the
         ONE frontend-neutral core (``operations.figure_capture``) -- the SAME logic the console panel's
-        Save uses, so a notebook ``.save()`` and a GUI panel Save write byte-identical rich npz.  Empty
-        when this figure carries no source binding (a bare array plot): then ``save`` writes the basic
-        payload (old behaviour).  Never raises -- a capture that fails for one block simply omits it."""
-        src = self._figure_source
-        if not src:
-            return {}
+        Save uses, so a notebook ``.save()`` and a GUI panel Save write byte-identical rich npz.  For a
+        BARE array plot (no source binding) the ``signals`` / device ``provenance`` are empty, but the save
+        STILL folds a minimal ``provenance['flow_graph']`` (``raw data -> plot``), so the Flow tab of even a
+        plain ``plot(arr).save()`` has a tree to draw.  Never raises -- a capture that fails for one block
+        simply omits it."""
+        src = self._figure_source or {}
         from Zou_lab_control.neutral_atom.operations.figure_capture import (
             capture_figure_signals, capture_figure_provenance, capture_flow_graph)
         out: dict[str, Any] = {}

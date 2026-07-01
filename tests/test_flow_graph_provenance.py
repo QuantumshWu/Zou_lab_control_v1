@@ -106,8 +106,9 @@ def test_multi_input_figure_captures_a_branching_graph():
         graph = capture_flow_graph(hub, proc, ["occ_occupied"], resolve_node=resolve)
         assert graph is not None
         by_id = _graph_by_role(graph)
-        # exactly one plot terminal, one processor, two measurements
-        roles = sorted(n["role"] for n in graph["nodes"])
+        # exactly one plot terminal, one processor, two measurements (device leaves are an ADDITIVE #5a
+        # expansion of each measurement, so assert the PRODUCING roles here, devices asserted separately)
+        roles = sorted(n["role"] for n in graph["nodes"] if n["role"] != "device")
         assert roles == ["measurement", "measurement", "plot", "processor"], roles
         # the processor node has TWO parents (the two cameras) -- the branch
         proc_id = next(nid for nid, n in by_id.items() if n["role"] == "processor")
@@ -157,15 +158,39 @@ def test_processor_chain_keeps_intermediate_identity():
 # --------------------------------------------------------------------------- 3: raw-data degrade
 def test_raw_data_figure_degrades_to_raw_leaf():
     """A figure whose data was handed in directly (no producing node) -> the graph degrades to a single
-    ``raw data -> plot`` -- so the Flow tab always has something to draw."""
+    ``raw data -> plot`` -- so the Flow tab ALWAYS has something to draw, even for a plain
+    ``plot(arr).save()`` with NO inputs and NO node (#4: no early ``None`` return)."""
+    # no inputs AND no node -- a bare plot(arr) -- still yields a raw-data leaf feeding the plot.
     graph = capture_flow_graph(None, None, [])
-    assert graph is None, "no inputs AND no node -> nothing to describe"
+    assert graph is not None, "even a bare plot(arr) gets a raw-data -> plot tree"
+    roles = sorted(n["role"] for n in graph["nodes"])
+    assert roles == ["plot", "raw data"], roles
+    assert _parents(graph, "__plot__") == {"__raw__"}
 
     # a bare plot with a wired input name but no producing node (resolve finds nothing) still yields a graph
     graph = capture_flow_graph(SignalHub(), None, ["mystery"], resolve_node=lambda name: None)
     roles = sorted(n["role"] for n in graph["nodes"])
     assert roles == ["plot", "raw data"], roles
     assert _parents(graph, "__plot__") == {"__raw__"}
+
+
+def test_bare_plot_save_folds_a_raw_flow_graph(tmp_path):
+    """#4: a plain ``plot(arr).save()`` (no ``bind_source``) still writes ``provenance['flow_graph']`` with
+    a ``raw data -> plot`` tree, so the reopened figure's Flow tab is NOT blank -- reproduced end-to-end
+    through the real notebook save path (``DataFigure.save``), not just the capture in isolation."""
+    from Zou_lab_control.frontend import plot as make_plot
+
+    fig = make_plot(np.linspace(0, 1, 40), np.random.default_rng(1).normal(size=40))
+    out = fig.to_data_figure()
+    saved = out.save(str(tmp_path / "bare"))
+    npz = saved["data"]
+    info = load_figure(npz).info
+    flow = info["provenance"]["flow_graph"]
+    assert isinstance(flow, dict) and flow["nodes"] and flow["edges"]
+    roles = sorted(n["role"] for n in flow["nodes"])
+    assert roles == ["plot", "raw data"], roles
+    assert {str(e["from"]) for e in flow["edges"] if str(e["to"]) == "__plot__"} == {"__raw__"}
+    plt.close("all")
 
 
 # --------------------------------------------------------------------------- 4: device source marked
@@ -189,6 +214,109 @@ def test_source_node_is_marked_as_holding_devices():
     finally:
         exp.close()
         plt.close("all")
+
+
+def test_device_holding_source_expands_to_device_leaves():
+    """#5a: a device-holding measurement is traced UP to the apparatus -- its held devices (camera +
+    sequencer) become their OWN most-upstream ``device`` leaf nodes, each with an edge ``device ->
+    measurement``, and (via the longest-path layering) they sit ABOVE the measurement.  One level only (no
+    TTL/DAC sub-tree)."""
+    exp = na.connect("virtual")
+    try:
+        hub = SignalHub()
+        cam = CameraMeasurement(hub, exp.devices.camera, sequencer=exp.devices.sequencer,
+                                prefix="cam_", repeat=1)
+        fire_live_imaging(exp)
+        for _ in range(2):
+            cam.step()
+        cam.refresh_provenance()
+        graph = capture_flow_graph(hub, cam, ["cam_frame_0"], resolve_node=_resolver([cam]))
+        by_id = _graph_by_role(graph)
+        # the two devices are their OWN leaf nodes, role=device, named for the apparatus
+        devs = [n for n in graph["nodes"] if n["role"] == "device"]
+        assert {n["name"] for n in devs} == {"camera", "sequencer"}, [n["name"] for n in devs]
+        meas_id = next(nid for nid, n in by_id.items() if n["role"] == "measurement")
+        # each device feeds the measurement (device -> measurement), and the measurement is their child
+        dev_ids = {n["id"] for n in devs}
+        assert _parents(graph, meas_id) == dev_ids, "both devices feed the measurement"
+        # a device leaf is the MOST upstream: it has NO parent of its own (one level, no sub-tree)
+        for did in dev_ids:
+            assert _parents(graph, did) == set(), "a device leaf is a terminal source (no TTL/DAC below)"
+    finally:
+        exp.close()
+        plt.close("all")
+
+
+def test_flow_view_places_device_leaves_in_the_top_layer():
+    """#5a (layout): the ``FlowGraphView`` drops the expanded ``device`` leaves in the TOP layer (smallest
+    y), above the measurement that holds them -- the flow reads top (apparatus) -> bottom (figure)."""
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.flow_graph_view import FlowGraphView
+
+    ensure_qt_app()
+    graph = {
+        "nodes": [
+            {"id": "cam0", "name": "camera", "role": "device"},
+            {"id": "seq0", "name": "sequencer", "role": "device"},
+            {"id": "m", "name": "camera A", "role": "measurement", "has_devices": True,
+             "devices": ["camera", "sequencer"]},
+            {"id": "__plot__", "name": "figure", "role": "plot"},
+        ],
+        "edges": [
+            {"from": "cam0", "to": "m", "signal": "camera", "role": "device"},
+            {"from": "seq0", "to": "m", "signal": "sequencer", "role": "device"},
+            {"from": "m", "to": "__plot__", "signal": "frame_0", "shape": [1, 1, 96, 128], "role": "value"},
+        ],
+    }
+    view = FlowGraphView()
+    view.set_graph(graph)
+    dev_tops = [view._boxes["cam0"].top(), view._boxes["seq0"].top()]
+    assert dev_tops[0] == dev_tops[1], "the two device leaves share the top layer"
+    assert dev_tops[0] < view._boxes["m"].top() < view._boxes["__plot__"].top(), \
+        "device (apparatus, top) -> measurement -> plot (bottom)"
+    # a device box is COMPACT: narrower than a standard producing node box
+    assert view._boxes["cam0"].width() < view._boxes["m"].width()
+
+
+def test_flow_view_labels_are_globally_non_overlapping():
+    """#5b: on a busy multi-input graph the ``FlowGraphView`` places its edge labels by a GLOBAL collision
+    pass -- ANY two signal-name plates in the whole graph are mutually non-overlapping (crossing lines or
+    not), which the old per-target-group stagger did NOT guarantee across groups."""
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.flow_graph_view import FlowGraphView
+
+    ensure_qt_app()
+    # a graph that fuses several sources into one plot AND one processor -> many edges crossing near mid-height
+    graph = {
+        "nodes": [
+            {"id": "cam0", "name": "camera", "role": "device"},
+            {"id": "seq0", "name": "sequencer", "role": "device"},
+            {"id": "mA", "name": "camera A", "role": "measurement", "has_devices": True,
+             "devices": ["camera", "sequencer"]},
+            {"id": "mB", "name": "camera B", "role": "measurement"},
+            {"id": "p", "name": "occupancy", "role": "processor"},
+            {"id": "__plot__", "name": "figure", "role": "plot"},
+        ],
+        "edges": [
+            {"from": "cam0", "to": "mA", "signal": "camera", "role": "device"},
+            {"from": "seq0", "to": "mA", "signal": "sequencer", "role": "device"},
+            {"from": "mA", "to": "p", "signal": "frame_alpha", "shape": [1, 1, 96, 128]},
+            {"from": "mB", "to": "p", "signal": "frame_beta", "shape": [1, 1, 96, 128]},
+            {"from": "mA", "to": "__plot__", "signal": "centers_map", "shape": [35, 2], "role": "centers"},
+            {"from": "mB", "to": "__plot__", "signal": "underlay_frame", "shape": [1, 1, 96, 128],
+             "role": "frame"},
+            {"from": "p", "to": "__plot__", "signal": "occupied_sites", "shape": [1, 1, 35], "role": "value"},
+        ],
+    }
+    view = FlowGraphView()
+    view.set_graph(graph)
+    rects = view.label_rects()
+    assert len(rects) >= 6, f"one plate per labelled edge (got {len(rects)})"
+    # every pair of label plates is disjoint (no overlap) -- the core #5b guarantee
+    for i in range(len(rects)):
+        for j in range(i + 1, len(rects)):
+            assert not rects[i].intersects(rects[j]), \
+                f"label plates {i} and {j} overlap: {rects[i]} vs {rects[j]}"
 
 
 # --------------------------------------------------------------------------- end-to-end save/load
@@ -238,8 +366,11 @@ def test_flow_graph_round_trips_through_the_console_save(tmp_path):
         info = load_figure(npz).info
         flow = info["provenance"]["flow_graph"]
         assert isinstance(flow, dict) and flow["nodes"] and flow["edges"]
-        roles = sorted(n["role"] for n in flow["nodes"])
+        # the PRODUCING roles survive the round-trip (device leaves are an additive #5a expansion)
+        roles = sorted(n["role"] for n in flow["nodes"] if n["role"] != "device")
         assert roles == ["measurement", "measurement", "plot", "processor"], roles
+        # the device leaves (camera + sequencer per measurement) survive the npz round-trip too
+        assert any(n["role"] == "device" for n in flow["nodes"]), "device leaves round-trip through the npz"
         proc_id = next(n["id"] for n in flow["nodes"] if n["role"] == "processor")
         parents = {str(e["from"]) for e in flow["edges"] if str(e["to"]) == proc_id}
         assert len(parents) == 2, "the branching processor survives the npz round-trip with both parents"

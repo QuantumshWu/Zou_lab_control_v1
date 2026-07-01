@@ -14,8 +14,11 @@ CONVERGE (one source feeding two processors that both feed the plot).  This widg
   short and un-crossed;
 * each node is a rounded Fluent box coloured by its ROLE (device / measurement / processor / plot / raw
   data) with a small role badge; a device-holding source is marked so the reader sees its snapshot is
-  attached;
-* each edge is a line labelled with the signal name + shape it carries.
+  attached, and the flow is traced all the way UP to the apparatus: a device-holding source expands into
+  compact ``device`` LEAVES (camera / sequencer) in the TOP layer, one per held device;
+* each edge is a curved (cubic-Bezier) line labelled with the signal name + shape it carries; the labels
+  are placed by a GLOBAL collision pass so any two signal names in the graph are mutually non-overlapping
+  (a plate that had to slide off its edge keeps a thin leader line back to the edge).
 
 Everything -- geometry, colours, fonts -- comes from the frontend's OWN tokens (``style.PALETTE``,
 ``qt_fluent`` colours + ``scaled_px``), never a per-call art knob, so it obeys the sealed-API contract and
@@ -38,19 +41,23 @@ from .qt_fluent import (
     GREY,
     ORANGE,
     TEXT,
+    YELLOW,
     fluent_font_size,
     scaled_px,
 )
 
 
 #: Role -> (fill, border) colours, all from the shared Fluent token set (never a fresh per-call colour):
-#: a device source is the warm ORANGE (an apparatus), a measurement the lab ACCENT blue, a processor the
-#: GREEN transform, the terminal plot the neutral TEXT-dark, and a bare raw-data leaf plain GREY.  A role
-#: the capture ever adds that is not listed here falls back to the neutral plot style.
+#: the most-upstream DEVICE leaf (the apparatus -- camera / sequencer) is the warm YELLOW, a measurement
+#: source the lab ACCENT blue, a processor the GREEN transform, the terminal plot the neutral TEXT-dark,
+#: and a bare raw-data leaf plain GREY.  A device-HOLDING source (a measurement whose ``has_devices`` is
+#: set) keeps the warm ORANGE apparatus badge (see ``_paint_nodes``).  A role the capture ever adds that
+#: is not listed here falls back to the neutral plot style.
 _ROLE_STYLE: Mapping[str, tuple[str, str]] = {
     "measurement": (ACCENT, "#4A7BA6"),
     "processor": (GREEN, "#4E8B77"),
     "task": (ORANGE, "#A9743F"),
+    "device": (YELLOW, "#B39A2E"),
     "plot": ("#5B5B5B", "#3A3A3A"),
     "raw data": (GREY, "#7C7C7C"),
 }
@@ -86,6 +93,24 @@ class FlowGraphView(QtWidgets.QWidget):
 
     def _node_h(self) -> int:
         return scaled_px(46, minimum=34)
+
+    def _device_w(self) -> int:
+        """A DEVICE leaf is a smaller box than a producing node -- it is an apparatus, not a logic node, so
+        it reads as a compact terminal source (narrower + shorter, same token family)."""
+        return scaled_px(104, minimum=80)
+
+    def _device_h(self) -> int:
+        return scaled_px(34, minimum=26)
+
+    @staticmethod
+    def _is_device(node: dict) -> bool:
+        return str(node.get("role")) == "device"
+
+    def _box_size(self, node: dict) -> tuple[int, int]:
+        """The (w, h) for a node's box -- the compact device size for a ``device`` leaf, the standard node
+        size otherwise -- so a single layout routine sizes every box from its role (no per-kind branch at
+        the call site)."""
+        return (self._device_w(), self._device_h()) if self._is_device(node) else (self._node_w(), self._node_h())
 
     def _gap_x(self) -> int:
         return scaled_px(46, minimum=30)
@@ -184,20 +209,39 @@ class FlowGraphView(QtWidgets.QWidget):
                 return sum(tgt) / len(tgt) if tgt else 1e9   # no downstream in the next layer -> park right
             order[layer] = sorted(ids, key=lambda nid: (_bary(nid), nid))
 
-        # Place the boxes: each layer is a horizontal row, centred so the whole graph is balanced.
-        nw, nh = self._node_w(), self._node_h()
+        # Place the boxes: each layer is a horizontal row, centred so the whole graph is balanced.  Boxes
+        # are sized PER NODE (a device leaf is a compact box), so a row's width is the sum of its own boxes
+        # + gaps and its band height is the tallest box in it (a device-only row is shorter).
         gx, gy, m = self._gap_x(), self._gap_y(), self._margin()
-        widest = max((len(order.get(l, [])) for l in range(n_layers)), default=1)
-        content_w = m * 2 + widest * nw + max(0, widest - 1) * gx
-        content_h = m * 2 + n_layers * nh + max(0, n_layers - 1) * gy
+
+        def _row_w(ids: list[str]) -> float:
+            return sum(self._box_size(nodes[nid])[0] for nid in ids) + max(0, len(ids) - 1) * gx
+
+        def _row_h(ids: list[str]) -> float:
+            return max((self._box_size(nodes[nid])[1] for nid in ids), default=self._node_h())
+
+        # Content width fits the widest ROW of boxes AND the widest edge LABEL (so a signal-name plate has
+        # room to sit near mid-height without being clipped by the canvas edge -- labels are often wider than
+        # a node box, e.g. ``frame_alpha (1×1×96×128)``).
+        fm = QtGui.QFontMetrics(self._small_font())
+        widest_row = max((_row_w(order.get(l, [])) for l in range(n_layers)), default=self._node_w())
+        widest_label = max((fm.horizontalAdvance(self._edge_label(e)) + scaled_px(8, minimum=6)
+                            for e in edges if self._edge_label(e)), default=0)
+        content_w = m * 2 + max(widest_row, widest_label)
+        band_h = [_row_h(order.get(l, [])) for l in range(n_layers)]
+        content_h = m * 2 + sum(band_h) + max(0, n_layers - 1) * gy
+        y = m
         for layer in range(n_layers):
             ids = order.get(layer, [])
-            row_w = len(ids) * nw + max(0, len(ids) - 1) * gx
-            x0 = (content_w - row_w) / 2.0
-            y = m + layer * (nh + gy)
-            for i, nid in enumerate(ids):
-                x = x0 + i * (nw + gx)
-                self._boxes[nid] = QtCore.QRectF(x, y, nw, nh)
+            row_w = _row_w(ids)
+            x = (content_w - row_w) / 2.0
+            bh = band_h[layer]
+            for nid in ids:
+                bw, bnh = self._box_size(nodes[nid])
+                # Centre each box vertically within the layer band (a shorter device box sits mid-band).
+                self._boxes[nid] = QtCore.QRectF(x, y + (bh - bnh) / 2.0, bw, bnh)
+                x += bw + gx
+            y += bh + gy
 
         self._content = QtCore.QSize(max(scaled_px(320, minimum=200), int(content_w)),
                                      max(scaled_px(120, minimum=90), int(content_h)))
@@ -205,6 +249,14 @@ class FlowGraphView(QtWidgets.QWidget):
 
     def sizeHint(self) -> QtCore.QSize:  # noqa: N802 - Qt API name
         return self._content
+
+    def label_rects(self) -> list[QtCore.QRectF]:
+        """The final, collision-resolved edge-label plates for the CURRENT layout (the exact rects the paint
+        draws) -- so a caller / contract test can assert the signal names are mutually non-overlapping
+        without reaching into the paint.  Empty when no graph is laid out."""
+        if self._graph is None or not self._boxes:
+            return []
+        return [item["plate"] for item in self._place_labels(self._edge_endpoints())]
 
     # ------------------------------------------------------------------ paint
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt API name
@@ -224,14 +276,13 @@ class FlowGraphView(QtWidgets.QWidget):
         self._paint_nodes(painter)
         painter.end()
 
-    def _paint_edges(self, painter: QtGui.QPainter) -> None:
-        painter.setFont(self._small_font())
-        fm = QtGui.QFontMetrics(self._small_font())
-        # Edges sharing ONE downstream target fan into DISTINCT points on its top edge (so two parents do
-        # not both plug into the exact centre); edges sharing ONE source likewise fan OUT of distinct
-        # points on its bottom edge -- so the common case of several signals flowing from the SAME producer
-        # into the SAME plot (occupied + centres + frame) reads as a spread fan, not one overlapping line.
-        # Their labels are then STAGGERED along the line by index so parallel branch labels never smear.
+    def _edge_endpoints(self) -> list[tuple[dict, QtCore.QPointF, QtCore.QPointF]]:
+        """Every drawable edge as ``(edge, p1, p2)`` -- the fanned start point on the upstream box's bottom
+        edge and the fanned end point on the downstream box's top edge.  Edges sharing ONE downstream target
+        fan into DISTINCT points on its top edge (two parents do not both plug into the exact centre); edges
+        sharing ONE source fan OUT of distinct points on its bottom edge -- so several signals from the SAME
+        producer into the SAME plot read as a spread fan, not one overlapping line.  Shared by the paint and
+        the label-placement passes (one source of edge geometry)."""
         by_target: dict[str, list[dict]] = {}
         by_source: dict[str, list[dict]] = {}
         for e in self._layout_edges:
@@ -242,39 +293,125 @@ class FlowGraphView(QtWidgets.QWidget):
             k, n = group.index(e), max(1, len(group))
             return box.left() + box.width() * (0.2 + 0.6 * (k + 1) / (n + 1))
 
+        out: list[tuple[dict, QtCore.QPointF, QtCore.QPointF]] = []
         for e in self._layout_edges:
             src = self._boxes.get(str(e.get("from")))
             dst = self._boxes.get(str(e.get("to")))
             if src is None or dst is None:
                 continue
-            tgroup = by_target.get(str(e.get("to")), [])
-            sgroup = by_source.get(str(e.get("from")), [])
-            k = tgroup.index(e)
-            n = max(1, len(tgroup))
-            # An edge flows DOWN: from a fanned point on the upstream box's bottom edge to a fanned point on
-            # the downstream box's top edge.
-            p1 = QtCore.QPointF(_fan_x(src, sgroup, e), src.bottom())
-            p2 = QtCore.QPointF(_fan_x(dst, tgroup, e), dst.top())
+            p1 = QtCore.QPointF(_fan_x(src, by_source.get(str(e.get("from")), []), e), src.bottom())
+            p2 = QtCore.QPointF(_fan_x(dst, by_target.get(str(e.get("to")), []), e), dst.top())
+            out.append((e, p1, p2))
+        return out
+
+    @staticmethod
+    def _edge_path(p1: QtCore.QPointF, p2: QtCore.QPointF) -> QtGui.QPainterPath:
+        """A cubic Bezier from ``p1`` (down) to ``p2`` with VERTICAL control handles, so the edge leaves the
+        source going straight down and enters the target going straight down -- a smooth S when the boxes are
+        offset horizontally (the curve absorbs the offset so lines and their labels do not crowd a diagonal)
+        and a straight drop when they line up."""
+        path = QtGui.QPainterPath(p1)
+        dy = (p2.y() - p1.y()) * 0.5
+        c1 = QtCore.QPointF(p1.x(), p1.y() + dy)
+        c2 = QtCore.QPointF(p2.x(), p2.y() - dy)
+        path.cubicTo(c1, c2, p2)
+        return path
+
+    def _place_labels(self, endpoints: list) -> list[dict]:
+        """GLOBALLY non-overlapping label plates.  Each edge's label starts at the curve midpoint; the
+        plates are then placed one by one and each is nudged along the edge NORMAL (perpendicular, so it
+        slides sideways off the line) in growing steps until its bounding box clears every plate ALREADY
+        placed AND every node box -- so any two signal names in the whole graph are mutually exclusive
+        (crossing lines or not) and a name never sits on top of a node.  Returns a list of
+        ``{plate, label, anchor}`` (``anchor`` = the on-curve point, for a leader line when the plate had to
+        move).  Longest labels are placed FIRST (hardest to fit -> best pick of free space)."""
+        import math
+        fm = QtGui.QFontMetrics(self._small_font())
+        pad_w = scaled_px(8, minimum=6)
+        pad_h = scaled_px(2, minimum=2)
+        step = scaled_px(6, minimum=4)                       # normal-offset increment per collision retry
+        gap = scaled_px(2, minimum=1)                        # min clear gap between two plates
+        # Node boxes are OBSTACLES too (a name must not sit on a node); grow them by the gap so a plate rests
+        # just clear of a box edge.
+        node_obstacles = [b.adjusted(-gap, -gap, gap, gap) for b in self._boxes.values()]
+
+        cand: list[dict] = []
+        for e, p1, p2 in endpoints:
+            label = self._edge_label(e)
+            if not label:
+                continue
+            path = self._edge_path(p1, p2)
+            anchor = path.pointAtPercent(0.5)
+            tw = fm.horizontalAdvance(label) + pad_w
+            th = fm.height() + pad_h
+            # Edge unit normal (perpendicular to the p1->p2 chord) -- the direction a plate slides to escape.
+            dx, dy = (p2.x() - p1.x()), (p2.y() - p1.y())
+            length = math.hypot(dx, dy) or 1.0
+            nx, ny = (-dy / length, dx / length)
+            cand.append({"label": label, "anchor": anchor, "tw": tw, "th": th, "nx": nx, "ny": ny})
+
+        cand.sort(key=lambda c: c["tw"], reverse=True)       # hardest (widest) first
+        placed: list[dict] = []
+        margin = self._margin()
+        max_w = float(self._content.width())
+        for c in cand:
+            tw, th = c["tw"], c["th"]
+            ax, ay = c["anchor"].x(), c["anchor"].y()
+            nx, ny = c["nx"], c["ny"]
+            chosen = None
+            # Try the on-curve midpoint, then step alternately to +/- normal offsets until the plate is clear
+            # of every already-placed plate AND every node box (and inside the canvas width).
+            for i in range(0, 120):
+                off = 0 if i == 0 else (((i + 1) // 2) * step) * (1 if i % 2 else -1)
+                cx = ax + nx * off
+                cy = ay + ny * off
+                plate = QtCore.QRectF(cx - tw / 2.0, cy - th / 2.0, tw, th)
+                if plate.left() < margin:
+                    plate.moveLeft(margin)
+                if plate.right() > max_w - margin:
+                    plate.moveRight(max_w - margin)
+                grown = plate.adjusted(-gap, -gap, gap, gap)
+                clear_labels = not any(grown.intersects(p["plate"]) for p in placed)
+                clear_nodes = not any(plate.intersects(nb) for nb in node_obstacles)
+                if clear_labels and clear_nodes:
+                    chosen = plate
+                    break
+            if chosen is None:                               # never fully clear -> take the last try anyway
+                chosen = QtCore.QRectF(ax - tw / 2.0, ay - th / 2.0, tw, th)
+            placed.append({"plate": chosen, "label": c["label"],
+                           "anchor": QtCore.QPointF(ax, ay)})
+        return placed
+
+    def _paint_edges(self, painter: QtGui.QPainter) -> None:
+        painter.setFont(self._small_font())
+        endpoints = self._edge_endpoints()
+        # 1) the curved edges + arrow heads.
+        for e, p1, p2 in endpoints:
+            path = self._edge_path(p1, p2)
             pen = QtGui.QPen(QtGui.QColor(GREY))
             pen.setWidthF(max(1.0, scaled_px(1, minimum=1)))
             painter.setPen(pen)
-            painter.drawLine(p1, p2)
-            self._draw_arrow_head(painter, p1, p2)
-            # Edge label = signal name (+ shape) on a small white plate.  Position it at a per-edge fraction
-            # down the line (staggered by index) so parallel branch labels sit at different heights.
-            label = self._edge_label(e)
-            if label:
-                t = 0.30 + 0.40 * (k / max(1, n - 1)) if n > 1 else 0.5
-                cx = p1.x() + (p2.x() - p1.x()) * t
-                cy = p1.y() + (p2.y() - p1.y()) * t
-                tw = fm.horizontalAdvance(label) + scaled_px(8, minimum=6)
-                th = fm.height() + scaled_px(2, minimum=2)
-                plate = QtCore.QRectF(cx - tw / 2.0, cy - th / 2.0, tw, th)
-                painter.setBrush(QtGui.QColor("#FFFFFF"))
-                painter.setPen(QtGui.QColor(DIVIDER))
-                painter.drawRoundedRect(plate, scaled_px(3, minimum=2), scaled_px(3, minimum=2))
-                painter.setPen(QtGui.QColor(TEXT))
-                painter.drawText(plate, int(QtCore.Qt.AlignCenter), label)
+            painter.setBrush(QtCore.Qt.NoBrush)
+            painter.drawPath(path)
+            # Arrow head along the curve's final tangent (approach the target box from its last segment).
+            near = path.pointAtPercent(0.92)
+            self._draw_arrow_head(painter, near, p2)
+        # 2) the globally non-overlapping labels, each on a small white plate; a plate that had to slide off
+        #    its edge gets a thin leader line back to the on-curve anchor so the reader still sees which edge
+        #    it names.
+        leader = QtGui.QPen(QtGui.QColor(DIVIDER))
+        leader.setWidthF(max(1.0, scaled_px(1, minimum=1)))
+        for item in self._place_labels(endpoints):
+            plate, label, anchor = item["plate"], item["label"], item["anchor"]
+            if not plate.contains(anchor):
+                painter.setPen(leader)
+                painter.drawLine(anchor, plate.center())
+            painter.setBrush(QtGui.QColor("#FFFFFF"))
+            painter.setPen(QtGui.QColor(DIVIDER))
+            painter.drawRoundedRect(plate, scaled_px(3, minimum=2), scaled_px(3, minimum=2))
+            painter.setPen(QtGui.QColor(TEXT))
+            painter.setFont(self._small_font())
+            painter.drawText(plate, int(QtCore.Qt.AlignCenter), label)
 
     @staticmethod
     def _edge_label(e: Mapping) -> str:
@@ -315,7 +452,20 @@ class FlowGraphView(QtWidgets.QWidget):
             pen = QtGui.QPen(QtGui.QColor(border))
             pen.setWidthF(max(1.0, scaled_px(1, minimum=1)))
             painter.setPen(pen)
-            painter.drawRoundedRect(box, radius, radius)
+            radius_n = scaled_px(4, minimum=3) if self._is_device(node) else radius
+            painter.drawRoundedRect(box, radius_n, radius_n)
+
+            # A compact DEVICE leaf has no room for a two-line name+badge; its name IS its role (camera /
+            # sequencer), so draw a single centred name and skip the badge line.
+            if self._is_device(node):
+                dev_font = self._small_font()
+                painter.setPen(QtGui.QColor("#FFFFFF"))
+                painter.setFont(dev_font)
+                dev_rect = QtCore.QRectF(box.x() + scaled_px(5), box.y(),
+                                         box.width() - scaled_px(10), box.height())
+                painter.drawText(dev_rect, int(QtCore.Qt.AlignCenter),
+                                 self._elide(str(node.get("name") or "device"), dev_rect.width(), dev_font))
+                continue
 
             # Node NAME (primary line) -- white on the coloured fill for contrast.
             name_font = self._label_font()
