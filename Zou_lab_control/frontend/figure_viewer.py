@@ -493,7 +493,12 @@ class FigureViewer(QtWidgets.QWidget):
         # fills the whole right pane and its gravity board reads the real viewport width -> reflows into
         # 2+ columns (vs a frozen-width console that stacks every card in one column).
         self._console_holder = QtWidgets.QVBoxLayout()
-        self._console_holder.setContentsMargins(0, 0, 0, 0)
+        # The embedded TaskConsole's own tab card carries a downward drop shadow (offset > 0); a zero
+        # bottom margin clips that soft bottom bleed so the card reads as CUT at the base (unlike the
+        # standalone console, whose window chrome leaves room below).  Reserve EXACTLY the shadow's
+        # bleed extent below -- the SAME single source the Info column reserves ABOVE its tab card
+        # (fluent_tab_shadow_margin), so the two can never drift out of step.
+        self._console_holder.setContentsMargins(0, 0, 0, fluent_tab_shadow_margin())
         holder_host = QtWidgets.QWidget()
         holder_host.setStyleSheet("background: transparent;")
         holder_host.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
@@ -608,10 +613,20 @@ class FigureViewer(QtWidgets.QWidget):
 
     def _add_raw_tab(self, title: str) -> FluentCodeEdit:
         """A permanent tab holding a read-only multi-line code editor (its own scrollbars) that shows the
-        WHOLE stored info dict verbatim -- so a long / nested value is fully readable, never truncated."""
+        WHOLE stored info dict verbatim -- so a long / nested value is fully readable, never truncated.
+
+        The editor lives in a transparent body inset by the SAME component-library card padding as the
+        rows tabs (:meth:`_add_rows_tab`), so the Raw tab card's content sits off its edge by CARD_PAD
+        exactly like every other Info / console tab -- not flush against the card edge."""
+        body = QtWidgets.QWidget()
+        body.setStyleSheet("background: transparent;")
+        vbox = QtWidgets.QVBoxLayout(body)
+        m = scaled_px(CARD_PAD, minimum=6)
+        vbox.setContentsMargins(m, m, m, m)
         raw = FluentCodeEdit("", read_only=True)
         raw.setToolTip("The full info dict stored in the npz -- read-only, select to copy.")
-        self.info_tabs.add_permanent_tab(raw, title)
+        vbox.addWidget(raw)
+        self.info_tabs.add_permanent_tab(body, title)
         return raw
 
     # -------------------------------------------------------------- public API

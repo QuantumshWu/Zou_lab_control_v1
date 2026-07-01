@@ -776,3 +776,127 @@ def test_tab_overflow_popup_uses_rounded_card_single_source():
         menu.deleteLater()
     finally:
         tabs.deleteLater()
+
+
+def test_readout_multiline_single_row_matches_line_edit_height():
+    """#3(a): a ONE-line :class:`FluentReadoutMultiline` is EXACTLY as tall as the single-line
+    :class:`FluentReadoutEdit`, so an Info row with a short value reads identically whether it is a
+    line edit or the multi-line field (the reported 'the multiline sits a few px taller than the
+    single-line one').  The expected height is DERIVED from a real FluentReadoutEdit (not a re-typed
+    literal), so the two can only ever agree by construction."""
+    from PyQt5 import QtWidgets
+    from Zou_lab_control.frontend.qt_fluent import (
+        FluentReadoutEdit, FluentReadoutMultiline, ensure_qt_app)
+
+    ensure_qt_app()
+    host = QtWidgets.QWidget()
+    lay = QtWidgets.QVBoxLayout(host)
+    single = FluentReadoutEdit("42")
+    multi = FluentReadoutMultiline("42")
+    lay.addWidget(single)
+    lay.addWidget(multi)
+    host.show()
+    try:
+        QtWidgets.QApplication.processEvents()
+        assert multi.height() == single.height(), (
+            "a one-line multiline field is exactly the single-line readout-edit height "
+            f"(multi={multi.height()} single={single.height()})")
+    finally:
+        host.close()
+        host.deleteLater()
+
+
+def test_readout_multiline_shows_all_lines_without_inner_scroll():
+    """#3(b): a long value grows to show EVERY wrapped line with NO inner scrollbar -- the whole form
+    scrolls in the Info column's outer scroll area instead.  The reported confusion was an inner
+    scrollbar on a field that already displays everything ('it's all shown, why scroll?').  Pins the
+    real invariants (not a brittle pixel-exact height): the inner vertical scrollbar is hard-disabled
+    by policy (so it can never be drawn no matter the layout), the field height reserves room for every
+    wrapped GLYPH line (>= line count x the font's glyph height, so no line's text is clipped), and it
+    is taller than a one-line value."""
+    from PyQt5 import QtCore, QtWidgets
+    from Zou_lab_control.frontend.qt_fluent import FluentReadoutMultiline, ensure_qt_app
+
+    ensure_qt_app()
+    long_value = ("C:/Users/lab/Dropbox/experiments/rb87/2026-07-01/"
+                  "overnight_survival_scan_run17_readout_calibration_final.npz")
+    host = QtWidgets.QWidget()
+    host.resize(240, 600)                                  # narrow -> the long path wraps to many lines
+    lay = QtWidgets.QVBoxLayout(host)
+    short = FluentReadoutMultiline("42")
+    long = FluentReadoutMultiline(long_value)
+    lay.addWidget(short)
+    lay.addWidget(long)
+    lay.addStretch(1)
+    host.show()
+    try:
+        QtWidgets.QApplication.processEvents()
+        long._adjust_height()
+        QtWidgets.QApplication.processEvents()
+        # the policy HARD-disables the inner scrollbar (the whole form scrolls, not the field) -- so no
+        # inner scrollbar is ever drawn regardless of the exact pixel height
+        assert long.verticalScrollBarPolicy() == QtCore.Qt.ScrollBarAlwaysOff, \
+            "the multiline readout never shows its own vertical scrollbar"
+        assert not long.verticalScrollBar().isVisible(), "so no inner scrollbar is drawn"
+        # the height fully contains the wrapped text -- the residual absorb leaves nothing scrolled off
+        assert long.verticalScrollBar().maximum() == 0, \
+            f"the field shows every wrapped line (nothing hidden), got max={long.verticalScrollBar().maximum()}"
+        # and (belt-and-braces) it reserves a full GLYPH row per wrapped line
+        lines = long._visual_line_count()
+        glyph_h = long.fontMetrics().height()
+        assert lines > 1, "the long value wrapped onto several lines"
+        assert long.height() >= lines * glyph_h, \
+            f"the field is tall enough for every wrapped line's glyphs (h={long.height()} " \
+            f"lines={lines} glyph_h={glyph_h})"
+        assert long.height() > short.height(), "and it is taller than a one-line value"
+    finally:
+        host.close()
+        host.deleteLater()
+
+
+def test_readout_multiline_takes_no_max_lines_arg():
+    """#3(b): the row cap is gone -- :class:`FluentReadoutMultiline` no longer accepts a ``max_lines``
+    (it always shows every line), so the old capped/scrolling behaviour cannot be reintroduced by a
+    caller."""
+    import inspect
+    from Zou_lab_control.frontend.qt_fluent import FluentReadoutMultiline
+
+    params = inspect.signature(FluentReadoutMultiline.__init__).parameters
+    assert "max_lines" not in params, "the multiline readout has no max_lines cap parameter anymore"
+
+
+def test_raw_tab_body_uses_card_padding(viewer):
+    """#2: the Raw tab's code editor lives in a body inset by the SAME component-library card padding
+    (``CARD_PAD``) as the rows tabs -- previously the FluentCodeEdit was added bare (no container, no
+    margin) so its text sat flush against the card edge, unlike every other Info / console tab."""
+    from Zou_lab_control.frontend.qt_fluent import CARD_PAD, scaled_px
+
+    v, _ = viewer
+    expected = scaled_px(CARD_PAD, minimum=6)
+    # the raw editor's parent is the padded body; read that layout's margins
+    body = v.raw_info.parentWidget()
+    margins = body.layout().contentsMargins()
+    assert (margins.left(), margins.top(), margins.right(), margins.bottom()) == \
+        (expected, expected, expected, expected), \
+        "the Raw tab body uses CARD_PAD on every edge (matches the rows tabs / console tab bodies)"
+
+
+def test_tab_overflow_menu_actions_are_not_checkable():
+    """#4: the overflow ``...`` menu actions are NOT checkable -- a checkable action makes Qt reserve
+    an indicator gutter and paint its own (un-Fluent) tick, the reported 'ugly check mark'.  The
+    active tab is already the visibly-selected pivot, so the list needs no tick."""
+    from PyQt5 import QtWidgets
+    from Zou_lab_control.frontend.qt_fluent import FluentTabWidget, ensure_qt_app
+
+    ensure_qt_app()
+    tabs = FluentTabWidget()
+    for name in ("Monitor", "Logic", "Edit alpha", "Edit beta", "Edit gamma"):
+        tabs.add_permanent_tab(QtWidgets.QWidget(), name)
+    try:
+        menu = tabs._overflow_menu()
+        assert menu.actions(), "the overflow menu lists the tabs"
+        assert not any(a.isCheckable() for a in menu.actions()), \
+            "no overflow action is checkable (Qt would draw an un-Fluent tick)"
+        menu.deleteLater()
+    finally:
+        tabs.deleteLater()

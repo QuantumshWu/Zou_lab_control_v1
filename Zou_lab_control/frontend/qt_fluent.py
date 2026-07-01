@@ -1025,16 +1025,17 @@ class FluentReadoutMultiline(QtWidgets.QPlainTextEdit):
 
     Same look/role as :class:`FluentReadoutEdit` (grey fill + faint border + full-contrast text, NO
     accent focus ring: you can select + Ctrl-C but not edit), but it SOFT-WRAPS a long value at the
-    field width (``WrapAtWordBoundaryOrAnywhere``) and AUTO-SIZES its height to the wrapped content --
-    so nothing is ever truncated the way a single-line edit clips it.  Height grows with the text up
-    to ``max_lines`` visible rows, after which it stops growing and the (shared fluent) vertical
-    scrollbar takes over.  Mirrors confocal_gui's ``DynamicPlainTextEdit._adjust_height`` (count the
-    VISUAL wrapped lines, size to fit), on the house Fluent readout chrome.  All colours / radius /
-    font come from the style tokens (one source), never re-picked."""
+    field width (``WrapAtWordBoundaryOrAnywhere``) and AUTO-SIZES its height to the WHOLE wrapped
+    content -- so every line is shown in full and nothing is ever truncated the way a single-line edit
+    clips it.  There is NO row cap and NO inner scrollbar: the field grows to fit all its lines and the
+    outer scroll area (the Info column's ``FluentScrollArea``) scrolls the whole form -- an inner
+    scrollbar on a field that already shows everything is exactly the "why scroll when it's all here"
+    confusion.  Mirrors confocal_gui's ``DynamicPlainTextEdit`` (scrollbars OFF, count the VISUAL
+    wrapped lines, size to fit), on the house Fluent readout chrome.  All colours / radius / font come
+    from the style tokens (one source), never re-picked."""
 
-    def __init__(self, text: str = "", parent=None, *, max_lines: int = 6):
+    def __init__(self, text: str = "", parent=None):
         super().__init__(parent)
-        self._max_lines = max(1, int(max_lines))
         self.setReadOnly(True)
         self.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse
                                      | QtCore.Qt.TextSelectableByKeyboard)
@@ -1043,14 +1044,20 @@ class FluentReadoutMultiline(QtWidgets.QPlainTextEdit):
         # wraps to as many lines as it needs instead of overflowing / clipping (confocal idiom).
         self.setLineWrapMode(QtWidgets.QPlainTextEdit.WidgetWidth)
         self.setWordWrapMode(QtGui.QTextOption.WrapAtWordBoundaryOrAnywhere)
-        self.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)  # width-wrapped -> never sideways
-        # Vertical scrollbar only appears once the text exceeds ``max_lines`` (the height is capped there).
-        self.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        # BOTH scrollbars OFF: width-wrapped -> never sideways, and the field auto-sizes to fit EVERY
+        # line so a vertical scrollbar would never have anything hidden to scroll to (confocal idiom).
+        self.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         apply_fluent_scrollbars(self)
+        # Match the document's inner margin to the single-line edit's vertical padding (PADDING_V): the
+        # default QPlainTextEdit documentMargin (4 px) makes one text row's content box TALLER than the
+        # FluentReadoutEdit row, so a one-line field could not both equal that height AND fully contain
+        # its text.  At PADDING_V the row's content box lines up with the line edit's, so the anchored
+        # height formula (single-row height + one lineSpacing per extra line) shows every line in full.
+        self.document().setDocumentMargin(scaled_px(PADDING_V))
         self._apply_style()
         if text:
             self.setPlainText(str(text))
-        self._doc_margin = self.document().documentMargin()
         # Recompute height when the text changes AND when the wrapped layout size changes (a resize
         # re-wraps the same text into a different line count) -- the two triggers confocal uses.
         self.textChanged.connect(self._adjust_height)
@@ -1104,15 +1111,43 @@ class FluentReadoutMultiline(QtWidgets.QPlainTextEdit):
         return max(1, count)
 
     def _adjust_height(self) -> None:
-        """Size the field to fit its wrapped content, up to ``max_lines`` rows (then it scrolls) --
-        confocal's height formula (visual lines x line height + frame + doc margin)."""
-        lines = min(self._visual_line_count(), self._max_lines)
-        line_height = self.fontMetrics().lineSpacing()
-        frame = self.frameWidth() * 2
-        margin = int(self._doc_margin) * 2
-        total = int(math.ceil(lines * line_height + frame + margin) + 1)
-        self.setFixedHeight(total)
-        self.updateGeometry()
+        """Size the field to fit ALL its wrapped content (no row cap -> every line shown, no inner
+        scroll).
+
+        A ONE-line value must land at EXACTLY the single-line :class:`FluentReadoutEdit` height so an
+        Info row with a short value looks identical whether it is a line edit or this multi-line field.
+        So the height is ANCHORED to that single-row height -- ``scaled_px(30, minimum=22)``, the SAME
+        expression :class:`FluentLineEdit` uses for its own row -- and each EXTRA wrapped line adds one
+        ``lineSpacing``.  That base row already reserves the doc margin + PADDING_V + border of one text
+        line, and every added line contributes exactly its own text height, so the field grows to show
+        every line in full with none clipped (the QPlainTextEdit ``frameWidth`` is NOT used: with a
+        stylesheet 1 px border it over-reports and would inflate a one-line field past the line edit).
+
+        Re-entrancy guard: measuring the wrapped line count calls ``document().adjustSize()`` and the
+        resize re-lays-out the document, either of which can emit ``documentSizeChanged`` -- a connected
+        trigger of this method -- so an unguarded call recurses.  The flag lets the outermost call settle
+        the height; a nested emission is dropped, and the trailing ``documentSizeChanged`` from the final
+        resize re-runs it once cleanly (converging, since a fixed WIDTH gives a stable wrapped count)."""
+        if getattr(self, "_adjusting_height", False):
+            return
+        self._adjusting_height = True
+        try:
+            lines = self._visual_line_count()
+            line_height = self.fontMetrics().lineSpacing()
+            base_row = scaled_px(30, minimum=22)    # == FluentLineEdit's single-row height (one source)
+            total = base_row + (lines - 1) * line_height
+            if total != self.height():
+                self.setFixedHeight(total)
+            # Absorb any residual: if the wrapped content is still a hair taller than the anchored
+            # estimate (sub-pixel wrap rounding differs run-to-run), the scrollbar reports how many
+            # pixels are hidden -- add exactly those so the LAST line's glyphs are never clipped.  A
+            # one-line value has no residual, so it stays exactly the single-row height.
+            residual = self.verticalScrollBar().maximum()
+            if residual > 0:
+                self.setFixedHeight(total + residual)
+            self.updateGeometry()
+        finally:
+            self._adjusting_height = False
 
 
 class FluentPathEdit(QtWidgets.QWidget):
@@ -1358,14 +1393,21 @@ class _FluentRoundedMenu(QtWidgets.QMenu):
                             | QtCore.Qt.NoDropShadowWindowHint)
         # Transparent menu body (the card is painted, not a stylesheet background) + a rounded ACCENT
         # pill on the selected/hover row -- the same item chrome the combo drop-down uses.
+        # The item has a horizontal MARGIN inside the menu's own padding so the selected/hover pill's
+        # rounded rect sits fully WITHIN the card's rounded corners (a pill flush to the padding edge
+        # gets clipped by the arc -> a square-cornered grey band bleeding past the corner).  The
+        # ``::indicator`` is collapsed to nothing (image:none + 0x0) so a (formerly checkable) action
+        # never reserves a tick gutter that shifts the labels right / draws an un-Fluent check box.
         self.setStyleSheet(
             f"""
             QMenu {{ background: transparent; border: none;
                      padding: {scaled_px(4, minimum=3)}px;
                      font: {fluent_font_size()}pt "{FONT}"; color: {TEXT}; }}
             QMenu::item {{ padding: {scaled_px(5, minimum=4)}px {scaled_px(14, minimum=10)}px;
+                          margin: 0px {scaled_px(2, minimum=2)}px;
                           border-radius: {_radius()}px; }}
             QMenu::item:selected {{ background: {ACCENT}; color: white; }}
+            QMenu::indicator {{ image: none; width: 0px; height: 0px; }}
             """
         )
 
@@ -2100,9 +2142,11 @@ class FluentTabWidget(QtWidgets.QTabWidget):
         QtCore.QTimer.singleShot(0, self._update_overflow)
 
     def _overflow_menu(self) -> QtWidgets.QMenu:
-        """Build (but do not show) the Fluent overflow menu: one checkable action per tab
-        that selects it on trigger (Qt scrolls it into view).  Split out from the popup so
-        the click->select wiring is testable without a blocking ``exec_``.
+        """Build (but do not show) the Fluent overflow menu: one action per tab that selects it on
+        trigger (Qt scrolls it into view).  Split out from the popup so the click->select wiring is
+        testable without a blocking ``exec_``.  The actions are NOT checkable -- a checkable action
+        makes Qt reserve an indicator gutter and draw its own (un-Fluent) tick/check box; the current
+        tab is already the visibly-active pivot, so no tick is needed on the list.
 
         The card is rounded the SAME way every other Fluent popup is (the FluentPopup Setting card,
         the FluentComboBox drop-down): a stylesheet ``border-radius`` alone leaves the menu's opaque
@@ -2112,11 +2156,8 @@ class FluentTabWidget(QtWidgets.QTabWidget):
         PAINTS one antialiased rounded rect (white fill + 1 px border) behind its items -- the shared
         rounded-card single source, composited so the labels still draw on top."""
         menu = _FluentRoundedMenu(self)
-        current = self.currentIndex()
         for i in range(self.count()):
             act = menu.addAction(self.tabText(i))
-            act.setCheckable(True)
-            act.setChecked(i == current)
             act.triggered.connect(lambda _c, idx=i: self.setCurrentIndex(idx))
         return menu
 
