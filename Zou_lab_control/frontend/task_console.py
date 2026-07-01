@@ -3828,7 +3828,12 @@ class PanelEditor(QtWidgets.QWidget):
             # PLUS the relim chooser -- rendered through the card's SHARED _emit_param_rows, so the Edit
             # tab auto-exposes EVERY plot display ParamDecl with no hand-wiring (#H3v-4b).  Each edit
             # routes via _edit_param -> the live card (config.params + re-render) THEN re-snapshots here.
-            display_specs = [s for s in PANEL_PARAMS.get(card.config.kind, ()) if s.display] + [_RELIM_PARAM]
+            # relim AND repeat_mode: the SAME declarative display knobs the Setting popup renders (relim
+            # via _RELIM_PARAM, repeat_mode via _repeat_param_specs) are present HERE too, so the Edit tab
+            # is the FULL data_figure UI (whatever the Setting can tune, the Edit can too).  Both route
+            # through _edit_param -> card._set_param -- the ONE writer -- so Setting and Edit never drift.
+            display_specs = ([s for s in PANEL_PARAMS.get(card.config.kind, ()) if s.display]
+                             + [_RELIM_PARAM] + list(card._repeat_param_specs()))
             self.ed_params = card._emit_param_rows(display_specs, col.addWidget, self._edit_param, disp_lw)
             self.ed_cmap = self.ed_params.get("cmap")        # named back-refs (kept for tests / clarity)
             self.ed_relim = self.ed_params.get("relim")
@@ -3837,6 +3842,11 @@ class PanelEditor(QtWidgets.QWidget):
             self.ed_fixed_row, self.ed_fixed_lo, self.ed_fixed_hi = \
                 card._make_fixed_lim_row(self._edit_fixed_lim, disp_lw)
             col.addWidget(self.ed_fixed_row)
+            # The lo/hi row stays PERMANENTLY in the layout; only its inputs enable when relim ==
+            # "fixed".  A setVisible toggle on a row that sits ABOVE the snapshot canvas in this shared
+            # scroll page reflowed the unit row + the whole canvas DOWN by the row's height on every
+            # relim change -- the reported Edit-tab jump.  Greying in place leaves every widget put.
+            self._sync_fixed_lim_enabled(card._relim())
             # x-axis unit cycle -- the IDENTICAL row the Setting popup builds (shared helper), minus the
             # Setting-only current-unit label; the callback re-routes through the card's _on_unit_cycle.
             ed_unit_row, self.ed_unit_button, _ = \
@@ -4122,7 +4132,7 @@ class PanelEditor(QtWidgets.QWidget):
         if self.card is not None:
             self.card._set_param(key, value)
         if key == "relim" and getattr(self, "ed_fixed_row", None) is not None:
-            self.ed_fixed_row.setVisible(str(value) == "fixed")   # reveal lo/hi only in fixed (#H2)
+            self._sync_fixed_lim_enabled(str(value))   # enable lo/hi in fixed WITHOUT moving the page
         # A display-only knob the snapshot can apply IN PLACE updates here too without a re-snapshot:
         # rebuild() tears down + recreates this canvas, which flashes/resizes it (#dis-resize).
         snap = getattr(self, "_plotter", None)
@@ -4131,6 +4141,22 @@ class PanelEditor(QtWidgets.QWidget):
                 self._canvas.draw_idle()
             return
         self.rebuild()
+
+    def _sync_fixed_lim_enabled(self, relim: str) -> None:
+        """The Edit tab's fixed lo/hi row is ALWAYS in the layout -- only its INPUTS enable when
+        ``relim == "fixed"``.  A ``setVisible`` toggle on a row that sits above the snapshot canvas in
+        the shared scroll page reflowed the unit row + the whole canvas down by the row's height on
+        every relim change (the reported Edit-tab jump); greying the inputs in place leaves every
+        widget put.  (The Setting popup keeps its reveal-and-grow-down: it is a compact floating card
+        with nothing beneath the row, so growing downward moves nothing.)"""
+        if self.ed_fixed_row is not None:
+            # ALWAYS shown here (the shared _make_fixed_lim_row hides it by default for the Setting
+            # popup's reveal-on-fixed) -- so the footprint is constant and the canvas never moves.
+            self.ed_fixed_row.setVisible(True)
+        fixed = str(relim) == "fixed"
+        for w in (self.ed_fixed_lo, self.ed_fixed_hi):
+            if w is not None:
+                w.setEnabled(fixed)
 
     def _edit_fixed_lim(self) -> None:
         """Persist the Edit-tab fixed lo/hi (#H2) through the card's own handler (SAME

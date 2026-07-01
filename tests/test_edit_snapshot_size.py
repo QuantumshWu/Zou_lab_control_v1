@@ -312,3 +312,54 @@ def test_setting_popup_relim_fixed_grows_down_from_a_fixed_top_left():
     finally:
         console.shutdown()
         exp.close()
+
+
+def test_edit_tab_fixed_lim_toggle_never_moves_the_snapshot_canvas():
+    """The Edit-tab '跳'/jump: the fixed lo/hi row lives ABOVE the snapshot canvas in one shared
+    scroll page, so the old ``setVisible`` reveal reflowed the unit row + the whole canvas DOWN by the
+    row's height on every relim change.  Fixed: the row stays PERMANENTLY in the layout and only its
+    inputs enable when relim == 'fixed', so the canvas y-position is invariant across every relim mode
+    (unlike the Setting popup, which has nothing below the row and grows downward)."""
+    ensure_qt_app()
+    from PyQt5 import QtCore, QtWidgets
+    from Zou_lab_control.frontend.task_console import PanelEditor
+    exp, console = _console()
+    try:
+        editor = PanelEditor(_hist_card(console), console)
+        editor.rebuild()
+        holder = QtWidgets.QWidget(); QtWidgets.QVBoxLayout(holder).addWidget(editor)
+        holder.resize(360, 720); holder.show()
+        QtWidgets.QApplication.instance().processEvents()
+        page = editor.findChild(QtWidgets.QScrollArea).widget()
+        canvas_y = lambda: editor._canvas.mapTo(page, QtCore.QPoint(0, 0)).y()
+        ys, enabled = [], []
+        for mode in ("tight", "fixed", "tight", "normal", "fixed"):
+            editor._edit_param("relim", mode)
+            QtWidgets.QApplication.instance().processEvents()
+            assert editor.ed_fixed_row.isVisible(), "the Edit fixed lo/hi row must stay in the layout (never hidden)"
+            ys.append(canvas_y())
+            enabled.append(bool(editor.ed_fixed_lo.isEnabled()))
+        assert len(set(ys)) == 1, f"the snapshot canvas must NOT move when relim toggles (the jump), got y={ys}"
+        assert enabled == [False, True, False, False, True], f"lo/hi must enable ONLY in fixed, got {enabled}"
+    finally:
+        console.shutdown()
+        exp.close()
+
+
+def test_edit_tab_exposes_repeat_mode_like_the_setting_popup():
+    """repeat mode (the plot's repeat-DISPLAY collapse) must be tunable in the Edit tab too, not only
+    the Setting popup -- both render the SAME ``_repeat_param_specs`` and write ``config.params`` via the
+    one ``_set_param``, so the two surfaces never drift."""
+    ensure_qt_app()
+    from Zou_lab_control.frontend.task_console import PanelEditor
+    exp, console = _console()
+    try:
+        card = _hist_card(console)
+        editor = PanelEditor(card, console)
+        assert "repeat_mode" in editor.ed_params, "the Edit tab must render the repeat_mode row (like the Setting popup)"
+        modes = card._kind_repeat_modes()
+        editor._edit_param("repeat_mode", modes[-1])                    # editing it routes through the ONE writer
+        assert card.config.params.get("repeat_mode") == modes[-1]
+    finally:
+        console.shutdown()
+        exp.close()
