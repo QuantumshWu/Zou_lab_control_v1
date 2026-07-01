@@ -256,12 +256,15 @@ def test_notebook_rolling_run_accepts_a_scalar_window():
 # The dependency must point that way (consumers import FROM live), never the reverse (the plot layer
 # importing a renderer from the pulse_gui editor app).  These pins encode that so it cannot regress.
 def test_pulse_render_lives_in_the_plot_layer():
-    """The pulse render entry points are DEFINED in ``live.py`` (the plot layer that owns every kind's
-    render), not in the ``pulse_gui`` editor app."""
+    """The STRUCTURED-figure render entry points (pulse timeline + per-site grid) are DEFINED in
+    ``live.py`` (the plot layer that owns every kind's render), not in the ``pulse_gui`` editor app -- so
+    notebook replay, the editor preview and a seeded console panel all draw through the ONE builder.  The
+    grid builder ``build_grid_figure`` mirrors the pulse builder ``build_pulse_preview_plot``."""
     from Zou_lab_control.frontend import live as live_mod
-    for name in ("build_pulse_preview_plot", "annotate_pulse_variable_regions", "analog_bus_traces"):
+    for name in ("build_pulse_preview_plot", "annotate_pulse_variable_regions", "analog_bus_traces",
+                 "build_grid_figure", "grid_recipe_from_cells", "kind_for_plotter"):
         obj = getattr(live_mod, name, None)
-        assert obj is not None, f"live.py must define the pulse-render entry point {name!r}"
+        assert obj is not None, f"live.py must define the render/kind entry point {name!r}"
         assert obj.__module__ == live_mod.__name__, \
             f"{name} must be DEFINED in live.py (the plot layer), got {obj.__module__}"
 

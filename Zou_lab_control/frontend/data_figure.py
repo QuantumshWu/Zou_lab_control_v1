@@ -254,9 +254,62 @@ class DataFigure:
         fit_info = self._saved_fit_info()
         if fit_info is not None:
             info.setdefault("fit", fit_info)
+        # Stamp the plotter's OWN kind (reverse-looked-up from the ONE PLOT_KINDS table) so a bare
+        # ``plot.save()`` round-trips ``SavedFigure.kind`` to the SAME kind that drew it -- a
+        # HistogramFigure save reopens as ``hist`` (not a fallback 1-D line), a LiveSiteMap save as
+        # ``sites`` (rings, not a 2-D image), a grid as ``grid``.  Only when NEITHER ``self.info`` nor an
+        # explicit ``extra_info`` already carries a kind (those WIN -- e.g. the GUI panel stamps its own),
+        # and only when there IS a bound plotter to ask (a bare array DataFigure has nothing to stamp).
+        if "kind" not in info and self.live_plot is not None:
+            from .live import kind_for_plotter
+            auto_kind = kind_for_plotter(self.live_plot)
+            if auto_kind is not None:
+                info["kind"] = auto_kind
+        # SELF-CONTAINED site map: a bare LiveSiteMap save (no hub binding -- the calibration report, a
+        # notebook site map) has no ``info['signals']`` from the rich capture, so a reopen would show
+        # rings on an EMPTY board (the underlay camera frame was never stored -- the reported bug where
+        # site_map.npz was ~1 KB).  Fold the plot's OWN centres + background frame into ``info['signals']``
+        # (the SAME faithful-path blocks a rich save writes), so the figure's data is self-contained: the
+        # reopen rebuilds the rings AND the template underlay without any device provenance.  Only when no
+        # signals block already exists (a rich save's WINS).
+        if info.get("kind") == "sites" and not info.get("signals"):
+            underlay = self._sites_underlay_signals()
+            if underlay:
+                info["signals"] = underlay
         self.fig.savefig(image_path, bbox_inches="tight")
         np.savez(data_path, data_x=self.data_x_original, data_y=self.data_y, info=info)
         return {"figure": image_path, "data": data_path}
+
+    def _sites_underlay_signals(self) -> dict[str, Any]:
+        """The self-contained ``info['signals']`` blocks a bare SITE-MAP save folds in so a reopen rebuilds
+        the rings AND the background camera frame WITHOUT any device provenance -- the ``value`` occupancy,
+        the ``(N, 2)`` centres and (crucially) the underlay ``frame`` -- in the SAME schema the rich
+        capture (``operations.figure_capture``) writes.  Empty when there is nothing to store (no bound
+        site-map plotter / no background frame), so a save is never blocked.  The blocks carry the native
+        ``(repeat, *points, *data)`` axes (occupancy ``(1, 1, N)``, frame ``(1, 1, H, W)``) so the reloader
+        declares the SAME shape contract a live producer did."""
+        lp = self.live_plot
+        centers = getattr(lp, "data_x", None)
+        background = getattr(lp, "background", None)
+        if lp is None or centers is None:
+            return {}
+        centers = np.asarray(centers, dtype=float)[:, :2]
+        n = centers.shape[0]
+        occ = np.asarray(getattr(lp, "data_y", self.data_y), dtype=float).reshape(-1)[:n].reshape(1, 1, n)
+        ylabel = self.labels[1] if len(self.labels) > 1 else "occupancy"
+        signals: dict[str, Any] = {
+            "occupied": {"block": occ, "points_shape": [1], "data_shape": [n],
+                         "label": str(ylabel), "unit": "", "role": "value"},
+            "centers": {"block": centers, "points_shape": None, "data_shape": None,
+                        "label": "site centre", "unit": "px", "role": "centers"},
+        }
+        if background is not None:
+            frame = np.asarray(background, dtype=float)
+            h, w = frame.shape
+            signals["frame_judged"] = {"block": frame.reshape(1, 1, h, w), "points_shape": [1],
+                                       "data_shape": [h, w], "label": "camera image", "unit": "counts",
+                                       "role": "frame"}
+        return signals
 
     def _saved_fit_info(self) -> dict[str, Any] | None:
         """The applied fit as a JSON-friendly dict (``func`` + ``names`` + ``popt``) for the
@@ -980,11 +1033,13 @@ class SavedFigure:
             return self._replay_recipe(recipe)
         return self._plot_from_arrays(kind, size, **overrides)
 
-    def _replay_recipe(self, recipe: Mapping[str, Any]) -> "DataFigure":
+    def _replay_recipe(self, recipe: Mapping[str, Any]):
         """Re-render a STRUCTURED figure from its ``figure_recipe`` -- a faithful reproduction from the
         recipe's OWN source, not the fallback ``data_x`` / ``data_y``.  Dispatch is by ``recipe['kind']``,
         so each structured-figure family owns its rebuild here (and a new family adds a branch); an
-        unknown recipe kind falls back to the ordinary array ``plot`` so nothing crashes.
+        unknown recipe kind falls back to the ordinary array ``plot`` so nothing crashes.  Returns the
+        family's figure handle (a single-axes :class:`DataFigure` for pulse; a composite grid handle for
+        grid), each carrying ``.fig`` + ``.save``.
 
         ``pulse`` -> rebuild the ``PulseTableState`` and re-draw the pulse figure through the SAME
         :func:`~.live.build_pulse_preview_plot` the plot layer owns, so every digital channel / analog
@@ -994,6 +1049,8 @@ class SavedFigure:
         rkind = str(recipe.get("kind") or "")
         if rkind == "pulse":
             return self._replay_pulse(recipe)
+        if rkind == "grid":
+            return self._replay_grid(recipe)
         # Unknown structured kind: fall back to the ordinary array reproduction (never crash on reopen).
         return self._plot_from_arrays()
 
@@ -1050,6 +1107,31 @@ class SavedFigure:
         df.info = {**df.info, **{k: v for k, v in self.info.items() if k != "labels"}}
         df.name = self.name or df.name
         return df
+
+    def grid_recipe(self) -> Mapping[str, Any] | None:
+        """The per-site GRID replay recipe for a ``kind="grid"`` save -- the single object the WHOLE grid
+        reproduction uses (the notebook ``.plot()`` rebuilds its figure from it, AND the Task console seeds
+        a ``kind="grid"`` PANEL bound to it, published as ``fig_value``), so both redraw the SAME faithful
+        grid through the ONE :func:`~.live.build_grid_figure` builder.  This is the grid counterpart of
+        :meth:`pulse_state`.  ``None`` when this is not a grid figure."""
+        recipe = self.figure_recipe
+        if recipe is None or str(recipe.get("kind") or "") != "grid":
+            return None
+        return recipe
+
+    def _replay_grid(self, recipe: Mapping[str, Any]):
+        """Rebuild the per-site grid figure: the stored recipe -> :func:`~.live.build_grid_figure` -> its
+        composite grid ``DataFigure`` (a :class:`~.live._GridData`).  The grid RENDER lives in the PLOT
+        LAYER (live.py), so notebook replay and a seeded console panel both draw through the ONE builder,
+        identical code (the grid counterpart of :meth:`_replay_pulse`).
+
+        Returns the grid's composite handle (it carries the whole-grid ``.fig`` for display + a per-cell
+        :class:`DataFigure` via ``.cell(k)`` + its own recipe-aware ``.save``), not a single-axes
+        ``DataFigure`` -- a grid is intrinsically multi-axes, so there is nothing to flatten to one axes."""
+        from .live import build_grid_figure
+
+        plotter = build_grid_figure(recipe, display=False)
+        return plotter.to_data_figure()
 
     def _plot_from_arrays(self, kind: str | None = None, size: str | None = None, **overrides):
         """The ordinary array-figure reproduction (``data_x`` / ``data_y`` -> :func:`~.live.plot`) -- the

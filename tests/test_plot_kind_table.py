@@ -133,6 +133,12 @@ def _build_one(pk: PlotKind):
     if pk.key == "pulse":
         return zf.plot([{"channel": "a", "start": 0.0, "duration": 1.0, "level": 1}],
                        kind="pulse", display=False)
+    if pk.key == "grid":
+        # grid has a per-cell construction (a GridCell, not a data_x/data_y array), so it is built through
+        # its own factory -- NOT ``zf.plot(kind="grid")`` (which rejects it, like pulse).
+        from Zou_lab_control.frontend.live import site_histogram_grid
+        per_site = [rng.normal(3, 1, 60) for _ in range(6)]
+        return site_histogram_grid(per_site, thresholds=[3.0] * 6, display=False)
     # 1d / monitor
     return zf.plot(x, y, kind=pk.key, display=False, update="once")
 
@@ -147,6 +153,13 @@ def test_built_plot_family_matches_declared_and_legacy_artist_heuristic():
         p = _build_one(pk)
         try:
             assert isinstance(p, pk.cls), f"{pk.key}: plot() built {type(p).__name__}, not {pk.cls.__name__}"
+            if pk.key == "grid":
+                # A grid is a COMPOSITE multi-axes plot: its ``to_data_figure`` returns a per-cell
+                # composite (``_GridData``), not a single-axes DataFigure with one fitting family -- each
+                # CELL is its own DataFigure.  The single-family artist heuristic below is meaningless for
+                # it, so it is exempt here (its per-cell DataFigures are exercised by the grid save/load
+                # round-trip in test_saved_figure_load).
+                continue
             df = p.to_data_figure()
             assert df.plot_type in _FIT_FAMILIES, (pk.key, df.plot_type)
             legacy = "2D" if df._ax.images else "1D"

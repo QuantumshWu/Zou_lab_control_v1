@@ -1062,6 +1062,9 @@ PANEL_PARAMS: dict[str, tuple[ParamDecl, ...]] = {
         ParamDecl(key="include_always_off", label="show off rows", kind="bool", default=True, display=True,
                   tooltip="Draw channel rows that stay OFF the whole sequence (and idle DAC buses)"),
     ),
+    # A grid panel (seeded from a saved per-site grid figure) has NO display knobs: the whole grid --
+    # cell family, thresholds, fidelities -- is fixed by the saved recipe and rendered faithfully.
+    "grid": (),
 }
 
 
@@ -1654,7 +1657,8 @@ class PanelCard(FluentGroupBox):
                  sources_provider=None, formats_provider=None, axes_provider=None,
                  sites_inputs_provider=None, curve_x_provider=None,
                  structure_provider=None, short_names_provider=None,
-                 live_namespace_provider=None, pulse_state_provider=None):
+                 live_namespace_provider=None, pulse_state_provider=None,
+                 grid_recipe_provider=None):
         # Titled frame: the title strip carries the panel KIND (top-left) and the
         # Setting button (top-right), so the card is delineated like the rest.
         super().__init__(PANEL_KINDS[config.kind], parent, shadow=True)
@@ -1696,6 +1700,10 @@ class PanelCard(FluentGroupBox):
         # reproduction state off the SAME producing node (the object is carried on the node, not the
         # float-only hub) -- the SAME "aux data from the producing node" wiring the site map uses.
         self.pulse_state_provider = pulse_state_provider
+        # callable(value_signal) -> grid recipe dict: a GRID panel resolves its replay recipe off the SAME
+        # producing node the SAME way a pulse panel resolves its state (a dict carried on the node, the
+        # float-only hub cannot hold it).
+        self.grid_recipe_provider = grid_recipe_provider
         self.plotter = None
         self.canvas = None
         self._value_shape: tuple[int, ...] | None = None
@@ -3165,6 +3173,22 @@ class PanelCard(FluentGroupBox):
             # fall back to the node's recorded value when the param is unset -- so toggling re-renders.
             include_off = bool(self.config.params.get("include_always_off", node_include_off))
             plotter, _channels, _repeat = build_pulse_preview_plot(state, include_always_off=include_off)
+        elif kind == "grid":
+            # A grid panel renders its per-site distribution / kernel grid through the ONE grid builder in
+            # the PLOT LAYER (``live.build_grid_figure`` -- the SAME one ``na.load_figure(npz).plot()`` and
+            # the report use).  Its reproduction RECIPE (a dict) is an OBJECT the float-only hub cannot
+            # carry, so it is resolved off the producing node via ``grid_recipe_provider`` -- the SAME "aux
+            # data from the producing node" wiring the pulse panel + site map use (the hub ``value`` here is
+            # only a numeric placeholder).  Its geometry (cell count-driven size) is frontend-owned.
+            from .live import build_grid_figure
+
+            recipe = self.grid_recipe_provider(self.config.inputs[0]) \
+                if (callable(self.grid_recipe_provider) and self.config.inputs) else None
+            if recipe is None:
+                raise ValueError(
+                    "grid panel needs a grid figure's producing node -- point it at a loaded grid "
+                    "figure's fig_value signal (it carries the grid recipe to reproduce).")
+            plotter = build_grid_figure(recipe, interactions=False, display=False)
         elif kind == "sites":
             centers, image = self._sites_aux(namespace or {})
             vec = np.asarray(value, dtype=float).reshape(-1)
@@ -4186,7 +4210,29 @@ class PanelEditor(QtWidgets.QWidget):
         view = card._view_kwargs(kind)   # ONE source: relim mode + fixed lo/hi -- for sites too (#4)
         cmap = _resolved_cmap(kind, card.config.params)   # operator pick, else the kind default (ONE resolver)
         try:
-            if kind == "2d":
+            if kind == "pulse":
+                # A pulse panel's snapshot rebuilds through the SAME renderer the live card uses
+                # (``build_pulse_preview_plot`` via the console's ``_pulse_state`` provider) -- NEVER the
+                # else (1d/monitor) branch, which reads ``src.data_x``/``data_y`` a PulseSequenceFigure does
+                # not carry (that was the blank-Edit-tab bug).  ``include_always_off`` comes from the card's
+                # own params (same source as the live card), falling back to the node's recorded value.
+                from .live import build_pulse_preview_plot
+                resolved = self.console._pulse_state(card.config.inputs[0]) if card.config.inputs else None
+                if resolved is None:
+                    raise ValueError("pulse panel has no producing node to snapshot")
+                state, node_include_off = resolved
+                include_off = bool(card.config.params.get("include_always_off", node_include_off))
+                new_plotter, _channels, _repeat = build_pulse_preview_plot(state, include_always_off=include_off)
+            elif kind == "grid":
+                # A grid panel's snapshot rebuilds through the SAME grid builder the live card uses
+                # (``build_grid_figure`` via the console's ``_grid_recipe`` provider) -- the grid mirror of
+                # the pulse branch, never the array else branch.
+                from .live import build_grid_figure
+                recipe = self.console._grid_recipe(card.config.inputs[0]) if card.config.inputs else None
+                if recipe is None:
+                    raise ValueError("grid panel has no producing node to snapshot")
+                new_plotter = build_grid_figure(recipe, interactions=True, display=False)
+            elif kind == "2d":
                 new_plotter = panel_plot(np.array(src.data_x, dtype=float),
                                          np.array(src.data_y[:, 0], dtype=float), kind="2d",
                                          size=size, cmap=cmap, **view,
@@ -5280,6 +5326,7 @@ class TaskConsole(QtWidgets.QWidget):
             formats_provider=self._signal_formats, axes_provider=self._signal_axes,
             sites_inputs_provider=self._sites_inputs, curve_x_provider=self._curve_x,
             structure_provider=self._signal_structure, pulse_state_provider=self._pulse_state,
+            grid_recipe_provider=self._grid_recipe,
             short_names_provider=self._signal_short_names, live_namespace_provider=self._expression_namespace)
 
     def _attach_card(self, card: PanelCard) -> None:
@@ -5555,6 +5602,23 @@ class TaskConsole(QtWidgets.QWidget):
                 published = set()
             if name in published and getattr(node, "pulse_state", None) is not None:
                 return (node.pulse_state, bool(getattr(node, "pulse_include_always_off", True)))
+        return None
+
+    def _grid_recipe(self, value_signal):
+        """For a GRID panel's ``value`` signal, resolve its replay RECIPE (a dict) off the SAME producing
+        node -- the loaded-figure node CARRIES the recipe as an attribute (the float-only hub cannot hold
+        the dict), exactly as :meth:`_pulse_state` resolves a pulse panel's state.  ``None`` when no running
+        node produces this signal with a grid recipe."""
+        name = str(value_signal or "")
+        if not name:
+            return None
+        for node in self.running_nodes:
+            try:
+                published = set(node.published_signals())
+            except Exception:
+                published = set()
+            if name in published and getattr(node, "grid_recipe", None) is not None:
+                return node.grid_recipe
         return None
 
     def _live_node_formats(self, node) -> list[tuple[str, str, str]]:

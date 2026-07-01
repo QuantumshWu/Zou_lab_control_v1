@@ -458,6 +458,173 @@ def _saved_pulse_recipe_npz(tmp_path) -> Path:
     return path
 
 
+def _saved_grid_npz(tmp_path, *, cell="hist") -> Path:
+    """Save a per-site GRID figure (hist or psf-image cell) through its OWN save, and return the ``.npz``
+    path -- a real grid save (kind='grid' + figure_recipe), so the viewer's grid load path is exercised."""
+    from Zou_lab_control.frontend.live import site_histogram_grid, site_psf_grid
+    rng = np.random.default_rng(7)
+    if cell == "image":
+        g = site_psf_grid([np.abs(rng.normal(size=(7, 7))) for _ in range(6)], display=False)
+    else:
+        g = site_histogram_grid([np.concatenate([rng.normal(200, 20, 40), rng.normal(1200, 60, 40)])
+                                 for _ in range(6)], thresholds=[700.0] * 6,
+                                site_fidelities=[0.99] * 6, display=False)
+    out = g.save(str(tmp_path / f"grid_{cell}"))
+    plt.close(g.fig)
+    return Path(out["data"])
+
+
+def test_grid_reopens_as_a_normal_panelcard_on_the_same_board(tmp_path):
+    """A per-site GRID figure reopens through the EXACT SAME load path as pulse (and every other kind):
+    ``LoadedFigureNode`` publishes ``fig_value`` (a numeric placeholder; the grid recipe is carried on the
+    node), ``_seed_state`` seeds a ``kind="grid"`` panel bound to it, and the SAME :class:`PanelCard`
+    renders it via its ``grid`` branch (``build_grid_figure``).  Pins: real console (never replaced),
+    Monitor tab survives, the seeded card is a NORMAL PanelCard of kind=grid wired to ``fig_value``, it
+    renders a faithful GridPlot through the tick, and ``grid`` is NOT in the live Add-Panel dropdown."""
+    from Zou_lab_control.frontend.task_console import PanelCard
+    npz = _saved_grid_npz(tmp_path)
+    v = show_figure_viewer(npz)
+    try:
+        con = v.console
+        assert isinstance(con, TaskConsole), "a grid figure opens on the SAME console (never replaced)"
+        assert v.saved.kind == "grid"
+        tab_titles = {con.tabs.tabText(i) for i in range(con.tabs.count())}
+        assert "Monitor" in tab_titles, "the Monitor tab survives a grid load"
+        assert len(con.cards) == 1
+        card = con.cards[0]
+        assert type(card) is PanelCard, "the loaded grid card is a NORMAL PanelCard (same seed path)"
+        assert card.config.kind == "grid" and card.config.inputs[0] == FIG_SIGNAL
+        assert card.config.size == "2x2", "a grid panel opens at the default 2x2 preset like every kind"
+        assert FIG_SIGNAL in set(v.hub.names()), "fig_value is published like every other kind"
+        # the producing node carries the reproduction recipe (the hub is float-only)
+        assert v.node is not None and v.node.grid_recipe is not None
+        con._tick()
+        plotter = card.plotter
+        assert type(plotter).__name__ in ("SiteHistogramGrid", "GridPlot"), "PanelCard renders grid faithfully"
+        assert plotter.n_cells == 6, "the reproduced grid has the saved site count"
+        # grid is a SEEDABLE kind but NOT live-addable -> absent from the Add-Panel dropdown
+        combo_kinds = {con.kind_combo.itemData(i) for i in range(con.kind_combo.count())}
+        assert "grid" not in {k for k in combo_kinds if isinstance(k, str)}, \
+            "grid is not offered in the live Add-Panel dropdown (seedable, not live-addable)"
+    finally:
+        win = v.window()
+        if win is not None:
+            win.close(); win.deleteLater()
+        v.teardown()
+        plt.close("all")
+
+
+def test_grid_image_cell_reopens_faithfully(tmp_path):
+    """A PSF-kernel GRID (cell='image') reopens the same way and renders imshow cells (a GridPlot of
+    ImageCell), not a hist grid -- the recipe's ``cell`` selects the family faithfully."""
+    npz = _saved_grid_npz(tmp_path, cell="image")
+    v = show_figure_viewer(npz)
+    try:
+        assert v.saved.grid_recipe()["cell"] == "image"
+        card = v.console.cards[0]
+        assert card.config.kind == "grid"
+        v.console._tick()
+        assert card.plotter is not None and card.plotter.n_cells == 6
+        # image cells carry an imshow per cell (no threshold lines)
+        assert any(len(ax.get_images()) >= 1 for ax in card.plotter.site_axes)
+    finally:
+        win = v.window()
+        if win is not None:
+            win.close(); win.deleteLater()
+        v.teardown()
+        plt.close("all")
+
+
+def test_pulse_panel_opens_at_default_2x2_and_edit_tab_is_not_blank(tmp_path):
+    """Regression pins: (1) a loaded pulse panel opens at the DEFAULT 2x2 preset (the ``_pulse_panel_size``
+    content-fit special-case was removed -- pulse sizes like every other kind); (2) the pulse panel's Edit
+    tab is NOT blank -- ``PanelEditor.rebuild`` has a ``pulse`` branch that rebuilds a real
+    ``PulseSequenceFigure`` through the SAME renderer the live card uses (the reported blank-Edit bug)."""
+    from Zou_lab_control.frontend.task_console import PanelEditor
+    npz = _saved_pulse_recipe_npz(tmp_path)
+    v = show_figure_viewer(npz)
+    try:
+        con = v.console
+        card = con.cards[0]
+        assert card.config.kind == "pulse"
+        assert card.config.size == "2x2", "the pulse panel opens at the default 2x2 (no content-fit special-case)"
+        con._tick()
+        # open the real Edit tab and rebuild its snapshot -- it must build a PulseSequenceFigure, not blank
+        con._edit_card(card)
+        editor = next(con.tabs.widget(i) for i in range(con.tabs.count())
+                      if isinstance(con.tabs.widget(i), PanelEditor) and con.tabs.widget(i).card is card)
+        editor.rebuild()
+        assert editor._plotter is not None, "the pulse Edit tab builds a snapshot (not blank)"
+        assert type(editor._plotter).__name__ == "PulseSequenceFigure", \
+            "the Edit-tab snapshot is a faithful pulse figure (rebuild has a pulse branch)"
+        assert len(editor._plotter.channels) >= 1
+    finally:
+        win = v.window()
+        if win is not None:
+            win.close(); win.deleteLater()
+        v.teardown()
+        plt.close("all")
+
+
+def test_pulse_panel_size_dead_symbol_is_gone():
+    """The ``_pulse_panel_size`` content-fit special-case was DELETED (pulse now uses the default 2x2 like
+    every other kind).  Pin it is a dead symbol = 0: the figure_viewer module must not define it."""
+    import Zou_lab_control.frontend.figure_viewer as fv
+    assert not hasattr(fv, "_pulse_panel_size"), "_pulse_panel_size must be fully removed (dead symbol = 0)"
+
+
+def test_calibration_report_every_npz_loads_as_correct_kind(tmp_path):
+    """END-TO-END: ``save_calibration_report`` (6 sites, template, psf_weights, by_method) writes its
+    report npz, and EVERY one reopens via ``load_figure`` at the CORRECT kind -- pooled -> ``hist``,
+    site_map -> ``sites`` (WITH its template underlay frame, not an empty board), site_distribution_* /
+    psf_grid -> ``grid``.  This is the reported bug fixed end-to-end (grid unloadable, sites frame missing,
+    single figures falling back to the wrong type)."""
+    from Zou_lab_control.frontend.calibration_report import save_calibration_report
+    from Zou_lab_control.frontend.data_figure import load_figure
+
+    rng = np.random.default_rng(0)
+    n_sites, n_shots = 6, 120
+    dark = rng.normal(200, 40, size=(n_shots // 2, n_sites))
+    bright = rng.normal(1200, 120, size=(n_shots - n_shots // 2, n_sites))
+    counts = np.vstack([dark, bright])
+    thresholds = np.full(n_sites, 700.0)
+    fidelity = np.full(n_sites, 0.99)
+    centers = np.array([[10 + 9 * i, 20.0] for i in range(n_sites)], dtype=float)
+    template = rng.normal(600, 30, size=(48, 64)).astype(float)
+    psf_weights = np.abs(rng.normal(size=(n_sites, 7, 7)))
+    by_method = {
+        "box": {"counts": counts, "thresholds": thresholds, "fidelity": fidelity},
+        "psf": {"counts": counts + rng.normal(0, 10, counts.shape), "thresholds": thresholds, "fidelity": fidelity},
+    }
+    paths = save_calibration_report(
+        tmp_path, counts=counts, thresholds=thresholds, fidelity=fidelity, centers=centers,
+        template=template, threshold_method="otsu", timestamp="t", by_method=by_method,
+        psf_weights=psf_weights)
+
+    expected_kind = {
+        "global_distribution": "hist",
+        "site_map": "sites",
+        "site_distribution_box": "grid",
+        "site_distribution_psf": "grid",
+        "psf_grid": "grid",
+    }
+    try:
+        for name, kind in expected_kind.items():
+            assert name in paths, f"the report is missing {name}"
+            npz = Path(paths[name]).with_suffix(".npz")
+            assert npz.exists(), f"{name} wrote no .npz"
+            saved = load_figure(npz)
+            assert saved.kind == kind, f"{name} loaded as {saved.kind!r}, expected {kind!r}"
+        # the site map is self-contained: its stored signals carry the template FRAME (a non-empty
+        # underlay), so a reopen shows the background image, not bare rings on an empty board
+        site_map = load_figure(Path(paths["site_map"]).with_suffix(".npz"))
+        signals = site_map.info.get("signals")
+        assert isinstance(signals, dict) and any(e.get("role") == "frame" for e in signals.values()), \
+            "the site_map save is self-contained -- it stored its template underlay frame"
+    finally:
+        plt.close("all")
+
+
 def test_pulse_seeds_a_normal_panelcard_via_the_same_load_path(tmp_path):
     """The reported bug: loading a PULSE figure wiped the console / Monitor tab (an old special-case
     replaced the whole board).  A pulse figure now takes the EXACT SAME load path as every other kind:

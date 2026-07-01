@@ -170,6 +170,160 @@ def test_na_facade_exposes_load_figure(tmp_path):
     assert saved.kind == "hist"
 
 
+# ---- bare-save kind round-trip: plot.save() stamps the plotter's OWN kind (single source) ----------
+def _build_plotter_of_kind(key: str):
+    """Build ONE plotter of ``key`` with kind-appropriate data, through the SAME factories a notebook
+    uses -- so ``plotter.save()`` (no explicit ``kind``) is exercised for every savable kind."""
+    from Zou_lab_control.frontend.live import site_histogram_grid, site_psf_grid
+    rng = np.random.default_rng(1)
+    if key == "2d":
+        xy = np.column_stack([np.tile(np.arange(7), 7), np.repeat(np.arange(7), 7)])
+        return plot(xy, rng.normal(size=49), kind="2d", display=False, update="once", data_figure=True)
+    if key == "sites":
+        centers = np.column_stack([(np.arange(9) % 3) * 5.0, (np.arange(9) // 3) * 5.0])
+        frame = rng.normal(600.0, 30.0, (30, 30))
+        return plot(centers, rng.random(9), kind="sites", display=False, update="once",
+                    data_figure=True, image=frame)
+    if key == "hist":
+        vals = np.concatenate([rng.normal(3, 1, 150), rng.normal(40, 4, 160)])
+        return plot(vals, kind="hist", display=False, update="once", data_figure=True)
+    if key == "grid":
+        return site_histogram_grid([rng.normal(3, 1, 60) for _ in range(6)],
+                                   thresholds=[3.0] * 6, display=False)
+    if key == "grid_image":
+        return site_psf_grid([np.abs(rng.normal(size=(7, 7))) for _ in range(6)], display=False)
+    # 1d / monitor
+    x = np.linspace(0, 1, 40).reshape(-1, 1)
+    y = np.sin(np.linspace(0, 6, 40)).reshape(-1, 1)
+    return plot(x, y, kind=key, display=False, update="once", data_figure=True)
+
+
+import pytest as _pytest  # noqa: E402
+
+
+@_pytest.mark.parametrize("key", ["2d", "sites", "1d", "monitor", "hist", "grid", "grid_image"])
+def test_bare_save_round_trips_the_plotters_own_kind(tmp_path, key):
+    """THE single-source kind round-trip: a bare ``plotter.save()`` (no explicit ``kind`` argument) stamps
+    the plotter's OWN registered kind into the saved ``info``, so ``load_figure().kind`` round-trips to the
+    SAME kind that drew it -- a HistogramFigure -> ``hist``, a LiveSiteMap -> ``sites``, a grid -> ``grid``
+    (not a shape-inferred fallback that flips a hist to a line or a site map to a 2-D image).  The saved
+    kind is also FIRST in ``compatible_kinds`` (reproduces the original)."""
+    plotter = _build_plotter_of_kind(key)
+    expected = "grid" if key == "grid_image" else key
+    try:
+        out = plotter.save(str(tmp_path / f"bare_{key}"))
+        saved = load_figure(out["data"])
+        assert saved.kind == expected, f"{key}: bare save did not round-trip kind (got {saved.kind!r})"
+        assert saved.compatible_kinds()[0] == expected, f"{key}: saved kind must be first in compatible_kinds"
+    finally:
+        plt.close("all")
+
+
+def test_kind_for_plotter_is_single_source_reverse_lookup():
+    """``kind_for_plotter`` reverse-looks-up a plotter's kind from the ONE PLOT_KINDS table (never a
+    hand-typed name), resolving a SUBCLASS to its base kind (SiteHistogramGrid / a psf grid -> ``grid``;
+    the rolling-trace LiveLiveDis -> ``monitor``) and ``None`` for a non-plotter."""
+    from Zou_lab_control.frontend.live import (kind_for_plotter, HistogramFigure, LiveSiteMap,
+                                               Live2DDis, Live1D, LiveLiveDis, SiteHistogramGrid,
+                                               PulseSequenceFigure)
+    rng = np.random.default_rng(2)
+    cases = {
+        "hist": _build_plotter_of_kind("hist"),
+        "sites": _build_plotter_of_kind("sites"),
+        "2d": _build_plotter_of_kind("2d"),
+        "1d": _build_plotter_of_kind("1d"),
+        "monitor": _build_plotter_of_kind("monitor"),
+        "grid": _build_plotter_of_kind("grid"),
+    }
+    try:
+        for expected, plotter in cases.items():
+            assert kind_for_plotter(plotter) == expected, (expected, type(plotter).__name__)
+        assert kind_for_plotter(object()) is None, "a non-plotter has no kind to stamp"
+    finally:
+        plt.close("all")
+
+
+# ---- grid -> figure_recipe save -> faithful reproduction (structured-figure path, mirrors pulse) ----
+def test_grid_save_stores_a_faithful_figure_recipe(tmp_path):
+    """A per-site grid save stores a REPLAY RECIPE (the grid counterpart of the pulse recipe), not just a
+    flat array: the npz ``info`` carries ``kind == 'grid'`` and ``figure_recipe['kind'] == 'grid'`` whose
+    ``per_cell`` / ``thresholds`` rebuild the exact grid.  ``grid`` is the only compatible kind (the arrays
+    are a lossy fallback)."""
+    from Zou_lab_control.frontend.live import site_histogram_grid
+    rng = np.random.default_rng(3)
+    per_site = [np.concatenate([rng.normal(200, 20, 40), rng.normal(1200, 60, 40)]) for _ in range(6)]
+    grid = site_histogram_grid(per_site, thresholds=[700.0] * 6, site_fidelities=[0.99] * 6, display=False)
+    try:
+        out = grid.save(str(tmp_path / "site_grid"))
+        assert Path(out["figure"]).exists() and Path(out["data"]).exists()
+        saved = load_figure(out["data"])
+        assert saved.kind == "grid"
+        recipe = saved.figure_recipe
+        assert isinstance(recipe, dict) and recipe.get("kind") == "grid" and recipe.get("cell") == "hist"
+        assert len(recipe["per_cell"]) == 6
+        assert recipe["thresholds"] == [700.0] * 6
+        assert saved.compatible_kinds() == ["grid"], "structured grid figure: only its recipe kind"
+    finally:
+        plt.close("all")
+
+
+def test_grid_recipe_reopens_as_faithful_grid(tmp_path):
+    """``na.load_figure(npz).plot()`` reproduces the ORIGINAL grid faithfully (a rebuilt SiteHistogramGrid
+    with the same site count + thresholds), not a flattened line -- the grid mirror of the pulse recipe
+    reopen.  A PSF-kernel grid (cell='image') reopens as an image-cell grid the same way."""
+    from Zou_lab_control.frontend.live import site_histogram_grid, site_psf_grid, SiteHistogramGrid, GridPlot
+    import Zou_lab_control.neutral_atom as na
+    rng = np.random.default_rng(4)
+
+    hist_grid = site_histogram_grid([rng.normal(3, 1, 50) for _ in range(6)],
+                                    thresholds=[3.0] * 6, display=False)
+    out = hist_grid.save(str(tmp_path / "hist_grid"))
+    plt.close(hist_grid.fig)
+    saved = na.load_figure(out["data"])
+    try:
+        reopened = saved.plot()                             # the recipe replay path
+        grid_plotter = reopened.grid
+        assert isinstance(grid_plotter, SiteHistogramGrid), "a hist grid reopens as a SiteHistogramGrid"
+        assert grid_plotter.n_cells == 6, "the reproduced grid has the same site count"
+        assert list(grid_plotter.thresholds) == [3.0] * 6, "the reproduced thresholds match"
+    finally:
+        plt.close("all")
+
+    psf_grid = site_psf_grid([np.abs(rng.normal(size=(7, 7))) for _ in range(6)], display=False)
+    out2 = psf_grid.save(str(tmp_path / "psf_grid"))
+    plt.close(psf_grid.fig)
+    saved2 = na.load_figure(out2["data"])
+    try:
+        assert saved2.kind == "grid" and saved2.figure_recipe["cell"] == "image"
+        reopened2 = saved2.plot()
+        assert isinstance(reopened2.grid, GridPlot) and reopened2.grid.n_cells == 6
+    finally:
+        plt.close("all")
+
+
+def test_recipeless_grid_save_falls_back_to_arrays_not_a_crash(tmp_path, monkeypatch):
+    """A grid save whose recipe capture FAILS must NOT stamp ``kind='grid'`` (which would send the reopen
+    down ``plot(kind='grid')`` -- rejected, like pulse -- and crash).  Without a recipe the save has NO
+    ``kind`` and the ``data_x`` / ``data_y`` fallback reopens through shape inference, exactly as the save's
+    docstring promises ('degrades to the array-only fallback').  This pins the kind/recipe pairing so a
+    future GridCell family with no recipe cannot produce an unloadable npz."""
+    from Zou_lab_control.frontend import live as live_mod
+    from Zou_lab_control.frontend.live import site_histogram_grid
+    # Force the recipe capture to fail (a future/custom cell family that has no recipe).
+    monkeypatch.setattr(live_mod, "grid_recipe_from_cells",
+                        lambda grid: (_ for _ in ()).throw(TypeError("no recipe")))
+    grid = site_histogram_grid([np.random.normal(0, 1, 30) for _ in range(4)], display=False)
+    try:
+        out = grid.save(str(tmp_path / "recipeless"))
+        saved = load_figure(out["data"])                    # must NOT raise (the reported latent crash)
+        assert saved.kind is None, "a recipe-less grid save carries NO grid kind (avoids plot(kind='grid'))"
+        assert saved.figure_recipe is None
+        df = saved.plot()                                   # shape-inferred array fallback -- must not raise
+        assert df.fig is not None
+    finally:
+        plt.close("all")
+
+
 # ---- pulse-preview -> figure_recipe save -> faithful reproduction (structured-figure path) --------
 def _pulse_editor():
     """A headless PulseSequenceEditor whose preview draws real MULTI-channel 0/1 transitions AND a real

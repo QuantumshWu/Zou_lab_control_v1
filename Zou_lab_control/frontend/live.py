@@ -2690,10 +2690,31 @@ PLOT_KINDS: tuple[PlotKind, ...] = (
     ),
     # Notebook-only static timing diagram -- NOT a console Add-Panel kind.
     PlotKind(key="pulse", cls=PulseSequenceFigure, label="Pulse sequence", render_family="1D", panel=False),
+    # NOTE: the per-site GRID kind (``key="grid"``, ``cls=GridPlot``) is APPENDED to this table right
+    # after ``GridPlot`` is defined below (``_append_grid_plot_kind``) -- ``GridPlot`` does not exist yet
+    # at this point in the module, so it cannot go in this literal.  It is still a single-source entry.
 )
 
-#: ``key -> PlotKind`` for O(1) dispatch.
+#: ``key -> PlotKind`` for O(1) dispatch.  Rebuilt by ``_append_grid_plot_kind`` once ``grid`` lands.
 PLOT_KIND_BY_KEY: dict[str, PlotKind] = {pk.key: pk for pk in PLOT_KINDS}
+
+
+def kind_for_plotter(plotter) -> str | None:
+    """The ``PLOT_KINDS`` key a plotter object BELONGS to -- reverse-looked-up from ``type(plotter)`` in
+    the ONE table (never a hand-typed name), so a bare ``plot.save()`` can stamp the correct ``kind`` into
+    the saved ``info`` and the reopen (``SavedFigure.kind``) round-trips to the SAME kind that drew it.
+
+    The match walks the plotter's MRO against each ``PlotKind.cls``, so a SUBCLASS resolves to its base
+    kind (``SiteHistogramGrid`` / an ``ImageCell`` grid -> the ``GridPlot`` kind ``"grid"``; the
+    ``LiveLiveDis`` rolling-trace variant -> ``"monitor"``).  The FIRST matching table entry wins (table
+    order), so a concrete class ranks before a base it also subclasses.  ``None`` when the object is not a
+    known plotter (a bare externally-built DataFigure has nothing to stamp)."""
+    cls = type(plotter)
+    for base in cls.__mro__:
+        for pk in PLOT_KINDS:
+            if pk.cls is base:
+                return pk.key
+    return None
 
 
 def _normalize_kind(kind: str | None) -> str:
@@ -2968,34 +2989,58 @@ class _GridData:
         return self.cells[k]
 
     def save(self, path: str = "", *, extra_info=None, image_ext: str = ".png", **kwargs):
-        """Save the whole grid the SAME way DataFigure saves a single plot: ONE png AND
-        ONE matching ``.npz`` of the plotted data (here the per-cell raw distributions).
-        The path-stem logic + the ``extra_info`` / ``image_ext`` kwargs mirror
-        :meth:`DataFigure.save` so the SAME call works on a grid or a single plot (else a
-        ``grid.save(path, extra_info=...)`` would crash by forwarding those into ``savefig``)."""
+        """Save the whole grid the SAME way DataFigure saves a single plot: ONE png AND ONE matching
+        ``.npz`` that ``load_figure`` reopens FAITHFULLY.  A grid is a first-class LOADABLE kind (like the
+        pulse figure): the ``.npz`` carries the standard ``data_x`` / ``data_y`` / ``info`` triple with
+        ``info['kind'] == 'grid'`` and a ``info['figure_recipe']`` (:func:`grid_recipe_from_cells`) that is
+        the SINGLE truth source for reproduction -- :func:`build_grid_figure` rebuilds the exact grid from
+        it, so ``na.load_figure(npz).plot()`` and a seeded ``kind="grid"`` console panel both redraw the
+        per-site distributions / kernels faithfully (not a flattened line off the fallback arrays).
+
+        The ``data_x`` / ``data_y`` are a VALID no-recipe fallback (each cell's flattened series stacked +
+        the cell index) so ``load_figure``'s ``data_x`` / ``data_y`` assertion passes and an older reader
+        still gets an array payload -- exactly as the pulse save writes numeric fallback arrays beside its
+        recipe.  ``extra_info`` (the caller's metadata) WINS over the auto keys, and its ``kind`` is not
+        overridden."""
         import time
         from .data_figure import resolve_save_base
         base = resolve_save_base(path, time.strftime("%Y_%m_%d_%H_%M_%S", time.localtime()))   # shared path stem (#C4)
         image_path = base.with_suffix(image_ext if str(image_ext).startswith(".") else f".{image_ext}")
         data_path = base.with_suffix(".npz")
         self.fig.savefig(image_path, **kwargs)
-        # Pack each cell's DataFigure data (data_x / data_y) into the .npz, one key per
-        # cell; the experimenter can reload the per-site distributions identically to a
-        # single-plot save.
-        bundle: dict[str, np.ndarray] = {}
-        for k, c in enumerate(self.cells):
+        # The faithful reproduction source: the grid's replay recipe (per-cell distributions / kernels +
+        # thresholds / fidelities / labels / shape).  Never raises the save -- a cell family with no recipe
+        # degrades to the array-only fallback.
+        try:
+            recipe = grid_recipe_from_cells(self.grid)
+        except Exception:
+            recipe = None
+        # A VALID no-recipe fallback: stack each cell's flat series as data_y columns (padded to a common
+        # length so it is a clean 2-D array) and the cell index as data_x, so ``load_figure``'s
+        # data_x/data_y assertion passes even for a reader that ignores the recipe.
+        columns: list[np.ndarray] = []
+        for c in self.cells:
             try:
-                bundle[f"cell{k}_data_x"] = np.asarray(c.data_x, dtype=float)
-                bundle[f"cell{k}_data_y"] = np.asarray(c.data_y, dtype=float)
+                columns.append(np.asarray(c.data_y, dtype=float).reshape(-1))
             except Exception:
-                continue
-        bundle["n_cells"] = np.asarray(len(self.cells), dtype=int)
-        if extra_info is not None:    # mirror DataFigure.save: caller metadata travels with the data
-            try:
-                bundle["info"] = np.asarray(extra_info)
-            except Exception:
-                pass
-        np.savez(data_path, **bundle)
+                columns.append(np.zeros(1, dtype=float))
+        width = max((col.size for col in columns), default=1)
+        data_y = np.full((len(columns) or 1, width), np.nan, dtype=float)
+        for k, col in enumerate(columns):
+            data_y[k, : col.size] = col
+        data_x = np.arange(data_y.shape[0], dtype=float).reshape(-1, 1)
+        info: dict[str, Any] = {"name": str(self.grid.title or "grid")}
+        # Only stamp ``kind='grid'`` when a recipe was captured -- the reopen resolves a grid figure by its
+        # recipe, so a grid ``kind`` WITHOUT a recipe would send the reopen down ``plot(kind='grid')``
+        # (which is rejected, like pulse) and crash.  A recipe-less save therefore has NO ``kind`` and the
+        # ``data_x`` / ``data_y`` fallback reopens through shape inference, exactly as the docstring's
+        # "degrades to the array-only fallback" promises.
+        if recipe is not None:
+            info["kind"] = "grid"
+            info["figure_recipe"] = recipe
+        if extra_info is not None:    # mirror DataFigure.save: caller metadata WINS over the auto keys
+            info.update(dict(extra_info))
+        np.savez(data_path, data_x=data_x, data_y=data_y, info=info)
         return {"figure": image_path, "data": data_path}
 
 
@@ -3230,6 +3275,27 @@ class SiteHistogramGrid(GridPlot):
         return self.cell_renderer.classify(k, values)
 
 
+def _append_grid_plot_kind() -> None:
+    """Register the per-site GRID kind in the ONE ``PLOT_KINDS`` table, now that ``GridPlot`` exists.
+
+    ``grid`` is a first-class LOADABLE panel kind, seeded from a saved grid figure the SAME way ``pulse``
+    is (``panel=False`` = not offered in the live Add-Panel dropdown, but a real panel kind on the SEED
+    path).  Its cell content (hist / image) is carried in the saved ``figure_recipe`` and rebuilt by
+    :func:`build_grid_figure`.  It cannot live in the ``PLOT_KINDS`` literal above because ``GridPlot`` is
+    defined AFTER that literal, so it is appended here (still a single-source entry -- ``PLOT_KIND_BY_KEY``
+    is rebuilt so the two stay in lock-step)."""
+    global PLOT_KINDS, PLOT_KIND_BY_KEY
+    if "grid" in PLOT_KIND_BY_KEY:
+        return
+    PLOT_KINDS = PLOT_KINDS + (
+        PlotKind(key="grid", cls=GridPlot, label="Site grid", render_family="1D", panel=False),
+    )
+    PLOT_KIND_BY_KEY = {pk.key: pk for pk in PLOT_KINDS}
+
+
+_append_grid_plot_kind()
+
+
 def site_histogram_grid(
     per_site_values,
     *,
@@ -3285,6 +3351,74 @@ def site_psf_grid(
     return GridPlot(
         ImageCell(images, labels=labels), labels=labels, title=title, **kwargs
     ).show(display=display)
+
+
+def grid_recipe_from_cells(grid: "GridPlot") -> dict:
+    """The REPLAY RECIPE a :class:`GridPlot` stores so it can be re-rendered FAITHFULLY on reopen -- the
+    grid counterpart of a pulse figure's ``figure_recipe``.  A grid's per-cell distributions / kernels
+    cannot be recovered from the flat ``data_x`` / ``data_y`` a bare save writes (``data_x`` is just the
+    cell index), so the recipe carries everything :func:`build_grid_figure` needs to rebuild the exact
+    grid: the cell FAMILY (``"hist"`` per-site distribution / ``"image"`` per-site kernel), the per-cell
+    payload, and the shared thresholds / fidelities / labels / title / grid shape.
+
+    Dispatch is by the concrete :class:`GridCell` the grid was built with, so a NEW grid-cell family adds
+    a branch here (and a matching one in :func:`build_grid_figure`) without touching either seam's callers.
+    Append-only keys -- the ``.npz`` structure is unchanged, so an older reader still reads the file."""
+    cell = grid.cell_renderer
+    recipe: dict[str, Any] = {
+        "kind": "grid",
+        "labels": [str(x) for x in getattr(cell, "labels", grid.labels)],
+        "title": str(grid.title),
+        "grid_shape": [int(grid.nrows), int(grid.ncols)],
+    }
+    if isinstance(cell, HistogramCell):
+        recipe["cell"] = "hist"
+        recipe["per_cell"] = [np.asarray(v, dtype=float).reshape(-1).tolist() for v in cell.values]
+        recipe["bins"] = int(cell.bins_arg)
+        recipe["thresholds"] = None if cell.thresholds is None else [float(t) for t in cell.thresholds]
+        recipe["fidelities"] = (None if cell.site_fidelities is None
+                                else [float(f) for f in np.asarray(cell.site_fidelities).reshape(-1)])
+        recipe["occupied"] = (None if cell.occupied is None
+                              else [np.asarray(o, dtype=float).reshape(-1).tolist() for o in cell.occupied])
+    elif isinstance(cell, ImageCell):
+        recipe["cell"] = "image"
+        recipe["per_cell"] = [np.asarray(im, dtype=float).tolist() for im in cell.images]
+    else:
+        raise TypeError(f"grid cell {type(cell).__name__} has no replay recipe")
+    return recipe
+
+
+def build_grid_figure(recipe: Mapping[str, Any], *, fig: plt.Figure | None = None,
+                      interactions: bool = True, display: bool = False):
+    """Rebuild a per-site GRID figure from its :func:`grid_recipe_from_cells` recipe -- the SINGLE source
+    of the grid reproduction, the grid counterpart of :func:`build_pulse_preview_plot`.
+
+    ``recipe['cell']`` selects the family: ``"hist"`` rebuilds the per-site distribution grid
+    (:class:`SiteHistogramGrid`, one histogram per site with its threshold line + fidelity annotation);
+    ``"image"`` rebuilds the per-site kernel grid (:func:`site_psf_grid`, one imshow per site).  Every
+    consumer -- ``na.load_figure(npz).plot()``, the figure viewer, a seeded ``kind="grid"`` console panel
+    -- draws through THIS one builder, so all three reproduce the identical faithful grid (never a
+    flattened 1-D line off the fallback arrays).  Returns the :class:`GridPlot` plotter (already ``show``-n
+    with ``display``)."""
+    cell = str(recipe.get("cell") or "hist")
+    labels = tuple(str(x) for x in (recipe.get("labels") or ("X", "Y")))
+    title = str(recipe.get("title") or "")
+    grid_shape = recipe.get("grid_shape")
+    grid_shape = tuple(int(n) for n in grid_shape) if grid_shape else None
+    if cell == "image":
+        images = [np.asarray(im, dtype=float) for im in (recipe.get("per_cell") or [])]
+        return GridPlot(ImageCell(images, labels=labels), grid_shape=grid_shape, labels=labels,
+                        title=title, fig=fig, interactions=interactions).show(display=display)
+    # per-site distribution grid (the default)
+    per_site = [np.asarray(v, dtype=float).reshape(-1) for v in (recipe.get("per_cell") or [])]
+    thresholds = recipe.get("thresholds")
+    fidelities = recipe.get("fidelities")
+    occupied = recipe.get("occupied")
+    return SiteHistogramGrid(
+        per_site, thresholds=thresholds, site_fidelities=fidelities,
+        occupied=None if occupied is None else [np.asarray(o, dtype=float).reshape(-1) for o in occupied],
+        grid_shape=grid_shape, bins=int(recipe.get("bins", 36)), labels=labels, title=title,
+        fig=fig, interactions=interactions).show(display=display)
 
 
 def plot(
@@ -3344,7 +3478,10 @@ def plot(
             normalized_kind = "2d" if x.shape[1] == 2 else "1d"
         labels = tuple(labels or ("X", "Y", "Z"))
         spec = PLOT_KIND_BY_KEY.get(normalized_kind)
-        if spec is None or spec.key in ("hist", "pulse"):
+        if spec is None or spec.key in ("hist", "pulse", "grid"):
+            # ``grid`` has a per-cell construction (a GridCell, not a data_x/data_y array), so it is built
+            # through ``build_grid_figure`` / ``site_histogram_grid`` / ``site_psf_grid``, never this
+            # array factory -- the SAME reason ``pulse`` is excluded here.
             raise ValueError("kind must be auto, 1d, 2d, monitor, hist, sites, or pulse.")
         cls = spec.cls
         if normalized_kind == "2d":
@@ -3429,11 +3566,16 @@ __all__ = [
     "GridCell",
     "HistogramCell",
     "SiteHistogramGrid",
+    "ImageCell",
+    "kind_for_plotter",
+    "build_grid_figure",
+    "grid_recipe_from_cells",
     "panel_plot",
     "panel_plot_spec",
     "panel_size_cells",
     "plot",
     "site_histogram_grid",
+    "site_psf_grid",
     "site_ring_radius",
     "pulse_plot_channels",
     "pulse_plot_spec",

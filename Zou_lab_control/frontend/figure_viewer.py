@@ -197,13 +197,21 @@ class LoadedFigureNode(LogicNode):
         # pulse_state_provider reads it off this node.  None for every non-pulse figure.
         self.pulse_state = None
         self.pulse_include_always_off = True
+        # A grid figure carries its replay RECIPE (a dict) here the SAME way -- the console's
+        # grid_recipe_provider reads it off this node.  None for every non-grid figure.
+        self.grid_recipe = None
 
-        # A STRUCTURED figure (a pulse timeline) publishes its reproduction OBJECT (a PulseTableState)
-        # as ``fig_value`` -- a hub value may be any object, not just an array -- so the seeded ``pulse``
-        # panel binds to it exactly like a hist panel binds to its sample vector, and PanelCard's ``pulse``
-        # branch renders the full timeline from it.  This is the SAME load path every kind uses.
+        # A STRUCTURED figure (a pulse timeline / a per-site grid) publishes its reproduction PAYLOAD
+        # (a PulseTableState object, or a grid recipe dict) carried ON THIS NODE -- a hub value may only be
+        # a float array, so the panel resolves the payload off the producing node (the SAME "aux data from
+        # the producing node" wiring the site map uses for its centres/frame).  The seeded ``pulse`` /
+        # ``grid`` panel binds to ``fig_value`` exactly like a hist panel binds to its sample vector, and
+        # PanelCard's matching branch renders from the resolved payload.  This is the SAME load path every
+        # kind uses.
         if kind == "pulse":
             self._build_pulse(saved)
+        elif kind == "grid":
+            self._build_grid(saved)
         else:
             stored = saved.info.get("signals")
             if isinstance(stored, Mapping) and stored:
@@ -285,6 +293,21 @@ class LoadedFigureNode(LogicNode):
         self._specs[FIG_VALUE_KEY] = SignalSpec(
             self.prefix + FIG_VALUE_KEY, str(saved.name or "pulse"), "",
             "the saved pulse figure (its PulseTableState is carried on the node, read via the provider)")
+        self._role_key["value"] = FIG_VALUE_KEY
+
+    # ------------------------------------------------------- structured (grid)
+    def _build_grid(self, saved: SavedFigure) -> None:
+        """A grid figure's reproduction source is a RECIPE dict (per-cell distributions / kernels), carried
+        on the node exactly as a pulse figure carries its ``PulseTableState`` -- the seeded grid panel reads
+        it off THIS producing node via the console's ``grid_recipe_provider``.  The hub ``fig_value`` is a
+        numeric PLACEHOLDER (the cell count) so the shot clock / version gate still tick; the grid panel
+        renders from the resolved recipe, not this value (mirrors :meth:`_build_pulse`)."""
+        self.grid_recipe = saved.grid_recipe()
+        n_cells = float(len(self.grid_recipe.get("per_cell", []))) if self.grid_recipe is not None else 0.0
+        self._blocks[FIG_VALUE_KEY] = np.array([n_cells], dtype=float)    # numeric placeholder for the hub
+        self._specs[FIG_VALUE_KEY] = SignalSpec(
+            self.prefix + FIG_VALUE_KEY, str(saved.name or "grid"), "",
+            "the saved grid figure (its replay recipe is carried on the node, read via the provider)")
         self._role_key["value"] = FIG_VALUE_KEY
 
     # ---------------------------------------------------------------- shaping
@@ -370,53 +393,23 @@ def _seed_state(saved: SavedFigure) -> TaskConsoleState:
         kind = "2d" if (np.asarray(saved.data_x).ndim == 2 and np.asarray(saved.data_x).shape[1] >= 2) else "1d"
         pk = PLOT_KIND_BY_KEY.get(kind)
     view = dict(saved.view or {})
-    # A pulse panel carries its ``include_always_off`` (how the reproduction was drawn) as a param, and
-    # opens at a size that fits the timeline (a wider preset), so the reproduced figure is not clipped.
-    size = "2x2"
+    # A pulse panel carries its ``include_always_off`` (how the reproduction was drawn) as a param so the
+    # reproduction re-renders with the saved "show off rows" choice.  It opens at the SAME default 2x2
+    # preset as every other kind (its card holds the timeline at its spec-owned natural size, scrolling if
+    # taller) -- no per-kind size special-case.
     if kind == "pulse":
         resolved = saved.pulse_state()
         if resolved is not None:
             view.setdefault("include_always_off", bool(resolved[1]))
-        size = _pulse_panel_size(saved)
     panel = PanelConfig(
         kind=kind,
         title=str(saved.name or "figure"),
-        size=size,
+        size="2x2",
         source=f"value = {FIG_PREFIX}{FIG_VALUE_KEY}",
         inputs=[FIG_PREFIX + FIG_VALUE_KEY],
         params=view,
     )
     return TaskConsoleState(name=str(saved.name or "figure"), panels=[panel])
-
-
-def _pulse_panel_size(saved: SavedFigure) -> str:
-    """The smallest ``PANEL_SIZES`` preset whose card content holds the reproduced pulse timeline (so it
-    is not clipped), else the largest.  The pulse figure's own spec-owned geometry (fixed inches, channel-
-    driven height) is measured once and matched to a preset -- the panel then sizes to that preset like
-    every other kind, and its card holds the figure at its natural size."""
-    from .live import PANEL_SIZES, panel_display_size
-
-    resolved = saved.pulse_state()
-    if resolved is None:
-        return "2x2"
-    try:
-        from .live import build_pulse_preview_plot
-        import matplotlib.pyplot as _plt
-        plotter, _c, _r = build_pulse_preview_plot(resolved[0], include_always_off=bool(resolved[1]))
-        w_in, h_in = (float(v) for v in plotter.fig.get_size_inches())
-        _plt.close(plotter.fig)
-    except Exception:
-        return "2x2"
-    from .live import DESIGN_DPI, PANEL_DISPLAY_SCALE
-    need_w = w_in * DESIGN_DPI * PANEL_DISPLAY_SCALE
-    need_h = h_in * DESIGN_DPI * PANEL_DISPLAY_SCALE
-    best = PANEL_SIZES[0]
-    for size in PANEL_SIZES:
-        avail_w, avail_h = panel_display_size(size)     # the on-screen canvas area a preset reserves
-        if avail_w >= need_w and avail_h >= need_h:
-            return size
-        best = size                                     # largest tried (fallback if nothing fits)
-    return best
 
 
 class FigureViewer(QtWidgets.QWidget):
