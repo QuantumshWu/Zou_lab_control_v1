@@ -168,3 +168,81 @@ def test_na_facade_exposes_load_figure(tmp_path):
     saved = na.load_figure(out["data"])
     assert isinstance(saved, SavedFigure)
     assert saved.kind == "hist"
+
+
+# ---- pulse-preview -> generic save -> figure_viewer load (the "any simple plot" path) ----------
+def _pulse_editor():
+    """A headless PulseSequenceEditor whose preview draws real 0/1 transitions (probe ON in the
+    first period, trig ON in the second) -- so the saved level arrays carry actual edges."""
+    pytest.importorskip("PyQt5")
+    from PyQt5 import QtWidgets
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
+    from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState, PulsePeriod
+
+    periods = [
+        PulsePeriod(duration=10, unit="us", name="p0", states=(1, 0)),
+        PulsePeriod(duration=20, unit="us", name="p1", states=(0, 1)),
+    ]
+    st = PulseTableState(channels=["probe", "trig"], periods=periods, name="demo_pulse")
+    return PulseSequenceEditor(st), st
+
+
+def test_pulse_preview_saves_generic_figure_and_npz(tmp_path):
+    """The pulse-preview Save routes through the SAME generic ``DataFigure.save``: a ``<stem>.png``
+    image PLUS a matching ``<stem>.npz`` whose ``data_x`` (time axis) / ``data_y`` (per-channel
+    step levels) / ``info`` are the standard SavedFigure payload.  The preview is not a hub signal
+    (no producing node), so the DataFigure is UNBOUND and the save degrades to the basic payload --
+    ``kind="1d"`` with no signals/provenance -- which is exactly what a static preview has to offer."""
+    ed, state = _pulse_editor()
+    df = ed._preview_data_figure(state, include_always_off=True)
+    try:
+        # A 1-column data_x (time axis) + one level column per drawn channel.
+        assert df.data_x.ndim == 2 and df.data_x.shape[1] == 1
+        assert df.data_y.shape[1] == 2                      # probe + trig level columns
+        assert df.info.get("kind") == "1d"
+        assert df.info.get("source") == "pulse preview"
+        assert df.info.get("channels") == ["probe", "trig"]
+        out = df.save(str(tmp_path / "demo_pulse.png"))
+        assert Path(out["figure"]).exists() and Path(out["figure"]).suffix == ".png"
+        assert Path(out["data"]).exists() and Path(out["data"]).suffix == ".npz"
+        # The stored levels are a faithful step reconstruction: probe ON then OFF, trig OFF then ON.
+        data = np.load(out["data"], allow_pickle=True)
+        assert data["data_y"].shape[1] == 2
+        np.testing.assert_array_equal(data["data_y"][0], [1.0, 0.0])   # t=0: probe on, trig off
+    finally:
+        plt.close("all")
+
+
+def test_pulse_preview_npz_reopens_in_figure_viewer(tmp_path):
+    """The pulse-preview npz reopens as a standard SavedFigure and BUILDS in the figure viewer:
+    ``na.load_figure`` reads it as ``kind="1d"``, ``.plot()`` reproduces a DataFigure, and
+    ``show_figure_viewer`` seeds a live 1-D panel redrawing the levels -- no bespoke pulse path."""
+    ed, state = _pulse_editor()
+    df = ed._preview_data_figure(state, include_always_off=True)
+    out = df.save(str(tmp_path / "demo_pulse.png"))
+    plt.close(df.fig)
+
+    import Zou_lab_control.neutral_atom as na
+
+    saved = na.load_figure(out["data"])
+    try:
+        assert isinstance(saved, SavedFigure)
+        assert saved.kind == "1d"
+        assert "1d" in saved.compatible_kinds()
+        assert "pulse preview" in saved.info_summary()
+        # DATA-view reproduction through the SAME plot() factory a 1-D save uses.
+        reopened = saved.plot()
+        assert reopened.fig is not None and reopened.plot_type == "1D"
+        plt.close(reopened.fig)
+        # Full viewer build: it seeds a real Task console panel of the saved kind.
+        from Zou_lab_control.frontend.figure_viewer import show_figure_viewer
+
+        viewer = show_figure_viewer(out["data"])
+        try:
+            assert viewer.saved is not None and viewer.saved.kind == "1d"
+            assert viewer.console is not None
+        finally:
+            viewer.teardown()
+    finally:
+        plt.close("all")

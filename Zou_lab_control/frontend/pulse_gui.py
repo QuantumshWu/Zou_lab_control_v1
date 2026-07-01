@@ -4274,10 +4274,108 @@ class PulseSequenceEditor(QtWidgets.QWidget):
             image_path = Path(path)
             if image_path.suffix == "":
                 image_path = image_path.with_suffix(".png")
-            self._save_preview_image(state, image_path)
-            self.preview_status.setText(f"Saved figure: {image_path.name}")
+            # The Save-Figure button writes through the SAME generic figure save the
+            # notebook / console panels use (DataFigure.save): a <stem>.png image PLUS
+            # a matching <stem>.npz that ``na.load_figure`` / ``show_figure_viewer`` can
+            # reopen.  The pulse preview is not a hub signal (no producing node), so the
+            # DataFigure is unbound => the save DEGRADES to the basic figure+npz (no
+            # signals / provenance) -- exactly the "info is sparse but structurally
+            # valid" round-trip the viewer expects.
+            include_always_off = bool(getattr(self, "preview_include_off", None) and self.preview_include_off.isChecked())
+            df = self._preview_data_figure(state, include_always_off=include_always_off)
+            out = df.save(str(image_path))
+            if plt is not None:
+                plt.close(df.fig)
+            data_name = Path(out.get("data", image_path.with_suffix(".npz"))).name
+            self.preview_status.setText(f"Saved figure: {image_path.name} (+ {data_name})")
         except Exception as exc:
             self._message(str(exc))
+
+    def _preview_data_figure(self, state: PulseTableState, *, include_always_off: bool):
+        """Wrap the pulse preview as a generic :class:`DataFigure` so its Save writes the
+        standard figure+npz pair (``data_x`` / ``data_y`` / ``info``) that the figure
+        viewer can reopen.
+
+        The pretty pulse timeline (the console/notebook ``kind="pulse"`` figure) is kept as
+        the SAVED IMAGE, while the npz stores a plain time-vs-level reconstruction:
+        ``data_x`` is the shared edge-time grid (seconds) and ``data_y`` is one step-held
+        level column per drawn row (each digital channel's 0/1, then each analog bus's
+        signed value).  That is a 1-column-``data_x`` payload, so it round-trips as
+        ``kind="1d"`` -- ``show_figure_viewer`` seeds a 1-D panel that redraws the levels as
+        step lines.  No hub binding is stamped, so ``DataFigure.save`` degrades to the basic
+        payload (no signals / provenance), which is all a static preview has to offer.
+        """
+        import numpy as np
+
+        from .data_figure import DataFigure
+
+        plotter, channels, _repeat = self._create_preview_plot(state, include_always_off=include_always_off)
+        # Collect one "level at time t" column per drawn row: digital channels (0/1 held
+        # between start and stop) followed by analog buses (signed value, step-held).
+        columns: list[tuple[str, list[tuple[float, float]]]] = []
+        pulses_by_channel: dict[str, list[dict]] = {}
+        for row in getattr(plotter, "pulses", []):
+            pulses_by_channel.setdefault(str(row["channel"]), []).append(row)
+        for channel in channels:
+            steps: list[tuple[float, float]] = [(0.0, 0.0)]
+            for row in sorted(pulses_by_channel.get(str(channel), []), key=lambda r: float(r["start"])):
+                level = 1.0 if row.get("value") else 0.0
+                steps.append((float(row["start"]), level))
+                steps.append((float(row["stop"]), 0.0))
+            columns.append((state.label_for(channel), steps))
+        for trace in getattr(plotter, "analog_traces", []):
+            starts = [float(s) for s in trace.get("starts", [])]
+            values = [float(v) for v in trace.get("values", [])]
+            steps = [(0.0, 0.0)]
+            for edge, value in zip(starts, values):
+                steps.append((edge, value))
+            columns.append((str(trace.get("label") or trace.get("name") or "analog"), steps))
+
+        # Shared, sorted, de-duplicated edge-time grid across every column; each column is
+        # sampled by "last edge at or before t" (a step hold) onto that grid.
+        edge_set = {0.0}
+        for _label, steps in columns:
+            for t, _v in steps:
+                if np.isfinite(t):
+                    edge_set.add(float(t))
+        seq_end = float(getattr(plotter, "duration", 0.0) or 0.0)
+        if seq_end > 0.0:
+            edge_set.add(seq_end)
+        times = np.array(sorted(edge_set), dtype=float)
+        if times.size < 1:
+            times = np.array([0.0], dtype=float)
+
+        def _sample(steps: list[tuple[float, float]]) -> np.ndarray:
+            steps = sorted(steps, key=lambda s: s[0])
+            edges = np.array([s[0] for s in steps], dtype=float)
+            levels = np.array([s[1] for s in steps], dtype=float)
+            idx = np.searchsorted(edges, times, side="right") - 1
+            idx = np.clip(idx, 0, len(levels) - 1)
+            return levels[idx]
+
+        if columns:
+            data_y = np.column_stack([_sample(steps) for _label, steps in columns])
+        else:
+            data_y = np.zeros((times.size, 1), dtype=float)
+        data_x = times.reshape(-1, 1)
+        row_labels = [label for label, _steps in columns]
+
+        info = {
+            "kind": "1d",
+            "source": "pulse preview",
+            "name": state.name or "pulse",
+            # Human-readable per-row legend, so a reader can tell which line is which
+            # channel/bus even though the viewer redraws them as generic 1-D step lines.
+            "channels": row_labels,
+        }
+        return DataFigure(
+            fig=plotter.fig,
+            data_x=data_x,
+            data_y=data_y,
+            labels=("Time (s)", "Level", "State"),
+            name=state.name or "pulse",
+            info=info,
+        )
 
     def _save_preview_image(self, state: PulseTableState, image_path: Path) -> Path:
         image_path.parent.mkdir(parents=True, exist_ok=True)
