@@ -903,7 +903,7 @@ Task 控制台（\filepath{task\_console.bat} / \pyapi{frontend.show\_task\_cons
   \item[Source（接什么数据）] \pyapi{signal} 下拉列出 hub 里\tfocus{此刻真实存在的所有信号名}——选一个，面板立即切到 \pyapi{value = 信号名}，不用打字。要做运算（差值、切片、历史堆叠）就在下面的表达式框写一行 Python 并点 \pyapi{Apply}（或回车）；下拉会自动回显纯信号表达式。命名空间：每个信号名（最新值）、\pyapi{history(name, n)}、\pyapi{latest(name)}、\pyapi{names()}、\pyapi{shot}、\pyapi{np}、\pyapi{math}。表达式出错时 \pyapi{Setting} 按钮变红，错误只落在\tfocus{该面板自己}的状态行，其余面板照常刷新。
   \item[Display（怎么显示）] \pyapi{size} 尺寸预设；2D / Site map 的 \pyapi{colormap}——\tfocus{这就是改 colorbar 配色（colorset）的地方}（没有"显隐 colorbar"开关，因为带 colorbar 的图恒显 colorbar）；以及各类型的\tfocus{声明式参数}（\pyapi{PANEL\_PARAMS} 里一行一个 \pyapi{ParamDecl}，控件由 \pyapi{param\_widgets.PARAM\_WIDGETS} 注册表按 kind 自动生成）：Site map 的 \pyapi{centers}/\pyapi{image} 信号名（\pyapi{image} 留空＝不垫相机帧）、Rolling trace 的历史长度、Distribution 的 bin 数。
   \item[relim 与 Unit] Display 段最后两行是\tfocus{轴控制}：\pyapi{relim} 下拉用 confocal\_gui 的 \pyapi{combo\_relim} 命名 \pyapi{tight}（紧贴数据自适应）/ \pyapi{normal}（带边距自适应）/ \pyapi{fixed}（\tfocus{钉死}上下限——选 fixed 时下方多出一行填 lo/hi），写进 \pyapi{config.params["relim"]}——这与该面板 Edit 标签里的 relim 控件是\tfocus{同一个 key}（单一真相源，绝不漂移），并\tfocus{对 2D image 与 Site map 的 colorbar clim 同样生效}（相机帧颜色范围跟着 tight/normal/fixed 走，不只是 1D 的 y 轴）；\pyapi{Unit} 按钮 + 右侧当前 unit 倍数。点一次在该轴单位环上前进一档（GHz/nm/MHz 或 ns/us/ms 等，复用 \pyapi{DataFigure.change\_unit}），轴标签无定义单位时是 no-op；当前 \pyapi{unit\_index} \tfocus{随布局 JSON 一起保存}，重建时由 \pyapi{\_apply\_display\_params} 重新应用——所以"这张卡我切到 normal + us"保存/载入/重建后都保持。\tfocus{Setting 没有手动 x/y 轴 lim 四框}（confocal\_gui 也没有，那在 \pyapi{Edit…} 标签）——但把\tfocus{数据范围数字钉死}就用上面 relim=\pyapi{fixed} + lo/hi（\tfocus{就在这儿，不必去 Edit}）；坐标轴范围细看用画布缩放 / 拖拽。
-  \item[Panel（这张卡）] 标题（显示在图内，改动通过 \pyapi{BaseLivePlot.\_apply\_title} → \pyapi{style.apply\_title} 走密封 API，字号永远是 \pyapi{title\_fontsize()}）；一行操作 \pyapi{Remove}（移除）、\pyapi{Edit…}（打开该面板自己的 Edit 标签做命令行拟合 / 手动 lim / 详细处理）、\pyapi{Save Fig}（一键导出 \pyapi{png} + \pyapi{npz} 到 tasks/，时间戳命名）。
+  \item[Panel（这张卡）] 标题（显示在图内，改动通过 \pyapi{BaseLivePlot.\_apply\_title} → \pyapi{style.apply\_title} 走密封 API，字号永远是 \pyapi{title\_fontsize()}）；一行操作 \pyapi{Remove}（移除）、\pyapi{Edit…}（打开该面板自己的 Edit 标签做命令行拟合 / 手动 lim / 详细处理，导出图的 \pyapi{Save Fig} 也在那里）。
 \end{description}
 \begin{notebox}
 弹窗用 \pyapi{FluentPopup}（\filepath{qt\_fluent.py}）：\tfocus{半透明、无边框}的顶层 \pyapi{Qt.Popup}，圆角白卡由 \pyapi{paintEvent} 抗锯齿描一笔（填充 + 1px 边框）。两条教训：① 不可在\tfocus{不透明}顶层弹窗上用样式表 \pyapi{border-radius}——方形窗体留在圆弧外，右下角露出方角白块（那条"奇怪的线"），Windows 还叠一层原生阴影；② 光加 \pyapi{WA\_TranslucentBackground} 不够，它会让样式表背景\tfocus{整块不画}（弹窗变透明）。所以圆角卡\tfocus{自己画}。边框是画出来的、不是样式表规则，因此也\tfocus{绝不会级联}到 QLabel/QComboBox 等子控件。
@@ -947,7 +947,7 @@ measurement / processor / task 三份目录都是\tfocus{自动发现的}:往 \p
   \item[Parameters（plot 的 API 参数）] 该面板\tfocus{plot 调用里可变的参数}自动铺成 GUI 控件（\pyapi{length} / \pyapi{bins} / \pyapi{centers} / \pyapi{image}……，由该 kind 的声明\tfocus{自动发现}）；改一下就\tfocus{实时重渲染}活面板与快照。colormap / relim / unit 这类\tfocus{轻量显示旋钮} Setting 与 Edit 的 Display 段\tfocus{两处都给}（\tfocus{同 key 单源}、改一处另一处跟着，不是两份逻辑），其余 \pyapi{display=False} 的功能参数只在这里。
   \item[框选写回源的采集参数（不再是内嵌测量表单）] plot 面板\tfocus{不}内嵌某测量的"参数表单 + Start"——那在该 measurement 作为 Logic 节点时它\tfocus{自己}的 Edit 里（Logic tab，见上）。这里保留的是\tfocus{框选写回}：在 Edit 快照上拖一个矩形（或缩放/平移），\pyapi{\_read\_region} 把端点 \pyapi{(x\_min,x\_max,y\_min,y\_max)} 交给产这张图的\tfocus{源节点}的 \pyapi{region\_to\_acquisition\_parameters}，源各转各的格式（相机节点→ROI 矩形、二维扫描→两条轴范围），\tfocus{填进上面 Acquisition 段的对应输入框}，点 \pyapi{Apply} 生效（学 \pyapi{confocal\_gui} 的 \pyapi{area.callback}；缩放/平移与框选共用同一回调，框选 OVERRIDE）。填的是\tfocus{采集参数}本身、不是坐标轴 lim。
   \item[Fit（全套 data\_figure）] 模型下拉是\tfocus{完整的 DataFigure 集合}（Lorentzian / Gaussian / Lorentzian (Zeeman) / Rabi / Exp decay / \tfocus{2D center}），\tfocus{不按 plot 类型门控}——2D 图用 2D 高斯 \pyapi{center} 拟合，其余拟合 1D 轨迹。一行自由文本拟合参数（\pyapi{p0=[...]} 初值、\pyapi{名字=值} 固定、\pyapi{is\_fit=False} 只叠加不优化）+ \pyapi{Fit}/\pyapi{Clear}；底层 \pyapi{DataFigure}（与 notebook 的 \pyapi{p.data\_figure.lorent()} 同源）。
-  \item[手动 x/y lim + 冻结快照 + Save Fig] 四个数字框 + \pyapi{Apply lim}（调 \pyapi{DataFigure.xlim/ylim}，作用在快照上，打开时自动回填）；快照\tfocus{照搬 Monitor 那张卡的 size}（与活面板\tfocus{同尺寸}、绝不裁切——不再强塞一个固定 2x4 撑破窄视区），画布\tfocus{钉成固定大小}（\pyapi{pin\_size}：\pyapi{min==max}=设计尺寸，连画布自己 deferred 的 resync 也守住），所以\tfocus{改一个参数重抓快照时它既不会胀大、也不会缩没}；重抓走\tfocus{先建后换}（新图建成功才换，建图报错就保留上一张好图、绝不留空白），并\tfocus{每种 kind 含 Site map 都吃 relim/fixed}（由单一 \pyapi{\_view\_kwargs} 同时喂活面板与快照，不再像以前 sitemap 改 lim 不刷新）。配 \pyapi{Refresh} 重抓 + \pyapi{Save Fig}（\pyapi{<标题>.png} + \pyapi{.npz} 到 \filepath{tasks/}）。
+  \item[手动 x/y lim + 冻结快照 + Save Fig] 四个数字框 + \pyapi{Apply lim}（调 \pyapi{DataFigure.xlim/ylim}，作用在快照上，打开时自动回填）；快照\tfocus{照搬 Monitor 那张卡的 size}（与活面板\tfocus{同尺寸}、绝不裁切——不再强塞一个固定 2x4 撑破窄视区），画布\tfocus{钉成固定大小}（\pyapi{pin\_size}：\pyapi{min==max}=设计尺寸，连画布自己 deferred 的 resync 也守住），所以\tfocus{改一个参数重抓快照时它既不会胀大、也不会缩没}；重抓走\tfocus{先建后换}（新图建成功才换，建图报错就保留上一张好图、绝不留空白），并\tfocus{每种 kind 含 Site map 都吃 relim/fixed}（由单一 \pyapi{\_view\_kwargs} 同时喂活面板与快照，不再像以前 sitemap 改 lim 不刷新）。配 \pyapi{Refresh} 重抓 + \pyapi{Save Fig}（一个 \pyapi{png}/\pyapi{pdf}/\pyapi{jpg} 格式下拉 + 按钮，导出\tfocus{当前面板}的图 + 同名 \pyapi{.npz} 到 \filepath{tasks/}，npz 数据不随图片格式变）。这个 Save 内部先把图 \pyapi{bind\_source} 到该面板接的信号、再调 \pyapi{DataFigure.save}——\tfocus{与 notebook 的 \pyapi{p.save()} 是同一套核心}（见"保存与回看图"一章），所以 GUI 面板 Save 与 notebook 存图产出的 npz 逐字一致，都能用 \pyapi{exp.figure\_viewer} 回看。
 \end{description}
 \tfocus{选择器分工}：Monitor 卡\tfocus{禁用所有选择器}（\pyapi{interactions=False} + \pyapi{isolate\_wheel=False}）——滚轮直接\tfocus{滚仪表盘}、绝不被框选/缩放吞掉；选择器（缩放、拖阈值线、\pyapi{AreaSelector} 框选读范围）\tfocus{只在 Edit 快照上启用}。每个 Edit 标签是\tfocus{独立快照}，不打扰 Monitor 实时刷新；relim / unit 这类只在 Setting，避免重复。
 
@@ -1240,6 +1240,97 @@ hist = plot(roi_counts, kind="hist", bins=55, thresholds=[45],
 
 \section{实时刷新}
 用 \pyapi{update="watch"} 时，返回对象启动一个前端定时器，从共享数组刷新，而采集代码在另一侧 in-place 修改这些数组。worker 不直接动 Matplotlib artist；前端拥有 artist 和刷新。绘图刷新依赖事件循环，因此阻塞式硬件采集不能直接跑在 UI 线程里。
+
+\chapter{保存与回看图（notebook 与 GUI 同一套核心）}
+
+\section{一套核心，两种调用}
+把一张图存下来、以后再打开重看／重拟合／换个图型看，是一件事，不是两件。所以\tfocus{存图的富捕获逻辑只有一份}，放在 frontend 之外的中立核心 \pyapi{neutral\_atom.operations.figure\_capture}（\pyapi{capture\_figure\_signals} + \pyapi{capture\_figure\_provenance}，只依赖 \pyapi{SignalHub} 与逻辑节点契约、不 import 任何 Qt/前端）。你有两种调用它的方式，\tfocus{产出的 \pyapi{.npz} 逐字一致}：
+
+\begin{itemize}
+  \item \tfocus{notebook}：任何绘图对象（\pyapi{plot(...)} 返回的 plotter，或它的 \pyapi{DataFigure}）都有 \pyapi{.save(path)} 方法；
+  \item \tfocus{GUI}：Task 控制台面板的 \pyapi{Save Fig}（在面板的 \pyapi{Edit} 标签里）。
+\end{itemize}
+
+两条路走的是\tfocus{同一个 \pyapi{figure\_capture} 核心}——不是两套实现。所以"notebook 里 \pyapi{p.save()} 出来的图"和"在 GUI 面板里 Save 出来的图"是同一种文件、能用同一个查看器打开。
+
+\section{存一张图：p.save()}
+\pyapi{.save(path)} 写\tfocus{两个}文件：一张图片（\pyapi{png}／可选 \pyapi{pdf}／\pyapi{jpg}）和一个同名 \pyapi{.npz} 数据包。npz 顶层永远是三个键 \pyapi{data\_x} / \pyapi{data\_y} / \pyapi{info}——图型、单位、拟合、来源等都折进 \pyapi{info}，所以\tfocus{一个文件既能当图看、又能当数据重开}。
+
+\begin{codeblock}[Python：最简单的存图]
+import numpy as np
+from Zou_lab_control import frontend as zf
+
+x = np.linspace(737.0, 737.2, 220).reshape(-1, 1)
+y = (lorentzian(x) + noise).reshape(-1, 1)
+p = zf.plot(x, y, labels=("Wavelength (nm)", "Counts/0.1s", "Counts"), display=False)
+p.data_figure.lorent(is_display=True)          # 叠加洛伦兹拟合
+
+out = p.save("scans/probe_scan")               # 写 scans/probe_scan_<时间戳>.png + .npz
+# out == {"figure": <...>.png, "data": <...>.npz}
+\end{codeblock}
+
+图片格式用 \pyapi{image\_ext=} 选：\pyapi{p.save("scans/probe", image\_ext="pdf")} 存 PDF。\tfocus{npz 数据不随图片格式变}——换成 pdf 或 jpg，里面的数组 + \pyapi{info} 完全一样。
+
+\section{富捕获：bind\_source 把"数据从哪来"盖进去}
+上面的例子是\tfocus{裸数组图}——只存下 \pyapi{data\_x} / \pyapi{data\_y} 和基础 \pyapi{info}。当图是从一次\tfocus{活实验}里长出来的（相机帧、逐站计数、一条扫描曲线），你往往还想让存下来的文件记住\tfocus{"这批数据是什么信号、采它时设备是什么状态"}。这就是\tfocus{富捕获}，由 \pyapi{bind\_source} 打开：
+
+\begin{codeblock}[Python：绑定来源后再存 = 富 npz]
+# hub 是实验循环 publish 数据用的 SignalHub；node 是产出这批信号的逻辑节点
+p = zf.plot(x, y, labels=("shot", "counts", ""), display=False)
+p.bind_source(hub, node, inputs=["counts"],
+              resolve_node=resolver, session=exp)   # 盖上来源戳（返回 self，可链式）
+p.save("scans/loading")                             # 现在是"富 npz"
+\end{codeblock}
+
+\pyapi{bind\_source(hub, node, *, inputs, resolve\_node=None, session=None)} 的五个参数：
+
+\begin{description}
+  \item[\pyapi{hub}] 这批数据 publish 到的 \pyapi{SignalHub}；
+  \item[\pyapi{node}] 产出面板第一个输入信号的\tfocus{逻辑节点}（measurement / processor）；
+  \item[\pyapi{inputs}] 这张图接的信号名列表（如 \pyapi{["counts"]}）；
+  \item[\pyapi{resolve\_node}]（可选）一个 \pyapi{信号名 -> 产出它的节点} 的映射器，用于\tfocus{向上游追设备}——一个 processor 面板（自己不持设备）据此把它源头 measurement 的相机／sequencer 状态\tfocus{提到顶层}；
+  \item[\pyapi{session}]（可选）没有节点产这批数据时的兜底设备快照来源。
+\end{description}
+
+绑定后 \pyapi{.save()} 变成\tfocus{富保存}，往 \pyapi{info} 多折两块：
+\begin{itemize}
+  \item \pyapi{info['signals']}——面板消费的\tfocus{原始 hub 信号块}（按裸名 + 角色 value/x/centers/frame）。\tfocus{Site map 靠它才能完整回来}：它的底垫相机帧和每站中心是从 flat \pyapi{data\_x}/\pyapi{data\_y} 里\tfocus{恢复不出来}的，必须原样存下；
+  \item \pyapi{info['provenance']}——采这批数据时的\tfocus{设备状态记录}（\pyapi{camera} + \pyapi{sequencer} 快照 + 采集参数），\tfocus{永远在顶层、格式统一}：不管这张图直接接的是 measurement 还是它下游的 processor，设备快照都提到同一层，读的时候一致。
+\end{itemize}
+
+\tfocus{没绑定就优雅退化}：不调 \pyapi{bind\_source}（一张纯数组图）时，\pyapi{.save()} 就只写基础的 figure + npz，绝不报错。所以"随手 \pyapi{p.save()}"永远能用，绑定只是让存下来的文件更富。\tfocus{这正是 GUI 面板 Save 在内部做的事}：面板 Save 先 \pyapi{bind\_source} 到该面板接的信号，再调同一个 \pyapi{DataFigure.save}——所以两边 npz 逐字一致。
+
+\section{回看：na.load\_figure 与 exp.figure\_viewer}
+存下来的 \pyapi{.npz} 有两种打开方式，都\tfocus{不需要连硬件}：
+
+\tfocus{（一）代码里轻量查看}——\pyapi{na.load\_figure(npz)} 返回一个 \pyapi{SavedFigure} 句柄：
+
+\begin{codeblock}[Python：无硬件重开一张存下的图]
+import Zou_lab_control.neutral_atom as na
+
+sf = na.load_figure("scans/probe_scan_2026_06_30_14_02_11.npz")
+print(sf.info_summary())          # 它存了什么：名字/来源/图型/标签/单位/形状/进度/view/拟合
+print(sf.compatible_kinds())      # 这份数据能被当成哪些图型看（由数据形状推，非写死）
+df = sf.plot()                    # 按存下的图型重画，复刻原图 -> 一个 DataFigure
+df2 = sf.plot(kind="hist")        # 用另一种兼容图型重新解读同一份 data_x/data_y
+df2.gaussian()                    # 重开的图照样能拟合
+df2.save("scans/refit")           # 也能再存
+\end{codeblock}
+
+\pyapi{SavedFigure.plot(kind=None)} 是\tfocus{数据视角}：同一份 \pyapi{data\_x}/\pyapi{data\_y} 交给 \pyapi{plot()} 工厂，默认用\tfocus{存下的图型}（复刻原图），换成 \pyapi{compatible\_kinds()} 里的任意一个则用另一种 plotter 重新解读；存下的 view 状态（relim / 固定上下限 / cmap / 标签）会\tfocus{种进}重画的图，你的 \pyapi{overrides} 再覆盖它。
+
+\tfocus{（二）GUI 里回看}——\pyapi{exp.figure\_viewer(path)}（或双击 \filepath{figure\_viewer.bat}、\pyapi{zf.show\_figure\_viewer()}）开一个\tfocus{纯查看器}窗口。它是个真的、无采集的看图台：
+
+\begin{description}
+  \item[左侧 Info 栏] 分五个标签：\pyapi{File}（文件本身）、\pyapi{Plot}（名字/图型/标签/单位/存的 view/拟合）、\pyapi{Measurement}（来源、\pyapi{data\_x}/\pyapi{data\_y} 形状、points/repeat、存下的信号块）、\pyapi{Device}（\pyapi{provenance} 里的\tfocus{采集时设备快照}：camera + sequencer，不管源是 measurement 还是 processor 都在顶层一致展开）、\pyapi{Raw}（整个 \pyapi{info} 字典原文）。
+  \item[右侧] 嵌\tfocus{一个真的 Task 控制台}：载入一张图＝往它的 hub 里发一条 \pyapi{fig\_value} 信号，并自动开一张\tfocus{复刻原图}的面板；于是缩放/拖阈值线/换图型/再拟合/再存都是控制台面板\tfocus{原本就有}的能力，不必另造。面板可以\tfocus{拖到第二列}；视口窄时看图台按需加\tfocus{横向滚动}、需要时扩展成多列。
+  \item[Browse] 选图对话框列出 \pyapi{png}/\pyapi{jpg} 图片和 \pyapi{npz}；\tfocus{选中一张图片会自动去载入它的同名 \pyapi{.npz}}——所以你按缩略图挑图，数据自动跟上。
+\end{description}
+
+\section{面板 Save 与 pulse 预览也走同一套}
+\tfocus{Task 控制台面板}的 \pyapi{Edit} 标签底部有 \pyapi{Save Fig}：一个 \pyapi{png}/\pyapi{pdf}/\pyapi{jpg} 格式下拉 + 按钮，导出\tfocus{当前面板}的图 + 同名 npz（npz 数据不随格式变）。它内部就是先 \pyapi{bind\_source} 到该面板接的信号、再调 \pyapi{DataFigure.save}——和你在 notebook 里 \pyapi{p.bind\_source(...).save()} 是\tfocus{同一条路}。
+
+\tfocus{脉冲编辑器}的 Preview 页也有 \pyapi{Save Figure}：它把当前预览的时序波形包成一个通用 \pyapi{DataFigure} 再 \pyapi{.save()}，所以\tfocus{存出来也是标准的 图 + npz}（图型标记 \pyapi{1d}），一样能在 \pyapi{figure\_viewer} 里回看——只是脉冲预览本身信息较少（没有信号块/设备 provenance），回看时以波形为主。
 
 \chapter{PDF 渲染 API}
 
