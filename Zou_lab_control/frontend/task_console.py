@@ -3055,7 +3055,7 @@ class PanelCard(FluentGroupBox):
             plotter = panel_plot(
                 centers, vec, kind="sites", size=size, interactions=False,
                 image=image, roi_radius=site_ring_radius(centers),
-                cmap=str(self.config.params.get("cmap", "gray")),
+                cmap=str(self.config.params.get("cmap") or "gray"),   # '' (a saved "default") -> the plot default
                 **self._view_kwargs("sites"),
                 labels=("Camera x (px)", "Camera y (px)", label),
                 title=self.config.title or None)
@@ -3079,7 +3079,7 @@ class PanelCard(FluentGroupBox):
             data_x = np.column_stack([xx.ravel(), yy.ravel()])
             plotter = panel_plot(
                 data_x, arr.ravel(), kind="2d", size=size, interactions=False,
-                cmap=str(self.config.params.get("cmap", "inferno")),
+                cmap=str(self.config.params.get("cmap") or "inferno"),   # '' (a saved "default") -> the plot default
                 **self._view_kwargs("2d"),
                 labels=(xlabel, ylabel, ""), title=self.config.title or None)
         elif kind == "monitor":
@@ -4051,7 +4051,7 @@ class PanelEditor(QtWidgets.QWidget):
         size = card.config.size          # mirror the Monitor frame, never force 2x4
         title = card.config.title or PANEL_KINDS[kind]
         view = card._view_kwargs(kind)   # ONE source: relim mode + fixed lo/hi -- for sites too (#4)
-        cmap = str(card.config.params.get("cmap", "gray" if kind == "sites" else "inferno"))
+        cmap = str(card.config.params.get("cmap") or ("gray" if kind == "sites" else "inferno"))  # '' saved -> default
         try:
             if kind == "2d":
                 new_plotter = panel_plot(np.array(src.data_x, dtype=float),
