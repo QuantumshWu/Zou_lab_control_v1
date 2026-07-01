@@ -170,10 +170,11 @@ def test_na_facade_exposes_load_figure(tmp_path):
     assert saved.kind == "hist"
 
 
-# ---- pulse-preview -> generic save -> figure_viewer load (the "any simple plot" path) ----------
+# ---- pulse-preview -> figure_recipe save -> faithful reproduction (structured-figure path) --------
 def _pulse_editor():
-    """A headless PulseSequenceEditor whose preview draws real 0/1 transitions (probe ON in the
-    first period, trig ON in the second) -- so the saved level arrays carry actual edges."""
+    """A headless PulseSequenceEditor whose preview draws real MULTI-channel 0/1 transitions AND a real
+    analog DAC bus (``da0..da3`` grouped into one signed analog trace), so a faithful reproduction has
+    genuine channels + an analog bus to compare against (not a single 1-D line)."""
     pytest.importorskip("PyQt5")
     from PyQt5 import QtWidgets
     QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
@@ -181,44 +182,63 @@ def _pulse_editor():
     from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState, PulsePeriod
 
     periods = [
-        PulsePeriod(duration=10, unit="us", name="p0", states=(1, 0)),
-        PulsePeriod(duration=20, unit="us", name="p1", states=(0, 1)),
+        PulsePeriod(duration=10, unit="us", name="p0", states=(1, 0, 0, 1, 0, 1)),
+        PulsePeriod(duration=20, unit="us", name="p1", states=(0, 1, 1, 0, 1, 0)),
     ]
-    st = PulseTableState(channels=["probe", "trig"], periods=periods, name="demo_pulse")
+    st = PulseTableState(
+        channels=["probe", "trig", "da0", "da1", "da2", "da3"], periods=periods, name="demo_pulse",
+        analog_buses={"da": ["da0", "da1", "da2", "da3"]},
+    )
     return PulseSequenceEditor(st), st
 
 
-def test_pulse_preview_saves_generic_figure_and_npz(tmp_path):
-    """The pulse-preview Save routes through the SAME generic ``DataFigure.save``: a ``<stem>.png``
-    image PLUS a matching ``<stem>.npz`` whose ``data_x`` (time axis) / ``data_y`` (per-channel
-    step levels) / ``info`` are the standard SavedFigure payload.  The preview is not a hub signal
-    (no producing node), so the DataFigure is UNBOUND and the save degrades to the basic payload --
-    ``kind="1d"`` with no signals/provenance -- which is exactly what a static preview has to offer."""
+def _preview_plotter(state, *, include_always_off=True):
+    """The ORIGINAL pulse plotter (the reference the reproduction must match), built through the SAME
+    module-level renderer the editor preview uses -- ``build_pulse_preview_plot``."""
+    from Zou_lab_control.frontend.pulse_gui import build_pulse_preview_plot
+    plotter, _channels, _repeat = build_pulse_preview_plot(state, include_always_off=include_always_off)
+    return plotter
+
+
+def test_pulse_preview_save_stores_a_faithful_figure_recipe(tmp_path):
+    """The pulse-preview Save stores a REPLAY RECIPE, not a flattened 1-D trace.  The npz ``info`` carries
+    ``figure_recipe['kind'] == 'pulse'`` whose ``pulse_state`` round-trips through ``PulseTableState.
+    from_dict`` -- so the ORIGINAL structured figure (multi-channel + analog bus) can be rebuilt exactly.
+    The kind is ``pulse`` and the recipe is the only compatible kind (the arrays are a lossy fallback)."""
+    from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState
+
     ed, state = _pulse_editor()
     df = ed._preview_data_figure(state, include_always_off=True)
     try:
-        # A 1-column data_x (time axis) + one level column per drawn channel.
-        assert df.data_x.ndim == 2 and df.data_x.shape[1] == 1
-        assert df.data_y.shape[1] == 2                      # probe + trig level columns
-        assert df.info.get("kind") == "1d"
-        assert df.info.get("source") == "pulse preview"
-        assert df.info.get("channels") == ["probe", "trig"]
+        assert df.info.get("kind") == "pulse"
+        recipe = df.info.get("figure_recipe")
+        assert isinstance(recipe, dict) and recipe.get("kind") == "pulse"
+        # the stored pulse_state faithfully round-trips (from_dict rebuilds the exact editor state)
+        rebuilt = PulseTableState.from_dict(recipe["pulse_state"])
+        assert list(rebuilt.channels) == list(state.channels)
+        assert len(rebuilt.periods) == len(state.periods)
+        assert dict(rebuilt.analog_buses) == dict(state.analog_buses)
         out = df.save(str(tmp_path / "demo_pulse.png"))
-        assert Path(out["figure"]).exists() and Path(out["figure"]).suffix == ".png"
-        assert Path(out["data"]).exists() and Path(out["data"]).suffix == ".npz"
-        # The stored levels are a faithful step reconstruction: probe ON then OFF, trig OFF then ON.
+        assert Path(out["figure"]).exists() and Path(out["data"]).exists()
         data = np.load(out["data"], allow_pickle=True)
-        assert data["data_y"].shape[1] == 2
-        np.testing.assert_array_equal(data["data_y"][0], [1.0, 0.0])   # t=0: probe on, trig off
+        info = data["info"].item()
+        assert info["figure_recipe"]["kind"] == "pulse"
+        assert "periods" in info["figure_recipe"]["pulse_state"]
     finally:
         plt.close("all")
 
 
-def test_pulse_preview_npz_reopens_in_figure_viewer(tmp_path):
-    """The pulse-preview npz reopens as a standard SavedFigure and BUILDS in the figure viewer:
-    ``na.load_figure`` reads it as ``kind="1d"``, ``.plot()`` reproduces a DataFigure, and
-    ``show_figure_viewer`` seeds a live 1-D panel redrawing the levels -- no bespoke pulse path."""
+def test_pulse_recipe_reopens_as_faithful_pulse_figure(tmp_path):
+    """``na.load_figure(npz).plot()`` reproduces the ORIGINAL pulse figure, not a 1-D line: the reopened
+    plotter is a ``PulseSequenceFigure`` whose channels / analog traces / pulse rows match the original
+    editor preview exactly (many channels + an analog bus + many pulse rows -- not a single line)."""
     ed, state = _pulse_editor()
+    original = _preview_plotter(state)
+    orig_channels = list(original.channels)
+    orig_analog = len(original.analog_traces)
+    orig_pulses = len(original.pulses)
+    plt.close(original.fig)
+
     df = ed._preview_data_figure(state, include_always_off=True)
     out = df.save(str(tmp_path / "demo_pulse.png"))
     plt.close(df.fig)
@@ -227,22 +247,74 @@ def test_pulse_preview_npz_reopens_in_figure_viewer(tmp_path):
 
     saved = na.load_figure(out["data"])
     try:
-        assert isinstance(saved, SavedFigure)
-        assert saved.kind == "1d"
-        assert "1d" in saved.compatible_kinds()
-        assert "pulse preview" in saved.info_summary()
-        # DATA-view reproduction through the SAME plot() factory a 1-D save uses.
+        assert saved.kind == "pulse"
+        assert saved.figure_recipe is not None and saved.figure_recipe["kind"] == "pulse"
+        assert saved.compatible_kinds() == ["pulse"]        # structured figure: only its recipe kind
+        # THE FAITHFUL REPRODUCTION: rebuild through the recipe -> a PulseSequenceFigure matching the original
         reopened = saved.plot()
-        assert reopened.fig is not None and reopened.plot_type == "1D"
+        plotter = reopened.live_plot
+        assert type(plotter).__name__ == "PulseSequenceFigure"
+        assert list(plotter.channels) == orig_channels, "the reproduced channels match the original"
+        assert len(plotter.analog_traces) == orig_analog, "the reproduced analog bus traces match"
+        assert len(plotter.pulses) == orig_pulses, "the reproduced pulse rows match"
+        assert orig_analog >= 1 and orig_pulses > 1, "the original really was multi-row (not a 1-D line)"
+        # more than one data-carrying line on the axes -- a faithful multi-channel figure, not one trace
+        lines = [ln for ln in plotter.ax.get_lines() if len(ln.get_xdata()) > 0]
+        assert len(lines) > 1
         plt.close(reopened.fig)
-        # Full viewer build: it seeds a real Task console panel of the saved kind.
-        from Zou_lab_control.frontend.figure_viewer import show_figure_viewer
-
-        viewer = show_figure_viewer(out["data"])
-        try:
-            assert viewer.saved is not None and viewer.saved.kind == "1d"
-            assert viewer.console is not None
-        finally:
-            viewer.teardown()
     finally:
+        plt.close("all")
+
+
+def test_pulse_recipe_prefers_provenance_sequencer_payload(tmp_path):
+    """When the save ALSO carries provenance (a FIRED pulse), the reproduction is sourced from the
+    sequencer snapshot's ``last_payload_json`` (the SAME ``PulseTableState.to_dict()`` format the recipe
+    uses) -- one source with the device state, no duplicate copy.  The recipe's own ``pulse_state`` is the
+    fallback for a pure preview that was never fired.  This pins that provenance WINS when present."""
+    import json
+    from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState, PulsePeriod
+
+    recipe_state = PulseTableState(channels=["a", "b"],
+                                   periods=[PulsePeriod(duration=5, unit="us", states=(1, 0))], name="recipe")
+    fired_state = PulseTableState(channels=["a", "b", "c"],
+                                  periods=[PulsePeriod(duration=7, unit="us", states=(1, 0, 1))], name="fired")
+    info = {
+        "kind": "pulse", "name": "x",
+        "figure_recipe": {"kind": "pulse", "pulse_state": recipe_state.to_dict(), "include_always_off": True},
+        "provenance": {"devices": {"sequencer": {"last_payload_json": json.dumps(fired_state.to_dict())}}},
+    }
+    npz = tmp_path / "fired_pulse.npz"
+    np.savez(npz, data_x=np.zeros((1, 1)), data_y=np.zeros((1, 1)), info=info)
+
+    saved = load_figure(npz)
+    try:
+        df = saved.plot()                                   # provenance-sourced reproduction
+        assert list(df.live_plot.channels) == ["a", "b", "c"], "provenance sequencer payload wins over the recipe copy"
+    finally:
+        plt.close("all")
+
+
+def test_pulse_recipe_reopens_in_figure_viewer(tmp_path):
+    """A pulse recipe npz reopens in ``show_figure_viewer``: the window does NOT crash, the right pane
+    shows the REPRODUCED pulse figure on an embedded canvas (a structured figure is ``panel=False`` so it
+    is NOT a console board), and the Info column carries the recipe."""
+    ed, state = _pulse_editor()
+    df = ed._preview_data_figure(state, include_always_off=True)
+    out = df.save(str(tmp_path / "demo_pulse.png"))
+    plt.close(df.fig)
+
+    from Zou_lab_control.frontend.figure_viewer import show_figure_viewer
+
+    viewer = show_figure_viewer(out["data"])
+    try:
+        assert viewer.saved is not None and viewer.saved.kind == "pulse"
+        assert viewer.console is None, "a structured (recipe) figure is NOT seeded onto a console board"
+        assert viewer._recipe_card is not None, "the right pane shows the reproduced pulse figure"
+        assert viewer._recipe_figure is not None
+        assert "figure_recipe" in viewer.raw_info.toPlainText()
+    finally:
+        win = viewer.window()
+        if win is not None:
+            win.close(); win.deleteLater()
+        viewer.teardown()
         plt.close("all")

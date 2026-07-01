@@ -530,6 +530,68 @@ def _analog_bus_traces(state: PulseTableState, *, include_always_off: bool = Tru
     return traces, folded_members
 
 
+def build_pulse_preview_plot(state: PulseTableState, *, include_always_off: bool):
+    """Render the pretty pulse timeline for ``state`` -- the SINGLE source of the pulse preview figure.
+
+    A pure function of the :class:`PulseTableState` (no editor widgets): it builds the sequence, folds
+    the analog DAC buses into their own rows, draws the digital channels + analog traces + repeat
+    brackets, and shades the scanned regions.  Returns ``(plotter, channels, repeat_notation)`` exactly
+    as the old in-editor builder did.
+
+    It is the ONE renderer shared by (a) the editor's live preview / Save-Figure image and (b) a
+    reopened ``figure_recipe`` -- :meth:`~.data_figure.SavedFigure.plot` for a ``kind="pulse"`` save
+    rebuilds the ``PulseTableState`` from the recipe and calls THIS, so a reloaded pulse figure is a
+    faithful reproduction (same channels / analog traces / brackets) of the one that was saved, not a
+    flattened 1-D trace.
+    """
+    sequence = state.to_sequence(expand_repeat=False)
+    repeat = pulse_repeat_notation(state)
+    repeat_brackets = pulse_repeat_markers(state)
+    # Channel delays can push edges past the period-table end; the repeat
+    # markers are computed from period starts only, so without this the
+    # delayed tail renders OUTSIDE the ×∞ loop bracket (reads as unphysical).
+    # Extend the infinite-loop bracket to enclose the whole drawn sequence.
+    seq_end = float(getattr(sequence, "duration", 0.0) or 0.0)
+    if seq_end > 0.0:
+        repeat_brackets = [
+            (start, max(stop, seq_end), label) if "∞" in str(label) else (start, stop, label)
+            for (start, stop, label) in repeat_brackets
+        ]
+    analog_traces, folded_members = _analog_bus_traces(state, include_always_off=include_always_off)
+    clk_set = set(getattr(state, "clk_channels", []))
+    digital_channel_universe = [
+        channel for channel in state.channels
+        if channel not in folded_members and channel not in clk_set   # clk channels aren't engine-driven
+    ]
+    channels = pulse_plot_channels(
+        sequence,
+        channels=digital_channel_universe,
+        include_always_off=include_always_off,
+    )
+    # Defensive: a folded DAC bit must never appear as its own digital row.
+    channels = [channel for channel in channels if channel not in folded_members]
+    plotter = frontend_plot(
+        sequence,
+        kind="pulse",
+        channels=channels,
+        include_always_off=True,
+        repeat_notation=repeat,
+        repeat_brackets=repeat_brackets,
+        channel_labels={channel: state.label_for(channel) for channel in channels},
+        analog_traces=analog_traces,
+        title=state.name,
+        show_names=True,
+        display=False,
+        data_figure=False,
+        # x auto-extend: one width block per PULSE_X_PERIODS_PER_BLOCK periods
+        # (capped at PULSE_X_MAX_WIDTH_FACTOR x) -- mirrors the y row blocks.
+        period_count=len(state.periods),
+    )
+    bus_rows = [str(trace.get("name")) for trace in analog_traces]
+    PulseSequenceEditor._annotate_variable_regions(plotter, state, channels, bus_rows=bus_rows)
+    return plotter, channels, repeat
+
+
 def _summary_time_text(value_ns: float) -> str:
     value_ns = float(value_ns)
     # Largest-unit-first table derived from the single source UNITS_TO_NS, skipping the
@@ -4104,55 +4166,14 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         return directory / f"{_safe_file_stem(state.name)}.png"
 
     def _create_preview_plot(self, state: PulseTableState, *, include_always_off: bool):
-        sequence = state.to_sequence(expand_repeat=False)
-        repeat = pulse_repeat_notation(state)
-        repeat_brackets = pulse_repeat_markers(state)
-        # Channel delays can push edges past the period-table end; the repeat
-        # markers are computed from period starts only, so without this the
-        # delayed tail renders OUTSIDE the ×∞ loop bracket (reads as unphysical).
-        # Extend the infinite-loop bracket to enclose the whole drawn sequence.
-        seq_end = float(getattr(sequence, "duration", 0.0) or 0.0)
-        if seq_end > 0.0:
-            repeat_brackets = [
-                (start, max(stop, seq_end), label) if "∞" in str(label) else (start, stop, label)
-                for (start, stop, label) in repeat_brackets
-            ]
-        analog_traces, folded_members = _analog_bus_traces(state, include_always_off=include_always_off)
-        clk_set = set(getattr(state, "clk_channels", []))
-        digital_channel_universe = [
-            channel for channel in state.channels
-            if channel not in folded_members and channel not in clk_set   # clk channels aren't engine-driven
-        ]
-        channels = pulse_plot_channels(
-            sequence,
-            channels=digital_channel_universe,
-            include_always_off=include_always_off,
-        )
-        # Defensive: a folded DAC bit must never appear as its own digital row.
-        channels = [channel for channel in channels if channel not in folded_members]
-        plotter = frontend_plot(
-            sequence,
-            kind="pulse",
-            channels=channels,
-            include_always_off=True,
-            repeat_notation=repeat,
-            repeat_brackets=repeat_brackets,
-            channel_labels={channel: state.label_for(channel) for channel in channels},
-            analog_traces=analog_traces,
-            title=state.name,
-            show_names=True,
-            display=False,
-            data_figure=False,
-            # x auto-extend: one width block per PULSE_X_PERIODS_PER_BLOCK periods
-            # (capped at PULSE_X_MAX_WIDTH_FACTOR x) -- mirrors the y row blocks.
-            period_count=len(state.periods),
-        )
-        bus_rows = [str(trace.get("name")) for trace in analog_traces]
-        self._annotate_variable_regions(plotter, state, channels, bus_rows=bus_rows)
-        return plotter, channels, repeat
+        # The pretty pulse render is a PURE function of the state (no editor widgets), so it lives at
+        # module level -- the ONE source both the GUI preview AND a reopened ``figure_recipe`` rebuild
+        # (``SavedFigure.plot()`` for a ``kind="pulse"`` save) call, so a reloaded pulse figure is
+        # byte-for-byte the figure that was saved.
+        return build_pulse_preview_plot(state, include_always_off=include_always_off)
 
+    @staticmethod
     def _annotate_variable_regions(
-        self,
         plotter,
         state: PulseTableState,
         channels: Sequence[str] | None = None,
@@ -4296,14 +4317,25 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         standard figure+npz pair (``data_x`` / ``data_y`` / ``info``) that the figure
         viewer can reopen.
 
-        The pretty pulse timeline (the console/notebook ``kind="pulse"`` figure) is kept as
-        the SAVED IMAGE, while the npz stores a plain time-vs-level reconstruction:
-        ``data_x`` is the shared edge-time grid (seconds) and ``data_y`` is one step-held
-        level column per drawn row (each digital channel's 0/1, then each analog bus's
-        signed value).  That is a 1-column-``data_x`` payload, so it round-trips as
-        ``kind="1d"`` -- ``show_figure_viewer`` seeds a 1-D panel that redraws the levels as
-        step lines.  No hub binding is stamped, so ``DataFigure.save`` degrades to the basic
-        payload (no signals / provenance), which is all a static preview has to offer.
+        The pulse figure is rendered from a STRUCTURED source (the period table + analog buses),
+        so it cannot be faithfully expressed as ``data_x`` / ``data_y`` alone -- a flattened
+        time-vs-level trace loses the multi-channel 0/1 rows, the analog bus traces and the pulse
+        rendering.  So, like a site map stores its underlay frame, the save carries a REPLAY RECIPE
+        under ``info['figure_recipe']``: ``{"kind": "pulse", "pulse_state": state.to_dict(),
+        "include_always_off": ...}``.  That recipe is the SINGLE truth source for reproduction --
+        :meth:`~.data_figure.SavedFigure.plot` rebuilds the ``PulseTableState`` from it and calls
+        :func:`build_pulse_preview_plot` (the SAME renderer this preview uses), so ``na.load_figure(npz)
+        .plot()`` and the figure viewer reproduce the ORIGINAL pulse figure (channels + analog traces +
+        brackets), not a 1-D line.
+
+        The recipe is extensible: ``figure_recipe['kind']`` names the structured-figure family, so a
+        future structured plot adds its own recipe kind without touching this seam.
+
+        ``data_x`` / ``data_y`` still carry a plain time-vs-level reconstruction (the shared edge-time
+        grid + one step-held level column per drawn row) as a NO-RECIPE FALLBACK -- an older reader that
+        does not understand ``figure_recipe`` still gets a valid 1-D payload.  No hub binding is stamped,
+        so ``DataFigure.save`` degrades to the basic payload (no signals / provenance), which is all a
+        static preview has to offer.
         """
         import numpy as np
 
@@ -4361,11 +4393,23 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         row_labels = [label for label, _steps in columns]
 
         info = {
-            "kind": "1d",
+            "kind": "pulse",
             "source": "pulse preview",
             "name": state.name or "pulse",
+            # The REPLAY RECIPE: the single truth source for a faithful reproduction.  ``pulse_state`` is
+            # the FULL JSON-able ``PulseTableState.to_dict()`` -- the SAME serialization format the
+            # sequencer records as ``last_payload_json`` in its ``.snapshot()`` (so a FIRED pulse's
+            # provenance carries the identical bytes; ``SavedFigure._pulse_state_dict`` PREFERS the
+            # provenance sequencer payload when present and only falls back to THIS for a pure preview
+            # that was never fired to a device).  Rebuilding from it reconstructs the exact editor state
+            # and re-renders the identical pulse figure.
+            "figure_recipe": {
+                "kind": "pulse",
+                "pulse_state": state.to_dict(),
+                "include_always_off": bool(include_always_off),
+            },
             # Human-readable per-row legend, so a reader can tell which line is which
-            # channel/bus even though the viewer redraws them as generic 1-D step lines.
+            # channel/bus even in the no-recipe fallback (a generic 1-D step-line view).
             "channels": row_labels,
         }
         return DataFigure(

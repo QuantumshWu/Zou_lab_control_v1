@@ -19,6 +19,14 @@ viewer, the loaded figure becomes ONE hub SIGNAL and the whole reuse is the Task
   the signal picker, re-wiring and the light processing for free -- add MORE panels reading the same
   ``fig_value`` under a different kind, or fit / relim / re-save through the panel's own Edit tab.
 
+A STRUCTURED figure (one whose save carries an ``info['figure_recipe']`` -- e.g. a pulse timeline, which
+is rendered from a period table + analog buses and so cannot be expressed as ``data_x`` / ``data_y``) is
+``panel=False`` (not a console-panel kind), so it does NOT seed a board.  Instead its right pane holds
+the FAITHFUL reproduction on an embedded matplotlib canvas: ``SavedFigure.plot()`` rebuilds it from the
+recipe (the pulse figure redrawn through the SAME renderer the editor used -- every channel / analog
+trace / bracket back), and the Info column shows the recipe alongside the rest.  The right pane thus
+holds EITHER a live console board (array figures) OR a reproduced structured figure (recipe figures).
+
 A read-only **Info** column on the left lists EVERY key the npz stored, grouped into tabs -- **Plot**
 (name / kind / labels / unit / saved / the view sub-dict / any fit), **Measurement** (source / data_x /
 data_y shapes / points / repeat / the stored signal blocks), **Device** (the run's provenance expanded
@@ -47,11 +55,17 @@ from Zou_lab_control.neutral_atom.core.signals import SignalHub
 from Zou_lab_control.neutral_atom.operations.logic import LogicNode, SignalSpec
 
 from .data_figure import SavedFigure, load_figure
+from .qt_canvas import panel_canvas
 from .task_console import (
     PanelConfig,
     TaskConsole,
     TaskConsoleState,
 )
+
+try:
+    import matplotlib.pyplot as _plt
+except Exception:                                # pragma: no cover - matplotlib always present in-frontend
+    _plt = None
 from .qt_fluent import (
     GREY,
     FluentCodeEdit,
@@ -360,6 +374,12 @@ class FigureViewer(QtWidgets.QWidget):
         self.hub = SignalHub()
         self.node: LoadedFigureNode | None = None
         self.console: TaskConsole | None = None
+        # A STRUCTURED figure (one carrying a ``figure_recipe`` -- e.g. a pulse timeline) is ``panel=False``
+        # (not a console-panel kind), so it CANNOT seed a board panel.  It is reproduced instead on an
+        # embedded matplotlib canvas that fills the right pane; ``_recipe_card`` / ``_recipe_figure`` hold
+        # it so the next load / teardown clears it.  The right pane holds EITHER a console OR a recipe view.
+        self._recipe_card: QtWidgets.QWidget | None = None
+        self._recipe_figure = None
         self._current_path: Path | None = None
 
         self._label_w = setting_label_width(
@@ -533,10 +553,19 @@ class FigureViewer(QtWidgets.QWidget):
         with _signals_blocked(self.path_edit.edit):
             self.path_edit.setText(str(path))
         self._fill_info(saved)
-        self._build_console(saved)
-        self.status.setText(
-            f"loaded {display_path(str(path))} -> fig_value signal; the seeded {saved.kind or 'figure'} "
-            "panel reproduces it -- Add Panel to view it another way.")
+        # A STRUCTURED figure (a ``figure_recipe`` -- e.g. a pulse timeline) is NOT a console-panel kind,
+        # so it is reproduced on an embedded canvas rather than seeded onto the board.  An ordinary array
+        # figure (scan / hist / site map) still becomes the ``fig_value`` hub signal + a real board.
+        if saved.figure_recipe is not None:
+            self._build_recipe_view(saved)
+            self.status.setText(
+                f"loaded {display_path(str(path))} -> reproduced the "
+                f"{saved.kind or 'structured'} figure faithfully from its saved recipe.")
+        else:
+            self._build_console(saved)
+            self.status.setText(
+                f"loaded {display_path(str(path))} -> fig_value signal; the seeded {saved.kind or 'figure'} "
+                "panel reproduces it -- Add Panel to view it another way.")
 
     def _clear_layout(self, layout: QtWidgets.QVBoxLayout) -> None:
         while layout.count():
@@ -654,6 +683,7 @@ class FigureViewer(QtWidgets.QWidget):
         publishes it as the ``fig_value`` hub signal and seeds a panel reproducing it; with ``None``
         (nothing loaded yet) it is an EMPTY board -- so the window ALWAYS shows a real console beside
         the Info column (never a bare, crammed strip), and Browse + Load simply reseeds it."""
+        self._teardown_recipe_view()             # the right pane holds EITHER a console OR a recipe view
         self._teardown_console()
         self.hub = SignalHub()
         if saved is not None:
@@ -696,7 +726,51 @@ class FigureViewer(QtWidgets.QWidget):
                 pass
             self.node = None
 
+    # -------------------------------------------------------- structured (recipe) view
+    def _build_recipe_view(self, saved: SavedFigure) -> None:
+        """Fill the right pane with the FAITHFUL reproduction of a STRUCTURED figure (a ``figure_recipe``
+        such as a pulse timeline) on an embedded matplotlib canvas -- NOT a console board, because such a
+        figure is ``panel=False`` (not a panel kind).  ``saved.plot()`` rebuilds it from the recipe (the
+        pulse figure is redrawn through the SAME renderer the editor used, so every channel / analog trace
+        / bracket comes back), and the canvas is wrapped in a fluent card whose rounded edge + shadow are
+        owned by :class:`FluentFrame` (no hand-drawn border here).  A rebuild that fails leaves the pane
+        empty + an error in the status rather than crashing the window."""
+        self._teardown_console()
+        self._teardown_recipe_view()
+        try:
+            df = saved.plot()                    # recipe reproduction -> a DataFigure holding the figure
+        except Exception as exc:
+            self.status.setText(f"could not reproduce: {str(exc).splitlines()[0][:160]}")
+            return
+        figure = df.fig
+        self._recipe_figure = figure
+        card = FluentFrame()
+        card.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        pad = scaled_px(10, minimum=6)
+        lay = QtWidgets.QVBoxLayout(card)
+        lay.setContentsMargins(pad, pad, pad, pad)
+        lay.setSpacing(scaled_px(6, minimum=4))
+        canvas = panel_canvas(figure, isolate_wheel=False)
+        canvas.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        lay.addWidget(canvas, 1)
+        self._recipe_card = card
+        self._console_holder.addWidget(card)
+
+    def _teardown_recipe_view(self) -> None:
+        if self._recipe_card is not None:
+            self._console_holder.removeWidget(self._recipe_card)
+            self._recipe_card.deleteLater()
+            self._recipe_card = None
+        if self._recipe_figure is not None:
+            if _plt is not None:
+                try:
+                    _plt.close(self._recipe_figure)
+                except Exception:
+                    pass
+            self._recipe_figure = None
+
     def teardown(self) -> None:
+        self._teardown_recipe_view()
         self._teardown_console()
 
     # ---------------------------------------------------------------- sizing

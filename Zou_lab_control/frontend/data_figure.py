@@ -860,6 +860,17 @@ class SavedFigure:
         return self.info.get("kind")
 
     @property
+    def figure_recipe(self) -> Mapping[str, Any] | None:
+        """The REPLAY RECIPE a structured figure stores so it can be re-rendered FAITHFULLY (not from
+        ``data_x`` / ``data_y``, which for a structured figure are only a lossy fallback).  A recipe is
+        ``{"kind": <family>, ...}`` -- e.g. a pulse figure stores ``{"kind": "pulse", "pulse_state":
+        <PulseTableState.to_dict()>, "include_always_off": ...}``.  ``None`` for an ordinary array figure
+        (a scan / hist / site map), whose ``data_x`` / ``data_y`` ARE the faithful source.  The dispatch
+        is by ``recipe['kind']``, so a new structured-figure family plugs in without touching this seam."""
+        recipe = self.info.get("figure_recipe")
+        return recipe if isinstance(recipe, Mapping) and recipe.get("kind") else None
+
+    @property
     def name(self) -> str | None:
         return self.info.get("name")
 
@@ -890,8 +901,16 @@ class SavedFigure:
         the ``PLOT_KINDS`` ``render_family`` (never a hard-coded list): a 2-column ``data_x`` (a 2-D
         scan) offers the ``"2D"`` families (image / site map); a 1-column ``data_x`` offers the
         ``"1D"`` families (line / rolling trace / distribution).  The saved kind is always first so
-        it reproduces the original figure."""
+        it reproduces the original figure.
+
+        A STRUCTURED figure (one carrying a ``figure_recipe``) offers ONLY its recipe kind: its
+        ``data_x`` / ``data_y`` are a lossy fallback, so re-interpreting them as a line / hist would
+        NOT be a faithful view -- the recipe kind is the one true way to draw it."""
         from .live import PLOT_KINDS
+
+        recipe = self.figure_recipe
+        if recipe is not None:
+            return [str(recipe.get("kind"))]
 
         is_2d = self.data_x.ndim == 2 and self.data_x.shape[1] >= 2
         want = "2D" if is_2d else "1D"
@@ -948,18 +967,91 @@ class SavedFigure:
         re-interprets the data with a different plotter).  The saved view state (relim / fixed lo-hi /
         cmap / labels) seeds the plotter and ``overrides`` win over it.  Only DATA kwargs
         (:data:`_VIEW_PLOT_KWARGS`) reach ``plot()`` -- geometry / dpi / typography stay frontend-owned,
-        and a saved knob a re-interpreted kind does not accept is dropped, never raised."""
+        and a saved knob a re-interpreted kind does not accept is dropped, never raised.
+
+        When this figure carries a ``figure_recipe`` (a STRUCTURED figure such as a pulse timeline),
+        the reproduction goes through :meth:`_replay_recipe` instead: it re-renders from the recipe's
+        own source (e.g. rebuilds the ``PulseTableState`` and re-draws the pulse figure), so the reopened
+        figure is FAITHFUL (all channels / analog traces / brackets), not a flattened line off the
+        fallback arrays.  ``kind`` / ``size`` / ``overrides`` are ignored for a recipe figure -- the
+        recipe is self-describing."""
+        recipe = self.figure_recipe
+        if recipe is not None:
+            return self._replay_recipe(recipe)
+        return self._plot_from_arrays(kind, size, **overrides)
+
+    def _replay_recipe(self, recipe: Mapping[str, Any]) -> "DataFigure":
+        """Re-render a STRUCTURED figure from its ``figure_recipe`` -- a faithful reproduction from the
+        recipe's OWN source, not the fallback ``data_x`` / ``data_y``.  Dispatch is by ``recipe['kind']``,
+        so each structured-figure family owns its rebuild here (and a new family adds a branch); an
+        unknown recipe kind falls back to the ordinary array ``plot`` so nothing crashes.
+
+        ``pulse`` -> rebuild the ``PulseTableState`` and re-draw the pulse figure through the SAME
+        :func:`~.pulse_gui.build_pulse_preview_plot` the editor uses, so every digital channel / analog
+        bus trace / repeat bracket comes back exactly as saved.  The rebuild imports ``pulse_gui`` LAZILY
+        (only when a pulse recipe is actually reopened) so the ordinary array-figure reload path stays
+        free of the pulse-editor / PyQt import."""
+        rkind = str(recipe.get("kind") or "")
+        if rkind == "pulse":
+            return self._replay_pulse(recipe)
+        # Unknown structured kind: fall back to the ordinary array reproduction (never crash on reopen).
+        return self._plot_from_arrays()
+
+    def _pulse_state_dict(self, recipe: Mapping[str, Any]) -> dict:
+        """The ``PulseTableState.to_dict()`` payload to rebuild the pulse figure from -- resolved from ONE
+        serialization format (``PulseTableState.to_dict``) with provenance PREFERRED over the recipe copy.
+
+        A fired pulse's provenance already carries the applied state: the sequencer's ``.snapshot()``
+        records ``last_payload_json = json.dumps(PulseTableState.to_dict())`` (the exact same format), and
+        the rich save folds that under ``info['provenance']['devices']['sequencer']``.  So when the save
+        HAS provenance with a sequencer payload, THAT is the reproduction source (single source with the
+        device state the run was taken under -- no second copy needed); the recipe's own ``pulse_state``
+        is the FALLBACK for a pure preview that was never fired (the standalone editor has no device, so
+        the editor's current ``PulseTableState`` is the only truth for what the preview drew)."""
+        prov = self.info.get("provenance")
+        devices = prov.get("devices") if isinstance(prov, Mapping) else None
+        seq = devices.get("sequencer") if isinstance(devices, Mapping) else None
+        payload = seq.get("last_payload_json") if isinstance(seq, Mapping) else None
+        if payload:
+            import json
+            try:
+                data = json.loads(payload) if isinstance(payload, str) else dict(payload)
+                if isinstance(data, Mapping) and "periods" in data:
+                    return dict(data)                        # the device-applied state (provenance-sourced)
+            except Exception:
+                pass
+        return dict(recipe.get("pulse_state") or {})         # preview fallback (editor state, never fired)
+
+    def _replay_pulse(self, recipe: Mapping[str, Any]) -> "DataFigure":
+        """Rebuild the pulse figure: ``PulseTableState.from_dict`` (provenance-preferred source) ->
+        :func:`~.pulse_gui.build_pulse_preview_plot` -> its :class:`DataFigure`.  Both source paths feed
+        the ONE renderer, so a fired pulse (rebuilt from its provenance) and a pure preview (rebuilt from
+        the recipe) draw through identical code."""
+        from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState
+
+        state = PulseTableState.from_dict(self._pulse_state_dict(recipe))
+        include_always_off = bool(recipe.get("include_always_off", True))
+        from .pulse_gui import build_pulse_preview_plot
+
+        plotter, _channels, _repeat = build_pulse_preview_plot(
+            state, include_always_off=include_always_off)
+        df = plotter.to_data_figure()
+        df.info = {**df.info, **{k: v for k, v in self.info.items() if k != "labels"}}
+        df.name = self.name or df.name
+        return df
+
+    def _plot_from_arrays(self, kind: str | None = None, size: str | None = None, **overrides):
+        """The ordinary array-figure reproduction (``data_x`` / ``data_y`` -> :func:`~.live.plot`) -- the
+        ONE array path, used by :meth:`plot` for a non-recipe figure AND as the fallback when a recipe's
+        kind is unknown (so there is a single array-reproduction implementation, not two copies)."""
         from .live import panel_plot_spec, plot as _plot
 
         use_kind = kind or self.kind or "auto"
         use_size = size or self.info.get("size", "2x2")
-        # Seed from the saved view state, then let explicit overrides win.
         kwargs = _view_to_plot_kwargs(self.view)
         if self.labels is not None:
             kwargs.setdefault("labels", self.labels)
         kwargs.update(overrides)
-        # Keep only the kwargs plot() accepts as DATA options (drop a knob a re-interpreted kind
-        # would reject, e.g. cmap on a 1-D plot); geometry keys never appear here by construction.
         kwargs = {k: v for k, v in kwargs.items() if k in _VIEW_PLOT_KWARGS}
         try:
             spec = panel_plot_spec(use_size)
@@ -967,11 +1059,7 @@ class SavedFigure:
             spec = None
         plotter = _plot(self.data_x, self.data_y, kind=use_kind, _spec=spec,
                         display=False, data_figure=True, update=False, **kwargs)
-        # ``plot()`` returns the PLOTTER (with its DataFigure built when data_figure=True); hand back
-        # the DataFigure -- the reusable fit / unit / re-save stack -- exactly as ``live.load`` does.
         df = getattr(plotter, "data_figure", None) or plotter.to_data_figure()
-        # Carry the saved provenance onto the reopened DataFigure so a unit-cycle / re-save
-        # round-trips identically (name, source, kind, unit, view, fit).
         df.info = {**df.info, **{k: v for k, v in self.info.items() if k != "labels"}}
         if self.name:
             df.name = self.name
