@@ -535,19 +535,26 @@ def test_grid_image_cell_reopens_faithfully(tmp_path):
         plt.close("all")
 
 
-def test_pulse_panel_opens_at_default_2x2_and_edit_tab_is_not_blank(tmp_path):
-    """Regression pins: (1) a loaded pulse panel opens at the DEFAULT 2x2 preset (the ``_pulse_panel_size``
-    content-fit special-case was removed -- pulse sizes like every other kind); (2) the pulse panel's Edit
-    tab is NOT blank -- ``PanelEditor.rebuild`` has a ``pulse`` branch that rebuilds a real
-    ``PulseSequenceFigure`` through the SAME renderer the live card uses (the reported blank-Edit bug)."""
+def test_pulse_panel_opens_at_optimal_size_and_edit_tab_is_not_blank(tmp_path):
+    """Regression pins: (1) a loaded pulse panel with no recorded ``panel_size`` opens at the SAME default
+    ``optimal_pulse_size`` the preview uses (a small pulse -> a small preset), NOT a forced 2x2; (2) the
+    pulse panel's Edit tab is NOT blank -- ``PanelEditor.rebuild`` has a ``pulse`` branch that rebuilds a
+    real ``PulseSequenceFigure`` through the SAME renderer the live card uses (the reported blank-Edit bug)."""
     from Zou_lab_control.frontend.task_console import PanelEditor
+    from Zou_lab_control.frontend.data_figure import load_figure
+    from Zou_lab_control.frontend.live import default_pulse_size
     npz = _saved_pulse_recipe_npz(tmp_path)
+    # The expected default is the SINGLE default source applied to this saved state's drawn content.
+    saved = load_figure(npz)
+    state, include_off = saved.pulse_state()
+    expected = default_pulse_size(state, include_always_off=include_off)
     v = show_figure_viewer(npz)
     try:
         con = v.console
         card = con.cards[0]
         assert card.config.kind == "pulse"
-        assert card.config.size == "2x2", "the pulse panel opens at the default 2x2 (no content-fit special-case)"
+        assert card.config.size == expected, \
+            f"a recipe with no panel_size opens at the optimal default ({expected}), not a forced 2x2"
         con._tick()
         # open the real Edit tab and rebuild its snapshot -- it must build a PulseSequenceFigure, not blank
         con._edit_card(card)
@@ -566,11 +573,31 @@ def test_pulse_panel_opens_at_default_2x2_and_edit_tab_is_not_blank(tmp_path):
         plt.close("all")
 
 
-def test_pulse_panel_size_dead_symbol_is_gone():
-    """The ``_pulse_panel_size`` content-fit special-case was DELETED (pulse now uses the default 2x2 like
-    every other kind).  Pin it is a dead symbol = 0: the figure_viewer module must not define it."""
-    import Zou_lab_control.frontend.figure_viewer as fv
-    assert not hasattr(fv, "_pulse_panel_size"), "_pulse_panel_size must be fully removed (dead symbol = 0)"
+def test_pulse_panel_size_round_trips_from_recipe(tmp_path):
+    """A pulse figure that RECORDS its ``panel_size`` in the recipe reopens at EXACTLY that size (the
+    operator's saved size wins over the optimal default) -- the size flows with the figure."""
+    from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState, PulsePeriod
+    st = PulseTableState(
+        channels=["probe", "trig"],
+        periods=[PulsePeriod(duration=10, unit="us", name="p0", states=(1, 0)),
+                 PulsePeriod(duration=20, unit="us", name="p1", states=(0, 1))],
+        name="sized_pulse")
+    info = {"kind": "pulse", "name": "sized_pulse", "source": "pulse preview",
+            "figure_recipe": {"kind": "pulse", "pulse_state": st.to_dict(),
+                              "include_always_off": True, "panel_size": "4x4"}}
+    npz = tmp_path / "sized_pulse.npz"
+    np.savez(npz, data_x=np.zeros((1, 1)), data_y=np.zeros((1, 1)), info=info)
+    v = show_figure_viewer(npz)
+    try:
+        card = v.console.cards[0]
+        assert card.config.kind == "pulse"
+        assert card.config.size == "4x4", "the recorded panel_size (4x4) wins over the optimal default"
+    finally:
+        win = v.window()
+        if win is not None:
+            win.close(); win.deleteLater()
+        v.teardown()
+        plt.close("all")
 
 
 def test_calibration_report_every_npz_loads_as_correct_kind(tmp_path):

@@ -1099,10 +1099,14 @@ class SavedFigure:
         PLOT LAYER (live.py), never the pulse_gui app -- so notebook replay, the editor preview and a
         seeded console panel all draw through the ONE renderer, identical code."""
         state, include_always_off = self.pulse_state()
-        from .live import build_pulse_preview_plot
+        from .live import build_pulse_preview_plot, default_pulse_size
 
+        # The reproduction opens at the size it was SAVED at (recipe['panel_size']), else the SAME optimal
+        # default the preview / the console seed use -- so notebook replay matches the reopened panel.
+        recorded = recipe.get("panel_size")
+        size = str(recorded) if recorded else default_pulse_size(state, include_always_off=include_always_off)
         plotter, _channels, _repeat = build_pulse_preview_plot(
-            state, include_always_off=include_always_off)
+            state, include_always_off=include_always_off, size=size)
         df = plotter.to_data_figure()
         df.info = {**df.info, **{k: v for k, v in self.info.items() if k != "labels"}}
         df.name = self.name or df.name
@@ -1130,7 +1134,10 @@ class SavedFigure:
         ``DataFigure`` -- a grid is intrinsically multi-axes, so there is nothing to flatten to one axes."""
         from .live import build_grid_figure
 
-        plotter = build_grid_figure(recipe, display=False)
+        # Open at the saved size if the recipe recorded one, else the stock default -- matching the panel seed.
+        recorded = recipe.get("panel_size")
+        size = str(recorded) if recorded else "2x2"
+        plotter = build_grid_figure(recipe, size=size, display=False)
         return plotter.to_data_figure()
 
     def _plot_from_arrays(self, kind: str | None = None, size: str | None = None, **overrides):

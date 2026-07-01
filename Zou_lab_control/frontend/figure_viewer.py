@@ -385,7 +385,7 @@ def _seed_state(saved: SavedFigure) -> TaskConsoleState:
     kind).  ``pulse`` is ``panel=False`` (not offered in the live Add-Panel dropdown) but it IS a real
     panel kind on this SEED path, so it is NOT downgraded.  Only a genuinely UNKNOWN kind (not in the
     plot-kind table) falls back to shape inference so the window still opens with a reproduction."""
-    from .live import PLOT_KIND_BY_KEY
+    from .live import PLOT_KIND_BY_KEY, default_pulse_size
 
     kind = str(saved.kind or "")
     pk = PLOT_KIND_BY_KEY.get(kind)
@@ -393,18 +393,32 @@ def _seed_state(saved: SavedFigure) -> TaskConsoleState:
         kind = "2d" if (np.asarray(saved.data_x).ndim == 2 and np.asarray(saved.data_x).shape[1] >= 2) else "1d"
         pk = PLOT_KIND_BY_KEY.get(kind)
     view = dict(saved.view or {})
-    # A pulse panel carries its ``include_always_off`` (how the reproduction was drawn) as a param so the
-    # reproduction re-renders with the saved "show off rows" choice.  It opens at the SAME default 2x2
-    # preset as every other kind (its card holds the timeline at its spec-owned natural size, scrolling if
-    # taller) -- no per-kind size special-case.
+    recipe = saved.figure_recipe or {}
+    # The panel opens at the size it was SAVED at, so a reopened figure looks like it did when saved (the
+    # operator can still change it via Setting).  A structured figure (pulse / grid) records ``panel_size``
+    # in its recipe -> use it; a pulse with no recorded size falls back to the SAME default the preview
+    # uses (default_pulse_size for its drawn content); every other kind keeps the stock 2x2 default.
+    size = "2x2"
     if kind == "pulse":
+        # A pulse panel carries its ``include_always_off`` (how the reproduction was drawn) as a param so
+        # the reproduction re-renders with the saved "show off rows" choice.
         resolved = saved.pulse_state()
+        include_off = bool(resolved[1]) if resolved is not None else False
         if resolved is not None:
-            view.setdefault("include_always_off", bool(resolved[1]))
+            view.setdefault("include_always_off", include_off)
+        recorded = recipe.get("panel_size")
+        if recorded:
+            size = str(recorded)
+        elif resolved is not None:
+            size = default_pulse_size(resolved[0], include_always_off=include_off)
+    elif kind == "grid":
+        recorded = recipe.get("panel_size")
+        if recorded:
+            size = str(recorded)
     panel = PanelConfig(
         kind=kind,
         title=str(saved.name or "figure"),
-        size="2x2",
+        size=size,
         source=f"value = {FIG_PREFIX}{FIG_VALUE_KEY}",
         inputs=[FIG_PREFIX + FIG_VALUE_KEY],
         params=view,

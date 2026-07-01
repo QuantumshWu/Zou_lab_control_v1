@@ -89,6 +89,7 @@ from .qt_fluent import (
     FluentWindow,
     center_window_on_primary_screen,
     ensure_qt_app,
+    fluent_tab_shadow_margin,
     fluent_text_width,
     fluent_widget_stylesheet,
     scaled_px,
@@ -3172,7 +3173,11 @@ class PanelCard(FluentGroupBox):
             # The "show off rows" toggle is the panel's own display param (seeded from the saved value);
             # fall back to the node's recorded value when the param is unset -- so toggling re-renders.
             include_off = bool(self.config.params.get("include_always_off", node_include_off))
-            plotter, _channels, _repeat = build_pulse_preview_plot(state, include_always_off=include_off)
+            # size drives the geometry like every other kind (config.size); interactions=False keeps the
+            # Monitor card display-only (NO selectors -- the same rule the sites / 2d / hist / 1d branches
+            # apply below).  Interactive zoom / drag lives in the Edit tab.
+            plotter, _channels, _repeat = build_pulse_preview_plot(
+                state, include_always_off=include_off, size=size, interactions=False)
         elif kind == "grid":
             # A grid panel renders its per-site distribution / kernel grid through the ONE grid builder in
             # the PLOT LAYER (``live.build_grid_figure`` -- the SAME one ``na.load_figure(npz).plot()`` and
@@ -3188,7 +3193,7 @@ class PanelCard(FluentGroupBox):
                 raise ValueError(
                     "grid panel needs a grid figure's producing node -- point it at a loaded grid "
                     "figure's fig_value signal (it carries the grid recipe to reproduce).")
-            plotter = build_grid_figure(recipe, interactions=False, display=False)
+            plotter = build_grid_figure(recipe, interactions=False, size=size, display=False)
         elif kind == "sites":
             centers, image = self._sites_aux(namespace or {})
             vec = np.asarray(value, dtype=float).reshape(-1)
@@ -4222,7 +4227,8 @@ class PanelEditor(QtWidgets.QWidget):
                     raise ValueError("pulse panel has no producing node to snapshot")
                 state, node_include_off = resolved
                 include_off = bool(card.config.params.get("include_always_off", node_include_off))
-                new_plotter, _channels, _repeat = build_pulse_preview_plot(state, include_always_off=include_off)
+                new_plotter, _channels, _repeat = build_pulse_preview_plot(
+                    state, include_always_off=include_off, size=size)   # Edit tab: interactive (default)
             elif kind == "grid":
                 # A grid panel's snapshot rebuilds through the SAME grid builder the live card uses
                 # (``build_grid_figure`` via the console's ``_grid_recipe`` provider) -- the grid mirror of
@@ -4231,7 +4237,7 @@ class PanelEditor(QtWidgets.QWidget):
                 recipe = self.console._grid_recipe(card.config.inputs[0]) if card.config.inputs else None
                 if recipe is None:
                     raise ValueError("grid panel has no producing node to snapshot")
-                new_plotter = build_grid_figure(recipe, interactions=True, display=False)
+                new_plotter = build_grid_figure(recipe, interactions=True, size=size, display=False)
             elif kind == "2d":
                 new_plotter = panel_plot(np.array(src.data_x, dtype=float),
                                          np.array(src.data_y[:, 0], dtype=float), kind="2d",
@@ -5268,6 +5274,14 @@ class TaskConsole(QtWidgets.QWidget):
 
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.tabs.tab_close_requested.connect(self._on_editor_tab_closed)
+        # The tab card (Monitor / Logic / Edit) carries a soft drop shadow whose blur+offset bleeds
+        # ``fluent_tab_shadow_margin`` past its TOP edge.  The generic row spacing above it is smaller than
+        # that bleed, so the tab strip's top read as CUT OFF -- most visibly in the EMBEDDED figure viewer,
+        # whose top inset is 0.  Top up the gap above the tabs to EXACTLY the shadow bleed (the ONE source
+        # shared with the shadow itself and with the Info column's own tab-gap), so the whole top shadow is
+        # visible at every display scale.  (Only the shortfall is added, so a standalone console's existing
+        # gap is unchanged where it already suffices.)
+        root.addSpacing(max(0, fluent_tab_shadow_margin() - root.spacing()))
         root.addWidget(self.tabs, 1)
 
     # ------------------------------------------------------------------ state

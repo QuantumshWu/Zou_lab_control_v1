@@ -169,14 +169,15 @@ def repeats_with_data(raw, *, core_ndim=None) -> int:
 # so the package surface can never set them; see frontend/__init__.py contract).
 _PULSE_X_MARGIN_FRAC = 0.04          # per-side x headroom, as a fraction of the time span
 _PULSE_X_BRACKET_LABEL_FRAC = 0.05   # extra RIGHT headroom when a repeat x N bracket label is shown
-# X AUTO-EXTEND (mirrors the y row-block behaviour): the pulse plot grows one base-width
-# block per _PULSE_X_PERIODS_PER_BLOCK periods, capped at _PULSE_X_MAX_WIDTH_FACTOR x the base width.
-_PULSE_X_PERIODS_PER_BLOCK = 5       # periods per horizontal width block
-_PULSE_X_MAX_WIDTH_FACTOR = 3        # max width as a multiple of the base data width
 _PULSE_Y_PAD_BOTTOM = 0.62           # gap below the bottom channel row (row units)
 _PULSE_Y_PAD_TOP = 0.38              # gap above the top channel row (row units)
-_PULSE_MARGINS_PX = (110, 90, 100, 50)   # owned pulse-plot margins (L, R, B, T)
-_PULSE_DPI = DESIGN_DPI                    # the ONE design dpi (never per-call; one source)
+# The pulse plot's LEFT margin: the ONLY margin that differs from a stock panel, because a pulse
+# row is labelled by a CHANNEL NAME on the y axis ("DA bus 5", "Trap AOM") -- wider than a scan's
+# 4-5 digit tick -- so it needs a touch more left room than PANEL_MARGINS_PX's 110 or the longest
+# channel name clips.  R/B/T are the SAME as a stock panel (see panel_margins_px), so a pulse card
+# lines up with every other kind; only this one value is pulse-specific (folded into the single
+# margin source below, NOT a separate margin tuple).
+_PULSE_LEFT_PX = 122
 
 # SHARED PLOT GEOMETRY -- OWNED by the frontend, never per-call.  These are the
 # few raw numbers the plot layouts used to spell inline; naming them ONCE here
@@ -1404,14 +1405,98 @@ def panel_size_cells(size: str) -> tuple[int, int]:
     return int(rows), int(cols)
 
 
-def panel_plot_spec(size: str = "2x2") -> FigureSpec:
-    """FigureSpec for a dashboard panel: the stock plot region scaled in
-    half-units, with the stock margins -- identical for EVERY panel kind."""
+def panel_margins_px(kind: str = "default") -> tuple[int, int, int, int]:
+    """The ONE panel margin source: ``(left, right, bottom, top)`` px around a panel's data box.
+
+    EVERY panel kind reads its outer margins from HERE -- there is no second margin tuple anywhere
+    (a pulse plot used to carry its own ``_PULSE_MARGINS_PX``, which let the two drift).  The default
+    is the stock ``PANEL_MARGINS_PX`` (confocal's left, a reserved title slot on top).  A ``pulse``
+    panel differs in ONE value only: a wider LEFT margin (``_PULSE_LEFT_PX``) so a row's channel-NAME
+    y label ("DA bus 5") is not clipped; R/B/T stay identical to a stock panel, so a pulse card lines
+    up with every other kind and its x label / title never clip either."""
+
+    left, right, bottom, top = PANEL_MARGINS_PX
+    if str(kind) == "pulse":
+        left = _PULSE_LEFT_PX
+    return (left, right, bottom, top)
+
+
+def panel_plot_spec(size: str = "2x2", *, kind: str = "default") -> FigureSpec:
+    """FigureSpec for a dashboard panel: the stock plot DATA region scaled in half-units, with the
+    ONE margin source (:func:`panel_margins_px`) -- so the data box is IDENTICAL for every panel kind
+    at a given ``size`` (it scales with the size preset, never with content), and only the pulse left
+    margin differs (channel-name room).  This is the SINGLE geometry source every kind's card reads --
+    2D / hist / 1D / monitor / sites AND pulse / grid -- so changing ``size`` truly rescales the data
+    region, not just the padding."""
 
     rows, cols = panel_size_cells(size)
     return FigureSpec(
         data_px=(cols * PANEL_UNIT_PX[1], rows * PANEL_UNIT_PX[0]),
-        margins_px=PANEL_MARGINS_PX)
+        margins_px=panel_margins_px(kind))
+
+
+# The per-site grid's cell / gaps / margins are the "2x2" baseline (_SITE_* above); a bigger size
+# preset scales the whole grid so its cells grow with the size exactly like a single-axes panel's data
+# box does (cols/2 wide, rows/2 tall, relative to the 2x2 baseline).  ONE size-scaling rule, so a grid
+# panel rescales with ``config.size`` and never stays a fixed footprint while every other kind grows.
+def _site_grid_geometry(size: str = "2x2") -> tuple[tuple[int, int], int, int, tuple[int, int, int, int]]:
+    rows, cols = panel_size_cells(size)
+    wf, hf = cols / 2.0, rows / 2.0                       # scale factors vs the 2x2 baseline
+    cell_px = (round(_SITE_CELL_PX[0] * wf), round(_SITE_CELL_PX[1] * hf))
+    col_gap = round(_SITE_COL_GAP_PX * wf)
+    row_gap = round(_SITE_ROW_GAP_PX * hf)
+    l, r, b, t = _SITE_GRID_MARGINS_PX                    # margins hold tick labels / outer axis label -- keep fixed
+    return cell_px, col_gap, row_gap, (l, r, b, t)
+
+
+def _focus_axes_bounds(fig, size: str = "2x2") -> list[float]:
+    """The ``[left, bottom, width, height]`` fraction for a grid's FOCUSED single cell, chosen so its
+    absolute px margins equal :func:`panel_margins_px` -- the SAME margins a standalone single-axes panel
+    of this ``size`` uses -- expressed as a fraction of the current grid figure (which is NOT resized on
+    focus).  So the focused cell's x label / title get exactly a real panel's room and never clip; a
+    contract test asserts the resulting margins match ``panel_plot_spec(size)`` to the pixel."""
+    from .canvas import design_dpi
+
+    dpi = design_dpi(fig)
+    fig_w_px = float(fig.get_size_inches()[0]) * dpi
+    fig_h_px = float(fig.get_size_inches()[1]) * dpi
+    left, right, bottom, top = panel_margins_px()        # a focused cell is a plain single-axes panel
+    w_px = max(1.0, fig_w_px - left - right)
+    h_px = max(1.0, fig_h_px - bottom - top)
+    return [left / fig_w_px, bottom / fig_h_px, w_px / fig_w_px, h_px / fig_h_px]
+
+
+# The readability floor a pulse timeline needs in the size-preset DATA region: enough px PER ROW that a
+# channel name is not squashed, and enough px PER PERIOD that the periods do not blur into one band.
+# These REPLACE the old content-driven inches (_PULSE_X_PERIODS_PER_BLOCK / auto-height): instead of
+# a bespoke figure size, a busy pulse now picks a BIGGER size PRESET (optimal_pulse_size), and the data
+# region rescales with that preset like every other kind.  Owned tokens (ART), never a per-call knob.
+_PULSE_ROW_MIN_PX = 26       # min data-region height per pulse row (channel + analog) for a legible name
+_PULSE_PERIOD_MIN_PX = 46    # min data-region width per period so periods stay distinct
+
+
+def optimal_pulse_size(channel_count: int, period_count: int) -> str:
+    """The SMALLEST ``PANEL_SIZES`` preset whose size-driven DATA region holds ``channel_count`` rows and
+    ``period_count`` periods legibly (>= ``_PULSE_ROW_MIN_PX`` per row, >= ``_PULSE_PERIOD_MIN_PX`` per
+    period), else the LARGEST preset.  The ONE source for a pulse preview's / loaded pulse panel's default
+    size: a busy pulse (many channels / periods) defaults to a bigger preset so nothing overlaps, and the
+    data region scales with that preset -- the size preset CARRIES the content density (the old
+    content-driven inches did).  The user can still override the size afterwards.
+
+    NOTE the ceiling: the largest preset is ``4x4`` (960x720 data px), holding ~27 rows / ~20 periods at
+    the floor; an EXTREME pulse beyond that still returns ``4x4`` (the biggest available) and scrolls in
+    its card -- there is no larger preset to grow into."""
+
+    rows_needed = max(1, int(channel_count))
+    periods_needed = max(1, int(period_count))
+    # PANEL_SIZES ordered smallest-area first, so the first fit is the smallest sufficient preset.
+    by_area = sorted(PANEL_SIZES, key=lambda s: (lambda rc: rc[0] * rc[1])(panel_size_cells(s)))
+    best = by_area[-1]                       # largest, the fallback when nothing fits
+    for size in by_area:
+        data_w, data_h = panel_plot_spec(size, kind="pulse").data_px
+        if data_h >= rows_needed * _PULSE_ROW_MIN_PX and data_w >= periods_needed * _PULSE_PERIOD_MIN_PX:
+            return size
+    return best
 
 
 def panel_display_size(size: str = "2x2") -> tuple[int, int]:
@@ -1440,36 +1525,16 @@ def panel_plot(data_x, data_y=None, *, kind: str, size: str = "2x2", **kwargs):
     return plot(data_x, data_y, kind=kind, _spec=spec, display=False, data_figure=False, **kwargs)
 
 
-def pulse_plot_spec(
-    channel_count: int,
-    *,
-    data_width_px: int = 520,
-    rows_per_block: int = 10,
-    block_height_px: int = 360,
-    period_count: int | None = None,
-    periods_per_block: int | None = None,
-    max_width_factor: int | None = None,
-) -> FigureSpec:
-    """FigureSpec sized so pulse rows stay legible beyond 10 channels.
+def pulse_plot_spec(size: str = "2x2") -> FigureSpec:
+    """FigureSpec for a pulse timeline: the SAME size-driven panel geometry every other kind uses --
+    ``panel_plot_spec(size, kind="pulse")``.  The data region scales with the ``size`` PRESET (not with
+    channel / period COUNT: a busy pulse instead picks a bigger preset via :func:`optimal_pulse_size`),
+    and the margins come from the ONE :func:`panel_margins_px` source (only the pulse LEFT margin differs,
+    for channel-name room).  Kept as the pulse geometry entry point named in the sealed-API contract, but
+    it is now a thin size-preset wrapper -- there is no per-call content geometry knob left (the old
+    ``_PULSE_MARGINS_PX`` / content-driven width blocks are gone; the size preset carries the density)."""
 
-    The HEIGHT grows one block per ``rows_per_block`` channels, and -- mirroring
-    that -- the WIDTH grows one ``data_width_px`` block per ``periods_per_block``
-    periods when ``period_count`` is given, capped at ``max_width_factor`` x the
-    base width (content-driven legibility knobs).  Margins and dpi are OWNED by
-    the frontend visual system (``_PULSE_MARGINS_PX`` / ``_PULSE_DPI``), never
-    set per-call."""
-
-    rows_per_block = max(1, int(rows_per_block))
-    chunks = max(1, ceil(max(1, int(channel_count)) / rows_per_block))
-    width_blocks = 1
-    if period_count is not None:
-        per_block = _PULSE_X_PERIODS_PER_BLOCK if periods_per_block is None else int(periods_per_block)
-        cap = _PULSE_X_MAX_WIDTH_FACTOR if max_width_factor is None else int(max_width_factor)
-        if per_block > 0:
-            width_blocks = min(max(1, int(cap)), max(1, ceil(max(1, int(period_count)) / per_block)))
-    return FigureSpec(
-        data_px=(int(data_width_px) * width_blocks, int(block_height_px) * chunks),
-        margins_px=_PULSE_MARGINS_PX, dpi=_PULSE_DPI)
+    return panel_plot_spec(size, kind="pulse")
 
 
 def pulse_repeat_notation(
@@ -1647,12 +1712,42 @@ def analog_bus_traces(state, *, include_always_off: bool = True) -> "tuple[list[
     return traces, folded_members
 
 
-def build_pulse_preview_plot(state, *, include_always_off: bool):
+def pulse_drawn_rows(state, *, include_always_off: bool) -> tuple[list[str], list[Mapping[str, Any]]]:
+    """The exact rows :func:`build_pulse_preview_plot` DRAWS for ``state`` -- ``(digital_channels,
+    analog_traces)`` -- with the SAME folding / clk-hiding / show-off-rows rules the render applies.  The
+    ONE source for "how many rows does this pulse draw", so a caller sizing the plot (``optimal_pulse_size``
+    for the preview default, the loaded-panel default, ...) counts EXACTLY the rows the figure will have,
+    never a re-derived approximation that could drift from the render."""
+    sequence = state.to_sequence(expand_repeat=False)
+    analog_traces, folded_members = analog_bus_traces(state, include_always_off=include_always_off)
+    clk_set = set(getattr(state, "clk_channels", []))
+    universe = [c for c in state.channels if c not in folded_members and c not in clk_set]
+    channels = [c for c in pulse_plot_channels(sequence, channels=universe,
+                                               include_always_off=include_always_off)
+                if c not in folded_members]
+    return channels, list(analog_traces)
+
+
+def default_pulse_size(state, *, include_always_off: bool) -> str:
+    """The default size preset for ``state`` -- :func:`optimal_pulse_size` of the rows it DRAWS
+    (:func:`pulse_drawn_rows`) and its period count.  The ONE default-size source shared by the preview
+    dropdown, the Save recipe and the reopened panel, so all three agree on a pulse's natural size."""
+    channels, traces = pulse_drawn_rows(state, include_always_off=include_always_off)
+    return optimal_pulse_size(len(channels) + len(traces), len(getattr(state, "periods", []) or []))
+
+
+def build_pulse_preview_plot(state, *, include_always_off: bool, size: str | None = None,
+                             interactions: bool = True):
     """Render the pretty pulse timeline for ``state`` -- the SINGLE source of the pulse preview figure.
 
     A pure function of the ``PulseTableState`` (no editor widgets): it builds the sequence, folds the
     analog DAC buses into their own rows, draws the digital channels + analog traces + repeat brackets,
     and shades the scanned regions.  Returns ``(plotter, channels, repeat_notation)``.
+
+    ``size`` is one of ``PANEL_SIZES`` -- the data region scales with it exactly like every other panel
+    kind (a busy pulse defaults to a bigger preset).  ``None`` picks :func:`optimal_pulse_size` for the
+    figure's own row / period counts (the single default source shared by the preview + the loaded panel).
+    ``interactions=False`` builds a display-only figure with NO selectors (the read-only Monitor card).
 
     This is the ONE renderer the plot layer owns and every consumer shares: (a) the editor's live preview
     / Save-Figure image (``pulse_gui``), (b) a reopened ``figure_recipe`` (``data_figure.SavedFigure``),
@@ -1683,6 +1778,11 @@ def build_pulse_preview_plot(state, *, include_always_off: bool):
     )
     # Defensive: a folded DAC bit must never appear as its own digital row.
     channels = [channel for channel in channels if channel not in folded_members]
+    # The default size preset carries the content density: a busy pulse (many rows / periods) picks a
+    # bigger preset so nothing overlaps, and the data region scales with it (the single default source
+    # shared with the loaded panel).  An explicit ``size`` (the preview's size dropdown) overrides it.
+    if size is None:
+        size = optimal_pulse_size(len(channels) + len(analog_traces), len(state.periods))
     plotter = plot(
         sequence,
         kind="pulse",
@@ -1696,9 +1796,8 @@ def build_pulse_preview_plot(state, *, include_always_off: bool):
         show_names=True,
         display=False,
         data_figure=False,
-        # x auto-extend: one width block per PULSE_X_PERIODS_PER_BLOCK periods (capped at
-        # PULSE_X_MAX_WIDTH_FACTOR x) -- mirrors the y row blocks.
-        period_count=len(state.periods),
+        interactions=interactions,
+        size=size,
     )
     bus_rows = [str(trace.get("name")) for trace in analog_traces]
     annotate_pulse_variable_regions(plotter, state, channels, bus_rows=bus_rows)
@@ -1821,7 +1920,7 @@ class PulseSequenceFigure(BaseLivePlot):
         repeat_brackets: Sequence[tuple[float, float, str]] | None = None,
         analog_traces: Sequence[Mapping[str, Any]] | None = None,
         auto_height: bool = True,
-        period_count: int | None = None,
+        size: str = "2x2",
         labels: Sequence[str] = ("Time (s)", "", "State"),
         **kwargs,
     ):
@@ -1848,10 +1947,11 @@ class PulseSequenceFigure(BaseLivePlot):
         self.channel_colors = list(colors or PULSE_COLORS)
         dummy_n = max(1, len(self.pulses))
         if auto_height and not any(key in kwargs for key in ("spec", "data_px", "margins_px")):
-            # period_count drives the x auto-extend (one width block per
-            # _PULSE_X_PERIODS_PER_BLOCK periods, capped at _PULSE_X_MAX_WIDTH_FACTOR).
-            kwargs["spec"] = pulse_plot_spec(
-                len(self.channels) + len(self.analog_traces), period_count=period_count)
+            # The pulse timeline gets the SAME size-driven panel geometry every kind uses: the data
+            # region scales with the ``size`` PRESET (the caller picks a bigger preset for a busy pulse
+            # via optimal_pulse_size), NOT with channel / period count -- one geometry source, no bespoke
+            # content inches.
+            kwargs["spec"] = pulse_plot_spec(size)
         super().__init__(np.arange(dummy_n, dtype=float), np.zeros((dummy_n, 1), dtype=float), labels=labels, relim_mode="tight", **kwargs)
 
     @property
@@ -3057,12 +3157,17 @@ class GridPlot(BaseLivePlot):
     plot_type = "grid"
 
     def __init__(self, cell: GridCell, *, grid_shape: tuple[int, int] | None = None,
-                 labels: Sequence[str] = ("X", "Y"), **kwargs):
+                 size: str = "2x2", labels: Sequence[str] = ("X", "Y"), **kwargs):
         self.cell_renderer = cell
         self.n_cells = int(cell.n_cells)
         if self.n_cells == 0:
             raise ValueError("a GridPlot needs at least one cell.")
         cell.prepare()
+        # The grid's data region scales with the size PRESET like every other kind: the cells / gaps
+        # grow via _site_grid_geometry, and a FOCUSED cell fills a data box IDENTICAL to a same-size
+        # single-axes panel (panel_plot_spec) so its x label never clips.
+        self._size = str(size)
+        panel_size_cells(self._size)                     # validate against PANEL_SIZES (raises otherwise)
         self.nrows, self.ncols = grid_shape_for(self.n_cells, prefer=grid_shape, max_cols=_SITE_MAX_COLS)
         # cells set their own ticks; the base single-axes smart-tick pass would
         # only touch cell 0 and make it differ from the rest.
@@ -3074,10 +3179,11 @@ class GridPlot(BaseLivePlot):
         self._focus_tools = None
 
     def _create_axes(self):
+        cell_px, col_gap, row_gap, margins = _site_grid_geometry(self._size)
         axes = create_axes_grid(
             self.fig, self.nrows, self.ncols,
-            cell_px=_SITE_CELL_PX, col_gap_px=_SITE_COL_GAP_PX,
-            row_gap_px=_SITE_ROW_GAP_PX, margins_px=_SITE_GRID_MARGINS_PX,
+            cell_px=cell_px, col_gap_px=col_gap,
+            row_gap_px=row_gap, margins_px=margins,
         )
         self.axes = axes
         return axes[0]
@@ -3184,9 +3290,12 @@ class GridPlot(BaseLivePlot):
         for t in self._hidden_texts:
             t.set_visible(False)
         self._set_grid_areas_active(False)   # no residual box from the focus double-click
-        # A clean, comfortably-margined single plot: room on the left for the counts
-        # axis + ylabel, on the bottom for the xlabel, on top for the title.
-        self.focus_ax = self.fig.add_axes([0.10, 0.13, 0.85, 0.77])
+        # The focused cell fills the figure with the SAME margins a single-axes panel of this size uses
+        # (panel_margins_px), expressed as a FRACTION of the current grid figure -- so the enlarged cell's
+        # x label / y label / title sit in exactly the room a standalone same-size panel gives them and
+        # NEVER clip, while the figure is NOT resized (focus is a visibility flip + one draw, not a
+        # rebuild).  ONE margin source (panel_margins_px) shared with every real panel.
+        self.focus_ax = self.fig.add_axes(_focus_axes_bounds(self.fig, self._size))
         line = self.cell_renderer.draw(self.focus_ax, k, detail=True)
         area = AreaSelector(self.focus_ax)
         cross = CrossSelector(self.focus_ax)
@@ -3389,7 +3498,7 @@ def grid_recipe_from_cells(grid: "GridPlot") -> dict:
 
 
 def build_grid_figure(recipe: Mapping[str, Any], *, fig: plt.Figure | None = None,
-                      interactions: bool = True, display: bool = False):
+                      interactions: bool = True, size: str = "2x2", display: bool = False):
     """Rebuild a per-site GRID figure from its :func:`grid_recipe_from_cells` recipe -- the SINGLE source
     of the grid reproduction, the grid counterpart of :func:`build_pulse_preview_plot`.
 
@@ -3399,7 +3508,11 @@ def build_grid_figure(recipe: Mapping[str, Any], *, fig: plt.Figure | None = Non
     consumer -- ``na.load_figure(npz).plot()``, the figure viewer, a seeded ``kind="grid"`` console panel
     -- draws through THIS one builder, so all three reproduce the identical faithful grid (never a
     flattened 1-D line off the fallback arrays).  Returns the :class:`GridPlot` plotter (already ``show``-n
-    with ``display``)."""
+    with ``display``).
+
+    ``size`` is one of ``PANEL_SIZES`` -- the grid's cells scale with it (like every other panel kind),
+    and a focused cell fills a data box with the same-size panel's margins; ``interactions=False`` builds
+    a display-only grid (the read-only Monitor card) with no selectors."""
     cell = str(recipe.get("cell") or "hist")
     labels = tuple(str(x) for x in (recipe.get("labels") or ("X", "Y")))
     title = str(recipe.get("title") or "")
@@ -3408,7 +3521,7 @@ def build_grid_figure(recipe: Mapping[str, Any], *, fig: plt.Figure | None = Non
     if cell == "image":
         images = [np.asarray(im, dtype=float) for im in (recipe.get("per_cell") or [])]
         return GridPlot(ImageCell(images, labels=labels), grid_shape=grid_shape, labels=labels,
-                        title=title, fig=fig, interactions=interactions).show(display=display)
+                        title=title, fig=fig, interactions=interactions, size=size).show(display=display)
     # per-site distribution grid (the default)
     per_site = [np.asarray(v, dtype=float).reshape(-1) for v in (recipe.get("per_cell") or [])]
     thresholds = recipe.get("thresholds")
@@ -3418,7 +3531,7 @@ def build_grid_figure(recipe: Mapping[str, Any], *, fig: plt.Figure | None = Non
         per_site, thresholds=thresholds, site_fidelities=fidelities,
         occupied=None if occupied is None else [np.asarray(o, dtype=float).reshape(-1) for o in occupied],
         grid_shape=grid_shape, bins=int(recipe.get("bins", 36)), labels=labels, title=title,
-        fig=fig, interactions=interactions).show(display=display)
+        fig=fig, interactions=interactions, size=size).show(display=display)
 
 
 def plot(
@@ -3570,6 +3683,10 @@ __all__ = [
     "kind_for_plotter",
     "build_grid_figure",
     "grid_recipe_from_cells",
+    "default_pulse_size",
+    "optimal_pulse_size",
+    "panel_margins_px",
+    "pulse_drawn_rows",
     "panel_plot",
     "panel_plot_spec",
     "panel_size_cells",

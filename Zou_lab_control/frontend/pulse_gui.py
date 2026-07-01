@@ -41,6 +41,8 @@ from .live import (
     pulse_repeat_markers,
     pulse_repeat_notation,
     build_pulse_preview_plot,
+    default_pulse_size,
+    PANEL_SIZES,
     analog_bus_traces as _analog_bus_traces,
     annotate_pulse_variable_regions,
     bus_signed_bounds as _bus_signed_bounds,
@@ -1999,6 +2001,20 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self.preview_include_off.setFixedSize(_px(198, minimum=178), preview_control_h)
         self.preview_include_off.setToolTip("Show channels that are always off in the preview.")
         self.preview_include_off.toggled.connect(self._request_preview_refresh)
+        # Preview SIZE: one of PANEL_SIZES (the same size presets the console panels use), so the pulse
+        # figure's data region scales like every other kind.  The default is optimal_pulse_size for the
+        # current channel / period counts (the ONE default source, shared with the loaded panel); once the
+        # operator picks a size it stays PINNED (no longer auto-tracks the content) and the chosen size is
+        # saved into the figure so a reopen restores it.
+        self.preview_size_label = FluentLabel("Size")
+        self.preview_size_combo = FluentComboBox()
+        self.preview_size_combo.addItems(list(PANEL_SIZES))
+        self.preview_size_combo.setCurrentText("2x2")
+        self.preview_size_combo.setFixedSize(_px(80, minimum=66), preview_control_h)
+        self.preview_size_combo.setToolTip("Plot size preset -- a busy pulse defaults to a bigger size; "
+                                           "pick one to pin it (saved with the figure).")
+        self._preview_size_pinned = False        # False until the operator picks a size manually
+        self.preview_size_combo.activated.connect(self._on_preview_size_picked)
         self.preview_save_figure_button = FluentButton("Save Figure", color=ACCENT)
         self.preview_save_figure_button.setFixedSize(_px(124, minimum=108), preview_control_h)
         self.preview_save_figure_button.clicked.connect(self.save_figure)
@@ -2006,6 +2022,8 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self.preview_status.setEnabled(False)
         self.preview_status.setFixedHeight(preview_control_h)
         preview_row.addWidget(self.preview_include_off)
+        preview_row.addWidget(self.preview_size_label)
+        preview_row.addWidget(self.preview_size_combo)
         preview_row.addWidget(self.preview_status, 1)
         preview_row.addWidget(self.preview_save_figure_button)
         preview_layout.addWidget(preview_controls)
@@ -4106,12 +4124,35 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         directory = Path(self.address_str).parent if self.address_str else _pulse_files_dir()
         return directory / f"{_safe_file_stem(state.name)}.png"
 
-    def _create_preview_plot(self, state: PulseTableState, *, include_always_off: bool):
+    def _preview_size_for(self, state: PulseTableState, *, include_always_off: bool) -> str:
+        """The size preset to render this preview at.  If the operator has PINNED a size (picked one from
+        the dropdown) that value wins; otherwise it is :func:`optimal_pulse_size` for this state's drawn
+        row / period counts (the ONE default source, shared with the loaded panel) and the dropdown is kept
+        in sync so it always shows the size the plot uses."""
+        if self._preview_size_pinned:
+            return self.preview_size_combo.currentText()
+        # The default is the ONE shared default source (default_pulse_size in the plot layer, which counts
+        # EXACTLY the rows the render draws), so the preview default matches the loaded panel default and
+        # never re-derives the row count here (which could drift from the render).
+        size = default_pulse_size(state, include_always_off=include_always_off)
+        if self.preview_size_combo.currentText() != size:
+            with _signals_blocked(self.preview_size_combo):   # sync display without re-triggering a refresh
+                self.preview_size_combo.setCurrentText(size)
+        return size
+
+    def _on_preview_size_picked(self, *_args) -> None:
+        """The operator picked a size: PIN it (stop auto-tracking the content) and re-render."""
+        self._preview_size_pinned = True
+        self._request_preview_refresh()
+
+    def _create_preview_plot(self, state: PulseTableState, *, include_always_off: bool, size: str | None = None):
         # The pulse render is a PURE function of the state that lives in the PLOT LAYER (live.py, next to
         # every other kind's render) -- this editor merely CONSUMES it, as do the reopened-recipe replay
         # (``SavedFigure.plot()``) and a seeded console pulse panel, so all three draw byte-for-byte the
         # same figure.  (Enforced by test_pulse_render_single_source: the render is not defined here.)
-        return build_pulse_preview_plot(state, include_always_off=include_always_off)
+        if size is None:
+            size = self._preview_size_for(state, include_always_off=include_always_off)
+        return build_pulse_preview_plot(state, include_always_off=include_always_off, size=size)
 
     def save_figure(self) -> None:
         try:
@@ -4173,7 +4214,10 @@ class PulseSequenceEditor(QtWidgets.QWidget):
 
         from .data_figure import DataFigure
 
-        plotter, channels, _repeat = self._create_preview_plot(state, include_always_off=include_always_off)
+        # Render (and save) at the SAME size the preview shows, and record it so a reopen restores it.
+        size = self._preview_size_for(state, include_always_off=include_always_off)
+        plotter, channels, _repeat = self._create_preview_plot(
+            state, include_always_off=include_always_off, size=size)
         # Collect one "level at time t" column per drawn row: digital channels (0/1 held
         # between start and stop) followed by analog buses (signed value, step-held).
         columns: list[tuple[str, list[tuple[float, float]]]] = []
@@ -4239,6 +4283,9 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 "kind": "pulse",
                 "pulse_state": state.to_dict(),
                 "include_always_off": bool(include_always_off),
+                # The size preset the figure was drawn at -- a reopen restores it (the operator can still
+                # change it), so the reproduced panel opens at the size it was saved, not a forced default.
+                "panel_size": str(size),
             },
             # Human-readable per-row legend, so a reader can tell which line is which
             # channel/bus even in the no-recipe fallback (a generic 1-D step-line view).
@@ -4281,13 +4328,16 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         try:
             state = self.read_state()
             include_always_off = self.preview_include_off.isChecked()
+            # The size preset (pinned pick, else optimal for the content) is part of what is rendered, so
+            # it keys the skip-rebuild cache AND is passed to the render -- picking a new size re-renders.
+            size = self._preview_size_for(state, include_always_off=include_always_off)
             # Rebuilding the figure + canvas costs ~130 ms; every visit to the
             # Preview tab used to pay it even with NOTHING changed.  Skip the
-            # rebuild when the rendered (state, toggle) pair is identical -- the
+            # rebuild when the rendered (state, toggle, size) triple is identical -- the
             # existing canvas already shows exactly this plot.  Restoring the
             # home view keeps the OLD observable behaviour (a rebuild always
             # came back at the default zoom).
-            render_key = (self._state_key(state), bool(include_always_off))
+            render_key = (self._state_key(state), bool(include_always_off), size)
             if (self._preview_canvas is not None
                     and render_key == getattr(self, "_preview_render_key", None)):
                 tools = getattr(self._preview_plot, "tools", None)
@@ -4317,7 +4367,8 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                     self.preview_status.setText(self._preview_status_text)
                 self._preview_dirty = False
                 return
-            plotter, channels, repeat = self._create_preview_plot(state, include_always_off=include_always_off)
+            plotter, channels, repeat = self._create_preview_plot(
+                state, include_always_off=include_always_off, size=size)
             self._replace_preview_canvas(plotter)
             repeat_part = f" | {repeat}" if repeat else ""
             mode = "all channels" if include_always_off else "active channels"
