@@ -4566,162 +4566,21 @@ class PanelEditor(QtWidgets.QWidget):
             "repeat_mode": self.card._repeat_mode_value(),
         }
 
-    def _provenance_for_save(self):
-        """The device-state record of the SOURCE that produced this panel's data, folded into the
-        saved ``info['provenance']`` so a reopened figure shows "what the apparatus was doing when
-        this data was taken".
-
-        The record is FLAT and UNIFORM regardless of what kind of node the panel is wired to: the
-        ``devices`` that produced the plotted data (``camera`` + ``sequencer`` snapshots) and their
-        ``acquisition_parameters`` are ALWAYS at the top level.  Resolved from the producing logic NODE
-        of the panel's first input (``console._node_for_signal(...)`` -> ``node.provenance_snapshot()``):
-
-        * a MEASUREMENT node holds its own devices -> they are already top-level;
-        * a DERIVED node (a processor: no device of its own, only a ``consumes`` list) is walked UPSTREAM
-          -- each consumed signal -> its producing node -> ... transitively -- to the nearest node that
-          DOES hold devices, and THAT node's ``devices`` + ``acquisition_parameters`` are HOISTED to the
-          top level.  So a site-map panel wired to ``Judge occupancy`` and a 2-D panel wired straight to
-          the camera both end up with ``provenance['devices']`` carrying camera + sequencer -- the two
-          kinds record the SAME shape, nothing hidden in a nested ``upstream`` sub-dict.
-
-        The processor's OWN identity keys (``node`` / ``layer`` / ``consumes`` /
-        ``calibration_fingerprint``) stay at the top level too, so a processed figure still says which
-        upstream signals it transformed and under which calibration.  When no node produces the signal
-        (a derived expression, a loaded static figure) it falls back to the whole-session device snapshot
-        (``session.devices.snapshot()``) if a session is attached, else ``None`` -- so a save NEVER
-        fails for lack of provenance.  The walk is transitive and visited-guarded (no cycle / duplicate)."""
-        inputs = self.card.config.inputs or []
-        node = self.console._node_for_signal(inputs[0]) if inputs else None
-        if node is not None:
-            try:
-                prov = dict(node.provenance_snapshot())
-            except Exception:
-                prov = None
-            if prov is not None:
-                # If this node holds no devices of its own (a processor), hoist the nearest
-                # device-holding upstream node's devices + acquisition params to the top level, so the
-                # record is flat and identical to a measurement's -- no nested ``upstream`` structure.
-                if not prov.get("devices"):
-                    hoisted = self._hoist_upstream_devices(node, visited={id(node)})
-                    if hoisted:
-                        prov.update(hoisted)          # top-level devices + acquisition_parameters
-                return prov
-        devices = getattr(getattr(self.console, "session", None), "devices", None)
-        snap = getattr(devices, "snapshot", None)
-        if callable(snap):
-            try:
-                return snap()
-            except Exception:
-                return None
-        return None
-
-    def _hoist_upstream_devices(self, node, *, visited) -> dict:
-        """Walk a DERIVED node's consumed inputs to the nearest node that HOLDS devices and return that
-        node's ``{devices, acquisition_parameters}`` (only the keys it has) to hoist to the top level --
-        so a processed panel's flat provenance carries the source apparatus state directly, not buried in
-        a per-signal ``upstream`` sub-dict.  The walk is transitive (a processor of a processor chains up
-        to the measurement) and visited-guarded (a set of ``id(node)`` -- no cycle / no double-visit); the
-        FIRST device-holding node found wins (breadth-first over each level's consumed signals)."""
-        consumes = list(getattr(node, "consumes", ()) or [])
-        deferred: list = []
-        for sig in consumes:
-            src = self.console._node_for_signal(sig)
-            if src is None or id(src) in visited:
-                continue
-            visited.add(id(src))
-            try:
-                src_prov = dict(src.provenance_snapshot())
-            except Exception:
-                continue
-            if src_prov.get("devices"):
-                # This upstream node HOLDS the devices: hoist its device state + acquisition params.
-                hoist = {"devices": src_prov["devices"]}
-                if src_prov.get("acquisition_parameters"):
-                    hoist["acquisition_parameters"] = src_prov["acquisition_parameters"]
-                return hoist
-            deferred.append(src)                       # a processor-of-a-processor: chase it next level
-        for src in deferred:                           # transitive: recurse into the deeper processors
-            deeper = self._hoist_upstream_devices(src, visited=visited)
-            if deeper:
-                return deeper
-        return {}
-
-    def _signals_for_save(self) -> dict[str, dict]:
-        """The RAW native hub blocks this panel actually consumes, keyed by bare name, folded into the
-        saved ``info['signals']`` so ``load_figure(...)`` can REBUILD every panel kind losslessly -- most
-        importantly a site map, whose 2-D underlay FRAME (`frame_judged`) and per-site `centers` are NOT
-        recoverable from the flat ``data_x``/``data_y`` a scatter plot saves (that dropped the frame, so a
-        reloaded site map could not be redrawn).
-
-        Roles resolved off the ONE producing node of the panel's first input (same node the site-map
-        wiring / provenance already use -- ``console._node_for_signal(inputs[0])``):
-          * ``value``   = the panel's own signal (``inputs[0]``);
-          * ``x``       = its companion x-axis signal for a 1-D curve (``node.x_signal``);
-          * ``centers`` = the node's site-centre output (``prefix + sitemap_centers_key``);
-          * ``frame``   = the node's underlay-image output (``prefix + sitemap_image_key``).
-        Each role stores the CURRENT native block (``hub.latest`` -- a copy of the raw, un-reshaped array)
-        plus the ``SignalSpec``'s ``points_shape``/``data_shape``/``label``/``unit`` (via
-        ``node.signal_spec``), so the reloader has the same contract metadata the live panel had.  A missing
-        role (no such signal / not on the hub / no producing node) is simply SKIPPED -- a save never fails
-        for a role it cannot resolve, and only the ``signals`` key is added (data_x/data_y unchanged =
-        backward compatible)."""
-        inputs = list(self.card.config.inputs or [])
-        if not inputs or not inputs[0]:
-            return {}
-        node = self.console._node_for_signal(inputs[0])
-        if node is None:
-            return {}
-        prefix = str(getattr(node, "prefix", "") or "")
-        centers_key = str(getattr(node, "sitemap_centers_key", "") or "")
-        image_key = str(getattr(node, "sitemap_image_key", "") or "")
-        # (role, full hub name) -- only the roles that resolve to a name; the rest never enter the loop.
-        roles: list[tuple[str, str]] = [("value", str(inputs[0]))]
-        x_full = str(getattr(node, "x_signal", "") or "")
-        if x_full:
-            roles.append(("x", x_full))
-        if centers_key:
-            roles.append(("centers", prefix + centers_key))
-        if image_key:
-            roles.append(("frame", prefix + image_key))
-
-        signals: dict[str, dict] = {}
-        for role, full in roles:
-            if not full:
-                continue
-            try:
-                block = self.console.hub.latest(full)          # raw native block (a copy), un-reshaped
-            except Exception:
-                continue                                       # signal not on the hub right now -> skip role
-            bare = full[len(prefix):] if prefix and full.startswith(prefix) else full
-            # One SIGNAL can fill two roles (a 2-D camera panel whose ``value`` IS the underlay
-            # ``frame``: inputs[0] == sitemap_image_key).  ``roles`` lists ``value`` FIRST, so the
-            # first writer wins -- keep ``value`` (the panel's own data, what the reloaded plot draws)
-            # and skip the later same-signal ``frame`` rather than clobbering it to role="frame"
-            # (which dropped fig_value and left the reloaded 2-D panel with nothing to plot).
-            if bare in signals:
-                continue
-            spec = None
-            try:
-                spec = node.signal_spec(full)
-            except Exception:
-                spec = None
-            ps = tuple(spec.points_shape) if (spec is not None and spec.points_shape is not None) else None
-            ds = tuple(spec.data_shape) if (spec is not None and spec.data_shape is not None) else None
-            signals[bare] = {
-                "block": np.asarray(block),
-                "points_shape": ps,
-                "data_shape": ds,
-                "label": str(getattr(spec, "label", "") or "") if spec is not None else "",
-                "unit": str(getattr(spec, "unit", "") or "") if spec is not None else "",
-                "role": role,
-            }
-        return signals
-
     def save(self) -> None:
         if self._plotter is None:
             return
         try:
             df = self._df_for()
+            # BIND the figure to its data SOURCE, then let ``DataFigure.save`` capture ``info['signals']``
+            # + ``info['provenance']`` through the ONE frontend-neutral core (the SAME path a notebook
+            # ``p.save()`` runs) -- the console only supplies its resolvers (a stopped node's lingering
+            # signal still resolves via ``_node_for_signal``, incl. the ``_last_node`` fallback).  The
+            # GUI-only display blocks (source/kind/size/view) stay ``extra_info`` (they are console state,
+            # not signal/provenance).
+            inputs = list(self.card.config.inputs or [])
+            value_node = self.console._node_for_signal(inputs[0]) if inputs else None
+            df.bind_source(self.console.hub, value_node, inputs=inputs,
+                           resolve_node=self.console._node_for_signal, session=self.console.session)
             stem = self._save_stem(time.strftime("%Y_%m_%d_%H_%M_%S", time.localtime()))
             stem.parent.mkdir(parents=True, exist_ok=True)
             # a path WITH a suffix makes DataFigure.save write it VERBATIM (no extra timestamp),
@@ -4730,9 +4589,7 @@ class PanelEditor(QtWidgets.QWidget):
                           extra_info={"source": self.card.config.source,
                                       "kind": self.card.config.kind,
                                       "size": self.card.config.size,
-                                      "view": self._save_view_state(),
-                                      "provenance": self._provenance_for_save(),
-                                      "signals": self._signals_for_save()})
+                                      "view": self._save_view_state()})
             self.console._last_save_dir = str(stem.parent)   # remember where (kernel session)
             self._update_save_preview()
             # Show the LEAF folder, not the full absolute path (the full path is one click away in the

@@ -8,9 +8,9 @@ The data flow (all through public paths):
     + node/layer identity + a timestamp -- the device BASE-STATE of the run, held CONSTANT across its
     shots (a scanned parameter's change IS the scan, already in the data), reading NO simulation ground
     truth, so it is the SAME record a real qCMOS run keeps (guarded by test_virtual_equals_real_contract);
-  * the console's Save resolves the producing node of the panel's signal
-    (``PanelEditor._provenance_for_save`` -> ``node.provenance_snapshot()``) and folds it into
-    ``extra_info['provenance']``, which ``DataFigure.save`` stores under the npz's top-level ``info``.
+  * the console's Save resolves the producing node of the panel's signal and captures its provenance
+    through the ONE frontend-neutral core (``operations.figure_capture.capture_figure_provenance`` ->
+    ``node.provenance_snapshot()``), which ``DataFigure.save`` stores under the npz's top-level ``info``.
     When that node is a DERIVED processor (no device, a ``consumes`` list) the save walks UPSTREAM to
     the measurement that produced each consumed signal and HOISTS its device snapshot to the TOP LEVEL
     (``provenance['devices']``) -- a FLAT record identical in shape to a direct measurement panel's, so
@@ -61,9 +61,24 @@ from Zou_lab_control.neutral_atom.operations.logic import (  # noqa: E402
     CameraMeasurement,
     OccupancyProcessor,
 )
+from Zou_lab_control.neutral_atom.operations.figure_capture import (  # noqa: E402
+    capture_figure_provenance,
+)
 from Zou_lab_control.frontend import load_figure  # noqa: E402
 from Zou_lab_control.frontend.qt_fluent import ensure_qt_app  # noqa: E402
 from conftest import fire_live_imaging  # noqa: E402
+
+
+def _console_provenance(editor):
+    """The provenance the console's Save writes -- resolved EXACTLY as ``PanelEditor.save`` binds it: the
+    producing node of the panel's first input, plus the console's ``_node_for_signal`` as the upstream
+    walker and its session as the fallback -- fed to the ONE frontend-neutral core.  A test helper so the
+    provenance assertions still exercise the console->core path after the logic moved out of PanelEditor."""
+    console = editor.console
+    inputs = list(editor.card.config.inputs or [])
+    node = console._node_for_signal(inputs[0]) if inputs else None
+    return capture_figure_provenance(node, resolve_node=console._node_for_signal,
+                                     session=console.session)
 
 
 # --------------------------------------------------------------------------- unit: the node snapshot
@@ -173,7 +188,7 @@ def test_console_save_writes_producing_node_provenance(tmp_path):
         editor = PanelEditor(card, console)
         editor.rebuild()
         # the console-side resolution: the panel's signal -> its producing node -> the node's snapshot
-        prov = editor._provenance_for_save()
+        prov = _console_provenance(editor)
         assert prov is not None and prov["devices"]["camera"]["type"] == type(exp.devices.camera).__name__
 
         # drive the REAL Save into tmp (auto-name off = verbatim path) and read the npz back
@@ -202,7 +217,7 @@ def test_console_save_chains_upstream_measurement_provenance():
 
     A camera measurement publishes ``cam_frame_0``; an OccupancyProcessor consumes it and publishes
     ``occ_occupied``.  A panel bound to ``occ_occupied`` resolves the processor (no device of its own)
-    as its producing node; ``_provenance_for_save`` then walks the processor's ``consumes`` to the
+    as its producing node; ``capture_figure_provenance`` then walks the processor's ``consumes`` to the
     camera node and HOISTS that node's ``devices`` + ``acquisition_parameters`` to the TOP LEVEL of the
     saved provenance -- so a processed figure carries the source apparatus state at ``prov['devices']``
     exactly where a direct camera panel carries it (no nested ``upstream`` sub-dict).  The processor's
@@ -237,7 +252,7 @@ def test_console_save_chains_upstream_measurement_provenance():
                                   kind="hist", size="2x4", bins=20, title="occ")
         editor = PanelEditor(card, console)
         editor.rebuild()
-        prov = editor._provenance_for_save()
+        prov = _console_provenance(editor)
         # the processor's own identity stays: its layer + the consumed input it transformed
         assert prov["layer"] == "processor" and "cam_frame_0" in prov.get("consumes", [])
         # NO nested upstream sub-dict -- the record is flat
@@ -292,7 +307,7 @@ def test_measurement_and_processor_panels_record_the_same_flat_devices_shape():
                                       kind="hist", size="2x4", bins=20, title=kind)
             editor = PanelEditor(card, console)
             editor.rebuild()
-            return editor._provenance_for_save()
+            return _console_provenance(editor)
 
         direct = prov_for("2d", "value = cam_frame_0", ["cam_frame_0"])          # measurement panel
         processed = prov_for("sites", "value = occ_occupied", ["occ_occupied"])   # processor panel
@@ -334,7 +349,7 @@ def test_save_falls_back_to_session_devices_when_no_producing_node(tmp_path):
                                   kind="hist", size="2x4", bins=40, title="dis")
         editor = PanelEditor(card, console)
         editor.rebuild()
-        prov = editor._provenance_for_save()
+        prov = _console_provenance(editor)
         # no producing node -> the session's device snapshot (keyed by device role name)
         assert isinstance(prov, dict) and "camera" in prov, \
             "with no producing node, provenance falls back to the session device snapshot"

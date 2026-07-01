@@ -420,6 +420,14 @@ class BaseLivePlot:
         self._shown = False
         self.data_figure = None
         self._stopped = False
+        # The SOURCE this plot's data came from (a SignalHub + the producing logic node + the wired
+        # signal names), stamped by :meth:`bind_source` when the plot is created FROM live signals (the
+        # console panel, a notebook hub-bound plot).  Its presence makes ``.save()`` a RICH save -- it
+        # captures ``info['signals']`` (raw hub blocks + roles) + ``info['provenance']`` (device state)
+        # through the ONE core capture, identical to the console panel's Save.  ``None`` (an array plot
+        # with no producing node) => ``.save()`` degrades to the basic figure+npz save.  The binding is a
+        # DATA fact (WHERE the data came from), not art/geometry, so it lives here, off the sealed set.
+        self._figure_source = None
 
     def _infer_points_done(self) -> int:
         finite = np.isfinite(self.data_y[:, 0])
@@ -693,8 +701,29 @@ class BaseLivePlot:
         self.data_figure = DataFigure(self)
         return self.data_figure
 
+    def bind_source(self, hub, node, *, inputs, resolve_node=None, session=None):
+        """Stamp WHERE this plot's data came from so ``.save()`` writes the RICH npz (``info['signals']``
+        + ``info['provenance']``), identical to the console panel's Save.
+
+        ``hub`` is the :class:`SignalHub` the data was published to; ``node`` is the producing logic node
+        of the panel's first input; ``inputs`` are the wired signal names; ``resolve_node`` (optional)
+        maps a signal name -> its producing node for the UPSTREAM provenance walk (a processor panel
+        hoists its source measurement's devices); ``session`` is the fallback device-snapshot source when
+        no node produced the data.  Returns ``self`` so a create can chain
+        ``plot(...).bind_source(hub, node, inputs=...)``.  The capture itself is done LAZILY at save time
+        (through the frontend-neutral core), so binding never touches the hub eagerly."""
+        self._figure_source = {"hub": hub, "node": node, "inputs": list(inputs or []),
+                               "resolve_node": resolve_node, "session": session}
+        if self.data_figure is not None:
+            self.data_figure._figure_source = self._figure_source
+        return self
+
     def save(self, path: str = "", **kwargs):
-        return self.to_data_figure().save(path, **kwargs)
+        df = self.to_data_figure()
+        # Carry the source binding onto the DataFigure so its save is the RICH save (the plotter is the
+        # object a notebook holds; the DataFigure is where save lives -- the binding rides across).
+        df._figure_source = self._figure_source
+        return df.save(path, **kwargs)
 
 
 class Live1D(BaseLivePlot):

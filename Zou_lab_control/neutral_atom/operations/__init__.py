@@ -2,6 +2,7 @@
 
 from .calibration import calibrate_sitemap_from_images, calibrate_threshold_from_images
 from .detection import detect_image
+from .figure_capture import capture_figure_provenance, capture_figure_signals
 from .logic import (
     CalibrateReadoutTask,
     CameraMeasurement,
@@ -73,6 +74,8 @@ __all__ = [
     "build_release_recapture_pulse",
     "calibrate_sitemap_from_images",
     "calibrate_threshold_from_images",
+    "capture_figure_provenance",
+    "capture_figure_signals",
     "characterize_readout",
     "CameraMeasurement",
     "detect_image",

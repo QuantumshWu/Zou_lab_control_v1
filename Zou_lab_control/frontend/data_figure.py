@@ -140,6 +140,11 @@ class DataFigure:
         self.fit_func = None
         self.text = None
         self._scatter_list = []
+        # The SOURCE binding (hub + producing node + wired inputs), copied from the live plot when this
+        # DataFigure wraps one, so ``save`` can write the RICH npz (``info['signals']`` +
+        # ``info['provenance']``) through the ONE core capture -- the SAME logic the console panel uses.
+        # ``None`` (a bare array DataFigure) => ``save`` writes the basic figure+npz (old behaviour).
+        self._figure_source = getattr(live_plot, "_figure_source", None)
         warnings.filterwarnings("ignore", category=OptimizeWarning)
 
     @staticmethod
@@ -175,6 +180,41 @@ class DataFigure:
         self._ax.set_ylim(y_min, y_max)
         self.fig.canvas.draw_idle()
 
+    def bind_source(self, hub, node, *, inputs, resolve_node=None, session=None):
+        """Stamp WHERE this figure's data came from so :meth:`save` writes the RICH npz -- the DataFigure
+        counterpart of :meth:`live.BaseLivePlot.bind_source`, for when a caller holds the DataFigure
+        directly.  Returns ``self`` for chaining."""
+        self._figure_source = {"hub": hub, "node": node, "inputs": list(inputs or []),
+                               "resolve_node": resolve_node, "session": session}
+        return self
+
+    def _rich_capture(self) -> dict[str, Any]:
+        """The ``signals`` + ``provenance`` blocks a RICH save folds into ``info``, captured through the
+        ONE frontend-neutral core (``operations.figure_capture``) -- the SAME logic the console panel's
+        Save uses, so a notebook ``.save()`` and a GUI panel Save write byte-identical rich npz.  Empty
+        when this figure carries no source binding (a bare array plot): then ``save`` writes the basic
+        payload (old behaviour).  Never raises -- a capture that fails for one block simply omits it."""
+        src = self._figure_source
+        if not src:
+            return {}
+        from Zou_lab_control.neutral_atom.operations.figure_capture import (
+            capture_figure_signals, capture_figure_provenance)
+        out: dict[str, Any] = {}
+        try:
+            signals = capture_figure_signals(src.get("hub"), src.get("node"), src.get("inputs"))
+        except Exception:
+            signals = {}
+        if signals:
+            out["signals"] = signals
+        try:
+            prov = capture_figure_provenance(src.get("node"), resolve_node=src.get("resolve_node"),
+                                             session=src.get("session"))
+        except Exception:
+            prov = None
+        if prov is not None:
+            out["provenance"] = prov
+        return out
+
     def save(
         self,
         path: str | Path = "",
@@ -182,7 +222,14 @@ class DataFigure:
         extra_info: Mapping[str, Any] | None = None,
         image_ext: str = "png",
     ) -> dict[str, Path]:
-        """Save the figure image and a matching ``.npz`` payload."""
+        """Save the figure image and a matching ``.npz`` payload.
+
+        When this figure carries a SOURCE binding (``bind_source`` / a plot created from live signals),
+        the save is RICH: it folds ``info['signals']`` (raw hub blocks + roles, so a site map's underlay
+        frame + centres round-trip) and ``info['provenance']`` (the device state the data was taken under)
+        captured through the ONE frontend-neutral core -- identical to the console panel's Save.  An
+        explicit ``extra_info`` key WINS over the auto-capture (the GUI passes its own richer blocks), and
+        a bare array figure (no binding) writes just the basic figure+npz."""
         current_time = time.strftime("%Y_%m_%d_%H_%M_%S", time.localtime())
         stem = "_".join(p for p in (self.name, current_time) if p)
         base = resolve_save_base(path, stem)
@@ -190,7 +237,8 @@ class DataFigure:
         data_path = base.with_suffix(".npz")
         info = {
             **self.info,
-            **dict(extra_info or {}),
+            **self._rich_capture(),          # auto signals/provenance (bound figure); {} for a bare plot
+            **dict(extra_info or {}),         # an explicit caller block WINS over the auto-capture
             "labels": self.labels,
             "name": self.name,
             "unit": self.unit_original,
