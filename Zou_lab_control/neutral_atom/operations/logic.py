@@ -222,6 +222,12 @@ class LogicNode:
         # the publish, then clears it -- so a no-op / frozen shot publishes nothing with a stale id.  Set and
         # read on the node's OWN thread only (shot()->step() are same-thread), so no extra lock (#shot-clock).
         self._current_source_shot: int | None = None
+        # ACQUISITION-TIME provenance: the device state + acquisition params captured the moment this node
+        # last produced data, so a saved figure records "what the apparatus was doing when this data was
+        # taken".  Refreshed by an acquiring node via ``refresh_provenance()`` after a real acquisition;
+        # ``provenance_snapshot()`` returns this cached dict (or computes it on demand when never set).  Set
+        # and read on the node's OWN thread (shot() is same-thread), so no extra lock.
+        self._provenance: dict[str, object] | None = None
 
     @property
     def display_label(self) -> str:
@@ -269,6 +275,12 @@ class LogicNode:
         self.hub.publish(named, provenance=self._current_source_shot)
         self._current_source_shot = None
         self.shots += 1
+        # Capture provenance the moment this node produced data, but ONLY for a node that actually
+        # HOLDS an acquisition device (a camera / sequencer) -- so the snapshot reflects the device
+        # state that took THIS shot.  A pure processor / task holds neither, so this is a cheap no-op
+        # for them (single source: the generic device check drives it, not a per-node-type flag).
+        if getattr(self, "camera", None) is not None or getattr(self, "sequencer", None) is not None:
+            self.refresh_provenance()
         return named
 
     def start(self, *, rate_hz: float = 5.0) -> "LogicNode":
@@ -425,6 +437,96 @@ class LogicNode:
         in a device-specific shape.  Default: a source with no spatial region
         returns ``{}`` (the selection is a no-op for it)."""
         return {}
+
+    # ----------------------------------------------------- acquisition provenance
+    # "What was the apparatus doing when this data was taken" -- collected the moment a node
+    # produces data so a SAVED figure can record it (frontend reads it off the producing node).
+    # It reads ONLY each device's PUBLIC ``.snapshot()`` (the backend-neutral contract on
+    # devices/base.py) plus the node's own acquisition params + calibration fingerprint -- never a
+    # simulation ground-truth, never a concrete backend -- so it is the SAME provenance a real qCMOS
+    # run records (virtual == real, guarded by test_virtual_equals_real_contract).
+    def _snapshot_devices(self) -> dict[str, object]:
+        """The public ``.snapshot()`` of every device this node HOLDS, keyed by role.
+
+        GENERIC (no per-node-type ``if``): it looks for the two device attributes a producing node
+        may own -- ``camera`` and ``sequencer`` -- and includes each one that is present AND exposes
+        the ``.snapshot()`` device contract.  A processor / task that holds neither simply yields an
+        empty dict.  A device whose snapshot raises is skipped (its role maps to the error text)
+        rather than wedging a save."""
+        out: dict[str, object] = {}
+        for role in ("camera", "sequencer"):
+            device = getattr(self, role, None)
+            snap = getattr(device, "snapshot", None)
+            if device is None or not callable(snap):
+                continue
+            try:
+                out[role] = snap()
+            except Exception as exc:                     # a device must never break a figure save
+                out[role] = f"<snapshot failed: {type(exc).__name__}: {exc}>"
+        return out
+
+    def _calibration_fingerprint(self) -> dict[str, object] | None:
+        """A small, human-readable fingerprint of the calibration this node reads with, or ``None``.
+
+        Records WHICH calibration the data was judged against (site count + the readout method +
+        the source file if the calibration knows one) without dumping the whole object -- enough to
+        answer "was this the same calibration".  Reads only public attributes; absent for a node
+        that carries no calibration."""
+        cal = getattr(self, "calibration", None)
+        if cal is None:
+            return None
+        fp: dict[str, object] = {}
+        centers = getattr(cal, "centers", None)
+        if centers is not None:
+            try:
+                fp["n_sites"] = int(np.asarray(centers).shape[0])
+            except Exception:
+                pass
+        meta = getattr(cal, "metadata", None)
+        if isinstance(meta, dict):
+            for key in ("threshold_method", "source_path", "thresholds_calibrated"):
+                if key in meta:
+                    fp[key] = meta[key]
+        return fp or None
+
+    def refresh_provenance(self) -> None:
+        """Capture and cache this node's provenance NOW (call from an acquiring node right after a
+        real acquisition, so the snapshot reflects the device state that produced THIS data)."""
+        self._provenance = self._collect_provenance()
+
+    def _collect_provenance(self) -> dict[str, object]:
+        """Assemble the provenance dict: the held devices' snapshots + this node's acquisition
+        params + calibration fingerprint + node/layer identity + a wall-clock timestamp."""
+        prov: dict[str, object] = {
+            "node": self.display_label,
+            "layer": self.layer,
+            "captured_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+        }
+        devices = self._snapshot_devices()
+        if devices:
+            prov["devices"] = devices
+        try:
+            params = self.acquisition_parameters()
+        except Exception:
+            params = {}
+        if params:
+            prov["acquisition_parameters"] = dict(params)
+        fingerprint = self._calibration_fingerprint()
+        if fingerprint is not None:
+            prov["calibration_fingerprint"] = fingerprint
+        return prov
+
+    def provenance_snapshot(self) -> dict[str, object]:
+        """The device state + acquisition context of the data this node produced -- the record a
+        saved figure keeps so a reader sees "what the apparatus was doing when this was taken".
+
+        Returns the snapshot cached by :meth:`refresh_provenance` (captured at the last acquisition);
+        when a node never refreshed one (e.g. a static node, or read before its first shot) it is
+        computed on demand from the current device state.  Always a plain dict of picklable values
+        (device ``.snapshot()`` dicts + scalars), so it round-trips through the saved-figure npz."""
+        if self._provenance is not None:
+            return dict(self._provenance)
+        return self._collect_provenance()
 
 
 # ===================================================================== logic node kinds

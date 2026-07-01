@@ -4508,6 +4508,33 @@ class PanelEditor(QtWidgets.QWidget):
             "repeat_mode": self.card._repeat_mode_value(),
         }
 
+    def _provenance_for_save(self):
+        """The device-state record of the SOURCE that produced this panel's data, folded into the
+        saved ``info['provenance']`` so a reopened figure shows "what the apparatus was doing when
+        this data was taken".
+
+        Resolved from the producing logic NODE of the panel's first input signal
+        (``console._node_for_signal(...)`` -> ``node.provenance_snapshot()``): its held devices'
+        public ``.snapshot()`` + acquisition params + calibration fingerprint.  When no node produces
+        the signal (a derived expression, a loaded static figure) it falls back to the whole-session
+        device snapshot (``session.devices.snapshot()``) if a session is attached, else ``None``
+        (nothing to record) -- so a save NEVER fails for lack of provenance."""
+        inputs = self.card.config.inputs or []
+        node = self.console._node_for_signal(inputs[0]) if inputs else None
+        if node is not None:
+            try:
+                return node.provenance_snapshot()
+            except Exception:
+                pass
+        devices = getattr(getattr(self.console, "session", None), "devices", None)
+        snap = getattr(devices, "snapshot", None)
+        if callable(snap):
+            try:
+                return snap()
+            except Exception:
+                return None
+        return None
+
     def save(self) -> None:
         if self._plotter is None:
             return
@@ -4521,7 +4548,8 @@ class PanelEditor(QtWidgets.QWidget):
                           extra_info={"source": self.card.config.source,
                                       "kind": self.card.config.kind,
                                       "size": self.card.config.size,
-                                      "view": self._save_view_state()})
+                                      "view": self._save_view_state(),
+                                      "provenance": self._provenance_for_save()})
             self.console._last_save_dir = str(stem.parent)   # remember where (kernel session)
             self._update_save_preview()
             # Show the LEAF folder, not the full absolute path (the full path is one click away in the

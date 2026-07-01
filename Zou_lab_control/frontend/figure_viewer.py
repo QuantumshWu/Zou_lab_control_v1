@@ -45,6 +45,7 @@ from .task_console import (
 from .qt_fluent import (
     GREY,
     FluentButton,
+    FluentFrame,
     FluentLabel,
     FluentPathEdit,
     FluentReadoutEdit,
@@ -286,11 +287,14 @@ class FigureViewer(QtWidgets.QWidget):
 
     # ------------------------------------------------------------------ layout
     def _build_info_column(self) -> QtWidgets.QWidget:
-        col = QtWidgets.QWidget()
-        col.setStyleSheet("background: transparent;")
+        # The Info column is a fluent CARD (like PanelCard / a Setting card), so its rounded corners,
+        # 1 px edge and soft shadow are OWNED by FluentFrame -- never hand-drawn borders here (rule 5/8).
+        # An inner card padding floats the content off the card edge so nothing hugs the rounded corner.
+        col = FluentFrame()
         col.setFixedWidth(self._info_col_w)
+        pad = scaled_px(12, minimum=8)
         lay = QtWidgets.QVBoxLayout(col)
-        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setContentsMargins(pad, pad, pad, pad)
         lay.setSpacing(scaled_px(6, minimum=4))
 
         # --- File: path field + Load ------------------------------------------
@@ -410,9 +414,52 @@ class FigureViewer(QtWidgets.QWidget):
             field = FluentReadoutEdit(str(value))
             field.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
             self.info_layout.addWidget(FluentSettingRow(key, field, label_width=self._label_w))
+        # Provenance: "what the apparatus was doing when this data was taken", expanded READABLY --
+        # each held device gets its own small section (its snapshot keys, one row each), so the
+        # operator sees the device state at a glance instead of one crushed line.  Absent / old npz:
+        # skipped silently (backward compatible).
+        self._fill_provenance(saved.info.get("provenance"))
         # Raw info: the WHOLE dict verbatim (every key the npz stored).
         self.raw_info.setText(repr(dict(saved.info)))
         self.raw_info.setToolTip(repr(dict(saved.info)))
+
+    def _add_info_row(self, key: str, value: object) -> None:
+        """One read-only ``key | value`` row in the Info column (the shared row primitive)."""
+        field = FluentReadoutEdit(str(value))
+        field.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
+        self.info_layout.addWidget(FluentSettingRow(key, field, label_width=self._label_w))
+
+    def _fill_provenance(self, provenance: object) -> None:
+        """Expand the saved ``info['provenance']`` (the producing node's device snapshot) into the
+        Info column, easy to read: a 'Provenance' section header, then the top-level scalar facts
+        (node / layer / captured_at / calibration fingerprint) as rows, then ONE sub-section per held
+        device (``camera`` / ``sequencer``) listing its snapshot keys one per row.  ``provenance`` may
+        be ``None`` (old npz, or nothing to record) -> nothing is added; a non-dict is shown verbatim."""
+        if not provenance:
+            return
+        self.info_layout.addWidget(FluentSectionLabel("Provenance"))
+        if not isinstance(provenance, Mapping):
+            self._add_info_row("provenance", provenance)
+            return
+        devices = provenance.get("devices") if isinstance(provenance.get("devices"), Mapping) else {}
+        # Top-level scalar facts first (skip the nested ``devices`` -- it gets its own sub-sections).
+        for key, value in provenance.items():
+            if key == "devices":
+                continue
+            if isinstance(value, Mapping):       # e.g. acquisition_parameters / calibration_fingerprint
+                self.info_layout.addWidget(FluentSectionLabel(str(key)))
+                for sub_key, sub_val in value.items():
+                    self._add_info_row(str(sub_key), sub_val)
+            else:
+                self._add_info_row(str(key), value)
+        # One sub-section per device, its snapshot keys one row each.
+        for role, snap in devices.items():
+            self.info_layout.addWidget(FluentSectionLabel(str(role)))
+            if isinstance(snap, Mapping):
+                for sub_key, sub_val in snap.items():
+                    self._add_info_row(str(sub_key), sub_val)
+            else:
+                self._add_info_row(str(role), snap)
 
     # -------------------------------------------------------------- console
     def _build_console(self, saved: SavedFigure) -> None:
