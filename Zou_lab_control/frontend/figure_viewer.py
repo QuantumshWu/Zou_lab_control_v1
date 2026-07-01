@@ -33,8 +33,10 @@ the same board, and the Monitor tab / Add Panel / re-wire reuse is identical to 
 A read-only **Info** column on the left lists EVERY key the npz stored, grouped into tabs -- **Plot**
 (name / kind / labels / unit / saved / the view sub-dict / any fit), **Measurement** (source / data_x /
 data_y shapes / points / repeat / the stored signal blocks), **Device** (the run's provenance expanded
-per device) and **Raw** (the whole ``info`` dict verbatim, multi-line + scrollable) -- so "what is in
-this file" is always fully visible next to the board.  Browse (or typing a valid path) loads it
+per device), **Flow** (the upstream DAG of how the data was produced -- raw data / a measurement signal /
+through which processor(s), drawn as a branching node-link tree, since one panel can consume several
+signals each from a different upstream source) and **Raw** (the whole ``info`` dict verbatim, multi-line
++ scrollable) -- so "what is in this file" is always fully visible next to the board.  Browse (or typing a valid path) loads it
 automatically -- there is no separate Load button.  Browse lists the saved-figure IMAGES (``.png`` /
 ``.jpg``) alongside the ``.npz``, so the operator can eye-ball the thumbnail to find the right run and
 picking the image loads its SIBLING ``.npz`` data (the save writes the pair under one ``<name>_<time>``
@@ -58,6 +60,7 @@ from Zou_lab_control.neutral_atom.core.signals import SignalHub
 from Zou_lab_control.neutral_atom.operations.logic import LogicNode, SignalSpec
 
 from .data_figure import SavedFigure, load_figure
+from .flow_graph_view import FlowGraphView
 from .task_console import (
     PanelConfig,
     TaskConsole,
@@ -523,9 +526,10 @@ class FigureViewer(QtWidgets.QWidget):
         self.path_edit.changed.connect(self._on_path_changed)
         lay.addWidget(FluentSettingRow("path", self.path_edit, label_width=self._label_w))
 
-        # --- Info tabs: Plot | Measurement | Device | Raw -----------------------------------
+        # --- Info tabs: Plot | Measurement | Device | Flow | Raw ------------------------------
         # The facts the npz stored, grouped so a column is not one long crushed list: Plot (how it draws),
-        # Measurement (its data shapes / source), Device (the run's provenance), Raw (the whole dict).
+        # Measurement (its data shapes / source), Device (the run's provenance), Flow (the upstream DAG of
+        # how the data was produced), Raw (the whole dict).
         # A clear gap ABOVE the tab card equal to EXACTLY the tab shadow's top bleed
         # (``fluent_tab_shadow_margin``, the ONE source shared with the shadow itself): the
         # FluentTabWidget carries a soft drop shadow whose blur+offset bleeds past its top edge, so
@@ -540,6 +544,9 @@ class FigureViewer(QtWidgets.QWidget):
         # ``info_layout`` is the DEVICE tab body -- the provenance expansion lands here (kept under this
         # name so _fill_provenance / _add_info_row + the provenance tests read one Info container).
         self.info_layout = self._add_rows_tab("Device")
+        # The Flow tab: the upstream DAG of how the data was produced (raw / measurement / processor chain,
+        # BRANCHING upward), drawn by the reusable FlowGraphView inside a scroll area (a large graph scrolls).
+        self.flow_view = self._add_flow_tab("Flow")
         self.raw_info = self._add_raw_tab("Raw")
         lay.addWidget(self.info_tabs, 1)
 
@@ -565,6 +572,21 @@ class FigureViewer(QtWidgets.QWidget):
         scroll.setWidget(body)
         self.info_tabs.add_permanent_tab(scroll, title)
         return vbox
+
+    def _add_flow_tab(self, title: str) -> FlowGraphView:
+        """A permanent tab holding the reusable :class:`FlowGraphView` inside a horizontal+vertical
+        FluentScrollArea -- a branching provenance graph that outgrows the column simply scrolls (the view
+        reports its natural size, so ``setWidgetResizable(True)`` lets it grow past the viewport)."""
+        scroll = FluentScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        view = FlowGraphView()
+        view.setToolTip("How this figure's data was produced: raw data / a measurement signal / through "
+                        "which processor(s).  The tree branches upward -- a panel can consume several "
+                        "signals, each from a different upstream source.")
+        scroll.setWidget(view)
+        self.info_tabs.add_permanent_tab(scroll, title)
+        return view
 
     def _add_raw_tab(self, title: str) -> FluentCodeEdit:
         """A permanent tab holding a read-only multi-line code editor (its own scrollbars) that shows the
@@ -695,6 +717,13 @@ class FigureViewer(QtWidgets.QWidget):
         self._fill_provenance(saved.info.get("provenance"))
         if self.info_layout.count() == 0:
             self._add_info_row("provenance", "(none recorded)")
+
+        # --- Flow tab: the upstream DAG of how the data was produced (raw / measurement / processor
+        # chain, branching upward).  Read off ``provenance['flow_graph']``; absent (old npz / no binding)
+        # -> the view shows its own muted placeholder, never a crash.
+        provenance = saved.info.get("provenance")
+        flow = provenance.get("flow_graph") if isinstance(provenance, Mapping) else None
+        self.flow_view.set_graph(flow)
 
         # --- Raw tab: the WHOLE dict verbatim (every key the npz stored), multi-line + scrollable ---
         text = repr(dict(saved.info))

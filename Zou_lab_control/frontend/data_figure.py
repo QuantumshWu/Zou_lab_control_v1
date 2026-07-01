@@ -198,7 +198,7 @@ class DataFigure:
         if not src:
             return {}
         from Zou_lab_control.neutral_atom.operations.figure_capture import (
-            capture_figure_signals, capture_figure_provenance)
+            capture_figure_signals, capture_figure_provenance, capture_flow_graph)
         out: dict[str, Any] = {}
         try:
             signals = capture_figure_signals(src.get("hub"), src.get("node"), src.get("inputs"))
@@ -211,6 +211,18 @@ class DataFigure:
                                              session=src.get("session"))
         except Exception:
             prov = None
+        # The SYSTEMATIC upstream DAG of how the data was produced (raw / measurement / processor chain,
+        # BRANCHING upward) -- captured through the SAME core and folded into ``provenance['flow_graph']``
+        # (an append-only key: it never disturbs the existing flat ``provenance`` / ``signals`` structure).
+        try:
+            flow = capture_flow_graph(src.get("hub"), src.get("node"), src.get("inputs"),
+                                      resolve_node=src.get("resolve_node"))
+        except Exception:
+            flow = None
+        if flow is not None:
+            if prov is None:
+                prov = {}
+            prov["flow_graph"] = flow
         if prov is not None:
             out["provenance"] = prov
         return out

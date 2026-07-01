@@ -149,6 +149,186 @@ def _hoist_upstream_devices(node, resolve_node, *, visited: set) -> dict:
     return {}
 
 
+#: The synthetic id/role of the terminal PLOT node in a flow graph -- the figure itself, which every
+#: wired input flows INTO (it is not a LogicNode, so it has no producing node to resolve).
+_PLOT_ID = "__plot__"
+#: The synthetic id/role of a RAW-DATA leaf -- a figure whose data was handed in directly (a bare array,
+#: no ``bind_source``), so there is no producing node and the flow degrades to ``raw data -> plot``.
+_RAW_ID = "__raw__"
+
+
+def _node_id(node) -> str:
+    """A stable per-instance id for a producing node in the flow graph.  ``id()`` is unique within one
+    capture (the whole graph is built in a single call), so two same-kind nodes (two occupancy judges)
+    never collide, and a node reached along two different paths (a diamond: one source feeding two
+    processors that both feed the plot) maps to the SAME graph node -- so convergence is preserved, not
+    duplicated."""
+    return f"n{id(node)}"
+
+
+def _node_role(node) -> str:
+    """The flow-graph ROLE of a producing node = its architecture LAYER (``measurement`` / ``processor``
+    / ``task``), read straight off ``node.layer`` -- structure-driven, never a per-kind special-case.  A
+    node without a layer (should not happen) degrades to ``node``."""
+    return str(getattr(node, "layer", "") or "node")
+
+
+def _bare_name(node, full: str) -> str:
+    """A signal's bare name (its published name minus the producing node's prefix) for a readable edge
+    label -- so an edge reads ``frame_0`` not ``cam_frame_0``.  Falls back to the full name when the
+    prefix does not apply."""
+    prefix = str(getattr(node, "prefix", "") or "")
+    return full[len(prefix):] if prefix and full.startswith(prefix) else full
+
+
+def _plot_input_roles(node, inputs) -> list[tuple[str, str]]:
+    """The (role, full-signal-name) edges that flow straight INTO the plot -- the SAME role resolution
+    ``capture_figure_signals`` uses (value / x / centers / frame), so the flow graph's terminal edges name
+    exactly the signals the figure consumes.  ``value`` is always ``inputs[0]``; the companion x / the
+    sitemap centres+underlay are read off the producing ``node`` (its ``x_signal`` / ``sitemap_*_key``),
+    exactly as the signal capture does.  A role whose signal cannot be resolved is simply omitted."""
+    wired = [str(s) for s in (inputs or []) if s]
+    if not wired:
+        return []
+    roles: list[tuple[str, str]] = [("value", wired[0])]
+    x_full = str(getattr(node, "x_signal", "") or "")
+    if x_full:
+        roles.append(("x", x_full))
+    prefix = str(getattr(node, "prefix", "") or "")
+    centers_key = str(getattr(node, "sitemap_centers_key", "") or "")
+    image_key = str(getattr(node, "sitemap_image_key", "") or "")
+    if centers_key:
+        roles.append(("centers", prefix + centers_key))
+    if image_key:
+        roles.append(("frame", prefix + image_key))
+    # De-dup a signal that fills two roles (a 2-D camera panel whose value IS the underlay frame): keep
+    # the FIRST (value) exactly like capture_figure_signals, so the plot has one edge per distinct signal.
+    seen: set[str] = set()
+    out: list[tuple[str, str]] = []
+    for role, full in roles:
+        if not full or full in seen:
+            continue
+        seen.add(full)
+        out.append((role, full))
+    return out
+
+
+def _signal_shape(hub, node, full: str) -> Optional[list]:
+    """The shape of a signal's current hub block as a plain list (or ``None`` when it is not on the hub /
+    the shape cannot be read) -- so an edge can carry ``shape`` without re-storing the whole array (the raw
+    blocks already live in ``info['signals']``).  Read through the public ``hub.latest`` contract only."""
+    if hub is None:
+        return None
+    try:
+        block = hub.latest(full)
+    except Exception:
+        return None
+    try:
+        return [int(n) for n in np.shape(block)]
+    except Exception:
+        return None
+
+
+def capture_flow_graph(hub, node, inputs, *, resolve_node: ResolveNode | None = None) -> Optional[dict]:
+    """The SYSTEMATIC upstream DAG of how a figure's data was produced -- ``{"nodes": [...], "edges": [...]}``
+    -- so a reopened figure can DRAW "where did this data come from": raw data? a measurement signal? through
+    which processor(s)?  and, crucially, the tree BRANCHES UPWARD (a site map consumes occupancy + centres +
+    an underlay frame, each along its OWN chain), which the old flat provenance discarded.
+
+    Built by RECURSIVELY expanding every input, driven purely by the node graph (never a per-kind
+    special-case):
+
+      * the terminal ``plot`` node is the figure itself; each wired input (value / x / centres / frame,
+        resolved exactly as :func:`capture_figure_signals`) is an EDGE from its producing node INTO the
+        plot, labelled with the signal name + its current shape;
+      * each producing node is then expanded via its ``consumes`` list -- every consumed signal resolves
+        (through ``resolve_node``) to a FURTHER upstream node and adds an edge ``upstream -> node``.  A node
+        with several consumed inputs therefore has several PARENTS (branching); a source reached along two
+        paths maps to ONE graph node (convergence).  The walk is ``id``-guarded so a cycle / a re-visit
+        never loops or double-adds;
+      * a SOURCE node that holds devices is marked ``has_devices`` -- the viewer shows that its device
+        snapshot provenance is attached (the snapshots themselves stay in ``provenance['devices']``, not
+        re-stored here).
+
+    Roles come from each node's architecture ``layer`` (``measurement`` / ``processor`` / ``task``) plus the
+    synthetic ``plot`` terminal and, when there is no producing node at all (a bare-array figure), a single
+    ``raw data`` leaf -> ``plot``.  Returns ``None`` only when there is no plot to describe (no inputs and no
+    node); otherwise ALWAYS a graph (at minimum ``raw data -> plot``), so the Flow tab always has something
+    to draw.  ``resolve_node`` is the upstream resolver (``console._node_for_signal`` / a notebook resolver);
+    without it the graph still captures the DIRECT plot inputs, just not the deeper chain."""
+    wired = [str(s) for s in (inputs or []) if s]
+    # Nothing to describe at all -- no wired inputs and no producing node.
+    if not wired and node is None:
+        return None
+
+    nodes: dict[str, dict] = {}
+    edges: list[dict] = []
+
+    def _ensure_node(n) -> str:
+        nid = _node_id(n)
+        if nid not in nodes:
+            entry: dict = {"id": nid, "name": str(getattr(n, "display_label", "") or "node"),
+                           "role": _node_role(n)}
+            # A source that HOLDS devices carries its snapshot provenance (stored flat in
+            # provenance['devices']); mark it so the viewer can badge it, WITHOUT re-storing the snapshot.
+            try:
+                prov = dict(n.provenance_snapshot())
+            except Exception:
+                prov = {}
+            if prov.get("devices"):
+                entry["has_devices"] = True
+                entry["devices"] = sorted(str(k) for k in prov["devices"])
+            nodes[nid] = entry
+        return nid
+
+    def _add_edge(frm: str, to: str, *, signal: str = "", shape=None, role: str = "") -> None:
+        edge: dict = {"from": frm, "to": to}
+        if signal:
+            edge["signal"] = signal
+        if shape is not None:
+            edge["shape"] = shape
+        if role:
+            edge["role"] = role
+        edges.append(edge)
+
+    def _expand(n, *, visited: set) -> None:
+        """Walk a node's consumed inputs upstream, adding one node + edge per consumed signal (branching
+        preserved: several consumes -> several parents)."""
+        nid = _node_id(n)
+        consumes = list(getattr(n, "consumes", ()) or [])
+        for sig in consumes:
+            sig = str(sig)
+            src = resolve_node(sig) if resolve_node is not None else None
+            if src is None:
+                continue
+            src_id = _ensure_node(src)
+            _add_edge(src_id, nid, signal=_bare_name(src, sig), shape=_signal_shape(hub, src, sig))
+            if id(src) in visited:
+                continue                                    # convergence / cycle -> edge kept, no re-expand
+            visited.add(id(src))
+            _expand(src, visited=visited)
+
+    # The terminal plot node.
+    nodes[_PLOT_ID] = {"id": _PLOT_ID, "name": "figure", "role": "plot"}
+
+    if node is None:
+        # No producing node: the figure's data was handed in directly -> a single raw-data leaf.
+        nodes[_RAW_ID] = {"id": _RAW_ID, "name": "raw data", "role": "raw data"}
+        _add_edge(_RAW_ID, _PLOT_ID)
+        return {"nodes": list(nodes.values()), "edges": edges}
+
+    # The DIRECT edges INTO the plot: each wired role's signal -> its producing node -> the plot.  The
+    # producing node of the panel's own value is ``node`` (already resolved by the caller); the companion
+    # roles (x / centres / frame) are published by that SAME node, so they share it.
+    node_id = _ensure_node(node)
+    for role, full in _plot_input_roles(node, inputs):
+        _add_edge(node_id, _PLOT_ID, signal=_bare_name(node, full),
+                  shape=_signal_shape(hub, node, full), role=role)
+    # Expand every producing node upstream (branching + convergence preserved).
+    _expand(node, visited={id(node)})
+    return {"nodes": list(nodes.values()), "edges": edges}
+
+
 def capture_figure_provenance(node, *, resolve_node: ResolveNode | None = None,
                               session=None) -> Optional[dict]:
     """The FLAT device-state record of the SOURCE that produced a panel's data -- folded into a save's
@@ -197,4 +377,4 @@ def capture_figure_provenance(node, *, resolve_node: ResolveNode | None = None,
     return None
 
 
-__all__ = ["capture_figure_signals", "capture_figure_provenance", "ResolveNode"]
+__all__ = ["capture_figure_signals", "capture_figure_provenance", "capture_flow_graph", "ResolveNode"]
