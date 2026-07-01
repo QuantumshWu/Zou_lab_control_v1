@@ -1653,6 +1653,20 @@ def resolve_task_state(task: str) -> TaskConsoleState:
 _MONITOR_UNSET = object()   # sentinel: a monitor panel that has never rolled yet
 
 
+class _GridFocus:
+    """Parked GRID state while one of its cells is ENLARGED into a standalone plot-kind figure in the
+    console.  Holds the grid plotter + its (detached, not closed) canvas so :meth:`PanelCard._unfocus_grid_cell`
+    can swap the grid back, the focused cell index (to mirror a threshold drag back onto it), and the mpl
+    callback ids on the focus canvas so they are disconnected on return / teardown."""
+
+    def __init__(self, *, grid, grid_canvas, k: int):
+        self.grid = grid
+        self.grid_canvas = grid_canvas
+        self.k = int(k)
+        self.click_cid = None
+        self.key_cid = None
+
+
 class PanelCard(FluentGroupBox):
     """One dashboard panel: a TITLED frame (title strip = the panel KIND + the signal-source
     legend, top-left) holding the frontend canvas, and a text
@@ -1720,6 +1734,15 @@ class PanelCard(FluentGroupBox):
         self.grid_recipe_provider = grid_recipe_provider
         self.plotter = None
         self.canvas = None
+        # GRID focus-zoom state (console path).  A GRID panel is display-only (interactions=False), so its
+        # own double-click handler is dormant; THIS card catches the double-click on the grid canvas and
+        # swaps ``self.plotter`` / ``self.canvas`` to a STANDALONE plot-kind figure of the clicked cell
+        # (``GridPlot.build_focus_plotter`` -- the SAME builder the notebook path uses).  While focused,
+        # ``self.plotter`` IS that standalone figure, so a lim / fit / relim edit reaches it through the
+        # ORDINARY _set_param / _apply_lim_to_plotter path (no bespoke code) and the live tick is gated OFF
+        # so the grid never rebuilds over it (no bounce-back).  ``None`` = showing the grid; else a
+        # ``_GridFocus`` holding the parked grid plotter/canvas + the focused cell index + the click/key cids.
+        self._grid_focus = None
         self._value_shape: tuple[int, ...] | None = None
         # A STRUCTURE knob (bins / colormap / fit ...) sets this to force the NEXT _render to REBUILD
         # the plotter -- WITHOUT pre-tearing it down.  _build_plot build-then-swaps, so a failed rebuild
@@ -3068,6 +3091,11 @@ class PanelCard(FluentGroupBox):
         # knows an upstream node's internals).  Bind it to a processor's per-site COUNTS to
         # see the bimodal readout; bind it to a raw frame and it histograms the frame's
         # pixels, honestly.  Whatever the source gives the dis is what the dis bins.
+        # A GRID cell is ENLARGED into a standalone plot-kind figure (``_grid_focus`` set): the live tick
+        # must NOT rebuild the grid over it, or the enlarged view (and any lim edit on it) would bounce back
+        # to the thumbnail.  Skip rendering entirely while focused -- the parked grid is redrawn on unfocus.
+        if self._grid_focus is not None:
+            return
         value = self._coerce(value)
         kind = self.config.kind
         # A pulse panel renders a STRUCTURED figure (a whole timeline) from its sequence object; there is
@@ -3359,6 +3387,103 @@ class PanelCard(FluentGroupBox):
         self._apply_display_params()
         self.canvas.draw()          # SYNCHRONOUS: the swapped-in canvas shows its FINAL frame at once
         self._place_setting_button()
+        # A GRID panel is display-only, so its own focus-zoom is dormant -- THIS card catches the double-click
+        # on the grid canvas and swaps to the clicked cell's standalone plot-kind figure (build_focus_plotter).
+        if kind == "grid" and self._grid_focus is None:
+            self._connect_grid_focus_click(self.plotter)
+
+    def _connect_grid_focus_click(self, grid) -> None:
+        """Wire a double-click on the GRID canvas to enlarge the clicked cell into its standalone plot-kind
+        figure (and Esc / another double-click to return).  The grid panel is display-only, so it has no
+        selectors; this is the ONE handler the console adds for the focus-zoom -- it reuses the grid's own
+        ``site_axes`` for hit-testing and :meth:`GridPlot.build_focus_plotter` for the enlarged view."""
+        canvas = getattr(grid.fig, "canvas", None)
+        if canvas is None:
+            return
+        self._grid_click_cid = canvas.mpl_connect("button_press_event", self._on_grid_canvas_click)
+
+    def _on_grid_canvas_click(self, event) -> None:
+        # Only a LEFT double-click toggles focus (mirror GridPlot._on_click -- some backends emit wheel /
+        # middle as dblclick button 2/4/5).
+        if not getattr(event, "dblclick", False) or getattr(event, "button", 1) != 1:
+            return
+        if self._grid_focus is None:
+            grid = self.plotter
+            axes = list(getattr(grid, "site_axes", []) or [])
+            if event.inaxes in axes:
+                self._focus_grid_cell(grid, axes.index(event.inaxes))
+        else:
+            self._unfocus_grid_cell()
+
+    def _on_grid_focus_key(self, event) -> None:
+        if getattr(event, "key", None) == "escape" and self._grid_focus is not None:
+            self._unfocus_grid_cell()
+
+    def _focus_grid_cell(self, grid, k: int) -> None:
+        """Enlarge grid cell ``k`` into its STANDALONE plot-kind figure and SWAP it into this card's canvas,
+        parking the grid (plotter + canvas) to swap back on unfocus.  The enlarged view is a real
+        ``panel_plot`` of the cell's kind with the STANDARD relim view kwargs, so a subsequent lim / fit /
+        relim edit reaches it through the ordinary _set_param / _apply_lim_to_plotter path -- and the live
+        tick is gated off (``_grid_focus`` set), so it never bounces back to the thumbnail."""
+        if panel_canvas is None:
+            return
+        # the enlarged view is a standalone panel of the CELL's kind -> its standard relim view kwargs
+        focus_kind = str(getattr(grid.cell_renderer, "focus_kind", "hist"))
+        focus = grid.build_focus_plotter(
+            k, size=self.config.size, interactions=True, **self._view_kwargs(focus_kind))
+        focus_canvas = panel_canvas(focus.fig, isolate_wheel=False)
+        # atomic swap-in (mirror _build_plot): insert the focus canvas, remove the grid canvas but do NOT
+        # close the grid figure -- it is parked for the return.
+        grid_canvas = self.canvas
+        self.canvas_holder.insertWidget(0, focus_canvas, alignment=QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop)
+        if grid_canvas is not None:
+            self.canvas_holder.removeWidget(grid_canvas)
+            grid_canvas.setParent(None)
+        self.plotter = focus
+        self.canvas = focus_canvas
+        self._grid_focus = _GridFocus(grid=grid, grid_canvas=grid_canvas, k=int(k))
+        self._grid_focus.key_cid = focus_canvas.mpl_connect("key_press_event", self._on_grid_focus_key)
+        self._grid_focus.click_cid = focus_canvas.mpl_connect("button_press_event", self._on_grid_canvas_click)
+        self._apply_display_params()        # re-apply unit / manual lims to the fresh focus plotter
+        focus_canvas.draw()
+        self._place_setting_button()
+
+    def _unfocus_grid_cell(self) -> None:
+        """Return from the enlarged cell to the grid: mirror any threshold drag back onto the grid cell, swap
+        the parked grid canvas back in, and close the focus figure."""
+        parked = self._grid_focus
+        if parked is None:
+            return
+        grid, grid_canvas, k = parked.grid, parked.grid_canvas, parked.k
+        focus, focus_canvas = self.plotter, self.canvas
+        # copy an enlarged-view threshold cut back onto the grid cell (the grid thumbnail + save recipe read it)
+        cell = getattr(grid, "cell_renderer", None)
+        if cell is not None and hasattr(cell, "sync_threshold_from_focus"):
+            try:
+                cell.sync_threshold_from_focus(k, focus)
+            except Exception:
+                pass
+        self._grid_focus = None
+        # swap the grid canvas back in FIRST (never a blank holder), then retire the focus canvas + figure
+        if grid_canvas is not None:
+            self.canvas_holder.insertWidget(0, grid_canvas, alignment=QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop)
+        self.plotter = grid
+        self.canvas = grid_canvas
+        if focus_canvas is not None:
+            self.canvas_holder.removeWidget(focus_canvas)
+            focus_canvas.setParent(None)
+            focus_canvas.deleteLater()
+        if focus is not None and plt is not None and focus.fig is not None:
+            plt.close(focus.fig)
+        # the grid thumbnails may have picked up a new threshold -> redraw them, then show
+        if hasattr(grid, "_redraw_thumbnails"):
+            try:
+                grid._redraw_thumbnails()
+            except Exception:
+                pass
+        if grid_canvas is not None:
+            grid_canvas.draw()
+        self._place_setting_button()
 
     def _reset_plot(self) -> None:
         """Drop the plot so the next refresh rebuilds it (size/params/source changed)."""
@@ -3366,6 +3491,16 @@ class PanelCard(FluentGroupBox):
         self._value_shape = None
 
     def _teardown_plot(self) -> None:
+        # If a grid cell is ENLARGED, the parked grid holds a SECOND figure/canvas -- close it too so a
+        # teardown while focused leaks neither figure (self.plotter/self.canvas are the FOCUS view here).
+        parked = self._grid_focus
+        self._grid_focus = None
+        if parked is not None:
+            if parked.grid_canvas is not None:
+                parked.grid_canvas.setParent(None)
+                parked.grid_canvas.deleteLater()
+            if parked.grid is not None and plt is not None and getattr(parked.grid, "fig", None) is not None:
+                plt.close(parked.grid.fig)
         canvas, plotter = self.canvas, self.plotter
         self.canvas = None
         self.plotter = None

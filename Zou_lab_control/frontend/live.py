@@ -202,12 +202,13 @@ _IMAGE_SPLIT = ([0.75, 0.1, 0.1], [0.025, 0.025])  # 2D image | side dist | colo
 # data region every other panel kind uses (``panel_plot_spec(size).data_px``) and SUBDIVIDES it into
 # cells with these inter-cell gaps -- so a grid's data box equals a single-axes panel's of the same size
 # (create_axes_grid(data_px=...) derives the per-cell size to fill the region), and a size change truly
-# rescales the cells, not just the padding.  The gaps scale with the size preset like the cells do.
+# rescales the cells, not just the padding.  The gaps scale with the size preset like the cells do.  The
+# OUTER margins around the whole grid come from the ONE panel margin source (:func:`panel_margins_px`) --
+# NOT a bespoke grid margin tuple -- so a grid's TOTAL figure px (data box + margins) equals a single-axes
+# panel's of the same size to the pixel (the same three-region L|data|R / B|data|T layout), and the grid
+# thumbnail's padding matches every other kind's card instead of looking visibly different (#5).
 _SITE_COL_GAP_PX = 12
 _SITE_ROW_GAP_PX = 16
-# (L, R, B, T) around the whole grid: B holds the bottom-row tick labels AND the
-# outer x-axis label (two text rows, so it is generous); T holds the suptitle.
-_SITE_GRID_MARGINS_PX = (54, 20, 62, 42)
 _SITE_MAX_COLS = 7                        # column cap (pulse-style width cap); extra sites wrap to rows
 
 
@@ -382,7 +383,6 @@ class BaseLivePlot:
         name: str = "figure",
         info: Mapping[str, Any] | None = None,
         unit: str | None = None,
-        external_ax: plt.Axes | None = None,
     ):
         self.labels = list(labels)
         self.xlabel = self.labels[0]
@@ -426,12 +426,6 @@ class BaseLivePlot:
         self._shown = False
         self.data_figure = None
         self._stopped = False
-        # An EXTERNAL axes to render onto instead of building this plot's own fixed-pixel figure box: the
-        # grid's focus-zoom hands a real plot-kind (HistogramFigure / Live2DDis / LiveSiteMap) the grid
-        # figure + the focus axes, so the enlarged cell IS a full standalone plot (draggable threshold +
-        # live fidelity, fit, full x/y axes) reusing the ONE plot-kind renderer -- never a hand-rolled
-        # simplified copy (part B).  ``None`` = the ordinary owned-geometry path (every notebook / panel plot).
-        self._external_ax = external_ax
         # The SOURCE this plot's data came from (a SignalHub + the producing logic node + the wired
         # signal names), stamped by :meth:`bind_source` when the plot is created FROM live signals (the
         # console panel, a notebook hub-bound plot).  Its presence makes ``.save()`` a RICH save -- it
@@ -448,18 +442,15 @@ class BaseLivePlot:
     def show(self, *, display: bool = True):
         """Initialize and optionally display the figure."""
         apply_style({"figure.dpi": self.spec.dpi})
-        if self._external_ax is not None:
-            # Render onto a caller-supplied axes (the grid's focus cell): the figure + axes already exist
-            # and are OWNED by the host (the GridPlot), so do NOT build / clear a figure -- just adopt them.
-            self.fig = self._external_ax.figure
-            self.ax = self._external_ax
+        if self.fig is None:
+            self.fig = new_figure(spec=self.spec)
         else:
-            if self.fig is None:
-                self.fig = new_figure(spec=self.spec)
-            else:
-                configure_canvas(self.fig)
-                self.fig.clear()
-            self.ax = self._create_axes()
+            # Build onto a caller-supplied figure (e.g. the grid's own canvas when a cell is focused into a
+            # standalone panel): clear it and lay out this plot's fixed-pixel box, so the plot OWNS the figure
+            # exactly as a fresh one would -- no external-axes overlay, just the standard geometry path.
+            configure_canvas(self.fig)
+            self.fig.clear()
+        self.ax = self._create_axes()
         if self.axes is None:
             self.axes = self.ax
         if self.smart_ticks:
@@ -477,24 +468,16 @@ class BaseLivePlot:
             )
         self.init_core()
         self._apply_title()
-        if self._external_ax is None:
-            # The figure-level state / self-anchor are OWNED by the host GridPlot when rendering onto its
-            # focus axes, so a focus plotter must NOT clobber the grid's ``_zlc_state`` / ``_zlc_plotter``
-            # (the grid restores its own tools on unfocus and owns the canvas draw).  The focus plotter
-            # still attaches its own selectors below (draggable threshold etc.), which the grid captures.
-            self._install_state()
+        self._install_state()
         if self.interactions:
             self._attach_interactions()
-        if self._external_ax is None:
-            # Strong self-ref on the figure (confocal's `fig._live_plotter` pattern):
-            # the nb live loop / QTimer hold the plotter, but an explicit anchor keeps
-            # it alive for the figure's lifetime even if a caller drops its reference,
-            # rather than relying only on the transitive `_zlc_tools` -> bound-method ref.
-            self.fig._zlc_plotter = self
+        # Strong self-ref on the figure (confocal's `fig._live_plotter` pattern):
+        # the nb live loop / QTimer hold the plotter, but an explicit anchor keeps
+        # it alive for the figure's lifetime even if a caller drops its reference,
+        # rather than relying only on the transitive `_zlc_tools` -> bound-method ref.
+        self.fig._zlc_plotter = self
         self._shown = True
-        if self._external_ax is not None:
-            pass                         # the host GridPlot owns the canvas draw (one draw after focus)
-        elif display:
+        if display:
             display_figure(self.fig)
         else:
             self.fig.canvas.draw()
@@ -1460,14 +1443,17 @@ def panel_plot_spec(size: str = "2x2", *, kind: str = "default") -> FigureSpec:
 # per-cell size is DERIVED to fill the region after the gaps).  So a grid's data box equals a single-axes
 # panel's of the same size (part A: grid_data_px == panel_plot_spec(size).data_px), and a size change truly
 # rescales the cells, not just the padding.  The gaps scale with the size preset (cols/2 wide, rows/2 tall,
-# relative to the 2x2 baseline) so a bigger grid's inter-cell spacing grows with the cells.  ONE size rule.
+# relative to the 2x2 baseline) so a bigger grid's inter-cell spacing grows with the cells.  The OUTER
+# margins are :func:`panel_margins_px` -- the SAME margins every single-axes panel uses -- so the grid's
+# TOTAL figure px (data box + margins) EQUALS a same-size single-axes panel's to the pixel, and the grid
+# thumbnail's outer padding matches every other kind's card (#5).  ONE size rule, ONE margin source.
 def _site_grid_geometry(size: str = "2x2") -> tuple[tuple[int, int], int, int, tuple[int, int, int, int]]:
     rows, cols = panel_size_cells(size)
     wf, hf = cols / 2.0, rows / 2.0                       # gap scale factors vs the 2x2 baseline
     data_px = panel_plot_spec(size).data_px               # total data region == every other kind's at this size
     col_gap = round(_SITE_COL_GAP_PX * wf)
     row_gap = round(_SITE_ROW_GAP_PX * hf)
-    l, r, b, t = _SITE_GRID_MARGINS_PX                    # margins hold tick labels / outer axis label -- keep fixed
+    l, r, b, t = panel_margins_px()                       # SAME outer margins as a single-axes panel -> total px matches
     return data_px, col_gap, row_gap, (l, r, b, t)
 
 
@@ -1499,23 +1485,6 @@ def optimal_grid_size(nrows: int, ncols: int) -> str:
         return (abs(rh - want[0]) + abs(ch - want[1]), -(rh * ch))
 
     return min(PANEL_SIZES, key=_score)
-
-
-def _focus_axes_bounds(fig, size: str = "2x2") -> list[float]:
-    """The ``[left, bottom, width, height]`` fraction for a grid's FOCUSED single cell, chosen so its
-    absolute px margins equal :func:`panel_margins_px` -- the SAME margins a standalone single-axes panel
-    of this ``size`` uses -- expressed as a fraction of the current grid figure (which is NOT resized on
-    focus).  So the focused cell's x label / title get exactly a real panel's room and never clip; a
-    contract test asserts the resulting margins match ``panel_plot_spec(size)`` to the pixel."""
-    from .canvas import design_dpi
-
-    dpi = design_dpi(fig)
-    fig_w_px = float(fig.get_size_inches()[0]) * dpi
-    fig_h_px = float(fig.get_size_inches()[1]) * dpi
-    left, right, bottom, top = panel_margins_px()        # a focused cell is a plain single-axes panel
-    w_px = max(1.0, fig_w_px - left - right)
-    h_px = max(1.0, fig_h_px - bottom - top)
-    return [left / fig_w_px, bottom / fig_h_px, w_px / fig_w_px, h_px / fig_h_px]
 
 
 # The readability floor a pulse timeline needs in the size-preset DATA region: enough px PER ROW that a
@@ -2937,20 +2906,32 @@ class GridCell:
 
     The GridPlot owns everything generic (layout, focus-zoom, per-cell selectors,
     DataFigure plumbing); the cell only knows how to DRAW one panel and what its
-    threshold/DataFigure are.  ``draw(ax, k, detail=False)`` must work at any axes
-    size -- the same method draws the small grid cell AND the enlarged focus view,
-    which is exactly why the focus-zoom is plot-type-agnostic."""
+    threshold/DataFigure are.  ``draw(ax, k)`` draws the small grid THUMBNAIL; the
+    ENLARGED focus view is a STANDALONE ``panel_plot`` of the cell's own plot KIND
+    (``focus_kind`` + :meth:`focus_data`), never a hand-rolled copy -- which is
+    exactly why the focus-zoom is plot-type-agnostic.
+
+    A subclass declares which ``PLOT_KINDS`` key its enlarged view is
+    (``focus_kind`` -- ``"hist"`` for a distribution cell, ``"2d"`` for an image
+    cell) and supplies that cell's data as ``panel_plot`` kwargs (:meth:`focus_data`).
+    :meth:`GridPlot.build_focus_plotter` then dispatches through the ONE
+    ``PLOT_KIND_BY_KEY`` table, so a NEW cell family adds ONE ``focus_kind`` +
+    ``focus_data`` (never a bespoke figure) -- the SAME plot the standalone panel of
+    that kind uses, so its lim / fit / threshold-drag all work on the standard path."""
 
     n_cells: int = 0
+    #: The ``PLOT_KINDS`` key of this cell's ENLARGED (focused) standalone view -- the SINGLE source the
+    #: focus-swap dispatches on (never a hard-coded class).  Subclasses set it ("hist" / "2d" / ...).
+    focus_kind: str = "hist"
 
     def prepare(self) -> None:
         """Compute any shared state (e.g. common histogram bin edges) once."""
 
     def draw(self, ax, k: int):
         """Draw the THUMBNAIL of cell ``k`` into ``ax`` -- the compact grid-cell view (a corner tag, hidden
-        axes; the SHAPE is the point).  The ENLARGED focus view is a full plot-kind figure built by
-        :meth:`focus_plotter`, NOT a detail flag on this draw.  Return the cell's draggable threshold line
-        or ``None``."""
+        axes; the SHAPE is the point).  The ENLARGED focus view is a STANDALONE ``panel_plot`` of this cell's
+        :data:`focus_kind`, built from :meth:`focus_data`, NOT a detail flag on this draw.  Return the cell's
+        draggable threshold line or ``None``."""
         raise NotImplementedError
 
     def threshold_line(self, k: int):
@@ -2963,15 +2944,14 @@ class GridCell:
         """The per-cell :class:`DataFigure` (reusable fitting stack)."""
         raise NotImplementedError
 
-    def focus_plotter(self, fig, ax, k: int, *, display_params: Mapping[str, Any] | None = None):
-        """The FULL plot-kind figure for the ENLARGED (focused) cell ``k``, rendered onto ``ax`` (the
-        grid's focus axes) -- NOT the simplified thumbnail :meth:`draw`.  A subclass returns a real
-        :class:`BaseLivePlot` of the matching kind (a :class:`HistogramFigure` for a distribution cell, a
-        :class:`Live2DDis` for an image cell) built with ``external_ax=ax`` + ``interactions=True``, so the
-        enlarged cell IS a standalone plot: draggable threshold that live-updates fidelity, the fit chooser,
-        full x/y axes and margins -- reusing the ONE plot-kind renderer instead of a hand-rolled copy
-        (part B).  ``display_params`` are the grid's live display knobs (bins / fit / ylog) applied to the
-        focused figure so a Setting change reaches the enlarged cell.  Returns the built plotter."""
+    def focus_data(self, k: int, *, display_params: Mapping[str, Any] | None = None) -> dict:
+        """The ``panel_plot`` args for the STANDALONE enlarged view of cell ``k``: ``{"data_x": ..., "data_y":
+        ..., ...kind-specific kwargs...}`` merged into ``panel_plot(kind=self.focus_kind, size=..., **here)``
+        by :meth:`GridPlot.build_focus_plotter`.  A distribution cell returns its sample vector + bins / fit /
+        threshold; an image cell returns the pixel-coordinate scatter + cmap.  ``display_params`` are the
+        grid's live display knobs (bins / fit / ylog / cmap) folded in, so a Setting change reaches the
+        enlarged cell.  Because the result is a REAL standalone ``panel_plot`` of ``focus_kind``, the enlarged
+        cell carries that kind's full x/y axes, draggable threshold, fit and standard relim -- no bespoke code."""
         raise NotImplementedError
 
 
@@ -2981,6 +2961,8 @@ class HistogramCell(GridCell):
     ``per_site_values`` is ``(n, n_samples)`` or a list of 1D arrays; ``occupied``
     colours dark/bright populations; ``thresholds`` draws a draggable cut;
     ``site_fidelities`` annotates each cell."""
+
+    focus_kind = "hist"          # the enlarged cell is a standalone ``hist`` panel (HistogramFigure)
 
     def __init__(self, per_site_values, *, occupied=None, thresholds=None,
                  site_fidelities=None, bins: int = 36, labels: Sequence[str] = ("Signal", "Shots")):
@@ -3017,7 +2999,7 @@ class HistogramCell(GridCell):
 
     def draw(self, ax, k: int):
         """The compact grid THUMBNAIL of cell ``k`` (corner tag, hidden counts axis; the SHAPE is the
-        point).  The enlarged focus view is a full :class:`HistogramFigure` -- see :meth:`focus_plotter`."""
+        point).  The enlarged focus view is a standalone ``hist`` panel (:class:`HistogramFigure`) -- see :meth:`focus_data`."""
         if self.edges is None:
             self.prepare()
         edges = self.edges
@@ -3072,32 +3054,30 @@ class HistogramCell(GridCell):
             thr = float(np.nanmedian(finite)) if finite.size else 0.0
         return (vals > thr).astype(int)
 
-    def focus_plotter(self, fig, ax, k: int, *, display_params: Mapping[str, Any] | None = None):
-        """The enlarged focus view of a distribution cell = a FULL :class:`HistogramFigure` on ``ax`` (part
-        B): the SAME class the standalone ``hist`` panel uses, so it carries the draggable threshold that
-        live-updates the fidelity readout, the two-Gaussian fit + fidelity stat, the fit chooser and the full
-        x/y axes -- NOT the simplified thumbnail :meth:`draw`.  The grid's per-cell values / threshold /
-        fidelity seed it, and the grid's live display knobs (``bins`` / ``fit`` / ``ylog``) are applied so a
-        Setting change reaches the enlarged cell.  A drag of the focus threshold is mirrored back onto the
-        cell (so the grid thumbnail + the save's recipe pick up the new cut)."""
+    def focus_data(self, k: int, *, display_params: Mapping[str, Any] | None = None) -> dict:
+        """The ``panel_plot(kind="hist")`` args for the STANDALONE enlarged view of distribution cell ``k`` --
+        the SAME ``hist`` panel a standalone histogram uses, so the enlarged cell carries the draggable
+        threshold that live-updates the fidelity readout, the two-Gaussian fit + fidelity stat, the fit chooser
+        and full x/y axes -- reusing the ONE plot-kind renderer (never a hand-rolled copy).  The grid's
+        per-cell values / threshold / fidelity seed it, and the grid's live display knobs (``bins`` / ``fit`` /
+        ``ylog``) are folded in so a Setting change reaches the enlarged cell.  :meth:`GridPlot.build_focus_plotter`
+        merges this into ``panel_plot``; a drag of the enlarged threshold is mirrored back onto the cell by
+        :meth:`sync_threshold_from_focus` (so the grid thumbnail + the save recipe pick up the new cut)."""
         params = dict(display_params or {})
         thr = None
         if self.thresholds is not None and np.isfinite(self.thresholds[k]):
             thr = [float(self.thresholds[k])]
         fid = self.site_fidelities
         ftxt = "" if (fid is None or not np.isfinite(fid[k])) else f"   F={fid[k] * 100:.1f}%"
-        hist = HistogramFigure(
-            self.values[k],
-            bins=int(params.get("bins", self.bins_arg)),
-            thresholds=thr,
-            fit=str(params.get("fit", "double")),
-            ylog=bool(params.get("ylog", False)),
-            labels=(self.labels[0], self.labels[1] if len(self.labels) > 1 else "Shots", "Population"),
-            title=f"site {k}{ftxt}",
-            external_ax=ax,
-            interactions=True,
-        ).show(display=False)
-        return hist
+        return {
+            "data_x": self.values[k],                    # hist reads data_x as the values array (plot() convention)
+            "bins": int(params.get("bins", self.bins_arg)),
+            "thresholds": thr,
+            "fit": str(params.get("fit", "double")),
+            "ylog": bool(params.get("ylog", False)),
+            "labels": (self.labels[0], self.labels[1] if len(self.labels) > 1 else "Shots", "Population"),
+            "title": f"site {k}{ftxt}",
+        }
 
     def sync_threshold_from_focus(self, k: int, focus_plotter) -> None:
         """After the operator dragged the FOCUS view's threshold, copy the resulting cut back onto cell
@@ -3125,6 +3105,8 @@ class ImageCell(GridCell):
     cut, so it contributes the zoom/pan/area/cross selectors but no draggable threshold
     line -- exactly the ``Image2DCell`` the :class:`GridCell` docstring reserves."""
 
+    focus_kind = "2d"            # the enlarged cell is a standalone ``2d`` panel (Live2DDis)
+
     def __init__(self, images, *, labels: Sequence[str] = ("x (px)", "y (px)")):
         self.images = [np.asarray(im, dtype=float) for im in images]
         self.n_cells = len(self.images)
@@ -3141,7 +3123,7 @@ class ImageCell(GridCell):
 
     def draw(self, ax, k: int):
         """The compact grid THUMBNAIL of kernel cell ``k`` (a corner tag, no ticks; the kernel SHAPE is the
-        point).  The enlarged focus view is a full :class:`Live2DDis` -- see :meth:`focus_plotter`."""
+        point).  The enlarged focus view is a standalone ``2d`` panel (:class:`Live2DDis`) -- see :meth:`focus_data`."""
         ax.imshow(self.images[k], origin="lower", cmap=PALETTE["cmap_camera"],
                   vmin=0.0, vmax=self.vmax, aspect="equal")
         # The tag sits ON the image, so a plain dark label vanishes on the dark corner -- draw it light (the
@@ -3163,27 +3145,27 @@ class ImageCell(GridCell):
         return DataFigure(fig=fig, ax=ax, data_x=np.arange(flat.size, dtype=float),
                           data_y=flat, labels=self.labels, name=f"site{k}_psf")
 
-    def focus_plotter(self, fig, ax, k: int, *, display_params: Mapping[str, Any] | None = None):
-        """The enlarged focus view of a kernel (image) cell = a FULL :class:`Live2DDis` on ``ax`` (part B):
-        the SAME class the standalone ``2d`` panel uses, so the enlarged kernel carries the side clim
-        distribution, the colorbar, the draggable clim lines and full x/y pixel axes -- NOT the simplified
-        thumbnail :meth:`draw`.  The image's pixel grid is unpacked into the ``(N, 2)`` coordinate scatter
-        + value column ``Live2DDis`` consumes (the SAME convention the console's ``2d`` panel uses).  The
-        cmap can be overridden by the grid's ``colorset`` display param."""
+    def focus_data(self, k: int, *, display_params: Mapping[str, Any] | None = None) -> dict:
+        """The ``panel_plot(kind="2d")`` args for the STANDALONE enlarged view of kernel cell ``k`` -- the SAME
+        ``2d`` panel a standalone image uses, so the enlarged kernel carries the side clim distribution, the
+        colorbar, the draggable clim lines and full x/y pixel axes -- reusing the ONE plot-kind renderer (never
+        a hand-rolled copy).  The image's pixel grid is unpacked into the ``(N, 2)`` coordinate scatter + value
+        column ``Live2DDis`` consumes (the SAME convention the console's ``2d`` panel uses).  The cmap can be
+        overridden by the grid's ``cmap`` / ``colorset`` display param.  :meth:`GridPlot.build_focus_plotter`
+        merges this into ``panel_plot``."""
         params = dict(display_params or {})
         im = self.images[k]
         ny, nx = im.shape
         xx, yy = np.meshgrid(np.arange(nx, dtype=float), np.arange(ny, dtype=float))
         data_x = np.column_stack([xx.ravel(), yy.ravel()])
         cmap = str(params.get("cmap") or params.get("colorset") or PALETTE["cmap_camera"])
-        return Live2DDis(
-            data_x, im.ravel(),
-            cmap=cmap, square=True,
-            labels=(self.labels[0], self.labels[1] if len(self.labels) > 1 else "y (px)", "weight"),
-            title=f"site {k}",
-            external_ax=ax,
-            interactions=True,
-        ).show(display=False)
+        return {
+            "data_x": data_x,
+            "data_y": im.ravel(),
+            "cmap": cmap,
+            "labels": (self.labels[0], self.labels[1] if len(self.labels) > 1 else "y (px)", "weight"),
+            "title": f"site {k}",
+        }
 
 
 class _GridData:
@@ -3288,9 +3270,9 @@ class GridPlot(BaseLivePlot):
         super().__init__(np.arange(self.n_cells), labels=labels, smart_ticks=False, **kwargs)
         self.site_axes: list = []
         self._cell_interactions: list = []
-        self.focus_ax = None
         self._focused: int | None = None
-        self._focus_tools = None
+        # The STANDALONE plot-kind figure a focused cell is enlarged into (a HistogramFigure / Live2DDis built
+        # by :meth:`build_focus_plotter` onto this grid's own canvas); ``None`` when showing the grid.
         self._focus_plotter: BaseLivePlot | None = None
         # The grid's live DISPLAY knobs (bins / fit / ylog / colorset), applied to a focused cell's full
         # plot-kind figure and re-drawn onto the thumbnails.  Empty = the per-cell defaults.  A saved grid
@@ -3337,8 +3319,17 @@ class GridPlot(BaseLivePlot):
         self.fig._zlc_state = PlotState(plot_type=self.plot_type)
 
     def _attach_interactions(self) -> None:
-        # Every cell gets the SAME selector bundle a standalone plot does (area +
-        # cross + zoom + draggable threshold), filtered by event.inaxes.
+        self._attach_cell_selectors()
+        # Focus-zoom: double-click a cell to enlarge it; double-click / Esc to return.  Connected to the
+        # CANVAS (which persists across a focus, since the notebook path swaps the figure CONTENT in place),
+        # so a double-click on the enlarged view returns to the grid.  Idempotent: only connect once.
+        self._connect_focus_zoom()
+
+    def _attach_cell_selectors(self) -> None:
+        """Build the per-cell selector bundle (area + cross + zoom + draggable threshold) -- the SAME bundle a
+        standalone plot has, filtered by ``event.inaxes``.  Separate from the focus-zoom connection so the grid
+        can rebuild its cell selectors on unfocus WITHOUT re-connecting (and double-firing) the canvas-level
+        double-click handler."""
         self._cell_interactions = []
         for k, ax in enumerate(self.site_axes):
             area = AreaSelector(ax)
@@ -3354,7 +3345,13 @@ class GridPlot(BaseLivePlot):
         # keeps the figure, not necessarily the object) -- otherwise "no selector".
         self.fig._zlc_tools = self.tools
         self.fig._zlc_grid_tools = self._cell_interactions
-        # Focus-zoom: double-click a cell to enlarge it; double-click / Esc to return.
+
+    def _connect_focus_zoom(self) -> None:
+        """Connect the canvas-level double-click / Esc focus-zoom handlers ONCE (idempotent).  The canvas
+        persists across a focus (the notebook path clears + rebuilds the figure content on the SAME canvas),
+        so these stay live -- a double-click on the enlarged view calls :meth:`unfocus`."""
+        if getattr(self, "_click_cid", None) is not None:
+            return
         self._click_cid = self.fig.canvas.mpl_connect("button_press_event", self._on_click)
         self._key_cid = self.fig.canvas.mpl_connect("key_press_event", self._on_key)
 
@@ -3380,76 +3377,66 @@ class GridPlot(BaseLivePlot):
         else:
             self.unfocus()
 
-    def _set_grid_areas_active(self, active: bool) -> None:
-        """Clear and (de)activate every grid cell's area selector.  Clearing wipes
-        the residual selection box the focus double-click leaves on a cell (it would
-        otherwise reappear when the grid returns); deactivating stops hidden cells
-        reacting while focused."""
-        for bundle in self._cell_interactions:
-            area = getattr(bundle, "area", None)
-            if area is None:
-                continue
-            try:
-                area.clear()
-                area.selector.set_active(active)
-            except Exception:
-                pass
-
     def _on_key(self, event) -> None:
         if getattr(event, "key", None) == "escape" and self._focused is not None:
             self.unfocus()
 
-    def focus(self, k: int) -> None:
-        """Enlarge cell ``k`` to fill the figure as a FULL plot-kind figure (part B) -- call again or
-        :meth:`unfocus` to return to the grid.
+    def build_focus_plotter(self, k: int, *, size: str = "2x2", interactions: bool = True,
+                            fig: "plt.Figure | None" = None, **view) -> "BaseLivePlot":
+        """Build the STANDALONE plot-kind figure for the enlarged cell ``k`` (part B) -- the ONE reusable
+        focus builder both surfaces call.
 
-        The enlarged cell is NOT a simplified thumbnail: :meth:`GridCell.focus_plotter` builds the SAME
-        plot-kind the standalone panel uses (a :class:`HistogramFigure` for a distribution cell, a
-        :class:`Live2DDis` for a kernel cell) ON the focus axes, so it carries the draggable threshold that
-        live-updates the fidelity readout, the fit + fit chooser and full x/y axes -- reusing the ONE
-        renderer.  The grid's live display knobs (``bins`` / ``fit`` / ``ylog`` / ``colorset``) are passed
-        through so a Setting change reaches the enlarged cell.  The figure is NOT resized (a visibility flip
-        + one draw), and the focus plotter attaches its OWN selectors, which the grid captures as its tools."""
+        The enlarged cell is a REAL ``panel_plot`` of the cell's own KIND, dispatched through the ONE
+        ``PLOT_KIND_BY_KEY`` table off :data:`GridCell.focus_kind` (``"hist"`` -> a :class:`HistogramFigure`,
+        ``"2d"`` -> a :class:`Live2DDis`) -- never a hard-coded class and never a hand-rolled copy.  So the
+        enlarged cell is EXACTLY a standalone panel of that kind: the standard ``size`` geometry (default the
+        stock ``2x2``), the full x/y axes, the draggable threshold that live-updates fidelity, the fit chooser
+        and the STANDARD relim path (``relim_mode`` / ``fixed_lo`` / ``fixed_hi`` via ``**view``) -- so a lim
+        change takes effect and never bounces back to a thumbnail, with no bespoke focus code.
+
+        The cell supplies its data as ``panel_plot`` args (:meth:`GridCell.focus_data`), with the grid's live
+        display knobs (bins / fit / ylog / cmap) folded in.  ``fig`` builds it ONTO an existing figure (the
+        notebook path swaps it into the grid's own canvas); ``None`` builds a fresh figure (the console path,
+        which embeds it in a new canvas)."""
+        pk = PLOT_KIND_BY_KEY.get(str(self.cell_renderer.focus_kind))
+        if pk is None:                                   # a cell family whose focus_kind is not a real panel kind
+            raise ValueError(
+                f"grid cell {type(self.cell_renderer).__name__}.focus_kind="
+                f"{self.cell_renderer.focus_kind!r} is not a known PLOT_KINDS panel kind")
+        data = dict(self.cell_renderer.focus_data(int(k), display_params=self._display_params))
+        data_x = data.pop("data_x")
+        data_y = data.pop("data_y", None)
+        return panel_plot(data_x, data_y, kind=pk.key, size=size, interactions=interactions,
+                          fig=fig, **view, **data)
+
+    def focus(self, k: int) -> None:
+        """Enlarge cell ``k`` to a FULL standalone plot-kind figure ON THE GRID'S OWN CANVAS (part B) -- call
+        again or :meth:`unfocus` to return to the grid.  This is the NOTEBOOK / bare-figure path; inside a
+        TaskConsole the host (``PanelCard``) builds the SAME :meth:`build_focus_plotter` into its own canvas.
+
+        The enlarged cell is NOT a simplified thumbnail: it is a real ``panel_plot`` of the cell's KIND (a
+        :class:`HistogramFigure` for a distribution cell, a :class:`Live2DDis` for a kernel cell) built onto
+        the grid's figure via :meth:`build_focus_plotter`, so it carries the draggable threshold that
+        live-updates the fidelity readout, the fit chooser, full x/y axes and the STANDARD relim path -- a lim
+        change sticks and never bounces back.  Since a grid's total figure px equals a same-size single-axes
+        panel's (#5), building the ``2x2`` standalone view onto this figure is seamless (no resize jump)."""
         if self._focused is not None:
             self.unfocus()
         k = int(k)
-        for ax in self.axes:
-            ax.set_visible(False)
-        # Hide the grid's OUTER labels/title while focused, so the enlarged cell's
-        # own xlabel/ylabel/title do not collide / double up with them.
-        self._hidden_texts = [t for t in self.fig.texts if t.get_visible()]
-        for t in self._hidden_texts:
-            t.set_visible(False)
-        self._set_grid_areas_active(False)   # no residual box from the focus double-click
-        # The focused cell fills the figure with the SAME margins a single-axes panel of this size uses
-        # (panel_margins_px), expressed as a FRACTION of the current grid figure -- so the enlarged cell's
-        # x label / y label / title sit in exactly the room a standalone same-size panel gives them and
-        # NEVER clip, while the figure is NOT resized (focus is a visibility flip + one draw, not a
-        # rebuild).  ONE margin source (panel_margins_px) shared with every real panel.
-        bounds = _focus_axes_bounds(self.fig, self._size)
-        self.focus_ax = self.fig.add_axes(bounds)
-        # Record the focus region as the figure's fixed data box so a composite focus plot (Live2DDis,
-        # which subdivides its data box into image | side-dist | colorbar via split_axes_horizontally) has
-        # the bounds it needs.  A single-axes focus (HistogramFigure) ignores it.  Restored on unfocus.
-        fw_in = float(self.fig.get_size_inches()[0])
-        fh_in = float(self.fig.get_size_inches()[1])
-        self._saved_fixed_box = (getattr(self.fig, "_zlc_fixed_box_in", None),
-                                 getattr(self.fig, "_zlc_fixed_bounds_frac", None))
-        self.fig._zlc_fixed_box_in = (bounds[2] * fw_in, bounds[3] * fh_in)
-        self.fig._zlc_fixed_bounds_frac = (bounds[0], bounds[1], bounds[2], bounds[3])
-        self._focus_plotter = self.cell_renderer.focus_plotter(
-            self.fig, self.focus_ax, k, display_params=self._display_params)
-        # The focus plotter attached its OWN selectors on the focus axes (interactions=True); adopt them as
-        # the grid's active tools so zoom / drag work in the enlarged view.  Its own axes list (a Live2DDis
-        # split its focus_ax into image|dist|cbar) is on the plotter; the grid keeps the primary handle.
-        self._focus_tools = getattr(self._focus_plotter, "tools", None)
-        if self._focus_tools is not None:
-            self.fig._zlc_tools = self._focus_tools
+        # Tear down the grid's per-cell selectors + clear the figure, then build the standalone plot-kind view
+        # ONTO the same figure (fig=self.fig) so it lives in the grid's own canvas -- a genuine standalone
+        # panel_plot, not an axes overlay.  The canvas-level focus-zoom double-click / Esc handlers STAY
+        # connected (they live on the persistent canvas), so a double-click on the enlarged view returns to
+        # the grid.  The 2x2 preset is the stock single-axes panel size.
+        self._teardown_cell_selectors()
+        self.fig.clear()
+        self._focus_plotter = self.build_focus_plotter(
+            k, size="2x2", interactions=self.interactions, fig=self.fig)
         self._focused = k
         self.draw()
 
     def unfocus(self) -> None:
-        """Return from the enlarged single-cell view to the grid."""
+        """Return from the enlarged single-cell view to the grid (rebuild the grid onto the same figure)."""
         if self._focused is None:
             return
         # A focus-view threshold drag is copied back onto the cell (the single source the grid thumbnail +
@@ -3459,35 +3446,37 @@ class GridPlot(BaseLivePlot):
         for handler in self.interaction_handles_of(self._focus_plotter):
             if hasattr(handler, "destroy"):
                 handler.destroy()
-        # Remove the focus axes AND any sub-axes a COMPOSITE focus plot split off (a Live2DDis splits its
-        # focus_ax into image | side-distribution | colorbar), so none linger when the grid returns.
-        if self.focus_ax is not None:
-            to_delete = {self.focus_ax}
-            for name in ("axdis", "cax"):
-                sub = getattr(self._focus_plotter, name, None)
-                if sub is not None:
-                    to_delete.add(sub)
-            for ax in to_delete:
-                if ax in self.fig.axes:
-                    self.fig.delaxes(ax)
-            self.focus_ax = None
         self._focus_plotter = None
-        self._focus_tools = None
         self._focused = None
-        # restore the grid's own fixed data box (the focus temporarily repointed it at the focus region)
-        box, frac = getattr(self, "_saved_fixed_box", (None, None))
-        if box is not None:
-            self.fig._zlc_fixed_box_in = box
-        if frac is not None:
-            self.fig._zlc_fixed_bounds_frac = frac
-        for ax in self.site_axes:
-            ax.set_visible(True)
-        for t in getattr(self, "_hidden_texts", []):    # restore the grid's outer labels/title
-            t.set_visible(True)
-        self._hidden_texts = []
-        self._set_grid_areas_active(True)               # re-arm grid area selectors, residue cleared
-        self.fig._zlc_tools = self.tools
+        self._rebuild_grid()                            # redraw the grid onto the same figure
         self.draw()
+
+    def _teardown_cell_selectors(self) -> None:
+        """Destroy the grid's PER-CELL selectors so the cleared figure carries no stale per-axes callbacks
+        when the standalone focus view is built onto it.  The canvas-level focus-zoom double-click / Esc
+        handlers are LEFT connected (they persist across the focus so the enlarged view can return)."""
+        for handler in self.interaction_handles():
+            if hasattr(handler, "destroy"):
+                try:
+                    handler.destroy()
+                except Exception:
+                    pass
+        self._cell_interactions = []
+        self.fig._zlc_tools = None
+        self.fig._zlc_grid_tools = None
+
+    def _rebuild_grid(self) -> None:
+        """Redraw the GRID onto the (cleared) figure -- the return leg of :meth:`unfocus`.  Replays the SAME
+        lifecycle steps ``show`` runs for the grid (axes -> cells -> outer labels -> per-cell selectors), so
+        the returned grid is identical to a fresh one, with its cells / thumbnails / selectors back.  The
+        canvas-level focus-zoom handlers were never disconnected (idempotent :meth:`_connect_focus_zoom`)."""
+        self.fig.clear()
+        self.ax = self._create_axes()
+        self.init_core()
+        self._apply_title()
+        self._install_state()
+        if self.interactions:
+            self._attach_interactions()
 
     @staticmethod
     def interaction_handles_of(plotter) -> list:
@@ -3515,8 +3504,8 @@ class GridPlot(BaseLivePlot):
             self.cell_renderer.prepare()
             if self._focused is None:                    # only redraw thumbnails when not zoomed in
                 self._redraw_thumbnails()
-        # Apply to the focused full figure in place (HistogramFigure / Live2DDis apply_param), else it takes
-        # effect the next time a cell is focused (the stored param seeds focus_plotter).
+        # Apply to the focused STANDALONE figure in place (HistogramFigure / Live2DDis apply_param), else it
+        # takes effect the next time a cell is focused (the stored param seeds build_focus_plotter's focus_data).
         if self._focused is not None and self._focus_plotter is not None:
             if not self._focus_plotter.apply_param(str(key), value):
                 # a knob the focus plotter cannot apply in place -> rebuild the focus view with it

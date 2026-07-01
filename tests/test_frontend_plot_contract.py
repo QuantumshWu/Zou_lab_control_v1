@@ -155,37 +155,47 @@ def test_site_grid_exposes_per_cell_selectors_and_fitting():
 
 
 def test_grid_focus_zoom_enlarges_one_cell_and_returns():
-    """Multi-panel zoom = focus one cell: focus(k) enlarges it to fill the figure
-    (full selectors), unfocus()/double-click returns to the grid."""
+    """Multi-panel zoom = focus one cell: a double-click enlarges the cell into its STANDALONE plot-kind
+    figure (a real HistogramFigure swapped onto the grid's own canvas), and a double-click / Esc on the
+    enlarged view returns to the grid.  A non-left double-click (scroll wheel / middle button) must NOT
+    toggle focus."""
     import numpy as np
 
     from matplotlib.backend_bases import MouseEvent
+    from Zou_lab_control.frontend.live import HistogramFigure
 
     rng = np.random.default_rng(3)
     sites = [np.concatenate([rng.normal(3, 1, 50), rng.normal(40, 3, 60)]) for _ in range(6)]
     g = zf.site_histogram_grid(sites, thresholds=[20.0] * 6, display=False)
     try:
-        assert g.focus_ax is None and g._focused is None
-        g.focus(2)                                              # enlarge cell 2
-        assert g._focused == 2 and g.focus_ax is not None
-        assert all(not ax.get_visible() for ax in g.site_axes)  # grid hidden
-        assert g._focus_tools.zoom is not None                  # enlarged cell has its own selectors
-        # grid area selectors are suspended while focused (no residual box on return)
-        assert all(not b.area.selector.active for b in g._cell_interactions)
+        assert g._focused is None and g._focus_plotter is None
+        cell_axes = list(g.site_axes)
 
-        # a NON-left double-click (scroll wheel / middle button) must NOT exit focus
         def _dbl(ax, button):
             e = MouseEvent("button_press_event", g.fig.canvas, *ax.transData.transform((20, 1)))
             e.dblclick, e.button, e.inaxes = True, button, ax
             g.fig.canvas.callbacks.process("button_press_event", e)
-        _dbl(g.focus_ax, 2)
-        assert g._focused == 2                                  # middle double-click did not exit
-        _dbl(g.focus_ax, 1)
-        assert g._focused is None and g.focus_ax is None        # left double-click returns to grid
+
+        # a NON-left double-click on a cell must NOT enter focus
+        _dbl(cell_axes[2], 2)
+        assert g._focused is None, "a middle/scroll double-click must not focus"
+
+        # a LEFT double-click on cell 2 enlarges it into a standalone HistogramFigure
+        _dbl(cell_axes[2], 1)
+        assert g._focused == 2
+        assert isinstance(g._focus_plotter, HistogramFigure), "focus is a real standalone plot kind"
+        assert g._focus_plotter.interaction_handles(), "the enlarged cell has its own selectors"
+        assert g._focus_plotter.ax.get_xlabel() and g._focus_plotter.ax.get_ylabel()
+
+        # a middle double-click on the enlarged view must NOT exit focus
+        _dbl(g._focus_plotter.ax, 2)
+        assert g._focused == 2
+
+        # a LEFT double-click on the enlarged view returns to the grid (cells + thumbnails back)
+        _dbl(g._focus_plotter.ax, 1)
+        assert g._focused is None and g._focus_plotter is None
         assert all(ax.get_visible() for ax in g.site_axes)
-        # grid area selectors re-armed AND cleared of any residue
-        assert all(b.area.selector.active and b.area.range == [None, None, None, None]
-                   for b in g._cell_interactions)
+        assert getattr(g.fig, "_zlc_grid_tools", None), "the grid's per-cell selectors are re-attached"
     finally:
         plt.close(g.fig)
 

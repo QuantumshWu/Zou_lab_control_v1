@@ -4,8 +4,10 @@ These pin the invariants of the size-unification round:
 
 1. a pulse / grid panel's DATA region scales with the ``size`` preset (2x2 vs 4x4 differ), exactly like
    the single-axes kinds -- the size preset carries the content density, not a bespoke content-inches;
-2. a grid's FOCUSED cell fills a data box with the SAME absolute margins a same-size single-axes panel
-   uses (``panel_margins_px``), so its x/y label + title never clip -- asserted to the pixel;
+2. a grid's TOTAL figure px (data box + OUTER margins) EQUALS a same-size single-axes panel's to the pixel
+   (#5, ONE ``panel_margins_px`` source), and a FOCUSED cell IS a standalone ``panel_plot`` of the cell's
+   KIND (dispatched generically off ``focus_kind`` through ``PLOT_KIND_BY_KEY`` -- hist -> HistogramFigure,
+   image -> Live2DDis), so its lim edit sticks and never bounces back to the thumbnail;
 3. a Monitor-card pulse / grid plotter is display-only (``interactions is False`` -> no selectors);
 4. ``optimal_pulse_size`` is the ONE default-size source (the preview default and the loaded-panel default
    both derive from it), and a pulse's default tracks its drawn-row / period counts;
@@ -153,10 +155,10 @@ def test_optimal_grid_size_is_the_4_cell_boundary_default():
 
 
 def test_grid_focus_is_a_full_plot_kind_not_a_thumbnail():
-    """A grid's FOCUSED (enlarged) cell is a FULL plot-kind figure (part B), NOT the simplified thumbnail:
-    focusing a distribution cell builds a real :class:`HistogramFigure` on the focus axes -- so it carries a
-    DRAGGABLE threshold, the two-Gaussian fit, the fidelity stat text and full x/y axes -- and unfocus tears
-    it down cleanly (the focus axes + any composite sub-axes removed, the grid cells back)."""
+    """A grid's FOCUSED (enlarged) cell is a FULL standalone plot-kind figure (part B), NOT the simplified
+    thumbnail: focusing a distribution cell builds a real :class:`HistogramFigure` (its OWN standard panel
+    figure) -- so it carries a DRAGGABLE threshold, the two-Gaussian fit and full x/y axes -- and unfocus
+    rebuilds the grid cleanly (the grid cells back)."""
     recipe = _grid_recipe()
     g = build_grid_figure(recipe, size="2x2", display=False)
     n_axes_grid = len(g.fig.axes)
@@ -169,25 +171,69 @@ def test_grid_focus_is_a_full_plot_kind_not_a_thumbnail():
     assert fp.ax.get_xlabel() and fp.ax.get_ylabel(), "the focused cell has full x/y axis labels"
     assert fp.interaction_handles(), "the focused cell attaches its own selectors (reusable layer)"
     g.unfocus()
-    assert g._focused is None and g.focus_ax is None, "unfocus returns to the grid"
-    assert len(g.fig.axes) == n_axes_grid, "unfocus removes the focus axes + any composite sub-axes"
+    assert g._focused is None and g._focus_plotter is None, "unfocus returns to the grid"
+    assert len(g.fig.axes) == n_axes_grid, "unfocus rebuilds the grid (its cell axes back)"
     assert all(ax.get_visible() for ax in g.site_axes), "the grid cells are visible again"
     plt.close(g.fig)
 
 
+def test_grid_focus_dispatches_by_cell_kind_generically():
+    """Focus dispatch is GENERIC through the ONE ``PLOT_KIND_BY_KEY`` table off each cell's ``focus_kind``
+    (never a hard-coded class): a HIST grid focuses into a :class:`HistogramFigure` AND an IMAGE grid focuses
+    into a :class:`Live2DDis` -- proving the SAME builder resolves the right standalone plot kind per cell."""
+    from Zou_lab_control.frontend.live import (
+        GridPlot, HistogramCell, ImageCell, Live2DDis, PLOT_KIND_BY_KEY,
+    )
+    rng = np.random.default_rng(3)
+    # a hist grid -> HistogramFigure
+    per = [np.concatenate([rng.normal(200, 25, 40), rng.normal(1200, 70, 40)]) for _ in range(4)]
+    gh = GridPlot(HistogramCell(per, thresholds=[700.0] * 4), grid_shape=(2, 2), size="2x2").show(display=False)
+    assert gh.cell_renderer.focus_kind == "hist" and PLOT_KIND_BY_KEY["hist"].cls is HistogramFigure
+    gh.focus(0)
+    assert isinstance(gh._focus_plotter, HistogramFigure), "hist cell -> standalone HistogramFigure"
+    gh.unfocus(); plt.close(gh.fig)
+    # an image grid -> Live2DDis (the SAME focus() path, only the cell's focus_kind differs)
+    imgs = [rng.random((9, 9)) for _ in range(4)]
+    gi = GridPlot(ImageCell(imgs), grid_shape=(2, 2), size="2x2").show(display=False)
+    assert gi.cell_renderer.focus_kind == "2d" and PLOT_KIND_BY_KEY["2d"].cls is Live2DDis
+    gi.focus(1)
+    assert isinstance(gi._focus_plotter, Live2DDis), "image cell -> standalone Live2DDis"
+    gi.unfocus(); plt.close(gi.fig)
+
+
 # --------------------------------------------------------------------------- 2. focus == same-size panel
-@pytest.mark.parametrize("size", ["1x2", "2x2", "4x4"])
-def test_grid_focus_cell_margins_equal_same_size_panel(size):
-    """A focused grid cell's absolute px margins EQUAL ``panel_margins_px`` -- the SAME margins a
-    standalone single-axes panel of this size uses -- so the enlarged cell's x/y label never clips."""
+@pytest.mark.parametrize("size", ["2x2", "4x4"])
+def test_grid_total_px_equals_same_size_single_axes_panel(size):
+    """#5: a grid's TOTAL figure px (data box + OUTER margins) EQUALS a same-size single-axes panel's to the
+    pixel -- not just the data_px.  The grid's outer margins are the ONE ``panel_margins_px`` source (no
+    bespoke grid-margin tuple), so the grid thumbnail's padding matches every other kind's card."""
+    from Zou_lab_control.frontend.live import panel_plot
+
+    def _total_px(fig):
+        dpi = design_dpi(fig)
+        w, h = fig.get_size_inches()
+        return round(w * dpi), round(h * dpi)
+
     recipe = _grid_recipe()
     g = build_grid_figure(recipe, size=size, display=False)
+    panel = panel_plot(np.linspace(0, 1, 50), kind="hist", size=size)   # a standalone same-size hist panel
+    assert _total_px(g.fig) == _total_px(panel.fig), \
+        f"grid {size} total px {_total_px(g.fig)} != same-size panel {_total_px(panel.fig)}"
+    plt.close(g.fig); plt.close(panel.fig)
+
+
+def test_grid_focus_cell_is_a_standalone_same_size_panel(size="2x2"):
+    """A focused cell is EXACTLY a standalone ``panel_plot`` of its kind at the stock ``2x2`` size, so its
+    absolute px margins EQUAL ``panel_margins_px`` -- the SAME as a real single-axes panel -- WITHOUT any
+    bespoke focus-bounds code (it just IS a panel_plot).  Asserted on the focus plotter's own axes."""
+    recipe = _grid_recipe()
+    g = build_grid_figure(recipe, size="4x4", display=False)   # grid at 4x4; focus opens at the stock 2x2
     g.focus(0)
-    fa = g.focus_ax
-    dpi = design_dpi(g.fig)
-    fw = float(g.fig.get_size_inches()[0]) * dpi
-    fh = float(g.fig.get_size_inches()[1]) * dpi
-    pos = fa.get_position()
+    fp = g._focus_plotter
+    dpi = design_dpi(fp.fig)
+    fw = float(fp.fig.get_size_inches()[0]) * dpi
+    fh = float(fp.fig.get_size_inches()[1]) * dpi
+    pos = fp.ax.get_position()
     got = (round(pos.x0 * fw), round(fw - (pos.x0 + pos.width) * fw),
            round(pos.y0 * fh), round(fh - (pos.y0 + pos.height) * fh))
     assert got == panel_margins_px("default"), \
@@ -196,18 +242,84 @@ def test_grid_focus_cell_margins_equal_same_size_panel(size):
     plt.close(g.fig)
 
 
-def test_focus_is_visibility_flip_not_a_resize():
-    """Focus does NOT resize the figure -- it hides the grid axes and adds one focus axes (a visibility
-    flip + draw), so the figure size before / during / after focus is identical."""
+def test_focus_lim_sticks_and_does_not_bounce_back():
+    """The HARD acceptance point: after focusing, changing the standalone view's fixed lim ACTUALLY moves the
+    axis (a real numeric change), and re-drawing / re-applying does NOT revert to the grid thumbnail (still
+    focused, still the same standalone plotter).  A histogram's relim pins its COUNT (y) axis."""
     recipe = _grid_recipe()
     g = build_grid_figure(recipe, size="2x2", display=False)
-    before = tuple(g.fig.get_size_inches())
     g.focus(0)
-    during = tuple(g.fig.get_size_inches())
+    fp = g._focus_plotter
+    fp.relim_mode = "fixed"
+    fp.fixed_lo, fp.fixed_hi = 0.0, 777.0
+    fp.apply_relim_now()
+    assert fp.ax.get_ylim() == (0.0, 777.0), f"fixed lim must move the axis, got {fp.ax.get_ylim()}"
+    # a redraw / re-apply must NOT bounce back to the grid thumbnail
+    fp.draw()
+    fp.apply_relim_now()
+    assert g._focused == 0 and g._focus_plotter is fp, "the focus view must NOT revert on redraw"
+    assert fp.ax.get_ylim() == (0.0, 777.0), "the fixed lim must persist (no bounce-back)"
     g.unfocus()
-    after = tuple(g.fig.get_size_inches())
-    assert before == during == after, f"focus must not resize the figure: {before} {during} {after}"
     plt.close(g.fig)
+
+
+def test_console_grid_focus_swaps_to_real_panel_lim_sticks_no_bounce():
+    """The CONSOLE path: a double-click on a grid panel's canvas SWAPS ``PanelCard.plotter`` to the clicked
+    cell's STANDALONE HistogramFigure; a fixed-lim edit through the ORDINARY console path moves its axis; a
+    live tick does NOT bounce back to the grid; a second double-click returns to the grid."""
+    from Zou_lab_control.frontend.qt_fluent import ensure_qt_app
+    from Zou_lab_control.frontend.task_console import PanelCard, PanelConfig
+    ensure_qt_app()
+    recipe = _grid_recipe()
+    cfg = PanelConfig(kind="grid", row=10, col=10, size="2x2", inputs=["fig_value"], source="value = signal")
+    card = PanelCard(cfg, grid_recipe_provider=lambda _sig: recipe)
+    try:
+        card._build_plot(0.0, {})
+        grid = card.plotter
+        assert isinstance(grid, SiteHistogramGrid) and card._grid_focus is None
+
+        class _Ev:
+            dblclick = True
+            button = 1
+            def __init__(self, ax):
+                self.inaxes = ax
+
+        card._on_grid_canvas_click(_Ev(grid.site_axes[2]))
+        assert isinstance(card.plotter, HistogramFigure), "double-click swaps to a standalone HistogramFigure"
+        assert card._grid_focus is not None and card._grid_focus.k == 2
+        fp = card.plotter
+
+        # fixed lim through the ordinary console path (config.params + _apply_lim_to_plotter) moves the axis
+        card.config.params.update({"relim": "fixed", "fixed_lo": 0.0, "fixed_hi": 888.0})
+        card._apply_lim_to_plotter()
+        assert fp.ax.get_ylim() == (0.0, 888.0), f"console fixed lim must move the axis, got {fp.ax.get_ylim()}"
+
+        # a live tick is gated OFF while focused -> no bounce-back to the grid
+        card._render(0.0, {})
+        assert card._grid_focus is not None and card.plotter is fp, "the live tick must not revert the focus view"
+        assert fp.ax.get_ylim() == (0.0, 888.0), "the fixed lim persists across a tick (no bounce-back)"
+
+        # a second double-click returns to the grid
+        card._on_grid_canvas_click(_Ev(None))
+        assert card._grid_focus is None and isinstance(card.plotter, SiteHistogramGrid)
+    finally:
+        card.shutdown()
+        plt.close("all")
+
+
+def test_no_external_ax_symbol_anywhere():
+    """The old ``external_ax`` focus HACK is GONE (a focus is now a standalone panel_plot, not an axes
+    overlay): the token must not appear in ANY frontend source or test -- a dead-symbol guard."""
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "Zou_lab_control" / "frontend"
+    offenders = []
+    for path in root.rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        if re.search(r"external_ax", text):
+            offenders.append(str(path))
+    assert not offenders, f"external_ax must be fully removed, still referenced in: {offenders}"
 
 
 # --------------------------------------------------------------------------- 3. Monitor = no selectors
