@@ -23,8 +23,11 @@ A read-only **Info** column on the left lists EVERY key the npz stored, grouped 
 (name / kind / labels / unit / saved / the view sub-dict / any fit), **Measurement** (source / data_x /
 data_y shapes / points / repeat / the stored signal blocks), **Device** (the run's provenance expanded
 per device) and **Raw** (the whole ``info`` dict verbatim, multi-line + scrollable) -- so "what is in
-this file" is always fully visible next to the board.  Browse (or typing a valid ``.npz`` path) loads it
-automatically -- there is no separate Load button.
+this file" is always fully visible next to the board.  Browse (or typing a valid path) loads it
+automatically -- there is no separate Load button.  Browse lists the saved-figure IMAGES (``.png`` /
+``.jpg``) alongside the ``.npz``, so the operator can eye-ball the thumbnail to find the right run and
+picking the image loads its SIBLING ``.npz`` data (the save writes the pair under one ``<name>_<time>``
+base); picking the ``.npz`` directly still works.
 
 It is session-INDEPENDENT: it only reads a file, no hardware, no acquisition -- the ``LoadedFigureNode``
 re-publishes the same stored arrays every shot.  The window chrome (Fluent frameless shell, one shared
@@ -90,6 +93,22 @@ FIG_FRAME_KEY = "frame"
 #: The node prefix -- so the published hub names are ``fig_value`` / ``fig_x`` / ``fig_centers`` /
 #: ``fig_frame`` and the seeded panel's ``inputs`` name ``fig_value``.
 FIG_PREFIX = "fig_"
+
+#: The saved-figure IMAGE suffixes ``DataFigure.save`` may write beside the data ``.npz`` (its default is
+#: ``.png``; ``image_ext=`` can pick ``.jpg`` / ``.jpeg``).  Browsing/typing one of these loads the
+#: SIBLING ``<image>.with_suffix('.npz')`` -- the save writes the pair under the same ``<name>_<time>``
+#: base, so the mapping is exact.  Kept next to the data param, not baked into ``FluentPathEdit`` (which
+#: stays a generic path field -- the sibling mapping is the viewer's job).
+FIGURE_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg")
+
+
+def _resolve_npz(path: Path) -> Path:
+    """Map a picked path to the ``.npz`` to load: a saved-figure IMAGE (``.png`` / ``.jpg`` / ``.jpeg``)
+    resolves to its SIBLING ``<image>.with_suffix('.npz')`` (the save writes the image + npz as a same-base
+    pair); a ``.npz`` (or anything else) is returned unchanged.  The caller checks the result exists."""
+    if path.suffix.lower() in FIGURE_IMAGE_SUFFIXES:
+        return path.with_suffix(".npz")
+    return path
 
 
 def _as_tuple_or_none(shape) -> tuple | None:
@@ -395,11 +414,16 @@ class FigureViewer(QtWidgets.QWidget):
         # No separate Load button: FluentPathEdit.changed(str) fires when Browse picks a file (or the
         # user finishes typing one) and _on_path_changed loads it if it is an existing .npz -- one action.
         lay.addWidget(FluentSectionLabel("File"))
+        # Browse shows the saved-figure IMAGES (png / jpg) too, not just the .npz -- so the operator can
+        # eye-ball the thumbnail to find the right run (the native Windows dialog draws image previews),
+        # then picking the image loads its SIBLING .npz data (the save writes ``<name>_<time>.png`` +
+        # ``<name>_<time>.npz`` as a pair, so the data is ``<image>.with_suffix('.npz')``).  Picking a
+        # .npz directly still works.
         self.path_edit = FluentPathEdit(
-            "", mode="file", caption="Open a saved figure (.npz)",
-            file_filter="Saved figures (*.npz);;All files (*)")
-        self.path_edit.setToolTip("A saved figure .npz -- Browse (or type a full path) and it loads onto "
-                                  "the board automatically.")
+            "", mode="file", caption="Open a saved figure (image or .npz)",
+            file_filter="Saved figures (*.png *.jpg *.jpeg *.npz);;All files (*)")
+        self.path_edit.setToolTip("A saved figure -- Browse (or type a full path).  Pick the image "
+                                  "(.png / .jpg) or the .npz and it loads onto the board automatically.")
         self.path_edit.changed.connect(self._on_path_changed)
         lay.addWidget(FluentSettingRow("path", self.path_edit, label_width=self._label_w))
 
@@ -459,23 +483,43 @@ class FigureViewer(QtWidgets.QWidget):
         return getattr(self, "_zlc_window", None)
 
     def open_path(self, path: str | Path) -> None:
-        """Load a ``.npz``: publish its data as ``fig_value`` and seed a console reproducing it."""
+        """Load a saved figure: publish its data as ``fig_value`` and seed a console reproducing it.
+
+        ``path`` may be the data ``.npz`` OR its sibling IMAGE (``.png`` / ``.jpg`` / ``.jpeg``) -- picking
+        the image loads the same-base ``.npz`` beside it (see :func:`_resolve_npz`).  A picked image with
+        no sibling ``.npz`` is reported in the status line (nothing is loaded), never a crash."""
         p = Path(str(path).strip())
         if str(p) in ("", "."):
             return
-        self._load_npz(p)
+        npz = _resolve_npz(p)
+        if p.suffix.lower() in FIGURE_IMAGE_SUFFIXES and not npz.is_file():
+            self.status.setText(f"no matching .npz data next to {display_path(str(p))} "
+                                f"(expected {npz.name})")
+            return
+        self._load_npz(npz)
 
     # ------------------------------------------------------------- file / load
     def _on_path_changed(self, text: str) -> None:
-        """Browse (or typed) path -> AUTO-LOAD when it is an existing ``.npz``.  ``changed`` fires on
-        every keystroke too, so we load only a real ``.npz`` file (mid-type garbage / a folder is
-        ignored, no error spam) -- Browse always yields a real file, so picking one loads immediately."""
+        """Browse (or typed) path -> AUTO-LOAD.  ``changed`` fires on every keystroke too, so we only act
+        on a real EXISTING file (mid-type garbage / a folder is ignored, no error spam) whose suffix is a
+        saved-figure one -- a ``.npz`` loads directly; a saved-figure IMAGE (``.png`` / ``.jpg`` /
+        ``.jpeg``) loads its SIBLING ``.npz`` (see :func:`_resolve_npz`).  Browse always yields a real
+        file, so picking the image OR the npz loads immediately; an image with no sibling npz reports it in
+        the status (never a crash)."""
         p = Path(str(text).strip())
-        if str(p) in ("", ".") or p.suffix.lower() != ".npz" or not p.is_file():
+        suffix = p.suffix.lower()
+        if str(p) in ("", ".") or not p.is_file():
             return
-        if self._current_path is not None and p == self._current_path:
+        if suffix != ".npz" and suffix not in FIGURE_IMAGE_SUFFIXES:
+            return                                       # mid-type / unrelated file -- no error spam
+        npz = _resolve_npz(p)
+        if not npz.is_file():
+            self.status.setText(f"no matching .npz data next to {display_path(str(p))} "
+                                f"(expected {npz.name})")
+            return
+        if self._current_path is not None and npz == self._current_path:
             return                                       # already loaded (the setText echo below re-fires)
-        self._load_npz(p)
+        self._load_npz(npz)
 
     def _load_npz(self, path: Path) -> None:
         path = Path(path)

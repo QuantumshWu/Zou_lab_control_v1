@@ -59,6 +59,19 @@ def _saved_hist_npz(tmp_path, *, name="readout") -> Path:
     return Path(out["data"])
 
 
+def _saved_hist_pair(tmp_path, *, name="readout") -> tuple[Path, Path]:
+    """Save a bimodal-readout hist figure and return ``(image_png, data_npz)`` -- the SAME same-base
+    pair ``DataFigure.save`` writes, so picking the image must load the sibling npz."""
+    rng = np.random.default_rng(0)
+    vals = np.concatenate([rng.normal(300.0, 20.0, 400), rng.normal(460.0, 20.0, 300)])
+    p = plot(vals, kind="hist", display=False, update="once", data_figure=True)
+    df = p.to_data_figure()
+    info = {"source": "counts", "kind": "hist", "view": {"relim": "tight"}}
+    out = df.save(str(tmp_path / name), extra_info=info, image_ext="png")
+    plt.close(p.fig)
+    return Path(out["figure"]), Path(out["data"])
+
+
 def _saved_1d_npz(tmp_path) -> Path:
     """Save a 1-D vector figure with a real x-axis label, and return its ``.npz`` path."""
     x = np.linspace(0.0, 10.0, 40)
@@ -337,6 +350,72 @@ def test_edit_tab_repeat_mode_create_redraws_snapshot_per_repeat(tmp_path):
         win = v.window()
         if win is not None:
             win.close(); win.deleteLater()
+        v.teardown()
+        plt.close("all")
+
+
+def test_browse_filter_lists_saved_figure_images(tmp_path):
+    """The File field's Browse dialog filter lists the saved-figure IMAGES (png / jpg / jpeg) next to the
+    .npz, so the operator can eye-ball a thumbnail to find the right run (confocal lists ``*.npz *.jpg``
+    in its 'Select Data File' dialog).  Pins the filter string carries the image suffixes."""
+    v = FigureViewer(path=None)
+    try:
+        filt = v.path_edit._filter
+        for suffix in ("png", "jpg", "jpeg", "npz"):
+            assert f"*.{suffix}" in filt, f"the Browse filter offers *.{suffix}"
+    finally:
+        v.teardown()
+        plt.close("all")
+
+
+def test_picking_image_loads_sibling_npz(tmp_path):
+    """Picking a saved-figure IMAGE (its .png) loads the SIBLING .npz data -- the save writes
+    ``<name>_<time>.png`` + ``<name>_<time>.npz`` as a same-base pair, so ``image.with_suffix('.npz')``
+    is the data.  open_path(png) and typing the png into the path field must BOTH load it, exactly as
+    picking the .npz does (confocal's on_load strips the suffix and resolves the sibling .npz)."""
+    png, npz = _saved_hist_pair(tmp_path)
+    assert png.suffix == ".png" and npz.suffix == ".npz" and png.stem == npz.stem
+
+    # open_path(png) loads the sibling npz and seeds the reproduction panel
+    v = show_figure_viewer(png)
+    try:
+        assert v.saved is not None and v.saved.kind == "hist", "picking the .png loaded its sibling .npz"
+        assert v.console is not None and len(v.console.cards) == 1, "the seeded panel built from the npz"
+        assert v._current_path == npz, "the loaded path is the sibling npz, not the image"
+        v.console._tick()
+        assert v.console.cards[0].plotter is not None, "the seeded panel builds (equivalent to loading npz)"
+    finally:
+        win = v.window()
+        if win is not None:
+            win.close(); win.deleteLater()
+        v.teardown()
+        plt.close("all")
+
+    # typing the image path into the field (== Browse picking it) auto-loads the sibling npz too
+    v2 = FigureViewer(path=None)
+    try:
+        v2.path_edit.setText(str(png))                # fires changed -> _on_path_changed
+        assert v2.saved is not None and v2.saved.kind == "hist", \
+            "setting the path field to the image auto-loads its sibling npz"
+        assert v2._current_path == npz
+    finally:
+        v2.teardown()
+        plt.close("all")
+
+
+def test_picking_image_without_sibling_npz_warns(tmp_path):
+    """A picked IMAGE with no sibling .npz beside it reports it in the status line and loads NOTHING --
+    never a crash (the reported-figure counterpart of confocal's fuzzy-search miss)."""
+    lonely = tmp_path / "bar.png"
+    lonely.write_bytes(b"\x89PNG\r\n\x1a\n")             # a bare file with no sibling bar.npz
+    v = FigureViewer(path=None)
+    try:
+        v.open_path(lonely)
+        assert v.saved is None, "no sibling .npz -> nothing loaded"
+        assert "no matching .npz" in v.status.text(), \
+            f"the status warns there is no matching data, got: {v.status.text()!r}"
+        assert v.console is not None and len(v.console.cards) == 0, "the board stays empty (no crash)"
+    finally:
         v.teardown()
         plt.close("all")
 
