@@ -294,24 +294,47 @@ def test_pulse_recipe_prefers_provenance_sequencer_payload(tmp_path):
         plt.close("all")
 
 
-def test_pulse_recipe_reopens_in_figure_viewer(tmp_path):
-    """A pulse recipe npz reopens in ``show_figure_viewer``: the window does NOT crash, the right pane
-    shows the REPRODUCED pulse figure on an embedded canvas (a structured figure is ``panel=False`` so it
-    is NOT a console board), and the Info column carries the recipe."""
+def test_pulse_recipe_reopens_on_the_same_console_board(tmp_path):
+    """A pulse recipe npz reopens in ``show_figure_viewer`` on the SAME real console board -- it does NOT
+    replace the console.  A pulse figure is ``panel=False`` (not array-fed, so not a signal-driven panel),
+    so it lands on the board as a ``StaticFigureCard`` BESIDE the panels, and the Monitor tab + Add Panel
+    stay intact.  The pins guard the reported bug 'loading a pulse figure wiped the console / Monitor tab':
+    (1) the console is a real ``TaskConsole`` (never None); (2) the Monitor tab is present; (3) the pulse
+    reproduction is a single static card on the board (NOT a seeded signal panel); (4) the reproduced
+    figure is faithful (a ``PulseSequenceFigure`` -- many channels + an analog bus, not a 1-D line); and
+    (5) the board is still live -- a further Add Panel adds an ordinary panel."""
+    from Zou_lab_control.frontend.figure_viewer import show_figure_viewer
+    from Zou_lab_control.frontend.task_console import StaticFigureCard, TaskConsole
+
     ed, state = _pulse_editor()
     df = ed._preview_data_figure(state, include_always_off=True)
     out = df.save(str(tmp_path / "demo_pulse.png"))
     plt.close(df.fig)
 
-    from Zou_lab_control.frontend.figure_viewer import show_figure_viewer
-
     viewer = show_figure_viewer(out["data"])
     try:
         assert viewer.saved is not None and viewer.saved.kind == "pulse"
-        assert viewer.console is None, "a structured (recipe) figure is NOT seeded onto a console board"
-        assert viewer._recipe_card is not None, "the right pane shows the reproduced pulse figure"
-        assert viewer._recipe_figure is not None
+        con = viewer.console
+        # (1) the pulse figure opens on a real console board -- the console is NEVER replaced
+        assert isinstance(con, TaskConsole), "a pulse figure opens on the SAME console (not a replacement)"
+        # (2) the Monitor tab survives (the reported bug wiped it)
+        tab_titles = {con.tabs.tabText(i) for i in range(con.tabs.count())}
+        assert "Monitor" in tab_titles, "the Monitor tab must survive a pulse load"
+        # (3) the reproduced pulse figure is ONE static card on the board -- no seeded signal panel
+        statics = [c for c in con.cards if isinstance(c, StaticFigureCard)]
+        assert len(statics) == 1, "the reproduced pulse figure is one static card on the board"
+        assert len(con.cards) == 1, "a pulse recipe seeds NO signal panel (it is not array-fed)"
+        assert viewer.node is None, "a pulse recipe publishes no fig_value signal (nothing array-fed)"
+        # (4) the reproduction is FAITHFUL: a PulseSequenceFigure with many channels + an analog bus
+        plotter = viewer.saved.plot().live_plot
+        assert type(plotter).__name__ == "PulseSequenceFigure", "the reproduction is a faithful pulse figure"
+        assert len(plotter.channels) > 1 and len(plotter.analog_traces) >= 1 and len(plotter.pulses) > 1
+        # the Info column still carries the recipe
         assert "figure_recipe" in viewer.raw_info.toPlainText()
+        # (5) the board is a real live console: Add Panel adds an ordinary panel beside the pulse card
+        con.kind_combo.setCurrentIndex(0)          # a "Plot: ..." kind
+        con._add_panel()
+        assert len(con.cards) == 2, "Add Panel still works with a static pulse card on the board"
     finally:
         win = viewer.window()
         if win is not None:

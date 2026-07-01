@@ -275,3 +275,66 @@ def test_on_pulse_after_moving_a_scan_slot_uploads_the_current_ui_table(_app):
     # the real distinct sweep survived the move (not [[nominal],[nominal],[nominal]])
     assert len({tuple(row) for row in payload.scan_table}) > 1
     assert seq.stopped >= 1                           # it stopped before re-uploading + firing
+
+
+# ---- Scan-tab Run '*' dirty tracks scan-slot changes: a stale generated table must FLAG a re-Run -----
+# The design defect: after Run generates a scan table, binding / unbinding / moving a scan slot makes the
+# generated table stale (wrong column count / order), yet the Run button showed no '*', so the user
+# thought the generated points were current.  Run must go dirty on any scan-slot change once a table has
+# been generated, and clear again on a fresh Run.
+def _scan_slot_editor():
+    from Zou_lab_control.frontend.pulse_gui import PulseSequenceEditor
+    from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState, PulsePeriod
+    st = PulseTableState(channels=["probe", "trig"])
+    st.periods.append(PulsePeriod(1000, tuple(0 for _ in st.channels), unit="ns"))
+    st.periods.append(PulsePeriod(1000, tuple(0 for _ in st.channels), unit="ns"))
+    st.bind_field("duration", "0", unit="us")         # one scan slot
+    ed = PulseSequenceEditor(st)
+    ed.tabs.setCurrentWidget(ed.scan_tab)
+    ed._refresh_scan_tab()                            # populate the default column_stack scan code
+    return ed
+
+
+def test_scan_run_goes_dirty_when_a_scan_slot_changes_after_run(_app):
+    """After a successful Run, binding a SECOND scan slot (the generated table is now one column short)
+    must mark the Run button dirty ('*'), and a fresh Run must clear it.  This is the defect: the stale
+    generated table was silently kept as if current."""
+    ed = _scan_slot_editor()
+
+    ed._run_scan_code()
+    assert ed.scan_run_button.is_dirty() is False, "a fresh Run clears the dirty star"
+    generated = ed._scan_tables["generated"]
+    assert generated and len(generated[0]) == 1, "the generated table has one column for one slot"
+
+    # bind a SECOND scan slot via the real dot-click path -> 1 -> 2 slots, the generated table is stale
+    ed._cycle_field_slot(ed.read_state(), "duration", "1", unit="us")
+    assert len(ed.read_state().scan_slots) == 2, "a second scan slot is now bound"
+    assert len(ed._scan_tables["generated"][0]) == 1, "the generated table is STALE (still one column)"
+    assert ed.scan_run_button.is_dirty() is True, \
+        "the stale generated table flags Run dirty so the user knows to re-Run"
+
+    # a fresh Run regenerates for the new slot count and clears the star
+    ed._run_scan_code()
+    assert len(ed._scan_tables["generated"][0]) == 2, "re-Run generates a two-column table"
+    assert ed.scan_run_button.is_dirty() is False, "the re-Run clears the dirty star"
+
+
+def test_scan_run_redirties_when_a_scan_slot_is_unbound(_app):
+    """Unbinding a scan slot (scan -> API on the dot) also makes the generated table stale -> Run dirty."""
+    ed = _scan_slot_editor()
+    ed._run_scan_code()
+    assert ed.scan_run_button.is_dirty() is False
+    ed._cycle_field_slot(ed.read_state(), "duration", "0", unit="us")   # scan -> API (unbinds the slot)
+    assert len(ed.read_state().scan_slots) == 0
+    assert ed.scan_run_button.is_dirty() is True, "unbinding the scan slot flags Run dirty"
+
+
+def test_scan_slot_change_before_any_run_does_not_spuriously_dirty(_app):
+    """Before the FIRST Run there is no generated table to be stale, so a scan-slot change must NOT set
+    the dirty star via the slot-signature path (the code editor's own edit-dirty governs that phase)."""
+    ed = _scan_slot_editor()
+    ed.scan_run_button.set_dirty(False)
+    assert ed._scan_generated_slots is None, "no table generated yet"
+    ed._cycle_field_slot(ed.read_state(), "duration", "1", unit="us")
+    assert ed.scan_run_button.is_dirty() is False, \
+        "no stale generated table before the first Run -> no spurious dirty from the slot change"

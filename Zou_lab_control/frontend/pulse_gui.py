@@ -1817,6 +1817,11 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         self._scan_tables: dict[str, list[list[float]]] = {"generated": [], "loaded": []}
         self._scan_loaded_path = ""
         self._scan_use_loaded = False
+        # The scan-SLOT layout the last Run generated its table against (a tuple of (kind, target) per
+        # slot).  The generated table has one column per slot in this exact order, so if the slots later
+        # change (a scan dot bound/unbound/moved) the generated table is STALE and Run must show its
+        # dirty '*' -- a re-Run is needed for the change to take effect.  ``None`` = never Run yet.
+        self._scan_generated_slots: tuple | None = None
         self._last_save_state = None
         self._last_load_state = None
         self._building = False
@@ -2824,6 +2829,9 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         # same confocal UNSYNCED treatment as any other edit (the fast path below bypasses
         # the widget signals that normally call _mark_dirty).
         self._mark_dirty()
+        # A scan-slot toggle changes the slot LAYOUT the last generated table was built against, so that
+        # table is now stale -> flag Run dirty (a re-Run is needed for the new binding to take effect).
+        self._sync_scan_run_dirty(state)
         # Fast path: a scan toggle keeps the structure, so update the existing
         # widgets in place (milliseconds) instead of a full rebuild (~400 ms with
         # all channels shown).  Fall back to load_state if anything looks off.
@@ -3299,6 +3307,28 @@ class PulseSequenceEditor(QtWidgets.QWidget):
         slot_defaults = [float(slot.nominal) for slot in state.scan_slots]
         return [list(row)[:n] + slot_defaults[len(row):n] for row in rows]
 
+    @staticmethod
+    def _scan_slot_signature(state: PulseTableState) -> tuple:
+        """The scan-SLOT layout as an ordered ``((kind, target), ...)`` tuple -- the identity of the slots
+        the generated scan table is shaped for (one column per slot, in this order).  Run's dirty star
+        keys off this: bind / unbind / move a scan slot and it changes, so a Run generated against the old
+        layout is stale (see :meth:`_sync_scan_run_dirty`)."""
+        return tuple((slot.kind, slot.target) for slot in state.scan_slots)
+
+    def _sync_scan_run_dirty(self, state: PulseTableState) -> None:
+        """Mark the Scan-tab **Run** button dirty (``*``) when the GENERATED scan table no longer matches
+        the current scan slots -- so a scan-slot change (a dot bound / unbound / moved) visibly tells the
+        user a re-Run is needed for it to take effect.  Only meaningful while the GENERATED source is
+        active (the loaded-array source applies immediately, it is not code that needs re-running); and
+        only once a table WAS generated (``_scan_generated_slots`` set) -- before the first Run there is
+        nothing stale to flag (the empty default template is handled by the code editor's own dirty)."""
+        if not hasattr(self, "scan_run_button") or self._scan_use_loaded:
+            return
+        if self._scan_generated_slots is None:
+            return                                        # never generated a table yet -> nothing stale
+        if self._scan_slot_signature(state) != self._scan_generated_slots:
+            self.scan_run_button.set_dirty(True)
+
     def _run_scan_code(self) -> None:
         try:
             state = self.read_state()
@@ -3306,10 +3336,13 @@ class PulseSequenceEditor(QtWidgets.QWidget):
                 self._message("Bind at least one field to a scan slot first (click a dot in the Edit tab).")
                 return
             self._scan_tables["generated"] = self._generate_scan_rows(state)
+            # Remember the slot layout this table was generated for, so a later slot change re-dirties
+            # Run (the table has one column per slot in THIS order).
+            self._scan_generated_slots = self._scan_slot_signature(state)
             self._scan_use_loaded = False
             self._apply_scan_source()
             self._open_scan_tab()
-            # Successful run -> the on-screen table matches the code: clear the dirty star.
+            # Successful run -> the on-screen table matches the code AND the current slots: clear the star.
             # (_apply_scan_source -> load_state may re-touch scan_code; clear AFTER it.)
             self.scan_run_button.set_dirty(False)
         except Exception as exc:

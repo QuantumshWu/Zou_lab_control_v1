@@ -47,6 +47,8 @@ import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from .live import (
+    DESIGN_DPI,
+    PANEL_DISPLAY_SCALE,
     PANEL_SIZES,
     PLOT_KINDS,
     panel_display_size,
@@ -3258,6 +3260,110 @@ class PanelCard(FluentGroupBox):
         self._teardown_plot()
 
 
+class StaticFigureCard(FluentGroupBox):
+    """A board card that holds a PRE-RENDERED matplotlib figure -- not one built from a hub signal.
+
+    A STRUCTURED figure (a pulse timeline: :class:`~.live.PulseSequenceFigure`) is ``panel=False`` (see
+    the ``PLOT_KINDS`` note) because it is NOT array-fed: it is rendered from a period table + analog
+    buses, so the array pipeline every :class:`PanelCard` runs (``_build_plot`` -> ``panel_plot(value,
+    kind=...)``) cannot produce it.  But the reproduced figure still belongs ON the Monitor board -- as a
+    CARD beside the ordinary panels, not as a replacement for the whole console.  This card is that
+    seam: it drops a ready-made figure (e.g. ``SavedFigure.plot().fig`` -- the faithful pulse
+    reproduction, every channel / analog trace / bracket) onto the board with the SAME fluent chrome +
+    drag handle every panel has, so the board / Monitor tab / Add Panel all stay intact.
+
+    It quacks like a :class:`PanelCard` for the board's sake -- a real :class:`PanelConfig` (so the
+    gravity packer sizes it, exactly like a panel), the same drag mechanic, the same five Qt signals,
+    a ``_render_version`` and a ``refresh`` -- but ``refresh`` is a NO-OP (the figure is static, there
+    is no live signal to re-evaluate), so the console's ``_tick`` skips it after the first frame.  The
+    figure canvas sits in a scroll area inside the card, so a figure larger than the card scrolls rather
+    than clipping or overrunning a neighbour (the packer's overlap math reads the card's PRESET size)."""
+
+    changed = QtCore.pyqtSignal()
+    layout_changed = QtCore.pyqtSignal()
+    update_interval_changed = QtCore.pyqtSignal()
+    remove_requested = QtCore.pyqtSignal(object)
+    edit_requested = QtCore.pyqtSignal(object)
+
+    def __init__(self, figure, config: PanelConfig, parent=None):
+        super().__init__(config.title or "Figure", parent, shadow=True)
+        self.config = config
+        self.figure = figure
+        # Board-card duck-typing: the console attaches this exactly like a PanelCard, so it needs the
+        # same handles the attach path + _tick read.  ``plotter`` stays None (nothing is built from a
+        # signal); ``_render_version`` lets the version gate leave it alone after the one static draw.
+        self.plotter = None
+        self.canvas = None
+        self._render_version = -1
+        self._drag_offset: QtCore.QPoint | None = None
+        self.setCursor(QtCore.Qt.OpenHandCursor)
+
+        holder = QtWidgets.QVBoxLayout(self)
+        holder.setContentsMargins(CARD_PAD, scaled_px(2), CARD_PAD, CARD_PAD)
+        holder.setSpacing(0)
+        # The figure keeps its OWN spec-owned geometry (fixed inches); it is NOT reshaped to the card.
+        # A scroll area holds the canvas so a figure taller/wider than the card is fully reachable
+        # (scroll) instead of clipped -- the packer sizes the card from its preset, below.
+        scroll = FluentScrollArea()
+        scroll.setWidgetResizable(False)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        if panel_canvas is not None and figure is not None:
+            self.canvas = panel_canvas(figure, isolate_wheel=True)
+            scroll.setWidget(self.canvas)
+        self._scroll = scroll
+        holder.addWidget(scroll, 1)
+        self.setFixedSize(*_card_size(self.config.size))
+
+    # ---- board-card contract (the console reads these off every card) ---------------------------
+    def refresh(self, namespace) -> None:
+        """No-op: the figure is static (no hub signal to evaluate).  The console's ``_tick`` calls this
+        on every card; a static card simply keeps the frame it was built with."""
+        return
+
+    def set_signal_info(self, text: str) -> None:
+        """No-op: a static figure reads no hub signal, so the per-card signal-flow legend the console
+        writes onto every card does not apply here (its blank source yields '(no signal set)')."""
+        return
+
+    def shutdown(self) -> None:
+        canvas, self.canvas = self.canvas, None
+        if canvas is not None:
+            canvas.setParent(None)
+            canvas.deleteLater()
+        if self.figure is not None and plt is not None:
+            try:
+                plt.close(self.figure)
+            except Exception:
+                pass
+            self.figure = None
+
+    # ---- drag (identical mechanic to PanelCard: the frame border is the drag handle) ------------
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if event.button() == QtCore.Qt.LeftButton:
+            self._drag_offset = event.pos()
+            self.setCursor(QtCore.Qt.ClosedHandCursor)
+            self.raise_()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if self._drag_offset is not None:
+            new_pos = self.mapToParent(event.pos() - self._drag_offset)
+            self.move(max(0, new_pos.x()), max(0, new_pos.y()))
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if self._drag_offset is not None:
+            self._drag_offset = None
+            self.setCursor(QtCore.Qt.OpenHandCursor)
+            col, row = max(0, self.x()), max(0, self.y())
+            if (col, row) != (self.config.col, self.config.row):
+                self.config.col, self.config.row = col, row
+                self.changed.emit()
+            self.layout_changed.emit()
+        super().mouseReleaseEvent(event)
+
+
 def _acquisition_param_decls(repeat_default: int = 0) -> tuple:
     """The ONE acquisition knob EVERY measurement-layer node owns, declared ONCE (#H3n): ``Repeat`` =
     the depth of the repeat axis = how many passes/photos the data block keeps and AVERAGES, then STOPS
@@ -5170,10 +5276,14 @@ class TaskConsole(QtWidgets.QWidget):
                 row.node.values = editor.collect_values()
             except Exception:
                 pass
+        # A StaticFigureCard holds a pre-rendered figure (a reproduced pulse timeline), NOT a
+        # signal-driven panel, so it is excluded from the saved LAYOUT: a saved layout is rebuilt by
+        # re-wiring each panel to a hub signal, which a static figure has none of (it is reproduced
+        # from a saved recipe, not the console's live hub).
         return TaskConsoleState(
             name=self.name_edit.text().strip() or "task",
             interval_ms=self.state.interval_ms,
-            panels=[card.config for card in self.cards],
+            panels=[card.config for card in self.cards if not isinstance(card, StaticFigureCard)],
             logic=[row.node for row in self.logic_nodes],
         )
 
@@ -5228,6 +5338,55 @@ class TaskConsole(QtWidgets.QWidget):
         card.edit_requested.connect(self._edit_card)
         self.cards.append(card)
         self._recompute_tick_interval()        # a new panel's rate may change the timer base
+
+    def _fit_static_size(self, figure) -> str:
+        """The SMALLEST panel preset whose content area holds ``figure``'s canvas (so the reproduced
+        figure shows without scrolling when it fits a preset; a larger figure lands on the biggest
+        preset + scrolls inside the card).  Reads the canvas' real pixel size, so it adapts to any
+        structured figure -- a tall many-channel pulse timeline lands on a taller preset."""
+        if panel_canvas is None or figure is None:
+            return "2x2"
+        w_in, h_in = (float(v) for v in figure.get_size_inches())
+        need_w = w_in * DESIGN_DPI * PANEL_DISPLAY_SCALE
+        need_h = h_in * DESIGN_DPI * PANEL_DISPLAY_SCALE
+        best = PANEL_SIZES[0]
+        for size in PANEL_SIZES:
+            cw, ch = _card_size(size)
+            # content area = card minus the same chrome _cell_size reserves (L/R pad, title strip, pad)
+            avail_w = cw - 2 * CARD_PAD
+            avail_h = ch - scaled_px(CARD_TITLE_PX) - scaled_px(2) - CARD_PAD
+            if avail_w >= need_w and avail_h >= need_h:
+                return size
+            best = size                            # remember the LARGEST tried (fallback: scroll inside it)
+        return best
+
+    def add_static_figure_card(self, figure, *, title: str = "") -> "StaticFigureCard":
+        """Drop a PRE-RENDERED figure onto the Monitor board as its OWN card (see
+        :class:`StaticFigureCard`).  A STRUCTURED figure -- a pulse timeline
+        (:class:`~.live.PulseSequenceFigure`) reproduced from a saved recipe -- is ``panel=False`` (not
+        array-fed), so it cannot be a signal-driven panel; this places the faithful reproduction as a
+        board card BESIDE the ordinary panels, keeping the console / Monitor tab / Add Panel intact.
+
+        The card is gravity-packed like any other (it carries a real :class:`PanelConfig` sized to the
+        figure) and dragged by its frame border, but it reads no hub signal (blank source) so the signal
+        picker / Edit / shot clock never touch it.  Returns the card."""
+        size = self._fit_static_size(figure)
+        name = title or "Figure"
+        config = PanelConfig(kind="1d", title=name, row=GAP, col=GAP, size=size,
+                             source=_BLANK_SOURCE, inputs=[])
+        card = StaticFigureCard(figure, config, parent=self.board)
+        card.setParent(self.board)
+        card.show()
+        # A static card only participates in LAYOUT (drag re-pack) + REMOVE; it has no signal source,
+        # so it is NOT wired to _refresh_signal_info / _edit_card / the acquisition-rate rebase.
+        card.layout_changed.connect(self._arrange)
+        card.remove_requested.connect(self._remove_panel)
+        self.cards.append(card)
+        self._arrange()
+        # The board's scroll viewport only has its real width once shown; pack again so the card lands
+        # against the true pane width immediately (an embedded console is built before it is laid out).
+        QtCore.QTimer.singleShot(0, self._arrange_if_cards)
+        return card
 
     # ----------------------------------------------------------------- control
     # ---- producing-node discovery: a panel's data comes from a logic node; its Edit
@@ -5871,8 +6030,11 @@ class TaskConsole(QtWidgets.QWidget):
         if self._task_locked:
             return
         if card in self.cards:
-            card.settings_popup.hide()
-            self._close_panel_editor(card)     # drop this card's Edit tab too
+            # A StaticFigureCard has no settings popup / Edit tab (it is a pre-rendered figure, not a
+            # signal-driven panel) -- guard those two so removing it is just teardown + re-pack.
+            if not isinstance(card, StaticFigureCard):
+                card.settings_popup.hide()
+                self._close_panel_editor(card)     # drop this card's Edit tab too
             self.cards.remove(card)
             card.shutdown()
             card.setParent(None)

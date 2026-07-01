@@ -440,3 +440,51 @@ def test_one_d_save_reproduces_with_saved_x_axis(tmp_path):
             win.close(); win.deleteLater()
         v.teardown()
         plt.close("all")
+
+
+def _saved_pulse_recipe_npz(tmp_path) -> Path:
+    """A pulse-recipe npz built inline (a real ``PulseTableState.to_dict`` under ``figure_recipe``), no
+    pulse editor -- so the viewer's structured-figure path can be exercised without the GUI editor."""
+    from Zou_lab_control.neutral_atom.timing.pulse_table import PulseTableState, PulsePeriod
+    st = PulseTableState(
+        channels=["probe", "trig", "da0", "da1"],
+        periods=[PulsePeriod(duration=10, unit="us", name="p0", states=(1, 0, 0, 1)),
+                 PulsePeriod(duration=20, unit="us", name="p1", states=(0, 1, 1, 0))],
+        name="demo_pulse", analog_buses={"da": ["da0", "da1"]})
+    info = {"kind": "pulse", "name": "demo_pulse", "source": "pulse preview",
+            "figure_recipe": {"kind": "pulse", "pulse_state": st.to_dict(), "include_always_off": True}}
+    path = tmp_path / "demo_pulse.npz"
+    np.savez(path, data_x=np.zeros((1, 1)), data_y=np.zeros((1, 1)), info=info)
+    return path
+
+
+def test_pulse_recipe_lands_as_static_card_and_keeps_the_console(tmp_path):
+    """The reported bug: loading a PULSE figure wiped the console / Monitor tab (an old special-case
+    replaced the whole board with a bare recipe canvas).  A pulse figure is ``panel=False`` (not
+    array-fed), so it is NOT a signal panel -- but it must still open on the SAME console board as a
+    ``StaticFigureCard`` (a card beside the panels), with the Monitor tab + Add Panel intact.  Pins: the
+    console is a real board (never None), the Monitor tab is present, the reproduced pulse is exactly one
+    static card (no seeded signal panel, no fig_value node), and it is a faithful ``PulseSequenceFigure``."""
+    from Zou_lab_control.frontend.task_console import StaticFigureCard
+    npz = _saved_pulse_recipe_npz(tmp_path)
+    v = show_figure_viewer(npz)
+    try:
+        con = v.console
+        assert isinstance(con, TaskConsole), "a pulse figure opens on the SAME console (never replaced)"
+        assert v.saved.kind == "pulse"
+        tab_titles = {con.tabs.tabText(i) for i in range(con.tabs.count())}
+        assert "Monitor" in tab_titles, "the Monitor tab survives a pulse load"
+        statics = [c for c in con.cards if isinstance(c, StaticFigureCard)]
+        assert len(statics) == 1 and len(con.cards) == 1, "one static pulse card, no seeded signal panel"
+        assert v.node is None, "a pulse recipe publishes no fig_value signal"
+        assert FIG_SIGNAL not in set(v.hub.names()), "no fig_value on the hub for a recipe figure"
+        # faithful reproduction: a PulseSequenceFigure with many channels + an analog bus
+        plotter = v.saved.plot().live_plot
+        assert type(plotter).__name__ == "PulseSequenceFigure"
+        assert len(plotter.channels) > 1 and len(plotter.analog_traces) >= 1
+    finally:
+        win = v.window()
+        if win is not None:
+            win.close(); win.deleteLater()
+        v.teardown()
+        plt.close("all")
