@@ -197,9 +197,29 @@ class DataFigure:
             "points_done": getattr(self.live_plot, "points_done", len(self.data_x)),
             "repeat_cur": getattr(self.live_plot, "repeat_cur", 1),
         }
+        # Fold the CURRENT view unit + any applied fit into ``info`` so a reload
+        # reproduces "the figure as saved" (not just the raw arrays): ``unit`` is
+        # the display unit, and a fit -- if one has been drawn -- carries its
+        # function name, coefficients and parameter names so a reader can see /
+        # re-apply it.  These only APPEND keys; the data_x/data_y/info structure
+        # is unchanged, so an older reader still reads the file.
+        fit_info = self._saved_fit_info()
+        if fit_info is not None:
+            info.setdefault("fit", fit_info)
         self.fig.savefig(image_path, bbox_inches="tight")
         np.savez(data_path, data_x=self.data_x_original, data_y=self.data_y, info=info)
         return {"figure": image_path, "data": data_path}
+
+    def _saved_fit_info(self) -> dict[str, Any] | None:
+        """The applied fit as a JSON-friendly dict (``func`` + ``names`` + ``popt``) for the
+        saved ``info``, or ``None`` when no fit has been drawn.  ``popt`` becomes a plain list
+        (never a raw ndarray) so ``np.savez`` round-trips it cleanly and a reader can read it
+        without unpacking an object array."""
+        if not self.fit_func or self.popt is None:
+            return None
+        names = list(getattr(self, "popt_str", []) or [])
+        return {"func": str(self.fit_func), "names": names,
+                "popt": [float(v) for v in np.asarray(self.popt, dtype=float).ravel()]}
 
     def _align_to_grid(self, value: float, axis: str) -> float:
         if self.plot_type != "2D" or self.live_plot is None:
@@ -731,5 +751,201 @@ class DataFigure:
         self.fig.canvas.draw_idle()
 
 
-__all__ = ["DataFigure", "FitResult", "VALID_FIT_FUNCS"]
+# ---------------------------------------------------------------------------
+# Reopening a saved figure (the read-back counterpart of ``DataFigure.save``).
+# ---------------------------------------------------------------------------
+
+#: The view-state keys ``SavedFigure`` restores and that ``plot()`` accepts as DATA options.
+#: An override only reaches ``plot()`` when it is in THIS set (a saved layout may carry a
+#: knob that a re-interpreted kind does not take, e.g. ``cmap`` on a 1-D plot -- it is simply
+#: dropped rather than raising).  Geometry / dpi / typography are NOT here: they are frontend-
+#: owned (the sealed-API contract), so a saved figure can never smuggle them back in.
+_VIEW_PLOT_KWARGS: tuple[str, ...] = (
+    "relim_mode", "fixed_lo", "fixed_hi", "cmap", "bins", "thresholds", "labels",
+)
+
+#: ``PanelEditor`` stores its Setting/Edit view knobs under this sub-dict of ``info`` (so the
+#: raw payload stays tidy); ``relim`` there is confocal naming for ``plot()``'s ``relim_mode``.
+_VIEW_INFO_KEY = "view"
+
+
+def _view_to_plot_kwargs(view: Mapping[str, Any]) -> dict[str, Any]:
+    """Translate a saved ``info['view']`` dict into the DATA kwargs ``plot()`` accepts.
+
+    The stored ``relim`` (confocal naming) maps to ``plot()``'s ``relim_mode``, and ``fixed_lo``/
+    ``fixed_hi`` are only forwarded when the mode is actually ``fixed`` (mirroring the live panel
+    builder, which omits them otherwise so the plotter keeps its autoscale).  ``unit`` / ``size`` /
+    ``repeat_mode`` live in ``info`` (not ``plot()`` kwargs) and are handled by the caller."""
+    out: dict[str, Any] = {}
+    relim = view.get("relim", view.get("relim_mode"))
+    if relim:
+        out["relim_mode"] = str(relim)
+    if str(relim) == "fixed":
+        for k in ("fixed_lo", "fixed_hi"):
+            if view.get(k) is not None:
+                out[k] = float(view[k])
+    cmap = view.get("cmap")
+    if cmap:
+        out["cmap"] = str(cmap)
+    return out
+
+
+class SavedFigure:
+    """A lightweight, hardware-free handle for a ``.npz`` written by :meth:`DataFigure.save`.
+
+    It answers "what was saved" (:meth:`info_summary`), lists the plot kinds the saved data can
+    be viewed as (:meth:`compatible_kinds`), and re-renders it (:meth:`plot`) through the SAME
+    :func:`~.live.plot` factory the live figure used -- so the saved kind reproduces the original
+    figure and any other compatible kind re-interprets the SAME ``data_x`` / ``data_y`` with a
+    different plotter.  Build one with :func:`load_figure`."""
+
+    def __init__(self, *, data_x, data_y, info: Mapping[str, Any], path=None):
+        self.path = Path(path) if path is not None else None
+        self.data_x = np.asarray(data_x)
+        self.data_y = np.asarray(data_y)
+        self.info = dict(info or {})
+        self.view = dict(self.info.get(_VIEW_INFO_KEY) or {})
+
+    # -- provenance accessors (all read from ``info``, with sane defaults for old npz) ---------
+    @property
+    def kind(self) -> str | None:
+        return self.info.get("kind")
+
+    @property
+    def name(self) -> str | None:
+        return self.info.get("name")
+
+    @property
+    def labels(self) -> list[str] | None:
+        labels = self.info.get("labels")
+        return list(labels) if labels is not None else None
+
+    @property
+    def unit(self) -> str | None:
+        return self.info.get("unit") or self.view.get("unit")
+
+    @property
+    def shape(self) -> dict[str, tuple[int, ...]]:
+        return {"data_x": tuple(self.data_x.shape), "data_y": tuple(self.data_y.shape)}
+
+    @property
+    def saved_at(self) -> str | None:
+        """The save timestamp, recovered from the ``<name>_<YYYY_MM_DD_HH_MM_SS>`` file name
+        (the format :meth:`DataFigure.save` writes) or ``None`` if the name does not carry one."""
+        if self.path is None:
+            return None
+        m = re.search(r"(\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2})", self.path.stem)
+        return m.group(1) if m else None
+
+    def compatible_kinds(self) -> list[str]:
+        """The panel plot kinds this saved data can be viewed as, derived from the data SHAPE and
+        the ``PLOT_KINDS`` ``render_family`` (never a hard-coded list): a 2-column ``data_x`` (a 2-D
+        scan) offers the ``"2D"`` families (image / site map); a 1-column ``data_x`` offers the
+        ``"1D"`` families (line / rolling trace / distribution).  The saved kind is always first so
+        it reproduces the original figure."""
+        from .live import PLOT_KINDS
+
+        is_2d = self.data_x.ndim == 2 and self.data_x.shape[1] >= 2
+        want = "2D" if is_2d else "1D"
+        kinds: list[str] = []
+        for pk in PLOT_KINDS:
+            if not pk.panel:
+                continue
+            # The site map declares ``render_family="auto"`` (image-only when it has a frame), but it
+            # is a 2-D VIEW -- it needs (N, 2) centres as data_x -- so it belongs with the 2-D family.
+            fam = "2D" if pk.render_family == "auto" else pk.render_family
+            if fam == want:
+                kinds.append(pk.key)
+        saved = self.kind
+        if saved in kinds:                       # saved kind FIRST (reproduces the original figure)
+            kinds = [saved] + [k for k in kinds if k != saved]
+        elif saved:
+            kinds = [saved] + kinds
+        return kinds
+
+    def info_summary(self) -> str:
+        """A human-readable multi-line answer to "what is in this file": name, source, kind, labels,
+        unit, array shapes, points/repeat progress, the saved view state and any applied fit."""
+        rows: list[tuple[str, Any]] = [
+            ("name", self.name),
+            ("source", self.info.get("source")),
+            ("kind", self.kind),
+            ("labels", self.labels),
+            ("unit", self.unit),
+            ("data_x shape", tuple(self.data_x.shape)),
+            ("data_y shape", tuple(self.data_y.shape)),
+            ("points_done", self.info.get("points_done")),
+            ("repeat_cur", self.info.get("repeat_cur")),
+            ("saved_at", self.saved_at),
+        ]
+        if self.info.get("size"):
+            rows.append(("size", self.info.get("size")))
+        if self.view:
+            view_bits = ", ".join(f"{k}={v}" for k, v in self.view.items() if v is not None)
+            rows.append(("view", view_bits or "(defaults)"))
+        fit = self.info.get("fit")
+        if isinstance(fit, Mapping) and fit.get("func"):
+            pairs = ", ".join(f"{n}={float(v):.5g}"
+                              for n, v in zip(fit.get("names", []), fit.get("popt", [])))
+            rows.append(("fit", f"{fit['func']}: {pairs}" if pairs else str(fit["func"])))
+        width = max((len(k) for k, _ in rows), default=0)
+        header = f"SavedFigure({self.path.name})" if self.path is not None else "SavedFigure"
+        lines = [header] + [f"  {k.ljust(width)} : {v}" for k, v in rows if v is not None]
+        return "\n".join(lines)
+
+    def plot(self, kind: str | None = None, size: str | None = None, **overrides):
+        """Re-render this saved figure as a :class:`DataFigure` -- DATA-viewing semantics: the SAME
+        ``data_x`` / ``data_y`` are handed to :func:`~.live.plot` under ``kind`` (the saved kind by
+        default, which reproduces the original figure; any :meth:`compatible_kinds` value instead
+        re-interprets the data with a different plotter).  The saved view state (relim / fixed lo-hi /
+        cmap / labels) seeds the plotter and ``overrides`` win over it.  Only DATA kwargs
+        (:data:`_VIEW_PLOT_KWARGS`) reach ``plot()`` -- geometry / dpi / typography stay frontend-owned,
+        and a saved knob a re-interpreted kind does not accept is dropped, never raised."""
+        from .live import panel_plot_spec, plot as _plot
+
+        use_kind = kind or self.kind or "auto"
+        use_size = size or self.info.get("size", "2x2")
+        # Seed from the saved view state, then let explicit overrides win.
+        kwargs = _view_to_plot_kwargs(self.view)
+        if self.labels is not None:
+            kwargs.setdefault("labels", self.labels)
+        kwargs.update(overrides)
+        # Keep only the kwargs plot() accepts as DATA options (drop a knob a re-interpreted kind
+        # would reject, e.g. cmap on a 1-D plot); geometry keys never appear here by construction.
+        kwargs = {k: v for k, v in kwargs.items() if k in _VIEW_PLOT_KWARGS}
+        try:
+            spec = panel_plot_spec(use_size)
+        except Exception:
+            spec = None
+        plotter = _plot(self.data_x, self.data_y, kind=use_kind, _spec=spec,
+                        display=False, data_figure=True, update=False, **kwargs)
+        # ``plot()`` returns the PLOTTER (with its DataFigure built when data_figure=True); hand back
+        # the DataFigure -- the reusable fit / unit / re-save stack -- exactly as ``live.load`` does.
+        df = getattr(plotter, "data_figure", None) or plotter.to_data_figure()
+        # Carry the saved provenance onto the reopened DataFigure so a unit-cycle / re-save
+        # round-trips identically (name, source, kind, unit, view, fit).
+        df.info = {**df.info, **{k: v for k, v in self.info.items() if k != "labels"}}
+        if self.name:
+            df.name = self.name
+        return df
+
+
+def load_figure(path) -> SavedFigure:
+    """Load a ``.npz`` saved by :meth:`DataFigure.save` into a :class:`SavedFigure`.
+
+    The read-back counterpart of save: with no hardware or session, reopen an overnight scan /
+    a saved panel to inspect what it holds (``.info_summary()``), list how it can be viewed
+    (``.compatible_kinds()``) or re-render it (``.plot()`` / ``.plot(kind=...)``).  Robust to old
+    payloads that carry only ``data_x`` / ``data_y`` and a minimal ``info``."""
+    path = Path(path)
+    data = np.load(str(path), allow_pickle=True)
+    if "data_x" not in data.files or "data_y" not in data.files:
+        raise ValueError(f"{path} is not a DataFigure save (missing data_x/data_y).")
+    info = data["info"].item() if "info" in data.files else {}
+    if not isinstance(info, Mapping):
+        info = {}
+    return SavedFigure(data_x=data["data_x"], data_y=data["data_y"], info=info, path=path)
+
+
+__all__ = ["DataFigure", "FitResult", "SavedFigure", "VALID_FIT_FUNCS", "load_figure"]
 

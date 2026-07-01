@@ -159,6 +159,12 @@ def __getattr__(name: str):
         from .devices.sequencer_server import CommandSequencerBackend
 
         return CommandSequencerBackend
+    if name == "load_figure":
+        # Reopen a saved figure npz (``na.load_figure('scan.npz')``) -- reached LAZILY through the
+        # GUI-action module so the frontend is not pulled onto the analysis import path.
+        from ._gui import load_figure
+
+        return load_figure
     if name in _PULSE_STREAMER_EXPORTS:
         from .devices import fpga_pulse_streamer
 
@@ -258,6 +264,7 @@ __all__ = [
     "infer_xdc_channel_labels",
     "infer_xdc_channels",
     "load_devices",
+    "load_figure",
     "otsu_threshold",
     "plot_detection_image",
     "plot_detection_scan",

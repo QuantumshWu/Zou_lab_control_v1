@@ -4493,6 +4493,21 @@ class PanelEditor(QtWidgets.QWidget):
             return
         self.save_preview.setText(f"{display_path(str(self._save_stem(None)))}.png + .npz")
 
+    def _save_view_state(self) -> dict[str, object]:
+        """The panel's DISPLAY knobs, read from ``config.params`` (the one source), folded into the
+        saved ``info['view']`` so ``load_figure(...).plot()`` reopens the figure AS SEEN: relim mode
+        + fixed lo/hi (``card._relim`` / the fixed bounds), unit index, colormap and repeat mode.
+        Everything defaults, so a panel saved before a knob was touched still round-trips cleanly."""
+        params = self.card.config.params
+        return {
+            "relim": self.card._relim(),
+            "fixed_lo": _safe_float(str(params.get("fixed_lo", 0.0)), 0.0),
+            "fixed_hi": _safe_float(str(params.get("fixed_hi", 1.0)), 1.0),
+            "unit_index": int(params.get("unit_index", 0) or 0),
+            "cmap": str(params.get("cmap", "")),
+            "repeat_mode": self.card._repeat_mode_value(),
+        }
+
     def save(self) -> None:
         if self._plotter is None:
             return
@@ -4504,7 +4519,9 @@ class PanelEditor(QtWidgets.QWidget):
             # so this resolver is the single source of the output name.
             out = df.save(stem.with_suffix(".png"),
                           extra_info={"source": self.card.config.source,
-                                      "kind": self.card.config.kind})
+                                      "kind": self.card.config.kind,
+                                      "size": self.card.config.size,
+                                      "view": self._save_view_state()})
             self.console._last_save_dir = str(stem.parent)   # remember where (kernel session)
             self._update_save_preview()
             # Show the LEAF folder, not the full absolute path (the full path is one click away in the

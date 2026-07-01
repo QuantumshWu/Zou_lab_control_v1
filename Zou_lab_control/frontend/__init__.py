@@ -31,7 +31,7 @@ from .canvas import (
     save_figure_data,
     split_axes_horizontally,
 )
-from .data_figure import DataFigure, FitResult
+from .data_figure import DataFigure, FitResult, SavedFigure, load_figure
 from .jupyter import (
     BOOTSTRAP_CELL,
     NotebookBuildResult,
@@ -181,6 +181,7 @@ __all__ = [
     "PulseSequenceEditor",
     "PulseSequenceFigure",
     "RunSession",
+    "SavedFigure",
     "SmartOffsetFormatter",
     "SmartOffsetLocator",
     "ZoomPan",
@@ -198,6 +199,7 @@ __all__ = [
     "enable_long_output",
     "execute_notebook",
     "load",
+    "load_figure",
     "new_figure",
     "notebook_setup",
     "notes_template_dir",

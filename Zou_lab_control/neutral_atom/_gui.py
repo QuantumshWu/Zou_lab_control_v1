@@ -102,4 +102,15 @@ def open_pulse_gui(session: Any = None, *, state=None, **kwargs):
     return editor
 
 
-__all__ = ["open_task_console", "open_pulse_gui"]
+def load_figure(path):
+    """Reopen a ``.npz`` saved by a panel's / notebook figure's Save as a hardware-free
+    ``SavedFigure`` -- ``na.load_figure('scan.npz').info_summary()`` tells what it holds and
+    ``.plot(kind=...)`` re-renders it, all without a session.  Sugar over
+    ``frontend.load_figure`` (the LAZY frontend reach lives here, off the analysis path)."""
+
+    from Zou_lab_control.frontend import load_figure as _load_figure
+
+    return _load_figure(path)
+
+
+__all__ = ["open_task_console", "open_pulse_gui", "load_figure"]
