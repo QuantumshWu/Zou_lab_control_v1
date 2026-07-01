@@ -278,6 +278,7 @@ def create_axes_grid(
     col_gap_px: int = 30,
     row_gap_px: int = 40,
     margins_px: tuple[int, int, int, int] = (78, 34, 60, 54),
+    data_px: tuple[int, int] | None = None,
 ) -> list[plt.Axes]:
     """Create ``nrows*ncols`` fixed-pixel cells in row-major (top-left first) order.
 
@@ -287,16 +288,36 @@ def create_axes_grid(
     aligned.  ``cell_px`` is ``(width, height)`` of one cell's full box (axes +
     its own ticks); ``margins_px`` is ``(left, right, bottom, top)`` around the
     whole grid (top leaves room for a suptitle).
+
+    ``data_px`` (``(width, height)``) makes the grid fill a TOTAL data region of that
+    size -- the SAME data region every other panel kind uses (``panel_plot_spec(size).data_px``)
+    -- by SUBDIVIDING it into ``ncols`` x ``nrows`` cells with the given inter-cell gaps
+    (``cell_px`` is then derived to fill ``data_px``, not read).  When given, the whole
+    cell block is the fixed data box, so ``fig._zlc_fixed_box_in`` is recorded EXACTLY as
+    ``create_axes_fixed`` does -- a grid figure's data region then equals a single-axes
+    panel's of the same size, and a size change truly rescales the cells (not just the
+    padding).  Omit it for the legacy fixed-``cell_px`` mode (cells drive the figure size).
     """
 
     nrows, ncols = max(1, int(nrows)), max(1, int(ncols))
     dpi = design_dpi(fig)
-    cw_in, ch_in = cell_px[0] / dpi, cell_px[1] / dpi
     cgap, rgap = col_gap_px / dpi, row_gap_px / dpi
     L, R, B, T = [m / dpi for m in margins_px]
+    if data_px is not None:
+        # Fill a FIXED total data region (== panel_plot_spec(size).data_px): the cells + gaps
+        # exactly span ``data_px``, so a grid's data box matches a single-axes panel's of the
+        # same size.  cell_px is DERIVED to fill it (the remaining width/height after gaps,
+        # split evenly), never read from the argument.
+        dw_in, dh_in = data_px[0] / dpi, data_px[1] / dpi
+        cw_in = max((dw_in - (ncols - 1) * cgap) / ncols, 1.0 / dpi)
+        ch_in = max((dh_in - (nrows - 1) * rgap) / nrows, 1.0 / dpi)
+    else:
+        cw_in, ch_in = cell_px[0] / dpi, cell_px[1] / dpi
 
-    fig_w = L + ncols * cw_in + (ncols - 1) * cgap + R
-    fig_h = B + nrows * ch_in + (nrows - 1) * rgap + T
+    block_w = ncols * cw_in + (ncols - 1) * cgap
+    block_h = nrows * ch_in + (nrows - 1) * rgap
+    fig_w = L + block_w + R
+    fig_h = B + block_h + T
     fig.set_size_inches(fig_w, fig_h, forward=True)
 
     horiz: list[Any] = [Size.Fixed(L)]
@@ -320,6 +341,12 @@ def create_axes_grid(
             ax.set_axes_locator(divider.new_locator(nx=1 + 2 * c, ny=1 + 2 * (nrows - 1 - r)))
             axes.append(ax)
     fig._zlc_grid = (nrows, ncols)
+    # Record the WHOLE cell block as the fixed data box (like create_axes_fixed) so the grid's
+    # data region equals panel_plot_spec(size).data_px and a focused single cell / contract test
+    # can read it back.  Only in data_px mode -- the legacy cell_px mode has no single data box.
+    if data_px is not None:
+        fig._zlc_fixed_box_in = (block_w, block_h)
+        fig._zlc_fixed_bounds_frac = (L / fig_w, B / fig_h, block_w / fig_w, block_h / fig_h)
     return axes
 
 

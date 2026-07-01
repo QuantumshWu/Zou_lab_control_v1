@@ -495,6 +495,12 @@ class DragVLine:
         return abs(event.xdata - x) <= tol
 
     def on_press(self, event) -> None:
+        # A DOUBLE-click is a focus-zoom toggle (a grid cell enlarge / return), NEVER the start of a
+        # threshold drag: starting a drag on the dblclick would leave the paired area selector deactivated
+        # after the grid returns (it deactivates on drag-start and only re-arms on release, which a dblclick
+        # has none of).  So ignore dblclick presses here and let only a single press begin a drag.
+        if getattr(event, "dblclick", False):
+            return
         if event.button == 1 and self._near(event):
             self.dragging = True
             self.ax.figure._zlc_disable_area_once = True

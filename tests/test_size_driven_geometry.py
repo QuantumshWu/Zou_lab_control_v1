@@ -35,14 +35,17 @@ import pytest  # noqa: E402
 
 from Zou_lab_control.frontend.live import (  # noqa: E402
     PANEL_SIZES,
+    HistogramFigure,
     SiteHistogramGrid,
     build_grid_figure,
     build_pulse_preview_plot,
     default_pulse_size,
     grid_recipe_from_cells,
+    optimal_grid_size,
     optimal_pulse_size,
     panel_margins_px,
     panel_plot_spec,
+    panel_size_cells,
     pulse_drawn_rows,
     pulse_plot_spec,
 )
@@ -97,15 +100,79 @@ def test_pulse_data_region_scales_with_size():
     plt.close(small.fig); plt.close(big.fig)
 
 
+@pytest.mark.parametrize("size", ["2x2", "4x4"])
+def test_grid_data_region_equals_the_size_panel_data_px(size):
+    """The grid's TOTAL data region == ``panel_plot_spec(size).data_px`` -- the SAME data box every OTHER
+    panel kind uses at this size (part A: the grid geometry is single-sourced off panel_plot_spec, no longer
+    a bespoke fixed per-cell box).  Asserted to the PIXEL at 2x2 AND 4x4 off ``fig._zlc_fixed_box_in`` (which
+    create_axes_grid(data_px=...) records for the whole cell block), so 2x2 grid data px == 2x2 hist / 2d /
+    1d data px, and 4x4 likewise -- the real detection the earlier bw>sw check glossed over."""
+    recipe = _grid_recipe()
+    g = build_grid_figure(recipe, size=size, display=False)
+    dpi = design_dpi(g.fig)
+    box_w, box_h = g.fig._zlc_fixed_box_in
+    got = (round(box_w * dpi), round(box_h * dpi))
+    assert got == panel_plot_spec(size).data_px, \
+        f"grid {size} data region {got} != panel_plot_spec({size}).data_px {panel_plot_spec(size).data_px}"
+    plt.close(g.fig)
+
+
 def test_grid_cells_scale_with_size():
-    """A grid's per-cell box grows with the size preset (2x2 vs 4x4 give a different figure size)."""
+    """A grid's data region grows with the size preset (2x2 vs 4x4 give a strictly larger data box AND
+    figure), so the size preset truly rescales the cells, not just the padding."""
     recipe = _grid_recipe()
     small = build_grid_figure(recipe, size="2x2", display=False)
     big = build_grid_figure(recipe, size="4x4", display=False)
     sw, sh = small.fig.get_size_inches()
     bw, bh = big.fig.get_size_inches()
     assert bw > sw and bh > sh, f"grid 4x4 ({bw:.2f}x{bh:.2f}) must exceed 2x2 ({sw:.2f}x{sh:.2f})"
+    # and the DATA region (not just the outer figure) grows -- the point of size-driven geometry
+    assert panel_plot_spec("4x4").data_px[0] > panel_plot_spec("2x2").data_px[0]
     plt.close(small.fig); plt.close(big.fig)
+
+
+def test_optimal_grid_size_is_the_4_cell_boundary_default():
+    """``optimal_grid_size`` is the ONE grid default-size source (part A) with the 4-cell boundary per axis:
+    a dimension with < 4 cells gets the compact half-unit (2), >= 4 gets the double half-unit (4), mapped to
+    the NEAREST available ``PANEL_SIZES`` preset.  So a small grid opens ``2x2`` and a big grid ``4x4`` -- and
+    a grid built with ``size=None`` (the factory default) adopts exactly this preset (single source, no drift)."""
+    # the 4-cell boundary on each axis
+    for r, c in [(1, 1), (2, 2), (2, 3), (3, 3)]:
+        assert panel_size_cells(optimal_grid_size(r, c)) == (2, 2), f"{r}x{c} (all < 4) -> compact 2x2"
+    for r, c in [(4, 4), (5, 5), (4, 6)]:
+        assert panel_size_cells(optimal_grid_size(r, c)) == (4, 4), f"{r}x{c} (>= 4) -> double 4x4"
+    # every returned preset is a real PANEL_SIZES member
+    for r in range(1, 8):
+        for c in range(1, 8):
+            assert optimal_grid_size(r, c) in PANEL_SIZES
+    # a grid built with size=None adopts the shape-driven default (the factory reads the SAME source)
+    recipe = _grid_recipe(n=16)                 # 4x4 shape -> the 4x4 preset
+    g = build_grid_figure(recipe, size=None, display=False)
+    assert g._size == optimal_grid_size(g.nrows, g.ncols)
+    plt.close(g.fig)
+
+
+def test_grid_focus_is_a_full_plot_kind_not_a_thumbnail():
+    """A grid's FOCUSED (enlarged) cell is a FULL plot-kind figure (part B), NOT the simplified thumbnail:
+    focusing a distribution cell builds a real :class:`HistogramFigure` on the focus axes -- so it carries a
+    DRAGGABLE threshold, the two-Gaussian fit, the fidelity stat text and full x/y axes -- and unfocus tears
+    it down cleanly (the focus axes + any composite sub-axes removed, the grid cells back)."""
+    recipe = _grid_recipe()
+    g = build_grid_figure(recipe, size="2x2", display=False)
+    n_axes_grid = len(g.fig.axes)
+    g.focus(0)
+    fp = g._focus_plotter
+    assert isinstance(fp, HistogramFigure), "a distribution cell focuses into a full HistogramFigure"
+    # the full-plot-kind machinery is present (a thumbnail has none of it)
+    assert fp.threshold_draggers, "the focused cell has a DRAGGABLE threshold (not a static line)"
+    assert fp.bimodal_popt is not None, "the focused cell ran the two-Gaussian fit"
+    assert fp.ax.get_xlabel() and fp.ax.get_ylabel(), "the focused cell has full x/y axis labels"
+    assert fp.interaction_handles(), "the focused cell attaches its own selectors (reusable layer)"
+    g.unfocus()
+    assert g._focused is None and g.focus_ax is None, "unfocus returns to the grid"
+    assert len(g.fig.axes) == n_axes_grid, "unfocus removes the focus axes + any composite sub-axes"
+    assert all(ax.get_visible() for ax in g.site_axes), "the grid cells are visible again"
+    plt.close(g.fig)
 
 
 # --------------------------------------------------------------------------- 2. focus == same-size panel

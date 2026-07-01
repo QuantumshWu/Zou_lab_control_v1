@@ -301,6 +301,40 @@ def test_grid_recipe_reopens_as_faithful_grid(tmp_path):
         plt.close("all")
 
 
+def test_focused_dis_grid_save_reopens_as_a_faithful_hist_grid(tmp_path):
+    """Part C: a distribution grid that was ENLARGED (focused) into one cell and had its DISPLAY knobs
+    changed (bins / ylog) saves a recipe that records the ``focused_cell_index`` + ``display_params`` +
+    ``panel_size`` -- and ``na.load_figure(npz).plot()`` reopens it as a FAITHFUL hist grid (cell='hist'),
+    re-applies the display knobs, and re-focuses the SAME cell as a full HistogramFigure.  The reported bug
+    was a focused dis grid that would not draw on reopen / fell back to the wrong (site) kind; this pins the
+    hist cell family driving the reopen (never sites) and the view-state round-trip."""
+    from Zou_lab_control.frontend.live import site_histogram_grid, SiteHistogramGrid, HistogramFigure
+    import Zou_lab_control.neutral_atom as na
+    rng = np.random.default_rng(7)
+    per = [np.concatenate([rng.normal(200, 25, 60), rng.normal(1200, 70, 40)]) for _ in range(6)]
+    grid = site_histogram_grid(per, thresholds=[700.0] * 6, site_fidelities=[0.99] * 6, display=False)
+    grid.apply_param("bins", 48)             # a display knob that re-bins the cells
+    grid.apply_param("ylog", True)           # a display knob that takes effect on a focused cell
+    grid.focus(3)                            # enlarge cell 3 into a full HistogramFigure
+    out = grid.save(str(tmp_path / "focused_dis_grid"))
+    plt.close(grid.fig)
+    saved = na.load_figure(out["data"])
+    try:
+        assert saved.kind == "grid", "a dis grid saves as kind='grid'"
+        recipe = saved.figure_recipe
+        assert recipe["cell"] == "hist", "the recipe's cell family is hist (drives the reopen -> NOT sites)"
+        assert recipe["focused_cell_index"] == 3, "the focused cell index is recorded"
+        assert recipe["display_params"].get("bins") == 48 and recipe["display_params"].get("ylog") is True
+        assert saved.compatible_kinds() == ["grid"], "a structured grid figure offers only its recipe kind"
+        reopened = saved.plot().grid                       # the recipe replay path -- must draw, not crash
+        assert isinstance(reopened, SiteHistogramGrid), "reopens as a hist grid (NOT a site map)"
+        assert reopened._display_params.get("bins") == 48, "the saved display knobs are restored"
+        assert reopened._focused == 3, "the reopen re-focuses the saved cell"
+        assert isinstance(reopened._focus_plotter, HistogramFigure), "the enlarged cell is a full hist figure"
+    finally:
+        plt.close("all")
+
+
 def test_recipeless_grid_save_falls_back_to_arrays_not_a_crash(tmp_path, monkeypatch):
     """A grid save whose recipe capture FAILS must NOT stamp ``kind='grid'`` (which would send the reopen
     down ``plot(kind='grid')`` -- rejected, like pulse -- and crash).  Without a recipe the save has NO

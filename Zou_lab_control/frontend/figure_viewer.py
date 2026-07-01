@@ -415,9 +415,18 @@ def _seed_state(saved: SavedFigure) -> TaskConsoleState:
         elif resolved is not None:
             size = default_pulse_size(resolved[0], include_always_off=include_off)
     elif kind == "grid":
+        # A grid panel opens at its SAVED size (recipe['panel_size']) if recorded, else the shape-driven
+        # optimal_grid_size default (the SAME source the grid factory uses), and restores its saved DISPLAY
+        # knobs (bins / fit / ylog) as panel params so the reopened grid draws exactly as it did when saved.
         recorded = recipe.get("panel_size")
         if recorded:
             size = str(recorded)
+        else:
+            shape = recipe.get("grid_shape") or (1, 1)
+            from .live import optimal_grid_size
+            size = optimal_grid_size(int(shape[0]), int(shape[1]))
+        for key, val in dict(recipe.get("display_params") or {}).items():
+            view.setdefault(str(key), val)               # saved display knobs seed the panel params
     panel = PanelConfig(
         kind=kind,
         title=str(saved.name or "figure"),

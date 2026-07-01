@@ -1063,9 +1063,22 @@ PANEL_PARAMS: dict[str, tuple[ParamDecl, ...]] = {
         ParamDecl(key="include_always_off", label="show off rows", kind="bool", default=True, display=True,
                   tooltip="Draw channel rows that stay OFF the whole sequence (and idle DAC buses)"),
     ),
-    # A grid panel (seeded from a saved per-site grid figure) has NO display knobs: the whole grid --
-    # cell family, thresholds, fidelities -- is fixed by the saved recipe and rendered faithfully.
-    "grid": (),
+    # A grid panel (seeded from a saved per-site grid figure) carries the SAME display knobs as a hist
+    # panel -- bins / fit / log axis -- which flow to the grid's cells (and especially the ENLARGED focused
+    # cell, which is a full HistogramFigure via GridPlot.apply_param).  ``bins`` re-bins the thumbnails too;
+    # ``fit`` / ``ylog`` take effect on a focused cell (a thumbnail has no fit).  A kernel (image) grid
+    # ignores the hist-only knobs.  The whole grid's cell family / thresholds / fidelities stay fixed by the
+    # saved recipe; these only change HOW the same data is drawn, so they belong here with size / relim.
+    "grid": (
+        ParamDecl(key="bins", label="bins", kind="int", default=36, lo=5, hi=500, display=True,
+                  tooltip="Histogram bins for the per-site distributions (re-bins the cells)"),
+        ParamDecl(key="fit", label="fit", kind="choice", choices=("none", "single", "double"),
+                  default="double", segmented=True, display=True,
+                  tooltip="Distribution fit drawn in the ENLARGED (double-click) cell view:\n"
+                          "  none / single / double (the dark/bright two-Gaussian readout)"),
+        ParamDecl(key="ylog", label="log count axis", kind="bool", default=False, display=True,
+                  tooltip="Log-scale the count axis in the ENLARGED cell view (reveals a sparse bright tail)"),
+    ),
 }
 
 
@@ -2445,6 +2458,22 @@ class PanelCard(FluentGroupBox):
         self.changed.emit()                    # mark the layout dirty
 
     # --------------------------------------------- basic display application
+    def _grid_recipe_with_params(self, recipe: Mapping[str, object]) -> dict:
+        """Fold THIS panel's live grid DISPLAY knobs (``bins`` / ``fit`` / ``ylog`` from ``config.params``)
+        into the producing node's grid recipe, so a rebuild redraws the grid with the operator's current
+        Setting choices (not just the recipe's saved defaults).  The panel's params WIN over the recipe's
+        stored ``display_params`` (the operator's live pick is the source of truth); ``bins`` also overrides
+        the recipe's top-level ``bins`` so the thumbnails re-bin.  A copy -- the node's recipe is untouched."""
+        out = dict(recipe)
+        display = dict(out.get("display_params") or {})
+        for key in ("bins", "fit", "ylog"):
+            if key in self.config.params:
+                display[key] = self.config.params[key]
+        if "bins" in display:
+            out["bins"] = int(display["bins"])          # top-level bins drives the thumbnail binning
+        out["display_params"] = display
+        return out
+
     def _apply_display_params(self) -> None:
         """Apply the persisted Setting toggles (relim mode + unit cycle) to
         the current plotter -- called after every rebuild and on each edit.
@@ -3193,6 +3222,7 @@ class PanelCard(FluentGroupBox):
                 raise ValueError(
                     "grid panel needs a grid figure's producing node -- point it at a loaded grid "
                     "figure's fig_value signal (it carries the grid recipe to reproduce).")
+            recipe = self._grid_recipe_with_params(recipe)   # fold the panel's live display knobs in
             plotter = build_grid_figure(recipe, interactions=False, size=size, display=False)
         elif kind == "sites":
             centers, image = self._sites_aux(namespace or {})
@@ -4237,6 +4267,7 @@ class PanelEditor(QtWidgets.QWidget):
                 recipe = self.console._grid_recipe(card.config.inputs[0]) if card.config.inputs else None
                 if recipe is None:
                     raise ValueError("grid panel has no producing node to snapshot")
+                recipe = card._grid_recipe_with_params(recipe)   # fold the panel's live display knobs in
                 new_plotter = build_grid_figure(recipe, interactions=True, size=size, display=False)
             elif kind == "2d":
                 new_plotter = panel_plot(np.array(src.data_x, dtype=float),
