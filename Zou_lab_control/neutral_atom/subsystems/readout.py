@@ -576,9 +576,13 @@ class ReadoutSubsystem(ExperimentSubsystem):
 
         return discovered_task_specs(self)
 
-    def camera_measurement(self, hub, *, prefix: str = "", frames_per_cycle: int = 1, repeat: int = 0):
-        """Build a CONTINUOUS camera Measurement over the session camera (a
+    def camera_measurement(self, hub, *, camera: str = "camera", prefix: str = "",
+                           frames_per_cycle: int = 1, repeat: int = 0):
+        """Build a CONTINUOUS camera Measurement over a NAMED session camera (a
         :class:`~..operations.logic.CameraMeasurement` publishing raw ``frame``s).
+        ``camera`` picks the sensor by device name -- ``"camera"`` is the readout qCMOS,
+        ``"monitor_camera"`` the MOT viewer; the node is identical either way (the
+        pure-grabber contract).
 
         This is the standalone live-image logic node -- one of the primitives a
         notebook or the task console composes the loading readout from by wiring
@@ -597,7 +601,8 @@ class ReadoutSubsystem(ExperimentSubsystem):
         from ..operations.logic import CameraMeasurement
 
         s = self._session
-        return CameraMeasurement(hub, s.devices.camera, sequencer=getattr(s.devices, "sequencer", None),
+        return CameraMeasurement(hub, s.devices[str(camera or "camera")],
+                                 sequencer=getattr(s.devices, "sequencer", None),
                                  frames_per_cycle=frames_per_cycle, prefix=prefix, repeat=repeat)
 
     def camera_spec(self) -> MeasurementSpec:
@@ -617,7 +622,6 @@ class ReadoutSubsystem(ExperimentSubsystem):
         GUI share one path."""
 
         s = self._session
-        exposure = float(s._camera_exposure())
 
         def _parse_region(text):
             """``"x0, x1, y0, y1"`` (sensor-pixel ENDPOINTS) -> a 4-list, or None for
@@ -631,11 +635,16 @@ class ReadoutSubsystem(ExperimentSubsystem):
                 raise ValueError("region must be 'x0, x1, y0, y1' (4 numbers) or blank for full sensor.")
             return [float(p) for p in parts]
 
-        def _build(hub, *, frames_per_cycle: int = 1, exposure: float = exposure,
-                   region: str = "", repeat: int = 0, **_ignored):
-            node = self.camera_measurement(hub, frames_per_cycle=int(frames_per_cycle),
+        def _build(hub, *, camera: str = "camera", frames_per_cycle: int = 1,
+                   exposure: float | None = None, region: str = "", repeat: int = 0, **_ignored):
+            node = self.camera_measurement(hub, camera=str(camera or "camera"),
+                                           frames_per_cycle=int(frames_per_cycle),
                                            repeat=max(0, int(repeat)))
             apply: dict[str, object] = {}
+            # exposure is PER-SELECTED-CAMERA state: blank/None = keep the chosen sensor's own
+            # current exposure (a spec-time default would freeze the MAIN camera's value and
+            # silently overwrite the monitor camera's when the choice changes -- the one
+            # confirmed X-round review finding).  Same blank-semantics as ``region``.
             if exposure is not None:
                 apply["exposure"] = float(exposure)
             # Always push ``region`` (None for blank) so a build matches the Edit
@@ -650,14 +659,20 @@ class ReadoutSubsystem(ExperimentSubsystem):
         return MeasurementSpec(
             name="Camera (live frames)",
             params=(
+                ParamDecl(key="camera", label="Camera", kind="choice", default="camera",
+                          choices=s.devices.camera_names(),
+                          tooltip="Which sensor streams: 'camera' = the readout sensor; "
+                                  "'monitor_camera' = the MOT viewer (a free-running Basler "
+                                  "shows an image with no pulse wiring at all)."),
                 ParamDecl(key="frames_per_cycle", label="frames / cycle", kind="int",
                           default=1, lo=1, hi=10000,
                           tooltip="emCCD events (camera triggers) per cycle.  Each event i publishes its "
                                   "OWN signal frame_i = a (repeat,1,H,W) block, so you can apply repeat_mode "
                                   "to a chosen event (e.g. average just frame_1 of a 3-event cycle)."),
                 ParamDecl(key="exposure", label="exposure", kind="float",
-                          default=exposure, unit="s", lo=0.0, hi=100.0,
-                          tooltip="Camera exposure time (applied live to the camera)."),
+                          default=None, unit="s", lo=0.0, hi=100.0,
+                          tooltip="Exposure applied live to the SELECTED camera; blank = keep "
+                                  "that camera's current exposure (each sensor keeps its own)."),
                 ParamDecl(key="region", label="region x0,x1,y0,y1", kind="text", default="",
                           tooltip="Camera ROI as sensor-pixel endpoints x0,x1,y0,y1 (blank = full "
                                   "sensor).  Or drag a box on a frame plot to set it -- both go to "

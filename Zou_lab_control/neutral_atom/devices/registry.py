@@ -59,6 +59,14 @@ class DeviceSet:
     def __getitem__(self, name: str):
         return self.devices[name]
 
+    def camera_names(self) -> tuple[str, ...]:
+        """Every camera in the set, sorted by name -- THE source for any "which camera?"
+        choice (a measurement's ``camera`` ParamDecl, a sweep's frame grabber).  Falls back
+        to ``("camera",)`` so a choice widget never renders empty."""
+        names = tuple(sorted(name for name, dev in self.devices.items()
+                             if isinstance(dev, CameraDevice)))
+        return names or ("camera",)
+
     def require(self, name: str, expected_type: type | tuple[type, ...] | None = None):
         if name not in self.devices:
             raise AttributeError(name)

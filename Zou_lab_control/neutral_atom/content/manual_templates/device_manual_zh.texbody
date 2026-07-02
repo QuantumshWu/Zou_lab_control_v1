@@ -959,6 +959,32 @@ raw = camera.acquire(
 \item[\pyapi{VirtualMotCamera}（\filepath{devices/virtual.py}）] 虚拟 MOT 物理相机。它\tfocus{只感知真正 fire 出去的序列}：在帧中点时刻用 \pyapi{decode\_analog\_bus}（\filepath{timing/sequence.py}，DAC 编码链的精确逆变换）从编译后的位通道脉冲里重建每路线圈总线的带符号电平，再按三维高斯模型算 MOT 俘获效率 \(\eta=\exp\!\big(-\tfrac12\sum_i\big(\tfrac{L_i-B_{0,i}}{\sigma_i}\big)^2\big)\)，渲染一颗中心高斯荧光斑（泊松光子噪声 + 读出噪声 + 常数 offset，与 qCMOS 噪声链同构）。\tfocus{它从不读任何人的设定值}——虚拟与真机走同一条"编译产物"路径，换真机只改 \pyapi{connect()} 的配置。
 \end{description}
 
+\subsection{自动发现与一键接线：\pyapi{discover\_devices}}
+
+接真机的第一步不是抄序列号，而是\tfocus{扫一遍总线}：
+
+\begin{codeblock}[Python]
+import Zou_lab_control.neutral_atom as na
+
+found = na.discover_devices()          # 打印一张表并返回行对象
+# [basler] 24012345   acA1920-155um  (ready)
+# [  visa] GPIB0::17::INSTR  Rigol,DSG836,...  (-)
+
+cams = [d for d in found if d.config is not None]
+devices = na.load_devices({"monitor_camera": cams[0].config})   # 片段直接可用
+\end{codeblock}
+
+规则与 confocal 参考实现一致：枚举 Basler（pypylon）相机与 VISA 资源（逐个 \pyapi{*IDN?} 短超时问身份）；\tfocus{缺库或空总线是一行提示，绝不抛异常}。每台 Basler 相机的行自带 \tfocus{ready config 片段}（一台钉死 serial、\pyapi{Software} 自由跑的 \pyapi{PylonCamera}），\pyapi{load\_devices} 原样消费——发现结果与设备构造之间没有手工转抄。裸 VISA 仪器本包没有对应设备类，只列地址+身份供你接进自定义类（\pyapi{register\_device\_class}）。
+
+再快一步：自带设备图 \pyapi{"basler\_monitor"} 是\tfocus{渐进接线}配置——读出链保持虚拟，\pyapi{monitor\_camera} 是真 Basler（\pyapi{serial=""} 取第一台）。插上 USB：
+
+\begin{codeblock}[Python]
+exp = na.connect("basler_monitor", open_devices=True)
+exp.devices["monitor_camera"].capture(frames=1, display=True)   # notebook 直接看图
+\end{codeblock}
+
+控制台同一路径：\pyapi{task\_console.bat --config basler\_monitor} 启动，Add Panel → Measurement → \tfocus{Camera (live frames)}，\pyapi{Camera} 下拉切 \pyapi{monitor\_camera}，Start 即实时看图（该下拉与 Pulse scan 的相机选择同出一源 \pyapi{DeviceSet.camera\_names()}）。自由跑模式（\pyapi{Software} 触发）不需要任何脉冲接线；接好 FPGA 触发线后把 \pyapi{trigger\_source} 改 \pyapi{"Line1"}，其余代码全部不动。acA1920-155um 的 \pyapi{pixel\_format} 可选 \pyapi{"Mono8"}（快）或 \pyapi{"Mono12"}（动态范围）。
+
 \subsection{脉冲模板：三个 DAC api 槽就是三路线圈}
 
 线圈扫描用普通的脉冲模板表达：三条 6 bit 模拟总线（如 \pyapi{da\_x}/\pyapi{da\_y}/\pyapi{da\_z}），每条在成像 period 上绑一个 \tfocus{dac api 槽}（\pyapi{a1}/\pyapi{a2}/\pyapi{a3}）。仓库自带 \filepath{pulses/mot\_field\_template.json}：period0 让线圈稳定（1 ms），period1 曝光（5 ms，\pyapi{mot\_trigger} 高电平触发监视相机）。自己搭模板时在 pulse GUI 里把 DAC 单元格点到 API（紫色）态即可。

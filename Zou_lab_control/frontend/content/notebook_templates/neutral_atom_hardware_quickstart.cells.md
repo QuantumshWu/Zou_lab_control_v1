@@ -52,6 +52,19 @@ zf.enable_long_output()
 zf.apply_style()
 
 <!-- cell:markdown -->
+## Discover attached devices（扫描端口自动发现）
+
+连接前先扫一遍本机总线：`na.discover_devices()` 枚举 Basler (pypylon) 相机和
+VISA 资源(每个资源用 `*IDN?` 短超时询问身份)。缺库/空总线不会报错，而是打印
+一行提示(confocal 式)。每台相机的行自带 **ready config 片段**——直接塞进
+device config 就能用，不用手抄序列号。
+
+<!-- cell:code -->
+found = na.discover_devices()
+cameras = [d for d in found if d.config is not None]
+cameras
+
+<!-- cell:markdown -->
 ## Connect hardware
 
 `na.connect(..., open_devices=True)` 会通过 device loader 构造、校验并打开
@@ -183,6 +196,27 @@ calibration/readout/detect 图。
 <!-- cell:code -->
 capture = exp.camera.capture(frames=1, display=True)
 capture.summary()
+
+<!-- cell:markdown -->
+## MOT 监视相机（Basler pylon，如 acA1920-155um）
+
+第二只相机 `monitor_camera` 盯 MOT 荧光斑。`configs/basler_monitor.json` 是渐进
+接线 config：读出链保持虚拟，`monitor_camera` 是真 Basler（`serial=""` = 第一台，
+`trigger_source="Software"` = 自由跑，插上 USB 就能看图；接好 FPGA 触发线后改
+`"Line1"`）。上面 `discover_devices()` 打印的序列号可以直接填进 config 钉住某一台。
+
+notebook 看图就是同一个 `capture`——真机自由跑时不需要任何脉冲：
+
+```python
+exp2 = na.connect("basler_monitor", open_devices=True)
+mot = exp2.devices["monitor_camera"].capture(frames=1, display=True)
+```
+
+task_console 里看图：`task_console.bat --config basler_monitor` 启动，
+Add Panel → Measurement → **Camera (live frames)**，把 `Camera` 下拉切到
+`monitor_camera`，Start——2d 面板实时显示 Basler 图像。配合 **MOT intensity**
+处理器（Frame source 选该测量的 `frame_0`）就得到 MOT 亮度实时曲线；扫线圈找
+最优磁场用 **Optimize MOT field** task（见 device manual"第二只相机"一章）。
 
 <!-- cell:markdown -->
 ## Calibrate sitemap

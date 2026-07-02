@@ -1,0 +1,50 @@
+{
+  "trap_array": {
+    "type": "VirtualTrapArray",
+    "params": {
+      "grid_shape": [
+        5,
+        7
+      ],
+      "image_shape": [
+        96,
+        128
+      ],
+      "loading_probability": 0.55,
+      "seed": 7
+    }
+  },
+  "camera": {
+    "type": "VirtualCamera",
+    "params": {
+      "trap_array": "$device:trap_array",
+      "exposure": 0.02,
+      "capture_trigger_channels": [
+        "emCCD"
+      ]
+    }
+  },
+  "monitor_camera": {
+    "type": "PylonCamera",
+    "params": {
+      "serial": "",
+      "trigger_source": "Software",
+      "pixel_format": "Mono8",
+      "exposure": 0.005
+    }
+  },
+  "sequencer": {
+    "type": "VirtualSequencer",
+    "params": {
+      "clock_hz": 50000000.0,
+      "channels": [
+        "trap",
+        "probe",
+        "emCCD",
+        "cooling",
+        "pushout",
+        "microwave"
+      ]
+    }
+  }
+}

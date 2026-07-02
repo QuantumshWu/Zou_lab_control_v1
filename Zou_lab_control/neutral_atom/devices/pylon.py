@@ -24,15 +24,21 @@ class PylonCamera(CameraDevice):
     """Externally-triggerable Basler (pylon) camera as a pure frame grabber.
 
     Parameters mirror the virtual monitor camera where they overlap (``exposure`` in seconds);
-    ``serial`` selects a specific camera when several are attached (empty = first found);
-    ``trigger_source`` is the Basler trigger line name (e.g. ``"Line1"``) or ``"Software"``."""
+    ``serial`` selects a specific camera when several are attached (empty = first found --
+    :func:`~.discovery.discover_devices` prints every attached serial);
+    ``trigger_source`` is the Basler trigger line name (e.g. ``"Line1"``) or ``"Software"``
+    (free-run: no trigger wiring needed, every ``acquire``/``capture`` just grabs frames --
+    the out-of-the-box mode for an acA1920-155um on USB3);
+    ``pixel_format`` is the Basler pixel format name (``"Mono8"`` / ``"Mono12"`` on the
+    acA1920-155um; ``Mono12`` for photon-counting-ish dynamic range, ``Mono8`` for speed)."""
 
     def __init__(self, *, exposure: float = 5e-3, serial: str = "",
-                 trigger_source: str = "Line1", timeout: float = 2.0,
-                 subarray_step: int = 2):
+                 trigger_source: str = "Line1", pixel_format: str = "Mono8",
+                 timeout: float = 2.0, subarray_step: int = 2):
         self._exposure = float(exposure)
         self.serial = str(serial)
         self.trigger_source = str(trigger_source)
+        self.pixel_format = str(pixel_format)
         self.timeout = float(timeout)
         self.subarray_step = int(subarray_step)
         self._camera = None                     # the pypylon InstantCamera, created in open()
@@ -52,6 +58,7 @@ class PylonCamera(CameraDevice):
         else:
             self._camera = pylon.InstantCamera(factory.CreateFirstDevice())
         self._camera.Open()
+        self._camera.PixelFormat.SetValue(self.pixel_format)
         self._apply_exposure()
         self._apply_trigger()
 
@@ -159,4 +166,5 @@ class PylonCamera(CameraDevice):
             "roi": self._roi,
             "serial": self.serial,
             "trigger_source": self.trigger_source,
+            "pixel_format": self.pixel_format,
         }

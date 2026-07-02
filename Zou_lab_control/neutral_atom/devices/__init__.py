@@ -19,6 +19,11 @@ from .sequencer import (
 )
 from .virtual import DEFAULT_CHANNELS, VirtualCamera, VirtualSequencer, VirtualTrapArray, virtual_config, write_virtual_run
 
+_DISCOVERY_EXPORTS = {
+    "DiscoveredDevice",
+    "discover_devices",
+}
+
 _REGISTRY_EXPORTS = {
     "DEVICE_CLASSES",
     "DeviceSet",
@@ -62,6 +67,10 @@ def __getattr__(name: str):
         from .sequencer_server import build_arg_parser
 
         return build_arg_parser
+    if name in _DISCOVERY_EXPORTS:
+        from . import discovery
+
+        return getattr(discovery, name)
     if name in _REGISTRY_EXPORTS:
         from . import registry
 
@@ -81,6 +90,8 @@ __all__ = [
     "DEFAULT_FPGA_CHANNEL_COUNT",
     "DEVICE_CLASSES",
     "DeviceSet",
+    "DiscoveredDevice",
+    "discover_devices",
     "ManualSequencer",
     "PulseController",
     "QCMOSCamera",

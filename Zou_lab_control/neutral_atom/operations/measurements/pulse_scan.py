@@ -42,7 +42,6 @@ from ...timing import (
     single_imaging_template,
     snap_scan_table,
 )
-from ...devices.base import CameraDevice
 from ..measurement import MeasurementSpec, ParamDecl
 from ..measurement_registry import measurement
 from ..signal_expr import SignalExpr
@@ -313,10 +312,7 @@ def pulse_scan(readout) -> MeasurementSpec:
                   tooltip="The pulse program fired each point.  Its api / scan slots populate the "
                           "auto-form below (one numeric input per api slot + ONE scan-table program)."),
         ParamDecl("camera", "Camera", "choice", default="camera",
-                  choices=tuple(sorted(
-                      name for name, dev in s.devices.devices.items()
-                      if isinstance(dev, CameraDevice)
-                  )) or ("camera",),
+                  choices=s.devices.camera_names(),
                   tooltip="Which camera grabs each point's frame: 'camera' = the readout sensor; "
                           "'monitor_camera' = the MOT viewer (sweep the coils, watch the MOT)."),
         ParamDecl("pulse_slots", "Slots", "pulse_slots", default={}, depends_on="template",
