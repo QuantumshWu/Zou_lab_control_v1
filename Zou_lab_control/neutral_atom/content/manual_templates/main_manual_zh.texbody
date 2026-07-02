@@ -68,10 +68,13 @@ GUI 只是脉冲前端。它可以只显示 \pyapi{trap/cooling/probe/emCCD} 四
 \end{notebox}
 
 \section{连接实验}
-\pyapi{na.connect} 返回一个 \pyapi{NeutralAtomSession}。三种典型连法：
+\pyapi{na.connect} 返回一个 \pyapi{NeutralAtomSession}。接真机前可以先\tfocus{扫一遍总线}——每个已注册的真机设备类自己声明"我怎么被发现"，扫到的相机行自带 ready config 片段，可直接喂给设备加载（详见设备手册"自动发现"一节）：
 
 \begin{codeblock}[Python]
 import Zou_lab_control.neutral_atom as na
+
+found = na.discover_devices()          # 枚举 Basler / Hamamatsu 相机 + VISA 资源
+# 缺库 / 空总线打印提示行，绝不报错；(ready) 行的 .config 可直接进 config
 
 # 完全离线：虚拟相机 + 虚拟 sequencer
 exp = na.connect("virtual")
@@ -83,6 +86,8 @@ exp = na.connect(
     open_devices=True,
 )
 \end{codeblock}
+
+config 只声明\tfocus{真实存在的硬件}：session 对缺角色宽容（只有一台监视相机的 rig 也能连），存在的角色自然点亮，绝不用假设备凑数。
 
 session 暴露子系统：\pyapi{exp.camera}（采图）、\pyapi{exp.timing}（脉冲/触发）、\pyapi{exp.readout}（标定与占据检测）、\pyapi{exp.devices}（底层设备，例如 \pyapi{exp.devices.sequencer}）。
 

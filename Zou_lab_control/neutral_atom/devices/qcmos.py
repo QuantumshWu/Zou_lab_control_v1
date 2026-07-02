@@ -67,6 +67,15 @@ class QCMOSCamera(CameraDevice):
         # never uses it to drive the sequencer -- a real qCMOS is gated by the hardware edge.
         self.capture_trigger_channels = tuple(self.config.capture_trigger_channels)
         self.dcam_module_name = str(dcam_module)
+        self._module = None
+        self._api = None
+        self._dcam = None
+        # The sub-array the camera ACTUALLY applied (read back from DCAM after the
+        # hardware snaps the request to its valid grid).  None until an open camera
+        # has applied a ROI; the `roi` property reports this -- not the raw request
+        # -- so a consumer (the Edit 'now:' reference, the 2D panel's axes) reflects
+        # the region truly being imaged.
+        self._applied_roi: tuple[int, int, int, int] | None = None
 
     # ------------------------------------------------------------------ discovery (self-describing)
     @classmethod
@@ -116,15 +125,6 @@ class QCMOSCamera(CameraDevice):
             kind="qcmos", ident=str(i), label=str(model_of(i)),
             config={"type": cls.__name__, "params": {"config": {"device_index": i}}})
             for i in range(max(0, int(count)))]
-        self._module = None
-        self._api = None
-        self._dcam = None
-        # The sub-array the camera ACTUALLY applied (read back from DCAM after the
-        # hardware snaps the request to its valid grid).  None until an open camera
-        # has applied a ROI; the `roi` property reports this -- not the raw request
-        # -- so a consumer (the Edit 'now:' reference, the 2D panel's axes) reflects
-        # the region truly being imaged.
-        self._applied_roi: tuple[int, int, int, int] | None = None
 
     @property
     def exposure(self) -> float:
