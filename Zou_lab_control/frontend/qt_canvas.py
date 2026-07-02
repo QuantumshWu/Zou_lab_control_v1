@@ -128,6 +128,18 @@ else:
             on every resync -- so this is idempotent.  Kept for the Edit-snapshot caller's intent."""
             self.setFixedSize(self._zlc_design_size())
 
+        def refresh_design_size(self) -> None:
+            """Re-read the FIGURE's current size and re-pin the widget to the matching design size --
+            for the one legitimate figure-resize path: a grid enlarging a cell into a standalone 2x2
+            panel ON ITS OWN figure (and back).  Construction cached ``_zlc_inches`` once and every
+            resync forces the figure BACK to it, so without this refresh the enlarged view's 2x2
+            buffer stretched over the old grid-sized widget (the "double-click zoom is as big as the
+            whole grid" bug).  The plot layer calls it through duck-typing (a non-Qt canvas simply
+            lacks the method and follows the figure natively)."""
+            self._zlc_inches = tuple(float(v) for v in self.figure.get_size_inches())
+            self._zlc_resync()
+            self.updateGeometry()
+
         def showEvent(self, event):  # noqa: N802 - Qt naming
             # Re-establish the size invariants + redraw the FIRST time the canvas actually becomes
             # visible.  A panel built on a not-yet-shown board (the FIRST task-takeover Monitor panel

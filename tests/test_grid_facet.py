@@ -355,8 +355,9 @@ def test_grid_hist_fit_draws_the_standard_curves_on_the_thumbnails():
     g = grid(vals, sub_plot_kind="hist", display=False)
     try:
         cell = g.cell_renderer
-        assert cell.fit == "none" and all(l is None for l in cell._fit_lines)   # opt-in on a grid
-        g.apply_param("fit", "double")
+        # the grid fits by DEFAULT ("double" -- DEFAULT_HIST_FIT, the ONE source the Setting UI's
+        # default reads too): what the UI says is what the thumbnails draw, from the first build
+        assert cell.fit == "double"
         lines = cell._fit_lines[0]
         assert lines is not None and len(lines) == 3
         assert len(lines[0].get_xdata()) == 400 and len(lines[2].get_xdata()) == 400
@@ -368,6 +369,51 @@ def test_grid_hist_fit_draws_the_standard_curves_on_the_thumbnails():
         focus = g.build_focus_plotter(0, size="2x2")
         assert focus._fit == "double"                               # the enlarged view inherits the pick
         plt.close(focus.fig)
+    finally:
+        plt.close(g.fig)
+        plt.close("all")
+
+
+def test_grid_edge_label_policy_survives_every_display_toggle():
+    """The shared-axes tick policy (round U): y tick labels ONLY on each row's leftmost cell, x tick
+    labels ONLY on each column's lowest cell (including a ragged column's mid-grid bottom), nothing
+    on inner cells -- and the rule must survive ylog / fit / bins toggles (set_yscale rebuilds the
+    locators; the redraw paths must re-assert the ONE policy)."""
+    vals = [RNG.normal(100, 8, size=200) for _ in range(8)]      # 3 cols -> ragged last row
+    g = grid(vals, sub_plot_kind="hist", display=False)
+    try:
+        def check():
+            ncols = g.ncols
+            for k, ax in enumerate(g.site_axes):
+                left = (k % ncols) == 0
+                bottom = (k + ncols) >= g.n_cells
+                assert (len(ax.get_yticks()) > 0) == left, f"cell {k} y-ticks vs leftmost rule"
+                assert (len(ax.get_xticks()) > 0) == bottom, f"cell {k} x-ticks vs bottom rule"
+        check()
+        for key, value in (("ylog", True), ("fit", "none"), ("bins", 24), ("ylog", False)):
+            g.apply_param(key, value)
+            check()
+    finally:
+        plt.close(g.fig)
+        plt.close("all")
+
+
+def test_grid_focus_is_a_stock_2x2_figure_and_unfocus_restores():
+    """Double-click zoom (round U): the enlarged cell is a STOCK 2x2 standalone panel -- the grid's
+    own FIGURE resizes to the 2x2 spec (an embedded Qt canvas follows via refresh_design_size), and
+    unfocus restores the grid-sized figure exactly."""
+    from Zou_lab_control.frontend.live import panel_plot
+    vals = [RNG.normal(100, 8, size=200) for _ in range(8)]
+    ref = panel_plot(vals[0], kind="hist", size="2x2")
+    ref_size = tuple(ref.fig.get_size_inches())
+    plt.close(ref.fig)
+    g = grid(vals, sub_plot_kind="hist", display=False, size="4x2", interactions=True)
+    try:
+        grid_size = tuple(g.fig.get_size_inches())
+        g.focus(1)
+        assert tuple(g.fig.get_size_inches()) == ref_size, "the zoom IS a stock 2x2 figure"
+        g.unfocus()
+        assert tuple(g.fig.get_size_inches()) == grid_size, "unfocus restores the grid size"
     finally:
         plt.close(g.fig)
         plt.close("all")

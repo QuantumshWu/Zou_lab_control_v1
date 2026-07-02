@@ -11,7 +11,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.collections import PolyCollection
 from matplotlib.patches import Rectangle
-from matplotlib.ticker import Formatter, FuncFormatter, MaxNLocator, ScalarFormatter
+from matplotlib.ticker import Formatter, FuncFormatter, LogLocator, MaxNLocator, NullLocator, ScalarFormatter
 import numpy as np
 from scipy.optimize import curve_fit
 
@@ -208,14 +208,20 @@ _IMAGE_SPLIT = ([0.75, 0.1, 0.1], [0.025, 0.025])  # 2D image | side dist | colo
 # panel's of the same size to the pixel (the same three-region L|data|R / B|data|T layout), and the grid
 # thumbnail's padding matches every other kind's card instead of looking visibly different (#5).
 _SITE_COL_GAP_PX = 12
-# The row gap must clear each cell's small TITLE (the site index, above the axes, #5) so a lower row's
-# title never crowds the row above -- wider than the column gap for exactly that title band.
-_SITE_ROW_GAP_PX = 26
+# The row gap must clear each cell's small TITLE (the site index, above the axes, #5) AND a ragged
+# column's bottom-edge x tick labels (the shared-axes policy puts x labels on each column's LOWEST
+# cell, which can sit mid-grid) -- so the band holds label + title without crowding.
+_SITE_ROW_GAP_PX = 34
 _SITE_MAX_COLS = 7                        # column cap (pulse-style width cap); extra sites wrap to rows
 #: Hard cap on the number of grid cells: beyond this the per-tick thumbnail update (and the first
 #: matplotlib layout) freezes the UI.  ONE source -- the grid factory raises past it and the console
 #: greys out facet axes that would exceed it.
 MAX_GRID_CELLS = 80
+#: Cell-text scaling reference: a cell whose data box is at least this tall (logical px) uses the
+#: STANDARD small/tick font sizes (the cap -- never larger than a 2x2 panel's text); shorter cells
+#: shrink their title/label text proportionally so a small grid panel never drowns in text.
+_CELL_FONT_REF_PX = 120
+_CELL_FONT_MIN_SCALE = 0.55
 
 
 def _as_data_x(data_x) -> np.ndarray:
@@ -2316,6 +2322,13 @@ class PulseSequenceFigure(BaseLivePlot):
         self.fig._zlc_state = PlotState(plot_type="pulse", x_array=None, y_array=None)
 
 
+#: The histogram-fit chooser's default -- "double" is the dark/bright readout convention.  ONE
+#: source for the standalone dis, the grid's hist cells AND the console's PANEL_PARAMS spec, so the
+#: Setting UI's default can never disagree with what the figure actually draws (the "fit says double
+#: but the grid shows no fit until toggled" bug).
+DEFAULT_HIST_FIT = "double"
+
+
 def fit_histogram_curves(vals, edges, counts, mode: str):
     """The ONE histogram-fit rule: fit ``mode`` ("none" / "single" / "double") to a binned sample set
     and return the CURVE DATA + threshold -- consumed by :class:`HistogramFigure` (the standalone dis)
@@ -2422,7 +2435,7 @@ class HistogramFigure(BaseLivePlot):
         thresholds: Sequence[float] | None = None,
         labels: Sequence[str] = ("Counts", "Shots", "Population"),
         ylog: bool = False,
-        fit: str = "double",            # fit chooser: "none" | "single" | "double" (dark/bright readout)
+        fit: str = DEFAULT_HIST_FIT,    # fit chooser: "none" | "single" | "double" (ONE default source)
         **kwargs,
     ):
         # 'create' repeat mode delivers (n_samples, R): column 0 is the FIRST repeat (the FULL
@@ -3133,6 +3146,11 @@ class GridCell:
     relim_mode: str = "tight"
     fixed_lo: float = 0.0
     fixed_hi: float = 1.0
+    #: Cell-text scale, set by the GRID from its cell geometry (cell height / _CELL_FONT_REF_PX,
+    #: capped at 1.0): a small panel's cell titles + edge tick labels shrink with the cells, and a
+    #: full-size cell never exceeds the standard small/tick font sizes.  Cells multiply their
+    #: apply_title size by it; the grid's tick policy multiplies its label size by it.
+    font_scale: float = 1.0
 
     def thumb_lims(self, auto_lo: float, auto_hi: float) -> tuple[float, float]:
         """The thumbnail's dependent-axis range: the operator's pinned lo/hi in ``fixed`` mode, else the
@@ -3234,10 +3252,10 @@ class HistogramCell(GridCell):
         self.labels = tuple(labels)
         self.edges = None
         # The hist kind's OWN display knobs, rendered on the thumbnails through the SAME primitives
-        # the standalone HistogramFigure uses (fit_histogram_curves / set_yscale).  ``fit`` defaults
-        # to "none" here -- an N-cell grid re-fits every cell on each redraw, so the fit is an
-        # explicit opt-in on a grid (the ENLARGED cell always fits, it is a standalone hist panel).
-        self.fit = "none"
+        # the standalone HistogramFigure uses (fit_histogram_curves / set_yscale) -- and the SAME
+        # defaults (DEFAULT_HIST_FIT): what the Setting UI shows as the default IS what the grid
+        # draws, never a per-surface divergence.
+        self.fit = DEFAULT_HIST_FIT
         self.ylog = False
         self.threshold_lines: list = [None] * self.n_cells
         self.tag_texts: list = [None] * self.n_cells
@@ -3272,6 +3290,15 @@ class HistogramCell(GridCell):
         span = hi - lo
         self.x_lo, self.x_hi = float(lo - 0.04 * span), float(hi + 0.04 * span)
         self.edges = np.linspace(self.x_lo, self.x_hi, self.bins_arg + 1)
+        # ONE shared count-axis top (the tallest cell): the grid is a shared-axes family, so the
+        # leftmost column's y labels read for every cell in the row -- per-cell tops would make
+        # the edge labels lie.  Cached here; auto_lims and the per-cell ylim consume it.
+        top = 0.0
+        for v in vals:
+            v = v[np.isfinite(v)]
+            if v.size:
+                top = max(top, float(np.histogram(v, bins=self.edges)[0].max()))
+        self.y_top = top
 
     def _tag_text(self, k: int) -> str:
         """The per-cell TITLE text -- the site index (+ its fidelity when known).  It is placed in the
@@ -3302,11 +3329,13 @@ class HistogramCell(GridCell):
         lines[2].set_data(res["x"], res["total"])
 
     def _apply_count_ylim(self, ax, counts) -> None:
-        """The thumbnail's count-axis scale + range: the operator's relim family via ``thumb_lims``,
-        with the standalone dis's log rule (floor at 0.5 so 0-count bars sit below the axis).
-        ``set_yscale`` only on an actual scale CHANGE -- it rebuilds the axis' locators, and calling
-        it per cell per live tick re-introduced exactly the tick cost the grid removed (#perf)."""
-        top = float(counts.max()) if len(counts) else 0.0
+        """The thumbnail's count-axis scale + range: the SHARED top (every cell shows the same count
+        axis, so the leftmost column's edge labels read for the whole grid) through the operator's
+        relim family (``thumb_lims``), with the standalone dis's log rule (floor at 0.5 so 0-count
+        bars sit below the axis).  ``set_yscale`` only on an actual scale CHANGE -- it rebuilds the
+        axis' locators, and calling it per cell per live tick re-introduced the tick cost (#perf)."""
+        del counts                              # the shared top is the range; per-cell counts are not
+        top = float(getattr(self, "y_top", 0.0))
         lo, hi = self.thumb_lims(0.0, top * 1.08 if top > 0 else 1.0)
         target = "log" if self.ylog else "linear"
         if ax.get_yscale() != target:
@@ -3372,7 +3401,7 @@ class HistogramCell(GridCell):
         self._apply_count_ylim(ax, counts_all)
         # The site index (+ fidelity) is the cell's small TITLE, ABOVE the axes -- NOT text inside the data
         # area (#5) -- through the ONE title mechanism (apply_title), just at small_fontsize().
-        apply_title(ax, self._tag_text(k), size=small_fontsize(), pad=1.5)
+        apply_title(ax, self._tag_text(k), size=small_fontsize() * self.font_scale, pad=1.5)
         self.threshold_lines[k] = line           # grid line, kept for per-cell drag
         return line
 
@@ -3396,14 +3425,10 @@ class HistogramCell(GridCell):
 
     def auto_lims(self) -> tuple[float, float]:
         """The tallest cell's count-axis range (same 8% headroom the thumbnail draw applies) --
-        the distribution grid's shared 'what you see now' pair."""
+        the distribution grid's shared 'what you see now' pair (cached by prepare)."""
         if self.edges is None:
             self.prepare()
-        top = 0.0
-        for v in self.values:
-            v = v[np.isfinite(v)]
-            if v.size:
-                top = max(top, float(np.histogram(v, bins=self.edges)[0].max()))
+        top = float(getattr(self, "y_top", 0.0))
         return 0.0, top * 1.08 if top > 0 else 1.0
 
     def set_cell_data(self, k: int, data) -> None:
@@ -3546,7 +3571,7 @@ class ImageCell(GridCell):
         vmin, vmax = self.thumb_lims(self.vmin, self.vmax)
         self._image_artists[k] = ax.imshow(self.images[k], origin="lower", cmap=self.cmap,
                                            vmin=vmin, vmax=vmax, aspect="equal")
-        apply_title(ax, f"s{k}", size=small_fontsize(), pad=1.5)   # ticks are the grid's ONE policy
+        apply_title(ax, f"s{k}", size=small_fontsize() * self.font_scale, pad=1.5)   # ticks are the grid's ONE policy
         return None
 
     def set_cell_data(self, k: int, data) -> None:
@@ -3728,20 +3753,41 @@ class GridPlot(BaseLivePlot):
             row_gap_px=row_gap, margins_px=margins,
         )
         self.axes = axes
+        # Cell-text scale from the CELL geometry: titles + edge tick labels shrink with the cells
+        # (a small panel size), capping at the standard sizes for full-height cells -- set once per
+        # layout, consumed by the cell draws (apply_title) and the grid's tick policy.
+        cell_h = (data_px[1] - (self.nrows - 1) * row_gap) / max(1, self.nrows)
+        self.cell_renderer.font_scale = float(
+            min(1.0, max(_CELL_FONT_MIN_SCALE, cell_h / _CELL_FONT_REF_PX)))
         return axes[0]
 
     def _style_cell_ticks(self, ax, k: int) -> None:
         """The ONE tick policy for every thumbnail, owned by the GRID (the cell families draw only
-        their data artists): NO y ticks (each cell's count/pixel scale varies -- the SHAPE is the
-        point) and x ticks ONLY on the bottom row (3 small ones).  Ticks were the N-cell draw's
-        dominant cost (#perf: 35 axes x 4 axis._update_ticks per draw); an empty tick list removes
-        that work entirely.  The ENLARGED view is a standalone panel with the kind's full axes."""
-        ax.set_yticks([])
-        if (k + self.ncols) < self.n_cells:
-            ax.set_xticks([])
+        their data artists): the shared-axes convention -- y tick LABELS only on each row's LEFTMOST
+        cell, x tick LABELS only on the BOTTOM cell of each column, no ticks anywhere else (which is
+        also what keeps the N-cell draw fast, #perf: ticks dominated it).  The cell families share
+        their dependent-axis range across cells (pooled clim / shared count top / shared y), so an
+        edge label reads for the whole grid.  EVERY (re)draw path funnels back through this method --
+        a ylog / fit toggle re-applies it after ``set_yscale`` rebuilt the locators, so the policy
+        never silently decays.  Label sizes follow the cell's ``font_scale`` (small panels shrink
+        proportionally; a full-size cell caps at the standard tick size)."""
+        scale = float(getattr(self.cell_renderer, "font_scale", 1.0))
+        if (k % self.ncols) == 0:               # the row's leftmost cell carries the y labels
+            if ax.get_yscale() == "linear":
+                ax.yaxis.set_major_locator(MaxNLocator(nbins=3))
+            else:                               # log axis: a LogLocator (MaxNLocator misplaces log ticks)
+                ax.yaxis.set_major_locator(LogLocator(numticks=3))
+                ax.yaxis.set_minor_locator(NullLocator())
+            ax.tick_params(axis="y", labelleft=True, labelsize=tick_fontsize() * scale, length=2)
         else:
+            ax.set_yticks([])
+            if ax.get_yscale() != "linear":     # log installs minor ticks too -- clear them as well
+                ax.yaxis.set_minor_locator(NullLocator())
+        if (k + self.ncols) >= self.n_cells:    # the column's bottom cell carries the x labels
             ax.xaxis.set_major_locator(MaxNLocator(nbins=3, prune="lower"))
-            ax.tick_params(labelsize=tick_fontsize(), length=2)
+            ax.tick_params(axis="x", labelbottom=True, labelsize=tick_fontsize() * scale, length=2)
+        else:
+            ax.set_xticks([])
 
     def _initial_draw(self) -> None:
         # Skip the base class's synchronous build-time draw: every real consumer draws again anyway
@@ -3930,6 +3976,7 @@ class GridPlot(BaseLivePlot):
         self._focus_plotter = self.build_focus_plotter(
             k, size="2x2", interactions=self.interactions, fig=self.fig)
         self._focused = k
+        self._sync_canvas_design_size()   # the figure is now stock 2x2 -- an embedded canvas follows
         self.draw()
 
     def unfocus(self) -> None:
@@ -3946,7 +3993,17 @@ class GridPlot(BaseLivePlot):
         self._focus_plotter = None
         self._focused = None
         self._rebuild_grid()                            # redraw the grid onto the same figure
+        self._sync_canvas_design_size()   # the figure is grid-sized again -- an embedded canvas follows
         self.draw()
+
+    def _sync_canvas_design_size(self) -> None:
+        """After a focus/unfocus swapped THIS figure's size (stock 2x2 <-> the grid size), let an
+        embedded Qt canvas re-pin its widget to the new design size (duck-typed: the Qt canvas
+        exposes ``refresh_design_size``; every other backend follows the figure natively).  Without
+        it the pinned widget stretched the 2x2 buffer over the whole grid-sized panel."""
+        refresh = getattr(getattr(self.fig, "canvas", None), "refresh_design_size", None)
+        if callable(refresh):
+            refresh()
 
     def _teardown_cell_selectors(self) -> None:
         """Destroy the grid's PER-CELL selectors so the cleared figure carries no stale per-axes callbacks
@@ -4074,6 +4131,10 @@ class GridPlot(BaseLivePlot):
         for k, ax in enumerate(self.site_axes):
             if not self.cell_renderer.update_cell(ax, k):
                 self._redraw_thumbnail(k, ax)
+            else:
+                # An in-place knob (ylog's set_yscale) may have rebuilt the axis locators --
+                # re-assert the ONE tick policy so the edge-label rule never silently decays.
+                self._style_cell_ticks(ax, k)
 
     def to_data_figure(self):
         self.data_figure = _GridData(self)
@@ -4207,7 +4268,7 @@ class LineCell(GridCell):
         if x.size:
             ax.set_xlim(float(x[0]), float(x[-1]) if x[-1] > x[0] else float(x[0]) + 1.0)
         ax.set_ylim(*self.thumb_lims(self.y_lo, self.y_hi))
-        apply_title(ax, f"s{k}", size=small_fontsize(), pad=1.5)   # ticks are the grid's ONE policy
+        apply_title(ax, f"s{k}", size=small_fontsize() * self.font_scale, pad=1.5)   # ticks are the grid's ONE policy
         return None
 
     def set_cell_data(self, k: int, data) -> None:

@@ -47,6 +47,7 @@ import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from .live import (
+    DEFAULT_HIST_FIT,
     PANEL_SIZES,
     PLOT_KINDS,
     panel_display_size,
@@ -1046,7 +1047,7 @@ PANEL_PARAMS: dict[str, tuple[ParamDecl, ...]] = {
         # dark/bright readout convention.  ``segmented=True`` renders it as the TriStateToggleSwitch
         # capsule (sliding thumb) instead of a combo box.
         ParamDecl(key="fit", label="fit", kind="choice", choices=("none", "single", "double"),
-                  default="double", segmented=True, display=True,
+                  default=DEFAULT_HIST_FIT, segmented=True, display=True,
                   tooltip="Distribution fit (drives the display directly -- no auto-decision):\n"
                           "  none   = no fit curve\n"
                           "  single = one Gaussian\n"
