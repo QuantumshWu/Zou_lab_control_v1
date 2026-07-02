@@ -42,6 +42,7 @@ from ...timing import (
     single_imaging_template,
     snap_scan_table,
 )
+from ...devices.base import CameraDevice
 from ..measurement import MeasurementSpec, ParamDecl
 from ..measurement_registry import measurement
 from ..signal_expr import SignalExpr
@@ -109,7 +110,7 @@ def _scan_table_arrays(
     return names, arrays, scan_shape
 
 
-def _api_table_arrays(state: PulseTableState, api_code: str) -> tuple[list[str], list[np.ndarray]]:
+def _api_table_arrays(state: PulseTableState, api_code: str) -> tuple[list[str], list[np.ndarray], tuple[int, ...] | None]:
     """Evaluate the SOFTWARE api-sweep program into per-api-slot arrays (one column per API slot,
     in slot order).
 
@@ -117,7 +118,9 @@ def _api_table_arrays(state: PulseTableState, api_code: str) -> tuple[list[str],
     program (the api slots advance in lockstep, one row per point).  Values are in each slot's
     NATIVE unit (``set_api`` interprets them: a duration api slot's value in its unit, a DAC api
     slot's value in signed LSB) -- there is NO hardware snap here (set_api snaps a duration to the
-    clock grid itself).  Returns ``(api names, columns)``."""
+    clock grid itself).  Returns ``(api names, columns, declared scan_shape or None)`` -- the same
+    optional grid declaration the hardware table carries, so a multi-axis api sweep (e.g. the x/y/z
+    coil-field grid) facets into the SAME grid display a hardware scan does."""
 
     names = [s.name for s in state.api_slots]
     if not names:
@@ -125,10 +128,10 @@ def _api_table_arrays(state: PulseTableState, api_code: str) -> tuple[list[str],
             "the pulse template has no API slot to sweep -- in the pulse GUI Edit tab, click a "
             "duration / DAC cell to its API (purple) state to expose a named handle aN, then give "
             "an api-sweep program here.")
-    table, _shape = evaluate_scan_table_code(api_code, len(names))   # N x n_api
-    columns = list(zip(*table))                                      # one column per api slot
+    table, scan_shape = evaluate_scan_table_code(api_code, len(names))   # N x n_api + optional grid shape
+    columns = list(zip(*table))                                          # one column per api slot
     arrays = [np.asarray(col, dtype=float) for col in columns]
-    return names, arrays
+    return names, arrays, scan_shape
 
 
 def _resolve_scan_mode(spec: Mapping, state: PulseTableState) -> str:
@@ -247,6 +250,7 @@ def pulse_scan(readout) -> MeasurementSpec:
     s = readout.session
 
     def build(*, template: str = DEFAULT_PROBE_TEMPLATE, pulse_slots: Mapping | None = None,
+              camera: str = "camera",
               y=None, y_name: str = "signal", **_ignored) -> PulseScanPlan:
         state = _resolve_probe_template(template)
         spec = dict(pulse_slots or {})
@@ -282,7 +286,7 @@ def pulse_scan(readout) -> MeasurementSpec:
             # itself).  Empty program -> the column_stack default for the api columns.
             if not scan_code.strip():
                 scan_code = scan_table_template("column_stack", state.api_column_specs())
-            api_names, api_arrays = _api_table_arrays(state, scan_code)
+            api_names, api_arrays, scan_shape = _api_table_arrays(state, scan_code)
         # scan_mode == "none": no sweep -> a single point at the fixed api values (scan/api arrays
         # stay empty; PulseScanPlan's primary axis is then the lone [0.0] point).
 
@@ -293,8 +297,12 @@ def pulse_scan(readout) -> MeasurementSpec:
         else:
             axis_label, axis_unit = _label_for_first_api_slot(state)
         y_expr = SignalExpr.from_value(y if y is not None else DEFAULT_Y_SOURCE)
+        # The frame source is a NAMED camera device ("camera" = the readout qCMOS; a second
+        # sensor like the MOT monitor_camera sweeps the same way) -- the pure-grabber contract
+        # is identical, so the scan engine never cares which sensor it arms.
+        scan_camera = s.devices[str(camera or "camera")]
         return PulseScanPlan(
-            state, scan_names, scan_arrays, s.devices.camera, s.devices.sequencer,
+            state, scan_names, scan_arrays, scan_camera, s.devices.sequencer,
             axis_label=axis_label, axis_unit=axis_unit, y_key=y_name, y_expr=y_expr,
             scan_shape=scan_shape, api_names=api_names, api_arrays=api_arrays,
             extra_delay_s=extra_delay_s)
@@ -304,6 +312,13 @@ def pulse_scan(readout) -> MeasurementSpec:
                   path_mode="file", base_dir="pulses", file_filter="Pulse program (*.json);;All files (*)",
                   tooltip="The pulse program fired each point.  Its api / scan slots populate the "
                           "auto-form below (one numeric input per api slot + ONE scan-table program)."),
+        ParamDecl("camera", "Camera", "choice", default="camera",
+                  choices=tuple(sorted(
+                      name for name, dev in s.devices.devices.items()
+                      if isinstance(dev, CameraDevice)
+                  )) or ("camera",),
+                  tooltip="Which camera grabs each point's frame: 'camera' = the readout sensor; "
+                          "'monitor_camera' = the MOT viewer (sweep the coils, watch the MOT)."),
         ParamDecl("pulse_slots", "Slots", "pulse_slots", default={}, depends_on="template",
                   tooltip="One numeric input per API slot (the fixed operator-set value), then a "
                           "Scan: [None | API | Scan] mode toggle that picks WHAT one shared scan "

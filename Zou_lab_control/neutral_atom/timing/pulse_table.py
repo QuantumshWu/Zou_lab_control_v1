@@ -654,6 +654,11 @@ class PulseTableState:
         elif slot.kind == "dac":
             bus, period_index = slot.target.split("@", 1)
             self._set_bus_target(bus, int(period_index), int(round(float(value))))   # keep ramp, else edge (#B2)
+            # Recompute the period DAC bit states NOW: ``to_sequence`` (the preview AND the virtual
+            # backend's fired sequence) reads period.states, not the mode plan -- without this a
+            # software api set/sweep of a DAC slot changed nothing on the virtual backend while the
+            # real edge-table compiler (which reads the plan) did move, breaking virtual == real.
+            self.apply_analog_bus_modes_to_period_states()
             self.validate()
 
     def _delay_targets(self, target: str) -> list[str]:

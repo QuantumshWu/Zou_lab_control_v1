@@ -551,3 +551,24 @@ __all__ = [
     "reference_bracket_sequence",
     "snap_seconds_to_clock",
 ]
+
+
+def decode_analog_bus(sequence: "PulseSequence", members, at_time: float) -> int:
+    """Reconstruct a DAC bus's SIGNED level at ``at_time`` from the compiled bit-channel pulses --
+    the INVERSE of the offset-binary encoding ``apply_analog_bus_modes_to_period_states`` bakes into
+    the period states (signed value + 2^(n-1) -> per-bit digital pulses, ``members`` ordered
+    LSB..MSB).  The virtual backend's analog-aware devices (e.g. the MOT monitor camera reading the
+    coil DACs) use this to SENSE what the fired sequence actually drives -- never the task's own
+    set-points -- so virtual sensing goes through the same compiled artefact the hardware plays.
+    A round-trip contract test pins this against ``set_api`` (encoder and decoder cannot drift)."""
+    members = [str(m) for m in members]
+    if not members:
+        raise ValueError("decode_analog_bus needs the bus's member bit channels (LSB..MSB).")
+    t = float(at_time)
+    word = 0
+    for bit, channel in enumerate(members):
+        for p in sequence.pulses:
+            if p.channel == channel and p.start <= t < p.start + p.duration and p.value:
+                word |= 1 << bit
+                break
+    return word - (1 << (len(members) - 1))

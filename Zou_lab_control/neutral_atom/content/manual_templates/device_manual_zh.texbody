@@ -948,6 +948,52 @@ raw = camera.acquire(
 \end{itemize}
 \end{notebox}
 
+\section{第二只相机：MOT 监视相机与线圈磁场寻优}
+
+除了负责读出的主相机（\pyapi{"camera"}），设备清单里还可以有一只\tfocus{监视相机}（约定名 \pyapi{"monitor_camera"}）：它不参与站点读出，只盯着 MOT 的荧光斑。典型用途是\tfocus{扫 x/y/z 三路线圈电流（DAC 码），同时看 MOT 亮度，找出装载最好的磁场}。监视相机与主相机遵守\tfocus{完全相同}的纯取帧器契约（\pyapi{acquire(N, sequence=..., on\_armed=...)}，arm-before-fire），所以扫描引擎、面板、处理器对"哪只相机"完全无感。
+
+\subsection{两种实现：PylonCamera 真机 vs VirtualMotCamera 仿真}
+
+\begin{description}
+\item[\pyapi{PylonCamera}（\filepath{devices/pylon.py}）] Basler pylon 相机的薄封装（\pyapi{pypylon} 在 \pyapi{open()} 内惰性导入，没装 Basler 运行库的机器照样可以导入包、跑虚拟后端）。\pyapi{trigger\_source} 选外触发线（如 \pyapi{"Line1"}）或 \pyapi{"Software"} 自由运行；\pyapi{serial} 在多相机时选定一台。真机拍的是真实世界，所以 \pyapi{acquire} 里的 \pyapi{sequence} 参数被\tfocus{接受并忽略}。
+\item[\pyapi{VirtualMotCamera}（\filepath{devices/virtual.py}）] 虚拟 MOT 物理相机。它\tfocus{只感知真正 fire 出去的序列}：在帧中点时刻用 \pyapi{decode\_analog\_bus}（\filepath{timing/sequence.py}，DAC 编码链的精确逆变换）从编译后的位通道脉冲里重建每路线圈总线的带符号电平，再按三维高斯模型算 MOT 俘获效率 \(\eta=\exp\!\big(-\tfrac12\sum_i\big(\tfrac{L_i-B_{0,i}}{\sigma_i}\big)^2\big)\)，渲染一颗中心高斯荧光斑（泊松光子噪声 + 读出噪声 + 常数 offset，与 qCMOS 噪声链同构）。\tfocus{它从不读任何人的设定值}——虚拟与真机走同一条"编译产物"路径，换真机只改 \pyapi{connect()} 的配置。
+\end{description}
+
+\subsection{脉冲模板：三个 DAC api 槽就是三路线圈}
+
+线圈扫描用普通的脉冲模板表达：三条 6 bit 模拟总线（如 \pyapi{da\_x}/\pyapi{da\_y}/\pyapi{da\_z}），每条在成像 period 上绑一个 \tfocus{dac api 槽}（\pyapi{a1}/\pyapi{a2}/\pyapi{a3}）。仓库自带 \filepath{pulses/mot\_field\_template.json}：period0 让线圈稳定（1 ms），period1 曝光（5 ms，\pyapi{mot\_trigger} 高电平触发监视相机）。自己搭模板时在 pulse GUI 里把 DAC 单元格点到 API（紫色）态即可。
+
+\subsection{MOT 光强：一条单源规则}
+
+MOT 亮度由 \pyapi{mot\_roi\_intensity(frame, cx, cy, radius)}（\filepath{operations/processors/mot\_intensity.py}）定义：\tfocus{圆盘 ROI 内均值减去外环（r..2r）背景均值}，环境光与相机 offset 自然抵消。控制台的 \tfocus{MOT intensity} 处理器（Add Panel → Processor）与一键寻优 task 消费的是\tfocus{同一个}函数——实时监看与优化器不可能意见不合。处理器接受一张 \pyapi{(H, W)} 帧或相机的 \pyapi{(repeat, 1, H, W)} 块，输出每次采集一个标量 \pyapi{mot\_intensity}（\pyapi{repeat\_contract="reduce"}）。
+
+\subsection{手动扫：Pulse scan + monitor\_camera + grid facet}
+
+想边扫边看，用通用的 \tfocus{Pulse scan} 测量即可：\pyapi{camera} 参数选 \pyapi{monitor\_camera}，扫描模式选 API（软件扫，逐点 \pyapi{set\_api} 重编译再 fire），y 选 MOT intensity 处理器发布的 \pyapi{mot\_intensity}。三维网格在 api 扫描程序里声明 \pyapi{scan\_shape}，与硬件扫描表\tfocus{同一份声明}，grid 面板据此把三维块 facet 成一格一平面：
+
+\begin{codeblock}[Python]
+import numpy as np
+a = np.array([1, 4, 7, 10, 13])       # Bx 候选码（带符号 LSB, 0 = 0 V）
+b = np.array([-11, -8, -5, -2, 1])    # By
+c = np.array([5, 8, 11, 14, 17])      # Bz
+A, B, C = np.meshgrid(a, b, c, indexing='ij')
+scan_table = np.column_stack([A.ravel(), B.ravel(), C.ravel()])
+scan_shape = (len(a), len(b), len(c))  # 声明网格 -> grid 面板 facet 成一格一平面
+\end{codeblock}
+
+\subsection{一键寻优：Optimize MOT field task}
+
+\pyapi{OptimizeMotFieldTask}（\filepath{operations/tasks/mot\_field.py}，控制台里叫 \tfocus{Optimize MOT field}）把整条链打包成一次运行：按 \pyapi{center\_x/y/z} 与 \pyapi{span}、\pyapi{points} 生成三维码网格，逐点 resolve 三个 dac api 槽、fire、在监视相机上量 MOT 光强；寻优 = argmax 加 \(3^3\) 邻域质心细化（免拟合、抗散粒噪声，可到亚步精度）；报告落到 \pyapi{folder}：原始强度块 \filepath{mot\_field\_scan.npz} + 一张按 \(B_z\) 平面 facet 的图。\pyapi{result} 给出 \pyapi{best\_x/best\_y/best\_z}（细化后的最优码，可以不落在网格点上）与 \pyapi{best\_intensity}。运行中 \pyapi{frame}/\pyapi{progress}/\pyapi{stage} 走 task 输出通道，Monitor 面板实时可见。
+
+\begin{notebox}[自检清单]
+\begin{itemize}
+\item task 报 "must expose exactly THREE dac api slots"？——模板没把三路线圈绑成 dac api 槽；到 pulse GUI 把三个 DAC 单元格点到 API（紫色）态再存模板。
+\item 扫描值被拒 "value must be between ..."？——DAC 码超出总线位宽的带符号范围（6 bit 即 $-32..31$）；网格取值要在范围内。
+\item 虚拟端 MOT 亮度不随扫描变化？——检查扫的是不是模板里真实绑定的那三个槽；\pyapi{VirtualMotCamera} 只认 fire 出去的序列里解码到的电平（\pyapi{snapshot()} 的 \pyapi{last\_levels} 可以直接看它感知到了什么）。
+\item 手动扫时 y 一直空？——MOT intensity 处理器的 Frame source 要选\tfocus{扫描节点发布的} \pyapi{frame\_0}（Pulse scan 自己发布帧），不是别的相机测量的帧。
+\end{itemize}
+\end{notebox}
+
 \chapter{相机读出教程与原理（深入）}
 
 本章从零讲解中性原子实验里的\tfocus{相机读出}（camera readout）：如何把相机拍到的一帧二维荧光图像，转换成"哪几个光阱里有原子"这一组布尔判定。整条链路都挂在会话对象 \pyapi{exp.readout} 上，它是一个 \pyapi{ReadoutSubsystem} 实例（定义在 \filepath{Zou\_lab\_control/neutral\_atom/subsystems/readout.py}）。底层的纯数学函数集中在 \filepath{Zou\_lab\_control/neutral\_atom/core/analysis.py}，标定结果的容器是 \filepath{Zou\_lab\_control/neutral\_atom/core/calibration.py} 里的 \pyapi{TrapCalibration}。

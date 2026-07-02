@@ -708,6 +708,129 @@ class VirtualCamera(CameraDevice):
         pass
 
 
+class VirtualMotCamera(CameraDevice):
+    """The virtual MOT MONITOR camera (the pylon-viewer stand-in): a second, independent sensor
+    watching the MOT fluorescence, whose brightness depends on the THREE coil-field DACs.
+
+    Physics: the MOT capture efficiency is a 3-D Gaussian in the coil space --
+    ``I = peak * exp(-sum(((L_i - b0_i)/sigma_i)^2)/2)`` where ``L_i`` is the SIGNED level each coil
+    bus actually drives in the FIRED sequence.  The camera SENSES those levels from the compiled
+    bit-channel pulses through :func:`~..timing.sequence.decode_analog_bus` (the encoder's exact
+    inverse, pinned by a round-trip contract test) -- never from a task's set-points, so the virtual
+    sensing chain goes through the same artefact the hardware plays (virtual == real; swapping in a
+    real pylon camera changes only ``connect()``).  The frame is a Gaussian fluorescence spot at the
+    sensor centre with Poisson photon noise + Gaussian read noise on a constant offset, mirroring the
+    qCMOS noise chain."""
+
+    def __init__(self, *, width: int = 64, height: int = 64, exposure: float = 5e-3,
+                 coil_buses: Mapping[str, Sequence[str]] | None = None,
+                 b0: Mapping[str, float] | None = None,
+                 b_sigma: Mapping[str, float] | None = None,
+                 peak_rate: float = 4.0e5, background_rate: float = 2.0e3,
+                 offset_counts: float = 100.0, read_noise: float = 2.0,
+                 spot_sigma_px: float = 6.0, timeout: float = 2.0, seed: int | None = None):
+        self.width, self.height = int(width), int(height)
+        self._exposure = positive_float(exposure, "exposure")
+        self.timeout = positive_float(timeout, "timeout")
+        # The coil DAC buses this camera's MOT responds to: {bus name: member bit channels LSB..MSB}.
+        # Defaults mirror pulses/mot_field_template.json (three 6-bit buses) so the virtual demo is
+        # zero-config; a real setup names its own buses in the device config.
+        self.coil_buses = {str(k): tuple(str(c) for c in v) for k, v in dict(
+            coil_buses or {"da_x": [f"dx{i}" for i in range(6)],
+                           "da_y": [f"dy{i}" for i in range(6)],
+                           "da_z": [f"dz{i}" for i in range(6)]}).items()}
+        self.b0 = {str(k): float(v) for k, v in dict(b0 or {"da_x": 7.0, "da_y": -5.0, "da_z": 11.0}).items()}
+        self.b_sigma = {str(k): positive_float(v, "b_sigma") for k, v in dict(
+            b_sigma or {"da_x": 6.0, "da_y": 6.0, "da_z": 6.0}).items()}
+        self.peak_rate = nonnegative_float(peak_rate, "peak_rate")
+        self.background_rate = nonnegative_float(background_rate, "background_rate")
+        self.offset_counts = nonnegative_float(offset_counts, "offset_counts")
+        self.read_noise = nonnegative_float(read_noise, "read_noise")
+        self.spot_sigma_px = positive_float(spot_sigma_px, "spot_sigma_px")
+        self._rng = np.random.default_rng(seed)
+        self._roi: tuple[int, int, int, int] | None = None
+        self.last_levels: dict[str, int] | None = None    # what the last frame sensed (snapshot/debug)
+
+    @property
+    def exposure(self) -> float:
+        return self._exposure
+
+    @exposure.setter
+    def exposure(self, value: float) -> None:
+        self._exposure = positive_float(value, "exposure")
+
+    @property
+    def roi(self) -> tuple[int, int, int, int] | None:
+        return self._roi
+
+    @property
+    def sensor_shape(self) -> tuple[int, int]:
+        return (self.height, self.width)
+
+    def configure(self, *, exposure: float | None = None, roi: object = None, **kwargs) -> None:
+        self._reject_unknown_configure_keys({"exposure", "roi"}, kwargs)
+        if exposure is not None:
+            self.exposure = positive_float(exposure, "exposure")
+        if roi is not None:
+            self._roi = None if roi in ("", "None") else snap_subarray(
+                tuple(roi), step=1, max_w=self.width, max_h=self.height)
+
+    def mot_efficiency(self, levels: Mapping[str, float]) -> float:
+        """The 3-D Gaussian capture efficiency at the given coil levels -- THE virtual MOT model,
+        exposed so the end-to-end optimum test asserts against the same rule the frames obey."""
+        z = 0.0
+        for bus, b0 in self.b0.items():
+            z += ((float(levels.get(bus, 0.0)) - b0) / self.b_sigma[bus]) ** 2
+        return float(np.exp(-0.5 * z))
+
+    def acquire(self, frames: int = 1, *, sequence: PulseSequence | None = None,
+                on_armed=None, stop=None, **_) -> list[np.ndarray]:
+        # A pure externally-triggered grabber (the H4f contract): arm, invoke the fire hook, then
+        # image what the FIRED sequence actually drives -- no trigger (no sequence) -> no frame,
+        # exactly like a real triggered sensor.
+        if on_armed is not None:
+            on_armed()
+        frames = positive_int(frames, "frames")
+        if sequence is None or not getattr(sequence, "pulses", None):
+            return []
+        from ..timing.sequence import decode_analog_bus
+        t_end = max(p.start + p.duration for p in sequence.pulses)
+        t_sense = 0.5 * t_end                       # the steady mid-frame level (edges settle at t=0)
+        levels = {bus: decode_analog_bus(sequence, members, t_sense)
+                  for bus, members in self.coil_buses.items()}
+        self.last_levels = dict(levels)
+        eff = self.mot_efficiency(levels)
+        yy, xx = np.mgrid[0:self.height, 0:self.width]
+        cx, cy = self.width / 2.0, self.height / 2.0
+        spot = np.exp(-(((xx - cx) ** 2 + (yy - cy) ** 2) / (2.0 * self.spot_sigma_px ** 2)))
+        rate = self.background_rate + self.peak_rate * eff * spot
+        out: list[np.ndarray] = []
+        for _k in range(frames):
+            photons = self._rng.poisson(rate * self.exposure).astype(float)
+            frame = self.offset_counts + photons + self._rng.normal(0.0, self.read_noise, size=photons.shape)
+            frame = np.clip(frame, 0, 65535).astype(np.uint16)
+            if self._roi is not None:
+                x, w, y, h = self._roi
+                frame = frame[y:y + h, x:x + w]
+            out.append(frame)
+        return self._retain(out)
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "type": type(self).__name__,
+            "exposure": self.exposure,
+            "roi": self._roi,
+            "coil_buses": {k: list(v) for k, v in self.coil_buses.items()},
+            "last_levels": self.last_levels,
+        }
+
+    def close(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+
 class VirtualSequencer(SequencerDevice):
     """In-process streamer = a :class:`SequencerService` software state machine + the virtual
     camera's ``firing`` handle.
@@ -1016,6 +1139,7 @@ def virtual_config() -> dict[str, object]:
     return {
         "trap_array": {"type": "VirtualTrapArray"},
         "camera": {"type": "VirtualCamera", "params": {"trap_array": "$device:trap_array"}},
+        "monitor_camera": {"type": "VirtualMotCamera"},
         "sequencer": {"type": "VirtualSequencer"},
     }
 
