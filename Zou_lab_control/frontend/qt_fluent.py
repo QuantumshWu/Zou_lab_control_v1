@@ -2235,8 +2235,13 @@ class FluentSwitch(QtWidgets.QAbstractButton):
         self.setMinimumSize(scaled_px(126, minimum=96), scaled_px(30, minimum=24))
 
     def sizeHint(self) -> QtCore.QSize:
+        # content = track + the 8 px track-to-label gap + the label + a few px of air; the gap
+        # MUST be budgeted here too (hitButton already counts it) or a labelled switch packed
+        # tight in a toolbar paints its last glyph under the next widget (the header "Selectors"
+        # clip at 1.5x display scale).
         text_w = fluent_text_width(QtGui.QFontMetrics(self.font()), self.text())
-        return QtCore.QSize(max(self.minimumWidth(), scaled_px(60) + text_w), self.minimumHeight())
+        content_w = scaled_px(60) + (scaled_px(8) + text_w + scaled_px(4) if self.text() else 0)
+        return QtCore.QSize(max(self.minimumWidth(), content_w), self.minimumHeight())
 
     def hitButton(self, pos) -> bool:
         # Only the visible switch TRACK (and its label, if any) toggles.  The widget reserves a wider

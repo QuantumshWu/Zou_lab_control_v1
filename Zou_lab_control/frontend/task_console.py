@@ -5841,9 +5841,8 @@ class TaskConsole(QtWidgets.QWidget):
         # anti-misclick rule.  Flip ON to arm the full selector layer (zoom/pan, area, cross,
         # draggable threshold/clim lines) on every dashboard panel IN PLACE -- no rebuild, and a
         # panel added while ON inherits it (see _attach_card).  A DISPLAY control like Pause, so
-        # it stays OUT of the running-task lockout.  (Trailing pad: FluentSwitch.sizeHint
-        # reserves the track width but paints the label past track+gap -- see save_autoname.)
-        self.selectors_switch = FluentSwitch("Selectors  ")
+        # it stays OUT of the running-task lockout.
+        self.selectors_switch = FluentSwitch("Selectors")
         self.selectors_switch.setChecked(False)
         self.selectors_switch.setToolTip(
             "OFF: panels are display-only (wheel scrolls the board).\n"
