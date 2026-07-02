@@ -486,8 +486,14 @@ class BaseLivePlot:
         if display:
             display_figure(self.fig)
         else:
-            self.fig.canvas.draw()
+            self._initial_draw()
         return self
+
+    def _initial_draw(self) -> None:
+        """The undisplayed (``display=False``) build's synchronous first render.  A subclass whose
+        real consumers ALWAYS re-render (the grid: the Qt panel canvas draws on construction,
+        savefig renders itself) overrides this to skip the wasted rasterisation."""
+        self.fig.canvas.draw()
 
     def watch(
         self,
@@ -3297,29 +3303,28 @@ class HistogramCell(GridCell):
 
     def _apply_count_ylim(self, ax, counts) -> None:
         """The thumbnail's count-axis scale + range: the operator's relim family via ``thumb_lims``,
-        with the standalone dis's log rule (floor at 0.5 so 0-count bars sit below the axis)."""
+        with the standalone dis's log rule (floor at 0.5 so 0-count bars sit below the axis).
+        ``set_yscale`` only on an actual scale CHANGE -- it rebuilds the axis' locators, and calling
+        it per cell per live tick re-introduced exactly the tick cost the grid removed (#perf)."""
         top = float(counts.max()) if len(counts) else 0.0
         lo, hi = self.thumb_lims(0.0, top * 1.08 if top > 0 else 1.0)
+        target = "log" if self.ylog else "linear"
+        if ax.get_yscale() != target:
+            ax.set_yscale(target)
         if self.ylog:
-            ax.set_yscale("log")
             ax.set_ylim(max(0.5, lo), max(hi, 1.0))
         else:
-            ax.set_yscale("linear")
             ax.set_ylim(lo, hi)
 
-    def draw(self, ax, k: int):
-        """The compact grid THUMBNAIL of cell ``k`` (corner tag, hidden counts axis; the SHAPE is the
-        point).  The bars are ONE filled :class:`PolyCollection` per population -- the SAME bar geometry
-        the standalone hist builds via :func:`_update_verts` (single source) -- NEVER ``ax.hist``, whose
-        per-bin ``Rectangle`` patches made an N-cell grid carry ~N x bins artists and drew visibly slower
-        than a same-size single plot (#perf: 16 cells x 36 bins = 576 patches -> 32 collections).  The
-        enlarged focus view is a standalone ``hist`` panel (:class:`HistogramFigure`) -- see :meth:`focus_data`."""
-        if self.edges is None:
-            self.prepare()
+    def _make_bar_colls(self, ax, k: int):
+        """(Re)build cell ``k``'s bar PolyCollections from the current samples on the shared edges --
+        the ONE bar construction :meth:`draw` and a re-bin (:meth:`update_cell`) share.  ONE filled
+        PolyCollection per population -- the SAME bar geometry the standalone hist builds via
+        :func:`_update_verts` (single source), NEVER ``ax.hist`` whose per-bin Rectangles made an
+        N-cell grid crawl (#perf).  Returns the total counts (also stored in ``cell_counts``)."""
         edges = self.edges
         v = self.values[k]
         v = v[np.isfinite(v)]
-
         colls = []
 
         def _bars(counts, color):
@@ -3329,7 +3334,7 @@ class HistogramCell(GridCell):
             ax.add_collection(coll)
             colls.append(coll)                 # kept so the live facet feed can move bars in place
 
-        counts_all = np.histogram(v, bins=edges)[0].astype(float) if v.size else np.zeros(self.bins_arg)
+        counts_all = np.histogram(v, bins=edges)[0].astype(float) if v.size else np.zeros(len(edges) - 1)
         occ = self.occupied
         if occ is not None and occ[k].size == self.values[k].size and v.size:
             mask = np.asarray(occ[k], dtype=bool)[np.isfinite(self.values[k])]
@@ -3345,6 +3350,16 @@ class HistogramCell(GridCell):
             _bars(counts_all, PALETTE["hist_fill"])
         self.cell_counts[k] = counts_all
         self._bar_colls[k] = colls
+        return counts_all
+
+    def draw(self, ax, k: int):
+        """The compact grid THUMBNAIL of cell ``k`` (corner tag; the SHAPE is the point).  Draws only
+        the DATA artists (bars via :meth:`_make_bar_colls`, fit curves, threshold) + the small title;
+        the tick policy is the GRID's (:meth:`GridPlot._style_cell_ticks`).  The enlarged focus view
+        is a standalone ``hist`` panel (:class:`HistogramFigure`) -- see :meth:`focus_data`."""
+        if self.edges is None:
+            self.prepare()
+        counts_all = self._make_bar_colls(ax, k)
         self._fit_lines[k] = None               # the axes were cleared -> the old fit lines are gone
         self._apply_fit_lines(ax, k, counts_all)
         line = None
@@ -3355,17 +3370,9 @@ class HistogramCell(GridCell):
         # in ``fixed`` mode the operator's pinned lo/hi win (thumb_lims -- the SAME relim family the
         # enlarged view honours, so a lim edit changes thumbnails AND zoom together, like cmap/bins do)
         self._apply_count_ylim(ax, counts_all)
-        # A THUMBNAIL keeps few ticks (the standalone hist uses nbins=5; a compact cell needs less):
-        # every tick costs a Text layout on EVERY draw, and with N cells that tick work dominated the
-        # grid's first render (#perf) -- fewer ticks = proportionally less _update_ticks/text-metrics.
-        ax.xaxis.set_major_locator(MaxNLocator(nbins=3, prune="lower"))
-        ax.yaxis.set_major_locator(MaxNLocator(nbins=3))
         # The site index (+ fidelity) is the cell's small TITLE, ABOVE the axes -- NOT text inside the data
         # area (#5) -- through the ONE title mechanism (apply_title), just at small_fontsize().
         apply_title(ax, self._tag_text(k), size=small_fontsize(), pad=1.5)
-        # labelleft=False (NOT set_yticklabels([]) -- that would instantiate every major tick's Text,
-        # which dominated the N-cell build time, #perf): counts scale varies per cell; shape is the point.
-        ax.tick_params(labelsize=tick_fontsize(), length=2, labelleft=False)
         self.threshold_lines[k] = line           # grid line, kept for per-cell drag
         return line
 
@@ -3404,23 +3411,26 @@ class HistogramCell(GridCell):
         self.edges = None                      # samples moved -> the shared bin edges re-derive (prepare)
 
     def update_cell(self, ax, k: int) -> bool:
-        """Move cell ``k``'s EXISTING bar collections to the current samples: recompute counts on the
-        (re-)prepared shared edges and ``set_verts`` -- the same bar geometry :meth:`draw` builds, with
-        no axes clear and no new artists (the live-grid perf contract).  The stacked dark/bright pair
-        cannot be re-derived without a matching ``occupied`` mask, so a structure mismatch returns
-        False and the grid redraws that thumbnail once."""
+        """Move cell ``k``'s bar collections to the current samples IN PLACE: recompute counts on the
+        (re-)prepared shared edges and ``set_verts``; when the artist structure no longer matches (a
+        re-bin changed the vert count, a stacked pair, an empty-born cell) rebuild ONLY the bar
+        collections through the one constructor (:meth:`_make_bar_colls`) -- the ticks, title,
+        threshold and fit lines all stay, so no display knob ever costs an axes clear (#perf)."""
         if self.edges is None:
             self.prepare()
         colls = self._bar_colls[k]
         v = self.values[k]
         v = v[np.isfinite(v)]
         counts = np.histogram(v, bins=self.edges)[0].astype(float) if v.size else np.zeros(len(self.edges) - 1)
-        if not colls or len(colls) != 1 or len(counts) != len(colls[0].get_paths()):
-            return False                       # empty-born / stacked / re-binned cell -> full redraw
-        verts = np.empty((len(counts), 4, 2), dtype=float)
-        _update_verts(self.edges, counts, verts, mode="vertical")
-        colls[0].set_verts(verts)
-        self.cell_counts[k] = counts
+        if colls and len(colls) == 1 and len(counts) == len(colls[0].get_paths()):
+            verts = np.empty((len(counts), 4, 2), dtype=float)
+            _update_verts(self.edges, counts, verts, mode="vertical")
+            colls[0].set_verts(verts)
+            self.cell_counts[k] = counts
+        else:                                  # re-binned / stacked / empty-born -> rebuild bars only
+            for coll in (colls or []):
+                coll.remove()
+            counts = self._make_bar_colls(ax, k)
         self._apply_fit_lines(ax, k, counts)   # the fit curves track the moved samples (one primitive)
         ax.set_xlim(self.x_lo, self.x_hi)      # shared edges track the pooled samples (prepare)
         self._apply_count_ylim(ax, counts)
@@ -3536,9 +3546,7 @@ class ImageCell(GridCell):
         vmin, vmax = self.thumb_lims(self.vmin, self.vmax)
         self._image_artists[k] = ax.imshow(self.images[k], origin="lower", cmap=self.cmap,
                                            vmin=vmin, vmax=vmax, aspect="equal")
-        apply_title(ax, f"s{k}", size=small_fontsize(), pad=1.5)
-        ax.set_xticks([])
-        ax.set_yticks([])
+        apply_title(ax, f"s{k}", size=small_fontsize(), pad=1.5)   # ticks are the grid's ONE policy
         return None
 
     def set_cell_data(self, k: int, data) -> None:
@@ -3555,6 +3563,7 @@ class ImageCell(GridCell):
         if im is None or tuple(im.get_array().shape) != tuple(self.images[k].shape):
             return False
         im.set_array(self.images[k])
+        im.set_cmap(self.cmap)                 # a Setting colormap pick lands in place too
         im.set_clim(*self.thumb_lims(self.vmin, self.vmax))
         return True
 
@@ -3721,6 +3730,25 @@ class GridPlot(BaseLivePlot):
         self.axes = axes
         return axes[0]
 
+    def _style_cell_ticks(self, ax, k: int) -> None:
+        """The ONE tick policy for every thumbnail, owned by the GRID (the cell families draw only
+        their data artists): NO y ticks (each cell's count/pixel scale varies -- the SHAPE is the
+        point) and x ticks ONLY on the bottom row (3 small ones).  Ticks were the N-cell draw's
+        dominant cost (#perf: 35 axes x 4 axis._update_ticks per draw); an empty tick list removes
+        that work entirely.  The ENLARGED view is a standalone panel with the kind's full axes."""
+        ax.set_yticks([])
+        if (k + self.ncols) < self.n_cells:
+            ax.set_xticks([])
+        else:
+            ax.xaxis.set_major_locator(MaxNLocator(nbins=3, prune="lower"))
+            ax.tick_params(labelsize=tick_fontsize(), length=2)
+
+    def _initial_draw(self) -> None:
+        # Skip the base class's synchronous build-time draw: every real consumer draws again anyway
+        # (the Qt panel canvas renders on construction, savefig renders itself), so the ~40% of the
+        # N-cell build spent rasterising a figure nobody sees was pure waste (#perf).
+        pass
+
     def init_core(self) -> None:
         self.site_axes = []
         for k, ax in enumerate(self.axes):
@@ -3729,10 +3757,7 @@ class GridPlot(BaseLivePlot):
                 continue
             self.site_axes.append(ax)
             self.cell_renderer.draw(ax, k)
-            if (k + self.ncols) < self.n_cells:        # hide x tick labels off the bottom row
-                # labelbottom=False, NOT set_xticklabels([]) -- the latter instantiates every major
-                # tick's Text and dominated the N-cell build time (#perf).
-                ax.tick_params(labelbottom=False)
+            self._style_cell_ticks(ax, k)
 
     def update_core(self) -> None:
         # A recipe (non-faceted) grid is a snapshot; the LIVE facet feed arrives via update_cells.
@@ -4035,18 +4060,20 @@ class GridPlot(BaseLivePlot):
 
     def _redraw_thumbnail(self, k: int, ax) -> None:
         """Fully re-draw ONE cell thumbnail (axes cleared) -- the fallback when an in-place move cannot
-        represent the change.  Mirrors the :meth:`init_core` cell step, then re-hides the off-row x tick
-        labels the grid layout hides, so the redraw looks identical to a fresh grid."""
+        represent the change.  Mirrors the :meth:`init_core` cell step (draw + the one tick policy)."""
         ax.clear()
         self.cell_renderer.draw(ax, k)
-        if (k + self.ncols) < self.n_cells:
-            ax.tick_params(labelbottom=False)       # mirror init_core (labelbottom, not set_xticklabels -- #perf)
+        self._style_cell_ticks(ax, k)
 
     def _redraw_thumbnails(self) -> None:
-        """Re-draw every grid cell thumbnail from the (re-prepared) cell renderer -- used when a display
-        knob changes the thumbnail binning."""
+        """Refresh every thumbnail after a display knob changed: IN PLACE first (update_cell moves /
+        rebuilds only the data artists -- ticks, title and threshold stay), a full axes-clear redraw
+        only when the cell family says the change cannot be represented in place.  Clearing all N
+        axes re-ran the whole per-cell text/tick build and made every Setting edit cost a rebuild
+        (#perf: 35 cells ~420 ms -> in-place ~tens of ms)."""
         for k, ax in enumerate(self.site_axes):
-            self._redraw_thumbnail(k, ax)
+            if not self.cell_renderer.update_cell(ax, k):
+                self._redraw_thumbnail(k, ax)
 
     def to_data_figure(self):
         self.data_figure = _GridData(self)
@@ -4180,10 +4207,7 @@ class LineCell(GridCell):
         if x.size:
             ax.set_xlim(float(x[0]), float(x[-1]) if x[-1] > x[0] else float(x[0]) + 1.0)
         ax.set_ylim(*self.thumb_lims(self.y_lo, self.y_hi))
-        ax.xaxis.set_major_locator(MaxNLocator(nbins=3, prune="lower"))
-        ax.yaxis.set_major_locator(MaxNLocator(nbins=3))
-        apply_title(ax, f"s{k}", size=small_fontsize(), pad=1.5)
-        ax.tick_params(labelsize=tick_fontsize(), length=2, labelleft=False)
+        apply_title(ax, f"s{k}", size=small_fontsize(), pad=1.5)   # ticks are the grid's ONE policy
         return None
 
     def set_cell_data(self, k: int, data) -> None:
