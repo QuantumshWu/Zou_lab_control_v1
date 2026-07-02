@@ -58,7 +58,9 @@ def test_discovery_aggregates_registered_self_describing_classes():
     from Zou_lab_control.neutral_atom.devices.discovery import _registered_discoverers
 
     discoverers, import_notes = _registered_discoverers()
-    assert "PylonCamera" in [name for name, _cls in discoverers]
+    names = [name for name, _cls in discoverers]
+    assert "PylonCamera" in names
+    assert "QCMOSCamera" in names                        # BOTH real cameras self-describe
     assert all(n.kind == "note" for n in import_notes)   # broken drivers become rows, not holes
     rows = discover_devices(visa=False, display=False)
     assert rows and all(isinstance(r, DiscoveredDevice) for r in rows)
@@ -74,6 +76,21 @@ def test_discovered_config_loads_straight_into_a_device_set():
     assert isinstance(cam, PylonCamera)
     assert cam.serial == "24012345"
     assert cam.trigger_source == "Software"
+
+
+def test_qcmos_discovery_rows_yield_ready_configs_for_the_class_itself():
+    """The qCMOS self-describes exactly like the Pylon camera: every DCAM index becomes a row
+    whose config is a READY entry for QCMOSCamera (device_index pinned, nested under the
+    class's own ``config`` param shape) -- and that config loads verbatim."""
+    from Zou_lab_control.neutral_atom.devices.qcmos import QCMOSCamera
+
+    rows = QCMOSCamera.discovery_rows(2, lambda i: f"C15550-20UP #{i}")
+    assert [r.ident for r in rows] == ["0", "1"]
+    assert rows[1].config == {"type": "QCMOSCamera", "params": {"config": {"device_index": 1}}}
+    devices = load_devices({"camera": rows[1].config}, open_devices=False)
+    assert isinstance(devices["camera"], QCMOSCamera)
+    assert devices["camera"].config.device_index == 1
+    assert QCMOSCamera.discovery_rows(0, lambda i: "") == []
 
 
 def test_visa_rows_are_informational_listings():

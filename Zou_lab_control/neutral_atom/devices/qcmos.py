@@ -67,6 +67,55 @@ class QCMOSCamera(CameraDevice):
         # never uses it to drive the sequencer -- a real qCMOS is gated by the hardware edge.
         self.capture_trigger_channels = tuple(self.config.capture_trigger_channels)
         self.dcam_module_name = str(dcam_module)
+
+    # ------------------------------------------------------------------ discovery (self-describing)
+    @classmethod
+    def discover(cls):
+        """Enumerate attached Hamamatsu DCAM cameras -- each hit carries a READY config entry
+        for THIS class (device_index-pinned).  The device class owns its own discovery:
+        :func:`~.discovery.discover_devices` only aggregates.  A missing DCAM runtime / empty
+        bus is a reported row, never an exception (the confocal contract)."""
+        from .discovery import discovery_note
+
+        try:
+            mod = importlib.import_module(DEFAULT_DCAM_MODULE)
+        except Exception as exc:
+            return [discovery_note("qcmos", f"DCAM driver not importable: {exc}")]
+        api = mod.Dcamapi
+        try:
+            if api.init() is False:
+                return [discovery_note(
+                    "qcmos", "DCAM runtime init failed -- DCAM-API not installed / no camera")]
+            count = int(api.get_devicecount() or 0)
+
+            def model_of(index: int) -> str:
+                try:
+                    from .drivers.dcam.dcamapi4 import DCAM_IDSTR
+                    text = mod.Dcam(index).dev_getstring(DCAM_IDSTR.MODEL)
+                    return str(text) if text else "Hamamatsu DCAM camera"
+                except Exception:
+                    return "Hamamatsu DCAM camera"
+
+            return (cls.discovery_rows(count, model_of)
+                    or [discovery_note("qcmos", "no Hamamatsu camera attached")])
+        except Exception as exc:                # runtime present but transport layer unhappy
+            return [discovery_note("qcmos", f"enumerate failed: {exc}")]
+        finally:
+            try:
+                api.uninit()
+            except Exception:
+                pass                            # enumeration must never leave the API held open
+
+    @classmethod
+    def discovery_rows(cls, count: int, model_of):
+        """Pure enumeration->rows mapping (tests feed fakes): each attached camera becomes a
+        row whose config is a ready entry for THIS class, pinned to its device index."""
+        from .discovery import DiscoveredDevice
+
+        return [DiscoveredDevice(
+            kind="qcmos", ident=str(i), label=str(model_of(i)),
+            config={"type": cls.__name__, "params": {"config": {"device_index": i}}})
+            for i in range(max(0, int(count)))]
         self._module = None
         self._api = None
         self._dcam = None
